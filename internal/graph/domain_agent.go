@@ -18,6 +18,7 @@ type DomainAgentNode struct {
 	registry     *RoleRegistry
 	factory      *RoleFactory
 	modelFactory *model.ModelFactory
+	toolCallback ToolCallback
 }
 
 // NewDomainAgentNode 创建领域Agent节点
@@ -33,6 +34,11 @@ func NewDomainAgentNode(instID string, registry *RoleRegistry, factory *RoleFact
 // SetModelFactory 设置模型工厂（用于LLM任务分析）
 func (n *DomainAgentNode) SetModelFactory(mf *model.ModelFactory) {
 	n.modelFactory = mf
+}
+
+// SetToolCallback 设置工具执行回调
+func (n *DomainAgentNode) SetToolCallback(cb ToolCallback) {
+	n.toolCallback = cb
 }
 
 // Name 返回节点名称
@@ -191,10 +197,20 @@ func (n *DomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLa
 	return result
 }
 
-// executeAssistantTask 执行助手任务（调用LLM或返回模拟结果）
+// executeAssistantTask 执行助手任务（LLM+工具循环 或 回退模拟）
 func (n *DomainAgentNode) executeAssistantTask(ctx context.Context, def *types.RoleDefinition, task string, state *types.ThreeLayerState) (string, error) {
-	// 尝试使用LLM执行
+	// 优先使用 LLM + 工具执行
 	if n.modelFactory != nil {
+		executor := NewToolExecutor("")
+		if n.toolCallback != nil {
+			executor.SetCallback(n.toolCallback)
+		}
+		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state)
+		if result != "" {
+			return result, nil
+		}
+
+		// 工具执行回退到普通LLM
 		llm, err := n.modelFactory.GetModel(ctx, def.ID)
 		if err == nil {
 			prompt := fmt.Sprintf("%s\n\n当前任务: %s\n领域目标: %s\n请执行任务并返回结果。",

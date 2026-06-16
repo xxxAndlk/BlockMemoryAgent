@@ -105,6 +105,13 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 		state.ActiveBlocks[block.ID] = block
 	}
 
+	// 所有领域创建失败，直接结束
+	if len(state.ActiveBlocks) == 0 {
+		state.NextAction = types.ActionFinish
+		state.Reason = "failed to create any domain agent"
+		return state, nil
+	}
+
 	for blockID := range state.ActiveBlocks {
 		state.CurrentBlockID = blockID
 		block := state.ActiveBlocks[blockID]

@@ -78,10 +78,15 @@ func createChatModel(ctx context.Context, cfg types.AgentModelConfig) (einoModel
 
 // createOpenAIModel 创建 OpenAI 兼容模型
 func createOpenAIModel(ctx context.Context, cfg types.AgentModelConfig) (einoModel.BaseChatModel, error) {
+	baseURL := cfg.BaseURL
+	if baseURL == "" {
+		baseURL = "https://api.deepseek.com/v1"
+	}
+
 	ocfg := &openai.ChatModelConfig{
 		APIKey:  cfg.APIKey,
 		Model:   cfg.Model,
-		BaseURL: cfg.BaseURL,
+		BaseURL: baseURL,
 	}
 
 	if cfg.Temperature != 0 {

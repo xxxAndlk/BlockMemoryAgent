@@ -22,6 +22,7 @@ type ThreeLayerGraph struct {
 	registry     *RoleRegistry
 	factory      *RoleFactory
 	modelFactory *model.ModelFactory
+	toolCallback ToolCallback
 }
 
 // ThreeLayerGraphBuilder 三层图构建器
@@ -30,6 +31,7 @@ type ThreeLayerGraphBuilder struct {
 	registry     *RoleRegistry
 	factory      *RoleFactory
 	modelFactory *model.ModelFactory
+	toolCallback ToolCallback
 }
 
 // NewThreeLayerGraphBuilder 创建三层图构建器
@@ -51,6 +53,11 @@ func (b *ThreeLayerGraphBuilder) SetModelFactory(mf *model.ModelFactory) {
 	b.modelFactory = mf
 }
 
+// SetToolCallback 设置工具执行回调
+func (b *ThreeLayerGraphBuilder) SetToolCallback(cb ToolCallback) {
+	b.toolCallback = cb
+}
+
 // AddNode 添加节点
 func (b *ThreeLayerGraphBuilder) AddNode(node ThreeLayerNode) {
 	b.nodes[node.Name()] = node
@@ -63,6 +70,7 @@ func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
 		registry:     b.registry,
 		factory:      b.factory,
 		modelFactory: b.modelFactory,
+		toolCallback: b.toolCallback,
 	}
 
 	// 为已有节点注入 ModelFactory
@@ -73,18 +81,25 @@ func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
 	return g
 }
 
-// injectModelFactory 为节点注入模型工厂
+// injectModelFactory 为节点注入模型工厂和工具回调
 func (g *ThreeLayerGraph) injectModelFactory(node ThreeLayerNode) {
-	if g.modelFactory == nil {
-		return
+	if g.modelFactory != nil {
+		switch n := node.(type) {
+		case *MetaAgentNode:
+			n.SetModelFactory(g.modelFactory)
+		case *DomainAgentNode:
+			n.SetModelFactory(g.modelFactory)
+		case *SubDomainAgentNode:
+			n.SetModelFactory(g.modelFactory)
+		}
 	}
-	switch n := node.(type) {
-	case *MetaAgentNode:
-		n.SetModelFactory(g.modelFactory)
-	case *DomainAgentNode:
-		n.SetModelFactory(g.modelFactory)
-	case *SubDomainAgentNode:
-		n.SetModelFactory(g.modelFactory)
+	if g.toolCallback != nil {
+		switch n := node.(type) {
+		case *DomainAgentNode:
+			n.SetToolCallback(g.toolCallback)
+		case *SubDomainAgentNode:
+			n.SetToolCallback(g.toolCallback)
+		}
 	}
 }
 
@@ -247,6 +262,20 @@ func (g *ThreeLayerGraph) assistantNext(state *types.ThreeLayerState) string {
 		return "MetaAgent"
 	}
 	return "MetaAgent"
+}
+
+// SetToolCallback 设置工具执行回调
+func (g *ThreeLayerGraph) SetToolCallback(cb ToolCallback) {
+	g.toolCallback = cb
+}
+
+// NewToolExecutor 创建带回调的工具执行器
+func (g *ThreeLayerGraph) NewToolExecutor(workDir string) *ToolExecutor {
+	executor := NewToolExecutor(workDir)
+	if g.toolCallback != nil {
+		executor.SetCallback(g.toolCallback)
+	}
+	return executor
 }
 
 // GetNode 获取指定名称的节点

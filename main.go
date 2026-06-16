@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,6 +12,7 @@ import (
 	"github.com/blockmemory/agent/internal/config"
 	"github.com/blockmemory/agent/internal/graph"
 	"github.com/blockmemory/agent/internal/model"
+	"github.com/blockmemory/agent/internal/server"
 	"github.com/blockmemory/agent/internal/store"
 	pkgconfig "github.com/blockmemory/agent/pkg/config"
 	"github.com/blockmemory/agent/pkg/types"
@@ -19,7 +21,18 @@ import (
 func main() {
 	configPath := flag.String("config", "config/config.yaml", "基础设施配置路径")
 	rolePath := flag.String("roles", "config/roles.yaml", "角色配置路径")
+	envPath := flag.String("env", ".env", "环境变量文件路径")
 	flag.Parse()
+
+	// 加载 .env 文件
+	if _, err := os.Stat(*envPath); err == nil {
+		if err := config.LoadEnvFile(*envPath); err != nil {
+			log.Fatalf("load .env file: %v", err)
+		}
+		log.Printf("Loaded environment variables from %s", *envPath)
+	} else {
+		log.Printf("No .env file found at %s, using system environment variables", *envPath)
+	}
 
 	// 加载基础设施配置
 	cfg, err := config.Load(*configPath)
@@ -77,29 +90,50 @@ func main() {
 	builder.AddNode(sinker)
 	threeLayerGraph := builder.Build()
 
-	// 启动示例会话
-	go func() {
-		sessionID := "session-001"
-		state := types.NewThreeLayerState(sessionID)
-		state.DomainGoal = "修复商城主页穿模问题"
+	// 初始化会话管理器
+	sessionMgr := server.NewSessionManager(threeLayerGraph, registry)
 
-		log.Printf("Starting session: %s, goal: %s", sessionID, state.DomainGoal)
+	// 路由
+	mux := http.NewServeMux()
 
-		result, err := threeLayerGraph.Invoke(ctx, state)
-		if err != nil {
-			log.Printf("Session error: %v", err)
+	// API
+	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			sessionMgr.HandleListSessions(w, r)
+		case http.MethodPost:
+			sessionMgr.HandleCreateSession(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/api/sessions/", sessionRouter(sessionMgr))
+
+	// 静态文件
+	fs := http.FileServer(http.Dir("web"))
+	mux.Handle("/static/", http.StripPrefix("/static/", fs))
+
+	// 首页
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
 			return
 		}
+		http.ServeFile(w, r, "web/index.html")
+	})
 
-		log.Printf("Session completed: action=%s, summary=%s", result.NextAction, result.SessionSummary)
+	// 启动 HTTP 服务
+	addr := cfg.HTTP.Addr
+	log.Printf("BlockMemoryAgent starting on http://localhost%s", addr)
 
-		for _, inst := range registry.GetInstancesBySession(sessionID) {
-			roleDef := registry.GetRoleDef(inst.RoleDefID)
-			name := "unknown"
-			if roleDef != nil {
-				name = roleDef.Name
-			}
-			log.Printf("  - [%s] %s (type: %s, domain: %s, status: %s)", inst.ID, name, inst.Type, inst.Domain, inst.Status)
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server error: %v", err)
 		}
 	}()
 
@@ -110,6 +144,28 @@ func main() {
 
 	log.Println("Shutting down...")
 	cancel()
+	httpServer.Close()
+}
+
+// sessionRouter 路由 /api/sessions/{id} 和 /api/sessions/{id}/stream
+func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+
+		// /api/sessions/{id}/stream
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/stream"):] == "/stream" {
+			mgr.HandleSessionStream(w, r)
+			return
+		}
+
+		// /api/sessions/{id}
+		if len(path) > len("/api/sessions/") {
+			mgr.HandleGetSession(w, r)
+			return
+		}
+
+		http.NotFound(w, r)
+	}
 }
 
 // sinkerNode 终止节点

@@ -18,6 +18,7 @@ type SubDomainAgentNode struct {
 	registry     *RoleRegistry
 	factory      *RoleFactory
 	modelFactory *model.ModelFactory
+	toolCallback ToolCallback
 }
 
 // NewSubDomainAgentNode 创建子领域Agent节点
@@ -33,6 +34,11 @@ func NewSubDomainAgentNode(instID string, registry *RoleRegistry, factory *RoleF
 // SetModelFactory 设置模型工厂
 func (n *SubDomainAgentNode) SetModelFactory(mf *model.ModelFactory) {
 	n.modelFactory = mf
+}
+
+// SetToolCallback 设置工具执行回调
+func (n *SubDomainAgentNode) SetToolCallback(cb ToolCallback) {
+	n.toolCallback = cb
 }
 
 // Name 返回节点名称
@@ -183,9 +189,18 @@ func (n *SubDomainAgentNode) runAssistant(ctx context.Context, state *types.Thre
 	return result
 }
 
-// executeAssistantTask 执行助手任务
+// executeAssistantTask 执行助手任务（LLM+工具循环 或 回退模拟）
 func (n *SubDomainAgentNode) executeAssistantTask(ctx context.Context, def *types.RoleDefinition, task string, state *types.ThreeLayerState) (string, error) {
 	if n.modelFactory != nil {
+		executor := NewToolExecutor("")
+		if n.toolCallback != nil {
+			executor.SetCallback(n.toolCallback)
+		}
+		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state)
+		if result != "" {
+			return result, nil
+		}
+
 		llm, err := n.modelFactory.GetModel(ctx, def.ID)
 		if err == nil {
 			prompt := fmt.Sprintf("%s\n\n当前任务: %s\n领域目标: %s\n请执行任务并返回结果。",

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BlockMemoryAgent</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <header>
+            <h1>BlockMemoryAgent</h1>
+            <p class="subtitle">Local AI Dev Tool - Multi-Agent Orchestration</p>
+        </header>
+
+        <main>
+            <div class="input-section">
+                <div class="input-group">
+                    <textarea id="goal-input" placeholder="Enter task, e.g.: Read the main.go file and analyze the project structure" rows="3"></textarea>
+                    <button id="submit-btn" onclick="createSession()">Run</button>
+                </div>
+            </div>
+
+            <div class="workspace">
+                <div class="sessions-panel">
+                    <div class="panel-header">
+                        <h2>Sessions</h2>
+                        <button class="refresh-btn" onclick="refreshSessions()">Refresh</button>
+                    </div>
+                    <div id="sessions-list" class="sessions-list">
+                        <p class="empty-hint">No sessions yet</p>
+                    </div>
+                </div>
+
+                <div id="session-detail" class="detail-panel" style="display:none">
+                    <div class="detail-header">
+                        <div class="detail-title">
+                            <span id="detail-status" class="status-badge"></span>
+                            <h2 id="detail-goal"></h2>
+                        </div>
+                        <button class="close-btn" onclick="closeDetail()">&times;</button>
+                    </div>
+
+                    <div class="detail-body">
+                        <div class="events-panel">
+                            <div class="panel-header">
+                                <h3>Execution Log</h3>
+                                <span id="event-count" class="event-count">0</span>
+                            </div>
+                            <div id="events-list" class="events-list"></div>
+                        </div>
+
+                        <div class="info-panel">
+                            <div class="panel-header"><h3>Info</h3></div>
+                            <div id="session-info" class="session-info"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

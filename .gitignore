@@ -1,3 +1,6 @@
 /migrations
 /设计文档.md
 /设计文档_v2_Eino版.md
+.env
+blockmemory-agent
+blockmemory-agent.exe

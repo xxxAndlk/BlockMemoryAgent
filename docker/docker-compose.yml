@@ -2,50 +2,40 @@ version: '3.8'
 
 services:
   postgres:
-    image: postgres:16-alpine  # 使用官方PostgreSQL镜像，版本可根据需要调整
-    container_name: postgres_db  # 容器名称
-    restart: unless-stopped  # 自动重启策略
-    environment:
-      POSTGRES_USER: admin  # 数据库用户名
-      POSTGRES_PASSWORD: admin123  # 数据库密码（请修改为强密码）
-      POSTGRES_DB: mydatabase  # 默认数据库名称
-      PGDATA: /var/lib/postgresql/data/pgdata  # 数据存储路径
-    ports:
-      - "5432:5432"  # 映射主机5432端口到容器5432端口
-    volumes:
-      - postgres_data:/var/lib/postgresql/data  # 持久化数据卷
-      - ./init:/docker-entrypoint-initdb.d  # 可选：初始化脚本目录
-    networks:
-      - postgres_network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d mydatabase"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # 可选：pgAdmin管理工具
-  pgadmin:
-    image: dpage/pgadmin4:latest
-    container_name: pgadmin
+    image: pgvector/pgvector:pg16
+    container_name: blockmemory-postgres
     restart: unless-stopped
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@example.com  # pgAdmin登录邮箱
-      PGADMIN_DEFAULT_PASSWORD: admin123  # pgAdmin登录密码
+      POSTGRES_USER: blockmemory
+      POSTGRES_PASSWORD: blockmemory_dev
+      POSTGRES_DB: blockmemory
     ports:
-      - "5050:80"  # 访问 http://localhost:5050
+      - "5432:5432"
     volumes:
-      - pgadmin_data:/var/lib/pgadmin
-    networks:
-      - postgres_network
-    depends_on:
-      - postgres
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockmemory -d blockmemory"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: blockmemory-redis
+    restart: unless-stopped
+    command: redis-server --requirepass blockmemory_dev
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "blockmemory_dev", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
-  postgres_data:  # PostgreSQL数据卷
+  postgres_data:
     driver: local
-  pgadmin_data:  # pgAdmin数据卷
+  redis_data:
     driver: local
-
-networks:
-  postgres_network:  # 自定义网络
-    driver: bridge

@@ -390,14 +390,20 @@ memory:
 
 ## 9. 运行方式
 
-```bash
-# 编译
-go build -o blockmemory-agent .
+> 详细部署教程见 [doc/DEPLOYMENT.md](DEPLOYMENT.md)
 
-# 运行 (需要配置环境变量)
-export OPENAI_API_KEY="your-key"
-export POSTGRES_DSN="postgres://user:pass@localhost:5432/blockmemory?sslmode=disable"
-export REDIS_ADDR="localhost:6379"
+```bash
+# 1. 启动基础设施
+cd docker && docker compose up -d && cd ..
+
+# 2. 配置环境变量
+cp .env.example .env
+# 编辑 .env 填入 OPENAI_API_KEY 等
+
+# 3. 编译运行
+go build -o blockmemory-agent .
+./blockmemory-agent                          # 自动加载 .env
+./blockmemory-agent -env /path/to/.env       # 指定 .env 路径
 ./blockmemory-agent -config config/config.yaml -roles config/roles.yaml
 
 # Demo模式 (无需外部依赖)
@@ -409,6 +415,8 @@ go run cmd/tui/main.go
 # 记忆控制台
 go run cmd/memory-console/main.go
 ```
+
+**配置优先级**: 系统环境变量 > `.env` 文件 > `config.yaml` 默认值
 
 ---
 
