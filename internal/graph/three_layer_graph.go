@@ -3,7 +3,9 @@ package graph
 import (
 	"context"
 	"fmt"
+	"sync"
 
+	"github.com/blockmemory/agent/internal/model"
 	"github.com/blockmemory/agent/pkg/types"
 )
 
@@ -15,16 +17,19 @@ type ThreeLayerNode interface {
 
 // ThreeLayerGraph 三层图
 type ThreeLayerGraph struct {
-	nodes     map[string]ThreeLayerNode
-	registry  *RoleRegistry
-	factory   *RoleFactory
+	mu           sync.RWMutex
+	nodes        map[string]ThreeLayerNode
+	registry     *RoleRegistry
+	factory      *RoleFactory
+	modelFactory *model.ModelFactory
 }
 
 // ThreeLayerGraphBuilder 三层图构建器
 type ThreeLayerGraphBuilder struct {
-	nodes    map[string]ThreeLayerNode
-	registry *RoleRegistry
-	factory  *RoleFactory
+	nodes        map[string]ThreeLayerNode
+	registry     *RoleRegistry
+	factory      *RoleFactory
+	modelFactory *model.ModelFactory
 }
 
 // NewThreeLayerGraphBuilder 创建三层图构建器
@@ -41,6 +46,11 @@ func (b *ThreeLayerGraphBuilder) SetFactory(factory *RoleFactory) {
 	b.factory = factory
 }
 
+// SetModelFactory 设置模型工厂
+func (b *ThreeLayerGraphBuilder) SetModelFactory(mf *model.ModelFactory) {
+	b.modelFactory = mf
+}
+
 // AddNode 添加节点
 func (b *ThreeLayerGraphBuilder) AddNode(node ThreeLayerNode) {
 	b.nodes[node.Name()] = node
@@ -48,10 +58,33 @@ func (b *ThreeLayerGraphBuilder) AddNode(node ThreeLayerNode) {
 
 // Build 构建图
 func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
-	return &ThreeLayerGraph{
-		nodes:     b.nodes,
-		registry:  b.registry,
-		factory:   b.factory,
+	g := &ThreeLayerGraph{
+		nodes:        b.nodes,
+		registry:     b.registry,
+		factory:      b.factory,
+		modelFactory: b.modelFactory,
+	}
+
+	// 为已有节点注入 ModelFactory
+	for _, node := range g.nodes {
+		g.injectModelFactory(node)
+	}
+
+	return g
+}
+
+// injectModelFactory 为节点注入模型工厂
+func (g *ThreeLayerGraph) injectModelFactory(node ThreeLayerNode) {
+	if g.modelFactory == nil {
+		return
+	}
+	switch n := node.(type) {
+	case *MetaAgentNode:
+		n.SetModelFactory(g.modelFactory)
+	case *DomainAgentNode:
+		n.SetModelFactory(g.modelFactory)
+	case *SubDomainAgentNode:
+		n.SetModelFactory(g.modelFactory)
 	}
 }
 
@@ -59,7 +92,7 @@ func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
 func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	current := "MetaAgent"
 	stepCount := 0
-	maxSteps := 200 // 防止无限循环
+	maxSteps := 200
 
 	for {
 		if stepCount >= maxSteps {
@@ -67,9 +100,10 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		}
 		stepCount++
 
+		g.mu.RLock()
 		node, ok := g.nodes[current]
+		g.mu.RUnlock()
 		if !ok {
-			// 尝试动态创建实例节点
 			node = g.resolveInstanceNode(current)
 			if node == nil {
 				return nil, fmt.Errorf("node %s not found", current)
@@ -82,12 +116,10 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		}
 		state = newState
 
-		// 检查是否完成
 		if state.NextAction == types.ActionFinish {
 			return state, nil
 		}
 
-		// 确定下一个节点
 		next := g.determineNext(current, state)
 		if next == "" {
 			return state, nil
@@ -103,22 +135,26 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 		return nil
 	}
 
+	var node ThreeLayerNode
+
 	switch inst.Type {
 	case types.RoleTypeDomain:
-		node := NewDomainAgentNode(instID, g.registry, g.factory)
-		g.nodes[instID] = node
-		return node
+		node = NewDomainAgentNode(instID, g.registry, g.factory)
 	case types.RoleTypeSubDomain:
-		node := NewSubDomainAgentNode(instID, g.registry, g.factory)
-		g.nodes[instID] = node
-		return node
+		node = NewSubDomainAgentNode(instID, g.registry, g.factory)
 	case types.RoleTypeFixed, types.RoleTypeDynamic:
-		node := NewAssistantNode(instID, g.registry, nil)
-		g.nodes[instID] = node
-		return node
+		node = NewAssistantNode(instID, g.registry, nil)
 	default:
 		return nil
 	}
+
+	// 注入 ModelFactory
+	g.injectModelFactory(node)
+
+	g.mu.Lock()
+	g.nodes[instID] = node
+	g.mu.Unlock()
+	return node
 }
 
 // determineNext 三层调度逻辑
@@ -131,7 +167,6 @@ func (g *ThreeLayerGraph) determineNext(current string, state *types.ThreeLayerS
 	case "Assistant":
 		return g.assistantNext(state)
 	default:
-		// 实例节点（DomainAgent / SubDomainAgent / Assistant）
 		if inst := g.registry.GetInstance(current); inst != nil {
 			switch inst.Type {
 			case types.RoleTypeDomain:
@@ -146,15 +181,12 @@ func (g *ThreeLayerGraph) determineNext(current string, state *types.ThreeLayerS
 	return ""
 }
 
-// metaAgentNext MetaAgent的下一步
 func (g *ThreeLayerGraph) metaAgentNext(state *types.ThreeLayerState) string {
 	switch state.NextAction {
 	case types.ActionSwitch:
-		// 切换到目标DomainAgent
 		if state.TargetRoleID != "" {
 			return state.TargetRoleID
 		}
-		// 没有目标，检查是否有活跃会话块
 		for blockID := range state.ActiveBlocks {
 			block := state.ActiveBlocks[blockID]
 			if len(block.Agents) > 0 {
@@ -166,35 +198,28 @@ func (g *ThreeLayerGraph) metaAgentNext(state *types.ThreeLayerState) string {
 	case types.ActionFinish:
 		return "Sinker"
 	case types.ActionContinue:
-		// 继续MetaAgent自身（循环）
 		return "MetaAgent"
 	}
 	return "MetaAgent"
 }
 
-// domainAgentNext DomainAgent的下一步
 func (g *ThreeLayerGraph) domainAgentNext(state *types.ThreeLayerState) string {
 	switch state.NextAction {
 	case types.ActionSwitch:
-		// 切换到目标助手
 		if state.TargetRoleID != "" {
 			return state.TargetRoleID
 		}
 	case types.ActionContinue:
-		// 助手调用完成，返回MetaAgent
 		if !state.IsCalling() {
 			return "MetaAgent"
 		}
-		// 继续当前助手
 		if state.CurrentAssistantID != "" {
 			return state.CurrentAssistantID
 		}
 	}
-	// 默认返回MetaAgent
 	return "MetaAgent"
 }
 
-// subDomainAgentNext SubDomainAgent的下一步
 func (g *ThreeLayerGraph) subDomainAgentNext(state *types.ThreeLayerState) string {
 	switch state.NextAction {
 	case types.ActionSwitch:
@@ -212,33 +237,32 @@ func (g *ThreeLayerGraph) subDomainAgentNext(state *types.ThreeLayerState) strin
 	return "MetaAgent"
 }
 
-// assistantNext Assistant的下一步
 func (g *ThreeLayerGraph) assistantNext(state *types.ThreeLayerState) string {
 	switch state.NextAction {
 	case types.ActionSwitch:
-		// 返回调用者（DomainAgent 或 SubDomainAgent）
 		if state.TargetRoleID != "" {
 			return state.TargetRoleID
 		}
 	case types.ActionContinue:
-		// 继续调用者
 		return "MetaAgent"
 	}
 	return "MetaAgent"
 }
 
-// GetNode 获取指定名称的节点（公共方法）
+// GetNode 获取指定名称的节点
 func (g *ThreeLayerGraph) GetNode(name string) (ThreeLayerNode, bool) {
+	g.mu.RLock()
 	node, ok := g.nodes[name]
+	g.mu.RUnlock()
 	return node, ok
 }
 
-// ResolveInstanceNode 根据实例ID动态解析节点（公共方法）
+// ResolveInstanceNode 根据实例ID动态解析节点
 func (g *ThreeLayerGraph) ResolveInstanceNode(instID string) ThreeLayerNode {
 	return g.resolveInstanceNode(instID)
 }
 
-// DetermineNext 确定下一个节点（公共方法）
+// DetermineNext 确定下一个节点
 func (g *ThreeLayerGraph) DetermineNext(current string, state *types.ThreeLayerState) string {
 	return g.determineNext(current, state)
 }

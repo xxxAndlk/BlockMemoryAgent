@@ -2,20 +2,23 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/blockmemory/agent/internal/model"
 	"github.com/blockmemory/agent/pkg/types"
 )
 
 // MetaAgentNode Layer 1: 主Agent / 会话调度器
 type MetaAgentNode struct {
-	name       string
-	registry   *RoleRegistry
-	factory    *RoleFactory
-	maxBlocks  int
+	name            string
+	registry        *RoleRegistry
+	factory         *RoleFactory
+	modelFactory    *model.ModelFactory
+	maxBlocks       int
 	summaryInterval int
-	stepCount  int
+	stepCount       int
 }
 
 // NewMetaAgentNode 创建主Agent节点
@@ -30,6 +33,11 @@ func NewMetaAgentNode(registry *RoleRegistry, factory *RoleFactory, maxBlocks, s
 	}
 }
 
+// SetModelFactory 设置模型工厂
+func (n *MetaAgentNode) SetModelFactory(mf *model.ModelFactory) {
+	n.modelFactory = mf
+}
+
 // Name 返回节点名称
 func (n *MetaAgentNode) Name() string {
 	return n.name
@@ -39,38 +47,28 @@ func (n *MetaAgentNode) Name() string {
 func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	n.stepCount++
 
-	// 1. 检查是否需要会话总结
 	if n.stepCount%n.summaryInterval == 0 {
 		n.updateSessionSummary(state)
 	}
 
-	// 2. 清理过期实例
 	n.registry.CleanupExpired()
 
-	// 3. 决策下一步
 	switch {
-	// 首次启动：分析用户目标，创建第一个DomainAgent
 	case len(state.ActiveBlocks) == 0 && state.CurrentBlockID == "":
 		return n.handleInitial(ctx, state)
 
-	// 所有会话块完成
 	case len(state.ActiveBlocks) == 0 && state.CurrentBlockID != "":
 		state.NextAction = types.ActionFinish
 		state.Reason = "all blocks completed"
 
-	// 当前有活跃会话块，需要调度
 	case state.CurrentBlockID != "" && state.IsCalling():
-		// 有助手调用正在进行，继续执行助手
 		state.NextAction = types.ActionContinue
 
-	// 当前会话块有助手调用请求
 	case state.CurrentBlockID != "" && !state.IsCalling():
 		block := state.ActiveBlocks[state.CurrentBlockID]
 		if block != nil && len(block.Events) > 0 {
-			// 处理DomainAgent提交的事件
 			return n.handleBlockEvents(ctx, state, block)
 		}
-		// 当前会话块完成，切换到下一个
 		return n.switchToNextBlock(ctx, state)
 
 	default:
@@ -82,16 +80,15 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 
 // handleInitial 首次启动处理
 func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	// 分析用户目标，确定需要哪些领域
-	domains := n.analyzeDomains(state)
+	domains := n.analyzeDomains(ctx, state)
 
-	// 为每个领域创建DomainAgent
 	for _, domain := range domains {
 		if len(state.ActiveBlocks) >= n.maxBlocks {
 			break
 		}
 		inst, err := n.factory.CreateDomainAgent(ctx, state.SessionID, domain.Name, domain.Goal, "")
 		if err != nil {
+			fmt.Printf("[MetaAgent] create domain agent %s failed: %v\n", domain.Name, err)
 			continue
 		}
 
@@ -108,14 +105,13 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 		state.ActiveBlocks[block.ID] = block
 	}
 
-	// 激活第一个会话块
 	for blockID := range state.ActiveBlocks {
 		state.CurrentBlockID = blockID
 		block := state.ActiveBlocks[blockID]
 		state.CurrentDomain = block.Domain
 		state.DomainGoal = block.Goal
 		state.NextAction = types.ActionSwitch
-		state.TargetRoleID = block.Agents[0] // DomainAgent实例ID
+		state.TargetRoleID = block.Agents[0]
 		break
 	}
 
@@ -132,11 +128,9 @@ func (n *MetaAgentNode) handleBlockEvents(ctx context.Context, state *types.Thre
 
 		switch ev.Type {
 		case types.EventCrossModify:
-			// DomainAgent请求其他领域协作
-			return n.handleCrossDomainRequest(ctx, state, block, ev)
+			return n.handleCrossDomainRequest(ctx, state, ev)
 
 		case types.EventEscalation:
-			// DomainAgent升级请求
 			state.NextAction = types.ActionEscalate
 			state.Reason = getString(ev.Payload, "reason")
 			return state, nil
@@ -146,13 +140,12 @@ func (n *MetaAgentNode) handleBlockEvents(ctx context.Context, state *types.Thre
 		}
 	}
 
-	// 事件处理完毕，继续当前DomainAgent
 	state.NextAction = types.ActionContinue
 	return state, nil
 }
 
 // handleCrossDomainRequest 处理跨领域请求
-func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *types.ThreeLayerState, block *types.SessionBlock, ev *types.Event) (*types.ThreeLayerState, error) {
+func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *types.ThreeLayerState, ev *types.Event) (*types.ThreeLayerState, error) {
 	targetDomain := getString(ev.Payload, "target_domain")
 	if targetDomain == "" {
 		ev.Status = types.EventDone
@@ -160,7 +153,6 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 		return state, nil
 	}
 
-	// 检查是否已有该领域的会话块
 	var targetBlock *types.SessionBlock
 	for _, b := range state.ActiveBlocks {
 		if b.Domain == targetDomain {
@@ -169,7 +161,6 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 		}
 	}
 
-	// 没有则创建
 	if targetBlock == nil {
 		if len(state.ActiveBlocks) >= n.maxBlocks {
 			state.NextAction = types.ActionEscalate
@@ -198,7 +189,6 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 		state.ActiveBlocks[targetBlock.ID] = targetBlock
 	}
 
-	// 切换到目标会话块
 	state.CurrentBlockID = targetBlock.ID
 	state.CurrentDomain = targetBlock.Domain
 	state.DomainGoal = targetBlock.Goal
@@ -211,13 +201,11 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 
 // switchToNextBlock 切换到下一个会话块
 func (n *MetaAgentNode) switchToNextBlock(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	// 标记当前会话块完成
 	if state.CurrentBlockID != "" {
 		state.CompletedBlocks = append(state.CompletedBlocks, state.CurrentBlockID)
 		delete(state.ActiveBlocks, state.CurrentBlockID)
 	}
 
-	// 查找下一个活跃会话块
 	for blockID, block := range state.ActiveBlocks {
 		state.CurrentBlockID = blockID
 		state.CurrentDomain = block.Domain
@@ -227,7 +215,6 @@ func (n *MetaAgentNode) switchToNextBlock(ctx context.Context, state *types.Thre
 		return state, nil
 	}
 
-	// 全部完成，更新会话总结
 	n.updateSessionSummary(state)
 	state.CurrentBlockID = ""
 	state.CurrentDomain = ""
@@ -255,18 +242,71 @@ type DomainInfo struct {
 	Goal string
 }
 
-// analyzeDomains 分析用户目标，确定需要的领域
-func (n *MetaAgentNode) analyzeDomains(state *types.ThreeLayerState) []DomainInfo {
-	// 简化实现：根据关键词匹配固定角色，推断领域
+// analyzeDomains 分析用户目标，确定需要的领域（优先LLM，回退规则）
+func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLayerState) []DomainInfo {
 	goal := state.DomainGoal
 	if goal == "" {
-		// 从会话总结中提取
 		goal = state.SessionSummary
 	}
 
+	// 尝试使用LLM分析领域
+	if n.modelFactory != nil {
+		if domains := n.analyzeDomainsWithLLM(ctx, goal); len(domains) > 0 {
+			return domains
+		}
+	}
+
+	// 规则回退
+	return n.analyzeDomainsByRules(goal)
+}
+
+// analyzeDomainsWithLLM 使用LLM分析用户目标，确定需要的业务领域
+func (n *MetaAgentNode) analyzeDomainsWithLLM(ctx context.Context, goal string) []DomainInfo {
+	llm, err := n.modelFactory.GetMetaModel(ctx)
+	if err != nil {
+		return nil
+	}
+
+	prompt := fmt.Sprintf(`你是一个多Agent系统的领域分析器。请分析以下用户目标，确定需要哪些业务领域来协作完成。
+
+用户目标: %s
+
+要求:
+- 每个领域名称简短（2-6个字）
+- 领域之间应该尽量独立
+- 输出JSON数组格式: [{"name":"领域名","goal":"该领域需要完成的目标"}]
+- 只输出JSON，不要其他内容
+
+领域列表:`, goal)
+
+	resp, err := llm.Generate(ctx, prompt)
+	if err != nil || resp == "" {
+		return nil
+	}
+
+	// 尝试解析JSON
+	jsonStr := extractJSON(resp)
+	var rawDomains []struct {
+		Name string `json:"name"`
+		Goal string `json:"goal"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &rawDomains); err != nil || len(rawDomains) == 0 {
+		return nil
+	}
+
+	var domains []DomainInfo
+	for _, d := range rawDomains {
+		if d.Name != "" {
+			domains = append(domains, DomainInfo{Name: d.Name, Goal: d.Goal})
+		}
+	}
+	return domains
+}
+
+// analyzeDomainsByRules 基于关键词规则的领域分析
+func (n *MetaAgentNode) analyzeDomainsByRules(goal string) []DomainInfo {
 	var domains []DomainInfo
 
-	// 关键词匹配
 	if strings.Contains(goal, "商城") || strings.Contains(goal, "页面") {
 		domains = append(domains, DomainInfo{Name: "商城页面", Goal: goal})
 	}
@@ -280,7 +320,6 @@ func (n *MetaAgentNode) analyzeDomains(state *types.ThreeLayerState) []DomainInf
 		domains = append(domains, DomainInfo{Name: "用户模块", Goal: goal})
 	}
 
-	// 默认领域
 	if len(domains) == 0 {
 		domains = append(domains, DomainInfo{Name: "通用", Goal: goal})
 	}

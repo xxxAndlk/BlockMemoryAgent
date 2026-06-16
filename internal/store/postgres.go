@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/blockmemory/agent/pkg/types"
@@ -375,12 +376,16 @@ func (s *PostgresStore) SaveDecisionLog(ctx context.Context, topicID, agentID, d
 	return err
 }
 
-// pgVector 将 float32 切片转为 pgvector 字符串格式
+// pgVector 将 float32 切片转为 pgvector 字符串格式 [1,2,3]
 func pgVector(v []float32) string {
 	if len(v) == 0 {
 		return "[]"
 	}
-	return fmt.Sprintf("%v", v)
+	parts := make([]string, len(v))
+	for i, f := range v {
+		parts[i] = fmt.Sprintf("%f", f)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
 }
 
 func scanKnowledgeRows(rows *sql.Rows) ([]*types.KnowledgeRecord, error) {

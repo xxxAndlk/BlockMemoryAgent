@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -65,6 +66,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.applyDefaults()
+	cfg.resolveEnvVars()
 	return cfg, nil
 }
 
@@ -115,7 +117,7 @@ func (c *Config) applyDefaults() {
 	}
 
 	if c.HTTP.Addr == "" {
-		c.HTTP.Addr = ":8080"
+		c.HTTP.Addr = ":10010"
 	}
 	if c.HTTP.ReadTimeout == 0 {
 		c.HTTP.ReadTimeout = 30
@@ -133,4 +135,29 @@ func (c *Config) applyDefaults() {
 	if c.Memory.SnapshotInterval == 0 {
 		c.Memory.SnapshotInterval = 300
 	}
+}
+
+// resolveEnvVars 解析 ${ENV_VAR} 和 ${ENV_VAR:"default"} 格式的环境变量引用
+func (c *Config) resolveEnvVars() {
+	c.Postgres.DSN = resolveEnvWithDefault(c.Postgres.DSN)
+	c.Redis.Addr = resolveEnvWithDefault(c.Redis.Addr)
+	c.Redis.Password = resolveEnvWithDefault(c.Redis.Password)
+	c.HTTP.Addr = resolveEnvWithDefault(c.HTTP.Addr)
+}
+
+// resolveEnvWithDefault 支持 ${VAR:"default"} 语法
+func resolveEnvWithDefault(s string) string {
+	if len(s) > 3 && s[0] == '$' && s[1] == '{' && s[len(s)-1] == '}' {
+		inner := s[2 : len(s)-1]
+		// 检查是否有默认值 ${VAR:"default"}
+		if varName, defaultPart, ok := strings.Cut(inner, ":"); ok {
+			defaultVal := strings.Trim(defaultPart, "\"")
+			if v := os.Getenv(varName); v != "" {
+				return v
+			}
+			return defaultVal
+		}
+		return os.Getenv(inner)
+	}
+	return s
 }

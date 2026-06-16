@@ -30,6 +30,7 @@ func (c *Compressor) Compress(ctx context.Context, agentID, topicID string) erro
 	sorted := sortByImportanceAndTime(episodes)
 
 	// 分层压缩
+	var compressed []*types.Episode
 	for _, ep := range sorted {
 		// 高重要且新鲜: 不压缩
 		if ep.Importance > 0.8 && time.Since(ep.Timestamp) < 24*time.Hour {
@@ -39,23 +40,32 @@ func (c *Compressor) Compress(ctx context.Context, agentID, topicID string) erro
 		// 中等重要: 压缩到 Level 1
 		if ep.Importance > 0.5 {
 			c.compressToLevel1(ep)
+			compressed = append(compressed, ep)
 			continue
 		}
 
 		// 低重要但较新: 压缩到 Level 2
 		if ep.Importance > 0.2 {
 			c.compressToLevel2(ep)
+			compressed = append(compressed, ep)
 			continue
 		}
 
 		// 超过 7 天: 压缩到 Level 3 (标记)
 		if time.Since(ep.Timestamp) > 7*24*time.Hour {
 			c.compressToLevel3(ep)
+			compressed = append(compressed, ep)
 			continue
 		}
 	}
 
-	// TODO: 批量更新到数据库
+	// 批量持久化压缩后的 Episode
+	for _, ep := range compressed {
+		if err := c.store.SaveEpisode(ctx, agentID, topicID, ep); err != nil {
+			return fmt.Errorf("persist compressed episode %s: %w", ep.StepID, err)
+		}
+	}
+
 	return nil
 }
 

@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -109,21 +110,28 @@ func (f *RoleFactory) generateDomainRoleDef(ctx context.Context, domain, goal st
 		return nil, err
 	}
 
-	// 简单解析JSON（实际应使用json.Unmarshal）
+	// 尝试解析LLM返回的JSON，失败则用模板
 	roleDef := &types.RoleDefinition{
 		ID:          fmt.Sprintf("domain_%s_%d", sanitizeID(domain), f.seq.Add(1)),
-		Name:        domain + "负责人",
 		Type:        types.RoleTypeDomain,
 		Lifecycle:   types.RoleLifecycleSession,
-		Description: fmt.Sprintf("负责%s领域的上下文管理与任务分发", domain),
-		SystemPrompt: fmt.Sprintf("你是%s领域的负责人。你的职责是：\n1. 管理该领域的上下文信息\n2. 分析任务并分发给合适的助手\n3. 汇总助手结果并输出\n\n领域目标: %s", domain, goal),
-		Keywords:    []string{domain, goal},
-		Skills:      []string{"任务分析", "上下文管理", "结果汇总"},
 		CanBeCalled: false,
 	}
 
-	// TODO: 解析LLM返回的JSON填充roleDef
-	_ = resp
+	if err := json.Unmarshal([]byte(extractJSON(resp)), roleDef); err != nil || roleDef.Name == "" {
+		// JSON解析失败，使用模板
+		roleDef.Name = domain + "负责人"
+		roleDef.Description = fmt.Sprintf("负责%s领域的上下文管理与任务分发", domain)
+		roleDef.SystemPrompt = fmt.Sprintf("你是%s领域的负责人。你的职责是：\n1. 管理该领域的上下文信息\n2. 分析任务并分发给合适的助手\n3. 汇总助手结果并输出\n\n领域目标: %s", domain, goal)
+		roleDef.Keywords = []string{domain, goal}
+		roleDef.Skills = []string{"任务分析", "上下文管理", "结果汇总"}
+	} else {
+		// 确保关键字段正确
+		roleDef.ID = fmt.Sprintf("domain_%s_%d", sanitizeID(domain), f.seq.Add(1))
+		roleDef.Type = types.RoleTypeDomain
+		roleDef.Lifecycle = types.RoleLifecycleSession
+		roleDef.CanBeCalled = false
+	}
 
 	return roleDef, nil
 }
@@ -160,18 +168,26 @@ func (f *RoleFactory) generateAssistantRoleDef(ctx context.Context, taskDesc, pa
 
 	roleDef := &types.RoleDefinition{
 		ID:          fmt.Sprintf("assistant_%d", f.seq.Add(1)),
-		Name:        "临时助手",
 		Type:        types.RoleTypeDynamic,
 		Lifecycle:   types.RoleLifecycleTask,
-		Description: taskDesc,
-		SystemPrompt: fmt.Sprintf("你是一个专业助手。你的唯一任务是：%s\n\n请专注于此任务，不要处理无关事务。完成后立即返回结果。", taskDesc),
-		Keywords:    extractKeywords(taskDesc),
-		Skills:      []string{taskDesc},
 		CanBeCalled: true,
 		Parents:     []string{parentDefID},
 	}
 
-	_ = resp
+	if err := json.Unmarshal([]byte(extractJSON(resp)), roleDef); err != nil || roleDef.Name == "" {
+		roleDef.Name = "临时助手"
+		roleDef.Description = taskDesc
+		roleDef.SystemPrompt = fmt.Sprintf("你是一个专业助手。你的唯一任务是：%s\n\n请专注于此任务，不要处理无关事务。完成后立即返回结果。", taskDesc)
+		roleDef.Keywords = extractKeywords(taskDesc)
+		roleDef.Skills = []string{taskDesc}
+	} else {
+		roleDef.ID = fmt.Sprintf("assistant_%d", f.seq.Add(1))
+		roleDef.Type = types.RoleTypeDynamic
+		roleDef.Lifecycle = types.RoleLifecycleTask
+		roleDef.CanBeCalled = true
+		roleDef.Parents = []string{parentDefID}
+	}
+
 	return roleDef, nil
 }
 
@@ -227,7 +243,6 @@ func sanitizeID(s string) string {
 
 // extractKeywords 从任务描述中提取关键词
 func extractKeywords(taskDesc string) []string {
-	// 简单实现：按空格分词，过滤短词
 	words := strings.Fields(taskDesc)
 	var result []string
 	for _, w := range words {
@@ -239,4 +254,29 @@ func extractKeywords(taskDesc string) []string {
 		result = result[:5]
 	}
 	return result
+}
+
+// extractJSON 从LLM响应中提取JSON块
+func extractJSON(s string) string {
+	s = strings.TrimSpace(s)
+	// 尝试提取 ```json ... ``` 代码块
+	if idx := strings.Index(s, "```json"); idx != -1 {
+		s = s[idx+7:]
+		if end := strings.Index(s, "```"); end != -1 {
+			s = s[:end]
+		}
+	} else if idx := strings.Index(s, "```"); idx != -1 {
+		s = s[idx+3:]
+		if end := strings.Index(s, "```"); end != -1 {
+			s = s[:end]
+		}
+	}
+	s = strings.TrimSpace(s)
+	// 提取第一个 { 到最后一个 }
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start != -1 && end > start {
+		return s[start : end+1]
+	}
+	return s
 }

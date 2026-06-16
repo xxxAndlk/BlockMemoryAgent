@@ -4,23 +4,24 @@ import (
 	"context"
 	"flag"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/blockmemory/agent/internal/config"
 	"github.com/blockmemory/agent/internal/graph"
-	"github.com/blockmemory/agent/internal/memory"
-	"github.com/blockmemory/agent/internal/server"
+	"github.com/blockmemory/agent/internal/model"
 	"github.com/blockmemory/agent/internal/store"
+	pkgconfig "github.com/blockmemory/agent/pkg/config"
+	"github.com/blockmemory/agent/pkg/types"
 )
 
 func main() {
-	configPath := flag.String("config", "config/config.yaml", "配置文件路径")
+	configPath := flag.String("config", "config/config.yaml", "基础设施配置路径")
+	rolePath := flag.String("roles", "config/roles.yaml", "角色配置路径")
 	flag.Parse()
 
+	// 加载基础设施配置
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
@@ -48,95 +49,58 @@ func main() {
 		defer redisStore.Close()
 	}
 
-	// 初始化广播器
-	broadcaster := server.NewTUIBroadcaster()
-
-	// 初始化记忆控制器
-	var writeProcessor *memory.WriteProcessor
-	var snapshotMgr *memory.SnapshotManager
-	if pgStore != nil {
-		writeProcessor = memory.NewWriteProcessor(pgStore)
-		snapshotMgr = memory.NewSnapshotManager(redisStore, pgStore)
-	}
-
-	_ = memory.NewCallbackHandler(writeProcessor, snapshotMgr, broadcaster)
-
-	// 初始化 Agent 注册表
-	registry := graph.NewSimpleRegistry()
-	// 注册示例 Agent
-	registry.Register(&graph.AgentInfo{
-		ID:          "ui_agent_homepage",
-		Name:        "UI Homepage Agent",
-		Description: "处理首页 UI 相关问题",
-		ModuleID:    "ui",
-		Keywords:    []string{"ui", "homepage", "page", "frontend", "界面", "首页"},
-	})
-	registry.Register(&graph.AgentInfo{
-		ID:          "cart_agent",
-		Name:        "Cart Agent",
-		Description: "处理购物车相关问题",
-		ModuleID:    "cart",
-		Keywords:    []string{"cart", "shopping", "buy", "购物车", "购买"},
-	})
-
-	// 初始化工作区 (使用 Redis)
-	var workspaceClient graph.WorkspaceClient = redisStore
-	var workspaceWriter graph.WorkspaceWriter = redisStore
-	var workspaceUpdater graph.WorkspaceUpdater = redisStore
-
-	// 构建 Graph
-	router := graph.NewRouterNode(registry, workspaceClient)
-	validator := graph.NewValidatorNode()
-	workspaceNode := graph.NewWorkspaceUpdaterNode(workspaceUpdater)
-	escalation := graph.NewEscalationHandlerNode()
-
-	// Agent 节点工厂
-	agentFactory := func(agentID string) graph.Node {
-		var assembler graph.ContextAssembler
-		if snapshotMgr != nil {
-			// TODO: 创建实际的 ContextAssembler
-			assembler = nil
-		}
-		return graph.NewAgentExecutorNode(agentID, assembler, snapshotMgr, workspaceWriter)
-	}
-
-	// 创建默认 Agent Executor (会被动态替换)
-	agentExecutor := agentFactory("default")
-
-	// 构建图
-	compiledGraph, err := graph.BuildDefaultGraph(
-		router,
-		agentExecutor,
-		validator,
-		workspaceNode,
-		escalation,
-		graph.NewSinkerNode(redisStore),
-	)
+	// 加载角色配置
+	roleCfg, err := pkgconfig.LoadRoleConfig(*rolePath)
 	if err != nil {
-		log.Fatalf("build graph: %v", err)
+		log.Fatalf("load role config: %v", err)
 	}
 
-	// 初始化 API 处理器
-	apiHandler := server.NewAPIHandler(broadcaster)
-	if snapshotMgr != nil {
-		apiHandler.SetSnapshotManager(snapshotMgr)
+	// 初始化模型工厂
+	modelFactory := model.NewModelFactory(roleCfg)
+	if err := modelFactory.WarmUp(ctx); err != nil {
+		log.Printf("Warning: model warmup failed: %v", err)
 	}
 
-	// 启动 HTTP 服务器
-	go startHTTPServer(ctx, cfg.HTTP.Addr, broadcaster, apiHandler)
+	// 初始化注册表和角色工厂
+	registry := graph.NewRoleRegistry(roleCfg)
+	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
 
-	// 启动示例话题
+	// 构建三层图
+	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
+	metaAgent.SetModelFactory(modelFactory)
+	escalation := graph.NewEscalationHandlerNode()
+	sinker := &sinkerNode{}
+	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
+	builder.SetModelFactory(modelFactory)
+	builder.AddNode(metaAgent)
+	builder.AddNode(escalation)
+	builder.AddNode(sinker)
+	threeLayerGraph := builder.Build()
+
+	// 启动示例会话
 	go func() {
-		time.Sleep(2 * time.Second)
-		state := graph.NewState("T-fix-overlap", "修复商城主页穿模")
-		log.Printf("Starting topic: %s", state.TopicID)
+		sessionID := "session-001"
+		state := types.NewThreeLayerState(sessionID)
+		state.DomainGoal = "修复商城主页穿模问题"
 
-		result, err := compiledGraph.Invoke(ctx, state)
+		log.Printf("Starting session: %s, goal: %s", sessionID, state.DomainGoal)
+
+		result, err := threeLayerGraph.Invoke(ctx, state)
 		if err != nil {
-			log.Printf("Graph execution error: %v", err)
+			log.Printf("Session error: %v", err)
 			return
 		}
-		log.Printf("Topic completed: %s, final action: %s", result.TopicID, result.NextAction)
+
+		log.Printf("Session completed: action=%s, summary=%s", result.NextAction, result.SessionSummary)
+
+		for _, inst := range registry.GetInstancesBySession(sessionID) {
+			roleDef := registry.GetRoleDef(inst.RoleDefID)
+			name := "unknown"
+			if roleDef != nil {
+				name = roleDef.Name
+			}
+			log.Printf("  - [%s] %s (type: %s, domain: %s, status: %s)", inst.ID, name, inst.Type, inst.Domain, inst.Status)
+		}
 	}()
 
 	// 等待中断信号
@@ -148,33 +112,11 @@ func main() {
 	cancel()
 }
 
-func startHTTPServer(ctx context.Context, addr string, broadcaster *server.TUIBroadcaster, apiHandler *server.APIHandler) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/tui/stream", broadcaster.SSEHandler)
-	mux.HandleFunc("/api/tui/retrieve", apiHandler.RetrieveHandler)
-	mux.HandleFunc("/api/tui/event/resolve", apiHandler.EventResolveHandler)
-	mux.HandleFunc("/api/tui/snapshot/inspect", apiHandler.SnapshotInspectHandler)
-	mux.HandleFunc("/api/tui/graph/pause", apiHandler.GraphPauseHandler)
-	mux.HandleFunc("/api/tui/graph/resume", apiHandler.GraphResumeHandler)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
+// sinkerNode 终止节点
+type sinkerNode struct{}
 
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: mux,
-	}
-
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		srv.Shutdown(shutdownCtx)
-	}()
-
-	log.Printf("HTTP server listening on %s", addr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Printf("HTTP server error: %v", err)
-	}
+func (n *sinkerNode) Name() string { return "Sinker" }
+func (n *sinkerNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
+	state.NextAction = types.ActionFinish
+	return state, nil
 }

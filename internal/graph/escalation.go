@@ -3,11 +3,16 @@ package graph
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/blockmemory/agent/pkg/types"
 )
 
-// EscalationHandlerNode 升级处理节点
+type stepKeyType struct{}
+
+var stepKey = stepKeyType{}
+
+// EscalationHandlerNode 升级处理节点（3层架构兼容）
 type EscalationHandlerNode struct {
 	name string
 }
@@ -22,32 +27,27 @@ func (n *EscalationHandlerNode) Name() string {
 	return n.name
 }
 
-// Invoke 执行升级处理
-func (n *EscalationHandlerNode) Invoke(ctx context.Context, state *State) (*State, error) {
-	// 1. 记录升级事件
-	fmt.Printf("[ESCALATION] Topic: %s, Reason: %s\n", state.TopicID, state.Reason)
+// Invoke 执行升级处理（ThreeLayerNode 接口）
+func (n *EscalationHandlerNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
+	fmt.Printf("[ESCALATION] Session: %s, Reason: %s\n", state.SessionID, state.Reason)
 
-	// 2. 生成仲裁摘要
-	arbitration := n.generateArbitration(state)
+	// 生成仲裁摘要
+	arbitration := fmt.Sprintf("Escalation: %s", state.Reason)
 
-	// 3. 添加到 Event 队列
-	state.AddEvent(&types.Event{
-		ID:          fmt.Sprintf("esc_%d", ctx.Value("step")),
-		Type:        types.EventEscalation,
-		SourceAgent: state.CurrentAgent,
-		Payload:     map[string]any{"arbitration": arbitration},
-		Priority:    10,
-		Status:      types.EventPending,
-	})
+	// 添加事件到当前会话块
+	if block := state.ActiveBlocks[state.CurrentBlockID]; block != nil {
+		block.Events = append(block.Events, &types.Event{
+			ID:          fmt.Sprintf("esc_%d", time.Now().UnixNano()),
+			Type:        types.EventEscalation,
+			SourceAgent: state.CurrentDomain,
+			Payload:     map[string]any{"arbitration": arbitration},
+			Priority:    10,
+			Status:      types.EventPending,
+		})
+	}
 
-	// 4. 重置为继续状态
 	state.NextAction = types.ActionContinue
 	state.Reason = ""
 
 	return state, nil
-}
-
-// generateArbitration 生成仲裁摘要
-func (n *EscalationHandlerNode) generateArbitration(state *State) string {
-	return fmt.Sprintf("Agent %s escalation: %s", state.CurrentAgent, state.Reason)
 }

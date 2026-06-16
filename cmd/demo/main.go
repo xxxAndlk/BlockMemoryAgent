@@ -126,10 +126,3 @@ func (m *mockThreeLayerNode) Invoke(ctx context.Context, state *types.ThreeLayer
 	}
 	return state, nil
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

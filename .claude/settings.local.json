@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(go build *)",
+      "Bash(xxd \"D:\\\\data\\\\project\\\\BlockMemoryAgent\\\\internal\\\\graph\\\\meta_agent.go\")",
+      "Bash(powershell *)",
+      "PowerShell(Get-Content *)",
+      "Bash(go version *)",
+      "Bash(go vet *)"
     ]
   }
 }

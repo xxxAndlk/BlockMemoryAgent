@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/blockmemory/agent/pkg/types"
@@ -165,22 +166,13 @@ func generateStepID(agentID string) string {
 	return fmt.Sprintf("%s_%d", agentID, time.Now().UnixNano())
 }
 
-// containsAny 检查字符串是否包含任意关键词
+// containsAny 检查字符串是否包含任意关键词（大小写不敏感）
 func containsAny(s string, keywords []string) bool {
-	lower := s
+	lower := strings.ToLower(s)
 	for _, kw := range keywords {
-		// 简单大小写不敏感匹配
-		if len(kw) <= len(lower) {
-			// 这里简化处理，实际应使用 strings.Contains(strings.ToLower(s), strings.ToLower(kw))
-			_ = lower
+		if strings.Contains(lower, strings.ToLower(kw)) {
+			return true
 		}
 	}
 	return false
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
