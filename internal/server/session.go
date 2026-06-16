@@ -119,6 +119,10 @@ func (m *SessionManager) ListSessions() []*Session {
 }
 
 func (m *SessionManager) runSession(ctx context.Context, session *Session) {
+	// 全局超时5分钟，防止LLM调用无限挂起
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
 	state := types.NewThreeLayerState(session.ID)
 	state.DomainGoal = session.Goal
 
@@ -155,6 +159,18 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	}
 
 	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", false)
+
+	// 报告超时统计
+	if metaNode, ok := m.graph.GetNode("MetaAgent"); ok {
+		if ma, ok := metaNode.(*graph.MetaAgentNode); ok {
+			calls, timeouts, avg, max := ma.TimeoutStats()
+			if calls > 0 {
+				m.addEvent(session, "stats", "System",
+					fmt.Sprintf("LLM统计: 调用%d次, 超时%d次, 平均%v, 最长%v", calls, timeouts, avg.Round(time.Millisecond), max.Round(time.Millisecond)),
+					"", "", "", "", false)
+			}
+		}
+	}
 }
 
 func (m *SessionManager) addEvent(session *Session, eventType, agent, message, tool, toolPath, toolOutput, toolError string, success bool) {
@@ -198,7 +214,7 @@ func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	session := m.CreateSession(r.Context(), req.Goal)
+	session := m.CreateSession(context.Background(), req.Goal)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(session)

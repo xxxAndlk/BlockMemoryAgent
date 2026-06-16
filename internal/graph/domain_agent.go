@@ -13,21 +13,23 @@ import (
 
 // DomainAgentNode Layer 2: 会话块Agent / 领域上下文管理器
 type DomainAgentNode struct {
-	name         string
-	instID       string // 本实例ID
-	registry     *RoleRegistry
-	factory      *RoleFactory
-	modelFactory *model.ModelFactory
-	toolCallback ToolCallback
+	name           string
+	instID         string // 本实例ID
+	registry       *RoleRegistry
+	factory        *RoleFactory
+	modelFactory   *model.ModelFactory
+	toolCallback   ToolCallback
+	timeoutTracker *model.TimeoutTracker
 }
 
 // NewDomainAgentNode 创建领域Agent节点
 func NewDomainAgentNode(instID string, registry *RoleRegistry, factory *RoleFactory) *DomainAgentNode {
 	return &DomainAgentNode{
-		name:     "DomainAgent",
-		instID:   instID,
-		registry: registry,
-		factory:  factory,
+		name:           "DomainAgent",
+		instID:         instID,
+		registry:       registry,
+		factory:        factory,
+		timeoutTracker: model.NewTimeoutTracker(),
 	}
 }
 
@@ -238,24 +240,8 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 	}
 
 	// 尝试使用LLM进行任务拆解
-	if n.modelFactory != nil {
-		if tasks := n.analyzeTasksWithLLM(ctx, goal); len(tasks) > 0 {
-			return tasks
-		}
-	}
-
-	// 规则回退
-	return n.analyzeTasksByRules(goal)
-}
-
-// analyzeTasksWithLLM 使用LLM拆解任务
-func (n *DomainAgentNode) analyzeTasksWithLLM(ctx context.Context, goal string) []string {
-	llm, err := n.modelFactory.GetDomainModel(ctx)
-	if err != nil {
-		return nil
-	}
-
-	prompt := fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-6个独立可执行的子任务。
+	if n.modelFactory != nil && !n.timeoutTracker.ShouldSkipLLM() {
+		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-6个独立可执行的子任务。
 
 目标: %s
 
@@ -264,19 +250,40 @@ func (n *DomainAgentNode) analyzeTasksWithLLM(ctx context.Context, goal string) 
 - 子任务之间可以有依赖但应尽量并行
 - 只输出子任务列表，每行一个，不要编号，不要其他内容
 
-子任务:`, goal)
-
-	resp, err := llm.Generate(ctx, prompt)
-	if err != nil || resp == "" {
-		return nil
+子任务:`, goal))
+		if !timedOut && err == nil && resp != "" {
+			if tasks := parseTaskListFromResp(resp); len(tasks) > 0 {
+				return tasks
+			}
+		}
+		if timedOut {
+			fmt.Printf("[DomainAgent] LLM timeout on task analysis, using rules. %s\n", n.timeoutTracker.StatsString())
+		}
 	}
 
+	// 规则回退
+	return n.analyzeTasksByRules(goal)
+}
+
+// callLLM 统一LLM调用入口（带自适应超时）
+func (n *DomainAgentNode) callLLM(ctx context.Context, prompt string) (string, error, bool) {
+	llm, err := n.modelFactory.GetDomainModel(ctx)
+	if err != nil {
+		return "", err, false
+	}
+	return n.timeoutTracker.CallWithTimeout(ctx, llm, prompt,
+		30*time.Second,
+		90*time.Second,
+	)
+}
+
+// parseTaskListFromResp 从LLM响应解析任务列表
+func parseTaskListFromResp(resp string) []string {
 	var tasks []string
 	for _, line := range strings.Split(resp, "\n") {
 		line = strings.TrimSpace(line)
 		line = strings.TrimPrefix(line, "- ")
 		line = strings.TrimPrefix(line, "* ")
-		// 去除编号
 		if idx := strings.Index(line, ". "); idx > 0 && idx < 4 {
 			line = line[idx+2:]
 		}
