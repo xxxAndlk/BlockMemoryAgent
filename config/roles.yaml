@@ -4,7 +4,7 @@
 meta_agent:
   model_config:
     provider: openai
-    model: gpt-4o-mini
+    model: deepseek-v4-flash
     api_key: ${OPENAI_API_KEY}
     temperature: 0.3
     max_tokens: 2048
@@ -23,7 +23,7 @@ meta_agent:
 domain_agent:
   model_config:
     provider: openai
-    model: gpt-4o
+    model: deepseek-v4-flash
     api_key: ${OPENAI_API_KEY}
     temperature: 0.5
     max_tokens: 4096
@@ -48,7 +48,7 @@ fixed_roles:
     tools: ["ReadFile", "WriteFile", "GitDiff", "RunTest"]
     model_config:
       provider: openai
-      model: gpt-4o
+      model: deepseek-v4-flash
       api_key: ${OPENAI_API_KEY}
       temperature: 0.4
       max_tokens: 4096
@@ -73,7 +73,7 @@ fixed_roles:
     tools: ["ReadFile", "CSSInspect", "BrowserDevTools"]
     model_config:
       provider: openai
-      model: gpt-4o
+      model: deepseek-v4-flash
       api_key: ${OPENAI_API_KEY}
       temperature: 0.5
       max_tokens: 4096
@@ -98,7 +98,7 @@ fixed_roles:
     tools: []
     model_config:
       provider: openai
-      model: gpt-4o-mini
+      model: deepseek-v4-flash
       api_key: ${OPENAI_API_KEY}
       temperature: 0.2
       max_tokens: 2048
@@ -123,7 +123,7 @@ fixed_roles:
     tools: ["RunTest", "CoverageReport"]
     model_config:
       provider: openai
-      model: gpt-4o
+      model: deepseek-v4-flash
       api_key: ${OPENAI_API_KEY}
       temperature: 0.4
       max_tokens: 4096
@@ -148,7 +148,7 @@ fixed_roles:
     tools: ["ReadFile", "WriteFile"]
     model_config:
       provider: openai
-      model: gpt-4o-mini
+      model: deepseek-v4-flash
       api_key: ${OPENAI_API_KEY}
       temperature: 0.5
       max_tokens: 4096

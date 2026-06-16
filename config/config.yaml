@@ -1,0 +1,45 @@
+# BlockMemoryAgent 配置文件
+
+# PostgreSQL 配置
+postgres:
+  dsn: "postgres://user:pass@localhost:5432/blockmemory?sslmode=disable"
+  # 连接池
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: 300  # 秒
+
+# pgvector 配置（依赖 PostgreSQL）
+pgvector:
+  enabled: true
+  dimensions: 768
+  index_type: ivfflat  # ivfflat | hnsw
+  distance_metric: cosine  # cosine | l2 | inner_product
+
+# Redis 配置
+redis:
+  addr: "localhost:6379"
+  password: "root1234"
+  db: 5
+  # 连接池
+  pool_size: 10
+  min_idle_conns: 3
+  # 超时（毫秒）
+  dial_timeout: 5000
+  read_timeout: 3000
+  write_timeout: 3000
+  # 工作区快照 TTL（天）
+  snapshot_ttl_days: 7
+
+# HTTP 服务配置
+http:
+  addr: ":8080"
+  read_timeout: 30   # 秒
+  write_timeout: 30  # 秒
+
+# 记忆系统配置
+memory:
+  # 写入处理器
+  write_batch_size: 100
+  write_flush_interval: 5  # 秒
+  # 快照
+  snapshot_interval: 300  # 秒

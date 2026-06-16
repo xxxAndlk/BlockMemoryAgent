@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/blockmemory/agent/internal/config"
 	"github.com/blockmemory/agent/internal/graph"
 	"github.com/blockmemory/agent/internal/memory"
 	"github.com/blockmemory/agent/internal/server"
@@ -17,20 +18,19 @@ import (
 )
 
 func main() {
-	var (
-		postgresDSN = flag.String("postgres", "postgres://user:pass@localhost/blockmemory?sslmode=disable", "PostgreSQL DSN")
-		redisAddr   = flag.String("redis", "localhost:6379", "Redis address")
-		redisPass   = flag.String("redis-pass", "", "Redis password")
-		redisDB     = flag.Int("redis-db", 0, "Redis DB")
-		httpAddr    = flag.String("http", ":8080", "HTTP server address")
-	)
+	configPath := flag.String("config", "config/config.yaml", "配置文件路径")
 	flag.Parse()
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// 初始化存储层
-	pgStore, err := store.NewPostgresStore(*postgresDSN)
+	pgStore, err := store.NewPostgresStore(cfg.Postgres.DSN)
 	if err != nil {
 		log.Printf("Warning: postgres not available: %v", err)
 		pgStore = nil
@@ -39,7 +39,7 @@ func main() {
 		defer pgStore.Close()
 	}
 
-	redisStore, err := store.NewRedisStore(*redisAddr, *redisPass, *redisDB)
+	redisStore, err := store.NewRedisStore(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
 		log.Printf("Warning: redis not available: %v", err)
 		redisStore = nil
@@ -123,7 +123,7 @@ func main() {
 	}
 
 	// 启动 HTTP 服务器
-	go startHTTPServer(ctx, *httpAddr, broadcaster, apiHandler)
+	go startHTTPServer(ctx, cfg.HTTP.Addr, broadcaster, apiHandler)
 
 	// 启动示例话题
 	go func() {
