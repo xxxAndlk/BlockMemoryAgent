@@ -95,6 +95,19 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 
 // normalizeToolName 把 snake_case 工具名转为 CamelCase。
 // 已是 CamelCase 的原样返回。
+// parseMkdirDir 解析 mkdir / mkdir -p 命令，返回目标目录。
+// 不是 mkdir 命令时返回空串。
+func parseMkdirDir(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	// 支持 "mkdir dir"、"mkdir -p dir"、"mkdir -p a/b/c"
+	if !strings.HasPrefix(cmd, "mkdir") {
+		return ""
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(cmd, "mkdir"))
+	rest = strings.TrimSpace(strings.TrimPrefix(rest, "-p"))
+	return rest
+}
+
 func normalizeToolName(name string) string {
 	aliases := map[string]string{
 		"read_file":       "ReadFile",
@@ -191,6 +204,15 @@ func (e *ToolExecutor) runCommand(ctx context.Context, args map[string]any) *Too
 	cmdStr, _ := args["command"].(string)
 	if cmdStr == "" {
 		return &ToolResult{Tool: "RunCommand", Error: "command is required"}
+	}
+
+	// 跨平台 mkdir：直接用 os.MkdirAll，绕过 shell 差异（Windows mkdir 不支持 -p）
+	if dir := parseMkdirDir(cmdStr); dir != "" {
+		absDir := e.resolvePath(dir)
+		if err := os.MkdirAll(absDir, 0755); err != nil {
+			return &ToolResult{Tool: "RunCommand", Error: "mkdir: " + err.Error()}
+		}
+		return &ToolResult{Tool: "RunCommand", Success: true, Output: "created: " + absDir}
 	}
 
 	timeout := e.timeout

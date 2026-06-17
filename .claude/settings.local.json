@@ -46,7 +46,16 @@
       "Bash(docker version *)",
       "Bash(docker exec *)",
       "Bash(go env *)",
-      "Bash(GOTOOLCHAIN=local go test ./... -count=1)"
+      "Bash(GOTOOLCHAIN=local go test ./... -count=1)",
+      "Bash(taskkill /F /PID 45436)",
+      "PowerShell(Stop-Process *)",
+      "Bash(GOTOOLCHAIN=local go test ./internal/graph/... -v -count=1)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('status:', d['status']\\); print\\('events:'\\); [print\\(' ', e['type'], e['agent'], e['message'][:120]\\) for e in d.get\\('events', []\\)]\")",
+      "Bash(python -c \"import turtle, random, time; print\\('deps ok'\\)\")",
+      "Bash(timeout 5 python snake.py)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(python snake.py)",
+      "PowerShell(Get-Process *)"
     ]
   }
 }

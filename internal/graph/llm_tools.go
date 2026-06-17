@@ -125,6 +125,7 @@ func executeWithTools(
 【硬性规则】
 1. 凡任务涉及"创建/写入/生成/实现/编写"文件或代码，必须调用 WriteFile 工具真正落盘，
    禁止只用文字描述代码内容当作完成。代码必须通过 WriteFile 的 content 参数写入磁盘。
+   写入的代码必须完整、可直接运行，禁止用 pass/占位符/省略号代替实际逻辑。
 2. 凡任务涉及"运行/执行/启动"程序，必须调用 RunCommand 工具实际执行，禁止只描述如何运行。
 3. 工具未成功执行前，不得宣称任务完成。
 4. 每次只调用一个工具，等待结果后再决定下一步。
@@ -189,7 +190,8 @@ func executeWithTools(
 				if round < maxRounds-1 {
 					emit("intend", "任务要求写文件但尚未落盘，拒绝文字答案，强制要求调用 WriteFile")
 					forcePrompt := prompt + "\n\n[系统提示] 任务要求创建/写入文件，但你尚未调用 WriteFile。" +
-						"请立即输出 WriteFile 工具调用，将完整代码写入目标路径。禁止再用文字描述。"
+						"请立即输出 WriteFile 工具调用，将完整可运行代码写入目标路径。" +
+						"代码必须完整、可运行，禁止用 pass/占位符/省略号代替实际逻辑。禁止再用文字描述。"
 					resp2, err2 := llm.Generate(ctx, forcePrompt)
 					if err2 == nil {
 						if req2 := parseToolCall(resp2); req2 != nil {
@@ -243,8 +245,9 @@ func taskRequiresWriteFile(task string) bool {
 	}
 	fileHints := []string{
 		"文件", "代码", "脚本", "程序", "游戏", "页面", "demo", "示例",
-		"file", "code", "script", "program", "game", "page",
-		".go", ".py", ".js", ".ts", ".html", ".css", ".md", ".json",
+		"接口", "配置", "服务", "模块", "库", "工具",
+		"file", "code", "script", "program", "game", "page", "server", "api", "config", "module", "lib",
+		".go", ".py", ".js", ".ts", ".html", ".css", ".md", ".json", ".yaml", ".yml", ".sql",
 	}
 	hasVerb := false
 	for _, v := range verbs {
