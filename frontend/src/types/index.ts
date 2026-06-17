@@ -1,3 +1,9 @@
+export interface ChatMessage {
+  role: 'user' | 'assistant' | 'system'
+  content: string
+  timestamp: string
+}
+
 export interface Session {
   id: string
   goal: string
@@ -6,6 +12,7 @@ export interface Session {
   started_at: string
   ended_at?: string
   events: SessionEvent[]
+  messages: ChatMessage[]
 }
 
 export interface SessionEvent {

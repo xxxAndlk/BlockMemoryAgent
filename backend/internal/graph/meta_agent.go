@@ -260,6 +260,20 @@ func truncateStr(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// loadMessagesSection 从 state.Messages 构建对话历史段落，注入 prompt。
+func (n *MetaAgentNode) loadMessagesSection(state *types.ThreeLayerState) string {
+	if len(state.Messages) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n对话历史:\n")
+	for _, msg := range state.Messages {
+		b.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, truncateStr(msg.Content, 300)))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
 // handleInitial 首次启动处理
 func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	n.emit("think", "分析用户目标，决定是否需要拆分领域")
@@ -270,6 +284,7 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 	}
 
 	// 简单问题直接回答，不拆分
+	messagesSection := n.loadMessagesSection(state)
 	if n.modelFactory != nil && n.isSimpleQuestion(state.DomainGoal) {
 		n.emit("intend", "判定为简单问题，直接调用 LLM 回答")
 		answer, err, timedOut := n.callLLM(ctx, fmt.Sprintf(
@@ -277,10 +292,10 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 你可以帮助用户：分析代码、操作文件、执行命令、搜索代码、编写程序等。
 
 请直接回答用户的简单问题，保持简洁友好。
-%s
+%s%s
 用户问题：%s
 
-你的回答：`, historySection, state.DomainGoal))
+你的回答：`, historySection, messagesSection, state.DomainGoal))
 		if timedOut {
 			state.SessionSummary = "LLM调用超时，请稍后重试"
 			state.NextAction = types.ActionFinish
@@ -630,6 +645,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 	}
 
 	historySection := n.loadHistorySection(ctx)
+	messagesSection := n.loadMessagesSection(state)
 
 	// 尝试使用LLM分析领域
 	if n.modelFactory != nil && !n.timeoutTracker.ShouldSkipLLM() {
@@ -637,7 +653,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个多Agent系统的领域分析器。请分析以下用户目标，确定需要哪些业务领域来协作完成。
 
 用户目标: %s
-%s
+%s%s
 要求:
 - 每个领域名称简短（2-6个字）
 - 领域之间应该尽量独立
@@ -645,7 +661,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 - 输出JSON数组格式: [{"name":"领域名","goal":"该领域需要完成的目标"}]
 - 只输出JSON，不要其他内容
 
-领域列表:`, goal, historySection))
+领域列表:`, goal, historySection, messagesSection))
 		if !timedOut && err == nil && resp != "" {
 			n.emit("think", "LLM 返回领域分析结果，正在解析")
 			if domains := n.parseDomainsFromLLM(resp); len(domains) > 0 {

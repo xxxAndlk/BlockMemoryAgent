@@ -7,6 +7,7 @@ import Topbar from './components/Topbar.vue'
 const route = useRoute()
 const titles: Record<string, string> = {
   dashboard: '总览',
+  chat: '对话',
   sessions: '会话管理',
   agents: '智能体树',
   board: '任务看板',

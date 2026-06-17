@@ -6,6 +6,9 @@ const route = useRoute()
 const sessionCount = ref(0)
 
 const navItems = [
+  { section: '工作区', items: [
+    { name: 'chat', label: '对话', icon: '◆' },
+  ]},
   { section: '概览', items: [
     { name: 'dashboard', label: '总览', icon: '▤' },
     { name: 'sessions', label: '会话', icon: '◈' },

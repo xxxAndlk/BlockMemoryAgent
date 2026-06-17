@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,7 @@ type Session struct {
 	StartedAt time.Time             `json:"started_at"`
 	EndedAt   *time.Time            `json:"ended_at,omitempty"`
 	Events    []SessionEvent        `json:"events"`
+	Messages  []types.ChatMessage   `json:"messages"`
 }
 
 // SessionEvent 会话事件
@@ -138,6 +140,9 @@ func (m *SessionManager) CreateSession(ctx context.Context, goal string) *Sessio
 		Status:    "running",
 		StartedAt: time.Now(),
 		Events:    make([]SessionEvent, 0),
+		Messages: []types.ChatMessage{
+			{Role: "system", Content: "Goal: " + goal, Timestamp: time.Now()},
+		},
 	}
 
 	m.mu.Lock()
@@ -399,4 +404,116 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
+}
+
+// HandleSessionMessage POST /api/sessions/{id}/message
+func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := r.URL.Path[len("/api/sessions/"):]
+	id = id[:len(id)-len("/message")]
+	if id == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Content == "" {
+		http.Error(w, "content is required", http.StatusBadRequest)
+		return
+	}
+
+	m.mu.Lock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	session.Messages = append(session.Messages, types.ChatMessage{
+		Role:      "user",
+		Content:   req.Content,
+		Timestamp: time.Now(),
+	})
+	m.addEvent(session, "user_message", "User", req.Content, "", "", "", "", "", true)
+
+	if session.Status != "running" {
+		session.Status = "running"
+		session.EndedAt = nil
+		go m.resumeSession(session)
+	}
+	m.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(session)
+}
+
+// resumeSession 基于历史消息恢复会话执行
+func (m *SessionManager) resumeSession(session *Session) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// 构建对话上下文（最近10条消息）
+	var history strings.Builder
+	start := 0
+	if len(session.Messages) > 10 {
+		start = len(session.Messages) - 10
+	}
+	for _, msg := range session.Messages[start:] {
+		history.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content))
+	}
+
+	state := types.NewThreeLayerState(session.ID)
+	state.DomainGoal = history.String()
+	state.SessionSummary = session.Result
+	state.Messages = session.Messages
+
+	m.addEvent(session, "system", "MetaAgent", "继续会话，新消息已纳入上下文", "", "", "", "", "", false)
+
+	result, err := m.graph.Invoke(ctx, state)
+	if err != nil {
+		m.mu.Lock()
+		session.Status = "error"
+		session.Result = err.Error()
+		now := time.Now()
+		session.EndedAt = &now
+		m.mu.Unlock()
+		m.addEvent(session, "error", "System", "执行失败: "+err.Error(), "", "", "", "", "", false)
+		return
+	}
+
+	m.mu.Lock()
+	session.Status = "completed"
+	session.Result = result.SessionSummary
+	session.State = result
+	now := time.Now()
+	session.EndedAt = &now
+	session.Messages = append(session.Messages, types.ChatMessage{
+		Role:      "assistant",
+		Content:   result.SessionSummary,
+		Timestamp: now,
+	})
+	m.mu.Unlock()
+
+	for _, inst := range m.registry.GetInstancesBySession(session.ID) {
+		roleDef := m.registry.GetRoleDef(inst.RoleDefID)
+		name := "unknown"
+		if roleDef != nil {
+			name = roleDef.Name
+		}
+		m.addEvent(session, "agent_done", name, fmt.Sprintf("类型: %s, 领域: %s, 状态: %s", inst.Type, inst.Domain, inst.Status), "", "", "", "", "", false)
+	}
+
+	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", "", false)
+	m.persistHistory(session)
 }

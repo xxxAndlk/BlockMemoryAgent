@@ -179,6 +179,12 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 			return
 		}
 
+		// /api/sessions/{id}/message
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/message"):] == "/message" {
+			mgr.HandleSessionMessage(w, r)
+			return
+		}
+
 		// /api/sessions/{id}
 		if len(path) > len("/api/sessions/") {
 			mgr.HandleGetSession(w, r)

@@ -3,6 +3,7 @@ import Dashboard from '../views/Dashboard.vue'
 
 const routes = [
   { path: '/', name: 'dashboard', component: Dashboard },
+  { path: '/chat', name: 'chat', component: () => import('../views/Chat.vue') },
   { path: '/sessions', name: 'sessions', component: () => import('../views/Sessions.vue') },
   { path: '/agents', name: 'agents', component: () => import('../views/Agents.vue') },
   { path: '/board', name: 'board', component: () => import('../views/Board.vue') },

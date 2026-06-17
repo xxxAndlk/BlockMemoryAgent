@@ -131,6 +131,9 @@ type ThreeLayerState struct {
 	CurrentAssistantID string             `json:"current_assistant_id"`
 	CallStack          []*CallRequest     `json:"call_stack"`         // 调用栈，支持嵌套调用
 
+	// 对话历史
+	Messages []ChatMessage `json:"messages,omitempty"`
+
 	// 全局
 	RoleInstances  map[string]*RoleInstance `json:"role_instances"`    // 所有角色实例
 	NextAction     ActionType             `json:"next_action"`

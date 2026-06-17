@@ -93,6 +93,13 @@ type Issue struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+// ChatMessage 对话消息
+type ChatMessage struct {
+	Role      string    `json:"role"` // "user" | "assistant" | "system"
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 // ActionType Graph 控制信号
 type ActionType string
 
