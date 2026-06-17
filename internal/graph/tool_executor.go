@@ -28,6 +28,17 @@ type ToolResult struct {
 // ToolCallback 工具执行回调（用于通知UI）
 type ToolCallback func(result *ToolResult)
 
+// ProgressEvent 单步进度事件，用于把 Agent 的思考/意图/工具调用实时推给 UI。
+type ProgressEvent struct {
+	Kind    string // "think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error"
+	Agent   string // 节点名/角色名
+	Message string // 人类可读描述
+	Detail  string // 可选：LLM 原始输出 / 工具参数 / 错误堆栈
+}
+
+// ProgressCallback 进度回调。server 层注入，graph 各节点在每个关键步骤触发。
+type ProgressCallback func(ev ProgressEvent)
+
 // ToolExecutor 本地工具执行器（沙箱）
 type ToolExecutor struct {
 	workDir  string
@@ -53,6 +64,10 @@ func (e *ToolExecutor) SetCallback(cb ToolCallback) {
 
 // Execute 执行工具调用
 func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[string]any) *ToolResult {
+	// 兼容 snake_case 工具名（LLM 可能输出 skill_id 而非 ToolRef）。
+	// 例如 write_file -> WriteFile。
+	toolName = normalizeToolName(toolName)
+
 	var result *ToolResult
 	switch toolName {
 	case "ReadFile":
@@ -76,6 +91,24 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 		e.callback(result)
 	}
 	return result
+}
+
+// normalizeToolName 把 snake_case 工具名转为 CamelCase。
+// 已是 CamelCase 的原样返回。
+func normalizeToolName(name string) string {
+	aliases := map[string]string{
+		"read_file":       "ReadFile",
+		"write_file":      "WriteFile",
+		"list_dir":        "ListDir",
+		"run_command":     "RunCommand",
+		"search_in_files": "SearchInFiles",
+		"http_get":        "HTTPGet",
+		"http_post":       "HTTPPost",
+	}
+	if v, ok := aliases[name]; ok {
+		return v
+	}
+	return name
 }
 
 // readFile 读取文件

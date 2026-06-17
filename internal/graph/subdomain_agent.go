@@ -19,6 +19,7 @@ type SubDomainAgentNode struct {
 	factory      *RoleFactory
 	modelFactory *model.ModelFactory
 	toolCallback ToolCallback
+	progress     ProgressCallback
 }
 
 // NewSubDomainAgentNode 创建子领域Agent节点
@@ -39,6 +40,11 @@ func (n *SubDomainAgentNode) SetModelFactory(mf *model.ModelFactory) {
 // SetToolCallback 设置工具执行回调
 func (n *SubDomainAgentNode) SetToolCallback(cb ToolCallback) {
 	n.toolCallback = cb
+}
+
+// SetProgressCallback 注入进度回调
+func (n *SubDomainAgentNode) SetProgressCallback(cb ProgressCallback) {
+	n.progress = cb
 }
 
 // Name 返回节点名称
@@ -198,7 +204,7 @@ func (n *SubDomainAgentNode) executeAssistantTask(ctx context.Context, def *type
 		}
 		// SubDomainAgent 当前与父 Domain 共享 Skill 子集（通过父 ID 查）
 		var skillBrief string
-		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief)
+		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief, n.progress, "SubDomainAgent["+def.Name+"]")
 		if result != "" {
 			return result, nil
 		}

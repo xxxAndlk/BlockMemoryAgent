@@ -66,11 +66,16 @@ type Config struct {
 	HardLimit int // 硬阈值（必须驱逐）
 }
 
-// DefaultConfig 默认阈值（v3 §4.4 中举例 3000 token）
+// DefaultConfig 默认阈值。
+//
+// 原 v3 §4.4 举例 3000 token 在实际使用中过低——一次 ReadFile 输出
+// （如 CLAUDE.md ≈ 3700 token）就会触发硬驱逐，导致会话被强制结束、
+// 写文件等关键动作来不及执行。提高到 soft=12000 / hard=20000，
+// 兼容一般 LLM 上下文窗口（≥128k）下的多轮工具调用。
 func DefaultConfig() Config {
 	return Config{
-		SoftLimit: 2400,
-		HardLimit: 3000,
+		SoftLimit: 12000,
+		HardLimit: 20000,
 	}
 }
 

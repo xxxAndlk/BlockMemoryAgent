@@ -24,6 +24,7 @@ type ThreeLayerGraph struct {
 	factory      *RoleFactory
 	modelFactory *model.ModelFactory
 	toolCallback ToolCallback
+	progress     ProgressCallback
 	rt           *runtime.Runtime
 }
 
@@ -34,6 +35,7 @@ type ThreeLayerGraphBuilder struct {
 	factory      *RoleFactory
 	modelFactory *model.ModelFactory
 	toolCallback ToolCallback
+	progress     ProgressCallback
 	rt           *runtime.Runtime
 }
 
@@ -61,6 +63,29 @@ func (b *ThreeLayerGraphBuilder) SetToolCallback(cb ToolCallback) {
 	b.toolCallback = cb
 }
 
+// SetProgressCallback 设置进度回调（思考/意图/工具调用实时推 UI）
+func (b *ThreeLayerGraphBuilder) SetProgressCallback(cb ProgressCallback) {
+	b.progress = cb
+}
+
+// SetProgressCallback 在已构建的图上设置进度回调（供 server 后注入）
+func (g *ThreeLayerGraph) SetProgressCallback(cb ProgressCallback) {
+	g.mu.Lock()
+	g.progress = cb
+	g.mu.Unlock()
+	// 同步给已存在的静态节点
+	for _, node := range g.nodes {
+		g.injectProgress(node)
+	}
+}
+
+// Progress 暴露进度回调（节点内部用）
+func (g *ThreeLayerGraph) Progress() ProgressCallback {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.progress
+}
+
 // SetRuntime 注入 Runtime（看板/邮箱/Watchdog/人格/Skill）
 func (b *ThreeLayerGraphBuilder) SetRuntime(rt *runtime.Runtime) {
 	b.rt = rt
@@ -79,15 +104,35 @@ func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
 		factory:      b.factory,
 		modelFactory: b.modelFactory,
 		toolCallback: b.toolCallback,
+		progress:     b.progress,
 		rt:           b.rt,
 	}
 
-	// 为已有节点注入 ModelFactory / Runtime
+	// 为已有节点注入 ModelFactory / Runtime / Progress
 	for _, node := range g.nodes {
 		g.injectModelFactory(node)
+		g.injectProgress(node)
 	}
 
 	return g
+}
+
+// injectProgress 向节点注入进度回调
+func (g *ThreeLayerGraph) injectProgress(node ThreeLayerNode) {
+	g.mu.RLock()
+	cb := g.progress
+	g.mu.RUnlock()
+	if cb == nil {
+		return
+	}
+	switch n := node.(type) {
+	case *MetaAgentNode:
+		n.SetProgressCallback(cb)
+	case *DomainAgentNode:
+		n.SetProgressCallback(cb)
+	case *SubDomainAgentNode:
+		n.SetProgressCallback(cb)
+	}
 }
 
 // injectModelFactory 为节点注入模型工厂、工具回调、运行时
@@ -185,6 +230,16 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 
 	// 注入 ModelFactory
 	g.injectModelFactory(node)
+	// 注入 Progress / ToolCallback
+	g.injectProgress(node)
+	if g.toolCallback != nil {
+		switch n := node.(type) {
+		case *DomainAgentNode:
+			n.SetToolCallback(g.toolCallback)
+		case *SubDomainAgentNode:
+			n.SetToolCallback(g.toolCallback)
+		}
+	}
 
 	g.mu.Lock()
 	g.nodes[instID] = node

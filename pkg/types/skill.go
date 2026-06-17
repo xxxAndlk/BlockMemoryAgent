@@ -45,13 +45,44 @@ type SkillSet struct {
 //
 // 严格遵循 v3 §5.3：LLM 看到的只是 ID + Description，不会被
 // 完整定义淹没。
+//
+// 注意：输出行用 ToolRef（如 WriteFile / RunCommand）作为工具名，
+// 与 ToolExecutor.Execute 接受的 case 名一致；同时附带参数 schema，
+// 避免 LLM 输出 {"tool":"write_file",...} 这种 snake_case 导致
+// "unknown tool" 错误。
 func (s *SkillSet) PromptList() string {
 	if s == nil || len(s.Skills) == 0 {
 		return "(无可用 Skill)"
 	}
 	out := ""
 	for _, sk := range s.Skills {
-		out += "- " + sk.SkillID + ": " + sk.Description + "\n"
+		toolName := sk.ToolRef
+		if toolName == "" {
+			toolName = sk.SkillID
+		}
+		out += "- " + toolName + ": " + sk.Description + ". 参数: " + schemaFor(toolName) + "\n"
 	}
 	return out
+}
+
+// schemaFor 返回各工具的参数 schema 提示，让 LLM 知道如何构造 args。
+func schemaFor(toolRef string) string {
+	switch toolRef {
+	case "ReadFile":
+		return `{"path": "文件路径"}`
+	case "WriteFile":
+		return `{"path": "文件路径", "content": "文件内容"}`
+	case "ListDir":
+		return `{"path": "目录路径"}`
+	case "RunCommand":
+		return `{"command": "命令", "timeout": 秒数}`
+	case "SearchInFiles":
+		return `{"pattern": "搜索模式", "dir": "目录"}`
+	case "HTTPGet":
+		return `{"url": "...", "headers": {...}}`
+	case "HTTPPost":
+		return `{"url": "...", "headers": {...}, "body": {...}}`
+	default:
+		return `{...}`
+	}
 }

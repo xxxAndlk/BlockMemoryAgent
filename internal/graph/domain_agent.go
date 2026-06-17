@@ -23,6 +23,7 @@ type DomainAgentNode struct {
 	toolCallback   ToolCallback
 	timeoutTracker *model.TimeoutTracker
 	rt             *runtime.Runtime
+	progress       ProgressCallback
 }
 
 // NewDomainAgentNode 创建领域Agent节点
@@ -51,6 +52,35 @@ func (n *DomainAgentNode) SetRuntime(rt *runtime.Runtime) {
 	n.rt = rt
 }
 
+// SetProgressCallback 注入进度回调
+func (n *DomainAgentNode) SetProgressCallback(cb ProgressCallback) {
+	n.progress = cb
+}
+
+// emit 推送进度事件
+func (n *DomainAgentNode) emit(kind, message string) {
+	if n.progress == nil {
+		return
+	}
+	agent := "DomainAgent"
+	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
+		agent = "DomainAgent[" + inst.Domain + "]"
+	}
+	n.progress(ProgressEvent{Kind: kind, Agent: agent, Message: message})
+}
+
+// emitDetail 推送带详情的进度事件
+func (n *DomainAgentNode) emitDetail(kind, message, detail string) {
+	if n.progress == nil {
+		return
+	}
+	agent := "DomainAgent"
+	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
+		agent = "DomainAgent[" + inst.Domain + "]"
+	}
+	n.progress(ProgressEvent{Kind: kind, Agent: agent, Message: message, Detail: detail})
+}
+
 // Name 返回节点名称
 func (n *DomainAgentNode) Name() string {
 	return n.name
@@ -68,10 +98,20 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		return nil, fmt.Errorf("domain agent instance %s not found", n.instID)
 	}
 
+	n.emit("think", fmt.Sprintf("DomainAgent 启动，领域目标: %s", state.DomainGoal))
 	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusActive)
 
 	// v3 §5：为本 DomainAgent 装配领域 Skill 子集（如未装配）
 	n.ensureSkillSet(ctx, inst, state)
+	if n.rt != nil && n.rt.Skills != nil {
+		if set := n.rt.Skills.GetForAgent(n.instID); set != nil && len(set.Skills) > 0 {
+			ids := make([]string, 0, len(set.Skills))
+			for _, s := range set.Skills {
+				ids = append(ids, s.SkillID)
+			}
+			n.emit("think", "已装配 Skill 子集: "+strings.Join(ids, ", "))
+		}
+	}
 
 	tasks := n.analyzeTasks(ctx, state)
 
@@ -86,6 +126,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 
 	// 检查是否需要拆分为子领域
 	if n.shouldSplitToSubDomains(ctx, state, tasks) {
+		n.emit("intend", fmt.Sprintf("领域较复杂（%d 个子任务），拆分为子领域并行处理", len(tasks)))
 		return n.handleSubDomainSplit(ctx, state, inst)
 	}
 
@@ -99,6 +140,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	}
 
 	if len(pendingTasks) == 0 {
+		n.emit("think", "所有子任务已完成，汇总结果")
 		n.summarizeResults(state)
 		n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusDone)
 		block.Status = "completed"
@@ -106,6 +148,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		return state, nil
 	}
 
+	n.emit("intend", fmt.Sprintf("派发 %d 个助手任务: %s", len(pendingTasks), strings.Join(pendingTasks, "; ")))
 	// 并行执行所有待处理任务
 	results := n.dispatchAssistantsParallel(ctx, state, inst, pendingTasks)
 
@@ -246,8 +289,12 @@ func (n *DomainAgentNode) executeAssistantTask(ctx context.Context, def *types.R
 			}
 		}
 
-		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief)
+		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief, n.progress, "助手["+def.Name+"]")
 		if result != "" {
+			// 完成门控：若任务要求写文件但结果含失败标记，返回 error 触发上层重试/告警
+			if strings.HasPrefix(result, "[失败:") {
+				return result, fmt.Errorf("助手未完成写文件任务: %s", task)
+			}
 			return result, nil
 		}
 
@@ -280,23 +327,30 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 
 	// 尝试使用LLM进行任务拆解
 	if n.modelFactory != nil && !n.timeoutTracker.ShouldSkipLLM() {
-		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-6个独立可执行的子任务。
+		n.emit("llm", "调用 LLM 拆解子任务...")
+		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-4个独立可执行的子任务。
 
 目标: %s
 
 要求:
-- 每个子任务必须是一个明确的、可独立执行的动作
+- 每个子任务必须是一个可直接用工具执行的动作（如"用 WriteFile 写 X 文件"、"用 RunCommand 运行 Y"）
+- 严禁出现"分析/确定/规划/设计/思考/研究"等纯思考类子任务，这类工作应在执行动作中一并完成
+- 涉及创建文件的目标，必须有子任务明确写出文件路径与内容来源
 - 子任务之间可以有依赖但应尽量并行
 - 只输出子任务列表，每行一个，不要编号，不要其他内容
 
 子任务:`, goal))
 		if !timedOut && err == nil && resp != "" {
 			if tasks := parseTaskListFromResp(resp); len(tasks) > 0 {
+				n.emit("think", fmt.Sprintf("LLM 拆解出 %d 个子任务", len(tasks)))
 				return tasks
 			}
 		}
 		if timedOut {
+			n.emit("error", "任务拆解 LLM 调用超时，回退到规则")
 			fmt.Printf("[DomainAgent] LLM timeout on task analysis, using rules. %s\n", n.timeoutTracker.StatsString())
+		} else if err != nil {
+			n.emitDetail("error", "任务拆解 LLM 调用失败: "+err.Error(), "")
 		}
 	}
 

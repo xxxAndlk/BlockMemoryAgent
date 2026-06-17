@@ -17,6 +17,55 @@ type ToolCallRequest struct {
 	Args map[string]any `json:"args"`
 }
 
+// mergeToolList 把 skillBrief（来自 SkillSet.PromptList，以 ToolRef 为工具名）
+// 与 defaultTools 合并，按行首工具名去重。skillBrief 行优先保留。
+// 两者都空时返回 defaultTools。
+func mergeToolList(skillBrief, defaultTools string) string {
+	if skillBrief == "" {
+		return defaultTools
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, line := range strings.Split(skillBrief, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name := toolNameFromLine(line)
+		if name == "" {
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, line)
+	}
+	for _, line := range strings.Split(defaultTools, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name := toolNameFromLine(line)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// toolNameFromLine 从 "- WriteFile: 写入文件..." 中提取 "WriteFile"
+func toolNameFromLine(line string) string {
+	s := strings.TrimPrefix(strings.TrimSpace(line), "-")
+	s = strings.TrimSpace(s)
+	if idx := strings.Index(s, ":"); idx > 0 {
+		return strings.TrimSpace(s[:idx])
+	}
+	return ""
+}
+
 // executeWithTools 使用LLM+工具循环执行任务
 // LLM分析任务，决定调用哪些工具，执行后返回结果给LLM继续分析，直到完成
 //
@@ -31,19 +80,38 @@ func executeWithTools(
 	task string,
 	state *types.ThreeLayerState,
 	skillBrief string,
+	progress ProgressCallback,
+	agentName string,
 ) (string, []*ToolResult) {
 	var allResults []*ToolResult
 
-	skillSection := skillBrief
-	if skillSection == "" {
-		skillSection = `- ReadFile: 读取文件内容。参数: {"path": "文件路径"}
+	emit := func(kind, msg string) {
+		if progress != nil {
+			progress(ProgressEvent{Kind: kind, Agent: agentName, Message: msg})
+		}
+	}
+	emitDetail := func(kind, msg, detail string) {
+		if progress != nil {
+			progress(ProgressEvent{Kind: kind, Agent: agentName, Message: msg, Detail: detail})
+		}
+	}
+	emit("think", "助手开始执行任务: "+task)
+
+	// 默认工具列表（CamelCase，与 ToolExecutor.Execute case 名一致）。
+	// 无论 DomainAgent 是否装配 SkillSet，都保留这套兜底工具，
+	// 避免 LLM 在 skillBrief 为空或与 ToolRef 不一致时无工具可用。
+	defaultTools := `- ReadFile: 读取文件内容。参数: {"path": "文件路径"}
 - WriteFile: 写入文件。参数: {"path": "文件路径", "content": "文件内容"}
 - ListDir: 列出目录内容。参数: {"path": "目录路径"}
 - RunCommand: 执行shell命令。参数: {"command": "命令", "timeout": 秒数}
 - SearchInFiles: 在文件中搜索。参数: {"pattern": "搜索模式", "dir": "目录"}
 - HTTPGet: HTTP GET 请求。参数: {"url": "...", "headers": {...}}
 - HTTPPost: HTTP POST 请求。参数: {"url": "...", "headers": {...}, "body": {...}}`
-	}
+
+	// skillBrief 是 DomainAgent 装配的 Skill 子集（含 ToolRef + 参数 schema）。
+	// 合并而非替换默认列表：Skill 子集作为"优先关注"项前置，默认工具作为兜底。
+	// 去重以 ToolRef 为准。
+	skillSection := mergeToolList(skillBrief, defaultTools)
 
 	systemPrompt := fmt.Sprintf(`%s
 
@@ -54,8 +122,13 @@ func executeWithTools(
 当你需要调用工具时，输出JSON格式:
 {"tool": "工具名", "args": {"参数名": "参数值"}}
 
-如果不需要工具，直接输出最终答案。
-每次只调用一个工具，等待结果后再决定下一步。`, roleDef.SystemPrompt, skillSection)
+【硬性规则】
+1. 凡任务涉及"创建/写入/生成/实现/编写"文件或代码，必须调用 WriteFile 工具真正落盘，
+   禁止只用文字描述代码内容当作完成。代码必须通过 WriteFile 的 content 参数写入磁盘。
+2. 凡任务涉及"运行/执行/启动"程序，必须调用 RunCommand 工具实际执行，禁止只描述如何运行。
+3. 工具未成功执行前，不得宣称任务完成。
+4. 每次只调用一个工具，等待结果后再决定下一步。
+5. 只有当所有要求的文件已落盘、命令已执行，且无需再调用工具时，才输出最终文字总结。`, roleDef.SystemPrompt, skillSection)
 
 	contextInfo := ""
 	if state.CurrentDomain != "" {
@@ -76,8 +149,10 @@ func executeWithTools(
 			prompt += "\n请根据以上结果继续分析，或输出最终结论。"
 		}
 
+		emit("llm", fmt.Sprintf("第 %d 轮：调用 LLM 决策下一步...", round+1))
 		resp, err := llm.Generate(ctx, prompt)
 		if err != nil {
+			emit("error", fmt.Sprintf("LLM 调用失败: %v", err))
 			if len(allResults) > 0 {
 				return fmt.Sprintf("LLM调用失败(已完成%d步工具操作): %v", len(allResults), err), allResults
 			}
@@ -87,13 +162,16 @@ func executeWithTools(
 		// 尝试解析工具调用
 		toolReq := parseToolCall(resp)
 		if toolReq == nil {
-			// 不是工具调用：若 LLM 声称"已写/已创建文件"但工具结果里没有 WriteFile，
-			// 视为幻觉，强制追加一轮验证，不能直接结束。
-			if claimsFileWrite(resp) && !hasWriteFileResult(allResults) {
+			// 不是工具调用。
+			needWrite := taskRequiresWriteFile(task)
+			alreadyWritten := hasWriteFileResult(allResults)
+
+			// 情况 1：LLM 声称已写文件但实际没有 WriteFile 记录 → 幻觉，强制要求落盘
+			if claimsFileWrite(resp) && !alreadyWritten {
+				emit("think", "LLM 声称已写文件但无 WriteFile 记录，疑似幻觉，强制要求调用工具")
 				prompt += "\n\n[系统提示] 你声称已写文件，但工具执行记录中没有 WriteFile 调用。" +
 					"请立即输出 WriteFile 工具调用以真正落盘，禁止用文字描述代替。"
 				prompt += "\n用户原始任务: " + task
-				// 再给一轮机会
 				resp2, err2 := llm.Generate(ctx, prompt)
 				if err2 == nil {
 					if req2 := parseToolCall(resp2); req2 != nil {
@@ -101,20 +179,89 @@ func executeWithTools(
 						allResults = append(allResults, result)
 						continue
 					}
-					// 仍不调用工具：返回带警告的最终结果
-					return resp2 + "\n[警告: LLM 声称写文件但未实际调用 WriteFile]", allResults
 				}
+				return resp + "\n[警告: LLM 声称写文件但未实际调用 WriteFile]", allResults
 			}
-			// 不是工具调用，视为最终答案
+
+			// 情况 2：任务要求写文件，但还没成功 WriteFile，且 LLM 想直接给文字答案
+			// → 不接受，强制继续要求 WriteFile（除非已是最后一轮）
+			if needWrite && !alreadyWritten {
+				if round < maxRounds-1 {
+					emit("intend", "任务要求写文件但尚未落盘，拒绝文字答案，强制要求调用 WriteFile")
+					forcePrompt := prompt + "\n\n[系统提示] 任务要求创建/写入文件，但你尚未调用 WriteFile。" +
+						"请立即输出 WriteFile 工具调用，将完整代码写入目标路径。禁止再用文字描述。"
+					resp2, err2 := llm.Generate(ctx, forcePrompt)
+					if err2 == nil {
+						if req2 := parseToolCall(resp2); req2 != nil {
+							result := executor.Execute(ctx, req2.Tool, req2.Args)
+							allResults = append(allResults, result)
+							if result.Success && result.Tool == "WriteFile" {
+								emit("think", "WriteFile 成功，任务完成")
+								return resp2, allResults
+							}
+							continue
+						}
+					}
+					// 仍不调用 → 继续下一轮（下一轮还会再逼一次），直至耗尽
+					continue
+				}
+				// 最后一轮仍未写文件 → 返回明确失败标记
+				emit("error", "达到最大轮数仍未通过 WriteFile 落盘，任务失败")
+				return "[失败: 任务要求写文件但未调用 WriteFile 落盘] " + resp, allResults
+			}
+
+			emit("think", "LLM 未调用工具，视为最终答案")
 			return resp, allResults
 		}
 
 		// 执行工具
+		argsStr, _ := json.Marshal(toolReq.Args)
+		emitDetail("tool_call", fmt.Sprintf("调用工具 %s", toolReq.Tool), string(argsStr))
 		result := executor.Execute(ctx, toolReq.Tool, toolReq.Args)
 		allResults = append(allResults, result)
+		if result.Success {
+			out := result.Output
+			if len(out) > 200 {
+				out = out[:200] + "..."
+			}
+			emitDetail("tool_result", fmt.Sprintf("工具 %s 执行成功", toolReq.Tool), out)
+		} else {
+			emit("error", fmt.Sprintf("工具 %s 执行失败: %s", toolReq.Tool, result.Error))
+		}
 	}
 
 	return "达到最大工具调用轮数", allResults
+}
+
+// taskRequiresWriteFile 判断任务是否要求创建/写入文件。
+// 用于"完成门控"：此类任务必须见到成功的 WriteFile 才算完成。
+func taskRequiresWriteFile(task string) bool {
+	lower := strings.ToLower(task)
+	verbs := []string{
+		"写", "创建", "生成", "实现", "编写", "开发", "保存", "落盘",
+		"write", "create", "generate", "implement", "build", "save",
+	}
+	fileHints := []string{
+		"文件", "代码", "脚本", "程序", "游戏", "页面", "demo", "示例",
+		"file", "code", "script", "program", "game", "page",
+		".go", ".py", ".js", ".ts", ".html", ".css", ".md", ".json",
+	}
+	hasVerb := false
+	for _, v := range verbs {
+		if strings.Contains(lower, v) {
+			hasVerb = true
+			break
+		}
+	}
+	if !hasVerb {
+		return false
+	}
+	for _, h := range fileHints {
+		if strings.Contains(lower, h) {
+			return true
+		}
+	}
+	return false
 }
 
 // claimsFileWrite 粗略检测 LLM 文本是否声称已经写入/创建了文件
@@ -191,6 +338,8 @@ func executeAssistantWithTools(
 	task string,
 	state *types.ThreeLayerState,
 	skillBrief string,
+	progress ProgressCallback,
+	agentName string,
 ) (string, []*ToolResult) {
 	if modelFactory == nil {
 		return "", nil
@@ -205,5 +354,5 @@ func executeAssistantWithTools(
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	return executeWithTools(ctx, llm, executor, roleDef, task, state, skillBrief)
+	return executeWithTools(ctx, llm, executor, roleDef, task, state, skillBrief, progress, agentName)
 }

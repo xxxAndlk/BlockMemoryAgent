@@ -63,6 +63,11 @@ func NewSessionManager(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry) *
 		m.handleToolResult(result)
 	}))
 
+	// 将进度回调注入图，把 Agent 的思考/意图/工具调用实时推给会话事件流
+	g.SetProgressCallback(graph.ProgressCallback(func(ev graph.ProgressEvent) {
+		m.handleProgress(ev)
+	}))
+
 	return m
 }
 
@@ -73,15 +78,52 @@ func (m *SessionManager) SetPostgresStore(pg *store.PostgresStore) {
 
 // handleToolResult 处理工具执行结果，将其广播到当前运行中的会话
 func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
+	// 注意：不能在持有 m.mu.RLock 的情况下调用 addEvent（addEvent 内部取 Lock，
+	// 同 goroutine RLock+Lock 会自死锁，导致会话卡死）。先在 RLock 下收集目标
+	// 会话指针，释放后再写事件。
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	// 找到当前运行中的会话
+	targets := make([]*Session, 0, 1)
 	for _, session := range m.sessions {
 		if session.Status == "running" {
-			m.addEvent(session, "tool_exec", "ToolExecutor", fmt.Sprintf("执行工具: %s", result.Tool),
-				result.Tool, result.Path, result.Output, result.Error, result.Success)
+			targets = append(targets, session)
 		}
+	}
+	m.mu.RUnlock()
+
+	for _, session := range targets {
+		m.addEvent(session, "tool_exec", "ToolExecutor", fmt.Sprintf("执行工具: %s", result.Tool),
+			result.Tool, result.Path, result.Output, result.Error, result.Success)
+	}
+}
+
+// handleProgress 把 graph 的进度事件转为会话事件，推到当前运行中的会话。
+// 事件类型映射:
+//
+//	think / intend / llm / wait -> "progress"
+//	tool_call / tool_result     -> "progress"（tool_exec 仍由 handleToolResult 单独发）
+//	error                       -> "progress"（标记 success=false）
+func (m *SessionManager) handleProgress(ev graph.ProgressEvent) {
+	msg := ev.Message
+	if ev.Detail != "" {
+		d := ev.Detail
+		if len(d) > 300 {
+			d = d[:300] + "..."
+		}
+		msg += "\n" + d
+	}
+	success := ev.Kind != "error"
+
+	m.mu.RLock()
+	targets := make([]*Session, 0, 1)
+	for _, session := range m.sessions {
+		if session.Status == "running" {
+			targets = append(targets, session)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, session := range targets {
+		m.addEvent(session, "progress", ev.Agent, msg, "", "", "", "", success)
 	}
 }
 
