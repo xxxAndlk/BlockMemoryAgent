@@ -376,6 +376,63 @@ func (s *PostgresStore) SaveDecisionLog(ctx context.Context, topicID, agentID, d
 	return err
 }
 
+// SessionHistoryRecord 跨会话历史摘要
+type SessionHistoryRecord struct {
+	SessionID   string    `json:"session_id"`
+	Goal        string    `json:"goal"`
+	Summary     string    `json:"summary"`
+	ToolResults []map[string]any `json:"tool_results"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// SaveSessionHistory 持久化一次会话的 goal/summary/工具调用结果
+func (s *PostgresStore) SaveSessionHistory(ctx context.Context, rec *SessionHistoryRecord) error {
+	if rec.ToolResults == nil {
+		rec.ToolResults = []map[string]any{}
+	}
+	data, err := json.Marshal(rec.ToolResults)
+	if err != nil {
+		return fmt.Errorf("marshal tool_results: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO session_history (session_id, goal, summary, tool_results, created_at)
+		VALUES ($1, $2, $3, $4, COALESCE($5, NOW()))
+		ON CONFLICT DO NOTHING
+	`, rec.SessionID, rec.Goal, rec.Summary, data, rec.CreatedAt)
+	return err
+}
+
+// RecentSessionHistories 返回最近 limit 条会话历史（按时间倒序）
+func (s *PostgresStore) RecentSessionHistories(ctx context.Context, limit int) ([]*SessionHistoryRecord, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT session_id, goal, summary, tool_results, created_at
+		FROM session_history
+		ORDER BY created_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*SessionHistoryRecord
+	for rows.Next() {
+		var r SessionHistoryRecord
+		var raw []byte
+		if err := rows.Scan(&r.SessionID, &r.Goal, &r.Summary, &raw, &r.CreatedAt); err != nil {
+			continue
+		}
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &r.ToolResults)
+		}
+		out = append(out, &r)
+	}
+	return out, nil
+}
+
 // pgVector 将 float32 切片转为 pgvector 字符串格式 [1,2,3]
 func pgVector(v []float32) string {
 	if len(v) == 0 {

@@ -40,7 +40,13 @@
       "Read(//c/Program Files/**)",
       "Bash(powershell.exe -Command \"Get-Command docker -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
       "Bash(powershell.exe *)",
-      "Bash(wsl.exe *)"
+      "Bash(wsl.exe *)",
+      "Bash(redis-cli -h localhost -p 6379 -a blockmemory_dev ping)",
+      "Bash(PGPASSWORD=blockmemory_dev psql -h localhost -U blockmemory -d blockmemory -c \"select 1;\")",
+      "Bash(docker version *)",
+      "Bash(docker exec *)",
+      "Bash(go env *)",
+      "Bash(GOTOOLCHAIN=local go test ./... -count=1)"
     ]
   }
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/internal/graph"
+	"github.com/blockmemory/agent/internal/store"
 	"github.com/blockmemory/agent/pkg/types"
 )
 
@@ -46,6 +47,7 @@ type SessionManager struct {
 	graph    *graph.ThreeLayerGraph
 	registry *graph.RoleRegistry
 	seq      atomic.Int64
+	pgStore  *store.PostgresStore
 }
 
 // NewSessionManager 创建会话管理器
@@ -62,6 +64,11 @@ func NewSessionManager(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry) *
 	}))
 
 	return m
+}
+
+// SetPostgresStore 注入 Postgres 存储，用于会话结束时落历史
+func (m *SessionManager) SetPostgresStore(pg *store.PostgresStore) {
+	m.pgStore = pg
 }
 
 // handleToolResult 处理工具执行结果，将其广播到当前运行中的会话
@@ -160,6 +167,9 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 
 	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", false)
 
+	// 持久化会话历史（跨会话记忆基础）
+	m.persistHistory(session)
+
 	// 报告超时统计
 	if metaNode, ok := m.graph.GetNode("MetaAgent"); ok {
 		if ma, ok := metaNode.(*graph.MetaAgentNode); ok {
@@ -171,6 +181,45 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 			}
 		}
 	}
+}
+
+// persistHistory 把会话目标/总结/工具调用结果写入 session_history 表
+func (m *SessionManager) persistHistory(session *Session) {
+	if m.pgStore == nil {
+		return
+	}
+	toolResults := make([]map[string]any, 0, len(session.Events))
+	for _, ev := range session.Events {
+		if ev.Type != "tool_exec" {
+			continue
+		}
+		toolResults = append(toolResults, map[string]any{
+			"tool":   ev.Tool,
+			"path":   ev.ToolPath,
+			"output": truncate(ev.ToolOutput, 500),
+			"error":  ev.ToolError,
+			"ok":     ev.Success,
+		})
+	}
+	rec := &store.SessionHistoryRecord{
+		SessionID:   session.ID,
+		Goal:        session.Goal,
+		Summary:     truncate(session.Result, 2000),
+		ToolResults: toolResults,
+		CreatedAt:   time.Now(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.pgStore.SaveSessionHistory(ctx, rec); err != nil {
+		log.Printf("[%s] persist history: %v", session.ID, err)
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...(truncated)"
 }
 
 func (m *SessionManager) addEvent(session *Session, eventType, agent, message, tool, toolPath, toolOutput, toolError string, success bool) {

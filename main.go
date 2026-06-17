@@ -100,6 +100,9 @@ func main() {
 	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
 	metaAgent.SetModelFactory(modelFactory)
 	metaAgent.SetRuntime(rt)
+	if pgStore != nil {
+		metaAgent.SetHistoryStore(&pgHistoryAdapter{pg: pgStore})
+	}
 	escalation := graph.NewEscalationHandlerNode()
 	sinker := &sinkerNode{}
 	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
@@ -112,6 +115,7 @@ func main() {
 
 	// 初始化会话管理器
 	sessionMgr := server.NewSessionManager(threeLayerGraph, registry)
+	sessionMgr.SetPostgresStore(pgStore)
 
 	// 路由
 	mux := http.NewServeMux()
@@ -186,6 +190,29 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 
 		http.NotFound(w, r)
 	}
+}
+
+// pgHistoryAdapter 把 *store.PostgresStore 适配为 graph.HistoryStore
+type pgHistoryAdapter struct {
+	pg *store.PostgresStore
+}
+
+func (a *pgHistoryAdapter) RecentSessionHistories(ctx context.Context, limit int) ([]graph.HistoryEntry, error) {
+	recs, err := a.pg.RecentSessionHistories(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]graph.HistoryEntry, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, graph.HistoryEntry{
+			SessionID:   r.SessionID,
+			Goal:        r.Goal,
+			Summary:     r.Summary,
+			ToolResults: r.ToolResults,
+			CreatedAt:   r.CreatedAt,
+		})
+	}
+	return out, nil
 }
 
 // sinkerNode 终止节点
