@@ -139,7 +139,7 @@ config/skills.yaml ─► skill.Pool
 
 ## 4. 实施顺序与提交记录
 
-实施严格按 v3 章节顺序，每个模块完成后立即跑 `go build ./...` 和该模块的单元测试，以避免一次性大改导致的回归。
+实施严格按 v3 章节顺序，每个模块完成后立即跑 `go build ./backend/...` 和该模块的单元测试，以避免一次性大改导致的回归。
 
 ```
 1. Skill 库 ─────────► 单元测试通过
@@ -156,7 +156,7 @@ config/skills.yaml ─► skill.Pool
 
 ## 5. 测试结果摘要
 
-`GOTOOLCHAIN=local go test ./... -count=1` 输出（关键行）：
+`GOTOOLCHAIN=local go test ./backend/... -count=1` 输出（关键行）：
 
 ```
 ok  	internal/board          0.094s

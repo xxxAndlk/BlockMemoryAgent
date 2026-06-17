@@ -55,7 +55,30 @@
       "Bash(timeout 5 python snake.py)",
       "Bash(echo \"exit=$?\")",
       "Bash(python snake.py)",
-      "PowerShell(Get-Process *)"
+      "PowerShell(Get-Process *)",
+      "Bash(npm --version)",
+      "Bash(npx create-vite@latest frontend --template vue-ts)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "PowerShell(Start-Sleep -Seconds 2; try { $r = Invoke-WebRequest -Uri 'http://localhost:10010/' -UseBasicParsing -TimeoutSec 5; Write-Output \\('status=' + $r.StatusCode\\); Write-Output $r.Content.Substring\\(0, 200\\) } catch { Write-Output 'fail' })",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri 'http://localhost:10010/assets/index-C7kdK-iC.js' -UseBasicParsing -TimeoutSec 5; Write-Output \\('js_status=' + $r.StatusCode\\) } catch { Write-Output 'js_fail' })",
+      "PowerShell(Start-Sleep -Seconds 2; try { $r = Invoke-WebRequest -Uri 'http://localhost:10010/' -UseBasicParsing -TimeoutSec 5; Write-Output \\('status=' + $r.StatusCode\\) } catch { Write-Output 'fail' }; try { $r = Invoke-WebRequest -Uri 'http://localhost:10010/assets/index-C7kdK-iC.js' -UseBasicParsing -TimeoutSec 5; Write-Output \\('js=' + $r.StatusCode\\) } catch { Write-Output 'js_fail' })",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri 'http://localhost:10010/api/sessions' -UseBasicParsing -TimeoutSec 5; Write-Output \\('api=' + $r.StatusCode\\) } catch { Write-Output 'api_fail' })",
+      "Bash(docker stop *)",
+      "Bash(docker rm *)",
+      "Bash(docker volume *)",
+      "Bash(mkdir -p backend)",
+      "Bash(git mv *)",
+      "Bash(rmdir -p)",
+      "Bash(rmdir -- \"-p\")",
+      "Bash(rmdir \"./-p\")",
+      "Bash(xargs sed -i 's|github.com/blockmemory/agent/|github.com/blockmemory/agent/backend/|g')",
+      "Bash(GOTOOLCHAIN=local go env GOWORK)",
+      "Bash(GOTOOLCHAIN=local go build ./backend/...)",
+      "Bash(GOTOOLCHAIN=local go test ./backend/... -count=1)",
+      "Bash(GOTOOLCHAIN=local go vet ./backend/...)",
+      "Bash(tasklist /FI \"PID eq 9068\")",
+      "Bash(GOTOOLCHAIN=local go run ./backend)"
     ]
   }
 }

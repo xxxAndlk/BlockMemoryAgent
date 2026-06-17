@@ -266,7 +266,7 @@ import (
 
     "github.com/cloudwego/eino/components/model"
     "github.com/cloudwego/eino/compose"
-    "github.com/blockmemory/agent/pkg/config"
+    "github.com/blockmemory/agent/backend/pkg/config"
 )
 
 // ChatModelFactory ChatModel 工厂
@@ -368,8 +368,8 @@ import (
 
     "github.com/cloudwego/eino/components/model"
     "github.com/cloudwego/eino/schema"
-    "github.com/blockmemory/agent/pkg/config"
-    "github.com/blockmemory/agent/pkg/types"
+    "github.com/blockmemory/agent/backend/pkg/config"
+    "github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // ChatModelFactory 模型工厂接口

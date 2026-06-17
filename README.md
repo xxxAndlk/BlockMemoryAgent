@@ -100,10 +100,10 @@ fixed_roles:
 
 ```bash
 # 命令行演示
-go run cmd/demo/main.go
+go run ./backend/cmd/demo/main.go
 
 # TUI 终端可视化
-go run cmd/tui/main.go
+go run ./backend/cmd/tui/main.go
 ```
 
 ---
@@ -112,22 +112,27 @@ go run cmd/tui/main.go
 
 ```
 .
-├── cmd/
-│   ├── demo/          # 三层架构命令行演示
-│   └── tui/           # bubbletea 终端可视化
+├── backend/
+│   ├── cmd/
+│   │   ├── demo/          # 三层架构命令行演示
+│   │   ├── tui/           # bubbletea 终端可视化
+│   │   └── memory-console/
+│   ├── internal/
+│   │   ├── graph/         # 三层/四层图编排（Meta/Domain/SubDomain/Assistant）
+│   │   ├── memory/        # 记忆模块（压缩、检索、组装、快照）
+│   │   ├── model/         # Eino ChatModel 工厂与客户端
+│   │   ├── retriever/     # 全局知识库检索
+│   │   ├── server/        # API 与 TUI 事件广播
+│   │   └── store/         # PostgreSQL + Redis 存储
+│   ├── pkg/
+│   │   ├── config/        # 配置加载
+│   │   └── types/         # 核心类型定义
+│   ├── go.mod
+│   └── main.go            # HTTP 服务入口
 ├── config/
 │   └── roles.yaml     # 角色与模型配置
-├── internal/
-│   ├── graph/         # 三层/四层图编排（Meta/Domain/SubDomain/Assistant）
-│   ├── memory/        # 记忆模块（压缩、检索、组装、快照）
-│   ├── model/         # Eino ChatModel 工厂与客户端
-│   ├── retriever/     # 全局知识库检索
-│   ├── server/        # API 与 TUI 事件广播
-│   └── store/         # PostgreSQL + Redis 存储
 ├── migrations/        # 数据库 Schema
-├── pkg/
-│   ├── config/        # 配置加载
-│   └── types/         # 核心类型定义
+├── go.work            # 工作区，指向 ./backend
 ├── ARCHITECTURE.md    # 三层架构详细设计
 ├── AGENT_MODEL_CONFIG.md  # 模型配置设计
 └── README.md
@@ -193,7 +198,7 @@ go run cmd/tui/main.go
 ### 命令行演示
 
 ```bash
-$ go run cmd/demo/main.go
+$ go run ./backend/cmd/demo/main.go
 
 === 角色配置加载完成 ===
 固定角色数量: 5
@@ -222,7 +227,7 @@ DomainAgent 模型: gpt-4o
 ### TUI 终端
 
 ```bash
-$ go run cmd/tui/main.go
+$ go run ./backend/cmd/tui/main.go
 ```
 
 界面布局：

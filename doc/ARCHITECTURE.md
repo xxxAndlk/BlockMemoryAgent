@@ -346,7 +346,7 @@ Assistant(代码助手) 遇到需要UI协助时
 ## 运行演示
 
 ```bash
-cd cmd/demo
+cd backend/cmd/demo
 go run main.go
 ```
 

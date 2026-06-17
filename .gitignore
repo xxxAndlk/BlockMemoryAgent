@@ -4,3 +4,9 @@
 .env
 blockmemory-agent
 blockmemory-agent.exe
+tui.exe
+/backend/blockmemory-agent
+/backend/blockmemory-agent.exe
+/backend/tui
+/backend/tui.exe
+go.work.sum

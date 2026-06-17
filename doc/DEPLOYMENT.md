@@ -89,7 +89,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 ```bash
 # 编译
-go build -o blockmemory-agent .
+go build -o blockmemory-agent ./backend
 
 # 运行
 ./blockmemory-agent
@@ -241,7 +241,7 @@ cp .env.example .env
 # 编辑 .env 填入实际值
 
 # 编译并运行
-go build -o blockmemory-agent .
+go build -o blockmemory-agent ./backend
 ./blockmemory-agent
 ```
 
@@ -253,13 +253,13 @@ go build -o blockmemory-agent .
 
 ```bash
 # Linux
-GOOS=linux GOARCH=amd64 go build -o blockmemory-agent .
+GOOS=linux GOARCH=amd64 go build -o blockmemory-agent ./backend
 
 # Windows
-GOOS=windows GOARCH=amd64 go build -o blockmemory-agent.exe .
+GOOS=windows GOARCH=amd64 go build -o blockmemory-agent.exe ./backend
 
 # macOS (Apple Silicon)
-GOOS=darwin GOARCH=arm64 go build -o blockmemory-agent .
+GOOS=darwin GOARCH=arm64 go build -o blockmemory-agent ./backend
 ```
 
 ### 5.2 部署文件结构

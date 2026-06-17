@@ -229,7 +229,7 @@ cp .env.example .env  # 填入 OPENAI_API_KEY
 ### 6.2 启动主进程
 
 ```bash
-GOTOOLCHAIN=local go run . \
+GOTOOLCHAIN=local go run ./backend \
   -config config/config.yaml \
   -roles  config/roles.yaml \
   -soul   config/soul.md \
@@ -240,7 +240,7 @@ GOTOOLCHAIN=local go run . \
 ### 6.3 直接跑测试
 
 ```bash
-GOTOOLCHAIN=local go test ./... -count=1
+GOTOOLCHAIN=local go test ./backend/... -count=1
 ```
 
 ### 6.4 离线模式

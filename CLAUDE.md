@@ -6,29 +6,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BlockMemoryAgent — Go multi-agent orchestration system built on CloudWeGo Eino. Four-layer agent hierarchy (MetaAgent → DomainAgent → SubDomainAgent → Assistant) with block-scoped private memory, three-tier storage (PostgreSQL + Redis + pgvector), and a bubbletea TUI / HTTP web UI.
 
-Go module: `github.com/blockmemory/agent`. Go 1.25 (requires `GOTOOLCHAIN=local` on machines whose default Go is older — repo tests use this flag).
+Go module: `github.com/blockmemory/agent/backend` (source under `backend/`, root `go.work` points at `./backend`). Go 1.25 (requires `GOTOOLCHAIN=local` on machines whose default Go is older — repo tests use this flag).
 
 ## Common commands
 
 ```bash
 # Run HTTP server (main entrypoint — wires graph, runtime, session manager, /api/sessions + /static)
-go run .
+go run ./backend
 
 # Run CLI demo (three-layer flow, prints role instances created)
-go run cmd/demo/main.go
+go run ./backend/cmd/demo/main.go
 
 # Run bubbletea TUI
-go run cmd/tui/main.go
+go run ./backend/cmd/tui/main.go
 
 # Memory inspection console
-go run cmd/memory-console/main.go
+go run ./backend/cmd/memory-console/main.go
 
 # All tests
-GOTOOLCHAIN=local go test ./... -count=1
+GOTOOLCHAIN=local go test ./backend/... -count=1
 
 # Single package / test
-go test ./internal/board/...
-go test ./test/aiopstest -run TestScenarioA_AlertStormAndRootCause -v
+go test ./backend/internal/board/...
 
 # Postgres + Redis via docker (pgvector image)
 docker compose -f docker/docker-compose.yml up -d
