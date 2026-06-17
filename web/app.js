@@ -2,6 +2,7 @@ const API = '';
 
 let currentEventSource = null;
 let currentSessionId = null;
+let lastEventCount = 0;
 
 async function createSession() {
     const input = document.getElementById('goal-input');
@@ -54,8 +55,9 @@ function renderSessions(sessions) {
         const statusClass = 'status-' + s.status;
         const statusText = { running: 'Running', completed: 'Done', error: 'Failed' }[s.status] || s.status;
         const time = new Date(s.started_at).toLocaleTimeString();
+        const runningClass = s.status === 'running' ? ' running-pulse' : '';
         return `
-            <div class="session-card${currentSessionId === s.id ? ' active' : ''}" onclick="openDetail('${s.id}')">
+            <div class="session-card${currentSessionId === s.id ? ' active' : ''}${runningClass}" onclick="openDetail('${s.id}')">
                 <div class="goal">${esc(s.goal)}</div>
                 <div class="meta">
                     <span class="time">${time}</span>
@@ -72,6 +74,7 @@ function openDetail(sessionId) {
     detail.style.display = 'flex';
     document.getElementById('events-list').innerHTML = '';
     document.getElementById('event-count').textContent = '0';
+    lastEventCount = 0;
 
     fetchSessionDetail(sessionId);
     refreshSessions();
@@ -132,40 +135,50 @@ function renderDetailHeader(session) {
 
 function renderEvents(events) {
     const list = document.getElementById('events-list');
-    list.innerHTML = events.map(ev => eventHtml(ev)).join('');
+    list.innerHTML = events.map((ev, idx) => eventHtml(ev, idx)).join('');
     document.getElementById('event-count').textContent = events.length;
     list.scrollTop = list.scrollHeight;
+    lastEventCount = events.length;
 }
 
 function appendEvent(ev) {
     const list = document.getElementById('events-list');
-    list.insertAdjacentHTML('beforeend', eventHtml(ev));
+    const idx = list.children.length;
+    list.insertAdjacentHTML('beforeend', eventHtml(ev, idx));
     const count = list.children.length;
     document.getElementById('event-count').textContent = count;
     list.scrollTop = list.scrollHeight;
+    lastEventCount = count;
 }
 
-function eventHtml(ev) {
+function eventHtml(ev, idx) {
     const time = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
-    const cls = 'event-item event-' + (ev.type || '');
+    const kind = ev.kind || '';
+    const cls = kind ? ('event-item event-progress event-kind-' + kind) : ('event-item event-' + (ev.type || ''));
+    const kindLabel = kind ? `<span class="kind-badge kind-${kind}">${kind}</span>` : '';
 
     if (ev.type === 'tool_exec') {
         const statusIcon = ev.success ? '<span class="tool-success">OK</span>' : '<span class="tool-fail">FAIL</span>';
+        const hasOutput = !!(ev.tool_output && ev.tool_output.length > 0);
+        const hasError = !!(ev.tool_error && ev.tool_error.length > 0);
+        const outputId = 'tool-out-' + idx;
         let output = '';
-        if (ev.tool_output) {
+        if (hasOutput) {
             const short = ev.tool_output.length > 2000 ? ev.tool_output.slice(0, 2000) + '\n... (truncated)' : ev.tool_output;
-            output = `<div class="tool-output">${esc(short)}</div>`;
+            output = `<div id="${outputId}" class="tool-output" style="display:none">${esc(short)}</div>`;
         }
         let error = '';
-        if (ev.tool_error) {
+        if (hasError) {
             error = `<div class="tool-error">${esc(ev.tool_error)}</div>`;
         }
+        const toggleBtn = hasOutput ? `<button class="toggle-btn" onclick="toggleOutput('${outputId}',this)">show</button>` : '';
         return `
             <div class="${cls}">
                 <div class="event-header">
                     <span class="event-time">${time}</span>
                     <span class="tool-name">${esc(ev.tool)}</span>
                     ${ev.tool_path ? '<span class="tool-path">' + esc(ev.tool_path) + '</span>' : ''}
+                    ${toggleBtn}
                     ${statusIcon}
                 </div>
                 ${output}${error}
@@ -173,32 +186,68 @@ function eventHtml(ev) {
         `;
     }
 
+    // Simple markdown: code blocks, bold, newlines
+    const msgHtml = simpleMarkdown(ev.message || '');
+
     return `
         <div class="${cls}">
             <div class="event-header">
                 <span class="event-time">${time}</span>
                 <span class="event-agent">${esc(ev.agent || '')}</span>
+                ${kindLabel}
             </div>
-            <div class="event-msg">${esc(ev.message || '')}</div>
+            <div class="event-msg">${msgHtml}</div>
         </div>
     `;
 }
 
+function simpleMarkdown(text) {
+    if (!text) return '';
+    // Escape first
+    let html = esc(text);
+    // Code blocks ``` ... ```
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="code-block"><code>$2</code></pre>');
+    // Inline code `...`
+    html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+    // Bold **...**
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    // Newlines
+    html = html.replace(/\n/g, '<br>');
+    return html;
+}
+
+function toggleOutput(id, btn) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.style.display === 'none') {
+        el.style.display = 'block';
+        btn.textContent = 'hide';
+    } else {
+        el.style.display = 'none';
+        btn.textContent = 'show';
+    }
+}
+
 function renderSessionInfo(session) {
     const info = document.getElementById('session-info');
+    const resultHtml = session.result ? simpleMarkdown(session.result) : '-';
     const rows = [
         ['Session', session.id],
         ['Status', { running: 'Running', completed: 'Done', error: 'Failed' }[session.status] || session.status],
         ['Started', session.started_at ? new Date(session.started_at).toLocaleString() : '-'],
         ['Ended', session.ended_at ? new Date(session.ended_at).toLocaleString() : '-'],
-        ['Result', session.result || '-'],
     ];
     info.innerHTML = rows.map(r => `
         <div class="info-row">
             <span class="label">${r[0]}</span>
             <span class="value">${esc(r[1])}</span>
         </div>
-    `).join('');
+    `).join('') + `
+        <div class="info-row result-row">
+            <span class="label">Result</span>
+        </div>
+        <div class="result-body">${resultHtml}</div>
+    `;
 }
 
 function esc(s) {

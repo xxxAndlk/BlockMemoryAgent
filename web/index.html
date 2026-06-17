@@ -7,55 +7,369 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="app">
-        <header>
-            <h1>BlockMemoryAgent</h1>
-            <p class="subtitle">Local AI Dev Tool - Multi-Agent Orchestration</p>
-        </header>
-
-        <main>
-            <div class="input-section">
-                <div class="input-group">
-                    <textarea id="goal-input" placeholder="Enter task, e.g.: Read the main.go file and analyze the project structure" rows="3"></textarea>
-                    <button id="submit-btn" onclick="createSession()">Run</button>
+    <div id="app">
+        <!-- 左侧导航栏 -->
+        <aside class="sidebar">
+            <div class="sidebar-brand">
+                <div class="brand-icon">◆</div>
+                <div class="brand-text">
+                    <div class="brand-title">BlockMemory</div>
+                    <div class="brand-subtitle">Agent Console</div>
                 </div>
             </div>
-
-            <div class="workspace">
-                <div class="sessions-panel">
-                    <div class="panel-header">
-                        <h2>Sessions</h2>
-                        <button class="refresh-btn" onclick="refreshSessions()">Refresh</button>
+            <nav class="sidebar-nav">
+                <div class="nav-section">
+                    <div class="nav-label">Overview</div>
+                    <a href="#" class="nav-item active" data-view="dashboard" onclick="switchView('dashboard')">
+                        <span class="nav-icon">▤</span>
+                        <span class="nav-text">Dashboard</span>
+                    </a>
+                    <a href="#" class="nav-item" data-view="sessions" onclick="switchView('sessions')">
+                        <span class="nav-icon">◈</span>
+                        <span class="nav-text">Sessions</span>
+                        <span class="nav-badge" id="nav-session-count">0</span>
+                    </a>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-label">Explorer</div>
+                    <a href="#" class="nav-item" data-view="agents" onclick="switchView('agents')">
+                        <span class="nav-icon">⚇</span>
+                        <span class="nav-text">Agent Tree</span>
+                    </a>
+                    <a href="#" class="nav-item" data-view="board" onclick="switchView('board')">
+                        <span class="nav-icon">▦</span>
+                        <span class="nav-text">Task Board</span>
+                    </a>
+                    <a href="#" class="nav-item" data-view="memory" onclick="switchView('memory')">
+                        <span class="nav-icon">◉</span>
+                        <span class="nav-text">Memory</span>
+                    </a>
+                    <a href="#" class="nav-item" data-view="skills" onclick="switchView('skills')">
+                        <span class="nav-icon">⚙</span>
+                        <span class="nav-text">Skills</span>
+                    </a>
+                    <a href="#" class="nav-item" data-view="files" onclick="switchView('files')">
+                        <span class="nav-icon">▣</span>
+                        <span class="nav-text">Files</span>
+                    </a>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-label">System</div>
+                    <a href="#" class="nav-item" data-view="knowledge" onclick="switchView('knowledge')">
+                        <span class="nav-icon">◐</span>
+                        <span class="nav-text">Knowledge</span>
+                    </a>
+                    <a href="#" class="nav-item" data-view="history" onclick="switchView('history')">
+                        <span class="nav-icon">◫</span>
+                        <span class="nav-text">History</span>
+                    </a>
+                    <a href="#" class="nav-item" data-view="health" onclick="switchView('health')">
+                        <span class="nav-icon">◍</span>
+                        <span class="nav-text">Health</span>
+                    </a>
+                    <a href="#" class="nav-item" data-view="settings" onclick="switchView('settings')">
+                        <span class="nav-icon">⚙</span>
+                        <span class="nav-text">Settings</span>
+                    </a>
+                </div>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="health-indicators">
+                    <div class="hi-item" title="PostgreSQL">
+                        <span class="hi-dot" id="hi-pg"></span>
+                        <span class="hi-label">PG</span>
                     </div>
-                    <div id="sessions-list" class="sessions-list">
-                        <p class="empty-hint">No sessions yet</p>
+                    <div class="hi-item" title="Redis">
+                        <span class="hi-dot" id="hi-redis"></span>
+                        <span class="hi-label">RD</span>
+                    </div>
+                    <div class="hi-item" title="LLM API">
+                        <span class="hi-dot" id="hi-llm"></span>
+                        <span class="hi-label">LLM</span>
                     </div>
                 </div>
+                <div class="version">v3.0</div>
+            </div>
+        </aside>
 
-                <div id="session-detail" class="detail-panel" style="display:none">
-                    <div class="detail-header">
-                        <div class="detail-title">
-                            <span id="detail-status" class="status-badge"></span>
-                            <h2 id="detail-goal"></h2>
-                        </div>
-                        <button class="close-btn" onclick="closeDetail()">&times;</button>
+        <!-- 主内容区 -->
+        <main class="main">
+            <!-- 顶部栏 -->
+            <header class="topbar">
+                <div class="topbar-left">
+                    <div class="breadcrumb" id="breadcrumb">Dashboard</div>
+                    <h1 class="page-title" id="page-title">Overview</h1>
+                </div>
+                <div class="topbar-right">
+                    <div class="search-box">
+                        <input type="text" id="global-search" placeholder="Search sessions, agents, knowledge...">
+                        <button class="search-btn">🔍</button>
                     </div>
+                    <div class="topbar-actions">
+                        <button class="action-btn" id="pause-btn" onclick="togglePause()" title="Pause/Resume Graph">⏸</button>
+                        <button class="action-btn" title="Notifications">🔔</button>
+                    </div>
+                </div>
+            </header>
 
-                    <div class="detail-body">
-                        <div class="events-panel">
-                            <div class="panel-header">
-                                <h3>Execution Log</h3>
-                                <span id="event-count" class="event-count">0</span>
+            <!-- 视图容器 -->
+            <div class="view-container" id="view-container">
+
+                <!-- ========== Dashboard View ========== -->
+                <div class="view" id="view-dashboard">
+                    <div class="dashboard-grid">
+                        <div class="dash-card stats-card">
+                            <div class="dash-card-header">
+                                <h3>Today's Stats</h3>
                             </div>
-                            <div id="events-list" class="events-list"></div>
+                            <div class="stats-grid">
+                                <div class="stat-item">
+                                    <div class="stat-value" id="stat-sessions">0</div>
+                                    <div class="stat-label">Sessions</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" id="stat-completion">0%</div>
+                                    <div class="stat-label">Completion</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" id="stat-llm-calls">0</div>
+                                    <div class="stat-label">LLM Calls</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" id="stat-avg-time">0s</div>
+                                    <div class="stat-label">Avg Time</div>
+                                </div>
+                            </div>
                         </div>
-
-                        <div class="info-panel">
-                            <div class="panel-header"><h3>Info</h3></div>
-                            <div id="session-info" class="session-info"></div>
+                        <div class="dash-card">
+                            <div class="dash-card-header">
+                                <h3>Quick Start</h3>
+                            </div>
+                            <div class="quick-actions">
+                                <button class="qa-btn" onclick="quickStart('Analyze code structure')">🔍 Analyze Code</button>
+                                <button class="qa-btn" onclick="quickStart('Write a new module')">✏️ Write File</button>
+                                <button class="qa-btn" onclick="quickStart('Run tests and report')">▶️ Run Command</button>
+                                <button class="qa-btn" onclick="quickStart('Search knowledge base')">📚 Search KB</button>
+                            </div>
+                        </div>
+                        <div class="dash-card wide">
+                            <div class="dash-card-header">
+                                <h3>Recent Sessions</h3>
+                                <button class="refresh-btn" onclick="refreshSessions()">↻ Refresh</button>
+                            </div>
+                            <div class="session-table" id="dash-session-list">
+                                <div class="empty-state">No sessions yet. Create one to get started.</div>
+                            </div>
                         </div>
                     </div>
                 </div>
+
+                <!-- ========== Sessions View ========== -->
+                <div class="view" id="view-sessions" style="display:none">
+                    <div class="session-layout">
+                        <div class="session-list-panel">
+                            <div class="panel-header-bar">
+                                <h3>All Sessions</h3>
+                                <button class="refresh-btn" onclick="refreshSessions()">↻</button>
+                            </div>
+                            <div class="session-cards" id="session-cards">
+                                <div class="empty-state">No sessions</div>
+                            </div>
+                        </div>
+                        <div class="session-detail-panel" id="session-detail-panel">
+                            <div class="empty-state large">Select a session to view details</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== Agent Tree View ========== -->
+                <div class="view" id="view-agents" style="display:none">
+                    <div class="agent-layout">
+                        <div class="agent-tree-panel">
+                            <div class="panel-header-bar"><h3>Agent Hierarchy</h3></div>
+                            <div class="agent-tree" id="agent-tree">
+                                <div class="empty-state">Select a running session to view agents</div>
+                            </div>
+                        </div>
+                        <div class="agent-detail-panel" id="agent-detail-panel">
+                            <div class="empty-state large">Select an agent to view details</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== Task Board View ========== -->
+                <div class="view" id="view-board" style="display:none">
+                    <div class="board-layout">
+                        <div class="board-header">
+                            <div class="board-title" id="board-title">Task Board</div>
+                            <div class="board-status" id="board-status">--</div>
+                        </div>
+                        <div class="kanban-board" id="kanban-board">
+                            <div class="kanban-column" data-status="pending">
+                                <div class="kanban-header">Pending</div>
+                                <div class="kanban-items" id="kanban-pending"></div>
+                            </div>
+                            <div class="kanban-column" data-status="in_progress">
+                                <div class="kanban-header">In Progress</div>
+                                <div class="kanban-items" id="kanban-in_progress"></div>
+                            </div>
+                            <div class="kanban-column" data-status="blocked">
+                                <div class="kanban-header">Blocked</div>
+                                <div class="kanban-items" id="kanban-blocked"></div>
+                            </div>
+                            <div class="kanban-column" data-status="done">
+                                <div class="kanban-header">Done</div>
+                                <div class="kanban-items" id="kanban-done"></div>
+                            </div>
+                            <div class="kanban-column" data-status="failed">
+                                <div class="kanban-header">Failed</div>
+                                <div class="kanban-items" id="kanban-failed"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== Memory View ========== -->
+                <div class="view" id="view-memory" style="display:none">
+                    <div class="memory-layout">
+                        <div class="memory-agent-panel">
+                            <div class="panel-header-bar"><h3>Select Agent</h3></div>
+                            <div class="agent-selector" id="memory-agent-selector">
+                                <div class="empty-state">No active agents</div>
+                            </div>
+                        </div>
+                        <div class="memory-content-panel">
+                            <div class="panel-header-bar">
+                                <h3>Memory Snapshot</h3>
+                                <button class="refresh-btn" onclick="refreshMemory()">↻</button>
+                            </div>
+                            <div class="memory-tabs">
+                                <button class="mem-tab active" onclick="switchMemTab('snapshot')">Snapshot</button>
+                                <button class="mem-tab" onclick="switchMemTab('search')">Search</button>
+                                <button class="mem-tab" onclick="switchMemTab('compression')">Compression</button>
+                            </div>
+                            <div class="memory-tab-content" id="memory-content">
+                                <div class="empty-state">Select an agent to view memory</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== Skills View ========== -->
+                <div class="view" id="view-skills" style="display:none">
+                    <div class="skills-layout">
+                        <div class="skills-agent-panel">
+                            <div class="panel-header-bar"><h3>Select Agent</h3></div>
+                            <div class="agent-selector" id="skills-agent-selector">
+                                <div class="empty-state">No active agents</div>
+                            </div>
+                        </div>
+                        <div class="skills-content-panel">
+                            <div class="panel-header-bar"><h3>Equipped Skills</h3></div>
+                            <div class="skill-cards" id="skill-cards">
+                                <div class="empty-state">Select an agent to view skills</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== Files View ========== -->
+                <div class="view" id="view-files" style="display:none">
+                    <div class="files-layout">
+                        <div class="files-list-panel">
+                            <div class="panel-header-bar"><h3>Session Files</h3></div>
+                            <div class="file-list" id="file-list">
+                                <div class="empty-state">No files created yet</div>
+                            </div>
+                        </div>
+                        <div class="file-preview-panel">
+                            <div class="panel-header-bar">
+                                <h3>Preview</h3>
+                                <span class="file-path" id="preview-path"></span>
+                            </div>
+                            <pre class="file-preview" id="file-preview"><code>Select a file to preview</code></pre>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== Knowledge View ========== -->
+                <div class="view" id="view-knowledge" style="display:none">
+                    <div class="knowledge-layout">
+                        <div class="knowledge-search-panel">
+                            <div class="panel-header-bar"><h3>Knowledge Base Search</h3></div>
+                            <div class="kb-search-box">
+                                <input type="text" id="kb-query" placeholder="Enter query for semantic search...">
+                                <button class="btn-primary" onclick="searchKnowledge()">Search</button>
+                            </div>
+                        </div>
+                        <div class="knowledge-results" id="knowledge-results">
+                            <div class="empty-state">Search the knowledge base to see results</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== History View ========== -->
+                <div class="view" id="view-history" style="display:none">
+                    <div class="history-layout">
+                        <div class="panel-header-bar"><h3>Session History</h3></div>
+                        <div class="history-timeline" id="history-timeline">
+                            <div class="empty-state">No session history available</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== Health View ========== -->
+                <div class="view" id="view-health" style="display:none">
+                    <div class="health-grid">
+                        <div class="health-card">
+                            <div class="health-card-header">
+                                <div class="health-icon">🗄</div>
+                                <div class="health-title">PostgreSQL</div>
+                            </div>
+                            <div class="health-status" id="health-pg">Checking...</div>
+                            <div class="health-detail" id="health-pg-detail">--</div>
+                        </div>
+                        <div class="health-card">
+                            <div class="health-card-header">
+                                <div class="health-icon">⚡</div>
+                                <div class="health-title">Redis</div>
+                            </div>
+                            <div class="health-status" id="health-redis">Checking...</div>
+                            <div class="health-detail" id="health-redis-detail">--</div>
+                        </div>
+                        <div class="health-card">
+                            <div class="health-card-header">
+                                <div class="health-icon">🧠</div>
+                                <div class="health-title">LLM API</div>
+                            </div>
+                            <div class="health-status" id="health-llm">Checking...</div>
+                            <div class="health-detail" id="health-llm-detail">--</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== Settings View ========== -->
+                <div class="view" id="view-settings" style="display:none">
+                    <div class="settings-layout">
+                        <div class="settings-section">
+                            <h3>Soul Configuration</h3>
+                            <div class="soul-content" id="soul-content">
+                                <div class="empty-state">Loading soul configuration...</div>
+                            </div>
+                            <div class="settings-actions">
+                                <button class="btn-primary" onclick="saveSoul()">Save</button>
+                            </div>
+                        </div>
+                        <div class="settings-section">
+                            <h3>Temperature</h3>
+                            <div class="slider-row">
+                                <input type="range" id="temp-slider" min="0" max="100" value="30">
+                                <span class="slider-value" id="temp-value">0.3</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
             </div>
         </main>
     </div>

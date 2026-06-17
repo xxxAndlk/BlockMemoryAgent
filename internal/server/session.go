@@ -32,6 +32,7 @@ type SessionEvent struct {
 	Type       string    `json:"type"`
 	Agent      string    `json:"agent"`
 	Message    string    `json:"message"`
+	Kind       string    `json:"kind,omitempty"` // progress 子类型: think/intend/llm/tool_call/tool_result/wait/error
 	Tool       string    `json:"tool,omitempty"`
 	ToolPath   string    `json:"tool_path,omitempty"`
 	ToolOutput string    `json:"tool_output,omitempty"`
@@ -92,7 +93,7 @@ func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 
 	for _, session := range targets {
 		m.addEvent(session, "tool_exec", "ToolExecutor", fmt.Sprintf("执行工具: %s", result.Tool),
-			result.Tool, result.Path, result.Output, result.Error, result.Success)
+			"", result.Tool, result.Path, result.Output, result.Error, result.Success)
 	}
 }
 
@@ -123,7 +124,7 @@ func (m *SessionManager) handleProgress(ev graph.ProgressEvent) {
 	m.mu.RUnlock()
 
 	for _, session := range targets {
-		m.addEvent(session, "progress", ev.Agent, msg, "", "", "", "", success)
+		m.addEvent(session, "progress", ev.Agent, msg, ev.Kind, "", "", "", "", success)
 	}
 }
 
@@ -175,7 +176,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	state := types.NewThreeLayerState(session.ID)
 	state.DomainGoal = session.Goal
 
-	m.addEvent(session, "system", "MetaAgent", "会话启动，目标: "+session.Goal, "", "", "", "", false)
+	m.addEvent(session, "system", "MetaAgent", "会话启动，目标: "+session.Goal, "", "", "", "", "", false)
 
 	result, err := m.graph.Invoke(ctx, state)
 	if err != nil {
@@ -185,7 +186,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 		now := time.Now()
 		session.EndedAt = &now
 		m.mu.Unlock()
-		m.addEvent(session, "error", "System", "执行失败: "+err.Error(), "", "", "", "", false)
+		m.addEvent(session, "error", "System", "执行失败: "+err.Error(), "", "", "", "", "", false)
 		return
 	}
 
@@ -204,10 +205,10 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 		if roleDef != nil {
 			name = roleDef.Name
 		}
-		m.addEvent(session, "agent_done", name, fmt.Sprintf("类型: %s, 领域: %s, 状态: %s", inst.Type, inst.Domain, inst.Status), "", "", "", "", false)
+		m.addEvent(session, "agent_done", name, fmt.Sprintf("类型: %s, 领域: %s, 状态: %s", inst.Type, inst.Domain, inst.Status), "", "", "", "", "", false)
 	}
 
-	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", false)
+	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", "", false)
 
 	// 持久化会话历史（跨会话记忆基础）
 	m.persistHistory(session)
@@ -219,7 +220,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 			if calls > 0 {
 				m.addEvent(session, "stats", "System",
 					fmt.Sprintf("LLM统计: 调用%d次, 超时%d次, 平均%v, 最长%v", calls, timeouts, avg.Round(time.Millisecond), max.Round(time.Millisecond)),
-					"", "", "", "", false)
+					"", "", "", "", "", false)
 			}
 		}
 	}
@@ -264,11 +265,12 @@ func truncate(s string, n int) string {
 	return s[:n] + "...(truncated)"
 }
 
-func (m *SessionManager) addEvent(session *Session, eventType, agent, message, tool, toolPath, toolOutput, toolError string, success bool) {
+func (m *SessionManager) addEvent(session *Session, eventType, agent, message, kind, tool, toolPath, toolOutput, toolError string, success bool) {
 	ev := SessionEvent{
 		Type:       eventType,
 		Agent:      agent,
 		Message:    message,
+		Kind:       kind,
 		Tool:       tool,
 		ToolPath:   toolPath,
 		ToolOutput: toolOutput,
