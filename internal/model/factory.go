@@ -15,6 +15,21 @@ type LLMClient interface {
 	Generate(ctx context.Context, prompt string) (string, error)
 }
 
+// TemperatureAware 可选接口：支持 per-call temperature 覆盖。
+// EinoClient 实现此接口；mockClient 不实现，调用方需走 type assertion。
+type TemperatureAware interface {
+	GenerateWithOptions(ctx context.Context, prompt string, temperature float64) (string, error)
+}
+
+// GenerateWithTemperature 工具函数：若客户端实现 TemperatureAware
+// 则用 per-call 温度，否则退回到 Generate。
+func GenerateWithTemperature(ctx context.Context, c LLMClient, prompt string, temperature float64) (string, error) {
+	if t, ok := c.(TemperatureAware); ok {
+		return t.GenerateWithOptions(ctx, prompt, temperature)
+	}
+	return c.Generate(ctx, prompt)
+}
+
 // mockClient 无API Key时的回退客户端
 type mockClient struct{}
 

@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/blockmemory/agent/internal/model"
+	"github.com/blockmemory/agent/internal/runtime"
 	"github.com/blockmemory/agent/pkg/types"
 )
 
@@ -23,6 +24,7 @@ type ThreeLayerGraph struct {
 	factory      *RoleFactory
 	modelFactory *model.ModelFactory
 	toolCallback ToolCallback
+	rt           *runtime.Runtime
 }
 
 // ThreeLayerGraphBuilder 三层图构建器
@@ -32,6 +34,7 @@ type ThreeLayerGraphBuilder struct {
 	factory      *RoleFactory
 	modelFactory *model.ModelFactory
 	toolCallback ToolCallback
+	rt           *runtime.Runtime
 }
 
 // NewThreeLayerGraphBuilder 创建三层图构建器
@@ -58,6 +61,11 @@ func (b *ThreeLayerGraphBuilder) SetToolCallback(cb ToolCallback) {
 	b.toolCallback = cb
 }
 
+// SetRuntime 注入 Runtime（看板/邮箱/Watchdog/人格/Skill）
+func (b *ThreeLayerGraphBuilder) SetRuntime(rt *runtime.Runtime) {
+	b.rt = rt
+}
+
 // AddNode 添加节点
 func (b *ThreeLayerGraphBuilder) AddNode(node ThreeLayerNode) {
 	b.nodes[node.Name()] = node
@@ -71,9 +79,10 @@ func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
 		factory:      b.factory,
 		modelFactory: b.modelFactory,
 		toolCallback: b.toolCallback,
+		rt:           b.rt,
 	}
 
-	// 为已有节点注入 ModelFactory
+	// 为已有节点注入 ModelFactory / Runtime
 	for _, node := range g.nodes {
 		g.injectModelFactory(node)
 	}
@@ -81,7 +90,7 @@ func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
 	return g
 }
 
-// injectModelFactory 为节点注入模型工厂和工具回调
+// injectModelFactory 为节点注入模型工厂、工具回调、运行时
 func (g *ThreeLayerGraph) injectModelFactory(node ThreeLayerNode) {
 	if g.modelFactory != nil {
 		switch n := node.(type) {
@@ -101,7 +110,18 @@ func (g *ThreeLayerGraph) injectModelFactory(node ThreeLayerNode) {
 			n.SetToolCallback(g.toolCallback)
 		}
 	}
+	if g.rt != nil {
+		switch n := node.(type) {
+		case *MetaAgentNode:
+			n.SetRuntime(g.rt)
+		case *DomainAgentNode:
+			n.SetRuntime(g.rt)
+		}
+	}
 }
+
+// Runtime 暴露 Runtime（server 层使用）
+func (g *ThreeLayerGraph) Runtime() *runtime.Runtime { return g.rt }
 
 // Invoke 执行三层图
 func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {

@@ -196,7 +196,9 @@ func (n *SubDomainAgentNode) executeAssistantTask(ctx context.Context, def *type
 		if n.toolCallback != nil {
 			executor.SetCallback(n.toolCallback)
 		}
-		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state)
+		// SubDomainAgent 当前与父 Domain 共享 Skill 子集（通过父 ID 查）
+		var skillBrief string
+		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief)
 		if result != "" {
 			return result, nil
 		}

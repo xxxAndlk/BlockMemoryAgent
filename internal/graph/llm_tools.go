@@ -19,6 +19,10 @@ type ToolCallRequest struct {
 
 // executeWithTools 使用LLM+工具循环执行任务
 // LLM分析任务，决定调用哪些工具，执行后返回结果给LLM继续分析，直到完成
+//
+// 支持可选的 skillBrief：当 DomainAgent 已装配 Skill 子集时，将其作为
+// "可见技能列表"加入 system prompt，避免把全局 ToolExecutor 全部
+// 工具集对子 Agent 暴露（v3 §5.3）。
 func executeWithTools(
 	ctx context.Context,
 	llm model.LLMClient,
@@ -26,24 +30,32 @@ func executeWithTools(
 	roleDef *types.RoleDefinition,
 	task string,
 	state *types.ThreeLayerState,
+	skillBrief string,
 ) (string, []*ToolResult) {
 	var allResults []*ToolResult
+
+	skillSection := skillBrief
+	if skillSection == "" {
+		skillSection = `- ReadFile: 读取文件内容。参数: {"path": "文件路径"}
+- WriteFile: 写入文件。参数: {"path": "文件路径", "content": "文件内容"}
+- ListDir: 列出目录内容。参数: {"path": "目录路径"}
+- RunCommand: 执行shell命令。参数: {"command": "命令", "timeout": 秒数}
+- SearchInFiles: 在文件中搜索。参数: {"pattern": "搜索模式", "dir": "目录"}
+- HTTPGet: HTTP GET 请求。参数: {"url": "...", "headers": {...}}
+- HTTPPost: HTTP POST 请求。参数: {"url": "...", "headers": {...}, "body": {...}}`
+	}
 
 	systemPrompt := fmt.Sprintf(`%s
 
 你可以使用以下工具来完成任务:
 
-- ReadFile: 读取文件内容。参数: {"path": "文件路径"}
-- WriteFile: 写入文件。参数: {"path": "文件路径", "content": "文件内容"}
-- ListDir: 列出目录内容。参数: {"path": "目录路径"}
-- RunCommand: 执行shell命令。参数: {"command": "命令", "timeout": 秒数}
-- SearchInFiles: 在文件中搜索。参数: {"pattern": "搜索模式", "dir": "目录"}
+%s
 
 当你需要调用工具时，输出JSON格式:
 {"tool": "工具名", "args": {"参数名": "参数值"}}
 
 如果不需要工具，直接输出最终答案。
-每次只调用一个工具，等待结果后再决定下一步。`, roleDef.SystemPrompt)
+每次只调用一个工具，等待结果后再决定下一步。`, roleDef.SystemPrompt, skillSection)
 
 	contextInfo := ""
 	if state.CurrentDomain != "" {
@@ -128,6 +140,7 @@ func executeAssistantWithTools(
 	roleDef *types.RoleDefinition,
 	task string,
 	state *types.ThreeLayerState,
+	skillBrief string,
 ) (string, []*ToolResult) {
 	if modelFactory == nil {
 		return "", nil
@@ -142,5 +155,5 @@ func executeAssistantWithTools(
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	return executeWithTools(ctx, llm, executor, roleDef, task, state)
+	return executeWithTools(ctx, llm, executor, roleDef, task, state, skillBrief)
 }

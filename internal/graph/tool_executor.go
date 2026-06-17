@@ -3,7 +3,10 @@ package graph
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,6 +65,10 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 		result = e.runCommand(ctx, args)
 	case "SearchInFiles":
 		result = e.searchInFiles(args)
+	case "HTTPGet":
+		result = e.httpGet(ctx, args)
+	case "HTTPPost":
+		result = e.httpPost(ctx, args)
 	default:
 		result = &ToolResult{Tool: toolName, Error: fmt.Sprintf("unknown tool: %s", toolName)}
 	}
@@ -256,6 +263,137 @@ func (e *ToolExecutor) searchInFiles(args map[string]any) *ToolResult {
 		result.Output = result.Output[:10000] + "\n... (truncated)"
 	}
 	return result
+}
+
+// httpGet 执行 HTTP GET 请求
+func (e *ToolExecutor) httpGet(ctx context.Context, args map[string]any) *ToolResult {
+	url, _ := args["url"].(string)
+	if url == "" {
+		return &ToolResult{Tool: "HTTPGet", Error: "url is required"}
+	}
+
+	headers := parseStringMap(args["headers"])
+
+	timeout := e.timeout
+	if t, ok := args["timeout"].(float64); ok && t > 0 {
+		timeout = time.Duration(t) * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return &ToolResult{Tool: "HTTPGet", Path: url, Error: err.Error()}
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return &ToolResult{Tool: "HTTPGet", Path: url, Error: err.Error()}
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 最多 1MB
+	output := fmt.Sprintf("HTTP %d\n%s", resp.StatusCode, string(body))
+	if len(output) > 10000 {
+		output = output[:10000] + "\n... (truncated)"
+	}
+
+	return &ToolResult{
+		Tool:    "HTTPGet",
+		Success: resp.StatusCode >= 200 && resp.StatusCode < 300,
+		Output:  output,
+		Path:    url,
+	}
+}
+
+// httpPost 执行 HTTP POST 请求（默认 JSON Body）
+func (e *ToolExecutor) httpPost(ctx context.Context, args map[string]any) *ToolResult {
+	url, _ := args["url"].(string)
+	if url == "" {
+		return &ToolResult{Tool: "HTTPPost", Error: "url is required"}
+	}
+
+	headers := parseStringMap(args["headers"])
+
+	var bodyBytes []byte
+	if raw, ok := args["body"]; ok {
+		switch v := raw.(type) {
+		case string:
+			bodyBytes = []byte(v)
+		default:
+			b, err := json.Marshal(v)
+			if err != nil {
+				return &ToolResult{Tool: "HTTPPost", Path: url, Error: "marshal body: " + err.Error()}
+			}
+			bodyBytes = b
+			if _, ok := headers["Content-Type"]; !ok {
+				if headers == nil {
+					headers = make(map[string]string)
+				}
+				headers["Content-Type"] = "application/json"
+			}
+		}
+	}
+
+	timeout := e.timeout
+	if t, ok := args["timeout"].(float64); ok && t > 0 {
+		timeout = time.Duration(t) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return &ToolResult{Tool: "HTTPPost", Path: url, Error: err.Error()}
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return &ToolResult{Tool: "HTTPPost", Path: url, Error: err.Error()}
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	output := fmt.Sprintf("HTTP %d\n%s", resp.StatusCode, string(body))
+	if len(output) > 10000 {
+		output = output[:10000] + "\n... (truncated)"
+	}
+
+	return &ToolResult{
+		Tool:    "HTTPPost",
+		Success: resp.StatusCode >= 200 && resp.StatusCode < 300,
+		Output:  output,
+		Path:    url,
+	}
+}
+
+// parseStringMap 兼容 map[string]any / map[string]string
+func parseStringMap(raw any) map[string]string {
+	if raw == nil {
+		return nil
+	}
+	switch m := raw.(type) {
+	case map[string]string:
+		return m
+	case map[string]any:
+		out := make(map[string]string, len(m))
+		for k, v := range m {
+			if s, ok := v.(string); ok {
+				out[k] = s
+			} else {
+				out[k] = fmt.Sprint(v)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func (e *ToolExecutor) resolvePath(path string) string {

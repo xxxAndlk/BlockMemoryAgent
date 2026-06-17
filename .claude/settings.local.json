@@ -34,7 +34,13 @@
       "Bash(gh repo *)",
       "PowerShell(gh repo view firecrawl/firecrawl --json name,description,url,defaultBranchRef,latestRelease)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:docs.firecrawl.dev)"
+      "WebFetch(domain:docs.firecrawl.dev)",
+      "Bash(docker compose *)",
+      "Bash(where.exe docker *)",
+      "Read(//c/Program Files/**)",
+      "Bash(powershell.exe -Command \"Get-Command docker -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
+      "Bash(powershell.exe *)",
+      "Bash(wsl.exe *)"
     ]
   }
 }

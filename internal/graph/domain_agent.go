@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/internal/model"
+	"github.com/blockmemory/agent/internal/runtime"
+	"github.com/blockmemory/agent/internal/skill"
 	"github.com/blockmemory/agent/pkg/types"
 )
 
@@ -20,6 +22,7 @@ type DomainAgentNode struct {
 	modelFactory   *model.ModelFactory
 	toolCallback   ToolCallback
 	timeoutTracker *model.TimeoutTracker
+	rt             *runtime.Runtime
 }
 
 // NewDomainAgentNode 创建领域Agent节点
@@ -43,6 +46,11 @@ func (n *DomainAgentNode) SetToolCallback(cb ToolCallback) {
 	n.toolCallback = cb
 }
 
+// SetRuntime 注入 Runtime（板/邮箱/Skill）
+func (n *DomainAgentNode) SetRuntime(rt *runtime.Runtime) {
+	n.rt = rt
+}
+
 // Name 返回节点名称
 func (n *DomainAgentNode) Name() string {
 	return n.name
@@ -61,6 +69,9 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	}
 
 	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusActive)
+
+	// v3 §5：为本 DomainAgent 装配领域 Skill 子集（如未装配）
+	n.ensureSkillSet(ctx, inst, state)
 
 	tasks := n.analyzeTasks(ctx, state)
 
@@ -115,7 +126,26 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	return state, nil
 }
 
-// dispatchAssistantsParallel 并行调度助手执行任务
+// ensureSkillSet 确保该 DomainAgent 已装配 Skill 子集。
+//
+// 若未装配则按"领域名 + 目标"调用 Pool.AssembleSet 触发 LLM 选择，
+// 装配后通过 Registry 绑定到当前 agent 实例 ID。
+func (n *DomainAgentNode) ensureSkillSet(ctx context.Context, inst *types.RoleInstance, state *types.ThreeLayerState) {
+	if n.rt == nil || n.rt.Skills == nil {
+		return
+	}
+	if existing := n.rt.Skills.GetForAgent(n.instID); existing != nil {
+		return
+	}
+	var llm skill.LLMClient
+	if n.modelFactory != nil {
+		if c, err := n.modelFactory.GetDomainModel(ctx); err == nil {
+			llm = c
+		}
+	}
+	set := n.rt.Skills.Pool().AssembleSet(ctx, llm, n.instID, inst.Domain, state.DomainGoal, 8)
+	n.rt.Skills.Bind(set)
+}
 func (n *DomainAgentNode) dispatchAssistantsParallel(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, tasks []string) map[string]string {
 	results := make(map[string]string)
 	var mu sync.Mutex
@@ -207,7 +237,16 @@ func (n *DomainAgentNode) executeAssistantTask(ctx context.Context, def *types.R
 		if n.toolCallback != nil {
 			executor.SetCallback(n.toolCallback)
 		}
-		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state)
+
+		// 取出本 DomainAgent 装配的 Skill 列表（v3 §5）
+		var skillBrief string
+		if n.rt != nil && n.rt.Skills != nil {
+			if set := n.rt.Skills.GetForAgent(n.instID); set != nil {
+				skillBrief = set.PromptList()
+			}
+		}
+
+		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief)
 		if result != "" {
 			return result, nil
 		}

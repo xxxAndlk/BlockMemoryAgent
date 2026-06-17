@@ -12,7 +12,9 @@ import (
 	"github.com/blockmemory/agent/internal/config"
 	"github.com/blockmemory/agent/internal/graph"
 	"github.com/blockmemory/agent/internal/model"
+	"github.com/blockmemory/agent/internal/runtime"
 	"github.com/blockmemory/agent/internal/server"
+	"github.com/blockmemory/agent/internal/skill"
 	"github.com/blockmemory/agent/internal/store"
 	pkgconfig "github.com/blockmemory/agent/pkg/config"
 	"github.com/blockmemory/agent/pkg/types"
@@ -22,6 +24,8 @@ func main() {
 	configPath := flag.String("config", "config/config.yaml", "基础设施配置路径")
 	rolePath := flag.String("roles", "config/roles.yaml", "角色配置路径")
 	envPath := flag.String("env", ".env", "环境变量文件路径")
+	soulPath := flag.String("soul", "config/soul.md", "人格定义文件路径")
+	skillPath := flag.String("skills", "config/skills.yaml", "Skill 池 YAML 路径（可选）")
 	flag.Parse()
 
 	// 加载 .env 文件
@@ -78,13 +82,29 @@ func main() {
 	registry := graph.NewRoleRegistry(roleCfg)
 	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
 
+	// 加载 Skill 池：优先 yaml 文件，否则回退 BuiltinPool
+	var skillPool *skill.Pool
+	if _, err := os.Stat(*skillPath); err == nil {
+		if p, err := skill.LoadFromYAML(*skillPath); err == nil {
+			skillPool = p
+			log.Printf("Loaded skill pool from %s (count=%d)", *skillPath, len(p.All()))
+		} else {
+			log.Printf("load skill yaml failed, fallback to builtin: %v", err)
+		}
+	}
+
+	// 创建运行时（看板 / 邮箱 / Watchdog / 人格 / Skill 注册表）
+	rt := runtime.New(*soulPath, skillPool)
+
 	// 构建三层图
 	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
 	metaAgent.SetModelFactory(modelFactory)
+	metaAgent.SetRuntime(rt)
 	escalation := graph.NewEscalationHandlerNode()
 	sinker := &sinkerNode{}
 	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
 	builder.SetModelFactory(modelFactory)
+	builder.SetRuntime(rt)
 	builder.AddNode(metaAgent)
 	builder.AddNode(escalation)
 	builder.AddNode(sinker)

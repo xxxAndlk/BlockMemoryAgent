@@ -80,8 +80,21 @@ func (f *RoleFactory) CreateAssistant(ctx context.Context, sessionID, taskDesc s
 	return inst, nil
 }
 
-// generateDomainRoleDef 让大模型生成领域角色定义
+// generateDomainRoleDef 让大模型生成领域角色定义；无 modelFactory 时回退模板
 func (f *RoleFactory) generateDomainRoleDef(ctx context.Context, domain, goal string) (*types.RoleDefinition, error) {
+	roleDef := &types.RoleDefinition{
+		ID:          fmt.Sprintf("domain_%s_%d", sanitizeID(domain), f.seq.Add(1)),
+		Type:        types.RoleTypeDomain,
+		Lifecycle:   types.RoleLifecycleSession,
+		CanBeCalled: false,
+	}
+
+	// 无 modelFactory 时（测试 / 离线模式）直接走模板
+	if f.modelFactory == nil {
+		f.fillDomainTemplate(roleDef, domain, goal)
+		return roleDef, nil
+	}
+
 	prompt := fmt.Sprintf(`你需要为以下业务领域创建一个AI Agent角色定义。
 
 领域名称: %s
@@ -102,29 +115,18 @@ func (f *RoleFactory) generateDomainRoleDef(ctx context.Context, domain, goal st
 
 	llmClient, err := f.modelFactory.GetDomainModel(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("get domain model: %w", err)
+		f.fillDomainTemplate(roleDef, domain, goal)
+		return roleDef, nil
 	}
 
 	resp, err := llmClient.Generate(ctx, prompt)
 	if err != nil {
-		return nil, err
-	}
-
-	// 尝试解析LLM返回的JSON，失败则用模板
-	roleDef := &types.RoleDefinition{
-		ID:          fmt.Sprintf("domain_%s_%d", sanitizeID(domain), f.seq.Add(1)),
-		Type:        types.RoleTypeDomain,
-		Lifecycle:   types.RoleLifecycleSession,
-		CanBeCalled: false,
+		f.fillDomainTemplate(roleDef, domain, goal)
+		return roleDef, nil
 	}
 
 	if err := json.Unmarshal([]byte(extractJSON(resp)), roleDef); err != nil || roleDef.Name == "" {
-		// JSON解析失败，使用模板
-		roleDef.Name = domain + "负责人"
-		roleDef.Description = fmt.Sprintf("负责%s领域的上下文管理与任务分发", domain)
-		roleDef.SystemPrompt = fmt.Sprintf("你是%s领域的负责人。你的职责是：\n1. 管理该领域的上下文信息\n2. 分析任务并分发给合适的助手\n3. 汇总助手结果并输出\n\n领域目标: %s", domain, goal)
-		roleDef.Keywords = []string{domain, goal}
-		roleDef.Skills = []string{"任务分析", "上下文管理", "结果汇总"}
+		f.fillDomainTemplate(roleDef, domain, goal)
 	} else {
 		// 确保关键字段正确
 		roleDef.ID = fmt.Sprintf("domain_%s_%d", sanitizeID(domain), f.seq.Add(1))
@@ -136,8 +138,29 @@ func (f *RoleFactory) generateDomainRoleDef(ctx context.Context, domain, goal st
 	return roleDef, nil
 }
 
-// generateAssistantRoleDef 让大模型生成助手角色定义
+// fillDomainTemplate 用默认模板填充 RoleDefinition
+func (f *RoleFactory) fillDomainTemplate(roleDef *types.RoleDefinition, domain, goal string) {
+	roleDef.Name = domain + "负责人"
+	roleDef.Description = fmt.Sprintf("负责%s领域的上下文管理与任务分发", domain)
+	roleDef.SystemPrompt = fmt.Sprintf("你是%s领域的负责人。你的职责是：\n1. 管理该领域的上下文信息\n2. 分析任务并分发给合适的助手\n3. 汇总助手结果并输出\n\n领域目标: %s", domain, goal)
+	roleDef.Keywords = []string{domain, goal}
+	roleDef.Skills = []string{"任务分析", "上下文管理", "结果汇总"}
+}
+
+// generateAssistantRoleDef 让大模型生成助手角色定义；无 modelFactory 时使用模板
 func (f *RoleFactory) generateAssistantRoleDef(ctx context.Context, taskDesc, parentDefID string) (*types.RoleDefinition, error) {
+	roleDef := &types.RoleDefinition{
+		ID:          fmt.Sprintf("assistant_%d", f.seq.Add(1)),
+		Type:        types.RoleTypeDynamic,
+		Lifecycle:   types.RoleLifecycleTask,
+		CanBeCalled: true,
+		Parents:     []string{parentDefID},
+	}
+	if f.modelFactory == nil {
+		f.fillAssistantTemplate(roleDef, taskDesc)
+		return roleDef, nil
+	}
+
 	prompt := fmt.Sprintf(`你需要为以下任务创建一个专门的AI助手角色定义。
 
 任务描述: %s
@@ -158,28 +181,18 @@ func (f *RoleFactory) generateAssistantRoleDef(ctx context.Context, taskDesc, pa
 
 	llmClient, err := f.modelFactory.GetDomainModel(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("get domain model: %w", err)
+		f.fillAssistantTemplate(roleDef, taskDesc)
+		return roleDef, nil
 	}
 
 	resp, err := llmClient.Generate(ctx, prompt)
 	if err != nil {
-		return nil, err
-	}
-
-	roleDef := &types.RoleDefinition{
-		ID:          fmt.Sprintf("assistant_%d", f.seq.Add(1)),
-		Type:        types.RoleTypeDynamic,
-		Lifecycle:   types.RoleLifecycleTask,
-		CanBeCalled: true,
-		Parents:     []string{parentDefID},
+		f.fillAssistantTemplate(roleDef, taskDesc)
+		return roleDef, nil
 	}
 
 	if err := json.Unmarshal([]byte(extractJSON(resp)), roleDef); err != nil || roleDef.Name == "" {
-		roleDef.Name = "临时助手"
-		roleDef.Description = taskDesc
-		roleDef.SystemPrompt = fmt.Sprintf("你是一个专业助手。你的唯一任务是：%s\n\n请专注于此任务，不要处理无关事务。完成后立即返回结果。", taskDesc)
-		roleDef.Keywords = extractKeywords(taskDesc)
-		roleDef.Skills = []string{taskDesc}
+		f.fillAssistantTemplate(roleDef, taskDesc)
 	} else {
 		roleDef.ID = fmt.Sprintf("assistant_%d", f.seq.Add(1))
 		roleDef.Type = types.RoleTypeDynamic
@@ -189,6 +202,15 @@ func (f *RoleFactory) generateAssistantRoleDef(ctx context.Context, taskDesc, pa
 	}
 
 	return roleDef, nil
+}
+
+// fillAssistantTemplate 用默认模板填充
+func (f *RoleFactory) fillAssistantTemplate(roleDef *types.RoleDefinition, taskDesc string) {
+	roleDef.Name = "临时助手"
+	roleDef.Description = taskDesc
+	roleDef.SystemPrompt = fmt.Sprintf("你是一个专业助手。你的唯一任务是：%s\n\n请专注于此任务，不要处理无关事务。完成后立即返回结果。", taskDesc)
+	roleDef.Keywords = extractKeywords(taskDesc)
+	roleDef.Skills = []string{taskDesc}
 }
 
 // CreateSubDomainAgent 动态创建子领域Agent

@@ -1,0 +1,58 @@
+# BlockMemoryAgent Skill 池配置（v3 §5）
+#
+# 每个 Skill 是结构化对象：DomainAgent 在初始化时按 domain 字段
+# 筛选出与本领域相关的 Skill 子集，再交给 LLM 二次精简后下发。
+#
+# 严禁把整个 Skill 池暴露给子 Agent（参见 v3 §2.2 / §5.3）。
+
+skills:
+  # ---- 文件 / 代码类 ----
+  - skill_id: read_file
+    name: 读取文件
+    description: 读取本地文件并返回文本内容
+    domain: code,doc,*
+    tool_ref: ReadFile
+    tags: [io, fs]
+
+  - skill_id: write_file
+    name: 写入文件
+    description: 把文本内容写入本地文件
+    domain: code,doc,*
+    tool_ref: WriteFile
+    tags: [io, fs]
+
+  - skill_id: list_dir
+    name: 列出目录
+    description: 列出目录中的文件与子目录
+    domain: code,*
+    tool_ref: ListDir
+    tags: [io, fs]
+
+  - skill_id: search_in_files
+    name: 代码搜索
+    description: 在工作目录中按关键词搜索文件内容
+    domain: code,doc,*
+    tool_ref: SearchInFiles
+    tags: [search]
+
+  - skill_id: run_command
+    name: 执行命令
+    description: 在沙箱内执行 shell 命令并返回输出
+    domain: code,ops,*
+    tool_ref: RunCommand
+    tags: [shell]
+
+  # ---- HTTP / API 类（AIOps 测试场景使用） ----
+  - skill_id: http_get
+    name: HTTP GET
+    description: 对指定 URL 发起 GET 请求并返回 JSON/文本
+    domain: ops,api,*
+    tool_ref: HTTPGet
+    tags: [http]
+
+  - skill_id: http_post
+    name: HTTP POST
+    description: 对指定 URL 发起 POST 请求（带 JSON Body）
+    domain: ops,api,*
+    tool_ref: HTTPPost
+    tags: [http]

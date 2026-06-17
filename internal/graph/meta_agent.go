@@ -7,7 +7,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/internal/mailbox"
 	"github.com/blockmemory/agent/internal/model"
+	"github.com/blockmemory/agent/internal/runtime"
+	"github.com/blockmemory/agent/internal/soul"
+	"github.com/blockmemory/agent/internal/watchdog"
 	"github.com/blockmemory/agent/pkg/types"
 )
 
@@ -21,6 +25,7 @@ type MetaAgentNode struct {
 	maxBlocks       int
 	summaryInterval int
 	stepCount       int
+	rt              *runtime.Runtime
 }
 
 // NewMetaAgentNode 创建主Agent节点
@@ -41,6 +46,14 @@ func (n *MetaAgentNode) SetModelFactory(mf *model.ModelFactory) {
 	n.modelFactory = mf
 }
 
+// SetRuntime 注入运行时（看板/邮箱/Watchdog/人格）
+func (n *MetaAgentNode) SetRuntime(rt *runtime.Runtime) {
+	n.rt = rt
+}
+
+// Runtime 暴露运行时（其他节点动态构造时使用）
+func (n *MetaAgentNode) Runtime() *runtime.Runtime { return n.rt }
+
 // TimeoutStats 获取超时统计
 func (n *MetaAgentNode) TimeoutStats() (callCount, timeoutCount int, avgDur, maxDur time.Duration) {
 	return n.timeoutTracker.Stats()
@@ -55,11 +68,17 @@ func (n *MetaAgentNode) Name() string {
 func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	n.stepCount++
 
-	if n.stepCount%n.summaryInterval == 0 {
+	if n.summaryInterval > 0 && n.stepCount%n.summaryInterval == 0 {
 		n.updateSessionSummary(state)
 	}
 
 	n.registry.CleanupExpired()
+
+	// Watchdog: 监控当前活跃 Agent 的上下文规模（v3 §4.4）
+	n.runWatchdog(state)
+
+	// 邮箱：拉取广播桶里的消息并尝试转交（v3 §7.2）
+	n.processMailbox(state)
 
 	switch {
 	case len(state.ActiveBlocks) == 0 && state.CurrentBlockID == "":
@@ -84,6 +103,79 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	}
 
 	return state, nil
+}
+
+// runWatchdog 评估当前活跃 Agent 的上下文规模并视情况触发动作
+func (n *MetaAgentNode) runWatchdog(state *types.ThreeLayerState) {
+	if n.rt == nil || n.rt.Watchdog == nil {
+		return
+	}
+	// 评估当前活跃块的目标 + 任务结果作为粗略上下文规模代理
+	block := state.ActiveBlocks[state.CurrentBlockID]
+	if block == nil {
+		return
+	}
+	var ctxBuf strings.Builder
+	ctxBuf.WriteString(block.Domain)
+	ctxBuf.WriteString("\n")
+	ctxBuf.WriteString(block.Goal)
+	ctxBuf.WriteString("\n")
+	for k, v := range block.TaskResults {
+		ctxBuf.WriteString(k)
+		ctxBuf.WriteString(": ")
+		ctxBuf.WriteString(v)
+		ctxBuf.WriteString("\n")
+	}
+	d := n.rt.Watchdog.Check(state.CurrentBlockID, ctxBuf.String())
+	if d.Level == watchdog.LevelEvict {
+		// 强制注入一条升级事件，让 EscalationHandler 处理
+		ev := &types.Event{
+			ID:        fmt.Sprintf("watchdog_%d", time.Now().UnixNano()),
+			Type:      types.EventEscalation,
+			Payload:   map[string]any{"reason": "context evict: " + d.Reason, "topic_id": state.SessionID},
+			Priority:  10,
+			CreatedAt: time.Now(),
+			Status:    types.EventPending,
+		}
+		block.Events = append(block.Events, ev)
+	}
+}
+
+// processMailbox 把广播邮件按目标 domain 转给具体 DomainAgent 实例
+func (n *MetaAgentNode) processMailbox(state *types.ThreeLayerState) {
+	if n.rt == nil || n.rt.Mailbox == nil {
+		return
+	}
+	bcasts := n.rt.Mailbox.DrainBroadcast()
+	if len(bcasts) == 0 {
+		return
+	}
+	for _, msg := range bcasts {
+		var domainHint string
+		if v, ok := msg.Payload["target_domain"].(string); ok {
+			domainHint = v
+		}
+		// 在活跃块里寻找匹配领域
+		for _, b := range state.ActiveBlocks {
+			if domainHint == "" || b.Domain == domainHint {
+				if len(b.Agents) > 0 {
+					_ = msg.From
+					n.rt.Mailbox.Forward(msg.ID, b.Agents[0])
+					if msg.Type == mailbox.MsgEscalate {
+						b.Events = append(b.Events, &types.Event{
+							ID:        msg.ID,
+							Type:      types.EventEscalation,
+							Payload:   map[string]any{"reason": msg.Subject},
+							Priority:  msg.Priority,
+							CreatedAt: msg.CreatedAt,
+							Status:    types.EventPending,
+						})
+					}
+					break
+				}
+			}
+		}
+	}
 }
 
 // handleInitial 首次启动处理
@@ -114,6 +206,14 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 	}
 
 	domains := n.analyzeDomains(ctx, state)
+
+	// 初始化 TaskBoard（v3 §7.1）：把领域名作为顶层子任务
+	if n.rt != nil && n.rt.Boards != nil {
+		bd := n.rt.Boards.GetOrCreate(state.SessionID, state.DomainGoal)
+		for _, d := range domains {
+			bd.AddSubTask(d.Name + " - " + d.Goal)
+		}
+	}
 
 	for _, domain := range domains {
 		if len(state.ActiveBlocks) >= n.maxBlocks {
@@ -339,16 +439,42 @@ func (n *MetaAgentNode) isSimpleQuestion(goal string) bool {
 	return len(goal) < 30
 }
 
-// callLLM 统一的LLM调用入口（带自适应超时）
+// callLLM 统一的LLM调用入口（带自适应超时 + 人格注入 + 温度调节）
 func (n *MetaAgentNode) callLLM(ctx context.Context, prompt string) (string, error, bool) {
 	llm, err := n.modelFactory.GetMetaModel(ctx)
 	if err != nil {
 		return "", err, false
 	}
+
+	// 注入人格
+	if n.rt != nil && n.rt.Soul != nil {
+		prompt = n.rt.Soul.Inject(prompt)
+	}
+
+	// MetaAgent 主要做"路由 / 总结"决策，使用 0 温度
+	if t, ok := llm.(model.TemperatureAware); ok {
+		desired := soul.Temperature(soul.KindRouting, 0)
+		// 通过包装一个临时 LLMClient 让 timeoutTracker 仍能记录耗时
+		wrapped := &temperatureWrappedLLM{base: llm, t: t, temperature: desired}
+		return n.timeoutTracker.CallWithTimeout(ctx, wrapped, prompt,
+			30*time.Second, 90*time.Second)
+	}
+
 	return n.timeoutTracker.CallWithTimeout(ctx, llm, prompt,
 		30*time.Second, // 正常超时
 		90*time.Second, // 深度思考超时
 	)
+}
+
+// temperatureWrappedLLM 在 LLMClient 外层叠加 per-call temperature
+type temperatureWrappedLLM struct {
+	base        model.LLMClient
+	t           model.TemperatureAware
+	temperature float64
+}
+
+func (w *temperatureWrappedLLM) Generate(ctx context.Context, prompt string) (string, error) {
+	return w.t.GenerateWithOptions(ctx, prompt, w.temperature)
 }
 
 // DomainInfo 领域信息

@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	einoModel "github.com/cloudwego/eino/components/model"
@@ -63,6 +64,33 @@ func (c *EinoClient) GenerateWithSystem(ctx context.Context, systemPrompt, userP
 		return "", fmt.Errorf("empty model response")
 	}
 
+	return resp.Content, nil
+}
+
+// GenerateWithOptions 允许在不重建客户端的前提下覆盖 temperature
+//
+// v3 §6.3 要求按任务类型动态调节温度（路由 0；代码 0.15；创意 0.8）。
+// Eino BaseChatModel 没有 per-call 温度选项，因此当温度变化超过阈值
+// 时，我们临时构造一个新 ChatModel 完成本次调用，避免污染缓存。
+func (c *EinoClient) GenerateWithOptions(ctx context.Context, prompt string, temperature float64) (string, error) {
+	if math.Abs(temperature-c.cfg.Temperature) < 1e-6 {
+		return c.Generate(ctx, prompt)
+	}
+
+	tmp := c.cfg
+	tmp.Temperature = temperature
+	override, err := createChatModel(ctx, tmp)
+	if err != nil {
+		return c.Generate(ctx, prompt)
+	}
+
+	resp, err := override.Generate(ctx, []*schema.Message{schema.UserMessage(prompt)})
+	if err != nil {
+		return "", fmt.Errorf("override generate: %w", err)
+	}
+	if resp == nil {
+		return "", fmt.Errorf("empty model response")
+	}
 	return resp.Content, nil
 }
 
