@@ -1,41 +1,47 @@
-# UI 功能缺口清单
+# Web UI 功能缺口清单
 
-为匹配 `doc/image/` 设计稿，前端已按新布局实现 Dashboard、Sessions、Memory 三页。以下功能当前用 mock 数据占位，需后端 / 模型 / 存储层补齐后替换真实 API。
+`frontend/` 已删除，新前端项目迁移到 `web/`。以下功能当前仍用 mock 数据占位，需后端 / 存储层补齐后替换真实 API。
 
-## Dashboard 首页
+## 已接入的真实接口
 
-| 前端展示 | 当前实现 | 缺口 |
+- `GET  /api/sessions` — 会话列表
+- `POST /api/sessions` — 创建会话
+- `GET  /api/sessions/{id}` — 会话详情
+- `GET  /api/sessions/{id}/stream` — SSE 事件流
+- `GET  /api/sessions/{id}/board` — 任务看板快照
+- `GET  /api/sessions/{id}/agents` — 会话内智能体
+
+## Dashboard 首页 (mock)
+
+| 前端展示 | 状态 | 待实现接口 |
 |---|---|---|
-| Program / Mode / LLM API / Health 状态芯片 | 硬编码 mock | 需要 `/api/status` 或 `/api/health` 返回运行模式、LLM 供应商、健康状态 |
-| Token 趋势图、延迟趋势图 | mock 数组 | 需要会话维度或全局聚合的时序接口，返回 `[{timestamp, tokens, latency}]` |
-| 领域分布条形图 | mock 数据 | 需要按 DomainAgent 聚合事件/调用统计的接口 |
-| 最近活动流 | mock | 需要全局事件流或审计日志接口 |
-| 平均耗时 | 硬编码 `1.2s` | 需要 `started_at` / `ended_at` 聚合计算 |
+| 顶部 Program/Mode/LLM API/Health 状态芯片 | mock | `/api/status` 或 `/api/health` |
+| 统计概览 (会话数/完成率/Token/超时率) | 部分由 events 计算，缺省时 mock | 全局聚合接口 |
+| 趋势图 | mock 数组 | `/api/metrics/timeline` |
+| 最近活动 | mock | `/api/activity` |
 
-## 会话详情页 (Sessions)
+## 会话详情页 (mock)
 
-| 前端展示 | 当前实现 | 缺口 |
+| 前端展示 | 状态 | 待实现接口 |
 |---|---|---|
-| 任务看板 (Task Board) | mock 任务列表 | 需要 `/api/sessions/{id}/board` 返回真实 TaskBoardData |
-| 智能体参与卡片 | 从 `agent_created` 事件解析，无事件时 fallback mock | 需要 `/api/sessions/{id}/agents` 返回 AgentNode 列表及实时状态 |
-| 概览页最终结果 | 从 `会话完成` 系统事件解析 | 需保证 MetaAgent 稳定输出该事件；或提供 `/api/sessions/{id}/result` |
-| Metrics Token/事件分布 | 由当前 events 派生 | 数据稀疏时仍为 mock，需要后端聚合 |
-| 运行时长 | 当前时间 - started_at (running) / ended_at - started_at | 已可从现有字段计算，无需新接口 |
+| 执行日志 | 真实 events + markdown 渲染 | 已接入 SSE |
+| 角色层级 | 优先用 `/agents` | 已接入 |
+| 任务看板 | 优先用 `/board` | 已接入 |
+| 约束条件 | 来自 board.constraints，否则 mock | 已接入 board |
+| 实时指标 (LLM 调用/超时/耗时/上下文 token) | 由 events 计算，兜底 mock | `/api/metrics/session/{id}` |
+| 看门狗状态 | mock | `/api/watchdog` |
+| 邮箱通知 | mock | `/api/mailbox` |
+| 系统健康 (Postgres/Redis/LLM) | mock | `/api/health` |
 
-## 记忆浏览页 (Memory)
+## 记忆浏览器 / Skill 装配 / 文件预览
 
-| 前端展示 | 当前实现 | 缺口 |
+| 前端展示 | 状态 | 待实现接口 |
 |---|---|---|
-| 智能体选择器 | 硬编码列表 | 需要 `/api/agents` 列出可浏览记忆的智能体 |
-| 记忆搜索 | 前端本地过滤 mock | 需要 `/api/memory/search?agent=...&q=...&level=...` 返回 MemoryItem |
-| 记忆统计 (总数/主题/实体/压缩率) | mock | 需要 `/api/memory/stats?agent=...` |
-| 压缩层级分布 | mock | 需要 `/api/memory/levels?agent=...` |
-| 记忆写入时间线 | mock | 需要 `/api/memory/timeline?agent=...` |
-| 最近访问记录 | mock | 需要审计/访问日志接口 |
-| 实体关系图谱 | mock 实体列表 | 需要 `/api/memory/entities?agent=...` 及关系边数据 |
+| 记忆快照、检索、压缩级别、实体关系 | 全 mock | `/api/memory/*` |
+| Skill 候选池、已装配技能、装配历史 | 全 mock | `/api/skills/*` |
+| 文件树、文件内容预览 | 全 mock | `/api/files/*` |
 
-## 通用
+## 配置
 
-- 设计稿中的顶部导航（首页、会话管理、知识库等）当前由 `Sidebar.vue` 完成，无需新增。
-- 深色主题色值、卡片、表格、时间线已统一使用 CSS 变量，后续若换肤只需改 `:root`。
-- 图表目前为 SVG 自绘，若需要复杂交互可引入 ECharts / Chart.js。
+- `web/vite.config.ts` 已设置 dev server port `10086` 并代理 `/api` 到 `http://localhost:10010`。
+- `backend/main.go` 已改为从 `web/dist` 提供静态文件。

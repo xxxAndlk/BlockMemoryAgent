@@ -156,14 +156,14 @@ func main() {
 	})
 	mux.HandleFunc("/api/sessions/", sessionRouter(sessionMgr))
 
-	// 静态文件：Vue 构建产物在 frontend/dist/
-	fs := http.FileServer(http.Dir("frontend/dist"))
+	// 静态文件：Vue 构建产物在 web/dist/
+	fs := http.FileServer(http.Dir("web/dist"))
 	mux.Handle("/assets/", fs)
 	mux.Handle("/favicon.svg", fs)
 
-	// 首页：Vue SPA（hash 路由，无需服务端回退）
+	// 首页：Vue SPA（history 路由，回退 index.html）
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "frontend/dist/index.html")
+		http.ServeFile(w, r, "web/dist/index.html")
 	})
 
 	// 启动 HTTP 服务

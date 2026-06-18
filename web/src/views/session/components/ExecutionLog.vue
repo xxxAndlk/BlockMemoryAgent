@@ -1,16 +1,82 @@
+<script setup lang="ts">
+import { ref, computed } from 'vue'
+import type { SessionEvent } from '@/types'
+import { renderMd } from '@/utils/markdown'
+
+const props = defineProps<{
+  events: SessionEvent[]
+}>()
+
+const filterAgent = ref('all')
+const filterKind = ref('all')
+const searchLog = ref('')
+
+const agents = computed(() => ['all', ...Array.from(new Set(props.events.map(e => e.agent)))]
+)
+const kinds = computed(() => ['all', ...Array.from(new Set(props.events.map(e => e.kind || e.type)))]
+)
+
+const filtered = computed(() => {
+  return props.events.filter(ev => {
+    if (filterAgent.value !== 'all' && ev.agent !== filterAgent.value) return false
+    if (filterKind.value !== 'all' && (ev.kind || ev.type) !== filterKind.value) return false
+    const q = searchLog.value.trim().toLowerCase()
+    if (q && !ev.message.toLowerCase().includes(q)) return false
+    return true
+  })
+})
+
+function kindType(kind?: string, type?: string) {
+  const k = kind || type || ''
+  if (k === 'think') return 'warning'
+  if (k === 'intend') return 'primary'
+  if (k === 'llm' || k === 'llm_result') return 'success'
+  if (k === 'tool_call') return 'primary'
+  if (k === 'tool_result') return 'success'
+  if (k === 'error') return 'danger'
+  if (k === 'notify') return 'info'
+  return 'info'
+}
+
+function agentColor(agent: string) {
+  return agent === 'MetaAgent' ? 'text-blue-400' : agent.startsWith('system') ? 'text-gray-500' : 'text-gray-300'
+}
+
+function fmtTime(iso: string) {
+  return new Date(iso).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function hasDetail(ev: SessionEvent) {
+  return !!(ev.tool_output || ev.tool_error || ev.detail_json || ev.prompt)
+}
+
+const expanded = ref<Set<number>>(new Set())
+function toggle(i: number) {
+  if (expanded.value.has(i)) expanded.value.delete(i)
+  else expanded.value.add(i)
+}
+
+const progress = computed(() => {
+  const total = props.events.length
+  if (!total) return 0
+  const done = props.events.filter(e => e.type === 'system' && e.message.startsWith('会话完成')).length
+  return done ? 100 : Math.min(95, Math.round(total / (total + 5) * 100))
+})
+</script>
+
 <template>
   <div class="flex-1 flex flex-col h-full bg-[#1a1d24]">
     <div class="p-3 border-b border-[#2a2d35] flex items-center gap-4 text-xs shrink-0">
       <div class="flex items-center gap-2">
         <span class="text-gray-400">Agent:</span>
-        <el-select v-model="filterAgent" size="small" class="w-28 !bg-transparent filter-select">
-          <el-option label="All" value="all" />
+        <el-select v-model="filterAgent" size="small" class="w-32 !bg-transparent filter-select">
+          <el-option v-for="a in agents" :key="a" :label="a === 'all' ? 'All' : a" :value="a" />
         </el-select>
       </div>
       <div class="flex items-center gap-2">
         <span class="text-gray-400">Kind:</span>
-        <el-select v-model="filterKind" size="small" class="w-28 !bg-transparent filter-select">
-          <el-option label="All" value="all" />
+        <el-select v-model="filterKind" size="small" class="w-32 !bg-transparent filter-select">
+          <el-option v-for="k in kinds" :key="k" :label="k === 'all' ? 'All' : k" :value="k" />
         </el-select>
       </div>
       <el-input v-model="searchLog" size="small" placeholder="搜索日志..." class="w-64 ml-auto !bg-[#0f1115] search-input">
@@ -22,76 +88,38 @@
     </div>
 
     <div class="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
-      <div v-for="(log, index) in logs" :key="index" class="flex text-xs items-start gap-4">
-        <div class="text-gray-500 w-16 shrink-0 pt-0.5">{{ log.time }}</div>
-        <div class="w-32 shrink-0 pt-0.5" :class="log.agentColor">{{ log.agent }}</div>
+      <div v-for="(ev, index) in filtered" :key="index" class="flex text-xs items-start gap-4">
+        <div class="text-gray-500 w-16 shrink-0 pt-0.5">{{ fmtTime(ev.timestamp) }}</div>
+        <div class="w-32 shrink-0 pt-0.5" :class="agentColor(ev.agent)">{{ ev.agent }}</div>
         <div class="w-20 shrink-0 pt-0.5 flex justify-center">
-          <el-tag size="small" :type="log.kindType" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-90">{{ log.kind }}</el-tag>
+          <el-tag size="small" :type="kindType(ev.kind, ev.type)" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-90">{{ ev.kind || ev.type }}</el-tag>
         </div>
         <div class="flex-1 min-w-0">
-          <div class="text-gray-300 break-words leading-relaxed pt-0.5" v-html="log.content"></div>
-          
-          <!-- Nested Details -->
-          <div v-if="log.details" class="mt-2 ml-2 pl-3 border-l-2 border-[#2a2d35]">
-            <div class="text-gray-400 mb-1 flex items-center gap-1 cursor-pointer hover:text-gray-300">
-              <el-icon><ArrowDown /></el-icon> 详情 ({{ log.details.length }} 条记录)
+          <div class="text-gray-300 break-words leading-relaxed pt-0.5 markdown-body" v-html="renderMd(ev.message)"></div>
+
+          <div v-if="hasDetail(ev)" class="mt-2">
+            <div class="text-gray-400 mb-1 flex items-center gap-1 cursor-pointer hover:text-gray-300" @click="toggle(index)"
+            >
+              <el-icon><component :is="expanded.has(index) ? 'ArrowUp' : 'ArrowDown'" /></el-icon> 详情
             </div>
-            <ul class="list-none space-y-1 text-gray-500">
-              <li v-for="(detail, idx) in log.details" :key="idx" class="truncate">- {{ detail }}</li>
-              <li class="text-gray-600">... 还有 {{ log.detailsTotal - log.details.length }} 条记录</li>
-            </ul>
+            <div v-if="expanded.has(index)" class="ml-2 pl-3 border-l-2 border-[#2a2d35] space-y-2">
+              <pre v-if="ev.tool_output" class="bg-[#0f1115] p-2 rounded text-gray-500 whitespace-pre-wrap">{{ ev.tool_output }}</pre>
+              <pre v-if="ev.tool_error" class="bg-[#0f1115] p-2 rounded text-red-400 whitespace-pre-wrap">{{ ev.tool_error }}</pre>
+              <pre v-if="ev.detail_json" class="bg-[#0f1115] p-2 rounded text-gray-500 whitespace-pre-wrap">{{ ev.detail_json }}</pre>
+              <pre v-if="ev.prompt" class="bg-[#0f1115] p-2 rounded text-gray-500 whitespace-pre-wrap">{{ ev.prompt }}</pre>
+            </div>
           </div>
         </div>
       </div>
     </div>
-    
-    <!-- Overall Progress Bar -->
+
     <div class="h-12 border-t border-[#2a2d35] flex items-center px-6 gap-4 shrink-0 bg-[#14161a]">
       <span class="text-xs text-gray-400 whitespace-nowrap">整体进度</span>
-      <el-progress :percentage="75" :show-text="false" class="flex-1 custom-progress" />
-      <span class="text-xs text-gray-400 whitespace-nowrap">75% (6/8)</span>
+      <el-progress :percentage="progress" :show-text="false" class="flex-1 custom-progress" />
+      <span class="text-xs text-gray-400 whitespace-nowrap">{{ progress }}% ({{ events.length }} 事件)</span>
     </div>
   </div>
 </template>
-
-<script setup lang="ts">
-import { ref } from 'vue'
-
-const filterAgent = ref('all')
-const filterKind = ref('all')
-const searchLog = ref('')
-
-const logs = ref([
-  { time: '15:42:10', agent: 'MetaAgent', agentColor: 'text-blue-400', kind: 'think', kindType: 'warning', content: '正在分析用户目标和任务分解策略...' },
-  { time: '15:42:11', agent: 'MetaAgent', agentColor: 'text-blue-400', kind: 'intend', kindType: 'primary', content: '将创建 CodeAnalysis 领域的 DomainAgent' },
-  { time: '15:42:12', agent: 'MetaAgent', agentColor: 'text-blue-400', kind: 'tool_call', kindType: 'primary', content: 'CreateDomainAgent({"domain":"CodeAnalysis"})' },
-  { time: '15:42:12', agent: 'system', agentColor: 'text-gray-500', kind: 'tool_result', kindType: 'success', content: '<span class="text-green-500 mr-1">✓</span> DomainAgent-CodeAnalysis 创建成功 (ID: da_123)' },
-  { time: '15:42:15', agent: 'DomainAgent-CodeAnalysis', agentColor: 'text-gray-300', kind: 'think', kindType: 'warning', content: '开始分析项目代码结构...' },
-  { time: '15:42:16', agent: 'DomainAgent-CodeAnalysis', agentColor: 'text-gray-300', kind: 'tool_call', kindType: 'primary', content: 'SearchKnowledge({"query":"golang project structure analysis"})' },
-  { 
-    time: '15:42:17', 
-    agent: 'system', 
-    agentColor: 'text-gray-500', 
-    kind: 'tool_result', 
-    kindType: 'success', 
-    content: '<span class="text-green-500 mr-1">✓</span> 找到 12 条相关知识记录',
-    details: [
-      'Go 项目结构最佳实践',
-      'DDD 在 Go 项目中的应用'
-    ],
-    detailsTotal: 12
-  },
-  { time: '15:42:20', agent: 'SubAgent-Parser', agentColor: 'text-gray-300', kind: 'think', kindType: 'warning', content: '开始解析项目 AST...' },
-  { time: '15:42:21', agent: 'SubAgent-Parser', agentColor: 'text-gray-300', kind: 'tool_call', kindType: 'primary', content: 'ReadFile {"path":"./go.mod"}' },
-  { time: '15:42:21', agent: 'system', agentColor: 'text-gray-500', kind: 'tool_result', kindType: 'success', content: '<span class="text-green-500 mr-1">✓</span> 文件读取成功 (2.3KB)' },
-  { time: '15:42:23', agent: 'SubAgent-Parser', agentColor: 'text-gray-300', kind: 'tool_call', kindType: 'primary', content: 'ASTParser {"content":"module github.com/example/project..."}' },
-  { time: '15:42:24', agent: 'system', agentColor: 'text-gray-500', kind: 'tool_result', kindType: 'success', content: '<span class="text-green-500 mr-1">✓</span> AST 解析完成, 发现 45 个包, 156 个文件' },
-  { time: '15:42:25', agent: 'SubAgent-Architecture', agentColor: 'text-gray-300', kind: 'think', kindType: 'warning', content: '基于解析结果进行架构分析...' },
-  { time: '15:42:26', agent: 'SubAgent-Architecture', agentColor: 'text-gray-300', kind: 'tool_call', kindType: 'primary', content: 'CallLLM {"prompt":"请分析这个Go项目的架构设计..."}' },
-  { time: '15:42:28', agent: 'system', agentColor: 'text-gray-500', kind: 'llm_result', kindType: 'success', content: '<span class="text-green-500 mr-1">✓</span> 分析完成 (耗时: 2.34s, tokens: 1,234)' },
-  { time: '15:42:30', agent: 'DomainAgent-CodeAnalysis', agentColor: 'text-gray-300', kind: 'notify', kindType: 'primary', content: '架构分析阶段完成, 进度更新: 75%' }
-])
-</script>
 
 <style scoped>
 :deep(.filter-select .el-input__wrapper) {
@@ -111,4 +139,7 @@ const logs = ref([
 :deep(.custom-progress .el-progress-bar__inner) {
   background-color: #1e3a8a;
 }
+.markdown-body :deep(p) { margin: 0; }
+.markdown-body :deep(pre) { background: #0f1115; padding: 8px; border-radius: 4px; margin-top: 4px; }
+.markdown-body :deep(code) { font-family: monospace; }
 </style>
