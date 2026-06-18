@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --el-bg-color: #1a1d24;
+  --el-bg-color-overlay: #1a1d24;
+  --el-text-color-primary: #e5e7eb;
+  --el-text-color-regular: #9ca3af;
+  --el-border-color: #2a2d35;
+  --el-border-color-light: #2a2d35;
+  --el-fill-color-blank: #1a1d24;
+  --el-menu-bg-color: #1a1d24;
+  --el-menu-hover-bg-color: #2a2d35;
+}
+
+html.dark {
+  /* Let element plus know it's dark mode */
+}
+
+body {
+  margin: 0;
+  background-color: #0f1219;
+  color: #e5e7eb;
+}
+
+.el-menu {
+  border-right: none !important;
+}
+
+.el-card {
+  background-color: var(--el-bg-color);
+  border-color: var(--el-border-color);
+  color: var(--el-text-color-primary);
+}
+
+.el-table {
+  background-color: var(--el-bg-color);
+  --el-table-border-color: var(--el-border-color);
+  --el-table-header-bg-color: var(--el-bg-color);
+  --el-table-row-hover-bg-color: #2a2d35;
+}
+
+.el-table th.el-table__cell {
+  background-color: var(--el-bg-color);
+}
+.el-table tr {
+  background-color: var(--el-bg-color);
+}
