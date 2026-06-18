@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick } from 'vue'
 import type { Session, SessionEvent } from '../types'
+import { renderMd, esc } from '../utils/markdown'
 
 const sessions = ref<Session[]>([])
 const activeSession = ref<Session | null>(null)
@@ -280,10 +281,6 @@ function formatTime(ts: string) {
   return new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-function esc(s: string) {
-  const d = document.createElement('div'); d.textContent = s; return d.innerHTML
-}
-
 function kindLabel(k?: string) {
   return ({
     think: '思考', intend: '决策', llm: 'LLM调用', tool_call: '工具调用', tool_result: '工具结果',
@@ -353,7 +350,7 @@ function eventIcon(ev: SessionEvent) {
           <!-- 助手最终回答 -->
           <div v-else-if="msg.role === 'assistant'" class="message assistant">
             <div class="message-content">
-              <div class="message-text" v-html="esc(msg.content)"></div>
+              <div class="message-text markdown-body" v-html="renderMd(msg.content)"></div>
             </div>
             <div class="message-time">{{ formatTime(msg.timestamp) }}</div>
           </div>

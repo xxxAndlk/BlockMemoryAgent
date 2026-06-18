@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import type { Session, SessionEvent } from '../types'
+import { renderMd, esc } from '../utils/markdown'
 
 const sessions = ref<Session[]>([])
 const active = ref<Session | null>(null)
@@ -29,10 +30,6 @@ async function select(s: Session) {
 
 function eventCls(ev: SessionEvent) {
   return ev.kind ? `event-kind-${ev.kind}` : `event-${ev.type}`
-}
-
-function esc(s: string) {
-  const d = document.createElement('div'); d.textContent = s; return d.innerHTML
 }
 
 function isDebugKind(ev: SessionEvent) {
@@ -112,7 +109,7 @@ function parseStep(msg: string) {
             <span v-if="ev.kind" :class="'kind kind-'+ev.kind">{{ ev.kind }}</span>
             <button v-if="isDebugKind(ev) && (ev.detail_json || ev.prompt)" class="toggle-btn" @click="toggle('detail-'+i)">{{ expanded.has('detail-'+i) ? 'hide' : 'show' }}</button>
           </div>
-          <div class="msg" v-html="esc(ev.message)"></div>
+          <div class="msg markdown-body" v-html="renderMd(ev.message)"></div>
           <pre v-if="ev.tool_output" class="out">{{ ev.tool_output }}</pre>
           <pre v-if="isDebugKind(ev) && expanded.has('detail-'+i)" class="out">{{ ev.detail_json || ev.prompt || '' }}</pre>
         </div>
