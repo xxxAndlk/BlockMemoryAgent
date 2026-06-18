@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/graph"
@@ -51,10 +53,18 @@ func main() {
 	pgStore, err := store.NewPostgresStore(cfg.Postgres.DSN)
 	if err != nil {
 		log.Printf("Warning: postgres not available: %v", err)
+		log.Printf("  DSN used: %s", redactDSN(cfg.Postgres.DSN))
+		log.Printf("  Session history will NOT persist. Set POSTGRES_DSN in .env and apply migrations/*.sql")
 		pgStore = nil
 	}
 	if pgStore != nil {
 		defer pgStore.Close()
+		// 自动应用 session_history 迁移，避免用户忘记跑 002_session_history.sql
+		if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
+			log.Printf("Warning: ensure session_history schema: %v", err)
+		} else {
+			log.Printf("Postgres connected; session_history table ready")
+		}
 	}
 
 	redisStore, err := store.NewRedisStore(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
@@ -64,6 +74,7 @@ func main() {
 	}
 	if redisStore != nil {
 		defer redisStore.Close()
+		log.Printf("Redis connected at %s", cfg.Redis.Addr)
 	}
 
 	// 加载角色配置
@@ -116,6 +127,18 @@ func main() {
 	// 初始化会话管理器
 	sessionMgr := server.NewSessionManager(threeLayerGraph, registry)
 	sessionMgr.SetPostgresStore(pgStore)
+
+	// 启动时从 session_history 恢复历史会话到内存，让前端列表不空
+	if pgStore != nil {
+		ctxRestore, cancelRestore := context.WithTimeout(ctx, 5*time.Second)
+		n := sessionMgr.RestoreSessions(ctxRestore, 50)
+		cancelRestore()
+		if n > 0 {
+			log.Printf("Restored %d past sessions into in-memory list", n)
+		}
+	} else {
+		log.Printf("Postgres unavailable — session history will NOT persist across restarts")
+	}
 
 	// 路由
 	mux := http.NewServeMux()
@@ -185,6 +208,18 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 			return
 		}
 
+		// /api/sessions/{id}/board
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/board"):] == "/board" {
+			mgr.HandleSessionBoard(w, r)
+			return
+		}
+
+		// /api/sessions/{id}/agents
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/agents"):] == "/agents" {
+			mgr.HandleSessionAgents(w, r)
+			return
+		}
+
 		// /api/sessions/{id}
 		if len(path) > len("/api/sessions/") {
 			mgr.HandleGetSession(w, r)
@@ -216,6 +251,22 @@ func (a *pgHistoryAdapter) RecentSessionHistories(ctx context.Context, limit int
 		})
 	}
 	return out, nil
+}
+
+// redactDSN 把 DSN 中的密码替换为 ***，仅用于启动日志
+func redactDSN(dsn string) string {
+	// 夼理 postgres://user:pass@host/db 形式
+	if i := strings.Index(dsn, "://"); i >= 0 {
+		rest := dsn[i+3:]
+		if at := strings.Index(rest, "@"); at >= 0 {
+			userpass := rest[:at]
+			if colon := strings.Index(userpass, ":"); colon >= 0 {
+				user := userpass[:colon]
+				return dsn[:i+3] + user + ":***@" + rest[at+1:]
+			}
+		}
+	}
+	return dsn
 }
 
 // sinkerNode 终止节点

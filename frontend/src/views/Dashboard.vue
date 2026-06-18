@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue'
 import type { Session } from '../types'
 
 const sessions = ref<Session[]>([])
-const stats = ref({ total: 0, completed: 0, llmCalls: 0, avgTime: '0s' })
+const stats = ref({ total: 0, completed: 0, llmCalls: 0, avgTime: '0s', totalTokens: 0, avgTokens: 0 })
 
 onMounted(async () => {
   try {
@@ -11,6 +11,20 @@ onMounted(async () => {
     sessions.value = await r.json()
     stats.value.total = sessions.value.length
     stats.value.completed = sessions.value.filter(s => s.status === 'completed').length
+    let totalCalls = 0, totalTokens = 0
+    sessions.value.forEach(s => {
+      (s.events || []).forEach(ev => {
+        if (ev.type === 'stats' && ev.message) {
+          const m = ev.message.match(/调用(\d+)次/)
+          if (m) totalCalls += parseInt(m[1])
+          const tm = ev.message.match(/输入Token=(\d+), 输出Token=(\d+)/)
+          if (tm) totalTokens += parseInt(tm[1]) + parseInt(tm[2])
+        }
+      })
+    })
+    stats.value.llmCalls = totalCalls
+    stats.value.totalTokens = totalTokens
+    stats.value.avgTokens = totalCalls > 0 ? Math.round(totalTokens / totalCalls) : 0
   } catch {}
 })
 
@@ -32,6 +46,8 @@ function quick(g: string) {
         <div class="stat"><div class="val">{{ stats.completed }}</div><div class="lab">已完成</div></div>
         <div class="stat"><div class="val">{{ stats.llmCalls }}</div><div class="lab">LLM调用</div></div>
         <div class="stat"><div class="val">{{ stats.avgTime }}</div><div class="lab">平均耗时</div></div>
+        <div class="stat"><div class="val">{{ stats.totalTokens.toLocaleString() }}</div><div class="lab">总Token</div></div>
+        <div class="stat"><div class="val">{{ stats.avgTokens.toLocaleString() }}</div><div class="lab">平均Token/次</div></div>
       </div>
     </div>
     <div class="card">
@@ -66,7 +82,7 @@ function quick(g: string) {
 .card.wide { grid-column: 1 / -1; }
 .card-header { padding: 12px 14px; border-bottom: 1px solid #243447; }
 .card-header h3 { font-size: 13px; font-weight: 700; margin: 0; }
-.stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #243447; }
+.stat-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1px; background: #243447; }
 .stat { background: #161f2e; padding: 16px; text-align: center; }
 .val { font-size: 24px; font-weight: 700; color: #3b82f6; }
 .lab { font-size: 11px; color: #64748b; margin-top: 4px; }

@@ -85,6 +85,59 @@ func (m *SessionManager) SetPostgresStore(pg *store.PostgresStore) {
 	m.pgStore = pg
 }
 
+// RestoreSessions 从 session_history 表恢复历史会话到内存映射。
+//
+// 服务重启后内存中的 m.sessions 会被清空，前端列表也就空了。本方法把
+// 数据库里最近 N 条 session_history 记录加载成最小 Session 对象
+// （只含 ID / Goal / Status / Result / StartedAt / Events=[]），
+// 让用户在 UI 上仍能看到上次的会话。
+//
+// 注意：完整的 events / messages 流无法从 session_history 还原
+// （该表只存 goal/summary/tool_results）。需要完整事件回放请走
+// 未来扩展的 events 表 + SSE 归档。
+func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
+	if m.pgStore == nil {
+		return 0
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	recs, err := m.pgStore.RecentSessionHistories(ctx, limit)
+	if err != nil {
+		log.Printf("restore sessions: %v", err)
+		return 0
+	}
+
+	restored := 0
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, rec := range recs {
+		if _, exists := m.sessions[rec.SessionID]; exists {
+			continue // 不要覆盖正在运行的会话
+		}
+		endedAt := rec.CreatedAt
+		m.sessions[rec.SessionID] = &Session{
+			ID:        rec.SessionID,
+			Goal:      rec.Goal,
+			Status:    "completed",
+			Result:    rec.Summary,
+			StartedAt: rec.CreatedAt,
+			EndedAt:   &endedAt,
+			Events:    make([]SessionEvent, 0),
+			Messages: []types.ChatMessage{
+				{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},
+				{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},
+			},
+		}
+		// 让列表的 seq 不与未来创建冲突
+		restored++
+	}
+	if restored > 0 {
+		log.Printf("restored %d sessions from history", restored)
+	}
+	return restored
+}
+
 // handleToolResult 处理工具执行结果，将其广播到当前运行中的会话
 func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 	// 注意：不能在持有 m.mu.RLock 的情况下调用 addEvent（addEvent 内部取 Lock，
@@ -375,6 +428,100 @@ func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Reque
 	sessions := m.ListSessions()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(sessions)
+}
+
+// HandleSessionBoard GET /api/sessions/{id}/board
+// 返回该会话的 TaskBoard 快照（领域子任务、约束、状态）。若无则返回 null。
+func (m *SessionManager) HandleSessionBoard(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/board")
+
+	session := m.GetSession(id)
+	if session == nil {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	var snap any
+	if rt := m.graph.Runtime(); rt != nil && rt.Boards != nil {
+		if b := rt.Boards.Get(id); b != nil {
+			snap = b.Snapshot()
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id": id,
+		"board":      snap,
+	})
+}
+
+// agentNode 是给前端用的扁平+树结构节点，含 RoleDefinition 名称与父子关系
+type agentNode struct {
+	InstID    string `json:"inst_id"`
+	RoleDefID string `json:"role_def_id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Domain    string `json:"domain"`
+	Status    string `json:"status"`
+	ParentID  string `json:"parent_id"`
+	Goal      string `json:"goal,omitempty"`
+	BlockID   string `json:"block_id,omitempty"`
+}
+
+// HandleSessionAgents GET /api/sessions/{id}/agents
+// 返回该会话所有 RoleInstance（带 RoleDefinition 名称），并附上对应 SessionBlock 的目标。
+func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/agents")
+
+	session := m.GetSession(id)
+	if session == nil {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	// 收集 block 中 domain->goal 映射，便于按 domain 回填 goal
+	blockGoalByDomain := make(map[string]string)
+	blockIDByDomain := make(map[string]string)
+	if session.State != nil {
+		for _, b := range session.State.ActiveBlocks {
+			blockGoalByDomain[b.Domain] = b.Goal
+			blockIDByDomain[b.Domain] = b.ID
+		}
+	}
+
+	instances := m.registry.GetInstancesBySession(id)
+	nodes := make([]agentNode, 0, len(instances))
+	for _, inst := range instances {
+		name := "unknown"
+		if def := m.registry.GetRoleDef(inst.RoleDefID); def != nil {
+			name = def.Name
+		}
+		goal := ""
+		blockID := ""
+		if inst.Domain != "" {
+			goal = blockGoalByDomain[inst.Domain]
+			blockID = blockIDByDomain[inst.Domain]
+		}
+		nodes = append(nodes, agentNode{
+			InstID:    inst.ID,
+			RoleDefID: inst.RoleDefID,
+			Name:      name,
+			Type:      string(inst.Type),
+			Domain:    inst.Domain,
+			Status:    string(inst.Status),
+			ParentID:  inst.ParentID,
+			Goal:      goal,
+			BlockID:   blockID,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id": id,
+		"agents":     nodes,
+	})
 }
 
 // HandleSessionStream GET /api/sessions/{id}/stream

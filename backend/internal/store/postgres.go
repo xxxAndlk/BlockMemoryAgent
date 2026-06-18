@@ -445,6 +445,25 @@ func pgVector(v []float32) string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
+// EnsureSessionHistorySchema 自动创建 session_history 表（幂等）。
+// 启动时调用，避免用户忘记跑 migrations/002_session_history.sql 导致
+// SaveSessionHistory 静默失败。
+func EnsureSessionHistorySchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS session_history (
+    id           BIGSERIAL PRIMARY KEY,
+    session_id   VARCHAR(64) NOT NULL,
+    goal         TEXT NOT NULL,
+    summary      TEXT NOT NULL,
+    tool_results JSONB DEFAULT '[]',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_session_history_created_at
+    ON session_history (created_at DESC);
+`)
+	return err
+}
+
 func scanKnowledgeRows(rows *sql.Rows) ([]*types.KnowledgeRecord, error) {
 	var results []*types.KnowledgeRecord
 	for rows.Next() {

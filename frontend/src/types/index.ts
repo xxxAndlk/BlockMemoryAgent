@@ -26,13 +26,22 @@ export interface SessionEvent {
   tool_error?: string
   success?: boolean
   timestamp: string
+  prompt?: string
+  input_tokens?: number
+  output_tokens?: number
+  detail_json?: string
 }
 
 export interface AgentNode {
+  inst_id: string
+  role_def_id: string
   name: string
   type: string
   domain: string
   status: string
+  parent_id: string
+  goal?: string
+  block_id?: string
 }
 
 export interface SubTask {
@@ -41,13 +50,18 @@ export interface SubTask {
   assignee?: string
   status: string
   result?: string
+  depends_on?: string[]
+  created_at: string
+  updated_at: string
 }
 
 export interface TaskBoardData {
   topic_id: string
   goal: string
   status: string
+  constraints?: Record<string, string>
   tasks: SubTask[]
+  updated_at: string
 }
 
 export interface Skill {

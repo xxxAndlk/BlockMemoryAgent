@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 
@@ -113,6 +114,9 @@ func executeWithTools(
 	// 去重以 ToolRef 为准。
 	skillSection := mergeToolList(skillBrief, defaultTools)
 
+	// 系统环境提示：避免 LLM 在 Windows 上反复尝试 python3/xdg-open 等命令
+	osHint := osSpecificHint()
+
 	systemPrompt := fmt.Sprintf(`%s
 
 你可以使用以下工具来完成任务:
@@ -122,6 +126,9 @@ func executeWithTools(
 当你需要调用工具时，输出JSON格式:
 {"tool": "工具名", "args": {"参数名": "参数值"}}
 
+【运行环境】
+%s
+
 【硬性规则】
 1. 凡任务涉及"创建/写入/生成/实现/编写"文件或代码，必须调用 WriteFile 工具真正落盘，
    禁止只用文字描述代码内容当作完成。代码必须通过 WriteFile 的 content 参数写入磁盘。
@@ -129,7 +136,10 @@ func executeWithTools(
 2. 凡任务涉及"运行/执行/启动"程序，必须调用 RunCommand 工具实际执行，禁止只描述如何运行。
 3. 工具未成功执行前，不得宣称任务完成。
 4. 每次只调用一个工具，等待结果后再决定下一步。
-5. 只有当所有要求的文件已落盘、命令已执行，且无需再调用工具时，才输出最终文字总结。`, roleDef.SystemPrompt, skillSection)
+5. 只有当所有要求的文件已落盘、命令已执行，且无需再调用工具时，才输出最终文字总结。
+6. 工具失败时，输出会包含 stderr/stdout。请阅读失败原因后再决定下一步，
+   不要盲目重试同一命令的不同变种。连续两次失败后必须换一种完全不同的方法
+   （例如换工具、换路径、放弃当前思路），而不是继续试错。`, roleDef.SystemPrompt, skillSection, osHint)
 
 	contextInfo := ""
 	if state.CurrentDomain != "" {
@@ -140,6 +150,8 @@ func executeWithTools(
 
 	// 最多8轮工具调用（提高以容纳验证轮次）
 	maxRounds := 8
+	consecutiveFailures := 0  // 连续失败计数（同一工具连续失败累加，成功则清零）
+	lastFailedTool := ""
 	for round := 0; round < maxRounds; round++ {
 		prompt := systemPrompt + "\n\n" + userMsg
 		if len(allResults) > 0 {
@@ -148,6 +160,15 @@ func executeWithTools(
 				prompt += fmt.Sprintf("%d. [%s] %s\n", i+1, r.Tool, summarizeToolResult(r))
 			}
 			prompt += "\n请根据以上结果继续分析，或输出最终结论。"
+		}
+
+		// 连续失败干预：超过阈值时显式提示 LLM 改变策略
+		if consecutiveFailures >= 2 {
+			prompt += fmt.Sprintf("\n\n[系统警告] 你已连续 %d 次失败（最近失败的命令族: %s）。"+
+				"禁止再继续尝试同类命令的不同写法。你必须："+
+				"(a) 换用完全不同的工具或思路；"+
+				"(b) 若确实无法完成，直接输出最终结论说明原因，不要再调用工具。",
+				consecutiveFailures, lastFailedTool)
 		}
 
 		emit("llm", fmt.Sprintf("第 %d 轮：调用 LLM 决策下一步...", round+1))
@@ -230,17 +251,52 @@ func executeWithTools(
 		result := executor.Execute(ctx, toolReq.Tool, toolReq.Args)
 		allResults = append(allResults, result)
 		if result.Success {
+			consecutiveFailures = 0
+			lastFailedTool = ""
 			out := result.Output
 			if len(out) > 200 {
 				out = out[:200] + "..."
 			}
 			emitDetail("tool_result", fmt.Sprintf("工具 %s 执行成功", toolReq.Tool), out)
 		} else {
-			emit("error", fmt.Sprintf("工具 %s 执行失败: %s", toolReq.Tool, result.Error))
+			// 累计连续失败次数：同一工具族（按工具名归并）连续失败才累加，
+			// 中途换工具则重置计数，避免误伤"先失败A再成功B"的合法路径
+			if lastFailedTool == "" || lastFailedTool == toolReq.Tool {
+				consecutiveFailures++
+			} else {
+				consecutiveFailures = 1
+			}
+			lastFailedTool = toolReq.Tool
+			emit("error", fmt.Sprintf("工具 %s 执行失败 (%d/%d 连续): %s",
+				toolReq.Tool, consecutiveFailures, maxConsecutiveFailures, result.Error))
+
+			// 同一工具连续失败超过阈值 → 停止盲目重试，把已收集到的失败信息交给上层
+			if consecutiveFailures >= maxConsecutiveFailures {
+				emit("error", fmt.Sprintf("连续 %d 次失败，停止重试，返回失败总结", consecutiveFailures))
+				return fmt.Sprintf("[失败: 工具 %s 连续 %d 次失败，最后错误: %s]",
+					toolReq.Tool, consecutiveFailures, result.Error), allResults
+			}
 		}
 	}
 
 	return "达到最大工具调用轮数", allResults
+}
+
+// maxConsecutiveFailures 同一工具连续失败多少次后强制放弃重试
+const maxConsecutiveFailures = 3
+
+// osSpecificHint 给 LLM 的运行环境提示，避免在 Windows 上反复尝试 python3/xdg-open 等命令
+func osSpecificHint() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "操作系统: Windows。打开浏览器用 `start <URL>`；打开文件用 `start <路径>`。" +
+			"python3 在 Windows 上通常叫 python；不要使用 xdg-open / open / say 等 macOS/Linux 命令。" +
+			"路径分隔符使用反斜杠 \\ 或在命令里用正斜杠 /。"
+	case "darwin":
+		return "操作系统: macOS。打开浏览器用 `open <URL>`；打开文件用 `open <路径>`。"
+	default:
+		return "操作系统: Linux/Unix。打开浏览器用 `xdg-open <URL>`。"
+	}
 }
 
 // taskRequiresWriteFile 判断任务是否要求创建/写入文件。
@@ -329,8 +385,19 @@ func parseToolCall(resp string) *ToolCallRequest {
 }
 
 // summarizeToolResult 总结工具结果（避免上下文过长）
+//
+// 注意：失败时必须把 stdout/stderr 一起带给 LLM，否则 LLM 只看到
+// "exit status 1" 之类的退出码，完全不知道失败原因，会反复尝试
+// 同一命令的不同变种。ToolExecutor 在失败时也会把 stderr 写入 Output。
 func summarizeToolResult(r *ToolResult) string {
 	if r.Error != "" {
+		out := r.Output
+		if len(out) > 400 {
+			out = out[:400] + "..."
+		}
+		if out != "" {
+			return fmt.Sprintf("失败: %s\n[输出]\n%s", r.Error, out)
+		}
 		return fmt.Sprintf("失败: %s", r.Error)
 	}
 	output := r.Output
