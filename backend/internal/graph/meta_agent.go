@@ -36,7 +36,7 @@ type MetaAgentNode struct {
 	registry        *RoleRegistry
 	factory         *RoleFactory
 	modelFactory    *model.ModelFactory
-	timeoutTracker  *model.TimeoutTracker
+	llmTracker      *model.LLMCallTracker
 	maxBlocks       int
 	summaryInterval int
 	stepCount       int
@@ -54,7 +54,7 @@ func NewMetaAgentNode(registry *RoleRegistry, factory *RoleFactory, maxBlocks, s
 		maxBlocks:       maxBlocks,
 		summaryInterval: summaryInterval,
 		stepCount:       0,
-		timeoutTracker:  model.NewTimeoutTracker(),
+		llmTracker:      model.NewLLMCallTracker(),
 	}
 }
 
@@ -97,9 +97,14 @@ func (n *MetaAgentNode) emitDetail(kind, message, detail string) {
 // Runtime 暴露运行时（其他节点动态构造时使用）
 func (n *MetaAgentNode) Runtime() *runtime.Runtime { return n.rt }
 
-// TimeoutStats 获取超时统计
+// TimeoutStats 获取超时统计（兼容原接口）
 func (n *MetaAgentNode) TimeoutStats() (callCount, timeoutCount int, avgDur, maxDur time.Duration) {
-	return n.timeoutTracker.Stats()
+	return n.llmTracker.Stats()
+}
+
+// LLMTracker 暴露 LLM 调用追踪器，供外部（如 SessionManager）读取详细统计
+func (n *MetaAgentNode) LLMTracker() *model.LLMCallTracker {
+	return n.llmTracker
 }
 
 // Name 返回节点名称
@@ -342,6 +347,14 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 			fmt.Printf("[MetaAgent] create domain agent %s failed: %v\n", domain.Name, err)
 			continue
 		}
+		// 推送 Agent 创建调试事件
+		roleDef := n.registry.GetRoleDef(inst.RoleDefID)
+		agentName := domain.Name + "负责人"
+		if roleDef != nil {
+			agentName = roleDef.Name
+		}
+		n.emitDetail("agent_created", fmt.Sprintf("创建 DomainAgent: %s (领域: %s)", agentName, domain.Name),
+			fmt.Sprintf("instID=%s roleDefID=%s goal=%s", inst.ID, inst.RoleDefID, domain.Goal))
 
 		block := &types.SessionBlock{
 			ID:          fmt.Sprintf("block_%s_%d", sanitizeID(domain.Name), len(state.ActiveBlocks)),
@@ -513,7 +526,7 @@ func (n *MetaAgentNode) finalizeSession(ctx context.Context, state *types.ThreeL
 		n.updateSessionSummary(state)
 		return
 	}
-	if n.modelFactory != nil && !n.timeoutTracker.ShouldSkipLLM() {
+	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是BlockMemoryAgent，一个本地AI开发助手。请基于以下各助手的执行结果，生成一个清晰、完整的最终回答给用户。
 
 各助手执行结果：
@@ -525,7 +538,7 @@ func (n *MetaAgentNode) finalizeSession(ctx context.Context, state *types.ThreeL
 			return
 		}
 		if timedOut {
-			fmt.Printf("[MetaAgent] LLM timeout on finalize, keeping raw results. %s\n", n.timeoutTracker.StatsString())
+			fmt.Printf("[MetaAgent] LLM timeout on finalize, keeping raw results. %s\n", n.llmTracker.StatsString())
 		}
 	}
 }
@@ -593,8 +606,13 @@ func isASCII(s string) bool {
 	return true
 }
 
-// callLLM 统一的LLM调用入口（带自适应超时 + 人格注入 + 温度调节）
+// callLLM 统一的LLM调用入口（带自适应超时 + 人格注入 + 温度调节 + Prompt/Token 日志）
 func (n *MetaAgentNode) callLLM(ctx context.Context, prompt string) (string, error, bool) {
+	return n.callLLMAs(ctx, "MetaAgent", prompt)
+}
+
+// callLLMAs 以指定调用者身份执行 LLM 调用，自动记录 prompt 和 token
+func (n *MetaAgentNode) callLLMAs(ctx context.Context, caller string, prompt string) (string, error, bool) {
 	llm, err := n.modelFactory.GetMetaModel(ctx)
 	if err != nil {
 		return "", err, false
@@ -605,19 +623,33 @@ func (n *MetaAgentNode) callLLM(ctx context.Context, prompt string) (string, err
 		prompt = n.rt.Soul.Inject(prompt)
 	}
 
+	// 发送 prompt 调试事件
+	n.emitDetail("prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
+
 	// MetaAgent 主要做"路由 / 总结"决策，使用 0 温度
+	var resp string
+	var callErr error
+	var timedOut bool
 	if t, ok := llm.(model.TemperatureAware); ok {
 		desired := soul.Temperature(soul.KindRouting, 0)
-		// 通过包装一个临时 LLMClient 让 timeoutTracker 仍能记录耗时
 		wrapped := &temperatureWrappedLLM{base: llm, t: t, temperature: desired}
-		return n.timeoutTracker.CallWithTimeout(ctx, wrapped, prompt,
+		resp, callErr, timedOut = n.llmTracker.CallWithTimeout(ctx, wrapped, prompt, caller,
+			30*time.Second, 90*time.Second)
+	} else {
+		resp, callErr, timedOut = n.llmTracker.CallWithTimeout(ctx, llm, prompt, caller,
 			30*time.Second, 90*time.Second)
 	}
 
-	return n.timeoutTracker.CallWithTimeout(ctx, llm, prompt,
-		30*time.Second, // 正常超时
-		90*time.Second, // 深度思考超时
-	)
+	// 发送 token_usage 调试事件（从 tracker 最新记录读取）
+	records := n.llmTracker.Records()
+	if len(records) > 0 {
+		last := records[len(records)-1]
+		n.emitDetail("token_usage",
+			fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", caller, last.InputTokens, last.OutputTokens, last.Duration.Round(time.Millisecond)),
+			"")
+	}
+
+	return resp, callErr, timedOut
 }
 
 // temperatureWrappedLLM 在 LLMClient 外层叠加 per-call temperature
@@ -648,7 +680,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 	messagesSection := n.loadMessagesSection(state)
 
 	// 尝试使用LLM分析领域
-	if n.modelFactory != nil && !n.timeoutTracker.ShouldSkipLLM() {
+	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
 		n.emit("llm", "调用 LLM 进行领域分析...")
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个多Agent系统的领域分析器。请分析以下用户目标，确定需要哪些业务领域来协作完成。
 
@@ -671,7 +703,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 		}
 		if timedOut {
 			n.emit("error", "领域分析 LLM 调用超时，回退到规则")
-			fmt.Printf("[MetaAgent] LLM timeout on domain analysis, using rules fallback. %s\n", n.timeoutTracker.StatsString())
+			fmt.Printf("[MetaAgent] LLM timeout on domain analysis, using rules fallback. %s\n", n.llmTracker.StatsString())
 		} else if err != nil {
 			n.emitDetail("error", "领域分析 LLM 调用失败: "+err.Error(), "")
 		}

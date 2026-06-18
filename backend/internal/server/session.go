@@ -34,13 +34,19 @@ type SessionEvent struct {
 	Type       string    `json:"type"`
 	Agent      string    `json:"agent"`
 	Message    string    `json:"message"`
-	Kind       string    `json:"kind,omitempty"` // progress 子类型: think/intend/llm/tool_call/tool_result/wait/error
+	Kind       string    `json:"kind,omitempty"` // progress 子类型: think/intend/llm/tool_call/tool_result/wait/error/prompt/agent_created/token_usage/graph_step
 	Tool       string    `json:"tool,omitempty"`
 	ToolPath   string    `json:"tool_path,omitempty"`
 	ToolOutput string    `json:"tool_output,omitempty"`
 	ToolError  string    `json:"tool_error,omitempty"`
 	Success    bool      `json:"success,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
+
+	// ---- 调试扩展字段（v3 debug） ----
+	Prompt       string `json:"prompt,omitempty"`        // 发送给 LLM 的 prompt（截断）
+	InputTokens  int    `json:"input_tokens,omitempty"`  // 输入 token 估算
+	OutputTokens int    `json:"output_tokens,omitempty"` // 输出 token 估算
+	DetailJSON   string `json:"detail_json,omitempty"`   // 结构化详情（Agent 创建参数、图步骤状态等）
 }
 
 // SessionManager 会话管理器
@@ -105,16 +111,27 @@ func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 //	think / intend / llm / wait -> "progress"
 //	tool_call / tool_result     -> "progress"（tool_exec 仍由 handleToolResult 单独发）
 //	error                       -> "progress"（标记 success=false）
+//	prompt / agent_created / token_usage / graph_step -> 同上，但扩展字段携带调试信息
 func (m *SessionManager) handleProgress(ev graph.ProgressEvent) {
 	msg := ev.Message
-	if ev.Detail != "" {
-		d := ev.Detail
-		if len(d) > 300 {
-			d = d[:300] + "..."
+	detail := ev.Detail
+	if detail != "" {
+		if len(detail) > 500 {
+			detail = detail[:500] + "..."
 		}
-		msg += "\n" + d
+		msg += "\n" + detail
 	}
 	success := ev.Kind != "error"
+
+	// 提取调试信息
+	var prompt string
+	var inputTokens, outputTokens int
+	switch ev.Kind {
+	case "prompt":
+		prompt = ev.Detail // 原始 prompt 摘要
+	case "token_usage":
+		inputTokens, outputTokens = parseTokenUsage(ev.Message)
+	}
 
 	m.mu.RLock()
 	targets := make([]*Session, 0, 1)
@@ -126,8 +143,15 @@ func (m *SessionManager) handleProgress(ev graph.ProgressEvent) {
 	m.mu.RUnlock()
 
 	for _, session := range targets {
-		m.addEvent(session, "progress", ev.Agent, msg, ev.Kind, "", "", "", "", success)
+		m.addEventDebug(session, "progress", ev.Agent, msg, ev.Kind, "", "", "", "", success, prompt, inputTokens, outputTokens, detail)
 	}
+}
+
+// parseTokenUsage 从 token_usage 消息中解析 in/out token 数
+// 格式: "[caller] Token 消耗: in=N out=M dur=X"
+func parseTokenUsage(msg string) (in, out int) {
+	fmt.Sscanf(msg, "%*s Token 消耗: in=%d out=%d", &in, &out)
+	return
 }
 
 // CreateSession 创建并启动新会话
@@ -218,13 +242,15 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	// 持久化会话历史（跨会话记忆基础）
 	m.persistHistory(session)
 
-	// 报告超时统计
+	// 报告 LLM 统计
 	if metaNode, ok := m.graph.GetNode("MetaAgent"); ok {
 		if ma, ok := metaNode.(*graph.MetaAgentNode); ok {
 			calls, timeouts, avg, max := ma.TimeoutStats()
+			inTotal, outTotal := ma.LLMTracker().TokenTotals()
 			if calls > 0 {
 				m.addEvent(session, "stats", "System",
-					fmt.Sprintf("LLM统计: 调用%d次, 超时%d次, 平均%v, 最长%v", calls, timeouts, avg.Round(time.Millisecond), max.Round(time.Millisecond)),
+					fmt.Sprintf("LLM统计: 调用%d次, 超时%d次, 平均%v, 最长%v, 输入Token=%d, 输出Token=%d",
+						calls, timeouts, avg.Round(time.Millisecond), max.Round(time.Millisecond), inTotal, outTotal),
 					"", "", "", "", "", false)
 			}
 		}
@@ -271,6 +297,10 @@ func truncate(s string, n int) string {
 }
 
 func (m *SessionManager) addEvent(session *Session, eventType, agent, message, kind, tool, toolPath, toolOutput, toolError string, success bool) {
+	m.addEventDebug(session, eventType, agent, message, kind, tool, toolPath, toolOutput, toolError, success, "", 0, 0, "")
+}
+
+func (m *SessionManager) addEventDebug(session *Session, eventType, agent, message, kind, tool, toolPath, toolOutput, toolError string, success bool, prompt string, inputTokens, outputTokens int, detailJSON string) {
 	ev := SessionEvent{
 		Type:       eventType,
 		Agent:      agent,
@@ -282,6 +312,10 @@ func (m *SessionManager) addEvent(session *Session, eventType, agent, message, k
 		ToolError:  toolError,
 		Success:    success,
 		Timestamp:  time.Now(),
+		Prompt:       prompt,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		DetailJSON:   detailJSON,
 	}
 	m.mu.Lock()
 	session.Events = append(session.Events, ev)

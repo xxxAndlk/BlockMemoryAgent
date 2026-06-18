@@ -61,17 +61,22 @@ function refreshDashboard() {
         const completed = sessions.filter(s => s.status === 'completed').length;
         const rate = sessions.length > 0 ? Math.round((completed / sessions.length) * 100) : 0;
         document.getElementById('stat-completion').textContent = rate + '%';
-        // LLM calls from stats events
+        // LLM calls and tokens from stats events
         let totalCalls = 0;
+        let totalTokens = 0;
         sessions.forEach(s => {
             (s.events || []).forEach(ev => {
                 if (ev.type === 'stats' && ev.message) {
                     const m = ev.message.match(/调用(\d+)次/);
                     if (m) totalCalls += parseInt(m[1]);
+                    const tm = ev.message.match(/输入Token=(\d+), 输出Token=(\d+)/);
+                    if (tm) totalTokens += parseInt(tm[1]) + parseInt(tm[2]);
                 }
             });
         });
         document.getElementById('stat-llm-calls').textContent = totalCalls;
+        document.getElementById('stat-total-tokens').textContent = totalTokens.toLocaleString();
+        document.getElementById('stat-avg-tokens').textContent = totalCalls > 0 ? Math.round(totalTokens / totalCalls).toLocaleString() : '0';
 
         // Recent sessions table
         const list = document.getElementById('dash-session-list');
@@ -160,6 +165,7 @@ async function openSessionDetail(id) {
                 <button class="tab-btn active" onclick="switchSessionTab(this,'log')">Execution Log</button>
                 <button class="tab-btn" onclick="switchSessionTab(this,'agents')">Agents</button>
                 <button class="tab-btn" onclick="switchSessionTab(this,'board')">Task Board</button>
+                <button class="tab-btn" onclick="switchSessionTab(this,'trace')">Trace</button>
                 <button class="tab-btn" onclick="switchSessionTab(this,'metrics')">Metrics</button>
                 <button class="tab-btn" onclick="switchSessionTab(this,'mailbox')">Mailbox</button>
             </div>
@@ -201,6 +207,7 @@ function switchSessionTab(btn, tab) {
     if (tab === 'log') content.innerHTML = renderLogTab(activeSession);
     else if (tab === 'agents') content.innerHTML = renderAgentsTab(activeSession);
     else if (tab === 'board') content.innerHTML = renderBoardTab(activeSession);
+    else if (tab === 'trace') content.innerHTML = renderTraceTab(activeSession);
     else if (tab === 'metrics') content.innerHTML = renderMetricsTab(activeSession);
     else if (tab === 'mailbox') content.innerHTML = renderMailboxTab(activeSession);
 }
@@ -282,12 +289,135 @@ function renderMailboxTab(session) {
     return '<div style="padding:16px"><div class="empty-state">Mailbox API not yet implemented</div></div>';
 }
 
+// ===== Trace Tab =====
+function renderTraceTab(session) {
+    const events = session.events || [];
+
+    // 1. Token 消耗统计
+    const tokenEvents = events.filter(ev => ev.kind === 'token_usage');
+    const callerStats = {};
+    tokenEvents.forEach(ev => {
+        const m = ev.message.match(/\[(.+?)\] Token 消耗: in=(\d+) out=(\d+) dur=(.+)/);
+        if (!m) return;
+        const caller = m[1];
+        const inT = parseInt(m[2]) || 0;
+        const outT = parseInt(m[3]) || 0;
+        if (!callerStats[caller]) {
+            callerStats[caller] = { calls: 0, input: 0, output: 0 };
+        }
+        callerStats[caller].calls++;
+        callerStats[caller].input += inT;
+        callerStats[caller].output += outT;
+    });
+
+    let tokenTable = '<div class="empty-state" style="padding:20px">暂无 Token 消耗记录</div>';
+    if (Object.keys(callerStats).length > 0) {
+        const rows = Object.entries(callerStats).map(([caller, s]) =>
+            `<tr><td>${esc(caller)}</td><td class="num">${s.calls}</td><td class="num">${s.input}</td><td class="num">${s.output}</td><td class="num">${s.input + s.output}</td></tr>`
+        ).join('');
+        tokenTable = `
+            <table class="token-table">
+                <thead><tr><th>调用者</th><th>次数</th><th>输入Token</th><th>输出Token</th><th>合计</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+    }
+
+    // 2. Prompt 查看器
+    const promptEvents = events.filter(ev => ev.kind === 'prompt');
+    let promptList = '<div class="empty-state" style="padding:20px">暂无 Prompt 记录</div>';
+    if (promptEvents.length > 0) {
+        promptList = promptEvents.map((ev, i) => {
+            const pid = 'trace-prompt-' + i;
+            return `
+                <div class="prompt-item">
+                    <div class="prompt-header" onclick="toggleOutput('${pid}', this.querySelector('.toggle-btn'))">
+                        <span>${esc(ev.message || '')}</span>
+                        <button class="toggle-btn">show</button>
+                    </div>
+                    <div id="${pid}" class="prompt-body">${esc(ev.prompt || ev.detail || '')}</div>
+                </div>`;
+        }).join('');
+    }
+
+    // 3. Agent 创建历史
+    const agentEvents = events.filter(ev => ev.kind === 'agent_created');
+    let agentList = '<div class="empty-state" style="padding:20px">暂无 Agent 创建记录</div>';
+    if (agentEvents.length > 0) {
+        agentList = agentEvents.map(ev => `
+            <div class="agent-create-card">
+                <div class="agent-create-title">${esc(ev.message || '')}</div>
+                <div class="agent-create-meta">${esc(ev.detail || '')}</div>
+            </div>`
+        ).join('');
+    }
+
+    // 4. 图执行步骤流
+    const stepEvents = events.filter(ev => ev.kind === 'graph_step');
+    let stepFlow = '<div class="empty-state" style="padding:20px">暂无图执行步骤记录</div>';
+    if (stepEvents.length > 0) {
+        stepFlow = '<div class="step-flow">' + stepEvents.map((ev, i) => {
+            const m = ev.message.match(/Step (\d+): (.+?) → (.+?) \(action=(.+)\)/);
+            if (!m) return `<div class="step-flow-item"><span class="step-flow-num">#${i+1}</span>${esc(ev.message)}</div>`;
+            return `
+                <div class="step-flow-item">
+                    <span class="step-flow-num">#${m[1]}</span>
+                    <span>${esc(m[2])}</span>
+                    <span class="step-flow-arrow">→</span>
+                    <span>${esc(m[3])}</span>
+                    <span class="step-flow-action">${esc(m[4])}</span>
+                </div>`;
+        }).join('') + '</div>';
+    }
+
+    return `
+        <div class="trace-layout">
+            <div class="trace-section">
+                <div class="trace-section-header">Token 消耗统计</div>
+                <div class="trace-section-body">${tokenTable}</div>
+            </div>
+            <div class="trace-section">
+                <div class="trace-section-header">Prompt 查看器 (${promptEvents.length})</div>
+                <div class="trace-section-body">${promptList}</div>
+            </div>
+            <div class="trace-section">
+                <div class="trace-section-header">Agent 创建历史 (${agentEvents.length})</div>
+                <div class="trace-section-body">${agentList}</div>
+            </div>
+            <div class="trace-section">
+                <div class="trace-section-header">图执行步骤流 (${stepEvents.length})></div>
+                <div class="trace-section-body">${stepFlow}</div>
+            </div>
+        </div>
+    `;
+}
+
 // ===== Event HTML =====
 function eventHtml(ev, idx) {
     const time = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
     const kind = ev.kind || '';
     const cls = kind ? ('event-item event-progress event-kind-' + kind) : ('event-item event-' + (ev.type || ''));
     const kindLabel = kind ? `<span class="kind-badge kind-${kind}">${kind}</span>` : '';
+
+    // 特殊调试事件类型渲染
+    if (ev.kind === 'prompt' || ev.kind === 'agent_created' || ev.kind === 'token_usage' || ev.kind === 'graph_step') {
+        const detailHtml = ev.detail_json || ev.detail || '';
+        const hasDetail = detailHtml.length > 0 && detailHtml.length < 2000;
+        const detailId = 'detail-' + idx;
+        const toggleBtn = hasDetail ? `<button class="toggle-btn" onclick="toggleOutput('${detailId}',this)">show</button>` : '';
+        const detailBlock = hasDetail ? `<div id="${detailId}" class="tool-output">${esc(detailHtml)}</div>` : '';
+        return `
+            <div class="${cls}">
+                <div class="event-header">
+                    <span class="event-time">${time}</span>
+                    <span class="event-agent">${esc(ev.agent || '')}</span>
+                    ${kindLabel}
+                    ${toggleBtn}
+                </div>
+                <div class="event-msg">${msgHtml}</div>
+                ${detailBlock}
+            </div>
+        `;
+    }
 
     if (ev.type === 'tool_exec') {
         const statusIcon = ev.success ? '<span class="tool-success">OK</span>' : '<span class="tool-fail">FAIL</span>';

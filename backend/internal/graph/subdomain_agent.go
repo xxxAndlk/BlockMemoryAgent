@@ -20,16 +20,42 @@ type SubDomainAgentNode struct {
 	modelFactory *model.ModelFactory
 	toolCallback ToolCallback
 	progress     ProgressCallback
+	llmTracker   *model.LLMCallTracker
 }
 
 // NewSubDomainAgentNode 创建子领域Agent节点
 func NewSubDomainAgentNode(instID string, registry *RoleRegistry, factory *RoleFactory) *SubDomainAgentNode {
 	return &SubDomainAgentNode{
-		name:     "SubDomainAgent",
-		instID:   instID,
-		registry: registry,
-		factory:  factory,
+		name:       "SubDomainAgent",
+		instID:     instID,
+		registry:   registry,
+		factory:    factory,
+		llmTracker: model.NewLLMCallTracker(),
 	}
+}
+
+// emit 推送进度事件
+func (n *SubDomainAgentNode) emit(kind, message string) {
+	if n.progress == nil {
+		return
+	}
+	agent := "SubDomainAgent"
+	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
+		agent = "SubDomainAgent[" + inst.Domain + "]"
+	}
+	n.progress(ProgressEvent{Kind: kind, Agent: agent, Message: message})
+}
+
+// emitDetail 推送带详情的进度事件
+func (n *SubDomainAgentNode) emitDetail(kind, message, detail string) {
+	if n.progress == nil {
+		return
+	}
+	agent := "SubDomainAgent"
+	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
+		agent = "SubDomainAgent[" + inst.Domain + "]"
+	}
+	n.progress(ProgressEvent{Kind: kind, Agent: agent, Message: message, Detail: detail})
 }
 
 // SetModelFactory 设置模型工厂
@@ -165,6 +191,10 @@ func (n *SubDomainAgentNode) createAssistantForTask(ctx context.Context, state *
 		fmt.Printf("[SubDomainAgent] create dynamic assistant for %q failed: %v\n", task, err)
 		return nil, nil
 	}
+	// 推送 Agent 创建调试事件
+	n.emitDetail("agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),
+		fmt.Sprintf("instID=%s roleDefID=%s parentID=%s", assistantInst.ID, assistantInst.RoleDefID, n.instID))
+
 	assistantDef = n.registry.GetRoleDef(assistantInst.RoleDefID)
 	if assistantDef == nil {
 		return nil, nil
@@ -267,9 +297,20 @@ func (n *SubDomainAgentNode) analyzeSubTasksWithLLM(ctx context.Context, subDoma
 
 子任务:`, subDomain, goal)
 
-	resp, err := llm.Generate(ctx, prompt)
-	if err != nil || resp == "" {
+	caller := "SubDomainAgent/子任务分析"
+	n.emitDetail("prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
+
+	resp, callErr, _ := n.llmTracker.CallWithTimeout(ctx, llm, prompt, caller, 30*time.Second, 90*time.Second)
+	if callErr != nil || resp == "" {
 		return nil
+	}
+
+	records := n.llmTracker.Records()
+	if len(records) > 0 {
+		last := records[len(records)-1]
+		n.emitDetail("token_usage",
+			fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", caller, last.InputTokens, last.OutputTokens, last.Duration.Round(time.Millisecond)),
+			"")
 	}
 
 	var tasks []string

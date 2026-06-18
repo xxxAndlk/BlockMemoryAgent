@@ -151,7 +151,15 @@ func executeWithTools(
 		}
 
 		emit("llm", fmt.Sprintf("第 %d 轮：调用 LLM 决策下一步...", round+1))
+		inputTokens := model.EstimateTokens(prompt)
+		emitDetail("prompt", fmt.Sprintf("[%s] 第 %d 轮 Prompt (%d tokens)", agentName, round+1, inputTokens), model.SummarizePrompt(prompt, 400))
+
+		start := time.Now()
 		resp, err := llm.Generate(ctx, prompt)
+		dur := time.Since(start)
+		outputTokens := model.EstimateTokens(resp)
+		emitDetail("token_usage", fmt.Sprintf("[%s] 第 %d 轮 Token: in=%d out=%d dur=%v", agentName, round+1, inputTokens, outputTokens, dur.Round(time.Millisecond)), "")
+
 		if err != nil {
 			emit("error", fmt.Sprintf("LLM 调用失败: %v", err))
 			if len(allResults) > 0 {

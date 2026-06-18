@@ -196,11 +196,21 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		}
 		state = newState
 
+		// 推送图步骤调试事件
+		next := g.determineNext(current, state)
+		if g.progress != nil {
+			g.progress(ProgressEvent{
+				Kind:    "graph_step",
+				Agent:   "Graph",
+				Message: fmt.Sprintf("Step %d: %s → %s (action=%s)", stepCount, current, next, state.NextAction),
+				Detail:  fmt.Sprintf("block=%s domain=%s calling=%v", state.CurrentBlockID, state.CurrentDomain, state.IsCalling()),
+			})
+		}
+
 		if state.NextAction == types.ActionFinish {
 			return state, nil
 		}
 
-		next := g.determineNext(current, state)
 		if next == "" {
 			return state, nil
 		}

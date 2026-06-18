@@ -29,11 +29,14 @@ type ToolResult struct {
 type ToolCallback func(result *ToolResult)
 
 // ProgressEvent 单步进度事件，用于把 Agent 的思考/意图/工具调用实时推给 UI。
+// Kind 取值:
+//   "think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error"  (原有)
+//   "prompt" | "agent_created" | "token_usage" | "graph_step"                     (新增调试类)
 type ProgressEvent struct {
-	Kind    string // "think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error"
+	Kind    string // "think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error" | "prompt" | "agent_created" | "token_usage" | "graph_step"
 	Agent   string // 节点名/角色名
 	Message string // 人类可读描述
-	Detail  string // 可选：LLM 原始输出 / 工具参数 / 错误堆栈
+	Detail  string // 可选：LLM 原始输出 / 工具参数 / 错误堆栈 / prompt 摘要 / JSON 详情
 }
 
 // ProgressCallback 进度回调。server 层注入，graph 各节点在每个关键步骤触发。

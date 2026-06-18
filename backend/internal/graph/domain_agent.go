@@ -21,7 +21,7 @@ type DomainAgentNode struct {
 	factory        *RoleFactory
 	modelFactory   *model.ModelFactory
 	toolCallback   ToolCallback
-	timeoutTracker *model.TimeoutTracker
+	llmTracker     *model.LLMCallTracker
 	rt             *runtime.Runtime
 	progress       ProgressCallback
 }
@@ -33,7 +33,7 @@ func NewDomainAgentNode(instID string, registry *RoleRegistry, factory *RoleFact
 		instID:         instID,
 		registry:       registry,
 		factory:        factory,
-		timeoutTracker: model.NewTimeoutTracker(),
+		llmTracker:     model.NewLLMCallTracker(),
 	}
 }
 
@@ -241,6 +241,10 @@ func (n *DomainAgentNode) createAssistantForTask(ctx context.Context, state *typ
 		fmt.Printf("[DomainAgent] create dynamic assistant for %q failed: %v\n", task, err)
 		return nil, nil
 	}
+	// 推送 Agent 创建调试事件
+	n.emitDetail("agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),
+		fmt.Sprintf("instID=%s roleDefID=%s parentID=%s", assistantInst.ID, assistantInst.RoleDefID, n.instID))
+
 	assistantDef = n.registry.GetRoleDef(assistantInst.RoleDefID)
 	if assistantDef == nil {
 		return nil, nil
@@ -326,7 +330,7 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 	}
 
 	// 尝试使用LLM进行任务拆解
-	if n.modelFactory != nil && !n.timeoutTracker.ShouldSkipLLM() {
+	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
 		n.emit("llm", "调用 LLM 拆解子任务...")
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-4个独立可执行的子任务。
 
@@ -348,7 +352,7 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 		}
 		if timedOut {
 			n.emit("error", "任务拆解 LLM 调用超时，回退到规则")
-			fmt.Printf("[DomainAgent] LLM timeout on task analysis, using rules. %s\n", n.timeoutTracker.StatsString())
+			fmt.Printf("[DomainAgent] LLM timeout on task analysis, using rules. %s\n", n.llmTracker.StatsString())
 		} else if err != nil {
 			n.emitDetail("error", "任务拆解 LLM 调用失败: "+err.Error(), "")
 		}
@@ -358,16 +362,34 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 	return n.analyzeTasksByRules(goal)
 }
 
-// callLLM 统一LLM调用入口（带自适应超时）
+// callLLM 统一LLM调用入口（带自适应超时 + Prompt/Token 日志）
 func (n *DomainAgentNode) callLLM(ctx context.Context, prompt string) (string, error, bool) {
+	return n.callLLMAs(ctx, "DomainAgent/任务拆解", prompt)
+}
+
+// callLLMAs 以指定调用者身份执行 LLM 调用
+func (n *DomainAgentNode) callLLMAs(ctx context.Context, caller string, prompt string) (string, error, bool) {
 	llm, err := n.modelFactory.GetDomainModel(ctx)
 	if err != nil {
 		return "", err, false
 	}
-	return n.timeoutTracker.CallWithTimeout(ctx, llm, prompt,
+
+	n.emitDetail("prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
+
+	resp, callErr, timedOut := n.llmTracker.CallWithTimeout(ctx, llm, prompt, caller,
 		30*time.Second,
 		90*time.Second,
 	)
+
+	records := n.llmTracker.Records()
+	if len(records) > 0 {
+		last := records[len(records)-1]
+		n.emitDetail("token_usage",
+			fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", caller, last.InputTokens, last.OutputTokens, last.Duration.Round(time.Millisecond)),
+			"")
+	}
+
+	return resp, callErr, timedOut
 }
 
 // parseTaskListFromResp 从LLM响应解析任务列表
@@ -475,8 +497,7 @@ func (n *DomainAgentNode) shouldSplitToSubDomains(ctx context.Context, state *ty
 
 // shouldSplitWithLLM 使用LLM判断是否需要拆分子领域
 func (n *DomainAgentNode) shouldSplitWithLLM(ctx context.Context, domain string, tasks []string) bool {
-	llm, err := n.modelFactory.GetDomainModel(ctx)
-	if err != nil {
+	if n.modelFactory == nil {
 		return false
 	}
 
@@ -491,7 +512,7 @@ func (n *DomainAgentNode) shouldSplitWithLLM(ctx context.Context, domain string,
 否则回答"否"。
 只回答"是"或"否"。`, domain, len(tasks), strings.Join(tasks, "\n"))
 
-	resp, err := llm.Generate(ctx, prompt)
+	resp, err, _ := n.callLLMAs(ctx, "DomainAgent/拆分判断", prompt)
 	if err != nil {
 		return false
 	}
@@ -562,11 +583,11 @@ func (n *DomainAgentNode) inferSubDomains(ctx context.Context, domain string) []
 
 // inferSubDomainsWithLLM 使用LLM推断子领域
 func (n *DomainAgentNode) inferSubDomainsWithLLM(ctx context.Context, domain string) []DomainInfo {
-	llm, err := n.modelFactory.GetDomainModel(ctx)
-	if err != nil {
+	if n.modelFactory == nil {
 		return nil
 	}
 
+	caller := "DomainAgent/子领域推断"
 	prompt := fmt.Sprintf(`将以下领域拆分为2-4个独立的子领域。
 
 领域: %s
@@ -578,7 +599,7 @@ func (n *DomainAgentNode) inferSubDomainsWithLLM(ctx context.Context, domain str
 
 子领域:`, domain)
 
-	resp, err := llm.Generate(ctx, prompt)
+	resp, err, _ := n.callLLMAs(ctx, caller, prompt)
 	if err != nil || resp == "" {
 		return nil
 	}
