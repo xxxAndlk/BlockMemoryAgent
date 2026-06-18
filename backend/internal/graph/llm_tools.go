@@ -86,17 +86,21 @@ func executeWithTools(
 ) (string, []*ToolResult) {
 	var allResults []*ToolResult
 
-	emit := func(kind, msg string) {
+	sessionID := ""
+	if state != nil {
+		sessionID = state.SessionID
+	}
+	emit := func(ctx context.Context, kind, msg string) {
 		if progress != nil {
-			progress(ProgressEvent{Kind: kind, Agent: agentName, Message: msg})
+			progress(ctx, ProgressEvent{SessionID: sessionID, Kind: kind, Agent: agentName, Message: msg})
 		}
 	}
-	emitDetail := func(kind, msg, detail string) {
+	emitDetail := func(ctx context.Context, kind, msg, detail string) {
 		if progress != nil {
-			progress(ProgressEvent{Kind: kind, Agent: agentName, Message: msg, Detail: detail})
+			progress(ctx, ProgressEvent{SessionID: sessionID, Kind: kind, Agent: agentName, Message: msg, Detail: detail})
 		}
 	}
-	emit("think", "助手开始执行任务: "+task)
+	emit(ctx, "think", "助手开始执行任务: "+task)
 
 	// 默认工具列表（CamelCase，与 ToolExecutor.Execute case 名一致）。
 	// 无论 DomainAgent 是否装配 SkillSet，都保留这套兜底工具，
@@ -171,18 +175,18 @@ func executeWithTools(
 				consecutiveFailures, lastFailedTool)
 		}
 
-		emit("llm", fmt.Sprintf("第 %d 轮：调用 LLM 决策下一步...", round+1))
+		emit(ctx, "llm", fmt.Sprintf("第 %d 轮：调用 LLM 决策下一步...", round+1))
 		inputTokens := model.EstimateTokens(prompt)
-		emitDetail("prompt", fmt.Sprintf("[%s] 第 %d 轮 Prompt (%d tokens)", agentName, round+1, inputTokens), model.SummarizePrompt(prompt, 400))
+		emitDetail(ctx, "prompt", fmt.Sprintf("[%s] 第 %d 轮 Prompt (%d tokens)", agentName, round+1, inputTokens), model.SummarizePrompt(prompt, 400))
 
 		start := time.Now()
 		resp, err := llm.Generate(ctx, prompt)
 		dur := time.Since(start)
 		outputTokens := model.EstimateTokens(resp)
-		emitDetail("token_usage", fmt.Sprintf("[%s] 第 %d 轮 Token: in=%d out=%d dur=%v", agentName, round+1, inputTokens, outputTokens, dur.Round(time.Millisecond)), "")
+		emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] 第 %d 轮 Token: in=%d out=%d dur=%v", agentName, round+1, inputTokens, outputTokens, dur.Round(time.Millisecond)), "")
 
 		if err != nil {
-			emit("error", fmt.Sprintf("LLM 调用失败: %v", err))
+			emit(ctx, "error", fmt.Sprintf("LLM 调用失败: %v", err))
 			if len(allResults) > 0 {
 				return fmt.Sprintf("LLM调用失败(已完成%d步工具操作): %v", len(allResults), err), allResults
 			}
@@ -198,14 +202,14 @@ func executeWithTools(
 
 			// 情况 1：LLM 声称已写文件但实际没有 WriteFile 记录 → 幻觉，强制要求落盘
 			if claimsFileWrite(resp) && !alreadyWritten {
-				emit("think", "LLM 声称已写文件但无 WriteFile 记录，疑似幻觉，强制要求调用工具")
+				emit(ctx, "think", "LLM 声称已写文件但无 WriteFile 记录，疑似幻觉，强制要求调用工具")
 				prompt += "\n\n[系统提示] 你声称已写文件，但工具执行记录中没有 WriteFile 调用。" +
 					"请立即输出 WriteFile 工具调用以真正落盘，禁止用文字描述代替。"
 				prompt += "\n用户原始任务: " + task
 				resp2, err2 := llm.Generate(ctx, prompt)
 				if err2 == nil {
 					if req2 := parseToolCall(resp2); req2 != nil {
-						result := executor.Execute(ctx, req2.Tool, req2.Args)
+						result := executor.Execute(WithSessionID(ctx, sessionID), req2.Tool, req2.Args)
 						allResults = append(allResults, result)
 						continue
 					}
@@ -217,17 +221,17 @@ func executeWithTools(
 			// → 不接受，强制继续要求 WriteFile（除非已是最后一轮）
 			if needWrite && !alreadyWritten {
 				if round < maxRounds-1 {
-					emit("intend", "任务要求写文件但尚未落盘，拒绝文字答案，强制要求调用 WriteFile")
+					emit(ctx, "intend", "任务要求写文件但尚未落盘，拒绝文字答案，强制要求调用 WriteFile")
 					forcePrompt := prompt + "\n\n[系统提示] 任务要求创建/写入文件，但你尚未调用 WriteFile。" +
 						"请立即输出 WriteFile 工具调用，将完整可运行代码写入目标路径。" +
 						"代码必须完整、可运行，禁止用 pass/占位符/省略号代替实际逻辑。禁止再用文字描述。"
 					resp2, err2 := llm.Generate(ctx, forcePrompt)
 					if err2 == nil {
 						if req2 := parseToolCall(resp2); req2 != nil {
-							result := executor.Execute(ctx, req2.Tool, req2.Args)
+							result := executor.Execute(WithSessionID(ctx, sessionID), req2.Tool, req2.Args)
 							allResults = append(allResults, result)
 							if result.Success && result.Tool == "WriteFile" {
-								emit("think", "WriteFile 成功，任务完成")
+								emit(ctx, "think", "WriteFile 成功，任务完成")
 								return resp2, allResults
 							}
 							continue
@@ -237,18 +241,18 @@ func executeWithTools(
 					continue
 				}
 				// 最后一轮仍未写文件 → 返回明确失败标记
-				emit("error", "达到最大轮数仍未通过 WriteFile 落盘，任务失败")
+				emit(ctx, "error", "达到最大轮数仍未通过 WriteFile 落盘，任务失败")
 				return "[失败: 任务要求写文件但未调用 WriteFile 落盘] " + resp, allResults
 			}
 
-			emit("think", "LLM 未调用工具，视为最终答案")
+			emit(ctx, "think", "LLM 未调用工具，视为最终答案")
 			return resp, allResults
 		}
 
 		// 执行工具
 		argsStr, _ := json.Marshal(toolReq.Args)
-		emitDetail("tool_call", fmt.Sprintf("调用工具 %s", toolReq.Tool), string(argsStr))
-		result := executor.Execute(ctx, toolReq.Tool, toolReq.Args)
+		emitDetail(ctx, "tool_call", fmt.Sprintf("调用工具 %s", toolReq.Tool), string(argsStr))
+		result := executor.Execute(WithSessionID(ctx, sessionID), toolReq.Tool, toolReq.Args)
 		allResults = append(allResults, result)
 		if result.Success {
 			consecutiveFailures = 0
@@ -257,7 +261,7 @@ func executeWithTools(
 			if len(out) > 200 {
 				out = out[:200] + "..."
 			}
-			emitDetail("tool_result", fmt.Sprintf("工具 %s 执行成功", toolReq.Tool), out)
+			emitDetail(ctx, "tool_result", fmt.Sprintf("工具 %s 执行成功", toolReq.Tool), out)
 		} else {
 			// 累计连续失败次数：同一工具族（按工具名归并）连续失败才累加，
 			// 中途换工具则重置计数，避免误伤"先失败A再成功B"的合法路径
@@ -267,12 +271,12 @@ func executeWithTools(
 				consecutiveFailures = 1
 			}
 			lastFailedTool = toolReq.Tool
-			emit("error", fmt.Sprintf("工具 %s 执行失败 (%d/%d 连续): %s",
+			emit(ctx, "error", fmt.Sprintf("工具 %s 执行失败 (%d/%d 连续): %s",
 				toolReq.Tool, consecutiveFailures, maxConsecutiveFailures, result.Error))
 
 			// 同一工具连续失败超过阈值 → 停止盲目重试，把已收集到的失败信息交给上层
 			if consecutiveFailures >= maxConsecutiveFailures {
-				emit("error", fmt.Sprintf("连续 %d 次失败，停止重试，返回失败总结", consecutiveFailures))
+				emit(ctx, "error", fmt.Sprintf("连续 %d 次失败，停止重试，返回失败总结", consecutiveFailures))
 				return fmt.Sprintf("[失败: 工具 %s 连续 %d 次失败，最后错误: %s]",
 					toolReq.Tool, consecutiveFailures, result.Error), allResults
 			}

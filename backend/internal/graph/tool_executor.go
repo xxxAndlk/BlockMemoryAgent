@@ -18,11 +18,12 @@ import (
 
 // ToolResult 工具执行结果
 type ToolResult struct {
-	Tool    string `json:"tool"`
-	Success bool   `json:"success"`
-	Output  string `json:"output"`
-	Error   string `json:"error,omitempty"`
-	Path    string `json:"path,omitempty"`
+	Tool      string `json:"tool"`
+	Success   bool   `json:"success"`
+	Output    string `json:"output"`
+	Error     string `json:"error,omitempty"`
+	Path      string `json:"path,omitempty"`
+	SessionID string `json:"session_id,omitempty"` // 归属会话，避免跨会话事件泄漏
 }
 
 // ToolCallback 工具执行回调（用于通知UI）
@@ -33,14 +34,16 @@ type ToolCallback func(result *ToolResult)
 //   "think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error"  (原有)
 //   "prompt" | "agent_created" | "token_usage" | "graph_step"                     (新增调试类)
 type ProgressEvent struct {
-	Kind    string // "think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error" | "prompt" | "agent_created" | "token_usage" | "graph_step"
-	Agent   string // 节点名/角色名
-	Message string // 人类可读描述
-	Detail  string // 可选：LLM 原始输出 / 工具参数 / 错误堆栈 / prompt 摘要 / JSON 详情
+	SessionID string // 归属会话，避免跨会话事件泄漏
+	Kind      string // "think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error" | "prompt" | "agent_created" | "token_usage" | "graph_step"
+	Agent     string // 节点名/角色名
+	Message   string // 人类可读描述
+	Detail    string // 可选：LLM 原始输出 / 工具参数 / 错误堆栈 / prompt 摘要 / JSON 详情
 }
 
 // ProgressCallback 进度回调。server 层注入，graph 各节点在每个关键步骤触发。
-type ProgressCallback func(ev ProgressEvent)
+// 携带 context 以便下游按 sessionID 路由事件。
+type ProgressCallback func(ctx context.Context, ev ProgressEvent)
 
 // ToolExecutor 本地工具执行器（沙箱）
 type ToolExecutor struct {
@@ -72,6 +75,7 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	toolName = normalizeToolName(toolName)
 
 	var result *ToolResult
+	sessionID := SessionIDFromContext(ctx)
 	switch toolName {
 	case "ReadFile":
 		result = e.readFile(args)
@@ -90,6 +94,7 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	default:
 		result = &ToolResult{Tool: toolName, Error: fmt.Sprintf("unknown tool: %s", toolName)}
 	}
+	result.SessionID = sessionID
 	if e.callback != nil {
 		e.callback(result)
 	}
@@ -459,4 +464,20 @@ func (e *ToolExecutor) resolvePath(path string) string {
 		return path
 	}
 	return filepath.Join(e.workDir, path)
+}
+
+// sessionIDKey 用于在 context 中传递会话 ID 的非导出键类型
+type sessionIDKey struct{}
+
+// WithSessionID 把会话 ID 写入 context
+func WithSessionID(ctx context.Context, sessionID string) context.Context {
+	return context.WithValue(ctx, sessionIDKey{}, sessionID)
+}
+
+// SessionIDFromContext 从 context 读取会话 ID
+func SessionIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(sessionIDKey{}).(string); ok {
+		return v
+	}
+	return ""
 }

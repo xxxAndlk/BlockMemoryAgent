@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,8 +74,8 @@ func NewSessionManager(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry) *
 	}))
 
 	// 将进度回调注入图，把 Agent 的思考/意图/工具调用实时推给会话事件流
-	g.SetProgressCallback(graph.ProgressCallback(func(ev graph.ProgressEvent) {
-		m.handleProgress(ev)
+	g.SetProgressCallback(graph.ProgressCallback(func(ctx context.Context, ev graph.ProgressEvent) {
+		m.handleProgress(ctx, ev)
 	}))
 
 	return m
@@ -132,13 +133,27 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 		// 让列表的 seq 不与未来创建冲突
 		restored++
 	}
+
+	// 根据已恢复会话的 ID 后缀同步 seq，避免新建会话 ID 与历史记录冲突
+	var maxSeq int64
+	for _, rec := range recs {
+		if id := rec.SessionID; strings.HasPrefix(id, "session-") {
+			if n, err := strconv.ParseInt(strings.TrimPrefix(id, "session-"), 10, 64); err == nil && n > maxSeq {
+				maxSeq = n
+			}
+		}
+	}
+	if maxSeq > 0 {
+		m.seq.Store(maxSeq)
+	}
+
 	if restored > 0 {
 		log.Printf("restored %d sessions from history", restored)
 	}
 	return restored
 }
 
-// handleToolResult 处理工具执行结果，将其广播到当前运行中的会话
+// handleToolResult 处理工具执行结果，将其路由到归属会话
 func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 	// 注意：不能在持有 m.mu.RLock 的情况下调用 addEvent（addEvent 内部取 Lock，
 	// 同 goroutine RLock+Lock 会自死锁，导致会话卡死）。先在 RLock 下收集目标
@@ -146,9 +161,14 @@ func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 	m.mu.RLock()
 	targets := make([]*Session, 0, 1)
 	for _, session := range m.sessions {
-		if session.Status == "running" {
-			targets = append(targets, session)
+		if session.Status != "running" {
+			continue
 		}
+		// 优先按工具结果携带的 sessionID 精确匹配，未携带时保持原广播行为兜底
+		if result.SessionID != "" && session.ID != result.SessionID {
+			continue
+		}
+		targets = append(targets, session)
 	}
 	m.mu.RUnlock()
 
@@ -165,7 +185,7 @@ func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 //	tool_call / tool_result     -> "progress"（tool_exec 仍由 handleToolResult 单独发）
 //	error                       -> "progress"（标记 success=false）
 //	prompt / agent_created / token_usage / graph_step -> 同上，但扩展字段携带调试信息
-func (m *SessionManager) handleProgress(ev graph.ProgressEvent) {
+func (m *SessionManager) handleProgress(ctx context.Context, ev graph.ProgressEvent) {
 	msg := ev.Message
 	detail := ev.Detail
 	if detail != "" {
@@ -189,9 +209,14 @@ func (m *SessionManager) handleProgress(ev graph.ProgressEvent) {
 	m.mu.RLock()
 	targets := make([]*Session, 0, 1)
 	for _, session := range m.sessions {
-		if session.Status == "running" {
-			targets = append(targets, session)
+		if session.Status != "running" {
+			continue
 		}
+		// 优先按进度事件携带的 sessionID 精确匹配，未携带时保持原广播行为兜底
+		if ev.SessionID != "" && session.ID != ev.SessionID {
+			continue
+		}
+		targets = append(targets, session)
 	}
 	m.mu.RUnlock()
 

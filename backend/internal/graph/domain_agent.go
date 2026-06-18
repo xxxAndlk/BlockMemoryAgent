@@ -58,7 +58,7 @@ func (n *DomainAgentNode) SetProgressCallback(cb ProgressCallback) {
 }
 
 // emit 推送进度事件
-func (n *DomainAgentNode) emit(kind, message string) {
+func (n *DomainAgentNode) emit(ctx context.Context, kind, message string) {
 	if n.progress == nil {
 		return
 	}
@@ -66,11 +66,11 @@ func (n *DomainAgentNode) emit(kind, message string) {
 	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
 		agent = "DomainAgent[" + inst.Domain + "]"
 	}
-	n.progress(ProgressEvent{Kind: kind, Agent: agent, Message: message})
+	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: agent, Message: message})
 }
 
 // emitDetail 推送带详情的进度事件
-func (n *DomainAgentNode) emitDetail(kind, message, detail string) {
+func (n *DomainAgentNode) emitDetail(ctx context.Context, kind, message, detail string) {
 	if n.progress == nil {
 		return
 	}
@@ -78,7 +78,7 @@ func (n *DomainAgentNode) emitDetail(kind, message, detail string) {
 	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
 		agent = "DomainAgent[" + inst.Domain + "]"
 	}
-	n.progress(ProgressEvent{Kind: kind, Agent: agent, Message: message, Detail: detail})
+	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: agent, Message: message, Detail: detail})
 }
 
 // Name 返回节点名称
@@ -98,7 +98,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		return nil, fmt.Errorf("domain agent instance %s not found", n.instID)
 	}
 
-	n.emit("think", fmt.Sprintf("DomainAgent 启动，领域目标: %s", state.DomainGoal))
+	n.emit(ctx, "think", fmt.Sprintf("DomainAgent 启动，领域目标: %s", state.DomainGoal))
 	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusActive)
 
 	// v3 §5：为本 DomainAgent 装配领域 Skill 子集（如未装配）
@@ -109,7 +109,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 			for _, s := range set.Skills {
 				ids = append(ids, s.SkillID)
 			}
-			n.emit("think", "已装配 Skill 子集: "+strings.Join(ids, ", "))
+			n.emit(ctx, "think", "已装配 Skill 子集: "+strings.Join(ids, ", "))
 		}
 	}
 
@@ -126,7 +126,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 
 	// 检查是否需要拆分为子领域
 	if n.shouldSplitToSubDomains(ctx, state, tasks) {
-		n.emit("intend", fmt.Sprintf("领域较复杂（%d 个子任务），拆分为子领域并行处理", len(tasks)))
+		n.emit(ctx, "intend", fmt.Sprintf("领域较复杂（%d 个子任务），拆分为子领域并行处理", len(tasks)))
 		return n.handleSubDomainSplit(ctx, state, inst)
 	}
 
@@ -140,7 +140,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	}
 
 	if len(pendingTasks) == 0 {
-		n.emit("think", "所有子任务已完成，汇总结果")
+		n.emit(ctx, "think", "所有子任务已完成，汇总结果")
 		n.summarizeResults(state)
 		n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusDone)
 		block.Status = "completed"
@@ -148,7 +148,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		return state, nil
 	}
 
-	n.emit("intend", fmt.Sprintf("派发 %d 个助手任务: %s", len(pendingTasks), strings.Join(pendingTasks, "; ")))
+	n.emit(ctx, "intend", fmt.Sprintf("派发 %d 个助手任务: %s", len(pendingTasks), strings.Join(pendingTasks, "; ")))
 	// 并行执行所有待处理任务
 	results := n.dispatchAssistantsParallel(ctx, state, inst, pendingTasks)
 
@@ -242,7 +242,7 @@ func (n *DomainAgentNode) createAssistantForTask(ctx context.Context, state *typ
 		return nil, nil
 	}
 	// 推送 Agent 创建调试事件
-	n.emitDetail("agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),
+	n.emitDetail(ctx, "agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),
 		fmt.Sprintf("instID=%s roleDefID=%s parentID=%s", assistantInst.ID, assistantInst.RoleDefID, n.instID))
 
 	assistantDef = n.registry.GetRoleDef(assistantInst.RoleDefID)
@@ -331,7 +331,7 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 
 	// 尝试使用LLM进行任务拆解
 	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
-		n.emit("llm", "调用 LLM 拆解子任务...")
+		n.emit(ctx, "llm", "调用 LLM 拆解子任务...")
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-4个独立可执行的子任务。
 
 目标: %s
@@ -346,15 +346,15 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 子任务:`, goal))
 		if !timedOut && err == nil && resp != "" {
 			if tasks := parseTaskListFromResp(resp); len(tasks) > 0 {
-				n.emit("think", fmt.Sprintf("LLM 拆解出 %d 个子任务", len(tasks)))
+				n.emit(ctx, "think", fmt.Sprintf("LLM 拆解出 %d 个子任务", len(tasks)))
 				return tasks
 			}
 		}
 		if timedOut {
-			n.emit("error", "任务拆解 LLM 调用超时，回退到规则")
+			n.emit(ctx, "error", "任务拆解 LLM 调用超时，回退到规则")
 			fmt.Printf("[DomainAgent] LLM timeout on task analysis, using rules. %s\n", n.llmTracker.StatsString())
 		} else if err != nil {
-			n.emitDetail("error", "任务拆解 LLM 调用失败: "+err.Error(), "")
+			n.emitDetail(ctx, "error", "任务拆解 LLM 调用失败: "+err.Error(), "")
 		}
 	}
 
@@ -374,7 +374,7 @@ func (n *DomainAgentNode) callLLMAs(ctx context.Context, caller string, prompt s
 		return "", err, false
 	}
 
-	n.emitDetail("prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
+	n.emitDetail(ctx, "prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
 
 	resp, callErr, timedOut := n.llmTracker.CallWithTimeout(ctx, llm, prompt, caller,
 		30*time.Second,
@@ -384,7 +384,7 @@ func (n *DomainAgentNode) callLLMAs(ctx context.Context, caller string, prompt s
 	records := n.llmTracker.Records()
 	if len(records) > 0 {
 		last := records[len(records)-1]
-		n.emitDetail("token_usage",
+		n.emitDetail(ctx, "token_usage",
 			fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", caller, last.InputTokens, last.OutputTokens, last.Duration.Round(time.Millisecond)),
 			"")
 	}

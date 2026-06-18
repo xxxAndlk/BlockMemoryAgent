@@ -79,12 +79,17 @@ function startStream(s: Session) {
   closeStream.value = streamSession(
     s.id,
     (ev) => {
+      // SSE 连接建立时后端会先推送一次完整 Session 快照，
+      // 该对象不是事件，跳过避免污染 events 数组。
+      if (ev && 'id' in ev && 'goal' in ev && 'events' in ev) return
       s.events.push(ev)
     },
     () => {
       loadSessions()
     },
-    () => {}
+    (err) => {
+      console.error('SSE error:', err)
+    }
   )
 }
 
@@ -328,7 +333,7 @@ const defaultProps = { children: 'children', label: 'label' }
         </template>
 
         <div class="text-xs text-gray-400 mb-2">LLM 调用统计</div>
-        <div class="grid grid-cols-3 gap-2 mb-6">
+        <div class="grid grid-cols-4 gap-2 mb-6">
           <div class="p-2 text-center">
             <div class="text-xs text-gray-500 mb-1">总调用</div>
             <div class="text-xl font-bold text-gray-200">{{ metrics.calls }}<span class="text-xs font-normal ml-1">次</span></div>
@@ -341,7 +346,7 @@ const defaultProps = { children: 'children', label: 'label' }
             <div class="text-xs text-gray-500 mb-1">平均耗时</div>
             <div class="text-xl font-bold text-green-400">{{ metrics.avg }}</div>
           </div>
-          <div class="p-2 text-center absolute right-6 top-[4.5rem]">
+          <div class="p-2 text-center">
             <div class="text-xs text-gray-500 mb-1">最长耗时</div>
             <div class="text-xl font-bold text-gray-200">{{ metrics.max }}</div>
           </div>

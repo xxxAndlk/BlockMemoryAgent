@@ -79,19 +79,19 @@ func (n *MetaAgentNode) SetProgressCallback(cb ProgressCallback) {
 }
 
 // emit 推送进度事件（nil 回调时无操作）
-func (n *MetaAgentNode) emit(kind, message string) {
+func (n *MetaAgentNode) emit(ctx context.Context, kind, message string) {
 	if n.progress == nil {
 		return
 	}
-	n.progress(ProgressEvent{Kind: kind, Agent: "MetaAgent", Message: message})
+	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: "MetaAgent", Message: message})
 }
 
 // emitDetail 推送带详情的进度事件
-func (n *MetaAgentNode) emitDetail(kind, message, detail string) {
+func (n *MetaAgentNode) emitDetail(ctx context.Context, kind, message, detail string) {
 	if n.progress == nil {
 		return
 	}
-	n.progress(ProgressEvent{Kind: kind, Agent: "MetaAgent", Message: message, Detail: detail})
+	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: "MetaAgent", Message: message, Detail: detail})
 }
 
 // Runtime 暴露运行时（其他节点动态构造时使用）
@@ -123,7 +123,7 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	n.registry.CleanupExpired()
 
 	// Watchdog: 监控当前活跃 Agent 的上下文规模（v3 §4.4）
-	n.runWatchdog(state)
+	n.runWatchdog(ctx, state)
 
 	// 邮箱：拉取广播桶里的消息并尝试转交（v3 §7.2）
 	n.processMailbox(state)
@@ -159,7 +159,7 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 // 实际场景下（如读大文件）一次工具输出就可能超硬阈值，强制结束会让
 // 写文件等关键动作来不及执行。现在 Evict 仅记录警告事件，不中断会话；
 // 真正的上下文压缩留待后续按 LevelCompress 实现。
-func (n *MetaAgentNode) runWatchdog(state *types.ThreeLayerState) {
+func (n *MetaAgentNode) runWatchdog(ctx context.Context, state *types.ThreeLayerState) {
 	if n.rt == nil || n.rt.Watchdog == nil {
 		return
 	}
@@ -183,9 +183,9 @@ func (n *MetaAgentNode) runWatchdog(state *types.ThreeLayerState) {
 	switch d.Level {
 	case watchdog.LevelEvict:
 		// 不再强制升级结束会话；仅记录警告，让当前任务继续完成。
-		n.emitDetail("wait", "Watchdog 触发 EVICT（上下文超硬阈值），已降级为警告，不中断会话: "+d.Reason, "")
+		n.emitDetail(ctx, "wait", "Watchdog 触发 EVICT（上下文超硬阈值），已降级为警告，不中断会话: "+d.Reason, "")
 	case watchdog.LevelCompress:
-		n.emit("think", "Watchdog 提示上下文接近软阈值，建议后续压缩: "+d.Reason)
+		n.emit(ctx, "think", "Watchdog 提示上下文接近软阈值，建议后续压缩: "+d.Reason)
 	case watchdog.LevelWarn:
 		// 静默
 	}
@@ -281,17 +281,17 @@ func (n *MetaAgentNode) loadMessagesSection(state *types.ThreeLayerState) string
 
 // handleInitial 首次启动处理
 func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	n.emit("think", "分析用户目标，决定是否需要拆分领域")
+	n.emit(ctx, "think", "分析用户目标，决定是否需要拆分领域")
 	// 加载跨会话历史，拼成"已知历史"段落注入后续 prompt
 	historySection := n.loadHistorySection(ctx)
 	if historySection != "" {
-		n.emit("think", "已加载跨会话历史作为上下文")
+		n.emit(ctx, "think", "已加载跨会话历史作为上下文")
 	}
 
 	// 简单问题直接回答，不拆分
 	messagesSection := n.loadMessagesSection(state)
 	if n.modelFactory != nil && n.isSimpleQuestion(state.DomainGoal) {
-		n.emit("intend", "判定为简单问题，直接调用 LLM 回答")
+		n.emit(ctx, "intend", "判定为简单问题，直接调用 LLM 回答")
 		answer, err, timedOut := n.callLLM(ctx, fmt.Sprintf(
 			`你是BlockMemoryAgent，一个基于大语言模型的本地AI开发助手，使用多Agent智能编排架构。
 你可以帮助用户：分析代码、操作文件、执行命令、搜索代码、编写程序等。
@@ -317,13 +317,13 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 
 	domains := n.analyzeDomains(ctx, state)
 	if len(domains) == 0 {
-		n.emit("error", "领域分析未返回任何领域，将结束会话")
+		n.emit(ctx, "error", "领域分析未返回任何领域，将结束会话")
 	} else {
 		names := make([]string, 0, len(domains))
 		for _, d := range domains {
 			names = append(names, d.Name)
 		}
-		n.emit("intend", fmt.Sprintf("拆分出 %d 个领域: %s", len(domains), strings.Join(names, ", ")))
+		n.emit(ctx, "intend", fmt.Sprintf("拆分出 %d 个领域: %s", len(domains), strings.Join(names, ", ")))
 	}
 
 	// 初始化 TaskBoard（v3 §7.1）：把领域名作为顶层子任务
@@ -338,7 +338,7 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 		if len(state.ActiveBlocks) >= n.maxBlocks {
 			break
 		}
-		n.emit("intend", fmt.Sprintf("创建 DomainAgent: %s (目标: %s)", domain.Name, domain.Goal))
+		n.emit(ctx, "intend", fmt.Sprintf("创建 DomainAgent: %s (目标: %s)", domain.Name, domain.Goal))
 		if len(state.ActiveBlocks) >= n.maxBlocks {
 			break
 		}
@@ -353,7 +353,7 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 		if roleDef != nil {
 			agentName = roleDef.Name
 		}
-		n.emitDetail("agent_created", fmt.Sprintf("创建 DomainAgent: %s (领域: %s)", agentName, domain.Name),
+		n.emitDetail(ctx, "agent_created", fmt.Sprintf("创建 DomainAgent: %s (领域: %s)", agentName, domain.Name),
 			fmt.Sprintf("instID=%s roleDefID=%s goal=%s", inst.ID, inst.RoleDefID, domain.Goal))
 
 		block := &types.SessionBlock{
@@ -624,7 +624,7 @@ func (n *MetaAgentNode) callLLMAs(ctx context.Context, caller string, prompt str
 	}
 
 	// 发送 prompt 调试事件
-	n.emitDetail("prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
+	n.emitDetail(ctx, "prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
 
 	// MetaAgent 主要做"路由 / 总结"决策，使用 0 温度
 	var resp string
@@ -644,7 +644,7 @@ func (n *MetaAgentNode) callLLMAs(ctx context.Context, caller string, prompt str
 	records := n.llmTracker.Records()
 	if len(records) > 0 {
 		last := records[len(records)-1]
-		n.emitDetail("token_usage",
+		n.emitDetail(ctx, "token_usage",
 			fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", caller, last.InputTokens, last.OutputTokens, last.Duration.Round(time.Millisecond)),
 			"")
 	}
@@ -681,7 +681,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 
 	// 尝试使用LLM分析领域
 	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
-		n.emit("llm", "调用 LLM 进行领域分析...")
+		n.emit(ctx, "llm", "调用 LLM 进行领域分析...")
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个多Agent系统的领域分析器。请分析以下用户目标，确定需要哪些业务领域来协作完成。
 
 用户目标: %s
@@ -695,21 +695,21 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 
 领域列表:`, goal, historySection, messagesSection))
 		if !timedOut && err == nil && resp != "" {
-			n.emit("think", "LLM 返回领域分析结果，正在解析")
+			n.emit(ctx, "think", "LLM 返回领域分析结果，正在解析")
 			if domains := n.parseDomainsFromLLM(resp); len(domains) > 0 {
 				return domains
 			}
-			n.emitDetail("think", "LLM 返回内容无法解析为领域列表", truncateStr(resp, 200))
+			n.emitDetail(ctx, "think", "LLM 返回内容无法解析为领域列表", truncateStr(resp, 200))
 		}
 		if timedOut {
-			n.emit("error", "领域分析 LLM 调用超时，回退到规则")
+			n.emit(ctx, "error", "领域分析 LLM 调用超时，回退到规则")
 			fmt.Printf("[MetaAgent] LLM timeout on domain analysis, using rules fallback. %s\n", n.llmTracker.StatsString())
 		} else if err != nil {
-			n.emitDetail("error", "领域分析 LLM 调用失败: "+err.Error(), "")
+			n.emitDetail(ctx, "error", "领域分析 LLM 调用失败: "+err.Error(), "")
 		}
 	}
 
-	n.emit("think", "回退到规则方式分析领域")
+	n.emit(ctx, "think", "回退到规则方式分析领域")
 	// 规则回退
 	return n.analyzeDomainsByRules(goal)
 }

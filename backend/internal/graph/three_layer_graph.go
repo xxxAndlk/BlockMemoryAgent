@@ -170,6 +170,7 @@ func (g *ThreeLayerGraph) Runtime() *runtime.Runtime { return g.rt }
 
 // Invoke 执行三层图
 func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
+	ctx = WithSessionID(ctx, state.SessionID)
 	current := "MetaAgent"
 	stepCount := 0
 	maxSteps := 200
@@ -199,11 +200,12 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		// 推送图步骤调试事件
 		next := g.determineNext(current, state)
 		if g.progress != nil {
-			g.progress(ProgressEvent{
-				Kind:    "graph_step",
-				Agent:   "Graph",
-				Message: fmt.Sprintf("Step %d: %s → %s (action=%s)", stepCount, current, next, state.NextAction),
-				Detail:  fmt.Sprintf("block=%s domain=%s calling=%v", state.CurrentBlockID, state.CurrentDomain, state.IsCalling()),
+			g.progress(ctx, ProgressEvent{
+				SessionID: state.SessionID,
+				Kind:      "graph_step",
+				Agent:     "Graph",
+				Message:   fmt.Sprintf("Step %d: %s → %s (action=%s)", stepCount, current, next, state.NextAction),
+				Detail:    fmt.Sprintf("block=%s domain=%s calling=%v", state.CurrentBlockID, state.CurrentDomain, state.IsCalling()),
 			})
 		}
 

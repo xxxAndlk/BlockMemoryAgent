@@ -52,9 +52,10 @@ async function runSession() {
   if (!goal.value.trim()) return
   loading.value = true
   try {
-    await createSession(goal.value.trim())
+    const s = await createSession(goal.value.trim())
     goal.value = ''
     await load()
+    if (s?.id) viewSession(s.id)
   } finally {
     loading.value = false
   }
@@ -129,9 +130,9 @@ const stats = computed(() => {
     })
   })
   return {
-    total: total || 28,
+    total,
     rate,
-    calls: calls || 1203,
+    calls,
     timeout: 2.4,
   }
 })
