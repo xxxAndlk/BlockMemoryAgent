@@ -264,6 +264,25 @@ func (m *SessionManager) GetSession(id string) *Session {
 	return m.sessions[id]
 }
 
+// LLMStats 返回所有运行中会话聚合的 LLM 调用统计（用于 /api/health）
+func (m *SessionManager) LLMStats() (callCount, timeoutCount int, avgDur, maxDur time.Duration) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, s := range m.sessions {
+		for _, ev := range s.Events {
+			if ev.Kind != "token_usage" {
+				continue
+			}
+			callCount++
+			if strings.Contains(ev.Message, "timeout") || strings.Contains(ev.Message, "超时") {
+				timeoutCount++
+			}
+		}
+	}
+	return
+}
+
 // ListSessions 列出所有会话
 func (m *SessionManager) ListSessions() []*Session {
 	m.mu.RLock()
@@ -722,4 +741,162 @@ func (m *SessionManager) resumeSession(session *Session) {
 
 	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", "", false)
 	m.persistHistory(session)
+}
+
+// HandleSessionMetrics GET /api/sessions/{id}/metrics — 会话级 LLM 统计
+func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/metrics")
+
+	session := m.GetSession(id)
+	if session == nil {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	var calls, timeouts, inputTokens, outputTokens int
+	var maxDur time.Duration
+	var totalDur time.Duration
+	for _, ev := range session.Events {
+		if ev.Kind != "token_usage" {
+			continue
+		}
+		calls++
+		inputTokens += ev.InputTokens
+		outputTokens += ev.OutputTokens
+		if strings.Contains(ev.Message, "timeout") || strings.Contains(ev.Message, "超时") {
+			timeouts++
+		}
+		// token_usage 消息格式: "[caller] Token 消耗: in=N out=M dur=X"
+		var dur time.Duration
+		fmt.Sscanf(ev.Message, "%*s Token 消耗: in=%*d out=%*d dur=%v", &dur)
+		totalDur += dur
+		if dur > maxDur {
+			maxDur = dur
+		}
+	}
+	avgDur := time.Duration(0)
+	if calls > 0 {
+		avgDur = totalDur / time.Duration(calls)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id":   id,
+		"calls":        calls,
+		"timeouts":     timeouts,
+		"avg_duration": avgDur.Round(time.Millisecond).String(),
+		"max_duration": maxDur.Round(time.Millisecond).String(),
+		"input_tokens": inputTokens,
+		"output_tokens": outputTokens,
+		"total_tokens": inputTokens + outputTokens,
+	})
+}
+
+// HandleSessionWatchdog GET /api/sessions/{id}/watchdog — 看门狗历史决策
+func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/watchdog")
+
+	session := m.GetSession(id)
+	if session == nil {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	var decisions []map[string]any
+	if m.graph.Runtime() != nil && m.graph.Runtime().Watchdog != nil {
+		for _, d := range m.graph.Runtime().Watchdog.History() {
+			// Watchdog.Check 使用 blockID 作为 agentID
+			if session.State == nil || session.State.ActiveBlocks[d.AgentID] == nil {
+				// 也匹配已完成 block
+				found := false
+				for _, bid := range session.State.CompletedBlocks {
+					if bid == d.AgentID {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+			}
+			decisions = append(decisions, map[string]any{
+				"agent_id":    d.AgentID,
+				"tokens":      d.Tokens,
+				"level":       d.Level.String(),
+				"reason":      d.Reason,
+				"suggested":   d.Suggested,
+				"occurred_at": d.OccurredAt,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id": id,
+		"decisions":  decisions,
+	})
+}
+
+// HandleSessionMailbox GET /api/sessions/{id}/mailbox — 会话内 Agent 未读邮件
+func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/mailbox")
+
+	session := m.GetSession(id)
+	if session == nil {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	var msgs []map[string]any
+	if rt := m.graph.Runtime(); rt != nil && rt.Mailbox != nil {
+		instances := m.registry.GetInstancesBySession(id)
+		seen := make(map[string]bool)
+		for _, inst := range instances {
+			for _, msg := range rt.Mailbox.Peek(inst.ID) {
+				if seen[msg.ID] {
+					continue
+				}
+				seen[msg.ID] = true
+				msgs = append(msgs, map[string]any{
+					"id":         msg.ID,
+					"from":       msg.From,
+					"to":         msg.To,
+					"type":       msg.Type,
+					"subject":    msg.Subject,
+					"body":       msg.Body,
+					"priority":   msg.Priority,
+					"status":     msg.Status,
+					"created_at": msg.CreatedAt,
+				})
+			}
+		}
+		// 合并广播桶
+		for _, msg := range rt.Mailbox.DrainBroadcast() {
+			if seen[msg.ID] {
+				continue
+			}
+			seen[msg.ID] = true
+			msgs = append(msgs, map[string]any{
+				"id":         msg.ID,
+				"from":       msg.From,
+				"to":         "*",
+				"type":       msg.Type,
+				"subject":    msg.Subject,
+				"body":       msg.Body,
+				"priority":   msg.Priority,
+				"status":     msg.Status,
+				"created_at": msg.CreatedAt,
+				"broadcast":  true,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id": id,
+		"messages":   msgs,
+	})
 }

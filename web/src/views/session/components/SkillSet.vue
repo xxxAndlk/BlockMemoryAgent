@@ -5,8 +5,9 @@
       <el-card class="!border-dark-border !bg-dark-panel">
         <div class="text-sm">
           <div class="text-gray-400 mb-1">当前 Agent</div>
-          <div class="font-bold text-primary text-lg">ArchitectureAgent</div>
-          <div class="text-xs text-gray-500 mt-1">Domain: CodeAnalysis</div>
+          <el-select v-model="selectedAgent" size="small" class="w-full">
+            <el-option v-for="opt in agentOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+          </el-select>
         </div>
       </el-card>
 
@@ -14,23 +15,22 @@
         <template #header>
           <div class="font-bold text-sm">当前装配的 Skills</div>
         </template>
-        
-        <div class="space-y-3">
-          <div v-for="(skill, idx) in equippedSkills" :key="idx" class="p-3 bg-dark-bg rounded border border-dark-border relative group">
+
+        <div v-if="loading" class="text-xs text-gray-500 text-center py-4">加载中...</div>
+        <div v-else class="space-y-3">
+          <div v-for="skill in equippedSkills" :key="skill.skill_id" class="p-3 bg-dark-bg rounded border border-dark-border relative group">
             <div class="flex justify-between items-start">
               <div>
                 <div class="font-bold text-sm text-gray-200">{{ skill.name }}</div>
-                <div class="text-xs text-gray-500 mt-1">Tool: <span class="text-blue-400">{{ skill.tool }}</span></div>
+                <div class="text-xs text-gray-500 mt-1">Tool: <span class="text-blue-400">{{ skill.tool_ref }}</span></div>
                 <div class="text-xs text-gray-500 mt-1">Cost: {{ skill.cost }}</div>
               </div>
-              <el-button type="danger" link class="opacity-0 group-hover:opacity-100 transition-opacity">
-                <el-icon><Delete /></el-icon>
-              </el-button>
             </div>
             <div class="text-xs text-gray-400 mt-2 pt-2 border-t border-dark-border">
-              描述: {{ skill.desc }}
+              描述: {{ skill.description }}
             </div>
           </div>
+          <div v-if="!equippedSkills.length" class="text-xs text-gray-500">未装配技能</div>
         </div>
       </el-card>
     </div>
@@ -41,76 +41,98 @@
       <el-card class="!border-dark-border !bg-dark-panel flex-1 overflow-y-auto">
         <template #header>
           <div class="flex justify-between items-center">
-            <div class="font-bold text-sm">技能候选池 (CodeAnalysis Domain)</div>
+            <div class="font-bold text-sm">技能候选池</div>
             <div class="flex gap-2">
               <el-input v-model="searchSkill" size="small" placeholder="搜索技能..." class="w-48">
                 <template #prefix><el-icon><Search /></el-icon></template>
               </el-input>
-              <el-button type="primary" size="small" plain>+ 新增 Skill</el-button>
             </div>
           </div>
         </template>
-        
-        <div class="grid grid-cols-3 gap-4">
-          <div v-for="(skill, idx) in availableSkills" :key="idx" class="p-4 bg-dark-bg rounded border border-dark-border hover:border-primary transition-colors flex flex-col">
+
+        <div v-if="loading" class="text-xs text-gray-500 text-center py-4">加载中...</div>
+        <div v-else class="grid grid-cols-3 gap-4">
+          <div v-for="skill in availableSkills" :key="skill.skill_id" class="p-4 bg-dark-bg rounded border border-dark-border hover:border-primary transition-colors flex flex-col">
             <div class="font-bold text-sm text-gray-200 mb-1">{{ skill.name }}</div>
-            <div class="text-xs text-gray-500 mb-1">Tool: <span class="text-blue-400">{{ skill.tool }}</span></div>
+            <div class="text-xs text-gray-500 mb-1">Tool: <span class="text-blue-400">{{ skill.tool_ref }}</span></div>
             <div class="text-xs text-gray-500 mb-4">Cost: {{ skill.cost }}</div>
-            
+
             <div class="mt-auto">
               <el-button type="primary" size="small" class="w-full !bg-primary/20 !text-primary !border-primary hover:!bg-primary hover:!text-white transition-colors">
                 <el-icon class="mr-1"><Plus /></el-icon> 装配
               </el-button>
             </div>
           </div>
+          <div v-if="!availableSkills.length" class="col-span-3 text-xs text-gray-500 text-center py-4">无可用技能</div>
         </div>
-      </el-card>
-
-      <!-- History -->
-      <el-card class="!border-dark-border !bg-dark-panel h-64">
-        <template #header>
-          <div class="font-bold text-sm">装配历史记录</div>
-        </template>
-        <el-table :data="history" size="small" class="!bg-transparent" height="100%">
-          <el-table-column prop="time" label="时间" width="160" class-name="text-gray-400" />
-          <el-table-column prop="agent" label="Agent" width="180" />
-          <el-table-column prop="skill" label="Skill" />
-          <el-table-column prop="action" label="操作" width="100">
-            <template #default="{ row }">
-              <span :class="row.action === '装配' ? 'text-green-500' : 'text-red-500'">{{ row.action }}</span>
-            </template>
-          </el-table-column>
-        </el-table>
       </el-card>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed, watch } from 'vue'
+import { listSkills, getAgentSkills, type Skill } from '@/api/session'
+import type { AgentNode } from '@/types'
+
+const props = defineProps<{
+  agents: AgentNode[]
+}>()
 
 const searchSkill = ref('')
+const allSkills = ref<Skill[]>([])
+const equippedSkillIds = ref<Set<string>>(new Set())
+const selectedAgent = ref('')
+const loading = ref(false)
 
-const equippedSkills = ref([
-  { name: 'Code Structure Analyzer', tool: 'ASTParser', cost: 3, desc: '分析代码结构和依赖关系' },
-  { name: 'Architecture Pattern Recognizer', tool: 'PatternMatcher', cost: 4, desc: '识别架构模式和设计原则' },
-  { name: 'Dependency Analyzer', tool: 'DepParser', cost: 2, desc: '分析模块间依赖关系' }
-])
+const agentOptions = computed(() => props.agents.map(a => ({ label: a.name, value: a.inst_id })))
 
-const availableSkills = ref([
-  { name: 'Go Code Analyzer', tool: 'GoParser', cost: 3 },
-  { name: 'Security Scanner', tool: 'SecScanner', cost: 5 },
-  { name: 'Performance Profiler', tool: 'Profiler', cost: 4 },
-  { name: 'Database Analyzer', tool: 'DBAnalyzer', cost: 2 },
-  { name: 'API Documentation', tool: 'APIDocGen', cost: 3 },
-  { name: 'Test Generator', tool: 'TestGen', cost: 2 }
-])
+watch(() => props.agents, (agents) => {
+  if (agents.length && !selectedAgent.value) {
+    selectedAgent.value = agents[0].inst_id
+  }
+}, { immediate: true })
 
-const history = ref([
-  { time: '2024-06-17 14:30', agent: 'ArchitectureAgent', skill: 'Code Structure Analyzer', action: '装配' },
-  { time: '2024-06-17 14:28', agent: 'ArchitectureAgent', skill: 'Architecture Pattern Recognizer', action: '装配' },
-  { time: '2024-06-17 14:25', agent: 'ArchitectureAgent', skill: 'Dependency Analyzer', action: '装配' }
-])
+watch(selectedAgent, () => loadAgentSkills())
+
+async function load() {
+  loading.value = true
+  try {
+    const res = await listSkills()
+    allSkills.value = res.skills || []
+  } catch {
+    allSkills.value = []
+  }
+  await loadAgentSkills()
+  loading.value = false
+}
+
+async function loadAgentSkills() {
+  if (!selectedAgent.value) {
+    equippedSkillIds.value = new Set()
+    return
+  }
+  try {
+    const res = await getAgentSkills(selectedAgent.value)
+    const ids = new Set<string>()
+    res.skillset?.skills?.forEach((s: Skill) => ids.add(s.skill_id))
+    equippedSkillIds.value = ids
+  } catch {
+    equippedSkillIds.value = new Set()
+  }
+}
+
+const equippedSkills = computed(() => allSkills.value.filter(s => equippedSkillIds.value.has(s.skill_id)))
+const availableSkills = computed(() => {
+  const q = searchSkill.value.trim().toLowerCase()
+  return allSkills.value.filter(s => {
+    if (equippedSkillIds.value.has(s.skill_id)) return false
+    if (!q) return true
+    return s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q) || s.skill_id.toLowerCase().includes(q)
+  })
+})
+
+load()
 </script>
 
 <style scoped>

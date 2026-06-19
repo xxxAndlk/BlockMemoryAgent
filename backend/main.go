@@ -13,6 +13,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/internal/memory"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
@@ -140,6 +141,23 @@ func main() {
 		log.Printf("Postgres unavailable — session history will NOT persist across restarts")
 	}
 
+	// 快照管理器（Redis 热加载 + Postgres 持久化）
+	var snapshotMgr *memory.SnapshotManager
+	if redisStore != nil && pgStore != nil {
+		snapshotMgr = memory.NewSnapshotManager(redisStore, pgStore)
+	}
+
+	// API 处理器（web 面板 / TUI 共用）
+	apiHandler := server.NewAPIHandler(nil)
+	apiHandler.SetSessionManager(sessionMgr)
+	apiHandler.SetRuntime(rt)
+	apiHandler.SetStores(pgStore, redisStore)
+	apiHandler.SetRoleConfig(roleCfg)
+	apiHandler.SetModelFactory(modelFactory)
+	if snapshotMgr != nil {
+		apiHandler.SetSnapshotManager(snapshotMgr)
+	}
+
 	// 路由
 	mux := http.NewServeMux()
 
@@ -155,6 +173,21 @@ func main() {
 		}
 	})
 	mux.HandleFunc("/api/sessions/", sessionRouter(sessionMgr))
+
+	// 全局状态与指标
+	mux.HandleFunc("/api/health", apiHandler.HealthHandler)
+	mux.HandleFunc("/api/status", apiHandler.StatusHandler)
+	mux.HandleFunc("/api/metrics/timeline", apiHandler.TimelineHandler)
+	mux.HandleFunc("/api/activity", apiHandler.ActivityHandler)
+
+	// 记忆 / Skill / 文件
+	mux.HandleFunc("/api/snapshot", apiHandler.SnapshotHandler)
+	mux.HandleFunc("/api/memory/search", apiHandler.MemorySearchHandler)
+	mux.HandleFunc("/api/memory/levels", apiHandler.MemoryLevelsHandler)
+	mux.HandleFunc("/api/skills", apiHandler.SkillsHandler)
+	mux.HandleFunc("/api/agents/", agentRouter(apiHandler))
+	mux.HandleFunc("/api/files", apiHandler.FilesHandler)
+	mux.HandleFunc("/api/files/content", apiHandler.FileContentHandler)
 
 	// 静态文件：Vue 构建产物在 web/dist/
 	fs := http.FileServer(http.Dir("web/dist"))
@@ -191,6 +224,18 @@ func main() {
 	httpServer.Close()
 }
 
+// agentRouter 路由 /api/agents/{id}/skills
+func agentRouter(handler *server.APIHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if len(path) > len("/api/agents/") && path[len(path)-len("/skills"):] == "/skills" {
+			handler.AgentSkillsHandler(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	}
+}
+
 // sessionRouter 路由 /api/sessions/{id} 和 /api/sessions/{id}/stream
 func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -217,6 +262,24 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 		// /api/sessions/{id}/agents
 		if len(path) > len("/api/sessions/") && path[len(path)-len("/agents"):] == "/agents" {
 			mgr.HandleSessionAgents(w, r)
+			return
+		}
+
+		// /api/sessions/{id}/metrics
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/metrics"):] == "/metrics" {
+			mgr.HandleSessionMetrics(w, r)
+			return
+		}
+
+		// /api/sessions/{id}/watchdog
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/watchdog"):] == "/watchdog" {
+			mgr.HandleSessionWatchdog(w, r)
+			return
+		}
+
+		// /api/sessions/{id}/mailbox
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/mailbox"):] == "/mailbox" {
+			mgr.HandleSessionMailbox(w, r)
 			return
 		}
 

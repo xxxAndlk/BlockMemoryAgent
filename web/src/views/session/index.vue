@@ -2,7 +2,7 @@
 import { ref, onMounted, computed, watch, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import type { Session, AgentNode, TaskBoardData } from '@/types'
-import { listSessions, getSession, getSessionBoard, getSessionAgents, streamSession } from '@/api/session'
+import { listSessions, getSession, getSessionBoard, getSessionAgents, streamSession, getSessionMetrics, getSessionWatchdog, getSessionMailbox, getHealth, type SessionMetrics, type WatchdogDecision, type MailboxMessage, type HealthResponse } from '@/api/session'
 import ExecutionLog from './components/ExecutionLog.vue'
 import MemoryExplorer from './components/MemoryExplorer.vue'
 import SkillSet from './components/SkillSet.vue'
@@ -17,6 +17,11 @@ const closeStream = ref<(() => void) | null>(null)
 
 const agents = ref<AgentNode[]>([])
 const board = ref<TaskBoardData | null>(null)
+
+const metrics = ref<SessionMetrics | null>(null)
+const watchdogDecisions = ref<WatchdogDecision[]>([])
+const mailboxMessages = ref<MailboxMessage[]>([])
+const health = ref<HealthResponse | null>(null)
 
 onMounted(async () => {
   await loadSessions()
@@ -61,17 +66,43 @@ async function selectSession(s: Session) {
   activeSession.value = s
   closeStream.value?.()
   startStream(s)
+  await loadSessionPanels(s.id)
+}
+
+async function loadSessionPanels(sessionID: string) {
   try {
-    const boardRes = await getSessionBoard(s.id)
+    const boardRes = await getSessionBoard(sessionID)
     board.value = boardRes.board || null
   } catch {
     board.value = null
   }
   try {
-    const agentRes = await getSessionAgents(s.id)
+    const agentRes = await getSessionAgents(sessionID)
     agents.value = agentRes.agents || []
   } catch {
     agents.value = []
+  }
+  try {
+    metrics.value = await getSessionMetrics(sessionID)
+  } catch {
+    metrics.value = null
+  }
+  try {
+    const wdRes = await getSessionWatchdog(sessionID)
+    watchdogDecisions.value = wdRes.decisions || []
+  } catch {
+    watchdogDecisions.value = []
+  }
+  try {
+    const mbRes = await getSessionMailbox(sessionID)
+    mailboxMessages.value = mbRes.messages || []
+  } catch {
+    mailboxMessages.value = []
+  }
+  try {
+    health.value = await getHealth()
+  } catch {
+    health.value = null
   }
 }
 
@@ -173,18 +204,6 @@ const constraints = computed(() => {
   ]
 })
 
-const metrics = computed(() => {
-  const evs = activeSession.value?.events || []
-  let calls = 0, input = 0, output = 0
-  evs.forEach(ev => {
-    if (ev.kind === 'token_usage') {
-      calls++
-      input += ev.input_tokens || 0
-      output += ev.output_tokens || 0
-    }
-  })
-  return { calls: calls || 127, timeout: 3, avg: '2.34s', max: '9.12s', input, output, total: input + output }
-})
 
 const progress = computed(() => {
   const done = tasks.value.filter(t => t.status === 'done').length
@@ -192,15 +211,65 @@ const progress = computed(() => {
   return total ? Math.round((done / total) * 100) : 75
 })
 
-const mails = ref([
-  { type: 'Milestone', color: 'text-green-500', icon: 'UserFilled', bgClass: 'bg-green-900/30', iconColor: 'text-green-500', time: '2分钟前', content: 'Architecture Analysis Complete', subContent: 'SubAgent-Architecture → MetaAgent' },
-  { type: 'Request', color: 'text-blue-400', icon: 'Connection', bgClass: 'bg-blue-900/30', iconColor: 'text-blue-400', time: '5分钟前', content: '需要确认架构设计方向', subContent: 'DomainAgent-CodeAnalysis → MetaAgent' },
-  { type: 'Dependency', color: 'text-yellow-500', icon: 'User', bgClass: 'bg-yellow-900/30', iconColor: 'text-yellow-500', time: '8分钟前', content: '等待 Redis 架构方案', subContent: 'SubAgent-Dependency → MetaAgent' },
-  { type: 'Info', color: 'text-gray-400', icon: 'Document', bgClass: 'bg-gray-800/50', iconColor: 'text-gray-400', time: '10分钟前', content: '项目结构解析完成', subContent: 'SubAgent-Parser → DomainAgent-CodeAnalysis' },
-  { type: 'Escalate', color: 'text-red-500', icon: 'WarningFilled', bgClass: 'bg-red-900/30', iconColor: 'text-red-500', time: '15分钟前', content: 'LLM 调用频率过高', subContent: 'Watchdog → MetaAgent' },
-])
-
 const defaultProps = { children: 'children', label: 'label' }
+
+function fmtTime(iso: string) {
+  return new Date(iso).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function fmtDateTime(iso: string) {
+  return new Date(iso).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function watchdogTagType(level: string) {
+  switch (level) {
+    case 'OK': return 'success'
+    case 'WARN': return 'warning'
+    case 'COMPRESS': return 'warning'
+    case 'EVICT': return 'danger'
+    default: return 'info'
+  }
+}
+
+function watchdogLabel(level: string) {
+  switch (level) {
+    case 'OK': return '正常'
+    case 'WARN': return '警告'
+    case 'COMPRESS': return '压缩'
+    case 'EVICT': return '驱逐'
+    default: return level
+  }
+}
+
+function mailboxTagType(type: string) {
+  switch (type) {
+    case 'milestone': return 'success'
+    case 'request': return 'primary'
+    case 'escalate': return 'danger'
+    case 'dependency': return 'warning'
+    case 'info': return 'info'
+    default: return 'info'
+  }
+}
+
+function mailboxIcon(type: string) {
+  switch (type) {
+    case 'milestone': return 'Trophy'
+    case 'request': return 'Connection'
+    case 'escalate': return 'WarningFilled'
+    case 'dependency': return 'Link'
+    case 'info': return 'Document'
+    default: return 'Message'
+  }
+}
+
+function healthDotClass(service?: { online?: boolean }) {
+  return service?.online ? 'text-green-500' : 'text-red-500'
+}
+
+function healthStatusText(service?: { online?: boolean; detail?: string }) {
+  return service?.online ? (service.detail || 'Connected') : (service?.detail || 'Offline')
+}
 
 </script>
 
@@ -316,9 +385,9 @@ const defaultProps = { children: 'children', label: 'label' }
 
       <div class="flex-1 overflow-hidden relative flex flex-col">
         <ExecutionLog v-if="activeTab === 'log'" :events="activeSession?.events || []" />
-        <MemoryExplorer v-if="activeTab === 'memory'" />
-        <SkillSet v-if="activeTab === 'skill'" />
-        <FilePreview v-if="activeTab === 'file'" />
+        <MemoryExplorer v-if="activeTab === 'memory'" :session-id="activeSession?.id || ''" :agents="agents" />
+        <SkillSet v-if="activeTab === 'skill'" :agents="agents" />
+        <FilePreview v-if="activeTab === 'file'" :session-id="activeSession?.id || ''" :agents="agents" />
       </div>
     </div>
 
@@ -336,31 +405,31 @@ const defaultProps = { children: 'children', label: 'label' }
         <div class="grid grid-cols-4 gap-2 mb-6">
           <div class="p-2 text-center">
             <div class="text-xs text-gray-500 mb-1">总调用</div>
-            <div class="text-xl font-bold text-gray-200">{{ metrics.calls }}<span class="text-xs font-normal ml-1">次</span></div>
+            <div class="text-xl font-bold text-gray-200">{{ metrics?.calls ?? 0 }}<span class="text-xs font-normal ml-1">次</span></div>
           </div>
           <div class="p-2 text-center">
             <div class="text-xs text-gray-500 mb-1">超时</div>
-            <div class="text-xl font-bold text-red-400">{{ metrics.timeout }}<span class="text-xs font-normal ml-1">次</span></div>
+            <div class="text-xl font-bold text-red-400">{{ metrics?.timeouts ?? 0 }}<span class="text-xs font-normal ml-1">次</span></div>
           </div>
           <div class="p-2 text-center">
             <div class="text-xs text-gray-500 mb-1">平均耗时</div>
-            <div class="text-xl font-bold text-green-400">{{ metrics.avg }}</div>
+            <div class="text-xl font-bold text-green-400">{{ metrics?.avg_duration ?? '-' }}</div>
           </div>
           <div class="p-2 text-center">
             <div class="text-xs text-gray-500 mb-1">最长耗时</div>
-            <div class="text-xl font-bold text-gray-200">{{ metrics.max }}</div>
+            <div class="text-xl font-bold text-gray-200">{{ metrics?.max_duration ?? '-' }}</div>
           </div>
         </div>
 
         <div class="text-xs text-gray-400 mb-2">上下文用量</div>
         <div class="mb-6 text-xs">
           <div class="flex justify-between mb-2">
-            <span>当前 Agent: SubAgent-Architecture</span>
-            <span class="text-blue-400 font-bold">{{ metrics.total > 0 ? Math.min(100, Math.round(metrics.total / 128000 * 100)) : 37.9 }}%</span>
+            <span>当前会话 Token 消耗</span>
+            <span class="text-blue-400 font-bold">{{ metrics && metrics.total_tokens > 0 ? Math.min(100, Math.round(metrics.total_tokens / 128000 * 100)) : 0 }}%</span>
           </div>
-          <div class="text-gray-500 mb-2">{{ metrics.total.toLocaleString() }} / 128,000 <span class="text-[10px]">tokens</span></div>
+          <div class="text-gray-500 mb-2">{{ (metrics?.total_tokens ?? 0).toLocaleString() }} / 128,000 <span class="text-[10px]">tokens</span></div>
           <div class="relative pt-1">
-            <el-progress :percentage="metrics.total > 0 ? Math.min(100, Math.round(metrics.total / 128000 * 100)) : 37.9" :show-text="false" class="custom-progress" />
+            <el-progress :percentage="metrics && metrics.total_tokens > 0 ? Math.min(100, Math.round(metrics.total_tokens / 128000 * 100)) : 0" :show-text="false" class="custom-progress" />
             <div class="absolute top-0 bottom-0 left-[80%] border-l-2 border-yellow-500 z-10 h-full -mt-0.5" style="height: 12px;"></div>
             <div class="absolute top-0 bottom-0 left-[95%] border-l-2 border-red-500 z-10 h-full -mt-0.5" style="height: 12px;"></div>
             <div class="flex justify-between mt-1 text-[10px]">
@@ -372,16 +441,12 @@ const defaultProps = { children: 'children', label: 'label' }
 
         <div class="text-xs text-gray-400 mb-2">看门狗状态</div>
         <div class="space-y-1 text-xs">
-          <div class="flex items-center gap-4">
-            <span class="text-gray-500 w-12">15:42:20</span>
-            <el-tag size="small" type="success" effect="plain" class="!bg-transparent !border-[#2a2d35] w-16 text-center">OK</el-tag>
-            <span class="text-gray-300">正常</span>
+          <div v-for="d in watchdogDecisions.slice(0, 5)" :key="d.agent_id + d.occurred_at" class="flex items-center gap-4">
+            <span class="text-gray-500 w-12">{{ fmtTime(d.occurred_at) }}</span>
+            <el-tag size="small" :type="watchdogTagType(d.level)" effect="plain" class="!bg-transparent !border-[#2a2d35] w-16 text-center">{{ d.level }}</el-tag>
+            <span class="text-gray-300 truncate flex-1">{{ watchdogLabel(d.level) }}</span>
           </div>
-          <div class="flex items-center gap-4">
-            <span class="text-gray-500 w-12">15:41:15</span>
-            <el-tag size="small" type="warning" effect="plain" class="!bg-transparent !border-[#2a2d35] w-16 text-center">Compress</el-tag>
-            <span class="text-gray-300">压缩记忆</span>
-          </div>
+          <div v-if="!watchdogDecisions.length" class="text-gray-500 text-xs">暂无看门狗决策</div>
         </div>
       </el-card>
 
@@ -393,23 +458,23 @@ const defaultProps = { children: 'children', label: 'label' }
           </div>
         </template>
         <div class="flex justify-between text-xs mb-4">
-          <span class="text-gray-400">未读消息 (5)</span>
-          <span class="text-blue-400 cursor-pointer hover:text-blue-300">全部标记已读</span>
+          <span class="text-gray-400">未读消息 ({{ mailboxMessages.length }})</span>
         </div>
         <div class="space-y-4">
-          <div v-for="(mail, idx) in mails" :key="idx" class="flex gap-3 text-xs">
-            <div class="mt-0.5 rounded-full p-1 shrink-0" :class="mail.bgClass">
-              <el-icon :class="mail.iconColor"><component :is="mail.icon" /></el-icon>
+          <div v-for="mail in mailboxMessages.slice(0, 8)" :key="mail.id" class="flex gap-3 text-xs">
+            <div class="mt-0.5 rounded-full p-1 shrink-0 bg-gray-800/50">
+              <el-icon class="text-gray-400"><component :is="mailboxIcon(mail.type)" /></el-icon>
             </div>
             <div class="flex-1 min-w-0">
               <div class="flex justify-between mb-1">
-                <span class="font-bold" :class="mail.color">{{ mail.type }}</span>
-                <span class="text-gray-500">{{ mail.time }}</span>
+                <span class="font-bold" :class="'text-' + mailboxTagType(mail.type) + '-500'">{{ mail.type }}</span>
+                <span class="text-gray-500">{{ fmtDateTime(mail.created_at) }}</span>
               </div>
-              <div class="text-gray-300 truncate">{{ mail.content }}</div>
-              <div class="text-gray-500 mt-1 truncate">{{ mail.subContent }}</div>
+              <div class="text-gray-300 truncate">{{ mail.subject }}</div>
+              <div class="text-gray-500 mt-1 truncate">{{ mail.from }} → {{ mail.to }}</div>
             </div>
           </div>
+          <div v-if="!mailboxMessages.length" class="text-gray-500 text-xs">暂无未读消息</div>
         </div>
       </el-card>
 
@@ -424,23 +489,20 @@ const defaultProps = { children: 'children', label: 'label' }
           <div class="flex items-center gap-4 bg-[#0f1115] p-2 rounded border border-[#2a2d35]">
             <el-icon class="text-gray-400 text-lg"><Coin /></el-icon>
             <div class="w-16 text-gray-300">Postgres</div>
-            <div class="text-green-500 w-16">Connected</div>
-            <div class="text-gray-500 flex-1">表行数: 24,567</div>
-            <div class="text-gray-500">延迟: 2ms</div>
+            <div class="w-16" :class="healthDotClass(health?.postgres)">{{ healthStatusText(health?.postgres) }}</div>
+            <div class="text-gray-500 flex-1">{{ health?.postgres?.online ? `延迟: ${health?.postgres?.latency_ms}ms` : '未连接' }}</div>
           </div>
           <div class="flex items-center gap-4 bg-[#0f1115] p-2 rounded border border-[#2a2d35]">
             <el-icon class="text-gray-400 text-lg"><DataLine /></el-icon>
             <div class="w-16 text-gray-300">Redis</div>
-            <div class="text-green-500 w-16">Connected</div>
-            <div class="text-gray-500 flex-1">Key 数量: 1,823</div>
-            <div class="text-gray-500">延迟: 1ms</div>
+            <div class="w-16" :class="healthDotClass(health?.redis)">{{ healthStatusText(health?.redis) }}</div>
+            <div class="text-gray-500 flex-1">{{ health?.redis?.online ? `延迟: ${health?.redis?.latency_ms}ms` : '未连接' }}</div>
           </div>
           <div class="flex items-center gap-4 bg-[#0f1115] p-2 rounded border border-[#2a2d35]">
             <el-icon class="text-gray-400 text-lg"><Connection /></el-icon>
             <div class="w-16 text-gray-300">LLM API</div>
-            <div class="text-green-500 w-16">Connected</div>
-            <div class="text-gray-500 flex-1">最近调用: 1.82s</div>
-            <div class="text-gray-500">成功率: 99.2%</div>
+            <div class="w-16" :class="healthDotClass(health?.llm)">{{ healthStatusText(health?.llm) }}</div>
+            <div class="text-gray-500 flex-1 truncate">{{ health?.llm?.detail || '未配置' }}</div>
           </div>
         </div>
       </el-card>

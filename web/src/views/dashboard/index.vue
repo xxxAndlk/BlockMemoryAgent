@@ -2,7 +2,7 @@
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import type { Session } from '@/types'
-import { listSessions, createSession } from '@/api/session'
+import { listSessions, createSession, getTimeline, getActivity, type TimelinePoint, type ActivityItem } from '@/api/session'
 
 const router = useRouter()
 const goal = ref('')
@@ -14,24 +14,22 @@ const filter = ref('all')
 
 const quickTags = ['系统架构设计', '代码审查', '接口测试', '混沌演练', '根因分析', '生成周报']
 
-const trend = ref([820, 760, 880, 920, 890, 980, 1050, 1120, 1080, 1200, 1180, 1250])
-
-const activities = ref([
-  { icon: 'Connection', bgClass: 'bg-blue-900/30', iconClass: 'text-blue-400', agent: 'MetaAgent', content: '在会话「分析 gin 项目的架构并生成设计文档」中调用了 SearchKnowledge 工具', tag: '', tagType: '', time: '2m ago' },
-  { icon: 'User', bgClass: 'bg-blue-900/30', iconClass: 'text-blue-400', agent: 'DomainAgent-CodeAnalysis', content: '完成了子任务「解析项目结构」', tag: '', tagType: '', time: '5m ago' },
-  { icon: 'Trophy', bgClass: 'bg-green-900/30', iconClass: 'text-green-400', agent: '', content: '收到来自 SubAgent-Architecture 的里程碑通知', tag: 'Milestone', tagType: 'success', time: '12m ago' },
-  { icon: 'Warning', bgClass: 'bg-yellow-900/30', iconClass: 'text-yellow-400', agent: 'Watchdog', content: '触发记忆压缩 (Compress)', tag: 'Warning', tagType: 'warning', time: '15m ago' },
-  { icon: 'CircleClose', bgClass: 'bg-red-900/30', iconClass: 'text-red-400', agent: '', content: '会话「调研 Redis 缓存方案」执行失败', tag: 'Error', tagType: 'danger', time: '5h ago' },
-])
+const timeline = ref<TimelinePoint[]>([])
+const activities = ref<ActivityItem[]>([])
 
 onMounted(load)
 
 async function load() {
   loading.value = true
   try {
-    sessions.value = await listSessions()
-  } catch (e) {
-    sessions.value = mockSessions()
+    const [sessionsRes, timelineRes, activityRes] = await Promise.all([
+      listSessions().catch(() => null),
+      getTimeline(12).catch(() => null),
+      getActivity(8).catch(() => null),
+    ])
+    sessions.value = sessionsRes || mockSessions()
+    timeline.value = timelineRes?.points || []
+    activities.value = activityRes?.activities || []
   } finally {
     loading.value = false
   }
@@ -120,22 +118,44 @@ const stats = computed(() => {
   const total = sessions.value.length
   const completed = sessions.value.filter(s => s.status === 'completed').length
   const rate = total > 0 ? Math.round((completed / total) * 100) : 0
-  let calls = 0, tokens = 0
+  let calls = 0, tokens = 0, timeouts = 0
   sessions.value.forEach(s => {
     (s.events || []).forEach(ev => {
       if (ev.kind === 'token_usage') {
         calls++
         tokens += (ev.input_tokens || 0) + (ev.output_tokens || 0)
       }
+      if (ev.kind === 'error' && (ev.message?.toLowerCase().includes('timeout') || ev.message?.includes('超时'))) {
+        timeouts++
+      }
     })
   })
+  const timeoutRate = calls > 0 ? parseFloat(((timeouts / calls) * 100).toFixed(1)) : 0
   return {
     total,
     rate,
     calls,
-    timeout: 2.4,
+    timeout: timeoutRate,
+    tokens,
   }
 })
+
+const trendValues = computed(() => {
+  if (!timeline.value.length) return Array(12).fill(0)
+  return timeline.value.map(p => p.tokens || p.calls || 0)
+})
+
+function activityStyle(kind: string) {
+  switch (kind) {
+    case 'tool_call': return { icon: 'Connection', bgClass: 'bg-blue-900/30', iconClass: 'text-blue-400' }
+    case 'tool_result': return { icon: 'CircleCheck', bgClass: 'bg-green-900/30', iconClass: 'text-green-400' }
+    case 'error': return { icon: 'WarningFilled', bgClass: 'bg-red-900/30', iconClass: 'text-red-400' }
+    case 'agent_created': return { icon: 'UserFilled', bgClass: 'bg-purple-900/30', iconClass: 'text-purple-400' }
+    case 'token_usage': return { icon: 'Coin', bgClass: 'bg-yellow-900/30', iconClass: 'text-yellow-400' }
+    case 'milestone': return { icon: 'Trophy', bgClass: 'bg-green-900/30', iconClass: 'text-green-400' }
+    default: return { icon: 'InfoFilled', bgClass: 'bg-gray-800/50', iconClass: 'text-gray-400' }
+  }
+}
 </script>
 
 <template>
@@ -285,50 +305,39 @@ const stats = computed(() => {
           <div class="p-3 bg-[#0f1115] rounded border border-[#2a2d35] relative overflow-hidden">
             <div class="text-xs text-gray-400 mb-1">会话总数</div>
             <div class="text-2xl font-bold text-gray-200">{{ stats.total }}</div>
-            <div class="text-xs text-gray-500 mt-1">较昨日 <span class="text-green-500">+12%</span></div>
-            <svg class="absolute bottom-2 right-2 w-16 h-8 text-green-500 opacity-50" viewBox="0 0 100 30" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M0 30 L20 20 L40 25 L60 10 L80 15 L100 5" />
-            </svg>
+            <div class="text-xs text-gray-500 mt-1">当前内存中的会话</div>
           </div>
 
           <div class="p-3 bg-[#0f1115] rounded border border-[#2a2d35] relative overflow-hidden">
             <div class="text-xs text-gray-400 mb-1">完成率</div>
             <div class="text-2xl font-bold text-gray-200">{{ stats.rate }}%</div>
-            <div class="text-xs text-gray-500 mt-1">较昨日 <span class="text-green-500">+8%</span></div>
-            <svg class="absolute bottom-2 right-2 w-16 h-8 text-green-500 opacity-50" viewBox="0 0 100 30" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M0 30 L20 25 L40 15 L60 20 L80 10 L100 5" />
-            </svg>
+            <div class="text-xs text-gray-500 mt-1">已完成 / 总数</div>
           </div>
 
           <div class="p-3 bg-[#0f1115] rounded border border-[#2a2d35] relative overflow-hidden">
             <div class="text-xs text-gray-400 mb-1">LLM 调用总数</div>
             <div class="text-2xl font-bold text-gray-200">{{ stats.calls.toLocaleString() }}</div>
-            <div class="text-xs text-gray-500 mt-1">较昨日 <span class="text-purple-500">+23%</span></div>
-            <svg class="absolute bottom-2 right-2 w-16 h-8 text-purple-500 opacity-50" viewBox="0 0 100 30" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M0 30 L20 10 L40 15 L60 5 L80 20 L100 0" />
-            </svg>
+            <div class="text-xs text-gray-500 mt-1">累计 Token: {{ stats.tokens.toLocaleString() }}</div>
           </div>
 
           <div class="p-3 bg-[#0f1115] rounded border border-[#2a2d35] relative overflow-hidden">
             <div class="text-xs text-gray-400 mb-1">超时率</div>
             <div class="text-2xl font-bold text-gray-200">{{ stats.timeout }}%</div>
-            <div class="text-xs text-gray-500 mt-1">较昨日 <span class="text-yellow-500">-1.2%</span></div>
-            <svg class="absolute bottom-2 right-2 w-16 h-8 text-yellow-500 opacity-50" viewBox="0 0 100 30" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M0 5 L20 15 L40 10 L60 25 L80 20 L100 30" />
-            </svg>
+            <div class="text-xs text-gray-500 mt-1">按 token_usage 事件估算</div>
           </div>
         </div>
 
         <div>
           <div class="flex justify-between text-xs text-gray-400 mb-2">
-            <span>平均响应时间趋势 (最近 12 次)</span>
-            <span>单位: ms</span>
+            <span>Token 消耗趋势 (最近 12 小时)</span>
+            <span>单位: tokens</span>
           </div>
           <div class="h-40 bg-[#0f1115] rounded border border-[#2a2d35] p-3">
-            <svg class="w-full h-full text-blue-500" viewBox="0 0 100 40" preserveAspectRatio="none" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path :d="`M0 ${40 - trend[0]/40} ${trend.slice(1).map((v,i)=>`L${(i+1)*100/(trend.length-1)} ${40 - v/40}`).join(' ')}`" />
-              <circle v-for="(v,i) in trend" :key="i" :cx="i*100/(trend.length-1)" :cy="40 - v/40" r="1.2" fill="currentColor" />
+            <svg v-if="trendValues.length > 1" class="w-full h-full text-blue-500" viewBox="0 0 100 40" preserveAspectRatio="none" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path :d="`M0 ${40 - trendValues[0]/40} ${trendValues.slice(1).map((v,i)=>`L${(i+1)*100/(trendValues.length-1)} ${40 - v/40}`).join(' ')}`" />
+              <circle v-for="(v,i) in trendValues" :key="i" :cx="i*100/(trendValues.length-1)" :cy="40 - v/40" r="1.2" fill="currentColor" />
             </svg>
+            <div v-else class="h-full flex items-center justify-center text-xs text-gray-500">暂无趋势数据</div>
           </div>
         </div>
       </el-card>
@@ -344,18 +353,19 @@ const stats = computed(() => {
 
         <div class="space-y-4">
           <div v-for="(activity, idx) in activities" :key="idx" class="flex items-start gap-3 text-sm">
-            <div class="mt-0.5 rounded-full p-1 shrink-0" :class="activity.bgClass">
-              <el-icon :class="activity.iconClass"><component :is="activity.icon" /></el-icon>
+            <div class="mt-0.5 rounded-full p-1 shrink-0" :class="activityStyle(activity.kind).bgClass">
+              <el-icon :class="activityStyle(activity.kind).iconClass"><component :is="activityStyle(activity.kind).icon" /></el-icon>
             </div>
             <div class="flex-1 min-w-0">
               <div class="text-gray-300 break-words line-clamp-2">
                 <span class="text-gray-400 mr-1" v-if="activity.agent">{{ activity.agent }}</span>
+                <span class="text-gray-500 mr-1">[{{ activity.kind }}]</span>
                 {{ activity.content }}
-                <el-tag v-if="activity.tag" :type="activity.tagType as any" size="small" effect="dark" class="scale-75 origin-left ml-1">{{ activity.tag }}</el-tag>
               </div>
             </div>
             <div class="text-xs text-gray-500 shrink-0 whitespace-nowrap">{{ activity.time }}</div>
           </div>
+          <div v-if="!activities.length" class="text-xs text-gray-500 text-center py-4">暂无活动</div>
         </div>
       </el-card>
     </div>

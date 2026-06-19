@@ -18,9 +18,9 @@
       </div>
       
       <div class="flex items-center space-x-6 text-sm ml-auto mr-8 shrink-0">
-        <span class="flex items-center text-gray-300"><div class="w-2 h-2 rounded-full bg-green-500 mr-2"></div>Postgres</span>
-        <span class="flex items-center text-gray-300"><div class="w-2 h-2 rounded-full bg-green-500 mr-2"></div>Redis</span>
-        <span class="flex items-center text-gray-300"><div class="w-2 h-2 rounded-full bg-green-500 mr-2"></div>LLM API</span>
+        <span class="flex items-center text-gray-300" title="Postgres"><div class="w-2 h-2 rounded-full mr-2" :class="healthDot(health?.postgres)"></div>Postgres</span>
+        <span class="flex items-center text-gray-300" title="Redis"><div class="w-2 h-2 rounded-full mr-2" :class="healthDot(health?.redis)"></div>Redis</span>
+        <span class="flex items-center text-gray-300" title="LLM API"><div class="w-2 h-2 rounded-full mr-2" :class="healthDot(health?.llm)"></div>LLM API</span>
       </div>
       
       <div class="flex items-center space-x-4 shrink-0">
@@ -74,13 +74,49 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { getHealth, getStatus, type HealthResponse, type StatusResponse } from '@/api/session'
 
 const route = useRoute()
 const router = useRouter()
 
 const currentSoul = ref('engineer')
+const health = ref<HealthResponse | null>(null)
+const status = ref<StatusResponse | null>(null)
+
+let healthTimer: ReturnType<typeof setInterval> | null = null
+
+async function loadStatus() {
+  try {
+    status.value = await getStatus()
+    if (status.value?.soul) currentSoul.value = status.value.soul
+  } catch {
+    // ignore
+  }
+}
+
+async function loadHealth() {
+  try {
+    health.value = await getHealth()
+  } catch {
+    health.value = null
+  }
+}
+
+onMounted(() => {
+  loadStatus()
+  loadHealth()
+  healthTimer = setInterval(loadHealth, 10000)
+})
+
+onUnmounted(() => {
+  if (healthTimer) clearInterval(healthTimer)
+})
+
+function healthDot(service?: { online?: boolean }) {
+  return service?.online ? 'bg-green-500' : 'bg-red-500'
+}
 
 const menuItems = computed(() => {
   const routes = router.options.routes.find(r => r.path === '/')?.children || []

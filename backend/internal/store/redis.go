@@ -33,6 +33,11 @@ func (s *RedisStore) Close() error {
 	return s.client.Close()
 }
 
+// Ping 检查 Redis 连接
+func (s *RedisStore) Ping(ctx context.Context) error {
+	return s.client.Ping(ctx).Err()
+}
+
 // topicKey 生成 topic 前缀 key
 func (s *RedisStore) topicKey(topicID, suffix string) string {
 	return fmt.Sprintf("topic:%s:%s", topicID, suffix)

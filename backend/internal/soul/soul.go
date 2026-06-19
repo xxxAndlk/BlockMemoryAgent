@@ -7,6 +7,7 @@ package soul
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,6 +54,21 @@ func (l *Loader) Current() *Persona {
 		return p
 	}
 	return &Persona{Path: l.path}
+}
+
+// Name 返回人格标识（文件名或 default）
+func (l *Loader) Name() string {
+	if l.path == "" {
+		return "default"
+	}
+	base := filepath.Base(l.path)
+	if ext := filepath.Ext(base); ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	if base == "" {
+		return "default"
+	}
+	return base
 }
 
 // Inject 把人格内容拼接到 systemPrompt 之前
