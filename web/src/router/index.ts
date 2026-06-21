@@ -14,10 +14,16 @@ const routes: Array<RouteRecordRaw> = [
         meta: { title: '首页', icon: 'House' }
       },
       {
+        path: 'chat',
+        name: 'Chat',
+        component: () => import('@/views/chat/index.vue'),
+        meta: { title: '对话', icon: 'ChatDotRound' }
+      },
+      {
         path: 'session',
         name: 'Session',
         component: () => import('@/views/session/index.vue'),
-        meta: { title: '会话管理', icon: 'ChatDotRound' }
+        meta: { title: '会话监控', icon: 'Monitor' }
       },
       {
         path: 'knowledge',
