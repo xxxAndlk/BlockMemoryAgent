@@ -2,7 +2,6 @@
 import { ref, computed } from 'vue'
 import type { SessionEvent } from '@/types'
 import { fmtTime, kindTagType, kindIcon, kindLabel, agentTextColor, hasDetail } from '../utils/eventStyles'
-import { renderMd } from '@/utils/markdown'
 
 const props = defineProps<{
   events: SessionEvent[]
@@ -27,6 +26,12 @@ const visible = computed(() => {
 })
 
 const hiddenCount = computed(() => props.events.length - visible.value.length)
+
+// 消息体只展示纯文本：多行混合中英/路径/JSON 的 prompt 摘要若走 markdown
+// 会出现错位、乱码式排版。仅最终回答（AssistantTurn）走 markdown。
+function asText(s: string | undefined): string {
+  return s || ''
+}
 </script>
 
 <template>
@@ -53,7 +58,7 @@ const hiddenCount = computed(() => props.events.length - visible.value.length)
           </el-tag>
           <span class="text-[11px] shrink-0" :class="agentTextColor(ev.agent)">{{ ev.agent }}</span>
           <div class="flex-1 min-w-0">
-            <div class="text-gray-300 break-words leading-relaxed markdown-body" v-html="renderMd(ev.message)"></div>
+            <div class="text-gray-300 break-words leading-relaxed whitespace-pre-wrap">{{ asText(ev.message) }}</div>
             <button v-if="hasDetail(ev)"
                     class="text-[10px] text-gray-500 hover:text-gray-300 mt-1 flex items-center gap-1"
                     @click="toggle(i)">
@@ -89,16 +94,4 @@ const hiddenCount = computed(() => props.events.length - visible.value.length)
 </template>
 
 <style scoped>
-.markdown-body :deep(p) { margin: 0; }
-.markdown-body :deep(pre) {
-  background: #0a0c10;
-  padding: 6px;
-  border-radius: 4px;
-  margin-top: 4px;
-  overflow-x: auto;
-  color: #e5e7eb;
-  font-size: 10.5px;
-}
-.markdown-body :deep(code) { font-family: monospace; font-size: 11px; }
-.markdown-body :deep(a) { color: #93c5fd; }
 </style>

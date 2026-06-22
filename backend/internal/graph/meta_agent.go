@@ -297,10 +297,11 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 你可以帮助用户：分析代码、操作文件、执行命令、搜索代码、编写程序等。
 
 请直接回答用户的简单问题，保持简洁友好。
+%s
 %s%s
 用户问题：%s
 
-你的回答：`, historySection, messagesSection, state.DomainGoal))
+你的回答：`, fmtEnvSection(), historySection, messagesSection, state.DomainGoal))
 		if timedOut {
 			state.SessionSummary = "LLM调用超时，请稍后重试"
 			state.NextAction = types.ActionFinish
@@ -579,9 +580,11 @@ func (n *MetaAgentNode) isSimpleQuestion(goal string) bool {
 		}
 	}
 
-	// 仅在命中明确寒暄/自我介绍模式时才视为简单问题
+	// 仅在命中明确寒暄/自我介绍模式时才视为简单问题。
+	// hello/hi/hey 必须作为整词（前后非字母数字）匹配，避免 "创建hello.txt"
+	// / "hey-check 工具" 这类实际任务被误判为寒暄。
 	simplePatterns := []string{
-		"你是什么", "你是谁", "什么模型", "你好", "hello", "hi", "hey",
+		"你是什么", "你是谁", "什么模型", "你好",
 		"叫什么名字", "介绍自己", "自我介绍", "能做什么", "有什么功能",
 	}
 	for _, p := range simplePatterns {
@@ -589,12 +592,46 @@ func (n *MetaAgentNode) isSimpleQuestion(goal string) bool {
 			return true
 		}
 	}
+	if isGreetingOnly(goalLower) {
+		return true
+	}
 
 	// 极短且纯 ASCII（如 "ping"）仍视为简单；中文短句一律不在此列
 	if utf8.RuneCountInString(goal) <= 6 && isASCII(goal) {
 		return true
 	}
 	return false
+}
+
+// isGreetingOnly 判断 goal 是否整句就是一个英文寒暄词（可带标点/空格），
+// 例如 "hello" / "hi there" / "hey!"。避免 "创建hello.txt" 这种实际任务
+// 被当作寒暄。
+func isGreetingOnly(goal string) bool {
+	g := strings.TrimSpace(strings.ToLower(goal))
+	greetings := []string{"hello", "hi", "hey", "hi there", "hey there"}
+	for _, gr := range greetings {
+		if g == gr {
+			return true
+		}
+		// 允许尾部标点
+		if strings.HasPrefix(g, gr) {
+			rest := strings.TrimSpace(g[len(gr):])
+			if rest == "" || allPunct(rest) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func allPunct(s string) bool {
+	for _, r := range s {
+		if !((r >= '!' && r <= '/') || (r >= ':' && r <= '@') || (r >= '[' && r <= '`') || (r >= '{' && r <= '~') ||
+			r == '！' || r == '。' || r == '？' || r == '，') {
+			return false
+		}
+	}
+	return s != ""
 }
 
 func isASCII(s string) bool {
@@ -685,6 +722,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个多Agent系统的领域分析器。请分析以下用户目标，确定需要哪些业务领域来协作完成。
 
 用户目标: %s
+%s
 %s%s
 要求:
 - 每个领域名称简短（2-6个字）
@@ -693,7 +731,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 - 输出JSON数组格式: [{"name":"领域名","goal":"该领域需要完成的目标"}]
 - 只输出JSON，不要其他内容
 
-领域列表:`, goal, historySection, messagesSection))
+领域列表:`, goal, fmtEnvSection(), historySection, messagesSection))
 		if !timedOut && err == nil && resp != "" {
 			n.emit(ctx, "think", "LLM 返回领域分析结果，正在解析")
 			if domains := n.parseDomainsFromLLM(resp); len(domains) > 0 {

@@ -186,13 +186,12 @@ func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 //	error                       -> "progress"（标记 success=false）
 //	prompt / agent_created / token_usage / graph_step -> 同上，但扩展字段携带调试信息
 func (m *SessionManager) handleProgress(ctx context.Context, ev graph.ProgressEvent) {
+	// message 字段仅保留人类可读简述，detail 仅走 detail_json/prompt 字段，
+	// 前端按需展开。之前把 detail 拼到 message 里，前端用 markdown 渲染多行
+	// prompt（中英混排 + JSON + 代码），会出现"乱码夹在中文中"的视觉错位。
 	msg := ev.Message
-	detail := ev.Detail
-	if detail != "" {
-		if len(detail) > 500 {
-			detail = detail[:500] + "..."
-		}
-		msg += "\n" + detail
+	if len(msg) > 1000 {
+		msg = msg[:1000] + "..."
 	}
 	success := ev.Kind != "error"
 
@@ -221,7 +220,7 @@ func (m *SessionManager) handleProgress(ctx context.Context, ev graph.ProgressEv
 	m.mu.RUnlock()
 
 	for _, session := range targets {
-		m.addEventDebug(session, "progress", ev.Agent, msg, ev.Kind, "", "", "", "", success, prompt, inputTokens, outputTokens, detail)
+		m.addEventDebug(session, "progress", ev.Agent, msg, ev.Kind, "", "", "", "", success, prompt, inputTokens, outputTokens, ev.Detail)
 	}
 }
 
@@ -295,8 +294,8 @@ func (m *SessionManager) ListSessions() []*Session {
 }
 
 func (m *SessionManager) runSession(ctx context.Context, session *Session) {
-	// 全局超时5分钟，防止LLM调用无限挂起
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	// 全局超时10分钟：复杂任务（写游戏+运行+DB检查）需多轮 ReAct，5分钟不够
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	state := types.NewThreeLayerState(session.ID)
@@ -685,7 +684,7 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 
 // resumeSession 基于历史消息恢复会话执行
 func (m *SessionManager) resumeSession(session *Session) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	// 构建对话上下文（最近10条消息）

@@ -148,19 +148,16 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		return state, nil
 	}
 
-	n.emit(ctx, "intend", fmt.Sprintf("派发 %d 个助手任务: %s", len(pendingTasks), strings.Join(pendingTasks, "; ")))
-	// 并行执行所有待处理任务
-	results := n.dispatchAssistantsParallel(ctx, state, inst, pendingTasks)
+	n.emit(ctx, "intend", fmt.Sprintf("派发 %d 个助手任务（串行）: %s", len(pendingTasks), strings.Join(pendingTasks, "; ")))
+	// 串行执行：子任务间常有依赖（如"启动游戏"依赖"写代码"），并行会导致后续任务找不到文件。
+	results := n.dispatchAssistantsSerial(ctx, state, inst, pendingTasks)
 
-	var mu sync.Mutex
 	if block.TaskResults == nil {
 		block.TaskResults = make(map[string]string)
 	}
-	mu.Lock()
 	for task, result := range results {
 		block.TaskResults[task] = result
 	}
-	mu.Unlock()
 
 	n.summarizeResults(state)
 	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusDone)
@@ -216,6 +213,24 @@ func (n *DomainAgentNode) dispatchAssistantsParallel(ctx context.Context, state 
 	}
 
 	wg.Wait()
+	return results
+}
+
+// dispatchAssistantsSerial 串行派发助手。
+//
+// 子任务间常有依赖（"启动游戏"依赖"写代码"、"运行 db_check"依赖"写 db_check"），
+// 并行会导致后续任务找不到前置产物而反复 ListDir/ReadFile 空转。
+// 串行虽慢，但 ReAct 循环能读到前置产物，任务成功率显著提升。
+func (n *DomainAgentNode) dispatchAssistantsSerial(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, tasks []string) map[string]string {
+	results := make(map[string]string, len(tasks))
+	for _, task := range tasks {
+		assistantInst, assistantDef := n.createAssistantForTask(ctx, state, inst, task)
+		if assistantInst == nil {
+			results[task] = fmt.Sprintf("[ERROR] 无法创建助手处理任务: %s", task)
+			continue
+		}
+		results[task] = n.runAssistant(ctx, state, assistantInst, assistantDef, task)
+	}
 	return results
 }
 
@@ -336,19 +351,37 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 
 目标: %s
 
+%s
+
 要求:
 - 每个子任务必须是一个可直接用工具执行的动作（如"用 WriteFile 写 X 文件"、"用 RunCommand 运行 Y"）
-- 严禁出现"分析/确定/规划/设计/思考/研究"等纯思考类子任务，这类工作应在执行动作中一并完成
+- 严禁出现"分析/确定/规划/设计/思考/研究/需求/方案"等纯思考类子任务，这类工作应在执行动作中一并完成
 - 涉及创建文件的目标，必须有子任务明确写出文件路径与内容来源
 - 子任务之间可以有依赖但应尽量并行
 - 只输出子任务列表，每行一个，不要编号，不要其他内容
 
-子任务:`, goal))
+示例（好）:
+用 WriteFile 把贪吃蛇游戏代码写到 workspace/snake.py
+用 RunCommand 运行 python workspace/snake.py 验证
+用 WriteFile 把 DB 检查脚本写到 workspace/db_check.py
+用 RunCommand 运行 python workspace/db_check.py
+
+示例（坏，禁止）:
+需求分析
+设计方案
+编写代码
+测试验证
+
+子任务:`, goal, fmtEnvSection()))
 		if !timedOut && err == nil && resp != "" {
 			if tasks := parseTaskListFromResp(resp); len(tasks) > 0 {
 				n.emit(ctx, "think", fmt.Sprintf("LLM 拆解出 %d 个子任务", len(tasks)))
 				return tasks
 			}
+			// LLM 返回的尽是思考类任务，过滤后为空 → 把整个 goal 作为单任务，
+			// 让一个 assistant 用 ReAct 循环完整执行（写文件+运行+验证）。
+			n.emit(ctx, "think", "LLM 拆解均为思考类任务，降级为单任务整体执行")
+			return []string{goal}
 		}
 		if timedOut {
 			n.emit(ctx, "error", "任务拆解 LLM 调用超时，回退到规则")
@@ -393,7 +426,12 @@ func (n *DomainAgentNode) callLLMAs(ctx context.Context, caller string, prompt s
 }
 
 // parseTaskListFromResp 从LLM响应解析任务列表
+//
+// 过滤纯思考类任务（需求分析/设计方案/测试验证 等），这类任务不产生可执行产物，
+// 只会浪费 ReAct 轮数并触发 LLM 超时。过滤后若为空，调用方应回退到规则拆解。
 func parseTaskListFromResp(resp string) []string {
+	thinkPatterns := []string{"需求分析", "设计方案", "设计", "分析", "规划", "思考", "研究",
+		"确定", "需求", "方案", "测试验证", "验证", "总结", "review"}
 	var tasks []string
 	for _, line := range strings.Split(resp, "\n") {
 		line = strings.TrimSpace(line)
@@ -402,9 +440,21 @@ func parseTaskListFromResp(resp string) []string {
 		if idx := strings.Index(line, ". "); idx > 0 && idx < 4 {
 			line = line[idx+2:]
 		}
-		if len(line) >= 2 {
-			tasks = append(tasks, line)
+		if len(line) < 2 {
+			continue
 		}
+		// 过滤纯思考类任务名（整行就是"需求分析"这种短词）
+		isThinkOnly := false
+		for _, p := range thinkPatterns {
+			if line == p || strings.TrimSpace(line) == p {
+				isThinkOnly = true
+				break
+			}
+		}
+		if isThinkOnly {
+			continue
+		}
+		tasks = append(tasks, line)
 	}
 	return tasks
 }
@@ -467,32 +517,15 @@ func (n *DomainAgentNode) matchFixedAssistant(task string) *types.RoleDefinition
 	return nil
 }
 
-// shouldSplitToSubDomains 判断是否需要拆分为子领域（基于任务复杂度+LLM判断）
+// shouldSplitToSubDomains 判断是否需要拆分为子领域。
+//
+// 已禁用：实测 SubDomain 拆分会产生 3+ 子领域，每个子领域又派 3-4 个 assistant，
+// 每个 assistant 跑 8 轮 ReAct，总 LLM 调用数爆炸（单任务 500+ events），
+// 5 分钟全局超时内根本跑不完，且子领域间重复执行同一任务。
+// DomainAgent 直接 dispatchAssistantsParallel 并行派 assistant 即可，
+// 不再走 SubDomain 层。
 func (n *DomainAgentNode) shouldSplitToSubDomains(ctx context.Context, state *types.ThreeLayerState, tasks []string) bool {
-	block := state.ActiveBlocks[state.CurrentBlockID]
-	if block != nil && block.SubDomainSplit {
-		if block.SubDomainIndex < len(block.SubDomainList) {
-			return true
-		}
-		return false
-	}
-
-	if len(tasks) < 4 {
-		return false
-	}
-
-	inst := n.registry.GetInstance(n.instID)
-	if inst == nil {
-		return false
-	}
-
-	// 尝试使用LLM判断是否需要拆分
-	if n.modelFactory != nil {
-		return n.shouldSplitWithLLM(ctx, inst.Domain, tasks)
-	}
-
-	// 规则回退：复杂领域自动拆分
-	return strings.Contains(inst.Domain, "商城") || strings.Contains(inst.Domain, "页面")
+	return false
 }
 
 // shouldSplitWithLLM 使用LLM判断是否需要拆分子领域

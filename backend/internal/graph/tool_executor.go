@@ -227,6 +227,10 @@ func (e *ToolExecutor) runCommand(ctx context.Context, args map[string]any) *Too
 	if t, ok := args["timeout"].(float64); ok && t > 0 {
 		timeout = time.Duration(t) * time.Second
 	}
+	// 强制上限 60s：LLM 可能传 300s+ 导致 curl/长命令卡死整个 session
+	if timeout > 60*time.Second {
+		timeout = 60 * time.Second
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

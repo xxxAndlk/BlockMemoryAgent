@@ -118,8 +118,8 @@ func executeWithTools(
 	// 去重以 ToolRef 为准。
 	skillSection := mergeToolList(skillBrief, defaultTools)
 
-	// 系统环境提示：避免 LLM 在 Windows 上反复尝试 python3/xdg-open 等命令
-	osHint := osSpecificHint()
+	// 系统环境提示：工作目录 / OS / DB 连接 / 运行时，避免 LLM 瞎猜路径或连不上库
+	envSection := fmtEnvSection()
 
 	systemPrompt := fmt.Sprintf(`%s
 
@@ -130,7 +130,6 @@ func executeWithTools(
 当你需要调用工具时，输出JSON格式:
 {"tool": "工具名", "args": {"参数名": "参数值"}}
 
-【运行环境】
 %s
 
 【硬性规则】
@@ -143,7 +142,7 @@ func executeWithTools(
 5. 只有当所有要求的文件已落盘、命令已执行，且无需再调用工具时，才输出最终文字总结。
 6. 工具失败时，输出会包含 stderr/stdout。请阅读失败原因后再决定下一步，
    不要盲目重试同一命令的不同变种。连续两次失败后必须换一种完全不同的方法
-   （例如换工具、换路径、放弃当前思路），而不是继续试错。`, roleDef.SystemPrompt, skillSection, osHint)
+   （例如换工具、换路径、放弃当前思路），而不是继续试错。`, roleDef.SystemPrompt, skillSection, envSection)
 
 	contextInfo := ""
 	if state.CurrentDomain != "" {
@@ -152,8 +151,8 @@ func executeWithTools(
 
 	userMsg := fmt.Sprintf("任务: %s%s\n\n请分析任务并执行。如果需要查看文件或执行命令，请调用工具。", task, contextInfo)
 
-	// 最多8轮工具调用（提高以容纳验证轮次）
-	maxRounds := 8
+	// 最多12轮工具调用：写文件+运行+验证+修正需多轮，8轮易卡在验证循环
+	maxRounds := 12
 	consecutiveFailures := 0  // 连续失败计数（同一工具连续失败累加，成功则清零）
 	lastFailedTool := ""
 	for round := 0; round < maxRounds; round++ {
@@ -289,7 +288,7 @@ func executeWithTools(
 // maxConsecutiveFailures 同一工具连续失败多少次后强制放弃重试
 const maxConsecutiveFailures = 3
 
-// osSpecificHint 给 LLM 的运行环境提示，避免在 Windows 上反复尝试 python3/xdg-open 等命令
+// osSpecificHint 兼容保留：旧调用点若仍引用此函数不会断链。新代码请用 fmtEnvSection。
 func osSpecificHint() string {
 	switch runtime.GOOS {
 	case "windows":
@@ -432,8 +431,8 @@ func executeAssistantWithTools(
 		return "", nil
 	}
 
-	// 带超时执行
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	// 带超时执行：单个 assistant 最多 5 分钟（12 轮 ReAct，每轮 LLM 可达 40s+）
+	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 
 	return executeWithTools(ctx, llm, executor, roleDef, task, state, skillBrief, progress, agentName)
