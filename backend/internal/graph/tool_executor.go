@@ -373,10 +373,10 @@ func (e *ToolExecutor) runCommand(ctx context.Context, args map[string]any) *Too
 
 	// 执行命令
 	err := cmd.Run()
-	// 合并 stdout 与 stderr
-	output := stdout.String()
+	// 合并 stdout 与 stderr，Windows cmd 默认 CP936 输出需转 UTF-8
+	output := SanitizeBytes(stdout.Bytes())
 	if stderr.Len() > 0 {
-		output += "\n[stderr]\n" + stderr.String()
+		output += "\n[stderr]\n" + SanitizeBytes(stderr.Bytes())
 	}
 
 	// 截断超长输出

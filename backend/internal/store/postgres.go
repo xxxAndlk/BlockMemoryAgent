@@ -575,6 +575,30 @@ func (s *PostgresStore) RecentSessionHistories(ctx context.Context, limit int) (
 	return out, nil
 }
 
+// GetSessionHistoryByID 按 session_id 查询单条会话历史。
+// 设计意图: 内存中只保留最近 N 条会话,旧会话从 DB 按需查。
+// 参数: ctx - 上下文; id - 会话 ID (session-N)。
+// 返回: 历史记录指针; 未找到返回 (nil, nil)。
+func (s *PostgresStore) GetSessionHistoryByID(ctx context.Context, id string) (*SessionHistoryRecord, error) {
+	var r SessionHistoryRecord
+	var raw []byte
+	err := s.db.QueryRowContext(ctx, `
+		SELECT session_id, goal, summary, tool_results, created_at
+		FROM session_history
+		WHERE session_id = $1
+	`, id).Scan(&r.SessionID, &r.Goal, &r.Summary, &raw, &r.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &r.ToolResults)
+	}
+	return &r, nil
+}
+
 // pgVector 将 float32 切片转为 pgvector 字符串格式 [1,2,3]。
 // 设计意图: database/sql 不直接支持 pgvector 类型,需以文本字面量形式传入 SQL。
 // 返回: 形如 "[0.123000,0.456000]" 的字符串;空切片返回 "[]"。

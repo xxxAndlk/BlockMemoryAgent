@@ -6,6 +6,7 @@ import (
 	"fmt"           // 格式化输出
 	"log"           // 日志输出
 	"net/http"      // HTTP 处理器
+	"sort"          // 会话列表按时间排序
 	"strconv"       // 字符串与数字转换
 	"strings"       // 字符串处理
 	"sync"          // 读写锁保护 sessions
@@ -62,6 +63,11 @@ type SessionEvent struct {
 	OutputTokens int    `json:"output_tokens,omitempty"` // 输出 token 估算
 	DetailJSON   string `json:"detail_json,omitempty"`   // 结构化详情（Agent 创建参数、图步骤状态等）
 }
+
+// maxInMemorySessions 内存中保留的最大已完成会话数。
+// 超过此阈值的最早完成会话从内存淘汰，仅保留 Postgres 持久化记录。
+// 运行中会话不计入此上限，永不淘汰。
+const maxInMemorySessions = 20
 
 // SessionManager 管理所有运行中 / 已完成的会话。
 // 持有 Graph 与 RoleRegistry 引用，通过 ToolCallback / ProgressCallback 把
@@ -174,6 +180,42 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 		log.Printf("restored %d sessions from history", restored) // 输出恢复条数
 	}
 	return restored
+}
+
+// evictCompletedSessions 淘汰最早的已完成会话，把内存占用控制在 maxInMemorySessions 以内。
+// 设计意图: 长期运行时 sessions map 无上限增长，每个会话的 Events 切片含 LLM prompt
+// 与工具输出，可达 MB 级，最终 OOM。已完成会话已持久化到 session_history 表，
+// 淘汰后前端仍可通过 HandleListSessions / HandleGetSession 从 DB 取回最小记录。
+// 并发安全: mu.Lock 保护 delete。
+func (m *SessionManager) evictCompletedSessions() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.sessions) <= maxInMemorySessions {
+		return
+	}
+	type kv struct {
+		id    string
+		ended time.Time
+	}
+	var completed []kv
+	for id, s := range m.sessions {
+		if s.Status == "running" || s.EndedAt == nil {
+			continue // 运行中不淘汰
+		}
+		completed = append(completed, kv{id, *s.EndedAt})
+	}
+	sort.Slice(completed, func(i, j int) bool {
+		return completed[i].ended.Before(completed[j].ended) // 升序：越早越先淘汰
+	})
+	excess := len(m.sessions) - maxInMemorySessions
+	dropped := 0
+	for i := 0; i < len(completed) && dropped < excess; i++ {
+		delete(m.sessions, completed[i].id)
+		dropped++
+	}
+	if dropped > 0 {
+		log.Printf("evicted %d completed sessions from memory (kept %d)", dropped, len(m.sessions))
+	}
 }
 
 // handleToolResult 处理工具执行结果，将其路由到归属会话。
@@ -400,6 +442,9 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 			}
 		}
 	}
+
+	// 会话完成后淘汰最早的已完成会话，防止长期运行 OOM
+	m.evictCompletedSessions()
 }
 
 // persistHistory 把会话目标 / 总结 / 工具调用结果写入 session_history 表
@@ -497,7 +542,7 @@ func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Requ
 	var req struct {
 		Goal string `json:"goal"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := DecodeJSONRequest(r.Body, &req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -513,7 +558,7 @@ func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Requ
 }
 
 // HandleGetSession GET /api/sessions/{id}
-// 按 URL 路径中的 id 查找会话，找不到返回 404。
+// 先查内存，未命中且配置了 Postgres 时回退到 session_history 表，返回最小记录。
 func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Path[len("/api/sessions/"):] // 截取 id
 	if id == "" {
@@ -522,6 +567,27 @@ func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request
 	}
 
 	session := m.GetSession(id)
+	if session == nil && m.pgStore != nil {
+		// 内存已淘汰，从 DB 恢复最小记录（无 events 流）
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		if rec, err := m.pgStore.GetSessionHistoryByID(ctx, id); err == nil && rec != nil {
+			endedAt := rec.CreatedAt
+			session = &Session{
+				ID:        rec.SessionID,
+				Goal:      rec.Goal,
+				Status:    "completed",
+				Result:    rec.Summary,
+				StartedAt: rec.CreatedAt,
+				EndedAt:   &endedAt,
+				Events:    make([]SessionEvent, 0),
+				Messages: []types.ChatMessage{
+					{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},
+					{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},
+				},
+			}
+		}
+	}
 	if session == nil {
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
@@ -532,11 +598,54 @@ func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request
 }
 
 // HandleListSessions GET /api/sessions
-// 返回所有会话列表。
+// 返回会话列表：内存中的运行中 + 最近完成会话，叠加 Postgres 中更早的历史会话。
+// 内存未命中但 DB 有记录的会话以最小形态返回（goal/summary/result/time，无 events）。
 func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Request) {
-	sessions := m.ListSessions()
+	memSessions := m.ListSessions() // 拷贝切片，已释放锁
+	seen := make(map[string]bool, len(memSessions))
+	for _, s := range memSessions {
+		seen[s.ID] = true
+	}
+
+	var all []*Session
+	all = append(all, memSessions...)
+
+	if m.pgStore != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		recs, err := m.pgStore.RecentSessionHistories(ctx, 200)
+		if err == nil {
+			for _, rec := range recs {
+				if seen[rec.SessionID] {
+					continue // 内存已有，跳过 DB 版本
+				}
+				endedAt := rec.CreatedAt
+				all = append(all, &Session{
+					ID:        rec.SessionID,
+					Goal:      rec.Goal,
+					Status:    "completed",
+					Result:    rec.Summary,
+					StartedAt: rec.CreatedAt,
+					EndedAt:   &endedAt,
+					Events:    make([]SessionEvent, 0),
+					Messages: []types.ChatMessage{
+						{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},
+						{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},
+					},
+				})
+			}
+		} else {
+			log.Printf("list sessions: db fallback failed: %v", err)
+		}
+	}
+
+	// 按 StartedAt 倒序，最新在前
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].StartedAt.After(all[j].StartedAt)
+	})
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(sessions)
+	json.NewEncoder(w).Encode(all)
 }
 
 // HandleSessionBoard GET /api/sessions/{id}/board
@@ -719,7 +828,7 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	var req struct {
 		Content string `json:"content"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := DecodeJSONRequest(r.Body, &req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -819,7 +928,8 @@ func (m *SessionManager) resumeSession(session *Session) {
 	}
 
 	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", "", false)
-	m.persistHistory(session) // 持久化历史
+	m.persistHistory(session)        // 持久化历史
+	m.evictCompletedSessions()       // 淘汰旧会话，防 OOM
 }
 
 // HandleSessionMetrics GET /api/sessions/{id}/metrics — 会话级 LLM 统计

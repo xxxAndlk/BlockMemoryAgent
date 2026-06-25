@@ -59,34 +59,25 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // 兜底取消
 
-	// 初始化 Postgres 存储层；失败时降级为 nil，服务仍可启动（仅历史不持久化）
+	// 初始化 Postgres 存储层；连接失败直接 fatal，不再降级
 	pgStore, err := store.NewPostgresStore(cfg.Postgres.DSN)
 	if err != nil {
-		log.Printf("Warning: postgres not available: %v", err)
-		log.Printf("  DSN used: %s", redactDSN(cfg.Postgres.DSN)) // 脱敏后打印 DSN
-		log.Printf("  Session history will NOT persist. Set POSTGRES_DSN in .env and apply migrations/*.sql")
-		pgStore = nil // 降级: 不连接数据库
+		log.Fatalf("postgres not available: %v (DSN: %s)", err, redactDSN(cfg.Postgres.DSN))
 	}
-	if pgStore != nil {
-		defer pgStore.Close() // 关闭连接池
-		// 自动应用 session_history 迁移，避免用户忘记跑 002_session_history.sql
-		if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
-			log.Printf("Warning: ensure session_history schema: %v", err)
-		} else {
-			log.Printf("Postgres connected; session_history table ready")
-		}
+	defer pgStore.Close() // 关闭连接池
+	// 自动应用 session_history 迁移，避免用户忘记跑 002_session_history.sql
+	if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
+		log.Fatalf("ensure session_history schema: %v", err)
 	}
+	log.Printf("Postgres connected; session_history table ready")
 
-	// 初始化 Redis 存储层；失败时同样降级为 nil
+	// 初始化 Redis 存储层；连接失败直接 fatal
 	redisStore, err := store.NewRedisStore(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
-		log.Printf("Warning: redis not available: %v", err)
-		redisStore = nil
+		log.Fatalf("redis not available: %v (addr=%s)", err, cfg.Redis.Addr)
 	}
-	if redisStore != nil {
-		defer redisStore.Close() // 关闭连接
-		log.Printf("Redis connected at %s", cfg.Redis.Addr)
-	}
+	defer redisStore.Close() // 关闭连接
+	log.Printf("Redis connected at %s", cfg.Redis.Addr)
 
 	// 加载角色配置（roles.yaml: meta_agent/domain_agent/fixed_roles/dynamic_templates）
 	roleCfg, err := pkgconfig.LoadRoleConfig(*rolePath)
@@ -94,28 +85,34 @@ func main() {
 		log.Fatalf("load role config: %v", err) // 角色配置缺失不可恢复
 	}
 
-	// 初始化模型工厂: 按角色缓存 Eino ChatModel 实例
+	// 初始化模型工厂: 按角色缓存 blades ModelProvider 实例
 	modelFactory := model.NewModelFactory(roleCfg)
-	// 预热: 提前创建常用角色模型，缺失 API Key 时回退 Mock
+	// 预热: 提前创建常用角色模型，缺失 API Key 或连接失败直接 fatal
 	if err := modelFactory.WarmUp(ctx); err != nil {
-		log.Printf("Warning: model warmup failed: %v", err)
+		log.Fatalf("model warmup failed: %v", err)
 	}
 
 	// 初始化角色注册表（运行期角色实例仓库）和角色工厂（创建动态/固定角色实例）
 	registry := graph.NewRoleRegistry(roleCfg)
 	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
 
-	// 加载 Skill 池: 优先从 yaml 文件加载，失败或缺失则回退 BuiltinPool
-	var skillPool *skill.Pool
-	if _, err := os.Stat(*skillPath); err == nil {
-		// 文件存在，尝试解析
-		if p, err := skill.LoadFromYAML(*skillPath); err == nil {
-			skillPool = p
-			log.Printf("Loaded skill pool from %s (count=%d)", *skillPath, len(p.All()))
-		} else {
-			log.Printf("load skill yaml failed, fallback to builtin: %v", err)
-		}
+	// soul.md 必须存在；缺失直接 fatal
+	if *soulPath == "" {
+		log.Fatalf("soul path is required")
 	}
+	if _, err := os.Stat(*soulPath); err != nil {
+		log.Fatalf("soul file not found: %s (%v)", *soulPath, err)
+	}
+
+	// Skill yaml 必须存在；缺失直接 fatal
+	if _, err := os.Stat(*skillPath); err != nil {
+		log.Fatalf("skill yaml not found: %s (%v)", *skillPath, err)
+	}
+	skillPool, err := skill.LoadFromYAML(*skillPath)
+	if err != nil {
+		log.Fatalf("load skill yaml: %v", err)
+	}
+	log.Printf("Loaded skill pool from %s (count=%d)", *skillPath, len(skillPool.All()))
 
 	// 创建运行时聚合: 看板 / 邮箱 / Watchdog / 人格 / Skill 注册表，统一注入图与节点
 	rt := runtime.New(*soulPath, skillPool)
@@ -124,10 +121,8 @@ func main() {
 	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
 	metaAgent.SetModelFactory(modelFactory) // 注入模型工厂供节点调用 LLM
 	metaAgent.SetRuntime(rt)                // 注入运行时聚合（看板/邮箱等）
-	if pgStore != nil {
-		// 注入历史存储适配器，让 MetaAgent 能读取过往会话历史
-		metaAgent.SetHistoryStore(&pgHistoryAdapter{pg: pgStore})
-	}
+	// 注入历史存储适配器，让 MetaAgent 能读取过往会话历史
+	metaAgent.SetHistoryStore(&pgHistoryAdapter{pg: pgStore})
 	escalation := graph.NewEscalationHandlerNode() // 升级仲裁节点
 	sinker := &sinkerNode{}                        // 终止节点，强制 Finish
 	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
@@ -143,22 +138,15 @@ func main() {
 	sessionMgr.SetPostgresStore(pgStore) // 注入 Postgres 以持久化历史
 
 	// 启动时从 session_history 恢复历史会话到内存，让前端列表不空
-	if pgStore != nil {
-		ctxRestore, cancelRestore := context.WithTimeout(ctx, 5*time.Second) // 最多恢复 5 秒
-		n := sessionMgr.RestoreSessions(ctxRestore, 50)                      // 最多恢复 50 条
-		cancelRestore()                                                       // 释放子上下文
-		if n > 0 {
-			log.Printf("Restored %d past sessions into in-memory list", n)
-		}
-	} else {
-		log.Printf("Postgres unavailable — session history will NOT persist across restarts")
+	ctxRestore, cancelRestore := context.WithTimeout(ctx, 5*time.Second) // 最多恢复 5 秒
+	n := sessionMgr.RestoreSessions(ctxRestore, 50)                      // 最多恢复 50 条
+	cancelRestore()                                                       // 释放子上下文
+	if n > 0 {
+		log.Printf("Restored %d past sessions into in-memory list", n)
 	}
 
-	// 快照管理器（Redis 热加载 + Postgres 持久化），需要两者均可用
-	var snapshotMgr *memory.SnapshotManager
-	if redisStore != nil && pgStore != nil {
-		snapshotMgr = memory.NewSnapshotManager(redisStore, pgStore)
-	}
+	// 快照管理器（Redis 热加载 + Postgres 持久化）
+	snapshotMgr := memory.NewSnapshotManager(redisStore, pgStore)
 
 	// API 处理器（web 面板 / TUI 共用），通过 setter 逐步注入依赖
 	apiHandler := server.NewAPIHandler(nil)
@@ -167,9 +155,7 @@ func main() {
 	apiHandler.SetStores(pgStore, redisStore)
 	apiHandler.SetRoleConfig(roleCfg)
 	apiHandler.SetModelFactory(modelFactory)
-	if snapshotMgr != nil {
-		apiHandler.SetSnapshotManager(snapshotMgr)
-	}
+	apiHandler.SetSnapshotManager(snapshotMgr)
 
 	// 路由注册
 	mux := http.NewServeMux()

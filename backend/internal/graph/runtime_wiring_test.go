@@ -2,6 +2,8 @@ package graph
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,16 +13,16 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
-// minimalRoleConfig 构造一个不依赖 yaml 的最小角色配置（mock 模式跑得通）
+// minimalRoleConfig 构造一个不依赖 yaml 的最小角色配置
 func minimalRoleConfig() *pkgconfig.RoleConfigFile {
 	return &pkgconfig.RoleConfigFile{
 		MetaAgent: pkgconfig.MetaAgentConfig{
 			MaxBlocks:       4,
 			SummaryInterval: 1,
-			ModelConfig:     types.AgentModelConfig{Provider: "openai", Model: "mock"}, // APIKey 空 → mockClient
+			ModelConfig:     types.AgentModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test-key"},
 		},
 		DomainAgent: pkgconfig.DomainAgentConfig{
-			ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "mock"},
+			ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test-key"},
 		},
 		FixedRoles: []types.RoleDefinition{
 			{
@@ -39,12 +41,18 @@ func minimalRoleConfig() *pkgconfig.RoleConfigFile {
 // TestThreeLayerGraph_RuntimeWired 验证：开一次 Session 后，
 // Runtime.Boards 已有该会话的看板、Watchdog 至少记录一次决策。
 func TestThreeLayerGraph_RuntimeWired(t *testing.T) {
+	// 临时 soul.md 文件，满足 runtime.New 的文件存在校验
+	soulPath := filepath.Join(t.TempDir(), "soul.md")
+	if err := os.WriteFile(soulPath, []byte("test persona"), 0644); err != nil {
+		t.Fatalf("write soul: %v", err)
+	}
+
 	cfg := minimalRoleConfig()
 	registry := NewRoleRegistry(cfg)
 	// 不用真实模型工厂；MetaAgent 在没有 modelFactory 时也能跑（走规则回退）
 	factory := NewRoleFactory(registry, nil, cfg)
 
-	rt := runtime.New("", skill.BuiltinPool())
+	rt := runtime.New(soulPath, skill.BuiltinPool())
 
 	meta := NewMetaAgentNode(registry, factory, cfg.MetaAgent.MaxBlocks, cfg.MetaAgent.SummaryInterval)
 	meta.SetRuntime(rt)

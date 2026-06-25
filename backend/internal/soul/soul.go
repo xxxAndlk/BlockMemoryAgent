@@ -50,17 +50,12 @@ func NewLoader(path string) *Loader {
 // 职责：读取磁盘文件 → 解析为字符串 → 通过 atomic.Store 发布。
 // 参数：无。
 // 返回：文件 IO 错误（如权限/不存在），调用方按需处理。
-// 副作用：更新 current 指针；即便读取出错也会先写入空 Persona，
-//
-//	使 Current() 始终返回非 nil，避免上层空指针判断。
+// 副作用：更新 current 指针。
 //
 // 并发安全：原子写，与并发读互不阻塞。
 func (l *Loader) Load() error {
-	// 读取 soul.md 全文；失败时仍发布空 Persona 并返回 err。
 	data, err := os.ReadFile(l.path)
 	if err != nil {
-		// 文件不存在不视为致命错误，使用空人格：保证服务可启动。
-		l.current.Store(&Persona{Path: l.path, Content: ""})
 		return err
 	}
 	// 成功读取：发布带全文的 Persona 快照。
