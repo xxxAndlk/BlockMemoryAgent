@@ -39,7 +39,7 @@ func NewGlobalKnowledgeRetriever(vectorDB VectorDB, metaDB MetaStore, embedder E
 	}
 }
 
-// Retrieve 检索全局知识 (实现 Eino Retriever 接口风格)
+// Retrieve 检索全局知识
 func (r *GlobalKnowledgeRetriever) Retrieve(ctx context.Context, query string, topK int) ([]*types.KnowledgeRecord, error) {
 	if topK <= 0 {
 		topK = 5

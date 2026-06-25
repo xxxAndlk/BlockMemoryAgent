@@ -1,6 +1,6 @@
 # BlockMemoryAgent
 
-基于 [CloudWeGo Eino](https://github.com/cloudwego/eino) 的多 Agent 智能编排系统，支持可配置角色、三层（可扩展至四层）架构调度、记忆模块优化与终端 TUI 可视化。
+基于 [go-kratos Blades](https://github.com/go-kratos/blades) 的多 Agent 智能编排系统，支持可配置角色、三层（可扩展至四层）架构调度、记忆模块优化与终端 TUI 可视化。
 
 ---
 
@@ -11,7 +11,7 @@
 - **独立模型配置**：每个角色可绑定独立模型（gpt-4o / gpt-4o-mini / claude 等），DomainAgent 层共用同一配置
 - **记忆模块优化**：三层记忆（PostgreSQL 私有记忆 + Redis 工作区 + Vector DB 全局知识库）+ 四级压缩 + 多信号相关性评分
 - **TUI 终端可视化**：基于 bubbletea 的 4 面板实时状态展示（角色树 / 会话状态 / 事件日志 / 统计）
-- **Eino 原生集成**：基于 Eino Graph 编排与 ChatModel 接口实现 Agent 节点
+- **Blades 原生集成**：基于 Blades `ModelProvider` + `Agent` + 原生 function-calling 实现 leaf 执行与工具调用闭环
 
 ---
 
@@ -120,7 +120,7 @@ go run ./backend/cmd/tui/main.go
 │   ├── internal/
 │   │   ├── graph/         # 三层/四层图编排（Meta/Domain/SubDomain/Assistant）
 │   │   ├── memory/        # 记忆模块（压缩、检索、组装、快照）
-│   │   ├── model/         # Eino ChatModel 工厂与客户端
+│   │   ├── model/         # blades ModelProvider 工厂与客户端
 │   │   ├── retriever/     # 全局知识库检索
 │   │   ├── server/        # API 与 TUI 事件广播
 │   │   └── store/         # PostgreSQL + Redis 存储
@@ -153,7 +153,7 @@ go run ./backend/cmd/tui/main.go
 
 ### 2. 模型工厂（`internal/model/`）
 
-- `eino_client.go` — Eino ChatModel 包装器，支持 Generate / GenerateWithSystem
+- `blades_client.go` — blades ModelProvider 包装器，支持 Generate / GenerateWithSystem，暴露 Provider() 供工具循环使用
 - `factory.go` — 按角色缓存模型实例，自动回退 Mock（无 API Key）
 
 ### 3. 记忆模块（`internal/memory/`）
@@ -261,8 +261,9 @@ $ go run ./backend/cmd/tui/main.go
 
 ## 技术栈
 
-- **编排框架**：CloudWeGo Eino（`compose.Graph`, `Branch`, `State`, `Callback`）
-- **模型适配**：Eino OpenAI Adapter（`eino-ext/components/model/openai`）
+- **编排框架**：自研三层图状态机（MetaAgent/DomainAgent/SubDomain/Assistant）+ go-kratos Blades leaf 执行
+- **模型适配**：Blades OpenAI Adapter（`blades/contrib/openai`）
+- **工具调用**：Blades 原生 function-calling（`tools.Tool` + `Agent` ReAct 循环）
 - **存储**：PostgreSQL（持久化）+ Redis（工作区缓存）
 - **TUI**：bubbletea + lipgloss
 - **配置解析**：gopkg.in/yaml.v3
@@ -273,7 +274,6 @@ $ go run ./backend/cmd/tui/main.go
 
 - **Meta-MetaAgent**：多会话协调层
 - **助手自治化**：Assistant 间直接调用（无需 DomainAgent 中转）
-- **Tool Calling**：集成 Eino `ToolCallingChatModel` 实现工具调用闭环
 - **Stream 输出**：TUI 支持 SSE 实时流式状态更新
 
 ---
@@ -283,9 +283,9 @@ $ go run ./backend/cmd/tui/main.go
 | 文档 | 内容 |
 |---|---|
 | `ARCHITECTURE.md` | 三层架构详细设计、状态机、调用权限矩阵 |
-| `AGENT_MODEL_CONFIG.md` | 多 Agent 模型配置与 Eino ChatModel 工厂设计 |
+| `AGENT_MODEL_CONFIG.md` | 多 Agent 模型配置与 blades ModelProvider 工厂设计 |
 | `设计文档.md` | 原始设计文档（记忆模块、Graph 编排） |
-| `设计文档_v2_Eino版.md` | 基于 Eino 的完整系统设计（含 SQL Schema、TUI 设计） |
+| `设计文档_v2_Eino版.md` | 基于 Eino 的完整系统设计（含 SQL Schema、TUI 设计，历史归档） |
 
 ---
 

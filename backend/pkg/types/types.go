@@ -110,7 +110,7 @@ const (
 	ActionFinish   ActionType = "Finish"
 )
 
-// GraphState Eino Graph 共享状态
+// GraphState 三层图共享状态
 type GraphState struct {
 	TopicID      string                 `json:"topic_id"`
 	TopicGoal    string                 `json:"topic_goal"`

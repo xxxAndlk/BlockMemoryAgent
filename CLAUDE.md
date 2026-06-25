@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-BlockMemoryAgent — Go multi-agent orchestration system built on CloudWeGo Eino. Four-layer agent hierarchy (MetaAgent → DomainAgent → SubDomainAgent → Assistant) with block-scoped private memory, three-tier storage (PostgreSQL + Redis + pgvector), and a bubbletea TUI / HTTP web UI.
+BlockMemoryAgent — Go multi-agent orchestration system built on go-kratos Blades. Four-layer agent hierarchy (MetaAgent → DomainAgent → SubDomainAgent → Assistant) with block-scoped private memory, three-tier storage (PostgreSQL + Redis + pgvector), and a bubbletea TUI / HTTP web UI.
 
 Go module: `github.com/blockmemory/agent/backend` (source under `backend/`, root `go.work` points at `./backend`). Go 1.25 (requires `GOTOOLCHAIN=local` on machines whose default Go is older — repo tests use this flag).
 
@@ -62,7 +62,7 @@ Four-stage pipeline: `write.go` (importance scoring + topic binding) → `compre
 `postgres.go` — private memory, snapshots, topic metadata, knowledge base CRUD (relies on pgvector for vector search). `redis.go` — workspace Hash / SortedSet / Stream + TTL (snapshot TTL configured via `memory.snapshot_ttl_days`).
 
 ### Model factory (`internal/model/`)
-`factory.go` caches Eino `ChatModel` instances per role. `eino_client.go` wraps `Generate`/`GenerateWithSystem`. Falls back to Mock when no API key — server runs without real LLM for testing.
+`factory.go` caches blades `ModelProvider` instances per role. `blades_client.go` wraps `Generate`/`GenerateWithSystem` and exposes `Provider()` for the tool-calling path. Falls back to Mock when no API key — server runs without real LLM for testing.
 
 ### Config
 - `config/config.yaml` — infra (Postgres DSN, pgvector, Redis, HTTP addr `:10010`, memory intervals). `${VAR:default}` env interpolation.
@@ -76,6 +76,6 @@ Four-stage pipeline: `write.go` (importance scoring + topic binding) → `compre
 
 ## Conventions
 
-- v3 design doc is the source of truth for in-progress capabilities: `doc/设计文档_v3.md`, with progress log in `doc/DEVELOPMENT_LOG_v3.md` and test results in `doc/RESULT_v3.md`. Older `doc/设计文档.md` and `doc/设计文档_v2_Eino版.md` document the pre-v3 architecture.
+- v3 design doc is the source of truth for in-progress capabilities: `doc/设计文档_v3.md`, with progress log in `doc/DEVELOPMENT_LOG_v3.md` and test results in `doc/RESULT_v3.md`. Older `doc/设计文档.md` and `doc/设计文档_v2_Eino版.md` document the pre-v3 (Eino-based) architecture; the codebase has since migrated to go-kratos Blades.
 - AIOps scenarios (`test/aiopstest/scenario_test.go`) are integration tests covering alert storm root-cause, playbook approval, chaos drill rollback, postmortem + knowledge — they exercise the full graph + memory stack. `test/aiopsmock/` holds mock fixtures.
 - Per-package `_test.go` files exist for `board`, `mailbox`, `skill`, `soul`, `watchdog`, `graph/runtime_wiring_test.go` — run them when touching those packages.

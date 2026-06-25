@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/go-kratos/blades"
 	"github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -16,7 +17,7 @@ type LLMClient interface {
 }
 
 // TemperatureAware 可选接口：支持 per-call temperature 覆盖。
-// EinoClient 实现此接口；mockClient 不实现，调用方需走 type assertion。
+// BladesClient 实现此接口；mockClient 不实现，调用方需走 type assertion。
 type TemperatureAware interface {
 	GenerateWithOptions(ctx context.Context, prompt string, temperature float64) (string, error)
 }
@@ -37,7 +38,7 @@ func (m *mockClient) Generate(ctx context.Context, prompt string) (string, error
 	return fmt.Sprintf("[模拟响应] 收到请求长度: %d 字符", len(prompt)), nil
 }
 
-// ModelFactory ChatModel 工厂，按角色缓存模型实例
+// ModelFactory 模型工厂，按角色缓存模型实例
 type ModelFactory struct {
 	mu     sync.RWMutex
 	models map[string]LLMClient // key: roleDefID or "meta" or "domain"
@@ -78,13 +79,27 @@ func (f *ModelFactory) GetModel(ctx context.Context, roleDefID string) (LLMClien
 		return f.models[roleDefID], nil
 	}
 
-	client, err := NewEinoClient(ctx, modelCfg)
+	client, err := NewBladesClient(ctx, modelCfg)
 	if err != nil {
-		return nil, fmt.Errorf("create eino client for %s: %w", roleDefID, err)
+		return nil, fmt.Errorf("create blades client for %s: %w", roleDefID, err)
 	}
 
 	f.models[roleDefID] = client
 	return client, nil
+}
+
+// GetBladesProvider 获取指定角色的底层 blades.ModelProvider（用于工具循环路径）。
+// 无 API Key（mock 路径）时返回错误，调用方应退回单次 Generate。
+func (f *ModelFactory) GetBladesProvider(ctx context.Context, roleDefID string) (blades.ModelProvider, error) {
+	client, err := f.GetModel(ctx, roleDefID)
+	if err != nil {
+		return nil, err
+	}
+	bc, ok := client.(*BladesClient)
+	if !ok {
+		return nil, fmt.Errorf("blades provider unavailable for %s (mock client)", roleDefID)
+	}
+	return bc.Provider(), nil
 }
 
 // GetMetaModel 获取 MetaAgent 的模型

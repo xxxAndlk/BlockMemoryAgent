@@ -55,7 +55,7 @@ func main() {
 	fmt.Printf("MetaAgent 模型: %s\n", roleCfg.MetaAgent.ModelConfig.Model)
 	fmt.Printf("DomainAgent 模型: %s\n", roleCfg.DomainAgent.ModelConfig.Model)
 
-	// 2. 初始化模型工厂（按角色缓存 Eino ChatModel）
+	// 2. 初始化模型工厂（按角色缓存 blades ModelProvider）
 	modelFactory := model.NewModelFactory(roleCfg)
 
 	// 尝试预热模型（如果配置了API Key则初始化真实模型，否则回退到Mock）
