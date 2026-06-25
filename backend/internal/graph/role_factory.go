@@ -357,7 +357,8 @@ func extractKeywords(taskDesc string) []string {
 // LLM 经常把 JSON 包在 ```json ... ``` 代码块里，或前后带解释文字。
 // 本函数按以下顺序尝试：
 //  1. 剥离 ```json 或 ``` 代码块标记。
-//  2. 取第一个 '{' 到最后一个 '}' 之间的内容。
+//  2. 若剩余串以 '[' 开头：取第一个 '[' 到最后一个 ']' 之间内容（JSON 数组）。
+//  3. 否则取第一个 '{' 到最后一个 '}' 之间内容（JSON 对象）。
 // 返回：纯净的 JSON 字符串；无法提取则返回原串。
 func extractJSON(s string) string {
 	s = strings.TrimSpace(s)
@@ -375,7 +376,13 @@ func extractJSON(s string) string {
 		}
 	}
 	s = strings.TrimSpace(s)
-	// 提取第一个 { 到最后一个 }
+	// 数组优先：LLM 常返回 [{...},{...}]，若按对象提取会丢掉 [] 与逗号导致解析失败
+	if start := strings.Index(s, "["); start != -1 {
+		if end := strings.LastIndex(s, "]"); end > start {
+			return s[start : end+1]
+		}
+	}
+	// 回退到对象提取
 	start := strings.Index(s, "{")
 	end := strings.LastIndex(s, "}")
 	if start != -1 && end > start {

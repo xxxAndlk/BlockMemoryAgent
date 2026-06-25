@@ -224,6 +224,9 @@ type ThreeLayerState struct {
 	TargetRoleID string `json:"target_role_id"`
 	// Reason 本次动作的理由，供审计与调试。
 	Reason string `json:"reason"`
+	// DirectExecute 标记为"直接执行"模式：MetaAgent 判定为简单查询/搜索/分析类任务时置 true，
+	// DomainAgent 见此标志跳过 LLM 子任务拆解，直接把 goal 作为单个子任务交给一个 Assistant。
+	DirectExecute bool `json:"direct_execute"`
 }
 
 // NewThreeLayerState 创建三层状态：初始化会话级映射与调用栈，默认动作 Continue。

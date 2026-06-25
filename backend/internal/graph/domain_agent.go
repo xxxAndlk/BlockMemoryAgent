@@ -527,11 +527,20 @@ func (n *DomainAgentNode) executeAssistantTask(ctx context.Context, def *types.R
 //   - state：图全局状态（取 DomainGoal 作为分析输入）
 //
 // 返回：子任务列表；无目标返回 nil；LLM 拆解均为思考类任务时降级为单任务。
+//
+// DirectExecute 模式：MetaAgent 判定为查询/搜索类简单任务时置 state.DirectExecute=true，
+// 此处跳过 LLM 拆解，直接把 goal 作为单任务交给一个 Assistant，避免无谓拆分。
 func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLayerState) []string {
 	// 取领域目标；为空则直接返回 nil
 	goal := state.DomainGoal
 	if goal == "" {
 		return nil
+	}
+
+	// DirectExecute 模式：跳过 LLM 拆解，直接派单任务
+	if state.DirectExecute {
+		n.emit(ctx, "think", "DirectExecute 模式：跳过子任务拆解，直接派发单助手执行")
+		return []string{goal}
 	}
 
 	// 尝试使用LLM进行任务拆解
@@ -545,23 +554,25 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 %s
 
 要求:
-- 每个子任务必须是一个可直接用工具执行的动作（如"用 WriteFile 写 X 文件"、"用 RunCommand 运行 Y"）
+- 每个子任务必须是一个可直接用工具执行的动作（如"用 WriteFile 写 X 文件"、"用 RunCommand 运行 Y"、"用 HTTPGet 抓取 Z"）
 - 严禁出现"分析/确定/规划/设计/思考/研究/需求/方案"等纯思考类子任务，这类工作应在执行动作中一并完成
 - 涉及创建文件的目标，必须有子任务明确写出文件路径与内容来源
 - 子任务之间可以有依赖但应尽量并行
 - 只输出子任务列表，每行一个，不要编号，不要其他内容
+- 任务匹配工具，不要"为了用工具而用工具"：
+  * 信息查询/搜索/新闻/行情类目标 → 用 HTTPGet 抓取公开 URL，禁止"写 Python 脚本去搜索"
+  * 只有目标明确要求"写代码/生成文件/运行程序"时，才用 WriteFile / RunCommand
 
 示例（好）:
+用 HTTPGet 抓取 https://news.example.com/ai 获取最近 AI 新闻
 用 WriteFile 把贪吃蛇游戏代码写到 workspace/snake.py
 用 RunCommand 运行 python workspace/snake.py 验证
-用 WriteFile 把 DB 检查脚本写到 workspace/db_check.py
-用 RunCommand 运行 python workspace/db_check.py
 
 示例（坏，禁止）:
 需求分析
 设计方案
 编写代码
-测试验证
+用 WriteFile 写一个 Python 脚本去搜索新闻（应该直接用 HTTPGet）
 
 子任务:`, goal, fmtEnvSection()))
 		if !timedOut && err == nil && resp != "" {

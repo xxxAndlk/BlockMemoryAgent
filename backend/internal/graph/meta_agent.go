@@ -434,6 +434,14 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 
 	// 简单问题直接回答，不拆分
 	messagesSection := n.loadMessagesSection(state)
+
+	// 查询/搜索/分析类简单任务：标记 DirectExecute，DomainAgent 将跳过子任务拆解，
+	// 直接把 goal 作为单任务交给一个 Assistant（用 HTTPGet/Web 搜索类工具，而非写脚本）
+	if n.shouldDirectExecute(state.DomainGoal) {
+		state.DirectExecute = true
+		n.emit(ctx, "intend", "判定为查询/搜索类任务，直接派发单助手执行（跳过子任务拆解）")
+	}
+
 	if n.modelFactory != nil && n.isSimpleQuestion(state.DomainGoal) {
 		n.emit(ctx, "intend", "判定为简单问题，直接调用 LLM 回答")
 		// 调 LLM 回答简单问题（含环境/历史/对话段落）
@@ -812,6 +820,56 @@ func (n *MetaAgentNode) updateSessionSummary(state *types.ThreeLayerState) {
 	state.SessionSummary = strings.Join(parts, "; ")
 }
 
+// shouldDirectExecute 判断是否为"查询/搜索/分析"类简单任务，
+// 这类任务应跳过 DomainAgent 子任务拆解，直接把 goal 作为单个子任务交给
+// 一个 Assistant 用 HTTPGet / Web 搜索类工具完成，而非写脚本。
+//
+// 判定规则：命中查询/搜索/资讯关键词，且未命中"创建/编写/运行/实现"等
+// 明确需要落盘或执行代码的动作词。
+func (n *MetaAgentNode) shouldDirectExecute(goal string) bool {
+	if goal == "" {
+		return false
+	}
+	goalLower := strings.ToLower(goal)
+
+	// 查询/搜索/资讯类关键词
+	queryPatterns := []string{
+		"查询", "查一下", "查下", "了解", "获取", "搜集", "收集",
+		"搜索", "搜一下", "搜索一下", "检索", "查找",
+		"新闻", "资讯", "行情", "股价", "股票", "汇率", "天气",
+		"最新", "近期", "最近", "今天", "昨日", "当前",
+		"原因", "为什么", "为何", "怎么样", "如何看",
+		"分析", "解读", "总结", "汇总",
+		"是什么", "什么是", "介绍一下", "解释",
+		"news", "search", "query", "lookup", "find", "latest", "recent", "today",
+	}
+	hitQuery := false
+	for _, p := range queryPatterns {
+		if strings.Contains(goalLower, p) {
+			hitQuery = true
+			break
+		}
+	}
+	if !hitQuery {
+		return false
+	}
+
+	// 明确需要写代码/运行程序的动作词：命中则不视为直接执行类
+	actionPatterns := []string{
+		"写一个", "写个", "编写", "实现", "开发", "创建一个", "创建个",
+		"生成", "制作", "搭建", "部署",
+		"运行", "执行", "启动", "跑一下",
+		"修改", "重构", "优化代码", "修复",
+		"贪吃蛇", "小游戏", "游戏",
+	}
+	for _, p := range actionPatterns {
+		if strings.Contains(goalLower, p) {
+			return false
+		}
+	}
+	return true
+}
+
 // isSimpleQuestion 判断是否为简单直接问题（仅寒暄/自我介绍类）。
 //
 // 职责：
@@ -1060,11 +1118,12 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 %s
 %s%s
 要求:
-- 每个领域名称简短（2-6个字）
+- 每个领域名称简短（2-6个字），禁止使用"通用"作为领域名——必须根据目标语义给出具体领域名（如"AI股票分析"、"贪吃蛇游戏"、"数据库检查"）
 - 领域之间应该尽量独立
 - 若用户目标涉及"查找/刚才/上次"等指代词，应优先创建一个"检索历史与文件"领域
+- 简单查询/搜索类目标只需一个领域即可，不要强行拆分
 - 输出JSON数组格式: [{"name":"领域名","goal":"该领域需要完成的目标"}]
-- 只输出JSON，不要其他内容
+- 只输出JSON数组，不要代码块标记，不要任何解释文字
 
 领域列表:`, goal, fmtEnvSection(), historySection, messagesSection))
 		if !timedOut && err == nil && resp != "" {
@@ -1104,6 +1163,11 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 func (n *MetaAgentNode) parseDomainsFromLLM(resp string) []DomainInfo {
 	// 抽取 JSON 片段（LLM 可能附带多余文本）
 	jsonStr := extractJSON(resp)
+	// 兜底：若 extractJSON 返回单个对象，包成数组再解析
+	trimmed := strings.TrimSpace(jsonStr)
+	if strings.HasPrefix(trimmed, "{") {
+		jsonStr = "[" + trimmed + "]"
+	}
 	// 反序列化为匿名结构数组
 	var rawDomains []struct {
 		Name string `json:"name"` // 领域名
@@ -1132,7 +1196,7 @@ func (n *MetaAgentNode) parseDomainsFromLLM(resp string) []DomainInfo {
 // 参数：
 //   - goal：领域目标
 //
-// 返回：领域列表；无匹配时返回单元素"通用"领域。
+// 返回：领域列表；无匹配时返回单元素领域（名称从 goal 推断，不再一律"通用"）。
 func (n *MetaAgentNode) analyzeDomainsByRules(goal string) []DomainInfo {
 	var domains []DomainInfo
 
@@ -1150,10 +1214,37 @@ func (n *MetaAgentNode) analyzeDomainsByRules(goal string) []DomainInfo {
 		domains = append(domains, DomainInfo{Name: "用户模块", Goal: goal}) // 用户模块领域
 	}
 
-	// 无匹配：返回"通用"单领域
+	// 无匹配：从 goal 截取前若干字符作为领域名，避免一律叫"通用"
 	if len(domains) == 0 {
-		domains = append(domains, DomainInfo{Name: "通用", Goal: goal}) // 兜底单领域
+		name := inferDomainName(goal)
+		domains = append(domains, DomainInfo{Name: name, Goal: goal}) // 兜底单领域
 	}
 
 	return domains
+}
+
+// inferDomainName 从 goal 文本启发式推断领域名，避免一律用"通用"。
+// 取前若干个有意义的字符（中文按 rune 计，最多 6 字），去除常见动词前缀。
+func inferDomainName(goal string) string {
+	g := strings.TrimSpace(goal)
+	if g == "" {
+		return "通用"
+	}
+	// 去掉常见动词前缀，让领域名更贴近主题
+	prefixes := []string{"完成", "请", "帮我", "帮助我", "实现", "做", "写", "创建", "查询", "查一下", "查下", "搜索", "搜一下"}
+	for _, p := range prefixes {
+		if strings.HasPrefix(g, p) {
+			g = strings.TrimSpace(strings.TrimPrefix(g, p))
+			break
+		}
+	}
+	if g == "" {
+		return "通用"
+	}
+	// 按 rune 截取前 6 个字符
+	rs := []rune(g)
+	if len(rs) > 6 {
+		rs = rs[:6]
+	}
+	return string(rs)
 }
