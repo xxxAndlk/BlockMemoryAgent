@@ -1,34 +1,40 @@
 package main
 
-import (
-	"context"
-	"fmt"
-	"log"
+// cmd/demo 是 CLI 三层流演示入口: 加载角色配置 → 构建三层图 → 启动示例会话 → 打印角色实例。
+// 不依赖数据库/HTTP，用于快速验证图与角色注册表是否工作。
 
-	"github.com/blockmemory/agent/backend/internal/graph"
-	"github.com/blockmemory/agent/backend/internal/model"
-	"github.com/blockmemory/agent/backend/pkg/config"
-	"github.com/blockmemory/agent/backend/pkg/types"
+import (
+	"context" // 上下文
+	"fmt"     // 标准输出
+	"log"     // 警告日志
+
+	"github.com/blockmemory/agent/backend/internal/graph" // 三层图构建
+	"github.com/blockmemory/agent/backend/internal/model" // 模型工厂
+	"github.com/blockmemory/agent/backend/pkg/config"     // 角色配置加载
+	"github.com/blockmemory/agent/backend/pkg/types"      // 公共类型
 )
 
 // MockLLMClient 模拟大模型客户端（当无API Key时回退使用）
 type MockLLMClient struct{}
 
+// Generate 返回固定格式的模拟响应，仅用于演示无真实 LLM 时的回退路径。
 func (m *MockLLMClient) Generate(ctx context.Context, prompt string) (string, error) {
 	return fmt.Sprintf("模拟LLM响应: %s", prompt[:min(50, len(prompt))]), nil
 }
 
+// main 是演示入口: 装配三层图并执行一次示例会话，最后打印角色实例。
+// 副作用: 控制台输出；无外部资源写入。
 func main() {
 	ctx := context.Background()
 
-	// 1. 加载角色配置
+	// 1. 加载角色配置: 失败时使用内置默认配置，保证演示可运行
 	roleCfg, err := config.LoadRoleConfig("config/roles.yaml")
 	if err != nil {
 		log.Printf("Warning: load role config failed: %v", err)
 		// 使用默认配置
 		roleCfg = &config.RoleConfigFile{
-			MetaAgent: config.MetaAgentConfig{MaxBlocks: 5, SummaryInterval: 3},
-			DomainAgent: config.DomainAgentConfig{},
+			MetaAgent:    config.MetaAgentConfig{MaxBlocks: 5, SummaryInterval: 3},
+			DomainAgent:  config.DomainAgentConfig{},
 			FixedRoles: []types.RoleDefinition{
 				{
 					ID: "code_assistant", Name: "代码助手", Type: types.RoleTypeFixed,
@@ -46,6 +52,7 @@ func main() {
 		}
 	}
 
+	// 打印角色配置概览
 	fmt.Println("=== 角色配置加载完成 ===")
 	fmt.Printf("固定角色数量: %d\n", len(roleCfg.FixedRoles))
 	for _, r := range roleCfg.FixedRoles {
@@ -68,7 +75,7 @@ func main() {
 	registry := graph.NewRoleRegistry(roleCfg)
 	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
 
-	// 3. 构建三层图
+	// 3. 构建三层图: 用 mock 节点充当升级处理器与终止节点
 	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
 	escalation := &mockThreeLayerNode{name: "EscalationHandler"}
 	sinker := &mockThreeLayerNode{name: "Sinker"}
@@ -84,18 +91,19 @@ func main() {
 	fmt.Printf("会话ID: %s\n", sessionID)
 	fmt.Printf("用户目标: %s\n", state.DomainGoal)
 
-	// 5. 执行
+	// 5. 执行: 驱动状态机直至完成
 	result, err := threeLayerGraph.Invoke(ctx, state)
 	if err != nil {
 		log.Fatalf("执行失败: %v", err)
 	}
 
+	// 打印最终结果
 	fmt.Println("\n=== 会话执行完成 ===")
 	fmt.Printf("最终动作: %s\n", result.NextAction)
 	fmt.Printf("会话总结: %s\n", result.SessionSummary)
 	fmt.Printf("完成的领域: %v\n", result.CompletedBlocks)
 
-	// 6. 打印所有角色实例
+	// 6. 打印所有角色实例: 展示运行期动态创建的角色层级
 	fmt.Println("\n=== 会话中创建的角色实例 ===")
 	for _, inst := range registry.GetInstancesBySession(sessionID) {
 		roleDef := registry.GetRoleDef(inst.RoleDefID)
@@ -108,15 +116,18 @@ func main() {
 	}
 }
 
-// mockThreeLayerNode 模拟三层节点
+// mockThreeLayerNode 模拟三层节点，用于演示中替代真实的升级处理器与终止节点。
 type mockThreeLayerNode struct {
-	name string
+	name string // 节点名称
 }
 
+// Name 返回节点名称。
 func (m *mockThreeLayerNode) Name() string {
 	return m.name
 }
 
+// Invoke 打印执行日志，并根据节点名称决定 NextAction。
+// Sinker 节点强制 Finish，其他节点继续，保证状态机能够收尾。
 func (m *mockThreeLayerNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	fmt.Printf("  [%s] 执行...\n", m.name)
 	if m.name == "Sinker" {

@@ -1,60 +1,118 @@
 package model
 
-import (
-	"context"
-	"fmt"
-	"math"
+// 本文件实现 BladesClient：对 blades.ModelProvider 的薄包装，
+// 提供 LLMClient / TemperatureAware 接口所需的 Generate 系列方法，
+// 供 ModelFactory 按角色缓存并复用。
 
-	"github.com/go-kratos/blades"
-	"github.com/go-kratos/blades/contrib/openai"
-	"github.com/blockmemory/agent/backend/pkg/types"
+import (
+	"context" // 上下文，用于超时与取消传递
+	"fmt"     // 错误格式化
+	"math"    // 浮点比较，判断温度是否变化
+
+	"github.com/go-kratos/blades"                    // 上游 ModelProvider 抽象
+	"github.com/go-kratos/blades/contrib/openai"     // OpenAI 兼容 provider 实现
+	"github.com/blockmemory/agent/backend/pkg/types" // AgentModelConfig 等共享类型
 )
 
 // BladesClient 包装 blades.ModelProvider，实现 LLMClient 接口。
+// 设计意图：屏蔽底层 provider 细节，对 graph 层暴露统一 Generate 入口；
+// 同时保留原始 Provider() 以供工具循环（tool-calling）路径直接调用。
 type BladesClient struct {
-	provider blades.ModelProvider
-	cfg      types.AgentModelConfig
+	provider blades.ModelProvider   // 底层 blades provider，真正承担请求
+	cfg      types.AgentModelConfig // 构造时的模型配置（含温度/MaxTokens 等），用于按需重建 provider
 }
 
-// NewBladesClient 从配置创建 Blades 客户端
+// NewBladesClient 根据给定配置构造 BladesClient。
+//
+// 职责：解析配置 → 创建底层 blades.ModelProvider → 装入 BladesClient。
+// 参数：
+//   - ctx: 上下文（当前实现未透传给 provider 构造，保留以备未来扩展）
+//   - cfg: 模型配置（Provider/BaseURL/APIKey/Model/Temperature/MaxTokens）
+//
+// 返回：
+//   - *BladesClient: 可用的客户端
+//   - error: provider 创建失败时返回（如 provider 类型不支持）
+//
+// 副作用：无外部状态变更；provider 内部可能持有 HTTP 连接池。
+// 并发安全：返回的实例可被多协程并发使用（底层 provider 自身线程安全）。
 func NewBladesClient(ctx context.Context, cfg types.AgentModelConfig) (*BladesClient, error) {
+	// 委托给 createBladesProvider 按 Provider 字段选择实现
 	provider, err := createBladesProvider(cfg)
 	if err != nil {
+		// 包装错误便于上层定位
 		return nil, fmt.Errorf("create blades provider: %w", err)
 	}
+	// 缓存 provider 与原始配置，供后续 Generate/GenerateWithOptions 使用
 	return &BladesClient{provider: provider, cfg: cfg}, nil
 }
 
-// Provider 暴露底层 blades.ModelProvider，供工具循环路径直接使用
+// Provider 暴露底层 blades.ModelProvider，供工具调用循环路径直接使用。
+//
+// 设计意图：工具循环需要访问 provider 的 Chat/ToolCall 等扩展能力，
+// 而 LLMClient 接口只暴露 Generate；通过此方法把底层 provider 透出去。
+// 并发安全：只读返回字段，本身线程安全。
 func (c *BladesClient) Provider() blades.ModelProvider {
-	return c.provider
+	return c.provider // 直接返回底层 provider 引用
 }
 
-// Generate 实现 LLMClient 接口
+// Generate 实现 LLMClient 接口的单轮文本生成。
+//
+// 职责：把 prompt 包装成单条 user message 调用底层 provider。
+// 参数：
+//   - ctx: 上下文，用于超时/取消
+//   - prompt: 用户提示词
+//
+// 返回：
+//   - string: 模型回复文本
+//   - error: 调用失败或响应为空时返回
+//
+// 副作用：无（除底层 HTTP 调用外）。
+// 并发安全：底层 provider 线程安全，可并发调用。
 func (c *BladesClient) Generate(ctx context.Context, prompt string) (string, error) {
+	// 构造只含一条 user 消息的请求
 	req := &blades.ModelRequest{
 		Messages: []*blades.Message{blades.UserMessage(prompt)},
 	}
+	// 调用底层 provider 生成
 	resp, err := c.provider.Generate(ctx, req)
 	if err != nil {
+		// 包装错误，保留原始 cause
 		return "", fmt.Errorf("model generate: %w", err)
 	}
+	// 防御空响应（部分 provider 在异常时可能返回 nil）
 	if resp == nil || resp.Message == nil {
 		return "", fmt.Errorf("empty model response")
 	}
+	// 取出回复文本
 	return resp.Message.Text(), nil
 }
 
-// GenerateWithSystem 带 system prompt 生成（用于角色定义生成）
+// GenerateWithSystem 带 system prompt 生成（用于角色定义生成等需要设定人设的场景）。
+//
+// 职责：在 user 消息之外额外传入 system instruction，引导模型行为。
+// 参数：
+//   - ctx: 上下文
+//   - systemPrompt: 系统提示词（人设/规则）
+//   - userPrompt: 用户输入
+//
+// 返回：
+//   - string: 模型回复文本
+//   - error: 调用失败或响应为空
+//
+// 副作用：无。
+// 并发安全：底层 provider 线程安全。
 func (c *BladesClient) GenerateWithSystem(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	// Instruction 字段承载 system 消息
 	req := &blades.ModelRequest{
-		Instruction: blades.SystemMessage(systemPrompt),
-		Messages:    []*blades.Message{blades.UserMessage(userPrompt)},
+		Instruction: blades.SystemMessage(systemPrompt),                // 系统提示
+		Messages:    []*blades.Message{blades.UserMessage(userPrompt)}, // 用户输入
 	}
+	// 调用底层 provider
 	resp, err := c.provider.Generate(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("model generate: %w", err)
 	}
+	// 防御空响应
 	if resp == nil || resp.Message == nil {
 		return "", fmt.Errorf("empty model response")
 	}
@@ -63,22 +121,38 @@ func (c *BladesClient) GenerateWithSystem(ctx context.Context, systemPrompt, use
 
 // GenerateWithOptions 允许覆盖 temperature 完成单次调用。
 //
-// v3 §6.3 要求按任务类型动态调节温度（路由 0；代码 0.15；创意 0.8）。
+// 设计意图：v3 §6.3 要求按任务类型动态调节温度（路由 0；代码 0.15；创意 0.8）。
 // blades openai.Config 的 Temperature 在构造时固定，无 per-call 选项，
 // 因此当温度变化超过阈值时，临时构造一个新 provider 完成本次调用，
 // 避免污染缓存。openai.NewModel 构造廉价，无需缓存温度变体。
+//
+// 参数：
+//   - ctx: 上下文
+//   - prompt: 用户提示词
+//   - temperature: 本次调用所需温度
+//
+// 返回：
+//   - string: 模型回复文本
+//   - error: 调用失败
+//
+// 副作用：温度变化时临时创建一个 provider，调用后丢弃（不影响缓存）。
+// 并发安全：临时 provider 仅本次调用可见，无共享状态。
 func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, temperature float64) (string, error) {
+	// 温度与缓存配置一致时，直接走快速路径，避免无谓重建
 	if math.Abs(temperature-c.cfg.Temperature) < 1e-6 {
 		return c.Generate(ctx, prompt)
 	}
 
+	// 复制配置并覆盖温度，构造临时 provider
 	tmp := c.cfg
 	tmp.Temperature = temperature
 	override, err := createBladesProvider(tmp)
 	if err != nil {
+		// 临时 provider 创建失败时退回默认 Generate，保证可用性
 		return c.Generate(ctx, prompt)
 	}
 
+	// 构造请求并调用临时 provider
 	req := &blades.ModelRequest{
 		Messages: []*blades.Message{blades.UserMessage(prompt)},
 	}
@@ -86,33 +160,59 @@ func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, t
 	if err != nil {
 		return "", fmt.Errorf("override generate: %w", err)
 	}
+	// 防御空响应
 	if resp == nil || resp.Message == nil {
 		return "", fmt.Errorf("empty model response")
 	}
 	return resp.Message.Text(), nil
 }
 
-// createBladesProvider 根据配置创建对应的 blades.ModelProvider
+// createBladesProvider 根据配置中的 Provider 字段选择对应的 blades.ModelProvider 实现。
+//
+// 职责：provider 类型分发；当前仅支持 openai 兼容（默认），其余报错。
+// 参数：
+//   - cfg: 模型配置
+//
+// 返回：
+//   - blades.ModelProvider: 构造好的 provider
+//   - error: 不支持的 provider 类型
+//
+// 副作用：无外部状态变更。
+// 并发安全：纯函数式构造，可并发调用。
 func createBladesProvider(cfg types.AgentModelConfig) (blades.ModelProvider, error) {
 	switch cfg.Provider {
-	case "openai", "":
+	case "openai", "": // 空字符串视为 openai 兼容默认值
 		return createOpenAIProvider(cfg), nil
 	default:
+		// 后续可在此扩展 anthropic/azure 等分支
 		return nil, fmt.Errorf("unsupported provider: %s", cfg.Provider)
 	}
 }
 
-// createOpenAIProvider 创建 OpenAI 兼容模型
+// createOpenAIProvider 创建 OpenAI 兼容模型 provider。
+//
+// 职责：把 AgentModelConfig 映射为 blades openai.Config 并构造 Model。
+// 参数：
+//   - cfg: 模型配置
+//
+// 返回：
+//   - blades.ModelProvider: OpenAI 兼容 provider
+//
+// 副作用：无。
+// 并发安全：纯构造函数。
 func createOpenAIProvider(cfg types.AgentModelConfig) blades.ModelProvider {
+	// BaseURL 缺省时使用 deepseek 兼容端点（项目默认）
 	baseURL := cfg.BaseURL
 	if baseURL == "" {
 		baseURL = "https://api.deepseek.com/v1"
 	}
+	// 组装 openai.Config：温度/最大 token 在此固定
 	ocfg := openai.Config{
-		BaseURL:         baseURL,
-		APIKey:          cfg.APIKey,
-		Temperature:     cfg.Temperature,
-		MaxOutputTokens: int64(cfg.MaxTokens),
+		BaseURL:         baseURL,              // API 端点
+		APIKey:          cfg.APIKey,           // 鉴权密钥
+		Temperature:     cfg.Temperature,      // 采样温度（构造时固化）
+		MaxOutputTokens: int64(cfg.MaxTokens), // 单次最大输出 token
 	}
+	// 以模型名 + 配置构造 provider 实例
 	return openai.NewModel(cfg.Model, ocfg)
 }

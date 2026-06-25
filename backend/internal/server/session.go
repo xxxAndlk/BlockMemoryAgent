@@ -1,47 +1,60 @@
 package server
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
+	"context"      // 请求上下文与超时
+	"encoding/json" // JSON 编解码
+	"fmt"           // 格式化输出
+	"log"           // 日志输出
+	"net/http"      // HTTP 处理器
+	"strconv"       // 字符串与数字转换
+	"strings"       // 字符串处理
+	"sync"          // 读写锁保护 sessions
+	"sync/atomic"   // 原子计数器（seq）
+	"time"          // 时间戳与超时
 
-	"github.com/blockmemory/agent/backend/internal/graph"
-	"github.com/blockmemory/agent/backend/internal/store"
-	"github.com/blockmemory/agent/backend/pkg/types"
+	"github.com/blockmemory/agent/backend/internal/graph" // Graph 引擎
+	"github.com/blockmemory/agent/backend/internal/store" // Postgres 存储
+	"github.com/blockmemory/agent/backend/pkg/types"      // 共享类型
 )
 
-// Session 会话信息
+// Session 表示一次会话的完整运行时状态。
+// 由 SessionManager 创建并维护，序列化后通过 /api/sessions 暴露给前端。
+//
+// 字段说明：
+//   - ID: 会话 ID（session-N）
+//   - Goal: 用户目标 / 请求
+//   - Status: running / completed / error
+//   - Result: 会话结果摘要
+//   - State: 最终 Graph 状态
+//   - StartedAt: 起始时间
+//   - EndedAt: 结束时间（nil 表示未结束）
+//   - Events: 事件流（含工具调用、思考、统计）
+//   - Messages: 对话消息（含 system / user / assistant）
 type Session struct {
-	ID        string                `json:"id"`
-	Goal      string                `json:"goal"`
-	Status    string                `json:"status"` // running / completed / error
-	Result    string                `json:"result,omitempty"`
-	State     *types.ThreeLayerState `json:"state,omitempty"`
-	StartedAt time.Time             `json:"started_at"`
-	EndedAt   *time.Time            `json:"ended_at,omitempty"`
-	Events    []SessionEvent        `json:"events"`
-	Messages  []types.ChatMessage   `json:"messages"`
+	ID        string                 `json:"id"`                   // 会话 ID（session-N）
+	Goal      string                 `json:"goal"`                 // 用户目标
+	Status    string                 `json:"status"`               // running / completed / error
+	Result    string                 `json:"result,omitempty"`     // 会话结果摘要
+	State     *types.ThreeLayerState `json:"state,omitempty"`      // 最终 Graph 状态
+	StartedAt time.Time              `json:"started_at"`           // 起始时间
+	EndedAt   *time.Time             `json:"ended_at,omitempty"`   // 结束时间（nil 表示未结束）
+	Events    []SessionEvent         `json:"events"`               // 事件流
+	Messages  []types.ChatMessage    `json:"messages"`             // 对话消息
 }
 
-// SessionEvent 会话事件
+// SessionEvent 是会话事件流的单个事件。
+// 字段较宽松，覆盖 progress / tool_exec / system / error / stats 等多种类型。
 type SessionEvent struct {
-	Type       string    `json:"type"`
-	Agent      string    `json:"agent"`
-	Message    string    `json:"message"`
-	Kind       string    `json:"kind,omitempty"` // progress 子类型: think/intend/llm/tool_call/tool_result/wait/error/prompt/agent_created/token_usage/graph_step
-	Tool       string    `json:"tool,omitempty"`
-	ToolPath   string    `json:"tool_path,omitempty"`
-	ToolOutput string    `json:"tool_output,omitempty"`
-	ToolError  string    `json:"tool_error,omitempty"`
-	Success    bool      `json:"success,omitempty"`
-	Timestamp  time.Time `json:"timestamp"`
+	Type       string    `json:"type"`                  // 事件类型（progress / tool_exec / system / error / stats / ...）
+	Agent      string    `json:"agent"`                 // 触发事件的 Agent 名称
+	Message    string    `json:"message"`               // 人类可读简述
+	Kind       string    `json:"kind,omitempty"`        // progress 子类型: think/intend/llm/tool_call/tool_result/wait/error/prompt/agent_created/token_usage/graph_step
+	Tool       string    `json:"tool,omitempty"`        // 工具名（tool_exec 时有效）
+	ToolPath   string    `json:"tool_path,omitempty"`   // 工具操作文件路径
+	ToolOutput string    `json:"tool_output,omitempty"` // 工具标准输出（截断）
+	ToolError  string    `json:"tool_error,omitempty"`  // 工具错误信息
+	Success    bool      `json:"success,omitempty"`     // 是否成功
+	Timestamp  time.Time `json:"timestamp"`             // 事件时间戳
 
 	// ---- 调试扩展字段（v3 debug） ----
 	Prompt       string `json:"prompt,omitempty"`        // 发送给 LLM 的 prompt（截断）
@@ -50,38 +63,44 @@ type SessionEvent struct {
 	DetailJSON   string `json:"detail_json,omitempty"`   // 结构化详情（Agent 创建参数、图步骤状态等）
 }
 
-// SessionManager 会话管理器
+// SessionManager 管理所有运行中 / 已完成的会话。
+// 持有 Graph 与 RoleRegistry 引用，通过 ToolCallback / ProgressCallback 把
+// Graph 内部事件回流到对应会话的事件流。并发安全（RWMutex 保护 sessions 映射）。
 type SessionManager struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
-	graph    *graph.ThreeLayerGraph
-	registry *graph.RoleRegistry
-	seq      atomic.Int64
-	pgStore  *store.PostgresStore
+	mu       sync.RWMutex           // 保护 sessions 映射
+	sessions map[string]*Session    // session_id -> Session
+	graph    *graph.ThreeLayerGraph // 注入的 Graph 引擎
+	registry *graph.RoleRegistry    // 注入的角色注册表
+	seq      atomic.Int64           // 会话 ID 自增计数
+	pgStore  *store.PostgresStore   // 可选：Postgres 持久化
 }
 
-// NewSessionManager 创建会话管理器
+// NewSessionManager 创建会话管理器，并把工具 / 进度回调注入 Graph。
+// 参数：g - 三层图；registry - 角色注册表。
+// 返回值：*SessionManager。
+// 副作用：g.SetToolCallback / g.SetProgressCallback 注入闭包，回调把事件写入对应 Session。
 func NewSessionManager(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry) *SessionManager {
 	m := &SessionManager{
-		sessions: make(map[string]*Session),
-		graph:    g,
-		registry: registry,
+		sessions: make(map[string]*Session), // 初始化 sessions 映射
+		graph:    g,                         // 注入 Graph
+		registry: registry,                  // 注入角色注册表
 	}
 
 	// 将工具回调注入图，使工具执行结果自动成为会话事件
 	g.SetToolCallback(graph.ToolCallback(func(result *graph.ToolResult) {
-		m.handleToolResult(result)
+		m.handleToolResult(result) // 工具结果路由到对应会话
 	}))
 
-	// 将进度回调注入图，把 Agent 的思考/意图/工具调用实时推给会话事件流
+	// 将进度回调注入图，把 Agent 的思考 / 意图 / 工具调用实时推给会话事件流
 	g.SetProgressCallback(graph.ProgressCallback(func(ctx context.Context, ev graph.ProgressEvent) {
-		m.handleProgress(ctx, ev)
+		m.handleProgress(ctx, ev) // 进度事件路由到对应会话
 	}))
 
 	return m
 }
 
-// SetPostgresStore 注入 Postgres 存储，用于会话结束时落历史
+// SetPostgresStore 注入 Postgres 存储，用于会话结束时落历史。
+// 参数：pg - Postgres 存储句柄（可为 nil，表示禁用持久化）。
 func (m *SessionManager) SetPostgresStore(pg *store.PostgresStore) {
 	m.pgStore = pg
 }
@@ -94,18 +113,22 @@ func (m *SessionManager) SetPostgresStore(pg *store.PostgresStore) {
 // 让用户在 UI 上仍能看到上次的会话。
 //
 // 注意：完整的 events / messages 流无法从 session_history 还原
-// （该表只存 goal/summary/tool_results）。需要完整事件回放请走
+// （该表只存 goal / summary / tool_results）。需要完整事件回放请走
 // 未来扩展的 events 表 + SSE 归档。
+//
+// 参数：ctx - 上下文；limit - 最多恢复条数（<=0 时取默认 50）。
+// 返回值：int - 实际恢复的条数。
+// 并发安全：mu.Lock 保护 sessions 写入与 seq 更新。
 func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 	if m.pgStore == nil {
-		return 0
+		return 0 // 未注入 Postgres，直接返回 0
 	}
 	if limit <= 0 {
-		limit = 50
+		limit = 50 // 默认恢复 50 条
 	}
-	recs, err := m.pgStore.RecentSessionHistories(ctx, limit)
+	recs, err := m.pgStore.RecentSessionHistories(ctx, limit) // 查询最近 N 条历史
 	if err != nil {
-		log.Printf("restore sessions: %v", err)
+		log.Printf("restore sessions: %v", err) // 查询失败仅记录日志
 		return 0
 	}
 
@@ -116,18 +139,18 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 		if _, exists := m.sessions[rec.SessionID]; exists {
 			continue // 不要覆盖正在运行的会话
 		}
-		endedAt := rec.CreatedAt
+		endedAt := rec.CreatedAt // 用创建时间作为结束时间（历史会话已结束）
 		m.sessions[rec.SessionID] = &Session{
 			ID:        rec.SessionID,
 			Goal:      rec.Goal,
-			Status:    "completed",
+			Status:    "completed",                       // 历史会话一律视为已完成
 			Result:    rec.Summary,
 			StartedAt: rec.CreatedAt,
 			EndedAt:   &endedAt,
-			Events:    make([]SessionEvent, 0),
+			Events:    make([]SessionEvent, 0),           // 历史会话事件流为空
 			Messages: []types.ChatMessage{
-				{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},
-				{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},
+				{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},          // 模拟原始用户消息
+				{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},  // 模拟助手回复
 			},
 		}
 		// 让列表的 seq 不与未来创建冲突
@@ -139,40 +162,46 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 	for _, rec := range recs {
 		if id := rec.SessionID; strings.HasPrefix(id, "session-") {
 			if n, err := strconv.ParseInt(strings.TrimPrefix(id, "session-"), 10, 64); err == nil && n > maxSeq {
-				maxSeq = n
+				maxSeq = n // 记录最大数字后缀
 			}
 		}
 	}
 	if maxSeq > 0 {
-		m.seq.Store(maxSeq)
+		m.seq.Store(maxSeq) // 同步原子计数器
 	}
 
 	if restored > 0 {
-		log.Printf("restored %d sessions from history", restored)
+		log.Printf("restored %d sessions from history", restored) // 输出恢复条数
 	}
 	return restored
 }
 
-// handleToolResult 处理工具执行结果，将其路由到归属会话
+// handleToolResult 处理工具执行结果，将其路由到归属会话。
+// 设计要点：不能在持有 m.mu.RLock 的情况下调用 addEvent（addEvent 内部取 Lock，
+// 同 goroutine RLock+Lock 会自死锁，导致会话卡死）。先在 RLock 下收集目标
+// 会话指针，释放后再写事件。
+// 参数：result - 工具执行结果（含 sessionID / tool / output 等）。
+// 副作用：对每个匹配的运行中会话追加 tool_exec 事件。
 func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 	// 注意：不能在持有 m.mu.RLock 的情况下调用 addEvent（addEvent 内部取 Lock，
 	// 同 goroutine RLock+Lock 会自死锁，导致会话卡死）。先在 RLock 下收集目标
 	// 会话指针，释放后再写事件。
 	m.mu.RLock()
-	targets := make([]*Session, 0, 1)
+	targets := make([]*Session, 0, 1) // 收集目标会话指针
 	for _, session := range m.sessions {
 		if session.Status != "running" {
-			continue
+			continue // 跳过非运行中会话
 		}
 		// 优先按工具结果携带的 sessionID 精确匹配，未携带时保持原广播行为兜底
 		if result.SessionID != "" && session.ID != result.SessionID {
-			continue
+			continue // sessionID 不匹配则跳过
 		}
-		targets = append(targets, session)
+		targets = append(targets, session) // 加入待写入列表
 	}
 	m.mu.RUnlock()
 
 	for _, session := range targets {
+		// 释放锁后再写入事件，避免 RLock+Lock 自死锁
 		m.addEvent(session, "tool_exec", "ToolExecutor", fmt.Sprintf("执行工具: %s", result.Tool),
 			"", result.Tool, result.Path, result.Output, result.Error, result.Success)
 	}
@@ -185,15 +214,18 @@ func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 //	tool_call / tool_result     -> "progress"（tool_exec 仍由 handleToolResult 单独发）
 //	error                       -> "progress"（标记 success=false）
 //	prompt / agent_created / token_usage / graph_step -> 同上，但扩展字段携带调试信息
+//
+// 参数：ctx - 上下文（保留以备未来扩展）；ev - Graph 进度事件。
+// 副作用：对每个匹配的运行中会话追加 progress 事件（含调试字段）。
 func (m *SessionManager) handleProgress(ctx context.Context, ev graph.ProgressEvent) {
-	// message 字段仅保留人类可读简述，detail 仅走 detail_json/prompt 字段，
+	// message 字段仅保留人类可读简述，detail 仅走 detail_json / prompt 字段，
 	// 前端按需展开。之前把 detail 拼到 message 里，前端用 markdown 渲染多行
 	// prompt（中英混排 + JSON + 代码），会出现"乱码夹在中文中"的视觉错位。
 	msg := ev.Message
 	if len(msg) > 1000 {
-		msg = msg[:1000] + "..."
+		msg = msg[:1000] + "..." // 防止超长 message 撑爆事件流
 	}
-	success := ev.Kind != "error"
+	success := ev.Kind != "error" // error 类标记为失败
 
 	// 提取调试信息
 	var prompt string
@@ -202,68 +234,77 @@ func (m *SessionManager) handleProgress(ctx context.Context, ev graph.ProgressEv
 	case "prompt":
 		prompt = ev.Detail // 原始 prompt 摘要
 	case "token_usage":
-		inputTokens, outputTokens = parseTokenUsage(ev.Message)
+		inputTokens, outputTokens = parseTokenUsage(ev.Message) // 解析 in / out token
 	}
 
 	m.mu.RLock()
-	targets := make([]*Session, 0, 1)
+	targets := make([]*Session, 0, 1) // 收集目标会话指针
 	for _, session := range m.sessions {
 		if session.Status != "running" {
-			continue
+			continue // 跳过非运行中会话
 		}
 		// 优先按进度事件携带的 sessionID 精确匹配，未携带时保持原广播行为兜底
 		if ev.SessionID != "" && session.ID != ev.SessionID {
-			continue
+			continue // sessionID 不匹配则跳过
 		}
-		targets = append(targets, session)
+		targets = append(targets, session) // 加入待写入列表
 	}
 	m.mu.RUnlock()
 
 	for _, session := range targets {
+		// 写入带调试字段的事件
 		m.addEventDebug(session, "progress", ev.Agent, msg, ev.Kind, "", "", "", "", success, prompt, inputTokens, outputTokens, ev.Detail)
 	}
 }
 
-// parseTokenUsage 从 token_usage 消息中解析 in/out token 数
+// parseTokenUsage 从 token_usage 消息中解析 in / out token 数
 // 格式: "[caller] Token 消耗: in=N out=M dur=X"
+// 返回值：in, out - 输入 / 输出 token 数。
 func parseTokenUsage(msg string) (in, out int) {
-	fmt.Sscanf(msg, "%*s Token 消耗: in=%d out=%d", &in, &out)
+	fmt.Sscanf(msg, "%*s Token 消耗: in=%d out=%d", &in, &out) // %*s 跳过 caller 前缀
 	return
 }
 
-// CreateSession 创建并启动新会话
+// CreateSession 创建并启动新会话。
+// 职责：分配 session ID，初始化 Session 对象（含 system 消息），异步调用 runSession。
+// 参数：ctx - 上下文（仅用于传递超时，不阻塞创建）；goal - 用户目标。
+// 返回值：*Session - 创建的会话对象（已加入 sessions 映射，运行中状态）。
+// 并发安全：mu.Lock 保护 sessions 写入。
 func (m *SessionManager) CreateSession(ctx context.Context, goal string) *Session {
-	sessionID := fmt.Sprintf("session-%d", m.seq.Add(1))
+	sessionID := fmt.Sprintf("session-%d", m.seq.Add(1)) // 原子自增生成 ID
 
 	session := &Session{
 		ID:        sessionID,
 		Goal:      goal,
-		Status:    "running",
+		Status:    "running",                       // 初始状态为运行中
 		StartedAt: time.Now(),
-		Events:    make([]SessionEvent, 0),
+		Events:    make([]SessionEvent, 0),         // 空事件流
 		Messages: []types.ChatMessage{
-			{Role: "system", Content: "Goal: " + goal, Timestamp: time.Now()},
+			{Role: "system", Content: "Goal: " + goal, Timestamp: time.Now()}, // 注入 system 消息
 		},
 	}
 
 	m.mu.Lock()
-	m.sessions[sessionID] = session
+	m.sessions[sessionID] = session // 加入 sessions 映射
 	m.mu.Unlock()
 
 	// 异步执行
-	go m.runSession(ctx, session)
+	go m.runSession(ctx, session) // 不阻塞 HTTP 请求
 
 	return session
 }
 
 // GetSession 获取会话
+// 参数：id - 会话 ID。
+// 返回值：*Session - 找不到返回 nil。
 func (m *SessionManager) GetSession(id string) *Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.sessions[id]
+	return m.sessions[id] // 找不到返回 nil
 }
 
 // LLMStats 返回所有运行中会话聚合的 LLM 调用统计（用于 /api/health）
+// 返回值：callCount - 调用次数；timeoutCount - 超时次数；avgDur / maxDur - 平均 / 最长耗时（当前实现未填充，由调用方按需扩展）。
 func (m *SessionManager) LLMStats() (callCount, timeoutCount int, avgDur, maxDur time.Duration) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -271,11 +312,11 @@ func (m *SessionManager) LLMStats() (callCount, timeoutCount int, avgDur, maxDur
 	for _, s := range m.sessions {
 		for _, ev := range s.Events {
 			if ev.Kind != "token_usage" {
-				continue
+				continue // 只统计 token_usage 事件
 			}
 			callCount++
 			if strings.Contains(ev.Message, "timeout") || strings.Contains(ev.Message, "超时") {
-				timeoutCount++
+				timeoutCount++ // 消息含 timeout / 超时 关键字
 			}
 		}
 	}
@@ -283,28 +324,35 @@ func (m *SessionManager) LLMStats() (callCount, timeoutCount int, avgDur, maxDur
 }
 
 // ListSessions 列出所有会话
+// 返回值：[]*Session - 所有会话指针的切片（拷贝，可安全遍历）。
 func (m *SessionManager) ListSessions() []*Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	result := make([]*Session, 0, len(m.sessions))
+	result := make([]*Session, 0, len(m.sessions)) // 预分配容量
 	for _, s := range m.sessions {
-		result = append(result, s)
+		result = append(result, s) // 拷贝指针
 	}
 	return result
 }
 
+// runSession 是会话执行的主循环（在独立 goroutine 中运行）。
+// 职责：构建初始 ThreeLayerState，调用 graph.Invoke，根据结果更新 Session 状态，
+// 写入 agent_done / system / stats 事件，最后持久化历史。
+// 参数：ctx - 请求上下文；session - 待运行的会话。
+// 副作用：异步运行；写入多个事件；更新 session.Status / Result / EndedAt。
 func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	// 全局超时10分钟：复杂任务（写游戏+运行+DB检查）需多轮 ReAct，5分钟不够
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
-	state := types.NewThreeLayerState(session.ID)
-	state.DomainGoal = session.Goal
+	state := types.NewThreeLayerState(session.ID) // 创建初始图状态
+	state.DomainGoal = session.Goal               // 注入用户目标
 
 	m.addEvent(session, "system", "MetaAgent", "会话启动，目标: "+session.Goal, "", "", "", "", "", false)
 
-	result, err := m.graph.Invoke(ctx, state)
+	result, err := m.graph.Invoke(ctx, state) // 调用三层图
 	if err != nil {
+		// 失败：更新状态并写入 error 事件
 		m.mu.Lock()
 		session.Status = "error"
 		session.Result = err.Error()
@@ -315,6 +363,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 		return
 	}
 
+	// 成功：更新状态、结果、最终 State
 	m.mu.Lock()
 	session.Status = "completed"
 	session.Result = result.SessionSummary
@@ -328,7 +377,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 		roleDef := m.registry.GetRoleDef(inst.RoleDefID)
 		name := "unknown"
 		if roleDef != nil {
-			name = roleDef.Name
+			name = roleDef.Name // 取角色定义名称
 		}
 		m.addEvent(session, "agent_done", name, fmt.Sprintf("类型: %s, 领域: %s, 状态: %s", inst.Type, inst.Domain, inst.Status), "", "", "", "", "", false)
 	}
@@ -341,8 +390,8 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	// 报告 LLM 统计
 	if metaNode, ok := m.graph.GetNode("MetaAgent"); ok {
 		if ma, ok := metaNode.(*graph.MetaAgentNode); ok {
-			calls, timeouts, avg, max := ma.TimeoutStats()
-			inTotal, outTotal := ma.LLMTracker().TokenTotals()
+			calls, timeouts, avg, max := ma.TimeoutStats()     // 超时统计
+			inTotal, outTotal := ma.LLMTracker().TokenTotals() // token 总量
 			if calls > 0 {
 				m.addEvent(session, "stats", "System",
 					fmt.Sprintf("LLM统计: 调用%d次, 超时%d次, 平均%v, 最长%v, 输入Token=%d, 输出Token=%d",
@@ -353,20 +402,22 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	}
 }
 
-// persistHistory 把会话目标/总结/工具调用结果写入 session_history 表
+// persistHistory 把会话目标 / 总结 / 工具调用结果写入 session_history 表
+// 职责：从 session.Events 过滤 tool_exec 事件，组装 SessionHistoryRecord，调用 pgStore 落库。
+// 副作用：写 Postgres；失败仅记录日志，不影响主流程。
 func (m *SessionManager) persistHistory(session *Session) {
 	if m.pgStore == nil {
-		return
+		return // 未配置 Postgres，跳过
 	}
 	toolResults := make([]map[string]any, 0, len(session.Events))
 	for _, ev := range session.Events {
 		if ev.Type != "tool_exec" {
-			continue
+			continue // 仅持久化 tool_exec 事件
 		}
 		toolResults = append(toolResults, map[string]any{
 			"tool":   ev.Tool,
 			"path":   ev.ToolPath,
-			"output": truncate(ev.ToolOutput, 500),
+			"output": truncate(ev.ToolOutput, 500), // 截断 500 字
 			"error":  ev.ToolError,
 			"ok":     ev.Success,
 		})
@@ -374,28 +425,38 @@ func (m *SessionManager) persistHistory(session *Session) {
 	rec := &store.SessionHistoryRecord{
 		SessionID:   session.ID,
 		Goal:        session.Goal,
-		Summary:     truncate(session.Result, 2000),
+		Summary:     truncate(session.Result, 2000), // 摘要截断 2000 字
 		ToolResults: toolResults,
 		CreatedAt:   time.Now(),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // 持久化超时 3 秒
 	defer cancel()
 	if err := m.pgStore.SaveSessionHistory(ctx, rec); err != nil {
-		log.Printf("[%s] persist history: %v", session.ID, err)
+		log.Printf("[%s] persist history: %v", session.ID, err) // 持久化失败仅日志
 	}
 }
 
+// truncate 把字符串截断到指定长度，超出加省略后缀。
+// 参数：s - 原始字符串；n - 最大长度。
+// 返回值：string - 截断后的字符串。
 func truncate(s string, n int) string {
 	if len(s) <= n {
-		return s
+		return s // 未超长
 	}
 	return s[:n] + "...(truncated)"
 }
 
+// addEvent 是 addEventDebug 的简化封装，省略调试字段。
+// 职责：把事件追加到 session.Events 并输出日志。
 func (m *SessionManager) addEvent(session *Session, eventType, agent, message, kind, tool, toolPath, toolOutput, toolError string, success bool) {
 	m.addEventDebug(session, eventType, agent, message, kind, tool, toolPath, toolOutput, toolError, success, "", 0, 0, "")
 }
 
+// addEventDebug 写入一个完整的 SessionEvent（含调试字段），并广播日志。
+// 职责：构造 SessionEvent，追加到 session.Events，输出日志（暂未接 SSE，靠前端轮询）。
+// 参数：见 SessionEvent 字段对应关系。
+// 副作用：修改 session.Events。
+// 并发安全：mu.Lock 保护 append。
 func (m *SessionManager) addEventDebug(session *Session, eventType, agent, message, kind, tool, toolPath, toolOutput, toolError string, success bool, prompt string, inputTokens, outputTokens int, detailJSON string) {
 	ev := SessionEvent{
 		Type:       eventType,
@@ -414,16 +475,19 @@ func (m *SessionManager) addEventDebug(session *Session, eventType, agent, messa
 		DetailJSON:   detailJSON,
 	}
 	m.mu.Lock()
-	session.Events = append(session.Events, ev)
+	session.Events = append(session.Events, ev) // 追加事件
 	m.mu.Unlock()
 
 	// 广播SSE
-	log.Printf("[%s] %s: %s", session.ID, agent, message)
+	log.Printf("[%s] %s: %s", session.ID, agent, message) // 当前仅日志，SSE 由前端轮询模拟
 }
 
 // ---- HTTP Handlers ----
 
 // HandleCreateSession POST /api/sessions
+// 解析 goal 并创建会话，返回 Session 对象。
+// 参数：w / r - HTTP 标准参数。
+// 副作用：创建会话并异步启动 runSession。
 func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -442,15 +506,16 @@ func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	session := m.CreateSession(context.Background(), req.Goal)
+	session := m.CreateSession(context.Background(), req.Goal) // 创建并异步启动
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(session)
+	json.NewEncoder(w).Encode(session) // 返回 Session JSON
 }
 
 // HandleGetSession GET /api/sessions/{id}
+// 按 URL 路径中的 id 查找会话，找不到返回 404。
 func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Path[len("/api/sessions/"):]
+	id := r.URL.Path[len("/api/sessions/"):] // 截取 id
 	if id == "" {
 		http.Error(w, "session id required", http.StatusBadRequest)
 		return
@@ -467,6 +532,7 @@ func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request
 }
 
 // HandleListSessions GET /api/sessions
+// 返回所有会话列表。
 func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 	sessions := m.ListSessions()
 	w.Header().Set("Content-Type", "application/json")
@@ -477,7 +543,7 @@ func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Reque
 // 返回该会话的 TaskBoard 快照（领域子任务、约束、状态）。若无则返回 null。
 func (m *SessionManager) HandleSessionBoard(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-	id = strings.TrimSuffix(id, "/board")
+	id = strings.TrimSuffix(id, "/board") // 剥离 /board 后缀
 
 	session := m.GetSession(id)
 	if session == nil {
@@ -488,35 +554,35 @@ func (m *SessionManager) HandleSessionBoard(w http.ResponseWriter, r *http.Reque
 	var snap any
 	if rt := m.graph.Runtime(); rt != nil && rt.Boards != nil {
 		if b := rt.Boards.Get(id); b != nil {
-			snap = b.Snapshot()
+			snap = b.Snapshot() // 取 TaskBoard 快照
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"session_id": id,
-		"board":      snap,
+		"board":      snap, // 没有则 nil
 	})
 }
 
 // agentNode 是给前端用的扁平+树结构节点，含 RoleDefinition 名称与父子关系
 type agentNode struct {
-	InstID    string `json:"inst_id"`
-	RoleDefID string `json:"role_def_id"`
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	Domain    string `json:"domain"`
-	Status    string `json:"status"`
-	ParentID  string `json:"parent_id"`
-	Goal      string `json:"goal,omitempty"`
-	BlockID   string `json:"block_id,omitempty"`
+	InstID    string `json:"inst_id"`            // 实例 ID
+	RoleDefID string `json:"role_def_id"`        // 角色定义 ID
+	Name      string `json:"name"`               // 角色名称
+	Type      string `json:"type"`               // 实例类型（meta / domain / subdomain / assistant）
+	Domain    string `json:"domain"`             // 所属领域
+	Status    string `json:"status"`             // 实例状态
+	ParentID  string `json:"parent_id"`          // 父实例 ID（树结构）
+	Goal      string `json:"goal,omitempty"`     // Block 目标
+	BlockID   string `json:"block_id,omitempty"` // 所属 SessionBlock ID
 }
 
 // HandleSessionAgents GET /api/sessions/{id}/agents
 // 返回该会话所有 RoleInstance（带 RoleDefinition 名称），并附上对应 SessionBlock 的目标。
 func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-	id = strings.TrimSuffix(id, "/agents")
+	id = strings.TrimSuffix(id, "/agents") // 剥离 /agents 后缀
 
 	session := m.GetSession(id)
 	if session == nil {
@@ -529,23 +595,23 @@ func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Requ
 	blockIDByDomain := make(map[string]string)
 	if session.State != nil {
 		for _, b := range session.State.ActiveBlocks {
-			blockGoalByDomain[b.Domain] = b.Goal
-			blockIDByDomain[b.Domain] = b.ID
+			blockGoalByDomain[b.Domain] = b.Goal // domain -> goal
+			blockIDByDomain[b.Domain] = b.ID     // domain -> blockID
 		}
 	}
 
-	instances := m.registry.GetInstancesBySession(id)
+	instances := m.registry.GetInstancesBySession(id) // 查询所有实例
 	nodes := make([]agentNode, 0, len(instances))
 	for _, inst := range instances {
 		name := "unknown"
 		if def := m.registry.GetRoleDef(inst.RoleDefID); def != nil {
-			name = def.Name
+			name = def.Name // 取角色定义名
 		}
 		goal := ""
 		blockID := ""
 		if inst.Domain != "" {
-			goal = blockGoalByDomain[inst.Domain]
-			blockID = blockIDByDomain[inst.Domain]
+			goal = blockGoalByDomain[inst.Domain]  // 按 domain 回填 goal
+			blockID = blockIDByDomain[inst.Domain] // 按 domain 回填 blockID
 		}
 		nodes = append(nodes, agentNode{
 			InstID:    inst.ID,
@@ -568,9 +634,11 @@ func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Requ
 }
 
 // HandleSessionStream GET /api/sessions/{id}/stream
+// SSE 长连接：先推送当前 session 全量快照，再轮询增量事件，直到会话结束或客户端断开。
+// 副作用：阻塞当前 goroutine 直到 session 结束或客户端断开。
 func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Path[len("/api/sessions/"):]
-	id = id[:len(id)-len("/stream")]
+	id = id[:len(id)-len("/stream")] // 剥离 /stream 后缀
 
 	session := m.GetSession(id)
 	if session == nil {
@@ -578,59 +646,63 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Content-Type", "text/event-stream") // SSE 头
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "*") // 跨域
 
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := w.(http.Flusher) // 断言 Flusher 接口
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
 	// 先发送当前状态
-	data, _ := json.Marshal(session)
-	fmt.Fprintf(w, "data: %s\n\n", data)
+	data, _ := json.Marshal(session)     // 序列化当前 session
+	fmt.Fprintf(w, "data: %s\n\n", data) // 写入 SSE 帧
 	flusher.Flush()
 
 	// 轮询更新
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond) // 500ms 轮询一次
 	defer ticker.Stop()
 
-	lastEventCount := len(session.Events)
+	lastEventCount := len(session.Events) // 记录上次推送的事件数
 
 	for {
 		select {
 		case <-ticker.C:
-			session = m.GetSession(id)
+			session = m.GetSession(id) // 重新查询（可能已被回收）
 			if session == nil {
 				return
 			}
 
 			if len(session.Events) > lastEventCount {
+				// 推送增量事件
 				for _, ev := range session.Events[lastEventCount:] {
 					data, _ := json.Marshal(ev)
 					fmt.Fprintf(w, "data: %s\n\n", data)
 				}
-				lastEventCount = len(session.Events)
+				lastEventCount = len(session.Events) // 更新水位
 				flusher.Flush()
 			}
 
 			if session.Status != "running" {
+				// 推送 done 事件并退出
 				data, _ := json.Marshal(map[string]string{"type": "done", "status": session.Status})
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				flusher.Flush()
 				return
 			}
 
-		case <-r.Context().Done():
+		case <-r.Context().Done(): // 客户端断开
 			return
 		}
 	}
 }
 
 // HandleSessionMessage POST /api/sessions/{id}/message
+// 向会话追加用户消息；若会话已结束则恢复执行。
+// 副作用：修改 session.Messages / Status / EndedAt；可能异步启动 resumeSession。
 func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -638,7 +710,7 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	}
 
 	id := r.URL.Path[len("/api/sessions/"):]
-	id = id[:len(id)-len("/message")]
+	id = id[:len(id)-len("/message")] // 剥离 /message 后缀
 	if id == "" {
 		http.Error(w, "session id required", http.StatusBadRequest)
 		return
@@ -664,6 +736,7 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// 追加用户消息
 	session.Messages = append(session.Messages, types.ChatMessage{
 		Role:      "user",
 		Content:   req.Content,
@@ -672,6 +745,7 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	m.addEvent(session, "user_message", "User", req.Content, "", "", "", "", "", true)
 
 	if session.Status != "running" {
+		// 已结束会话：重新激活并异步恢复
 		session.Status = "running"
 		session.EndedAt = nil
 		go m.resumeSession(session)
@@ -683,29 +757,33 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 }
 
 // resumeSession 基于历史消息恢复会话执行
+// 职责：构建最近 10 条消息上下文，调用 graph.Invoke 续跑，更新状态并持久化。
+// 参数：session - 待恢复的会话（Status 已被设为 running）。
+// 副作用：异步运行；写入 system / agent_done / error 事件；更新 session 状态。
 func (m *SessionManager) resumeSession(session *Session) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute) // 恢复也用 10 分钟超时
 	defer cancel()
 
 	// 构建对话上下文（最近10条消息）
 	var history strings.Builder
 	start := 0
 	if len(session.Messages) > 10 {
-		start = len(session.Messages) - 10
+		start = len(session.Messages) - 10 // 仅取最后 10 条
 	}
 	for _, msg := range session.Messages[start:] {
-		history.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content))
+		history.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content)) // 拼成 role: content 文本
 	}
 
 	state := types.NewThreeLayerState(session.ID)
-	state.DomainGoal = history.String()
-	state.SessionSummary = session.Result
-	state.Messages = session.Messages
+	state.DomainGoal = history.String()   // 用历史消息作为新目标
+	state.SessionSummary = session.Result // 携带之前的摘要
+	state.Messages = session.Messages     // 传递消息流
 
 	m.addEvent(session, "system", "MetaAgent", "继续会话，新消息已纳入上下文", "", "", "", "", "", false)
 
 	result, err := m.graph.Invoke(ctx, state)
 	if err != nil {
+		// 失败：更新状态并写入 error 事件
 		m.mu.Lock()
 		session.Status = "error"
 		session.Result = err.Error()
@@ -716,6 +794,7 @@ func (m *SessionManager) resumeSession(session *Session) {
 		return
 	}
 
+	// 成功：更新状态、结果、最终 State，并追加助手回复
 	m.mu.Lock()
 	session.Status = "completed"
 	session.Result = result.SessionSummary
@@ -729,6 +808,7 @@ func (m *SessionManager) resumeSession(session *Session) {
 	})
 	m.mu.Unlock()
 
+	// 写入每个角色实例的完成事件
 	for _, inst := range m.registry.GetInstancesBySession(session.ID) {
 		roleDef := m.registry.GetRoleDef(inst.RoleDefID)
 		name := "unknown"
@@ -739,10 +819,11 @@ func (m *SessionManager) resumeSession(session *Session) {
 	}
 
 	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", "", false)
-	m.persistHistory(session)
+	m.persistHistory(session) // 持久化历史
 }
 
 // HandleSessionMetrics GET /api/sessions/{id}/metrics — 会话级 LLM 统计
+// 职责：聚合该会话所有 token_usage 事件，输出调用次数、超时次数、平均 / 最长耗时、token 总量。
 func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
 	id = strings.TrimSuffix(id, "/metrics")
@@ -758,7 +839,7 @@ func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Req
 	var totalDur time.Duration
 	for _, ev := range session.Events {
 		if ev.Kind != "token_usage" {
-			continue
+			continue // 仅统计 token_usage
 		}
 		calls++
 		inputTokens += ev.InputTokens
@@ -768,15 +849,15 @@ func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Req
 		}
 		// token_usage 消息格式: "[caller] Token 消耗: in=N out=M dur=X"
 		var dur time.Duration
-		fmt.Sscanf(ev.Message, "%*s Token 消耗: in=%*d out=%*d dur=%v", &dur)
+		fmt.Sscanf(ev.Message, "%*s Token 消耗: in=%*d out=%*d dur=%v", &dur) // 解析 dur
 		totalDur += dur
 		if dur > maxDur {
-			maxDur = dur
+			maxDur = dur // 记录最长
 		}
 	}
 	avgDur := time.Duration(0)
 	if calls > 0 {
-		avgDur = totalDur / time.Duration(calls)
+		avgDur = totalDur / time.Duration(calls) // 计算平均
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -793,6 +874,7 @@ func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Req
 }
 
 // HandleSessionWatchdog GET /api/sessions/{id}/watchdog — 看门狗历史决策
+// 职责：从全局 Watchdog 历史中过滤出本会话相关的决策（按 blockID 匹配 active / completed blocks），返回决策列表。
 func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
 	id = strings.TrimSuffix(id, "/watchdog")
@@ -812,12 +894,12 @@ func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Re
 				found := false
 				for _, bid := range session.State.CompletedBlocks {
 					if bid == d.AgentID {
-						found = true
+						found = true // 命中已完成 block
 						break
 					}
 				}
 				if !found {
-					continue
+					continue // 既不在 active 也不在 completed，跳过
 				}
 			}
 			decisions = append(decisions, map[string]any{
@@ -839,6 +921,8 @@ func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Re
 }
 
 // HandleSessionMailbox GET /api/sessions/{id}/mailbox — 会话内 Agent 未读邮件
+// 职责：枚举该会话所有 RoleInstance 的邮箱，去重后合并广播桶消息，返回邮件列表。
+// 副作用：DrainBroadcast 会消费广播桶（Peek 不消费点对点邮件）。
 func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
 	id = strings.TrimSuffix(id, "/mailbox")
@@ -852,9 +936,9 @@ func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Req
 	var msgs []map[string]any
 	if rt := m.graph.Runtime(); rt != nil && rt.Mailbox != nil {
 		instances := m.registry.GetInstancesBySession(id)
-		seen := make(map[string]bool)
+		seen := make(map[string]bool) // 邮件去重集合
 		for _, inst := range instances {
-			for _, msg := range rt.Mailbox.Peek(inst.ID) {
+			for _, msg := range rt.Mailbox.Peek(inst.ID) { // Peek 不消费
 				if seen[msg.ID] {
 					continue
 				}
@@ -873,7 +957,7 @@ func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Req
 			}
 		}
 		// 合并广播桶
-		for _, msg := range rt.Mailbox.DrainBroadcast() {
+		for _, msg := range rt.Mailbox.DrainBroadcast() { // DrainBroadcast 会消费广播桶
 			if seen[msg.ID] {
 				continue
 			}
@@ -881,14 +965,14 @@ func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Req
 			msgs = append(msgs, map[string]any{
 				"id":         msg.ID,
 				"from":       msg.From,
-				"to":         "*",
+				"to":         "*",         // 广播邮件 to 字段统一为 *
 				"type":       msg.Type,
 				"subject":    msg.Subject,
 				"body":       msg.Body,
 				"priority":   msg.Priority,
 				"status":     msg.Status,
 				"created_at": msg.CreatedAt,
-				"broadcast":  true,
+				"broadcast":  true,        // 标记为广播邮件
 			})
 		}
 	}
