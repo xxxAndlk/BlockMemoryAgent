@@ -301,6 +301,18 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 			return
 		}
 
+		// /api/sessions/{id}/interrupt —— 抢占中断（特性6）
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/interrupt"):] == "/interrupt" {
+			mgr.HandleSessionInterrupt(w, r)
+			return
+		}
+
+		// /api/sessions/{id}/enqueue —— 队列注入（特性6）
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/enqueue"):] == "/enqueue" {
+			mgr.HandleSessionEnqueue(w, r)
+			return
+		}
+
 		// /api/sessions/{id} —— 单个会话详情
 		if len(path) > len("/api/sessions/") {
 			mgr.HandleGetSession(w, r)

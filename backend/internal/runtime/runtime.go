@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/blockmemory/agent/backend/internal/board"
+	"github.com/blockmemory/agent/backend/internal/cmdqueue"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/skill"
@@ -29,6 +30,7 @@ type Runtime struct {
 	Soul     *soul.Loader       // 人格加载器：注入 soul.md 并提供热重载与温度策略
 	Watchdog *watchdog.Watchdog // 上下文看门狗：按软/硬阈值发出压缩或切换信号
 	AgentCfg *config.AgentConfig // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
+	CmdQueue *cmdqueue.Manager   // 用户指令队列（特性6：抢占中断 / 队列注入）
 }
 
 // New 创建带默认依赖的运行时。
@@ -62,6 +64,7 @@ func New(soulPath string, skillPool *skill.Pool) *Runtime {
 		Skills:   skill.NewRegistry(skillPool),           // 以技能池初始化注册表
 		Soul:     loader,                                 // 人格加载器，供 Agent 拼 system prompt 时注入
 		Watchdog: watchdog.New(watchdog.DefaultConfig()), // 使用默认软/硬阈值（soft=12000/hard=20000）
+		CmdQueue: cmdqueue.NewManager(),                  // 用户指令队列（特性6）
 	}
 }
 

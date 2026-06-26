@@ -156,6 +156,7 @@ func (n *MetaAgentNode) Name() string {
 //
 // 职责：
 //   - 递增步数；按 summaryInterval 定期更新会话摘要
+//   - 处理用户指令队列（特性6：抢占中断 / 队列注入）
 //   - 清理过期实例
 //   - 跑 Watchdog 监控上下文规模
 //   - 跑邮箱分发跨域广播
@@ -171,6 +172,14 @@ func (n *MetaAgentNode) Name() string {
 func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	// 1. 递增步数
 	n.stepCount++
+
+	// 1.5 特性6：处理用户指令队列（抢占中断 / 队列注入）
+	if n.rt != nil && n.rt.CmdQueue != nil {
+		if stopped := n.drainCommandQueue(ctx, state); stopped {
+			// 抢占中断已重置 state，让循环回到 handleInitial 重新起步
+			return state, nil
+		}
+	}
 
 	// 2. 按间隔更新会话摘要（避免每步都跑 LLM 摘要）
 	if n.summaryInterval > 0 && n.stepCount%n.summaryInterval == 0 {
@@ -217,6 +226,53 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	}
 
 	return state, nil
+}
+
+// drainCommandQueue 处理用户指令队列（特性6）。
+//
+// 行为：
+//   - IntentInterrupt：清空 ActiveBlocks / CallStack / CurrentBlockID 等上下文，
+//     把新指令作为 DomainGoal，置 ActionContinue 让 Invoke 下一 tick 进入 handleInitial。
+//     返回 true 表示已重置 state，调用方应立即返回。
+//   - IntentEnqueue：把指令作为 user 消息追加到 state.Messages，继续当前任务。
+//     返回 false。
+//
+// 没有队列或队列为空时返回 false。
+func (n *MetaAgentNode) drainCommandQueue(ctx context.Context, state *types.ThreeLayerState) bool {
+	items := n.rt.CmdQueue.Drain(state.SessionID)
+	if len(items) == 0 {
+		return false
+	}
+	for _, it := range items {
+		switch it.Intent {
+		case 1: // cmdqueue.IntentInterrupt
+			n.emit(ctx, "intend", "抢占中断：清空当前上下文，按新指令重新启动")
+			// 清空图状态，保留 SessionID 与 Messages 中的历史对话
+			state.ActiveBlocks = make(map[string]*types.SessionBlock)
+			state.CompletedBlocks = nil
+			state.CallStack = make([]*types.CallRequest, 0)
+			state.CurrentBlockID = ""
+			state.CurrentDomain = ""
+			state.DomainGoal = it.Content
+			state.CurrentAssistantID = ""
+			state.TargetRoleID = ""
+			state.DirectExecute = false
+			state.PendingClarify = nil
+			state.NextAction = types.ActionContinue
+			state.Reason = "interrupted by user"
+			// 追加为最新用户消息
+			state.Messages = append(state.Messages, types.ChatMessage{
+				Role: "user", Content: it.Content, Timestamp: time.Now(),
+			})
+			return true
+		default: // IntentEnqueue
+			n.emit(ctx, "intend", "队列注入：追加用户指令到当前上下文")
+			state.Messages = append(state.Messages, types.ChatMessage{
+				Role: "user", Content: it.Content, Timestamp: time.Now(),
+			})
+		}
+	}
+	return false
 }
 
 // runWatchdog 评估当前活跃 Agent 的上下文规模并视情况触发动作。

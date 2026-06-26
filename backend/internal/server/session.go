@@ -13,6 +13,7 @@ import (
 	"sync/atomic"   // 原子计数器（seq）
 	"time"          // 时间戳与超时
 
+	"github.com/blockmemory/agent/backend/internal/cmdqueue" // 用户指令队列（特性6）
 	"github.com/blockmemory/agent/backend/internal/graph" // Graph 引擎
 	"github.com/blockmemory/agent/backend/internal/store" // Postgres 存储
 	"github.com/blockmemory/agent/backend/pkg/types"      // 共享类型
@@ -884,6 +885,121 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 		"session_id": id,
 		"status":     "running",
 	})
+}
+
+// HandleSessionInterrupt POST /api/sessions/{id}/interrupt
+// 特性6：抢占中断 — 用户暂停当前任务并以新指令重启。
+// 职责：把新指令作为 IntentInterrupt 推入会话队列；若会话已完成则直接以新指令恢复执行。
+// 副作用：写入 CmdQueue；可能异步启动 resumeSession。
+func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/interrupt")
+	if id == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Content == "" {
+		http.Error(w, "content is required", http.StatusBadRequest)
+		return
+	}
+
+	rt := m.graph.Runtime()
+	if rt == nil || rt.CmdQueue == nil {
+		http.Error(w, "command queue not available", http.StatusServiceUnavailable)
+		return
+	}
+	rt.CmdQueue.Push(id, cmdqueue.Item{Content: req.Content, Intent: cmdqueue.IntentInterrupt})
+
+	m.mu.Lock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	m.addEvent(session, "interrupt", "User", "抢占中断: "+req.Content, "", "", "", "", "", true)
+	wasRunning := session.Status == "running"
+	if !wasRunning {
+		session.Status = "running"
+		session.EndedAt = nil
+	}
+	m.mu.Unlock()
+
+	// 已结束会话：异步恢复执行；运行中会话：由 MetaAgent 下一个 tick 拉取中断
+	if !wasRunning {
+		go m.resumeSession(session)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running"})
+}
+
+// HandleSessionEnqueue POST /api/sessions/{id}/enqueue
+// 特性6：队列注入 — 用户在任务执行中追加指令，不中断当前流程。
+// 职责：把新指令作为 IntentEnqueue 推入会话队列；若会话已结束则按 /message 行为恢复。
+// 副作用：写入 CmdQueue；可能异步启动 resumeSession。
+func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/enqueue")
+	if id == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Content == "" {
+		http.Error(w, "content is required", http.StatusBadRequest)
+		return
+	}
+
+	rt := m.graph.Runtime()
+	if rt == nil || rt.CmdQueue == nil {
+		http.Error(w, "command queue not available", http.StatusServiceUnavailable)
+		return
+	}
+	rt.CmdQueue.Push(id, cmdqueue.Item{Content: req.Content, Intent: cmdqueue.IntentEnqueue})
+
+	m.mu.Lock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	m.addEvent(session, "enqueue", "User", "队列注入: "+req.Content, "", "", "", "", "", true)
+	wasRunning := session.Status == "running"
+	if !wasRunning {
+		session.Status = "running"
+		session.EndedAt = nil
+	}
+	m.mu.Unlock()
+
+	if !wasRunning {
+		go m.resumeSession(session)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running"})
 }
 
 // HandleSessionMessage POST /api/sessions/{id}/message
