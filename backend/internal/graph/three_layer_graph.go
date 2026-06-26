@@ -269,6 +269,11 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 			return state, nil
 		}
 
+		// ActionWait：挂起图循环，等待人机对话答复后由 server 侧恢复（特性5）
+		if state.NextAction == types.ActionWait {
+			return state, nil
+		}
+
 		if next == "" {
 			return state, nil // 无下一跳，安全退出
 		}

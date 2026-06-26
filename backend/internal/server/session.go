@@ -405,6 +405,19 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 		return
 	}
 
+	// 特性5：人机对话挂起 — Graph 返回 ActionWait 且有待处理澄清请求时，
+	// 保留运行态，等待用户通过 /api/sessions/{id}/clarify 提交答复后恢复执行。
+	if result.NextAction == types.ActionWait && result.PendingClarify != nil {
+		m.mu.Lock()
+		session.Status = "awaiting_clarify"
+		session.State = result
+		m.mu.Unlock()
+		m.addEvent(session, "clarify", "MetaAgent",
+			"请求用户澄清: "+result.PendingClarify.Question,
+			"", "", "", "", "", false)
+		return
+	}
+
 	// 成功：更新状态、结果、最终 State
 	m.mu.Lock()
 	session.Status = "completed"
@@ -809,6 +822,70 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 	}
 }
 
+// HandleSessionClarify POST /api/sessions/{id}/clarify
+// 特性5：人机对话 — 用户答复 Agent 提出的澄清问题。
+// 职责：将答复追加到会话消息，清空 PendingClarify，异步恢复 graph 执行。
+// 副作用：修改 session.Messages / Status / State；异步启动 resumeSession。
+func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/clarify")
+	if id == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Answer     string `json:"answer"`
+		QuestionID string `json:"question_id"`
+	}
+	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Answer == "" {
+		http.Error(w, "answer is required", http.StatusBadRequest)
+		return
+	}
+
+	m.mu.Lock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	if session.Status != "awaiting_clarify" {
+		m.mu.Unlock()
+		http.Error(w, "session is not awaiting clarification", http.StatusBadRequest)
+		return
+	}
+	// 追加用户答复到对话历史
+	session.Messages = append(session.Messages, types.ChatMessage{
+		Role:      "user",
+		Content:   "[澄清答复] " + req.Answer,
+		Timestamp: time.Now(),
+	})
+	// 清空 PendingClarify，恢复执行时会以最新 Messages 重新构造上下文
+	if session.State != nil {
+		session.State.PendingClarify = nil
+	}
+	session.Status = "running"
+	m.addEvent(session, "clarify", "User", "用户答复: "+req.Answer, "", "", "", "", "", true)
+	m.mu.Unlock()
+
+	go m.resumeSession(session)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id": id,
+		"status":     "running",
+	})
+}
+
 // HandleSessionMessage POST /api/sessions/{id}/message
 // 向会话追加用户消息；若会话已结束则恢复执行。
 // 副作用：修改 session.Messages / Status / EndedAt；可能异步启动 resumeSession。
@@ -900,6 +977,18 @@ func (m *SessionManager) resumeSession(session *Session) {
 		session.EndedAt = &now
 		m.mu.Unlock()
 		m.addEvent(session, "error", "System", "执行失败: "+err.Error(), "", "", "", "", "", false)
+		return
+	}
+
+	// 特性5：人机对话挂起 — 恢复路径同样支持再次挂起
+	if result.NextAction == types.ActionWait && result.PendingClarify != nil {
+		m.mu.Lock()
+		session.Status = "awaiting_clarify"
+		session.State = result
+		m.mu.Unlock()
+		m.addEvent(session, "clarify", "MetaAgent",
+			"请求用户澄清: "+result.PendingClarify.Question,
+			"", "", "", "", "", false)
 		return
 	}
 

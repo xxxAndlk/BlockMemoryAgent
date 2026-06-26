@@ -295,6 +295,12 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 			return
 		}
 
+		// /api/sessions/{id}/clarify —— 人机对话答复（特性5）
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/clarify"):] == "/clarify" {
+			mgr.HandleSessionClarify(w, r)
+			return
+		}
+
 		// /api/sessions/{id} —— 单个会话详情
 		if len(path) > len("/api/sessions/") {
 			mgr.HandleGetSession(w, r)

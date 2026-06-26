@@ -168,7 +168,21 @@ const (
 	ActionEscalate ActionType = "Escalate"
 	// ActionFinish 完成：结束整个 Graph 循环，进入收尾。
 	ActionFinish ActionType = "Finish"
+	// ActionWait 等待：暂停 Graph 循环，等待外部输入（如人机对话答复）后由 server 侧恢复执行。
+	ActionWait ActionType = "Wait"
 )
+
+// ClarifyRequest 人机对话请求：Agent 在执行中遇到需要用户确认的问题时挂起，
+// 由 server 层通过 HTTP 暴露给前端，用户答复后回填 Answer 并恢复 graph。
+type ClarifyRequest struct {
+	ID        string    `json:"id"`         // 请求唯一 ID（用于答复对齐）
+	Question  string    `json:"question"`   // Agent 提给用户的问题
+	Context   string    `json:"context"`    // 触发澄清的上下文摘要（便于用户理解）
+	AgentID   string    `json:"agent_id"`   // 发起澄清的 Agent 实例 ID
+	CreatedAt time.Time `json:"created_at"` // 创建时间
+	Answer    string    `json:"answer,omitempty"` // 用户答复（回填）
+	AnsweredAt *time.Time `json:"answered_at,omitempty"` // 答复时间
+}
 
 // GraphState 三层图共享状态：早期版本的全局状态载体（向后兼容保留）。
 // 运行时主路径使用 ThreeLayerState，本结构用于事件序列化与外部 API。

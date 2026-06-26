@@ -508,7 +508,22 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 	// 复杂问题：调 LLM 拆分领域
 	domains := n.analyzeDomains(ctx, state)
 	if len(domains) == 0 {
-		// 无领域返回：推送错误事件
+		// 无领域返回：若启用人机对话（特性5），向用户请求澄清而非直接结束
+		if n.humanClarifyEnabled() {
+			clr := &types.ClarifyRequest{
+				ID:        fmt.Sprintf("clarify_%s_%d", state.SessionID, time.Now().UnixNano()),
+				Question:  "无法从目标中识别出可执行的领域，请补充说明你希望完成的具体任务或目标。",
+				Context:   fmt.Sprintf("原始目标: %s", state.DomainGoal),
+				AgentID:   "MetaAgent",
+				CreatedAt: time.Now(),
+			}
+			state.PendingClarify = clr
+			state.NextAction = types.ActionWait
+			state.Reason = "awaiting human clarification"
+			n.emit(ctx, "wait", "已向用户请求澄清: "+clr.Question)
+			return state, nil
+		}
+		// 未启用：推送错误事件
 		n.emit(ctx, "error", "领域分析未返回任何领域，将结束会话")
 	} else {
 		// 推送拆分结果
@@ -1115,6 +1130,15 @@ type temperatureWrappedLLM struct {
 	base        model.LLMClient         // 被包装的底层客户端
 	t           model.TemperatureAware  // 温度感知接口
 	temperature float64                 // 本次调用使用的温度
+}
+
+// humanClarifyEnabled 返回是否启用人机对话（特性5）。
+// 默认 true；可被 AgentCfg.HumanClarifyEnabled 关闭。
+func (n *MetaAgentNode) humanClarifyEnabled() bool {
+	if n.rt == nil || n.rt.AgentCfg == nil {
+		return true // 默认启用
+	}
+	return n.rt.AgentCfg.HumanClarifyEnabled
 }
 
 // classifyComplexityLLM 用 LLM 判断 goal 复杂度，作为关键词规则的补充（特性7）。

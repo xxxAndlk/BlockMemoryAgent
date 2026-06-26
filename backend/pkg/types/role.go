@@ -227,6 +227,8 @@ type ThreeLayerState struct {
 	// DirectExecute 标记为"直接执行"模式：MetaAgent 判定为简单查询/搜索/分析类任务时置 true，
 	// DomainAgent 见此标志跳过 LLM 子任务拆解，直接把 goal 作为单个子任务交给一个 Assistant。
 	DirectExecute bool `json:"direct_execute"`
+	// PendingClarify 待处理的人机对话请求：非空表示 Graph 已挂起，等待用户答复后由 server 侧恢复。
+	PendingClarify *ClarifyRequest `json:"pending_clarify,omitempty"`
 }
 
 // NewThreeLayerState 创建三层状态：初始化会话级映射与调用栈，默认动作 Continue。
