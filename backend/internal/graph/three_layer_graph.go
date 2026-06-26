@@ -36,6 +36,7 @@ type ThreeLayerGraph struct {
 	progress     ProgressCallback     // 思考/意图/工具调用实时推送回调
 	rt           *runtime.Runtime     // 看板/邮箱/Watchdog/人格/Skill 聚合体
 	blockMemory  BlockMemoryStore     // 块记忆存储（特性3：domainAgent 后向量检索）
+	archiveStore DomainArchiveStore   // domainAgent 归档存储（特性4：跨会话复用）
 }
 
 // SetBlockMemoryStore 在已构建的图上注入块记忆存储（特性3）。
@@ -47,6 +48,21 @@ func (g *ThreeLayerGraph) SetBlockMemoryStore(s BlockMemoryStore) {
 	for _, node := range g.nodes {
 		if d, ok := node.(*DomainAgentNode); ok {
 			d.SetBlockMemoryStore(s)
+		}
+	}
+}
+
+// SetArchiveStore 在已构建的图上注入 domainAgent 归档存储（特性4）。
+func (g *ThreeLayerGraph) SetArchiveStore(s DomainArchiveStore) {
+	g.mu.Lock()
+	g.archiveStore = s
+	g.mu.Unlock()
+	for _, node := range g.nodes {
+		if d, ok := node.(*DomainAgentNode); ok {
+			d.SetArchiveStore(s)
+		}
+		if m, ok := node.(*MetaAgentNode); ok {
+			m.SetArchiveStore(s)
 		}
 	}
 }
@@ -342,6 +358,15 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 	if bm != nil {
 		if d, ok := node.(*DomainAgentNode); ok {
 			d.SetBlockMemoryStore(bm)
+		}
+	}
+	// 注入 domainAgent 归档存储（特性4）
+	g.mu.RLock()
+	as := g.archiveStore
+	g.mu.RUnlock()
+	if as != nil {
+		if d, ok := node.(*DomainAgentNode); ok {
+			d.SetArchiveStore(as)
 		}
 	}
 

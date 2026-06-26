@@ -16,6 +16,7 @@ import (
 	"time"    // 超时时长
 
 	"github.com/blockmemory/agent/backend/internal/config"   // 基础设施配置加载
+	"github.com/blockmemory/agent/backend/internal/embed"    // 伪嵌入（特性3/4 共享）
 	"github.com/blockmemory/agent/backend/internal/graph"    // 三层图构建与节点
 	"github.com/blockmemory/agent/backend/internal/memory"   // 快照管理器 + 块记忆伪嵌入
 	"github.com/blockmemory/agent/backend/internal/model"    // 模型工厂
@@ -141,6 +142,8 @@ func main() {
 
 	// 特性3：注入块记忆存储适配器，让 DomainAgent 能归档/检索相似块记忆
 	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})
+	// 特性4：注入 domainAgent 归档存储，让 DomainAgent 完成后持久化信息跨会话复用
+	threeLayerGraph.SetArchiveStore(pgStore)
 
 	// 启动时从 session_history 恢复历史会话到内存，让前端列表不空
 	ctxRestore, cancelRestore := context.WithTimeout(ctx, 5*time.Second) // 最多恢复 5 秒
@@ -350,7 +353,7 @@ func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, d
 
 // SearchBlockMemory 按查询文本检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
 func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, query string, topK int) (string, error) {
-	emb := memory.PseudoEmbed(query, a.dim)
+	emb := embed.PseudoEmbed(query, a.dim)
 	recs, err := a.pg.SearchKnowledgeByType(ctx, "block_memory", emb, topK)
 	if err != nil {
 		return "", err

@@ -56,6 +56,7 @@ type MetaAgentNode struct {
 	rt              *runtime.Runtime      // Runtime 聚合体（板/邮箱/Watchdog/人格）
 	history         HistoryStore          // 跨会话历史读取器
 	progress        ProgressCallback      // 进度回调（推思考/意图/Token）
+	archiveStore    DomainArchiveStore    // domainAgent 归档存储（特性4：跨会话复用与清理）
 }
 
 // NewMetaAgentNode 创建主Agent节点。
@@ -95,6 +96,12 @@ func (n *MetaAgentNode) SetRuntime(rt *runtime.Runtime) {
 // 用于 handleInitial 加载"上次做过什么"，支持指代类问题（"那个文件在哪"）。
 func (n *MetaAgentNode) SetHistoryStore(h HistoryStore) {
 	n.history = h
+}
+
+// SetArchiveStore 注入 domainAgent 归档存储（特性4）。
+// nil 时跳过归档清理与复用检索。
+func (n *MetaAgentNode) SetArchiveStore(s DomainArchiveStore) {
+	n.archiveStore = s
 }
 
 // SetProgressCallback 注入进度回调。
@@ -188,6 +195,18 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 
 	// 3. 清理过期实例（registry 内部按 TTL 回收）
 	n.registry.CleanupExpired()
+
+	// 3.5 特性4：定期清理过期 domainAgent 归档（每 50 tick 跑一次）
+	if n.stepCount%50 == 0 && n.archiveStore != nil {
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if n, err := n.archiveStore.CleanupExpiredDomainArchives(bgCtx); err == nil && n > 0 {
+				// 日志即可，不阻塞主路径
+				fmt.Printf("[MetaAgent] cleaned up %d expired domain archives\n", n)
+			}
+		}()
+	}
 
 	// 4. Watchdog: 监控当前活跃 Agent 的上下文规模（v3 §4.4）
 	n.runWatchdog(ctx, state)

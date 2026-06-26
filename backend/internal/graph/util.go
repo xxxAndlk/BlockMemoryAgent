@@ -5,6 +5,7 @@ package graph
 
 import (
 	"context"
+	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -24,6 +25,33 @@ type BlockMemoryStore interface {
 	SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string) error
 	// SearchBlockMemory 按查询文本检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
 	SearchBlockMemory(ctx context.Context, query string, topK int) (string, error)
+}
+
+// DomainArchiveRecord domainAgent 归档记录（特性4）。
+// 在 DomainAgent 完成后落库，跨会话可按领域相似度召回，复用其 Skill 子集与上下文摘要。
+type DomainArchiveRecord struct {
+	ArchiveID    string   // 归档唯一 ID（global_knowledge.id）
+	SessionID    string   // 创建会话 ID
+	Domain       string   // 领域名
+	Goal         string   // 领域目标
+	RoleDefID    string   // 角色定义 ID
+	Skills       []string // 已装配 Skill ID 列表
+	ContextSummary string // 上下文摘要（任务结果汇总）
+	Weight       int      // 复用权重，每次被命中 +1
+	ExpiresAt    time.Time // 过期时间（命中后延后）
+	CreatedAt    time.Time // 创建时间
+}
+
+// DomainArchiveStore domainAgent 归档存储接口（特性4）。
+type DomainArchiveStore interface {
+	// SaveDomainArchive 归档或更新一条 domainAgent 记录。
+	SaveDomainArchive(ctx context.Context, rec *DomainArchiveRecord) error
+	// SearchDomainArchive 按领域/目标检索 topK 条相似归档，按权重降序。
+	SearchDomainArchive(ctx context.Context, domain, goal string, topK int) ([]*DomainArchiveRecord, error)
+	// BumpDomainArchiveWeight 命中复用时权重 +1 且延后过期时间。
+	BumpDomainArchiveWeight(ctx context.Context, archiveID string, ttl time.Duration) error
+	// CleanupExpiredDomainArchives 删除已过期归档，返回删除条数。
+	CleanupExpiredDomainArchives(ctx context.Context) (int, error)
 }
 
 // getString 从 map 中获取字符串。

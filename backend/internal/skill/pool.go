@@ -203,6 +203,32 @@ func trimSkills(in []*types.Skill, max int) []*types.Skill {
 	return cp[:max] // 截取前 max 个
 }
 
+// AssembleFromIDs 按 Skill ID 列表从池中重建 SkillSet（特性4 复用路径）。
+//
+// 职责：从归档存储恢复历史 domainAgent 的 Skill 子集时，按 ID 反查 Pool。
+// 不存在的 ID 静默跳过，避免因 Skill 池变化导致整组失效。
+//
+// 参数：
+//   - ownerAgent：持有者 Agent 实例 ID
+//   - ids：归档时记录的 Skill ID 列表
+//
+// 返回：装配好的 *types.SkillSet；ids 为空或全部不存在时返回空 SkillSet。
+func (p *Pool) AssembleFromIDs(ownerAgent string, ids []string) *types.SkillSet {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var skills []*types.Skill
+	for _, id := range ids {
+		if s, ok := p.skills[id]; ok && s != nil {
+			skills = append(skills, s)
+		}
+	}
+	return &types.SkillSet{
+		OwnerAgent: ownerAgent,
+		Skills:     skills,
+		CreatedAt:  time.Now(),
+	}
+}
+
 // llmPickSkills 使用 LLM 从 candidates 中挑出 maxKeep 个最匹配的
 //
 // 参数：见 AssembleSet 调用处。

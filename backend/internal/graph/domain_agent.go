@@ -34,6 +34,7 @@ type DomainAgentNode struct {
 	rt           *runtime.Runtime      // Runtime 聚合体（板/邮箱/Skill/人格/Watchdog）
 	progress     ProgressCallback      // 进度回调（推思考/意图/Token）
 	blockMemory  BlockMemoryStore      // 块记忆存储（特性3：向量检索归档）
+	archiveStore DomainArchiveStore    // domainAgent 归档存储（特性4：跨会话复用）
 	recalledMemory string              // 本次 Invoke 检索到的相似块记忆文本（注入 analyzeTasks）
 }
 
@@ -83,6 +84,12 @@ func (n *DomainAgentNode) SetProgressCallback(cb ProgressCallback) {
 // nil 时 DomainAgent 不做向量检索与归档，仅退化为无记忆模式。
 func (n *DomainAgentNode) SetBlockMemoryStore(s BlockMemoryStore) {
 	n.blockMemory = s
+}
+
+// SetArchiveStore 注入 domainAgent 归档存储（特性4）。
+// nil 时不做跨会话归档与复用。
+func (n *DomainAgentNode) SetArchiveStore(s DomainArchiveStore) {
+	n.archiveStore = s
 }
 
 // emit 推送进度事件。
@@ -256,7 +263,8 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 //
 // 职责：
 //   - 若已装配则直接返回
-//   - 否则取领域模型作为 LLMClient
+//   - 特性4：先查归档存储是否有同领域历史 Agent，命中则复用其 Skill 子集
+//     并权重+1、延后过期；未命中再走 LLM AssembleSet
 //   - 调 Pool.AssembleSet 触发 LLM 选择 ≤8 个技能
 //   - 通过 Registry.Bind 绑定到本 agent 实例 ID
 //
@@ -265,10 +273,10 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 //   - inst：本实例
 //   - state：图全局状态（取 DomainGoal 作为选择输入）
 //
-// 副作用：装配成功后向 registry 写入 SkillSet。
+// 副作用：装配成功后向 registry 写入 SkillSet；命中归档时 BumpWeight。
 //
 // 设计意图：v3 §5，让每个 DomainAgent 只看到与其领域相关的技能子集，
-// 避免全局技能列表污染 system prompt。
+// 避免全局技能列表污染 system prompt。特性4 在此基础上跨会话复用历史装配结果。
 func (n *DomainAgentNode) ensureSkillSet(ctx context.Context, inst *types.RoleInstance, state *types.ThreeLayerState) {
 	// Runtime 或 Skill 注册表缺失则跳过（退化模式）
 	if n.rt == nil || n.rt.Skills == nil {
@@ -278,6 +286,25 @@ func (n *DomainAgentNode) ensureSkillSet(ctx context.Context, inst *types.RoleIn
 	if existing := n.rt.Skills.GetForAgent(n.instID); existing != nil {
 		return
 	}
+
+	// 特性4：先查归档，命中则复用历史 Skill 子集
+	if n.archiveStore != nil {
+		if archives, err := n.archiveStore.SearchDomainArchive(ctx, inst.Domain, state.DomainGoal, 1); err == nil && len(archives) > 0 {
+			arc := archives[0]
+			if reused := n.rt.Skills.Pool().AssembleFromIDs(n.instID, arc.Skills); reused != nil && len(reused.Skills) > 0 {
+				n.rt.Skills.Bind(reused)
+				// 权重 +1 且延后过期
+				ttl := time.Duration(168) * time.Hour
+				if n.rt.AgentCfg != nil && n.rt.AgentCfg.DomainArchiveTTLHours > 0 {
+					ttl = time.Duration(n.rt.AgentCfg.DomainArchiveTTLHours) * time.Hour
+				}
+				_ = n.archiveStore.BumpDomainArchiveWeight(ctx, arc.ArchiveID, ttl)
+				n.emit(ctx, "think", fmt.Sprintf("复用历史 domainAgent 归档: domain=%s weight=%d skills=%v", arc.Domain, arc.Weight, arc.Skills))
+				return
+			}
+		}
+	}
+
 	// 取领域模型作为技能选择的 LLMClient；取不到则 llm 为 nil，AssembleSet 内部回退规则
 	var llm skill.LLMClient
 	if n.modelFactory != nil {
@@ -1104,6 +1131,44 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 				fmt.Printf("[DomainAgent] save block memory: %v\n", err)
 			}
 		}(block, inst.Domain, block.Goal, summary)
+	}
+
+	// 特性4：把 domainAgent 信息（领域/技能/上下文摘要）归档，跨会话可复用
+	if n.archiveStore != nil && block != nil {
+		var archivedSkills []string
+		if n.rt != nil && n.rt.Skills != nil {
+			if set := n.rt.Skills.GetForAgent(n.instID); set != nil {
+				for _, s := range set.Skills {
+					archivedSkills = append(archivedSkills, s.SkillID)
+				}
+			}
+		}
+		ttl := 168 * time.Hour
+		if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.DomainArchiveTTLHours > 0 {
+			ttl = time.Duration(n.rt.AgentCfg.DomainArchiveTTLHours) * time.Hour
+		}
+		summary := state.Reason
+		if summary == "" {
+			summary = block.Goal
+		}
+		rec := &DomainArchiveRecord{
+			SessionID:      block.SessionID,
+			Domain:         inst.Domain,
+			Goal:           block.Goal,
+			RoleDefID:      inst.RoleDefID,
+			Skills:         archivedSkills,
+			ContextSummary: summary,
+			Weight:         1,
+			ExpiresAt:      time.Now().Add(ttl),
+			CreatedAt:      time.Now(),
+		}
+		go func(r *DomainArchiveRecord) {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := n.archiveStore.SaveDomainArchive(bgCtx, r); err != nil {
+				fmt.Printf("[DomainAgent] save domain archive: %v\n", err)
+			}
+		}(rec)
 	}
 }
 
