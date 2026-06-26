@@ -442,6 +442,40 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 		n.emit(ctx, "intend", "判定为查询/搜索类任务，直接派发单助手执行（跳过子任务拆解）")
 	}
 
+	// 特性7：LLM 智能路由 — 关键词规则未命中时，用 LLM 判断 goal 复杂度，
+	// 命中"simple"则直接调 LLM 回答，命中"query"则走 DirectExecute，命中"complex"则派发子 Agent。
+	// 仅在规则路径未决出 DirectExecute / simple 且模型可用时触发，避免增加无谓 LLM 调用。
+	if !state.DirectExecute && n.modelFactory != nil && !n.isSimpleQuestion(state.DomainGoal) {
+		switch n.classifyComplexityLLM(ctx, state.DomainGoal) {
+		case "simple":
+			n.emit(ctx, "intend", "LLM 路由判定为简单问题，直接调用 LLM 回答")
+			answer, err, timedOut := n.callLLM(ctx, fmt.Sprintf(
+				`你是BlockMemoryAgent，一个基于大语言模型的本地AI开发助手。
+请直接回答用户的简单问题，保持简洁友好。
+%s
+用户问题：%s
+
+你的回答：`, fmtEnvSection(), state.DomainGoal))
+			if timedOut {
+				state.SessionSummary = "LLM调用超时，请稍后重试"
+				state.NextAction = types.ActionFinish
+				state.Reason = "llm timeout on smart-route simple"
+				return state, nil
+			}
+			if err == nil && answer != "" {
+				state.SessionSummary = answer
+				state.NextAction = types.ActionFinish
+				state.Reason = "smart-route direct answer"
+				return state, nil
+			}
+		case "query":
+			state.DirectExecute = true
+			n.emit(ctx, "intend", "LLM 路由判定为查询类任务，标记 DirectExecute 由单助手执行")
+		case "complex":
+			n.emit(ctx, "intend", "LLM 路由判定为复杂任务，进入领域拆分流程")
+		}
+	}
+
 	if n.modelFactory != nil && n.isSimpleQuestion(state.DomainGoal) {
 		n.emit(ctx, "intend", "判定为简单问题，直接调用 LLM 回答")
 		// 调 LLM 回答简单问题（含环境/历史/对话段落）
@@ -1081,6 +1115,49 @@ type temperatureWrappedLLM struct {
 	base        model.LLMClient         // 被包装的底层客户端
 	t           model.TemperatureAware  // 温度感知接口
 	temperature float64                 // 本次调用使用的温度
+}
+
+// classifyComplexityLLM 用 LLM 判断 goal 复杂度，作为关键词规则的补充（特性7）。
+//
+// 返回值：
+//   - "simple"：寒暄/常识/定义类，主 Agent 直接回答即可
+//   - "query"  ：查询/搜索/资讯类，单助手 + 工具即可（DirectExecute）
+//   - "complex"：需要拆分领域派发多 Agent 协作
+//   - ""       ：LLM 不可用或调用失败，调用方应回退到原规则路径
+//
+// 设计意图：shouldDirectExecute 与 isSimpleQuestion 覆盖典型关键词，
+// 但中文表述多变时容易漏判。此处用一次轻量 LLM 调用作兜底，避免把
+// "帮我分析下这段代码有什么问题"这类需要 ReAct 的任务误派给单助手。
+func (n *MetaAgentNode) classifyComplexityLLM(ctx context.Context, goal string) string {
+	if n.modelFactory == nil || n.llmTracker.ShouldSkipLLM() {
+		return ""
+	}
+	if strings.TrimSpace(goal) == "" {
+		return ""
+	}
+	prompt := fmt.Sprintf(`判断以下用户目标的复杂度，只回答一个单词：simple、query 或 complex。
+
+- simple：寒暄、自我介绍、常识/定义类问题，无需调工具，主 Agent 直接回答即可
+- query  ：查询/搜索/资讯/行情类，需要用 HTTPGet 等工具抓取，但单助手即可完成
+- complex：需要写代码/创建文件/多步执行/多领域协作，必须拆分领域派发多 Agent
+
+用户目标: %s
+
+只回答 simple / query / complex 三者之一，不要其他文字:`, goal)
+	resp, err, timedOut := n.callLLMAs(ctx, "MetaAgent/复杂度判定", prompt)
+	if timedOut || err != nil || resp == "" {
+		return ""
+	}
+	resp = strings.ToLower(strings.TrimSpace(resp))
+	switch {
+	case strings.Contains(resp, "simple"):
+		return "simple"
+	case strings.Contains(resp, "query"):
+		return "query"
+	case strings.Contains(resp, "complex"):
+		return "complex"
+	}
+	return ""
 }
 
 // Generate 实现 model.LLMClient 接口，转发到带温度选项的生成方法。
