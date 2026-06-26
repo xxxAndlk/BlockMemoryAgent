@@ -882,7 +882,14 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 		session.State.PendingClarify = nil
 	}
 	session.Status = "running"
-	m.addEvent(session, "clarify", "User", "用户答复: "+req.Answer, "", "", "", "", "", true)
+	// 直接 append 事件，避免 addEvent 再次取锁自死锁
+	session.Events = append(session.Events, SessionEvent{
+		Type:      "clarify",
+		Agent:     "User",
+		Message:   "用户答复: " + req.Answer,
+		Success:   true,
+		Timestamp: time.Now(),
+	})
 	m.mu.Unlock()
 
 	go m.resumeSession(session)
@@ -935,7 +942,14 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
-	m.addEvent(session, "interrupt", "User", "抢占中断: "+req.Content, "", "", "", "", "", true)
+	// 直接 append 事件，避免 addEvent 再次取锁自死锁
+	session.Events = append(session.Events, SessionEvent{
+		Type:      "interrupt",
+		Agent:     "User",
+		Message:   "抢占中断: " + req.Content,
+		Success:   true,
+		Timestamp: time.Now(),
+	})
 	wasRunning := session.Status == "running"
 	if !wasRunning {
 		session.Status = "running"
@@ -993,7 +1007,14 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
-	m.addEvent(session, "enqueue", "User", "队列注入: "+req.Content, "", "", "", "", "", true)
+	// 直接 append 事件，避免 addEvent 再次取锁自死锁
+	session.Events = append(session.Events, SessionEvent{
+		Type:      "enqueue",
+		Agent:     "User",
+		Message:   "队列注入: " + req.Content,
+		Success:   true,
+		Timestamp: time.Now(),
+	})
 	wasRunning := session.Status == "running"
 	if !wasRunning {
 		session.Status = "running"
@@ -1041,28 +1062,79 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	session, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
-		http.Error(w, "session not found", http.StatusNotFound)
-		return
+		// Session not in memory — may be a historical session restored from DB
+		// via RecentSessionHistories. Revive a minimal Session so the user can
+		// continue the conversation.
+		revived := m.reviveFromHistory(id)
+		if revived == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		m.mu.Lock()
+		session = revived
 	}
 
-	// 追加用户消息
+	// 追加用户消息与事件（直接 append，避免调用 addEvent 再次取锁自死锁）
 	session.Messages = append(session.Messages, types.ChatMessage{
 		Role:      "user",
 		Content:   req.Content,
 		Timestamp: time.Now(),
 	})
-	m.addEvent(session, "user_message", "User", req.Content, "", "", "", "", "", true)
+	session.Events = append(session.Events, SessionEvent{
+		Type:      "user_message",
+		Agent:     "User",
+		Message:   req.Content,
+		Success:   true,
+		Timestamp: time.Now(),
+	})
 
-	if session.Status != "running" {
+	wasRunning := session.Status == "running"
+	if !wasRunning {
 		// 已结束会话：重新激活并异步恢复
 		session.Status = "running"
 		session.EndedAt = nil
-		go m.resumeSession(session)
 	}
 	m.mu.Unlock()
 
+	if !wasRunning {
+		go m.resumeSession(session)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(session)
+}
+
+// reviveFromHistory loads a minimal Session from session_history and inserts it
+// into m.sessions so it can be resumed. Caller must NOT hold m.mu. Returns nil
+// if the session is not in DB either.
+func (m *SessionManager) reviveFromHistory(id string) *Session {
+	if m.pgStore == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	rec, err := m.pgStore.GetSessionHistoryByID(ctx, id)
+	if err != nil || rec == nil {
+		return nil
+	}
+	endedAt := rec.CreatedAt
+	session := &Session{
+		ID:        rec.SessionID,
+		Goal:      rec.Goal,
+		Status:    "completed",
+		Result:    rec.Summary,
+		StartedAt: rec.CreatedAt,
+		EndedAt:   &endedAt,
+		Events:    make([]SessionEvent, 0),
+		Messages: []types.ChatMessage{
+			{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},
+			{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},
+		},
+	}
+	m.mu.Lock()
+	m.sessions[id] = session
+	m.mu.Unlock()
+	return session
 }
 
 // resumeSession 基于历史消息恢复会话执行
