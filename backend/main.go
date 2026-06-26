@@ -6,6 +6,7 @@ package main
 import (
 	"context" // 上下文，用于取消与超时控制
 	"flag"    // 命令行参数解析
+	"fmt"     // 格式化输出
 	"log"     // 日志输出
 	"net/http"// HTTP 服务与路由
 	"os"      // 文件信息、信号
@@ -16,7 +17,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/config"   // 基础设施配置加载
 	"github.com/blockmemory/agent/backend/internal/graph"    // 三层图构建与节点
-	"github.com/blockmemory/agent/backend/internal/memory"   // 快照管理器
+	"github.com/blockmemory/agent/backend/internal/memory"   // 快照管理器 + 块记忆伪嵌入
 	"github.com/blockmemory/agent/backend/internal/model"    // 模型工厂
 	"github.com/blockmemory/agent/backend/internal/runtime"  // 运行时聚合（看板/邮箱/Skill/Soul/Watchdog）
 	"github.com/blockmemory/agent/backend/internal/server"   // HTTP API 与会话管理器
@@ -137,6 +138,9 @@ func main() {
 	// 初始化会话管理器: 管理内存中的会话生命周期，连接图与存储
 	sessionMgr := server.NewSessionManager(threeLayerGraph, registry)
 	sessionMgr.SetPostgresStore(pgStore) // 注入 Postgres 以持久化历史
+
+	// 特性3：注入块记忆存储适配器，让 DomainAgent 能归档/检索相似块记忆
+	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})
 
 	// 启动时从 session_history 恢复历史会话到内存，让前端列表不空
 	ctxRestore, cancelRestore := context.WithTimeout(ctx, 5*time.Second) // 最多恢复 5 秒
@@ -322,6 +326,43 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 		// 其余未匹配路径返回 404
 		http.NotFound(w, r)
 	}
+}
+
+// pgBlockMemoryAdapter 把 *store.PostgresStore 适配为 graph.BlockMemoryStore 接口（特性3）。
+// 利用 global_knowledge 表 + pgvector，KnowledgeType 固定为 "block_memory"。
+// 嵌入用 memory.PseudoEmbed 的 hashed bag-of-tokens 伪向量，避免依赖外部 embedding 模型。
+type pgBlockMemoryAdapter struct {
+	pg  *store.PostgresStore
+	dim int
+}
+
+// SaveBlockMemory 归档一条 domainAgent 块记忆到 global_knowledge 表。
+func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string) error {
+	rec := (&memory.BlockMemoryRecord{
+		SessionID: sessionID,
+		Domain:    domain,
+		Goal:      goal,
+		Summary:   summary,
+		CreatedAt: time.Now(),
+	}).ToKnowledgeRecord(a.dim)
+	return a.pg.SaveKnowledge(ctx, rec)
+}
+
+// SearchBlockMemory 按查询文本检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
+func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, query string, topK int) (string, error) {
+	emb := memory.PseudoEmbed(query, a.dim)
+	recs, err := a.pg.SearchKnowledgeByType(ctx, "block_memory", emb, topK)
+	if err != nil {
+		return "", err
+	}
+	if len(recs) == 0 {
+		return "", nil
+	}
+	var b strings.Builder
+	for i, r := range recs {
+		b.WriteString(fmt.Sprintf("[%d] %s\n", i+1, r.Content))
+	}
+	return b.String(), nil
 }
 
 // pgHistoryAdapter 把 *store.PostgresStore 适配为 graph.HistoryStore 接口。

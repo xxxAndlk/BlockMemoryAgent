@@ -33,6 +33,8 @@ type DomainAgentNode struct {
 	llmTracker   *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token）
 	rt           *runtime.Runtime      // Runtime 聚合体（板/邮箱/Skill/人格/Watchdog）
 	progress     ProgressCallback      // 进度回调（推思考/意图/Token）
+	blockMemory  BlockMemoryStore      // 块记忆存储（特性3：向量检索归档）
+	recalledMemory string              // 本次 Invoke 检索到的相似块记忆文本（注入 analyzeTasks）
 }
 
 // NewDomainAgentNode 创建领域Agent节点。
@@ -75,6 +77,12 @@ func (n *DomainAgentNode) SetRuntime(rt *runtime.Runtime) {
 // 用于推送思考/意图/LLM 调用/Token 消耗等事件到 UI。
 func (n *DomainAgentNode) SetProgressCallback(cb ProgressCallback) {
 	n.progress = cb
+}
+
+// SetBlockMemoryStore 注入块记忆存储（特性3）。
+// nil 时 DomainAgent 不做向量检索与归档，仅退化为无记忆模式。
+func (n *DomainAgentNode) SetBlockMemoryStore(s BlockMemoryStore) {
+	n.blockMemory = s
 }
 
 // emit 推送进度事件。
@@ -169,6 +177,15 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 			}
 			// 推送装配结果到 UI
 			n.emit(ctx, "think", "已装配 Skill 子集: "+strings.Join(ids, ", "))
+		}
+	}
+
+	// 3.5 特性3：检索相似块记忆，注入 analyzeTasks 作为上下文
+	n.recalledMemory = ""
+	if n.blockMemory != nil {
+		if recalled, err := n.blockMemory.SearchBlockMemory(ctx, state.DomainGoal, 3); err == nil && recalled != "" {
+			n.recalledMemory = recalled
+			n.emit(ctx, "think", "已检索到历史相似块记忆，将作为上下文注入任务拆解")
 		}
 	}
 
@@ -565,10 +582,16 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
 		n.emit(ctx, "llm", "调用 LLM 拆解子任务...")
 		// 构造拆解 prompt：强调"可直接用工具执行"，禁止纯思考类子任务
+		// 若本次 Invoke 检索到历史相似块记忆，作为参考段注入（特性3）
+		memorySection := ""
+		if n.recalledMemory != "" {
+			memorySection = fmt.Sprintf("\n相关历史块记忆（参考，避免重复劳动）:\n%s\n", n.recalledMemory)
+		}
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-4个独立可执行的子任务。
 
 目标: %s
 
+%s
 %s
 
 要求:
@@ -592,7 +615,7 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 编写代码
 用 WriteFile 写一个 Python 脚本去搜索新闻（应该直接用 HTTPGet）
 
-子任务:`, goal, fmtEnvSection()))
+子任务:`, goal, memorySection, fmtEnvSection()))
 		if !timedOut && err == nil && resp != "" {
 			// 解析响应为任务列表
 			if tasks := parseTaskListFromResp(resp); len(tasks) > 0 {
@@ -1029,11 +1052,12 @@ func (n *DomainAgentNode) inferSubDomainsByRules(domain string) []DomainInfo {
 // summarizeResults 汇总助手结果。
 //
 // 职责：把当前块的 TaskResults 拼成简短摘要，写入 state.Reason 供上层展示。
+// 同时若启用块记忆存储（特性3），把摘要归档到 pgvector，供后续相似检索。
 //
 // 参数：
 //   - state：图全局状态（原地修改 state.Reason）
 //
-// 副作用：修改 state.Reason；每个结果截断到 100 字符。
+// 副作用：修改 state.Reason；可能写 Postgres（块记忆归档）。
 func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 	// 取本实例
 	inst := n.registry.GetInstance(n.instID)
@@ -1064,6 +1088,22 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 	if len(summaries) > 0 {
 		// 用分号连接所有摘要
 		state.Reason = fmt.Sprintf("领域[%s]完成: %s", inst.Domain, strings.Join(summaries, "; "))
+	}
+
+	// 特性3：把块记忆归档到 pgvector，供后续 DomainAgent 相似检索
+	if n.blockMemory != nil && block != nil {
+		summary := state.Reason
+		if summary == "" {
+			summary = block.Goal
+		}
+		// 异步归档避免阻塞图循环；失败仅记录日志，不影响主流程
+		go func(b *types.SessionBlock, domain, goal, sum string) {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := n.blockMemory.SaveBlockMemory(bgCtx, b.SessionID, domain, goal, sum); err != nil {
+				fmt.Printf("[DomainAgent] save block memory: %v\n", err)
+			}
+		}(block, inst.Domain, block.Goal, summary)
 	}
 }
 

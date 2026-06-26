@@ -348,6 +348,30 @@ func (s *PostgresStore) SearchKnowledge(ctx context.Context, embedding []float32
 	return scanKnowledgeRows(rows)
 }
 
+// SearchKnowledgeByType 按 knowledge_type 过滤的向量相似搜索（特性3使用）。
+// 职责：限定返回记录的 KnowledgeType，便于把 block_memory / playbook 等分类检索。
+// 参数：
+//   - knowledgeType：必填过滤条件
+//   - embedding：查询向量
+//   - topK：返回上限
+func (s *PostgresStore) SearchKnowledgeByType(ctx context.Context, knowledgeType string, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+		FROM global_knowledge
+		WHERE archived = false AND knowledge_type = $1
+		ORDER BY embedding <=> $2
+		LIMIT $3
+	`, knowledgeType, pgVector(embedding), topK)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanKnowledgeRows(rows)
+}
+
 // ArchiveKnowledge 归档指定 ID 的知识 (软删除)。
 // 参数:
 //   - id: 知识记录主键

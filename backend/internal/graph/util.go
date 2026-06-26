@@ -16,6 +16,16 @@ type WorkspaceWriter interface {
 	SaveAgentOutput(ctx context.Context, topicID string, output *types.AgentOutput) error
 }
 
+// BlockMemoryStore 块记忆存储接口（特性3）。
+// 抽象 domainAgent 执行后归档与按相似度检索的能力，避免 graph 反向依赖 store。
+// 实现方在 store 包（PostgresStore + pgvector）。
+type BlockMemoryStore interface {
+	// SaveBlockMemory 归档一条 domainAgent 完成的块记忆。
+	SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string) error
+	// SearchBlockMemory 按查询文本检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
+	SearchBlockMemory(ctx context.Context, query string, topK int) (string, error)
+}
+
 // getString 从 map 中获取字符串。
 // 容错读取：map 为 nil 或 key 不存在或类型不符都返回空串。
 // 用途：解析 LLM 返回的不确定结构 JSON 时安全取值。

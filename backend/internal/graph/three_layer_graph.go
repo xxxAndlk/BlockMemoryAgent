@@ -35,6 +35,20 @@ type ThreeLayerGraph struct {
 	toolCallback ToolCallback         // 工具执行结果回调（推 UI）
 	progress     ProgressCallback     // 思考/意图/工具调用实时推送回调
 	rt           *runtime.Runtime     // 看板/邮箱/Watchdog/人格/Skill 聚合体
+	blockMemory  BlockMemoryStore     // 块记忆存储（特性3：domainAgent 后向量检索）
+}
+
+// SetBlockMemoryStore 在已构建的图上注入块记忆存储（特性3）。
+// 供 server / main 后注入；同步给已存在的 DomainAgent 静态节点与动态缓存。
+func (g *ThreeLayerGraph) SetBlockMemoryStore(s BlockMemoryStore) {
+	g.mu.Lock()
+	g.blockMemory = s
+	g.mu.Unlock()
+	for _, node := range g.nodes {
+		if d, ok := node.(*DomainAgentNode); ok {
+			d.SetBlockMemoryStore(s)
+		}
+	}
 }
 
 // ThreeLayerGraphBuilder 三层图构建器。
@@ -319,6 +333,15 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 			n.SetToolCallback(g.toolCallback)
 		case *SubDomainAgentNode:
 			n.SetToolCallback(g.toolCallback)
+		}
+	}
+	// 注入块记忆存储（特性3）
+	g.mu.RLock()
+	bm := g.blockMemory
+	g.mu.RUnlock()
+	if bm != nil {
+		if d, ok := node.(*DomainAgentNode); ok {
+			d.SetBlockMemoryStore(bm)
 		}
 	}
 
