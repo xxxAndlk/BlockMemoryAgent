@@ -110,6 +110,7 @@ func toolNameFromLine(line string) string {
 //   - skillBrief：已装配技能的简介文本，注入 system prompt。
 //   - progress：进度回调，把每一步动作推给 UI。
 //   - agentName：当前 agent 名，用于事件归属。
+//   - maxIters：ReAct 循环最大轮数（<=0 时使用默认 12）。
 // 返回：
 //   - string：最终输出文本（含失败标记前缀）。
 //   - []*ToolResult：本次执行产生的所有工具结果，供上层门控与回放使用。
@@ -126,6 +127,7 @@ func executeWithTools(
 	skillBrief string,
 	progress ProgressCallback,
 	agentName string,
+	maxIters int,
 ) (string, []*ToolResult) {
 	// allResults 收集本次 agent 执行期间所有工具调用结果
 	var allResults []*ToolResult
@@ -204,13 +206,18 @@ func executeWithTools(
 	// 构造 7 个内置工具的 blades.Tool 集合，结果会写回 allResults
 	tools := buildBladesTools(executor, progress, sessionID, agentName, &allResults)
 
-	// 创建 blades Agent：注入模型、系统指令、工具集，限制最多 12 轮迭代
+	// 解析 ReAct 循环最大轮数：<=0 时回退默认 12
+	maxItersResolved := maxIters
+	if maxItersResolved <= 0 {
+		maxItersResolved = 12
+	}
+	// 创建 blades Agent：注入模型、系统指令、工具集，按配置限制最大迭代轮数
 	agent, err := blades.NewAgent(
 		agentName,
 		blades.WithModel(provider),
 		blades.WithInstruction(systemPrompt),
 		blades.WithTools(tools...),
-		blades.WithMaxIterations(12),
+		blades.WithMaxIterations(maxItersResolved),
 	)
 	if err != nil {
 		emit(ctx, "error", fmt.Sprintf("创建 blades agent 失败: %v", err))
@@ -218,7 +225,7 @@ func executeWithTools(
 	}
 
 	// 启动 blades runner 执行 ReAct 循环
-	emit(ctx, "llm", "启动 blades agent 执行（最多 12 轮 function calling）")
+	emit(ctx, "llm", fmt.Sprintf("启动 blades agent 执行（最多 %d 轮 function calling）", maxItersResolved))
 	start := time.Now()                              // 记录起始时间用于耗时统计
 	runner := blades.NewRunner(agent)                // 创建运行器
 	output, err := runner.Run(ctx, blades.UserMessage(userMsg)) // 驱动 Agent 循环
@@ -385,6 +392,7 @@ func summarizeToolResult(r *ToolResult) string {
 //   - skillBrief：已装配技能简介。
 //   - progress：进度回调。
 //   - agentName：当前 agent 名。
+//   - maxIters：ReAct 循环最大轮数（<=0 时使用默认 12）。
 // 返回：最终文本与工具结果列表；modelFactory 为 nil 或取模型失败时返回空。
 // 副作用：通过 progress 推送事件；通过 executor 产生文件/命令副作用。
 // 并发安全：单次调用安全；超时通过 context 控制。
@@ -398,6 +406,7 @@ func executeAssistantWithTools(
 	skillBrief string,
 	progress ProgressCallback,
 	agentName string,
+	maxIters int,
 ) (string, []*ToolResult) {
 	// 工厂为空直接返回，避免空指针
 	if modelFactory == nil {
@@ -413,10 +422,10 @@ func executeAssistantWithTools(
 	// 取 blades provider；mock 路径（无 API Key）返回错误，传入 nil 触发退化
 	provider, _ := modelFactory.GetBladesProvider(ctx, roleDef.ID)
 
-	// 带超时执行：单个 assistant 最多 5 分钟（12 轮 function calling，每轮 LLM 可达 40s+）
+	// 带超时执行：单个 assistant 最多 5 分钟（每轮 LLM 可达 40s+）
 	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 
 	// 转调核心执行函数
-	return executeWithTools(ctx, provider, llm, executor, roleDef, task, state, skillBrief, progress, agentName)
+	return executeWithTools(ctx, provider, llm, executor, roleDef, task, state, skillBrief, progress, agentName, maxIters)
 }

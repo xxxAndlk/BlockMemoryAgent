@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/blockmemory/agent/backend/internal/board"
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/internal/soul"
@@ -27,6 +28,7 @@ type Runtime struct {
 	Skills   *skill.Registry    // Skill 注册表：持有 Pool 并维护 Agent→SkillSet 装配映射
 	Soul     *soul.Loader       // 人格加载器：注入 soul.md 并提供热重载与温度策略
 	Watchdog *watchdog.Watchdog // 上下文看门狗：按软/硬阈值发出压缩或切换信号
+	AgentCfg *config.AgentConfig // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
 }
 
 // New 创建带默认依赖的运行时。
@@ -39,7 +41,7 @@ type Runtime struct {
 //	soulPath  人格文件路径，必须存在（main.go 已校验）
 //	skillPool 技能池，由 main.go 从 yaml 加载；nil 时退回 BuiltinPool 兜底
 //
-// 返回：装配完成的 *Runtime，各字段均已就绪。
+// 返回：装配完成的 *Runtime，各字段均已就绪。AgentCfg 默认 nil，需调用方通过 SetAgentConfig 注入。
 //
 // 副作用：触发一次 loader.Load()；文件读取失败 panic（main.go 已保证文件存在）。
 func New(soulPath string, skillPool *skill.Pool) *Runtime {
@@ -61,4 +63,10 @@ func New(soulPath string, skillPool *skill.Pool) *Runtime {
 		Soul:     loader,                                 // 人格加载器，供 Agent 拼 system prompt 时注入
 		Watchdog: watchdog.New(watchdog.DefaultConfig()), // 使用默认软/硬阈值（soft=12000/hard=20000）
 	}
+}
+
+// SetAgentConfig 注入 Agent 运行时动态参数。
+// 由 main.go 在装载 Runtime 后调用；nil 时下游节点应回退到各自默认值。
+func (r *Runtime) SetAgentConfig(cfg *config.AgentConfig) {
+	r.AgentCfg = cfg
 }

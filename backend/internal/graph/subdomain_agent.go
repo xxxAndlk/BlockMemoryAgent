@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/model"
+	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -33,6 +34,12 @@ type SubDomainAgentNode struct {
 	toolCallback ToolCallback          // 工具执行结果回调（推 UI）
 	progress     ProgressCallback      // 进度回调（推思考/意图/Token）
 	llmTracker   *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token）
+	rt           *runtime.Runtime      // Runtime 聚合体（用于读取 AgentCfg 等动态参数）
+}
+
+// SetRuntime 注入 Runtime。nil 时动态参数回退默认值。
+func (n *SubDomainAgentNode) SetRuntime(rt *runtime.Runtime) {
+	n.rt = rt
 }
 
 // NewSubDomainAgentNode 创建子领域Agent节点。
@@ -328,8 +335,18 @@ func (n *SubDomainAgentNode) runAssistant(ctx context.Context, state *types.Thre
 	var result string // 任务结果
 	var err error     // 执行错误
 
-	// 重试 3 次，初始退避 100ms（指数翻倍）
-	err = retryWithBackoff(3, 100*time.Millisecond, func() error {
+	// 重试次数与初始退避：默认 3 次 / 100ms，可被 AgentCfg 覆盖（特性2）
+	retryCount := 3
+	retryDelay := 100 * time.Millisecond
+	if n.rt != nil && n.rt.AgentCfg != nil {
+		if n.rt.AgentCfg.RetryCount > 0 {
+			retryCount = n.rt.AgentCfg.RetryCount
+		}
+		if n.rt.AgentCfg.RetryBackoffMs > 0 {
+			retryDelay = time.Duration(n.rt.AgentCfg.RetryBackoffMs) * time.Millisecond
+		}
+	}
+	err = retryWithBackoff(retryCount, retryDelay, func() error {
 		// 在闭包内执行助手任务
 		result, err = n.executeAssistantTask(ctx, def, task, state)
 		return err
@@ -372,7 +389,11 @@ func (n *SubDomainAgentNode) executeAssistantTask(ctx context.Context, def *type
 		// SubDomainAgent 当前与父 Domain 共享 Skill 子集（通过父 ID 查），
 		// 此处 skillBrief 暂为空串，工具列表由 executeAssistantWithTools 内部默认值提供
 		var skillBrief string
-		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief, n.progress, "SubDomainAgent["+def.Name+"]")
+		maxIters := 12
+		if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.ToolCallMaxRounds > 0 {
+			maxIters = n.rt.AgentCfg.ToolCallMaxRounds
+		}
+		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief, n.progress, "SubDomainAgent["+def.Name+"]", maxIters)
 		if result != "" {
 			return result, nil // 成功返回
 		}

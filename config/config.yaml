@@ -37,3 +37,20 @@ memory:
   write_batch_size: 100
   write_flush_interval: 5  # 秒
   snapshot_interval: 300  # 秒
+
+# Agent 运行时动态参数（替代散落在 graph 包中的硬编码常量）
+agent:
+  max_steps: 200                 # 图状态机最大步数（防死循环）
+  skill_set_size: 8              # 每个 DomainAgent 装配的 Skill 子集上限
+  tool_call_max_rounds: 12       # Assistant ReAct 工具调用循环最大轮数
+  retry_count: 3                 # Assistant 任务指数退避重试次数
+  retry_backoff_ms: 100          # 重试初始退避时长（毫秒）
+  llm_soft_timeout_sec: 30       # LLM 软超时（建议取消）
+  llm_hard_timeout_sec: 90       # LLM 硬超时（强制取消）
+  context_window: 32000          # Agent 上下文窗口（token 数）
+  interrupt_enabled: true        # 启用抢占中断
+  queue_inject_enabled: true     # 启用队列注入
+  human_clarify_enabled: true    # 启用人机对话
+  human_clarify_timeout_sec: 120 # 等待用户回答超时（秒）
+  domain_archive_ttl_hours: 168  # domainAgent 归档默认存活时长（7 天）
+  domain_archive_max_weight: 100 # domainAgent 归档权重上限

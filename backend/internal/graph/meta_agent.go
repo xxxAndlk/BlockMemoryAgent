@@ -1039,16 +1039,27 @@ func (n *MetaAgentNode) callLLMAs(ctx context.Context, caller string, prompt str
 	var resp string       // LLM 响应文本
 	var callErr error     // 调用错误
 	var timedOut bool     // 是否超时
+	// 解析 LLM 软/硬超时：默认 30s/90s，可被 AgentCfg 覆盖（特性2）
+	softTimeout := 30 * time.Second
+	hardTimeout := 90 * time.Second
+	if n.rt != nil && n.rt.AgentCfg != nil {
+		if n.rt.AgentCfg.LLMSoftTimeoutSec > 0 {
+			softTimeout = time.Duration(n.rt.AgentCfg.LLMSoftTimeoutSec) * time.Second
+		}
+		if n.rt.AgentCfg.LLMHardTimeoutSec > 0 {
+			hardTimeout = time.Duration(n.rt.AgentCfg.LLMHardTimeoutSec) * time.Second
+		}
+	}
 	// 若 LLM 支持 TemperatureAware，用温度包装器叠加 0 温度
 	if t, ok := llm.(model.TemperatureAware); ok {
 		desired := soul.Temperature(soul.KindRouting, 0)                          // 路由场景温度
 		wrapped := &temperatureWrappedLLM{base: llm, t: t, temperature: desired}  // 包装器
 		resp, callErr, timedOut = n.llmTracker.CallWithTimeout(ctx, wrapped, prompt, caller,
-			30*time.Second, 90*time.Second)
+			softTimeout, hardTimeout)
 	} else {
 		// 不支持温度控制：直接调用
 		resp, callErr, timedOut = n.llmTracker.CallWithTimeout(ctx, llm, prompt, caller,
-			30*time.Second, 90*time.Second)
+			softTimeout, hardTimeout)
 	}
 
 	// 发送 token_usage 调试事件（从 tracker 最新记录读取）

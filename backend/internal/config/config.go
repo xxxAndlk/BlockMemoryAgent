@@ -17,6 +17,30 @@ type Config struct {
 	Redis    RedisConfig    `yaml:"redis"`    // Redis 热缓存配置（workspace、快照、Stream）
 	HTTP     HTTPConfig     `yaml:"http"`     // HTTP 服务监听与超时配置
 	Memory   MemoryConfig   `yaml:"memory"`   // 记忆管线运行参数（批写/刷新/快照间隔）
+	Agent    AgentConfig    `yaml:"agent"`    // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
+}
+
+// AgentConfig 集中所有 Agent 运行时动态可配置参数。
+// 替代散落在 graph 包中的硬编码常量（maxSteps=200、skillSetSize=8、
+// retry=3、LLM 软/硬超时 30s/90s 等），让运维可以通过 config.yaml 调整。
+type AgentConfig struct {
+	MaxSteps          int `yaml:"max_steps"`           // 图状态机最大步数（防死循环）
+	SkillSetSize      int `yaml:"skill_set_size"`      // 每个 DomainAgent 装配的 Skill 子集上限
+	ToolCallMaxRounds int `yaml:"tool_call_max_rounds"`// Assistant 单任务 ReAct 工具调用循环最大轮数
+	RetryCount        int `yaml:"retry_count"`         // Assistant 任务执行指数退避重试次数
+	RetryBackoffMs    int `yaml:"retry_backoff_ms"`    // 重试初始退避时长（毫秒）
+	LLMSoftTimeoutSec int `yaml:"llm_soft_timeout_sec"`// LLM 调用软超时（秒，建议取消）
+	LLMHardTimeoutSec int `yaml:"llm_hard_timeout_sec"`// LLM 调用硬超时（秒，强制取消）
+	ContextWindow     int `yaml:"context_window"`      // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
+	// 抢占中断与队列注入（特性6）
+	InterruptEnabled  bool `yaml:"interrupt_enabled"`   // 是否启用抢占中断
+	QueueInjectEnabled bool `yaml:"queue_inject_enabled"`// 是否启用队列注入
+	// 人机对话（特性5）
+	HumanClarifyEnabled bool `yaml:"human_clarify_enabled"` // 是否启用人机对话
+	HumanClarifyTimeoutSec int `yaml:"human_clarify_timeout_sec"` // 等待用户回答超时（秒）
+	// domainAgent 持久化（特性4）
+	DomainArchiveTTLHours int `yaml:"domain_archive_ttl_hours"` // domainAgent 归档默认存活时长（小时）
+	DomainArchiveMaxWeight int `yaml:"domain_archive_max_weight"` // domainAgent 归档权重上限
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -165,6 +189,41 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Memory.SnapshotInterval == 0 {
 		c.Memory.SnapshotInterval = 300
+	}
+
+	// —— Agent 运行时参数默认值 ——
+	if c.Agent.MaxSteps == 0 {
+		c.Agent.MaxSteps = 200
+	}
+	if c.Agent.SkillSetSize == 0 {
+		c.Agent.SkillSetSize = 8
+	}
+	if c.Agent.ToolCallMaxRounds == 0 {
+		c.Agent.ToolCallMaxRounds = 12
+	}
+	if c.Agent.RetryCount == 0 {
+		c.Agent.RetryCount = 3
+	}
+	if c.Agent.RetryBackoffMs == 0 {
+		c.Agent.RetryBackoffMs = 100
+	}
+	if c.Agent.LLMSoftTimeoutSec == 0 {
+		c.Agent.LLMSoftTimeoutSec = 30
+	}
+	if c.Agent.LLMHardTimeoutSec == 0 {
+		c.Agent.LLMHardTimeoutSec = 90
+	}
+	if c.Agent.ContextWindow == 0 {
+		c.Agent.ContextWindow = 32000
+	}
+	if c.Agent.HumanClarifyTimeoutSec == 0 {
+		c.Agent.HumanClarifyTimeoutSec = 120
+	}
+	if c.Agent.DomainArchiveTTLHours == 0 {
+		c.Agent.DomainArchiveTTLHours = 168 // 7 天
+	}
+	if c.Agent.DomainArchiveMaxWeight == 0 {
+		c.Agent.DomainArchiveMaxWeight = 100
 	}
 }
 

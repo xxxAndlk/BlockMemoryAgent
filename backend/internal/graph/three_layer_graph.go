@@ -196,6 +196,8 @@ func (g *ThreeLayerGraph) injectModelFactory(node ThreeLayerNode) {
 			n.SetRuntime(g.rt) // MetaAgent 用 Runtime 跑 Watchdog / 处理 Mailbox
 		case *DomainAgentNode:
 			n.SetRuntime(g.rt) // DomainAgent 用 Runtime 查看板 / 收邮件
+		case *SubDomainAgentNode:
+			n.SetRuntime(g.rt) // SubDomainAgent 用 Runtime 读取 AgentCfg 动态参数
 		}
 	}
 }
@@ -217,7 +219,10 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	ctx = WithSessionID(ctx, state.SessionID) // 把 sessionID 写入 ctx，供下游日志/存储使用
 	current := "MetaAgent"                    // 入口固定从 MetaAgent 开始
 	stepCount := 0                            // 已执行步数
-	maxSteps := 200                           // 步数硬上限，防止死循环
+	maxSteps := 200                           // 默认步数硬上限，防止死循环
+	if g.rt != nil && g.rt.AgentCfg != nil && g.rt.AgentCfg.MaxSteps > 0 {
+		maxSteps = g.rt.AgentCfg.MaxSteps // 配置覆盖默认值（特性2）
+	}
 
 	for {
 		// 1. 步数保护：超过上限直接报错退出

@@ -269,8 +269,12 @@ func (n *DomainAgentNode) ensureSkillSet(ctx context.Context, inst *types.RoleIn
 			llm = c
 		}
 	}
-	// 装配：≤8 个技能，输入为实例ID、领域名、领域目标
-	set := n.rt.Skills.Pool().AssembleSet(ctx, llm, n.instID, inst.Domain, state.DomainGoal, 8)
+	// 装配：≤8 个技能（默认），可被 AgentCfg.SkillSetSize 覆盖（特性2）
+	skillSetSize := 8
+	if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.SkillSetSize > 0 {
+		skillSetSize = n.rt.AgentCfg.SkillSetSize
+	}
+	set := n.rt.Skills.Pool().AssembleSet(ctx, llm, n.instID, inst.Domain, state.DomainGoal, skillSetSize)
 	// 绑定到本 agent
 	n.rt.Skills.Bind(set)
 }
@@ -432,8 +436,18 @@ func (n *DomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLa
 	var result string // 任务结果
 	var err error     // 执行错误
 
-	// 重试 3 次，初始退避 100ms（指数翻倍）；写文件失败等可重试场景生效
-	err = retryWithBackoff(3, 100*time.Millisecond, func() error {
+	// 重试次数与初始退避：默认 3 次 / 100ms，可被 AgentCfg 覆盖（特性2）
+	retryCount := 3
+	retryDelay := 100 * time.Millisecond
+	if n.rt != nil && n.rt.AgentCfg != nil {
+		if n.rt.AgentCfg.RetryCount > 0 {
+			retryCount = n.rt.AgentCfg.RetryCount
+		}
+		if n.rt.AgentCfg.RetryBackoffMs > 0 {
+			retryDelay = time.Duration(n.rt.AgentCfg.RetryBackoffMs) * time.Millisecond
+		}
+	}
+	err = retryWithBackoff(retryCount, retryDelay, func() error {
 		// 在闭包内执行助手任务
 		result, err = n.executeAssistantTask(ctx, def, task, state)
 		return err
@@ -486,7 +500,11 @@ func (n *DomainAgentNode) executeAssistantTask(ctx context.Context, def *types.R
 		}
 
 		// 调用 blades.Agent + 工具循环执行
-		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief, n.progress, "助手["+def.Name+"]")
+		maxIters := 12
+		if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.ToolCallMaxRounds > 0 {
+			maxIters = n.rt.AgentCfg.ToolCallMaxRounds
+		}
+		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief, n.progress, "助手["+def.Name+"]", maxIters)
 		if result != "" {
 			// 完成门控：若任务要求写文件但结果含失败标记，返回 error 触发上层重试/告警
 			if strings.HasPrefix(result, "[失败:") {
@@ -631,10 +649,20 @@ func (n *DomainAgentNode) callLLMAs(ctx context.Context, caller string, prompt s
 	// 推送 prompt 调试事件（含 token 估算与 500 字摘要）
 	n.emitDetail(ctx, "prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
 
-	// 带自适应超时调用 LLM：30s 软超时（建议取消）/ 90s 硬超时（强制取消）
+	// 带自适应超时调用 LLM：默认 30s 软超时 / 90s 硬超时，可被 AgentCfg 覆盖（特性2）
+	softTimeout := 30 * time.Second
+	hardTimeout := 90 * time.Second
+	if n.rt != nil && n.rt.AgentCfg != nil {
+		if n.rt.AgentCfg.LLMSoftTimeoutSec > 0 {
+			softTimeout = time.Duration(n.rt.AgentCfg.LLMSoftTimeoutSec) * time.Second
+		}
+		if n.rt.AgentCfg.LLMHardTimeoutSec > 0 {
+			hardTimeout = time.Duration(n.rt.AgentCfg.LLMHardTimeoutSec) * time.Second
+		}
+	}
 	resp, callErr, timedOut := n.llmTracker.CallWithTimeout(ctx, llm, prompt, caller,
-		30*time.Second,
-		90*time.Second,
+		softTimeout,
+		hardTimeout,
 	)
 
 	// 推送最近一次调用的 Token 消耗（in/out/耗时）

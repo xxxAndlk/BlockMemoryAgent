@@ -116,6 +116,7 @@ func main() {
 
 	// 创建运行时聚合: 看板 / 邮箱 / Watchdog / 人格 / Skill 注册表，统一注入图与节点
 	rt := runtime.New(*soulPath, skillPool)
+	rt.SetAgentConfig(&cfg.Agent) // 注入 Agent 运行时动态参数（特性2）
 
 	// 构建三层图: MetaAgent 节点 + 升级处理器 + 终止节点
 	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
