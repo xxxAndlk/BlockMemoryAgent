@@ -16,6 +16,7 @@ import (
 	"time"    // 超时时长
 
 	"github.com/blockmemory/agent/backend/internal/config"   // 基础设施配置加载
+	"github.com/blockmemory/agent/backend/internal/dag"      // DAG 调度（特性1）
 	"github.com/blockmemory/agent/backend/internal/embed"    // 伪嵌入（特性3/4 共享）
 	"github.com/blockmemory/agent/backend/internal/graph"    // 三层图构建与节点
 	"github.com/blockmemory/agent/backend/internal/memory"   // 快照管理器 + 块记忆伪嵌入
@@ -71,7 +72,11 @@ func main() {
 	if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
 		log.Fatalf("ensure session_history schema: %v", err)
 	}
-	log.Printf("Postgres connected; session_history table ready")
+	// 特性1：自动应用 dag_jobs 表 schema
+	if err := store.EnsureDAGSchema(ctx, pgStore.DB()); err != nil {
+		log.Fatalf("ensure dag_jobs schema: %v", err)
+	}
+	log.Printf("Postgres connected; session_history + dag_jobs tables ready")
 
 	// 初始化 Redis 存储层；连接失败直接 fatal
 	redisStore, err := store.NewRedisStore(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
@@ -145,6 +150,10 @@ func main() {
 	// 特性4：注入 domainAgent 归档存储，让 DomainAgent 完成后持久化信息跨会话复用
 	threeLayerGraph.SetArchiveStore(pgStore)
 
+	// 特性1：创建 DAG 调度器（按 cron + 依赖关系派发 session）
+	dagScheduler := dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
+	dagScheduler.Start(ctx)
+
 	// 启动时从 session_history 恢复历史会话到内存，让前端列表不空
 	ctxRestore, cancelRestore := context.WithTimeout(ctx, 5*time.Second) // 最多恢复 5 秒
 	n := sessionMgr.RestoreSessions(ctxRestore, 50)                      // 最多恢复 50 条
@@ -187,6 +196,11 @@ func main() {
 	mux.HandleFunc("/api/status", apiHandler.StatusHandler)
 	mux.HandleFunc("/api/metrics/timeline", apiHandler.TimelineHandler)
 	mux.HandleFunc("/api/activity", apiHandler.ActivityHandler)
+
+	// 特性1：DAG 调度接口
+	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
+	mux.Handle("/api/dag", dagHandler)
+	mux.Handle("/api/dag/", dagHandler)
 
 	// 记忆 / Skill / 文件相关端点
 	mux.HandleFunc("/api/snapshot", apiHandler.SnapshotHandler)

@@ -112,6 +112,13 @@ func (m *SessionManager) SetPostgresStore(pg *store.PostgresStore) {
 	m.pgStore = pg
 }
 
+// LaunchSession 实现 dag.SessionLauncher 接口（特性1）。
+// 把一个 task.goal 派发为新 session，返回 sessionID。
+func (m *SessionManager) LaunchSession(goal string) string {
+	s := m.CreateSession(context.Background(), goal)
+	return s.ID
+}
+
 // RestoreSessions 从 session_history 表恢复历史会话到内存映射。
 //
 // 服务重启后内存中的 m.sessions 会被清空，前端列表也就空了。本方法把
