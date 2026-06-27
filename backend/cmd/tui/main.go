@@ -131,6 +131,8 @@ func main() {
 	dagScheduler.Start(ctx)
 
 	// Start a local HTTP server so the TUI input bar can POST to /api/sessions/* and /api/dag/*.
+	// 这里不直接复用 server.api.go 是因为 TUI 进程内已持有 SessionManager/Graph 实例，
+	// 直接走本地 HTTP 比进程内调用更解耦：输入栏只关心 HTTP，便于后续替换为远程后端。
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -148,11 +150,13 @@ func main() {
 	mux.Handle("/api/dag", dagHandler)
 	mux.Handle("/api/dag/", dagHandler)
 
+	// 监听 127.0.0.1:0 让内核分配空闲端口，避免与其他进程冲突；端口通过 ln.Addr() 回传给 TUI
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
 	go func() {
+		// 关闭连接时的 "use of closed network connection" 是正常退出，不当作错误
 		if err := http.Serve(ln, mux); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
 			log.Printf("http server: %v", err)
 		}
@@ -168,6 +172,9 @@ func main() {
 	}
 }
 
+// sessionRouter 把 /api/sessions/{id}/{suffix} 路径分发到对应 handler。
+// 路径解析：剥离前缀 → 按 / 切两段 → 第一段为 sessionID，第二段为操作后缀。
+// 未识别后缀走 HandleGetSession（取单会话详情），保持 RESTful 路径风格。
 func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
@@ -183,15 +190,15 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 		}
 		switch suffix {
 		case "stream":
-			mgr.HandleSessionStream(w, r)
+			mgr.HandleSessionStream(w, r) // SSE 流：实时推送 graph 事件到 TUI
 		case "message":
 			mgr.HandleSessionMessage(w, r)
 		case "clarify":
-			mgr.HandleSessionClarify(w, r)
+			mgr.HandleSessionClarify(w, r) // 特性5：人机对话答复
 		case "interrupt":
-			mgr.HandleSessionInterrupt(w, r)
+			mgr.HandleSessionInterrupt(w, r) // 特性6：抢占中断
 		case "enqueue":
-			mgr.HandleSessionEnqueue(w, r)
+			mgr.HandleSessionEnqueue(w, r) // 特性6：队列注入
 		case "board":
 			mgr.HandleSessionBoard(w, r)
 		case "agents":
@@ -201,7 +208,7 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 		case "watchdog":
 			mgr.HandleSessionWatchdog(w, r)
 		default:
-			mgr.HandleGetSession(w, r)
+			mgr.HandleGetSession(w, r) // 无后缀：单会话详情
 		}
 	}
 }

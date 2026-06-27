@@ -4,29 +4,29 @@ package main
 // 启动顺序: 配置加载 → 存储初始化 → 角色配置 → 模型工厂预热 → 图构建 → 会话管理器 → 路由注册 → HTTP 监听 → 信号处理优雅关闭。
 
 import (
-	"context" // 上下文，用于取消与超时控制
-	"flag"    // 命令行参数解析
-	"fmt"     // 格式化输出
-	"log"     // 日志输出
-	"net/http"// HTTP 服务与路由
-	"os"      // 文件信息、信号
-	"os/signal"// 信号监听
-	"strings" // DSN 脱敏时的字符串处理
-	"syscall" // SIGINT/SIGTERM 信号常量
-	"time"    // 超时时长
+	"context"   // 上下文，用于取消与超时控制
+	"flag"      // 命令行参数解析
+	"fmt"       // 格式化输出
+	"log"       // 日志输出
+	"net/http"  // HTTP 服务与路由
+	"os"        // 文件信息、信号
+	"os/signal" // 信号监听
+	"strings"   // DSN 脱敏时的字符串处理
+	"syscall"   // SIGINT/SIGTERM 信号常量
+	"time"      // 超时时长
 
-	"github.com/blockmemory/agent/backend/internal/config"   // 基础设施配置加载
-	"github.com/blockmemory/agent/backend/internal/dag"      // DAG 调度（特性1）
-	"github.com/blockmemory/agent/backend/internal/embed"    // 伪嵌入（特性3/4 共享）
-	"github.com/blockmemory/agent/backend/internal/graph"    // 三层图构建与节点
-	"github.com/blockmemory/agent/backend/internal/memory"   // 快照管理器 + 块记忆伪嵌入
-	"github.com/blockmemory/agent/backend/internal/model"    // 模型工厂
-	"github.com/blockmemory/agent/backend/internal/runtime"  // 运行时聚合（看板/邮箱/Skill/Soul/Watchdog）
-	"github.com/blockmemory/agent/backend/internal/server"   // HTTP API 与会话管理器
-	"github.com/blockmemory/agent/backend/internal/skill"    // Skill 池加载
-	"github.com/blockmemory/agent/backend/internal/store"    // Postgres / Redis 存储
+	"github.com/blockmemory/agent/backend/internal/config"      // 基础设施配置加载
+	"github.com/blockmemory/agent/backend/internal/dag"         // DAG 调度（特性1）
+	"github.com/blockmemory/agent/backend/internal/embed"       // 伪嵌入（特性3/4 共享）
+	"github.com/blockmemory/agent/backend/internal/graph"       // 三层图构建与节点
+	"github.com/blockmemory/agent/backend/internal/memory"      // 快照管理器 + 块记忆伪嵌入
+	"github.com/blockmemory/agent/backend/internal/model"       // 模型工厂
+	"github.com/blockmemory/agent/backend/internal/runtime"     // 运行时聚合（看板/邮箱/Skill/Soul/Watchdog）
+	"github.com/blockmemory/agent/backend/internal/server"      // HTTP API 与会话管理器
+	"github.com/blockmemory/agent/backend/internal/skill"       // Skill 池加载
+	"github.com/blockmemory/agent/backend/internal/store"       // Postgres / Redis 存储
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config" // 角色配置（roles.yaml）
-	"github.com/blockmemory/agent/backend/pkg/types"         // 公共类型（状态、节点接口）
+	"github.com/blockmemory/agent/backend/pkg/types"            // 公共类型（状态、节点接口）
 )
 
 // main 是服务入口。职责: 解析 flag → 装配依赖 → 启动 HTTP → 等待信号优雅关闭。
@@ -157,7 +157,7 @@ func main() {
 	// 启动时从 session_history 恢复历史会话到内存，让前端列表不空
 	ctxRestore, cancelRestore := context.WithTimeout(ctx, 5*time.Second) // 最多恢复 5 秒
 	n := sessionMgr.RestoreSessions(ctxRestore, 50)                      // 最多恢复 50 条
-	cancelRestore()                                                       // 释放子上下文
+	cancelRestore()                                                      // 释放子上下文
 	if n > 0 {
 		log.Printf("Restored %d past sessions into in-memory list", n)
 	}
@@ -354,6 +354,7 @@ type pgBlockMemoryAdapter struct {
 }
 
 // SaveBlockMemory 归档一条 domainAgent 块记忆到 global_knowledge 表。
+// 流程：组装 BlockMemoryRecord → ToKnowledgeRecord 生成 content/embedding/meta → SaveKnowledge 落库。
 func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string) error {
 	rec := (&memory.BlockMemoryRecord{
 		SessionID: sessionID,
@@ -361,11 +362,12 @@ func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, d
 		Goal:      goal,
 		Summary:   summary,
 		CreatedAt: time.Now(),
-	}).ToKnowledgeRecord(a.dim)
+	}).ToKnowledgeRecord(a.dim) // 内部用 embed.PseudoEmbed 生成伪向量
 	return a.pg.SaveKnowledge(ctx, rec)
 }
 
 // SearchBlockMemory 按查询文本检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
+// 检索路径：query → 伪嵌入 → pgvector cosine 距离 ORDER BY → 取 topK → 拼成编号文本。
 func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, query string, topK int) (string, error) {
 	emb := embed.PseudoEmbed(query, a.dim)
 	recs, err := a.pg.SearchKnowledgeByType(ctx, "block_memory", emb, topK)
@@ -373,8 +375,10 @@ func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, query stri
 		return "", err
 	}
 	if len(recs) == 0 {
+		// 返回空串让调用方跳过 prompt 注入，避免空段污染 LLM 输入
 		return "", nil
 	}
+	// 编号拼接：[1] xxx\n[2] xxx\n ... 便于 LLM 在 prompt 中引用
 	var b strings.Builder
 	for i, r := range recs {
 		b.WriteString(fmt.Sprintf("[%d] %s\n", i+1, r.Content))
@@ -418,7 +422,7 @@ func (a *pgHistoryAdapter) RecentSessionHistories(ctx context.Context, limit int
 func redactDSN(dsn string) string {
 	// 处理 postgres://user:pass@host/db 形式
 	if i := strings.Index(dsn, "://"); i >= 0 {
-		rest := dsn[i+3:]                 // 协议之后的部分
+		rest := dsn[i+3:] // 协议之后的部分
 		if at := strings.Index(rest, "@"); at >= 0 {
 			userpass := rest[:at] // user:pass 子串
 			if colon := strings.Index(userpass, ":"); colon >= 0 {

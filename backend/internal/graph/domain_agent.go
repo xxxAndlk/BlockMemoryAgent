@@ -188,6 +188,8 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	}
 
 	// 3.5 特性3：检索相似块记忆，注入 analyzeTasks 作为上下文
+	// 用 DomainGoal 做查询，取 topK=3；命中结果在 analyzeTasks prompt 里拼成"参考段"
+	// 让 LLM 知晓过往类似领域已做过的任务，避免重复劳动或漏掉关键步骤
 	n.recalledMemory = ""
 	if n.blockMemory != nil {
 		if recalled, err := n.blockMemory.SearchBlockMemory(ctx, state.DomainGoal, 3); err == nil && recalled != "" {
@@ -288,13 +290,15 @@ func (n *DomainAgentNode) ensureSkillSet(ctx context.Context, inst *types.RoleIn
 	}
 
 	// 特性4：先查归档，命中则复用历史 Skill 子集
+	// 检索路径：domain + DomainGoal 双条件做相似查询，topK=1 取最相关的一条
 	if n.archiveStore != nil {
 		if archives, err := n.archiveStore.SearchDomainArchive(ctx, inst.Domain, state.DomainGoal, 1); err == nil && len(archives) > 0 {
 			arc := archives[0]
+			// 用归档里保存的 Skill ID 列表重建 SkillSet；查不到任何技能则 fall-through 到 LLM 路径
 			if reused := n.rt.Skills.Pool().AssembleFromIDs(n.instID, arc.Skills); reused != nil && len(reused.Skills) > 0 {
 				n.rt.Skills.Bind(reused)
-				// 权重 +1 且延后过期
-				ttl := time.Duration(168) * time.Hour
+				// 权重 +1 且延后过期：让热点领域的归档越用越不容易被回收
+				ttl := time.Duration(168) * time.Hour // 默认 7 天
 				if n.rt.AgentCfg != nil && n.rt.AgentCfg.DomainArchiveTTLHours > 0 {
 					ttl = time.Duration(n.rt.AgentCfg.DomainArchiveTTLHours) * time.Hour
 				}
@@ -1119,12 +1123,15 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 
 	// 特性3：把块记忆归档到 pgvector，供后续 DomainAgent 相似检索
 	if n.blockMemory != nil && block != nil {
+		// 优先用 state.Reason（含各任务结果摘要）；为空时退化为领域目标
 		summary := state.Reason
 		if summary == "" {
 			summary = block.Goal
 		}
 		// 异步归档避免阻塞图循环；失败仅记录日志，不影响主流程
+		// 注意：通过参数显式捕获 block/domain/goal/sum，避免闭包捕获迭代变量
 		go func(b *types.SessionBlock, domain, goal, sum string) {
+			// 独立 ctx：与会话 ctx 解耦，会话结束后归档仍能完成
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := n.blockMemory.SaveBlockMemory(bgCtx, b.SessionID, domain, goal, sum); err != nil {
@@ -1135,6 +1142,7 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 
 	// 特性4：把 domainAgent 信息（领域/技能/上下文摘要）归档，跨会话可复用
 	if n.archiveStore != nil && block != nil {
+		// 收集当前实例绑定的 Skill ID 列表，作为下次复用的种子
 		var archivedSkills []string
 		if n.rt != nil && n.rt.Skills != nil {
 			if set := n.rt.Skills.GetForAgent(n.instID); set != nil {
@@ -1143,14 +1151,17 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 				}
 			}
 		}
+		// TTL 来自配置；默认 168h（7 天）保证热点领域归档不会过快失效
 		ttl := 168 * time.Hour
 		if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.DomainArchiveTTLHours > 0 {
 			ttl = time.Duration(n.rt.AgentCfg.DomainArchiveTTLHours) * time.Hour
 		}
+		// 摘要优先取 state.Reason（含各任务结果）；为空时退化为领域目标
 		summary := state.Reason
 		if summary == "" {
 			summary = block.Goal
 		}
+		// 新归档权重从 1 起步；每次被复用时 BumpDomainArchiveWeight 会自增
 		rec := &DomainArchiveRecord{
 			SessionID:      block.SessionID,
 			Domain:         inst.Domain,
@@ -1162,6 +1173,7 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 			ExpiresAt:      time.Now().Add(ttl),
 			CreatedAt:      time.Now(),
 		}
+		// 异步落库：独立 ctx 不受会话生命周期影响；失败仅日志，主流程已结束不影响结果
 		go func(r *DomainArchiveRecord) {
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()

@@ -197,8 +197,10 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	n.registry.CleanupExpired()
 
 	// 3.5 特性4：定期清理过期 domainAgent 归档（每 50 tick 跑一次）
+	// 频率取 50 tick 是权衡：太频繁会反复扫表，太稀疏会让过期记录占据 pgvector 索引
 	if n.stepCount%50 == 0 && n.archiveStore != nil {
 		go func() {
+			// 独立 ctx：清理不阻塞主路径，超时 5s 防止异常长 SQL
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if n, err := n.archiveStore.CleanupExpiredDomainArchives(bgCtx); err == nil && n > 0 {
@@ -267,30 +269,34 @@ func (n *MetaAgentNode) drainCommandQueue(ctx context.Context, state *types.Thre
 		case 1: // cmdqueue.IntentInterrupt
 			n.emit(ctx, "intend", "抢占中断：清空当前上下文，按新指令重新启动")
 			// 清空图状态，保留 SessionID 与 Messages 中的历史对话
+			// 注意：必须重置 ActiveBlocks/CallStack/CurrentBlockID 三件套，
+			//       否则下一 tick 仍可能跳进旧 DomainAgent 的子任务路径
 			state.ActiveBlocks = make(map[string]*types.SessionBlock)
 			state.CompletedBlocks = nil
 			state.CallStack = make([]*types.CallRequest, 0)
 			state.CurrentBlockID = ""
 			state.CurrentDomain = ""
-			state.DomainGoal = it.Content
+			state.DomainGoal = it.Content // 新指令覆盖原 goal，下一 tick 由 handleInitial 重新拆分
 			state.CurrentAssistantID = ""
 			state.TargetRoleID = ""
 			state.DirectExecute = false
-			state.PendingClarify = nil
+			state.PendingClarify = nil // 同步丢弃旧的澄清请求，避免恢复后误挂起
 			state.NextAction = types.ActionContinue
 			state.Reason = "interrupted by user"
-			// 追加为最新用户消息
+			// 追加为最新用户消息：LLM 在新 handleInitial 中会读到这条消息作为输入
 			state.Messages = append(state.Messages, types.ChatMessage{
 				Role: "user", Content: it.Content, Timestamp: time.Now(),
 			})
 			return true
 		default: // IntentEnqueue
+			// 仅追加消息，不重置状态；当前 tick 继续，下个 tick 起各 Agent 会读到新消息
 			n.emit(ctx, "intend", "队列注入：追加用户指令到当前上下文")
 			state.Messages = append(state.Messages, types.ChatMessage{
 				Role: "user", Content: it.Content, Timestamp: time.Now(),
 			})
 		}
 	}
+	// 多条 enqueue 都处理完不中断，调用方继续原 tick 流程
 	return false
 }
 
@@ -520,9 +526,12 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 	// 特性7：LLM 智能路由 — 关键词规则未命中时，用 LLM 判断 goal 复杂度，
 	// 命中"simple"则直接调 LLM 回答，命中"query"则走 DirectExecute，命中"complex"则派发子 Agent。
 	// 仅在规则路径未决出 DirectExecute / simple 且模型可用时触发，避免增加无谓 LLM 调用。
+	// 注意：classifier 返回 ""（LLM 不可用/超时/未识别）时不进入任何 case，
+	//       直接 fall-through 到下方 analyzeDomains 走原规则路径，保证无回归。
 	if !state.DirectExecute && n.modelFactory != nil && !n.isSimpleQuestion(state.DomainGoal) {
 		switch n.classifyComplexityLLM(ctx, state.DomainGoal) {
 		case "simple":
+			// 直接调主 LLM 生成回答并结束会话，跳过领域拆分与子 Agent 派发
 			n.emit(ctx, "intend", "LLM 路由判定为简单问题，直接调用 LLM 回答")
 			answer, err, timedOut := n.callLLM(ctx, fmt.Sprintf(
 				`你是BlockMemoryAgent，一个基于大语言模型的本地AI开发助手。
@@ -531,12 +540,14 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 用户问题：%s
 
 你的回答：`, fmtEnvSection(), state.DomainGoal))
+			// LLM 软超时：写入超时提示并 Finish，避免阻塞会话
 			if timedOut {
 				state.SessionSummary = "LLM调用超时，请稍后重试"
 				state.NextAction = types.ActionFinish
 				state.Reason = "llm timeout on smart-route simple"
 				return state, nil
 			}
+			// 成功：写回答到 SessionSummary 并 Finish；err!=nil 或空回答时 fall-through 到常规拆分流程
 			if err == nil && answer != "" {
 				state.SessionSummary = answer
 				state.NextAction = types.ActionFinish
@@ -544,9 +555,11 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 				return state, nil
 			}
 		case "query":
+			// 标记 DirectExecute，由下方 handleInitial 流程派发单助手 + 工具执行（HTTPGet 等）
 			state.DirectExecute = true
 			n.emit(ctx, "intend", "LLM 路由判定为查询类任务，标记 DirectExecute 由单助手执行")
 		case "complex":
+			// 仅打点，不修改状态；fall-through 后由 analyzeDomains 拆分领域并派发子 Agent
 			n.emit(ctx, "intend", "LLM 路由判定为复杂任务，进入领域拆分流程")
 		}
 	}
@@ -585,6 +598,7 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 	if len(domains) == 0 {
 		// 无领域返回：若启用人机对话（特性5），向用户请求澄清而非直接结束
 		if n.humanClarifyEnabled() {
+			// 构造澄清请求：ID 用 SessionID+纳秒时间戳保证唯一；Context 回放原始 goal 便于用户对照
 			clr := &types.ClarifyRequest{
 				ID:        fmt.Sprintf("clarify_%s_%d", state.SessionID, time.Now().UnixNano()),
 				Question:  "无法从目标中识别出可执行的领域，请补充说明你希望完成的具体任务或目标。",
@@ -592,13 +606,14 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 				AgentID:   "MetaAgent",
 				CreatedAt: time.Now(),
 			}
+			// 挂起图循环：PendingClarify 非空 + ActionWait 触发 server 把 session 置 awaiting_clarify
 			state.PendingClarify = clr
 			state.NextAction = types.ActionWait
 			state.Reason = "awaiting human clarification"
 			n.emit(ctx, "wait", "已向用户请求澄清: "+clr.Question)
 			return state, nil
 		}
-		// 未启用：推送错误事件
+		// 未启用：推送错误事件，下方继续走 Finish 流程
 		n.emit(ctx, "error", "领域分析未返回任何领域，将结束会话")
 	} else {
 		// 推送拆分结果
@@ -1228,9 +1243,11 @@ func (n *MetaAgentNode) humanClarifyEnabled() bool {
 // 但中文表述多变时容易漏判。此处用一次轻量 LLM 调用作兜底，避免把
 // "帮我分析下这段代码有什么问题"这类需要 ReAct 的任务误派给单助手。
 func (n *MetaAgentNode) classifyComplexityLLM(ctx context.Context, goal string) string {
+	// 模型未装配或 llmTracker 判定应跳过（如连续失败熔断中）时回退空串
 	if n.modelFactory == nil || n.llmTracker.ShouldSkipLLM() {
 		return ""
 	}
+	// 空目标无法分类，直接回退
 	if strings.TrimSpace(goal) == "" {
 		return ""
 	}
@@ -1243,10 +1260,12 @@ func (n *MetaAgentNode) classifyComplexityLLM(ctx context.Context, goal string) 
 用户目标: %s
 
 只回答 simple / query / complex 三者之一，不要其他文字:`, goal)
+	// callLLMAs：以 MetaAgent 身份调用，自带软/硬超时与重试；任一异常都视作未判定
 	resp, err, timedOut := n.callLLMAs(ctx, "MetaAgent/复杂度判定", prompt)
 	if timedOut || err != nil || resp == "" {
 		return ""
 	}
+	// LLM 可能输出 "simple." 或 "Complex\n" 等变体，统一小写后用 Contains 子串匹配
 	resp = strings.ToLower(strings.TrimSpace(resp))
 	switch {
 	case strings.Contains(resp, "simple"):
@@ -1256,6 +1275,7 @@ func (n *MetaAgentNode) classifyComplexityLLM(ctx context.Context, goal string) 
 	case strings.Contains(resp, "complex"):
 		return "complex"
 	}
+	// 未匹配三者时回退空串，调用方按原规则路径处理
 	return ""
 }
 

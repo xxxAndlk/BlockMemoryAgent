@@ -31,11 +31,16 @@ func NewDAGHandler(store dag.Store, sched *dag.Scheduler) *DAGHandler {
 }
 
 // ServeHTTP 统一分发 /api/dag* 路径。
+// 路径解析顺序：先剥离 /api/dag 前缀与首尾斜杠，再按段匹配：
+//   - "running"             → 运行中快照
+//   - ""                    → 集合资源（GET 列表 / POST upsert）
+//   - "{id}"                → 单条资源（GET 详情 / DELETE 删除）
+//   - "{id}/trigger"        → 立即触发
 func (h *DAGHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/dag")
 	path = strings.Trim(path, "/")
 
-	// /api/dag/running
+	// /api/dag/running — 必须放在 /api/dag/{id} 之前，否则 "running" 会被当作 id
 	if path == "running" && r.Method == http.MethodGet {
 		snap := h.Scheduler.Snapshot()
 		writeJSON(w, snap)
@@ -56,6 +61,7 @@ func (h *DAGHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, dags)
 			return
 		case http.MethodPost:
+			// upsert 语义：按 d.ID 覆盖；新建时填 CreatedAt，更新时仅刷新 UpdatedAt
 			var d dag.DAG
 			if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 				http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
@@ -65,6 +71,7 @@ func (h *DAGHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "id is required", http.StatusBadRequest)
 				return
 			}
+			// 环检测：拒绝持久化带环的 DAG，避免调度器进入死锁
 			if d.HasCycle() {
 				http.Error(w, "dag has cycle", http.StatusBadRequest)
 				return
@@ -73,7 +80,7 @@ func (h *DAGHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if d.CreatedAt.IsZero() {
 				d.CreatedAt = now
 			}
-			d.UpdatedAt = now
+			d.UpdatedAt = now // 每次 upsert 都刷新，作为 cron 触发判断的基准时间
 			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 			defer cancel()
 			if err := h.Store.SaveDAG(ctx, &d); err != nil {
@@ -90,8 +97,9 @@ func (h *DAGHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// /api/dag/{id}[/trigger]
 	parts := strings.SplitN(path, "/", 2)
 	id := parts[0]
+	// trigger 子路径：跳过 cron 检查直接派发一次
 	if len(parts) == 2 && parts[1] == "trigger" && r.Method == http.MethodPost {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second) // trigger 内部可能阻塞（HasCycle+dispatch）
 		defer cancel()
 		if err := h.Scheduler.Trigger(ctx, id); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

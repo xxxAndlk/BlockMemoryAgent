@@ -16,6 +16,8 @@ func (m Model) View() string {
 		return "Initializing..."
 	}
 
+	// 布局尺寸约定：每个带边框面板固定 Height(3)（上边框+内容+下边框），
+	// tabs 单行高 1。contentH 为剩余高度，最小 4 防止终端过小时挤压为 0。
 	topH := 3    // bordered top bar (border + content + border)
 	inputH := 3  // bordered input bar
 	tabsH := 1
@@ -184,6 +186,7 @@ func (m Model) renderChat(w, h int) string {
 
 // clipChat applies a fixed Width/Height style so the borderless chat area
 // never grows beyond its allocated space and pushes the input bar down.
+// 替代旧 padLines：lipgloss Height 会自动截断超出部分并补齐空白，比手工 pad/tail 更稳定。
 func (m Model) clipChat(content string, w, h int) string {
 	return lipgloss.NewStyle().Width(w).Height(h).Render(content)
 }

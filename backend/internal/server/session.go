@@ -871,18 +871,19 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 		http.Error(w, "session is not awaiting clarification", http.StatusBadRequest)
 		return
 	}
-	// 追加用户答复到对话历史
+	// 追加用户答复到对话历史：前缀 "[澄清答复]" 让 LLM 在后续上下文中识别这是对悬停问题的回答
 	session.Messages = append(session.Messages, types.ChatMessage{
 		Role:      "user",
 		Content:   "[澄清答复] " + req.Answer,
 		Timestamp: time.Now(),
 	})
-	// 清空 PendingClarify，恢复执行时会以最新 Messages 重新构造上下文
+	// 清空 PendingClarify，避免 resumeSession 时被再次判定为挂起状态
 	if session.State != nil {
 		session.State.PendingClarify = nil
 	}
+	// 切回 running 让其他端点（interrupt/enqueue）知道会话已恢复可被抢占
 	session.Status = "running"
-	// 直接 append 事件，避免 addEvent 再次取锁自死锁
+	// 直接 append 事件，避免 addEvent 再次取锁自死锁（此处已持 m.mu）
 	session.Events = append(session.Events, SessionEvent{
 		Type:      "clarify",
 		Agent:     "User",
@@ -892,6 +893,7 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 	})
 	m.mu.Unlock()
 
+	// 异步恢复：避免阻塞 HTTP 响应；graph 从最新 state 继续，可能再次 ActionWait
 	go m.resumeSession(session)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -933,6 +935,7 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 		http.Error(w, "command queue not available", http.StatusServiceUnavailable)
 		return
 	}
+	// 先入队再判断会话状态，避免运行中会话被漏掉：MetaAgent 下个 tick Drain 时会拿到这条指令
 	rt.CmdQueue.Push(id, cmdqueue.Item{Content: req.Content, Intent: cmdqueue.IntentInterrupt})
 
 	m.mu.Lock()
@@ -952,12 +955,14 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 	})
 	wasRunning := session.Status == "running"
 	if !wasRunning {
+		// 已结束的会话需重新置 running 并清空 EndedAt，否则 resumeSession 会因状态不对跳过
 		session.Status = "running"
 		session.EndedAt = nil
 	}
 	m.mu.Unlock()
 
-	// 已结束会话：异步恢复执行；运行中会话：由 MetaAgent 下一个 tick 拉取中断
+	// 已结束会话：异步恢复执行，由 drainCommandQueue 在首 tick 应用中断；
+	// 运行中会话：不主动 resume，等 MetaAgent 下一个 tick 自然拉取队列
 	if !wasRunning {
 		go m.resumeSession(session)
 	}
@@ -998,6 +1003,7 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 		http.Error(w, "command queue not available", http.StatusServiceUnavailable)
 		return
 	}
+	// 与 interrupt 同序：先入队，再判断是否需要 resume；enqueue 不重置上下文，仅追加消息
 	rt.CmdQueue.Push(id, cmdqueue.Item{Content: req.Content, Intent: cmdqueue.IntentEnqueue})
 
 	m.mu.Lock()
@@ -1017,11 +1023,13 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 	})
 	wasRunning := session.Status == "running"
 	if !wasRunning {
+		// 已结束会话：enqueue 退化为普通 message 恢复，重新置 running
 		session.Status = "running"
 		session.EndedAt = nil
 	}
 	m.mu.Unlock()
 
+	// 运行中会话：等 MetaAgent 下个 tick Drain；已结束会话：异步恢复
 	if !wasRunning {
 		go m.resumeSession(session)
 	}

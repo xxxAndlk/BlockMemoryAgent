@@ -180,11 +180,13 @@ func chatItems(s *server.Session) []chatItem {
 
 // formatMarkdown applies light Markdown formatting for the chat view.
 // Supports: headers, bold, italic, inline code, code blocks, lists, blockquotes.
+// 行级状态机：按行扫描，遇 ``` 切换 inCodeBlock；代码块内原样累积，块外按行类型渲染。
 func formatMarkdown(text string) string {
 	var out []string
 	var inCodeBlock bool
 	var codeBlock []string
 
+	// 预定义样式：避免在循环内反复构造，提升长文本渲染性能
 	mdHeader := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(cHeader))
 	mdBold := lipgloss.NewStyle().Bold(true)
 	mdItalic := lipgloss.NewStyle().Italic(true)
@@ -192,6 +194,7 @@ func formatMarkdown(text string) string {
 	mdCodeBlock := lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cValue)).Padding(0, 1)
 	mdDim := lipgloss.NewStyle().Foreground(lipgloss.Color(cDone))
 
+	// flushCode 把累积的代码块行渲染为单个带背景的代码块并清空缓存
 	flushCode := func() {
 		if len(codeBlock) == 0 {
 			return
@@ -204,7 +207,7 @@ func formatMarkdown(text string) string {
 		line := raw
 		trimmed := strings.TrimSpace(line)
 
-		// Code fence
+		// Code fence：``` 切换代码块状态；行本身不输出
 		if strings.HasPrefix(trimmed, "```") {
 			if inCodeBlock {
 				flushCode()
@@ -214,12 +217,13 @@ func formatMarkdown(text string) string {
 			}
 			continue
 		}
+		// 代码块内：原样累积，跳过其他 Markdown 解析，避免 ** 被误识别
 		if inCodeBlock {
 			codeBlock = append(codeBlock, line)
 			continue
 		}
 
-		// Header
+		// Header：# ~ ###### 后跟空格或行尾；level 不限但渲染样式统一
 		if strings.HasPrefix(trimmed, "#") {
 			level := 0
 			for level < len(trimmed) && trimmed[level] == '#' {
@@ -233,7 +237,7 @@ func formatMarkdown(text string) string {
 			}
 		}
 
-		// Blockquote
+		// Blockquote：> 前缀，用 ┃ 替换以适配等宽字体对齐
 		if strings.HasPrefix(trimmed, ">") {
 			content := strings.TrimSpace(strings.TrimPrefix(trimmed, ">"))
 			content = applyInlineMarkdown(content, mdBold, mdItalic, mdCode)
@@ -241,7 +245,7 @@ func formatMarkdown(text string) string {
 			continue
 		}
 
-		// List item
+		// List item：- / * / + 后跟空格才识别（避免把 *bold* 误判为列表项）
 		if strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "*") || strings.HasPrefix(trimmed, "+") {
 			if len(trimmed) > 1 && trimmed[1] == ' ' {
 				content := strings.TrimSpace(trimmed[1:])
@@ -251,16 +255,19 @@ func formatMarkdown(text string) string {
 			}
 		}
 
-		// Plain line
+		// Plain line：仅做内联格式化
 		line = applyInlineMarkdown(line, mdBold, mdItalic, mdCode)
 		out = append(out, line)
 	}
+	// 文本结束时若仍在代码块中，flush 兜底输出
 	flushCode()
 
 	return strings.Join(out, "\n")
 }
 
 // applyInlineMarkdown handles **bold**, *italic*, and `inline code`.
+// 顺序很重要：先处理 `code`（避免其中 ** 被吃掉），再 **bold，最后 *italic。
+// 这样 ** 会优先于 * 被匹配，避免 bold 内容被识别成 italic。
 func applyInlineMarkdown(text string, bold, italic, code lipgloss.Style) string {
 	// Inline code
 	text = replacePairs(text, "`", func(s string) string { return code.Render(s) })
@@ -272,6 +279,8 @@ func applyInlineMarkdown(text string, bold, italic, code lipgloss.Style) string 
 }
 
 // replacePairs replaces matching pairs of markers with the result of f(content).
+// 简易成对替换：找到首个 marker 作为开标记，再找其后第一个 marker 作为闭标记，
+// 把中间内容传给 f 渲染；循环到没有配对为止。不支持嵌套。
 func replacePairs(text, marker string, f func(string) string) string {
 	for {
 		start := strings.Index(text, marker)
@@ -280,7 +289,7 @@ func replacePairs(text, marker string, f func(string) string) string {
 		}
 		end := strings.Index(text[start+len(marker):], marker)
 		if end == -1 {
-			break
+			break // 只有开标记无闭标记：保持原样，避免吞字符
 		}
 		end += start + len(marker)
 		content := text[start+len(marker) : end]

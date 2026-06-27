@@ -113,6 +113,16 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// submitInput 解析用户输入命令并路由到对应 HTTP 端点。
+// 命令语义：
+//   - "/new <goal>"         无需选中会话，直接创建新会话
+//   - "/clarify <id> <ans>" 回复特性5 的人机澄清请求
+//   - "/interrupt <text>"   特性6 抢占中断
+//   - "/enqueue <text>"     特性6 队列注入
+//   - "/dag trigger <id>"   立即触发 DAG
+//   - "/dag new <json>"     创建 DAG（JSON 内联）
+//   - 其他                  作为普通消息追加到当前会话
+// 未选中会话时，纯文本输入自动作为新会话的 goal。
 func (m *Model) submitInput(cmd string) {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
@@ -141,6 +151,7 @@ func (m *Model) submitInput(cmd string) {
 	// /clarify <id> <answer...>
 	if parts[0] == "/clarify" && len(parts) >= 3 {
 		id := parts[1]
+		// 用 TrimPrefix 而非 Fields 拼接 answer，保留 answer 内的空格
 		answer := strings.TrimSpace(strings.TrimPrefix(cmd, "/clarify "+id))
 		m.postJSON(fmt.Sprintf("/api/sessions/%s/clarify", s.ID), map[string]string{"question_id": id, "answer": answer})
 		return
@@ -182,9 +193,12 @@ func (m *Model) submitInput(cmd string) {
 	m.postJSON(fmt.Sprintf("/api/sessions/%s/message", s.ID), map[string]string{"content": cmd})
 }
 
+// postJSON 向本地 TUI 后端发 POST 请求。
+// 失败仅写 flashMsg 提示，不阻塞 TUI 主循环；requestTimeout 控制单次请求最长 3s。
 func (m *Model) postJSON(path string, body any) {
 	addr := m.httpAddr
 	if addr == "" {
+		// 兜底地址：当 TUI 未通过本地 HTTP 启动而直连外部后端时使用
 		addr = "http://localhost:10010"
 	}
 	data, err := json.Marshal(body)

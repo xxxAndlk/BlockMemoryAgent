@@ -59,6 +59,7 @@ func (d *DAG) HasCycle() bool {
 }
 
 // TopoSort 拓扑排序，返回任务执行顺序；存在环或依赖缺失返回错误。
+// 实现：Kahn 算法 — 入度表 + BFS 队列；排序后节点数不等于总数即存在环。
 func (d *DAG) TopoSort() ([]*Task, error) {
 	byID := make(map[string]*Task, len(d.Tasks))
 	for _, t := range d.Tasks {
@@ -67,7 +68,7 @@ func (d *DAG) TopoSort() ([]*Task, error) {
 		}
 		byID[t.ID] = t
 	}
-	// 校验依赖存在性
+	// 校验依赖存在性：依赖指向不存在的 task 直接报错，避免后续 inDeg 计算踩空
 	for _, t := range d.Tasks {
 		for _, dep := range t.DependsOn {
 			if _, ok := byID[dep]; !ok {
@@ -75,7 +76,7 @@ func (d *DAG) TopoSort() ([]*Task, error) {
 			}
 		}
 	}
-	// Kahn 算法
+	// Kahn 算法：inDeg[id] = len(DependsOn)；入度为 0 的进队列
 	inDeg := make(map[string]int, len(d.Tasks))
 	for _, t := range d.Tasks {
 		inDeg[t.ID] = len(t.DependsOn)
@@ -87,6 +88,7 @@ func (d *DAG) TopoSort() ([]*Task, error) {
 		}
 	}
 	var sorted []*Task
+	// 每次出队一个节点，把依赖它的节点入度减 1；归零则入队
 	for len(queue) > 0 {
 		id := queue[0]
 		queue = queue[1:]
@@ -102,6 +104,7 @@ func (d *DAG) TopoSort() ([]*Task, error) {
 			}
 		}
 	}
+	// 环检测：若还有节点未入队，说明它们互相依赖成环，无法拓扑排序
 	if len(sorted) != len(d.Tasks) {
 		return nil, fmt.Errorf("cycle detected in dag %s", d.ID)
 	}
@@ -225,6 +228,8 @@ func (s *Scheduler) loop(ctx context.Context) {
 }
 
 // tick 一次调度轮询：检查 cron 触发 + 推进运行中 DAG 的依赖。
+// 触发判定（简化版）：当前时间 - updatedAt >= interval 即触发；trigger 后回写 updatedAt
+// 作为下次触发的起点。这避免引入独立 lastFire 字段，但也意味着触发后必须落库。
 func (s *Scheduler) tick(ctx context.Context) {
 	dags, err := s.store.ListDAGs(ctx)
 	if err != nil || len(dags) == 0 {
@@ -233,7 +238,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 	now := time.Now()
 	for _, d := range dags {
 		if !d.Enabled || d.Cron == "" {
-			continue
+			continue // 未启用或仅手动触发的 DAG 跳过 cron 检查
 		}
 		interval, err := ParseInterval(d.Cron)
 		if err != nil || interval <= 0 {
@@ -243,10 +248,10 @@ func (s *Scheduler) tick(ctx context.Context) {
 		if now.Sub(d.UpdatedAt) >= interval {
 			_ = s.Trigger(ctx, d.ID)
 			d.UpdatedAt = now
-			_ = s.store.SaveDAG(ctx, d)
+			_ = s.store.SaveDAG(ctx, d) // 持久化新的 updatedAt，避免重复触发
 		}
 	}
-	// 推进运行中 DAG
+	// 推进运行中 DAG：拷贝一份引用后释放锁，再逐个 dispatchReady，避免长持锁
 	s.mu.Lock()
 	running := make(map[string]*DAG, len(s.running))
 	for k, v := range s.running {
@@ -259,7 +264,8 @@ func (s *Scheduler) tick(ctx context.Context) {
 }
 
 // dispatchReady 把所有依赖已完成的 pending 任务派发为 session。
-// 依赖检测：依赖任务状态均为 completed。
+// 依赖检测：依赖任务状态均为 completed；任一依赖未完成或缺失则保持 pending。
+// 派发动作：LaunchSession(goal) 返回 sessionID，写入 task 并置 Running。
 func (s *Scheduler) dispatchReady(ctx context.Context, d *DAG) {
 	byID := make(map[string]*Task, len(d.Tasks))
 	for _, t := range d.Tasks {
@@ -267,24 +273,24 @@ func (s *Scheduler) dispatchReady(ctx context.Context, d *DAG) {
 	}
 	for _, t := range d.Tasks {
 		if t.Status != TaskStatusPending {
-			continue
+			continue // 已派发或已完成的不再处理
 		}
 		ready := true
 		for _, dep := range t.DependsOn {
 			if depT, ok := byID[dep]; ok {
 				if depT.Status != TaskStatusCompleted {
-					ready = false
+					ready = false // 任一依赖未完成，保持 pending
 					break
 				}
 			} else {
-				ready = false
+				ready = false // 依赖指向不存在的任务，保守不派发
 				break
 			}
 		}
 		if !ready {
 			continue
 		}
-		// 派发
+		// 派发：把 task.goal 作为新 session 的输入；sessionID 用于后续 MarkCompleted 回调
 		sid := s.launcher.LaunchSession(t.Goal)
 		t.SessionID = sid
 		t.Status = TaskStatusRunning
@@ -295,11 +301,13 @@ func (s *Scheduler) dispatchReady(ctx context.Context, d *DAG) {
 
 // MarkCompleted 标记某 DAG 中某 task 对应的 session 已完成。
 // 由 SessionManager 在 session 结束时调用，触发后续依赖任务。
+// 注意：参数 taskID 当前未使用，匹配靠 sessionID 唯一定位 task。
 func (s *Scheduler) MarkCompleted(dagID, taskID, sessionID string, success bool) {
 	s.mu.Lock()
 	d, ok := s.running[dagID]
 	s.mu.Unlock()
 	if !ok {
+		// DAG 已被清理或不在运行中：忽略回调，避免空指针
 		return
 	}
 	for _, t := range d.Tasks {
@@ -309,12 +317,12 @@ func (s *Scheduler) MarkCompleted(dagID, taskID, sessionID string, success bool)
 			if success {
 				t.Status = TaskStatusCompleted
 			} else {
-				t.Status = TaskStatusFailed
+				t.Status = TaskStatusFailed // 失败标记让下游依赖永远不会 ready
 			}
 			break
 		}
 	}
-	// 推进后续依赖
+	// 推进后续依赖：依赖本 task 的 pending 任务，若其他依赖也都完成，会被 dispatchReady 派发
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s.dispatchReady(ctx, d)

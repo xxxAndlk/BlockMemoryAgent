@@ -192,6 +192,9 @@ func (c *Config) applyDefaults() {
 	}
 
 	// —— Agent 运行时参数默认值 ——
+	// 约定：所有数值字段以 0 表示"未配置"，按字段语义填充默认。
+	// 因此配置侧无法把任一项显式设为 0；如需禁用某参数，请改用对应的
+	// 布尔开关（如 InterruptEnabled）而非将其置 0。
 	if c.Agent.MaxSteps == 0 {
 		c.Agent.MaxSteps = 200
 	}
