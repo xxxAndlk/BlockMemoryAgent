@@ -19,6 +19,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/dag"         // DAG 调度（特性1）
 	"github.com/blockmemory/agent/backend/internal/embed"       // 伪嵌入（特性3/4 共享）
 	"github.com/blockmemory/agent/backend/internal/graph"       // 三层图构建与节点
+	"github.com/blockmemory/agent/backend/internal/logging"     // 日志文件按天分割
 	"github.com/blockmemory/agent/backend/internal/memory"      // 快照管理器 + 块记忆伪嵌入
 	"github.com/blockmemory/agent/backend/internal/model"       // 模型工厂
 	"github.com/blockmemory/agent/backend/internal/runtime"     // 运行时聚合（看板/邮箱/Skill/Soul/Watchdog）
@@ -57,6 +58,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err) // 配置加载失败不可恢复
 	}
+
+	// 日志文件输出（浏览器入口）：按天分割到 logs/browser-YYYY-MM-DD.log
+	// 失败不 fatal：文件日志缺失时仍用 stderr，保证服务可启动
+	if cfg.Logging.Enabled {
+		if _, err := logging.Init(logging.EntryBrowser, cfg.Logging.Dir); err != nil {
+			log.Printf("warning: init file logging: %v (stderr-only)", err)
+		} else {
+			defer logging.Close() // 进程退出时关闭文件句柄
+		}
+	}
+	log.Printf("BlockMemoryAgent browser entry starting, log dir=%s", cfg.Logging.Dir)
 
 	// 根上下文，cancel 在收到信号时触发，用于通知后台任务退出
 	ctx, cancel := context.WithCancel(context.Background())

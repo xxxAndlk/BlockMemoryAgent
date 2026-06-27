@@ -18,6 +18,14 @@ type Config struct {
 	HTTP     HTTPConfig     `yaml:"http"`     // HTTP 服务监听与超时配置
 	Memory   MemoryConfig   `yaml:"memory"`   // 记忆管线运行参数（批写/刷新/快照间隔）
 	Agent    AgentConfig    `yaml:"agent"`    // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
+	Logging  LoggingConfig  `yaml:"logging"`  // 日志文件输出（按天分割，按入口分文件）
+}
+
+// LoggingConfig 日志文件输出配置。
+// 不同入口（浏览器 HTTP 服务 / TUI）写入独立文件，便于按入口排查问题。
+type LoggingConfig struct {
+	Dir     string `yaml:"dir"`      // 日志目录，空则默认 ./logs；自动按入口 + 日期生成文件名
+	Enabled bool   `yaml:"enabled"`  // 是否启用文件日志；false 时仅输出到 stderr
 }
 
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
@@ -227,6 +235,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Agent.DomainArchiveMaxWeight == 0 {
 		c.Agent.DomainArchiveMaxWeight = 100
+	}
+
+	// —— 日志默认值：默认目录 ./logs ——
+	if c.Logging.Dir == "" {
+		c.Logging.Dir = "logs"
 	}
 }
 

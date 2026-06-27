@@ -42,7 +42,7 @@ memory:
 agent:
   max_steps: 200                 # 图状态机最大步数（防死循环）
   skill_set_size: 8              # 每个 DomainAgent 装配的 Skill 子集上限
-  tool_call_max_rounds: 12       # Assistant ReAct 工具调用循环最大轮数
+  tool_call_max_rounds: 20       # Assistant ReAct 工具调用循环最大轮数
   retry_count: 3                 # Assistant 任务指数退避重试次数
   retry_backoff_ms: 100          # 重试初始退避时长（毫秒）
   llm_soft_timeout_sec: 30       # LLM 软超时（建议取消）
@@ -54,3 +54,10 @@ agent:
   human_clarify_timeout_sec: 120 # 等待用户回答超时（秒）
   domain_archive_ttl_hours: 168  # domainAgent 归档默认存活时长（7 天）
   domain_archive_max_weight: 100 # domainAgent 归档权重上限
+
+# 日志文件输出（按天分割，按入口分文件）
+# 浏览器入口 → logs/browser-YYYY-MM-DD.log
+# TUI 入口    → logs/tui-YYYY-MM-DD.log
+logging:
+  enabled: true                  # false 时仅输出到 stderr，不写文件
+  dir: logs                      # 日志目录，自动创建

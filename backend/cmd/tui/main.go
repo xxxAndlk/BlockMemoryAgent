@@ -21,6 +21,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/dag"
 	"github.com/blockmemory/agent/backend/internal/embed"
 	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/internal/logging"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
@@ -50,6 +51,17 @@ func main() {
 		log.Printf("warning: load config: %v; using defaults", err)
 		cfg = &config.Config{}
 	}
+
+	// 日志文件输出（TUI 入口）：按天分割到 logs/tui-YYYY-MM-DD.log
+	// 与浏览器入口分文件，便于按入口排查问题
+	if cfg.Logging.Enabled {
+		if _, err := logging.Init(logging.EntryTUI, cfg.Logging.Dir); err != nil {
+			log.Printf("warning: init file logging: %v (stderr-only)", err)
+		} else {
+			defer logging.Close()
+		}
+	}
+	log.Printf("BlockMemoryAgent TUI entry starting, log dir=%s", cfg.Logging.Dir)
 
 	ctx := context.Background()
 
