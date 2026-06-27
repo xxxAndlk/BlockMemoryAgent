@@ -133,7 +133,8 @@ func (m *Model) submitInput(cmd string) {
 
 	s := m.selectedSession()
 	if s == nil {
-		m.flashMsg("no session selected — type /new <goal>")
+		// No session yet: treat plain input as a new conversation goal.
+		m.createSession(cmd)
 		return
 	}
 

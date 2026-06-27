@@ -26,18 +26,19 @@ func (m Model) View() string {
 
 	mainRow := m.renderChat(m.width, contentH)
 
-	rows := []string{
-		m.renderTopBar(m.width),
-		mainRow,
-		m.renderInput(m.width),
-		m.renderTabs(m.width),
-	}
-
 	if m.flash != "" && time.Now().After(m.flashUntil) {
 		m.flash = ""
 	}
 
-	view := lipgloss.JoinVertical(lipgloss.Left, rows...)
+	// Join rows with exact placement: top bar, chat area, input bar, tabs.
+	// Each bordered row is forced to Height(3) so content never wraps and pushes
+	// the chat below the input bar.
+	view := lipgloss.JoinVertical(lipgloss.Top,
+		m.renderTopBar(m.width),
+		mainRow,
+		m.renderInput(m.width),
+		m.renderTabs(m.width),
+	)
 	if m.overlay != overlayNone {
 		overlay := m.renderOverlay(m.width, m.height-2)
 		view = lipgloss.JoinVertical(lipgloss.Left, view, overlay)
@@ -104,7 +105,7 @@ func (m Model) renderTopBar(w int) string {
 	if goal != "" {
 		text = strings.TrimRight(text, " ") + " │ " + m.styles.Dim.Render(truncate(goal, 40)) + " "
 	}
-	return m.styles.FocusBorder.Width(w).Render(strings.TrimRight(text, " "))
+	return m.styles.FocusBorder.Width(w).Height(3).Render(strings.TrimRight(text, " "))
 }
 
 func (m Model) renderChat(w, h int) string {
@@ -116,7 +117,7 @@ func (m Model) renderChat(w, h int) string {
 		lines = append(lines, "  "+m.styles.Dim.Render("No active session."))
 		lines = append(lines, "  "+m.styles.Dim.Render("Type /new <your goal> to start a conversation."))
 		// Pad to height.
-		return padLines(strings.Join(lines, "\n"), w, h)
+		return m.clipChat(strings.Join(lines, "\n"), w, h)
 	}
 
 	items := chatItems(s)
@@ -178,7 +179,13 @@ func (m Model) renderChat(w, h int) string {
 		lines = append(lines, "  "+m.styles.Dim.Render("(empty — send a message below)"))
 	}
 
-	return padLines(strings.Join(lines, "\n"), w, h)
+	return m.clipChat(strings.Join(lines, "\n"), w, h)
+}
+
+// clipChat applies a fixed Width/Height style so the borderless chat area
+// never grows beyond its allocated space and pushes the input bar down.
+func (m Model) clipChat(content string, w, h int) string {
+	return lipgloss.NewStyle().Width(w).Height(h).Render(content)
 }
 
 func (m Model) renderInput(w int) string {
@@ -205,7 +212,7 @@ func (m Model) renderInput(w int) string {
 	if m.focus == panelInput {
 		border = m.styles.FocusBorder
 	}
-	return border.Width(w).Render(left + text + flash)
+	return border.Width(w).Height(3).Render(left + text + flash)
 }
 
 func (m Model) renderTabs(w int) string {
@@ -260,19 +267,6 @@ func (m Model) renderOverlay(w, h int) string {
 	body := lipgloss.JoinVertical(lipgloss.Left, header+hint, content)
 	box := m.styles.Overlay.Width(boxW).Height(boxH).Render(body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
-}
-
-// padLines pads content with blank lines so it fills exactly h rows.
-// Used for the borderless chat panel.
-func padLines(content string, w, h int) string {
-	lines := strings.Split(content, "\n")
-	for len(lines) < h {
-		lines = append(lines, "")
-	}
-	if len(lines) > h {
-		lines = lines[len(lines)-h:]
-	}
-	return strings.Join(lines, "\n")
 }
 
 func truncate(s string, n int) string {

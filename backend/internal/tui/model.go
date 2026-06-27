@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"context"
 	"strings"
 	"time"
 	"unicode"
@@ -138,33 +137,9 @@ func (m *Model) refreshSessions() {
 	if m.sessionsCursor >= 0 && m.sessionsCursor < len(m.sessions) {
 		prevID = m.sessions[m.sessionsCursor].ID
 	}
+	// TUI only shows sessions created during this TUI run. Historical sessions
+	// are kept for Agent internal retrieval; they are not surfaced here.
 	m.sessions = m.sessionMgr.ListSessions()
-	if m.pgStore != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if recs, err := m.pgStore.RecentSessionHistories(ctx, 200); err == nil {
-			seen := make(map[string]bool)
-			for _, s := range m.sessions {
-				seen[s.ID] = true
-			}
-			for _, rec := range recs {
-				if seen[rec.SessionID] {
-					continue
-				}
-				endedAt := rec.CreatedAt
-				m.sessions = append(m.sessions, &server.Session{
-					ID:        rec.SessionID,
-					Goal:      rec.Goal,
-					Status:    "completed",
-					Result:    rec.Summary,
-					StartedAt: rec.CreatedAt,
-					EndedAt:   &endedAt,
-					Events:    make([]server.SessionEvent, 0),
-					Messages:  make([]types.ChatMessage, 0),
-				})
-			}
-		}
-	}
 	found := -1
 	for i, s := range m.sessions {
 		if s.ID == prevID {

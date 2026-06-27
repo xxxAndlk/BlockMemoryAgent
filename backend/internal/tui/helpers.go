@@ -29,25 +29,6 @@ func (m *Model) hasPlan() bool {
 	return len(b.Snapshot().Tasks) > 0
 }
 
-func (m *Model) planStats() (done, total int) {
-	s := m.selectedSession()
-	if s == nil || m.rt == nil || m.rt.Boards == nil {
-		return 0, 0
-	}
-	b := m.rt.Boards.Get(s.ID)
-	if b == nil {
-		return 0, 0
-	}
-	snap := b.Snapshot()
-	total = len(snap.Tasks)
-	for _, t := range snap.Tasks {
-		if t.Status == board.TaskDone {
-			done++
-		}
-	}
-	return done, total
-}
-
 // showChatDetail opens a popup with the full content of the selected chat item.
 func (m *Model) showChatDetail() {
 	s := m.selectedSession()
@@ -184,20 +165,128 @@ func (m *Model) buildAgentsLines() []string {
 }
 
 func chatItems(s *server.Session) []chatItem {
+	// TUI chat shows only the conversation: user / assistant / system messages.
+	// All Agent-internal events (think/intend/prompt/token_usage/tool_exec/...)
+	// are logged server-side, not surfaced here.
 	var items []chatItem
 	for _, msg := range s.Messages {
 		items = append(items, chatItem{
 			title:  fmt.Sprintf("[%s] %s", msg.Role, msg.Timestamp.Format("15:04:05")),
-			detail: msg.Content,
-		})
-	}
-	for _, ev := range s.Events {
-		items = append(items, chatItem{
-			title:  fmt.Sprintf("[%s] %s %s", ev.Type, ev.Agent, ev.Timestamp.Format("15:04:05")),
-			detail: ev.Message,
+			detail: formatMarkdown(msg.Content),
 		})
 	}
 	return items
+}
+
+// formatMarkdown applies light Markdown formatting for the chat view.
+// Supports: headers, bold, italic, inline code, code blocks, lists, blockquotes.
+func formatMarkdown(text string) string {
+	var out []string
+	var inCodeBlock bool
+	var codeBlock []string
+
+	mdHeader := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(cHeader))
+	mdBold := lipgloss.NewStyle().Bold(true)
+	mdItalic := lipgloss.NewStyle().Italic(true)
+	mdCode := lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cValue))
+	mdCodeBlock := lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cValue)).Padding(0, 1)
+	mdDim := lipgloss.NewStyle().Foreground(lipgloss.Color(cDone))
+
+	flushCode := func() {
+		if len(codeBlock) == 0 {
+			return
+		}
+		out = append(out, mdCodeBlock.Render(strings.Join(codeBlock, "\n")))
+		codeBlock = nil
+	}
+
+	for _, raw := range strings.Split(text, "\n") {
+		line := raw
+		trimmed := strings.TrimSpace(line)
+
+		// Code fence
+		if strings.HasPrefix(trimmed, "```") {
+			if inCodeBlock {
+				flushCode()
+				inCodeBlock = false
+			} else {
+				inCodeBlock = true
+			}
+			continue
+		}
+		if inCodeBlock {
+			codeBlock = append(codeBlock, line)
+			continue
+		}
+
+		// Header
+		if strings.HasPrefix(trimmed, "#") {
+			level := 0
+			for level < len(trimmed) && trimmed[level] == '#' {
+				level++
+			}
+			if level > 0 && (level == len(trimmed) || trimmed[level] == ' ') {
+				content := strings.TrimSpace(trimmed[level:])
+				content = applyInlineMarkdown(content, mdBold, mdItalic, mdCode)
+				out = append(out, mdHeader.Render(content))
+				continue
+			}
+		}
+
+		// Blockquote
+		if strings.HasPrefix(trimmed, ">") {
+			content := strings.TrimSpace(strings.TrimPrefix(trimmed, ">"))
+			content = applyInlineMarkdown(content, mdBold, mdItalic, mdCode)
+			out = append(out, mdDim.Render("┃ "+content))
+			continue
+		}
+
+		// List item
+		if strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "*") || strings.HasPrefix(trimmed, "+") {
+			if len(trimmed) > 1 && trimmed[1] == ' ' {
+				content := strings.TrimSpace(trimmed[1:])
+				content = applyInlineMarkdown(content, mdBold, mdItalic, mdCode)
+				out = append(out, mdDim.Render("• ")+content)
+				continue
+			}
+		}
+
+		// Plain line
+		line = applyInlineMarkdown(line, mdBold, mdItalic, mdCode)
+		out = append(out, line)
+	}
+	flushCode()
+
+	return strings.Join(out, "\n")
+}
+
+// applyInlineMarkdown handles **bold**, *italic*, and `inline code`.
+func applyInlineMarkdown(text string, bold, italic, code lipgloss.Style) string {
+	// Inline code
+	text = replacePairs(text, "`", func(s string) string { return code.Render(s) })
+	// Bold
+	text = replacePairs(text, "**", func(s string) string { return bold.Render(s) })
+	// Italic (single asterisks not already consumed by bold)
+	text = replacePairs(text, "*", func(s string) string { return italic.Render(s) })
+	return text
+}
+
+// replacePairs replaces matching pairs of markers with the result of f(content).
+func replacePairs(text, marker string, f func(string) string) string {
+	for {
+		start := strings.Index(text, marker)
+		if start == -1 {
+			break
+		}
+		end := strings.Index(text[start+len(marker):], marker)
+		if end == -1 {
+			break
+		}
+		end += start + len(marker)
+		content := text[start+len(marker) : end]
+		text = text[:start] + f(content) + text[end+len(marker):]
+	}
+	return text
 }
 
 func statusIcon(status string) string {
@@ -214,20 +303,5 @@ func statusIcon(status string) string {
 		return "◦"
 	default:
 		return "◦"
-	}
-}
-
-func statusColor(styles *Styles, status string) lipgloss.Style {
-	switch status {
-	case "running", string(types.RoleStatusActive), string(board.TaskInProgress):
-		return styles.TreeActive
-	case "awaiting_clarify", string(types.RoleStatusWaiting), string(board.TaskBlocked):
-		return styles.LogWarn
-	case "completed", string(board.TaskDone):
-		return styles.TreeDone
-	case "error", string(board.TaskFailed):
-		return styles.LogError
-	default:
-		return styles.Dim
 	}
 }
