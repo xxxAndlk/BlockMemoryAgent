@@ -729,6 +729,13 @@ func (n *DomainAgentNode) callLLMAs(ctx context.Context, caller string, prompt s
 			"")
 	}
 
+	// 推送 LLM 响应摘要调试事件（500 字截断），便于排查任务拆解/子任务结果
+	if resp != "" {
+		n.emitDetail(ctx, "llm_response",
+			fmt.Sprintf("[%s] LLM 响应 (%d 字符)", caller, len(resp)),
+			model.SummarizePrompt(resp, 500))
+	}
+
 	return resp, callErr, timedOut
 }
 

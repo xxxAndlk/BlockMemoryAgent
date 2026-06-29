@@ -261,7 +261,12 @@ func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 
 	for _, session := range targets {
 		// 释放锁后再写入事件，避免 RLock+Lock 自死锁
-		m.addEvent(session, "tool_exec", "ToolExecutor", fmt.Sprintf("执行工具: %s", result.Tool),
+		// message 含工具名 + 入参摘要，便于日志定位工具调用上下文
+		msg := fmt.Sprintf("执行工具: %s (path=%s)", result.Tool, result.Path)
+		if result.ArgsJSON != "" {
+			msg = fmt.Sprintf("执行工具: %s 入参=%s", result.Tool, result.ArgsJSON)
+		}
+		m.addEvent(session, "tool_exec", "ToolExecutor", msg,
 			"", result.Tool, result.Path, result.Output, result.Error, result.Success)
 	}
 }
@@ -1295,6 +1300,8 @@ func (m *SessionManager) resumeSession(session *Session) {
 
 	// 用轻量模型把历史对话总结为清晰的目标描述，避免直接塞 raw history 让 MetaAgent 误判
 	// 模型调用失败视为系统级故障，中止续话并将会话置为 error
+	m.addEvent(session, "llm", "LightweightModel",
+		fmt.Sprintf("续话：调用轻量模型总结历史对话 (%d 字符)", history.Len()), "", "", "", "", "", false)
 	goal, err := m.summarizeHistoryForGoal(ctx, session.ID, history.String())
 	if err != nil {
 		m.mu.Lock()
@@ -1307,6 +1314,8 @@ func (m *SessionManager) resumeSession(session *Session) {
 		log.Printf("[%s] resumeSession aborted: %v", session.ID, err)
 		return
 	}
+	m.addEvent(session, "think", "LightweightModel",
+		"续话：历史对话已总结为目标: "+goal, "", "", "", "", "", false)
 
 	state := types.NewThreeLayerState(session.ID)
 	state.DomainGoal = goal               // 轻量模型总结后的目标

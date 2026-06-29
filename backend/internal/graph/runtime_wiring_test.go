@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/skill"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
@@ -53,6 +54,12 @@ func TestThreeLayerGraph_RuntimeWired(t *testing.T) {
 	factory := NewRoleFactory(registry, nil, cfg)
 
 	rt := runtime.New(soulPath, skill.BuiltinPool())
+	// 注入 AgentConfig，提供死循环防护三项必需参数 (StallSteps/MaxRepeatFingerprint/SessionTimeoutMin)
+	rt.SetAgentConfig(&config.AgentConfig{
+		StallSteps:           30,
+		MaxRepeatFingerprint: 3,
+		SessionTimeoutMin:    60,
+	})
 
 	meta := NewMetaAgentNode(registry, factory, cfg.MetaAgent.MaxBlocks, cfg.MetaAgent.SummaryInterval)
 	meta.SetRuntime(rt)

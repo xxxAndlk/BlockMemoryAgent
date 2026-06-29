@@ -312,13 +312,18 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		next := g.determineNext(current, state)
 
 		// 推送图步骤调试事件（每个 tick 都推，便于 TUI / Web 调试）
+		// message 含步号/节点跳转/action；detail 含 state 关键字段变化，便于定位循环卡点
 		if g.progress != nil {
 			g.progress(ctx, ProgressEvent{
 				SessionID: state.SessionID,
 				Kind:      "graph_step",
 				Agent:     "Graph",
-				Message:   fmt.Sprintf("Step %d: %s → %s (action=%s)", stepCount, current, next, state.NextAction),
-				Detail:    fmt.Sprintf("block=%s domain=%s calling=%v", state.CurrentBlockID, state.CurrentDomain, state.IsCalling()),
+				Message: fmt.Sprintf("Step %d: %s → %s (action=%s, domain=%s, block=%s, stack=%d)",
+					stepCount, current, next, state.NextAction,
+					state.CurrentDomain, state.CurrentBlockID, len(state.CallStack)),
+				Detail: fmt.Sprintf("completed=%d active=%d roles=%d calling=%v clarify=%v",
+					len(state.CompletedBlocks), len(state.ActiveBlocks), len(state.RoleInstances),
+					state.IsCalling(), state.PendingClarify != nil),
 			})
 		}
 
@@ -332,12 +337,41 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		} else {
 			// 指纹未变
 			repeatCount++
+			// 渐进 warning：达 50% / 80% 阈值时推送，便于观察死循环形成过程
+			if g.progress != nil {
+				if repeatCount == maxRepeatFP/2 && maxRepeatFP >= 2 {
+					g.progress(ctx, ProgressEvent{
+						SessionID: state.SessionID, Kind: "wait", Agent: "Graph",
+						Message: fmt.Sprintf("⚠ 状态指纹连续 %d/%d 步重复 (节点=%s)，疑似死循环", repeatCount, maxRepeatFP, current),
+					})
+				} else if repeatCount == maxRepeatFP-1 && maxRepeatFP >= 2 {
+					g.progress(ctx, ProgressEvent{
+						SessionID: state.SessionID, Kind: "wait", Agent: "Graph",
+						Message: fmt.Sprintf("⚠⚠ 状态指纹连续 %d/%d 步重复，即将触发死循环终止", repeatCount, maxRepeatFP),
+					})
+				}
+			}
 			if repeatCount >= maxRepeatFP {
 				return nil, fmt.Errorf("检测到死循环：状态连续 %d 步无变化 (节点=%s)，状态机终止", repeatCount, current)
 			}
 		}
+		// 无进展步数渐进 warning：达 50% / 80% 阈值时推送
+		stallGap := stepCount - lastProgressStep
+		if g.progress != nil && stallGap > 0 {
+			if stallGap == stallSteps/2 && stallSteps >= 2 {
+				g.progress(ctx, ProgressEvent{
+					SessionID: state.SessionID, Kind: "wait", Agent: "Graph",
+					Message: fmt.Sprintf("⚠ 连续 %d/%d 步无进展 (节点=%s)，疑似卡死", stallGap, stallSteps, current),
+				})
+			} else if stallGap == stallSteps-1 && stallSteps >= 2 {
+				g.progress(ctx, ProgressEvent{
+					SessionID: state.SessionID, Kind: "wait", Agent: "Graph",
+					Message: fmt.Sprintf("⚠⚠ 连续 %d/%d 步无进展，即将触发死循环终止", stallGap, stallSteps),
+				})
+			}
+		}
 		// 无进展步数超阈值 → 判死循环
-		if stepCount-lastProgressStep >= stallSteps {
+		if stallGap >= stallSteps {
 			return nil, fmt.Errorf("检测到死循环：连续 %d 步无进展 (节点=%s)，状态机终止", stallSteps, current)
 		}
 

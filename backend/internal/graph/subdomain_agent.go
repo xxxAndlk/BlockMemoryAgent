@@ -506,6 +506,11 @@ func (n *SubDomainAgentNode) analyzeSubTasksWithLLM(ctx context.Context, subDoma
 			"")
 	}
 
+	// 推送 LLM 响应摘要调试事件（500 字截断），便于排查子任务拆解结果
+	n.emitDetail(ctx, "llm_response",
+		fmt.Sprintf("[%s] LLM 响应 (%d 字符)", caller, len(resp)),
+		model.SummarizePrompt(resp, 500))
+
 	// 解析响应：逐行清洗（去前缀 "- "/"* "、去 "1. " 编号），过滤过短行
 	var tasks []string
 	for _, line := range strings.Split(resp, "\n") {

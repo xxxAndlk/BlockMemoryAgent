@@ -33,6 +33,7 @@ type ToolResult struct {
 	Output    string `json:"output"`
 	Error     string `json:"error,omitempty"`
 	Path      string `json:"path,omitempty"`
+	ArgsJSON  string `json:"args_json,omitempty"` // 入参 JSON 摘要（截断），用于日志展示
 	SessionID string `json:"session_id,omitempty"` // 归属会话，避免跨会话事件泄漏
 }
 
@@ -152,6 +153,14 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	}
 	// 统一填入 sessionID，便于上层按会话过滤事件
 	result.SessionID = sessionID
+	// 统一填入入参 JSON 摘要（截断 300 字），便于日志展示工具调用上下文
+	if argsJSON, mErr := json.Marshal(args); mErr == nil {
+		argsStr := string(argsJSON)
+		if len(argsStr) > 300 {
+			argsStr = argsStr[:300] + "...(truncated)"
+		}
+		result.ArgsJSON = argsStr
+	}
 	// 回调通知（如 TUI 广播器）
 	if e.callback != nil {
 		e.callback(result)

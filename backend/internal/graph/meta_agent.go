@@ -346,10 +346,12 @@ func (n *MetaAgentNode) runWatchdog(ctx context.Context, state *types.ThreeLayer
 	switch d.Level {
 	case watchdog.LevelEvict:
 		// 不再强制升级结束会话；仅记录警告，让当前任务继续完成。
-		n.emitDetail(ctx, "wait", "Watchdog 触发 EVICT（上下文超硬阈值），已降级为警告，不中断会话: "+d.Reason, "")
+		n.emitDetail(ctx, "wait",
+			fmt.Sprintf("Watchdog 触发 EVICT（上下文 %d tokens 超硬阈值），已降级为警告，不中断会话: %s", d.Tokens, d.Reason), "")
 	case watchdog.LevelCompress:
-		// 接近软阈值：推送建议压缩提示
-		n.emit(ctx, "think", "Watchdog 提示上下文接近软阈值，建议后续压缩: "+d.Reason)
+		// 接近软阈值：推送建议压缩提示，携带实际 token 数
+		n.emit(ctx, "think",
+			fmt.Sprintf("Watchdog 提示上下文接近软阈值 (%d tokens)，建议后续压缩: %s", d.Tokens, d.Reason))
 	case watchdog.LevelWarn:
 		// 静默
 	}
@@ -1209,6 +1211,13 @@ func (n *MetaAgentNode) callLLMAs(ctx context.Context, caller string, prompt str
 		n.emitDetail(ctx, "token_usage",
 			fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", caller, last.InputTokens, last.OutputTokens, last.Duration.Round(time.Millisecond)),
 			"")
+	}
+
+	// 发送 LLM 响应摘要调试事件（500 字截断），便于排查决策依据
+	if resp != "" {
+		n.emitDetail(ctx, "llm_response",
+			fmt.Sprintf("[%s] LLM 响应 (%d 字符)", caller, len(resp)),
+			model.SummarizePrompt(resp, 500))
 	}
 
 	return resp, callErr, timedOut
