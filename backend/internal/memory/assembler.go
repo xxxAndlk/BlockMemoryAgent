@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -213,14 +214,14 @@ func (a *ContextAssembler) buildMessages(
 	}
 	// 以 system 角色注入约束段。
 	messages = append(messages, &graph.Message{
-		Role:    "system",
+		Role:    enums.ChatRoleSystem,
 		Content: systemContent,
 	})
 
 	// [TopicGlobal] 话题目标 + 当前状态：以 user 角色强化目标。
 	if topicMeta != nil {
 		messages = append(messages, &graph.Message{
-			Role:    "user",
+			Role:    enums.ChatRoleUser,
 			Content: fmt.Sprintf("Topic Goal: %s", topicMeta.Goal),
 		})
 	}
@@ -234,7 +235,7 @@ func (a *ContextAssembler) buildMessages(
 			content += fmt.Sprintf("- %s (v%d): %s\n", output.AgentID, output.Version, output.Summary)
 		}
 		messages = append(messages, &graph.Message{
-			Role:    "user",
+			Role:    enums.ChatRoleUser,
 			Content: content,
 		})
 	}
@@ -248,7 +249,7 @@ func (a *ContextAssembler) buildMessages(
 			content += fmt.Sprintf("- [%s] %s\n", rec.KnowledgeType, rec.Content)
 		}
 		messages = append(messages, &graph.Message{
-			Role:    "user",
+			Role:    enums.ChatRoleUser,
 			Content: content,
 		})
 	}
@@ -262,7 +263,7 @@ func (a *ContextAssembler) buildMessages(
 			content += fmt.Sprintf("- [%s] %s (importance: %.2f)\n", ep.StepID, ep.ObservationSummary, ep.Importance)
 		}
 		messages = append(messages, &graph.Message{
-			Role:    "user",
+			Role:    enums.ChatRoleUser,
 			Content: content,
 		})
 	}
@@ -276,14 +277,14 @@ func (a *ContextAssembler) buildMessages(
 			content += fmt.Sprintf("- %s: %s\n", issue.ID, issue.Description)
 		}
 		messages = append(messages, &graph.Message{
-			Role:    "user",
+			Role:    enums.ChatRoleUser,
 			Content: content,
 		})
 	}
 
 	// [Task] 当前任务：最后一条消息，明确本次调用需要 LLM 解决的问题。
 	messages = append(messages, &graph.Message{
-		Role:    "user",
+		Role:    enums.ChatRoleUser,
 		Content: fmt.Sprintf("Current task: %s", req.TaskQuery),
 	})
 

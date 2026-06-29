@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/embed"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -36,7 +37,7 @@ func (r *BlockMemoryRecord) ToKnowledgeRecord(dim int) *types.KnowledgeRecord {
 		"goal":       r.Goal,
 	}
 	return &types.KnowledgeRecord{
-		KnowledgeType: "block_memory",
+		KnowledgeType: enums.KnowledgeTypeBlockMemory,
 		TopicID:       r.SessionID,
 		Content:       content,
 		Embedding:     embed.PseudoEmbed(content, dim),

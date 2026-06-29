@@ -13,6 +13,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/soul"
 	"github.com/blockmemory/agent/backend/internal/watchdog"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -285,14 +286,14 @@ func (n *MetaAgentNode) drainCommandQueue(ctx context.Context, state *types.Thre
 			state.Reason = "interrupted by user"
 			// 追加为最新用户消息：LLM 在新 handleInitial 中会读到这条消息作为输入
 			state.Messages = append(state.Messages, types.ChatMessage{
-				Role: "user", Content: it.Content, Timestamp: time.Now(),
+				Role: enums.ChatRoleUser, Content: it.Content, Timestamp: time.Now(),
 			})
 			return true
 		default: // IntentEnqueue
 			// 仅追加消息，不重置状态；当前 tick 继续，下个 tick 起各 Agent 会读到新消息
 			n.emit(ctx, "intend", "队列注入：追加用户指令到当前上下文")
 			state.Messages = append(state.Messages, types.ChatMessage{
-				Role: "user", Content: it.Content, Timestamp: time.Now(),
+				Role: enums.ChatRoleUser, Content: it.Content, Timestamp: time.Now(),
 			})
 		}
 	}
@@ -535,7 +536,7 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 			n.emit(ctx, "intend", "LLM 路由判定为简单问题，直接调用 LLM 回答")
 			answer, err, timedOut := n.callLLM(ctx, fmt.Sprintf(
 				`你是BlockMemoryAgent，一个基于大语言模型的本地AI开发助手。
-请直接回答用户的简单问题，保持简洁友好。
+请直接回答用户的简单问题，保持简洁友好。回答请控制在 2000 字以内，确保核心结论完整。
 %s
 用户问题：%s
 
@@ -571,7 +572,7 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 			`你是BlockMemoryAgent，一个基于大语言模型的本地AI开发助手，使用多Agent智能编排架构。
 你可以帮助用户：分析代码、操作文件、执行命令、搜索代码、编写程序等。
 
-请直接回答用户的简单问题，保持简洁友好。
+请直接回答用户的简单问题，保持简洁友好。回答请控制在 2000 字以内，确保核心结论完整。
 %s
 %s%s
 用户问题：%s
@@ -924,7 +925,7 @@ func (n *MetaAgentNode) finalizeSession(ctx context.Context, state *types.ThreeL
 各助手执行结果：
 %s
 
-请直接输出最终回答，不要加任何前缀或总结性语句。`, state.SessionSummary))
+请直接输出最终回答，不要加任何前缀或总结性语句。回答请控制在 2000 字以内，保留关键结论与必要细节。`, state.SessionSummary))
 		// 成功：替换为润色后的回答
 		if !timedOut && err == nil && resp != "" {
 			state.SessionSummary = resp // 替换为润色后的回答

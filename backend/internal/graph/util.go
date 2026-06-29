@@ -7,6 +7,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -89,6 +90,6 @@ type ContextPack struct {
 // Message 消息。
 // 轻量级消息结构，与 Eino SDK 解耦，便于在节点间传递。
 type Message struct {
-	Role    string // 角色：system / user / assistant
-	Content string // 消息内容
+	Role    enums.ChatRole // 角色：system / user / assistant
+	Content string         // 消息内容
 }

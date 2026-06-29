@@ -8,6 +8,7 @@ import (
 	"strings"        // 拼接 pgvector 的逗号分隔向量分量
 	"time"           // 时间戳与连接池生命周期管理
 
+	"github.com/blockmemory/agent/backend/pkg/enums" // 枚举常量
 	"github.com/blockmemory/agent/backend/pkg/types" // 领域模型 (Episode / Snapshot / KnowledgeRecord 等)
 	_ "github.com/lib/pq"                            // 注册 postgres 驱动,无需直接引用
 )
@@ -354,7 +355,7 @@ func (s *PostgresStore) SearchKnowledge(ctx context.Context, embedding []float32
 //   - knowledgeType：必填过滤条件
 //   - embedding：查询向量
 //   - topK：返回上限
-func (s *PostgresStore) SearchKnowledgeByType(ctx context.Context, knowledgeType string, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
+func (s *PostgresStore) SearchKnowledgeByType(ctx context.Context, knowledgeType enums.KnowledgeType, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
 	if topK <= 0 {
 		topK = 5
 	}

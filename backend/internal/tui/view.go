@@ -53,7 +53,7 @@ func (m Model) renderTopBar(w int) string {
 	status := "idle"
 	goal := ""
 	if s != nil {
-		status = s.Status
+		status = string(s.Status)
 		goal = s.Goal
 	}
 

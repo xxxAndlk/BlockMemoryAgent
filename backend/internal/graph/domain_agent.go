@@ -10,6 +10,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/skill"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -234,7 +235,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		n.emit(ctx, "think", "所有子任务已完成，汇总结果")
 		n.summarizeResults(state)                                            // 汇总写入 state.Reason
 		n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusDone)      // 标记实例完成
-		block.Status = "completed"                                            // 标记块完成
+		block.Status = enums.BlockStatusCompleted                            // 标记块完成
 		state.NextAction = types.ActionContinue                               // 交回 MetaAgent
 		return state, nil
 	}
@@ -256,7 +257,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	// 11. 汇总结果、标记完成、继续图循环（交回 MetaAgent 决策下一步）
 	n.summarizeResults(state)                                            // 汇总写入 state.Reason
 	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusDone)      // 标记实例完成
-	block.Status = "completed"                                            // 标记块完成
+	block.Status = enums.BlockStatusCompleted                            // 标记块完成
 	state.NextAction = types.ActionContinue                               // 交回 MetaAgent
 	return state, nil
 }

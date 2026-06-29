@@ -2,6 +2,8 @@ package types
 
 import (
 	"time"
+
+	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
 // Episode 结构化情节记录：一次 Agent 执行步骤的完整留痕。
@@ -61,27 +63,29 @@ type AgentOutput struct {
 }
 
 // EventType 工作区事件类型：刻画 Agent 间协作事件的语义分类。
-type EventType string
+// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
+type EventType = enums.EventType
 
 const (
 	// EventCrossModify 跨 Agent 修改事件：某 Agent 改动了他人负责的领域数据。
-	EventCrossModify EventType = "CrossModify"
+	EventCrossModify = enums.EventCrossModify
 	// EventDependencyMet 依赖满足事件：被等待的前置产物已就绪。
-	EventDependencyMet EventType = "DependencyMet"
+	EventDependencyMet = enums.EventDependencyMet
 	// EventEscalation 升级事件：将问题/上下文上抛给 MetaAgent 裁决。
-	EventEscalation EventType = "Escalation"
+	EventEscalation = enums.EventEscalation
 )
 
 // EventStatus 事件状态：事件在生命周期中的处理阶段。
-type EventStatus string
+// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
+type EventStatus = enums.EventStatus
 
 const (
 	// EventPending 待处理：事件已入队但尚未被消费。
-	EventPending EventStatus = "Pending"
+	EventPending = enums.EventPending
 	// EventProcessing 处理中：目标 Agent 已接收但未完成。
-	EventProcessing EventStatus = "Processing"
+	EventProcessing = enums.EventProcessing
 	// EventDone 已完成：事件处理结束，可归档。
-	EventDone EventStatus = "Done"
+	EventDone = enums.EventDone
 )
 
 // Event 工作区事件：跨 Agent 协作的原子语义消息，由 Mailbox 分发。
@@ -147,8 +151,8 @@ type Issue struct {
 
 // ChatMessage 对话消息：与用户/系统对话的逐条记录，用于上下文构造。
 type ChatMessage struct {
-	// Role 角色："user" / "assistant" / "system"。
-	Role string `json:"role"`
+	// Role 角色：ChatRoleSystem / ChatRoleUser / ChatRoleAssistant。
+	Role enums.ChatRole `json:"role"`
 	// Content 消息正文。
 	Content string `json:"content"`
 	// Timestamp 消息时间。
@@ -156,20 +160,20 @@ type ChatMessage struct {
 }
 
 // ActionType Graph 控制信号：三层图状态机的下一步动作语义。
-// 由各 Node 的 Invoke 返回，驱动 ThreeLayerGraph 的循环。
-type ActionType string
+// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
+type ActionType = enums.ActionType
 
 const (
 	// ActionContinue 继续：当前节点继续推进，不切换上下文。
-	ActionContinue ActionType = "Continue"
+	ActionContinue = enums.ActionContinue
 	// ActionSwitch 切换：切换当前活跃 DomainAgent / SessionBlock。
-	ActionSwitch ActionType = "Switch"
+	ActionSwitch = enums.ActionSwitch
 	// ActionEscalate 升级：上抛给 MetaAgent 或 EscalationHandlerNode。
-	ActionEscalate ActionType = "Escalate"
+	ActionEscalate = enums.ActionEscalate
 	// ActionFinish 完成：结束整个 Graph 循环，进入收尾。
-	ActionFinish ActionType = "Finish"
+	ActionFinish = enums.ActionFinish
 	// ActionWait 等待：暂停 Graph 循环，等待外部输入（如人机对话答复）后由 server 侧恢复执行。
-	ActionWait ActionType = "Wait"
+	ActionWait = enums.ActionWait
 )
 
 // ClarifyRequest 人机对话请求：Agent 在执行中遇到需要用户确认的问题时挂起，
@@ -210,18 +214,18 @@ type GraphState struct {
 }
 
 // CompressionLevel 记忆压缩层级：4 级递进压缩，权衡细节与 Token 成本。
-// 见 internal/memory/compress.go。
-type CompressionLevel int
+// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
+type CompressionLevel = enums.CompressionLevel
 
 const (
 	// LevelRaw 完整原始记录：保留 FullObservation 等全部字段。
-	LevelRaw CompressionLevel = iota
+	LevelRaw = enums.LevelRaw
 	// LevelStandard 标准级：保留摘要 + Facts，丢弃 FullObservation。
-	LevelStandard
+	LevelStandard = enums.LevelStandard
 	// LevelCompact 紧凑级：仅保留一句话 Summary。
-	LevelCompact
+	LevelCompact = enums.LevelCompact
 	// LevelMarker 标记级：仅保留存在性标记，内容已不可读。
-	LevelMarker
+	LevelMarker = enums.LevelMarker
 )
 
 // TokenBudget Token 预算分配：上下文 4 段式拼接的 Token 上限配置。
@@ -270,8 +274,8 @@ type RelevanceScore struct {
 type KnowledgeRecord struct {
 	// ID 自增主键。
 	ID int64 `json:"id"`
-	// KnowledgeType 知识类型（如 playbook / postmortem / rule）。
-	KnowledgeType string `json:"knowledge_type"`
+	// KnowledgeType 知识类型（playbook / postmortem / rule / block_memory / domain_archive）。
+	KnowledgeType enums.KnowledgeType `json:"knowledge_type"`
 	// TopicID 关联话题，可空表示全局知识。
 	TopicID string `json:"topic_id,omitempty"`
 	// Content 知识正文。
@@ -296,8 +300,8 @@ type TopicMeta struct {
 	ID string `json:"id"`
 	// Goal 话题目标。
 	Goal string `json:"goal"`
-	// Status 话题状态（active / done / archived 等）。
-	Status string `json:"status"`
+	// Status 话题状态（active / done / archived）。
+	Status enums.TopicStatus `json:"status"`
 	// CreatedAt 创建时间。
 	CreatedAt time.Time `json:"created_at"`
 	// ExpiresAt 过期时间，可空表示不过期。
@@ -365,11 +369,11 @@ type EventPayload struct {
 	// ID 事件 ID。
 	ID string `json:"id"`
 	// Type 事件类型。
-	Type string `json:"type"`
+	Type EventType `json:"type"`
 	// Summary 事件摘要。
 	Summary string `json:"summary"`
 	// Status 事件状态。
-	Status string `json:"status"`
+	Status EventStatus `json:"status"`
 	// Priority 优先级。
 	Priority int `json:"priority"`
 }

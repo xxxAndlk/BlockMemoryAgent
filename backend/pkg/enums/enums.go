@@ -1,0 +1,332 @@
+// Package enums 集中定义项目所有结构体字段使用的枚举类型。
+//
+// 设计意图:
+//   - 把散落在 types / server / graph 等包中的字符串字面量与 iota 常量统一收敛到一处,
+//     作为单一可信源 (single source of truth),避免同一语义在不同包内出现多种写法
+//     (如 "running" vs "Running" vs "RUNNING")。
+//   - 每个枚举值都附详细中文注释,说明语义、触发场景与流转方向,提升可读性。
+//   - 类型全部以 typed string 形式定义,既保留 JSON 序列化的可读性,又获得编译期类型检查。
+//
+// 使用约定:
+//  1. struct 字段不再使用裸 string,而是引用本包的具体枚举类型 (如 SessionStatus / ChatRole)。
+//  2. 赋值时使用枚举常量,不要硬编码字符串字面量。
+//  3. 与外部系统 (HTTP / DB / YAML) 交互时,枚举值的字符串形式即协议字面量,
+//     修改常量值等同于破坏协议,需同步迁移存量数据。
+package enums
+
+// ============================================================
+// 1. Graph 控制信号
+// ============================================================
+
+// ActionType Graph 控制信号:三层图状态机的下一步动作语义。
+// 由各 Node 的 Invoke 返回,驱动 ThreeLayerGraph 的循环。
+// 修改值等同于改变 Graph 状态机协议,需同步 ThreeLayerGraph.determineNext 路由逻辑。
+type ActionType string
+
+const (
+	// ActionContinue 继续:当前节点继续推进,不切换上下文。
+	// 典型场景:DomainAgent 内部多步 ReAct 循环未结束,需要继续执行下一步。
+	ActionContinue ActionType = "Continue"
+
+	// ActionSwitch 切换:切换当前活跃 DomainAgent / SessionBlock。
+	// 典型场景:MetaAgent 完成一个领域的子任务后,切到下一个领域继续执行。
+	ActionSwitch ActionType = "Switch"
+
+	// ActionEscalate 升级:上抛给 MetaAgent 或 EscalationHandlerNode 仲裁。
+	// 典型场景:DomainAgent 遇到无法决策的歧义、超出权限的操作、或检测到跨域冲突。
+	ActionEscalate ActionType = "Escalate"
+
+	// ActionFinish 完成:结束整个 Graph 循环,进入收尾。
+	// 典型场景:所有领域子任务完成,MetaAgent 汇总结果后返回。
+	ActionFinish ActionType = "Finish"
+
+	// ActionWait 等待:暂停 Graph 循环,等待外部输入 (如人机对话答复) 后由 server 侧恢复执行。
+	// 典型场景:Agent 触发 ClarifyRequest,Graph 返回此信号挂起,server 把会话置为 awaiting_clarify。
+	ActionWait ActionType = "Wait"
+)
+
+// ============================================================
+// 2. 工作区事件
+// ============================================================
+
+// EventType 工作区事件类型:刻画 Agent 间协作事件的语义分类。
+// 由 Mailbox 分发,消费方按 Type 走不同处理分支。
+type EventType string
+
+const (
+	// EventCrossModify 跨 Agent 修改事件:某 Agent 改动了他人负责的领域数据。
+	// 触发场景:DomainAgent 写入了不属于自己领域的文件 / 状态。
+	// 处理:MetaAgent 介入仲裁,可能回滚或升级。
+	EventCrossModify EventType = "CrossModify"
+
+	// EventDependencyMet 依赖满足事件:被等待的前置产物已就绪。
+	// 触发场景:某 Agent 发布新版本输出后,通知等待该产物的下游 Agent。
+	EventDependencyMet EventType = "DependencyMet"
+
+	// EventEscalation 升级事件:将问题 / 上下文上抛给 MetaAgent 裁决。
+	// 触发场景:DomainAgent 自身无法解决,需要更高层决策。
+	// 注意:与 ActionEscalate 区分 — ActionEscalate 是 Graph 控制信号,
+	// EventEscalation 是 Mailbox 中流转的事件。
+	EventEscalation EventType = "Escalation"
+)
+
+// EventStatus 事件状态:事件在生命周期中的处理阶段。
+// 流转:Pending → Processing → Done。
+type EventStatus string
+
+const (
+	// EventPending 待处理:事件已入队但尚未被消费。
+	// 初始状态,Mailbox 接收事件后立即置此状态。
+	EventPending EventStatus = "Pending"
+
+	// EventProcessing 处理中:目标 Agent 已接收但未完成。
+	// 中间态,用于异常恢复时识别未完成的事件。
+	EventProcessing EventStatus = "Processing"
+
+	// EventDone 已完成:事件处理结束,可归档。
+	// 终态,Mailbox 不再投递此事件。
+	EventDone EventStatus = "Done"
+)
+
+// ============================================================
+// 3. 记忆压缩层级
+// ============================================================
+
+// CompressionLevel 记忆压缩层级:4 级递进压缩,权衡细节与 Token 成本。
+// 见 internal/memory/compress.go。
+// 层级关系:Raw > Standard > Compact > Marker (递进丢弃细节)。
+type CompressionLevel int
+
+const (
+	// LevelRaw 完整原始记录:保留 FullObservation 等全部字段。
+	// 用于近期高频访问的 Episode,保留完整上下文供回放。
+	LevelRaw CompressionLevel = iota
+
+	// LevelStandard 标准级:保留摘要 + Facts,丢弃 FullObservation。
+	// Episode 进入长期记忆后的默认层级,平衡可读性与成本。
+	LevelStandard
+
+	// LevelCompact 紧凑级:仅保留一句话 Summary。
+	// 长期未访问或重要性较低的 Episode 压缩到此级。
+	LevelCompact
+
+	// LevelMarker 标记级:仅保留存在性标记,内容已不可读。
+	// 仅用于"此 Episode 曾存在"的索引目的,不参与检索内容返回。
+	LevelMarker
+)
+
+// ============================================================
+// 4. 角色体系
+// ============================================================
+
+// RoleType 角色类型:四层 Agent 体系中的角色分类,决定实例化路径与生命周期管理。
+type RoleType string
+
+const (
+	// RoleTypeMeta 主 Agent / MetaAgent:顶层调度者,负责会话级任务分解与升级裁决。
+	// 全局唯一,每个会话一个 MetaAgent 实例。
+	RoleTypeMeta RoleType = "meta"
+
+	// RoleTypeDomain 会话块 Agent / DomainAgent:负责单一领域的子任务执行与会话块管理。
+	// 由 MetaAgent 按领域动态创建,会话内可存在多个。
+	RoleTypeDomain RoleType = "domain"
+
+	// RoleTypeSubDomain 子领域 Agent / SubDomainAgent:DomainAgent 进一步拆分的子领域执行者。
+	// 第三层,处理 DomainAgent 内部复杂子任务。
+	RoleTypeSubDomain RoleType = "subdomain"
+
+	// RoleTypeFixed 固定助手角色:由配置文件 (roles.yaml) 预定义,长期可复用。
+	// 跨会话存在,如 ReadFileAssistant / WriteFileAssistant 等工具型助手。
+	RoleTypeFixed RoleType = "fixed"
+
+	// RoleTypeDynamic 动态助手角色:由 LLM 在运行时按需创建,随任务结束消亡。
+	// DomainAgent 根据子任务特征让 LLM 决定创建何种助手。
+	RoleTypeDynamic RoleType = "dynamic"
+)
+
+// RoleLifecycle 角色生命周期:刻画角色实例的存活时长与回收策略。
+type RoleLifecycle string
+
+const (
+	// RoleLifecyclePermanent 永久型:固定角色,跨会话长期存在。
+	// 仅适用于 RoleTypeFixed,实例在进程生命周期内常驻。
+	RoleLifecyclePermanent RoleLifecycle = "permanent"
+
+	// RoleLifecycleSession 会话级:随会话结束自动消亡。
+	// 适用于 MetaAgent / DomainAgent,会话关闭时统一回收。
+	RoleLifecycleSession RoleLifecycle = "session"
+
+	// RoleLifecycleTask 任务级:单次任务完成后即回收。
+	// 适用于 SubDomainAgent / Dynamic Assistant,粒度最细,资源利用率最高。
+	RoleLifecycleTask RoleLifecycle = "task"
+)
+
+// RoleStatus 角色状态:实例在运行时状态机中的当前阶段。
+// 流转:Idle → Active → (Waiting | Calling) → Done | Error。
+type RoleStatus string
+
+const (
+	// RoleStatusIdle 空闲:已创建但未开始执行。
+	// 初始状态,实例化后默认置此状态,等待被调度。
+	RoleStatusIdle RoleStatus = "idle"
+
+	// RoleStatusActive 活跃:正在执行任务。
+	// 运行中状态,LLM 调用 / 工具执行时置此状态。
+	RoleStatusActive RoleStatus = "active"
+
+	// RoleStatusWaiting 等待:阻塞等待依赖 / 外部事件。
+	// 如等待其他 Agent 输出、等待人机对话答复。
+	RoleStatusWaiting RoleStatus = "waiting"
+
+	// RoleStatusCalling 调用中:正在调用下层助手角色。
+	// DomainAgent 调用 SubDomainAgent / Assistant 时置此状态。
+	RoleStatusCalling RoleStatus = "calling"
+
+	// RoleStatusDone 完成:任务已成功结束。
+	// 终态,实例不再参与调度,可被归档。
+	RoleStatusDone RoleStatus = "done"
+
+	// RoleStatusError 错误:执行失败,需升级或重试。
+	// 终态,触发 ActionEscalate 上抛 MetaAgent 处理。
+	RoleStatusError RoleStatus = "error"
+)
+
+// ============================================================
+// 5. 会话与对话
+// ============================================================
+
+// SessionStatus 会话状态:Session 在生命周期中的当前阶段。
+// 见 internal/server/session.go。
+// 流转:running → (awaiting_clarify → running)* → completed | error。
+type SessionStatus string
+
+const (
+	// SessionStatusRunning 运行中:Graph 循环正在执行。
+	// 初始状态,会话创建后立即进入。
+	SessionStatusRunning SessionStatus = "running"
+
+	// SessionStatusCompleted 已完成:Graph 正常结束,所有子任务成功。
+	// 终态,前端可展示结果。
+	SessionStatusCompleted SessionStatus = "completed"
+
+	// SessionStatusError 错误:Graph 执行失败或超时。
+	// 终态,前端展示错误信息。
+	SessionStatusError SessionStatus = "error"
+
+	// SessionStatusAwaitingClarify 等待澄清:Graph 因 ActionWait 挂起,等待用户答复。
+	// 中间态,用户通过 /clarify 提交答复后回到 running。
+	SessionStatusAwaitingClarify SessionStatus = "awaiting_clarify"
+)
+
+// ChatRole 对话角色:ChatMessage 的角色分类,与 OpenAI Chat Completion 协议对齐。
+// 修改值等同于破坏 LLM API 协议。
+type ChatRole string
+
+const (
+	// ChatRoleSystem 系统消息:注入 LLM 上下文的系统指令 (soul.md / 角色定义)。
+	// 不直接展示给用户,作为 LLM 行为约束。
+	ChatRoleSystem ChatRole = "system"
+
+	// ChatRoleUser 用户消息:来自用户的输入。
+	// 触发 Agent 执行,作为任务目标来源。
+	ChatRoleUser ChatRole = "user"
+
+	// ChatRoleAssistant 助手消息:Agent 的回复。
+	// 作为 Agent 输出记录到对话历史,供后续轮次引用。
+	ChatRoleAssistant ChatRole = "assistant"
+)
+
+// ============================================================
+// 6. 会话块状态
+// ============================================================
+
+// BlockStatus 会话块状态:SessionBlock 在 DomainAgent 执行过程中的阶段。
+// 见 pkg/types/role.go SessionBlock.Status。
+// 流转:active → completed | failed。
+type BlockStatus string
+
+const (
+	// BlockStatusActive 活跃:DomainAgent 正在处理此会话块。
+	// 初始状态,DomainAgent 创建会话块后置此状态。
+	BlockStatusActive BlockStatus = "active"
+
+	// BlockStatusCompleted 已完成:DomainAgent 成功完成此会话块的所有子任务。
+	// 终态,会话块进入 CompletedBlocks 列表,不再参与调度。
+	BlockStatusCompleted BlockStatus = "completed"
+
+	// BlockStatusFailed 失败:DomainAgent 执行此会话块失败。
+	// 终态,触发升级或会话级错误处理。
+	BlockStatusFailed BlockStatus = "failed"
+)
+
+// ============================================================
+// 7. 角色调用结果
+// ============================================================
+
+// CallResult 角色调用结果状态:CallResponse.Status 的取值。
+// 父 Agent 据此判断是否需要重试或升级。
+type CallResult string
+
+const (
+	// CallResultSuccess 成功:被调用者正常完成并返回结果。
+	CallResultSuccess CallResult = "success"
+
+	// CallResultFailed 失败:被调用者执行出错或超时。
+	// 触发重试或 ActionEscalate 升级。
+	CallResultFailed CallResult = "failed"
+)
+
+// ============================================================
+// 8. 话题状态
+// ============================================================
+
+// TopicStatus 话题状态:TopicMeta.Status 的取值,描述话题生命周期。
+// 见 internal/memory/topic.go。
+// 流转:active → done → archived (可跳过 done 直接 archive)。
+type TopicStatus string
+
+const (
+	// TopicStatusActive 活跃:话题正在被 Agent 处理。
+	// 初始状态,话题创建后默认置此状态。
+	TopicStatusActive TopicStatus = "active"
+
+	// TopicStatusDone 完成:话题目标已达成,Agent 不再主动推进。
+	// 仍可被检索,但不再参与调度。
+	TopicStatusDone TopicStatus = "done"
+
+	// TopicStatusArchived 已归档:话题长期未访问,转入冷存储。
+	// 默认检索不返回,需显式查询归档话题。
+	TopicStatusArchived TopicStatus = "archived"
+)
+
+// ============================================================
+// 9. 知识库类型
+// ============================================================
+
+// KnowledgeType 知识库类型:KnowledgeRecord.KnowledgeType 的取值,
+// 用于在 global_knowledge 表中按类型分类检索。
+// 见 internal/store/postgres.go SearchKnowledgeByType。
+// 修改值等同于破坏 DB 协议,需同步迁移存量数据。
+type KnowledgeType string
+
+const (
+	// KnowledgeTypePlaybook 运维手册:AIOps 场景下沉淀的标准操作流程。
+	// 检索命中后作为 Agent 处理类似告警的参考步骤。
+	KnowledgeTypePlaybook KnowledgeType = "playbook"
+
+	// KnowledgeTypePostmortem 事故复盘:故障事后总结,记录根因与改进措施。
+	// 供未来类似故障参考,避免重复踩坑。
+	KnowledgeTypePostmortem KnowledgeType = "postmortem"
+
+	// KnowledgeTypeRule 业务规则:领域专家输入的硬性约束与规则。
+	// 作为 Agent 决策的不可违反前提。
+	KnowledgeTypeRule KnowledgeType = "rule"
+
+	// KnowledgeTypeBlockMemory 块记忆:DomainAgent 完成后归档的领域级摘要。
+	// 见 internal/memory/block_vector.go,跨会话复用 DomainAgent 经验。
+	KnowledgeTypeBlockMemory KnowledgeType = "block_memory"
+
+	// KnowledgeTypeDomainArchive 领域归档:DomainAgent 完成后持久化的跨会话信息。
+	// 见 internal/store/domain_archive.go,与 block_memory 区别在于粒度更粗。
+	KnowledgeTypeDomainArchive KnowledgeType = "domain_archive"
+)

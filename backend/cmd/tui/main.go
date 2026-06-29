@@ -29,6 +29,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/store"
 	"github.com/blockmemory/agent/backend/internal/tui"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -243,7 +244,7 @@ func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, d
 	content := fmt.Sprintf("领域:%s\n目标:%s\n摘要:%s", domain, goal, summary)
 	emb := embed.PseudoEmbed(content, a.dim)
 	return a.pg.SaveKnowledge(ctx, &types.KnowledgeRecord{
-		KnowledgeType: "block_memory",
+		KnowledgeType: enums.KnowledgeTypeBlockMemory,
 		TopicID:       sessionID,
 		Content:       content,
 		Embedding:     emb,
@@ -253,7 +254,7 @@ func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, d
 
 func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, query string, topK int) (string, error) {
 	emb := embed.PseudoEmbed(query, a.dim)
-	recs, err := a.pg.SearchKnowledgeByType(ctx, "block_memory", emb, topK)
+	recs, err := a.pg.SearchKnowledgeByType(ctx, enums.KnowledgeTypeBlockMemory, emb, topK)
 	if err != nil {
 		return "", err
 	}

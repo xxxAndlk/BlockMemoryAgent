@@ -6,6 +6,7 @@ import (
 	"fmt"           // 格式化错误与 key 拼接
 	"time"          // TTL 与时间戳解析
 
+	"github.com/blockmemory/agent/backend/pkg/enums" // 枚举常量
 	"github.com/blockmemory/agent/backend/pkg/types" // 领域模型 (TopicMeta / AgentOutput / Event / AgentSnapshot 等)
 	"github.com/redis/go-redis/v9"                   // Redis 客户端
 )
@@ -73,7 +74,7 @@ func (s *RedisStore) SaveTopicMeta(ctx context.Context, topic *types.TopicMeta) 
 	data := map[string]string{
 		"id":     topic.ID,
 		"goal":   topic.Goal,
-		"status": topic.Status,
+		"status": string(topic.Status),
 	}
 	if topic.CreatedAt.IsZero() {
 		// 零值时兜底为当前时间,避免写入空字符串
@@ -104,7 +105,7 @@ func (s *RedisStore) GetTopicMeta(ctx context.Context, topicID string) (*types.T
 	topic := &types.TopicMeta{
 		ID:     data["id"],
 		Goal:   data["goal"],
-		Status: data["status"],
+		Status: enums.TopicStatus(data["status"]),
 	}
 	// 解析创建时间,失败则保持零值
 	if t, err := time.Parse(time.RFC3339, data["created_at"]); err == nil {

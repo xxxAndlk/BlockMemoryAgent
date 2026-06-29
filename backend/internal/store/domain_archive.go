@@ -13,6 +13,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/embed"
 	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -48,7 +49,7 @@ func (s *PostgresStore) SaveDomainArchive(ctx context.Context, rec *graph.Domain
 	content := fmt.Sprintf("领域:%s\n目标:%s\n摘要:%s", rec.Domain, rec.Goal, rec.ContextSummary)
 	emb := embed.PseudoEmbed(content, 768)
 	krec := &types.KnowledgeRecord{
-		KnowledgeType: "domain_archive",
+		KnowledgeType: enums.KnowledgeTypeDomainArchive,
 		TopicID:       rec.SessionID,
 		Content:       content,
 		Embedding:     emb,
@@ -74,7 +75,7 @@ func (s *PostgresStore) SearchDomainArchive(ctx context.Context, domain, goal st
 	}
 	query := fmt.Sprintf("领域:%s\n目标:%s", domain, goal)
 	emb := embed.PseudoEmbed(query, 768)
-	recs, err := s.SearchKnowledgeByType(ctx, "domain_archive", emb, topK)
+	recs, err := s.SearchKnowledgeByType(ctx, enums.KnowledgeTypeDomainArchive, emb, topK)
 	if err != nil {
 		return nil, err
 	}

@@ -27,6 +27,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/skill"       // Skill 池加载
 	"github.com/blockmemory/agent/backend/internal/store"       // Postgres / Redis 存储
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config" // 角色配置（roles.yaml）
+	"github.com/blockmemory/agent/backend/pkg/enums"            // 枚举常量
 	"github.com/blockmemory/agent/backend/pkg/types"            // 公共类型（状态、节点接口）
 )
 
@@ -382,7 +383,7 @@ func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, d
 // 检索路径：query → 伪嵌入 → pgvector cosine 距离 ORDER BY → 取 topK → 拼成编号文本。
 func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, query string, topK int) (string, error) {
 	emb := embed.PseudoEmbed(query, a.dim)
-	recs, err := a.pg.SearchKnowledgeByType(ctx, "block_memory", emb, topK)
+	recs, err := a.pg.SearchKnowledgeByType(ctx, enums.KnowledgeTypeBlockMemory, emb, topK)
 	if err != nil {
 		return "", err
 	}

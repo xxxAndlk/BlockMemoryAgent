@@ -1,7 +1,7 @@
 package server
 
 import (
-	"context"      // 请求上下文与超时
+	"context"       // 请求上下文与超时
 	"encoding/json" // JSON 编解码
 	"fmt"           // 格式化输出
 	"log"           // 日志输出
@@ -14,9 +14,10 @@ import (
 	"time"          // 时间戳与超时
 
 	"github.com/blockmemory/agent/backend/internal/cmdqueue" // 用户指令队列（特性6）
-	"github.com/blockmemory/agent/backend/internal/graph" // Graph 引擎
-	"github.com/blockmemory/agent/backend/internal/store" // Postgres 存储
-	"github.com/blockmemory/agent/backend/pkg/types"      // 共享类型
+	"github.com/blockmemory/agent/backend/internal/graph"    // Graph 引擎
+	"github.com/blockmemory/agent/backend/internal/store"    // Postgres 存储
+	"github.com/blockmemory/agent/backend/pkg/enums"         // 枚举常量
+	"github.com/blockmemory/agent/backend/pkg/types"         // 共享类型
 )
 
 // Session 表示一次会话的完整运行时状态。
@@ -33,15 +34,15 @@ import (
 //   - Events: 事件流（含工具调用、思考、统计）
 //   - Messages: 对话消息（含 system / user / assistant）
 type Session struct {
-	ID        string                 `json:"id"`                   // 会话 ID（session-N）
-	Goal      string                 `json:"goal"`                 // 用户目标
-	Status    string                 `json:"status"`               // running / completed / error
-	Result    string                 `json:"result,omitempty"`     // 会话结果摘要
-	State     *types.ThreeLayerState `json:"state,omitempty"`      // 最终 Graph 状态
-	StartedAt time.Time              `json:"started_at"`           // 起始时间
-	EndedAt   *time.Time             `json:"ended_at,omitempty"`   // 结束时间（nil 表示未结束）
-	Events    []SessionEvent         `json:"events"`               // 事件流
-	Messages  []types.ChatMessage    `json:"messages"`             // 对话消息
+	ID        string                 `json:"id"`                 // 会话 ID（session-N）
+	Goal      string                 `json:"goal"`               // 用户目标
+	Status    enums.SessionStatus    `json:"status"`             // running / completed / error / awaiting_clarify
+	Result    string                 `json:"result,omitempty"`   // 会话结果摘要
+	State     *types.ThreeLayerState `json:"state,omitempty"`    // 最终 Graph 状态
+	StartedAt time.Time              `json:"started_at"`         // 起始时间
+	EndedAt   *time.Time             `json:"ended_at,omitempty"` // 结束时间（nil 表示未结束）
+	Events    []SessionEvent         `json:"events"`             // 事件流
+	Messages  []types.ChatMessage    `json:"messages"`           // 对话消息
 }
 
 // SessionEvent 是会话事件流的单个事件。
@@ -157,14 +158,14 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 		m.sessions[rec.SessionID] = &Session{
 			ID:        rec.SessionID,
 			Goal:      rec.Goal,
-			Status:    "completed",                       // 历史会话一律视为已完成
+			Status:    enums.SessionStatusCompleted, // 历史会话一律视为已完成
 			Result:    rec.Summary,
 			StartedAt: rec.CreatedAt,
 			EndedAt:   &endedAt,
-			Events:    make([]SessionEvent, 0),           // 历史会话事件流为空
+			Events:    make([]SessionEvent, 0), // 历史会话事件流为空
 			Messages: []types.ChatMessage{
-				{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},          // 模拟原始用户消息
-				{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},  // 模拟助手回复
+				{Role: enums.ChatRoleUser, Content: rec.Goal, Timestamp: rec.CreatedAt},         // 模拟原始用户消息
+				{Role: enums.ChatRoleAssistant, Content: rec.Summary, Timestamp: rec.CreatedAt}, // 模拟助手回复
 			},
 		}
 		// 让列表的 seq 不与未来创建冲突
@@ -207,7 +208,7 @@ func (m *SessionManager) evictCompletedSessions() {
 	}
 	var completed []kv
 	for id, s := range m.sessions {
-		if s.Status == "running" || s.EndedAt == nil {
+		if s.Status == enums.SessionStatusRunning || s.EndedAt == nil {
 			continue // 运行中不淘汰
 		}
 		completed = append(completed, kv{id, *s.EndedAt})
@@ -239,7 +240,7 @@ func (m *SessionManager) handleToolResult(result *graph.ToolResult) {
 	m.mu.RLock()
 	targets := make([]*Session, 0, 1) // 收集目标会话指针
 	for _, session := range m.sessions {
-		if session.Status != "running" {
+		if session.Status != enums.SessionStatusRunning {
 			continue // 跳过非运行中会话
 		}
 		// 优先按工具结果携带的 sessionID 精确匹配，未携带时保持原广播行为兜底
@@ -290,7 +291,7 @@ func (m *SessionManager) handleProgress(ctx context.Context, ev graph.ProgressEv
 	m.mu.RLock()
 	targets := make([]*Session, 0, 1) // 收集目标会话指针
 	for _, session := range m.sessions {
-		if session.Status != "running" {
+		if session.Status != enums.SessionStatusRunning {
 			continue // 跳过非运行中会话
 		}
 		// 优先按进度事件携带的 sessionID 精确匹配，未携带时保持原广播行为兜底
@@ -326,11 +327,11 @@ func (m *SessionManager) CreateSession(ctx context.Context, goal string) *Sessio
 	session := &Session{
 		ID:        sessionID,
 		Goal:      goal,
-		Status:    "running",                       // 初始状态为运行中
+		Status:    enums.SessionStatusRunning, // 初始状态为运行中
 		StartedAt: time.Now(),
-		Events:    make([]SessionEvent, 0),         // 空事件流
+		Events:    make([]SessionEvent, 0), // 空事件流
 		Messages: []types.ChatMessage{
-			{Role: "system", Content: "Goal: " + goal, Timestamp: time.Now()}, // 注入 system 消息
+			{Role: enums.ChatRoleSystem, Content: "Goal: " + goal, Timestamp: time.Now()}, // 注入 system 消息
 		},
 	}
 
@@ -404,7 +405,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	if err != nil {
 		// 失败：更新状态并写入 error 事件
 		m.mu.Lock()
-		session.Status = "error"
+		session.Status = enums.SessionStatusError
 		session.Result = err.Error()
 		now := time.Now()
 		session.EndedAt = &now
@@ -417,7 +418,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	// 保留运行态，等待用户通过 /api/sessions/{id}/clarify 提交答复后恢复执行。
 	if result.NextAction == types.ActionWait && result.PendingClarify != nil {
 		m.mu.Lock()
-		session.Status = "awaiting_clarify"
+		session.Status = enums.SessionStatusAwaitingClarify
 		session.State = result
 		m.mu.Unlock()
 		m.addEvent(session, "clarify", "MetaAgent",
@@ -428,7 +429,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 
 	// 成功：更新状态、结果、最终 State
 	m.mu.Lock()
-	session.Status = "completed"
+	session.Status = enums.SessionStatusCompleted
 	session.Result = result.SessionSummary
 	session.State = result
 	now := time.Now()
@@ -491,7 +492,7 @@ func (m *SessionManager) persistHistory(session *Session) {
 	rec := &store.SessionHistoryRecord{
 		SessionID:   session.ID,
 		Goal:        session.Goal,
-		Summary:     truncate(session.Result, 2000), // 摘要截断 2000 字
+		Summary:     session.Result, // 摘要长度由 MetaAgent 生成时限制（见 meta_agent.go 各 prompt）
 		ToolResults: toolResults,
 		CreatedAt:   time.Now(),
 	}
@@ -502,14 +503,19 @@ func (m *SessionManager) persistHistory(session *Session) {
 	}
 }
 
-// truncate 把字符串截断到指定长度，超出加省略后缀。
-// 参数：s - 原始字符串；n - 最大长度。
+// truncate 把字符串按 rune 截断到指定字数，超出加省略后缀。
+// 按 rune 切片避免 UTF-8 多字节字符（如中文）被从中段截断产生乱码。
+// 参数：s - 原始字符串；n - 最大 rune 数。
 // 返回值：string - 截断后的字符串。
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
 		return s // 未超长
 	}
-	return s[:n] + "...(truncated)"
+	return string(r[:n]) + "...(truncated)"
 }
 
 // addEvent 是 addEventDebug 的简化封装，省略调试字段。
@@ -525,16 +531,16 @@ func (m *SessionManager) addEvent(session *Session, eventType, agent, message, k
 // 并发安全：mu.Lock 保护 append。
 func (m *SessionManager) addEventDebug(session *Session, eventType, agent, message, kind, tool, toolPath, toolOutput, toolError string, success bool, prompt string, inputTokens, outputTokens int, detailJSON string) {
 	ev := SessionEvent{
-		Type:       eventType,
-		Agent:      agent,
-		Message:    message,
-		Kind:       kind,
-		Tool:       tool,
-		ToolPath:   toolPath,
-		ToolOutput: toolOutput,
-		ToolError:  toolError,
-		Success:    success,
-		Timestamp:  time.Now(),
+		Type:         eventType,
+		Agent:        agent,
+		Message:      message,
+		Kind:         kind,
+		Tool:         tool,
+		ToolPath:     toolPath,
+		ToolOutput:   toolOutput,
+		ToolError:    toolError,
+		Success:      success,
+		Timestamp:    time.Now(),
 		Prompt:       prompt,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
@@ -548,15 +554,15 @@ func (m *SessionManager) addEventDebug(session *Session, eventType, agent, messa
 	log.Printf("[%s] %s: %s", session.ID, agent, message) // 当前仅日志，SSE 由前端轮询模拟
 }
 
-// ---- HTTP Handlers ----
+// ---- HTTP 处理器 ----
 
-// HandleCreateSession POST /api/sessions
+// HandleCreateSession 处理 POST /api/sessions，创建并启动新会话。
 // 解析 goal 并创建会话，返回 Session 对象。
 // 参数：w / r - HTTP 标准参数。
 // 副作用：创建会话并异步启动 runSession。
 func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -564,11 +570,11 @@ func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Requ
 		Goal string `json:"goal"`
 	}
 	if err := DecodeJSONRequest(r.Body, &req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
 	if req.Goal == "" {
-		http.Error(w, "goal is required", http.StatusBadRequest)
+		http.Error(w, "目标 (goal) 不能为空", http.StatusBadRequest)
 		return
 	}
 
@@ -578,12 +584,12 @@ func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(session) // 返回 Session JSON
 }
 
-// HandleGetSession GET /api/sessions/{id}
+// HandleGetSession 处理 GET /api/sessions/{id}，返回单个会话详情。
 // 先查内存，未命中且配置了 Postgres 时回退到 session_history 表，返回最小记录。
 func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Path[len("/api/sessions/"):] // 截取 id
 	if id == "" {
-		http.Error(w, "session id required", http.StatusBadRequest)
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
 
@@ -597,20 +603,20 @@ func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request
 			session = &Session{
 				ID:        rec.SessionID,
 				Goal:      rec.Goal,
-				Status:    "completed",
+				Status:    enums.SessionStatusCompleted,
 				Result:    rec.Summary,
 				StartedAt: rec.CreatedAt,
 				EndedAt:   &endedAt,
 				Events:    make([]SessionEvent, 0),
 				Messages: []types.ChatMessage{
-					{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},
-					{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},
+					{Role: enums.ChatRoleUser, Content: rec.Goal, Timestamp: rec.CreatedAt},
+					{Role: enums.ChatRoleAssistant, Content: rec.Summary, Timestamp: rec.CreatedAt},
 				},
 			}
 		}
 	}
 	if session == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
 
@@ -618,7 +624,7 @@ func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(session)
 }
 
-// HandleListSessions GET /api/sessions
+// HandleListSessions 处理 GET /api/sessions，返回会话列表。
 // 返回会话列表：内存中的运行中 + 最近完成会话，叠加 Postgres 中更早的历史会话。
 // 内存未命中但 DB 有记录的会话以最小形态返回（goal/summary/result/time，无 events）。
 func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -644,14 +650,14 @@ func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Reque
 				all = append(all, &Session{
 					ID:        rec.SessionID,
 					Goal:      rec.Goal,
-					Status:    "completed",
+					Status:    enums.SessionStatusCompleted,
 					Result:    rec.Summary,
 					StartedAt: rec.CreatedAt,
 					EndedAt:   &endedAt,
 					Events:    make([]SessionEvent, 0),
 					Messages: []types.ChatMessage{
-						{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},
-						{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},
+						{Role: enums.ChatRoleUser, Content: rec.Goal, Timestamp: rec.CreatedAt},
+						{Role: enums.ChatRoleAssistant, Content: rec.Summary, Timestamp: rec.CreatedAt},
 					},
 				})
 			}
@@ -669,7 +675,7 @@ func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(all)
 }
 
-// HandleSessionBoard GET /api/sessions/{id}/board
+// HandleSessionBoard 处理 GET /api/sessions/{id}/board，返回任务看板。
 // 返回该会话的 TaskBoard 快照（领域子任务、约束、状态）。若无则返回 null。
 func (m *SessionManager) HandleSessionBoard(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
@@ -677,7 +683,7 @@ func (m *SessionManager) HandleSessionBoard(w http.ResponseWriter, r *http.Reque
 
 	session := m.GetSession(id)
 	if session == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
 
@@ -708,7 +714,7 @@ type agentNode struct {
 	BlockID   string `json:"block_id,omitempty"` // 所属 SessionBlock ID
 }
 
-// HandleSessionAgents GET /api/sessions/{id}/agents
+// HandleSessionAgents 处理 GET /api/sessions/{id}/agents，返回会话内角色实例。
 // 返回该会话所有 RoleInstance（带 RoleDefinition 名称），并附上对应 SessionBlock 的目标。
 func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
@@ -716,7 +722,7 @@ func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Requ
 
 	session := m.GetSession(id)
 	if session == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
 
@@ -763,7 +769,7 @@ func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// HandleSessionStream GET /api/sessions/{id}/stream
+// HandleSessionStream 处理 GET /api/sessions/{id}/stream，SSE 实时事件流。
 // SSE 长连接：先推送当前 session 全量快照，再轮询增量事件，直到会话结束或客户端断开。
 // 副作用：阻塞当前 goroutine 直到 session 结束或客户端断开。
 func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Request) {
@@ -772,7 +778,7 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 
 	session := m.GetSession(id)
 	if session == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
 
@@ -783,7 +789,7 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 
 	flusher, ok := w.(http.Flusher) // 断言 Flusher 接口
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		http.Error(w, "不支持流式输出", http.StatusInternalServerError)
 		return
 	}
 
@@ -816,9 +822,9 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 				flusher.Flush()
 			}
 
-			if session.Status != "running" {
+			if session.Status != enums.SessionStatusRunning {
 				// 推送 done 事件并退出
-				data, _ := json.Marshal(map[string]string{"type": "done", "status": session.Status})
+				data, _ := json.Marshal(map[string]string{"type": "done", "status": string(session.Status)})
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				flusher.Flush()
 				return
@@ -830,19 +836,19 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-// HandleSessionClarify POST /api/sessions/{id}/clarify
+// HandleSessionClarify 处理 POST /api/sessions/{id}/clarify，提交人机对话答复。
 // 特性5：人机对话 — 用户答复 Agent 提出的澄清问题。
 // 职责：将答复追加到会话消息，清空 PendingClarify，异步恢复 graph 执行。
 // 副作用：修改 session.Messages / Status / State；异步启动 resumeSession。
 func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
 	id = strings.TrimSuffix(id, "/clarify")
 	if id == "" {
-		http.Error(w, "session id required", http.StatusBadRequest)
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
 
@@ -851,11 +857,11 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 		QuestionID string `json:"question_id"`
 	}
 	if err := DecodeJSONRequest(r.Body, &req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
 	if req.Answer == "" {
-		http.Error(w, "answer is required", http.StatusBadRequest)
+		http.Error(w, "答复内容不能为空", http.StatusBadRequest)
 		return
 	}
 
@@ -863,17 +869,17 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 	session, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
-	if session.Status != "awaiting_clarify" {
+	if session.Status != enums.SessionStatusAwaitingClarify {
 		m.mu.Unlock()
-		http.Error(w, "session is not awaiting clarification", http.StatusBadRequest)
+		http.Error(w, "会话未处于等待澄清状态", http.StatusBadRequest)
 		return
 	}
 	// 追加用户答复到对话历史：前缀 "[澄清答复]" 让 LLM 在后续上下文中识别这是对悬停问题的回答
 	session.Messages = append(session.Messages, types.ChatMessage{
-		Role:      "user",
+		Role:      enums.ChatRoleUser,
 		Content:   "[澄清答复] " + req.Answer,
 		Timestamp: time.Now(),
 	})
@@ -882,7 +888,7 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 		session.State.PendingClarify = nil
 	}
 	// 切回 running 让其他端点（interrupt/enqueue）知道会话已恢复可被抢占
-	session.Status = "running"
+	session.Status = enums.SessionStatusRunning
 	// 直接 append 事件，避免 addEvent 再次取锁自死锁（此处已持 m.mu）
 	session.Events = append(session.Events, SessionEvent{
 		Type:      "clarify",
@@ -903,36 +909,36 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// HandleSessionInterrupt POST /api/sessions/{id}/interrupt
+// HandleSessionInterrupt 处理 POST /api/sessions/{id}/interrupt，抢占中断。
 // 特性6：抢占中断 — 用户暂停当前任务并以新指令重启。
 // 职责：把新指令作为 IntentInterrupt 推入会话队列；若会话已完成则直接以新指令恢复执行。
 // 副作用：写入 CmdQueue；可能异步启动 resumeSession。
 func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
 	id = strings.TrimSuffix(id, "/interrupt")
 	if id == "" {
-		http.Error(w, "session id required", http.StatusBadRequest)
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
 	var req struct {
 		Content string `json:"content"`
 	}
 	if err := DecodeJSONRequest(r.Body, &req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
 	if req.Content == "" {
-		http.Error(w, "content is required", http.StatusBadRequest)
+		http.Error(w, "内容不能为空", http.StatusBadRequest)
 		return
 	}
 
 	rt := m.graph.Runtime()
 	if rt == nil || rt.CmdQueue == nil {
-		http.Error(w, "command queue not available", http.StatusServiceUnavailable)
+		http.Error(w, "命令队列不可用", http.StatusServiceUnavailable)
 		return
 	}
 	// 先入队再判断会话状态，避免运行中会话被漏掉：MetaAgent 下个 tick Drain 时会拿到这条指令
@@ -942,7 +948,7 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 	session, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
 	// 直接 append 事件，避免 addEvent 再次取锁自死锁
@@ -956,7 +962,7 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 	wasRunning := session.Status == "running"
 	if !wasRunning {
 		// 已结束的会话需重新置 running 并清空 EndedAt，否则 resumeSession 会因状态不对跳过
-		session.Status = "running"
+		session.Status = enums.SessionStatusRunning
 		session.EndedAt = nil
 	}
 	m.mu.Unlock()
@@ -971,36 +977,36 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 	json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running"})
 }
 
-// HandleSessionEnqueue POST /api/sessions/{id}/enqueue
+// HandleSessionEnqueue 处理 POST /api/sessions/{id}/enqueue，队列注入消息。
 // 特性6：队列注入 — 用户在任务执行中追加指令，不中断当前流程。
 // 职责：把新指令作为 IntentEnqueue 推入会话队列；若会话已结束则按 /message 行为恢复。
 // 副作用：写入 CmdQueue；可能异步启动 resumeSession。
 func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
 	id = strings.TrimSuffix(id, "/enqueue")
 	if id == "" {
-		http.Error(w, "session id required", http.StatusBadRequest)
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
 	var req struct {
 		Content string `json:"content"`
 	}
 	if err := DecodeJSONRequest(r.Body, &req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
 	if req.Content == "" {
-		http.Error(w, "content is required", http.StatusBadRequest)
+		http.Error(w, "内容不能为空", http.StatusBadRequest)
 		return
 	}
 
 	rt := m.graph.Runtime()
 	if rt == nil || rt.CmdQueue == nil {
-		http.Error(w, "command queue not available", http.StatusServiceUnavailable)
+		http.Error(w, "命令队列不可用", http.StatusServiceUnavailable)
 		return
 	}
 	// 与 interrupt 同序：先入队，再判断是否需要 resume；enqueue 不重置上下文，仅追加消息
@@ -1010,7 +1016,7 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 	session, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
 	// 直接 append 事件，避免 addEvent 再次取锁自死锁
@@ -1024,7 +1030,7 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 	wasRunning := session.Status == "running"
 	if !wasRunning {
 		// 已结束会话：enqueue 退化为普通 message 恢复，重新置 running
-		session.Status = "running"
+		session.Status = enums.SessionStatusRunning
 		session.EndedAt = nil
 	}
 	m.mu.Unlock()
@@ -1038,19 +1044,19 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 	json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running"})
 }
 
-// HandleSessionMessage POST /api/sessions/{id}/message
+// HandleSessionMessage 处理 POST /api/sessions/{id}/message，向会话追加用户消息。
 // 向会话追加用户消息；若会话已结束则恢复执行。
 // 副作用：修改 session.Messages / Status / EndedAt；可能异步启动 resumeSession。
 func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
 		return
 	}
 
 	id := r.URL.Path[len("/api/sessions/"):]
 	id = id[:len(id)-len("/message")] // 剥离 /message 后缀
 	if id == "" {
-		http.Error(w, "session id required", http.StatusBadRequest)
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
 
@@ -1058,11 +1064,11 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 		Content string `json:"content"`
 	}
 	if err := DecodeJSONRequest(r.Body, &req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
 	if req.Content == "" {
-		http.Error(w, "content is required", http.StatusBadRequest)
+		http.Error(w, "内容不能为空", http.StatusBadRequest)
 		return
 	}
 
@@ -1070,21 +1076,28 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	session, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
-		// Session not in memory — may be a historical session restored from DB
-		// via RecentSessionHistories. Revive a minimal Session so the user can
-		// continue the conversation.
+		// 会话不在内存中 — 从数据库恢复完整会话（含工具调用过程）。
 		revived := m.reviveFromHistory(id)
 		if revived == nil {
-			http.Error(w, "session not found", http.StatusNotFound)
+			http.Error(w, "会话不存在", http.StatusNotFound)
 			return
 		}
 		m.mu.Lock()
 		session = revived
+	} else if session.Status == enums.SessionStatusCompleted && len(session.Events) == 0 && session.Result != "" {
+		// 启动时 RestoreSessions 加载的最小历史会话（无 Events），
+		// 续话前需替换为完整版本（含工具调用过程），否则 LLM 看不到历史工具结果会重复调用。
+		m.mu.Unlock()
+		revived := m.reviveFromHistory(id)
+		m.mu.Lock()
+		if revived != nil {
+			session = revived
+		}
 	}
 
 	// 追加用户消息与事件（直接 append，避免调用 addEvent 再次取锁自死锁）
 	session.Messages = append(session.Messages, types.ChatMessage{
-		Role:      "user",
+		Role:      enums.ChatRoleUser,
 		Content:   req.Content,
 		Timestamp: time.Now(),
 	})
@@ -1099,7 +1112,7 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	wasRunning := session.Status == "running"
 	if !wasRunning {
 		// 已结束会话：重新激活并异步恢复
-		session.Status = "running"
+		session.Status = enums.SessionStatusRunning
 		session.EndedAt = nil
 	}
 	m.mu.Unlock()
@@ -1112,9 +1125,16 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	json.NewEncoder(w).Encode(session)
 }
 
-// reviveFromHistory loads a minimal Session from session_history and inserts it
-// into m.sessions so it can be resumed. Caller must NOT hold m.mu. Returns nil
-// if the session is not in DB either.
+// reviveFromHistory 从 session_history 表加载会话并插入 m.sessions，
+// 恢复完整对话上下文（含工具调用过程），以便后续续话执行。
+// 调用方不得持有 m.mu；若数据库中也不存在则返回 nil。
+//
+// 恢复内容：
+//   - Events: 把 ToolResults 还原为 tool_exec 事件，前端可回放工具调用过程
+//   - Messages: user(goal) → 每个工具调用拼成 assistant 消息 → assistant(summary)
+//
+// 注意：ToolResults 中的 output 在持久化时已截断到 500 字（见 persistHistory），
+// 属于正常压缩，续话时 LLM 看到的是工具结果摘要而非完整原文。
 func (m *SessionManager) reviveFromHistory(id string) *Session {
 	if m.pgStore == nil {
 		return nil
@@ -1126,18 +1146,68 @@ func (m *SessionManager) reviveFromHistory(id string) *Session {
 		return nil
 	}
 	endedAt := rec.CreatedAt
+
+	// 还原 Events：每条 ToolResult → 一个 tool_exec 事件
+	events := make([]SessionEvent, 0, len(rec.ToolResults)+2)
+	for _, tr := range rec.ToolResults {
+		tool, _ := tr["tool"].(string)
+		path, _ := tr["path"].(string)
+		output, _ := tr["output"].(string)
+		toolErr, _ := tr["error"].(string)
+		ok, _ := tr["ok"].(bool)
+		events = append(events, SessionEvent{
+			Type:       "tool_exec",
+			Agent:      "Assistant",
+			Message:    fmt.Sprintf("调用工具 %s", tool),
+			Tool:       tool,
+			ToolPath:   path,
+			ToolOutput: output,
+			ToolError:  toolErr,
+			Success:    ok,
+			Timestamp:  rec.CreatedAt,
+		})
+	}
+
+	// 还原 Messages：user(goal) → 工具调用序列（assistant）→ assistant(summary)
+	msgs := make([]types.ChatMessage, 0, len(rec.ToolResults)+2)
+	msgs = append(msgs, types.ChatMessage{
+		Role:      enums.ChatRoleUser,
+		Content:   rec.Goal,
+		Timestamp: rec.CreatedAt,
+	})
+	for _, tr := range rec.ToolResults {
+		tool, _ := tr["tool"].(string)
+		path, _ := tr["path"].(string)
+		output, _ := tr["output"].(string)
+		toolErr, _ := tr["error"].(string)
+		content := fmt.Sprintf("调用工具 %s (path=%s)", tool, path)
+		if toolErr != "" {
+			content += "\n错误: " + toolErr
+		}
+		if output != "" {
+			content += "\n结果: " + output
+		}
+		msgs = append(msgs, types.ChatMessage{
+			Role:      enums.ChatRoleAssistant,
+			Content:   content,
+			Timestamp: rec.CreatedAt,
+		})
+	}
+	msgs = append(msgs, types.ChatMessage{
+		Role:      enums.ChatRoleAssistant,
+		Content:   rec.Summary,
+		Timestamp: rec.CreatedAt,
+	})
+
 	session := &Session{
 		ID:        rec.SessionID,
 		Goal:      rec.Goal,
-		Status:    "completed",
+		Status:    enums.SessionStatusCompleted,
 		Result:    rec.Summary,
 		StartedAt: rec.CreatedAt,
 		EndedAt:   &endedAt,
-		Events:    make([]SessionEvent, 0),
-		Messages: []types.ChatMessage{
-			{Role: "user", Content: rec.Goal, Timestamp: rec.CreatedAt},
-			{Role: "assistant", Content: rec.Summary, Timestamp: rec.CreatedAt},
-		},
+		Events:    events,
+		Messages:  msgs,
 	}
 	m.mu.Lock()
 	m.sessions[id] = session
@@ -1153,11 +1223,11 @@ func (m *SessionManager) resumeSession(session *Session) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute) // 恢复也用 10 分钟超时
 	defer cancel()
 
-	// 构建对话上下文（最近10条消息）
+	// 构建对话上下文（最近20条消息）
 	var history strings.Builder
 	start := 0
-	if len(session.Messages) > 10 {
-		start = len(session.Messages) - 10 // 仅取最后 10 条
+	if len(session.Messages) > 20 {
+		start = len(session.Messages) - 20 // 仅取最后 20 条
 	}
 	for _, msg := range session.Messages[start:] {
 		history.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content)) // 拼成 role: content 文本
@@ -1174,7 +1244,7 @@ func (m *SessionManager) resumeSession(session *Session) {
 	if err != nil {
 		// 失败：更新状态并写入 error 事件
 		m.mu.Lock()
-		session.Status = "error"
+		session.Status = enums.SessionStatusError
 		session.Result = err.Error()
 		now := time.Now()
 		session.EndedAt = &now
@@ -1186,7 +1256,7 @@ func (m *SessionManager) resumeSession(session *Session) {
 	// 特性5：人机对话挂起 — 恢复路径同样支持再次挂起
 	if result.NextAction == types.ActionWait && result.PendingClarify != nil {
 		m.mu.Lock()
-		session.Status = "awaiting_clarify"
+		session.Status = enums.SessionStatusAwaitingClarify
 		session.State = result
 		m.mu.Unlock()
 		m.addEvent(session, "clarify", "MetaAgent",
@@ -1197,13 +1267,13 @@ func (m *SessionManager) resumeSession(session *Session) {
 
 	// 成功：更新状态、结果、最终 State，并追加助手回复
 	m.mu.Lock()
-	session.Status = "completed"
+	session.Status = enums.SessionStatusCompleted
 	session.Result = result.SessionSummary
 	session.State = result
 	now := time.Now()
 	session.EndedAt = &now
 	session.Messages = append(session.Messages, types.ChatMessage{
-		Role:      "assistant",
+		Role:      enums.ChatRoleAssistant,
 		Content:   result.SessionSummary,
 		Timestamp: now,
 	})
@@ -1220,8 +1290,8 @@ func (m *SessionManager) resumeSession(session *Session) {
 	}
 
 	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", "", false)
-	m.persistHistory(session)        // 持久化历史
-	m.evictCompletedSessions()       // 淘汰旧会话，防 OOM
+	m.persistHistory(session)  // 持久化历史
+	m.evictCompletedSessions() // 淘汰旧会话，防 OOM
 }
 
 // HandleSessionMetrics GET /api/sessions/{id}/metrics — 会话级 LLM 统计
@@ -1232,7 +1302,7 @@ func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Req
 
 	session := m.GetSession(id)
 	if session == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
 
@@ -1264,14 +1334,14 @@ func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"session_id":   id,
-		"calls":        calls,
-		"timeouts":     timeouts,
-		"avg_duration": avgDur.Round(time.Millisecond).String(),
-		"max_duration": maxDur.Round(time.Millisecond).String(),
-		"input_tokens": inputTokens,
+		"session_id":    id,
+		"calls":         calls,
+		"timeouts":      timeouts,
+		"avg_duration":  avgDur.Round(time.Millisecond).String(),
+		"max_duration":  maxDur.Round(time.Millisecond).String(),
+		"input_tokens":  inputTokens,
 		"output_tokens": outputTokens,
-		"total_tokens": inputTokens + outputTokens,
+		"total_tokens":  inputTokens + outputTokens,
 	})
 }
 
@@ -1283,7 +1353,7 @@ func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Re
 
 	session := m.GetSession(id)
 	if session == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
 
@@ -1331,7 +1401,7 @@ func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Req
 
 	session := m.GetSession(id)
 	if session == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "会话不存在", http.StatusNotFound)
 		return
 	}
 
@@ -1367,14 +1437,14 @@ func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Req
 			msgs = append(msgs, map[string]any{
 				"id":         msg.ID,
 				"from":       msg.From,
-				"to":         "*",         // 广播邮件 to 字段统一为 *
+				"to":         "*", // 广播邮件 to 字段统一为 *
 				"type":       msg.Type,
 				"subject":    msg.Subject,
 				"body":       msg.Body,
 				"priority":   msg.Priority,
 				"status":     msg.Status,
 				"created_at": msg.CreatedAt,
-				"broadcast":  true,        // 标记为广播邮件
+				"broadcast":  true, // 标记为广播邮件
 			})
 		}
 	}

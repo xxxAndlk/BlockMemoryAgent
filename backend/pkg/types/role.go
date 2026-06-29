@@ -2,34 +2,38 @@ package types
 
 import (
 	"time"
+
+	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
 // RoleType 角色类型：四层 Agent 体系中的角色分类，决定实例化路径与生命周期管理。
-type RoleType string
+// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
+type RoleType = enums.RoleType
 
 const (
 	// RoleTypeMeta 主 Agent / MetaAgent：顶层调度者，负责会话级任务分解与升级裁决。
-	RoleTypeMeta RoleType = "meta"
+	RoleTypeMeta = enums.RoleTypeMeta
 	// RoleTypeDomain 会话块 Agent / DomainAgent：负责单一领域的子任务执行与会话块管理。
-	RoleTypeDomain RoleType = "domain"
+	RoleTypeDomain = enums.RoleTypeDomain
 	// RoleTypeSubDomain 子领域 Agent / SubDomainAgent：DomainAgent 进一步拆分的子领域执行者。
-	RoleTypeSubDomain RoleType = "subdomain"
+	RoleTypeSubDomain = enums.RoleTypeSubDomain
 	// RoleTypeFixed 固定助手角色：由配置文件（roles.yaml）预定义，长期可复用。
-	RoleTypeFixed RoleType = "fixed"
+	RoleTypeFixed = enums.RoleTypeFixed
 	// RoleTypeDynamic 动态助手角色：由 LLM 在运行时按需创建，随任务结束消亡。
-	RoleTypeDynamic RoleType = "dynamic"
+	RoleTypeDynamic = enums.RoleTypeDynamic
 )
 
 // RoleLifecycle 角色生命周期：刻画角色实例的存活时长与回收策略。
-type RoleLifecycle string
+// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
+type RoleLifecycle = enums.RoleLifecycle
 
 const (
 	// RoleLifecyclePermanent 永久型：固定角色，跨会话长期存在。
-	RoleLifecyclePermanent RoleLifecycle = "permanent"
+	RoleLifecyclePermanent = enums.RoleLifecyclePermanent
 	// RoleLifecycleSession 会话级：随会话结束自动消亡。
-	RoleLifecycleSession RoleLifecycle = "session"
+	RoleLifecycleSession = enums.RoleLifecycleSession
 	// RoleLifecycleTask 任务级：单次任务完成后即回收。
-	RoleLifecycleTask RoleLifecycle = "task"
+	RoleLifecycleTask = enums.RoleLifecycleTask
 )
 
 // RoleDefinition 角色定义（配置层面）：来自 roles.yaml 的静态角色模板。
@@ -106,21 +110,22 @@ type RoleInstance struct {
 }
 
 // RoleStatus 角色状态：实例在运行时状态机中的当前阶段。
-type RoleStatus string
+// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
+type RoleStatus = enums.RoleStatus
 
 const (
 	// RoleStatusIdle 空闲：已创建但未开始执行。
-	RoleStatusIdle RoleStatus = "idle"
+	RoleStatusIdle = enums.RoleStatusIdle
 	// RoleStatusActive 活跃：正在执行任务。
-	RoleStatusActive RoleStatus = "active"
+	RoleStatusActive = enums.RoleStatusActive
 	// RoleStatusWaiting 等待：阻塞等待依赖/外部事件。
-	RoleStatusWaiting RoleStatus = "waiting"
+	RoleStatusWaiting = enums.RoleStatusWaiting
 	// RoleStatusCalling 调用中：正在调用下层助手角色。
-	RoleStatusCalling RoleStatus = "calling"
+	RoleStatusCalling = enums.RoleStatusCalling
 	// RoleStatusDone 完成：任务已成功结束。
-	RoleStatusDone RoleStatus = "done"
+	RoleStatusDone = enums.RoleStatusDone
 	// RoleStatusError 错误：执行失败，需升级或重试。
-	RoleStatusError RoleStatus = "error"
+	RoleStatusError = enums.RoleStatusError
 )
 
 // CallRequest 角色间调用请求：父 Agent 向子 Agent 发起的结构化调用。
@@ -147,8 +152,8 @@ type CallResponse struct {
 	RequestID string `json:"request_id"`
 	// Result 结果文本摘要。
 	Result string `json:"result"`
-	// Status 状态："success" / "failed"。
-	Status string `json:"status"`
+	// Status 状态：CallResultSuccess / CallResultFailed。
+	Status enums.CallResult `json:"status"`
 	// Output 结构化公开输出，可空。
 	Output *AgentOutput `json:"output,omitempty"`
 }
@@ -164,8 +169,8 @@ type SessionBlock struct {
 	Domain string `json:"domain"`
 	// Goal 本块目标描述。
 	Goal string `json:"goal"`
-	// Status 本块状态（active / done / failed 等）。
-	Status string `json:"status"`
+	// Status 本块状态（active / completed / failed）。
+	Status enums.BlockStatus `json:"status"`
 	// Agents 该会话块内的角色实例 ID 列表。
 	Agents []string `json:"agents"`
 	// Events 本块累积的工作区事件。
