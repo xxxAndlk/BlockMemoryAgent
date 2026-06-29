@@ -7,7 +7,7 @@ export function kindTagType(kind?: string, type?: string): TagType {
   const k = kind || type || ''
   if (k === 'think') return 'warning'
   if (k === 'intend') return 'primary'
-  if (k === 'llm' || k === 'llm_result') return 'success'
+  if (k === 'llm' || k === 'llm_result' || k === 'llm_response') return 'success'
   if (k === 'tool_call') return 'primary'
   if (k === 'tool_result' || k === 'tool_exec') return 'success'
   if (k === 'error') return 'danger'
@@ -17,6 +17,7 @@ export function kindTagType(kind?: string, type?: string): TagType {
   if (k === 'wait') return 'warning'
   if (k === 'graph_step') return 'info'
   if (k === 'agent_done') return 'success'
+  if (k === 'clarify') return 'warning'
   return 'info'
 }
 
@@ -25,7 +26,7 @@ export function kindIcon(kind?: string, type?: string): string {
   const k = kind || type || ''
   if (k === 'think') return 'ChatLineRound'
   if (k === 'intend') return 'Aim'
-  if (k === 'llm' || k === 'llm_result') return 'MagicStick'
+  if (k === 'llm' || k === 'llm_result' || k === 'llm_response') return 'MagicStick'
   if (k === 'tool_call') return 'Tools'
   if (k === 'tool_result' || k === 'tool_exec') return 'Check'
   if (k === 'error') return 'CircleClose'
@@ -35,6 +36,7 @@ export function kindIcon(kind?: string, type?: string): string {
   if (k === 'wait') return 'Clock'
   if (k === 'graph_step') return 'Connection'
   if (k === 'agent_done') return 'CircleCheck'
+  if (k === 'clarify') return 'QuestionFilled'
   return 'InfoFilled'
 }
 
@@ -46,6 +48,7 @@ export function kindLabel(kind?: string, type?: string): string {
     intend: '意图',
     llm: 'LLM',
     llm_result: 'LLM 输出',
+    llm_response: 'LLM 响应',
     tool_call: '工具调用',
     tool_result: '工具结果',
     tool_exec: '工具执行',
@@ -59,6 +62,8 @@ export function kindLabel(kind?: string, type?: string): string {
     user_message: '用户消息',
     system: '系统',
     progress: '进度',
+    clarify: '需要澄清',
+    stats: '统计',
   }
   return map[k] || k
 }

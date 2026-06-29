@@ -18,8 +18,9 @@ export interface Turn {
   thinkChain: SessionEvent[]
   toolCalls: ToolCallGroup[]
   errors: SessionEvent[]
+  clarifyQuestion?: SessionEvent
   finalAnswer?: SessionEvent
-  status: 'running' | 'completed' | 'error'
+  status: 'running' | 'completed' | 'error' | 'awaiting_clarify'
   startedAt: string
   endedAt?: string
   tokens: { in: number; out: number }
@@ -31,6 +32,7 @@ const THINK_KINDS = new Set([
   'intend',
   'llm',
   'llm_result',
+  'llm_response',
   'wait',
   'prompt',
   'agent_created',
@@ -118,6 +120,14 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
     if (isCompletion(ev)) {
       current!.finalAnswer = ev
       current!.status = ev.message?.startsWith('执行失败') ? 'error' : 'completed'
+      current!.endedAt = ev.timestamp
+      continue
+    }
+
+    // 待澄清：Agent 请求用户澄清，挂起会话；区别于错误，单独标记
+    if (ev.type === 'clarify' || ev.kind === 'clarify') {
+      current!.clarifyQuestion = ev
+      current!.status = 'awaiting_clarify'
       current!.endedAt = ev.timestamp
       continue
     }

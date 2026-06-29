@@ -22,12 +22,14 @@ const finalText = computed(() => {
 const statusLabel = computed(() => {
   if (props.turn.status === 'running') return '处理中'
   if (props.turn.status === 'error') return '失败'
+  if (props.turn.status === 'awaiting_clarify') return '待澄清'
   return '完成'
 })
 
 const statusColor = computed(() => {
   if (props.turn.status === 'running') return 'text-blue-400'
   if (props.turn.status === 'error') return 'text-red-400'
+  if (props.turn.status === 'awaiting_clarify') return 'text-yellow-400'
   return 'text-green-400'
 })
 
@@ -76,6 +78,17 @@ const primaryAgent = computed(() => props.turn.agents[0] || 'MetaAgent')
       <!-- 最终回答 -->
       <div v-if="finalText" class="bg-[#1a1d24] border border-[#2a2d35] rounded-lg px-4 py-3 mt-2 text-sm text-gray-200 leading-relaxed markdown-body"
            v-html="renderMd(finalText)"></div>
+
+      <!-- 待澄清提示：Agent 请求用户回答，会话挂起 -->
+      <div v-else-if="turn.status === 'awaiting_clarify' && turn.clarifyQuestion"
+           class="bg-yellow-900/20 border border-yellow-700/40 rounded-lg px-3 py-2 my-2 text-xs text-yellow-300">
+        <div class="flex items-center gap-2 font-medium mb-1">
+          <el-icon><QuestionFilled /></el-icon>
+          <span>需要你的澄清</span>
+          <span class="text-gray-500 ml-auto">{{ fmtTime(turn.clarifyQuestion.timestamp) }}</span>
+        </div>
+        <div class="whitespace-pre-wrap">{{ turn.clarifyQuestion.message }}</div>
+      </div>
 
       <!-- 运行中提示 -->
       <div v-else-if="turn.status === 'running'" class="text-xs text-gray-500 mt-2 flex items-center gap-2">

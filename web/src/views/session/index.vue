@@ -145,33 +145,9 @@ const roleTree = computed(() => {
       map.get(a.parent_id)!.children.push(map.get(a.inst_id))
     }
   })
-  return root.length ? root : defaultRoleTree()
+  // 无 Agent 数据时返回空数组，模板渲染空状态占位，不再展示伪造的角色树
+  return root
 })
-
-function defaultRoleTree() {
-  return [{
-    label: 'MetaAgent',
-    status: 'active',
-    statusType: 'success',
-    active: true,
-    isUser: false,
-    iconColor: 'text-green-500',
-    children: [
-      {
-        label: 'DomainAgent - CodeAnalysis',
-        status: 'active',
-        statusType: 'success',
-        active: true,
-        isUser: true,
-        iconColor: 'text-green-500',
-        children: [
-          { label: 'SubAgent - Parser', status: 'active', statusType: 'success', active: true, isUser: false, iconColor: 'text-green-500', children: [] },
-          { label: 'SubAgent - Architecture', status: 'running', statusType: 'warning', active: true, isUser: false, iconColor: 'text-yellow-500', children: [] },
-        ]
-      }
-    ]
-  }]
-}
 
 interface TaskItem {
   title?: string
@@ -184,31 +160,21 @@ const tasks = computed(() => {
   if (board.value?.tasks?.length) {
     return board.value.tasks.map(t => ({ title: t.title, assignee: t.assignee, status: t.status })) as TaskItem[]
   }
-  return [
-    { name: '解析项目结构', assignee: 'Parser', status: 'done' },
-    { name: '分析依赖关系', assignee: 'Dependency', status: 'done' },
-    { name: '构建架构图', assignee: 'Architecture', status: 'in_progress' },
-    { name: '分析核心模块', assignee: 'Architecture', status: 'in_progress' },
-    { name: '生成设计文档', assignee: 'Writer', status: 'pending' },
-    { name: '文档审查', assignee: 'Reviewer', status: 'pending' },
-  ] as TaskItem[]
+  // 无任务数据返回空数组，模板展示空状态，不再伪造任务
+  return [] as TaskItem[]
 })
 
 const constraints = computed(() => {
   if (board.value?.constraints) return Object.entries(board.value.constraints)
-  return [
-    ['编程语言', 'Go'],
-    ['架构风格', 'DDD'],
-    ['文档格式', 'Markdown'],
-    ['输出路径', './docs/design.md'],
-  ]
+  // 无约束数据返回空数组
+  return [] as [string, string][]
 })
 
 
 const progress = computed(() => {
   const done = tasks.value.filter(t => t.status === 'done').length
   const total = tasks.value.length
-  return total ? Math.round((done / total) * 100) : 75
+  return total ? Math.round((done / total) * 100) : 0
 })
 
 const defaultProps = { children: 'children', label: 'label' }
@@ -284,7 +250,9 @@ function healthStatusText(service?: { online?: boolean; detail?: string }) {
             <div class="font-bold text-sm text-gray-200">角色层级 (Role Hierarchy)</div>
           </div>
         </template>
+        <div v-if="!roleTree.length" class="text-gray-500 text-xs py-4 text-center">暂无角色实例，会话启动后自动创建</div>
         <el-tree
+          v-else
           :data="roleTree"
           :props="defaultProps"
           default-expand-all
@@ -333,6 +301,7 @@ function healthStatusText(service?: { online?: boolean; detail?: string }) {
           </div>
 
           <div class="space-y-1 mb-6">
+            <div v-if="!tasks.length" class="text-gray-500 text-xs py-3 text-center">暂无子任务，等待 DomainAgent 拆解</div>
             <div v-for="(task, index) in tasks" :key="index" class="flex items-center text-xs p-2 hover:bg-[#2a2d35] rounded transition-colors group">
               <div class="flex-1 flex items-center gap-2 truncate pr-2" :class="{'text-gray-200': task.status !== 'pending', 'text-gray-500': task.status === 'pending'}">
                 <span class="text-gray-500">{{ index + 1 }}.</span>
@@ -352,6 +321,7 @@ function healthStatusText(service?: { online?: boolean; detail?: string }) {
           <div class="border-t border-[#2a2d35] pt-4">
             <div class="text-xs font-bold text-gray-400 mb-3">约束条件 (Constraints)</div>
             <div class="space-y-2 text-xs">
+              <div v-if="!constraints.length" class="text-gray-500 py-2 text-center">暂无约束条件</div>
               <div v-for="(c, i) in constraints" :key="i" class="flex justify-between p-2 bg-[#0f1115] rounded">
                 <span class="text-gray-500">{{ c[0] }}</span>
                 <span class="text-gray-200">{{ c[1] }}</span>

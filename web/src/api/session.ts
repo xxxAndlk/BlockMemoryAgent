@@ -41,10 +41,17 @@ export function sendMessage(id: string, content: string): Promise<void> {
   })
 }
 
+export function clarifySession(id: string, answer: string): Promise<void> {
+  return fetchJson(`/sessions/${id}/clarify`, {
+    method: 'POST',
+    body: JSON.stringify({ answer }),
+  })
+}
+
 export function streamSession(
   id: string,
   onEvent: (ev: SessionEvent) => void,
-  onDone?: () => void,
+  onDone?: (finalStatus?: string) => void,
   onError?: (err: Error) => void
 ): () => void {
   const es = new EventSource(`${API_BASE}/sessions/${id}/stream`)
@@ -53,7 +60,8 @@ export function streamSession(
       const d = JSON.parse(e.data)
       if (d.type === 'done') {
         es.close()
-        onDone?.()
+        // 后端 done 帧携带真实 status (completed/error/awaiting_clarify)，转发给调用方
+        onDone?.(d.status)
         return
       }
       onEvent(d as SessionEvent)

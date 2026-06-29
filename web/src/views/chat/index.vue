@@ -6,6 +6,7 @@ import {
   listSessions,
   createSession,
   sendMessage,
+  clarifySession,
   getSession,
   streamSession,
   getSessionAgents,
@@ -100,12 +101,13 @@ function startStream(s: Session) {
       }
       events.value.push(ev as SessionEvent)
     },
-    () => {
-      // 完成
+    (finalStatus?: string) => {
+      // 完成：使用后端 done 帧携带的真实 status，避免把 error/awaiting_clarify 误显示为 completed
       refreshPanels(s.id)
       loadSessions()
       if (activeSession.value) {
-        activeSession.value = { ...activeSession.value, status: 'completed' as Session['status'] }
+        const status = (finalStatus as Session['status']) || 'completed'
+        activeSession.value = { ...activeSession.value, status }
       }
       sending.value = false
     },
@@ -117,17 +119,24 @@ async function handleSubmit(content: string) {
   if (!content.trim()) return
   sending.value = true
   try {
-    if (!activeSession.value || activeSession.value.status !== 'running') {
-      // 没有运行中的会话 → 创建新会话
-      const s = await createSession(content)
-      sessions.value.unshift(s)
-      router.replace({ path: '/chat', query: { id: s.id } })
-      await openSession(s.id)
-    } else {
-      // 追加到当前会话
+    // 1) 待澄清会话 → 调 /clarify 提交答复，复用同一会话
+    if (activeSession.value && activeSession.value.status === 'awaiting_clarify') {
+      await clarifySession(activeSession.value.id, content)
+      activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
+      await openSession(activeSession.value.id)
+      return
+    }
+    // 2) 运行中会话 → 追加消息
+    if (activeSession.value && activeSession.value.status === 'running') {
       await sendMessage(activeSession.value.id, content)
       // SSE 已经在监听，会自动推送 user_message 事件
+      return
     }
+    // 3) 无运行中会话 → 创建新会话
+    const s = await createSession(content)
+    sessions.value.unshift(s)
+    router.replace({ path: '/chat', query: { id: s.id } })
+    await openSession(s.id)
   } catch (e) {
     console.error('submit failed:', e)
   } finally {
@@ -157,12 +166,18 @@ function statusDotClass(status: string) {
     case 'running': return 'bg-blue-400 animate-pulse'
     case 'completed': return 'bg-green-500'
     case 'error': return 'bg-red-500'
+    case 'awaiting_clarify': return 'bg-yellow-400 animate-pulse'
     default: return 'bg-gray-500'
   }
 }
 
 function statusText(status: string) {
-  const map: Record<string, string> = { running: '运行中', completed: '完成', error: '失败' }
+  const map: Record<string, string> = {
+    running: '运行中',
+    completed: '完成',
+    error: '失败',
+    awaiting_clarify: '待澄清',
+  }
   return map[status] || status
 }
 

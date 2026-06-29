@@ -59,8 +59,22 @@ function toggle(i: number) {
 const progress = computed(() => {
   const total = props.events.length
   if (!total) return 0
-  const done = props.events.filter(e => e.type === 'system' && e.message.startsWith('会话完成')).length
-  return done ? 100 : Math.min(95, Math.round(total / (total + 5) * 100))
+  const events = props.events
+  // 终态判定：会话完成 / 执行失败 / 错误 / 待澄清 → 100%
+  const hasFinish = events.some(e => e.type === 'system' && e.message.startsWith('会话完成'))
+  const hasError = events.some(e => e.type === 'error' || e.message.includes('执行失败'))
+  const hasClarify = events.some(e => e.type === 'clarify' || e.kind === 'clarify')
+  if (hasFinish || hasError || hasClarify) return 100
+  // 运行中：基于步数渐进，避免失败会话永远卡在 95%
+  return Math.min(95, Math.round(total / (total + 5) * 100))
+})
+
+const progressStatus = computed(() => {
+  const events = props.events
+  if (events.some(e => e.type === 'error' || e.message.includes('执行失败'))) return 'exception'
+  if (events.some(e => e.type === 'clarify' || e.kind === 'clarify')) return 'warning'
+  if (events.some(e => e.type === 'system' && e.message.startsWith('会话完成'))) return 'success'
+  return undefined
 })
 </script>
 
@@ -115,7 +129,7 @@ const progress = computed(() => {
 
     <div class="h-12 border-t border-[#2a2d35] flex items-center px-6 gap-4 shrink-0 bg-[#14161a]">
       <span class="text-xs text-gray-400 whitespace-nowrap">整体进度</span>
-      <el-progress :percentage="progress" :show-text="false" class="flex-1 custom-progress" />
+      <el-progress :percentage="progress" :status="progressStatus" :show-text="false" class="flex-1 custom-progress" />
       <span class="text-xs text-gray-400 whitespace-nowrap">{{ progress }}% ({{ events.length }} 事件)</span>
     </div>
   </div>

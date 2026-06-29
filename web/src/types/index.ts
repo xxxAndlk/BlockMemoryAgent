@@ -7,7 +7,7 @@ export interface ChatMessage {
 export interface Session {
   id: string
   goal: string
-  status: 'running' | 'completed' | 'error'
+  status: 'running' | 'completed' | 'error' | 'awaiting_clarify'
   result?: string
   started_at: string
   ended_at?: string
@@ -24,6 +24,7 @@ export interface SessionEvent {
   tool_path?: string
   tool_output?: string
   tool_error?: string
+  tool_args?: string
   success?: boolean
   timestamp: string
   prompt?: string

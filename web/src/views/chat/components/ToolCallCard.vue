@@ -17,8 +17,10 @@ const statusColor = computed(() => {
   return props.group.success ? 'text-green-400' : 'text-red-400'
 })
 
-const callArgs = computed(() => props.group.call?.detail_json || '')
+const callArgs = computed(() => props.group.call?.detail_json || props.group.call?.tool_args || '')
 const resultText = computed(() => props.group.result?.tool_output || props.group.result?.message || '')
+// 后端 truncate 在 500 字处截断 (session.go persistHistory)，命中阈值时提示用户
+const resultTruncated = computed(() => (props.group.result?.tool_output || '').length >= 500)
 const errorText = computed(() => props.group.result?.tool_error || '')
 const path = computed(() => props.group.result?.tool_path || '')
 const startedAt = computed(() => props.group.call?.timestamp || props.group.result?.timestamp || '')
@@ -55,6 +57,7 @@ const startedAt = computed(() => props.group.call?.timestamp || props.group.resu
       <div v-if="resultText">
         <div class="text-[10px] text-gray-500 mb-1">执行结果</div>
         <pre class="bg-[#0a0c10] p-2 rounded text-[11px] text-gray-300 whitespace-pre-wrap font-mono max-h-64 overflow-auto">{{ resultText }}</pre>
+        <div v-if="resultTruncated" class="text-[10px] text-yellow-500 mt-1">⚠ 结果已截断，仅显示前 500 字</div>
       </div>
       <div v-if="errorText">
         <div class="text-[10px] text-gray-500 mb-1">错误信息</div>

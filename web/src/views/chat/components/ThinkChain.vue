@@ -21,7 +21,7 @@ const visible = computed(() => {
   if (props.verbose) return props.events
   return props.events.filter(ev => {
     const k = ev.kind || ev.type
-    return k === 'think' || k === 'intend' || k === 'llm' || k === 'llm_result' || k === 'wait' || k === 'agent_done'
+    return k === 'think' || k === 'intend' || k === 'llm' || k === 'llm_result' || k === 'llm_response' || k === 'wait' || k === 'agent_done' || k === 'clarify'
   })
 })
 
