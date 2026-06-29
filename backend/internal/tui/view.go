@@ -134,26 +134,17 @@ func (m Model) renderChat(w, h int) string {
 		cursor = len(items) - 1
 	}
 
-	visibleCount := h
-	if visibleCount < 1 {
-		visibleCount = 1
+	// 先把每个 item 渲染成若干行（title 行 + detail 行），并记录每个 item 的起始行号，
+	// 以便按"行"切视窗。旧实现以 item 数当可见数，但每个 item 占多行，
+	// 导致内容多行时被 clipChat 硬裁、看不到全部，且放大窗口后内容丢失。
+	type renderedItem struct {
+		lines []string
 	}
-	total := len(items)
-	end := cursor + 1
-	if end < visibleCount {
-		end = visibleCount
-	}
-	if end > total {
-		end = total
-	}
-	start := end - visibleCount
-	if start < 0 {
-		start = 0
-	}
-	visible := items[start:end]
-
-	for i, item := range visible {
-		globalIdx := start + i
+	rendered := make([]renderedItem, len(items))
+	totalLines := 0
+	itemStartLine := make([]int, len(items)) // 每个 item 首行在全局行列表中的下标
+	for i, item := range items {
+		itemStartLine[i] = totalLines
 		roleStyle := m.styles.LogInfo
 		icon := "·"
 		switch {
@@ -166,19 +157,107 @@ func (m Model) renderChat(w, h int) string {
 		case strings.HasPrefix(item.title, "[system]"):
 			roleStyle = m.styles.LogSystem
 			icon = "#"
+		case strings.HasPrefix(item.title, "🔧"):
+			// 工具调用：成功绿色，失败红色（title 已含 🔧 图标，icon 留空避免重复）
+			if strings.Contains(item.title, " ✗ ·") {
+				roleStyle = m.styles.LogError
+			} else {
+				roleStyle = m.styles.LogSuccess
+			}
+			icon = ""
+		case strings.HasPrefix(item.title, "💭"):
+			roleStyle = m.styles.LogInfo
+			icon = ""
+		case strings.HasPrefix(item.title, "✗ Error"):
+			roleStyle = m.styles.LogError
+			icon = ""
 		}
 		marker := "  "
-		if m.focus == panelChat && globalIdx == cursor {
+		if m.focus == panelChat && i == cursor {
 			marker = m.styles.TreeActive.Render("▸ ")
 		}
-		lines = append(lines, fmt.Sprintf("%s%s %s", marker, m.styles.Dim.Render(icon), roleStyle.Render(item.title)))
+		var ls []string
+		// title 截断后再着色，避免 ANSI 样式码被从中间截断导致终端乱码；
+		// 同时保证 title 行不超宽触发自动换行（会扰乱行级视窗计数）
+		titleStr := truncate(item.title, w-8)
+		ls = append(ls, fmt.Sprintf("%s%s %s", marker, m.styles.Dim.Render(icon), roleStyle.Render(titleStr)))
 		for _, l := range strings.Split(item.detail, "\n") {
-			lines = append(lines, "    "+truncate(l, w-6))
+			ls = append(ls, "    "+truncate(l, w-6))
 		}
+		rendered[i] = renderedItem{lines: ls}
+		totalLines += len(ls)
 	}
 
 	if len(items) == 0 {
 		lines = append(lines, "  "+m.styles.Dim.Render("(empty — send a message below)"))
+		return m.clipChat(strings.Join(lines, "\n"), w, h)
+	}
+
+	// 行级视窗：以当前 item 的首行为锚点，尽量让锚点行可见。
+	// chatFollowBottom 时锚定最末行，保证新输出始终可见。
+	viewportH := h
+	if viewportH < 1 {
+		viewportH = 1
+	}
+	var anchorLine int
+	if m.chatFollowBottom {
+		anchorLine = totalLines - 1
+	} else {
+		anchorLine = itemStartLine[cursor]
+	}
+	// 计算可见窗口的起始行：让锚点行落在视窗内（居中偏上），并夹紧到合法范围。
+	startLine := anchorLine - viewportH/3
+	if startLine < 0 {
+		startLine = 0
+	}
+	if startLine > totalLines-viewportH {
+		startLine = totalLines - viewportH
+	}
+	if startLine < 0 {
+		startLine = 0
+	}
+	endLine := startLine + viewportH
+	if endLine > totalLines {
+		endLine = totalLines
+	}
+
+	// 从全局行列表里切出 [startLine, endLine)。为节省内存，按 item 累积到 startLine 后再收集。
+	skip := startLine
+	for i := range rendered {
+		ls := rendered[i].lines
+		if skip >= len(ls) {
+			skip -= len(ls)
+			continue
+		}
+		// 该 item 部分或全部落在窗口内
+		take := ls[skip:]
+		remaining := endLine - (itemStartLine[i] + skip)
+		if remaining < len(take) {
+			if remaining < 0 {
+				remaining = 0
+			}
+			take = take[:remaining]
+		}
+		lines = append(lines, take...)
+		skip = 0
+		if len(lines) >= viewportH {
+			break
+		}
+	}
+
+	// 滚动位置指示（内容超出视窗时在右上角提示）
+	if totalLines > viewportH {
+		pct := 0
+		if endLine >= totalLines {
+			pct = 100
+		} else if startLine > 0 {
+			pct = startLine * 100 / totalLines
+		}
+		hint := m.styles.Dim.Render(fmt.Sprintf(" [%d%%] ↑↓/j/k 滚动 ", pct))
+		// 用 lipgloss 把提示放到内容顶部右侧的占位：简化为附在首行
+		if len(lines) > 0 {
+			lines[0] = lines[0] + " " + hint
+		}
 	}
 
 	return m.clipChat(strings.Join(lines, "\n"), w, h)
@@ -227,11 +306,13 @@ func (m Model) renderOverlay(w, h int) string {
 		m.overlayTitle = "Help"
 		m.overlayLines = strings.Split(strings.Trim(fullHelpText, "\n"), "\n")
 	}
-	// Refresh dynamic popup content every render so plan/agents stay live.
+	// Refresh dynamic popup content every render so plan/agents/log stay live.
 	if m.overlay == overlayPlan {
 		m.overlayLines = m.buildPlanLines()
 	} else if m.overlay == overlayAgents {
 		m.overlayLines = m.buildAgentsLines()
+	} else if m.overlay == overlayLog {
+		m.overlayLines = m.buildTranscriptLines()
 	}
 
 	maxLines := h - 4

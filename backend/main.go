@@ -61,9 +61,10 @@ func main() {
 	}
 
 	// 日志文件输出（浏览器入口）：按天分割到 logs/browser-YYYY-MM-DD.log
-	// 失败不 fatal：文件日志缺失时仍用 stderr，保证服务可启动
+	// 失败不 fatal：文件日志缺失时仍用 stderr，保证服务可启动。
+	// silent=false：HTTP 入口无 alt-screen，stderr + 文件双写便于开发期实时查看。
 	if cfg.Logging.Enabled {
-		if _, err := logging.Init(logging.EntryBrowser, cfg.Logging.Dir); err != nil {
+		if _, err := logging.Init(logging.EntryBrowser, cfg.Logging.Dir, false); err != nil {
 			log.Printf("warning: init file logging: %v (stderr-only)", err)
 		} else {
 			defer logging.Close() // 进程退出时关闭文件句柄
@@ -165,8 +166,15 @@ func main() {
 	threeLayerGraph.SetArchiveStore(pgStore)
 
 	// 特性1：创建 DAG 调度器（按 cron + 依赖关系派发 session）
-	dagScheduler := dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
-	dagScheduler.Start(ctx)
+	// Postgres 缺失时不启动后台调度循环（避免 nil 解引用 panic），DAG 功能降级为不可用：
+	// DAGHandler 仍注册但所有写操作会返回降级错误（HTTP 500），不会让进程崩溃。
+	var dagScheduler *dag.Scheduler
+	if pgStore == nil {
+		log.Printf("warning: postgres unavailable, DAG scheduler disabled (degraded mode)")
+	} else {
+		dagScheduler = dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
+		dagScheduler.Start(ctx)
+	}
 
 	// 启动时从 session_history 恢复历史会话到内存，让前端列表不空
 	ctxRestore, cancelRestore := context.WithTimeout(ctx, 5*time.Second) // 最多恢复 5 秒

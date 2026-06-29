@@ -82,11 +82,14 @@ var (
 	globalWriter  *dailyWriter
 )
 
-// Init 初始化全局日志输出：把标准 log 包的输出重定向到 stderr + 按天分割文件。
+// Init 初始化全局日志输出：把标准 log 包的输出重定向到（可选 stderr +）按天分割文件。
 //
 // 参数：
 //   - entry：入口标识（EntryBrowser / EntryTUI），决定文件名前缀
 //   - dir：日志目录，空串则使用 ./logs
+//   - silent：true 时仅写文件、不写 stderr。TUI 入口（bubbletea alt-screen 全屏
+//     接管终端）必须传 true，否则日志会刷到屏幕上顶乱 TUI 布局、把输入框顶跑；
+//     HTTP 入口传 false，开发期可在终端实时查看日志。
 //
 // 行为：
 //   - dir 会被自动创建（MkdirAll）
@@ -94,7 +97,7 @@ var (
 //   - 设置 log 标志：Ldate | Ltime | Lmicroseconds | Lshortfile，便于定位调用点
 //
 // 返回 close 函数，供 defer 调用关闭文件句柄。
-func Init(entry Entry, dir string) (close func() error, err error) {
+func Init(entry Entry, dir string, silent bool) (close func() error, err error) {
 	if dir == "" {
 		dir = "logs"
 	}
@@ -118,9 +121,14 @@ func Init(entry Entry, dir string) (close func() error, err error) {
 	}
 	globalWriter = w
 
-	// MultiWriter 同时输出到 stderr 与文件：开发期可在终端实时查看，
-	// 生产期可在文件中检索历史
-	log.SetOutput(io.MultiWriter(os.Stderr, w))
+	if silent {
+		// TUI 模式：仅写文件，让 bubbletea 独占终端，避免日志上屏顶乱布局
+		log.SetOutput(w)
+	} else {
+		// MultiWriter 同时输出到 stderr 与文件：开发期可在终端实时查看，
+		// 生产期可在文件中检索历史
+		log.SetOutput(io.MultiWriter(os.Stderr, w))
+	}
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
 
 	return func() error { return w.Close() }, nil

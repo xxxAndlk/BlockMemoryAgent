@@ -297,6 +297,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshSessions()
 		}
 		m.rebuildAgents()
+		// 弹窗打开时刷新动态内容（完整记录面板在末尾时跟随新输出）
+		if m.overlay != overlayNone {
+			m.refreshOverlay()
+		}
 		return m, tickCmd()
 
 	case tea.MouseMsg:
@@ -334,6 +338,14 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Ctrl+L 全局开关"完整记录"面板：无论当前焦点在输入栏还是对话区、
+	// 无论是否已打开其它弹窗，都可随时翻阅全部输出。这是查看长输出的主入口，
+	// 绕开"发送后焦点锁在输入栏导致 j/k 无法滚动对话区"的问题。
+	if msg.String() == "ctrl+l" {
+		m.toggleLogPopup()
+		return m, nil
+	}
+
 	// Overlay mode: navigate or close.
 	if m.overlay != overlayNone {
 		// Keep popup content / cursor in sync with live state.
@@ -360,6 +372,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.togglePlanPopup()
 		case "3":
 			m.toggleAgentsPopup()
+		case "4":
+			m.toggleLogPopup()
 		case "1":
 			m.overlay = overlayNone
 		}
@@ -382,6 +396,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.togglePlanPopup()
 	case "3":
 		m.toggleAgentsPopup()
+	case "4":
+		m.toggleLogPopup()
 	case "/":
 		// Focus the input bar empty — for slash commands. Other printable chars
 		// fall through to the default case and seed the buffer directly.
@@ -419,7 +435,7 @@ func (m *Model) moveChatCursor(delta int) {
 	if s == nil {
 		return
 	}
-	items := len(s.Messages) + len(s.Events)
+	items := len(chatItems(s))
 	m.chatCursor = clamp(m.chatCursor+delta, 0, items-1)
 	if delta < 0 {
 		m.chatFollowBottom = false
@@ -445,6 +461,14 @@ func (m *Model) refreshOverlay() {
 		m.overlayLines = m.buildPlanLines()
 	case overlayAgents:
 		m.overlayLines = m.buildAgentsLines()
+	case overlayLog:
+		// 实时刷新完整记录：若用户当前停在末尾（跟读最新输出），新行加入后自动跟随到尾；
+		// 用户已上滚浏览历史时不打断其位置。
+		wasAtEnd := len(m.overlayLines) > 0 && m.overlayCursor >= len(m.overlayLines)-1
+		m.overlayLines = m.buildTranscriptLines()
+		if wasAtEnd {
+			m.overlayCursor = len(m.overlayLines) - 1
+		}
 	case overlayHelp:
 		m.overlayLines = strings.Split(strings.Trim(fullHelpText, "\n"), "\n")
 	}
@@ -503,6 +527,32 @@ func (m *Model) toggleAgentsPopup() {
 	m.overlayTitle = "Agent Topology"
 	m.overlayLines = lines
 	m.overlayCursor = clamp(m.overlayCursor, 0, len(lines)-1)
+}
+
+// toggleLogPopup 打开/关闭"完整记录"面板：把整段对话铺成可滚动行列表，
+// 用户可用 j/k/g/G 翻阅全部 LLM 输出 / 工具调用 / 思考，不受对话区高度限制。
+// 内容每次渲染实时刷新（refreshOverlay），保证新输出立即可见。
+func (m *Model) toggleLogPopup() {
+	s := m.selectedSession()
+	if s == nil {
+		m.flashMsg("no active session")
+		return
+	}
+	if m.overlay == overlayLog {
+		m.overlay = overlayNone
+		return
+	}
+	lines := m.buildTranscriptLines()
+	// 打开时默认滚到末尾，方便先看最新输出；用户可 g 回到顶部
+	cursor := len(lines) - 1
+	if cursor < 0 {
+		cursor = 0
+	}
+	m.overlay = overlayLog
+	m.overlayKind = overlayLog
+	m.overlayTitle = "Full Transcript"
+	m.overlayLines = lines
+	m.overlayCursor = cursor
 }
 
 func (m *Model) openOverlay(title string, lines []string) {

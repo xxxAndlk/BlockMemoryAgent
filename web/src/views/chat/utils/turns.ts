@@ -1,22 +1,31 @@
 import type { SessionEvent } from '@/types'
 
-/** 一次工具调用：把 tool_call (intent) + tool_result/tool_exec (结果) 配对 */
+/** 一次工具调用：把 tool_call (intent) + tool_exec (结果) 配对 */
 export interface ToolCallGroup {
   id: string
   tool: string
   agent: string
   call?: SessionEvent     // kind === 'tool_call'
-  result?: SessionEvent   // type === 'tool_exec' 或 kind === 'tool_result'
+  result?: SessionEvent   // type === 'tool_exec'
   success: boolean
   pending: boolean
+}
+
+/** 回合内一个按时间顺序的步骤：要么是一段思考，要么是一次工具调用 */
+export interface TurnStep {
+  kind: 'think' | 'tool'
+  event?: SessionEvent    // think 步骤对应的事件
+  group?: ToolCallGroup   // tool 步骤对应的工具调用组
 }
 
 /** 一个对话回合：用户消息 → 助手处理过程 → 最终答案 */
 export interface Turn {
   id: string
   userMessage?: SessionEvent
-  thinkChain: SessionEvent[]
-  toolCalls: ToolCallGroup[]
+  /** 按时间交错的步骤序列，保留 ReAct 时序（思考↔工具↔结果↔下一轮思考） */
+  steps: TurnStep[]
+  thinkChain: SessionEvent[]   // 兼容字段：所有思考事件扁平集合
+  toolCalls: ToolCallGroup[]   // 兼容字段：所有工具调用组
   errors: SessionEvent[]
   clarifyQuestion?: SessionEvent
   finalAnswer?: SessionEvent
@@ -64,9 +73,11 @@ function tokenOut(ev: SessionEvent): number {
  *
  * 规则：
  * - 每条 type='user_message' 开启新回合；或会话初始的 system "会话启动" 事件视为第一个回合的"用户消息"。
- * - 回合内事件按 Kind 路由：think/intend/llm/wait/prompt/agent_created/token_usage/graph_step → thinkChain；
- *   tool_call → toolCalls[].call；tool_result + tool_exec → toolCalls[].result（按 tool 名最近匹配）；
+ * - 回合内事件按时间顺序路由到 steps[]，保留 ReAct 时序：
+ *   think/intend/llm/llm_result/wait/... → think 步骤；
+ *   tool_call → 新建工具组 + tool 步骤；tool_exec → 匹配同名 pending 组填 result（不新增步骤）；
  *   error → errors；system "会话完成"/"执行失败" → finalAnswer + 改变 status。
+ * - 工具类事件判断优先于 error，避免失败的工具调用被误归 errors 而永久 pending。
  */
 export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
   const turns: Turn[] = []
@@ -76,6 +87,7 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
     current = {
       id: ev?.timestamp || `turn-${turns.length}`,
       userMessage: ev,
+      steps: [],
       thinkChain: [],
       toolCalls: [],
       errors: [],
@@ -132,57 +144,67 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
       continue
     }
 
-    // 错误
-    if (isError(ev)) {
-      current!.errors.push(ev)
-      current!.status = 'error'
-      continue
-    }
-
-    // 工具调用
+    // 工具调用意图（pending）：新建组并占一个 tool 步骤
     if (TOOL_CALL_KINDS.has(ev.kind || '')) {
-      current!.toolCalls.push({
+      const group: ToolCallGroup = {
         id: ev.timestamp,
         tool: ev.tool || extractToolName(ev.message) || 'unknown',
         agent: ev.agent,
         call: ev,
         success: false,
         pending: true,
-      })
+      }
+      current!.toolCalls.push(group)
+      current!.steps.push({ kind: 'tool', group })
       continue
     }
 
-    // 工具结果（kind=tool_result 或 type=tool_exec）
-    if (TOOL_RESULT_KINDS.has(ev.kind || '') || ev.type === 'tool_exec') {
+    // 工具执行结果（type=tool_exec）：配对到同名 pending 组填 result，不新增步骤
+    if (ev.type === 'tool_exec') {
       const toolName = ev.tool || extractToolName(ev.message) || 'unknown'
-      // 反向找到最近一个同名、未匹配的 call
       const matched = [...current!.toolCalls].reverse().find(g => g.tool === toolName && g.pending)
       if (matched) {
         matched.result = ev
         matched.success = ev.success !== false
         matched.pending = false
       } else {
-        // 没有配对的 call，作为孤儿结果新建一个组
-        current!.toolCalls.push({
+        // 没有配对的 call（历史回放/孤儿），作为自包含组新建一个 tool 步骤
+        const group: ToolCallGroup = {
           id: ev.timestamp,
           tool: toolName,
           agent: ev.agent,
           result: ev,
           success: ev.success !== false,
           pending: false,
-        })
+        }
+        current!.toolCalls.push(group)
+        current!.steps.push({ kind: 'tool', group })
       }
       continue
     }
 
-    // 思考链相关 Kind
+    // 旧版后端可能仍发 tool_result kind（已废弃），忽略避免重复卡片
+    if (TOOL_RESULT_KINDS.has(ev.kind || '')) {
+      continue
+    }
+
+    // 错误（工具失败已由 tool_exec.success=false 体现，此处只收真正的错误事件）
+    if (isError(ev)) {
+      current!.errors.push(ev)
+      current!.status = 'error'
+      continue
+    }
+
+    // 思考链相关 Kind → think 步骤（同时累积到 thinkChain 兼容字段）
     if (THINK_KINDS.has(ev.kind || '') || ev.type === 'progress') {
       current!.thinkChain.push(ev)
+      current!.steps.push({ kind: 'think', event: ev })
       continue
     }
 
     // agent_done / stats / 其它系统事件：也归到思考链
     current!.thinkChain.push(ev)
+    current!.steps.push({ kind: 'think', event: ev })
   }
 
   return turns

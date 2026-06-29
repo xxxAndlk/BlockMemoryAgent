@@ -316,8 +316,8 @@ func (m *SessionManager) handleProgress(ctx context.Context, ev graph.ProgressEv
 	m.mu.RUnlock()
 
 	for _, session := range targets {
-		// 写入带调试字段的事件
-		m.addEventDebug(session, "progress", ev.Agent, msg, ev.Kind, "", "", "", "", success, prompt, inputTokens, outputTokens, ev.Detail)
+		// 写入带调试字段的事件；ev.Tool 仅 tool_call 携带工具名，其余为空
+		m.addEventDebug(session, "progress", ev.Agent, msg, ev.Kind, ev.Tool, "", "", "", success, prompt, inputTokens, outputTokens, ev.Detail)
 	}
 }
 
@@ -344,7 +344,8 @@ func (m *SessionManager) CreateSession(ctx context.Context, goal string) *Sessio
 		StartedAt: time.Now(),
 		Events:    make([]SessionEvent, 0), // 空事件流
 		Messages: []types.ChatMessage{
-			{Role: enums.ChatRoleSystem, Content: "Goal: " + goal, Timestamp: time.Now()}, // 注入 system 消息
+			{Role: enums.ChatRoleSystem, Content: "Goal: " + goal, Timestamp: time.Now()},         // 注入 system 消息
+			{Role: enums.ChatRoleUser, Content: goal, Timestamp: time.Now()},                       // 注入用户原始输入，供 TUI/前端对话区展示
 		},
 	}
 
@@ -447,6 +448,13 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	session.State = result
 	now := time.Now()
 	session.EndedAt = &now
+	// 落最终助手回复到 Messages，供 TUI/前端对话区展示完整一问一答
+	// （此前新会话路径只写了 system "会话完成" 事件，TUI chatItems 读 Messages 看不到回答）
+	session.Messages = append(session.Messages, types.ChatMessage{
+		Role:      enums.ChatRoleAssistant,
+		Content:   result.SessionSummary,
+		Timestamp: now,
+	})
 	m.mu.Unlock()
 
 	// 添加角色实例事件

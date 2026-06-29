@@ -224,29 +224,47 @@ func executeWithTools(
 		return "", nil
 	}
 
-	// 启动 blades runner 执行 ReAct 循环
+	// 启动 blades agent 执行 ReAct 循环
 	emit(ctx, "llm", fmt.Sprintf("启动 blades agent 执行（最多 %d 轮 function calling）", maxItersResolved))
-	start := time.Now()                              // 记录起始时间用于耗时统计
-	runner := blades.NewRunner(agent)                // 创建运行器
-	output, err := runner.Run(ctx, blades.UserMessage(userMsg)) // 驱动 Agent 循环
-	dur := time.Since(start)                         // 计算总耗时
+	start := time.Now() // 记录起始时间用于耗时统计
+
+	// 不用 runner.Run（只返回最终 output），而是手动迭代 agent.Run：blades 的 Agent.Run
+	// 返回一个 Generator，每轮 ReAct yield 一个 *Message。借此 hook 每轮 LLM 文本输出
+	// （推理/中间想法），推给前端思考链，让"为什么调这个工具"可见。
+	invocation := &blades.Invocation{
+		ID:      blades.NewInvocationID(),
+		Session: blades.NewSession(),
+		Message: blades.UserMessage(userMsg), // Stream 零值 false，与原 runner.Run 非 stream 一致
+	}
+	var lastMessage *blades.Message
+	for m, err := range agent.Run(ctx, invocation) {
+		if err != nil {
+			dur := time.Since(start)
+			emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] blades agent 完成 dur=%v", agentName, dur.Round(time.Millisecond)), "")
+			emit(ctx, "error", fmt.Sprintf("blades agent 执行失败: %v", err))
+			// 已完成部分工具操作，附带步数返回供上层决策
+			if len(allResults) > 0 {
+				return fmt.Sprintf("agent 执行失败(已完成%d步工具操作): %v", len(allResults), err), allResults
+			}
+			return "", nil
+		}
+		if m == nil {
+			continue
+		}
+		lastMessage = m
+		// 暴露每轮 LLM 文本输出；工具调用轮次 (RoleTool) Text 通常为空，不会重复 emit
+		if txt := m.Text(); txt != "" {
+			emit(ctx, "llm_result", "LLM 输出: "+truncateStr(txt, 400))
+		}
+	}
+	dur := time.Since(start) // 计算总耗时
 	// 推送本次 agent 的耗时统计事件
 	emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] blades agent 完成 dur=%v", agentName, dur.Round(time.Millisecond)), "")
 
-	// 执行出错处理：若已有部分工具结果，则带上已完成步数返回，便于上层判断
-	if err != nil {
-		emit(ctx, "error", fmt.Sprintf("blades agent 执行失败: %v", err))
-		if len(allResults) > 0 {
-			// 已完成部分工具操作，附带步数返回供上层决策
-			return fmt.Sprintf("agent 执行失败(已完成%d步工具操作): %v", len(allResults), err), allResults
-		}
-		return "", nil
-	}
-
-	// 提取最终文本输出
+	// 提取最终文本输出（最后一个 message，与原 runner.Run 语义一致）
 	finalText := ""
-	if output != nil {
-		finalText = output.Text()
+	if lastMessage != nil {
+		finalText = lastMessage.Text()
 	}
 
 	// 完成门控：任务要求写文件但无成功 WriteFile 记录 → 返回失败标记触发上层重试

@@ -57,8 +57,9 @@ type ToolCallback func(result *ToolResult)
 //   - Detail：可选详情（LLM 原始输出 / 工具参数 / 错误堆栈 / prompt 摘要 / JSON 详情）。
 type ProgressEvent struct {
 	SessionID string // 归属会话，避免跨会话事件泄漏
-	Kind      string // "think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error" | "prompt" | "agent_created" | "token_usage" | "graph_step"
+	Kind      string // "think" | "intend" | "tool_call" | "tool_result" | "llm" | "llm_result" | "wait" | "error" | "prompt" | "agent_created" | "token_usage" | "graph_step"
 	Agent     string // 节点名/角色名
+	Tool      string // 工具名（tool_call 时携带，供前端直接展示，免正则推断）
 	Message   string // 人类可读描述
 	Detail    string // 可选：LLM 原始输出 / 工具参数 / 错误堆栈 / prompt 摘要 / JSON 详情
 }

@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -54,13 +55,20 @@ func main() {
 	}
 
 	// 日志文件输出（TUI 入口）：按天分割到 logs/tui-YYYY-MM-DD.log
-	// 与浏览器入口分文件，便于按入口排查问题
+	// 与浏览器入口分文件，便于按入口排查问题。
+	// silent=true：仅写文件，不写 stderr——bubbletea 用 alt-screen 全屏接管终端，
+	// 若日志仍走 stderr 会刷到屏幕上顶乱 TUI 布局、把输入框顶跑。TUI 必须静默 stderr。
 	if cfg.Logging.Enabled {
-		if _, err := logging.Init(logging.EntryTUI, cfg.Logging.Dir); err != nil {
-			log.Printf("warning: init file logging: %v (stderr-only)", err)
+		if _, err := logging.Init(logging.EntryTUI, cfg.Logging.Dir, true); err != nil {
+			// Init 失败时 log 仍走默认 stderr；此时也无法靠它上屏提示，记到 stdout 兜底
+			fmt.Println("warning: init file logging:", err)
 		} else {
 			defer logging.Close()
 		}
+	} else {
+		// 未启用文件日志时，TUI 也必须把 log 输出从 stderr 改走，否则同样上屏。
+		// 重定向到 io.Discard（丢弃）—— TUI 模式下日志无终端可看，需开文件日志才能查。
+		log.SetOutput(io.Discard)
 	}
 	log.Printf("BlockMemoryAgent TUI entry starting, log dir=%s", cfg.Logging.Dir)
 
@@ -140,8 +148,14 @@ func main() {
 		threeLayerGraph.SetArchiveStore(pgStore)
 	}
 
-	dagScheduler := dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
-	dagScheduler.Start(ctx)
+	// Postgres 缺失时不启动 DAG 调度器，避免 nil 解引用 panic；DAG 功能降级为不可用。
+	var dagScheduler *dag.Scheduler
+	if pgStore == nil {
+		log.Printf("warning: postgres unavailable, DAG scheduler disabled (degraded mode)")
+	} else {
+		dagScheduler = dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
+		dagScheduler.Start(ctx)
+	}
 
 	// Start a local HTTP server so the TUI input bar can POST to /api/sessions/* and /api/dag/*.
 	// 这里不直接复用 server.api.go 是因为 TUI 进程内已持有 SessionManager/Graph 实例，

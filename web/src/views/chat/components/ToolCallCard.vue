@@ -24,6 +24,36 @@ const resultTruncated = computed(() => (props.group.result?.tool_output || '').l
 const errorText = computed(() => props.group.result?.tool_error || '')
 const path = computed(() => props.group.result?.tool_path || '')
 const startedAt = computed(() => props.group.call?.timestamp || props.group.result?.timestamp || '')
+
+// 从调用参数 JSON 中提取一行关键入参摘要，折叠态直接展示，
+// 让用户不展开也能看出"读了哪个文件 / 跑了什么命令 / 请求哪个 URL"。
+const argSummary = computed(() => {
+  const raw = callArgs.value
+  if (!raw) return ''
+  let args: Record<string, unknown>
+  try {
+    args = JSON.parse(raw)
+  } catch {
+    return ''
+  }
+  switch (props.group.tool) {
+    case 'ReadFile':
+    case 'WriteFile':
+    case 'ListDir':
+      return String(args.path || '')
+    case 'RunCommand':
+      return String(args.command || '')
+    case 'HTTPGet':
+    case 'HTTPPost':
+      return String(args.url || '')
+    case 'SearchInFiles':
+      return String(args.pattern || '')
+    default:
+      return ''
+  }
+})
+// 折叠态标题行：优先展示具体入参，其次回退到工具 path
+const headline = computed(() => argSummary.value || path.value)
 </script>
 
 <template>
@@ -41,7 +71,7 @@ const startedAt = computed(() => props.group.call?.timestamp || props.group.resu
           {{ statusLabel }}
         </el-tag>
         <span class="text-gray-500 text-[10px]">{{ group.agent }}</span>
-        <span v-if="path" class="text-gray-500 text-[10px] truncate max-w-[280px]" :title="path">→ {{ path }}</span>
+        <span v-if="headline" class="text-gray-400 text-[10px] truncate max-w-[280px]" :title="headline">→ {{ headline }}</span>
       </span>
       <span class="flex items-center gap-2">
         <span class="text-[10px] text-gray-500">{{ fmtTime(startedAt) }}</span>

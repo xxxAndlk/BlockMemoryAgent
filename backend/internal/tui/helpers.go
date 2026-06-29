@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -90,8 +91,9 @@ func (m *Model) showAgentDetailByIndex(idx int) {
 }
 
 type chatItem struct {
-	title  string
-	detail string
+	title     string
+	detail    string
+	timestamp time.Time
 }
 
 // buildPlanLines renders the current session's TaskBoard as flat lines for the popup.
@@ -165,17 +167,101 @@ func (m *Model) buildAgentsLines() []string {
 }
 
 func chatItems(s *server.Session) []chatItem {
-	// TUI chat shows only the conversation: user / assistant / system messages.
-	// All Agent-internal events (think/intend/prompt/token_usage/tool_exec/...)
-	// are logged server-side, not surfaced here.
+	// TUI chat interleaves conversation messages with key Agent events
+	// (tool calls, LLM/think output, errors), merged by timestamp so the ReAct
+	// sequence (think → tool → result → next think) is visible. Pure-debug
+	// events (token_usage/graph_step/agent_created/prompt/stats/agent_done) are
+	// filtered to keep the view readable.
 	var items []chatItem
 	for _, msg := range s.Messages {
 		items = append(items, chatItem{
-			title:  fmt.Sprintf("[%s] %s", msg.Role, msg.Timestamp.Format("15:04:05")),
-			detail: formatMarkdown(msg.Content),
+			title:     fmt.Sprintf("[%s] %s", msg.Role, msg.Timestamp.Format("15:04:05")),
+			detail:    formatMarkdown(msg.Content),
+			timestamp: msg.Timestamp,
 		})
 	}
+	for _, ev := range s.Events {
+		title, detail, ok := eventChatItem(ev)
+		if !ok {
+			continue
+		}
+		items = append(items, chatItem{title: title, detail: detail, timestamp: ev.Timestamp})
+	}
+	// 稳定排序：同时间戳时保持插入顺序（message 先于其后触发的事件）
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].timestamp.Before(items[j].timestamp)
+	})
 	return items
+}
+
+// buildTranscriptLines 把整段对话（消息 + 关键事件）铺成可滚动弹窗用的扁平行列表。
+// 每行按弹窗内宽截断，避免自动换行打乱 overlay 的行级滚动计数。
+// 用途：Ctrl+L / 4 打开的"完整记录"面板，让用户不受窗口高度与输入栏焦点限制，
+// 用 j/k 翻阅全部 LLM 输出 / 工具调用 / 思考过程。
+func (m *Model) buildTranscriptLines() []string {
+	s := m.selectedSession()
+	if s == nil {
+		return []string{"(no active session)"}
+	}
+	items := chatItems(s)
+	if len(items) == 0 {
+		return []string{"(empty — send a message below)"}
+	}
+	// 弹窗内容宽度：boxW = width*4/5，减去 padding(4) + border(2) + 余量
+	maxW := m.width*4/5 - 8
+	if maxW < 40 {
+		maxW = 80
+	}
+	var out []string
+	for _, it := range items {
+		out = append(out, truncate(it.title, maxW))
+		for _, l := range strings.Split(it.detail, "\n") {
+			out = append(out, "    "+truncate(l, maxW-4))
+		}
+		out = append(out, m.styles.Dim.Render("─"))
+	}
+	return out
+}
+
+// eventChatItem 把一个 SessionEvent 映射为对话区的一行（title + detail）。
+// 返回 ok=false 表示该事件类型不展示（调试噪声）。
+func eventChatItem(ev server.SessionEvent) (title, detail string, ok bool) {
+	ts := ev.Timestamp.Format("15:04:05")
+	switch {
+	case ev.Type == "tool_exec" || ev.Kind == "tool_call":
+		tool := ev.Tool
+		if tool == "" {
+			tool = "tool"
+		}
+		status := "✓"
+		if !ev.Success {
+			status = "✗"
+		}
+		title = fmt.Sprintf("🔧 %s %s · %s", tool, status, ts)
+		var d strings.Builder
+		if ev.Message != "" {
+			d.WriteString(ev.Message)
+			d.WriteByte('\n')
+		}
+		if ev.ToolOutput != "" {
+			d.WriteString("结果:\n")
+			d.WriteString(ev.ToolOutput)
+			d.WriteByte('\n')
+		}
+		if ev.ToolError != "" {
+			d.WriteString("错误: ")
+			d.WriteString(ev.ToolError)
+			d.WriteByte('\n')
+		}
+		return title, strings.TrimRight(d.String(), "\n"), true
+	case ev.Kind == "llm_result" || ev.Kind == "think" || ev.Kind == "llm" || ev.Kind == "intend" || ev.Kind == "wait":
+		title = fmt.Sprintf("💭 %s · %s", ev.Agent, ts)
+		return title, ev.Message, true
+	case ev.Kind == "error" || ev.Type == "error":
+		title = fmt.Sprintf("✗ Error · %s · %s", ev.Agent, ts)
+		return title, ev.Message, true
+	}
+	return "", "", false
 }
 
 // formatMarkdown applies light Markdown formatting for the chat view.

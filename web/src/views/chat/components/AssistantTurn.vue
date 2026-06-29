@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { Turn } from '../utils/turns'
+import type { SessionEvent } from '@/types'
+import type { Turn, ToolCallGroup } from '../utils/turns'
 import { fmtTime, agentTextColor } from '../utils/eventStyles'
 import { renderMd } from '@/utils/markdown'
 import ThinkChain from './ThinkChain.vue'
@@ -34,6 +35,34 @@ const statusColor = computed(() => {
 })
 
 const primaryAgent = computed(() => props.turn.agents[0] || 'MetaAgent')
+
+// 把按时间交错的 steps 切成渲染块：连续的 think 合并成一段 ThinkChain，
+// 每个 tool 单独一张 ToolCallCard。这样保留 ReAct 时序
+// （思考 → 工具调用 → 结果 → 下一轮思考），而非原先工具与思考分离两块。
+interface ThinkBlock { type: 'think'; events: SessionEvent[] }
+interface ToolBlock { type: 'tool'; group: ToolCallGroup }
+type RenderBlock = ThinkBlock | ToolBlock
+
+const blocks = computed<RenderBlock[]>(() => {
+  const out: RenderBlock[] = []
+  let buf: SessionEvent[] = []
+  const flush = () => {
+    if (buf.length) {
+      out.push({ type: 'think', events: buf })
+      buf = []
+    }
+  }
+  for (const step of props.turn.steps) {
+    if (step.kind === 'think' && step.event) {
+      buf.push(step.event)
+    } else if (step.kind === 'tool' && step.group) {
+      flush()
+      out.push({ type: 'tool', group: step.group })
+    }
+  }
+  flush()
+  return out
+})
 </script>
 
 <template>
@@ -58,11 +87,11 @@ const primaryAgent = computed(() => props.turn.agents[0] || 'MetaAgent')
         </span>
       </div>
 
-      <!-- 工具调用卡片（在思考链之前显示，让用户先看工具结果） -->
-      <ToolCallCard v-for="g in turn.toolCalls" :key="g.id" :group="g" />
-
-      <!-- 思考链路 -->
-      <ThinkChain :events="turn.thinkChain" :verbose="verbose" />
+      <!-- ReAct 步骤：按时间交错渲染思考链与工具调用，保留时序 -->
+      <template v-for="(b, i) in blocks" :key="i">
+        <ThinkChain v-if="b.type === 'think'" :events="b.events" :verbose="verbose" />
+        <ToolCallCard v-else :group="b.group" />
+      </template>
 
       <!-- 错误事件 -->
       <div v-for="(err, i) in turn.errors" :key="'err-' + i"

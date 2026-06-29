@@ -118,6 +118,13 @@ func (r *toolRunner) emit(ctx context.Context, kind, msg, detail string) {
 	}
 }
 
+// emitTool 推送一条携带工具名的进度事件（用于 tool_call，让前端直接拿到工具名）。
+func (r *toolRunner) emitTool(ctx context.Context, kind, tool, msg, detail string) {
+	if r.progress != nil {
+		r.progress(ctx, ProgressEvent{SessionID: r.session, Kind: kind, Agent: r.agent, Tool: tool, Message: msg, Detail: detail})
+	}
+}
+
 // run 执行工具并返回 JSON 结果字符串。
 // 失败达阈值时通过 ToolContext 设置 ActionLoopExit 跳出 Agent 循环。
 //
@@ -132,8 +139,9 @@ func (r *toolRunner) emit(ctx context.Context, kind, msg, detail string) {
 //   达失败阈值时设置 tools.ActionLoopExit。
 // 并发安全：results 追加持锁；failures 内部持锁；可被 Agent 并发调用。
 func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) string {
-	argsStr, _ := json.Marshal(args)                    // 序列化参数用于事件展示
-	r.emit(ctx, "tool_call", "调用工具 "+name, string(argsStr)) // 推送调用前事件
+	argsStr, _ := json.Marshal(args) // 序列化参数用于事件展示
+	// 推送调用前事件（pending 态）：携带 Tool 名，前端无需正则推断
+	r.emitTool(ctx, "tool_call", name, "调用工具 "+name, string(argsStr))
 
 	// 把 sessionID 注入 ctx，让 executor 知道这是哪个会话的调用
 	ctx = WithSessionID(ctx, r.session)
@@ -145,20 +153,15 @@ func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) 
 	*r.results = append(*r.results, result)
 	r.mu.Unlock()
 
-	// 截断输出用于事件展示，避免长输出撑爆 UI
-	out := result.Output
-	if len(out) > 200 {
-		out = out[:200] + "..."
-	}
+	// 工具结果统一由 ToolExecutor callback → handleToolResult → tool_exec 事件携带
+	// （含完整 Tool/Path/Output/Error/Success/ArgsJSON），这里不再单独 emit
+	// tool_result/error，避免前端一次调用收到多个结果事件导致重复卡片。
 	if result.Success {
-		// 成功：清零该工具的失败计数，推送成功事件
+		// 成功：清零该工具的失败计数
 		r.failures.reset(name)
-		r.emit(ctx, "tool_result", "工具 "+name+" 执行成功", out)
 	} else {
-		// 失败：累加失败计数，推送错误事件
+		// 失败：累加失败计数；达阈值时强制跳出 Agent 循环，避免盲目重试
 		n := r.failures.fail(name)
-		r.emit(ctx, "error", "工具 "+name+" 执行失败", result.Error)
-		// 达阈值：从 ctx 取出 blades 的 ToolContext，设置 ActionLoopExit 强制跳出循环
 		if n >= maxConsecutiveFailures {
 			if tc, ok := tools.FromContext(ctx); ok {
 				tc.SetAction(tools.ActionLoopExit, true)

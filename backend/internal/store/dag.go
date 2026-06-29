@@ -36,8 +36,24 @@ func EnsureDAGSchema(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
+// errDAGStoreNotReady 在 Postgres 未初始化（缺数据库/降级运行）时返回，
+// 让上层优雅降级（记日志、跳过 DAG 调度），而不是 nil 指针 panic。
+var errDAGStoreNotReady = fmt.Errorf("dag store not ready: postgres unavailable (degraded mode)")
+
+// checkReady 校验 PostgresStore 已初始化，未初始化时返回降级错误而非 panic。
+// nil 接收者调用方法是合法的（Go 允许 typed-nil 调方法），真正的 panic 来自解引用 s.db。
+func (s *PostgresStore) checkReady() error {
+	if s == nil || s.db == nil {
+		return errDAGStoreNotReady
+	}
+	return nil
+}
+
 // SaveDAG upsert 一条 DAG 定义。
 func (s *PostgresStore) SaveDAG(ctx context.Context, d *dag.DAG) error {
+	if err := s.checkReady(); err != nil {
+		return err
+	}
 	if d == nil {
 		return fmt.Errorf("nil dag")
 	}
@@ -57,6 +73,9 @@ func (s *PostgresStore) SaveDAG(ctx context.Context, d *dag.DAG) error {
 
 // GetDAG 按 ID 取单条 DAG。
 func (s *PostgresStore) GetDAG(ctx context.Context, id string) (*dag.DAG, error) {
+	if err := s.checkReady(); err != nil {
+		return nil, err
+	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, cron, enabled, tasks, created_at, updated_at
 		FROM dag_jobs WHERE id=$1
@@ -74,6 +93,9 @@ func (s *PostgresStore) GetDAG(ctx context.Context, id string) (*dag.DAG, error)
 
 // ListDAGs 列出全部 DAG。
 func (s *PostgresStore) ListDAGs(ctx context.Context) ([]*dag.DAG, error) {
+	if err := s.checkReady(); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, cron, enabled, tasks, created_at, updated_at
 		FROM dag_jobs ORDER BY updated_at DESC
@@ -99,6 +121,9 @@ func (s *PostgresStore) ListDAGs(ctx context.Context) ([]*dag.DAG, error) {
 
 // DeleteDAG 按 ID 删除 DAG。
 func (s *PostgresStore) DeleteDAG(ctx context.Context, id string) error {
+	if err := s.checkReady(); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM dag_jobs WHERE id=$1`, id)
 	return err
 }
