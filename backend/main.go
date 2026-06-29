@@ -156,7 +156,8 @@ func main() {
 
 	// 初始化会话管理器: 管理内存中的会话生命周期，连接图与存储
 	sessionMgr := server.NewSessionManager(threeLayerGraph, registry)
-	sessionMgr.SetPostgresStore(pgStore) // 注入 Postgres 以持久化历史
+	sessionMgr.SetPostgresStore(pgStore)   // 注入 Postgres 以持久化历史
+	sessionMgr.SetModelFactory(modelFactory) // 注入模型工厂，续话时调轻量模型总结历史
 
 	// 特性3：注入块记忆存储适配器，让 DomainAgent 能归档/检索相似块记忆
 	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})

@@ -15,6 +15,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/cmdqueue" // 用户指令队列（特性6）
 	"github.com/blockmemory/agent/backend/internal/graph"    // Graph 引擎
+	"github.com/blockmemory/agent/backend/internal/model"    // 模型工厂（轻量模型用于历史总结）
 	"github.com/blockmemory/agent/backend/internal/store"    // Postgres 存储
 	"github.com/blockmemory/agent/backend/pkg/enums"         // 枚举常量
 	"github.com/blockmemory/agent/backend/pkg/types"         // 共享类型
@@ -75,12 +76,13 @@ const maxInMemorySessions = 20
 // 持有 Graph 与 RoleRegistry 引用，通过 ToolCallback / ProgressCallback 把
 // Graph 内部事件回流到对应会话的事件流。并发安全（RWMutex 保护 sessions 映射）。
 type SessionManager struct {
-	mu       sync.RWMutex           // 保护 sessions 映射
-	sessions map[string]*Session    // session_id -> Session
-	graph    *graph.ThreeLayerGraph // 注入的 Graph 引擎
-	registry *graph.RoleRegistry    // 注入的角色注册表
-	seq      atomic.Int64           // 会话 ID 自增计数
-	pgStore  *store.PostgresStore   // 可选：Postgres 持久化
+	mu           sync.RWMutex           // 保护 sessions 映射
+	sessions     map[string]*Session    // session_id -> Session
+	graph        *graph.ThreeLayerGraph // 注入的 Graph 引擎
+	registry     *graph.RoleRegistry    // 注入的角色注册表
+	seq          atomic.Int64           // 会话 ID 自增计数
+	pgStore      *store.PostgresStore   // 可选：Postgres 持久化
+	modelFactory *model.ModelFactory    // 可选：模型工厂，用于续话时调轻量模型总结历史
 }
 
 // NewSessionManager 创建会话管理器，并把工具 / 进度回调注入 Graph。
@@ -111,6 +113,12 @@ func NewSessionManager(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry) *
 // 参数：pg - Postgres 存储句柄（可为 nil，表示禁用持久化）。
 func (m *SessionManager) SetPostgresStore(pg *store.PostgresStore) {
 	m.pgStore = pg
+}
+
+// SetModelFactory 注入模型工厂，用于续话时调轻量模型总结历史消息。
+// 参数：mf - 模型工厂句柄（可为 nil，表示禁用 LLM 总结，回退到原始 history 文本）。
+func (m *SessionManager) SetModelFactory(mf *model.ModelFactory) {
+	m.modelFactory = mf
 }
 
 // LaunchSession 实现 dag.SessionLauncher 接口（特性1）。
@@ -1215,10 +1223,62 @@ func (m *SessionManager) reviveFromHistory(id string) *Session {
 	return session
 }
 
+// summarizeHistoryForGoal 用轻量模型把历史对话总结为清晰的目标描述。
+// 设计意图：避免把 raw "role: content" 文本直接作为 DomainGoal 让 MetaAgent 处理，
+// 否则 MetaAgent 会把整段历史当成新目标，容易误判任务边界、重复拆分领域。
+// 调轻量模型把历史压缩为"用户当前想做什么"的一句话目标，让续话路径与新建会话一致。
+//
+// 参数：
+//   - ctx: 上下文（含超时）
+//   - sessionID: 会话 ID（仅用于日志与错误定位）
+//   - history: 历史消息拼接文本（role: content 形式）
+//
+// 返回：
+//   - string: 总结后的目标
+//   - error: 模型不可用 / 调用失败 / 超时 / 空结果时返回，视为系统级故障，调用方应中止续话
+//
+// 容错策略：模型调用是续话的前置依赖，失败即系统级问题，不回退 raw history。
+// 空历史直接返回空串不算错误（无需总结）。
+func (m *SessionManager) summarizeHistoryForGoal(ctx context.Context, sessionID, history string) (string, error) {
+	if strings.TrimSpace(history) == "" {
+		return "", nil // 空历史无需总结，非错误
+	}
+	if m.modelFactory == nil {
+		return "", fmt.Errorf("modelFactory not injected: lightweight model unavailable for session %s", sessionID)
+	}
+	client, err := m.modelFactory.GetLightweightModel(ctx)
+	if err != nil {
+		return "", fmt.Errorf("get lightweight model for session %s: %w", sessionID, err)
+	}
+	prompt := fmt.Sprintf(`你是会话续接助手。请基于以下历史对话，提炼出用户当前想要完成的核心目标。
+要求：
+1. 用一句话（不超过 200 字）描述目标
+2. 保留关键上下文（涉及的文件/领域/已尝试的方案）
+3. 不要复述历史，只输出目标本身
+4. 不要加任何前缀或解释
+
+历史对话：
+%s
+
+用户当前目标：`, history)
+	// 轻量模型总结独立超时 30 秒，避免阻塞续话主流程
+	summaryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	resp, err := client.Generate(summaryCtx, prompt)
+	if err != nil {
+		return "", fmt.Errorf("lightweight summary for session %s failed: %w", sessionID, err)
+	}
+	resp = strings.TrimSpace(resp)
+	if resp == "" {
+		return "", fmt.Errorf("lightweight summary for session %s returned empty response", sessionID)
+	}
+	return resp, nil
+}
+
 // resumeSession 基于历史消息恢复会话执行
-// 职责：构建最近 10 条消息上下文，调用 graph.Invoke 续跑，更新状态并持久化。
+// 职责：用轻量模型总结历史消息为目标，调用 graph.Invoke 续跑，更新状态并持久化。
 // 参数：session - 待恢复的会话（Status 已被设为 running）。
-// 副作用：异步运行；写入 system / agent_done / error 事件；更新 session 状态。
+// 副作用：异步运行；可能调用轻量模型；写入 system / agent_done / error 事件；更新 session 状态。
 func (m *SessionManager) resumeSession(session *Session) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute) // 恢复也用 10 分钟超时
 	defer cancel()
@@ -1230,11 +1290,26 @@ func (m *SessionManager) resumeSession(session *Session) {
 		start = len(session.Messages) - 20 // 仅取最后 20 条
 	}
 	for _, msg := range session.Messages[start:] {
-		history.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content)) // 拼成 role: content 文本
+		fmt.Fprintf(&history, "%s: %s\n", msg.Role, msg.Content) // 拼成 role: content 文本
+	}
+
+	// 用轻量模型把历史对话总结为清晰的目标描述，避免直接塞 raw history 让 MetaAgent 误判
+	// 模型调用失败视为系统级故障，中止续话并将会话置为 error
+	goal, err := m.summarizeHistoryForGoal(ctx, session.ID, history.String())
+	if err != nil {
+		m.mu.Lock()
+		session.Status = enums.SessionStatusError
+		session.Result = err.Error()
+		now := time.Now()
+		session.EndedAt = &now
+		m.mu.Unlock()
+		m.addEvent(session, "error", "System", "续话失败（轻量模型不可用）: "+err.Error(), "", "", "", "", "", false)
+		log.Printf("[%s] resumeSession aborted: %v", session.ID, err)
+		return
 	}
 
 	state := types.NewThreeLayerState(session.ID)
-	state.DomainGoal = history.String()   // 用历史消息作为新目标
+	state.DomainGoal = goal               // 轻量模型总结后的目标
 	state.SessionSummary = session.Result // 携带之前的摘要
 	state.Messages = session.Messages     // 传递消息流
 

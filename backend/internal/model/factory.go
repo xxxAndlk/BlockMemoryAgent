@@ -168,6 +168,14 @@ func (f *ModelFactory) GetDomainModel(ctx context.Context) (LLMClient, error) {
 	return f.GetModel(ctx, "domain") // "domain" 为 Domain/SubDomain 共用缓存键
 }
 
+// GetLightweightModel 获取轻量模型，用于历史总结/检索 query 改写等低开销任务。
+// 设计意图：与主对话模型解耦，可指向更便宜更快的模型，降低高频小任务的成本与延迟。
+// 未配置 lightweight_model 时回退到 DomainAgent 模型（见 resolveConfig）。
+// 并发安全：委托 GetModel。
+func (f *ModelFactory) GetLightweightModel(ctx context.Context) (LLMClient, error) {
+	return f.GetModel(ctx, "lightweight") // "lightweight" 为轻量模型固定缓存键
+}
+
 // resolveConfig 根据角色ID解析模型配置。
 //
 // 职责：把 roleDefID 映射到 AgentModelConfig。
@@ -189,6 +197,13 @@ func (f *ModelFactory) resolveConfig(roleDefID string) types.AgentModelConfig {
 		return f.cfg.MetaAgent.ModelConfig // MetaAgent 专用配置
 	case "domain":
 		return f.cfg.DomainAgent.ModelConfig // DomainAgent 共用配置
+	case "lightweight":
+		// 轻量模型：用于历史总结/检索 query 改写等低开销任务。
+		// 未配置时回退到 DomainAgent 配置，保证启动不中断。
+		if f.cfg.LightweightModel.Model != "" {
+			return f.cfg.LightweightModel
+		}
+		return f.cfg.DomainAgent.ModelConfig
 	default:
 		// 查找固定角色配置（roles.yaml 中显式定义的角色）
 		if role := f.cfg.GetFixedRole(roleDefID); role != nil {
@@ -218,6 +233,10 @@ func (f *ModelFactory) WarmUp(ctx context.Context) error {
 	// 预热 DomainAgent 模型
 	if _, err := f.GetDomainModel(ctx); err != nil {
 		return fmt.Errorf("warmup domain model: %w", err)
+	}
+	// 预热轻量模型（历史总结/检索改写用）；未配置时回退 domain 已预热，此处可容错
+	if _, err := f.GetLightweightModel(ctx); err != nil {
+		return fmt.Errorf("warmup lightweight model: %w", err)
 	}
 	return nil
 }

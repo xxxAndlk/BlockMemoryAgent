@@ -6,8 +6,11 @@ package graph
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
@@ -27,16 +30,16 @@ type ThreeLayerNode interface {
 // 持有静态节点表、角色注册表/工厂、模型工厂、工具回调、进度回调和 Runtime 注入器。
 // 通过 sync.RWMutex 保护 nodes / progress 等可被并发访问的字段。
 type ThreeLayerGraph struct {
-	mu           sync.RWMutex         // 保护 nodes 与 progress 的读写锁
+	mu           sync.RWMutex              // 保护 nodes 与 progress 的读写锁
 	nodes        map[string]ThreeLayerNode // 静态节点表：MetaAgent / EscalationHandler / Sinker + 动态缓存
-	registry     *RoleRegistry        // 角色定义 + 实例的注册表
-	factory      *RoleFactory         // 动态角色工厂（创建 Domain/Assistant 实例）
-	modelFactory *model.ModelFactory  // Eino ChatModel 工厂（按角色缓存）
-	toolCallback ToolCallback         // 工具执行结果回调（推 UI）
-	progress     ProgressCallback     // 思考/意图/工具调用实时推送回调
-	rt           *runtime.Runtime     // 看板/邮箱/Watchdog/人格/Skill 聚合体
-	blockMemory  BlockMemoryStore     // 块记忆存储（特性3：domainAgent 后向量检索）
-	archiveStore DomainArchiveStore   // domainAgent 归档存储（特性4：跨会话复用）
+	registry     *RoleRegistry             // 角色定义 + 实例的注册表
+	factory      *RoleFactory              // 动态角色工厂（创建 Domain/Assistant 实例）
+	modelFactory *model.ModelFactory       // Eino ChatModel 工厂（按角色缓存）
+	toolCallback ToolCallback              // 工具执行结果回调（推 UI）
+	progress     ProgressCallback          // 思考/意图/工具调用实时推送回调
+	rt           *runtime.Runtime          // 看板/邮箱/Watchdog/人格/Skill 聚合体
+	blockMemory  BlockMemoryStore          // 块记忆存储（特性3：domainAgent 后向量检索）
+	archiveStore DomainArchiveStore        // domainAgent 归档存储（特性4：跨会话复用）
 }
 
 // SetBlockMemoryStore 在已构建的图上注入块记忆存储（特性3）。
@@ -83,6 +86,7 @@ type ThreeLayerGraphBuilder struct {
 // 参数：
 //   - registry：角色注册表，用于路由时解析实例。
 //   - factory：角色工厂，用于动态创建 Domain/Assistant。
+//
 // 返回：空的构建器，调用方继续用 Set* 注入依赖，最后 Build()。
 func NewThreeLayerGraphBuilder(registry *RoleRegistry, factory *RoleFactory) *ThreeLayerGraphBuilder {
 	return &ThreeLayerGraphBuilder{
@@ -121,7 +125,7 @@ func (b *ThreeLayerGraphBuilder) SetProgressCallback(cb ProgressCallback) {
 // 副作用：同步给已存在的所有静态节点，保证后续 tick 都能上报进度。
 // 并发安全：写 progress 时持写锁，遍历 nodes 时降级为读锁。
 func (g *ThreeLayerGraph) SetProgressCallback(cb ProgressCallback) {
-	g.mu.Lock()      // 先写锁更新字段
+	g.mu.Lock() // 先写锁更新字段
 	g.progress = cb
 	g.mu.Unlock()
 	// 同步给已存在的静态节点
@@ -156,7 +160,7 @@ func (b *ThreeLayerGraphBuilder) AddNode(node ThreeLayerNode) {
 // 返回：可直接 Invoke 的图实例。
 func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
 	g := &ThreeLayerGraph{
-		nodes:        b.nodes,        // 转移节点表所有权
+		nodes:        b.nodes, // 转移节点表所有权
 		registry:     b.registry,
 		factory:      b.factory,
 		modelFactory: b.modelFactory,
@@ -242,6 +246,7 @@ func (g *ThreeLayerGraph) Runtime() *runtime.Runtime { return g.rt }
 // 参数：
 //   - ctx：上下文，会被 WithSessionID 注入会话 ID。
 //   - state：图状态，跨节点共享。
+//
 // 返回：终态 state 或错误。
 // 副作用：每轮通过 progress 回调推送 graph_step 调试事件。
 // 并发安全：同一会话不应并发 Invoke；nodes 表访问持读锁。
@@ -249,15 +254,38 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	ctx = WithSessionID(ctx, state.SessionID) // 把 sessionID 写入 ctx，供下游日志/存储使用
 	current := "MetaAgent"                    // 入口固定从 MetaAgent 开始
 	stepCount := 0                            // 已执行步数
-	maxSteps := 200                           // 默认步数硬上限，防止死循环
-	if g.rt != nil && g.rt.AgentCfg != nil && g.rt.AgentCfg.MaxSteps > 0 {
-		maxSteps = g.rt.AgentCfg.MaxSteps // 配置覆盖默认值（特性2）
+
+	// —— 死循环防护配置（替代硬步数上限）——
+	// 三层防御：进展检测 + 状态指纹去重 + wall-clock 超时
+	// 配置缺失视为系统级故障，不做兜底；默认值在 config.Load 阶段填充，启动时已校验
+	if g.rt == nil || g.rt.AgentCfg == nil {
+		return nil, fmt.Errorf("运行时配置未注入 (Runtime/AgentCfg 为空)，状态机无法启动")
+	}
+	// 进展检测：连续 N 步状态指纹无变化 → 判死循环
+	stallSteps := g.rt.AgentCfg.StallSteps
+	// 状态指纹去重：同一指纹连续出现 N 次 → 判死循环
+	maxRepeatFP := g.rt.AgentCfg.MaxRepeatFingerprint
+	// wall-clock 超时：单次 Invoke 超过 sessionTimeout → 判死循环
+	sessionTimeout := time.Duration(g.rt.AgentCfg.SessionTimeoutMin) * time.Minute
+
+	// wall-clock 超时：若 ctx 已有 deadline 不早于 sessionTimeout 则保留，否则叠加
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, sessionTimeout)
+		defer cancel()
 	}
 
+	// 进展检测：记录最近一次有进展的步号。进展 = state 关键字段变化（指纹变化）。
+	// 指纹只取影响路由的字段，避免无关字段抖动误判进展。
+	lastProgressStep := 0
+	// 状态指纹去重：记录上一指纹与连续重复次数
+	prevFP := ""
+	repeatCount := 0
+
 	for {
-		// 1. 步数保护：超过上限直接报错退出
-		if stepCount >= maxSteps {
-			return nil, fmt.Errorf("max steps exceeded")
+		// 1. wall-clock 超时检查
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("会话 wall-clock 超时 (%v)，状态机终止 (已执行 %d 步)", sessionTimeout, stepCount)
 		}
 		stepCount++
 
@@ -269,14 +297,14 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 			// 静态表里没有 → 可能是某 Domain/Assistant 的实例 ID
 			node = g.resolveInstanceNode(current)
 			if node == nil {
-				return nil, fmt.Errorf("node %s not found", current)
+				return nil, fmt.Errorf("节点 %s 未找到", current)
 			}
 		}
 
 		// 3. 执行节点：传入当前 state，拿到更新后的 state
 		newState, err := node.Invoke(ctx, state)
 		if err != nil {
-			return nil, fmt.Errorf("node %s failed: %w", current, err)
+			return nil, fmt.Errorf("节点 %s 执行失败: %w", current, err)
 		}
 		state = newState
 
@@ -294,7 +322,26 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 			})
 		}
 
-		// 5. 终止判定：Finish 或 next 为空都结束循环
+		// 5. 进展检测 + 指纹去重（在终止判定之前，避免挂起态误判）
+		fp := fingerprintState(state)
+		if fp != prevFP {
+			// 指纹变化 → 有进展，重置计数
+			lastProgressStep = stepCount
+			repeatCount = 0
+			prevFP = fp
+		} else {
+			// 指纹未变
+			repeatCount++
+			if repeatCount >= maxRepeatFP {
+				return nil, fmt.Errorf("检测到死循环：状态连续 %d 步无变化 (节点=%s)，状态机终止", repeatCount, current)
+			}
+		}
+		// 无进展步数超阈值 → 判死循环
+		if stepCount-lastProgressStep >= stallSteps {
+			return nil, fmt.Errorf("检测到死循环：连续 %d 步无进展 (节点=%s)，状态机终止", stallSteps, current)
+		}
+
+		// 6. 终止判定：Finish 或 next 为空都结束循环
 		if state.NextAction == types.ActionFinish {
 			return state, nil
 		}
@@ -302,6 +349,7 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		// ActionWait：挂起图循环，等待人机对话答复后由 server 侧恢复（特性5）。
 		// 直接 return 而非 continue，避免下一 tick 继续推进；server 在收到 /clarify 答复后会
 		// 通过 resumeSession 重新调用 Invoke，从当前 state 继续执行。
+		// 注意：Wait 态指纹稳定会重复，但此处已 return，不会触发死循环判定。
 		if state.NextAction == types.ActionWait {
 			return state, nil
 		}
@@ -313,11 +361,42 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	}
 }
 
+// fingerprintState 计算状态指纹：取影响路由与语义的关键字段做 SHA256。
+// 只取关键字段而非全 state，避免无关字段（如时间戳）抖动误判进展。
+// 用于死循环检测：连续 N 步指纹不变 → 判死循环。
+func fingerprintState(s *types.ThreeLayerState) string {
+	if s == nil {
+		return ""
+	}
+	h := sha256.New()
+	// 当前节点路由相关
+	fmt.Fprintf(h, "block=%s|domain=%s|goal=%s|action=%s|target=%s|",
+		s.CurrentBlockID, s.CurrentDomain, s.DomainGoal, s.NextAction, s.TargetRoleID)
+	// 调用栈深度 + 顶层 callee（反映 Assistant 调用进展）
+	fmt.Fprintf(h, "stack=%d|top=%s|", len(s.CallStack), s.CurrentAssistantID)
+	// 已完成块（反映领域推进）
+	fmt.Fprintf(h, "done=%v|", s.CompletedBlocks)
+	// 活跃块 ID 集合（反映领域创建进展）
+	activeIDs := make([]string, 0, len(s.ActiveBlocks))
+	for id := range s.ActiveBlocks {
+		activeIDs = append(activeIDs, id)
+	}
+	fmt.Fprintf(h, "active=%v|", activeIDs)
+	// 角色实例数（反映 Agent 创建进展）
+	fmt.Fprintf(h, "roles=%d|", len(s.RoleInstances))
+	// 待处理澄清请求 ID（反映人机对话态）
+	if s.PendingClarify != nil {
+		fmt.Fprintf(h, "clarify=%s|", s.PendingClarify.ID)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16] // 16 字符够去重，节省内存
+}
+
 // resolveInstanceNode 根据实例ID解析节点（动态创建）。
 // 静态节点表查不到时调用：从 registry 取实例元信息，按类型 new 一个对应节点，
 // 注入依赖后缓存回 nodes 表（避免下次再 new）。
 // 参数：
 //   - instID：角色实例 ID（形如 domain_xxx_1 / assistant_2）。
+//
 // 返回：构造好的节点；实例不存在则返回 nil。
 // 副作用：成功时会把新节点写入 g.nodes，后续命中走快路径。
 // 并发安全：读实例无锁（registry 内部自锁），写 nodes 持写锁。
@@ -439,6 +518,7 @@ func (g *ThreeLayerGraph) metaAgentNext(state *types.ThreeLayerState) string {
 // domainAgentNext DomainAgent 的路由策略。
 //   - Switch：切到显式目标角色。
 //   - Continue：无调用栈则回 MetaAgent；否则继续当前 Assistant。
+//
 // 其余情况默认回 MetaAgent 汇报。
 func (g *ThreeLayerGraph) domainAgentNext(state *types.ThreeLayerState) string {
 	switch state.NextAction {
@@ -502,6 +582,7 @@ func (g *ThreeLayerGraph) SetToolCallback(cb ToolCallback) {
 // 便捷工厂：先 NewToolExecutor 拿到默认执行器，再把图的 toolCallback 挂上。
 // 参数：
 //   - workDir：工具执行的工作目录（文件读写 / 命令执行的根）。
+//
 // 返回：已配置回调的 ToolExecutor。
 func (g *ThreeLayerGraph) NewToolExecutor(workDir string) *ToolExecutor {
 	executor := NewToolExecutor(workDir)
@@ -540,6 +621,7 @@ func (g *ThreeLayerGraph) DetermineNext(current string, state *types.ThreeLayerS
 //   - escalation：升级仲裁节点。
 //   - sinker：收尾节点（强制 Finish）。
 //   - registry / factory：必填依赖。
+//
 // 返回：已 Build 的图（依赖仍需通过 Set* 后注入）。
 func BuildThreeLayerGraph(
 	metaAgent ThreeLayerNode,
@@ -549,8 +631,8 @@ func BuildThreeLayerGraph(
 	factory *RoleFactory,
 ) *ThreeLayerGraph {
 	builder := NewThreeLayerGraphBuilder(registry, factory)
-	builder.AddNode(metaAgent)   // 入口节点
-	builder.AddNode(escalation)  // 升级仲裁
-	builder.AddNode(sinker)      // 收尾节点
+	builder.AddNode(metaAgent)  // 入口节点
+	builder.AddNode(escalation) // 升级仲裁
+	builder.AddNode(sinker)     // 收尾节点
 	return builder.Build()
 }

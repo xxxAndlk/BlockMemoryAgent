@@ -20,6 +20,9 @@ type RoleConfigFile struct {
 	MetaAgent MetaAgentConfig `yaml:"meta_agent"`
 	// DomainAgent 所有 DomainAgent/SubDomainAgent 共用的配置(模型层共享)。
 	DomainAgent DomainAgentConfig `yaml:"domain_agent"`
+	// LightweightModel 轻量模型配置，用于历史总结/检索 query 改写等低开销任务。
+	// 与 MetaAgent/DomainAgent 模型解耦，可指向更便宜更快的模型（如 deepseek-v4-lite）。
+	LightweightModel types.AgentModelConfig `yaml:"lightweight_model"`
 	// FixedRoles 固定角色定义列表，对应 fixed_roles 配置项。
 	FixedRoles []types.RoleDefinition `yaml:"fixed_roles"`
 	// DynamicTemplates 动态角色生成模板，由 LLM 在运行时按需实例化为临时助手。
@@ -115,6 +118,9 @@ func (c *RoleConfigFile) resolveEnvVars() {
 	// DomainAgent 模型配置: 密钥与 BaseURL
 	c.DomainAgent.ModelConfig.APIKey = resolveEnv(c.DomainAgent.ModelConfig.APIKey)
 	c.DomainAgent.ModelConfig.BaseURL = resolveEnv(c.DomainAgent.ModelConfig.BaseURL)
+	// 轻量模型配置: 密钥与 BaseURL
+	c.LightweightModel.APIKey = resolveEnv(c.LightweightModel.APIKey)
+	c.LightweightModel.BaseURL = resolveEnv(c.LightweightModel.BaseURL)
 	// 逐个固定角色: 密钥与 BaseURL
 	for i := range c.FixedRoles {
 		c.FixedRoles[i].ModelConfig.APIKey = resolveEnv(c.FixedRoles[i].ModelConfig.APIKey)

@@ -24,30 +24,32 @@ type Config struct {
 // LoggingConfig 日志文件输出配置。
 // 不同入口（浏览器 HTTP 服务 / TUI）写入独立文件，便于按入口排查问题。
 type LoggingConfig struct {
-	Dir     string `yaml:"dir"`      // 日志目录，空则默认 ./logs；自动按入口 + 日期生成文件名
-	Enabled bool   `yaml:"enabled"`  // 是否启用文件日志；false 时仅输出到 stderr
+	Dir     string `yaml:"dir"`     // 日志目录，空则默认 ./logs；自动按入口 + 日期生成文件名
+	Enabled bool   `yaml:"enabled"` // 是否启用文件日志；false 时仅输出到 stderr
 }
 
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
 // 替代散落在 graph 包中的硬编码常量（maxSteps=200、skillSetSize=8、
 // retry=3、LLM 软/硬超时 30s/90s 等），让运维可以通过 config.yaml 调整。
 type AgentConfig struct {
-	MaxSteps          int `yaml:"max_steps"`           // 图状态机最大步数（防死循环）
-	SkillSetSize      int `yaml:"skill_set_size"`      // 每个 DomainAgent 装配的 Skill 子集上限
-	ToolCallMaxRounds int `yaml:"tool_call_max_rounds"`// Assistant 单任务 ReAct 工具调用循环最大轮数
-	RetryCount        int `yaml:"retry_count"`         // Assistant 任务执行指数退避重试次数
-	RetryBackoffMs    int `yaml:"retry_backoff_ms"`    // 重试初始退避时长（毫秒）
-	LLMSoftTimeoutSec int `yaml:"llm_soft_timeout_sec"`// LLM 调用软超时（秒，建议取消）
-	LLMHardTimeoutSec int `yaml:"llm_hard_timeout_sec"`// LLM 调用硬超时（秒，强制取消）
-	ContextWindow     int `yaml:"context_window"`      // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
+	SkillSetSize      int `yaml:"skill_set_size"`       // 每个 DomainAgent 装配的 Skill 子集上限
+	ToolCallMaxRounds int `yaml:"tool_call_max_rounds"` // Assistant 单任务 ReAct 工具调用循环最大轮数
+	RetryCount        int `yaml:"retry_count"`          // Assistant 任务执行指数退避重试次数
+	RetryBackoffMs    int `yaml:"retry_backoff_ms"`     // 重试初始退避时长（毫秒）
+	LLMSoftTimeoutSec int `yaml:"llm_soft_timeout_sec"` // LLM 调用软超时（秒，建议取消）
+	LLMHardTimeoutSec int `yaml:"llm_hard_timeout_sec"` // LLM 调用硬超时（秒，强制取消）
+	ContextWindow     int `yaml:"context_window"`       // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
 	// 抢占中断与队列注入（特性6）
-	InterruptEnabled  bool `yaml:"interrupt_enabled"`   // 是否启用抢占中断
-	QueueInjectEnabled bool `yaml:"queue_inject_enabled"`// 是否启用队列注入
+	InterruptEnabled   bool `yaml:"interrupt_enabled"`    // 是否启用抢占中断
+	QueueInjectEnabled bool `yaml:"queue_inject_enabled"` // 是否启用队列注入
 	// 人机对话（特性5）
-	HumanClarifyEnabled bool `yaml:"human_clarify_enabled"` // 是否启用人机对话
-	HumanClarifyTimeoutSec int `yaml:"human_clarify_timeout_sec"` // 等待用户回答超时（秒）
+	HumanClarifyEnabled    bool `yaml:"human_clarify_enabled"`     // 是否启用人机对话
+	HumanClarifyTimeoutSec int  `yaml:"human_clarify_timeout_sec"` // 等待用户回答超时（秒）
 	// domainAgent 持久化（特性4）
-	DomainArchiveTTLHours int `yaml:"domain_archive_ttl_hours"` // domainAgent 归档默认存活时长（小时）
+	DomainArchiveTTLHours  int `yaml:"domain_archive_ttl_hours"`  // domainAgent 归档默认存活时长（小时）
+	StallSteps             int `yaml:"stall_steps"`               //  Graph 死循环防护 无进展步数阈值：连续 N 步未产生新 Episode / 工具结果 / state 变化 → 判死循环
+	MaxRepeatFingerprint   int `yaml:"max_repeat_fingerprint"`    // 状态指纹重复阈值：同一 state 指纹连续出现 N 次 → 判死循环
+	SessionTimeoutMin      int `yaml:"session_timeout_min"`       // 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
 	DomainArchiveMaxWeight int `yaml:"domain_archive_max_weight"` // domainAgent 归档权重上限
 }
 
@@ -119,7 +121,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	// 为零值字段填充默认值，保证运行参数始终可用
-	cfg.applyDefaults()
+	if err := cfg.applyDefaults(); err != nil {
+		return nil, err
+	}
 	// 将 ${VAR:default} 形式的引用替换为真实环境变量值
 	cfg.resolveEnvVars()
 	return cfg, nil
@@ -127,8 +131,8 @@ func Load(path string) (*Config, error) {
 
 // applyDefaults 为 Config 中所有零值字段填充合理的默认值。
 // 职责：仅在字段为零值时写入默认，避免覆盖用户显式配置。
-// 副作用：就地修改 Config。
-func (c *Config) applyDefaults() {
+// 副作用：就地修改 Config；必要配置缺失时返回 error，让 Load 失败、程序拒绝启动。
+func (c *Config) applyDefaults() error {
 	// —— Postgres 默认值：本地开发 DSN 与中等规模连接池 ——
 	if c.Postgres.DSN == "" {
 		c.Postgres.DSN = "postgres://user:pass@localhost:5432/blockmemory?sslmode=disable"
@@ -203,8 +207,16 @@ func (c *Config) applyDefaults() {
 	// 约定：所有数值字段以 0 表示"未配置"，按字段语义填充默认。
 	// 因此配置侧无法把任一项显式设为 0；如需禁用某参数，请改用对应的
 	// 布尔开关（如 InterruptEnabled）而非将其置 0。
-	if c.Agent.MaxSteps == 0 {
-		c.Agent.MaxSteps = 200
+	// 例外：Graph 死循环防护三项 (StallSteps/MaxRepeatFingerprint/SessionTimeoutMin)
+	// 不做默认值兜底，config.yaml 必须显式提供，缺失即报错 — 配置问题不应让程序运行起来。
+	if c.Agent.StallSteps == 0 {
+		return fmt.Errorf("config agent.stall_steps 未配置：Graph 死循环防护必需，请在 config.yaml 显式设置")
+	}
+	if c.Agent.MaxRepeatFingerprint == 0 {
+		return fmt.Errorf("config agent.max_repeat_fingerprint 未配置：Graph 死循环防护必需，请在 config.yaml 显式设置")
+	}
+	if c.Agent.SessionTimeoutMin == 0 {
+		return fmt.Errorf("config agent.session_timeout_min 未配置：Graph wall-clock 超时必需，请在 config.yaml 显式设置")
 	}
 	if c.Agent.SkillSetSize == 0 {
 		c.Agent.SkillSetSize = 8
@@ -241,6 +253,7 @@ func (c *Config) applyDefaults() {
 	if c.Logging.Dir == "" {
 		c.Logging.Dir = "logs"
 	}
+	return nil
 }
 
 // resolveEnvVars 解析配置中 ${VAR} 与 ${VAR:"default"} 形式的环境变量引用。

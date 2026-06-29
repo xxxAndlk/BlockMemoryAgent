@@ -30,6 +30,16 @@ domain_agent:
     temperature: 0.5
     max_tokens: 4096
 
+# 轻量模型配置（用于历史会话总结、检索 query 改写等低开销任务）
+# 可指向更便宜更快的模型；留空 model 时回退到 domain_agent 模型
+lightweight_model:
+  provider: openai
+  model: deepseek-v4-flash
+  api_key: ${OPENAI_API_KEY}
+  base_url: ${OPENAI_BASE_URL}
+  temperature: 0.2
+  max_tokens: 1024
+
 # Layer 3: 固定助手角色（配置文件预定义，长期存在）
 fixed_roles:
   # 代码助手

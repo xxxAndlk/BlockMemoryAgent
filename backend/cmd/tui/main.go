@@ -111,7 +111,7 @@ func main() {
 	}
 
 	rt := runtime.New(*soulPath, skillPool)
-	if cfg.Agent.MaxSteps > 0 {
+	if cfg.Agent.StallSteps > 0 {
 		rt.SetAgentConfig(&cfg.Agent)
 	}
 
