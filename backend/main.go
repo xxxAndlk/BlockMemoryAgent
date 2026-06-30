@@ -46,31 +46,31 @@ func main() {
 	if _, err := os.Stat(*envPath); err == nil {
 		// 文件存在，尝试解析并加载
 		if err := config.LoadEnvFile(*envPath); err != nil {
-			log.Fatalf("load .env file: %v", err) // 解析失败直接退出
+			log.Fatalf("加载 .env 文件失败: %v", err) // 解析失败直接退出
 		}
-		log.Printf("Loaded environment variables from %s", *envPath)
+		log.Printf("已加载环境变量: %s", *envPath)
 	} else {
 		// 无 .env 文件，回退使用系统环境变量
-		log.Printf("No .env file found at %s, using system environment variables", *envPath)
+		log.Printf("未找到 .env 文件 (%s)，使用系统环境变量", *envPath)
 	}
 
 	// 加载基础设施配置（config.yaml: Postgres DSN、pgvector、Redis、HTTP 地址、记忆间隔等）
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err) // 配置加载失败不可恢复
+		log.Fatalf("加载配置失败: %v", err) // 配置加载失败不可恢复
 	}
 
-	// 日志文件输出（浏览器入口）：按天分割到 logs/browser-YYYY-MM-DD.log
+	// 日志文件输出（后台入口）：按天分割到 logs/backend/YYYY-MM-DD.log
 	// 失败不 fatal：文件日志缺失时仍用 stderr，保证服务可启动。
 	// silent=false：HTTP 入口无 alt-screen，stderr + 文件双写便于开发期实时查看。
 	if cfg.Logging.Enabled {
-		if _, err := logging.Init(logging.EntryBrowser, cfg.Logging.Dir, false); err != nil {
-			log.Printf("warning: init file logging: %v (stderr-only)", err)
+		if _, err := logging.Init(logging.EntryBackend, cfg.Logging.Dir, false); err != nil {
+			log.Printf("警告: 初始化文件日志失败: %v (仅输出到 stderr)", err)
 		} else {
 			defer logging.Close() // 进程退出时关闭文件句柄
 		}
 	}
-	log.Printf("BlockMemoryAgent browser entry starting, log dir=%s", cfg.Logging.Dir)
+	log.Printf("BlockMemoryAgent 后台服务启动中, 日志目录=%s", cfg.Logging.Dir)
 
 	// 根上下文，cancel 在收到信号时触发，用于通知后台任务退出
 	ctx, cancel := context.WithCancel(context.Background())
@@ -79,42 +79,42 @@ func main() {
 	// 初始化 Postgres 存储层；连接失败直接 fatal，不再降级
 	pgStore, err := store.NewPostgresStore(cfg.Postgres.DSN)
 	if err != nil {
-		log.Fatalf("postgres not available: %v (DSN: %s)", err, redactDSN(cfg.Postgres.DSN))
+		log.Fatalf("Postgres 不可用: %v (DSN: %s)", err, redactDSN(cfg.Postgres.DSN))
 	}
 	defer pgStore.Close() // 关闭连接池
 	// 自动应用 session_history 迁移
 	if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
-		log.Fatalf("ensure session_history schema: %v", err)
+		log.Fatalf("初始化 session_history 表失败: %v", err)
 	}
 	// 自动应用 session_events 迁移
 	if err := store.EnsureSessionEventsSchema(ctx, pgStore.DB()); err != nil {
-		log.Fatalf("ensure session_events schema: %v", err)
+		log.Fatalf("初始化 session_events 表失败: %v", err)
 	}
 	// 特性1：自动应用 dag_jobs 表 schema
 	if err := store.EnsureDAGSchema(ctx, pgStore.DB()); err != nil {
-		log.Fatalf("ensure dag_jobs schema: %v", err)
+		log.Fatalf("初始化 dag_jobs 表失败: %v", err)
 	}
-	log.Printf("Postgres connected; session_history + dag_jobs tables ready")
+	log.Printf("Postgres 已连接, session_history + dag_jobs 表就绪")
 
 	// 初始化 Redis 存储层；连接失败直接 fatal
 	redisStore, err := store.NewRedisStore(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
-		log.Fatalf("redis not available: %v (addr=%s)", err, cfg.Redis.Addr)
+		log.Fatalf("Redis 不可用: %v (addr=%s)", err, cfg.Redis.Addr)
 	}
 	defer redisStore.Close() // 关闭连接
-	log.Printf("Redis connected at %s", cfg.Redis.Addr)
+	log.Printf("Redis 已连接: %s", cfg.Redis.Addr)
 
 	// 加载角色配置（roles.yaml: meta_agent/domain_agent/fixed_roles/dynamic_templates）
 	roleCfg, err := pkgconfig.LoadRoleConfig(*rolePath)
 	if err != nil {
-		log.Fatalf("load role config: %v", err) // 角色配置缺失不可恢复
+		log.Fatalf("加载角色配置失败: %v", err) // 角色配置缺失不可恢复
 	}
 
 	// 初始化模型工厂: 按角色缓存 blades ModelProvider 实例
 	modelFactory := model.NewModelFactory(roleCfg)
 	// 预热: 提前创建常用角色模型，缺失 API Key 或连接失败直接 fatal
 	if err := modelFactory.WarmUp(ctx); err != nil {
-		log.Fatalf("model warmup failed: %v", err)
+		log.Fatalf("模型预热失败: %v", err)
 	}
 
 	// 初始化角色注册表（运行期角色实例仓库）和角色工厂（创建动态/固定角色实例）
@@ -123,21 +123,21 @@ func main() {
 
 	// soul.md 必须存在；缺失直接 fatal
 	if *soulPath == "" {
-		log.Fatalf("soul path is required")
+		log.Fatalf("soul 路径必须指定")
 	}
 	if _, err := os.Stat(*soulPath); err != nil {
-		log.Fatalf("soul file not found: %s (%v)", *soulPath, err)
+		log.Fatalf("soul 文件未找到: %s (%v)", *soulPath, err)
 	}
 
 	// Skill yaml 必须存在；缺失直接 fatal
 	if _, err := os.Stat(*skillPath); err != nil {
-		log.Fatalf("skill yaml not found: %s (%v)", *skillPath, err)
+		log.Fatalf("skill 配置文件未找到: %s (%v)", *skillPath, err)
 	}
 	skillPool, err := skill.LoadFromYAML(*skillPath)
 	if err != nil {
-		log.Fatalf("load skill yaml: %v", err)
+		log.Fatalf("加载 skill 配置失败: %v", err)
 	}
-	log.Printf("Loaded skill pool from %s (count=%d)", *skillPath, len(skillPool.All()))
+	log.Printf("已加载 skill 池: %s (数量=%d)", *skillPath, len(skillPool.All()))
 
 	// 创建运行时聚合: 看板 / 邮箱 / Watchdog / 人格 / Skill 注册表，统一注入图与节点
 	rt := runtime.New(*soulPath, skillPool)
@@ -174,7 +174,7 @@ func main() {
 	// DAGHandler 仍注册但所有写操作会返回降级错误（HTTP 500），不会让进程崩溃。
 	var dagScheduler *dag.Scheduler
 	if pgStore == nil {
-		log.Printf("warning: postgres unavailable, DAG scheduler disabled (degraded mode)")
+		log.Printf("警告: Postgres 不可用, DAG 调度器已禁用 (降级模式)")
 	} else {
 		dagScheduler = dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
 		dagScheduler.Start(ctx)
@@ -243,7 +243,7 @@ func main() {
 
 	// 启动 HTTP 服务
 	addr := cfg.HTTP.Addr
-	log.Printf("BlockMemoryAgent starting on http://localhost%s", addr)
+	log.Printf("BlockMemoryAgent 服务启动: http://localhost%s", addr)
 
 	// 构造 http.Server，Handler 指向上面注册好的 mux
 	httpServer := &http.Server{
@@ -254,7 +254,7 @@ func main() {
 	// 后台 goroutine 监听并服务；非 ErrServerClosed 错误视为致命
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
+			log.Fatalf("HTTP 服务错误: %v", err)
 		}
 	}()
 
@@ -264,7 +264,7 @@ func main() {
 	<-sigCh // 阻塞直到收到信号
 
 	// 优雅关闭: 取消上下文并关闭 HTTP 服务
-	log.Println("Shutting down...")
+	log.Println("正在关闭服务...")
 	cancel()
 	httpServer.Close()
 }

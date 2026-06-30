@@ -207,7 +207,7 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 			defer cancel()
 			if n, err := n.archiveStore.CleanupExpiredDomainArchives(bgCtx); err == nil && n > 0 {
 				// 日志即可，不阻塞主路径
-				log.Printf("[MetaAgent] cleaned up %d expired domain archives", n)
+				log.Printf("[MetaAgent] 清理了 %d 个过期领域归档", n)
 			}
 		}()
 	}
@@ -649,7 +649,7 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 		inst, err := n.factory.CreateDomainAgent(ctx, state.SessionID, domain.Name, domain.Goal, "")
 		if err != nil {
 			// 创建失败：打印日志并跳过该领域
-			log.Printf("[MetaAgent] create domain agent %s failed: %v\n", domain.Name, err)
+			log.Printf("[MetaAgent] 创建领域 Agent %s 失败: %v\n", domain.Name, err)
 			continue
 		}
 		// 推送 Agent 创建调试事件
@@ -931,7 +931,7 @@ func (n *MetaAgentNode) finalizeSession(ctx context.Context, state *types.ThreeL
 		}
 		// 超时：保留原始结果并打印警告
 		if timedOut {
-			log.Printf("[MetaAgent] LLM timeout on finalize, keeping raw results. %s\n", n.llmTracker.StatsString())
+			log.Printf("[MetaAgent] LLM 调用超时(最终汇总阶段)，保留原始结果。%s\n", n.llmTracker.StatsString())
 		}
 	}
 }
@@ -1349,7 +1349,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 		// 超时或失败：推送事件并回退规则
 		if timedOut {
 			n.emit(ctx, "error", "领域分析 LLM 调用超时，回退到规则")
-			log.Printf("[MetaAgent] LLM timeout on domain analysis, using rules fallback. %s\n", n.llmTracker.StatsString())
+			log.Printf("[MetaAgent] LLM 调用超时(领域分析阶段)，使用规则兜底。%s\n", n.llmTracker.StatsString())
 		} else if err != nil {
 			n.emitDetail(ctx, "error", "领域分析 LLM 调用失败: "+err.Error(), "")
 		}

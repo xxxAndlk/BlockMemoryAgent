@@ -3,7 +3,6 @@ package tui
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -23,16 +22,22 @@ func (m Model) singleColumnView() string {
 	topH := 3
 	inputH := 4
 	tabsH := 1
-	contentH := m.height - topH - inputH - tabsH
+
+	// 弹窗打开时预先扣减聊天区高度，确保总高度 ≤ m.height，输入框始终可见。
+	overlayH := 0
+	if m.overlay != overlayNone {
+		overlayH = m.height / 3
+		if overlayH < 6 {
+			overlayH = 6
+		}
+	}
+
+	contentH := m.height - topH - inputH - tabsH - overlayH
 	if contentH < 4 {
 		contentH = 4
 	}
 
 	mainRow := m.renderChat(m.width, contentH)
-
-	if m.flash != "" && time.Now().After(m.flashUntil) {
-		m.flash = ""
-	}
 
 	view := lipgloss.JoinVertical(lipgloss.Top,
 		m.renderTopBar(m.width),
@@ -40,12 +45,7 @@ func (m Model) singleColumnView() string {
 		m.renderInput(m.width),
 		m.renderTabs(m.width),
 	)
-	if m.overlay != overlayNone {
-		// Reduce content area to keep input visible when overlay opens.
-		overlayH := m.height / 3
-		if overlayH < 6 {
-			overlayH = 6
-		}
+	if overlayH > 0 {
 		overlay := m.renderOverlay(m.width, overlayH)
 		view = lipgloss.JoinVertical(lipgloss.Left, view, overlay)
 	}
@@ -140,7 +140,7 @@ func (m Model) renderChat(w, h int) string {
 	totalLines := 0
 	for i, item := range items {
 		itemStartLine[i] = totalLines
-		n := 1 + len(strings.Split(item.detail, "\n"))
+		n := 1 + len(displayDetailLines(item.title, item.detail))
 		itemLineCount[i] = n
 		totalLines += n
 	}
@@ -206,12 +206,7 @@ func (m Model) renderChat(w, h int) string {
 		var ls []string
 		titleStr := truncate(item.title, w-8)
 		ls = append(ls, fmt.Sprintf("%s%s %s", marker, m.styles.Dim.Render(icon), roleStyle.Render(titleStr)))
-		detailLines := strings.Split(item.detail, "\n")
-		isTool := strings.HasPrefix(item.title, "🔧")
-		if isTool && len(detailLines) > 5 {
-			detailLines = detailLines[:5]
-			detailLines = append(detailLines, "    ...")
-		}
+		detailLines := displayDetailLines(item.title, item.detail)
 		for _, l := range detailLines {
 			ls = append(ls, "    "+truncate(l, w-6))
 		}
@@ -348,6 +343,17 @@ func (m Model) renderOverlay(w, h int) string {
 	body := lipgloss.JoinVertical(lipgloss.Left, header+hint, content)
 	box := m.styles.Overlay.Width(boxW).Height(boxH).Render(body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// displayDetailLines returns detail lines as they will be rendered.
+// Tool output (🔧 prefix) is truncated to 5 lines + "    ..." to keep the TUI compact.
+func displayDetailLines(title, detail string) []string {
+	lines := strings.Split(detail, "\n")
+	if strings.HasPrefix(title, "🔧") && len(lines) > 5 {
+		lines = lines[:5]
+		lines = append(lines, "    ...")
+	}
+	return lines
 }
 
 func truncate(s string, n int) string {

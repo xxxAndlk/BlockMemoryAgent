@@ -153,7 +153,7 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 	}
 	recs, err := m.pgStore.RecentSessionHistories(ctx, limit) // 查询最近 N 条历史
 	if err != nil {
-		log.Printf("restore sessions: %v", err) // 查询失败仅记录日志
+		log.Printf("恢复会话失败: %v", err) // 查询失败仅记录日志
 		return 0
 	}
 
@@ -201,7 +201,7 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 	}
 
 	if restored > 0 {
-		log.Printf("restored %d sessions from history", restored) // 输出恢复条数
+		log.Printf("从历史恢复了 %d 个会话", restored) // 输出恢复条数
 	}
 	return restored
 }
@@ -238,7 +238,7 @@ func (m *SessionManager) evictCompletedSessions() {
 		dropped++
 	}
 	if dropped > 0 {
-		log.Printf("evicted %d completed sessions from memory (kept %d)", dropped, len(m.sessions))
+		log.Printf("从内存淘汰了 %d 个已完成会话 (保留 %d)", dropped, len(m.sessions))
 	}
 }
 
@@ -553,7 +553,7 @@ func (m *SessionManager) persistHistory(session *Session) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // 持久化超时 3 秒
 	defer cancel()
 	if err := m.pgStore.SaveSessionHistory(ctx, rec); err != nil {
-		log.Printf("[%s] persist history: %v", session.ID, err) // 持久化失败仅日志
+		log.Printf("[%s] 持久化会话历史失败: %v", session.ID, err) // 持久化失败仅日志
 	}
 }
 
@@ -585,7 +585,7 @@ func (m *SessionManager) persistEvents(session *Session) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := m.pgStore.SaveSessionEvents(ctx, session.ID, records); err != nil {
-		log.Printf("[%s] persist events: %v", session.ID, err)
+		log.Printf("[%s] 持久化会话事件失败: %v", session.ID, err)
 	}
 }
 
@@ -833,7 +833,7 @@ func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Reque
 				})
 			}
 		} else {
-			log.Printf("list sessions: db fallback failed: %v", err)
+			log.Printf("列出会话失败(数据库回退): %v", err)
 		}
 	}
 
@@ -1527,7 +1527,7 @@ func (m *SessionManager) resumeSession(session *Session) {
 		session.EndedAt = &now
 		m.mu.Unlock()
 		m.addEvent(session, "error", "System", "续话失败（轻量模型不可用）: "+err.Error(), "", "", "", "", "", false)
-		log.Printf("[%s] resumeSession aborted: %v", session.ID, err)
+		log.Printf("[%s] 续话失败: %v", session.ID, err)
 		return
 	}
 	m.addEvent(session, "think", "LightweightModel",

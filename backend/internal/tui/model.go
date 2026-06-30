@@ -306,15 +306,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rebuildAgents()
 		m.accumulateTokens()
 		// Auto-scroll to bottom when following.
-		if m.chatFollowBottom {
-			s := m.selectedSession()
-			if s != nil {
-				items := chatItems(s)
-				if len(items) > 0 {
-					m.chatScrollLine = 999999 // clamped by viewport calc
-				}
-			}
+		// 清理过期闪屏提示
+		if m.flash != "" && time.Now().After(m.flashUntil) {
+			m.flash = ""
 		}
+		// chatFollowBottom alone triggers bottom-clamping in renderChat;
+		// no sentinel needed.
 		// 弹窗打开时刷新动态内容（完整记录面板在末尾时跟随新输出）
 		if m.overlay != overlayNone {
 			m.refreshOverlay()
@@ -347,13 +344,20 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	// Otherwise wheel scrolls the chat panel (wherever the pointer is).
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
-		m.chatFollowBottom = false
+		if m.chatFollowBottom {
+			m.chatFollowBottom = false
+			m.chatScrollLine = m.chatBottomLine()
+		}
 		m.chatScrollLine -= 3
 		if m.chatScrollLine < 0 {
 			m.chatScrollLine = 0
 		}
 	case tea.MouseButtonWheelDown:
 		m.chatScrollLine += 3
+		// Re-attach follow-bottom when scrolled past content end.
+		if m.chatScrollLine >= m.chatBottomLine() {
+			m.chatFollowBottom = true
+		}
 	}
 	return m, nil
 }
@@ -465,7 +469,7 @@ func (m *Model) moveChatCursor(delta int) {
 	totalLines := 0
 	for i, item := range items {
 		itemStartLine[i] = totalLines
-		totalLines += 1 + len(strings.Split(item.detail, "\n"))
+		totalLines += 1 + len(displayDetailLines(item.title, item.detail))
 	}
 	// Find current item from chatScrollLine (or chatCursor if not scrolled).
 	curItem := m.chatCursor
@@ -486,6 +490,31 @@ func (m *Model) moveChatCursor(delta int) {
 	if m.chatCursor >= len(items)-1 {
 		m.chatFollowBottom = true
 	}
+}
+
+// chatBottomLine returns the scrollLine that places the last content line at
+// the bottom of the chat viewport. Used by mouse-wheel to transition out of
+// follow-bottom mode without jumping.
+func (m *Model) chatBottomLine() int {
+	s := m.selectedSession()
+	if s == nil {
+		return 0
+	}
+	items := chatItems(s)
+	totalLines := 0
+	for _, item := range items {
+		totalLines += 1 + len(displayDetailLines(item.title, item.detail))
+	}
+	contentH := m.height - 8 // topH(3)+inputH(4)+tabsH(1)
+	viewportH := contentH - 2
+	if viewportH < 1 {
+		viewportH = 1
+	}
+	bottom := totalLines - viewportH
+	if bottom < 0 {
+		bottom = 0
+	}
+	return bottom
 }
 
 func (m *Model) handleOverlayEnter() {

@@ -1,8 +1,8 @@
-// Package logging 提供按天分割、按入口分文件的日志输出。
+// Package logging 提供按天分割、按入口分目录的日志输出。
 //
 // 设计意图：
-//   - 项目有两个入口（浏览器 HTTP 服务 / TUI），日志需要分开存放，
-//     便于按入口排查问题：browser-YYYY-MM-DD.log 与 tui-YYYY-MM-DD.log
+//   - 项目有三个入口（backend HTTP 服务 / TUI / web），日志分开存放到子目录：
+//     logs/backend/YYYY-MM-DD.log, logs/tui/YYYY-MM-DD.log, logs/web/YYYY-MM-DD.log
 //   - 按天切割：写日志时检查当前日期，跨天则关闭旧文件、打开新文件
 //   - 不引入 lumberjack 等额外依赖，纯标准库实现
 //
@@ -24,9 +24,13 @@ import (
 type Entry string
 
 const (
-	EntryBrowser Entry = "browser" // 浏览器 HTTP 服务入口
+	EntryBackend Entry = "backend" // 后台 HTTP 服务入口
 	EntryTUI     Entry = "tui"     // 终端 TUI 入口
+	EntryWeb     Entry = "web"     // Web 前端入口
 )
+
+// Deprecated: 使用 EntryBackend 代替。
+const EntryBrowser = EntryBackend
 
 // dailyWriter 按天切换文件的 io.Writer。
 // 跨天时关闭旧文件、打开新文件；同一天内复用已打开的句柄。
@@ -50,10 +54,11 @@ func (w *dailyWriter) Write(p []byte) (int, error) {
 			// 旧文件关闭错误仅忽略：写入已经成功，关闭失败不影响日志
 			_ = w.curFile.Close()
 		}
-		if err := os.MkdirAll(w.dir, 0o755); err != nil {
+		subDir := filepath.Join(w.dir, string(w.entry))
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
 			return 0, fmt.Errorf("create log dir: %w", err)
 		}
-		path := filepath.Join(w.dir, fmt.Sprintf("%s-%s.log", w.entry, today))
+		path := filepath.Join(subDir, fmt.Sprintf("%s.log", today))
 		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			return 0, fmt.Errorf("open log file: %w", err)
