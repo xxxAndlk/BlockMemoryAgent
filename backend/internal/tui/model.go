@@ -36,8 +36,13 @@ type Model struct {
 	sessionsCursor int
 
 	// chat panel
+	chatScrollLine   int // viewport top line (absolute)
 	chatCursor       int
 	chatFollowBottom bool
+
+	// accumulated token counts from token_usage events
+	totalInputTokens  int
+	totalOutputTokens int
 
 	// agents tree (built every tick)
 	agentsNodes []agentTreeNode
@@ -46,7 +51,7 @@ type Model struct {
 	inputMode    int
 	inputRunes   []rune
 	inputCursor  int
-	inputHistory []string
+	inputHistory map[string][]string // sessionID -> 历史输入
 	inputHistIdx int
 
 	// overlay
@@ -96,6 +101,7 @@ func NewModel(
 		focus:      panelChat,
 		chatFollowBottom: true,
 		inputHistIdx:     -1,
+		inputHistory:     make(map[string][]string),
 	}
 	m.refreshSessions()
 	if len(m.sessions) > 0 {
@@ -125,6 +131,7 @@ func (m *Model) selectSession(idx int) {
 	}
 	m.sessionsCursor = idx
 	m.chatCursor = 0
+	m.chatScrollLine = 0
 	m.chatFollowBottom = true
 	m.rebuildAgents()
 }
@@ -297,6 +304,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshSessions()
 		}
 		m.rebuildAgents()
+		m.accumulateTokens()
+		// Auto-scroll to bottom when following.
+		if m.chatFollowBottom {
+			s := m.selectedSession()
+			if s != nil {
+				items := chatItems(s)
+				if len(items) > 0 {
+					m.chatScrollLine = 999999 // clamped by viewport calc
+				}
+			}
+		}
 		// 弹窗打开时刷新动态内容（完整记录面板在末尾时跟随新输出）
 		if m.overlay != overlayNone {
 			m.refreshOverlay()
@@ -330,9 +348,12 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		m.chatFollowBottom = false
-		m.moveChatCursor(-3)
+		m.chatScrollLine -= 3
+		if m.chatScrollLine < 0 {
+			m.chatScrollLine = 0
+		}
 	case tea.MouseButtonWheelDown:
-		m.moveChatCursor(3)
+		m.chatScrollLine += 3
 	}
 	return m, nil
 }
@@ -435,12 +456,34 @@ func (m *Model) moveChatCursor(delta int) {
 	if s == nil {
 		return
 	}
-	items := len(chatItems(s))
-	m.chatCursor = clamp(m.chatCursor+delta, 0, items-1)
+	items := chatItems(s)
+	if len(items) == 0 {
+		return
+	}
+	// Compute item start lines (same as renderChat viewport calc).
+	itemStartLine := make([]int, len(items))
+	totalLines := 0
+	for i, item := range items {
+		itemStartLine[i] = totalLines
+		totalLines += 1 + len(strings.Split(item.detail, "\n"))
+	}
+	// Find current item from chatScrollLine (or chatCursor if not scrolled).
+	curItem := m.chatCursor
+	if m.chatScrollLine > 0 {
+		for i := len(items) - 1; i >= 0; i-- {
+			if itemStartLine[i] <= m.chatScrollLine {
+				curItem = i
+				break
+			}
+		}
+	}
+	newItem := clamp(curItem+delta, 0, len(items)-1)
+	m.chatCursor = newItem
+	m.chatScrollLine = itemStartLine[newItem]
 	if delta < 0 {
 		m.chatFollowBottom = false
 	}
-	if m.chatCursor >= items-1 {
+	if m.chatCursor >= len(items)-1 {
 		m.chatFollowBottom = true
 	}
 }
@@ -561,6 +604,21 @@ func (m *Model) openOverlay(title string, lines []string) {
 	m.overlayTitle = title
 	m.overlayLines = lines
 	m.overlayCursor = 0
+}
+
+// accumulateTokens sums token_usage events and updates total counts.
+func (m *Model) accumulateTokens() {
+	s := m.selectedSession()
+	if s == nil {
+		return
+	}
+	in, out := 0, 0
+	for _, ev := range s.Events {
+		in += ev.InputTokens
+		out += ev.OutputTokens
+	}
+	m.totalInputTokens = in
+	m.totalOutputTokens = out
 }
 
 func clamp(v, lo, hi int) int {

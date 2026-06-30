@@ -82,9 +82,13 @@ func main() {
 		log.Fatalf("postgres not available: %v (DSN: %s)", err, redactDSN(cfg.Postgres.DSN))
 	}
 	defer pgStore.Close() // 关闭连接池
-	// 自动应用 session_history 迁移，避免用户忘记跑 002_session_history.sql
+	// 自动应用 session_history 迁移
 	if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
 		log.Fatalf("ensure session_history schema: %v", err)
+	}
+	// 自动应用 session_events 迁移
+	if err := store.EnsureSessionEventsSchema(ctx, pgStore.DB()); err != nil {
+		log.Fatalf("ensure session_events schema: %v", err)
 	}
 	// 特性1：自动应用 dag_jobs 表 schema
 	if err := store.EnsureDAGSchema(ctx, pgStore.DB()); err != nil {
@@ -176,13 +180,7 @@ func main() {
 		dagScheduler.Start(ctx)
 	}
 
-	// 启动时从 session_history 恢复历史会话到内存，让前端列表不空
-	ctxRestore, cancelRestore := context.WithTimeout(ctx, 5*time.Second) // 最多恢复 5 秒
-	n := sessionMgr.RestoreSessions(ctxRestore, 50)                      // 最多恢复 50 条
-	cancelRestore()                                                      // 释放子上下文
-	if n > 0 {
-		log.Printf("Restored %d past sessions into in-memory list", n)
-	}
+		// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
 
 	// 快照管理器（Redis 热加载 + Postgres 持久化）
 	snapshotMgr := memory.NewSnapshotManager(redisStore, pgStore)
@@ -353,6 +351,12 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 		// /api/sessions/{id}/enqueue —— 队列注入（特性6）
 		if len(path) > len("/api/sessions/") && path[len(path)-len("/enqueue"):] == "/enqueue" {
 			mgr.HandleSessionEnqueue(w, r)
+			return
+		}
+
+		// /api/sessions/{id}/cancel —— 取消运行中会话
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/cancel"):] == "/cancel" {
+			mgr.HandleSessionCancel(w, r)
 			return
 		}
 

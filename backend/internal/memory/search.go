@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -61,10 +62,12 @@ func (s *SearchScorer) ScoreEpisode(ep *types.Episode, query string, queryEmbedd
 	// 初始化评分对象，各分项默认 0，后面逐步填充。
 	score := &types.RelevanceScore{}
 
-	// 1. 语义相似度：依赖查询向量。当前为占位实现，后续将基于 Episode 摘要向量计算余弦相似度。
-	if queryEmbedding != nil {
-		// TODO: 计算 Episode 摘要的嵌入向量并计算余弦相似度
-		score.SemanticSim = 0.5 // 占位值，避免语义分缺失导致权重失衡
+	// 1. 语义相似度：对 Episode 摘要做嵌入，与查询向量计算余弦相似度。
+	if queryEmbedding != nil && s.embedder != nil {
+		epEmbedding, err := s.embedder.Embed(context.Background(), ep.ObservationSummary)
+		if err == nil && len(epEmbedding) > 0 {
+			score.SemanticSim = cosineSimilarity(queryEmbedding, epEmbedding)
+		}
 	}
 
 	// 2. 实体重叠度：基于关键词（字符级）匹配，衡量查询与观察摘要的字面相关度。
@@ -100,10 +103,14 @@ func (s *SearchScorer) ScoreEpisode(ep *types.Episode, query string, queryEmbedd
 // 注意：当 Embedder 调用失败时，queryEmbedding 置 nil 以降级为非语义评分。
 func (s *SearchScorer) SearchAndScore(ctx context.Context, agentID, topicID, query string, episodes []*types.Episode) ([]*ScoredEpisode, error) {
 	// 向量化查询语句，作为语义相似度的输入。
-	queryEmbedding, err := s.embedder.Embed(ctx, query)
-	if err != nil {
-		// 嵌入失败时降级为 nil，ScoreEpisode 内部会跳过语义分计算。
-		queryEmbedding = nil
+	var queryEmbedding []float32
+	if s.embedder != nil {
+		emb, err := s.embedder.Embed(ctx, query)
+		if err != nil {
+			queryEmbedding = nil
+		} else {
+			queryEmbedding = emb
+		}
 	}
 
 	// 预声明结果切片，遍历 Episode 逐个评分。
@@ -118,15 +125,9 @@ func (s *SearchScorer) SearchAndScore(ctx context.Context, agentID, topicID, que
 		})
 	}
 
-	// 按 FinalScore 降序排序（冒泡排序：实现简单，数据规模通常较小）。
-	for i := 0; i < len(results)-1; i++ {
-		for j := 0; j < len(results)-1-i; j++ {
-			// 若前一条分数小于后一条，则交换，使大值上浮。
-			if results[j].Score.FinalScore < results[j+1].Score.FinalScore {
-				results[j], results[j+1] = results[j+1], results[j]
-			}
-		}
-	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score.FinalScore > results[j].Score.FinalScore
+	})
 
 	// 返回排序后的结果切片，调用方可直接取头部作为最相关记忆。
 	return results, nil
@@ -230,4 +231,24 @@ func calculateCausalChain(ep *types.Episode, query string) float64 {
 	}
 	// 返回因果链匹配度。
 	return score
+}
+
+// cosineSimilarity 计算两个等长 float32 向量的余弦相似度。
+// 返回 [0,1] 的相似度值；向量为空或长度不等时返回 0。
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) == 0 || len(b) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var dot, normA, normB float64
+	for i := range a {
+		da := float64(a[i])
+		db := float64(b[i])
+		dot += da * db
+		normA += da * da
+		normB += db * db
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }

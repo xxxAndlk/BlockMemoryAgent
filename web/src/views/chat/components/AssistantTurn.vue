@@ -63,6 +63,15 @@ const blocks = computed<RenderBlock[]>(() => {
   flush()
   return out
 })
+
+// 最后一条 think block 的索引：运行时只展示最新思考，替换而非累计
+const lastThinkIndex = computed(() => {
+  const bs = blocks.value
+  for (let i = bs.length - 1; i >= 0; i--) {
+    if (bs[i].type === 'think') return i
+  }
+  return -1
+})
 </script>
 
 <template>
@@ -79,6 +88,7 @@ const blocks = computed<RenderBlock[]>(() => {
         <span :class="statusColor" class="flex items-center gap-1">
           <el-icon v-if="turn.status === 'running'" class="is-loading"><Loading /></el-icon>
           <el-icon v-else-if="turn.status === 'completed'"><CircleCheck /></el-icon>
+          <el-icon v-else-if="turn.status === 'awaiting_clarify'"><QuestionFilled /></el-icon>
           <el-icon v-else><CircleClose /></el-icon>
           {{ statusLabel }}
         </span>
@@ -87,10 +97,11 @@ const blocks = computed<RenderBlock[]>(() => {
         </span>
       </div>
 
-      <!-- ReAct 步骤：按时间交错渲染思考链与工具调用，保留时序 -->
+      <!-- ReAct 步骤：按时间交错渲染思考链与工具调用，保留时序。
+           思考步骤仅展示最新一条（运行时替换），工具调用全部保留。 -->
       <template v-for="(b, i) in blocks" :key="i">
-        <ThinkChain v-if="b.type === 'think'" :events="b.events" :verbose="verbose" />
-        <ToolCallCard v-else :group="b.group" />
+        <ThinkChain v-if="b.type === 'think' && i === lastThinkIndex" :events="b.events" :verbose="verbose" />
+        <ToolCallCard v-else-if="b.type === 'tool'" :group="b.group" />
       </template>
 
       <!-- 错误事件 -->

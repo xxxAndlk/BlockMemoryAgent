@@ -7,6 +7,7 @@ import {
   createSession,
   sendMessage,
   clarifySession,
+  cancelSession,
   getSession,
   streamSession,
   getSessionAgents,
@@ -29,6 +30,7 @@ const metrics = ref<SessionMetrics | null>(null)
 const loading = ref(false)
 const sending = ref(false)
 const closeStream = ref<(() => void) | null>(null)
+const panelTimer = ref<ReturnType<typeof setInterval> | null>(null)
 
 // 用户偏好
 const verbose = ref(false)
@@ -45,7 +47,10 @@ onMounted(async () => {
   }
 })
 
-onUnmounted(() => closeStream.value?.())
+onUnmounted(() => {
+  closeStream.value?.()
+  stopPanelTimer()
+})
 
 watch(() => route.query.id, (id) => {
   if (id && typeof id === 'string' && id !== activeSession.value?.id) {
@@ -78,6 +83,18 @@ async function openSession(id: string) {
   }
 }
 
+function stopPanelTimer() {
+  if (panelTimer.value !== null) {
+    clearInterval(panelTimer.value)
+    panelTimer.value = null
+  }
+}
+
+function startPanelTimer(sessionId: string) {
+  stopPanelTimer()
+  panelTimer.value = setInterval(() => refreshPanels(sessionId), 3000)
+}
+
 async function refreshPanels(id: string) {
   try {
     const a = await getSessionAgents(id)
@@ -89,6 +106,7 @@ async function refreshPanels(id: string) {
 }
 
 function startStream(s: Session) {
+  startPanelTimer(s.id)
   closeStream.value = streamSession(
     s.id,
     (ev) => {
@@ -102,6 +120,7 @@ function startStream(s: Session) {
       events.value.push(ev as SessionEvent)
     },
     (finalStatus?: string) => {
+      stopPanelTimer()
       // 完成：使用后端 done 帧携带的真实 status，避免把 error/awaiting_clarify 误显示为 completed
       refreshPanels(s.id)
       loadSessions()
@@ -111,7 +130,10 @@ function startStream(s: Session) {
       }
       sending.value = false
     },
-    (err) => console.error('SSE error:', err),
+    (err) => {
+      stopPanelTimer()
+      console.error('SSE error:', err)
+    },
   )
 }
 
@@ -144,8 +166,18 @@ async function handleSubmit(content: string) {
   }
 }
 
+async function handleCancel() {
+  if (!activeSession.value) return
+  try {
+    await cancelSession(activeSession.value.id)
+  } catch (e) {
+    console.error('cancel failed:', e)
+  }
+}
+
 async function handleNewSession() {
   closeStream.value?.()
+  stopPanelTimer()
   events.value = []
   activeSession.value = null
   agents.value = []
@@ -219,14 +251,14 @@ function fmtDateTime(iso: string) {
         </button>
 
         <div v-if="!filteredSessions.length" class="text-center text-xs text-gray-500 py-10">
-          暂无会话，在右侧输入框直接下达命令即可创建。
+          暂无会话，在下方输入框直接下达命令即可创建。
         </div>
       </div>
     </aside>
 
     <!-- 中间对话区 -->
     <main class="flex-1 flex flex-col bg-[#1a1d24] border border-[#2a2d35] rounded-lg overflow-hidden min-w-0">
-      <ChatHeader :session="activeSession" :agents="agents" />
+      <ChatHeader :session="activeSession" :agents="agents" @cancel="handleCancel" />
       <MessageList :events="events" :verbose="verbose" />
       <ChatInput :loading="sending"
                  :session-active="activeSession?.status === 'running'"

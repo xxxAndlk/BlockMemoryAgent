@@ -83,6 +83,19 @@ func (m *Manager) Drain(sessionID string) []Item {
 	return out
 }
 
+// HasPending 检查会话是否有待处理指令（不消费）。
+func (m *Manager) HasPending(sessionID string) bool {
+	m.mu.RLock()
+	q, ok := m.queues[sessionID]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items) > 0
+}
+
 // Delete 清理会话队列（会话结束时调用）。
 func (m *Manager) Delete(sessionID string) {
 	m.mu.Lock()

@@ -10,6 +10,7 @@ const searchSession = ref('')
 const sessions = ref<Session[]>([])
 const loading = ref(false)
 const filter = ref('all')
+const usingMock = ref(false)
 
 
 const quickTags = ['系统架构设计', '代码审查', '接口测试', '混沌演练', '根因分析', '生成周报']
@@ -27,7 +28,7 @@ async function load() {
       getTimeline(12).catch(() => null),
       getActivity(8).catch(() => null),
     ])
-    sessions.value = sessionsRes || mockSessions()
+    sessions.value = sessionsRes || (usingMock.value = true, mockSessions())
     timeline.value = timelineRes?.points || []
     activities.value = activityRes?.activities || []
   } finally {
@@ -162,6 +163,12 @@ function activityStyle(kind: string) {
   <div class="h-full flex gap-6 overflow-hidden">
     <!-- Left Column -->
     <div class="flex-1 flex flex-col gap-6 min-w-0 overflow-y-auto pr-2">
+      <!-- Mock data warning -->
+      <div v-if="usingMock" class="bg-yellow-900/30 border border-yellow-700/50 rounded-lg px-4 py-3 text-sm text-yellow-300 flex items-center gap-2">
+        <el-icon><WarningFilled /></el-icon>
+        <span>后端不可用，当前显示为示例数据</span>
+      </div>
+
       <!-- Create Session -->
       <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
         <template #header>

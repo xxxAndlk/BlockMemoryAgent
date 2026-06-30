@@ -7,6 +7,8 @@ const props = defineProps<{
   agents: AgentNode[]
 }>()
 
+const emit = defineEmits<{ (e: 'cancel'): void }>()
+
 const statusColor = computed(() => {
   if (!props.session) return 'text-gray-500'
   switch (props.session.status) {
@@ -54,6 +56,11 @@ function nodeColor(type: string) {
       <el-tag size="small" effect="plain"
               class="!bg-transparent !border-[#2a2d35] scale-90 shrink-0"
               :class="statusColor">{{ statusLabel }}</el-tag>
+      <el-button v-if="session?.status === 'running'" size="small"
+                 class="!bg-red-900/30 !border-red-700/40 !text-red-400 hover:!bg-red-800/50 shrink-0"
+                 @click="emit('cancel')">
+        <el-icon class="mr-1"><VideoPause /></el-icon>停止
+      </el-button>
       <span class="text-xs text-gray-500 truncate shrink-0">{{ session?.id || '' }}</span>
     </div>
 

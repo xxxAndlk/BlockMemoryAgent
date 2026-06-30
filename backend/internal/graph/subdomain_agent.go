@@ -38,7 +38,7 @@ type SubDomainAgentNode struct {
 }
 
 // SetRuntime 注入 Runtime。nil 时动态参数回退默认值。
-// 特性2 装配路径：ThreeLayerGraph.injectModelFactory 在装载阶段把 g.rt 同步给
+// 特性2 装配路径：ThreeLayerGraph.injectDependencies 在装载阶段把 g.rt 同步给
 // 三层节点，让 SubDomainAgent 也能读到 AgentCfg.RetryCount / ToolCallMaxRounds 等。
 func (n *SubDomainAgentNode) SetRuntime(rt *runtime.Runtime) {
 	n.rt = rt

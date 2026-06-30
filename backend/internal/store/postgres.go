@@ -538,6 +538,24 @@ type SessionHistoryRecord struct {
 	ToolResults []map[string]any `json:"tool_results"` // 工具调用结果数组
 	CreatedAt   time.Time        `json:"created_at"`   // 创建时间
 }
+// SessionEventRecord 会话事件归档记录。
+type SessionEventRecord struct {
+	SessionID    string    `json:"session_id"`
+	Type         string    `json:"type"`
+	Agent        string    `json:"agent"`
+	Message      string    `json:"message"`
+	Kind         string    `json:"kind"`
+	Tool         string    `json:"tool"`
+	ToolPath     string    `json:"tool_path"`
+	ToolOutput   string    `json:"tool_output"`
+	ToolError    string    `json:"tool_error"`
+	Success      bool      `json:"success"`
+	Timestamp    time.Time `json:"timestamp"`
+	Prompt       string    `json:"prompt"`
+	InputTokens  int       `json:"input_tokens"`
+	OutputTokens int       `json:"output_tokens"`
+	DetailJSON   string    `json:"detail_json"`
+}
 
 // SaveSessionHistory 持久化一次会话的 goal/summary/工具调用结果。
 // 参数:
@@ -560,6 +578,56 @@ func (s *PostgresStore) SaveSessionHistory(ctx context.Context, rec *SessionHist
 		ON CONFLICT DO NOTHING
 	`, rec.SessionID, rec.Goal, rec.Summary, data, rec.CreatedAt)
 	return err
+}
+
+// SaveSessionEvents 批量持久化会话事件。
+func (s *PostgresStore) SaveSessionEvents(ctx context.Context, sessionID string, events []SessionEventRecord) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO session_events (session_id, type, agent, message, kind, tool, tool_path, tool_output, tool_error, success, timestamp, prompt, input_tokens, output_tokens, detail_json)
+		VALUES (,,,,,,,,,0,1,2,3,4,5)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, e := range events {
+		_, err := stmt.ExecContext(ctx, sessionID, e.Type, e.Agent, e.Message, e.Kind, e.Tool, e.ToolPath, e.ToolOutput, e.ToolError, e.Success, e.Timestamp, e.Prompt, e.InputTokens, e.OutputTokens, e.DetailJSON)
+		if err != nil {
+			return fmt.Errorf("insert event: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// GetSessionEvents 读取某个会话的全部事件（按时间升序）。
+func (s *PostgresStore) GetSessionEvents(ctx context.Context, sessionID string) ([]SessionEventRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT session_id, type, agent, message, kind, tool, tool_path, tool_output, tool_error, success, timestamp, prompt, input_tokens, output_tokens, detail_json
+		FROM session_events
+		WHERE session_id = 
+		ORDER BY timestamp ASC
+	`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []SessionEventRecord
+	for rows.Next() {
+		var e SessionEventRecord
+		if err := rows.Scan(&e.SessionID, &e.Type, &e.Agent, &e.Message, &e.Kind, &e.Tool, &e.ToolPath, &e.ToolOutput, &e.ToolError, &e.Success, &e.Timestamp, &e.Prompt, &e.InputTokens, &e.OutputTokens, &e.DetailJSON); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		events = append(events, e)
+	}
+	return events, rows.Err()
 }
 
 // RecentSessionHistories 返回最近 limit 条会话历史 (按时间倒序)。
@@ -641,12 +709,6 @@ func pgVector(v []float32) string {
 }
 
 // EnsureSessionHistorySchema 自动创建 session_history 表 (幂等)。
-// 启动时调用,避免用户忘记跑 migrations/002_session_history.sql 导致
-// SaveSessionHistory 静默失败。
-// 参数:
-//   - db: 任意 *sql.DB 连接
-// 返回: 建表/建索引错误。
-// 副作用: 建表 + 建索引 (IF NOT EXISTS),可重复执行。
 func EnsureSessionHistorySchema(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS session_history (
@@ -662,6 +724,34 @@ CREATE INDEX IF NOT EXISTS idx_session_history_created_at
 `)
 	return err
 }
+
+// EnsureSessionEventsSchema 自动创建 session_events 表 (幂等)。
+func EnsureSessionEventsSchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS session_events (
+    id            BIGSERIAL PRIMARY KEY,
+    session_id    VARCHAR(64) NOT NULL,
+    type          VARCHAR(32) NOT NULL DEFAULT '',
+    agent         VARCHAR(128) NOT NULL DEFAULT '',
+    message       TEXT NOT NULL DEFAULT '',
+    kind          VARCHAR(32) NOT NULL DEFAULT '',
+    tool          VARCHAR(128) NOT NULL DEFAULT '',
+    tool_path     TEXT NOT NULL DEFAULT '',
+    tool_output   TEXT NOT NULL DEFAULT '',
+    tool_error    TEXT NOT NULL DEFAULT '',
+    success       BOOLEAN NOT NULL DEFAULT false,
+    timestamp     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    prompt        TEXT NOT NULL DEFAULT '',
+    input_tokens  INT NOT NULL DEFAULT 0,
+    output_tokens INT NOT NULL DEFAULT 0,
+    detail_json   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_session_events_session_ts
+    ON session_events (session_id, timestamp);
+`)
+	return err
+}
+
 
 // scanKnowledgeRows 扫描知识库查询结果集,统一处理 NULL 字段与 JSONB 反序列化。
 // 参数:

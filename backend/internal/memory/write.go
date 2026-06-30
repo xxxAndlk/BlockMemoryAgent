@@ -73,20 +73,54 @@ func (s *SimpleSummarizer) Summarize(content string) string {
 type SimpleFactExtractor struct{}
 
 // ExtractFacts 提取关键事实。
-// 职责: 从 content 中抽取事实短句（当前为截取前缀的占位实现）。
+// 职责: 将 content 按句分割，取前 3 句作为事实条目。
 // 参数: content - 原始观察文本。
 // 返回: 事实字符串切片；空输入返回 nil。
 // 副作用: 无。
 // 并发安全: 是（无共享状态）。
 func (e *SimpleFactExtractor) ExtractFacts(content string) []string {
-	// 简单实现: 占位逻辑，后续可扩展为句子分割与关键信息过滤
+	if len(content) == 0 {
+		return nil
+	}
+	// 按中英文标点分句：。！？!?.\n
+	sentences := splitSentences(content)
 	var facts []string
-	// TODO: 实现更复杂的事实提取
-	// 仅在内容非空时截取前 100 字符作为事实条目
-	if len(content) > 0 {
+	for _, s := range sentences {
+		s = strings.TrimSpace(s)
+		if len(s) > 0 {
+			facts = append(facts, s)
+		}
+		if len(facts) >= 3 {
+			break
+		}
+	}
+	if len(facts) == 0 {
 		facts = append(facts, content[:min(100, len(content))])
 	}
 	return facts
+}
+
+// splitSentences 按标点符号分割句子。
+func splitSentences(text string) []string {
+	var sentences []string
+	start := 0
+	runes := []rune(text)
+	for i, r := range runes {
+		switch r {
+		case '。', '！', '？', '.', '!', '?', '\n':
+			if i > start {
+				sentences = append(sentences, string(runes[start:i+1]))
+			}
+			start = i + 1
+		}
+	}
+	if start < len(runes) {
+		remain := strings.TrimSpace(string(runes[start:]))
+		if len(remain) > 0 {
+			sentences = append(sentences, remain)
+		}
+	}
+	return sentences
 }
 
 // SimpleImportanceScorer 简单重要性评分器。

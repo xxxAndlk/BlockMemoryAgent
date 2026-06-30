@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/blockmemory/agent/backend/internal/graph"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -37,6 +38,7 @@ type ContextAssembler struct {
 	globalKB  GlobalRetriever     // 全局知识检索句柄
 	store     PrivateStore        // 私有记忆存储句柄，提供 Episode 读取
 	budget    *types.TokenBudget  // 4 段 Token 预算配置
+	scorer    *SearchScorer       // 多信号评分器（可选），nil 时退回重要性排序
 }
 
 // NewContextAssembler 创建上下文构建器并初始化默认 Token 预算。
@@ -60,6 +62,9 @@ func NewContextAssembler(workspace WorkspaceReader, globalKB GlobalRetriever, st
 		},
 	}
 }
+
+// SetScorer 注入多信号评分器，启用语义级记忆排序。
+func (a *ContextAssembler) SetScorer(scorer *SearchScorer) { a.scorer = scorer }
 
 // BuildContext 构建一次 LLM 调用所需的完整上下文。
 // 流程：取话题元数据 → 取约束 → 取上游输出 → 取私有记忆 → 全局知识检索 →
@@ -117,7 +122,7 @@ func (a *ContextAssembler) BuildContext(ctx context.Context, req *graph.BuildReq
 	}
 
 	// 5. 按相关性分配配额并裁剪私有记忆，控制在 PrivateMemory 预算内。
-	selectedEpisodes := a.allocateByRelevance(episodes, a.budget.PrivateMemory)
+	selectedEpisodes := a.allocateByRelevance(episodes, req.TaskQuery, a.budget.PrivateMemory)
 
 	// 6. 组装为消息列表，按 System / TopicGlobal / SharedState / GlobalKB / Private / Snapshot / Task 顺序拼接。
 	messages := a.buildMessages(topicMeta, constraints, sharedOutputs, selectedEpisodes, globalRecords, req)
@@ -129,48 +134,52 @@ func (a *ContextAssembler) BuildContext(ctx context.Context, req *graph.BuildReq
 	}, nil
 }
 
-// allocateByRelevance 按相关性（当前实现为重要性）分配 Token 配额，裁剪私有记忆。
-// 简化实现：按 Importance 降序排序，再按"每条平均 200 token"的估算截取前 N 条。
+// allocateByRelevance 按多信号相关性分配 Token 配额，裁剪私有记忆。
+// 优先使用 scorer 做语义+实体+因果+时间多信号评分；scorer 为 nil 时退回重要性排序。
 //
 // 参数：
 //   - episodes: 候选 Episode 列表。
+//   - query: 当前任务查询文本，供多信号评分使用。
 //   - budget: PrivateMemory 段的 Token 预算上限。
 //
-// 返回：裁剪后的 Episode 切片（按重要性降序）；输入为空时返回 nil。
-// 副作用：无（内部 copy 一份避免修改入参）。
-// TODO: 实现完整的多信号评分和配额分配。
-func (a *ContextAssembler) allocateByRelevance(episodes []*types.Episode, budget int) []*types.Episode {
-	// 无候选时直接返回 nil，避免后续空操作。
+// 返回：裁剪后的 Episode 切片（按相关性降序）；输入为空时返回 nil。
+// 副作用：scorer 非 nil 时可能调用 Embedder 计算语义相似度。
+func (a *ContextAssembler) allocateByRelevance(episodes []*types.Episode, query string, budget int) []*types.Episode {
 	if len(episodes) == 0 {
 		return nil
 	}
 
-	// 简化实现：按重要性降序，取前 N 条。
-	// TODO: 实现完整的多信号评分和配额分配
-	// 复制一份切片，避免在排序时修改调用方的底层数组。
 	sorted := make([]*types.Episode, len(episodes))
 	copy(sorted, episodes)
 
-	// 按重要性降序排序（简化冒泡排序：数据量小，复杂度可控）。
-	for i := 0; i < len(sorted)-1; i++ {
-		for j := 0; j < len(sorted)-1-i; j++ {
-			// 前一条重要性小于后一条时交换，使高重要性上浮。
-			if sorted[j].Importance < sorted[j+1].Importance {
-				sorted[j], sorted[j+1] = sorted[j+1], sorted[j]
+	if a.scorer != nil {
+		// 多信号评分：为每条 episode 调用 ScoreEpisode，综合语义/实体/时间/因果
+		results, err := a.scorer.SearchAndScore(context.Background(), "", "", query, sorted)
+		if err == nil {
+			// 按 FinalScore 降序提取 episode
+			sorted = make([]*types.Episode, 0, len(results))
+			for _, r := range results {
+				sorted = append(sorted, r.Episode)
 			}
 		}
 	}
 
-	// 计算可容纳的条数（假设每条平均 200 token）。
-	avgTokens := 200
-	// 预算除以单条均值得到可容纳上限。
-	maxCount := budget / avgTokens
-	if maxCount > len(sorted) {
-		// 若预算允许容纳全部，则取实际条数，避免切片越界。
-		maxCount = len(sorted)
+	// scorer 不可用时回退到重要性排序
+	if a.scorer == nil {
+		sort.Slice(sorted, func(i, j int) bool {
+			return sorted[i].Importance > sorted[j].Importance
+		})
 	}
 
-	// 返回前 maxCount 条高重要性 Episode。
+	avgTokens := 200
+	maxCount := budget / avgTokens
+	if maxCount > len(sorted) {
+		maxCount = len(sorted)
+	}
+	if maxCount <= 0 {
+		maxCount = 1
+	}
+
 	return sorted[:maxCount]
 }
 

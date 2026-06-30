@@ -41,6 +41,10 @@ export function sendMessage(id: string, content: string): Promise<void> {
   })
 }
 
+export function cancelSession(id: string): Promise<{ session_id: string; status: string }> {
+  return fetchJson(`/sessions/${id}/cancel`, { method: 'POST' })
+}
+
 export function clarifySession(id: string, answer: string): Promise<void> {
   return fetchJson(`/sessions/${id}/clarify`, {
     method: 'POST',

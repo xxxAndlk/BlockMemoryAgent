@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -206,7 +207,7 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 			defer cancel()
 			if n, err := n.archiveStore.CleanupExpiredDomainArchives(bgCtx); err == nil && n > 0 {
 				// 日志即可，不阻塞主路径
-				fmt.Printf("[MetaAgent] cleaned up %d expired domain archives\n", n)
+				log.Printf("[MetaAgent] cleaned up %d expired domain archives", n)
 			}
 		}()
 	}
@@ -510,11 +511,6 @@ func (n *MetaAgentNode) loadMessagesSection(state *types.ThreeLayerState) string
 // 副作用：创建 DomainAgent 实例；写入 ActiveBlocks、TaskBoard；更新 SessionSummary。
 func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	n.emit(ctx, "think", "分析用户目标，决定是否需要拆分领域")
-	// 加载跨会话历史，拼成"已知历史"段落注入后续 prompt
-	historySection := n.loadHistorySection(ctx)
-	if historySection != "" {
-		n.emit(ctx, "think", "已加载跨会话历史作为上下文")
-	}
 
 	// 简单问题直接回答，不拆分
 	messagesSection := n.loadMessagesSection(state)
@@ -576,10 +572,10 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 
 请直接回答用户的简单问题，保持简洁友好。回答请控制在 2000 字以内，确保核心结论完整。
 %s
-%s%s
+%s
 用户问题：%s
 
-你的回答：`, fmtEnvSection(), historySection, messagesSection, state.DomainGoal))
+你的回答：`, fmtEnvSection(), messagesSection, state.DomainGoal))
 		// LLM 超时：写入超时提示并结束
 		if timedOut {
 			state.SessionSummary = "LLM调用超时，请稍后重试" // 写入超时摘要
@@ -653,7 +649,7 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 		inst, err := n.factory.CreateDomainAgent(ctx, state.SessionID, domain.Name, domain.Goal, "")
 		if err != nil {
 			// 创建失败：打印日志并跳过该领域
-			fmt.Printf("[MetaAgent] create domain agent %s failed: %v\n", domain.Name, err)
+			log.Printf("[MetaAgent] create domain agent %s failed: %v\n", domain.Name, err)
 			continue
 		}
 		// 推送 Agent 创建调试事件
@@ -935,7 +931,7 @@ func (n *MetaAgentNode) finalizeSession(ctx context.Context, state *types.ThreeL
 		}
 		// 超时：保留原始结果并打印警告
 		if timedOut {
-			fmt.Printf("[MetaAgent] LLM timeout on finalize, keeping raw results. %s\n", n.llmTracker.StatsString())
+			log.Printf("[MetaAgent] LLM timeout on finalize, keeping raw results. %s\n", n.llmTracker.StatsString())
 		}
 	}
 }
@@ -1321,8 +1317,6 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 		goal = state.SessionSummary
 	}
 
-	// 加载历史与对话段落
-	historySection := n.loadHistorySection(ctx)
 	messagesSection := n.loadMessagesSection(state)
 
 	// 尝试使用LLM分析领域
@@ -1333,7 +1327,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 
 用户目标: %s
 %s
-%s%s
+%s
 要求:
 - 每个领域名称简短（2-6个字），禁止使用"通用"作为领域名——必须根据目标语义给出具体领域名（如"AI股票分析"、"贪吃蛇游戏"、"数据库检查"）
 - 领域之间应该尽量独立
@@ -1342,7 +1336,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 - 输出JSON数组格式: [{"name":"领域名","goal":"该领域需要完成的目标"}]
 - 只输出JSON数组，不要代码块标记，不要任何解释文字
 
-领域列表:`, goal, fmtEnvSection(), historySection, messagesSection))
+领域列表:`, goal, fmtEnvSection(), messagesSection))
 		if !timedOut && err == nil && resp != "" {
 			n.emit(ctx, "think", "LLM 返回领域分析结果，正在解析")
 			// 解析 JSON 为领域列表
@@ -1355,7 +1349,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 		// 超时或失败：推送事件并回退规则
 		if timedOut {
 			n.emit(ctx, "error", "领域分析 LLM 调用超时，回退到规则")
-			fmt.Printf("[MetaAgent] LLM timeout on domain analysis, using rules fallback. %s\n", n.llmTracker.StatsString())
+			log.Printf("[MetaAgent] LLM timeout on domain analysis, using rules fallback. %s\n", n.llmTracker.StatsString())
 		} else if err != nil {
 			n.emitDetail(ctx, "error", "领域分析 LLM 调用失败: "+err.Error(), "")
 		}

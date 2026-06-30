@@ -50,6 +50,7 @@ type AgentConfig struct {
 	StallSteps             int `yaml:"stall_steps"`               //  Graph 死循环防护 无进展步数阈值：连续 N 步未产生新 Episode / 工具结果 / state 变化 → 判死循环
 	MaxRepeatFingerprint   int `yaml:"max_repeat_fingerprint"`    // 状态指纹重复阈值：同一 state 指纹连续出现 N 次 → 判死循环
 	SessionTimeoutMin      int `yaml:"session_timeout_min"`       // 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
+	MaxSteps               int `yaml:"max_steps"`                 //  Graph 绝对步数上限（安全网，超出即使无死循环也终止），0 表示不限制
 	DomainArchiveMaxWeight int `yaml:"domain_archive_max_weight"` // domainAgent 归档权重上限
 }
 

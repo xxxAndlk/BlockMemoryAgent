@@ -8,7 +8,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -55,22 +54,19 @@ func main() {
 	}
 
 	// 日志文件输出（TUI 入口）：按天分割到 logs/tui-YYYY-MM-DD.log
-	// 与浏览器入口分文件，便于按入口排查问题。
-	// silent=true：仅写文件，不写 stderr——bubbletea 用 alt-screen 全屏接管终端，
-	// 若日志仍走 stderr 会刷到屏幕上顶乱 TUI 布局、把输入框顶跑。TUI 必须静默 stderr。
-	if cfg.Logging.Enabled {
-		if _, err := logging.Init(logging.EntryTUI, cfg.Logging.Dir, true); err != nil {
-			// Init 失败时 log 仍走默认 stderr；此时也无法靠它上屏提示，记到 stdout 兜底
-			fmt.Println("warning: init file logging:", err)
-		} else {
-			defer logging.Close()
-		}
-	} else {
-		// 未启用文件日志时，TUI 也必须把 log 输出从 stderr 改走，否则同样上屏。
-		// 重定向到 io.Discard（丢弃）—— TUI 模式下日志无终端可看，需开文件日志才能查。
-		log.SetOutput(io.Discard)
+	// bubbletea 用 alt-screen 全屏接管终端，日志若走 stderr 会刷到屏幕上顶乱布局。
+	// TUI 必须静默 stderr，始终写文件。即使配置中未启用文件日志，也写入默认目录兜底，
+	// 避免日志完全丢入 io.Discard 导致排障无据可查。
+	logDir := cfg.Logging.Dir
+	if !cfg.Logging.Enabled || logDir == "" {
+		logDir = "logs"
 	}
-	log.Printf("BlockMemoryAgent TUI entry starting, log dir=%s", cfg.Logging.Dir)
+	if _, err := logging.Init(logging.EntryTUI, logDir, true); err != nil {
+		fmt.Println("warning: init file logging:", err)
+	} else {
+		defer logging.Close()
+	}
+	log.Printf("BlockMemoryAgent TUI entry starting, log dir=%s", logDir)
 
 	ctx := context.Background()
 
@@ -84,6 +80,9 @@ func main() {
 			defer pgStore.Close()
 			if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
 				log.Printf("warning: session_history schema: %v", err)
+			}
+			if err := store.EnsureSessionEventsSchema(ctx, pgStore.DB()); err != nil {
+				log.Printf("warning: session_events schema: %v", err)
 			}
 			if err := store.EnsureDAGSchema(ctx, pgStore.DB()); err != nil {
 				log.Printf("warning: dag_jobs schema: %v", err)
@@ -142,6 +141,9 @@ func main() {
 
 	sessionMgr := server.NewSessionManager(threeLayerGraph, registry)
 	sessionMgr.SetPostgresStore(pgStore)
+	sessionMgr.SetModelFactory(modelFactory) // 注入模型工厂，续话时调轻量模型总结历史
+
+		// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
 
 	if pgStore != nil {
 		threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})
@@ -176,6 +178,12 @@ func main() {
 	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
 	mux.Handle("/api/dag", dagHandler)
 	mux.Handle("/api/dag/", dagHandler)
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		pgOnline := pgStore != nil
+		llmOnline := modelFactory != nil
+		fmt.Fprintf(w, `{"postgres":{"online":%v},"redis":{"online":false,"detail":"not configured in TUI"},"llm":{"online":%v}}`, pgOnline, llmOnline)
+	})
 
 	// 监听 127.0.0.1:0 让内核分配空闲端口，避免与其他进程冲突；端口通过 ln.Addr() 回传给 TUI
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -194,6 +202,12 @@ func main() {
 	modelName := roleCfg.MetaAgent.ModelConfig.Model
 	model := tui.NewModel(sessionMgr, registry, rt, dagHandler, pgStore, httpAddr, modelName)
 	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
+	// panic 恢复：确保异常退出时记录堆栈，bubbletea 自身会恢复终端
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("TUI panic recovered: %v (terminal may need reset)", r)
+		}
+	}()
 	if _, err := p.Run(); err != nil {
 		log.Fatalf("TUI error: %v", err)
 	}
@@ -226,6 +240,8 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 			mgr.HandleSessionInterrupt(w, r) // 特性6：抢占中断
 		case "enqueue":
 			mgr.HandleSessionEnqueue(w, r) // 特性6：队列注入
+		case "cancel":
+			mgr.HandleSessionCancel(w, r) // 取消运行中会话
 		case "board":
 			mgr.HandleSessionBoard(w, r)
 		case "agents":

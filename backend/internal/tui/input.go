@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -27,7 +28,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		cmd := string(m.inputRunes)
 		if strings.TrimSpace(cmd) != "" {
-			m.inputHistory = append(m.inputHistory, cmd)
+			m.pushHistory(cmd)
 		}
 		m.inputHistIdx = -1
 		m.submitInput(cmd)
@@ -39,26 +40,28 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyUp:
-		if len(m.inputHistory) == 0 {
+		h := m.sessionHistory()
+		if len(h) == 0 {
 			return m, nil
 		}
 		if m.inputHistIdx == -1 {
-			m.inputHistIdx = len(m.inputHistory)
+			m.inputHistIdx = len(h)
 		}
 		if m.inputHistIdx > 0 {
 			m.inputHistIdx--
-			m.inputRunes = []rune(m.inputHistory[m.inputHistIdx])
+			m.inputRunes = []rune(h[m.inputHistIdx])
 			m.inputCursor = len(m.inputRunes)
 		}
 		return m, nil
 
 	case tea.KeyDown:
+		h := m.sessionHistory()
 		if m.inputHistIdx == -1 {
 			return m, nil
 		}
-		if m.inputHistIdx < len(m.inputHistory)-1 {
+		if m.inputHistIdx < len(h)-1 {
 			m.inputHistIdx++
-			m.inputRunes = []rune(m.inputHistory[m.inputHistIdx])
+			m.inputRunes = []rune(h[m.inputHistIdx])
 			m.inputCursor = len(m.inputRunes)
 		} else {
 			m.inputHistIdx = -1
@@ -116,6 +119,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // submitInput 解析用户输入命令并路由到对应 HTTP 端点。
 // 命令语义：
 //   - "/new <goal>"         无需选中会话，直接创建新会话
+//   - "/cancel"            终止当前运行中会话
 //   - "/clarify <id> <ans>" 回复特性5 的人机澄清请求
 //   - "/interrupt <text>"   特性6 抢占中断
 //   - "/enqueue <text>"     特性6 队列注入
@@ -157,6 +161,13 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
+	// /cancel — 终止当前运行中会话
+	if parts[0] == "/cancel" {
+		m.postJSON(fmt.Sprintf("/api/sessions/%s/cancel", s.ID), map[string]any{})
+		m.flashMsg("session cancelled")
+		return
+	}
+
 	// /interrupt <goal...>
 	if parts[0] == "/interrupt" && len(parts) > 1 {
 		content := strings.TrimSpace(strings.TrimPrefix(cmd, "/interrupt "))
@@ -194,11 +205,11 @@ func (m *Model) submitInput(cmd string) {
 }
 
 // postJSON 向本地 TUI 后端发 POST 请求。
-// 失败仅写 flashMsg 提示，不阻塞 TUI 主循环；requestTimeout 控制单次请求最长 3s。
+// 失败时自动重试 2 次（间隔 500ms），仅对网络/连接错误重试，4xx/5xx 不重试。
+// 失败仅写 flashMsg 提示，不阻塞 TUI 主循环。
 func (m *Model) postJSON(path string, body any) {
 	addr := m.httpAddr
 	if addr == "" {
-		// 兜底地址：当 TUI 未通过本地 HTTP 启动而直连外部后端时使用
 		addr = "http://localhost:10010"
 	}
 	data, err := json.Marshal(body)
@@ -206,23 +217,34 @@ func (m *Model) postJSON(path string, body any) {
 		m.flashMsg("marshal error: " + err.Error())
 		return
 	}
-	req, err := http.NewRequest(http.MethodPost, addr+path, bytes.NewReader(data))
-	if err != nil {
-		m.flashMsg("request error: " + err.Error())
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	// Use a short timeout; failures are non-fatal in TUI.
 	client := &http.Client{Timeout: requestTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		m.flashMsg("post error: " + err.Error())
+
+	const maxRetries = 2
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+		req, err := http.NewRequest(http.MethodPost, addr+path, bytes.NewReader(data))
+		if err != nil {
+			m.flashMsg("request error: " + err.Error())
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		// Drain body for connection reuse (Step 8)
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			m.flashMsg(fmt.Sprintf("%s returned %d", path, resp.StatusCode))
+		}
 		return
 	}
-	resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		m.flashMsg(fmt.Sprintf("%s returned %d", path, resp.StatusCode))
-	}
+	m.flashMsg("post error (retried): " + lastErr.Error())
 }
 
 // createSession POSTs /api/sessions with the goal, then selects the new session.
@@ -246,6 +268,7 @@ func (m *Model) createSession(goal string) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
+		_, _ = io.ReadAll(resp.Body)
 		m.flashMsg(fmt.Sprintf("create session returned %d", resp.StatusCode))
 		return
 	}
@@ -263,6 +286,44 @@ func (m *Model) createSession(goal string) {
 		}
 	}
 	m.flashMsg("session started: " + created.ID)
+}
+
+// sessionHistory returns the input history slice for the currently selected session.
+func (m *Model) sessionHistory() []string {
+	s := m.selectedSession()
+	if s == nil {
+		return nil
+	}
+	return m.inputHistory[s.ID]
+}
+
+// pushHistory appends a command to the current session's input history.
+func (m *Model) pushHistory(cmd string) {
+	s := m.selectedSession()
+	if s == nil {
+		return
+	}
+	m.inputHistory[s.ID] = append(m.inputHistory[s.ID], cmd)
+}
+
+// getJSON 向本地 TUI 后端发 GET 请求并 JSON 解码到 dst。
+// 失败返回 error，调用方自行处理（如显示 flash 或退回空结果）。
+func (m *Model) getJSON(path string, dst any) error {
+	addr := m.httpAddr
+	if addr == "" {
+		addr = "http://localhost:10010"
+	}
+	client := &http.Client{Timeout: requestTimeout}
+	resp, err := client.Get(addr + path)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		_, _ = io.ReadAll(resp.Body)
+		return fmt.Errorf("%s returned %d", path, resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(dst)
 }
 
 const requestTimeout = 3 * time.Second

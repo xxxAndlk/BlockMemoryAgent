@@ -10,16 +10,18 @@ import (
 	"github.com/blockmemory/agent/backend/internal/board"
 )
 
-// View renders the entire TUI.
+// View renders the entire TUI in single-column chat-focused layout.
 func (m Model) View() string {
 	if m.width == 0 || m.height == 0 {
 		return "Initializing..."
 	}
+	return m.singleColumnView()
+}
 
-	// 布局尺寸约定：每个带边框面板固定 Height(3)（上边框+内容+下边框），
-	// tabs 单行高 1。contentH 为剩余高度，最小 4 防止终端过小时挤压为 0。
-	topH := 3    // bordered top bar (border + content + border)
-	inputH := 3  // bordered input bar
+// singleColumnView 窄终端单列布局（原始布局，向后兼容）。
+func (m Model) singleColumnView() string {
+	topH := 3
+	inputH := 4
 	tabsH := 1
 	contentH := m.height - topH - inputH - tabsH
 	if contentH < 4 {
@@ -32,9 +34,6 @@ func (m Model) View() string {
 		m.flash = ""
 	}
 
-	// Join rows with exact placement: top bar, chat area, input bar, tabs.
-	// Each bordered row is forced to Height(3) so content never wraps and pushes
-	// the chat below the input bar.
 	view := lipgloss.JoinVertical(lipgloss.Top,
 		m.renderTopBar(m.width),
 		mainRow,
@@ -42,7 +41,12 @@ func (m Model) View() string {
 		m.renderTabs(m.width),
 	)
 	if m.overlay != overlayNone {
-		overlay := m.renderOverlay(m.width, m.height-2)
+		// Reduce content area to keep input visible when overlay opens.
+		overlayH := m.height / 3
+		if overlayH < 6 {
+			overlayH = 6
+		}
+		overlay := m.renderOverlay(m.width, overlayH)
 		view = lipgloss.JoinVertical(lipgloss.Left, view, overlay)
 	}
 	return view
@@ -70,16 +74,14 @@ func (m Model) renderTopBar(w int) string {
 		}
 	}
 
-	mem := "-"
-	if m.rt != nil && m.rt.Watchdog != nil {
-		if d := m.rt.Watchdog.LastNonOK(); d != nil {
-			mem = fmt.Sprintf("%d", d.Tokens)
-		}
-	}
-
 	modelName := m.modelName
 	if modelName == "" {
 		modelName = "mock"
+	}
+
+	tokenStr := "-"
+	if m.totalInputTokens > 0 || m.totalOutputTokens > 0 {
+		tokenStr = fmt.Sprintf("in %d out %d", m.totalInputTokens, m.totalOutputTokens)
 	}
 
 	// Build status segment with badges.
@@ -98,7 +100,7 @@ func (m Model) renderTopBar(w int) string {
 	text := fmt.Sprintf(" %s │ %s %s %s │ %s %s ",
 		m.styles.Title.Render("BlockMemoryAgent"),
 		m.styles.StatLabel.Render("Model:"), m.styles.StatValue.Render(modelName),
-		m.styles.StatLabel.Render("Mem:"), mem,
+		m.styles.StatLabel.Render("Tokens:"), m.styles.StatValue.Render(tokenStr),
 		m.styles.StatValue.Render(statusIcon(status)+" "+status),
 	)
 	if planBadge != "" || agentsBadge != "" {
@@ -118,33 +120,59 @@ func (m Model) renderChat(w, h int) string {
 		lines = append(lines, "")
 		lines = append(lines, "  "+m.styles.Dim.Render("No active session."))
 		lines = append(lines, "  "+m.styles.Dim.Render("Type /new <your goal> to start a conversation."))
-		// Pad to height.
 		return m.clipChat(strings.Join(lines, "\n"), w, h)
 	}
 
 	items := chatItems(s)
-	cursor := m.chatCursor
-	if m.chatFollowBottom {
-		cursor = len(items) - 1
-	}
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor >= len(items) {
-		cursor = len(items) - 1
+	if len(items) == 0 {
+		lines = append(lines, "  "+m.styles.Dim.Render("(empty — send a message below)"))
+		return m.clipChat(strings.Join(lines, "\n"), w, h)
 	}
 
-	// 先把每个 item 渲染成若干行（title 行 + detail 行），并记录每个 item 的起始行号，
-	// 以便按"行"切视窗。旧实现以 item 数当可见数，但每个 item 占多行，
-	// 导致内容多行时被 clipChat 硬裁、看不到全部，且放大窗口后内容丢失。
+	viewportH := h
+	if viewportH < 1 {
+		viewportH = 1
+	}
+
+	// Pre-compute item start lines to derive cursor from chatScrollLine.
+	itemLineCount := make([]int, len(items))
+	itemStartLine := make([]int, len(items))
+	totalLines := 0
+	for i, item := range items {
+		itemStartLine[i] = totalLines
+		n := 1 + len(strings.Split(item.detail, "\n"))
+		itemLineCount[i] = n
+		totalLines += n
+	}
+
+	// Clamp scroll position.
+	startLine := m.chatScrollLine
+	if m.chatFollowBottom || startLine > totalLines-viewportH {
+		startLine = totalLines - viewportH
+	}
+	if startLine < 0 {
+		startLine = 0
+	}
+	// Derive highlighted cursor from viewport center line.
+	centerLine := startLine + viewportH/3
+	cursor := 0
+	if m.chatFollowBottom {
+		cursor = len(items) - 1
+	} else {
+		for i := len(items) - 1; i >= 0; i-- {
+			if itemStartLine[i] <= centerLine {
+				cursor = i
+				break
+			}
+		}
+	}
+
+	// Render items.
 	type renderedItem struct {
 		lines []string
 	}
 	rendered := make([]renderedItem, len(items))
-	totalLines := 0
-	itemStartLine := make([]int, len(items)) // 每个 item 首行在全局行列表中的下标
 	for i, item := range items {
-		itemStartLine[i] = totalLines
 		roleStyle := m.styles.LogInfo
 		icon := "·"
 		switch {
@@ -158,7 +186,6 @@ func (m Model) renderChat(w, h int) string {
 			roleStyle = m.styles.LogSystem
 			icon = "#"
 		case strings.HasPrefix(item.title, "🔧"):
-			// 工具调用：成功绿色，失败红色（title 已含 🔧 图标，icon 留空避免重复）
 			if strings.Contains(item.title, " ✗ ·") {
 				roleStyle = m.styles.LogError
 			} else {
@@ -177,51 +204,24 @@ func (m Model) renderChat(w, h int) string {
 			marker = m.styles.TreeActive.Render("▸ ")
 		}
 		var ls []string
-		// title 截断后再着色，避免 ANSI 样式码被从中间截断导致终端乱码；
-		// 同时保证 title 行不超宽触发自动换行（会扰乱行级视窗计数）
 		titleStr := truncate(item.title, w-8)
 		ls = append(ls, fmt.Sprintf("%s%s %s", marker, m.styles.Dim.Render(icon), roleStyle.Render(titleStr)))
-		for _, l := range strings.Split(item.detail, "\n") {
+		detailLines := strings.Split(item.detail, "\n")
+		isTool := strings.HasPrefix(item.title, "🔧")
+		if isTool && len(detailLines) > 5 {
+			detailLines = detailLines[:5]
+			detailLines = append(detailLines, "    ...")
+		}
+		for _, l := range detailLines {
 			ls = append(ls, "    "+truncate(l, w-6))
 		}
 		rendered[i] = renderedItem{lines: ls}
-		totalLines += len(ls)
-	}
-
-	if len(items) == 0 {
-		lines = append(lines, "  "+m.styles.Dim.Render("(empty — send a message below)"))
-		return m.clipChat(strings.Join(lines, "\n"), w, h)
-	}
-
-	// 行级视窗：以当前 item 的首行为锚点，尽量让锚点行可见。
-	// chatFollowBottom 时锚定最末行，保证新输出始终可见。
-	viewportH := h
-	if viewportH < 1 {
-		viewportH = 1
-	}
-	var anchorLine int
-	if m.chatFollowBottom {
-		anchorLine = totalLines - 1
-	} else {
-		anchorLine = itemStartLine[cursor]
-	}
-	// 计算可见窗口的起始行：让锚点行落在视窗内（居中偏上），并夹紧到合法范围。
-	startLine := anchorLine - viewportH/3
-	if startLine < 0 {
-		startLine = 0
-	}
-	if startLine > totalLines-viewportH {
-		startLine = totalLines - viewportH
-	}
-	if startLine < 0 {
-		startLine = 0
 	}
 	endLine := startLine + viewportH
 	if endLine > totalLines {
 		endLine = totalLines
 	}
 
-	// 从全局行列表里切出 [startLine, endLine)。为节省内存，按 item 累积到 startLine 后再收集。
 	skip := startLine
 	for i := range rendered {
 		ls := rendered[i].lines
@@ -229,7 +229,6 @@ func (m Model) renderChat(w, h int) string {
 			skip -= len(ls)
 			continue
 		}
-		// 该 item 部分或全部落在窗口内
 		take := ls[skip:]
 		remaining := endLine - (itemStartLine[i] + skip)
 		if remaining < len(take) {
@@ -245,7 +244,6 @@ func (m Model) renderChat(w, h int) string {
 		}
 	}
 
-	// 滚动位置指示（内容超出视窗时在右上角提示）
 	if totalLines > viewportH {
 		pct := 0
 		if endLine >= totalLines {
@@ -254,7 +252,6 @@ func (m Model) renderChat(w, h int) string {
 			pct = startLine * 100 / totalLines
 		}
 		hint := m.styles.Dim.Render(fmt.Sprintf(" [%d%%] ↑↓/j/k 滚动 ", pct))
-		// 用 lipgloss 把提示放到内容顶部右侧的占位：简化为附在首行
 		if len(lines) > 0 {
 			lines[0] = lines[0] + " " + hint
 		}
@@ -265,7 +262,6 @@ func (m Model) renderChat(w, h int) string {
 
 // clipChat applies a fixed Width/Height style so the borderless chat area
 // never grows beyond its allocated space and pushes the input bar down.
-// 替代旧 padLines：lipgloss Height 会自动截断超出部分并补齐空白，比手工 pad/tail 更稳定。
 func (m Model) clipChat(content string, w, h int) string {
 	return lipgloss.NewStyle().Width(w).Height(h).Render(content)
 }
@@ -294,7 +290,9 @@ func (m Model) renderInput(w int) string {
 	if m.focus == panelInput {
 		border = m.styles.FocusBorder
 	}
-	return border.Width(w).Height(3).Render(left + text + flash)
+	hint := m.styles.Dim.Render("/new /cancel /interrupt /enqueue /clarify  ↑↓历史  esc返回")
+	content := lipgloss.JoinVertical(lipgloss.Left, left+text+flash, " "+hint)
+	return border.Width(w).Height(4).Render(content)
 }
 
 func (m Model) renderTabs(w int) string {
@@ -306,7 +304,6 @@ func (m Model) renderOverlay(w, h int) string {
 		m.overlayTitle = "Help"
 		m.overlayLines = strings.Split(strings.Trim(fullHelpText, "\n"), "\n")
 	}
-	// Refresh dynamic popup content every render so plan/agents/log stay live.
 	if m.overlay == overlayPlan {
 		m.overlayLines = m.buildPlanLines()
 	} else if m.overlay == overlayAgents {
@@ -363,5 +360,3 @@ func truncate(s string, n int) string {
 	}
 	return string(runes[:n-1]) + "…"
 }
-
-var _ = board.TaskDone
