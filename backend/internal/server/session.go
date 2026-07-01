@@ -356,13 +356,16 @@ func (m *SessionManager) CreateSession(ctx context.Context, goal string) *Sessio
 		},
 	}
 
-	m.mu.Lock()
-	m.sessions[sessionID] = session // 加入 sessions 映射
-	m.mu.Unlock()
-
-	// 创建可取消的 context，允许 HandleSessionCancel 终止 graph 执行
+	// 创建可取消的 context，允许 HandleSessionCancel 终止 graph 执行。
+	// 必须在加入 sessions 映射之前设置 cancelFn（H2 修复：原实现先 publish 再无锁写 cancelFn，
+	// 与 HandleSessionCancel 的加锁读产生 data race，且存在窗口期 cancel 返回 nil 无法取消）。
 	runCtx, cancelFn := context.WithCancel(context.Background())
 	session.cancelFn = cancelFn
+
+	m.mu.Lock()
+	m.sessions[sessionID] = session // 加入 sessions 映射（cancelFn 已就绪）
+	m.mu.Unlock()
+
 	go m.runSession(runCtx, session) // 不阻塞 HTTP 请求
 
 	return session
@@ -993,8 +996,29 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 				flusher.Flush()
 			}
 
-			if session.Status != enums.SessionStatusRunning {
-				// 推送 done 事件并退出
+			// awaiting_clarify：会话挂起等待用户答复，推送 clarify 事件但保持流连接，
+			// 让前端感知需要输入且能继续接收后续恢复后的事件（H8 修复：原实现统一发 done 退出，
+			// 前端误认为会话终结，无法呈现澄清输入框）。
+			if session.Status == enums.SessionStatusAwaitingClarify {
+				pending := ""
+				qid := ""
+				if session.State != nil && session.State.PendingClarify != nil {
+					pending = session.State.PendingClarify.Question
+					qid = session.State.PendingClarify.ID
+				}
+				data, _ := json.Marshal(map[string]string{
+					"type":        "awaiting_clarify",
+					"status":      string(session.Status),
+					"question":    pending,
+					"question_id": qid,
+				})
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+				// 不 return：保持 SSE 连接，等用户提交 clarify 后会话恢复 Running 继续推送
+			}
+
+			if session.Status != enums.SessionStatusRunning && session.Status != enums.SessionStatusAwaitingClarify {
+				// 仅在终态（completed/error/cancelled）推送 done 并退出
 				data, _ := json.Marshal(map[string]string{"type": "done", "status": string(session.Status)})
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				flusher.Flush()
@@ -1494,7 +1518,10 @@ func (m *SessionManager) summarizeHistoryForGoal(ctx context.Context, sessionID,
 // 副作用：异步运行；可能调用轻量模型；写入 system / agent_done / error 事件；更新 session 状态。
 func (m *SessionManager) resumeSession(session *Session) {
 	ctx, rootCancel := context.WithCancel(context.Background())
+	// 在持锁状态下设置 cancelFn（H2 修复：原实现无锁写，与 HandleSessionCancel 的加锁读产生竞态）
+	m.mu.Lock()
 	session.cancelFn = rootCancel
+	m.mu.Unlock()
 	ctx, timeoutCancel := context.WithTimeout(ctx, 10*time.Minute) // 恢复也用 10 分钟超时
 	defer timeoutCancel()
 	// 会话结束时清空 cancelFn，防止 HandleSessionCancel 对已完成会话误操作
@@ -1678,7 +1705,10 @@ func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Re
 	if m.graph.Runtime() != nil && m.graph.Runtime().Watchdog != nil {
 		for _, d := range m.graph.Runtime().Watchdog.History() {
 			// Watchdog.Check 使用 blockID 作为 agentID
-			if session.State == nil || session.State.ActiveBlocks[d.AgentID] == nil {
+			if session.State == nil {
+				continue // 会话状态未初始化，跳过
+			}
+			if session.State.ActiveBlocks[d.AgentID] == nil {
 				// 也匹配已完成 block
 				found := false
 				for _, bid := range session.State.CompletedBlocks {

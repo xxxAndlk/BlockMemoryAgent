@@ -52,19 +52,20 @@ func NewSearchScorer(embedder Embedder, vectorDB VectorSearch) *SearchScorer {
 // 再按固定权重融合为 FinalScore，用于后续排序。
 //
 // 参数：
+//   - ctx: 上下文，用于 Embedder 调用的取消传递（M4 修复：原用 context.Background() 忽略上层取消）。
 //   - ep: 待评分的 Episode 指针。
 //   - query: 当前查询文本，用于实体重叠等字符串级匹配。
 //   - queryEmbedding: 查询的嵌入向量；为 nil 时跳过语义相似度计算。
 //
 // 返回：填充了各分项与 FinalScore 的 *types.RelevanceScore。
 // 副作用：无。并发安全：纯函数式计算，无共享状态。
-func (s *SearchScorer) ScoreEpisode(ep *types.Episode, query string, queryEmbedding []float32) *types.RelevanceScore {
+func (s *SearchScorer) ScoreEpisode(ctx context.Context, ep *types.Episode, query string, queryEmbedding []float32) *types.RelevanceScore {
 	// 初始化评分对象，各分项默认 0，后面逐步填充。
 	score := &types.RelevanceScore{}
 
 	// 1. 语义相似度：对 Episode 摘要做嵌入，与查询向量计算余弦相似度。
 	if queryEmbedding != nil && s.embedder != nil {
-		epEmbedding, err := s.embedder.Embed(context.Background(), ep.ObservationSummary)
+		epEmbedding, err := s.embedder.Embed(ctx, ep.ObservationSummary)
 		if err == nil && len(epEmbedding) > 0 {
 			score.SemanticSim = cosineSimilarity(queryEmbedding, epEmbedding)
 		}
@@ -116,8 +117,8 @@ func (s *SearchScorer) SearchAndScore(ctx context.Context, agentID, topicID, que
 	// 预声明结果切片，遍历 Episode 逐个评分。
 	var results []*ScoredEpisode
 	for _, ep := range episodes {
-		// 对当前 Episode 计算多信号评分。
-		score := s.ScoreEpisode(ep, query, queryEmbedding)
+		// 对当前 Episode 计算多信号评分（透传 ctx 以支持取消）。
+		score := s.ScoreEpisode(ctx, ep, query, queryEmbedding)
 		// 将 Episode 与其评分打包成一个条目。
 		results = append(results, &ScoredEpisode{
 			Episode: ep,

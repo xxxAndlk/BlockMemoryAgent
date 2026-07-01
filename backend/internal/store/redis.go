@@ -4,6 +4,7 @@ import (
 	"context"      // 上下文,贯穿所有 Redis 调用以支持超时与取消
 	"encoding/json" // 结构体与 Redis 字符串值之间的序列化
 	"fmt"           // 格式化错误与 key 拼接
+	"sync"          // 保护 eventCursors map 的并发访问
 	"time"          // TTL 与时间戳解析
 
 	"github.com/blockmemory/agent/backend/pkg/enums" // 枚举常量
@@ -17,6 +18,12 @@ import (
 // 并发安全: go-redis 客户端内部维护连接池,可在多 goroutine 间共享。
 type RedisStore struct {
 	client *redis.Client // 共享 Redis 客户端,所有方法通过该句柄执行命令
+
+	// eventCursors 维护每个 topic events stream 的已读游标（last message ID）。
+	// C4 修复：原 PollEvents 用 XRead "0" 起始，每次返回全量消息，
+	// 随 stream 增长从 O(1) 退化为 O(n)。维护游标后只读增量。
+	eventCursorsMu sync.Mutex
+	eventCursors   map[string]string
 }
 
 // NewRedisStore 创建 Redis 存储实例。
@@ -37,7 +44,7 @@ func NewRedisStore(addr, password string, db int) (*RedisStore, error) {
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		return nil, fmt.Errorf("ping redis: %w", err)
 	}
-	return &RedisStore{client: client}, nil
+	return &RedisStore{client: client, eventCursors: make(map[string]string)}, nil
 }
 
 // Close 关闭 Redis 客户端连接。
@@ -227,25 +234,36 @@ func (s *RedisStore) PushEvent(ctx context.Context, topicID string, event *types
 //   - topicID: 话题 ID
 //   - count:   最多拉取条数,<=0 时默认 10
 // 返回: 状态为 Pending 的事件切片。
-// 注意: 当前为简单实现,仅通过 XRead 读取最近 count 条,不做 ACK。
+// 实现: 维护 per-topic 的 stream 游标（last message ID），从游标位置 XRead 增量拉取，
+// 避免 stream 增长后每次全量读取导致 O(n) 退化（C4 修复）。游标在内存中，
+// 进程重启会回退到 "0" 重新读取——可接受，因为 Pending 事件幂等处理。
 func (s *RedisStore) PollEvents(ctx context.Context, topicID string, count int64) ([]*types.Event, error) {
 	if count <= 0 {
 		// 兜底默认值
 		count = 10
 	}
 	key := s.topicKey(topicID, "events")
-	// 读取所有未确认消息 (简单实现: 读取最近 count 条)
+	// 取当前游标；无游标从 "0" 开始（首次拉取）
+	s.eventCursorsMu.Lock()
+	cursor, ok := s.eventCursors[key]
+	s.eventCursorsMu.Unlock()
+	if !ok {
+		cursor = "0"
+	}
+	// XRead 从游标位置读取增量消息
 	streams, err := s.client.XRead(ctx, &redis.XReadArgs{
-		Streams: []string{key, "0"},
+		Streams: []string{key, cursor},
 		Count:   count,
 	}).Result()
-	if err != nil {
+	if err != nil && err != redis.Nil {
 		return nil, err
 	}
 
 	var events []*types.Event
+	var lastID string
 	for _, stream := range streams {
 		for _, msg := range stream.Messages {
+			lastID = msg.ID // 记录最后一条消息 ID 作为下次游标
 			// 提取 data 字段,类型不匹配则跳过
 			dataStr, ok := msg.Values["data"].(string)
 			if !ok {
@@ -261,6 +279,12 @@ func (s *RedisStore) PollEvents(ctx context.Context, topicID string, count int64
 				events = append(events, &ev)
 			}
 		}
+	}
+	// 推进游标；"$" 表示已读到末尾，下次仍从末尾继续
+	if lastID != "" {
+		s.eventCursorsMu.Lock()
+		s.eventCursors[key] = lastID
+		s.eventCursorsMu.Unlock()
 	}
 	return events, nil
 }

@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -460,6 +461,8 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 // fingerprintState 计算状态指纹：取影响路由与语义的关键字段做 SHA256。
 // 只取关键字段而非全 state，避免无关字段（如时间戳）抖动误判进展。
 // 用于死循环检测：连续 N 步指纹不变 → 判死循环。
+// 注意：map 迭代顺序在 Go 中随机，必须先对 key 排序再拼接，
+// 否则相同状态会产生不同指纹，导致死锁检测漏报/误报（C3）。
 func fingerprintState(s *types.ThreeLayerState) string {
 	if s == nil {
 		return ""
@@ -470,13 +473,14 @@ func fingerprintState(s *types.ThreeLayerState) string {
 		s.CurrentBlockID, s.CurrentDomain, s.DomainGoal, s.NextAction, s.TargetRoleID)
 	// 调用栈深度 + 顶层 callee（反映 Assistant 调用进展）
 	fmt.Fprintf(h, "stack=%d|top=%s|", len(s.CallStack), s.CurrentAssistantID)
-	// 已完成块（反映领域推进）
+	// 已完成块（反映领域推进）——切片有序，可直接拼接
 	fmt.Fprintf(h, "done=%v|", s.CompletedBlocks)
-	// 活跃块 ID 集合（反映领域创建进展）
+	// 活跃块 ID 集合（反映领域创建进展）——map 无序，必须排序后再拼接
 	activeIDs := make([]string, 0, len(s.ActiveBlocks))
 	for id := range s.ActiveBlocks {
 		activeIDs = append(activeIDs, id)
 	}
+	sort.Strings(activeIDs) // 排序保证相同 map 内容产生相同指纹
 	fmt.Fprintf(h, "active=%v|", activeIDs)
 	// 角色实例数（反映 Agent 创建进展）
 	fmt.Fprintf(h, "roles=%d|", len(s.RoleInstances))
@@ -703,8 +707,12 @@ func (g *ThreeLayerGraph) assistantNext(state *types.ThreeLayerState) string {
 
 // SetToolCallback 设置工具执行回调。
 // 供 server 层在图构建后补充注入（与 SetProgressCallback 同样的后注入模式）。
+// 并发安全：写 g.toolCallback 持写锁（H1/M8 修复：原实现无锁，
+// 与 resolveInstanceNode/Invoke 的 RLock 读产生 data race）。
 func (g *ThreeLayerGraph) SetToolCallback(cb ToolCallback) {
+	g.mu.Lock()
 	g.toolCallback = cb
+	g.mu.Unlock()
 }
 
 // NewToolExecutor 创建带回调的工具执行器。

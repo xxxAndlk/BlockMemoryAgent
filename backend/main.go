@@ -81,6 +81,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("Postgres 不可用: %v (DSN: %s)", err, redactDSN(cfg.Postgres.DSN))
 	}
+	// 同步向量维度（H6：让 domain_archive 等使用配置中的 dim 而非硬编码 768）
+	pgStore.SetEmbeddingDim(cfg.PgVector.Dimensions)
 	defer pgStore.Close() // 关闭连接池
 	// 自动应用 session_history 迁移
 	if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {

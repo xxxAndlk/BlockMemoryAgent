@@ -5,6 +5,7 @@ import (
 	"fmt"      // 格式化与错误包装
 	"strings"  // 字符串小写化与子串匹配
 	"time"     // 时间戳生成与时间间隔判断
+	"unicode/utf8" // rune 计数与按字符截断，避免破坏 UTF-8
 
 	"github.com/blockmemory/agent/backend/pkg/types" // Episode 等公共类型
 )
@@ -56,16 +57,18 @@ type SimpleSummarizer struct{}
 // Summarize 生成摘要。
 // 职责: 对 content 做长度截断式摘要。
 // 参数: content - 原始观察文本。
-// 返回: 不超过 200 字符的摘要字符串。
+// 返回: 不超过 200 个 rune 的摘要字符串。
 // 副作用: 无。
 // 并发安全: 是（无共享状态）。
+// 实现: 按 rune 截断而非字节，避免在 UTF-8 多字节字符中间切断产生无效字符串（H3）。
 func (s *SimpleSummarizer) Summarize(content string) string {
 	// 短文本无需摘要，直接原样返回
-	if len(content) <= 200 {
+	if utf8.RuneCountInString(content) <= 200 {
 		return content
 	}
-	// 长文本截断到前 200 字符并标记省略
-	return content[:200] + "..."
+	// 长文本截断到前 200 个 rune 并标记省略
+	runes := []rune(content)
+	return string(runes[:200]) + "..."
 }
 
 // SimpleFactExtractor 简单事实提取器。
@@ -95,7 +98,12 @@ func (e *SimpleFactExtractor) ExtractFacts(content string) []string {
 		}
 	}
 	if len(facts) == 0 {
-		facts = append(facts, content[:min(100, len(content))])
+		// 按 rune 截断前 100 字符，避免破坏 UTF-8（H3）
+		runes := []rune(content)
+		if len(runes) > 100 {
+			runes = runes[:100]
+		}
+		facts = append(facts, string(runes))
 	}
 	return facts
 }

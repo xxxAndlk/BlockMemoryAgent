@@ -56,7 +56,10 @@ func (n *EscalationHandlerNode) Invoke(ctx context.Context, state *types.ThreeLa
 	arbitration := fmt.Sprintf("Escalation: %s", state.Reason)
 
 	// 添加事件到当前会话块
-	// SessionBlock 是 DomainAgent 的上下文隔离单元，升级事件写回这里便于回溯
+	// SessionBlock 是 DomainAgent 的上下文隔离单元，升级事件写回这里便于回溯。
+	// 注意：必须标记为 EventDone（H7 修复）——若标 Pending，下一 tick handleBlockEvents
+	// 会再次触发 EventEscalation 分支 → 再次进入 EscalationHandler → 再追加 Pending 事件，
+	// 形成无限升级循环。这里作为审计记录，直接置 Done。
 	if block := state.ActiveBlocks[state.CurrentBlockID]; block != nil {
 		block.Events = append(block.Events, &types.Event{
 			ID:          fmt.Sprintf("esc_%d", time.Now().UnixNano()), // 纳秒时间戳保证唯一
@@ -64,7 +67,7 @@ func (n *EscalationHandlerNode) Invoke(ctx context.Context, state *types.ThreeLa
 			SourceAgent: state.CurrentDomain, // 记录升级来源
 			Payload:     map[string]any{"arbitration": arbitration},
 			Priority:    10, // 升级事件高优先级
-			Status:      types.EventPending,
+			Status:      types.EventDone, // 审计记录直接置完成，避免触发循环
 		})
 	}
 

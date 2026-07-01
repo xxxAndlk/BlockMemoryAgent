@@ -7,7 +7,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -47,7 +46,7 @@ func (s *PostgresStore) SaveDomainArchive(ctx context.Context, rec *graph.Domain
 		SessionID: rec.SessionID,
 	}
 	content := fmt.Sprintf("领域:%s\n目标:%s\n摘要:%s", rec.Domain, rec.Goal, rec.ContextSummary)
-	emb := embed.PseudoEmbed(content, 768)
+	emb := embed.PseudoEmbed(content, s.EmbeddingDim()) // H6：从配置读取维度，不再硬编码 768
 	krec := &types.KnowledgeRecord{
 		KnowledgeType: enums.KnowledgeTypeDomainArchive,
 		TopicID:       rec.SessionID,
@@ -74,7 +73,7 @@ func (s *PostgresStore) SearchDomainArchive(ctx context.Context, domain, goal st
 		topK = 5
 	}
 	query := fmt.Sprintf("领域:%s\n目标:%s", domain, goal)
-	emb := embed.PseudoEmbed(query, 768)
+	emb := embed.PseudoEmbed(query, s.EmbeddingDim()) // H6：从配置读取维度
 	recs, err := s.SearchKnowledgeByType(ctx, enums.KnowledgeTypeDomainArchive, emb, topK)
 	if err != nil {
 		return nil, err
@@ -92,24 +91,33 @@ func (s *PostgresStore) SearchDomainArchive(ctx context.Context, domain, goal st
 }
 
 // BumpDomainArchiveWeight 命中复用时权重 +1 且延后过期时间。
-// 通过 UPDATE global_knowledge SET meta=... WHERE id=$1 实现。
+// 通过单条 UPDATE + jsonb_set 原子完成 weight 自增与 expires_at 覆盖（H4 修复：
+// 原实现 SELECT 再 UPDATE 两步无事务，并发 bump 丢失更新）。
 func (s *PostgresStore) BumpDomainArchiveWeight(ctx context.Context, archiveID string, ttl time.Duration) error {
-	// 取现有 meta
-	var metaRaw []byte
-	row := s.db.QueryRowContext(ctx, `SELECT meta FROM global_knowledge WHERE id=$1`, archiveID)
-	if err := row.Scan(&metaRaw); err != nil {
-		return fmt.Errorf("load archive meta: %w", err)
+	expiresAt := time.Now().Add(ttl).Unix()
+	// 单条原子 UPDATE：
+	//   weight = (meta->>'weight')::int + 1   —— 读取并自增，数据库层加锁避免 lost update
+	//   expires_at = $1::jsonb                —— 覆盖为新过期时间
+	//   last_accessed = NOW()                 —— 顺带更新访问时间
+	// 使用 jsonb_set 保留 meta 中其他字段不变。
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE global_knowledge
+		SET meta = jsonb_set(
+		        jsonb_set(
+		            meta,
+		            '{weight}',
+		            COALESCE(((meta->>'weight')::int + 1), 1)::text::jsonb
+		        ),
+		        '{expires_at}',
+		        $1::text::jsonb
+		    ),
+		    last_accessed = NOW()
+		WHERE id = $2
+	`, expiresAt, archiveID)
+	if err != nil {
+		return fmt.Errorf("bump archive weight: %w", err)
 	}
-	var meta map[string]any
-	if err := json.Unmarshal(metaRaw, &meta); err != nil {
-		return fmt.Errorf("unmarshal meta: %w", err)
-	}
-	w, _ := meta["weight"].(float64)
-	meta["weight"] = int(w) + 1
-	meta["expires_at"] = time.Now().Add(ttl).Unix()
-	newMeta, _ := json.Marshal(meta)
-	_, err := s.db.ExecContext(ctx, `UPDATE global_knowledge SET meta=$1, last_accessed=NOW() WHERE id=$2`, newMeta, archiveID)
-	return err
+	return nil
 }
 
 // CleanupExpiredDomainArchives 删除已过期的 domain_archive 记录。

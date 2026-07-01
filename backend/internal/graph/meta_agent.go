@@ -476,13 +476,15 @@ func (n *MetaAgentNode) loadHistorySection(ctx context.Context) string {
 	return b.String()
 }
 
-// truncateStr 把字符串截断到 n 字符并加 "..." 后缀。
+// truncateStr 把字符串截断到 n 个 rune 并加 "..." 后缀。
 // 用于摘要展示，避免过长的 LLM 输出污染 prompt。
+// 按 rune 截断而非字节，避免在 UTF-8 多字节字符（如中文，每字 3 字节）中间切断产生无效 UTF-8（H3）。
 func truncateStr(s string, n int) string {
-	if len(s) <= n {
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	runes := []rune(s)
+	return string(runes[:n]) + "..."
 }
 
 // loadMessagesSection 从 state.Messages 构建对话历史段落，注入 prompt。
@@ -743,9 +745,10 @@ func (n *MetaAgentNode) handleBlockEvents(ctx context.Context, state *types.Thre
 			return n.handleCrossDomainRequest(ctx, state, ev)
 
 		case types.EventEscalation:
-			// 升级事件：设置 ActionEscalate，交 EscalationHandler 处理
-			state.NextAction = types.ActionEscalate          // 设置升级动作
-			state.Reason = getString(ev.Payload, "reason")   // 记录升级原因
+			// 升级事件：标记完成避免重复处理（H7），设置 ActionEscalate 交 EscalationHandler 仲裁
+			ev.Status = types.EventDone                       // 先标记完成，防止 handleBlockEvents 下轮重复触发
+			state.NextAction = types.ActionEscalate           // 设置升级动作
+			state.Reason = getString(ev.Payload, "reason")    // 记录升级原因
 			return state, nil
 
 		default:

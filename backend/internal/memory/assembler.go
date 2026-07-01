@@ -122,7 +122,7 @@ func (a *ContextAssembler) BuildContext(ctx context.Context, req *graph.BuildReq
 	}
 
 	// 5. 按相关性分配配额并裁剪私有记忆，控制在 PrivateMemory 预算内。
-	selectedEpisodes := a.allocateByRelevance(episodes, req.TaskQuery, a.budget.PrivateMemory)
+	selectedEpisodes := a.allocateByRelevance(ctx, episodes, req.TaskQuery, a.budget.PrivateMemory)
 
 	// 6. 组装为消息列表，按 System / TopicGlobal / SharedState / GlobalKB / Private / Snapshot / Task 顺序拼接。
 	messages := a.buildMessages(topicMeta, constraints, sharedOutputs, selectedEpisodes, globalRecords, req)
@@ -138,13 +138,14 @@ func (a *ContextAssembler) BuildContext(ctx context.Context, req *graph.BuildReq
 // 优先使用 scorer 做语义+实体+因果+时间多信号评分；scorer 为 nil 时退回重要性排序。
 //
 // 参数：
+//   - ctx: 上下文，透传给 SearchAndScore/Embedder 以支持取消（M4 修复：原用 context.Background() 忽略上层取消）。
 //   - episodes: 候选 Episode 列表。
 //   - query: 当前任务查询文本，供多信号评分使用。
 //   - budget: PrivateMemory 段的 Token 预算上限。
 //
 // 返回：裁剪后的 Episode 切片（按相关性降序）；输入为空时返回 nil。
 // 副作用：scorer 非 nil 时可能调用 Embedder 计算语义相似度。
-func (a *ContextAssembler) allocateByRelevance(episodes []*types.Episode, query string, budget int) []*types.Episode {
+func (a *ContextAssembler) allocateByRelevance(ctx context.Context, episodes []*types.Episode, query string, budget int) []*types.Episode {
 	if len(episodes) == 0 {
 		return nil
 	}
@@ -154,7 +155,7 @@ func (a *ContextAssembler) allocateByRelevance(episodes []*types.Episode, query 
 
 	if a.scorer != nil {
 		// 多信号评分：为每条 episode 调用 ScoreEpisode，综合语义/实体/时间/因果
-		results, err := a.scorer.SearchAndScore(context.Background(), "", "", query, sorted)
+		results, err := a.scorer.SearchAndScore(ctx, "", "", query, sorted)
 		if err == nil {
 			// 按 FinalScore 降序提取 episode
 			sorted = make([]*types.Episode, 0, len(results))

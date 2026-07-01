@@ -3,7 +3,9 @@ package memory
 import (
 	"context"  // 上下文，用于取消与超时传递
 	"fmt"      // 格式化与错误包装
+	"sort"     // sort.Slice 替代手写冒泡，稳定性与可读性更佳
 	"time"     // 时间间隔判断（24h、7d 等压缩阈值）
+	"unicode/utf8" // rune 计数与按字符截断，避免破坏 UTF-8
 
 	"github.com/blockmemory/agent/backend/pkg/types" // Episode 等公共类型
 )
@@ -93,7 +95,7 @@ func (c *Compressor) Compress(ctx context.Context, agentID, topicID string) erro
 //   - topicID: Topic 标识。
 //   - maxTokens: 允许的最大 Token 预算。
 // 返回: 读取或统计失败时返回 error；无需压缩返回 nil。
-// 副作用: 就地修改低重要性 Episode 的字段（注意: 本函数未回写存储）。
+// 副作用: 就地修改低重要性 Episode 的字段并逐条写回 PrivateStore（C2 修复：原实现未持久化，导致压缩管线形同虚设）。
 // 并发安全: 自身无共享可变状态；并发安全性取决于底层 store 实现。
 // 设计: 以"每条平均 200 token"粗略估算，按超出比例压缩对应条数。
 func (c *Compressor) CompressByBudget(ctx context.Context, agentID, topicID string, maxTokens int) error {
@@ -125,6 +127,10 @@ func (c *Compressor) CompressByBudget(ctx context.Context, agentID, topicID stri
 	targetCompress := int(float64(len(sorted)) * compressRatio)
 	for i := 0; i < targetCompress && i < len(sorted); i++ {
 		c.compressToLevel2(sorted[i])
+		// 持久化压缩后的 Episode：原实现遗漏此步导致压缩结果丢失
+		if err := c.store.SaveEpisode(ctx, agentID, topicID, sorted[i]); err != nil {
+			return fmt.Errorf("persist budget-compressed episode %s: %w", sorted[i].StepID, err)
+		}
 	}
 
 	return nil
@@ -141,15 +147,16 @@ func (c *Compressor) compressToLevel1(ep *types.Episode) {
 }
 
 // compressToLevel2 压缩到精简级（Compact）。
-// 职责: 丢弃全文与事实，仅保留截断到 100 字符的短摘要。
+// 职责: 丢弃全文与事实，仅保留截断到 100 个 rune 的短摘要。
 // 参数: ep - 待压缩的 Episode 指针（就地修改）。
-// 副作用: 清空 FullObservation、Facts、ToolCalls，截断 ObservationSummary。
+// 副作用: 清空 FullObservation、Facts、ToolCalls，按 rune 截断 ObservationSummary（避免破坏 UTF-8 多字节字符）。
 // 并发安全: 非并发安全（调用方需保证对同一 ep 的独占访问）。
 func (c *Compressor) compressToLevel2(ep *types.Episode) {
 	ep.FullObservation = ""
-	// 仅保留 Summary 一句话: 超过 100 字符则截断并加省略号
-	if len(ep.ObservationSummary) > 100 {
-		ep.ObservationSummary = ep.ObservationSummary[:100] + "..."
+	// 仅保留 Summary 一句话: 超过 100 个 rune 则截断并加省略号（按 rune 截断避免中文 UTF-8 断裂）
+	if utf8.RuneCountInString(ep.ObservationSummary) > 100 {
+		runes := []rune(ep.ObservationSummary)
+		ep.ObservationSummary = string(runes[:100]) + "..."
 	}
 	ep.Facts = nil    // 丢弃事实列表
 	ep.ToolCalls = nil // 丢弃工具调用明细
@@ -175,28 +182,16 @@ func (c *Compressor) compressToLevel3(ep *types.Episode) {
 // 返回: 排序后的新切片（不修改原切片）。
 // 副作用: 无（拷贝后排序）。
 // 并发安全: 是（纯函数，不修改入参）。
-// 实现: 冒泡排序，无额外分配开销。
+// 实现: sort.Slice 替代原 O(n²) 冒泡，长列表性能更佳。
 func sortByImportanceAndTime(episodes []*types.Episode) []*types.Episode {
-	// 拷贝一份避免修改调用方的切片
 	result := make([]*types.Episode, len(episodes))
 	copy(result, episodes)
-
-	// 冒泡外层: 共 n-1 轮
-	for i := 0; i < len(result)-1; i++ {
-		// 冒泡内层: 每轮把最值推到末尾
-		for j := 0; j < len(result)-1-i; j++ {
-			a, b := result[j], result[j+1]
-			// 先按重要性降序: 低分后移
-			if a.Importance < b.Importance {
-				result[j], result[j+1] = result[j+1], result[j]
-			} else if a.Importance == b.Importance {
-				// 重要性相同时再按时间降序: 旧的后移
-				if a.Timestamp.Before(b.Timestamp) {
-					result[j], result[j+1] = result[j+1], result[j]
-				}
-			}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Importance != result[j].Importance {
+			return result[i].Importance > result[j].Importance // 重要性降序
 		}
-	}
+		return result[i].Timestamp.After(result[j].Timestamp) // 时间降序
+	})
 	return result
 }
 
@@ -206,20 +201,12 @@ func sortByImportanceAndTime(episodes []*types.Episode) []*types.Episode {
 // 返回: 排序后的新切片（不修改原切片）。
 // 副作用: 无（拷贝后排序）。
 // 并发安全: 是（纯函数，不修改入参）。
-// 实现: 冒泡排序，用于 CompressByBudget 从最低价值开始压缩。
+// 实现: sort.Slice，用于 CompressByBudget 从最低价值开始压缩。
 func sortByImportanceAsc(episodes []*types.Episode) []*types.Episode {
-	// 拷贝一份避免修改调用方的切片
 	result := make([]*types.Episode, len(episodes))
 	copy(result, episodes)
-
-	// 冒泡外层: 共 n-1 轮
-	for i := 0; i < len(result)-1; i++ {
-		// 冒泡内层: 高分后移，使最低分排在最前
-		for j := 0; j < len(result)-1-i; j++ {
-			if result[j].Importance > result[j+1].Importance {
-				result[j], result[j+1] = result[j+1], result[j]
-			}
-		}
-	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Importance < result[j].Importance // 重要性升序
+	})
 	return result
 }

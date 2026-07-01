@@ -18,7 +18,8 @@ import (
 // 并依赖 pgvector 扩展完成向量相似检索。
 // 并发安全: 内部仅持有 *sql.DB 连接池,database/sql 自身线程安全,可在多 goroutine 间共享。
 type PostgresStore struct {
-	db *sql.DB // 共享连接池,所有方法通过该句柄执行 SQL
+	db  *sql.DB // 共享连接池,所有方法通过该句柄执行 SQL
+	dim int     // 向量维度，由 SetEmbeddingDim 设置；默认 768，需与 schema 中 VECTOR(N) 一致
 }
 
 // NewPostgresStore 创建 PostgreSQL 存储实例。
@@ -44,7 +45,24 @@ func NewPostgresStore(dsn string) (*PostgresStore, error) {
 	db.SetMaxIdleConns(10)
 	// 连接最长存活 1 小时,促进后端重新负载均衡
 	db.SetConnMaxLifetime(time.Hour)
-	return &PostgresStore{db: db}, nil
+	return &PostgresStore{db: db, dim: 768}, nil // 默认 768 维，可通过 SetEmbeddingDim 覆盖
+}
+
+// SetEmbeddingDim 设置向量维度（H6 修复：原 domain_archive 硬编码 768，
+// 不随 config.PgVector.Dimensions 走，导致维度不匹配时 pgvector 查询报错）。
+// 必须在 SaveDomainArchive / SearchDomainArchive 之前调用，且需与 schema 中 VECTOR(N) 一致。
+func (s *PostgresStore) SetEmbeddingDim(dim int) {
+	if dim > 0 {
+		s.dim = dim
+	}
+}
+
+// EmbeddingDim 返回当前向量维度。
+func (s *PostgresStore) EmbeddingDim() int {
+	if s.dim > 0 {
+		return s.dim
+	}
+	return 768
 }
 
 // Close 关闭底层连接池并释放数据库资源。

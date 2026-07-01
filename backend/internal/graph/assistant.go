@@ -22,14 +22,15 @@ import (
 //
 // 并发安全：节点本身无共享可变状态；实例状态由 registry 内部锁保护。
 type AssistantNode struct {
-	name         string             // 节点名（固定 "Assistant"），实现 ThreeLayerNode.Name
-	instID       string             // 本实例ID，对应 registry 中的 RoleInstance.ID
-	registry     *RoleRegistry      // 角色注册表，查询实例/角色定义、更新状态
+	name             string             // 节点名（固定 "Assistant"），实现 ThreeLayerNode.Name
+	instID           string             // 本实例ID，对应 registry 中的 RoleInstance.ID
+	registry         *RoleRegistry      // 角色注册表，查询实例/角色定义、更新状态
 	workspace        WorkspaceWriter    // 工作区写入器，持久化 AgentOutput（可能为 nil）
 	modelFactory     *model.ModelFactory // LLM 模型工厂，nil 时退回 mock
 	rt               *runtime.Runtime   // 运行时聚合体，读取 AgentCfg 超时配置
 	progress         ProgressCallback   // 进度回调，推送 prompt / token_usage 事件
 	contextAssembler ContextAssembler   // 上下文组装器，注入私有记忆与全局知识
+	llmTracker       *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token，复用 callLLMWithTimeout 模式避免 goroutine 泄漏）
 }
 
 // NewAssistantNode 创建助手节点。
@@ -42,10 +43,11 @@ type AssistantNode struct {
 // 返回：装配好的 *AssistantNode，待图调度循环拉起。
 func NewAssistantNode(instID string, registry *RoleRegistry, workspace WorkspaceWriter) *AssistantNode {
 	return &AssistantNode{
-		name:      "Assistant",
-		instID:    instID,
-		registry:  registry,
-		workspace: workspace,
+		name:       "Assistant",
+		instID:     instID,
+		registry:   registry,
+		workspace:  workspace,
+		llmTracker: model.NewLLMCallTracker(), // 初始化追踪器，避免 nil 调用
 	}
 }
 
@@ -178,6 +180,8 @@ func (n *AssistantNode) executeTask(ctx context.Context, roleDef *types.RoleDefi
 }
 
 // callLLM 构建 prompt 并调用 LLM。
+// 使用 LLMCallTracker.CallWithTimeout 复用 MetaAgent/DomainAgent 的软/硬超时 + discard 机制，
+// 避免 ctx 超时后 goroutine 持续运行导致泄漏（C1）。同时正确记录 token 用于 R1。
 func (n *AssistantNode) callLLM(ctx context.Context, roleDef *types.RoleDefinition, task string, callReq *types.CallRequest) (string, error) {
 	llm, err := n.modelFactory.GetModel(ctx, roleDef.ID)
 	if err != nil {
@@ -212,53 +216,64 @@ func (n *AssistantNode) callLLM(ctx context.Context, roleDef *types.RoleDefiniti
 	}
 
 	// 推送 prompt 事件
+	caller := roleDef.Name
 	if n.progress != nil {
 		n.progress(ctx, ProgressEvent{
 			SessionID: SessionIDFromContext(ctx),
 			Kind:      "prompt",
 			Agent:     n.instID,
-			Message:   fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", roleDef.Name, model.EstimateTokens(prompt)),
+			Message:   fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)),
 			Detail:    model.SummarizePrompt(prompt, 500),
 		})
 	}
 
-	// 自适应超时
+	// 解析软/硬超时：默认 30s/90s，可被 AgentCfg 覆盖
+	softTimeout := 30 * time.Second
 	hardTimeout := 90 * time.Second
-	if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.LLMHardTimeoutSec > 0 {
-		hardTimeout = time.Duration(n.rt.AgentCfg.LLMHardTimeoutSec) * time.Second
-	}
-
-	// 带超时的 LLM 调用
-	type result struct {
-		text string
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		text, err := llm.Generate(ctx, prompt)
-		ch <- result{text, err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case <-time.After(hardTimeout):
-		return "", fmt.Errorf("LLM 硬超时 %v", hardTimeout)
-	case r := <-ch:
-		if r.err != nil {
-			return "", r.err
+	if n.rt != nil && n.rt.AgentCfg != nil {
+		if n.rt.AgentCfg.LLMSoftTimeoutSec > 0 {
+			softTimeout = time.Duration(n.rt.AgentCfg.LLMSoftTimeoutSec) * time.Second
 		}
-		// 推送 token_usage 事件
+		if n.rt.AgentCfg.LLMHardTimeoutSec > 0 {
+			hardTimeout = time.Duration(n.rt.AgentCfg.LLMHardTimeoutSec) * time.Second
+		}
+	}
+
+	// 通过 tracker 调用：内部用 timeoutCtx + discard goroutine 模式，超时后 goroutine 安全退出
+	resp, callErr, timedOut := n.llmTracker.CallWithTimeout(ctx, llm, prompt, caller, softTimeout, hardTimeout)
+
+	// 推送 token_usage 事件（从 tracker 最新记录读取，格式与 MetaAgent/DomainAgent 一致以便 parseTokenUsage 解析）
+	records := n.llmTracker.Records()
+	if len(records) > 0 {
+		last := records[len(records)-1]
 		if n.progress != nil {
 			n.progress(ctx, ProgressEvent{
 				SessionID: SessionIDFromContext(ctx),
 				Kind:      "token_usage",
 				Agent:     n.instID,
-				Message:   fmt.Sprintf("[%s] LLM 响应 (%d 字符)", roleDef.Name, len(r.text)),
+				Message:   fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", caller, last.InputTokens, last.OutputTokens, last.Duration.Round(time.Millisecond)),
 			})
 		}
-		return r.text, nil
 	}
+
+	if callErr != nil {
+		if timedOut {
+			return "", fmt.Errorf("LLM 超时: %w", callErr)
+		}
+		return "", callErr
+	}
+
+	// 推送 LLM 响应摘要事件
+	if n.progress != nil && resp != "" {
+		n.progress(ctx, ProgressEvent{
+			SessionID: SessionIDFromContext(ctx),
+			Kind:      "llm_response",
+			Agent:     n.instID,
+			Message:   fmt.Sprintf("[%s] LLM 响应 (%d 字符)", caller, len(resp)),
+			Detail:    model.SummarizePrompt(resp, 500),
+		})
+	}
+	return resp, nil
 }
 
 // formatContextPack 把 ContextPack 中的消息列表与角色定义、任务拼接成单段 prompt。
