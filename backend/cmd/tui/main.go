@@ -211,6 +211,11 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		log.Fatalf("TUI error: %v", err)
 	}
+	// T8 修复：退出前关闭 HTTP listener + 取消运行中会话 ctx。
+	// 原实现仅靠 defer pgStore.Close()，未关闭 ln（端口悬挂到进程退出）、
+	// 未取消 graph.Invoke goroutine（SSE 流 / goroutine 泄漏到 os.Exit）。
+	ln.Close()
+	sessionMgr.Shutdown()
 }
 
 // sessionRouter 把 /api/sessions/{id}/{suffix} 路径分发到对应 handler。

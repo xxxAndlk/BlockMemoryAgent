@@ -12,8 +12,13 @@ const collapsed = ref(false)
 const expanded = ref<Set<number>>(new Set())
 
 function toggle(i: number) {
-  if (expanded.value.has(i)) expanded.value.delete(i)
-  else expanded.value.add(i)
+  // 重新赋值新 Set 触发 ref 响应性（F5 修复）。
+  // Vue 3 ref 追踪值重新赋值，不追踪 Set 内部 add/delete 变更，
+  // 原地改 expanded.value 后模板中 expanded.has(i) 不会重新求值，按钮无视觉反馈。
+  const next = new Set(expanded.value)
+  if (next.has(i)) next.delete(i)
+  else next.add(i)
+  expanded.value = next
 }
 
 // 简洁模式时折叠 prompt / token_usage / detail_json 详情；可在每条上单独展开

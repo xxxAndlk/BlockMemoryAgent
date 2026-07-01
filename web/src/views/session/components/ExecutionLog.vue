@@ -52,8 +52,11 @@ function hasDetail(ev: SessionEvent) {
 
 const expanded = ref<Set<number>>(new Set())
 function toggle(i: number) {
-  if (expanded.value.has(i)) expanded.value.delete(i)
-  else expanded.value.add(i)
+  // 重新赋值新 Set 触发 ref 响应性（F6 修复，同 F5）
+  const next = new Set(expanded.value)
+  if (next.has(i)) next.delete(i)
+  else next.add(i)
+  expanded.value = next
 }
 
 const progress = computed(() => {

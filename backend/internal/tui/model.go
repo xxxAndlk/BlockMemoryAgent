@@ -2,6 +2,7 @@ package tui
 
 import (
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -63,6 +64,12 @@ type Model struct {
 	// flash banner
 	flash      string
 	flashUntil time.Time
+	flashMu    *sync.Mutex // 保护 flash/flashUntil 的并发读写（T2 修复：后台 HTTP goroutine 写，主循环 View 读）。用指针避免 bubbletea 值语义 Model 拷贝 Mutex
+
+	// pendingSelectID 由后台 createSession goroutine 写入，tick handler 消费：
+	// 成功创建会话后选中它需操作 m.sessions/cursor，不能在后台 goroutine 直接改
+	// （与主循环 View 读产生 race），改为 tick 在主循环内执行 refresh+select。
+	pendingSelectID string
 
 	tickCount int
 }
@@ -102,6 +109,7 @@ func NewModel(
 		chatFollowBottom: true,
 		inputHistIdx:     -1,
 		inputHistory:     make(map[string][]string),
+		flashMu:          &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
 	}
 	m.refreshSessions()
 	if len(m.sessions) > 0 {
@@ -288,7 +296,10 @@ func (m *Model) selectedSession() *server.Session {
 	if m.sessionsCursor < 0 || m.sessionsCursor >= len(m.sessions) {
 		return nil
 	}
-	return m.sessions[m.sessionsCursor]
+	// 返回持锁深拷贝（T1 修复：原直接返回 *Session 指针，TUI 在 tea 主 goroutine
+	// 无锁读 Events/Messages/State，与后台 runSession/addEventDebug 的并发写产生
+	// data race，事件量大时可能 slice 迭代越界 panic 或读取半更新 State 指针）。
+	return m.sessionMgr.SnapshotSession(m.sessions[m.sessionsCursor].ID)
 }
 
 // Update handles messages.
@@ -306,9 +317,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rebuildAgents()
 		m.accumulateTokens()
 		// Auto-scroll to bottom when following.
-		// 清理过期闪屏提示
+		// 清理过期闪屏提示（持锁，T2 修复）
+		m.flashMu.Lock()
 		if m.flash != "" && time.Now().After(m.flashUntil) {
 			m.flash = ""
+		}
+		m.flashMu.Unlock()
+		// 消费后台 createSession 写入的 pendingSelectID：在主循环内 refresh+select
+		// 避免后台 goroutine 直接改 m.sessions/cursor 与 View 产生 race（T2 修复）
+		if m.pendingSelectID != "" {
+			id := m.pendingSelectID
+			m.pendingSelectID = ""
+			m.refreshSessions()
+			for i, s := range m.sessions {
+				if s.ID == id {
+					m.selectSession(i)
+					break
+				}
+			}
 		}
 		// chatFollowBottom alone triggers bottom-clamping in renderChat;
 		// no sentinel needed.

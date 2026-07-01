@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/blockmemory/agent/backend/internal/board"
 )
@@ -241,10 +242,14 @@ func (m Model) renderChat(w, h int) string {
 
 	if totalLines > viewportH {
 		pct := 0
+		scrollable := totalLines - viewportH
+		if scrollable < 1 {
+			scrollable = 1
+		}
 		if endLine >= totalLines {
 			pct = 100
-		} else if startLine > 0 {
-			pct = startLine * 100 / totalLines
+		} else {
+			pct = startLine * 100 / scrollable
 		}
 		hint := m.styles.Dim.Render(fmt.Sprintf(" [%d%%] ↑↓/j/k 滚动 ", pct))
 		if len(lines) > 0 {
@@ -278,8 +283,12 @@ func (m Model) renderInput(w int) string {
 	}
 	text := string(m.inputRunes[:m.inputCursor]) + cursor + string(m.inputRunes[m.inputCursor:])
 	flash := ""
-	if m.flash != "" {
-		flash = "  " + m.styles.LogError.Render(m.flash)
+	// 持锁读 flash（T2 修复：后台 HTTP goroutine 可能并发写）
+	m.flashMu.Lock()
+	curFlash := m.flash
+	m.flashMu.Unlock()
+	if curFlash != "" {
+		flash = "  " + m.styles.LogError.Render(curFlash)
 	}
 	border := m.styles.BlurBorder
 	if m.focus == panelInput {
@@ -360,9 +369,22 @@ func truncate(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	runes := []rune(s)
-	if len(runes) <= n {
+	// T11 修复：CJK 字符终端占 2 列。原按 rune 计数会让 CJK 标题超宽错位。
+	// 用 runewidth 按显示宽度截断。
+	w := runewidth.StringWidth(s)
+	if w <= n {
 		return s
 	}
-	return string(runes[:n-1]) + "…"
+	var b strings.Builder
+	cur := 0
+	for _, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if cur+rw > n-1 { // 留 1 列给省略号
+			break
+		}
+		b.WriteRune(r)
+		cur += rw
+	}
+	b.WriteString("…")
+	return b.String()
 }

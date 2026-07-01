@@ -3,12 +3,20 @@ import type { Session, SessionEvent, AgentNode } from '@/types'
 const API_BASE = '/api'
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const r = await fetch(`${API_BASE}${url}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  })
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
-  return r.json() as Promise<T>
+  // AbortController 10s 超时（F7 修复：原 fetch 无超时，后端挂起时 UI 永久加载）
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 10000)
+  try {
+    const r = await fetch(`${API_BASE}${url}`, {
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      ...options,
+    })
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+    return r.json() as Promise<T>
+  } finally {
+    clearTimeout(timeoutId)
+  }
 }
 
 export function listSessions(): Promise<Session[]> {
@@ -58,25 +66,52 @@ export function streamSession(
   onDone?: (finalStatus?: string) => void,
   onError?: (err: Error) => void
 ): () => void {
-  const es = new EventSource(`${API_BASE}/sessions/${id}/stream`)
-  es.onmessage = (e) => {
-    try {
-      const d = JSON.parse(e.data)
-      if (d.type === 'done') {
-        es.close()
-        // 后端 done 帧携带真实 status (completed/error/awaiting_clarify)，转发给调用方
-        onDone?.(d.status)
+  // F3/F4 修复：原 EventSource.onerror 直接报错不重连，网络抖动即断流。
+  // 改为手动重连 + 指数退避（最多 5 次）。重连后服务端发全量快照，
+  // 调用方在 onEvent 中识别快照（含 id/goal/events 字段）重置状态，天然去重。
+  let closed = false
+  let attempt = 0
+  let es: EventSource | null = null
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+  const connect = () => {
+    if (closed) return
+    es = new EventSource(`${API_BASE}/sessions/${id}/stream`)
+    es.onopen = () => { attempt = 0 } // 连接成功后重置退避计数
+    es.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data)
+        if (d.type === 'done') {
+          es?.close()
+          onDone?.(d.status)
+          return
+        }
+        onEvent(d as SessionEvent)
+      } catch (err) {
+        onError?.(err as Error)
+      }
+    }
+    es.onerror = () => {
+      es?.close()
+      es = null
+      if (closed) return
+      // 指数退避：1s, 2s, 4s, 8s, 16s，超过 5 次放弃
+      if (attempt >= 5) {
+        onError?.(new Error('SSE 重连失败，已超过最大重试次数'))
         return
       }
-      onEvent(d as SessionEvent)
-    } catch (err) {
-      onError?.(err as Error)
+      const delay = Math.min(1000 * Math.pow(2, attempt), 16000)
+      attempt++
+      reconnectTimer = setTimeout(connect, delay)
     }
   }
-  es.onerror = () => {
-    onError?.(new Error('SSE error'))
+  connect()
+
+  return () => {
+    closed = true
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    es?.close()
   }
-  return () => es.close()
 }
 
 export interface HealthStatus {

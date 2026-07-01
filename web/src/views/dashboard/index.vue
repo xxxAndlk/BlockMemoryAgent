@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import type { Session } from '@/types'
 import { listSessions, createSession, getTimeline, getActivity, type TimelinePoint, type ActivityItem } from '@/api/session'
 
@@ -55,6 +56,8 @@ async function runSession() {
     goal.value = ''
     await load()
     if (s?.id) viewSession(s.id)
+  } catch (e) {
+    ElMessage.error('创建会话失败：' + (e instanceof Error ? e.message : String(e)))
   } finally {
     loading.value = false
   }

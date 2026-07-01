@@ -207,85 +207,87 @@ func (m *Model) submitInput(cmd string) {
 // postJSON 向本地 TUI 后端发 POST 请求。
 // 失败时自动重试 2 次（间隔 500ms），仅对网络/连接错误重试，4xx/5xx 不重试。
 // 失败仅写 flashMsg 提示，不阻塞 TUI 主循环。
+// 异步执行（T2 修复：原同步阻塞主循环最差 ~10s 冻结键盘/tick）。
 func (m *Model) postJSON(path string, body any) {
-	addr := m.httpAddr
-	if addr == "" {
-		addr = "http://localhost:10010"
-	}
-	data, err := json.Marshal(body)
-	if err != nil {
-		m.flashMsg("marshal error: " + err.Error())
-		return
-	}
-	client := &http.Client{Timeout: requestTimeout}
-
-	const maxRetries = 2
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			time.Sleep(500 * time.Millisecond)
+	go func() {
+		addr := m.httpAddr
+		if addr == "" {
+			addr = "http://localhost:10010"
 		}
-		req, err := http.NewRequest(http.MethodPost, addr+path, bytes.NewReader(data))
+		data, err := json.Marshal(body)
+		if err != nil {
+			m.flashMsg("marshal error: " + err.Error())
+			return
+		}
+		client := &http.Client{Timeout: requestTimeout}
+
+		const maxRetries = 2
+		var lastErr error
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				time.Sleep(500 * time.Millisecond)
+			}
+			req, err := http.NewRequest(http.MethodPost, addr+path, bytes.NewReader(data))
+			if err != nil {
+				m.flashMsg("request error: " + err.Error())
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			// Drain body for connection reuse (Step 8)
+			_, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				m.flashMsg(fmt.Sprintf("%s returned %d", path, resp.StatusCode))
+			}
+			return
+		}
+		m.flashMsg("post error (retried): " + lastErr.Error())
+	}()
+}
+
+// createSession POSTs /api/sessions with the goal, then selects the new session.
+// 异步执行（T2 修复）：成功后写 pendingSelectID，由 tick handler 在主循环内
+// 执行 refreshSessions + selectSession，避免后台 goroutine 直接改 m.sessions/cursor
+// 与 View 产生 race。
+func (m *Model) createSession(goal string) {
+	go func() {
+		addr := m.httpAddr
+		if addr == "" {
+			addr = "http://localhost:10010"
+		}
+		body, _ := json.Marshal(map[string]string{"goal": goal})
+		req, err := http.NewRequest(http.MethodPost, addr+"/api/sessions", bytes.NewReader(body))
 		if err != nil {
 			m.flashMsg("request error: " + err.Error())
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: requestTimeout}
 		resp, err := client.Do(req)
 		if err != nil {
-			lastErr = err
-			continue
+			m.flashMsg("create session: " + err.Error())
+			return
 		}
-		// Drain body for connection reuse (Step 8)
-		_, _ = io.ReadAll(resp.Body)
-		resp.Body.Close()
+		defer resp.Body.Close()
 		if resp.StatusCode >= 400 {
-			m.flashMsg(fmt.Sprintf("%s returned %d", path, resp.StatusCode))
+			errBody, _ := io.ReadAll(resp.Body)
+			m.flashMsg(fmt.Sprintf("create session returned %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody))))
+			return
 		}
-		return
-	}
-	m.flashMsg("post error (retried): " + lastErr.Error())
-}
-
-// createSession POSTs /api/sessions with the goal, then selects the new session.
-func (m *Model) createSession(goal string) {
-	addr := m.httpAddr
-	if addr == "" {
-		addr = "http://localhost:10010"
-	}
-	body, _ := json.Marshal(map[string]string{"goal": goal})
-	req, err := http.NewRequest(http.MethodPost, addr+"/api/sessions", bytes.NewReader(body))
-	if err != nil {
-		m.flashMsg("request error: " + err.Error())
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: requestTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		m.flashMsg("create session: " + err.Error())
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		_, _ = io.ReadAll(resp.Body)
-		m.flashMsg(fmt.Sprintf("create session returned %d", resp.StatusCode))
-		return
-	}
-	var created server.Session
-	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
-		m.flashMsg("decode session: " + err.Error())
-		return
-	}
-	m.refreshSessions()
-	// Select the freshly created session by ID.
-	for i, s := range m.sessions {
-		if s.ID == created.ID {
-			m.selectSession(i)
-			break
+		var created server.Session
+		if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+			m.flashMsg("decode session: " + err.Error())
+			return
 		}
-	}
-	m.flashMsg("session started: " + created.ID)
+		// 写 pendingSelectID，tick handler 消费时在主循环内 refresh+select
+		m.pendingSelectID = created.ID
+		m.flashMsg("session started: " + created.ID)
+	}()
 }
 
 // sessionHistory returns the input history slice for the currently selected session.

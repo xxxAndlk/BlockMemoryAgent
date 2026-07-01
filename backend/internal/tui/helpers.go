@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -13,9 +14,20 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
+// ansiRegex 匹配 ANSI 转义序列（CSI/OSC 等）。T10 修复：
+// tool_output 含 ANSI（如 colored log）会让 bubbletea 渲染错位。
+var ansiRegex = regexp.MustCompile("\x1b\\[[0-9;]*[A-Za-z]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)|\x1b[@-Z\\-_]")
+
+func stripANSI(s string) string {
+	return ansiRegex.ReplaceAllString(s, "")
+}
+
 func (m *Model) flashMsg(msg string) {
+	// 加锁保护：postJSON/createSession 后台 goroutine 与主循环 View 并发读写 flash（T2 修复）
+	m.flashMu.Lock()
 	m.flash = msg
 	m.flashUntil = time.Now().Add(2 * time.Second)
+	m.flashMu.Unlock()
 }
 
 func (m *Model) hasPlan() bool {
@@ -245,12 +257,12 @@ func eventChatItem(ev server.SessionEvent) (title, detail string, ok bool) {
 		}
 		if ev.ToolOutput != "" {
 			d.WriteString("结果:\n")
-			d.WriteString(ev.ToolOutput)
+			d.WriteString(stripANSI(ev.ToolOutput))
 			d.WriteByte('\n')
 		}
 		if ev.ToolError != "" {
 			d.WriteString("错误: ")
-			d.WriteString(ev.ToolError)
+			d.WriteString(stripANSI(ev.ToolError))
 			d.WriteByte('\n')
 		}
 		return title, strings.TrimRight(d.String(), "\n"), true

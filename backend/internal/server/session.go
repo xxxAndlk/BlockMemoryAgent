@@ -331,9 +331,41 @@ func (m *SessionManager) handleProgress(ctx context.Context, ev graph.ProgressEv
 // parseTokenUsage 从 token_usage 消息中解析 in / out token 数
 // 格式: "[caller] Token 消耗: in=N out=M dur=X"
 // 返回值：in, out - 输入 / 输出 token 数。
+// 实现：用 strings.Index 定位 "in=" / "out=" 子串提取数字（R1 修复）。
+// 原 Sscanf "%*s" 只跳一个非空白词，caller 含空格（如 "MetaAgent/复杂度判定"）时
+// 匹配失败 → in/out 解析为 0，metrics API 返回全零。
 func parseTokenUsage(msg string) (in, out int) {
-	fmt.Sscanf(msg, "%*s Token 消耗: in=%d out=%d", &in, &out) // %*s 跳过 caller 前缀
+	in = extractIntAfter(msg, "in=")
+	out = extractIntAfter(msg, "out=")
 	return
+}
+
+// extractIntAfter 在 s 中查找 marker 子串，解析其后的十进制整数。
+// 找不到 marker 或无数字返回 0。
+func extractIntAfter(s, marker string) int {
+	idx := strings.Index(s, marker)
+	if idx < 0 {
+		return 0
+	}
+	start := idx + len(marker)
+	// 跳过可能的前导空白
+	for start < len(s) && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	n := 0
+	signed := false
+	if start < len(s) && s[start] == '-' {
+		signed = true
+		start++
+	}
+	for start < len(s) && s[start] >= '0' && s[start] <= '9' {
+		n = n*10 + int(s[start]-'0')
+		start++
+	}
+	if signed {
+		n = -n
+	}
+	return n
 }
 
 // CreateSession 创建并启动新会话。
@@ -400,8 +432,10 @@ func (m *SessionManager) LLMStats() (callCount, timeoutCount int, avgDur, maxDur
 	return
 }
 
-// ListSessions 列出所有会话
+// ListSessions 列出所有会话，按 StartedAt 降序排序（最新的在前）。
 // 返回值：[]*Session - 所有会话指针的切片（拷贝，可安全遍历）。
+// 排序修复 T3：原实现遍历 map[string]*Session，迭代顺序随机，
+// TUI 每 5s 刷新一次列表会重排，用户看到会话位置不断跳动。
 func (m *SessionManager) ListSessions() []*Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -409,7 +443,64 @@ func (m *SessionManager) ListSessions() []*Session {
 	for _, s := range m.sessions {
 		result = append(result, s) // 拷贝指针
 	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].StartedAt.After(result[j].StartedAt) // StartedAt 降序
+	})
 	return result
+}
+
+// Shutdown 取消所有运行中会话的 ctx，用于进程退出前清理（T8 修复：
+// 原退出仅依赖 pgStore.Close，未取消运行中 graph.Invoke goroutine，
+// 导致 ctx 不被回收、SSE 流悬挂到进程强制退出）。
+func (m *SessionManager) Shutdown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.sessions {
+		if s.cancelFn != nil {
+			s.cancelFn()
+			s.cancelFn = nil
+		}
+	}
+}
+
+// snapshotSession 在持锁状态下返回 session 的深拷贝（Events / Messages 切片复制）。
+// 供 SSE handler / TUI 等需要安全读取会话数据的路径使用，避免与 runSession /
+// addEventDebug 的并发写入产生 data race（T1/T4 修复）。
+// 调用方可在无锁状态下自由使用返回值。
+func (m *SessionManager) snapshotSession(session *Session) *Session {
+	if session == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cp := *session // 浅拷贝值类型字段（ID/Goal/Status/StartedAt 等）
+	// 深拷贝 Events 与 Messages 切片：append 时底层数组可能重分配，
+	// 调用方持有旧数组指针会读到半更新数据或越界。
+	if session.Events != nil {
+		cp.Events = make([]SessionEvent, len(session.Events))
+		copy(cp.Events, session.Events)
+	}
+	if session.Messages != nil {
+		cp.Messages = make([]types.ChatMessage, len(session.Messages))
+		copy(cp.Messages, session.Messages)
+	}
+	// State 指针共享：ThreeLayerState 仅在 graph.Invoke 串行修改，
+	// SSE/TUI 读取只读字段不构成 race；深度拷贝成本过高，保持共享。
+	return &cp
+}
+
+// SnapshotSession 导出版本：按会话 ID 返回持锁深拷贝。
+// 供 TUI 等外部消费者使用（T1 修复：TUI 原直接读 *Session 的 Events/Messages/State
+// 无锁，与后台 goroutine 并发写产生 data race）。
+// 找不到会话返回 nil。
+func (m *SessionManager) SnapshotSession(id string) *Session {
+	m.mu.RLock()
+	session, ok := m.sessions[id]
+	m.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	return m.snapshotSession(session)
 }
 
 // runSession 是会话执行的主循环（在独立 goroutine 中运行）。
@@ -967,8 +1058,9 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// 先发送当前状态
-	data, _ := json.Marshal(session)     // 序列化当前 session
+	// 先发送当前状态（持锁快照 Events 避免与 addEventDebug 并发 append 产生 race，T4 修复）
+	snapshot := m.snapshotSession(session)
+	data, _ := json.Marshal(snapshot) // 序列化当前 session 快照
 	fmt.Fprintf(w, "data: %s\n\n", data) // 写入 SSE 帧
 	flusher.Flush()
 
@@ -976,7 +1068,7 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 	ticker := time.NewTicker(500 * time.Millisecond) // 500ms 轮询一次
 	defer ticker.Stop()
 
-	lastEventCount := len(session.Events) // 记录上次推送的事件数
+	lastEventCount := len(snapshot.Events) // 记录上次推送的事件数
 
 	for {
 		select {
@@ -986,13 +1078,25 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 				return
 			}
 
-			if len(session.Events) > lastEventCount {
-				// 推送增量事件
-				for _, ev := range session.Events[lastEventCount:] {
+			// 持锁快照当前 Events（T4 修复：原无锁读 len + 切片，
+			// 与 addEventDebug 的 append / trimDebugEvents 的前删产生竞态，
+			// trim 后 lastEventCount 可能超过新 len 导致切片负长度 panic）
+			snapshot = m.snapshotSession(session)
+			currentEvents := snapshot.Events
+
+			// trimDebugEvents 会从前端删除调试事件，导致 lastEventCount 超过新 len。
+			// 此时应重置水位为当前长度（已删事件不可补推），而非切片 panic。
+			if lastEventCount > len(currentEvents) {
+				lastEventCount = len(currentEvents) // 重置到尾部，只推后续新事件
+			}
+
+			if len(currentEvents) > lastEventCount {
+				// 推送增量事件（从快照拷贝中读，无锁竞争）
+				for _, ev := range currentEvents[lastEventCount:] {
 					data, _ := json.Marshal(ev)
 					fmt.Fprintf(w, "data: %s\n\n", data)
 				}
-				lastEventCount = len(session.Events) // 更新水位
+				lastEventCount = len(currentEvents) // 更新水位
 				flusher.Flush()
 			}
 

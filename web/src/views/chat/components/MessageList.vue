@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, nextTick, onMounted } from 'vue'
+import { ref, watch, nextTick, onMounted, computed } from 'vue'
 import type { SessionEvent } from '@/types'
 import { groupEventsToTurns } from '../utils/turns'
 import UserBubble from './UserBubble.vue'
@@ -12,6 +12,10 @@ const props = defineProps<{
 
 const containerRef = ref<HTMLElement | null>(null)
 const stickToBottom = ref(true)
+
+// F9 修复：原 groupEventsToTurns(events) 在模板内直接调用，
+// 每次 patch 都重新 O(n) 分组。改 computed 仅在 events 变化时重算。
+const turns = computed(() => groupEventsToTurns(props.events))
 
 function onScroll() {
   if (!containerRef.value) return
@@ -49,7 +53,7 @@ defineExpose({ scrollToBottom })
       </div>
     </template>
     <template v-else>
-      <div v-for="turn in groupEventsToTurns(events)" :key="turn.id">
+      <div v-for="turn in turns" :key="turn.id">
         <UserBubble v-if="turn.userMessage" :event="turn.userMessage" />
         <AssistantTurn :turn="turn" :verbose="verbose" />
       </div>

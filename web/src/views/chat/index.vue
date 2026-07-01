@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import type { Session, SessionEvent, AgentNode } from '@/types'
 import {
   listSessions,
@@ -70,14 +71,16 @@ async function openSession(id: string) {
   loading.value = true
   closeStream.value?.()
   events.value = []
+  panelEpoch.value++ // 作废旧 refreshPanels 响应（F17）
   try {
     const s = await getSession(id)
     activeSession.value = s
     events.value = [...(s.events || [])]
     startStream(s)
     await refreshPanels(id)
-  } catch {
+  } catch (e) {
     activeSession.value = null
+    ElMessage.error('会话不存在或加载失败：' + (e instanceof Error ? e.message : String(e)))
   } finally {
     loading.value = false
   }
@@ -95,14 +98,21 @@ function startPanelTimer(sessionId: string) {
   panelTimer.value = setInterval(() => refreshPanels(sessionId), 3000)
 }
 
+// F17 修复：原 refreshPanels 无请求竞态保护。会话切换时旧请求可能在新请求后返回，
+// 用 epoch 计数器丢弃过期响应（比 abort 更简单，且不依赖 AbortController 透传）。
+const panelEpoch = ref(0)
+
 async function refreshPanels(id: string) {
+  const epoch = ++panelEpoch.value
   try {
     const a = await getSessionAgents(id)
+    if (epoch !== panelEpoch.value) return // 已被新会话切换作废
     agents.value = a.agents || []
-  } catch { agents.value = [] }
+  } catch { if (epoch === panelEpoch.value) agents.value = [] }
   try {
     metrics.value = await getSessionMetrics(id)
-  } catch { metrics.value = null }
+    if (epoch !== panelEpoch.value) return
+  } catch { if (epoch === panelEpoch.value) metrics.value = null }
 }
 
 function startStream(s: Session) {
@@ -133,6 +143,10 @@ function startStream(s: Session) {
     (err) => {
       stopPanelTimer()
       console.error('SSE error:', err)
+      // SSE 错误必须重置 sending，否则发送按钮永久禁用（F2 修复）。
+      // 原 onError 仅 console.error，sending 保持 true 导致 UI 死锁只能刷新。
+      sending.value = false
+      ElMessage.error('实时连接异常，请检查网络或刷新页面')
     },
   )
 }
@@ -161,8 +175,10 @@ async function handleSubmit(content: string) {
     await openSession(s.id)
   } catch (e) {
     console.error('submit failed:', e)
-  } finally {
-    // sending 由 SSE done 关闭
+    // API 异常时 SSE 不会建立，onDone 永不触发，必须在此重置 sending（F11 修复）。
+    // 原 finally 注释说"SSE done will close it"，但 API 抛错路径下 sending 永久 true。
+    sending.value = false
+    ElMessage.error('发送失败：' + (e instanceof Error ? e.message : String(e)))
   }
 }
 
@@ -172,6 +188,7 @@ async function handleCancel() {
     await cancelSession(activeSession.value.id)
   } catch (e) {
     console.error('cancel failed:', e)
+    ElMessage.error('取消会话失败：' + (e instanceof Error ? e.message : String(e)))
   }
 }
 

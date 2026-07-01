@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, watch, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import type { Session, AgentNode, TaskBoardData } from '@/types'
 import { listSessions, getSession, getSessionBoard, getSessionAgents, streamSession, getSessionMetrics, getSessionWatchdog, getSessionMailbox, getHealth, type SessionMetrics, type WatchdogDecision, type MailboxMessage, type HealthResponse } from '@/api/session'
 import ExecutionLog from './components/ExecutionLog.vue'
@@ -44,8 +45,9 @@ watch(() => route.query.id, (id) => {
 async function loadSessions() {
   try {
     sessions.value = await listSessions()
-  } catch {
+  } catch (e) {
     sessions.value = []
+    ElMessage.error('加载会话列表失败：' + (e instanceof Error ? e.message : String(e)))
   }
 }
 
@@ -54,9 +56,13 @@ async function selectSessionById(id: string) {
   try {
     const s = await getSession(id)
     selectSession(s)
-  } catch {
+  } catch (e) {
     const s = sessions.value.find(x => x.id === id)
-    if (s) selectSession(s)
+    if (s) {
+      selectSession(s)
+    } else {
+      ElMessage.error('会话不存在或加载失败：' + (e instanceof Error ? e.message : String(e)))
+    }
   } finally {
     loading.value = false
   }
@@ -110,16 +116,28 @@ function startStream(s: Session) {
   closeStream.value = streamSession(
     s.id,
     (ev) => {
-      // SSE 连接建立时后端会先推送一次完整 Session 快照，
-      // 该对象不是事件，跳过避免污染 events 数组。
-      if (ev && 'id' in ev && 'goal' in ev && 'events' in ev) return
-      s.events.push(ev)
+      // SSE 连接建立 / 重连时后端推送完整 Session 快照（含 id/goal/events）。
+      // F12 修复：原实现直接 return 丢弃快照，导致 activeSession.status 永不更新
+      // （header 一直显示 running 即使会话已 completed/error）。
+      // 改为用快照刷新 activeSession 状态 + events（重连去重靠快照重置）。
+      if (ev && 'id' in ev && 'goal' in ev && 'events' in ev) {
+        const snap = ev as unknown as Session
+        if (activeSession.value?.id === snap.id) {
+          activeSession.value = { ...activeSession.value, status: snap.status, events: snap.events || [] }
+        }
+        return
+      }
+      // 推到 activeSession.events（非 sessions 列表项的 s），避免污染共享对象
+      if (activeSession.value && activeSession.value.id === s.id) {
+        activeSession.value = { ...activeSession.value, events: [...(activeSession.value.events || []), ev] }
+      }
     },
     () => {
       loadSessions()
     },
     (err) => {
       console.error('SSE error:', err)
+      ElMessage.error('实时连接异常，请检查网络或刷新页面')
     }
   )
 }
