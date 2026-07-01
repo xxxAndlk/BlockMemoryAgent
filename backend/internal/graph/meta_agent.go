@@ -59,6 +59,7 @@ type MetaAgentNode struct {
 	history         HistoryStore          // 跨会话历史读取器
 	progress        ProgressCallback      // 进度回调（推思考/意图/Token）
 	archiveStore    DomainArchiveStore    // domainAgent 归档存储（特性4：跨会话复用与清理）
+	compressor      EpisodeCompressor     // Episode 压缩器（Watchdog 触发压缩时调用）
 }
 
 // NewMetaAgentNode 创建主Agent节点。
@@ -104,6 +105,12 @@ func (n *MetaAgentNode) SetHistoryStore(h HistoryStore) {
 // nil 时跳过归档清理与复用检索。
 func (n *MetaAgentNode) SetArchiveStore(s DomainArchiveStore) {
 	n.archiveStore = s
+}
+
+// SetEpisodeCompressor 注入 Episode 压缩器。
+// nil 时 Watchdog 仅推送建议压缩提示，不执行压缩。
+func (n *MetaAgentNode) SetEpisodeCompressor(c EpisodeCompressor) {
+	n.compressor = c
 }
 
 // SetProgressCallback 注入进度回调。
@@ -350,9 +357,18 @@ func (n *MetaAgentNode) runWatchdog(ctx context.Context, state *types.ThreeLayer
 		n.emitDetail(ctx, "wait",
 			fmt.Sprintf("Watchdog 触发 EVICT（上下文 %d tokens 超硬阈值），已降级为警告，不中断会话: %s", d.Tokens, d.Reason), "")
 	case watchdog.LevelCompress:
-		// 接近软阈值：推送建议压缩提示，携带实际 token 数
+		// 接近软阈值：推送建议压缩提示，并尝试对当前块主 Agent 执行 Episode 压缩
 		n.emit(ctx, "think",
 			fmt.Sprintf("Watchdog 提示上下文接近软阈值 (%d tokens)，建议后续压缩: %s", d.Tokens, d.Reason))
+		if n.compressor != nil {
+			if block != nil && len(block.Agents) > 0 {
+				for _, agentID := range block.Agents {
+					if err := n.compressor.Compress(ctx, agentID, state.SessionID); err == nil {
+						n.emit(ctx, "think", fmt.Sprintf("已对 Agent %s 执行 Episode 压缩", agentID))
+					}
+				}
+			}
+		}
 	case watchdog.LevelWarn:
 		// 静默
 	}

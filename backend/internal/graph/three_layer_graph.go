@@ -40,6 +40,10 @@ type ThreeLayerGraph struct {
 	rt           *runtime.Runtime          // 看板/邮箱/Watchdog/人格/Skill 聚合体
 	blockMemory  BlockMemoryStore          // 块记忆存储（特性3：domainAgent 后向量检索）
 	archiveStore DomainArchiveStore        // domainAgent 归档存储（特性4：跨会话复用）
+	memCallback  MemoryCallbackHandler     // 记忆回调处理器（驱动 Episode 写入与快照保存）
+	assembler    ContextAssembler          // 上下文组装器（为 Assistant 注入私有记忆）
+	compressor   EpisodeCompressor         // Episode 压缩器（Watchdog 触发压缩）
+	snapshotMgr  AgentSnapshotManager      // Agent 快照管理器（DomainAgent 启动加载/结束保存）
 }
 
 // SetBlockMemoryStore 在已构建的图上注入块记忆存储（特性3）。
@@ -66,6 +70,64 @@ func (g *ThreeLayerGraph) SetArchiveStore(s DomainArchiveStore) {
 		}
 		if m, ok := node.(*MetaAgentNode); ok {
 			m.SetArchiveStore(s)
+		}
+	}
+}
+
+// SetMemoryCallbackHandler 在已构建的图上注入记忆回调处理器。
+// 同步给已存在的 DomainAgent / SubDomainAgent 静态节点与动态缓存。
+func (g *ThreeLayerGraph) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
+	g.mu.Lock()
+	g.memCallback = h
+	g.mu.Unlock()
+	for _, node := range g.nodes {
+		if d, ok := node.(*DomainAgentNode); ok {
+			d.SetMemoryCallbackHandler(h)
+		}
+		if sd, ok := node.(*SubDomainAgentNode); ok {
+			sd.SetMemoryCallbackHandler(h)
+		}
+	}
+}
+
+// SetContextAssembler 在已构建的图上注入上下文组装器。
+// 同步给已存在的 Assistant 静态节点与动态缓存。
+func (g *ThreeLayerGraph) SetContextAssembler(a ContextAssembler) {
+	g.mu.Lock()
+	g.assembler = a
+	g.mu.Unlock()
+	for _, node := range g.nodes {
+		if aNode, ok := node.(*AssistantNode); ok {
+			aNode.SetContextAssembler(a)
+		}
+	}
+}
+
+// SetEpisodeCompressor 在已构建的图上注入 Episode 压缩器。
+// 同步给已存在的 MetaAgent 节点。
+func (g *ThreeLayerGraph) SetEpisodeCompressor(c EpisodeCompressor) {
+	g.mu.Lock()
+	g.compressor = c
+	g.mu.Unlock()
+	for _, node := range g.nodes {
+		if m, ok := node.(*MetaAgentNode); ok {
+			m.SetEpisodeCompressor(c)
+		}
+	}
+}
+
+// SetAgentSnapshotManager 在已构建的图上注入 Agent 快照管理器。
+// 同步给已存在的 DomainAgent / SubDomainAgent 静态节点与动态缓存。
+func (g *ThreeLayerGraph) SetAgentSnapshotManager(s AgentSnapshotManager) {
+	g.mu.Lock()
+	g.snapshotMgr = s
+	g.mu.Unlock()
+	for _, node := range g.nodes {
+		if d, ok := node.(*DomainAgentNode); ok {
+			d.SetAgentSnapshotManager(s)
+		}
+		if sd, ok := node.(*SubDomainAgentNode); ok {
+			sd.SetAgentSnapshotManager(s)
 		}
 	}
 }
@@ -482,6 +544,39 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 	if as != nil {
 		if d, ok := node.(*DomainAgentNode); ok {
 			d.SetArchiveStore(as)
+		}
+	}
+	// 注入记忆回调处理器
+	g.mu.RLock()
+	memCb := g.memCallback
+	g.mu.RUnlock()
+	if memCb != nil {
+		if d, ok := node.(*DomainAgentNode); ok {
+			d.SetMemoryCallbackHandler(memCb)
+		}
+		if sd, ok := node.(*SubDomainAgentNode); ok {
+			sd.SetMemoryCallbackHandler(memCb)
+		}
+	}
+	// 注入上下文组装器
+	g.mu.RLock()
+	asm := g.assembler
+	g.mu.RUnlock()
+	if asm != nil {
+		if aNode, ok := node.(*AssistantNode); ok {
+			aNode.SetContextAssembler(asm)
+		}
+	}
+	// 注入快照管理器
+	g.mu.RLock()
+	sm := g.snapshotMgr
+	g.mu.RUnlock()
+	if sm != nil {
+		if d, ok := node.(*DomainAgentNode); ok {
+			d.SetAgentSnapshotManager(sm)
+		}
+		if sd, ok := node.(*SubDomainAgentNode); ok {
+			sd.SetAgentSnapshotManager(sm)
 		}
 	}
 

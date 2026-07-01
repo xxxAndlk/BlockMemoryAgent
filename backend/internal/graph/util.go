@@ -18,6 +18,37 @@ type WorkspaceWriter interface {
 	SaveAgentOutput(ctx context.Context, topicID string, output *types.AgentOutput) error
 }
 
+// MemoryCallbackHandler 记忆回调处理器接口。
+// 在节点生命周期事件上驱动 Episode 写入、快照保存与状态广播。
+// 实现方在 memory 包，graph 只依赖接口避免循环依赖。
+type MemoryCallbackHandler interface {
+	OnStart(ctx context.Context, agentID, topicID string)
+	OnEnd(ctx context.Context, agentID, topicID, action, rawContent string, stepCount int)
+	OnError(ctx context.Context, agentID, topicID string, err error)
+}
+
+// ContextAssembler 上下文组装器接口。
+// 将系统角色、话题目标、共享状态、全局知识与私有记忆按 Token 预算组装成消息列表。
+// 实现方在 memory 包，返回 graph 包定义的 ContextPack。
+type ContextAssembler interface {
+	BuildContext(ctx context.Context, req *BuildRequest) (*ContextPack, error)
+}
+
+// EpisodeCompressor Episode 压缩器接口。
+// 按重要性 + 时间对私有记忆做分层压缩，降低长期记忆 Token 占用。
+// 实现方在 memory 包。
+type EpisodeCompressor interface {
+	Compress(ctx context.Context, agentID, topicID string) error
+}
+
+// AgentSnapshotManager Agent 快照管理器接口。
+// 协调 Redis 热存与 Postgres 冷存的两级快照读写。
+// 实现方在 memory 包。
+type AgentSnapshotManager interface {
+	Load(ctx context.Context, agentID, topicID string) (*types.AgentSnapshot, error)
+	SaveFromState(ctx context.Context, agentID, topicID string, output *types.AgentOutput, episodes []*types.Episode) error
+}
+
 // BlockMemoryStore 块记忆存储接口（特性3）。
 // 抽象 domainAgent 执行后归档与按相似度检索的能力，避免 graph 反向依赖 store。
 // 实现方在 store 包（PostgresStore + pgvector）。

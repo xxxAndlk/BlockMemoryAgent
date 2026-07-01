@@ -3,10 +3,12 @@ package graph
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -23,10 +25,11 @@ type AssistantNode struct {
 	name         string             // 节点名（固定 "Assistant"），实现 ThreeLayerNode.Name
 	instID       string             // 本实例ID，对应 registry 中的 RoleInstance.ID
 	registry     *RoleRegistry      // 角色注册表，查询实例/角色定义、更新状态
-	workspace    WorkspaceWriter    // 工作区写入器，持久化 AgentOutput（可能为 nil）
-	modelFactory *model.ModelFactory // LLM 模型工厂，nil 时退回 mock
-	rt           *runtime.Runtime   // 运行时聚合体，读取 AgentCfg 超时配置
-	progress     ProgressCallback   // 进度回调，推送 prompt / token_usage 事件
+	workspace        WorkspaceWriter    // 工作区写入器，持久化 AgentOutput（可能为 nil）
+	modelFactory     *model.ModelFactory // LLM 模型工厂，nil 时退回 mock
+	rt               *runtime.Runtime   // 运行时聚合体，读取 AgentCfg 超时配置
+	progress         ProgressCallback   // 进度回调，推送 prompt / token_usage 事件
+	contextAssembler ContextAssembler   // 上下文组装器，注入私有记忆与全局知识
 }
 
 // NewAssistantNode 创建助手节点。
@@ -62,6 +65,10 @@ func (n *AssistantNode) SetRuntime(rt *runtime.Runtime) { n.rt = rt }
 
 // SetProgressCallback 实现 ProgressCallbackReceiver。
 func (n *AssistantNode) SetProgressCallback(cb ProgressCallback) { n.progress = cb }
+
+// SetContextAssembler 注入上下文组装器。
+// nil 时 Assistant 退化为原生的角色定义 + 任务 prompt。
+func (n *AssistantNode) SetContextAssembler(a ContextAssembler) { n.contextAssembler = a }
 
 // Invoke 执行本节点。
 //
@@ -177,15 +184,32 @@ func (n *AssistantNode) callLLM(ctx context.Context, roleDef *types.RoleDefiniti
 		return "", fmt.Errorf("get model: %w", err)
 	}
 
-	// 构建 prompt：角色定义 + 任务
-	domain := ""
-	if callReq != nil && callReq.Context != nil {
-		if d, ok := callReq.Context["domain"]; ok {
-			domain = fmt.Sprintf("%v", d)
+	// 构建 prompt：优先使用上下文组装器注入私有记忆 / 全局知识
+	var prompt string
+	if n.contextAssembler != nil {
+		req := &BuildRequest{
+			AgentID:   n.instID,
+			TopicID:   SessionIDFromContext(ctx),
+			TaskQuery: task,
+		}
+		if callReq != nil {
+			req.DependsOn = []string{callReq.CallerID}
+		}
+		if pack, err := n.contextAssembler.BuildContext(ctx, req); err == nil && pack != nil {
+			prompt = formatContextPack(pack, roleDef, task)
 		}
 	}
-	prompt := fmt.Sprintf("你是一个 %s，专长：%s。\n领域：%s\n请完成以下任务：%s",
-		roleDef.Name, roleDef.Description, domain, task)
+	if prompt == "" {
+		// 回退到原生 prompt
+		domain := ""
+		if callReq != nil && callReq.Context != nil {
+			if d, ok := callReq.Context["domain"]; ok {
+				domain = fmt.Sprintf("%v", d)
+			}
+		}
+		prompt = fmt.Sprintf("你是一个 %s，专长：%s。\n领域：%s\n请完成以下任务：%s",
+			roleDef.Name, roleDef.Description, domain, task)
+	}
 
 	// 推送 prompt 事件
 	if n.progress != nil {
@@ -235,6 +259,30 @@ func (n *AssistantNode) callLLM(ctx context.Context, roleDef *types.RoleDefiniti
 		}
 		return r.text, nil
 	}
+}
+
+// formatContextPack 把 ContextPack 中的消息列表与角色定义、任务拼接成单段 prompt。
+// 当前 ChatModel 接口只接受字符串，因此把多段消息按角色顺序拼成文本。
+func formatContextPack(pack *ContextPack, roleDef *types.RoleDefinition, task string) string {
+	var b strings.Builder
+	// 先写入角色定义，作为 system 段补充
+	b.WriteString(fmt.Sprintf("你是 %s，专长：%s。\n", roleDef.Name, roleDef.Description))
+	// 按消息角色顺序拼接
+	for _, m := range pack.Messages {
+		switch m.Role {
+		case enums.ChatRoleSystem:
+			b.WriteString(fmt.Sprintf("[系统] %s\n", m.Content))
+		case enums.ChatRoleUser:
+			b.WriteString(fmt.Sprintf("[用户] %s\n", m.Content))
+		case enums.ChatRoleAssistant:
+			b.WriteString(fmt.Sprintf("[助手] %s\n", m.Content))
+		default:
+			b.WriteString(fmt.Sprintf("[%s] %s\n", m.Role, m.Content))
+		}
+	}
+	// 最后再次明确当前任务
+	b.WriteString(fmt.Sprintf("\n请完成以下任务：%s", task))
+	return b.String()
 }
 
 // mockResult 生成模拟结果（无 LLM key 时的占位）。

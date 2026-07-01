@@ -35,6 +35,8 @@ type SubDomainAgentNode struct {
 	progress     ProgressCallback      // 进度回调（推思考/意图/Token）
 	llmTracker   *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token）
 	rt           *runtime.Runtime      // Runtime 聚合体（用于读取 AgentCfg 等动态参数）
+	memCallback  MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
+	snapshotMgr  AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
 }
 
 // SetRuntime 注入 Runtime。nil 时动态参数回退默认值。
@@ -118,6 +120,18 @@ func (n *SubDomainAgentNode) SetProgressCallback(cb ProgressCallback) {
 	n.progress = cb
 }
 
+// SetMemoryCallbackHandler 注入记忆回调处理器。
+// nil 时不触发 Episode 写入与快照保存。
+func (n *SubDomainAgentNode) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
+	n.memCallback = h
+}
+
+// SetAgentSnapshotManager 注入 Agent 快照管理器。
+// nil 时不加载/保存快照。
+func (n *SubDomainAgentNode) SetAgentSnapshotManager(s AgentSnapshotManager) {
+	n.snapshotMgr = s
+}
+
 // Name 返回节点名称。
 // 实现 ThreeLayerNode 接口。
 func (n *SubDomainAgentNode) Name() string {
@@ -150,11 +164,24 @@ func (n *SubDomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayer
 	inst := n.registry.GetInstance(n.instID)
 	if inst == nil {
 		// 实例已被清理或路由错误，终止本次执行
+		if n.memCallback != nil {
+			n.memCallback.OnError(ctx, n.instID, state.SessionID, fmt.Errorf("subdomain agent instance %s not found", n.instID))
+		}
 		return nil, fmt.Errorf("subdomain agent instance %s not found", n.instID)
 	}
 
 	// 2. 标记实例活跃
 	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusActive)
+
+	// 2.5 记忆回调：广播 SubDomainAgent 进入 ACTIVE，并尝试加载历史快照
+	if n.memCallback != nil {
+		n.memCallback.OnStart(ctx, n.instID, state.SessionID)
+	}
+	if n.snapshotMgr != nil {
+		if snap, err := n.snapshotMgr.Load(ctx, n.instID, state.SessionID); err == nil && snap != nil {
+			n.emit(ctx, "think", fmt.Sprintf("已加载历史快照，未决问题 %d 个", len(snap.OpenIssues)))
+		}
+	}
 
 	// 3. 拆解子任务（LLM 优先，失败回退规则）
 	tasks := n.analyzeSubTasks(ctx, state)
@@ -164,6 +191,7 @@ func (n *SubDomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayer
 	if block == nil {
 		// 块缺失（被并发清理或路由错误），交回 MetaAgent 决策
 		state.NextAction = types.ActionContinue
+		n.finish(ctx, state)
 		return state, nil
 	}
 	// 懒初始化 TaskResults
@@ -211,7 +239,16 @@ func (n *SubDomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayer
 		state.TargetRoleID = "MetaAgent" // 无父则回 MetaAgent
 	}
 
+	n.finish(ctx, state)
 	return state, nil
+}
+
+// finish 在 SubDomainAgent 成功结束前触发记忆回调。
+// 由 CallbackHandler 内部负责 Episode 写入与快照保存；此处只发起回调。
+func (n *SubDomainAgentNode) finish(ctx context.Context, state *types.ThreeLayerState) {
+	if n.memCallback != nil {
+		n.memCallback.OnEnd(ctx, n.instID, state.SessionID, "SubDomainAgent完成", state.Reason, 0)
+	}
 }
 
 // dispatchAssistantsParallel 并行调度助手。

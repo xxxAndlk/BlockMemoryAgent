@@ -37,6 +37,9 @@ type DomainAgentNode struct {
 	blockMemory  BlockMemoryStore      // 块记忆存储（特性3：向量检索归档）
 	archiveStore DomainArchiveStore    // domainAgent 归档存储（特性4：跨会话复用）
 	recalledMemory string              // 本次 Invoke 检索到的相似块记忆文本（注入 analyzeTasks）
+	memCallback  MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
+	snapshotMgr  AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
+	snapshot     *types.AgentSnapshot  // 本次 Invoke 加载到的快照
 }
 
 // NewDomainAgentNode 创建领域Agent节点。
@@ -91,6 +94,18 @@ func (n *DomainAgentNode) SetBlockMemoryStore(s BlockMemoryStore) {
 // nil 时不做跨会话归档与复用。
 func (n *DomainAgentNode) SetArchiveStore(s DomainArchiveStore) {
 	n.archiveStore = s
+}
+
+// SetMemoryCallbackHandler 注入记忆回调处理器。
+// nil 时不触发 Episode 写入与快照保存。
+func (n *DomainAgentNode) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
+	n.memCallback = h
+}
+
+// SetAgentSnapshotManager 注入 Agent 快照管理器。
+// nil 时不加载/保存快照。
+func (n *DomainAgentNode) SetAgentSnapshotManager(s AgentSnapshotManager) {
+	n.snapshotMgr = s
 }
 
 // emit 推送进度事件。
@@ -165,12 +180,26 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	inst := n.registry.GetInstance(n.instID)
 	if inst == nil {
 		// 实例已被清理或路由错误
+		if n.memCallback != nil {
+			n.memCallback.OnError(ctx, n.instID, state.SessionID, fmt.Errorf("domain agent instance %s not found", n.instID))
+		}
 		return nil, fmt.Errorf("domain agent instance %s not found", n.instID)
 	}
 
 	// 2. 推送启动事件并标记实例活跃
 	n.emit(ctx, "think", fmt.Sprintf("DomainAgent 启动，领域目标: %s", state.DomainGoal))
 	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusActive)
+
+	// 2.5 记忆回调：广播 DomainAgent 进入 ACTIVE，并尝试加载历史快照
+	if n.memCallback != nil {
+		n.memCallback.OnStart(ctx, n.instID, state.SessionID)
+	}
+	if n.snapshotMgr != nil {
+		if snap, err := n.snapshotMgr.Load(ctx, n.instID, state.SessionID); err == nil && snap != nil {
+			n.snapshot = snap
+			n.emit(ctx, "think", fmt.Sprintf("已加载历史快照，未决问题 %d 个", len(snap.OpenIssues)))
+		}
+	}
 
 	// 3. v3 §5：为本 DomainAgent 装配领域 Skill 子集（如未装配）
 	n.ensureSkillSet(ctx, inst, state)
@@ -207,6 +236,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	if block == nil {
 		// 块缺失，交回 MetaAgent 决策
 		state.NextAction = types.ActionContinue
+		n.finish(ctx, state)
 		return state, nil
 	}
 	// 懒初始化 TaskResults
@@ -217,7 +247,11 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	// 6. 判断是否需要拆分为子领域（当前实现已禁用，恒返回 false）
 	if n.shouldSplitToSubDomains(ctx, state, tasks) {
 		n.emit(ctx, "intend", fmt.Sprintf("领域较复杂（%d 个子任务），拆分为子领域并行处理", len(tasks)))
-		return n.handleSubDomainSplit(ctx, state, inst)
+		state, err := n.handleSubDomainSplit(ctx, state, inst)
+		if err == nil {
+			n.finish(ctx, state)
+		}
+		return state, err
 	}
 
 	// 7. 过滤已完成的任务（结果已存在则跳过，支持断点续跑）
@@ -237,6 +271,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusDone)      // 标记实例完成
 		block.Status = enums.BlockStatusCompleted                            // 标记块完成
 		state.NextAction = types.ActionContinue                               // 交回 MetaAgent
+		n.finish(ctx, state)
 		return state, nil
 	}
 
@@ -259,7 +294,16 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusDone)      // 标记实例完成
 	block.Status = enums.BlockStatusCompleted                            // 标记块完成
 	state.NextAction = types.ActionContinue                               // 交回 MetaAgent
+	n.finish(ctx, state)
 	return state, nil
+}
+
+// finish 在 DomainAgent 成功结束前触发记忆回调。
+// 由 CallbackHandler 内部负责 Episode 写入与快照保存；此处只发起回调。
+func (n *DomainAgentNode) finish(ctx context.Context, state *types.ThreeLayerState) {
+	if n.memCallback != nil {
+		n.memCallback.OnEnd(ctx, n.instID, state.SessionID, "DomainAgent完成", state.Reason, 0)
+	}
 }
 
 // ensureSkillSet 确保该 DomainAgent 已装配 Skill 子集。

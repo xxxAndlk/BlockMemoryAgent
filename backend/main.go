@@ -94,7 +94,11 @@ func main() {
 	if err := store.EnsureDAGSchema(ctx, pgStore.DB()); err != nil {
 		log.Fatalf("初始化 dag_jobs 表失败: %v", err)
 	}
-	log.Printf("Postgres 已连接, session_history + dag_jobs 表就绪")
+	// 自动创建 001_init.sql 中的记忆/知识/注册表相关表
+	if err := store.EnsureInitialMemorySchema(ctx, pgStore.DB()); err != nil {
+		log.Fatalf("初始化记忆相关表失败: %v", err)
+	}
+	log.Printf("Postgres 已连接, session_history + session_events + dag_jobs + 记忆表就绪")
 
 	// 初始化 Redis 存储层；连接失败直接 fatal
 	redisStore, err := store.NewRedisStore(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
@@ -103,6 +107,21 @@ func main() {
 	}
 	defer redisStore.Close() // 关闭连接
 	log.Printf("Redis 已连接: %s", cfg.Redis.Addr)
+
+	// 快照管理器（Redis 热加载 + Postgres 持久化）
+	snapshotMgr := memory.NewSnapshotManager(redisStore, pgStore)
+	// 私有 Episode 记忆写入流水线
+	writeProcessor := memory.NewWriteProcessor(pgStore)
+	// 记忆回调处理器：在 DomainAgent/SubDomainAgent 生命周期上驱动 Episode 写入与快照保存
+	memoryCallbackHandler := memory.NewCallbackHandler(writeProcessor, snapshotMgr, nil)
+	// Episode 压缩器：Watchdog 触发压缩时调用
+	episodeCompressor := memory.NewCompressor(pgStore)
+	// 上下文组装器：为 Assistant 注入私有记忆 / 全局知识 / 快照
+	contextAssembler := memory.NewContextAssembler(
+		memory.NewSimpleWorkspaceReader(),
+		&globalKBAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions},
+		pgStore,
+	)
 
 	// 加载角色配置（roles.yaml: meta_agent/domain_agent/fixed_roles/dynamic_templates）
 	roleCfg, err := pkgconfig.LoadRoleConfig(*rolePath)
@@ -168,6 +187,11 @@ func main() {
 	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})
 	// 特性4：注入 domainAgent 归档存储，让 DomainAgent 完成后持久化信息跨会话复用
 	threeLayerGraph.SetArchiveStore(pgStore)
+	// 注入记忆回调 / 上下文组装器 / 压缩器 / 快照管理器
+	threeLayerGraph.SetMemoryCallbackHandler(memoryCallbackHandler)
+	threeLayerGraph.SetContextAssembler(contextAssembler)
+	threeLayerGraph.SetEpisodeCompressor(episodeCompressor)
+	threeLayerGraph.SetAgentSnapshotManager(snapshotMgr)
 
 	// 特性1：创建 DAG 调度器（按 cron + 依赖关系派发 session）
 	// Postgres 缺失时不启动后台调度循环（避免 nil 解引用 panic），DAG 功能降级为不可用：
@@ -181,9 +205,6 @@ func main() {
 	}
 
 		// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
-
-	// 快照管理器（Redis 热加载 + Postgres 持久化）
-	snapshotMgr := memory.NewSnapshotManager(redisStore, pgStore)
 
 	// API 处理器（web 面板 / TUI 共用），通过 setter 逐步注入依赖
 	apiHandler := server.NewAPIHandler(nil)
@@ -377,6 +398,19 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 type pgBlockMemoryAdapter struct {
 	pg  *store.PostgresStore
 	dim int
+}
+
+// globalKBAdapter 把 *store.PostgresStore 适配为 memory.GlobalRetriever 接口。
+// 供 ContextAssembler 召回全局知识记录。
+type globalKBAdapter struct {
+	pg  *store.PostgresStore
+	dim int
+}
+
+// Retrieve 按查询语义召回 topK 条全局知识记录（不限制 knowledge_type）。
+func (a *globalKBAdapter) Retrieve(ctx context.Context, query string, topK int) ([]*types.KnowledgeRecord, error) {
+	emb := embed.PseudoEmbed(query, a.dim)
+	return a.pg.SearchKnowledge(ctx, emb, topK)
 }
 
 // SaveBlockMemory 归档一条 domainAgent 块记忆到 global_knowledge 表。

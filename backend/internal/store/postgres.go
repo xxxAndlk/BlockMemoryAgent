@@ -590,7 +590,7 @@ func (s *PostgresStore) SaveSessionEvents(ctx context.Context, sessionID string,
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO session_events (session_id, type, agent, message, kind, tool, tool_path, tool_output, tool_error, success, timestamp, prompt, input_tokens, output_tokens, detail_json)
-		VALUES (,,,,,,,,,0,1,2,3,4,5)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
@@ -611,7 +611,7 @@ func (s *PostgresStore) GetSessionEvents(ctx context.Context, sessionID string) 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT session_id, type, agent, message, kind, tool, tool_path, tool_output, tool_error, success, timestamp, prompt, input_tokens, output_tokens, detail_json
 		FROM session_events
-		WHERE session_id = 
+		WHERE session_id = $1
 		ORDER BY timestamp ASC
 	`, sessionID)
 	if err != nil {
@@ -748,6 +748,107 @@ CREATE TABLE IF NOT EXISTS session_events (
 );
 CREATE INDEX IF NOT EXISTS idx_session_events_session_ts
     ON session_events (session_id, timestamp);
+`)
+	return err
+}
+
+// EnsureInitialMemorySchema 自动创建 001_init.sql 中定义的记忆/知识/注册表相关表 (幂等)。
+// 负责在启动时补齐 global_knowledge / agent_private_memory / agent_snapshots / topics /
+// agent_registry / decision_logs / topic_archives 等表,避免块记忆、私有记忆、快照写入失败。
+func EnsureInitialMemorySchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS agent_private_memory (
+    id BIGSERIAL PRIMARY KEY,
+    agent_id VARCHAR(64) NOT NULL,
+    topic_id VARCHAR(64) NOT NULL,
+    episode JSONB NOT NULL,
+    snapshot_ref VARCHAR(128),
+    compression_level INT DEFAULT 0,
+    importance_score FLOAT DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_apm_agent_topic ON agent_private_memory(agent_id, topic_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_apm_importance ON agent_private_memory(importance_score DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_apm_episode_gin ON agent_private_memory USING GIN (episode);
+
+CREATE TABLE IF NOT EXISTS agent_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    agent_id VARCHAR(64) NOT NULL,
+    topic_id VARCHAR(64) NOT NULL,
+    snapshot JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT uniq_agent_topic_snapshot UNIQUE (agent_id, topic_id)
+);
+CREATE INDEX IF NOT EXISTS idx_snap_agent_topic ON agent_snapshots(agent_id, topic_id);
+
+CREATE TABLE IF NOT EXISTS topics (
+    id VARCHAR(64) PRIMARY KEY,
+    goal TEXT NOT NULL,
+    status VARCHAR(32) DEFAULT 'active',
+    constraints JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS global_knowledge (
+    id BIGSERIAL PRIMARY KEY,
+    knowledge_type VARCHAR(32) NOT NULL,
+    topic_id VARCHAR(64),
+    content TEXT NOT NULL,
+    embedding VECTOR(768),
+    meta JSONB DEFAULT '{}',
+    access_count INT DEFAULT 0,
+    last_accessed TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    archived BOOL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_gk_type ON global_knowledge(knowledge_type);
+CREATE INDEX IF NOT EXISTS idx_gk_topic ON global_knowledge(topic_id);
+CREATE INDEX IF NOT EXISTS idx_gk_access ON global_knowledge(last_accessed, access_count);
+CREATE INDEX IF NOT EXISTS idx_gk_archived ON global_knowledge(archived);
+
+CREATE TABLE IF NOT EXISTS agent_registry (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(128) NOT NULL,
+    description TEXT,
+    module_id VARCHAR(64) NOT NULL,
+    keywords JSONB DEFAULT '[]',
+    dependencies JSONB DEFAULT '[]',
+    capabilities JSONB DEFAULT '[]',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS decision_logs (
+    id BIGSERIAL PRIMARY KEY,
+    topic_id VARCHAR(64) NOT NULL,
+    agent_id VARCHAR(64) NOT NULL,
+    decision TEXT NOT NULL,
+    context JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_decision_topic ON decision_logs(topic_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS topic_archives (
+    id BIGSERIAL PRIMARY KEY,
+    topic_id VARCHAR(64) NOT NULL UNIQUE,
+    summary TEXT NOT NULL,
+    outputs JSONB DEFAULT '[]',
+    decisions JSONB DEFAULT '[]',
+    embedding VECTOR(768),
+    archived_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_gk_embedding ON global_knowledge
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+CREATE INDEX IF NOT EXISTS idx_archive_embedding ON topic_archives
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
 `)
 	return err
 }
