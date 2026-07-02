@@ -5,6 +5,7 @@ import (
 	"database/sql"   // 标准库 SQL 抽象层,底层驱动为 postgres
 	"encoding/json"  // 结构体与 JSONB/JSON 列之间的序列化
 	"fmt"            // 格式化错误信息与 pgvector 字符串
+	"strconv"        // 解析 vector(768) 维度数字（ValidateEmbeddingDimension）
 	"strings"        // 拼接 pgvector 的逗号分隔向量分量
 	"time"           // 时间戳与连接池生命周期管理
 
@@ -869,6 +870,56 @@ USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
 `)
 	return err
+}
+
+// ValidateEmbeddingDimension 校验 global_knowledge.embedding 列的实际向量维度与配置一致。
+//
+// 职责：pgvector 的 VECTOR(N) 列维度在建表时固定；若 config 的 pgvector.dimensions 与列维度
+//   不一致，所有 SaveKnowledge 的 INSERT 会因维度不匹配静默失败（仅日志），导致块记忆/归档
+//   无法落库。启动期显式校验，不一致则返回错误，由调用方 fatal 退出（TODO #4 D3）。
+//
+// 参数：
+//   - ctx：请求上下文。
+//   - db：数据库连接。
+//   - expectedDim：期望维度（来自 config pgvector.dimensions）。
+//
+// 返回：一致返回 nil；不一致或查询失败返回描述性错误。
+func ValidateEmbeddingDimension(ctx context.Context, db *sql.DB, expectedDim int) error {
+	var typeStr string
+	// format_type 返回形如 "vector(768)"；pg_attribute 取 embedding 列的类型
+	err := db.QueryRowContext(ctx, `
+SELECT format_type(a.atttypid, a.atttypmod)
+FROM pg_attribute a
+WHERE a.attrelid = 'global_knowledge'::regclass AND a.attname = 'embedding'
+`).Scan(&typeStr)
+	if err != nil {
+		return fmt.Errorf("查询 embedding 列类型失败: %w", err)
+	}
+	actual := parseVectorDim(typeStr)
+	if actual <= 0 {
+		// 列可能不存在或非 vector 类型；不阻断（建表逻辑会处理）
+		return nil
+	}
+	if actual != expectedDim {
+		return fmt.Errorf("embedding 维度不一致: 数据库 VECTOR(%d) ≠ 配置 pgvector.dimensions(%d)；"+
+			"请调整配置或重建 global_knowledge 表（DROP 后重启自动建表）", actual, expectedDim)
+	}
+	return nil
+}
+
+// parseVectorDim 从 "vector(768)" 这类类型字符串中解析出维度数字。
+func parseVectorDim(typeStr string) int {
+	// 取 '(' 与 ')' 之间的数字
+	start := strings.Index(typeStr, "(")
+	end := strings.Index(typeStr, ")")
+	if start < 0 || end <= start {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(typeStr[start+1 : end]))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 

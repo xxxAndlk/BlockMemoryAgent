@@ -57,6 +57,10 @@ func (g *ThreeLayerGraph) SetBlockMemoryStore(s BlockMemoryStore) {
 		if d, ok := node.(*DomainAgentNode); ok {
 			d.SetBlockMemoryStore(s)
 		}
+		// MetaAgent 也注入：switchToNextBlock 幂等兜底归档用（TODO #4）
+		if m, ok := node.(*MetaAgentNode); ok {
+			m.SetBlockMemoryStore(s)
+		}
 	}
 }
 
@@ -530,6 +534,8 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 			n.SetToolCallback(g.toolCallback)
 		case *SubDomainAgentNode:
 			n.SetToolCallback(g.toolCallback)
+		case *AssistantNode:
+			n.SetToolCallback(g.toolCallback) // 修复 SubDomain→Assistant 路径无工具的问题
 		}
 	}
 	// 注入块记忆存储（特性3）
@@ -707,11 +713,18 @@ func (g *ThreeLayerGraph) assistantNext(state *types.ThreeLayerState) string {
 
 // SetToolCallback 设置工具执行回调。
 // 供 server 层在图构建后补充注入（与 SetProgressCallback 同样的后注入模式）。
+// 同时向预注册的静态节点（MetaAgent）传播，使其 RouteDirectTool/Assistant 直接执行路径可用工具回调。
 // 并发安全：写 g.toolCallback 持写锁（H1/M8 修复：原实现无锁，
 // 与 resolveInstanceNode/Invoke 的 RLock 读产生 data race）。
 func (g *ThreeLayerGraph) SetToolCallback(cb ToolCallback) {
 	g.mu.Lock()
 	g.toolCallback = cb
+	// 传播到预注册的 MetaAgent 节点（动态构造的 Domain/SubDomain/Assistant 在 resolveInstanceNode 时注入）
+	for _, node := range g.nodes {
+		if m, ok := node.(*MetaAgentNode); ok {
+			m.SetToolCallback(cb)
+		}
+	}
 	g.mu.Unlock()
 }
 

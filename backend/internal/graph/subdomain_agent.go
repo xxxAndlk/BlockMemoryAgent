@@ -314,45 +314,17 @@ func (n *SubDomainAgentNode) dispatchAssistantsParallel(ctx context.Context, sta
 //   - task：任务文本
 //
 // 返回：助手实例与角色定义；任一环节失败返回 (nil, nil)。
+// createAssistantForTask 委托公共实现：为指定任务创建或匹配助手实例。
+//
+// 保留 emitDetail 调试事件推送，其余逻辑走 CommonCreateAssistantForTask。
 func (n *SubDomainAgentNode) createAssistantForTask(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, task string) (*types.RoleInstance, *types.RoleDefinition) {
-	// 1. 先尝试匹配固定助手
-	assistantDef := n.matchFixedAssistant(task)
-	if assistantDef != nil {
-		// 权限校验：本实例是否可调用该角色
-		if !n.registry.CanCall(n.instID, assistantDef.ID) {
-			return nil, nil // 无权限
-		}
-		// 创建固定助手实例
-		assistantInst, err := n.registry.CreateInstance(assistantDef.ID, state.SessionID, inst.Domain, n.instID)
-		if err != nil {
-			// 创建失败：打印日志
-			fmt.Printf("[SubDomainAgent] create fixed assistant %s failed: %v\n", assistantDef.ID, err)
-			return nil, nil
-		}
-		return assistantInst, assistantDef // 返回固定助手
+	assistantInst, assistantDef := CommonCreateAssistantForTask(ctx, n.registry, n.factory, n.instID, inst, state, task)
+	// 动态创建成功时推送 Agent 创建调试事件，便于 UI 观察动态角色生成
+	if assistantInst != nil && assistantDef != nil && assistantDef.Type == types.RoleTypeDynamic {
+		n.emitDetail(ctx, "agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),
+			fmt.Sprintf("instID=%s roleDefID=%s parentID=%s", assistantInst.ID, assistantInst.RoleDefID, n.instID))
 	}
-
-	// 2. 动态创建助手（由 LLM 推断角色定义）
-	assistantInst, err := n.factory.CreateAssistant(ctx, state.SessionID, task, n.instID, inst.RoleDefID)
-	if err != nil {
-		// 创建失败：打印日志
-		fmt.Printf("[SubDomainAgent] create dynamic assistant for %q failed: %v\n", task, err)
-		return nil, nil
-	}
-	// 推送 Agent 创建调试事件，便于 UI 观察动态角色生成
-	n.emitDetail(ctx, "agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),
-		fmt.Sprintf("instID=%s roleDefID=%s parentID=%s", assistantInst.ID, assistantInst.RoleDefID, n.instID))
-
-	// 3. 取出动态创建的角色定义
-	assistantDef = n.registry.GetRoleDef(assistantInst.RoleDefID)
-	if assistantDef == nil {
-		return nil, nil // 角色定义缺失
-	}
-	// 权限校验
-	if !n.registry.CanCall(n.instID, assistantDef.ID) {
-		return nil, nil // 无权限
-	}
-	return assistantInst, assistantDef // 返回动态助手
+	return assistantInst, assistantDef
 }
 
 // runAssistant 运行助手执行任务。
@@ -418,46 +390,11 @@ func (n *SubDomainAgentNode) runAssistant(ctx context.Context, state *types.Thre
 //
 // 副作用：可能调用工具/写文件/运行命令（由工具循环内部决定）。
 func (n *SubDomainAgentNode) executeAssistantTask(ctx context.Context, def *types.RoleDefinition, task string, state *types.ThreeLayerState) (string, error) {
-	// 1. 有模型工厂则优先走工具循环
-	if n.modelFactory != nil {
-		// 新建工具执行器并注入回调
-		executor := NewToolExecutor("")
-		if n.toolCallback != nil {
-			executor.SetCallback(n.toolCallback)
-		}
-		// SubDomainAgent 当前与父 Domain 共享 Skill 子集（通过父 ID 查），
-		// 此处 skillBrief 暂为空串，工具列表由 executeAssistantWithTools 内部默认值提供
-		var skillBrief string
-		maxIters := 12
-		if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.ToolCallMaxRounds > 0 {
-			maxIters = n.rt.AgentCfg.ToolCallMaxRounds
-		}
-		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief, n.progress, "SubDomainAgent["+def.Name+"]", maxIters)
-		if result != "" {
-			return result, nil // 成功返回
-		}
-
-		// 工具循环无输出：回退到单次 LLM 生成
-		llm, err := n.modelFactory.GetModel(ctx, def.ID)
-		if err == nil {
-			// 拼 prompt：角色 system prompt + 当前任务 + 领域目标
-			prompt := fmt.Sprintf("%s\n\n当前任务: %s\n领域目标: %s\n请执行任务并返回结果。",
-				def.SystemPrompt, task, state.DomainGoal)
-			resp, err := llm.Generate(ctx, prompt)
-			if err == nil && resp != "" {
-				return resp, nil // 成功返回
-			}
-		}
-	}
-
-	// 2. 无模型工厂或上述路径都失败：回退到模拟结果
-	contextInfo := ""
-	if state.CurrentDomain != "" {
-		// 拼接领域前缀
-		contextInfo = fmt.Sprintf("[领域: %s] ", state.CurrentDomain)
-	}
-	// 返回模拟结果
-	return fmt.Sprintf("%s助手[%s]完成任务: %s", contextInfo, def.Name, task), nil
+	// SubDomainAgent 当前与父 Domain 共享 Skill 子集（通过父 ID 查），
+	// skillBrief 暂为空串，工具列表由 executeAssistantWithTools 内部默认值提供。
+	// 委托公共执行入口：SubDomainAgent 不启用写文件完成门控（保持原行为）。
+	return CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt, def, task, state,
+		"", n.progress, "SubDomainAgent["+def.Name+"]", 0, false)
 }
 
 // analyzeSubTasks 分析子领域任务（优先LLM，回退规则）。
@@ -606,45 +543,9 @@ func (n *SubDomainAgentNode) analyzeSubTasksByRules(subDomain, goal string) []st
 //   - task：任务文本
 //
 // 返回：匹配的角色定义；最高分 < 10 返回 nil（视为无匹配，转动态创建）。
+// matchFixedAssistant 委托公共实现：按技能/关键词打分匹配固定助手。
 func (n *SubDomainAgentNode) matchFixedAssistant(task string) *types.RoleDefinition {
-	// 任务文本转小写，做大小写不敏感匹配
-	taskLower := strings.ToLower(task)
-	var bestMatch *types.RoleDefinition
-	bestScore := 0
-
-	// 遍历所有助手角色定义
-	for _, def := range n.registry.GetAssistantRoleDefs() {
-		// 只考虑固定角色（动态角色不参与匹配）
-		if def.Type != types.RoleTypeFixed {
-			continue
-		}
-		score := 0
-		// 技能命中：+10 分
-		for _, skill := range def.Skills {
-			// 任务文本包含技能关键词则加分
-			if strings.Contains(taskLower, strings.ToLower(skill)) {
-				score += 10
-			}
-		}
-		// 关键词命中：+5 分
-		for _, kw := range def.Keywords {
-			// 任务文本包含角色关键词则加分
-			if strings.Contains(taskLower, strings.ToLower(kw)) {
-				score += 5
-			}
-		}
-		// 更新最高分
-		if score > bestScore {
-			bestScore = score   // 更新最高分
-			bestMatch = def     // 记录最佳匹配
-		}
-	}
-
-	// 阈值 10：至少一个技能命中才视为有效匹配
-	if bestScore >= 10 {
-		return bestMatch // 返回最佳匹配
-	}
-	return nil // 无有效匹配
+	return CommonMatchFixedAssistant(n.registry, task)
 }
 
 // summarizeResults 汇总助手结果。
@@ -665,20 +566,7 @@ func (n *SubDomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 
 	// 取当前块并收集结果摘要
 	block := state.ActiveBlocks[state.CurrentBlockID]
-	var summaries []string
-
-	if block != nil && block.TaskResults != nil {
-		for task, result := range block.TaskResults {
-			// 结果过长则截断到 100 字符
-			shortResult := result
-			if len(shortResult) > 100 {
-				// 截断并加省略号
-				shortResult = shortResult[:100] + "..."
-			}
-			// 拼成 "任务: 结果" 格式
-			summaries = append(summaries, fmt.Sprintf("%s: %s", task, shortResult))
-		}
-	}
+	summaries := CommonCollectTaskSummaries(block)
 
 	// 有摘要则拼成一句话写入 state.Reason
 	if len(summaries) > 0 {

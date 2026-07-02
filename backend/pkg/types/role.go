@@ -1,6 +1,7 @@
 package types
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -177,6 +178,11 @@ type SessionBlock struct {
 	Events []*Event `json:"events"`
 	// TaskResults 已完成任务的结果映射（任务名 -> 结果摘要）。
 	TaskResults map[string]string `json:"task_results"`
+	// Plan 结构化执行计划（Plan-and-Execute，TODO #1）。多任务时由 DomainAgent 生成，按步骤派发助手。
+	Plan *ExecutionPlan `json:"plan,omitempty"`
+	// archived 块记忆是否已落库（幂等兜底用，TODO #4）。异步归档成功后置 true。
+	// 用 atomic.Bool 因为异步归档 goroutine 写、图循环读，需无锁并发安全。不序列化（瞬态标志）。
+	archived atomic.Bool `json:"-"`
 	// SubDomainSplit 是否已拆分为子领域；true 表示进入第三层。
 	SubDomainSplit bool `json:"subdomain_split"`
 	// SubDomainList 子领域名称列表，拆分后顺序执行。
@@ -232,6 +238,9 @@ type ThreeLayerState struct {
 	// DirectExecute 标记为"直接执行"模式：MetaAgent 判定为简单查询/搜索/分析类任务时置 true，
 	// DomainAgent 见此标志跳过 LLM 子任务拆解，直接把 goal 作为单个子任务交给一个 Assistant。
 	DirectExecute bool `json:"direct_execute"`
+	// EnableSubdomain 是否允许 DomainAgent 自适应启用 SubDomain（第四层）。
+	// 由 MetaAgent 路由判定：仅 RouteFullFourLayer 路径置 true；其余路径 false 以避免不必要的 overhead。
+	EnableSubdomain bool `json:"enable_subdomain"`
 	// PendingClarify 待处理的人机对话请求：非空表示 Graph 已挂起，等待用户答复后由 server 侧恢复。
 	PendingClarify *ClarifyRequest `json:"pending_clarify,omitempty"`
 }
@@ -300,4 +309,20 @@ func (s *ThreeLayerState) PopCallStack() *CallRequest {
 // 返回：true 表示当前嵌套在助手调用链中。副作用：无。
 func (s *ThreeLayerState) IsCalling() bool {
 	return len(s.CallStack) > 0
+}
+
+// MarkArchived 标记块记忆已落库（异步归档成功后调用，幂等兜底用）。
+func (b *SessionBlock) MarkArchived() {
+	if b == nil {
+		return
+	}
+	b.archived.Store(true)
+}
+
+// IsArchived 返回块记忆是否已落库（图循环在 switchToNextBlock 兜底归档前读取）。
+func (b *SessionBlock) IsArchived() bool {
+	if b == nil {
+		return false
+	}
+	return b.archived.Load()
 }

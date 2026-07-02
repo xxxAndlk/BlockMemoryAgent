@@ -43,8 +43,14 @@ onMounted(async () => {
   const id = route.query.id as string
   if (id) {
     await openSession(id)
-  } else if (sessions.value.length) {
-    await openSession(sessions.value[0].id)
+  } else {
+    // 无 URL id 时优先恢复上次活跃会话（localStorage），否则打开最近一个
+    const last = localStorage.getItem('lastSessionID')
+    if (last && sessions.value.some((s) => s.id === last)) {
+      await openSession(last)
+    } else if (sessions.value.length) {
+      await openSession(sessions.value[0].id)
+    }
   }
 })
 
@@ -76,9 +82,11 @@ async function openSession(id: string) {
     const s = await getSession(id)
     activeSession.value = s
     events.value = [...(s.events || [])]
+    localStorage.setItem('lastSessionID', id) // 记住上次活跃会话，刷新后恢复
     startStream(s)
     await refreshPanels(id)
   } catch (e) {
+    localStorage.removeItem('lastSessionID') // 会话不存在则清除，避免反复加载失败
     activeSession.value = null
     ElMessage.error('会话不存在或加载失败：' + (e instanceof Error ? e.message : String(e)))
   } finally {
@@ -162,13 +170,20 @@ async function handleSubmit(content: string) {
       await openSession(activeSession.value.id)
       return
     }
-    // 2) 运行中会话 → 追加消息
-    if (activeSession.value && activeSession.value.status === 'running') {
+    // 2) 已有会话（running/completed/error）→ 追加消息到同一会话，不新开栏
+    //    后端 POST /api/sessions/{id}/message 支持向已完成会话追加并 resumeSession。
+    if (activeSession.value) {
+      const wasRunning = activeSession.value.status === 'running'
       await sendMessage(activeSession.value.id, content)
-      // SSE 已经在监听，会自动推送 user_message 事件
+      if (!wasRunning) {
+        // 会话此前已完成/出错：onDone 已关闭 SSE，需重新打开会话以重建事件流并置 running
+        activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
+        await openSession(activeSession.value.id)
+      }
+      // wasRunning 时 SSE 仍在监听，会自动推送 user_message 事件
       return
     }
-    // 3) 无运行中会话 → 创建新会话
+    // 3) 无选中会话 → 创建新会话
     const s = await createSession(content)
     sessions.value.unshift(s)
     router.replace({ path: '/chat', query: { id: s.id } })

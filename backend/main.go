@@ -100,6 +100,10 @@ func main() {
 	if err := store.EnsureInitialMemorySchema(ctx, pgStore.DB()); err != nil {
 		log.Fatalf("初始化记忆相关表失败: %v", err)
 	}
+	// 维度一致性校验（TODO #4 D3）：embedding 列维度必须与配置一致，否则 SaveKnowledge 静默失败
+	if err := store.ValidateEmbeddingDimension(ctx, pgStore.DB(), cfg.PgVector.Dimensions); err != nil {
+		log.Fatalf("embedding 维度校验失败: %v", err)
+	}
 	log.Printf("Postgres 已连接, session_history + session_events + dag_jobs + 记忆表就绪")
 
 	// 初始化 Redis 存储层；连接失败直接 fatal

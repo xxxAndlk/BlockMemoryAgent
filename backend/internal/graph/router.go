@@ -1,0 +1,211 @@
+package graph
+
+import (
+	"context"
+	"strings"
+
+	"github.com/blockmemory/agent/backend/pkg/types"
+)
+
+// 本文件实现 5 路径智能路由，让 80% 简单任务不进入四层编排。
+//
+// 五条路径（详见 修改文档/计划）：
+//   - RouteDirectTool      0 层：MetaAgent 自跑工具循环（含 0 工具的纯 QA）
+//   - RouteDirectAssistant 1 层：MetaAgent 建助手 + 跑工具循环
+//   - RouteCreateDomain    2 层：单领域，不启用 SubDomain
+//   - RouteMultiDomain     2 层 × N：多领域并行
+//   - RouteFullFourLayer   4 层：完整编排，启用 SubDomain
+//
+// 决策顺序：规则层（零 LLM 成本，覆盖典型 60%+）→ LLM 兜底（轻量模型）→ 安全兜底
+// （RouteCreateDomain = 当前复杂任务行为，零回归）。
+
+// RoutePath 路由路径枚举。
+type RoutePath string
+
+const (
+	RouteDirectTool      RoutePath = "direct_tool"
+	RouteDirectAssistant RoutePath = "direct_assistant"
+	RouteCreateDomain    RoutePath = "create_domain"
+	RouteMultiDomain     RoutePath = "multi_domain"
+	RouteFullFourLayer   RoutePath = "full_four_layer"
+)
+
+// RouteDecision 路由决策结果。
+type RouteDecision struct {
+	Path            RoutePath // 命中的路径
+	EnableSubdomain bool      // 是否启用 SubDomain（仅 RouteFullFourLayer 为 true）
+}
+
+// ClassifyTask 对用户目标做路由分类。
+//
+// 决策顺序：规则层 → LLM 兜底 → 安全兜底（RouteCreateDomain）。
+// 纯 QA / 单工具 / 单领域简单任务在规则层即短路，不消耗 LLM。
+//
+// 参数：
+//   - ctx：请求上下文（LLM 兜底用）。
+//   - state：图全局状态（取 DomainGoal）。
+//
+// 返回：RouteDecision。
+func (n *MetaAgentNode) ClassifyTask(ctx context.Context, state *types.ThreeLayerState) RouteDecision {
+	goal := ""
+	if state != nil {
+		goal = state.DomainGoal
+	}
+	// 空目标：安全兜底
+	if strings.TrimSpace(goal) == "" {
+		return RouteDecision{Path: RouteCreateDomain}
+	}
+
+	// 1. 规则层（零 LLM 成本）
+	if path := classifyByRules(n, goal); path != "" {
+		return RouteDecision{Path: path, EnableSubdomain: path == RouteFullFourLayer}
+	}
+
+	// 2. LLM 兜底（轻量模型判定，复用 MetaAgent 的 callLLMAs 超时/熔断机制）
+	if n.modelFactory != nil && n.llmTracker != nil && !n.llmTracker.ShouldSkipLLM() {
+		if path := n.classifyRouteLLM(ctx, goal); path != "" {
+			return RouteDecision{Path: path, EnableSubdomain: path == RouteFullFourLayer}
+		}
+	}
+
+	// 3. 安全兜底：RouteCreateDomain（= 当前复杂任务行为，零回归）
+	return RouteDecision{Path: RouteCreateDomain, EnableSubdomain: false}
+}
+
+// classifyByRules 规则层路由（零 LLM 成本）。
+//
+// 命中则返回路径；未命中返回空串交由 LLM 兜底。
+// 复用 MetaAgent 既有的 isSimpleQuestion / shouldDirectExecute 关键词规则。
+func classifyByRules(n *MetaAgentNode, goal string) RoutePath {
+	// 纯寒暄/常识 QA：MetaAgent 直接回答（0 工具）→ RouteDirectTool
+	if n.isSimpleQuestion(goal) {
+		return RouteDirectTool
+	}
+	// 单次工具调用类请求（读文件、跑命令、查天气等）→ RouteDirectTool
+	if isSingleToolRequest(goal) {
+		return RouteDirectTool
+	}
+	// 查询/搜索/资讯类单工具任务（读文件、跑命令、查天气、HTTPGet）→ RouteDirectTool
+	if n.shouldDirectExecute(goal) {
+		return RouteDirectTool
+	}
+	// 单领域简单任务（修 CSS、改文案等，需一个专家助手但无需领域拆分）→ RouteDirectAssistant
+	if isSingleDomainSimpleTask(goal) {
+		return RouteDirectAssistant
+	}
+	// 明确多领域并行信号 → RouteMultiDomain
+	if isMultiDomainHint(goal) {
+		return RouteMultiDomain
+	}
+	return "" // 未命中，交 LLM 兜底
+}
+
+// isSingleToolRequest 判断是否为单次工具调用类请求（读文件/跑命令/查天气等）。
+//
+// 命中"读/运行/查/列"等动作 + 明确对象，且不含多步骤/写代码信号。
+func isSingleToolRequest(goal string) bool {
+	gl := strings.ToLower(goal)
+	// 单工具动作词
+	toolActions := []string{"读一下", "读取", "看一下", "查看", "列一下", "列出", "运行", "执行", "跑一下", "查天气", "查一下天气"}
+	hit := false
+	for _, a := range toolActions {
+		if strings.Contains(gl, a) {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		return false
+	}
+	// 多步骤/写代码信号：命中则不是单工具
+	complexSignals := []string{"然后", "接着", "并且", "同时", "重构", "实现一个", "开发一个", "写一个"}
+	for _, s := range complexSignals {
+		if strings.Contains(gl, s) {
+			return false
+		}
+	}
+	return true
+}
+
+// isSingleDomainSimpleTask 判断是否为单领域简单任务（需一个助手，无需领域拆分）。
+//
+// 典型：修复 CSS、改文案、调整样式、改个配置等小改动。
+func isSingleDomainSimpleTask(goal string) bool {
+	gl := strings.ToLower(goal)
+	simplePatterns := []string{
+		"修复", "改一下", "改个", "调整", "修改", "替换", "重命名",
+		"css", "样式", "文案", "文字", "颜色", "padding", "margin",
+		"配置", "字号", "字体",
+	}
+	for _, p := range simplePatterns {
+		if strings.Contains(gl, p) {
+			// 含多领域/多步骤信号则升级
+			if isMultiDomainHint(goal) {
+				return false
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// isMultiDomainHint 判断是否含多领域并行信号。
+//
+// 命中"前端+后端"、"接口+页面"等跨领域组合，或显式"并行/同时"多目标。
+func isMultiDomainHint(goal string) bool {
+	gl := strings.ToLower(goal)
+	// 跨领域组合关键词
+	combos := [][]string{
+		{"前端", "后端"},
+		{"页面", "接口"},
+		{"前端", "接口"},
+		{"后端", "样式"},
+		{"ui", "api"},
+	}
+	for _, c := range combos {
+		if strings.Contains(gl, c[0]) && strings.Contains(gl, c[1]) {
+			return true
+		}
+	}
+	// 显式多目标分隔
+	if strings.Contains(gl, "，同时") || strings.Contains(gl, "，并且") || strings.Contains(gl, "；") {
+		return true
+	}
+	return false
+}
+
+// classifyRouteLLM LLM 兜底路由（轻量模型判定）。
+//
+// 让模型在 5 条路径中选一；未识别/超时/非法输出返回空串交安全兜底。
+func (n *MetaAgentNode) classifyRouteLLM(ctx context.Context, goal string) RoutePath {
+	prompt := `判断以下用户目标应走哪条执行路径，只回答路径代号：direct_tool / direct_assistant / create_domain / multi_domain / full_four_layer。
+
+- direct_tool       ：寒暄/常识/定义类，或单次工具调用（读文件、运行命令、查天气、HTTPGet 抓取）。主 Agent 直接处理，无需创建领域 Agent。
+- direct_assistant  ：单领域简单任务（修 CSS、改文案、调配置），需一个专家助手但无需领域拆分。
+- create_domain     ：单领域复杂任务（重构某模块 API、设计数据库），需拆子任务但不跨子领域。
+- multi_domain      ：多领域并行（后端加接口 + 前端改样式）。
+- full_four_layer   ：超复杂任务，子领域边界明显（API 层 + 数据库层 + 前端层需分别拆分）。
+
+用户目标: ` + goal + `
+
+只回答上述代号之一，不要其他文字:`
+	resp, err, timedOut := n.callLLMAs(ctx, "MetaAgent/路由判定", prompt)
+	if timedOut || err != nil || resp == "" {
+		return ""
+	}
+	resp = strings.ToLower(strings.TrimSpace(resp))
+	// 容忍模型输出带前后缀（如 "direct_tool." 或 "路径: direct_tool"）
+	switch {
+	case strings.Contains(resp, "direct_tool"):
+		return RouteDirectTool
+	case strings.Contains(resp, "direct_assistant"):
+		return RouteDirectAssistant
+	case strings.Contains(resp, "multi_domain"):
+		return RouteMultiDomain
+	case strings.Contains(resp, "full_four_layer"):
+		return RouteFullFourLayer
+	case strings.Contains(resp, "create_domain"):
+		return RouteCreateDomain
+	}
+	return "" // 未识别，交安全兜底
+}

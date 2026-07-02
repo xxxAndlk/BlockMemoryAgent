@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -244,7 +245,13 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		block.TaskResults = make(map[string]string)
 	}
 
-	// 6. 判断是否需要拆分为子领域（当前实现已禁用，恒返回 false）
+	// 5.5 Plan-and-Execute（TODO #1）：多任务且启用时生成结构化计划，按步骤派发
+	//     仅在尚未生成计划时生成（断点续行时不重复生成）；解析失败回退为原 tasks（零回归）
+	if block.Plan == nil && planEnabledFromRT(n.rt) && len(tasks) > 1 {
+		block.Plan = n.generatePlan(ctx, state, tasks)
+	}
+
+	// 6. 判断是否需要拆分为子领域（自适应：仅 state.EnableSubdomain 且跨子领域边界）
 	if n.shouldSplitToSubDomains(ctx, state, tasks) {
 		n.emit(ctx, "intend", fmt.Sprintf("领域较复杂（%d 个子任务），拆分为子领域并行处理", len(tasks)))
 		state, err := n.handleSubDomainSplit(ctx, state, inst)
@@ -254,14 +261,19 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		return state, err
 	}
 
-	// 7. 过滤已完成的任务（结果已存在则跳过，支持断点续跑）
+	// 7. 确定待处理任务列表：有 Plan 时用计划的未完成步骤，否则过滤原 tasks（支持断点续跑）
 	var pendingTasks []string
-	for _, task := range tasks {
-		// 结果已存在则跳过，支持断点续跑
-		if _, done := block.TaskResults[task]; done {
-			continue
+	if block.Plan != nil {
+		// Plan-and-Execute：用计划的未完成步骤目标
+		pendingTasks = block.Plan.PendingGoals()
+	} else {
+		for _, task := range tasks {
+			// 结果已存在则跳过，支持断点续跑
+			if _, done := block.TaskResults[task]; done {
+				continue
+			}
+			pendingTasks = append(pendingTasks, task)
 		}
-		pendingTasks = append(pendingTasks, task)
 	}
 
 	// 8. 无待处理任务：汇总结果、标记完成、继续图循环
@@ -441,6 +453,7 @@ func (n *DomainAgentNode) dispatchAssistantsParallel(ctx context.Context, state 
 func (n *DomainAgentNode) dispatchAssistantsSerial(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, tasks []string) map[string]string {
 	// 预分配容量，避免 map 扩容
 	results := make(map[string]string, len(tasks))
+	block := state.ActiveBlocks[state.CurrentBlockID]
 	for _, task := range tasks {
 		// 为任务创建/匹配 Assistant
 		assistantInst, assistantDef := n.createAssistantForTask(ctx, state, inst, task)
@@ -451,6 +464,10 @@ func (n *DomainAgentNode) dispatchAssistantsSerial(ctx context.Context, state *t
 		}
 		// 串行执行：上一个完成后再跑下一个，确保依赖产物可见
 		results[task] = n.runAssistant(ctx, state, assistantInst, assistantDef, task)
+		// Plan-and-Execute：标记计划步骤完成（断点续行用）
+		if block != nil && block.Plan != nil {
+			block.Plan.MarkDone(task)
+		}
 	}
 	return results // 返回所有任务的结果
 }
@@ -469,45 +486,17 @@ func (n *DomainAgentNode) dispatchAssistantsSerial(ctx context.Context, state *t
 //   - task：任务文本
 //
 // 返回：助手实例与角色定义；任一环节失败返回 (nil, nil)。
+// createAssistantForTask 委托公共实现：为指定任务创建或匹配助手实例。
+//
+// 保留 emitDetail 调试事件推送（公共函数不感知 UI 事件），其余逻辑走 CommonCreateAssistantForTask。
 func (n *DomainAgentNode) createAssistantForTask(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, task string) (*types.RoleInstance, *types.RoleDefinition) {
-	// 1. 先尝试匹配固定助手
-	assistantDef := n.matchFixedAssistant(task)
-	if assistantDef != nil {
-		// 权限校验：本实例是否可调用该角色
-		if !n.registry.CanCall(n.instID, assistantDef.ID) {
-			return nil, nil // 无权限
-		}
-		// 创建固定助手实例
-		assistantInst, err := n.registry.CreateInstance(assistantDef.ID, state.SessionID, inst.Domain, n.instID)
-		if err != nil {
-			// 创建失败：打印日志
-			fmt.Printf("[DomainAgent] create fixed assistant %s failed: %v\n", assistantDef.ID, err)
-			return nil, nil
-		}
-		return assistantInst, assistantDef // 返回固定助手
+	assistantInst, assistantDef := CommonCreateAssistantForTask(ctx, n.registry, n.factory, n.instID, inst, state, task)
+	// 动态创建成功时推送 Agent 创建调试事件，便于 UI 观察动态角色生成
+	if assistantInst != nil && assistantDef != nil && assistantDef.Type == types.RoleTypeDynamic {
+		n.emitDetail(ctx, "agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),
+			fmt.Sprintf("instID=%s roleDefID=%s parentID=%s", assistantInst.ID, assistantInst.RoleDefID, n.instID))
 	}
-
-	// 2. 动态创建助手（由 LLM 推断角色定义）
-	assistantInst, err := n.factory.CreateAssistant(ctx, state.SessionID, task, n.instID, inst.RoleDefID)
-	if err != nil {
-		// 创建失败：打印日志
-		fmt.Printf("[DomainAgent] create dynamic assistant for %q failed: %v\n", task, err)
-		return nil, nil
-	}
-	// 推送 Agent 创建调试事件，便于 UI 观察动态角色生成
-	n.emitDetail(ctx, "agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),
-		fmt.Sprintf("instID=%s roleDefID=%s parentID=%s", assistantInst.ID, assistantInst.RoleDefID, n.instID))
-
-	// 3. 取出动态创建的角色定义
-	assistantDef = n.registry.GetRoleDef(assistantInst.RoleDefID)
-	if assistantDef == nil {
-		return nil, nil // 角色定义缺失
-	}
-	// 权限校验
-	if !n.registry.CanCall(n.instID, assistantDef.ID) {
-		return nil, nil // 无权限
-	}
-	return assistantInst, assistantDef // 返回动态助手
+	return assistantInst, assistantDef
 }
 
 // runAssistant 在当前goroutine中运行助手执行任务。
@@ -574,59 +563,18 @@ func (n *DomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLa
 //
 // 副作用：可能调用工具/写文件/运行命令（由工具循环内部决定）。
 func (n *DomainAgentNode) executeAssistantTask(ctx context.Context, def *types.RoleDefinition, task string, state *types.ThreeLayerState) (string, error) {
-	// 1. 优先使用 LLM + 工具执行
-	if n.modelFactory != nil {
-		// 新建工具执行器并注入回调
-		executor := NewToolExecutor("")
-		if n.toolCallback != nil {
-			executor.SetCallback(n.toolCallback)
-		}
-
-		// 取出本 DomainAgent 装配的 Skill 列表（v3 §5），作为 system prompt 的可见技能段
-		var skillBrief string
-		if n.rt != nil && n.rt.Skills != nil {
-			// 取本实例已绑定的 SkillSet
-			if set := n.rt.Skills.GetForAgent(n.instID); set != nil {
-				// 转为 prompt 可用的技能简介文本
-				skillBrief = set.PromptList()
-			}
-		}
-
-		// 调用 blades.Agent + 工具循环执行
-		maxIters := 12
-		if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.ToolCallMaxRounds > 0 {
-			maxIters = n.rt.AgentCfg.ToolCallMaxRounds
-		}
-		result, _ := executeAssistantWithTools(ctx, n.modelFactory, executor, def, task, state, skillBrief, n.progress, "助手["+def.Name+"]", maxIters)
-		if result != "" {
-			// 完成门控：若任务要求写文件但结果含失败标记，返回 error 触发上层重试/告警
-			if strings.HasPrefix(result, "[失败:") {
-				return result, fmt.Errorf("助手未完成写文件任务: %s", task)
-			}
-			return result, nil // 成功返回
-		}
-
-		// 工具执行回退到普通LLM（单次生成，无工具）
-		llm, err := n.modelFactory.GetModel(ctx, def.ID)
-		if err == nil {
-			// 拼 prompt：角色 system prompt + 当前任务 + 领域目标
-			prompt := fmt.Sprintf("%s\n\n当前任务: %s\n领域目标: %s\n请执行任务并返回结果。",
-				def.SystemPrompt, task, state.DomainGoal)
-			resp, err := llm.Generate(ctx, prompt)
-			if err == nil && resp != "" {
-				return resp, nil // 成功返回
-			}
+	// 取出本 DomainAgent 装配的 Skill 列表（v3 §5），作为 system prompt 的可见技能段
+	var skillBrief string
+	if n.rt != nil && n.rt.Skills != nil {
+		// 取本实例已绑定的 SkillSet
+		if set := n.rt.Skills.GetForAgent(n.instID); set != nil {
+			// 转为 prompt 可用的技能简介文本
+			skillBrief = set.PromptList()
 		}
 	}
-
-	// 2. 回退到模拟结果（无 modelFactory 或上述路径都失败）
-	contextInfo := ""
-	if state.CurrentDomain != "" {
-		// 拼接领域前缀
-		contextInfo = fmt.Sprintf("[领域: %s] ", state.CurrentDomain)
-	}
-	// 返回模拟结果
-	return fmt.Sprintf("%s助手[%s]完成任务: %s", contextInfo, def.Name, task), nil
+	// 委托公共执行入口：DomainAgent 启用写文件完成门控
+	return CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt, def, task, state,
+		skillBrief, n.progress, "助手["+def.Name+"]", 0, true)
 }
 
 // analyzeTasks 分析领域任务（优先使用LLM，回退到规则）。
@@ -872,58 +820,70 @@ func (n *DomainAgentNode) analyzeTasksByRules(goal string) []string {
 //   - task：任务文本
 //
 // 返回：匹配的角色定义；最高分 < 10 返回 nil（视为无匹配，转动态创建）。
+// matchFixedAssistant 委托公共实现：按技能/关键词打分匹配固定助手。
 func (n *DomainAgentNode) matchFixedAssistant(task string) *types.RoleDefinition {
-	// 任务文本转小写，做大小写不敏感匹配
-	taskLower := strings.ToLower(task)
-	var bestMatch *types.RoleDefinition
-	bestScore := 0
-
-	// 遍历所有助手角色定义
-	for _, def := range n.registry.GetAssistantRoleDefs() {
-		// 只考虑固定角色（动态角色不参与匹配）
-		if def.Type != types.RoleTypeFixed {
-			continue
-		}
-		score := 0
-		// 技能命中：+10 分
-		for _, skill := range def.Skills {
-			// 任务文本包含技能关键词则加分
-			if strings.Contains(taskLower, strings.ToLower(skill)) {
-				score += 10
-			}
-		}
-		// 关键词命中：+5 分
-		for _, kw := range def.Keywords {
-			// 任务文本包含角色关键词则加分
-			if strings.Contains(taskLower, strings.ToLower(kw)) {
-				score += 5
-			}
-		}
-		// 更新最高分
-		if score > bestScore {
-			bestScore = score   // 更新最高分
-			bestMatch = def     // 记录最佳匹配
-		}
-	}
-
-	// 阈值 10：至少一个技能命中才视为有效匹配
-	if bestScore >= 10 {
-		return bestMatch // 返回最佳匹配
-	}
-	return nil // 无有效匹配
+	return CommonMatchFixedAssistant(n.registry, task)
 }
 
 // shouldSplitToSubDomains 判断是否需要拆分为子领域。
 //
-// 设计意图（已禁用）：实测 SubDomain 拆分会产生 3+ 子领域，每个子领域又派 3-4 个 assistant，
-// 每个 assistant 跑 8 轮 ReAct，总 LLM 调用数爆炸（单任务 500+ events），
-// 5 分钟全局超时内根本跑不完，且子领域间重复执行同一任务。
-// DomainAgent 直接 dispatchAssistantsParallel 并行派 assistant 即可，
-// 不再走 SubDomain 层。
+// v3 路由重构后改为自适应：仅当 MetaAgent 路由判定为 RouteFullFourLayer（state.EnableSubdomain=true）
+// 且任务确实跨子领域边界时才启用，避免单领域任务不必要的第三层 overhead。
 //
-// 返回：恒 false（保留签名以备后续按需启用）。
+// 判定顺序：
+//  1. state.EnableSubdomain=false → 直接 false（路由层已决定不进四层）
+//  2. 任务数 ≤ 1 → false（单任务无需拆子领域）
+//  3. 跨子领域边界检测：命中不同子领域关键词 → true；否则 false
+//  4. （可选）LLM 兜底判断
+//
+// 返回：是否拆分。
 func (n *DomainAgentNode) shouldSplitToSubDomains(ctx context.Context, state *types.ThreeLayerState, tasks []string) bool {
+	// 路由层未启用 SubDomain → 直接返回 false
+	if !state.EnableSubdomain {
+		return false
+	}
+	// 单任务无需拆子领域
+	if len(tasks) <= 1 {
+		return false
+	}
+	// 规则层：跨子领域边界检测（命中不同子领域关键词才拆）
+	if detectSubdomainBoundaries(tasks) {
+		n.emit(ctx, "think", fmt.Sprintf("检测到 %d 个任务跨子领域边界，启用 SubDomain 拆分", len(tasks)))
+		return true
+	}
+	// 规则未命中：可选 LLM 兜底（模型可用时）
+	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
+		if n.shouldSplitWithLLM(ctx, state.CurrentDomain, tasks) {
+			n.emit(ctx, "think", "LLM 判定需要拆分子领域，启用 SubDomain")
+			return true
+		}
+	}
 	return false
+}
+
+// detectSubdomainBoundaries 规则层子领域边界检测。
+//
+// 命中 ≥2 个不同子领域关键词组时返回 true。关键词组覆盖常见前后端/数据/接口分层。
+func detectSubdomainBoundaries(tasks []string) bool {
+	// 子领域关键词组：每组代表一个子领域
+	groups := [][]string{
+		{"api", "接口", "路由", "handler", "controller"},
+		{"数据库", "database", "model", "schema", "sql", "表结构"},
+		{"前端", "frontend", "页面", "ui", "组件", "css", "样式"},
+		{"后端", "backend", "服务", "service", "逻辑"},
+		{"测试", "test", "用例"},
+	}
+	joined := strings.ToLower(strings.Join(tasks, " "))
+	hitGroups := 0
+	for _, g := range groups {
+		for _, kw := range g {
+			if strings.Contains(joined, kw) {
+				hitGroups++
+				break // 每组只计一次
+			}
+		}
+	}
+	return hitGroups >= 2
 }
 
 // shouldSplitWithLLM 使用LLM判断是否需要拆分子领域。
@@ -1151,21 +1111,7 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 
 	// 取当前块并收集结果摘要
 	block := state.ActiveBlocks[state.CurrentBlockID]
-	var summaries []string
-
-	// 从 TaskResults 收集
-	if block != nil && block.TaskResults != nil {
-		for task, result := range block.TaskResults {
-			// 结果过长则截断到 100 字符
-			shortResult := result
-			if len(shortResult) > 100 {
-				// 截断并加省略号
-				shortResult = shortResult[:100] + "..."
-			}
-			// 拼成 "任务: 结果" 格式
-			summaries = append(summaries, fmt.Sprintf("%s: %s", task, shortResult))
-		}
-	}
+	summaries := CommonCollectTaskSummaries(block)
 
 	// 有摘要则拼成一句话写入 state.Reason
 	if len(summaries) > 0 {
@@ -1180,15 +1126,18 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 		if summary == "" {
 			summary = block.Goal
 		}
-		// 异步归档避免阻塞图循环；失败仅记录日志，不影响主流程
+		// 异步归档避免阻塞图循环；失败仅结构化日志，不影响主流程
 		// 注意：通过参数显式捕获 block/domain/goal/sum，避免闭包捕获迭代变量
+		// 成功后置 b.archived=true，供 switchToNextBlock 幂等兜底判断（TODO #4）
 		go func(b *types.SessionBlock, domain, goal, sum string) {
 			// 独立 ctx：与会话 ctx 解耦，会话结束后归档仍能完成
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := n.blockMemory.SaveBlockMemory(bgCtx, b.SessionID, domain, goal, sum); err != nil {
-				fmt.Printf("[DomainAgent] save block memory: %v\n", err)
+				log.Printf("[DomainAgent] save block memory failed: session=%s domain=%s err=%v", b.SessionID, domain, err)
+				return
 			}
+			b.MarkArchived() // 标记已落库，switchToNextBlock 据此跳过兜底
 		}(block, inst.Domain, block.Goal, summary)
 	}
 
@@ -1225,12 +1174,12 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 			ExpiresAt:      time.Now().Add(ttl),
 			CreatedAt:      time.Now(),
 		}
-		// 异步落库：独立 ctx 不受会话生命周期影响；失败仅日志，主流程已结束不影响结果
+		// 异步落库：独立 ctx 不受会话生命周期影响；失败仅结构化日志，主流程已结束不影响结果
 		go func(r *DomainArchiveRecord) {
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := n.archiveStore.SaveDomainArchive(bgCtx, r); err != nil {
-				fmt.Printf("[DomainAgent] save domain archive: %v\n", err)
+				log.Printf("[DomainAgent] save domain archive failed: session=%s domain=%s err=%v", r.SessionID, r.Domain, err)
 			}
 		}(rec)
 	}

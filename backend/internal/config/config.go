@@ -52,6 +52,9 @@ type AgentConfig struct {
 	SessionTimeoutMin      int `yaml:"session_timeout_min"`       // 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
 	MaxSteps               int `yaml:"max_steps"`                 //  Graph 绝对步数上限（安全网，超出即使无死循环也终止），0 表示不限制
 	DomainArchiveMaxWeight int `yaml:"domain_archive_max_weight"` // domainAgent 归档权重上限
+	// Plan-and-Execute + Self-Reflection（TODO #1）
+	PlanEnabled     bool `yaml:"plan_enabled"`      // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
+	ReflectionEnabled bool `yaml:"reflection_enabled"` // 是否在助手执行后做 Self-Reflection（不达标重试一次）
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。

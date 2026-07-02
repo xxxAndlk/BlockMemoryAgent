@@ -74,7 +74,9 @@ func TestThreeLayerGraph_RuntimeWired(t *testing.T) {
 	g := builder.Build()
 
 	state := types.NewThreeLayerState("test-session")
-	state.DomainGoal = "修复商城首页穿模问题"
+	// 用一个不会被路由规则短路为 direct_tool/direct_assistant 的复杂目标，
+	// 确保走 RouteCreateDomain → handleInitialCreateDomains，从而创建 TaskBoard。
+	state.DomainGoal = "开发一个商城系统"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -29,6 +29,7 @@ type AssistantNode struct {
 	modelFactory     *model.ModelFactory // LLM 模型工厂，nil 时退回 mock
 	rt               *runtime.Runtime   // 运行时聚合体，读取 AgentCfg 超时配置
 	progress         ProgressCallback   // 进度回调，推送 prompt / token_usage 事件
+	toolCallback     ToolCallback       // 工具执行结果回调（推 UI），启用工具循环
 	contextAssembler ContextAssembler   // 上下文组装器，注入私有记忆与全局知识
 	llmTracker       *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token，复用 callLLMWithTimeout 模式避免 goroutine 泄漏）
 }
@@ -67,6 +68,10 @@ func (n *AssistantNode) SetRuntime(rt *runtime.Runtime) { n.rt = rt }
 
 // SetProgressCallback 实现 ProgressCallbackReceiver。
 func (n *AssistantNode) SetProgressCallback(cb ProgressCallback) { n.progress = cb }
+
+// SetToolCallback 设置工具执行结果回调。
+// 启用后 AssistantNode 的 executeTask 走 blades 工具循环（修复原 SubDomain→Assistant 路径无工具的问题）。
+func (n *AssistantNode) SetToolCallback(cb ToolCallback) { n.toolCallback = cb }
 
 // SetContextAssembler 注入上下文组装器。
 // nil 时 Assistant 退化为原生的角色定义 + 任务 prompt。
@@ -111,8 +116,8 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 		task = callReq.Task
 	}
 
-	// 6. 执行任务 — 优先走 LLM，不可用时退回 mock
-	result := n.executeTask(ctx, roleDef, task, callReq)
+	// 6. 执行任务 — 优先走 LLM+工具循环，不可用时退回 mock
+	result := n.executeTask(ctx, roleDef, task, callReq, state)
 
 	// 7. 回写结果到 SessionBlock
 	if callReq != nil {
@@ -157,26 +162,77 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 }
 
 // executeTask 调用 LLM 执行任务（不可用时退回 mock）。
-func (n *AssistantNode) executeTask(ctx context.Context, roleDef *types.RoleDefinition, task string, callReq *types.CallRequest) string {
-	// 有模型工厂时调用真实 LLM
+// executeTask 调用 LLM+工具循环执行任务（不可用时退回 mock）。
+//
+// 走 CommonExecuteAssistantTask（blades ReAct 工具循环），与 DomainAgent 内联执行路径一致，
+// 修复原 SubDomain→Assistant 路径无工具的问题。若注入了上下文组装器，把私有记忆/全局知识
+// 作为前缀注入任务文本，避免丢失。
+func (n *AssistantNode) executeTask(ctx context.Context, roleDef *types.RoleDefinition, task string, callReq *types.CallRequest, state *types.ThreeLayerState) string {
+	// 有模型工厂时走 LLM + 工具循环
 	if n.modelFactory != nil {
-		result, err := n.callLLM(ctx, roleDef, task, callReq)
-		if err == nil {
+		// 可选：注入上下文组装器的私有记忆/全局知识到任务文本前
+		effectiveTask := task
+		if n.contextAssembler != nil {
+			req := &BuildRequest{
+				AgentID:   n.instID,
+				TopicID:   SessionIDFromContext(ctx),
+				TaskQuery: task,
+			}
+			if callReq != nil {
+				req.DependsOn = []string{callReq.CallerID}
+			}
+			if pack, err := n.contextAssembler.BuildContext(ctx, req); err == nil && pack != nil {
+				if prefix := assembleContextPrefix(pack); prefix != "" {
+					effectiveTask = prefix + "\n\n" + task
+				}
+			}
+		}
+		// 委托公共执行入口：AssistantNode 不启用写文件门控（与原 SubDomain 行为一致）
+		result, err := CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt,
+			roleDef, effectiveTask, state, "", n.progress, roleDef.Name, 0, false)
+		if err == nil && result != "" {
 			return result
 		}
-		// LLM 调用失败时退回 mock，保证主流程不中断
+		// 工具循环失败时退回 mock，保证主流程不中断
 		if n.progress != nil {
 			n.progress(ctx, ProgressEvent{
 				SessionID: SessionIDFromContext(ctx),
 				Kind:      "error",
 				Agent:     n.instID,
-				Message:   fmt.Sprintf("LLM call failed, fallback to mock: %v", err),
+				Message:   fmt.Sprintf("LLM+工具执行失败，退回 mock: %v", err),
 			})
 		}
 	}
 
 	// LLM 不可用时退回模拟结果
 	return n.mockResult(roleDef, task, callReq)
+}
+
+// assembleContextPrefix 把 ContextPack 的消息列表拼成简短上下文前缀（供注入任务文本）。
+// 返回空串表示无可注入内容。
+func assembleContextPrefix(pack *ContextPack) string {
+	if pack == nil || len(pack.Messages) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("[相关上下文记忆]")
+	for _, m := range pack.Messages {
+		// 跳过空内容
+		if strings.TrimSpace(m.Content) == "" {
+			continue
+		}
+		switch m.Role {
+		case enums.ChatRoleSystem:
+			b.WriteString("\n[系统] " + m.Content)
+		case enums.ChatRoleUser:
+			b.WriteString("\n[用户] " + m.Content)
+		case enums.ChatRoleAssistant:
+			b.WriteString("\n[助手] " + m.Content)
+		default:
+			b.WriteString("\n[" + string(m.Role) + "] " + m.Content)
+		}
+	}
+	return b.String()
 }
 
 // callLLM 构建 prompt 并调用 LLM。

@@ -58,7 +58,9 @@ type MetaAgentNode struct {
 	rt              *runtime.Runtime      // Runtime 聚合体（板/邮箱/Watchdog/人格）
 	history         HistoryStore          // 跨会话历史读取器
 	progress        ProgressCallback      // 进度回调（推思考/意图/Token）
+	toolCallback    ToolCallback          // 工具执行结果回调（推 UI），RouteDirectTool/Assistant 直接执行时用
 	archiveStore    DomainArchiveStore    // domainAgent 归档存储（特性4：跨会话复用与清理）
+	blockMemory     BlockMemoryStore      // 块记忆存储（特性3：switchToNextBlock 幂等兜底归档用）
 	compressor      EpisodeCompressor     // Episode 压缩器（Watchdog 触发压缩时调用）
 }
 
@@ -87,6 +89,17 @@ func NewMetaAgentNode(registry *RoleRegistry, factory *RoleFactory, maxBlocks, s
 // 由图构建器在 Build 阶段注入。
 func (n *MetaAgentNode) SetModelFactory(mf *model.ModelFactory) {
 	n.modelFactory = mf
+}
+
+// SetToolCallback 设置工具执行结果回调。
+// RouteDirectTool / RouteDirectAssistant 路径下 MetaAgent 直接跑工具循环时用。
+func (n *MetaAgentNode) SetToolCallback(cb ToolCallback) {
+	n.toolCallback = cb
+}
+
+// SetBlockMemoryStore 注入块记忆存储（switchToNextBlock 幂等兜底归档用，TODO #4）。
+func (n *MetaAgentNode) SetBlockMemoryStore(s BlockMemoryStore) {
+	n.blockMemory = s
 }
 
 // SetRuntime 注入运行时（看板/邮箱/Watchdog/人格）。
@@ -510,14 +523,90 @@ func (n *MetaAgentNode) loadMessagesSection(state *types.ThreeLayerState) string
 	return b.String()
 }
 
+// metaDirectRoleDef 构造 MetaAgent 直接执行工具时使用的角色定义。
+//
+// ID="meta" 让 ModelFactory.GetModel 命中 MetaAgent 模型配置；SystemPrompt 取 soul 人格
+// （无 soul 则用默认开发助手人格）。executeWithTools 会在此基础上追加环境段与硬性规则。
+func (n *MetaAgentNode) metaDirectRoleDef() *types.RoleDefinition {
+	basePersona := "你是 BlockMemoryAgent，一个基于大语言模型的本地 AI 开发助手。" +
+		"你可以帮助用户：分析代码、操作文件、执行命令、搜索代码、编写程序等。"
+	systemPrompt := basePersona
+	// 注入 soul 人格（无 soul 时 Inject 返回原串）
+	if n.rt != nil && n.rt.Soul != nil {
+		systemPrompt = n.rt.Soul.Inject(basePersona)
+	}
+	return &types.RoleDefinition{
+		ID:           "meta",
+		Name:         "MetaAgent",
+		SystemPrompt: systemPrompt,
+		Description:  "主 Agent 直接执行",
+		Type:         types.RoleTypeMeta,
+	}
+}
+
+// executeDirect MetaAgent 直接跑工具循环执行任务（RouteDirectTool / RouteDirectAssistant 共用）。
+//
+// 职责：用给定 roleDef 调 CommonExecuteAssistantTask 跑 blades ReAct 工具循环，
+//   把结果写入 SessionSummary 并置 ActionFinish，不创建 DomainAgent/SubDomainAgent。
+//
+// 参数：
+//   - ctx：请求上下文。
+//   - state：图全局状态（写入 SessionSummary / NextAction / Reason）。
+//   - roleDef：执行用的角色定义（RouteDirectTool 用 meta 角色；RouteDirectAssistant 用动态助手角色）。
+//   - task：任务文本（通常为 state.DomainGoal）。
+//
+// 返回：更新后的 state。
+func (n *MetaAgentNode) executeDirect(ctx context.Context, state *types.ThreeLayerState, roleDef *types.RoleDefinition, task string) (*types.ThreeLayerState, error) {
+	if n.modelFactory == nil {
+		// 无模型：写占位回答并结束
+		state.SessionSummary = "模型不可用，无法直接执行。"
+		state.NextAction = types.ActionFinish
+		state.Reason = "no model factory for direct execute"
+		return state, nil
+	}
+	// 走公共执行入口：MetaAgent 不启用写文件门控（直接执行不强制重试）
+	result, err := CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt,
+		roleDef, task, state, "", n.progress, "MetaAgent["+roleDef.Name+"]", 0, false)
+	if err != nil || result == "" {
+		// 直接执行失败：回退到 RouteCreateDomain 走领域拆分（保底）
+		n.emit(ctx, "error", fmt.Sprintf("直接执行失败，回退到领域拆分: %v", err))
+		return n.handleInitialCreateDomains(ctx, state, false)
+	}
+	state.SessionSummary = result
+	state.NextAction = types.ActionFinish
+	state.Reason = "direct execute by MetaAgent"
+	return state, nil
+}
+
+// executeDirectAssistant RouteDirectAssistant 路径：MetaAgent 建一个助手角色后直接跑工具循环。
+//
+// 不经过 DomainAgent 任务拆分，直接用一个专家助手执行单领域简单任务。
+func (n *MetaAgentNode) executeDirectAssistant(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
+	task := state.DomainGoal
+	// 用 factory.CreateAssistant 动态创建一个助手角色定义（无父领域）
+	inst, err := n.factory.CreateAssistant(ctx, state.SessionID, task, "", "meta")
+	if err != nil || inst == nil {
+		// 创建失败：回退到 RouteCreateDomain
+		n.emit(ctx, "error", fmt.Sprintf("直接助手创建失败，回退领域拆分: %v", err))
+		return n.handleInitialCreateDomains(ctx, state, false)
+	}
+	def := n.registry.GetRoleDef(inst.RoleDefID)
+	if def == nil {
+		return n.handleInitialCreateDomains(ctx, state, false)
+	}
+	n.emitDetail(ctx, "agent_created", fmt.Sprintf("直接创建 Assistant: %s (任务: %s)", inst.ID, task),
+		fmt.Sprintf("instID=%s roleDefID=%s", inst.ID, inst.RoleDefID))
+	return n.executeDirect(ctx, state, def, task)
+}
+
 // handleInitial 首次启动处理。
 //
 // 职责：
-//   - 加载跨会话历史与对话历史作为上下文
-//   - 简单问题（寒暄/自我介绍）直接调 LLM 回答并结束
-//   - 复杂问题调 analyzeDomains 拆分领域
+//   - 调 ClassifyTask 做 5 路径路由
+//   - RouteDirectTool / RouteDirectAssistant：MetaAgent 直接执行并结束（0-1 层，不创建领域 Agent）
+//   - RouteCreateDomain / RouteMultiDomain：调 analyzeDomains 拆分领域，创建 DomainAgent（不启用 SubDomain）
+//   - RouteFullFourLayer：同上但启用 SubDomain
 //   - 初始化 TaskBoard，把领域名作为顶层子任务
-//   - 为每个领域创建 DomainAgent 实例与 SessionBlock
 //   - 切换到第一个块交控制权给 DomainAgent
 //
 // 参数：
@@ -528,86 +617,34 @@ func (n *MetaAgentNode) loadMessagesSection(state *types.ThreeLayerState) string
 //
 // 副作用：创建 DomainAgent 实例；写入 ActiveBlocks、TaskBoard；更新 SessionSummary。
 func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	n.emit(ctx, "think", "分析用户目标，决定是否需要拆分领域")
+	n.emit(ctx, "think", "分析用户目标，决定执行路径")
 
-	// 简单问题直接回答，不拆分
-	messagesSection := n.loadMessagesSection(state)
+	// 5 路径路由：规则层（零 LLM）→ LLM 兜底 → 安全兜底（RouteCreateDomain）
+	decision := n.ClassifyTask(ctx, state)
+	n.emit(ctx, "intend", fmt.Sprintf("路由判定: %s", decision.Path))
 
-	// 查询/搜索/分析类简单任务：标记 DirectExecute，DomainAgent 将跳过子任务拆解，
-	// 直接把 goal 作为单任务交给一个 Assistant（用 HTTPGet/Web 搜索类工具，而非写脚本）
-	if n.shouldDirectExecute(state.DomainGoal) {
-		state.DirectExecute = true
-		n.emit(ctx, "intend", "判定为查询/搜索类任务，直接派发单助手执行（跳过子任务拆解）")
+	switch decision.Path {
+	case RouteDirectTool:
+		// 0 层：MetaAgent 自跑工具循环（含 0 工具的纯 QA）
+		return n.executeDirect(ctx, state, n.metaDirectRoleDef(), state.DomainGoal)
+	case RouteDirectAssistant:
+		// 1 层：MetaAgent 建助手 + 跑工具循环
+		return n.executeDirectAssistant(ctx, state)
+	default:
+		// RouteCreateDomain / RouteMultiDomain / RouteFullFourLayer：走领域拆分
+		return n.handleInitialCreateDomains(ctx, state, decision.EnableSubdomain)
 	}
+}
 
-	// 特性7：LLM 智能路由 — 关键词规则未命中时，用 LLM 判断 goal 复杂度，
-	// 命中"simple"则直接调 LLM 回答，命中"query"则走 DirectExecute，命中"complex"则派发子 Agent。
-	// 仅在规则路径未决出 DirectExecute / simple 且模型可用时触发，避免增加无谓 LLM 调用。
-	// 注意：classifier 返回 ""（LLM 不可用/超时/未识别）时不进入任何 case，
-	//       直接 fall-through 到下方 analyzeDomains 走原规则路径，保证无回归。
-	if !state.DirectExecute && n.modelFactory != nil && !n.isSimpleQuestion(state.DomainGoal) {
-		switch n.classifyComplexityLLM(ctx, state.DomainGoal) {
-		case "simple":
-			// 直接调主 LLM 生成回答并结束会话，跳过领域拆分与子 Agent 派发
-			n.emit(ctx, "intend", "LLM 路由判定为简单问题，直接调用 LLM 回答")
-			answer, err, timedOut := n.callLLM(ctx, fmt.Sprintf(
-				`你是BlockMemoryAgent，一个基于大语言模型的本地AI开发助手。
-请直接回答用户的简单问题，保持简洁友好。回答请控制在 2000 字以内，确保核心结论完整。
-%s
-用户问题：%s
-
-你的回答：`, fmtEnvSection(), state.DomainGoal))
-			// LLM 软超时：写入超时提示并 Finish，避免阻塞会话
-			if timedOut {
-				state.SessionSummary = "LLM调用超时，请稍后重试"
-				state.NextAction = types.ActionFinish
-				state.Reason = "llm timeout on smart-route simple"
-				return state, nil
-			}
-			// 成功：写回答到 SessionSummary 并 Finish；err!=nil 或空回答时 fall-through 到常规拆分流程
-			if err == nil && answer != "" {
-				state.SessionSummary = answer
-				state.NextAction = types.ActionFinish
-				state.Reason = "smart-route direct answer"
-				return state, nil
-			}
-		case "query":
-			// 标记 DirectExecute，由下方 handleInitial 流程派发单助手 + 工具执行（HTTPGet 等）
-			state.DirectExecute = true
-			n.emit(ctx, "intend", "LLM 路由判定为查询类任务，标记 DirectExecute 由单助手执行")
-		case "complex":
-			// 仅打点，不修改状态；fall-through 后由 analyzeDomains 拆分领域并派发子 Agent
-			n.emit(ctx, "intend", "LLM 路由判定为复杂任务，进入领域拆分流程")
-		}
-	}
-
-	if n.modelFactory != nil && n.isSimpleQuestion(state.DomainGoal) {
-		n.emit(ctx, "intend", "判定为简单问题，直接调用 LLM 回答")
-		// 调 LLM 回答简单问题（含环境/历史/对话段落）
-		answer, err, timedOut := n.callLLM(ctx, fmt.Sprintf(
-			`你是BlockMemoryAgent，一个基于大语言模型的本地AI开发助手，使用多Agent智能编排架构。
-你可以帮助用户：分析代码、操作文件、执行命令、搜索代码、编写程序等。
-
-请直接回答用户的简单问题，保持简洁友好。回答请控制在 2000 字以内，确保核心结论完整。
-%s
-%s
-用户问题：%s
-
-你的回答：`, fmtEnvSection(), messagesSection, state.DomainGoal))
-		// LLM 超时：写入超时提示并结束
-		if timedOut {
-			state.SessionSummary = "LLM调用超时，请稍后重试" // 写入超时摘要
-			state.NextAction = types.ActionFinish           // 结束会话
-			state.Reason = "llm timeout on simple question" // 记录原因
-			return state, nil
-		}
-		// LLM 成功：写入回答并结束
-		if err == nil && answer != "" {
-			state.SessionSummary = answer                      // 写入 LLM 回答
-			state.NextAction = types.ActionFinish              // 结束会话
-			state.Reason = "direct answer for simple question" // 记录原因
-			return state, nil
-		}
+// handleInitialCreateDomains 领域拆分路径：analyzeDomains → 创建 DomainAgent/SessionBlock → 切换。
+//
+// 被 handleInitial 的 RouteCreateDomain/MultiDomain/FullFourLayer 路径，以及直接执行失败回退调用。
+// enableSubdomain=true 时在 state 置位，DomainAgent 据此自适应启用 SubDomain。
+func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *types.ThreeLayerState, enableSubdomain bool) (*types.ThreeLayerState, error) {
+	// 标记是否允许 DomainAgent 自适应启用 SubDomain（仅 RouteFullFourLayer 为 true）
+	state.EnableSubdomain = enableSubdomain
+	if enableSubdomain {
+		n.emit(ctx, "intend", "启用 SubDomain 自适应（完整四层编排候选）")
 	}
 
 	// 复杂问题：调 LLM 拆分领域
@@ -842,14 +879,40 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 // switchToNextBlock 切换到下一个会话块。
 //
 // 职责：
-//   - 汇总当前块结果到 SessionSummary
-//   - 把当前块移入 CompletedBlocks 并从 ActiveBlocks 删除
-//   - 切换到下一个活跃块；无活跃块则结束会话
+// ensureBlockArchived 幂等兜底归档：若异步归档未确认成功（!block.IsArchived），同步补一次。
+//
+// 职责：DomainAgent.summarizeResults 的异步归档 goroutine 可能因超时/异常漏写，
+//   此处在块切换前用短超时同步补写，确保块记忆落库。失败仅结构化日志，不阻塞块切换。
 //
 // 参数：
-//   - ctx：请求上下文
-//   - state：图全局状态
-//
+//   - ctx：请求上下文。
+//   - state：图全局状态（取 SessionSummary/Reason 作为摘要来源）。
+//   - block：当前会话块。
+func (n *MetaAgentNode) ensureBlockArchived(ctx context.Context, state *types.ThreeLayerState, block *types.SessionBlock) {
+	if n.blockMemory == nil || block == nil {
+		return
+	}
+	// 异步归档已成功 → 跳过，避免重复落库
+	if block.IsArchived() {
+		return
+	}
+	// 摘要优先取 state.Reason（含各任务结果）；为空退化为块目标
+	summary := state.Reason
+	if summary == "" {
+		summary = block.Goal
+	}
+	// 同步兜底：短超时，失败仅日志不阻塞
+	bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := n.blockMemory.SaveBlockMemory(bgCtx, block.SessionID, block.Domain, block.Goal, summary); err != nil {
+		log.Printf("[MetaAgent] block memory fallback archive failed: session=%s domain=%s err=%v", block.SessionID, block.Domain, err)
+		return
+	}
+	block.MarkArchived()
+	log.Printf("[MetaAgent] block memory fallback archive ok: session=%s domain=%s", block.SessionID, block.Domain)
+}
+
+// switchToNextBlock 切换到下一个会话块。
 // 返回：更新后的 state；无活跃块时调 finalizeSession 生成最终回答。
 func (n *MetaAgentNode) switchToNextBlock(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	// 1. 收尾当前块
@@ -858,6 +921,8 @@ func (n *MetaAgentNode) switchToNextBlock(ctx context.Context, state *types.Thre
 		block := state.ActiveBlocks[state.CurrentBlockID]
 		if block != nil {
 			n.collectBlockResult(state, block)
+			// 幂等兜底归档（TODO #4）：异步归档未确认成功时，同步补一次，避免异常退出漏写
+			n.ensureBlockArchived(ctx, state, block)
 		}
 		// 移入已完成列表
 		state.CompletedBlocks = append(state.CompletedBlocks, state.CurrentBlockID)
