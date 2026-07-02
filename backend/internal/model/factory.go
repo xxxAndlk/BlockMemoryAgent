@@ -289,15 +289,20 @@ func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 		}
 		seen[key] = true
 
-		// 构造客户端（带缓存）
-		client, err := f.GetModel(ctx, roleID)
+		// 构造一个 MaxTokens=1 的临时探测客户端：连通性探测只需模型"能应答"，
+		// 用极小输出预算避免推理类模型（如 deepseek-v4-flash）为 "ping" 生成大段
+		// reasoning 而拖慢/超时启动校验。正常 LLM 在 ~1s 内返回；错误配置（key/
+		// 端点/模型名）通常在 <1s 内返回 4xx，仍能快速失败。
+		probeCfg := cfg
+		probeCfg.MaxTokens = 1
+		probeClient, err := NewBladesClient(ctx, probeCfg)
 		if err != nil {
 			failed = append(failed, fmt.Sprintf("%s (构造失败: %v)", roleID, err))
 			continue
 		}
-		// 探测：10s 整体超时，单次 8s
-		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		if err := probeLLM(probeCtx, client); err != nil {
+		// 探测：整体 30s（容纳 2 次重试 + 退避），单次 12s
+		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := probeLLM(probeCtx, probeClient); err != nil {
 			failed = append(failed, fmt.Sprintf("%s (model=%s: %v)", roleID, cfg.Model, err))
 		}
 		cancel()
@@ -309,10 +314,11 @@ func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 	return nil
 }
 
-// probeLLM 对已构造的客户端发起一次最小化调用（3 次重试，短超时），验证可连通性。
+// probeLLM 对已构造的探测客户端发起一次最小化调用（2 次重试，单次 12s），验证可连通性。
+// 注：传入的 client 应已用 MaxTokens=1 构造，确保正常 LLM 快速应答。
 // 返回 nil 表示连通。
 func probeLLM(ctx context.Context, client LLMClient) error {
-	_, err, _ := retryGenerate(ctx, client, probePrompt, 8*time.Second)
+	_, err, _ := retryGenerate(ctx, client, probePrompt, 12*time.Second)
 	return err
 }
 
