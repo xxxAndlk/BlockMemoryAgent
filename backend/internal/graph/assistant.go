@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
+
 
 // AssistantNode Layer 3: 助手角色 / 具体任务执行者。
 //
@@ -152,10 +152,10 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	// 11. 路由
 	if callReq != nil && callReq.CallerID != "" {
 		n.registry.UpdateInstanceStatus(callReq.CallerID, types.RoleStatusActive)
-		state.NextAction = types.ActionSwitch
+		state.NextAction = enums.ActionSwitch
 		state.TargetRoleID = callReq.CallerID
 	} else {
-		state.NextAction = types.ActionContinue
+		state.NextAction = enums.ActionContinue
 	}
 
 	return state, nil
@@ -235,126 +235,6 @@ func assembleContextPrefix(pack *ContextPack) string {
 	return b.String()
 }
 
-// callLLM 构建 prompt 并调用 LLM。
-// 使用 LLMCallTracker.CallWithTimeout 复用 MetaAgent/DomainAgent 的软/硬超时 + discard 机制，
-// 避免 ctx 超时后 goroutine 持续运行导致泄漏（C1）。同时正确记录 token 用于 R1。
-func (n *AssistantNode) callLLM(ctx context.Context, roleDef *types.RoleDefinition, task string, callReq *types.CallRequest) (string, error) {
-	llm, err := n.modelFactory.GetModel(ctx, roleDef.ID)
-	if err != nil {
-		return "", fmt.Errorf("get model: %w", err)
-	}
-
-	// 构建 prompt：优先使用上下文组装器注入私有记忆 / 全局知识
-	var prompt string
-	if n.contextAssembler != nil {
-		req := &BuildRequest{
-			AgentID:   n.instID,
-			TopicID:   SessionIDFromContext(ctx),
-			TaskQuery: task,
-		}
-		if callReq != nil {
-			req.DependsOn = []string{callReq.CallerID}
-		}
-		if pack, err := n.contextAssembler.BuildContext(ctx, req); err == nil && pack != nil {
-			prompt = formatContextPack(pack, roleDef, task)
-		}
-	}
-	if prompt == "" {
-		// 回退到原生 prompt
-		domain := ""
-		if callReq != nil && callReq.Context != nil {
-			if d, ok := callReq.Context["domain"]; ok {
-				domain = fmt.Sprintf("%v", d)
-			}
-		}
-		prompt = fmt.Sprintf("你是一个 %s，专长：%s。\n领域：%s\n请完成以下任务：%s",
-			roleDef.Name, roleDef.Description, domain, task)
-	}
-
-	// 推送 prompt 事件
-	caller := roleDef.Name
-	if n.progress != nil {
-		n.progress(ctx, ProgressEvent{
-			SessionID: SessionIDFromContext(ctx),
-			Kind:      "prompt",
-			Agent:     n.instID,
-			Message:   fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)),
-			Detail:    model.SummarizePrompt(prompt, 500),
-		})
-	}
-
-	// 解析软/硬超时：默认 30s/90s，可被 AgentCfg 覆盖
-	softTimeout := 30 * time.Second
-	hardTimeout := 90 * time.Second
-	if n.rt != nil && n.rt.AgentCfg != nil {
-		if n.rt.AgentCfg.LLMSoftTimeoutSec > 0 {
-			softTimeout = time.Duration(n.rt.AgentCfg.LLMSoftTimeoutSec) * time.Second
-		}
-		if n.rt.AgentCfg.LLMHardTimeoutSec > 0 {
-			hardTimeout = time.Duration(n.rt.AgentCfg.LLMHardTimeoutSec) * time.Second
-		}
-	}
-
-	// 通过 tracker 调用：内部用 timeoutCtx + discard goroutine 模式，超时后 goroutine 安全退出
-	resp, callErr, timedOut := n.llmTracker.CallWithTimeout(ctx, llm, prompt, caller, softTimeout, hardTimeout)
-
-	// 推送 token_usage 事件（从 tracker 最新记录读取，格式与 MetaAgent/DomainAgent 一致以便 parseTokenUsage 解析）
-	records := n.llmTracker.Records()
-	if len(records) > 0 {
-		last := records[len(records)-1]
-		if n.progress != nil {
-			n.progress(ctx, ProgressEvent{
-				SessionID: SessionIDFromContext(ctx),
-				Kind:      "token_usage",
-				Agent:     n.instID,
-				Message:   fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", caller, last.InputTokens, last.OutputTokens, last.Duration.Round(time.Millisecond)),
-			})
-		}
-	}
-
-	if callErr != nil {
-		if timedOut {
-			return "", fmt.Errorf("LLM 超时: %w", callErr)
-		}
-		return "", callErr
-	}
-
-	// 推送 LLM 响应摘要事件
-	if n.progress != nil && resp != "" {
-		n.progress(ctx, ProgressEvent{
-			SessionID: SessionIDFromContext(ctx),
-			Kind:      "llm_response",
-			Agent:     n.instID,
-			Message:   fmt.Sprintf("[%s] LLM 响应 (%d 字符)", caller, len(resp)),
-			Detail:    model.SummarizePrompt(resp, 500),
-		})
-	}
-	return resp, nil
-}
-
-// formatContextPack 把 ContextPack 中的消息列表与角色定义、任务拼接成单段 prompt。
-// 当前 ChatModel 接口只接受字符串，因此把多段消息按角色顺序拼成文本。
-func formatContextPack(pack *ContextPack, roleDef *types.RoleDefinition, task string) string {
-	var b strings.Builder
-	// 先写入角色定义，作为 system 段补充
-	b.WriteString(fmt.Sprintf("你是 %s，专长：%s。\n", roleDef.Name, roleDef.Description))
-	// 按消息角色顺序拼接
-	for _, m := range pack.Messages {
-		switch m.Role {
-		case enums.ChatRoleSystem:
-			b.WriteString(fmt.Sprintf("[系统] %s\n", m.Content))
-		case enums.ChatRoleUser:
-			b.WriteString(fmt.Sprintf("[用户] %s\n", m.Content))
-		case enums.ChatRoleAssistant:
-			b.WriteString(fmt.Sprintf("[助手] %s\n", m.Content))
-		default:
-			b.WriteString(fmt.Sprintf("[%s] %s\n", m.Role, m.Content))
-		}
-	}
-	// 最后再次明确当前任务
-	b.WriteString(fmt.Sprintf("\n请完成以下任务：%s", task))
-	return b.String()
-}
 
 // mockResult 生成模拟结果（无 LLM key 时的占位）。
 func (n *AssistantNode) mockResult(roleDef *types.RoleDefinition, task string, callReq *types.CallRequest) string {

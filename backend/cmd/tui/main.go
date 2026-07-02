@@ -19,9 +19,9 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
-	"github.com/blockmemory/agent/backend/internal/embed"
 	"github.com/blockmemory/agent/backend/internal/graph"
 	"github.com/blockmemory/agent/backend/internal/logging"
+	"github.com/blockmemory/agent/backend/internal/memory"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
@@ -266,7 +266,7 @@ type sinkerNode struct{}
 func (s *sinkerNode) Name() string { return "Sinker" }
 
 func (s *sinkerNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	state.NextAction = types.ActionFinish
+	state.NextAction = enums.ActionFinish
 	return state, nil
 }
 
@@ -276,26 +276,24 @@ type pgBlockMemoryAdapter struct {
 }
 
 func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string) error {
-	content := fmt.Sprintf("领域:%s\n目标:%s\n摘要:%s", domain, goal, summary)
-	emb := embed.PseudoEmbed(content, a.dim)
-	return a.pg.SaveKnowledge(ctx, &types.KnowledgeRecord{
-		KnowledgeType: enums.KnowledgeTypeBlockMemory,
-		TopicID:       sessionID,
-		Content:       content,
-		Embedding:     emb,
-		CreatedAt:     time.Now(),
-	})
+	rec := (&memory.BlockMemoryRecord{
+		SessionID: sessionID,
+		Domain:    domain,
+		Goal:      goal,
+		Summary:   summary,
+		CreatedAt: time.Now(),
+	}).ToKnowledgeRecord(a.dim)
+	return a.pg.SaveKnowledge(ctx, rec)
 }
 
-func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, query string, topK int) (string, error) {
-	emb := embed.PseudoEmbed(query, a.dim)
-	recs, err := a.pg.SearchKnowledgeByType(ctx, enums.KnowledgeTypeBlockMemory, emb, topK)
+func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, domain, query string, topK int) (string, error) {
+	recs, err := memory.SearchBlockMemory(ctx, a.pg, domain, query, topK)
 	if err != nil {
 		return "", err
 	}
 	var sb strings.Builder
 	for _, rec := range recs {
-		sb.WriteString(rec.Content)
+		sb.WriteString(rec.Summary)
 		sb.WriteString("\n---\n")
 	}
 	return sb.String(), nil

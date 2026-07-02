@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS agent_private_memory (
     snapshot_ref VARCHAR(128),
     compression_level INT DEFAULT 0,
     importance_score FLOAT DEFAULT 0,
+    step_count INT DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS agent_private_memory (
 CREATE INDEX IF NOT EXISTS idx_apm_agent_topic ON agent_private_memory(agent_id, topic_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_apm_importance ON agent_private_memory(importance_score DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_apm_episode_gin ON agent_private_memory USING GIN (episode);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_private_memory_idempotent ON agent_private_memory(agent_id, topic_id, step_count);
 
 -- 2. Agent 快照表
 CREATE TABLE IF NOT EXISTS agent_snapshots (
@@ -61,6 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_gk_type ON global_knowledge(knowledge_type);
 CREATE INDEX IF NOT EXISTS idx_gk_topic ON global_knowledge(topic_id);
 CREATE INDEX IF NOT EXISTS idx_gk_access ON global_knowledge(last_accessed, access_count);
 CREATE INDEX IF NOT EXISTS idx_gk_archived ON global_knowledge(archived);
+CREATE INDEX IF NOT EXISTS idx_global_knowledge_domain ON global_knowledge USING btree ((meta->>'domain'));
 
 -- 5. Agent 能力注册表
 CREATE TABLE IF NOT EXISTS agent_registry (
@@ -105,3 +108,17 @@ WITH (lists = 100);
 CREATE INDEX IF NOT EXISTS idx_archive_embedding ON topic_archives
 USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
+
+CREATE TABLE IF NOT EXISTS memory_write_failures (
+    id SERIAL PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    topic_id TEXT NOT NULL,
+    step_count INT NOT NULL,
+    action TEXT,
+    raw_content TEXT,
+    error TEXT NOT NULL,
+    retry_count INT DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_memory_write_failures_unresolved ON memory_write_failures(created_at) WHERE resolved_at IS NULL;

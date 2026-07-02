@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -63,16 +64,16 @@ func (n *EscalationHandlerNode) Invoke(ctx context.Context, state *types.ThreeLa
 	if block := state.ActiveBlocks[state.CurrentBlockID]; block != nil {
 		block.Events = append(block.Events, &types.Event{
 			ID:          fmt.Sprintf("esc_%d", time.Now().UnixNano()), // 纳秒时间戳保证唯一
-			Type:        types.EventEscalation,
+			Type:        enums.EventEscalation,
 			SourceAgent: state.CurrentDomain, // 记录升级来源
 			Payload:     map[string]any{"arbitration": arbitration},
 			Priority:    10, // 升级事件高优先级
-			Status:      types.EventDone, // 审计记录直接置完成，避免触发循环
+			Status:      enums.EventDone, // 审计记录直接置完成，避免触发循环
 		})
 	}
 
 	// 清理升级状态，回到 Continue 让 MetaAgent 继续循环
-	state.NextAction = types.ActionContinue
+	state.NextAction = enums.ActionContinue
 	state.Reason = ""
 
 	return state, nil

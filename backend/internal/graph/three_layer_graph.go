@@ -15,6 +15,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -443,7 +444,7 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		}
 
 		// 6. 终止判定：Finish 或 next 为空都结束循环
-		if state.NextAction == types.ActionFinish {
+		if state.NextAction == enums.ActionFinish {
 			return state, nil
 		}
 
@@ -451,7 +452,7 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		// 直接 return 而非 continue，避免下一 tick 继续推进；server 在收到 /clarify 答复后会
 		// 通过 resumeSession 重新调用 Invoke，从当前 state 继续执行。
 		// 注意：Wait 态指纹稳定会重复，但此处已 return，不会触发死循环判定。
-		if state.NextAction == types.ActionWait {
+		if state.NextAction == enums.ActionWait {
 			return state, nil
 		}
 
@@ -632,7 +633,7 @@ func (g *ThreeLayerGraph) determineNext(current string, state *types.ThreeLayerS
 //   - Continue：继续在 MetaAgent 循环。
 func (g *ThreeLayerGraph) metaAgentNext(state *types.ThreeLayerState) string {
 	switch state.NextAction {
-	case types.ActionSwitch:
+	case enums.ActionSwitch:
 		// 显式目标优先
 		if state.TargetRoleID != "" {
 			return state.TargetRoleID
@@ -644,11 +645,11 @@ func (g *ThreeLayerGraph) metaAgentNext(state *types.ThreeLayerState) string {
 				return block.Agents[0]
 			}
 		}
-	case types.ActionEscalate:
+	case enums.ActionEscalate:
 		return "EscalationHandler" // 上抛到升级处理节点
-	case types.ActionFinish:
+	case enums.ActionFinish:
 		return "Sinker" // 走收尾节点
-	case types.ActionContinue:
+	case enums.ActionContinue:
 		return "MetaAgent" // 自循环
 	}
 	return "MetaAgent" // 默认回到 MetaAgent
@@ -661,11 +662,11 @@ func (g *ThreeLayerGraph) metaAgentNext(state *types.ThreeLayerState) string {
 // 其余情况默认回 MetaAgent 汇报。
 func (g *ThreeLayerGraph) domainAgentNext(state *types.ThreeLayerState) string {
 	switch state.NextAction {
-	case types.ActionSwitch:
+	case enums.ActionSwitch:
 		if state.TargetRoleID != "" {
 			return state.TargetRoleID
 		}
-	case types.ActionContinue:
+	case enums.ActionContinue:
 		// 没有挂起的子调用 → 回 MetaAgent 汇报
 		if !state.IsCalling() {
 			return "MetaAgent"
@@ -682,11 +683,11 @@ func (g *ThreeLayerGraph) domainAgentNext(state *types.ThreeLayerState) string {
 // SubDomainAgent 完成后同样回 DomainAgent（经由 MetaAgent 调度）。
 func (g *ThreeLayerGraph) subDomainAgentNext(state *types.ThreeLayerState) string {
 	switch state.NextAction {
-	case types.ActionSwitch:
+	case enums.ActionSwitch:
 		if state.TargetRoleID != "" {
 			return state.TargetRoleID
 		}
-	case types.ActionContinue:
+	case enums.ActionContinue:
 		if !state.IsCalling() {
 			return "MetaAgent" // 子任务做完，回上层
 		}
@@ -701,11 +702,11 @@ func (g *ThreeLayerGraph) subDomainAgentNext(state *types.ThreeLayerState) strin
 // Assistant 完成后无脑回 MetaAgent（由 MetaAgent 决定是否继续 DomainAgent 流程）。
 func (g *ThreeLayerGraph) assistantNext(state *types.ThreeLayerState) string {
 	switch state.NextAction {
-	case types.ActionSwitch:
+	case enums.ActionSwitch:
 		if state.TargetRoleID != "" {
 			return state.TargetRoleID
 		}
-	case types.ActionContinue:
+	case enums.ActionContinue:
 		return "MetaAgent"
 	}
 	return "MetaAgent"

@@ -16,6 +16,8 @@ import (
 type PrivateStore interface {
 	// SaveEpisode 将单条 Episode 写入指定 Agent + Topic 的私有记忆空间。
 	SaveEpisode(ctx context.Context, agentID, topicID string, ep *types.Episode) error
+	// SaveEpisodeWithStepCount 将单条 Episode 写入指定 Agent + Topic 的私有记忆空间，使用 step_count 作为幂等键。
+	SaveEpisodeWithStepCount(ctx context.Context, agentID, topicID string, stepCount int, ep *types.Episode) error
 	// GetEpisodes 读取 Episode 列表；limit<=0 表示不限制条数。
 	GetEpisodes(ctx context.Context, agentID, topicID string, limit int) ([]*types.Episode, error)
 	// CountEpisodes 统计 Episode 总数，供按预算压缩时估算 Token 占用。
@@ -258,6 +260,49 @@ func (wp *WriteProcessor) Process(ctx context.Context, agentID, topicID, action,
 
 	// 6. 持久化: 写入私有记忆存储，失败时包装错误返回
 	if err := wp.store.SaveEpisode(ctx, agentID, topicID, episode); err != nil {
+		return nil, fmt.Errorf("save episode: %w", err)
+	}
+
+	return episode, nil
+}
+
+// ProcessWithStepCount 处理写入（带 stepCount 幂等键）。
+// 职责: 将一条原始观察加工为 Episode 并持久化，stepCount 用于幂等去重。
+// 参数:
+//   - ctx: 上下文。
+//   - agentID: 归属 Agent 标识。
+//   - topicID: 归属 Topic 标识。
+//   - action: 本步动作摘要。
+//   - rawContent: 原始完整观察文本。
+//   - stepCount: 当前步骤序号，作为幂等键。
+// 返回: 构建完成的 Episode；持久化失败时返回 wrapped error。
+func (wp *WriteProcessor) ProcessWithStepCount(ctx context.Context, agentID, topicID, action, rawContent string, stepCount int) (*types.Episode, error) {
+	// 1. 生成摘要
+	summary := wp.summarizer.Summarize(rawContent)
+
+	// 2. 提取关键事实
+	facts := wp.extractor.ExtractFacts(rawContent)
+
+	// 3. 重要性评分
+	importance := wp.scorer.Score(summary, facts)
+
+	// 4. 话题边界检测
+	topicBound := wp.detector.DetectBoundary(topicID, rawContent)
+
+	// 5. 构建 Episode
+	episode := &types.Episode{
+		StepID:             generateStepID(agentID),
+		Timestamp:          time.Now(),
+		Action:             action,
+		ObservationSummary: summary,
+		FullObservation:    rawContent,
+		Facts:              facts,
+		Importance:         importance,
+		TopicBound:         topicBound,
+	}
+
+	// 6. 持久化（带幂等键 stepCount）
+	if err := wp.store.SaveEpisodeWithStepCount(ctx, agentID, topicID, stepCount, episode); err != nil {
 		return nil, fmt.Errorf("save episode: %w", err)
 	}
 

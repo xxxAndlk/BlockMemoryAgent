@@ -541,7 +541,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 
 	// 特性5：人机对话挂起 — Graph 返回 ActionWait 且有待处理澄清请求时，
 	// 保留运行态，等待用户通过 /api/sessions/{id}/clarify 提交答复后恢复执行。
-	if result.NextAction == types.ActionWait && result.PendingClarify != nil {
+	if result.NextAction == enums.ActionWait && result.PendingClarify != nil {
 		m.mu.Lock()
 		session.Status = enums.SessionStatusAwaitingClarify
 		session.State = result
@@ -1687,7 +1687,7 @@ func (m *SessionManager) resumeSession(session *Session) {
 	}
 
 	// 特性5：人机对话挂起 — 恢复路径同样支持再次挂起
-	if result.NextAction == types.ActionWait && result.PendingClarify != nil {
+	if result.NextAction == enums.ActionWait && result.PendingClarify != nil {
 		m.mu.Lock()
 		session.Status = enums.SessionStatusAwaitingClarify
 		session.State = result

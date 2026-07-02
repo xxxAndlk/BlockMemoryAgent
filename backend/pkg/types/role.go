@@ -230,7 +230,7 @@ type ThreeLayerState struct {
 	// RoleInstances 所有角色实例映射（ID -> RoleInstance）。
 	RoleInstances map[string]*RoleInstance `json:"role_instances"`
 	// NextAction 下一步控制信号，驱动状态机。
-	NextAction ActionType `json:"next_action"`
+	NextAction enums.ActionType `json:"next_action"`
 	// TargetRoleID Switch/Escalate 动作的目标角色 ID。
 	TargetRoleID string `json:"target_role_id"`
 	// Reason 本次动作的理由，供审计与调试。
@@ -253,7 +253,7 @@ func NewThreeLayerState(sessionID string) *ThreeLayerState {
 		ActiveBlocks:  make(map[string]*SessionBlock),
 		RoleInstances: make(map[string]*RoleInstance),
 		CallStack:     make([]*CallRequest, 0),
-		NextAction:    ActionContinue,
+		NextAction:    enums.ActionContinue,
 	}
 }
 

@@ -275,7 +275,7 @@ func (s *RedisStore) PollEvents(ctx context.Context, topicID string, count int64
 				continue
 			}
 			// 仅返回 Pending 状态的事件
-			if ev.Status == types.EventPending {
+			if ev.Status == enums.EventPending {
 				events = append(events, &ev)
 			}
 		}

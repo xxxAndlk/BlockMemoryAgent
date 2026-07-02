@@ -9,9 +9,10 @@ import (
 	"strings"        // 拼接 pgvector 的逗号分隔向量分量
 	"time"           // 时间戳与连接池生命周期管理
 
+	"github.com/blockmemory/agent/backend/internal/embed" // 伪嵌入生成
 	"github.com/blockmemory/agent/backend/pkg/enums" // 枚举常量
 	"github.com/blockmemory/agent/backend/pkg/types" // 领域模型 (Episode / Snapshot / KnowledgeRecord 等)
-	_ "github.com/lib/pq"                            // 注册 postgres 驱动,无需直接引用
+	"github.com/lib/pq"                            // postgres 驱动与错误码
 )
 
 // PostgresStore 是 PostgreSQL 存储层。
@@ -94,9 +95,41 @@ func (s *PostgresStore) SaveEpisode(ctx context.Context, agentID, topicID string
 	}
 	// 插入行,importance_score 单独冗余以便后续按重要性排序
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO agent_private_memory (agent_id, topic_id, episode, importance_score, created_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO agent_private_memory (agent_id, topic_id, episode, importance_score, step_count, created_at)
+		VALUES ($1, $2, $3, $4, 0, $5)
 	`, agentID, topicID, data, ep.Importance, ep.Timestamp)
+	return err
+}
+
+// SaveEpisodeWithStepCount 保存单条 Episode 到 agent_private_memory 表，使用 step_count 作为幂等键。
+// 若相同 (agent_id, topic_id, step_count) 已存在，则忽略冲突（ON CONFLICT DO NOTHING）。
+func (s *PostgresStore) SaveEpisodeWithStepCount(ctx context.Context, agentID, topicID string, stepCount int, ep *types.Episode) error {
+	data, err := json.Marshal(ep)
+	if err != nil {
+		return fmt.Errorf("marshal episode: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO agent_private_memory (agent_id, topic_id, episode, importance_score, step_count, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (agent_id, topic_id, step_count) DO NOTHING
+	`, agentID, topicID, data, ep.Importance, stepCount, ep.Timestamp)
+	return err
+}
+
+// IsDuplicateError 判断错误是否为 PostgreSQL 唯一约束冲突（23505）。
+func (s *PostgresStore) IsDuplicateError(err error) bool {
+	if pgErr, ok := err.(*pq.Error); ok {
+		return pgErr.Code == "23505"
+	}
+	return false
+}
+
+// SaveMemoryWriteFailure 将失败的记忆写入记录到死信表。
+func (s *PostgresStore) SaveMemoryWriteFailure(ctx context.Context, agentID, topicID string, stepCount int, action, rawContent, errMsg string, retryCount int) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO memory_write_failures (agent_id, topic_id, step_count, action, raw_content, error, retry_count, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+	`, agentID, topicID, stepCount, action, rawContent, errMsg, retryCount)
 	return err
 }
 
@@ -148,7 +181,7 @@ func (s *PostgresStore) GetEpisodes(ctx context.Context, agentID, topicID string
 //   - limit: 返回上限,<=0 时默认 100
 // 返回: 按重要性降序、再按创建时间倒序的 Episode 切片。
 // 设计意图: 压缩管道各阶段拉取对应层级的记忆做组装。
-func (s *PostgresStore) GetEpisodesByLevel(ctx context.Context, agentID, topicID string, level types.CompressionLevel, limit int) ([]*types.Episode, error) {
+func (s *PostgresStore) GetEpisodesByLevel(ctx context.Context, agentID, topicID string, level enums.CompressionLevel, limit int) ([]*types.Episode, error) {
 	if limit <= 0 {
 		// 兜底默认值
 		limit = 100
@@ -194,7 +227,7 @@ func (s *PostgresStore) CountEpisodes(ctx context.Context, agentID, topicID stri
 
 // CountEpisodesByLevel 按压缩层级分组计数。
 // 返回: map[level]count,用于观察当前压缩管道进度。
-func (s *PostgresStore) CountEpisodesByLevel(ctx context.Context, agentID, topicID string) (map[types.CompressionLevel]int, error) {
+func (s *PostgresStore) CountEpisodesByLevel(ctx context.Context, agentID, topicID string) (map[enums.CompressionLevel]int, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT compression_level, COUNT(*) FROM agent_private_memory
 		WHERE agent_id = $1 AND topic_id = $2
@@ -205,7 +238,7 @@ func (s *PostgresStore) CountEpisodesByLevel(ctx context.Context, agentID, topic
 	}
 	defer rows.Close()
 
-	result := make(map[types.CompressionLevel]int)
+	result := make(map[enums.CompressionLevel]int)
 	for rows.Next() {
 		var level int
 		var count int
@@ -214,7 +247,7 @@ func (s *PostgresStore) CountEpisodesByLevel(ctx context.Context, agentID, topic
 			continue
 		}
 		// 将 int 转回枚举类型作为 map key
-		result[types.CompressionLevel(level)] = count
+		result[enums.CompressionLevel(level)] = count
 	}
 	return result, rows.Err()
 }
@@ -366,6 +399,45 @@ func (s *PostgresStore) SearchKnowledge(ctx context.Context, embedding []float32
 	defer rows.Close()
 
 	return scanKnowledgeRows(rows)
+}
+
+// SearchKnowledgeByTypeAndDomain 按 knowledge_type 与 meta->>'domain' 双重过滤的向量相似搜索。
+// 职责：先按类型和领域精确过滤，再在过滤后的结果中按 pgvector 余弦距离排序取 topK，
+// 避免不同领域块记忆之间的串扰。
+//
+// 参数：
+//   - knowledgeType：必填过滤条件（如 KnowledgeTypeBlockMemory）
+//   - domain：meta->>'domain' 精确匹配值
+//   - embedding：查询向量
+//   - topK：返回上限
+func (s *PostgresStore) SearchKnowledgeByTypeAndDomain(ctx context.Context, knowledgeType enums.KnowledgeType, domain string, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+		FROM global_knowledge
+		WHERE archived = false AND knowledge_type = $1 AND meta->>'domain' = $2
+		ORDER BY embedding <=> $3
+		LIMIT $4
+	`, knowledgeType, domain, pgVector(embedding), topK)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanKnowledgeRows(rows)
+}
+
+// SearchBlockMemory 按 domain 过滤后再语义匹配检索块记忆。
+// 先通过 meta->>'domain' 做精确过滤，再在过滤后的结果中按向量相似度排序，
+// 避免不同领域块记忆之间的串扰。
+func (s *PostgresStore) SearchBlockMemory(ctx context.Context, domain, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	query := fmt.Sprintf("领域:%s\n目标:%s", domain, goal)
+	emb := embed.PseudoEmbed(query, s.EmbeddingDim())
+	return s.SearchKnowledgeByTypeAndDomain(ctx, enums.KnowledgeTypeBlockMemory, domain, emb, topK)
 }
 
 // SearchKnowledgeByType 按 knowledge_type 过滤的向量相似搜索（特性3使用）。
@@ -789,9 +861,15 @@ CREATE TABLE IF NOT EXISTS agent_private_memory (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE agent_private_memory ADD COLUMN IF NOT EXISTS step_count INT DEFAULT 0;
+
+-- 为已有数据分配唯一 step_count，避免创建唯一索引时冲突（P0-2 迁移兼容）
+UPDATE agent_private_memory SET step_count = id WHERE step_count = 0 OR step_count IS NULL;
+
 CREATE INDEX IF NOT EXISTS idx_apm_agent_topic ON agent_private_memory(agent_id, topic_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_apm_importance ON agent_private_memory(importance_score DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_apm_episode_gin ON agent_private_memory USING GIN (episode);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_private_memory_idempotent ON agent_private_memory(agent_id, topic_id, step_count);
 
 CREATE TABLE IF NOT EXISTS agent_snapshots (
     id BIGSERIAL PRIMARY KEY,
@@ -829,6 +907,7 @@ CREATE INDEX IF NOT EXISTS idx_gk_type ON global_knowledge(knowledge_type);
 CREATE INDEX IF NOT EXISTS idx_gk_topic ON global_knowledge(topic_id);
 CREATE INDEX IF NOT EXISTS idx_gk_access ON global_knowledge(last_accessed, access_count);
 CREATE INDEX IF NOT EXISTS idx_gk_archived ON global_knowledge(archived);
+CREATE INDEX IF NOT EXISTS idx_global_knowledge_domain ON global_knowledge USING btree ((meta->>'domain'));
 
 CREATE TABLE IF NOT EXISTS agent_registry (
     id VARCHAR(64) PRIMARY KEY,
@@ -860,6 +939,20 @@ CREATE TABLE IF NOT EXISTS topic_archives (
     embedding VECTOR(768),
     archived_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS memory_write_failures (
+    id SERIAL PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    topic_id TEXT NOT NULL,
+    step_count INT NOT NULL,
+    action TEXT,
+    raw_content TEXT,
+    error TEXT NOT NULL,
+    retry_count INT DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_memory_write_failures_unresolved ON memory_write_failures(created_at) WHERE resolved_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_gk_embedding ON global_knowledge
 USING ivfflat (embedding vector_cosine_ops)

@@ -12,12 +12,8 @@
 11.**Plan-and-Execute + Self-Reflection**（原待完成 #1）：新增 `plan.go`，DomainAgent 在多任务时调重量模型生成结构化 `ExecutionPlan`（步骤列表），按步骤顺序派发助手并支持断点续行（`PendingGoals`/`MarkDone`）。`CommonExecuteAssistantTask` 内置 `reflectOnResult`（轻量模型评估结果），不达标时带反馈重试一次（仅一次防死循环）。Feature flag：`agent.plan_enabled` / `agent.reflection_enabled`，默认关闭，按需开启。
 12.**前端会话复用修复**（原待完成 #3）：修正 `web/src/views/chat/index.vue` `handleSubmit`——追加消息的判定从仅 `status==='running'` 扩展到 `running/completed/error`（非 `awaiting_clarify` 即追加），后端 `POST /api/sessions/{id}/message` 已支持向已完成会话追加并 `resumeSession`；已完成会话续话时重新建立 SSE 流。新增 `localStorage.lastSessionID`，刷新页面后无 URL id 时优先恢复上次会话。**每条消息不再新开会话栏**。
 13.**块记忆持久化可靠性**（原待完成 #4）：(a) 异步归档失败日志从 `fmt.Printf` 改为结构化 `log.Printf`（含 sessionID/domain/error）；(b) `SessionBlock.archived`（atomic.Bool）标记异步归档是否成功，`switchToNextBlock` 在块切换前做**幂等兜底归档**（未确认成功则同步补写，短超时，失败仅日志不阻塞）；(c) 启动期 `ValidateEmbeddingDimension` 校验 `global_knowledge.embedding` 列维度与配置一致，不一致 `log.Fatalf`（避免维度不匹配导致 SaveKnowledge 静默失败、零落库）。
+14.**私有 Episode 记忆与快照主线接入**：(a) 修复 `session_events` 写入/读取 SQL 语法错误；(b) 新增 `EnsureInitialMemorySchema`，启动时自动创建 `agent_private_memory` / `agent_snapshots` / `topics` / `global_knowledge` 等 `001_init.sql` 表；(c) `main.go` 初始化 `WriteProcessor` / `CallbackHandler` / `ContextAssembler` / `Compressor` / `SnapshotManager`，并注入三层图；(d) `DomainAgent`/`SubDomainAgent` 生命周期调用记忆回调，加载/保存快照；(e) `AssistantNode` 调用 LLM 前通过 `ContextAssembler` 注入私有记忆与全局知识；(f) `MetaAgent` 的 `Watchdog` 触发压缩时调用 `Compressor`。
 
----
-
-## 待完成（按优先级分级）
-
-### P0 — 核心承诺修复，必须先做
 
 **P0-1. 块记忆检索领域过滤**（原待完成 #3，违背"话题隔离"核心承诺）
 - 现状：`SearchBlockMemory(ctx, query, topK)` 底层 `SearchKnowledgeByType` 仅按 `knowledge_type='block_memory'` 过滤，**无 domain 过滤**，存在跨领域串扰。
@@ -36,7 +32,6 @@
   - 队列满时降级同步写（阻塞主路径，保数据）
   - 幂等键 `(agentID, topicID, stepCount)` 唯一索引，重试不产生重复
 - 失败可见：结构化日志含 sessionID/agentID/step/action/error，超阈值告警。
-
 **P0-3. 大文件拆分 + 技术债清理**（其他改动的前置）
 - 现状：`meta_agent.go` 1545行、`domain_agent.go` 1218行、`subdomain_agent.go` 576行、`llm_tracker.go` 476行，违反 TODO#4 自定"80行内"规则。
 - 拆分目标：
@@ -49,6 +44,19 @@
   - 删 `assistant.go` 中 `callLLM`/`formatContextPack` 死代码
   - 删 `meta_agent.go` 中 `classifyComplexityLLM` 死代码
   - `go vet`/`gofmt` 零告警（gofmt 单独一次格式化提交）
+
+---
+
+## 待完成（按优先级分级）
+
+### P0 — 核心承诺修复，必须先做
+
+
+**P0-2. 回调写入优化**（数据可靠性根基）
+- 后期仍然需要回调写入队列+重试优化。
+
+**P0-3. 大文件拆分 + 技术债清理**（其他改动的前置）
+- 还有部分大文件，可后期优化
 
 ### P1 — 核心冗余修复 + 调试基础
 

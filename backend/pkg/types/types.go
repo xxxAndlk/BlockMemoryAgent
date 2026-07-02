@@ -62,38 +62,14 @@ type AgentOutput struct {
 	Validated bool `json:"validated"`
 }
 
-// EventType 工作区事件类型：刻画 Agent 间协作事件的语义分类。
-// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
-type EventType = enums.EventType
 
-const (
-	// EventCrossModify 跨 Agent 修改事件：某 Agent 改动了他人负责的领域数据。
-	EventCrossModify = enums.EventCrossModify
-	// EventDependencyMet 依赖满足事件：被等待的前置产物已就绪。
-	EventDependencyMet = enums.EventDependencyMet
-	// EventEscalation 升级事件：将问题/上下文上抛给 MetaAgent 裁决。
-	EventEscalation = enums.EventEscalation
-)
-
-// EventStatus 事件状态：事件在生命周期中的处理阶段。
-// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
-type EventStatus = enums.EventStatus
-
-const (
-	// EventPending 待处理：事件已入队但尚未被消费。
-	EventPending = enums.EventPending
-	// EventProcessing 处理中：目标 Agent 已接收但未完成。
-	EventProcessing = enums.EventProcessing
-	// EventDone 已完成：事件处理结束，可归档。
-	EventDone = enums.EventDone
-)
 
 // Event 工作区事件：跨 Agent 协作的原子语义消息，由 Mailbox 分发。
 type Event struct {
 	// ID 事件唯一标识。
 	ID string `json:"id"`
 	// Type 事件类型，决定消费方的处理分支。
-	Type EventType `json:"type"`
+	Type enums.EventType `json:"type"`
 	// SourceAgent 发起事件的 Agent ID。
 	SourceAgent string `json:"source_agent"`
 	// TargetAgent 目标 Agent ID；空表示广播。
@@ -105,7 +81,7 @@ type Event struct {
 	// CreatedAt 创建时间。
 	CreatedAt time.Time `json:"created_at"`
 	// Status 当前处理状态。
-	Status EventStatus `json:"status"`
+	Status enums.EventStatus `json:"status"`
 }
 
 // AgentSnapshot Agent 私有快照：Agent 在某 Topic 下的本地状态持久化。
@@ -159,22 +135,6 @@ type ChatMessage struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// ActionType Graph 控制信号：三层图状态机的下一步动作语义。
-// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
-type ActionType = enums.ActionType
-
-const (
-	// ActionContinue 继续：当前节点继续推进，不切换上下文。
-	ActionContinue = enums.ActionContinue
-	// ActionSwitch 切换：切换当前活跃 DomainAgent / SessionBlock。
-	ActionSwitch = enums.ActionSwitch
-	// ActionEscalate 升级：上抛给 MetaAgent 或 EscalationHandlerNode。
-	ActionEscalate = enums.ActionEscalate
-	// ActionFinish 完成：结束整个 Graph 循环，进入收尾。
-	ActionFinish = enums.ActionFinish
-	// ActionWait 等待：暂停 Graph 循环，等待外部输入（如人机对话答复）后由 server 侧恢复执行。
-	ActionWait = enums.ActionWait
-)
 
 // ClarifyRequest 人机对话请求：Agent 在执行中遇到需要用户确认的问题时挂起，
 // 由 server 层通过 HTTP 暴露给前端，用户答复后回填 Answer 并恢复 graph。
@@ -206,27 +166,13 @@ type GraphState struct {
 	// SnapshotRefs 各 Agent 的快照存储键。
 	SnapshotRefs map[string]string `json:"snapshot_refs"`
 	// NextAction 下一步控制信号。
-	NextAction ActionType `json:"next_action"`
+	NextAction enums.ActionType `json:"next_action"`
 	// TargetAgent Switch 动作的目标 Agent ID。
 	TargetAgent string `json:"target_agent"`
 	// Reason 本次动作的理由，供审计与调试。
 	Reason string `json:"reason"`
 }
 
-// CompressionLevel 记忆压缩层级：4 级递进压缩，权衡细节与 Token 成本。
-// 实际定义见 pkg/enums/enums.go，此处保留 type alias 以向后兼容。
-type CompressionLevel = enums.CompressionLevel
-
-const (
-	// LevelRaw 完整原始记录：保留 FullObservation 等全部字段。
-	LevelRaw = enums.LevelRaw
-	// LevelStandard 标准级：保留摘要 + Facts，丢弃 FullObservation。
-	LevelStandard = enums.LevelStandard
-	// LevelCompact 紧凑级：仅保留一句话 Summary。
-	LevelCompact = enums.LevelCompact
-	// LevelMarker 标记级：仅保留存在性标记，内容已不可读。
-	LevelMarker = enums.LevelMarker
-)
 
 // TokenBudget Token 预算分配：上下文 4 段式拼接的 Token 上限配置。
 // 见 memory/assembler.go 的 4 段装配（System/TopicGlobal/SharedState/PrivateMemory）。
@@ -369,11 +315,11 @@ type EventPayload struct {
 	// ID 事件 ID。
 	ID string `json:"id"`
 	// Type 事件类型。
-	Type EventType `json:"type"`
+	Type enums.EventType `json:"type"`
 	// Summary 事件摘要。
 	Summary string `json:"summary"`
 	// Status 事件状态。
-	Status EventStatus `json:"status"`
+	Status enums.EventStatus `json:"status"`
 	// Priority 优先级。
 	Priority int `json:"priority"`
 }

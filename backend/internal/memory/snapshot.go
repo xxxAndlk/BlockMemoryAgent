@@ -124,6 +124,50 @@ func (m *SnapshotManager) Save(ctx context.Context, snapshot *types.AgentSnapsho
 	return nil
 }
 
+// SaveSnapshotToPostgres 直接保存快照到 Postgres（用于回调队列重试路径）。
+func (m *SnapshotManager) SaveSnapshotToPostgres(ctx context.Context, snapshot *types.AgentSnapshot) error {
+	return m.pgStore.SaveSnapshot(ctx, snapshot)
+}
+
+// BuildSnapshotFromState 从状态构建快照（复用 SaveFromState 的构建逻辑）。
+func (m *SnapshotManager) BuildSnapshotFromState(agentID, topicID string, output *types.AgentOutput, episodes []*types.Episode) *types.AgentSnapshot {
+	const k = 5
+	summaries := make([]types.SummaryBlock, 0, k)
+	for i := len(episodes) - 1; i >= 0 && len(summaries) < k; i-- {
+		ep := episodes[i]
+		summaries = append(summaries, types.SummaryBlock{
+			StepID:    ep.StepID,
+			Content:   ep.ObservationSummary,
+			Timestamp: ep.Timestamp,
+		})
+	}
+
+	var openIssues []types.Issue
+	for _, ep := range episodes {
+		if ep.Importance > 0.7 && ep.Reflection == "" {
+			openIssues = append(openIssues, types.Issue{
+				ID:          ep.StepID,
+				Description: ep.ObservationSummary,
+				CreatedAt:   ep.Timestamp,
+			})
+		}
+	}
+
+	snapshot := &types.AgentSnapshot{
+		AgentID:      agentID,
+		TopicID:      topicID,
+		KeySummaries: summaries,
+		OpenIssues:   openIssues,
+		LocalVars:    make(map[string]any),
+		PublishedVer: output.Version,
+		UpdatedAt:    time.Now(),
+	}
+	if len(episodes) > 0 {
+		snapshot.LastStepID = episodes[len(episodes)-1].StepID
+	}
+	return snapshot
+}
+
 // SaveFromState 从 GraphState 派生并保存快照。
 // 提取最近 K 步 Episode 的摘要块与未决问题，组装为 AgentSnapshot 后调用 Save。
 //

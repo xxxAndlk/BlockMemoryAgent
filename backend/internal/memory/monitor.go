@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -196,12 +197,12 @@ func (a *AutoArbitrator) createEscalationEvent(topicID, reason string) *types.Ev
 	// 组装升级事件，ID 使用纳秒时间戳保证唯一性。
 	return &types.Event{
 		ID:          fmt.Sprintf("esc_%d", time.Now().UnixNano()), // 唯一 ID
-		Type:        types.EventEscalation,                        // 升级事件类型
+		Type:        enums.EventEscalation,                        // 升级事件类型
 		SourceAgent: "monitor",                                    // 来源标记为监控器
 		Payload:     map[string]any{"reason": reason, "topic_id": topicID}, // 携带原因与话题
 		Priority:    10,                                           // 高优先级，需 MetaAgent 优先处理
 		CreatedAt:   time.Now(),                                   // 创建时间
-		Status:      types.EventPending,                           // 初始状态为待处理
+		Status:      enums.EventPending,                           // 初始状态为待处理
 	}
 }
 

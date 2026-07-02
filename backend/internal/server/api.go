@@ -12,6 +12,7 @@ import (
 	"strings"       // 字符串处理
 	"time"          // 超时与时间戳
 
+	"github.com/blockmemory/agent/backend/internal/memory"      // BlockMemory 检索
 	"github.com/blockmemory/agent/backend/internal/model"      // ModelFactory
 	"github.com/blockmemory/agent/backend/internal/runtime"    // Runtime
 	"github.com/blockmemory/agent/backend/internal/store"      // Postgres / Redis
@@ -474,8 +475,9 @@ func (h *APIHandler) SnapshotHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// MemorySearchHandler POST /api/memory/search — 关键词检索 Agent 记忆
-// 职责：从 Postgres 拉取最近 200 条 Episode，按关键词评分排序，返回 top N。
+// MemorySearchHandler POST /api/memory/search — 检索 Agent 记忆
+// 职责：优先按 domain 做块记忆向量检索（P0-1 领域过滤）；未提供 domain 时回退到
+// Episode 关键词评分排序，返回 top N。
 // 参数：?limit=N - 默认 10。
 func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -485,6 +487,7 @@ func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		AgentID string `json:"agent_id"`
 		TopicID string `json:"topic_id"`
+		Domain  string `json:"domain"`
 		Query   string `json:"query"`
 		Limit   int    `json:"limit"`
 	}
@@ -498,25 +501,47 @@ func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request)
 
 	var results []map[string]any
 	if h.pgStore != nil {
-		eps, err := h.pgStore.GetEpisodes(r.Context(), req.AgentID, req.TopicID, 200) // 取最近 200 条
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		// 无 embedder，使用简单关键词评分
-		scored := scoreEpisodesByKeywords(eps, req.Query)
-		if len(scored) > req.Limit {
-			scored = scored[:req.Limit] // 截断到 limit
-		}
-		for _, s := range scored {
-			results = append(results, map[string]any{
-				"step_id":    s.Episode.StepID,
-				"summary":    s.Episode.ObservationSummary,
-				"action":     s.Episode.Action,
-				"importance": s.Episode.Importance,
-				"score":      s.Score,
-				"time":       s.Episode.Timestamp,
-			})
+		if req.Domain != "" {
+			// P0-1：按 domain 过滤的块记忆向量检索
+			recs, err := memory.SearchBlockMemory(r.Context(), h.pgStore, req.Domain, req.Query, req.Limit)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			for _, rec := range recs {
+				results = append(results, map[string]any{
+					"step_id":    "",
+					"summary":    rec.Summary,
+					"action":     "block_memory",
+					"importance": 0.0,
+					"score":      0.0,
+					"time":       rec.CreatedAt,
+					"domain":     rec.Domain,
+					"goal":       rec.Goal,
+				})
+			}
+		} else {
+			// 无 domain 时回退到 Episode 关键词评分
+			eps, err := h.pgStore.GetEpisodes(r.Context(), req.AgentID, req.TopicID, 200) // 取最近 200 条
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			// 无 embedder，使用简单关键词评分
+			scored := scoreEpisodesByKeywords(eps, req.Query)
+			if len(scored) > req.Limit {
+				scored = scored[:req.Limit] // 截断到 limit
+			}
+			for _, s := range scored {
+				results = append(results, map[string]any{
+					"step_id":    s.Episode.StepID,
+					"summary":    s.Episode.ObservationSummary,
+					"action":     s.Episode.Action,
+					"importance": s.Episode.Importance,
+					"score":      s.Score,
+					"time":       s.Episode.Timestamp,
+				})
+			}
 		}
 	}
 
@@ -524,6 +549,7 @@ func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(map[string]any{
 		"agent_id": req.AgentID,
 		"query":    req.Query,
+		"domain":   req.Domain,
 		"results":  results,
 	})
 }

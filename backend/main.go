@@ -119,7 +119,7 @@ func main() {
 	// 私有 Episode 记忆写入流水线
 	writeProcessor := memory.NewWriteProcessor(pgStore)
 	// 记忆回调处理器：在 DomainAgent/SubDomainAgent 生命周期上驱动 Episode 写入与快照保存
-	memoryCallbackHandler := memory.NewCallbackHandler(writeProcessor, snapshotMgr, nil)
+	memoryCallbackHandler := memory.NewCallbackHandler(writeProcessor, snapshotMgr, nil, pgStore)
 	// Episode 压缩器：Watchdog 触发压缩时调用
 	episodeCompressor := memory.NewCompressor(pgStore)
 	// 上下文组装器：为 Assistant 注入私有记忆 / 全局知识 / 快照
@@ -432,11 +432,10 @@ func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, d
 	return a.pg.SaveKnowledge(ctx, rec)
 }
 
-// SearchBlockMemory 按查询文本检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
-// 检索路径：query → 伪嵌入 → pgvector cosine 距离 ORDER BY → 取 topK → 拼成编号文本。
-func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, query string, topK int) (string, error) {
-	emb := embed.PseudoEmbed(query, a.dim)
-	recs, err := a.pg.SearchKnowledgeByType(ctx, enums.KnowledgeTypeBlockMemory, emb, topK)
+// SearchBlockMemory 按 domain 过滤后检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
+// 先通过 meta->>'domain' 精确过滤，再在过滤后的结果中按向量相似度排序，避免跨领域串扰。
+func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, domain, query string, topK int) (string, error) {
+	recs, err := memory.SearchBlockMemory(ctx, a.pg, domain, query, topK)
 	if err != nil {
 		return "", err
 	}
@@ -447,7 +446,7 @@ func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, query stri
 	// 编号拼接：[1] xxx\n[2] xxx\n ... 便于 LLM 在 prompt 中引用
 	var b strings.Builder
 	for i, r := range recs {
-		b.WriteString(fmt.Sprintf("[%d] %s\n", i+1, r.Content))
+		b.WriteString(fmt.Sprintf("[%d] %s\n", i+1, r.Summary))
 	}
 	return b.String(), nil
 }
@@ -513,6 +512,6 @@ func (n *sinkerNode) Name() string { return "Sinker" }
 // 返回: 更新后的状态与 nil 错误。
 // 副作用: 修改传入的 state。
 func (n *sinkerNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	state.NextAction = types.ActionFinish
+	state.NextAction = enums.ActionFinish
 	return state, nil
 }

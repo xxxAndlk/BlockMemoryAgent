@@ -55,8 +55,8 @@ type AgentSnapshotManager interface {
 type BlockMemoryStore interface {
 	// SaveBlockMemory 归档一条 domainAgent 完成的块记忆。
 	SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string) error
-	// SearchBlockMemory 按查询文本检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
-	SearchBlockMemory(ctx context.Context, query string, topK int) (string, error)
+	// SearchBlockMemory 按 domain 过滤后检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
+	SearchBlockMemory(ctx context.Context, domain, query string, topK int) (string, error)
 }
 
 // DomainArchiveRecord domainAgent 归档记录（特性4）。

@@ -11,6 +11,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/skill"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -98,6 +99,6 @@ type fakeSinker struct{}
 
 func (n *fakeSinker) Name() string { return "Sinker" }
 func (n *fakeSinker) Invoke(ctx context.Context, s *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	s.NextAction = types.ActionFinish
+	s.NextAction = enums.ActionFinish
 	return s, nil
 }
