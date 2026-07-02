@@ -12,6 +12,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/internal/store"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -48,6 +49,10 @@ type Model struct {
 	// agents tree (built every tick)
 	agentsNodes []agentTreeNode
 
+	// v2.0 面板开关
+	agentPanelVisible bool
+	planBarVisible    bool
+
 	// input bar
 	inputMode    int
 	inputRunes   []rune
@@ -80,8 +85,8 @@ type agentTreeNode struct {
 	instID    string
 	name      string
 	domain    string
-	roleType  types.RoleType
-	status    types.RoleStatus
+	roleType  enums.RoleType
+	status    enums.RoleStatus
 	goal      string
 	isClarify bool
 }
@@ -97,19 +102,20 @@ func NewModel(
 	modelName string,
 ) *Model {
 	m := &Model{
-		sessionMgr:       sessionMgr,
-		registry:         registry,
-		rt:               rt,
-		dagHandler:       dagHandler,
-		pgStore:          pgStore,
-		httpAddr:         httpAddr,
-		modelName:        modelName,
-		styles:           NewStyles(),
-		focus:            panelChat,
-		chatFollowBottom: true,
-		inputHistIdx:     -1,
-		inputHistory:     make(map[string][]string),
-		flashMu:          &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
+		sessionMgr:        sessionMgr,
+		registry:          registry,
+		rt:                rt,
+		dagHandler:        dagHandler,
+		pgStore:           pgStore,
+		httpAddr:          httpAddr,
+		modelName:         modelName,
+		styles:            NewStyles(),
+		focus:             panelChat,
+		chatFollowBottom:  true,
+		planBarVisible:    true,
+		inputHistIdx:      -1,
+		inputHistory:      make(map[string][]string),
+		flashMu:           &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
 	}
 	m.refreshSessions()
 	if len(m.sessions) > 0 {
@@ -128,7 +134,8 @@ func (m Model) Init() tea.Cmd {
 }
 
 func tickCmd() tea.Cmd {
-	return tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg{} })
+	// v2.0：100ms 快速 tick 保证对话区流畅；Agent 面板/顶栏等耗时操作每 10 tick（1s）刷新一次。
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg{} })
 }
 
 type tickMsg struct{}
@@ -177,22 +184,22 @@ func (m *Model) rebuildAgents() {
 		return
 	}
 
-	metaStatus := types.RoleStatusIdle
+	metaStatus := enums.RoleStatusIdle
 	switch s.Status {
 	case "running":
-		metaStatus = types.RoleStatusActive
+		metaStatus = enums.RoleStatusActive
 	case "completed":
-		metaStatus = types.RoleStatusDone
+		metaStatus = enums.RoleStatusDone
 	case "error":
-		metaStatus = types.RoleStatusError
+		metaStatus = enums.RoleStatusError
 	case "awaiting_clarify":
-		metaStatus = types.RoleStatusWaiting
+		metaStatus = enums.RoleStatusWaiting
 	}
 	m.agentsNodes = append(m.agentsNodes, agentTreeNode{
 		depth:    0,
 		instID:   "MetaAgent",
 		name:     "MetaAgent",
-		roleType: types.RoleTypeMeta,
+		roleType: enums.RoleTypeMeta,
 		status:   metaStatus,
 	})
 
@@ -202,7 +209,7 @@ func (m *Model) rebuildAgents() {
 		byID[inst.ID] = inst
 	}
 	for _, inst := range insts {
-		if inst.Type != types.RoleTypeDomain {
+		if inst.Type != enums.RoleTypeDomain {
 			continue
 		}
 		goal := ""
@@ -229,7 +236,7 @@ func (m *Model) rebuildAgents() {
 				continue
 			}
 			depth := 2
-			if child.Type == types.RoleTypeSubDomain {
+			if child.Type == enums.RoleTypeSubDomain {
 				m.agentsNodes = append(m.agentsNodes, agentTreeNode{
 					depth:    depth,
 					instID:   child.ID,
@@ -252,7 +259,7 @@ func (m *Model) rebuildAgents() {
 						status:   sub.Status,
 					})
 				}
-			} else if child.Type == types.RoleTypeFixed || child.Type == types.RoleTypeDynamic {
+			} else if child.Type == enums.RoleTypeFixed || child.Type == enums.RoleTypeDynamic {
 				m.agentsNodes = append(m.agentsNodes, agentTreeNode{
 					depth:    depth,
 					instID:   child.ID,
@@ -270,8 +277,8 @@ func (m *Model) rebuildAgents() {
 			depth:     1,
 			instID:    "clarify",
 			name:      "Clarify pending",
-			roleType:  types.RoleTypeMeta,
-			status:    types.RoleStatusWaiting,
+			roleType:  enums.RoleTypeMeta,
+			status:    enums.RoleStatusWaiting,
 			isClarify: true,
 		})
 	}
@@ -281,7 +288,7 @@ func instName(r *graph.RoleRegistry, inst *types.RoleInstance) string {
 	if inst == nil {
 		return "unknown"
 	}
-	if inst.Type == types.RoleTypeDomain || inst.Type == types.RoleTypeSubDomain {
+	if inst.Type == enums.RoleTypeDomain || inst.Type == enums.RoleTypeSubDomain {
 		if inst.Domain != "" {
 			return inst.Domain
 		}
@@ -311,11 +318,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.tickCount++
-		if m.tickCount%25 == 0 {
+		// 每 5 tick（0.5s）刷新会话列表；每 10 tick（1s）刷新 Agent 面板与 Token 统计。
+		if m.tickCount%5 == 0 {
 			m.refreshSessions()
 		}
-		m.rebuildAgents()
-		m.accumulateTokens()
+		if m.tickCount%10 == 0 {
+			m.rebuildAgents()
+			m.accumulateTokens()
+		}
 		// Auto-scroll to bottom when following.
 		// 清理过期闪屏提示（持锁，T2 修复）
 		m.flashMu.Lock()
@@ -439,7 +449,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Chat navigation mode.
 	switch msg.String() {
-	case "ctrl+c":
+	case "ctrl+c", "q", "Q":
 		return m, tea.Quit
 	case "1":
 		// already on chat
@@ -462,13 +472,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.moveChatCursor(1)
 	case "k", "up":
 		m.moveChatCursor(-1)
+	case "pgup":
+		m.scrollChat(-5)
+	case "pgdown":
+		m.scrollChat(5)
 	case "g":
 		m.moveChatCursor(-99999)
 	case "G":
 		m.moveChatCursor(99999)
 	case "tab":
-		m.focus = panelInput
-		m.inputMode = inputNormal
+		m.agentPanelVisible = !m.agentPanelVisible
 	default:
 		// Any printable rune jumps to input mode and seeds the buffer.
 		if len(msg.Runes) > 0 && unicode.IsPrint(msg.Runes[0]) {
@@ -479,6 +492,37 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// scrollChat 按行数滚动对话区（PgUp/PgDn 用）。
+func (m *Model) scrollChat(delta int) {
+	s := m.selectedSession()
+	if s == nil {
+		return
+	}
+	items := chatItems(s)
+	totalLines := 0
+	for _, item := range items {
+		totalLines += 1 + len(displayDetailLines(item.title, item.detail))
+	}
+	viewportH := m.height - 8
+	if viewportH < 1 {
+		viewportH = 1
+	}
+	m.chatScrollLine += delta
+	maxScroll := totalLines - viewportH
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.chatScrollLine < 0 {
+		m.chatScrollLine = 0
+	}
+	if m.chatScrollLine > maxScroll {
+		m.chatScrollLine = maxScroll
+		m.chatFollowBottom = true
+	} else {
+		m.chatFollowBottom = false
+	}
 }
 
 func (m *Model) moveChatCursor(delta int) {

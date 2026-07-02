@@ -7,6 +7,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -44,7 +45,7 @@ func CommonMatchFixedAssistant(registry *RoleRegistry, task string) *types.RoleD
 	// 遍历所有助手角色定义
 	for _, def := range registry.GetAssistantRoleDefs() {
 		// 只考虑固定角色（动态角色不参与匹配）
-		if def.Type != types.RoleTypeFixed {
+		if def.Type != enums.RoleTypeFixed {
 			continue
 		}
 		score := 0

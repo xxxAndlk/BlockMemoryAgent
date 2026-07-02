@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
@@ -38,6 +39,7 @@ type SubDomainAgentNode struct {
 	memCallback  MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
 	snapshotMgr  AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
 	logger       *logger.Logger        // 结构化日志器（P1-2）
+	stepCounter  atomic.Int64          // 单调步骤计数器，作为 Episode/Snapshot 幂等键
 }
 
 // SetRuntime 注入 Runtime。nil 时动态参数回退默认值。
@@ -164,7 +166,7 @@ func (n *SubDomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayer
 		return nil, fmt.Errorf("subdomain agent instance %s not found", n.instID)
 	}
 
-	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusActive)
+	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusActive)
 
 	if n.memCallback != nil {
 		n.memCallback.OnStart(ctx, n.instID, state.SessionID)
@@ -208,12 +210,12 @@ func (n *SubDomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayer
 
 	state.PopCallStack()
 	n.summarizeResults(state)
-	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusDone)
+	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone)
 
 	state.NextAction = enums.ActionSwitch
 	if inst.ParentID != "" {
 		state.TargetRoleID = inst.ParentID
-		n.registry.UpdateInstanceStatus(inst.ParentID, types.RoleStatusActive)
+		n.registry.UpdateInstanceStatus(inst.ParentID, enums.RoleStatusActive)
 	} else {
 		state.TargetRoleID = "MetaAgent"
 	}
@@ -225,6 +227,7 @@ func (n *SubDomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayer
 // finish 在 SubDomainAgent 成功结束前触发记忆回调。
 func (n *SubDomainAgentNode) finish(ctx context.Context, state *types.ThreeLayerState) {
 	if n.memCallback != nil {
-		n.memCallback.OnEnd(ctx, n.instID, state.SessionID, "SubDomainAgent完成", state.Reason, 0)
+		stepCount := int(n.stepCounter.Add(1))
+		n.memCallback.OnEnd(ctx, n.instID, state.SessionID, "SubDomainAgent完成", state.Reason, stepCount)
 	}
 }

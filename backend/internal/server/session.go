@@ -1394,6 +1394,102 @@ func (m *SessionManager) HandleSessionCancel(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "error"})
 }
 
+// ClearSessionChat 清空会话的对话历史（保留最初的 system/user 消息），不删除记忆。
+// 供 TUI /clear 命令使用。返回是否成功清空。
+func (m *SessionManager) ClearSessionChat(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.sessions[id]
+	if !ok {
+		return false
+	}
+	// 保留最初的 goal 上下文（system + user 第一条消息）
+	keep := make([]types.ChatMessage, 0, 2)
+	for _, msg := range session.Messages {
+		if msg.Role == enums.ChatRoleSystem || msg.Role == enums.ChatRoleUser {
+			keep = append(keep, msg)
+			if len(keep) >= 2 {
+				break
+			}
+		}
+	}
+	session.Messages = keep
+	session.Events = make([]SessionEvent, 0)
+	return true
+}
+
+// HandleSessionTopic 处理 POST /api/sessions/{id}/topic，切换或创建话题（SessionBlock）。
+// 运行中会话：通过命令队列触发 MetaAgent 以新话题重新启动；非运行中会话：创建新会话。
+func (m *SessionManager) HandleSessionTopic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/topic")
+	if id == "" {
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+		Goal string `json:"goal,omitempty"`
+	}
+	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+		http.Error(w, "请求体无效", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, "话题名称 (name) 不能为空", http.StatusBadRequest)
+		return
+	}
+	goal := req.Goal
+	if goal == "" {
+		goal = req.Name
+	}
+
+	m.mu.Lock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		http.Error(w, "会话不存在", http.StatusNotFound)
+		return
+	}
+
+	wasRunning := session.Status == enums.SessionStatusRunning
+	oldDomain := ""
+	if session.State != nil {
+		oldDomain = session.State.CurrentDomain
+	}
+	// 记录话题切换事件
+	session.Events = append(session.Events, SessionEvent{
+		Type:      "progress",
+		Agent:     "User",
+		Message:   fmt.Sprintf("切换话题: 从 [%s] 到 [%s]", oldDomain, req.Name),
+		Kind:      "topic_switch",
+		Success:   true,
+		Timestamp: time.Now(),
+	})
+	m.mu.Unlock()
+
+	if wasRunning {
+		rt := m.graph.Runtime()
+		if rt != nil && rt.CmdQueue != nil {
+			rt.CmdQueue.Push(id, cmdqueue.Item{Content: goal, Intent: cmdqueue.IntentInterrupt})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running", "topic": req.Name})
+		return
+	}
+
+	// 非运行中：创建新会话继续该话题
+	newSession := m.CreateSession(r.Context(), goal)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(newSession)
+}
+
 // HandleSessionMessage 处理 POST /api/sessions/{id}/message，向会话追加用户消息。
 // 向会话追加用户消息；若会话已结束则恢复执行。
 // 副作用：修改 session.Messages / Status / EndedAt；可能异步启动 resumeSession。

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/config"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -46,6 +47,7 @@ type RoleRegistry struct {
 // NewRoleRegistry 创建角色注册表。
 // 参数：
 //   - cfg：从 roles.yaml 解析出的角色配置，含 fixed_roles[] / dynamic_templates。
+//
 // 返回：已加载所有固定角色定义的注册表；动态角色按需 RegisterDynamicRole。
 func NewRoleRegistry(cfg *config.RoleConfigFile) *RoleRegistry {
 	r := &RoleRegistry{
@@ -67,6 +69,7 @@ func NewRoleRegistry(cfg *config.RoleConfigFile) *RoleRegistry {
 // GetRoleDef 获取角色定义（先查固定，再查动态）。
 // 参数：
 //   - roleDefID：角色定义 ID。
+//
 // 返回：定义指针；不存在返回 nil。
 // 并发安全：持读锁。
 func (r *RoleRegistry) GetRoleDef(roleDefID string) *types.RoleDefinition {
@@ -106,13 +109,13 @@ func (r *RoleRegistry) GetAssistantRoleDefs() []*types.RoleDefinition {
 	var result []*types.RoleDefinition
 	// 固定助手
 	for _, def := range r.fixedDefs {
-		if def.Type == types.RoleTypeFixed {
+		if def.Type == enums.RoleTypeFixed {
 			result = append(result, def)
 		}
 	}
 	// 动态助手
 	for _, def := range r.dynamicDefs {
-		if def.Type == types.RoleTypeDynamic {
+		if def.Type == enums.RoleTypeDynamic {
 			result = append(result, def)
 		}
 	}
@@ -141,6 +144,7 @@ func (r *RoleRegistry) RegisterDynamicRole(def *types.RoleDefinition) error {
 //   - sessionID：所属会话 ID。
 //   - domain：领域名（仅 Domain/SubDomain 实例填，Assistant 留空）。
 //   - parentID：父实例 ID（DomainAgent 的 parent 是 MetaAgent，Assistant 的 parent 是 DomainAgent）。
+//
 // 返回：新实例指针；定义不存在返回 error。
 // 副作用：写入 instances 表；若 parentID 非空则追加到父实例的 Children 切片。
 // 并发安全：持写锁（整个创建过程原子）。
@@ -167,7 +171,7 @@ func (r *RoleRegistry) CreateInstance(roleDefID, sessionID string, domain string
 		Lifecycle: def.Lifecycle, // 生命周期继承自定义
 		SessionID: sessionID,
 		Domain:    domain,
-		Status:    types.RoleStatusIdle, // 初始空闲
+		Status:    enums.RoleStatusIdle, // 初始空闲
 		CreatedAt: time.Now(),
 		ParentID:  parentID,
 		Children:  make([]string, 0),
@@ -175,10 +179,10 @@ func (r *RoleRegistry) CreateInstance(roleDefID, sessionID string, domain string
 
 	// 设置过期时间：按生命周期策略
 	// session 级 24h、task 级 1h，过期后由 CleanupExpired 清理
-	if def.Lifecycle == types.RoleLifecycleSession {
+	if def.Lifecycle == enums.RoleLifecycleSession {
 		t := inst.CreatedAt.Add(24 * time.Hour)
 		inst.ExpiresAt = &t
-	} else if def.Lifecycle == types.RoleLifecycleTask {
+	} else if def.Lifecycle == enums.RoleLifecycleTask {
 		t := inst.CreatedAt.Add(1 * time.Hour)
 		inst.ExpiresAt = &t
 	}
@@ -225,7 +229,7 @@ func (r *RoleRegistry) GetInstancesBySession(sessionID string) []*types.RoleInst
 // UpdateInstanceStatus 更新实例状态。
 // 用途：节点开始执行时置 Active，结束后回 Idle。
 // 并发安全：持写锁（虽然只改一个字段，但保持一致性）。
-func (r *RoleRegistry) UpdateInstanceStatus(instID string, status types.RoleStatus) {
+func (r *RoleRegistry) UpdateInstanceStatus(instID string, status enums.RoleStatus) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if inst, ok := r.instances[instID]; ok {
@@ -266,7 +270,9 @@ func (r *RoleRegistry) CleanupExpired() int {
 // MatchRoleByGoal 根据目标匹配角色定义。
 // 算法：对每个候选 Definition 计算 matchScore，取最高分。
 // 用途：MetaAgent 拿到用户 goal 后，先尝试匹配已有固定/动态角色，命中则复用，
-//   避免每次都让 LLM 重新造角色。
+//
+//	避免每次都让 LLM 重新造角色。
+//
 // 参数：goal 用户原始目标文本。
 // 返回：最佳匹配 Definition；无任何命中返回 nil。
 // 并发安全：持读锁。
@@ -301,9 +307,11 @@ func (r *RoleRegistry) MatchRoleByGoal(goal string) *types.RoleDefinition {
 //   - Domain/SubDomain → 可调用任何 Assistant（fixed/dynamic/subdomain）。
 //   - Meta → 可调用 Domain/SubDomain。
 //   - 固定角色 → 委托给配置层 cfg.CanCall 查 Parents 关系。
+//
 // 参数：
 //   - callerInstID：调用方实例 ID。
 //   - calleeDefID：被调用方角色定义 ID。
+//
 // 返回：允许 true / 拒绝 false。
 // 并发安全：依赖 GetInstance / GetRoleDef（均持读锁）。
 func (r *RoleRegistry) CanCall(callerInstID, calleeDefID string) bool {
@@ -316,12 +324,12 @@ func (r *RoleRegistry) CanCall(callerInstID, calleeDefID string) bool {
 		return false // 被调用方定义不存在 → 拒绝
 	}
 	// DomainAgent/SubDomainAgent可以调用任何助手
-	if caller.Type == types.RoleTypeDomain || caller.Type == types.RoleTypeSubDomain {
-		return callee.Type == types.RoleTypeFixed || callee.Type == types.RoleTypeDynamic || callee.Type == types.RoleTypeSubDomain
+	if caller.Type == enums.RoleTypeDomain || caller.Type == enums.RoleTypeSubDomain {
+		return callee.Type == enums.RoleTypeFixed || callee.Type == enums.RoleTypeDynamic || callee.Type == enums.RoleTypeSubDomain
 	}
 	// MetaAgent可以调用DomainAgent/SubDomainAgent
-	if caller.Type == types.RoleTypeMeta {
-		return callee.Type == types.RoleTypeDomain || callee.Type == types.RoleTypeSubDomain
+	if caller.Type == enums.RoleTypeMeta {
+		return callee.Type == enums.RoleTypeDomain || callee.Type == enums.RoleTypeSubDomain
 	}
 	// 固定角色：委托给配置检查Parents等
 	return r.cfg.CanCall(caller.RoleDefID, calleeDefID)
@@ -332,6 +340,7 @@ func (r *RoleRegistry) CanCall(callerInstID, calleeDefID string) bool {
 //   - 关键词命中：+10/个（关键词列表是路由的主要信号）。
 //   - 描述包含目标：+5（弱信号）。
 //   - 目标包含角色名：+8（中信号）。
+//
 // 返回：累计分数；0 表示无任何命中。
 func matchScore(def *types.RoleDefinition, goalLower string) int {
 	score := 0

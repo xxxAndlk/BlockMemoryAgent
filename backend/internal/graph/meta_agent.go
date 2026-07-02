@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/logger"
@@ -173,6 +174,15 @@ func (n *MetaAgentNode) emitDetail(ctx context.Context, kind, message, detail st
 	}
 	// 推送带 detail 的事件
 	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: "MetaAgent", Message: message, Detail: detail})
+}
+
+// emitTopicSwitch 推送话题切换事件，供 TUI 显示分隔线提示。
+func (n *MetaAgentNode) emitTopicSwitch(ctx context.Context, from, to string) {
+	if from == "" {
+		n.emit(ctx, "topic_switch", fmt.Sprintf("切换话题: 到 [%s]", to))
+	} else {
+		n.emit(ctx, "topic_switch", fmt.Sprintf("切换话题: 从 [%s] 到 [%s]", from, to))
+	}
 }
 
 // Runtime 暴露运行时。

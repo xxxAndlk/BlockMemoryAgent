@@ -171,8 +171,9 @@ func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *t
 
 	// 切换到第一个块（map 迭代顺序不固定，但只取一个）
 	for blockID := range state.ActiveBlocks {
+		block := state.ActiveBlocks[blockID] // 取块引用
+		n.emitTopicSwitch(ctx, "", block.Domain)
 		state.CurrentBlockID = blockID        // 设为当前块
-		block := state.ActiveBlocks[blockID]  // 取块引用
 		state.CurrentDomain = block.Domain    // 更新当前领域
 		state.DomainGoal = block.Goal         // 更新领域目标
 		state.NextAction = enums.ActionSwitch // 切换到 DomainAgent
@@ -296,6 +297,8 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 	}
 
 	// 切换到目标块
+	prevDomain := state.CurrentDomain
+	n.emitTopicSwitch(ctx, prevDomain, targetBlock.Domain)
 	state.CurrentBlockID = targetBlock.ID      // 设为当前块
 	state.CurrentDomain = targetBlock.Domain   // 更新当前领域
 	state.DomainGoal = targetBlock.Goal        // 更新领域目标
@@ -310,7 +313,9 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 // 返回：更新后的 state；无活跃块时调 finalizeSession 生成最终回答。
 func (n *MetaAgentNode) switchToNextBlock(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	// 1. 收尾当前块
+	prevDomain := ""
 	if state.CurrentBlockID != "" {
+		prevDomain = state.CurrentDomain
 		// 汇总当前block的结果到SessionSummary
 		block := state.ActiveBlocks[state.CurrentBlockID]
 		if block != nil {
@@ -325,6 +330,7 @@ func (n *MetaAgentNode) switchToNextBlock(ctx context.Context, state *types.Thre
 
 	// 2. 切换到下一个活跃块
 	for blockID, block := range state.ActiveBlocks {
+		n.emitTopicSwitch(ctx, prevDomain, block.Domain)
 		state.CurrentBlockID = blockID        // 设为当前块
 		state.CurrentDomain = block.Domain    // 更新当前领域
 		state.DomainGoal = block.Goal         // 更新领域目标

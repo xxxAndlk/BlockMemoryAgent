@@ -26,6 +26,12 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEnter:
+		// Shift+Enter 插入换行；普通 Enter 提交。
+		if msg.Shift {
+			m.inputRunes = append(m.inputRunes[:m.inputCursor], append([]rune{'\n'}, m.inputRunes[m.inputCursor:]...)...)
+			m.inputCursor++
+			return m, nil
+		}
 		cmd := string(m.inputRunes)
 		if strings.TrimSpace(cmd) != "" {
 			m.pushHistory(cmd)
@@ -37,6 +43,10 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputMode = inputNormal
 		// Keep focus in input so the user can immediately type the next message.
 		m.focus = panelInput
+		return m, nil
+
+	case tea.KeyTab:
+		m.agentPanelVisible = !m.agentPanelVisible
 		return m, nil
 
 	case tea.KeyUp:
@@ -126,6 +136,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 //   - "/dag trigger <id>"   立即触发 DAG
 //   - "/dag new <json>"     创建 DAG（JSON 内联）
 //   - 其他                  作为普通消息追加到当前会话
+//
 // 未选中会话时，纯文本输入自动作为新会话的 goal。
 func (m *Model) submitInput(cmd string) {
 	cmd = strings.TrimSpace(cmd)

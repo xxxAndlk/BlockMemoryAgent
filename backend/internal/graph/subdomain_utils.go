@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -29,7 +30,7 @@ import (
 func (n *SubDomainAgentNode) createAssistantForTask(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, task string) (*types.RoleInstance, *types.RoleDefinition) {
 	assistantInst, assistantDef := CommonCreateAssistantForTask(ctx, n.registry, n.factory, n.instID, inst, state, task)
 	// 动态创建成功时推送 Agent 创建调试事件，便于 UI 观察动态角色生成
-	if assistantInst != nil && assistantDef != nil && assistantDef.Type == types.RoleTypeDynamic {
+	if assistantInst != nil && assistantDef != nil && assistantDef.Type == enums.RoleTypeDynamic {
 		n.emitDetail(ctx, "agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),
 			fmt.Sprintf("instID=%s roleDefID=%s parentID=%s", assistantInst.ID, assistantInst.RoleDefID, n.instID))
 	}
@@ -50,7 +51,7 @@ func (n *SubDomainAgentNode) createAssistantForTask(ctx context.Context, state *
 // 返回：结果文本；失败则返回 [ERROR] 前缀的描述。
 func (n *SubDomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, def *types.RoleDefinition, task string) string {
 	// 标记助手活跃
-	n.registry.UpdateInstanceStatus(inst.ID, types.RoleStatusActive)
+	n.registry.UpdateInstanceStatus(inst.ID, enums.RoleStatusActive)
 
 	var result string // 任务结果
 	var err error     // 执行错误
@@ -73,7 +74,7 @@ func (n *SubDomainAgentNode) runAssistant(ctx context.Context, state *types.Thre
 	})
 
 	// 标记助手完成
-	n.registry.UpdateInstanceStatus(inst.ID, types.RoleStatusDone)
+	n.registry.UpdateInstanceStatus(inst.ID, enums.RoleStatusDone)
 
 	// 失败则返回错误信息
 	if err != nil {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/pkg/config"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -49,6 +50,7 @@ func NewRoleFactory(registry *RoleRegistry, modelFactory *model.ModelFactory, cf
 //   - domain：领域名（如 "DBA" / "AIOps"）。
 //   - goal：领域目标，喂给 LLM 生成 system_prompt。
 //   - parentID：父实例 ID（通常是 MetaAgent 实例）。
+//
 // 返回：DomainAgent 实例；LLM 失败会回退模板，不会返回错误。
 // 副作用：注册新的动态角色定义 + 创建实例。
 func (f *RoleFactory) CreateDomainAgent(ctx context.Context, sessionID, domain, goal string, parentID string) (*types.RoleInstance, error) {
@@ -88,6 +90,7 @@ func (f *RoleFactory) CreateDomainAgent(ctx context.Context, sessionID, domain, 
 //   - taskDesc：任务描述，喂给 LLM 生成专注于此任务的 system_prompt。
 //   - parentID：父实例 ID（通常是 DomainAgent 实例）。
 //   - parentDefID：父角色定义 ID，写入 Parents 字段建立调用关系。
+//
 // 返回：Assistant 实例。
 // 副作用：注册动态角色定义 + 创建实例（task 生命周期）。
 func (f *RoleFactory) CreateAssistant(ctx context.Context, sessionID, taskDesc string, parentID string, parentDefID string) (*types.RoleInstance, error) {
@@ -118,15 +121,17 @@ func (f *RoleFactory) CreateAssistant(ctx context.Context, sessionID, taskDesc s
 //  1. 构造空 Definition（ID/Type/Lifecycle/CanBeCalled 已定）。
 //  2. 无 modelFactory → 直接走模板。
 //  3. 有 modelFactory → 调 LLM，解析 JSON；解析失败再回退模板。
+//
 // 参数：
 //   - domain：领域名。
 //   - goal：领域目标。
+//
 // 返回：填充好的 Definition；不会因 LLM 失败而返回 error（总是回退模板）。
 func (f *RoleFactory) generateDomainRoleDef(ctx context.Context, domain, goal string) (*types.RoleDefinition, error) {
 	roleDef := &types.RoleDefinition{
 		ID:          fmt.Sprintf("domain_%s_%d", sanitizeID(domain), f.seq.Add(1)),
-		Type:        types.RoleTypeDomain,
-		Lifecycle:   types.RoleLifecycleSession, // 会话级
+		Type:        enums.RoleTypeDomain,
+		Lifecycle:   enums.RoleLifecycleSession, // 会话级
 		CanBeCalled: false,                      // DomainAgent 不被直接调用，由 MetaAgent 路由
 	}
 
@@ -177,8 +182,8 @@ func (f *RoleFactory) generateDomainRoleDef(ctx context.Context, domain, goal st
 		// 确保关键字段正确
 		// 即使 LLM 改了 type/lifecycle/can_be_called，也要强制覆盖回 Domain 约束
 		roleDef.ID = fmt.Sprintf("domain_%s_%d", sanitizeID(domain), f.seq.Add(1))
-		roleDef.Type = types.RoleTypeDomain
-		roleDef.Lifecycle = types.RoleLifecycleSession
+		roleDef.Type = enums.RoleTypeDomain
+		roleDef.Lifecycle = enums.RoleLifecycleSession
 		roleDef.CanBeCalled = false
 	}
 
@@ -205,8 +210,8 @@ func (f *RoleFactory) fillDomainTemplate(roleDef *types.RoleDefinition, domain, 
 func (f *RoleFactory) generateAssistantRoleDef(ctx context.Context, taskDesc, parentDefID string) (*types.RoleDefinition, error) {
 	roleDef := &types.RoleDefinition{
 		ID:          fmt.Sprintf("assistant_%d", f.seq.Add(1)),
-		Type:        types.RoleTypeDynamic,
-		Lifecycle:   types.RoleLifecycleTask, // 任务级，1h 过期
+		Type:        enums.RoleTypeDynamic,
+		Lifecycle:   enums.RoleLifecycleTask, // 任务级，1h 过期
 		CanBeCalled: true,                    // 助手可被父 DomainAgent 调用
 		Parents:     []string{parentDefID},   // 建立调用关系
 	}
@@ -250,8 +255,8 @@ func (f *RoleFactory) generateAssistantRoleDef(ctx context.Context, taskDesc, pa
 	} else {
 		// 强制覆盖关键字段，防止 LLM 篡改
 		roleDef.ID = fmt.Sprintf("assistant_%d", f.seq.Add(1))
-		roleDef.Type = types.RoleTypeDynamic
-		roleDef.Lifecycle = types.RoleLifecycleTask
+		roleDef.Type = enums.RoleTypeDynamic
+		roleDef.Lifecycle = enums.RoleLifecycleTask
 		roleDef.CanBeCalled = true
 		roleDef.Parents = []string{parentDefID}
 	}
@@ -276,14 +281,15 @@ func (f *RoleFactory) fillAssistantTemplate(roleDef *types.RoleDefinition, taskD
 //   - subDomain：子领域名。
 //   - goal：子领域目标。
 //   - parentDomainID：父 DomainAgent 的 Definition ID，写入 Parents。
+//
 // 返回：SubDomainAgent 实例。
 // 副作用：注册动态角色定义 + 创建实例（session 生命周期）。
 func (f *RoleFactory) CreateSubDomainAgent(ctx context.Context, sessionID, subDomain, goal string, parentDomainID string) (*types.RoleInstance, error) {
 	roleDef := &types.RoleDefinition{
 		ID:           fmt.Sprintf("subdomain_%s_%d", sanitizeID(subDomain), f.seq.Add(1)),
 		Name:         subDomain + "子领域负责人",
-		Type:         types.RoleTypeSubDomain,
-		Lifecycle:    types.RoleLifecycleSession,
+		Type:         enums.RoleTypeSubDomain,
+		Lifecycle:    enums.RoleLifecycleSession,
 		Description:  fmt.Sprintf("负责%s子领域的任务执行与结果汇总", subDomain),
 		SystemPrompt: fmt.Sprintf("你是%s子领域的负责人。你的职责是：\n1. 管理该子领域的上下文信息\n2. 分析任务并分发给合适的助手\n3. 汇总助手结果并返回给父领域\n\n子领域目标: %s", subDomain, goal),
 		Keywords:     []string{subDomain, goal},
@@ -309,11 +315,12 @@ func (f *RoleFactory) CreateSubDomainAgent(ctx context.Context, sessionID, subDo
 // 参数：
 //   - sessionID：会话 ID。
 //   - domain：领域名。
+//
 // 返回：已存在的实例；无则 nil。
 func (f *RoleFactory) findDomainAgent(sessionID, domain string) *types.RoleInstance {
 	for _, inst := range f.registry.GetInstancesBySession(sessionID) {
 		// 类型必须是 Domain，且 domain 字段匹配
-		if inst.Type == types.RoleTypeDomain && inst.Domain == domain {
+		if inst.Type == enums.RoleTypeDomain && inst.Domain == domain {
 			return inst
 		}
 	}
@@ -359,6 +366,7 @@ func extractKeywords(taskDesc string) []string {
 //  1. 剥离 ```json 或 ``` 代码块标记。
 //  2. 若剩余串以 '[' 开头：取第一个 '[' 到最后一个 ']' 之间内容（JSON 数组）。
 //  3. 否则取第一个 '{' 到最后一个 '}' 之间内容（JSON 对象）。
+//
 // 返回：纯净的 JSON 字符串；无法提取则返回原串。
 func extractJSON(s string) string {
 	s = strings.TrimSpace(s)

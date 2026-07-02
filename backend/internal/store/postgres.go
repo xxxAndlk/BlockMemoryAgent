@@ -27,9 +27,11 @@ type PostgresStore struct {
 // NewPostgresStore 创建 PostgreSQL 存储实例。
 // 参数:
 //   - dsn: PostgreSQL 数据源字符串 (host/port/user/password/dbname/sslmode 等)
+//
 // 返回:
 //   - *PostgresStore: 已通过 Ping 校验的存储实例
 //   - error: 打开连接或 Ping 失败时返回包装错误
+//
 // 副作用: 初始化连接池参数 (20 最大连接 / 10 空闲 / 1 小时连接寿命)。
 func NewPostgresStore(dsn string) (*PostgresStore, error) {
 	// 仅解析 DSN 构建连接池,真正建连发生在 Ping
@@ -85,6 +87,7 @@ func (s *PostgresStore) DB() *sql.DB {
 //   - agentID: 所属 Agent ID
 //   - topicID: 话题 ID
 //   - ep:      待持久化的 Episode (含重要性、时间戳、内容)
+//
 // 返回: SQL 执行错误。
 // 副作用: 写入一行新记录;compression_level 字段使用数据库默认值 0 (Raw 层级)。
 func (s *PostgresStore) SaveEpisode(ctx context.Context, agentID, topicID string, ep *types.Episode) error {
@@ -133,10 +136,53 @@ func (s *PostgresStore) SaveMemoryWriteFailure(ctx context.Context, agentID, top
 	return err
 }
 
+// QueryUnresolvedMemoryWriteFailures 查询未解析的记忆写入死信记录。
+func (s *PostgresStore) QueryUnresolvedMemoryWriteFailures(ctx context.Context, limit int) ([]*types.MemoryWriteFailure, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, agent_id, topic_id, step_count, action, raw_content, error, retry_count, created_at, resolved_at
+		FROM memory_write_failures
+		WHERE resolved_at IS NULL
+		ORDER BY created_at ASC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*types.MemoryWriteFailure
+	for rows.Next() {
+		var f types.MemoryWriteFailure
+		var resolvedAt sql.NullTime
+		if err := rows.Scan(&f.ID, &f.AgentID, &f.TopicID, &f.StepCount, &f.Action, &f.RawContent, &f.Error, &f.RetryCount, &f.CreatedAt, &resolvedAt); err != nil {
+			continue
+		}
+		if resolvedAt.Valid {
+			f.ResolvedAt = &resolvedAt.Time
+		}
+		out = append(out, &f)
+	}
+	return out, rows.Err()
+}
+
+// ResolveMemoryWriteFailure 将死信记录标记为已解析。
+func (s *PostgresStore) ResolveMemoryWriteFailure(ctx context.Context, id int) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE memory_write_failures
+		SET resolved_at = NOW()
+		WHERE id = $1
+	`, id)
+	return err
+}
+
 // GetEpisodes 获取 Agent 在指定话题下的全部 Episode (按创建时间倒序)。
 // 参数:
 //   - agentID, topicID: 检索范围
 //   - limit: 最大返回条数;<=0 时默认 100
+//
 // 返回: Episode 切片 (可能为空) 与 SQL 错误。
 // 注意: 反序列化失败的行被静默跳过,保证部分坏数据不阻断整体读取。
 func (s *PostgresStore) GetEpisodes(ctx context.Context, agentID, topicID string, limit int) ([]*types.Episode, error) {
@@ -179,6 +225,7 @@ func (s *PostgresStore) GetEpisodes(ctx context.Context, agentID, topicID string
 //   - agentID, topicID: 检索范围
 //   - level: Raw/Standard/Compact/Marker 之一
 //   - limit: 返回上限,<=0 时默认 100
+//
 // 返回: 按重要性降序、再按创建时间倒序的 Episode 切片。
 // 设计意图: 压缩管道各阶段拉取对应层级的记忆做组装。
 func (s *PostgresStore) GetEpisodesByLevel(ctx context.Context, agentID, topicID string, level enums.CompressionLevel, limit int) ([]*types.Episode, error) {
@@ -256,6 +303,7 @@ func (s *PostgresStore) CountEpisodesByLevel(ctx context.Context, agentID, topic
 // 参数:
 //   - agentID, topicID: 更新范围
 //   - episodes: 需更新的 Episode (按 step_id 匹配)
+//
 // 返回: 事务提交错误。
 // 设计意图: 压缩阶段一次性写回多条压缩结果,避免多次往返。
 // 副作用: 任意一行序列化失败均跳过;事务提交时整体生效。
@@ -291,6 +339,7 @@ func (s *PostgresStore) BatchUpdateEpisodes(ctx context.Context, agentID, topicI
 // SaveSnapshot 保存 Agent 快照 (UPSERT)。
 // 参数:
 //   - snapshot: 含 AgentID/TopicID 与完整上下文状态
+//
 // 返回: SQL 执行错误。
 // 设计意图: 每个 (agent, topic) 仅保留一份最新快照,供热加载使用。
 // 副作用: ON CONFLICT 命中主键则更新 snapshot 与 updated_at。
@@ -312,6 +361,7 @@ func (s *PostgresStore) SaveSnapshot(ctx context.Context, snapshot *types.AgentS
 // 返回:
 //   - *types.AgentSnapshot: 命中时返回;不存在时返回 (nil, nil)
 //   - error: 其他 SQL/反序列化错误
+//
 // 设计意图: 配合 Redis 缓存做热加载,未命中时回源 PG。
 func (s *PostgresStore) GetSnapshot(ctx context.Context, agentID, topicID string) (*types.AgentSnapshot, error) {
 	var raw []byte
@@ -336,6 +386,7 @@ func (s *PostgresStore) GetSnapshot(ctx context.Context, agentID, topicID string
 // SaveKnowledge 写入一条全局知识记录 (含向量)。
 // 参数:
 //   - rec: 知识记录,含 KnowledgeType/TopicID/Content/Embedding/Meta 等
+//
 // 返回: SQL 执行错误。
 // 副作用: embedding 通过 pgVector 转为字符串文本,依赖 pgvector 扩展解析。
 func (s *PostgresStore) SaveKnowledge(ctx context.Context, rec *types.KnowledgeRecord) error {
@@ -352,6 +403,7 @@ func (s *PostgresStore) SaveKnowledge(ctx context.Context, rec *types.KnowledgeR
 // 参数:
 //   - knowledgeType: 例如 "playbook"/"postmortem"
 //   - limit: 返回上限,<=0 时默认 10
+//
 // 返回: 知识记录切片与 SQL 错误。
 // 设计意图: 排除已归档记录,优先返回热数据。
 func (s *PostgresStore) GetKnowledgeByType(ctx context.Context, knowledgeType string, limit int) ([]*types.KnowledgeRecord, error) {
@@ -379,6 +431,7 @@ func (s *PostgresStore) GetKnowledgeByType(ctx context.Context, knowledgeType st
 // 参数:
 //   - embedding: 查询向量
 //   - topK: 返回前 K 条,<=0 时默认 5
+//
 // 返回: 按相似度 (L2 距离) 升序的知识记录切片。
 // 注意: <=> 是 pgvector 的距离算子,值越小越相似。
 func (s *PostgresStore) SearchKnowledge(ctx context.Context, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
@@ -467,6 +520,7 @@ func (s *PostgresStore) SearchKnowledgeByType(ctx context.Context, knowledgeType
 // ArchiveKnowledge 归档指定 ID 的知识 (软删除)。
 // 参数:
 //   - id: 知识记录主键
+//
 // 返回: SQL 执行错误。
 // 副作用: archived 置 true,后续查询自动排除该记录。
 func (s *PostgresStore) ArchiveKnowledge(ctx context.Context, id int64) error {
@@ -479,6 +533,7 @@ func (s *PostgresStore) ArchiveKnowledge(ctx context.Context, id int64) error {
 // IncrementAccessCount 自增访问计数并刷新最近访问时间。
 // 参数:
 //   - id: 知识记录主键
+//
 // 返回: SQL 执行错误。
 // 设计意图: 配合 GetKnowledgeByType 的排序,实现简单的热度衰减。
 func (s *PostgresStore) IncrementAccessCount(ctx context.Context, id int64) error {
@@ -493,6 +548,7 @@ func (s *PostgresStore) IncrementAccessCount(ctx context.Context, id int64) erro
 // CreateTopic 创建话题元数据。
 // 参数:
 //   - topic: 含 ID/Goal/Status/CreatedAt/ExpiresAt
+//
 // 返回: SQL 执行错误。
 // 副作用: constraints 字段写入空 JSON 对象占位。
 func (s *PostgresStore) CreateTopic(ctx context.Context, topic *types.TopicMeta) error {
@@ -508,6 +564,7 @@ func (s *PostgresStore) CreateTopic(ctx context.Context, topic *types.TopicMeta)
 // GetTopic 读取话题元数据。
 // 参数:
 //   - topicID: 话题 ID
+//
 // 返回: 命中返回 *TopicMeta;不存在返回 (nil, nil)。
 // 副作用: expires_at 可能为 NULL,通过 sql.NullTime 安全读取。
 func (s *PostgresStore) GetTopic(ctx context.Context, topicID string) (*types.TopicMeta, error) {
@@ -539,6 +596,7 @@ func (s *PostgresStore) GetTopic(ctx context.Context, topicID string) (*types.To
 //   - outputs:   产出 JSON (RawMessage)
 //   - decisions: 决策 JSON (RawMessage)
 //   - embedding: 摘要向量,用于跨话题检索
+//
 // 返回: SQL 执行错误。
 // 副作用: 同一 topic_id 重复归档会覆盖原记录。
 func (s *PostgresStore) SaveTopicArchive(ctx context.Context, topicID, summary string, outputs, decisions json.RawMessage, embedding []float32) error {
@@ -555,6 +613,7 @@ func (s *PostgresStore) SaveTopicArchive(ctx context.Context, topicID, summary s
 // 参数:
 //   - id, name, description, moduleID: 基础标识
 //   - keywords, dependencies, capabilities: 三个标签切片,分别序列化为 JSONB
+//
 // 返回: SQL 执行错误。
 // 设计意图: 让 MetaAgent 在动态创建 Agent 时持久化注册信息。
 func (s *PostgresStore) RegisterAgent(ctx context.Context, id, name, description, moduleID string, keywords, dependencies, capabilities []string) error {
@@ -609,6 +668,7 @@ func (s *PostgresStore) GetAgentRegistry(ctx context.Context) ([]map[string]any,
 // 参数:
 //   - topicID, agentID, decision: 决策主体与文本
 //   - context: 附加上下文,序列化为 JSONB
+//
 // 返回: SQL 执行错误。
 // 副作用: created_at 由数据库 NOW() 生成。
 func (s *PostgresStore) SaveDecisionLog(ctx context.Context, topicID, agentID, decision string, context map[string]any) error {
@@ -652,6 +712,7 @@ type SessionEventRecord struct {
 // SaveSessionHistory 持久化一次会话的 goal/summary/工具调用结果。
 // 参数:
 //   - rec: 会话历史记录;ToolResults 为 nil 时补为空数组,保证 JSONB 非 null
+//
 // 返回: SQL 执行错误。
 // 副作用: ON CONFLICT DO NOTHING 保证同 session_id 重复写入幂等。
 func (s *PostgresStore) SaveSessionHistory(ctx context.Context, rec *SessionHistoryRecord) error {
@@ -725,6 +786,7 @@ func (s *PostgresStore) GetSessionEvents(ctx context.Context, sessionID string) 
 // RecentSessionHistories 返回最近 limit 条会话历史 (按时间倒序)。
 // 参数:
 //   - limit: 返回上限,<=0 时默认 10
+//
 // 返回: 会话历史切片与 SQL 错误。
 // 设计意图: 给新会话提供"最近发生过什么"的上下文。
 func (s *PostgresStore) RecentSessionHistories(ctx context.Context, limit int) ([]*SessionHistoryRecord, error) {
@@ -969,8 +1031,9 @@ WITH (lists = 100);
 // ValidateEmbeddingDimension 校验 global_knowledge.embedding 列的实际向量维度与配置一致。
 //
 // 职责：pgvector 的 VECTOR(N) 列维度在建表时固定；若 config 的 pgvector.dimensions 与列维度
-//   不一致，所有 SaveKnowledge 的 INSERT 会因维度不匹配静默失败（仅日志），导致块记忆/归档
-//   无法落库。启动期显式校验，不一致则返回错误，由调用方 fatal 退出（TODO #4 D3）。
+//
+//	不一致，所有 SaveKnowledge 的 INSERT 会因维度不匹配静默失败（仅日志），导致块记忆/归档
+//	无法落库。启动期显式校验，不一致则返回错误，由调用方 fatal 退出（TODO #4 D3）。
 //
 // 参数：
 //   - ctx：请求上下文。
@@ -1020,6 +1083,7 @@ func parseVectorDim(typeStr string) int {
 // 参数:
 //   - rows: 已执行的 *sql.Rows,列顺序固定为
 //     id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+//
 // 返回: 知识记录切片;扫描/反序列化失败的单行被跳过。
 func scanKnowledgeRows(rows *sql.Rows) ([]*types.KnowledgeRecord, error) {
 	var results []*types.KnowledgeRecord

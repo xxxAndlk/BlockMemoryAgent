@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
@@ -38,6 +39,7 @@ type DomainAgentNode struct {
 	snapshotMgr    AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
 	snapshot       *types.AgentSnapshot  // 本次 Invoke 加载到的快照
 	logger         *logger.Logger        // 结构化日志器（P1-2）
+	stepCounter    atomic.Int64          // 单调步骤计数器，作为 Episode/Snapshot 幂等键
 }
 
 // NewDomainAgentNode 创建领域Agent节点。
@@ -275,6 +277,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		if recalled, err := n.blockMemory.SearchBlockMemory(ctx, state.CurrentDomain, state.DomainGoal, 3); err == nil && recalled != "" {
 			n.recalledMemory = recalled
 			n.emit(ctx, "think", "已检索到历史相似块记忆，将作为上下文注入任务拆解")
+			n.emit(ctx, "memory_recall", truncateString(recalled, 300))
 			if log := n.sessionLogger(ctx); log != nil {
 				log.Event(ctx, "memory_recall", fmt.Sprintf("block_memory query=%s hits=1", state.DomainGoal), map[string]any{
 					"query":  state.DomainGoal,
@@ -387,6 +390,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 // 由 CallbackHandler 内部负责 Episode 写入与快照保存；此处只发起回调。
 func (n *DomainAgentNode) finish(ctx context.Context, state *types.ThreeLayerState) {
 	if n.memCallback != nil {
-		n.memCallback.OnEnd(ctx, n.instID, state.SessionID, "DomainAgent完成", state.Reason, 0)
+		stepCount := int(n.stepCounter.Add(1))
+		n.memCallback.OnEnd(ctx, n.instID, state.SessionID, "DomainAgent完成", state.Reason, stepCount)
 	}
 }

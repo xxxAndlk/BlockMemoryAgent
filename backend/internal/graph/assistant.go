@@ -101,7 +101,7 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	}
 
 	// 3. 标记为活跃
-	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusActive)
+	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusActive)
 
 	// 4. 从调用栈顶 peek 调用请求
 	var callReq *types.CallRequest
@@ -143,14 +143,14 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	}
 
 	// 9. 标记为完成
-	n.registry.UpdateInstanceStatus(n.instID, types.RoleStatusDone)
+	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone)
 
 	// 10. 弹出调用栈
 	state.PopCallStack()
 
 	// 11. 路由
 	if callReq != nil && callReq.CallerID != "" {
-		n.registry.UpdateInstanceStatus(callReq.CallerID, types.RoleStatusActive)
+		n.registry.UpdateInstanceStatus(callReq.CallerID, enums.RoleStatusActive)
 		state.NextAction = enums.ActionSwitch
 		state.TargetRoleID = callReq.CallerID
 	} else {

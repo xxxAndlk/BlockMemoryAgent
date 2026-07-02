@@ -18,11 +18,18 @@ func (m Model) View() string {
 	return m.singleColumnView()
 }
 
-// singleColumnView 窄终端单列布局（原始布局，向后兼容）。
+
+
+// singleColumnView v2.0 主布局：顶部状态栏 + 主对话区 + 计划进度栏 + 输入栏 + 底部标签。
+// 当 agentPanelVisible 为 true 时，主对话区与右侧 Agent 面板分两列显示。
 func (m Model) singleColumnView() string {
-	topH := 3
-	inputH := 4
+	topH := 1
+	inputH := 3
 	tabsH := 1
+	planH := 0
+	if m.planBarVisible {
+		planH = 1
+	}
 
 	// 弹窗打开时预先扣减聊天区高度，确保总高度 ≤ m.height，输入框始终可见。
 	overlayH := 0
@@ -33,19 +40,35 @@ func (m Model) singleColumnView() string {
 		}
 	}
 
-	contentH := m.height - topH - inputH - tabsH - overlayH
+	contentH := m.height - topH - inputH - tabsH - planH - overlayH
 	if contentH < 4 {
 		contentH = 4
 	}
 
-	mainRow := m.renderChat(m.width, contentH)
+	var mainRow string
+	if m.agentPanelVisible {
+		chatW := m.width * 3 / 4
+		agentW := m.width - chatW
+		if agentW < 20 {
+			agentW = 20
+			chatW = m.width - agentW
+		}
+		chatPanel := m.renderChat(chatW, contentH)
+		agentPanel := renderAgentPanel(m, agentW)
+		mainRow = lipgloss.JoinHorizontal(lipgloss.Top, chatPanel, agentPanel)
+	} else {
+		mainRow = m.renderChat(m.width, contentH)
+	}
 
 	view := lipgloss.JoinVertical(lipgloss.Top,
 		m.renderTopBar(m.width),
 		mainRow,
-		m.renderInput(m.width),
-		m.renderTabs(m.width),
 	)
+	if m.planBarVisible {
+		view = lipgloss.JoinVertical(lipgloss.Top, view, m.renderPlanBar(m.width))
+	}
+	view = lipgloss.JoinVertical(lipgloss.Top, view, m.renderInput(m.width), m.renderTabs(m.width))
+
 	if overlayH > 0 {
 		overlay := m.renderOverlay(m.width, overlayH)
 		view = lipgloss.JoinVertical(lipgloss.Left, view, overlay)
@@ -56,61 +79,17 @@ func (m Model) singleColumnView() string {
 func (m Model) renderTopBar(w int) string {
 	s := m.selectedSession()
 	status := "idle"
-	goal := ""
+	sessionID := ""
 	if s != nil {
 		status = string(s.Status)
-		goal = s.Goal
+		sessionID = s.ID
 	}
-
-	tasksDone, tasksTotal := 0, 0
-	if s != nil && m.rt != nil && m.rt.Boards != nil {
-		if b := m.rt.Boards.Get(s.ID); b != nil {
-			snap := b.Snapshot()
-			tasksTotal = len(snap.Tasks)
-			for _, t := range snap.Tasks {
-				if t.Status == board.TaskDone {
-					tasksDone++
-				}
-			}
-		}
-	}
-
-	modelName := m.modelName
-	if modelName == "" {
-		modelName = "mock"
-	}
-
-	tokenStr := "-"
-	if m.totalInputTokens > 0 || m.totalOutputTokens > 0 {
-		tokenStr = fmt.Sprintf("in %d out %d", m.totalInputTokens, m.totalOutputTokens)
-	}
-
-	// Build status segment with badges.
-	planBadge := ""
-	if tasksTotal > 0 {
-		planBadge = " " + m.styles.Badge.Render(fmt.Sprintf("Plan %d/%d", tasksDone, tasksTotal))
-	}
-	agentsBadge := ""
-	if n := len(m.agentsNodes); n > 0 {
-		agentsBadge = " " + m.styles.Badge.Render(fmt.Sprintf("Agents %d", n))
-	}
+	agentCount := len(m.agentsNodes)
 	if s != nil && s.State != nil && s.State.PendingClarify != nil {
-		agentsBadge += " " + m.styles.BadgeWarn.Render("Clarify?")
+		agentCount++
 	}
-
-	text := fmt.Sprintf(" %s │ %s %s %s │ %s %s ",
-		m.styles.Title.Render("BlockMemoryAgent"),
-		m.styles.StatLabel.Render("Model:"), m.styles.StatValue.Render(modelName),
-		m.styles.StatLabel.Render("Tokens:"), m.styles.StatValue.Render(tokenStr),
-		m.styles.StatValue.Render(statusIcon(status)+" "+status),
-	)
-	if planBadge != "" || agentsBadge != "" {
-		text = strings.TrimRight(text, " ") + planBadge + agentsBadge + " "
-	}
-	if goal != "" {
-		text = strings.TrimRight(text, " ") + " │ " + m.styles.Dim.Render(truncate(goal, 40)) + " "
-	}
-	return m.styles.FocusBorder.Width(w).Height(3).Render(strings.TrimRight(text, " "))
+	line := formatTopBar(m.styles, sessionID, status, agentCount, m.totalInputTokens, m.totalOutputTokens)
+	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
 }
 
 func (m Model) renderChat(w, h int) string {
@@ -154,19 +133,6 @@ func (m Model) renderChat(w, h int) string {
 	if startLine < 0 {
 		startLine = 0
 	}
-	// Derive highlighted cursor from viewport center line.
-	centerLine := startLine + viewportH/3
-	cursor := 0
-	if m.chatFollowBottom {
-		cursor = len(items) - 1
-	} else {
-		for i := len(items) - 1; i >= 0; i-- {
-			if itemStartLine[i] <= centerLine {
-				cursor = i
-				break
-			}
-		}
-	}
 
 	// Render items.
 	type renderedItem struct {
@@ -174,42 +140,39 @@ func (m Model) renderChat(w, h int) string {
 	}
 	rendered := make([]renderedItem, len(items))
 	for i, item := range items {
-		roleStyle := m.styles.LogInfo
-		icon := "·"
-		switch {
-		case strings.HasPrefix(item.title, "[user]"):
-			roleStyle = m.styles.LogUser
-			icon = ">"
-		case strings.HasPrefix(item.title, "[assistant]"):
-			roleStyle = m.styles.LogAssistant
-			icon = "<"
-		case strings.HasPrefix(item.title, "[system]"):
-			roleStyle = m.styles.LogSystem
-			icon = "#"
-		case strings.HasPrefix(item.title, "🔧"):
-			if strings.Contains(item.title, " ✗ ·") {
-				roleStyle = m.styles.LogError
-			} else {
-				roleStyle = m.styles.LogSuccess
-			}
-			icon = ""
-		case strings.HasPrefix(item.title, "💭"):
-			roleStyle = m.styles.LogInfo
-			icon = ""
-		case strings.HasPrefix(item.title, "✗ Error"):
-			roleStyle = m.styles.LogError
-			icon = ""
-		}
-		marker := "  "
-		if m.focus == panelChat && i == cursor {
-			marker = m.styles.TreeActive.Render("▸ ")
-		}
 		var ls []string
-		titleStr := truncate(item.title, w-8)
-		ls = append(ls, fmt.Sprintf("%s%s %s", marker, m.styles.Dim.Render(icon), roleStyle.Render(titleStr)))
+		style := m.styles.LogInfo
+		switch {
+		case strings.HasPrefix(item.title, "> "):
+			// 用户输入：高亮前缀 >
+			style = m.styles.LogUser
+			ls = append(ls, style.Render(truncate(item.title, w-2)))
+		case strings.HasPrefix(item.title, "[●] "):
+			// 工具调用中：黄色
+			ls = append(ls, m.styles.LogWarn.Render(truncate(item.title, w-2)))
+		case strings.HasPrefix(item.title, "[✓] "):
+			// 工具调用成功：绿色
+			ls = append(ls, m.styles.LogSuccess.Render(truncate(item.title, w-2)))
+		case strings.HasPrefix(item.title, "[✗] "):
+			// 工具调用失败：红色
+			ls = append(ls, m.styles.LogError.Render(truncate(item.title, w-2)))
+		case strings.HasPrefix(item.title, "🧠 recalled: "):
+			// 记忆召回：灰色
+			ls = append(ls, m.styles.Dim.Render(truncate(item.title, w-2)))
+		case strings.HasPrefix(item.title, "─── ") && strings.HasSuffix(item.title, " ───"):
+			// 话题切换：蓝色/强调色，居中
+			line := truncate(item.title, w-2)
+			ls = append(ls, m.styles.CallStack.Render(line))
+		case strings.HasPrefix(item.title, "✗ Error"):
+			ls = append(ls, m.styles.LogError.Render(truncate(item.title, w-2)))
+		default:
+			// Agent 响应：普通文本（仍做轻量 Markdown 格式化）
+			content := formatMarkdown(item.title)
+			ls = append(ls, content)
+		}
 		detailLines := displayDetailLines(item.title, item.detail)
 		for _, l := range detailLines {
-			ls = append(ls, "    "+truncate(l, w-6))
+			ls = append(ls, "  "+truncate(l, w-4))
 		}
 		rendered[i] = renderedItem{lines: ls}
 	}
@@ -266,6 +229,17 @@ func (m Model) clipChat(content string, w, h int) string {
 	return lipgloss.NewStyle().Width(w).Height(h).Render(content)
 }
 
+func (m Model) renderPlanBar(w int) string {
+	var snap board.Snapshot
+	if s := m.selectedSession(); s != nil && m.rt != nil && m.rt.Boards != nil {
+		if b := m.rt.Boards.Get(s.ID); b != nil {
+			snap = b.Snapshot()
+		}
+	}
+	line := formatPlanBar(m.styles, snap)
+	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
+}
+
 func (m Model) renderInput(w int) string {
 	prompt := ">"
 	switch m.inputMode {
@@ -294,9 +268,9 @@ func (m Model) renderInput(w int) string {
 	if m.focus == panelInput {
 		border = m.styles.FocusBorder
 	}
-	hint := m.styles.Dim.Render("/new /cancel /interrupt /enqueue /clarify  ↑↓历史  esc返回")
+	hint := m.styles.Dim.Render("Tab 面板  ↑↓历史  Shift+Enter 换行  /help  Q 退出")
 	content := lipgloss.JoinVertical(lipgloss.Left, left+text+flash, " "+hint)
-	return border.Width(w).Height(4).Render(content)
+	return border.Width(w).Height(3).Render(content)
 }
 
 func (m Model) renderTabs(w int) string {

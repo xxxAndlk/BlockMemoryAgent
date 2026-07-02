@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"gopkg.in/yaml.v3"
 )
@@ -153,7 +154,7 @@ func (c *RoleConfigFile) GetFixedRole(roleID string) *types.RoleDefinition {
 //   - roleType: 目标类型(meta/domain/fixed/dynamic 等)。
 //
 // 返回: 新切片(可能为空)，不修改内部状态。
-func (c *RoleConfigFile) GetFixedRolesByType(roleType types.RoleType) []types.RoleDefinition {
+func (c *RoleConfigFile) GetFixedRolesByType(roleType enums.RoleType) []types.RoleDefinition {
 	var result []types.RoleDefinition
 	for _, r := range c.FixedRoles {
 		// 类型匹配则追加到结果
@@ -199,9 +200,9 @@ func (c *RoleConfigFile) CanCall(callerRoleDefID, calleeRoleDefID string) bool {
 		return false
 	}
 	// 规则2: meta/domain 可调用任意 fixed/dynamic 助手
-	if caller.Type == types.RoleTypeMeta || caller.Type == types.RoleTypeDomain {
+	if caller.Type == enums.RoleTypeMeta || caller.Type == enums.RoleTypeDomain {
 		callee := c.GetFixedRole(calleeRoleDefID)
-		if callee != nil && (callee.Type == types.RoleTypeFixed || callee.Type == types.RoleTypeDynamic) {
+		if callee != nil && (callee.Type == enums.RoleTypeFixed || callee.Type == enums.RoleTypeDynamic) {
 			return true
 		}
 	}

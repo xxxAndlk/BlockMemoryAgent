@@ -43,9 +43,11 @@ func (n *EscalationHandlerNode) Name() string {
 //  2. 生成仲裁摘要字符串。
 //  3. 把仲裁事件追加到当前 SessionBlock 的 Events 列表。
 //  4. 清空 Reason，把 NextAction 置为 Continue，让图回到 MetaAgent 继续。
+//
 // 参数：
 //   - ctx：上下文（当前未使用，预留扩展）。
 //   - state：图状态，含 SessionID / Reason / CurrentBlockID 等。
+//
 // 返回：更新后的 state；不会返回 error。
 // 副作用：向 state.ActiveBlocks[CurrentBlockID].Events 追加一条 EventEscalation。
 func (n *EscalationHandlerNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {

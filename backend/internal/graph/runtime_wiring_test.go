@@ -30,8 +30,8 @@ func minimalRoleConfig() *pkgconfig.RoleConfigFile {
 			{
 				ID:          "code_assistant",
 				Name:        "代码助手",
-				Type:        types.RoleTypeFixed,
-				Lifecycle:   types.RoleLifecyclePermanent,
+				Type:        enums.RoleTypeFixed,
+				Lifecycle:   enums.RoleLifecyclePermanent,
 				Skills:      []string{"代码"},
 				Keywords:    []string{"代码", "code"},
 				CanBeCalled: true,

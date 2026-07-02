@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -17,6 +18,8 @@ type Broadcaster interface {
 // DeadLetterStore 死信存储接口，用于持久化写入失败记录。
 type DeadLetterStore interface {
 	SaveMemoryWriteFailure(ctx context.Context, agentID, topicID string, stepCount int, action, rawContent, errStr string, retryCount int) error
+	QueryUnresolvedMemoryWriteFailures(ctx context.Context, limit int) ([]*types.MemoryWriteFailure, error)
+	ResolveMemoryWriteFailure(ctx context.Context, id int) error
 }
 
 // writeQueueItem 内存队列项。
@@ -38,6 +41,9 @@ type CallbackHandler struct {
 	deadLetterStore DeadLetterStore     // 死信存储，写入失败时归档
 	writeQueue      chan writeQueueItem // 内存队列
 	queueDone       chan struct{}       // worker 退出信号
+	retryAttempts   int                 // 重试次数（测试可覆盖）
+	retryDelay      time.Duration       // 重试基础退避（测试可覆盖）
+	writeTimeout    time.Duration       // 单次写入超时（测试可覆盖）
 }
 
 // NewCallbackHandler 创建回调处理器，注入核心依赖并启动后台 worker。
@@ -52,6 +58,9 @@ func NewCallbackHandler(writeProcessor *WriteProcessor, snapshotMgr *SnapshotMan
 		deadLetterStore: deadLetterStore,
 		writeQueue:      make(chan writeQueueItem, 100), // 缓冲队列，满时降级同步写
 		queueDone:       make(chan struct{}),
+		retryAttempts:   3,
+		retryDelay:      time.Second,
+		writeTimeout:    5 * time.Second,
 	}
 	go h.writeWorker()
 	return h
@@ -144,13 +153,13 @@ func (h *CallbackHandler) processItem(item writeQueueItem) {
 // retryEpisodeWrite 写入 Episode，失败重试 3 次（指数退避：1s, 2s, 4s）。
 func (h *CallbackHandler) retryEpisodeWrite(item writeQueueItem) {
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < h.retryAttempts; attempt++ {
 		if attempt > 0 {
 			// 指数退避：1s, 2s, 4s
-			time.Sleep(time.Duration(1<<uint(attempt-1)) * time.Second)
+			time.Sleep(time.Duration(1<<uint(attempt-1)) * h.retryDelay)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), h.writeTimeout)
 		episode, err := h.writeProcessor.ProcessWithStepCount(ctx, item.agentID, item.topicID, item.action, item.rawContent, item.stepCount)
 		cancel()
 
@@ -175,20 +184,20 @@ func (h *CallbackHandler) retryEpisodeWrite(item writeQueueItem) {
 	}
 
 	// 3 次都失败，入死信表
-	h.saveDeadLetter(item, "episode_write", lastErr, 3)
+	h.saveDeadLetter(item, "episode_write", lastErr, h.retryAttempts)
 	log.Printf("[memory_write] dead_letter session=%s agent=%s step=%d action=%s err=%v", item.topicID, item.agentID, item.stepCount, item.action, lastErr)
 }
 
 // retrySnapshotSave 保存快照，失败重试 3 次（指数退避：1s, 2s, 4s）。
 func (h *CallbackHandler) retrySnapshotSave(item writeQueueItem) {
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < h.retryAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt-1)) * time.Second)
+			time.Sleep(time.Duration(1<<uint(attempt-1)) * h.retryDelay)
 		}
 
 		// 获取最近 10 条 Episode
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), h.writeTimeout)
 		episodes, _ := h.writeProcessor.store.GetEpisodes(ctx, item.agentID, item.topicID, 10)
 		cancel()
 
@@ -202,7 +211,7 @@ func (h *CallbackHandler) retrySnapshotSave(item writeQueueItem) {
 		// 构建快照并直接写入 Postgres（绕过 Redis 同步写与内部 goroutine，便于精确重试）
 		snapshot := h.snapshotMgr.BuildSnapshotFromState(item.agentID, item.topicID, output, episodes)
 
-		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel = context.WithTimeout(context.Background(), h.writeTimeout)
 		err := h.snapshotMgr.SaveSnapshotToPostgres(ctx, snapshot)
 		cancel()
 
@@ -215,7 +224,7 @@ func (h *CallbackHandler) retrySnapshotSave(item writeQueueItem) {
 	}
 
 	// 3 次都失败，入死信
-	h.saveDeadLetter(item, "snapshot_save", lastErr, 3)
+	h.saveDeadLetter(item, "snapshot_save", lastErr, h.retryAttempts)
 	log.Printf("[memory_write] snapshot_dead_letter session=%s agent=%s step=%d err=%v", item.topicID, item.agentID, item.stepCount, lastErr)
 }
 
@@ -234,5 +243,50 @@ func (h *CallbackHandler) saveDeadLetter(item writeQueueItem, action string, err
 	defer cancel()
 	if err := h.deadLetterStore.SaveMemoryWriteFailure(ctx, item.agentID, item.topicID, item.stepCount, action, item.rawContent, err.Error(), retryCount); err != nil {
 		log.Printf("[memory_write] dead_letter_fail session=%s agent=%s step=%d action=%s err=%v", item.topicID, item.agentID, item.stepCount, action, err)
+	}
+}
+
+// ReplayDeadLetters 在启动时扫描死信表并尝试重新写入。
+// 每条死信会复用原有 stepCount，保证幂等；写入成功后标记为已解析。
+func (h *CallbackHandler) ReplayDeadLetters(ctx context.Context) error {
+	if h.deadLetterStore == nil {
+		return nil
+	}
+	failures, err := h.deadLetterStore.QueryUnresolvedMemoryWriteFailures(ctx, 1000)
+	if err != nil {
+		return fmt.Errorf("query dead letters: %w", err)
+	}
+	if len(failures) == 0 {
+		return nil
+	}
+	log.Printf("[memory_write] replay_start count=%d", len(failures))
+	var replayed int
+	for _, f := range failures {
+		item := writeQueueItem{
+			agentID:    f.AgentID,
+			topicID:    f.TopicID,
+			action:     f.Action,
+			rawContent: f.RawContent,
+			stepCount:  f.StepCount,
+		}
+		h.processItem(item)
+		if err := h.deadLetterStore.ResolveMemoryWriteFailure(ctx, f.ID); err != nil {
+			log.Printf("[memory_write] resolve_failed id=%d err=%v", f.ID, err)
+			continue
+		}
+		replayed++
+	}
+	log.Printf("[memory_write] replay_done count=%d replayed=%d", len(failures), replayed)
+	return nil
+}
+
+// Close 优雅关闭回调处理器：关闭写入队列并等待后台 worker 退出。
+func (h *CallbackHandler) Close() error {
+	close(h.writeQueue)
+	select {
+	case <-h.queueDone:
+		return nil
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("callback handler worker shutdown timeout")
 	}
 }

@@ -19,7 +19,9 @@ import (
 // ToolResult 工具执行结果。
 //
 // 职责：统一描述一次工具调用的产出，供 blades Agent 回灌给 LLM、供 UI 展示、
-//   供上层完成门控判断。
+//
+//	供上层完成门控判断。
+//
 // 字段：
 //   - Tool：工具名（已归一化为 CamelCase）。
 //   - Success：是否执行成功。
@@ -45,8 +47,9 @@ type ToolCallback func(result *ToolResult)
 
 // ProgressEvent 单步进度事件，用于把 Agent 的思考/意图/工具调用实时推给 UI。
 // Kind 取值:
-//   "think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error"  (原有)
-//   "prompt" | "agent_created" | "token_usage" | "graph_step"                     (新增调试类)
+//
+//	"think" | "intend" | "tool_call" | "tool_result" | "llm" | "wait" | "error"  (原有)
+//	"prompt" | "agent_created" | "token_usage" | "graph_step"                     (新增调试类)
 //
 // 职责：承载一个 Agent 执行步骤的可观测信息，由 ProgressCallback 推送给 UI。
 // 字段：
@@ -74,13 +77,17 @@ type ProgressCallback func(ctx context.Context, ev ProgressEvent)
 // ToolExecutor 本地工具执行器（沙箱）。
 //
 // 职责：在受限工作目录下执行 7 个内置工具，统一封装路径解析、超时控制、
-//   输出截断与回调通知。
+//
+//	输出截断与回调通知。
+//
 // 字段：
 //   - workDir：工具执行的基准目录，相对路径基于此解析。
 //   - timeout：默认超时（命令/HTTP），可被入参覆盖（上限 60s）。
 //   - callback：可选回调，每次 Execute 后触发。
+//
 // 并发安全：workDir/timeout/callback 在 SetCallback 后不再变化；
-//   Execute 可被多 goroutine 并发调用（无共享可变状态）。
+//
+//	Execute 可被多 goroutine 并发调用（无共享可变状态）。
 type ToolExecutor struct {
 	workDir  string        // 工具执行基准目录
 	timeout  time.Duration // 默认超时
@@ -91,6 +98,7 @@ type ToolExecutor struct {
 //
 // 参数：
 //   - workDir：基准工作目录；空串时回退到当前进程工作目录。
+//
 // 返回：初始化好的 *ToolExecutor，默认超时 30s，callback 为 nil。
 // 副作用：workDir 为空时调用 os.Getwd()。
 func NewToolExecutor(workDir string) *ToolExecutor {
@@ -108,6 +116,7 @@ func NewToolExecutor(workDir string) *ToolExecutor {
 //
 // 参数：
 //   - cb：每次 Execute 完成后调用的回调；传 nil 可清除。
+//
 // 副作用：覆盖既有 callback。
 // 并发安全：非并发安全，预期在初始化阶段调用一次。
 func (e *ToolExecutor) SetCallback(cb ToolCallback) {
@@ -121,6 +130,7 @@ func (e *ToolExecutor) SetCallback(cb ToolCallback) {
 //   - ctx：请求上下文，携带 sessionID 与超时。
 //   - toolName：工具名（支持 snake_case 别名，会自动归一化）。
 //   - args：工具入参 map。
+//
 // 返回：填充好的 *ToolResult（始终非 nil，失败也通过 result.Error 表达）。
 // 副作用：通过具体工具实现产生文件/命令/网络副作用；通过 callback 通知订阅方。
 // 并发安全：可被多 goroutine 并发调用。
@@ -175,6 +185,7 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 // 职责：兼容 LLM 输出的 snake_case 工具名（如 write_file），统一映射到内部 CamelCase。
 // 参数：
 //   - name：原始工具名。
+//
 // 返回：归一化后的工具名；未命中别名时原样返回。
 // 副作用：无。
 // 并发安全：纯函数（每次构建 map，无共享状态）。
@@ -185,6 +196,7 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 // 职责：跨平台兼容 mkdir 命令，绕过 Windows shell 不支持 -p 的问题。
 // 参数：
 //   - cmd：原始命令字符串。
+//
 // 返回：mkdir 的目标目录；非 mkdir 命令返回空串。
 // 副作用：无。
 // 并发安全：纯函数。
@@ -205,6 +217,7 @@ func parseMkdirDir(cmd string) string {
 //
 // 参数：
 //   - name：原始工具名。
+//
 // 返回：归一化后的工具名；未命中别名时原样返回。
 func normalizeToolName(name string) string {
 	// 别名表：LLM 偶尔输出 snake_case，这里统一翻译回 CamelCase
@@ -228,6 +241,7 @@ func normalizeToolName(name string) string {
 // 职责：读取指定路径文件，超过 10000 字符时截断，返回内容与绝对路径。
 // 参数：
 //   - args：必须含 "path" 字段。
+//
 // 返回：成功时 Output 为文件内容；失败时 Error 为错误信息。
 // 副作用：只读，无写入。
 func (e *ToolExecutor) readFile(args map[string]any) *ToolResult {
@@ -259,6 +273,7 @@ func (e *ToolExecutor) readFile(args map[string]any) *ToolResult {
 // 职责：把 content 写入指定路径，自动创建父目录。
 // 参数：
 //   - args：含 "path" 与 "content" 字段。
+//
 // 返回：成功时 Output 为写入字节数；失败时 Error 为错误信息。
 // 副作用：创建目录 + 写文件（覆盖已有内容）。
 func (e *ToolExecutor) writeFile(args map[string]any) *ToolResult {
@@ -293,6 +308,7 @@ func (e *ToolExecutor) writeFile(args map[string]any) *ToolResult {
 // 职责：列出指定目录下的条目，区分目录/文件，附带文件大小。
 // 参数：
 //   - args：含 "path" 字段，空则取工作目录。
+//
 // 返回：成功时 Output 为多行条目列表；失败时 Error 为错误信息。
 // 副作用：只读。
 func (e *ToolExecutor) listDir(args map[string]any) *ToolResult {
@@ -331,10 +347,13 @@ func (e *ToolExecutor) listDir(args map[string]any) *ToolResult {
 // runCommand 执行命令。
 //
 // 职责：在 workDir 下执行 shell 命令（Windows 用 cmd /c，Unix 用 sh -c），
-//   捕获 stdout/stderr，超时控制，输出截断。mkdir 命令走跨平台 fast path。
+//
+//	捕获 stdout/stderr，超时控制，输出截断。mkdir 命令走跨平台 fast path。
+//
 // 参数：
 //   - ctx：用于超时控制。
 //   - args：含 "command" 字段，可选 "timeout"（秒，上限 60）。
+//
 // 返回：成功时 Output 含 stdout+stderr；失败时 Error 为错误信息。
 // 副作用：执行任意 shell 命令（沙箱取决于 workDir 隔离程度）。
 func (e *ToolExecutor) runCommand(ctx context.Context, args map[string]any) *ToolResult {
@@ -412,9 +431,12 @@ func (e *ToolExecutor) runCommand(ctx context.Context, args map[string]any) *Too
 // searchInFiles 在文件中搜索（跨平台，纯Go实现）。
 //
 // 职责：递归搜索指定目录下白名单扩展名文件中包含 pattern 的行，
-//   大小写不敏感，跳过 .git/node_modules/vendor，最多返回 500 条。
+//
+//	大小写不敏感，跳过 .git/node_modules/vendor，最多返回 500 条。
+//
 // 参数：
 //   - args：含 "pattern" 字段，可选 "dir"（默认 "."）。
+//
 // 返回：命中时 Success=true，Output 为 "相对路径:行号: 行内容" 多行；无命中时 Success=false。
 // 副作用：只读。
 func (e *ToolExecutor) searchInFiles(args map[string]any) *ToolResult {
@@ -497,6 +519,7 @@ func (e *ToolExecutor) searchInFiles(args map[string]any) *ToolResult {
 // 参数：
 //   - ctx：用于超时控制。
 //   - args：含 "url" 字段，可选 "headers"/"timeout"。
+//
 // 返回：Output 为 "HTTP <status>\n<body>"；2xx 时 Success=true。
 // 副作用：发起网络请求。
 func (e *ToolExecutor) httpGet(ctx context.Context, args map[string]any) *ToolResult {
@@ -555,10 +578,13 @@ func (e *ToolExecutor) httpGet(ctx context.Context, args map[string]any) *ToolRe
 // httpPost 执行 HTTP POST 请求（默认 JSON Body）。
 //
 // 职责：发起 POST 请求，body 默认按 JSON 序列化并自动补 Content-Type，
-//   最多读 1MB 响应体。
+//
+//	最多读 1MB 响应体。
+//
 // 参数：
 //   - ctx：用于超时控制。
 //   - args：含 "url" 字段，可选 "headers"/"body"/"timeout"。
+//
 // 返回：Output 为 "HTTP <status>\n<body>"；2xx 时 Success=true。
 // 副作用：发起网络请求。
 func (e *ToolExecutor) httpPost(ctx context.Context, args map[string]any) *ToolResult {
@@ -639,6 +665,7 @@ func (e *ToolExecutor) httpPost(ctx context.Context, args map[string]any) *ToolR
 // 职责：把 LLM 传来的 headers（可能是任意 map 类型）统一转为 map[string]string。
 // 参数：
 //   - raw：原始值，预期为 map[string]string 或 map[string]any。
+//
 // 返回：归一化后的 map[string]string；nil 输入返回 nil。
 // 副作用：无。
 // 并发安全：纯函数。
@@ -669,6 +696,7 @@ func parseStringMap(raw any) map[string]string {
 // 职责：相对路径基于 workDir 解析，绝对路径原样返回。
 // 参数：
 //   - path：原始路径。
+//
 // 返回：绝对路径。
 // 副作用：无。
 // 并发安全：纯函数（workDir 只读）。
@@ -691,6 +719,7 @@ type sessionIDKey struct{}
 // 参数：
 //   - ctx：原 context。
 //   - sessionID：会话 ID。
+//
 // 返回：携带 sessionID 的新 context。
 // 副作用：无（仅 context 派生）。
 // 并发安全：context 派生安全。
@@ -703,6 +732,7 @@ func WithSessionID(ctx context.Context, sessionID string) context.Context {
 // 职责：取出 WithSessionID 写入的 sessionID；未设置时返回空串。
 // 参数：
 //   - ctx：携带 sessionID 的 context。
+//
 // 返回：sessionID 字符串；不存在时返回 ""。
 // 副作用：无。
 // 并发安全：context 读取安全。

@@ -17,10 +17,13 @@ import (
 // 两者都空时返回 defaultTools。
 //
 // 职责：将动态装配的技能简介与默认工具列表合并为一份去重的工具清单，
-//   用于在 system prompt 中向 LLM 展示当前可用的工具集合。
+//
+//	用于在 system prompt 中向 LLM 展示当前可用的工具集合。
+//
 // 参数：
 //   - skillBrief：来自 SkillSet 的技能简介文本，每行一个工具描述。
 //   - defaultTools：兜底的默认工具列表。
+//
 // 返回：合并去重后的多行字符串（每行一个工具简介）。
 // 副作用：无。
 // 并发安全：纯函数，无共享状态。
@@ -71,6 +74,7 @@ func mergeToolList(skillBrief, defaultTools string) string {
 // 职责：解析一行工具简介文本，提取行首的工具名。
 // 参数：
 //   - line：形如 "- WriteFile: 写入文件" 的工具描述行。
+//
 // 返回：工具名（如 "WriteFile"）；无法解析时返回空串。
 // 副作用：无。
 // 并发安全：纯函数。
@@ -98,7 +102,9 @@ func toolNameFromLine(line string) string {
 // blades.Tool）。
 //
 // 职责：助手节点执行任务的核心入口，负责组装 system prompt、构建工具集、
-//   驱动 blades Agent 的 ReAct 循环，并在结束时做完成门控校验。
+//
+//	驱动 blades Agent 的 ReAct 循环，并在结束时做完成门控校验。
+//
 // 参数：
 //   - ctx：请求上下文，携带超时与取消信号。
 //   - provider：blades 模型提供者；nil 时走 mock 单次调用路径。
@@ -111,9 +117,11 @@ func toolNameFromLine(line string) string {
 //   - progress：进度回调，把每一步动作推给 UI。
 //   - agentName：当前 agent 名，用于事件归属。
 //   - maxIters：ReAct 循环最大轮数（<=0 时使用默认 12）。
+//
 // 返回：
 //   - string：最终输出文本（含失败标记前缀）。
 //   - []*ToolResult：本次执行产生的所有工具结果，供上层门控与回放使用。
+//
 // 副作用：通过 progress 推送 ProgressEvent；通过 executor 产生文件/命令副作用。
 // 并发安全：单次调用安全；多 goroutine 并发调用需各自独立的 state/results。
 func executeWithTools(
@@ -281,7 +289,8 @@ func executeWithTools(
 // maxConsecutiveFailures 同一工具连续失败多少次后强制放弃重试。
 //
 // 设计意图：防止 LLM 在某个工具上陷入"失败-重试-再失败"的死循环，
-//   达到阈值后通过 SetAction(ActionLoopExit) 强制跳出 blades Agent 循环。
+//
+//	达到阈值后通过 SetAction(ActionLoopExit) 强制跳出 blades Agent 循环。
 const maxConsecutiveFailures = 3
 
 // osSpecificHint 兼容保留：旧调用点若仍引用此函数不会断链。新代码请用 fmtEnvSection。
@@ -312,6 +321,7 @@ func osSpecificHint() string {
 // 职责：基于关键词匹配判断任务是否涉及文件创建/写入动作。
 // 参数：
 //   - task：任务描述文本。
+//
 // 返回：true 表示该任务必须通过 WriteFile 工具落盘才算完成。
 // 副作用：无。
 // 并发安全：纯函数。
@@ -355,6 +365,7 @@ func taskRequiresWriteFile(task string) bool {
 // 职责：扫描工具结果列表，确认是否存在成功的 WriteFile 调用记录。
 // 参数：
 //   - results：本次 agent 执行产生的全部工具结果。
+//
 // 返回：存在成功 WriteFile 时返回 true。
 // 副作用：无。
 // 并发安全：只读切片，安全。
@@ -373,6 +384,7 @@ func hasWriteFileResult(results []*ToolResult) bool {
 // 职责：把单个工具结果压缩为一行简短摘要，供回灌给 LLM 或日志展示。
 // 参数：
 //   - r：工具执行结果。
+//
 // 返回：截断后的摘要字符串。
 // 副作用：无。
 // 并发安全：纯函数。
@@ -399,7 +411,9 @@ func summarizeToolResult(r *ToolResult) string {
 // executeAssistantWithTools 助手使用 blades.Agent + 工具执行任务。
 //
 // 职责：助手节点执行任务的对外入口，负责从 ModelFactory 取模型与 blades provider，
-//   设置 5 分钟超时，转调 executeWithTools。
+//
+//	设置 5 分钟超时，转调 executeWithTools。
+//
 // 参数：
 //   - ctx：请求上下文。
 //   - modelFactory：模型工厂，用于按角色 ID 获取 LLM 客户端与 blades provider。
@@ -411,6 +425,7 @@ func summarizeToolResult(r *ToolResult) string {
 //   - progress：进度回调。
 //   - agentName：当前 agent 名。
 //   - maxIters：ReAct 循环最大轮数（<=0 时使用默认 12）。
+//
 // 返回：最终文本与工具结果列表；modelFactory 为 nil 或取模型失败时返回空。
 // 副作用：通过 progress 推送事件；通过 executor 产生文件/命令副作用。
 // 并发安全：单次调用安全；超时通过 context 控制。

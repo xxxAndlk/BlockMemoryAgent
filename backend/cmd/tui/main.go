@@ -16,6 +16,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-isatty"
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
@@ -40,6 +41,7 @@ func main() {
 	envPath := flag.String("env", ".env", "环境变量文件路径")
 	soulPath := flag.String("soul", "config/soul.md", "人格定义文件路径")
 	skillPath := flag.String("skills", "config/skills.yaml", "Skill 池 YAML 路径（可选）")
+	noAltScreen := flag.Bool("no-alt-screen", false, "禁用 alt-screen（CI 或非 TTY 自动禁用）")
 	flag.Parse()
 
 	if _, err := os.Stat(*envPath); err == nil {
@@ -210,7 +212,14 @@ func main() {
 
 	modelName := roleCfg.MetaAgent.ModelConfig.Model
 	model := tui.NewModel(sessionMgr, registry, rt, dagHandler, pgStore, httpAddr, modelName)
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
+
+	// CI 环境或 stdin 非 TTY 时自动禁用 alt-screen，避免输出被吞或光标异常。
+	useAltScreen := !*noAltScreen && os.Getenv("CI") == "" && isatty.IsTerminal(os.Stdin.Fd())
+	opts := []tea.ProgramOption{tea.WithMouseAllMotion()}
+	if useAltScreen {
+		opts = append(opts, tea.WithAltScreen())
+	}
+	p := tea.NewProgram(model, opts...)
 	// panic 恢复：确保异常退出时记录堆栈，bubbletea 自身会恢复终端
 	defer func() {
 		if r := recover(); r != nil {
@@ -264,6 +273,8 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 			mgr.HandleSessionMetrics(w, r)
 		case "watchdog":
 			mgr.HandleSessionWatchdog(w, r)
+		case "topic":
+			mgr.HandleSessionTopic(w, r)
 		default:
 			mgr.HandleGetSession(w, r) // 无后缀：单会话详情
 		}
@@ -345,8 +356,8 @@ func defaultRoleConfig() *pkgconfig.RoleConfigFile {
 		MetaAgent:   pkgconfig.MetaAgentConfig{MaxBlocks: 5, SummaryInterval: 3},
 		DomainAgent: pkgconfig.DomainAgentConfig{},
 		FixedRoles: []types.RoleDefinition{
-			{ID: "code_assistant", Name: "代码助手", Type: types.RoleTypeFixed, Lifecycle: types.RoleLifecyclePermanent, Description: "代码编写与审查", Skills: []string{"代码编写", "代码审查"}, Keywords: []string{"代码", "bug"}, CanBeCalled: true},
-			{ID: "ui_assistant", Name: "UI助手", Type: types.RoleTypeFixed, Lifecycle: types.RoleLifecyclePermanent, Description: "前端UI实现", Skills: []string{"UI修复", "组件开发"}, Keywords: []string{"UI", "样式"}, CanBeCalled: true},
+			{ID: "code_assistant", Name: "代码助手", Type: enums.RoleTypeFixed, Lifecycle: enums.RoleLifecyclePermanent, Description: "代码编写与审查", Skills: []string{"代码编写", "代码审查"}, Keywords: []string{"代码", "bug"}, CanBeCalled: true},
+			{ID: "ui_assistant", Name: "UI助手", Type: enums.RoleTypeFixed, Lifecycle: enums.RoleLifecyclePermanent, Description: "前端UI实现", Skills: []string{"UI修复", "组件开发"}, Keywords: []string{"UI", "样式"}, CanBeCalled: true},
 		},
 	}
 }

@@ -11,7 +11,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/server"
-	"github.com/blockmemory/agent/backend/pkg/types"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
 // ansiRegex 匹配 ANSI 转义序列（CSI/OSC 等）。T10 修复：
@@ -153,11 +153,11 @@ func (m *Model) buildAgentsLines() []string {
 		prefix := strings.Repeat("  ", node.depth)
 		var icon string
 		switch node.roleType {
-		case types.RoleTypeMeta:
+		case enums.RoleTypeMeta:
 			icon = "◆"
-		case types.RoleTypeDomain:
+		case enums.RoleTypeDomain:
 			icon = "◆"
-		case types.RoleTypeSubDomain:
+		case enums.RoleTypeSubDomain:
 			icon = "◇"
 		default:
 			icon = "▸"
@@ -186,9 +186,23 @@ func chatItems(s *server.Session) []chatItem {
 	// filtered to keep the view readable.
 	var items []chatItem
 	for _, msg := range s.Messages {
+		// v2.0：用户输入前缀 ">"，助手回复普通文本，系统消息折叠
+		var title string
+		var detail string
+		switch msg.Role {
+		case enums.ChatRoleUser:
+			title = "> " + strings.TrimSpace(msg.Content)
+		case enums.ChatRoleAssistant:
+			title = strings.TrimSpace(msg.Content)
+			detail = ""
+		default:
+			// system / tool 等角色按原格式展示
+			title = fmt.Sprintf("[%s] %s", msg.Role, msg.Timestamp.Format("15:04:05"))
+			detail = formatMarkdown(msg.Content)
+		}
 		items = append(items, chatItem{
-			title:     fmt.Sprintf("[%s] %s", msg.Role, msg.Timestamp.Format("15:04:05")),
-			detail:    formatMarkdown(msg.Content),
+			title:     title,
+			detail:    detail,
 			timestamp: msg.Timestamp,
 		})
 	}
@@ -238,7 +252,6 @@ func (m *Model) buildTranscriptLines() []string {
 // eventChatItem 把一个 SessionEvent 映射为对话区的一行（title + detail）。
 // 返回 ok=false 表示该事件类型不展示（调试噪声）。
 func eventChatItem(ev server.SessionEvent) (title, detail string, ok bool) {
-	ts := ev.Timestamp.Format("15:04:05")
 	switch {
 	case ev.Type == "tool_exec" || ev.Kind == "tool_call":
 		tool := ev.Tool
@@ -246,10 +259,16 @@ func eventChatItem(ev server.SessionEvent) (title, detail string, ok bool) {
 			tool = "tool"
 		}
 		status := "✓"
-		if !ev.Success {
+		if ev.Kind == "tool_call" {
+			status = "●"
+		}
+		if !ev.Success && ev.Type == "tool_exec" {
 			status = "✗"
 		}
-		title = fmt.Sprintf("🔧 %s %s · %s", tool, status, ts)
+		title = fmt.Sprintf("[%s] %s: %s", status, tool, ev.ToolPath)
+		if title == fmt.Sprintf("[%s] %s: ", status, tool) {
+			title = fmt.Sprintf("[%s] %s", status, tool)
+		}
 		var d strings.Builder
 		if ev.Message != "" {
 			d.WriteString(ev.Message)
@@ -266,12 +285,18 @@ func eventChatItem(ev server.SessionEvent) (title, detail string, ok bool) {
 			d.WriteByte('\n')
 		}
 		return title, strings.TrimRight(d.String(), "\n"), true
+	case ev.Kind == "memory_recall":
+		return "🧠 recalled: " + strings.TrimSpace(ev.Message), "", true
+	case ev.Kind == "topic_switch":
+		msg := ev.Message
+		if msg == "" {
+			msg = "切换话题"
+		}
+		return "─── " + msg + " ───", "", true
 	case ev.Kind == "llm_result" || ev.Kind == "think" || ev.Kind == "llm" || ev.Kind == "intend" || ev.Kind == "wait":
-		title = fmt.Sprintf("💭 %s · %s", ev.Agent, ts)
-		return title, ev.Message, true
+		return ev.Message, "", true
 	case ev.Kind == "error" || ev.Type == "error":
-		title = fmt.Sprintf("✗ Error · %s · %s", ev.Agent, ts)
-		return title, ev.Message, true
+		return "✗ Error: " + ev.Message, "", true
 	}
 	return "", "", false
 }
@@ -398,17 +423,138 @@ func replacePairs(text, marker string, f func(string) string) string {
 
 func statusIcon(status string) string {
 	switch status {
-	case "running", string(types.RoleStatusActive), string(board.TaskInProgress):
+	case "running", string(enums.RoleStatusActive), string(board.TaskInProgress):
 		return "●"
-	case "awaiting_clarify", string(types.RoleStatusWaiting), string(board.TaskBlocked):
+	case "awaiting_clarify", string(enums.RoleStatusWaiting), string(board.TaskBlocked):
 		return "◐"
 	case "completed", string(board.TaskDone):
 		return "✓"
 	case "error", string(board.TaskFailed):
 		return "✗"
-	case string(board.TaskPending), string(types.RoleStatusIdle):
+	case string(board.TaskPending), string(enums.RoleStatusIdle):
 		return "◦"
 	default:
 		return "◦"
 	}
+}
+
+// formatTopBar 按 v2.0 格式渲染顶部状态栏：
+// BlockMemoryAgent > {sessionID}  ●running  {N} agents active  in:{in} out:{out}
+func formatTopBar(styles *Styles, sessionID, status string, agentCount, inTokens, outTokens int) string {
+	if sessionID == "" {
+		sessionID = "-"
+	}
+	if status == "" {
+		status = "idle"
+	}
+	icon := statusIcon(status)
+	agents := ""
+	if agentCount > 0 {
+		agents = fmt.Sprintf("  %d agents active", agentCount)
+	}
+	tokenStr := ""
+	if inTokens > 0 || outTokens > 0 {
+		tokenStr = fmt.Sprintf("  in:%d out:%d", inTokens, outTokens)
+	}
+	left := styles.Title.Render("BlockMemoryAgent") + styles.StatLabel.Render(" > ") + styles.StatValue.Render(sessionID)
+	mid := styles.StatValue.Render("  "+icon+status) + styles.StatValue.Render(agents)
+	right := styles.StatLabel.Render(tokenStr)
+	return left + mid + right
+}
+
+// formatPlanBar 渲染计划进度栏。
+// 有任务看板时显示当前计划步骤与进度；无计划时显示 [direct] 直接回答。
+func formatPlanBar(styles *Styles, snap board.Snapshot) string {
+	if len(snap.Tasks) == 0 {
+		return styles.Dim.Render("[direct] 直接回答")
+	}
+	done := 0
+	current := 0
+	for i, t := range snap.Tasks {
+		if t.Status == board.TaskDone {
+			done++
+		}
+		if t.Status == board.TaskInProgress || t.Status == board.TaskBlocked {
+			current = i + 1
+		}
+	}
+	if current == 0 && done < len(snap.Tasks) {
+		current = done + 1
+	}
+	var steps []string
+	for i, t := range snap.Tasks {
+		step := fmt.Sprintf("%d.%s", i+1, t.Title)
+		if i+1 == current {
+			step = styles.StatValue.Render(step)
+		} else if i+1 <= done {
+			step = styles.Dim.Render(step)
+		}
+		steps = append(steps, step)
+	}
+	progressIcon := "●"
+	if done == len(snap.Tasks) {
+		progressIcon = "✓"
+	}
+	return fmt.Sprintf("[plan] %s   [%d/%d] %s",
+		strings.Join(steps, " → "),
+		current,
+		len(snap.Tasks),
+		styles.StatValue.Render(progressIcon),
+	)
+}
+
+// renderAgentPanel 渲染右侧 Agent 面板。
+func renderAgentPanel(m *Model, w int) string {
+	s := m.selectedSession()
+	if s == nil {
+		return m.styles.BlurBorder.Width(w).Render(m.styles.Dim.Render("No active session"))
+	}
+
+	var lines []string
+	lines = append(lines, m.styles.Header.Render("Agents"))
+
+	if len(m.agentsNodes) == 0 {
+		lines = append(lines, m.styles.Dim.Render("  (no agents)"))
+	} else {
+		for _, node := range m.agentsNodes {
+			prefix := strings.Repeat("  ", node.depth)
+			icon := statusIcon(string(node.status))
+			name := node.name
+			if node.goal != "" {
+				name += " " + m.styles.Dim.Render(truncate(node.goal, w-12))
+			}
+			lines = append(lines, fmt.Sprintf("%s%s %s %s", prefix, icon, name, m.styles.Dim.Render("")))
+		}
+	}
+
+	lines = append(lines, "", m.styles.Header.Render("Memory"))
+	recalls := recentMemoryRecalls(s, 3)
+	if len(recalls) == 0 {
+		lines = append(lines, m.styles.Dim.Render("  (none)"))
+	} else {
+		for _, r := range recalls {
+			lines = append(lines, m.styles.Dim.Render("  • "+truncate(r, w-4)))
+		}
+	}
+
+	lines = append(lines, "", m.styles.Header.Render("Tokens"))
+	lines = append(lines, fmt.Sprintf("  in:%d out:%d", m.totalInputTokens, m.totalOutputTokens))
+
+	content := strings.Join(lines, "\n")
+	return m.styles.BlurBorder.Width(w).Height(m.height - 2).Render(content)
+}
+
+// recentMemoryRecalls 从会话事件中抽取最近召回的记忆片段。
+func recentMemoryRecalls(s *server.Session, limit int) []string {
+	if limit <= 0 {
+		limit = 3
+	}
+	var out []string
+	for i := len(s.Events) - 1; i >= 0 && len(out) < limit; i-- {
+		ev := s.Events[i]
+		if ev.Kind == "memory_recall" && strings.TrimSpace(ev.Message) != "" {
+			out = append([]string{strings.TrimSpace(ev.Message)}, out...)
+		}
+	}
+	return out
 }

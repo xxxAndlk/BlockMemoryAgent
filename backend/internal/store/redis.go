@@ -31,6 +31,7 @@ type RedisStore struct {
 //   - addr:     Redis 地址 (host:port)
 //   - password: 认证密码,空表示无密码
 //   - db:       Redis 数据库编号
+//
 // 返回:
 //   - *RedisStore: 已通过 Ping 校验的存储实例
 //   - error: Ping 失败时返回包装错误
@@ -57,6 +58,7 @@ func (s *RedisStore) Close() error {
 // Ping 检查 Redis 连通性,用于健康检查。
 // 参数:
 //   - ctx: 超时控制
+//
 // 返回: Ping 错误。
 func (s *RedisStore) Ping(ctx context.Context) error {
 	return s.client.Ping(ctx).Err()
@@ -66,6 +68,7 @@ func (s *RedisStore) Ping(ctx context.Context) error {
 // 参数:
 //   - topicID: 话题 ID
 //   - suffix:  子类型 (meta/constraints/events/outputs:xxx 等)
+//
 // 返回: 形如 "topic:{topicID}:{suffix}" 的 key。
 func (s *RedisStore) topicKey(topicID, suffix string) string {
 	return fmt.Sprintf("topic:%s:%s", topicID, suffix)
@@ -74,6 +77,7 @@ func (s *RedisStore) topicKey(topicID, suffix string) string {
 // SaveTopicMeta 保存话题元数据到 Redis Hash。
 // 参数:
 //   - topic: 话题元数据
+//
 // 返回: HSet 错误。
 // 副作用: CreatedAt 为零值时补为当前时间;ExpiresAt 非空时一并写入。
 func (s *RedisStore) SaveTopicMeta(ctx context.Context, topic *types.TopicMeta) error {
@@ -98,6 +102,7 @@ func (s *RedisStore) SaveTopicMeta(ctx context.Context, topic *types.TopicMeta) 
 // GetTopicMeta 获取话题元数据。
 // 参数:
 //   - topicID: 话题 ID
+//
 // 返回: 命中返回 *TopicMeta;Hash 为空 (话题不存在) 返回 (nil, nil)。
 // 注意: 时间字段按 RFC3339 解析,解析失败则对应字段保持零值。
 func (s *RedisStore) GetTopicMeta(ctx context.Context, topicID string) (*types.TopicMeta, error) {
@@ -129,6 +134,7 @@ func (s *RedisStore) GetTopicMeta(ctx context.Context, topicID string) (*types.T
 // 参数:
 //   - topicID:     话题 ID
 //   - constraints: 约束键值对
+//
 // 返回: HSet 错误。
 func (s *RedisStore) SetTopicConstraints(ctx context.Context, topicID string, constraints map[string]string) error {
 	return s.client.HSet(ctx, s.topicKey(topicID, "constraints"), constraints).Err()
@@ -137,6 +143,7 @@ func (s *RedisStore) SetTopicConstraints(ctx context.Context, topicID string, co
 // GetTopicConstraints 获取话题的全局约束。
 // 参数:
 //   - topicID: 话题 ID
+//
 // 返回: 约束键值对 map;话题无约束时返回空 map。
 func (s *RedisStore) GetTopicConstraints(ctx context.Context, topicID string) (map[string]string, error) {
 	return s.client.HGetAll(ctx, s.topicKey(topicID, "constraints")).Result()
@@ -146,6 +153,7 @@ func (s *RedisStore) GetTopicConstraints(ctx context.Context, topicID string) (m
 // 参数:
 //   - topicID: 话题 ID
 //   - output:  Agent 输出 (含 AgentID 与 Version)
+//
 // 返回: 序列化或 ZAdd 错误。
 // 设计意图: 同一 Agent 的多版本输出按 Version 分数排序,支持历史回溯。
 func (s *RedisStore) SaveAgentOutput(ctx context.Context, topicID string, output *types.AgentOutput) error {
@@ -165,6 +173,7 @@ func (s *RedisStore) SaveAgentOutput(ctx context.Context, topicID string, output
 // GetAgentOutputs 获取 Agent 在某话题下的全部输出 (按版本升序)。
 // 参数:
 //   - topicID, agentID: 检索范围
+//
 // 返回: AgentOutput 切片;反序列化失败的成员被跳过。
 func (s *RedisStore) GetAgentOutputs(ctx context.Context, topicID, agentID string) ([]*types.AgentOutput, error) {
 	key := s.topicKey(topicID, fmt.Sprintf("outputs:%s", agentID))
@@ -188,6 +197,7 @@ func (s *RedisStore) GetAgentOutputs(ctx context.Context, topicID, agentID strin
 // GetLatestAgentOutput 获取 Agent 最新版本输出。
 // 参数:
 //   - topicID, agentID: 检索范围
+//
 // 返回: 最新 AgentOutput;无数据时返回 (nil, nil)。
 // 设计意图: 取 Sorted Set 中 score 最大的成员 (ZRevRange 0 0)。
 func (s *RedisStore) GetLatestAgentOutput(ctx context.Context, topicID, agentID string) (*types.AgentOutput, error) {
@@ -212,6 +222,7 @@ func (s *RedisStore) GetLatestAgentOutput(ctx context.Context, topicID, agentID 
 // 参数:
 //   - topicID: 话题 ID
 //   - event:   待推送事件
+//
 // 返回: 序列化或 XAdd 错误。
 // 设计意图: Stream 提供有序、可消费的事件流,供跨 Agent 通信使用。
 func (s *RedisStore) PushEvent(ctx context.Context, topicID string, event *types.Event) error {
@@ -233,6 +244,7 @@ func (s *RedisStore) PushEvent(ctx context.Context, topicID string, event *types
 // 参数:
 //   - topicID: 话题 ID
 //   - count:   最多拉取条数,<=0 时默认 10
+//
 // 返回: 状态为 Pending 的事件切片。
 // 实现: 维护 per-topic 的 stream 游标（last message ID），从游标位置 XRead 增量拉取，
 // 避免 stream 增长后每次全量读取导致 O(n) 退化（C4 修复）。游标在内存中，
@@ -293,6 +305,7 @@ func (s *RedisStore) PollEvents(ctx context.Context, topicID string, count int64
 // 参数:
 //   - topicID:  话题 ID
 //   - decision: 决策文本
+//
 // 返回: LPush 错误。
 // 副作用: 新决策插入到列表头部,最新决策排在最前。
 func (s *RedisStore) AppendDecision(ctx context.Context, topicID, decision string) error {
@@ -304,6 +317,7 @@ func (s *RedisStore) AppendDecision(ctx context.Context, topicID, decision strin
 // 参数:
 //   - topicID: 话题 ID
 //   - count:   最多返回条数,<=0 时默认 50
+//
 // 返回: 决策文本切片 (按 LPush 顺序,最新在前)。
 func (s *RedisStore) GetDecisions(ctx context.Context, topicID string, count int64) ([]string, error) {
 	if count <= 0 {
@@ -319,6 +333,7 @@ func (s *RedisStore) GetDecisions(ctx context.Context, topicID string, count int
 // 参数:
 //   - topicID: 话题 ID
 //   - deps:    依赖关系 map (agentID -> 依赖的 agentID 列表)
+//
 // 返回: 序列化或 Set 错误。
 // 副作用: 以 String 类型存储,TTL 为 0 (永久)。
 func (s *RedisStore) SetDepsGraph(ctx context.Context, topicID string, deps map[string][]string) error {
@@ -334,6 +349,7 @@ func (s *RedisStore) SetDepsGraph(ctx context.Context, topicID string, deps map[
 // GetDepsGraph 获取话题的依赖关系图。
 // 参数:
 //   - topicID: 话题 ID
+//
 // 返回: 依赖关系 map;key 不存在返回 (nil, nil)。
 func (s *RedisStore) GetDepsGraph(ctx context.Context, topicID string) (map[string][]string, error) {
 	data, err := s.client.Get(ctx, s.topicKey(topicID, "deps_graph")).Result()
@@ -355,6 +371,7 @@ func (s *RedisStore) GetDepsGraph(ctx context.Context, topicID string) (map[stri
 // 参数:
 //   - snapshot: 含 AgentID/TopicID 与完整上下文状态
 //   - ttl:      过期时间;<=0 时默认 7 天
+//
 // 返回: 序列化或 Set 错误。
 // 设计意图: 作为 PG 快照的前置缓存,减少回源延迟;TTL 控制缓存时效。
 func (s *RedisStore) SaveSnapshot(ctx context.Context, snapshot *types.AgentSnapshot, ttl time.Duration) error {
@@ -374,6 +391,7 @@ func (s *RedisStore) SaveSnapshot(ctx context.Context, snapshot *types.AgentSnap
 // GetSnapshot 从 Redis 获取快照。
 // 参数:
 //   - agentID, topicID: 快照定位
+//
 // 返回: 命中返回 *AgentSnapshot;key 不存在返回 (nil, nil)。
 // 设计意图: 热加载路径优先查 Redis,未命中再回源 PG。
 func (s *RedisStore) GetSnapshot(ctx context.Context, agentID, topicID string) (*types.AgentSnapshot, error) {
@@ -400,6 +418,7 @@ func (s *RedisStore) GetSnapshot(ctx context.Context, agentID, topicID string) (
 //   - outputs:   产出 JSON 字节 (本实现未使用)
 //   - decisions: 决策 JSON 字节 (本实现未使用)
 //   - embedding: 摘要向量 (本实现未使用)
+//
 // 返回: Set 错误。
 // 注意: Redis 侧仅缓存 summary 文本,完整归档由 PostgresStore.SaveTopicArchive 持久化。
 func (s *RedisStore) SaveTopicArchive(ctx context.Context, topicID, summary string, outputs, decisions []byte, embedding []float32) error {
@@ -411,6 +430,7 @@ func (s *RedisStore) SaveTopicArchive(ctx context.Context, topicID, summary stri
 // 参数:
 //   - topicID:    话题 ID
 //   - ttlSeconds: TTL 秒数
+//
 // 返回: 底层 SetTopicTTLDuration 错误。
 func (s *RedisStore) SetTopicTTL(ctx context.Context, topicID string, ttlSeconds int) error {
 	return s.SetTopicTTLDuration(ctx, topicID, time.Duration(ttlSeconds)*time.Second)
@@ -420,6 +440,7 @@ func (s *RedisStore) SetTopicTTL(ctx context.Context, topicID string, ttlSeconds
 // 参数:
 //   - topicID: 话题 ID
 //   - ttl:     过期时长
+//
 // 返回: Scan 迭代错误。
 // 副作用: 通过 SCAN 遍历 topic:{id}:* 模式的 key,逐个设置 Expire。
 // 注意: 不设置 ttl<=0 的兜底,由调用方保证。
@@ -437,6 +458,7 @@ func (s *RedisStore) SetTopicTTLDuration(ctx context.Context, topicID string, tt
 // DeleteTopic 删除话题的所有数据。
 // 参数:
 //   - topicID: 话题 ID
+//
 // 返回: Del 错误或 Scan 迭代错误。
 // 副作用: SCAN 收集所有 topic:{id}:* 的 key 后批量 DEL。
 func (s *RedisStore) DeleteTopic(ctx context.Context, topicID string) error {

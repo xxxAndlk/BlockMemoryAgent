@@ -31,6 +31,7 @@ func newFailureCounter() *failureCounter {
 //
 // 参数：
 //   - name：工具名。
+//
 // 返回：累计后的连续失败次数。
 // 并发安全：持锁操作，安全。
 func (f *failureCounter) fail(name string) int {
@@ -44,6 +45,7 @@ func (f *failureCounter) fail(name string) int {
 //
 // 参数：
 //   - name：工具名。
+//
 // 并发安全：持锁操作，安全。
 func (f *failureCounter) reset(name string) {
 	f.mu.Lock()
@@ -54,7 +56,8 @@ func (f *failureCounter) reset(name string) {
 // 工具入参类型。json schema 由 tools.NewFunc 自动生成。
 //
 // 设计意图：每个工具的入参用一个独立 struct 表达，配合 tools.NewFunc 泛型函数
-//   自动生成 JSON Schema 与反序列化逻辑，避免手写 schema。
+//
+//	自动生成 JSON Schema 与反序列化逻辑，避免手写 schema。
 type (
 	readFileInput struct {
 		Path string `json:"path"` // 文件路径，相对工作目录或绝对路径
@@ -91,7 +94,9 @@ type (
 // 所有 blades.Tool 共用同一个 runner，通过 name 区分。
 //
 // 职责：作为 7 个内置工具的统一执行适配层，把 blades.Tool 的调用转发给
-//   ToolExecutor，同时推送 ProgressEvent 并维护连续失败计数。
+//
+//	ToolExecutor，同时推送 ProgressEvent 并维护连续失败计数。
+//
 // 并发安全：results 切片通过 mu 保护；failures 内部自带锁；其余字段只读。
 type toolRunner struct {
 	executor *ToolExecutor    // 沙箱执行器，真正干活的人
@@ -110,6 +115,7 @@ type toolRunner struct {
 //   - kind：事件类型，如 "tool_call" / "tool_result" / "error"。
 //   - msg：人类可读描述。
 //   - detail：可选详情（工具参数 / 错误信息 / 截断输出）。
+//
 // 副作用：progress 非 nil 时触发回调。
 func (r *toolRunner) emit(ctx context.Context, kind, msg, detail string) {
 	if r.progress != nil {
@@ -129,14 +135,19 @@ func (r *toolRunner) emitTool(ctx context.Context, kind, tool, msg, detail strin
 // 失败达阈值时通过 ToolContext 设置 ActionLoopExit 跳出 Agent 循环。
 //
 // 职责：单次工具调用的核心流程——推送调用事件、执行工具、记录结果、推送结果事件、
-//   必要时强制退出 Agent 循环。
+//
+//	必要时强制退出 Agent 循环。
+//
 // 参数：
 //   - ctx：blades 传入的上下文，可能携带 tools.ToolContext。
 //   - name：工具名（已归一化前的原名，用于事件展示与失败计数）。
 //   - args：工具入参 map。
+//
 // 返回：工具结果序列化后的 JSON 字符串（成功失败都返回 JSON，错误不通过 error）。
 // 副作用：通过 executor 产生文件/命令/网络副作用；通过 progress 推送事件；
-//   达失败阈值时设置 tools.ActionLoopExit。
+//
+//	达失败阈值时设置 tools.ActionLoopExit。
+//
 // 并发安全：results 追加持锁；failures 内部持锁；可被 Agent 并发调用。
 func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) string {
 	argsStr, _ := json.Marshal(args) // 序列化参数用于事件展示
@@ -178,14 +189,17 @@ func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) 
 // 复用 ToolExecutor 的沙箱实现，结果通过 toolRunner 推送 ProgressEvent。
 //
 // 职责：为 blades Agent 装配 7 个内置工具（ReadFile/WriteFile/ListDir/RunCommand/
-//   SearchInFiles/HTTPGet/HTTPPost），每个工具的入参用独立 struct 描述，
-//   实际执行统一委托给 toolRunner.run → ToolExecutor.Execute。
+//
+//	SearchInFiles/HTTPGet/HTTPPost），每个工具的入参用独立 struct 描述，
+//	实际执行统一委托给 toolRunner.run → ToolExecutor.Execute。
+//
 // 参数：
 //   - executor：本地工具沙箱执行器。
 //   - progress：进度回调，可空。
 //   - sessionID：当前会话 ID，用于事件归属。
 //   - agentName：当前 agent 名，用于事件归属。
 //   - results：指向外部 slice，用于收集所有工具结果。
+//
 // 返回：长度 ≤7 的 blades.Tool 切片（某个工具构造失败时会跳过）。
 // 副作用：无（仅构造工具定义，不执行）。
 // 并发安全：返回的工具集合由调用方独占使用；内部 toolRunner 自带锁。

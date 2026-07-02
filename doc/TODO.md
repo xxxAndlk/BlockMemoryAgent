@@ -45,18 +45,93 @@
   - 删 `meta_agent.go` 中 `classifyComplexityLLM` 死代码
   - `go vet`/`gofmt` 零告警（gofmt 单独一次格式化提交）
 
+**P1-1. 删 DomainArchive 召回 + 块记忆键值化**（合并重叠机制）
+- 现状：DomainArchive（特性4）与 BlockMemory（特性3）同表存两份近同内容，生命周期割裂，场景C（Archive 过期 BlockMemory 仍在）导致 Skill 装配与 prompt 注入割裂。
+- 方案：
+  - 删 DomainArchive 相关代码（`store/domain_archive.go` + `domain_agent.go` 中 `ensureSkillSet` 归档复用路径）
+  - `ensureSkillSet` 改为只走 LLM AssembleSet
+  - BlockMemory 键值化：`Meta.facts` 改为结构化数组
+    ```
+    facts: [
+      {key:"vue_version", value:"3.4", scope:"global"},
+      {key:"css_framework", value:"tailwind", scope:"domain"},
+      {key:"error_pattern", value:"padding不一致", scope:"task"}
+    ]
+    ```
+  - 检索精细化：当前领域任务只取 `scope=domain`+`scope=task`，全局共享取 `scope=global`
+  - `write.go` 现有 `Facts` 三元组可复用，改格式即可
+- 收益：注入 prompt 按需取键，token 省、精准度高。
+
+**P1-2. 完整日志 + Agent IO 可视化**（调试与可观测基础）
+- 现状：8 处 log.Printf 散落，`llm_tracker.go` 476 行已有追踪基础但未串联。
+- 目标日志链路：
+  ```
+  MetaAgent.Invoke
+    ├─ [routing] goal=xxx → path=create_domain
+    ├─ [llm_call] prompt=xxx → response=xxx (tokens=1234, latency=800ms)
+    ├─ [task_split] tasks=[a,b,c]
+    ├─ [domain_create] domain=css skills=[vue,css]
+    │
+    ├─ DomainAgent.Invoke
+    │   ├─ [memory_recall] block_memory query=xxx → hits=2
+    │   ├─ [memory_inject] context=xxx (truncated to 2000 tokens)
+    │   ├─ [llm_call] prompt=xxx → response=xxx
+    │   ├─ [tool_call] WriteFile path=xxx size=1.2KB
+    │   └─ [result] summary=xxx
+    │
+    └─ [meta_summary] session done, total_tokens=12345
+  ```
+- 实现：
+  - 结构化 JSON 日志（zap/slog），按 sessionID 串联
+  - 日志写入 `session_logs` 表，Web API `/api/sessions/{id}/logs` 查询
+  - Web 端日志分析页：按 session/agent/level 过滤，Prompt/Response 全文可展开（脱敏 API Key）
+  - Token 消耗面板：按 Agent/模型/任务类型聚合
+
+**P1-3. 特性加 TODO 暂不做**（聚焦主路径）
+- 以下特性保留代码但 feature flag 默认关，写入此 TODO 待完善，默认关的 feature 需有单测覆盖防代码腐烂：
+  - Plan-and-Execute + Self-Reflection（`agent.plan_enabled` / `agent.reflection_enabled`）
+  - SubDomain 自适应启用（`state.EnableSubdomain`）
+  - DAG 定时任务流程（特性1）
+  - 抢占中断与队列注入（特性6）
+  - 人机对话处理（特性5）
+  - DomainAgent 持久化归档（特性4，P1-1 删除后此条作废）
+  - 
 ---
 
 ## 待完成（按优先级分级）
 
 ### P0 — 核心承诺修复，必须先做
 
+**P0-1. 轻量级总结模型优化**
+- 现状：超时后无重试机制，需要3次重试机制。每个Agent在启动时添加一个测试，测试Agent是否成功访问LLM，若无响应则重试，重试三次失败则启动失败，报错哪些Agent没有成功连接，主要是配置中与固定助手检验。
 
 **P0-2. 回调写入优化**（数据可靠性根基）
 - 后期仍然需要回调写入队列+重试优化。
 
 **P0-3. 大文件拆分 + 技术债清理**（其他改动的前置）
 - 还有部分大文件，可后期优化
+- 现状实测（2026-07-02）：`three_layer_graph.go` 814行 / `tool_executor.go` 714行 / `llm_tools.go` 449行 / `llm_tracker.go` 499行，4 个文件超 400 行限制
+- 继续拆分目标：
+  - `three_layer_graph.go` → 抽 `graph_resolve.go`(节点解析) + `graph_loop.go`(Invoke 循环) + `graph_routes.go`(determineNext 路由)
+  - `tool_executor.go` → 按工具类别拆分（文件类/命令类/HTTP类）
+  - `llm_tools.go` → 抽 `blades_agent_runner.go`(agent.Run 循环) + `blades_tools_build.go`(工具构造)
+  - `llm_tracker.go` → 抽 `tracker_stats.go`(Stats/Report) + `tracker_records.go`(RecordCall/Records)
+
+**P0-4. blade 路径 token 计量接入**（测试报告 High 级真实问题）
+- 现状：`LLMCallTracker.CallWithTimeout` 仅在 `meta_llm.go`/`domain_llm.go`/`subdomain_llm.go` 的 `callLLMAs` 路径调用；`executeWithTools`（`llm_tools.go:200-278`）走 blades `agent.Run` 生成器循环，**无 `llmTracker.RecordCall` 调用**，仅 `emitDetail(ctx, "token_usage", ...)` 推 dur，未记录 input/output tokens。
+- 根因：blades `agent.Run` 不暴露 per-call token usage，`BladesClient.Generate` 也未提取 `resp.Usage`（OpenAI 兼容响应标准字段）。
+- 修复：
+  - `BladesClient.Generate` / `GenerateWithSystem` / `GenerateWithOptions` 提取 `resp.Message` 或 `resp.Usage` 的 token 字段
+  - `executeWithTools` 在每轮 `agent.Run` yield 后或结束时调 `llmTracker.RecordCall`
+  - Web 端 Token 消耗面板的 Input/Output/Calls 字段才能填充（当前全零）
+
+**P0-5. DomainArchive 死代码清理**（P1-1 删除 DomainArchive 召回后的残留）
+- 现状：P1-1 计划删除 DomainArchive 召回机制（`store/domain_archive.go` + `domain_agent.go` 中 `ensureSkillSet` 归档复用路径），删除后需清理残留：
+  - `store/domain_archive.go` 整文件删除（若 P1-1 已删则跳过）
+  - `graph/util.go` 中 `SaveDomainArchive` / `SearchDomainArchive` / `DomainArchiveRecord` 接口定义删除
+  - `domain_agent.go` 中 `archiveStore` 字段及相关注入删除
+  - `enums.KnowledgeTypeDomainArchive` 常量保留（历史数据兼容）或删除（激进）
+- 验证：`go vet`/`staticcheck` 扫描无未使用符号
 
 ### P2 — 体验与验证
 
@@ -65,6 +140,10 @@
 - 核心要素：主对话占 80% 高度、底部状态栏（plan 进度+工具状态）、Tab 切换右侧 Agent 列表面板、记忆召回指示 `🧠 recalled: ...`、话题切换提示。
 - 现状偏离：commit `83f3b1a`/`6f0d90b`/`2cb102b` 多次返工未对齐文档。
 - 方案：先按文档重写布局，再迁现有 HTTP 驱动逻辑，不在旧实现上打补丁。
+- 同步修复：TUI alt-screen 与自动化工具/overlay 焦点冲突（测试报告 Low 级真实问题）
+  - 加 `--no-alt-screen` CLI flag，bubbletea `WithoutAltScreen` 选项
+  - 检测 CI/自动化环境（`CI` env / 非 TTY）自动禁用 alt-screen
+  - Computer Use 测试场景可用此 flag
 
 **P2-2. 集成测试模块整理**
 - 现状：`test/aiopstest/` AIOps 场景完整，编程主场景缺失。

@@ -49,6 +49,13 @@ type ThreeLayerGraph struct {
 	snapshotMgr  AgentSnapshotManager      // Agent 快照管理器（DomainAgent 启动加载/结束保存）
 }
 
+// Factory 暴露角色工厂，供 server 层在需要时动态创建 DomainAgent 实例。
+func (g *ThreeLayerGraph) Factory() *RoleFactory {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.factory
+}
+
 // SetBlockMemoryStore 在已构建的图上注入块记忆存储（特性3）。
 // 供 server / main 后注入；同步给已存在的 DomainAgent 静态节点与动态缓存。
 func (g *ThreeLayerGraph) SetBlockMemoryStore(s BlockMemoryStore) {
@@ -547,11 +554,11 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 
 	// 按实例类型构造对应节点
 	switch inst.Type {
-	case types.RoleTypeDomain:
+	case enums.RoleTypeDomain:
 		node = NewDomainAgentNode(instID, g.registry, g.factory)
-	case types.RoleTypeSubDomain:
+	case enums.RoleTypeSubDomain:
 		node = NewSubDomainAgentNode(instID, g.registry, g.factory)
-	case types.RoleTypeFixed, types.RoleTypeDynamic:
+	case enums.RoleTypeFixed, enums.RoleTypeDynamic:
 		node = NewAssistantNode(instID, g.registry, nil)
 	default:
 		return nil // 未知类型，无法构造
@@ -639,11 +646,11 @@ func (g *ThreeLayerGraph) determineNext(current string, state *types.ThreeLayerS
 		// 动态实例 ID：查类型再分发
 		if inst := g.registry.GetInstance(current); inst != nil {
 			switch inst.Type {
-			case types.RoleTypeDomain:
+			case enums.RoleTypeDomain:
 				return g.domainAgentNext(state)
-			case types.RoleTypeSubDomain:
+			case enums.RoleTypeSubDomain:
 				return g.subDomainAgentNext(state)
-			case types.RoleTypeFixed, types.RoleTypeDynamic:
+			case enums.RoleTypeFixed, enums.RoleTypeDynamic:
 				return g.assistantNext(state)
 			}
 		}

@@ -21,7 +21,6 @@ func (n *DomainAgentNode) matchFixedAssistant(task string) *types.RoleDefinition
 	return CommonMatchFixedAssistant(n.registry, task)
 }
 
-//
 // 职责：为每个任务创建/匹配一个 Assistant，并发执行后收集结果。
 //
 // 参数：

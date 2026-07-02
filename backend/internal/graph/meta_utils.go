@@ -109,14 +109,15 @@ func (n *MetaAgentNode) metaDirectRoleDef() *types.RoleDefinition {
 		Name:         "MetaAgent",
 		SystemPrompt: systemPrompt,
 		Description:  "主 Agent 直接执行",
-		Type:         types.RoleTypeMeta,
+		Type:         enums.RoleTypeMeta,
 	}
 }
 
 // executeDirect MetaAgent 直接跑工具循环执行任务（RouteDirectTool / RouteDirectAssistant 共用）。
 //
 // 职责：用给定 roleDef 调 CommonExecuteAssistantTask 跑 blades ReAct 工具循环，
-//   把结果写入 SessionSummary 并置 ActionFinish，不创建 DomainAgent/SubDomainAgent。
+//
+//	把结果写入 SessionSummary 并置 ActionFinish，不创建 DomainAgent/SubDomainAgent。
 //
 // 参数：
 //   - ctx：请求上下文。
