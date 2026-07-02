@@ -26,8 +26,10 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEnter:
-		// Shift+Enter 插入换行；普通 Enter 提交。
-		if msg.Shift {
+		// Alt+Enter 插入换行；普通 Enter 提交。
+		// 注：bubbletea v1.3.10 的 KeyMsg 仅有 Alt 修饰位（无 Shift），
+		// 故用 Alt+Enter 作为多行换行键。
+		if msg.Alt {
 			m.inputRunes = append(m.inputRunes[:m.inputCursor], append([]rune{'\n'}, m.inputRunes[m.inputCursor:]...)...)
 			m.inputCursor++
 			return m, nil
@@ -156,10 +158,65 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
+	// 纯本地命令：无需选中会话即可执行（P2-1 命令模式补全）
+	switch parts[0] {
+	case "/help":
+		m.openHelpPopup()
+		return
+	case "/agents":
+		// 选中会话时打开 agent 拓扑面板；无会话则提示
+		if m.selectedSession() == nil {
+			m.flashMsg("no active session")
+			return
+		}
+		m.toggleAgentsPopup()
+		return
+	}
+
 	s := m.selectedSession()
 	if s == nil {
 		// No session yet: treat plain input as a new conversation goal.
 		m.createSession(cmd)
+		return
+	}
+
+	// 需选中会话的本地命令（P2-1）
+	switch parts[0] {
+	case "/status":
+		// 展示当前会话状态摘要
+		m.flashMsg(fmt.Sprintf("session %s: status=%s agents=%d", s.ID, s.Status, len(m.agentsNodes)))
+		return
+	case "/clear":
+		// 重置主对话区滚动到最新（chat 由服务端事件驱动，本地仅重置视图位置）
+		m.chatFollowBottom = true
+		m.chatScrollLine = 0
+		m.flashMsg("chat scrolled to bottom")
+		return
+	case "/topic":
+		// /topic <name> [goal...]：触发话题切换（后端 HandleSessionTopic）
+		if len(parts) < 2 {
+			m.flashMsg("usage: /topic <name> [goal]")
+			return
+		}
+		name := parts[1]
+		goal := strings.TrimSpace(strings.TrimPrefix(cmd, "/topic "+name))
+		m.postJSON(fmt.Sprintf("/api/sessions/%s/topic", s.ID), map[string]string{"name": name, "goal": goal})
+		m.flashMsg("switching topic: " + name)
+		return
+	case "/topics":
+		// 话题列表由服务端在 topic_switch 事件中推送，内联显示为分隔线；
+		// 此处打开完整记录面板便于翻阅历史话题切换点
+		m.toggleLogPopup()
+		return
+	case "/memory":
+		// /memory <query>：手动检索 Agent 记忆（POST /api/memory/search）
+		if len(parts) < 2 {
+			m.flashMsg("usage: /memory <query>")
+			return
+		}
+		query := strings.TrimSpace(strings.TrimPrefix(cmd, "/memory "))
+		m.postJSON("/api/memory/search", map[string]string{"query": query})
+		m.flashMsg("memory search: " + query)
 		return
 	}
 

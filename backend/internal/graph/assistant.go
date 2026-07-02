@@ -188,7 +188,7 @@ func (n *AssistantNode) executeTask(ctx context.Context, roleDef *types.RoleDefi
 		}
 		// 委托公共执行入口：AssistantNode 不启用写文件门控（与原 SubDomain 行为一致）
 		result, err := CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt,
-			roleDef, effectiveTask, state, "", n.progress, roleDef.Name, 0, false)
+			roleDef, effectiveTask, state, "", n.progress, roleDef.Name, 0, false, n.llmTracker)
 		if err == nil && result != "" {
 			return result
 		}

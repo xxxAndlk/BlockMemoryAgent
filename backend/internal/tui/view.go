@@ -47,14 +47,15 @@ func (m Model) singleColumnView() string {
 
 	var mainRow string
 	if m.agentPanelVisible {
-		chatW := m.width * 3 / 4
+		// 文档 §2.5：Agent 面板展开时主对话区 80% → 60%，面板占 40%
+		chatW := m.width * 3 / 5
 		agentW := m.width - chatW
-		if agentW < 20 {
-			agentW = 20
+		if agentW < 24 {
+			agentW = 24
 			chatW = m.width - agentW
 		}
 		chatPanel := m.renderChat(chatW, contentH)
-		agentPanel := renderAgentPanel(m, agentW)
+		agentPanel := renderAgentPanel(&m, agentW)
 		mainRow = lipgloss.JoinHorizontal(lipgloss.Top, chatPanel, agentPanel)
 	} else {
 		mainRow = m.renderChat(m.width, contentH)
@@ -231,12 +232,16 @@ func (m Model) clipChat(content string, w, h int) string {
 
 func (m Model) renderPlanBar(w int) string {
 	var snap board.Snapshot
-	if s := m.selectedSession(); s != nil && m.rt != nil && m.rt.Boards != nil {
-		if b := m.rt.Boards.Get(s.ID); b != nil {
-			snap = b.Snapshot()
+	var toolLabel string
+	if s := m.selectedSession(); s != nil {
+		toolLabel = lastToolLabel(s)
+		if m.rt != nil && m.rt.Boards != nil {
+			if b := m.rt.Boards.Get(s.ID); b != nil {
+				snap = b.Snapshot()
+			}
 		}
 	}
-	line := formatPlanBar(m.styles, snap)
+	line := formatPlanBar(m.styles, snap, toolLabel)
 	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
 }
 
@@ -268,7 +273,7 @@ func (m Model) renderInput(w int) string {
 	if m.focus == panelInput {
 		border = m.styles.FocusBorder
 	}
-	hint := m.styles.Dim.Render("Tab 面板  ↑↓历史  Shift+Enter 换行  /help  Q 退出")
+	hint := m.styles.Dim.Render("Tab 面板  ↑↓历史  Alt+Enter 换行  /help  Q 退出")
 	content := lipgloss.JoinVertical(lipgloss.Left, left+text+flash, " "+hint)
 	return border.Width(w).Height(3).Render(content)
 }

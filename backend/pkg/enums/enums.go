@@ -326,7 +326,8 @@ const (
 	// 见 internal/memory/block_vector.go,跨会话复用 DomainAgent 经验。
 	KnowledgeTypeBlockMemory KnowledgeType = "block_memory"
 
-	// KnowledgeTypeDomainArchive 领域归档:DomainAgent 完成后持久化的跨会话信息。
-	// 见 internal/store/domain_archive.go,与 block_memory 区别在于粒度更粗。
+	// KnowledgeTypeDomainArchive 领域归档:历史遗留知识类型，召回机制已在 P1-1 删除
+	// （原 internal/store/domain_archive.go 已移除）。常量保留以兼容历史数据，
+	// 新代码不应再写入此类型，统一使用 KnowledgeTypeBlockMemory。
 	KnowledgeTypeDomainArchive KnowledgeType = "domain_archive"
 )

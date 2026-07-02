@@ -56,8 +56,16 @@ const fullHelpText = `
   /cancel           终止当前运行中会话
   /interrupt goal   抢占中断
   /enqueue text     队列注入
+  /topic <name> [goal]  切换/创建话题
+  /topics           打开完整记录翻阅话题切换点
+  /memory <query>   手动检索 Agent 记忆
+  /agents           打开 Agent 编排面板
+  /status           显示当前会话状态
+  /clear            重置主对话区滚动到底部
+  /help             打开帮助
   /dag trigger <id> 触发 DAG
   /dag new <json>   创建 DAG
+  Alt+Enter         输入换行（多行）
   ↑/↓               浏览历史输入
 
 弹窗（计划 / Agents / DAG / Runtime）会在有内容时于顶栏显示徽标，

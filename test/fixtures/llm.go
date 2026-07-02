@@ -42,6 +42,7 @@ type MockLLMServer struct {
 	mu         sync.RWMutex
 	responses  map[string]MockResponse // keyed by prompt substring
 	defaultRes *MockResponse
+	sequence   []MockResponse // FIFO 队列：非空时优先按序返回，驱动确定性多轮工具调用
 	requests   []mockRequest
 }
 
@@ -88,12 +89,34 @@ func (m *MockLLMServer) RegisterResponseBySubstring(substring string, r MockResp
 	m.responses[substring] = r
 }
 
+// RegisterSequence 注册一组按序返回的响应（FIFO 队列）。
+// 队列非空时优先于 substring/default，每次请求弹出队首；耗尽后回退到 substring/default。
+// 用途：驱动确定性的多轮 ReAct 序列（如先 WriteFile 工具调用，再最终文本）。
+func (m *MockLLMServer) RegisterSequence(responses ...MockResponse) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sequence = append(m.sequence, responses...)
+}
+
 // Requests returns a copy of all requests received so far.
 func (m *MockLLMServer) Requests() []mockRequest {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]mockRequest, len(m.requests))
 	copy(out, m.requests)
+	return out
+}
+
+// RequestPrompts returns the joined prompt text (all message contents) for each
+// received request. Lets external-package tests inspect what reached the LLM
+// without accessing unexported mockRequest fields.
+func (m *MockLLMServer) RequestPrompts() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]string, len(m.requests))
+	for i, r := range m.requests {
+		out[i] = m.promptText(r)
+	}
 	return out
 }
 
@@ -130,6 +153,16 @@ func (m *MockLLMServer) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *MockLLMServer) pickResponse(req mockRequest) MockResponse {
+	// 优先消费 FIFO 序列队列（确定性多轮驱动）
+	m.mu.Lock()
+	if len(m.sequence) > 0 {
+		res := m.sequence[0]
+		m.sequence = m.sequence[1:]
+		m.mu.Unlock()
+		return res
+	}
+	m.mu.Unlock()
+
 	prompt := m.promptText(req)
 	for sub, res := range m.responses {
 		if strings.Contains(prompt, sub) {

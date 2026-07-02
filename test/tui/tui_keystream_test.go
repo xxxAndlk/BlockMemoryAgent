@@ -21,7 +21,7 @@ func TestTUIKeyStream(t *testing.T) {
 		f.Server.Deps.SessionManager,
 		f.Server.Deps.Graph.Registry(),
 		f.Server.Deps.Runtime,
-		f.Server.Deps.DAGScheduler,
+		f.Server.Deps.DAGHandler,
 		f.Server.Deps.Postgres,
 		f.Server.URL(),
 		"mock-model",
@@ -32,14 +32,20 @@ func TestTUIKeyStream(t *testing.T) {
 		t.Fatal("NewModel returned nil")
 	}
 
-	// Send Tab to move focus between panels. bubbletea value semantics mean we
-	// reassign the model on each Update.
+	// Send Tab to move focus between panels. bubbletea value semantics mean Update
+	// returns a tea.Model interface (a tui.Model value); assert back to *tui.Model.
 	var cmd tea.Cmd
-	m, cmd = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	nm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	_ = cmd
+	if mv, ok := nm.(tui.Model); ok {
+		m = &mv
+	}
 
 	// Type a command prefix in the input bar.
-	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/', 'n', 'e', 'w'}})
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/', 'n', 'e', 'w'}})
+	if mv, ok := nm.(tui.Model); ok {
+		m = &mv
+	}
 
 	// TODO: expose getters on tui.Model or use reflection to assert state
 	// transitions such as focus == panelInput and input mode changes.

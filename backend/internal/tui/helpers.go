@@ -206,7 +206,28 @@ func chatItems(s *server.Session) []chatItem {
 			timestamp: msg.Timestamp,
 		})
 	}
-	for _, ev := range s.Events {
+	// P2-1（文档 §2.2）：内联 🧠 recalled 最多 2 条，避免淹没主对话。
+	// 找出最后 2 条 memory_recall 事件的索引，其余在下面循环中跳过。
+	recallKeep := map[int]bool{}
+	var recallIdxs []int
+	for i, ev := range s.Events {
+		if ev.Kind == "memory_recall" && strings.TrimSpace(ev.Message) != "" {
+			recallIdxs = append(recallIdxs, i)
+		}
+	}
+	keepFrom := 0
+	if len(recallIdxs) > 2 {
+		keepFrom = len(recallIdxs) - 2 // 仅保留最后 2 条
+	}
+	for k := keepFrom; k < len(recallIdxs); k++ {
+		recallKeep[recallIdxs[k]] = true
+	}
+
+	for i, ev := range s.Events {
+		// 超出限额的 memory_recall 不内联展示（仍在右侧 Agent 面板的 Memory 区可见）
+		if ev.Kind == "memory_recall" && !recallKeep[i] {
+			continue
+		}
 		title, detail, ok := eventChatItem(ev)
 		if !ok {
 			continue
@@ -464,8 +485,12 @@ func formatTopBar(styles *Styles, sessionID, status string, agentCount, inTokens
 
 // formatPlanBar 渲染计划进度栏。
 // 有任务看板时显示当前计划步骤与进度；无计划时显示 [direct] 直接回答。
-func formatPlanBar(styles *Styles, snap board.Snapshot) string {
+func formatPlanBar(styles *Styles, snap board.Snapshot, toolLabel string) string {
 	if len(snap.Tasks) == 0 {
+		// 无 plan 时：若仍有工具在执行，展示工具状态（文档 §2.3 "plan 进度+工具状态"）
+		if toolLabel != "" {
+			return styles.Dim.Render("[tool] " + toolLabel + " [●]")
+		}
 		return styles.Dim.Render("[direct] 直接回答")
 	}
 	done := 0
@@ -501,6 +526,36 @@ func formatPlanBar(styles *Styles, snap board.Snapshot) string {
 		len(snap.Tasks),
 		styles.StatValue.Render(progressIcon),
 	)
+}
+
+// lastToolLabel 返回当前会话中"进行中"的工具标签（"Name: path" 或 "Name"）。
+// 判定：遍历事件，最后一个 tool_call（●）若未被后续 tool_exec（✓/✗）关闭，则视为进行中。
+// 无进行中工具返回空串。用于 plan 栏展示工具状态（P2-1，文档 §2.3）。
+func lastToolLabel(s *server.Session) string {
+	if s == nil {
+		return ""
+	}
+	inFlight := false
+	var tool, path string
+	for _, ev := range s.Events {
+		if ev.Kind == "tool_call" {
+			inFlight = true
+			tool = ev.Tool
+			path = ev.ToolPath
+		} else if ev.Type == "tool_exec" {
+			inFlight = false // 工具执行完成（成功或失败），关闭进行中标记
+		}
+	}
+	if !inFlight {
+		return ""
+	}
+	if tool == "" {
+		tool = "tool"
+	}
+	if path != "" {
+		return tool + ": " + path
+	}
+	return tool
 }
 
 // renderAgentPanel 渲染右侧 Agent 面板。

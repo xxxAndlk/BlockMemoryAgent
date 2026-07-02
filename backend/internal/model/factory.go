@@ -7,7 +7,9 @@ package model
 import (
 	"context" // 上下文传递
 	"fmt"     // 错误格式化
+	"strings" // 失败角色列表拼接
 	"sync"    // 读写锁，保护 models 缓存
+	"time"    // 探测超时
 
 	"github.com/blockmemory/agent/backend/pkg/config" // RoleConfigFile 角色配置
 	"github.com/blockmemory/agent/backend/pkg/types"  // AgentModelConfig 类型
@@ -24,6 +26,13 @@ type LLMClient interface {
 // BladesClient 实现此接口。
 type TemperatureAware interface {
 	GenerateWithOptions(ctx context.Context, prompt string, temperature float64) (string, error)
+}
+
+// UsageAware 可选接口：返回 token 用量的生成调用。
+// BladesClient 实现此接口；仅需要真实 token 计量的路径（blades 工具循环的 mock 退化路径）使用。
+// 设计意图（P0-4）：不破坏 LLMClient.Generate 的两返回值签名，需要用量的调用方类型断言到本接口。
+type UsageAware interface {
+	GenerateWithUsage(ctx context.Context, prompt string) (text string, usage blades.TokenUsage, err error)
 }
 
 // GenerateWithTemperature 工具函数：若客户端实现 TemperatureAware
@@ -239,4 +248,84 @@ func (f *ModelFactory) WarmUp(ctx context.Context) error {
 		return fmt.Errorf("warmup lightweight model: %w", err)
 	}
 	return nil
+}
+
+// probePrompt 连通性探测用的最小化提示词（廉价，约 1 token）。
+const probePrompt = "ping"
+
+// VerifyConnectivity 启动期对每个已配置模型角色发起一次最小化真实 LLM 调用，验证可连通性。
+//
+// 职责（P0-1）：
+//   - 候选角色 = meta/domain/lightweight + 每个 fixed_roles[].ID
+//   - 按 (provider,model,apikey,baseURL) 去重：roles.yaml 多角色常共享同一后端，去重后仅探测一次
+//   - APIKey 为空（Mock/无 key 模式）跳过，不阻塞启动
+//   - 每个唯一后端用 probeLLM 探测（3 次重试，短超时）
+//
+// 返回：
+//   - error: 任一角色不可达时返回聚合错误（列出全部失败角色），全部可达/跳过则返回 nil
+//
+// 副作用：可能触发 GetModel 缓存填充（与 WarmUp 重叠，幂等）。
+// 并发安全：GetModel 内部锁保护。
+func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
+	// 候选角色列表：三个内置角色 + 全部固定角色
+	roles := []string{"meta", "domain", "lightweight"}
+	for _, fr := range f.cfg.FixedRoles {
+		if fr.ID != "" {
+			roles = append(roles, fr.ID)
+		}
+	}
+
+	seen := make(map[string]bool) // 按 (provider,model,key,baseURL) 去重
+	var failed []string
+	for _, roleID := range roles {
+		cfg := f.resolveConfig(roleID)
+		// Mock/无 key 模式：跳过，视为 OK（保证服务可在无 LLM 环境启动）
+		if cfg.APIKey == "" {
+			continue
+		}
+		key := cfg.Provider + "\x00" + cfg.Model + "\x00" + cfg.APIKey + "\x00" + cfg.BaseURL
+		if seen[key] {
+			continue // 同一后端已探测，跳过
+		}
+		seen[key] = true
+
+		// 构造客户端（带缓存）
+		client, err := f.GetModel(ctx, roleID)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s (构造失败: %v)", roleID, err))
+			continue
+		}
+		// 探测：10s 整体超时，单次 8s
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := probeLLM(probeCtx, client); err != nil {
+			failed = append(failed, fmt.Sprintf("%s (model=%s: %v)", roleID, cfg.Model, err))
+		}
+		cancel()
+	}
+
+	if len(failed) > 0 {
+		return fmt.Errorf("LLM 连通性校验未通过: %s", strings.Join(failed, "; "))
+	}
+	return nil
+}
+
+// probeLLM 对已构造的客户端发起一次最小化调用（3 次重试，短超时），验证可连通性。
+// 返回 nil 表示连通。
+func probeLLM(ctx context.Context, client LLMClient) error {
+	_, err, _ := retryGenerate(ctx, client, probePrompt, 8*time.Second)
+	return err
+}
+
+// CallLightweightWithRetry 用轻量模型生成（带 3 次重试）。
+//
+// 设计意图（P0-1）：reflectOnResult / summarizeHistoryForGoal 等轻量直连 callers
+// 原本绕过 tracker 直调 llm.Generate 无重试；统一收敛到本方法，落实"轻量级总结模型优化"。
+// per-attempt 超时 30s，整体取消由 ctx 控制。
+func (f *ModelFactory) CallLightweightWithRetry(ctx context.Context, prompt string) (string, error) {
+	llm, err := f.GetLightweightModel(ctx)
+	if err != nil {
+		return "", err
+	}
+	resp, err, _ := retryGenerate(ctx, llm, prompt, 30*time.Second)
+	return resp, err
 }

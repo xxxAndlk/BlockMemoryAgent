@@ -110,5 +110,5 @@ func (n *DomainAgentNode) executeAssistantTask(ctx context.Context, def *types.R
 	}
 	// 委托公共执行入口：DomainAgent 启用写文件完成门控
 	return CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt, def, task, state,
-		skillBrief, n.progress, "助手["+def.Name+"]", 0, true)
+		skillBrief, n.progress, "助手["+def.Name+"]", 0, true, n.llmTracker)
 }

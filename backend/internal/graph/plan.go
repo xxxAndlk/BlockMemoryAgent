@@ -83,10 +83,6 @@ func reflectOnResult(ctx context.Context, modelFactory *model.ModelFactory, task
 	if modelFactory == nil {
 		return true, ""
 	}
-	llm, err := modelFactory.GetLightweightModel(ctx)
-	if err != nil || llm == nil {
-		return true, "" // 轻量模型不可用：不阻断
-	}
 	prompt := fmt.Sprintf(`你是质量评审员。判断以下任务执行结果是否达标。
 
 任务: %s
@@ -101,9 +97,10 @@ func reflectOnResult(ctx context.Context, modelFactory *model.ModelFactory, task
 只输出 JSON：{"ok":true/false,"feedback":"若不达标，给出改进建议；达标则留空"}
 
 JSON:`, task, truncateForPrompt(result, 800))
-	resp, err := llm.Generate(ctx, prompt)
+	// P0-1：轻量模型调用统一走 CallLightweightWithRetry（3 次重试）
+	resp, err := modelFactory.CallLightweightWithRetry(ctx, prompt)
 	if err != nil || resp == "" {
-		return true, "" // 调用失败：不阻断
+		return true, "" // 轻量模型不可用或调用失败：不阻断
 	}
 	jsonStr := extractJSON(resp)
 	var verdict struct {

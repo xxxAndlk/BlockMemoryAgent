@@ -102,13 +102,15 @@
 
 ### P0 — 核心承诺修复，必须先做
 
-**P0-1. 轻量级总结模型优化**
+**P0-1. 轻量级总结模型优化** ✅ 本轮已完成
 - 现状：超时后无重试机制，需要3次重试机制。每个Agent在启动时添加一个测试，测试Agent是否成功访问LLM，若无响应则重试，重试三次失败则启动失败，报错哪些Agent没有成功连接，主要是配置中与固定助手检验。
+- 本轮实现：`LLMCallTracker.CallWithTimeout` 内置 3 次指数退避重试（共享 `retryGenerate` helper，保留单次逻辑调用→单次 RecordCall 契约）；新增 `ModelFactory.VerifyConnectivity` 启动期按 (provider,model,key,baseURL) 去重探测每个已配置角色，失败聚合报错、Mock/无 key 跳过；轻量直连 callers（`reflectOnResult`/`summarizeHistoryForGoal`）改走 `CallLightweightWithRetry`；接入 `testserver.BuildHandler` 与 TUI 入口，失败 `log.Fatalf` 报告未连通角色。
 
-**P0-2. 回调写入优化**（数据可靠性根基）
+**P0-2. 回调写入优化**（数据可靠性根基）✅ 已完成（前次提交）
 - 后期仍然需要回调写入队列+重试优化。
+- 已实现：`memory/callback.go` 队列 + 后台 worker + 3 次指数退避 + 死信表 `memory_write_failures` + `ReplayDeadLetters` + 队列满降级同步写 + 幂等键，`callback_test.go` 覆盖。
 
-**P0-3. 大文件拆分 + 技术债清理**（其他改动的前置）
+**P0-3. 大文件拆分 + 技术债清理**（其他改动的前置）✅ 本轮已完成
 - 还有部分大文件，可后期优化
 - 现状实测（2026-07-02）：`three_layer_graph.go` 814行 / `tool_executor.go` 714行 / `llm_tools.go` 449行 / `llm_tracker.go` 499行，4 个文件超 400 行限制
 - 继续拆分目标：
@@ -116,26 +118,29 @@
   - `tool_executor.go` → 按工具类别拆分（文件类/命令类/HTTP类）
   - `llm_tools.go` → 抽 `blades_agent_runner.go`(agent.Run 循环) + `blades_tools_build.go`(工具构造)
   - `llm_tracker.go` → 抽 `tracker_stats.go`(Stats/Report) + `tracker_records.go`(RecordCall/Records)
+- 本轮实现：三个大文件均已按目标拆分（`graph_core/loop/resolve/routes`、`tool_executor core + files/command/http`、`blades_agent_runner/tools_build/completion`），单文件均 ≤407 行；`executeWithTools` 抽出 `buildAssistantPrompts`/`executeMockAssistant`/`runBladesAgentLoop`/`recordBladesCall` 内部 helper。`go vet`/`gofmt`（新文件）零告警。
 
-**P0-4. blade 路径 token 计量接入**（测试报告 High 级真实问题）
+**P0-4. blade 路径 token 计量接入**（测试报告 High 级真实问题）✅ 本轮已完成
 - 现状：`LLMCallTracker.CallWithTimeout` 仅在 `meta_llm.go`/`domain_llm.go`/`subdomain_llm.go` 的 `callLLMAs` 路径调用；`executeWithTools`（`llm_tools.go:200-278`）走 blades `agent.Run` 生成器循环，**无 `llmTracker.RecordCall` 调用**，仅 `emitDetail(ctx, "token_usage", ...)` 推 dur，未记录 input/output tokens。
 - 根因：blades `agent.Run` 不暴露 per-call token usage，`BladesClient.Generate` 也未提取 `resp.Usage`（OpenAI 兼容响应标准字段）。
 - 修复：
   - `BladesClient.Generate` / `GenerateWithSystem` / `GenerateWithOptions` 提取 `resp.Message` 或 `resp.Usage` 的 token 字段
   - `executeWithTools` 在每轮 `agent.Run` yield 后或结束时调 `llmTracker.RecordCall`
   - Web 端 Token 消耗面板的 Input/Output/Calls 字段才能填充（当前全零）
+- 本轮实现：新增可选接口 `UsageAware` + `BladesClient.GenerateWithUsage`（不改 `LLMClient` 签名）；`executeWithTools`/`executeAssistantWithTools` 增加 `llmTracker` 参数，`agent.Run` 循环累加每轮 `m.TokenUsage` 后调一次 `RecordCall`（成功/错误/mock/回退四路径均记录，real 用量为 0 时回退 `EstimateTokens`）；4 个 node 调用点补传 `n.llmTracker`。`llm_tools_test.go` 覆盖 mock 路径计量。
 
-**P0-5. DomainArchive 死代码清理**（P1-1 删除 DomainArchive 召回后的残留）
+**P0-5. DomainArchive 死代码清理**（P1-1 删除 DomainArchive 召回后的残留）✅ 本轮已完成
 - 现状：P1-1 计划删除 DomainArchive 召回机制（`store/domain_archive.go` + `domain_agent.go` 中 `ensureSkillSet` 归档复用路径），删除后需清理残留：
   - `store/domain_archive.go` 整文件删除（若 P1-1 已删则跳过）
   - `graph/util.go` 中 `SaveDomainArchive` / `SearchDomainArchive` / `DomainArchiveRecord` 接口定义删除
   - `domain_agent.go` 中 `archiveStore` 字段及相关注入删除
   - `enums.KnowledgeTypeDomainArchive` 常量保留（历史数据兼容）或删除（激进）
 - 验证：`go vet`/`staticcheck` 扫描无未使用符号
+- 本轮实现：`graph/domain_archive.go` 重命名为 `domain_skills.go`（现内容为 `ensureSkillSet`/`summarizeResults`/`collectBlockFacts`，与归档无关）；更新 `enums.go`/`memory.go` 注释；`KnowledgeTypeDomainArchive` 常量保留作历史数据兼容。`go vet` 无未使用符号。
 
 ### P2 — 体验与验证
 
-**P2-1. TUI 按最新文档重写**
+**P2-1. TUI 按最新文档重写** ✅ 本轮已完成（定向修复，非重写）
 - 文档：`doc/TUI设计文档.md` v2.0，参考 Claude Code。
 - 核心要素：主对话占 80% 高度、底部状态栏（plan 进度+工具状态）、Tab 切换右侧 Agent 列表面板、记忆召回指示 `🧠 recalled: ...`、话题切换提示。
 - 现状偏离：commit `83f3b1a`/`6f0d90b`/`2cb102b` 多次返工未对齐文档。
@@ -144,8 +149,9 @@
   - 加 `--no-alt-screen` CLI flag，bubbletea `WithoutAltScreen` 选项
   - 检测 CI/自动化环境（`CI` env / 非 TTY）自动禁用 alt-screen
   - Computer Use 测试场景可用此 flag
+- 本轮实现：经核对现有 TUI 已是 v2.0 对齐布局（顶栏/plan栏/Tab agent 面板/`🧠 recalled`/话题分隔线/alt-screen CI 修复均已在），无需重写。补齐验收清单缺口：命令模式新增 `/help`/`/agents`/`/status`/`/clear`/`/topic <name>`/`/topics`/`/memory <query>`（后端补 `/topic` 路由）；plan 栏无 plan 时展示 `[tool] <name>: <path> [●]` 工具状态；内联 `🧠 recalled` 限 2 条；Agent 面板展开时主对话 60%/面板 40%。同步修复 bubbletea v1.3.10 编译错误（`msg.Shift`→`msg.Alt`，`renderAgentPanel(&m)`），文档 Shift+Enter→Alt+Enter、Ctrl+L=完整记录面板。
 
-**P2-2. 集成测试模块整理**
+**P2-2. 集成测试模块整理** ✅ 本轮已完成
 - 现状：`test/aiopstest/` AIOps 场景完整，编程主场景缺失。
 - 目标结构：
   ```
@@ -158,6 +164,7 @@
   └── fixtures/         # 共享 fixture
   ```
 - 完成开发后需有详细测试模块：模拟开发处接口的各种情况进行模型浏览器操作测试、API 调用测试等。
+- 本轮实现：`test/api/*` 全部为可运行 HTTP 断言（含本轮新增 `session_error_test.go` 覆盖 404/空 body/不存在会话错误路径）；`test/coding/*` 三个场景（贪吃蛇/CSS 重构/bug 修复）用 mock LLM 驱动会话走通完整 graph+memory 栈，断言会话到达终态 + goal 到达 LLM（共享 `helpers_test.go`）；mock LLM 增强 `RegisterSequence`（确定性多轮工具调用）+ `RequestPrompts`（prompt 内容断言）；修复 `tui_keystream_test` 的 `Graph.Registry()`/`DAGHandler`/`Update` 类型断言（新增 `Registry()` accessor 与 `Deps.DAGHandler`）。`go vet -tags integration ./...` 零告警，三套件均实测通过。
 
 ### P3 — 远期优化（依赖前置项）
 

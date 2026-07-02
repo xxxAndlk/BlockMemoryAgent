@@ -136,7 +136,7 @@ func (n *MetaAgentNode) executeDirect(ctx context.Context, state *types.ThreeLay
 	}
 	// 走公共执行入口：MetaAgent 不启用写文件门控（直接执行不强制重试）
 	result, err := CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt,
-		roleDef, task, state, "", n.progress, "MetaAgent["+roleDef.Name+"]", 0, false)
+		roleDef, task, state, "", n.progress, "MetaAgent["+roleDef.Name+"]", 0, false, n.llmTracker)
 	if err != nil || result == "" {
 		// 直接执行失败：回退到 RouteCreateDomain 走领域拆分（保底）
 		n.emit(ctx, "error", fmt.Sprintf("直接执行失败，回退到领域拆分: %v", err))

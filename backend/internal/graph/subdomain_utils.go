@@ -104,7 +104,7 @@ func (n *SubDomainAgentNode) executeAssistantTask(ctx context.Context, def *type
 	// skillBrief 暂为空串，工具列表由 executeAssistantWithTools 内部默认值提供。
 	// 委托公共执行入口：SubDomainAgent 不启用写文件完成门控（保持原行为）。
 	return CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt, def, task, state,
-		"", n.progress, "SubDomainAgent["+def.Name+"]", 0, false)
+		"", n.progress, "SubDomainAgent["+def.Name+"]", 0, false, n.llmTracker)
 }
 
 // matchFixedAssistant 匹配固定助手。

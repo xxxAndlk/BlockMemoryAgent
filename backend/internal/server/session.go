@@ -1684,10 +1684,6 @@ func (m *SessionManager) summarizeHistoryForGoal(ctx context.Context, sessionID,
 	if m.modelFactory == nil {
 		return "", fmt.Errorf("modelFactory not injected: lightweight model unavailable for session %s", sessionID)
 	}
-	client, err := m.modelFactory.GetLightweightModel(ctx)
-	if err != nil {
-		return "", fmt.Errorf("get lightweight model for session %s: %w", sessionID, err)
-	}
 	prompt := fmt.Sprintf(`你是会话续接助手。请基于以下历史对话，提炼出用户当前想要完成的核心目标。
 要求：
 1. 用一句话（不超过 200 字）描述目标
@@ -1699,10 +1695,11 @@ func (m *SessionManager) summarizeHistoryForGoal(ctx context.Context, sessionID,
 %s
 
 用户当前目标：`, history)
-	// 轻量模型总结独立超时 30 秒，避免阻塞续话主流程
-	summaryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// 轻量模型总结独立超时 120 秒（P0-1：3 次重试 × 30s，避免阻塞续话主流程）
+	summaryCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	resp, err := client.Generate(summaryCtx, prompt)
+	// P0-1：统一走 CallLightweightWithRetry（3 次重试）
+	resp, err := m.modelFactory.CallLightweightWithRetry(summaryCtx, prompt)
 	if err != nil {
 		return "", fmt.Errorf("lightweight summary for session %s failed: %w", sessionID, err)
 	}

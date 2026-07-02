@@ -87,6 +87,38 @@ func (c *BladesClient) Generate(ctx context.Context, prompt string) (string, err
 	return resp.Message.Text(), nil
 }
 
+// GenerateWithUsage 实现 UsageAware 接口：单轮文本生成并返回 token 用量。
+//
+// 设计意图（P0-4）：blades 工具循环的 mock 退化路径（provider==nil）需要真实 token 计量；
+// 本方法复用 Generate 逻辑，额外返回 resp.Message.TokenUsage（OpenAI 兼容响应标准字段）。
+// provider 未填充用量时返回零值 TokenUsage，调用方应回退到 EstimateTokens。
+//
+// 参数：
+//   - ctx: 上下文
+//   - prompt: 用户提示词
+//
+// 返回：
+//   - string: 模型回复文本
+//   - blades.TokenUsage: token 用量（InputTokens/OutputTokens/TotalTokens）
+//   - error: 调用失败或响应为空
+func (c *BladesClient) GenerateWithUsage(ctx context.Context, prompt string) (string, blades.TokenUsage, error) {
+	// 构造只含一条 user 消息的请求
+	req := &blades.ModelRequest{
+		Messages: []*blades.Message{blades.UserMessage(prompt)},
+	}
+	// 调用底层 provider 生成
+	resp, err := c.provider.Generate(ctx, req)
+	if err != nil {
+		return "", blades.TokenUsage{}, fmt.Errorf("model generate: %w", err)
+	}
+	// 防御空响应
+	if resp == nil || resp.Message == nil {
+		return "", blades.TokenUsage{}, fmt.Errorf("empty model response")
+	}
+	// 取出回复文本与用量
+	return resp.Message.Text(), resp.Message.TokenUsage, nil
+}
+
 // GenerateWithSystem 带 system prompt 生成（用于角色定义生成等需要设定人设的场景）。
 //
 // 职责：在 user 消息之外额外传入 system instruction，引导模型行为。

@@ -56,7 +56,7 @@ func TestCommonExecuteAssistantTask_NoModelFactory(t *testing.T) {
 	def := &types.RoleDefinition{ID: "x", Name: "测试助手", SystemPrompt: "sp"}
 	state := types.NewThreeLayerState("s1")
 	state.CurrentDomain = "demo"
-	got, err := CommonExecuteAssistantTask(context.Background(), nil, nil, nil, def, "做某事", state, "", nil, "助手[测试]", 0, false)
+	got, err := CommonExecuteAssistantTask(context.Background(), nil, nil, nil, def, "做某事", state, "", nil, "助手[测试]", 0, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

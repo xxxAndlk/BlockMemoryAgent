@@ -109,6 +109,7 @@ type KnowledgeRecord struct {
 	// ID 自增主键。
 	ID int64 `json:"id"`
 	// KnowledgeType 知识类型（playbook / postmortem / rule / block_memory / domain_archive）。
+	// 注：domain_archive 为历史遗留类型，召回机制已移除，常量保留仅作历史数据兼容。
 	KnowledgeType enums.KnowledgeType `json:"knowledge_type"`
 	// TopicID 关联话题，可空表示全局知识。
 	TopicID string `json:"topic_id,omitempty"`

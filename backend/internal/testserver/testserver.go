@@ -47,6 +47,7 @@ type Deps struct {
 	ContextAssembler      *memory.ContextAssembler
 	EpisodeCompressor     *memory.Compressor
 	DAGScheduler          *dag.Scheduler
+	DAGHandler            *server.DAGHandler
 }
 
 // BuildHandler wires the backend with the same logic as main.go and returns the
@@ -122,6 +123,13 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		pgStore.Close()
 		redisStore.Close()
 		return nil, nil, nil, fmt.Errorf("warmup models: %w", err)
+	}
+	// P0-1：启动期 LLM 连通性校验。任一已配置角色不可达（3 次重试后仍失败）
+	// 则装配失败，上层 main.go log.Fatalf 报告未连通角色。Mock/无 key 角色自动跳过。
+	if err := modelFactory.VerifyConnectivity(ctx); err != nil {
+		pgStore.Close()
+		redisStore.Close()
+		return nil, nil, nil, fmt.Errorf("verify LLM connectivity: %w", err)
 	}
 
 	registry := graph.NewRoleRegistry(roleCfg)
@@ -237,6 +245,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		ContextAssembler:      contextAssembler,
 		EpisodeCompressor:     episodeCompressor,
 		DAGScheduler:          dagScheduler,
+		DAGHandler:            dagHandler,
 	}
 
 	cleanup := func() {
@@ -317,6 +326,10 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 		}
 		if len(path) > len("/api/sessions/") && path[len(path)-len("/cancel"):] == "/cancel" {
 			mgr.HandleSessionCancel(w, r)
+			return
+		}
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/topic"):] == "/topic" {
+			mgr.HandleSessionTopic(w, r)
 			return
 		}
 		if len(path) > len("/api/sessions/") {

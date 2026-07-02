@@ -11,6 +11,62 @@ import (
 	"time"    // 时间统计
 )
 
+// maxRetries 单次逻辑调用的最大尝试次数（含首次）。
+// P0-1：超时/错误后重试，避免单次抖动导致整体失败。
+const maxRetries = 3
+
+// retryGenerate 以最多 maxRetries 次尝试调用 llm.Generate，指数退避。
+// 复用给 CallWithTimeout 的重试逻辑与 VerifyConnectivity 的连通性探测。
+//
+// 参数：
+//   - ctx: 上下文（提供整体取消；每 attempt 叠加 perAttemptTimeout）
+//   - llm: LLM 客户端
+//   - prompt: 提示词
+//   - perAttemptTimeout: 单次尝试的超时
+//
+// 返回：
+//   - string: 成功时的模型回复
+//   - error: 最后一次尝试的错误（全部失败时）
+//   - bool: 是否发生过超时（用于电路熔断判定）
+//
+// 退避：500ms × 2^(attempt-1)，封顶 2s；sleep 期间监听 ctx.Done() 以便及时取消。
+func retryGenerate(ctx context.Context, llm LLMClient, prompt string, perAttemptTimeout time.Duration) (string, error, bool) {
+	var lastErr error
+	timedOut := false
+	backoff := 500 * time.Millisecond
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// 整体 ctx 已取消则立即返回，不再重试
+		if err := ctx.Err(); err != nil {
+			return "", err, false
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
+		resp, err := llm.Generate(attemptCtx, prompt)
+		// 在 cancel 前判定是否为超时（cancel 后 Err() 变为 Canceled）
+		deadlineExceeded := attemptCtx.Err() == context.DeadlineExceeded
+		cancel()
+		if err == nil {
+			return resp, nil, false
+		}
+		lastErr = err
+		if deadlineExceeded {
+			timedOut = true
+		}
+		// 末次尝试不再退避
+		if attempt < maxRetries {
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return "", ctx.Err(), false
+			}
+			backoff *= 2
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+		}
+	}
+	return "", lastErr, timedOut
+}
+
 // CallRecord 单次 LLM 调用记录。
 // 设计意图：持久化每次调用的元信息，供后续审计/调试/聚合分析。
 type CallRecord struct {
@@ -106,32 +162,30 @@ func (t *LLMCallTracker) CallWithTimeout(
 		}
 	}
 
-	// 构造带超时的子上下文
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
 	// 预先估算输入 token 与摘要（调用前 prompt 已知）
 	inputTokens := EstimateTokens(prompt)
 	summary := SummarizePrompt(prompt, 500)
 
-	// 执行调用并计时
-	start := time.Now()
-	resp, err := llm.Generate(timeoutCtx, prompt)
-	dur := time.Since(start)
-	// 估算输出 token
-	outputTokens := EstimateTokens(resp)
-
-	// 判断是否为超时错误
-	timedOut := false
-	if err != nil {
-		if timeoutCtx.Err() == context.DeadlineExceeded {
-			timedOut = true
-			// 包装超时错误，附上当前尝试序号
-			err = fmt.Errorf("LLM call timed out after %v (attempt #%d)", timeout, t.callCount+1)
-		}
+	// 已取消的 ctx 不重试，直接记录并返回
+	if err := ctx.Err(); err != nil {
+		t.RecordCall(ctx, 0, err, caller, summary, prompt, "", inputTokens, 0, false)
+		return "", err, false
 	}
 
-	// 记录本次调用（含 token/摘要/完整 prompt/response）
+	// P0-1：带重试的调用（最多 maxRetries 次，指数退避）
+	// 单次逻辑调用 → 单次 RecordCall，保留现有回调契约与电路熔断语义。
+	start := time.Now()
+	resp, err, retryTimedOut := retryGenerate(ctx, llm, prompt, timeout)
+	dur := time.Since(start)
+	outputTokens := EstimateTokens(resp)
+
+	// 判断是否为超时：重试期间任意 attempt 超时，或整体 ctx 超时
+	timedOut := retryTimedOut || ctx.Err() == context.DeadlineExceeded
+	if err != nil && timedOut {
+		err = fmt.Errorf("LLM call timed out after %v per attempt (%d retries)", timeout, maxRetries)
+	}
+
+	// 记录本次逻辑调用（含 token/摘要/完整 prompt/response）
 	t.RecordCall(ctx, dur, err, caller, summary, prompt, resp, inputTokens, outputTokens, timedOut)
 	return resp, err, timedOut
 }

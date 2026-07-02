@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
@@ -187,6 +188,7 @@ func CommonExecuteAssistantTask(
 	agentName string,
 	maxIters int,
 	enforceWriteGate bool,
+	llmTracker *model.LLMCallTracker,
 ) (string, error) {
 	// 1. 优先使用 LLM + 工具执行
 	if modelFactory != nil {
@@ -202,7 +204,7 @@ func CommonExecuteAssistantTask(
 		}
 
 		// 调用 blades.Agent + 工具循环执行
-		result, _ := executeAssistantWithTools(ctx, modelFactory, executor, def, task, state, skillBrief, progress, agentName, maxIters)
+		result, _ := executeAssistantWithTools(ctx, modelFactory, executor, def, task, state, skillBrief, progress, agentName, maxIters, llmTracker)
 		if result != "" {
 			// Self-Reflection（TODO #1）：启用时评估结果，不达标则带反馈重试一次
 			if reflectionEnabledFromRT(rt) {
@@ -217,7 +219,7 @@ func CommonExecuteAssistantTask(
 					}
 					// 把反馈注入任务文本前缀后重试一次（防死循环：仅一次）
 					retryTask := fmt.Sprintf("[上次结果未达标，改进建议: %s]\n\n%s", feedback, task)
-					if r2, _ := executeAssistantWithTools(ctx, modelFactory, executor, def, retryTask, state, skillBrief, progress, agentName, maxIters); r2 != "" {
+					if r2, _ := executeAssistantWithTools(ctx, modelFactory, executor, def, retryTask, state, skillBrief, progress, agentName, maxIters, llmTracker); r2 != "" {
 						result = r2
 					}
 				}
@@ -239,7 +241,15 @@ func CommonExecuteAssistantTask(
 			}
 			prompt := fmt.Sprintf("%s\n\n当前任务: %s\n领域目标: %s\n请执行任务并返回结果。",
 				def.SystemPrompt, task, domainGoal)
+			fbStart := time.Now()
 			resp, err := llm.Generate(ctx, prompt)
+			// P0-4：回退路径也记录一次调用（用量回退估算）
+			if llmTracker != nil {
+				inTok := model.EstimateTokens(prompt)
+				outTok := model.EstimateTokens(resp)
+				llmTracker.RecordCall(ctx, time.Since(fbStart), err, agentName,
+					model.SummarizePrompt(prompt, 500), prompt, resp, inTok, outTok, false)
+			}
 			if err == nil && resp != "" {
 				return resp, nil // 成功返回
 			}

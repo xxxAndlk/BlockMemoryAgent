@@ -103,6 +103,10 @@ func main() {
 	if err := modelFactory.WarmUp(ctx); err != nil {
 		log.Printf("warning: model warmup: %v; mock fallback may be used", err)
 	}
+	// P0-1：启动期 LLM 连通性校验，失败则启动失败并报告未连通角色。
+	if err := modelFactory.VerifyConnectivity(ctx); err != nil {
+		log.Fatalf("启动失败：LLM 连通性校验未通过: %v", err)
+	}
 
 	registry := graph.NewRoleRegistry(roleCfg)
 	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
