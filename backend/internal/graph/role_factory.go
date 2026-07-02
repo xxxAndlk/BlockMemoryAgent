@@ -22,10 +22,10 @@ import (
 // RoleFactory 角色工厂（动态创建临时角色）。
 // seq 用于生成全局唯一角色 ID 后缀；modelFactory 可选，缺失时走模板。
 type RoleFactory struct {
-	registry     *RoleRegistry        // 注册表：造好的角色要写回这里
-	modelFactory *model.ModelFactory  // LLM 客户端工厂（可空）
+	registry     *RoleRegistry          // 注册表：造好的角色要写回这里
+	modelFactory *model.ModelFactory    // LLM 客户端工厂（可空）
 	cfg          *config.RoleConfigFile // 原始配置（保留以读取模板）
-	seq          atomic.Int64         // 角色 ID 自增序号
+	seq          atomic.Int64           // 角色 ID 自增序号
 }
 
 // NewRoleFactory 创建角色工厂。
@@ -280,16 +280,16 @@ func (f *RoleFactory) fillAssistantTemplate(roleDef *types.RoleDefinition, taskD
 // 副作用：注册动态角色定义 + 创建实例（session 生命周期）。
 func (f *RoleFactory) CreateSubDomainAgent(ctx context.Context, sessionID, subDomain, goal string, parentDomainID string) (*types.RoleInstance, error) {
 	roleDef := &types.RoleDefinition{
-		ID:          fmt.Sprintf("subdomain_%s_%d", sanitizeID(subDomain), f.seq.Add(1)),
-		Name:        subDomain + "子领域负责人",
-		Type:        types.RoleTypeSubDomain,
-		Lifecycle:   types.RoleLifecycleSession,
-		Description: fmt.Sprintf("负责%s子领域的任务执行与结果汇总", subDomain),
+		ID:           fmt.Sprintf("subdomain_%s_%d", sanitizeID(subDomain), f.seq.Add(1)),
+		Name:         subDomain + "子领域负责人",
+		Type:         types.RoleTypeSubDomain,
+		Lifecycle:    types.RoleLifecycleSession,
+		Description:  fmt.Sprintf("负责%s子领域的任务执行与结果汇总", subDomain),
 		SystemPrompt: fmt.Sprintf("你是%s子领域的负责人。你的职责是：\n1. 管理该子领域的上下文信息\n2. 分析任务并分发给合适的助手\n3. 汇总助手结果并返回给父领域\n\n子领域目标: %s", subDomain, goal),
-		Keywords:    []string{subDomain, goal},
-		Skills:      []string{"子任务分析", "上下文管理", "结果汇总"},
-		CanBeCalled: true, // SubDomain 可被父 Domain 调用
-		Parents:     []string{parentDomainID},
+		Keywords:     []string{subDomain, goal},
+		Skills:       []string{"子任务分析", "上下文管理", "结果汇总"},
+		CanBeCalled:  true, // SubDomain 可被父 Domain 调用
+		Parents:      []string{parentDomainID},
 	}
 
 	if err := f.registry.RegisterDynamicRole(roleDef); err != nil {

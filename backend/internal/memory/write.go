@@ -1,10 +1,10 @@
 package memory
 
 import (
-	"context"  // 上下文，用于取消与超时传递
-	"fmt"      // 格式化与错误包装
-	"strings"  // 字符串小写化与子串匹配
-	"time"     // 时间戳生成与时间间隔判断
+	"context"      // 上下文，用于取消与超时传递
+	"fmt"          // 格式化与错误包装
+	"strings"      // 字符串小写化与子串匹配
+	"time"         // 时间戳生成与时间间隔判断
 	"unicode/utf8" // rune 计数与按字符截断，避免破坏 UTF-8
 
 	"github.com/blockmemory/agent/backend/pkg/types" // Episode 等公共类型
@@ -229,6 +229,7 @@ func NewWriteProcessor(store PrivateStore) *WriteProcessor {
 //   - topicID: 归属 Topic 标识。
 //   - action: 本步动作摘要（如 "调用工具 X"）。
 //   - rawContent: 原始完整观察文本。
+//
 // 返回: 构建完成的 Episode；持久化失败时返回 wrapped error。
 // 副作用: 向 PrivateStore 写入一条 Episode。
 // 并发安全: 自身无共享可变状态，并发安全性取决于底层 store 实现。
@@ -275,6 +276,7 @@ func (wp *WriteProcessor) Process(ctx context.Context, agentID, topicID, action,
 //   - action: 本步动作摘要。
 //   - rawContent: 原始完整观察文本。
 //   - stepCount: 当前步骤序号，作为幂等键。
+//
 // 返回: 构建完成的 Episode；持久化失败时返回 wrapped error。
 func (wp *WriteProcessor) ProcessWithStepCount(ctx context.Context, agentID, topicID, action, rawContent string, stepCount int) (*types.Episode, error) {
 	// 1. 生成摘要

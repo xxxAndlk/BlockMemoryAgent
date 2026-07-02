@@ -14,8 +14,8 @@ import (
 type Intent int
 
 const (
-	IntentEnqueue Intent = iota // 队列注入：追加到当前上下文继续执行
-	IntentInterrupt             // 抢占中断：清空当前上下文，以新指令重新启动
+	IntentEnqueue   Intent = iota // 队列注入：追加到当前上下文继续执行
+	IntentInterrupt               // 抢占中断：清空当前上下文，以新指令重新启动
 )
 
 // Item 队列项：一条用户指令 + 意图。

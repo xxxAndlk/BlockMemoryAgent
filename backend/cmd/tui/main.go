@@ -20,6 +20,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
 	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/logging"
 	"github.com/blockmemory/agent/backend/internal/memory"
 	"github.com/blockmemory/agent/backend/internal/model"
@@ -122,6 +123,14 @@ func main() {
 		rt.SetAgentConfig(&cfg.Agent)
 	}
 
+	// 结构化日志器：写 stderr + session_logs 表（P1-2）
+	var sessionLogger *logger.Logger
+	if pgStore != nil {
+		sessionLogger = logger.New(pgStore)
+	} else {
+		sessionLogger = logger.New(nil)
+	}
+
 	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
 	metaAgent.SetModelFactory(modelFactory)
 	metaAgent.SetRuntime(rt)
@@ -134,6 +143,7 @@ func main() {
 	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
 	builder.SetModelFactory(modelFactory)
 	builder.SetRuntime(rt)
+	builder.SetLogger(sessionLogger)
 	builder.AddNode(metaAgent)
 	builder.AddNode(escalation)
 	builder.AddNode(sinker)
@@ -143,11 +153,10 @@ func main() {
 	sessionMgr.SetPostgresStore(pgStore)
 	sessionMgr.SetModelFactory(modelFactory) // 注入模型工厂，续话时调轻量模型总结历史
 
-		// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
+	// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
 
 	if pgStore != nil {
 		threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})
-		threeLayerGraph.SetArchiveStore(pgStore)
 	}
 
 	// Postgres 缺失时不启动 DAG 调度器，避免 nil 解引用 panic；DAG 功能降级为不可用。
@@ -275,12 +284,17 @@ type pgBlockMemoryAdapter struct {
 	dim int
 }
 
-func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string) error {
+func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string, facts []graph.BlockMemoryFact) error {
+	memFacts := make([]memory.Fact, 0, len(facts))
+	for _, f := range facts {
+		memFacts = append(memFacts, memory.Fact{Key: f.Key, Value: f.Value, Scope: memory.FactScope(f.Scope)})
+	}
 	rec := (&memory.BlockMemoryRecord{
 		SessionID: sessionID,
 		Domain:    domain,
 		Goal:      goal,
 		Summary:   summary,
+		Facts:     memFacts,
 		CreatedAt: time.Now(),
 	}).ToKnowledgeRecord(a.dim)
 	return a.pg.SaveKnowledge(ctx, rec)
@@ -294,7 +308,12 @@ func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, domain, qu
 	var sb strings.Builder
 	for _, rec := range recs {
 		sb.WriteString(rec.Summary)
-		sb.WriteString("\n---\n")
+		sb.WriteString("\n")
+		if facts := memory.FormatBlockMemoryFacts(rec.Facts); facts != "" {
+			sb.WriteString("facts:\n")
+			sb.WriteString(facts)
+		}
+		sb.WriteString("---\n")
 	}
 	return sb.String(), nil
 }

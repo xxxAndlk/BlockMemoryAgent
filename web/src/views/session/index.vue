@@ -3,7 +3,7 @@ import { ref, onMounted, computed, watch, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { Session, AgentNode, TaskBoardData } from '@/types'
-import { listSessions, getSession, getSessionBoard, getSessionAgents, streamSession, getSessionMetrics, getSessionWatchdog, getSessionMailbox, getHealth, type SessionMetrics, type WatchdogDecision, type MailboxMessage, type HealthResponse } from '@/api/session'
+import { listSessions, getSession, getSessionBoard, getSessionAgents, streamSession, getSessionMetrics, getSessionWatchdog, getSessionMailbox, getHealth, getSessionLogs, getSessionTokenMetrics, type SessionMetrics, type WatchdogDecision, type MailboxMessage, type HealthResponse, type SessionLog, type SessionTokenMetricsResponse } from '@/api/session'
 import ExecutionLog from './components/ExecutionLog.vue'
 import MemoryExplorer from './components/MemoryExplorer.vue'
 import SkillSet from './components/SkillSet.vue'
@@ -23,6 +23,14 @@ const metrics = ref<SessionMetrics | null>(null)
 const watchdogDecisions = ref<WatchdogDecision[]>([])
 const mailboxMessages = ref<MailboxMessage[]>([])
 const health = ref<HealthResponse | null>(null)
+
+// P1-2：结构化会话日志与 Token 面板
+const sessionLogs = ref<SessionLog[]>([])
+const tokenMetrics = ref<SessionTokenMetricsResponse | null>(null)
+const logFilterAgent = ref('')
+const logFilterLevel = ref('')
+const logLimit = ref(100)
+const expandedLogId = ref<number | null>(null)
 
 onMounted(async () => {
   await loadSessions()
@@ -110,6 +118,29 @@ async function loadSessionPanels(sessionID: string) {
   } catch {
     health.value = null
   }
+  await loadSessionLogs(sessionID)
+}
+
+async function loadSessionLogs(sessionID: string) {
+  try {
+    const res = await getSessionLogs(sessionID, {
+      agent: logFilterAgent.value || undefined,
+      level: logFilterLevel.value || undefined,
+      limit: logLimit.value,
+    })
+    sessionLogs.value = res.logs || []
+  } catch {
+    sessionLogs.value = []
+  }
+  try {
+    tokenMetrics.value = await getSessionTokenMetrics(sessionID)
+  } catch {
+    tokenMetrics.value = null
+  }
+}
+
+function applyLogFilters() {
+  if (activeSession.value) loadSessionLogs(activeSession.value.id)
 }
 
 function startStream(s: Session) {
@@ -369,6 +400,10 @@ function healthStatusText(service?: { online?: boolean; detail?: string }) {
         >
           <el-icon class="mr-1"><Files /></el-icon> 文件预览
         </span>
+        <span @click="activeTab = 'logs'" :class="activeTab === 'logs' ? 'text-blue-400 font-bold border-b-2 border-blue-500 pb-[2px]' : 'text-gray-400 hover:text-gray-200'" class="flex items-center h-full cursor-pointer"
+        >
+          <el-icon class="mr-1"><Tickets /></el-icon> 日志分析
+        </span>
       </div>
 
       <div class="flex-1 overflow-hidden relative flex flex-col">
@@ -376,6 +411,42 @@ function healthStatusText(service?: { online?: boolean; detail?: string }) {
         <MemoryExplorer v-if="activeTab === 'memory'" :session-id="activeSession?.id || ''" :agents="agents" />
         <SkillSet v-if="activeTab === 'skill'" :agents="agents" />
         <FilePreview v-if="activeTab === 'file'" :session-id="activeSession?.id || ''" :agents="agents" />
+        <div v-if="activeTab === 'logs'" class="flex-1 overflow-hidden flex flex-col p-4">
+          <div class="flex items-center gap-3 mb-3 shrink-0">
+            <el-input v-model="logFilterAgent" placeholder="Agent 过滤" size="small" class="w-40" />
+            <el-select v-model="logFilterLevel" placeholder="Level" size="small" class="w-28">
+              <el-option label="全部" value="" />
+              <el-option label="info" value="info" />
+              <el-option label="warn" value="warn" />
+              <el-option label="error" value="error" />
+            </el-select>
+            <el-button size="small" type="primary" @click="applyLogFilters">查询</el-button>
+          </div>
+          <div class="flex-1 overflow-y-auto space-y-2 pr-1">
+            <div v-if="!sessionLogs.length" class="text-gray-500 text-sm text-center py-10">暂无结构化日志</div>
+            <div v-for="log in sessionLogs" :key="log.id" class="text-xs border border-[#2a2d35] rounded p-2 bg-[#14161a]">
+              <div class="flex items-center justify-between mb-1">
+                <div class="flex items-center gap-2">
+                  <el-tag size="small" :type="log.level === 'error' ? 'danger' : log.level === 'warn' ? 'warning' : 'info'" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-90 origin-left">{{ log.level }}</el-tag>
+                  <span class="text-gray-400">{{ log.phase }}</span>
+                  <span class="text-gray-500">{{ log.agent }}</span>
+                </div>
+                <span class="text-gray-500">{{ fmtDateTime(log.created_at) }}</span>
+              </div>
+              <div class="text-gray-200 mb-1">{{ log.message }}</div>
+              <div v-if="log.input_tokens || log.output_tokens" class="text-gray-500 mb-1">tokens: {{ log.input_tokens }} / {{ log.output_tokens }} · latency: {{ log.latency_ms }}ms · model: {{ log.model || '-' }}</div>
+              <div v-if="log.prompt || log.response" class="mt-2">
+                <el-button link size="small" type="primary" @click="expandedLogId = expandedLogId === log.id ? null : log.id">
+                  {{ expandedLogId === log.id ? '收起' : '展开 Prompt/Response' }}
+                </el-button>
+                <div v-if="expandedLogId === log.id" class="mt-2 space-y-2">
+                  <div v-if="log.prompt" class="bg-[#0f1115] p-2 rounded text-gray-400 whitespace-pre-wrap">{{ log.prompt }}</div>
+                  <div v-if="log.response" class="bg-[#0f1115] p-2 rounded text-gray-400 whitespace-pre-wrap">{{ log.response }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -435,6 +506,38 @@ function healthStatusText(service?: { online?: boolean; detail?: string }) {
             <span class="text-gray-300 truncate flex-1">{{ watchdogLabel(d.level) }}</span>
           </div>
           <div v-if="!watchdogDecisions.length" class="text-gray-500 text-xs">暂无看门狗决策</div>
+        </div>
+      </el-card>
+
+      <!-- Token Metrics -->
+      <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
+        <template #header>
+          <div class="flex justify-between items-center">
+            <div class="font-bold text-sm text-gray-200">Token 消耗 (Token Metrics)</div>
+          </div>
+        </template>
+        <div class="text-xs text-gray-400 mb-2">总计</div>
+        <div class="grid grid-cols-3 gap-2 mb-4 text-center">
+          <div>
+            <div class="text-xs text-gray-500">Input</div>
+            <div class="text-lg font-bold text-gray-200">{{ (tokenMetrics?.total_input_tokens ?? 0).toLocaleString() }}</div>
+          </div>
+          <div>
+            <div class="text-xs text-gray-500">Output</div>
+            <div class="text-lg font-bold text-gray-200">{{ (tokenMetrics?.total_output_tokens ?? 0).toLocaleString() }}</div>
+          </div>
+          <div>
+            <div class="text-xs text-gray-500">Calls</div>
+            <div class="text-lg font-bold text-gray-200">{{ tokenMetrics?.total_calls ?? 0 }}</div>
+          </div>
+        </div>
+        <div class="text-xs text-gray-400 mb-2">按 Agent / Model</div>
+        <div class="space-y-1 text-xs">
+          <div v-for="s in tokenMetrics?.stats || []" :key="s.agent + '|' + s.model" class="flex justify-between p-2 bg-[#0f1115] rounded">
+            <span class="text-gray-400 truncate flex-1">{{ s.agent }} <span v-if="s.model" class="text-gray-600">({{ s.model }})</span></span>
+            <span class="text-gray-200">{{ s.input_tokens + s.output_tokens }}</span>
+          </div>
+          <div v-if="!tokenMetrics?.stats?.length" class="text-gray-500 text-xs text-center py-2">暂无 token 数据</div>
         </div>
       </el-card>
 

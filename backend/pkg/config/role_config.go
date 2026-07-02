@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"gopkg.in/yaml.v3"
 	"github.com/blockmemory/agent/backend/pkg/types"
+	"gopkg.in/yaml.v3"
 )
 
 // RoleConfigFile 角色配置文件根结构。

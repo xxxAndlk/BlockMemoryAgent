@@ -3,14 +3,13 @@ package graph
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
+	"strings"
+	"time"
 )
-
 
 // AssistantNode Layer 3: 助手角色 / 具体任务执行者。
 //
@@ -22,15 +21,15 @@ import (
 //
 // 并发安全：节点本身无共享可变状态；实例状态由 registry 内部锁保护。
 type AssistantNode struct {
-	name             string             // 节点名（固定 "Assistant"），实现 ThreeLayerNode.Name
-	instID           string             // 本实例ID，对应 registry 中的 RoleInstance.ID
-	registry         *RoleRegistry      // 角色注册表，查询实例/角色定义、更新状态
-	workspace        WorkspaceWriter    // 工作区写入器，持久化 AgentOutput（可能为 nil）
-	modelFactory     *model.ModelFactory // LLM 模型工厂，nil 时退回 mock
-	rt               *runtime.Runtime   // 运行时聚合体，读取 AgentCfg 超时配置
-	progress         ProgressCallback   // 进度回调，推送 prompt / token_usage 事件
-	toolCallback     ToolCallback       // 工具执行结果回调（推 UI），启用工具循环
-	contextAssembler ContextAssembler   // 上下文组装器，注入私有记忆与全局知识
+	name             string                // 节点名（固定 "Assistant"），实现 ThreeLayerNode.Name
+	instID           string                // 本实例ID，对应 registry 中的 RoleInstance.ID
+	registry         *RoleRegistry         // 角色注册表，查询实例/角色定义、更新状态
+	workspace        WorkspaceWriter       // 工作区写入器，持久化 AgentOutput（可能为 nil）
+	modelFactory     *model.ModelFactory   // LLM 模型工厂，nil 时退回 mock
+	rt               *runtime.Runtime      // 运行时聚合体，读取 AgentCfg 超时配置
+	progress         ProgressCallback      // 进度回调，推送 prompt / token_usage 事件
+	toolCallback     ToolCallback          // 工具执行结果回调（推 UI），启用工具循环
+	contextAssembler ContextAssembler      // 上下文组装器，注入私有记忆与全局知识
 	llmTracker       *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token，复用 callLLMWithTimeout 模式避免 goroutine 泄漏）
 }
 
@@ -234,7 +233,6 @@ func assembleContextPrefix(pack *ContextPack) string {
 	}
 	return b.String()
 }
-
 
 // mockResult 生成模拟结果（无 LLM key 时的占位）。
 func (n *AssistantNode) mockResult(roleDef *types.RoleDefinition, task string, callReq *types.CallRequest) string {

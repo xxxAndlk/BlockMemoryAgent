@@ -3,10 +3,9 @@ package graph
 import (
 	"context"
 	"fmt"
-	"strings"
 	"github.com/blockmemory/agent/backend/pkg/types"
+	"strings"
 )
-
 
 // analyzeTasks 分析领域任务（优先使用LLM，回退到规则）。
 //
@@ -94,6 +93,7 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 	// 规则回退
 	return n.analyzeTasksByRules(goal)
 }
+
 // parseTaskListFromResp 从LLM响应解析任务列表。
 //
 // 职责：逐行清洗响应（去前缀/编号），过滤纯思考类任务名。
@@ -154,19 +154,19 @@ func (n *DomainAgentNode) analyzeTasksByRules(goal string) []string {
 
 	// 按"修复/实现/优化"等关键词匹配模板
 	if strings.Contains(goal, "修复") {
-		tasks = append(tasks, "分析根因")       // 第1步：根因分析
-		tasks = append(tasks, "定位问题代码")   // 第2步：定位代码
-		tasks = append(tasks, "生成修复方案")   // 第3步：生成方案
-		tasks = append(tasks, "验证修复")       // 第4步：验证
+		tasks = append(tasks, "分析根因")   // 第1步：根因分析
+		tasks = append(tasks, "定位问题代码") // 第2步：定位代码
+		tasks = append(tasks, "生成修复方案") // 第3步：生成方案
+		tasks = append(tasks, "验证修复")   // 第4步：验证
 	} else if strings.Contains(goal, "实现") || strings.Contains(goal, "开发") {
-		tasks = append(tasks, "需求分析")   // 第1步：需求
-		tasks = append(tasks, "设计方案")   // 第2步：设计
-		tasks = append(tasks, "编写代码")   // 第3步：编码
-		tasks = append(tasks, "测试验证")   // 第4步：测试
+		tasks = append(tasks, "需求分析") // 第1步：需求
+		tasks = append(tasks, "设计方案") // 第2步：设计
+		tasks = append(tasks, "编写代码") // 第3步：编码
+		tasks = append(tasks, "测试验证") // 第4步：测试
 	} else if strings.Contains(goal, "优化") {
-		tasks = append(tasks, "性能分析")   // 第1步：性能分析
-		tasks = append(tasks, "识别瓶颈")   // 第2步：识别瓶颈
-		tasks = append(tasks, "实施优化")   // 第3步：实施
+		tasks = append(tasks, "性能分析") // 第1步：性能分析
+		tasks = append(tasks, "识别瓶颈") // 第2步：识别瓶颈
+		tasks = append(tasks, "实施优化") // 第3步：实施
 	} else {
 		// 无匹配：把整个目标作为单任务
 		tasks = append(tasks, goal)

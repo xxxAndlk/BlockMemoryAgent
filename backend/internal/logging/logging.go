@@ -35,11 +35,11 @@ const EntryBrowser = EntryBackend
 // dailyWriter 按天切换文件的 io.Writer。
 // 跨天时关闭旧文件、打开新文件；同一天内复用已打开的句柄。
 type dailyWriter struct {
-	mu       sync.Mutex
-	dir      string // 日志目录
-	entry    Entry  // 入口名（用于文件名前缀）
-	curDate  string // 当前文件对应的日期 YYYY-MM-DD
-	curFile  *os.File
+	mu      sync.Mutex
+	dir     string // 日志目录
+	entry   Entry  // 入口名（用于文件名前缀）
+	curDate string // 当前文件对应的日期 YYYY-MM-DD
+	curFile *os.File
 }
 
 // Write 实现 io.Writer：每次写前检查日期，跨天则切换文件。
@@ -83,8 +83,8 @@ func (w *dailyWriter) Close() error {
 
 // 全局实例：Init 调用后持有，供 Close 时使用。
 var (
-	globalMu      sync.Mutex
-	globalWriter  *dailyWriter
+	globalMu     sync.Mutex
+	globalWriter *dailyWriter
 )
 
 // Init 初始化全局日志输出：把标准 log 包的输出重定向到（可选 stderr +）按天分割文件。

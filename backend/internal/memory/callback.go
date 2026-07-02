@@ -32,12 +32,12 @@ type writeQueueItem struct {
 // 持有写入处理器、快照管理器、TUI 广播器与死信存储四个依赖。
 // P0-2 修复：OnEnd 不再直接起 goroutine，而是推送到内存队列由后台 worker 消费。
 type CallbackHandler struct {
-	writeProcessor  *WriteProcessor          // Episode 写入流水线
-	snapshotMgr     *SnapshotManager         // 快照两级存储管理
-	broadcaster     Broadcaster              // TUI / SSE 事件广播器，可为 nil
-	deadLetterStore DeadLetterStore          // 死信存储，写入失败时归档
-	writeQueue      chan writeQueueItem      // 内存队列
-	queueDone       chan struct{}            // worker 退出信号
+	writeProcessor  *WriteProcessor     // Episode 写入流水线
+	snapshotMgr     *SnapshotManager    // 快照两级存储管理
+	broadcaster     Broadcaster         // TUI / SSE 事件广播器，可为 nil
+	deadLetterStore DeadLetterStore     // 死信存储，写入失败时归档
+	writeQueue      chan writeQueueItem // 内存队列
+	queueDone       chan struct{}       // worker 退出信号
 }
 
 // NewCallbackHandler 创建回调处理器，注入核心依赖并启动后台 worker。

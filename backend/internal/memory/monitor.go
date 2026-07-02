@@ -34,9 +34,9 @@ func NewMonitor() *Monitor {
 	// 预分配空切片，避免后续 append 触发 nil 检查。
 	return &Monitor{
 		switchHistory: make([]SwitchRecord, 0),
-		maxHistory:    100,              // 最多保留 100 条历史，控制内存占用
-		threshold:     10,               // 5 分钟内最多 10 次切换
-		window:        5 * time.Minute,  // 检测窗口
+		maxHistory:    100,             // 最多保留 100 条历史，控制内存占用
+		threshold:     10,              // 5 分钟内最多 10 次切换
+		window:        5 * time.Minute, // 检测窗口
 	}
 }
 
@@ -124,7 +124,7 @@ func (m *Monitor) DetectEntanglement() *EntanglementReport {
 			return &EntanglementReport{
 				Pair:        pair,
 				SwitchCount: count,
-				Severity:    count / 4,   // 1 次往返=1 级，线性递增
+				Severity:    count / 4, // 1 次往返=1 级，线性递增
 				Timestamp:   time.Now(),
 			}
 		}
@@ -153,8 +153,10 @@ func (r *EntanglementReport) String() string {
 // AutoArbitrator 自动仲裁器：基于 Monitor 检测结果生成升级事件。
 // 当切换频率或震荡纠缠触发阈值时，构造 EventEscalation 交由 MetaAgent 处理。
 type AutoArbitrator struct {
-	monitor     *Monitor                                            // 关联的监控器
-	broadcaster interface{ Broadcast(topicID string, ev types.UIEvent) } // 可选广播器接口（保留扩展）
+	monitor     *Monitor // 关联的监控器
+	broadcaster interface {
+		Broadcast(topicID string, ev types.UIEvent)
+	} // 可选广播器接口（保留扩展）
 }
 
 // NewAutoArbitrator 创建自动仲裁器。
@@ -196,13 +198,13 @@ func (a *AutoArbitrator) CheckAndArbitrate(topicID string) (*types.Event, bool) 
 func (a *AutoArbitrator) createEscalationEvent(topicID, reason string) *types.Event {
 	// 组装升级事件，ID 使用纳秒时间戳保证唯一性。
 	return &types.Event{
-		ID:          fmt.Sprintf("esc_%d", time.Now().UnixNano()), // 唯一 ID
-		Type:        enums.EventEscalation,                        // 升级事件类型
-		SourceAgent: "monitor",                                    // 来源标记为监控器
+		ID:          fmt.Sprintf("esc_%d", time.Now().UnixNano()),          // 唯一 ID
+		Type:        enums.EventEscalation,                                 // 升级事件类型
+		SourceAgent: "monitor",                                             // 来源标记为监控器
 		Payload:     map[string]any{"reason": reason, "topic_id": topicID}, // 携带原因与话题
-		Priority:    10,                                           // 高优先级，需 MetaAgent 优先处理
-		CreatedAt:   time.Now(),                                   // 创建时间
-		Status:      enums.EventPending,                           // 初始状态为待处理
+		Priority:    10,                                                    // 高优先级，需 MetaAgent 优先处理
+		CreatedAt:   time.Now(),                                            // 创建时间
+		Status:      enums.EventPending,                                    // 初始状态为待处理
 	}
 }
 

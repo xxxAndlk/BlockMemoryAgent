@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-kratos/blades"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/pkg/types"
+	"github.com/go-kratos/blades"
 )
 
 // mergeToolList 把 skillBrief（来自 SkillSet.PromptList，以 ToolRef 为工具名）

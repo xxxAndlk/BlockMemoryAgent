@@ -161,16 +161,16 @@ func (r *RoleRegistry) CreateInstance(roleDefID, sessionID string, domain string
 	// sessionID 前缀便于按会话筛日志；序号防同会话内冲突
 	instID := fmt.Sprintf("%s_%s_%d", roleDefID, sessionID[:min(8, len(sessionID))], r.seq.Add(1))
 	inst := &types.RoleInstance{
-		ID:         instID,
-		RoleDefID:  roleDefID,
-		Type:       def.Type,      // 类型继承自定义
-		Lifecycle:  def.Lifecycle, // 生命周期继承自定义
-		SessionID:  sessionID,
-		Domain:     domain,
-		Status:     types.RoleStatusIdle, // 初始空闲
-		CreatedAt:  time.Now(),
-		ParentID:   parentID,
-		Children:   make([]string, 0),
+		ID:        instID,
+		RoleDefID: roleDefID,
+		Type:      def.Type,      // 类型继承自定义
+		Lifecycle: def.Lifecycle, // 生命周期继承自定义
+		SessionID: sessionID,
+		Domain:    domain,
+		Status:    types.RoleStatusIdle, // 初始空闲
+		CreatedAt: time.Now(),
+		ParentID:  parentID,
+		Children:  make([]string, 0),
 	}
 
 	// 设置过期时间：按生命周期策略

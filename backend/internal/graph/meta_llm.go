@@ -3,11 +3,10 @@ package graph
 import (
 	"context"
 	"fmt"
-	"time"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/soul"
+	"time"
 )
-
 
 // callLLM 统一的LLM调用入口。
 // 职责：以 "MetaAgent" 身份调用 callLLMAs。
@@ -49,9 +48,9 @@ func (n *MetaAgentNode) callLLMAs(ctx context.Context, caller string, prompt str
 	n.emitDetail(ctx, "prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
 
 	// MetaAgent 主要做"路由 / 总结"决策，使用 0 温度
-	var resp string       // LLM 响应文本
-	var callErr error     // 调用错误
-	var timedOut bool     // 是否超时
+	var resp string   // LLM 响应文本
+	var callErr error // 调用错误
+	var timedOut bool // 是否超时
 	// 解析 LLM 软/硬超时：默认 30s/90s，可被 AgentCfg 覆盖（特性2）
 	softTimeout := 30 * time.Second
 	hardTimeout := 90 * time.Second
@@ -65,8 +64,8 @@ func (n *MetaAgentNode) callLLMAs(ctx context.Context, caller string, prompt str
 	}
 	// 若 LLM 支持 TemperatureAware，用温度包装器叠加 0 温度
 	if t, ok := llm.(model.TemperatureAware); ok {
-		desired := soul.Temperature(soul.KindRouting, 0)                          // 路由场景温度
-		wrapped := &temperatureWrappedLLM{base: llm, t: t, temperature: desired}  // 包装器
+		desired := soul.Temperature(soul.KindRouting, 0)                         // 路由场景温度
+		wrapped := &temperatureWrappedLLM{base: llm, t: t, temperature: desired} // 包装器
 		resp, callErr, timedOut = n.llmTracker.CallWithTimeout(ctx, wrapped, prompt, caller,
 			softTimeout, hardTimeout)
 	} else {
@@ -93,14 +92,16 @@ func (n *MetaAgentNode) callLLMAs(ctx context.Context, caller string, prompt str
 
 	return resp, callErr, timedOut
 }
+
 // temperatureWrappedLLM 在 LLMClient 外层叠加 per-call temperature。
 // 设计意图：让不支持运行时改温度的 ChatModel 也能按场景（路由/创作）
 // 设置不同温度，而不修改 modelFactory 缓存的实例。
 type temperatureWrappedLLM struct {
-	base        model.LLMClient         // 被包装的底层客户端
-	t           model.TemperatureAware  // 温度感知接口
-	temperature float64                 // 本次调用使用的温度
+	base        model.LLMClient        // 被包装的底层客户端
+	t           model.TemperatureAware // 温度感知接口
+	temperature float64                // 本次调用使用的温度
 }
+
 // Generate 实现 model.LLMClient 接口，转发到带温度选项的生成方法。
 func (w *temperatureWrappedLLM) Generate(ctx context.Context, prompt string) (string, error) {
 	return w.t.GenerateWithOptions(ctx, prompt, w.temperature)

@@ -58,59 +58,6 @@
 **P0-3. 大文件拆分 + 技术债清理**（其他改动的前置）
 - 还有部分大文件，可后期优化
 
-### P1 — 核心冗余修复 + 调试基础
-
-**P1-1. 删 DomainArchive 召回 + 块记忆键值化**（合并重叠机制）
-- 现状：DomainArchive（特性4）与 BlockMemory（特性3）同表存两份近同内容，生命周期割裂，场景C（Archive 过期 BlockMemory 仍在）导致 Skill 装配与 prompt 注入割裂。
-- 方案：
-  - 删 DomainArchive 相关代码（`store/domain_archive.go` + `domain_agent.go` 中 `ensureSkillSet` 归档复用路径）
-  - `ensureSkillSet` 改为只走 LLM AssembleSet
-  - BlockMemory 键值化：`Meta.facts` 改为结构化数组
-    ```
-    facts: [
-      {key:"vue_version", value:"3.4", scope:"global"},
-      {key:"css_framework", value:"tailwind", scope:"domain"},
-      {key:"error_pattern", value:"padding不一致", scope:"task"}
-    ]
-    ```
-  - 检索精细化：当前领域任务只取 `scope=domain`+`scope=task`，全局共享取 `scope=global`
-  - `write.go` 现有 `Facts` 三元组可复用，改格式即可
-- 收益：注入 prompt 按需取键，token 省、精准度高。
-
-**P1-2. 完整日志 + Agent IO 可视化**（调试与可观测基础）
-- 现状：8 处 log.Printf 散落，`llm_tracker.go` 476 行已有追踪基础但未串联。
-- 目标日志链路：
-  ```
-  MetaAgent.Invoke
-    ├─ [routing] goal=xxx → path=create_domain
-    ├─ [llm_call] prompt=xxx → response=xxx (tokens=1234, latency=800ms)
-    ├─ [task_split] tasks=[a,b,c]
-    ├─ [domain_create] domain=css skills=[vue,css]
-    │
-    ├─ DomainAgent.Invoke
-    │   ├─ [memory_recall] block_memory query=xxx → hits=2
-    │   ├─ [memory_inject] context=xxx (truncated to 2000 tokens)
-    │   ├─ [llm_call] prompt=xxx → response=xxx
-    │   ├─ [tool_call] WriteFile path=xxx size=1.2KB
-    │   └─ [result] summary=xxx
-    │
-    └─ [meta_summary] session done, total_tokens=12345
-  ```
-- 实现：
-  - 结构化 JSON 日志（zap/slog），按 sessionID 串联
-  - 日志写入 `session_logs` 表，Web API `/api/sessions/{id}/logs` 查询
-  - Web 端日志分析页：按 session/agent/level 过滤，Prompt/Response 全文可展开（脱敏 API Key）
-  - Token 消耗面板：按 Agent/模型/任务类型聚合
-
-**P1-3. 特性加 TODO 暂不做**（聚焦主路径）
-- 以下特性保留代码但 feature flag 默认关，写入此 TODO 待完善，默认关的 feature 需有单测覆盖防代码腐烂：
-  - Plan-and-Execute + Self-Reflection（`agent.plan_enabled` / `agent.reflection_enabled`）
-  - SubDomain 自适应启用（`state.EnableSubdomain`）
-  - DAG 定时任务流程（特性1）
-  - 抢占中断与队列注入（特性6）
-  - 人机对话处理（特性5）
-  - DomainAgent 持久化归档（特性4，P1-1 删除后此条作废）
-
 ### P2 — 体验与验证
 
 **P2-1. TUI 按最新文档重写**

@@ -6,7 +6,6 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
-
 // processMailbox 把广播邮件按目标 domain 转给具体 DomainAgent 实例。
 //
 // 职责：
@@ -46,12 +45,12 @@ func (n *MetaAgentNode) processMailbox(state *types.ThreeLayerState) {
 					// 升级类消息：注入块事件，由 handleBlockEvents 处理
 					if msg.Type == mailbox.MsgEscalate {
 						b.Events = append(b.Events, &types.Event{
-							ID:        msg.ID,                  // 事件ID
-							Type:      enums.EventEscalation,   // 升级事件
+							ID:        msg.ID,                                // 事件ID
+							Type:      enums.EventEscalation,                 // 升级事件
 							Payload:   map[string]any{"reason": msg.Subject}, // 载荷含原因
-							Priority:  msg.Priority,            // 优先级
-							CreatedAt: msg.CreatedAt,           // 创建时间
-							Status:    enums.EventPending,      // 待处理
+							Priority:  msg.Priority,                          // 优先级
+							CreatedAt: msg.CreatedAt,                         // 创建时间
+							Status:    enums.EventPending,                    // 待处理
 						})
 					}
 					break // 一个目标只转发一次

@@ -3,13 +3,12 @@ package graph
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
 	"github.com/blockmemory/agent/backend/internal/watchdog"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
+	"strings"
+	"time"
 )
-
 
 // drainCommandQueue 处理用户指令队列（特性6）。
 //
@@ -22,6 +21,10 @@ import (
 //
 // 没有队列或队列为空时返回 false。
 func (n *MetaAgentNode) drainCommandQueue(ctx context.Context, state *types.ThreeLayerState) bool {
+	// 若抢占中断与队列注入均未启用，直接跳过，避免不必要的队列 drain
+	if n.rt == nil || n.rt.AgentCfg == nil || (!n.rt.AgentCfg.InterruptEnabled && !n.rt.AgentCfg.QueueInjectEnabled) {
+		return false
+	}
 	items := n.rt.CmdQueue.Drain(state.SessionID)
 	if len(items) == 0 {
 		return false
@@ -29,6 +32,9 @@ func (n *MetaAgentNode) drainCommandQueue(ctx context.Context, state *types.Thre
 	for _, it := range items {
 		switch it.Intent {
 		case 1: // cmdqueue.IntentInterrupt
+			if !n.rt.AgentCfg.InterruptEnabled {
+				continue
+			}
 			n.emit(ctx, "intend", "抢占中断：清空当前上下文，按新指令重新启动")
 			// 清空图状态，保留 SessionID 与 Messages 中的历史对话
 			// 注意：必须重置 ActiveBlocks/CallStack/CurrentBlockID 三件套，
@@ -96,9 +102,9 @@ func (n *MetaAgentNode) runWatchdog(ctx context.Context, state *types.ThreeLayer
 	ctxBuf.WriteString(block.Goal)   // 写入领域目标
 	ctxBuf.WriteString("\n")         // 换行
 	for k, v := range block.TaskResults {
-		ctxBuf.WriteString(k)   // 写入任务名
+		ctxBuf.WriteString(k)    // 写入任务名
 		ctxBuf.WriteString(": ") // 分隔符
-		ctxBuf.WriteString(v)   // 写入任务结果
+		ctxBuf.WriteString(v)    // 写入任务结果
 		ctxBuf.WriteString("\n") // 换行
 	}
 	// 调 Watchdog 评估

@@ -3,12 +3,11 @@ package graph
 import (
 	"context"
 	"fmt"
+	"github.com/blockmemory/agent/backend/pkg/types"
 	"log"
 	"strings"
 	"time"
-	"github.com/blockmemory/agent/backend/pkg/types"
 )
-
 
 func (n *MetaAgentNode) ensureBlockArchived(ctx context.Context, state *types.ThreeLayerState, block *types.SessionBlock) {
 	if n.blockMemory == nil || block == nil {
@@ -26,13 +25,14 @@ func (n *MetaAgentNode) ensureBlockArchived(ctx context.Context, state *types.Th
 	// 同步兜底：短超时，失败仅日志不阻塞
 	bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := n.blockMemory.SaveBlockMemory(bgCtx, block.SessionID, block.Domain, block.Goal, summary); err != nil {
+	if err := n.blockMemory.SaveBlockMemory(bgCtx, block.SessionID, block.Domain, block.Goal, summary, nil); err != nil {
 		log.Printf("[MetaAgent] block memory fallback archive failed: session=%s domain=%s err=%v", block.SessionID, block.Domain, err)
 		return
 	}
 	block.MarkArchived()
 	log.Printf("[MetaAgent] block memory fallback archive ok: session=%s domain=%s", block.SessionID, block.Domain)
 }
+
 // collectBlockResult 收集block结果到session summary。
 //
 // 职责：把块的领域名与各任务结果拼成段落，追加到 SessionSummary。
@@ -116,8 +116,8 @@ func (n *MetaAgentNode) updateSessionSummary(state *types.ThreeLayerState) {
 	var parts []string
 	// 拼接各维度信息
 	parts = append(parts, fmt.Sprintf("会话[%s]已执行%d步", state.SessionID, n.stepCount)) // 会话ID+步数
-	parts = append(parts, fmt.Sprintf("完成领域: %v", state.CompletedBlocks))             // 已完成块列表
-	parts = append(parts, fmt.Sprintf("活跃领域: %d个", len(state.ActiveBlocks)))          // 活跃块数量
+	parts = append(parts, fmt.Sprintf("完成领域: %v", state.CompletedBlocks))            // 已完成块列表
+	parts = append(parts, fmt.Sprintf("活跃领域: %d个", len(state.ActiveBlocks)))         // 活跃块数量
 	if state.CurrentDomain != "" {
 		// 有当前领域则追加
 		parts = append(parts, fmt.Sprintf("当前领域: %s", state.CurrentDomain))

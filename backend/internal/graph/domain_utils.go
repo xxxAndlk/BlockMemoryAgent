@@ -3,11 +3,10 @@ package graph
 import (
 	"context"
 	"fmt"
+	"github.com/blockmemory/agent/backend/pkg/types"
 	"sync"
 	"time"
-	"github.com/blockmemory/agent/backend/pkg/types"
 )
-
 
 // matchFixedAssistant 匹配固定助手。
 //
@@ -108,6 +107,7 @@ func (n *DomainAgentNode) dispatchAssistantsSerial(ctx context.Context, state *t
 	}
 	return results // 返回所有任务的结果
 }
+
 // retryWithBackoff 指数退避重试。
 //
 // 职责：最多重试 maxRetries 次 fn；每次失败后 sleep delay 并翻倍 delay。

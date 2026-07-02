@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -36,6 +37,7 @@ type SubDomainAgentNode struct {
 	rt           *runtime.Runtime      // Runtime 聚合体（用于读取 AgentCfg 等动态参数）
 	memCallback  MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
 	snapshotMgr  AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
+	logger       *logger.Logger        // 结构化日志器（P1-2）
 }
 
 // SetRuntime 注入 Runtime。nil 时动态参数回退默认值。
@@ -101,6 +103,39 @@ func (n *SubDomainAgentNode) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
 // SetAgentSnapshotManager 注入 Agent 快照管理器。
 func (n *SubDomainAgentNode) SetAgentSnapshotManager(s AgentSnapshotManager) {
 	n.snapshotMgr = s
+}
+
+// SetLogger 注入结构化日志器（P1-2）。
+func (n *SubDomainAgentNode) SetLogger(l *logger.Logger) {
+	n.logger = l
+	if l != nil {
+		n.llmTracker.SetRecordCallback(func(ctx context.Context, r model.CallRecord) {
+			sessionID := SessionIDFromContext(ctx)
+			if sessionID == "" {
+				return
+			}
+			level := "info"
+			msg := "llm_call"
+			if r.Err != nil {
+				level = "error"
+				msg = "llm_call_error: " + r.Err.Error()
+			}
+			agent := "SubDomainAgent"
+			if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
+				agent = "SubDomainAgent[" + inst.Domain + "]"
+			}
+			l.WithSession(sessionID).WithAgent(agent).WithPhase("llm_call").
+				Event(ctx, "llm_call", msg, map[string]any{
+					"input_tokens":  r.InputTokens,
+					"output_tokens": r.OutputTokens,
+					"latency_ms":    int(r.Duration.Milliseconds()),
+					"timed_out":     r.TimedOut,
+					"prompt":        r.Prompt,
+					"response":      r.Response,
+					"level":         level,
+				})
+		})
+	}
 }
 
 // Name 返回节点名称。

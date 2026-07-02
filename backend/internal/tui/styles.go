@@ -4,22 +4,22 @@ import "github.com/charmbracelet/lipgloss"
 
 // Colors — Tokyo Night palette.
 const (
-	cTitle      = "#7AA2F7"
-	cFocus      = "#7AA2F7"
-	cBlur       = "#414868"
-	cMeta       = "#F7768E"
-	cDomain     = "#E0AF68"
-	cSub        = "#7AA2F7"
-	cAssist     = "#9ECE6A"
-	cActive     = "#9ECE6A"
-	cDone       = "#565F89"
-	cWarn       = "#E0AF68"
-	cError      = "#F7768E"
-	cInfo       = "#A9B1D6"
-	cValue      = "#C0CAF5"
-	cHelpBg     = "#1F2335"
-	cHeader     = "#BB9AF7"
-	cOverlayBg  = "#24283B"
+	cTitle     = "#7AA2F7"
+	cFocus     = "#7AA2F7"
+	cBlur      = "#414868"
+	cMeta      = "#F7768E"
+	cDomain    = "#E0AF68"
+	cSub       = "#7AA2F7"
+	cAssist    = "#9ECE6A"
+	cActive    = "#9ECE6A"
+	cDone      = "#565F89"
+	cWarn      = "#E0AF68"
+	cError     = "#F7768E"
+	cInfo      = "#A9B1D6"
+	cValue     = "#C0CAF5"
+	cHelpBg    = "#1F2335"
+	cHeader    = "#BB9AF7"
+	cOverlayBg = "#24283B"
 )
 
 // Styles holds all lipgloss styles used by the TUI.
@@ -92,4 +92,3 @@ func NewStyles() *Styles {
 		BadgeOk:      lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cActive)).Padding(0, 1),
 	}
 }
-

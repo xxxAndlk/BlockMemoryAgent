@@ -19,6 +19,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/dag"         // DAG 调度（特性1）
 	"github.com/blockmemory/agent/backend/internal/embed"       // 伪嵌入（特性3/4 共享）
 	"github.com/blockmemory/agent/backend/internal/graph"       // 三层图构建与节点
+	"github.com/blockmemory/agent/backend/internal/logger"      // 结构化会话日志（P1-2）
 	"github.com/blockmemory/agent/backend/internal/logging"     // 日志文件按天分割
 	"github.com/blockmemory/agent/backend/internal/memory"      // 快照管理器 + 块记忆伪嵌入
 	"github.com/blockmemory/agent/backend/internal/model"       // 模型工厂
@@ -122,6 +123,8 @@ func main() {
 	memoryCallbackHandler := memory.NewCallbackHandler(writeProcessor, snapshotMgr, nil, pgStore)
 	// Episode 压缩器：Watchdog 触发压缩时调用
 	episodeCompressor := memory.NewCompressor(pgStore)
+	// 结构化日志器：写 stderr + session_logs 表（P1-2）
+	sessionLogger := logger.New(pgStore)
 	// 上下文组装器：为 Assistant 注入私有记忆 / 全局知识 / 快照
 	contextAssembler := memory.NewContextAssembler(
 		memory.NewSimpleWorkspaceReader(),
@@ -179,6 +182,7 @@ func main() {
 	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
 	builder.SetModelFactory(modelFactory) // 全局模型工厂
 	builder.SetRuntime(rt)                // 全局运行时
+	builder.SetLogger(sessionLogger)      // 结构化日志器（P1-2）
 	builder.AddNode(metaAgent)            // 注册 MetaAgent 节点
 	builder.AddNode(escalation)           // 注册升级处理节点
 	builder.AddNode(sinker)               // 注册终止节点
@@ -186,13 +190,11 @@ func main() {
 
 	// 初始化会话管理器: 管理内存中的会话生命周期，连接图与存储
 	sessionMgr := server.NewSessionManager(threeLayerGraph, registry)
-	sessionMgr.SetPostgresStore(pgStore)   // 注入 Postgres 以持久化历史
+	sessionMgr.SetPostgresStore(pgStore)     // 注入 Postgres 以持久化历史
 	sessionMgr.SetModelFactory(modelFactory) // 注入模型工厂，续话时调轻量模型总结历史
 
 	// 特性3：注入块记忆存储适配器，让 DomainAgent 能归档/检索相似块记忆
 	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})
-	// 特性4：注入 domainAgent 归档存储，让 DomainAgent 完成后持久化信息跨会话复用
-	threeLayerGraph.SetArchiveStore(pgStore)
 	// 注入记忆回调 / 上下文组装器 / 压缩器 / 快照管理器
 	threeLayerGraph.SetMemoryCallbackHandler(memoryCallbackHandler)
 	threeLayerGraph.SetContextAssembler(contextAssembler)
@@ -200,17 +202,19 @@ func main() {
 	threeLayerGraph.SetAgentSnapshotManager(snapshotMgr)
 
 	// 特性1：创建 DAG 调度器（按 cron + 依赖关系派发 session）
-	// Postgres 缺失时不启动后台调度循环（避免 nil 解引用 panic），DAG 功能降级为不可用：
-	// DAGHandler 仍注册但所有写操作会返回降级错误（HTTP 500），不会让进程崩溃。
+	// 仅当 cfg.Agent.DAGEnabled 为 true 时启动；默认关闭，避免后台循环空转。
+	// Postgres 缺失时也不启动后台调度循环（避免 nil 解引用 panic）。
 	var dagScheduler *dag.Scheduler
 	if pgStore == nil {
 		log.Printf("警告: Postgres 不可用, DAG 调度器已禁用 (降级模式)")
+	} else if !cfg.Agent.DAGEnabled {
+		log.Printf("DAG 调度器已禁用 (feature flag)")
 	} else {
 		dagScheduler = dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
 		dagScheduler.Start(ctx)
 	}
 
-		// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
+	// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
 
 	// API 处理器（web 面板 / TUI 共用），通过 setter 逐步注入依赖
 	apiHandler := server.NewAPIHandler(nil)
@@ -351,6 +355,18 @@ func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
 			return
 		}
 
+		// /api/sessions/{id}/logs —— 结构化会话日志（P1-2）
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/logs"):] == "/logs" {
+			mgr.HandleSessionLogs(w, r)
+			return
+		}
+
+		// /api/sessions/{id}/token-metrics —— Token 消耗聚合（P1-2）
+		if len(path) > len("/api/sessions/") && path[len(path)-len("/token-metrics"):] == "/token-metrics" {
+			mgr.HandleSessionTokenMetrics(w, r)
+			return
+		}
+
 		// /api/sessions/{id}/watchdog —— 看门狗状态
 		if len(path) > len("/api/sessions/") && path[len(path)-len("/watchdog"):] == "/watchdog" {
 			mgr.HandleSessionWatchdog(w, r)
@@ -421,12 +437,17 @@ func (a *globalKBAdapter) Retrieve(ctx context.Context, query string, topK int) 
 
 // SaveBlockMemory 归档一条 domainAgent 块记忆到 global_knowledge 表。
 // 流程：组装 BlockMemoryRecord → ToKnowledgeRecord 生成 content/embedding/meta → SaveKnowledge 落库。
-func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string) error {
+func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string, facts []graph.BlockMemoryFact) error {
+	memFacts := make([]memory.Fact, 0, len(facts))
+	for _, f := range facts {
+		memFacts = append(memFacts, memory.Fact{Key: f.Key, Value: f.Value, Scope: memory.FactScope(f.Scope)})
+	}
 	rec := (&memory.BlockMemoryRecord{
 		SessionID: sessionID,
 		Domain:    domain,
 		Goal:      goal,
 		Summary:   summary,
+		Facts:     memFacts,
 		CreatedAt: time.Now(),
 	}).ToKnowledgeRecord(a.dim) // 内部用 embed.PseudoEmbed 生成伪向量
 	return a.pg.SaveKnowledge(ctx, rec)
@@ -434,6 +455,7 @@ func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, d
 
 // SearchBlockMemory 按 domain 过滤后检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
 // 先通过 meta->>'domain' 精确过滤，再在过滤后的结果中按向量相似度排序，避免跨领域串扰。
+// 返回内容包含摘要 + 结构化 facts（已按 scope 过滤为 domain / task）。
 func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, domain, query string, topK int) (string, error) {
 	recs, err := memory.SearchBlockMemory(ctx, a.pg, domain, query, topK)
 	if err != nil {
@@ -443,10 +465,15 @@ func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, domain, qu
 		// 返回空串让调用方跳过 prompt 注入，避免空段污染 LLM 输入
 		return "", nil
 	}
-	// 编号拼接：[1] xxx\n[2] xxx\n ... 便于 LLM 在 prompt 中引用
+	// 编号拼接：[1] 摘要 + facts 列表，便于 LLM 在 prompt 中引用
 	var b strings.Builder
 	for i, r := range recs {
 		b.WriteString(fmt.Sprintf("[%d] %s\n", i+1, r.Summary))
+		if facts := memory.FormatBlockMemoryFacts(r.Facts); facts != "" {
+			b.WriteString("facts:\n")
+			b.WriteString(facts)
+		}
+		b.WriteString("\n")
 	}
 	return b.String(), nil
 }

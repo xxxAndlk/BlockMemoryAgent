@@ -1,7 +1,7 @@
 package server
 
 import (
-	"context"      // 超时上下文
+	"context"       // 超时上下文
 	"encoding/json" // JSON 编解码
 	"fmt"           // 格式化字符串
 	"math"          // 时间衰减用 math.Exp
@@ -13,9 +13,9 @@ import (
 	"time"          // 超时与时间戳
 
 	"github.com/blockmemory/agent/backend/internal/memory"      // BlockMemory 检索
-	"github.com/blockmemory/agent/backend/internal/model"      // ModelFactory
-	"github.com/blockmemory/agent/backend/internal/runtime"    // Runtime
-	"github.com/blockmemory/agent/backend/internal/store"      // Postgres / Redis
+	"github.com/blockmemory/agent/backend/internal/model"       // ModelFactory
+	"github.com/blockmemory/agent/backend/internal/runtime"     // Runtime
+	"github.com/blockmemory/agent/backend/internal/store"       // Postgres / Redis
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config" // RoleConfigFile
 	"github.com/blockmemory/agent/backend/pkg/types"            // 共享类型
 )
@@ -318,7 +318,7 @@ func checkLLM(mgr *SessionManager) map[string]any {
 		return status
 	}
 	calls, timeouts, avg, max := mgr.LLMStats() // 聚合统计
-	online := calls > 0 && timeouts < calls      // 调用次数 > 0 且超时未占满
+	online := calls > 0 && timeouts < calls     // 调用次数 > 0 且超时未占满
 	status["online"] = online
 	status["detail"] = fmt.Sprintf("calls=%d timeouts=%d avg=%v max=%v", calls, timeouts, avg.Round(time.Millisecond), max.Round(time.Millisecond))
 	if !online {
@@ -344,7 +344,7 @@ func (h *APIHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 	llmModel := "mock"
 	if h.roleCfg != nil {
 		llmProvider = h.roleCfg.MetaAgent.ModelConfig.Provider // 供应商
-		llmModel = h.roleCfg.MetaAgent.ModelConfig.Model      // 模型名
+		llmModel = h.roleCfg.MetaAgent.ModelConfig.Model       // 模型名
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -571,7 +571,7 @@ func scoreEpisodesByKeywords(eps []*types.Episode, query string) []*scoredEpisod
 			}
 		}
 		// 时间衰减
-		score += math.Exp(-0.01 * time.Since(ep.Timestamp).Hours()) * 0.3 // 越新分数越高
+		score += math.Exp(-0.01*time.Since(ep.Timestamp).Hours()) * 0.3 // 越新分数越高
 		// 重要性
 		score += ep.Importance * 0.3
 		if score > 1.0 {

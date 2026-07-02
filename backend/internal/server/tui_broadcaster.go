@@ -2,10 +2,10 @@ package server
 
 import (
 	"encoding/json" // 事件 JSON 序列化
-	"fmt"            // SSE 帧 fmt.Fprintf
-	"net/http"       // HTTP / SSE 处理器
-	"sync"           // 读写锁保护 clients 映射
-	"time"           // 时间戳与心跳 ticker
+	"fmt"           // SSE 帧 fmt.Fprintf
+	"net/http"      // HTTP / SSE 处理器
+	"sync"          // 读写锁保护 clients 映射
+	"time"          // 时间戳与心跳 ticker
 
 	"github.com/blockmemory/agent/backend/pkg/types" // UIEvent 等共享类型
 )

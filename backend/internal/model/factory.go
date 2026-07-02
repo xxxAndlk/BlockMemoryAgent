@@ -9,9 +9,9 @@ import (
 	"fmt"     // 错误格式化
 	"sync"    // 读写锁，保护 models 缓存
 
-	"github.com/go-kratos/blades"                     // blades.ModelProvider 类型引用
 	"github.com/blockmemory/agent/backend/pkg/config" // RoleConfigFile 角色配置
 	"github.com/blockmemory/agent/backend/pkg/types"  // AgentModelConfig 类型
+	"github.com/go-kratos/blades"                     // blades.ModelProvider 类型引用
 )
 
 // LLMClient 大模型客户端接口（与 graph 包兼容）。

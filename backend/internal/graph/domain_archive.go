@@ -6,17 +6,15 @@ import (
 	"log"
 	"strings"
 	"time"
+
 	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
-
 
 // ensureSkillSet 确保该 DomainAgent 已装配 Skill 子集。
 //
 // 职责：
 //   - 若已装配则直接返回
-//   - 特性4：先查归档存储是否有同领域历史 Agent，命中则复用其 Skill 子集
-//     并权重+1、延后过期；未命中再走 LLM AssembleSet
 //   - 调 Pool.AssembleSet 触发 LLM 选择 ≤8 个技能
 //   - 通过 Registry.Bind 绑定到本 agent 实例 ID
 //
@@ -25,10 +23,7 @@ import (
 //   - inst：本实例
 //   - state：图全局状态（取 DomainGoal 作为选择输入）
 //
-// 副作用：装配成功后向 registry 写入 SkillSet；命中归档时 BumpWeight。
-//
-// 设计意图：v3 §5，让每个 DomainAgent 只看到与其领域相关的技能子集，
-// 避免全局技能列表污染 system prompt。特性4 在此基础上跨会话复用历史装配结果。
+// 副作用：装配成功后向 registry 写入 SkillSet。
 func (n *DomainAgentNode) ensureSkillSet(ctx context.Context, inst *types.RoleInstance, state *types.ThreeLayerState) {
 	// Runtime 或 Skill 注册表缺失则跳过（退化模式）
 	if n.rt == nil || n.rt.Skills == nil {
@@ -37,26 +32,6 @@ func (n *DomainAgentNode) ensureSkillSet(ctx context.Context, inst *types.RoleIn
 	// 已装配则直接返回，避免重复 LLM 调用
 	if existing := n.rt.Skills.GetForAgent(n.instID); existing != nil {
 		return
-	}
-
-	// 特性4：先查归档，命中则复用历史 Skill 子集
-	// 检索路径：domain + DomainGoal 双条件做相似查询，topK=1 取最相关的一条
-	if n.archiveStore != nil {
-		if archives, err := n.archiveStore.SearchDomainArchive(ctx, inst.Domain, state.DomainGoal, 1); err == nil && len(archives) > 0 {
-			arc := archives[0]
-			// 用归档里保存的 Skill ID 列表重建 SkillSet；查不到任何技能则 fall-through 到 LLM 路径
-			if reused := n.rt.Skills.Pool().AssembleFromIDs(n.instID, arc.Skills); reused != nil && len(reused.Skills) > 0 {
-				n.rt.Skills.Bind(reused)
-				// 权重 +1 且延后过期：让热点领域的归档越用越不容易被回收
-				ttl := time.Duration(168) * time.Hour // 默认 7 天
-				if n.rt.AgentCfg != nil && n.rt.AgentCfg.DomainArchiveTTLHours > 0 {
-					ttl = time.Duration(n.rt.AgentCfg.DomainArchiveTTLHours) * time.Hour
-				}
-				_ = n.archiveStore.BumpDomainArchiveWeight(ctx, arc.ArchiveID, ttl)
-				n.emit(ctx, "think", fmt.Sprintf("复用历史 domainAgent 归档: domain=%s weight=%d skills=%v", arc.Domain, arc.Weight, arc.Skills))
-				return
-			}
-		}
 	}
 
 	// 取领域模型作为技能选择的 LLMClient；取不到则 llm 为 nil，AssembleSet 内部回退规则
@@ -111,61 +86,41 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 		if summary == "" {
 			summary = block.Goal
 		}
+		// 从任务结果中提取结构化 facts（domain + task 级）
+		facts := collectBlockFacts(inst.Domain, block)
 		// 异步归档避免阻塞图循环；失败仅结构化日志，不影响主流程
-		// 注意：通过参数显式捕获 block/domain/goal/sum，避免闭包捕获迭代变量
-		// 成功后置 b.archived=true，供 switchToNextBlock 幂等兜底判断（TODO #4）
-		go func(b *types.SessionBlock, domain, goal, sum string) {
+		// 注意：通过参数显式捕获 block/domain/goal/sum/facts，避免闭包捕获迭代变量
+		// 成功后置 b.archived=true，供 switchToNextBlock 幂等兜底判断
+		go func(b *types.SessionBlock, domain, goal, sum string, fs []BlockMemoryFact) {
 			// 独立 ctx：与会话 ctx 解耦，会话结束后归档仍能完成
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err := n.blockMemory.SaveBlockMemory(bgCtx, b.SessionID, domain, goal, sum); err != nil {
+			if err := n.blockMemory.SaveBlockMemory(bgCtx, b.SessionID, domain, goal, sum, fs); err != nil {
 				log.Printf("[DomainAgent] save block memory failed: session=%s domain=%s err=%v", b.SessionID, domain, err)
 				return
 			}
 			b.MarkArchived() // 标记已落库，switchToNextBlock 据此跳过兜底
-		}(block, inst.Domain, block.Goal, summary)
+		}(block, inst.Domain, block.Goal, summary, facts)
 	}
+}
 
-	// 特性4：把 domainAgent 信息（领域/技能/上下文摘要）归档，跨会话可复用
-	if n.archiveStore != nil && block != nil {
-		// 收集当前实例绑定的 Skill ID 列表，作为下次复用的种子
-		var archivedSkills []string
-		if n.rt != nil && n.rt.Skills != nil {
-			if set := n.rt.Skills.GetForAgent(n.instID); set != nil {
-				for _, s := range set.Skills {
-					archivedSkills = append(archivedSkills, s.SkillID)
-				}
-			}
-		}
-		// TTL 来自配置；默认 168h（7 天）保证热点领域归档不会过快失效
-		ttl := 168 * time.Hour
-		if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.DomainArchiveTTLHours > 0 {
-			ttl = time.Duration(n.rt.AgentCfg.DomainArchiveTTLHours) * time.Hour
-		}
-		// 摘要优先取 state.Reason（含各任务结果）；为空时退化为领域目标
-		summary := state.Reason
-		if summary == "" {
-			summary = block.Goal
-		}
-		// 新归档权重从 1 起步；每次被复用时 BumpDomainArchiveWeight 会自增
-		rec := &DomainArchiveRecord{
-			SessionID:      block.SessionID,
-			Domain:         inst.Domain,
-			Goal:           block.Goal,
-			RoleDefID:      inst.RoleDefID,
-			Skills:         archivedSkills,
-			ContextSummary: summary,
-			Weight:         1,
-			ExpiresAt:      time.Now().Add(ttl),
-			CreatedAt:      time.Now(),
-		}
-		// 异步落库：独立 ctx 不受会话生命周期影响；失败仅结构化日志，主流程已结束不影响结果
-		go func(r *DomainArchiveRecord) {
-			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := n.archiveStore.SaveDomainArchive(bgCtx, r); err != nil {
-				log.Printf("[DomainAgent] save domain archive failed: session=%s domain=%s err=%v", r.SessionID, r.Domain, err)
-			}
-		}(rec)
+// collectBlockFacts 从 SessionBlock 中提取 domain / task 级 facts。
+// 规则：领域名作为 domain 级 fact；每个 TaskResult 作为 task 级 fact。
+func collectBlockFacts(domain string, block *types.SessionBlock) []BlockMemoryFact {
+	if block == nil {
+		return nil
 	}
+	facts := []BlockMemoryFact{
+		{Key: "domain", Value: domain, Scope: "domain"},
+		{Key: "goal", Value: block.Goal, Scope: "domain"},
+	}
+	for task, result := range block.TaskResults {
+		// 对结果做简短截断，避免 value 过长
+		v := result
+		if len(v) > 200 {
+			v = v[:200] + "..."
+		}
+		facts = append(facts, BlockMemoryFact{Key: "task:" + task, Value: v, Scope: "task"})
+	}
+	return facts
 }

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -41,8 +42,8 @@ type ThreeLayerGraph struct {
 	progress     ProgressCallback          // 思考/意图/工具调用实时推送回调
 	rt           *runtime.Runtime          // 看板/邮箱/Watchdog/人格/Skill 聚合体
 	blockMemory  BlockMemoryStore          // 块记忆存储（特性3：domainAgent 后向量检索）
-	archiveStore DomainArchiveStore        // domainAgent 归档存储（特性4：跨会话复用）
 	memCallback  MemoryCallbackHandler     // 记忆回调处理器（驱动 Episode 写入与快照保存）
+	logger       *logger.Logger            // 结构化日志器（P1-2）
 	assembler    ContextAssembler          // 上下文组装器（为 Assistant 注入私有记忆）
 	compressor   EpisodeCompressor         // Episode 压缩器（Watchdog 触发压缩）
 	snapshotMgr  AgentSnapshotManager      // Agent 快照管理器（DomainAgent 启动加载/结束保存）
@@ -65,17 +66,20 @@ func (g *ThreeLayerGraph) SetBlockMemoryStore(s BlockMemoryStore) {
 	}
 }
 
-// SetArchiveStore 在已构建的图上注入 domainAgent 归档存储（特性4）。
-func (g *ThreeLayerGraph) SetArchiveStore(s DomainArchiveStore) {
+// SetLogger 在已构建的图上注入结构化日志器（P1-2）。
+// 同步给已存在的 MetaAgent / DomainAgent / SubDomainAgent 静态节点与动态缓存。
+func (g *ThreeLayerGraph) SetLogger(l *logger.Logger) {
 	g.mu.Lock()
-	g.archiveStore = s
+	g.logger = l
 	g.mu.Unlock()
 	for _, node := range g.nodes {
-		if d, ok := node.(*DomainAgentNode); ok {
-			d.SetArchiveStore(s)
-		}
-		if m, ok := node.(*MetaAgentNode); ok {
-			m.SetArchiveStore(s)
+		switch n := node.(type) {
+		case *MetaAgentNode:
+			n.SetLogger(l)
+		case *DomainAgentNode:
+			n.SetLogger(l)
+		case *SubDomainAgentNode:
+			n.SetLogger(l)
 		}
 	}
 }
@@ -148,6 +152,7 @@ type ThreeLayerGraphBuilder struct {
 	toolCallback ToolCallback              // 工具回调（可后置注入）
 	progress     ProgressCallback          // 进度回调（可后置注入）
 	rt           *runtime.Runtime          // Runtime（可后置注入）
+	logger       *logger.Logger            // 结构化日志器（P1-2，可后置注入）
 }
 
 // NewThreeLayerGraphBuilder 创建三层图构建器。
@@ -216,6 +221,11 @@ func (b *ThreeLayerGraphBuilder) SetRuntime(rt *runtime.Runtime) {
 	b.rt = rt
 }
 
+// SetLogger 注入结构化日志器（P1-2）。
+func (b *ThreeLayerGraphBuilder) SetLogger(l *logger.Logger) {
+	b.logger = l
+}
+
 // AddNode 添加节点。
 // 以 node.Name() 作为 key 存入节点表，重名会覆盖。
 func (b *ThreeLayerGraphBuilder) AddNode(node ThreeLayerNode) {
@@ -235,16 +245,38 @@ func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
 		toolCallback: b.toolCallback,
 		progress:     b.progress,
 		rt:           b.rt,
+		logger:       b.logger,
 	}
 
-	// 为已有节点注入 ModelFactory / Runtime / Progress
+	// 为已有节点注入 ModelFactory / Runtime / Progress / Logger
 	// 动态节点（DomainAgent 等）在 resolveInstanceNode 时单独注入
 	for _, node := range g.nodes {
 		g.injectModelFactory(node) // 模型工厂 + 工具回调 + Runtime
 		g.injectProgress(node)     // 进度回调
+		g.injectLogger(node)       // 结构化日志器
 	}
 
 	return g
+}
+
+// injectLogger 向节点注入结构化日志器。
+// 仅对 MetaAgent / DomainAgent / SubDomainAgent 三类节点生效。
+// 并发安全：读 logger 时持读锁。
+func (g *ThreeLayerGraph) injectLogger(node ThreeLayerNode) {
+	g.mu.RLock()
+	l := g.logger
+	g.mu.RUnlock()
+	if l == nil {
+		return
+	}
+	switch n := node.(type) {
+	case *MetaAgentNode:
+		n.SetLogger(l)
+	case *DomainAgentNode:
+		n.SetLogger(l)
+	case *SubDomainAgentNode:
+		n.SetLogger(l)
+	}
 }
 
 // injectProgress 向节点注入进度回调。
@@ -548,15 +580,6 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 			d.SetBlockMemoryStore(bm)
 		}
 	}
-	// 注入 domainAgent 归档存储（特性4）
-	g.mu.RLock()
-	as := g.archiveStore
-	g.mu.RUnlock()
-	if as != nil {
-		if d, ok := node.(*DomainAgentNode); ok {
-			d.SetArchiveStore(as)
-		}
-	}
 	// 注入记忆回调处理器
 	g.mu.RLock()
 	memCb := g.memCallback
@@ -590,6 +613,8 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 			sd.SetAgentSnapshotManager(sm)
 		}
 	}
+	// 注入结构化日志器
+	g.injectLogger(node)
 
 	// 缓存到静态表：下次同名 ID 直接命中，避免重复构造
 	g.mu.Lock()

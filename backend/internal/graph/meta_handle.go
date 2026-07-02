@@ -3,13 +3,12 @@ package graph
 import (
 	"context"
 	"fmt"
+	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/types"
 	"log"
 	"strings"
 	"time"
-	"github.com/blockmemory/agent/backend/pkg/enums"
-	"github.com/blockmemory/agent/backend/pkg/types"
 )
-
 
 // handleInitial 首次启动处理。
 //
@@ -34,6 +33,13 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 	// 5 路径路由：规则层（零 LLM）→ LLM 兜底 → 安全兜底（RouteCreateDomain）
 	decision := n.ClassifyTask(ctx, state)
 	n.emit(ctx, "intend", fmt.Sprintf("路由判定: %s", decision.Path))
+	if log := n.sessionLogger(ctx); log != nil {
+		log.Event(ctx, "routing", fmt.Sprintf("goal=%s → path=%s", state.DomainGoal, decision.Path), map[string]any{
+			"goal":      state.DomainGoal,
+			"path":      decision.Path,
+			"subdomain": decision.EnableSubdomain,
+		})
+	}
 
 	switch decision.Path {
 	case RouteDirectTool:
@@ -89,6 +95,12 @@ func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *t
 			names = append(names, d.Name)
 		}
 		n.emit(ctx, "intend", fmt.Sprintf("拆分出 %d 个领域: %s", len(domains), strings.Join(names, ", ")))
+		if log := n.sessionLogger(ctx); log != nil {
+			log.Event(ctx, "task_split", fmt.Sprintf("拆分出 %d 个领域", len(domains)), map[string]any{
+				"domains": names,
+				"count":   len(domains),
+			})
+		}
 	}
 
 	// 初始化 TaskBoard（v3 §7.1）：把领域名作为顶层子任务
@@ -108,6 +120,12 @@ func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *t
 			break
 		}
 		n.emit(ctx, "intend", fmt.Sprintf("创建 DomainAgent: %s (目标: %s)", domain.Name, domain.Goal))
+		if log := n.sessionLogger(ctx); log != nil {
+			log.Event(ctx, "domain_create", fmt.Sprintf("创建 DomainAgent: %s", domain.Name), map[string]any{
+				"domain": domain.Name,
+				"goal":   domain.Goal,
+			})
+		}
 		// 二次检查（防御性）
 		if len(state.ActiveBlocks) >= n.maxBlocks {
 			break
@@ -121,7 +139,7 @@ func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *t
 		}
 		// 推送 Agent 创建调试事件
 		roleDef := n.registry.GetRoleDef(inst.RoleDefID) // 取角色定义
-		agentName := domain.Name + "负责人"               // 默认名称
+		agentName := domain.Name + "负责人"                 // 默认名称
 		if roleDef != nil {
 			// 有角色定义则用其名称
 			agentName = roleDef.Name
@@ -132,13 +150,13 @@ func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *t
 		// 构造会话块
 		block := &types.SessionBlock{
 			ID:          fmt.Sprintf("block_%s_%d", sanitizeID(domain.Name), len(state.ActiveBlocks)), // 块ID（领域名+序号）
-			SessionID:   state.SessionID,        // 所属会话
-			Domain:      domain.Name,             // 领域名
-			Goal:        domain.Goal,             // 领域目标
-			Status:      enums.BlockStatusActive,      // 初始状态活跃
-			Agents:      []string{inst.ID},       // 关联的 DomainAgent 实例
-			Events:      make([]*types.Event, 0), // 事件队列
-			TaskResults: make(map[string]string), // 任务结果
+			SessionID:   state.SessionID,                                                              // 所属会话
+			Domain:      domain.Name,                                                                  // 领域名
+			Goal:        domain.Goal,                                                                  // 领域目标
+			Status:      enums.BlockStatusActive,                                                      // 初始状态活跃
+			Agents:      []string{inst.ID},                                                            // 关联的 DomainAgent 实例
+			Events:      make([]*types.Event, 0),                                                      // 事件队列
+			TaskResults: make(map[string]string),                                                      // 任务结果
 		}
 		// 写入活跃块表
 		state.ActiveBlocks[block.ID] = block
@@ -153,10 +171,10 @@ func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *t
 
 	// 切换到第一个块（map 迭代顺序不固定，但只取一个）
 	for blockID := range state.ActiveBlocks {
-		state.CurrentBlockID = blockID       // 设为当前块
-		block := state.ActiveBlocks[blockID] // 取块引用
-		state.CurrentDomain = block.Domain   // 更新当前领域
-		state.DomainGoal = block.Goal        // 更新领域目标
+		state.CurrentBlockID = blockID        // 设为当前块
+		block := state.ActiveBlocks[blockID]  // 取块引用
+		state.CurrentDomain = block.Domain    // 更新当前领域
+		state.DomainGoal = block.Goal         // 更新领域目标
 		state.NextAction = enums.ActionSwitch // 切换到 DomainAgent
 		state.TargetRoleID = block.Agents[0]  // 路由目标
 		break                                 // 只取第一个
@@ -195,9 +213,9 @@ func (n *MetaAgentNode) handleBlockEvents(ctx context.Context, state *types.Thre
 
 		case enums.EventEscalation:
 			// 升级事件：标记完成避免重复处理（H7），设置 ActionEscalate 交 EscalationHandler 仲裁
-			ev.Status = enums.EventDone                       // 先标记完成，防止 handleBlockEvents 下轮重复触发
-			state.NextAction = enums.ActionEscalate           // 设置升级动作
-			state.Reason = getString(ev.Payload, "reason")    // 记录升级原因
+			ev.Status = enums.EventDone                    // 先标记完成，防止 handleBlockEvents 下轮重复触发
+			state.NextAction = enums.ActionEscalate        // 设置升级动作
+			state.Reason = getString(ev.Payload, "reason") // 记录升级原因
 			return state, nil
 
 		default:
@@ -210,6 +228,7 @@ func (n *MetaAgentNode) handleBlockEvents(ctx context.Context, state *types.Thre
 	state.NextAction = enums.ActionContinue
 	return state, nil
 }
+
 // handleCrossDomainRequest 处理跨领域请求。
 //
 // 职责：
@@ -227,7 +246,7 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 	// 取目标领域；为空则标记事件完成并继续
 	targetDomain := getString(ev.Payload, "target_domain")
 	if targetDomain == "" {
-		ev.Status = enums.EventDone            // 标记事件完成
+		ev.Status = enums.EventDone             // 标记事件完成
 		state.NextAction = enums.ActionContinue // 继续图循环
 		return state, nil
 	}
@@ -264,28 +283,29 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 		// 构造新会话块
 		targetBlock = &types.SessionBlock{
 			ID:          fmt.Sprintf("block_%s_%d", sanitizeID(targetDomain), len(state.ActiveBlocks)), // 块ID（领域名+序号）
-			SessionID:   state.SessionID,        // 所属会话
-			Domain:      targetDomain,            // 领域名
-			Goal:        getString(ev.Payload, "goal"), // 领域目标
-			Status:      enums.BlockStatusActive,      // 初始状态活跃
-			Agents:      []string{inst.ID},       // 关联的 DomainAgent 实例
-			Events:      make([]*types.Event, 0), // 事件队列
-			TaskResults: make(map[string]string), // 任务结果
+			SessionID:   state.SessionID,                                                               // 所属会话
+			Domain:      targetDomain,                                                                  // 领域名
+			Goal:        getString(ev.Payload, "goal"),                                                 // 领域目标
+			Status:      enums.BlockStatusActive,                                                       // 初始状态活跃
+			Agents:      []string{inst.ID},                                                             // 关联的 DomainAgent 实例
+			Events:      make([]*types.Event, 0),                                                       // 事件队列
+			TaskResults: make(map[string]string),                                                       // 任务结果
 		}
 		// 写入活跃块表
 		state.ActiveBlocks[targetBlock.ID] = targetBlock
 	}
 
 	// 切换到目标块
-	state.CurrentBlockID = targetBlock.ID       // 设为当前块
-	state.CurrentDomain = targetBlock.Domain    // 更新当前领域
-	state.DomainGoal = targetBlock.Goal         // 更新领域目标
-	state.NextAction = enums.ActionSwitch       // 切换到 DomainAgent
-	state.TargetRoleID = targetBlock.Agents[0]  // 路由目标
-	ev.Status = enums.EventDone                 // 标记事件已处理
+	state.CurrentBlockID = targetBlock.ID      // 设为当前块
+	state.CurrentDomain = targetBlock.Domain   // 更新当前领域
+	state.DomainGoal = targetBlock.Goal        // 更新领域目标
+	state.NextAction = enums.ActionSwitch      // 切换到 DomainAgent
+	state.TargetRoleID = targetBlock.Agents[0] // 路由目标
+	ev.Status = enums.EventDone                // 标记事件已处理
 
 	return state, nil
 }
+
 // switchToNextBlock 切换到下一个会话块。
 // 返回：更新后的 state；无活跃块时调 finalizeSession 生成最终回答。
 func (n *MetaAgentNode) switchToNextBlock(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
@@ -314,11 +334,11 @@ func (n *MetaAgentNode) switchToNextBlock(ctx context.Context, state *types.Thre
 	}
 
 	// 3. 所有block完成，生成最终回答
-	n.finalizeSession(ctx, state)               // 生成最终回答
-	state.CurrentBlockID = ""                   // 清空当前块
-	state.CurrentDomain = ""                    // 清空当前领域
-	state.DomainGoal = ""                       // 清空领域目标
-	state.NextAction = enums.ActionFinish       // 结束会话
+	n.finalizeSession(ctx, state)                 // 生成最终回答
+	state.CurrentBlockID = ""                     // 清空当前块
+	state.CurrentDomain = ""                      // 清空当前领域
+	state.DomainGoal = ""                         // 清空领域目标
+	state.NextAction = enums.ActionFinish         // 结束会话
 	state.Reason = "all session blocks completed" // 记录原因
 	return state, nil
 }

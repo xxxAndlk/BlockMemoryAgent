@@ -2,23 +2,23 @@ package graph
 
 import (
 	"context"
-	"log"
 	"time"
+
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
-
 // HistoryEntry 跨会话历史摘要。
 // 与 store.SessionHistoryRecord 解耦，避免 graph 反向依赖 store 包。
 type HistoryEntry struct {
-	SessionID   string              // 历史会话ID
-	Goal        string              // 历史会话目标
-	Summary     string              // 历史会话结果摘要
-	ToolResults []map[string]any    // 历史会话的工具调用结果（含 tool/path 等）
-	CreatedAt   time.Time           // 历史会话创建时间
+	SessionID   string           // 历史会话ID
+	Goal        string           // 历史会话目标
+	Summary     string           // 历史会话结果摘要
+	ToolResults []map[string]any // 历史会话的工具调用结果（含 tool/path 等）
+	CreatedAt   time.Time        // 历史会话创建时间
 }
 
 // HistoryStore 跨会话历史读取接口。
@@ -52,9 +52,9 @@ type MetaAgentNode struct {
 	history         HistoryStore          // 跨会话历史读取器
 	progress        ProgressCallback      // 进度回调（推思考/意图/Token）
 	toolCallback    ToolCallback          // 工具执行结果回调（推 UI），RouteDirectTool/Assistant 直接执行时用
-	archiveStore    DomainArchiveStore    // domainAgent 归档存储（特性4：跨会话复用与清理）
 	blockMemory     BlockMemoryStore      // 块记忆存储（特性3：switchToNextBlock 幂等兜底归档用）
 	compressor      EpisodeCompressor     // Episode 压缩器（Watchdog 触发压缩时调用）
+	logger          *logger.Logger        // 结构化日志器（P1-2）
 }
 
 // NewMetaAgentNode 创建主Agent节点。
@@ -68,13 +68,13 @@ type MetaAgentNode struct {
 // 返回：装配好的节点；modelFactory/runtime/history/progress 通过 Set* 后置注入。
 func NewMetaAgentNode(registry *RoleRegistry, factory *RoleFactory, maxBlocks, summaryInterval int) *MetaAgentNode {
 	return &MetaAgentNode{
-		name:            "MetaAgent",                     // 节点名固定
-		registry:        registry,                         // 注入注册表
-		factory:         factory,                          // 注入工厂
-		maxBlocks:       maxBlocks,                        // 最大并发块数
-		summaryInterval: summaryInterval,                  // 摘要更新间隔
-		stepCount:       0,                                // 步数清零
-		llmTracker:      model.NewLLMCallTracker(),        // 新建 LLM 调用追踪器
+		name:            "MetaAgent",               // 节点名固定
+		registry:        registry,                  // 注入注册表
+		factory:         factory,                   // 注入工厂
+		maxBlocks:       maxBlocks,                 // 最大并发块数
+		summaryInterval: summaryInterval,           // 摘要更新间隔
+		stepCount:       0,                         // 步数清零
+		llmTracker:      model.NewLLMCallTracker(), // 新建 LLM 调用追踪器
 	}
 }
 
@@ -107,12 +107,6 @@ func (n *MetaAgentNode) SetHistoryStore(h HistoryStore) {
 	n.history = h
 }
 
-// SetArchiveStore 注入 domainAgent 归档存储（特性4）。
-// nil 时跳过归档清理与复用检索。
-func (n *MetaAgentNode) SetArchiveStore(s DomainArchiveStore) {
-	n.archiveStore = s
-}
-
 // SetEpisodeCompressor 注入 Episode 压缩器。
 // nil 时 Watchdog 仅推送建议压缩提示，不执行压缩。
 func (n *MetaAgentNode) SetEpisodeCompressor(c EpisodeCompressor) {
@@ -123,6 +117,36 @@ func (n *MetaAgentNode) SetEpisodeCompressor(c EpisodeCompressor) {
 // 用于推送思考/意图/LLM 调用/Token 消耗等事件到 UI。
 func (n *MetaAgentNode) SetProgressCallback(cb ProgressCallback) {
 	n.progress = cb
+}
+
+// SetLogger 注入结构化日志器（P1-2）。
+// 注入后自动配置 LLM 调用追踪器的持久化回调，将每次 LLM 调用写入 session_logs。
+func (n *MetaAgentNode) SetLogger(l *logger.Logger) {
+	n.logger = l
+	if l != nil {
+		n.llmTracker.SetRecordCallback(func(ctx context.Context, r model.CallRecord) {
+			sessionID := SessionIDFromContext(ctx)
+			if sessionID == "" {
+				return
+			}
+			level := "info"
+			msg := "llm_call"
+			if r.Err != nil {
+				level = "error"
+				msg = "llm_call_error: " + r.Err.Error()
+			}
+			l.WithSession(sessionID).WithAgent(r.Caller).WithPhase("llm_call").
+				Event(ctx, "llm_call", msg, map[string]any{
+					"input_tokens":  r.InputTokens,
+					"output_tokens": r.OutputTokens,
+					"latency_ms":    int(r.Duration.Milliseconds()),
+					"timed_out":     r.TimedOut,
+					"prompt":        r.Prompt,
+					"response":      r.Response,
+					"level":         level,
+				})
+		})
+	}
 }
 
 // emit 推送进度事件（nil 回调时无操作）。
@@ -155,6 +179,18 @@ func (n *MetaAgentNode) emitDetail(ctx context.Context, kind, message, detail st
 // 其他节点（如动态构造的 DomainAgent）通过此方法获取聚合 Runtime，
 // 避免在图构建器里重复传递各组件指针。
 func (n *MetaAgentNode) Runtime() *runtime.Runtime { return n.rt }
+
+// sessionLogger 返回按 session_id 绑定的 Logger；未注入时返回 nil-safe 的退化 logger。
+func (n *MetaAgentNode) sessionLogger(ctx context.Context) *logger.Logger {
+	if n.logger == nil {
+		return logger.New(nil)
+	}
+	sessionID := SessionIDFromContext(ctx)
+	if sessionID == "" {
+		return n.logger
+	}
+	return n.logger.WithSession(sessionID).WithAgent("MetaAgent")
+}
 
 // TimeoutStats 获取超时统计（兼容原接口）。
 // 返回值：callCount 调用次数 / timeoutCount 超时次数 / avgDur 平均耗时 / maxDur 最大耗时。
@@ -211,20 +247,6 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	// 3. 清理过期实例（registry 内部按 TTL 回收）
 	n.registry.CleanupExpired()
 
-	// 3.5 特性4：定期清理过期 domainAgent 归档（每 50 tick 跑一次）
-	// 频率取 50 tick 是权衡：太频繁会反复扫表，太稀疏会让过期记录占据 pgvector 索引
-	if n.stepCount%50 == 0 && n.archiveStore != nil {
-		go func() {
-			// 独立 ctx：清理不阻塞主路径，超时 5s 防止异常长 SQL
-			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if n, err := n.archiveStore.CleanupExpiredDomainArchives(bgCtx); err == nil && n > 0 {
-				// 日志即可，不阻塞主路径
-				log.Printf("[MetaAgent] 清理了 %d 个过期领域归档", n)
-			}
-		}()
-	}
-
 	// 4. Watchdog: 监控当前活跃 Agent 的上下文规模（v3 §4.4）
 	n.runWatchdog(ctx, state)
 
@@ -241,6 +263,15 @@ func (n *MetaAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	case len(state.ActiveBlocks) == 0 && state.CurrentBlockID != "":
 		state.NextAction = enums.ActionFinish
 		state.Reason = "all blocks completed"
+		totalIn, totalOut := n.llmTracker.TokenTotals()
+		if log := n.sessionLogger(ctx); log != nil {
+			log.Event(ctx, "meta_summary", "session done", map[string]any{
+				"total_tokens":     totalIn + totalOut,
+				"input_tokens":     totalIn,
+				"output_tokens":    totalOut,
+				"completed_blocks": len(state.CompletedBlocks),
+			})
+		}
 
 	// 调用中：当前块存在且调用栈非空 → 继续图循环（让被调用者执行）
 	case state.CurrentBlockID != "" && state.IsCalling():

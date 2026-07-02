@@ -62,8 +62,6 @@ type AgentOutput struct {
 	Validated bool `json:"validated"`
 }
 
-
-
 // Event 工作区事件：跨 Agent 协作的原子语义消息，由 Mailbox 分发。
 type Event struct {
 	// ID 事件唯一标识。
@@ -135,16 +133,15 @@ type ChatMessage struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-
 // ClarifyRequest 人机对话请求：Agent 在执行中遇到需要用户确认的问题时挂起，
 // 由 server 层通过 HTTP 暴露给前端，用户答复后回填 Answer 并恢复 graph。
 type ClarifyRequest struct {
-	ID        string    `json:"id"`         // 请求唯一 ID（用于答复对齐）
-	Question  string    `json:"question"`   // Agent 提给用户的问题
-	Context   string    `json:"context"`    // 触发澄清的上下文摘要（便于用户理解）
-	AgentID   string    `json:"agent_id"`   // 发起澄清的 Agent 实例 ID
-	CreatedAt time.Time `json:"created_at"` // 创建时间
-	Answer    string    `json:"answer,omitempty"` // 用户答复（回填）
+	ID         string     `json:"id"`                    // 请求唯一 ID（用于答复对齐）
+	Question   string     `json:"question"`              // Agent 提给用户的问题
+	Context    string     `json:"context"`               // 触发澄清的上下文摘要（便于用户理解）
+	AgentID    string     `json:"agent_id"`              // 发起澄清的 Agent 实例 ID
+	CreatedAt  time.Time  `json:"created_at"`            // 创建时间
+	Answer     string     `json:"answer,omitempty"`      // 用户答复（回填）
 	AnsweredAt *time.Time `json:"answered_at,omitempty"` // 答复时间
 }
 
@@ -172,7 +169,6 @@ type GraphState struct {
 	// Reason 本次动作的理由，供审计与调试。
 	Reason string `json:"reason"`
 }
-
 
 // TokenBudget Token 预算分配：上下文 4 段式拼接的 Token 上限配置。
 // 见 memory/assembler.go 的 4 段装配（System/TopicGlobal/SharedState/PrivateMemory）。

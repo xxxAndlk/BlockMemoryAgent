@@ -14,10 +14,10 @@
 package mailbox
 
 import (
-	"sort"       // 用于按优先级排序消息
-	"sync"       // 提供 RWMutex 保护并发访问
+	"sort"        // 用于按优先级排序消息
+	"sync"        // 提供 RWMutex 保护并发访问
 	"sync/atomic" // 提供原子计数器生成消息 ID
-	"time"       // 用于时间戳与 ID 格式化
+	"time"        // 用于时间戳与 ID 格式化
 )
 
 // MessageType 邮件类型，区分 Agent 间事件语义。
@@ -25,15 +25,15 @@ type MessageType string
 
 const (
 	// MsgMilestone 里程碑达成事件，表示某 Agent 完成关键节点。
-	MsgMilestone   MessageType = "milestone"    // 完成里程碑
+	MsgMilestone MessageType = "milestone" // 完成里程碑
 	// MsgRequest 协助请求，要求目标 Agent 提供支持。
-	MsgRequest     MessageType = "request"      // 请求协助
+	MsgRequest MessageType = "request" // 请求协助
 	// MsgInfo 普通通知，仅作信息同步，无需响应。
-	MsgInfo        MessageType = "info"         // 普通通知
+	MsgInfo MessageType = "info" // 普通通知
 	// MsgEscalate 升级请求，需要上层 Agent 介入裁决。
-	MsgEscalate    MessageType = "escalate"     // 升级请求
+	MsgEscalate MessageType = "escalate" // 升级请求
 	// MsgDependency 依赖完成事件，通知等待方前置任务已就绪。
-	MsgDependency  MessageType = "dependency"   // 依赖完成事件
+	MsgDependency MessageType = "dependency" // 依赖完成事件
 )
 
 // Status 邮件状态，用于区分未读/已读，避免重复拉取。
@@ -43,33 +43,33 @@ const (
 	// StatusUnread 未读：消息尚未被目标 Agent 消费。
 	StatusUnread Status = "unread"
 	// StatusRead 已读：消息已被 Drain 拉取并注入过上下文。
-	StatusRead   Status = "read"
+	StatusRead Status = "read"
 )
 
 // Message 邮件结构体，描述一次 Agent 间异步事件。
 type Message struct {
 	// ID 唯一标识，由 Send 自动生成（msg_HHMMSS_seq）。
-	ID        string         `json:"id"`
+	ID string `json:"id"`
 	// From 发送者 Agent 实例 ID。
-	From      string         `json:"from"`           // 发送者 agent 实例 ID
+	From string `json:"from"` // 发送者 agent 实例 ID
 	// To 收件者 Agent 实例 ID；"*" 表示广播，由主 Agent 决议。
-	To        string         `json:"to"`             // 收件者 agent 实例 ID（"*" 广播）
+	To string `json:"to"` // 收件者 agent 实例 ID（"*" 广播）
 	// Type 事件类型，影响接收方的处理策略。
-	Type      MessageType    `json:"type"`
+	Type MessageType `json:"type"`
 	// Subject 一行摘要，注入上下文时作为标题展示。
-	Subject   string         `json:"subject"`        // 一行摘要
+	Subject string `json:"subject"` // 一行摘要
 	// Body 详情正文，可为空（仅靠 Subject 表意时）。
-	Body      string         `json:"body,omitempty"` // 详情，可空
+	Body string `json:"body,omitempty"` // 详情，可空
 	// Payload 结构化附加数据，供接收方按需解析。
-	Payload   map[string]any `json:"payload,omitempty"`
+	Payload map[string]any `json:"payload,omitempty"`
 	// Priority 优先级，数字越大越紧急，默认 0；排序时靠前。
-	Priority  int            `json:"priority"`       // 数字越大越紧急（默认 0）
+	Priority int `json:"priority"` // 数字越大越紧急（默认 0）
 	// Status 当前邮件状态（unread/read）。
-	Status    Status         `json:"status"`
+	Status Status `json:"status"`
 	// CreatedAt 创建时间，由 Send 在投递时填充。
-	CreatedAt time.Time      `json:"created_at"`
+	CreatedAt time.Time `json:"created_at"`
 	// ReadAt 首次被 Drain 标记为已读的时间；未读时为 nil。
-	ReadAt    *time.Time     `json:"read_at,omitempty"`
+	ReadAt *time.Time `json:"read_at,omitempty"`
 }
 
 // Mailbox 多 Agent 邮箱管理器，维护每个 Agent 的收件箱与广播桶。
@@ -82,10 +82,10 @@ type Message struct {
 //
 // 并发安全：所有公开方法均自行加锁，可被多 goroutine 同时调用。
 type Mailbox struct {
-	mu     sync.RWMutex
-	inbox  map[string][]*Message // agentID -> messages
-	bcast  []*Message            // To == "*" 等待主 Agent 决议
-	seq    atomic.Int64
+	mu    sync.RWMutex
+	inbox map[string][]*Message // agentID -> messages
+	bcast []*Message            // To == "*" 等待主 Agent 决议
+	seq   atomic.Int64
 }
 
 // New 创建并返回一个新的邮箱管理器实例。

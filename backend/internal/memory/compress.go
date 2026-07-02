@@ -1,10 +1,10 @@
 package memory
 
 import (
-	"context"  // 上下文，用于取消与超时传递
-	"fmt"      // 格式化与错误包装
-	"sort"     // sort.Slice 替代手写冒泡，稳定性与可读性更佳
-	"time"     // 时间间隔判断（24h、7d 等压缩阈值）
+	"context"      // 上下文，用于取消与超时传递
+	"fmt"          // 格式化与错误包装
+	"sort"         // sort.Slice 替代手写冒泡，稳定性与可读性更佳
+	"time"         // 时间间隔判断（24h、7d 等压缩阈值）
 	"unicode/utf8" // rune 计数与按字符截断，避免破坏 UTF-8
 
 	"github.com/blockmemory/agent/backend/pkg/types" // Episode 等公共类型
@@ -33,6 +33,7 @@ func NewCompressor(store PrivateStore) *Compressor {
 //   - ctx: 上下文。
 //   - agentID: Agent 标识。
 //   - topicID: Topic 标识。
+//
 // 返回: 持久化失败时返回 wrapped error。
 // 副作用: 修改 Episode 字段并批量写回 PrivateStore。
 // 并发安全: 自身无共享可变状态；并发安全性取决于底层 store 实现。
@@ -94,6 +95,7 @@ func (c *Compressor) Compress(ctx context.Context, agentID, topicID string) erro
 //   - agentID: Agent 标识。
 //   - topicID: Topic 标识。
 //   - maxTokens: 允许的最大 Token 预算。
+//
 // 返回: 读取或统计失败时返回 error；无需压缩返回 nil。
 // 副作用: 就地修改低重要性 Episode 的字段并逐条写回 PrivateStore（C2 修复：原实现未持久化，导致压缩管线形同虚设）。
 // 并发安全: 自身无共享可变状态；并发安全性取决于底层 store 实现。
@@ -158,7 +160,7 @@ func (c *Compressor) compressToLevel2(ep *types.Episode) {
 		runes := []rune(ep.ObservationSummary)
 		ep.ObservationSummary = string(runes[:100]) + "..."
 	}
-	ep.Facts = nil    // 丢弃事实列表
+	ep.Facts = nil     // 丢弃事实列表
 	ep.ToolCalls = nil // 丢弃工具调用明细
 }
 
@@ -171,9 +173,9 @@ func (c *Compressor) compressToLevel3(ep *types.Episode) {
 	ep.FullObservation = ""
 	// 用 ID + 分数覆盖摘要，仅留存在性标记
 	ep.ObservationSummary = fmt.Sprintf("[%s] importance=%.2f", ep.StepID, ep.Importance)
-	ep.Facts = nil      // 丢弃事实
-	ep.Reflection = ""  // 丢弃反思
-	ep.ToolCalls = nil  // 丢弃工具调用
+	ep.Facts = nil     // 丢弃事实
+	ep.Reflection = "" // 丢弃反思
+	ep.ToolCalls = nil // 丢弃工具调用
 }
 
 // sortByImportanceAndTime 按重要性降序、时间降序排序。

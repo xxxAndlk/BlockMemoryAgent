@@ -78,12 +78,12 @@ func (m *SnapshotManager) Load(ctx context.Context, agentID, topicID string) (*t
 	// 3. 都不存在，初始化空快照，保证调用方拿到可用对象。
 	if snap == nil {
 		snap = &types.AgentSnapshot{
-			AgentID:      agentID,                    // 标记归属 Agent
-			TopicID:      topicID,                    // 标记归属话题
+			AgentID:      agentID,                       // 标记归属 Agent
+			TopicID:      topicID,                       // 标记归属话题
 			KeySummaries: make([]types.SummaryBlock, 0), // 关键摘要初始化为空切片（避免 nil）
-			OpenIssues:   make([]types.Issue, 0),     // 未决问题初始化为空切片
-			LocalVars:    make(map[string]any),       // 私有变量初始化为空 map
-			UpdatedAt:    time.Now(),                 // 记录初始化时间
+			OpenIssues:   make([]types.Issue, 0),        // 未决问题初始化为空切片
+			LocalVars:    make(map[string]any),          // 私有变量初始化为空 map
+			UpdatedAt:    time.Now(),                    // 记录初始化时间
 		}
 	}
 
@@ -189,9 +189,9 @@ func (m *SnapshotManager) SaveFromState(ctx context.Context, agentID, topicID st
 		ep := episodes[i]
 		// 将 Episode 摘要打包为可引用的 SummaryBlock。
 		summaries = append(summaries, types.SummaryBlock{
-			StepID:    ep.StepID,              // 关联原始步骤 ID
-			Content:   ep.ObservationSummary,  // 使用观察摘要作为快照内容
-			Timestamp: ep.Timestamp,           // 保留原始时间戳
+			StepID:    ep.StepID,             // 关联原始步骤 ID
+			Content:   ep.ObservationSummary, // 使用观察摘要作为快照内容
+			Timestamp: ep.Timestamp,          // 保留原始时间戳
 		})
 	}
 
@@ -201,23 +201,23 @@ func (m *SnapshotManager) SaveFromState(ctx context.Context, agentID, topicID st
 		// 阈值 0.7 表示高重要性；Reflection 为空表示未做收尾反思。
 		if ep.Importance > 0.7 && ep.Reflection == "" {
 			openIssues = append(openIssues, types.Issue{
-				ID:          ep.StepID,              // 问题 ID 复用 StepID
-				Description: ep.ObservationSummary,  // 问题描述使用观察摘要
-				CreatedAt:   ep.Timestamp,           // 记录问题发现时间
+				ID:          ep.StepID,             // 问题 ID 复用 StepID
+				Description: ep.ObservationSummary, // 问题描述使用观察摘要
+				CreatedAt:   ep.Timestamp,          // 记录问题发现时间
 			})
 		}
 	}
 
 	// 组装最终快照对象。
 	snapshot := &types.AgentSnapshot{
-		AgentID:      agentID,                    // 归属 Agent
-		TopicID:      topicID,                    // 归属话题
-		LastStepID:   "",                         // 占位，后续按 episodes 末尾填充
-		KeySummaries: summaries,                  // 关键摘要块
-		OpenIssues:   openIssues,                 // 未决问题
-		LocalVars:    make(map[string]any),       // 私有变量初始化为空 map
-		PublishedVer: output.Version,             // 记录已发布版本号
-		UpdatedAt:    time.Now(),                 // 记录快照生成时间
+		AgentID:      agentID,              // 归属 Agent
+		TopicID:      topicID,              // 归属话题
+		LastStepID:   "",                   // 占位，后续按 episodes 末尾填充
+		KeySummaries: summaries,            // 关键摘要块
+		OpenIssues:   openIssues,           // 未决问题
+		LocalVars:    make(map[string]any), // 私有变量初始化为空 map
+		PublishedVer: output.Version,       // 记录已发布版本号
+		UpdatedAt:    time.Now(),           // 记录快照生成时间
 	}
 
 	// 若存在 Episode，将最后一步 StepID 写入 LastStepID，便于增量更新。

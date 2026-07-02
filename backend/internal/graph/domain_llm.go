@@ -3,10 +3,9 @@ package graph
 import (
 	"context"
 	"fmt"
-	"time"
 	"github.com/blockmemory/agent/backend/internal/model"
+	"time"
 )
-
 
 // callLLM 统一LLM调用入口（带自适应超时 + Prompt/Token 日志）。
 // caller 固定为 "DomainAgent/任务拆解"。

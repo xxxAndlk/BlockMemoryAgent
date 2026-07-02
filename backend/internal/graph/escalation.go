@@ -67,7 +67,7 @@ func (n *EscalationHandlerNode) Invoke(ctx context.Context, state *types.ThreeLa
 			Type:        enums.EventEscalation,
 			SourceAgent: state.CurrentDomain, // 记录升级来源
 			Payload:     map[string]any{"arbitration": arbitration},
-			Priority:    10, // 升级事件高优先级
+			Priority:    10,              // 升级事件高优先级
 			Status:      enums.EventDone, // 审计记录直接置完成，避免触发循环
 		})
 	}

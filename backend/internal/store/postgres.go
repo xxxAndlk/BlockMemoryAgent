@@ -2,17 +2,17 @@ package store
 
 import (
 	"context"       // 上下文,贯穿所有数据库调用以支持超时与取消
-	"database/sql"   // 标准库 SQL 抽象层,底层驱动为 postgres
-	"encoding/json"  // 结构体与 JSONB/JSON 列之间的序列化
-	"fmt"            // 格式化错误信息与 pgvector 字符串
-	"strconv"        // 解析 vector(768) 维度数字（ValidateEmbeddingDimension）
-	"strings"        // 拼接 pgvector 的逗号分隔向量分量
-	"time"           // 时间戳与连接池生命周期管理
+	"database/sql"  // 标准库 SQL 抽象层,底层驱动为 postgres
+	"encoding/json" // 结构体与 JSONB/JSON 列之间的序列化
+	"fmt"           // 格式化错误信息与 pgvector 字符串
+	"strconv"       // 解析 vector(768) 维度数字（ValidateEmbeddingDimension）
+	"strings"       // 拼接 pgvector 的逗号分隔向量分量
+	"time"          // 时间戳与连接池生命周期管理
 
 	"github.com/blockmemory/agent/backend/internal/embed" // 伪嵌入生成
-	"github.com/blockmemory/agent/backend/pkg/enums" // 枚举常量
-	"github.com/blockmemory/agent/backend/pkg/types" // 领域模型 (Episode / Snapshot / KnowledgeRecord 等)
-	"github.com/lib/pq"                            // postgres 驱动与错误码
+	"github.com/blockmemory/agent/backend/pkg/enums"      // 枚举常量
+	"github.com/blockmemory/agent/backend/pkg/types"      // 领域模型 (Episode / Snapshot / KnowledgeRecord 等)
+	"github.com/lib/pq"                                   // postgres 驱动与错误码
 )
 
 // PostgresStore 是 PostgreSQL 存储层。
@@ -50,9 +50,9 @@ func NewPostgresStore(dsn string) (*PostgresStore, error) {
 	return &PostgresStore{db: db, dim: 768}, nil // 默认 768 维，可通过 SetEmbeddingDim 覆盖
 }
 
-// SetEmbeddingDim 设置向量维度（H6 修复：原 domain_archive 硬编码 768，
+// SetEmbeddingDim 设置向量维度（H6 修复：原块记忆硬编码 768，
 // 不随 config.PgVector.Dimensions 走，导致维度不匹配时 pgvector 查询报错）。
-// 必须在 SaveDomainArchive / SearchDomainArchive 之前调用，且需与 schema 中 VECTOR(N) 一致。
+// 必须在 SaveKnowledge / SearchKnowledge 之前调用，且需与 schema 中 VECTOR(N) 一致。
 func (s *PostgresStore) SetEmbeddingDim(dim int) {
 	if dim > 0 {
 		s.dim = dim
@@ -629,6 +629,7 @@ type SessionHistoryRecord struct {
 	ToolResults []map[string]any `json:"tool_results"` // 工具调用结果数组
 	CreatedAt   time.Time        `json:"created_at"`   // 创建时间
 }
+
 // SessionEventRecord 会话事件归档记录。
 type SessionEventRecord struct {
 	SessionID    string    `json:"session_id"`
@@ -1014,7 +1015,6 @@ func parseVectorDim(typeStr string) int {
 	}
 	return n
 }
-
 
 // scanKnowledgeRows 扫描知识库查询结果集,统一处理 NULL 字段与 JSONB 反序列化。
 // 参数:

@@ -32,22 +32,22 @@ const (
 
 // Task DAG 节点。
 type Task struct {
-	ID         string     `json:"id"`          // 任务 ID（DAG 内唯一）
-	Goal       string     `json:"goal"`        // 任务目标，作为 session.goal
-	DependsOn  []string   `json:"depends_on"`  // 前置任务 ID 列表
-	Status     TaskStatus `json:"status"`      // 当前状态
-	SessionID  string     `json:"session_id"`  // 关联 session ID
+	ID         string     `json:"id"`         // 任务 ID（DAG 内唯一）
+	Goal       string     `json:"goal"`       // 任务目标，作为 session.goal
+	DependsOn  []string   `json:"depends_on"` // 前置任务 ID 列表
+	Status     TaskStatus `json:"status"`     // 当前状态
+	SessionID  string     `json:"session_id"` // 关联 session ID
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 }
 
 // DAG 有向无环图：一组带依赖关系的任务 + 可选 cron 调度。
 type DAG struct {
-	ID        string    `json:"id"`         // DAG 唯一 ID
-	Name      string    `json:"name"`       // 人类可读名称
-	Cron      string    `json:"cron"`       // 调度表达式（"<N>s" / "" 表示手动触发）
-	Tasks     []*Task   `json:"tasks"`      // 任务节点列表
-	Enabled   bool      `json:"enabled"`    // 是否启用调度
+	ID        string    `json:"id"`      // DAG 唯一 ID
+	Name      string    `json:"name"`    // 人类可读名称
+	Cron      string    `json:"cron"`    // 调度表达式（"<N>s" / "" 表示手动触发）
+	Tasks     []*Task   `json:"tasks"`   // 任务节点列表
+	Enabled   bool      `json:"enabled"` // 是否启用调度
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

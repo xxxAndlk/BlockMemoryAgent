@@ -5,7 +5,6 @@ import (
 	"unicode/utf8"
 )
 
-
 // shouldDirectExecute 判断是否为"查询/搜索/分析"类简单任务，
 // 这类任务应跳过 DomainAgent 子任务拆解，直接把 goal 作为单个子任务交给
 // 一个 Assistant 用 HTTPGet / Web 搜索类工具完成，而非写脚本。
@@ -181,6 +180,7 @@ func isASCII(s string) bool {
 	}
 	return true
 }
+
 // humanClarifyEnabled 返回是否启用人机对话（特性5）。
 // 默认 true；可被 AgentCfg.HumanClarifyEnabled 关闭。
 func (n *MetaAgentNode) humanClarifyEnabled() bool {

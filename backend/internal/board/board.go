@@ -28,27 +28,27 @@ const (
 
 // SubTask 看板上的一个子任务
 type SubTask struct {
-	ID         string     `json:"id"`                   // 子任务唯一 ID，格式 <topicID>_t<n>
-	Title      string     `json:"title"`                // 子任务标题（由 MetaAgent 推断）
-	Assignee   string     `json:"assignee,omitempty"`   // 责任 Agent 实例 ID（domainAgent / assistant）
-	Status     TaskStatus `json:"status"`               // 当前状态
-	Result     string     `json:"result,omitempty"`     // 完成结果或失败/阻塞原因
-	DependsOn  []string   `json:"depends_on,omitempty"` // 依赖的其他子任务 ID 列表
-	CreatedAt  time.Time  `json:"created_at"`           // 创建时间
-	UpdatedAt  time.Time  `json:"updated_at"`           // 最近变更时间
+	ID        string     `json:"id"`                   // 子任务唯一 ID，格式 <topicID>_t<n>
+	Title     string     `json:"title"`                // 子任务标题（由 MetaAgent 推断）
+	Assignee  string     `json:"assignee,omitempty"`   // 责任 Agent 实例 ID（domainAgent / assistant）
+	Status    TaskStatus `json:"status"`               // 当前状态
+	Result    string     `json:"result,omitempty"`     // 完成结果或失败/阻塞原因
+	DependsOn []string   `json:"depends_on,omitempty"` // 依赖的其他子任务 ID 列表
+	CreatedAt time.Time  `json:"created_at"`           // 创建时间
+	UpdatedAt time.Time  `json:"updated_at"`           // 最近变更时间
 }
 
 // TaskBoard 任务看板：单个 topic 的全局状态容器
 type TaskBoard struct {
 	mu sync.RWMutex // 读写锁：读多写少场景下允许并发 Snapshot
 
-	TopicID     string             // 话题 ID（=会话 ID）
-	Goal        string             // 全局目标
-	Status      string             // NEW / IN_PROGRESS / DONE / FAILED
-	Constraints map[string]string  // 全局约束（如"兼容旧版 API"）
+	TopicID     string              // 话题 ID（=会话 ID）
+	Goal        string              // 全局目标
+	Status      string              // NEW / IN_PROGRESS / DONE / FAILED
+	Constraints map[string]string   // 全局约束（如"兼容旧版 API"）
 	Tasks       map[string]*SubTask // 子任务表，按 ID 索引
-	Order       []string           // 子任务展示顺序（创建序）
-	UpdatedAt   time.Time          // 看板最近变更时间
+	Order       []string            // 子任务展示顺序（创建序）
+	UpdatedAt   time.Time           // 看板最近变更时间
 }
 
 // NewTaskBoard 新建空看板

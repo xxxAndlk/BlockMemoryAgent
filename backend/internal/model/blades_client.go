@@ -9,9 +9,9 @@ import (
 	"fmt"     // 错误格式化
 	"math"    // 浮点比较，判断温度是否变化
 
+	"github.com/blockmemory/agent/backend/pkg/types" // AgentModelConfig 等共享类型
 	"github.com/go-kratos/blades"                    // 上游 ModelProvider 抽象
 	"github.com/go-kratos/blades/contrib/openai"     // OpenAI 兼容 provider 实现
-	"github.com/blockmemory/agent/backend/pkg/types" // AgentModelConfig 等共享类型
 )
 
 // BladesClient 包装 blades.ModelProvider，实现 LLMClient 接口。

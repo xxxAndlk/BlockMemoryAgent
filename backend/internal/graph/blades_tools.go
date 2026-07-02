@@ -15,8 +15,8 @@ import (
 // 职责：在多次工具调用间累计每个工具的连续失败次数，达到阈值后触发循环退出。
 // 并发安全：内部用 sync.Mutex 保护 counts map，可被多个 blades.Tool 回调并发调用。
 type failureCounter struct {
-	mu     sync.Mutex      // 保护 counts 的互斥锁
-	counts map[string]int  // 工具名 → 连续失败次数
+	mu     sync.Mutex     // 保护 counts 的互斥锁
+	counts map[string]int // 工具名 → 连续失败次数
 }
 
 // newFailureCounter 创建一个空的失败计数器。
@@ -71,8 +71,8 @@ type (
 		Timeout float64 `json:"timeout,omitempty"` // 可选超时（秒），上限 60s
 	}
 	searchInFilesInput struct {
-		Pattern string `json:"pattern"`           // 搜索关键字（大小写不敏感）
-		Dir     string `json:"dir,omitempty"`     // 搜索目录，空则取工作目录
+		Pattern string `json:"pattern"`       // 搜索关键字（大小写不敏感）
+		Dir     string `json:"dir,omitempty"` // 搜索目录，空则取工作目录
 	}
 	httpGetInput struct {
 		URL     string            `json:"url"`               // 请求 URL
@@ -94,13 +94,13 @@ type (
 //   ToolExecutor，同时推送 ProgressEvent 并维护连续失败计数。
 // 并发安全：results 切片通过 mu 保护；failures 内部自带锁；其余字段只读。
 type toolRunner struct {
-	executor *ToolExecutor        // 沙箱执行器，真正干活的人
-	progress ProgressCallback     // 进度回调，可空
-	session  string               // 当前会话 ID，用于事件归属
-	agent    string               // 当前 agent 名，用于事件归属
-	failures *failureCounter      // 连续失败计数器
-	results  *[]*ToolResult       // 指向外部 slice，收集所有工具结果
-	mu       sync.Mutex           // 保护 results 切片的并发追加
+	executor *ToolExecutor    // 沙箱执行器，真正干活的人
+	progress ProgressCallback // 进度回调，可空
+	session  string           // 当前会话 ID，用于事件归属
+	agent    string           // 当前 agent 名，用于事件归属
+	failures *failureCounter  // 连续失败计数器
+	results  *[]*ToolResult   // 指向外部 slice，收集所有工具结果
+	mu       sync.Mutex       // 保护 results 切片的并发追加
 }
 
 // emit 推送一条进度事件（含 detail 字段）。

@@ -42,7 +42,7 @@ type MetaStore interface {
 // 负责跨域共享知识的语义检索与按类型检索，
 // 并在检索命中时更新访问计数以支撑时间衰减与热度排序。
 type GlobalKnowledgeRetriever struct {
-	vectorDB VectorDB // 向量数据库，用于语义召回
+	vectorDB VectorDB  // 向量数据库，用于语义召回
 	metaDB   MetaStore // 元数据存储，用于按类型查询与访问计数
 	embedder Embedder  // 文本向量化器，将查询转为向量
 }
@@ -53,6 +53,7 @@ type GlobalKnowledgeRetriever struct {
 //   - vectorDB: 向量数据库实现，提供 Top-K 语义召回。
 //   - metaDB: 元数据存储实现，提供按类型查询与访问计数自增。
 //   - embedder: 文本嵌入实现，将查询字符串转为向量。
+//
 // 返回：组装完成的 *GlobalKnowledgeRetriever 指针。
 // 副作用：无；依赖的具体实现若未就绪需由调用方保证可用性。
 func NewGlobalKnowledgeRetriever(vectorDB VectorDB, metaDB MetaStore, embedder Embedder) *GlobalKnowledgeRetriever {
@@ -70,6 +71,7 @@ func NewGlobalKnowledgeRetriever(vectorDB VectorDB, metaDB MetaStore, embedder E
 //   - ctx: 上下文，用于控制超时与取消。
 //   - query: 自然语言查询字符串。
 //   - topK: 期望召回的条数；若 <=0 则使用默认值 5。
+//
 // 返回：命中的知识记录切片，或在向量化/检索失败时返回 error。
 // 副作用：对每条命中记录调用 IncrementAccessCount 更新访问计数，
 //
@@ -114,6 +116,7 @@ func (r *GlobalKnowledgeRetriever) Retrieve(ctx context.Context, query string, t
 //   - ctx: 上下文，用于控制超时与取消。
 //   - knowledgeType: 知识类型标识，由上层业务定义。
 //   - limit: 最大返回条数。
+//
 // 返回：该类型下的知识记录切片，或底层存储错误。
 // 副作用：无（不更新访问计数）。
 func (r *GlobalKnowledgeRetriever) RetrieveByType(ctx context.Context, knowledgeType string, limit int) ([]*types.KnowledgeRecord, error) {

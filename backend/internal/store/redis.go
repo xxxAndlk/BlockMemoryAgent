@@ -1,7 +1,7 @@
 package store
 
 import (
-	"context"      // 上下文,贯穿所有 Redis 调用以支持超时与取消
+	"context"       // 上下文,贯穿所有 Redis 调用以支持超时与取消
 	"encoding/json" // 结构体与 Redis 字符串值之间的序列化
 	"fmt"           // 格式化错误与 key 拼接
 	"sync"          // 保护 eventCursors map 的并发访问

@@ -34,11 +34,11 @@ type GlobalRetriever interface {
 // 段划分：System（角色+约束）/ TopicGlobal（话题目标）/ SharedState（上游输出+全局知识）/
 // PrivateMemory（私有记忆+快照）。各段受 TokenBudget 限制。
 type ContextAssembler struct {
-	workspace WorkspaceReader     // 工作区读取句柄，提供共享状态
-	globalKB  GlobalRetriever     // 全局知识检索句柄
-	store     PrivateStore        // 私有记忆存储句柄，提供 Episode 读取
-	budget    *types.TokenBudget  // 4 段 Token 预算配置
-	scorer    *SearchScorer       // 多信号评分器（可选），nil 时退回重要性排序
+	workspace WorkspaceReader    // 工作区读取句柄，提供共享状态
+	globalKB  GlobalRetriever    // 全局知识检索句柄
+	store     PrivateStore       // 私有记忆存储句柄，提供 Episode 读取
+	budget    *types.TokenBudget // 4 段 Token 预算配置
+	scorer    *SearchScorer      // 多信号评分器（可选），nil 时退回重要性排序
 }
 
 // NewContextAssembler 创建上下文构建器并初始化默认 Token 预算。

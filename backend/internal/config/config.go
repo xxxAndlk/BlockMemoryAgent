@@ -45,15 +45,15 @@ type AgentConfig struct {
 	// 人机对话（特性5）
 	HumanClarifyEnabled    bool `yaml:"human_clarify_enabled"`     // 是否启用人机对话
 	HumanClarifyTimeoutSec int  `yaml:"human_clarify_timeout_sec"` // 等待用户回答超时（秒）
-	// domainAgent 持久化（特性4）
-	DomainArchiveTTLHours  int `yaml:"domain_archive_ttl_hours"`  // domainAgent 归档默认存活时长（小时）
-	StallSteps             int `yaml:"stall_steps"`               //  Graph 死循环防护 无进展步数阈值：连续 N 步未产生新 Episode / 工具结果 / state 变化 → 判死循环
-	MaxRepeatFingerprint   int `yaml:"max_repeat_fingerprint"`    // 状态指纹重复阈值：同一 state 指纹连续出现 N 次 → 判死循环
-	SessionTimeoutMin      int `yaml:"session_timeout_min"`       // 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
-	MaxSteps               int `yaml:"max_steps"`                 //  Graph 绝对步数上限（安全网，超出即使无死循环也终止），0 表示不限制
-	DomainArchiveMaxWeight int `yaml:"domain_archive_max_weight"` // domainAgent 归档权重上限
+	// DAG 定时任务（特性1）
+	DAGEnabled bool `yaml:"dag_enabled"` // 是否启动 DAG 调度器
+	// Graph 死循环防护
+	StallSteps           int `yaml:"stall_steps"`            //  Graph 死循环防护 无进展步数阈值：连续 N 步未产生新 Episode / 工具结果 / state 变化 → 判死循环
+	MaxRepeatFingerprint int `yaml:"max_repeat_fingerprint"` // 状态指纹重复阈值：同一 state 指纹连续出现 N 次 → 判死循环
+	SessionTimeoutMin    int `yaml:"session_timeout_min"`    // 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
+	MaxSteps             int `yaml:"max_steps"`              //  Graph 绝对步数上限（安全网，超出即使无死循环也终止），0 表示不限制
 	// Plan-and-Execute + Self-Reflection（TODO #1）
-	PlanEnabled     bool `yaml:"plan_enabled"`      // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
+	PlanEnabled       bool `yaml:"plan_enabled"`       // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
 	ReflectionEnabled bool `yaml:"reflection_enabled"` // 是否在助手执行后做 Self-Reflection（不达标重试一次）
 }
 
@@ -245,12 +245,6 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.Agent.HumanClarifyTimeoutSec == 0 {
 		c.Agent.HumanClarifyTimeoutSec = 120
-	}
-	if c.Agent.DomainArchiveTTLHours == 0 {
-		c.Agent.DomainArchiveTTLHours = 168 // 7 天
-	}
-	if c.Agent.DomainArchiveMaxWeight == 0 {
-		c.Agent.DomainArchiveMaxWeight = 100
 	}
 
 	// —— 日志默认值：默认目录 ./logs ——

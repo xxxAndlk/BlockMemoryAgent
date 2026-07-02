@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -22,21 +23,21 @@ import (
 // 并发安全：节点字段在构造后只读；实例状态由 registry 内部锁保护。
 // dispatchAssistantsParallel 路径（当前未启用）用 sync.Mutex 保护结果 map。
 type DomainAgentNode struct {
-	name         string                // 节点名（固定 "DomainAgent"）
-	instID       string                // 本实例ID
-	registry     *RoleRegistry         // 角色注册表
-	factory      *RoleFactory          // 动态角色工厂（创建 Assistant/SubDomain）
-	modelFactory *model.ModelFactory   // 模型工厂，按角色获取 ChatModel
-	toolCallback ToolCallback          // 工具执行结果回调（推 UI）
-	llmTracker   *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token）
-	rt           *runtime.Runtime      // Runtime 聚合体（板/邮箱/Skill/人格/Watchdog）
-	progress     ProgressCallback      // 进度回调（推思考/意图/Token）
-	blockMemory  BlockMemoryStore      // 块记忆存储（特性3：向量检索归档）
-	archiveStore DomainArchiveStore    // domainAgent 归档存储（特性4：跨会话复用）
-	recalledMemory string              // 本次 Invoke 检索到的相似块记忆文本（注入 analyzeTasks）
-	memCallback  MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
-	snapshotMgr  AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
-	snapshot     *types.AgentSnapshot  // 本次 Invoke 加载到的快照
+	name           string                // 节点名（固定 "DomainAgent"）
+	instID         string                // 本实例ID
+	registry       *RoleRegistry         // 角色注册表
+	factory        *RoleFactory          // 动态角色工厂（创建 Assistant/SubDomain）
+	modelFactory   *model.ModelFactory   // 模型工厂，按角色获取 ChatModel
+	toolCallback   ToolCallback          // 工具执行结果回调（推 UI）
+	llmTracker     *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token）
+	rt             *runtime.Runtime      // Runtime 聚合体（板/邮箱/Skill/人格/Watchdog）
+	progress       ProgressCallback      // 进度回调（推思考/意图/Token）
+	blockMemory    BlockMemoryStore      // 块记忆存储（特性3：向量检索归档）
+	recalledMemory string                // 本次 Invoke 检索到的相似块记忆文本（注入 analyzeTasks）
+	memCallback    MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
+	snapshotMgr    AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
+	snapshot       *types.AgentSnapshot  // 本次 Invoke 加载到的快照
+	logger         *logger.Logger        // 结构化日志器（P1-2）
 }
 
 // NewDomainAgentNode 创建领域Agent节点。
@@ -49,11 +50,11 @@ type DomainAgentNode struct {
 // 返回：装配好的节点；modelFactory/toolCallback/runtime/progress 通过 Set* 后置注入。
 func NewDomainAgentNode(instID string, registry *RoleRegistry, factory *RoleFactory) *DomainAgentNode {
 	return &DomainAgentNode{
-		name:       "DomainAgent",                 // 节点名固定
-		instID:     instID,                         // 绑定实例
-		registry:   registry,                       // 注入注册表
-		factory:    factory,                        // 注入工厂
-		llmTracker: model.NewLLMCallTracker(),      // 新建 LLM 调用追踪器
+		name:       "DomainAgent",             // 节点名固定
+		instID:     instID,                    // 绑定实例
+		registry:   registry,                  // 注入注册表
+		factory:    factory,                   // 注入工厂
+		llmTracker: model.NewLLMCallTracker(), // 新建 LLM 调用追踪器
 	}
 }
 
@@ -87,12 +88,6 @@ func (n *DomainAgentNode) SetBlockMemoryStore(s BlockMemoryStore) {
 	n.blockMemory = s
 }
 
-// SetArchiveStore 注入 domainAgent 归档存储（特性4）。
-// nil 时不做跨会话归档与复用。
-func (n *DomainAgentNode) SetArchiveStore(s DomainArchiveStore) {
-	n.archiveStore = s
-}
-
 // SetMemoryCallbackHandler 注入记忆回调处理器。
 // nil 时不触发 Episode 写入与快照保存。
 func (n *DomainAgentNode) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
@@ -103,6 +98,40 @@ func (n *DomainAgentNode) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
 // nil 时不加载/保存快照。
 func (n *DomainAgentNode) SetAgentSnapshotManager(s AgentSnapshotManager) {
 	n.snapshotMgr = s
+}
+
+// SetLogger 注入结构化日志器（P1-2）。
+// 注入后自动配置 LLM 调用追踪器的持久化回调，将每次 LLM 调用写入 session_logs。
+func (n *DomainAgentNode) SetLogger(l *logger.Logger) {
+	n.logger = l
+	if l != nil {
+		n.llmTracker.SetRecordCallback(func(ctx context.Context, r model.CallRecord) {
+			sessionID := SessionIDFromContext(ctx)
+			if sessionID == "" {
+				return
+			}
+			level := "info"
+			msg := "llm_call"
+			if r.Err != nil {
+				level = "error"
+				msg = "llm_call_error: " + r.Err.Error()
+			}
+			agent := "DomainAgent"
+			if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
+				agent = "DomainAgent[" + inst.Domain + "]"
+			}
+			l.WithSession(sessionID).WithAgent(agent).WithPhase("llm_call").
+				Event(ctx, "llm_call", msg, map[string]any{
+					"input_tokens":  r.InputTokens,
+					"output_tokens": r.OutputTokens,
+					"latency_ms":    int(r.Duration.Milliseconds()),
+					"timed_out":     r.TimedOut,
+					"prompt":        r.Prompt,
+					"response":      r.Response,
+					"level":         level,
+				})
+		})
+	}
 }
 
 // emit 推送进度事件。
@@ -143,10 +172,34 @@ func (n *DomainAgentNode) emitDetail(ctx context.Context, kind, message, detail 
 	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: agent, Message: message, Detail: detail})
 }
 
+// sessionLogger 返回按 session_id 绑定的 Logger；未注入时返回 nil-safe 的退化 logger。
+func (n *DomainAgentNode) sessionLogger(ctx context.Context) *logger.Logger {
+	if n.logger == nil {
+		return logger.New(nil)
+	}
+	sessionID := SessionIDFromContext(ctx)
+	agent := "DomainAgent"
+	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
+		agent = "DomainAgent[" + inst.Domain + "]"
+	}
+	if sessionID == "" {
+		return n.logger.WithAgent(agent)
+	}
+	return n.logger.WithSession(sessionID).WithAgent(agent)
+}
+
 // Name 返回节点名称。
 // 实现 ThreeLayerNode 接口。
 func (n *DomainAgentNode) Name() string {
 	return n.name
+}
+
+// truncateString 截断字符串并加省略号。
+func truncateString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // InstanceID 返回实例ID。
@@ -222,6 +275,24 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		if recalled, err := n.blockMemory.SearchBlockMemory(ctx, state.CurrentDomain, state.DomainGoal, 3); err == nil && recalled != "" {
 			n.recalledMemory = recalled
 			n.emit(ctx, "think", "已检索到历史相似块记忆，将作为上下文注入任务拆解")
+			if log := n.sessionLogger(ctx); log != nil {
+				log.Event(ctx, "memory_recall", fmt.Sprintf("block_memory query=%s hits=1", state.DomainGoal), map[string]any{
+					"query":  state.DomainGoal,
+					"hits":   1,
+					"domain": state.CurrentDomain,
+				})
+				log.Event(ctx, "memory_inject", "注入历史块记忆到任务拆解", map[string]any{
+					"context": truncateString(recalled, 500),
+				})
+			}
+		} else if err == nil {
+			if log := n.sessionLogger(ctx); log != nil {
+				log.Event(ctx, "memory_recall", fmt.Sprintf("block_memory query=%s hits=0", state.DomainGoal), map[string]any{
+					"query":  state.DomainGoal,
+					"hits":   0,
+					"domain": state.CurrentDomain,
+				})
+			}
 		}
 	}
 
@@ -275,10 +346,10 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	// 8. 无待处理任务：汇总结果、标记完成、继续图循环
 	if len(pendingTasks) == 0 {
 		n.emit(ctx, "think", "所有子任务已完成，汇总结果")
-		n.summarizeResults(state)                                            // 汇总写入 state.Reason
-		n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone)      // 标记实例完成
-		block.Status = enums.BlockStatusCompleted                            // 标记块完成
-		state.NextAction = enums.ActionContinue                               // 交回 MetaAgent
+		n.summarizeResults(state)                                       // 汇总写入 state.Reason
+		n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone) // 标记实例完成
+		block.Status = enums.BlockStatusCompleted                       // 标记块完成
+		state.NextAction = enums.ActionContinue                         // 交回 MetaAgent
 		n.finish(ctx, state)
 		return state, nil
 	}
@@ -298,10 +369,16 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	}
 
 	// 11. 汇总结果、标记完成、继续图循环（交回 MetaAgent 决策下一步）
-	n.summarizeResults(state)                                            // 汇总写入 state.Reason
-	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone)      // 标记实例完成
-	block.Status = enums.BlockStatusCompleted                            // 标记块完成
-	state.NextAction = enums.ActionContinue                               // 交回 MetaAgent
+	n.summarizeResults(state) // 汇总写入 state.Reason
+	if log := n.sessionLogger(ctx); log != nil {
+		log.Event(ctx, "result", fmt.Sprintf("domain=%s summary=%s", state.CurrentDomain, truncateString(state.Reason, 200)), map[string]any{
+			"domain":  state.CurrentDomain,
+			"summary": state.Reason,
+		})
+	}
+	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone) // 标记实例完成
+	block.Status = enums.BlockStatusCompleted                       // 标记块完成
+	state.NextAction = enums.ActionContinue                         // 交回 MetaAgent
 	n.finish(ctx, state)
 	return state, nil
 }

@@ -191,6 +191,62 @@ export function getSessionMetrics(id: string): Promise<SessionMetrics> {
   return fetchJson(`/sessions/${id}/metrics`)
 }
 
+export interface SessionLog {
+  id: number
+  session_id: string
+  agent: string
+  level: string
+  phase: string
+  message: string
+  prompt?: string
+  response?: string
+  input_tokens: number
+  output_tokens: number
+  model: string
+  latency_ms: number
+  created_at: string
+  meta?: Record<string, any>
+}
+
+export interface SessionLogsResponse {
+  session_id: string
+  logs: SessionLog[]
+  count: number
+}
+
+export function getSessionLogs(
+  id: string,
+  params?: { agent?: string; level?: string; limit?: number; offset?: number }
+): Promise<SessionLogsResponse> {
+  const qs = new URLSearchParams()
+  if (params?.agent) qs.set('agent', params.agent)
+  if (params?.level) qs.set('level', params.level)
+  if (params?.limit !== undefined) qs.set('limit', String(params.limit))
+  if (params?.offset !== undefined) qs.set('offset', String(params.offset))
+  const q = qs.toString() ? `?${qs.toString()}` : ''
+  return fetchJson(`/sessions/${id}/logs${q}`)
+}
+
+export interface AgentModelTokenStats {
+  agent: string
+  model: string
+  input_tokens: number
+  output_tokens: number
+  calls: number
+}
+
+export interface SessionTokenMetricsResponse {
+  session_id: string
+  total_input_tokens: number
+  total_output_tokens: number
+  total_calls: number
+  stats: AgentModelTokenStats[]
+}
+
+export function getSessionTokenMetrics(id: string): Promise<SessionTokenMetricsResponse> {
+  return fetchJson(`/sessions/${id}/token-metrics`)
+}
+
 export interface WatchdogDecision {
   agent_id: string
   tokens: number

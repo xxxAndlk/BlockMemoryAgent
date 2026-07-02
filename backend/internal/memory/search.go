@@ -136,7 +136,7 @@ func (s *SearchScorer) SearchAndScore(ctx context.Context, agentID, topicID, que
 
 // ScoredEpisode 带评分的 Episode：将 Episode 与其相关性评分捆绑，作为检索结果单元。
 type ScoredEpisode struct {
-	Episode *types.Episode     // 原始 Episode 指针
+	Episode *types.Episode        // 原始 Episode 指针
 	Score   *types.RelevanceScore // 该 Episode 的多信号相关性评分
 }
 
@@ -158,7 +158,7 @@ func calculateKeywordOverlap(summary, query string) float64 {
 
 	// 统计查询中命中摘要的字符数。
 	overlap := 0
-	queryRunes := []rune(query)   // 按 rune 处理中文等多字节字符
+	queryRunes := []rune(query) // 按 rune 处理中文等多字节字符
 	summaryRunes := []rune(summary)
 
 	// 双层循环：对每个查询字符检查是否出现在摘要中。

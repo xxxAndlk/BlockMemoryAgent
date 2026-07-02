@@ -1,19 +1,19 @@
 package graph
 
 import (
-	"bytes"      // bytes.Buffer 用于捕获命令 stdout/stderr
-	"context"    // 上下文与超时控制
+	"bytes"         // bytes.Buffer 用于捕获命令 stdout/stderr
+	"context"       // 上下文与超时控制
 	"encoding/json" // HTTPPost body 序列化
-	"fmt"        // 格式化输出与错误信息
-	"io"         // HTTP 响应体读取与 LimitReader
-	"net/http"   // HTTP 工具实现
-	"os"         // 文件读写与目录操作
-	"os/exec"    // 子进程执行
+	"fmt"           // 格式化输出与错误信息
+	"io"            // HTTP 响应体读取与 LimitReader
+	"net/http"      // HTTP 工具实现
+	"os"            // 文件读写与目录操作
+	"os/exec"       // 子进程执行
 	"path/filepath" // 路径解析、WalkDir、扩展名提取
-	"runtime"    // GOOS 判断，区分 Windows/Unix 命令
-	"slices"     // slices.Contains 判断扩展名白名单
-	"strings"    // 字符串切分、前缀处理、大小写转换
-	"time"       // 超时时长
+	"runtime"       // GOOS 判断，区分 Windows/Unix 命令
+	"slices"        // slices.Contains 判断扩展名白名单
+	"strings"       // 字符串切分、前缀处理、大小写转换
+	"time"          // 超时时长
 )
 
 // ToolResult 工具执行结果。
@@ -33,7 +33,7 @@ type ToolResult struct {
 	Output    string `json:"output"`
 	Error     string `json:"error,omitempty"`
 	Path      string `json:"path,omitempty"`
-	ArgsJSON  string `json:"args_json,omitempty"` // 入参 JSON 摘要（截断），用于日志展示
+	ArgsJSON  string `json:"args_json,omitempty"`  // 入参 JSON 摘要（截断），用于日志展示
 	SessionID string `json:"session_id,omitempty"` // 归属会话，避免跨会话事件泄漏
 }
 

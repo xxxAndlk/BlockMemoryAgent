@@ -18,6 +18,8 @@ import (
 type CallRecord struct {
 	Caller        string        `json:"caller"`          // 调用方标识（如 MetaAgent/DomainAgent 节点名）
 	PromptSummary string        `json:"prompt_summary"`  // 截断后的 prompt 摘要
+	Prompt        string        `json:"prompt"`          // 完整 prompt（用于 session_logs 持久化）
+	Response      string        `json:"response"`        // 完整 response（用于 session_logs 持久化）
 	InputTokens   int           `json:"input_tokens"`    // 估算的输入 token 数
 	OutputTokens  int           `json:"output_tokens"`   // 估算的输出 token 数
 	Duration      time.Duration `json:"duration"`        // 调用耗时
@@ -30,14 +32,15 @@ type CallRecord struct {
 // 设计意图：在自适应超时（TimeoutTracker）基础上，叠加 token 与 prompt 维度，
 // 用于成本观测与异常定位。
 type LLMCallTracker struct {
-	mu           sync.RWMutex  // 读写锁保护所有字段
-	callCount    int           // 累计调用次数
-	timeoutCount int           // 连续超时次数（成功时清零）
-	totalDur     time.Duration // 累计耗时，用于计算平均
-	maxDur       time.Duration // 历史最大耗时
-	lastDur      time.Duration // 最近一次耗时
-	slowMode     bool          // 连续超时后进入慢速模式，跳过 LLM
-	records      []CallRecord  // 每次调用的详细记录
+	mu             sync.RWMutex                      // 读写锁保护所有字段
+	callCount      int                               // 累计调用次数
+	timeoutCount   int                               // 连续超时次数（成功时清零）
+	totalDur       time.Duration                     // 累计耗时，用于计算平均
+	maxDur         time.Duration                     // 历史最大耗时
+	lastDur        time.Duration                     // 最近一次耗时
+	slowMode       bool                              // 连续超时后进入慢速模式，跳过 LLM
+	records        []CallRecord                      // 每次调用的详细记录
+	recordCallback func(context.Context, CallRecord) // 可选：每次记录后的回调（用于写入 session_logs）
 }
 
 // NewLLMCallTracker 创建调用追踪器。
@@ -49,6 +52,14 @@ func NewLLMCallTracker() *LLMCallTracker {
 	return &LLMCallTracker{
 		records: make([]CallRecord, 0), // 预分配空切片避免 nil
 	}
+}
+
+// SetRecordCallback 设置每次 LLM 调用记录后的回调。
+// 回调接收 context 与 CallRecord 副本，典型用途是写入 session_logs 表。
+func (t *LLMCallTracker) SetRecordCallback(cb func(context.Context, CallRecord)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.recordCallback = cb
 }
 
 // EstimateTokens 粗略估算文本的 token 数量。
@@ -207,8 +218,8 @@ func (t *LLMCallTracker) CallWithTimeout(
 		}
 	}
 
-	// 记录本次调用（含 token/摘要）
-	t.RecordCall(dur, err, caller, summary, inputTokens, outputTokens, timedOut)
+	// 记录本次调用（含 token/摘要/完整 prompt/response）
+	t.RecordCall(ctx, dur, err, caller, summary, prompt, resp, inputTokens, outputTokens, timedOut)
 	return resp, err, timedOut
 }
 
@@ -227,10 +238,13 @@ func (t *LLMCallTracker) CallWithTimeout(
 // 副作用：修改所有累计字段，追加 records。
 // 并发安全：通过 mu 写锁保护。
 func (t *LLMCallTracker) RecordCall(
+	ctx context.Context,
 	dur time.Duration,
 	err error,
 	caller string,
 	promptSummary string,
+	prompt string,
+	response string,
 	inputTokens int,
 	outputTokens int,
 	timedOut bool,
@@ -261,16 +275,25 @@ func (t *LLMCallTracker) RecordCall(
 	}
 
 	// 追加详细记录
-	t.records = append(t.records, CallRecord{
+	rec := CallRecord{
 		Caller:        caller,
 		PromptSummary: promptSummary,
+		Prompt:        prompt,
+		Response:      response,
 		InputTokens:   inputTokens,
 		OutputTokens:  outputTokens,
 		Duration:      dur,
 		Err:           err,
 		TimedOut:      timedOut,
 		Timestamp:     time.Now(),
-	})
+	}
+	t.records = append(t.records, rec)
+
+	// 触发持久化回调（若已设置），不阻塞、不处理错误
+	if t.recordCallback != nil {
+		cb := t.recordCallback
+		go cb(ctx, rec)
+	}
 }
 
 // ShouldSkipLLM 是否应该跳过 LLM 调用。

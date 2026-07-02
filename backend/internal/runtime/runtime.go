@@ -24,11 +24,11 @@ import (
 // 对象，在 main.go 一次性装配、经 ThreeLayerGraphBuilder.SetRuntime
 // 注入图，再向下游节点透明传播，避免散挂指针与漏注风险。
 type Runtime struct {
-	Boards   *board.Manager     // 多看板管理器：每会话一个 TaskBoard，记录目标/子任务/约束/进度
-	Mailbox  *mailbox.Mailbox   // Agent 间异步邮箱：事件投递与拉取，避免上下文交叉污染
-	Skills   *skill.Registry    // Skill 注册表：持有 Pool 并维护 Agent→SkillSet 装配映射
-	Soul     *soul.Loader       // 人格加载器：注入 soul.md 并提供热重载与温度策略
-	Watchdog *watchdog.Watchdog // 上下文看门狗：按软/硬阈值发出压缩或切换信号
+	Boards   *board.Manager      // 多看板管理器：每会话一个 TaskBoard，记录目标/子任务/约束/进度
+	Mailbox  *mailbox.Mailbox    // Agent 间异步邮箱：事件投递与拉取，避免上下文交叉污染
+	Skills   *skill.Registry     // Skill 注册表：持有 Pool 并维护 Agent→SkillSet 装配映射
+	Soul     *soul.Loader        // 人格加载器：注入 soul.md 并提供热重载与温度策略
+	Watchdog *watchdog.Watchdog  // 上下文看门狗：按软/硬阈值发出压缩或切换信号
 	AgentCfg *config.AgentConfig // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
 	CmdQueue *cmdqueue.Manager   // 用户指令队列（特性6：抢占中断 / 队列注入）
 }

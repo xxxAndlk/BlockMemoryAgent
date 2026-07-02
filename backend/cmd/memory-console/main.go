@@ -13,9 +13,9 @@ import (
 	"os"            // 标准错误与退出
 	"time"          // 时长与时间格式化
 
-	tea "github.com/charmbracelet/bubbletea"   // bubbletea 框架
-	"github.com/charmbracelet/lipgloss"        // 终端样式
 	"github.com/blockmemory/agent/backend/pkg/types" // 公共事件类型
+	tea "github.com/charmbracelet/bubbletea"         // bubbletea 框架
+	"github.com/charmbracelet/lipgloss"              // 终端样式
 )
 
 // 命令行参数: 后端地址、订阅 Topic、重连间隔
@@ -50,11 +50,11 @@ type Model struct {
 	width  int // 终端宽
 	height int // 终端高
 
-	agents     []types.AgentStatusPayload          // Agent 状态列表
-	graphSteps []types.GraphStepPayload            // 图步骤历史
-	events     []types.EventPayload                // 事件列表（最新在前）
-	episodes   map[string]*types.EpisodePayload    // Episode 详情，按 agent#step 索引
-	stats      types.StatsView                     // 全局统计
+	agents     []types.AgentStatusPayload       // Agent 状态列表
+	graphSteps []types.GraphStepPayload         // 图步骤历史
+	events     []types.EventPayload             // 事件列表（最新在前）
+	episodes   map[string]*types.EpisodePayload // Episode 详情，按 agent#step 索引
+	stats      types.StatsView                  // 全局统计
 
 	focusPanel  int  // 0: agents, 1: graph, 2: events, 3: stats
 	agentCursor int  // Agent 列表光标

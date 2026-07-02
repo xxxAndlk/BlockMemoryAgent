@@ -5,7 +5,6 @@ package graph
 
 import (
 	"context"
-	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -49,41 +48,21 @@ type AgentSnapshotManager interface {
 	SaveFromState(ctx context.Context, agentID, topicID string, output *types.AgentOutput, episodes []*types.Episode) error
 }
 
+// BlockMemoryFact 块记忆键值化事实（graph 包本地定义，避免反向依赖 memory 包产生循环导入）。
+type BlockMemoryFact struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	Scope string `json:"scope"` // global | domain | task
+}
+
 // BlockMemoryStore 块记忆存储接口（特性3）。
 // 抽象 domainAgent 执行后归档与按相似度检索的能力，避免 graph 反向依赖 store。
 // 实现方在 store 包（PostgresStore + pgvector）。
 type BlockMemoryStore interface {
-	// SaveBlockMemory 归档一条 domainAgent 完成的块记忆。
-	SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string) error
+	// SaveBlockMemory 归档一条 domainAgent 完成的块记忆，附带结构化 facts。
+	SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string, facts []BlockMemoryFact) error
 	// SearchBlockMemory 按 domain 过滤后检索 topK 条相似块记忆，返回可注入 prompt 的文本段。
 	SearchBlockMemory(ctx context.Context, domain, query string, topK int) (string, error)
-}
-
-// DomainArchiveRecord domainAgent 归档记录（特性4）。
-// 在 DomainAgent 完成后落库，跨会话可按领域相似度召回，复用其 Skill 子集与上下文摘要。
-type DomainArchiveRecord struct {
-	ArchiveID    string   // 归档唯一 ID（global_knowledge.id）
-	SessionID    string   // 创建会话 ID
-	Domain       string   // 领域名
-	Goal         string   // 领域目标
-	RoleDefID    string   // 角色定义 ID
-	Skills       []string // 已装配 Skill ID 列表
-	ContextSummary string // 上下文摘要（任务结果汇总）
-	Weight       int      // 复用权重，每次被命中 +1
-	ExpiresAt    time.Time // 过期时间（命中后延后）
-	CreatedAt    time.Time // 创建时间
-}
-
-// DomainArchiveStore domainAgent 归档存储接口（特性4）。
-type DomainArchiveStore interface {
-	// SaveDomainArchive 归档或更新一条 domainAgent 记录。
-	SaveDomainArchive(ctx context.Context, rec *DomainArchiveRecord) error
-	// SearchDomainArchive 按领域/目标检索 topK 条相似归档，按权重降序。
-	SearchDomainArchive(ctx context.Context, domain, goal string, topK int) ([]*DomainArchiveRecord, error)
-	// BumpDomainArchiveWeight 命中复用时权重 +1 且延后过期时间。
-	BumpDomainArchiveWeight(ctx context.Context, archiveID string, ttl time.Duration) error
-	// CleanupExpiredDomainArchives 删除已过期归档，返回删除条数。
-	CleanupExpiredDomainArchives(ctx context.Context) (int, error)
 }
 
 // getString 从 map 中获取字符串。
@@ -104,18 +83,18 @@ func getString(m map[string]any, key string) string {
 // BuildRequest 上下文构建请求。
 // 由节点向 memory 模块发起，请求组装一段上下文（消息列表 + Token 预算）。
 type BuildRequest struct {
-	AgentID    string                  // 请求方实例 ID
-	TopicID    string                  // 主题 ID（记忆检索锚点）
-	DependsOn  []string                // 依赖的其他 Agent 输出 ID
-	TaskQuery  string                  // 任务查询串（用于语义检索）
-	Snapshot   *types.AgentSnapshot    // 快照（可选，用于恢复上下文）
+	AgentID   string               // 请求方实例 ID
+	TopicID   string               // 主题 ID（记忆检索锚点）
+	DependsOn []string             // 依赖的其他 Agent 输出 ID
+	TaskQuery string               // 任务查询串（用于语义检索）
+	Snapshot  *types.AgentSnapshot // 快照（可选，用于恢复上下文）
 }
 
 // ContextPack 上下文包。
 // BuildRequest 的响应：组装好的消息列表 + Token 预算信息。
 type ContextPack struct {
-	Messages    []*Message          // 组装好的对话消息（System/User/Assistant）
-	TokenBudget *types.TokenBudget  // Token 预算（分四段：System/TopicGlobal/SharedState/PrivateMemory）
+	Messages    []*Message         // 组装好的对话消息（System/User/Assistant）
+	TokenBudget *types.TokenBudget // Token 预算（分四段：System/TopicGlobal/SharedState/PrivateMemory）
 }
 
 // Message 消息。

@@ -3,11 +3,10 @@ package graph
 import (
 	"context"
 	"fmt"
-	"strings"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
+	"strings"
 )
-
 
 // shouldSplitToSubDomains 判断是否需要拆分为子领域。
 //
@@ -147,7 +146,7 @@ func (n *DomainAgentNode) handleSubDomainSplit(ctx context.Context, state *types
 
 	// 取当前子领域名并推进游标
 	subDomainName := block.SubDomainList[block.SubDomainIndex] // 取当前子领域
-	block.SubDomainIndex++                                       // 推进游标
+	block.SubDomainIndex++                                     // 推进游标
 
 	// 创建 SubDomainAgent 实例
 	subInst, err := n.factory.CreateSubDomainAgent(ctx, state.SessionID, subDomainName, state.DomainGoal, n.instID)
@@ -161,9 +160,9 @@ func (n *DomainAgentNode) handleSubDomainSplit(ctx context.Context, state *types
 	// 构造调用请求：领域目标作为任务，附带领域/子领域/块ID等上下文
 	callReq := &types.CallRequest{
 		ID:       fmt.Sprintf("call_%s_%d", subInst.ID, len(state.CallStack)), // 唯一调用ID
-		CallerID: n.instID,                                                     // 调用者=本 Domain
-		CalleeID: subInst.ID,                                                   // 被调用者=子领域
-		Task:     state.DomainGoal,                                             // 任务=领域目标
+		CallerID: n.instID,                                                    // 调用者=本 Domain
+		CalleeID: subInst.ID,                                                  // 被调用者=子领域
+		Task:     state.DomainGoal,                                            // 任务=领域目标
 		Context: map[string]any{
 			"domain":          inst.Domain,          // 父领域名
 			"sub_domain":      subDomainName,        // 子领域名
@@ -175,9 +174,9 @@ func (n *DomainAgentNode) handleSubDomainSplit(ctx context.Context, state *types
 	}
 
 	// 入栈调用请求并切换到子领域节点
-	state.PushCallStack(callReq)            // 压入调用栈
-	state.NextAction = enums.ActionSwitch   // 切换到子领域节点
-	state.TargetRoleID = subInst.ID         // 路由目标
+	state.PushCallStack(callReq)          // 压入调用栈
+	state.NextAction = enums.ActionSwitch // 切换到子领域节点
+	state.TargetRoleID = subInst.ID       // 路由目标
 	return state, nil
 }
 
@@ -267,9 +266,9 @@ func (n *DomainAgentNode) inferSubDomainsByRules(domain string) []DomainInfo {
 	// 商城/页面类：拆为头部/列表/底部三个子领域
 	if strings.Contains(domain, "商城") || strings.Contains(domain, "页面") {
 		return []DomainInfo{
-			{Name: "首页头部", Goal: "修复头部导航样式问题"},   // 头部子领域
-			{Name: "商品列表", Goal: "修复商品列表布局问题"},   // 列表子领域
-			{Name: "底部导航", Goal: "修复底部导航样式问题"},   // 底部子领域
+			{Name: "首页头部", Goal: "修复头部导航样式问题"}, // 头部子领域
+			{Name: "商品列表", Goal: "修复商品列表布局问题"}, // 列表子领域
+			{Name: "底部导航", Goal: "修复底部导航样式问题"}, // 底部子领域
 		}
 	}
 	// 默认：单子领域

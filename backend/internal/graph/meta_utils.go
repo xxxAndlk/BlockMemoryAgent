@@ -3,13 +3,12 @@ package graph
 import (
 	"context"
 	"fmt"
+	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/types"
 	"strings"
 	"time"
 	"unicode/utf8"
-	"github.com/blockmemory/agent/backend/pkg/enums"
-	"github.com/blockmemory/agent/backend/pkg/types"
 )
-
 
 // loadHistorySection 读取最近 N 条会话历史，拼成可注入 prompt 的中文段落。
 //
@@ -58,6 +57,7 @@ func (n *MetaAgentNode) loadHistorySection(ctx context.Context) string {
 	b.WriteString("\n当用户提到指代词（在哪/刚才/上次/那个文件）时，请优先结合上述历史作答或检索。\n")
 	return b.String()
 }
+
 // truncateStr 把字符串截断到 n 个 rune 并加 "..." 后缀。
 // 用于摘要展示，避免过长的 LLM 输出污染 prompt。
 // 按 rune 截断而非字节，避免在 UTF-8 多字节字符（如中文，每字 3 字节）中间切断产生无效 UTF-8（H3）。
@@ -68,6 +68,7 @@ func truncateStr(s string, n int) string {
 	runes := []rune(s)
 	return string(runes[:n]) + "..."
 }
+
 // loadMessagesSection 从 state.Messages 构建对话历史段落，注入 prompt。
 //
 // 职责：把当前会话的对话消息拼成"对话历史"段落，每条消息截断 300 字。

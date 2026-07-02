@@ -6,6 +6,7 @@ import (
 	"fmt"           // 格式化输出
 	"log"           // 日志输出
 	"net/http"      // HTTP 处理器
+	"regexp"        // API Key 脱敏
 	"sort"          // 会话列表按时间排序
 	"strconv"       // 字符串与数字转换
 	"strings"       // 字符串处理
@@ -165,24 +166,24 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 			continue // 不要覆盖正在运行的会话
 		}
 		endedAt := rec.CreatedAt // 用创建时间作为结束时间（历史会话已结束）
-			restoredEvents := m.loadSessionEvents(ctx, rec.SessionID)
-			simMsgs := []types.ChatMessage{
-				{Role: enums.ChatRoleUser, Content: rec.Goal, Timestamp: rec.CreatedAt},
-				{Role: enums.ChatRoleAssistant, Content: rec.Summary, Timestamp: rec.CreatedAt},
-			}
-			if len(restoredEvents) > 0 {
-				simMsgs = extractMessagesFromEvents(restoredEvents, rec.Goal, rec.Summary)
-			}
-			m.sessions[rec.SessionID] = &Session{
-				ID:        rec.SessionID,
-				Goal:      rec.Goal,
-				Status:    enums.SessionStatusCompleted,
-				Result:    rec.Summary,
-				StartedAt: rec.CreatedAt,
-				EndedAt:   &endedAt,
-				Events:    restoredEvents,
-				Messages:  simMsgs,
-			}
+		restoredEvents := m.loadSessionEvents(ctx, rec.SessionID)
+		simMsgs := []types.ChatMessage{
+			{Role: enums.ChatRoleUser, Content: rec.Goal, Timestamp: rec.CreatedAt},
+			{Role: enums.ChatRoleAssistant, Content: rec.Summary, Timestamp: rec.CreatedAt},
+		}
+		if len(restoredEvents) > 0 {
+			simMsgs = extractMessagesFromEvents(restoredEvents, rec.Goal, rec.Summary)
+		}
+		m.sessions[rec.SessionID] = &Session{
+			ID:        rec.SessionID,
+			Goal:      rec.Goal,
+			Status:    enums.SessionStatusCompleted,
+			Result:    rec.Summary,
+			StartedAt: rec.CreatedAt,
+			EndedAt:   &endedAt,
+			Events:    restoredEvents,
+			Messages:  simMsgs,
+		}
 		// 让列表的 seq 不与未来创建冲突
 		restored++
 	}
@@ -383,8 +384,8 @@ func (m *SessionManager) CreateSession(ctx context.Context, goal string) *Sessio
 		StartedAt: time.Now(),
 		Events:    make([]SessionEvent, 0), // 空事件流
 		Messages: []types.ChatMessage{
-			{Role: enums.ChatRoleSystem, Content: "Goal: " + goal, Timestamp: time.Now()},         // 注入 system 消息
-			{Role: enums.ChatRoleUser, Content: goal, Timestamp: time.Now()},                       // 注入用户原始输入，供 TUI/前端对话区展示
+			{Role: enums.ChatRoleSystem, Content: "Goal: " + goal, Timestamp: time.Now()}, // 注入 system 消息
+			{Role: enums.ChatRoleUser, Content: goal, Timestamp: time.Now()},              // 注入用户原始输入，供 TUI/前端对话区展示
 		},
 	}
 
@@ -1060,7 +1061,7 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 
 	// 先发送当前状态（持锁快照 Events 避免与 addEventDebug 并发 append 产生 race，T4 修复）
 	snapshot := m.snapshotSession(session)
-	data, _ := json.Marshal(snapshot) // 序列化当前 session 快照
+	data, _ := json.Marshal(snapshot)    // 序列化当前 session 快照
 	fmt.Fprintf(w, "data: %s\n\n", data) // 写入 SSE 帧
 	flusher.Flush()
 
@@ -1738,7 +1739,7 @@ func (m *SessionManager) resumeSession(session *Session) {
 
 	m.addEvent(session, "system", "MetaAgent", "会话完成: "+result.SessionSummary, "", "", "", "", "", false)
 	m.persistHistory(session)
-	m.persistEvents(session)  // 持久化历史+事件
+	m.persistEvents(session)   // 持久化历史+事件
 	m.evictCompletedSessions() // 淘汰旧会话，防 OOM
 }
 
@@ -1904,5 +1905,109 @@ func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Req
 	json.NewEncoder(w).Encode(map[string]any{
 		"session_id": id,
 		"messages":   msgs,
+	})
+}
+
+// redactSensitive 脱敏 prompt/response 中的 API Key。
+func redactSensitive(s string) string {
+	// Bearer token / sk-... / ak-... 等
+	s = regexp.MustCompile(`(?i)\b(bearer\s+)[a-z0-9_\-\.]{8,}\b`).ReplaceAllString(s, "${1}***")
+	s = regexp.MustCompile(`(?i)\b(sk-[a-z0-9]{20,})\b`).ReplaceAllString(s, "***")
+	s = regexp.MustCompile(`(?i)\b(ak-[a-z0-9]{10,})\b`).ReplaceAllString(s, "***")
+	return s
+}
+
+// HandleSessionLogs GET /api/sessions/{id}/logs — 结构化会话日志查询
+// 支持 query 参数：agent、level、limit、offset。
+func (m *SessionManager) HandleSessionLogs(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/logs")
+
+	if m.pgStore == nil {
+		http.Error(w, "Postgres 不可用", http.StatusServiceUnavailable)
+		return
+	}
+
+	agent := r.URL.Query().Get("agent")
+	level := r.URL.Query().Get("level")
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	recs, err := m.pgStore.QuerySessionLogs(ctx, id, agent, level, limit, offset)
+	if err != nil {
+		log.Printf("[SessionManager] 查询 session_logs 失败: session=%s err=%v", id, err)
+		http.Error(w, "查询日志失败", http.StatusInternalServerError)
+		return
+	}
+
+	items := make([]map[string]any, 0, len(recs))
+	for _, rec := range recs {
+		items = append(items, map[string]any{
+			"id":            rec.ID,
+			"session_id":    rec.SessionID,
+			"agent":         rec.Agent,
+			"level":         rec.Level,
+			"phase":         rec.Phase,
+			"message":       rec.Message,
+			"prompt":        redactSensitive(rec.Prompt),
+			"response":      redactSensitive(rec.Response),
+			"input_tokens":  rec.InputTokens,
+			"output_tokens": rec.OutputTokens,
+			"model":         rec.Model,
+			"latency_ms":    rec.LatencyMs,
+			"created_at":    rec.CreatedAt,
+			"meta":          rec.Meta,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id": id,
+		"logs":       items,
+		"count":      len(items),
+	})
+}
+
+// HandleSessionTokenMetrics GET /api/sessions/{id}/token-metrics — Token 消耗聚合
+func (m *SessionManager) HandleSessionTokenMetrics(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+	id = strings.TrimSuffix(id, "/token-metrics")
+
+	if m.pgStore == nil {
+		http.Error(w, "Postgres 不可用", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	agg, err := m.pgStore.AggregateSessionTokens(ctx, id)
+	if err != nil {
+		log.Printf("[SessionManager] 聚合 token 消耗失败: session=%s err=%v", id, err)
+		http.Error(w, "聚合失败", http.StatusInternalServerError)
+		return
+	}
+
+	stats := make([]map[string]any, 0, len(agg.ByAgentModel))
+	for _, v := range agg.ByAgentModel {
+		stats = append(stats, map[string]any{
+			"agent":         v.Agent,
+			"model":         v.Model,
+			"input_tokens":  v.InputTokens,
+			"output_tokens": v.OutputTokens,
+			"calls":         v.Calls,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id":          id,
+		"total_input_tokens":  agg.TotalInputTokens,
+		"total_output_tokens": agg.TotalOutputTokens,
+		"total_calls":         agg.TotalCalls,
+		"stats":               stats,
 	})
 }

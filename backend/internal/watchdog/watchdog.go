@@ -48,9 +48,9 @@ type Level int
 
 const (
 	LevelOK       Level = iota // 上下文余量充足，无需任何动作
-	LevelWarn                   // 已接近软阈值（≥80% soft），记录警告并建议监控
-	LevelCompress               // 已超过软阈值，建议触发上下文压缩
-	LevelEvict                  // 已超过硬阈值，必须切换或销毁该 Agent
+	LevelWarn                  // 已接近软阈值（≥80% soft），记录警告并建议监控
+	LevelCompress              // 已超过软阈值，建议触发上下文压缩
+	LevelEvict                 // 已超过硬阈值，必须切换或销毁该 Agent
 )
 
 // String 返回 Level 的可读字符串，用于日志和调试输出。
@@ -108,10 +108,10 @@ func DefaultConfig() Config {
 //
 // 并发安全：所有方法均通过 mu 保护 decisions，可被多 goroutine 并发调用。
 type Watchdog struct {
-	cfg     Config // 软/硬阈值配置
-	mu      sync.RWMutex // 保护 decisions 切片的读写锁
-	decisions []Decision // 历史决策缓冲（最新追加到尾部，超出 max 丢弃最旧）
-	max     int // 历史决策最大保留数，超出则丢弃最旧
+	cfg       Config       // 软/硬阈值配置
+	mu        sync.RWMutex // 保护 decisions 切片的读写锁
+	decisions []Decision   // 历史决策缓冲（最新追加到尾部，超出 max 丢弃最旧）
+	max       int          // 历史决策最大保留数，超出则丢弃最旧
 }
 
 // New 创建一个 Watchdog 实例。

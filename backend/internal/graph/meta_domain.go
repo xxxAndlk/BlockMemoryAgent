@@ -4,11 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/blockmemory/agent/backend/pkg/types"
 	"log"
 	"strings"
-	"github.com/blockmemory/agent/backend/pkg/types"
 )
-
 
 // DomainInfo 领域信息。
 // 由 analyzeDomains 产出，描述一个待创建的领域。

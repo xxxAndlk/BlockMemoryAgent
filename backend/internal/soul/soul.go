@@ -31,8 +31,8 @@ type Persona struct {
 //   - current 用 atomic.Pointer 实现 RCU 风格的读多写少场景，避免读路径加锁；
 //   - 写路径（Load/Reload）通过 Store 原子发布新 Persona，旧读者持有旧快照不受影响。
 type Loader struct {
-	mu      sync.RWMutex          // 保留以扩展静态字段；当前 path 不可变
-	path    string                // soul.md 文件路径，空串表示无文件
+	mu      sync.RWMutex            // 保留以扩展静态字段；当前 path 不可变
+	path    string                  // soul.md 文件路径，空串表示无文件
 	current atomic.Pointer[Persona] // 当前人格快照，可能为 nil（未加载）
 }
 
