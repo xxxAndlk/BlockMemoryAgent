@@ -39,12 +39,14 @@ type Model struct {
 	sessionsCursor int
 
 	// chat panel
-	chatVP           viewport.Model
-	chatCursor       int
-	chatFollowBottom bool
-	chatLastItems    int  // 用于检测会话内容变化，决定是否重建 viewport content
-	chatLastWidth    int  // 上次生成 content 时的宽度
-	chatItemOffsets  []int // 每个 chatItem 在 viewport content 中的起始行偏移
+	chatVP              viewport.Model
+	chatCursor          int
+	chatFollowBottom    bool
+	chatLastItems       int  // 用于检测会话内容变化，决定是否重建 viewport content
+	chatLastWidth       int  // 上次生成 content 时的宽度
+	chatItemOffsets     []int // 每个 chatItem 在 viewport content 中的起始行偏移
+	pendingScrollToUser bool  // 发送消息后优先滚动到用户问题
+	chatAnchorUser      bool  // 已锚定到用户问题，禁止自动跟随底部
 
 	// accumulated token counts from token_usage events
 	totalInputTokens  int
@@ -146,6 +148,10 @@ func tickCmd() tea.Cmd {
 
 type tickMsg struct{}
 
+// selectSession 仅在显式切换会话（NewModel 初始化 / pendingSelectID 自动选中）时调用。
+// 不重置 pendingScrollToUser：第一条用户消息触发 createSession → tick 消费 pendingSelectID
+// → selectSession，此时 pendingScrollToUser 仍需保留以便后续滚动到用户问题，
+// 否则 GotoBottom 会把用户消息顶出视口（chatVP 内容含会话启动/agent_created 等后续事件）。
 func (m *Model) selectSession(idx int) {
 	if idx < 0 || idx >= len(m.sessions) {
 		return
@@ -153,11 +159,18 @@ func (m *Model) selectSession(idx int) {
 	m.sessionsCursor = idx
 	m.chatCursor = 0
 	m.chatFollowBottom = true
+	m.chatAnchorUser = false
 	m.chatLastItems = 0
 	m.chatLastWidth = 0
 	m.rebuildAgents()
 	m.rebuildChatContent()
-	m.chatVP.GotoBottom()
+	// 内容未撑满视口时回到顶部，确保首条用户消息/欢迎信息可见；
+	// 内容超出视口时才滚到底部看最新消息。
+	if m.chatVP.TotalLineCount() <= m.chatVP.VisibleLineCount() {
+		m.chatVP.GotoTop()
+	} else {
+		m.chatVP.GotoBottom()
+	}
 }
 
 func (m *Model) refreshSessions() {
@@ -361,20 +374,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// 发送消息后，优先滚动到最后一条用户问题，确保用户能看到自己的输入。
+		// 该逻辑必须排在内容重建/自动跟随底部之前，防止新内容把用户问题顶出视口。
+		if m.pendingScrollToUser {
+			if s := m.selectedSession(); s != nil {
+				items := chatItems(s, true)
+				for idx := len(items) - 1; idx >= 0; idx-- {
+					if strings.HasPrefix(items[idx].title, "> ") {
+						m.rebuildChatContent()
+						// 把用户问题底部对齐视口底部，保留上方历史可见；
+						// 同时锚定，让后续流式输出在下方展开而不把用户问题顶走。
+						m.chatScrollToItemBottom(idx)
+						m.chatFollowBottom = false
+						m.chatAnchorUser = true
+						m.pendingScrollToUser = false
+						break
+					}
+				}
+				// 未找到用户消息时保留 pendingScrollToUser，等待服务端写入后再试
+			}
+			// 无选中会话时也保留 pendingScrollToUser，等待 createSession 异步完成并 selectSession 后再滚动
+		}
 		// viewport 内容随会话事件/消息增长而重建；跟随底部时自动滚到最新。
+		// 锚定到用户问题时仅重建内容、不自动滚动，避免用户问题被顶出视口。
 		if s := m.selectedSession(); s != nil {
-			itemsChanged := len(chatItems(s)) != m.chatLastItems
+			itemsChanged := len(chatItems(s, true)) != m.chatLastItems
 			widthChanged := m.chatContentWidth() != m.chatLastWidth
 			if itemsChanged || widthChanged {
 				wasAtBottom := m.chatVP.AtBottom() || m.chatFollowBottom
 				m.rebuildChatContent()
-				if wasAtBottom {
+				if !m.chatAnchorUser && wasAtBottom {
 					m.chatVP.GotoBottom()
 					m.chatFollowBottom = true
 				}
 			}
 		}
-		if m.chatFollowBottom {
+		if !m.chatAnchorUser && m.chatFollowBottom {
 			m.chatVP.GotoBottom()
 		}
 		// 弹窗打开时刷新动态内容（完整记录面板在末尾时跟随新输出）
@@ -411,6 +446,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.chatVP, cmd = m.chatVP.Update(msg)
 	m.chatFollowBottom = m.chatVP.AtBottom()
+	m.chatAnchorUser = false
 	return m, cmd
 }
 
@@ -481,7 +517,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.flashMsg("Git Diff: not implemented in TUI")
 	case "s":
 		m.flashMsg("Settings: not implemented in TUI")
-	case "k":
+	case "K":
 		m.focus = panelInput
 		m.inputMode = inputNormal
 	case "/":
@@ -500,9 +536,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "pgup":
 		m.chatVP.HalfViewUp()
 		m.chatFollowBottom = m.chatVP.AtBottom()
+		m.chatAnchorUser = false
 	case "pgdown":
 		m.chatVP.HalfViewDown()
 		m.chatFollowBottom = m.chatVP.AtBottom()
+		m.chatAnchorUser = false
 	case "home":
 		m.chatGotoTop()
 	case "end":
@@ -546,11 +584,54 @@ func (m *Model) chatScrollToItem(idx int) {
 	m.chatFollowBottom = idx == len(m.chatItemOffsets)-1
 }
 
-func (m *Model) chatItemUp()   { m.chatScrollToItem(m.chatCurrentItem() - 1) }
-func (m *Model) chatItemDown() { m.chatScrollToItem(m.chatCurrentItem() + 1) }
+// chatScrollToItemBottom 滚动到指定 item 底部对齐视口底部，用于把刚发送的
+// 用户问题固定在屏幕底部，同时保留上方历史记录可见。
+func (m *Model) chatScrollToItemBottom(idx int) {
+	s := m.selectedSession()
+	if s == nil || len(m.chatItemOffsets) == 0 {
+		return
+	}
+	idx = clamp(idx, 0, len(m.chatItemOffsets)-1)
+	startOffset := m.chatItemOffsets[idx]
+	var endOffset int
+	if idx+1 < len(m.chatItemOffsets) {
+		endOffset = m.chatItemOffsets[idx+1]
+	} else {
+		endOffset = m.chatVP.TotalLineCount()
+	}
+	visible := m.chatVP.VisibleLineCount()
+	// 目标：让 item 的最后一行位于视口最底行
+	target := endOffset - visible
+	if target < startOffset {
+		// item 高度超过视口高度时，退回到 item 顶部
+		target = startOffset
+	}
+	if target < 0 {
+		target = 0
+	}
+	maxOffset := m.chatVP.TotalLineCount() - visible
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if target > maxOffset {
+		target = maxOffset
+	}
+	m.chatVP.SetYOffset(target)
+	m.chatFollowBottom = target >= maxOffset
+}
+
+func (m *Model) chatItemUp() {
+	m.chatScrollToItem(m.chatCurrentItem() - 1)
+	m.chatAnchorUser = false
+}
+func (m *Model) chatItemDown() {
+	m.chatScrollToItem(m.chatCurrentItem() + 1)
+	m.chatAnchorUser = false
+}
 
 func (m *Model) chatGotoTop() {
 	m.chatScrollToItem(0)
+	m.chatAnchorUser = false
 }
 
 func (m *Model) chatGotoBottom() {
@@ -560,6 +641,7 @@ func (m *Model) chatGotoBottom() {
 	}
 	m.chatScrollToItem(n - 1)
 	m.chatVP.GotoBottom()
+	m.chatAnchorUser = false
 }
 
 // rebuildChatContent 根据当前窗口尺寸把当前会话内容渲染成带样式的字符串，
@@ -577,14 +659,17 @@ func (m *Model) rebuildChatContent() {
 	}
 	content := m.buildChatContent(w)
 	m.chatVP.SetContent(content)
-	m.chatLastItems = len(chatItems(s))
+	m.chatLastItems = len(chatItems(s, true))
 	m.chatLastWidth = w
 }
 
 // rightPanelVisible 返回是否显示右侧计划/Agent 分栏。
-// 仅在有活动会话且终端宽度充足时显示。
+// 仅在有活动会话、终端宽度充足，且存在执行计划或多 Agent 编排时显示。
 func (m *Model) rightPanelVisible() bool {
-	return m.selectedSession() != nil && m.width >= 100
+	if m.selectedSession() == nil || m.width < 100 {
+		return false
+	}
+	return m.hasPlan() || len(m.agentsNodes) > 1
 }
 
 // chatAreaWidth 返回左侧对话区总宽度（含滚动条与间隔）。

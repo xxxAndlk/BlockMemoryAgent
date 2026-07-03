@@ -6,6 +6,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
+	"github.com/muesli/reflow/wordwrap"
 
 	"github.com/blockmemory/agent/backend/internal/board"
 )
@@ -18,43 +19,18 @@ func (m Model) View() string {
 	return m.singleColumnView()
 }
 
-// singleColumnView v2.0 主布局：顶部状态栏 + 主对话区 + 计划进度栏 + 输入栏 + 底部标签。
-// 当 agentPanelVisible 为 true 时，主对话区与右侧 Agent 面板分两列显示。
+// singleColumnView v2.5 主布局：顶部状态栏 + 主内容区 + 输入栏 + 底部快捷键栏。
+// 有活动会话且终端宽度充足时，主内容区左侧为对话区，右侧为计划/Agent 面板。
 func (m Model) singleColumnView() string {
-	topH := 1
-	inputH := 3
-	tabsH := 1
-	planH := 0
-	if m.planBarVisible {
-		planH = 1
-	}
-
-	// 弹窗打开时预先扣减聊天区高度，确保总高度 ≤ m.height，输入框始终可见。
-	overlayH := 0
-	if m.overlay != overlayNone {
-		overlayH = m.height / 3
-		if overlayH < 6 {
-			overlayH = 6
-		}
-	}
-
-	contentH := m.height - topH - inputH - tabsH - planH - overlayH
-	if contentH < 4 {
-		contentH = 4
-	}
+	contentH := m.mainContentHeight()
 
 	var mainRow string
-	if m.agentPanelVisible {
-		// 文档 §2.5：Agent 面板展开时主对话区 80% → 60%，面板占 40%
-		chatW := m.width * 3 / 5
-		agentW := m.width - chatW
-		if agentW < 24 {
-			agentW = 24
-			chatW = m.width - agentW
-		}
+	if m.rightPanelVisible() {
+		chatW := m.chatAreaWidth()
+		rightW := m.rightPanelWidth()
 		chatPanel := m.renderChat(chatW, contentH)
-		agentPanel := renderAgentPanel(&m, agentW)
-		mainRow = lipgloss.JoinHorizontal(lipgloss.Top, chatPanel, agentPanel)
+		rightPanel := m.renderRightPanels(rightW, contentH)
+		mainRow = lipgloss.JoinHorizontal(lipgloss.Top, chatPanel, rightPanel)
 	} else {
 		mainRow = m.renderChat(m.width, contentH)
 	}
@@ -62,13 +38,15 @@ func (m Model) singleColumnView() string {
 	view := lipgloss.JoinVertical(lipgloss.Top,
 		m.renderTopBar(m.width),
 		mainRow,
+		m.renderInput(m.width),
+		m.renderShortcutBar(m.width),
 	)
-	if m.planBarVisible {
-		view = lipgloss.JoinVertical(lipgloss.Top, view, m.renderPlanBar(m.width))
-	}
-	view = lipgloss.JoinVertical(lipgloss.Top, view, m.renderInput(m.width), m.renderTabs(m.width))
 
-	if overlayH > 0 {
+	if m.overlay != overlayNone {
+		overlayH := m.height / 3
+		if overlayH < 6 {
+			overlayH = 6
+		}
 		overlay := m.renderOverlay(m.width, overlayH)
 		view = lipgloss.JoinVertical(lipgloss.Left, view, overlay)
 	}
@@ -76,161 +54,331 @@ func (m Model) singleColumnView() string {
 }
 
 func (m Model) renderTopBar(w int) string {
+	// 左侧：版本、模型、Memory、Skills、MCP、Workspace
+	version := m.styles.TopBarLabel.Render("BlockMemoryAgent") + m.styles.TopBarSep.Render(" v0.8.0")
+	modelLabel := m.styles.TopBarLabel.Render("Model") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render(m.modelName)
+	memory := m.styles.TopBarLabel.Render("Memory") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarStatus.Render("On")
+	skills := m.styles.TopBarLabel.Render("Skills") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render("38")
+	mcp := m.styles.TopBarLabel.Render("MCP") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render("12")
+	workspace := m.styles.TopBarLabel.Render("Workspace") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render("~/demo")
+	left := lipgloss.JoinHorizontal(lipgloss.Left, version, "  ", modelLabel, "  ", memory, "  ", skills, "  ", mcp, "  ", workspace)
+
+	// 右侧：Session、Status、Time
 	s := m.selectedSession()
 	status := "idle"
-	sessionID := ""
+	sessionID := "-"
 	if s != nil {
 		status = string(s.Status)
-		sessionID = s.ID
+		sessionID = "#" + s.ID
 	}
-	agentCount := len(m.agentsNodes)
-	if s != nil && s.State != nil && s.State.PendingClarify != nil {
-		agentCount++
+	statusColor := cStatusIdle
+	switch status {
+	case "running":
+		statusColor = cStatusRun
+	case "awaiting_clarify":
+		statusColor = cStatusWait
+	case "error":
+		statusColor = cStatusErr
 	}
-	line := formatTopBar(m.styles, sessionID, status, agentCount, m.totalInputTokens, m.totalOutputTokens)
-	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
+	statusDot := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor)).Render("●")
+	sessionStr := m.styles.TopBarLabel.Render("Session") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render(sessionID)
+	statusStr := m.styles.TopBarLabel.Render("Status") + m.styles.TopBarSep.Render(": ") + statusDot + " " + m.styles.TopBarValue.Render(status)
+	timeStr := m.styles.TopBarLabel.Render("Time") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render("00:00:00")
+	right := lipgloss.JoinHorizontal(lipgloss.Left, sessionStr, "  ", statusStr, "  ", timeStr)
+
+	line := lipgloss.JoinHorizontal(lipgloss.Top, left, lipgloss.NewStyle().Width(w-lipgloss.Width(left)-lipgloss.Width(right)).Render(""), right)
+	if lipgloss.Width(line) > w {
+		line = left
+	}
+	return m.styles.TopBar.Width(w).Height(1).Render(line)
+}
+
+func (m Model) renderWelcome(w, h int) string {
+	title := m.styles.WelcomeTitle.Render("BlockMemoryAgent")
+	subtitle := m.styles.WelcomeSub.Render("AI Agent for Code, Memory and More.")
+	info := m.renderWelcomeInfo(w)
+	content := lipgloss.JoinVertical(lipgloss.Center, title, "", subtitle, "", info)
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, content)
+}
+
+// renderEmptyChat 当会话已创建但还没有任何聊天内容时展示的占位提示。
+// 放在对话区顶部，提示用户输入消息，避免首屏空白导致"第一个问题不展示"的错觉。
+func (m Model) renderEmptyChat(w, h int) string {
+	title := m.styles.WelcomeTitle.Render("BlockMemoryAgent")
+	hint := m.styles.WelcomeSub.Render("会话已启动，在底部输入栏发送第一条消息。")
+	shortcuts := m.styles.Dim.Render("Enter 发送 · / 命令 · ? 帮助 · Ctrl+C 退出")
+	content := lipgloss.JoinVertical(lipgloss.Center, title, "", hint, "", shortcuts)
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, content)
+}
+
+func (m Model) renderWelcomeInfo(w int) string {
+	pairs := []struct {
+		icon  string
+		label string
+		value string
+	}{
+		{"🖥", "Model", m.modelName},
+		{"📁", "Workspace", "~/demo"},
+		{"🧠", "Memory", "Enabled"},
+		{"#", "Session", "#12"},
+		{"⚡", "Skills", "38"},
+		{"🪟", "Context Window", "128K"},
+		{"🔌", "MCP Servers", "12 Connected"},
+		{"🐚", "Shell", "zsh"},
+	}
+	colW := (w - 6) / 2
+	if colW < 20 {
+		colW = 20
+	}
+	var left, right []string
+	for i, p := range pairs {
+		line := fmt.Sprintf("%s %s: %s", p.icon, m.styles.WelcomeLabel.Render(p.label), m.styles.WelcomeValue.Render(p.value))
+		line = truncate(line, colW)
+		if i%2 == 0 {
+			left = append(left, line)
+		} else {
+			right = append(right, line)
+		}
+	}
+	body := lipgloss.JoinHorizontal(lipgloss.Top,
+		strings.Join(left, "\n"),
+		lipgloss.NewStyle().Width(4).Render(""),
+		strings.Join(right, "\n"),
+	)
+	return m.styles.WelcomeBox.Width(w).Render(body)
 }
 
 func (m Model) renderChat(w, h int) string {
 	const scrollbarW = 1
-	contentW := w - scrollbarW - 1 // 1 列间隔
+	gap := 1
+	contentW := w - scrollbarW - gap
 	if contentW < 4 {
 		contentW = w
 	}
 
 	s := m.selectedSession()
 	if s == nil {
-		lines := []string{
-			"",
-			"  " + m.styles.Dim.Render("No active session."),
-			"  " + m.styles.Dim.Render("Type /new <your goal> to start a conversation."),
+		return m.renderWelcome(contentW, h)
+	}
+
+	// 有会话但暂无消息/事件时，在对话区顶部显示首页提示，避免空白一片。
+	if len(chatItems(s, true)) == 0 {
+		return m.renderEmptyChat(contentW, h)
+	}
+
+	// viewport 尺寸在 WindowSizeMsg 中维护；渲染前再同步一次以防万一直接调用。
+	m.chatVP.Width = contentW
+	m.chatVP.Height = h
+
+	content := lipgloss.NewStyle().Width(contentW).Height(h).Render(m.chatVP.View())
+	totalLines := m.chatVP.TotalLineCount()
+	viewportH := m.chatVP.VisibleLineCount()
+	startLine := m.chatVP.YOffset
+	bar := m.renderScrollbar(scrollbarW, h, viewportH, totalLines, startLine)
+	return lipgloss.JoinHorizontal(lipgloss.Top, content, bar)
+}
+
+func (m Model) renderRightPanels(w, h int) string {
+	if w < 20 {
+		w = 20
+	}
+	showPlan := m.hasPlan()
+	showAgents := len(m.agentsNodes) > 1
+	if showPlan && showAgents {
+		topH := h * 55 / 100
+		if topH < 6 {
+			topH = 6
 		}
-		content := m.clipChat(strings.Join(lines, "\n"), contentW, h)
-		return lipgloss.JoinHorizontal(lipgloss.Top, content, m.renderScrollbar(w-contentW, h, 0, 0, 0))
-	}
-
-	items := chatItems(s)
-	if len(items) == 0 {
-		lines := []string{"  " + m.styles.Dim.Render("(empty — send a message below)")}
-		content := m.clipChat(strings.Join(lines, "\n"), contentW, h)
-		return lipgloss.JoinHorizontal(lipgloss.Top, content, m.renderScrollbar(w-contentW, h, 0, 0, 0))
-	}
-
-	viewportH := h
-	if viewportH < 1 {
-		viewportH = 1
-	}
-
-	// Pre-compute item start lines to derive cursor from chatScrollLine.
-	itemLineCount := make([]int, len(items))
-	itemStartLine := make([]int, len(items))
-	totalLines := 0
-	for i, item := range items {
-		itemStartLine[i] = totalLines
-		n := 1 + len(displayDetailLines(item.title, item.detail))
-		itemLineCount[i] = n
-		totalLines += n
-	}
-
-	// Clamp scroll position.
-	startLine := m.chatScrollLine
-	if m.chatFollowBottom || startLine > totalLines-viewportH {
-		startLine = totalLines - viewportH
-	}
-	if startLine < 0 {
-		startLine = 0
-	}
-
-	// Render items.
-	type renderedItem struct {
-		lines []string
-	}
-	rendered := make([]renderedItem, len(items))
-	for i, item := range items {
-		var ls []string
-		style := m.styles.LogInfo
-		switch {
-		case strings.HasPrefix(item.title, "> "):
-			// 用户输入：高亮前缀 >
-			style = m.styles.LogUser
-			ls = append(ls, style.Render(truncate(item.title, contentW-2)))
-		case strings.HasPrefix(item.title, "[●] "):
-			// 工具调用中：黄色
-			ls = append(ls, m.styles.LogWarn.Render(truncate(item.title, contentW-2)))
-		case strings.HasPrefix(item.title, "[✓] "):
-			// 工具调用成功：绿色
-			ls = append(ls, m.styles.LogSuccess.Render(truncate(item.title, contentW-2)))
-		case strings.HasPrefix(item.title, "[✗] "):
-			// 工具调用失败：红色
-			ls = append(ls, m.styles.LogError.Render(truncate(item.title, contentW-2)))
-		case strings.HasPrefix(item.title, "🧠 recalled: "):
-			// 记忆召回：灰色
-			ls = append(ls, m.styles.Dim.Render(truncate(item.title, contentW-2)))
-		case strings.HasPrefix(item.title, "─── ") && strings.HasSuffix(item.title, " ───"):
-			// 话题切换：蓝色/强调色，居中
-			line := truncate(item.title, contentW-2)
-			ls = append(ls, m.styles.CallStack.Render(line))
-		case strings.HasPrefix(item.title, "✗ Error"):
-			ls = append(ls, m.styles.LogError.Render(truncate(item.title, contentW-2)))
-		default:
-			// Agent 响应：普通文本（仍做轻量 Markdown 格式化）
-			content := formatMarkdown(item.title)
-			ls = append(ls, content)
+		bottomH := h - topH
+		if bottomH < 6 {
+			bottomH = 6
 		}
-		detailLines := displayDetailLines(item.title, item.detail)
-		for _, l := range detailLines {
-			ls = append(ls, "  "+truncate(l, contentW-4))
-		}
-		rendered[i] = renderedItem{lines: ls}
+		return lipgloss.JoinVertical(lipgloss.Top, m.renderPlanPanel(w, topH), m.renderAgentsPanel(w, bottomH))
 	}
-	endLine := startLine + viewportH
-	if endLine > totalLines {
-		endLine = totalLines
+	if showPlan {
+		return m.renderPlanPanel(w, h)
+	}
+	if showAgents {
+		return m.renderAgentsPanel(w, h)
+	}
+	return ""
+}
+
+func (m Model) renderPlanPanel(w, h int) string {
+	header := m.styles.PanelHeader.Width(w).Render("执行计划")
+	innerW := w - 4
+	if innerW < 10 {
+		innerW = 10
 	}
 
 	var lines []string
-	skip := startLine
-	for i := range rendered {
-		ls := rendered[i].lines
-		if skip >= len(ls) {
-			skip -= len(ls)
-			continue
+	s := m.selectedSession()
+	if s == nil || m.rt == nil || m.rt.Boards == nil {
+		lines = append(lines, "(no plan)")
+		body := strings.Join(lines, "\n")
+		return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w).Height(h-1).Render(body))
+	}
+	b := m.rt.Boards.Get(s.ID)
+	if b == nil {
+		lines = append(lines, "(no plan)")
+		body := strings.Join(lines, "\n")
+		return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w).Height(h-1).Render(body))
+	}
+	snap := b.Snapshot()
+	done, total := 0, len(snap.Tasks)
+	current := -1
+	for i, t := range snap.Tasks {
+		if t.Status == board.TaskDone {
+			done++
 		}
-		take := ls[skip:]
-		remaining := endLine - (itemStartLine[i] + skip)
-		if remaining < len(take) {
-			if remaining < 0 {
-				remaining = 0
-			}
-			take = take[:remaining]
-		}
-		lines = append(lines, take...)
-		skip = 0
-		if len(lines) >= viewportH {
-			break
+		if current == -1 && (t.Status == board.TaskInProgress || t.Status == board.TaskBlocked) {
+			current = i
 		}
 	}
+	if current == -1 && total > 0 && done < total {
+		current = done
+	}
 
-	if totalLines > viewportH {
-		pct := 0
-		scrollable := totalLines - viewportH
-		if scrollable < 1 {
-			scrollable = 1
-		}
-		if endLine >= totalLines {
-			pct = 100
+	lines = append(lines, m.styles.Dim.Render("Goal: ")+truncate(snap.Goal, innerW-6))
+	pct := 0
+	if total > 0 {
+		pct = done * 100 / total
+	}
+	barW := innerW - 8
+	if barW < 4 {
+		barW = 4
+	}
+	filled := 0
+	if total > 0 {
+		filled = barW * done / total
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("─", barW-filled)
+	lines = append(lines, fmt.Sprintf("%s %d%%", bar, pct))
+	lines = append(lines, "")
+
+	for i, t := range snap.Tasks {
+		icon := statusIcon(string(t.Status))
+		prefix := fmt.Sprintf("%d. ", i+1)
+		line := prefix + icon + " " + t.Title
+		if i == current {
+			line = m.styles.StatValue.Render(truncate(line, innerW))
+		} else if t.Status == board.TaskDone {
+			line = m.styles.Dim.Render(truncate(line, innerW))
 		} else {
-			pct = startLine * 100 / scrollable
+			line = truncate(line, innerW)
 		}
-		hint := m.styles.Dim.Render(fmt.Sprintf(" [%d%%] ↑↓/j/k 滚动 ", pct))
-		if len(lines) > 0 {
-			lines[0] = lines[0] + " " + hint
+		lines = append(lines, line)
+	}
+
+	body := strings.Join(lines, "\n")
+	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w).Height(h-1).Render(body))
+}
+
+func (m Model) renderAgentsPanel(w, h int) string {
+	header := m.styles.PanelHeader.Width(w).Render("Agent 编排")
+	innerW := w - 4
+	if innerW < 10 {
+		innerW = 10
+	}
+
+	var lines []string
+	if len(m.agentsNodes) == 0 {
+		lines = append(lines, "(no agents)")
+	} else {
+		for _, node := range m.agentsNodes {
+			prefix := strings.Repeat("  ", node.depth)
+			icon := statusIcon(string(node.status))
+			name := node.name
+			if node.goal != "" {
+				name += " " + m.styles.Dim.Render(truncate(node.goal, innerW-lipgloss.Width(prefix)-lipgloss.Width(name)-4))
+			}
+			line := fmt.Sprintf("%s%s %s", prefix, icon, name)
+			lines = append(lines, truncate(line, innerW))
 		}
 	}
 
-	content := m.clipChat(strings.Join(lines, "\n"), contentW, h)
-	bar := m.renderScrollbar(w-contentW, h, viewportH, totalLines, startLine)
-	return lipgloss.JoinHorizontal(lipgloss.Top, content, bar)
+	body := strings.Join(lines, "\n")
+	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w).Height(h-1).Render(body))
+}
+
+// buildChatContent 把当前会话的全部 chatItem 渲染成 viewport 可滚动的字符串，
+// 并同步更新 m.chatItemOffsets。
+func (m *Model) buildChatContent(width int) string {
+	s := m.selectedSession()
+	if s == nil {
+		m.chatItemOffsets = nil
+		return ""
+	}
+	items := chatItems(s, true)
+	offsets := make([]int, len(items))
+	var lines []string
+
+	for i, item := range items {
+		offsets[i] = len(lines)
+		ts := item.timestamp.Format("15:04:05")
+		tsStyled := m.styles.Dim.Render(ts)
+
+		// 标题行：根据来源选择标签与样式
+		var titleLines []string
+		switch {
+		case strings.HasPrefix(item.title, "> "):
+			content := strings.TrimPrefix(item.title, "> ")
+			label := m.styles.LogUser.Render("You")
+			availW := width - lipgloss.Width(label) - lipgloss.Width(ts) - 3
+			if availW < 4 {
+				availW = 4
+			}
+			text := m.styles.LogUser.Render(truncate(content, availW))
+			titleLines = append(titleLines, tsStyled+" "+label+" "+text)
+		case strings.HasPrefix(item.title, "[●] "):
+			titleLines = append(titleLines, tsStyled+" "+m.styles.LogWarn.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+		case strings.HasPrefix(item.title, "[✓] "):
+			titleLines = append(titleLines, tsStyled+" "+m.styles.LogSuccess.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+		case strings.HasPrefix(item.title, "[✗] "):
+			titleLines = append(titleLines, tsStyled+" "+m.styles.LogError.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+		case strings.HasPrefix(item.title, "🧠 recalled: "):
+			titleLines = append(titleLines, tsStyled+" "+m.styles.Dim.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+		case strings.HasPrefix(item.title, "─── ") && strings.HasSuffix(item.title, " ───"):
+			titleLines = append(titleLines, tsStyled+" "+m.styles.CallStack.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+		case strings.HasPrefix(item.title, "✗ Error"):
+			titleLines = append(titleLines, tsStyled+" "+m.styles.LogError.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+		case item.isEvent:
+			// 事件标题已自带 Agent 名称（如 MetaAgent: ... / code_assistant 完成: ...）
+			titleLines = append(titleLines, tsStyled+" "+m.styles.LogInfo.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+		default:
+			label := m.styles.LogAssistant.Render("Assistant")
+			availW := width - lipgloss.Width(label) - lipgloss.Width(ts) - 3
+			if availW < 4 {
+				availW = 4
+			}
+			text := formatMarkdown(item.title)
+			// 对 Assistant 长回答做自动换行，避免截断
+			wrapped := wordwrap.String(text, availW)
+			wrappedLines := strings.Split(wrapped, "\n")
+			for j, wl := range wrappedLines {
+				line := tsStyled + " " + label + " " + wl
+				if j > 0 {
+					// 续行去掉 timestamp/label，用空格对齐
+					line = strings.Repeat(" ", lipgloss.Width(ts)+1) + "   " + wl
+				}
+				titleLines = append(titleLines, line)
+			}
+		}
+		lines = append(lines, titleLines...)
+
+		// detail 行统一缩进并截断/换行；空 detail 跳过避免标题与详情重复（non-tool 事件 detail 为空）
+		if item.detail != "" {
+			for _, l := range displayDetailLines(item.title, item.detail) {
+				wrapped := wordwrap.String(l, width-2)
+				for _, wl := range strings.Split(wrapped, "\n") {
+					lines = append(lines, "  "+wl)
+				}
+			}
+		}
+	}
+
+	m.chatItemOffsets = offsets
+	return strings.Join(lines, "\n")
 }
 
 // renderScrollbar 绘制右侧垂直滚动条。
@@ -313,26 +461,51 @@ func (m Model) renderInput(w int) string {
 	if m.focus == panelInput {
 		cursor = "▌"
 	}
-	text := string(m.inputRunes[:m.inputCursor]) + cursor + string(m.inputRunes[m.inputCursor:])
-	flash := ""
+
+	var text string
+	if len(m.inputRunes) == 0 {
+		text = m.styles.InputHint.Render("Type your message... (Enter to send, / for commands)")
+	} else {
+		text = string(m.inputRunes[:m.inputCursor]) + cursor + string(m.inputRunes[m.inputCursor:])
+	}
+
 	// 持锁读 flash（T2 修复：后台 HTTP goroutine 可能并发写）
 	m.flashMu.Lock()
 	curFlash := m.flash
 	m.flashMu.Unlock()
+	flash := ""
 	if curFlash != "" {
 		flash = "  " + m.styles.LogError.Render(curFlash)
 	}
+
 	border := m.styles.BlurBorder
 	if m.focus == panelInput {
 		border = m.styles.FocusBorder
 	}
-	hint := m.styles.Dim.Render("Tab 面板  ↑↓历史  Alt+Enter 换行  /help  Q 退出")
-	content := lipgloss.JoinVertical(lipgloss.Left, left+text+flash, " "+hint)
+	content := lipgloss.JoinVertical(lipgloss.Left, left+" "+text+flash, "")
 	return border.Width(w).Height(3).Render(content)
 }
 
-func (m Model) renderTabs(w int) string {
-	return m.styles.HelpBar.Width(w).Render(" " + bottomTabs + " ")
+func (m Model) renderShortcutBar(w int) string {
+	shortcuts := []struct {
+		key   string
+		label string
+	}{
+		{"K", "Command Palette"},
+		{"P", "Plan"},
+		{"A", "Agents"},
+		{"L", "Logs"},
+		{"M", "Memory"},
+		{"G", "Git Diff"},
+		{"S", "Settings"},
+		{"?", "Help"},
+		{"Ctrl+C", "Exit"},
+	}
+	var parts []string
+	for _, s := range shortcuts {
+		parts = append(parts, "["+m.styles.ShortcutKey.Render(s.key)+"] "+m.styles.ShortcutLabel.Render(s.label))
+	}
+	return m.styles.ShortcutBar.Width(w).Height(1).Render(strings.Join(parts, "  "))
 }
 
 func (m Model) renderOverlay(w, h int) string {
@@ -383,7 +556,7 @@ func (m Model) renderOverlay(w, h int) string {
 	hint := m.styles.Dim.Render("  [Esc close · j/k scroll · enter detail]")
 	body := lipgloss.JoinVertical(lipgloss.Left, header+hint, content)
 	box := m.styles.Overlay.Width(boxW).Height(boxH).Render(body)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
 }
 
 // displayDetailLines returns detail lines as they will be rendered.

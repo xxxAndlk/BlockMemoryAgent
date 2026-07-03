@@ -3,10 +3,12 @@ package graph
 import (
 	"context"
 	"fmt"
-	"github.com/blockmemory/agent/backend/pkg/types"
 	"log"
 	"strings"
 	"time"
+
+	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 func (n *MetaAgentNode) ensureBlockArchived(ctx context.Context, state *types.ThreeLayerState, block *types.SessionBlock) {
@@ -100,37 +102,76 @@ func (n *MetaAgentNode) collectBlockResult(state *types.ThreeLayerState, block *
 // 职责：
 //   - SessionSummary 为空时调 updateSessionSummary 生成默认摘要
 //   - 有 modelFactory 时调 LLM 把各助手结果润色为最终回答
-//   - LLM 超时/失败则保留原始结果
+//   - 最终回答按子Agent数量限长：默认500字，每调用一个子Agent增加200字
+//   - LLM 超时/失败则对原始结果兜底截断
 //
 // 参数：
 //   - ctx：请求上下文
 //   - state：图全局状态（原地修改 SessionSummary）
 //
-// 副作用：可能用 LLM 重写 SessionSummary。
+// 副作用：可能用 LLM 重写 SessionSummary，并截断到动态字数上限。
 func (n *MetaAgentNode) finalizeSession(ctx context.Context, state *types.ThreeLayerState) {
+	limit := summaryLimit(state)
+
 	// 无摘要则生成默认摘要
 	if state.SessionSummary == "" {
 		n.updateSessionSummary(state)
-		return
-	}
-	// 有模型工厂且未触发 LLM 跳过：调 LLM 润色最终回答
-	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
+	} else if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
+		// 有模型工厂且未触发 LLM 跳过：调 LLM 润色最终回答
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是BlockMemoryAgent，一个本地AI开发助手。请基于以下各助手的执行结果，生成一个清晰、完整的最终回答给用户。
 
 各助手执行结果：
 %s
 
-请直接输出最终回答，不要加任何前缀或总结性语句。回答请控制在 2000 字以内，保留关键结论与必要细节。`, state.SessionSummary))
+请直接输出最终回答，不要加任何前缀或总结性语句。回答请控制在 %d 字以内，保留关键结论与必要细节。`, state.SessionSummary, limit))
 		// 成功：替换为润色后的回答
 		if !timedOut && err == nil && resp != "" {
-			state.SessionSummary = resp // 替换为润色后的回答
-			return
-		}
-		// 超时：保留原始结果并打印警告
-		if timedOut {
+			state.SessionSummary = resp
+		} else if timedOut {
+			// 超时：保留原始结果并打印警告
 			log.Printf("[MetaAgent] LLM 调用超时(最终汇总阶段)，保留原始结果。%s\n", n.llmTracker.StatsString())
 		}
 	}
+
+	// 统一截断到动态字数上限（按 rune 计数，避免中文被字节截断）
+	state.SessionSummary = truncateStringByRunes(state.SessionSummary, limit)
+}
+
+const (
+	baseSummaryLimit = 500 // 默认总结字数上限
+	perAgentLimit    = 200 // 每调用一个子Agent增加的字数
+)
+
+// subAgentCount 统计当前会话中已调用的非 MetaAgent 角色实例数。
+func subAgentCount(state *types.ThreeLayerState) int {
+	if state == nil {
+		return 0
+	}
+	count := 0
+	for _, inst := range state.RoleInstances {
+		if inst != nil && inst.Type != enums.RoleTypeMeta {
+			count++
+		}
+	}
+	return count
+}
+
+// summaryLimit 根据子Agent数量计算 MetaAgent 总结的字数上限。
+// 默认 500 字，每调用一个子Agent增加 200 字。
+func summaryLimit(state *types.ThreeLayerState) int {
+	return baseSummaryLimit + perAgentLimit*subAgentCount(state)
+}
+
+// truncateStringByRunes 按 rune（字符）截断字符串并加省略号。
+func truncateStringByRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
 }
 
 // updateSessionSummary 更新会话总结。

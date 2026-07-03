@@ -172,6 +172,36 @@
 
 ## 待完成（按优先级分级）
 
+**P0-0. 恢复 MetaAgent 直接调用工具能力并升级智能路由**
+
+- **背景**：P0-1 记忆层优化中临时禁用了 MetaAgent 直接调用工具的能力，所有"做事"需求通过助手/领域 Agent 完成。当前 `meta_handle.go` 把 `RouteDirectTool` 与 `RouteDirectAssistant` 统一收敛到 `executeDirectAssistant`，失去了 0 层直接工具执行的低延迟路径，也与原 5 路径设计（`修改文档.md` §4.2/4.3）不一致。
+- **目标**：
+  1. 恢复 MetaAgent 直接调用工具的能力（RouteDirectTool，0 层，不创建任何 Agent 节点）。
+  2. 保留 MetaAgent 直接调用助手的能力（RouteDirectAssistant，1 层）。
+  3. 升级智能路由：规则层未命中时，使用轻量模型（`LightweightModel`）组装提示词与用户问题，先判断"简单问题 / 复杂问题"，再根据复杂度输出对应路由路径；简单问题由 MetaAgent 直接处理，复杂问题派发子 Agent。
+- **实现要点**：
+  - `backend/internal/graph/router.go`：
+    - `classifyRouteLLM` 改为调用 `modelFactory.CallLightweightWithRetry`，不再走 `callLLMAs`（Meta 模型）。
+    - Prompt 要求模型先做二分类（`simple` / `complex`），再映射到 5 条路径之一；输出格式严格为 `complexity: simple|complex\npath: <path>`，便于解析。
+    - 保留非法路径回退到 `RouteCreateDomain` 的安全兜底。
+  - `backend/internal/graph/meta_handle.go`：
+    - `handleInitialClassify` 的 switch 区分 `RouteDirectTool` 与 `RouteDirectAssistant`。
+    - `RouteDirectTool` 调用新增的 `executeDirectTool`；`RouteDirectAssistant` 保持调用 `executeDirectAssistant`。
+    - `handleInitial` 判断简单问题时优先取最近一条 `ChatRoleUser` 消息，避免 `resumeSession` 将历史总结为新 goal 后，原简单问句（如"你是什么模型"）被误判为复杂任务。
+  - `backend/internal/graph/meta_utils.go`：
+    - 新增 `executeDirectTool`：通过 `registry.GetMetaRoleDef()` 获取 MetaAgent 自身角色定义，直接走 `CommonExecuteAssistantTask`（使用 MetaAgent 自身模型跑 blades 工具循环，不创建 Assistant 实例）。
+    - 若未找到 meta 角色定义或无模型，回退到 `executeDirectAssistant`。
+    - 删除 `metaDirectRoleDef` 与自跑工具逻辑的历史残留注释（P0-1 已删）。
+  - `backend/internal/graph/role_registry.go`：
+    - 新增 `GetMetaRoleDef()`：根据 `cfg.MetaAgent.SystemPrompt` 构造 MetaAgent 的 `RoleDefinition`（roles.yaml 中 `meta_agent` 不属于 `fixed_roles`，原本 registry 中无此定义）。
+  - `backend/internal/tui/view.go` / `model.go`：
+    - `renderChat` 增加空会话占位提示 `renderEmptyChat`，会话已创建但暂无消息时显示引导信息，避免首屏空白。
+    - `selectSession` 重建内容后：内容未撑满视口则 `GotoTop()`，确保首条用户消息可见；仅当内容超出视口才 `GotoBottom()`。
+  - `backend/internal/graph/router_test.go`：补充测试：
+    - 轻量模型路由路径解析（mock 返回 `complex/simple` + path）。
+    - `RouteDirectTool` 直接执行不创建 DomainAgent/Assistant 实例。
+  - 验证：`go test ./...`、`go vet ./...`、`go build ./...` 通过。
+
 **P0-1. 记忆层优化** ✅ 本轮已完成
 
 - **目标**：取消 MetaAgent 直接调用工具的能力，所有"做事"需求通过助手/领域 Agent 完成；MetaAgent 只维护轻量级调度记忆，不记录繁琐上下文，同时保证记忆完整性不会导致调度失忆。

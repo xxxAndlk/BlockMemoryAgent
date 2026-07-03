@@ -103,8 +103,24 @@ func (n *MetaAgentNode) loadMessagesSection(state *types.ThreeLayerState) string
 	return b.String()
 }
 
-// executeDirect MetaAgent 通过 Assistant 执行任务（RouteDirectAssistant 路径）。
-// 注意：P0-1 后 MetaAgent 不再直接调用工具，本函数仅作为创建 Assistant 后的统一执行入口。
+// executeDirectTool RouteDirectTool 路径：MetaAgent 直接跑工具循环，不创建任何 Agent 节点。
+//
+// 职责：使用 MetaAgent 自身的 "meta" 角色定义，直接调用 CommonExecuteAssistantTask 跑 blades ReAct 工具循环，
+// 把结果写入 SessionSummary 并置 ActionFinish。若找不到 meta 角色定义则回退到 RouteDirectAssistant。
+func (n *MetaAgentNode) executeDirectTool(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
+	task := state.DomainGoal
+	n.emit(ctx, "intend", "直接执行工具: "+task)
+
+	// 获取 MetaAgent 自身角色定义
+	def := n.registry.GetMetaRoleDef()
+	if def == nil {
+		n.emit(ctx, "error", "未找到 meta 角色定义，回退到直接助手")
+		return n.executeDirectAssistant(ctx, state)
+	}
+	return n.executeDirect(ctx, state, def, task)
+}
+
+// executeDirect MetaAgent 直接执行任务（RouteDirectTool / RouteDirectAssistant 公共执行入口）。
 //
 // 职责：用给定 roleDef 调 CommonExecuteAssistantTask 跑 blades ReAct 工具循环，
 //
@@ -133,7 +149,7 @@ func (n *MetaAgentNode) executeDirect(ctx context.Context, state *types.ThreeLay
 		n.emit(ctx, "error", fmt.Sprintf("直接执行失败，回退到领域拆分: %v", err))
 		return n.handleInitialCreateDomains(ctx, state, false)
 	}
-	// P0-1：MetaAgent 不直接产出结果，而是把助手返回的 AgentResult 作为本会话结果
+	// 把执行结果作为本会话结果；若 SummaryForUser 为空则用 MemoryForMeta 兜底
 	if result.SummaryForUser == "" && result.MemoryForMeta != "" {
 		result.SummaryForUser = result.MemoryForMeta
 	}

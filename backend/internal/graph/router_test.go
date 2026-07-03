@@ -124,3 +124,30 @@ func TestDetectSubdomainBoundaries(t *testing.T) {
 		t.Errorf("expected no boundaries for same-domain tasks")
 	}
 }
+
+// TestParseRoutePath 验证从 LLM 输出解析路由路径。
+func TestParseRoutePath(t *testing.T) {
+	cases := []struct {
+		input string
+		want  RoutePath
+	}{
+		{"complexity: simple\npath: direct_tool", RouteDirectTool},
+		{"complexity: simple\npath: direct_assistant", RouteDirectAssistant},
+		{"complexity: complex\npath: create_domain", RouteCreateDomain},
+		{"complexity: complex\npath: multi_domain", RouteMultiDomain},
+		{"complexity: complex\npath: full_four_layer", RouteFullFourLayer},
+		// 兼容旧输出/兜底
+		{"direct_tool", RouteDirectTool},
+		{"  direct_assistant  ", RouteDirectAssistant},
+		{"path: create_domain.", RouteCreateDomain},
+		// 非法路径回退空串
+		{"path: unknown_path", ""},
+		{"just some text", ""},
+	}
+	for _, c := range cases {
+		got := parseRoutePath(c.input)
+		if got != c.want {
+			t.Errorf("parseRoutePath(%q) = %s, want %s", c.input, got, c.want)
+		}
+	}
+}

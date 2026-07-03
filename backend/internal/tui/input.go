@@ -43,12 +43,16 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputRunes = nil
 		m.inputCursor = 0
 		m.inputMode = inputNormal
+		// 发送后先停止跟随底部，等待 tick 把视口滚动到刚发送的用户问题，
+		// 避免长回答直接顶掉用户问题。
+		m.chatFollowBottom = false
+		m.pendingScrollToUser = true
 		// Keep focus in input so the user can immediately type the next message.
 		m.focus = panelInput
 		return m, nil
 
 	case tea.KeyTab:
-		m.agentPanelVisible = !m.agentPanelVisible
+		m.focus = panelChat
 		return m, nil
 
 	case tea.KeyUp:
@@ -189,6 +193,7 @@ func (m *Model) submitInput(cmd string) {
 	case "/clear":
 		// 重置主对话区滚动到最新（chat 由服务端事件驱动，本地仅重置视图位置）
 		m.chatFollowBottom = true
+		m.chatAnchorUser = false
 		m.chatVP.GotoBottom()
 		m.flashMsg("chat scrolled to bottom")
 		return

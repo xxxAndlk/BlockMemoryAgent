@@ -26,25 +26,25 @@ const (
 	inputEnqueue
 )
 
-// Bottom tabs.
-const bottomTabs = "[1 Chat] [2 Plan] [3 Agents] [4 Log] [5 DAG] [6 Runtime] [? Help] [/ Input] [ctrl+c Quit]"
-
 // Full help text.
 const fullHelpText = `
 键位
   /                聚焦底部输入栏
-  1                关闭弹窗，回到对话
-  2                打开 / 关闭 计划看板弹窗
-  3                打开 / 关闭 Agent 编排弹窗
-  4 / Ctrl+L       打开 / 关闭 完整记录弹窗（可滚动查看全部输出）
-  5                打开 / 关闭 DAG 拓扑弹窗（任务依赖与状态）
-  6                打开 / 关闭 运行时面板（TaskBoard / Mailbox / Watchdog）
+  K                聚焦底部输入栏（Command Palette）
+  1 / Esc          关闭弹窗，回到对话
+  2 / p            打开 / 关闭 计划看板弹窗
+  3 / a            打开 / 关闭 Agent 编排弹窗
+  4 / l / Ctrl+L   打开 / 关闭 完整记录弹窗（可滚动查看全部输出）
+  m                Memory 面板占位提示
+  g                Git Diff 占位提示
+  s                Settings 占位提示
   ?                帮助
   Esc              关闭弹窗 / 离开输入栏 / 回到对话区
   ctrl+c           退出 TUI（任意状态下生效）
 
 对话面板
-  j/k  上下滚动  g/G 首/尾  Enter 展开详情
+  j/k  按 item 上下滚动  g/G 首/尾  PgUp/PgDn 半屏滚动  Enter 展开详情
+  Home/End  跳到首/尾
   鼠标滚轮可在对话区滚动
   发送消息后焦点停在输入栏，按 Esc 可切回对话面板用 j/k 滚动；
   或随时按 Ctrl+L 打开完整记录面板查看全部输出
@@ -68,6 +68,5 @@ const fullHelpText = `
   Alt+Enter         输入换行（多行）
   ↑/↓               浏览历史输入
 
-弹窗（计划 / Agents / DAG / Runtime）会在有内容时于顶栏显示徽标，
-按 2 / 3 / 5 / 6 打开弹窗查看详情，j/k/g/G 滚动，Enter 展开，Esc/q 关闭。
+底部快捷键栏：K Command Palette  P Plan  A Agents  L Logs  M Memory  G Git Diff  S Settings  ? Help  Ctrl+C Exit
 `

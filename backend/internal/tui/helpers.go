@@ -48,13 +48,18 @@ func (m *Model) showChatDetail() {
 	if s == nil {
 		return
 	}
-	items := chatItems(s)
+	items := chatItems(s, true)
 	idx := m.chatCurrentItem()
 	if idx < 0 || idx >= len(items) {
 		return
 	}
 	item := items[idx]
-	m.openOverlay(item.title, strings.Split(item.detail, "\n"))
+	// 弹窗展示完整详情（rawDetail），不截断工具输出
+	detail := item.rawDetail
+	if detail == "" {
+		detail = item.detail
+	}
+	m.openOverlay(item.title, strings.Split(detail, "\n"))
 }
 
 func (m *Model) showPlanDetailByIndex(idx int) {
@@ -105,8 +110,11 @@ func (m *Model) showAgentDetailByIndex(idx int) {
 
 type chatItem struct {
 	title     string
-	detail    string
+	detail    string // 主对话区展示的 compact 详情（工具输出可能被截断）
+	rawDetail string // 完整详情，用于弹窗/完整记录面板
 	timestamp time.Time
+	isEvent   bool           // true 表示来自 SessionEvent，false 表示来自 ChatMessage
+	role      enums.ChatRole // 仅对 ChatMessage 有效
 }
 
 // buildPlanLines renders the current session's TaskBoard as flat lines for the popup.
@@ -179,32 +187,40 @@ func (m *Model) buildAgentsLines() []string {
 	return lines
 }
 
-func chatItems(s *server.Session) []chatItem {
+func chatItems(s *server.Session, compact bool) []chatItem {
 	// TUI chat interleaves conversation messages with key Agent events
 	// (tool calls, LLM/think output, errors), merged by timestamp so the ReAct
 	// sequence (think → tool → result → next think) is visible. Pure-debug
-	// events (token_usage/graph_step/agent_created/prompt/stats/agent_done) are
-	// filtered to keep the view readable.
+	// events (token_usage/graph_step/agent_created/prompt/stats) are filtered
+	// to keep the view readable.
 	var items []chatItem
 	for _, msg := range s.Messages {
-		// v2.0：用户输入前缀 ">"，助手回复普通文本，系统消息折叠
+		// v2.5：用户输入前缀 ">"，助手回复普通文本，
+		// 初始 "Goal: ..." 系统提示作为噪声过滤。
+		content := strings.TrimSpace(msg.Content)
+		if msg.Role == enums.ChatRoleSystem && strings.HasPrefix(content, "Goal: ") {
+			continue
+		}
+
 		var title string
 		var detail string
 		switch msg.Role {
 		case enums.ChatRoleUser:
-			title = "> " + strings.TrimSpace(msg.Content)
+			title = "> " + content
 		case enums.ChatRoleAssistant:
-			title = strings.TrimSpace(msg.Content)
+			title = content
 			detail = ""
 		default:
 			// system / tool 等角色按原格式展示
 			title = fmt.Sprintf("[%s] %s", msg.Role, msg.Timestamp.Format("15:04:05"))
-			detail = formatMarkdown(msg.Content)
+			detail = formatMarkdown(content)
 		}
 		items = append(items, chatItem{
 			title:     title,
 			detail:    detail,
 			timestamp: msg.Timestamp,
+			isEvent:   false,
+			role:      msg.Role,
 		})
 	}
 	// P2-1（文档 §2.2）：内联 🧠 recalled 最多 2 条，避免淹没主对话。
@@ -229,17 +245,152 @@ func chatItems(s *server.Session) []chatItem {
 		if ev.Kind == "memory_recall" && !recallKeep[i] {
 			continue
 		}
-		title, detail, ok := eventChatItem(ev)
+		title, detail, rawDetail, ok := eventChatItem(ev, compact)
 		if !ok {
 			continue
 		}
-		items = append(items, chatItem{title: title, detail: detail, timestamp: ev.Timestamp})
+		items = append(items, chatItem{title: title, detail: detail, rawDetail: rawDetail, timestamp: ev.Timestamp, isEvent: true})
 	}
 	// 稳定排序：同时间戳时保持插入顺序（message 先于其后触发的事件）
 	sort.SliceStable(items, func(i, j int) bool {
 		return items[i].timestamp.Before(items[j].timestamp)
 	})
+
+	// 聚合：把连续的无详情非 verbose 工具完成事件合并为 [✓] ToolName × N，
+	// 大幅减少 ListDir/ReadFile 等高频工具在对话区的刷屏。
+	if compact {
+		items = aggregateToolEvents(items)
+	}
+
+	// 去重：删除所有与最后一条 Assistant 消息内容重复的 "MetaAgent 总结: 会话完成: ..."
+	// 事件，避免直接回答等场景下同一段答案出现多次。
+	if len(items) >= 2 {
+		var lastAssistantIdx int = -1
+		for i := len(items) - 1; i >= 0; i-- {
+			if !items[i].isEvent && items[i].role == enums.ChatRoleAssistant {
+				lastAssistantIdx = i
+				break
+			}
+		}
+		if lastAssistantIdx >= 0 {
+			assistantText := normalizeChatText(items[lastAssistantIdx].title)
+			// 从后往前删除所有重复总结事件（可能因 LLM/事件重复产生多条）
+			for i := len(items) - 1; i > lastAssistantIdx; i-- {
+				if !items[i].isEvent {
+					continue
+				}
+				if strings.HasPrefix(items[i].title, "MetaAgent 总结: 会话完成: ") {
+					summary := strings.TrimPrefix(items[i].title, "MetaAgent 总结: 会话完成: ")
+					if normalizeChatText(summary) == assistantText {
+						items = append(items[:i], items[i+1:]...)
+					}
+				}
+			}
+		}
+	}
+
 	return items
+}
+
+// normalizeChatText 把聊天文本归一化，用于去重比较：
+// 移除 ANSI、Markdown 标记、列表符号，并压平空白。
+func normalizeChatText(s string) string {
+	s = stripANSI(s)
+	s = strings.ReplaceAll(s, "**", "")
+	s = strings.ReplaceAll(s, "*", "")
+	s = strings.ReplaceAll(s, "`", "")
+	s = strings.ReplaceAll(s, "#", "")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	return strings.TrimSpace(s)
+}
+
+// aggregateToolEvents 把连续的无详情非 verbose 工具完成事件聚合成一条
+// [✓] ToolName × N，显著减少 ListDir/ReadFile 等高频工具刷屏。
+func aggregateToolEvents(items []chatItem) []chatItem {
+	if len(items) < 2 {
+		return items
+	}
+	var out []chatItem
+	for i := 0; i < len(items); {
+		it := items[i]
+		tool, ok := collapsibleToolTitle(it)
+		if !ok {
+			out = append(out, it)
+			i++
+			continue
+		}
+		paths := []string{}
+		j := i
+		for j < len(items) {
+			nextTool, ok := collapsibleToolTitle(items[j])
+			if !ok || nextTool != tool {
+				break
+			}
+			path := strings.TrimSpace(strings.TrimPrefix(items[j].title, "[✓] "+tool+":"))
+			paths = append(paths, path)
+			j++
+		}
+		if len(paths) > 1 {
+			aggTitle := fmt.Sprintf("[✓] %s × %d", tool, len(paths))
+			out = append(out, chatItem{
+				title:     aggTitle,
+				detail:    aggregateToolPaths(paths),
+				timestamp: it.timestamp,
+				isEvent:   true,
+			})
+			i = j
+			continue
+		}
+		out = append(out, it)
+		i++
+	}
+	return out
+}
+
+// collapsibleToolTitle 判断 item 是否可被聚合：非 verbose 工具的 [✓] 完成事件且无 detail。
+func collapsibleToolTitle(it chatItem) (tool string, ok bool) {
+	if !it.isEvent || it.detail != "" {
+		return "", false
+	}
+	if !strings.HasPrefix(it.title, "[✓] ") {
+		return "", false
+	}
+	rest := strings.TrimPrefix(it.title, "[✓] ")
+	idx := strings.Index(rest, ":")
+	if idx <= 0 {
+		return "", false
+	}
+	tool = strings.TrimSpace(rest[:idx])
+	if verboseTools[tool] {
+		return "", false
+	}
+	return tool, true
+}
+
+// aggregateToolPaths 把路径列表折叠成短 detail，最多展示前 5 条。
+func aggregateToolPaths(paths []string) string {
+	const maxShow = 5
+	var b strings.Builder
+	n := len(paths)
+	if n <= maxShow {
+		for _, p := range paths {
+			b.WriteString("  ")
+			b.WriteString(p)
+			b.WriteByte('\n')
+		}
+		return strings.TrimRight(b.String(), "\n")
+	}
+	for _, p := range paths[:maxShow] {
+		b.WriteString("  ")
+		b.WriteString(p)
+		b.WriteByte('\n')
+	}
+	b.WriteString(fmt.Sprintf("  ... 还有 %d 条", n-maxShow))
+	return b.String()
 }
 
 // buildTranscriptLines 把整段对话（消息 + 关键事件）铺成可滚动弹窗用的扁平行列表。
@@ -251,7 +402,7 @@ func (m *Model) buildTranscriptLines() []string {
 	if s == nil {
 		return []string{"(no active session)"}
 	}
-	items := chatItems(s)
+	items := chatItems(s, false)
 	if len(items) == 0 {
 		return []string{"(empty — send a message below)"}
 	}
@@ -263,7 +414,11 @@ func (m *Model) buildTranscriptLines() []string {
 	var out []string
 	for _, it := range items {
 		out = append(out, truncate(it.title, maxW))
-		for _, l := range strings.Split(it.detail, "\n") {
+		detail := it.rawDetail
+		if detail == "" {
+			detail = it.detail
+		}
+		for _, l := range strings.Split(detail, "\n") {
 			out = append(out, "    "+truncate(l, maxW-4))
 		}
 		out = append(out, m.styles.Dim.Render("─"))
@@ -279,14 +434,37 @@ var verboseTools = map[string]bool{
 	"RunCommand": true,
 }
 
-// eventChatItem 把一个 SessionEvent 映射为对话区的一行（title + detail）。
+// compactToolOutputLines 是 verbose 工具输出在主对话区最多展示的行数，
+// 超出部分折叠，可在弹窗/Ctrl+L 完整记录中查看。
+const compactToolOutputLines = 20
+
+// truncateToolOutput 截断工具输出到指定行数，超出部分显示 "  ..." 提示。
+func truncateToolOutput(output string, maxLines int) string {
+	if maxLines <= 0 {
+		return output
+	}
+	lines := strings.Split(output, "\n")
+	if len(lines) <= maxLines {
+		return output
+	}
+	return strings.Join(lines[:maxLines], "\n") + "\n  ..."
+}
+
+// eventChatItem 把一个 SessionEvent 映射为对话区的一行（title + detail + rawDetail）。
+// compact=true 时会对 verbose 工具的长输出做截断，用于主对话区；
+// compact=false 时 rawDetail 保留完整输出，用于弹窗/完整记录面板。
 // 返回 ok=false 表示该事件类型不展示（调试噪声）。
-func eventChatItem(ev server.SessionEvent) (title, detail string, ok bool) {
+func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDetail string, ok bool) {
 	switch {
 	case ev.Type == "tool_exec" || ev.Kind == "tool_call":
 		tool := ev.Tool
 		if tool == "" {
 			tool = "tool"
+		}
+		// 非 verbose 工具只保留执行完成的事件，隐藏调用前 pending 事件，
+		// 避免 ListDir/ReadFile/HTTPGet 等高频工具在对话区产生大量 [●] 行。
+		if ev.Kind == "tool_call" && !verboseTools[tool] {
+			return "", "", "", false
 		}
 		status := "✓"
 		if ev.Kind == "tool_call" {
@@ -299,37 +477,90 @@ func eventChatItem(ev server.SessionEvent) (title, detail string, ok bool) {
 		if title == fmt.Sprintf("[%s] %s: ", status, tool) {
 			title = fmt.Sprintf("[%s] %s", status, tool)
 		}
-		var d strings.Builder
+		// rawDetail 始终保留完整信息，用于弹窗/完整记录面板
+		var full strings.Builder
 		if ev.Message != "" {
-			d.WriteString(ev.Message)
-			d.WriteByte('\n')
+			full.WriteString(ev.Message)
+			full.WriteByte('\n')
 		}
-		// P2-3：仅 WriteFile / RunCommand 展开 output，其余工具默认折叠
-		if verboseTools[ev.Tool] && ev.ToolOutput != "" {
-			d.WriteString("结果:\n")
-			d.WriteString(stripANSI(ev.ToolOutput))
-			d.WriteByte('\n')
+		if ev.ToolOutput != "" {
+			full.WriteString("结果:\n")
+			full.WriteString(stripANSI(ev.ToolOutput))
+			full.WriteByte('\n')
 		}
 		if ev.ToolError != "" {
-			d.WriteString("错误: ")
-			d.WriteString(stripANSI(ev.ToolError))
-			d.WriteByte('\n')
+			full.WriteString("错误: ")
+			full.WriteString(stripANSI(ev.ToolError))
+			full.WriteByte('\n')
 		}
-		return title, strings.TrimRight(d.String(), "\n"), true
+		rawDetail = strings.TrimRight(full.String(), "\n")
+
+		// compact detail：verbose 工具展示 Message + 截断 Output + Error；
+		// 非 verbose 工具仅展示 Error，避免输出刷屏但保证错误可见。
+		var compactDetail strings.Builder
+		if verboseTools[tool] {
+			if ev.Message != "" {
+				compactDetail.WriteString(ev.Message)
+				compactDetail.WriteByte('\n')
+			}
+			if ev.ToolOutput != "" {
+				compactDetail.WriteString("结果:\n")
+				compactDetail.WriteString(truncateToolOutput(stripANSI(ev.ToolOutput), compactToolOutputLines))
+				if compactDetail.Len() > len("结果:\n") {
+					compactDetail.WriteByte('\n')
+				}
+			}
+		}
+		if ev.ToolError != "" {
+			compactDetail.WriteString("错误: ")
+			compactDetail.WriteString(stripANSI(ev.ToolError))
+			compactDetail.WriteByte('\n')
+		}
+		detail = strings.TrimRight(compactDetail.String(), "\n")
+		if !compact {
+			detail = rawDetail
+		}
+		return title, detail, rawDetail, true
 	case ev.Kind == "memory_recall":
-		return "🧠 recalled: " + strings.TrimSpace(ev.Message), "", true
+		title = "🧠 recalled: " + strings.TrimSpace(ev.Message)
+		return title, "", title, true
 	case ev.Kind == "topic_switch":
 		msg := ev.Message
 		if msg == "" {
 			msg = "切换话题"
 		}
-		return "─── " + msg + " ───", "", true
+		title = "─── " + msg + " ───"
+		return title, "", title, true
 	case ev.Kind == "llm_result" || ev.Kind == "think" || ev.Kind == "llm" || ev.Kind == "intend" || ev.Kind == "wait":
-		return ev.Message, "", true
+		agent := ev.Agent
+		if agent == "" {
+			agent = "Assistant"
+		}
+		title = agent + ": " + ev.Message
+		return title, "", title, true
+	case ev.Type == "agent_done":
+		agent := ev.Agent
+		if agent == "" {
+			agent = "Agent"
+		}
+		title = agent + " 完成: " + ev.Message
+		return title, "", title, true
+	case ev.Type == "system":
+		// 只展示会话完成总结，避免“会话启动/继续执行”等噪声淹没对话。
+		if strings.Contains(ev.Message, "会话完成") {
+			agent := ev.Agent
+			if agent == "" {
+				agent = "MetaAgent"
+			}
+			title = agent + " 总结: " + ev.Message
+			return title, "", title, true
+		}
+		return "", "", "", false
 	case ev.Kind == "error" || ev.Type == "error":
-		return "✗ Error: " + ev.Message, "", true
+		title = "✗ Error: " + ev.Message
+		return title, "", title, true
 	}
-	return "", "", false
+	return "", "", "", false
 }
 
 // formatMarkdown applies light Markdown formatting for the chat view.

@@ -83,6 +83,26 @@ func (r *RoleRegistry) GetRoleDef(roleDefID string) *types.RoleDefinition {
 	return r.dynamicDefs[roleDefID] // 回退到动态角色
 }
 
+// GetMetaRoleDef 获取 MetaAgent 自身的角色定义。
+//
+// MetaAgent 配置来自 roles.yaml 的 meta_agent 段，不属于 fixed_roles，
+// 因此不会出现在 fixedDefs 中；本方法根据 cfg.MetaAgent.SystemPrompt 构造一个
+// 临时的 RoleDefinition，供 RouteDirectTool 等需要 MetaAgent 自身 system prompt 的路径使用。
+//
+// 返回：定义指针；配置未加载返回 nil。
+// 并发安全：只读 cfg，无锁。
+func (r *RoleRegistry) GetMetaRoleDef() *types.RoleDefinition {
+	if r.cfg == nil {
+		return nil
+	}
+	return &types.RoleDefinition{
+		ID:           "meta",
+		Name:         "MetaAgent",
+		Type:         enums.RoleTypeMeta,
+		SystemPrompt: r.cfg.MetaAgent.SystemPrompt,
+	}
+}
+
 // GetFixedRoleDefs 获取所有固定角色定义。
 // 用途：MetaAgent 构建系统提示词时把所有可调用的固定角色列给 LLM。
 // 返回：固定角色定义切片（无序）；表为空时返回 nil。

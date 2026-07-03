@@ -15,6 +15,68 @@ func (n *MetaAgentNode) callLLM(ctx context.Context, prompt string) (string, err
 	return n.callLLMAs(ctx, "MetaAgent", prompt)
 }
 
+// callLightweightAs 以轻量模型身份执行 LLM 调用。
+//
+// 职责：与 callLLMAs 相同，但使用 LightweightModel（更便宜、更快），
+// 用于路由判定、历史总结、检索改写等低开销任务。
+func (n *MetaAgentNode) callLightweightAs(ctx context.Context, caller string, prompt string) (string, error, bool) {
+	// 取轻量模型；失败则直接返回错误
+	llm, err := n.modelFactory.GetLightweightModel(ctx)
+	if err != nil {
+		return "", err, false
+	}
+
+	// 注入人格（soul.md 内容拼到 prompt 前部）
+	if n.rt != nil && n.rt.Soul != nil {
+		prompt = n.rt.Soul.Inject(prompt)
+	}
+
+	// 发送 prompt 调试事件（含 token 估算与 500 字摘要）
+	n.emitDetail(ctx, "prompt", fmt.Sprintf("[%s] 发送 Prompt (%d tokens)", caller, model.EstimateTokens(prompt)), model.SummarizePrompt(prompt, 500))
+
+	// 路由/总结场景使用 0 温度
+	var resp string
+	var callErr error
+	var timedOut bool
+	softTimeout := 30 * time.Second
+	hardTimeout := 90 * time.Second
+	if n.rt != nil && n.rt.AgentCfg != nil {
+		if n.rt.AgentCfg.LLMSoftTimeoutSec > 0 {
+			softTimeout = time.Duration(n.rt.AgentCfg.LLMSoftTimeoutSec) * time.Second
+		}
+		if n.rt.AgentCfg.LLMHardTimeoutSec > 0 {
+			hardTimeout = time.Duration(n.rt.AgentCfg.LLMHardTimeoutSec) * time.Second
+		}
+	}
+	if t, ok := llm.(model.TemperatureAware); ok {
+		desired := soul.Temperature(soul.KindRouting, 0)
+		wrapped := &temperatureWrappedLLM{base: llm, t: t, temperature: desired}
+		resp, callErr, timedOut = n.llmTracker.CallWithTimeout(ctx, wrapped, prompt, caller,
+			softTimeout, hardTimeout)
+	} else {
+		resp, callErr, timedOut = n.llmTracker.CallWithTimeout(ctx, llm, prompt, caller,
+			softTimeout, hardTimeout)
+	}
+
+	// 发送 token_usage 调试事件
+	records := n.llmTracker.Records()
+	if len(records) > 0 {
+		last := records[len(records)-1]
+		n.emitDetail(ctx, "token_usage",
+			fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", caller, last.InputTokens, last.OutputTokens, last.Duration.Round(time.Millisecond)),
+			"")
+	}
+
+	// 发送 LLM 响应摘要调试事件
+	if resp != "" {
+		n.emitDetail(ctx, "llm_response",
+			fmt.Sprintf("[%s] LLM 响应 (%d 字符)", caller, len(resp)),
+			model.SummarizePrompt(resp, 500))
+	}
+
+	return resp, callErr, timedOut
+}
+
 // callLLMAs 以指定调用者身份执行 LLM 调用。
 //
 // 职责：

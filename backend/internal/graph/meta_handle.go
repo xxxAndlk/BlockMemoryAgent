@@ -28,6 +28,23 @@ import (
 //
 // 副作用：创建 DomainAgent 实例；写入 ActiveBlocks、TaskBoard；更新 SessionSummary。
 func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
+	// 判断简单问题时，优先使用最近一条用户原始消息（resumeSession 会把历史总结成 goal，
+	// 导致原简单问句丢失，误判为复杂任务）。无用户消息时回退到 DomainGoal。
+	goal := state.DomainGoal
+	if len(state.Messages) > 0 {
+		if last := state.Messages[len(state.Messages)-1]; last.Role == enums.ChatRoleUser {
+			goal = last.Content
+		}
+	}
+	// 简单寒暄/自我介绍类问题：MetaAgent 直接回答，不拆领域、不创建子 Agent。
+	if n.isSimpleQuestion(goal) {
+		return n.executeDirectAnswer(ctx, state)
+	}
+	return n.handleInitialClassify(ctx, state)
+}
+
+// handleInitialClassify 执行常规 5 路径路由（规则 + LLM）。
+func (n *MetaAgentNode) handleInitialClassify(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	n.emit(ctx, "think", "分析用户目标，决定执行路径")
 
 	// 5 路径路由：规则层（零 LLM）→ LLM 兜底 → 安全兜底（RouteCreateDomain）
@@ -42,14 +59,36 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 	}
 
 	switch decision.Path {
-	case RouteDirectTool, RouteDirectAssistant:
-		// 0-1 层：MetaAgent 不直接执行工具，而是创建 Assistant 代为执行（P0-1）。
-		// RouteDirectTool 原意为"简单工具请求"，同样走助手路径，避免 MetaAgent 直接调用工具。
+	case RouteDirectTool:
+		// 0 层：MetaAgent 直接跑工具循环，不创建任何 Agent 节点。
+		return n.executeDirectTool(ctx, state)
+	case RouteDirectAssistant:
+		// 1 层：MetaAgent 直接创建一个专家助手执行，不经过 DomainAgent 拆分。
 		return n.executeDirectAssistant(ctx, state)
 	default:
 		// RouteCreateDomain / RouteMultiDomain / RouteFullFourLayer：走领域拆分
 		return n.handleInitialCreateDomains(ctx, state, decision.EnableSubdomain)
 	}
+}
+
+// executeDirectAnswer 让 MetaAgent 直接回答简单问题（寒暄/自我介绍类），
+// 不创建 DomainAgent / Assistant，直接结束会话。
+func (n *MetaAgentNode) executeDirectAnswer(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
+	n.emit(ctx, "intend", "直接回答简单问题")
+	prompt := fmt.Sprintf("用户问题：%s\n请根据你的人格与能力，直接给出简洁友好的回答，不要调用任何工具。", state.DomainGoal)
+	answer, err, _ := n.callLLM(ctx, prompt)
+	if err != nil {
+		n.emit(ctx, "error", "直接回答失败，回退到常规路由: "+err.Error())
+		// 回退：继续走常规路由，避免再次进入 executeDirectAnswer 死循环
+		return n.handleInitialClassify(ctx, state)
+	}
+	if answer == "" {
+		answer = "你好，我是 BlockMemoryAgent，一个面向代码与记忆的 AI Agent。有什么可以帮你的吗？"
+	}
+	state.SessionSummary = answer
+	state.NextAction = enums.ActionFinish
+	state.Reason = "simple question answered directly"
+	return state, nil
 }
 
 // handleInitialCreateDomains 领域拆分路径：analyzeDomains → 创建 DomainAgent/SessionBlock → 切换。

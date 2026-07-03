@@ -174,27 +174,72 @@ func isMultiDomainHint(goal string) bool {
 	return false
 }
 
-// classifyRouteLLM LLM 兜底路由（轻量模型判定）。
+// classifyRouteLLM LLM 兜底路由（轻量模型判定复杂度后映射路径）。
 //
-// 让模型在 5 条路径中选一；未识别/超时/非法输出返回空串交安全兜底。
+// 让轻量模型先判断"简单问题 / 复杂问题"，再给出 5 条路径之一；
+// 未识别/超时/非法输出返回空串交安全兜底。
 func (n *MetaAgentNode) classifyRouteLLM(ctx context.Context, goal string) RoutePath {
-	prompt := `判断以下用户目标应走哪条执行路径，只回答路径代号：direct_tool / direct_assistant / create_domain / multi_domain / full_four_layer。
+	prompt := `你是一名任务复杂度判定专家。请按以下两步分析用户目标，并严格按格式输出：
 
-- direct_tool       ：寒暄/常识/定义类，或单次工具调用（读文件、运行命令、查天气、HTTPGet 抓取）。主 Agent 直接处理，无需创建领域 Agent。
-- direct_assistant  ：单领域简单任务（修 CSS、改文案、调配置），需一个专家助手但无需领域拆分。
-- create_domain     ：单领域复杂任务（重构某模块 API、设计数据库），需拆子任务但不跨子领域。
-- multi_domain      ：多领域并行（后端加接口 + 前端改样式）。
-- full_four_layer   ：超复杂任务，子领域边界明显（API 层 + 数据库层 + 前端层需分别拆分）。
+第一步：判断问题复杂度
+- simple（简单问题）：仅需单次工具调用即可回答/完成，如读文件、运行命令、查天气、HTTPGet 抓取；或单领域简单修改，如修 CSS padding、改文案、调配置。
+- complex（复杂问题）：需要多步骤规划、跨模块协作、领域拆分，如重构模块 API、设计数据库、前后端并行开发、全栈架构设计。
+
+第二步：在对应复杂度下选择执行路径
+- simple → direct_tool：单次工具调用或纯 QA，主 Agent 直接跑工具循环，无需创建任何子 Agent。
+- simple → direct_assistant：单领域简单任务，主 Agent 直接创建一个专家助手执行，无需 DomainAgent 拆分。
+- complex → create_domain：单领域复杂任务，需要创建 DomainAgent 进行任务拆分。
+- complex → multi_domain：多领域并行任务，需要创建多个 DomainAgent。
+- complex → full_four_layer：超复杂任务，子领域边界明显（API 层 + 数据库层 + 前端层），需要启用 SubDomainAgent 完整四层编排。
+
+输出格式（严格遵循，不要其他文字）：
+complexity: simple|complex
+path: direct_tool|direct_assistant|create_domain|multi_domain|full_four_layer
 
 用户目标: ` + goal + `
 
-只回答上述代号之一，不要其他文字:`
-	resp, err, timedOut := n.callLLMAs(ctx, "MetaAgent/路由判定", prompt)
+请输出：`
+	resp, err, timedOut := n.callLightweightAs(ctx, "MetaAgent/路由判定(轻量)", prompt)
 	if timedOut || err != nil || resp == "" {
 		return ""
 	}
 	resp = strings.ToLower(strings.TrimSpace(resp))
-	// 容忍模型输出带前后缀（如 "direct_tool." 或 "路径: direct_tool"）
+	// 解析 complexity 与 path；容忍前后缀、空行与标点
+	path := parseRoutePath(resp)
+	if path != "" {
+		return path
+	}
+	return "" // 未识别，交安全兜底
+}
+
+// parseRoutePath 从 LLM 输出中解析路由路径。
+//
+// 支持两种格式：
+//   - 结构化："complexity: simple\npath: direct_tool"
+//   - 兜底：直接包含路径代号（兼容旧输出）。
+func parseRoutePath(resp string) RoutePath {
+	// 1. 尝试显式提取 "path: xxx" 行
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.ToLower(strings.TrimSpace(line))
+		if !strings.HasPrefix(line, "path:") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(line, "path:"))
+		v = strings.TrimRight(v, ".。,，")
+		switch v {
+		case "direct_tool":
+			return RouteDirectTool
+		case "direct_assistant":
+			return RouteDirectAssistant
+		case "create_domain":
+			return RouteCreateDomain
+		case "multi_domain":
+			return RouteMultiDomain
+		case "full_four_layer":
+			return RouteFullFourLayer
+		}
+	}
+	// 2. 兜底：包含关键字即命中（兼容旧模型/非结构化输出）
 	switch {
 	case strings.Contains(resp, "direct_tool"):
 		return RouteDirectTool
@@ -207,5 +252,5 @@ func (n *MetaAgentNode) classifyRouteLLM(ctx context.Context, goal string) Route
 	case strings.Contains(resp, "create_domain"):
 		return RouteCreateDomain
 	}
-	return "" // 未识别，交安全兜底
+	return ""
 }
