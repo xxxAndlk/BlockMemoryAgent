@@ -189,7 +189,7 @@ func (m *Model) submitInput(cmd string) {
 	case "/clear":
 		// 重置主对话区滚动到最新（chat 由服务端事件驱动，本地仅重置视图位置）
 		m.chatFollowBottom = true
-		m.chatScrollLine = 0
+		m.chatVP.GotoBottom()
 		m.flashMsg("chat scrolled to bottom")
 		return
 	case "/topic":

@@ -6,6 +6,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/blockmemory/agent/backend/internal/graph"
@@ -38,9 +39,12 @@ type Model struct {
 	sessionsCursor int
 
 	// chat panel
-	chatScrollLine   int // viewport top line (absolute)
+	chatVP           viewport.Model
 	chatCursor       int
 	chatFollowBottom bool
+	chatLastItems    int  // 用于检测会话内容变化，决定是否重建 viewport content
+	chatLastWidth    int  // 上次生成 content 时的宽度
+	chatItemOffsets  []int // 每个 chatItem 在 viewport content 中的起始行偏移
 
 	// accumulated token counts from token_usage events
 	totalInputTokens  int
@@ -116,7 +120,9 @@ func NewModel(
 		inputHistIdx:      -1,
 		inputHistory:      make(map[string][]string),
 		flashMu:           &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
+		chatVP:            viewport.New(0, 0),
 	}
+	m.chatVP.SetContent("")
 	m.refreshSessions()
 	if len(m.sessions) > 0 {
 		m.selectSession(0)
@@ -146,9 +152,12 @@ func (m *Model) selectSession(idx int) {
 	}
 	m.sessionsCursor = idx
 	m.chatCursor = 0
-	m.chatScrollLine = 0
 	m.chatFollowBottom = true
+	m.chatLastItems = 0
+	m.chatLastWidth = 0
 	m.rebuildAgents()
+	m.rebuildChatContent()
+	m.chatVP.GotoBottom()
 }
 
 func (m *Model) refreshSessions() {
@@ -315,6 +324,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.chatVP.Width = m.chatContentWidth()
+		m.chatVP.Height = m.mainContentHeight()
+		m.rebuildChatContent()
+		if m.chatFollowBottom {
+			m.chatVP.GotoBottom()
+		}
 
 	case tickMsg:
 		m.tickCount++
@@ -346,8 +361,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		// chatFollowBottom alone triggers bottom-clamping in renderChat;
-		// no sentinel needed.
+		// viewport 内容随会话事件/消息增长而重建；跟随底部时自动滚到最新。
+		if s := m.selectedSession(); s != nil {
+			itemsChanged := len(chatItems(s)) != m.chatLastItems
+			widthChanged := m.chatContentWidth() != m.chatLastWidth
+			if itemsChanged || widthChanged {
+				wasAtBottom := m.chatVP.AtBottom() || m.chatFollowBottom
+				m.rebuildChatContent()
+				if wasAtBottom {
+					m.chatVP.GotoBottom()
+					m.chatFollowBottom = true
+				}
+			}
+		}
+		if m.chatFollowBottom {
+			m.chatVP.GotoBottom()
+		}
 		// 弹窗打开时刷新动态内容（完整记录面板在末尾时跟随新输出）
 		if m.overlay != overlayNone {
 			m.refreshOverlay()
@@ -375,27 +404,14 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case tea.MouseButtonWheelDown:
 			m.overlayCursor++
 		}
+		m.clampOverlayCursor()
 		return m, nil
 	}
-	// Otherwise wheel scrolls the chat panel (wherever the pointer is).
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		if m.chatFollowBottom {
-			m.chatFollowBottom = false
-			m.chatScrollLine = m.chatBottomLine()
-		}
-		m.chatScrollLine -= 3
-		if m.chatScrollLine < 0 {
-			m.chatScrollLine = 0
-		}
-	case tea.MouseButtonWheelDown:
-		m.chatScrollLine += 3
-		// Re-attach follow-bottom when scrolled past content end.
-		if m.chatScrollLine >= m.chatBottomLine() {
-			m.chatFollowBottom = true
-		}
-	}
-	return m, nil
+	// Otherwise route mouse to the chat viewport.
+	var cmd tea.Cmd
+	m.chatVP, cmd = m.chatVP.Update(msg)
+	m.chatFollowBottom = m.chatVP.AtBottom()
+	return m, cmd
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -451,14 +467,23 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q", "Q":
 		return m, tea.Quit
-	case "1":
-		// already on chat
-	case "2":
+	case "1", "esc":
+		m.overlay = overlayNone
+	case "2", "p":
 		m.togglePlanPopup()
-	case "3":
+	case "3", "a":
 		m.toggleAgentsPopup()
-	case "4":
+	case "4", "l":
 		m.toggleLogPopup()
+	case "m":
+		m.flashMsg("Memory panel: not implemented in TUI")
+	case "g":
+		m.flashMsg("Git Diff: not implemented in TUI")
+	case "s":
+		m.flashMsg("Settings: not implemented in TUI")
+	case "k":
+		m.focus = panelInput
+		m.inputMode = inputNormal
 	case "/":
 		// Focus the input bar empty — for slash commands. Other printable chars
 		// fall through to the default case and seed the buffer directly.
@@ -469,19 +494,19 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		m.showChatDetail()
 	case "j", "down":
-		m.moveChatCursor(1)
+		m.chatItemDown()
 	case "k", "up":
-		m.moveChatCursor(-1)
+		m.chatItemUp()
 	case "pgup":
-		m.scrollChat(-5)
+		m.chatVP.HalfViewUp()
+		m.chatFollowBottom = m.chatVP.AtBottom()
 	case "pgdown":
-		m.scrollChat(5)
-	case "g":
-		m.moveChatCursor(-99999)
-	case "G":
-		m.moveChatCursor(99999)
-	case "tab":
-		m.agentPanelVisible = !m.agentPanelVisible
+		m.chatVP.HalfViewDown()
+		m.chatFollowBottom = m.chatVP.AtBottom()
+	case "home":
+		m.chatGotoTop()
+	case "end":
+		m.chatGotoBottom()
 	default:
 		// Any printable rune jumps to input mode and seeds the buffer.
 		if len(msg.Runes) > 0 && unicode.IsPrint(msg.Runes[0]) {
@@ -494,97 +519,119 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// scrollChat 按行数滚动对话区（PgUp/PgDn 用）。
-func (m *Model) scrollChat(delta int) {
-	s := m.selectedSession()
-	if s == nil {
-		return
-	}
-	items := chatItems(s)
-	totalLines := 0
-	for _, item := range items {
-		totalLines += 1 + len(displayDetailLines(item.title, item.detail))
-	}
-	viewportH := m.height - 8
-	if viewportH < 1 {
-		viewportH = 1
-	}
-	m.chatScrollLine += delta
-	maxScroll := totalLines - viewportH
-	if maxScroll < 0 {
-		maxScroll = 0
-	}
-	if m.chatScrollLine < 0 {
-		m.chatScrollLine = 0
-	}
-	if m.chatScrollLine > maxScroll {
-		m.chatScrollLine = maxScroll
-		m.chatFollowBottom = true
-	} else {
-		m.chatFollowBottom = false
-	}
-}
-
-func (m *Model) moveChatCursor(delta int) {
-	s := m.selectedSession()
-	if s == nil {
-		return
-	}
-	items := chatItems(s)
-	if len(items) == 0 {
-		return
-	}
-	// Compute item start lines (same as renderChat viewport calc).
-	itemStartLine := make([]int, len(items))
-	totalLines := 0
-	for i, item := range items {
-		itemStartLine[i] = totalLines
-		totalLines += 1 + len(displayDetailLines(item.title, item.detail))
-	}
-	// Find current item from chatScrollLine (or chatCursor if not scrolled).
-	curItem := m.chatCursor
-	if m.chatScrollLine > 0 {
-		for i := len(items) - 1; i >= 0; i-- {
-			if itemStartLine[i] <= m.chatScrollLine {
-				curItem = i
-				break
-			}
-		}
-	}
-	newItem := clamp(curItem+delta, 0, len(items)-1)
-	m.chatCursor = newItem
-	m.chatScrollLine = itemStartLine[newItem]
-	if delta < 0 {
-		m.chatFollowBottom = false
-	}
-	if m.chatCursor >= len(items)-1 {
-		m.chatFollowBottom = true
-	}
-}
-
-// chatBottomLine returns the scrollLine that places the last content line at
-// the bottom of the chat viewport. Used by mouse-wheel to transition out of
-// follow-bottom mode without jumping.
-func (m *Model) chatBottomLine() int {
-	s := m.selectedSession()
-	if s == nil {
+// chatCurrentItem 返回当前 viewport 顶部对应的 chatItem 索引。
+func (m *Model) chatCurrentItem() int {
+	if len(m.chatItemOffsets) == 0 {
 		return 0
 	}
-	items := chatItems(s)
-	totalLines := 0
-	for _, item := range items {
-		totalLines += 1 + len(displayDetailLines(item.title, item.detail))
+	offset := m.chatVP.YOffset
+	idx := 0
+	for i := len(m.chatItemOffsets) - 1; i >= 0; i-- {
+		if m.chatItemOffsets[i] <= offset {
+			idx = i
+			break
+		}
 	}
-	contentH := m.height - 8 // topH(3)+inputH(4)+tabsH(1)
-	viewportH := contentH - 2
-	if viewportH < 1 {
-		viewportH = 1
+	return idx
+}
+
+// chatScrollToItem 滚动到指定 item 顶部，并更新 followBottom 状态。
+func (m *Model) chatScrollToItem(idx int) {
+	s := m.selectedSession()
+	if s == nil || len(m.chatItemOffsets) == 0 {
+		return
 	}
-	bottom := totalLines - viewportH
-	if bottom < 0 {
-		bottom = 0
+	idx = clamp(idx, 0, len(m.chatItemOffsets)-1)
+	m.chatVP.SetYOffset(m.chatItemOffsets[idx])
+	m.chatFollowBottom = idx == len(m.chatItemOffsets)-1
+}
+
+func (m *Model) chatItemUp()   { m.chatScrollToItem(m.chatCurrentItem() - 1) }
+func (m *Model) chatItemDown() { m.chatScrollToItem(m.chatCurrentItem() + 1) }
+
+func (m *Model) chatGotoTop() {
+	m.chatScrollToItem(0)
+}
+
+func (m *Model) chatGotoBottom() {
+	n := len(m.chatItemOffsets)
+	if n == 0 {
+		return
 	}
-	return bottom
+	m.chatScrollToItem(n - 1)
+	m.chatVP.GotoBottom()
+}
+
+// rebuildChatContent 根据当前窗口尺寸把当前会话内容渲染成带样式的字符串，
+// 并同步到 viewport。ScrollToBottom 由调用方按需执行。
+func (m *Model) rebuildChatContent() {
+	s := m.selectedSession()
+	if s == nil {
+		m.chatVP.SetContent("")
+		m.chatLastItems = 0
+		return
+	}
+	w := m.chatContentWidth()
+	if w < 4 {
+		w = 4
+	}
+	content := m.buildChatContent(w)
+	m.chatVP.SetContent(content)
+	m.chatLastItems = len(chatItems(s))
+	m.chatLastWidth = w
+}
+
+// rightPanelVisible 返回是否显示右侧计划/Agent 分栏。
+// 仅在有活动会话且终端宽度充足时显示。
+func (m *Model) rightPanelVisible() bool {
+	return m.selectedSession() != nil && m.width >= 100
+}
+
+// chatAreaWidth 返回左侧对话区总宽度（含滚动条与间隔）。
+func (m *Model) chatAreaWidth() int {
+	if !m.rightPanelVisible() {
+		return m.width
+	}
+	w := m.width * 65 / 100
+	if w < 50 {
+		w = 50
+	}
+	return w
+}
+
+// rightPanelWidth 返回右侧面板可用宽度。
+func (m *Model) rightPanelWidth() int {
+	return m.width - m.chatAreaWidth()
+}
+
+// chatContentWidth 返回 viewport 内文本可用宽度（已扣除滚动条与间隔）。
+func (m *Model) chatContentWidth() int {
+	const scrollbarW = 1
+	gap := 1
+	w := m.chatAreaWidth() - scrollbarW - gap
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
+
+// mainContentHeight 返回中间主内容区高度（已扣除顶栏、输入栏、底部快捷键栏、弹窗占位）。
+func (m *Model) mainContentHeight() int {
+	topH := 1
+	inputH := 3
+	shortcutH := 1
+	overlayH := 0
+	if m.overlay != overlayNone {
+		overlayH = m.height / 3
+		if overlayH < 6 {
+			overlayH = 6
+		}
+	}
+	h := m.height - topH - inputH - shortcutH - overlayH
+	if h < 4 {
+		h = 4
+	}
+	return h
 }
 
 func (m *Model) handleOverlayEnter() {

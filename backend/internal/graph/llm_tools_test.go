@@ -2,6 +2,9 @@ package graph
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -40,8 +43,8 @@ func TestExecuteWithToolsMockPathRecordsTokens(t *testing.T) {
 	resp, results := executeWithTools(
 		context.Background(), nil, llm, nil, roleDef, "做某事", state, "", nil, "助手[t]", 0, tracker,
 	)
-	if resp != "hello world" {
-		t.Fatalf("响应应为 hello world，got %s", resp)
+	if resp == nil || resp.SummaryForUser != "hello world" {
+		t.Fatalf("响应应为 hello world，got %v", resp)
 	}
 	if len(results) != 0 {
 		t.Fatalf("mock 路径不应产生工具结果，got %d", len(results))
@@ -85,7 +88,157 @@ func TestExecuteWithToolsMockPathNilTracker(t *testing.T) {
 	resp, _ := executeWithTools(
 		context.Background(), nil, llm, nil, roleDef, "做某事", state, "", nil, "助手[t]", 0, nil,
 	)
-	if resp != "ok" {
-		t.Fatalf("响应应为 ok，got %s", resp)
+	if resp == nil || resp.SummaryForUser != "ok" {
+		t.Fatalf("响应应为 ok，got %v", resp)
 	}
+}
+
+// TestExecuteWithToolsMockPathEmitsTokenUsage 验证 P0-4：mock 路径会推送带 in/out 数值的
+// token_usage 事件，且 message 格式可被后端 parseTokenUsage 解析出非零 token。
+func TestExecuteWithToolsMockPathEmitsTokenUsage(t *testing.T) {
+	llm := &fakeLLMClient{resp: "hello world"}
+	roleDef := &types.RoleDefinition{ID: "x", Name: "t", SystemPrompt: "sp"}
+	state := types.NewThreeLayerState("s1")
+
+	var mu sync.Mutex
+	var events []ProgressEvent
+	progress := ProgressCallback(func(ctx context.Context, ev ProgressEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	})
+
+	executeWithTools(
+		context.Background(), nil, llm, nil, roleDef, "做某事", state, "", progress, "助手[t]", 0, nil,
+	)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var tokenUsage *ProgressEvent
+	for i := range events {
+		if events[i].Kind == "token_usage" {
+			tokenUsage = &events[i]
+			break
+		}
+	}
+	if tokenUsage == nil {
+		t.Fatalf("未找到 token_usage 事件，got events: %+v", events)
+	}
+	if !strings.Contains(tokenUsage.Message, "in=") || !strings.Contains(tokenUsage.Message, "out=") {
+		t.Fatalf("token_usage 事件 message 应包含 in=/out=，got: %s", tokenUsage.Message)
+	}
+	inStr := extractIntFromMessage(tokenUsage.Message, "in=")
+	outStr := extractIntFromMessage(tokenUsage.Message, "out=")
+	if inStr <= 0 {
+		t.Fatalf("输入 token 应大于 0，got %d (message: %s)", inStr, tokenUsage.Message)
+	}
+	if outStr <= 0 {
+		t.Fatalf("输出 token 应大于 0，got %d (message: %s)", outStr, tokenUsage.Message)
+	}
+}
+
+// TestExecuteWithToolsMockPathEmptyResponseStillNonZeroTokens 验证 P0-4：mock 路径返回空
+// response 时，token_usage 事件的 input/output token 仍大于 0（用占位符兜底）。
+func TestExecuteWithToolsMockPathEmptyResponseStillNonZeroTokens(t *testing.T) {
+	llm := &fakeLLMClient{resp: ""}
+	roleDef := &types.RoleDefinition{ID: "x", Name: "t", SystemPrompt: "sp"}
+	state := types.NewThreeLayerState("s1")
+
+	var mu sync.Mutex
+	var events []ProgressEvent
+	progress := ProgressCallback(func(ctx context.Context, ev ProgressEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	})
+
+	executeWithTools(
+		context.Background(), nil, llm, nil, roleDef, "做某事", state, "", progress, "助手[t]", 0, nil,
+	)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var tokenUsage *ProgressEvent
+	for i := range events {
+		if events[i].Kind == "token_usage" {
+			tokenUsage = &events[i]
+			break
+		}
+	}
+	if tokenUsage == nil {
+		t.Fatalf("未找到 token_usage 事件")
+	}
+	inTok := extractIntFromMessage(tokenUsage.Message, "in=")
+	outTok := extractIntFromMessage(tokenUsage.Message, "out=")
+	if inTok <= 0 {
+		t.Fatalf("空响应时输入 token 应大于 0，got %d", inTok)
+	}
+	if outTok <= 0 {
+		t.Fatalf("空响应时输出 token 应大于 0（兜底占位符），got %d", outTok)
+	}
+}
+
+// TestExecuteWithToolsMockPathErrorStillNonZeroTokens 验证 P0-4：mock 路径 LLM 调用失败时，
+// token_usage 事件 input/output token 仍大于 0（用错误信息兜底 output）。
+func TestExecuteWithToolsMockPathErrorStillNonZeroTokens(t *testing.T) {
+	llm := &fakeLLMClient{err: fmt.Errorf("connection refused")}
+	roleDef := &types.RoleDefinition{ID: "x", Name: "t", SystemPrompt: "sp"}
+	state := types.NewThreeLayerState("s1")
+
+	var mu sync.Mutex
+	var events []ProgressEvent
+	progress := ProgressCallback(func(ctx context.Context, ev ProgressEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	})
+
+	executeWithTools(
+		context.Background(), nil, llm, nil, roleDef, "做某事", state, "", progress, "助手[t]", 0, nil,
+	)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var tokenUsage *ProgressEvent
+	for i := range events {
+		if events[i].Kind == "token_usage" {
+			tokenUsage = &events[i]
+			break
+		}
+	}
+	if tokenUsage == nil {
+		t.Fatalf("未找到 token_usage 事件")
+	}
+	inTok := extractIntFromMessage(tokenUsage.Message, "in=")
+	outTok := extractIntFromMessage(tokenUsage.Message, "out=")
+	if inTok <= 0 {
+		t.Fatalf("失败时输入 token 应大于 0，got %d", inTok)
+	}
+	if outTok <= 0 {
+		t.Fatalf("失败时输出 token 应大于 0（错误信息兜底），got %d", outTok)
+	}
+}
+
+// extractIntFromMessage 从 message 中解析 marker 后的整数，与 server.parseTokenUsage 逻辑保持一致。
+func extractIntFromMessage(msg, marker string) int {
+	idx := strings.Index(msg, marker)
+	if idx < 0 {
+		return 0
+	}
+	start := idx + len(marker)
+	for start < len(msg) && (msg[start] == ' ' || msg[start] == '\t') {
+		start++
+	}
+	end := start
+	for end < len(msg) && msg[end] >= '0' && msg[end] <= '9' {
+		end++
+	}
+	if start == end {
+		return 0
+	}
+	n, _ := strconv.Atoi(msg[start:end])
+	return n
 }

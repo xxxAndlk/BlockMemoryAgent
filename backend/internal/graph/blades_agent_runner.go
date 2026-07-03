@@ -31,7 +31,7 @@ type emitFunc func(ctx context.Context, kind, msg string)
 // provider 为 nil 时（mock 路径，无 API Key）退化为单次 llm.Generate。
 //
 // 参数：见各字段；llmTracker 非 nil 时记录 token 用量（P0-4）。
-// 返回：最终输出文本（含失败标记前缀）与工具结果列表。
+// 返回：结构化 AgentResult（SummaryForUser/MemoryForMeta）与工具结果列表。
 func executeWithTools(
 	ctx context.Context,
 	provider blades.ModelProvider,
@@ -45,7 +45,7 @@ func executeWithTools(
 	agentName string,
 	maxIters int,
 	llmTracker *model.LLMCallTracker,
-) (string, []*ToolResult) {
+) (*types.AgentResult, []*ToolResult) {
 	var allResults []*ToolResult
 	sessionID := sessionIDFromState(state)
 	emit, emitDetail := newEmitters(progress, sessionID, agentName)
@@ -55,7 +55,8 @@ func executeWithTools(
 
 	// mock 路径：无 blades provider，退化为单次 LLM 调用
 	if provider == nil {
-		return executeMockAssistant(ctx, llm, systemPrompt, userMsg, agentName, llmTracker, emit)
+		res, _ := executeMockAssistant(ctx, llm, systemPrompt, userMsg, agentName, llmTracker, emit, emitDetail)
+		return res, nil
 	}
 
 	// 构造内置工具集，结果写回 allResults
@@ -73,7 +74,11 @@ func executeWithTools(
 	)
 	if err != nil {
 		emit(ctx, "error", fmt.Sprintf("创建 blades agent 失败: %v", err))
-		return "", nil
+		return &types.AgentResult{
+			SummaryForUser: "",
+			MemoryForMeta:  fmt.Sprintf("创建 blades agent 失败: %v", err),
+			Error:          err.Error(),
+		}, nil
 	}
 
 	emit(ctx, "llm", fmt.Sprintf("启动 blades agent 执行（最多 %d 轮 function calling）", maxItersResolved))
@@ -86,34 +91,49 @@ func executeWithTools(
 	// 手动迭代 agent.Run：每轮 yield 一个 *Message，借此 hook 每轮 LLM 文本输出推给前端思考链
 	lastMessage, totalUsage, loopErr := runBladesAgentLoop(ctx, agent, invocation, agentName, emit)
 	dur := time.Since(start)
-	emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] blades agent 完成 dur=%v", agentName, dur.Round(time.Millisecond)), "")
 
 	finalText := ""
 	if lastMessage != nil {
 		finalText = lastMessage.Text()
 	}
 
+	var inTok, outTok int
 	if loopErr != nil {
 		// P0-4：循环错误也记录一次（带 err），便于失败可见
-		recordBladesCall(llmTracker, ctx, dur, loopErr, agentName, systemPrompt, userMsg, "",
+		inTok, outTok = recordBladesCall(llmTracker, ctx, dur, loopErr, agentName, systemPrompt, userMsg, "",
 			int(totalUsage.InputTokens), int(totalUsage.OutputTokens))
+		emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", agentName, inTok, outTok, dur.Round(time.Millisecond)), "")
 		emit(ctx, "error", fmt.Sprintf("blades agent 执行失败: %v", loopErr))
+		resultText := ""
 		if len(allResults) > 0 {
-			return fmt.Sprintf("agent 执行失败(已完成%d步工具操作): %v", len(allResults), loopErr), allResults
+			resultText = fmt.Sprintf("agent 执行失败(已完成%d步工具操作): %v", len(allResults), loopErr)
 		}
-		return "", nil
+		return &types.AgentResult{
+			SummaryForUser: resultText,
+			MemoryForMeta:  fmt.Sprintf("blades agent 执行失败: %v", loopErr),
+			Error:          loopErr.Error(),
+		}, allResults
 	}
 
 	// P0-4：成功完成时记录一次 LLM 调用（含累计 token 用量）
-	recordBladesCall(llmTracker, ctx, dur, nil, agentName, systemPrompt, userMsg, finalText,
+	inTok, outTok = recordBladesCall(llmTracker, ctx, dur, nil, agentName, systemPrompt, userMsg, finalText,
 		int(totalUsage.InputTokens), int(totalUsage.OutputTokens))
+	emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", agentName, inTok, outTok, dur.Round(time.Millisecond)), "")
 
 	// 完成门控：任务要求写文件但无成功 WriteFile 记录 → 返回失败标记触发上层重试
 	if taskRequiresWriteFile(task) && !hasWriteFileResult(allResults) {
 		emit(ctx, "error", "任务要求写文件但未通过 WriteFile 落盘")
-		return "[失败: 任务要求写文件但未调用 WriteFile 落盘] " + finalText, allResults
+		failedText := "[失败: 任务要求写文件但未调用 WriteFile 落盘] " + finalText
+		return &types.AgentResult{
+			SummaryForUser: failedText,
+			MemoryForMeta:  "任务要求写文件但未通过 WriteFile 落盘",
+			Error:          "missing WriteFile result",
+		}, allResults
 	}
-	return finalText, allResults
+	return &types.AgentResult{
+		SummaryForUser: finalText,
+		MemoryForMeta:  finalText,
+	}, allResults
 }
 
 // newEmitters 构造 emit / emitDetail 两个进度事件推送闭包。
@@ -170,7 +190,8 @@ func buildAssistantPrompts(roleDef *types.RoleDefinition, skillBrief string, sta
 func executeMockAssistant(
 	ctx context.Context, llm model.LLMClient, systemPrompt, userMsg, agentName string,
 	llmTracker *model.LLMCallTracker, emit emitFunc,
-) (string, []*ToolResult) {
+	emitDetail func(ctx context.Context, kind, msg, detail string),
+) (*types.AgentResult, []*ToolResult) {
 	emit(ctx, "llm", "无 blades provider（mock 模式），单次 LLM 调用")
 	mockPrompt := systemPrompt + "\n\n" + userMsg
 	mockStart := time.Now()
@@ -184,14 +205,24 @@ func executeMockAssistant(
 		resp, err = llm.Generate(ctx, mockPrompt)
 	}
 	mockDur := time.Since(mockStart)
+	var inTok, outTok int
 	if err != nil {
-		recordBladesCall(llmTracker, ctx, mockDur, err, agentName, systemPrompt, userMsg, "", 0, 0)
+		inTok, outTok = recordBladesCall(llmTracker, ctx, mockDur, err, agentName, systemPrompt, userMsg, "", 0, 0)
+		emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", agentName, inTok, outTok, mockDur.Round(time.Millisecond)), "")
 		emit(ctx, "error", fmt.Sprintf("LLM 调用失败: %v", err))
-		return "", nil
+		return &types.AgentResult{
+			SummaryForUser: "",
+			MemoryForMeta:  fmt.Sprintf("LLM 调用失败: %v", err),
+			Error:          err.Error(),
+		}, nil
 	}
-	recordBladesCall(llmTracker, ctx, mockDur, nil, agentName, systemPrompt, userMsg, resp,
+	inTok, outTok = recordBladesCall(llmTracker, ctx, mockDur, nil, agentName, systemPrompt, userMsg, resp,
 		int(usage.InputTokens), int(usage.OutputTokens))
-	return resp, nil
+	emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", agentName, inTok, outTok, mockDur.Round(time.Millisecond)), "")
+	return &types.AgentResult{
+		SummaryForUser: resp,
+		MemoryForMeta:  resp,
+	}, nil
 }
 
 // runBladesAgentLoop 迭代 blades agent.Run 生成器，累加每轮 token 用量（P0-4）。
@@ -220,26 +251,42 @@ func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *bla
 }
 
 // recordBladesCall 记录一次 blades 路径 LLM 调用；real 用量为 0 时回退 EstimateTokens（P0-4）。
+// 返回最终记录/展示用的 input/output token 数（tracker 为 nil 时回退估算值）。
+// 兜底：input/output 均保证至少为 1，避免 token_usage 事件出现全 0 导致面板统计为空。
 func recordBladesCall(tracker *model.LLMCallTracker, ctx context.Context, dur time.Duration, err error,
-	agentName, systemPrompt, userMsg, response string, inReal, outReal int) {
-	if tracker == nil {
-		return
-	}
+	agentName, systemPrompt, userMsg, response string, inReal, outReal int) (inTok, outTok int) {
 	prompt := systemPrompt + "\n\n" + userMsg
-	inTok := inReal
+	inTok = inReal
 	if inTok == 0 {
 		inTok = model.EstimateTokens(prompt)
 	}
-	outTok := outReal
-	if outTok == 0 {
-		outTok = model.EstimateTokens(response)
+	if inTok == 0 && prompt != "" {
+		inTok = 1
 	}
-	tracker.RecordCall(ctx, dur, err, agentName, model.SummarizePrompt(prompt, 500), prompt, response, inTok, outTok, false)
+	outTok = outReal
+	if outTok == 0 {
+		// response 为空时，用错误信息或占位符兜底估算，确保 output token 不为 0
+		fallback := response
+		if fallback == "" && err != nil {
+			fallback = err.Error()
+		}
+		if fallback == "" {
+			fallback = "[no response]"
+		}
+		outTok = model.EstimateTokens(fallback)
+	}
+	if outTok == 0 {
+		outTok = 1
+	}
+	if tracker != nil {
+		tracker.RecordCall(ctx, dur, err, agentName, model.SummarizePrompt(prompt, 500), prompt, response, inTok, outTok, false)
+	}
+	return
 }
 
 // executeAssistantWithTools 助手使用 blades.Agent + 工具执行任务的对外入口。
 // 职责：从 ModelFactory 取模型与 blades provider，设置 5 分钟超时，转调 executeWithTools。
-// 返回：最终文本与工具结果列表；modelFactory 为 nil 或取模型失败时返回空。
+// 返回：结构化 AgentResult 与工具结果列表；modelFactory 为 nil 或取模型失败时返回空。
 func executeAssistantWithTools(
 	ctx context.Context,
 	modelFactory *model.ModelFactory,
@@ -252,13 +299,13 @@ func executeAssistantWithTools(
 	agentName string,
 	maxIters int,
 	llmTracker *model.LLMCallTracker,
-) (string, []*ToolResult) {
+) (*types.AgentResult, []*ToolResult) {
 	if modelFactory == nil {
-		return "", nil
+		return nil, nil
 	}
 	llm, err := modelFactory.GetModel(ctx, roleDef.ID)
 	if err != nil {
-		return "", nil // 取模型失败，静默返回
+		return nil, nil // 取模型失败，静默返回
 	}
 	// 取 blades provider；mock 路径（无 API Key）返回错误，传入 nil 触发退化
 	provider, _ := modelFactory.GetBladesProvider(ctx, roleDef.ID)

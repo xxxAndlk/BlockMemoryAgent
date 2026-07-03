@@ -18,8 +18,6 @@ func (m Model) View() string {
 	return m.singleColumnView()
 }
 
-
-
 // singleColumnView v2.0 主布局：顶部状态栏 + 主对话区 + 计划进度栏 + 输入栏 + 底部标签。
 // 当 agentPanelVisible 为 true 时，主对话区与右侧 Agent 面板分两列显示。
 func (m Model) singleColumnView() string {
@@ -94,20 +92,28 @@ func (m Model) renderTopBar(w int) string {
 }
 
 func (m Model) renderChat(w, h int) string {
-	var lines []string
+	const scrollbarW = 1
+	contentW := w - scrollbarW - 1 // 1 列间隔
+	if contentW < 4 {
+		contentW = w
+	}
 
 	s := m.selectedSession()
 	if s == nil {
-		lines = append(lines, "")
-		lines = append(lines, "  "+m.styles.Dim.Render("No active session."))
-		lines = append(lines, "  "+m.styles.Dim.Render("Type /new <your goal> to start a conversation."))
-		return m.clipChat(strings.Join(lines, "\n"), w, h)
+		lines := []string{
+			"",
+			"  " + m.styles.Dim.Render("No active session."),
+			"  " + m.styles.Dim.Render("Type /new <your goal> to start a conversation."),
+		}
+		content := m.clipChat(strings.Join(lines, "\n"), contentW, h)
+		return lipgloss.JoinHorizontal(lipgloss.Top, content, m.renderScrollbar(w-contentW, h, 0, 0, 0))
 	}
 
 	items := chatItems(s)
 	if len(items) == 0 {
-		lines = append(lines, "  "+m.styles.Dim.Render("(empty — send a message below)"))
-		return m.clipChat(strings.Join(lines, "\n"), w, h)
+		lines := []string{"  " + m.styles.Dim.Render("(empty — send a message below)")}
+		content := m.clipChat(strings.Join(lines, "\n"), contentW, h)
+		return lipgloss.JoinHorizontal(lipgloss.Top, content, m.renderScrollbar(w-contentW, h, 0, 0, 0))
 	}
 
 	viewportH := h
@@ -147,25 +153,25 @@ func (m Model) renderChat(w, h int) string {
 		case strings.HasPrefix(item.title, "> "):
 			// 用户输入：高亮前缀 >
 			style = m.styles.LogUser
-			ls = append(ls, style.Render(truncate(item.title, w-2)))
+			ls = append(ls, style.Render(truncate(item.title, contentW-2)))
 		case strings.HasPrefix(item.title, "[●] "):
 			// 工具调用中：黄色
-			ls = append(ls, m.styles.LogWarn.Render(truncate(item.title, w-2)))
+			ls = append(ls, m.styles.LogWarn.Render(truncate(item.title, contentW-2)))
 		case strings.HasPrefix(item.title, "[✓] "):
 			// 工具调用成功：绿色
-			ls = append(ls, m.styles.LogSuccess.Render(truncate(item.title, w-2)))
+			ls = append(ls, m.styles.LogSuccess.Render(truncate(item.title, contentW-2)))
 		case strings.HasPrefix(item.title, "[✗] "):
 			// 工具调用失败：红色
-			ls = append(ls, m.styles.LogError.Render(truncate(item.title, w-2)))
+			ls = append(ls, m.styles.LogError.Render(truncate(item.title, contentW-2)))
 		case strings.HasPrefix(item.title, "🧠 recalled: "):
 			// 记忆召回：灰色
-			ls = append(ls, m.styles.Dim.Render(truncate(item.title, w-2)))
+			ls = append(ls, m.styles.Dim.Render(truncate(item.title, contentW-2)))
 		case strings.HasPrefix(item.title, "─── ") && strings.HasSuffix(item.title, " ───"):
 			// 话题切换：蓝色/强调色，居中
-			line := truncate(item.title, w-2)
+			line := truncate(item.title, contentW-2)
 			ls = append(ls, m.styles.CallStack.Render(line))
 		case strings.HasPrefix(item.title, "✗ Error"):
-			ls = append(ls, m.styles.LogError.Render(truncate(item.title, w-2)))
+			ls = append(ls, m.styles.LogError.Render(truncate(item.title, contentW-2)))
 		default:
 			// Agent 响应：普通文本（仍做轻量 Markdown 格式化）
 			content := formatMarkdown(item.title)
@@ -173,7 +179,7 @@ func (m Model) renderChat(w, h int) string {
 		}
 		detailLines := displayDetailLines(item.title, item.detail)
 		for _, l := range detailLines {
-			ls = append(ls, "  "+truncate(l, w-4))
+			ls = append(ls, "  "+truncate(l, contentW-4))
 		}
 		rendered[i] = renderedItem{lines: ls}
 	}
@@ -182,6 +188,7 @@ func (m Model) renderChat(w, h int) string {
 		endLine = totalLines
 	}
 
+	var lines []string
 	skip := startLine
 	for i := range rendered {
 		ls := rendered[i].lines
@@ -221,7 +228,53 @@ func (m Model) renderChat(w, h int) string {
 		}
 	}
 
-	return m.clipChat(strings.Join(lines, "\n"), w, h)
+	content := m.clipChat(strings.Join(lines, "\n"), contentW, h)
+	bar := m.renderScrollbar(w-contentW, h, viewportH, totalLines, startLine)
+	return lipgloss.JoinHorizontal(lipgloss.Top, content, bar)
+}
+
+// renderScrollbar 绘制右侧垂直滚动条。
+// w/h 为滚动条区域宽高；viewportH/totalLines/startLine 决定滑块位置与高度。
+func (m Model) renderScrollbar(w, h, viewportH, totalLines, startLine int) string {
+	if h < 1 {
+		return ""
+	}
+	if w < 1 {
+		w = 1
+	}
+	trackStyle := m.styles.ScrollbarTrack
+	thumbStyle := m.styles.ScrollbarThumb
+
+	rows := make([]string, h)
+	for i := range rows {
+		rows[i] = trackStyle.Render("│")
+	}
+
+	if totalLines > viewportH && viewportH > 0 {
+		scrollable := totalLines - viewportH
+		if scrollable < 1 {
+			scrollable = 1
+		}
+		// 滑块高度按视口占比缩放，最小 1 行，最大不超过轨道。
+		thumbH := h * viewportH / totalLines
+		if thumbH < 1 {
+			thumbH = 1
+		}
+		if thumbH > h {
+			thumbH = h
+		}
+		thumbPos := startLine * (h - thumbH) / scrollable
+		if thumbPos < 0 {
+			thumbPos = 0
+		}
+		if thumbPos+thumbH > h {
+			thumbPos = h - thumbH
+		}
+		for i := thumbPos; i < thumbPos+thumbH; i++ {
+			rows[i] = thumbStyle.Render("█")
+		}
+	}
+	return lipgloss.NewStyle().Width(w).Height(h).Render(strings.Join(rows, "\n"))
 }
 
 // clipChat applies a fixed Width/Height style so the borderless chat area

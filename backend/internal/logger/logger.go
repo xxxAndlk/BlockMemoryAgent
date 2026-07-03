@@ -6,6 +6,7 @@ package logger
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"time"
@@ -28,7 +29,13 @@ type Logger struct {
 
 // New 创建默认 Logger，JSON 输出到 stderr；store 可选。
 func New(store LogStore) *Logger {
-	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+	return NewWithWriter(store, os.Stderr)
+}
+
+// NewWithWriter 创建 Logger 并指定 JSON 日志输出目标；store 可选。
+// TUI 入口可用此函数把结构化日志重定向到文件，避免刷到终端顶乱布局。
+func NewWithWriter(store LogStore, w io.Writer) *Logger {
+	h := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})
 	return &Logger{slog: slog.New(h), store: store}

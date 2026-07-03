@@ -48,13 +48,13 @@ func (n *SubDomainAgentNode) createAssistantForTask(ctx context.Context, state *
 //   - def：助手角色定义
 //   - task：任务文本
 //
-// 返回：结果文本；失败则返回 [ERROR] 前缀的描述。
-func (n *SubDomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, def *types.RoleDefinition, task string) string {
+// 返回：结构化 AgentResult；失败则返回带 Error 字段的结果（P0-1）。
+func (n *SubDomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, def *types.RoleDefinition, task string) *types.AgentResult {
 	// 标记助手活跃
 	n.registry.UpdateInstanceStatus(inst.ID, enums.RoleStatusActive)
 
-	var result string // 任务结果
-	var err error     // 执行错误
+	var result *types.AgentResult // 任务结果
+	var err error                 // 执行错误
 
 	// 重试次数与初始退避：默认 3 次 / 100ms，可被 AgentCfg 覆盖（特性2）
 	retryCount := 3
@@ -76,9 +76,16 @@ func (n *SubDomainAgentNode) runAssistant(ctx context.Context, state *types.Thre
 	// 标记助手完成
 	n.registry.UpdateInstanceStatus(inst.ID, enums.RoleStatusDone)
 
-	// 失败则返回错误信息
+	// 失败则返回带 Error 字段的结果
 	if err != nil {
-		return fmt.Sprintf("[ERROR] 助手[%s]执行失败: %v", def.Name, err)
+		return &types.AgentResult{
+			SummaryForUser: fmt.Sprintf("[ERROR] 助手[%s]执行失败: %v", def.Name, err),
+			MemoryForMeta:  fmt.Sprintf("助手[%s]执行失败: %v", def.Name, err),
+			Error:          err.Error(),
+		}
+	}
+	if result == nil {
+		result = &types.AgentResult{}
 	}
 	return result // 返回成功结果
 }
@@ -96,10 +103,10 @@ func (n *SubDomainAgentNode) runAssistant(ctx context.Context, state *types.Thre
 //   - task：任务文本
 //   - state：图全局状态
 //
-// 返回：结果文本与 error。
+// 返回：结构化 AgentResult 与 error（P0-1）。
 //
 // 副作用：可能调用工具/写文件/运行命令（由工具循环内部决定）。
-func (n *SubDomainAgentNode) executeAssistantTask(ctx context.Context, def *types.RoleDefinition, task string, state *types.ThreeLayerState) (string, error) {
+func (n *SubDomainAgentNode) executeAssistantTask(ctx context.Context, def *types.RoleDefinition, task string, state *types.ThreeLayerState) (*types.AgentResult, error) {
 	// SubDomainAgent 当前与父 Domain 共享 Skill 子集（通过父 ID 查），
 	// skillBrief 暂为空串，工具列表由 executeAssistantWithTools 内部默认值提供。
 	// 委托公共执行入口：SubDomainAgent 不启用写文件完成门控（保持原行为）。

@@ -29,15 +29,15 @@ func (n *DomainAgentNode) matchFixedAssistant(task string) *types.RoleDefinition
 //   - inst：本 Domain 实例（作为 Assistant 的父）
 //   - tasks：待处理任务列表
 //
-// 返回：task -> 结果文本 的映射。
+// 返回：task -> AgentResult 的映射（P0-1）。
 //
 // 并发安全：内部用 sync.Mutex 保护 results map；WaitGroup 等待全部完成。
 //
 // 注意：当前 Invoke 走串行路径，此函数保留以备并行场景使用。
-func (n *DomainAgentNode) dispatchAssistantsParallel(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, tasks []string) map[string]string {
-	results := make(map[string]string) // 结果收集
-	var mu sync.Mutex                  // 保护 results 的并发写入
-	var wg sync.WaitGroup              // 等待所有 goroutine 完成
+func (n *DomainAgentNode) dispatchAssistantsParallel(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, tasks []string) map[string]*types.AgentResult {
+	results := make(map[string]*types.AgentResult) // 结果收集
+	var mu sync.Mutex                              // 保护 results 的并发写入
+	var wg sync.WaitGroup                          // 等待所有 goroutine 完成
 
 	for _, task := range tasks {
 		// 为任务创建/匹配 Assistant 实例与角色定义
@@ -45,7 +45,11 @@ func (n *DomainAgentNode) dispatchAssistantsParallel(ctx context.Context, state 
 		if assistantInst == nil {
 			// 创建失败：直接写入错误结果，不进入 goroutine
 			mu.Lock()
-			results[task] = fmt.Sprintf("[ERROR] 无法创建助手处理任务: %s", task)
+			results[task] = &types.AgentResult{
+				SummaryForUser: fmt.Sprintf("[ERROR] 无法创建助手处理任务: %s", task),
+				MemoryForMeta:  fmt.Sprintf("无法创建助手处理任务: %s", task),
+				Error:          fmt.Sprintf("无法创建助手处理任务: %s", task),
+			}
 			mu.Unlock()
 			continue
 		}
@@ -80,21 +84,25 @@ func (n *DomainAgentNode) dispatchAssistantsParallel(ctx context.Context, state 
 //   - inst：本 Domain 实例
 //   - tasks：待处理任务列表
 //
-// 返回：task -> 结果文本 的映射。
+// 返回：task -> AgentResult 的映射（P0-1）。
 //
 // 设计意图：子任务间常有依赖（"启动游戏"依赖"写代码"、"运行 db_check"依赖"写 db_check"），
 // 并行会导致后续任务找不到前置产物而反复 ListDir/ReadFile 空转。
 // 串行虽慢，但 ReAct 循环能读到前置产物，任务成功率显著提升。
-func (n *DomainAgentNode) dispatchAssistantsSerial(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, tasks []string) map[string]string {
+func (n *DomainAgentNode) dispatchAssistantsSerial(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, tasks []string) map[string]*types.AgentResult {
 	// 预分配容量，避免 map 扩容
-	results := make(map[string]string, len(tasks))
+	results := make(map[string]*types.AgentResult, len(tasks))
 	block := state.ActiveBlocks[state.CurrentBlockID]
 	for _, task := range tasks {
 		// 为任务创建/匹配 Assistant
 		assistantInst, assistantDef := n.createAssistantForTask(ctx, state, inst, task)
 		if assistantInst == nil {
 			// 创建失败：写入错误结果
-			results[task] = fmt.Sprintf("[ERROR] 无法创建助手处理任务: %s", task)
+			results[task] = &types.AgentResult{
+				SummaryForUser: fmt.Sprintf("[ERROR] 无法创建助手处理任务: %s", task),
+				MemoryForMeta:  fmt.Sprintf("无法创建助手处理任务: %s", task),
+				Error:          fmt.Sprintf("无法创建助手处理任务: %s", task),
+			}
 			continue
 		}
 		// 串行执行：上一个完成后再跑下一个，确保依赖产物可见

@@ -35,10 +35,12 @@ func (n *MetaAgentNode) ensureBlockArchived(ctx context.Context, state *types.Th
 
 // collectBlockResult 收集block结果到session summary。
 //
-// 职责：把块的领域名与各任务结果拼成段落，追加到 SessionSummary。
+// 职责（P0-1）：
+//   - 把块返回的 AgentResult.SummaryForUser 拼成段落，追加到 SessionSummary（给用户看的总结）。
+//   - 把 AgentResult.MemoryForMeta 与 Facts 以 MetaMemoryEntry 形式追加到 state.MetaMemory（调度记忆）。
 //
 // 参数：
-//   - state：图全局状态（原地修改 SessionSummary）
+//   - state：图全局状态（原地修改 SessionSummary / MetaMemory）
 //   - block：当前会话块
 //
 // 副作用：在 SessionSummary 末尾追加段落（用换行分隔）。
@@ -48,7 +50,34 @@ func (n *MetaAgentNode) collectBlockResult(state *types.ThreeLayerState, block *
 	if block.Domain != "" {
 		parts = append(parts, fmt.Sprintf("【%s】", block.Domain))
 	}
-	// 拼接各任务结果
+
+	// P0-1：优先使用块级 AgentResult
+	if block.Result != nil {
+		if block.Result.SummaryForUser != "" {
+			parts = append(parts, block.Result.SummaryForUser)
+		}
+		if block.Result.MemoryForMeta != "" {
+			state.MetaMemory = append(state.MetaMemory, types.MetaMemoryEntry{
+				Timestamp: time.Now(),
+				Source:    block.ID,
+				Content:   block.Result.MemoryForMeta,
+				Tags:      []string{"summary"},
+			})
+		}
+		for _, fact := range block.Result.Facts {
+			if strings.TrimSpace(fact) == "" {
+				continue
+			}
+			state.MetaMemory = append(state.MetaMemory, types.MetaMemoryEntry{
+				Timestamp: time.Now(),
+				Source:    block.ID,
+				Content:   fact,
+				Tags:      []string{"fact"},
+			})
+		}
+	}
+
+	// 兼容旧路径：拼接各任务结果
 	for task, result := range block.TaskResults {
 		// 跳过空结果
 		if result != "" {

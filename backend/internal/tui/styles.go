@@ -4,22 +4,28 @@ import "github.com/charmbracelet/lipgloss"
 
 // Colors — Tokyo Night palette.
 const (
-	cTitle     = "#7AA2F7"
-	cFocus     = "#7AA2F7"
-	cBlur      = "#414868"
-	cMeta      = "#F7768E"
-	cDomain    = "#E0AF68"
-	cSub       = "#7AA2F7"
-	cAssist    = "#9ECE6A"
-	cActive    = "#9ECE6A"
-	cDone      = "#565F89"
-	cWarn      = "#E0AF68"
-	cError     = "#F7768E"
-	cInfo      = "#A9B1D6"
-	cValue     = "#C0CAF5"
-	cHelpBg    = "#1F2335"
-	cHeader    = "#BB9AF7"
-	cOverlayBg = "#24283B"
+	cTitle      = "#7AA2F7"
+	cFocus      = "#7AA2F7"
+	cBlur       = "#414868"
+	cMeta       = "#F7768E"
+	cDomain     = "#E0AF68"
+	cSub        = "#7AA2F7"
+	cAssist     = "#9ECE6A"
+	cActive     = "#9ECE6A"
+	cDone       = "#565F89"
+	cWarn       = "#E0AF68"
+	cError      = "#F7768E"
+	cInfo       = "#A9B1D6"
+	cValue      = "#C0CAF5"
+	cHelpBg     = "#1F2335"
+	cHeader     = "#BB9AF7"
+	cOverlayBg  = "#24283B"
+	cPanelBg    = "#16161E"
+	cTopBarBg   = "#1A1B26"
+	cStatusRun  = "#9ECE6A"
+	cStatusIdle = "#565F89"
+	cStatusWait = "#E0AF68"
+	cStatusErr  = "#F7768E"
 )
 
 // Styles holds all lipgloss styles used by the TUI.
@@ -48,12 +54,33 @@ type Styles struct {
 	SessionSum   lipgloss.Style
 	StepNode     lipgloss.Style
 	Overlay      lipgloss.Style
-	InputPrompt  lipgloss.Style
-	InputText    lipgloss.Style
-	Dim          lipgloss.Style
-	Badge        lipgloss.Style
-	BadgeWarn    lipgloss.Style
-	BadgeOk      lipgloss.Style
+	InputPrompt    lipgloss.Style
+	InputText      lipgloss.Style
+	Dim            lipgloss.Style
+	Badge          lipgloss.Style
+	BadgeWarn      lipgloss.Style
+	BadgeOk        lipgloss.Style
+	ScrollbarTrack lipgloss.Style
+	ScrollbarThumb lipgloss.Style
+
+	// v2.5 新布局样式
+	TopBar         lipgloss.Style
+	TopBarLabel    lipgloss.Style
+	TopBarValue    lipgloss.Style
+	TopBarStatus   lipgloss.Style
+	TopBarSep      lipgloss.Style
+	WelcomeTitle   lipgloss.Style
+	WelcomeSub     lipgloss.Style
+	WelcomeBox     lipgloss.Style
+	WelcomeLabel   lipgloss.Style
+	WelcomeValue   lipgloss.Style
+	WelcomeExample lipgloss.Style
+	PanelHeader    lipgloss.Style
+	PanelBox       lipgloss.Style
+	ShortcutKey    lipgloss.Style
+	ShortcutLabel  lipgloss.Style
+	ShortcutBar    lipgloss.Style
+	InputHint      lipgloss.Style
 }
 
 // NewStyles constructs the default style set.
@@ -87,8 +114,29 @@ func NewStyles() *Styles {
 		InputPrompt:  lipgloss.NewStyle().Foreground(lipgloss.Color(cActive)).Bold(true),
 		InputText:    lipgloss.NewStyle().Foreground(lipgloss.Color(cValue)),
 		Dim:          lipgloss.NewStyle().Foreground(lipgloss.Color(cDone)),
-		Badge:        lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cValue)).Padding(0, 1),
-		BadgeWarn:    lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cWarn)).Padding(0, 1),
-		BadgeOk:      lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cActive)).Padding(0, 1),
+		Badge:          lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cValue)).Padding(0, 1),
+		BadgeWarn:      lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cWarn)).Padding(0, 1),
+		BadgeOk:        lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cActive)).Padding(0, 1),
+		ScrollbarTrack: lipgloss.NewStyle().Foreground(lipgloss.Color(cBlur)),
+		ScrollbarThumb: lipgloss.NewStyle().Foreground(lipgloss.Color(cFocus)),
+
+		// v2.5 新布局样式
+		TopBar:         lipgloss.NewStyle().Background(lipgloss.Color(cTopBarBg)).Foreground(lipgloss.Color(cInfo)),
+		TopBarLabel:    lipgloss.NewStyle().Foreground(lipgloss.Color(cDone)),
+		TopBarValue:    lipgloss.NewStyle().Foreground(lipgloss.Color(cValue)),
+		TopBarStatus:   lipgloss.NewStyle().Foreground(lipgloss.Color(cStatusRun)),
+		TopBarSep:      lipgloss.NewStyle().Foreground(lipgloss.Color(cBlur)),
+		WelcomeTitle:   lipgloss.NewStyle().Foreground(lipgloss.Color(cTitle)).Bold(true),
+		WelcomeSub:     lipgloss.NewStyle().Foreground(lipgloss.Color(cInfo)),
+		WelcomeBox:     lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(cBlur)).Padding(1, 2),
+		WelcomeLabel:   lipgloss.NewStyle().Foreground(lipgloss.Color(cDone)),
+		WelcomeValue:   lipgloss.NewStyle().Foreground(lipgloss.Color(cValue)),
+		WelcomeExample: lipgloss.NewStyle().Foreground(lipgloss.Color(cSub)),
+		PanelHeader:    lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cValue)).Bold(true).Padding(0, 1),
+		PanelBox:       lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(cBlur)).Padding(0, 1),
+		ShortcutKey:    lipgloss.NewStyle().Foreground(lipgloss.Color(cTitle)).Bold(true),
+		ShortcutLabel:  lipgloss.NewStyle().Foreground(lipgloss.Color(cInfo)),
+		ShortcutBar:    lipgloss.NewStyle().Background(lipgloss.Color(cTopBarBg)).Foreground(lipgloss.Color(cInfo)).Padding(0, 1),
+		InputHint:      lipgloss.NewStyle().Foreground(lipgloss.Color(cDone)),
 	}
 }

@@ -42,11 +42,9 @@ func (n *MetaAgentNode) handleInitial(ctx context.Context, state *types.ThreeLay
 	}
 
 	switch decision.Path {
-	case RouteDirectTool:
-		// 0 层：MetaAgent 自跑工具循环（含 0 工具的纯 QA）
-		return n.executeDirect(ctx, state, n.metaDirectRoleDef(), state.DomainGoal)
-	case RouteDirectAssistant:
-		// 1 层：MetaAgent 建助手 + 跑工具循环
+	case RouteDirectTool, RouteDirectAssistant:
+		// 0-1 层：MetaAgent 不直接执行工具，而是创建 Assistant 代为执行（P0-1）。
+		// RouteDirectTool 原意为"简单工具请求"，同样走助手路径，避免 MetaAgent 直接调用工具。
 		return n.executeDirectAssistant(ctx, state)
 	default:
 		// RouteCreateDomain / RouteMultiDomain / RouteFullFourLayer：走领域拆分

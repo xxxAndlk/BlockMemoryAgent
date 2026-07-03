@@ -83,7 +83,7 @@ func (w *dailyWriter) Close() error {
 
 // 全局实例：Init 调用后持有，供 Close 时使用。
 var (
-	globalMu     sync.Mutex
+	globalMu     sync.RWMutex
 	globalWriter *dailyWriter
 )
 
@@ -149,4 +149,12 @@ func Close() error {
 	err := globalWriter.Close()
 	globalWriter = nil
 	return err
+}
+
+// Writer 返回当前全局 writer，供其他日志组件（如结构化 logger）复用同一文件。
+// 未调用 Init 时返回 nil。
+func Writer() io.Writer {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	return globalWriter
 }

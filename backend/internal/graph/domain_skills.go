@@ -104,6 +104,32 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 	}
 }
 
+// buildBlockResult 根据本块所有子任务结果与归档记忆，生成本块返回给 MetaAgent 的 AgentResult（P0-1）。
+func buildBlockResult(domain string, block *types.SessionBlock, summaries, memories []string) *types.AgentResult {
+	if block == nil {
+		return &types.AgentResult{}
+	}
+	summaryText := fmt.Sprintf("领域[%s]完成", domain)
+	if len(summaries) > 0 {
+		summaryText += ": " + strings.Join(summaries, "; ")
+	}
+	memoryText := fmt.Sprintf("领域 %s 完成，目标: %s", domain, block.Goal)
+	if len(memories) > 0 {
+		memoryText += "。关键记忆: " + strings.Join(memories, "; ")
+	}
+	var facts []string
+	for _, entry := range block.MetaMemory {
+		if entry.HasTag("fact") {
+			facts = append(facts, entry.Content)
+		}
+	}
+	return &types.AgentResult{
+		SummaryForUser: summaryText,
+		MemoryForMeta:  memoryText,
+		Facts:          facts,
+	}
+}
+
 // collectBlockFacts 从 SessionBlock 中提取 domain / task 级 facts。
 // 规则：领域名作为 domain 级 fact；每个 TaskResult 作为 task 级 fact。
 func collectBlockFacts(domain string, block *types.SessionBlock) []BlockMemoryFact {

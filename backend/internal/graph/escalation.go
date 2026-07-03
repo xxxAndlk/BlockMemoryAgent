@@ -7,6 +7,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -52,7 +53,7 @@ func (n *EscalationHandlerNode) Name() string {
 // 副作用：向 state.ActiveBlocks[CurrentBlockID].Events 追加一条 EventEscalation。
 func (n *EscalationHandlerNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	// 调试日志：会话 + 升级原因
-	fmt.Printf("[ESCALATION] Session: %s, Reason: %s\n", state.SessionID, state.Reason)
+	log.Printf("[ESCALATION] Session: %s, Reason: %s", state.SessionID, state.Reason)
 
 	// 生成仲裁摘要
 	// 当前实现极简：直接拼接 Reason；后续可扩展为 LLM 仲裁

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
@@ -362,16 +363,45 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	// 串行执行：子任务间常有依赖（如"启动游戏"依赖"写代码"），并行会导致后续任务找不到文件。
 	results := n.dispatchAssistantsSerial(ctx, state, inst, pendingTasks)
 
-	// 10. 合并结果到 block.TaskResults
+	// 10. 合并结果到 block.TaskResults 与 block.MetaMemory（P0-1）
 	if block.TaskResults == nil {
 		block.TaskResults = make(map[string]string)
 	}
+	var combinedSummary []string
+	var combinedMemory []string
 	for task, result := range results {
-		// 逐条写入块结果
-		block.TaskResults[task] = result
+		if result == nil {
+			continue
+		}
+		// SummaryForUser 写入块结果（兼容旧路径）
+		block.TaskResults[task] = result.SummaryForUser
+		combinedSummary = append(combinedSummary, fmt.Sprintf("%s: %s", task, result.SummaryForUser))
+		// MemoryForMeta 归档到块记忆
+		if result.MemoryForMeta != "" {
+			block.MetaMemory = append(block.MetaMemory, types.MetaMemoryEntry{
+				Timestamp: time.Now(),
+				Source:    n.instID,
+				Content:   result.MemoryForMeta,
+				Tags:      []string{"summary"},
+			})
+			combinedMemory = append(combinedMemory, result.MemoryForMeta)
+		}
+		// Facts 归档
+		for _, fact := range result.Facts {
+			if strings.TrimSpace(fact) == "" {
+				continue
+			}
+			block.MetaMemory = append(block.MetaMemory, types.MetaMemoryEntry{
+				Timestamp: time.Now(),
+				Source:    n.instID,
+				Content:   fact,
+				Tags:      []string{"fact"},
+			})
+		}
 	}
 
-	// 11. 汇总结果、标记完成、继续图循环（交回 MetaAgent 决策下一步）
+	// 11. 生成本块 AgentResult 并汇总结果、标记完成、继续图循环（交回 MetaAgent 决策下一步）
+	block.Result = buildBlockResult(inst.Domain, block, combinedSummary, combinedMemory)
 	n.summarizeResults(state) // 汇总写入 state.Reason
 	if log := n.sessionLogger(ctx); log != nil {
 		log.Event(ctx, "result", fmt.Sprintf("domain=%s summary=%s", state.CurrentDomain, truncateString(state.Reason, 200)), map[string]any{

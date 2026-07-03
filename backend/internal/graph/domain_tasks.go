@@ -3,6 +3,8 @@ package graph
 import (
 	"context"
 	"fmt"
+	"log"
+
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"strings"
 )
@@ -84,7 +86,7 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 		// 超时或失败：推送事件并回退规则
 		if timedOut {
 			n.emit(ctx, "error", "任务拆解 LLM 调用超时，回退到规则")
-			fmt.Printf("[DomainAgent] LLM timeout on task analysis, using rules. %s\n", n.llmTracker.StatsString())
+			log.Printf("[DomainAgent] LLM timeout on task analysis, using rules. %s", n.llmTracker.StatsString())
 		} else if err != nil {
 			n.emitDetail(ctx, "error", "任务拆解 LLM 调用失败: "+err.Error(), "")
 		}

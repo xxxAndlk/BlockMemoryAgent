@@ -95,10 +95,6 @@
   - 抢占中断与队列注入（特性6）
   - 人机对话处理（特性5）
   - DomainAgent 持久化归档（特性4，P1-1 删除后此条作废）
-  - 
----
-
-## 待完成（按优先级分级）
 
 ### P0 — 核心承诺修复，必须先做
 
@@ -120,14 +116,21 @@
   - `llm_tracker.go` → 抽 `tracker_stats.go`(Stats/Report) + `tracker_records.go`(RecordCall/Records)
 - 本轮实现：三个大文件均已按目标拆分（`graph_core/loop/resolve/routes`、`tool_executor core + files/command/http`、`blades_agent_runner/tools_build/completion`），单文件均 ≤407 行；`executeWithTools` 抽出 `buildAssistantPrompts`/`executeMockAssistant`/`runBladesAgentLoop`/`recordBladesCall` 内部 helper。`go vet`/`gofmt`（新文件）零告警。
 
-**P0-4. blade 路径 token 计量接入**（测试报告 High 级真实问题）✅ 本轮已完成
-- 现状：`LLMCallTracker.CallWithTimeout` 仅在 `meta_llm.go`/`domain_llm.go`/`subdomain_llm.go` 的 `callLLMAs` 路径调用；`executeWithTools`（`llm_tools.go:200-278`）走 blades `agent.Run` 生成器循环，**无 `llmTracker.RecordCall` 调用**，仅 `emitDetail(ctx, "token_usage", ...)` 推 dur，未记录 input/output tokens。
-- 根因：blades `agent.Run` 不暴露 per-call token usage，`BladesClient.Generate` 也未提取 `resp.Usage`（OpenAI 兼容响应标准字段）。
+**P0-4. blade 路径 token 计量接入**（测试报告 High 级真实问题）✅ 已修复
+- 现状：`LLMCallTracker.CallWithTimeout` 仅在 `meta_llm.go`/`domain_llm.go`/`subdomain_llm.go` 的 `callLLMAs` 路径调用；`executeWithTools`（`blades_agent_runner.go`）走 blades `agent.Run` 生成器循环，**已调用 `llmTracker.RecordCall`**，但 `emitDetail(ctx, "token_usage", ...)` 的 message 仅含 `dur`，**不含 `in=/out=`**，导致 `server.parseTokenUsage` 解析为 0，Web 端 Token 消耗面板 Input/Output/Calls 全零。
+- 根因：
+  - blades `agent.Run` 不暴露 per-call token usage，`BladesClient.GenerateWithUsage` 提取的 `resp.Message.TokenUsage` 也常为 0，原代码未在事件中展示回退后的 `EstimateTokens` 数值。
+  - blade 路径 emit 的 `token_usage` 消息格式为 `"blades agent 完成 dur=..."`，与 `meta_llm.go`/`domain_llm.go` 的 `"Token 消耗: in=N out=M dur=X"` 不一致，`parseTokenUsage` 无法提取。
 - 修复：
-  - `BladesClient.Generate` / `GenerateWithSystem` / `GenerateWithOptions` 提取 `resp.Message` 或 `resp.Usage` 的 token 字段
-  - `executeWithTools` 在每轮 `agent.Run` yield 后或结束时调 `llmTracker.RecordCall`
-  - Web 端 Token 消耗面板的 Input/Output/Calls 字段才能填充（当前全零）
-- 本轮实现：新增可选接口 `UsageAware` + `BladesClient.GenerateWithUsage`（不改 `LLMClient` 签名）；`executeWithTools`/`executeAssistantWithTools` 增加 `llmTracker` 参数，`agent.Run` 循环累加每轮 `m.TokenUsage` 后调一次 `RecordCall`（成功/错误/mock/回退四路径均记录，real 用量为 0 时回退 `EstimateTokens`）；4 个 node 调用点补传 `n.llmTracker`。`llm_tools_test.go` 覆盖 mock 路径计量。
+  - `recordBladesCall` 改为返回最终采用的 `input/output tokens`（real 为 0 时回退 `EstimateTokens`，tracker 为 nil 时仍返回估算值）。
+  - `executeWithTools` 在成功/错误两条路径 emit `token_usage` 时统一使用 `"[agent] Token 消耗: in=N out=M dur=X"` 格式。
+  - `executeMockAssistant` 在 mock 路径同样 emit 带 `in=/out=` 的 `token_usage` 事件（此前 mock 分支直接 return，未触发外层统一 emit）。
+  - 新增 `TestExecuteWithToolsMockPathEmitsTokenUsage` 验证事件格式与数值非零；新增 `TestParseTokenUsage` 验证后端解析逻辑兼容 blade 路径消息。
+- 本轮加固（防数值为 0）：
+  - `recordBladesCall` 增加双重兜底：input 在 `EstimateTokens(prompt)` 为 0 时置 1；output 在 response 为空时用 `err.Error()` 或 `"[no response]"` 估算，仍 0 则置 1。确保任何情况下 token_usage 事件不会出现 `in=0 out=0`。
+  - `agent_common.go` 工具循环回退到普通 LLM 的路径：原先只写 tracker 不推事件，现同步 emit `token_usage` 事件，并保证 in/out ≥ 1。
+  - 新增单测 `TestExecuteWithToolsMockPathEmptyResponseStillNonZeroTokens` / `TestExecuteWithToolsMockPathErrorStillNonZeroTokens` 覆盖空响应与错误场景的 token 非零。
+- 验证：`go test ./...` 通过，`go vet ./...` 通过，`gofmt` 已格式化。
 
 **P0-5. DomainArchive 死代码清理**（P1-1 删除 DomainArchive 召回后的残留）✅ 本轮已完成
 - 现状：P1-1 计划删除 DomainArchive 召回机制（`store/domain_archive.go` + `domain_agent.go` 中 `ensureSkillSet` 归档复用路径），删除后需清理残留：
@@ -165,6 +168,48 @@
   ```
 - 完成开发后需有详细测试模块：模拟开发处接口的各种情况进行模型浏览器操作测试、API 调用测试等。
 - 本轮实现：`test/api/*` 全部为可运行 HTTP 断言（含本轮新增 `session_error_test.go` 覆盖 404/空 body/不存在会话错误路径）；`test/coding/*` 三个场景（贪吃蛇/CSS 重构/bug 修复）用 mock LLM 驱动会话走通完整 graph+memory 栈，断言会话到达终态 + goal 到达 LLM（共享 `helpers_test.go`）；mock LLM 增强 `RegisterSequence`（确定性多轮工具调用）+ `RequestPrompts`（prompt 内容断言）；修复 `tui_keystream_test` 的 `Graph.Registry()`/`DAGHandler`/`Update` 类型断言（新增 `Registry()` accessor 与 `Deps.DAGHandler`）。`go vet -tags integration ./...` 零告警，三套件均实测通过。
+---
+
+## 待完成（按优先级分级）
+
+**P0-1. 记忆层优化** ✅ 本轮已完成
+
+- **目标**：取消 MetaAgent 直接调用工具的能力，所有"做事"需求通过助手/领域 Agent 完成；MetaAgent 只维护轻量级调度记忆，不记录繁琐上下文，同时保证记忆完整性不会导致调度失忆。
+
+- **实现要点**：
+  - 新增 `backend/pkg/types/agent_result.go`：`AgentResult`（SummaryForUser / MemoryForMeta / Facts / ToolResults / Error）与 `MetaMemoryEntry`（Timestamp / Source / Content / Tags）。
+  - 扩展 `pkg/types/role.go`：`SessionBlock.MetaMemory []MetaMemoryEntry`、`SessionBlock.Result`、`ThreeLayerState.MetaMemory`；移除已弃用的 `CallResponse`。
+
+- **Agent 返回与记忆组合**：
+  - `graph/agent_common.go`：`CommonExecuteAssistantTask` 返回 `(*AgentResult, error)`。
+  - `graph/assistant.go`：`executeTask` / `Invoke` 写入 `AgentResult` 与块级 `MetaMemory`。
+  - `graph/domain_agent.go`、`domain_assistant.go`、`domain_utils.go`、`domain_skills.go`：领域执行链路返回 `AgentResult`。
+  - `graph/subdomain_agent.go`、`subdomain_tasks.go`、`subdomain_utils.go`：子领域执行链路返回 `AgentResult`。
+  - `graph/meta_archive.go`：`collectBlockResult` 把 `AgentResult` 聚合进 `state.SessionSummary` 与 `state.MetaMemory`。
+
+- **MetaAgent 移除直接工具路径**：
+  - `graph/meta_handle.go`：`RouteDirectTool` / `RouteDirectAssistant` 统一走 `executeDirectAssistant`（创建 Assistant 执行）。
+  - `graph/meta_utils.go`：删除 `metaDirectRoleDef` 与自跑工具逻辑；`executeDirect` 改走 `CommonExecuteAssistantTask`。
+  - `graph/meta_utils.go`：`loadHistorySection` 注入历史 `MetaMemory`。
+
+- **持久化**：
+  - `migrations/006_session_history_meta_memory.sql` 新增 `meta_memory` JSONB 列。
+  - `backend/internal/store/postgres.go`：`SessionHistoryRecord` 读写 `MetaMemory`。
+  - `backend/internal/server/session.go`：`persistHistory` / 恢复路径适配。
+  - `backend/internal/testserver/testserver.go` 与 `backend/cmd/tui/main.go` 历史适配器同步更新。
+- **测试**：`backend/internal/graph/agent_common_test.go`、`llm_tools_test.go` 已更新；`go test ./...`、`go vet ./...`、`go build ./...` 通过。
+
+**P2-3. TUI 页面优化：工具输出默认折叠** ✅ 已完成
+- 目标：减少 TUI 主对话区中低价值工具输出的视觉噪声。
+- 默认隐藏 output 的工具（5 个）：`ReadFile`、`SearchInFiles`、`ListDir`、`HTTPGet`、`HTTPPost`。
+  - 这些工具的 output 只显示工具名和路径（`[✓] ReadFile: path/to/file`），不展开 output 内容。
+  - LLM 已在调用时拿到完整结果，UI 无需重复展示全文。
+- 保留 output 展示的工具（2 个）：`WriteFile`、`RunCommand`。
+  - `WriteFile` 简短确认有价值；`RunCommand` 的 stdout/stderr 是用户最关心的执行结果。
+- 错误处理：所有工具的 `ToolError` 仍默认展示，避免隐藏失败信息。
+- 实现位置：`backend/internal/tui/helpers.go` 的 `eventChatItem`。
+- 实现方式：新增 `verboseTools` 集合；`tool_exec` / `tool_call` 分支中，仅 verbose 工具把 `ToolOutput` 拼入 detail。
+- 验证：新增 `backend/internal/tui/helpers_test.go`：`TestEventChatItemToolOutputCollapsed` 覆盖隐藏/保留两类工具与错误展示；`go test ./internal/tui/` 通过。
 
 ### P3 — 远期优化（依赖前置项）
 

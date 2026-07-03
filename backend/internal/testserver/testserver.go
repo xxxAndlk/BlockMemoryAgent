@@ -407,6 +407,7 @@ func (a *pgHistoryAdapter) RecentSessionHistories(ctx context.Context, limit int
 			Goal:        r.Goal,
 			Summary:     r.Summary,
 			ToolResults: r.ToolResults,
+			MetaMemory:  r.MetaMemory,
 			CreatedAt:   r.CreatedAt,
 		})
 	}

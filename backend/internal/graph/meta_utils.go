@@ -52,6 +52,17 @@ func (n *MetaAgentNode) loadHistorySection(ctx context.Context) string {
 			// 输出 "工具 -> 路径" 行
 			b.WriteString(fmt.Sprintf("   - %s -> %s\n", tool, path))
 		}
+		// P0-1：注入历史会话的 MetaAgent 调度记忆（截断 200 字/条）
+		if len(e.MetaMemory) > 0 {
+			b.WriteString("   调度记忆:\n")
+			for _, mem := range e.MetaMemory {
+				content, _ := mem["content"].(string)
+				if content == "" {
+					continue
+				}
+				b.WriteString(fmt.Sprintf("     • %s\n", truncateStr(content, 200)))
+			}
+		}
 	}
 	// 末尾提示：指代类问题优先结合历史
 	b.WriteString("\n当用户提到指代词（在哪/刚才/上次/那个文件）时，请优先结合上述历史作答或检索。\n")
@@ -92,28 +103,8 @@ func (n *MetaAgentNode) loadMessagesSection(state *types.ThreeLayerState) string
 	return b.String()
 }
 
-// metaDirectRoleDef 构造 MetaAgent 直接执行工具时使用的角色定义。
-//
-// ID="meta" 让 ModelFactory.GetModel 命中 MetaAgent 模型配置；SystemPrompt 取 soul 人格
-// （无 soul 则用默认开发助手人格）。executeWithTools 会在此基础上追加环境段与硬性规则。
-func (n *MetaAgentNode) metaDirectRoleDef() *types.RoleDefinition {
-	basePersona := "你是 BlockMemoryAgent，一个基于大语言模型的本地 AI 开发助手。" +
-		"你可以帮助用户：分析代码、操作文件、执行命令、搜索代码、编写程序等。"
-	systemPrompt := basePersona
-	// 注入 soul 人格（无 soul 时 Inject 返回原串）
-	if n.rt != nil && n.rt.Soul != nil {
-		systemPrompt = n.rt.Soul.Inject(basePersona)
-	}
-	return &types.RoleDefinition{
-		ID:           "meta",
-		Name:         "MetaAgent",
-		SystemPrompt: systemPrompt,
-		Description:  "主 Agent 直接执行",
-		Type:         enums.RoleTypeMeta,
-	}
-}
-
-// executeDirect MetaAgent 直接跑工具循环执行任务（RouteDirectTool / RouteDirectAssistant 共用）。
+// executeDirect MetaAgent 通过 Assistant 执行任务（RouteDirectAssistant 路径）。
+// 注意：P0-1 后 MetaAgent 不再直接调用工具，本函数仅作为创建 Assistant 后的统一执行入口。
 //
 // 职责：用给定 roleDef 调 CommonExecuteAssistantTask 跑 blades ReAct 工具循环，
 //
@@ -137,12 +128,16 @@ func (n *MetaAgentNode) executeDirect(ctx context.Context, state *types.ThreeLay
 	// 走公共执行入口：MetaAgent 不启用写文件门控（直接执行不强制重试）
 	result, err := CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt,
 		roleDef, task, state, "", n.progress, "MetaAgent["+roleDef.Name+"]", 0, false, n.llmTracker)
-	if err != nil || result == "" {
+	if err != nil || result == nil || (result.SummaryForUser == "" && result.Error != "") {
 		// 直接执行失败：回退到 RouteCreateDomain 走领域拆分（保底）
 		n.emit(ctx, "error", fmt.Sprintf("直接执行失败，回退到领域拆分: %v", err))
 		return n.handleInitialCreateDomains(ctx, state, false)
 	}
-	state.SessionSummary = result
+	// P0-1：MetaAgent 不直接产出结果，而是把助手返回的 AgentResult 作为本会话结果
+	if result.SummaryForUser == "" && result.MemoryForMeta != "" {
+		result.SummaryForUser = result.MemoryForMeta
+	}
+	state.SessionSummary = result.SummaryForUser
 	state.NextAction = enums.ActionFinish
 	state.Reason = "direct execute by MetaAgent"
 	return state, nil

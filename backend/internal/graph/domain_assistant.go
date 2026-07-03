@@ -46,13 +46,13 @@ func (n *DomainAgentNode) createAssistantForTask(ctx context.Context, state *typ
 //   - def：助手角色定义
 //   - task：任务文本
 //
-// 返回：结果文本；失败则返回 [ERROR] 前缀的描述。
-func (n *DomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, def *types.RoleDefinition, task string) string {
+// 返回：结构化 AgentResult；失败则返回带 Error 字段的结果（P0-1）。
+func (n *DomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, def *types.RoleDefinition, task string) *types.AgentResult {
 	// 标记助手活跃
 	n.registry.UpdateInstanceStatus(inst.ID, enums.RoleStatusActive)
 
-	var result string // 任务结果
-	var err error     // 执行错误
+	var result *types.AgentResult // 任务结果
+	var err error                 // 执行错误
 
 	// 重试次数与初始退避：默认 3 次 / 100ms，可被 AgentCfg 覆盖（特性2）
 	retryCount := 3
@@ -74,9 +74,16 @@ func (n *DomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLa
 	// 标记助手完成
 	n.registry.UpdateInstanceStatus(inst.ID, enums.RoleStatusDone)
 
-	// 失败则返回错误信息
+	// 失败则返回带 Error 字段的结果
 	if err != nil {
-		return fmt.Sprintf("[ERROR] 助手[%s]执行失败: %v", def.Name, err)
+		return &types.AgentResult{
+			SummaryForUser: fmt.Sprintf("[ERROR] 助手[%s]执行失败: %v", def.Name, err),
+			MemoryForMeta:  fmt.Sprintf("助手[%s]执行失败: %v", def.Name, err),
+			Error:          err.Error(),
+		}
+	}
+	if result == nil {
+		result = &types.AgentResult{}
 	}
 	return result // 返回成功结果
 }
@@ -95,10 +102,10 @@ func (n *DomainAgentNode) runAssistant(ctx context.Context, state *types.ThreeLa
 //   - task：任务文本
 //   - state：图全局状态
 //
-// 返回：结果文本与 error。
+// 返回：结构化 AgentResult 与 error（P0-1）。
 //
 // 副作用：可能调用工具/写文件/运行命令（由工具循环内部决定）。
-func (n *DomainAgentNode) executeAssistantTask(ctx context.Context, def *types.RoleDefinition, task string, state *types.ThreeLayerState) (string, error) {
+func (n *DomainAgentNode) executeAssistantTask(ctx context.Context, def *types.RoleDefinition, task string, state *types.ThreeLayerState) (*types.AgentResult, error) {
 	// 取出本 DomainAgent 装配的 Skill 列表（v3 §5），作为 system prompt 的可见技能段
 	var skillBrief string
 	if n.rt != nil && n.rt.Skills != nil {

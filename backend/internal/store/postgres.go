@@ -681,12 +681,13 @@ func (s *PostgresStore) SaveDecisionLog(ctx context.Context, topicID, agentID, d
 }
 
 // SessionHistoryRecord 跨会话历史摘要。
-// 设计意图: 长期沉淀每次会话的 goal/summary/工具调用结果,供后续会话检索复用。
+// 设计意图: 长期沉淀每次会话的 goal/summary/工具调用结果/调度记忆,供后续会话检索复用。
 type SessionHistoryRecord struct {
 	SessionID   string           `json:"session_id"`   // 会话唯一标识
 	Goal        string           `json:"goal"`         // 会话目标
 	Summary     string           `json:"summary"`      // 会话总结
 	ToolResults []map[string]any `json:"tool_results"` // 工具调用结果数组
+	MetaMemory  []map[string]any `json:"meta_memory"`  // P0-1: MetaAgent 调度记忆
 	CreatedAt   time.Time        `json:"created_at"`   // 创建时间
 }
 
@@ -709,9 +710,9 @@ type SessionEventRecord struct {
 	DetailJSON   string    `json:"detail_json"`
 }
 
-// SaveSessionHistory 持久化一次会话的 goal/summary/工具调用结果。
+// SaveSessionHistory 持久化一次会话的 goal/summary/工具调用结果/调度记忆。
 // 参数:
-//   - rec: 会话历史记录;ToolResults 为 nil 时补为空数组,保证 JSONB 非 null
+//   - rec: 会话历史记录;ToolResults/MetaMemory 为 nil 时补为空数组,保证 JSONB 非 null
 //
 // 返回: SQL 执行错误。
 // 副作用: ON CONFLICT DO NOTHING 保证同 session_id 重复写入幂等。
@@ -720,16 +721,23 @@ func (s *PostgresStore) SaveSessionHistory(ctx context.Context, rec *SessionHist
 		// 避免写入 null,统一为空数组便于下游读取
 		rec.ToolResults = []map[string]any{}
 	}
-	data, err := json.Marshal(rec.ToolResults)
+	if rec.MetaMemory == nil {
+		rec.MetaMemory = []map[string]any{}
+	}
+	toolData, err := json.Marshal(rec.ToolResults)
 	if err != nil {
 		return fmt.Errorf("marshal tool_results: %w", err)
 	}
+	memData, err := json.Marshal(rec.MetaMemory)
+	if err != nil {
+		return fmt.Errorf("marshal meta_memory: %w", err)
+	}
 	// COALESCE 保证 created_at 为零值时回退到 NOW()
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO session_history (session_id, goal, summary, tool_results, created_at)
-		VALUES ($1, $2, $3, $4, COALESCE($5, NOW()))
+		INSERT INTO session_history (session_id, goal, summary, tool_results, meta_memory, created_at)
+		VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()))
 		ON CONFLICT DO NOTHING
-	`, rec.SessionID, rec.Goal, rec.Summary, data, rec.CreatedAt)
+	`, rec.SessionID, rec.Goal, rec.Summary, toolData, memData, rec.CreatedAt)
 	return err
 }
 
@@ -795,7 +803,7 @@ func (s *PostgresStore) RecentSessionHistories(ctx context.Context, limit int) (
 		limit = 10
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT session_id, goal, summary, tool_results, created_at
+		SELECT session_id, goal, summary, tool_results, meta_memory, created_at
 		FROM session_history
 		ORDER BY created_at DESC
 		LIMIT $1
@@ -808,14 +816,17 @@ func (s *PostgresStore) RecentSessionHistories(ctx context.Context, limit int) (
 	var out []*SessionHistoryRecord
 	for rows.Next() {
 		var r SessionHistoryRecord
-		var raw []byte
-		if err := rows.Scan(&r.SessionID, &r.Goal, &r.Summary, &raw, &r.CreatedAt); err != nil {
+		var toolRaw, memRaw []byte
+		if err := rows.Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt); err != nil {
 			// 单行扫描失败跳过
 			continue
 		}
-		// 仅在非空时反序列化 tool_results
-		if len(raw) > 0 {
-			_ = json.Unmarshal(raw, &r.ToolResults)
+		// 仅在非空时反序列化 tool_results / meta_memory
+		if len(toolRaw) > 0 {
+			_ = json.Unmarshal(toolRaw, &r.ToolResults)
+		}
+		if len(memRaw) > 0 {
+			_ = json.Unmarshal(memRaw, &r.MetaMemory)
 		}
 		out = append(out, &r)
 	}
@@ -828,20 +839,23 @@ func (s *PostgresStore) RecentSessionHistories(ctx context.Context, limit int) (
 // 返回: 历史记录指针; 未找到返回 (nil, nil)。
 func (s *PostgresStore) GetSessionHistoryByID(ctx context.Context, id string) (*SessionHistoryRecord, error) {
 	var r SessionHistoryRecord
-	var raw []byte
+	var toolRaw, memRaw []byte
 	err := s.db.QueryRowContext(ctx, `
-		SELECT session_id, goal, summary, tool_results, created_at
+		SELECT session_id, goal, summary, tool_results, meta_memory, created_at
 		FROM session_history
 		WHERE session_id = $1
-	`, id).Scan(&r.SessionID, &r.Goal, &r.Summary, &raw, &r.CreatedAt)
+	`, id).Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &r.ToolResults)
+	if len(toolRaw) > 0 {
+		_ = json.Unmarshal(toolRaw, &r.ToolResults)
+	}
+	if len(memRaw) > 0 {
+		_ = json.Unmarshal(memRaw, &r.MetaMemory)
 	}
 	return &r, nil
 }

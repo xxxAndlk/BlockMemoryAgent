@@ -260,24 +260,7 @@ const (
 )
 
 // ============================================================
-// 7. 角色调用结果
-// ============================================================
-
-// CallResult 角色调用结果状态:CallResponse.Status 的取值。
-// 父 Agent 据此判断是否需要重试或升级。
-type CallResult string
-
-const (
-	// CallResultSuccess 成功:被调用者正常完成并返回结果。
-	CallResultSuccess CallResult = "success"
-
-	// CallResultFailed 失败:被调用者执行出错或超时。
-	// 触发重试或 ActionEscalate 升级。
-	CallResultFailed CallResult = "failed"
-)
-
-// ============================================================
-// 8. 话题状态
+// 7. 话题状态
 // ============================================================
 
 // TopicStatus 话题状态:TopicMeta.Status 的取值,描述话题生命周期。

@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -126,7 +127,7 @@ func CommonCreateAssistantForTask(
 		assistantInst, err := registry.CreateInstance(assistantDef.ID, state.SessionID, parentDomain, callerInstID)
 		if err != nil {
 			// 创建失败：打印日志
-			fmt.Printf("[Common] create fixed assistant %s failed: %v\n", assistantDef.ID, err)
+			log.Printf("[Common] create fixed assistant %s failed: %v", assistantDef.ID, err)
 			return nil, nil
 		}
 		return assistantInst, assistantDef // 返回固定助手
@@ -136,7 +137,7 @@ func CommonCreateAssistantForTask(
 	assistantInst, err := factory.CreateAssistant(ctx, state.SessionID, task, callerInstID, parentDefID)
 	if err != nil {
 		// 创建失败：打印日志
-		fmt.Printf("[Common] create dynamic assistant for %q failed: %v\n", task, err)
+		log.Printf("[Common] create dynamic assistant for %q failed: %v", task, err)
 		return nil, nil
 	}
 
@@ -174,7 +175,7 @@ func CommonCreateAssistantForTask(
 //   - maxIters：ReAct 循环最大轮数（<=0 时使用默认 12）。
 //   - enforceWriteGate：是否启用写文件完成门控。
 //
-// 返回：结果文本与 error。
+// 返回：结构化 AgentResult 与 error（P0-1）。
 func CommonExecuteAssistantTask(
 	ctx context.Context,
 	modelFactory *model.ModelFactory,
@@ -189,7 +190,7 @@ func CommonExecuteAssistantTask(
 	maxIters int,
 	enforceWriteGate bool,
 	llmTracker *model.LLMCallTracker,
-) (string, error) {
+) (*types.AgentResult, error) {
 	// 1. 优先使用 LLM + 工具执行
 	if modelFactory != nil {
 		// 新建工具执行器并注入回调
@@ -205,10 +206,10 @@ func CommonExecuteAssistantTask(
 
 		// 调用 blades.Agent + 工具循环执行
 		result, _ := executeAssistantWithTools(ctx, modelFactory, executor, def, task, state, skillBrief, progress, agentName, maxIters, llmTracker)
-		if result != "" {
+		if result != nil && result.Error == "" && result.SummaryForUser != "" {
 			// Self-Reflection（TODO #1）：启用时评估结果，不达标则带反馈重试一次
 			if reflectionEnabledFromRT(rt) {
-				if ok, feedback := reflectOnResult(ctx, modelFactory, task, result); !ok && feedback != "" {
+				if ok, feedback := reflectOnResult(ctx, modelFactory, task, result.SummaryForUser); !ok && feedback != "" {
 					if progress != nil {
 						progress(ctx, ProgressEvent{
 							SessionID: sessionIDFromState(state),
@@ -219,13 +220,13 @@ func CommonExecuteAssistantTask(
 					}
 					// 把反馈注入任务文本前缀后重试一次（防死循环：仅一次）
 					retryTask := fmt.Sprintf("[上次结果未达标，改进建议: %s]\n\n%s", feedback, task)
-					if r2, _ := executeAssistantWithTools(ctx, modelFactory, executor, def, retryTask, state, skillBrief, progress, agentName, maxIters, llmTracker); r2 != "" {
+					if r2, _ := executeAssistantWithTools(ctx, modelFactory, executor, def, retryTask, state, skillBrief, progress, agentName, maxIters, llmTracker); r2 != nil && r2.Error == "" && r2.SummaryForUser != "" {
 						result = r2
 					}
 				}
 			}
 			// 完成门控：若任务要求写文件但结果含失败标记，返回 error 触发上层重试/告警
-			if enforceWriteGate && strings.HasPrefix(result, "[失败:") {
+			if enforceWriteGate && strings.HasPrefix(result.SummaryForUser, "[失败:") {
 				return result, fmt.Errorf("助手未完成写文件任务: %s", task)
 			}
 			return result, nil // 成功返回
@@ -243,15 +244,38 @@ func CommonExecuteAssistantTask(
 				def.SystemPrompt, task, domainGoal)
 			fbStart := time.Now()
 			resp, err := llm.Generate(ctx, prompt)
-			// P0-4：回退路径也记录一次调用（用量回退估算）
+			// P0-4：回退路径也记录一次调用并推送 token_usage 事件
+			inTok := model.EstimateTokens(prompt)
+			if inTok == 0 {
+				inTok = 1
+			}
+			outTok := model.EstimateTokens(resp)
+			if outTok == 0 {
+				if err != nil {
+					outTok = model.EstimateTokens(err.Error())
+				}
+				if outTok == 0 {
+					outTok = 1
+				}
+			}
+			fbDur := time.Since(fbStart)
 			if llmTracker != nil {
-				inTok := model.EstimateTokens(prompt)
-				outTok := model.EstimateTokens(resp)
-				llmTracker.RecordCall(ctx, time.Since(fbStart), err, agentName,
+				llmTracker.RecordCall(ctx, fbDur, err, agentName,
 					model.SummarizePrompt(prompt, 500), prompt, resp, inTok, outTok, false)
 			}
+			if progress != nil {
+				progress(ctx, ProgressEvent{
+					SessionID: sessionIDFromState(state),
+					Kind:      "token_usage",
+					Agent:     agentName,
+					Message:   fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", agentName, inTok, outTok, fbDur.Round(time.Millisecond)),
+				})
+			}
 			if err == nil && resp != "" {
-				return resp, nil // 成功返回
+				return &types.AgentResult{
+					SummaryForUser: resp,
+					MemoryForMeta:  resp,
+				}, nil // 成功返回
 			}
 		}
 	}
@@ -263,7 +287,11 @@ func CommonExecuteAssistantTask(
 		contextInfo = fmt.Sprintf("[领域: %s] ", state.CurrentDomain)
 	}
 	// 返回模拟结果
-	return fmt.Sprintf("%s助手[%s]完成任务: %s", contextInfo, def.Name, task), nil
+	mockText := fmt.Sprintf("%s助手[%s]完成任务: %s", contextInfo, def.Name, task)
+	return &types.AgentResult{
+		SummaryForUser: mockText,
+		MemoryForMeta:  mockText,
+	}, nil
 }
 
 // sessionIDFromState 从 state 取 SessionID（nil 安全）。

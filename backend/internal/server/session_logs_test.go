@@ -32,3 +32,41 @@ func TestRedactSensitive(t *testing.T) {
 		}
 	}
 }
+
+func TestParseTokenUsage(t *testing.T) {
+	cases := []struct {
+		msg       string
+		wantIn    int
+		wantOut   int
+		wantCalls int // 此字段本测试未使用，仅保留结构清晰
+	}{
+		{
+			msg:     "[MetaAgent] Token 消耗: in=123 out=456 dur=789ms",
+			wantIn:  123,
+			wantOut: 456,
+		},
+		{
+			msg:     "[助手[代码助手]] Token 消耗: in=10 out=20 dur=30ms",
+			wantIn:  10,
+			wantOut: 20,
+		},
+		{
+			msg:     "[助手[t]] blades agent 完成 dur=30ms",
+			wantIn:  0,
+			wantOut: 0,
+		},
+		{
+			msg:     "",
+			wantIn:  0,
+			wantOut: 0,
+		},
+	}
+
+	for _, c := range cases {
+		gotIn, gotOut := parseTokenUsage(c.msg)
+		if gotIn != c.wantIn || gotOut != c.wantOut {
+			t.Fatalf("parseTokenUsage(%q) = (%d, %d), want (%d, %d)",
+				c.msg, gotIn, gotOut, c.wantIn, c.wantOut)
+		}
+	}
+}

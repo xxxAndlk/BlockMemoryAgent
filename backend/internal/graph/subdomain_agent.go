@@ -3,8 +3,10 @@ package graph
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
@@ -197,18 +199,45 @@ func (n *SubDomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayer
 		pendingTasks = append(pendingTasks, task)
 	}
 
+	var combinedSummary []string
+	var combinedMemory []string
 	if len(pendingTasks) > 0 {
 		results := n.dispatchAssistantsParallel(ctx, state, inst, pendingTasks)
 
 		var mu sync.Mutex
 		mu.Lock()
 		for task, result := range results {
-			block.TaskResults[task] = result
+			if result == nil {
+				continue
+			}
+			block.TaskResults[task] = result.SummaryForUser
+			combinedSummary = append(combinedSummary, fmt.Sprintf("%s: %s", task, result.SummaryForUser))
+			if result.MemoryForMeta != "" {
+				block.MetaMemory = append(block.MetaMemory, types.MetaMemoryEntry{
+					Timestamp: time.Now(),
+					Source:    n.instID,
+					Content:   result.MemoryForMeta,
+					Tags:      []string{"summary"},
+				})
+				combinedMemory = append(combinedMemory, result.MemoryForMeta)
+			}
+			for _, fact := range result.Facts {
+				if strings.TrimSpace(fact) == "" {
+					continue
+				}
+				block.MetaMemory = append(block.MetaMemory, types.MetaMemoryEntry{
+					Timestamp: time.Now(),
+					Source:    n.instID,
+					Content:   fact,
+					Tags:      []string{"fact"},
+				})
+			}
 		}
 		mu.Unlock()
 	}
 
 	state.PopCallStack()
+	block.Result = buildBlockResult(inst.Domain, block, combinedSummary, combinedMemory)
 	n.summarizeResults(state)
 	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone)
 

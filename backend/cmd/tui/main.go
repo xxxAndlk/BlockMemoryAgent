@@ -105,7 +105,12 @@ func main() {
 	}
 	// P0-1：启动期 LLM 连通性校验，失败则启动失败并报告未连通角色。
 	if err := modelFactory.VerifyConnectivity(ctx); err != nil {
-		log.Fatalf("启动失败：LLM 连通性校验未通过: %v", err)
+		// logging.Init(silent=true) 已把 log 输出重定向到日志文件，
+		// log.Fatalf 不会在终端显示失败原因，用户只看到 "exit status 1"。
+		// 这里先 fmt.Fprintln 到 stderr 让终端可见，再 log.Fatal 写文件留痕并退出。
+		msg := fmt.Sprintf("启动失败：LLM 连通性校验未通过: %v", err)
+		fmt.Fprintln(os.Stderr, msg)
+		log.Fatal(msg)
 	}
 
 	registry := graph.NewRoleRegistry(roleCfg)
@@ -129,12 +134,17 @@ func main() {
 		rt.SetAgentConfig(&cfg.Agent)
 	}
 
-	// 结构化日志器：写 stderr + session_logs 表（P1-2）
+	// 结构化日志器：TUI 模式下与标准 log 共用同一文件 writer，避免 JSON 日志刷到终端顶乱布局。
+	// 仍写 session_logs 表（若 Postgres 可用）。
 	var sessionLogger *logger.Logger
+	logWriter := logging.Writer()
+	if logWriter == nil {
+		logWriter = os.Stderr
+	}
 	if pgStore != nil {
-		sessionLogger = logger.New(pgStore)
+		sessionLogger = logger.NewWithWriter(pgStore, logWriter)
 	} else {
-		sessionLogger = logger.New(nil)
+		sessionLogger = logger.NewWithWriter(nil, logWriter)
 	}
 
 	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
@@ -219,7 +229,7 @@ func main() {
 
 	// CI 环境或 stdin 非 TTY 时自动禁用 alt-screen，避免输出被吞或光标异常。
 	useAltScreen := !*noAltScreen && os.Getenv("CI") == "" && isatty.IsTerminal(os.Stdin.Fd())
-	opts := []tea.ProgramOption{tea.WithMouseAllMotion()}
+	opts := []tea.ProgramOption{tea.WithMouseCellMotion()}
 	if useAltScreen {
 		opts = append(opts, tea.WithAltScreen())
 	}
@@ -349,6 +359,7 @@ func (a *pgHistoryAdapter) RecentSessionHistories(ctx context.Context, limit int
 			Goal:        rec.Goal,
 			Summary:     rec.Summary,
 			ToolResults: rec.ToolResults,
+			MetaMemory:  rec.MetaMemory,
 			CreatedAt:   rec.CreatedAt,
 		})
 	}

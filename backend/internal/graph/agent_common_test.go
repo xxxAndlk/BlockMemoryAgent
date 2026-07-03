@@ -51,7 +51,7 @@ func TestCommonMatchFixedAssistant_NilRegistry(t *testing.T) {
 	}
 }
 
-// TestCommonExecuteAssistantTask_NoModelFactory 验证无模型工厂回退模拟结果。
+// TestCommonExecuteAssistantTask_NoModelFactory 验证无模型工厂回退模拟结果（P0-1：返回 AgentResult）。
 func TestCommonExecuteAssistantTask_NoModelFactory(t *testing.T) {
 	def := &types.RoleDefinition{ID: "x", Name: "测试助手", SystemPrompt: "sp"}
 	state := types.NewThreeLayerState("s1")
@@ -60,12 +60,16 @@ func TestCommonExecuteAssistantTask_NoModelFactory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got == "" {
+	if got == nil || got.SummaryForUser == "" {
 		t.Fatalf("expected mock result, got empty")
 	}
 	// 模拟结果应含领域前缀与任务文本
-	if !contains(got, "demo") || !contains(got, "做某事") {
-		t.Errorf("mock result missing domain/task: %s", got)
+	if !contains(got.SummaryForUser, "demo") || !contains(got.SummaryForUser, "做某事") {
+		t.Errorf("mock result missing domain/task: %s", got.SummaryForUser)
+	}
+	// MemoryForMeta 应同步填充，供 MetaAgent 调度使用
+	if !contains(got.MemoryForMeta, "做某事") {
+		t.Errorf("mock result MemoryForMeta missing task: %s", got.MemoryForMeta)
 	}
 }
 

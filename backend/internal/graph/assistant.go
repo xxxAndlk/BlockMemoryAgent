@@ -117,15 +117,39 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 
 	// 6. 执行任务 — 优先走 LLM+工具循环，不可用时退回 mock
 	result := n.executeTask(ctx, roleDef, task, callReq, state)
+	if result == nil {
+		result = &types.AgentResult{}
+	}
 
-	// 7. 回写结果到 SessionBlock
+	// 7. 回写结果到 SessionBlock：SummaryForUser 写入 TaskResults，MemoryForMeta/Facts 写入 MetaMemory（P0-1）
 	if callReq != nil {
 		if blockID, ok := callReq.Context["block_id"].(string); ok {
 			if block := state.ActiveBlocks[blockID]; block != nil {
 				if block.TaskResults == nil {
 					block.TaskResults = make(map[string]string)
 				}
-				block.TaskResults[callReq.Task] = result
+				block.TaskResults[callReq.Task] = result.SummaryForUser
+				// 把 MemoryForMeta 作为 MetaMemoryEntry 归档到块
+				if result.MemoryForMeta != "" {
+					block.MetaMemory = append(block.MetaMemory, types.MetaMemoryEntry{
+						Timestamp: time.Now(),
+						Source:    n.instID,
+						Content:   result.MemoryForMeta,
+						Tags:      []string{"summary"},
+					})
+				}
+				// 关键事实也归档
+				for _, fact := range result.Facts {
+					if strings.TrimSpace(fact) == "" {
+						continue
+					}
+					block.MetaMemory = append(block.MetaMemory, types.MetaMemoryEntry{
+						Timestamp: time.Now(),
+						Source:    n.instID,
+						Content:   fact,
+						Tags:      []string{"fact"},
+					})
+				}
 			}
 		}
 	}
@@ -134,9 +158,9 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	output := &types.AgentOutput{
 		AgentID:   n.instID,
 		Version:   1,
-		Summary:   result,
+		Summary:   result.SummaryForUser,
 		Timestamp: time.Now(),
-		Validated: true,
+		Validated: result.Error == "",
 	}
 	if n.workspace != nil {
 		_ = n.workspace.SaveAgentOutput(ctx, state.SessionID, output)
@@ -160,13 +184,14 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 	return state, nil
 }
 
-// executeTask 调用 LLM 执行任务（不可用时退回 mock）。
 // executeTask 调用 LLM+工具循环执行任务（不可用时退回 mock）。
 //
 // 走 CommonExecuteAssistantTask（blades ReAct 工具循环），与 DomainAgent 内联执行路径一致，
 // 修复原 SubDomain→Assistant 路径无工具的问题。若注入了上下文组装器，把私有记忆/全局知识
 // 作为前缀注入任务文本，避免丢失。
-func (n *AssistantNode) executeTask(ctx context.Context, roleDef *types.RoleDefinition, task string, callReq *types.CallRequest, state *types.ThreeLayerState) string {
+//
+// 返回 *types.AgentResult：SummaryForUser 面向用户，MemoryForMeta 面向 MetaAgent（P0-1）。
+func (n *AssistantNode) executeTask(ctx context.Context, roleDef *types.RoleDefinition, task string, callReq *types.CallRequest, state *types.ThreeLayerState) *types.AgentResult {
 	// 有模型工厂时走 LLM + 工具循环
 	if n.modelFactory != nil {
 		// 可选：注入上下文组装器的私有记忆/全局知识到任务文本前
@@ -189,7 +214,7 @@ func (n *AssistantNode) executeTask(ctx context.Context, roleDef *types.RoleDefi
 		// 委托公共执行入口：AssistantNode 不启用写文件门控（与原 SubDomain 行为一致）
 		result, err := CommonExecuteAssistantTask(ctx, n.modelFactory, n.toolCallback, n.rt,
 			roleDef, effectiveTask, state, "", n.progress, roleDef.Name, 0, false, n.llmTracker)
-		if err == nil && result != "" {
+		if err == nil && result != nil {
 			return result
 		}
 		// 工具循环失败时退回 mock，保证主流程不中断
@@ -204,7 +229,11 @@ func (n *AssistantNode) executeTask(ctx context.Context, roleDef *types.RoleDefi
 	}
 
 	// LLM 不可用时退回模拟结果
-	return n.mockResult(roleDef, task, callReq)
+	mockText := n.mockResult(roleDef, task, callReq)
+	return &types.AgentResult{
+		SummaryForUser: mockText,
+		MemoryForMeta:  mockText,
+	}
 }
 
 // assembleContextPrefix 把 ContextPack 的消息列表拼成简短上下文前缀（供注入任务文本）。

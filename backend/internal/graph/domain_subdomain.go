@@ -3,6 +3,8 @@ package graph
 import (
 	"context"
 	"fmt"
+	"log"
+
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"strings"
@@ -152,7 +154,7 @@ func (n *DomainAgentNode) handleSubDomainSplit(ctx context.Context, state *types
 	subInst, err := n.factory.CreateSubDomainAgent(ctx, state.SessionID, subDomainName, state.DomainGoal, n.instID)
 	if err != nil {
 		// 创建失败：打印日志并继续
-		fmt.Printf("[DomainAgent] create subdomain agent %s failed: %v\n", subDomainName, err)
+		log.Printf("[DomainAgent] create subdomain agent %s failed: %v", subDomainName, err)
 		state.NextAction = enums.ActionContinue
 		return state, nil
 	}

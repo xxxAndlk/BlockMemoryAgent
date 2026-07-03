@@ -618,7 +618,7 @@ func (m *SessionManager) runSession(ctx context.Context, session *Session) {
 	m.evictCompletedSessions()
 }
 
-// persistHistory 把会话目标 / 总结 / 工具调用结果写入 session_history 表
+// persistHistory 把会话目标 / 总结 / 工具调用结果 / 调度记忆写入 session_history 表
 // 职责：从 session.Events 过滤 tool_exec 事件，组装 SessionHistoryRecord，调用 pgStore 落库。
 // 副作用：写 Postgres；失败仅记录日志，不影响主流程。
 func (m *SessionManager) persistHistory(session *Session) {
@@ -638,11 +638,24 @@ func (m *SessionManager) persistHistory(session *Session) {
 			"ok":     ev.Success,
 		})
 	}
+	// P0-1：持久化 MetaAgent 调度记忆
+	metaMemory := make([]map[string]any, 0)
+	if session.State != nil {
+		for _, entry := range session.State.MetaMemory {
+			metaMemory = append(metaMemory, map[string]any{
+				"timestamp": entry.Timestamp,
+				"source":    entry.Source,
+				"content":   entry.Content,
+				"tags":      entry.Tags,
+			})
+		}
+	}
 	rec := &store.SessionHistoryRecord{
 		SessionID:   session.ID,
 		Goal:        session.Goal,
 		Summary:     session.Result, // 摘要长度由 MetaAgent 生成时限制（见 meta_agent.go 各 prompt）
 		ToolResults: toolResults,
+		MetaMemory:  metaMemory,
 		CreatedAt:   time.Now(),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // 持久化超时 3 秒

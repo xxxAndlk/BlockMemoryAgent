@@ -19,6 +19,7 @@ type HistoryEntry struct {
 	Goal        string           // 历史会话目标
 	Summary     string           // 历史会话结果摘要
 	ToolResults []map[string]any // 历史会话的工具调用结果（含 tool/path 等）
+	MetaMemory  []map[string]any // P0-1: 历史会话的 MetaAgent 调度记忆
 	CreatedAt   time.Time        // 历史会话创建时间
 }
 

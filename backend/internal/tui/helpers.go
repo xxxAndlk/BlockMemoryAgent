@@ -49,10 +49,11 @@ func (m *Model) showChatDetail() {
 		return
 	}
 	items := chatItems(s)
-	if m.chatCursor < 0 || m.chatCursor >= len(items) {
+	idx := m.chatCurrentItem()
+	if idx < 0 || idx >= len(items) {
 		return
 	}
-	item := items[m.chatCursor]
+	item := items[idx]
 	m.openOverlay(item.title, strings.Split(item.detail, "\n"))
 }
 
@@ -270,6 +271,14 @@ func (m *Model) buildTranscriptLines() []string {
 	return out
 }
 
+// verboseTools 默认在 TUI 对话区展开完整 ToolOutput 的工具。
+// 其余工具（ReadFile/SearchInFiles/ListDir/HTTPGet/HTTPPost）只显示工具名和路径，
+// 隐藏 output 内容以减少视觉噪声（P2-3）。
+var verboseTools = map[string]bool{
+	"WriteFile":  true,
+	"RunCommand": true,
+}
+
 // eventChatItem 把一个 SessionEvent 映射为对话区的一行（title + detail）。
 // 返回 ok=false 表示该事件类型不展示（调试噪声）。
 func eventChatItem(ev server.SessionEvent) (title, detail string, ok bool) {
@@ -295,7 +304,8 @@ func eventChatItem(ev server.SessionEvent) (title, detail string, ok bool) {
 			d.WriteString(ev.Message)
 			d.WriteByte('\n')
 		}
-		if ev.ToolOutput != "" {
+		// P2-3：仅 WriteFile / RunCommand 展开 output，其余工具默认折叠
+		if verboseTools[ev.Tool] && ev.ToolOutput != "" {
 			d.WriteString("结果:\n")
 			d.WriteString(stripANSI(ev.ToolOutput))
 			d.WriteByte('\n')

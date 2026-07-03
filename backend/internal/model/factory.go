@@ -300,8 +300,9 @@ func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 			failed = append(failed, fmt.Sprintf("%s (构造失败: %v)", roleID, err))
 			continue
 		}
-		// 探测：整体 30s（容纳 2 次重试 + 退避），单次 12s
-		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		// 探测：整体 60s（容纳 2 次重试 + 退避 + 冷启动），单次 30s
+		// deepseek-v4-flash 等推理类模型首包冷启动可能 >12s，拉长单次超时避免误杀
+		probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		if err := probeLLM(probeCtx, probeClient); err != nil {
 			failed = append(failed, fmt.Sprintf("%s (model=%s: %v)", roleID, cfg.Model, err))
 		}
@@ -314,11 +315,11 @@ func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 	return nil
 }
 
-// probeLLM 对已构造的探测客户端发起一次最小化调用（2 次重试，单次 12s），验证可连通性。
+// probeLLM 对已构造的探测客户端发起一次最小化调用（2 次重试，单次 30s），验证可连通性。
 // 注：传入的 client 应已用 MaxTokens=1 构造，确保正常 LLM 快速应答。
 // 返回 nil 表示连通。
 func probeLLM(ctx context.Context, client LLMClient) error {
-	_, err, _ := retryGenerate(ctx, client, probePrompt, 12*time.Second)
+	_, err, _ := retryGenerate(ctx, client, probePrompt, 30*time.Second)
 	return err
 }
 

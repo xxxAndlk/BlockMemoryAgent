@@ -98,18 +98,6 @@ type CallRequest struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// CallResponse 角色间调用响应：被调用者执行完成后返回的结果。
-type CallResponse struct {
-	// RequestID 对应 CallRequest.ID。
-	RequestID string `json:"request_id"`
-	// Result 结果文本摘要。
-	Result string `json:"result"`
-	// Status 状态：CallResultSuccess / CallResultFailed。
-	Status enums.CallResult `json:"status"`
-	// Output 结构化公开输出，可空。
-	Output *AgentOutput `json:"output,omitempty"`
-}
-
 // SessionBlock 会话块（DomainAgent 管理）：按领域隔离的上下文容器。
 // 每个会话块绑定一个 DomainAgent，包含其子任务、事件与中间产物。
 type SessionBlock struct {
@@ -129,6 +117,12 @@ type SessionBlock struct {
 	Events []*Event `json:"events"`
 	// TaskResults 已完成任务的结果映射（任务名 -> 结果摘要）。
 	TaskResults map[string]string `json:"task_results"`
+	// MetaMemory 本块累积的 MetaAgent 调度记忆（P0-1）。
+	// 下级 Agent 返回的 memory_for_meta / facts 经转换后写入此处，随块归档。
+	MetaMemory []MetaMemoryEntry `json:"meta_memory,omitempty"`
+	// Result 本块最终返回的结构化结果（P0-1）。
+	// DomainAgent / SubDomainAgent 完成时生成，供 MetaAgent 组合记忆与生成最终回复。
+	Result *AgentResult `json:"result,omitempty"`
 	// Plan 结构化执行计划（Plan-and-Execute，TODO #1）。多任务时由 DomainAgent 生成，按步骤派发助手。
 	Plan *ExecutionPlan `json:"plan,omitempty"`
 	// archived 块记忆是否已落库（幂等兜底用，TODO #4）。异步归档成功后置 true。
@@ -154,6 +148,9 @@ type ThreeLayerState struct {
 	SessionID string `json:"session_id"`
 	// SessionSummary 会话级信息总结，由 MetaAgent 维护。
 	SessionSummary string `json:"session_summary"`
+	// MetaMemory 会话级 MetaAgent 调度记忆（P0-1）。
+	// 各块完成时由 MetaAgent 汇总归档，供最终回复生成与跨块决策使用。
+	MetaMemory []MetaMemoryEntry `json:"meta_memory,omitempty"`
 	// ActiveBlocks 当前活跃的会话块映射（ID -> SessionBlock）。
 	ActiveBlocks map[string]*SessionBlock `json:"active_blocks"`
 	// CompletedBlocks 已完成的会话块 ID 列表。
