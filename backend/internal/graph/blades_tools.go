@@ -63,8 +63,9 @@ type (
 		Path string `json:"path"` // 文件路径，相对工作目录或绝对路径
 	}
 	writeFileInput struct {
-		Path    string `json:"path"`    // 目标文件路径
-		Content string `json:"content"` // 写入内容（整体覆盖）
+		Path      string `json:"path"`      // 目标文件路径
+		Content   string `json:"content"`   // 写入内容（整体覆盖）
+		Temporary bool   `json:"temporary"` // 是否为临时文件（默认 false）。仅用于中间执行/分析的产物；用户要求保留的文件保持 false
 	}
 	listDirInput struct {
 		Path string `json:"path"` // 目录路径，空则取工作目录
@@ -229,8 +230,8 @@ func buildBladesTools(
 		toolsList = append(toolsList, t)
 	}
 	// WriteFile：写文件，委托给 executor.writeFile
-	if t, err := tools.NewFunc("WriteFile", "写入文件。", func(ctx context.Context, in writeFileInput) (string, error) {
-		return r.run(ctx, "WriteFile", map[string]any{"path": in.Path, "content": in.Content}), nil
+	if t, err := tools.NewFunc("WriteFile", "写入文件。若文件仅作为临时产物使用（例如运行脚本、中间分析、一次性计算），请设置 temporary=true，文件会写入会话级临时目录并在会话结束后自动清理；用户明确要求保留的文件请保持 temporary=false（默认）。", func(ctx context.Context, in writeFileInput) (string, error) {
+		return r.run(ctx, "WriteFile", map[string]any{"path": in.Path, "content": in.Content, "temporary": in.Temporary}), nil
 	}); err == nil {
 		toolsList = append(toolsList, t)
 	}
@@ -241,7 +242,7 @@ func buildBladesTools(
 		toolsList = append(toolsList, t)
 	}
 	// RunCommand：执行 shell 命令，按需带上 timeout 参数
-	if t, err := tools.NewFunc("RunCommand", "执行 shell 命令。", func(ctx context.Context, in runCommandInput) (string, error) {
+	if t, err := tools.NewFunc("RunCommand", "执行 shell 命令。命令执行时环境变量 BMA_SESSION_TEMP_DIR 指向本会话的临时目录，如需创建临时文件请写入该目录，会话结束后会自动清理。", func(ctx context.Context, in runCommandInput) (string, error) {
 		args := map[string]any{"command": in.Command}
 		if in.Timeout > 0 {
 			args["timeout"] = in.Timeout // 仅当 LLM 显式指定时才传

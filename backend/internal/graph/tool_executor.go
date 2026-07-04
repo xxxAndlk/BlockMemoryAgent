@@ -25,14 +25,18 @@ import (
 //   - Error：失败时的错误信息（成功时为空）。
 //   - Path：相关路径（文件路径 / URL / 工作目录），便于审计。
 //   - SessionID：归属会话，避免跨会话事件泄漏。
+//   - IsTemporary：该工具创建的文件是否为临时文件（会话结束后自动清理）。
+//   - TempDir：临时文件存放的会话级目录（仅当 IsTemporary=true 时有效）。
 type ToolResult struct {
-	Tool      string `json:"tool"`
-	Success   bool   `json:"success"`
-	Output    string `json:"output"`
-	Error     string `json:"error,omitempty"`
-	Path      string `json:"path,omitempty"`
-	ArgsJSON  string `json:"args_json,omitempty"`  // 入参 JSON 摘要（截断），用于日志展示
-	SessionID string `json:"session_id,omitempty"` // 归属会话，避免跨会话事件泄漏
+	Tool        string `json:"tool"`
+	Success     bool   `json:"success"`
+	Output      string `json:"output"`
+	Error       string `json:"error,omitempty"`
+	Path        string `json:"path,omitempty"`
+	ArgsJSON    string `json:"args_json,omitempty"`    // 入参 JSON 摘要（截断），用于日志展示
+	SessionID   string `json:"session_id,omitempty"`   // 归属会话，避免跨会话事件泄漏
+	IsTemporary bool   `json:"is_temporary,omitempty"` // 是否为临时文件
+	TempDir     string `json:"temp_dir,omitempty"`     // 会话级临时目录
 }
 
 // ToolCallback 工具执行回调（用于通知UI）。
@@ -143,7 +147,7 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	case "ReadFile":
 		result = e.readFile(args)
 	case "WriteFile":
-		result = e.writeFile(args)
+		result = e.writeFile(ctx, args)
 	case "ListDir":
 		result = e.listDir(args)
 	case "RunCommand":
@@ -217,6 +221,22 @@ func (e *ToolExecutor) resolvePath(path string) string {
 	}
 	// 相对路径拼接 workDir
 	return filepath.Join(e.workDir, path)
+}
+
+// sessionTempDir 返回指定会话的临时文件目录。
+//
+// 职责：为每个会话分配独立的临时目录，便于会话结束后统一清理。
+// 路径规则：<workDir>/.bma/tmp/<sessionID>。
+// 参数：
+//   - sessionID：会话 ID。
+//
+// 返回：临时目录绝对路径；sessionID 为空时返回空串。
+// 并发安全：纯函数（workDir 只读）。
+func (e *ToolExecutor) sessionTempDir(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	return filepath.Join(e.workDir, ".bma", "tmp", sessionID)
 }
 
 // sessionIDKey 用于在 context 中传递会话 ID 的非导出键类型。

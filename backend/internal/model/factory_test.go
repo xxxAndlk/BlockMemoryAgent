@@ -9,16 +9,17 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
-// TestVerifyConnectivitySkipsNoKey 验证 P0-1：无 API key 的角色全部跳过，返回 nil（Mock 模式不阻塞启动）。
-func TestVerifyConnectivitySkipsNoKey(t *testing.T) {
+// TestVerifyConnectivityRequiresKey 验证 P0-1：无 API key 的角色全部视为未配置，
+// 严格启动要求返回聚合错误，不允许跳过或 Mock 启动。
+func TestVerifyConnectivityRequiresKey(t *testing.T) {
 	cfg := &config.RoleConfigFile{
 		MetaAgent:   config.MetaAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "m"}},
 		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "d"}},
 		FixedRoles:  []types.RoleDefinition{{ID: "coder", ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "c"}}},
 	}
 	f := NewModelFactory(cfg)
-	if err := f.VerifyConnectivity(context.Background()); err != nil {
-		t.Fatalf("无 key 应跳过并返回 nil，got %v", err)
+	if err := f.VerifyConnectivity(context.Background()); err == nil {
+		t.Fatal("无 key 应返回错误，禁止跳过启动")
 	}
 }
 

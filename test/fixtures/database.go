@@ -164,9 +164,9 @@ func (d *TestDatabase) pingRedis() bool {
 	return client.Ping(ctx).Err() == nil
 }
 
-// applyMigrations runs 001_init.sql through 005_session_logs.sql against the
-// Postgres instance. Migration files are read from ../../migrations relative to
-// this package.
+// applyMigrations runs 001_init.sql through 006_session_history_meta_memory.sql
+// against the Postgres instance. Migration files are read from ../../migrations
+// relative to this package.
 func (d *TestDatabase) applyMigrations() error {
 	db, err := sql.Open("postgres", d.PostgresDSN)
 	if err != nil {
@@ -174,7 +174,7 @@ func (d *TestDatabase) applyMigrations() error {
 	}
 	defer db.Close()
 
-	for i := 1; i <= 5; i++ {
+	for i := 1; i <= 6; i++ {
 		name := fmt.Sprintf("%03d_*.sql", i)
 		matches, err := filepath.Glob(filepath.Join(migrationDir, name))
 		if err != nil {
@@ -228,7 +228,6 @@ func (d *TestDatabase) Truncate() {
 		"decision_logs",
 		"session_history",
 		"session_events",
-		"memory_write_failures",
 		"session_logs",
 		"dag_jobs",
 	}

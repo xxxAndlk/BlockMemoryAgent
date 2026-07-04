@@ -597,7 +597,7 @@ type scoredEpisode struct {
 }
 
 // MemoryLevelsHandler GET /api/memory/levels — 返回压缩层级分布
-// 职责：调用 Postgres 统计各压缩层级（0-3）的 Episode 数，返回分布 JSON。
+// 职责：调用 Postgres 统计两级压缩层级（Raw=0 / Standard=1）的 Episode 数，返回分布 JSON。
 // 参数：?agent_id=...&topic_id=...
 func (h *APIHandler) MemoryLevelsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -607,16 +607,20 @@ func (h *APIHandler) MemoryLevelsHandler(w http.ResponseWriter, r *http.Request)
 	agentID := r.URL.Query().Get("agent_id")
 	topicID := r.URL.Query().Get("topic_id")
 
-	levels := map[string]int{"0": 0, "1": 0, "2": 0, "3": 0} // 4 个压缩层级
+	levels := map[string]int{"raw": 0, "standard": 0}
 	total := 0
 	if h.pgStore != nil {
-		counts, err := h.pgStore.CountEpisodesByLevel(r.Context(), agentID, topicID)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		for lvl, cnt := range counts {
-			levels[strconv.Itoa(int(lvl))] = cnt // 写入对应层级
+		for lvl, key := range map[int]string{0: "raw", 1: "standard"} {
+			var cnt int
+			err := h.pgStore.DB().QueryRowContext(r.Context(), `
+				SELECT COUNT(*) FROM agent_private_memory
+				WHERE agent_id = $1 AND topic_id = $2 AND compression_level = $3
+			`, agentID, topicID, lvl).Scan(&cnt)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			levels[key] = cnt
 			total += cnt
 		}
 	}

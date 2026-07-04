@@ -114,7 +114,7 @@ func (n *MetaAgentNode) runWatchdog(ctx context.Context, state *types.ThreeLayer
 	case watchdog.LevelEvict:
 		// 不再强制升级结束会话；仅记录警告，让当前任务继续完成。
 		n.emitDetail(ctx, "wait",
-			fmt.Sprintf("Watchdog 触发 EVICT（上下文 %d tokens 超硬阈值），已降级为警告，不中断会话: %s", d.Tokens, d.Reason), "")
+			fmt.Sprintf("Watchdog 触发 EVICT（上下文 %d tokens 超硬阈值），已转为警告，不中断会话: %s", d.Tokens, d.Reason), "")
 	case watchdog.LevelCompress:
 		// 接近软阈值：推送建议压缩提示，并尝试对当前块主 Agent 执行 Episode 压缩
 		n.emit(ctx, "think",

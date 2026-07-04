@@ -63,13 +63,17 @@ func New(soulPath string, skillPool *skill.Pool) *Runtime {
 		Mailbox:  mailbox.New(),                          // 空邮箱，各 Agent 通过 Send/Drain 异步通信
 		Skills:   skill.NewRegistry(skillPool),           // 以技能池初始化注册表
 		Soul:     loader,                                 // 人格加载器，供 Agent 拼 system prompt 时注入
-		Watchdog: watchdog.New(watchdog.DefaultConfig()), // 使用默认软/硬阈值（soft=12000/hard=20000）
+		Watchdog: watchdog.New(watchdog.DefaultConfig()), // 默认基于 32k 上下文窗口（soft=16k/hard=25.6k），SetAgentConfig 后按 context_window 更新
 		CmdQueue: cmdqueue.NewManager(),                  // 用户指令队列（特性6）
 	}
 }
 
 // SetAgentConfig 注入 Agent 运行时动态参数。
 // 由 main.go 在装载 Runtime 后调用；nil 时下游节点应回退到各自默认值。
+// 副作用：根据 cfg.ContextWindow 同步更新 Watchdog 软/硬阈值。
 func (r *Runtime) SetAgentConfig(cfg *config.AgentConfig) {
 	r.AgentCfg = cfg
+	if cfg != nil && cfg.ContextWindow > 0 {
+		r.Watchdog.SetConfig(watchdog.ConfigForWindow(cfg.ContextWindow))
+	}
 }

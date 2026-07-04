@@ -17,7 +17,7 @@ import (
 //   - ctx：请求上下文
 //   - state：图全局状态（取 DomainGoal 作为分析输入）
 //
-// 返回：子任务列表；无目标返回 nil；LLM 拆解均为思考类任务时降级为单任务。
+// 返回：子任务列表；无目标返回 nil；LLM 拆解均为思考类任务时回退为单任务。
 //
 // DirectExecute 模式：MetaAgent 判定为查询/搜索类简单任务时置 state.DirectExecute=true，
 // 此处跳过 LLM 拆解，直接把 goal 作为单任务交给一个 Assistant，避免无谓拆分。
@@ -80,8 +80,8 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 			}
 			// LLM 返回的尽是思考类任务，过滤后为空 → 把整个 goal 作为单任务，
 			// 让一个 assistant 用 ReAct 循环完整执行（写文件+运行+验证）。
-			n.emit(ctx, "think", "LLM 拆解均为思考类任务，降级为单任务整体执行")
-			return []string{goal} // 降级为单任务
+			n.emit(ctx, "think", "LLM 拆解均为思考类任务，回退为单任务整体执行")
+			return []string{goal} // 回退为单任务
 		}
 		// 超时或失败：推送事件并回退规则
 		if timedOut {

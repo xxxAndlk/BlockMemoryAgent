@@ -158,13 +158,12 @@ func (m Model) renderChat(w, h int) string {
 		contentW = w
 	}
 
-	s := m.selectedSession()
-	if s == nil && m.pendingFirstMessage == "" {
-		return m.renderWelcome(contentW, h)
-	}
-
-	// 有会话但暂无消息/事件，且无本地预展示消息时，在对话区顶部显示首页提示。
-	if s != nil && len(chatItems(s, true)) == 0 && m.pendingFirstMessage == "" {
+	items := m.collectChatItems()
+	if len(items) == 0 {
+		if m.selectedSession() == nil {
+			return m.renderWelcome(contentW, h)
+		}
+		// 有会话但暂无消息/事件，且无本地预展示消息时，在对话区顶部显示首页提示。
 		return m.renderEmptyChat(contentW, h)
 	}
 
@@ -303,22 +302,46 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w).Height(h-1).Render(body))
 }
 
-// buildChatContent 把当前会话的全部 chatItem 渲染成 viewport 可滚动的字符串，
-// 并同步更新 m.chatItemOffsets。
-func (m *Model) buildChatContent(width int) string {
+// collectChatItems 收集当前应展示的全部 chatItem，包含真实会话消息/事件，
+// 以及尚未同步到服务端的本地预展示首条用户消息。
+func (m *Model) collectChatItems() []chatItem {
 	s := m.selectedSession()
 	var items []chatItem
 	if s != nil {
 		items = chatItems(s, true)
-	} else if m.pendingFirstMessage != "" {
-		// 会话创建中，本地预显示首条用户消息，保证高亮样式与真实消息一致
-		items = []chatItem{{
-			title:     "> " + m.pendingFirstMessage,
-			timestamp: time.Now(),
-			isEvent:   false,
-			role:      enums.ChatRoleUser,
-		}}
-	} else {
+	}
+	// 本地预展示的首条用户消息：无会话时直接展示；有会话但服务端尚未同步该
+	// 消息时，也作为兜底展示，避免用户输入"消失"。
+	if m.pendingFirstMessage != "" {
+		already := false
+		for _, it := range items {
+			if strings.TrimPrefix(it.title, "> ") == m.pendingFirstMessage {
+				already = true
+				break
+			}
+		}
+		if !already {
+			// 尽量使用会话开始时间作为时间戳，保证排序自然
+			ts := time.Now()
+			if s != nil {
+				ts = s.StartedAt
+			}
+			items = append(items, chatItem{
+				title:     "> " + m.pendingFirstMessage,
+				timestamp: ts,
+				isEvent:   false,
+				role:      enums.ChatRoleUser,
+			})
+		}
+	}
+	return items
+}
+
+// buildChatContent 把当前会话的全部 chatItem 渲染成 viewport 可滚动的字符串，
+// 并同步更新 m.chatItemOffsets。
+func (m *Model) buildChatContent(width int) string {
+	items := m.collectChatItems()
+	if len(items) == 0 {
 		m.chatItemOffsets = nil
 		return ""
 	}

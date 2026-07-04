@@ -41,25 +41,35 @@ type ContextAssembler struct {
 	scorer    *SearchScorer      // 多信号评分器（可选），nil 时退回重要性排序
 }
 
-// NewContextAssembler 创建上下文构建器并初始化默认 Token 预算。
-// 参数：workspace 工作区读取；globalKB 全局知识检索；store 私有记忆存储。
-// 返回：装配好的 *ContextAssembler，budget 字段使用默认段位配置。
+// NewContextAssembler 创建上下文构建器并按 contextWindow 动态分配 Token 预算。
+// 参数：workspace 工作区读取；globalKB 全局知识检索；store 私有记忆存储；
+//       contextWindow 模型上下文窗口总 token 数（来自 config.Agent.ContextWindow）。
+// 返回：装配好的 *ContextAssembler，budget 字段按总窗口比例分配。
 // 副作用：无。
-func NewContextAssembler(workspace WorkspaceReader, globalKB GlobalRetriever, store PrivateStore) *ContextAssembler {
-	// 组装依赖并配置默认 Token 预算（各段位数值依据经验设定，可后续从配置覆盖）。
+func NewContextAssembler(workspace WorkspaceReader, globalKB GlobalRetriever, store PrivateStore, contextWindow int) *ContextAssembler {
+	if contextWindow <= 0 {
+		contextWindow = 32000
+	}
 	return &ContextAssembler{
 		workspace: workspace,
 		globalKB:  globalKB,
 		store:     store,
-		budget: &types.TokenBudget{
-			SystemRole:    2048, // 系统角色段：soul.md + 角色定义
-			TopicGlobal:   4096, // 话题全局段：目标与状态
-			SharedState:   8192, // 共享状态段：上游 Agent 输出
-			GlobalKB:      4096, // 全局知识段：KnowledgeRecord
-			PrivateMemory: 8192, // 私有记忆段：本 Agent 的 Episode
-			TaskQuery:     2048, // 任务查询段：当前任务描述
-			Reserve:       4096, // 预留缓冲，防止超出模型上下文窗口
-		},
+		budget:    allocateTokenBudget(contextWindow),
+	}
+}
+
+// allocateTokenBudget 按总上下文窗口比例分配各段预算。
+// 比例依据：System/Topic 占比较小，SharedState 与 PrivateMemory 占大头，Reserve 留缓冲。
+// 当 contextWindow 变化时，所有段位同比缩放，保持结构稳定。
+func allocateTokenBudget(contextWindow int) *types.TokenBudget {
+	return &types.TokenBudget{
+		SystemRole:    max(contextWindow*6/100, 512),   // 系统角色段：soul.md + 角色定义
+		TopicGlobal:   max(contextWindow*12/100, 1024), // 话题全局段：目标与状态
+		SharedState:   max(contextWindow*25/100, 2048), // 共享状态段：上游 Agent 输出
+		GlobalKB:      max(contextWindow*12/100, 1024), // 全局知识段：KnowledgeRecord
+		PrivateMemory: max(contextWindow*25/100, 2048), // 私有记忆段：本 Agent 的 Episode
+		TaskQuery:     max(contextWindow*6/100, 512),   // 任务查询段：当前任务描述
+		Reserve:       max(contextWindow*14/100, 1024), // 预留缓冲，防止超出模型上下文窗口
 	}
 }
 
@@ -85,7 +95,7 @@ func (a *ContextAssembler) BuildContext(ctx context.Context, req *graph.BuildReq
 		return nil, fmt.Errorf("get topic meta: %w", err)
 	}
 
-	// 获取话题约束（键值对），失败时降级为空 map 继续组装。
+	// 获取话题约束（键值对），失败时回退为空 map 继续组装。
 	constraints, err := a.workspace.GetTopicConstraints(ctx, req.TopicID)
 	if err != nil {
 		// 约束读取失败不阻断流程，使用空约束。

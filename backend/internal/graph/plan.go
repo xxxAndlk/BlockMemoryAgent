@@ -91,7 +91,7 @@ func reflectOnResult(ctx context.Context, modelFactory *model.ModelFactory, task
 
 判定标准:
 - 结果是否完成了任务要求（写文件类是否落盘、查询类是否给出答案）
-- 结果是否包含明显的失败标记（如 "[失败:"、"[ERROR]"）
+- 结果是否包含明显的失败标记（如 Error: missing WriteFile result、[ERROR]）
 - 结果是否为空或仅是占位模拟
 
 只输出 JSON：{"ok":true/false,"feedback":"若不达标，给出改进建议；达标则留空"}

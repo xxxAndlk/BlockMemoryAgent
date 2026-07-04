@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -91,81 +92,30 @@ func (m *SnapshotManager) Load(ctx context.Context, agentID, topicID string) (*t
 	return snap, nil
 }
 
-// Save 保存 Agent 快照：同步写 Redis + 异步落 Postgres。
-// 同步写 Redis 保证热数据即时可见；异步写 Postgres 避免阻塞主路径。
+// Save 保存 Agent 快照：同步写 Postgres 持久化，再同步写 Redis 热存。
+// 主路径以 Postgres 为准；Redis 失败只记录日志，不阻塞主路径。
 //
 // 参数：
-//   - ctx: 取消信号（仅用于同步 Redis 写入）。
+//   - ctx: 取消信号。
 //   - snapshot: 待保存的快照指针，函数会就地更新 UpdatedAt。
 //
-// 返回：Redis 写入失败时返回错误；Postgres 写入失败被忽略（异步）。
-// 副作用：更新 snapshot.UpdatedAt；触发 Redis 写与 Postgres 异步写。
-// 并发安全：实例无共享可变状态；异步 goroutine 使用独立 context。
+// 返回：Postgres 写入失败时返回错误；Redis 写入失败仅记录日志。
+// 副作用：更新 snapshot.UpdatedAt；触发 Postgres 与 Redis 同步写。
 func (m *SnapshotManager) Save(ctx context.Context, snapshot *types.AgentSnapshot) error {
 	// 刷新快照更新时间，标记本次写入。
 	snapshot.UpdatedAt = time.Now()
 
-	// 1. 保存到 Redis（TTL 7 天），同步执行保证热存即时一致。
+	// 1. 同步保存到 PostgreSQL（持久化），主路径必须成功。
+	if err := m.pgStore.SaveSnapshot(ctx, snapshot); err != nil {
+		return fmt.Errorf("pg save snapshot: %w", err)
+	}
+
+	// 2. 同步保存到 Redis（TTL 7 天），失败仅记录日志。
 	if err := m.redisStore.SaveSnapshot(ctx, snapshot, 7*24*time.Hour); err != nil {
-		// 热存写入失败视为致命，返回错误。
-		return fmt.Errorf("redis save snapshot: %w", err)
+		log.Printf("[snapshot] redis save failed: %v", err)
 	}
 
-	// 2. 异步保存到 PostgreSQL（持久化），不阻塞主路径。
-	go func() {
-		// 独立 context：避免父 ctx 取消影响冷存写入。
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		// 冷存写入失败仅忽略，热存已成功，下次加载仍可命中。
-		_ = m.pgStore.SaveSnapshot(ctx, snapshot)
-	}()
-
-	// 热存已写成功，返回 nil。
 	return nil
-}
-
-// SaveSnapshotToPostgres 直接保存快照到 Postgres（用于回调队列重试路径）。
-func (m *SnapshotManager) SaveSnapshotToPostgres(ctx context.Context, snapshot *types.AgentSnapshot) error {
-	return m.pgStore.SaveSnapshot(ctx, snapshot)
-}
-
-// BuildSnapshotFromState 从状态构建快照（复用 SaveFromState 的构建逻辑）。
-func (m *SnapshotManager) BuildSnapshotFromState(agentID, topicID string, output *types.AgentOutput, episodes []*types.Episode) *types.AgentSnapshot {
-	const k = 5
-	summaries := make([]types.SummaryBlock, 0, k)
-	for i := len(episodes) - 1; i >= 0 && len(summaries) < k; i-- {
-		ep := episodes[i]
-		summaries = append(summaries, types.SummaryBlock{
-			StepID:    ep.StepID,
-			Content:   ep.ObservationSummary,
-			Timestamp: ep.Timestamp,
-		})
-	}
-
-	var openIssues []types.Issue
-	for _, ep := range episodes {
-		if ep.Importance > 0.7 && ep.Reflection == "" {
-			openIssues = append(openIssues, types.Issue{
-				ID:          ep.StepID,
-				Description: ep.ObservationSummary,
-				CreatedAt:   ep.Timestamp,
-			})
-		}
-	}
-
-	snapshot := &types.AgentSnapshot{
-		AgentID:      agentID,
-		TopicID:      topicID,
-		KeySummaries: summaries,
-		OpenIssues:   openIssues,
-		LocalVars:    make(map[string]any),
-		PublishedVer: output.Version,
-		UpdatedAt:    time.Now(),
-	}
-	if len(episodes) > 0 {
-		snapshot.LastStepID = episodes[len(episodes)-1].StepID
-	}
-	return snapshot
 }
 
 // SaveFromState 从 GraphState 派生并保存快照。

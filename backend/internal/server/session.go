@@ -6,6 +6,8 @@ import (
 	"fmt"           // 格式化输出
 	"log"           // 日志输出
 	"net/http"      // HTTP 处理器
+	"os"            // 工作目录获取与临时目录清理
+	"path/filepath" // 临时目录路径拼接
 	"regexp"        // API Key 脱敏
 	"sort"          // 会话列表按时间排序
 	"strconv"       // 字符串与数字转换
@@ -35,6 +37,7 @@ import (
 //   - EndedAt: 结束时间（nil 表示未结束）
 //   - Events: 事件流（含工具调用、思考、统计）
 //   - Messages: 对话消息（含 system / user / assistant）
+//   - TempDir: 本会话的临时文件目录（会话结束后清理）
 //   - cancelFn: 取消函数，用于终止正在运行的 graph.Invoke（nil 表示未运行）
 type Session struct {
 	ID        string                 `json:"id"`                 // 会话 ID（session-N）
@@ -46,6 +49,7 @@ type Session struct {
 	EndedAt   *time.Time             `json:"ended_at,omitempty"` // 结束时间（nil 表示未结束）
 	Events    []SessionEvent         `json:"events"`             // 事件流
 	Messages  []types.ChatMessage    `json:"messages"`           // 对话消息
+	TempDir   string                 `json:"temp_dir,omitempty"` // 会话级临时目录
 	cancelFn  context.CancelFunc     `json:"-"`                  // 取消函数（不序列化）
 }
 
@@ -86,6 +90,7 @@ type SessionManager struct {
 	seq          atomic.Int64           // 会话 ID 自增计数
 	pgStore      *store.PostgresStore   // 可选：Postgres 持久化
 	modelFactory *model.ModelFactory    // 可选：模型工厂，用于续话时调轻量模型总结历史
+	workDir      string                 // 工具执行基准目录，用于计算会话级临时目录
 }
 
 // NewSessionManager 创建会话管理器，并把工具 / 进度回调注入 Graph。
@@ -93,10 +98,12 @@ type SessionManager struct {
 // 返回值：*SessionManager。
 // 副作用：g.SetToolCallback / g.SetProgressCallback 注入闭包，回调把事件写入对应 Session。
 func NewSessionManager(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry) *SessionManager {
+	workDir, _ := os.Getwd()
 	m := &SessionManager{
 		sessions: make(map[string]*Session), // 初始化 sessions 映射
 		graph:    g,                         // 注入 Graph
 		registry: registry,                  // 注入角色注册表
+		workDir:  workDir,                   // 与 ToolExecutor 默认 workDir 保持一致
 	}
 
 	// 将工具回调注入图，使工具执行结果自动成为会话事件
@@ -205,6 +212,29 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 		log.Printf("从历史恢复了 %d 个会话", restored) // 输出恢复条数
 	}
 	return restored
+}
+
+// cleanupSessionTempDir 清理会话级临时目录。
+//
+// 职责：会话进入终态（completed / error）后，删除其临时目录及内部所有文件，
+// 避免 Agent 产生的临时脚本/中间产物长期占用磁盘。
+// 参数：
+//   - sessionID：会话 ID，仅用于日志。
+//   - tempDir：临时目录绝对路径。
+//
+// 副作用：删除目录；失败仅记录日志，不影响主流程。
+func (m *SessionManager) cleanupSessionTempDir(sessionID, tempDir string) {
+	if tempDir == "" {
+		return
+	}
+	if _, err := os.Stat(tempDir); os.IsNotExist(err) {
+		return
+	}
+	if err := os.RemoveAll(tempDir); err != nil {
+		log.Printf("[%s] 清理临时目录失败: %v", sessionID, err)
+	} else {
+		log.Printf("[%s] 已清理临时目录: %s", sessionID, tempDir)
+	}
 }
 
 // evictCompletedSessions 淘汰最早的已完成会话，把内存占用控制在 maxInMemorySessions 以内。
@@ -382,7 +412,8 @@ func (m *SessionManager) CreateSession(ctx context.Context, goal string) *Sessio
 		Goal:      goal,
 		Status:    enums.SessionStatusRunning, // 初始状态为运行中
 		StartedAt: time.Now(),
-		Events:    make([]SessionEvent, 0), // 空事件流
+		Events:    make([]SessionEvent, 0),                            // 空事件流
+		TempDir:   filepath.Join(m.workDir, ".bma", "tmp", sessionID), // 本会话的临时文件根目录
 		Messages: []types.ChatMessage{
 			{Role: enums.ChatRoleSystem, Content: "Goal: " + goal, Timestamp: time.Now()}, // 注入 system 消息
 			{Role: enums.ChatRoleUser, Content: goal, Timestamp: time.Now()},              // 注入用户原始输入，供 TUI/前端对话区展示
@@ -510,14 +541,24 @@ func (m *SessionManager) SnapshotSession(id string) *Session {
 // 参数：ctx - 请求上下文；session - 待运行的会话。
 // 副作用：异步运行；写入多个事件；更新 session.Status / Result / EndedAt。
 func (m *SessionManager) runSession(ctx context.Context, session *Session) {
-	// 全局超时10分钟：复杂任务（写游戏+运行+DB检查）需多轮 ReAct，5分钟不够
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	// 全局超时：优先取 AgentCfg.SessionTimeoutMin，未配置或非法时兜底 10 分钟
+	sessionTimeout := 10 * time.Minute
+	if rt := m.graph.Runtime(); rt != nil && rt.AgentCfg != nil && rt.AgentCfg.SessionTimeoutMin > 0 {
+		sessionTimeout = time.Duration(rt.AgentCfg.SessionTimeoutMin) * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, sessionTimeout)
 	defer cancel()
-	// 会话结束时清空 cancelFn，防止 HandleSessionCancel 对已完成会话误操作
+	// 会话结束时清空 cancelFn，防止 HandleSessionCancel 对已完成会话误操作；
+	// 若会话进入终态（completed/error），清理本会话的临时目录。
 	defer func() {
 		m.mu.Lock()
+		status := session.Status
+		tempDir := session.TempDir
 		session.cancelFn = nil
 		m.mu.Unlock()
+		if status == enums.SessionStatusCompleted || status == enums.SessionStatusError {
+			m.cleanupSessionTempDir(session.ID, tempDir)
+		}
 	}()
 
 	state := types.NewThreeLayerState(session.ID) // 创建初始图状态
@@ -1735,11 +1776,17 @@ func (m *SessionManager) resumeSession(session *Session) {
 	m.mu.Unlock()
 	ctx, timeoutCancel := context.WithTimeout(ctx, 10*time.Minute) // 恢复也用 10 分钟超时
 	defer timeoutCancel()
-	// 会话结束时清空 cancelFn，防止 HandleSessionCancel 对已完成会话误操作
+	// 会话结束时清空 cancelFn，防止 HandleSessionCancel 对已完成会话误操作；
+	// 若会话进入终态（completed/error），清理本会话的临时目录。
 	defer func() {
 		m.mu.Lock()
+		status := session.Status
+		tempDir := session.TempDir
 		session.cancelFn = nil
 		m.mu.Unlock()
+		if status == enums.SessionStatusCompleted || status == enums.SessionStatusError {
+			m.cleanupSessionTempDir(session.ID, tempDir)
+		}
 	}()
 
 	// 构建对话上下文（最近20条消息）

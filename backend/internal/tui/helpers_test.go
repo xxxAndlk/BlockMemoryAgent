@@ -300,3 +300,40 @@ func TestFirstMessagePendingDisplay(t *testing.T) {
 		t.Fatalf("首条消息内容应在对话区可见，got:\n%s", view)
 	}
 }
+
+// TestFirstMessageFallbackWhenSessionMissingUserMessage 验证：当选中会话的 Messages
+// 中尚未同步首条用户消息时，TUI 仍通过 pendingFirstMessage 兜底展示该消息，
+// 并以 "You" 高亮，避免首条问题"消失"。
+func TestFirstMessageFallbackWhenSessionMissingUserMessage(t *testing.T) {
+	m := &Model{
+		styles:              NewStyles(),
+		chatVP:              viewport.New(80, 20),
+		width:               80,
+		height:              24,
+		pendingFirstMessage: "hello fallback",
+		sessionsCursor:      0,
+		flashMu:             &sync.Mutex{},
+	}
+	m.chatVP.SetContent("")
+	// 构造一个已选中但 Messages 里暂时没有用户消息的会话
+	m.sessions = []*server.Session{{
+		ID:        "session-fallback",
+		Goal:      "other",
+		Status:    enums.SessionStatusRunning,
+		StartedAt: time.Now(),
+		Messages: []types.ChatMessage{
+			{Role: enums.ChatRoleSystem, Content: "Goal: other", Timestamp: time.Now()},
+		},
+		Events: []server.SessionEvent{},
+	}}
+
+	m.rebuildChatContent()
+	view := m.View()
+	t.Logf("fallback view:\n%s", view)
+	if !strings.Contains(view, "You") {
+		t.Fatal("pendingFirstMessage 兜底展示时应带有 'You' 标签")
+	}
+	if !strings.Contains(view, "hello fallback") {
+		t.Fatalf("pendingFirstMessage 内容应在对话区可见，got:\n%s", view)
+	}
+}

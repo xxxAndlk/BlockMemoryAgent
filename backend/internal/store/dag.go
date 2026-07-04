@@ -36,11 +36,11 @@ func EnsureDAGSchema(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
-// errDAGStoreNotReady 在 Postgres 未初始化（缺数据库/降级运行）时返回，
-// 让上层优雅降级（记日志、跳过 DAG 调度），而不是 nil 指针 panic。
-var errDAGStoreNotReady = fmt.Errorf("dag store not ready: postgres unavailable (degraded mode)")
+// errDAGStoreNotReady 在 Postgres 未初始化时返回，
+// 让上层明确报错（记日志、跳过 DAG 调度），而不是 nil 指针 panic。
+var errDAGStoreNotReady = fmt.Errorf("dag store not ready: postgres unavailable")
 
-// checkReady 校验 PostgresStore 已初始化，未初始化时返回降级错误而非 panic。
+// checkReady 校验 PostgresStore 已初始化，未初始化时返回错误而非 panic。
 // nil 接收者调用方法是合法的（Go 允许 typed-nil 调方法），真正的 panic 来自解引用 s.db。
 func (s *PostgresStore) checkReady() error {
 	if s == nil || s.db == nil {

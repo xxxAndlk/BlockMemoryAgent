@@ -258,11 +258,11 @@ const probePrompt = "ping"
 // 职责（P0-1）：
 //   - 候选角色 = meta/domain/lightweight + 每个 fixed_roles[].ID
 //   - 按 (provider,model,apikey,baseURL) 去重：roles.yaml 多角色常共享同一后端，去重后仅探测一次
-//   - APIKey 为空（Mock/无 key 模式）跳过，不阻塞启动
+//   - APIKey 为空视为未配置，加入失败列表，不允许 Mock/无 key 跳过启动
 //   - 每个唯一后端用 probeLLM 探测（3 次重试，短超时）
 //
 // 返回：
-//   - error: 任一角色不可达时返回聚合错误（列出全部失败角色），全部可达/跳过则返回 nil
+//   - error: 任一角色不可达或未配置时返回聚合错误（列出全部失败角色），全部可达则返回 nil
 //
 // 副作用：可能触发 GetModel 缓存填充（与 WarmUp 重叠，幂等）。
 // 并发安全：GetModel 内部锁保护。
@@ -279,8 +279,9 @@ func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 	var failed []string
 	for _, roleID := range roles {
 		cfg := f.resolveConfig(roleID)
-		// Mock/无 key 模式：跳过，视为 OK（保证服务可在无 LLM 环境启动）
+		// 严格启动：未配置 API Key 视为不可达，不跳过。
 		if cfg.APIKey == "" {
+			failed = append(failed, fmt.Sprintf("%s (api_key not configured)", roleID))
 			continue
 		}
 		key := cfg.Provider + "\x00" + cfg.Model + "\x00" + cfg.APIKey + "\x00" + cfg.BaseURL

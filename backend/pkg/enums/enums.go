@@ -92,27 +92,19 @@ const (
 // 3. 记忆压缩层级
 // ============================================================
 
-// CompressionLevel 记忆压缩层级:4 级递进压缩,权衡细节与 Token 成本。
+// CompressionLevel 记忆压缩层级：按设计文档简化为两级。
 // 见 internal/memory/compress.go。
-// 层级关系:Raw > Standard > Compact > Marker (递进丢弃细节)。
+// 层级关系：Raw（完整记录） > Standard（摘要）。
 type CompressionLevel int
 
 const (
-	// LevelRaw 完整原始记录:保留 FullObservation 等全部字段。
-	// 用于近期高频访问的 Episode,保留完整上下文供回放。
+	// LevelRaw 完整原始记录：保留 FullObservation 等全部字段。
+	// 用于近期高频访问的 Episode，保留完整上下文供回放。
 	LevelRaw CompressionLevel = iota
 
-	// LevelStandard 标准级:保留摘要 + Facts,丢弃 FullObservation。
-	// Episode 进入长期记忆后的默认层级,平衡可读性与成本。
+	// LevelStandard 标准级：保留摘要，丢弃 FullObservation。
+	// Episode 进入长期记忆后的默认层级，平衡可读性与成本。
 	LevelStandard
-
-	// LevelCompact 紧凑级:仅保留一句话 Summary。
-	// 长期未访问或重要性较低的 Episode 压缩到此级。
-	LevelCompact
-
-	// LevelMarker 标记级:仅保留存在性标记,内容已不可读。
-	// 仅用于"此 Episode 曾存在"的索引目的,不参与检索内容返回。
-	LevelMarker
 )
 
 // ============================================================

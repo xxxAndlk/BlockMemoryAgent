@@ -55,25 +55,39 @@ type Deps struct {
 // returned cleanup function closes stores and the memory callback handler; it
 // should be deferred by callers.
 func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, skillPath string) (*http.ServeMux, *Deps, func(), error) {
-	if _, err := os.Stat(envPath); err == nil {
-		if err := config.LoadEnvFile(envPath); err != nil {
-			return nil, nil, nil, fmt.Errorf("load env file: %w", err)
+	// 严格启动：任意配置文件不存在即失败，明确告知缺失项。
+	for path, name := range map[string]string{
+		cfgPath:  "config file",
+		rolePath: "roles file",
+		envPath:  "env file",
+		soulPath: "soul file",
+		skillPath: "skills file",
+	} {
+		if path == "" {
+			return nil, nil, nil, fmt.Errorf("%s path is required", name)
 		}
+		if _, err := os.Stat(path); err != nil {
+			return nil, nil, nil, fmt.Errorf("%s not found: %s", name, path)
+		}
+	}
+
+	if err := config.LoadEnvFile(envPath); err != nil {
+		return nil, nil, nil, fmt.Errorf("load env file %s: %w", envPath, err)
 	}
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("load config: %w", err)
+		return nil, nil, nil, fmt.Errorf("load config %s: %w", cfgPath, err)
 	}
 
 	roleCfg, err := pkgconfig.LoadRoleConfig(rolePath)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("load roles: %w", err)
+		return nil, nil, nil, fmt.Errorf("load roles %s: %w", rolePath, err)
 	}
 
 	pgStore, err := store.NewPostgresStore(cfg.Postgres.DSN)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("postgres: %w", err)
+		return nil, nil, nil, fmt.Errorf("connect postgres with DSN from %s: %w", cfgPath, err)
 	}
 	pgStore.SetEmbeddingDim(cfg.PgVector.Dimensions)
 
@@ -101,21 +115,19 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	redisStore, err := store.NewRedisStore(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
 		pgStore.Close()
-		return nil, nil, nil, fmt.Errorf("redis: %w", err)
+		return nil, nil, nil, fmt.Errorf("connect redis with addr from %s: %w", cfgPath, err)
 	}
 
 	snapshotMgr := memory.NewSnapshotManager(redisStore, pgStore)
 	writeProcessor := memory.NewWriteProcessor(pgStore)
-	memoryCallbackHandler := memory.NewCallbackHandler(writeProcessor, snapshotMgr, nil, pgStore)
-	if err := memoryCallbackHandler.ReplayDeadLetters(ctx); err != nil {
-		log.Printf("warning: replay dead letters: %v", err)
-	}
+	memoryCallbackHandler := memory.NewCallbackHandler(writeProcessor, snapshotMgr, nil)
 	episodeCompressor := memory.NewCompressor(pgStore)
 	sessionLogger := logger.New(pgStore)
 	contextAssembler := memory.NewContextAssembler(
 		memory.NewSimpleWorkspaceReader(),
 		&globalKBAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions},
 		pgStore,
+		cfg.Agent.ContextWindow,
 	)
 
 	modelFactory := model.NewModelFactory(roleCfg)
@@ -124,8 +136,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		redisStore.Close()
 		return nil, nil, nil, fmt.Errorf("warmup models: %w", err)
 	}
-	// P0-1：启动期 LLM 连通性校验。任一已配置角色不可达（3 次重试后仍失败）
-	// 则装配失败，上层 main.go log.Fatalf 报告未连通角色。Mock/无 key 角色自动跳过。
+	// 启动期 LLM 连通性校验：任一已配置角色不可达则装配失败。
 	if err := modelFactory.VerifyConnectivity(ctx); err != nil {
 		pgStore.Close()
 		redisStore.Close()
@@ -135,26 +146,11 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	registry := graph.NewRoleRegistry(roleCfg)
 	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
 
-	if soulPath == "" {
-		pgStore.Close()
-		redisStore.Close()
-		return nil, nil, nil, fmt.Errorf("soul path is required")
-	}
-	if _, err := os.Stat(soulPath); err != nil {
-		pgStore.Close()
-		redisStore.Close()
-		return nil, nil, nil, fmt.Errorf("soul file not found: %w", err)
-	}
-	if _, err := os.Stat(skillPath); err != nil {
-		pgStore.Close()
-		redisStore.Close()
-		return nil, nil, nil, fmt.Errorf("skill file not found: %w", err)
-	}
 	skillPool, err := skill.LoadFromYAML(skillPath)
 	if err != nil {
 		pgStore.Close()
 		redisStore.Close()
-		return nil, nil, nil, fmt.Errorf("load skills: %w", err)
+		return nil, nil, nil, fmt.Errorf("load skills %s: %w", skillPath, err)
 	}
 
 	rt := runtime.New(soulPath, skillPool)

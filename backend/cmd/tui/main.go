@@ -2,7 +2,7 @@ package main
 
 // cmd/tui 是 bubbletea 终端 UI 入口：在进程内直接持有 Runtime / SessionManager / Graph，
 // 同时启动一个本地 HTTP 端口供 TUI 输入栏调用 /api/sessions/* /api/dag/*。
-// 基础设施（Postgres/Redis/API key）缺失时降级运行，保证无外部依赖也能启动。
+// 启动策略为严格模式：任一必需配置文件缺失，或 PostgreSQL / LLM 后端不可达，立即失败并明确报告。
 
 import (
 	"context"
@@ -44,16 +44,26 @@ func main() {
 	noAltScreen := flag.Bool("no-alt-screen", false, "禁用 alt-screen（CI 或非 TTY 自动禁用）")
 	flag.Parse()
 
-	if _, err := os.Stat(*envPath); err == nil {
-		if err := config.LoadEnvFile(*envPath); err != nil {
-			log.Printf("warning: load .env: %v", err)
+	// 严格启动：任一必需配置文件缺失即失败。
+	for path, name := range map[string]string{
+		*configPath: "config file",
+		*rolePath:   "roles file",
+		*envPath:    "env file",
+		*soulPath:   "soul file",
+		*skillPath:  "skills file",
+	} {
+		if _, err := os.Stat(path); err != nil {
+			log.Fatalf("%s not found: %s", name, path)
 		}
+	}
+
+	if err := config.LoadEnvFile(*envPath); err != nil {
+		log.Fatalf("load .env: %v", err)
 	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Printf("warning: load config: %v; using defaults", err)
-		cfg = &config.Config{}
+		log.Fatalf("load config: %v", err)
 	}
 
 	// 日志文件输出（TUI 入口）：按天分割到 logs/tui-YYYY-MM-DD.log
@@ -73,35 +83,35 @@ func main() {
 
 	ctx := context.Background()
 
-	var pgStore *store.PostgresStore
-	if cfg.Postgres.DSN != "" {
-		var err error
-		pgStore, err = store.NewPostgresStore(cfg.Postgres.DSN)
-		if err != nil {
-			log.Printf("warning: postgres unavailable: %v", err)
-		} else {
-			defer pgStore.Close()
-			if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
-				log.Printf("warning: session_history schema: %v", err)
-			}
-			if err := store.EnsureSessionEventsSchema(ctx, pgStore.DB()); err != nil {
-				log.Printf("warning: session_events schema: %v", err)
-			}
-			if err := store.EnsureDAGSchema(ctx, pgStore.DB()); err != nil {
-				log.Printf("warning: dag_jobs schema: %v", err)
-			}
-		}
+	if cfg.Postgres.DSN == "" {
+		log.Fatalf("postgres DSN not configured in %s", *configPath)
+	}
+	pgStore, err := store.NewPostgresStore(cfg.Postgres.DSN)
+	if err != nil {
+		log.Fatalf("connect postgres: %v", err)
+	}
+	defer pgStore.Close()
+	if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
+		log.Fatalf("ensure session_history schema: %v", err)
+	}
+	if err := store.EnsureSessionEventsSchema(ctx, pgStore.DB()); err != nil {
+		log.Fatalf("ensure session_events schema: %v", err)
+	}
+	if err := store.EnsureDAGSchema(ctx, pgStore.DB()); err != nil {
+		log.Fatalf("ensure dag_jobs schema: %v", err)
+	}
+	if err := store.EnsureInitialMemorySchema(ctx, pgStore.DB()); err != nil {
+		log.Fatalf("ensure memory schema: %v", err)
 	}
 
 	roleCfg, err := pkgconfig.LoadRoleConfig(*rolePath)
 	if err != nil {
-		log.Printf("warning: load role config: %v; using defaults", err)
-		roleCfg = defaultRoleConfig()
+		log.Fatalf("load roles: %v", err)
 	}
 
 	modelFactory := model.NewModelFactory(roleCfg)
 	if err := modelFactory.WarmUp(ctx); err != nil {
-		log.Printf("warning: model warmup: %v; mock fallback may be used", err)
+		log.Fatalf("warmup models: %v", err)
 	}
 	// P0-1：启动期 LLM 连通性校验，失败则启动失败并报告未连通角色。
 	if err := modelFactory.VerifyConnectivity(ctx); err != nil {
@@ -116,17 +126,9 @@ func main() {
 	registry := graph.NewRoleRegistry(roleCfg)
 	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
 
-	var skillPool *skill.Pool
-	if _, err := os.Stat(*skillPath); err == nil {
-		pool, err := skill.LoadFromYAML(*skillPath)
-		if err != nil {
-			log.Printf("warning: load skills: %v; using builtin", err)
-			skillPool = skill.BuiltinPool()
-		} else {
-			skillPool = pool
-		}
-	} else {
-		skillPool = skill.BuiltinPool()
+	skillPool, err := skill.LoadFromYAML(*skillPath)
+	if err != nil {
+		log.Fatalf("load skills: %v", err)
 	}
 
 	rt := runtime.New(*soulPath, skillPool)
@@ -135,24 +137,18 @@ func main() {
 	}
 
 	// 结构化日志器：TUI 模式下与标准 log 共用同一文件 writer，避免 JSON 日志刷到终端顶乱布局。
-	// 仍写 session_logs 表（若 Postgres 可用）。
+	// 仍写 session_logs 表。
 	var sessionLogger *logger.Logger
 	logWriter := logging.Writer()
 	if logWriter == nil {
 		logWriter = os.Stderr
 	}
-	if pgStore != nil {
-		sessionLogger = logger.NewWithWriter(pgStore, logWriter)
-	} else {
-		sessionLogger = logger.NewWithWriter(nil, logWriter)
-	}
+	sessionLogger = logger.NewWithWriter(pgStore, logWriter)
 
 	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
 	metaAgent.SetModelFactory(modelFactory)
 	metaAgent.SetRuntime(rt)
-	if pgStore != nil {
-		metaAgent.SetHistoryStore(&pgHistoryAdapter{pg: pgStore})
-	}
+	metaAgent.SetHistoryStore(&pgHistoryAdapter{pg: pgStore})
 	escalation := graph.NewEscalationHandlerNode()
 	sinker := &sinkerNode{}
 
@@ -170,16 +166,10 @@ func main() {
 	sessionMgr.SetModelFactory(modelFactory) // 注入模型工厂，续话时调轻量模型总结历史
 
 	// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
+	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})
 
-	if pgStore != nil {
-		threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})
-	}
-
-	// Postgres 缺失时不启动 DAG 调度器，避免 nil 解引用 panic；DAG 功能降级为不可用。
 	var dagScheduler *dag.Scheduler
-	if pgStore == nil {
-		log.Printf("warning: postgres unavailable, DAG scheduler disabled (degraded mode)")
-	} else {
+	if cfg.Agent.DAGEnabled {
 		dagScheduler = dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
 		dagScheduler.Start(ctx)
 	}
@@ -205,9 +195,7 @@ func main() {
 	mux.Handle("/api/dag/", dagHandler)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		pgOnline := pgStore != nil
-		llmOnline := modelFactory != nil
-		fmt.Fprintf(w, `{"postgres":{"online":%v},"redis":{"online":false,"detail":"not configured in TUI"},"llm":{"online":%v}}`, pgOnline, llmOnline)
+		fmt.Fprint(w, `{"postgres":{"online":true},"redis":{"online":false,"detail":"not configured in TUI"},"llm":{"online":true}}`)
 	})
 
 	// 监听 127.0.0.1:0 让内核分配空闲端口，避免与其他进程冲突；端口通过 ln.Addr() 回传给 TUI
@@ -366,13 +354,4 @@ func (a *pgHistoryAdapter) RecentSessionHistories(ctx context.Context, limit int
 	return out, nil
 }
 
-func defaultRoleConfig() *pkgconfig.RoleConfigFile {
-	return &pkgconfig.RoleConfigFile{
-		MetaAgent:   pkgconfig.MetaAgentConfig{MaxBlocks: 5, SummaryInterval: 3},
-		DomainAgent: pkgconfig.DomainAgentConfig{},
-		FixedRoles: []types.RoleDefinition{
-			{ID: "code_assistant", Name: "代码助手", Type: enums.RoleTypeFixed, Lifecycle: enums.RoleLifecyclePermanent, Description: "代码编写与审查", Skills: []string{"代码编写", "代码审查"}, Keywords: []string{"代码", "bug"}, CanBeCalled: true},
-			{ID: "ui_assistant", Name: "UI助手", Type: enums.RoleTypeFixed, Lifecycle: enums.RoleLifecyclePermanent, Description: "前端UI实现", Skills: []string{"UI修复", "组件开发"}, Keywords: []string{"UI", "样式"}, CanBeCalled: true},
-		},
-	}
-}
+

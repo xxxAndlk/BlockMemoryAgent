@@ -93,15 +93,27 @@ type Config struct {
 //
 // 设计意图：原 v3 §4.4 举例 3000 token 在实际使用中过低——一次 ReadFile 输出
 // （如 CLAUDE.md ≈ 3700 token）就会触发硬驱逐，导致会话被强制结束、
-// 写文件等关键动作来不及执行。提高到 soft=12000 / hard=20000，
+// 写文件等关键动作来不及执行。默认基于 32k 上下文窗口设置 soft=16000 / hard=25600，
 // 兼容一般 LLM 上下文窗口（≥128k）下的多轮工具调用。
 //
-// 返回：soft=12000、hard=20000 的 Config。
+// 返回：soft=16000、hard=25600 的 Config。
 func DefaultConfig() Config {
-	return Config{
-		SoftLimit: 12000, // 软阈值：达到后建议压缩
-		HardLimit: 20000, // 硬阈值：达到后必须驱逐
+	return ConfigForWindow(32000)
+}
+
+// ConfigForWindow 根据给定的上下文窗口总 token 数推导软/硬阈值。
+// 比例：soft = 50% contextWindow，hard = 80% contextWindow，
+// 保证硬阈值始终比软阈值大至少 600 token 的安全余量。
+func ConfigForWindow(contextWindow int) Config {
+	if contextWindow <= 0 {
+		contextWindow = 32000
 	}
+	soft := contextWindow * 50 / 100
+	hard := contextWindow * 80 / 100
+	if hard <= soft+600 {
+		hard = soft + 600
+	}
+	return Config{SoftLimit: soft, HardLimit: hard}
 }
 
 // Watchdog 是上下文长度看门狗的核心结构，持有阈值配置与决策历史。
@@ -126,17 +138,30 @@ type Watchdog struct {
 //
 // 副作用：可能修改 cfg 的局部副本（按值传入，不影响调用方）。
 func New(cfg Config) *Watchdog {
-	// 软阈值非法时回退到默认值，避免 0 导致所有文本都触发压缩
+	cfg = normalizeConfig(cfg)
+	// max=200 限制历史决策条数，防止长会话内存无限增长
+	return &Watchdog{cfg: cfg, max: 200}
+}
+
+// SetConfig 运行时更新 Watchdog 阈值。
+// 用于 Runtime.SetAgentConfig 注入用户配置的 context_window 后同步调整软/硬阈值。
+// 并发安全：持写锁更新 cfg。
+func (w *Watchdog) SetConfig(cfg Config) {
+	cfg = normalizeConfig(cfg)
+	w.mu.Lock()
+	w.cfg = cfg
+	w.mu.Unlock()
+}
+
+// normalizeConfig 对阈值做兜底修正。
+func normalizeConfig(cfg Config) Config {
 	if cfg.SoftLimit <= 0 {
 		cfg.SoftLimit = DefaultConfig().SoftLimit
 	}
-	// 硬阈值必须大于软阈值，否则 Check 的 switch 永远走不到 Evict；
-	// 这里强制拉开 600 token 的安全余量
 	if cfg.HardLimit <= cfg.SoftLimit {
 		cfg.HardLimit = cfg.SoftLimit + 600
 	}
-	// max=200 限制历史决策条数，防止长会话内存无限增长
-	return &Watchdog{cfg: cfg, max: 200}
+	return cfg
 }
 
 // Check 评估指定 Agent 的当前上下文规模并返回决策。

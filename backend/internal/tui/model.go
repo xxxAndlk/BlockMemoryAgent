@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -42,12 +43,17 @@ type Model struct {
 	chatVP              viewport.Model
 	chatCursor          int
 	chatFollowBottom    bool
-	chatLastItems       int  // 用于检测会话内容变化，决定是否重建 viewport content
-	chatLastWidth       int  // 上次生成 content 时的宽度
-	chatItemOffsets     []int // 每个 chatItem 在 viewport content 中的起始行偏移
-	pendingScrollToUser bool  // 发送消息后优先滚动到用户问题
-	chatAnchorUser      bool  // 已锚定到用户问题，禁止自动跟随底部
+	chatLastItems       int    // 用于检测会话内容变化，决定是否重建 viewport content
+	chatLastWidth       int    // 上次生成 content 时的宽度
+	chatItemOffsets     []int  // 每个 chatItem 在 viewport content 中的起始行偏移
+	pendingScrollToUser bool   // 发送消息后优先滚动到用户问题
+	chatAnchorUser      bool   // 已锚定到用户问题，禁止自动跟随底部
 	pendingFirstMessage string // 无会话时用户发送的首条消息，用于立即切换到对话视图并高亮展示
+
+	// scrollbar drag state
+	scrollbarDragging bool // 是否正在拖动聊天区滚动条滑块
+	dragStartY        int  // 拖动开始时鼠标 Y 坐标
+	dragStartOffset   int  // 拖动开始时 viewport YOffset
 
 	// accumulated token counts from token_usage events
 	totalInputTokens  int
@@ -109,21 +115,21 @@ func NewModel(
 	modelName string,
 ) *Model {
 	m := &Model{
-		sessionMgr:        sessionMgr,
-		registry:          registry,
-		rt:                rt,
-		dagHandler:        dagHandler,
-		pgStore:           pgStore,
-		httpAddr:          httpAddr,
-		modelName:         modelName,
-		styles:            NewStyles(),
-		focus:             panelChat,
-		chatFollowBottom:  true,
-		planBarVisible:    true,
-		inputHistIdx:      -1,
-		inputHistory:      make(map[string][]string),
-		flashMu:           &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
-		chatVP:            viewport.New(0, 0),
+		sessionMgr:       sessionMgr,
+		registry:         registry,
+		rt:               rt,
+		dagHandler:       dagHandler,
+		pgStore:          pgStore,
+		httpAddr:         httpAddr,
+		modelName:        modelName,
+		styles:           NewStyles(),
+		focus:            panelChat,
+		chatFollowBottom: true,
+		planBarVisible:   true,
+		inputHistIdx:     -1,
+		inputHistory:     make(map[string][]string),
+		flashMu:          &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
+		chatVP:           viewport.New(0, 0),
 	}
 	m.chatVP.SetContent("")
 	m.refreshSessions()
@@ -158,7 +164,26 @@ func (m *Model) selectSession(idx int) {
 		return
 	}
 	m.sessionsCursor = idx
-	m.pendingFirstMessage = "" // 会话已选中，首条消息已由服务端保存，清除本地预展示
+	// 只有在确认服务端会话的 Messages 中已包含同一条首条用户消息时，
+	// 才清除本地预展示；否则保留 pendingFirstMessage，由 buildChatContent
+	// 继续展示，避免选中后首条消息"消失"的竞态错觉。
+	if m.pendingFirstMessage != "" {
+		s := m.selectedSession()
+		found := false
+		if s != nil {
+			for _, msg := range s.Messages {
+				if msg.Role == enums.ChatRoleUser && strings.TrimSpace(msg.Content) == m.pendingFirstMessage {
+					found = true
+					break
+				}
+			}
+		}
+		if found {
+			m.pendingFirstMessage = ""
+		} else {
+			log.Printf("[tui] selectSession: session %s 尚未同步首条用户消息，保留本地预展示", m.sessions[idx].ID)
+		}
+	}
 	m.chatCursor = 0
 	m.chatFollowBottom = true
 	m.chatAnchorUser = false
@@ -327,6 +352,11 @@ func (m *Model) selectedSession() *server.Session {
 	if m.sessionsCursor < 0 || m.sessionsCursor >= len(m.sessions) {
 		return nil
 	}
+	// 测试或降级场景：无 SessionManager 时直接返回本地 sessions 的浅拷贝。
+	if m.sessionMgr == nil {
+		s := *m.sessions[m.sessionsCursor]
+		return &s
+	}
 	// 返回持锁深拷贝（T1 修复：原直接返回 *Session 指针，TUI 在 tea 主 goroutine
 	// 无锁读 Events/Messages/State，与后台 runSession/addEventDebug 的并发写产生
 	// data race，事件量大时可能 slice 迭代越界 panic 或读取半更新 State 指针）。
@@ -379,23 +409,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 发送消息后，优先滚动到最后一条用户问题，确保用户能看到自己的输入。
 		// 该逻辑必须排在内容重建/自动跟随底部之前，防止新内容把用户问题顶出视口。
 		if m.pendingScrollToUser {
-			if s := m.selectedSession(); s != nil {
-				items := chatItems(s, true)
-				for idx := len(items) - 1; idx >= 0; idx-- {
-					if strings.HasPrefix(items[idx].title, "> ") {
-						m.rebuildChatContent()
-						// 把用户问题底部对齐视口底部，保留上方历史可见；
-						// 同时锚定，让后续流式输出在下方展开而不把用户问题顶走。
-						m.chatScrollToItemBottom(idx)
-						m.chatFollowBottom = false
-						m.chatAnchorUser = true
-						m.pendingScrollToUser = false
-						break
+			items := m.collectChatItems()
+			for idx := len(items) - 1; idx >= 0; idx-- {
+				if strings.HasPrefix(items[idx].title, "> ") {
+					m.rebuildChatContent()
+					// 把用户问题底部对齐视口底部，保留上方历史可见；
+					// 同时锚定，让后续流式输出在下方展开而不把用户问题顶走。
+					m.chatScrollToItemBottom(idx)
+					m.chatFollowBottom = false
+					m.chatAnchorUser = true
+					m.pendingScrollToUser = false
+					// 找到真实用户消息后，若其内容与本地预展示一致，清除预展示标记
+					if m.pendingFirstMessage != "" && strings.TrimPrefix(items[idx].title, "> ") == m.pendingFirstMessage {
+						m.pendingFirstMessage = ""
 					}
+					break
 				}
-				// 未找到用户消息时保留 pendingScrollToUser，等待服务端写入后再试
 			}
-			// 无选中会话时也保留 pendingScrollToUser，等待 createSession 异步完成并 selectSession 后再滚动
+			// 未找到用户消息时保留 pendingScrollToUser，等待服务端写入或本地兜底展示后再试
 		}
 		// viewport 内容随会话事件/消息增长而重建；跟随底部时自动滚到最新。
 		// 锚定到用户问题时仅重建内容、不自动滚动，避免用户问题被顶出视口。
@@ -444,7 +475,47 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.clampOverlayCursor()
 		return m, nil
 	}
-	// Otherwise route mouse to the chat viewport.
+
+	// 滚轮始终交给 viewport 处理。
+	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+		var cmd tea.Cmd
+		m.chatVP, cmd = m.chatVP.Update(msg)
+		m.chatFollowBottom = m.chatVP.AtBottom()
+		m.chatAnchorUser = false
+		return m, cmd
+	}
+
+	// 滚动条拖动处理。
+	sx, sy, sw, sh := m.scrollbarArea()
+	inScrollbar := msg.X >= sx && msg.X < sx+sw && msg.Y >= sy && msg.Y < sy+sh
+
+	if m.scrollbarDragging {
+		// 拖动过程中：根据鼠标 Y 位移实时更新 viewport offset。
+		// 释放事件（Release）也走这里，先更新位置再结束拖动。
+		m.updateScrollbarDrag(msg.Y)
+		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionRelease {
+			m.scrollbarDragging = false
+		}
+		return m, nil
+	}
+
+	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress && inScrollbar {
+		thumbStart, thumbEnd := m.scrollbarThumbBounds()
+		relY := msg.Y - sy
+		if thumbStart >= 0 && relY >= thumbStart && relY <= thumbEnd {
+			// 点击滑块：开始拖动。
+			m.scrollbarDragging = true
+			m.dragStartY = msg.Y
+			m.dragStartOffset = m.chatVP.YOffset
+			return m, nil
+		}
+		// 点击轨道但不在滑块上：跳转（以滑块中心对齐鼠标位置）。
+		thumbH := thumbEnd - thumbStart + 1
+		m.scrollToThumbY(relY - thumbH/2)
+		return m, nil
+	}
+
+	// 默认交给 viewport 处理内容区点击等。
 	var cmd tea.Cmd
 	m.chatVP, cmd = m.chatVP.Update(msg)
 	m.chatFollowBottom = m.chatVP.AtBottom()
@@ -649,8 +720,8 @@ func (m *Model) chatGotoBottom() {
 // rebuildChatContent 根据当前窗口尺寸把当前会话内容渲染成带样式的字符串，
 // 并同步到 viewport。ScrollToBottom 由调用方按需执行。
 func (m *Model) rebuildChatContent() {
-	s := m.selectedSession()
-	if s == nil && m.pendingFirstMessage == "" {
+	items := m.collectChatItems()
+	if len(items) == 0 {
 		m.chatVP.SetContent("")
 		m.chatLastItems = 0
 		return
@@ -661,11 +732,7 @@ func (m *Model) rebuildChatContent() {
 	}
 	content := m.buildChatContent(w)
 	m.chatVP.SetContent(content)
-	if s != nil {
-		m.chatLastItems = len(chatItems(s, true))
-	} else {
-		m.chatLastItems = 1 // 本地预展示的首条用户消息
-	}
+	m.chatLastItems = len(items)
 	m.chatLastWidth = w
 }
 
@@ -869,4 +936,117 @@ func clamp(v, lo, hi int) int {
 		return hi
 	}
 	return v
+}
+
+// scrollbarArea 返回聊天区滚动条在屏幕上的范围（x, y, w, h）。
+// 顶栏占 1 行，滚动条位于对话区最右侧，宽度 1。
+func (m *Model) scrollbarArea() (x, y, w, h int) {
+	x = m.chatAreaWidth() - 2 // 扣除 gap(1) + scrollbar 宽度(1)
+	if x < 0 {
+		x = 0
+	}
+	y = 1 // 顶栏占 1 行
+	w = 1
+	h = m.mainContentHeight()
+	return
+}
+
+// scrollbarThumbBounds 返回滑块在滚动条区域内的起始/结束行索引（含）。
+// 若内容无需滚动则返回 (-1, -1)。
+func (m *Model) scrollbarThumbBounds() (start, end int) {
+	totalLines := m.chatVP.TotalLineCount()
+	viewportH := m.chatVP.VisibleLineCount()
+	h := m.mainContentHeight()
+	if totalLines <= viewportH || viewportH <= 0 || h < 1 {
+		return -1, -1
+	}
+	scrollable := totalLines - viewportH
+	if scrollable < 1 {
+		scrollable = 1
+	}
+	thumbH := h * viewportH / totalLines
+	if thumbH < 1 {
+		thumbH = 1
+	}
+	if thumbH > h {
+		thumbH = h
+	}
+	thumbPos := m.chatVP.YOffset * (h - thumbH) / scrollable
+	if thumbPos < 0 {
+		thumbPos = 0
+	}
+	if thumbPos+thumbH > h {
+		thumbPos = h - thumbH
+	}
+	return thumbPos, thumbPos + thumbH - 1
+}
+
+// updateScrollbarDrag 根据当前鼠标 Y 坐标更新 viewport 滚动位置。
+// 以 dragStartY/dragStartOffset 为基准，按滑块可移动范围与内容可滚动范围的比率映射。
+func (m *Model) updateScrollbarDrag(mouseY int) {
+	totalLines := m.chatVP.TotalLineCount()
+	viewportH := m.chatVP.VisibleLineCount()
+	h := m.mainContentHeight()
+	if totalLines <= viewportH || viewportH <= 0 || h < 1 {
+		return
+	}
+	scrollable := totalLines - viewportH
+	thumbH := h * viewportH / totalLines
+	if thumbH < 1 {
+		thumbH = 1
+	}
+	if thumbH > h {
+		thumbH = h
+	}
+	maxThumbTravel := h - thumbH
+	if maxThumbTravel < 1 {
+		maxThumbTravel = 1
+	}
+	deltaY := mouseY - m.dragStartY
+	deltaOffset := deltaY * scrollable / maxThumbTravel
+	newOffset := m.dragStartOffset + deltaOffset
+	if newOffset < 0 {
+		newOffset = 0
+	}
+	if newOffset > scrollable {
+		newOffset = scrollable
+	}
+	m.chatVP.YOffset = newOffset
+	m.chatFollowBottom = m.chatVP.AtBottom()
+	m.chatAnchorUser = false
+}
+
+// scrollToThumbY 将滑块中心对齐到滚动条区域内的指定 Y 坐标（相对于滚动条顶部）。
+func (m *Model) scrollToThumbY(thumbCenterY int) {
+	totalLines := m.chatVP.TotalLineCount()
+	viewportH := m.chatVP.VisibleLineCount()
+	h := m.mainContentHeight()
+	if totalLines <= viewportH || viewportH <= 0 || h < 1 {
+		return
+	}
+	scrollable := totalLines - viewportH
+	thumbH := h * viewportH / totalLines
+	if thumbH < 1 {
+		thumbH = 1
+	}
+	if thumbH > h {
+		thumbH = h
+	}
+	maxPos := h - thumbH
+	if maxPos < 1 {
+		maxPos = 1
+	}
+	pos := thumbCenterY
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > maxPos {
+		pos = maxPos
+	}
+	m.chatVP.YOffset = pos * scrollable / maxPos
+	if m.chatVP.YOffset > scrollable {
+		m.chatVP.YOffset = scrollable
+	}
+	m.chatFollowBottom = m.chatVP.AtBottom()
+	m.chatAnchorUser = false
 }

@@ -40,11 +40,9 @@ func (h *DAGHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/dag")
 	path = strings.Trim(path, "/")
 
-	// 降级守卫：Postgres 不可用时 store/scheduler 可能为 nil。
-	// 不直接返回 503 而是放行——store 方法已会返回降级错误（HTTP 500），
-	// 仅 /running 与 /trigger 依赖 scheduler，需单独拦截避免 nil 解引用 panic。
+	// 可用性守卫：DAG 未启用时 scheduler 为 nil，避免 nil 解引用 panic。
 	if h.Scheduler == nil {
-		http.Error(w, "dag scheduler disabled: postgres unavailable (degraded mode)", http.StatusServiceUnavailable)
+		http.Error(w, "dag scheduler disabled", http.StatusServiceUnavailable)
 		return
 	}
 

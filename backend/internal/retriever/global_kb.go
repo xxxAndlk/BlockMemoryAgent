@@ -77,7 +77,7 @@ func NewGlobalKnowledgeRetriever(vectorDB VectorDB, metaDB MetaStore, embedder E
 //
 //	计数失败被静默忽略，不影响主流程返回。
 func (r *GlobalKnowledgeRetriever) Retrieve(ctx context.Context, query string, topK int) ([]*types.KnowledgeRecord, error) {
-	// topK 非正数时回退为默认召回数量 5，保证调用方零配置可用。
+	// topK 非正数时回退为默认召回数量 5，避免无效参数导致空召回。
 	if topK <= 0 {
 		topK = 5
 	}

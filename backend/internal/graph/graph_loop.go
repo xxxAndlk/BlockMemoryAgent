@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -58,9 +59,12 @@ func (g *ThreeLayerGraph) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	repeatCount := 0
 
 	for {
-		// 1. wall-clock 超时检查
+		// 1. wall-clock 超时 / 取消检查
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("会话 wall-clock 超时 (%v)，状态机终止 (已执行 %d 步)", sessionTimeout, stepCount)
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("会话 wall-clock 超时 (%v)，状态机终止 (已执行 %d 步)", sessionTimeout, stepCount)
+			}
+			return nil, fmt.Errorf("会话被取消或上下文终止 (原因=%v，已执行 %d 步)", err, stepCount)
 		}
 		stepCount++
 

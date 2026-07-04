@@ -89,18 +89,19 @@ func (s *PostgresStore) DB() *sql.DB {
 //   - ep:      待持久化的 Episode (含重要性、时间戳、内容)
 //
 // 返回: SQL 执行错误。
-// 副作用: 写入一行新记录;compression_level 字段使用数据库默认值 0 (Raw 层级)。
+// 副作用: 写入一行新记录;compression_level 根据 FullObservation 是否为空自动判定 Raw/Standard。
 func (s *PostgresStore) SaveEpisode(ctx context.Context, agentID, topicID string, ep *types.Episode) error {
 	// 将 Episode 整体序列化为 JSON,存入 JSONB 列 episode
 	data, err := json.Marshal(ep)
 	if err != nil {
 		return fmt.Errorf("marshal episode: %w", err)
 	}
+	level := compressionLevelOf(ep)
 	// 插入行,importance_score 单独冗余以便后续按重要性排序
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO agent_private_memory (agent_id, topic_id, episode, importance_score, step_count, created_at)
-		VALUES ($1, $2, $3, $4, 0, $5)
-	`, agentID, topicID, data, ep.Importance, ep.Timestamp)
+		INSERT INTO agent_private_memory (agent_id, topic_id, episode, compression_level, importance_score, step_count, created_at)
+		VALUES ($1, $2, $3, $4, $5, 0, $6)
+	`, agentID, topicID, data, level, ep.Importance, ep.Timestamp)
 	return err
 }
 
@@ -111,12 +112,22 @@ func (s *PostgresStore) SaveEpisodeWithStepCount(ctx context.Context, agentID, t
 	if err != nil {
 		return fmt.Errorf("marshal episode: %w", err)
 	}
+	level := compressionLevelOf(ep)
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO agent_private_memory (agent_id, topic_id, episode, importance_score, step_count, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO agent_private_memory (agent_id, topic_id, episode, compression_level, importance_score, step_count, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (agent_id, topic_id, step_count) DO NOTHING
-	`, agentID, topicID, data, ep.Importance, stepCount, ep.Timestamp)
+	`, agentID, topicID, data, level, ep.Importance, stepCount, ep.Timestamp)
 	return err
+}
+
+// compressionLevelOf 根据 Episode 内容推断压缩层级。
+// FullObservation 为空表示已压缩到 Standard，否则为 Raw。
+func compressionLevelOf(ep *types.Episode) int {
+	if ep.FullObservation == "" {
+		return int(enums.LevelStandard)
+	}
+	return int(enums.LevelRaw)
 }
 
 // IsDuplicateError 判断错误是否为 PostgreSQL 唯一约束冲突（23505）。
@@ -125,57 +136,6 @@ func (s *PostgresStore) IsDuplicateError(err error) bool {
 		return pgErr.Code == "23505"
 	}
 	return false
-}
-
-// SaveMemoryWriteFailure 将失败的记忆写入记录到死信表。
-func (s *PostgresStore) SaveMemoryWriteFailure(ctx context.Context, agentID, topicID string, stepCount int, action, rawContent, errMsg string, retryCount int) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO memory_write_failures (agent_id, topic_id, step_count, action, raw_content, error, retry_count, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-	`, agentID, topicID, stepCount, action, rawContent, errMsg, retryCount)
-	return err
-}
-
-// QueryUnresolvedMemoryWriteFailures 查询未解析的记忆写入死信记录。
-func (s *PostgresStore) QueryUnresolvedMemoryWriteFailures(ctx context.Context, limit int) ([]*types.MemoryWriteFailure, error) {
-	if limit <= 0 {
-		limit = 1000
-	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, agent_id, topic_id, step_count, action, raw_content, error, retry_count, created_at, resolved_at
-		FROM memory_write_failures
-		WHERE resolved_at IS NULL
-		ORDER BY created_at ASC
-		LIMIT $1
-	`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []*types.MemoryWriteFailure
-	for rows.Next() {
-		var f types.MemoryWriteFailure
-		var resolvedAt sql.NullTime
-		if err := rows.Scan(&f.ID, &f.AgentID, &f.TopicID, &f.StepCount, &f.Action, &f.RawContent, &f.Error, &f.RetryCount, &f.CreatedAt, &resolvedAt); err != nil {
-			continue
-		}
-		if resolvedAt.Valid {
-			f.ResolvedAt = &resolvedAt.Time
-		}
-		out = append(out, &f)
-	}
-	return out, rows.Err()
-}
-
-// ResolveMemoryWriteFailure 将死信记录标记为已解析。
-func (s *PostgresStore) ResolveMemoryWriteFailure(ctx context.Context, id int) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE memory_write_failures
-		SET resolved_at = NOW()
-		WHERE id = $1
-	`, id)
-	return err
 }
 
 // GetEpisodes 获取 Agent 在指定话题下的全部 Episode (按创建时间倒序)。
@@ -220,47 +180,6 @@ func (s *PostgresStore) GetEpisodes(ctx context.Context, agentID, topicID string
 	return episodes, rows.Err()
 }
 
-// GetEpisodesByLevel 按压缩层级过滤 Episode。
-// 参数:
-//   - agentID, topicID: 检索范围
-//   - level: Raw/Standard/Compact/Marker 之一
-//   - limit: 返回上限,<=0 时默认 100
-//
-// 返回: 按重要性降序、再按创建时间倒序的 Episode 切片。
-// 设计意图: 压缩管道各阶段拉取对应层级的记忆做组装。
-func (s *PostgresStore) GetEpisodesByLevel(ctx context.Context, agentID, topicID string, level enums.CompressionLevel, limit int) ([]*types.Episode, error) {
-	if limit <= 0 {
-		// 兜底默认值
-		limit = 100
-	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT episode FROM agent_private_memory
-		WHERE agent_id = $1 AND topic_id = $2 AND compression_level = $3
-		ORDER BY importance_score DESC, created_at DESC
-		LIMIT $4
-	`, agentID, topicID, int(level), limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var episodes []*types.Episode
-	for rows.Next() {
-		var raw []byte
-		// 读取 JSONB 原始字节
-		if err := rows.Scan(&raw); err != nil {
-			continue
-		}
-		var ep types.Episode
-		// 反序列化失败跳过当前行
-		if err := json.Unmarshal(raw, &ep); err != nil {
-			continue
-		}
-		episodes = append(episodes, &ep)
-	}
-	return episodes, rows.Err()
-}
-
 // CountEpisodes 统计 Agent 在某话题下的 Episode 总数。
 // 返回: 行数与查询错误;用于触发压缩阈值判断。
 func (s *PostgresStore) CountEpisodes(ctx context.Context, agentID, topicID string) (int, error) {
@@ -270,70 +189,6 @@ func (s *PostgresStore) CountEpisodes(ctx context.Context, agentID, topicID stri
 		WHERE agent_id = $1 AND topic_id = $2
 	`, agentID, topicID).Scan(&count)
 	return count, err
-}
-
-// CountEpisodesByLevel 按压缩层级分组计数。
-// 返回: map[level]count,用于观察当前压缩管道进度。
-func (s *PostgresStore) CountEpisodesByLevel(ctx context.Context, agentID, topicID string) (map[enums.CompressionLevel]int, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT compression_level, COUNT(*) FROM agent_private_memory
-		WHERE agent_id = $1 AND topic_id = $2
-		GROUP BY compression_level
-	`, agentID, topicID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := make(map[enums.CompressionLevel]int)
-	for rows.Next() {
-		var level int
-		var count int
-		if err := rows.Scan(&level, &count); err != nil {
-			// 单行扫描失败跳过
-			continue
-		}
-		// 将 int 转回枚举类型作为 map key
-		result[enums.CompressionLevel(level)] = count
-	}
-	return result, rows.Err()
-}
-
-// BatchUpdateEpisodes 在单个事务中批量更新 Episode。
-// 参数:
-//   - agentID, topicID: 更新范围
-//   - episodes: 需更新的 Episode (按 step_id 匹配)
-//
-// 返回: 事务提交错误。
-// 设计意图: 压缩阶段一次性写回多条压缩结果,避免多次往返。
-// 副作用: 任意一行序列化失败均跳过;事务提交时整体生效。
-func (s *PostgresStore) BatchUpdateEpisodes(ctx context.Context, agentID, topicID string, episodes []*types.Episode) error {
-	// 开启事务,保证批量更新的原子性
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	// 失败时回滚;Commit 后 Rollback 为 no-op
-	defer tx.Rollback()
-
-	for _, ep := range episodes {
-		data, err := json.Marshal(ep)
-		if err != nil {
-			// 序列化失败跳过本条,继续处理其他
-			continue
-		}
-		// 通过 episode->>'step_id' 从 JSONB 中提取字段做匹配
-		_, err = tx.ExecContext(ctx, `
-			UPDATE agent_private_memory
-			SET episode = $1, importance_score = $2, updated_at = $3
-			WHERE agent_id = $4 AND topic_id = $5 AND episode->>'step_id' = $6
-		`, data, ep.Importance, time.Now(), agentID, topicID, ep.StepID)
-		if err != nil {
-			// 单条更新失败也跳过,保证事务整体推进
-			continue
-		}
-	}
-	return tx.Commit()
 }
 
 // SaveSnapshot 保存 Agent 快照 (UPSERT)。
@@ -933,7 +788,7 @@ CREATE TABLE IF NOT EXISTS agent_private_memory (
     topic_id VARCHAR(64) NOT NULL,
     episode JSONB NOT NULL,
     snapshot_ref VARCHAR(128),
-    compression_level INT DEFAULT 0,
+    compression_level INT DEFAULT 0, -- 0=Raw 完整记录, 1=Standard 摘要; 仅两级
     importance_score FLOAT DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -1016,20 +871,6 @@ CREATE TABLE IF NOT EXISTS topic_archives (
     embedding VECTOR(768),
     archived_at TIMESTAMPTZ DEFAULT NOW()
 );
-
-CREATE TABLE IF NOT EXISTS memory_write_failures (
-    id SERIAL PRIMARY KEY,
-    agent_id TEXT NOT NULL,
-    topic_id TEXT NOT NULL,
-    step_count INT NOT NULL,
-    action TEXT,
-    raw_content TEXT,
-    error TEXT NOT NULL,
-    retry_count INT DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    resolved_at TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS idx_memory_write_failures_unresolved ON memory_write_failures(created_at) WHERE resolved_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_gk_embedding ON global_knowledge
 USING ivfflat (embedding vector_cosine_ops)

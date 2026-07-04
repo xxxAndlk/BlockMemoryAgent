@@ -149,10 +149,10 @@ type StatsView struct {
 	TopicID string `json:"topic_id"`
 	// PrivateEpisodes 私有 Episode 总数。
 	PrivateEpisodes int `json:"private_episodes"`
-	// CompressedL1 压缩到 LevelStandard 的 Episode 数。
-	CompressedL1 int `json:"compressed_l1"`
-	// CompressedL2 压缩到 LevelCompact 及以上的 Episode 数。
-	CompressedL2 int `json:"compressed_l2"`
+	// CompressedStandard 压缩到 LevelStandard 的 Episode 数。
+	CompressedStandard int `json:"compressed_standard"`
+	// CompressedRaw 保持 LevelRaw 的 Episode 数。
+	CompressedRaw int `json:"compressed_raw"`
 	// GlobalKBHits 全局知识库命中次数。
 	GlobalKBHits int `json:"global_kb_hits"`
 	// TokenBudgetUsed 已用 Token 预算。

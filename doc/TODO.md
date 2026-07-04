@@ -24,13 +24,13 @@
 
 **P0-2. 回调写入优化**（数据可靠性根基）
 - 现状：`memory/callback.go` `OnEnd` 起两个 goroutine，独立 ctx，失败静默；Episode 写失败时快照仍写，数据不一致；无重试无幂等。
-- 方案（写队列 + 重试）：
-  - `OnEnd` 不起 goroutine，推到内存队列（chan）
-  - 后台 worker 消费，失败重试 3 次（指数退避）
-  - 重试失败入死信表 `memory_write_failures`，启动时扫表补写
-  - 队列满时降级同步写（阻塞主路径，保数据）
-  - 幂等键 `(agentID, topicID, stepCount)` 唯一索引，重试不产生重复
-- 失败可见：结构化日志含 sessionID/agentID/step/action/error，超阈值告警。
+- 方案（显式同步写入）：
+  - `OnEnd` 直接同步调用 `WriteProcessor.ProcessWithStepCount` 写入 Episode
+  - 直接同步调用 `SnapshotManager.SaveFromState` 保存快照
+  - 写入失败仅记录日志，不阻塞主路径
+  - 删除内存队列、后台 worker、指数退避重试、死信表 `memory_write_failures`、启动回放等复杂机制
+  - 保留幂等键 `(agentID, topicID, stepCount)` 唯一索引，避免重复写入
+- 失败可见：结构化日志含 sessionID/agentID/step/action/error。
 **P0-3. 大文件拆分 + 技术债清理**（其他改动的前置）
 - 现状：`meta_agent.go` 1545行、`domain_agent.go` 1218行、`subdomain_agent.go` 576行、`llm_tracker.go` 476行，违反 TODO#4 自定"80行内"规则。
 - 拆分目标：
@@ -99,11 +99,10 @@
 
 **P0-1. 轻量级总结模型优化** ✅ 本轮已完成
 - 现状：超时后无重试机制，需要3次重试机制。每个Agent在启动时添加一个测试，测试Agent是否成功访问LLM，若无响应则重试，重试三次失败则启动失败，报错哪些Agent没有成功连接，主要是配置中与固定助手检验。
-- 本轮实现：`LLMCallTracker.CallWithTimeout` 内置 3 次指数退避重试（共享 `retryGenerate` helper，保留单次逻辑调用→单次 RecordCall 契约）；新增 `ModelFactory.VerifyConnectivity` 启动期按 (provider,model,key,baseURL) 去重探测每个已配置角色，失败聚合报错、Mock/无 key 跳过；轻量直连 callers（`reflectOnResult`/`summarizeHistoryForGoal`）改走 `CallLightweightWithRetry`；接入 `testserver.BuildHandler` 与 TUI 入口，失败 `log.Fatalf` 报告未连通角色。
+- 本轮实现：`LLMCallTracker.CallWithTimeout` 内置 3 次指数退避重试（共享 `retryGenerate` helper，保留单次逻辑调用→单次 RecordCall 契约）；新增 `ModelFactory.VerifyConnectivity` 启动期按 (provider,model,key,baseURL) 去重探测每个已配置角色，失败聚合报错；轻量直连 callers（`reflectOnResult`/`summarizeHistoryForGoal`）改走 `CallLightweightWithRetry`；接入 `testserver.BuildHandler` 与 TUI 入口，失败 `log.Fatalf` 报告未连通角色。
 
-**P0-2. 回调写入优化**（数据可靠性根基）✅ 已完成（前次提交）
-- 后期仍然需要回调写入队列+重试优化。
-- 已实现：`memory/callback.go` 队列 + 后台 worker + 3 次指数退避 + 死信表 `memory_write_failures` + `ReplayDeadLetters` + 队列满降级同步写 + 幂等键，`callback_test.go` 覆盖。
+**P0-2. 回调写入优化**（数据可靠性根基）✅ 已完成
+- 已实现：`memory/callback.go` 改为显式同步写入，`OnEnd` 直接调用 `WriteProcessor` 写 Episode、`SnapshotManager` 保存快照；删除队列、后台 worker、指数退避、死信表 `memory_write_failures`、`ReplayDeadLetters`；保留幂等键与 `callback_test.go` 覆盖。
 
 **P0-3. 大文件拆分 + 技术债清理**（其他改动的前置）✅ 本轮已完成
 - 还有部分大文件，可后期优化

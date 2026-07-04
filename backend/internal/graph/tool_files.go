@@ -4,6 +4,7 @@ package graph
 // 从 tool_executor.go 按工具类别拆出（P0-3）。方法挂在 *ToolExecutor 上，同 package。
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -47,21 +48,42 @@ func (e *ToolExecutor) readFile(args map[string]any) *ToolResult {
 //
 // 职责：把 content 写入指定路径，自动创建父目录。
 // 参数：
-//   - args：含 "path" 与 "content" 字段。
+//
+//   - ctx：上下文，用于取 sessionID 以计算会话级临时目录。
+//
+//   - args：含 "path" / "content" / "temporary" 字段；temporary=true 时文件写入
+//
+//     会话临时目录并在 ToolResult 中标记，会话结束后自动清理。
 //
 // 返回：成功时 Output 为写入字节数；失败时 Error 为错误信息。
 // 副作用：创建目录 + 写文件（覆盖已有内容）。
-func (e *ToolExecutor) writeFile(args map[string]any) *ToolResult {
+func (e *ToolExecutor) writeFile(ctx context.Context, args map[string]any) *ToolResult {
 	// 取 path 与 content，类型断言失败时取零值
 	path, _ := args["path"].(string)
 	content, _ := args["content"].(string)
+	temporary, _ := args["temporary"].(bool)
 
 	if path == "" {
 		return &ToolResult{Tool: "WriteFile", Error: "path is required"}
 	}
 
-	// 解析为绝对路径
+	// 解析为绝对路径；临时文件写入会话级临时目录，防止污染工作目录
 	absPath := e.resolvePath(path)
+	tempDir := ""
+	if temporary {
+		sessionID := SessionIDFromContext(ctx)
+		if sessionID == "" {
+			return &ToolResult{Tool: "WriteFile", Error: "temporary file requires a session context"}
+		}
+		tempDir = e.sessionTempDir(sessionID)
+		// 临时文件路径统一收敛到会话临时目录，绝对路径仅保留文件名，
+		// 防止 LLM 用绝对路径把临时文件写到预期之外的位置。
+		cleanPath := filepath.Clean(path)
+		if filepath.IsAbs(cleanPath) {
+			cleanPath = filepath.Base(cleanPath)
+		}
+		absPath = filepath.Join(tempDir, cleanPath)
+	}
 
 	// 创建父目录（支持嵌套创建），权限 0755
 	dir := filepath.Dir(absPath)
@@ -75,7 +97,17 @@ func (e *ToolExecutor) writeFile(args map[string]any) *ToolResult {
 	}
 
 	// 返回写入字节数，便于 LLM 判断是否完整落盘
-	return &ToolResult{Tool: "WriteFile", Success: true, Output: fmt.Sprintf("wrote %d bytes", len(content)), Path: absPath}
+	result := &ToolResult{
+		Tool:    "WriteFile",
+		Success: true,
+		Output:  fmt.Sprintf("wrote %d bytes", len(content)),
+		Path:    absPath,
+	}
+	if temporary {
+		result.IsTemporary = true
+		result.TempDir = tempDir
+	}
+	return result
 }
 
 // listDir 列出目录。

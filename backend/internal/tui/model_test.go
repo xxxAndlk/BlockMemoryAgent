@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/graph"
@@ -213,4 +214,81 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 	if !strings.Contains(view, "BlockMemoryAgent") {
 		t.Fatalf("助手回复应在对话区可见，got:\n%s", view)
 	}
+}
+
+// TestScrollbarDragScrollsChat 验证：鼠标拖动聊天区滚动条滑块时，viewport 会跟随滚动。
+func TestScrollbarDragScrollsChat(t *testing.T) {
+	m := &Model{
+		styles:  NewStyles(),
+		chatVP:  viewport.New(80, 5),
+		width:   80,
+		height:  12,
+		flashMu: &sync.Mutex{},
+	}
+	// 顶栏 1 行 + 主内容区 8 行 + 输入栏 3 行 = 12 行
+	// mainContentHeight = 12 - 1 - 3 - 1 = 7
+	if h := m.mainContentHeight(); h != 7 {
+		t.Fatalf("mainContentHeight 应为 7，got %d", h)
+	}
+
+	// 构造 20 行内容，使 viewport 可滚动。
+	lines := make([]string, 20)
+	for i := range lines {
+		lines[i] = strings.Repeat("x", 70)
+	}
+	m.chatVP.SetContent(strings.Join(lines, "\n"))
+	m.chatVP.YOffset = 0
+
+	totalLines := m.chatVP.TotalLineCount()
+	viewportH := m.chatVP.VisibleLineCount()
+	if totalLines <= viewportH {
+		t.Fatalf("内容应超出 viewport，totalLines=%d viewportH=%d", totalLines, viewportH)
+	}
+
+	sx, sy, sw, sh := m.scrollbarArea()
+	if sx < 0 || sy != 1 || sw != 1 || sh != 7 {
+		t.Fatalf("scrollbarArea 异常: x=%d y=%d w=%d h=%d", sx, sy, sw, sh)
+	}
+
+	thumbStart, thumbEnd := m.scrollbarThumbBounds()
+	if thumbStart < 0 || thumbEnd < thumbStart {
+		t.Fatalf("滑块边界异常: start=%d end=%d", thumbStart, thumbEnd)
+	}
+	thumbCenter := sy + (thumbStart+thumbEnd)/2
+
+	// 在滑块上按下左键开始拖动。
+	press := tea.MouseMsg{X: sx, Y: thumbCenter, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress}
+	nm, _ := m.Update(press)
+	m = modelPtr(nm)
+	if !m.scrollbarDragging {
+		t.Fatal("在滑块上按下左键后应开始拖动")
+	}
+
+	initialOffset := m.chatVP.YOffset
+
+	// 向下拖动 3 行。
+	drag := tea.MouseMsg{X: sx, Y: thumbCenter + 3, Button: tea.MouseButtonNone, Action: tea.MouseActionMotion}
+	nm, _ = m.Update(drag)
+	m = modelPtr(nm)
+	if m.chatVP.YOffset <= initialOffset {
+		t.Fatalf("向下拖动后 YOffset 应增大，初始=%d 现在=%d", initialOffset, m.chatVP.YOffset)
+	}
+
+	// 释放左键。
+	release := tea.MouseMsg{X: sx, Y: thumbCenter + 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease}
+	nm, _ = m.Update(release)
+	m = modelPtr(nm)
+	if m.scrollbarDragging {
+		t.Fatal("释放左键后应结束拖动")
+	}
+}
+
+func modelPtr(m tea.Model) *Model {
+	if mv, ok := m.(*Model); ok {
+		return mv
+	}
+	if mv, ok := m.(Model); ok {
+		return &mv
+	}
+	panic("model is not tui.Model")
 }

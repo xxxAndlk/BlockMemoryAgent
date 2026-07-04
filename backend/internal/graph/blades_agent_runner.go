@@ -6,7 +6,9 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/model"
@@ -23,6 +25,106 @@ const maxConsecutiveFailures = 3
 
 // emitFunc 推送无 detail 的进度事件（executeWithTools 内闭包的类型别名）。
 type emitFunc func(ctx context.Context, kind, msg string)
+
+// loopExitError 表示 blades 工具循环被智能循环检测主动终止，不是执行错误。
+// 触发时 executeWithTools 会基于已收集的工具结果返回总结，而非返回 Error。
+type loopExitError struct {
+	reason string
+}
+
+func (e *loopExitError) Error() string { return e.reason }
+
+// toolCallFingerprint 工具调用指纹，用于检测重复调用。
+type toolCallFingerprint struct {
+	name    string
+	request string
+}
+
+// loopDetector 在 blades Agent 迭代过程中检测死循环/空转，并在适当时机请求优雅退出。
+//
+// 检测策略：
+//   - 重复调用：最近 windowSize 次工具调用中，同一 (name, request) 出现超过 maxRepeat 次。
+//   - 连续空转：连续 maxEmptyStreak 轮 Assistant 消息只有工具调用请求、没有任何文本输出。
+//   - 硬上限兜底：当观察到的工具调用次数达到 maxRounds 时主动退出（与 blades.WithMaxIterations 对齐）。
+type loopDetector struct {
+	maxRounds      int
+	windowSize     int
+	maxRepeat      int
+	maxEmptyStreak int
+
+	rounds        int
+	toolHistory   []toolCallFingerprint
+	emptyStreak   int
+}
+
+// newLoopDetector 创建循环检测器。maxRounds 通常等于传给 blades.WithMaxIterations 的值。
+func newLoopDetector(maxRounds int) *loopDetector {
+	if maxRounds <= 0 {
+		maxRounds = 12
+	}
+	return &loopDetector{
+		maxRounds:      maxRounds,
+		windowSize:     5,
+		maxRepeat:      2, // 同一工具+参数在最近 5 次中出现 3 次即判定循环
+		maxEmptyStreak: 4, // 连续 4 轮只有工具调用无文本输出即判定空转
+		toolHistory:    make([]toolCallFingerprint, 0, 5),
+	}
+}
+
+// observe 观察一轮 blades 消息，返回是否需要主动退出及原因。
+// 对 RoleAssistant 消息中的 ToolPart 计数；对空文本的工具调用消息累计空转次数。
+func (d *loopDetector) observe(m *blades.Message) (stop bool, reason string) {
+	if m == nil {
+		return false, ""
+	}
+
+	isAssistant := m.Role == blades.RoleAssistant
+	hasToolCall := false
+	hasText := m.Text() != ""
+
+	for _, part := range m.Parts {
+		tp, ok := part.(blades.ToolPart)
+		if !ok {
+			continue
+		}
+		hasToolCall = true
+		d.rounds++
+
+		// 硬上限兜底：达到最大轮数时退出。
+		if d.rounds >= d.maxRounds {
+			return true, fmt.Sprintf("达到最大工具调用轮数 %d", d.maxRounds)
+		}
+
+		fp := toolCallFingerprint{name: tp.Name, request: tp.Request}
+		d.toolHistory = append(d.toolHistory, fp)
+		if len(d.toolHistory) > d.windowSize {
+			d.toolHistory = d.toolHistory[len(d.toolHistory)-d.windowSize:]
+		}
+
+		// 重复调用检测。
+		repeats := 0
+		for _, old := range d.toolHistory {
+			if old == fp {
+				repeats++
+			}
+		}
+		if repeats > d.maxRepeat {
+			return true, fmt.Sprintf("工具 %s 以相同参数重复调用 %d 次，判定为循环", tp.Name, repeats)
+		}
+	}
+
+	// 空转检测：Assistant 只有 tool call 且没有文字说明时，认为无进展。
+	if isAssistant && hasToolCall && !hasText {
+		d.emptyStreak++
+		if d.emptyStreak >= d.maxEmptyStreak {
+			return true, fmt.Sprintf("连续 %d 轮只有工具调用无文字输出，判定为空转", d.emptyStreak)
+		}
+	} else {
+		d.emptyStreak = 0
+	}
+
+	return false, ""
+}
 
 // executeWithTools 使用 blades.Agent + 原生 function-calling 执行任务。
 //
@@ -89,7 +191,7 @@ func executeWithTools(
 		Message: blades.UserMessage(userMsg),
 	}
 	// 手动迭代 agent.Run：每轮 yield 一个 *Message，借此 hook 每轮 LLM 文本输出推给前端思考链
-	lastMessage, totalUsage, loopErr := runBladesAgentLoop(ctx, agent, invocation, agentName, emit)
+	lastMessage, totalUsage, loopErr := runBladesAgentLoop(ctx, agent, invocation, agentName, maxItersResolved, emit)
 	dur := time.Since(start)
 
 	finalText := ""
@@ -99,6 +201,27 @@ func executeWithTools(
 
 	var inTok, outTok int
 	if loopErr != nil {
+		var loopExit *loopExitError
+		if errors.As(loopErr, &loopExit) {
+			// 智能循环检测触发：不是执行错误，基于已收集结果返回总结。
+			resultText := finalText
+			if resultText == "" && len(allResults) > 0 {
+				resultText = summarizeToolResults(allResults)
+			}
+			if resultText == "" {
+				resultText = fmt.Sprintf("工具执行已收敛（%s），但未产生最终文字输出。", loopExit.reason)
+			}
+			resultText = fmt.Sprintf("%s [循环保护: %s, 已完成%d步工具操作]", resultText, loopExit.reason, len(allResults))
+			inTok, outTok = recordBladesCall(llmTracker, ctx, dur, nil, agentName, systemPrompt, userMsg, resultText,
+				int(totalUsage.InputTokens), int(totalUsage.OutputTokens))
+			emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", agentName, inTok, outTok, dur.Round(time.Millisecond)), "")
+			emit(ctx, "think", fmt.Sprintf("基于已收集结果返回（%s）", loopExit.reason))
+			return &types.AgentResult{
+				SummaryForUser: resultText,
+				MemoryForMeta:  resultText,
+			}, allResults
+		}
+
 		// P0-4：循环错误也记录一次（带 err），便于失败可见
 		inTok, outTok = recordBladesCall(llmTracker, ctx, dur, loopErr, agentName, systemPrompt, userMsg, "",
 			int(totalUsage.InputTokens), int(totalUsage.OutputTokens))
@@ -120,13 +243,12 @@ func executeWithTools(
 		int(totalUsage.InputTokens), int(totalUsage.OutputTokens))
 	emitDetail(ctx, "token_usage", fmt.Sprintf("[%s] Token 消耗: in=%d out=%d dur=%v", agentName, inTok, outTok, dur.Round(time.Millisecond)), "")
 
-	// 完成门控：任务要求写文件但无成功 WriteFile 记录 → 返回失败标记触发上层重试
-	if taskRequiresWriteFile(task) && !hasWriteFileResult(allResults) {
-		emit(ctx, "error", "任务要求写文件但未通过 WriteFile 落盘")
-		failedText := "[失败: 任务要求写文件但未调用 WriteFile 落盘] " + finalText
+	// 完成门控：LLM 声称已写文件但无成功 WriteFile 记录 → 返回 Error 触发上层重试
+	if !hasWriteFileResult(allResults) && outputClaimsWriteFile(finalText) {
+		emit(ctx, "error", "输出声称已写文件但未调用 WriteFile 落盘")
 		return &types.AgentResult{
-			SummaryForUser: failedText,
-			MemoryForMeta:  "任务要求写文件但未通过 WriteFile 落盘",
+			SummaryForUser: finalText,
+			MemoryForMeta:  "输出声称已写文件但未调用 WriteFile 落盘",
 			Error:          "missing WriteFile result",
 		}, allResults
 	}
@@ -171,11 +293,15 @@ func buildAssistantPrompts(roleDef *types.RoleDefinition, skillBrief string, sta
 2. 凡任务涉及"创建/写入/生成/实现/编写"文件或代码，必须调用 WriteFile 工具真正落盘，
    禁止只用文字描述代码内容当作完成。代码必须完整、可直接运行，禁止用 pass/占位符/省略号代替实际逻辑。
 3. 凡任务涉及"运行/执行/启动"程序，必须调用 RunCommand 工具实际执行，禁止只描述如何运行。
+   但【未明确要求运行时禁止直接启动程序】：如果用户只是让"写/实现/开发"某个程序，没有明确说"运行它""启动它""执行它"，
+   你只能用 RunCommand 做编译/语法检查（如 'python -m py_compile xxx.py'），禁止直接运行会打开 GUI、进入主循环或长时间占用终端的程序。
 4. 工具未成功执行前，不得宣称任务完成。
 5. 工具失败时，输出会包含 stderr/stdout。请阅读失败原因后再决定下一步，
    不要盲目重试同一命令的不同变种。连续两次失败后必须换一种完全不同的方法
    （例如换工具、换路径、放弃当前思路），而不是继续试错。
-6. 只有当所有要求的文件已落盘、命令已执行，且无需再调用工具时，才输出最终文字总结。`,
+6. 只有当所有要求的文件已落盘、命令已执行，且无需再调用工具时，才输出最终文字总结。
+7. 循环收敛：若连续多次工具调用未获得新信息、同一命令重复失败、或已无明显进展，
+   必须立即停止继续试错，基于已掌握的信息给出当前结论，而不是无限循环。`,
 		roleDef.SystemPrompt, skillSection, envSection)
 
 	contextInfo := ""
@@ -225,12 +351,14 @@ func executeMockAssistant(
 	}, nil
 }
 
-// runBladesAgentLoop 迭代 blades agent.Run 生成器，累加每轮 token 用量（P0-4）。
+// runBladesAgentLoop 迭代 blades agent.Run 生成器，累加每轮 token 用量（P0-4），
+// 并在循环检测器触发时主动退出，避免无限循环或成本失控。
 // 返回最后一个 message、累计用量、循环错误（nil 表示正常结束）。
 // 注意：假设 provider 非流式返回每轮独立用量；若未来切流式需复查累加逻辑。
-func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *blades.Invocation, agentName string, emit emitFunc) (*blades.Message, blades.TokenUsage, error) {
+func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *blades.Invocation, agentName string, maxIters int, emit emitFunc) (*blades.Message, blades.TokenUsage, error) {
 	var lastMessage *blades.Message
 	var totalUsage blades.TokenUsage
+	detector := newLoopDetector(maxIters)
 	for m, err := range agent.Run(ctx, invocation) {
 		if err != nil {
 			return lastMessage, totalUsage, err
@@ -245,6 +373,11 @@ func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *bla
 		// 暴露每轮 LLM 文本输出；工具调用轮次 (RoleTool) Text 通常为空，不会重复 emit
 		if txt := m.Text(); txt != "" {
 			emit(ctx, "llm_result", "LLM 输出: "+truncateStr(txt, 400))
+		}
+		// 智能循环检测：重复调用 / 空转 / 硬上限兜底。
+		if stop, reason := detector.observe(m); stop {
+			emit(ctx, "wait", fmt.Sprintf("触发循环保护：%s，基于已收集结果返回", reason))
+			return lastMessage, totalUsage, &loopExitError{reason: reason}
 		}
 	}
 	return lastMessage, totalUsage, nil
@@ -313,4 +446,35 @@ func executeAssistantWithTools(
 	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 	return executeWithTools(ctx, provider, llm, executor, roleDef, task, state, skillBrief, progress, agentName, maxIters, llmTracker)
+}
+
+// summarizeToolResults 把已收集的工具结果拼成一段简短总结，用于循环保护触发时
+// 向用户返回已有进展，而不是空白。
+func summarizeToolResults(results []*ToolResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("已执行工具操作摘要：")
+	for _, r := range results {
+		sb.WriteString("\n- ")
+		sb.WriteString(r.Tool)
+		if r.Path != "" {
+			sb.WriteString(" ")
+			sb.WriteString(r.Path)
+		}
+		if r.Success {
+			out := truncateStr(r.Output, 120)
+			if out != "" {
+				sb.WriteString(": ")
+				sb.WriteString(out)
+			} else {
+				sb.WriteString(": 成功")
+			}
+		} else if r.Error != "" {
+			sb.WriteString(" 失败: ")
+			sb.WriteString(truncateStr(r.Error, 120))
+		}
+	}
+	return sb.String()
 }

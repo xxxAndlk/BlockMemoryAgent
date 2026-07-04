@@ -225,8 +225,8 @@ func CommonExecuteAssistantTask(
 					}
 				}
 			}
-			// 完成门控：若任务要求写文件但结果含失败标记，返回 error 触发上层重试/告警
-			if enforceWriteGate && strings.HasPrefix(result.SummaryForUser, "[失败:") {
+			// 完成门控：若助手输出声称写文件但未真正落盘，返回 error 触发上层重试/告警
+			if enforceWriteGate && result.Error == "missing WriteFile result" {
 				return result, fmt.Errorf("助手未完成写文件任务: %s", task)
 			}
 			return result, nil // 成功返回

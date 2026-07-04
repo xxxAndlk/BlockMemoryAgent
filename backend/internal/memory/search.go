@@ -23,7 +23,7 @@ type VectorSearch interface {
 type Embedder interface {
 	// Embed 将一段文本编码为 float32 向量。
 	// 参数：ctx 取消信号；text 待编码文本。
-	// 返回：嵌入向量与错误；模型不可用时应返回非 nil 错误以便上层降级。
+	// 返回：嵌入向量与错误；模型不可用时应返回非 nil 错误以便上层回退。
 	Embed(ctx context.Context, text string) ([]float32, error)
 }
 
@@ -101,7 +101,7 @@ func (s *SearchScorer) ScoreEpisode(ctx context.Context, ep *types.Episode, quer
 //
 // 返回：按 FinalScore 降序排列的 ScoredEpisode 切片与错误。
 // 副作用：无。并发安全：除读取传入列表外无共享状态。
-// 注意：当 Embedder 调用失败时，queryEmbedding 置 nil 以降级为非语义评分。
+// 注意：当 Embedder 调用失败时，queryEmbedding 置 nil 以回退为非语义评分。
 func (s *SearchScorer) SearchAndScore(ctx context.Context, agentID, topicID, query string, episodes []*types.Episode) ([]*ScoredEpisode, error) {
 	// 向量化查询语句，作为语义相似度的输入。
 	var queryEmbedding []float32

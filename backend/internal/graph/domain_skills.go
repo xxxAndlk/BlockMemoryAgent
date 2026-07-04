@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -95,6 +96,8 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 			// 独立 ctx：与会话 ctx 解耦，会话结束后归档仍能完成
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			// 清洗非法 UTF-8 并截断，避免写入 Postgres 时报 22021 编码错误
+			domain, goal, sum, fs = sanitizeBlockMemoryInputs(domain, goal, sum, fs)
 			if err := n.blockMemory.SaveBlockMemory(bgCtx, b.SessionID, domain, goal, sum, fs); err != nil {
 				log.Printf("[DomainAgent] save block memory failed: session=%s domain=%s err=%v", b.SessionID, domain, err)
 				return
@@ -102,6 +105,40 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 			b.MarkArchived() // 标记已落库，switchToNextBlock 据此跳过兜底
 		}(block, inst.Domain, block.Goal, summary, facts)
 	}
+}
+
+// sanitizeUTF8 把字符串中的非法 UTF-8 字节序列替换为 �，避免写入 Postgres 时报
+// "invalid byte sequence for encoding UTF8"。
+func sanitizeUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "�")
+}
+
+// truncateRunes 按 rune 截断字符串，避免按字节截断时把多字节 UTF-8 字符（如中文）
+// 切成两半，产生非法序列。
+func truncateRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n]) + "..."
+}
+
+// sanitizeBlockMemoryInputs 清洗写入 Postgres 块记忆的字段，确保合法 UTF-8。
+func sanitizeBlockMemoryInputs(domain, goal, summary string, facts []BlockMemoryFact) (string, string, string, []BlockMemoryFact) {
+	domain = sanitizeUTF8(domain)
+	goal = sanitizeUTF8(goal)
+	summary = sanitizeUTF8(summary)
+	out := make([]BlockMemoryFact, len(facts))
+	for i, f := range facts {
+		out[i] = BlockMemoryFact{
+			Key:   sanitizeUTF8(f.Key),
+			Value: sanitizeUTF8(f.Value),
+			Scope: sanitizeUTF8(f.Scope),
+		}
+	}
+	return domain, goal, summary, out
 }
 
 // buildBlockResult 根据本块所有子任务结果与归档记忆，生成本块返回给 MetaAgent 的 AgentResult（P0-1）。
@@ -132,20 +169,19 @@ func buildBlockResult(domain string, block *types.SessionBlock, summaries, memor
 
 // collectBlockFacts 从 SessionBlock 中提取 domain / task 级 facts。
 // 规则：领域名作为 domain 级 fact；每个 TaskResult 作为 task 级 fact。
+// 所有写入 Postgres 的字段会先经过 sanitizeBlockMemoryInputs 清洗，但这里仍按 rune
+// 截断并保证 UTF-8 合法，避免后续路径因非法字节序列触发 22021 编码错误。
 func collectBlockFacts(domain string, block *types.SessionBlock) []BlockMemoryFact {
 	if block == nil {
 		return nil
 	}
 	facts := []BlockMemoryFact{
-		{Key: "domain", Value: domain, Scope: "domain"},
-		{Key: "goal", Value: block.Goal, Scope: "domain"},
+		{Key: "domain", Value: sanitizeUTF8(domain), Scope: "domain"},
+		{Key: "goal", Value: sanitizeUTF8(block.Goal), Scope: "domain"},
 	}
 	for task, result := range block.TaskResults {
-		// 对结果做简短截断，避免 value 过长
-		v := result
-		if len(v) > 200 {
-			v = v[:200] + "..."
-		}
+		// 对结果做简短截断，按 rune 而非字节，避免中文等多字节字符被切半产生非法 UTF-8
+		v := truncateRunes(sanitizeUTF8(result), 200)
 		facts = append(facts, BlockMemoryFact{Key: "task:" + task, Value: v, Scope: "task"})
 	}
 	return facts

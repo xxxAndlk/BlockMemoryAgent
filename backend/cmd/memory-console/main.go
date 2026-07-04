@@ -346,8 +346,8 @@ func (m Model) renderEvents(w, h int) string {
 // renderStats 渲染统计面板: 私有 Episode、压缩层级、KB 命中、Token 预算、活跃 Agent。
 func (m Model) renderStats(w, h int) string {
 	lines := fmt.Sprintf(
-		"Private Episodes: %d\nCompressed L1:    %d\nCompressed L2:    %d\nGlobal KB Hits:   %d\nToken Budget:     %d%%\nActive Agents:    %d/%d",
-		m.stats.PrivateEpisodes, m.stats.CompressedL1, m.stats.CompressedL2,
+		"Private Episodes: %d\nCompressed Raw:   %d\nCompressed Std:   %d\nGlobal KB Hits:   %d\nToken Budget:     %d%%\nActive Agents:    %d/%d",
+		m.stats.PrivateEpisodes, m.stats.CompressedRaw, m.stats.CompressedStandard,
 		m.stats.GlobalKBHits, m.stats.TokenBudgetUsed,
 		m.stats.ActiveAgents, m.stats.TotalAgents,
 	)

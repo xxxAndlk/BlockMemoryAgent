@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS agent_private_memory (
     topic_id VARCHAR(64) NOT NULL,
     episode JSONB NOT NULL,
     snapshot_ref VARCHAR(128),
-    compression_level INT DEFAULT 0,
+    compression_level INT DEFAULT 0, -- 0=Raw 完整记录, 1=Standard 摘要; 仅两级
     importance_score FLOAT DEFAULT 0,
     step_count INT DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -109,16 +109,4 @@ CREATE INDEX IF NOT EXISTS idx_archive_embedding ON topic_archives
 USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
 
-CREATE TABLE IF NOT EXISTS memory_write_failures (
-    id SERIAL PRIMARY KEY,
-    agent_id TEXT NOT NULL,
-    topic_id TEXT NOT NULL,
-    step_count INT NOT NULL,
-    action TEXT,
-    raw_content TEXT,
-    error TEXT NOT NULL,
-    retry_count INT DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    resolved_at TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS idx_memory_write_failures_unresolved ON memory_write_failures(created_at) WHERE resolved_at IS NULL;
+

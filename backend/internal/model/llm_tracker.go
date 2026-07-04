@@ -1,11 +1,11 @@
 package model
 
 // 本文件实现 LLMCallTracker：LLM 调用全量追踪器。
-// 在自适应超时基础上扩展 Token 统计、Prompt 摘要、按调用者聚合等能力，
-// 兼容原 TimeoutTracker 接口（CallWithTimeout/Stats/StatsString）。
+// 统一负责自适应超时、Token 统计、Prompt/Response 记录与持久化回调。
 
 import (
 	"context" // 上下文与超时
+	"errors"  // 错误类型判断
 	"fmt"     // 字符串格式化
 	"sync"    // 读写锁保护并发访问
 	"time"    // 时间统计
@@ -83,8 +83,7 @@ type CallRecord struct {
 }
 
 // LLMCallTracker LLM调用全量追踪器（超时统计 + Token 消耗 + Prompt 记录）。
-// 设计意图：在自适应超时（TimeoutTracker）基础上，叠加 token 与 prompt 维度，
-// 用于成本观测与异常定位。
+// 设计意图：统一负责 LLM 调用的自适应超时、Token 统计、Prompt/Response 记录与持久化回调。
 type LLMCallTracker struct {
 	mu             sync.RWMutex                      // 读写锁保护所有字段
 	callCount      int                               // 累计调用次数
@@ -116,7 +115,7 @@ func (t *LLMCallTracker) SetRecordCallback(cb func(context.Context, CallRecord))
 	t.recordCallback = cb
 }
 
-// CallWithTimeout 带自适应超时的 LLM 调用（兼容原 TimeoutTracker 接口）。
+// CallWithTimeout 带自适应超时的 LLM 调用。
 //
 // 职责：
 //   - 判断是否进入慢速模式（连续超时）→ 直接跳过 LLM
@@ -168,8 +167,10 @@ func (t *LLMCallTracker) CallWithTimeout(
 
 	// 已取消的 ctx 不重试，直接记录并返回
 	if err := ctx.Err(); err != nil {
-		t.RecordCall(ctx, 0, err, caller, summary, prompt, "", inputTokens, 0, false)
-		return "", err, false
+		// 区分 deadline exceeded 与主动取消，便于日志定位
+		timedOut := errors.Is(err, context.DeadlineExceeded)
+		t.RecordCall(ctx, 0, err, caller, summary, prompt, "", inputTokens, 0, timedOut)
+		return "", err, timedOut
 	}
 
 	// P0-1：带重试的调用（最多 maxRetries 次，指数退避）

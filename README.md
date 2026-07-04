@@ -39,12 +39,12 @@ Claude Code 的对话一旦超过几百轮，质量明显下降。你被迫开�
 - **5 路径智能路由**：规则层（零 LLM）+ LLM 兜底 + 安全兜底，80% 简单任务不进入四层编排（`router.go`）
 - **上下文恒定控制**：无论运行多久、多少轮对话，输入 LLM 的上下文始终控制在配置阈值内，通过外部化记忆 + 按需召回实现
 - **会话块隔离（SessionBlock）**：每个 DomainAgent 拥有独立上下文块，切换话题时旧话题归档，新话题只加载 relevant 记忆，互不污染
-- **4 阶段记忆管线**：Write（重要性评分 + 话题绑定）→ Compress（四级：Raw → Standard → Compact → Marker）→ Search（多信号：pgvector 语义 + 实体重叠 + 因果链 + 时间衰减）→ Assemble（4 段 TokenBudget 组装）
+- **4 阶段记忆管线**：Write（重要性评分 + 话题绑定）→ Compress（两级：Raw → Standard）→ Search（多信号：pgvector 语义 + 实体重叠 + 因果链 + 时间衰减）→ Assemble（4 段 TokenBudget 组装）
 - **跨会话记忆**：关键知识在会话结束后持久化，新会话自动召回；MetaMemory 轻量调度记忆跨会话保留
 - **Leaf 执行用 go-kratos Blades**：Assistant 真正干活走 Blades `Agent` + 原生 function-calling（ReAct 工具循环）；上层四层图状态机自研
-- **降级启动**：PG/Redis/API Key 任一缺失都不致命，无 key 时走 Mock，服务器零配置可跑
+- **严格启动**：config/roles/env/soul/skills 任一配置文件缺失，或 PG/Redis/LLM 后端不可达，启动即失败并明确报错
 - **双入口 + 可观测**：HTTP Web UI（Vue 3 SPA）+ bubbletea TUI；SSE 实时推送思考/工具/token 事件
-- **工程防护**：完成门控（写文件任务必须见到成功 WriteFile）、死循环渐进告警、LLM 调用追踪 + 超时追踪、回调写入队列 + 重试 + 死信表
+- **工程防护**：完成门控（LLM 声称写文件时必须见到成功 WriteFile）、死循环渐进告警、LLM 调用追踪 + 超时追踪、同步记忆写入
 
 ---
 
@@ -88,18 +88,16 @@ Blades `Session` 仅管叶子 ReAct 短上下文，长期记忆全自研，4 阶
 | 阶段 | 文件 | 职责 |
 |---|---|---|
 | Write | `memory/write.go` | Episode 重要性评分 + 话题绑定 |
-| Compress | `memory/compress.go` | 4 级压缩：Raw → Standard → Compact → Marker |
+| Compress | `memory/compress.go` | 2 级压缩：Raw → Standard |
 | Search | `memory/search.go` | 多信号相关性：pgvector 语义 + 实体重叠 + 因果链 + 时间衰减 |
 | Assemble | `memory/assembler.go` | 4 段上下文组装（System/TopicGlobal/SharedState/PrivateMemory）+ TokenBudget |
 | Snapshot | `memory/snapshot.go` | Redis 热加载 + Postgres 持久化，归档幂等兜底（`archived` atomic 标记 + 切块前补写） |
 
-**记忆写入机制**：不是回调触发，而是 Agent 执行后的显式调用。回调路径（`memory/callback.go`）已改为队列 + 后台 worker + 3 次指数退避重试 + 死信表 `memory_write_failures` + 幂等键，失败可见、可重试、可补写。
+**记忆写入机制**：Agent 执行后通过 `CallbackHandler` 显式同步写入 Episode 与 Snapshot。`memory/callback.go` 不再使用队列、后台 worker、重试或死信表，写入失败直接记录日志。
 
 **压缩层级**：
 - `LevelRaw` — 完整原始记录
-- `LevelStandard` — 摘要 + Facts
-- `LevelCompact` — 一句话
-- `LevelMarker` — 仅存在性标记
+- `LevelStandard` — 摘要（丢弃 FullObservation）
 
 > 注：当前向量检索用 `embed.PseudoEmbed`（sha256 hashed bag-of-tokens 伪向量），cosine 不可靠，仅用于跑通全链路。真实 embedding（text-embedding-3 / bge-m3）为后续接入项（见 `doc/TODO.md` P3-3）。
 
@@ -114,7 +112,7 @@ Blades `Session` 仅管叶子 ReAct 短上下文，长期记忆全自研，4 阶
 - Redis 7+（短期记忆热缓存）
 - OpenAI 兼容 API Key（如 DeepSeek）
 
-> PG/Redis/API Key 任一缺失，服务器仍可启动（对应组件降级 nil，日志 warning）。无 key 时模型走 Mock，可用于验证 graph 装配与 API。
+> 所有依赖必须可用：config/roles/env/soul/skills 配置文件须存在，PostgreSQL、Redis、LLM 后端须可达。任一缺失或不可达，服务器启动失败并明确报告。
 
 ### 安装与配置
 

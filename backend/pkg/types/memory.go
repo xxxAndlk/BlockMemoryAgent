@@ -184,26 +184,3 @@ type RelevanceScore struct {
 	FinalScore float64 `json:"final_score"`
 }
 
-// MemoryWriteFailure 记忆写入死信记录：写入失败经重试耗尽后归档，供启动期回放补写。
-type MemoryWriteFailure struct {
-	// ID 死信记录主键。
-	ID int `json:"id"`
-	// AgentID 失败记录所属 Agent 实例 ID。
-	AgentID string `json:"agent_id"`
-	// TopicID 所属话题/会话 ID。
-	TopicID string `json:"topic_id"`
-	// StepCount 步骤序号，作为幂等键的一部分。
-	StepCount int `json:"step_count"`
-	// Action 失败的写入动作类型（如 episode_write / snapshot_save）。
-	Action string `json:"action"`
-	// RawContent 待写入的原始内容摘要。
-	RawContent string `json:"raw_content"`
-	// Error 失败错误信息。
-	Error string `json:"error"`
-	// RetryCount 已重试次数。
-	RetryCount int `json:"retry_count"`
-	// CreatedAt 死信记录创建时间。
-	CreatedAt time.Time `json:"created_at"`
-	// ResolvedAt 回放成功后的解析时间；nil 表示未解析。
-	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
-}
