@@ -63,6 +63,10 @@ type AgentConfig struct {
 	// Plan-and-Execute + Self-Reflection（TODO #1）
 	PlanEnabled       bool `yaml:"plan_enabled"`       // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
 	ReflectionEnabled bool `yaml:"reflection_enabled"` // 是否在助手执行后做 Self-Reflection（不达标重试一次）
+	// 工具沙箱（安全）
+	ToolSandboxDisabled      bool     `yaml:"tool_sandbox_disabled"`       // true 时关闭写路径逃逸检测（保留命令黑名单）
+	ToolSandboxAllowedPaths  []string `yaml:"tool_sandbox_allowed_paths"`  // 允许读写的额外绝对路径白名单
+	ToolSandboxBlockedCmds   []string `yaml:"tool_sandbox_blocked_cmds"`   // 额外命令黑名单（追加到默认黑名单）
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -102,6 +106,9 @@ type HTTPConfig struct {
 	Addr         string `yaml:"addr"`          // 监听地址（如 :10010），支持 ${VAR:default} 插值
 	ReadTimeout  int    `yaml:"read_timeout"`  // 读超时（秒）
 	WriteTimeout int    `yaml:"write_timeout"` // 写超时（秒）
+	// 简单 Token 鉴权
+	AuthEnabled bool   `yaml:"auth_enabled"` // 是否启用 Token 鉴权
+	AuthToken   string `yaml:"auth_token"`   // API Token，建议通过 BMA_API_TOKEN 环境变量注入
 }
 
 // MemoryConfig 描述记忆管线的运行节奏参数，
@@ -203,6 +210,9 @@ func (c *Config) applyDefaults() error {
 	if c.HTTP.WriteTimeout == 0 {
 		c.HTTP.WriteTimeout = 30
 	}
+	if c.HTTP.AuthEnabled && c.HTTP.AuthToken == "" {
+		return fmt.Errorf("HTTP auth_enabled=true 但 auth_token 为空：请设置 BMA_API_TOKEN 环境变量或在 config.yaml 中配置 auth_token")
+	}
 
 	// —— 记忆管线默认值：100 条/批、5 秒刷新、300 秒快照 ——
 	if c.Memory.WriteBatchSize == 0 {
@@ -292,6 +302,8 @@ func (c *Config) resolveEnvVars() {
 	c.Redis.Password = resolveEnvWithDefault(c.Redis.Password)
 	// HTTP 监听端口可能由容器平台注入
 	c.HTTP.Addr = resolveEnvWithDefault(c.HTTP.Addr)
+	// API Token 走环境变量，避免硬编码到 YAML
+	c.HTTP.AuthToken = resolveEnvWithDefault(c.HTTP.AuthToken)
 }
 
 // resolveEnvWithDefault 将形如 ${VAR} 或 ${VAR:"default"} 的字符串解析为实际值。

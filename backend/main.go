@@ -5,13 +5,14 @@ package main
 // internal/testserver 包，保证生产二进制与集成测试使用同一份初始化路径。
 
 import (
-	"context"   // 上下文，用于取消与超时控制
-	"flag"      // 命令行参数解析
-	"log"       // 日志输出
-	"net/http"  // HTTP 服务与路由
-	"os"        // 文件信息、信号
-	"os/signal" // 信号监听
-	"syscall"   // SIGINT/SIGTERM 信号常量
+	"context"       // 上下文，用于取消与超时控制
+	"flag"          // 命令行参数解析
+	"log"           // 日志输出
+	"net/http"      // HTTP 服务与路由
+	"os"            // 文件信息、信号
+	"os/signal"     // 信号监听
+	"path/filepath" // 可执行文件相对路径解析
+	"syscall"       // SIGINT/SIGTERM 信号常量
 
 	"github.com/blockmemory/agent/backend/internal/config"      // 基础设施配置加载
 	"github.com/blockmemory/agent/backend/internal/logging"     // 日志文件按天分割
@@ -27,6 +28,7 @@ func main() {
 	envPath := flag.String("env", ".env", "环境变量文件路径")
 	soulPath := flag.String("soul", "config/soul.md", "人格定义文件路径")
 	skillPath := flag.String("skills", "config/skills.yaml", "Skill 池 YAML 路径（可选）")
+	webDistPath := flag.String("web-dist", "web/dist", "前端构建产物目录路径（相对路径将基于可执行文件目录解析）")
 	flag.Parse() // 解析 flag，解析后上述指针才指向实际值
 
 	// 加载 .env 文件: 若存在则把其中 KEY=VALUE 注入进程环境变量
@@ -69,14 +71,15 @@ func main() {
 	}
 	defer cleanup()
 
-	// 静态文件: Vue 构建产物在 web/dist/，仅暴露 assets 与 favicon
-	fs := http.FileServer(http.Dir("web/dist"))
+	// 静态文件: Vue 构建产物目录支持相对可执行文件路径解析，避免从其他目录启动时失效
+	webDist := resolveWebDistPath(*webDistPath)
+	fs := http.FileServer(http.Dir(webDist))
 	mux.Handle("/assets/", fs)
 	mux.Handle("/favicon.svg", fs)
 
 	// 首页: Vue SPA，history 路由统一回退 index.html
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "web/dist/index.html")
+		http.ServeFile(w, r, filepath.Join(webDist, "index.html"))
 	})
 
 	// 启动 HTTP 服务
@@ -105,4 +108,24 @@ func main() {
 	log.Println("正在关闭服务...")
 	cancel()
 	httpServer.Close()
+}
+
+// resolveWebDistPath 解析前端构建产物目录路径。
+// 若 path 为绝对路径则原样返回；若为相对路径，则基于当前可执行文件所在目录解析，
+// 避免服务从其他工作目录启动时找不到 web/dist。
+func resolveWebDistPath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		// 无法获取可执行文件路径时，回退到原始相对路径（保持旧行为）
+		return path
+	}
+	// 处理符号链接：取最终实际路径
+	if real, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = real
+	}
+	baseDir := filepath.Dir(exe)
+	return filepath.Join(baseDir, path)
 }

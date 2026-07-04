@@ -6,6 +6,7 @@ package graph
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -56,9 +57,17 @@ func (e *ToolExecutor) runCommand(ctx context.Context, args map[string]any) *Too
 		return &ToolResult{Tool: "RunCommand", Error: "command is required"}
 	}
 
+	// 命令黑名单检测
+	if pattern, blocked := e.isCommandBlocked(cmdStr); blocked {
+		return &ToolResult{Tool: "RunCommand", Error: fmt.Sprintf("blocked command matches sandbox rule: %s", pattern)}
+	}
+
 	// 跨平台 mkdir：直接用 os.MkdirAll，绕过 shell 差异（Windows mkdir 不支持 -p）
 	if dir := parseMkdirDir(cmdStr); dir != "" {
 		absDir := e.resolvePath(dir)
+		if err := e.sanitizeWritePath(absDir); err != nil {
+			return &ToolResult{Tool: "RunCommand", Error: err.Error()}
+		}
 		if err := os.MkdirAll(absDir, 0755); err != nil {
 			return &ToolResult{Tool: "RunCommand", Error: "mkdir: " + err.Error()}
 		}

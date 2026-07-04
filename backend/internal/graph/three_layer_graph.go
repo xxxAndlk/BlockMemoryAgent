@@ -377,6 +377,18 @@ func (g *ThreeLayerGraph) NewToolExecutor(workDir string) *ToolExecutor {
 	if g.toolCallback != nil {
 		executor.SetCallback(g.toolCallback)
 	}
+	// 应用运行时沙箱配置（若已配置）
+	if g.rt != nil && g.rt.AgentCfg != nil {
+		cfg := &SandboxConfig{
+			BlockedCmds:              append([]string{}, DefaultSandboxConfig().BlockedCmds...),
+			AllowedPaths:             g.rt.AgentCfg.ToolSandboxAllowedPaths,
+			AllowWriteOutsideWorkDir: g.rt.AgentCfg.ToolSandboxDisabled,
+		}
+		if len(g.rt.AgentCfg.ToolSandboxBlockedCmds) > 0 {
+			cfg.BlockedCmds = append(cfg.BlockedCmds, g.rt.AgentCfg.ToolSandboxBlockedCmds...)
+		}
+		executor.SetSandboxConfig(cfg)
+	}
 	return executor
 }
 

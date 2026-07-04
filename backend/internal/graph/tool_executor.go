@@ -89,9 +89,10 @@ type ProgressCallback func(ctx context.Context, ev ProgressEvent)
 //
 //	Execute 可被多 goroutine 并发调用（无共享可变状态）。
 type ToolExecutor struct {
-	workDir  string        // 工具执行基准目录
-	timeout  time.Duration // 默认超时
-	callback ToolCallback  // 工具执行回调
+	workDir  string         // 工具执行基准目录
+	timeout  time.Duration  // 默认超时
+	callback ToolCallback   // 工具执行回调
+	sandbox  SandboxConfig  // 轻量级沙箱策略（命令黑名单 + 路径逃逸检测）
 }
 
 // NewToolExecutor 创建工具执行器。
@@ -99,7 +100,7 @@ type ToolExecutor struct {
 // 参数：
 //   - workDir：基准工作目录；空串时回退到当前进程工作目录。
 //
-// 返回：初始化好的 *ToolExecutor，默认超时 30s，callback 为 nil。
+// 返回：初始化好的 *ToolExecutor，默认超时 30s，启用默认沙箱，callback 为 nil。
 // 副作用：workDir 为空时调用 os.Getwd()。
 func NewToolExecutor(workDir string) *ToolExecutor {
 	// workDir 为空时回退到进程当前目录，避免相对路径解析失败
@@ -109,6 +110,7 @@ func NewToolExecutor(workDir string) *ToolExecutor {
 	return &ToolExecutor{
 		workDir: workDir,
 		timeout: 30 * time.Second, // 默认 30s 超时
+		sandbox: DefaultSandboxConfig(),
 	}
 }
 
@@ -135,6 +137,9 @@ func (e *ToolExecutor) SetCallback(cb ToolCallback) {
 // 副作用：通过具体工具实现产生文件/命令/网络副作用；通过 callback 通知订阅方。
 // 并发安全：可被多 goroutine 并发调用。
 func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[string]any) *ToolResult {
+	// 确保通过旧构造函数或未设置沙箱的 executor 仍有默认安全策略
+	e.ensureSandboxDefaults()
+
 	// 兼容 snake_case 工具名（LLM 可能输出 skill_id 而非 ToolRef）。
 	// 例如 write_file -> WriteFile。
 	toolName = normalizeToolName(toolName)

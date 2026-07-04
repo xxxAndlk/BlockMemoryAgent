@@ -197,7 +197,18 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	apiHandler.SetSnapshotManager(snapshotMgr)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
+
+	// 简单 Token 鉴权：默认放行（auth_enabled=false），生产环境应在 config.yaml 启用
+	authToken := ""
+	publicPaths := []string{"/api/health"}
+	if cfg.HTTP.AuthEnabled {
+		authToken = cfg.HTTP.AuthToken
+	}
+	wrap := func(h http.HandlerFunc) http.HandlerFunc {
+		return server.AuthMiddleware(authToken, publicPaths, h)
+	}
+
+	mux.HandleFunc("/api/sessions", wrap(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			sessionMgr.HandleListSessions(w, r)
@@ -206,24 +217,28 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-	})
-	mux.HandleFunc("/api/sessions/", sessionRouter(sessionMgr))
+	}))
+	mux.HandleFunc("/api/sessions/", wrap(sessionRouter(sessionMgr)))
 	mux.HandleFunc("/api/health", apiHandler.HealthHandler)
-	mux.HandleFunc("/api/status", apiHandler.StatusHandler)
-	mux.HandleFunc("/api/metrics/timeline", apiHandler.TimelineHandler)
-	mux.HandleFunc("/api/activity", apiHandler.ActivityHandler)
+	mux.HandleFunc("/api/status", wrap(apiHandler.StatusHandler))
+	mux.HandleFunc("/api/metrics/timeline", wrap(apiHandler.TimelineHandler))
+	mux.HandleFunc("/api/activity", wrap(apiHandler.ActivityHandler))
 
 	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
-	mux.Handle("/api/dag", dagHandler)
-	mux.Handle("/api/dag/", dagHandler)
+	mux.Handle("/api/dag", wrap(func(w http.ResponseWriter, r *http.Request) {
+		dagHandler.ServeHTTP(w, r)
+	}))
+	mux.Handle("/api/dag/", wrap(func(w http.ResponseWriter, r *http.Request) {
+		dagHandler.ServeHTTP(w, r)
+	}))
 
-	mux.HandleFunc("/api/snapshot", apiHandler.SnapshotHandler)
-	mux.HandleFunc("/api/memory/search", apiHandler.MemorySearchHandler)
-	mux.HandleFunc("/api/memory/levels", apiHandler.MemoryLevelsHandler)
-	mux.HandleFunc("/api/skills", apiHandler.SkillsHandler)
-	mux.HandleFunc("/api/agents/", agentRouter(apiHandler))
-	mux.HandleFunc("/api/files", apiHandler.FilesHandler)
-	mux.HandleFunc("/api/files/content", apiHandler.FileContentHandler)
+	mux.HandleFunc("/api/snapshot", wrap(apiHandler.SnapshotHandler))
+	mux.HandleFunc("/api/memory/search", wrap(apiHandler.MemorySearchHandler))
+	mux.HandleFunc("/api/memory/levels", wrap(apiHandler.MemoryLevelsHandler))
+	mux.HandleFunc("/api/skills", wrap(apiHandler.SkillsHandler))
+	mux.HandleFunc("/api/agents/", wrap(agentRouter(apiHandler)))
+	mux.HandleFunc("/api/files", wrap(apiHandler.FilesHandler))
+	mux.HandleFunc("/api/files/content", wrap(apiHandler.FileContentHandler))
 
 	// Static SPA assets are not wired here; integration tests should hit API
 	// endpoints only. The root fallback is omitted to avoid serving web/dist.

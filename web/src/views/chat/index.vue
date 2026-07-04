@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import type { Session, SessionEvent, AgentNode } from '@/types'
+import type { Session, SessionEvent, AgentNode, TaskBoardData } from '@/types'
 import {
   listSessions,
   createSession,
@@ -12,6 +12,7 @@ import {
   getSession,
   streamSession,
   getSessionAgents,
+  getSessionBoard,
   type SessionMetrics,
   getSessionMetrics,
 } from '@/api/session'
@@ -27,6 +28,7 @@ const activeSession = ref<Session | null>(null)
 const events = ref<SessionEvent[]>([])
 const agents = ref<AgentNode[]>([])
 const metrics = ref<SessionMetrics | null>(null)
+const board = ref<TaskBoardData | null>(null)
 
 const loading = ref(false)
 const sending = ref(false)
@@ -117,6 +119,11 @@ async function refreshPanels(id: string) {
     if (epoch !== panelEpoch.value) return // 已被新会话切换作废
     agents.value = a.agents || []
   } catch { if (epoch === panelEpoch.value) agents.value = [] }
+  try {
+    const b = await getSessionBoard(id)
+    if (epoch !== panelEpoch.value) return
+    board.value = b.board || null
+  } catch { if (epoch === panelEpoch.value) board.value = null }
   try {
     metrics.value = await getSessionMetrics(id)
     if (epoch !== panelEpoch.value) return
@@ -214,8 +221,62 @@ async function handleNewSession() {
   activeSession.value = null
   agents.value = []
   metrics.value = null
+  board.value = null
   router.replace({ path: '/chat' })
 }
+
+// Agent编排栏 - 角色层级树
+const roleTree = computed(() => {
+  const root: any[] = []
+  const map = new Map<string, any>()
+  agents.value.forEach(a => {
+    const node = {
+      label: a.name,
+      status: a.status,
+      statusType: a.status === 'active' ? 'success' : a.status === 'running' ? 'warning' : 'info',
+      active: a.status === 'active' || a.status === 'running',
+      isUser: a.type === 'domain' || a.type === 'subdomain',
+      iconColor: a.status === 'active' ? 'text-green-500' : a.status === 'running' ? 'text-yellow-500' : 'text-gray-500',
+      children: [] as any[],
+    }
+    map.set(a.inst_id, node)
+    if (!a.parent_id) root.push(node)
+  })
+  agents.value.forEach(a => {
+    if (a.parent_id && map.has(a.parent_id)) {
+      map.get(a.parent_id)!.children.push(map.get(a.inst_id))
+    }
+  })
+  return root
+})
+
+interface TaskItem {
+  title?: string
+  name?: string
+  assignee?: string
+  status: string
+}
+
+// 任务栏 - 任务看板数据
+const tasks = computed(() => {
+  if (board.value?.tasks?.length) {
+    return board.value.tasks.map(t => ({ title: t.title, assignee: t.assignee, status: t.status })) as TaskItem[]
+  }
+  return [] as TaskItem[]
+})
+
+const constraints = computed(() => {
+  if (board.value?.constraints) return Object.entries(board.value.constraints)
+  return [] as [string, string][]
+})
+
+const taskProgress = computed(() => {
+  const done = tasks.value.filter(t => t.status === 'done').length
+  const total = tasks.value.length
+  return total ? Math.round((done / total) * 100) : 0
+})
+
+const defaultProps = { children: 'children', label: 'label' }
 
 const filteredSessions = computed(() => {
   const q = sessionFilter.value.trim().toLowerCase()
@@ -327,20 +388,61 @@ function fmtDateTime(iso: string) {
         <div v-else class="text-xs text-gray-500">暂无指标数据</div>
       </el-card>
 
+      <!-- Agent编排栏 - 角色层级 -->
       <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
         <template #header>
-          <div class="text-sm font-bold text-gray-200">活跃 Agent</div>
+          <div class="text-sm font-bold text-gray-200">Agent编排 (Role Hierarchy)</div>
         </template>
-        <div v-if="agents.length" class="space-y-1.5 text-xs">
-          <div v-for="a in agents" :key="a.inst_id"
+        <div v-if="roleTree.length" class="text-xs">
+          <el-tree
+            :data="roleTree"
+            :props="defaultProps"
+            default-expand-all
+            class="!bg-transparent custom-tree"
+            :expand-on-click-node="false"
+          >
+            <template #default="{ node, data }">
+              <div class="flex items-center justify-between w-full pr-1 py-0.5">
+                <span class="flex items-center gap-1.5">
+                  <el-icon :class="data.iconColor" class="text-sm">
+                    <UserFilled v-if="data.isUser" /><User v-else />
+                  </el-icon>
+                  <span :class="{'text-gray-200': data.active, 'text-gray-500': !data.active}" class="text-xs">{{ node.label }}</span>
+                </span>
+                <el-tag v-if="data.status" :type="data.statusType" size="small" effect="plain"
+                  class="!bg-transparent !border-[#2a2d35] scale-75 origin-right"
+                  :class="{'!text-green-500': data.status==='active', '!text-yellow-500': data.status==='running', '!text-gray-500': data.status==='pending'}">
+                  {{ data.status }}
+                </el-tag>
+              </div>
+            </template>
+          </el-tree>
+        </div>
+        <div v-else class="text-xs text-gray-500">暂无 Agent 实例，会话启动后自动创建</div>
+      </el-card>
+
+      <!-- 任务栏 - Task Board -->
+      <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
+        <template #header>
+          <div class="flex justify-between items-center">
+            <div class="text-sm font-bold text-gray-200">任务栏 (Task Board)</div>
+            <el-progress v-if="tasks.length" :percentage="taskProgress" :show-text="false" class="w-20 custom-progress" />
+          </div>
+        </template>
+        <div v-if="tasks.length" class="space-y-1.5 text-xs">
+          <div v-for="(t, i) in tasks" :key="i"
                class="flex items-center gap-2 p-1.5 bg-[#0f1115] rounded border border-[#2a2d35]">
-            <span class="w-1.5 h-1.5 rounded-full shrink-0"
-                  :class="a.status === 'active' || a.status === 'running' ? 'bg-green-500' : 'bg-gray-500'"></span>
-            <span class="font-mono text-gray-200 truncate">{{ a.name }}</span>
-            <span class="text-[10px] text-gray-500 ml-auto shrink-0">{{ a.type }}</span>
+            <el-icon v-if="t.status === 'done'" class="text-green-500 text-sm"><CircleCheck /></el-icon>
+            <el-icon v-else-if="t.status === 'running'" class="text-yellow-500 text-sm"><Loading /></el-icon>
+            <el-icon v-else class="text-gray-500 text-sm"><CirclePlus /></el-icon>
+            <span class="text-gray-200 truncate flex-1">{{ t.title || t.name }}</span>
+            <span v-if="t.assignee" class="text-[10px] text-gray-500 shrink-0 font-mono">{{ t.assignee }}</span>
+            <el-tag v-if="t.status === 'done'" size="small" type="success" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">完成</el-tag>
+            <el-tag v-else-if="t.status === 'running'" size="small" type="warning" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">进行中</el-tag>
+            <el-tag v-else size="small" type="info" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">待办</el-tag>
           </div>
         </div>
-        <div v-else class="text-xs text-gray-500">无活跃 Agent</div>
+        <div v-else class="text-xs text-gray-500">暂无任务数据</div>
       </el-card>
 
       <el-card class="!border-[#2a2d35] !bg-[#1a1d24]" v-if="activeSession">

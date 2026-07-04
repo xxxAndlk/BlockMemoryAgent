@@ -82,6 +82,8 @@ http:
   addr: ":0"
   read_timeout: 30
   write_timeout: 30
+  auth_enabled: false
+  auth_token: ""
 
 memory:
   write_batch_size: 10

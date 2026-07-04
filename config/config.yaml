@@ -31,6 +31,8 @@ http:
   addr: ${HTTP_ADDR:":10010"}
   read_timeout: 30   # 秒
   write_timeout: 30  # 秒
+  auth_enabled: true                     # 是否启用 Token 鉴权（推荐生产环境开启）
+  auth_token: ${BMA_API_TOKEN:""}        # API Token，建议通过环境变量注入
 
 # 记忆系统配置
 memory:
@@ -65,6 +67,10 @@ agent:
   plan_enabled: false            # Plan-and-Execute（默认关闭）
   reflection_enabled: false      # Self-Reflection（默认关闭）
   human_clarify_timeout_sec: 120 # 等待用户回答超时（秒）
+  # 工具沙箱（安全）
+  tool_sandbox_disabled: false   # true 时关闭写路径逃逸检测（保留命令黑名单）
+  tool_sandbox_allowed_paths: [] # 允许读写的额外绝对路径白名单
+  tool_sandbox_blocked_cmds: []  # 追加到默认命令黑名单的额外命令
 
 # 日志文件输出（按天分割，按入口分文件）
 # 浏览器入口 → logs/browser-YYYY-MM-DD.log

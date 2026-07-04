@@ -199,6 +199,18 @@ func CommonExecuteAssistantTask(
 		if toolCallback != nil {
 			executor.SetCallback(toolCallback)
 		}
+		// 应用运行时沙箱配置（若已配置）
+		if rt != nil && rt.AgentCfg != nil {
+			cfg := &SandboxConfig{
+				BlockedCmds:              append([]string{}, DefaultSandboxConfig().BlockedCmds...),
+				AllowedPaths:             rt.AgentCfg.ToolSandboxAllowedPaths,
+				AllowWriteOutsideWorkDir: rt.AgentCfg.ToolSandboxDisabled,
+			}
+			if len(rt.AgentCfg.ToolSandboxBlockedCmds) > 0 {
+				cfg.BlockedCmds = append(cfg.BlockedCmds, rt.AgentCfg.ToolSandboxBlockedCmds...)
+			}
+			executor.SetSandboxConfig(cfg)
+		}
 
 		// 解析 ReAct 循环最大轮数：rt 配置覆盖显式传入值；配置无效且 maxIters <= 0 时回退默认 12。
 		// blades_agent_runner 内部还有 loopDetector 做重复调用/空转检测，会提前优雅退出。

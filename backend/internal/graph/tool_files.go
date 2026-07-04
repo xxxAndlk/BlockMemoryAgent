@@ -27,8 +27,11 @@ func (e *ToolExecutor) readFile(args map[string]any) *ToolResult {
 		return &ToolResult{Tool: "ReadFile", Error: "path is required"}
 	}
 
-	// 解析为绝对路径（相对 workDir）
-	absPath := e.resolvePath(path)
+	// 解析为绝对路径（相对 workDir）并做沙箱读路径校验
+	absPath, err := e.resolvePathWithSandbox(path)
+	if err != nil {
+		return &ToolResult{Tool: "ReadFile", Path: absPath, Error: err.Error()}
+	}
 	// 读文件
 	data, err := os.ReadFile(absPath)
 	if err != nil {
@@ -83,6 +86,11 @@ func (e *ToolExecutor) writeFile(ctx context.Context, args map[string]any) *Tool
 			cleanPath = filepath.Base(cleanPath)
 		}
 		absPath = filepath.Join(tempDir, cleanPath)
+	} else {
+		// 非临时文件必须先通过沙箱路径校验，禁止写到工作目录外
+		if err := e.sanitizeWritePath(absPath); err != nil {
+			return &ToolResult{Tool: "WriteFile", Path: absPath, Error: err.Error()}
+		}
 	}
 
 	// 创建父目录（支持嵌套创建），权限 0755
@@ -125,8 +133,11 @@ func (e *ToolExecutor) listDir(args map[string]any) *ToolResult {
 		path = "."
 	}
 
-	// 解析为绝对路径
-	absPath := e.resolvePath(path)
+	// 解析为绝对路径并做沙箱读路径校验
+	absPath, err := e.resolvePathWithSandbox(path)
+	if err != nil {
+		return &ToolResult{Tool: "ListDir", Path: absPath, Error: err.Error()}
+	}
 	// 读目录条目
 	entries, err := os.ReadDir(absPath)
 	if err != nil {
@@ -170,8 +181,11 @@ func (e *ToolExecutor) searchInFiles(args map[string]any) *ToolResult {
 		dir = "."
 	}
 
-	// 解析为绝对目录
-	absDir := e.resolvePath(dir)
+	// 解析为绝对目录并做沙箱读路径校验
+	absDir, err := e.resolvePathWithSandbox(dir)
+	if err != nil {
+		return &ToolResult{Tool: "SearchInFiles", Path: absDir, Error: err.Error()}
+	}
 	// 大小写不敏感匹配：pattern 与行都转小写比较
 	patternLower := strings.ToLower(pattern)
 
