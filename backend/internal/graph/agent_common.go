@@ -172,7 +172,8 @@ func CommonCreateAssistantForTask(
 //   - skillBrief：已装配技能简介文本，注入 system prompt；可为空。
 //   - progress：进度回调；可为 nil。
 //   - agentName：当前 agent 名，用于事件归属（如 "助手[X]" / "MetaAgent"）。
-//   - maxIters：ReAct 循环最大轮数（<=0 时使用默认 12）。
+//   - maxIters：ReAct 循环最大轮数。rt.AgentCfg.ToolCallMaxRounds > 0 时优先使用配置值；
+//     配置无效且 maxIters <= 0 时回退到默认 12。
 //   - enforceWriteGate：是否启用写文件完成门控。
 //
 // 返回：结构化 AgentResult 与 error（P0-1）。
@@ -199,7 +200,8 @@ func CommonExecuteAssistantTask(
 			executor.SetCallback(toolCallback)
 		}
 
-		// 解析 ReAct 循环最大轮数：rt 配置覆盖显式传入值（<=0 时取配置，仍 <=0 取默认 12）
+		// 解析 ReAct 循环最大轮数：rt 配置覆盖显式传入值；配置无效且 maxIters <= 0 时回退默认 12。
+		// blades_agent_runner 内部还有 loopDetector 做重复调用/空转检测，会提前优雅退出。
 		if rt != nil && rt.AgentCfg != nil && rt.AgentCfg.ToolCallMaxRounds > 0 {
 			maxIters = rt.AgentCfg.ToolCallMaxRounds
 		}

@@ -6,21 +6,40 @@ import (
 	"sort"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // Compressor 遗忘与压缩器。
 // 负责 Episode 的两级压缩（Raw → Standard），按重要性 + 时间分层决策，降低长期记忆的 Token 占用。
 type Compressor struct {
-	store PrivateStore // 私有记忆存储后端
+	store PrivateStore       // 私有记忆存储后端
+	cfg   *config.AgentConfig // Agent 运行时配置（压缩阈值）
 }
 
 // NewCompressor 创建压缩器。
 // 职责: 绑定存储后端，返回可用的 Compressor。
-// 参数: store - PrivateStore 实现。
+// 参数: store - PrivateStore 实现；cfg - Agent 配置（可为 nil，使用默认）。
 // 返回: Compressor 指针。
-func NewCompressor(store PrivateStore) *Compressor {
-	return &Compressor{store: store}
+func NewCompressor(store PrivateStore, cfg *config.AgentConfig) *Compressor {
+	return &Compressor{store: store, cfg: cfg}
+}
+
+// importanceThreshold 返回保留 Raw 的重要性阈值。
+func (c *Compressor) importanceThreshold() float64 {
+	if c.cfg != nil && c.cfg.CompressImportanceThreshold > 0 {
+		return c.cfg.CompressImportanceThreshold
+	}
+	return 0.7
+}
+
+// maxAge 返回保留 Raw 的最大年龄。
+func (c *Compressor) maxAge() time.Duration {
+	hours := 24
+	if c.cfg != nil && c.cfg.CompressAgeHours > 0 {
+		hours = c.cfg.CompressAgeHours
+	}
+	return time.Duration(hours) * time.Hour
 }
 
 // Compress 压缩指定 Agent 的私有记忆。
@@ -34,10 +53,13 @@ func (c *Compressor) Compress(ctx context.Context, agentID, topicID string) erro
 
 	sorted := sortByImportanceAndTime(episodes)
 
+	threshold := c.importanceThreshold()
+	maxAge := c.maxAge()
 	var compressed []*types.Episode
 	for _, ep := range sorted {
-		// 高重要且新鲜：保留 Raw
-		if ep.Importance > 0.7 && time.Since(ep.Timestamp) < 24*time.Hour {
+		// 高重要且新鲜：保留 Raw。
+		// 加入轻微缓冲：重要性 >= threshold 且年龄 < maxAge 即保留，避免硬阈值附近震荡。
+		if ep.Importance >= threshold && time.Since(ep.Timestamp) < maxAge {
 			continue
 		}
 		// 其余压缩为 Standard：丢弃原始全文，保留摘要

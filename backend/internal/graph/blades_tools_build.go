@@ -4,7 +4,6 @@ package graph
 // 从 llm_tools.go 拆出（P0-3），保持单一职责：工具清单合并 + 行解析 + OS 提示。
 
 import (
-	"runtime"
 	"strings"
 )
 
@@ -85,24 +84,4 @@ func toolNameFromLine(line string) string {
 	return "" // 无冒号则无法识别
 }
 
-// osSpecificHint 兼容保留：旧调用点若仍引用此函数不会断链。新代码请用 fmtEnvSection。
-//
-// 职责：根据当前 GOOS 返回对应的 OS 操作提示（打开浏览器/文件的命令差异）。
-// 返回：可读的 OS 提示字符串。
-// 副作用：无。
-// 并发安全：纯函数。
-func osSpecificHint() string {
-	switch runtime.GOOS {
-	case "windows":
-		// Windows：用 start 打开，python3 通常叫 python，避免使用 xdg-open 等
-		return "操作系统: Windows。打开浏览器用 `start <URL>`；打开文件用 `start <路径>`。" +
-			"python3 在 Windows 上通常叫 python；不要使用 xdg-open / open / say 等 macOS/Linux 命令。" +
-			"路径分隔符使用反斜杠 \\ 或在命令里用正斜杠 /。"
-	case "darwin":
-		// macOS：用 open 打开
-		return "操作系统: macOS。打开浏览器用 `open <URL>`；打开文件用 `open <路径>`。"
-	default:
-		// Linux/Unix：用 xdg-open 打开
-		return "操作系统: Linux/Unix。打开浏览器用 `xdg-open <URL>`。"
-	}
-}
+

@@ -151,9 +151,22 @@ func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *t
 	}
 
 	// 为每个领域创建 DomainAgent 与 SessionBlock
-	for _, domain := range domains {
-		// 达到最大并发块数则停止
+	for i, domain := range domains {
+		// 达到最大并发块数则停止，并提示被跳过的领域
 		if len(state.ActiveBlocks) >= n.maxBlocks {
+			skipped := domains[i:]
+			names := make([]string, 0, len(skipped))
+			for _, d := range skipped {
+				names = append(names, d.Name)
+			}
+			msg := fmt.Sprintf("达到最大并发块数 %d，以下领域未创建: %s", n.maxBlocks, strings.Join(names, ", "))
+			n.emit(ctx, "wait", msg)
+			if log := n.sessionLogger(ctx); log != nil {
+				log.Event(ctx, "domain_skipped", msg, map[string]any{
+					"max_blocks": n.maxBlocks,
+					"skipped":    names,
+				})
+			}
 			break
 		}
 		n.emit(ctx, "intend", fmt.Sprintf("创建 DomainAgent: %s (目标: %s)", domain.Name, domain.Goal))
@@ -163,8 +176,16 @@ func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *t
 				"goal":   domain.Goal,
 			})
 		}
-		// 二次检查（防御性）
+		// 二次检查（防御性）：并发块数在创建前一刻达到上限
 		if len(state.ActiveBlocks) >= n.maxBlocks {
+			msg := fmt.Sprintf("并发块数在创建前达到上限 %d，领域 %s 未创建", n.maxBlocks, domain.Name)
+			n.emit(ctx, "wait", msg)
+			if log := n.sessionLogger(ctx); log != nil {
+				log.Event(ctx, "domain_skipped", msg, map[string]any{
+					"max_blocks": n.maxBlocks,
+					"skipped":    []string{domain.Name},
+				})
+			}
 			break
 		}
 		// 创建 DomainAgent 实例
@@ -195,6 +216,8 @@ func (n *MetaAgentNode) handleInitialCreateDomains(ctx context.Context, state *t
 			Events:      make([]*types.Event, 0),                                                      // 事件队列
 			TaskResults: make(map[string]string),                                                      // 任务结果
 		}
+		// R8: 新块自动继承当前会话级 MetaMemory，避免跨域失忆
+		mergeSessionMetaMemory(state, block)
 		// 写入活跃块表
 		state.ActiveBlocks[block.ID] = block
 	}
@@ -329,6 +352,8 @@ func (n *MetaAgentNode) handleCrossDomainRequest(ctx context.Context, state *typ
 			Events:      make([]*types.Event, 0),                                                       // 事件队列
 			TaskResults: make(map[string]string),                                                       // 任务结果
 		}
+		// R8: 新块自动继承当前会话级 MetaMemory，避免跨域失忆
+		mergeSessionMetaMemory(state, targetBlock)
 		// 写入活跃块表
 		state.ActiveBlocks[targetBlock.ID] = targetBlock
 	}
@@ -357,6 +382,8 @@ func (n *MetaAgentNode) switchToNextBlock(ctx context.Context, state *types.Thre
 		block := state.ActiveBlocks[state.CurrentBlockID]
 		if block != nil {
 			n.collectBlockResult(state, block)
+			// R7: 当前块完成前，通过 Mailbox 通知其他活跃块
+			notifyOtherActiveBlocks(state, block, n.rt)
 			// 幂等兜底归档（TODO #4）：异步归档未确认成功时，同步补一次，避免异常退出漏写
 			n.ensureBlockArchived(ctx, state, block)
 		}

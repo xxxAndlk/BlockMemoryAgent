@@ -145,7 +145,8 @@ func parseTaskListFromResp(resp string) []string {
 
 // analyzeTasksByRules 基于规则的任务拆解（回退方案）。
 //
-// 职责：LLM 不可用时的回退，按目标关键词匹配预设模板。
+// 职责：LLM 不可用时的回退，按目标关键词匹配可直接用工具执行的子任务模板。
+// 避免生成"分析/设计/思考"等纯思考类子任务，防止被 parseTaskListFromResp 过滤后退化回单任务。
 //
 // 参数：
 //   - goal：领域目标
@@ -154,23 +155,25 @@ func parseTaskListFromResp(resp string) []string {
 func (n *DomainAgentNode) analyzeTasksByRules(goal string) []string {
 	var tasks []string
 
-	// 按"修复/实现/优化"等关键词匹配模板
+	// 按关键词匹配可直接执行的工具调用描述
 	if strings.Contains(goal, "修复") {
-		tasks = append(tasks, "分析根因")   // 第1步：根因分析
-		tasks = append(tasks, "定位问题代码") // 第2步：定位代码
-		tasks = append(tasks, "生成修复方案") // 第3步：生成方案
-		tasks = append(tasks, "验证修复")   // 第4步：验证
-	} else if strings.Contains(goal, "实现") || strings.Contains(goal, "开发") {
-		tasks = append(tasks, "需求分析") // 第1步：需求
-		tasks = append(tasks, "设计方案") // 第2步：设计
-		tasks = append(tasks, "编写代码") // 第3步：编码
-		tasks = append(tasks, "测试验证") // 第4步：测试
+		tasks = append(tasks, "用 ReadFile 读取相关文件定位问题代码")
+		tasks = append(tasks, "用 WriteFile 修改问题代码完成修复")
+		tasks = append(tasks, "用 RunCommand 运行测试或验证命令确认修复生效")
+	} else if strings.Contains(goal, "实现") || strings.Contains(goal, "开发") || strings.Contains(goal, "编写") {
+		tasks = append(tasks, "用 ReadFile 查看现有代码/目录结构确定实现位置")
+		tasks = append(tasks, "用 WriteFile 创建或修改文件实现目标功能")
+		tasks = append(tasks, "用 RunCommand 运行编译/语法检查/测试验证实现正确")
 	} else if strings.Contains(goal, "优化") {
-		tasks = append(tasks, "性能分析") // 第1步：性能分析
-		tasks = append(tasks, "识别瓶颈") // 第2步：识别瓶颈
-		tasks = append(tasks, "实施优化") // 第3步：实施
+		tasks = append(tasks, "用 ReadFile 读取待优化文件内容")
+		tasks = append(tasks, "用 WriteFile 实施优化修改")
+		tasks = append(tasks, "用 RunCommand 运行基准测试或验证命令确认优化效果")
+	} else if strings.Contains(goal, "查询") || strings.Contains(goal, "查一下") || strings.Contains(goal, "搜索") {
+		tasks = append(tasks, "用 HTTPGet 或 ReadFile 获取目标信息并整理回答")
+	} else if strings.Contains(goal, "运行") || strings.Contains(goal, "执行") {
+		tasks = append(tasks, "用 RunCommand 执行目标命令并收集输出")
 	} else {
-		// 无匹配：把整个目标作为单任务
+		// 无匹配：把整个目标作为单任务，交给 Assistant 自行拆解
 		tasks = append(tasks, goal)
 	}
 

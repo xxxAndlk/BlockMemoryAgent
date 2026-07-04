@@ -118,10 +118,11 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		return nil, nil, nil, fmt.Errorf("connect redis with addr from %s: %w", cfgPath, err)
 	}
 
-	snapshotMgr := memory.NewSnapshotManager(redisStore, pgStore)
+	snapshotMgr := memory.NewSnapshotManager(redisStore, pgStore, &cfg.Agent)
 	writeProcessor := memory.NewWriteProcessor(pgStore)
+	writeProcessor.SetAgentConfig(&cfg.Agent)
 	memoryCallbackHandler := memory.NewCallbackHandler(writeProcessor, snapshotMgr, nil)
-	episodeCompressor := memory.NewCompressor(pgStore)
+	episodeCompressor := memory.NewCompressor(pgStore, &cfg.Agent)
 	sessionLogger := logger.New(pgStore)
 	contextAssembler := memory.NewContextAssembler(
 		memory.NewSimpleWorkspaceReader(),

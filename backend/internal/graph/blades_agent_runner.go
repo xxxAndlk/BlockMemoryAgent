@@ -165,7 +165,7 @@ func executeWithTools(
 	tools := buildBladesTools(executor, progress, sessionID, agentName, &allResults)
 	maxItersResolved := maxIters
 	if maxItersResolved <= 0 {
-		maxItersResolved = 12
+		maxItersResolved = 50
 	}
 	agent, err := blades.NewAgent(
 		agentName,

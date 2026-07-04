@@ -105,7 +105,7 @@ func newTestCallbackHandler(t *testing.T) (*CallbackHandler, *fakePrivateStore, 
 	rs := &fakeRedisSnapshotStore{}
 	bc := &fakeBroadcaster{}
 	wp := NewWriteProcessor(ps)
-	sm := NewSnapshotManager(rs, ss)
+	sm := NewSnapshotManager(rs, ss, nil)
 	h := NewCallbackHandler(wp, sm, bc)
 	return h, ps, ss, bc
 }

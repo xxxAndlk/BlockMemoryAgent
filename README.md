@@ -200,7 +200,7 @@ flags：`-config config/config.yaml -roles config/roles.yaml -env .env -soul con
 
 ### 3. Leaf 执行：Blades 工具循环（`internal/graph/llm_tools.go` + `blades_tools.go`）
 
-Assistant 走 Blades 原生 function-calling：`blades.NewAgent` + `WithTools` + `WithMaxIterations(12)`，`Agent.Run` 内部跑 ReAct（`model.Generate` → 检测 ToolPart → `tool.Handle` → 回灌 → 直到无 tool call 或达上限）。
+Assistant 走 Blades 原生 function-calling：`blades.NewAgent` + `WithTools` + `WithMaxIterations(tool_call_max_rounds)`，`Agent.Run` 内部跑 ReAct（`model.Generate` → 检测 ToolPart → `tool.Handle` → 回灌 → 直到无 tool call 或达上限）。默认 40 轮，并在 `blades_agent_runner.go` 中用 `loopDetector` 检测重复调用/空转，提前优雅退出，避免无限循环。
 
 **7 个内置工具**：`ReadFile` / `WriteFile` / `ListDir` / `RunCommand` / `SearchInFiles` / `HTTPGet` / `HTTPPost`，用 `tools.NewFunc` 自动生成 JSON schema，复用 `ToolExecutor` 沙箱实现。
 

@@ -187,6 +187,10 @@ func (n *SubDomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayer
 		n.finish(ctx, state)
 		return state, nil
 	}
+	// R8: 启动时合并会话级 MetaMemory，避免跨域失忆
+	mergeSessionMetaMemory(state, block)
+	// R7: 消费其他块通过 Mailbox 发来的跨域通知，注入块记忆
+	applyMailboxToBlock(state, block, n.rt, n.instID)
 	if block.TaskResults == nil {
 		block.TaskResults = make(map[string]string)
 	}

@@ -118,7 +118,8 @@ func isSingleToolRequest(goal string) bool {
 		return false
 	}
 	// 多步骤/写代码信号：命中则不是单工具
-	complexSignals := []string{"然后", "接着", "并且", "同时", "重构", "实现一个", "开发一个", "写一个"}
+	complexSignals := []string{"然后", "接着", "并且", "同时", "并", "再", "之后", "且",
+		"重构", "实现一个", "开发一个", "写一个", "修改"}
 	for _, s := range complexSignals {
 		if strings.Contains(gl, s) {
 			return false
@@ -161,6 +162,13 @@ func isMultiDomainHint(goal string) bool {
 		{"前端", "接口"},
 		{"后端", "样式"},
 		{"ui", "api"},
+		{"数据库", "缓存"},
+		{"数据库", "前端"},
+		{"数据库", "后端"},
+		{"算法", "前端"},
+		{"算法", "后端"},
+		{"api", "数据库"},
+		{"服务", "前端"},
 	}
 	for _, c := range combos {
 		if strings.Contains(gl, c[0]) && strings.Contains(gl, c[1]) {
@@ -239,18 +247,43 @@ func parseRoutePath(resp string) RoutePath {
 			return RouteFullFourLayer
 		}
 	}
-	// 2. 兜底：包含关键字即命中（兼容旧模型/非结构化输出）
+	// 2. 兜底：包含关键字即命中（兼容旧模型/非结构化输出），
+	// 但需排除被否定的路径，例如 LLM 说"不应使用 direct_tool"时不能误判。
 	switch {
-	case strings.Contains(resp, "direct_tool"):
+	case strings.Contains(resp, "direct_tool") && !routePathNegated(resp, "direct_tool"):
 		return RouteDirectTool
-	case strings.Contains(resp, "direct_assistant"):
+	case strings.Contains(resp, "direct_assistant") && !routePathNegated(resp, "direct_assistant"):
 		return RouteDirectAssistant
-	case strings.Contains(resp, "multi_domain"):
+	case strings.Contains(resp, "multi_domain") && !routePathNegated(resp, "multi_domain"):
 		return RouteMultiDomain
-	case strings.Contains(resp, "full_four_layer"):
+	case strings.Contains(resp, "full_four_layer") && !routePathNegated(resp, "full_four_layer"):
 		return RouteFullFourLayer
-	case strings.Contains(resp, "create_domain"):
+	case strings.Contains(resp, "create_domain") && !routePathNegated(resp, "create_domain"):
 		return RouteCreateDomain
 	}
 	return ""
+}
+
+// routePathNegated 检查 resp 中 path 关键字前是否出现否定词（如"不应/不要/别/不用"）。
+// 用于 parseRoutePath 的关键词兜底路径，避免"不应使用 direct_tool"被误判为 direct_tool。
+func routePathNegated(resp, path string) bool {
+	lower := strings.ToLower(resp)
+	lowerPath := strings.ToLower(path)
+	idx := strings.Index(lower, lowerPath)
+	if idx < 0 {
+		return false
+	}
+	window := 24 // 检查 path 前 24 个字符
+	start := idx - window
+	if start < 0 {
+		start = 0
+	}
+	before := lower[start:idx]
+	negations := []string{"不应", "不要", "别", "不用", "不是", "避免", "不建议", "不能"}
+	for _, neg := range negations {
+		if strings.Contains(before, neg) {
+			return true
+		}
+	}
+	return false
 }

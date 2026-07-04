@@ -33,7 +33,7 @@ type LoggingConfig struct {
 // retry=3、LLM 软/硬超时 30s/90s 等），让运维可以通过 config.yaml 调整。
 type AgentConfig struct {
 	SkillSetSize      int `yaml:"skill_set_size"`       // 每个 DomainAgent 装配的 Skill 子集上限
-	ToolCallMaxRounds int `yaml:"tool_call_max_rounds"` // Assistant 单任务 ReAct 工具调用循环最大轮数
+	ToolCallMaxRounds int `yaml:"tool_call_max_rounds"` // Assistant 单任务 ReAct 工具调用循环最大轮数（含重复调用/空转检测提前退出）
 	RetryCount        int `yaml:"retry_count"`          // Assistant 任务执行指数退避重试次数
 	RetryBackoffMs    int `yaml:"retry_backoff_ms"`     // 重试初始退避时长（毫秒）
 	LLMSoftTimeoutSec int `yaml:"llm_soft_timeout_sec"` // LLM 调用软超时（秒，建议取消）
@@ -52,6 +52,14 @@ type AgentConfig struct {
 	MaxRepeatFingerprint int `yaml:"max_repeat_fingerprint"` // 状态指纹重复阈值：同一 state 指纹连续出现 N 次 → 判死循环
 	SessionTimeoutMin    int `yaml:"session_timeout_min"`    // 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
 	MaxSteps             int `yaml:"max_steps"`              //  Graph 绝对步数上限（安全网，超出即使无死循环也终止），0 表示不限制
+	// 私有快照参数（替代 memory/snapshot.go 中的硬编码）
+	SnapshotSummaryCount       int     `yaml:"snapshot_summary_count"`        // 快照保留的最近摘要条数（默认 20）
+	SnapshotOpenIssueThreshold float64 `yaml:"snapshot_open_issue_threshold"` // 未决问题重要性阈值（默认 0.7）
+	// Episode 写入与压缩参数（替代 memory/write.go / compress.go 硬编码）
+	SummaryMaxRunes            int     `yaml:"summary_max_runes"`             // 摘要最大 rune 数（默认 400）
+	FactMaxSentences           int     `yaml:"fact_max_sentences"`            // 事实提取最大句数（默认 5）
+	CompressImportanceThreshold float64 `yaml:"compress_importance_threshold"` // 压缩保留 Raw 的重要性阈值（默认 0.7）
+	CompressAgeHours           int     `yaml:"compress_age_hours"`            // 压缩保留 Raw 的最大年龄（小时，默认 24）
 	// Plan-and-Execute + Self-Reflection（TODO #1）
 	PlanEnabled       bool `yaml:"plan_enabled"`       // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
 	ReflectionEnabled bool `yaml:"reflection_enabled"` // 是否在助手执行后做 Self-Reflection（不达标重试一次）
@@ -226,7 +234,7 @@ func (c *Config) applyDefaults() error {
 		c.Agent.SkillSetSize = 8
 	}
 	if c.Agent.ToolCallMaxRounds == 0 {
-		c.Agent.ToolCallMaxRounds = 12
+		c.Agent.ToolCallMaxRounds = 50
 	}
 	if c.Agent.RetryCount == 0 {
 		c.Agent.RetryCount = 3
@@ -245,6 +253,24 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.Agent.HumanClarifyTimeoutSec == 0 {
 		c.Agent.HumanClarifyTimeoutSec = 120
+	}
+	if c.Agent.SnapshotSummaryCount == 0 {
+		c.Agent.SnapshotSummaryCount = 20
+	}
+	if c.Agent.SnapshotOpenIssueThreshold == 0 {
+		c.Agent.SnapshotOpenIssueThreshold = 0.7
+	}
+	if c.Agent.SummaryMaxRunes == 0 {
+		c.Agent.SummaryMaxRunes = 400
+	}
+	if c.Agent.FactMaxSentences == 0 {
+		c.Agent.FactMaxSentences = 5
+	}
+	if c.Agent.CompressImportanceThreshold == 0 {
+		c.Agent.CompressImportanceThreshold = 0.7
+	}
+	if c.Agent.CompressAgeHours == 0 {
+		c.Agent.CompressAgeHours = 24
 	}
 
 	// —— 日志默认值：默认目录 ./logs ——

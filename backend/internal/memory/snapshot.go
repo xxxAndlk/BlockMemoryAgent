@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -30,20 +32,38 @@ type RedisSnapshotStore interface {
 // SnapshotManager 快照管理器：协调 Redis 热存与 Postgres 冷存的两级快照读写。
 // 读路径：Redis → Postgres → 空快照；写路径：同步写 Redis + 异步落 Postgres。
 type SnapshotManager struct {
-	redisStore RedisSnapshotStore // 热存，优先读取与同步写入
-	pgStore    SnapshotStore      // 冷存，异步持久化
+	redisStore RedisSnapshotStore  // 热存，优先读取与同步写入
+	pgStore    SnapshotStore       // 冷存，异步持久化
+	cfg        *config.AgentConfig // Agent 运行时配置（决定摘要条数、未决问题阈值等）；nil 时使用默认值
 }
 
 // NewSnapshotManager 创建快照管理器，注入热存与冷存后端。
-// 参数：redis 热存后端；pg 冷存后端。
+// 参数：redis 热存后端；pg 冷存后端；cfg Agent 运行时配置（可为 nil，使用默认）。
 // 返回：组装好的 *SnapshotManager。
 // 副作用：无。
-func NewSnapshotManager(redis RedisSnapshotStore, pg SnapshotStore) *SnapshotManager {
+func NewSnapshotManager(redis RedisSnapshotStore, pg SnapshotStore, cfg *config.AgentConfig) *SnapshotManager {
 	// 注入两级存储依赖，后续 Load / Save 复用。
 	return &SnapshotManager{
 		redisStore: redis,
 		pgStore:    pg,
+		cfg:        cfg,
 	}
+}
+
+// summaryCount 返回快照应保留的最近摘要条数。
+func (m *SnapshotManager) summaryCount() int {
+	if m.cfg != nil && m.cfg.SnapshotSummaryCount > 0 {
+		return m.cfg.SnapshotSummaryCount
+	}
+	return 20
+}
+
+// openIssueThreshold 返回未决问题的重要性阈值。
+func (m *SnapshotManager) openIssueThreshold() float64 {
+	if m.cfg != nil && m.cfg.SnapshotOpenIssueThreshold > 0 {
+		return m.cfg.SnapshotOpenIssueThreshold
+	}
+	return 0.7
 }
 
 // Load 加载 Agent 快照，遵循两级回退策略。
@@ -131,12 +151,16 @@ func (m *SnapshotManager) Save(ctx context.Context, snapshot *types.AgentSnapsho
 // 返回：Save 过程中发生的错误。
 // 副作用：同 Save（更新 UpdatedAt、写入 Redis、异步写 Postgres）。
 func (m *SnapshotManager) SaveFromState(ctx context.Context, agentID, topicID string, output *types.AgentOutput, episodes []*types.Episode) error {
+	k := m.summaryCount()
+	threshold := m.openIssueThreshold()
+
 	// 提取最近 K 步关键摘要：从末尾向前取最多 k 条。
-	const k = 5
 	summaries := make([]types.SummaryBlock, 0, k)
+	selected := make(map[string]bool, k)
 	// 倒序遍历，确保最新步骤排在前面；达到 k 条即停止。
 	for i := len(episodes) - 1; i >= 0 && len(summaries) < k; i-- {
 		ep := episodes[i]
+		selected[ep.StepID] = true
 		// 将 Episode 摘要打包为可引用的 SummaryBlock。
 		summaries = append(summaries, types.SummaryBlock{
 			StepID:    ep.StepID,             // 关联原始步骤 ID
@@ -145,11 +169,32 @@ func (m *SnapshotManager) SaveFromState(ctx context.Context, agentID, topicID st
 		})
 	}
 
-	// 提取未解决问题：重要性高且无反思的 Episode 视为待解决。
+	// 混合策略：在最近的 k 条之外，补充高重要性但未入选的旧 Episode，
+	// 避免"只看最近"导致关键历史决策/错误被遗漏。最多再补充 k 条。
+	if len(summaries) < k*2 {
+		for _, ep := range episodes {
+			if selected[ep.StepID] {
+				continue
+			}
+			if ep.Importance >= threshold {
+				selected[ep.StepID] = true
+				summaries = append(summaries, types.SummaryBlock{
+					StepID:    ep.StepID,
+					Content:   ep.ObservationSummary,
+					Timestamp: ep.Timestamp,
+				})
+				if len(summaries) >= k*2 {
+					break
+				}
+			}
+		}
+	}
+
+	// 提取未解决问题：重要性高、无反思，且 Episode 本身提示未完成的才视为待解决。
 	var openIssues []types.Issue
 	for _, ep := range episodes {
-		// 阈值 0.7 表示高重要性；Reflection 为空表示未做收尾反思。
-		if ep.Importance > 0.7 && ep.Reflection == "" {
+		// 阈值过滤 + 必须有未完成/失败迹象，避免把正常高价值输出误判为未决问题。
+		if ep.Importance > threshold && ep.Reflection == "" && episodeLooksUnresolved(ep) {
 			openIssues = append(openIssues, types.Issue{
 				ID:          ep.StepID,             // 问题 ID 复用 StepID
 				Description: ep.ObservationSummary, // 问题描述使用观察摘要
@@ -177,4 +222,28 @@ func (m *SnapshotManager) SaveFromState(ctx context.Context, agentID, topicID st
 
 	// 委托 Save 执行两级存储写入。
 	return m.Save(ctx, snapshot)
+}
+
+// episodeLooksUnresolved 判断 Episode 是否提示任务未完成或失败。
+// 用于减少 OpenIssues 误报：高重要性但已成功完成的 Episode 不应列为未决问题。
+func episodeLooksUnresolved(ep *types.Episode) bool {
+	// 1. 文本层面包含失败/错误/未完成的明确信号
+	lower := strings.ToLower(ep.ObservationSummary + " " + ep.Action)
+	failureSignals := []string{"error", "fail", "exception", "timeout", "panic", "失败", "错误", "超时", "异常"}
+	for _, s := range failureSignals {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	// 2. 工具调用中存在明显失败输出（简单启发式：output 含 error/fail）
+	for _, tc := range ep.ToolCalls {
+		if strings.Contains(strings.ToLower(tc.Output), "error") || strings.Contains(strings.ToLower(tc.Output), "失败") {
+			return true
+		}
+	}
+	// 3. 内容极短且没有工具调用，可能表示任务尚未展开
+	if len(ep.ToolCalls) == 0 && len(ep.ObservationSummary) < 20 {
+		return true
+	}
+	return false
 }

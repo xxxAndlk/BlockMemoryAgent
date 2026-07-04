@@ -7,7 +7,8 @@ import (
 	"time"         // 时间戳生成与时间间隔判断
 	"unicode/utf8" // rune 计数与按字符截断，避免破坏 UTF-8
 
-	"github.com/blockmemory/agent/backend/pkg/types" // Episode 等公共类型
+	"github.com/blockmemory/agent/backend/internal/config" // Agent 运行时配置
+	"github.com/blockmemory/agent/backend/pkg/types"       // Episode 等公共类型
 )
 
 // PrivateStore 私有记忆存储接口。
@@ -53,32 +54,40 @@ type TopicDetector interface {
 }
 
 // SimpleSummarizer 简单摘要器。
-// 短文本原样返回，长文本截断到 200 字符并加省略号。
-type SimpleSummarizer struct{}
+// 短文本原样返回，长文本截断到 maxRunes 字符并加省略号。
+type SimpleSummarizer struct {
+	maxRunes int
+}
 
 // Summarize 生成摘要。
 // 职责: 对 content 做长度截断式摘要。
 // 参数: content - 原始观察文本。
-// 返回: 不超过 200 个 rune 的摘要字符串。
+// 返回: 不超过 maxRunes 个 rune 的摘要字符串。
 // 副作用: 无。
 // 并发安全: 是（无共享状态）。
 // 实现: 按 rune 截断而非字节，避免在 UTF-8 多字节字符中间切断产生无效字符串（H3）。
 func (s *SimpleSummarizer) Summarize(content string) string {
+	limit := s.maxRunes
+	if limit <= 0 {
+		limit = 200
+	}
 	// 短文本无需摘要，直接原样返回
-	if utf8.RuneCountInString(content) <= 200 {
+	if utf8.RuneCountInString(content) <= limit {
 		return content
 	}
-	// 长文本截断到前 200 个 rune 并标记省略
+	// 长文本截断到前 limit 个 rune 并标记省略
 	runes := []rune(content)
-	return string(runes[:200]) + "..."
+	return string(runes[:limit]) + "..."
 }
 
 // SimpleFactExtractor 简单事实提取器。
-// 占位实现：取内容前 100 字符作为唯一事实条目。
-type SimpleFactExtractor struct{}
+// 将 content 按句分割，取前 maxSentences 句作为事实条目。
+type SimpleFactExtractor struct {
+	maxSentences int
+}
 
 // ExtractFacts 提取关键事实。
-// 职责: 将 content 按句分割，取前 3 句作为事实条目。
+// 职责: 将 content 按句分割，取前 maxSentences 句作为事实条目。
 // 参数: content - 原始观察文本。
 // 返回: 事实字符串切片；空输入返回 nil。
 // 副作用: 无。
@@ -87,7 +96,11 @@ func (e *SimpleFactExtractor) ExtractFacts(content string) []string {
 	if len(content) == 0 {
 		return nil
 	}
-	// 按中英文标点分句：。！？!?.\n
+	max := e.maxSentences
+	if max <= 0 {
+		max = 3
+	}
+	// 按中英文标点分句：。！？!?.
 	sentences := splitSentences(content)
 	var facts []string
 	for _, s := range sentences {
@@ -95,7 +108,7 @@ func (e *SimpleFactExtractor) ExtractFacts(content string) []string {
 		if len(s) > 0 {
 			facts = append(facts, s)
 		}
-		if len(facts) >= 3 {
+		if len(facts) >= max {
 			break
 		}
 	}
@@ -145,34 +158,47 @@ type SimpleImportanceScorer struct{}
 // 并发安全: 是（无共享状态）。
 // 设计: 时间衰减由调用方处理，此处只反映内容本身的静态权重。
 func (s *SimpleImportanceScorer) Score(summary string, facts []string) float64 {
-	// 初始分数为 0，后续逐步累加各项权重
+	// 平滑评分：用连续函数替代硬阈值跳跃，让不同长度/事实数的重要性区分更细腻。
 	score := 0.0
 
-	// 长度因子: 摘要较长说明信息量足，加 0.1
-	if len(summary) > 50 {
-		score += 0.1
+	// 长度因子：0~0.15，随 rune 数平滑增长，避免 50/51 的断崖
+	lengthScore := float64(utf8.RuneCountInString(summary)) / 600.0
+	if lengthScore > 0.15 {
+		lengthScore = 0.15
 	}
+	score += lengthScore
 
-	// 事实数量因子: 每条事实贡献 0.1
-	score += float64(len(facts)) * 0.1
-
-	// 包含错误关键词: 错误类事件通常高价值，加 0.3
-	if containsAny(summary, []string{"error", "fail", "exception", "bug", "crash"}) {
-		score += 0.3
+	// 事实数量因子：每条 0.07，最高 0.28（默认 5 条满额）
+	factScore := float64(len(facts)) * 0.07
+	if factScore > 0.28 {
+		factScore = 0.28
 	}
+	score += factScore
 
-	// 包含决策关键词: 决策类事件影响后续走向，加 0.25
-	if containsAny(summary, []string{"decide", "choose", "select", "确定", "决定"}) {
-		score += 0.25
+	// 语义关键词：多个命中时累加但做封顶，避免单一事件被过度加权
+	semantic := 0.0
+	if containsAny(summary, []string{"error", "fail", "exception", "bug", "crash", "失败", "错误", "超时"}) {
+		semantic += 0.28
 	}
-
-	// 包含状态变更: 状态变更需留痕便于回溯，加 0.2
-	if containsAny(summary, []string{"update", "modify", "change", "创建", "修改", "更新"}) {
-		score += 0.2
+	if containsAny(summary, []string{"decide", "choose", "select", "确定", "决定", "判定"}) {
+		semantic += 0.22
 	}
+	if containsAny(summary, []string{"update", "modify", "change", "创建", "修改", "更新", "写入", "删除"}) {
+		semantic += 0.18
+	}
+	if containsAny(summary, []string{"plan", "步骤", "任务", "goal", "目标"}) {
+		semantic += 0.10
+	}
+	if semantic > 0.45 {
+		semantic = 0.45
+	}
+	score += semantic
 
-	// 时间衰减因子由调用方处理（本函数只做静态权重）
-	// 封顶到 1.0，避免关键词叠加导致分数溢出
+	// 保底 0.05：任何被记录的 Episode 都至少有轻微保留价值
+	if score < 0.05 {
+		score = 0.05
+	}
+	// 封顶到 1.0
 	if score > 1.0 {
 		score = 1.0
 	}
@@ -203,6 +229,7 @@ type WriteProcessor struct {
 	extractor  FactExtractor    // 事实提取器
 	scorer     ImportanceScorer // 重要性评分器
 	detector   TopicDetector    // 话题边界检测器
+	cfg        *config.AgentConfig
 }
 
 // NewWriteProcessor 创建写入处理器。
@@ -218,6 +245,20 @@ func NewWriteProcessor(store PrivateStore) *WriteProcessor {
 		extractor:  &SimpleFactExtractor{},    // 默认事实提取器
 		scorer:     &SimpleImportanceScorer{}, // 默认重要性评分器
 		detector:   &SimpleTopicDetector{},    // 默认话题边界检测器
+	}
+}
+
+// SetAgentConfig 注入 Agent 运行时配置，动态调整摘要/事实提取参数。
+func (wp *WriteProcessor) SetAgentConfig(cfg *config.AgentConfig) {
+	wp.cfg = cfg
+	if cfg == nil {
+		return
+	}
+	if s, ok := wp.summarizer.(*SimpleSummarizer); ok && cfg.SummaryMaxRunes > 0 {
+		s.maxRunes = cfg.SummaryMaxRunes
+	}
+	if e, ok := wp.extractor.(*SimpleFactExtractor); ok && cfg.FactMaxSentences > 0 {
+		e.maxSentences = cfg.FactMaxSentences
 	}
 }
 

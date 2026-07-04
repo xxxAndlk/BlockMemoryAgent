@@ -95,6 +95,9 @@ func (n *MetaAgentNode) collectBlockResult(state *types.ThreeLayerState, block *
 		// 追加本块结果段落
 		state.SessionSummary += strings.Join(parts, "\n")
 	}
+
+	// R8: 把会话级 MetaMemory 同步到所有活跃块，让并行/后续块看到最新决策
+	syncMetaMemoryToActiveBlocks(state)
 }
 
 // finalizeSession 会话结束，生成最终回答。

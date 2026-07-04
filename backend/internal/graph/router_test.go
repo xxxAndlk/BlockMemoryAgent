@@ -97,7 +97,7 @@ func TestRouteDecision_EnableSubdomainFlag(t *testing.T) {
 	}
 }
 
-// TestIsSingleToolRequest 验证单工具请求识别。
+// TestIsSingleToolRequest 验证单工具请求识别，包含新增复合信号词。
 func TestIsSingleToolRequest(t *testing.T) {
 	positives := []string{"读一下 main.go", "运行 go test", "查看 config.yaml"}
 	for _, g := range positives {
@@ -105,10 +105,31 @@ func TestIsSingleToolRequest(t *testing.T) {
 			t.Errorf("expected single tool request for %q", g)
 		}
 	}
-	negatives := []string{"读一下 main.go 然后重构它", "实现一个 web 服务"}
+	negatives := []string{
+		"读一下 main.go 然后重构它",
+		"实现一个 web 服务",
+		"读一下 A 再写一下 B",
+		"查一下天气并发送邮件",
+		"修改配置之后重启服务",
+	}
 	for _, g := range negatives {
 		if isSingleToolRequest(g) {
 			t.Errorf("expected NOT single tool for %q", g)
+		}
+	}
+}
+
+// TestIsMultiDomainHint_Extended 验证扩展后的跨领域组合。
+func TestIsMultiDomainHint_Extended(t *testing.T) {
+	positives := []string{
+		"设计数据库表结构并加缓存",
+		"前端展示算法排序结果",
+		"后端 API 连数据库",
+		"服务接口和前端页面一起改",
+	}
+	for _, g := range positives {
+		if !isMultiDomainHint(g) {
+			t.Errorf("expected multi-domain hint for %q", g)
 		}
 	}
 }
@@ -140,6 +161,9 @@ func TestParseRoutePath(t *testing.T) {
 		{"direct_tool", RouteDirectTool},
 		{"  direct_assistant  ", RouteDirectAssistant},
 		{"path: create_domain.", RouteCreateDomain},
+		// 否定前缀：不应被兜底路径误判
+		{"不应使用 direct_tool，请用 create_domain", RouteCreateDomain},
+		{"不要选 direct_assistant，选 multi_domain", RouteMultiDomain},
 		// 非法路径回退空串
 		{"path: unknown_path", ""},
 		{"just some text", ""},

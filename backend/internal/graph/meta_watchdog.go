@@ -35,12 +35,17 @@ func (n *MetaAgentNode) drainCommandQueue(ctx context.Context, state *types.Thre
 			if !n.rt.AgentCfg.InterruptEnabled {
 				continue
 			}
-			n.emit(ctx, "intend", "抢占中断：清空当前上下文，按新指令重新启动")
-			// 清空图状态，保留 SessionID 与 Messages 中的历史对话
-			// 注意：必须重置 ActiveBlocks/CallStack/CurrentBlockID 三件套，
-			//       否则下一 tick 仍可能跳进旧 DomainAgent 的子任务路径
+			n.emit(ctx, "intend", "抢占中断：暂停当前任务上下文，按新指令重新启动")
+			// 阶段回落：保留 CompletedBlocks（已完成任务记忆不丢）；
+			// 把 ActiveBlocks 移动到 PausedBlocks 暂存，未来可支持恢复；
+			// 重置当前执行上下文，让下一 tick 进入 handleInitial 按新指令重新路由。
+			if state.PausedBlocks == nil {
+				state.PausedBlocks = make(map[string]*types.SessionBlock)
+			}
+			for id, block := range state.ActiveBlocks {
+				state.PausedBlocks[id] = block
+			}
 			state.ActiveBlocks = make(map[string]*types.SessionBlock)
-			state.CompletedBlocks = nil
 			state.CallStack = make([]*types.CallRequest, 0)
 			state.CurrentBlockID = ""
 			state.CurrentDomain = ""
@@ -48,6 +53,7 @@ func (n *MetaAgentNode) drainCommandQueue(ctx context.Context, state *types.Thre
 			state.CurrentAssistantID = ""
 			state.TargetRoleID = ""
 			state.DirectExecute = false
+			state.EnableSubdomain = false
 			state.PendingClarify = nil // 同步丢弃旧的澄清请求，避免恢复后误挂起
 			state.NextAction = enums.ActionContinue
 			state.Reason = "interrupted by user"

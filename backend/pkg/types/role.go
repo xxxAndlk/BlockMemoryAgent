@@ -155,6 +155,10 @@ type ThreeLayerState struct {
 	ActiveBlocks map[string]*SessionBlock `json:"active_blocks"`
 	// CompletedBlocks 已完成的会话块 ID 列表。
 	CompletedBlocks []string `json:"completed_blocks"`
+	// PausedBlocks 被用户中断暂停的会话块映射（ID -> SessionBlock）。
+	// 阶段回落设计：IntentInterrupt 不丢弃已完成块，也不直接删除活跃块，
+	// 而是把活跃块暂存到这里，未来支持"恢复上次任务"时重新激活。
+	PausedBlocks map[string]*SessionBlock `json:"paused_blocks,omitempty"`
 
 	// ===== Layer 2: DomainAgent（当前活跃的） =====
 	// CurrentBlockID 当前活跃会话块 ID。
@@ -199,6 +203,7 @@ func NewThreeLayerState(sessionID string) *ThreeLayerState {
 	return &ThreeLayerState{
 		SessionID:     sessionID,
 		ActiveBlocks:  make(map[string]*SessionBlock),
+		PausedBlocks:  make(map[string]*SessionBlock),
 		RoleInstances: make(map[string]*RoleInstance),
 		CallStack:     make([]*CallRequest, 0),
 		NextAction:    enums.ActionContinue,

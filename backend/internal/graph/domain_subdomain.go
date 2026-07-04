@@ -82,7 +82,8 @@ func detectSubdomainBoundaries(tasks []string) bool {
 //
 // 返回：LLM 回答"是"/"yes"返回 true；否则 false。
 //
-// 注意：当前 shouldSplitToSubDomains 恒返回 false，本函数未被主路径调用，保留以备启用。
+// 注意：shouldSplitToSubDomains 仅在 EnableSubdomain=true 且跨子领域边界时返回 true；
+// 本函数作为可选 LLM 兜底，在规则未命中且模型可用时被调用。
 func (n *DomainAgentNode) shouldSplitWithLLM(ctx context.Context, domain string, tasks []string) bool {
 	// 无模型工厂则直接返回 false
 	if n.modelFactory == nil {
@@ -125,7 +126,8 @@ func (n *DomainAgentNode) shouldSplitWithLLM(ctx context.Context, domain string,
 //
 // 返回：更新后的 state；子领域全部派发完后返回 ActionContinue。
 //
-// 注意：当前 shouldSplitToSubDomains 恒返回 false，本函数未被主路径调用，保留以备启用。
+// 注意：本函数仅在 shouldSplitToSubDomains 返回 true 时被调用；
+// 当前默认路由（direct_tool / direct_assistant / create_domain / multi_domain）不启用 SubDomain。
 func (n *DomainAgentNode) handleSubDomainSplit(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance) (*types.ThreeLayerState, error) {
 	// 取当前块
 	block := state.ActiveBlocks[state.CurrentBlockID]
