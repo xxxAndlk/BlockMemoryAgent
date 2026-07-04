@@ -3,12 +3,14 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 	"github.com/muesli/reflow/wordwrap"
 
 	"github.com/blockmemory/agent/backend/internal/board"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
 // View renders the entire TUI in single-column chat-focused layout.
@@ -157,12 +159,12 @@ func (m Model) renderChat(w, h int) string {
 	}
 
 	s := m.selectedSession()
-	if s == nil {
+	if s == nil && m.pendingFirstMessage == "" {
 		return m.renderWelcome(contentW, h)
 	}
 
-	// 有会话但暂无消息/事件时，在对话区顶部显示首页提示，避免空白一片。
-	if len(chatItems(s, true)) == 0 {
+	// 有会话但暂无消息/事件，且无本地预展示消息时，在对话区顶部显示首页提示。
+	if s != nil && len(chatItems(s, true)) == 0 && m.pendingFirstMessage == "" {
 		return m.renderEmptyChat(contentW, h)
 	}
 
@@ -305,11 +307,21 @@ func (m Model) renderAgentsPanel(w, h int) string {
 // 并同步更新 m.chatItemOffsets。
 func (m *Model) buildChatContent(width int) string {
 	s := m.selectedSession()
-	if s == nil {
+	var items []chatItem
+	if s != nil {
+		items = chatItems(s, true)
+	} else if m.pendingFirstMessage != "" {
+		// 会话创建中，本地预显示首条用户消息，保证高亮样式与真实消息一致
+		items = []chatItem{{
+			title:     "> " + m.pendingFirstMessage,
+			timestamp: time.Now(),
+			isEvent:   false,
+			role:      enums.ChatRoleUser,
+		}}
+	} else {
 		m.chatItemOffsets = nil
 		return ""
 	}
-	items := chatItems(s, true)
 	offsets := make([]int, len(items))
 	var lines []string
 

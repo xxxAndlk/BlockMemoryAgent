@@ -78,7 +78,8 @@
       "Bash(GOTOOLCHAIN=local go test ./backend/... -count=1)",
       "Bash(GOTOOLCHAIN=local go vet ./backend/...)",
       "Bash(tasklist /FI \"PID eq 9068\")",
-      "Bash(GOTOOLCHAIN=local go run ./backend)"
+      "Bash(GOTOOLCHAIN=local go run ./backend)",
+      "Bash(git rm *)"
     ]
   }
 }

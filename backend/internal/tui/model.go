@@ -47,6 +47,7 @@ type Model struct {
 	chatItemOffsets     []int // 每个 chatItem 在 viewport content 中的起始行偏移
 	pendingScrollToUser bool  // 发送消息后优先滚动到用户问题
 	chatAnchorUser      bool  // 已锚定到用户问题，禁止自动跟随底部
+	pendingFirstMessage string // 无会话时用户发送的首条消息，用于立即切换到对话视图并高亮展示
 
 	// accumulated token counts from token_usage events
 	totalInputTokens  int
@@ -157,6 +158,7 @@ func (m *Model) selectSession(idx int) {
 		return
 	}
 	m.sessionsCursor = idx
+	m.pendingFirstMessage = "" // 会话已选中，首条消息已由服务端保存，清除本地预展示
 	m.chatCursor = 0
 	m.chatFollowBottom = true
 	m.chatAnchorUser = false
@@ -648,7 +650,7 @@ func (m *Model) chatGotoBottom() {
 // 并同步到 viewport。ScrollToBottom 由调用方按需执行。
 func (m *Model) rebuildChatContent() {
 	s := m.selectedSession()
-	if s == nil {
+	if s == nil && m.pendingFirstMessage == "" {
 		m.chatVP.SetContent("")
 		m.chatLastItems = 0
 		return
@@ -659,7 +661,11 @@ func (m *Model) rebuildChatContent() {
 	}
 	content := m.buildChatContent(w)
 	m.chatVP.SetContent(content)
-	m.chatLastItems = len(chatItems(s, true))
+	if s != nil {
+		m.chatLastItems = len(chatItems(s, true))
+	} else {
+		m.chatLastItems = 1 // 本地预展示的首条用户消息
+	}
 	m.chatLastWidth = w
 }
 

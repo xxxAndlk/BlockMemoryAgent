@@ -180,6 +180,10 @@ func (m *Model) submitInput(cmd string) {
 	s := m.selectedSession()
 	if s == nil {
 		// No session yet: treat plain input as a new conversation goal.
+		// 先本地预展示首条消息，确保用户按下回车后立刻在对话区看到自己的输入，
+		// 避免欢迎页停留造成"第一个问题未记录"的错觉。
+		m.pendingFirstMessage = cmd
+		m.rebuildChatContent()
 		m.createSession(cmd)
 		return
 	}

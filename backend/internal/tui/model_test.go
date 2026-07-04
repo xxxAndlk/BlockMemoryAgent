@@ -1,0 +1,216 @@
+package tui
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/charmbracelet/bubbles/viewport"
+
+	"github.com/blockmemory/agent/backend/internal/config"
+	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/internal/runtime"
+	"github.com/blockmemory/agent/backend/internal/server"
+	"github.com/blockmemory/agent/backend/internal/skill"
+	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
+	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/types"
+)
+
+// fakeMetaAgentForRender 是一个立即结束的 MetaAgent 节点，用于在测试中
+// 快速得到一个包含用户消息和助手回复的已完成会话。
+type fakeMetaAgentForRender struct {
+	summary string
+}
+
+func (n *fakeMetaAgentForRender) Name() string { return "MetaAgent" }
+func (n *fakeMetaAgentForRender) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
+	state.SessionSummary = n.summary
+	state.NextAction = enums.ActionFinish
+	return state, nil
+}
+
+type fakeSinkerForRender struct{}
+
+func (n *fakeSinkerForRender) Name() string { return "Sinker" }
+func (n *fakeSinkerForRender) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
+	state.NextAction = enums.ActionFinish
+	return state, nil
+}
+
+func minimalRoleConfigForRender() *pkgconfig.RoleConfigFile {
+	return &pkgconfig.RoleConfigFile{
+		MetaAgent: pkgconfig.MetaAgentConfig{
+			MaxBlocks:       4,
+			SummaryInterval: 1,
+			ModelConfig:     types.AgentModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test-key"},
+		},
+		DomainAgent: pkgconfig.DomainAgentConfig{
+			ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test-key"},
+		},
+	}
+}
+
+// TestFirstMessagePendingToRealSession 验证：无会话时发送首条消息后，
+// 本地预展示的消息可见；待后端会话创建完成并选中后，真实会话中的同一条
+// 用户消息仍然以 "You" 高亮展示。
+func TestFirstMessagePendingToRealSession(t *testing.T) {
+	soulPath := filepath.Join(t.TempDir(), "soul.md")
+	if err := os.WriteFile(soulPath, []byte("test persona"), 0644); err != nil {
+		t.Fatalf("write soul: %v", err)
+	}
+
+	cfg := minimalRoleConfigForRender()
+	registry := graph.NewRoleRegistry(cfg)
+	factory := graph.NewRoleFactory(registry, nil, cfg)
+
+	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt.SetAgentConfig(&config.AgentConfig{
+		StallSteps:           30,
+		MaxRepeatFingerprint: 3,
+		SessionTimeoutMin:    60,
+	})
+
+	meta := &fakeMetaAgentForRender{summary: "收到，开始处理。"}
+	escalation := graph.NewEscalationHandlerNode()
+	sinker := &fakeSinkerForRender{}
+
+	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
+	builder.SetRuntime(rt)
+	builder.AddNode(meta)
+	builder.AddNode(escalation)
+	builder.AddNode(sinker)
+	g := builder.Build()
+
+	sessionMgr := server.NewSessionManager(g, registry)
+
+	m := &Model{
+		styles:     NewStyles(),
+		chatVP:     viewport.New(80, 20),
+		width:      80,
+		height:     24,
+		sessionMgr: sessionMgr,
+		registry:   registry,
+		httpAddr:   "http://127.0.0.1:1",
+		flashMu:    &sync.Mutex{},
+	}
+	m.chatVP.SetContent("")
+
+	// 无会话时发送首条消息
+	m.submitInput("hello")
+	if m.pendingFirstMessage != "hello" {
+		t.Fatalf("pendingFirstMessage 应被设置，got %q", m.pendingFirstMessage)
+	}
+	view := m.View()
+	if !strings.Contains(view, "You hello") {
+		t.Fatalf("本地预展示消息应可见，got:\n%s", view)
+	}
+
+	// 模拟后端会话创建完成（直接创建，跳过异步 HTTP）
+	session := sessionMgr.CreateSession(context.Background(), "hello")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := sessionMgr.SnapshotSession(session.ID)
+		if snap != nil && snap.Status == enums.SessionStatusCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	m.pendingSelectID = session.ID
+
+	// 触发 tick，让 selectSession 消费 pendingSelectID
+	nm, _ := m.Update(tickMsg{})
+	if mv, ok := nm.(Model); ok {
+		m = &mv
+	}
+
+	if m.pendingFirstMessage != "" {
+		t.Fatalf("selectSession 后 pendingFirstMessage 应被清空，got %q", m.pendingFirstMessage)
+	}
+
+	view = m.View()
+	t.Logf("after session selected view:\n%s", view)
+	if !strings.Contains(view, "You hello") {
+		t.Fatalf("真实会话中的首条用户消息仍应以 'You' 高亮展示，got:\n%s", view)
+	}
+}
+
+// TestFirstMessageRenderedInExistingSession 验证：已有会话中发送的首条用户消息
+// 必须出现在对话区并以 "You" 高亮展示，助手回复紧随其后可见。
+func TestFirstMessageRenderedInExistingSession(t *testing.T) {
+	soulPath := filepath.Join(t.TempDir(), "soul.md")
+	if err := os.WriteFile(soulPath, []byte("test persona"), 0644); err != nil {
+		t.Fatalf("write soul: %v", err)
+	}
+
+	cfg := minimalRoleConfigForRender()
+	registry := graph.NewRoleRegistry(cfg)
+	factory := graph.NewRoleFactory(registry, nil, cfg)
+
+	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt.SetAgentConfig(&config.AgentConfig{
+		StallSteps:           30,
+		MaxRepeatFingerprint: 3,
+		SessionTimeoutMin:    60,
+	})
+
+	meta := &fakeMetaAgentForRender{summary: "你好！我是你的多 Agent 编排助手 BlockMemoryAgent。"}
+	escalation := graph.NewEscalationHandlerNode()
+	sinker := &fakeSinkerForRender{}
+
+	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
+	builder.SetRuntime(rt)
+	builder.AddNode(meta)
+	builder.AddNode(escalation)
+	builder.AddNode(sinker)
+	g := builder.Build()
+
+	sessionMgr := server.NewSessionManager(g, registry)
+
+	// 创建会话；fake MetaAgent 立即结束，不会并发修改 Messages
+	session := sessionMgr.CreateSession(context.Background(), "a")
+
+	// 等待会话完成，确保 Messages 已追加助手总结
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := sessionMgr.SnapshotSession(session.ID)
+		if snap != nil && snap.Status == enums.SessionStatusCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	m := &Model{
+		styles:     NewStyles(),
+		chatVP:     viewport.New(80, 20),
+		width:      80,
+		height:     24,
+		sessionMgr: sessionMgr,
+		registry:   registry,
+		httpAddr:   "http://127.0.0.1:1",
+		flashMu:    &sync.Mutex{},
+	}
+	m.chatVP.SetContent("")
+	m.refreshSessions()
+	if len(m.sessions) == 0 {
+		t.Fatal("expected at least one session after CreateSession")
+	}
+	m.selectSession(0)
+
+	view := m.View()
+	t.Logf("rendered view:\n%s", view)
+
+	if !strings.Contains(view, "You") {
+		t.Fatal("用户消息应以 'You' 高亮标签展示")
+	}
+	if !strings.Contains(view, "You a") {
+		t.Fatalf("用户消息 'a' 应以 'You' 标签在对话区可见，got:\n%s", view)
+	}
+	if !strings.Contains(view, "BlockMemoryAgent") {
+		t.Fatalf("助手回复应在对话区可见，got:\n%s", view)
+	}
+}

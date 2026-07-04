@@ -3,8 +3,11 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/bubbles/viewport"
 
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -257,4 +260,43 @@ func titlesOf(items []chatItem) []string {
 		out[i] = it.title
 	}
 	return out
+}
+
+// TestFirstMessagePendingDisplay 验证无会话时发送首条消息，TUI 立即切换到对话视图
+// 并高亮展示用户输入，而不是继续显示欢迎页（修复“第一个问题未记录”的错觉）。
+func TestFirstMessagePendingDisplay(t *testing.T) {
+	m := &Model{
+		styles:   NewStyles(),
+		chatVP:   viewport.New(80, 20),
+		width:    80,
+		height:   24,
+		httpAddr: "http://127.0.0.1:1", // 让后台 createSession 快速失败，避免测试被网络阻塞
+		flashMu:  &sync.Mutex{},
+	}
+	m.chatVP.SetContent("")
+
+	// 初始状态应展示欢迎页
+	welcomeView := m.View()
+	if !strings.Contains(welcomeView, "AI Agent for Code, Memory and More.") {
+		t.Fatal("初始无会话时应展示欢迎页")
+	}
+
+	// 用户发送首条消息
+	m.submitInput("hello world")
+
+	if m.pendingFirstMessage != "hello world" {
+		t.Fatalf("pendingFirstMessage 应被设为 %q，got %q", "hello world", m.pendingFirstMessage)
+	}
+
+	// 发送后应立刻切换到对话视图，不再展示欢迎页
+	view := m.View()
+	if strings.Contains(view, "AI Agent for Code, Memory and More.") {
+		t.Fatal("发送首条消息后欢迎页应立即隐藏")
+	}
+	if !strings.Contains(view, "You") {
+		t.Fatal("首条消息应以高亮 'You' 标签展示")
+	}
+	if !strings.Contains(view, "hello world") {
+		t.Fatalf("首条消息内容应在对话区可见，got:\n%s", view)
+	}
 }
