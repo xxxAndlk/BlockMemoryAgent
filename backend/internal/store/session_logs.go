@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -152,7 +153,9 @@ func scanSessionLogRows(rows *sql.Rows) ([]*SessionLogRecord, error) {
 			continue
 		}
 		if len(metaRaw) > 0 {
-			_ = json.Unmarshal(metaRaw, &r.Meta)
+			if err := json.Unmarshal(metaRaw, &r.Meta); err != nil {
+				log.Printf("[store] unmarshal session_logs.meta_json failed: id=%d err=%v", r.ID, err)
+			}
 		}
 		out = append(out, &r)
 	}

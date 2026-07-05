@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -246,9 +247,13 @@ func (s *Scheduler) tick(ctx context.Context) {
 		}
 		// 简化：若距 updatedAt > interval，则触发
 		if now.Sub(d.UpdatedAt) >= interval {
-			_ = s.Trigger(ctx, d.ID)
+			if err := s.Trigger(ctx, d.ID); err != nil {
+				log.Printf("[DAG] trigger failed: id=%s err=%v", d.ID, err)
+			}
 			d.UpdatedAt = now
-			_ = s.store.SaveDAG(ctx, d) // 持久化新的 updatedAt，避免重复触发
+			if err := s.store.SaveDAG(ctx, d); err != nil { // 持久化新的 updatedAt，避免重复触发
+				log.Printf("[DAG] save dag failed: id=%s err=%v", d.ID, err)
+			}
 		}
 	}
 	// 推进运行中 DAG：拷贝一份引用后释放锁，再逐个 dispatchReady，避免长持锁

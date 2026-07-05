@@ -86,7 +86,7 @@ func main() {
 	if cfg.Postgres.DSN == "" {
 		log.Fatalf("postgres DSN not configured in %s", *configPath)
 	}
-	pgStore, err := store.NewPostgresStore(cfg.Postgres.DSN)
+	pgStore, err := store.NewPostgresStore(ctx, cfg.Postgres.DSN)
 	if err != nil {
 		log.Fatalf("connect postgres: %v", err)
 	}
@@ -193,6 +193,11 @@ func main() {
 	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
 	mux.Handle("/api/dag", dagHandler)
 	mux.Handle("/api/dag/", dagHandler)
+
+	apiHandler := server.NewAPIHandler(nil)
+	apiHandler.SetSessionManager(sessionMgr)
+	mux.HandleFunc("/api/metrics", apiHandler.MetricsHandler)
+
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"postgres":{"online":true},"redis":{"online":false,"detail":"not configured in TUI"},"llm":{"online":true}}`)

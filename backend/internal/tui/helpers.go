@@ -683,6 +683,62 @@ func replacePairs(text, marker string, f func(string) string) string {
 	return text
 }
 
+// planStatusText 把看板任务状态转换为短文本标签，用于右侧面板展示。
+func planStatusText(status board.TaskStatus) string {
+	switch status {
+	case board.TaskDone:
+		return " Done"
+	case board.TaskInProgress:
+		return " Running"
+	case board.TaskBlocked:
+		return " Blocked"
+	case board.TaskFailed:
+		return " Failed"
+	default:
+		return " Waiting"
+	}
+}
+
+// taskElapsed 估算任务已用时长：已完成/失败用 UpdatedAt-CreatedAt，
+// 进行中用 Now-CreatedAt，待处理返回 0。
+func taskElapsed(t board.SubTask) time.Duration {
+	if t.Status == board.TaskPending {
+		return 0
+	}
+	end := t.UpdatedAt
+	if t.Status == board.TaskInProgress || t.Status == board.TaskBlocked {
+		end = time.Now()
+	}
+	if end.Before(t.CreatedAt) {
+		end = t.CreatedAt
+	}
+	return end.Sub(t.CreatedAt)
+}
+
+// formatDurationShort 把时长格式化为 mm:ss 或 hh:mm:ss。
+func formatDurationShort(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s)
+}
+
+// agentTreePrefix 根据 Agent 在拓扑中的深度返回带缩进/连接符的前缀，
+// 让右侧面板的 Agent 编排更像参考设计中的层级拓扑。
+func agentTreePrefix(depth int) string {
+	if depth <= 0 {
+		return ""
+	}
+	return strings.Repeat("  ", depth)
+}
+
 func statusIcon(status string) string {
 	switch status {
 	case "running", string(enums.RoleStatusActive), string(board.TaskInProgress):

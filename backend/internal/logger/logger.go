@@ -153,11 +153,24 @@ func (l *Logger) log(ctx context.Context, level slog.Level, msg string, record *
 	if record.Phase == "" {
 		record.Phase = l.attrValue("phase")
 	}
-	// 异步写表避免阻塞主路径；失败仅 stderr 已由上面输出
+	// 异步写表避免阻塞主路径；指数退避重试 3 次，最终失败再记录错误日志
 	go func(r *store.SessionLogRecord) {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = l.store.SaveSessionLog(bgCtx, r)
+		var lastErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			}
+			lastErr = l.store.SaveSessionLog(bgCtx, r)
+			if lastErr == nil {
+				return
+			}
+		}
+		l.slog.Error("save session log failed after retries",
+			slog.String("error", lastErr.Error()),
+			slog.String("session_id", r.SessionID),
+			slog.String("phase", r.Phase))
 	}(record)
 }
 

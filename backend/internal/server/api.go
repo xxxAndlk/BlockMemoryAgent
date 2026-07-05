@@ -8,6 +8,7 @@ import (
 	"net/http"      // HTTP 处理器
 	"os"            // 文件读取 / Stat
 	"path/filepath" // filepath.Base
+	stdruntime "runtime" // 进程运行时指标
 	"strconv"       // Atoi 等
 	"strings"       // 字符串处理
 	"time"          // 超时与时间戳
@@ -248,6 +249,32 @@ func (h *APIHandler) GraphResumeHandler(w http.ResponseWriter, r *http.Request) 
 // 返回值：bool - true 表示已暂停。
 func (h *APIHandler) IsPaused(topicID string) bool {
 	return h.paused[topicID]
+}
+
+// MetricsHandler GET /api/metrics — 返回 Prometheus 格式运行时指标
+// 指标：goroutine 数、内存分配、内存中会话数、LLM 调用/超时次数。
+func (h *APIHandler) MetricsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var ms stdruntime.MemStats
+	stdruntime.ReadMemStats(&ms)
+
+	sessionCount := 0
+	callCount, timeoutCount := 0, 0
+	if h.sessionMgr != nil {
+		sessionCount = h.sessionMgr.SessionCount()
+		callCount, timeoutCount, _, _ = h.sessionMgr.LLMStats()
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, "# HELP go_goroutines Number of goroutines\n# TYPE go_goroutines gauge\ngo_goroutines %d\n\n", stdruntime.NumGoroutine())
+	fmt.Fprintf(w, "# HELP go_memory_alloc_bytes Allocated memory in bytes\n# TYPE go_memory_alloc_bytes gauge\ngo_memory_alloc_bytes %d\n\n", ms.Alloc)
+	fmt.Fprintf(w, "# HELP bma_sessions_total Total sessions in memory\n# TYPE bma_sessions_total gauge\nbma_sessions_total %d\n\n", sessionCount)
+	fmt.Fprintf(w, "# HELP bma_llm_calls_total Total LLM calls\n# TYPE bma_llm_calls_total counter\nbma_llm_calls_total %d\n\n", callCount)
+	fmt.Fprintf(w, "# HELP bma_llm_timeouts_total Total LLM timeouts\n# TYPE bma_llm_timeouts_total counter\nbma_llm_timeouts_total %d\n", timeoutCount)
 }
 
 // HealthHandler GET /api/health — 返回 Postgres / Redis / LLM 连接状态

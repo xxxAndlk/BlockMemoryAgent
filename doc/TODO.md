@@ -1,5 +1,18 @@
 ## 已完成
-1.添加基于DAG（有向无环图）的定时任务逻辑流程
+1.**风险审计修复（2026-07-05）**：基于 `workspace/risk_report.md` 的 P0/P1/P2 风险逐项核实并修复真实缺陷：
+  - P0-01：`backend/main.go` 为 `http.Server` 配置 `ReadTimeout`/`WriteTimeout`/`IdleTimeout`。
+  - P0-02：`NewPostgresStore`/`NewRedisStore` 接收 `context.Context`，内部用 5s 超时包装 `PingContext`/`Ping`，避免启动挂死。
+  - P0-03：`backend/internal/dag/dag.go` 的 `Trigger`/`SaveDAG` 错误改为 `log.Printf` 记录，不再静默丢弃。
+  - P0-04：`backend/internal/logger/logger.go` 异步写 `session_logs` 失败时记录结构化 `slog.Error`。
+  - P0-05：`backend/internal/memory/block_vector.go` 反序列化 `facts` 失败时记录日志。
+  - P1-01：`agent_common.go` / `domain_skills.go` 的 `log.Printf` 替换为结构化 `logger.Error`/`logger.Event`。
+  - P1-02：块记忆归档与 `session_logs` 异步写入增加 3 次指数退避重试。
+  - P1-04：新增 `/api/metrics` Prometheus 端点（goroutine/内存/会话/LLM 调用/超时）。
+  - P2-04：`provider_ollama.go` URL 解析失败返回错误，不再静默回退。
+  - P2-05：`store/postgres.go` / `store/dag.go` / `store/session_logs.go` 多处忽略的 `json.Unmarshal` 错误增加日志。
+  - 已核实不成立/已修复：P0-06（TUI HTTP body 已关闭）、P1-03（`evictCompletedSessions` 确实从 map 删除）。
+  - 未改动（架构债务）：P2-01/P2-02（大文件拆分）、P2-03（SubDomainAgent 保留但运行时禁用）。
+2.添加基于DAG（有向无环图）的定时任务逻辑流程
 2.把每个Agent的上下文窗口不写死，根据配置变化、每个子Agent的skill库大小、工具调用轮数等写死的数据都修改为配置动态参数
 3.在domainAgent执行后，块记忆存储后，增加向量检索，在需要检索到这些上下文时，从向量库中检索出最相似的块，并返回给domainAgent。
 5.添加"人机对话"处理，agent遇到需要确定的问题，以提问的方式给到用户，用户回答添加到上下文中，agent根据用户回答，进行下一步处理。

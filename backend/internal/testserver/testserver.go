@@ -91,7 +91,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		return nil, nil, nil, fmt.Errorf("load roles %s: %w", rolePath, err)
 	}
 
-	pgStore, err := store.NewPostgresStore(cfg.Postgres.DSN)
+	pgStore, err := store.NewPostgresStore(ctx, cfg.Postgres.DSN)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("connect postgres with DSN from %s: %w", cfgPath, err)
 	}
@@ -112,6 +112,10 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		pgStore.Close()
 		return nil, nil, nil, fmt.Errorf("ensure session_events schema: %w", err)
 	}
+	if err := store.EnsureSessionLogsSchema(ctx, pgStore.DB()); err != nil {
+		pgStore.Close()
+		return nil, nil, nil, fmt.Errorf("ensure session_logs schema: %w", err)
+	}
 	if err := store.EnsureDAGSchema(ctx, pgStore.DB()); err != nil {
 		pgStore.Close()
 		return nil, nil, nil, fmt.Errorf("ensure dag schema: %w", err)
@@ -125,7 +129,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		return nil, nil, nil, fmt.Errorf("validate embedding dimension: %w", err)
 	}
 
-	redisStore, err := store.NewRedisStore(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
+	redisStore, err := store.NewRedisStore(ctx, cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
 		pgStore.Close()
 		return nil, nil, nil, fmt.Errorf("connect redis with addr from %s: %w", cfgPath, err)
@@ -233,6 +237,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	}))
 	mux.HandleFunc("/api/sessions/", wrap(sessionRouter(sessionMgr)))
 	mux.HandleFunc("/api/health", apiHandler.HealthHandler)
+	mux.HandleFunc("/api/metrics", wrap(apiHandler.MetricsHandler))
 	mux.HandleFunc("/api/status", wrap(apiHandler.StatusHandler))
 	mux.HandleFunc("/api/metrics/timeline", wrap(apiHandler.TimelineHandler))
 	mux.HandleFunc("/api/activity", wrap(apiHandler.ActivityHandler))

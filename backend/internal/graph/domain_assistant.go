@@ -26,7 +26,7 @@ import (
 //
 // 保留 emitDetail 调试事件推送（公共函数不感知 UI 事件），其余逻辑走 CommonCreateAssistantForTask。
 func (n *DomainAgentNode) createAssistantForTask(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, task string) (*types.RoleInstance, *types.RoleDefinition) {
-	assistantInst, assistantDef := CommonCreateAssistantForTask(ctx, n.registry, n.factory, n.instID, inst, state, task)
+	assistantInst, assistantDef := CommonCreateAssistantForTask(ctx, n.registry, n.factory, n.instID, inst, state, task, n.sessionLogger(ctx))
 	// 动态创建成功时推送 Agent 创建调试事件，便于 UI 观察动态角色生成
 	if assistantInst != nil && assistantDef != nil && assistantDef.Type == enums.RoleTypeDynamic {
 		n.emitDetail(ctx, "agent_created", fmt.Sprintf("创建 Assistant: %s (任务: %s)", assistantInst.ID, task),

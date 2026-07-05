@@ -43,7 +43,7 @@ Claude Code 的对话一旦超过几百轮，质量明显下降。你被迫开�
 - **跨会话记忆**：关键知识在会话结束后持久化，新会话自动召回；MetaMemory 轻量调度记忆跨会话保留
 - **Leaf 执行用 go-kratos Blades**：Assistant 真正干活走 Blades `Agent` + 原生 function-calling（ReAct 工具循环）；上层四层图状态机自研
 - **严格启动**：config/roles/env/soul/skills 任一配置文件缺失，或 PG/Redis/LLM 后端不可达，启动即失败并明确报错
-- **双入口 + 可观测**：HTTP Web UI（Vue 3 SPA）+ bubbletea TUI；SSE 实时推送思考/工具/token 事件
+- **双入口 + 可观测**：HTTP Web UI（Vue 3 SPA）+ bubbletea TUI；SSE 实时推送思考/工具/token 事件；后端暴露 `/api/metrics` 输出 Prometheus 格式运行时指标
 - **工程防护**：完成门控（LLM 声称写文件时必须见到成功 WriteFile）、死循环渐进告警、LLM 调用追踪 + 超时追踪、同步记忆写入
 
 ---
@@ -221,6 +221,17 @@ Assistant 走 Blades 原生 function-calling：`blades.NewAgent` + `WithTools` +
 参考 Claude Code 的简洁终端交互，编程场景优化：主对话区 + 底部状态栏（plan 进度 + 工具状态）+ Tab 切换右侧 Agent 面板 + 记忆召回指示 `🧠 recalled: ...`。工具输出默认折叠（ReadFile/SearchInFiles/ListDir/HTTPGet/HTTPPost 仅显示路径，WriteFile/RunCommand 保留 output，错误一律展示）。
 
 ---
+
+## 可观测性与指标
+
+- **健康检查**：`GET /api/health` 返回 Postgres / Redis / LLM 连通性 JSON。
+- **Prometheus 指标**：`GET /api/metrics` 暴露以下运行时指标（`text/plain`）：
+  - `go_goroutines`：当前 goroutine 数
+  - `go_memory_alloc_bytes`：已分配内存字节数
+  - `bma_sessions_total`：内存中会话总数
+  - `bma_llm_calls_total`：LLM 调用总次数
+  - `bma_llm_timeouts_total`：LLM 超时总次数
+- **结构化日志**：所有 Agent 关键事件写入 `session_logs` 表，可通过 `GET /api/sessions/{id}/logs` 按 session/agent/level 查询；stderr 同时输出 JSON 格式日志。
 
 ## 与 Claude Code 的对比
 

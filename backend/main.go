@@ -13,6 +13,7 @@ import (
 	"os/signal"     // 信号监听
 	"path/filepath" // 可执行文件相对路径解析
 	"syscall"       // SIGINT/SIGTERM 信号常量
+	"time"          // HTTP 超时
 
 	"github.com/blockmemory/agent/backend/internal/config"      // 基础设施配置加载
 	"github.com/blockmemory/agent/backend/internal/logging"     // 日志文件按天分割
@@ -87,9 +88,13 @@ func main() {
 	log.Printf("BlockMemoryAgent 服务启动: http://localhost%s", addr)
 
 	// 构造 http.Server，Handler 指向上面注册好的 mux
+	// P0-01 修复：配置读/写超时，避免慢客户端攻击；IdleTimeout 兜底 120s。
 	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  time.Duration(cfg.HTTP.ReadTimeout) * time.Second,
+		WriteTimeout: time.Duration(cfg.HTTP.WriteTimeout) * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// 后台 goroutine 监听并服务；非 ErrServerClosed 错误视为致命

@@ -3,11 +3,12 @@ package graph
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -90,20 +91,35 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 		// 从任务结果中提取结构化 facts（domain + task 级）
 		facts := collectBlockFacts(inst.Domain, block)
 		// 异步归档避免阻塞图循环；失败仅结构化日志，不影响主流程
-		// 注意：通过参数显式捕获 block/domain/goal/sum/facts，避免闭包捕获迭代变量
+		// 注意：通过参数显式捕获 block/domain/goal/sum/facts/log，避免闭包捕获迭代变量
 		// 成功后置 b.archived=true，供 switchToNextBlock 幂等兜底判断
-		go func(b *types.SessionBlock, domain, goal, sum string, fs []BlockMemoryFact) {
+		logCtx := WithSessionID(context.Background(), state.SessionID)
+		log := n.sessionLogger(logCtx)
+		go func(b *types.SessionBlock, domain, goal, sum string, fs []BlockMemoryFact, log *logger.Logger) {
 			// 独立 ctx：与会话 ctx 解耦，会话结束后归档仍能完成
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			// 清洗非法 UTF-8 并截断，避免写入 Postgres 时报 22021 编码错误
 			domain, goal, sum, fs = sanitizeBlockMemoryInputs(domain, goal, sum, fs)
-			if err := n.blockMemory.SaveBlockMemory(bgCtx, b.SessionID, domain, goal, sum, fs); err != nil {
-				log.Printf("[DomainAgent] save block memory failed: session=%s domain=%s err=%v", b.SessionID, domain, err)
+			// 写块记忆归档：指数退避重试 3 次，避免偶发网络/连接抖动导致数据丢失
+			var lastErr error
+			for attempt := 0; attempt < 3; attempt++ {
+				if attempt > 0 {
+					time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+				}
+				lastErr = n.blockMemory.SaveBlockMemory(bgCtx, b.SessionID, domain, goal, sum, fs)
+				if lastErr == nil {
+					break
+				}
+			}
+			if lastErr != nil {
+				log.Error(bgCtx, "save block memory failed after retries", lastErr,
+					slog.String("session_id", b.SessionID),
+					slog.String("domain", domain))
 				return
 			}
 			b.MarkArchived() // 标记已落库，switchToNextBlock 据此跳过兜底
-		}(block, inst.Domain, block.Goal, summary, facts)
+		}(block, inst.Domain, block.Goal, summary, facts, log)
 	}
 }
 

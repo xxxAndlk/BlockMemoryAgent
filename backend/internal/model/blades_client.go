@@ -221,7 +221,7 @@ func createBladesProvider(cfg types.AgentModelConfig) (blades.ModelProvider, err
 	case "anthropic":
 		return newAnthropicProvider(cfg), nil
 	case "ollama":
-		return newOllamaProvider(cfg), nil
+		return newOllamaProvider(cfg)
 	default:
 		// 后续可在此扩展 azure/bedrock 等分支
 		return nil, fmt.Errorf("unsupported provider: %s", cfg.Provider)

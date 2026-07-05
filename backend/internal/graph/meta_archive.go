@@ -27,7 +27,9 @@ func (n *MetaAgentNode) ensureBlockArchived(ctx context.Context, state *types.Th
 	// 同步兜底：短超时，失败仅日志不阻塞
 	bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := n.blockMemory.SaveBlockMemory(bgCtx, block.SessionID, block.Domain, block.Goal, summary, nil); err != nil {
+	// 清洗非法 UTF-8，避免写入 Postgres 时报 22021 编码错误
+	domain, goal, sum, _ := sanitizeBlockMemoryInputs(block.Domain, block.Goal, summary, nil)
+	if err := n.blockMemory.SaveBlockMemory(bgCtx, block.SessionID, domain, goal, sum, nil); err != nil {
 		log.Printf("[MetaAgent] block memory fallback archive failed: session=%s domain=%s err=%v", block.SessionID, block.Domain, err)
 		return
 	}

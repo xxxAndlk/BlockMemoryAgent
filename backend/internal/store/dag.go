@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/blockmemory/agent/backend/internal/dag"
 )
@@ -86,7 +87,9 @@ func (s *PostgresStore) GetDAG(ctx context.Context, id string) (*dag.DAG, error)
 		return nil, err
 	}
 	if len(tasksJSON) > 0 {
-		_ = json.Unmarshal(tasksJSON, &d.Tasks)
+		if err := json.Unmarshal(tasksJSON, &d.Tasks); err != nil {
+			log.Printf("[store] unmarshal dag_jobs.tasks failed: id=%s err=%v", d.ID, err)
+		}
 	}
 	return &d, nil
 }
@@ -112,7 +115,9 @@ func (s *PostgresStore) ListDAGs(ctx context.Context) ([]*dag.DAG, error) {
 			return nil, err
 		}
 		if len(tasksJSON) > 0 {
-			_ = json.Unmarshal(tasksJSON, &d.Tasks)
+			if err := json.Unmarshal(tasksJSON, &d.Tasks); err != nil {
+				log.Printf("[store] unmarshal dag_jobs.tasks failed: id=%s err=%v", d.ID, err)
+			}
 		}
 		out = append(out, &d)
 	}

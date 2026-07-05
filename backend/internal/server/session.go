@@ -15,6 +15,7 @@ import (
 	"sync"          // 读写锁保护 sessions
 	"sync/atomic"   // 原子计数器（seq）
 	"time"          // 时间戳与超时
+	"unicode/utf8"  // UTF-8 合法性校验
 
 	"github.com/blockmemory/agent/backend/internal/cmdqueue" // 用户指令队列（特性6）
 	"github.com/blockmemory/agent/backend/internal/graph"    // Graph 引擎
@@ -464,6 +465,13 @@ func (m *SessionManager) LLMStats() (callCount, timeoutCount int, avgDur, maxDur
 	return
 }
 
+// SessionCount 返回内存中当前会话总数（含运行中与已完成未淘汰的）。
+func (m *SessionManager) SessionCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.sessions)
+}
+
 // ListSessions 列出所有会话，按 StartedAt 降序排序（最新的在前）。
 // 返回值：[]*Session - 所有会话指针的切片（拷贝，可安全遍历）。
 // 排序修复 T3：原实现遍历 map[string]*Session，迭代顺序随机，
@@ -717,18 +725,18 @@ func (m *SessionManager) persistEvents(session *Session) {
 			SessionID:    session.ID,
 			Type:         ev.Type,
 			Agent:        ev.Agent,
-			Message:      ev.Message,
+			Message:      sanitizeUTF8(ev.Message),
 			Kind:         ev.Kind,
 			Tool:         ev.Tool,
-			ToolPath:     ev.ToolPath,
-			ToolOutput:   truncate(ev.ToolOutput, 2048),
-			ToolError:    ev.ToolError,
+			ToolPath:     sanitizeUTF8(ev.ToolPath),
+			ToolOutput:   sanitizeUTF8(truncate(ev.ToolOutput, 2048)),
+			ToolError:    sanitizeUTF8(ev.ToolError),
 			Success:      ev.Success,
 			Timestamp:    ev.Timestamp,
-			Prompt:       truncate(ev.Prompt, 2048),
+			Prompt:       sanitizeUTF8(truncate(ev.Prompt, 2048)),
 			InputTokens:  ev.InputTokens,
 			OutputTokens: ev.OutputTokens,
-			DetailJSON:   ev.DetailJSON,
+			DetailJSON:   sanitizeUTF8(ev.DetailJSON),
 		})
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -770,6 +778,15 @@ func truncate(s string, n int) string {
 		return s // 未超长
 	}
 	return string(r[:n]) + "...(truncated)"
+}
+
+// sanitizeUTF8 把字符串中的非法 UTF-8 字节序列替换为 �，避免写入 Postgres 时报
+// "invalid byte sequence for encoding UTF8"（22021）。
+func sanitizeUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "�")
 }
 
 // addEvent 是 addEventDebug 的简化封装，省略调试字段。

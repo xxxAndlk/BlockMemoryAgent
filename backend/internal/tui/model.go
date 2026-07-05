@@ -666,8 +666,10 @@ func (m *Model) chatScrollToItem(idx int) {
 	m.chatFollowBottom = idx == len(m.chatItemOffsets)-1
 }
 
-// chatScrollToItemBottom 滚动到指定 item 底部对齐视口底部，用于把刚发送的
-// 用户问题固定在屏幕底部，同时保留上方历史记录可见。
+// chatScrollToItemBottom 滚动到指定 item 完全可见，用于把刚发送的用户问题
+// 固定在屏幕内。若 item 高度不超过视口高度，则让 item 顶部对齐视口顶部，
+// 避免短消息被后续内容顶出视口；若 item 高于视口，则底部对齐以便看最新部分，
+// 同时保留上方历史记录可见。
 func (m *Model) chatScrollToItemBottom(idx int) {
 	s := m.selectedSession()
 	if s == nil || len(m.chatItemOffsets) == 0 {
@@ -682,11 +684,14 @@ func (m *Model) chatScrollToItemBottom(idx int) {
 		endOffset = m.chatVP.TotalLineCount()
 	}
 	visible := m.chatVP.VisibleLineCount()
-	// 目标：让 item 的最后一行位于视口最底行
-	target := endOffset - visible
-	if target < startOffset {
-		// item 高度超过视口高度时，退回到 item 顶部
+	itemH := endOffset - startOffset
+	var target int
+	if itemH <= visible {
+		// 短消息优先完整展示在视口顶部，防止顶部被后续内容遮挡
 		target = startOffset
+	} else {
+		// item 高度超过视口高度时，底部对齐以便看最新部分
+		target = endOffset - visible
 	}
 	if target < 0 {
 		target = 0
@@ -748,7 +753,7 @@ func (m *Model) rebuildChatContent() {
 // rightPanelVisible 返回是否显示右侧计划/Agent 分栏。
 // 显示条件（满足其一即可）：
 //   - 用户手动强制显示（ctrl+b）
-//   - 有活动会话、终端宽度≥80，且存在执行计划或任意 Agent（含 MetaAgent）
+//   - 有活动会话且终端宽度≥80（参考设计：右侧面板为会话视图的固定组成部分）
 func (m *Model) rightPanelVisible() bool {
 	if m.rightPanelForced == 1 {
 		return true
@@ -759,7 +764,7 @@ func (m *Model) rightPanelVisible() bool {
 	if m.selectedSession() == nil || m.width < 80 {
 		return false
 	}
-	return m.hasPlan() || len(m.agentsNodes) > 0
+	return true
 }
 
 // chatAreaWidth 返回左侧对话区总宽度（含滚动条与间隔）。

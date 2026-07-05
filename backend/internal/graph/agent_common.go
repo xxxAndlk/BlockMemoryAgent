@@ -3,10 +3,11 @@ package graph
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -104,6 +105,7 @@ func CommonCreateAssistantForTask(
 	parentInst *types.RoleInstance,
 	state *types.ThreeLayerState,
 	task string,
+	log *logger.Logger,
 ) (*types.RoleInstance, *types.RoleDefinition) {
 	if registry == nil || factory == nil || state == nil {
 		return nil, nil
@@ -126,8 +128,12 @@ func CommonCreateAssistantForTask(
 		// 创建固定助手实例
 		assistantInst, err := registry.CreateInstance(assistantDef.ID, state.SessionID, parentDomain, callerInstID)
 		if err != nil {
-			// 创建失败：打印日志
-			log.Printf("[Common] create fixed assistant %s failed: %v", assistantDef.ID, err)
+			// 创建失败：记录结构化日志
+			if log != nil {
+				log.Error(ctx, "create fixed assistant failed", err,
+					slog.String("assistant_id", assistantDef.ID),
+					slog.String("session_id", state.SessionID))
+			}
 			return nil, nil
 		}
 		return assistantInst, assistantDef // 返回固定助手
@@ -136,8 +142,12 @@ func CommonCreateAssistantForTask(
 	// 2. 动态创建助手（由 LLM 推断角色定义）
 	assistantInst, err := factory.CreateAssistant(ctx, state.SessionID, task, callerInstID, parentDefID)
 	if err != nil {
-		// 创建失败：打印日志
-		log.Printf("[Common] create dynamic assistant for %q failed: %v", task, err)
+		// 创建失败：记录结构化日志
+		if log != nil {
+			log.Error(ctx, "create dynamic assistant failed", err,
+				slog.String("task", task),
+				slog.String("session_id", state.SessionID))
+		}
 		return nil, nil
 	}
 

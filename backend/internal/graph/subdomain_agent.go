@@ -24,8 +24,11 @@ import (
 //   - 汇总结果后弹出调用栈，返回父 DomainAgent
 //
 // 设计意图：处理领域内可并行化的独立模块（如前端页面头部/列表/底部）。
-// 注：实测中本层在 DomainAgent.shouldSplitToSubDomains 已被禁用，
-// 保留代码以备后续按需启用。
+//
+// 现状（P2-03）：实测中本层在 DomainAgent.shouldSplitToSubDomains 已被运行时禁用
+//（state.EnableSubdomain 默认为 false），因此当前二进制中 SubDomainAgent 不会被主动创建。
+// 代码仍保留以备后续按需启用；彻底删除或加 build tag 需要同步修改 graph_resolve /
+// three_layer_graph / graph_routes 等多处类型断言，属于较大范围重构，暂作为架构债务保留。
 //
 // 并发安全：节点字段在构造后只读；实例状态由 registry 内部锁保护。
 type SubDomainAgentNode struct {
@@ -107,6 +110,22 @@ func (n *SubDomainAgentNode) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
 // SetAgentSnapshotManager 注入 Agent 快照管理器。
 func (n *SubDomainAgentNode) SetAgentSnapshotManager(s AgentSnapshotManager) {
 	n.snapshotMgr = s
+}
+
+// sessionLogger 返回按 session_id 绑定的 Logger；未注入时返回 nil-safe 的退化 logger。
+func (n *SubDomainAgentNode) sessionLogger(ctx context.Context) *logger.Logger {
+	if n.logger == nil {
+		return logger.New(nil)
+	}
+	sessionID := SessionIDFromContext(ctx)
+	agent := "SubDomainAgent"
+	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
+		agent = "SubDomainAgent[" + inst.Domain + "]"
+	}
+	if sessionID == "" {
+		return n.logger.WithAgent(agent)
+	}
+	return n.logger.WithSession(sessionID).WithAgent(agent)
 }
 
 // SetLogger 注入结构化日志器（P1-2）。

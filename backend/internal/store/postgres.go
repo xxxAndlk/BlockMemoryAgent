@@ -5,6 +5,7 @@ import (
 	"database/sql"  // 标准库 SQL 抽象层,底层驱动为 postgres
 	"encoding/json" // 结构体与 JSONB/JSON 列之间的序列化
 	"fmt"           // 格式化错误信息与 pgvector 字符串
+	"log"           // 反序列化失败时记录坏数据
 	"strconv"       // 解析 vector(768) 维度数字（ValidateEmbeddingDimension）
 	"strings"       // 拼接 pgvector 的逗号分隔向量分量
 	"time"          // 时间戳与连接池生命周期管理
@@ -27,6 +28,7 @@ type PostgresStore struct {
 
 // NewPostgresStore 创建 PostgreSQL 存储实例。
 // 参数:
+//   - ctx: 用于 Ping 超时控制的上下文
 //   - dsn: PostgreSQL 数据源字符串 (host/port/user/password/dbname/sslmode 等)
 //
 // 返回:
@@ -34,14 +36,17 @@ type PostgresStore struct {
 //   - error: 打开连接或 Ping 失败时返回包装错误
 //
 // 副作用: 初始化连接池参数 (20 最大连接 / 10 空闲 / 1 小时连接寿命)。
-func NewPostgresStore(dsn string) (*PostgresStore, error) {
+func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 	// 仅解析 DSN 构建连接池,真正建连发生在 Ping
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
 	}
-	// 主动 Ping 一次,提前暴露网络/凭证类错误
-	if err := db.Ping(); err != nil {
+	// 主动 Ping 一次,提前暴露网络/凭证类错误；使用超时 context 避免启动挂死
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 	// 限制最大打开连接数,避免突发流量打满 Postgres
@@ -339,6 +344,9 @@ func (s *PostgresStore) SearchKnowledgeByTypeAndDomain(ctx context.Context, know
 	if topK <= 0 {
 		topK = 5
 	}
+	// pgvector 检索可能因数据量大或索引失效而变慢，加独立超时防止阻塞主流程。
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
 		FROM global_knowledge
@@ -698,10 +706,14 @@ func (s *PostgresStore) RecentSessionHistories(ctx context.Context, limit int) (
 		}
 		// 仅在非空时反序列化 tool_results / meta_memory
 		if len(toolRaw) > 0 {
-			_ = json.Unmarshal(toolRaw, &r.ToolResults)
+			if err := json.Unmarshal(toolRaw, &r.ToolResults); err != nil {
+				log.Printf("[store] unmarshal session_history.tool_results failed: session=%s err=%v", r.SessionID, err)
+			}
 		}
 		if len(memRaw) > 0 {
-			_ = json.Unmarshal(memRaw, &r.MetaMemory)
+			if err := json.Unmarshal(memRaw, &r.MetaMemory); err != nil {
+				log.Printf("[store] unmarshal session_history.meta_memory failed: session=%s err=%v", r.SessionID, err)
+			}
 		}
 		out = append(out, &r)
 	}
@@ -727,10 +739,14 @@ func (s *PostgresStore) GetSessionHistoryByID(ctx context.Context, id string) (*
 		return nil, err
 	}
 	if len(toolRaw) > 0 {
-		_ = json.Unmarshal(toolRaw, &r.ToolResults)
+		if err := json.Unmarshal(toolRaw, &r.ToolResults); err != nil {
+			log.Printf("[store] unmarshal session_history.tool_results failed: session=%s err=%v", r.SessionID, err)
+		}
 	}
 	if len(memRaw) > 0 {
-		_ = json.Unmarshal(memRaw, &r.MetaMemory)
+		if err := json.Unmarshal(memRaw, &r.MetaMemory); err != nil {
+			log.Printf("[store] unmarshal session_history.meta_memory failed: session=%s err=%v", r.SessionID, err)
+		}
 	}
 	return &r, nil
 }
@@ -752,6 +768,8 @@ func pgVector(v []float32) string {
 }
 
 // EnsureSessionHistorySchema 自动创建 session_history 表 (幂等)。
+// 同时确保 006_session_history_meta_memory.sql 中声明的 meta_memory 列已存在，
+// 避免 SaveSessionHistory 因列缺失而失败。
 func EnsureSessionHistorySchema(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS session_history (
@@ -760,10 +778,39 @@ CREATE TABLE IF NOT EXISTS session_history (
     goal         TEXT NOT NULL,
     summary      TEXT NOT NULL,
     tool_results JSONB DEFAULT '[]',
+    meta_memory  JSONB DEFAULT '[]',
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_session_history_created_at
     ON session_history (created_at DESC);
+`)
+	return err
+}
+
+// EnsureSessionLogsSchema 自动创建 session_logs 表 (幂等)。
+// 对应 migrations/005_session_logs.sql，供 logger 持久化结构化 Agent IO 日志。
+func EnsureSessionLogsSchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS session_logs (
+    id            BIGSERIAL PRIMARY KEY,
+    session_id    VARCHAR(64) NOT NULL,
+    agent         VARCHAR(128) NOT NULL DEFAULT '',
+    level         VARCHAR(32) NOT NULL DEFAULT 'info',
+    phase         VARCHAR(128) NOT NULL DEFAULT '',
+    message       TEXT NOT NULL DEFAULT '',
+    prompt        TEXT NOT NULL DEFAULT '',
+    response      TEXT NOT NULL DEFAULT '',
+    input_tokens  INT NOT NULL DEFAULT 0,
+    output_tokens INT NOT NULL DEFAULT 0,
+    model         VARCHAR(128) NOT NULL DEFAULT '',
+    latency_ms    INT NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    meta_json     JSONB DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_session_logs_session_id ON session_logs(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_logs_agent ON session_logs(agent);
+CREATE INDEX IF NOT EXISTS idx_session_logs_level ON session_logs(level);
+CREATE INDEX IF NOT EXISTS idx_session_logs_created_at ON session_logs(created_at);
 `)
 	return err
 }
@@ -974,7 +1021,9 @@ func scanKnowledgeRows(rows *sql.Rows) ([]*types.KnowledgeRecord, error) {
 		}
 		// 仅在 meta 非空时反序列化
 		if len(metaRaw) > 0 {
-			_ = json.Unmarshal(metaRaw, &r.Meta)
+			if err := json.Unmarshal(metaRaw, &r.Meta); err != nil {
+				log.Printf("[store] unmarshal global_knowledge.meta failed: id=%d err=%v", r.ID, err)
+			}
 		}
 		// last_accessed 可能为 NULL,有效时填充指针
 		if lastAccessed.Valid {

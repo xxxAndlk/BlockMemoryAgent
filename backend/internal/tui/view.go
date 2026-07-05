@@ -183,29 +183,37 @@ func (m Model) renderRightPanels(w, h int) string {
 		w = 20
 	}
 	showPlan := m.hasPlan()
-	showAgents := len(m.agentsNodes) > 0
-	if showPlan && showAgents {
-		topH := h * 55 / 100
-		if topH < 6 {
-			topH = 6
+
+	// 高度不足时优先展示有内容的面板；空会话也保留计划面板占位，
+	// 避免右侧面板整体消失。
+	if h < 12 {
+		if showPlan {
+			return m.renderPlanPanel(w, h)
 		}
-		bottomH := h - topH
-		if bottomH < 6 {
-			bottomH = 6
-		}
-		return lipgloss.JoinVertical(lipgloss.Top, m.renderPlanPanel(w, topH), m.renderAgentsPanel(w, bottomH))
-	}
-	if showPlan {
-		return m.renderPlanPanel(w, h)
-	}
-	if showAgents {
 		return m.renderAgentsPanel(w, h)
 	}
-	return ""
+
+	// 高度足够时始终渲染计划 + Agent 两个面板，与参考设计保持一致。
+	topH := h * 55 / 100
+	if topH < 6 {
+		topH = 6
+	}
+	bottomH := h - topH
+	if bottomH < 6 {
+		bottomH = 6
+	}
+	return lipgloss.JoinVertical(lipgloss.Top, m.renderPlanPanel(w, topH), m.renderAgentsPanel(w, bottomH))
 }
 
 func (m Model) renderPlanPanel(w, h int) string {
-	header := m.styles.PanelHeader.Width(w).Render("执行计划")
+	titleLeft := "📝 执行计划"
+	titleRight := "[P] 关闭"
+	titlePadding := w - lipgloss.Width(titleLeft) - lipgloss.Width(titleRight) - 2
+	if titlePadding < 1 {
+		titlePadding = 1
+	}
+	headerText := titleLeft + strings.Repeat(" ", titlePadding) + titleRight
+	header := m.styles.PanelHeader.Width(w).Render(headerText)
 	innerW := w - 4
 	if innerW < 10 {
 		innerW = 10
@@ -259,7 +267,26 @@ func (m Model) renderPlanPanel(w, h int) string {
 	for i, t := range snap.Tasks {
 		icon := statusIcon(string(t.Status))
 		prefix := fmt.Sprintf("%d. ", i+1)
-		line := prefix + icon + " " + t.Title
+		statusText := planStatusText(t.Status)
+		var elapsed string
+		if t.Status == board.TaskPending {
+			elapsed = "--:--"
+		} else {
+			elapsed = formatDurationShort(taskElapsed(t))
+		}
+		meta := fmt.Sprintf("%s %s", icon+statusText, elapsed)
+		// 保留序号+标题，右侧对齐状态与耗时
+		titlePart := prefix + t.Title
+		avail := innerW - lipgloss.Width(meta) - 1
+		if avail < lipgloss.Width(prefix)+4 {
+			avail = lipgloss.Width(prefix) + 4
+		}
+		titlePart = truncate(titlePart, avail)
+		padding := innerW - lipgloss.Width(titlePart) - lipgloss.Width(meta)
+		if padding < 1 {
+			padding = 1
+		}
+		line := titlePart + strings.Repeat(" ", padding) + meta
 		if i == current {
 			line = m.styles.StatValue.Render(truncate(line, innerW))
 		} else if t.Status == board.TaskDone {
@@ -275,7 +302,14 @@ func (m Model) renderPlanPanel(w, h int) string {
 }
 
 func (m Model) renderAgentsPanel(w, h int) string {
-	header := m.styles.PanelHeader.Width(w).Render("Agent 编排")
+	titleLeft := "🧩 Agent 编排"
+	titleRight := "[A] 关闭"
+	titlePadding := w - lipgloss.Width(titleLeft) - lipgloss.Width(titleRight) - 2
+	if titlePadding < 1 {
+		titlePadding = 1
+	}
+	headerText := titleLeft + strings.Repeat(" ", titlePadding) + titleRight
+	header := m.styles.PanelHeader.Width(w).Render(headerText)
 	innerW := w - 4
 	if innerW < 10 {
 		innerW = 10
@@ -286,7 +320,7 @@ func (m Model) renderAgentsPanel(w, h int) string {
 		lines = append(lines, "(no agents)")
 	} else {
 		for _, node := range m.agentsNodes {
-			prefix := strings.Repeat("  ", node.depth)
+			prefix := agentTreePrefix(node.depth)
 			icon := statusIcon(string(node.status))
 			name := node.name
 			if node.goal != "" {

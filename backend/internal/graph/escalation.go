@@ -55,6 +55,11 @@ func (n *EscalationHandlerNode) Invoke(ctx context.Context, state *types.ThreeLa
 	// 调试日志：会话 + 升级原因
 	log.Printf("[ESCALATION] Session: %s, Reason: %s", state.SessionID, state.Reason)
 
+	// 仲裁节点必须带超时熔断，避免无限等待阻塞整个图执行。
+	// 超时后按降级策略把控制权交还 MetaAgent。
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	// 生成仲裁摘要
 	// 当前实现极简：直接拼接 Reason；后续可扩展为 LLM 仲裁
 	arbitration := fmt.Sprintf("Escalation: %s", state.Reason)

@@ -28,6 +28,7 @@ type RedisStore struct {
 
 // NewRedisStore 创建 Redis 存储实例。
 // 参数:
+//   - ctx:      用于 Ping 超时控制的上下文
 //   - addr:     Redis 地址 (host:port)
 //   - password: 认证密码,空表示无密码
 //   - db:       Redis 数据库编号
@@ -35,14 +36,16 @@ type RedisStore struct {
 // 返回:
 //   - *RedisStore: 已通过 Ping 校验的存储实例
 //   - error: Ping 失败时返回包装错误
-func NewRedisStore(addr, password string, db int) (*RedisStore, error) {
+func NewRedisStore(ctx context.Context, addr, password string, db int) (*RedisStore, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: password,
 		DB:       db,
 	})
-	// 主动 Ping 一次,提前暴露网络/凭证类错误
-	if err := client.Ping(context.Background()).Err(); err != nil {
+	// 主动 Ping 一次,提前暴露网络/凭证类错误；使用超时 context 避免启动挂死
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := client.Ping(pingCtx).Err(); err != nil {
 		return nil, fmt.Errorf("ping redis: %w", err)
 	}
 	return &RedisStore{client: client, eventCursors: make(map[string]string)}, nil

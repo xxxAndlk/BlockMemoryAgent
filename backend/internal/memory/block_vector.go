@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -181,7 +182,9 @@ func knowledgeToBlockMemory(rec *types.KnowledgeRecord) *BlockMemoryRecord {
 	}
 	var facts []Fact
 	if raw, ok := rec.Meta["facts"].(string); ok && raw != "" {
-		_ = json.Unmarshal([]byte(raw), &facts)
+		if err := json.Unmarshal([]byte(raw), &facts); err != nil {
+			log.Printf("[memory] unmarshal block memory facts failed: %v", err)
+		}
 	}
 	// 从 Content 中解析 Summary：Content 格式为 "领域:...\n目标:...\n结果:..."
 	summary := rec.Content

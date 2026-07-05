@@ -23,17 +23,21 @@ type ollamaProvider struct {
 	maxTokens   int
 }
 
+// defaultOllamaBaseURL 是 Ollama 本地默认端点。
+// 推荐在 roles.yaml 的 model_config.base_url 中显式配置，避免隐式依赖。
+const defaultOllamaBaseURL = "http://localhost:11434"
+
 // newOllamaProvider 构造一个 Ollama 原生 provider。
-func newOllamaProvider(cfg types.AgentModelConfig) blades.ModelProvider {
+// 当 cfg.BaseURL 为空时回退到 defaultOllamaBaseURL；URL 解析失败返回错误，避免静默回退导致配置错误难以排查。
+func newOllamaProvider(cfg types.AgentModelConfig) (blades.ModelProvider, error) {
 	baseURL := cfg.BaseURL
 	if baseURL == "" {
-		baseURL = "http://localhost:11434"
+		baseURL = defaultOllamaBaseURL
 	}
 
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		// 解析失败时回退到默认 URL，避免构造阶段崩溃。
-		u, _ = url.Parse("http://localhost:11434")
+		return nil, fmt.Errorf("parse ollama base_url %q: %w", baseURL, err)
 	}
 
 	return &ollamaProvider{
@@ -42,7 +46,7 @@ func newOllamaProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 		baseURL:     baseURL,
 		temperature: cfg.Temperature,
 		maxTokens:   cfg.MaxTokens,
-	}
+	}, nil
 }
 
 func (p *ollamaProvider) Name() string { return p.modelName }
