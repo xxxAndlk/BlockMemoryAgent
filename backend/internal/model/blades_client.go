@@ -11,7 +11,6 @@ import (
 
 	"github.com/blockmemory/agent/backend/pkg/types" // AgentModelConfig 等共享类型
 	"github.com/go-kratos/blades"                    // 上游 ModelProvider 抽象
-	"github.com/go-kratos/blades/contrib/openai"     // OpenAI 兼容 provider 实现
 )
 
 // BladesClient 包装 blades.ModelProvider，实现 LLMClient 接口。
@@ -201,7 +200,11 @@ func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, t
 
 // createBladesProvider 根据配置中的 Provider 字段选择对应的 blades.ModelProvider 实现。
 //
-// 职责：provider 类型分发；当前仅支持 openai 兼容（默认），其余报错。
+// 职责：provider 类型分发。
+//   - openai（或空）：使用 blades/contrib/openai 的 OpenAI 兼容 provider。
+//   - anthropic：使用 Anthropic Go SDK 原生 Messages API。
+//   - ollama：使用 Ollama Go SDK 原生 /api/chat。
+//
 // 参数：
 //   - cfg: 模型配置
 //
@@ -214,37 +217,13 @@ func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, t
 func createBladesProvider(cfg types.AgentModelConfig) (blades.ModelProvider, error) {
 	switch cfg.Provider {
 	case "openai", "": // 空字符串视为 openai 兼容默认值
-		return createOpenAIProvider(cfg), nil
+		return newOpenAIProvider(cfg), nil
+	case "anthropic":
+		return newAnthropicProvider(cfg), nil
+	case "ollama":
+		return newOllamaProvider(cfg), nil
 	default:
-		// 后续可在此扩展 anthropic/azure 等分支
+		// 后续可在此扩展 azure/bedrock 等分支
 		return nil, fmt.Errorf("unsupported provider: %s", cfg.Provider)
 	}
-}
-
-// createOpenAIProvider 创建 OpenAI 兼容模型 provider。
-//
-// 职责：把 AgentModelConfig 映射为 blades openai.Config 并构造 Model。
-// 参数：
-//   - cfg: 模型配置
-//
-// 返回：
-//   - blades.ModelProvider: OpenAI 兼容 provider
-//
-// 副作用：无。
-// 并发安全：纯构造函数。
-func createOpenAIProvider(cfg types.AgentModelConfig) blades.ModelProvider {
-	// BaseURL 缺省时使用 deepseek 兼容端点（项目默认）
-	baseURL := cfg.BaseURL
-	if baseURL == "" {
-		baseURL = "https://api.deepseek.com/v1"
-	}
-	// 组装 openai.Config：温度/最大 token 在此固定
-	ocfg := openai.Config{
-		BaseURL:         baseURL,              // API 端点
-		APIKey:          cfg.APIKey,           // 鉴权密钥
-		Temperature:     cfg.Temperature,      // 采样温度（构造时固化）
-		MaxOutputTokens: int64(cfg.MaxTokens), // 单次最大输出 token
-	}
-	// 以模型名 + 配置构造 provider 实例
-	return openai.NewModel(cfg.Model, ocfg)
 }

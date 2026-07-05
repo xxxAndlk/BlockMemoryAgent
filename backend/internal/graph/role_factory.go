@@ -73,6 +73,10 @@ func (f *RoleFactory) CreateDomainAgent(ctx context.Context, sessionID, domain, 
 	if err := f.registry.RegisterDynamicRole(roleDef); err != nil {
 		return nil, fmt.Errorf("register dynamic role: %w", err)
 	}
+	// 3.5 将动态角色模型配置注册到 ModelFactory（P3-4）
+	if f.modelFactory != nil {
+		f.modelFactory.RegisterDynamicModelConfig(roleDef.ID, roleDef.ModelConfig)
+	}
 
 	// 4. 创建实例
 	// 把 Definition 实例化为运行时实体，挂到 parentID 之下
@@ -104,6 +108,10 @@ func (f *RoleFactory) CreateAssistant(ctx context.Context, sessionID, taskDesc s
 	// 2. 注册动态角色定义
 	if err := f.registry.RegisterDynamicRole(roleDef); err != nil {
 		return nil, fmt.Errorf("register dynamic role: %w", err)
+	}
+	// 2.5 将动态角色模型配置注册到 ModelFactory（P3-4）
+	if f.modelFactory != nil {
+		f.modelFactory.RegisterDynamicModelConfig(roleDef.ID, roleDef.ModelConfig)
 	}
 
 	// 3. 创建实例
@@ -185,6 +193,10 @@ func (f *RoleFactory) generateDomainRoleDef(ctx context.Context, domain, goal st
 		roleDef.Type = enums.RoleTypeDomain
 		roleDef.Lifecycle = enums.RoleLifecycleSession
 		roleDef.CanBeCalled = false
+		// LLM 未返回模型配置时，回退到动态模板配置
+		if roleDef.ModelConfig.Provider == "" && roleDef.ModelConfig.Model == "" {
+			roleDef.ModelConfig = f.dynamicTemplateModelConfig("domain_template")
+		}
 	}
 
 	return roleDef, nil
@@ -201,6 +213,7 @@ func (f *RoleFactory) fillDomainTemplate(roleDef *types.RoleDefinition, domain, 
 	roleDef.SystemPrompt = fmt.Sprintf("你是%s领域的负责人。你的职责是：\n1. 管理该领域的上下文信息\n2. 分析任务并分发给合适的助手\n3. 汇总助手结果并输出\n\n领域目标: %s", domain, goal)
 	roleDef.Keywords = []string{domain, goal}
 	roleDef.Skills = []string{"任务分析", "上下文管理", "结果汇总"}
+	roleDef.ModelConfig = f.dynamicTemplateModelConfig("domain_template")
 }
 
 // generateAssistantRoleDef 让大模型生成助手角色定义；无 modelFactory 时使用模板。
@@ -259,6 +272,10 @@ func (f *RoleFactory) generateAssistantRoleDef(ctx context.Context, taskDesc, pa
 		roleDef.Lifecycle = enums.RoleLifecycleTask
 		roleDef.CanBeCalled = true
 		roleDef.Parents = []string{parentDefID}
+		// LLM 未返回模型配置时，回退到动态模板配置
+		if roleDef.ModelConfig.Provider == "" && roleDef.ModelConfig.Model == "" {
+			roleDef.ModelConfig = f.dynamicTemplateModelConfig("assistant_template")
+		}
 	}
 
 	return roleDef, nil
@@ -272,6 +289,20 @@ func (f *RoleFactory) fillAssistantTemplate(roleDef *types.RoleDefinition, taskD
 	roleDef.SystemPrompt = fmt.Sprintf("你是一个专业助手。你的唯一任务是：%s\n\n请专注于此任务，不要处理无关事务。完成后立即返回结果。", taskDesc)
 	roleDef.Keywords = extractKeywords(taskDesc) // 简单分词提取
 	roleDef.Skills = []string{taskDesc}
+	roleDef.ModelConfig = f.dynamicTemplateModelConfig("assistant_template")
+}
+
+// dynamicTemplateModelConfig 读取 dynamic_templates 中指定模板的模型配置。
+// 未配置或模板不存在时返回零值，调用方（ModelFactory.resolveConfig）会回退到 DomainAgent 模型。
+func (f *RoleFactory) dynamicTemplateModelConfig(templateID string) types.AgentModelConfig {
+	if f.cfg == nil {
+		return types.AgentModelConfig{}
+	}
+	tmpl := f.cfg.GetDynamicTemplate(templateID)
+	if tmpl == nil {
+		return types.AgentModelConfig{}
+	}
+	return tmpl.ModelConfig
 }
 
 // CreateSubDomainAgent 动态创建子领域Agent。
@@ -296,10 +327,14 @@ func (f *RoleFactory) CreateSubDomainAgent(ctx context.Context, sessionID, subDo
 		Skills:       []string{"子任务分析", "上下文管理", "结果汇总"},
 		CanBeCalled:  true, // SubDomain 可被父 Domain 调用
 		Parents:      []string{parentDomainID},
+		ModelConfig:  f.dynamicTemplateModelConfig("domain_template"),
 	}
 
 	if err := f.registry.RegisterDynamicRole(roleDef); err != nil {
 		return nil, fmt.Errorf("register subdomain role: %w", err)
+	}
+	if f.modelFactory != nil {
+		f.modelFactory.RegisterDynamicModelConfig(roleDef.ID, roleDef.ModelConfig)
 	}
 
 	inst, err := f.registry.CreateInstance(roleDef.ID, sessionID, subDomain, parentDomainID)

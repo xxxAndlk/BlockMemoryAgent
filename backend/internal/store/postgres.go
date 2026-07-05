@@ -20,8 +20,9 @@ import (
 // 并依赖 pgvector 扩展完成向量相似检索。
 // 并发安全: 内部仅持有 *sql.DB 连接池,database/sql 自身线程安全,可在多 goroutine 间共享。
 type PostgresStore struct {
-	db  *sql.DB // 共享连接池,所有方法通过该句柄执行 SQL
-	dim int     // 向量维度，由 SetEmbeddingDim 设置；默认 768，需与 schema 中 VECTOR(N) 一致
+	db       *sql.DB        // 共享连接池,所有方法通过该句柄执行 SQL
+	dim      int            // 向量维度，由 SetEmbeddingDim 设置；默认 768，需与 schema 中 VECTOR(N) 一致
+	embedder embed.Embedder // 文本嵌入实现（P3-3）；nil 时回退 PseudoEmbed
 }
 
 // NewPostgresStore 创建 PostgreSQL 存储实例。
@@ -67,6 +68,22 @@ func (s *PostgresStore) EmbeddingDim() int {
 		return s.dim
 	}
 	return 768
+}
+
+// SetEmbedder 注入文本嵌入实现（P3-3）。
+// 注入后 SearchKnowledge / SearchBlockMemory 等将向量化委托给该实现；
+// nil 时仍使用兼容旧行为的 embed.PseudoEmbed。
+func (s *PostgresStore) SetEmbedder(e embed.Embedder) {
+	s.embedder = e
+}
+
+// Embed 实现 memory.BlockMemorySearcher 接口，将查询文本编码为向量。
+// 优先使用注入的 embedder，否则回退 embed.PseudoEmbed。
+func (s *PostgresStore) Embed(ctx context.Context, text string) ([]float32, error) {
+	if s.embedder != nil {
+		return s.embedder.Embed(ctx, text)
+	}
+	return embed.PseudoEmbed(text, s.EmbeddingDim()), nil
 }
 
 // Close 关闭底层连接池并释放数据库资源。
@@ -344,7 +361,10 @@ func (s *PostgresStore) SearchBlockMemory(ctx context.Context, domain, goal stri
 		topK = 5
 	}
 	query := fmt.Sprintf("领域:%s\n目标:%s", domain, goal)
-	emb := embed.PseudoEmbed(query, s.EmbeddingDim())
+	emb, err := s.Embed(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
 	return s.SearchKnowledgeByTypeAndDomain(ctx, enums.KnowledgeTypeBlockMemory, domain, emb, topK)
 }
 

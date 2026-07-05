@@ -30,6 +30,11 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
+// EmbedderFactory 创建并注入 embedder；独立函数便于测试替换。
+var EmbedderFactory = func(cfg *config.Config, roleCfg *pkgconfig.RoleConfigFile) (embed.Embedder, error) {
+	return embed.NewEmbedder(roleCfg.Embed, cfg.PgVector.Dimensions)
+}
+
 // Deps holds the live backend dependencies returned by BuildHandler. Tests can
 // use it to access stores, the session manager, runtime, and the model factory
 // directly when HTTP alone is not enough.
@@ -39,6 +44,7 @@ type Deps struct {
 	Postgres              *store.PostgresStore
 	Redis                 *store.RedisStore
 	ModelFactory          *model.ModelFactory
+	Embedder              embed.Embedder
 	Runtime               *runtime.Runtime
 	SessionManager        *server.SessionManager
 	Graph                 *graph.ThreeLayerGraph
@@ -57,10 +63,10 @@ type Deps struct {
 func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, skillPath string) (*http.ServeMux, *Deps, func(), error) {
 	// 严格启动：任意配置文件不存在即失败，明确告知缺失项。
 	for path, name := range map[string]string{
-		cfgPath:  "config file",
-		rolePath: "roles file",
-		envPath:  "env file",
-		soulPath: "soul file",
+		cfgPath:   "config file",
+		rolePath:  "roles file",
+		envPath:   "env file",
+		soulPath:  "soul file",
 		skillPath: "skills file",
 	} {
 		if path == "" {
@@ -90,6 +96,13 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		return nil, nil, nil, fmt.Errorf("connect postgres with DSN from %s: %w", cfgPath, err)
 	}
 	pgStore.SetEmbeddingDim(cfg.PgVector.Dimensions)
+
+	embedder, err := EmbedderFactory(cfg, roleCfg)
+	if err != nil {
+		pgStore.Close()
+		return nil, nil, nil, fmt.Errorf("create embedder: %w", err)
+	}
+	pgStore.SetEmbedder(embedder)
 
 	if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
 		pgStore.Close()
@@ -126,7 +139,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	sessionLogger := logger.New(pgStore)
 	contextAssembler := memory.NewContextAssembler(
 		memory.NewSimpleWorkspaceReader(),
-		&globalKBAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions},
+		&globalKBAdapter{pg: pgStore, embedder: embedder},
 		pgStore,
 		cfg.Agent.ContextWindow,
 	)
@@ -249,6 +262,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		Postgres:              pgStore,
 		Redis:                 redisStore,
 		ModelFactory:          modelFactory,
+		Embedder:              embedder,
 		Runtime:               rt,
 		SessionManager:        sessionMgr,
 		Graph:                 threeLayerGraph,
@@ -394,12 +408,15 @@ func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, domain, qu
 }
 
 type globalKBAdapter struct {
-	pg  *store.PostgresStore
-	dim int
+	pg       *store.PostgresStore
+	embedder embed.Embedder
 }
 
 func (a *globalKBAdapter) Retrieve(ctx context.Context, query string, topK int) ([]*types.KnowledgeRecord, error) {
-	emb := embed.PseudoEmbed(query, a.dim)
+	emb, err := a.embedder.Embed(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
 	return a.pg.SearchKnowledge(ctx, emb, topK)
 }
 

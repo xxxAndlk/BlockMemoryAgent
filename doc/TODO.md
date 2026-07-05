@@ -164,9 +164,6 @@
   ```
 - 完成开发后需有详细测试模块：模拟开发处接口的各种情况进行模型浏览器操作测试、API 调用测试等。
 - 本轮实现：`test/api/*` 全部为可运行 HTTP 断言（含本轮新增 `session_error_test.go` 覆盖 404/空 body/不存在会话错误路径）；`test/coding/*` 三个场景（贪吃蛇/CSS 重构/bug 修复）用 mock LLM 驱动会话走通完整 graph+memory 栈，断言会话到达终态 + goal 到达 LLM（共享 `helpers_test.go`）；mock LLM 增强 `RegisterSequence`（确定性多轮工具调用）+ `RequestPrompts`（prompt 内容断言）；修复 `tui_keystream_test` 的 `Graph.Registry()`/`DAGHandler`/`Update` 类型断言（新增 `Registry()` accessor 与 `Deps.DAGHandler`）。`go vet -tags integration ./...` 零告警，三套件均实测通过。
----
-
-## 待完成（按优先级分级）
 
 **P0-0. 恢复 MetaAgent 直接调用工具能力并升级智能路由**
 
@@ -237,6 +234,10 @@
 - 实现方式：新增 `verboseTools` 集合；`tool_exec` / `tool_call` 分支中，仅 verbose 工具把 `ToolOutput` 拼入 detail。
 - 验证：新增 `backend/internal/tui/helpers_test.go`：`TestEventChatItemToolOutputCollapsed` 覆盖隐藏/保留两类工具与错误展示；`go test ./internal/tui/` 通过。
 
+---
+
+## 待完成（按优先级分级）
+
 ### P3 — 远期优化（依赖前置项）
 
 **P3-1. 记忆层简化**（依赖 P3-3 真实 embedding 接入后评测）
@@ -246,38 +247,64 @@
 - 评测方法：跑 `test/coding/` + `test/api/` 全套，统计每级落库量。
 - 评测后再选：可能两级够（Raw 7天 + 摘要永久），也可能保留三级但去 Marker。
 
-**P3-2. 编程工具扩展 + 自定义工具 + Skill 装配**（原待完成 #2 扩展）
-- 现状：`tool_executor.go` 仅有 7 个基础工具（ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles/HTTPGet/HTTPPost）。
-- 待完善：
-  - 新增 Git 工具（diff/blame/log/status）
-  - 测试运行器（多框架检测 Go/Python/Node）
-  - 浏览器自动化（chromedp 截图/导航/点击）
-  - 自定义工具：用户在 `config/tools.yaml` 注册，handler 走 MCP 协议或本地脚本
-  - Skill 与工具关系：Skill 是"工具使用模板"，绑定工具子集 + 使用场景描述，助手装配 Skill 时自动获得对应工具
-  - 新工具注册到 `blades_tools.go` 的 `buildBladesTools` 与 `llm_tools.go` 的 `defaultTools` 描述
-- 预留接口：`ToolRegistry.Register(tool Tool)`，runtime 从 yaml 加载注册。
+**P3-2. 编程工具扩展 + 自定义工具 + Skill 装配**（原待完成 #2 扩展）✅ 本轮已完成（Git 工具）
+- 现状：`tool_executor.go` 原有 7 个基础工具。
+- 本轮实现：
+  - 新增 Git 工具：`GitDiff` / `GitStatus` / `GitLog` / `GitBlame`，实现于 `backend/internal/graph/tool_git.go`。
+  - 工具在 `tool_executor.go` 中分发，`blades_tools.go` 中注册到 blades function-calling，`config/skills.yaml` 中补充 skill 定义。
+  - `buildBladesTools` 由 7 个工具扩展为 11 个。
+- 仍待后续：测试运行器、浏览器自动化（chromedp）、自定义工具 YAML 注册、MCP 协议集成、Skill 与工具绑定机制。
 
-**P3-3. 真实 Embedding 接入**
-- 现状：`embed.PseudoEmbed` 字符哈希伪向量，cosine 不可靠。
-- 预留点：`internal/embed/` 包，接口抽象 `Embedder interface { Embed(text) []float32 }`。
-- 测试期：伪向量跑通全链路，验证召回路径无 bug。
-- 后期接入：text-embedding-3 / bge-m3 / 本地 m3e，配置 `embed.provider=openai|local|pseudo`。
-- 注意：伪向量下"召回质量"评测无意义，P3-1 记忆层简化评测**必须等真实 embedding 接入后**做。
+**P3-3. 真实 Embedding 接入 + Embed 配置迁移到 roles.yaml** ✅ 本轮已完成
+- 现状：`embed.PseudoEmbed` 字符哈希伪向量，cosine 不可靠；此前 embed 配置位于 `config.yaml`。
+- 本轮实现：
+  - `internal/embed/` 定义统一 `Embedder` 接口与 `NewEmbedder(roleCfg, dim)` 工厂。
+  - 保留 `PseudoEmbedder` 作为默认零依赖实现（`provider=pseudo`）。
+  - 新增 `OpenAIEmbedder`：调用 OpenAI 兼容 `/v1/embeddings`，支持 `provider=openai` 与 `provider=local`（ollama/xinference 等）。
+  - **Embed 配置从 `config.yaml` 迁移到 `config/roles.yaml`**：`EmbedConfig` 类型下沉到 `backend/pkg/types/embed.go`，`RoleConfigFile` 负责 `embed` 段默认值与环境变量解析；`internal/config.Config` 移除 `Embed` 字段。
+  - `PostgresStore` 增加 `SetEmbedder` / `Embed`，`memory.BlockMemorySearcher` 接口增加 `Embed`，`SearchBlockMemory` 统一走接口向量化。
+  - `testserver.BuildHandler` 创建 embedder 并注入 pgStore 与 global KB adapter；`Deps` 暴露 `Embedder`。
+  - 新增 `backend/internal/embed/embed_test.go` 覆盖 pseudo / openai 基础路径。
+- 注意：伪向量下"召回质量"评测无意义，P3-1 记忆层简化评测**必须等真实 embedding 接入并跑通后**做。
 
-**P3-4. 各级别 Agent 模型单独配置**（原待完成 #1）
+**P3-4. 各级别 Agent 模型单独配置**（原待完成 #1）✅ 本轮已完成
 - 现状：`config/roles.yaml` 已支持 MetaAgent / DomainAgent / LightweightModel / 每个 FixedRole 各自配置 `ModelConfig`，`ModelFactory` 按角色缓存模型实例。
-- 待完善：
-  - 前端 Web UI 暴露各角色模型配置页（当前只能改 yaml）
-  - 路由判定 / 块记忆摘要 / 反思 已用轻量模型；任务拆分（`analyzeTasks`）与代码生成（`CommonExecuteAssistantTask`）仍用角色配置的模型，可进一步细分轻量/重量映射并统计 token 成本下降比例
-  - 模型分层结果的可观测性：日志/面板展示轻量 vs 重量调用分布与 token 消耗（依赖 P1-2 日志基础）
+- 本轮实现：
+  - `dynamic_templates`（`domain_template` / `assistant_template`）新增独立 `model_config` 支持（`backend/pkg/config/role_config.go` + `backend/internal/graph/role_factory.go` + `backend/internal/model/factory.go`）。
+  - 动态角色生成后向 `ModelFactory` 注册动态配置；`resolveConfig` 按 `动态角色 → fixed_roles → domain_agent` 优先级回退。
+  - 若 LLM 未在生成的角色定义中返回模型配置，自动回退到对应模板配置；模板未配置则回退到 `domain_agent.model_config`。
+- 仍待后续：
+  - 前端 Web UI 暴露各角色模型配置页（当前只能改 yaml）。
+  - 任务拆分（`analyzeTasks`）与代码生成（`CommonExecuteAssistantTask`）可进一步细分轻量/重量映射并统计 token 成本下降比例。
 
-**P3-5. MCP / Skill / Computer Use / RAG / LLM Wiki 插件预留**
+**P3-5. MCP / Skill / Computer Use / RAG / LLM Wiki 插件预留** ✅ 本轮已完成
 - 预留点：
-  - `ToolRegistry` 抽象，MCP 工具走 `MCPTool implements Tool`
-  - `KnowledgeSource` 接口，RAG/Wiki 各自实现 `Retrieve(query) []Chunk`
-  - `ComputerUse` 作为特殊工具集，独立 `internal/computeruse/`
-  - 配置 `plugins.mcp.enabled` / `plugins.rag.enabled` 默认关
+  - `plugins.ToolRegistry` / `plugins.Tool` 抽象，默认内存实现 `StaticToolRegistry`（`backend/internal/plugins/registry.go`）。
+  - `plugins.KnowledgeSource` / `plugins.Chunk` 抽象（`backend/internal/plugins/knowledge.go`）。
+  - `internal/computeruse/` 包占位（`doc.go`），说明后续能力范围与安全边界。
+  - `config.yaml` 新增 `plugins.mcp.enabled` / `plugins.rag.enabled` / `plugins.computer_use.enabled`，默认关闭。
+  - `config.go` 新增 `PluginsConfig` / `PluginToggle` 结构体。
 - 关键：接口先定，实现后做，避免提前实现绑定死。
+
+**P3-6. 原生多协议模型接入（OpenAI / Anthropic / Ollama）** ✅ 本轮已完成
+- 现状：`blades_client.go` 仅显式支持 `openai` provider，anthropic/ollama 被转成 OpenAI 兼容端点，易因 base_url 拼接错误导致 401/404。
+- 本轮实现：
+  - `backend/internal/model/provider_openai.go`：保留 `blades/contrib/openai` 原生封装。
+  - `backend/internal/model/provider_anthropic.go`：实现 `blades.ModelProvider` 接口，使用 `github.com/anthropics/anthropic-sdk-go` 原生 Messages API，独立处理 system prompt、tool-calling、usage 与流式事件。
+  - `backend/internal/model/provider_ollama.go`：实现 `blades.ModelProvider` 接口，使用 `github.com/ollama/ollama/api` 原生 Chat API，默认 base_url `http://localhost:11434`，支持本地模型。
+  - `backend/internal/model/blades_client.go`：`createBladesProvider` 按 `model_config.provider` 分发到对应原生实现；OpenAI 兼容后端（DeepSeek / 豆包 / 硅基流动等）统一配 `provider: openai`。
+  - `config/roles.yaml` 顶部 provider 说明更新为三种原生协议。
+  - `.env.example` 拆分 `OPENAI_BASE_URL`、`ANTHROPIC_BASE_URL`、`OLLAMA_BASE_URL`，避免 key 与端点错配。
+- 验证：`go vet ./internal/model/...`、`go build ./internal/model/...`、`go test ./internal/model/...` 通过；关键包编译与测试通过。
+
+
+**P3-7. 模型分层结果可观测性**（原待完成 #4）✅ 本轮已完成
+- 实现：
+  - `model.LLMCallTracker` 新增按模型层聚合的 `LayerStats`（meta/domain/lightweight/assistant/other），在 `RecordCall` 中实时累加。
+  - 新增 `LLMCallTracker.LayerStatsSnapshot()` 返回分层统计快照。
+  - `model.CallerToLayer(caller)` 导出，供 server 层复用。
+  - `server.HandleSessionTokenMetrics` 在原有按 agent/model 聚合基础上，额外返回 `layer_stats`。
+- 验证：`go test ./internal/model/...` / `go test ./internal/server/...` 通过。
 
 ---
 

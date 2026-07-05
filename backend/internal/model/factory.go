@@ -62,9 +62,10 @@ func GenerateWithTemperature(ctx context.Context, c LLMClient, prompt string, te
 // ModelFactory 模型工厂，按角色缓存模型实例。
 // 设计意图：避免重复构造 provider（连接池/鉴权开销），按角色复用。
 type ModelFactory struct {
-	mu     sync.RWMutex           // 读写锁保护 models 并发访问
-	models map[string]LLMClient   // key: roleDefID or "meta" or "domain"
-	cfg    *config.RoleConfigFile // 角色配置，用于解析每个角色的 ModelConfig
+	mu              sync.RWMutex           // 读写锁保护 models 并发访问
+	models          map[string]LLMClient   // key: roleDefID or "meta" or "domain"
+	cfg             *config.RoleConfigFile // 角色配置，用于解析每个角色的 ModelConfig
+	dynamicConfigs  map[string]types.AgentModelConfig // 运行时动态角色的模型配置（P3-4）
 }
 
 // NewModelFactory 创建模型工厂。
@@ -79,8 +80,9 @@ type ModelFactory struct {
 // 并发安全：返回实例可被多协程共享调用。
 func NewModelFactory(cfg *config.RoleConfigFile) *ModelFactory {
 	return &ModelFactory{
-		models: make(map[string]LLMClient), // 初始化空缓存
-		cfg:    cfg,
+		models:         make(map[string]LLMClient),           // 初始化空缓存
+		cfg:            cfg,
+		dynamicConfigs: make(map[string]types.AgentModelConfig), // 动态角色模型配置
 	}
 }
 
@@ -163,6 +165,21 @@ func (f *ModelFactory) GetBladesProvider(ctx context.Context, roleDefID string) 
 	return bc.Provider(), nil
 }
 
+// RegisterDynamicModelConfig 注册运行时动态角色的模型配置（P3-4）。
+// 由 RoleFactory 在创建动态 Domain/Assistant/SubDomain 角色后调用；
+// 当 GetModel 遇到非 meta/domain/lightweight/FixedRole 的角色 ID 时，优先使用此处注册的配置，
+// 未注册再回退到 DomainAgent 模型。
+//
+// 并发安全：内部持锁。
+func (f *ModelFactory) RegisterDynamicModelConfig(roleDefID string, cfg types.AgentModelConfig) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.dynamicConfigs == nil {
+		f.dynamicConfigs = make(map[string]types.AgentModelConfig)
+	}
+	f.dynamicConfigs[roleDefID] = cfg
+}
+
 // GetMetaModel 获取 MetaAgent 的模型。
 // 设计意图：MetaAgent 是图入口节点，使用独立（通常更轻量）的模型配置。
 // 并发安全：委托 GetModel。
@@ -214,11 +231,15 @@ func (f *ModelFactory) resolveConfig(roleDefID string) types.AgentModelConfig {
 		}
 		return f.cfg.DomainAgent.ModelConfig
 	default:
-		// 查找固定角色配置（roles.yaml 中显式定义的角色）
+		// 1. 运行时动态角色配置（P3-4）：RoleFactory 创建动态角色后注册到 ModelFactory
+		if cfg, ok := f.dynamicConfigs[roleDefID]; ok {
+			return cfg
+		}
+		// 2. 查找固定角色配置（roles.yaml 中显式定义的角色）
 		if role := f.cfg.GetFixedRole(roleDefID); role != nil {
 			return role.ModelConfig
 		}
-		// 回退到 DomainAgent 配置：动态生成的助手角色默认沿用 Domain 模型
+		// 3. 回退到 DomainAgent 配置：动态生成的助手角色默认沿用 Domain 模型
 		return f.cfg.DomainAgent.ModelConfig
 	}
 }

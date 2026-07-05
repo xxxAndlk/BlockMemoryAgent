@@ -89,12 +89,24 @@ type (
 		Body    map[string]any    `json:"body,omitempty"`    // 请求体（默认 JSON 序列化）
 		Timeout float64           `json:"timeout,omitempty"` // 可选超时（秒）
 	}
+	gitDiffInput struct {
+		Target string `json:"target,omitempty"` // 空=未暂存；"--staged"=暂存区；"commit...commit"=历史对比
+		Path   string `json:"path,omitempty"`   // 可选文件/目录路径
+	}
+	gitStatusInput struct{}
+	gitLogInput    struct {
+		Limit float64 `json:"limit,omitempty"` // 返回最近 N 条提交，默认 20
+		Path  string  `json:"path,omitempty"`  // 可选文件/目录路径
+	}
+	gitBlameInput struct {
+		Path string `json:"path"` // 目标文件路径
+	}
 )
 
 // toolRunner 封装一次工具执行 + 进度事件 + 失败计数。
 // 所有 blades.Tool 共用同一个 runner，通过 name 区分。
 //
-// 职责：作为 7 个内置工具的统一执行适配层，把 blades.Tool 的调用转发给
+// 职责：作为内置工具的统一执行适配层，把 blades.Tool 的调用转发给
 //
 //	ToolExecutor，同时推送 ProgressEvent 并维护连续失败计数。
 //
@@ -186,12 +198,12 @@ func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) 
 	return string(b)
 }
 
-// buildBladesTools 构造 7 个内置工具的 blades.Tool 集合。
+// buildBladesTools 构造内置工具的 blades.Tool 集合（P3-2 扩展为 11 个）。
 // 复用 ToolExecutor 的沙箱实现，结果通过 toolRunner 推送 ProgressEvent。
 //
-// 职责：为 blades Agent 装配 7 个内置工具（ReadFile/WriteFile/ListDir/RunCommand/
+// 职责：为 blades Agent 装配工具（ReadFile/WriteFile/ListDir/RunCommand/
 //
-//	SearchInFiles/HTTPGet/HTTPPost），每个工具的入参用独立 struct 描述，
+//	SearchInFiles/HTTPGet/HTTPPost/GitDiff/GitStatus/GitLog/GitBlame），每个工具的入参用独立 struct 描述，
 //	实际执行统一委托给 toolRunner.run → ToolExecutor.Execute。
 //
 // 参数：
@@ -201,7 +213,7 @@ func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) 
 //   - agentName：当前 agent 名，用于事件归属。
 //   - results：指向外部 slice，用于收集所有工具结果。
 //
-// 返回：长度 ≤7 的 blades.Tool 切片（某个工具构造失败时会跳过）。
+// 返回：长度 ≤11 的 blades.Tool 切片（某个工具构造失败时会跳过）。
 // 副作用：无（仅构造工具定义，不执行）。
 // 并发安全：返回的工具集合由调用方独占使用；内部 toolRunner 自带锁。
 func buildBladesTools(
@@ -221,7 +233,7 @@ func buildBladesTools(
 	}
 
 	// tools.NewFunc 是泛型函数，无法通过函数字面量包装，这里逐个构造。
-	toolsList := make([]tools.Tool, 0, 7)
+	toolsList := make([]tools.Tool, 0, 11)
 
 	// ReadFile：读文件，委托给 executor.readFile
 	if t, err := tools.NewFunc("ReadFile", "读取文件内容。", func(ctx context.Context, in readFileInput) (string, error) {
@@ -274,6 +286,30 @@ func buildBladesTools(
 			args["timeout"] = in.Timeout
 		}
 		return r.run(ctx, "HTTPPost", args), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// GitDiff：查看 Git 差异（工作区/暂存区/历史对比）
+	if t, err := tools.NewFunc("GitDiff", `查看 Git 差异。target 为空时显示未暂存变更；"--staged" 显示暂存区变更；"HEAD~1..HEAD" 等显示历史区间差异。`, func(ctx context.Context, in gitDiffInput) (string, error) {
+		return r.run(ctx, "GitDiff", map[string]any{"target": in.Target, "path": in.Path}), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// GitStatus：查看 Git 工作区状态
+	if t, err := tools.NewFunc("GitStatus", "查看 Git 工作区状态（简短格式）。", func(ctx context.Context, in gitStatusInput) (string, error) {
+		return r.run(ctx, "GitStatus", map[string]any{}), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// GitLog：查看 Git 提交历史
+	if t, err := tools.NewFunc("GitLog", "查看 Git 提交历史。limit 控制返回条数（默认 20），path 可限定文件/目录。", func(ctx context.Context, in gitLogInput) (string, error) {
+		return r.run(ctx, "GitLog", map[string]any{"limit": in.Limit, "path": in.Path}), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// GitBlame：查看文件每行最后修改者
+	if t, err := tools.NewFunc("GitBlame", "查看指定文件每行的最后修改者（git blame）。", func(ctx context.Context, in gitBlameInput) (string, error) {
+		return r.run(ctx, "GitBlame", map[string]any{"path": in.Path}), nil
 	}); err == nil {
 		toolsList = append(toolsList, t)
 	}

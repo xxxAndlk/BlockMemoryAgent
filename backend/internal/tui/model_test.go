@@ -292,3 +292,112 @@ func modelPtr(m tea.Model) *Model {
 	}
 	panic("model is not tui.Model")
 }
+
+// TestRightPanelVisibleWithMetaAgent 验证：会话激活且存在 MetaAgent 时，
+// 宽度≥80 应自动展示右侧 Agent 编排栏；宽度不足时隐藏。
+func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
+	soulPath := filepath.Join(t.TempDir(), "soul.md")
+	if err := os.WriteFile(soulPath, []byte("test persona"), 0644); err != nil {
+		t.Fatalf("write soul: %v", err)
+	}
+
+	cfg := minimalRoleConfigForRender()
+	registry := graph.NewRoleRegistry(cfg)
+	factory := graph.NewRoleFactory(registry, nil, cfg)
+
+	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt.SetAgentConfig(&config.AgentConfig{
+		StallSteps:           30,
+		MaxRepeatFingerprint: 3,
+		SessionTimeoutMin:    60,
+	})
+
+	meta := &fakeMetaAgentForRender{summary: "收到，开始处理。"}
+	escalation := graph.NewEscalationHandlerNode()
+	sinker := &fakeSinkerForRender{}
+
+	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
+	builder.SetRuntime(rt)
+	builder.AddNode(meta)
+	builder.AddNode(escalation)
+	builder.AddNode(sinker)
+	g := builder.Build()
+
+	sessionMgr := server.NewSessionManager(g, registry)
+	session := sessionMgr.CreateSession(context.Background(), "x")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := sessionMgr.SnapshotSession(session.ID)
+		if snap != nil && snap.Status == enums.SessionStatusCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	m := &Model{
+		styles:     NewStyles(),
+		chatVP:     viewport.New(80, 20),
+		width:      80,
+		height:     24,
+		sessionMgr: sessionMgr,
+		registry:   registry,
+		httpAddr:   "http://127.0.0.1:1",
+		flashMu:    &sync.Mutex{},
+	}
+	m.chatVP.SetContent("")
+	m.refreshSessions()
+	if len(m.sessions) == 0 {
+		t.Fatal("expected at least one session after CreateSession")
+	}
+	m.selectSession(0)
+
+	if len(m.agentsNodes) == 0 {
+		t.Fatal("selectSession 后应至少包含 MetaAgent")
+	}
+	if !m.rightPanelVisible() {
+		t.Fatalf("宽度 80 且有 MetaAgent，右侧面板应显示")
+	}
+	view := m.View()
+	if !strings.Contains(view, "Agent 编排") {
+		t.Fatalf("视图中应出现 Agent 编排面板，got:\n%s", view)
+	}
+
+	// 宽度不足时应隐藏。
+	m.width = 70
+	if m.rightPanelVisible() {
+		t.Fatalf("宽度 70 时不应显示右侧面板")
+	}
+}
+
+// TestLongUserMessageWrapsAtRightPanelBoundary 验证：当右侧栏显示时，
+// 超长用户消息在对话区可用宽度内自动换行，而不是被截断为 "…"。
+func TestLongUserMessageWrapsAtRightPanelBoundary(t *testing.T) {
+	m := &Model{
+		styles:           NewStyles(),
+		chatVP:           viewport.New(80, 20),
+		width:            80,
+		height:           24,
+		rightPanelForced: 1, // 强制显示右侧栏，模拟右侧栏出现后的窄对话区
+		flashMu:          &sync.Mutex{},
+	}
+	m.chatVP.SetContent("")
+
+	cw := m.chatContentWidth()
+	if cw >= 80-2 {
+		t.Fatalf("chatContentWidth 应因右侧栏而变窄，got %d", cw)
+	}
+
+	m.pendingFirstMessage = strings.Repeat("a", 200)
+	content := m.buildChatContent(cw)
+	if strings.Contains(content, "…") {
+		t.Fatalf("长用户消息不应被截断为省略号，got:\n%s", content)
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) < 2 {
+		t.Fatalf("长用户消息应换行为多行，got %d line(s):\n%s", len(lines), content)
+	}
+	if !strings.Contains(lines[0], "You") {
+		t.Fatalf("首行应保留 You 标签，got:\n%s", lines[0])
+	}
+}

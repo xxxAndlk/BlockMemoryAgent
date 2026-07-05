@@ -21,6 +21,10 @@ func (f *fakeSearcher) SearchKnowledgeByTypeAndDomain(ctx context.Context, knowl
 
 func (f *fakeSearcher) EmbeddingDim() int { return f.dim }
 
+func (f *fakeSearcher) Embed(ctx context.Context, text string) ([]float32, error) {
+	return make([]float32, f.dim), nil
+}
+
 func TestToKnowledgeRecordFacts(t *testing.T) {
 	rec := &BlockMemoryRecord{
 		SessionID: "s1",

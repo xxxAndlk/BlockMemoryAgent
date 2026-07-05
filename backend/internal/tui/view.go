@@ -7,7 +7,6 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
-	"github.com/muesli/reflow/wordwrap"
 
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -184,7 +183,7 @@ func (m Model) renderRightPanels(w, h int) string {
 		w = 20
 	}
 	showPlan := m.hasPlan()
-	showAgents := len(m.agentsNodes) > 1
+	showAgents := len(m.agentsNodes) > 0
 	if showPlan && showAgents {
 		topH := h * 55 / 100
 		if topH < 6 {
@@ -359,27 +358,36 @@ func (m *Model) buildChatContent(width int) string {
 		case strings.HasPrefix(item.title, "> "):
 			content := strings.TrimPrefix(item.title, "> ")
 			label := m.styles.LogUser.Render("You")
-			availW := width - lipgloss.Width(label) - lipgloss.Width(ts) - 3
+			prefix := tsStyled + " " + label + " "
+			indent := strings.Repeat(" ", lipgloss.Width(ts)+1) + strings.Repeat(" ", lipgloss.Width(label)+1)
+			availW := width - lipgloss.Width(prefix)
 			if availW < 4 {
 				availW = 4
 			}
-			text := m.styles.LogUser.Render(truncate(content, availW))
-			titleLines = append(titleLines, tsStyled+" "+label+" "+text)
+			wrappedLines := wrapToWidth(content, availW)
+			for j, wl := range wrappedLines {
+				styledWl := m.styles.LogUser.Render(wl)
+				if j == 0 {
+					titleLines = append(titleLines, prefix+styledWl)
+				} else {
+					titleLines = append(titleLines, indent+styledWl)
+				}
+			}
 		case strings.HasPrefix(item.title, "[●] "):
-			titleLines = append(titleLines, tsStyled+" "+m.styles.LogWarn.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogWarn, width)...)
 		case strings.HasPrefix(item.title, "[✓] "):
-			titleLines = append(titleLines, tsStyled+" "+m.styles.LogSuccess.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogSuccess, width)...)
 		case strings.HasPrefix(item.title, "[✗] "):
-			titleLines = append(titleLines, tsStyled+" "+m.styles.LogError.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogError, width)...)
 		case strings.HasPrefix(item.title, "🧠 recalled: "):
-			titleLines = append(titleLines, tsStyled+" "+m.styles.Dim.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.Dim, width)...)
 		case strings.HasPrefix(item.title, "─── ") && strings.HasSuffix(item.title, " ───"):
-			titleLines = append(titleLines, tsStyled+" "+m.styles.CallStack.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.CallStack, width)...)
 		case strings.HasPrefix(item.title, "✗ Error"):
-			titleLines = append(titleLines, tsStyled+" "+m.styles.LogError.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogError, width)...)
 		case item.isEvent:
 			// 事件标题已自带 Agent 名称（如 MetaAgent: ... / code_assistant 完成: ...）
-			titleLines = append(titleLines, tsStyled+" "+m.styles.LogInfo.Render(truncate(item.title, width-lipgloss.Width(ts)-1)))
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogInfo, width)...)
 		default:
 			label := m.styles.LogAssistant.Render("Assistant")
 			availW := width - lipgloss.Width(label) - lipgloss.Width(ts) - 3
@@ -387,9 +395,8 @@ func (m *Model) buildChatContent(width int) string {
 				availW = 4
 			}
 			text := formatMarkdown(item.title)
-			// 对 Assistant 长回答做自动换行，避免截断
-			wrapped := wordwrap.String(text, availW)
-			wrappedLines := strings.Split(wrapped, "\n")
+			// 对 Assistant 长回答做自动换行，避免截断；使用 ANSI 感知的按显示宽度换行，支持中文/长串。
+			wrappedLines := wrapToWidth(text, availW)
 			for j, wl := range wrappedLines {
 				line := tsStyled + " " + label + " " + wl
 				if j > 0 {
@@ -401,11 +408,11 @@ func (m *Model) buildChatContent(width int) string {
 		}
 		lines = append(lines, titleLines...)
 
-		// detail 行统一缩进并截断/换行；空 detail 跳过避免标题与详情重复（non-tool 事件 detail 为空）
+		// detail 行统一缩进并换行；空 detail 跳过避免标题与详情重复（non-tool 事件 detail 为空）
 		if item.detail != "" {
 			for _, l := range displayDetailLines(item.title, item.detail) {
-				wrapped := wordwrap.String(l, width-2)
-				for _, wl := range strings.Split(wrapped, "\n") {
+				wrappedLines := wrapToWidth(l, width-2)
+				for _, wl := range wrappedLines {
 					lines = append(lines, "  "+wl)
 				}
 			}
@@ -530,6 +537,7 @@ func (m Model) renderShortcutBar(w int) string {
 		{"P", "Plan"},
 		{"A", "Agents"},
 		{"L", "Logs"},
+		{"B", "Side Panel"},
 		{"M", "Memory"},
 		{"G", "Git Diff"},
 		{"S", "Settings"},
@@ -592,6 +600,73 @@ func (m Model) renderOverlay(w, h int) string {
 	body := lipgloss.JoinVertical(lipgloss.Left, header+hint, content)
 	box := m.styles.Overlay.Width(boxW).Height(boxH).Render(body)
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
+}
+
+// wrapStyledLine 将单行原始文本按宽度换行，并在首行保留时间戳前缀，续行保持对齐。
+// style 为整行文本应用的颜色样式；width 为对话区总宽度。
+func wrapStyledLine(tsStyled, text string, style lipgloss.Style, width int) []string {
+	prefix := tsStyled + " "
+	availW := width - lipgloss.Width(prefix)
+	if availW < 4 {
+		availW = 4
+	}
+	wrappedLines := wrapToWidth(text, availW)
+	var out []string
+	tsW := lipgloss.Width(tsStyled)
+	for i, wl := range wrappedLines {
+		styledWl := style.Render(wl)
+		if i == 0 {
+			out = append(out, prefix+styledWl)
+		} else {
+			out = append(out, strings.Repeat(" ", tsW+1)+styledWl)
+		}
+	}
+	return out
+}
+
+// wrapToWidth 按显示宽度将字符串换行，保留 ANSI 转义序列与原有换行；
+// 对中文、长 URL 等无空格内容也能在边界处正确折断，避免截断。
+func wrapToWidth(s string, width int) []string {
+	if width < 1 {
+		width = 1
+	}
+	var lines []string
+	var b strings.Builder
+	curW := 0
+	inAnsi := false
+	for _, r := range s {
+		if r == '\x1b' {
+			inAnsi = true
+			b.WriteRune(r)
+			continue
+		}
+		if inAnsi {
+			b.WriteRune(r)
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inAnsi = false
+			}
+			continue
+		}
+		if r == '\n' {
+			lines = append(lines, b.String())
+			b.Reset()
+			curW = 0
+			continue
+		}
+		rw := runewidth.RuneWidth(r)
+		// 当前行已有内容且加入该 rune 会超宽时，先换行
+		if curW > 0 && curW+rw > width {
+			lines = append(lines, b.String())
+			b.Reset()
+			curW = 0
+		}
+		b.WriteRune(r)
+		curW += rw
+	}
+	if b.Len() > 0 {
+		lines = append(lines, b.String())
+	}
+	return lines
 }
 
 // displayDetailLines returns detail lines as they will be rendered.

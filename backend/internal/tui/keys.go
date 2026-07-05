@@ -35,6 +35,7 @@ const fullHelpText = `
   2 / p            打开 / 关闭 计划看板弹窗
   3 / a            打开 / 关闭 Agent 编排弹窗
   4 / l / Ctrl+L   打开 / 关闭 完整记录弹窗（可滚动查看全部输出）
+  Ctrl+B           切换右侧计划/Agent 分栏显示（自动/强制显示/强制隐藏）
   m                Memory 面板占位提示
   g                Git Diff 占位提示
   s                Settings 占位提示

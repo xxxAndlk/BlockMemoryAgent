@@ -89,10 +89,10 @@ type ProgressCallback func(ctx context.Context, ev ProgressEvent)
 //
 //	Execute 可被多 goroutine 并发调用（无共享可变状态）。
 type ToolExecutor struct {
-	workDir  string         // 工具执行基准目录
-	timeout  time.Duration  // 默认超时
-	callback ToolCallback   // 工具执行回调
-	sandbox  SandboxConfig  // 轻量级沙箱策略（命令黑名单 + 路径逃逸检测）
+	workDir  string        // 工具执行基准目录
+	timeout  time.Duration // 默认超时
+	callback ToolCallback  // 工具执行回调
+	sandbox  SandboxConfig // 轻量级沙箱策略（命令黑名单 + 路径逃逸检测）
 }
 
 // NewToolExecutor 创建工具执行器。
@@ -163,6 +163,14 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 		result = e.httpGet(ctx, args) // HTTP 需要 ctx 做超时控制
 	case "HTTPPost":
 		result = e.httpPost(ctx, args)
+	case "GitDiff":
+		result = e.gitDiff(args)
+	case "GitStatus":
+		result = e.gitStatus(args)
+	case "GitLog":
+		result = e.gitLog(args)
+	case "GitBlame":
+		result = e.gitBlame(args)
 	default:
 		// 未知工具：返回带错误的空结果，不 panic
 		result = &ToolResult{Tool: toolName, Error: fmt.Sprintf("unknown tool: %s", toolName)}
@@ -204,6 +212,10 @@ func normalizeToolName(name string) string {
 		"search_in_files": "SearchInFiles",
 		"http_get":        "HTTPGet",
 		"http_post":       "HTTPPost",
+		"git_diff":        "GitDiff",
+		"git_status":      "GitStatus",
+		"git_log":         "GitLog",
+		"git_blame":       "GitBlame",
 	}
 	if v, ok := aliases[name]; ok {
 		return v

@@ -99,7 +99,7 @@ Blades `Session` 仅管叶子 ReAct 短上下文，长期记忆全自研，4 阶
 - `LevelRaw` — 完整原始记录
 - `LevelStandard` — 摘要（丢弃 FullObservation）
 
-> 注：当前向量检索用 `embed.PseudoEmbed`（sha256 hashed bag-of-tokens 伪向量），cosine 不可靠，仅用于跑通全链路。真实 embedding（text-embedding-3 / bge-m3）为后续接入项（见 `doc/TODO.md` P3-3）。
+> 向量检索默认使用 `embed.PseudoEmbed`（sha256 hashed bag-of-tokens 伪向量，零外部依赖），已在 `config/roles.yaml` 的 `embed` 段支持接入真实 Embedding 模型（OpenAI 兼容端点，如 text-embedding-3 / bge-m3 / 豆包 Embedding）。详见 `doc/项目说明.md` §6 与 `doc/TODO.md` P3-3。
 
 ---
 
@@ -110,7 +110,7 @@ Blades `Session` 仅管叶子 ReAct 短上下文，长期记忆全自研，4 阶
 - Go 1.25（机器默认 Go 较旧时需 `GOTOOLCHAIN=local`）
 - PostgreSQL 14+（含 pgvector 插件，记忆持久化）
 - Redis 7+（短期记忆热缓存）
-- OpenAI 兼容 API Key（如 DeepSeek）
+- 至少一个大模型 API Key（OpenAI 兼容 / Anthropic / 本地 Ollama）
 
 > 所有依赖必须可用：config/roles/env/soul/skills 配置文件须存在，PostgreSQL、Redis、LLM 后端须可达。任一缺失或不可达，服务器启动失败并明确报告。
 
@@ -121,7 +121,7 @@ go mod download
 cp .env.example .env  # 填 OPENAI_API_KEY / OPENAI_BASE_URL / POSTGRES_DSN / REDIS_ADDR
 ```
 
-编辑 `config/roles.yaml` 配置各角色模型（MetaAgent / DomainAgent / LightweightModel / 每个 FixedRole 各自 `model_config`）。
+编辑 `config/roles.yaml` 配置各角色模型（MetaAgent / DomainAgent / LightweightModel / FixedRole / dynamic_templates 均可独立配置 `model_config`）。
 
 ### 运行
 
@@ -242,7 +242,7 @@ Assistant 走 Blades 原生 function-calling：`blades.NewAgent` + `WithTools` +
 
 - **语言**：Go 1.25（需 `GOTOOLCHAIN=local`）
 - **Agent leaf 框架**：go-kratos Blades v0.5.0（`ModelProvider`/`Agent`/`tools.Tool`）
-- **模型适配**：Blades `contrib/openai`（OpenAI 兼容，默认 DeepSeek）
+- **模型适配**：原生多 Provider 分发（`openai` / `anthropic` / `ollama`），`config/roles.yaml` 每个角色独立配置 `model_config.provider`；OpenAI 兼容后端（DeepSeek / 豆包 / 硅基流动等）统一用 `provider: openai`
 - **上层编排**：自研 `ThreeLayerGraph` 状态机（不依赖任何框架的图抽象）
 - **存储**：PostgreSQL 14+ + pgvector（私有记忆/快照/知识库/会话历史/会话事件/会话日志）+ Redis 7+（工作区/快照热加载/Stream）
 - **Web**：Vue 3 + Vite + Tailwind
@@ -255,10 +255,11 @@ Assistant 走 Blades 原生 function-calling：`blades.NewAgent` + `WithTools` +
 ## 扩展方向
 
 见 `doc/TODO.md` P3 远期项：
-- **真实 Embedding**：接入 text-embedding-3 / bge-m3，替换 `PseudoEmbed` 伪向量（P3-3）
-- **编程工具扩展**：Git 工具、测试运行器、浏览器自动化、自定义工具注册（P3-2）
+- **真实 Embedding**：已接入 OpenAI 兼容端点，配置从 `config.yaml` 迁移到 `roles.yaml`（P3-3）；伪向量仍保留为默认零依赖方案
+- **编程工具扩展**：Git 工具已落地（P3-2），测试运行器、浏览器自动化、自定义工具注册待后续
 - **MCP / Computer Use / RAG / LLM Wiki 插件**：接口预留，实现后做（P3-5）
-- **模型分层可观测性**：轻量 vs 重量调用分布与 token 消耗面板（P3-4，依赖日志基础 P1-2）
+- **模型分层可观测性**：已支持按 meta/domain/lightweight/assistant/other 聚合的 token 统计（P3-7），前端配置页待后续（P3-4）
+- **多协议模型接入**：原生 OpenAI / Anthropic / Ollama 协议已落地（P3-6），通过 `provider` 字段区分
 
 ---
 

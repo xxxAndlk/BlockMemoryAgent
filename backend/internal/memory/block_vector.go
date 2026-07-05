@@ -78,17 +78,22 @@ func (r *BlockMemoryRecord) ToKnowledgeRecord(dim int) *types.KnowledgeRecord {
 type BlockMemorySearcher interface {
 	SearchKnowledgeByTypeAndDomain(ctx context.Context, knowledgeType enums.KnowledgeType, domain string, embedding []float32, topK int) ([]*types.KnowledgeRecord, error)
 	EmbeddingDim() int
+	// Embed 将查询文本编码为向量（P3-3：由 store 层统一封装嵌入实现）。
+	Embed(ctx context.Context, text string) ([]float32, error)
 }
 
 // SearchBlockMemory 按领域过滤检索块记忆，返回结构化记录。
-// 使用 embed.PseudoEmbed 生成查询向量，通过 searcher 做数据库检索。
+// 使用 searcher.Embed 生成查询向量（P3-3：可接入真实 embedding 模型），通过 searcher 做数据库检索。
 // 默认只取 scope=domain 与 scope=task 的事实；全局共享事实请用 GlobalRetriever 单独召回。
 // 结果总摘要长度控制在 TokenBudget 20% 以内（约 800 token，按每字符 0.5 token 保守估算）。
 func SearchBlockMemory(ctx context.Context, searcher BlockMemorySearcher, domain, goal string, topK int) ([]*BlockMemoryRecord, error) {
 	if topK <= 0 {
 		topK = 5
 	}
-	emb := embed.PseudoEmbed(goal, searcher.EmbeddingDim())
+	emb, err := searcher.Embed(ctx, goal)
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
 	recs, err := searcher.SearchKnowledgeByTypeAndDomain(ctx, enums.KnowledgeTypeBlockMemory, domain, emb, topK)
 	if err != nil {
 		return nil, err

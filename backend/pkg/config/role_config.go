@@ -24,6 +24,8 @@ type RoleConfigFile struct {
 	// LightweightModel 轻量模型配置，用于历史总结/检索 query 改写等低开销任务。
 	// 与 MetaAgent/DomainAgent 模型解耦，可指向更便宜更快的模型（如 deepseek-v4-lite）。
 	LightweightModel types.AgentModelConfig `yaml:"lightweight_model"`
+	// Embed 文本嵌入模型配置（已从 config.yaml 迁移到 roles.yaml）。
+	Embed types.EmbedConfig `yaml:"embed"`
 	// FixedRoles 固定角色定义列表，对应 fixed_roles 配置项。
 	FixedRoles []types.RoleDefinition `yaml:"fixed_roles"`
 	// DynamicTemplates 动态角色生成模板，由 LLM 在运行时按需实例化为临时助手。
@@ -55,13 +57,15 @@ type DomainAgentConfig struct {
 //
 // 由 LLM 在运行时根据当前任务填充 PromptTemplate 实例化出临时角色
 // (类型为 domain 或 assistant)，并通过 MaxLifetime 控制其存活时长。
+// 可独立配置 ModelConfig；未配置时动态创建的角色回退到 DomainAgent 模型。
 type DynamicRoleTemplate struct {
-	ID             string   `yaml:"id"`              // 模板唯一标识
-	Name           string   `yaml:"name"`            // 模板名称(展示用)
-	Type           string   `yaml:"type"`            // "domain" or "assistant"
-	PromptTemplate string   `yaml:"prompt_template"` // 让大模型填充的模板
-	Skills         []string `yaml:"skills"`          // 模板预置技能 ID 列表
-	MaxLifetime    int      `yaml:"max_lifetime"`    // 最大存活时间（秒）
+	ID             string                 `yaml:"id"`              // 模板唯一标识
+	Name           string                 `yaml:"name"`            // 模板名称(展示用)
+	Type           string                 `yaml:"type"`            // "domain" or "assistant"
+	PromptTemplate string                 `yaml:"prompt_template"` // 让大模型填充的模板
+	Skills         []string               `yaml:"skills"`          // 模板预置技能 ID 列表
+	MaxLifetime    int                    `yaml:"max_lifetime"`    // 最大存活时间（秒）
+	ModelConfig    types.AgentModelConfig `yaml:"model_config"`    // 可选：动态角色专用模型配置
 }
 
 // LoadRoleConfig 从指定路径加载角色配置文件。
@@ -104,6 +108,13 @@ func LoadRoleConfig(path string) (*RoleConfigFile, error) {
 	if cfg.MetaAgent.SummaryInterval <= 0 {
 		cfg.MetaAgent.SummaryInterval = 5
 	}
+	// Embed 默认值: provider 为空时回退 pseudo, batch_size 默认 1
+	if cfg.Embed.Provider == "" {
+		cfg.Embed.Provider = "pseudo"
+	}
+	if cfg.Embed.BatchSize <= 0 {
+		cfg.Embed.BatchSize = 1
+	}
 
 	return &cfg, nil
 }
@@ -122,10 +133,18 @@ func (c *RoleConfigFile) resolveEnvVars() {
 	// 轻量模型配置: 密钥与 BaseURL
 	c.LightweightModel.APIKey = resolveEnv(c.LightweightModel.APIKey)
 	c.LightweightModel.BaseURL = resolveEnv(c.LightweightModel.BaseURL)
+	// 文本嵌入模型配置: 密钥与 BaseURL
+	c.Embed.APIKey = resolveEnv(c.Embed.APIKey)
+	c.Embed.BaseURL = resolveEnv(c.Embed.BaseURL)
 	// 逐个固定角色: 密钥与 BaseURL
 	for i := range c.FixedRoles {
 		c.FixedRoles[i].ModelConfig.APIKey = resolveEnv(c.FixedRoles[i].ModelConfig.APIKey)
 		c.FixedRoles[i].ModelConfig.BaseURL = resolveEnv(c.FixedRoles[i].ModelConfig.BaseURL)
+	}
+	// 动态角色模板: 密钥与 BaseURL（P3-4）
+	for i := range c.DynamicTemplates {
+		c.DynamicTemplates[i].ModelConfig.APIKey = resolveEnv(c.DynamicTemplates[i].ModelConfig.APIKey)
+		c.DynamicTemplates[i].ModelConfig.BaseURL = resolveEnv(c.DynamicTemplates[i].ModelConfig.BaseURL)
 	}
 }
 

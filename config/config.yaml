@@ -72,6 +72,15 @@ agent:
   tool_sandbox_allowed_paths: [] # 允许读写的额外绝对路径白名单
   tool_sandbox_blocked_cmds: []  # 追加到默认命令黑名单的额外命令
 
+# 插件预留配置（P3-5）：接口先定，实现后做，默认全部关闭
+plugins:
+  mcp:
+    enabled: false               # MCP 工具接入
+  rag:
+    enabled: false               # 外部 RAG 知识源接入
+  computer_use:
+    enabled: false               # Computer Use 浏览器/GUI 自动化
+
 # 日志文件输出（按天分割，按入口分文件）
 # 浏览器入口 → logs/browser-YYYY-MM-DD.log
 # TUI 入口    → logs/tui-YYYY-MM-DD.log

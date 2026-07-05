@@ -56,3 +56,32 @@ skills:
     domain: ops,api,*
     tool_ref: HTTPPost
     tags: [http]
+
+  # ---- Git 类（P3-2） ----
+  - skill_id: git_diff
+    name: Git Diff
+    description: 查看工作区/暂存区/历史提交的 Git 差异
+    domain: code,*
+    tool_ref: GitDiff
+    tags: [git,vcs]
+
+  - skill_id: git_status
+    name: Git Status
+    description: 查看 Git 工作区简短状态
+    domain: code,*
+    tool_ref: GitStatus
+    tags: [git,vcs]
+
+  - skill_id: git_log
+    name: Git Log
+    description: 查看 Git 提交历史
+    domain: code,*
+    tool_ref: GitLog
+    tags: [git,vcs]
+
+  - skill_id: git_blame
+    name: Git Blame
+    description: 查看文件每行最后修改者
+    domain: code,*
+    tool_ref: GitBlame
+    tags: [git,vcs]

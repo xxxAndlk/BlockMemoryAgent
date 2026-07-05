@@ -9,7 +9,8 @@ import (
 )
 
 // Config 是后端服务的顶层配置结构，对应 config/config.yaml 的根节点。
-// 它聚合了 Postgres、PgVector、Redis、HTTP、Memory 五大子配置模块，
+// 它聚合了 Postgres、PgVector、Redis、HTTP、Memory、Agent、Logging 六个子配置模块，
+// 注：文本嵌入模型配置（EmbedConfig）已迁移到 roles.yaml，由 pkg/config 解析。
 // 由 Load 函数从 YAML 文件读取并填充后返回。
 type Config struct {
 	Postgres PostgresConfig `yaml:"postgres"` // PostgreSQL 关系型存储配置（私有记忆、快照、知识库 CRUD）
@@ -19,6 +20,21 @@ type Config struct {
 	Memory   MemoryConfig   `yaml:"memory"`   // 记忆管线运行参数（批写/刷新/快照间隔）
 	Agent    AgentConfig    `yaml:"agent"`    // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
 	Logging  LoggingConfig  `yaml:"logging"`  // 日志文件输出（按天分割，按入口分文件）
+	Plugins  PluginsConfig  `yaml:"plugins"`  // 插件预留开关（P3-5）
+}
+
+
+// PluginsConfig 插件预留配置（P3-5）。
+// 当前仅作开关，后续接入 MCP / RAG / Computer Use 时展开字段。
+type PluginsConfig struct {
+	MCP         PluginToggle `yaml:"mcp"`          // MCP 工具接入
+	RAG         PluginToggle `yaml:"rag"`          // 外部 RAG 知识源
+	ComputerUse PluginToggle `yaml:"computer_use"` // Computer Use 浏览器/GUI 自动化
+}
+
+// PluginToggle 单个插件开关。
+type PluginToggle struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 // LoggingConfig 日志文件输出配置。
@@ -56,17 +72,17 @@ type AgentConfig struct {
 	SnapshotSummaryCount       int     `yaml:"snapshot_summary_count"`        // 快照保留的最近摘要条数（默认 20）
 	SnapshotOpenIssueThreshold float64 `yaml:"snapshot_open_issue_threshold"` // 未决问题重要性阈值（默认 0.7）
 	// Episode 写入与压缩参数（替代 memory/write.go / compress.go 硬编码）
-	SummaryMaxRunes            int     `yaml:"summary_max_runes"`             // 摘要最大 rune 数（默认 400）
-	FactMaxSentences           int     `yaml:"fact_max_sentences"`            // 事实提取最大句数（默认 5）
+	SummaryMaxRunes             int     `yaml:"summary_max_runes"`             // 摘要最大 rune 数（默认 400）
+	FactMaxSentences            int     `yaml:"fact_max_sentences"`            // 事实提取最大句数（默认 5）
 	CompressImportanceThreshold float64 `yaml:"compress_importance_threshold"` // 压缩保留 Raw 的重要性阈值（默认 0.7）
-	CompressAgeHours           int     `yaml:"compress_age_hours"`            // 压缩保留 Raw 的最大年龄（小时，默认 24）
+	CompressAgeHours            int     `yaml:"compress_age_hours"`            // 压缩保留 Raw 的最大年龄（小时，默认 24）
 	// Plan-and-Execute + Self-Reflection（TODO #1）
 	PlanEnabled       bool `yaml:"plan_enabled"`       // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
 	ReflectionEnabled bool `yaml:"reflection_enabled"` // 是否在助手执行后做 Self-Reflection（不达标重试一次）
 	// 工具沙箱（安全）
-	ToolSandboxDisabled      bool     `yaml:"tool_sandbox_disabled"`       // true 时关闭写路径逃逸检测（保留命令黑名单）
-	ToolSandboxAllowedPaths  []string `yaml:"tool_sandbox_allowed_paths"`  // 允许读写的额外绝对路径白名单
-	ToolSandboxBlockedCmds   []string `yaml:"tool_sandbox_blocked_cmds"`   // 额外命令黑名单（追加到默认黑名单）
+	ToolSandboxDisabled     bool     `yaml:"tool_sandbox_disabled"`      // true 时关闭写路径逃逸检测（保留命令黑名单）
+	ToolSandboxAllowedPaths []string `yaml:"tool_sandbox_allowed_paths"` // 允许读写的额外绝对路径白名单
+	ToolSandboxBlockedCmds  []string `yaml:"tool_sandbox_blocked_cmds"`  // 额外命令黑名单（追加到默认黑名单）
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。

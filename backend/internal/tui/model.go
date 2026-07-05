@@ -66,6 +66,10 @@ type Model struct {
 	agentPanelVisible bool
 	planBarVisible    bool
 
+	// rightPanelForced 用户手动强制显示/隐藏右侧计划/Agent 分栏。
+	// 0=自动（按宽度和内容），1=强制显示，-1=强制隐藏。
+	rightPanelForced int
+
 	// input bar
 	inputMode    int
 	inputRunes   []rune
@@ -531,6 +535,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.toggleLogPopup()
 		return m, nil
 	}
+	// Ctrl+B 全局切换右侧计划/Agent 分栏显示/隐藏。
+	if msg.String() == "ctrl+b" {
+		m.toggleRightPanel()
+		return m, nil
+	}
 
 	// Overlay mode: navigate or close.
 	if m.overlay != overlayNone {
@@ -737,12 +746,20 @@ func (m *Model) rebuildChatContent() {
 }
 
 // rightPanelVisible 返回是否显示右侧计划/Agent 分栏。
-// 仅在有活动会话、终端宽度充足，且存在执行计划或多 Agent 编排时显示。
+// 显示条件（满足其一即可）：
+//   - 用户手动强制显示（ctrl+b）
+//   - 有活动会话、终端宽度≥80，且存在执行计划或任意 Agent（含 MetaAgent）
 func (m *Model) rightPanelVisible() bool {
-	if m.selectedSession() == nil || m.width < 100 {
+	if m.rightPanelForced == 1 {
+		return true
+	}
+	if m.rightPanelForced == -1 {
 		return false
 	}
-	return m.hasPlan() || len(m.agentsNodes) > 1
+	if m.selectedSession() == nil || m.width < 80 {
+		return false
+	}
+	return m.hasPlan() || len(m.agentsNodes) > 0
 }
 
 // chatAreaWidth 返回左侧对话区总宽度（含滚动条与间隔）。
@@ -874,6 +891,22 @@ func (m *Model) toggleAgentsPopup() {
 	m.overlayTitle = "Agent Topology"
 	m.overlayLines = lines
 	m.overlayCursor = clamp(m.overlayCursor, 0, len(lines)-1)
+}
+
+// toggleRightPanel 切换右侧计划/Agent 分栏的强制显示/隐藏状态。
+// 循环：自动 → 强制显示 → 强制隐藏 → 自动。
+func (m *Model) toggleRightPanel() {
+	switch m.rightPanelForced {
+	case 0:
+		m.rightPanelForced = 1
+		m.flashMsg("right panel: forced visible")
+	case 1:
+		m.rightPanelForced = -1
+		m.flashMsg("right panel: forced hidden")
+	default:
+		m.rightPanelForced = 0
+		m.flashMsg("right panel: auto")
+	}
 }
 
 // toggleLogPopup 打开/关闭"完整记录"面板：把整段对话铺成可滚动行列表，

@@ -2155,6 +2155,24 @@ func (m *SessionManager) HandleSessionTokenMetrics(w http.ResponseWriter, r *htt
 		})
 	}
 
+	// P3-7：按模型层聚合统计
+	layerMap := make(map[string]map[string]any)
+	for _, v := range agg.ByAgentModel {
+		layer := model.CallerToLayer(v.Agent)
+		ls, ok := layerMap[layer]
+		if !ok {
+			ls = map[string]any{"layer": layer, "input_tokens": 0, "output_tokens": 0, "calls": 0}
+			layerMap[layer] = ls
+		}
+		ls["input_tokens"] = ls["input_tokens"].(int) + v.InputTokens
+		ls["output_tokens"] = ls["output_tokens"].(int) + v.OutputTokens
+		ls["calls"] = ls["calls"].(int) + v.Calls
+	}
+	layerStats := make([]map[string]any, 0, len(layerMap))
+	for _, ls := range layerMap {
+		layerStats = append(layerStats, ls)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"session_id":          id,
@@ -2162,5 +2180,6 @@ func (m *SessionManager) HandleSessionTokenMetrics(w http.ResponseWriter, r *htt
 		"total_output_tokens": agg.TotalOutputTokens,
 		"total_calls":         agg.TotalCalls,
 		"stats":               stats,
+		"layer_stats":         layerStats,
 	})
 }

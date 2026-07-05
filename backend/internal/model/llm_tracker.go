@@ -7,6 +7,7 @@ import (
 	"context" // 上下文与超时
 	"errors"  // 错误类型判断
 	"fmt"     // 字符串格式化
+	"strings" // caller 分层判断
 	"sync"    // 读写锁保护并发访问
 	"time"    // 时间统计
 )
@@ -82,7 +83,16 @@ type CallRecord struct {
 	Timestamp     time.Time     `json:"timestamp"`       // 调用时间戳
 }
 
-// LLMCallTracker LLM调用全量追踪器（超时统计 + Token 消耗 + Prompt 记录）。
+// LayerStats 某一层模型的调用统计（P3-7：模型分层可观测性）。
+type LayerStats struct {
+	Layer        string `json:"layer"`         // 层名：meta / domain / lightweight / assistant / other
+	Calls        int    `json:"calls"`         // 调用次数
+	InputTokens  int    `json:"input_tokens"`  // 累计输入 token
+	OutputTokens int    `json:"output_tokens"` // 累计输出 token
+	Errors       int    `json:"errors"`        // 失败次数
+}
+
+// LLMCallTracker LLM调用全量追踪器（超时统计 + Token 消耗 + Prompt 记录 + 模型分层统计）。
 // 设计意图：统一负责 LLM 调用的自适应超时、Token 统计、Prompt/Response 记录与持久化回调。
 type LLMCallTracker struct {
 	mu             sync.RWMutex                      // 读写锁保护所有字段
@@ -94,6 +104,7 @@ type LLMCallTracker struct {
 	slowMode       bool                              // 连续超时后进入慢速模式，跳过 LLM
 	records        []CallRecord                      // 每次调用的详细记录
 	recordCallback func(context.Context, CallRecord) // 可选：每次记录后的回调（用于写入 session_logs）
+	layerStats     map[string]*LayerStats            // 按模型层聚合的统计（P3-7）
 }
 
 // NewLLMCallTracker 创建调用追踪器。
@@ -103,7 +114,8 @@ type LLMCallTracker struct {
 // 并发安全：返回实例可被多协程共享。
 func NewLLMCallTracker() *LLMCallTracker {
 	return &LLMCallTracker{
-		records: make([]CallRecord, 0), // 预分配空切片避免 nil
+		records:    make([]CallRecord, 0), // 预分配空切片避免 nil
+		layerStats: make(map[string]*LayerStats),
 	}
 }
 
@@ -257,6 +269,20 @@ func (t *LLMCallTracker) RecordCall(
 	}
 	t.records = append(t.records, rec)
 
+	// P3-7：按模型层聚合统计
+	layer := CallerToLayer(caller)
+	ls, ok := t.layerStats[layer]
+	if !ok {
+		ls = &LayerStats{Layer: layer}
+		t.layerStats[layer] = ls
+	}
+	ls.Calls++
+	ls.InputTokens += inputTokens
+	ls.OutputTokens += outputTokens
+	if err != nil {
+		ls.Errors++
+	}
+
 	// 触发持久化回调（若已设置），不阻塞、不处理错误
 	if t.recordCallback != nil {
 		cb := t.recordCallback
@@ -272,4 +298,42 @@ func (t *LLMCallTracker) ShouldSkipLLM() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.slowMode
+}
+
+// CallerToLayer 把调用方标识映射到模型分层（P3-7）。
+// 规则：
+//   - 包含 "MetaAgent" 或 caller="meta" → meta
+//   - 包含 "DomainAgent" 或 caller="domain" → domain
+//   - 包含 "Lightweight" 或 caller="lightweight" → lightweight
+//   - 包含 "助手" 或 "Assistant" → assistant
+//   - 其他 → other
+func CallerToLayer(caller string) string {
+	if caller == "" {
+		return "other"
+	}
+	lower := strings.ToLower(caller)
+	switch {
+	case lower == "meta" || strings.Contains(lower, "metaagent"):
+		return "meta"
+	case lower == "domain" || strings.Contains(lower, "domainagent") || strings.Contains(lower, "subdomain"):
+		return "domain"
+	case lower == "lightweight" || strings.Contains(lower, "lightweight"):
+		return "lightweight"
+	case strings.Contains(lower, "助手") || strings.Contains(lower, "assistant"):
+		return "assistant"
+	default:
+		return "other"
+	}
+}
+
+// LayerStatsSnapshot 返回按模型层聚合的调用统计快照（P3-7）。
+// 并发安全：读锁保护；返回副本，避免外部修改内部状态。
+func (t *LLMCallTracker) LayerStatsSnapshot() []LayerStats {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]LayerStats, 0, len(t.layerStats))
+	for _, ls := range t.layerStats {
+		out = append(out, *ls)
+	}
+	return out
 }

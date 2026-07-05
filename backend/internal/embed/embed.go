@@ -1,9 +1,9 @@
-// Package embed 提供 hashed bag-of-tokens 伪嵌入实现。
+// Package embed 提供文本嵌入抽象与实现。
 //
-// 设计意图：项目未接入独立 embedding 模型，这里用 sha256 哈希把 token
-// 映射到固定维度向量，再 L2 归一化。相同 token 必落同一维，相近文本因
-// 共享 token 而向量靠近。后续若引入真实 embedding 模型，只需替换本文件
-// 中的 PseudoEmbed 实现即可，所有调用方（store / memory / graph）自动复用。
+// 设计意图（P3-3）：定义统一的 Embedder 接口，支持 pseudo（字符哈希，零依赖）、
+// openai（官方/兼容端点）、local（本地 ollama/xinference 等 OpenAI 兼容服务）。
+// 所有调用方（store / memory / retriever）均依赖 Embedder 接口，切换模型只需改配置。
+// PseudoEmbed 作为默认实现保留，保证无外部模型时也能跑通全链路。
 //
 // 抽到独立包是为避免 store ↔ memory 之间的循环依赖。
 package embed
