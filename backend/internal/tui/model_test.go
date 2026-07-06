@@ -495,3 +495,52 @@ func TestLongUserMessageWrapsAtRightPanelBoundary(t *testing.T) {
 		t.Fatalf("首行应保留 You 标签，got:\n%s", lines[0])
 	}
 }
+
+// TestPlanPanelReflectsAgentStatuses 验证：当后端 TaskBoard 未及时更新时，
+// 右侧面板的计划进度仍会根据 Agent 实例的真实状态显示完成率与 Done 标记。
+func TestPlanPanelReflectsAgentStatuses(t *testing.T) {
+	soulPath := filepath.Join(t.TempDir(), "soul.md")
+	if err := os.WriteFile(soulPath, []byte("test"), 0644); err != nil {
+		t.Fatalf("write soul: %v", err)
+	}
+	rt := runtime.New(soulPath, skill.BuiltinPool())
+	bd := rt.Boards.GetOrCreate("session-1", "塔防游戏 demo")
+	bd.AddSubTask("战斗领域 - 实现怪物路径")
+	bd.AddSubTask("UI领域 - Canvas 渲染")
+	bd.AddSubTask("经济领域 - 金币系统")
+
+	m := &Model{
+		styles:           NewStyles(),
+		chatVP:           viewport.New(80, 20),
+		width:            120,
+		height:           40,
+		rt:               rt,
+		rightPanelForced: 1,
+		flashMu:          &sync.Mutex{},
+		sessions: []*server.Session{
+			{ID: "session-1", Goal: "塔防游戏 demo"},
+		},
+		sessionsCursor: 0,
+		agentsNodes: []agentTreeNode{
+			{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusDone},
+			{depth: 1, instID: "d1", name: "战斗领域", domain: "战斗领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusDone},
+			{depth: 1, instID: "d2", name: "UI领域", domain: "UI领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusActive},
+			{depth: 1, instID: "d3", name: "经济领域", domain: "经济领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusWaiting},
+		},
+	}
+	m.chatVP.SetContent("")
+
+	view := m.View()
+	// 进度应大于 0（3 个里 1 个完成）
+	if !strings.Contains(view, "33%") && !strings.Contains(view, "34%") {
+		t.Fatalf("计划面板应显示约 33%% 进度，got:\n%s", view)
+	}
+	// 战斗领域应显示完成
+	if !strings.Contains(view, "战斗领域") {
+		t.Fatalf("计划面板应包含战斗领域任务，got:\n%s", view)
+	}
+	// 检查完成标记出现（✓ Done 或中文完成徽章）
+	if !strings.Contains(view, "✓") {
+		t.Fatalf("计划面板应显示完成标记，got:\n%s", view)
+	}
+}

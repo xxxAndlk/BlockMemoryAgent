@@ -80,8 +80,15 @@ func (m Model) renderTopBar(w int) string {
 		statusColor = cStatusWait
 	case "error":
 		statusColor = cStatusErr
+	case "completed":
+		statusColor = cStatusDone
 	}
-	statusDot := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor)).Render("●")
+	// 完成态用 ✓ 替代 ●，让用户一眼看出会话已结束
+	statusIcon := "●"
+	if status == "completed" {
+		statusIcon = "✓"
+	}
+	statusDot := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor)).Render(statusIcon)
 	sessionStr := m.styles.TopBarLabel.Render("Session") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render(sessionID)
 	statusStr := m.styles.TopBarLabel.Render("Status") + m.styles.TopBarSep.Render(": ") + statusDot + " " + m.styles.TopBarValue.Render(status)
 	timeStr := m.styles.TopBarLabel.Render("Time") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render("00:00:00")
@@ -270,6 +277,19 @@ func (m Model) renderPlanPanel(w, h int) string {
 			Goal:  goal,
 			Tasks: []board.SubTask{{ID: "direct", Title: "直接执行", Status: status}},
 		}
+	} else {
+		// 看板子任务状态可能未被后端及时更新，用 Agent 实例的真实状态覆盖，
+		// 这样进度条和状态才能反映实际完成情况。
+		domainStatus := m.deriveDomainTaskStatuses()
+		tasks := make([]board.SubTask, len(snap.Tasks))
+		copy(tasks, snap.Tasks)
+		for i := range tasks {
+			domain := planTaskDomain(tasks[i].Title)
+			if st, ok := domainStatus[domain]; ok {
+				tasks[i].Status = st
+			}
+		}
+		snap.Tasks = tasks
 	}
 
 	lines := m.formatPlanSnapshot(innerW, snap)
@@ -319,7 +339,7 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
 		if t.Status == board.TaskPending {
 			elapsed = "--:--"
 		} else {
-			elapsed = formatDurationShort(taskElapsed(t))
+			elapsed = formatTaskElapsed(t)
 		}
 		meta := fmt.Sprintf("%s %s", icon+statusText, elapsed)
 		// 保留序号+标题，右侧对齐状态与耗时
@@ -346,6 +366,56 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
 	return lines
 }
 
+// deriveDomainTaskStatuses 从 Agent 拓扑中汇总每个领域的实际状态，
+// 用于覆盖 TaskBoard 中可能未被后端更新的子任务状态。
+// 优先级：Failed > InProgress > Done > Pending。
+func (m Model) deriveDomainTaskStatuses() map[string]board.TaskStatus {
+	status := make(map[string]board.TaskStatus)
+	for _, node := range m.agentsNodes {
+		if node.domain == "" {
+			continue
+		}
+		var st board.TaskStatus
+		switch node.status {
+		case enums.RoleStatusError:
+			st = board.TaskFailed
+		case enums.RoleStatusActive:
+			st = board.TaskInProgress
+		case enums.RoleStatusDone:
+			st = board.TaskDone
+		default:
+			st = board.TaskPending
+		}
+		cur := status[node.domain]
+		status[node.domain] = strongerTaskStatus(cur, st)
+	}
+	return status
+}
+
+// strongerTaskStatus 返回两个任务状态中优先级更高的一个。
+func strongerTaskStatus(a, b board.TaskStatus) board.TaskStatus {
+	order := map[board.TaskStatus]int{
+		board.TaskFailed:     3,
+		board.TaskInProgress: 2,
+		board.TaskBlocked:    2,
+		board.TaskDone:       1,
+		board.TaskPending:    0,
+	}
+	if order[b] > order[a] {
+		return b
+	}
+	return a
+}
+
+// planTaskDomain 从看板子任务标题（格式 "领域名 - 目标"）中提取领域名。
+func planTaskDomain(title string) string {
+	parts := strings.SplitN(title, " - ", 2)
+	if len(parts) == 0 {
+		return title
+	}
+	return strings.TrimSpace(parts[0])
+}
+
 func (m Model) renderAgentsPanel(w, h int) string {
 	titleLeft := "Agent 编排"
 	titleRight := "[A] 关闭"
@@ -365,14 +435,21 @@ func (m Model) renderAgentsPanel(w, h int) string {
 		lines = append(lines, "(no agents)")
 	} else {
 		for _, node := range m.agentsNodes {
+			// 过滤掉大量已完成且无目标的无意义临时助手，避免面板被刷屏。
+			if node.depth >= 2 && node.goal == "" &&
+				(node.status == enums.RoleStatusDone || node.status == enums.RoleStatusIdle) {
+				continue
+			}
+
 			prefix := agentTreePrefix(node.depth)
 			icon := statusIcon(string(node.status))
+			badge := agentStatusBadge(m.styles, node.status)
 			name := node.name
 			if node.goal != "" {
 				goal := strings.ReplaceAll(node.goal, "\n", " ")
-				name += " " + m.styles.Dim.Render(truncate(goal, innerW-lipgloss.Width(prefix)-lipgloss.Width(name)-4))
+				name += " " + m.styles.Dim.Render(truncate(goal, innerW-lipgloss.Width(prefix)-lipgloss.Width(name)-lipgloss.Width(badge)-4))
 			}
-			line := fmt.Sprintf("%s%s %s", prefix, icon, name)
+			line := fmt.Sprintf("%s%s %s %s", prefix, icon, name, badge)
 			lines = append(lines, truncate(line, innerW))
 		}
 	}

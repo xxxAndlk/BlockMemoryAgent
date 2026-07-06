@@ -34,9 +34,9 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 		return []string{goal}
 	}
 
-	// 尝试使用LLM进行任务拆解
+	// 尝试使用LLM进行任务拆解（用轻量模型 + 短超时，避免 domain_agent 模型 91s 超时）
 	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
-		n.emit(ctx, "llm", "调用 LLM 拆解子任务...")
+		n.emit(ctx, "llm", "调用轻量 LLM 拆解子任务...")
 		// 构造拆解 prompt：强调"可直接用工具执行"，禁止纯思考类子任务
 		// 若本次 Invoke 检索到历史相似块记忆，作为参考段注入（特性3）
 		// 若 blockMemory 可用但未召回任何记忆，强制注入 NO_PRIOR_RECALL 标记，
@@ -47,7 +47,7 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 		} else if n.recallAttempted && n.blockMemory != nil {
 			memorySection = "\n[NO_PRIOR_RECALL] 块记忆检索未命中任何历史决策。\n禁止编造\"上次会话/上次讨论过 X\"类内容；如需建立新决策，直接落地并在 Facts 标注 first_session=true。\n禁止用 WriteFile 创建\"决策记录.md\"等文件伪造历史。\n\n"
 		}
-		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-4个独立可执行的子任务。
+		resp, err, timedOut := n.callLightweightAs(ctx, "DomainAgent/任务拆解(轻量)", fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-4个独立可执行的子任务。
 
 目标: %s
 

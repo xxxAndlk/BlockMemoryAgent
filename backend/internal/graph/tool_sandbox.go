@@ -41,6 +41,7 @@ func DefaultSandboxConfig() SandboxConfig {
 			"sudo", "su", "doas",                       // 权限提升
 			"chmod", "chown", "chgrp", "setfacl",       // 权限修改
 			"curl", "wget", "nc", "netcat", "telnet", "ssh", "scp", "ftp", // 网络外发
+			"taskkill", "kill", "killall", "pkill", // 进程终止：Agent 不应杀任意 PID（参见塔防 demo 事故 v2）
 		},
 		AllowedPaths:             nil,
 		AllowWriteOutsideWorkDir: false,

@@ -300,11 +300,18 @@ func chatItems(s *server.Session, compact bool) []chatItem {
 				if !items[i].isEvent {
 					continue
 				}
-				if strings.HasPrefix(items[i].title, "MetaAgent 总结: 会话完成: ") {
-					summary := strings.TrimPrefix(items[i].title, "MetaAgent 总结: 会话完成: ")
-					if normalizeChatText(summary) == assistantText {
-						items = append(items[:i], items[i+1:]...)
-					}
+				// 新格式: "✓ 会话已结束 — MetaAgent 总结: 会话完成: ..."
+				// 旧格式: "MetaAgent 总结: 会话完成: ..."
+				var summary string
+				if strings.HasPrefix(items[i].title, "✓ 会话已结束 — MetaAgent 总结: 会话完成: ") {
+					summary = strings.TrimPrefix(items[i].title, "✓ 会话已结束 — MetaAgent 总结: 会话完成: ")
+				} else if strings.HasPrefix(items[i].title, "MetaAgent 总结: 会话完成: ") {
+					summary = strings.TrimPrefix(items[i].title, "MetaAgent 总结: 会话完成: ")
+				} else {
+					continue
+				}
+				if normalizeChatText(summary) == assistantText {
+					items = append(items[:i], items[i+1:]...)
 				}
 			}
 		}
@@ -567,13 +574,14 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		title = agent + " 完成: " + ev.Message
 		return title, "", title, true
 	case ev.Type == "system":
-		// 只展示会话完成总结，避免“会话启动/继续执行”等噪声淹没对话。
+		// 只展示会话完成总结，避免 "会话启动/继续执行" 等噪声淹没对话。
 		if strings.Contains(ev.Message, "会话完成") {
 			agent := ev.Agent
 			if agent == "" {
 				agent = "MetaAgent"
 			}
-			title = agent + " 总结: " + ev.Message
+			// 加 ✓ 已结束 前缀，让用户一眼看出会话已结束
+			title = "✓ 会话已结束 — " + agent + " 总结: " + ev.Message
 			return title, "", title, true
 		}
 		return "", "", "", false
@@ -736,6 +744,17 @@ func taskElapsed(t board.SubTask) time.Duration {
 	return end.Sub(t.CreatedAt)
 }
 
+// formatTaskElapsed 格式化任务已用时长；看板时间戳缺失时返回占位符而非异常大值。
+func formatTaskElapsed(t board.SubTask) string {
+	if t.CreatedAt.IsZero() {
+		return "--:--"
+	}
+	if (t.Status == board.TaskDone || t.Status == board.TaskFailed) && t.UpdatedAt.IsZero() {
+		return "--:--"
+	}
+	return formatDurationShort(taskElapsed(t))
+}
+
 // formatDurationShort 把时长格式化为 mm:ss 或 hh:mm:ss。
 func formatDurationShort(d time.Duration) string {
 	if d < 0 {
@@ -774,6 +793,22 @@ func statusIcon(status string) string {
 		return "◦"
 	default:
 		return "◦"
+	}
+}
+
+// agentStatusBadge 把 Agent 状态渲染成短标签徽章，用于 Agent 编排栏。
+func agentStatusBadge(styles *Styles, status enums.RoleStatus) string {
+	switch status {
+	case enums.RoleStatusActive:
+		return styles.BadgeWarn.Render(" 运行 ")
+	case enums.RoleStatusDone:
+		return styles.BadgeOk.Render(" 完成 ")
+	case enums.RoleStatusError:
+		return styles.BadgeWarn.Render(" 错误 ")
+	case enums.RoleStatusWaiting:
+		return styles.Badge.Render(" 等待 ")
+	default:
+		return styles.Badge.Render(" 空闲 ")
 	}
 }
 

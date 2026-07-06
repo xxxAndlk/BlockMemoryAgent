@@ -4,13 +4,32 @@ package graph
 // 具体工具实现按类别拆分（P0-3）：tool_files.go / tool_command.go / tool_http.go。
 
 import (
-	"context"       // 上下文与超时控制
+	"bytes"        // marshalNoHTMLEscape buffer
+	"context"      // 上下文与超时控制
 	"encoding/json" // Execute 入参 JSON 摘要
-	"fmt"           // 错误格式化
-	"os"            // NewToolExecutor 回退 Getwd
+	"fmt"          // 错误格式化
+	"os"           // NewToolExecutor 回退 Getwd
 	"path/filepath" // resolvePath
-	"time"          // 默认超时
+	"time"         // 默认超时
 )
+
+// marshalNoHTMLEscape 序列化 v 为 JSON，关闭 HTML 转义。
+// 默认 json.Marshal 会把 < > & 转成 < > &，TUI/日志直接展示
+// 这些转义序列就是乱码。用 json.Encoder + SetEscapeHTML(false) 避免。
+func marshalNoHTMLEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	// Encode 末尾会加换行，trim 掉以保持与 json.Marshal 一致
+	out := buf.Bytes()
+	if len(out) > 0 && out[len(out)-1] == '\n' {
+		out = out[:len(out)-1]
+	}
+	return out, nil
+}
 
 // ToolResult 工具执行结果。
 //
@@ -178,7 +197,10 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	// 统一填入 sessionID，便于上层按会话过滤事件
 	result.SessionID = sessionID
 	// 统一填入入参 JSON 摘要（截断 300 字），便于日志展示工具调用上下文
-	if argsJSON, mErr := json.Marshal(args); mErr == nil {
+	// 关闭 HTML 转义：默认 json.Marshal 会把 < > & 转成 < > &，
+	// TUI/日志直接展示这些转义序列就是乱码（参见塔防 demo 事故：HTML 内容显示为
+	// <!DOCTYPE html>，命令中的 && 显示为 &&）。
+	if argsJSON, mErr := marshalNoHTMLEscape(args); mErr == nil {
 		argsStr := string(argsJSON)
 		if len(argsStr) > 300 {
 			argsStr = argsStr[:300] + "...(truncated)"

@@ -355,10 +355,16 @@ func executeMockAssistant(
 // 并在循环检测器触发时主动退出，避免无限循环或成本失控。
 // 返回最后一个 message、累计用量、循环错误（nil 表示正常结束）。
 // 注意：假设 provider 非流式返回每轮独立用量；若未来切流式需复查累加逻辑。
+//
+// 上下文爆炸保护：单轮 input_tokens 超 maxInputTokensBudget（默认 100K）时主动退出。
+// 参见塔防 demo 事故 v2：MetaAgent[临时助手] 累积 850K input tokens（152s 调用），
+// 因反复读 game.js/game_core.js + 工具结果全量回灌 LLM。blades agent 内部无上下文裁剪，
+// 需在外层 loop 拦截。
 func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *blades.Invocation, agentName string, maxIters int, emit emitFunc) (*blades.Message, blades.TokenUsage, error) {
 	var lastMessage *blades.Message
 	var totalUsage blades.TokenUsage
 	detector := newLoopDetector(maxIters)
+	const maxInputTokensBudget = 100000 // 单轮输入 token 上限，超此视为上下文爆炸
 	for m, err := range agent.Run(ctx, invocation) {
 		if err != nil {
 			return lastMessage, totalUsage, err
@@ -370,6 +376,13 @@ func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *bla
 		totalUsage.InputTokens += m.TokenUsage.InputTokens
 		totalUsage.OutputTokens += m.TokenUsage.OutputTokens
 		totalUsage.TotalTokens += m.TokenUsage.TotalTokens
+		// 上下文爆炸检测：单轮 input_tokens 超预算则退出
+		if m.TokenUsage.InputTokens > maxInputTokensBudget {
+			reason := fmt.Sprintf("上下文爆炸保护：单轮 input_tokens=%d 超预算 %d，可能因工具结果累积过多。建议减少 ReadFile 次数或缩短工具输出",
+				m.TokenUsage.InputTokens, maxInputTokensBudget)
+			emit(ctx, "error", reason)
+			return lastMessage, totalUsage, &loopExitError{reason: reason}
+		}
 		// 暴露每轮 LLM 文本输出；工具调用轮次 (RoleTool) Text 通常为空，不会重复 emit
 		if txt := m.Text(); txt != "" {
 			emit(ctx, "llm_result", "LLM 输出: "+truncateStr(txt, 400))

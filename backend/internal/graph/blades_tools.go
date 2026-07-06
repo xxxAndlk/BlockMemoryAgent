@@ -2,7 +2,6 @@ package graph
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 
 	"github.com/go-kratos/blades/tools"
@@ -163,7 +162,7 @@ func (r *toolRunner) emitTool(ctx context.Context, kind, tool, msg, detail strin
 //
 // 并发安全：results 追加持锁；failures 内部持锁；可被 Agent 并发调用。
 func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) string {
-	argsStr, _ := json.Marshal(args) // 序列化参数用于事件展示
+	argsStr, _ := marshalNoHTMLEscape(args) // 序列化参数用于事件展示（关闭 HTML 转义，避免 TUI 乱码）
 	// 推送调用前事件（pending 态）：携带 Tool 名，前端无需正则推断
 	r.emitTool(ctx, "tool_call", name, "调用工具 "+name, string(argsStr))
 
@@ -194,7 +193,9 @@ func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) 
 	}
 
 	// 结果序列化为 JSON 返回给 blades Agent，Agent 会把文本回灌给 LLM
-	b, _ := json.Marshal(result)
+	// 关闭 HTML 转义：result.Output 可能含 < > &（HTML/命令输出），转义后 LLM 看到
+	// 乱码影响后续决策（参见塔防 demo 事故：HTML 内容回灌为 <!DOCTYPE>）
+	b, _ := marshalNoHTMLEscape(result)
 	return string(b)
 }
 

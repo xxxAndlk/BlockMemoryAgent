@@ -20,6 +20,12 @@ func TestRunCommandBlocksDangerousCommands(t *testing.T) {
 		"sudo apt update",
 		"dd if=/dev/zero of=/tmp/x",
 		"format C:",
+		// 塔防 demo 事故 v2：Agent 用 taskkill 杀任意 PID
+		"taskkill /F /PID 44160",
+		"taskkill /F /IM python.exe",
+		"kill -9 1234",
+		"killall python",
+		"pkill -f server",
 	}
 
 	for _, cmd := range cases {

@@ -71,12 +71,43 @@ func (e *ToolExecutor) writeFile(ctx context.Context, args map[string]any) *Tool
 		return &ToolResult{Tool: "WriteFile", Error: "path is required"}
 	}
 
+	// 工作区污染拦截：禁止 Agent 写到后端源码树 / 测试模块 / 根 go.mod / go.work。
+	// 塔防 demo 事故中，Agent 把 Go 包写到 backend/internal/tdcombat/、改根 go.work、
+	// 在 workspace/ 建 go.mod，污染项目结构。Agent 只能写 workspace/ 子目录下的用户产物。
+	if err := rejectProtectedPath(path); err != nil {
+		return &ToolResult{Tool: "WriteFile", Path: path, Error: err.Error()}
+	}
+
 	// 邮箱文件化拦截：Agent 偶尔把跨域邮箱当成 JSON 文件写到 workspace/.../mailbox/
 	// 目录（参见塔防 demo 事故）。系统内置 runtime.Mailbox 投递，禁止用 WriteFile
 	// 伪造邮箱消息。命中模式：路径段含 "mailbox" + 文件名 to-*/from-*/msg-*.json。
 	if isMailboxFilePath(path) {
 		return &ToolResult{Tool: "WriteFile", Path: path,
 			Error: "禁止用 WriteFile 写邮箱消息文件。跨域协作请通过 runtime.Mailbox 投递（DomainAgent 内部 API），或在任务输出中声明『请把 X 发给 Y 领域』由 MetaAgent 转发。直接写 mailbox/*.json 不会被下游领域消费。"}
+	}
+
+	// 临时脚本反模式拦截：Agent 偶尔用 WriteFile 写 Python/Shell 脚本去读文件、
+	// 列目录、搜文本，而不是直接用 ReadFile/ListDir/SearchInFiles（参见塔防 demo
+	// 事故：写了 10+ 个 read_game_js.py / check_game_js.py / dump_game.py 浪费 token）。
+	// 命中典型模式：.py 脚本含 open(...).read() + print，或 os.listdir + print。
+	if reason := detectFileHelperScript(path, content); reason != "" {
+		return &ToolResult{Tool: "WriteFile", Path: path,
+			Error: "禁止写脚本做文件读取/列目录/搜索: " + reason +
+				"。直接用 ReadFile / ListDir / SearchInFiles 工具，无需写中间脚本。" +
+				"此反模式浪费 token 与执行时间（塔防事故中 Agent 写 10+ 个 .py 读 game.js）。"}
+	}
+
+	// 邮箱 Go 程序绕过拦截：Agent 写 Go 源码（send_interface.go 等）调用
+	// runtime.Mailbox.Send 绕过 JSON 文件化检测（参见塔防 demo 事故：
+	// Agent 写 backend/cmd/send_interface/main.go 伪造跨域邮箱投递）。
+	// 这类 Go 程序不会被编译进后端二进制，纯浪费 token；且直接写 backend/ 已被
+	// rejectProtectedPath 拦截，但 workspace/ 下的 .go 仍可能漏过。
+	if reason := detectMailboxGoProgram(path, content); reason != "" {
+		return &ToolResult{Tool: "WriteFile", Path: path,
+			Error: "禁止写 Go 程序伪造邮箱投递: " + reason +
+				"。跨域协作请通过 runtime.Mailbox 投递（DomainAgent 内部 API，Agent 不应直接调用），" +
+				"或在任务输出中声明『请把 X 发给 Y 领域』由 MetaAgent 转发。" +
+				"写 Go 源码绕过邮箱检测不会被编译，纯属浪费 token（塔防事故 Agent 写 send_interface.go）。"}
 	}
 
 	// 路径段空格校验：LLM 偶尔把 "docs/workspace" 错写成 "docs workspace"，
@@ -134,6 +165,151 @@ func (e *ToolExecutor) writeFile(ctx context.Context, args map[string]any) *Tool
 		result.TempDir = tempDir
 	}
 	return result
+}
+
+// detectFileHelperScript 检测 WriteFile 是否在写"读文件/列目录/搜索"类辅助脚本。
+// 命中条件：.py/.sh 文件 + 内容含 open(...).read() / os.listdir / grep / findstr 等模式。
+// 这类脚本完全可以用 ReadFile / ListDir / SearchInFiles 替代，写脚本纯属浪费。
+func detectFileHelperScript(path, content string) string {
+	if path == "" || content == "" {
+		return ""
+	}
+	lowerPath := strings.ToLower(path)
+	isScript := strings.HasSuffix(lowerPath, ".py") || strings.HasSuffix(lowerPath, ".sh")
+	if !isScript {
+		return ""
+	}
+	lower := strings.ToLower(content)
+	// Python: open(...).read() + 任意输出（print / sys.stdout.write / sys.stdout.buffer.write）
+	// 塔防 demo 事故 v2：Agent 用 sys.stdout.write 绕过只查 print 的检测，
+	// 写 _read_tail.py 反复读 game_core.js / game.js tail。补全所有输出方法。
+	if strings.HasSuffix(lowerPath, ".py") {
+		hasOpen := strings.Contains(lower, "open(") && (strings.Contains(lower, ".read(") || strings.Contains(lower, "readlines(") || strings.Contains(lower, "readline("))
+		// 任意输出方式：print / sys.stdout.write / sys.stdout.buffer.write / sys.stderr.write / write(
+		hasOutput := strings.Contains(lower, "print(") ||
+			strings.Contains(lower, "sys.stdout.write") ||
+			strings.Contains(lower, "sys.stdout.buffer.write") ||
+			strings.Contains(lower, "sys.stderr.write") ||
+			strings.Contains(lower, "sys.stdout.buffer.flush")
+		if hasOpen && hasOutput {
+			return "Python 脚本含 open(...).read() + 输出（读文件并打印，应直接用 ReadFile）"
+		}
+		if strings.Contains(lower, "os.listdir") && hasOutput {
+			return "Python 脚本含 os.listdir + 输出（列目录并打印，应直接用 ListDir）"
+		}
+		if strings.Contains(lower, "os.walk") && hasOutput {
+			return "Python 脚本含 os.walk + 输出（遍历目录并打印，应直接用 ListDir）"
+		}
+		if (strings.Contains(lower, "re.search") || strings.Contains(lower, "re.findall")) && hasOutput {
+			return "Python 脚本用正则搜索并输出（应直接用 SearchInFiles）"
+		}
+		// 逐行读取 + 输出（readlines / for line in f）
+		if (strings.Contains(lower, "for line in") || strings.Contains(lower, "readlines(")) && hasOutput {
+			return "Python 脚本逐行读文件并输出（应直接用 ReadFile）"
+		}
+	}
+	// Shell: cat / ls / grep + echo
+	if strings.HasSuffix(lowerPath, ".sh") {
+		if (strings.Contains(lower, "cat ") || strings.Contains(lower, "ls ") || strings.Contains(lower, "grep ")) && strings.Contains(lower, "echo ") {
+			return "Shell 脚本含 cat/ls/grep + echo（应直接用 ReadFile/ListDir/SearchInFiles）"
+		}
+	}
+	return ""
+}
+
+// detectMailboxGoProgram 检测 WriteFile 是否在写 Go 程序绕过邮箱投递。
+// 命中条件：.go 文件 + 内容含 runtime.Mailbox / mailbox.Send / runtime.NewMailbox 等模式。
+// Agent 不应直接调用 runtime.Mailbox（DomainAgent 内部 API），跨域协作走 MetaAgent 转发。
+// 参见塔防 demo 事故：Agent 写 send_interface.go 调 runtime.Mailbox.Send 绕过 JSON 检测。
+func detectMailboxGoProgram(path, content string) string {
+	if path == "" || content == "" {
+		return ""
+	}
+	lowerPath := strings.ToLower(path)
+	if !strings.HasSuffix(lowerPath, ".go") {
+		return ""
+	}
+	lower := strings.ToLower(content)
+	// 命中模式：Go 源码引用 runtime.Mailbox 或类似邮箱 API
+	hasMailboxRef := strings.Contains(lower, "runtime.mailbox") ||
+		strings.Contains(lower, "mailbox.send") ||
+		strings.Contains(lower, "mailbox.post") ||
+		strings.Contains(lower, "mailbox.publish") ||
+		strings.Contains(lower, "newmailbox(") ||
+		strings.Contains(lower, "runtime.new(")
+	if !hasMailboxRef {
+		return ""
+	}
+	// 进一步确认是程序性调用（含 import 或 func main 或 .Send( 调用）
+	hasProgramStructure := strings.Contains(lower, "package main") ||
+		strings.Contains(lower, "func main()") ||
+		strings.Contains(lower, ".send(") ||
+		strings.Contains(lower, ".post(") ||
+		strings.Contains(lower, ".publish(")
+	if !hasProgramStructure {
+		return ""
+	}
+	return "Go 源码引用 runtime.Mailbox 并含程序结构（package main / func main / .Send(）"
+}
+
+// rejectProtectedPath 拒绝 Agent 写到受保护的项目路径。
+// 禁止写：
+//   - 根 go.mod / go.work（污染 Go module 配置）
+//   - backend/ 源码树（Agent 不应改后端代码）
+//   - test/ 测试模块（同上）
+//   - cmd/ 顶层命令目录
+//   - config/ 配置目录（系统配置，非用户产物）
+//   - migrations/ 数据库迁移
+//   - .git/ / .github/ / .claude/ 等元数据目录
+//
+// 允许写：
+//   - workspace/ 子目录（用户产物）
+//   - workspace/ 下的任意子路径
+//
+// 塔防 demo 事故：Agent 在 backend/internal/tdcombat/ 写 Go 包、改根 go.work、
+// 在 workspace/ 建 go.mod，全错。
+func rejectProtectedPath(path string) error {
+	if path == "" {
+		return nil
+	}
+	cleaned := filepath.Clean(path)
+	cleaned = strings.ReplaceAll(cleaned, "\\", "/")
+	lower := strings.ToLower(cleaned)
+
+	// 检查路径是否落在项目根的关键目录内
+	segments := strings.Split(lower, "/")
+	protectedRoots := []string{"backend", "test", "cmd", "config", "migrations", ".git", ".github", ".claude", ".idea", ".vscode", "doc", "docs", "scripts", "docker"}
+	for i, seg := range segments {
+		// 仅跳过盘符（Windows 绝对路径首段如 "c:"）或空段（Unix 绝对路径前导 /）或 "."
+		// 相对路径首段（如 "backend/..."）不跳过，否则项目根受保护目录漏检
+		if i == 0 && (seg == "" || strings.HasSuffix(seg, ":") || seg == ".") {
+			continue
+		}
+		for _, root := range protectedRoots {
+			if seg == root {
+				// 允许 workspace/backend 等用户自建子目录，但禁止直接写项目根的 backend/
+				// 判断：如果该 protected 段是项目根的直接子目录（前面只有盘符或空或 .），拒绝
+				prev := ""
+				if i > 0 {
+					prev = segments[i-1]
+				}
+				if prev == "" || strings.HasSuffix(prev, ":") || prev == "." {
+					return fmt.Errorf("禁止写入受保护目录 %s/（项目源码树/配置/元数据）。Agent 只能写 workspace/ 子目录下的用户产物。如确需修改后端代码请由人工操作", root)
+				}
+			}
+		}
+	}
+
+	// 根 go.mod / go.work 拒绝
+	base := strings.ToLower(filepath.Base(cleaned))
+	if base == "go.mod" || base == "go.work" {
+		// 允许 workspace/go.mod（用户子项目），拒绝根
+		if !strings.Contains(lower, "workspace/") {
+			return fmt.Errorf("禁止写入根 %s（污染 Go module 配置）。如需 Go 子项目请放到 workspace/ 下", base)
+		}
+	}
+
+	return nil
 }
 
 // isMailboxFilePath 检测路径是否像 Agent 伪造的邮箱消息文件。

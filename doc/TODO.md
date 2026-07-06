@@ -246,20 +246,6 @@
 - 实现位置：`backend/internal/tui/helpers.go` 的 `eventChatItem`。
 - 实现方式：新增 `verboseTools` 集合；`tool_exec` / `tool_call` 分支中，仅 verbose 工具把 `ToolOutput` 拼入 detail。
 - 验证：新增 `backend/internal/tui/helpers_test.go`：`TestEventChatItemToolOutputCollapsed` 覆盖隐藏/保留两类工具与错误展示；`go test ./internal/tui/` 通过。
-
----
-
-## 待完成（按优先级分级）
-
-### P3 — 远期优化（依赖前置项）
-
-**P3-1. 记忆层简化**（依赖 P3-3 真实 embedding 接入后评测）
-- 现状：4级压缩 Raw→Standard→Compact→Marker 阈值难调，实际触发效果未评测。
-- 方案：先评测再定方案，不评测就简化=拍脑袋。
-- 评测指标：①触发频次 ②各级命中率 ③压缩后召回质量（人工评分） ④token 节省量。
-- 评测方法：跑 `test/coding/` + `test/api/` 全套，统计每级落库量。
-- 评测后再选：可能两级够（Raw 7天 + 摘要永久），也可能保留三级但去 Marker。
-
 **P3-2. 编程工具扩展 + 自定义工具 + Skill 装配**（原待完成 #2 扩展）✅ 本轮已完成（Git 工具）
 - 现状：`tool_executor.go` 原有 7 个基础工具。
 - 本轮实现：
@@ -318,6 +304,23 @@
   - `model.CallerToLayer(caller)` 导出，供 server 层复用。
   - `server.HandleSessionTokenMetrics` 在原有按 agent/model 聚合基础上，额外返回 `layer_stats`。
 - 验证：`go test ./internal/model/...` / `go test ./internal/server/...` 通过。
+
+
+---
+
+## 待完成（按优先级分级）
+
+### P3 — 远期优化（依赖前置项）
+
+**P3-1. 记忆层简化**（依赖 P3-3 真实 embedding 接入后评测）
+- 现状：4级压缩 Raw→Standard→Compact→Marker 阈值难调，实际触发效果未评测。
+- 方案：先评测再定方案，不评测就简化=拍脑袋。
+- 评测指标：①触发频次 ②各级命中率 ③压缩后召回质量（人工评分） ④token 节省量。
+- 评测方法：跑 `test/coding/` + `test/api/` 全套，统计每级落库量。
+- 评测后再选：可能两级够（Raw 7天 + 摘要永久），也可能保留三级但去 Marker。
+
+**P3-2. 加强测试流程，当前测试流程不足**
+- 加强测试流程，助手级Agent完成后，对自己的子任务需要进行单元测试，领域Agent完成后，需要派遣测试助手对完整模块进行全方面测试。抓跟他完成任务后需要测试完整度、是否完成任务，更徐亚哦测试各个模块间协同时的测试是否有问题，也使用测试助手进行测试。
 
 ---
 

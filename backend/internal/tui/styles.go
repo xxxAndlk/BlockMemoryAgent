@@ -26,6 +26,7 @@ const (
 	cStatusIdle = "#565F89"
 	cStatusWait = "#E0AF68"
 	cStatusErr  = "#F7768E"
+	cStatusDone = "#7AA2F7" // 完成态：蓝色，区别于 idle 灰
 )
 
 // Styles holds all lipgloss styles used by the TUI.
