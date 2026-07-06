@@ -182,31 +182,45 @@ func (m Model) renderRightPanels(w, h int) string {
 	if w < 20 {
 		w = 20
 	}
-	showPlan := m.hasPlan()
 
-	// 高度不足时优先展示有内容的面板；空会话也保留计划面板占位，
-	// 避免右侧面板整体消失。
-	if h < 12 {
-		if showPlan {
-			return m.renderPlanPanel(w, h)
-		}
-		return m.renderAgentsPanel(w, h)
-	}
-
-	// 高度足够时始终渲染计划 + Agent 两个面板，与参考设计保持一致。
+	// 右侧面板始终同时展示计划与 Agent 编排两个面板。
+	// 即使终端高度紧张，也优先保证两个面板都有可见区域（标题+至少一行内容），
+	// 避免计划栏被完全丢弃导致"内容没有显示"。
 	topH := h * 55 / 100
-	if topH < 6 {
-		topH = 6
+	if topH < 3 {
+		topH = 3
 	}
 	bottomH := h - topH
-	if bottomH < 6 {
-		bottomH = 6
+	if bottomH < 3 {
+		bottomH = 3
+	}
+	// 极小高度下两者之和可能超过 h，按 h 裁剪并确保计划面板至少 2 行。
+	if topH+bottomH > h {
+		if h >= 5 {
+			topH = h*55/100
+			if topH < 3 {
+				topH = 3
+			}
+			bottomH = h - topH
+			if bottomH < 2 {
+				bottomH = 2
+			}
+		} else {
+			topH = h/2 + h%2
+			bottomH = h / 2
+			if topH < 2 {
+				topH = 2
+			}
+			if bottomH < 2 {
+				bottomH = 2
+			}
+		}
 	}
 	return lipgloss.JoinVertical(lipgloss.Top, m.renderPlanPanel(w, topH), m.renderAgentsPanel(w, bottomH))
 }
 
 func (m Model) renderPlanPanel(w, h int) string {
-	titleLeft := "📝 执行计划"
+	titleLeft := "执行计划"
 	titleRight := "[P] 关闭"
 	titlePadding := w - lipgloss.Width(titleLeft) - lipgloss.Width(titleRight) - 2
 	if titlePadding < 1 {
@@ -219,20 +233,52 @@ func (m Model) renderPlanPanel(w, h int) string {
 		innerW = 10
 	}
 
-	var lines []string
 	s := m.selectedSession()
-	if s == nil || m.rt == nil || m.rt.Boards == nil {
-		lines = append(lines, "(no plan)")
-		body := strings.Join(lines, "\n")
-		return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w).Height(h-1).Render(body))
+	var snap board.Snapshot
+	if s != nil && m.rt != nil && m.rt.Boards != nil {
+		if b := m.rt.Boards.Get(s.ID); b != nil {
+			snap = b.Snapshot()
+		}
 	}
-	b := m.rt.Boards.Get(s.ID)
-	if b == nil {
-		lines = append(lines, "(no plan)")
-		body := strings.Join(lines, "\n")
-		return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w).Height(h-1).Render(body))
+
+	// 没有看板时（如 direct_tool），用会话目标生成一个最小计划视图，
+	// 避免右侧面板出现空白的 "(no plan)"。
+	if len(snap.Tasks) == 0 {
+		goal := ""
+		status := board.TaskDone
+		if s != nil {
+			goal = s.Goal
+			if goal == "" && len(s.Messages) > 0 {
+				for _, msg := range s.Messages {
+					if msg.Role == enums.ChatRoleUser {
+						goal = strings.TrimSpace(msg.Content)
+						break
+					}
+				}
+			}
+			switch s.Status {
+			case enums.SessionStatusRunning:
+				status = board.TaskInProgress
+			case enums.SessionStatusError:
+				status = board.TaskFailed
+			}
+		}
+		if goal == "" {
+			goal = "(no plan)"
+		}
+		snap = board.Snapshot{
+			Goal:  goal,
+			Tasks: []board.SubTask{{ID: "direct", Title: "直接执行", Status: status}},
+		}
 	}
-	snap := b.Snapshot()
+
+	lines := m.formatPlanSnapshot(innerW, snap)
+	body := strings.Join(lines, "\n")
+	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
+}
+
+// formatPlanSnapshot 把看板快照渲染成计划面板内的文本行。
+func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
 	done, total := 0, len(snap.Tasks)
 	current := -1
 	for i, t := range snap.Tasks {
@@ -247,6 +293,7 @@ func (m Model) renderPlanPanel(w, h int) string {
 		current = done
 	}
 
+	var lines []string
 	lines = append(lines, m.styles.Dim.Render("Goal: ")+truncate(snap.Goal, innerW-6))
 	pct := 0
 	if total > 0 {
@@ -296,13 +343,11 @@ func (m Model) renderPlanPanel(w, h int) string {
 		}
 		lines = append(lines, line)
 	}
-
-	body := strings.Join(lines, "\n")
-	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w).Height(h-1).Render(body))
+	return lines
 }
 
 func (m Model) renderAgentsPanel(w, h int) string {
-	titleLeft := "🧩 Agent 编排"
+	titleLeft := "Agent 编排"
 	titleRight := "[A] 关闭"
 	titlePadding := w - lipgloss.Width(titleLeft) - lipgloss.Width(titleRight) - 2
 	if titlePadding < 1 {
@@ -324,7 +369,8 @@ func (m Model) renderAgentsPanel(w, h int) string {
 			icon := statusIcon(string(node.status))
 			name := node.name
 			if node.goal != "" {
-				name += " " + m.styles.Dim.Render(truncate(node.goal, innerW-lipgloss.Width(prefix)-lipgloss.Width(name)-4))
+				goal := strings.ReplaceAll(node.goal, "\n", " ")
+				name += " " + m.styles.Dim.Render(truncate(goal, innerW-lipgloss.Width(prefix)-lipgloss.Width(name)-4))
 			}
 			line := fmt.Sprintf("%s%s %s", prefix, icon, name)
 			lines = append(lines, truncate(line, innerW))
@@ -332,7 +378,7 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	}
 
 	body := strings.Join(lines, "\n")
-	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w).Height(h-1).Render(body))
+	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
 }
 
 // collectChatItems 收集当前应展示的全部 chatItem，包含真实会话消息/事件，
@@ -522,6 +568,11 @@ func (m Model) renderPlanBar(w int) string {
 	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
 }
 
+// inputIsMultiline 判断当前输入是否包含换行（粘贴大段/多行内容）。
+func (m *Model) inputIsMultiline() bool {
+	return strings.ContainsRune(string(m.inputRunes), '\n')
+}
+
 func (m Model) renderInput(w int) string {
 	prompt := ">"
 	switch m.inputMode {
@@ -541,6 +592,10 @@ func (m Model) renderInput(w int) string {
 	var text string
 	if len(m.inputRunes) == 0 {
 		text = m.styles.InputHint.Render("Type your message... (Enter to send, / for commands)")
+	} else if m.inputIsMultiline() {
+		// 多行内容（粘贴或 Alt+Enter）在输入栏折叠为占位提示，避免大段文本挤占界面。
+		lines := strings.Count(string(m.inputRunes), "\n") + 1
+		text = m.styles.InputText.Render(fmt.Sprintf("[%d行内容]%s", lines, cursor))
 	} else {
 		text = string(m.inputRunes[:m.inputCursor]) + cursor + string(m.inputRunes[m.inputCursor:])
 	}
@@ -559,7 +614,8 @@ func (m Model) renderInput(w int) string {
 		border = m.styles.FocusBorder
 	}
 	content := lipgloss.JoinVertical(lipgloss.Left, left+" "+text+flash, "")
-	return border.Width(w).Height(3).Render(content)
+	// border 占 2 列，Width 设置的是内部宽度，因此请求 w-2 以保证总宽度为 w。
+	return border.Width(w - 2).Height(3).Render(content)
 }
 
 func (m Model) renderShortcutBar(w int) string {

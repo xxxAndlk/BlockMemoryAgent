@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/graph"
@@ -367,6 +368,99 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 	m.width = 70
 	if m.rightPanelVisible() {
 		t.Fatalf("宽度 70 时不应显示右侧面板")
+	}
+}
+
+// TestRightPanelLayoutDoesNotOverflow 验证：右侧面板同时展示计划与 Agent 编排，
+// 且整体视图宽度不超过终端宽度，避免 box-drawing 字符宽度计算错误导致溢位。
+func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
+	soulPath := filepath.Join(t.TempDir(), "soul.md")
+	if err := os.WriteFile(soulPath, []byte("test persona"), 0644); err != nil {
+		t.Fatalf("write soul: %v", err)
+	}
+
+	cfg := minimalRoleConfigForRender()
+	registry := graph.NewRoleRegistry(cfg)
+	factory := graph.NewRoleFactory(registry, nil, cfg)
+
+	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt.SetAgentConfig(&config.AgentConfig{
+		StallSteps:           30,
+		MaxRepeatFingerprint: 3,
+		SessionTimeoutMin:    60,
+	})
+
+	meta := &fakeMetaAgentForRender{summary: "收到，开始处理。"}
+	escalation := graph.NewEscalationHandlerNode()
+	sinker := &fakeSinkerForRender{}
+
+	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
+	builder.SetRuntime(rt)
+	builder.AddNode(meta)
+	builder.AddNode(escalation)
+	builder.AddNode(sinker)
+	g := builder.Build()
+
+	sessionMgr := server.NewSessionManager(g, registry)
+	session := sessionMgr.CreateSession(context.Background(), "x")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := sessionMgr.SnapshotSession(session.ID)
+		if snap != nil && snap.Status == enums.SessionStatusCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	m := &Model{
+		styles:     NewStyles(),
+		chatVP:     viewport.New(80, 20),
+		width:      120,
+		height:     40,
+		sessionMgr: sessionMgr,
+		registry:   registry,
+		httpAddr:   "http://127.0.0.1:1",
+		flashMu:    &sync.Mutex{},
+	}
+	m.chatVP.SetContent("")
+	m.refreshSessions()
+	if len(m.sessions) == 0 {
+		t.Fatal("expected at least one session after CreateSession")
+	}
+	m.selectSession(0)
+
+	view := m.View()
+	if !strings.Contains(view, "Agent 编排") {
+		t.Fatalf("视图中应出现 Agent 编排面板，got:\n%s", view)
+	}
+	if !strings.Contains(view, "执行计划") {
+		t.Fatalf("视图中应出现执行计划面板，got:\n%s", view)
+	}
+	if got := lipgloss.Width(view); got > m.width {
+		t.Fatalf("视图宽度 %d 超过终端宽度 %d，右侧栏可能溢出", got, m.width)
+	}
+}
+
+// TestRightPanelShowsBothPanelsEvenWhenShort 验证：即使终端高度较紧张，
+// 右侧计划栏与 Agent 编排栏也应同时出现，而不是计划栏被完全丢弃。
+func TestRightPanelShowsBothPanelsEvenWhenShort(t *testing.T) {
+	m := &Model{
+		styles:           NewStyles(),
+		chatVP:           viewport.New(80, 20),
+		width:            80,
+		height:           12,
+		rightPanelForced: 1,
+		flashMu:          &sync.Mutex{},
+	}
+	m.chatVP.SetContent("")
+
+	view := m.View()
+	if !strings.Contains(view, "Agent 编排") {
+		t.Fatalf("高度 12 时仍应显示 Agent 编排面板，got:\n%s", view)
+	}
+	if !strings.Contains(view, "执行计划") {
+		t.Fatalf("高度 12 时仍应显示执行计划面板，got:\n%s", view)
 	}
 }
 

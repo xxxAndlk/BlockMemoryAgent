@@ -17,6 +17,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-isatty"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
@@ -36,6 +37,10 @@ import (
 )
 
 func main() {
+	// 统一按窄字符计算等宽字体宽度，避免 Windows 终端下 box-drawing / CJK 字符
+	// 被 runewidth 误判为宽字符，导致 lipgloss 布局错位或右侧面板溢出问题。
+	runewidth.DefaultCondition.EastAsianWidth = false
+
 	configPath := flag.String("config", "config/config.yaml", "基础设施配置路径")
 	rolePath := flag.String("roles", "config/roles.yaml", "角色配置路径")
 	envPath := flag.String("env", ".env", "环境变量文件路径")

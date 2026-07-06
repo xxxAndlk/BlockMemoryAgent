@@ -31,15 +31,9 @@ func (m *Model) flashMsg(msg string) {
 }
 
 func (m *Model) hasPlan() bool {
-	s := m.selectedSession()
-	if s == nil || m.rt == nil || m.rt.Boards == nil {
-		return false
-	}
-	b := m.rt.Boards.Get(s.ID)
-	if b == nil {
-		return false
-	}
-	return len(b.Snapshot().Tasks) > 0
+	// 只要有激活会话就认为有计划可展示（包括 direct_tool 的合成计划），
+	// 避免计划弹窗在大多数会话里被禁用。
+	return m.selectedSession() != nil
 }
 
 // showChatDetail opens a popup with the full content of the selected chat item.
@@ -120,14 +114,44 @@ type chatItem struct {
 // buildPlanLines renders the current session's TaskBoard as flat lines for the popup.
 func (m *Model) buildPlanLines() []string {
 	s := m.selectedSession()
-	if s == nil || m.rt == nil || m.rt.Boards == nil {
-		return []string{"(no plan)"}
+	var snap board.Snapshot
+	if s != nil && m.rt != nil && m.rt.Boards != nil {
+		if b := m.rt.Boards.Get(s.ID); b != nil {
+			snap = b.Snapshot()
+		}
 	}
-	b := m.rt.Boards.Get(s.ID)
-	if b == nil {
-		return []string{"(no plan)"}
+
+	// 没有看板时（如 direct_tool），用会话目标生成最小计划视图，
+	// 避免弹窗只显示空白的 "(no plan)"。
+	if len(snap.Tasks) == 0 {
+		goal := ""
+		status := board.TaskDone
+		if s != nil {
+			goal = s.Goal
+			if goal == "" && len(s.Messages) > 0 {
+				for _, msg := range s.Messages {
+					if msg.Role == enums.ChatRoleUser {
+						goal = strings.TrimSpace(msg.Content)
+						break
+					}
+				}
+			}
+			switch s.Status {
+			case enums.SessionStatusRunning:
+				status = board.TaskInProgress
+			case enums.SessionStatusError:
+				status = board.TaskFailed
+			}
+		}
+		if goal == "" {
+			goal = "(no plan)"
+		}
+		snap = board.Snapshot{
+			Goal:  goal,
+			Tasks: []board.SubTask{{ID: "direct", Title: "直接执行", Status: status}},
+		}
 	}
-	snap := b.Snapshot()
+
 	done, total := 0, len(snap.Tasks)
 	for _, t := range snap.Tasks {
 		if t.Status == board.TaskDone {
@@ -145,9 +169,6 @@ func (m *Model) buildPlanLines() []string {
 			marker = "▸"
 		}
 		lines = append(lines, fmt.Sprintf("%s %s  %s", marker, statusIcon(string(t.Status)), t.Title))
-	}
-	if total == 0 {
-		lines = append(lines, m.styles.Dim.Render("(empty)"))
 	}
 	return lines
 }

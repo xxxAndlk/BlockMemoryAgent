@@ -15,7 +15,15 @@ import (
 	"github.com/blockmemory/agent/backend/internal/server"
 )
 
+// pasteEnterThreshold 用于区分终端粘贴产生的连续 Enter 与手动回车。
+// 连续两次按键间隔小于该阈值时，Enter 被当作多行粘贴的一部分，插入换行而非提交。
+const pasteEnterThreshold = 80 * time.Millisecond
+
 func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	now := time.Now()
+	// 记录按键时间，用于区分终端粘贴产生的快速连续 Enter 与手动回车。
+	defer func() { m.lastKeyTime = now }()
+
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.focus = panelChat
@@ -26,10 +34,14 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEnter:
-		// Alt+Enter 插入换行；普通 Enter 提交。
-		// 注：bubbletea v1.3.10 的 KeyMsg 仅有 Alt 修饰位（无 Shift），
-		// 故用 Alt+Enter 作为多行换行键。
-		if msg.Alt {
+		// Alt+Enter 或粘贴产生的 Enter 都作为换行插入，普通 Enter 才提交。
+		// 很多终端（尤其是 Windows）粘贴多行时不会给每个 KeyEnter 打 Paste 标记，
+		// 因此用时间间隔做兜底：连续快速到达的 Enter 视为粘贴的一部分。
+		isPasteEnter := msg.Alt || msg.Paste
+		if !isPasteEnter && !m.lastKeyTime.IsZero() && now.Sub(m.lastKeyTime) < pasteEnterThreshold {
+			isPasteEnter = true
+		}
+		if isPasteEnter {
 			m.inputRunes = append(m.inputRunes[:m.inputCursor], append([]rune{'\n'}, m.inputRunes[m.inputCursor:]...)...)
 			m.inputCursor++
 			return m, nil
@@ -87,14 +99,21 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyBackspace:
-		if m.inputCursor > 0 {
+		if m.inputIsMultiline() {
+			// 多行内容一次性清空，避免逐字符删除长文本。
+			m.inputRunes = nil
+			m.inputCursor = 0
+		} else if m.inputCursor > 0 {
 			m.inputRunes = append(m.inputRunes[:m.inputCursor-1], m.inputRunes[m.inputCursor:]...)
 			m.inputCursor--
 		}
 		return m, nil
 
 	case tea.KeyDelete:
-		if m.inputCursor < len(m.inputRunes) {
+		if m.inputIsMultiline() {
+			m.inputRunes = nil
+			m.inputCursor = 0
+		} else if m.inputCursor < len(m.inputRunes) {
 			m.inputRunes = append(m.inputRunes[:m.inputCursor], m.inputRunes[m.inputCursor+1:]...)
 		}
 		return m, nil
@@ -145,19 +164,20 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 //
 // 未选中会话时，纯文本输入自动作为新会话的 goal。
 func (m *Model) submitInput(cmd string) {
-	cmd = strings.TrimSpace(cmd)
-	if cmd == "" {
+	if strings.TrimSpace(cmd) == "" {
 		return
 	}
 
-	parts := strings.Fields(cmd)
+	// 命令解析用去空白版本；消息发送保留原始内容，避免多行粘贴时首行缩进被吞。
+	trimmed := strings.TrimSpace(cmd)
+	parts := strings.Fields(trimmed)
 	if len(parts) == 0 {
 		return
 	}
 
 	// /new <goal...> works without a selected session.
 	if parts[0] == "/new" && len(parts) > 1 {
-		goal := strings.TrimSpace(strings.TrimPrefix(cmd, "/new "))
+		goal := strings.TrimSpace(strings.TrimPrefix(trimmed, "/new "))
 		m.createSession(goal)
 		return
 	}
@@ -208,7 +228,7 @@ func (m *Model) submitInput(cmd string) {
 			return
 		}
 		name := parts[1]
-		goal := strings.TrimSpace(strings.TrimPrefix(cmd, "/topic "+name))
+		goal := strings.TrimSpace(strings.TrimPrefix(trimmed, "/topic "+name))
 		m.postJSON(fmt.Sprintf("/api/sessions/%s/topic", s.ID), map[string]string{"name": name, "goal": goal})
 		m.flashMsg("switching topic: " + name)
 		return
@@ -223,7 +243,7 @@ func (m *Model) submitInput(cmd string) {
 			m.flashMsg("usage: /memory <query>")
 			return
 		}
-		query := strings.TrimSpace(strings.TrimPrefix(cmd, "/memory "))
+		query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/memory "))
 		m.postJSON("/api/memory/search", map[string]string{"query": query})
 		m.flashMsg("memory search: " + query)
 		return
@@ -233,7 +253,7 @@ func (m *Model) submitInput(cmd string) {
 	if parts[0] == "/clarify" && len(parts) >= 3 {
 		id := parts[1]
 		// 用 TrimPrefix 而非 Fields 拼接 answer，保留 answer 内的空格
-		answer := strings.TrimSpace(strings.TrimPrefix(cmd, "/clarify "+id))
+		answer := strings.TrimSpace(strings.TrimPrefix(trimmed, "/clarify "+id))
 		m.postJSON(fmt.Sprintf("/api/sessions/%s/clarify", s.ID), map[string]string{"question_id": id, "answer": answer})
 		return
 	}
@@ -247,7 +267,7 @@ func (m *Model) submitInput(cmd string) {
 
 	// /interrupt <goal...>
 	if parts[0] == "/interrupt" && len(parts) > 1 {
-		content := strings.TrimSpace(strings.TrimPrefix(cmd, "/interrupt "))
+		content := strings.TrimSpace(strings.TrimPrefix(trimmed, "/interrupt "))
 		m.postJSON(fmt.Sprintf("/api/sessions/%s/interrupt", s.ID), map[string]string{"content": content})
 		m.flashMsg("interrupted")
 		return
@@ -255,7 +275,7 @@ func (m *Model) submitInput(cmd string) {
 
 	// /enqueue <text...>
 	if parts[0] == "/enqueue" && len(parts) > 1 {
-		content := strings.TrimSpace(strings.TrimPrefix(cmd, "/enqueue "))
+		content := strings.TrimSpace(strings.TrimPrefix(trimmed, "/enqueue "))
 		m.postJSON(fmt.Sprintf("/api/sessions/%s/enqueue", s.ID), map[string]string{"content": content})
 		return
 	}
@@ -269,7 +289,7 @@ func (m *Model) submitInput(cmd string) {
 	// /dag new <json...>
 	if len(parts) >= 3 && parts[0] == "/dag" && parts[1] == "new" {
 		var d dag.DAG
-		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(cmd, "/dag new "))), &d); err != nil {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(trimmed, "/dag new "))), &d); err != nil {
 			m.flashMsg("invalid dag json: " + err.Error())
 			return
 		}
@@ -277,7 +297,7 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
-	// default: message
+	// default: message（保留原始多行内容，包括缩进与换行）
 	m.postJSON(fmt.Sprintf("/api/sessions/%s/message", s.ID), map[string]string{"content": cmd})
 }
 

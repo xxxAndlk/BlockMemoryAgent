@@ -76,6 +76,7 @@ type Model struct {
 	inputCursor  int
 	inputHistory map[string][]string // sessionID -> 历史输入
 	inputHistIdx int
+	lastKeyTime  time.Time           // 上次按键时间，用于区分快速粘贴与手动回车
 
 	// overlay
 	overlayTitle  string
@@ -248,12 +249,24 @@ func (m *Model) rebuildAgents() {
 	case "awaiting_clarify":
 		metaStatus = enums.RoleStatusWaiting
 	}
+	metaGoal := ""
+	if s.Goal != "" {
+		metaGoal = s.Goal
+	} else if len(s.Messages) > 0 {
+		for _, msg := range s.Messages {
+			if msg.Role == enums.ChatRoleUser {
+				metaGoal = strings.TrimSpace(msg.Content)
+				break
+			}
+		}
+	}
 	m.agentsNodes = append(m.agentsNodes, agentTreeNode{
 		depth:    0,
 		instID:   "MetaAgent",
 		name:     "MetaAgent",
 		roleType: enums.RoleTypeMeta,
 		status:   metaStatus,
+		goal:     metaGoal,
 	})
 
 	insts := m.registry.GetInstancesBySession(s.ID)

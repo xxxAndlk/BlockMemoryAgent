@@ -9,10 +9,10 @@
 # Layer 1: 主Agent (MetaAgent)
 meta_agent:
   model_config:
-    provider: openai
-    model: deepseek-v4-pro
-    api_key: ${OPENAI_API_KEY}
-    base_url: ${OPENAI_BASE_URL}
+    provider: anthropic
+    model: glm-5.2
+    api_key: ${ANTHROPIC_API_KEY_TWO}
+    base_url: ${ANTHROPIC_BASE_URL_TWO}
     temperature: 0.3
     max_tokens: 2048
   system_prompt: |
@@ -23,8 +23,8 @@ meta_agent:
     4. 处理跨领域协作请求
     5. 定期生成会话总结
     6. 所有领域完成后，汇总结果并结束会话
-  max_blocks: 10
-  summary_interval: 5
+  max_blocks: 20
+  summary_interval: 10
 
 # Layer 2: 领域Agent配置（所有DomainAgent共用同一模型）
 domain_agent:
