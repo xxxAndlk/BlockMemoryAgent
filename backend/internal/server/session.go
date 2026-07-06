@@ -1737,10 +1737,10 @@ func (m *SessionManager) reviveFromHistory(id string) *Session {
 // 否则 MetaAgent 会把整段历史当成新目标，容易误判任务边界、重复拆分领域。
 // 调轻量模型把历史压缩为"用户当前想做什么"的一句话目标，让续话路径与新建会话一致。
 //
-// 参数：
 //   - ctx: 上下文（含超时）
 //   - sessionID: 会话 ID（仅用于日志与错误定位）
 //   - history: 历史消息拼接文本（role: content 形式）
+//   - priorSummary: 上次会话的摘要（session.Result），用于保留工作区路径等关键上下文
 //
 // 返回：
 //   - string: 总结后的目标
@@ -1748,24 +1748,36 @@ func (m *SessionManager) reviveFromHistory(id string) *Session {
 //
 // 容错策略：模型调用是续话的前置依赖，失败即系统级问题，不回退 raw history。
 // 空历史直接返回空串不算错误（无需总结）。
-func (m *SessionManager) summarizeHistoryForGoal(ctx context.Context, sessionID, history string) (string, error) {
+func (m *SessionManager) summarizeHistoryForGoal(ctx context.Context, sessionID, history, priorSummary string) (string, error) {
 	if strings.TrimSpace(history) == "" {
 		return "", nil // 空历史无需总结，非错误
 	}
 	if m.modelFactory == nil {
 		return "", fmt.Errorf("modelFactory not injected: lightweight model unavailable for session %s", sessionID)
 	}
-	prompt := fmt.Sprintf(`你是会话续接助手。请基于以下历史对话，提炼出用户当前想要完成的核心目标。
+	prompt := fmt.Sprintf(`你是会话续接助手。请基于以下历史对话与上次会话摘要，提炼出用户当前想要完成的核心目标。
 要求：
 1. 用一句话（不超过 200 字）描述目标
-2. 保留关键上下文（涉及的文件/领域/已尝试的方案）
-3. 不要复述历史，只输出目标本身
-4. 不要加任何前缀或解释
+2. 保留关键上下文，特别是以下信息必须原样保留，禁止改写或省略：
+   - 文件路径（如 workspace/tower_defense/index.html、backend/internal/...）
+   - 目录路径与工作区位置
+   - 领域名 / 模块名 / 配置项名
+   - 已尝试的方案与结论
+3. 区分"用户的新目标"与"用户对上次任务的追问"：
+   - 若用户在追问/确认上次产物（如"index.html 在哪""如何打开""路径是什么"），
+     目标应表述为"基于上次任务（工作区: <路径>）回答用户追问: <追问内容>"，
+     禁止把追问本身转成新目标（如"打开 index.html"是错误目标）
+   - 若用户提出新需求，直接描述新需求并保留相关历史路径
+4. 不要复述历史，只输出目标本身
+5. 不要加任何前缀或解释
 
-历史对话：
+上次会话摘要:
 %s
 
-用户当前目标：`, history)
+历史对话:
+%s
+
+用户当前目标：`, priorSummary, history)
 	// 轻量模型总结独立超时 120 秒（P0-1：3 次重试 × 30s，避免阻塞续话主流程）
 	summaryCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
@@ -1820,7 +1832,7 @@ func (m *SessionManager) resumeSession(session *Session) {
 	// 模型调用失败视为系统级故障，中止续话并将会话置为 error
 	m.addEvent(session, "llm", "LightweightModel",
 		fmt.Sprintf("续话：调用轻量模型总结历史对话 (%d 字符)", history.Len()), "", "", "", "", "", false)
-	goal, err := m.summarizeHistoryForGoal(ctx, session.ID, history.String())
+	goal, err := m.summarizeHistoryForGoal(ctx, session.ID, history.String(), session.Result)
 	if err != nil {
 		m.mu.Lock()
 		session.Status = enums.SessionStatusError

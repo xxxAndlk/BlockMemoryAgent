@@ -35,3 +35,7 @@ blockmemory-agent.exe
 /backend/tui
 /backend/tui.exe
 go.work.sum
+/workspace
+/.bma
+/test
+/.claude

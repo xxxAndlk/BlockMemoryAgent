@@ -1,13 +1,28 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
+
+// sanitizeUTF8 清洗字符串中的非法 UTF8 字节序列。
+// Postgres 拒绝 0xe7 0xbb 0x2e 这类不完整的多字节序列（错误码 22021），
+// 用 strings.ToValidUTF8 把非法字节替换为 U+FFFD。
+func sanitizeUTF8(s string) string {
+	if s == "" {
+		return s
+	}
+	if strings.ToValidUTF8(s, "") == s {
+		return s
+	}
+	return strings.ToValidUTF8(s, "�")
+}
 
 // SessionLogRecord 单条结构化会话日志。
 type SessionLogRecord struct {
@@ -49,10 +64,19 @@ func (s *PostgresStore) SaveSessionLog(ctx context.Context, rec *SessionLogRecor
 	if rec == nil {
 		return fmt.Errorf("nil session log record")
 	}
+	rec.SessionID = sanitizeUTF8(rec.SessionID)
+	rec.Agent = sanitizeUTF8(rec.Agent)
+	rec.Level = sanitizeUTF8(rec.Level)
+	rec.Phase = sanitizeUTF8(rec.Phase)
+	rec.Message = sanitizeUTF8(rec.Message)
+	rec.Prompt = sanitizeUTF8(rec.Prompt)
+	rec.Response = sanitizeUTF8(rec.Response)
+	rec.Model = sanitizeUTF8(rec.Model)
 	metaRaw, err := json.Marshal(rec.Meta)
 	if err != nil {
 		return fmt.Errorf("marshal meta: %w", err)
 	}
+	metaRaw = bytes.ToValidUTF8(metaRaw, []byte("�"))
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO session_logs (
 			session_id, agent, level, phase, message,

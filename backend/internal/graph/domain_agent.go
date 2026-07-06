@@ -10,6 +10,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
+	"github.com/blockmemory/agent/backend/internal/watchdog"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -36,6 +37,7 @@ type DomainAgentNode struct {
 	progress       ProgressCallback      // 进度回调（推思考/意图/Token）
 	blockMemory    BlockMemoryStore      // 块记忆存储（特性3：向量检索归档）
 	recalledMemory string                // 本次 Invoke 检索到的相似块记忆文本（注入 analyzeTasks）
+	recallAttempted bool                 // 是否已尝试检索块记忆（无论命中与否）；用于 analyzeTasks 区分"未检索"与"检索未命中"
 	memCallback    MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
 	snapshotMgr    AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
 	snapshot       *types.AgentSnapshot  // 本次 Invoke 加载到的快照
@@ -243,6 +245,12 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	n.emit(ctx, "think", fmt.Sprintf("DomainAgent 启动，领域目标: %s", state.DomainGoal))
 	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusActive)
 
+	// 2.1 DomainAgent 侧 Watchdog：用真实 LLM token 总量评估上下文规模。
+	// MetaAgent 的 runWatchdog 只看 block.TaskResults 文本，严重低估实际上下文
+	// （塔防 demo 事故中从未触发压缩）。DomainAgent 持有自己的 llmTracker，
+	// TokenTotals() = 累计 input+output，是真实上下文消耗的代理。
+	n.runDomainWatchdog(ctx, state)
+
 	// 2.5 记忆回调：广播 DomainAgent 进入 ACTIVE，并尝试加载历史快照
 	if n.memCallback != nil {
 		n.memCallback.OnStart(ctx, n.instID, state.SessionID)
@@ -274,7 +282,9 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	// 用 DomainGoal 做查询，取 topK=3；命中结果在 analyzeTasks prompt 里拼成"参考段"
 	// 让 LLM 知晓过往类似领域已做过的任务，避免重复劳动或漏掉关键步骤
 	n.recalledMemory = ""
+	n.recallAttempted = false
 	if n.blockMemory != nil {
+		n.recallAttempted = true
 		if recalled, err := n.blockMemory.SearchBlockMemory(ctx, state.CurrentDomain, state.DomainGoal, 3); err == nil && recalled != "" {
 			n.recalledMemory = recalled
 			n.emit(ctx, "think", "已检索到历史相似块记忆，将作为上下文注入任务拆解")
@@ -418,6 +428,63 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	state.NextAction = enums.ActionContinue                         // 交回 MetaAgent
 	n.finish(ctx, state)
 	return state, nil
+}
+
+// runDomainWatchdog DomainAgent 侧上下文看门狗：用真实 LLM token 总量评估。
+//
+// 职责：
+//   - 取本 DomainAgent 的 llmTracker.TokenTotals() 作为上下文规模代理
+//   - 调 runtime.Watchdog.Check 评估等级
+//   - LevelCompress：推送压缩提示事件 + 写日志，提示 MetaAgent 后续可压缩
+//   - LevelEvict：emit 警告 + 写日志；不强制中断（避免破坏写文件等关键动作）
+//
+// 与 MetaAgent.runWatchdog 的区别：
+//   - MetaAgent.runWatchdog 用 block.TaskResults 文本估算，严重低估（塔防事故从未触发）
+//   - DomainAgent.runDomainWatchdog 用真实 LLM token 累计值，准确反映上下文消耗
+//
+// 设计意图：弥补原 Watchdog 仅在 MetaAgent 侧、且用文本估算的两大缺陷。
+func (n *DomainAgentNode) runDomainWatchdog(ctx context.Context, state *types.ThreeLayerState) {
+	if n.rt == nil || n.rt.Watchdog == nil || n.llmTracker == nil {
+		return
+	}
+	inputTokens, outputTokens := n.llmTracker.TokenTotals()
+	totalTokens := inputTokens + outputTokens
+	if totalTokens <= 0 {
+		return // 还没调过 LLM，跳过
+	}
+	// 用真实 token 数构造上下文文本喂给 Watchdog.Check。
+	// Check 内部用 Estimator(bytes/4+1) 估算，会低估真实 token；直接拼一个
+	// 长度为 totalTokens*4 的占位串让 Estimator 输出 ≈ totalTokens，保证等级判定准确。
+	placeholder := make([]byte, totalTokens*4)
+	d := n.rt.Watchdog.Check(n.instID, string(placeholder))
+	switch d.Level {
+	case watchdog.LevelCompress:
+		n.emit(ctx, "think",
+			fmt.Sprintf("Watchdog(COMPRESS): DomainAgent %s token=%d (in=%d,out=%d) ≥ soft=%d，建议压缩: %s",
+				n.instID, totalTokens, inputTokens, outputTokens, d.Tokens, d.Reason))
+		if log := n.sessionLogger(ctx); log != nil {
+			log.Event(ctx, "watchdog_compress", fmt.Sprintf("domain=%s tokens=%d soft=%d", state.CurrentDomain, totalTokens, d.Tokens), map[string]any{
+				"agent":         n.instID,
+				"domain":        state.CurrentDomain,
+				"tokens":        totalTokens,
+				"input_tokens":  inputTokens,
+				"output_tokens": outputTokens,
+				"soft_limit":    d.Tokens,
+			})
+		}
+	case watchdog.LevelEvict:
+		n.emit(ctx, "wait",
+			fmt.Sprintf("Watchdog(EVICT): DomainAgent %s token=%d ≥ hard=%d，已转警告: %s",
+				n.instID, totalTokens, d.Tokens, d.Reason))
+		if log := n.sessionLogger(ctx); log != nil {
+			log.Event(ctx, "watchdog_evict", fmt.Sprintf("domain=%s tokens=%d hard=%d", state.CurrentDomain, totalTokens, d.Tokens), map[string]any{
+				"agent":         n.instID,
+				"domain":        state.CurrentDomain,
+				"tokens":        totalTokens,
+				"hard_limit":    d.Tokens,
+			})
+		}
+	}
 }
 
 // finish 在 DomainAgent 成功结束前触发记忆回调。

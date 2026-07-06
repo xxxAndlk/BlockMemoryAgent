@@ -39,9 +39,13 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 		n.emit(ctx, "llm", "调用 LLM 拆解子任务...")
 		// 构造拆解 prompt：强调"可直接用工具执行"，禁止纯思考类子任务
 		// 若本次 Invoke 检索到历史相似块记忆，作为参考段注入（特性3）
+		// 若 blockMemory 可用但未召回任何记忆，强制注入 NO_PRIOR_RECALL 标记，
+		// 防止 LLM 幻觉出"上次会话讨论过 X"并编造决策文件（参见塔防 demo 事故）。
 		memorySection := ""
 		if n.recalledMemory != "" {
 			memorySection = fmt.Sprintf("\n相关历史块记忆（参考，避免重复劳动）:\n%s\n", n.recalledMemory)
+		} else if n.recallAttempted && n.blockMemory != nil {
+			memorySection = "\n[NO_PRIOR_RECALL] 块记忆检索未命中任何历史决策。\n禁止编造\"上次会话/上次讨论过 X\"类内容；如需建立新决策，直接落地并在 Facts 标注 first_session=true。\n禁止用 WriteFile 创建\"决策记录.md\"等文件伪造历史。\n\n"
 		}
 		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个任务分析专家。请将以下目标拆解为2-4个独立可执行的子任务。
 
@@ -51,9 +55,10 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 %s
 
 要求:
+- 至少拆出 2 个子任务，禁止只返回 1 个；若目标本身已是单步动作（如"读文件 X"），仍须补充"验证/运行/读取依赖"等配套子任务
 - 每个子任务必须是一个可直接用工具执行的动作（如"用 WriteFile 写 X 文件"、"用 RunCommand 运行 Y"、"用 HTTPGet 抓取 Z"）
 - 严禁出现"分析/确定/规划/设计/思考/研究/需求/方案"等纯思考类子任务，这类工作应在执行动作中一并完成
-- 涉及创建文件的目标，必须有子任务明确写出文件路径与内容来源
+- 涉及创建文件的目标，必须有子任务明确写出文件路径与内容来源；多文件交付目标（如游戏 demo 含 index.html+game.js+config.json+tests）必须每个文件一个子任务
 - 子任务之间可以有依赖但应尽量并行
 - 只输出子任务列表，每行一个，不要编号，不要其他内容
 - 任务匹配工具，不要"为了用工具而用工具"：
@@ -70,18 +75,26 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 设计方案
 编写代码
 用 WriteFile 写一个 Python 脚本去搜索新闻（应该直接用 HTTPGet）
+（仅返回 1 个子任务也是禁止的）
 
 子任务:`, goal, memorySection, fmtEnvSection()))
 		if !timedOut && err == nil && resp != "" {
 			// 解析响应为任务列表
 			if tasks := parseTaskListFromResp(resp); len(tasks) > 0 {
+				// 强制最少 2 子任务：LLM 只返回 1 个时回退到规则拆解，
+				// 避免 DomainAgent 把整个领域压成单 Assistant（参见塔防 demo 事故：
+				// 战斗领域只派 1 个 Assistant，射击/AI/弹道/buff/波次全塞一个 prompt）。
+				if len(tasks) < 2 && !state.DirectExecute {
+					n.emit(ctx, "think", fmt.Sprintf("LLM 仅拆出 %d 个子任务，不足 2 个，回退到规则拆解", len(tasks)))
+					return n.analyzeTasksByRules(goal)
+				}
 				n.emit(ctx, "think", fmt.Sprintf("LLM 拆解出 %d 个子任务", len(tasks)))
 				return tasks // 返回 LLM 拆解的任务
 			}
 			// LLM 返回的尽是思考类任务，过滤后为空 → 把整个 goal 作为单任务，
 			// 让一个 assistant 用 ReAct 循环完整执行（写文件+运行+验证）。
 			n.emit(ctx, "think", "LLM 拆解均为思考类任务，回退为单任务整体执行")
-			return []string{goal} // 回退为单任务
+			return n.analyzeTasksByRules(goal) // 改用规则拆解，避免单任务退化
 		}
 		// 超时或失败：推送事件并回退规则
 		if timedOut {
@@ -160,6 +173,12 @@ func (n *DomainAgentNode) analyzeTasksByRules(goal string) []string {
 		tasks = append(tasks, "用 ReadFile 读取相关文件定位问题代码")
 		tasks = append(tasks, "用 WriteFile 修改问题代码完成修复")
 		tasks = append(tasks, "用 RunCommand 运行测试或验证命令确认修复生效")
+	} else if strings.Contains(goal, "游戏") || strings.Contains(goal, "demo") || strings.Contains(goal, "Demo") {
+		// 游戏/演示类目标：按交付物拆分，避免单 Assistant 包揽全部
+		tasks = append(tasks, "用 ListDir 查看工作目录结构确定输出路径")
+		tasks = append(tasks, "用 WriteFile 创建入口文件（如 index.html）")
+		tasks = append(tasks, "用 WriteFile 创建核心逻辑文件（如 game.js 或对应模块）")
+		tasks = append(tasks, "用 RunCommand 运行语法检查或测试验证可加载")
 	} else if strings.Contains(goal, "实现") || strings.Contains(goal, "开发") || strings.Contains(goal, "编写") {
 		tasks = append(tasks, "用 ReadFile 查看现有代码/目录结构确定实现位置")
 		tasks = append(tasks, "用 WriteFile 创建或修改文件实现目标功能")

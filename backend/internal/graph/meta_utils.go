@@ -109,6 +109,17 @@ func (n *MetaAgentNode) loadMessagesSection(state *types.ThreeLayerState) string
 // 把结果写入 SessionSummary 并置 ActionFinish。若找不到 meta 角色定义则回退到 RouteDirectAssistant。
 func (n *MetaAgentNode) executeDirectTool(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	task := state.DomainGoal
+	// 文件/路径存在性问题强制工具验证：
+	// 塔防 demo 事故中，用户问"index.html 在哪"，LLM 走 direct_tool 路径直接生成
+	// 文本回答，从未真正 ListDir/ReadFile，导致编造"位于项目根目录"。
+	// 此处检测文件名/路径模式，命中则在 task 前拼接强制工具验证指令。
+	if needsFileVerification(task) {
+		task = "[强制工具验证] 此问题涉及文件/路径存在性。回答前必须先调用 ListDir 列出工作目录与可疑子目录,"
+		task += "再对候选路径调用 ReadFile 验证存在性。"
+		task += "若工具未返回该文件，必须明确回复『未找到』，禁止凭推断/记忆编造路径。"
+		task += "\n\n原始问题: " + state.DomainGoal
+		n.emit(ctx, "intend", "检测到文件存在性问题，强制工具验证: "+state.DomainGoal)
+	}
 	n.emit(ctx, "intend", "直接执行工具: "+task)
 
 	// 获取 MetaAgent 自身角色定义
@@ -118,6 +129,49 @@ func (n *MetaAgentNode) executeDirectTool(ctx context.Context, state *types.Thre
 		return n.executeDirectAssistant(ctx, state)
 	}
 	return n.executeDirect(ctx, state, def, task)
+}
+
+// needsFileVerification 判断目标是否涉及文件/路径存在性问题。
+// 命中模式：含"在哪/哪里/在哪找/在哪看/路径/位置" + 文件名特征（含 . 后缀 / 含 / 或 \）。
+// 用于阻止 LLM 在 direct_tool 路径上凭记忆编造文件路径。
+func needsFileVerification(goal string) bool {
+	if goal == "" {
+		return false
+	}
+	gl := strings.ToLower(goal)
+	// 存在性/定位类关键词
+	locPatterns := []string{"在哪", "哪里", "在哪找", "在哪看", "位置", "路径", "存在", "找不到", "没找到", "存不存在", "absolute", "where is", "locate"}
+	hitLoc := false
+	for _, p := range locPatterns {
+		if strings.Contains(gl, p) {
+			hitLoc = true
+			break
+		}
+	}
+	if !hitLoc {
+		return false
+	}
+	// 文件名特征：含 . 后缀（.html/.js/.go 等）或路径分隔符
+	if strings.ContainsAny(gl, "/\\") {
+		return true
+	}
+	// 检测 .ext 模式（2-5 字母后缀）
+	dotIdx := strings.IndexByte(gl, '.')
+	if dotIdx >= 0 && dotIdx < len(gl)-1 {
+		rest := gl[dotIdx+1:]
+		cnt := 0
+		for _, r := range rest {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				cnt++
+			} else {
+				break
+			}
+		}
+		if cnt >= 2 && cnt <= 5 {
+			return true
+		}
+	}
+	return false
 }
 
 // executeDirect MetaAgent 直接执行任务（RouteDirectTool / RouteDirectAssistant 公共执行入口）。

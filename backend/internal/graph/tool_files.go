@@ -65,9 +65,27 @@ func (e *ToolExecutor) writeFile(ctx context.Context, args map[string]any) *Tool
 	path, _ := args["path"].(string)
 	content, _ := args["content"].(string)
 	temporary, _ := args["temporary"].(bool)
+	allowSpaces, _ := args["allow_spaces"].(bool)
 
 	if path == "" {
 		return &ToolResult{Tool: "WriteFile", Error: "path is required"}
+	}
+
+	// 邮箱文件化拦截：Agent 偶尔把跨域邮箱当成 JSON 文件写到 workspace/.../mailbox/
+	// 目录（参见塔防 demo 事故）。系统内置 runtime.Mailbox 投递，禁止用 WriteFile
+	// 伪造邮箱消息。命中模式：路径段含 "mailbox" + 文件名 to-*/from-*/msg-*.json。
+	if isMailboxFilePath(path) {
+		return &ToolResult{Tool: "WriteFile", Path: path,
+			Error: "禁止用 WriteFile 写邮箱消息文件。跨域协作请通过 runtime.Mailbox 投递（DomainAgent 内部 API），或在任务输出中声明『请把 X 发给 Y 领域』由 MetaAgent 转发。直接写 mailbox/*.json 不会被下游领域消费。"}
+	}
+
+	// 路径段空格校验：LLM 偶尔把 "docs/workspace" 错写成 "docs workspace"，
+	// 导致创建带空格的错误目录。拒绝此类路径，强制 LLM 用 / 或 \ 分隔。
+	// allow_spaces=true 时放行（罕见场景，如文件名确需含空格）。
+	if !allowSpaces {
+		if err := validateNoSpacesInSegments(path); err != nil {
+			return &ToolResult{Tool: "WriteFile", Path: path, Error: err.Error()}
+		}
 	}
 
 	// 解析为绝对路径；临时文件写入会话级临时目录，防止污染工作目录
@@ -116,6 +134,65 @@ func (e *ToolExecutor) writeFile(ctx context.Context, args map[string]any) *Tool
 		result.TempDir = tempDir
 	}
 	return result
+}
+
+// isMailboxFilePath 检测路径是否像 Agent 伪造的邮箱消息文件。
+// 命中条件：路径中含 "mailbox" 段 + 文件名以 to-/from-/msg-/mailbox 开头且 .json 结尾。
+// 这类文件不会被系统消费，应通过 runtime.Mailbox.Send 投递。
+func isMailboxFilePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	lower := strings.ToLower(path)
+	if !strings.Contains(lower, "mailbox") {
+		return false
+	}
+	// 提取 basename
+	base := path
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' || path[i] == '\\' {
+			base = path[i+1:]
+			break
+		}
+	}
+	baseLower := strings.ToLower(base)
+	if !strings.HasSuffix(baseLower, ".json") {
+		return false
+	}
+	prefixes := []string{"to-", "from-", "msg-", "mailbox", "mail-", "send-", "notify-"}
+	for _, p := range prefixes {
+		if strings.HasPrefix(baseLower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateNoSpacesInSegments 拒绝路径段中含空格的路径。
+// LLM 偶尔把 "docs/workspace" 错写成 "docs workspace"，filepath.Clean 不会修正，
+// 反而会创建名为 "docs workspace" 的目录。此函数把这类路径挡在写入前。
+// 允许：纯文件名含空格（最后一段）—— 但仍不推荐，由调用方决定是否放行。
+func validateNoSpacesInSegments(path string) error {
+	if path == "" {
+		return nil
+	}
+	// 标准化分隔符后再切分
+	cleaned := filepath.Clean(path)
+	seps := string(os.PathSeparator) + "/"
+	// 按系统分隔符或 / 切分
+	parts := strings.FieldsFunc(cleaned, func(r rune) bool {
+		return strings.ContainsRune(seps, r)
+	})
+	for i, seg := range parts {
+		if strings.Contains(seg, " ") {
+			// 最后一段是文件名，含空格时仅警告不拒绝（许多场景合理）
+			if i == len(parts)-1 {
+				continue
+			}
+			return fmt.Errorf("path segment contains space: %q in path %q (use / or %c as separator, or set allow_spaces=true to override)", seg, path, os.PathSeparator)
+		}
+	}
+	return nil
 }
 
 // listDir 列出目录。
