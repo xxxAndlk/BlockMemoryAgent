@@ -10,7 +10,8 @@ import (
 
 func TestLoopDetectorDetectsRepeat(t *testing.T) {
 	d := newLoopDetector(40)
-	for i := 0; i < 3; i++ {
+	// maxRepeat=1：同一 (name,request) 出现 2 次即判定循环。
+	for i := 0; i < 2; i++ {
 		m := &blades.Message{
 			Role: blades.RoleAssistant,
 			Parts: []blades.Part{
@@ -18,13 +19,13 @@ func TestLoopDetectorDetectsRepeat(t *testing.T) {
 			},
 		}
 		stop, reason := d.observe(m)
-		if i < 2 && stop {
+		if i == 0 && stop {
 			t.Fatalf("第%d次不应触发循环，got %s", i+1, reason)
 		}
-		if i == 2 && !stop {
-			t.Fatal("第三次重复调用应触发循环检测")
+		if i == 1 && !stop {
+			t.Fatal("第二次重复调用应触发循环检测")
 		}
-		if i == 2 && !strings.Contains(reason, "ReadFile") {
+		if i == 1 && !strings.Contains(reason, "ReadFile") {
 			t.Fatalf("原因应包含工具名，got %s", reason)
 		}
 	}

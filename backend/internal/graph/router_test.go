@@ -28,6 +28,91 @@ func TestClassifyByRules_DirectAssistant(t *testing.T) {
 	}
 }
 
+// TestClassifyByRules_TowerDefenseBugExample 验证多动作开放探索目标不被误判为 direct_assistant。
+// 塔防事故根因：该目标被路由到 direct_assistant，单 Assistant 包揽复杂目标后上下文爆炸。
+func TestClassifyByRules_TowerDefenseBugExample(t *testing.T) {
+	n := &MetaAgentNode{}
+	cases := []string{
+		"查看塔防游戏找出 bug 修复并优化",
+		"查看 workspace 中的塔防游戏并修复 bug",
+		"分析现有代码找出问题并优化性能",
+		"排查登录 bug 并修复，同时优化数据库查询",
+	}
+	for _, goal := range cases {
+		if got := classifyByRules(n, goal); got == RouteDirectAssistant {
+			t.Errorf("goal=%q: 不应路由到 direct_assistant（多动作/开放探索），got %s", goal, got)
+		}
+		if got := classifyByRules(n, goal); got == RouteDirectTool {
+			t.Errorf("goal=%q: 不应路由到 direct_tool（多动作/开放探索），got %s", goal, got)
+		}
+	}
+}
+
+// TestProfileGoal_MultiAction 验证多维打分对多动作目标的识别。
+func TestProfileGoal_MultiAction(t *testing.T) {
+	// 塔防事故目标：4 个动作（查看/找出/修复/优化）+ 开放探索 + 多步骤（并）
+	p := profileGoal("查看塔防游戏找出 bug 修复并优化")
+	if !p.OpenEnded {
+		t.Errorf("应识别为开放探索（找出/优化）")
+	}
+	if p.StepCount == 0 {
+		t.Errorf("应识别到多步骤信号（并）")
+	}
+	if p.HasLightAction && p.ActionCount <= 1 {
+		t.Errorf("多动作目标 ActionCount 应 ≥2，got %d", p.ActionCount)
+	}
+	// 修复 CSS padding：单轻量动作，无开放探索
+	p2 := profileGoal("修复 CSS padding")
+	if p2.OpenEnded {
+		t.Errorf("修复 CSS padding 不应识别为开放探索")
+	}
+	if !p2.HasLightAction {
+		t.Errorf("应识别到轻量动作 修复")
+	}
+	if p2.ActionCount != 1 {
+		t.Errorf("单动作目标 ActionCount 应=1，got %d", p2.ActionCount)
+	}
+}
+
+// TestParseRouteConfidence 验证 LLM 输出置信度解析。
+func TestParseRouteConfidence(t *testing.T) {
+	cases := []struct {
+		input string
+		want  float64
+	}{
+		{"complexity: simple\npath: direct_tool\nconfidence: 0.9", 0.9},
+		{"confidence:0.75", 0.75},
+		{"置信度: 0.6", 0.6},
+		{"confidence: 1.5", 1.0}, // 超界归一
+		{"confidence: -0.1", 0.0},
+		{"no confidence line", 0.0},
+		{"confidence: abc", 0.0},
+	}
+	for _, c := range cases {
+		got := parseRouteConfidence(c.input)
+		if got != c.want {
+			t.Errorf("parseRouteConfidence(%q) = %v, want %v", c.input, got, c.want)
+		}
+	}
+}
+
+// TestClassifyByProfile_LowConfidenceFallback 验证低置信度 LLM 输出返回空串（交安全兜底）。
+// 通过模拟 LLM 返回低置信度，检查 classifyRouteLLM 行为不可在此单元测试中直接验证
+// （需 modelFactory），这里只验证 parseRouteConfidence 与 minRouteConfidence 阈值的配合。
+func TestMinRouteConfidence(t *testing.T) {
+	if minRouteConfidence != 0.7 {
+		t.Errorf("minRouteConfidence 应为 0.7，got %v", minRouteConfidence)
+	}
+	// 低置信度应小于阈值
+	if parseRouteConfidence("confidence: 0.5") >= minRouteConfidence {
+		t.Errorf("0.5 应低于阈值 0.7")
+	}
+	// 高置信度应大于等于阈值
+	if parseRouteConfidence("confidence: 0.85") < minRouteConfidence {
+		t.Errorf("0.85 应不低于阈值 0.7")
+	}
+}
+
 // TestClassifyByRules_MultiDomain 验证多领域信号路由到 RouteMultiDomain。
 func TestClassifyByRules_MultiDomain(t *testing.T) {
 	n := &MetaAgentNode{}

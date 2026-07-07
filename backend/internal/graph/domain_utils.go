@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/blockmemory/agent/backend/pkg/types"
+	"strings"
 	"sync"
 	"time"
 )
@@ -105,14 +106,70 @@ func (n *DomainAgentNode) dispatchAssistantsSerial(ctx context.Context, state *t
 			}
 			continue
 		}
+		// 组装上下文前缀：把前序已完成任务的结果摘要注入，避免后序助手重复探索
+		contextPrefix := buildPriorContext(task, results)
+		effectiveTask := task
+		if contextPrefix != "" {
+			effectiveTask = contextPrefix + "\n\n当前任务: " + task
+		}
 		// 串行执行：上一个完成后再跑下一个，确保依赖产物可见
-		results[task] = n.runAssistant(ctx, state, assistantInst, assistantDef, task)
+		results[task] = n.runAssistant(ctx, state, assistantInst, assistantDef, effectiveTask)
 		// Plan-and-Execute：标记计划步骤完成（断点续行用）
 		if block != nil && block.Plan != nil {
 			block.Plan.MarkDone(task)
 		}
 	}
 	return results // 返回所有任务的结果
+}
+
+// buildPriorContext 为当前任务构造前序任务结果摘要。
+//
+// 职责：串行执行中，后序任务应基于前序任务的结论继续，而不是从零开始重新探索代码。
+// 只选取与当前任务文本有关键词重叠的前序结果，避免无关上下文膨胀。
+func buildPriorContext(currentTask string, results map[string]*types.AgentResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("[前置任务结论，供参考]\n")
+	hasContent := false
+	for priorTask, result := range results {
+		if result == nil || result.SummaryForUser == "" {
+			continue
+		}
+		// 简单相关度过滤：当前任务包含前序任务中的任意关键词才携带
+		relevant := false
+		for _, word := range strings.Fields(priorTask) {
+			if len(word) >= 2 && strings.Contains(currentTask, word) {
+				relevant = true
+				break
+			}
+		}
+		if !relevant && len(results) <= 2 {
+			// 任务数很少时放宽，避免遗漏
+			relevant = true
+		}
+		if !relevant {
+			continue
+		}
+		summary := result.SummaryForUser
+		// 清理可能破坏 JSON/API 请求的非法控制字符
+		summary = strings.Map(func(r rune) rune {
+			if r == 0x00 {
+				return -1
+			}
+			return r
+		}, summary)
+		if len(summary) > 200 {
+			summary = summary[:200] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", priorTask, summary))
+		hasContent = true
+	}
+	if !hasContent {
+		return ""
+	}
+	return sb.String()
 }
 
 // retryWithBackoff 指数退避重试。

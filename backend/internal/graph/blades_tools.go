@@ -2,6 +2,8 @@ package graph
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/go-kratos/blades/tools"
@@ -109,16 +111,23 @@ type (
 //
 //	ToolExecutor，同时推送 ProgressEvent 并维护连续失败计数。
 //
-// 并发安全：results 切片通过 mu 保护；failures 内部自带锁；其余字段只读。
+// 并发安全：results 切片通过 mu 保护；failures 内部自带锁；readFiles 通过 readMu 保护；其余字段只读。
 type toolRunner struct {
-	executor *ToolExecutor    // 沙箱执行器，真正干活的人
-	progress ProgressCallback // 进度回调，可空
-	session  string           // 当前会话 ID，用于事件归属
-	agent    string           // 当前 agent 名，用于事件归属
-	failures *failureCounter  // 连续失败计数器
-	results  *[]*ToolResult   // 指向外部 slice，收集所有工具结果
-	mu       sync.Mutex       // 保护 results 切片的并发追加
+	executor  *ToolExecutor    // 沙箱执行器，真正干活的人
+	progress  ProgressCallback // 进度回调，可空
+	session   string           // 当前会话 ID，用于事件归属
+	agent     string           // 当前 agent 名，用于事件归属
+	failures  *failureCounter  // 连续失败计数器
+	results   *[]*ToolResult   // 指向外部 slice，收集所有工具结果
+	mu        sync.Mutex       // 保护 results 切片的并发追加
+	readFiles []string         // 本任务已读文件路径列表（去重），用于防重读与清单注入
+	readMu    sync.Mutex       // 保护 readFiles
 }
+
+// maxReadFilePerTask 单个 Assistant 任务内 ReadFile 调用次数上限。
+// 塔防事故中单任务读了 12+ 文件（含 game_td.js 重读 3 次）导致上下文爆炸。
+// 5 次足够覆盖"ListDir 定位 + 精读关键源文件 + 配置文件"的典型流程。
+const maxReadFilePerTask = 5
 
 // emit 推送一条进度事件（含 detail 字段）。
 //
@@ -158,18 +167,45 @@ func (r *toolRunner) emitTool(ctx context.Context, kind, tool, msg, detail strin
 // 返回：工具结果序列化后的 JSON 字符串（成功失败都返回 JSON，错误不通过 error）。
 // 副作用：通过 executor 产生文件/命令/网络副作用；通过 progress 推送事件；
 //
-//	达失败阈值时设置 tools.ActionLoopExit。
+//	达失败阈值时设置 tools.ActionLoopExit；ReadFile 超上限时也设置 ActionLoopExit。
 //
-// 并发安全：results 追加持锁；failures 内部持锁；可被 Agent 并发调用。
+// 并发安全：results 追加持锁；failures 内部持锁；readFiles 持 readMu 锁；可被 Agent 并发调用。
 func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) string {
 	argsStr, _ := marshalNoHTMLEscape(args) // 序列化参数用于事件展示（关闭 HTML 转义，避免 TUI 乱码）
 	// 推送调用前事件（pending 态）：携带 Tool 名，前端无需正则推断
 	r.emitTool(ctx, "tool_call", name, "调用工具 "+name, string(argsStr))
 
+	// ReadFile 预检：拦截重读与超上限读取，避免上下文爆炸。
+	// 在真正执行前判断，避免浪费 IO 与 token。
+	if name == "ReadFile" {
+		path, _ := args["path"].(string)
+		if blocked := r.checkReadFileBudget(ctx, path); blocked != "" {
+			// 返回错误 JSON 给 LLM，并强制退出 Agent 循环
+			result := &ToolResult{Tool: "ReadFile", Path: path, Error: blocked}
+			r.mu.Lock()
+			*r.results = append(*r.results, result)
+			r.mu.Unlock()
+			if tc, ok := tools.FromContext(ctx); ok {
+				tc.SetAction(tools.ActionLoopExit, true)
+			}
+			b, _ := marshalNoHTMLEscape(result)
+			return string(b)
+		}
+	}
+
 	// 把 sessionID 注入 ctx，让 executor 知道这是哪个会话的调用
 	ctx = WithSessionID(ctx, r.session)
 	// 真正执行工具，拿到结构化结果
 	result := r.executor.Execute(ctx, name, args)
+
+	// ReadFile 成功后：把路径加入已读清单，并在 Output 末尾追加清单提示，
+	// 让 LLM 看到已读文件列表，避免后续轮次重读。
+	if name == "ReadFile" && result.Success && result.Path != "" {
+		r.recordReadFile(result.Path)
+		if hint := r.readListHint(); hint != "" {
+			result.Output = result.Output + "\n" + hint
+		}
+	}
 
 	// 把结果追加到共享 slice，持锁防止并发覆盖
 	r.mu.Lock()
@@ -197,6 +233,52 @@ func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) 
 	// 乱码影响后续决策（参见塔防 demo 事故：HTML 内容回灌为 <!DOCTYPE>）
 	b, _ := marshalNoHTMLEscape(result)
 	return string(b)
+}
+
+// checkReadFileBudget 检查 ReadFile 是否超出预算：重读或超上限。
+// 返回非空字符串表示被拦截，字符串内容为错误原因；空串表示放行。
+//
+// 拦截规则：
+//   - path 已在 readFiles 中：返回"已读"错误，强制 LLM 复用已返回内容。
+//   - readFiles 长度已达 maxReadFilePerTask：返回"超上限"错误，强制退出循环。
+//
+// 并发安全：持 readMu 锁读写 readFiles。
+func (r *toolRunner) checkReadFileBudget(ctx context.Context, path string) string {
+	if path == "" {
+		return ""
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	// 重读检测：路径已在清单中
+	for _, p := range r.readFiles {
+		if p == path {
+			return fmt.Sprintf("该文件本任务已读过（%s），禁止重读。复用已返回内容推进任务；如需看其他段落请用 SearchInFiles 精确定位。", path)
+		}
+	}
+	// 上限检测：已达 maxReadFilePerTask 次上限
+	if len(r.readFiles) >= maxReadFilePerTask {
+		return fmt.Sprintf("已达单任务 ReadFile 上限 %d 次（已读: %s）。请基于已读内容推进任务，或用 SearchInFiles 定位新内容。", maxReadFilePerTask, strings.Join(r.readFiles, ", "))
+	}
+	return ""
+}
+
+// recordReadFile 把路径加入已读清单（不去重，调用方已通过 checkReadFileBudget 保证不重）。
+func (r *toolRunner) recordReadFile(path string) {
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	r.readFiles = append(r.readFiles, path)
+}
+
+// readListHint 返回注入 ReadFile 结果末尾的已读清单提示。
+// 清单为空时返回空串。
+func (r *toolRunner) readListHint() string {
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	if len(r.readFiles) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("[已读文件清单 (%d/%d): %s — 禁止重读]",
+		len(r.readFiles), maxReadFilePerTask, strings.Join(r.readFiles, ", "))
 }
 
 // buildBladesTools 构造内置工具的 blades.Tool 集合（P3-2 扩展为 11 个）。

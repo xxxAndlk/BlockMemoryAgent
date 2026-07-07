@@ -59,22 +59,24 @@ func (n *DomainAgentNode) analyzeTasks(ctx context.Context, state *types.ThreeLa
 - 每个子任务必须是一个可直接用工具执行的动作（如"用 WriteFile 写 X 文件"、"用 RunCommand 运行 Y"、"用 HTTPGet 抓取 Z"）
 - 严禁出现"分析/确定/规划/设计/思考/研究/需求/方案"等纯思考类子任务，这类工作应在执行动作中一并完成
 - 涉及创建文件的目标，必须有子任务明确写出文件路径与内容来源；多文件交付目标（如游戏 demo 含 index.html+game.js+config.json+tests）必须每个文件一个子任务
-- 子任务之间可以有依赖但应尽量并行
+- 子任务之间可以有依赖但应尽量并行；后序任务必须能复用前序任务结论，禁止多个助手重复全量读取同一份代码
+- 若目标涉及改造现有项目，应拆为："读取并总结关键文件位置与结构"、"基于前述总结修改具体文件"、"验证修改"; 禁止把"读代码"和"改代码"塞到同一任务里反复探索
 - 只输出子任务列表，每行一个，不要编号，不要其他内容
 - 任务匹配工具，不要"为了用工具而用工具"：
   * 信息查询/搜索/新闻/行情类目标 → 用 HTTPGet 抓取公开 URL，禁止"写 Python 脚本去搜索"
   * 只有目标明确要求"写代码/生成文件/运行程序"时，才用 WriteFile / RunCommand
 
 示例（好）:
-用 HTTPGet 抓取 https://news.example.com/ai 获取最近 AI 新闻
-用 WriteFile 把贪吃蛇游戏代码写到 workspace/snake.py
-用 RunCommand 运行 python workspace/snake.py 验证
+用 SearchInFiles 定位 workspace/tower_game 中金币与波次相关代码，再用 ReadFile 读取关键片段并总结文件路径和函数名
+用 WriteFile 修改 workspace/tower_game/game.js 的金币规则为击杀+10、波次完成+20，并添加 10 关关卡配置
+用 RunCommand 运行 node -c workspace/tower_game/game.js 验证语法
 
 示例（坏，禁止）:
 需求分析
 设计方案
 编写代码
 用 WriteFile 写一个 Python 脚本去搜索新闻（应该直接用 HTTPGet）
+用 ReadFile 读取所有游戏文件并修改金币和关卡系统（任务过大，应拆分）
 （仅返回 1 个子任务也是禁止的）
 
 子任务:`, goal, memorySection, fmtEnvSection()))

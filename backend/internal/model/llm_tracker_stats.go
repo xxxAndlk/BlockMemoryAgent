@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -69,5 +70,33 @@ func (t *LLMCallTracker) Records() []CallRecord {
 	out := make([]CallRecord, len(t.records))
 	copy(out, t.records)
 	return out
+}
+
+// TokenTotalsByAgent 按 caller 子串过滤后累加 input/output token。
+//
+// 设计意图：watchdog 需要取"当前 block 内各 Agent"的真实 token 总量，
+// 而非全局 TokenTotals。CallRecord.Caller 形如 "DomainAgent[xxx]" / "助手[临时助手]"，
+// 调用方传入 agentName 子串（如 "临时助手" 或 block 内全部 agent 名）做匹配。
+// 传入空 caller 子串时退化为全量 TokenTotals。
+//
+// 返回：(inputTokens, outputTokens) 累加值。
+// 并发安全：读锁保护。
+func (t *LLMCallTracker) TokenTotalsByAgent(callerSub string) (inputTokens, outputTokens int) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if callerSub == "" {
+		for _, r := range t.records {
+			inputTokens += r.InputTokens
+			outputTokens += r.OutputTokens
+		}
+		return
+	}
+	for _, r := range t.records {
+		if strings.Contains(r.Caller, callerSub) {
+			inputTokens += r.InputTokens
+			outputTokens += r.OutputTokens
+		}
+	}
+	return
 }
 

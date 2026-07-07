@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -75,28 +76,32 @@ func (n *MetaAgentNode) ClassifyTask(ctx context.Context, state *types.ThreeLaye
 // classifyByRules 规则层路由（零 LLM 成本）。
 //
 // 命中则返回路径；未命中返回空串交由 LLM 兜底。
-// 复用 MetaAgent 既有的 isSimpleQuestion / shouldDirectExecute 关键词规则。
+// 改造为基于多维 profile 的打分判定（替代单关键词命中），并保留
+// shouldDirectExecute 作为兜底以兼容既有用例（但仅在 profile 未识别到
+// 开放探索/多步骤/多动作信号时才走兜底，避免把复杂任务压到 direct_tool）。
 func classifyByRules(n *MetaAgentNode, goal string) RoutePath {
 	// 纯寒暄/常识 QA：MetaAgent 直接回答（0 工具）→ RouteDirectTool
 	if n.isSimpleQuestion(goal) {
 		return RouteDirectTool
 	}
-	// 单次工具调用类请求（读文件、跑命令、查天气等）→ RouteDirectTool
-	if isSingleToolRequest(goal) {
-		return RouteDirectTool
+
+	// 多维打分：基于 profile 决策，规则层只放极窄高置信命中
+	p := profileGoal(goal)
+	p.IsGreeting = false // isSimpleQuestion 已在上一步处理
+	if path := classifyByProfile(p); path != "" {
+		return path
 	}
-	// 查询/搜索/资讯类单工具任务（读文件、跑命令、查天气、HTTPGet）→ RouteDirectTool
-	if n.shouldDirectExecute(goal) {
-		return RouteDirectTool
+
+	// 兼容兜底：查询/搜索/资讯类单工具任务（HTTPGet / Web 搜索）。
+	// 仅在 profile 未识别到开放探索/多步骤/写/重动作时才走，避免
+	// "分析现有代码找出问题并优化性能" 这类含开放探索词的目标被
+	// shouldDirectExecute 的 "分析" 关键词误判为 direct_tool。
+	if !p.OpenEnded && p.StepCount == 0 && !p.HasWriteAction && !p.HasHeavyAction && p.ActionCount <= 1 {
+		if n.shouldDirectExecute(goal) {
+			return RouteDirectTool
+		}
 	}
-	// 单领域简单任务（修 CSS、改文案等，需一个专家助手但无需领域拆分）→ RouteDirectAssistant
-	if isSingleDomainSimpleTask(goal) {
-		return RouteDirectAssistant
-	}
-	// 明确多领域并行信号 → RouteMultiDomain
-	if isMultiDomainHint(goal) {
-		return RouteMultiDomain
-	}
+
 	return "" // 未命中，交 LLM 兜底
 }
 
@@ -126,28 +131,6 @@ func isSingleToolRequest(goal string) bool {
 		}
 	}
 	return true
-}
-
-// isSingleDomainSimpleTask 判断是否为单领域简单任务（需一个助手，无需领域拆分）。
-//
-// 典型：修复 CSS、改文案、调整样式、改个配置等小改动。
-func isSingleDomainSimpleTask(goal string) bool {
-	gl := strings.ToLower(goal)
-	simplePatterns := []string{
-		"修复", "改一下", "改个", "调整", "修改", "替换", "重命名",
-		"css", "样式", "文案", "文字", "颜色", "padding", "margin",
-		"配置", "字号", "字体",
-	}
-	for _, p := range simplePatterns {
-		if strings.Contains(gl, p) {
-			// 含多领域/多步骤信号则升级
-			if isMultiDomainHint(goal) {
-				return false
-			}
-			return true
-		}
-	}
-	return false
 }
 
 // isMultiDomainHint 判断是否含多领域并行信号。
@@ -182,9 +165,11 @@ func isMultiDomainHint(goal string) bool {
 	return false
 }
 
-// classifyRouteLLM LLM 兜底路由（轻量模型判定复杂度后映射路径）。
+// classifyRouteLLM LLM 兜底路由（轻量模型判定复杂度 + 路径 + 置信度）。
 //
-// 让轻量模型先判断"简单问题 / 复杂问题"，再给出 5 条路径之一；
+// 让轻量模型输出 complexity / path / confidence 三元组；解析后若置信度
+// 低于 minRouteConfidence（默认 0.7）视为不可信，返回空串交安全兜底（RouteCreateDomain），
+// 避免低置信度误判把复杂任务压到 direct_assistant 单助手路径。
 // 未识别/超时/非法输出返回空串交安全兜底。
 func (n *MetaAgentNode) classifyRouteLLM(ctx context.Context, goal string) RoutePath {
 	prompt := `你是一名任务复杂度判定专家。请按以下两步分析用户目标，并严格按格式输出：
@@ -200,9 +185,12 @@ func (n *MetaAgentNode) classifyRouteLLM(ctx context.Context, goal string) Route
 - complex → multi_domain：多领域并行任务，需要创建多个 DomainAgent。
 - complex → full_four_layer：超复杂任务，子领域边界明显（API 层 + 数据库层 + 前端层），需要启用 SubDomainAgent 完整四层编排。
 
+置信度（confidence）：0.0-1.0，表示你对路径选择的把握。低于 0.7 时系统会回退到更保守的 create_domain。
+
 输出格式（严格遵循，不要其他文字）：
 complexity: simple|complex
 path: direct_tool|direct_assistant|create_domain|multi_domain|full_four_layer
+confidence: 0.0-1.0
 
 用户目标: ` + goal + `
 
@@ -212,12 +200,49 @@ path: direct_tool|direct_assistant|create_domain|multi_domain|full_four_layer
 		return ""
 	}
 	resp = strings.ToLower(strings.TrimSpace(resp))
-	// 解析 complexity 与 path；容忍前后缀、空行与标点
+	// 解析 path 与 confidence；容忍前后缀、空行与标点
 	path := parseRoutePath(resp)
-	if path != "" {
-		return path
+	if path == "" {
+		return "" // 未识别路径，交安全兜底
 	}
-	return "" // 未识别，交安全兜底
+	// 置信度门控：低置信度不采纳 LLM 判定，交安全兜底走 create_domain
+	conf := parseRouteConfidence(resp)
+	if conf < minRouteConfidence {
+		return ""
+	}
+	return path
+}
+
+// minRouteConfidence LLM 路由判定的最低置信度阈值。
+// 低于此值视为不可信，回退到安全兜底 RouteCreateDomain。
+const minRouteConfidence = 0.7
+
+// parseRouteConfidence 从 LLM 输出中解析 confidence 数值。
+//
+// 支持格式："confidence: 0.8" / "confidence:0.8" / "置信度: 0.8"。
+// 缺失或解析失败返回 0.0（视为低置信度，触发安全兜底）。
+func parseRouteConfidence(resp string) float64 {
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.ToLower(strings.TrimSpace(line))
+		if !strings.HasPrefix(line, "confidence:") && !strings.HasPrefix(line, "置信度:") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(line, "confidence:"))
+		v = strings.TrimSpace(strings.TrimPrefix(v, "置信度:"))
+		v = strings.TrimRight(v, ".。,，")
+		var f float64
+		if n, _ := fmt.Sscanf(v, "%f", &f); n == 1 {
+			if f < 0 {
+				return 0
+			}
+			if f > 1 {
+				return 1
+			}
+			return f
+		}
+		return 0
+	}
+	return 0
 }
 
 // parseRoutePath 从 LLM 输出中解析路由路径。

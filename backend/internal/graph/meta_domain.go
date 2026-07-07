@@ -154,13 +154,36 @@ func (n *MetaAgentNode) analyzeDomainsByRules(goal string) []DomainInfo {
 }
 
 // inferDomainName 从 goal 文本启发式推断领域名，避免一律用"通用"。
-// 取前若干个有意义的字符（中文按 rune 计，最多 6 字），去除常见动词前缀。
+// 优先从路径、游戏/项目名、核心名词提取；取前若干个有意义的字符（中文按 rune 计，最多 6 字）。
 func inferDomainName(goal string) string {
 	g := strings.TrimSpace(goal)
 	if g == "" {
 		return "通用"
 	}
-	// 去掉常见动词前缀，让领域名更贴近主题
+
+	// 1. 尝试提取 workspace/ 后的目录名作为领域名（塔防 demo 事故：goal 里含 workspace 路径）
+	if idx := strings.Index(g, "workspace/"); idx != -1 {
+		rest := g[idx+len("workspace/"):]
+		if rest != "" {
+			// 取到下一个空白或标点
+			end := strings.IndexAny(rest, " \t\r\n/\\，。；：！？,.;:!?\"'")
+			if end == -1 {
+				end = len(rest)
+			}
+			if end > 0 {
+				name := strings.TrimSpace(rest[:end])
+				if name != "" {
+					rs := []rune(name)
+					if len(rs) > 6 {
+						rs = rs[:6]
+					}
+					return string(rs)
+				}
+			}
+		}
+	}
+
+	// 2. 去掉常见动词前缀，让领域名更贴近主题
 	prefixes := []string{"完成", "请", "帮我", "帮助我", "实现", "做", "写", "创建", "查询", "查一下", "查下", "搜索", "搜一下"}
 	for _, p := range prefixes {
 		if strings.HasPrefix(g, p) {

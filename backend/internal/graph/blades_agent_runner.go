@@ -64,10 +64,10 @@ func newLoopDetector(maxRounds int) *loopDetector {
 	}
 	return &loopDetector{
 		maxRounds:      maxRounds,
-		windowSize:     5,
-		maxRepeat:      2, // 同一工具+参数在最近 5 次中出现 3 次即判定循环
+		windowSize:     20,
+		maxRepeat:      1, // 同一工具+参数在最近 20 次中出现 2 次即判定循环（塔防事故中 game_td.js 被读 3 次才触发，过宽）
 		maxEmptyStreak: 4, // 连续 4 轮只有工具调用无文本输出即判定空转
-		toolHistory:    make([]toolCallFingerprint, 0, 5),
+		toolHistory:    make([]toolCallFingerprint, 0, 20),
 	}
 }
 
@@ -301,7 +301,13 @@ func buildAssistantPrompts(roleDef *types.RoleDefinition, skillBrief string, sta
    （例如换工具、换路径、放弃当前思路），而不是继续试错。
 6. 只有当所有要求的文件已落盘、命令已执行，且无需再调用工具时，才输出最终文字总结。
 7. 循环收敛：若连续多次工具调用未获得新信息、同一命令重复失败、或已无明显进展，
-   必须立即停止继续试错，基于已掌握的信息给出当前结论，而不是无限循环。`,
+   必须立即停止继续试错，基于已掌握的信息给出当前结论，而不是无限循环。
+8. 文件读取预算：
+   - 先用 SearchInFiles/ListDir 定位，再用 ReadFile 精确读取。
+   - 同一文件禁止重复读取；需要确认时依靠已返回内容。
+   - 单次 ReadFile 不超过 300 行；每个任务累计不超过 5 次。
+   - 禁止写临时脚本再次打印已读过的文件内容。
+   - 连续两次工具调用无新信息，或累计 input tokens 超过 80K，立即停止探索并返回结论。`,
 		roleDef.SystemPrompt, skillSection, envSection)
 
 	contextInfo := ""
@@ -356,17 +362,28 @@ func executeMockAssistant(
 // 返回最后一个 message、累计用量、循环错误（nil 表示正常结束）。
 // 注意：假设 provider 非流式返回每轮独立用量；若未来切流式需复查累加逻辑。
 //
-// 上下文爆炸保护：单轮 input_tokens 超 maxInputTokensBudget（默认 100K）时主动退出。
+// 上下文爆炸保护：分两级阈值。
+//   - 软阈值 50K：单轮 input_tokens 超 50K 时 emit 警告，提示 LLM 收敛。
+//   - 硬阈值 80K：单轮 input_tokens 超 80K 时主动退出，返回已收集结果。
+//
 // 参见塔防 demo 事故 v2：MetaAgent[临时助手] 累积 850K input tokens（152s 调用），
 // 因反复读 game.js/game_core.js + 工具结果全量回灌 LLM。blades agent 内部无上下文裁剪，
-// 需在外层 loop 拦截。
+// 需在外层 loop 拦截。软阈值给 LLM 一次"收敛机会"，硬阈值兜底防爆炸。
 func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *blades.Invocation, agentName string, maxIters int, emit emitFunc) (*blades.Message, blades.TokenUsage, error) {
 	var lastMessage *blades.Message
 	var totalUsage blades.TokenUsage
 	detector := newLoopDetector(maxIters)
-	const maxInputTokensBudget = 100000 // 单轮输入 token 上限，超此视为上下文爆炸
+	const maxInputTokensBudget = 80000  // 单轮输入 token 硬上限，超此视为上下文爆炸
+	const softWarnThreshold = 50000    // 软阈值：超此 emit 警告但不退出
+	softWarned := false                // 软阈值只警告一次，避免刷屏
 	for m, err := range agent.Run(ctx, invocation) {
 		if err != nil {
+			// 单 assistant wall-clock 超时：返回已收集结果而非裸 error，避免上层当作失败丢弃半成品
+			if errors.Is(err, context.DeadlineExceeded) {
+				reason := fmt.Sprintf("单助手 wall-clock 超时（3min），基于已收集结果返回（已完成 %d 步工具操作）", detector.rounds)
+				emit(ctx, "wait", reason)
+				return lastMessage, totalUsage, &loopExitError{reason: reason}
+			}
 			return lastMessage, totalUsage, err
 		}
 		if m == nil {
@@ -376,6 +393,11 @@ func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *bla
 		totalUsage.InputTokens += m.TokenUsage.InputTokens
 		totalUsage.OutputTokens += m.TokenUsage.OutputTokens
 		totalUsage.TotalTokens += m.TokenUsage.TotalTokens
+		// 软阈值警告：单轮 input_tokens 超 50K 但未达 80K，提示 LLM 收敛
+		if !softWarned && m.TokenUsage.InputTokens >= softWarnThreshold && m.TokenUsage.InputTokens < maxInputTokensBudget {
+			emit(ctx, "wait", fmt.Sprintf("上下文接近爆炸（单轮 input_tokens=%d），请减少 ReadFile 次数并基于已读内容推进任务", m.TokenUsage.InputTokens))
+			softWarned = true
+		}
 		// 上下文爆炸检测：单轮 input_tokens 超预算则退出
 		if m.TokenUsage.InputTokens > maxInputTokensBudget {
 			reason := fmt.Sprintf("上下文爆炸保护：单轮 input_tokens=%d 超预算 %d，可能因工具结果累积过多。建议减少 ReadFile 次数或缩短工具输出",
@@ -455,8 +477,9 @@ func executeAssistantWithTools(
 	}
 	// 取 blades provider；mock 路径（无 API Key）返回错误，传入 nil 触发退化
 	provider, _ := modelFactory.GetBladesProvider(ctx, roleDef.ID)
-	// 带超时执行：单个 assistant 最多 5 分钟（每轮 LLM 可达 40s+）
-	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
+	// 带超时执行：单个 assistant 最多 3 分钟（每轮 LLM 可达 40s+，3min 够 4-5 轮 ReAct）
+	// 塔防事故：assistant_17 在 4m25s 内烧 1.5M input tokens，5min 上限太松
+	ctx, cancel := context.WithTimeout(ctx, 180*time.Second)
 	defer cancel()
 	return executeWithTools(ctx, provider, llm, executor, roleDef, task, state, skillBrief, progress, agentName, maxIters, llmTracker)
 }

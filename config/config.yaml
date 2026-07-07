@@ -45,7 +45,7 @@ agent:
   # —— Graph 死循环防护（三层防御，替代硬步数上限）——
   stall_steps: 30                # 无进展步数阈值：连续 N 步状态指纹无变化 → 判死循环
   max_repeat_fingerprint: 3      # 状态指纹重复阈值：同一指纹连续出现 N 次 → 判死循环
-  session_timeout_min: 60        # 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
+  session_timeout_min: 240       # 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
   skill_set_size: 8              # 每个 DomainAgent 装配的 Skill 子集上限
   tool_call_max_rounds: 100      # Assistant ReAct 工具调用循环最大轮数（含循环检测提前退出）
   retry_count: 3                 # Assistant 任务指数退避重试次数

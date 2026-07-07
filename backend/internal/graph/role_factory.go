@@ -210,7 +210,7 @@ func (f *RoleFactory) generateDomainRoleDef(ctx context.Context, domain, goal st
 func (f *RoleFactory) fillDomainTemplate(roleDef *types.RoleDefinition, domain, goal string) {
 	roleDef.Name = domain + "负责人"
 	roleDef.Description = fmt.Sprintf("负责%s领域的上下文管理与任务分发", domain)
-	roleDef.SystemPrompt = fmt.Sprintf("你是%s领域的负责人。你的职责是：\n1. 管理该领域的上下文信息\n2. 分析任务并分发给合适的助手\n3. 汇总助手结果并输出\n\n领域目标: %s", domain, goal)
+	roleDef.SystemPrompt = fmt.Sprintf("你是%s领域的负责人。职责：管理上下文、分发任务、汇总结果。\n\n领域目标: %s\n\n上下文约束：\n- 子任务可独立执行，后序任务复用前序结论。\n- 派发任务时附带关键上下文：文件路径、函数/行号、前置结论。\n- 禁止多个助手重复全量读取同一份代码。\n- 每个助手 ReadFile 不超过 5 次，单次不超过 300 行；超预算立即收敛。", domain, goal)
 	roleDef.Keywords = []string{domain, goal}
 	roleDef.Skills = []string{"任务分析", "上下文管理", "结果汇总"}
 	roleDef.ModelConfig = f.dynamicTemplateModelConfig("domain_template")
@@ -286,7 +286,7 @@ func (f *RoleFactory) generateAssistantRoleDef(ctx context.Context, taskDesc, pa
 func (f *RoleFactory) fillAssistantTemplate(roleDef *types.RoleDefinition, taskDesc string) {
 	roleDef.Name = "临时助手"
 	roleDef.Description = taskDesc
-	roleDef.SystemPrompt = fmt.Sprintf("你是一个专业助手。你的唯一任务是：%s\n\n请专注于此任务，不要处理无关事务。完成后立即返回结果。", taskDesc)
+	roleDef.SystemPrompt = fmt.Sprintf("你是一个专业助手。任务是：%s\n\n专注于此任务，不处理无关事务，完成后立即返回结果。\n\n执行纪律：\n1. 先用 SearchInFiles/ListDir 定位，禁止一上来大量 ReadFile。\n2. 同一文件禁止重复读取；需要确认时依靠已返回内容。\n3. 单次 ReadFile 不超过 300 行；每个任务累计不超过 5 次。\n4. 禁止写临时脚本再次打印已读过的文件内容。\n5. 连续两次工具调用无新信息，或累计 input tokens 超过 80K，立即停止探索并返回结论。", taskDesc)
 	roleDef.Keywords = extractKeywords(taskDesc) // 简单分词提取
 	roleDef.Skills = []string{taskDesc}
 	roleDef.ModelConfig = f.dynamicTemplateModelConfig("assistant_template")

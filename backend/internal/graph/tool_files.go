@@ -14,7 +14,7 @@ import (
 
 // readFile 读取文件内容。
 //
-// 职责：读取指定路径文件，超过 10000 字符时截断，返回内容与绝对路径。
+// 职责：读取指定路径文件，超过 4000 字符时截断，返回内容与绝对路径。
 // 参数：
 //   - args：必须含 "path" 字段。
 //
@@ -38,10 +38,14 @@ func (e *ToolExecutor) readFile(args map[string]any) *ToolResult {
 		return &ToolResult{Tool: "ReadFile", Path: absPath, Error: err.Error()}
 	}
 
-	// 转 string 并截断超长内容，避免回灌 LLM 时上下文爆炸
+	// 转 string 并截断超长内容，避免回灌 LLM 时上下文爆炸。
+	// 阈值 4000 字符（约 1.3K token）：塔防事故中 game_td.js 等大文件全量回灌
+	// 叠加多轮工具调用，单轮 input_tokens 冲到 103K 触发爆炸保护。
+	// 4000 字符够覆盖大多数源文件关键段落，需要看更多内容时 LLM 应换 SearchInFiles
+	// 精确定位或用 offset/limit 参数（待扩展）。
 	content := string(data)
-	if len(content) > 10000 {
-		content = content[:10000] + "\n... (truncated)"
+	if len(content) > 4000 {
+		content = content[:4000] + "\n... (truncated, total " + fmt.Sprintf("%d", len(string(data))) + " chars)"
 	}
 
 	return &ToolResult{Tool: "ReadFile", Success: true, Output: content, Path: absPath}
@@ -496,9 +500,9 @@ func (e *ToolExecutor) searchInFiles(args map[string]any) *ToolResult {
 	if len(lines) > 0 {
 		result.Success = true
 	}
-	// 截断超长输出
-	if len(result.Output) > 10000 {
-		result.Output = result.Output[:10000] + "\n... (truncated)"
+	// 截断超长输出（与 ReadFile 一致 4000，避免 SearchInFiles 大量命中回灌导致上下文爆炸）
+	if len(result.Output) > 4000 {
+		result.Output = result.Output[:4000] + "\n... (truncated)"
 	}
 	return result
 }
