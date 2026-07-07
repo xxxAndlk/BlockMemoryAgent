@@ -312,19 +312,27 @@
 
 ### P3 — 远期优化（依赖前置项）
 
-**P3-1. 记忆层简化**（依赖 P3-3 真实 embedding 接入后评测）
-- 现状：4级压缩 Raw→Standard→Compact→Marker 阈值难调，实际触发效果未评测。
-- 方案：先评测再定方案，不评测就简化=拍脑袋。
-- 评测指标：①触发频次 ②各级命中率 ③压缩后召回质量（人工评分） ④token 节省量。
-- 评测方法：跑 `test/coding/` + `test/api/` 全套，统计每级落库量。
-- 评测后再选：可能两级够（Raw 7天 + 摘要永久），也可能保留三级但去 Marker。
+**P3-1. 记忆层简化**（依赖 P3-3 真实 embedding 接入后评测）✅ 评测能力已补齐
+- 现状：代码实际已实现两级压缩（Raw / Standard），非设计文档原四级。`Compressor.Compress` 已返回 `CompressStats`（Raw 保留数、压缩数、字节节省量），并接入 `meta_watchdog` 日志。
+- 已新增：
+  - `backend/internal/memory/compress_test.go` 覆盖高重要保留、低重要/超龄压缩、字节节省统计。
+  - `backend/internal/store/postgres.go` 新增 `CountEpisodesByLevel` 按压缩层级统计。
+  - `backend/internal/server/api.go` 新增 `GET /api/memory/eval` 端点，汇总所有 `(agent_id, topic_id)` 的 Raw/Standard 分布。
+- 评测方法：跑 `test/coding/` + `test/api/` 全套后调用 `GET /api/memory/eval`，观察 `raw` / `standard` 分布与触发频次。
+- 评测后再选：若 Standard 占比高且召回无损失，可进一步简化为仅保留 Raw 7 天 + 摘要永久；否则维持两级。
 
-**P3-2. 加强测试流程，当前测试流程不足**
-- 加强测试流程，助手级Agent完成后，对自己的子任务需要进行单元测试，领域Agent完成后，需要派遣测试助手对完整模块进行全方面测试。抓跟他完成任务后需要测试完整度、是否完成任务，更徐亚哦测试各个模块间协同时的测试是否有问题，也使用测试助手进行测试。
+**P3-2. 加强测试流程，当前测试流程不足** ✅ 已实现
+- 新增配置开关：`agent.assistant_self_test_enabled` / `agent.domain_self_test_enabled`，默认关闭。
+- 新增 `backend/internal/graph/agent_common.go` `runSelfTestAssistant`：调用轻量模型生成结构化测试报告（passed/issues/report）。
+- `AssistantNode` 完成后若开启助手级自测，自动追加测试报告到结果并归档 facts。
+- `DomainAgentNode` 完成后若开启领域级自测，生成模块级测试报告并写入 `block.MetaMemory`（tag=`test_report`）。
+- 新增 `backend/internal/graph/self_test_test.go` 覆盖 JSON 提取、通过/失败路径。
 
-**P3-3. TUI页的任务编排与Agent编排优化**
-- 档期啊你任务编排与Agent编排只有进入Agent的第一次与问题会展示，后续的用户问题展示的一直是第一次的计划与Agent编排。修改为每次对话输入，重新展示新的任务编排与Agent编排。
-- 任务栏的任务描述太长时会被截断，需要把任务栏的任务描述进行LLM提取与精简。Agent编排栏太过于捡漏，需要根据新TUI页.png的Agent编排栏逐步复刻，任务编排栏样式也需要复刻。
+**P3-3. TUI页的任务编排与Agent编排优化** ✅ 已实现
+- 会话续话/中断/队列注入/澄清答复前清理 `runtime.Boards` 旧看板与 `RoleRegistry` 中旧实例，确保每次用户输入后展示新的计划与 Agent 拓扑。
+- 计划栏长任务描述在 LLM 可用时经 `summarizeTaskTitle` 语义精简，不可用时回退截断；结果缓存避免重复请求。
+- Agent 编排栏复刻参考设计：状态色点 + 按角色类型着色名称 + 状态徽章 + 时间戳 + 任务描述，树状连接符 `├─/└─/│` 展示层级。
+- 新增 `backend/internal/tui/view_test.go` 覆盖树前缀、卡片渲染、任务标题精简回退。
 ---
 
 ## 优先级依赖关系

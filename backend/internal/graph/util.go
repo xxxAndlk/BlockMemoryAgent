@@ -37,7 +37,7 @@ type ContextAssembler interface {
 // 按重要性 + 时间对私有记忆做分层压缩，降低长期记忆 Token 占用。
 // 实现方在 memory 包。
 type EpisodeCompressor interface {
-	Compress(ctx context.Context, agentID, topicID string) error
+	Compress(ctx context.Context, agentID, topicID string) (*types.CompressStats, error)
 }
 
 // AgentSnapshotManager Agent 快照管理器接口。

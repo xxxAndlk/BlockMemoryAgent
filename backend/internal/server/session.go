@@ -132,6 +132,20 @@ func (m *SessionManager) SetModelFactory(mf *model.ModelFactory) {
 	m.modelFactory = mf
 }
 
+// resetSessionRuntime 清理会话上一轮的运行时残留（看板、角色实例）。
+// 用于续话/中断/队列注入/澄清答复后重建新的计划与 Agent 拓扑，避免右侧面板展示旧状态。
+// 调用方需确保会话当前不在运行中，否则可能破坏正在执行的图。
+func (m *SessionManager) resetSessionRuntime(sessionID string) {
+	if m.graph != nil {
+		if rt := m.graph.Runtime(); rt != nil && rt.Boards != nil {
+			rt.Boards.Remove(sessionID)
+		}
+	}
+	if m.registry != nil {
+		m.registry.RemoveSessionInstances(sessionID)
+	}
+}
+
 // LaunchSession 实现 dag.SessionLauncher 接口（特性1）。
 // 把一个 task.goal 派发为新 session，返回 sessionID。
 func (m *SessionManager) LaunchSession(goal string) string {
@@ -1270,6 +1284,8 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 	})
 	m.mu.Unlock()
 
+	// P3-3：澄清答复后清理上一轮运行时残留，重建计划与 Agent 拓扑
+	m.resetSessionRuntime(session.ID)
 	// 异步恢复：避免阻塞 HTTP 响应；graph 从最新 state 继续，可能再次 ActionWait
 	go m.resumeSession(session)
 
@@ -1341,6 +1357,8 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 	// 已结束会话：异步恢复执行，由 drainCommandQueue 在首 tick 应用中断；
 	// 运行中会话：不主动 resume，等 MetaAgent 下一个 tick 自然拉取队列
 	if !wasRunning {
+		// P3-3：中断后清理上一轮运行时残留，确保新的计划与 Agent 拓扑从当前指令重建
+		m.resetSessionRuntime(session.ID)
 		go m.resumeSession(session)
 	}
 
@@ -1408,6 +1426,8 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 
 	// 运行中会话：等 MetaAgent 下个 tick Drain；已结束会话：异步恢复
 	if !wasRunning {
+		// P3-3：队列注入恢复前清理上一轮运行时残留
+		m.resetSessionRuntime(session.ID)
 		go m.resumeSession(session)
 	}
 
@@ -1635,6 +1655,8 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	m.mu.Unlock()
 
 	if !wasRunning {
+		// P3-3：续话前清理上一轮运行时残留，确保右侧面板展示新的计划与 Agent 拓扑
+		m.resetSessionRuntime(session.ID)
 		go m.resumeSession(session)
 	}
 

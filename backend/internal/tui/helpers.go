@@ -770,15 +770,6 @@ func formatDurationShort(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
-// agentTreePrefix 根据 Agent 在拓扑中的深度返回带缩进/连接符的前缀，
-// 让右侧面板的 Agent 编排更像参考设计中的层级拓扑。
-func agentTreePrefix(depth int) string {
-	if depth <= 0 {
-		return ""
-	}
-	return strings.Repeat("  ", depth)
-}
-
 func statusIcon(status string) string {
 	switch status {
 	case "running", string(enums.RoleStatusActive), string(board.TaskInProgress):

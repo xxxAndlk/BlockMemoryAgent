@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -352,4 +353,117 @@ func CommonCollectTaskSummaries(block *types.SessionBlock) []string {
 		summaries = append(summaries, fmt.Sprintf("%s: %s", task, shortResult))
 	}
 	return summaries
+}
+
+// SelfTestReport 是测试助手输出的结构化报告。
+type SelfTestReport struct {
+	Passed bool     `json:"passed"`
+	Issues []string `json:"issues"`
+	Report string   `json:"report"`
+}
+
+// runSelfTestAssistant 派遣轻量测试助手验证任务结果。
+// 默认关闭（agent.assistant_self_test_enabled / agent.domain_self_test_enabled），
+// 开启后对助手级/领域级结果做质量检查，并将测试结论归档到 MetaMemory。
+func runSelfTestAssistant(
+	ctx context.Context,
+	modelFactory *model.ModelFactory,
+	toolCallback ToolCallback,
+	rt *runtime.Runtime,
+	state *types.ThreeLayerState,
+	task string,
+	result *types.AgentResult,
+	progress ProgressCallback,
+	agentName string,
+	llmTracker *model.LLMCallTracker,
+) (*types.AgentResult, error) {
+	if modelFactory == nil {
+		return nil, fmt.Errorf("modelFactory not available for self-test")
+	}
+
+	summary := ""
+	if result != nil {
+		summary = result.SummaryForUser
+	}
+	prompt := fmt.Sprintf(`你是测试助手。请验证以下任务是否完成并给出测试报告。
+原任务：%s
+执行结果：%s
+请检查：1) 是否完成目标 2) 是否有明显错误 3) 模块间协作是否有问题。
+只输出 JSON：{"passed":true/false,"issues":["..."],"report":"..."}`,
+		task, summary)
+
+	resp, err := modelFactory.CallLightweightWithRetry(ctx, prompt)
+	if err != nil {
+		return nil, fmt.Errorf("self-test llm call failed: %w", err)
+	}
+
+	// 提取 JSON 块（允许模型包裹在 markdown 代码块中）
+	jsonStr := extractJSONBlock(resp)
+	var report SelfTestReport
+	if err := json.Unmarshal([]byte(jsonStr), &report); err != nil {
+		// 解析失败时回退为文本报告
+		report = SelfTestReport{
+			Passed: true,
+			Report: resp,
+		}
+	}
+
+	reportText := report.Report
+	if reportText == "" {
+		if report.Passed {
+			reportText = "测试通过"
+		} else {
+			reportText = "测试未通过"
+		}
+	}
+	if !report.Passed && len(report.Issues) > 0 {
+		reportText += "\n问题: " + strings.Join(report.Issues, "; ")
+	}
+
+	if progress != nil {
+		progress(ctx, ProgressEvent{
+			SessionID: sessionIDFromState(state),
+			Kind:      "test_result",
+			Agent:     agentName,
+			Message:   fmt.Sprintf("自测结果: passed=%v issues=%d", report.Passed, len(report.Issues)),
+			Detail:    reportText,
+		})
+	}
+
+	selfTestResult := &types.AgentResult{
+		SummaryForUser: reportText,
+		MemoryForMeta:  fmt.Sprintf("自测结论: passed=%v issues=%d", report.Passed, len(report.Issues)),
+	}
+	for _, issue := range report.Issues {
+		if strings.TrimSpace(issue) != "" {
+			selfTestResult.Facts = append(selfTestResult.Facts, "issue: "+issue)
+		}
+	}
+	return selfTestResult, nil
+}
+
+// extractJSONBlock 从可能包含 markdown 代码块的文本中提取 JSON 对象。
+func extractJSONBlock(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		lines := strings.Split(s, "\n")
+		var body []string
+		for i, line := range lines {
+			if i == 0 && strings.HasPrefix(line, "```") {
+				continue
+			}
+			if strings.TrimSpace(line) == "```" {
+				break
+			}
+			body = append(body, line)
+		}
+		s = strings.Join(body, "\n")
+	}
+	// 兜底：取第一个 '{' 到最后一个 '}' 之间的内容
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start >= 0 && end > start {
+		return s[start : end+1]
+	}
+	return s
 }

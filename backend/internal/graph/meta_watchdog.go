@@ -128,8 +128,10 @@ func (n *MetaAgentNode) runWatchdog(ctx context.Context, state *types.ThreeLayer
 		if n.compressor != nil {
 			if block != nil && len(block.Agents) > 0 {
 				for _, agentID := range block.Agents {
-					if err := n.compressor.Compress(ctx, agentID, state.SessionID); err == nil {
-						n.emit(ctx, "think", fmt.Sprintf("已对 Agent %s 执行 Episode 压缩", agentID))
+					stats, err := n.compressor.Compress(ctx, agentID, state.SessionID)
+					if err == nil && stats != nil {
+						n.emit(ctx, "think", fmt.Sprintf("已对 Agent %s 执行 Episode 压缩: raw=%d standard=%d saved=%dB",
+							agentID, stats.RawKept, stats.Compressed, stats.BytesBefore-stats.BytesAfter))
 					}
 				}
 			}

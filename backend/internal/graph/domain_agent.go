@@ -26,23 +26,23 @@ import (
 // 并发安全：节点字段在构造后只读；实例状态由 registry 内部锁保护。
 // dispatchAssistantsParallel 路径（当前未启用）用 sync.Mutex 保护结果 map。
 type DomainAgentNode struct {
-	name           string                // 节点名（固定 "DomainAgent"）
-	instID         string                // 本实例ID
-	registry       *RoleRegistry         // 角色注册表
-	factory        *RoleFactory          // 动态角色工厂（创建 Assistant/SubDomain）
-	modelFactory   *model.ModelFactory   // 模型工厂，按角色获取 ChatModel
-	toolCallback   ToolCallback          // 工具执行结果回调（推 UI）
-	llmTracker     *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token）
-	rt             *runtime.Runtime      // Runtime 聚合体（板/邮箱/Skill/人格/Watchdog）
-	progress       ProgressCallback      // 进度回调（推思考/意图/Token）
-	blockMemory    BlockMemoryStore      // 块记忆存储（特性3：向量检索归档）
-	recalledMemory string                // 本次 Invoke 检索到的相似块记忆文本（注入 analyzeTasks）
-	recallAttempted bool                 // 是否已尝试检索块记忆（无论命中与否）；用于 analyzeTasks 区分"未检索"与"检索未命中"
-	memCallback    MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
-	snapshotMgr    AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
-	snapshot       *types.AgentSnapshot  // 本次 Invoke 加载到的快照
-	logger         *logger.Logger        // 结构化日志器（P1-2）
-	stepCounter    atomic.Int64          // 单调步骤计数器，作为 Episode/Snapshot 幂等键
+	name            string                // 节点名（固定 "DomainAgent"）
+	instID          string                // 本实例ID
+	registry        *RoleRegistry         // 角色注册表
+	factory         *RoleFactory          // 动态角色工厂（创建 Assistant/SubDomain）
+	modelFactory    *model.ModelFactory   // 模型工厂，按角色获取 ChatModel
+	toolCallback    ToolCallback          // 工具执行结果回调（推 UI）
+	llmTracker      *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token）
+	rt              *runtime.Runtime      // Runtime 聚合体（板/邮箱/Skill/人格/Watchdog）
+	progress        ProgressCallback      // 进度回调（推思考/意图/Token）
+	blockMemory     BlockMemoryStore      // 块记忆存储（特性3：向量检索归档）
+	recalledMemory  string                // 本次 Invoke 检索到的相似块记忆文本（注入 analyzeTasks）
+	recallAttempted bool                  // 是否已尝试检索块记忆（无论命中与否）；用于 analyzeTasks 区分"未检索"与"检索未命中"
+	memCallback     MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
+	snapshotMgr     AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
+	snapshot        *types.AgentSnapshot  // 本次 Invoke 加载到的快照
+	logger          *logger.Logger        // 结构化日志器（P1-2）
+	stepCounter     atomic.Int64          // 单调步骤计数器，作为 Episode/Snapshot 幂等键
 }
 
 // NewDomainAgentNode 创建领域Agent节点。
@@ -417,6 +417,31 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 	// 11. 生成本块 AgentResult 并汇总结果、标记完成、继续图循环（交回 MetaAgent 决策下一步）
 	block.Result = buildBlockResult(inst.Domain, block, combinedSummary, combinedMemory)
 	n.summarizeResults(state) // 汇总写入 state.Reason
+
+	// P3-2：领域级自测（默认关闭）
+	if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.DomainSelfTestEnabled && block.Result != nil && block.Result.Error == "" {
+		domainTask := fmt.Sprintf("领域[%s]目标: %s", inst.Domain, block.Goal)
+		if testResult, err := runSelfTestAssistant(ctx, n.modelFactory, n.toolCallback, n.rt, state, domainTask, block.Result, n.progress, "DomainTester", n.llmTracker); err == nil && testResult != nil {
+			block.MetaMemory = append(block.MetaMemory, types.MetaMemoryEntry{
+				Timestamp: time.Now(),
+				Source:    n.instID,
+				Content:   testResult.SummaryForUser,
+				Tags:      []string{"test_report"},
+			})
+			for _, fact := range testResult.Facts {
+				if strings.TrimSpace(fact) == "" {
+					continue
+				}
+				block.MetaMemory = append(block.MetaMemory, types.MetaMemoryEntry{
+					Timestamp: time.Now(),
+					Source:    n.instID,
+					Content:   fact,
+					Tags:      []string{"fact", "test"},
+				})
+			}
+		}
+	}
+
 	if log := n.sessionLogger(ctx); log != nil {
 		log.Event(ctx, "result", fmt.Sprintf("domain=%s summary=%s", state.CurrentDomain, truncateString(state.Reason, 200)), map[string]any{
 			"domain":  state.CurrentDomain,
@@ -478,10 +503,10 @@ func (n *DomainAgentNode) runDomainWatchdog(ctx context.Context, state *types.Th
 				n.instID, totalTokens, d.Tokens, d.Reason))
 		if log := n.sessionLogger(ctx); log != nil {
 			log.Event(ctx, "watchdog_evict", fmt.Sprintf("domain=%s tokens=%d hard=%d", state.CurrentDomain, totalTokens, d.Tokens), map[string]any{
-				"agent":         n.instID,
-				"domain":        state.CurrentDomain,
-				"tokens":        totalTokens,
-				"hard_limit":    d.Tokens,
+				"agent":      n.instID,
+				"domain":     state.CurrentDomain,
+				"tokens":     totalTokens,
+				"hard_limit": d.Tokens,
 			})
 		}
 	}

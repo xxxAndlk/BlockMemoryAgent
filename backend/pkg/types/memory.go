@@ -31,6 +31,18 @@ type Episode struct {
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
+// CompressStats 记录一次 Episode 压缩操作的统计信息。
+type CompressStats struct {
+	// RawKept 保留 Raw 的 Episode 数量。
+	RawKept int `json:"raw_kept"`
+	// Compressed 被压缩为 Standard 的 Episode 数量。
+	Compressed int `json:"compressed"`
+	// BytesBefore 压缩前 FullObservation 总字节数。
+	BytesBefore int64 `json:"bytes_before"`
+	// BytesAfter 压缩后 FullObservation 总字节数（被压缩的置空）。
+	BytesAfter int64 `json:"bytes_after"`
+}
+
 // ToolCall 工具调用记录：单次工具执行的结构化留痕。
 type ToolCall struct {
 	// Name 工具名（如 ReadFile / RunCommand），与 ToolExecutor case 对齐。
@@ -183,4 +195,3 @@ type RelevanceScore struct {
 	// FinalScore 加权融合后的最终评分，用于排序。
 	FinalScore float64 `json:"final_score"`
 }
-

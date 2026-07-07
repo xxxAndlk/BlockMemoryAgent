@@ -213,6 +213,30 @@ func (s *PostgresStore) CountEpisodes(ctx context.Context, agentID, topicID stri
 	return count, err
 }
 
+// CountEpisodesByLevel 统计 Agent 在某话题下各 compression_level 的数量。
+// 返回: map[compression_level]count，用于记忆层评测（P3-1）。
+func (s *PostgresStore) CountEpisodesByLevel(ctx context.Context, agentID, topicID string) (map[int]int, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT compression_level, COUNT(*) FROM agent_private_memory
+		WHERE agent_id = $1 AND topic_id = $2
+		GROUP BY compression_level
+	`, agentID, topicID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[int]int)
+	for rows.Next() {
+		var level, count int
+		if err := rows.Scan(&level, &count); err != nil {
+			return nil, err
+		}
+		result[level] = count
+	}
+	return result, rows.Err()
+}
+
 // SaveSnapshot 保存 Agent 快照 (UPSERT)。
 // 参数:
 //   - snapshot: 含 AgentID/TopicID 与完整上下文状态

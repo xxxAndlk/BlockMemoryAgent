@@ -1,17 +1,17 @@
 package server
 
 import (
-	"context"       // 超时上下文
-	"encoding/json" // JSON 编解码
-	"fmt"           // 格式化字符串
-	"math"          // 时间衰减用 math.Exp
-	"net/http"      // HTTP 处理器
-	"os"            // 文件读取 / Stat
-	"path/filepath" // filepath.Base
+	"context"            // 超时上下文
+	"encoding/json"      // JSON 编解码
+	"fmt"                // 格式化字符串
+	"math"               // 时间衰减用 math.Exp
+	"net/http"           // HTTP 处理器
+	"os"                 // 文件读取 / Stat
+	"path/filepath"      // filepath.Base
 	stdruntime "runtime" // 进程运行时指标
-	"strconv"       // Atoi 等
-	"strings"       // 字符串处理
-	"time"          // 超时与时间戳
+	"strconv"            // Atoi 等
+	"strings"            // 字符串处理
+	"time"               // 超时与时间戳
 
 	"github.com/blockmemory/agent/backend/internal/memory"      // BlockMemory 检索
 	"github.com/blockmemory/agent/backend/internal/model"       // ModelFactory
@@ -658,6 +658,83 @@ func (h *APIHandler) MemoryLevelsHandler(w http.ResponseWriter, r *http.Request)
 		"topic_id": topicID,
 		"total":    total,
 		"levels":   levels,
+	})
+}
+
+// MemoryEvalHandler GET /api/memory/eval — 记忆层简化评测入口（P3-1）
+// 职责：汇总所有 (agent_id, topic_id) 下的 Raw/Standard 分布，输出评测 JSON。
+// 调用方应先跑 test/coding/ 与 test/api/ 集成测试，再请求本端点获取分布数据。
+func (h *APIHandler) MemoryEvalHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.pgStore == nil {
+		http.Error(w, "postgres store not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	rows, err := h.pgStore.DB().QueryContext(r.Context(), `
+		SELECT agent_id, topic_id, compression_level, COUNT(*)
+		FROM agent_private_memory
+		GROUP BY agent_id, topic_id, compression_level
+		ORDER BY topic_id, agent_id, compression_level
+	`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type pairStat struct {
+		AgentID string         `json:"agent_id"`
+		TopicID string         `json:"topic_id"`
+		Levels  map[string]int `json:"levels"`
+		Total   int            `json:"total"`
+	}
+
+	pairs := make(map[string]*pairStat)
+	grandTotal := 0
+	grandRaw := 0
+	grandStandard := 0
+
+	for rows.Next() {
+		var agentID, topicID string
+		var level, count int
+		if err := rows.Scan(&agentID, &topicID, &level, &count); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		key := topicID + "/" + agentID
+		p, ok := pairs[key]
+		if !ok {
+			p = &pairStat{AgentID: agentID, TopicID: topicID, Levels: map[string]int{"raw": 0, "standard": 0}}
+			pairs[key] = p
+		}
+		switch level {
+		case 0:
+			p.Levels["raw"] = count
+			grandRaw += count
+		case 1:
+			p.Levels["standard"] = count
+			grandStandard += count
+		}
+		p.Total += count
+		grandTotal += count
+	}
+
+	var pairList []*pairStat
+	for _, p := range pairs {
+		pairList = append(pairList, p)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"total_episodes": grandTotal,
+		"raw":            grandRaw,
+		"standard":       grandStandard,
+		"pairs":          pairList,
+		"note":           "Run test/coding/ and test/api/ integration tests, then call this endpoint to evaluate Raw/Standard distribution.",
 	})
 }
 

@@ -121,6 +121,16 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 		result = &types.AgentResult{}
 	}
 
+	// P3-2：助手级自测（默认关闭）
+	if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.AssistantSelfTestEnabled && result.Error == "" {
+		if testResult, err := runSelfTestAssistant(ctx, n.modelFactory, n.toolCallback, n.rt, state, task, result, n.progress, roleDef.Name, n.llmTracker); err == nil && testResult != nil {
+			if testResult.SummaryForUser != "" {
+				result.SummaryForUser += "\n\n[自测] " + testResult.SummaryForUser
+			}
+			result.Facts = append(result.Facts, testResult.Facts...)
+		}
+	}
+
 	// 7. 回写结果到 SessionBlock：SummaryForUser 写入 TaskResults，MemoryForMeta/Facts 写入 MetaMemory（P0-1）
 	if callReq != nil {
 		if blockID, ok := callReq.Context["block_id"].(string); ok {

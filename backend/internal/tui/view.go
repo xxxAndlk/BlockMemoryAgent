@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -204,7 +205,7 @@ func (m Model) renderRightPanels(w, h int) string {
 	// 极小高度下两者之和可能超过 h，按 h 裁剪并确保计划面板至少 2 行。
 	if topH+bottomH > h {
 		if h >= 5 {
-			topH = h*55/100
+			topH = h * 55 / 100
 			if topH < 3 {
 				topH = 3
 			}
@@ -343,7 +344,9 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
 		}
 		meta := fmt.Sprintf("%s %s", icon+statusText, elapsed)
 		// 保留序号+标题，右侧对齐状态与耗时
-		titlePart := prefix + t.Title
+		// P3-3：过长标题先经 LLM 语义精简，再按显示宽度截断
+		briefTitle := m.summarizeTaskTitle(t.Title)
+		titlePart := prefix + briefTitle
 		avail := innerW - lipgloss.Width(meta) - 1
 		if avail < lipgloss.Width(prefix)+4 {
 			avail = lipgloss.Width(prefix) + 4
@@ -434,28 +437,154 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	if len(m.agentsNodes) == 0 {
 		lines = append(lines, "(no agents)")
 	} else {
-		for _, node := range m.agentsNodes {
+		for i, node := range m.agentsNodes {
 			// 过滤掉大量已完成且无目标的无意义临时助手，避免面板被刷屏。
 			if node.depth >= 2 && node.goal == "" &&
 				(node.status == enums.RoleStatusDone || node.status == enums.RoleStatusIdle) {
 				continue
 			}
 
-			prefix := agentTreePrefix(node.depth)
-			icon := statusIcon(string(node.status))
-			badge := agentStatusBadge(m.styles, node.status)
-			name := node.name
-			if node.goal != "" {
-				goal := strings.ReplaceAll(node.goal, "\n", " ")
-				name += " " + m.styles.Dim.Render(truncate(goal, innerW-lipgloss.Width(prefix)-lipgloss.Width(name)-lipgloss.Width(badge)-4))
-			}
-			line := fmt.Sprintf("%s%s %s %s", prefix, icon, name, badge)
-			lines = append(lines, truncate(line, innerW))
+			card := m.agentCardLine(node, i, innerW)
+			lines = append(lines, card...)
 		}
 	}
 
 	body := strings.Join(lines, "\n")
 	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
+}
+
+// agentCardLine 渲染单个 Agent 卡片行，返回可能占多行的字符串切片。
+// 参考“新TUI页.png”设计：状态色点 + 按角色着色的名称 + 状态徽章 + 时间戳 + 任务描述。
+func (m Model) agentCardLine(node agentTreeNode, idx, innerW int) []string {
+	prefix := agentTreePrefix(m.agentsNodes, idx)
+	prefixW := runewidth.StringWidth(prefix)
+	avail := innerW - prefixW
+	if avail < 10 {
+		avail = 10
+	}
+
+	icon := statusIcon(string(node.status))
+	iconStyled := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor(string(node.status)))).Render(icon)
+	nameColor := agentRoleColor(node.roleType)
+	nameStyled := lipgloss.NewStyle().Foreground(lipgloss.Color(nameColor)).Bold(true).Render(node.name)
+	badge := agentStatusBadge(m.styles, node.status)
+
+	ts := ""
+	if !node.createdAt.IsZero() {
+		ts = node.createdAt.Format("15:04:05")
+	}
+	tsStyled := m.styles.Dim.Render(ts)
+
+	// 第一行：前缀 + 状态点 + 名称 + 徽章 + 时间戳
+	line := fmt.Sprintf("%s%s %s %s", prefix, iconStyled, nameStyled, badge)
+	if ts != "" {
+		gap := avail - lipgloss.Width(line) + prefixW - lipgloss.Width(tsStyled)
+		if gap < 1 {
+			gap = 1
+		}
+		line += strings.Repeat(" ", gap) + tsStyled
+	}
+	line = truncate(line, innerW)
+
+	lines := []string{line}
+
+	// 第二行：任务描述（goal），深度缩进对齐
+	if node.goal != "" && !node.isClarify {
+		goal := strings.ReplaceAll(node.goal, "\n", " ")
+		goalPrefix := strings.Repeat(" ", prefixW) + "  "
+		goalAvail := innerW - runewidth.StringWidth(goalPrefix)
+		if goalAvail < 10 {
+			goalAvail = 10
+		}
+		goalLine := goalPrefix + m.styles.Dim.Render(truncate(goal, goalAvail))
+		lines = append(lines, goalLine)
+	}
+
+	return lines
+}
+
+// agentRoleColor 返回不同 Agent 类型的主题色。
+func agentRoleColor(roleType enums.RoleType) string {
+	switch roleType {
+	case enums.RoleTypeMeta:
+		return cMeta
+	case enums.RoleTypeDomain:
+		return cDomain
+	case enums.RoleTypeSubDomain:
+		return cSub
+	case enums.RoleTypeFixed, enums.RoleTypeDynamic:
+		return cAssist
+	default:
+		return cInfo
+	}
+}
+
+// statusColor 返回状态对应的颜色。
+func statusColor(status string) string {
+	switch status {
+	case "running", string(enums.RoleStatusActive), string(board.TaskInProgress):
+		return cStatusRun
+	case "awaiting_clarify", string(enums.RoleStatusWaiting), string(board.TaskBlocked):
+		return cStatusWait
+	case "completed", string(board.TaskDone):
+		return cStatusDone
+	case "error", string(board.TaskFailed):
+		return cStatusErr
+	default:
+		return cStatusIdle
+	}
+}
+
+// agentTreePrefix 根据节点在扁平树中的位置生成树状连接符前缀。
+func agentTreePrefix(nodes []agentTreeNode, idx int) string {
+	if idx < 0 || idx >= len(nodes) {
+		return ""
+	}
+	depth := nodes[idx].depth
+	if depth == 0 {
+		return ""
+	}
+
+	var parts []string
+	for d := 1; d <= depth; d++ {
+		// 向上找到当前节点在第 d 层的祖先
+		ancestorIdx := -1
+		for j := idx; j >= 0; j-- {
+			if nodes[j].depth == d {
+				ancestorIdx = j
+				break
+			}
+		}
+		if ancestorIdx == -1 {
+			parts = append(parts, "   ")
+			continue
+		}
+		// 判断该祖先是否是其层级中的最后一个兄弟
+		isLast := true
+		for j := ancestorIdx + 1; j < len(nodes); j++ {
+			if nodes[j].depth < d {
+				break
+			}
+			if nodes[j].depth == d {
+				isLast = false
+				break
+			}
+		}
+		if d == depth {
+			if isLast {
+				parts = append(parts, "└─ ")
+			} else {
+				parts = append(parts, "├─ ")
+			}
+		} else {
+			if isLast {
+				parts = append(parts, "   ")
+			} else {
+				parts = append(parts, "│  ")
+			}
+		}
+	}
+	return strings.Join(parts, "")
 }
 
 // collectChatItems 收集当前应展示的全部 chatItem，包含真实会话消息/事件，
@@ -869,4 +998,44 @@ func truncate(s string, n int) string {
 	}
 	b.WriteString("…")
 	return b.String()
+}
+
+const (
+	// taskTitleSummarizeThreshold 任务标题超过该显示宽度时才触发 LLM 精简。
+	taskTitleSummarizeThreshold = 60
+	// taskTitleMaxBriefWidth 精简后的任务标题最大显示宽度。
+	taskTitleMaxBriefWidth = 40
+)
+
+// summarizeTaskTitle 对过长任务标题做语义精简。
+// 优先读缓存；LLM 不可用时回退到机械截断。
+func (m *Model) summarizeTaskTitle(title string) string {
+	w := runewidth.StringWidth(title)
+	if w <= taskTitleSummarizeThreshold {
+		return title
+	}
+	if brief, ok := m.taskBriefCache[title]; ok {
+		return brief
+	}
+	if m.modelFactory == nil {
+		brief := truncate(title, taskTitleMaxBriefWidth)
+		m.taskBriefCache[title] = brief
+		return brief
+	}
+	prompt := fmt.Sprintf("将以下任务描述压缩成 %d 字以内的简短任务名，保留核心动作与对象，不要解释：\n%s", taskTitleMaxBriefWidth, title)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	brief, err := m.modelFactory.CallLightweightWithRetry(ctx, prompt)
+	if err != nil || strings.TrimSpace(brief) == "" {
+		brief = truncate(title, taskTitleMaxBriefWidth)
+	} else {
+		brief = strings.TrimSpace(brief)
+		// 去除可能的中文引号或 markdown 标记
+		brief = strings.Trim(brief, "\"'"+"`「」【】()")
+		if runewidth.StringWidth(brief) > taskTitleMaxBriefWidth {
+			brief = truncate(brief, taskTitleMaxBriefWidth)
+		}
+	}
+	m.taskBriefCache[title] = brief
+	return brief
 }

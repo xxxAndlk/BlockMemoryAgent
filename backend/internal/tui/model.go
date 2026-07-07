@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/internal/store"
@@ -23,13 +24,14 @@ type Model struct {
 	width  int
 	height int
 
-	sessionMgr *server.SessionManager
-	registry   *graph.RoleRegistry
-	rt         *runtime.Runtime
-	dagHandler *server.DAGHandler
-	pgStore    *store.PostgresStore
-	httpAddr   string
-	modelName  string
+	sessionMgr   *server.SessionManager
+	registry     *graph.RoleRegistry
+	rt           *runtime.Runtime
+	dagHandler   *server.DAGHandler
+	pgStore      *store.PostgresStore
+	httpAddr     string
+	modelName    string
+	modelFactory *model.ModelFactory
 
 	styles *Styles
 
@@ -62,6 +64,9 @@ type Model struct {
 	// agents tree (built every tick)
 	agentsNodes []agentTreeNode
 
+	// taskBriefCache 缓存 LLM 精简后的任务标题，避免同一长描述重复请求。
+	taskBriefCache map[string]string
+
 	// v2.0 面板开关
 	agentPanelVisible bool
 	planBarVisible    bool
@@ -76,7 +81,7 @@ type Model struct {
 	inputCursor  int
 	inputHistory map[string][]string // sessionID -> 历史输入
 	inputHistIdx int
-	lastKeyTime  time.Time           // 上次按键时间，用于区分快速粘贴与手动回车
+	lastKeyTime  time.Time // 上次按键时间，用于区分快速粘贴与手动回车
 
 	// overlay
 	overlayTitle  string
@@ -107,6 +112,7 @@ type agentTreeNode struct {
 	status    enums.RoleStatus
 	goal      string
 	isClarify bool
+	createdAt time.Time
 }
 
 // NewModel builds a TUI model wired to backend dependencies.
@@ -118,6 +124,7 @@ func NewModel(
 	pgStore *store.PostgresStore,
 	httpAddr string,
 	modelName string,
+	modelFactory *model.ModelFactory,
 ) *Model {
 	m := &Model{
 		sessionMgr:       sessionMgr,
@@ -127,6 +134,7 @@ func NewModel(
 		pgStore:          pgStore,
 		httpAddr:         httpAddr,
 		modelName:        modelName,
+		modelFactory:     modelFactory,
 		styles:           NewStyles(),
 		focus:            panelChat,
 		chatFollowBottom: true,
@@ -135,6 +143,7 @@ func NewModel(
 		inputHistory:     make(map[string][]string),
 		flashMu:          &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
 		chatVP:           viewport.New(0, 0),
+		taskBriefCache:   make(map[string]string),
 	}
 	m.chatVP.SetContent("")
 	m.refreshSessions()
@@ -261,12 +270,13 @@ func (m *Model) rebuildAgents() {
 		}
 	}
 	m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-		depth:    0,
-		instID:   "MetaAgent",
-		name:     "MetaAgent",
-		roleType: enums.RoleTypeMeta,
-		status:   metaStatus,
-		goal:     metaGoal,
+		depth:     0,
+		instID:    "MetaAgent",
+		name:      "MetaAgent",
+		roleType:  enums.RoleTypeMeta,
+		status:    metaStatus,
+		goal:      metaGoal,
+		createdAt: s.StartedAt,
 	})
 
 	insts := m.registry.GetInstancesBySession(s.ID)
@@ -288,13 +298,14 @@ func (m *Model) rebuildAgents() {
 			}
 		}
 		m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-			depth:    1,
-			instID:   inst.ID,
-			name:     instName(m.registry, inst),
-			domain:   inst.Domain,
-			roleType: inst.Type,
-			status:   inst.Status,
-			goal:     goal,
+			depth:     1,
+			instID:    inst.ID,
+			name:      instName(m.registry, inst),
+			domain:    inst.Domain,
+			roleType:  inst.Type,
+			status:    inst.Status,
+			goal:      goal,
+			createdAt: inst.CreatedAt,
 		})
 		for _, childID := range inst.Children {
 			child := byID[childID]
@@ -304,12 +315,13 @@ func (m *Model) rebuildAgents() {
 			depth := 2
 			if child.Type == enums.RoleTypeSubDomain {
 				m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-					depth:    depth,
-					instID:   child.ID,
-					name:     instName(m.registry, child),
-					domain:   child.Domain,
-					roleType: child.Type,
-					status:   child.Status,
+					depth:     depth,
+					instID:    child.ID,
+					name:      instName(m.registry, child),
+					domain:    child.Domain,
+					roleType:  child.Type,
+					status:    child.Status,
+					createdAt: child.CreatedAt,
 				})
 				for _, subID := range child.Children {
 					sub := byID[subID]
@@ -317,22 +329,24 @@ func (m *Model) rebuildAgents() {
 						continue
 					}
 					m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-						depth:    3,
-						instID:   sub.ID,
-						name:     instName(m.registry, sub),
-						domain:   sub.Domain,
-						roleType: sub.Type,
-						status:   sub.Status,
+						depth:     3,
+						instID:    sub.ID,
+						name:      instName(m.registry, sub),
+						domain:    sub.Domain,
+						roleType:  sub.Type,
+						status:    sub.Status,
+						createdAt: sub.CreatedAt,
 					})
 				}
 			} else if child.Type == enums.RoleTypeFixed || child.Type == enums.RoleTypeDynamic {
 				m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-					depth:    depth,
-					instID:   child.ID,
-					name:     instName(m.registry, child),
-					domain:   child.Domain,
-					roleType: child.Type,
-					status:   child.Status,
+					depth:     depth,
+					instID:    child.ID,
+					name:      instName(m.registry, child),
+					domain:    child.Domain,
+					roleType:  child.Type,
+					status:    child.Status,
+					createdAt: child.CreatedAt,
 				})
 			}
 		}

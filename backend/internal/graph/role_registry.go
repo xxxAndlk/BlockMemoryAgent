@@ -266,6 +266,40 @@ func (r *RoleRegistry) RemoveInstance(instID string) {
 	delete(r.instances, instID)
 }
 
+// RemoveSessionInstances 清理某会话下的所有角色实例。
+// 用于会话续话/结束时重置运行时拓扑，避免旧 Agent 残留在右侧面板。
+// 副作用：从 instances 表删除所有 SessionID == sessionID 的实例；
+//
+//	同时删除仅被这些实例引用的动态角色定义。
+//
+// 并发安全：持写锁。
+func (r *RoleRegistry) RemoveSessionInstances(sessionID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// 先收集要删除的实例 ID 及其角色定义 ID
+	removedInst := 0
+	defRefCount := make(map[string]int)
+	for id, inst := range r.instances {
+		if inst.SessionID == sessionID {
+			delete(r.instances, id)
+			removedInst++
+		} else {
+			// 统计仍被其他实例引用的动态角色
+			defRefCount[inst.RoleDefID]++
+		}
+	}
+
+	// 删除不再被任何实例引用的动态角色定义
+	for defID := range r.dynamicDefs {
+		if defRefCount[defID] == 0 {
+			delete(r.dynamicDefs, defID)
+		}
+	}
+
+	return removedInst
+}
+
 // CleanupExpired 清理过期实例。
 // 由后台周期任务调用（或会话结束时手动调一次）。
 // 返回：本次清理的实例数。

@@ -253,6 +253,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	mux.HandleFunc("/api/snapshot", wrap(apiHandler.SnapshotHandler))
 	mux.HandleFunc("/api/memory/search", wrap(apiHandler.MemorySearchHandler))
 	mux.HandleFunc("/api/memory/levels", wrap(apiHandler.MemoryLevelsHandler))
+	mux.HandleFunc("/api/memory/eval", wrap(apiHandler.MemoryEvalHandler))
 	mux.HandleFunc("/api/skills", wrap(apiHandler.SkillsHandler))
 	mux.HandleFunc("/api/agents/", wrap(agentRouter(apiHandler)))
 	mux.HandleFunc("/api/files", wrap(apiHandler.FilesHandler))

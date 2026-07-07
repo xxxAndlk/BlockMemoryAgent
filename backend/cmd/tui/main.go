@@ -223,7 +223,7 @@ func main() {
 	log.Printf("TUI backend listening at %s", httpAddr)
 
 	modelName := roleCfg.MetaAgent.ModelConfig.Model
-	model := tui.NewModel(sessionMgr, registry, rt, dagHandler, pgStore, httpAddr, modelName)
+	model := tui.NewModel(sessionMgr, registry, rt, dagHandler, pgStore, httpAddr, modelName, modelFactory)
 
 	// CI 环境或 stdin 非 TTY 时自动禁用 alt-screen，避免输出被吞或光标异常。
 	useAltScreen := !*noAltScreen && os.Getenv("CI") == "" && isatty.IsTerminal(os.Stdin.Fd())
@@ -363,5 +363,3 @@ func (a *pgHistoryAdapter) RecentSessionHistories(ctx context.Context, limit int
 	}
 	return out, nil
 }
-
-

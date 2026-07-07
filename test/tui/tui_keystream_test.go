@@ -25,6 +25,7 @@ func TestTUIKeyStream(t *testing.T) {
 		f.Server.Deps.Postgres,
 		f.Server.URL(),
 		"mock-model",
+		f.Server.Deps.ModelFactory,
 	)
 
 	// Ensure the model starts with a sane initial state.
