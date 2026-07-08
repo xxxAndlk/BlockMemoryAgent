@@ -62,7 +62,7 @@ func (n *SubDomainAgentNode) analyzeSubTasksWithLLM(ctx context.Context, subDoma
 子任务:`, subDomain, goal)
 
 	caller := "SubDomainAgent/子任务分析"
-	resp, callErr, _ := n.callLLMAs(ctx, caller, prompt)
+	resp, callErr, _ := n.CallLLM(ctx, prompt, LLMCallOptions{Caller: caller})
 	if callErr != nil || resp == "" {
 		return nil
 	}

@@ -52,9 +52,9 @@ type loopDetector struct {
 	maxRepeat      int
 	maxEmptyStreak int
 
-	rounds        int
-	toolHistory   []toolCallFingerprint
-	emptyStreak   int
+	rounds      int
+	toolHistory []toolCallFingerprint
+	emptyStreak int
 }
 
 // newLoopDetector 创建循环检测器。maxRounds 通常等于传给 blades.WithMaxIterations 的值。
@@ -146,7 +146,7 @@ func executeWithTools(
 	progress ProgressCallback,
 	agentName string,
 	maxIters int,
-	llmTracker *model.LLMCallTracker,
+	llmTracker llmCallTracker,
 ) (*types.AgentResult, []*ToolResult) {
 	var allResults []*ToolResult
 	sessionID := sessionIDFromState(state)
@@ -321,7 +321,7 @@ func buildAssistantPrompts(roleDef *types.RoleDefinition, skillBrief string, sta
 // executeMockAssistant mock 路径：无 blades provider 时单次 llm.Generate，并记录用量（P0-4）。
 func executeMockAssistant(
 	ctx context.Context, llm model.LLMClient, systemPrompt, userMsg, agentName string,
-	llmTracker *model.LLMCallTracker, emit emitFunc,
+	llmTracker llmCallTracker, emit emitFunc,
 	emitDetail func(ctx context.Context, kind, msg, detail string),
 ) (*types.AgentResult, []*ToolResult) {
 	emit(ctx, "llm", "无 blades provider（mock 模式），单次 LLM 调用")
@@ -373,7 +373,7 @@ func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *bla
 	var lastMessage *blades.Message
 	var totalUsage blades.TokenUsage
 	detector := newLoopDetector(maxIters)
-	const maxInputTokensBudget = 80000  // 单轮输入 token 硬上限，超此视为上下文爆炸
+	const maxInputTokensBudget = 80000 // 单轮输入 token 硬上限，超此视为上下文爆炸
 	const softWarnThreshold = 50000    // 软阈值：超此 emit 警告但不退出
 	softWarned := false                // 软阈值只警告一次，避免刷屏
 	for m, err := range agent.Run(ctx, invocation) {
@@ -421,7 +421,7 @@ func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *bla
 // recordBladesCall 记录一次 blades 路径 LLM 调用；real 用量为 0 时回退 EstimateTokens（P0-4）。
 // 返回最终记录/展示用的 input/output token 数（tracker 为 nil 时回退估算值）。
 // 兜底：input/output 均保证至少为 1，避免 token_usage 事件出现全 0 导致面板统计为空。
-func recordBladesCall(tracker *model.LLMCallTracker, ctx context.Context, dur time.Duration, err error,
+func recordBladesCall(tracker llmCallTracker, ctx context.Context, dur time.Duration, err error,
 	agentName, systemPrompt, userMsg, response string, inReal, outReal int) (inTok, outTok int) {
 	prompt := systemPrompt + "\n\n" + userMsg
 	inTok = inReal
@@ -466,7 +466,7 @@ func executeAssistantWithTools(
 	progress ProgressCallback,
 	agentName string,
 	maxIters int,
-	llmTracker *model.LLMCallTracker,
+	llmTracker llmCallTracker,
 ) (*types.AgentResult, []*ToolResult) {
 	if modelFactory == nil {
 		return nil, nil

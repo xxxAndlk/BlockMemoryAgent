@@ -103,7 +103,7 @@ func (n *DomainAgentNode) shouldSplitWithLLM(ctx context.Context, domain string,
 只回答"是"或"否"。`, domain, len(tasks), strings.Join(tasks, "\n"))
 
 	// 调用 LLM（caller 为"拆分判断"）
-	resp, err, _ := n.callLLMAs(ctx, "DomainAgent/拆分判断", prompt)
+	resp, err, _ := n.CallLLM(ctx, prompt, LLMCallOptions{Caller: "DomainAgent/拆分判断"})
 	if err != nil {
 		return false // 调用失败：不拆分
 	}
@@ -232,7 +232,7 @@ func (n *DomainAgentNode) inferSubDomainsWithLLM(ctx context.Context, domain str
 子领域:`, domain)
 
 	// 调用 LLM
-	resp, err, _ := n.callLLMAs(ctx, caller, prompt)
+	resp, err, _ := n.CallLLM(ctx, prompt, LLMCallOptions{Caller: caller})
 	if err != nil || resp == "" {
 		return nil
 	}

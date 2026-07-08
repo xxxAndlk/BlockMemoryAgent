@@ -123,12 +123,18 @@ func (n *MetaAgentNode) finalizeSession(ctx context.Context, state *types.ThreeL
 		n.updateSessionSummary(state)
 	} else if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
 		// 有模型工厂且未触发 LLM 跳过：调 LLM 润色最终回答
-		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是BlockMemoryAgent，一个本地AI开发助手。请基于以下各助手的执行结果，生成一个清晰、完整的最终回答给用户。
+		resp, err, timedOut := n.CallLLM(ctx, fmt.Sprintf(`你是BlockMemoryAgent，一个本地AI开发助手。请基于以下各助手的执行结果，生成一个清晰、完整的最终回答给用户。
 
 各助手执行结果：
 %s
 
-请直接输出最终回答，不要加任何前缀或总结性语句。回答请控制在 %d 字以内，保留关键结论与必要细节。`, state.SessionSummary, limit))
+请直接输出最终回答，不要加任何前缀或总结性语句。回答请控制在 %d 字以内，保留关键结论与必要细节。`, state.SessionSummary, limit), LLMCallOptions{
+			Caller:       "MetaAgent",
+			InjectSoul:   true,
+			UseMetaModel: true,
+			SoftTimeout:  30 * time.Second,
+			HardTimeout:  90 * time.Second,
+		})
 		// 成功：替换为润色后的回答
 		if !timedOut && err == nil && resp != "" {
 			state.SessionSummary = resp

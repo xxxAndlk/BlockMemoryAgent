@@ -9,6 +9,21 @@ import (
 	"github.com/blockmemory/agent/backend/internal/runtime"
 )
 
+// llmCallTracker 是 graph 包内部对 LLM 调用追踪器的最小依赖接口。
+// 使用接口而非具体 *model.LLMCallTracker，便于单元测试注入 recording/mock tracker。
+type llmCallTracker interface {
+	CallWithTimeout(ctx context.Context, llm model.LLMClient, prompt, caller string, fastTimeout, slowTimeout time.Duration) (string, error, bool)
+	Records() []model.CallRecord
+	ShouldSkipLLM() bool
+	SetRecordCallback(cb func(context.Context, model.CallRecord))
+	RecordCall(ctx context.Context, dur time.Duration, err error, caller, promptSummary, prompt, response string, inputTokens, outputTokens int, timedOut bool)
+	StatsString() string
+	Stats() (callCount, timeoutCount int, avgDur, maxDur time.Duration)
+	TokenTotals() (inputTokens, outputTokens int)
+	TokenTotalsByAgent(callerSub string) (inputTokens, outputTokens int)
+	LayerStatsSnapshot() []model.LayerStats
+}
+
 // BaseAgentNode 是 MetaAgentNode / DomainAgentNode / SubDomainAgentNode 的公共依赖与行为基类。
 //
 // 提取原本在三类节点中重复声明的 registry / factory / modelFactory / progress / logger /
@@ -20,7 +35,7 @@ type BaseAgentNode struct {
 	modelFactory *model.ModelFactory
 	progress     ProgressCallback
 	logger       *logger.Logger
-	llmTracker   *model.LLMCallTracker
+	llmTracker   llmCallTracker
 	rt           *runtime.Runtime
 	toolCallback ToolCallback
 

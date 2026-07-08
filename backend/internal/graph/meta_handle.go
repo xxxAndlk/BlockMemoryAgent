@@ -76,7 +76,13 @@ func (n *MetaAgentNode) handleInitialClassify(ctx context.Context, state *types.
 func (n *MetaAgentNode) executeDirectAnswer(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	n.emit(ctx, "intend", "直接回答简单问题")
 	prompt := fmt.Sprintf("用户问题：%s\n请根据你的人格与能力，直接给出简洁友好的回答，不要调用任何工具。", state.DomainGoal)
-	answer, err, _ := n.callLLM(ctx, prompt)
+	answer, err, _ := n.CallLLM(ctx, prompt, LLMCallOptions{
+		Caller:       "MetaAgent",
+		InjectSoul:   true,
+		UseMetaModel: true,
+		SoftTimeout:  30 * time.Second,
+		HardTimeout:  90 * time.Second,
+	})
 	if err != nil {
 		n.emit(ctx, "error", "直接回答失败，回退到常规路由: "+err.Error())
 		// 回退：继续走常规路由，避免再次进入 executeDirectAnswer 死循环

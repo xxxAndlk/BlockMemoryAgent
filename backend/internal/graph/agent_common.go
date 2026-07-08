@@ -201,7 +201,7 @@ func CommonExecuteAssistantTask(
 	agentName string,
 	maxIters int,
 	enforceWriteGate bool,
-	llmTracker *model.LLMCallTracker,
+	llmTracker llmCallTracker,
 ) (*types.AgentResult, error) {
 	// 1. 优先使用 LLM + 工具执行
 	if modelFactory != nil {
@@ -375,7 +375,7 @@ func runSelfTestAssistant(
 	result *types.AgentResult,
 	progress ProgressCallback,
 	agentName string,
-	llmTracker *model.LLMCallTracker,
+	llmTracker llmCallTracker,
 ) (*types.AgentResult, error) {
 	if modelFactory == nil {
 		return nil, fmt.Errorf("modelFactory not available for self-test")

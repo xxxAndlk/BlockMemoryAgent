@@ -7,6 +7,7 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"log"
 	"strings"
+	"time"
 )
 
 // DomainInfo 领域信息。
@@ -42,7 +43,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 	if n.modelFactory != nil && !n.llmTracker.ShouldSkipLLM() {
 		n.emit(ctx, "llm", "调用 LLM 进行领域分析...")
 		// 构造分析 prompt：要求 JSON 数组，含指代词时优先创建"检索历史与文件"领域
-		resp, err, timedOut := n.callLLM(ctx, fmt.Sprintf(`你是一个多Agent系统的领域分析器。请分析以下用户目标，确定需要哪些业务领域来协作完成。
+		resp, err, timedOut := n.CallLLM(ctx, fmt.Sprintf(`你是一个多Agent系统的领域分析器。请分析以下用户目标，确定需要哪些业务领域来协作完成。
 
 用户目标: %s
 %s
@@ -55,7 +56,13 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 - 输出JSON数组格式: [{"name":"领域名","goal":"该领域需要完成的目标"}]
 - 只输出JSON数组，不要代码块标记，不要任何解释文字
 
-领域列表:`, goal, fmtEnvSection(), messagesSection))
+领域列表:`, goal, fmtEnvSection(), messagesSection), LLMCallOptions{
+			Caller:       "MetaAgent",
+			InjectSoul:   true,
+			UseMetaModel: true,
+			SoftTimeout:  30 * time.Second,
+			HardTimeout:  90 * time.Second,
+		})
 		if !timedOut && err == nil && resp != "" {
 			n.emit(ctx, "think", "LLM 返回领域分析结果，正在解析")
 			// 解析 JSON 为领域列表

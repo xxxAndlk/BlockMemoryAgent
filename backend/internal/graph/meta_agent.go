@@ -119,7 +119,10 @@ func (n *MetaAgentNode) TimeoutStats() (callCount, timeoutCount int, avgDur, max
 // LLMTracker 暴露 LLM 调用追踪器。
 // 供外部（如 SessionManager）读取详细统计与最近调用记录。
 func (n *MetaAgentNode) LLMTracker() *model.LLMCallTracker {
-	return n.llmTracker
+	if t, ok := n.llmTracker.(*model.LLMCallTracker); ok {
+		return t
+	}
+	return nil
 }
 
 // Name 返回节点名称。

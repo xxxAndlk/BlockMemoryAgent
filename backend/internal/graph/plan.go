@@ -44,7 +44,7 @@ func (n *DomainAgentNode) generatePlan(ctx context.Context, state *types.ThreeLa
 - 只输出 JSON，不要其他文字
 
 JSON:`, state.CurrentDomain, state.DomainGoal, strings.Join(tasks, "\n"))
-	resp, err, _ := n.callLLMAs(ctx, "DomainAgent/计划生成", prompt)
+	resp, err, _ := n.CallLLM(ctx, prompt, LLMCallOptions{Caller: "DomainAgent/计划生成"})
 	if err != nil || resp == "" {
 		return nil
 	}

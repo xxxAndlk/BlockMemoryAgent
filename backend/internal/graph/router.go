@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -196,7 +197,14 @@ confidence: 0.0-1.0
 用户目标: ` + goal + `
 
 请输出：`
-	resp, err, timedOut := n.callLightweightAs(ctx, "MetaAgent/路由判定(轻量)", prompt)
+	resp, err, timedOut := n.CallLLM(ctx, prompt, LLMCallOptions{
+		Caller:      "MetaAgent/路由判定(轻量)",
+		Lightweight: true,
+		InjectSoul:  true,
+		SoftTimeout: 30 * time.Second,
+		HardTimeout: 90 * time.Second,
+		Temperature: &routingTemperature,
+	})
 	if timedOut || err != nil || resp == "" {
 		return ""
 	}
