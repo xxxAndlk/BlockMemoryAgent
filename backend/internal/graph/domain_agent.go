@@ -7,9 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
-	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/watchdog"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -26,22 +24,15 @@ import (
 // 并发安全：节点字段在构造后只读；实例状态由 registry 内部锁保护。
 // dispatchAssistantsParallel 路径（当前未启用）用 sync.Mutex 保护结果 map。
 type DomainAgentNode struct {
+	BaseAgentNode
 	name            string                // 节点名（固定 "DomainAgent"）
 	instID          string                // 本实例ID
-	registry        *RoleRegistry         // 角色注册表
-	factory         *RoleFactory          // 动态角色工厂（创建 Assistant/SubDomain）
-	modelFactory    *model.ModelFactory   // 模型工厂，按角色获取 ChatModel
-	toolCallback    ToolCallback          // 工具执行结果回调（推 UI）
-	llmTracker      *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token）
-	rt              *runtime.Runtime      // Runtime 聚合体（板/邮箱/Skill/人格/Watchdog）
-	progress        ProgressCallback      // 进度回调（推思考/意图/Token）
 	blockMemory     BlockMemoryStore      // 块记忆存储（特性3：向量检索归档）
 	recalledMemory  string                // 本次 Invoke 检索到的相似块记忆文本（注入 analyzeTasks）
 	recallAttempted bool                  // 是否已尝试检索块记忆（无论命中与否）；用于 analyzeTasks 区分"未检索"与"检索未命中"
 	memCallback     MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
 	snapshotMgr     AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
 	snapshot        *types.AgentSnapshot  // 本次 Invoke 加载到的快照
-	logger          *logger.Logger        // 结构化日志器（P1-2）
 	stepCounter     atomic.Int64          // 单调步骤计数器，作为 Episode/Snapshot 幂等键
 }
 
@@ -55,36 +46,20 @@ type DomainAgentNode struct {
 // 返回：装配好的节点；modelFactory/toolCallback/runtime/progress 通过 Set* 后置注入。
 func NewDomainAgentNode(instID string, registry *RoleRegistry, factory *RoleFactory) *DomainAgentNode {
 	return &DomainAgentNode{
-		name:       "DomainAgent",             // 节点名固定
-		instID:     instID,                    // 绑定实例
-		registry:   registry,                  // 注入注册表
-		factory:    factory,                   // 注入工厂
-		llmTracker: model.NewLLMCallTracker(), // 新建 LLM 调用追踪器
+		BaseAgentNode: BaseAgentNode{
+			llmTracker: model.NewLLMCallTracker(),
+			registry:   registry,
+			factory:    factory,
+			agentLabel: func() string {
+				if inst := registry.GetInstance(instID); inst != nil && inst.Domain != "" {
+					return "DomainAgent[" + inst.Domain + "]"
+				}
+				return "DomainAgent"
+			},
+		},
+		name:   "DomainAgent", // 节点名固定
+		instID: instID,        // 绑定实例
 	}
-}
-
-// SetModelFactory 设置模型工厂（用于LLM任务分析）。
-// 由图构建器在 Build 阶段注入。
-func (n *DomainAgentNode) SetModelFactory(mf *model.ModelFactory) {
-	n.modelFactory = mf
-}
-
-// SetToolCallback 设置工具执行回调。
-// 工具执行后通过此回调把 ToolResult 推给 UI。
-func (n *DomainAgentNode) SetToolCallback(cb ToolCallback) {
-	n.toolCallback = cb
-}
-
-// SetRuntime 注入 Runtime（板/邮箱/Skill）。
-// 由图构建器注入；nil 时 Skill 装配与跨域协作能力退化。
-func (n *DomainAgentNode) SetRuntime(rt *runtime.Runtime) {
-	n.rt = rt
-}
-
-// SetProgressCallback 注入进度回调。
-// 用于推送思考/意图/LLM 调用/Token 消耗等事件到 UI。
-func (n *DomainAgentNode) SetProgressCallback(cb ProgressCallback) {
-	n.progress = cb
 }
 
 // SetBlockMemoryStore 注入块记忆存储（特性3）。
@@ -103,94 +78,6 @@ func (n *DomainAgentNode) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
 // nil 时不加载/保存快照。
 func (n *DomainAgentNode) SetAgentSnapshotManager(s AgentSnapshotManager) {
 	n.snapshotMgr = s
-}
-
-// SetLogger 注入结构化日志器（P1-2）。
-// 注入后自动配置 LLM 调用追踪器的持久化回调，将每次 LLM 调用写入 session_logs。
-func (n *DomainAgentNode) SetLogger(l *logger.Logger) {
-	n.logger = l
-	if l != nil {
-		n.llmTracker.SetRecordCallback(func(ctx context.Context, r model.CallRecord) {
-			sessionID := SessionIDFromContext(ctx)
-			if sessionID == "" {
-				return
-			}
-			level := "info"
-			msg := "llm_call"
-			if r.Err != nil {
-				level = "error"
-				msg = "llm_call_error: " + r.Err.Error()
-			}
-			agent := "DomainAgent"
-			if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
-				agent = "DomainAgent[" + inst.Domain + "]"
-			}
-			l.WithSession(sessionID).WithAgent(agent).WithPhase("llm_call").
-				Event(ctx, "llm_call", msg, map[string]any{
-					"input_tokens":  r.InputTokens,
-					"output_tokens": r.OutputTokens,
-					"latency_ms":    int(r.Duration.Milliseconds()),
-					"timed_out":     r.TimedOut,
-					"prompt":        r.Prompt,
-					"response":      r.Response,
-					"level":         level,
-				})
-		})
-	}
-}
-
-// emit 推送进度事件。
-//
-// 参数：
-//   - ctx：请求上下文（用于提取 SessionID）
-//   - kind：事件类型（think/intend/llm/error 等）
-//   - message：事件摘要
-//
-// 副作用：若 progress 为 nil 则无操作；否则触发回调（可能阻塞）。
-func (n *DomainAgentNode) emit(ctx context.Context, kind, message string) {
-	// 未注入回调则直接返回
-	if n.progress == nil {
-		return
-	}
-	// 默认 Agent 名，若实例有领域则带上领域后缀便于 UI 区分
-	agent := "DomainAgent"
-	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
-		agent = "DomainAgent[" + inst.Domain + "]"
-	}
-	// 推送事件
-	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: agent, Message: message})
-}
-
-// emitDetail 推送带详情的进度事件。
-// 与 emit 的区别：附带 detail 字段，用于展示 Prompt 全文/Token 明细等调试信息。
-func (n *DomainAgentNode) emitDetail(ctx context.Context, kind, message, detail string) {
-	// 未注入回调则直接返回
-	if n.progress == nil {
-		return
-	}
-	// 默认 Agent 名，若实例有领域则带上领域后缀
-	agent := "DomainAgent"
-	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
-		agent = "DomainAgent[" + inst.Domain + "]"
-	}
-	// 推送带 detail 的事件
-	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: agent, Message: message, Detail: detail})
-}
-
-// sessionLogger 返回按 session_id 绑定的 Logger；未注入时返回 nil-safe 的退化 logger。
-func (n *DomainAgentNode) sessionLogger(ctx context.Context) *logger.Logger {
-	if n.logger == nil {
-		return logger.New(nil)
-	}
-	sessionID := SessionIDFromContext(ctx)
-	agent := "DomainAgent"
-	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
-		agent = "DomainAgent[" + inst.Domain + "]"
-	}
-	if sessionID == "" {
-		return n.logger.WithAgent(agent)
-	}
-	return n.logger.WithSession(sessionID).WithAgent(agent)
 }
 
 // Name 返回节点名称。

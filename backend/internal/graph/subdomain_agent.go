@@ -8,9 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
-	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -32,74 +30,31 @@ import (
 //
 // 并发安全：节点字段在构造后只读；实例状态由 registry 内部锁保护。
 type SubDomainAgentNode struct {
-	name         string                // 节点名（固定 "SubDomainAgent"）
-	instID       string                // 本实例ID
-	registry     *RoleRegistry         // 角色注册表
-	factory      *RoleFactory          // 动态角色工厂（创建 Assistant）
-	modelFactory *model.ModelFactory   // 模型工厂，按角色获取 ChatModel
-	toolCallback ToolCallback          // 工具执行结果回调（推 UI）
-	progress     ProgressCallback      // 进度回调（推思考/意图/Token）
-	llmTracker   *model.LLMCallTracker // LLM 调用追踪器（统计超时/Token）
-	rt           *runtime.Runtime      // Runtime 聚合体（用于读取 AgentCfg 等动态参数）
-	memCallback  MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
-	snapshotMgr  AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
-	logger       *logger.Logger        // 结构化日志器（P1-2）
-	stepCounter  atomic.Int64          // 单调步骤计数器，作为 Episode/Snapshot 幂等键
-}
-
-// SetRuntime 注入 Runtime。nil 时动态参数回退默认值。
-func (n *SubDomainAgentNode) SetRuntime(rt *runtime.Runtime) {
-	n.rt = rt
+	BaseAgentNode
+	name        string                // 节点名（固定 "SubDomainAgent"）
+	instID      string                // 本实例ID
+	memCallback MemoryCallbackHandler // 记忆回调处理器（驱动 Episode 写入与快照保存）
+	snapshotMgr AgentSnapshotManager  // Agent 快照管理器（启动加载/结束保存）
+	stepCounter atomic.Int64          // 单调步骤计数器，作为 Episode/Snapshot 幂等键
 }
 
 // NewSubDomainAgentNode 创建子领域Agent节点。
 func NewSubDomainAgentNode(instID string, registry *RoleRegistry, factory *RoleFactory) *SubDomainAgentNode {
 	return &SubDomainAgentNode{
-		name:       "SubDomainAgent",
-		instID:     instID,
-		registry:   registry,
-		factory:    factory,
-		llmTracker: model.NewLLMCallTracker(),
+		BaseAgentNode: BaseAgentNode{
+			llmTracker: model.NewLLMCallTracker(),
+			registry:   registry,
+			factory:    factory,
+			agentLabel: func() string {
+				if inst := registry.GetInstance(instID); inst != nil && inst.Domain != "" {
+					return "SubDomainAgent[" + inst.Domain + "]"
+				}
+				return "SubDomainAgent"
+			},
+		},
+		name:   "SubDomainAgent",
+		instID: instID,
 	}
-}
-
-// emit 推送进度事件。
-func (n *SubDomainAgentNode) emit(ctx context.Context, kind, message string) {
-	if n.progress == nil {
-		return
-	}
-	agent := "SubDomainAgent"
-	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
-		agent = "SubDomainAgent[" + inst.Domain + "]"
-	}
-	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: agent, Message: message})
-}
-
-// emitDetail 推送带详情的进度事件。
-func (n *SubDomainAgentNode) emitDetail(ctx context.Context, kind, message, detail string) {
-	if n.progress == nil {
-		return
-	}
-	agent := "SubDomainAgent"
-	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
-		agent = "SubDomainAgent[" + inst.Domain + "]"
-	}
-	n.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Agent: agent, Message: message, Detail: detail})
-}
-
-// SetModelFactory 设置模型工厂。
-func (n *SubDomainAgentNode) SetModelFactory(mf *model.ModelFactory) {
-	n.modelFactory = mf
-}
-
-// SetToolCallback 设置工具执行回调。
-func (n *SubDomainAgentNode) SetToolCallback(cb ToolCallback) {
-	n.toolCallback = cb
-}
-
-// SetProgressCallback 注入进度回调。
-func (n *SubDomainAgentNode) SetProgressCallback(cb ProgressCallback) {
-	n.progress = cb
 }
 
 // SetMemoryCallbackHandler 注入记忆回调处理器。
@@ -110,55 +65,6 @@ func (n *SubDomainAgentNode) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
 // SetAgentSnapshotManager 注入 Agent 快照管理器。
 func (n *SubDomainAgentNode) SetAgentSnapshotManager(s AgentSnapshotManager) {
 	n.snapshotMgr = s
-}
-
-// sessionLogger 返回按 session_id 绑定的 Logger；未注入时返回 nil-safe 的退化 logger。
-func (n *SubDomainAgentNode) sessionLogger(ctx context.Context) *logger.Logger {
-	if n.logger == nil {
-		return logger.New(nil)
-	}
-	sessionID := SessionIDFromContext(ctx)
-	agent := "SubDomainAgent"
-	if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
-		agent = "SubDomainAgent[" + inst.Domain + "]"
-	}
-	if sessionID == "" {
-		return n.logger.WithAgent(agent)
-	}
-	return n.logger.WithSession(sessionID).WithAgent(agent)
-}
-
-// SetLogger 注入结构化日志器（P1-2）。
-func (n *SubDomainAgentNode) SetLogger(l *logger.Logger) {
-	n.logger = l
-	if l != nil {
-		n.llmTracker.SetRecordCallback(func(ctx context.Context, r model.CallRecord) {
-			sessionID := SessionIDFromContext(ctx)
-			if sessionID == "" {
-				return
-			}
-			level := "info"
-			msg := "llm_call"
-			if r.Err != nil {
-				level = "error"
-				msg = "llm_call_error: " + r.Err.Error()
-			}
-			agent := "SubDomainAgent"
-			if inst := n.registry.GetInstance(n.instID); inst != nil && inst.Domain != "" {
-				agent = "SubDomainAgent[" + inst.Domain + "]"
-			}
-			l.WithSession(sessionID).WithAgent(agent).WithPhase("llm_call").
-				Event(ctx, "llm_call", msg, map[string]any{
-					"input_tokens":  r.InputTokens,
-					"output_tokens": r.OutputTokens,
-					"latency_ms":    int(r.Duration.Milliseconds()),
-					"timed_out":     r.TimedOut,
-					"prompt":        r.Prompt,
-					"response":      r.Response,
-					"level":         level,
-				})
-		})
-	}
 }
 
 // Name 返回节点名称。
