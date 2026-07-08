@@ -1,8 +1,10 @@
 package graph
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,6 +146,25 @@ func TestBaseAgentNode_sessionLoggerWithSession(t *testing.T) {
 	}
 }
 
+// TestMetaAgentNode_sessionLoggerEmptySessionUsesBareLogger 验证 MetaAgentNode 在 sessionID 为空时
+// 返回不附加 Agent 标签的裸 logger，与重构前行为一致。
+func TestMetaAgentNode_sessionLoggerEmptySessionUsesBareLogger(t *testing.T) {
+	var buf bytes.Buffer
+	log := logger.NewWithWriter(nil, &buf)
+	meta := NewMetaAgentNode(&RoleRegistry{}, &RoleFactory{}, 4, 0)
+	meta.SetLogger(log)
+
+	got := meta.sessionLogger(context.Background())
+	if got == nil {
+		t.Fatalf("expected non-nil logger")
+	}
+	// 写一条日志并检查输出中不含 agent 字段
+	got.Info(context.Background(), "bare log test")
+	if strings.Contains(buf.String(), `"agent":"MetaAgent"`) {
+		t.Errorf("empty-session logger should not contain MetaAgent agent tag, got: %s", buf.String())
+	}
+}
+
 func TestBaseAgentNode_SetLoggerRecordCallback(t *testing.T) {
 	fs := &fakeLogStore{}
 	log := logger.NewWithWriter(fs, io.Discard)
@@ -184,5 +205,58 @@ func TestBaseAgentNode_SetLoggerRecordCallback(t *testing.T) {
 	}
 	if rec.Meta["output_tokens"] != 3 {
 		t.Errorf("output_tokens = %v, want 3", rec.Meta["output_tokens"])
+	}
+}
+
+// TestBaseAgentNode_SetLoggerRecordCallbackPrefersCaller 验证 LLM 记录回调优先使用 record.Caller，
+// 仅在 Caller 为空时才 fallback 到 agentLabel。该行为保留 MetaAgent 原先的动态 caller 名称。
+func TestBaseAgentNode_SetLoggerRecordCallbackPrefersCaller(t *testing.T) {
+	fs := &fakeLogStore{}
+	log := logger.NewWithWriter(fs, io.Discard)
+	b := newBaseAgentNode()
+	b.agentLabel = func() string { return "MetaAgent" }
+	b.SetLogger(log)
+
+	ctx := WithSessionID(context.Background(), "s5")
+	b.llmTracker.RecordCall(ctx, 10*time.Millisecond, nil, "meta_analyzer", "summary", "prompt", "response", 1, 2, false)
+
+	var rec *store.SessionLogRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(fs.records) > 0 {
+			rec = fs.records[0]
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if rec == nil {
+		t.Fatalf("expected session log record")
+	}
+	if rec.Agent != "meta_analyzer" {
+		t.Errorf("agent = %q, want meta_analyzer", rec.Agent)
+	}
+}
+
+// TestBaseAgentNode_sessionLoggerEmptySessionHook 验证 emptySessionLogger 钩子在 sessionID 为空时被调用，
+// 用于保留 MetaAgent 返回裸 logger 的原有行为。
+func TestBaseAgentNode_sessionLoggerEmptySessionHook(t *testing.T) {
+	log := logger.NewWithWriter(nil, io.Discard)
+	called := false
+	b := BaseAgentNode{
+		logger:     log,
+		agentLabel: func() string { return "MetaAgent" },
+		emptySessionLogger: func() *logger.Logger {
+			called = true
+			return log
+		},
+	}
+
+	got := b.sessionLogger(context.Background())
+	if got == nil {
+		t.Fatalf("expected non-nil logger")
+	}
+	if !called {
+		t.Errorf("emptySessionLogger hook was not called")
 	}
 }

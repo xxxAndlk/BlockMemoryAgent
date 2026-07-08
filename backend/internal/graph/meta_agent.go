@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -61,7 +62,7 @@ type MetaAgentNode struct {
 //
 // 返回：装配好的节点；modelFactory/runtime/history/progress 通过 Set* 后置注入。
 func NewMetaAgentNode(registry *RoleRegistry, factory *RoleFactory, maxBlocks, summaryInterval int) *MetaAgentNode {
-	return &MetaAgentNode{
+	n := &MetaAgentNode{
 		BaseAgentNode: BaseAgentNode{
 			llmTracker: model.NewLLMCallTracker(),
 			registry:   registry,
@@ -73,6 +74,9 @@ func NewMetaAgentNode(registry *RoleRegistry, factory *RoleFactory, maxBlocks, s
 		summaryInterval: summaryInterval, // 摘要更新间隔
 		stepCount:       0,               // 步数清零
 	}
+	// 保留 MetaAgent 原有行为：无 sessionID 时返回裸 logger，不附加 "MetaAgent" Agent 标签。
+	n.emptySessionLogger = func() *logger.Logger { return n.logger }
+	return n
 }
 
 // SetBlockMemoryStore 注入块记忆存储（switchToNextBlock 幂等兜底归档用，TODO #4）。

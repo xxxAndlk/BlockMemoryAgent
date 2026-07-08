@@ -27,6 +27,11 @@ type BaseAgentNode struct {
 	// agentLabel 返回当前节点在进度事件与日志中应展示的 Agent 名称。
 	// MetaAgent 返回固定名；DomainAgent / SubDomainAgent 可动态附加领域后缀。
 	agentLabel func() string
+
+	// emptySessionLogger 在 sessionID 为空时返回可选的退化 logger。
+	// MetaAgent 原先在此场景返回裸 logger（不附加 Agent 标签），可通过设置此钩子保留旧行为；
+	// 未设置时保持 Domain/SubDomain 的统一行为：返回 WithAgent(agentLabel)。
+	emptySessionLogger func() *logger.Logger
 }
 
 // newBaseAgentNode 创建带有独立 LLM 调用追踪器的基类实例。
@@ -65,12 +70,9 @@ func (b *BaseAgentNode) SetLogger(l *logger.Logger) {
 			level = "error"
 			msg = "llm_call_error: " + r.Err.Error()
 		}
-		agent := ""
-		if b.agentLabel != nil {
+		agent := r.Caller
+		if agent == "" && b.agentLabel != nil {
 			agent = b.agentLabel()
-		}
-		if agent == "" {
-			agent = r.Caller
 		}
 		l.WithSession(sessionID).WithAgent(agent).WithPhase("llm_call").
 			Event(ctx, "llm_call", msg, map[string]any{
@@ -135,6 +137,9 @@ func (b *BaseAgentNode) sessionLogger(ctx context.Context) *logger.Logger {
 	}
 	sessionID := SessionIDFromContext(ctx)
 	if sessionID == "" {
+		if b.emptySessionLogger != nil {
+			return b.emptySessionLogger()
+		}
 		return b.logger.WithAgent(agent)
 	}
 	return b.logger.WithSession(sessionID).WithAgent(agent)
