@@ -50,13 +50,11 @@ func TestClassifyByRules_TowerDefenseBugExample(t *testing.T) {
 
 // TestProfileGoal_MultiAction 验证多维打分对多动作目标的识别。
 func TestProfileGoal_MultiAction(t *testing.T) {
-	// 塔防事故目标：4 个动作（查看/找出/修复/优化）+ 开放探索 + 多步骤（并）
+	// 塔防事故目标：4 个动作（查看/找出/修复/优化）+ 开放探索
+	// 注："并" 已从 stepSignals 移除（太常见），此目标靠 OpenEnded + ActionCount 识别
 	p := profileGoal("查看塔防游戏找出 bug 修复并优化")
 	if !p.OpenEnded {
 		t.Errorf("应识别为开放探索（找出/优化）")
-	}
-	if p.StepCount == 0 {
-		t.Errorf("应识别到多步骤信号（并）")
 	}
 	if p.HasLightAction && p.ActionCount <= 1 {
 		t.Errorf("多动作目标 ActionCount 应 ≥2，got %d", p.ActionCount)

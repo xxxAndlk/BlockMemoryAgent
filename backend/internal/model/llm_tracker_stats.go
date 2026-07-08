@@ -81,6 +81,12 @@ func (t *LLMCallTracker) Records() []CallRecord {
 //
 // 返回：(inputTokens, outputTokens) 累加值。
 // 并发安全：读锁保护。
+//
+// ⚠ 子串匹配风险：若一个 agent 名是另一个的子串（如 "agent_2" 是 "agent_20" 的子串），
+// 传 "agent_2" 会同时命中两者，导致重复计数。调用方应传足够具体的名（如完整
+// "DomainAgent[xxx]" / "助手[临时助手]"），或改用精确匹配（解析 Caller 字段后 == 比较）。
+// 当前调用方 meta_watchdog.go 传 block.Agents 元素（实例 ID）与 Caller 格式（agentName）
+// 不一致，实际命中数为 0；此处保留子串匹配以兼容其他调用方，待后续统一格式。
 func (t *LLMCallTracker) TokenTotalsByAgent(callerSub string) (inputTokens, outputTokens int) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

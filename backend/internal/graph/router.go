@@ -93,10 +93,11 @@ func classifyByRules(n *MetaAgentNode, goal string) RoutePath {
 	}
 
 	// 兼容兜底：查询/搜索/资讯类单工具任务（HTTPGet / Web 搜索）。
-	// 仅在 profile 未识别到开放探索/多步骤/写/重动作时才走，避免
+	// 仅在 profile 未识别到开放探索/多步骤/写/轻量/重动作时才走，避免
 	// "分析现有代码找出问题并优化性能" 这类含开放探索词的目标被
-	// shouldDirectExecute 的 "分析" 关键词误判为 direct_tool。
-	if !p.OpenEnded && p.StepCount == 0 && !p.HasWriteAction && !p.HasHeavyAction && p.ActionCount <= 1 {
+	// shouldDirectExecute 的 "分析" 关键词误判为 direct_tool，
+	// 也避免 "查询新闻改一下API" 这类含轻量动作的多动作目标被误判。
+	if !p.OpenEnded && p.StepCount == 0 && !p.HasWriteAction && !p.HasHeavyAction && !p.HasLightAction && p.ActionCount <= 1 {
 		if n.shouldDirectExecute(goal) {
 			return RouteDirectTool
 		}

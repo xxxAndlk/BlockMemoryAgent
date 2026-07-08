@@ -1007,35 +1007,77 @@ const (
 	taskTitleMaxBriefWidth = 40
 )
 
+// taskBriefCacheMaxSize 缓存上限，超限淘汰任意一条。
+// TUI 单会话任务标题通常 <100，200 留足余量且内存可控。
+const taskBriefCacheMaxSize = 200
+
 // summarizeTaskTitle 对过长任务标题做语义精简。
-// 优先读缓存；LLM 不可用时回退到机械截断。
-func (m *Model) summarizeTaskTitle(title string) string {
+// 渲染路径严禁阻塞 LLM（bubbletea View() 必须秒回）：
+//   - 缓存命中 → 直接返回
+//   - 缓存未命中 → 立即返回机械截断，同时异步请求 LLM 填充缓存供下次渲染使用
+func (m Model) summarizeTaskTitle(title string) string {
 	w := runewidth.StringWidth(title)
 	if w <= taskTitleSummarizeThreshold {
 		return title
 	}
-	if brief, ok := m.taskBriefCache[title]; ok {
+	if brief, ok := m.getTaskBrief(title); ok {
 		return brief
 	}
+	// 未命中：立即截断返回，异步预热
+	fallback := truncate(title, taskTitleMaxBriefWidth)
+	m.setTaskBrief(title, fallback)
+	m.warmTaskBriefAsync(title)
+	return fallback
+}
+
+// getTaskBrief 加锁读缓存。
+func (m Model) getTaskBrief(title string) (string, bool) {
+	if m.taskBriefMu == nil {
+		return "", false
+	}
+	m.taskBriefMu.Lock()
+	defer m.taskBriefMu.Unlock()
+	brief, ok := m.taskBriefCache[title]
+	return brief, ok
+}
+
+// setTaskBrief 加锁写缓存，超限时淘汰任意一条。
+func (m Model) setTaskBrief(title, brief string) {
+	if m.taskBriefMu == nil {
+		return
+	}
+	m.taskBriefMu.Lock()
+	defer m.taskBriefMu.Unlock()
+	if len(m.taskBriefCache) >= taskBriefCacheMaxSize {
+		for k := range m.taskBriefCache {
+			delete(m.taskBriefCache, k)
+			break
+		}
+	}
+	m.taskBriefCache[title] = brief
+}
+
+// warmTaskBriefAsync 异步请求 LLM 精简标题，成功后更新缓存。
+// 失败/超时静默丢弃（已有 fallback 截断结果占位）。
+// 限制并发：通过 sync.Map 或 channel 限流可进一步优化，此处简单 goroutine 即可。
+func (m Model) warmTaskBriefAsync(title string) {
 	if m.modelFactory == nil {
-		brief := truncate(title, taskTitleMaxBriefWidth)
-		m.taskBriefCache[title] = brief
-		return brief
+		return
 	}
-	prompt := fmt.Sprintf("将以下任务描述压缩成 %d 字以内的简短任务名，保留核心动作与对象，不要解释：\n%s", taskTitleMaxBriefWidth, title)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	brief, err := m.modelFactory.CallLightweightWithRetry(ctx, prompt)
-	if err != nil || strings.TrimSpace(brief) == "" {
-		brief = truncate(title, taskTitleMaxBriefWidth)
-	} else {
+	mf := m.modelFactory
+	go func() {
+		prompt := fmt.Sprintf("将以下任务描述压缩成 %d 字以内的简短任务名，保留核心动作与对象，不要解释：\n%s", taskTitleMaxBriefWidth, title)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		brief, err := mf.CallLightweightWithRetry(ctx, prompt)
+		if err != nil || strings.TrimSpace(brief) == "" {
+			return
+		}
 		brief = strings.TrimSpace(brief)
-		// 去除可能的中文引号或 markdown 标记
 		brief = strings.Trim(brief, "\"'"+"`「」【】()")
 		if runewidth.StringWidth(brief) > taskTitleMaxBriefWidth {
 			brief = truncate(brief, taskTitleMaxBriefWidth)
 		}
-	}
-	m.taskBriefCache[title] = brief
-	return brief
+		m.setTaskBrief(title, brief)
+	}()
 }

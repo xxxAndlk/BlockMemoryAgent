@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -177,11 +178,14 @@ func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) 
 
 	// ReadFile 预检：拦截重读与超上限读取，避免上下文爆炸。
 	// 在真正执行前判断，避免浪费 IO 与 token。
+	// 路径归一化：LLM 可能传 "workspace/foo.js" / "./foo.js" / "workspace//foo.js"，
+	// 统一解析为绝对路径，否则与 recordReadFile 存储的 result.Path 不匹配，dedup 失效。
 	if name == "ReadFile" {
 		path, _ := args["path"].(string)
-		if blocked := r.checkReadFileBudget(ctx, path); blocked != "" {
+		normalizedPath := r.executor.resolvePath(path)
+		if blocked := r.checkReadFileBudget(ctx, normalizedPath); blocked != "" {
 			// 返回错误 JSON 给 LLM，并强制退出 Agent 循环
-			result := &ToolResult{Tool: "ReadFile", Path: path, Error: blocked}
+			result := &ToolResult{Tool: "ReadFile", Path: normalizedPath, Error: blocked}
 			r.mu.Lock()
 			*r.results = append(*r.results, result)
 			r.mu.Unlock()
@@ -243,16 +247,18 @@ func (r *toolRunner) run(ctx context.Context, name string, args map[string]any) 
 //   - readFiles 长度已达 maxReadFilePerTask：返回"超上限"错误，强制退出循环。
 //
 // 并发安全：持 readMu 锁读写 readFiles。
+// 路径归一化：调用方应传 resolvePath 后的绝对路径；此处额外 filepath.Clean 防 "./" "//" 等变体。
 func (r *toolRunner) checkReadFileBudget(ctx context.Context, path string) string {
 	if path == "" {
 		return ""
 	}
+	cleanPath := filepath.Clean(path)
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
 	// 重读检测：路径已在清单中
 	for _, p := range r.readFiles {
-		if p == path {
-			return fmt.Sprintf("该文件本任务已读过（%s），禁止重读。复用已返回内容推进任务；如需看其他段落请用 SearchInFiles 精确定位。", path)
+		if filepath.Clean(p) == cleanPath {
+			return fmt.Sprintf("该文件本任务已读过（%s），禁止重读。复用已返回内容推进任务；如需看其他段落请用 SearchInFiles 精确定位。", cleanPath)
 		}
 	}
 	// 上限检测：已达 maxReadFilePerTask 次上限
@@ -262,11 +268,21 @@ func (r *toolRunner) checkReadFileBudget(ctx context.Context, path string) strin
 	return ""
 }
 
-// recordReadFile 把路径加入已读清单（不去重，调用方已通过 checkReadFileBudget 保证不重）。
+// recordReadFile 把路径加入已读清单。
+// 路径归一化：与 checkReadFileBudget 保持一致，存 filepath.Clean 后的绝对路径。
+// 注意：由于 check 与 record 之间存在窗口，并发调用可能产生重复条目；
+// blades Agent 单 assistant 内 ReAct 串行，跨 assistant 不共享 runner，故实际无并发风险。
 func (r *toolRunner) recordReadFile(path string) {
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
-	r.readFiles = append(r.readFiles, path)
+	cleanPath := filepath.Clean(path)
+	// 防御性去重
+	for _, p := range r.readFiles {
+		if filepath.Clean(p) == cleanPath {
+			return
+		}
+	}
+	r.readFiles = append(r.readFiles, cleanPath)
 }
 
 // readListHint 返回注入 ReadFile 结果末尾的已读清单提示。

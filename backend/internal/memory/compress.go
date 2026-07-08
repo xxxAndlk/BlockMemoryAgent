@@ -76,7 +76,9 @@ func (c *Compressor) Compress(ctx context.Context, agentID, topicID string) (*ty
 
 	for _, ep := range compressed {
 		if err := c.store.SaveEpisode(ctx, agentID, topicID, ep); err != nil {
-			return stats, fmt.Errorf("persist compressed episode %s: %w", ep.StepID, err)
+			// 返回 nil 而非部分 stats：stats.Compressed 含未持久化的 episode，会误导调用方。
+			// 与 GetEpisodes 错误路径一致（返回 nil）。
+			return nil, fmt.Errorf("persist compressed episode %s: %w", ep.StepID, err)
 		}
 	}
 

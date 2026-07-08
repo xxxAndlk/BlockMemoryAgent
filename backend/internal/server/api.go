@@ -9,6 +9,7 @@ import (
 	"os"                 // 文件读取 / Stat
 	"path/filepath"      // filepath.Base
 	stdruntime "runtime" // 进程运行时指标
+	"sort"               // 排序响应列表
 	"strconv"            // Atoi 等
 	"strings"            // 字符串处理
 	"time"               // 超时与时间戳
@@ -714,19 +715,34 @@ func (h *APIHandler) MemoryEvalHandler(w http.ResponseWriter, r *http.Request) {
 		switch level {
 		case 0:
 			p.Levels["raw"] = count
-			grandRaw += count
+		 grandRaw += count
 		case 1:
 			p.Levels["standard"] = count
-			grandStandard += count
+		 grandStandard += count
+		default:
+			// 未预期 level：跳过，避免 raw+standard != total 的不一致
+			continue
 		}
 		p.Total += count
 		grandTotal += count
 	}
+	// 检查迭代错误（database/sql 契约：rows.Next() 退出可能因错误而非正常结束）
+	if err := rows.Err(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
+	// map 迭代顺序非确定，排序保证响应可复现（与 SQL ORDER BY 一致）
 	var pairList []*pairStat
 	for _, p := range pairs {
 		pairList = append(pairList, p)
 	}
+	sort.Slice(pairList, func(i, j int) bool {
+		if pairList[i].TopicID != pairList[j].TopicID {
+			return pairList[i].TopicID < pairList[j].TopicID
+		}
+		return pairList[i].AgentID < pairList[j].AgentID
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

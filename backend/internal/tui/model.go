@@ -65,7 +65,10 @@ type Model struct {
 	agentsNodes []agentTreeNode
 
 	// taskBriefCache 缓存 LLM 精简后的任务标题，避免同一长描述重复请求。
-	taskBriefCache map[string]string
+	// taskBriefMu 用指针避免 Model 值拷贝触发 copylocks（bubbletea Model 按值传递）。
+	// 容量上限 taskBriefCacheMaxSize，超限淘汰任意一条（见 view.go setTaskBriefCache）。
+	taskBriefCache   map[string]string
+	taskBriefMu      *sync.Mutex
 
 	// v2.0 面板开关
 	agentPanelVisible bool
@@ -144,6 +147,7 @@ func NewModel(
 		flashMu:          &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
 		chatVP:           viewport.New(0, 0),
 		taskBriefCache:   make(map[string]string),
+		taskBriefMu:      &sync.Mutex{},
 	}
 	m.chatVP.SetContent("")
 	m.refreshSessions()
