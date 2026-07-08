@@ -60,6 +60,7 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 			Caller:       "MetaAgent",
 			InjectSoul:   true,
 			UseMetaModel: true,
+			Temperature:  &routingTemperature,
 			SoftTimeout:  30 * time.Second,
 			HardTimeout:  90 * time.Second,
 		})

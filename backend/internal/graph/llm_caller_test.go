@@ -33,11 +33,12 @@ type recordedCall struct {
 	prompt string
 	soft   time.Duration
 	hard   time.Duration
+	llm    model.LLMClient
 }
 
 func (r *recordingTracker) CallWithTimeout(ctx context.Context, llm model.LLMClient, prompt, caller string, soft, hard time.Duration) (string, error, bool) {
 	r.mu.Lock()
-	r.calls = append(r.calls, recordedCall{caller: caller, prompt: prompt, soft: soft, hard: hard})
+	r.calls = append(r.calls, recordedCall{caller: caller, prompt: prompt, soft: soft, hard: hard, llm: llm})
 	r.mu.Unlock()
 	return r.LLMCallTracker.CallWithTimeout(ctx, llm, prompt, caller, soft, hard)
 }
@@ -46,6 +47,18 @@ func (r *recordingTracker) Calls() []recordedCall {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]recordedCall(nil), r.calls...)
+}
+
+// assertTemperatureWrapped 验证传入的 LLM 被 routingTemperature 包装。
+func assertTemperatureWrapped(t *testing.T, llm model.LLMClient) {
+	t.Helper()
+	wrapped, ok := llm.(*temperatureWrappedLLM)
+	if !ok {
+		t.Fatalf("expected *temperatureWrappedLLM, got %T", llm)
+	}
+	if wrapped.temperature != routingTemperature {
+		t.Errorf("wrapped temperature = %v, want %v", wrapped.temperature, routingTemperature)
+	}
 }
 
 // newMockModelFactory 构造一个指向 mock HTTP 服务器的 ModelFactory，
@@ -405,8 +418,8 @@ func TestCallLLM_EmitsProgressEventsInOrder(t *testing.T) {
 	}
 }
 
-// TestCallLLM_MetaLightweight_RoutingTemperature 验证 MetaAgent 轻量调用使用 0 温度包装。
-func TestCallLLM_MetaLightweight_RoutingTemperature(t *testing.T) {
+// TestCallLLM_MetaLightweight_UsesRoutingTemperature 验证 MetaAgent 轻量调用使用 0 温度包装。
+func TestCallLLM_MetaLightweight_UsesRoutingTemperature(t *testing.T) {
 	server := newMockLLMServer(t)
 	defer server.Close()
 	mf := newMockModelFactory(t, server.URL)
@@ -426,4 +439,56 @@ func TestCallLLM_MetaLightweight_RoutingTemperature(t *testing.T) {
 	if calls[0].caller != "MetaAgent/路由判定(轻量)" {
 		t.Errorf("caller = %q, want MetaAgent/路由判定(轻量)", calls[0].caller)
 	}
+	assertTemperatureWrapped(t, calls[0].llm)
+}
+
+// newTestMetaAgentNode 构造一个用于测试 MetaAgent 调用行为的 MetaAgentNode。
+func newTestMetaAgentNode(t *testing.T, mf *model.ModelFactory) (*MetaAgentNode, *recordingTracker) {
+	t.Helper()
+	tracker := &recordingTracker{LLMCallTracker: model.NewLLMCallTracker()}
+	n := NewMetaAgentNode(nil, nil, 5, 0)
+	n.modelFactory = mf
+	n.llmTracker = tracker
+	n.progress = func(ctx context.Context, ev ProgressEvent) {}
+	return n, tracker
+}
+
+// TestCallLLM_MetaAgent_NonLightweight_UsesRoutingTemperature 验证 MetaAgent 非轻量调用
+//（analyzeDomains / executeDirectAnswer / finalizeSession）默认被 routingTemperature 包装。
+func TestCallLLM_MetaAgent_NonLightweight_UsesRoutingTemperature(t *testing.T) {
+	server := newMockLLMServer(t)
+	defer server.Close()
+	mf := newMockModelFactory(t, server.URL)
+
+	ctx := WithSessionID(context.Background(), "s1")
+
+	t.Run("executeDirectAnswer", func(t *testing.T) {
+		n, tracker := newTestMetaAgentNode(t, mf)
+		_, _ = n.executeDirectAnswer(ctx, &types.ThreeLayerState{DomainGoal: "你好"})
+		calls := tracker.Calls()
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 call, got %d", len(calls))
+		}
+		assertTemperatureWrapped(t, calls[0].llm)
+	})
+
+	t.Run("analyzeDomains", func(t *testing.T) {
+		n, tracker := newTestMetaAgentNode(t, mf)
+		_ = n.analyzeDomains(ctx, &types.ThreeLayerState{DomainGoal: "开发一个商城系统"})
+		calls := tracker.Calls()
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 call, got %d", len(calls))
+		}
+		assertTemperatureWrapped(t, calls[0].llm)
+	})
+
+	t.Run("finalizeSession", func(t *testing.T) {
+		n, tracker := newTestMetaAgentNode(t, mf)
+		n.finalizeSession(ctx, &types.ThreeLayerState{SessionSummary: "已完成"})
+		calls := tracker.Calls()
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 call, got %d", len(calls))
+		}
+		assertTemperatureWrapped(t, calls[0].llm)
+	})
 }

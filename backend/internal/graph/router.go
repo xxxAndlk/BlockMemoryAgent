@@ -63,7 +63,7 @@ func (n *MetaAgentNode) ClassifyTask(ctx context.Context, state *types.ThreeLaye
 		return RouteDecision{Path: path, EnableSubdomain: path == RouteFullFourLayer}
 	}
 
-	// 2. LLM 兜底（轻量模型判定，复用 MetaAgent 的 callLLMAs 超时/熔断机制）
+	// 2. LLM 兜底（轻量模型判定，复用 MetaAgent 的 CallLLM 超时/熔断机制）
 	if n.modelFactory != nil && n.llmTracker != nil && !n.llmTracker.ShouldSkipLLM() {
 		if path := n.classifyRouteLLM(ctx, goal); path != "" {
 			return RouteDecision{Path: path, EnableSubdomain: path == RouteFullFourLayer}
