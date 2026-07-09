@@ -131,12 +131,12 @@ func TestCallWithTimeoutRetriesThenSucceeds(t *testing.T) {
 }
 
 // TestCallWithTimeoutAllFailReturnsError 验证 P0-1：3 次全部失败时返回错误，
-// 仅 1 条记录，且连续 3 次逻辑调用失败后进入 slowMode。
+// 仅 1 条记录。通用错误不再触发 slow mode（Task 4.10 行为修复）。
 func TestCallWithTimeoutAllFailReturnsError(t *testing.T) {
 	tracker := NewLLMCallTracker()
 	tracker.SetRecordCallback(func(ctx context.Context, r CallRecord) {}) // no-op
 
-	llm := &flakyLLM{resp: "never", failN: 100} // 永远失败
+	llm := &flakyLLM{resp: "never", failN: 100} // 永远返回通用错误
 	ctx := context.Background()
 
 	// 第一次逻辑调用：3 次重试全失败
@@ -148,14 +148,34 @@ func TestCallWithTimeoutAllFailReturnsError(t *testing.T) {
 		t.Fatalf("应重试 3 次，got %d", llm.calls)
 	}
 	if tracker.ShouldSkipLLM() {
-		t.Fatal("单次逻辑失败不应进入 slowMode")
+		t.Fatal("单次通用错误不应进入 slowMode")
 	}
 
-	// 再连续两次逻辑失败，累计 3 次后进入 slowMode
+	// 再连续两次通用错误，累计 3 次后仍不应进入 slowMode
 	tracker.CallWithTimeout(ctx, llm, "p", "MetaAgent", 5*time.Second, 10*time.Second)
+	tracker.CallWithTimeout(ctx, llm, "p", "MetaAgent", 5*time.Second, 10*time.Second)
+	if tracker.ShouldSkipLLM() {
+		t.Fatal("通用错误不应触发 slowMode")
+	}
+}
+
+// TestCallWithTimeoutConsecutiveTimeoutsTriggerSlowMode 验证连续超时触发慢速模式。
+func TestCallWithTimeoutConsecutiveTimeoutsTriggerSlowMode(t *testing.T) {
+	tracker := NewLLMCallTracker()
+	tracker.SetRecordCallback(func(ctx context.Context, r CallRecord) {}) // no-op
+
+	llm := &fakeLLM{err: context.DeadlineExceeded}
+	ctx := context.Background()
+
+	tracker.CallWithTimeout(ctx, llm, "p", "MetaAgent", 5*time.Second, 10*time.Second)
+	tracker.CallWithTimeout(ctx, llm, "p", "MetaAgent", 5*time.Second, 10*time.Second)
+	if tracker.ShouldSkipLLM() {
+		t.Fatal("2 次连续超时后不应进入 slowMode")
+	}
+
 	tracker.CallWithTimeout(ctx, llm, "p", "MetaAgent", 5*time.Second, 10*time.Second)
 	if !tracker.ShouldSkipLLM() {
-		t.Fatal("连续 3 次逻辑失败应进入 slowMode")
+		t.Fatal("3 次连续超时后应进入 slowMode")
 	}
 }
 
@@ -168,4 +188,72 @@ func TestRetryGenerateBackoffRespectsCancel(t *testing.T) {
 	if err == nil {
 		t.Fatal("取消的 ctx 应返回错误")
 	}
+}
+
+// TestLLMCallTrackerClassifiesErrors 是 Task 4.10 的回归测试：
+// 旧行为把 context.Canceled 也计入 timeoutCount 并触发 slow mode；
+// 修复后仅 context.DeadlineExceeded 计入超时，取消不再触发慢速模式。
+func TestLLMCallTrackerClassifiesErrors(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("context.Canceled does not trigger slow mode", func(t *testing.T) {
+		tracker := NewLLMCallTracker()
+		tracker.SetRecordCallback(func(context.Context, CallRecord) {})
+
+		// 记录 3 次 context.Canceled（旧 bug：这会进入 slow mode）
+		for i := 0; i < 3; i++ {
+			tracker.RecordCall(ctx, 0, context.Canceled, "test", "", "", "", 0, 0, false)
+		}
+
+		// 修复后断言：cancel 不计入 slow mode
+		if tracker.ShouldSkipLLM() {
+			t.Fatal("修复后：3 次 cancel 不应进入 slow mode")
+		}
+		calls, timeouts, _, _ := tracker.Stats()
+		if calls != 3 {
+			t.Fatalf("调用次数应为 3，got %d", calls)
+		}
+		if timeouts != 0 {
+			t.Fatalf("超时计数应为 0，got %d", timeouts)
+		}
+	})
+
+	t.Run("context.DeadlineExceeded triggers slow mode after threshold", func(t *testing.T) {
+		tracker := NewLLMCallTracker()
+		tracker.SetRecordCallback(func(context.Context, CallRecord) {})
+
+		tracker.RecordCall(ctx, 0, context.DeadlineExceeded, "test", "", "", "", 0, 0, true)
+		tracker.RecordCall(ctx, 0, context.DeadlineExceeded, "test", "", "", "", 0, 0, true)
+		if tracker.ShouldSkipLLM() {
+			t.Fatal("2 次超时后不应进入 slow mode")
+		}
+
+		tracker.RecordCall(ctx, 0, context.DeadlineExceeded, "test", "", "", "", 0, 0, true)
+		if !tracker.ShouldSkipLLM() {
+			t.Fatal("3 次连续超时后应进入 slow mode")
+		}
+	})
+
+	t.Run("nil error resets consecutive counters", func(t *testing.T) {
+		tracker := NewLLMCallTracker()
+		tracker.SetRecordCallback(func(context.Context, CallRecord) {})
+
+		tracker.RecordCall(ctx, 0, context.DeadlineExceeded, "test", "", "", "", 0, 0, true)
+		tracker.RecordCall(ctx, 0, context.DeadlineExceeded, "test", "", "", "", 0, 0, true)
+		tracker.RecordCall(ctx, 0, nil, "test", "", "", "ok", 0, 0, false)
+		if tracker.ShouldSkipLLM() {
+			t.Fatal("成功调用后应退出 slow mode")
+		}
+
+		_, timeouts, _, _ := tracker.Stats()
+		if timeouts != 0 {
+			t.Fatalf("成功调用后超时计数应清零，got %d", timeouts)
+		}
+
+		// 再次 1 次超时不应重新进入 slow mode
+		tracker.RecordCall(ctx, 0, context.DeadlineExceeded, "test", "", "", "", 0, 0, true)
+		if tracker.ShouldSkipLLM() {
+			t.Fatal("成功调用后仅 1 次超时不应进入 slow mode")
+		}
+	})
 }

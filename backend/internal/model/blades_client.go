@@ -54,6 +54,19 @@ func (c *BladesClient) Provider() blades.ModelProvider {
 	return c.provider // 直接返回底层 provider 引用
 }
 
+// doGenerate 执行 blades 生成请求并做通用校验。
+// 四个 Generate* 方法共享此 helper，避免重复构造请求与空响应检查。
+func (c *BladesClient) doGenerate(ctx context.Context, provider blades.ModelProvider, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	resp, err := provider.Generate(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("model generate: %w", err)
+	}
+	if resp == nil || resp.Message == nil {
+		return nil, fmt.Errorf("empty model response")
+	}
+	return resp, nil
+}
+
 // Generate 实现 LLMClient 接口的单轮文本生成。
 //
 // 职责：把 prompt 包装成单条 user message 调用底层 provider。
@@ -68,21 +81,13 @@ func (c *BladesClient) Provider() blades.ModelProvider {
 // 副作用：无（除底层 HTTP 调用外）。
 // 并发安全：底层 provider 线程安全，可并发调用。
 func (c *BladesClient) Generate(ctx context.Context, prompt string) (string, error) {
-	// 构造只含一条 user 消息的请求
 	req := &blades.ModelRequest{
 		Messages: []*blades.Message{blades.UserMessage(prompt)},
 	}
-	// 调用底层 provider 生成
-	resp, err := c.provider.Generate(ctx, req)
+	resp, err := c.doGenerate(ctx, c.provider, req)
 	if err != nil {
-		// 包装错误，保留原始 cause
-		return "", fmt.Errorf("model generate: %w", err)
+		return "", err
 	}
-	// 防御空响应（部分 provider 在异常时可能返回 nil）
-	if resp == nil || resp.Message == nil {
-		return "", fmt.Errorf("empty model response")
-	}
-	// 取出回复文本
 	return resp.Message.Text(), nil
 }
 
@@ -101,20 +106,13 @@ func (c *BladesClient) Generate(ctx context.Context, prompt string) (string, err
 //   - blades.TokenUsage: token 用量（InputTokens/OutputTokens/TotalTokens）
 //   - error: 调用失败或响应为空
 func (c *BladesClient) GenerateWithUsage(ctx context.Context, prompt string) (string, blades.TokenUsage, error) {
-	// 构造只含一条 user 消息的请求
 	req := &blades.ModelRequest{
 		Messages: []*blades.Message{blades.UserMessage(prompt)},
 	}
-	// 调用底层 provider 生成
-	resp, err := c.provider.Generate(ctx, req)
+	resp, err := c.doGenerate(ctx, c.provider, req)
 	if err != nil {
-		return "", blades.TokenUsage{}, fmt.Errorf("model generate: %w", err)
+		return "", blades.TokenUsage{}, err
 	}
-	// 防御空响应
-	if resp == nil || resp.Message == nil {
-		return "", blades.TokenUsage{}, fmt.Errorf("empty model response")
-	}
-	// 取出回复文本与用量
 	return resp.Message.Text(), resp.Message.TokenUsage, nil
 }
 
@@ -133,19 +131,13 @@ func (c *BladesClient) GenerateWithUsage(ctx context.Context, prompt string) (st
 // 副作用：无。
 // 并发安全：底层 provider 线程安全。
 func (c *BladesClient) GenerateWithSystem(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	// Instruction 字段承载 system 消息
 	req := &blades.ModelRequest{
-		Instruction: blades.SystemMessage(systemPrompt),                // 系统提示
-		Messages:    []*blades.Message{blades.UserMessage(userPrompt)}, // 用户输入
+		Instruction: blades.SystemMessage(systemPrompt),
+		Messages:    []*blades.Message{blades.UserMessage(userPrompt)},
 	}
-	// 调用底层 provider
-	resp, err := c.provider.Generate(ctx, req)
+	resp, err := c.doGenerate(ctx, c.provider, req)
 	if err != nil {
-		return "", fmt.Errorf("model generate: %w", err)
-	}
-	// 防御空响应
-	if resp == nil || resp.Message == nil {
-		return "", fmt.Errorf("empty model response")
+		return "", err
 	}
 	return resp.Message.Text(), nil
 }
@@ -183,17 +175,12 @@ func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, t
 		return c.Generate(ctx, prompt)
 	}
 
-	// 构造请求并调用临时 provider
 	req := &blades.ModelRequest{
 		Messages: []*blades.Message{blades.UserMessage(prompt)},
 	}
-	resp, err := override.Generate(ctx, req)
+	resp, err := c.doGenerate(ctx, override, req)
 	if err != nil {
-		return "", fmt.Errorf("override generate: %w", err)
-	}
-	// 防御空响应
-	if resp == nil || resp.Message == nil {
-		return "", fmt.Errorf("empty model response")
+		return "", err
 	}
 	return resp.Message.Text(), nil
 }

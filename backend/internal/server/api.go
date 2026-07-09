@@ -4,17 +4,14 @@ import (
 	"context"            // 超时上下文
 	"encoding/json"      // JSON 编解码
 	"fmt"                // 格式化字符串
-	"math"               // 时间衰减用 math.Exp
 	"net/http"           // HTTP 处理器
 	"os"                 // 文件读取 / Stat
 	"path/filepath"      // filepath.Base
 	stdruntime "runtime" // 进程运行时指标
-	"sort"               // 排序响应列表
 	"strconv"            // Atoi 等
-	"strings"            // 字符串处理
+	"sync"               // paused 互斥锁
 	"time"               // 超时与时间戳
 
-	"github.com/blockmemory/agent/backend/internal/memory"           // BlockMemory 检索
 	"github.com/blockmemory/agent/backend/internal/model"            // ModelFactory
 	"github.com/blockmemory/agent/backend/internal/runtime"          // Runtime
 	"github.com/blockmemory/agent/backend/internal/server/eventkind" // 事件类型常量
@@ -42,14 +39,17 @@ type APIHandler struct {
 		Load(ctx context.Context, agentID, topicID string) (*types.AgentSnapshot, error)
 	}
 	// graphControl 用于暂停/恢复 Graph
-	paused map[string]bool // topic_id -> 是否暂停
+	paused   map[string]bool // topic_id -> 是否暂停
+	pausedMu sync.RWMutex    // 保护 paused 的并发读写
 
-	rt           *runtime.Runtime          // 聚合运行时
-	sessionMgr   *SessionManager           // 会话管理器
-	pgStore      *store.PostgresStore      // Postgres 存储
-	redisStore   *store.RedisStore         // Redis 存储
-	roleCfg      *pkgconfig.RoleConfigFile // 角色配置
-	modelFactory *model.ModelFactory       // 模型工厂
+	rt            *runtime.Runtime          // 聚合运行时
+	sessionMgr    *SessionManager           // 会话管理器
+	pgStore       *store.PostgresStore      // Postgres 存储
+	redisStore    *store.RedisStore         // Redis 存储
+	roleCfg       *pkgconfig.RoleConfigFile // 角色配置
+	modelFactory  *model.ModelFactory       // 模型工厂
+	memoryService *MemoryService            // 记忆查询/评分服务
+	statsService  *StatsService             // 会话统计聚合服务
 }
 
 // NewAPIHandler 创建 API 处理器
@@ -80,6 +80,14 @@ func (h *APIHandler) SetRuntime(rt *runtime.Runtime) {
 // 参数：mgr - 会话管理器。
 func (h *APIHandler) SetSessionManager(mgr *SessionManager) {
 	h.sessionMgr = mgr
+	if h.statsService == nil {
+		h.statsService = NewStatsService(mgr)
+	}
+}
+
+// SetStatsService 显式注入统计服务（测试用）。
+func (h *APIHandler) SetStatsService(s *StatsService) {
+	h.statsService = s
 }
 
 // SetStores 注入存储层
@@ -87,6 +95,14 @@ func (h *APIHandler) SetSessionManager(mgr *SessionManager) {
 func (h *APIHandler) SetStores(pg *store.PostgresStore, redis *store.RedisStore) {
 	h.pgStore = pg
 	h.redisStore = redis
+	if h.memoryService == nil {
+		h.memoryService = NewMemoryService(pg)
+	}
+}
+
+// SetMemoryService 显式注入记忆服务（测试用）。
+func (h *APIHandler) SetMemoryService(s *MemoryService) {
+	h.memoryService = s
 }
 
 // SetRoleConfig 注入角色配置
@@ -160,37 +176,9 @@ func (h *APIHandler) EventResolveHandler(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(map[string]string{"status": "resolved"})
 }
 
-// SnapshotInspectHandler 查看快照详情
-// 职责：调用 snapshotMgr.Load 取 Agent 快照，返回 JSON。
+// SnapshotInspectHandler 查看快照详情（与 SnapshotHandler 共享实现）。
 func (h *APIHandler) SnapshotInspectHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	req, err := DecodeBody[struct {
-		TopicID string `json:"topic_id"`
-		AgentID string `json:"agent_id"`
-	}](r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	var snapshot *types.AgentSnapshot
-	if h.snapshotMgr != nil {
-		snapshot, err = h.snapshotMgr.Load(r.Context(), req.AgentID, req.TopicID)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"agent_id": req.AgentID,
-		"snapshot": snapshot,
-	})
+	h.handleSnapshot(w, r)
 }
 
 // GraphPauseHandler 暂停 Graph
@@ -209,7 +197,10 @@ func (h *APIHandler) GraphPauseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.pausedMu.Lock()
 	h.paused[req.TopicID] = true // 标记暂停
+	h.pausedMu.Unlock()
+
 	h.broadcaster.Broadcast(req.TopicID, types.UIEvent{
 		Type:    "graph.control",
 		Payload: map[string]string{"action": "pause"},
@@ -235,7 +226,10 @@ func (h *APIHandler) GraphResumeHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	h.pausedMu.Lock()
 	delete(h.paused, req.TopicID) // 取消暂停
+	h.pausedMu.Unlock()
+
 	h.broadcaster.Broadcast(req.TopicID, types.UIEvent{
 		Type:    "graph.control",
 		Payload: map[string]string{"action": "resume"},
@@ -249,6 +243,8 @@ func (h *APIHandler) GraphResumeHandler(w http.ResponseWriter, r *http.Request) 
 // 参数：topicID - 话题 ID。
 // 返回值：bool - true 表示已暂停。
 func (h *APIHandler) IsPaused(topicID string) bool {
+	h.pausedMu.RLock()
+	defer h.pausedMu.RUnlock()
 	return h.paused[topicID]
 }
 
@@ -398,35 +394,11 @@ func (h *APIHandler) TimelineHandler(w http.ResponseWriter, r *http.Request) {
 	points := 12 // 默认 12 个点（12 小时）
 	if q := r.URL.Query().Get("points"); q != "" {
 		if n, err := strconv.Atoi(q); err == nil && n > 0 {
-			points = n // 解析 query 参数
+			points = n
 		}
 	}
 
-	data := make([]map[string]any, points)
-	now := time.Now()
-	for i := 0; i < points; i++ {
-		data[i] = map[string]any{
-			"time":   now.Add(-time.Duration(points-1-i) * time.Hour).Format("15:00"), // 第 i 个点的时间
-			"calls":  0,
-			"tokens": 0,
-		}
-	}
-
-	if h.sessionMgr != nil {
-		for _, s := range h.sessionMgr.ListSessions() {
-			for _, ev := range s.Events {
-				if ev.Kind != eventkind.TokenUsage {
-					continue // 仅统计 token_usage
-				}
-				hourIdx := points - 1 - int(now.Sub(ev.Timestamp).Hours()) // 计算落在第几个时间点
-				if hourIdx < 0 || hourIdx >= points {
-					continue // 超出范围跳过
-				}
-				data[hourIdx]["calls"] = data[hourIdx]["calls"].(int) + 1
-				data[hourIdx]["tokens"] = data[hourIdx]["tokens"].(int) + ev.InputTokens + ev.OutputTokens
-			}
-		}
-	}
+	data := h.statsService.Timeline(points)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"points": data})
@@ -448,37 +420,24 @@ func (h *APIHandler) ActivityHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var activities []map[string]any
-	if h.sessionMgr != nil {
-		for _, s := range h.sessionMgr.ListSessions() {
-			// 从尾部倒序遍历，直到达到 limit
-			for i := len(s.Events) - 1; i >= 0 && len(activities) < limit; i-- {
-				ev := s.Events[i]
-				if ev.Kind == "" {
-					continue // 跳过无 kind 的事件
-				}
-				activities = append(activities, map[string]any{
-					"session_id": s.ID,
-					"agent":      ev.Agent,
-					"kind":       ev.Kind,
-					"content":    ev.Message,
-					"time":       ev.Timestamp.Format("15:04:05"),
-				})
-			}
-		}
-	}
+	activities := h.statsService.Activity(limit)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"activities": activities})
 }
 
-// SnapshotHandler POST /api/snapshot — 查看 Agent 快照
-// 职责：与 SnapshotInspectHandler 类似，按 agent_id + topic_id 加载快照。
+// SnapshotHandler POST /api/snapshot — 查看 Agent 快照（与 SnapshotInspectHandler 共享实现）。
 func (h *APIHandler) SnapshotHandler(w http.ResponseWriter, r *http.Request) {
+	h.handleSnapshot(w, r)
+}
+
+// handleSnapshot 是 SnapshotHandler / SnapshotInspectHandler 的共享实现。
+func (h *APIHandler) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	req, err := DecodeBody[struct {
 		AgentID string `json:"agent_id"`
 		TopicID string `json:"topic_id"`
@@ -487,6 +446,7 @@ func (h *APIHandler) SnapshotHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
 	var snap *types.AgentSnapshot
 	if h.snapshotMgr != nil {
 		snap, err = h.snapshotMgr.Load(r.Context(), req.AgentID, req.TopicID)
@@ -495,6 +455,7 @@ func (h *APIHandler) SnapshotHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"agent_id": req.AgentID,
@@ -503,8 +464,7 @@ func (h *APIHandler) SnapshotHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // MemorySearchHandler POST /api/memory/search — 检索 Agent 记忆
-// 职责：优先按 domain 做块记忆向量检索（P0-1 领域过滤）；未提供 domain 时回退到
-// Episode 关键词评分排序，返回 top N。
+// 职责：委托 MemoryService 按 domain 做块记忆向量检索或回退到 Episode 关键词评分。
 // 参数：?limit=N - 默认 10。
 func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -526,50 +486,15 @@ func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request)
 		req.Limit = 10 // 默认 10 条
 	}
 
-	var results []map[string]any
-	if h.pgStore != nil {
-		if req.Domain != "" {
-			// P0-1：按 domain 过滤的块记忆向量检索
-			recs, err := memory.SearchBlockMemory(r.Context(), h.pgStore, req.Domain, req.Query, req.Limit)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			for _, rec := range recs {
-				results = append(results, map[string]any{
-					"step_id":    "",
-					"summary":    rec.Summary,
-					"action":     "block_memory",
-					"importance": 0.0,
-					"score":      0.0,
-					"time":       rec.CreatedAt,
-					"domain":     rec.Domain,
-					"goal":       rec.Goal,
-				})
-			}
-		} else {
-			// 无 domain 时回退到 Episode 关键词评分
-			eps, err := h.pgStore.GetEpisodes(r.Context(), req.AgentID, req.TopicID, 200) // 取最近 200 条
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			// 无 embedder，使用简单关键词评分
-			scored := scoreEpisodesByKeywords(eps, req.Query)
-			if len(scored) > req.Limit {
-				scored = scored[:req.Limit] // 截断到 limit
-			}
-			for _, s := range scored {
-				results = append(results, map[string]any{
-					"step_id":    s.Episode.StepID,
-					"summary":    s.Episode.ObservationSummary,
-					"action":     s.Episode.Action,
-					"importance": s.Episode.Importance,
-					"score":      s.Score,
-					"time":       s.Episode.Timestamp,
-				})
-			}
-		}
+	if h.memoryService == nil {
+		http.Error(w, "memory service not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	results, err := h.memoryService.Search(r.Context(), req.AgentID, req.TopicID, req.Domain, req.Query, req.Limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -581,50 +506,8 @@ func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// scoreEpisodesByKeywords 简化关键词评分（无 embedder 时兜底）
-// 评分 = 关键词重叠 * 0.05 + 时间衰减 * 0.3 + 重要性 * 0.3（上限 1.0）
-// 参数：eps - 候选 Episode 列表；query - 查询字符串。
-// 返回值：按分数降序排列的 scoredEpisode 列表。
-func scoreEpisodesByKeywords(eps []*types.Episode, query string) []*scoredEpisode {
-	var out []*scoredEpisode
-	queryRunes := []rune(strings.ToLower(query)) // 查询转小写 rune 列表
-	for _, ep := range eps {
-		score := 0.0
-		summaryLower := strings.ToLower(ep.ObservationSummary) // 摘要转小写
-		// 关键词重叠
-		for _, r := range queryRunes {
-			if strings.ContainsRune(summaryLower, r) {
-				score += 0.05 // 每命中一个 rune 加 0.05
-			}
-		}
-		// 时间衰减
-		score += math.Exp(-0.01*time.Since(ep.Timestamp).Hours()) * 0.3 // 越新分数越高
-		// 重要性
-		score += ep.Importance * 0.3
-		if score > 1.0 {
-			score = 1.0 // 截顶 1.0
-		}
-		out = append(out, &scoredEpisode{Episode: ep, Score: score})
-	}
-	// 冒泡排序（数据量小，简单实现）
-	for i := 0; i < len(out)-1; i++ {
-		for j := 0; j < len(out)-1-i; j++ {
-			if out[j].Score < out[j+1].Score {
-				out[j], out[j+1] = out[j+1], out[j] // 降序交换
-			}
-		}
-	}
-	return out
-}
-
-// scoredEpisode 包装 Episode 及其关键词评分。
-type scoredEpisode struct {
-	Episode *types.Episode
-	Score   float64
-}
-
 // MemoryLevelsHandler GET /api/memory/levels — 返回压缩层级分布
-// 职责：调用 Postgres 统计两级压缩层级（Raw=0 / Standard=1）的 Episode 数，返回分布 JSON。
+// 职责：委托 MemoryService 统计两级压缩层级（Raw=0 / Standard=1）的 Episode 数。
 // 参数：?agent_id=...&topic_id=...
 func (h *APIHandler) MemoryLevelsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -634,22 +517,15 @@ func (h *APIHandler) MemoryLevelsHandler(w http.ResponseWriter, r *http.Request)
 	agentID := r.URL.Query().Get("agent_id")
 	topicID := r.URL.Query().Get("topic_id")
 
-	levels := map[string]int{"raw": 0, "standard": 0}
-	total := 0
-	if h.pgStore != nil {
-		for lvl, key := range map[int]string{0: "raw", 1: "standard"} {
-			var cnt int
-			err := h.pgStore.DB().QueryRowContext(r.Context(), `
-				SELECT COUNT(*) FROM agent_private_memory
-				WHERE agent_id = $1 AND topic_id = $2 AND compression_level = $3
-			`, agentID, topicID, lvl).Scan(&cnt)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			levels[key] = cnt
-			total += cnt
-		}
+	if h.memoryService == nil {
+		http.Error(w, "memory service not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	levels, total, err := h.memoryService.Levels(r.Context(), agentID, topicID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -662,95 +538,26 @@ func (h *APIHandler) MemoryLevelsHandler(w http.ResponseWriter, r *http.Request)
 }
 
 // MemoryEvalHandler GET /api/memory/eval — 记忆层简化评测入口（P3-1）
-// 职责：汇总所有 (agent_id, topic_id) 下的 Raw/Standard 分布，输出评测 JSON。
+// 职责：委托 MemoryService 汇总所有 (agent_id, topic_id) 下的 Raw/Standard 分布。
 // 调用方应先跑 test/coding/ 与 test/api/ 集成测试，再请求本端点获取分布数据。
 func (h *APIHandler) MemoryEvalHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if h.pgStore == nil {
-		http.Error(w, "postgres store not available", http.StatusServiceUnavailable)
+	if h.memoryService == nil {
+		http.Error(w, "memory service not available", http.StatusServiceUnavailable)
 		return
 	}
 
-	rows, err := h.pgStore.DB().QueryContext(r.Context(), `
-		SELECT agent_id, topic_id, compression_level, COUNT(*)
-		FROM agent_private_memory
-		GROUP BY agent_id, topic_id, compression_level
-		ORDER BY topic_id, agent_id, compression_level
-	`)
+	resp, err := h.memoryService.Eval(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
-
-	type pairStat struct {
-		AgentID string         `json:"agent_id"`
-		TopicID string         `json:"topic_id"`
-		Levels  map[string]int `json:"levels"`
-		Total   int            `json:"total"`
-	}
-
-	pairs := make(map[string]*pairStat)
-	grandTotal := 0
-	grandRaw := 0
-	grandStandard := 0
-
-	for rows.Next() {
-		var agentID, topicID string
-		var level, count int
-		if err := rows.Scan(&agentID, &topicID, &level, &count); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		key := topicID + "/" + agentID
-		p, ok := pairs[key]
-		if !ok {
-			p = &pairStat{AgentID: agentID, TopicID: topicID, Levels: map[string]int{"raw": 0, "standard": 0}}
-			pairs[key] = p
-		}
-		switch level {
-		case 0:
-			p.Levels["raw"] = count
-			grandRaw += count
-		case 1:
-			p.Levels["standard"] = count
-			grandStandard += count
-		default:
-			// 未预期 level：跳过，避免 raw+standard != total 的不一致
-			continue
-		}
-		p.Total += count
-		grandTotal += count
-	}
-	// 检查迭代错误（database/sql 契约：rows.Next() 退出可能因错误而非正常结束）
-	if err := rows.Err(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// map 迭代顺序非确定，排序保证响应可复现（与 SQL ORDER BY 一致）
-	var pairList []*pairStat
-	for _, p := range pairs {
-		pairList = append(pairList, p)
-	}
-	sort.Slice(pairList, func(i, j int) bool {
-		if pairList[i].TopicID != pairList[j].TopicID {
-			return pairList[i].TopicID < pairList[j].TopicID
-		}
-		return pairList[i].AgentID < pairList[j].AgentID
-	})
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"total_episodes": grandTotal,
-		"raw":            grandRaw,
-		"standard":       grandStandard,
-		"pairs":          pairList,
-		"note":           "Run test/coding/ and test/api/ integration tests, then call this endpoint to evaluate Raw/Standard distribution.",
-	})
+	json.NewEncoder(w).Encode(resp)
 }
 
 // SkillsHandler GET /api/skills — 返回 Skill 池全部技能

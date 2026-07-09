@@ -98,6 +98,8 @@ type LLMCallTracker struct {
 	mu             sync.RWMutex                      // 读写锁保护所有字段
 	callCount      int                               // 累计调用次数
 	timeoutCount   int                               // 连续超时次数（成功时清零）
+	consecutiveCancel int                            // 连续取消次数（成功时清零）
+	consecutiveError  int                            // 连续其它错误次数（成功时清零）
 	totalDur       time.Duration                     // 累计耗时，用于计算平均
 	maxDur         time.Duration                     // 历史最大耗时
 	lastDur        time.Duration                     // 最近一次耗时
@@ -195,7 +197,7 @@ func (t *LLMCallTracker) CallWithTimeout(
 	// 判断是否为超时：重试期间任意 attempt 超时，或整体 ctx 超时
 	timedOut := retryTimedOut || ctx.Err() == context.DeadlineExceeded
 	if err != nil && timedOut {
-		err = fmt.Errorf("LLM call timed out after %v per attempt (%d retries)", timeout, maxRetries)
+		err = fmt.Errorf("LLM call timed out after %v per attempt (%d retries): %w", timeout, maxRetries, err)
 	}
 
 	// 记录本次逻辑调用（含 token/摘要/完整 prompt/response）
@@ -242,15 +244,31 @@ func (t *LLMCallTracker) RecordCall(
 		t.maxDur = dur
 	}
 
-	// 错误处理：累加连续超时计数，达到阈值进入慢速模式
+	// 错误分类处理：仅 context.DeadlineExceeded 计入连续超时并触发慢速模式；
+	// context.Canceled 与其它错误分别计数，不触发慢速模式。
 	if err != nil {
-		t.timeoutCount++
-		if t.timeoutCount >= 3 {
-			t.slowMode = true // 连续 3 次失败进入慢速模式
+		switch {
+		case errors.Is(err, context.Canceled):
+			t.consecutiveCancel++
+			t.timeoutCount = 0
+			t.consecutiveError = 0
+		case errors.Is(err, context.DeadlineExceeded):
+			t.timeoutCount++
+			t.consecutiveCancel = 0
+			t.consecutiveError = 0
+			if t.timeoutCount >= 3 {
+				t.slowMode = true // 连续 3 次超时进入慢速模式
+			}
+		default:
+			t.consecutiveError++
+			t.consecutiveCancel = 0
+			t.timeoutCount = 0
 		}
 	} else {
-		// 成功调用重置连续超时计数与慢速模式
+		// 成功调用重置所有连续计数与慢速模式
 		t.timeoutCount = 0
+		t.consecutiveCancel = 0
+		t.consecutiveError = 0
 		t.slowMode = false
 	}
 
