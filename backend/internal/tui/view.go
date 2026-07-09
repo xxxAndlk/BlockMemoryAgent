@@ -1,10 +1,8 @@
 package tui
 
 import (
-	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
@@ -44,7 +42,7 @@ func (m Model) singleColumnView() string {
 		m.renderShortcutBar(m.width),
 	)
 
-	if m.overlay != overlayNone {
+	if m.overlayPanel.mode != overlayNone {
 		overlayH := m.height / 3
 		if overlayH < 6 {
 			overlayH = 6
@@ -100,90 +98,6 @@ func (m Model) renderTopBar(w int) string {
 		line = left
 	}
 	return m.styles.TopBar.Width(w).Height(1).Render(line)
-}
-
-func (m Model) renderWelcome(w, h int) string {
-	title := m.styles.WelcomeTitle.Render("BlockMemoryAgent")
-	subtitle := m.styles.WelcomeSub.Render("AI Agent for Code, Memory and More.")
-	info := m.renderWelcomeInfo(w)
-	content := lipgloss.JoinVertical(lipgloss.Center, title, "", subtitle, "", info)
-	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, content)
-}
-
-// renderEmptyChat 当会话已创建但还没有任何聊天内容时展示的占位提示。
-// 放在对话区顶部，提示用户输入消息，避免首屏空白导致"第一个问题不展示"的错觉。
-func (m Model) renderEmptyChat(w, h int) string {
-	title := m.styles.WelcomeTitle.Render("BlockMemoryAgent")
-	hint := m.styles.WelcomeSub.Render("会话已启动，在底部输入栏发送第一条消息。")
-	shortcuts := m.styles.Dim.Render("Enter 发送 · / 命令 · ? 帮助 · Ctrl+C 退出")
-	content := lipgloss.JoinVertical(lipgloss.Center, title, "", hint, "", shortcuts)
-	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, content)
-}
-
-func (m Model) renderWelcomeInfo(w int) string {
-	pairs := []struct {
-		icon  string
-		label string
-		value string
-	}{
-		{"🖥", "Model", m.modelName},
-		{"📁", "Workspace", "~/demo"},
-		{"🧠", "Memory", "Enabled"},
-		{"#", "Session", "#12"},
-		{"⚡", "Skills", "38"},
-		{"🪟", "Context Window", "128K"},
-		{"🔌", "MCP Servers", "12 Connected"},
-		{"🐚", "Shell", "zsh"},
-	}
-	colW := (w - 6) / 2
-	if colW < 20 {
-		colW = 20
-	}
-	var left, right []string
-	for i, p := range pairs {
-		line := fmt.Sprintf("%s %s: %s", p.icon, m.styles.WelcomeLabel.Render(p.label), m.styles.WelcomeValue.Render(p.value))
-		line = truncate(line, colW)
-		if i%2 == 0 {
-			left = append(left, line)
-		} else {
-			right = append(right, line)
-		}
-	}
-	body := lipgloss.JoinHorizontal(lipgloss.Top,
-		strings.Join(left, "\n"),
-		lipgloss.NewStyle().Width(4).Render(""),
-		strings.Join(right, "\n"),
-	)
-	return m.styles.WelcomeBox.Width(w).Render(body)
-}
-
-func (m Model) renderChat(w, h int) string {
-	const scrollbarW = 1
-	gap := 1
-	contentW := w - scrollbarW - gap
-	if contentW < 4 {
-		contentW = w
-	}
-
-	items := m.collectChatItems()
-	if len(items) == 0 {
-		if m.selectedSession() == nil {
-			return m.renderWelcome(contentW, h)
-		}
-		// 有会话但暂无消息/事件，且无本地预展示消息时，在对话区顶部显示首页提示。
-		return m.renderEmptyChat(contentW, h)
-	}
-
-	// viewport 尺寸在 WindowSizeMsg 中维护；渲染前再同步一次以防万一直接调用。
-	m.chatVP.Width = contentW
-	m.chatVP.Height = h
-
-	content := lipgloss.NewStyle().Width(contentW).Height(h).Render(m.chatVP.View())
-	totalLines := m.chatVP.TotalLineCount()
-	viewportH := m.chatVP.VisibleLineCount()
-	startLine := m.chatVP.YOffset
-	bar := m.renderScrollbar(scrollbarW, h, viewportH, totalLines, startLine)
-	return lipgloss.JoinHorizontal(lipgloss.Top, content, bar)
 }
 
 func (m Model) renderRightPanels(w, h int) string {
@@ -281,7 +195,7 @@ func (m Model) renderPlanPanel(w, h int) string {
 	} else {
 		// 看板子任务状态可能未被后端及时更新，用 Agent 实例的真实状态覆盖，
 		// 这样进度条和状态才能反映实际完成情况。
-		domainStatus := m.deriveDomainTaskStatuses()
+		domainStatus := m.agentTreePanel.deriveDomainTaskStatuses()
 		tasks := make([]board.SubTask, len(snap.Tasks))
 		copy(tasks, snap.Tasks)
 		for i := range tasks {
@@ -374,7 +288,7 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
 // 优先级：Failed > InProgress > Done > Pending。
 func (m Model) deriveDomainTaskStatuses() map[string]board.TaskStatus {
 	status := make(map[string]board.TaskStatus)
-	for _, node := range m.agentsNodes {
+	for _, node := range m.agentTreePanel.nodes {
 		if node.domain == "" {
 			continue
 		}
@@ -419,106 +333,9 @@ func planTaskDomain(title string) string {
 	return strings.TrimSpace(parts[0])
 }
 
-func (m Model) renderAgentsPanel(w, h int) string {
-	titleLeft := "Agent 编排"
-	titleRight := "[A] 关闭"
-	titlePadding := w - lipgloss.Width(titleLeft) - lipgloss.Width(titleRight) - 2
-	if titlePadding < 1 {
-		titlePadding = 1
-	}
-	headerText := titleLeft + strings.Repeat(" ", titlePadding) + titleRight
-	header := m.styles.PanelHeader.Width(w).Render(headerText)
-	innerW := w - 4
-	if innerW < 10 {
-		innerW = 10
-	}
-
-	var lines []string
-	if len(m.agentsNodes) == 0 {
-		lines = append(lines, "(no agents)")
-	} else {
-		for i, node := range m.agentsNodes {
-			// 过滤掉大量已完成且无目标的无意义临时助手，避免面板被刷屏。
-			if node.depth >= 2 && node.goal == "" &&
-				(node.status == enums.RoleStatusDone || node.status == enums.RoleStatusIdle) {
-				continue
-			}
-
-			card := m.agentCardLine(node, i, innerW)
-			lines = append(lines, card...)
-		}
-	}
-
-	body := strings.Join(lines, "\n")
-	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
-}
-
 // agentCardLine 渲染单个 Agent 卡片行，返回可能占多行的字符串切片。
 // 参考“新TUI页.png”设计：状态色点 + 按角色着色的名称 + 状态徽章 + 时间戳 + 任务描述。
-func (m Model) agentCardLine(node agentTreeNode, idx, innerW int) []string {
-	prefix := agentTreePrefix(m.agentsNodes, idx)
-	prefixW := runewidth.StringWidth(prefix)
-	avail := innerW - prefixW
-	if avail < 10 {
-		avail = 10
-	}
-
-	icon := statusIcon(string(node.status))
-	iconStyled := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor(string(node.status)))).Render(icon)
-	nameColor := agentRoleColor(node.roleType)
-	nameStyled := lipgloss.NewStyle().Foreground(lipgloss.Color(nameColor)).Bold(true).Render(node.name)
-	badge := agentStatusBadge(m.styles, node.status)
-
-	ts := ""
-	if !node.createdAt.IsZero() {
-		ts = node.createdAt.Format("15:04:05")
-	}
-	tsStyled := m.styles.Dim.Render(ts)
-
-	// 第一行：前缀 + 状态点 + 名称 + 徽章 + 时间戳
-	line := fmt.Sprintf("%s%s %s %s", prefix, iconStyled, nameStyled, badge)
-	if ts != "" {
-		gap := avail - lipgloss.Width(line) + prefixW - lipgloss.Width(tsStyled)
-		if gap < 1 {
-			gap = 1
-		}
-		line += strings.Repeat(" ", gap) + tsStyled
-	}
-	line = truncate(line, innerW)
-
-	lines := []string{line}
-
-	// 第二行：任务描述（goal），深度缩进对齐
-	if node.goal != "" && !node.isClarify {
-		goal := strings.ReplaceAll(node.goal, "\n", " ")
-		goalPrefix := strings.Repeat(" ", prefixW) + "  "
-		goalAvail := innerW - runewidth.StringWidth(goalPrefix)
-		if goalAvail < 10 {
-			goalAvail = 10
-		}
-		goalLine := goalPrefix + m.styles.Dim.Render(truncate(goal, goalAvail))
-		lines = append(lines, goalLine)
-	}
-
-	return lines
-}
-
 // agentRoleColor 返回不同 Agent 类型的主题色。
-func agentRoleColor(roleType enums.RoleType) string {
-	switch roleType {
-	case enums.RoleTypeMeta:
-		return cMeta
-	case enums.RoleTypeDomain:
-		return cDomain
-	case enums.RoleTypeSubDomain:
-		return cSub
-	case enums.RoleTypeFixed, enums.RoleTypeDynamic:
-		return cAssist
-	default:
-		return cInfo
-	}
-}
-
 // statusColor 返回状态对应的颜色。
 func statusColor(status string) string {
 	switch status {
@@ -536,179 +353,10 @@ func statusColor(status string) string {
 }
 
 // agentTreePrefix 根据节点在扁平树中的位置生成树状连接符前缀。
-func agentTreePrefix(nodes []agentTreeNode, idx int) string {
-	if idx < 0 || idx >= len(nodes) {
-		return ""
-	}
-	depth := nodes[idx].depth
-	if depth == 0 {
-		return ""
-	}
-
-	var parts []string
-	for d := 1; d <= depth; d++ {
-		// 向上找到当前节点在第 d 层的祖先
-		ancestorIdx := -1
-		for j := idx; j >= 0; j-- {
-			if nodes[j].depth == d {
-				ancestorIdx = j
-				break
-			}
-		}
-		if ancestorIdx == -1 {
-			parts = append(parts, "   ")
-			continue
-		}
-		// 判断该祖先是否是其层级中的最后一个兄弟
-		isLast := true
-		for j := ancestorIdx + 1; j < len(nodes); j++ {
-			if nodes[j].depth < d {
-				break
-			}
-			if nodes[j].depth == d {
-				isLast = false
-				break
-			}
-		}
-		if d == depth {
-			if isLast {
-				parts = append(parts, "└─ ")
-			} else {
-				parts = append(parts, "├─ ")
-			}
-		} else {
-			if isLast {
-				parts = append(parts, "   ")
-			} else {
-				parts = append(parts, "│  ")
-			}
-		}
-	}
-	return strings.Join(parts, "")
-}
-
 // collectChatItems 收集当前应展示的全部 chatItem，包含真实会话消息/事件，
 // 以及尚未同步到服务端的本地预展示首条用户消息。
-func (m *Model) collectChatItems() []chatItem {
-	s := m.selectedSession()
-	var items []chatItem
-	if s != nil {
-		items = chatItems(s, true)
-	}
-	// 本地预展示的首条用户消息：无会话时直接展示；有会话但服务端尚未同步该
-	// 消息时，也作为兜底展示，避免用户输入"消失"。
-	if m.pendingFirstMessage != "" {
-		already := false
-		for _, it := range items {
-			if strings.TrimPrefix(it.title, "> ") == m.pendingFirstMessage {
-				already = true
-				break
-			}
-		}
-		if !already {
-			// 尽量使用会话开始时间作为时间戳，保证排序自然
-			ts := time.Now()
-			if s != nil {
-				ts = s.StartedAt
-			}
-			items = append(items, chatItem{
-				title:     "> " + m.pendingFirstMessage,
-				timestamp: ts,
-				isEvent:   false,
-				role:      enums.ChatRoleUser,
-			})
-		}
-	}
-	return items
-}
-
 // buildChatContent 把当前会话的全部 chatItem 渲染成 viewport 可滚动的字符串，
-// 并同步更新 m.chatItemOffsets。
-func (m *Model) buildChatContent(width int) string {
-	items := m.collectChatItems()
-	if len(items) == 0 {
-		m.chatItemOffsets = nil
-		return ""
-	}
-	offsets := make([]int, len(items))
-	var lines []string
-
-	for i, item := range items {
-		offsets[i] = len(lines)
-		ts := item.timestamp.Format("15:04:05")
-		tsStyled := m.styles.Dim.Render(ts)
-
-		// 标题行：根据来源选择标签与样式
-		var titleLines []string
-		switch {
-		case strings.HasPrefix(item.title, "> "):
-			content := strings.TrimPrefix(item.title, "> ")
-			label := m.styles.LogUser.Render("You")
-			prefix := tsStyled + " " + label + " "
-			indent := strings.Repeat(" ", lipgloss.Width(ts)+1) + strings.Repeat(" ", lipgloss.Width(label)+1)
-			availW := width - lipgloss.Width(prefix)
-			if availW < 4 {
-				availW = 4
-			}
-			wrappedLines := wrapToWidth(content, availW)
-			for j, wl := range wrappedLines {
-				styledWl := m.styles.LogUser.Render(wl)
-				if j == 0 {
-					titleLines = append(titleLines, prefix+styledWl)
-				} else {
-					titleLines = append(titleLines, indent+styledWl)
-				}
-			}
-		case strings.HasPrefix(item.title, "[●] "):
-			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogWarn, width)...)
-		case strings.HasPrefix(item.title, "[✓] "):
-			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogSuccess, width)...)
-		case strings.HasPrefix(item.title, "[✗] "):
-			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogError, width)...)
-		case strings.HasPrefix(item.title, "🧠 recalled: "):
-			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.Dim, width)...)
-		case strings.HasPrefix(item.title, "─── ") && strings.HasSuffix(item.title, " ───"):
-			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.CallStack, width)...)
-		case strings.HasPrefix(item.title, "✗ Error"):
-			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogError, width)...)
-		case item.isEvent:
-			// 事件标题已自带 Agent 名称（如 MetaAgent: ... / code_assistant 完成: ...）
-			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, m.styles.LogInfo, width)...)
-		default:
-			label := m.styles.LogAssistant.Render("Assistant")
-			availW := width - lipgloss.Width(label) - lipgloss.Width(ts) - 3
-			if availW < 4 {
-				availW = 4
-			}
-			text := formatMarkdown(item.title)
-			// 对 Assistant 长回答做自动换行，避免截断；使用 ANSI 感知的按显示宽度换行，支持中文/长串。
-			wrappedLines := wrapToWidth(text, availW)
-			for j, wl := range wrappedLines {
-				line := tsStyled + " " + label + " " + wl
-				if j > 0 {
-					// 续行去掉 timestamp/label，用空格对齐
-					line = strings.Repeat(" ", lipgloss.Width(ts)+1) + "   " + wl
-				}
-				titleLines = append(titleLines, line)
-			}
-		}
-		lines = append(lines, titleLines...)
-
-		// detail 行统一缩进并换行；空 detail 跳过避免标题与详情重复（non-tool 事件 detail 为空）
-		if item.detail != "" {
-			for _, l := range displayDetailLines(item.title, item.detail) {
-				wrappedLines := wrapToWidth(l, width-2)
-				for _, wl := range wrappedLines {
-					lines = append(lines, "  "+wl)
-				}
-			}
-		}
-	}
-
-	m.chatItemOffsets = offsets
-	return strings.Join(lines, "\n")
-}
-
+// 并同步更新 m.chatPanel.itemOffsets。
 // renderScrollbar 绘制右侧垂直滚动条。
 // w/h 为滚动条区域宽高；viewportH/totalLines/startLine 决定滑块位置与高度。
 func (m Model) renderScrollbar(w, h, viewportH, totalLines, startLine int) string {
@@ -775,55 +423,6 @@ func (m Model) renderPlanBar(w int) string {
 }
 
 // inputIsMultiline 判断当前输入是否包含换行（粘贴大段/多行内容）。
-func (m *Model) inputIsMultiline() bool {
-	return strings.ContainsRune(string(m.inputRunes), '\n')
-}
-
-func (m Model) renderInput(w int) string {
-	prompt := ">"
-	switch m.inputMode {
-	case inputClarify:
-		prompt = "/clarify>"
-	case inputInterrupt:
-		prompt = "/interrupt>"
-	case inputEnqueue:
-		prompt = "/enqueue>"
-	}
-	left := m.styles.InputPrompt.Render(" " + prompt + " ")
-	cursor := " "
-	if m.focus == panelInput {
-		cursor = "▌"
-	}
-
-	var text string
-	if len(m.inputRunes) == 0 {
-		text = m.styles.InputHint.Render("Type your message... (Enter to send, / for commands)")
-	} else if m.inputIsMultiline() {
-		// 多行内容（粘贴或 Alt+Enter）在输入栏折叠为占位提示，避免大段文本挤占界面。
-		lines := strings.Count(string(m.inputRunes), "\n") + 1
-		text = m.styles.InputText.Render(fmt.Sprintf("[%d行内容]%s", lines, cursor))
-	} else {
-		text = string(m.inputRunes[:m.inputCursor]) + cursor + string(m.inputRunes[m.inputCursor:])
-	}
-
-	// 持锁读 flash（T2 修复：后台 HTTP goroutine 可能并发写）
-	m.flashMu.Lock()
-	curFlash := m.flash
-	m.flashMu.Unlock()
-	flash := ""
-	if curFlash != "" {
-		flash = "  " + m.styles.LogError.Render(curFlash)
-	}
-
-	border := m.styles.BlurBorder
-	if m.focus == panelInput {
-		border = m.styles.FocusBorder
-	}
-	content := lipgloss.JoinVertical(lipgloss.Left, left+" "+text+flash, "")
-	// border 占 2 列，Width 设置的是内部宽度，因此请求 w-2 以保证总宽度为 w。
-	return border.Width(w - 2).Height(3).Render(content)
-}
-
 func (m Model) renderShortcutBar(w int) string {
 	shortcuts := []struct {
 		key   string
@@ -845,57 +444,6 @@ func (m Model) renderShortcutBar(w int) string {
 		parts = append(parts, "["+m.styles.ShortcutKey.Render(s.key)+"] "+m.styles.ShortcutLabel.Render(s.label))
 	}
 	return m.styles.ShortcutBar.Width(w).Height(1).Render(strings.Join(parts, "  "))
-}
-
-func (m Model) renderOverlay(w, h int) string {
-	if m.overlay == overlayHelp {
-		m.overlayTitle = "Help"
-		m.overlayLines = strings.Split(strings.Trim(fullHelpText, "\n"), "\n")
-	}
-	if m.overlay == overlayPlan {
-		m.overlayLines = m.buildPlanLines()
-	} else if m.overlay == overlayAgents {
-		m.overlayLines = m.buildAgentsLines()
-	} else if m.overlay == overlayLog {
-		m.overlayLines = m.buildTranscriptLines()
-	}
-
-	maxLines := h - 4
-	if maxLines < 3 {
-		maxLines = 3
-	}
-	if m.overlayCursor < 0 {
-		m.overlayCursor = 0
-	}
-	if m.overlayCursor >= len(m.overlayLines) {
-		m.overlayCursor = len(m.overlayLines) - 1
-	}
-	start := m.overlayCursor - maxLines/2
-	if start < 0 {
-		start = 0
-	}
-	end := start + maxLines
-	if end > len(m.overlayLines) {
-		end = len(m.overlayLines)
-		start = end - maxLines
-		if start < 0 {
-			start = 0
-		}
-	}
-	visible := m.overlayLines[start:end]
-	content := strings.Join(visible, "\n")
-
-	boxW := w * 4 / 5
-	if boxW < 40 {
-		boxW = w - 4
-	}
-	boxH := h - 2
-
-	header := m.styles.Header.Render(m.overlayTitle)
-	hint := m.styles.Dim.Render("  [Esc close · j/k scroll · enter detail]")
-	body := lipgloss.JoinVertical(lipgloss.Left, header+hint, content)
-	box := m.styles.Overlay.Width(boxW).Height(boxH).Render(body)
-	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
 }
 
 // wrapStyledLine 将单行原始文本按宽度换行，并在首行保留时间戳前缀，续行保持对齐。
@@ -1000,84 +548,4 @@ func truncate(s string, n int) string {
 	return b.String()
 }
 
-const (
-	// taskTitleSummarizeThreshold 任务标题超过该显示宽度时才触发 LLM 精简。
-	taskTitleSummarizeThreshold = 60
-	// taskTitleMaxBriefWidth 精简后的任务标题最大显示宽度。
-	taskTitleMaxBriefWidth = 40
-)
 
-// taskBriefCacheMaxSize 缓存上限，超限淘汰任意一条。
-// TUI 单会话任务标题通常 <100，200 留足余量且内存可控。
-const taskBriefCacheMaxSize = 200
-
-// summarizeTaskTitle 对过长任务标题做语义精简。
-// 渲染路径严禁阻塞 LLM（bubbletea View() 必须秒回）：
-//   - 缓存命中 → 直接返回
-//   - 缓存未命中 → 立即返回机械截断，同时异步请求 LLM 填充缓存供下次渲染使用
-func (m Model) summarizeTaskTitle(title string) string {
-	w := runewidth.StringWidth(title)
-	if w <= taskTitleSummarizeThreshold {
-		return title
-	}
-	if brief, ok := m.getTaskBrief(title); ok {
-		return brief
-	}
-	// 未命中：立即截断返回，异步预热
-	fallback := truncate(title, taskTitleMaxBriefWidth)
-	m.setTaskBrief(title, fallback)
-	m.warmTaskBriefAsync(title)
-	return fallback
-}
-
-// getTaskBrief 加锁读缓存。
-func (m Model) getTaskBrief(title string) (string, bool) {
-	if m.taskBriefMu == nil {
-		return "", false
-	}
-	m.taskBriefMu.Lock()
-	defer m.taskBriefMu.Unlock()
-	brief, ok := m.taskBriefCache[title]
-	return brief, ok
-}
-
-// setTaskBrief 加锁写缓存，超限时淘汰任意一条。
-func (m Model) setTaskBrief(title, brief string) {
-	if m.taskBriefMu == nil {
-		return
-	}
-	m.taskBriefMu.Lock()
-	defer m.taskBriefMu.Unlock()
-	if len(m.taskBriefCache) >= taskBriefCacheMaxSize {
-		for k := range m.taskBriefCache {
-			delete(m.taskBriefCache, k)
-			break
-		}
-	}
-	m.taskBriefCache[title] = brief
-}
-
-// warmTaskBriefAsync 异步请求 LLM 精简标题，成功后更新缓存。
-// 失败/超时静默丢弃（已有 fallback 截断结果占位）。
-// 限制并发：通过 sync.Map 或 channel 限流可进一步优化，此处简单 goroutine 即可。
-func (m Model) warmTaskBriefAsync(title string) {
-	if m.modelFactory == nil {
-		return
-	}
-	mf := m.modelFactory
-	go func() {
-		prompt := fmt.Sprintf("将以下任务描述压缩成 %d 字以内的简短任务名，保留核心动作与对象，不要解释：\n%s", taskTitleMaxBriefWidth, title)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		brief, err := mf.CallLightweightWithRetry(ctx, prompt)
-		if err != nil || strings.TrimSpace(brief) == "" {
-			return
-		}
-		brief = strings.TrimSpace(brief)
-		brief = strings.Trim(brief, "\"'"+"`「」【】()")
-		if runewidth.StringWidth(brief) > taskTitleMaxBriefWidth {
-			brief = truncate(brief, taskTitleMaxBriefWidth)
-		}
-		m.setTaskBrief(title, brief)
-	}()
-}

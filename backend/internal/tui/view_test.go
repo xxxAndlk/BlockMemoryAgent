@@ -41,7 +41,7 @@ func TestAgentTreePrefix(t *testing.T) {
 func TestAgentCardLineRendersGoalAndBadge(t *testing.T) {
 	m := &Model{
 		styles:         NewStyles(),
-		taskBriefCache: make(map[string]string),
+		taskBriefCache: NewTaskBriefCache(),
 	}
 	nodes := []agentTreeNode{
 		{depth: 0, name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive, createdAt: time.Now()},
@@ -67,7 +67,7 @@ func TestAgentCardLineRendersGoalAndBadge(t *testing.T) {
 func TestSummarizeTaskTitleFallback(t *testing.T) {
 	m := &Model{
 		styles:         NewStyles(),
-		taskBriefCache: make(map[string]string),
+		taskBriefCache: NewTaskBriefCache(),
 		modelFactory:   nil,
 	}
 	long := strings.Repeat("设计并实现一个完整的后台管理系统前端页面包含商品管理和订单管理以及用户管理模块", 2)

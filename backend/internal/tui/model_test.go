@@ -104,7 +104,7 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 
 	m := &Model{
 		styles:       NewStyles(),
-		chatVP:       viewport.New(80, 20),
+		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:        80,
 		height:       24,
 		agent:        testAgent(g, registry, sessionMgr),
@@ -112,12 +112,12 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 		httpAddr:     "http://127.0.0.1:1",
 		flashMu:      &sync.Mutex{},
 	}
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.SetContent("")
 
 	// 无会话时发送首条消息
 	m.submitInput("hello")
-	if m.pendingFirstMessage != "hello" {
-		t.Fatalf("pendingFirstMessage 应被设置，got %q", m.pendingFirstMessage)
+	if m.chatPanel.pendingFirstMessage != "hello" {
+		t.Fatalf("pendingFirstMessage 应被设置，got %q", m.chatPanel.pendingFirstMessage)
 	}
 	view := m.View()
 	if !strings.Contains(view, "You hello") {
@@ -142,8 +142,8 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 		m = &mv
 	}
 
-	if m.pendingFirstMessage != "" {
-		t.Fatalf("selectSession 后 pendingFirstMessage 应被清空，got %q", m.pendingFirstMessage)
+	if m.chatPanel.pendingFirstMessage != "" {
+		t.Fatalf("selectSession 后 pendingFirstMessage 应被清空，got %q", m.chatPanel.pendingFirstMessage)
 	}
 
 	view = m.View()
@@ -205,7 +205,7 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 
 	m := &Model{
 		styles:       NewStyles(),
-		chatVP:       viewport.New(80, 20),
+		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:        80,
 		height:       24,
 		agent:        testAgent(g, registry, sessionMgr),
@@ -213,7 +213,7 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 		httpAddr:     "http://127.0.0.1:1",
 		flashMu:      &sync.Mutex{},
 	}
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.SetContent("")
 	m.refreshSessions()
 	if len(m.sessions) == 0 {
 		t.Fatal("expected at least one session after CreateSession")
@@ -238,7 +238,7 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 func TestScrollbarDragScrollsChat(t *testing.T) {
 	m := &Model{
 		styles:  NewStyles(),
-		chatVP:  viewport.New(80, 5),
+		chatPanel: ChatPanel{vp: viewport.New(80, 5)},
 		width:   80,
 		height:  12,
 		flashMu: &sync.Mutex{},
@@ -254,21 +254,21 @@ func TestScrollbarDragScrollsChat(t *testing.T) {
 	for i := range lines {
 		lines[i] = strings.Repeat("x", 70)
 	}
-	m.chatVP.SetContent(strings.Join(lines, "\n"))
-	m.chatVP.YOffset = 0
+	m.chatPanel.vp.SetContent(strings.Join(lines, "\n"))
+	m.chatPanel.vp.YOffset = 0
 
-	totalLines := m.chatVP.TotalLineCount()
-	viewportH := m.chatVP.VisibleLineCount()
+	totalLines := m.chatPanel.vp.TotalLineCount()
+	viewportH := m.chatPanel.vp.VisibleLineCount()
 	if totalLines <= viewportH {
 		t.Fatalf("内容应超出 viewport，totalLines=%d viewportH=%d", totalLines, viewportH)
 	}
 
-	sx, sy, sw, sh := m.scrollbarArea()
+	sx, sy, sw, sh := m.chatPanel.scrollbarArea(m.chatAreaWidth(), m.mainContentHeight())
 	if sx < 0 || sy != 1 || sw != 1 || sh != 7 {
 		t.Fatalf("scrollbarArea 异常: x=%d y=%d w=%d h=%d", sx, sy, sw, sh)
 	}
 
-	thumbStart, thumbEnd := m.scrollbarThumbBounds()
+	thumbStart, thumbEnd := m.chatPanel.thumbBounds(m.mainContentHeight())
 	if thumbStart < 0 || thumbEnd < thumbStart {
 		t.Fatalf("滑块边界异常: start=%d end=%d", thumbStart, thumbEnd)
 	}
@@ -278,25 +278,25 @@ func TestScrollbarDragScrollsChat(t *testing.T) {
 	press := tea.MouseMsg{X: sx, Y: thumbCenter, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress}
 	nm, _ := m.Update(press)
 	m = modelPtr(nm)
-	if !m.scrollbarDragging {
+	if !m.chatPanel.scrollbarDragging {
 		t.Fatal("在滑块上按下左键后应开始拖动")
 	}
 
-	initialOffset := m.chatVP.YOffset
+	initialOffset := m.chatPanel.vp.YOffset
 
 	// 向下拖动 3 行。
 	drag := tea.MouseMsg{X: sx, Y: thumbCenter + 3, Button: tea.MouseButtonNone, Action: tea.MouseActionMotion}
 	nm, _ = m.Update(drag)
 	m = modelPtr(nm)
-	if m.chatVP.YOffset <= initialOffset {
-		t.Fatalf("向下拖动后 YOffset 应增大，初始=%d 现在=%d", initialOffset, m.chatVP.YOffset)
+	if m.chatPanel.vp.YOffset <= initialOffset {
+		t.Fatalf("向下拖动后 YOffset 应增大，初始=%d 现在=%d", initialOffset, m.chatPanel.vp.YOffset)
 	}
 
 	// 释放左键。
 	release := tea.MouseMsg{X: sx, Y: thumbCenter + 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease}
 	nm, _ = m.Update(release)
 	m = modelPtr(nm)
-	if m.scrollbarDragging {
+	if m.chatPanel.scrollbarDragging {
 		t.Fatal("释放左键后应结束拖动")
 	}
 }
@@ -360,7 +360,7 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 
 	m := &Model{
 		styles:       NewStyles(),
-		chatVP:       viewport.New(80, 20),
+		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:        80,
 		height:       24,
 		agent:        testAgent(g, registry, sessionMgr),
@@ -368,14 +368,14 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 		httpAddr:     "http://127.0.0.1:1",
 		flashMu:      &sync.Mutex{},
 	}
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.SetContent("")
 	m.refreshSessions()
 	if len(m.sessions) == 0 {
 		t.Fatal("expected at least one session after CreateSession")
 	}
 	m.selectSession(0)
 
-	if len(m.agentsNodes) == 0 {
+	if len(m.agentTreePanel.nodes) == 0 {
 		t.Fatal("selectSession 后应至少包含 MetaAgent")
 	}
 	if !m.rightPanelVisible() {
@@ -442,7 +442,7 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 
 	m := &Model{
 		styles:       NewStyles(),
-		chatVP:       viewport.New(80, 20),
+		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:        120,
 		height:       40,
 		agent:        testAgent(g, registry, sessionMgr),
@@ -450,7 +450,7 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 		httpAddr:     "http://127.0.0.1:1",
 		flashMu:      &sync.Mutex{},
 	}
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.SetContent("")
 	m.refreshSessions()
 	if len(m.sessions) == 0 {
 		t.Fatal("expected at least one session after CreateSession")
@@ -474,13 +474,13 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 func TestRightPanelShowsBothPanelsEvenWhenShort(t *testing.T) {
 	m := &Model{
 		styles:           NewStyles(),
-		chatVP:           viewport.New(80, 20),
+		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:            80,
 		height:           12,
 		rightPanelForced: 1,
 		flashMu:          &sync.Mutex{},
 	}
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.SetContent("")
 
 	view := m.View()
 	if !strings.Contains(view, "Agent 编排") {
@@ -496,21 +496,21 @@ func TestRightPanelShowsBothPanelsEvenWhenShort(t *testing.T) {
 func TestLongUserMessageWrapsAtRightPanelBoundary(t *testing.T) {
 	m := &Model{
 		styles:           NewStyles(),
-		chatVP:           viewport.New(80, 20),
+		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:            80,
 		height:           24,
 		rightPanelForced: 1, // 强制显示右侧栏，模拟右侧栏出现后的窄对话区
 		flashMu:          &sync.Mutex{},
 	}
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.SetContent("")
 
 	cw := m.chatContentWidth()
 	if cw >= 80-2 {
 		t.Fatalf("chatContentWidth 应因右侧栏而变窄，got %d", cw)
 	}
 
-	m.pendingFirstMessage = strings.Repeat("a", 200)
-	content := m.buildChatContent(cw)
+	m.chatPanel.pendingFirstMessage = strings.Repeat("a", 200)
+	content := m.chatPanel.buildContent(m.collectChatItems(), m.styles, cw)
 	if strings.Contains(content, "…") {
 		t.Fatalf("长用户消息不应被截断为省略号，got:\n%s", content)
 	}
@@ -541,7 +541,7 @@ func TestPlanPanelReflectsAgentStatuses(t *testing.T) {
 
 	m := &Model{
 		styles:           NewStyles(),
-		chatVP:           viewport.New(80, 20),
+		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:            120,
 		height:           40,
 		rt:               rt,
@@ -551,14 +551,14 @@ func TestPlanPanelReflectsAgentStatuses(t *testing.T) {
 			{ID: "session-1", Goal: "塔防游戏 demo"},
 		},
 		sessionsCursor: 0,
-		agentsNodes: []agentTreeNode{
+		agentTreePanel: AgentTreePanel{nodes: []agentTreeNode{
 			{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusDone},
 			{depth: 1, instID: "d1", name: "战斗领域", domain: "战斗领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusDone},
 			{depth: 1, instID: "d2", name: "UI领域", domain: "UI领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusActive},
 			{depth: 1, instID: "d3", name: "经济领域", domain: "经济领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusWaiting},
-		},
+		}},
 	}
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.SetContent("")
 
 	view := m.View()
 	// 进度应大于 0（3 个里 1 个完成）

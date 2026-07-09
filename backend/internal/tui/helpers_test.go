@@ -267,13 +267,13 @@ func titlesOf(items []chatItem) []string {
 func TestFirstMessagePendingDisplay(t *testing.T) {
 	m := &Model{
 		styles:   NewStyles(),
-		chatVP:   viewport.New(80, 20),
+		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:    80,
 		height:   24,
 		httpAddr: "http://127.0.0.1:1", // 让后台 createSession 快速失败，避免测试被网络阻塞
 		flashMu:  &sync.Mutex{},
 	}
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.SetContent("")
 
 	// 初始状态应展示欢迎页
 	welcomeView := m.View()
@@ -284,8 +284,8 @@ func TestFirstMessagePendingDisplay(t *testing.T) {
 	// 用户发送首条消息
 	m.submitInput("hello world")
 
-	if m.pendingFirstMessage != "hello world" {
-		t.Fatalf("pendingFirstMessage 应被设为 %q，got %q", "hello world", m.pendingFirstMessage)
+	if m.chatPanel.pendingFirstMessage != "hello world" {
+		t.Fatalf("pendingFirstMessage 应被设为 %q，got %q", "hello world", m.chatPanel.pendingFirstMessage)
 	}
 
 	// 发送后应立刻切换到对话视图，不再展示欢迎页
@@ -306,15 +306,17 @@ func TestFirstMessagePendingDisplay(t *testing.T) {
 // 并以 "You" 高亮，避免首条问题"消失"。
 func TestFirstMessageFallbackWhenSessionMissingUserMessage(t *testing.T) {
 	m := &Model{
-		styles:              NewStyles(),
-		chatVP:              viewport.New(80, 20),
-		width:               80,
-		height:              24,
-		pendingFirstMessage: "hello fallback",
-		sessionsCursor:      0,
-		flashMu:             &sync.Mutex{},
+		styles: NewStyles(),
+		chatPanel: ChatPanel{
+			vp:                  viewport.New(80, 20),
+			pendingFirstMessage: "hello fallback",
+		},
+		width:          80,
+		height:         24,
+		sessionsCursor: 0,
+		flashMu:        &sync.Mutex{},
 	}
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.SetContent("")
 	// 构造一个已选中但 Messages 里暂时没有用户消息的会话
 	m.sessions = []*server.Session{{
 		ID:        "session-fallback",

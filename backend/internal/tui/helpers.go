@@ -43,7 +43,7 @@ func (m *Model) showChatDetail() {
 		return
 	}
 	items := chatItems(s, true)
-	idx := m.chatCurrentItem()
+	idx := m.chatPanel.currentItem()
 	if idx < 0 || idx >= len(items) {
 		return
 	}
@@ -53,7 +53,7 @@ func (m *Model) showChatDetail() {
 	if detail == "" {
 		detail = item.detail
 	}
-	m.openOverlay(item.title, strings.Split(detail, "\n"))
+	m.overlayPanel.open(item.title, strings.Split(detail, "\n"))
 }
 
 func (m *Model) showPlanDetailByIndex(idx int) {
@@ -79,14 +79,14 @@ func (m *Model) showPlanDetailByIndex(idx int) {
 	if t.Result != "" {
 		lines = append(lines, fmt.Sprintf("Result: %s", t.Result))
 	}
-	m.openOverlay("Plan Task", lines)
+	m.overlayPanel.open("Plan Task", lines)
 }
 
 func (m *Model) showAgentDetailByIndex(idx int) {
-	if idx < 0 || idx >= len(m.agentsNodes) {
+	if idx < 0 || idx >= len(m.agentTreePanel.nodes) {
 		return
 	}
-	node := m.agentsNodes[idx]
+	node := m.agentTreePanel.nodes[idx]
 	lines := []string{
 		fmt.Sprintf("Instance: %s", node.instID),
 		fmt.Sprintf("Name: %s", node.name),
@@ -99,7 +99,7 @@ func (m *Model) showAgentDetailByIndex(idx int) {
 	if node.goal != "" {
 		lines = append(lines, fmt.Sprintf("Goal: %s", node.goal))
 	}
-	m.openOverlay("Agent", lines)
+	m.overlayPanel.open("Agent", lines)
 }
 
 type chatItem struct {
@@ -165,7 +165,7 @@ func (m *Model) buildPlanLines() []string {
 	}
 	for i, t := range snap.Tasks {
 		marker := " "
-		if i == m.overlayCursor {
+		if i == m.overlayPanel.cursor {
 			marker = "▸"
 		}
 		lines = append(lines, fmt.Sprintf("%s %s  %s", marker, statusIcon(string(t.Status)), t.Title))
@@ -175,11 +175,11 @@ func (m *Model) buildPlanLines() []string {
 
 // buildAgentsLines renders the agent topology as flat lines for the popup.
 func (m *Model) buildAgentsLines() []string {
-	if len(m.agentsNodes) == 0 {
+	if len(m.agentTreePanel.nodes) == 0 {
 		return []string{"(no agents)"}
 	}
 	var lines []string
-	for i, node := range m.agentsNodes {
+	for i, node := range m.agentTreePanel.nodes {
 		prefix := strings.Repeat("  ", node.depth)
 		var icon string
 		switch node.roleType {
@@ -193,7 +193,7 @@ func (m *Model) buildAgentsLines() []string {
 			icon = "▸"
 		}
 		marker := " "
-		if i == m.overlayCursor {
+		if i == m.overlayPanel.cursor {
 			marker = "▸"
 		}
 		name := node.name
@@ -788,21 +788,6 @@ func statusIcon(status string) string {
 }
 
 // agentStatusBadge 把 Agent 状态渲染成短标签徽章，用于 Agent 编排栏。
-func agentStatusBadge(styles *Styles, status enums.RoleStatus) string {
-	switch status {
-	case enums.RoleStatusActive:
-		return styles.BadgeWarn.Render(" 运行 ")
-	case enums.RoleStatusDone:
-		return styles.BadgeOk.Render(" 完成 ")
-	case enums.RoleStatusError:
-		return styles.BadgeWarn.Render(" 错误 ")
-	case enums.RoleStatusWaiting:
-		return styles.Badge.Render(" 等待 ")
-	default:
-		return styles.Badge.Render(" 空闲 ")
-	}
-}
-
 // formatTopBar 按 v2.0 格式渲染顶部状态栏：
 // BlockMemoryAgent > {sessionID}  ●running  {N} agents active  in:{in} out:{out}
 func formatTopBar(styles *Styles, sessionID, status string, agentCount, inTokens, outTokens int) string {
@@ -903,46 +888,6 @@ func lastToolLabel(s *server.Session) string {
 }
 
 // renderAgentPanel 渲染右侧 Agent 面板。
-func renderAgentPanel(m *Model, w int) string {
-	s := m.selectedSession()
-	if s == nil {
-		return m.styles.BlurBorder.Width(w).Render(m.styles.Dim.Render("No active session"))
-	}
-
-	var lines []string
-	lines = append(lines, m.styles.Header.Render("Agents"))
-
-	if len(m.agentsNodes) == 0 {
-		lines = append(lines, m.styles.Dim.Render("  (no agents)"))
-	} else {
-		for _, node := range m.agentsNodes {
-			prefix := strings.Repeat("  ", node.depth)
-			icon := statusIcon(string(node.status))
-			name := node.name
-			if node.goal != "" {
-				name += " " + m.styles.Dim.Render(truncate(node.goal, w-12))
-			}
-			lines = append(lines, fmt.Sprintf("%s%s %s %s", prefix, icon, name, m.styles.Dim.Render("")))
-		}
-	}
-
-	lines = append(lines, "", m.styles.Header.Render("Memory"))
-	recalls := recentMemoryRecalls(s, 3)
-	if len(recalls) == 0 {
-		lines = append(lines, m.styles.Dim.Render("  (none)"))
-	} else {
-		for _, r := range recalls {
-			lines = append(lines, m.styles.Dim.Render("  • "+truncate(r, w-4)))
-		}
-	}
-
-	lines = append(lines, "", m.styles.Header.Render("Tokens"))
-	lines = append(lines, fmt.Sprintf("  in:%d out:%d", m.totalInputTokens, m.totalOutputTokens))
-
-	content := strings.Join(lines, "\n")
-	return m.styles.BlurBorder.Width(w).Height(m.height - 2).Render(content)
-}
-
 // recentMemoryRecalls 从会话事件中抽取最近召回的记忆片段。
 func recentMemoryRecalls(s *server.Session, limit int) []string {
 	if limit <= 0 {

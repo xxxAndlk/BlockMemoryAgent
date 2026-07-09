@@ -23,15 +23,15 @@ const pasteEnterThreshold = 80 * time.Millisecond
 func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	now := time.Now()
 	// 记录按键时间，用于区分终端粘贴产生的快速连续 Enter 与手动回车。
-	defer func() { m.lastKeyTime = now }()
+	defer func() { m.inputBar.lastKeyTime = now }()
 
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.focus = panelChat
-		m.inputRunes = nil
-		m.inputCursor = 0
-		m.inputMode = inputNormal
-		m.inputHistIdx = -1
+		m.inputBar.runes = nil
+		m.inputBar.cursor = 0
+		m.inputBar.mode = inputNormal
+		m.inputBar.histIdx = -1
 		return m, nil
 
 	case tea.KeyEnter:
@@ -39,27 +39,27 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// 很多终端（尤其是 Windows）粘贴多行时不会给每个 KeyEnter 打 Paste 标记，
 		// 因此用时间间隔做兜底：连续快速到达的 Enter 视为粘贴的一部分。
 		isPasteEnter := msg.Alt || msg.Paste
-		if !isPasteEnter && !m.lastKeyTime.IsZero() && now.Sub(m.lastKeyTime) < pasteEnterThreshold {
+		if !isPasteEnter && !m.inputBar.lastKeyTime.IsZero() && now.Sub(m.inputBar.lastKeyTime) < pasteEnterThreshold {
 			isPasteEnter = true
 		}
 		if isPasteEnter {
-			m.inputRunes = append(m.inputRunes[:m.inputCursor], append([]rune{'\n'}, m.inputRunes[m.inputCursor:]...)...)
-			m.inputCursor++
+			m.inputBar.runes = append(m.inputBar.runes[:m.inputBar.cursor], append([]rune{'\n'}, m.inputBar.runes[m.inputBar.cursor:]...)...)
+			m.inputBar.cursor++
 			return m, nil
 		}
-		cmd := string(m.inputRunes)
+		cmd := string(m.inputBar.runes)
 		if strings.TrimSpace(cmd) != "" {
 			m.pushHistory(cmd)
 		}
-		m.inputHistIdx = -1
+		m.inputBar.histIdx = -1
 		m.submitInput(cmd)
-		m.inputRunes = nil
-		m.inputCursor = 0
-		m.inputMode = inputNormal
+		m.inputBar.runes = nil
+		m.inputBar.cursor = 0
+		m.inputBar.mode = inputNormal
 		// 发送后先停止跟随底部，等待 tick 把视口滚动到刚发送的用户问题，
 		// 避免长回答直接顶掉用户问题。
-		m.chatFollowBottom = false
-		m.pendingScrollToUser = true
+		m.chatPanel.followBottom = false
+		m.chatPanel.pendingScrollToUser = true
 		// Keep focus in input so the user can immediately type the next message.
 		m.focus = panelInput
 		return m, nil
@@ -73,70 +73,70 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(h) == 0 {
 			return m, nil
 		}
-		if m.inputHistIdx == -1 {
-			m.inputHistIdx = len(h)
+		if m.inputBar.histIdx == -1 {
+			m.inputBar.histIdx = len(h)
 		}
-		if m.inputHistIdx > 0 {
-			m.inputHistIdx--
-			m.inputRunes = []rune(h[m.inputHistIdx])
-			m.inputCursor = len(m.inputRunes)
+		if m.inputBar.histIdx > 0 {
+			m.inputBar.histIdx--
+			m.inputBar.runes = []rune(h[m.inputBar.histIdx])
+			m.inputBar.cursor = len(m.inputBar.runes)
 		}
 		return m, nil
 
 	case tea.KeyDown:
 		h := m.sessionHistory()
-		if m.inputHistIdx == -1 {
+		if m.inputBar.histIdx == -1 {
 			return m, nil
 		}
-		if m.inputHistIdx < len(h)-1 {
-			m.inputHistIdx++
-			m.inputRunes = []rune(h[m.inputHistIdx])
-			m.inputCursor = len(m.inputRunes)
+		if m.inputBar.histIdx < len(h)-1 {
+			m.inputBar.histIdx++
+			m.inputBar.runes = []rune(h[m.inputBar.histIdx])
+			m.inputBar.cursor = len(m.inputBar.runes)
 		} else {
-			m.inputHistIdx = -1
-			m.inputRunes = nil
-			m.inputCursor = 0
+			m.inputBar.histIdx = -1
+			m.inputBar.runes = nil
+			m.inputBar.cursor = 0
 		}
 		return m, nil
 
 	case tea.KeyBackspace:
-		if m.inputIsMultiline() {
+		if m.inputBar.isMultiline() {
 			// 多行内容一次性清空，避免逐字符删除长文本。
-			m.inputRunes = nil
-			m.inputCursor = 0
-		} else if m.inputCursor > 0 {
-			m.inputRunes = append(m.inputRunes[:m.inputCursor-1], m.inputRunes[m.inputCursor:]...)
-			m.inputCursor--
+			m.inputBar.runes = nil
+			m.inputBar.cursor = 0
+		} else if m.inputBar.cursor > 0 {
+			m.inputBar.runes = append(m.inputBar.runes[:m.inputBar.cursor-1], m.inputBar.runes[m.inputBar.cursor:]...)
+			m.inputBar.cursor--
 		}
 		return m, nil
 
 	case tea.KeyDelete:
-		if m.inputIsMultiline() {
-			m.inputRunes = nil
-			m.inputCursor = 0
-		} else if m.inputCursor < len(m.inputRunes) {
-			m.inputRunes = append(m.inputRunes[:m.inputCursor], m.inputRunes[m.inputCursor+1:]...)
+		if m.inputBar.isMultiline() {
+			m.inputBar.runes = nil
+			m.inputBar.cursor = 0
+		} else if m.inputBar.cursor < len(m.inputBar.runes) {
+			m.inputBar.runes = append(m.inputBar.runes[:m.inputBar.cursor], m.inputBar.runes[m.inputBar.cursor+1:]...)
 		}
 		return m, nil
 
 	case tea.KeyLeft:
-		if m.inputCursor > 0 {
-			m.inputCursor--
+		if m.inputBar.cursor > 0 {
+			m.inputBar.cursor--
 		}
 		return m, nil
 
 	case tea.KeyRight:
-		if m.inputCursor < len(m.inputRunes) {
-			m.inputCursor++
+		if m.inputBar.cursor < len(m.inputBar.runes) {
+			m.inputBar.cursor++
 		}
 		return m, nil
 
 	case tea.KeyHome:
-		m.inputCursor = 0
+		m.inputBar.cursor = 0
 		return m, nil
 
 	case tea.KeyEnd:
-		m.inputCursor = len(m.inputRunes)
+		m.inputBar.cursor = len(m.inputBar.runes)
 		return m, nil
 
 	case tea.KeyCtrlC:
@@ -144,8 +144,8 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case tea.KeyRunes:
-		m.inputRunes = append(m.inputRunes[:m.inputCursor], append(msg.Runes, m.inputRunes[m.inputCursor:]...)...)
-		m.inputCursor += len(msg.Runes)
+		m.inputBar.runes = append(m.inputBar.runes[:m.inputBar.cursor], append(msg.Runes, m.inputBar.runes[m.inputBar.cursor:]...)...)
+		m.inputBar.cursor += len(msg.Runes)
 		return m, nil
 	}
 
@@ -203,7 +203,7 @@ func (m *Model) submitInput(cmd string) {
 		// No session yet: treat plain input as a new conversation goal.
 		// 先本地预展示首条消息，确保用户按下回车后立刻在对话区看到自己的输入，
 		// 避免欢迎页停留造成"第一个问题未记录"的错觉。
-		m.pendingFirstMessage = cmd
+		m.chatPanel.pendingFirstMessage = cmd
 		m.rebuildChatContent()
 		m.createSession(cmd)
 		return
@@ -213,13 +213,13 @@ func (m *Model) submitInput(cmd string) {
 	switch parts[0] {
 	case "/status":
 		// 展示当前会话状态摘要
-		m.flashMsg(fmt.Sprintf("session %s: status=%s agents=%d", s.ID, s.Status, len(m.agentsNodes)))
+		m.flashMsg(fmt.Sprintf("session %s: status=%s agents=%d", s.ID, s.Status, len(m.agentTreePanel.nodes)))
 		return
 	case "/clear":
 		// 重置主对话区滚动到最新（chat 由服务端事件驱动，本地仅重置视图位置）
-		m.chatFollowBottom = true
-		m.chatAnchorUser = false
-		m.chatVP.GotoBottom()
+		m.chatPanel.followBottom = true
+		m.chatPanel.anchorUser = false
+		m.chatPanel.vp.GotoBottom()
 		m.flashMsg("chat scrolled to bottom")
 		return
 	case "/topic":
@@ -370,23 +370,7 @@ func (m *Model) createSession(goal string) {
 }
 
 // sessionHistory returns the input history slice for the currently selected session.
-func (m *Model) sessionHistory() []string {
-	s := m.selectedSession()
-	if s == nil {
-		return nil
-	}
-	return m.inputHistory[s.ID]
-}
-
 // pushHistory appends a command to the current session's input history.
-func (m *Model) pushHistory(cmd string) {
-	s := m.selectedSession()
-	if s == nil {
-		return
-	}
-	m.inputHistory[s.ID] = append(m.inputHistory[s.ID], cmd)
-}
-
 // getJSON 向本地 TUI 后端发 GET 请求并 JSON 解码到 dst。
 // 失败返回 error，调用方自行处理（如显示 flash 或退回空结果）。
 func (m *Model) getJSON(path string, dst any) error {

@@ -19,16 +19,16 @@ func TestMultilinePasteCollapsesInput(t *testing.T) {
 		focus:   panelInput,
 		flashMu: &sync.Mutex{},
 	}
-	m.chatVP.Width = 80
-	m.chatVP.Height = 20
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.Width = 80
+	m.chatPanel.vp.Height = 20
+	m.chatPanel.vp.SetContent("")
 
 	pasted := "line1\nline2\nline3"
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(pasted), Paste: true})
 	mv := nm.(*Model)
 
-	if string(mv.inputRunes) != pasted {
-		t.Fatalf("底层应保留完整粘贴内容，got %q", string(mv.inputRunes))
+	if string(mv.inputBar.runes) != pasted {
+		t.Fatalf("底层应保留完整粘贴内容，got %q", string(mv.inputBar.runes))
 	}
 	if !mv.inputIsMultiline() {
 		t.Fatal("inputIsMultiline 应为 true")
@@ -47,37 +47,41 @@ func TestMultilinePasteCollapsesInput(t *testing.T) {
 // TestMultilineInputBackspaceClearsAll 验证多行输入下 Backspace 一次性清空。
 func TestMultilineInputBackspaceClearsAll(t *testing.T) {
 	m := &Model{
-		styles:      NewStyles(),
-		width:       120,
-		height:      40,
-		focus:       panelInput,
-		inputRunes:  []rune("a\nb\nc"),
-		inputCursor: 5,
-		flashMu:     &sync.Mutex{},
+		styles: NewStyles(),
+		width:  120,
+		height: 40,
+		focus:  panelInput,
+		inputBar: InputBar{
+			runes:  []rune("a\nb\nc"),
+			cursor: 5,
+		},
+		flashMu: &sync.Mutex{},
 	}
 
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
 	mv := nm.(*Model)
 
-	if len(mv.inputRunes) != 0 {
-		t.Fatalf("Backspace 应清空多行输入，got %q", string(mv.inputRunes))
+	if len(mv.inputBar.runes) != 0 {
+		t.Fatalf("Backspace 应清空多行输入，got %q", string(mv.inputBar.runes))
 	}
 }
 
 // TestSingleLineInputStillShowsCursor 验证单行输入保持原有光标展示。
 func TestSingleLineInputStillShowsCursor(t *testing.T) {
 	m := &Model{
-		styles:      NewStyles(),
-		width:       120,
-		height:      40,
-		focus:       panelInput,
-		inputRunes:  []rune("hello"),
-		inputCursor: 2,
-		flashMu:     &sync.Mutex{},
+		styles: NewStyles(),
+		width:  120,
+		height: 40,
+		focus:  panelInput,
+		inputBar: InputBar{
+			runes:  []rune("hello"),
+			cursor: 2,
+		},
+		flashMu: &sync.Mutex{},
 	}
-	m.chatVP.Width = 80
-	m.chatVP.Height = 20
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.Width = 80
+	m.chatPanel.vp.Height = 20
+	m.chatPanel.vp.SetContent("")
 
 	view := m.View()
 	if strings.Contains(view, "[1行内容]") {
@@ -98,18 +102,18 @@ func TestMultilineSubmitPreservesContent(t *testing.T) {
 		focus:   panelInput,
 		flashMu: &sync.Mutex{},
 	}
-	m.chatVP.Width = 80
-	m.chatVP.Height = 20
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.Width = 80
+	m.chatPanel.vp.Height = 20
+	m.chatPanel.vp.SetContent("")
 
 	pasted := "func main() {\n\tfmt.Println(\"hello\")\n}"
-	m.inputRunes = []rune(pasted)
-	m.inputCursor = len(m.inputRunes)
+	m.inputBar.runes = []rune(pasted)
+	m.inputBar.cursor = len(m.inputBar.runes)
 
-	m.submitInput(string(m.inputRunes))
+	m.submitInput(string(m.inputBar.runes))
 
-	if m.pendingFirstMessage != pasted {
-		t.Fatalf("未选中会话时应完整保留粘贴内容用于创建会话，got %q", m.pendingFirstMessage)
+	if m.chatPanel.pendingFirstMessage != pasted {
+		t.Fatalf("未选中会话时应完整保留粘贴内容用于创建会话，got %q", m.chatPanel.pendingFirstMessage)
 	}
 }
 
@@ -123,9 +127,9 @@ func TestPasteEnterInsertsNewline(t *testing.T) {
 		focus:   panelInput,
 		flashMu: &sync.Mutex{},
 	}
-	m.chatVP.Width = 80
-	m.chatVP.Height = 20
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.Width = 80
+	m.chatPanel.vp.Height = 20
+	m.chatPanel.vp.SetContent("")
 
 	// 模拟粘贴第一行
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("line1"), Paste: true})
@@ -133,22 +137,22 @@ func TestPasteEnterInsertsNewline(t *testing.T) {
 	// 粘贴中的换行应作为 \n 插入，而不是提交
 	nm, _ = mv.Update(tea.KeyMsg{Type: tea.KeyEnter, Paste: true})
 	mv = nm.(*Model)
-	if string(mv.inputRunes) != "line1\n" {
-		t.Fatalf("粘贴中的 Enter 应插入换行，got %q", string(mv.inputRunes))
+	if string(mv.inputBar.runes) != "line1\n" {
+		t.Fatalf("粘贴中的 Enter 应插入换行，got %q", string(mv.inputBar.runes))
 	}
-	if mv.pendingFirstMessage != "" {
-		t.Fatalf("粘贴换行时不应提交，pendingFirstMessage=%q", mv.pendingFirstMessage)
+	if mv.chatPanel.pendingFirstMessage != "" {
+		t.Fatalf("粘贴换行时不应提交，pendingFirstMessage=%q", mv.chatPanel.pendingFirstMessage)
 	}
 
 	// 继续粘贴第二行
 	nm, _ = mv.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("line2"), Paste: true})
 	mv = nm.(*Model)
 	// 模拟用户停顿后手动按 Enter，避免被判定为粘贴的一部分
-	mv.lastKeyTime = time.Now().Add(-200 * time.Millisecond)
+	mv.inputBar.lastKeyTime = time.Now().Add(-200 * time.Millisecond)
 	nm, _ = mv.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mv = nm.(*Model)
-	if mv.pendingFirstMessage != "line1\nline2" {
-		t.Fatalf("普通 Enter 应一次性提交完整多行内容，got %q", mv.pendingFirstMessage)
+	if mv.chatPanel.pendingFirstMessage != "line1\nline2" {
+		t.Fatalf("普通 Enter 应一次性提交完整多行内容，got %q", mv.chatPanel.pendingFirstMessage)
 	}
 }
 
@@ -162,45 +166,45 @@ func TestRapidPasteAccumulatesLines(t *testing.T) {
 		focus:   panelInput,
 		flashMu: &sync.Mutex{},
 	}
-	m.chatVP.Width = 80
-	m.chatVP.Height = 20
-	m.chatVP.SetContent("")
+	m.chatPanel.vp.Width = 80
+	m.chatPanel.vp.Height = 20
+	m.chatPanel.vp.SetContent("")
 
 	// 把 lastKeyTime 设为刚过去，模拟终端粘贴的高速连续按键
-	m.lastKeyTime = time.Now().Add(-10 * time.Millisecond)
+	m.inputBar.lastKeyTime = time.Now().Add(-10 * time.Millisecond)
 
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("line1")})
 	mv := nm.(*Model)
-	mv.lastKeyTime = time.Now().Add(-10 * time.Millisecond)
+	mv.inputBar.lastKeyTime = time.Now().Add(-10 * time.Millisecond)
 
 	// 快速 Enter → 插入换行，不提交
 	nm, _ = mv.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mv = nm.(*Model)
-	if string(mv.inputRunes) != "line1\n" {
-		t.Fatalf("快速 Enter 应插入换行，got %q", string(mv.inputRunes))
+	if string(mv.inputBar.runes) != "line1\n" {
+		t.Fatalf("快速 Enter 应插入换行，got %q", string(mv.inputBar.runes))
 	}
-	if mv.pendingFirstMessage != "" {
-		t.Fatalf("粘贴过程中不应提交，pendingFirstMessage=%q", mv.pendingFirstMessage)
+	if mv.chatPanel.pendingFirstMessage != "" {
+		t.Fatalf("粘贴过程中不应提交，pendingFirstMessage=%q", mv.chatPanel.pendingFirstMessage)
 	}
-	mv.lastKeyTime = time.Now().Add(-10 * time.Millisecond)
+	mv.inputBar.lastKeyTime = time.Now().Add(-10 * time.Millisecond)
 
 	// 第二行文本
 	nm, _ = mv.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("line2")})
 	mv = nm.(*Model)
-	mv.lastKeyTime = time.Now().Add(-10 * time.Millisecond)
+	mv.inputBar.lastKeyTime = time.Now().Add(-10 * time.Millisecond)
 
 	// 再次快速 Enter → 继续累积
 	nm, _ = mv.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mv = nm.(*Model)
-	if string(mv.inputRunes) != "line1\nline2\n" {
-		t.Fatalf("应继续累积多行内容，got %q", string(mv.inputRunes))
+	if string(mv.inputBar.runes) != "line1\nline2\n" {
+		t.Fatalf("应继续累积多行内容，got %q", string(mv.inputBar.runes))
 	}
 
 	// 稍等一会儿再按 Enter，视为手动提交
-	mv.lastKeyTime = time.Now().Add(-200 * time.Millisecond)
+	mv.inputBar.lastKeyTime = time.Now().Add(-200 * time.Millisecond)
 	nm, _ = mv.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mv = nm.(*Model)
-	if mv.pendingFirstMessage != "line1\nline2\n" {
-		t.Fatalf("手动 Enter 应一次性提交完整内容，got %q", mv.pendingFirstMessage)
+	if mv.chatPanel.pendingFirstMessage != "line1\nline2\n" {
+		t.Fatalf("手动 Enter 应一次性提交完整内容，got %q", mv.chatPanel.pendingFirstMessage)
 	}
 }

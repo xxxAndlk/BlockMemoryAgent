@@ -8,7 +8,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
@@ -35,40 +34,20 @@ type Model struct {
 
 	styles *Styles
 
-	focus   int // panelChat / panelInput
-	overlay int
+	focus int // panelChat / panelInput
 
 	sessions       []*server.Session
 	sessionsCursor int
 
-	// chat panel
-	chatVP              viewport.Model
-	chatCursor          int
-	chatFollowBottom    bool
-	chatLastItems       int    // 用于检测会话内容变化，决定是否重建 viewport content
-	chatLastWidth       int    // 上次生成 content 时的宽度
-	chatItemOffsets     []int  // 每个 chatItem 在 viewport content 中的起始行偏移
-	pendingScrollToUser bool   // 发送消息后优先滚动到用户问题
-	chatAnchorUser      bool   // 已锚定到用户问题，禁止自动跟随底部
-	pendingFirstMessage string // 无会话时用户发送的首条消息，用于立即切换到对话视图并高亮展示
-
-	// scrollbar drag state
-	scrollbarDragging bool // 是否正在拖动聊天区滚动条滑块
-	dragStartY        int  // 拖动开始时鼠标 Y 坐标
-	dragStartOffset   int  // 拖动开始时 viewport YOffset
+	chatPanel      ChatPanel
+	inputBar       InputBar
+	overlayPanel   OverlayPanel
+	agentTreePanel AgentTreePanel
+	taskBriefCache TaskBriefCache
 
 	// accumulated token counts from token_usage events
 	totalInputTokens  int
 	totalOutputTokens int
-
-	// agents tree (built every tick)
-	agentsNodes []agentTreeNode
-
-	// taskBriefCache 缓存 LLM 精简后的任务标题，避免同一长描述重复请求。
-	// taskBriefMu 用指针避免 Model 值拷贝触发 copylocks（bubbletea Model 按值传递）。
-	// 容量上限 taskBriefCacheMaxSize，超限淘汰任意一条（见 view.go setTaskBriefCache）。
-	taskBriefCache map[string]string
-	taskBriefMu    *sync.Mutex
 
 	// v2.0 面板开关
 	agentPanelVisible bool
@@ -77,20 +56,6 @@ type Model struct {
 	// rightPanelForced 用户手动强制显示/隐藏右侧计划/Agent 分栏。
 	// 0=自动（按宽度和内容），1=强制显示，-1=强制隐藏。
 	rightPanelForced int
-
-	// input bar
-	inputMode    int
-	inputRunes   []rune
-	inputCursor  int
-	inputHistory map[string][]string // sessionID -> 历史输入
-	inputHistIdx int
-	lastKeyTime  time.Time // 上次按键时间，用于区分快速粘贴与手动回车
-
-	// overlay
-	overlayTitle  string
-	overlayLines  []string
-	overlayCursor int
-	overlayKind   int // overlayPlan / overlayAgents / overlayDetail / overlayHelp
 
 	// flash banner
 	flash      string
@@ -110,19 +75,6 @@ type Model struct {
 	tickCount int
 }
 
-// agentTreeNode is one flattened row in the agent topology.
-type agentTreeNode struct {
-	depth     int
-	instID    string
-	name      string
-	domain    string
-	roleType  enums.RoleType
-	status    enums.RoleStatus
-	goal      string
-	isClarify bool
-	createdAt time.Time
-}
-
 // NewModel builds a TUI model wired to backend dependencies.
 func NewModel(
 	agentFacade agent.Agent,
@@ -134,33 +86,29 @@ func NewModel(
 	modelFactory *model.ModelFactory,
 ) *Model {
 	m := &Model{
-		agent:            agentFacade,
-		rt:               rt,
-		dagHandler:       dagHandler,
-		pgStore:          pgStore,
-		httpAddr:         httpAddr,
-		modelName:        modelName,
-		modelFactory:     modelFactory,
-		styles:           NewStyles(),
-		focus:            panelChat,
-		chatFollowBottom: true,
-		planBarVisible:   true,
-		inputHistIdx:     -1,
-		inputHistory:     make(map[string][]string),
-		flashMu:          &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
-		chatVP:           viewport.New(0, 0),
-		taskBriefCache:   make(map[string]string),
-		taskBriefMu:      &sync.Mutex{},
-		streamEvents:     make(chan agent.Event, 16),
+		agent:          agentFacade,
+		rt:             rt,
+		dagHandler:     dagHandler,
+		pgStore:        pgStore,
+		httpAddr:       httpAddr,
+		modelName:      modelName,
+		modelFactory:   modelFactory,
+		styles:         NewStyles(),
+		focus:          panelChat,
+		chatPanel:      NewChatPanel(),
+		planBarVisible: true,
+		inputBar:       NewInputBar(),
+		flashMu:        &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
+		taskBriefCache: NewTaskBriefCache(),
+		streamEvents:   make(chan agent.Event, 16),
 	}
-	m.chatVP.SetContent("")
 	m.refreshSessions()
 	if len(m.sessions) > 0 {
 		m.selectSession(0)
 	} else {
 		// No sessions — drop user into the input bar so they can /new one.
 		m.focus = panelInput
-		m.inputMode = inputNormal
+		m.inputBar.mode = inputNormal
 	}
 	return m
 }
@@ -207,37 +155,37 @@ func (m *Model) selectSession(idx int) {
 	// 只有在确认服务端会话的 Messages 中已包含同一条首条用户消息时，
 	// 才清除本地预展示；否则保留 pendingFirstMessage，由 buildChatContent
 	// 继续展示，避免选中后首条消息"消失"的竞态错觉。
-	if m.pendingFirstMessage != "" {
+	if m.chatPanel.pendingFirstMessage != "" {
 		s := m.selectedSession()
 		found := false
 		if s != nil {
 			for _, msg := range s.Messages {
-				if msg.Role == enums.ChatRoleUser && strings.TrimSpace(msg.Content) == m.pendingFirstMessage {
+				if msg.Role == enums.ChatRoleUser && strings.TrimSpace(msg.Content) == m.chatPanel.pendingFirstMessage {
 					found = true
 					break
 				}
 			}
 		}
 		if found {
-			m.pendingFirstMessage = ""
+			m.chatPanel.pendingFirstMessage = ""
 		} else {
 			log.Printf("[tui] selectSession: session %s 尚未同步首条用户消息，保留本地预展示", m.sessions[idx].ID)
 		}
 	}
-	m.chatCursor = 0
-	m.chatFollowBottom = true
-	m.chatAnchorUser = false
-	m.chatLastItems = 0
-	m.chatLastWidth = 0
+	m.chatPanel.cursor = 0
+	m.chatPanel.followBottom = true
+	m.chatPanel.anchorUser = false
+	m.chatPanel.lastItems = 0
+	m.chatPanel.lastWidth = 0
 	m.rebuildAgents()
 	m.startStream()
 	m.rebuildChatContent()
 	// 内容未撑满视口时回到顶部，确保首条用户消息/欢迎信息可见；
 	// 内容超出视口时才滚到底部看最新消息。
-	if m.chatVP.TotalLineCount() <= m.chatVP.VisibleLineCount() {
-		m.chatVP.GotoTop()
+	if m.chatPanel.vp.TotalLineCount() <= m.chatPanel.vp.VisibleLineCount() {
+		m.chatPanel.vp.GotoTop()
 	} else {
-		m.chatVP.GotoBottom()
+		m.chatPanel.vp.GotoBottom()
 	}
 }
 
@@ -280,6 +228,10 @@ func (m *Model) startStream() {
 	}()
 }
 
+func (m *Model) rebuildAgents() {
+	m.agentTreePanel.rebuild(m.agent, m.selectedSession())
+}
+
 func (m *Model) refreshSessions() {
 	if m.agent == nil {
 		return
@@ -311,134 +263,6 @@ func (m *Model) refreshSessions() {
 	} else if m.sessionsCursor >= len(m.sessions) && len(m.sessions) > 0 {
 		m.sessionsCursor = len(m.sessions) - 1
 		m.rebuildAgents()
-	}
-}
-
-func (m *Model) rebuildAgents() {
-	m.agentsNodes = nil
-	s := m.selectedSession()
-	if s == nil {
-		return
-	}
-
-	metaStatus := enums.RoleStatusIdle
-	switch s.Status {
-	case "running":
-		metaStatus = enums.RoleStatusActive
-	case "completed":
-		metaStatus = enums.RoleStatusDone
-	case "error":
-		metaStatus = enums.RoleStatusError
-	case "awaiting_clarify":
-		metaStatus = enums.RoleStatusWaiting
-	}
-	metaGoal := ""
-	if s.Goal != "" {
-		metaGoal = s.Goal
-	} else if len(s.Messages) > 0 {
-		for _, msg := range s.Messages {
-			if msg.Role == enums.ChatRoleUser {
-				metaGoal = strings.TrimSpace(msg.Content)
-				break
-			}
-		}
-	}
-	m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-		depth:     0,
-		instID:    "MetaAgent",
-		name:      "MetaAgent",
-		roleType:  enums.RoleTypeMeta,
-		status:    metaStatus,
-		goal:      metaGoal,
-		createdAt: s.StartedAt,
-	})
-
-	insts, err := m.agent.ListAgents(context.Background(), s.ID)
-	if err != nil {
-		log.Printf("[tui] rebuildAgents: %v", err)
-		return
-	}
-	byID := make(map[string]agent.AgentInstance)
-	for _, inst := range insts {
-		byID[inst.ModuleID] = inst
-	}
-	for _, inst := range insts {
-		if inst.RoleType != enums.RoleTypeDomain {
-			continue
-		}
-		goal := ""
-		if s.State != nil {
-			for _, b := range s.State.ActiveBlocks {
-				if b.Domain == inst.Domain {
-					goal = b.Goal
-					break
-				}
-			}
-		}
-		m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-			depth:     1,
-			instID:    inst.ModuleID,
-			name:      inst.Name,
-			domain:    inst.Domain,
-			roleType:  inst.RoleType,
-			status:    enums.RoleStatus(inst.Status),
-			goal:      goal,
-			createdAt: inst.CreatedAt,
-		})
-		for _, childID := range inst.Children {
-			child := byID[childID]
-			if child.ModuleID == "" {
-				continue
-			}
-			depth := 2
-			if child.RoleType == enums.RoleTypeSubDomain {
-				m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-					depth:     depth,
-					instID:    child.ModuleID,
-					name:      child.Name,
-					domain:    child.Domain,
-					roleType:  child.RoleType,
-					status:    enums.RoleStatus(child.Status),
-					createdAt: child.CreatedAt,
-				})
-				for _, subID := range child.Children {
-					sub := byID[subID]
-					if sub.ModuleID == "" {
-						continue
-					}
-					m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-						depth:     3,
-						instID:    sub.ModuleID,
-						name:      sub.Name,
-						domain:    sub.Domain,
-						roleType:  sub.RoleType,
-						status:    enums.RoleStatus(sub.Status),
-						createdAt: sub.CreatedAt,
-					})
-				}
-			} else if child.RoleType == enums.RoleTypeFixed || child.RoleType == enums.RoleTypeDynamic {
-				m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-					depth:     depth,
-					instID:    child.ModuleID,
-					name:      child.Name,
-					domain:    child.Domain,
-					roleType:  child.RoleType,
-					status:    enums.RoleStatus(child.Status),
-					createdAt: child.CreatedAt,
-				})
-			}
-		}
-	}
-
-	if s.State != nil && s.State.PendingClarify != nil {
-		m.agentsNodes = append(m.agentsNodes, agentTreeNode{
-			depth:     1,
-			instID:    "clarify",
-			name:      "Clarify pending",
-			roleType:  enums.RoleTypeMeta,
-			status:    enums.RoleStatusWaiting,
-			isClarify: true,
-		})
 	}
 }
 
@@ -555,11 +379,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.chatVP.Width = m.chatContentWidth()
-		m.chatVP.Height = m.mainContentHeight()
+		m.chatPanel.vp.Width = m.chatContentWidth()
+		m.chatPanel.vp.Height = m.mainContentHeight()
 		m.rebuildChatContent()
-		if m.chatFollowBottom {
-			m.chatVP.GotoBottom()
+		if m.chatPanel.followBottom {
+			m.chatPanel.vp.GotoBottom()
 		}
 
 	case tickMsg:
@@ -615,20 +439,20 @@ func (m *Model) refreshView() {
 	}
 	// 发送消息后，优先滚动到最后一条用户问题，确保用户能看到自己的输入。
 	// 该逻辑必须排在内容重建/自动跟随底部之前，防止新内容把用户问题顶出视口。
-	if m.pendingScrollToUser {
+	if m.chatPanel.pendingScrollToUser {
 		items := m.collectChatItems()
 		for idx := len(items) - 1; idx >= 0; idx-- {
 			if strings.HasPrefix(items[idx].title, "> ") {
 				m.rebuildChatContent()
 				// 把用户问题底部对齐视口底部，保留上方历史可见；
 				// 同时锚定，让后续流式输出在下方展开而不把用户问题顶走。
-				m.chatScrollToItemBottom(idx)
-				m.chatFollowBottom = false
-				m.chatAnchorUser = true
-				m.pendingScrollToUser = false
+				m.chatPanel.scrollToItemBottom(idx, m.chatPanel.vp.TotalLineCount(), m.chatPanel.vp.VisibleLineCount())
+				m.chatPanel.followBottom = false
+				m.chatPanel.anchorUser = true
+				m.chatPanel.pendingScrollToUser = false
 				// 找到真实用户消息后，若其内容与本地预展示一致，清除预展示标记
-				if m.pendingFirstMessage != "" && strings.TrimPrefix(items[idx].title, "> ") == m.pendingFirstMessage {
-					m.pendingFirstMessage = ""
+				if m.chatPanel.pendingFirstMessage != "" && strings.TrimPrefix(items[idx].title, "> ") == m.chatPanel.pendingFirstMessage {
+					m.chatPanel.pendingFirstMessage = ""
 				}
 				break
 			}
@@ -638,36 +462,36 @@ func (m *Model) refreshView() {
 	// viewport 内容随会话事件/消息增长而重建；跟随底部时自动滚到最新。
 	// 锚定到用户问题时仅重建内容、不自动滚动，避免用户问题被顶出视口。
 	if s := m.selectedSession(); s != nil {
-		itemsChanged := len(chatItems(s, true)) != m.chatLastItems
-		widthChanged := m.chatContentWidth() != m.chatLastWidth
+		itemsChanged := len(chatItems(s, true)) != m.chatPanel.lastItems
+		widthChanged := m.chatContentWidth() != m.chatPanel.lastWidth
 		if itemsChanged || widthChanged {
-			wasAtBottom := m.chatVP.AtBottom() || m.chatFollowBottom
+			wasAtBottom := m.chatPanel.vp.AtBottom() || m.chatPanel.followBottom
 			m.rebuildChatContent()
-			if !m.chatAnchorUser && wasAtBottom {
-				m.chatVP.GotoBottom()
-				m.chatFollowBottom = true
+			if !m.chatPanel.anchorUser && wasAtBottom {
+				m.chatPanel.vp.GotoBottom()
+				m.chatPanel.followBottom = true
 			}
 		}
 	}
-	if !m.chatAnchorUser && m.chatFollowBottom {
-		m.chatVP.GotoBottom()
+	if !m.chatPanel.anchorUser && m.chatPanel.followBottom {
+		m.chatPanel.vp.GotoBottom()
 	}
 	// 弹窗打开时刷新动态内容（完整记录面板在末尾时跟随新输出）
-	if m.overlay != overlayNone {
+	if m.overlayPanel.mode != overlayNone {
 		m.refreshOverlay()
 	}
 }
 
 func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	// When popup is open, wheel scrolls popup contents.
-	if m.overlay != overlayNone && m.overlay != overlayHelp {
+	if m.overlayPanel.mode != overlayNone && m.overlayPanel.mode != overlayHelp {
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
-			if m.overlayCursor > 0 {
-				m.overlayCursor--
+			if m.overlayPanel.cursor > 0 {
+				m.overlayPanel.cursor--
 			}
 		case tea.MouseButtonWheelDown:
-			m.overlayCursor++
+			m.overlayPanel.cursor++
 		}
 		m.clampOverlayCursor()
 		return m, nil
@@ -676,47 +500,47 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	// 滚轮始终交给 viewport 处理。
 	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
 		var cmd tea.Cmd
-		m.chatVP, cmd = m.chatVP.Update(msg)
-		m.chatFollowBottom = m.chatVP.AtBottom()
-		m.chatAnchorUser = false
+		m.chatPanel.vp, cmd = m.chatPanel.vp.Update(msg)
+		m.chatPanel.followBottom = m.chatPanel.vp.AtBottom()
+		m.chatPanel.anchorUser = false
 		return m, cmd
 	}
 
 	// 滚动条拖动处理。
-	sx, sy, sw, sh := m.scrollbarArea()
+	sx, sy, sw, sh := m.chatPanel.scrollbarArea(m.chatAreaWidth(), m.mainContentHeight())
 	inScrollbar := msg.X >= sx && msg.X < sx+sw && msg.Y >= sy && msg.Y < sy+sh
 
-	if m.scrollbarDragging {
+	if m.chatPanel.scrollbarDragging {
 		// 拖动过程中：根据鼠标 Y 位移实时更新 viewport offset。
 		// 释放事件（Release）也走这里，先更新位置再结束拖动。
-		m.updateScrollbarDrag(msg.Y)
+		m.chatPanel.updateDrag(msg.Y, m.mainContentHeight())
 		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionRelease {
-			m.scrollbarDragging = false
+			m.chatPanel.scrollbarDragging = false
 		}
 		return m, nil
 	}
 
 	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress && inScrollbar {
-		thumbStart, thumbEnd := m.scrollbarThumbBounds()
+		thumbStart, thumbEnd := m.chatPanel.thumbBounds(m.mainContentHeight())
 		relY := msg.Y - sy
 		if thumbStart >= 0 && relY >= thumbStart && relY <= thumbEnd {
 			// 点击滑块：开始拖动。
-			m.scrollbarDragging = true
-			m.dragStartY = msg.Y
-			m.dragStartOffset = m.chatVP.YOffset
+			m.chatPanel.scrollbarDragging = true
+			m.chatPanel.dragStartY = msg.Y
+			m.chatPanel.dragStartOffset = m.chatPanel.vp.YOffset
 			return m, nil
 		}
 		// 点击轨道但不在滑块上：跳转（以滑块中心对齐鼠标位置）。
 		thumbH := thumbEnd - thumbStart + 1
-		m.scrollToThumbY(relY - thumbH/2)
+		m.chatPanel.scrollToThumbY(relY - thumbH/2, m.mainContentHeight())
 		return m, nil
 	}
 
 	// 默认交给 viewport 处理内容区点击等。
 	var cmd tea.Cmd
-	m.chatVP, cmd = m.chatVP.Update(msg)
-	m.chatFollowBottom = m.chatVP.AtBottom()
-	m.chatAnchorUser = false
+	m.chatPanel.vp, cmd = m.chatPanel.vp.Update(msg)
+	m.chatPanel.followBottom = m.chatPanel.vp.AtBottom()
+	m.chatPanel.anchorUser = false
 	return m, cmd
 }
 
@@ -735,25 +559,25 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Overlay mode: navigate or close.
-	if m.overlay != overlayNone {
+	if m.overlayPanel.mode != overlayNone {
 		// Keep popup content / cursor in sync with live state.
 		m.refreshOverlay()
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "esc", "q":
-			m.overlay = overlayNone
+			m.overlayPanel.mode = overlayNone
 			return m, nil
 		case "j", "down":
-			m.overlayCursor++
+			m.overlayPanel.cursor++
 		case "k", "up":
-			if m.overlayCursor > 0 {
-				m.overlayCursor--
+			if m.overlayPanel.cursor > 0 {
+				m.overlayPanel.cursor--
 			}
 		case "g":
-			m.overlayCursor = 0
+			m.overlayPanel.cursor = 0
 		case "G":
-			m.overlayCursor = len(m.overlayLines) - 1
+			m.overlayPanel.cursor = len(m.overlayPanel.lines) - 1
 		case "enter":
 			m.handleOverlayEnter()
 		case "2":
@@ -763,7 +587,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "4":
 			m.toggleLogPopup()
 		case "1":
-			m.overlay = overlayNone
+			m.overlayPanel.mode = overlayNone
 		}
 		m.clampOverlayCursor()
 		return m, nil
@@ -779,7 +603,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c", "q", "Q":
 		return m, tea.Quit
 	case "1", "esc":
-		m.overlay = overlayNone
+		m.overlayPanel.mode = overlayNone
 	case "2", "p":
 		m.togglePlanPopup()
 	case "3", "a":
@@ -794,155 +618,52 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.flashMsg("Settings: not implemented in TUI")
 	case "K":
 		m.focus = panelInput
-		m.inputMode = inputNormal
+		m.inputBar.mode = inputNormal
 	case "/":
 		// Focus the input bar empty — for slash commands. Other printable chars
 		// fall through to the default case and seed the buffer directly.
 		m.focus = panelInput
-		m.inputMode = inputNormal
+		m.inputBar.mode = inputNormal
 	case "?":
 		m.openHelpPopup()
 	case "enter":
 		m.showChatDetail()
 	case "j", "down":
-		m.chatItemDown()
+		m.chatPanel.itemDown()
 	case "k", "up":
-		m.chatItemUp()
+		m.chatPanel.itemUp()
 	case "pgup":
-		m.chatVP.HalfViewUp()
-		m.chatFollowBottom = m.chatVP.AtBottom()
-		m.chatAnchorUser = false
+		m.chatPanel.vp.HalfViewUp()
+		m.chatPanel.followBottom = m.chatPanel.vp.AtBottom()
+		m.chatPanel.anchorUser = false
 	case "pgdown":
-		m.chatVP.HalfViewDown()
-		m.chatFollowBottom = m.chatVP.AtBottom()
-		m.chatAnchorUser = false
+		m.chatPanel.vp.HalfViewDown()
+		m.chatPanel.followBottom = m.chatPanel.vp.AtBottom()
+		m.chatPanel.anchorUser = false
 	case "home":
-		m.chatGotoTop()
+		m.chatPanel.gotoTop()
 	case "end":
-		m.chatGotoBottom()
+		m.chatPanel.gotoBottom()
 	default:
 		// Any printable rune jumps to input mode and seeds the buffer.
 		if len(msg.Runes) > 0 && unicode.IsPrint(msg.Runes[0]) {
 			m.focus = panelInput
-			m.inputMode = inputNormal
-			m.inputRunes = append([]rune{}, msg.Runes...)
-			m.inputCursor = len(m.inputRunes)
+			m.inputBar.mode = inputNormal
+			m.inputBar.runes = append([]rune{}, msg.Runes...)
+			m.inputBar.cursor = len(m.inputBar.runes)
 		}
 	}
 	return m, nil
 }
 
 // chatCurrentItem 返回当前 viewport 顶部对应的 chatItem 索引。
-func (m *Model) chatCurrentItem() int {
-	if len(m.chatItemOffsets) == 0 {
-		return 0
-	}
-	offset := m.chatVP.YOffset
-	idx := 0
-	for i := len(m.chatItemOffsets) - 1; i >= 0; i-- {
-		if m.chatItemOffsets[i] <= offset {
-			idx = i
-			break
-		}
-	}
-	return idx
-}
-
 // chatScrollToItem 滚动到指定 item 顶部，并更新 followBottom 状态。
-func (m *Model) chatScrollToItem(idx int) {
-	s := m.selectedSession()
-	if s == nil || len(m.chatItemOffsets) == 0 {
-		return
-	}
-	idx = clamp(idx, 0, len(m.chatItemOffsets)-1)
-	m.chatVP.SetYOffset(m.chatItemOffsets[idx])
-	m.chatFollowBottom = idx == len(m.chatItemOffsets)-1
-}
-
 // chatScrollToItemBottom 滚动到指定 item 完全可见，用于把刚发送的用户问题
 // 固定在屏幕内。若 item 高度不超过视口高度，则让 item 顶部对齐视口顶部，
 // 避免短消息被后续内容顶出视口；若 item 高于视口，则底部对齐以便看最新部分，
 // 同时保留上方历史记录可见。
-func (m *Model) chatScrollToItemBottom(idx int) {
-	s := m.selectedSession()
-	if s == nil || len(m.chatItemOffsets) == 0 {
-		return
-	}
-	idx = clamp(idx, 0, len(m.chatItemOffsets)-1)
-	startOffset := m.chatItemOffsets[idx]
-	var endOffset int
-	if idx+1 < len(m.chatItemOffsets) {
-		endOffset = m.chatItemOffsets[idx+1]
-	} else {
-		endOffset = m.chatVP.TotalLineCount()
-	}
-	visible := m.chatVP.VisibleLineCount()
-	itemH := endOffset - startOffset
-	var target int
-	if itemH <= visible {
-		// 短消息优先完整展示在视口顶部，防止顶部被后续内容遮挡
-		target = startOffset
-	} else {
-		// item 高度超过视口高度时，底部对齐以便看最新部分
-		target = endOffset - visible
-	}
-	if target < 0 {
-		target = 0
-	}
-	maxOffset := m.chatVP.TotalLineCount() - visible
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
-	if target > maxOffset {
-		target = maxOffset
-	}
-	m.chatVP.SetYOffset(target)
-	m.chatFollowBottom = target >= maxOffset
-}
-
-func (m *Model) chatItemUp() {
-	m.chatScrollToItem(m.chatCurrentItem() - 1)
-	m.chatAnchorUser = false
-}
-func (m *Model) chatItemDown() {
-	m.chatScrollToItem(m.chatCurrentItem() + 1)
-	m.chatAnchorUser = false
-}
-
-func (m *Model) chatGotoTop() {
-	m.chatScrollToItem(0)
-	m.chatAnchorUser = false
-}
-
-func (m *Model) chatGotoBottom() {
-	n := len(m.chatItemOffsets)
-	if n == 0 {
-		return
-	}
-	m.chatScrollToItem(n - 1)
-	m.chatVP.GotoBottom()
-	m.chatAnchorUser = false
-}
-
 // rebuildChatContent 根据当前窗口尺寸把当前会话内容渲染成带样式的字符串，
 // 并同步到 viewport。ScrollToBottom 由调用方按需执行。
-func (m *Model) rebuildChatContent() {
-	items := m.collectChatItems()
-	if len(items) == 0 {
-		m.chatVP.SetContent("")
-		m.chatLastItems = 0
-		return
-	}
-	w := m.chatContentWidth()
-	if w < 4 {
-		w = 4
-	}
-	content := m.buildChatContent(w)
-	m.chatVP.SetContent(content)
-	m.chatLastItems = len(items)
-	m.chatLastWidth = w
-}
-
 // rightPanelVisible 返回是否显示右侧计划/Agent 分栏。
 // 显示条件（满足其一即可）：
 //   - 用户手动强制显示（ctrl+b）
@@ -994,7 +715,7 @@ func (m *Model) mainContentHeight() int {
 	inputH := 3
 	shortcutH := 1
 	overlayH := 0
-	if m.overlay != overlayNone {
+	if m.overlayPanel.mode != overlayNone {
 		overlayH = m.height / 3
 		if overlayH < 6 {
 			overlayH = 6
@@ -1007,90 +728,7 @@ func (m *Model) mainContentHeight() int {
 	return h
 }
 
-func (m *Model) handleOverlayEnter() {
-	switch m.overlay {
-	case overlayPlan:
-		m.showPlanDetailByIndex(m.overlayCursor)
-	case overlayAgents:
-		m.showAgentDetailByIndex(m.overlayCursor)
-	}
-}
-
 // refreshOverlay rebuilds popup lines for plan/agents so live state stays in sync.
-func (m *Model) refreshOverlay() {
-	switch m.overlay {
-	case overlayPlan:
-		m.overlayLines = m.buildPlanLines()
-	case overlayAgents:
-		m.overlayLines = m.buildAgentsLines()
-	case overlayLog:
-		// 实时刷新完整记录：若用户当前停在末尾（跟读最新输出），新行加入后自动跟随到尾；
-		// 用户已上滚浏览历史时不打断其位置。
-		wasAtEnd := len(m.overlayLines) > 0 && m.overlayCursor >= len(m.overlayLines)-1
-		m.overlayLines = m.buildTranscriptLines()
-		if wasAtEnd {
-			m.overlayCursor = len(m.overlayLines) - 1
-		}
-	case overlayHelp:
-		m.overlayLines = strings.Split(strings.Trim(fullHelpText, "\n"), "\n")
-	}
-}
-
-func (m *Model) clampOverlayCursor() {
-	if len(m.overlayLines) == 0 {
-		m.overlayCursor = 0
-		return
-	}
-	if m.overlayCursor < 0 {
-		m.overlayCursor = 0
-	}
-	if m.overlayCursor >= len(m.overlayLines) {
-		m.overlayCursor = len(m.overlayLines) - 1
-	}
-}
-
-func (m *Model) openHelpPopup() {
-	m.overlay = overlayHelp
-	m.overlayKind = overlayHelp
-	m.overlayTitle = "Help"
-	m.overlayLines = strings.Split(strings.Trim(fullHelpText, "\n"), "\n")
-	m.overlayCursor = 0
-}
-
-func (m *Model) togglePlanPopup() {
-	if !m.hasPlan() {
-		m.flashMsg("no plan available")
-		return
-	}
-	if m.overlay == overlayPlan {
-		m.overlay = overlayNone
-		return
-	}
-	lines := m.buildPlanLines()
-	m.overlay = overlayPlan
-	m.overlayKind = overlayPlan
-	m.overlayTitle = "Execution Plan"
-	m.overlayLines = lines
-	m.overlayCursor = clamp(m.overlayCursor, 0, len(lines)-1)
-}
-
-func (m *Model) toggleAgentsPopup() {
-	if len(m.agentsNodes) == 0 {
-		m.flashMsg("no agents available")
-		return
-	}
-	if m.overlay == overlayAgents {
-		m.overlay = overlayNone
-		return
-	}
-	lines := m.buildAgentsLines()
-	m.overlay = overlayAgents
-	m.overlayKind = overlayAgents
-	m.overlayTitle = "Agent Topology"
-	m.overlayLines = lines
-	m.overlayCursor = clamp(m.overlayCursor, 0, len(lines)-1)
-}
-
 // toggleRightPanel 切换右侧计划/Agent 分栏的强制显示/隐藏状态。
 // 循环：自动 → 强制显示 → 强制隐藏 → 自动。
 func (m *Model) toggleRightPanel() {
@@ -1110,37 +748,6 @@ func (m *Model) toggleRightPanel() {
 // toggleLogPopup 打开/关闭"完整记录"面板：把整段对话铺成可滚动行列表，
 // 用户可用 j/k/g/G 翻阅全部 LLM 输出 / 工具调用 / 思考，不受对话区高度限制。
 // 内容每次渲染实时刷新（refreshOverlay），保证新输出立即可见。
-func (m *Model) toggleLogPopup() {
-	s := m.selectedSession()
-	if s == nil {
-		m.flashMsg("no active session")
-		return
-	}
-	if m.overlay == overlayLog {
-		m.overlay = overlayNone
-		return
-	}
-	lines := m.buildTranscriptLines()
-	// 打开时默认滚到末尾，方便先看最新输出；用户可 g 回到顶部
-	cursor := len(lines) - 1
-	if cursor < 0 {
-		cursor = 0
-	}
-	m.overlay = overlayLog
-	m.overlayKind = overlayLog
-	m.overlayTitle = "Full Transcript"
-	m.overlayLines = lines
-	m.overlayCursor = cursor
-}
-
-func (m *Model) openOverlay(title string, lines []string) {
-	m.overlay = overlayDetail
-	m.overlayKind = overlayDetail
-	m.overlayTitle = title
-	m.overlayLines = lines
-	m.overlayCursor = 0
-}
-
 // accumulateTokens sums token_usage events and updates total counts.
 func (m *Model) accumulateTokens() {
 	s := m.selectedSession()
@@ -1171,113 +778,8 @@ func clamp(v, lo, hi int) int {
 
 // scrollbarArea 返回聊天区滚动条在屏幕上的范围（x, y, w, h）。
 // 顶栏占 1 行，滚动条位于对话区最右侧，宽度 1。
-func (m *Model) scrollbarArea() (x, y, w, h int) {
-	x = m.chatAreaWidth() - 2 // 扣除 gap(1) + scrollbar 宽度(1)
-	if x < 0 {
-		x = 0
-	}
-	y = 1 // 顶栏占 1 行
-	w = 1
-	h = m.mainContentHeight()
-	return
-}
-
 // scrollbarThumbBounds 返回滑块在滚动条区域内的起始/结束行索引（含）。
 // 若内容无需滚动则返回 (-1, -1)。
-func (m *Model) scrollbarThumbBounds() (start, end int) {
-	totalLines := m.chatVP.TotalLineCount()
-	viewportH := m.chatVP.VisibleLineCount()
-	h := m.mainContentHeight()
-	if totalLines <= viewportH || viewportH <= 0 || h < 1 {
-		return -1, -1
-	}
-	scrollable := totalLines - viewportH
-	if scrollable < 1 {
-		scrollable = 1
-	}
-	thumbH := h * viewportH / totalLines
-	if thumbH < 1 {
-		thumbH = 1
-	}
-	if thumbH > h {
-		thumbH = h
-	}
-	thumbPos := m.chatVP.YOffset * (h - thumbH) / scrollable
-	if thumbPos < 0 {
-		thumbPos = 0
-	}
-	if thumbPos+thumbH > h {
-		thumbPos = h - thumbH
-	}
-	return thumbPos, thumbPos + thumbH - 1
-}
-
 // updateScrollbarDrag 根据当前鼠标 Y 坐标更新 viewport 滚动位置。
 // 以 dragStartY/dragStartOffset 为基准，按滑块可移动范围与内容可滚动范围的比率映射。
-func (m *Model) updateScrollbarDrag(mouseY int) {
-	totalLines := m.chatVP.TotalLineCount()
-	viewportH := m.chatVP.VisibleLineCount()
-	h := m.mainContentHeight()
-	if totalLines <= viewportH || viewportH <= 0 || h < 1 {
-		return
-	}
-	scrollable := totalLines - viewportH
-	thumbH := h * viewportH / totalLines
-	if thumbH < 1 {
-		thumbH = 1
-	}
-	if thumbH > h {
-		thumbH = h
-	}
-	maxThumbTravel := h - thumbH
-	if maxThumbTravel < 1 {
-		maxThumbTravel = 1
-	}
-	deltaY := mouseY - m.dragStartY
-	deltaOffset := deltaY * scrollable / maxThumbTravel
-	newOffset := m.dragStartOffset + deltaOffset
-	if newOffset < 0 {
-		newOffset = 0
-	}
-	if newOffset > scrollable {
-		newOffset = scrollable
-	}
-	m.chatVP.YOffset = newOffset
-	m.chatFollowBottom = m.chatVP.AtBottom()
-	m.chatAnchorUser = false
-}
-
 // scrollToThumbY 将滑块中心对齐到滚动条区域内的指定 Y 坐标（相对于滚动条顶部）。
-func (m *Model) scrollToThumbY(thumbCenterY int) {
-	totalLines := m.chatVP.TotalLineCount()
-	viewportH := m.chatVP.VisibleLineCount()
-	h := m.mainContentHeight()
-	if totalLines <= viewportH || viewportH <= 0 || h < 1 {
-		return
-	}
-	scrollable := totalLines - viewportH
-	thumbH := h * viewportH / totalLines
-	if thumbH < 1 {
-		thumbH = 1
-	}
-	if thumbH > h {
-		thumbH = h
-	}
-	maxPos := h - thumbH
-	if maxPos < 1 {
-		maxPos = 1
-	}
-	pos := thumbCenterY
-	if pos < 0 {
-		pos = 0
-	}
-	if pos > maxPos {
-		pos = maxPos
-	}
-	m.chatVP.YOffset = pos * scrollable / maxPos
-	if m.chatVP.YOffset > scrollable {
-		m.chatVP.YOffset = scrollable
-	}
-	m.chatFollowBottom = m.chatVP.AtBottom()
-	m.chatAnchorUser = false
-}
