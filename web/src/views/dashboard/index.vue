@@ -5,6 +5,9 @@ import { ElMessage } from 'element-plus'
 import type { Session } from '@/types'
 import { listSessions, createSession } from '@/api/session'
 import { getTimeline, getActivity, type TimelinePoint, type ActivityItem } from '@/api/metrics'
+import { statusTagType, statusText } from '@/utils/sessionStatus'
+import { fmtDate } from '@/utils/date'
+import { kindIcon, kindTagType } from '@/views/chat/utils/eventStyles'
 
 const router = useRouter()
 const goal = ref('')
@@ -73,24 +76,6 @@ function viewSession(id: string) {
   router.push({ path: '/session', query: { id } })
 }
 
-function fmtDate(iso: string) {
-  return new Date(iso).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
-
-function statusType(status: string) {
-  switch (status) {
-    case 'running': return 'primary'
-    case 'completed': return 'success'
-    case 'error': return 'danger'
-    default: return 'info'
-  }
-}
-
-function statusLabel(status: string) {
-  const m: Record<string, string> = { running: '运行中', completed: '已完成', error: '失败', idle: '待处理' }
-  return m[status] || status
-}
-
 function progressOf(s: Session) {
   if (s.status === 'completed') return 100
   if (s.status === 'error') return 0
@@ -150,15 +135,28 @@ const trendValues = computed(() => {
   return timeline.value.map(p => p.tokens || p.calls || 0)
 })
 
+const tagBgMap: Record<string, string> = {
+  success: 'bg-green-900/30',
+  warning: 'bg-yellow-900/30',
+  danger: 'bg-red-900/30',
+  primary: 'bg-blue-900/30',
+  info: 'bg-gray-800/50',
+}
+
+const tagIconColorMap: Record<string, string> = {
+  success: 'text-green-400',
+  warning: 'text-yellow-400',
+  danger: 'text-red-400',
+  primary: 'text-blue-400',
+  info: 'text-gray-400',
+}
+
 function activityStyle(kind: string) {
-  switch (kind) {
-    case 'tool_call': return { icon: 'Connection', bgClass: 'bg-blue-900/30', iconClass: 'text-blue-400' }
-    case 'tool_result': return { icon: 'CircleCheck', bgClass: 'bg-green-900/30', iconClass: 'text-green-400' }
-    case 'error': return { icon: 'WarningFilled', bgClass: 'bg-red-900/30', iconClass: 'text-red-400' }
-    case 'agent_created': return { icon: 'UserFilled', bgClass: 'bg-purple-900/30', iconClass: 'text-purple-400' }
-    case 'token_usage': return { icon: 'Coin', bgClass: 'bg-yellow-900/30', iconClass: 'text-yellow-400' }
-    case 'milestone': return { icon: 'Trophy', bgClass: 'bg-green-900/30', iconClass: 'text-green-400' }
-    default: return { icon: 'InfoFilled', bgClass: 'bg-gray-800/50', iconClass: 'text-gray-400' }
+  const tag = kindTagType(kind)
+  return {
+    icon: kindIcon(kind),
+    bgClass: tagBgMap[tag] || tagBgMap.info,
+    iconClass: tagIconColorMap[tag] || tagIconColorMap.info,
   }
 }
 </script>
@@ -269,9 +267,9 @@ function activityStyle(kind: string) {
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-3 mb-1">
                 <span class="font-bold text-sm text-gray-200 truncate">{{ s.goal }}</span>
-                <el-tag :type="statusType(s.status)" size="small" effect="plain" class="!bg-transparent !border-none px-0"
+                <el-tag :type="statusTagType(s.status)" size="small" effect="plain" class="!bg-transparent !border-none px-0"
                 >
-                  {{ statusLabel(s.status) }} <span class="ml-1" :class="s.status==='running'?'text-blue-500':s.status==='completed'?'text-green-500':'text-red-500'">●</span>
+                  {{ statusText(s.status) }} <span class="ml-1" :class="s.status==='running'?'text-blue-500':s.status==='completed'?'text-green-500':'text-red-500'">●</span>
                 </el-tag>
               </div>
               <div class="text-xs text-gray-500">创建时间: {{ fmtDate(s.started_at) }}</div>

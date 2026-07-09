@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import type { SessionEvent } from '@/types'
 import { renderMd } from '@/utils/markdown'
+import { kindTagType, agentTextColor, fmtTime, hasDetail } from '@/views/chat/utils/eventStyles'
 
 const props = defineProps<{
   events: SessionEvent[]
@@ -25,30 +26,6 @@ const filtered = computed(() => {
     return true
   })
 })
-
-function kindType(kind?: string, type?: string) {
-  const k = kind || type || ''
-  if (k === 'think') return 'warning'
-  if (k === 'intend') return 'primary'
-  if (k === 'llm' || k === 'llm_result') return 'success'
-  if (k === 'tool_call') return 'primary'
-  if (k === 'tool_result') return 'success'
-  if (k === 'error') return 'danger'
-  if (k === 'notify') return 'info'
-  return 'info'
-}
-
-function agentColor(agent: string) {
-  return agent === 'MetaAgent' ? 'text-blue-400' : agent.startsWith('system') ? 'text-gray-500' : 'text-gray-300'
-}
-
-function fmtTime(iso: string) {
-  return new Date(iso).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-}
-
-function hasDetail(ev: SessionEvent) {
-  return !!(ev.tool_output || ev.tool_error || ev.detail_json || ev.prompt)
-}
 
 const expanded = ref<Set<number>>(new Set())
 function toggle(i: number) {
@@ -107,9 +84,9 @@ const progressStatus = computed(() => {
     <div class="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
       <div v-for="(ev, index) in filtered" :key="index" class="flex text-xs items-start gap-4">
         <div class="text-gray-500 w-16 shrink-0 pt-0.5">{{ fmtTime(ev.timestamp) }}</div>
-        <div class="w-32 shrink-0 pt-0.5" :class="agentColor(ev.agent)">{{ ev.agent }}</div>
+        <div class="w-32 shrink-0 pt-0.5" :class="agentTextColor(ev.agent)">{{ ev.agent }}</div>
         <div class="w-20 shrink-0 pt-0.5 flex justify-center">
-          <el-tag size="small" :type="kindType(ev.kind, ev.type)" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-90">{{ ev.kind || ev.type }}</el-tag>
+          <el-tag size="small" :type="kindTagType(ev.kind, ev.type)" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-90">{{ ev.kind || ev.type }}</el-tag>
         </div>
         <div class="flex-1 min-w-0">
           <div class="text-gray-300 break-words leading-relaxed pt-0.5 markdown-body" v-html="renderMd(ev.message)"></div>

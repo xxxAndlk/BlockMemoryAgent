@@ -26,17 +26,21 @@ import { usePanelRefresh } from '@/composables/usePanelRefresh'
 import { useRoleTree } from '@/composables/useRoleTree'
 import { useTaskBoard } from '@/composables/useTaskBoard'
 import { useSessionList } from '@/composables/useSessionList'
-import { useSessionStatus } from '@/composables/useSessionStatus'
 import ExecutionLog from './components/ExecutionLog.vue'
 import MemoryExplorer from './components/MemoryExplorer.vue'
 import SkillSet from './components/SkillSet.vue'
 import FilePreview from './components/FilePreview.vue'
+import MetricsCard from './components/MetricsCard.vue'
+import TokenMetricsCard from './components/TokenMetricsCard.vue'
+import WatchdogCard from './components/WatchdogCard.vue'
+import MailboxCard from './components/MailboxCard.vue'
+import HealthCard from './components/HealthCard.vue'
+import SessionLogsPanel from './components/SessionLogsPanel.vue'
 
 const route = useRoute()
 const { sessions, loadSessions } = useSessionList()
 const stream = useSessionStream()
 const panel = usePanelRefresh()
-const { healthDotClass, healthStatusText } = useSessionStatus()
 
 const activeSession = ref<Session | null>(null)
 const activeTab = ref('log')
@@ -100,18 +104,22 @@ async function selectSession(s: Session) {
 }
 
 async function loadSessionPanels(sessionID: string) {
-  const boardRes = await panel.run(() => getSessionBoard(sessionID))
-  board.value = boardRes?.board || null
-  const agentRes = await panel.run(() => getSessionAgents(sessionID))
-  agents.value = agentRes?.agents || []
-  const metricsRes = await panel.run(() => getSessionMetrics(sessionID))
-  metrics.value = metricsRes || null
-  const wdRes = await panel.run(() => getSessionWatchdog(sessionID))
-  watchdogDecisions.value = wdRes?.decisions || []
-  const mbRes = await panel.run(() => getSessionMailbox(sessionID))
-  mailboxMessages.value = mbRes?.messages || []
-  const healthRes = await panel.run(() => getHealth())
-  health.value = healthRes || null
+  const [boardRes, agentRes, metricsRes, wdRes, mbRes, healthRes] = await Promise.allSettled([
+    panel.run(() => getSessionBoard(sessionID)),
+    panel.run(() => getSessionAgents(sessionID)),
+    panel.run(() => getSessionMetrics(sessionID)),
+    panel.run(() => getSessionWatchdog(sessionID)),
+    panel.run(() => getSessionMailbox(sessionID)),
+    panel.run(() => getHealth()),
+  ])
+
+  board.value = boardRes.status === 'fulfilled' && boardRes.value ? boardRes.value.board || null : null
+  agents.value = agentRes.status === 'fulfilled' && agentRes.value ? agentRes.value.agents || [] : []
+  metrics.value = metricsRes.status === 'fulfilled' && metricsRes.value ? metricsRes.value : null
+  watchdogDecisions.value = wdRes.status === 'fulfilled' && wdRes.value ? wdRes.value.decisions || [] : []
+  mailboxMessages.value = mbRes.status === 'fulfilled' && mbRes.value ? mbRes.value.messages || [] : []
+  health.value = healthRes.status === 'fulfilled' && healthRes.value ? healthRes.value : null
+
   await loadSessionLogs(sessionID)
 }
 
@@ -153,56 +161,6 @@ function startStream(s: Session) {
       ElMessage.error('实时连接异常，请检查网络或刷新页面')
     },
   })
-}
-
-function fmtTime(iso: string) {
-  return new Date(iso).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-}
-
-function fmtDateTime(iso: string) {
-  return new Date(iso).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
-
-function watchdogTagType(level: string) {
-  switch (level) {
-    case 'OK': return 'success'
-    case 'WARN': return 'warning'
-    case 'COMPRESS': return 'warning'
-    case 'EVICT': return 'danger'
-    default: return 'info'
-  }
-}
-
-function watchdogLabel(level: string) {
-  switch (level) {
-    case 'OK': return '正常'
-    case 'WARN': return '警告'
-    case 'COMPRESS': return '压缩'
-    case 'EVICT': return '驱逐'
-    default: return level
-  }
-}
-
-function mailboxTagType(type: string) {
-  switch (type) {
-    case 'milestone': return 'success'
-    case 'request': return 'primary'
-    case 'escalate': return 'danger'
-    case 'dependency': return 'warning'
-    case 'info': return 'info'
-    default: return 'info'
-  }
-}
-
-function mailboxIcon(type: string) {
-  switch (type) {
-    case 'milestone': return 'Trophy'
-    case 'request': return 'Connection'
-    case 'escalate': return 'WarningFilled'
-    case 'dependency': return 'Link'
-    case 'info': return 'Document'
-    default: return 'Message'
-  }
 }
 
 </script>
@@ -330,192 +288,24 @@ function mailboxIcon(type: string) {
         <MemoryExplorer v-if="activeTab === 'memory'" :session-id="activeSession?.id || ''" :agents="agents" />
         <SkillSet v-if="activeTab === 'skill'" :agents="agents" />
         <FilePreview v-if="activeTab === 'file'" :session-id="activeSession?.id || ''" :agents="agents" />
-        <div v-if="activeTab === 'logs'" class="flex-1 overflow-hidden flex flex-col p-4">
-          <div class="flex items-center gap-3 mb-3 shrink-0">
-            <el-input v-model="logFilterAgent" placeholder="Agent 过滤" size="small" class="w-40" />
-            <el-select v-model="logFilterLevel" placeholder="Level" size="small" class="w-28">
-              <el-option label="全部" value="" />
-              <el-option label="info" value="info" />
-              <el-option label="warn" value="warn" />
-              <el-option label="error" value="error" />
-            </el-select>
-            <el-button size="small" type="primary" @click="applyLogFilters">查询</el-button>
-          </div>
-          <div class="flex-1 overflow-y-auto space-y-2 pr-1">
-            <div v-if="!sessionLogs.length" class="text-gray-500 text-sm text-center py-10">暂无结构化日志</div>
-            <div v-for="log in sessionLogs" :key="log.id" class="text-xs border border-[#2a2d35] rounded p-2 bg-[#14161a]">
-              <div class="flex items-center justify-between mb-1">
-                <div class="flex items-center gap-2">
-                  <el-tag size="small" :type="log.level === 'error' ? 'danger' : log.level === 'warn' ? 'warning' : 'info'" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-90 origin-left">{{ log.level }}</el-tag>
-                  <span class="text-gray-400">{{ log.phase }}</span>
-                  <span class="text-gray-500">{{ log.agent }}</span>
-                </div>
-                <span class="text-gray-500">{{ fmtDateTime(log.created_at) }}</span>
-              </div>
-              <div class="text-gray-200 mb-1">{{ log.message }}</div>
-              <div v-if="log.input_tokens || log.output_tokens" class="text-gray-500 mb-1">tokens: {{ log.input_tokens }} / {{ log.output_tokens }} · latency: {{ log.latency_ms }}ms · model: {{ log.model || '-' }}</div>
-              <div v-if="log.prompt || log.response" class="mt-2">
-                <el-button link size="small" type="primary" @click="expandedLogId = expandedLogId === log.id ? null : log.id">
-                  {{ expandedLogId === log.id ? '收起' : '展开 Prompt/Response' }}
-                </el-button>
-                <div v-if="expandedLogId === log.id" class="mt-2 space-y-2">
-                  <div v-if="log.prompt" class="bg-[#0f1115] p-2 rounded text-gray-400 whitespace-pre-wrap">{{ log.prompt }}</div>
-                  <div v-if="log.response" class="bg-[#0f1115] p-2 rounded text-gray-400 whitespace-pre-wrap">{{ log.response }}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
+        <SessionLogsPanel
+          v-if="activeTab === 'logs'"
+          v-model:agent="logFilterAgent"
+          v-model:level="logFilterLevel"
+          v-model:expandedLogId="expandedLogId"
+          :logs="sessionLogs"
+          @query="applyLogFilters"
+        />
       </div>
     </div>
 
     <!-- Right: Metrics & Health -->
     <div class="w-[320px] flex flex-col gap-4 overflow-y-auto shrink-0 pl-1">
-      <!-- Metrics -->
-      <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
-        <template #header>
-          <div class="flex justify-between items-center">
-            <div class="font-bold text-sm text-gray-200">实时指标 (Metrics)</div>
-          </div>
-        </template>
-
-        <div class="text-xs text-gray-400 mb-2">LLM 调用统计</div>
-        <div class="grid grid-cols-4 gap-2 mb-6">
-          <div class="p-2 text-center">
-            <div class="text-xs text-gray-500 mb-1">总调用</div>
-            <div class="text-xl font-bold text-gray-200">{{ metrics?.calls ?? 0 }}<span class="text-xs font-normal ml-1">次</span></div>
-          </div>
-          <div class="p-2 text-center">
-            <div class="text-xs text-gray-500 mb-1">超时</div>
-            <div class="text-xl font-bold text-red-400">{{ metrics?.timeouts ?? 0 }}<span class="text-xs font-normal ml-1">次</span></div>
-          </div>
-          <div class="p-2 text-center">
-            <div class="text-xs text-gray-500 mb-1">平均耗时</div>
-            <div class="text-xl font-bold text-green-400">{{ metrics?.avg_duration ?? '-' }}</div>
-          </div>
-          <div class="p-2 text-center">
-            <div class="text-xs text-gray-500 mb-1">最长耗时</div>
-            <div class="text-xl font-bold text-gray-200">{{ metrics?.max_duration ?? '-' }}</div>
-          </div>
-        </div>
-
-        <div class="text-xs text-gray-400 mb-2">上下文用量</div>
-        <div class="mb-6 text-xs">
-          <div class="flex justify-between mb-2">
-            <span>当前会话 Token 消耗</span>
-            <span class="text-blue-400 font-bold">{{ metrics && metrics.total_tokens > 0 ? Math.min(100, Math.round(metrics.total_tokens / 128000 * 100)) : 0 }}%</span>
-          </div>
-          <div class="text-gray-500 mb-2">{{ (metrics?.total_tokens ?? 0).toLocaleString() }} / 128,000 <span class="text-[10px]">tokens</span></div>
-          <div class="relative pt-1">
-            <el-progress :percentage="metrics && metrics.total_tokens > 0 ? Math.min(100, Math.round(metrics.total_tokens / 128000 * 100)) : 0" :show-text="false" class="custom-progress" />
-            <div class="absolute top-0 bottom-0 left-[80%] border-l-2 border-yellow-500 z-10 h-full -mt-0.5" style="height: 12px;"></div>
-            <div class="absolute top-0 bottom-0 left-[95%] border-l-2 border-red-500 z-10 h-full -mt-0.5" style="height: 12px;"></div>
-            <div class="flex justify-between mt-1 text-[10px]">
-              <span class="text-yellow-500 flex items-center gap-1"><div class="w-1.5 h-1.5 rounded-full bg-yellow-500"></div> 80% 警告线</span>
-              <span class="text-red-500 flex items-center gap-1"><div class="w-1.5 h-1.5 rounded-full bg-red-500"></div> 95% 硬限制</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="text-xs text-gray-400 mb-2">看门狗状态</div>
-        <div class="space-y-1 text-xs">
-          <div v-for="d in watchdogDecisions.slice(0, 5)" :key="d.agent_id + d.occurred_at" class="flex items-center gap-4">
-            <span class="text-gray-500 w-12">{{ fmtTime(d.occurred_at) }}</span>
-            <el-tag size="small" :type="watchdogTagType(d.level)" effect="plain" class="!bg-transparent !border-[#2a2d35] w-16 text-center">{{ d.level }}</el-tag>
-            <span class="text-gray-300 truncate flex-1">{{ watchdogLabel(d.level) }}</span>
-          </div>
-          <div v-if="!watchdogDecisions.length" class="text-gray-500 text-xs">暂无看门狗决策</div>
-        </div>
-      </el-card>
-
-      <!-- Token Metrics -->
-      <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
-        <template #header>
-          <div class="flex justify-between items-center">
-            <div class="font-bold text-sm text-gray-200">Token 消耗 (Token Metrics)</div>
-          </div>
-        </template>
-        <div class="text-xs text-gray-400 mb-2">总计</div>
-        <div class="grid grid-cols-3 gap-2 mb-4 text-center">
-          <div>
-            <div class="text-xs text-gray-500">Input</div>
-            <div class="text-lg font-bold text-gray-200">{{ (tokenMetrics?.total_input_tokens ?? 0).toLocaleString() }}</div>
-          </div>
-          <div>
-            <div class="text-xs text-gray-500">Output</div>
-            <div class="text-lg font-bold text-gray-200">{{ (tokenMetrics?.total_output_tokens ?? 0).toLocaleString() }}</div>
-          </div>
-          <div>
-            <div class="text-xs text-gray-500">Calls</div>
-            <div class="text-lg font-bold text-gray-200">{{ tokenMetrics?.total_calls ?? 0 }}</div>
-          </div>
-        </div>
-        <div class="text-xs text-gray-400 mb-2">按 Agent / Model</div>
-        <div class="space-y-1 text-xs">
-          <div v-for="s in tokenMetrics?.stats || []" :key="s.agent + '|' + s.model" class="flex justify-between p-2 bg-[#0f1115] rounded">
-            <span class="text-gray-400 truncate flex-1">{{ s.agent }} <span v-if="s.model" class="text-gray-600">({{ s.model }})</span></span>
-            <span class="text-gray-200">{{ s.input_tokens + s.output_tokens }}</span>
-          </div>
-          <div v-if="!tokenMetrics?.stats?.length" class="text-gray-500 text-xs text-center py-2">暂无 token 数据</div>
-        </div>
-      </el-card>
-
-      <!-- Mailbox -->
-      <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
-        <template #header>
-          <div class="flex justify-between items-center">
-            <div class="font-bold text-sm text-gray-200">邮箱通知 (Mailbox)</div>
-          </div>
-        </template>
-        <div class="flex justify-between text-xs mb-4">
-          <span class="text-gray-400">未读消息 ({{ mailboxMessages.length }})</span>
-        </div>
-        <div class="space-y-4">
-          <div v-for="mail in mailboxMessages.slice(0, 8)" :key="mail.id" class="flex gap-3 text-xs">
-            <div class="mt-0.5 rounded-full p-1 shrink-0 bg-gray-800/50">
-              <el-icon class="text-gray-400"><component :is="mailboxIcon(mail.type)" /></el-icon>
-            </div>
-            <div class="flex-1 min-w-0">
-              <div class="flex justify-between mb-1">
-                <span class="font-bold" :class="'text-' + mailboxTagType(mail.type) + '-500'">{{ mail.type }}</span>
-                <span class="text-gray-500">{{ fmtDateTime(mail.created_at) }}</span>
-              </div>
-              <div class="text-gray-300 truncate">{{ mail.subject }}</div>
-              <div class="text-gray-500 mt-1 truncate">{{ mail.from }} → {{ mail.to }}</div>
-            </div>
-          </div>
-          <div v-if="!mailboxMessages.length" class="text-gray-500 text-xs">暂无未读消息</div>
-        </div>
-      </el-card>
-
-      <!-- System Health -->
-      <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
-        <template #header>
-          <div class="flex justify-between items-center">
-            <div class="font-bold text-sm text-gray-200">系统状态 (System Health)</div>
-          </div>
-        </template>
-        <div class="space-y-2 text-xs">
-          <div class="flex items-center gap-4 bg-[#0f1115] p-2 rounded border border-[#2a2d35]">
-            <el-icon class="text-gray-400 text-lg"><Coin /></el-icon>
-            <div class="w-16 text-gray-300">Postgres</div>
-            <div class="w-16" :class="healthDotClass(health?.postgres)">{{ healthStatusText(health?.postgres) }}</div>
-            <div class="text-gray-500 flex-1">{{ health?.postgres?.online ? `延迟: ${health?.postgres?.latency_ms}ms` : '未连接' }}</div>
-          </div>
-          <div class="flex items-center gap-4 bg-[#0f1115] p-2 rounded border border-[#2a2d35]">
-            <el-icon class="text-gray-400 text-lg"><DataLine /></el-icon>
-            <div class="w-16 text-gray-300">Redis</div>
-            <div class="w-16" :class="healthDotClass(health?.redis)">{{ healthStatusText(health?.redis) }}</div>
-            <div class="text-gray-500 flex-1">{{ health?.redis?.online ? `延迟: ${health?.redis?.latency_ms}ms` : '未连接' }}</div>
-          </div>
-          <div class="flex items-center gap-4 bg-[#0f1115] p-2 rounded border border-[#2a2d35]">
-            <el-icon class="text-gray-400 text-lg"><Connection /></el-icon>
-            <div class="w-16 text-gray-300">LLM API</div>
-            <div class="w-16" :class="healthDotClass(health?.llm)">{{ healthStatusText(health?.llm) }}</div>
-            <div class="text-gray-500 flex-1 truncate">{{ health?.llm?.detail || '未配置' }}</div>
-          </div>
-        </div>
-      </el-card>
+      <MetricsCard :metrics="metrics" />
+      <WatchdogCard :decisions="watchdogDecisions" />
+      <TokenMetricsCard :token-metrics="tokenMetrics" />
+      <MailboxCard :messages="mailboxMessages" />
+      <HealthCard :health="health" />
     </div>
   </div>
 </template>
