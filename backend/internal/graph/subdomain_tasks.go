@@ -1,5 +1,8 @@
 package graph
 
+// SubDomainAgent 当前处于预留/未启用状态（shouldSplitToSubDomains 默认返回 false）。
+// 本文件仅做技术封装，不改动业务逻辑，未来可通过 FeatureToggle 重新启用。
+
 import (
 	"context"
 	"fmt"
