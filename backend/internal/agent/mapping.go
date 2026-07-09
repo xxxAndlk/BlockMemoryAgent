@@ -1,0 +1,91 @@
+package agent
+
+import (
+	"time"
+
+	"github.com/blockmemory/agent/backend/internal/server"
+	"github.com/blockmemory/agent/backend/pkg/types"
+)
+
+// toAgentSession converts a server.Session DTO to an agent.Session DTO.
+func toAgentSession(s *server.Session) *Session {
+	if s == nil {
+		return nil
+	}
+
+	state := ""
+	if s.State != nil {
+		if s.State.CurrentDomain != "" {
+			state = s.State.CurrentDomain
+		} else {
+			state = "active"
+		}
+	}
+
+	var endedAt time.Time
+	if s.EndedAt != nil {
+		endedAt = *s.EndedAt
+	}
+
+	events := make([]Event, 0, len(s.Events))
+	for i := range s.Events {
+		events = append(events, *toAgentEvent(&s.Events[i]))
+	}
+
+	messages := make([]Message, 0, len(s.Messages))
+	for _, m := range s.Messages {
+		messages = append(messages, Message{
+			Role:    string(m.Role),
+			Content: m.Content,
+		})
+	}
+
+	return &Session{
+		ID:        s.ID,
+		Goal:      s.Goal,
+		Status:    string(s.Status),
+		Result:    s.Result,
+		State:     state,
+		StartedAt: s.StartedAt,
+		EndedAt:   endedAt,
+		Events:    events,
+		Messages:  messages,
+		TempDir:   s.TempDir,
+	}
+}
+
+// toAgentEvent converts a server.SessionEvent DTO to an agent.Event DTO.
+func toAgentEvent(e *server.SessionEvent) *Event {
+	if e == nil {
+		return nil
+	}
+	return &Event{
+		Type:         e.Type,
+		Agent:        e.Agent,
+		Message:      e.Message,
+		Kind:         e.Kind,
+		Tool:         e.Tool,
+		ToolPath:     e.ToolPath,
+		ToolOutput:   e.ToolOutput,
+		ToolError:    e.ToolError,
+		Success:      e.Success,
+		Timestamp:    e.Timestamp,
+		Prompt:       e.Prompt,
+		InputTokens:  e.InputTokens,
+		OutputTokens: e.OutputTokens,
+		DetailJSON:   e.DetailJSON,
+	}
+}
+
+// toAgentInstance converts a runtime RoleInstance to an agent.AgentInstance DTO.
+func toAgentInstance(inst *types.RoleInstance) *AgentInstance {
+	if inst == nil {
+		return nil
+	}
+	return &AgentInstance{
+		Name:     inst.RoleDefID,
+		Role:     string(inst.Type),
+		ModuleID: inst.ID,
+		Status:   string(inst.Status),
+	}
+}
