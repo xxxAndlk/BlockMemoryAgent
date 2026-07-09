@@ -23,7 +23,6 @@ type Config struct {
 	Plugins  PluginsConfig  `yaml:"plugins"`  // 插件预留开关（P3-5）
 }
 
-
 // PluginsConfig 插件预留配置（P3-5）。
 // 当前仅作开关，后续接入 MCP / RAG / Computer Use 时展开字段。
 type PluginsConfig struct {
@@ -47,81 +46,95 @@ type LoggingConfig struct {
 // MemoryPolicyConfig 记忆管线策略配置。
 // 控制上下文装配时的分段比例、私有记忆裁剪参数等，替代 memory 包中的硬编码魔法数。
 type MemoryPolicyConfig struct {
-	ContextWindow      int `yaml:"context_window"`       // 模型上下文窗口总 token 数
-	SystemSegmentRatio int `yaml:"system_segment_ratio"` // System 段占比（百分之 N）
-	TopicGlobalRatio   int `yaml:"topic_global_ratio"`   // TopicGlobal 段占比（百分之 N）
-	SharedStateRatio   int `yaml:"shared_state_ratio"`   // SharedState 段占比（百分之 N）
-	GlobalKBRatio      int `yaml:"global_kb_ratio"`      // GlobalKB 段占比（百分之 N）
-	PrivateMemoryRatio int `yaml:"private_memory_ratio"` // PrivateMemory 段占比（百分之 N）
-	TaskRatio          int `yaml:"task_ratio"`           // TaskQuery 段占比（百分之 N）
-	ReserveRatio       int `yaml:"reserve_ratio"`        // Reserve 预留段占比（百分之 N）
+	ContextWindow        int `yaml:"context_window"`        // 模型上下文窗口总 token 数
+	SystemSegmentRatio   int `yaml:"system_segment_ratio"`  // System 段占比（百分之 N）
+	TopicGlobalRatio     int `yaml:"topic_global_ratio"`    // TopicGlobal 段占比（百分之 N）
+	SharedStateRatio     int `yaml:"shared_state_ratio"`    // SharedState 段占比（百分之 N）
+	GlobalKBRatio        int `yaml:"global_kb_ratio"`       // GlobalKB 段占比（百分之 N）
+	PrivateMemoryRatio   int `yaml:"private_memory_ratio"`  // PrivateMemory 段占比（百分之 N）
+	TaskRatio            int `yaml:"task_ratio"`            // TaskQuery 段占比（百分之 N）
+	ReserveRatio         int `yaml:"reserve_ratio"`         // Reserve 预留段占比（百分之 N）
 	DefaultTokensPerItem int `yaml:"default_tokens_per_item"` // 私有记忆单条默认 token 数，用于按预算裁剪
 }
 
-// AgentConfig 集中所有 Agent 运行时动态可配置参数。
-// 替代散落在 graph 包中的硬编码常量（maxSteps=200、skillSetSize=8、
-// retry=3、LLM 软/硬超时 30s/90s 等），让运维可以通过 config.yaml 调整。
-type AgentConfig struct {
-	SkillSetSize      int `yaml:"skill_set_size"`       // 每个 DomainAgent 装配的 Skill 子集上限
+// GraphPolicyConfig Graph 死循环防护与全局步数策略配置。
+type GraphPolicyConfig struct {
+	StallSteps           int `yaml:"stall_steps"`            //  Graph 死循环防护 无进展步数阈值：连续 N 步未产生新 Episode / 工具结果 / state 变化 → 判死循环
+	MaxRepeatFingerprint int `yaml:"max_repeat_fingerprint"` // 状态指纹重复阈值：同一 state 指纹连续出现 N 次 → 判死循环
+	SessionTimeoutMin    int `yaml:"session_timeout_min"`    // 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
+	MaxSteps             int `yaml:"max_steps"`              //  Graph 绝对步数上限（安全网，超出即使无死循环也终止），0 表示不限制
+}
+
+// LLMRuntimeConfig LLM 调用与重试运行时参数配置。
+type LLMRuntimeConfig struct {
 	ToolCallMaxRounds int `yaml:"tool_call_max_rounds"` // Assistant 单任务 ReAct 工具调用循环最大轮数（含重复调用/空转检测提前退出）
 	RetryCount        int `yaml:"retry_count"`          // Assistant 任务执行指数退避重试次数
 	RetryBackoffMs    int `yaml:"retry_backoff_ms"`     // 重试初始退避时长（毫秒）
 	LLMSoftTimeoutSec int `yaml:"llm_soft_timeout_sec"` // LLM 调用软超时（秒，建议取消）
 	LLMHardTimeoutSec int `yaml:"llm_hard_timeout_sec"` // LLM 调用硬超时（秒，强制取消）
-	ContextWindow     int `yaml:"context_window"`       // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
-	// 抢占中断与队列注入（特性6）
-	InterruptEnabled   bool `yaml:"interrupt_enabled"`    // 是否启用抢占中断
-	QueueInjectEnabled bool `yaml:"queue_inject_enabled"` // 是否启用队列注入
-	// 人机对话（特性5）
-	HumanClarifyEnabled    bool `yaml:"human_clarify_enabled"`     // 是否启用人机对话
+}
+
+// SafetyConfig 工具沙箱与安全策略配置。
+type SafetyConfig struct {
+	ToolSandboxDisabled     bool     `yaml:"tool_sandbox_disabled"`      // true 时关闭写路径逃逸检测（保留命令黑名单）
+	ToolSandboxAllowedPaths []string `yaml:"tool_sandbox_allowed_paths"` // 允许读写的额外绝对路径白名单
+	ToolSandboxBlockedCmds  []string `yaml:"tool_sandbox_blocked_cmds"`  // 额外命令黑名单（追加到默认黑名单）
+}
+
+// FeatureTogglesConfig Agent 特性开关配置。
+type FeatureTogglesConfig struct {
+	InterruptEnabled     bool `yaml:"interrupt_enabled"`         // 是否启用抢占中断
+	QueueInjectEnabled   bool `yaml:"queue_inject_enabled"`      // 是否启用队列注入
+	HumanClarifyEnabled  bool `yaml:"human_clarify_enabled"`     // 是否启用人机对话
 	HumanClarifyTimeoutSec int  `yaml:"human_clarify_timeout_sec"` // 等待用户回答超时（秒）
-	// DAG 定时任务（特性1）
-	DAGEnabled bool `yaml:"dag_enabled"` // 是否启动 DAG 调度器
-	// Graph 死循环防护
-	StallSteps           int `yaml:"stall_steps"`            //  Graph 死循环防护 无进展步数阈值：连续 N 步未产生新 Episode / 工具结果 / state 变化 → 判死循环
-	MaxRepeatFingerprint int `yaml:"max_repeat_fingerprint"` // 状态指纹重复阈值：同一 state 指纹连续出现 N 次 → 判死循环
-	SessionTimeoutMin    int `yaml:"session_timeout_min"`    // 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
-	MaxSteps             int `yaml:"max_steps"`              //  Graph 绝对步数上限（安全网，超出即使无死循环也终止），0 表示不限制
-	// 私有快照参数（替代 memory/snapshot.go 中的硬编码）
+	DAGEnabled           bool `yaml:"dag_enabled"`               // 是否启动 DAG 调度器
+	PlanEnabled          bool `yaml:"plan_enabled"`              // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
+	ReflectionEnabled    bool `yaml:"reflection_enabled"`        // 是否在助手执行后做 Self-Reflection（不达标重试一次）
+	AssistantSelfTestEnabled bool `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证
+	DomainSelfTestEnabled    bool `yaml:"domain_self_test_enabled"`    // 领域 Agent 完成后是否派遣测试助手验证完整模块
+}
+
+// AgentConfig 集中所有 Agent 运行时动态可配置参数。
+// 通过嵌入若干聚焦的子配置，既保持 cfg.Agent.Xxx 的既有访问方式，又将相关字段按职责分组。
+// 替代散落在 graph 包中的硬编码常量（maxSteps=200、skillSetSize=8、
+// retry=3、LLM 软/硬超时 30s/90s 等），让运维可以通过 config.yaml 调整。
+type AgentConfig struct {
+	GraphPolicyConfig    `yaml:",inline"`
+	LLMRuntimeConfig     `yaml:",inline"`
+	SafetyConfig         `yaml:",inline"`
+	FeatureTogglesConfig `yaml:",inline"`
+
+	// 记忆管线策略保持为具名字段，以维持 agent.memory_policy 的 YAML 路径不变。
+	MemoryPolicy MemoryPolicyConfig `yaml:"memory_policy"`
+
+	// 其余不适合归入上述子配置的独立字段。
+	SkillSetSize      int `yaml:"skill_set_size"`       // 每个 DomainAgent 装配的 Skill 子集上限
+	ContextWindow     int `yaml:"context_window"`       // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
 	SnapshotSummaryCount       int     `yaml:"snapshot_summary_count"`        // 快照保留的最近摘要条数（默认 20）
 	SnapshotOpenIssueThreshold float64 `yaml:"snapshot_open_issue_threshold"` // 未决问题重要性阈值（默认 0.7）
-	// Episode 写入与压缩参数（替代 memory/write.go / compress.go 硬编码）
 	SummaryMaxRunes             int     `yaml:"summary_max_runes"`             // 摘要最大 rune 数（默认 400）
 	FactMaxSentences            int     `yaml:"fact_max_sentences"`            // 事实提取最大句数（默认 5）
 	CompressImportanceThreshold float64 `yaml:"compress_importance_threshold"` // 压缩保留 Raw 的重要性阈值（默认 0.7）
 	CompressAgeHours            int     `yaml:"compress_age_hours"`            // 压缩保留 Raw 的最大年龄（小时，默认 24）
-	// Plan-and-Execute + Self-Reflection（TODO #1）
-	PlanEnabled       bool `yaml:"plan_enabled"`       // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
-	ReflectionEnabled bool `yaml:"reflection_enabled"` // 是否在助手执行后做 Self-Reflection（不达标重试一次）
-	// 自测流程（P3-2）
-	AssistantSelfTestEnabled bool `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证
-	DomainSelfTestEnabled    bool `yaml:"domain_self_test_enabled"`    // 领域 Agent 完成后是否派遣测试助手验证完整模块
-	// 工具沙箱（安全）
-	ToolSandboxDisabled     bool     `yaml:"tool_sandbox_disabled"`      // true 时关闭写路径逃逸检测（保留命令黑名单）
-	ToolSandboxAllowedPaths []string `yaml:"tool_sandbox_allowed_paths"` // 允许读写的额外绝对路径白名单
-	ToolSandboxBlockedCmds  []string `yaml:"tool_sandbox_blocked_cmds"`  // 额外命令黑名单（追加到默认黑名单）
-	// 阈值与限额（替代 graph / tool / logger 中的硬编码 magic number）
-	ReadFileMaxChars           int `yaml:"read_file_max_chars"`            // ReadFile / SearchInFiles 输出截断字符数
-	RunCommandMaxOutput        int `yaml:"run_command_max_output"`         // RunCommand 输出截断字符数
-	RunCommandTimeoutSec       int `yaml:"run_command_timeout_sec"`        // RunCommand 最大允许超时（秒）
-	ToolExecMaxBytes           int `yaml:"tool_exec_max_bytes"`            // Execute 入参 JSON 摘要截断字节数
-	LLMPromptMaxChars          int `yaml:"llm_prompt_max_chars"`           // prompt / response 日志摘要截断字符数
+	ReadFileMaxChars            int `yaml:"read_file_max_chars"`            // ReadFile / SearchInFiles 输出截断字符数
+	RunCommandMaxOutput         int `yaml:"run_command_max_output"`         // RunCommand 输出截断字符数
+	RunCommandTimeoutSec        int `yaml:"run_command_timeout_sec"`        // RunCommand 最大允许超时（秒）
+	ToolExecMaxBytes            int `yaml:"tool_exec_max_bytes"`            // Execute 入参 JSON 摘要截断字节数
+	LLMPromptMaxChars           int `yaml:"llm_prompt_max_chars"`           // prompt / response 日志摘要截断字符数
 	LLMTrackerSlowModeThreshold int `yaml:"llm_tracker_slow_mode_threshold"` // 连续多少次 LLM 失败进入 slow mode
-	LoggerRetryCount           int `yaml:"logger_retry_count"`             // 日志异步写表重试次数
-	ContextExplodeSoftLimit    int `yaml:"context_explode_soft_limit"`     // blades 上下文爆炸软阈值（input tokens）
-	ContextExplodeHardLimit    int `yaml:"context_explode_hard_limit"`     // blades 上下文爆炸硬阈值（input tokens）
-	SummaryTruncateChars       int `yaml:"summary_truncate_chars"`         // CommonCollectTaskSummaries 单条结果截断字符数
-	SearchBlockMemoryMaxTokens int `yaml:"search_block_memory_max_tokens"` // 块记忆检索摘要 token 上限
-	SummaryBaseLimit           int `yaml:"summary_base_limit"`             // MetaAgent 最终总结基础字数
-	SummaryExtendedLimit       int `yaml:"summary_extended_limit"`         // MetaAgent 最终总结每子 Agent 增加字数
-	LoopDetectorWindowSize     int `yaml:"loop_detector_window_size"`      // 循环检测器窗口大小
-	LoopDetectorMaxRepeat      int `yaml:"loop_detector_max_repeat"`       // 循环检测器重复阈值
-	LoopDetectorMaxEmpty       int `yaml:"loop_detector_max_empty"`        // 循环检测器连续空转阈值
-	DomainMemoryRecallMaxChars int `yaml:"domain_memory_recall_max_chars"` // DomainAgent 记忆召回事件截断字符数
+	LoggerRetryCount            int `yaml:"logger_retry_count"`             // 日志异步写表重试次数
+	ContextExplodeSoftLimit     int `yaml:"context_explode_soft_limit"`     // blades 上下文爆炸软阈值（input tokens）
+	ContextExplodeHardLimit     int `yaml:"context_explode_hard_limit"`     // blades 上下文爆炸硬阈值（input tokens）
+	SummaryTruncateChars        int `yaml:"summary_truncate_chars"`         // CommonCollectTaskSummaries 单条结果截断字符数
+	SearchBlockMemoryMaxTokens  int `yaml:"search_block_memory_max_tokens"` // 块记忆检索摘要 token 上限
+	SummaryBaseLimit            int `yaml:"summary_base_limit"`             // MetaAgent 最终总结基础字数
+	SummaryExtendedLimit        int `yaml:"summary_extended_limit"`         // MetaAgent 最终总结每子 Agent 增加字数
+	LoopDetectorWindowSize      int `yaml:"loop_detector_window_size"`      // 循环检测器窗口大小
+	LoopDetectorMaxRepeat       int `yaml:"loop_detector_max_repeat"`       // 循环检测器重复阈值
+	LoopDetectorMaxEmpty        int `yaml:"loop_detector_max_empty"`        // 循环检测器连续空转阈值
+	DomainMemoryRecallMaxChars  int `yaml:"domain_memory_recall_max_chars"` // DomainAgent 记忆召回事件截断字符数
 	DomainMemoryContextMaxChars int `yaml:"domain_memory_context_max_chars"` // DomainAgent 记忆上下文注入截断字符数
-	DomainResultLogMaxChars    int `yaml:"domain_result_log_max_chars"`    // DomainAgent 结果日志截断字符数
-	// 记忆管线策略（替代 memory 包硬编码比例与单条 token 估算）
-	MemoryPolicy MemoryPolicyConfig `yaml:"memory_policy"`
+	DomainResultLogMaxChars     int `yaml:"domain_result_log_max_chars"`    // DomainAgent 结果日志截断字符数
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -207,6 +220,21 @@ func Load(path string) (*Config, error) {
 // 职责：仅在字段为零值时写入默认，避免覆盖用户显式配置。
 // 副作用：就地修改 Config；必要配置缺失时返回 error，让 Load 失败、程序拒绝启动。
 func (c *Config) applyDefaults() error {
+	c.applyPostgresDefaults()
+	c.applyPgVectorDefaults()
+	c.applyRedisDefaults()
+	if err := c.applyHTTPDefaults(); err != nil {
+		return err
+	}
+	c.applyMemoryDefaults()
+	if err := c.applyAgentDefaults(); err != nil {
+		return err
+	}
+	c.applyLoggingDefaults()
+	return nil
+}
+
+func (c *Config) applyPostgresDefaults() {
 	// —— Postgres 默认值：本地开发 DSN 与中等规模连接池 ——
 	if c.Postgres.DSN == "" {
 		c.Postgres.DSN = "postgres://user:pass@localhost:5432/blockmemory?sslmode=disable"
@@ -220,7 +248,9 @@ func (c *Config) applyDefaults() error {
 	if c.Postgres.ConnMaxLifetime == 0 {
 		c.Postgres.ConnMaxLifetime = 300
 	}
+}
 
+func (c *Config) applyPgVectorDefaults() {
 	// —— pgvector 默认值：768 维、ivfflat 索引、cosine 距离 ——
 	if c.PgVector.Dimensions == 0 {
 		c.PgVector.Dimensions = 768
@@ -231,7 +261,9 @@ func (c *Config) applyDefaults() error {
 	if c.PgVector.DistanceMetric == "" {
 		c.PgVector.DistanceMetric = "cosine"
 	}
+}
 
+func (c *Config) applyRedisDefaults() {
 	// —— Redis 默认值：本地地址、小型连接池、毫秒级超时、7 天快照 TTL ——
 	if c.Redis.Addr == "" {
 		c.Redis.Addr = "localhost:6379"
@@ -254,7 +286,9 @@ func (c *Config) applyDefaults() error {
 	if c.Redis.SnapshotTTLDays == 0 {
 		c.Redis.SnapshotTTLDays = 7
 	}
+}
 
+func (c *Config) applyHTTPDefaults() error {
 	// —— HTTP 默认值：10010 端口、30 秒超时 ——
 	if c.HTTP.Addr == "" {
 		c.HTTP.Addr = ":10010"
@@ -268,7 +302,10 @@ func (c *Config) applyDefaults() error {
 	if c.HTTP.AuthEnabled && c.HTTP.AuthToken == "" {
 		return fmt.Errorf("HTTP auth_enabled=true 但 auth_token 为空：请设置 BMA_API_TOKEN 环境变量或在 config.yaml 中配置 auth_token")
 	}
+	return nil
+}
 
+func (c *Config) applyMemoryDefaults() {
 	// —— 记忆管线默认值：100 条/批、5 秒刷新、300 秒快照 ——
 	if c.Memory.WriteBatchSize == 0 {
 		c.Memory.WriteBatchSize = 100
@@ -279,11 +316,25 @@ func (c *Config) applyDefaults() error {
 	if c.Memory.SnapshotInterval == 0 {
 		c.Memory.SnapshotInterval = 300
 	}
+}
 
+func (c *Config) applyAgentDefaults() error {
 	// —— Agent 运行时参数默认值 ——
 	// 约定：所有数值字段以 0 表示"未配置"，按字段语义填充默认。
 	// 因此配置侧无法把任一项显式设为 0；如需禁用某参数，请改用对应的
 	// 布尔开关（如 InterruptEnabled）而非将其置 0。
+	if err := c.applyGraphPolicyDefaults(); err != nil {
+		return err
+	}
+	c.applyLLMRuntimeDefaults()
+	c.applySafetyDefaults()
+	c.applyFeatureTogglesDefaults()
+	c.applyAgentStandaloneDefaults()
+	c.applyMemoryPolicyDefaults()
+	return nil
+}
+
+func (c *Config) applyGraphPolicyDefaults() error {
 	// 例外：Graph 死循环防护三项 (StallSteps/MaxRepeatFingerprint/SessionTimeoutMin)
 	// 不做默认值兜底，config.yaml 必须显式提供，缺失即报错 — 配置问题不应让程序运行起来。
 	if c.Agent.StallSteps == 0 {
@@ -295,9 +346,10 @@ func (c *Config) applyDefaults() error {
 	if c.Agent.SessionTimeoutMin == 0 {
 		return fmt.Errorf("config agent.session_timeout_min 未配置：Graph wall-clock 超时必需，请在 config.yaml 显式设置")
 	}
-	if c.Agent.SkillSetSize == 0 {
-		c.Agent.SkillSetSize = 8
-	}
+	return nil
+}
+
+func (c *Config) applyLLMRuntimeDefaults() {
 	if c.Agent.ToolCallMaxRounds == 0 {
 		c.Agent.ToolCallMaxRounds = 50
 	}
@@ -313,39 +365,24 @@ func (c *Config) applyDefaults() error {
 	if c.Agent.LLMHardTimeoutSec == 0 {
 		c.Agent.LLMHardTimeoutSec = 90
 	}
-	if c.Agent.ContextWindow == 0 {
-		c.Agent.ContextWindow = 32000
-	}
-	// 记忆管线策略默认值（与 assembler.go 原硬编码比例一致：6/12/25/12/25/6/14）
-	if c.Agent.MemoryPolicy.ContextWindow == 0 {
-		c.Agent.MemoryPolicy.ContextWindow = c.Agent.ContextWindow
-	}
-	if c.Agent.MemoryPolicy.SystemSegmentRatio == 0 {
-		c.Agent.MemoryPolicy.SystemSegmentRatio = 6
-	}
-	if c.Agent.MemoryPolicy.TopicGlobalRatio == 0 {
-		c.Agent.MemoryPolicy.TopicGlobalRatio = 12
-	}
-	if c.Agent.MemoryPolicy.SharedStateRatio == 0 {
-		c.Agent.MemoryPolicy.SharedStateRatio = 25
-	}
-	if c.Agent.MemoryPolicy.GlobalKBRatio == 0 {
-		c.Agent.MemoryPolicy.GlobalKBRatio = 12
-	}
-	if c.Agent.MemoryPolicy.PrivateMemoryRatio == 0 {
-		c.Agent.MemoryPolicy.PrivateMemoryRatio = 25
-	}
-	if c.Agent.MemoryPolicy.TaskRatio == 0 {
-		c.Agent.MemoryPolicy.TaskRatio = 6
-	}
-	if c.Agent.MemoryPolicy.ReserveRatio == 0 {
-		c.Agent.MemoryPolicy.ReserveRatio = 14
-	}
-	if c.Agent.MemoryPolicy.DefaultTokensPerItem == 0 {
-		c.Agent.MemoryPolicy.DefaultTokensPerItem = 200
-	}
+}
+
+func (c *Config) applySafetyDefaults() {
+	// SafetyConfig 当前所有字段（黑名单/白名单/开关）零值即表示关闭/空列表，无需默认值兜底。
+}
+
+func (c *Config) applyFeatureTogglesDefaults() {
 	if c.Agent.HumanClarifyTimeoutSec == 0 {
 		c.Agent.HumanClarifyTimeoutSec = 120
+	}
+}
+
+func (c *Config) applyAgentStandaloneDefaults() {
+	if c.Agent.SkillSetSize == 0 {
+		c.Agent.SkillSetSize = 8
+	}
+	if c.Agent.ContextWindow == 0 {
+		c.Agent.ContextWindow = 32000
 	}
 	if c.Agent.SnapshotSummaryCount == 0 {
 		c.Agent.SnapshotSummaryCount = 20
@@ -422,12 +459,44 @@ func (c *Config) applyDefaults() error {
 	if c.Agent.DomainResultLogMaxChars == 0 {
 		c.Agent.DomainResultLogMaxChars = 200
 	}
+}
 
+func (c *Config) applyMemoryPolicyDefaults() {
+	// 记忆管线策略默认值（与 assembler.go 原硬编码比例一致：6/12/25/12/25/6/14）
+	if c.Agent.MemoryPolicy.ContextWindow == 0 {
+		c.Agent.MemoryPolicy.ContextWindow = c.Agent.ContextWindow
+	}
+	if c.Agent.MemoryPolicy.SystemSegmentRatio == 0 {
+		c.Agent.MemoryPolicy.SystemSegmentRatio = 6
+	}
+	if c.Agent.MemoryPolicy.TopicGlobalRatio == 0 {
+		c.Agent.MemoryPolicy.TopicGlobalRatio = 12
+	}
+	if c.Agent.MemoryPolicy.SharedStateRatio == 0 {
+		c.Agent.MemoryPolicy.SharedStateRatio = 25
+	}
+	if c.Agent.MemoryPolicy.GlobalKBRatio == 0 {
+		c.Agent.MemoryPolicy.GlobalKBRatio = 12
+	}
+	if c.Agent.MemoryPolicy.PrivateMemoryRatio == 0 {
+		c.Agent.MemoryPolicy.PrivateMemoryRatio = 25
+	}
+	if c.Agent.MemoryPolicy.TaskRatio == 0 {
+		c.Agent.MemoryPolicy.TaskRatio = 6
+	}
+	if c.Agent.MemoryPolicy.ReserveRatio == 0 {
+		c.Agent.MemoryPolicy.ReserveRatio = 14
+	}
+	if c.Agent.MemoryPolicy.DefaultTokensPerItem == 0 {
+		c.Agent.MemoryPolicy.DefaultTokensPerItem = 200
+	}
+}
+
+func (c *Config) applyLoggingDefaults() {
 	// —— 日志默认值：默认目录 ./logs ——
 	if c.Logging.Dir == "" {
 		c.Logging.Dir = "logs"
 	}
-	return nil
 }
 
 // resolveEnvVars 解析配置中 ${VAR} 与 ${VAR:"default"} 形式的环境变量引用。

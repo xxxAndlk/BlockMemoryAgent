@@ -76,8 +76,10 @@ func TestDrainCommandQueueFeatureFlags(t *testing.T) {
 			mgr := cmdqueue.NewManager()
 			rt := rtPkg.New(soulPath(t), nil)
 			rt.SetAgentConfig(&config.AgentConfig{
-				InterruptEnabled:   tt.interruptEnabled,
-				QueueInjectEnabled: tt.queueInjectEnabled,
+				FeatureTogglesConfig: config.FeatureTogglesConfig{
+					InterruptEnabled:   tt.interruptEnabled,
+					QueueInjectEnabled: tt.queueInjectEnabled,
+				},
 			})
 			rt.CmdQueue = mgr
 
@@ -113,10 +115,10 @@ func TestDrainCommandQueueFeatureFlags(t *testing.T) {
 
 func TestHumanClarifyEnabledRespectsConfig(t *testing.T) {
 	rtEnabled := rtPkg.New(soulPath(t), nil)
-	rtEnabled.SetAgentConfig(&config.AgentConfig{HumanClarifyEnabled: true})
+	rtEnabled.SetAgentConfig(&config.AgentConfig{FeatureTogglesConfig: config.FeatureTogglesConfig{HumanClarifyEnabled: true}})
 
 	rtDisabled := rtPkg.New(soulPath(t), nil)
-	rtDisabled.SetAgentConfig(&config.AgentConfig{HumanClarifyEnabled: false})
+	rtDisabled.SetAgentConfig(&config.AgentConfig{FeatureTogglesConfig: config.FeatureTogglesConfig{HumanClarifyEnabled: false}})
 
 	nodeEnabled := NewMetaAgentNode(NewRoleRegistry(emptyRoleConfig(t)), nil, 10, 0)
 	nodeEnabled.SetRuntime(rtEnabled)

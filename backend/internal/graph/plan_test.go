@@ -16,12 +16,12 @@ func TestPlanEnabledFromRT(t *testing.T) {
 		t.Fatal("无 AgentCfg 时应返回 false")
 	}
 	rtDisabled := rtPkg.New(soulPath(t), nil)
-	rtDisabled.SetAgentConfig(&config.AgentConfig{PlanEnabled: false})
+	rtDisabled.SetAgentConfig(&config.AgentConfig{FeatureTogglesConfig: config.FeatureTogglesConfig{PlanEnabled: false}})
 	if planEnabledFromRT(rtDisabled) {
 		t.Fatal("PlanEnabled=false 时应返回 false")
 	}
 	rtEnabled := rtPkg.New(soulPath(t), nil)
-	rtEnabled.SetAgentConfig(&config.AgentConfig{PlanEnabled: true})
+	rtEnabled.SetAgentConfig(&config.AgentConfig{FeatureTogglesConfig: config.FeatureTogglesConfig{PlanEnabled: true}})
 	if !planEnabledFromRT(rtEnabled) {
 		t.Fatal("PlanEnabled=true 时应返回 true")
 	}
@@ -32,12 +32,12 @@ func TestReflectionEnabledFromRT(t *testing.T) {
 		t.Fatal("nil runtime 应返回 false")
 	}
 	rtDisabled := rtPkg.New(soulPath(t), nil)
-	rtDisabled.SetAgentConfig(&config.AgentConfig{ReflectionEnabled: false})
+	rtDisabled.SetAgentConfig(&config.AgentConfig{FeatureTogglesConfig: config.FeatureTogglesConfig{ReflectionEnabled: false}})
 	if reflectionEnabledFromRT(rtDisabled) {
 		t.Fatal("ReflectionEnabled=false 时应返回 false")
 	}
 	rtEnabled := rtPkg.New(soulPath(t), nil)
-	rtEnabled.SetAgentConfig(&config.AgentConfig{ReflectionEnabled: true})
+	rtEnabled.SetAgentConfig(&config.AgentConfig{FeatureTogglesConfig: config.FeatureTogglesConfig{ReflectionEnabled: true}})
 	if !reflectionEnabledFromRT(rtEnabled) {
 		t.Fatal("ReflectionEnabled=true 时应返回 true")
 	}

@@ -187,7 +187,7 @@ func TestCallLLM_MetaAgent_AgentCfgOverride(t *testing.T) {
 	mf := newMockModelFactory(t, server.URL)
 	node, tracker, _ := newTestBaseAgentNode(t, mf)
 	node.rt = &runtime.Runtime{
-		AgentCfg: &config.AgentConfig{LLMSoftTimeoutSec: 10, LLMHardTimeoutSec: 20},
+		AgentCfg: &config.AgentConfig{LLMRuntimeConfig: config.LLMRuntimeConfig{LLMSoftTimeoutSec: 10, LLMHardTimeoutSec: 20}},
 	}
 
 	ctx := WithSessionID(context.Background(), "s1")
@@ -256,7 +256,7 @@ func TestCallLLM_DomainAgent_AgentCfgOverride(t *testing.T) {
 	mf := newMockModelFactory(t, server.URL)
 	node, tracker, _ := newTestBaseAgentNode(t, mf)
 	node.rt = &runtime.Runtime{
-		AgentCfg: &config.AgentConfig{LLMSoftTimeoutSec: 5, LLMHardTimeoutSec: 8},
+		AgentCfg: &config.AgentConfig{LLMRuntimeConfig: config.LLMRuntimeConfig{LLMSoftTimeoutSec: 5, LLMHardTimeoutSec: 8}},
 	}
 
 	ctx := WithSessionID(context.Background(), "s1")
@@ -306,7 +306,7 @@ func TestCallLLM_DomainLightweight_HardcodedTimeouts(t *testing.T) {
 		agentLabel:   func() string { return "DomainAgent" },
 	}}
 	domain.rt = &runtime.Runtime{
-		AgentCfg: &config.AgentConfig{LLMSoftTimeoutSec: 100, LLMHardTimeoutSec: 200},
+		AgentCfg: &config.AgentConfig{LLMRuntimeConfig: config.LLMRuntimeConfig{LLMSoftTimeoutSec: 100, LLMHardTimeoutSec: 200}},
 	}
 
 	ctx := WithSessionID(context.Background(), "s1")
@@ -353,7 +353,7 @@ func TestCallLLM_DomainLightweight_FallbackUsesDefaultTimeouts(t *testing.T) {
 		agentLabel:   func() string { return "DomainAgent" },
 	}}
 	domain.rt = &runtime.Runtime{
-		AgentCfg: &config.AgentConfig{LLMSoftTimeoutSec: 7, LLMHardTimeoutSec: 11},
+		AgentCfg: &config.AgentConfig{LLMRuntimeConfig: config.LLMRuntimeConfig{LLMSoftTimeoutSec: 7, LLMHardTimeoutSec: 11}},
 	}
 
 	ctx := WithSessionID(context.Background(), "s1")
@@ -378,7 +378,7 @@ func TestCallLLM_SubDomainAgent_DefaultTimeouts(t *testing.T) {
 	mf := newMockModelFactory(t, server.URL)
 	node, tracker, _ := newTestBaseAgentNode(t, mf)
 	node.rt = &runtime.Runtime{
-		AgentCfg: &config.AgentConfig{LLMSoftTimeoutSec: 12, LLMHardTimeoutSec: 18},
+		AgentCfg: &config.AgentConfig{LLMRuntimeConfig: config.LLMRuntimeConfig{LLMSoftTimeoutSec: 12, LLMHardTimeoutSec: 18}},
 	}
 
 	ctx := WithSessionID(context.Background(), "s1")

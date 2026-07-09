@@ -72,9 +72,11 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 
 	rt := runtime.New(soulPath, skill.BuiltinPool())
 	rt.SetAgentConfig(&config.AgentConfig{
-		StallSteps:           30,
-		MaxRepeatFingerprint: 3,
-		SessionTimeoutMin:    60,
+		GraphPolicyConfig: config.GraphPolicyConfig{
+			StallSteps:           30,
+			MaxRepeatFingerprint: 3,
+			SessionTimeoutMin:    60,
+		},
 	})
 
 	meta := &fakeMetaAgentForRender{summary: "收到，开始处理。"}
@@ -155,9 +157,11 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 
 	rt := runtime.New(soulPath, skill.BuiltinPool())
 	rt.SetAgentConfig(&config.AgentConfig{
-		StallSteps:           30,
-		MaxRepeatFingerprint: 3,
-		SessionTimeoutMin:    60,
+		GraphPolicyConfig: config.GraphPolicyConfig{
+			StallSteps:           30,
+			MaxRepeatFingerprint: 3,
+			SessionTimeoutMin:    60,
+		},
 	})
 
 	meta := &fakeMetaAgentForRender{summary: "你好！我是你的多 Agent 编排助手 BlockMemoryAgent。"}
@@ -308,9 +312,11 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 
 	rt := runtime.New(soulPath, skill.BuiltinPool())
 	rt.SetAgentConfig(&config.AgentConfig{
-		StallSteps:           30,
-		MaxRepeatFingerprint: 3,
-		SessionTimeoutMin:    60,
+		GraphPolicyConfig: config.GraphPolicyConfig{
+			StallSteps:           30,
+			MaxRepeatFingerprint: 3,
+			SessionTimeoutMin:    60,
+		},
 	})
 
 	meta := &fakeMetaAgentForRender{summary: "收到，开始处理。"}
@@ -385,9 +391,11 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 
 	rt := runtime.New(soulPath, skill.BuiltinPool())
 	rt.SetAgentConfig(&config.AgentConfig{
-		StallSteps:           30,
-		MaxRepeatFingerprint: 3,
-		SessionTimeoutMin:    60,
+		GraphPolicyConfig: config.GraphPolicyConfig{
+			StallSteps:           30,
+			MaxRepeatFingerprint: 3,
+			SessionTimeoutMin:    60,
+		},
 	})
 
 	meta := &fakeMetaAgentForRender{summary: "收到，开始处理。"}
