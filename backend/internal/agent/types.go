@@ -1,6 +1,10 @@
 package agent
 
-import "time"
+import (
+	"time"
+
+	"github.com/blockmemory/agent/backend/pkg/enums"
+)
 
 // CreateRequest starts a new session.
 type CreateRequest struct {
@@ -16,8 +20,9 @@ type ResumeRequest struct {
 
 // Message is a single chat message exchanged within a session.
 type Message struct {
-	Role    string
-	Content string
+	Role      string
+	Content   string
+	Timestamp time.Time
 }
 
 // Query asks a read-only question about a session.
@@ -43,19 +48,39 @@ type Filter struct {
 	Limit  int
 }
 
+// ActiveBlock is a lightweight view of a running session block.
+type ActiveBlock struct {
+	ID     string
+	Domain string
+	Goal   string
+}
+
+// ClarifyRequest mirrors types.ClarifyRequest using plain DTO fields.
+type ClarifyRequest struct {
+	ID         string
+	Question   string
+	Context    string
+	AgentID    string
+	CreatedAt  time.Time
+	Answer     string
+	AnsweredAt *time.Time
+}
+
 // Session mirrors server.Session field-by-field using plain DTO types so the
 // agent package stays decoupled from internal/server and backend/pkg/types.
 type Session struct {
-	ID        string
-	Goal      string
-	Status    string
-	Result    string
-	State     string
-	StartedAt time.Time
-	EndedAt   time.Time
-	Events    []Event
-	Messages  []Message
-	TempDir   string
+	ID             string
+	Goal           string
+	Status         string
+	Result         string
+	State          string
+	StartedAt      time.Time
+	EndedAt        time.Time
+	Events         []Event
+	Messages       []Message
+	TempDir        string
+	ActiveBlocks   []ActiveBlock
+	PendingClarify *ClarifyRequest
 }
 
 // Event mirrors server.SessionEvent field-by-field.
@@ -78,8 +103,13 @@ type Event struct {
 
 // AgentInstance is a lightweight runtime view of an instantiated agent.
 type AgentInstance struct {
-	Name     string
-	Role     string
-	ModuleID string
-	Status   string
+	Name      string
+	Role      string
+	ModuleID  string
+	Status    string
+	Domain    string
+	RoleType  enums.RoleType
+	Children  []string
+	CreatedAt time.Time
+	RoleDefID string
 }

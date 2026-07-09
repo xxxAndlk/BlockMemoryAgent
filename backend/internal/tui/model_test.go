@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/graph"
 	"github.com/blockmemory/agent/backend/internal/runtime"
@@ -42,6 +43,12 @@ func (n *fakeSinkerForRender) Name() string { return "Sinker" }
 func (n *fakeSinkerForRender) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
 	state.NextAction = enums.ActionFinish
 	return state, nil
+}
+
+// testAgent wraps an existing SessionManager with the agent.Agent facade so
+// tests can construct a tui.Model without direct SessionManager/Registry fields.
+func testAgent(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry, sessionMgr *server.SessionManager) agent.Agent {
+	return agent.NewService(g, registry, nil, agent.WithSessionManager(sessionMgr))
 }
 
 func minimalRoleConfigForRender() *pkgconfig.RoleConfigFile {
@@ -96,14 +103,14 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 	sessionMgr := server.NewSessionManager(g, registry)
 
 	m := &Model{
-		styles:     NewStyles(),
-		chatVP:     viewport.New(80, 20),
-		width:      80,
-		height:     24,
-		sessionMgr: sessionMgr,
-		registry:   registry,
-		httpAddr:   "http://127.0.0.1:1",
-		flashMu:    &sync.Mutex{},
+		styles:       NewStyles(),
+		chatVP:       viewport.New(80, 20),
+		width:        80,
+		height:       24,
+		agent:        testAgent(g, registry, sessionMgr),
+		streamEvents: make(chan agent.Event, 16),
+		httpAddr:     "http://127.0.0.1:1",
+		flashMu:      &sync.Mutex{},
 	}
 	m.chatVP.SetContent("")
 
@@ -197,14 +204,14 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 	}
 
 	m := &Model{
-		styles:     NewStyles(),
-		chatVP:     viewport.New(80, 20),
-		width:      80,
-		height:     24,
-		sessionMgr: sessionMgr,
-		registry:   registry,
-		httpAddr:   "http://127.0.0.1:1",
-		flashMu:    &sync.Mutex{},
+		styles:       NewStyles(),
+		chatVP:       viewport.New(80, 20),
+		width:        80,
+		height:       24,
+		agent:        testAgent(g, registry, sessionMgr),
+		streamEvents: make(chan agent.Event, 16),
+		httpAddr:     "http://127.0.0.1:1",
+		flashMu:      &sync.Mutex{},
 	}
 	m.chatVP.SetContent("")
 	m.refreshSessions()
@@ -352,14 +359,14 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 	}
 
 	m := &Model{
-		styles:     NewStyles(),
-		chatVP:     viewport.New(80, 20),
-		width:      80,
-		height:     24,
-		sessionMgr: sessionMgr,
-		registry:   registry,
-		httpAddr:   "http://127.0.0.1:1",
-		flashMu:    &sync.Mutex{},
+		styles:       NewStyles(),
+		chatVP:       viewport.New(80, 20),
+		width:        80,
+		height:       24,
+		agent:        testAgent(g, registry, sessionMgr),
+		streamEvents: make(chan agent.Event, 16),
+		httpAddr:     "http://127.0.0.1:1",
+		flashMu:      &sync.Mutex{},
 	}
 	m.chatVP.SetContent("")
 	m.refreshSessions()
@@ -434,14 +441,14 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 	}
 
 	m := &Model{
-		styles:     NewStyles(),
-		chatVP:     viewport.New(80, 20),
-		width:      120,
-		height:     40,
-		sessionMgr: sessionMgr,
-		registry:   registry,
-		httpAddr:   "http://127.0.0.1:1",
-		flashMu:    &sync.Mutex{},
+		styles:       NewStyles(),
+		chatVP:       viewport.New(80, 20),
+		width:        120,
+		height:       40,
+		agent:        testAgent(g, registry, sessionMgr),
+		streamEvents: make(chan agent.Event, 16),
+		httpAddr:     "http://127.0.0.1:1",
+		flashMu:      &sync.Mutex{},
 	}
 	m.chatVP.SetContent("")
 	m.refreshSessions()

@@ -57,6 +57,15 @@ func WithModelFactory(mf *model.ModelFactory) ServiceOption {
 	}
 }
 
+// WithSessionManager replaces the internal SessionManager with an existing one.
+// This lets the TUI/HTTP server share the same session store while still
+// consuming it through the Agent facade.
+func WithSessionManager(mgr *server.SessionManager) ServiceOption {
+	return func(s *Service) {
+		s.sessions = mgr
+	}
+}
+
 // CreateSession starts a new session for the given goal.
 func (s *Service) CreateSession(ctx context.Context, req CreateRequest) (*Session, error) {
 	sess := s.sessions.CreateSession(ctx, req.Goal)
@@ -172,8 +181,17 @@ func (s *Service) ListAgents(ctx context.Context, sessionID string) ([]AgentInst
 	out := make([]AgentInstance, 0, len(insts))
 	for _, inst := range insts {
 		ai := toAgentInstance(inst)
-		if def := s.registry.GetRoleDef(inst.RoleDefID); def != nil && def.Name != "" {
-			ai.Name = def.Name
+		// Match the TUI's instName behavior: domain/subdomain agents are named
+		// after their domain; otherwise fall back to the role definition name.
+		switch ai.RoleType {
+		case enums.RoleTypeDomain, enums.RoleTypeSubDomain:
+			if ai.Domain != "" {
+				ai.Name = ai.Domain
+			}
+		default:
+			if def := s.registry.GetRoleDef(inst.RoleDefID); def != nil && def.Name != "" {
+				ai.Name = def.Name
+			}
 		}
 		out = append(out, *ai)
 	}

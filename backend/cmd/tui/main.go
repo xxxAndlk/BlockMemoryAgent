@@ -19,6 +19,7 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/mattn/go-runewidth"
 
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
 	"github.com/blockmemory/agent/backend/internal/embed"
@@ -182,6 +183,12 @@ func main() {
 	sessionMgr.SetPostgresStore(pgStore)
 	sessionMgr.SetModelFactory(modelFactory) // 注入模型工厂，续话时调轻量模型总结历史
 
+	agentSvc := agent.NewService(threeLayerGraph, registry, rt,
+		agent.WithSessionManager(sessionMgr),
+		agent.WithPostgresStore(pgStore),
+		agent.WithModelFactory(modelFactory),
+	)
+
 	// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
 	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, embedder: embedder, dim: cfg.PgVector.Dimensions})
 
@@ -235,7 +242,7 @@ func main() {
 	log.Printf("TUI backend listening at %s", httpAddr)
 
 	modelName := roleCfg.MetaAgent.ModelConfig.Model
-	model := tui.NewModel(sessionMgr, registry, rt, dagHandler, pgStore, httpAddr, modelName, modelFactory)
+	model := tui.NewModel(agentSvc, rt, dagHandler, pgStore, httpAddr, modelName, modelFactory)
 
 	// CI 环境或 stdin 非 TTY 时自动禁用 alt-screen，避免输出被吞或光标异常。
 	useAltScreen := !*noAltScreen && os.Getenv("CI") == "" && isatty.IsTerminal(os.Stdin.Fd())
@@ -257,7 +264,7 @@ func main() {
 	// 原实现仅靠 defer pgStore.Close()，未关闭 ln（端口悬挂到进程退出）、
 	// 未取消 graph.Invoke goroutine（SSE 流 / goroutine 泄漏到 os.Exit）。
 	ln.Close()
-	sessionMgr.Shutdown()
+	agentSvc.Shutdown(context.Background())
 }
 
 // sessionRouter 把 /api/sessions/{id}/{suffix} 路径分发到对应 handler。

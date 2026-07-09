@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,8 +12,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/dag"
-	"github.com/blockmemory/agent/backend/internal/server"
 )
 
 // pasteEnterThreshold 用于区分终端粘贴产生的连续 Enter 与手动回车。
@@ -347,38 +348,19 @@ func (m *Model) postJSON(path string, body any) {
 	}()
 }
 
-// createSession POSTs /api/sessions with the goal, then selects the new session.
+// createSession creates a new session through the agent.Agent facade.
 // 异步执行（T2 修复）：成功后写 pendingSelectID，由 tick handler 在主循环内
 // 执行 refreshSessions + selectSession，避免后台 goroutine 直接改 m.sessions/cursor
 // 与 View 产生 race。
 func (m *Model) createSession(goal string) {
 	go func() {
-		addr := m.httpAddr
-		if addr == "" {
-			addr = "http://localhost:10010"
-		}
-		body, _ := json.Marshal(map[string]string{"goal": goal})
-		req, err := http.NewRequest(http.MethodPost, addr+"/api/sessions", bytes.NewReader(body))
-		if err != nil {
-			m.flashMsg("request error: " + err.Error())
+		if m.agent == nil {
+			m.flashMsg("agent facade not available")
 			return
 		}
-		req.Header.Set("Content-Type", "application/json")
-		client := &http.Client{Timeout: requestTimeout}
-		resp, err := client.Do(req)
+		created, err := m.agent.CreateSession(context.Background(), agent.CreateRequest{Goal: goal})
 		if err != nil {
 			m.flashMsg("create session: " + err.Error())
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			errBody, _ := io.ReadAll(resp.Body)
-			m.flashMsg(fmt.Sprintf("create session returned %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody))))
-			return
-		}
-		var created server.Session
-		if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
-			m.flashMsg("decode session: " + err.Error())
 			return
 		}
 		// 写 pendingSelectID，tick handler 消费时在主循环内 refresh+select

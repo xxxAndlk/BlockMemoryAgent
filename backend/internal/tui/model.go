@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"log"
 	"strings"
 	"sync"
@@ -10,7 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
@@ -24,8 +25,7 @@ type Model struct {
 	width  int
 	height int
 
-	sessionMgr   *server.SessionManager
-	registry     *graph.RoleRegistry
+	agent        agent.Agent
 	rt           *runtime.Runtime
 	dagHandler   *server.DAGHandler
 	pgStore      *store.PostgresStore
@@ -67,8 +67,8 @@ type Model struct {
 	// taskBriefCache 缓存 LLM 精简后的任务标题，避免同一长描述重复请求。
 	// taskBriefMu 用指针避免 Model 值拷贝触发 copylocks（bubbletea Model 按值传递）。
 	// 容量上限 taskBriefCacheMaxSize，超限淘汰任意一条（见 view.go setTaskBriefCache）。
-	taskBriefCache   map[string]string
-	taskBriefMu      *sync.Mutex
+	taskBriefCache map[string]string
+	taskBriefMu    *sync.Mutex
 
 	// v2.0 面板开关
 	agentPanelVisible bool
@@ -102,6 +102,11 @@ type Model struct {
 	// （与主循环 View 读产生 race），改为 tick 在主循环内执行 refresh+select。
 	pendingSelectID string
 
+	// streamEvents 接收当前选中会话的 agent.Stream 事件，用于触发即时刷新。
+	streamEvents chan agent.Event
+	// streamCancel 关闭当前会话的事件流 goroutine。
+	streamCancel context.CancelFunc
+
 	tickCount int
 }
 
@@ -120,8 +125,7 @@ type agentTreeNode struct {
 
 // NewModel builds a TUI model wired to backend dependencies.
 func NewModel(
-	sessionMgr *server.SessionManager,
-	registry *graph.RoleRegistry,
+	agentFacade agent.Agent,
 	rt *runtime.Runtime,
 	dagHandler *server.DAGHandler,
 	pgStore *store.PostgresStore,
@@ -130,8 +134,7 @@ func NewModel(
 	modelFactory *model.ModelFactory,
 ) *Model {
 	m := &Model{
-		sessionMgr:       sessionMgr,
-		registry:         registry,
+		agent:            agentFacade,
 		rt:               rt,
 		dagHandler:       dagHandler,
 		pgStore:          pgStore,
@@ -148,6 +151,7 @@ func NewModel(
 		chatVP:           viewport.New(0, 0),
 		taskBriefCache:   make(map[string]string),
 		taskBriefMu:      &sync.Mutex{},
+		streamEvents:     make(chan agent.Event, 16),
 	}
 	m.chatVP.SetContent("")
 	m.refreshSessions()
@@ -161,9 +165,9 @@ func NewModel(
 	return m
 }
 
-// Init starts background ticks.
+// Init starts background ticks and the agent stream listener.
 func (m Model) Init() tea.Cmd {
-	return tickCmd()
+	return tea.Batch(tickCmd(), streamCmd(m.streamEvents))
 }
 
 func tickCmd() tea.Cmd {
@@ -172,6 +176,24 @@ func tickCmd() tea.Cmd {
 }
 
 type tickMsg struct{}
+
+// streamEventMsg is emitted when the agent.Stream channel for the selected
+// session delivers a new event. It triggers the same refresh path as tickMsg
+// so the TUI stays in sync with live graph output.
+type streamEventMsg struct{ event agent.Event }
+
+// streamCmd returns a bubbletea Cmd that waits for the next event on the
+// shared streamEvents channel. The goroutine feeding the channel is restarted
+// whenever the selected session changes.
+func streamCmd(ch <-chan agent.Event) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return streamEventMsg{event: ev}
+	}
+}
 
 // selectSession 仅在显式切换会话（NewModel 初始化 / pendingSelectID 自动选中）时调用。
 // 不重置 pendingScrollToUser：第一条用户消息触发 createSession → tick 消费 pendingSelectID
@@ -208,6 +230,7 @@ func (m *Model) selectSession(idx int) {
 	m.chatLastItems = 0
 	m.chatLastWidth = 0
 	m.rebuildAgents()
+	m.startStream()
 	m.rebuildChatContent()
 	// 内容未撑满视口时回到顶部，确保首条用户消息/欢迎信息可见；
 	// 内容超出视口时才滚到底部看最新消息。
@@ -218,8 +241,47 @@ func (m *Model) selectSession(idx int) {
 	}
 }
 
+// startStream cancels any previous agent.Stream goroutine for this model and
+// starts a new one that follows the currently selected session. Events are
+// pushed into streamEvents so the bubbletea message loop can refresh the view.
+func (m *Model) startStream() {
+	if m.streamCancel != nil {
+		m.streamCancel()
+	}
+	if m.agent == nil || m.sessionsCursor < 0 || m.sessionsCursor >= len(m.sessions) {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.streamCancel = cancel
+	sessionID := m.sessions[m.sessionsCursor].ID
+	go func() {
+		ch, err := m.agent.Stream(ctx, sessionID)
+		if err != nil {
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-ch:
+				if !ok {
+					return
+				}
+				select {
+				case m.streamEvents <- ev:
+				case <-ctx.Done():
+					return
+				default:
+					// Buffer full: drop the event; the next tick will refresh via
+					// agent.Get anyway.
+				}
+			}
+		}
+	}()
+}
+
 func (m *Model) refreshSessions() {
-	if m.sessionMgr == nil {
+	if m.agent == nil {
 		return
 	}
 	prevID := ""
@@ -228,7 +290,15 @@ func (m *Model) refreshSessions() {
 	}
 	// TUI only shows sessions created during this TUI run. Historical sessions
 	// are kept for Agent internal retrieval; they are not surfaced here.
-	m.sessions = m.sessionMgr.ListSessions()
+	sessions, err := m.agent.List(context.Background(), agent.Filter{})
+	if err != nil {
+		log.Printf("[tui] refreshSessions: %v", err)
+		return
+	}
+	m.sessions = make([]*server.Session, 0, len(sessions))
+	for _, s := range sessions {
+		m.sessions = append(m.sessions, toServerSession(s))
+	}
 	found := -1
 	for i, s := range m.sessions {
 		if s.ID == prevID {
@@ -283,13 +353,17 @@ func (m *Model) rebuildAgents() {
 		createdAt: s.StartedAt,
 	})
 
-	insts := m.registry.GetInstancesBySession(s.ID)
-	byID := make(map[string]*types.RoleInstance)
+	insts, err := m.agent.ListAgents(context.Background(), s.ID)
+	if err != nil {
+		log.Printf("[tui] rebuildAgents: %v", err)
+		return
+	}
+	byID := make(map[string]agent.AgentInstance)
 	for _, inst := range insts {
-		byID[inst.ID] = inst
+		byID[inst.ModuleID] = inst
 	}
 	for _, inst := range insts {
-		if inst.Type != enums.RoleTypeDomain {
+		if inst.RoleType != enums.RoleTypeDomain {
 			continue
 		}
 		goal := ""
@@ -303,53 +377,53 @@ func (m *Model) rebuildAgents() {
 		}
 		m.agentsNodes = append(m.agentsNodes, agentTreeNode{
 			depth:     1,
-			instID:    inst.ID,
-			name:      instName(m.registry, inst),
+			instID:    inst.ModuleID,
+			name:      inst.Name,
 			domain:    inst.Domain,
-			roleType:  inst.Type,
-			status:    inst.Status,
+			roleType:  inst.RoleType,
+			status:    enums.RoleStatus(inst.Status),
 			goal:      goal,
 			createdAt: inst.CreatedAt,
 		})
 		for _, childID := range inst.Children {
 			child := byID[childID]
-			if child == nil {
+			if child.ModuleID == "" {
 				continue
 			}
 			depth := 2
-			if child.Type == enums.RoleTypeSubDomain {
+			if child.RoleType == enums.RoleTypeSubDomain {
 				m.agentsNodes = append(m.agentsNodes, agentTreeNode{
 					depth:     depth,
-					instID:    child.ID,
-					name:      instName(m.registry, child),
+					instID:    child.ModuleID,
+					name:      child.Name,
 					domain:    child.Domain,
-					roleType:  child.Type,
-					status:    child.Status,
+					roleType:  child.RoleType,
+					status:    enums.RoleStatus(child.Status),
 					createdAt: child.CreatedAt,
 				})
 				for _, subID := range child.Children {
 					sub := byID[subID]
-					if sub == nil {
+					if sub.ModuleID == "" {
 						continue
 					}
 					m.agentsNodes = append(m.agentsNodes, agentTreeNode{
 						depth:     3,
-						instID:    sub.ID,
-						name:      instName(m.registry, sub),
+						instID:    sub.ModuleID,
+						name:      sub.Name,
 						domain:    sub.Domain,
-						roleType:  sub.Type,
-						status:    sub.Status,
+						roleType:  sub.RoleType,
+						status:    enums.RoleStatus(sub.Status),
 						createdAt: sub.CreatedAt,
 					})
 				}
-			} else if child.Type == enums.RoleTypeFixed || child.Type == enums.RoleTypeDynamic {
+			} else if child.RoleType == enums.RoleTypeFixed || child.RoleType == enums.RoleTypeDynamic {
 				m.agentsNodes = append(m.agentsNodes, agentTreeNode{
 					depth:     depth,
-					instID:    child.ID,
-					name:      instName(m.registry, child),
+					instID:    child.ModuleID,
+					name:      child.Name,
 					domain:    child.Domain,
-					roleType:  child.Type,
-					status:    child.Status,
+					roleType:  child.RoleType,
+					status:    enums.RoleStatus(child.Status),
 					createdAt: child.CreatedAt,
 				})
 			}
@@ -368,34 +442,111 @@ func (m *Model) rebuildAgents() {
 	}
 }
 
-func instName(r *graph.RoleRegistry, inst *types.RoleInstance) string {
-	if inst == nil {
-		return "unknown"
+// toServerSession converts an agent.Session DTO back to the server.Session type
+// that the TUI still uses internally for chat rendering and plan panels.
+// This adapter keeps the boundary at agent.Agent while avoiding a wholesale
+// rewrite of the view/helpers in this refactoring step.
+func toServerSession(a *agent.Session) *server.Session {
+	if a == nil {
+		return nil
 	}
-	if inst.Type == enums.RoleTypeDomain || inst.Type == enums.RoleTypeSubDomain {
-		if inst.Domain != "" {
-			return inst.Domain
+
+	var state *types.ThreeLayerState
+	if a.State != "" || len(a.ActiveBlocks) > 0 || a.PendingClarify != nil {
+		state = &types.ThreeLayerState{
+			CurrentDomain: a.State,
+		}
+		if len(a.ActiveBlocks) > 0 {
+			state.ActiveBlocks = make(map[string]*types.SessionBlock, len(a.ActiveBlocks))
+			for _, b := range a.ActiveBlocks {
+				state.ActiveBlocks[b.ID] = &types.SessionBlock{
+					ID:     b.ID,
+					Domain: b.Domain,
+					Goal:   b.Goal,
+				}
+			}
+		}
+		if a.PendingClarify != nil {
+			req := a.PendingClarify
+			state.PendingClarify = &types.ClarifyRequest{
+				ID:         req.ID,
+				Question:   req.Question,
+				Context:    req.Context,
+				AgentID:    req.AgentID,
+				CreatedAt:  req.CreatedAt,
+				Answer:     req.Answer,
+				AnsweredAt: req.AnsweredAt,
+			}
 		}
 	}
-	if def := r.GetRoleDef(inst.RoleDefID); def != nil {
-		return def.Name
+
+	var endedAt *time.Time
+	if !a.EndedAt.IsZero() {
+		t := a.EndedAt
+		endedAt = &t
 	}
-	return inst.RoleDefID
+
+	events := make([]server.SessionEvent, len(a.Events))
+	for i, e := range a.Events {
+		events[i] = server.SessionEvent{
+			Type:         e.Type,
+			Agent:        e.Agent,
+			Message:      e.Message,
+			Kind:         e.Kind,
+			Tool:         e.Tool,
+			ToolPath:     e.ToolPath,
+			ToolOutput:   e.ToolOutput,
+			ToolError:    e.ToolError,
+			Success:      e.Success,
+			Timestamp:    e.Timestamp,
+			Prompt:       e.Prompt,
+			InputTokens:  e.InputTokens,
+			OutputTokens: e.OutputTokens,
+			DetailJSON:   e.DetailJSON,
+		}
+	}
+
+	messages := make([]types.ChatMessage, len(a.Messages))
+	for i, msg := range a.Messages {
+		messages[i] = types.ChatMessage{
+			Role:      enums.ChatRole(msg.Role),
+			Content:   msg.Content,
+			Timestamp: msg.Timestamp,
+		}
+	}
+
+	return &server.Session{
+		ID:        a.ID,
+		Goal:      a.Goal,
+		Status:    enums.SessionStatus(a.Status),
+		Result:    a.Result,
+		State:     state,
+		StartedAt: a.StartedAt,
+		EndedAt:   endedAt,
+		Events:    events,
+		Messages:  messages,
+		TempDir:   a.TempDir,
+	}
 }
 
 func (m *Model) selectedSession() *server.Session {
 	if m.sessionsCursor < 0 || m.sessionsCursor >= len(m.sessions) {
 		return nil
 	}
-	// 测试或降级场景：无 SessionManager 时直接返回本地 sessions 的浅拷贝。
-	if m.sessionMgr == nil {
+	// 测试或降级场景：无 agent facade 时直接返回本地 sessions 的浅拷贝。
+	if m.agent == nil {
 		s := *m.sessions[m.sessionsCursor]
 		return &s
 	}
-	// 返回持锁深拷贝（T1 修复：原直接返回 *Session 指针，TUI 在 tea 主 goroutine
-	// 无锁读 Events/Messages/State，与后台 runSession/addEventDebug 的并发写产生
-	// data race，事件量大时可能 slice 迭代越界 panic 或读取半更新 State 指针）。
-	return m.sessionMgr.SnapshotSession(m.sessions[m.sessionsCursor].ID)
+	// 通过 agent.Agent facade 获取会话快照，避免直接依赖 SessionManager 内部方法。
+	sess, err := m.agent.Get(context.Background(), m.sessions[m.sessionsCursor].ID)
+	if err != nil {
+		log.Printf("[tui] selectedSession: %v", err)
+		// 降级：返回本地缓存的会话。
+		s := *m.sessions[m.sessionsCursor]
+		return &s
+	}
+	return toServerSession(sess)
 }
 
 // Update handles messages.
@@ -428,63 +579,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flash = ""
 		}
 		m.flashMu.Unlock()
-		// 消费后台 createSession 写入的 pendingSelectID：在主循环内 refresh+select
-		// 避免后台 goroutine 直接改 m.sessions/cursor 与 View 产生 race（T2 修复）
-		if m.pendingSelectID != "" {
-			id := m.pendingSelectID
-			m.pendingSelectID = ""
-			m.refreshSessions()
-			for i, s := range m.sessions {
-				if s.ID == id {
-					m.selectSession(i)
-					break
-				}
-			}
-		}
-		// 发送消息后，优先滚动到最后一条用户问题，确保用户能看到自己的输入。
-		// 该逻辑必须排在内容重建/自动跟随底部之前，防止新内容把用户问题顶出视口。
-		if m.pendingScrollToUser {
-			items := m.collectChatItems()
-			for idx := len(items) - 1; idx >= 0; idx-- {
-				if strings.HasPrefix(items[idx].title, "> ") {
-					m.rebuildChatContent()
-					// 把用户问题底部对齐视口底部，保留上方历史可见；
-					// 同时锚定，让后续流式输出在下方展开而不把用户问题顶走。
-					m.chatScrollToItemBottom(idx)
-					m.chatFollowBottom = false
-					m.chatAnchorUser = true
-					m.pendingScrollToUser = false
-					// 找到真实用户消息后，若其内容与本地预展示一致，清除预展示标记
-					if m.pendingFirstMessage != "" && strings.TrimPrefix(items[idx].title, "> ") == m.pendingFirstMessage {
-						m.pendingFirstMessage = ""
-					}
-					break
-				}
-			}
-			// 未找到用户消息时保留 pendingScrollToUser，等待服务端写入或本地兜底展示后再试
-		}
-		// viewport 内容随会话事件/消息增长而重建；跟随底部时自动滚到最新。
-		// 锚定到用户问题时仅重建内容、不自动滚动，避免用户问题被顶出视口。
-		if s := m.selectedSession(); s != nil {
-			itemsChanged := len(chatItems(s, true)) != m.chatLastItems
-			widthChanged := m.chatContentWidth() != m.chatLastWidth
-			if itemsChanged || widthChanged {
-				wasAtBottom := m.chatVP.AtBottom() || m.chatFollowBottom
-				m.rebuildChatContent()
-				if !m.chatAnchorUser && wasAtBottom {
-					m.chatVP.GotoBottom()
-					m.chatFollowBottom = true
-				}
-			}
-		}
-		if !m.chatAnchorUser && m.chatFollowBottom {
-			m.chatVP.GotoBottom()
-		}
-		// 弹窗打开时刷新动态内容（完整记录面板在末尾时跟随新输出）
-		if m.overlay != overlayNone {
-			m.refreshOverlay()
-		}
+		m.refreshView()
 		return m, tickCmd()
+
+	case streamEventMsg:
+		m.refreshView()
+		return m, streamCmd(m.streamEvents)
 
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
@@ -494,6 +594,68 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// refreshView contains the view-refresh logic shared by tickMsg and
+// streamEventMsg: pending session selection, scroll-to-user, chat content
+// rebuild, and overlay refresh.
+func (m *Model) refreshView() {
+	// 消费后台 createSession 写入的 pendingSelectID：在主循环内 refresh+select
+	// 避免后台 goroutine 直接改 m.sessions/cursor 与 View 产生 race（T2 修复）
+	if m.pendingSelectID != "" {
+		id := m.pendingSelectID
+		m.pendingSelectID = ""
+		m.refreshSessions()
+		for i, s := range m.sessions {
+			if s.ID == id {
+				m.selectSession(i)
+				break
+			}
+		}
+	}
+	// 发送消息后，优先滚动到最后一条用户问题，确保用户能看到自己的输入。
+	// 该逻辑必须排在内容重建/自动跟随底部之前，防止新内容把用户问题顶出视口。
+	if m.pendingScrollToUser {
+		items := m.collectChatItems()
+		for idx := len(items) - 1; idx >= 0; idx-- {
+			if strings.HasPrefix(items[idx].title, "> ") {
+				m.rebuildChatContent()
+				// 把用户问题底部对齐视口底部，保留上方历史可见；
+				// 同时锚定，让后续流式输出在下方展开而不把用户问题顶走。
+				m.chatScrollToItemBottom(idx)
+				m.chatFollowBottom = false
+				m.chatAnchorUser = true
+				m.pendingScrollToUser = false
+				// 找到真实用户消息后，若其内容与本地预展示一致，清除预展示标记
+				if m.pendingFirstMessage != "" && strings.TrimPrefix(items[idx].title, "> ") == m.pendingFirstMessage {
+					m.pendingFirstMessage = ""
+				}
+				break
+			}
+		}
+		// 未找到用户消息时保留 pendingScrollToUser，等待服务端写入或本地兜底展示后再试
+	}
+	// viewport 内容随会话事件/消息增长而重建；跟随底部时自动滚到最新。
+	// 锚定到用户问题时仅重建内容、不自动滚动，避免用户问题被顶出视口。
+	if s := m.selectedSession(); s != nil {
+		itemsChanged := len(chatItems(s, true)) != m.chatLastItems
+		widthChanged := m.chatContentWidth() != m.chatLastWidth
+		if itemsChanged || widthChanged {
+			wasAtBottom := m.chatVP.AtBottom() || m.chatFollowBottom
+			m.rebuildChatContent()
+			if !m.chatAnchorUser && wasAtBottom {
+				m.chatVP.GotoBottom()
+				m.chatFollowBottom = true
+			}
+		}
+	}
+	if !m.chatAnchorUser && m.chatFollowBottom {
+		m.chatVP.GotoBottom()
+	}
+	// 弹窗打开时刷新动态内容（完整记录面板在末尾时跟随新输出）
+	if m.overlay != overlayNone {
+		m.refreshOverlay()
+	}
 }
 
 func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
