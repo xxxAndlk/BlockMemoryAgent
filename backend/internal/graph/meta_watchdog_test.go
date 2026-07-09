@@ -74,7 +74,10 @@ func TestDrainCommandQueueFeatureFlags(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mgr := cmdqueue.NewManager()
-			rt := rtPkg.New(soulPath(t), nil)
+			rt, err := rtPkg.New(soulPath(t), nil)
+			if err != nil {
+				t.Fatalf("init runtime: %v", err)
+			}
 			rt.SetAgentConfig(&config.AgentConfig{
 				FeatureTogglesConfig: config.FeatureTogglesConfig{
 					InterruptEnabled:   tt.interruptEnabled,
@@ -114,10 +117,16 @@ func TestDrainCommandQueueFeatureFlags(t *testing.T) {
 }
 
 func TestHumanClarifyEnabledRespectsConfig(t *testing.T) {
-	rtEnabled := rtPkg.New(soulPath(t), nil)
+	rtEnabled, err := rtPkg.New(soulPath(t), nil)
+	if err != nil {
+		t.Fatalf("init runtime: %v", err)
+	}
 	rtEnabled.SetAgentConfig(&config.AgentConfig{FeatureTogglesConfig: config.FeatureTogglesConfig{HumanClarifyEnabled: true}})
 
-	rtDisabled := rtPkg.New(soulPath(t), nil)
+	rtDisabled, err := rtPkg.New(soulPath(t), nil)
+	if err != nil {
+		t.Fatalf("init runtime: %v", err)
+	}
 	rtDisabled.SetAgentConfig(&config.AgentConfig{FeatureTogglesConfig: config.FeatureTogglesConfig{HumanClarifyEnabled: false}})
 
 	nodeEnabled := NewMetaAgentNode(NewRoleRegistry(emptyRoleConfig(t)), nil, 10, 0)

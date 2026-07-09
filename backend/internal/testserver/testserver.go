@@ -173,7 +173,12 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		return nil, nil, nil, fmt.Errorf("load skills %s: %w", skillPath, err)
 	}
 
-	rt := runtime.New(soulPath, skillPool)
+	rt, err := runtime.New(soulPath, skillPool)
+	if err != nil {
+		pgStore.Close()
+		redisStore.Close()
+		return nil, nil, nil, fmt.Errorf("init runtime: %w", err)
+	}
 	rt.SetAgentConfig(&cfg.Agent)
 
 	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)

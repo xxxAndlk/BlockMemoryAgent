@@ -54,7 +54,10 @@ func TestThreeLayerGraph_RuntimeWired(t *testing.T) {
 	// 不用真实模型工厂；MetaAgent 在没有 modelFactory 时也能跑（走规则回退）
 	factory := NewRoleFactory(registry, nil, cfg)
 
-	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt, err := runtime.New(soulPath, skill.BuiltinPool())
+	if err != nil {
+		t.Fatalf("init runtime: %v", err)
+	}
 	// 注入 AgentConfig，提供死循环防护三项必需参数 (StallSteps/MaxRepeatFingerprint/SessionTimeoutMin)
 	rt.SetAgentConfig(&config.AgentConfig{
 		GraphPolicyConfig: config.GraphPolicyConfig{

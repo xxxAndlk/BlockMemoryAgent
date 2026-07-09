@@ -33,6 +33,34 @@ type Runtime struct {
 	CmdQueue *cmdqueue.Manager   // 用户指令队列（特性6：抢占中断 / 队列注入）
 }
 
+// RuntimeOption 用于在构造 Runtime 时注入或覆盖依赖。
+type RuntimeOption func(*Runtime)
+
+// WithBoards 注入多看板管理器。
+func WithBoards(bm *board.Manager) RuntimeOption {
+	return func(r *Runtime) { r.Boards = bm }
+}
+
+// WithMailbox 注入 Agent 间异步邮箱。
+func WithMailbox(mb *mailbox.Mailbox) RuntimeOption {
+	return func(r *Runtime) { r.Mailbox = mb }
+}
+
+// WithWatchdog 注入上下文看门狗。
+func WithWatchdog(w *watchdog.Watchdog) RuntimeOption {
+	return func(r *Runtime) { r.Watchdog = w }
+}
+
+// WithCmdQueue 注入用户指令队列。
+func WithCmdQueue(cq *cmdqueue.Manager) RuntimeOption {
+	return func(r *Runtime) { r.CmdQueue = cq }
+}
+
+// WithSoul 注入人格加载器；提供时跳过从 soulPath 加载。
+func WithSoul(loader *soul.Loader) RuntimeOption {
+	return func(r *Runtime) { r.Soul = loader }
+}
+
 // New 创建带默认依赖的运行时。
 //
 // 职责：在 main.go 启动阶段一次性装配 Runtime 的五大组件，让上层 graph
@@ -40,32 +68,42 @@ type Runtime struct {
 //
 // 参数：
 //
-//	soulPath  人格文件路径，必须存在（main.go 已校验）
-//	skillPool 技能池，由 main.go 从 yaml 加载；nil 时退回 BuiltinPool 兜底
+//	soulPath   人格文件路径；空路径时 loader.Load() 会返回错误，由调用方处理
+//	skillPool  技能池，由 main.go 从 yaml 加载；nil 时退回 BuiltinPool 兜底
+//	opts       可选依赖注入，用于测试或高级定制
 //
-// 返回：装配完成的 *Runtime，各字段均已就绪。AgentCfg 默认 nil，需调用方通过 SetAgentConfig 注入。
+// 返回：装配完成的 *Runtime 与构造错误。AgentCfg 默认 nil，需调用方通过 SetAgentConfig 注入。
 //
-// 副作用：触发一次 loader.Load()；文件读取失败 panic（main.go 已保证文件存在）。
-func New(soulPath string, skillPool *skill.Pool) *Runtime {
+// 副作用：触发一次 loader.Load()；文件读取失败返回包装错误，不再 panic。
+func New(soulPath string, skillPool *skill.Pool, opts ...RuntimeOption) (*Runtime, error) {
 	// skillPool 为 nil 时退回内置技能池作为兜底
 	if skillPool == nil {
 		skillPool = skill.BuiltinPool()
 	}
 
-	loader := soul.NewLoader(soulPath)
-	if err := loader.Load(); err != nil {
-		panic(fmt.Sprintf("load soul.md: %v", err))
-	}
-
-	// 一次性装配五大组件并返回进程级共享的 Runtime
-	return &Runtime{
+	// 先用默认值装配 Runtime，再通过选项覆盖依赖
+	rt := &Runtime{
 		Boards:   board.NewManager(),                     // 空看板管理器，会话启动时由 MetaAgent 按需 GetOrCreate
 		Mailbox:  mailbox.New(),                          // 空邮箱，各 Agent 通过 Send/Drain 异步通信
 		Skills:   skill.NewRegistry(skillPool),           // 以技能池初始化注册表
-		Soul:     loader,                                 // 人格加载器，供 Agent 拼 system prompt 时注入
 		Watchdog: watchdog.New(watchdog.DefaultConfig()), // 默认基于 32k 上下文窗口（soft=16k/hard=25.6k），SetAgentConfig 后按 context_window 更新
 		CmdQueue: cmdqueue.NewManager(),                  // 用户指令队列（特性6）
 	}
+
+	for _, opt := range opts {
+		opt(rt)
+	}
+
+	// 若未通过选项注入 Soul，则从 soulPath 加载人格
+	if rt.Soul == nil {
+		loader := soul.NewLoader(soulPath)
+		if err := loader.Load(); err != nil {
+			return nil, fmt.Errorf("load soul.md: %w", err)
+		}
+		rt.Soul = loader
+	}
+
+	return rt, nil
 }
 
 // SetAgentConfig 注入 Agent 运行时动态参数。

@@ -70,7 +70,10 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 	registry := graph.NewRoleRegistry(cfg)
 	factory := graph.NewRoleFactory(registry, nil, cfg)
 
-	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt, err := runtime.New(soulPath, skill.BuiltinPool())
+	if err != nil {
+		t.Fatalf("init runtime: %v", err)
+	}
 	rt.SetAgentConfig(&config.AgentConfig{
 		GraphPolicyConfig: config.GraphPolicyConfig{
 			StallSteps:           30,
@@ -155,7 +158,10 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 	registry := graph.NewRoleRegistry(cfg)
 	factory := graph.NewRoleFactory(registry, nil, cfg)
 
-	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt, err := runtime.New(soulPath, skill.BuiltinPool())
+	if err != nil {
+		t.Fatalf("init runtime: %v", err)
+	}
 	rt.SetAgentConfig(&config.AgentConfig{
 		GraphPolicyConfig: config.GraphPolicyConfig{
 			StallSteps:           30,
@@ -310,7 +316,10 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 	registry := graph.NewRoleRegistry(cfg)
 	factory := graph.NewRoleFactory(registry, nil, cfg)
 
-	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt, err := runtime.New(soulPath, skill.BuiltinPool())
+	if err != nil {
+		t.Fatalf("init runtime: %v", err)
+	}
 	rt.SetAgentConfig(&config.AgentConfig{
 		GraphPolicyConfig: config.GraphPolicyConfig{
 			StallSteps:           30,
@@ -389,7 +398,10 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 	registry := graph.NewRoleRegistry(cfg)
 	factory := graph.NewRoleFactory(registry, nil, cfg)
 
-	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt, err := runtime.New(soulPath, skill.BuiltinPool())
+	if err != nil {
+		t.Fatalf("init runtime: %v", err)
+	}
 	rt.SetAgentConfig(&config.AgentConfig{
 		GraphPolicyConfig: config.GraphPolicyConfig{
 			StallSteps:           30,
@@ -511,7 +523,10 @@ func TestPlanPanelReflectsAgentStatuses(t *testing.T) {
 	if err := os.WriteFile(soulPath, []byte("test"), 0644); err != nil {
 		t.Fatalf("write soul: %v", err)
 	}
-	rt := runtime.New(soulPath, skill.BuiltinPool())
+	rt, err := runtime.New(soulPath, skill.BuiltinPool())
+	if err != nil {
+		t.Fatalf("init runtime: %v", err)
+	}
 	bd := rt.Boards.GetOrCreate("session-1", "塔防游戏 demo")
 	bd.AddSubTask("战斗领域 - 实现怪物路径")
 	bd.AddSubTask("UI领域 - Canvas 渲染")

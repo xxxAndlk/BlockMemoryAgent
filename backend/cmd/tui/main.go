@@ -145,7 +145,10 @@ func main() {
 		log.Fatalf("load skills: %v", err)
 	}
 
-	rt := runtime.New(*soulPath, skillPool)
+	rt, err := runtime.New(*soulPath, skillPool)
+	if err != nil {
+		log.Fatalf("init runtime: %v", err)
+	}
 	if cfg.Agent.StallSteps > 0 {
 		rt.SetAgentConfig(&cfg.Agent)
 	}
