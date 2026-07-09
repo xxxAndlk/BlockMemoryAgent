@@ -44,8 +44,8 @@ func (e *ToolExecutor) readFile(args map[string]any) *ToolResult {
 	// 4000 字符够覆盖大多数源文件关键段落，需要看更多内容时 LLM 应换 SearchInFiles
 	// 精确定位或用 offset/limit 参数（待扩展）。
 	content := string(data)
-	if len(content) > 4000 {
-		content = content[:4000] + "\n... (truncated, total " + fmt.Sprintf("%d", len(string(data))) + " chars)"
+	if maxChars := e.agentConfig().ReadFileMaxChars; len(content) > maxChars {
+		content = content[:maxChars] + "\n... (truncated, total " + fmt.Sprintf("%d", len(string(data))) + " chars)"
 	}
 
 	return &ToolResult{Tool: "ReadFile", Success: true, Output: content, Path: absPath}
@@ -458,9 +458,9 @@ func (e *ToolExecutor) searchInFiles(args map[string]any) *ToolResult {
 	if len(lines) > 0 {
 		result.Success = true
 	}
-	// 截断超长输出（与 ReadFile 一致 4000，避免 SearchInFiles 大量命中回灌导致上下文爆炸）
-	if len(result.Output) > 4000 {
-		result.Output = result.Output[:4000] + "\n... (truncated)"
+	// 截断超长输出（与 ReadFile 使用同一阈值，避免 SearchInFiles 大量命中回灌导致上下文爆炸）
+	if maxChars := e.agentConfig().ReadFileMaxChars; len(result.Output) > maxChars {
+		result.Output = result.Output[:maxChars] + "\n... (truncated)"
 	}
 	return result
 }

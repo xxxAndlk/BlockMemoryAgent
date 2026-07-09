@@ -10,7 +10,7 @@ import (
 // TestCommonCollectTaskSummaries 验证摘要收集与截断。
 func TestCommonCollectTaskSummaries(t *testing.T) {
 	t.Run("nil block", func(t *testing.T) {
-		if got := CommonCollectTaskSummaries(nil); len(got) != 0 {
+		if got := CommonCollectTaskSummaries(nil, 100); len(got) != 0 {
 			t.Errorf("nil block should yield no summaries")
 		}
 	})
@@ -23,7 +23,7 @@ func TestCommonCollectTaskSummaries(t *testing.T) {
 			"task1": "short result",
 			"task2": string(long),
 		}}
-		got := CommonCollectTaskSummaries(block)
+		got := CommonCollectTaskSummaries(block, 100)
 		if len(got) != 2 {
 			t.Fatalf("want 2 summaries, got %d", len(got))
 		}

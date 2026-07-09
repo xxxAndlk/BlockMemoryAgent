@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/watchdog"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -91,6 +92,18 @@ func (n *DomainAgentNode) Name() string {
 // 统一委托给 textutil.TruncateBytes。
 func truncateString(s string, n int) string {
 	return textutil.TruncateBytes(s, n, "...")
+}
+
+// agentConfig 返回当前 Runtime 注入的 AgentConfig；未注入时使用与 config.applyDefaults 一致的默认值。
+func (n *DomainAgentNode) agentConfig() *config.AgentConfig {
+	if n.rt != nil && n.rt.AgentCfg != nil {
+		return n.rt.AgentCfg
+	}
+	return &config.AgentConfig{
+		DomainMemoryRecallMaxChars:  300,
+		DomainMemoryContextMaxChars: 500,
+		DomainResultLogMaxChars:     200,
+	}
 }
 
 // InstanceID 返回实例ID。
@@ -179,7 +192,7 @@ func (n *DomainAgentNode) prepareContext(ctx context.Context, state *types.Three
 		if recalled, err := n.blockMemory.SearchBlockMemory(ctx, state.CurrentDomain, state.DomainGoal, 3); err == nil && recalled != "" {
 			n.recalledMemory = recalled
 			n.emit(ctx, "think", "已检索到历史相似块记忆，将作为上下文注入任务拆解")
-			n.emit(ctx, "memory_recall", truncateString(recalled, 300))
+			n.emit(ctx, "memory_recall", truncateString(recalled, n.agentConfig().DomainMemoryRecallMaxChars))
 			if log := n.sessionLogger(ctx); log != nil {
 				log.Event(ctx, "memory_recall", fmt.Sprintf("block_memory query=%s hits=1", state.DomainGoal), map[string]any{
 					"query":  state.DomainGoal,
@@ -187,7 +200,7 @@ func (n *DomainAgentNode) prepareContext(ctx context.Context, state *types.Three
 					"domain": state.CurrentDomain,
 				})
 				log.Event(ctx, "memory_inject", "注入历史块记忆到任务拆解", map[string]any{
-					"context": truncateString(recalled, 500),
+					"context": truncateString(recalled, n.agentConfig().DomainMemoryContextMaxChars),
 				})
 			}
 		} else if err == nil {
@@ -345,7 +358,7 @@ func (n *DomainAgentNode) finalizeBlock(ctx context.Context, state *types.ThreeL
 	}
 
 	if log := n.sessionLogger(ctx); log != nil {
-		log.Event(ctx, "result", fmt.Sprintf("domain=%s summary=%s", state.CurrentDomain, truncateString(state.Reason, 200)), map[string]any{
+		log.Event(ctx, "result", fmt.Sprintf("domain=%s summary=%s", state.CurrentDomain, truncateString(state.Reason, n.agentConfig().DomainResultLogMaxChars)), map[string]any{
 			"domain":  state.CurrentDomain,
 			"summary": state.Reason,
 		})

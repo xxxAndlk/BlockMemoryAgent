@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
@@ -58,16 +59,32 @@ type loopDetector struct {
 }
 
 // newLoopDetector 创建循环检测器。maxRounds 通常等于传给 blades.WithMaxIterations 的值。
-func newLoopDetector(maxRounds int) *loopDetector {
+// cfg 为 nil 时使用与 config.applyDefaults 一致的默认值。
+func newLoopDetector(maxRounds int, cfg *config.AgentConfig) *loopDetector {
 	if maxRounds <= 0 {
 		maxRounds = 12
 	}
+	if cfg == nil {
+		cfg = &config.AgentConfig{}
+	}
+	windowSize := cfg.LoopDetectorWindowSize
+	maxRepeat := cfg.LoopDetectorMaxRepeat
+	maxEmpty := cfg.LoopDetectorMaxEmpty
+	if windowSize == 0 {
+		windowSize = 20
+	}
+	if maxRepeat == 0 {
+		maxRepeat = 1 // 同一工具+参数在最近 20 次中出现 2 次即判定循环（塔防事故中 game_td.js 被读 3 次才触发，过宽）
+	}
+	if maxEmpty == 0 {
+		maxEmpty = 4 // 连续 4 轮只有工具调用无文本输出即判定空转
+	}
 	return &loopDetector{
 		maxRounds:      maxRounds,
-		windowSize:     20,
-		maxRepeat:      1, // 同一工具+参数在最近 20 次中出现 2 次即判定循环（塔防事故中 game_td.js 被读 3 次才触发，过宽）
-		maxEmptyStreak: 4, // 连续 4 轮只有工具调用无文本输出即判定空转
-		toolHistory:    make([]toolCallFingerprint, 0, 20),
+		windowSize:     windowSize,
+		maxRepeat:      maxRepeat,
+		maxEmptyStreak: maxEmpty,
+		toolHistory:    make([]toolCallFingerprint, 0, windowSize),
 	}
 }
 
@@ -191,7 +208,7 @@ func executeWithTools(
 		Message: blades.UserMessage(userMsg),
 	}
 	// 手动迭代 agent.Run：每轮 yield 一个 *Message，借此 hook 每轮 LLM 文本输出推给前端思考链
-	lastMessage, totalUsage, loopErr := runBladesAgentLoop(ctx, agent, invocation, agentName, maxItersResolved, emit)
+	lastMessage, totalUsage, loopErr := runBladesAgentLoop(ctx, agent, invocation, agentName, maxItersResolved, executor.agentConfig(), emit)
 	dur := time.Since(start)
 
 	finalText := ""
@@ -369,13 +386,20 @@ func executeMockAssistant(
 // 参见塔防 demo 事故 v2：MetaAgent[临时助手] 累积 850K input tokens（152s 调用），
 // 因反复读 game.js/game_core.js + 工具结果全量回灌 LLM。blades agent 内部无上下文裁剪，
 // 需在外层 loop 拦截。软阈值给 LLM 一次"收敛机会"，硬阈值兜底防爆炸。
-func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *blades.Invocation, agentName string, maxIters int, emit emitFunc) (*blades.Message, blades.TokenUsage, error) {
+func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *blades.Invocation, agentName string, maxIters int, cfg *config.AgentConfig, emit emitFunc) (*blades.Message, blades.TokenUsage, error) {
 	var lastMessage *blades.Message
 	var totalUsage blades.TokenUsage
-	detector := newLoopDetector(maxIters)
-	const maxInputTokensBudget = 80000 // 单轮输入 token 硬上限，超此视为上下文爆炸
-	const softWarnThreshold = 50000    // 软阈值：超此 emit 警告但不退出
-	softWarned := false                // 软阈值只警告一次，避免刷屏
+	detector := newLoopDetector(maxIters, cfg)
+
+	softLimit := cfg.ContextExplodeSoftLimit
+	hardLimit := cfg.ContextExplodeHardLimit
+	if softLimit == 0 {
+		softLimit = 50000
+	}
+	if hardLimit == 0 {
+		hardLimit = 80000
+	}
+	softWarned := false // 软阈值只警告一次，避免刷屏
 	for m, err := range agent.Run(ctx, invocation) {
 		if err != nil {
 			// 单 assistant wall-clock 超时：返回已收集结果而非裸 error，避免上层当作失败丢弃半成品
@@ -393,15 +417,15 @@ func runBladesAgentLoop(ctx context.Context, agent blades.Agent, invocation *bla
 		totalUsage.InputTokens += m.TokenUsage.InputTokens
 		totalUsage.OutputTokens += m.TokenUsage.OutputTokens
 		totalUsage.TotalTokens += m.TokenUsage.TotalTokens
-		// 软阈值警告：单轮 input_tokens 超 50K 但未达 80K，提示 LLM 收敛
-		if !softWarned && m.TokenUsage.InputTokens >= softWarnThreshold && m.TokenUsage.InputTokens < maxInputTokensBudget {
+		// 软阈值警告：单轮 input_tokens 超过软限制但未达硬限制，提示 LLM 收敛
+		if !softWarned && m.TokenUsage.InputTokens >= int64(softLimit) && m.TokenUsage.InputTokens < int64(hardLimit) {
 			emit(ctx, "wait", fmt.Sprintf("上下文接近爆炸（单轮 input_tokens=%d），请减少 ReadFile 次数并基于已读内容推进任务", m.TokenUsage.InputTokens))
 			softWarned = true
 		}
 		// 上下文爆炸检测：单轮 input_tokens 超预算则退出
-		if m.TokenUsage.InputTokens > maxInputTokensBudget {
+		if m.TokenUsage.InputTokens > int64(hardLimit) {
 			reason := fmt.Sprintf("上下文爆炸保护：单轮 input_tokens=%d 超预算 %d，可能因工具结果累积过多。建议减少 ReadFile 次数或缩短工具输出",
-				m.TokenUsage.InputTokens, maxInputTokensBudget)
+				m.TokenUsage.InputTokens, hardLimit)
 			emit(ctx, "error", reason)
 			return lastMessage, totalUsage, &loopExitError{reason: reason}
 		}

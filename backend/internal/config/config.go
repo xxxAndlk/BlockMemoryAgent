@@ -86,6 +86,26 @@ type AgentConfig struct {
 	ToolSandboxDisabled     bool     `yaml:"tool_sandbox_disabled"`      // true 时关闭写路径逃逸检测（保留命令黑名单）
 	ToolSandboxAllowedPaths []string `yaml:"tool_sandbox_allowed_paths"` // 允许读写的额外绝对路径白名单
 	ToolSandboxBlockedCmds  []string `yaml:"tool_sandbox_blocked_cmds"`  // 额外命令黑名单（追加到默认黑名单）
+	// 阈值与限额（替代 graph / tool / logger 中的硬编码 magic number）
+	ReadFileMaxChars           int `yaml:"read_file_max_chars"`            // ReadFile / SearchInFiles 输出截断字符数
+	RunCommandMaxOutput        int `yaml:"run_command_max_output"`         // RunCommand 输出截断字符数
+	RunCommandTimeoutSec       int `yaml:"run_command_timeout_sec"`        // RunCommand 最大允许超时（秒）
+	ToolExecMaxBytes           int `yaml:"tool_exec_max_bytes"`            // Execute 入参 JSON 摘要截断字节数
+	LLMPromptMaxChars          int `yaml:"llm_prompt_max_chars"`           // prompt / response 日志摘要截断字符数
+	LLMTrackerSlowModeThreshold int `yaml:"llm_tracker_slow_mode_threshold"` // 连续多少次 LLM 失败进入 slow mode
+	LoggerRetryCount           int `yaml:"logger_retry_count"`             // 日志异步写表重试次数
+	ContextExplodeSoftLimit    int `yaml:"context_explode_soft_limit"`     // blades 上下文爆炸软阈值（input tokens）
+	ContextExplodeHardLimit    int `yaml:"context_explode_hard_limit"`     // blades 上下文爆炸硬阈值（input tokens）
+	SummaryTruncateChars       int `yaml:"summary_truncate_chars"`         // CommonCollectTaskSummaries 单条结果截断字符数
+	SearchBlockMemoryMaxTokens int `yaml:"search_block_memory_max_tokens"` // 块记忆检索摘要 token 上限
+	SummaryBaseLimit           int `yaml:"summary_base_limit"`             // MetaAgent 最终总结基础字数
+	SummaryExtendedLimit       int `yaml:"summary_extended_limit"`         // MetaAgent 最终总结每子 Agent 增加字数
+	LoopDetectorWindowSize     int `yaml:"loop_detector_window_size"`      // 循环检测器窗口大小
+	LoopDetectorMaxRepeat      int `yaml:"loop_detector_max_repeat"`       // 循环检测器重复阈值
+	LoopDetectorMaxEmpty       int `yaml:"loop_detector_max_empty"`        // 循环检测器连续空转阈值
+	DomainMemoryRecallMaxChars int `yaml:"domain_memory_recall_max_chars"` // DomainAgent 记忆召回事件截断字符数
+	DomainMemoryContextMaxChars int `yaml:"domain_memory_context_max_chars"` // DomainAgent 记忆上下文注入截断字符数
+	DomainResultLogMaxChars    int `yaml:"domain_result_log_max_chars"`    // DomainAgent 结果日志截断字符数
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -300,6 +320,63 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.Agent.CompressAgeHours == 0 {
 		c.Agent.CompressAgeHours = 24
+	}
+	if c.Agent.ReadFileMaxChars == 0 {
+		c.Agent.ReadFileMaxChars = 4000
+	}
+	if c.Agent.RunCommandMaxOutput == 0 {
+		c.Agent.RunCommandMaxOutput = 10000
+	}
+	if c.Agent.RunCommandTimeoutSec == 0 {
+		c.Agent.RunCommandTimeoutSec = 60
+	}
+	if c.Agent.ToolExecMaxBytes == 0 {
+		c.Agent.ToolExecMaxBytes = 300
+	}
+	if c.Agent.LLMPromptMaxChars == 0 {
+		c.Agent.LLMPromptMaxChars = 500
+	}
+	if c.Agent.LLMTrackerSlowModeThreshold == 0 {
+		c.Agent.LLMTrackerSlowModeThreshold = 3
+	}
+	if c.Agent.LoggerRetryCount == 0 {
+		c.Agent.LoggerRetryCount = 3
+	}
+	if c.Agent.ContextExplodeSoftLimit == 0 {
+		c.Agent.ContextExplodeSoftLimit = 50000
+	}
+	if c.Agent.ContextExplodeHardLimit == 0 {
+		c.Agent.ContextExplodeHardLimit = 80000
+	}
+	if c.Agent.SummaryTruncateChars == 0 {
+		c.Agent.SummaryTruncateChars = 100
+	}
+	if c.Agent.SearchBlockMemoryMaxTokens == 0 {
+		c.Agent.SearchBlockMemoryMaxTokens = 800
+	}
+	if c.Agent.SummaryBaseLimit == 0 {
+		c.Agent.SummaryBaseLimit = 500
+	}
+	if c.Agent.SummaryExtendedLimit == 0 {
+		c.Agent.SummaryExtendedLimit = 200
+	}
+	if c.Agent.LoopDetectorWindowSize == 0 {
+		c.Agent.LoopDetectorWindowSize = 20
+	}
+	if c.Agent.LoopDetectorMaxRepeat == 0 {
+		c.Agent.LoopDetectorMaxRepeat = 1
+	}
+	if c.Agent.LoopDetectorMaxEmpty == 0 {
+		c.Agent.LoopDetectorMaxEmpty = 4
+	}
+	if c.Agent.DomainMemoryRecallMaxChars == 0 {
+		c.Agent.DomainMemoryRecallMaxChars = 300
+	}
+	if c.Agent.DomainMemoryContextMaxChars == 0 {
+		c.Agent.DomainMemoryContextMaxChars = 500
+	}
+	if c.Agent.DomainResultLogMaxChars == 0 {
+		c.Agent.DomainResultLogMaxChars = 200
 	}
 
 	// —— 日志默认值：默认目录 ./logs ——

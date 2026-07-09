@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -117,7 +118,7 @@ func (n *MetaAgentNode) collectBlockResult(state *types.ThreeLayerState, block *
 //
 // 副作用：可能用 LLM 重写 SessionSummary，并截断到动态字数上限。
 func (n *MetaAgentNode) finalizeSession(ctx context.Context, state *types.ThreeLayerState) {
-	limit := summaryLimit(state)
+	limit := n.summaryLimit(state)
 
 	// 无摘要则生成默认摘要
 	if state.SessionSummary == "" {
@@ -150,10 +151,16 @@ func (n *MetaAgentNode) finalizeSession(ctx context.Context, state *types.ThreeL
 	state.SessionSummary = truncateStringByRunes(state.SessionSummary, limit)
 }
 
-const (
-	baseSummaryLimit = 500 // 默认总结字数上限
-	perAgentLimit    = 200 // 每调用一个子Agent增加的字数
-)
+// agentConfig 返回当前 Runtime 注入的 AgentConfig；未注入时使用与 config.applyDefaults 一致的默认值。
+func (n *MetaAgentNode) agentConfig() *config.AgentConfig {
+	if n.rt != nil && n.rt.AgentCfg != nil {
+		return n.rt.AgentCfg
+	}
+	return &config.AgentConfig{
+		SummaryBaseLimit:     500,
+		SummaryExtendedLimit: 200,
+	}
+}
 
 // subAgentCount 统计当前会话中已调用的非 MetaAgent 角色实例数。
 func subAgentCount(state *types.ThreeLayerState) int {
@@ -171,8 +178,9 @@ func subAgentCount(state *types.ThreeLayerState) int {
 
 // summaryLimit 根据子Agent数量计算 MetaAgent 总结的字数上限。
 // 默认 500 字，每调用一个子Agent增加 200 字。
-func summaryLimit(state *types.ThreeLayerState) int {
-	return baseSummaryLimit + perAgentLimit*subAgentCount(state)
+func (n *MetaAgentNode) summaryLimit(state *types.ThreeLayerState) int {
+	cfg := n.agentConfig()
+	return cfg.SummaryBaseLimit + cfg.SummaryExtendedLimit*subAgentCount(state)
 }
 
 // truncateStringByRunes 按 rune（字符）截断字符串并加省略号。

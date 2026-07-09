@@ -79,9 +79,9 @@ func (e *ToolExecutor) runCommand(ctx context.Context, args map[string]any) *Too
 	if t, ok := args["timeout"].(float64); ok && t > 0 {
 		timeout = time.Duration(t) * time.Second
 	}
-	// 强制上限 60s：LLM 可能传 300s+ 导致 curl/长命令卡死整个 session
-	if timeout > 60*time.Second {
-		timeout = 60 * time.Second
+	// 强制上限：LLM 可能传 300s+ 导致 curl/长命令卡死整个 session
+	if maxTimeout := time.Duration(e.agentConfig().RunCommandTimeoutSec) * time.Second; timeout > maxTimeout {
+		timeout = maxTimeout
 	}
 
 	// 派生带超时的 ctx
@@ -127,8 +127,8 @@ func (e *ToolExecutor) runCommand(ctx context.Context, args map[string]any) *Too
 	}
 
 	// 截断超长输出
-	if len(output) > 10000 {
-		output = output[:10000] + "\n... (truncated)"
+	if maxOut := e.agentConfig().RunCommandMaxOutput; len(output) > maxOut {
+		output = output[:maxOut] + "\n... (truncated)"
 	}
 
 	// 组装结果，成功与否由 err 决定

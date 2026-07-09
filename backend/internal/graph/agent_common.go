@@ -331,25 +331,26 @@ func sessionIDFromState(state *types.ThreeLayerState) string {
 
 // CommonCollectTaskSummaries 收集块内任务结果摘要（共享子过程）。
 //
-// 职责：遍历 block.TaskResults，每项截断到 100 字符，拼成 "任务: 结果" 格式。
+// 职责：遍历 block.TaskResults，每项截断到 maxChars 字符，拼成 "任务: 结果" 格式。
 // DomainAgent / SubDomainAgent 的 summarizeResults 共用此函数收集摘要，
 // 各自再决定是否归档块记忆/领域归档。
 //
 // 参数：
 //   - block：当前会话块；可为 nil。
+//   - maxChars：单条结果截断长度；<=0 时不截断。
 //
 // 返回：摘要字符串切片（无结果时为空切片）。
-func CommonCollectTaskSummaries(block *types.SessionBlock) []string {
+func CommonCollectTaskSummaries(block *types.SessionBlock, maxChars int) []string {
 	var summaries []string
 	if block == nil || block.TaskResults == nil {
 		return summaries
 	}
 	for task, result := range block.TaskResults {
-		// 结果过长则截断到 100 字符
+		// 结果过长则截断到 maxChars 字符
 		shortResult := result
-		if len(shortResult) > 100 {
+		if maxChars > 0 && len(shortResult) > maxChars {
 			// 截断并加省略号
-			shortResult = shortResult[:100] + "..."
+			shortResult = shortResult[:maxChars] + "..."
 		}
 		// 拼成 "任务: 结果" 格式
 		summaries = append(summaries, fmt.Sprintf("%s: %s", task, shortResult))

@@ -11,6 +11,8 @@ import (
 	"os"           // NewToolExecutor 回退 Getwd
 	"path/filepath" // resolvePath
 	"time"         // 默认超时
+
+	"github.com/blockmemory/agent/backend/internal/config"
 )
 
 // marshalNoHTMLEscape 序列化 v 为 JSON，关闭 HTML 转义。
@@ -117,6 +119,7 @@ type ToolExecutor struct {
 	sandbox      SandboxConfig   // 轻量级沙箱策略（命令黑名单 + 路径逃逸检测）
 	guards       *GuardRegistry  // 业务策略守卫（写保护、命令拦截等）
 	toolRegistry *ToolRegistry   // 工具注册表
+	agentCfg     *config.AgentConfig // Agent 阈值配置（如 ReadFileMaxChars）
 }
 
 // NewToolExecutor 创建工具执行器。
@@ -189,6 +192,24 @@ func (e *ToolExecutor) SetToolRegistry(r *ToolRegistry) {
 	e.toolRegistry = r
 }
 
+// SetAgentConfig 注入 Agent 阈值配置，nil 时调用方仍应使用默认值。
+func (e *ToolExecutor) SetAgentConfig(cfg *config.AgentConfig) {
+	e.agentCfg = cfg
+}
+
+// agentConfig 返回非空的阈值配置；未注入时使用与 config.applyDefaults 一致的硬编码默认值。
+func (e *ToolExecutor) agentConfig() *config.AgentConfig {
+	if e.agentCfg != nil {
+		return e.agentCfg
+	}
+	return &config.AgentConfig{
+		ReadFileMaxChars:     4000,
+		RunCommandMaxOutput:  10000,
+		RunCommandTimeoutSec: 60,
+		ToolExecMaxBytes:     300,
+	}
+}
+
 // ensureToolRegistryDefaults 保证 toolRegistry 字段非空。
 func (e *ToolExecutor) ensureToolRegistryDefaults() {
 	if e.toolRegistry == nil {
@@ -255,8 +276,9 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	// <!DOCTYPE html>，命令中的 && 显示为 &&）。
 	if argsJSON, mErr := marshalNoHTMLEscape(args); mErr == nil {
 		argsStr := string(argsJSON)
-		if len(argsStr) > 300 {
-			argsStr = argsStr[:300] + "...(truncated)"
+		maxBytes := e.agentConfig().ToolExecMaxBytes
+		if len(argsStr) > maxBytes {
+			argsStr = argsStr[:maxBytes] + "...(truncated)"
 		}
 		result.ArgsJSON = argsStr
 	}

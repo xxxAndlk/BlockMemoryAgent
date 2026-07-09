@@ -74,7 +74,7 @@ func (n *DomainAgentNode) summarizeResults(state *types.ThreeLayerState) {
 
 	// 取当前块并收集结果摘要
 	block := state.ActiveBlocks[state.CurrentBlockID]
-	summaries := CommonCollectTaskSummaries(block)
+	summaries := CommonCollectTaskSummaries(block, n.agentConfig().SummaryTruncateChars)
 
 	// 有摘要则拼成一句话写入 state.Reason
 	if len(summaries) > 0 {

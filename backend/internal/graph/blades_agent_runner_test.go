@@ -9,7 +9,7 @@ import (
 )
 
 func TestLoopDetectorDetectsRepeat(t *testing.T) {
-	d := newLoopDetector(40)
+	d := newLoopDetector(40, nil)
 	// maxRepeat=1：同一 (name,request) 出现 2 次即判定循环。
 	for i := 0; i < 2; i++ {
 		m := &blades.Message{
@@ -32,7 +32,7 @@ func TestLoopDetectorDetectsRepeat(t *testing.T) {
 }
 
 func TestLoopDetectorDetectsEmptyStreak(t *testing.T) {
-	d := newLoopDetector(40)
+	d := newLoopDetector(40, nil)
 	for i := 0; i < 4; i++ {
 		req := fmt.Sprintf(`{"command":"cmd%d"}`, i)
 		m := &blades.Message{
@@ -55,7 +55,7 @@ func TestLoopDetectorDetectsEmptyStreak(t *testing.T) {
 }
 
 func TestLoopDetectorTextResetsEmptyStreak(t *testing.T) {
-	d := newLoopDetector(40)
+	d := newLoopDetector(40, nil)
 	for i := 0; i < 4; i++ {
 		req := fmt.Sprintf(`{"command":"cmd%d"}`, i)
 		m := &blades.Message{

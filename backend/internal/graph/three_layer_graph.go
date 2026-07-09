@@ -291,6 +291,10 @@ func (g *ThreeLayerGraph) NewToolExecutor(workDir string) *ToolExecutor {
 	if g.toolCallback != nil {
 		executor.SetCallback(g.toolCallback)
 	}
+	// 应用运行时阈值配置（若已配置）
+	if g.rt != nil && g.rt.AgentCfg != nil {
+		executor.SetAgentConfig(g.rt.AgentCfg)
+	}
 	// 应用运行时沙箱配置（若已配置）
 	if g.rt != nil && g.rt.AgentCfg != nil {
 		cfg := &SandboxConfig{
