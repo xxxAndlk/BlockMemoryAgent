@@ -72,8 +72,8 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { listSkills, getAgentSkills, type Skill } from '@/api/session'
-import type { AgentNode } from '@/types'
+import { listSkills, getAgentSkills } from '@/api/skills'
+import type { AgentNode, Skill } from '@/types'
 
 const props = defineProps<{
   agents: AgentNode[]

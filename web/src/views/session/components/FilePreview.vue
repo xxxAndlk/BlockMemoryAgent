@@ -62,7 +62,7 @@
 
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue'
-import { listFiles, getFileContent, type FileItem } from '@/api/session'
+import { listFiles, getFileContent, type FileItem } from '@/api/files'
 
 const props = defineProps<{
   sessionId: string

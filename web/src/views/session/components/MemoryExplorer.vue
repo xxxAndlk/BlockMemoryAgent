@@ -127,7 +127,14 @@
 
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue'
-import { getSnapshot, searchMemory, getMemoryLevels, type AgentSnapshot, type MemorySearchResult, type MemoryLevelsResponse } from '@/api/session'
+import {
+  getSnapshot,
+  searchMemory,
+  getMemoryLevels,
+  type AgentSnapshot,
+  type MemorySearchResult,
+  type MemoryLevelsResponse,
+} from '@/api/memory'
 import type { AgentNode } from '@/types'
 
 const props = defineProps<{

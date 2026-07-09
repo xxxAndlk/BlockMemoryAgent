@@ -13,9 +13,8 @@ import {
   streamSession,
   getSessionAgents,
   getSessionBoard,
-  type SessionMetrics,
-  getSessionMetrics,
 } from '@/api/session'
+import { getSessionMetrics, type SessionMetrics } from '@/api/metrics'
 import MessageList from './components/MessageList.vue'
 import ChatInput from './components/ChatInput.vue'
 import ChatHeader from './components/ChatHeader.vue'
@@ -263,11 +262,6 @@ const tasks = computed(() => {
     return board.value.tasks.map(t => ({ title: t.title, assignee: t.assignee, status: t.status })) as TaskItem[]
   }
   return [] as TaskItem[]
-})
-
-const constraints = computed(() => {
-  if (board.value?.constraints) return Object.entries(board.value.constraints)
-  return [] as [string, string][]
 })
 
 const taskProgress = computed(() => {

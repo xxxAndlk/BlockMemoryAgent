@@ -76,7 +76,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { getHealth, getStatus, type HealthResponse, type StatusResponse } from '@/api/session'
+import { getHealth, getStatus, type HealthResponse, type StatusResponse } from '@/api/health'
 
 const route = useRoute()
 const router = useRouter()

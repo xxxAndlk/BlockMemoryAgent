@@ -1,23 +1,6 @@
-import type { Session, SessionEvent, AgentNode } from '@/types'
-
-const API_BASE = '/api'
-
-async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  // AbortController 10s 超时（F7 修复：原 fetch 无超时，后端挂起时 UI 永久加载）
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 10000)
-  try {
-    const r = await fetch(`${API_BASE}${url}`, {
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      ...options,
-    })
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
-    return r.json() as Promise<T>
-  } finally {
-    clearTimeout(timeoutId)
-  }
-}
+import type { Session, SessionEvent, AgentNode, TaskBoardData } from '@/types'
+import { fetchJson } from './client'
+import { APP_CONFIG } from '@/config/app'
 
 export function listSessions(): Promise<Session[]> {
   return fetchJson('/sessions')
@@ -34,11 +17,13 @@ export function getSession(id: string): Promise<Session> {
   return fetchJson(`/sessions/${id}`)
 }
 
-export function getSessionBoard(id: string): Promise<{ session_id: string; board: any }> {
+export function getSessionBoard(id: string): Promise<{ session_id: string; board: TaskBoardData }> {
   return fetchJson(`/sessions/${id}/board`)
 }
 
-export function getSessionAgents(id: string): Promise<{ session_id: string; agents: AgentNode[]; tree: AgentNode[] }> {
+export function getSessionAgents(
+  id: string
+): Promise<{ session_id: string; agents: AgentNode[]; tree: AgentNode[] }> {
   return fetchJson(`/sessions/${id}/agents`)
 }
 
@@ -66,9 +51,6 @@ export function streamSession(
   onDone?: (finalStatus?: string) => void,
   onError?: (err: Error) => void
 ): () => void {
-  // F3/F4 修复：原 EventSource.onerror 直接报错不重连，网络抖动即断流。
-  // 改为手动重连 + 指数退避（最多 5 次）。重连后服务端发全量快照，
-  // 调用方在 onEvent 中识别快照（含 id/goal/events 字段）重置状态，天然去重。
   let closed = false
   let attempt = 0
   let es: EventSource | null = null
@@ -76,8 +58,10 @@ export function streamSession(
 
   const connect = () => {
     if (closed) return
-    es = new EventSource(`${API_BASE}/sessions/${id}/stream`)
-    es.onopen = () => { attempt = 0 } // 连接成功后重置退避计数
+    es = new EventSource(`${APP_CONFIG.apiBase}/sessions/${id}/stream`)
+    es.onopen = () => {
+      attempt = 0
+    }
     es.onmessage = (e) => {
       try {
         const d = JSON.parse(e.data)
@@ -95,12 +79,11 @@ export function streamSession(
       es?.close()
       es = null
       if (closed) return
-      // 指数退避：1s, 2s, 4s, 8s, 16s，超过 5 次放弃
-      if (attempt >= 5) {
+      if (attempt >= APP_CONFIG.sseRetry) {
         onError?.(new Error('SSE 重连失败，已超过最大重试次数'))
         return
       }
-      const delay = Math.min(1000 * Math.pow(2, attempt), 16000)
+      const delay = Math.min(1000 * Math.pow(2, attempt), APP_CONFIG.sseRetryMaxDelayMs)
       attempt++
       reconnectTimer = setTimeout(connect, delay)
     }
@@ -112,83 +95,6 @@ export function streamSession(
     if (reconnectTimer) clearTimeout(reconnectTimer)
     es?.close()
   }
-}
-
-export interface HealthStatus {
-  name: string
-  online: boolean
-  latency_ms?: number
-  detail: string
-}
-
-export interface HealthResponse {
-  postgres: HealthStatus
-  redis: HealthStatus
-  llm: HealthStatus
-}
-
-export function getHealth(): Promise<HealthResponse> {
-  return fetchJson('/health')
-}
-
-export interface StatusResponse {
-  program: string
-  mode: string
-  soul: string
-  llm_provider: string
-  llm_model: string
-  version: string
-}
-
-export function getStatus(): Promise<StatusResponse> {
-  return fetchJson('/status')
-}
-
-export interface TimelinePoint {
-  time: string
-  calls: number
-  tokens: number
-}
-
-export interface TimelineResponse {
-  points: TimelinePoint[]
-}
-
-export function getTimeline(points?: number): Promise<TimelineResponse> {
-  const qs = points ? `?points=${points}` : ''
-  return fetchJson(`/metrics/timeline${qs}`)
-}
-
-export interface ActivityItem {
-  session_id: string
-  agent: string
-  kind: string
-  content: string
-  time: string
-}
-
-export interface ActivityResponse {
-  activities: ActivityItem[]
-}
-
-export function getActivity(limit?: number): Promise<ActivityResponse> {
-  const qs = limit ? `?limit=${limit}` : ''
-  return fetchJson(`/activity${qs}`)
-}
-
-export interface SessionMetrics {
-  session_id: string
-  calls: number
-  timeouts: number
-  avg_duration: string
-  max_duration: string
-  input_tokens: number
-  output_tokens: number
-  total_tokens: number
-}
-
-export function getSessionMetrics(id: string): Promise<SessionMetrics> {
-  return fetchJson(`/sessions/${id}/metrics`)
 }
 
 export interface SessionLog {
@@ -205,7 +111,7 @@ export interface SessionLog {
   model: string
   latency_ms: number
   created_at: string
-  meta?: Record<string, any>
+  meta?: Record<string, unknown>
 }
 
 export interface SessionLogsResponse {
@@ -225,26 +131,6 @@ export function getSessionLogs(
   if (params?.offset !== undefined) qs.set('offset', String(params.offset))
   const q = qs.toString() ? `?${qs.toString()}` : ''
   return fetchJson(`/sessions/${id}/logs${q}`)
-}
-
-export interface AgentModelTokenStats {
-  agent: string
-  model: string
-  input_tokens: number
-  output_tokens: number
-  calls: number
-}
-
-export interface SessionTokenMetricsResponse {
-  session_id: string
-  total_input_tokens: number
-  total_output_tokens: number
-  total_calls: number
-  stats: AgentModelTokenStats[]
-}
-
-export function getSessionTokenMetrics(id: string): Promise<SessionTokenMetricsResponse> {
-  return fetchJson(`/sessions/${id}/token-metrics`)
 }
 
 export interface WatchdogDecision {
@@ -285,118 +171,4 @@ export interface SessionMailboxResponse {
 
 export function getSessionMailbox(id: string): Promise<SessionMailboxResponse> {
   return fetchJson(`/sessions/${id}/mailbox`)
-}
-
-export interface AgentSnapshot {
-  agent_id: string
-  topic_id: string
-  last_step_id: string
-  key_summaries: { step_id: string; content: string; timestamp: string }[]
-  open_issues: { id: string; description: string; created_at: string }[]
-  local_vars: Record<string, any>
-  published_ver: number
-  updated_at: string
-}
-
-export interface SnapshotResponse {
-  agent_id: string
-  snapshot: AgentSnapshot | null
-}
-
-export function getSnapshot(agentID: string, topicID: string): Promise<SnapshotResponse> {
-  return fetchJson('/snapshot', {
-    method: 'POST',
-    body: JSON.stringify({ agent_id: agentID, topic_id: topicID }),
-  })
-}
-
-export interface MemorySearchResult {
-  step_id: string
-  summary: string
-  action: string
-  importance: number
-  score: number
-  time: string
-}
-
-export interface MemorySearchResponse {
-  agent_id: string
-  query: string
-  results: MemorySearchResult[]
-}
-
-export function searchMemory(agentID: string, topicID: string, query: string, limit = 10): Promise<MemorySearchResponse> {
-  return fetchJson('/memory/search', {
-    method: 'POST',
-    body: JSON.stringify({ agent_id: agentID, topic_id: topicID, query, limit }),
-  })
-}
-
-export interface MemoryLevelsResponse {
-  agent_id: string
-  topic_id: string
-  total: number
-  levels: Record<string, number>
-}
-
-export function getMemoryLevels(agentID: string, topicID: string): Promise<MemoryLevelsResponse> {
-  return fetchJson(`/memory/levels?agent_id=${encodeURIComponent(agentID)}&topic_id=${encodeURIComponent(topicID)}`)
-}
-
-export interface Skill {
-  skill_id: string
-  name: string
-  description: string
-  domain: string
-  tool_ref: string
-  cost: number
-  tags: string[]
-}
-
-export interface SkillsResponse {
-  skills: Skill[]
-}
-
-export function listSkills(): Promise<SkillsResponse> {
-  return fetchJson('/skills')
-}
-
-export interface SkillSet {
-  owner_agent: string
-  domain: string
-  skills: Skill[]
-  created_at: string
-}
-
-export interface AgentSkillsResponse {
-  agent_id: string
-  skillset: SkillSet | null
-}
-
-export function getAgentSkills(agentID: string): Promise<AgentSkillsResponse> {
-  return fetchJson(`/agents/${agentID}/skills`)
-}
-
-export interface FileItem {
-  path: string
-  size: number
-  name: string
-}
-
-export interface FilesResponse {
-  session_id: string
-  files: FileItem[]
-}
-
-export function listFiles(sessionID: string): Promise<FilesResponse> {
-  return fetchJson(`/files?session=${encodeURIComponent(sessionID)}`)
-}
-
-export interface FileContentResponse {
-  path: string
-  content: string
-}
-
-export function getFileContent(path: string): Promise<FileContentResponse> {
-  return fetchJson(`/files/content?path=${encodeURIComponent(path)}`)
 }

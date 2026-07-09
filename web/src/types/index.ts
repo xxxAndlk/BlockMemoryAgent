@@ -1,3 +1,5 @@
+export type SessionStatus = 'running' | 'completed' | 'error' | 'awaiting_clarify'
+
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
@@ -7,7 +9,7 @@ export interface ChatMessage {
 export interface Session {
   id: string
   goal: string
-  status: 'running' | 'completed' | 'error' | 'awaiting_clarify'
+  status: SessionStatus
   result?: string
   started_at: string
   ended_at?: string
@@ -69,6 +71,7 @@ export interface Skill {
   skill_id: string
   name: string
   description: string
+  domain: string
   tool_ref: string
   cost: number
   tags: string[]
@@ -77,5 +80,6 @@ export interface Skill {
 export interface HealthStatus {
   name: string
   online: boolean
+  latency_ms?: number
   detail: string
 }

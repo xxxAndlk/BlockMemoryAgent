@@ -3,7 +3,26 @@ import { ref, onMounted, computed, watch, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { Session, AgentNode, TaskBoardData } from '@/types'
-import { listSessions, getSession, getSessionBoard, getSessionAgents, streamSession, getSessionMetrics, getSessionWatchdog, getSessionMailbox, getHealth, getSessionLogs, getSessionTokenMetrics, type SessionMetrics, type WatchdogDecision, type MailboxMessage, type HealthResponse, type SessionLog, type SessionTokenMetricsResponse } from '@/api/session'
+import {
+  listSessions,
+  getSession,
+  getSessionBoard,
+  getSessionAgents,
+  streamSession,
+  getSessionWatchdog,
+  getSessionMailbox,
+  getSessionLogs,
+  type WatchdogDecision,
+  type MailboxMessage,
+  type SessionLog,
+} from '@/api/session'
+import { getHealth, type HealthResponse } from '@/api/health'
+import {
+  getSessionMetrics,
+  getSessionTokenMetrics,
+  type SessionMetrics,
+  type SessionTokenMetricsResponse,
+} from '@/api/metrics'
 import ExecutionLog from './components/ExecutionLog.vue'
 import MemoryExplorer from './components/MemoryExplorer.vue'
 import SkillSet from './components/SkillSet.vue'

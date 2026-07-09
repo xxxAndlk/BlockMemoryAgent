@@ -3,7 +3,8 @@ import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { Session } from '@/types'
-import { listSessions, createSession, getTimeline, getActivity, type TimelinePoint, type ActivityItem } from '@/api/session'
+import { listSessions, createSession } from '@/api/session'
+import { getTimeline, getActivity, type TimelinePoint, type ActivityItem } from '@/api/metrics'
 
 const router = useRouter()
 const goal = ref('')
