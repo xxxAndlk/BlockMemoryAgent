@@ -3,6 +3,8 @@ package graph
 import (
 	"context"
 	"fmt"
+	"log/slog"
+
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -173,7 +175,9 @@ func (n *AssistantNode) Invoke(ctx context.Context, state *types.ThreeLayerState
 		Validated: result.Error == "",
 	}
 	if n.workspace != nil {
-		_ = n.workspace.SaveAgentOutput(ctx, state.SessionID, output)
+		if err := n.workspace.SaveAgentOutput(ctx, state.SessionID, output); err != nil {
+			slog.Debug("persist agent output failed", slog.String("session_id", state.SessionID), slog.String("agent_id", n.instID), slog.String("error", err.Error()))
+		}
 	}
 
 	// 9. 标记为完成

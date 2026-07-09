@@ -4,13 +4,14 @@ package graph
 // 具体工具实现按类别拆分（P0-3）：tool_files.go / tool_command.go / tool_http.go。
 
 import (
-	"bytes"        // marshalNoHTMLEscape buffer
-	"context"      // 上下文与超时控制
+	"bytes"         // marshalNoHTMLEscape buffer
+	"context"       // 上下文与超时控制
 	"encoding/json" // Execute 入参 JSON 摘要
-	"fmt"          // 错误格式化
-	"os"           // NewToolExecutor 回退 Getwd
+	"fmt"           // 错误格式化
+	"log/slog"      // 非致命错误调试日志
+	"os"            // NewToolExecutor 回退 Getwd
 	"path/filepath" // resolvePath
-	"time"         // 默认超时
+	"time"          // 默认超时
 
 	"github.com/blockmemory/agent/backend/internal/config"
 )
@@ -132,7 +133,11 @@ type ToolExecutor struct {
 func NewToolExecutor(workDir string) *ToolExecutor {
 	// workDir 为空时回退到进程当前目录，避免相对路径解析失败
 	if workDir == "" {
-		workDir, _ = os.Getwd()
+		if wd, err := os.Getwd(); err == nil {
+			workDir = wd
+		} else {
+			slog.Debug("tool_executor: fallback to empty workDir", slog.String("error", err.Error()))
+		}
 	}
 	e := &ToolExecutor{
 		workDir: workDir,

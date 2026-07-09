@@ -64,24 +64,20 @@ func (h *CallbackHandler) OnStart(ctx context.Context, agentID, topicID string) 
 // 副作用：同步触发 Episode 写入、快照保存与 TUI 状态广播；写入失败仅记录日志，不阻塞主路径。
 func (h *CallbackHandler) OnEnd(ctx context.Context, agentID, topicID, action, rawContent string, stepCount int) {
 	// 1. 同步写入 Episode
-	var episode *types.Episode
 	if h.writeProcessor != nil {
 		ep, err := h.writeProcessor.ProcessWithStepCount(ctx, agentID, topicID, action, rawContent, stepCount)
 		if err != nil {
 			log.Printf("[memory_write] episode_write_failed session=%s agent=%s step=%d action=%s err=%v", topicID, agentID, stepCount, action, err)
-		} else {
-			episode = ep
-			if h.broadcaster != nil {
-				h.broadcaster.BroadcastEpisode(topicID, types.EpisodePayload{
-					AgentID:    agentID,
-					StepID:     ep.StepID,
-					Importance: ep.Importance,
-					Summary:    ep.ObservationSummary,
-					Facts:      ep.Facts,
-					Timestamp:  ep.Timestamp,
-					ToolCalls:  ep.ToolCalls,
-				})
-			}
+		} else if h.broadcaster != nil {
+			h.broadcaster.BroadcastEpisode(topicID, types.EpisodePayload{
+				AgentID:    agentID,
+				StepID:     ep.StepID,
+				Importance: ep.Importance,
+				Summary:    ep.ObservationSummary,
+				Facts:      ep.Facts,
+				Timestamp:  ep.Timestamp,
+				ToolCalls:  ep.ToolCalls,
+			})
 		}
 	}
 
@@ -112,8 +108,6 @@ func (h *CallbackHandler) OnEnd(ctx context.Context, agentID, topicID, action, r
 			LastOutput:  rawContent,
 		})
 	}
-
-	_ = episode
 }
 
 // OnError 错误回调：广播 Agent 进入 ERROR 状态，便于 TUI 显著提示。

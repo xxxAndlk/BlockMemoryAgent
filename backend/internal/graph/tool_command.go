@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"runtime"
@@ -328,9 +329,13 @@ func extractPortFromCommand(cmdStr string) string {
 func killProcessTree(pid int) {
 	if runtime.GOOS == "windows" {
 		// /T 结束进程树，/F 强制结束
-		_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
+		if err := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run(); err != nil {
+			slog.Debug("kill process tree failed", slog.Int("pid", pid), slog.String("error", err.Error()))
+		}
 	} else {
-		_ = exec.Command("kill", "-9", "-"+strconv.Itoa(pid)).Run()
+		if err := exec.Command("kill", "-9", "-"+strconv.Itoa(pid)).Run(); err != nil {
+			slog.Debug("kill process tree failed", slog.Int("pid", pid), slog.String("error", err.Error()))
+		}
 	}
 }
 
