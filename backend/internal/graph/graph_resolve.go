@@ -36,64 +36,65 @@ func (g *ThreeLayerGraph) resolveInstanceNode(instID string) ThreeLayerNode {
 		return nil // 未知类型，无法构造
 	}
 
-	// 注入 ModelFactory（内含模型/工具/Runtime 依赖）
-	g.injectModelFactory(node)
-	// 注入 Progress / ToolCallback
-	g.injectProgress(node)
+	// 注入 ModelFactory / Runtime / ToolCallback / Progress / Logger
+	injectToNode[ModelFactoryReceiver](node, func(n ModelFactoryReceiver) {
+		n.SetModelFactory(g.modelFactory)
+	})
+	injectToNode[RuntimeReceiver](node, func(n RuntimeReceiver) {
+		n.SetRuntime(g.rt)
+	})
 	if g.toolCallback != nil {
-		switch n := node.(type) {
-		case *DomainAgentNode:
+		injectToNode[ToolCallbackReceiver](node, func(n ToolCallbackReceiver) {
 			n.SetToolCallback(g.toolCallback)
-		case *SubDomainAgentNode:
-			n.SetToolCallback(g.toolCallback)
-		case *AssistantNode:
-			n.SetToolCallback(g.toolCallback) // 修复 SubDomain→Assistant 路径无工具的问题
-		}
+		})
 	}
+	if g.progress != nil {
+		injectToNode[ProgressReceiver](node, func(n ProgressReceiver) {
+			n.SetProgressCallback(g.progress)
+		})
+	}
+	if g.logger != nil {
+		injectToNode[LoggerReceiver](node, func(n LoggerReceiver) {
+			n.SetLogger(g.logger)
+		})
+	}
+
 	// 注入块记忆存储（特性3）
 	g.mu.RLock()
 	bm := g.blockMemory
 	g.mu.RUnlock()
 	if bm != nil {
-		if d, ok := node.(*DomainAgentNode); ok {
-			d.SetBlockMemoryStore(bm)
-		}
+		injectToNode[BlockMemoryReceiver](node, func(n BlockMemoryReceiver) {
+			n.SetBlockMemoryStore(bm)
+		})
 	}
 	// 注入记忆回调处理器
 	g.mu.RLock()
 	memCb := g.memCallback
 	g.mu.RUnlock()
 	if memCb != nil {
-		if d, ok := node.(*DomainAgentNode); ok {
-			d.SetMemoryCallbackHandler(memCb)
-		}
-		if sd, ok := node.(*SubDomainAgentNode); ok {
-			sd.SetMemoryCallbackHandler(memCb)
-		}
+		injectToNode[MemoryCallbackReceiver](node, func(n MemoryCallbackReceiver) {
+			n.SetMemoryCallbackHandler(memCb)
+		})
 	}
 	// 注入上下文组装器
 	g.mu.RLock()
 	asm := g.assembler
 	g.mu.RUnlock()
 	if asm != nil {
-		if aNode, ok := node.(*AssistantNode); ok {
-			aNode.SetContextAssembler(asm)
-		}
+		injectToNode[ContextAssemblerReceiver](node, func(n ContextAssemblerReceiver) {
+			n.SetContextAssembler(asm)
+		})
 	}
 	// 注入快照管理器
 	g.mu.RLock()
 	sm := g.snapshotMgr
 	g.mu.RUnlock()
 	if sm != nil {
-		if d, ok := node.(*DomainAgentNode); ok {
-			d.SetAgentSnapshotManager(sm)
-		}
-		if sd, ok := node.(*SubDomainAgentNode); ok {
-			sd.SetAgentSnapshotManager(sm)
-		}
+		injectToNode[SnapshotManagerReceiver](node, func(n SnapshotManagerReceiver) {
+			n.SetAgentSnapshotManager(sm)
+		})
 	}
-	// 注入结构化日志器
-	g.injectLogger(node)
 
 	// 缓存到静态表：下次同名 ID 直接命中，避免重复构造
 	g.mu.Lock()

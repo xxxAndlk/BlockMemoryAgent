@@ -64,15 +64,9 @@ func (g *ThreeLayerGraph) SetBlockMemoryStore(s BlockMemoryStore) {
 	g.mu.Lock()
 	g.blockMemory = s
 	g.mu.Unlock()
-	for _, node := range g.nodes {
-		if d, ok := node.(*DomainAgentNode); ok {
-			d.SetBlockMemoryStore(s)
-		}
-		// MetaAgent 也注入：switchToNextBlock 幂等兜底归档用（TODO #4）
-		if m, ok := node.(*MetaAgentNode); ok {
-			m.SetBlockMemoryStore(s)
-		}
-	}
+	injectTo[BlockMemoryReceiver](g.nodes, func(n BlockMemoryReceiver) {
+		n.SetBlockMemoryStore(s)
+	})
 }
 
 // SetLogger 在已构建的图上注入结构化日志器（P1-2）。
@@ -81,16 +75,9 @@ func (g *ThreeLayerGraph) SetLogger(l *logger.Logger) {
 	g.mu.Lock()
 	g.logger = l
 	g.mu.Unlock()
-	for _, node := range g.nodes {
-		switch n := node.(type) {
-		case *MetaAgentNode:
-			n.SetLogger(l)
-		case *DomainAgentNode:
-			n.SetLogger(l)
-		case *SubDomainAgentNode:
-			n.SetLogger(l)
-		}
-	}
+	injectTo[LoggerReceiver](g.nodes, func(n LoggerReceiver) {
+		n.SetLogger(l)
+	})
 }
 
 // SetMemoryCallbackHandler 在已构建的图上注入记忆回调处理器。
@@ -99,14 +86,9 @@ func (g *ThreeLayerGraph) SetMemoryCallbackHandler(h MemoryCallbackHandler) {
 	g.mu.Lock()
 	g.memCallback = h
 	g.mu.Unlock()
-	for _, node := range g.nodes {
-		if d, ok := node.(*DomainAgentNode); ok {
-			d.SetMemoryCallbackHandler(h)
-		}
-		if sd, ok := node.(*SubDomainAgentNode); ok {
-			sd.SetMemoryCallbackHandler(h)
-		}
-	}
+	injectTo[MemoryCallbackReceiver](g.nodes, func(n MemoryCallbackReceiver) {
+		n.SetMemoryCallbackHandler(h)
+	})
 }
 
 // SetContextAssembler 在已构建的图上注入上下文组装器。
@@ -115,11 +97,9 @@ func (g *ThreeLayerGraph) SetContextAssembler(a ContextAssembler) {
 	g.mu.Lock()
 	g.assembler = a
 	g.mu.Unlock()
-	for _, node := range g.nodes {
-		if aNode, ok := node.(*AssistantNode); ok {
-			aNode.SetContextAssembler(a)
-		}
-	}
+	injectTo[ContextAssemblerReceiver](g.nodes, func(n ContextAssemblerReceiver) {
+		n.SetContextAssembler(a)
+	})
 }
 
 // SetEpisodeCompressor 在已构建的图上注入 Episode 压缩器。
@@ -128,11 +108,9 @@ func (g *ThreeLayerGraph) SetEpisodeCompressor(c EpisodeCompressor) {
 	g.mu.Lock()
 	g.compressor = c
 	g.mu.Unlock()
-	for _, node := range g.nodes {
-		if m, ok := node.(*MetaAgentNode); ok {
-			m.SetEpisodeCompressor(c)
-		}
-	}
+	injectTo[EpisodeCompressorReceiver](g.nodes, func(n EpisodeCompressorReceiver) {
+		n.SetEpisodeCompressor(c)
+	})
 }
 
 // SetAgentSnapshotManager 在已构建的图上注入 Agent 快照管理器。
@@ -141,14 +119,9 @@ func (g *ThreeLayerGraph) SetAgentSnapshotManager(s AgentSnapshotManager) {
 	g.mu.Lock()
 	g.snapshotMgr = s
 	g.mu.Unlock()
-	for _, node := range g.nodes {
-		if d, ok := node.(*DomainAgentNode); ok {
-			d.SetAgentSnapshotManager(s)
-		}
-		if sd, ok := node.(*SubDomainAgentNode); ok {
-			sd.SetAgentSnapshotManager(s)
-		}
-	}
+	injectTo[SnapshotManagerReceiver](g.nodes, func(n SnapshotManagerReceiver) {
+		n.SetAgentSnapshotManager(s)
+	})
 }
 
 // ThreeLayerGraphBuilder 三层图构建器。
@@ -211,9 +184,9 @@ func (g *ThreeLayerGraph) SetProgressCallback(cb ProgressCallback) {
 	g.progress = cb
 	g.mu.Unlock()
 	// 同步给已存在的静态节点
-	for _, node := range g.nodes {
-		g.injectProgress(node) // injectProgress 内部自行获取读锁
-	}
+	injectTo[ProgressReceiver](g.nodes, func(n ProgressReceiver) {
+		n.SetProgressCallback(cb)
+	})
 }
 
 // Progress 暴露进度回调（节点内部用）。
@@ -257,92 +230,35 @@ func (b *ThreeLayerGraphBuilder) Build() *ThreeLayerGraph {
 		logger:       b.logger,
 	}
 
-	// 为已有节点注入 ModelFactory / Runtime / Progress / Logger
+	// 为已有节点注入 ModelFactory / Runtime / Progress / Logger / ToolCallback
 	// 动态节点（DomainAgent 等）在 resolveInstanceNode 时单独注入
-	for _, node := range g.nodes {
-		g.injectModelFactory(node) // 模型工厂 + 工具回调 + Runtime
-		g.injectProgress(node)     // 进度回调
-		g.injectLogger(node)       // 结构化日志器
+	if g.modelFactory != nil {
+		injectTo[ModelFactoryReceiver](g.nodes, func(n ModelFactoryReceiver) {
+			n.SetModelFactory(g.modelFactory)
+		})
+	}
+	if g.rt != nil {
+		injectTo[RuntimeReceiver](g.nodes, func(n RuntimeReceiver) {
+			n.SetRuntime(g.rt)
+		})
+	}
+	if g.toolCallback != nil {
+		injectTo[ToolCallbackReceiver](g.nodes, func(n ToolCallbackReceiver) {
+			n.SetToolCallback(g.toolCallback)
+		})
+	}
+	if g.logger != nil {
+		injectTo[LoggerReceiver](g.nodes, func(n LoggerReceiver) {
+			n.SetLogger(g.logger)
+		})
+	}
+	if g.progress != nil {
+		injectTo[ProgressReceiver](g.nodes, func(n ProgressReceiver) {
+			n.SetProgressCallback(g.progress)
+		})
 	}
 
 	return g
-}
-
-// injectLogger 向节点注入结构化日志器。
-// 仅对 MetaAgent / DomainAgent / SubDomainAgent 三类节点生效。
-// 并发安全：读 logger 时持读锁。
-func (g *ThreeLayerGraph) injectLogger(node ThreeLayerNode) {
-	g.mu.RLock()
-	l := g.logger
-	g.mu.RUnlock()
-	if l == nil {
-		return
-	}
-	switch n := node.(type) {
-	case *MetaAgentNode:
-		n.SetLogger(l)
-	case *DomainAgentNode:
-		n.SetLogger(l)
-	case *SubDomainAgentNode:
-		n.SetLogger(l)
-	}
-}
-
-// injectProgress 向节点注入进度回调。
-// 仅对 MetaAgent / DomainAgent / SubDomainAgent 三类节点生效；
-// Assistant 节点不需要进度回调（其进度由父 Domain 上报）。
-// 并发安全：读 progress 时持读锁。
-func (g *ThreeLayerGraph) injectProgress(node ThreeLayerNode) {
-	g.mu.RLock()
-	cb := g.progress
-	g.mu.RUnlock()
-	if cb == nil {
-		return // 未配置回调，跳过
-	}
-	switch n := node.(type) {
-	case *MetaAgentNode:
-		n.SetProgressCallback(cb)
-	case *DomainAgentNode:
-		n.SetProgressCallback(cb)
-	case *SubDomainAgentNode:
-		n.SetProgressCallback(cb)
-	}
-}
-
-// injectModelFactory 为节点注入模型工厂、工具回调、运行时。
-// 三类依赖按节点类型选择性注入：
-//   - ModelFactory：Meta/Domain/SubDomain 都需要用来生成 LLM 客户端。
-//   - ToolCallback：仅 Domain/SubDomain 需要工具执行回调。
-//   - Runtime：仅 Meta/Domain 需要（Watchdog/看板只在两层调度者上启用）。
-func (g *ThreeLayerGraph) injectModelFactory(node ThreeLayerNode) {
-	if g.modelFactory != nil {
-		switch n := node.(type) {
-		case *MetaAgentNode:
-			n.SetModelFactory(g.modelFactory)
-		case *DomainAgentNode:
-			n.SetModelFactory(g.modelFactory)
-		case *SubDomainAgentNode:
-			n.SetModelFactory(g.modelFactory)
-		}
-	}
-	if g.toolCallback != nil {
-		switch n := node.(type) {
-		case *DomainAgentNode:
-			n.SetToolCallback(g.toolCallback)
-		case *SubDomainAgentNode:
-			n.SetToolCallback(g.toolCallback)
-		}
-	}
-	if g.rt != nil {
-		switch n := node.(type) {
-		case *MetaAgentNode:
-			n.SetRuntime(g.rt) // MetaAgent 用 Runtime 跑 Watchdog / 处理 Mailbox
-		case *DomainAgentNode:
-			n.SetRuntime(g.rt) // DomainAgent 用 Runtime 查看板 / 收邮件
-		case *SubDomainAgentNode:
-			n.SetRuntime(g.rt) // SubDomainAgent 用 Runtime 读取 AgentCfg 动态参数
-		}
-	}
 }
 
 // Runtime 暴露 Runtime（server 层使用）。
@@ -358,11 +274,9 @@ func (g *ThreeLayerGraph) SetToolCallback(cb ToolCallback) {
 	g.mu.Lock()
 	g.toolCallback = cb
 	// 传播到预注册的 MetaAgent 节点（动态构造的 Domain/SubDomain/Assistant 在 resolveInstanceNode 时注入）
-	for _, node := range g.nodes {
-		if m, ok := node.(*MetaAgentNode); ok {
-			m.SetToolCallback(cb)
-		}
-	}
+	injectTo[ToolCallbackReceiver](g.nodes, func(n ToolCallbackReceiver) {
+		n.SetToolCallback(cb)
+	})
 	g.mu.Unlock()
 }
 
