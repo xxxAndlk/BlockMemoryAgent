@@ -118,27 +118,38 @@ func (n *DomainAgentNode) InstanceID() string {
 //
 // 副作用：更新实例状态；修改 state.ActiveBlocks、NextAction。
 func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	// 1. 取出本实例；不存在则直接报错
+	inst, err := n.prepareContext(ctx, state)
+	if err != nil {
+		return nil, err
+	}
+
+	pendingTasks, done, err := n.analyzeAndPlan(ctx, state, inst)
+	if done {
+		return state, err
+	}
+
+	results := n.dispatchAndCollect(ctx, state, inst, pendingTasks)
+	return n.finalizeBlock(ctx, state, inst, results)
+}
+
+// prepareContext 负责 DomainAgent 启动阶段的上下文准备：
+// 实例校验、状态广播、Watchdog、记忆回调/快照加载、Skill 装配、块记忆召回。
+func (n *DomainAgentNode) prepareContext(ctx context.Context, state *types.ThreeLayerState) (*types.RoleInstance, error) {
 	inst := n.registry.GetInstance(n.instID)
 	if inst == nil {
-		// 实例已被清理或路由错误
 		if n.memCallback != nil {
 			n.memCallback.OnError(ctx, n.instID, state.SessionID, fmt.Errorf("domain agent instance %s not found", n.instID))
 		}
 		return nil, fmt.Errorf("domain agent instance %s not found", n.instID)
 	}
 
-	// 2. 推送启动事件并标记实例活跃
 	n.emit(ctx, "think", fmt.Sprintf("DomainAgent 启动，领域目标: %s", state.DomainGoal))
 	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusActive)
 
-	// 2.1 DomainAgent 侧 Watchdog：用真实 LLM token 总量评估上下文规模。
-	// MetaAgent 的 runWatchdog 只看 block.TaskResults 文本，严重低估实际上下文
-	// （塔防 demo 事故中从未触发压缩）。DomainAgent 持有自己的 llmTracker，
-	// TokenTotals() = 累计 input+output，是真实上下文消耗的代理。
+	// DomainAgent 侧 Watchdog：用真实 LLM token 总量评估上下文规模。
 	n.runDomainWatchdog(ctx, state)
 
-	// 2.5 记忆回调：广播 DomainAgent 进入 ACTIVE，并尝试加载历史快照
+	// 记忆回调：广播 DomainAgent 进入 ACTIVE，并尝试加载历史快照
 	if n.memCallback != nil {
 		n.memCallback.OnStart(ctx, n.instID, state.SessionID)
 	}
@@ -149,25 +160,19 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		}
 	}
 
-	// 3. v3 §5：为本 DomainAgent 装配领域 Skill 子集（如未装配）
+	// 装配领域 Skill 子集（如未装配）
 	n.ensureSkillSet(ctx, inst, state)
-	// 装配后把 Skill ID 列表推给 UI，便于观察可见技能
 	if n.rt != nil && n.rt.Skills != nil {
-		// 取本实例已绑定的 SkillSet
 		if set := n.rt.Skills.GetForAgent(n.instID); set != nil && len(set.Skills) > 0 {
-			// 收集所有 Skill ID 用于事件展示
 			ids := make([]string, 0, len(set.Skills))
 			for _, s := range set.Skills {
 				ids = append(ids, s.SkillID)
 			}
-			// 推送装配结果到 UI
 			n.emit(ctx, "think", "已装配 Skill 子集: "+strings.Join(ids, ", "))
 		}
 	}
 
-	// 3.5 特性3：检索相似块记忆，注入 analyzeTasks 作为上下文
-	// 用 DomainGoal 做查询，取 topK=3；命中结果在 analyzeTasks prompt 里拼成"参考段"
-	// 让 LLM 知晓过往类似领域已做过的任务，避免重复劳动或漏掉关键步骤
+	// 检索相似块记忆，注入 analyzeTasks 作为上下文
 	n.recalledMemory = ""
 	n.recallAttempted = false
 	if n.blockMemory != nil {
@@ -197,50 +202,47 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		}
 	}
 
-	// 4. 拆解子任务（LLM 优先，规则回退）
+	return inst, nil
+}
+
+// analyzeAndPlan 拆解任务、生成计划、处理子领域拆分，并返回待处理任务列表。
+// 若返回 done==true，表示当前调用已直接终了（块缺失 / 子领域拆分 / 无待处理任务），调用方应直接返回 state。
+func (n *DomainAgentNode) analyzeAndPlan(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance) (pendingTasks []string, done bool, err error) {
 	tasks := n.analyzeTasks(ctx, state)
 
-	// 5. 取出当前会话块；不存在则直接继续图循环
 	block := state.ActiveBlocks[state.CurrentBlockID]
 	if block == nil {
-		// 块缺失，交回 MetaAgent 决策
 		state.NextAction = enums.ActionContinue
 		n.finish(ctx, state)
-		return state, nil
+		return nil, true, nil
 	}
-	// R8: 启动时合并会话级 MetaMemory，避免跨域失忆
+
 	mergeSessionMetaMemory(state, block)
-	// R7: 消费其他块通过 Mailbox 发来的跨域通知，注入块记忆
 	applyMailboxToBlock(state, block, n.rt, n.instID)
-	// 懒初始化 TaskResults
 	if block.TaskResults == nil {
 		block.TaskResults = make(map[string]string)
 	}
 
-	// 5.5 Plan-and-Execute（TODO #1）：多任务且启用时生成结构化计划，按步骤派发
-	//     仅在尚未生成计划时生成（断点续行时不重复生成）；解析失败回退为原 tasks（零回归）
+	// Plan-and-Execute：多任务且启用时生成结构化计划
 	if block.Plan == nil && planEnabledFromRT(n.rt) && len(tasks) > 1 {
 		block.Plan = n.generatePlan(ctx, state, tasks)
 	}
 
-	// 6. 判断是否需要拆分为子领域（自适应：仅 state.EnableSubdomain 且跨子领域边界）
+	// 判断是否需要拆分为子领域（当前默认禁用）
 	if n.shouldSplitToSubDomains(ctx, state, tasks) {
 		n.emit(ctx, "intend", fmt.Sprintf("领域较复杂（%d 个子任务），拆分为子领域并行处理", len(tasks)))
-		state, err := n.handleSubDomainSplit(ctx, state, inst)
-		if err == nil {
-			n.finish(ctx, state)
+		newState, splitErr := n.handleSubDomainSplit(ctx, state, inst)
+		if splitErr == nil {
+			n.finish(ctx, newState)
 		}
-		return state, err
+		return nil, true, splitErr
 	}
 
-	// 7. 确定待处理任务列表：有 Plan 时用计划的未完成步骤，否则过滤原 tasks（支持断点续跑）
-	var pendingTasks []string
+	// 确定待处理任务列表
 	if block.Plan != nil {
-		// Plan-and-Execute：用计划的未完成步骤目标
 		pendingTasks = block.Plan.PendingGoals()
 	} else {
 		for _, task := range tasks {
-			// 结果已存在则跳过，支持断点续跑
 			if _, done := block.TaskResults[task]; done {
 				continue
 			}
@@ -248,36 +250,34 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		}
 	}
 
-	// 8. 无待处理任务：汇总结果、标记完成、继续图循环
+	// 无待处理任务：汇总结果、标记完成
 	if len(pendingTasks) == 0 {
 		n.emit(ctx, "think", "所有子任务已完成，汇总结果")
-		n.summarizeResults(state)                                       // 汇总写入 state.Reason
-		n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone) // 标记实例完成
-		block.Status = enums.BlockStatusCompleted                       // 标记块完成
-		state.NextAction = enums.ActionContinue                         // 交回 MetaAgent
+		n.summarizeResults(state)
+		n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone)
+		block.Status = enums.BlockStatusCompleted
+		state.NextAction = enums.ActionContinue
 		n.finish(ctx, state)
-		return state, nil
+		return nil, true, nil
 	}
 
-	// 9. 串行派发助手执行待处理任务
+	return pendingTasks, false, nil
+}
+
+// dispatchAndCollect 串行派发助手执行待处理任务，并将结果合并到 block。
+func (n *DomainAgentNode) dispatchAndCollect(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, pendingTasks []string) map[string]*types.AgentResult {
 	n.emit(ctx, "intend", fmt.Sprintf("派发 %d 个助手任务（串行）: %s", len(pendingTasks), strings.Join(pendingTasks, "; ")))
-	// 串行执行：子任务间常有依赖（如"启动游戏"依赖"写代码"），并行会导致后续任务找不到文件。
 	results := n.dispatchAssistantsSerial(ctx, state, inst, pendingTasks)
 
-	// 10. 合并结果到 block.TaskResults 与 block.MetaMemory（P0-1）
+	block := state.ActiveBlocks[state.CurrentBlockID]
 	if block.TaskResults == nil {
 		block.TaskResults = make(map[string]string)
 	}
-	var combinedSummary []string
-	var combinedMemory []string
 	for task, result := range results {
 		if result == nil {
 			continue
 		}
-		// SummaryForUser 写入块结果（兼容旧路径）
 		block.TaskResults[task] = result.SummaryForUser
-		combinedSummary = append(combinedSummary, fmt.Sprintf("%s: %s", task, result.SummaryForUser))
-		// MemoryForMeta 归档到块记忆
 		if result.MemoryForMeta != "" {
 			block.MetaMemory = append(block.MetaMemory, types.MetaMemoryEntry{
 				Timestamp: time.Now(),
@@ -285,9 +285,7 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 				Content:   result.MemoryForMeta,
 				Tags:      []string{"summary"},
 			})
-			combinedMemory = append(combinedMemory, result.MemoryForMeta)
 		}
-		// Facts 归档
 		for _, fact := range result.Facts {
 			if strings.TrimSpace(fact) == "" {
 				continue
@@ -301,9 +299,27 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 		}
 	}
 
-	// 11. 生成本块 AgentResult 并汇总结果、标记完成、继续图循环（交回 MetaAgent 决策下一步）
+	return results
+}
+
+// finalizeBlock 构建块结果、执行可选自测、记录日志并标记完成。
+func (n *DomainAgentNode) finalizeBlock(ctx context.Context, state *types.ThreeLayerState, inst *types.RoleInstance, results map[string]*types.AgentResult) (*types.ThreeLayerState, error) {
+	block := state.ActiveBlocks[state.CurrentBlockID]
+
+	var combinedSummary []string
+	var combinedMemory []string
+	for task, result := range results {
+		if result == nil {
+			continue
+		}
+		combinedSummary = append(combinedSummary, fmt.Sprintf("%s: %s", task, result.SummaryForUser))
+		if result.MemoryForMeta != "" {
+			combinedMemory = append(combinedMemory, result.MemoryForMeta)
+		}
+	}
+
 	block.Result = buildBlockResult(inst.Domain, block, combinedSummary, combinedMemory)
-	n.summarizeResults(state) // 汇总写入 state.Reason
+	n.summarizeResults(state)
 
 	// P3-2：领域级自测（默认关闭）
 	if n.rt != nil && n.rt.AgentCfg != nil && n.rt.AgentCfg.DomainSelfTestEnabled && block.Result != nil && block.Result.Error == "" {
@@ -335,9 +351,9 @@ func (n *DomainAgentNode) Invoke(ctx context.Context, state *types.ThreeLayerSta
 			"summary": state.Reason,
 		})
 	}
-	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone) // 标记实例完成
-	block.Status = enums.BlockStatusCompleted                       // 标记块完成
-	state.NextAction = enums.ActionContinue                         // 交回 MetaAgent
+	n.registry.UpdateInstanceStatus(n.instID, enums.RoleStatusDone)
+	block.Status = enums.BlockStatusCompleted
+	state.NextAction = enums.ActionContinue
 	n.finish(ctx, state)
 	return state, nil
 }
