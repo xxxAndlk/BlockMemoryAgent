@@ -1,9 +1,10 @@
 package config
 
 import (
-	"fmt"     // 用于包装和格式化错误信息
-	"os"      // 用于读取配置文件与获取环境变量
-	"strings" // 用于字符串切分、裁剪等处理
+	"fmt"           // 用于包装和格式化错误信息
+	"os"            // 用于读取配置文件与获取环境变量
+	"path/filepath" // 用于定位同目录下的拆分配置文件
+	"strings"       // 用于字符串切分、裁剪等处理
 
 	"gopkg.in/yaml.v3" // YAML 解析库，用于反序列化 config.yaml
 )
@@ -188,7 +189,8 @@ type MemoryConfig struct {
 }
 
 // Load 从指定路径读取 YAML 配置文件并构造 *Config。
-// 职责：读取文件 → 反序列化为 Config → 填充默认值 → 解析环境变量引用。
+// 职责：读取文件 → 反序列化为 Config → 合并同目录下的 infrastructure.yaml / agent-policy.yaml
+// （如果存在）→ 填充默认值 → 解析环境变量引用。
 // 参数：path 为 config.yaml 的文件路径。
 // 返回：填充完成的 *Config；任一阶段失败均返回包装后的 error。
 // 副作用：仅读取文件系统与进程环境变量，不修改它们。
@@ -200,11 +202,39 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	// 创建空 Config 实例，准备接收 YAML 反序列化结果
-	cfg := &Config{}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		// YAML 语法错误时包装并返回
+	// 先以通用 map 加载主配置，便于与拆分配置做深度合并
+	raw := map[string]any{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	// 若同目录存在 infrastructure.yaml / agent-policy.yaml，则按深度合并方式叠加上去。
+	// 拆分文件中的同名字段覆盖主配置，新增字段追加；config.yaml 本身保留完整内容时仍可独立使用。
+	dir := filepath.Dir(path)
+	for _, name := range []string{"infrastructure.yaml", "agent-policy.yaml"} {
+		extraPath := filepath.Join(dir, name)
+		extraData, err := os.ReadFile(extraPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		extra := map[string]any{}
+		if err := yaml.Unmarshal(extraData, &extra); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", name, err)
+		}
+		mergeMap(raw, extra)
+	}
+
+	// 将合并后的通用 map 反序列化为 Config 结构体
+	merged, err := yaml.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("marshal merged config: %w", err)
+	}
+	cfg := &Config{}
+	if err := yaml.Unmarshal(merged, cfg); err != nil {
+		return nil, fmt.Errorf("parse merged config: %w", err)
 	}
 
 	// 为零值字段填充默认值，保证运行参数始终可用
@@ -214,6 +244,25 @@ func Load(path string) (*Config, error) {
 	// 将 ${VAR:default} 形式的引用替换为真实环境变量值
 	cfg.resolveEnvVars()
 	return cfg, nil
+}
+
+// mergeMap 将 src 深度合并到 dst 中。
+// 对于同名的 map 键递归合并；否则 src 的值覆盖 dst 的值。
+func mergeMap(dst, src map[string]any) {
+	for k, sv := range src {
+		dv, ok := dst[k]
+		if !ok {
+			dst[k] = sv
+			continue
+		}
+		dm, dOk := dv.(map[string]any)
+		sm, sOk := sv.(map[string]any)
+		if dOk && sOk {
+			mergeMap(dm, sm)
+		} else {
+			dst[k] = sv
+		}
+	}
 }
 
 // applyDefaults 为 Config 中所有零值字段填充合理的默认值。

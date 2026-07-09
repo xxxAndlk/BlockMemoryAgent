@@ -1,0 +1,43 @@
+# BlockMemoryAgent Agent 策略配置
+#
+# 本文件包含 Agent 运行时策略配置：记忆管线参数与 Agent 行为参数。
+# 启动时 config.Load 会将其与 infrastructure.yaml 合并到 config.yaml 之上，
+# 因此本文件中的字段会覆盖 config.yaml 中的同名配置。
+
+# 记忆系统配置
+memory:
+  write_batch_size: 100
+  write_flush_interval: 5  # 秒
+  snapshot_interval: 300  # 秒
+
+# Agent 运行时动态参数（替代散落在 graph 包中的硬编码常量）
+agent:
+  # —— Graph 死循环防护（三层防御，替代硬步数上限）——
+  stall_steps: 30                # 无进展步数阈值：连续 N 步状态指纹无变化 → 判死循环
+  max_repeat_fingerprint: 3      # 状态指纹重复阈值：同一指纹连续出现 N 次 → 判死循环
+  session_timeout_min: 240       # 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
+  skill_set_size: 8              # 每个 DomainAgent 装配的 Skill 子集上限
+  tool_call_max_rounds: 100      # Assistant ReAct 工具调用循环最大轮数（含循环检测提前退出）
+  retry_count: 3                 # Assistant 任务指数退避重试次数
+  retry_backoff_ms: 100          # 重试初始退避时长（毫秒）
+  llm_soft_timeout_sec: 30       # LLM 软超时（建议取消）
+  llm_hard_timeout_sec: 90       # LLM 硬超时（强制取消）
+  context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
+  snapshot_summary_count: 20     # 私有快照保留的最近 Episode 摘要条数（默认 20）
+  snapshot_open_issue_threshold: 0.7 # 未决问题重要性阈值（默认 0.7）
+  summary_max_runes: 400         # Episode 摘要最大 rune 数（默认 400）
+  fact_max_sentences: 5          # 事实提取最大句数（默认 5）
+  compress_importance_threshold: 0.7 # 压缩保留 Raw 的重要性阈值（默认 0.7）
+  compress_age_hours: 24         # 压缩保留 Raw 的最大年龄（小时，默认 24）
+  # 以下特性保留代码但默认关闭（P1-3：TODO 暂不做）
+  interrupt_enabled: false       # 抢占中断（默认关闭）
+  queue_inject_enabled: false    # 队列注入（默认关闭）
+  human_clarify_enabled: false   # 人机对话（默认关闭）
+  dag_enabled: false             # DAG 定时任务调度（默认关闭）
+  plan_enabled: false            # Plan-and-Execute（默认关闭）
+  reflection_enabled: false      # Self-Reflection（默认关闭）
+  human_clarify_timeout_sec: 120 # 等待用户回答超时（秒）
+  # 工具沙箱（安全）
+  tool_sandbox_disabled: false   # true 时关闭写路径逃逸检测（保留命令黑名单）
+  tool_sandbox_allowed_paths: [] # 允许读写的额外绝对路径白名单
+  tool_sandbox_blocked_cmds: []  # 追加到默认命令黑名单的额外命令
