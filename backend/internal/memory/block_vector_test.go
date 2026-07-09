@@ -37,7 +37,10 @@ func TestToKnowledgeRecordFacts(t *testing.T) {
 		},
 		CreatedAt: time.Now(),
 	}
-	kr := rec.ToKnowledgeRecord(768)
+	kr, err := rec.ToKnowledgeRecord(context.Background(), nil, 768)
+	if err != nil {
+		t.Fatalf("ToKnowledgeRecord 失败: %v", err)
+	}
 	if kr.Meta["facts"] == "" {
 		t.Fatalf("facts 应被序列化写入 meta")
 	}
@@ -47,7 +50,7 @@ func TestToKnowledgeRecordFacts(t *testing.T) {
 }
 
 func TestKnowledgeToBlockMemoryParsesFacts(t *testing.T) {
-	rec := (&BlockMemoryRecord{
+	rec, err := (&BlockMemoryRecord{
 		SessionID: "s1",
 		Domain:    "frontend",
 		Goal:      "修复 CSS",
@@ -57,7 +60,10 @@ func TestKnowledgeToBlockMemoryParsesFacts(t *testing.T) {
 			{Key: "global_key", Value: "vue3", Scope: FactScopeGlobal},
 		},
 		CreatedAt: time.Now(),
-	}).ToKnowledgeRecord(768)
+	}).ToKnowledgeRecord(context.Background(), nil, 768)
+	if err != nil {
+		t.Fatalf("ToKnowledgeRecord 失败: %v", err)
+	}
 
 	out := knowledgeToBlockMemory(rec)
 	if out == nil {
@@ -72,7 +78,7 @@ func TestKnowledgeToBlockMemoryParsesFacts(t *testing.T) {
 }
 
 func TestSearchBlockMemoryScopeFilter(t *testing.T) {
-	rec := (&BlockMemoryRecord{
+	rec, err := (&BlockMemoryRecord{
 		SessionID: "s1",
 		Domain:    "frontend",
 		Goal:      "修复 CSS",
@@ -83,7 +89,10 @@ func TestSearchBlockMemoryScopeFilter(t *testing.T) {
 			{Key: "stack", Value: "vue3", Scope: FactScopeGlobal},
 		},
 		CreatedAt: time.Now(),
-	}).ToKnowledgeRecord(768)
+	}).ToKnowledgeRecord(context.Background(), nil, 768)
+	if err != nil {
+		t.Fatalf("ToKnowledgeRecord 失败: %v", err)
+	}
 
 	fs := &fakeSearcher{records: []*types.KnowledgeRecord{rec}, dim: 768}
 	out, err := SearchBlockMemory(context.Background(), fs, "frontend", "修复 CSS", 5)

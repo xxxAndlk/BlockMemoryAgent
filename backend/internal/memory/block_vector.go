@@ -51,27 +51,42 @@ type BlockMemoryRecord struct {
 
 // ToKnowledgeRecord 把块记忆转为 global_knowledge 表记录。
 // Content 拼装为可读文本，便于检索后直接注入 prompt；facts 以 JSON 数组存入 meta。
-func (r *BlockMemoryRecord) ToKnowledgeRecord(dim int) *types.KnowledgeRecord {
+// 向量由注入的 embedder 生成；embedder 为 nil 时回退到 embed.PseudoEmbed，保持旧行为兼容。
+func (r *BlockMemoryRecord) ToKnowledgeRecord(ctx context.Context, embedder embed.Embedder, dim int) (*types.KnowledgeRecord, error) {
 	content := strings.Join([]string{
 		"领域:", r.Domain,
 		"目标:", r.Goal,
 		"结果:", r.Summary,
 	}, "\n")
-	factsJSON, _ := json.Marshal(r.Facts)
+	factsJSON, err := json.Marshal(r.Facts)
+	if err != nil {
+		return nil, fmt.Errorf("marshal facts: %w", err)
+	}
 	meta := map[string]any{
 		"session_id": r.SessionID,
 		"domain":     r.Domain,
 		"goal":       r.Goal,
 		"facts":      string(factsJSON),
 	}
+
+	var embedding []float32
+	if embedder != nil {
+		embedding, err = embedder.Embed(ctx, content)
+		if err != nil {
+			return nil, fmt.Errorf("embed content: %w", err)
+		}
+	} else {
+		embedding = embed.PseudoEmbed(content, dim)
+	}
+
 	return &types.KnowledgeRecord{
 		KnowledgeType: enums.KnowledgeTypeBlockMemory,
 		TopicID:       r.SessionID,
 		Content:       content,
-		Embedding:     embed.PseudoEmbed(content, dim),
+		Embedding:     embedding,
 		Meta:          meta,
 		CreatedAt:     r.CreatedAt,
-	}
+	}, nil
 }
 
 // BlockMemorySearcher 提供按类型+domain 过滤的向量检索能力。

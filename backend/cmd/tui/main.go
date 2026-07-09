@@ -21,6 +21,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
+	"github.com/blockmemory/agent/backend/internal/embed"
 	"github.com/blockmemory/agent/backend/internal/graph"
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/logging"
@@ -114,6 +115,12 @@ func main() {
 		log.Fatalf("load roles: %v", err)
 	}
 
+	embedder, err := embed.NewEmbedder(roleCfg.Embed, cfg.PgVector.Dimensions)
+	if err != nil {
+		log.Fatalf("create embedder: %v", err)
+	}
+	pgStore.SetEmbedder(embedder)
+
 	modelFactory := model.NewModelFactory(roleCfg)
 	if err := modelFactory.WarmUp(ctx); err != nil {
 		log.Fatalf("warmup models: %v", err)
@@ -171,7 +178,7 @@ func main() {
 	sessionMgr.SetModelFactory(modelFactory) // 注入模型工厂，续话时调轻量模型总结历史
 
 	// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
-	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, dim: cfg.PgVector.Dimensions})
+	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, embedder: embedder, dim: cfg.PgVector.Dimensions})
 
 	var dagScheduler *dag.Scheduler
 	if cfg.Agent.DAGEnabled {
@@ -303,8 +310,9 @@ func (s *sinkerNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (
 }
 
 type pgBlockMemoryAdapter struct {
-	pg  *store.PostgresStore
-	dim int
+	pg       *store.PostgresStore
+	embedder embed.Embedder
+	dim      int
 }
 
 func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string, facts []graph.BlockMemoryFact) error {
@@ -312,14 +320,17 @@ func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, d
 	for _, f := range facts {
 		memFacts = append(memFacts, memory.Fact{Key: f.Key, Value: f.Value, Scope: memory.FactScope(f.Scope)})
 	}
-	rec := (&memory.BlockMemoryRecord{
+	rec, err := (&memory.BlockMemoryRecord{
 		SessionID: sessionID,
 		Domain:    domain,
 		Goal:      goal,
 		Summary:   summary,
 		Facts:     memFacts,
 		CreatedAt: time.Now(),
-	}).ToKnowledgeRecord(a.dim)
+	}).ToKnowledgeRecord(ctx, a.embedder, a.dim)
+	if err != nil {
+		return fmt.Errorf("convert block memory: %w", err)
+	}
 	return a.pg.SaveKnowledge(ctx, rec)
 }
 
