@@ -17,10 +17,11 @@ export interface Session {
   messages: ChatMessage[]
 }
 
-export interface SessionEvent {
+export interface BaseSessionEvent {
   type: string
   agent: string
   message: string
+  timestamp: string
   kind?: string
   tool?: string
   tool_path?: string
@@ -28,11 +29,80 @@ export interface SessionEvent {
   tool_error?: string
   tool_args?: string
   success?: boolean
-  timestamp: string
   prompt?: string
   input_tokens?: number
   output_tokens?: number
   detail_json?: string
+}
+
+export interface UserMessageEvent extends BaseSessionEvent {
+  type: 'user_message'
+}
+
+export interface ToolCallEvent extends BaseSessionEvent {
+  type: 'tool_call'
+  kind: 'tool_call'
+}
+
+export interface ToolExecEvent extends BaseSessionEvent {
+  type: 'tool_exec'
+}
+
+export interface LLMEvent extends BaseSessionEvent {
+  kind: 'llm' | 'llm_result' | 'llm_response' | 'think' | 'intend' | 'prompt' | 'agent_done' | 'wait' | 'graph_step'
+}
+
+export interface ErrorEvent extends BaseSessionEvent {
+  type: 'error'
+  kind?: 'error'
+}
+
+export interface TokenUsageEvent extends BaseSessionEvent {
+  kind: 'token_usage'
+}
+
+export type SessionEvent =
+  | UserMessageEvent
+  | ToolCallEvent
+  | ToolExecEvent
+  | LLMEvent
+  | ErrorEvent
+  | TokenUsageEvent
+  | BaseSessionEvent
+
+export function isUserMessageEvent(ev: SessionEvent): ev is UserMessageEvent {
+  return ev.type === 'user_message'
+}
+
+export function isToolCallEvent(ev: SessionEvent): ev is ToolCallEvent {
+  return ev.type === 'tool_call' || ev.kind === 'tool_call'
+}
+
+export function isToolExecEvent(ev: SessionEvent): ev is ToolExecEvent {
+  return ev.type === 'tool_exec'
+}
+
+export function isLLMEvent(ev: SessionEvent): ev is LLMEvent {
+  const kinds = new Set([
+    'llm',
+    'llm_result',
+    'llm_response',
+    'think',
+    'intend',
+    'prompt',
+    'agent_done',
+    'wait',
+    'graph_step',
+  ])
+  return !!(ev.kind && kinds.has(ev.kind))
+}
+
+export function isErrorEvent(ev: SessionEvent): ev is ErrorEvent {
+  return ev.type === 'error' || ev.kind === 'error' || ev.success === false
+}
+
+export function isTokenUsageEvent(ev: SessionEvent): ev is TokenUsageEvent {
+  return ev.kind === 'token_usage'
 }
 
 export interface AgentNode {

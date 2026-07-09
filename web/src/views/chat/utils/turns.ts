@@ -1,12 +1,19 @@
 import type { SessionEvent } from '@/types'
+import {
+  isUserMessageEvent,
+  isToolCallEvent,
+  isToolExecEvent,
+  isTokenUsageEvent,
+  isErrorEvent,
+} from '@/types'
 
 /** 一次工具调用：把 tool_call (intent) + tool_exec (结果) 配对 */
 export interface ToolCallGroup {
   id: string
   tool: string
   agent: string
-  call?: SessionEvent     // kind === 'tool_call'
-  result?: SessionEvent   // type === 'tool_exec'
+  call?: SessionEvent // kind === 'tool_call'
+  result?: SessionEvent // type === 'tool_exec'
   success: boolean
   pending: boolean
 }
@@ -14,8 +21,8 @@ export interface ToolCallGroup {
 /** 回合内一个按时间顺序的步骤：要么是一段思考，要么是一次工具调用 */
 export interface TurnStep {
   kind: 'think' | 'tool'
-  event?: SessionEvent    // think 步骤对应的事件
-  group?: ToolCallGroup   // tool 步骤对应的工具调用组
+  event?: SessionEvent // think 步骤对应的事件
+  group?: ToolCallGroup // tool 步骤对应的工具调用组
 }
 
 /** 一个对话回合：用户消息 → 助手处理过程 → 最终答案 */
@@ -24,8 +31,8 @@ export interface Turn {
   userMessage?: SessionEvent
   /** 按时间交错的步骤序列，保留 ReAct 时序（思考↔工具↔结果↔下一轮思考） */
   steps: TurnStep[]
-  thinkChain: SessionEvent[]   // 兼容字段：所有思考事件扁平集合
-  toolCalls: ToolCallGroup[]   // 兼容字段：所有工具调用组
+  thinkChain: SessionEvent[] // 兼容字段：所有思考事件扁平集合
+  toolCalls: ToolCallGroup[] // 兼容字段：所有工具调用组
   errors: SessionEvent[]
   clarifyQuestion?: SessionEvent
   finalAnswer?: SessionEvent
@@ -35,6 +42,19 @@ export interface Turn {
   tokens: { in: number; out: number }
   agents: string[]
 }
+
+type EventCategory =
+  | 'user_message'
+  | 'system_start'
+  | 'system_resume'
+  | 'tool_call'
+  | 'tool_exec'
+  | 'tool_result_legacy'
+  | 'completion'
+  | 'clarify'
+  | 'error'
+  | 'think'
+  | 'other'
 
 const THINK_KINDS = new Set([
   'think',
@@ -50,20 +70,65 @@ const THINK_KINDS = new Set([
   'notify',
 ])
 
-const TOOL_CALL_KINDS = new Set(['tool_call'])
-const TOOL_RESULT_KINDS = new Set(['tool_result'])
-
-function isCompletion(ev: SessionEvent): boolean {
-  return ev.type === 'system' && ev.agent === 'MetaAgent' && (ev.message?.startsWith('会话完成') || ev.message?.startsWith('执行失败'))
+/** 将事件归类到单一语义类别，作为后续路由的依据 */
+export function classifyEvent(ev: SessionEvent): EventCategory {
+  if (isUserMessageEvent(ev)) return 'user_message'
+  if (ev.type === 'system' && ev.agent === 'MetaAgent' && ev.message?.startsWith('会话启动')) {
+    return 'system_start'
+  }
+  if (ev.type === 'system' && ev.message?.startsWith('继续会话')) return 'system_resume'
+  if (isCompletion(ev)) return 'completion'
+  if (ev.type === 'clarify' || ev.kind === 'clarify') return 'clarify'
+  if (isToolCallEvent(ev)) return 'tool_call'
+  if (isToolExecEvent(ev)) return 'tool_exec'
+  if (ev.kind === 'tool_result') return 'tool_result_legacy'
+  if (isErrorEvent(ev)) return 'error'
+  if (isLLMThinkEvent(ev)) return 'think'
+  return 'other'
 }
 
-function isError(ev: SessionEvent): boolean {
-  return ev.type === 'error' || (ev.kind === 'error') || ev.success === false
+function isLLMThinkEvent(ev: SessionEvent): boolean {
+  return THINK_KINDS.has(ev.kind || '') || ev.type === 'progress'
+}
+
+export function isCompletion(ev: SessionEvent): boolean {
+  return (
+    ev.type === 'system' &&
+    ev.agent === 'MetaAgent' &&
+    (ev.message?.startsWith('会话完成') || ev.message?.startsWith('执行失败'))
+  )
+}
+
+export function isError(ev: SessionEvent): boolean {
+  return isErrorEvent(ev)
+}
+
+export function createToolGroup(callEv: SessionEvent): ToolCallGroup {
+  return {
+    id: callEv.timestamp,
+    tool: callEv.tool || extractToolName(callEv.message) || 'unknown',
+    agent: callEv.agent,
+    call: callEv,
+    success: false,
+    pending: true,
+  }
+}
+
+export function finalizeTurn(turn: Turn, finalEvent?: SessionEvent): Turn {
+  if (!finalEvent) return turn
+  const status: Turn['status'] = finalEvent.message?.startsWith('执行失败') ? 'error' : 'completed'
+  return {
+    ...turn,
+    finalAnswer: finalEvent,
+    status,
+    endedAt: finalEvent.timestamp,
+  }
 }
 
 function tokenIn(ev: SessionEvent): number {
   return ev.input_tokens || 0
 }
+
 function tokenOut(ev: SessionEvent): number {
   return ev.output_tokens || 0
 }
@@ -100,17 +165,19 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
   }
 
   for (const ev of events) {
+    const category = classifyEvent(ev)
+
     // 启动 / 用户消息 → 新回合
-    if (ev.type === 'user_message') {
+    if (category === 'user_message') {
       openTurn(ev)
       continue
     }
-    if (ev.type === 'system' && ev.agent === 'MetaAgent' && ev.message?.startsWith('会话启动')) {
+    if (category === 'system_start') {
       // 用启动事件作为首个回合的"目标"占位（如果用户已经显式发过 user_message 就别覆盖）
       if (!current) openTurn(ev)
       continue
     }
-    if (ev.type === 'system' && ev.message?.startsWith('继续会话')) {
+    if (category === 'system_resume') {
       // 接续上一个回合（用户已 push 过 user_message），忽略
       continue
     }
@@ -123,21 +190,19 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
     }
 
     // Token 累计
-    if (ev.kind === 'token_usage') {
+    if (isTokenUsageEvent(ev)) {
       current!.tokens.in += tokenIn(ev)
       current!.tokens.out += tokenOut(ev)
     }
 
     // 完成事件
-    if (isCompletion(ev)) {
-      current!.finalAnswer = ev
-      current!.status = ev.message?.startsWith('执行失败') ? 'error' : 'completed'
-      current!.endedAt = ev.timestamp
+    if (category === 'completion') {
+      current = finalizeTurn(current!, ev)
       continue
     }
 
     // 待澄清：Agent 请求用户澄清，挂起会话；区别于错误，单独标记
-    if (ev.type === 'clarify' || ev.kind === 'clarify') {
+    if (category === 'clarify') {
       current!.clarifyQuestion = ev
       current!.status = 'awaiting_clarify'
       current!.endedAt = ev.timestamp
@@ -145,24 +210,17 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
     }
 
     // 工具调用意图（pending）：新建组并占一个 tool 步骤
-    if (TOOL_CALL_KINDS.has(ev.kind || '')) {
-      const group: ToolCallGroup = {
-        id: ev.timestamp,
-        tool: ev.tool || extractToolName(ev.message) || 'unknown',
-        agent: ev.agent,
-        call: ev,
-        success: false,
-        pending: true,
-      }
+    if (category === 'tool_call') {
+      const group = createToolGroup(ev)
       current!.toolCalls.push(group)
       current!.steps.push({ kind: 'tool', group })
       continue
     }
 
     // 工具执行结果（type=tool_exec）：配对到同名 pending 组填 result，不新增步骤
-    if (ev.type === 'tool_exec') {
+    if (category === 'tool_exec') {
       const toolName = ev.tool || extractToolName(ev.message) || 'unknown'
-      const matched = [...current!.toolCalls].reverse().find(g => g.tool === toolName && g.pending)
+      const matched = [...current!.toolCalls].reverse().find((g) => g.tool === toolName && g.pending)
       if (matched) {
         matched.result = ev
         matched.success = ev.success !== false
@@ -184,27 +242,23 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
     }
 
     // 旧版后端可能仍发 tool_result kind（已废弃），忽略避免重复卡片
-    if (TOOL_RESULT_KINDS.has(ev.kind || '')) {
+    if (category === 'tool_result_legacy') {
       continue
     }
 
     // 错误（工具失败已由 tool_exec.success=false 体现，此处只收真正的错误事件）
-    if (isError(ev)) {
+    if (category === 'error') {
       current!.errors.push(ev)
       current!.status = 'error'
       continue
     }
 
     // 思考链相关 Kind → think 步骤（同时累积到 thinkChain 兼容字段）
-    if (THINK_KINDS.has(ev.kind || '') || ev.type === 'progress') {
+    if (category === 'think' || category === 'other') {
       current!.thinkChain.push(ev)
       current!.steps.push({ kind: 'think', event: ev })
       continue
     }
-
-    // agent_done / stats / 其它系统事件：也归到思考链
-    current!.thinkChain.push(ev)
-    current!.steps.push({ kind: 'think', event: ev })
   }
 
   return turns
@@ -229,7 +283,7 @@ function extractToolName(msg?: string): string | undefined {
 export function filterTurnForConcise(turn: Turn): Turn {
   return {
     ...turn,
-    thinkChain: turn.thinkChain.filter(ev => {
+    thinkChain: turn.thinkChain.filter((ev) => {
       const k = ev.kind || ev.type
       return k === 'think' || k === 'intend' || k === 'llm' || k === 'wait'
     }),
