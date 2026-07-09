@@ -4,6 +4,7 @@ import (
 	"context"       // 上下文，贯穿所有数据库调用以支持超时与取消
 	"database/sql"  // 标准库 SQL 抽象层
 	"encoding/json" // 结构体与 JSONB/JSON 列之间的序列化
+	"errors"        // 错误包装与判断
 	"fmt"           // 格式化错误信息
 
 	"github.com/blockmemory/agent/backend/pkg/enums" // 枚举常量
@@ -66,8 +67,10 @@ func compressionLevelOf(ep *types.Episode) int {
 }
 
 // IsDuplicateError 判断错误是否为 PostgreSQL 唯一约束冲突（23505）。
+// 支持被 fmt.Errorf("...: %w") 包装过的错误。
 func (s *EpisodeStore) IsDuplicateError(err error) bool {
-	if pgErr, ok := err.(*pq.Error); ok {
+	var pgErr *pq.Error
+	if errors.As(err, &pgErr) {
 		return pgErr.Code == "23505"
 	}
 	return false

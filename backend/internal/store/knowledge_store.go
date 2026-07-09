@@ -27,8 +27,11 @@ type KnowledgeStore struct {
 // 副作用: embedding 通过 pgVector 转为字符串文本,依赖 pgvector 扩展解析。
 func (s *KnowledgeStore) Save(ctx context.Context, rec *types.KnowledgeRecord) error {
 	// meta 即使为 nil 也写入 "{}",保证列非空
-	meta, _ := json.Marshal(rec.Meta)
-	_, err := s.db.ExecContext(ctx, `
+	meta, err := json.Marshal(rec.Meta)
+	if err != nil {
+		return fmt.Errorf("marshal knowledge meta: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO global_knowledge (knowledge_type, topic_id, content, embedding, meta, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
 	`, rec.KnowledgeType, rec.TopicID, rec.Content, pgVector(rec.Embedding), meta, rec.CreatedAt)

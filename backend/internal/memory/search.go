@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -101,17 +102,16 @@ func (s *SearchScorer) ScoreEpisode(ctx context.Context, ep *types.Episode, quer
 //
 // 返回：按 FinalScore 降序排列的 ScoredEpisode 切片与错误。
 // 副作用：无。并发安全：除读取传入列表外无共享状态。
-// 注意：当 Embedder 调用失败时，queryEmbedding 置 nil 以回退为非语义评分。
+// 注意：当 Embedder 调用失败时直接返回错误，避免在调用方不知情的情况下回退到非语义评分。
 func (s *SearchScorer) SearchAndScore(ctx context.Context, agentID, topicID, query string, episodes []*types.Episode) ([]*ScoredEpisode, error) {
 	// 向量化查询语句，作为语义相似度的输入。
 	var queryEmbedding []float32
 	if s.embedder != nil {
 		emb, err := s.embedder.Embed(ctx, query)
 		if err != nil {
-			queryEmbedding = nil
-		} else {
-			queryEmbedding = emb
+			return nil, fmt.Errorf("embed query: %w", err)
 		}
+		queryEmbedding = emb
 	}
 
 	// 预声明结果切片，遍历 Episode 逐个评分。
@@ -251,5 +251,12 @@ func cosineSimilarity(a, b []float32) float64 {
 	if normA == 0 || normB == 0 {
 		return 0
 	}
-	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
+	cos := dot / (math.Sqrt(normA) * math.Sqrt(normB))
+	if cos < 0 {
+		return 0
+	}
+	if cos > 1 {
+		return 1
+	}
+	return cos
 }
