@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/blockmemory/agent/backend/internal/dag"
+	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // EnsureDAGSchema 自动创建 dag_jobs 表（幂等）。
@@ -51,15 +51,18 @@ func (s *PostgresStore) checkReady() error {
 }
 
 // SaveDAG upsert 一条 DAG 定义。
-func (s *PostgresStore) SaveDAG(ctx context.Context, d *dag.DAG) error {
+func (s *PostgresStore) SaveDAG(ctx context.Context, d *types.DAG) error {
 	if err := s.checkReady(); err != nil {
 		return err
 	}
 	if d == nil {
 		return fmt.Errorf("nil dag")
 	}
-	tasksJSON, _ := json.Marshal(d.Tasks)
-	_, err := s.db.ExecContext(ctx, `
+	tasksJSON, err := json.Marshal(d.Tasks)
+	if err != nil {
+		return fmt.Errorf("marshal dag tasks: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO dag_jobs (id, name, cron, enabled, tasks, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (id) DO UPDATE SET
@@ -73,7 +76,7 @@ func (s *PostgresStore) SaveDAG(ctx context.Context, d *dag.DAG) error {
 }
 
 // GetDAG 按 ID 取单条 DAG。
-func (s *PostgresStore) GetDAG(ctx context.Context, id string) (*dag.DAG, error) {
+func (s *PostgresStore) GetDAG(ctx context.Context, id string) (*types.DAG, error) {
 	if err := s.checkReady(); err != nil {
 		return nil, err
 	}
@@ -81,7 +84,7 @@ func (s *PostgresStore) GetDAG(ctx context.Context, id string) (*dag.DAG, error)
 		SELECT id, name, cron, enabled, tasks, created_at, updated_at
 		FROM dag_jobs WHERE id=$1
 	`, id)
-	var d dag.DAG
+	var d types.DAG
 	var tasksJSON []byte
 	if err := row.Scan(&d.ID, &d.Name, &d.Cron, &d.Enabled, &tasksJSON, &d.CreatedAt, &d.UpdatedAt); err != nil {
 		return nil, err
@@ -95,7 +98,7 @@ func (s *PostgresStore) GetDAG(ctx context.Context, id string) (*dag.DAG, error)
 }
 
 // ListDAGs 列出全部 DAG。
-func (s *PostgresStore) ListDAGs(ctx context.Context) ([]*dag.DAG, error) {
+func (s *PostgresStore) ListDAGs(ctx context.Context) ([]*types.DAG, error) {
 	if err := s.checkReady(); err != nil {
 		return nil, err
 	}
@@ -107,9 +110,9 @@ func (s *PostgresStore) ListDAGs(ctx context.Context) ([]*dag.DAG, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []*dag.DAG
+	var out []*types.DAG
 	for rows.Next() {
-		var d dag.DAG
+		var d types.DAG
 		var tasksJSON []byte
 		if err := rows.Scan(&d.ID, &d.Name, &d.Cron, &d.Enabled, &tasksJSON, &d.CreatedAt, &d.UpdatedAt); err != nil {
 			return nil, err

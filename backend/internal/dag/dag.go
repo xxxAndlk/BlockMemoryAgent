@@ -18,51 +18,22 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
-// TaskStatus DAG 任务状态。
-type TaskStatus string
+// TaskStatus, Task, and DAG are aliases to pkg/types so that the storage layer
+// can depend on the type without importing the dag scheduler package.
+type TaskStatus = types.TaskStatus
+type Task = types.Task
+type DAG = types.DAG
 
 const (
-	TaskStatusPending   TaskStatus = "pending"   // 待触发（依赖未满足）
-	TaskStatusRunning   TaskStatus = "running"   // 已派发为 session，运行中
-	TaskStatusCompleted TaskStatus = "completed" // session 已完成
-	TaskStatusFailed    TaskStatus = "failed"    // session 失败
+	TaskStatusPending   = types.TaskStatusPending
+	TaskStatusRunning   = types.TaskStatusRunning
+	TaskStatusCompleted = types.TaskStatusCompleted
+	TaskStatusFailed    = types.TaskStatusFailed
 )
-
-// Task DAG 节点。
-type Task struct {
-	ID         string     `json:"id"`         // 任务 ID（DAG 内唯一）
-	Goal       string     `json:"goal"`       // 任务目标，作为 session.goal
-	DependsOn  []string   `json:"depends_on"` // 前置任务 ID 列表
-	Status     TaskStatus `json:"status"`     // 当前状态
-	SessionID  string     `json:"session_id"` // 关联 session ID
-	StartedAt  *time.Time `json:"started_at,omitempty"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
-}
-
-// DAG 有向无环图：一组带依赖关系的任务 + 可选 cron 调度。
-type DAG struct {
-	ID        string    `json:"id"`      // DAG 唯一 ID
-	Name      string    `json:"name"`    // 人类可读名称
-	Cron      string    `json:"cron"`    // 调度表达式（"<N>s" / "" 表示手动触发）
-	Tasks     []*Task   `json:"tasks"`   // 任务节点列表
-	Enabled   bool      `json:"enabled"` // 是否启用调度
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-// HasCycle 检测 DAG 是否存在环（拓扑排序失败即有环）。
-func (d *DAG) HasCycle() bool {
-	_, err := TopoSort(d.Tasks)
-	return err != nil
-}
-
-// TopoSort 拓扑排序，返回任务执行顺序；存在环或依赖缺失返回错误。
-// 委托给包级函数 TopoSort 以保持确定性（按 ID 排序就绪节点）并复用实现。
-func (d *DAG) TopoSort() ([]*Task, error) {
-	return TopoSort(d.Tasks)
-}
 
 // ParseInterval 解析 cron 字段为定时间隔。
 // 支持 "Ns"（N 秒）、"Nm"（N 分钟）、"Nh"（N 小时）；空串返回 0 表示仅手动触发。

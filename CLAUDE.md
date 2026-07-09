@@ -92,6 +92,27 @@ Four-stage pipeline: `write.go` (importance scoring + topic binding) → `compre
 ### Server / UI (`internal/server/`, `web/`)
 `api.go` + `session.go` — session CRUD and SSE stream at `/api/sessions/{id}/stream`. `tui_broadcaster.go` mirrors graph events to TUI subscribers. `web/` static files served at `/static/`, `index.html` at `/`.
 
+## Package Dependency Rules
+
+The backend is layered from the bottom up:
+
+- `pkg/*` — shared primitives (`types`, `enums`, `jsonutil`, `textutil`, `httputil`).
+- `internal/store`, `internal/memory`, `internal/model`, `internal/logger`, `internal/embed`, `internal/config` — infrastructure.
+- `internal/dag`, `internal/skill`, `internal/soul`, `internal/watchdog`, `internal/board`, `internal/mailbox` — runtime components.
+- `internal/runtime` — runtime aggregator.
+- `internal/graph` — orchestration layer.
+- `internal/agent` — facade exposing `agent.Agent`.
+- `internal/server`, `internal/tui`, `internal/testserver`, `cmd/*`, `main.go`, `test/*` — adapters and entry points.
+
+Key rules:
+
+- `pkg/*` must not import `internal/*`.
+- Infrastructure packages must not import `internal/graph`, `internal/runtime`, `internal/server`, `internal/tui`, `internal/agent`, or entry points.
+- `internal/graph` must not import `internal/server`, `internal/tui`, `internal/agent`, or entry points.
+- Adapters should consume the system through `agent.Agent` and `internal/bootstrap` rather than directly importing `internal/graph` / `internal/runtime` internals.
+
+When a lower-layer package needs a type from an upper layer, move the type to `pkg/types` or invert the dependency with an interface. See `docs/superpowers/plans/dependency-rules.md` for the full rules and verification commands.
+
 ## Conventions
 
 - `doc/项目说明.md` is the authoritative implementation guide (directory layout, code reading order, key design decisions). `doc/设计文档_v3.md` is a vision doc whose top carries a status note acknowledging divergence from code — defer to `项目说明.md` on conflict. `doc/TODO.md` tracks progress; `doc/TUI设计文档.md` covers TUI design. The codebase migrated from CloudWeGo Eino to go-kratos Blades (pre-v3 Eino docs are no longer in the tree).
