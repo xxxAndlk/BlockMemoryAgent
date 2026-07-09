@@ -8,6 +8,8 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
+	"github.com/blockmemory/agent/backend/pkg/jsonutil"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -49,7 +51,12 @@ JSON:`, state.CurrentDomain, state.DomainGoal, strings.Join(tasks, "\n"))
 		return nil
 	}
 	// 抽取 JSON 片段
-	jsonStr := extractJSON(resp)
+	jsonStr := jsonutil.ExtractJSON(resp, jsonutil.ExtractOptions{
+		StripComments:     true,
+		FixSingleQuotes:   true,
+		FixTrailingCommas: true,
+		AllowArray:        true,
+	})
 	var rawSteps []struct {
 		Goal     string `json:"goal"`
 		ToolHint string `json:"tool_hint"`
@@ -96,13 +103,18 @@ func reflectOnResult(ctx context.Context, modelFactory *model.ModelFactory, task
 
 只输出 JSON：{"ok":true/false,"feedback":"若不达标，给出改进建议；达标则留空"}
 
-JSON:`, task, truncateForPrompt(result, 800))
+JSON:`, task, textutil.TruncateBytes(result, 800, "\n...(truncated)"))
 	// P0-1：轻量模型调用统一走 CallLightweightWithRetry（3 次重试）
 	resp, err := modelFactory.CallLightweightWithRetry(ctx, prompt)
 	if err != nil || resp == "" {
 		return true, "" // 轻量模型不可用或调用失败：不阻断
 	}
-	jsonStr := extractJSON(resp)
+	jsonStr := jsonutil.ExtractJSON(resp, jsonutil.ExtractOptions{
+		StripComments:     true,
+		FixSingleQuotes:   true,
+		FixTrailingCommas: true,
+		AllowArray:        true,
+	})
 	var verdict struct {
 		OK       bool   `json:"ok"`
 		Feedback string `json:"feedback"`
@@ -111,14 +123,6 @@ JSON:`, task, truncateForPrompt(result, 800))
 		return true, "" // 解析失败：不阻断
 	}
 	return verdict.OK, verdict.Feedback
-}
-
-// truncateForPrompt 截断文本到 maxChars，超长加省略号。
-func truncateForPrompt(s string, maxChars int) string {
-	if len(s) <= maxChars {
-		return s
-	}
-	return s[:maxChars] + "\n...(truncated)"
 }
 
 // planEnabledFromRT 从运行时配置读取 Plan 开关（默认关闭，未配置时 false）。

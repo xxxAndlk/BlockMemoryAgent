@@ -12,6 +12,8 @@ import (
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/jsonutil"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -240,7 +242,7 @@ func CommonExecuteAssistantTask(
 							SessionID: sessionIDFromState(state),
 							Kind:      "reflect",
 							Agent:     agentName,
-							Message:   fmt.Sprintf("反思判定不达标，带反馈重试: %s", truncateForPrompt(feedback, 200)),
+							Message:   fmt.Sprintf("反思判定不达标，带反馈重试: %s", textutil.TruncateBytes(feedback, 200, "\n...(truncated)")),
 						})
 					}
 					// 把反馈注入任务文本前缀后重试一次（防死循环：仅一次）
@@ -443,27 +445,7 @@ func runSelfTestAssistant(
 }
 
 // extractJSONBlock 从可能包含 markdown 代码块的文本中提取 JSON 对象。
+// 统一委托给 jsonutil.ExtractJSON，使用空选项以保持最小干预行为。
 func extractJSONBlock(s string) string {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "```") {
-		lines := strings.Split(s, "\n")
-		var body []string
-		for i, line := range lines {
-			if i == 0 && strings.HasPrefix(line, "```") {
-				continue
-			}
-			if strings.TrimSpace(line) == "```" {
-				break
-			}
-			body = append(body, line)
-		}
-		s = strings.Join(body, "\n")
-	}
-	// 兜底：取第一个 '{' 到最后一个 '}' 之间的内容
-	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start >= 0 && end > start {
-		return s[start : end+1]
-	}
-	return s
+	return jsonutil.ExtractJSON(s, jsonutil.ExtractOptions{})
 }

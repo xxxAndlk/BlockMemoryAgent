@@ -10,6 +10,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/skill"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -133,12 +134,9 @@ func sanitizeUTF8(s string) string {
 }
 
 // truncateRunes 按 rune 截断字符串，避免按字节截断时把多字节 UTF-8 字符（如中文）
-// 切成两半，产生非法序列。
+// 切成两半，产生非法序列。统一委托给 textutil.TruncateRunes。
 func truncateRunes(s string, n int) string {
-	if utf8.RuneCountInString(s) <= n {
-		return s
-	}
-	return string([]rune(s)[:n]) + "..."
+	return textutil.TruncateRunes(s, n, "...")
 }
 
 // sanitizeBlockMemoryInputs 清洗写入 Postgres 块记忆的字段，确保合法 UTF-8。

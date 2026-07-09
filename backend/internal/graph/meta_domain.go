@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/blockmemory/agent/backend/pkg/types"
 	"log"
 	"strings"
 	"time"
+
+	"github.com/blockmemory/agent/backend/pkg/jsonutil"
+	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // DomainInfo 领域信息。
@@ -100,8 +102,13 @@ func (n *MetaAgentNode) analyzeDomains(ctx context.Context, state *types.ThreeLa
 // 返回：领域列表；解析失败或为空返回 nil。
 func (n *MetaAgentNode) parseDomainsFromLLM(resp string) []DomainInfo {
 	// 抽取 JSON 片段（LLM 可能附带多余文本）
-	jsonStr := extractJSON(resp)
-	// 兜底：若 extractJSON 返回单个对象，包成数组再解析
+	jsonStr := jsonutil.ExtractJSON(resp, jsonutil.ExtractOptions{
+		StripComments:     true,
+		FixSingleQuotes:   true,
+		FixTrailingCommas: true,
+		AllowArray:        true,
+	})
+	// 兜底：若返回单个对象，包成数组再解析
 	trimmed := strings.TrimSpace(jsonStr)
 	if strings.HasPrefix(trimmed, "{") {
 		jsonStr = "[" + trimmed + "]"

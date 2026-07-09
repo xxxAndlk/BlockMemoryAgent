@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -175,15 +176,9 @@ func summaryLimit(state *types.ThreeLayerState) int {
 }
 
 // truncateStringByRunes 按 rune（字符）截断字符串并加省略号。
+// 统一委托给 textutil.TruncateRunes。
 func truncateStringByRunes(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n]) + "..."
+	return textutil.TruncateRunes(s, n, "...")
 }
 
 // updateSessionSummary 更新会话总结。

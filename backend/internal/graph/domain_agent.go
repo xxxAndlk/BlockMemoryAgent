@@ -10,6 +10,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/watchdog"
 	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -87,11 +88,9 @@ func (n *DomainAgentNode) Name() string {
 }
 
 // truncateString 截断字符串并加省略号。
+// 统一委托给 textutil.TruncateBytes。
 func truncateString(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
+	return textutil.TruncateBytes(s, n, "...")
 }
 
 // InstanceID 返回实例ID。
