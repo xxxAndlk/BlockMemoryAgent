@@ -10,12 +10,13 @@ import (
 	"log/slog"
 	"os"
 	"time"
+	"unicode/utf8"
 
 	"github.com/blockmemory/agent/backend/internal/store"
 )
 
-// LogStore 是会话日志持久化接口（由 *store.PostgresStore 实现）。
-type LogStore interface {
+// oldLogStore 是历史接口，底层 store 使用 *store.SessionLogRecord。保留它以兼容现有调用方。
+type oldLogStore interface {
 	SaveSessionLog(ctx context.Context, rec *store.SessionLogRecord) error
 }
 
@@ -24,21 +25,72 @@ type LogStore interface {
 type Logger struct {
 	slog  *slog.Logger
 	store LogStore
+	batch *BatchingLogStore
 	attrs []slog.Attr
 }
 
 // New 创建默认 Logger，JSON 输出到 stderr；store 可选。
-func New(store LogStore) *Logger {
+// store 可以是 logger.LogStore 或历史接口 *store.PostgresStore/fake store。
+func New(store any) *Logger {
 	return NewWithWriter(store, os.Stderr)
 }
 
 // NewWithWriter 创建 Logger 并指定 JSON 日志输出目标；store 可选。
 // TUI 入口可用此函数把结构化日志重定向到文件，避免刷到终端顶乱布局。
-func NewWithWriter(store LogStore, w io.Writer) *Logger {
+func NewWithWriter(store any, w io.Writer) *Logger {
 	h := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})
-	return &Logger{slog: slog.New(h), store: store}
+	l := &Logger{slog: slog.New(h)}
+
+	if store != nil {
+		l.store = adaptStore(store)
+		if l.store != nil {
+			l.batch = NewBatchingLogStore(l.store, 4, 1024)
+		}
+	}
+	return l
+}
+
+// adaptStore 将传入的 store 适配为 logger.LogStore。
+func adaptStore(s any) LogStore {
+	if ls, ok := s.(LogStore); ok {
+		return ls
+	}
+	if ls, ok := s.(oldLogStore); ok {
+		return &storeAdapter{underlying: ls}
+	}
+	return nil
+}
+
+// storeAdapter 将 *store.SessionLogRecord 接口适配为 logger.LogStore。
+type storeAdapter struct {
+	underlying oldLogStore
+}
+
+func (a *storeAdapter) SaveSessionLog(ctx context.Context, rec *SessionLogRecord) error {
+	return a.underlying.SaveSessionLog(ctx, toStoreRecord(rec))
+}
+
+func toStoreRecord(rec *SessionLogRecord) *store.SessionLogRecord {
+	if rec == nil {
+		return nil
+	}
+	return &store.SessionLogRecord{
+		SessionID:    rec.SessionID,
+		Agent:        rec.Agent,
+		Level:        rec.Level,
+		Phase:        rec.Phase,
+		Message:      rec.Message,
+		Prompt:       rec.Prompt,
+		Response:     rec.Response,
+		InputTokens:  rec.InputTokens,
+		OutputTokens: rec.OutputTokens,
+		Model:        rec.Model,
+		LatencyMs:    rec.LatencyMs,
+		CreatedAt:    rec.CreatedAt,
+		Meta:         rec.Meta,
+	}
 }
 
 // With 返回附加固定字段的新 Logger。
@@ -46,7 +98,7 @@ func (l *Logger) With(attrs ...slog.Attr) *Logger {
 	merged := make([]slog.Attr, 0, len(l.attrs)+len(attrs))
 	merged = append(merged, l.attrs...)
 	merged = append(merged, attrs...)
-	return &Logger{slog: l.slog, store: l.store, attrs: merged}
+	return &Logger{slog: l.slog, store: l.store, batch: l.batch, attrs: merged}
 }
 
 // WithSession 返回绑定 session_id 的 Logger。
@@ -88,26 +140,28 @@ func (l *Logger) Error(ctx context.Context, msg string, err error, extra ...slog
 }
 
 // LLMCall 记录一次 LLM 调用（phase=llm_call）。
-func (l *Logger) LLMCall(ctx context.Context, agent, model string, prompt, response string, inputTokens, outputTokens, latencyMs int, extra ...slog.Attr) {
+func (l *Logger) LLMCall(ctx context.Context, rec LLMCallRecord, extra ...slog.Attr) {
 	attrs := []slog.Attr{
-		slog.String("agent", agent),
+		slog.String("agent", rec.Agent),
 		slog.String("phase", "llm_call"),
-		slog.String("model", model),
-		slog.Int("input_tokens", inputTokens),
-		slog.Int("output_tokens", outputTokens),
-		slog.Int("latency_ms", latencyMs),
+		slog.String("model", rec.Model),
+		slog.Int("input_tokens", rec.InputTokens),
+		slog.Int("output_tokens", rec.OutputTokens),
+		slog.Int("latency_ms", rec.LatencyMs),
 	}
 	attrs = append(attrs, extra...)
-	l.log(ctx, slog.LevelInfo, "llm_call", &store.SessionLogRecord{
-		Agent:        firstNonEmpty(l.attrValue("agent"), agent),
+
+	summary := truncate(rec.Prompt, 200) + " -> " + truncate(rec.Response, 200)
+	l.log(ctx, slog.LevelInfo, summary, &SessionLogRecord{
+		Agent:        firstNonEmpty(l.attrValue("agent"), rec.Agent),
 		Phase:        "llm_call",
-		Message:      truncate(prompt, 200) + " -> " + truncate(response, 200),
-		Prompt:       prompt,
-		Response:     response,
-		Model:        model,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		LatencyMs:    latencyMs,
+		Message:      summary,
+		Prompt:       rec.Prompt,
+		Response:     rec.Response,
+		Model:        rec.Model,
+		InputTokens:  rec.InputTokens,
+		OutputTokens: rec.OutputTokens,
+		LatencyMs:    rec.LatencyMs,
 	}, attrs...)
 }
 
@@ -120,7 +174,7 @@ func (l *Logger) Event(ctx context.Context, phase, message string, meta map[stri
 		}
 	}
 	attrs = append(attrs, extra...)
-	l.log(ctx, slog.LevelInfo, message, &store.SessionLogRecord{
+	l.log(ctx, slog.LevelInfo, message, &SessionLogRecord{
 		Phase:   phase,
 		Message: message,
 		Meta:    meta,
@@ -128,11 +182,11 @@ func (l *Logger) Event(ctx context.Context, phase, message string, meta map[stri
 }
 
 // log 是底层日志入口。
-func (l *Logger) log(ctx context.Context, level slog.Level, msg string, record *store.SessionLogRecord, extra ...slog.Attr) {
+func (l *Logger) log(ctx context.Context, level slog.Level, msg string, record *SessionLogRecord, extra ...slog.Attr) {
 	attrs := append(l.attrs, extra...)
 	l.slog.LogAttrs(ctx, level, msg, attrs...)
 
-	if l.store == nil {
+	if l.batch == nil {
 		return
 	}
 	sessionID := l.attrValue("session_id")
@@ -141,37 +195,38 @@ func (l *Logger) log(ctx context.Context, level slog.Level, msg string, record *
 		return
 	}
 	if record == nil {
-		record = &store.SessionLogRecord{}
+		record = &SessionLogRecord{}
 	}
 	record.SessionID = sessionID
 	record.Level = level.String()
-	record.Message = msg
-	record.CreatedAt = time.Now()
+	if record.Message == "" {
+		record.Message = msg
+	}
+	now := time.Now()
+	record.CreatedAt = now
+	record.Timestamp = now.UnixMilli()
 	if record.Agent == "" {
 		record.Agent = l.attrValue("agent")
 	}
 	if record.Phase == "" {
 		record.Phase = l.attrValue("phase")
 	}
-	// 异步写表避免阻塞主路径；指数退避重试 3 次，最终失败再记录错误日志
-	go func(r *store.SessionLogRecord) {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		var lastErr error
-		for attempt := 0; attempt < 3; attempt++ {
-			if attempt > 0 {
-				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
-			}
-			lastErr = l.store.SaveSessionLog(bgCtx, r)
-			if lastErr == nil {
-				return
-			}
-		}
-		l.slog.Error("save session log failed after retries",
-			slog.String("error", lastErr.Error()),
-			slog.String("session_id", r.SessionID),
-			slog.String("phase", r.Phase))
-	}(record)
+
+	// 使用有界工作池异步写入，避免每条日志都启动 goroutine。
+	if err := l.batch.Enqueue(ctx, record); err != nil {
+		l.slog.Error("enqueue session log failed",
+			slog.String("error", err.Error()),
+			slog.String("session_id", record.SessionID),
+			slog.String("phase", record.Phase))
+	}
+}
+
+// Close 停止日志器的工作池，等待所有待处理日志落盘。
+func (l *Logger) Close() error {
+	if l.batch != nil {
+		l.batch.Stop()
+	}
+	return nil
 }
 
 // attrValue 读取固定字段值。
@@ -194,10 +249,11 @@ func firstNonEmpty(ss ...string) string {
 	return ""
 }
 
-// truncate 截断字符串并加省略号。
-func truncate(s string, n int) string {
-	if len(s) <= n {
+// truncate 按 rune 截断字符串并加省略号，避免破坏多字节 UTF-8 字符。
+func truncate(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
 		return s
 	}
-	return s[:n] + "..."
+	runes := []rune(s)
+	return string(runes[:maxRunes]) + "..."
 }

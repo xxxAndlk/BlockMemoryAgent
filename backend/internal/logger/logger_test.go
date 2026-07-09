@@ -79,7 +79,15 @@ func TestLoggerLLMCall(t *testing.T) {
 	fs := &fakeLogStore{}
 	l := New(fs).WithSession("s2")
 	ctx := context.Background()
-	l.LLMCall(ctx, "DomainAgent[frontend]", "deepseek-v4", "prompt", "response", 100, 50, 800)
+	l.LLMCall(ctx, LLMCallRecord{
+		Agent:        "DomainAgent[frontend]",
+		Model:        "deepseek-v4",
+		Prompt:       "prompt",
+		Response:     "response",
+		InputTokens:  100,
+		OutputTokens: 50,
+		LatencyMs:    800,
+	})
 
 	recs := waitForRecords(fs, 1)
 	if len(recs) != 1 {
