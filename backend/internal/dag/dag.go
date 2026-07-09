@@ -12,7 +12,6 @@ package dag
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -55,61 +54,14 @@ type DAG struct {
 
 // HasCycle 检测 DAG 是否存在环（拓扑排序失败即有环）。
 func (d *DAG) HasCycle() bool {
-	_, err := d.TopoSort()
+	_, err := TopoSort(d.Tasks)
 	return err != nil
 }
 
 // TopoSort 拓扑排序，返回任务执行顺序；存在环或依赖缺失返回错误。
-// 实现：Kahn 算法 — 入度表 + BFS 队列；排序后节点数不等于总数即存在环。
+// 委托给包级函数 TopoSort 以保持确定性（按 ID 排序就绪节点）并复用实现。
 func (d *DAG) TopoSort() ([]*Task, error) {
-	byID := make(map[string]*Task, len(d.Tasks))
-	for _, t := range d.Tasks {
-		if _, dup := byID[t.ID]; dup {
-			return nil, fmt.Errorf("duplicate task id: %s", t.ID)
-		}
-		byID[t.ID] = t
-	}
-	// 校验依赖存在性：依赖指向不存在的 task 直接报错，避免后续 inDeg 计算踩空
-	for _, t := range d.Tasks {
-		for _, dep := range t.DependsOn {
-			if _, ok := byID[dep]; !ok {
-				return nil, fmt.Errorf("task %s depends on missing %s", t.ID, dep)
-			}
-		}
-	}
-	// Kahn 算法：inDeg[id] = len(DependsOn)；入度为 0 的进队列
-	inDeg := make(map[string]int, len(d.Tasks))
-	for _, t := range d.Tasks {
-		inDeg[t.ID] = len(t.DependsOn)
-	}
-	var queue []string
-	for id, deg := range inDeg {
-		if deg == 0 {
-			queue = append(queue, id)
-		}
-	}
-	var sorted []*Task
-	// 每次出队一个节点，把依赖它的节点入度减 1；归零则入队
-	for len(queue) > 0 {
-		id := queue[0]
-		queue = queue[1:]
-		sorted = append(sorted, byID[id])
-		for _, t := range d.Tasks {
-			for _, dep := range t.DependsOn {
-				if dep == id {
-					inDeg[t.ID]--
-					if inDeg[t.ID] == 0 {
-						queue = append(queue, t.ID)
-					}
-				}
-			}
-		}
-	}
-	// 环检测：若还有节点未入队，说明它们互相依赖成环，无法拓扑排序
-	if len(sorted) != len(d.Tasks) {
-		return nil, fmt.Errorf("cycle detected in dag %s", d.ID)
-	}
-	return sorted, nil
+	return TopoSort(d.Tasks)
 }
 
 // ParseInterval 解析 cron 字段为定时间隔。
@@ -153,6 +105,8 @@ type Scheduler struct {
 	running  map[string]*DAG // 正在执行的 DAG 实例（含运行中 task 状态）
 	interval time.Duration   // 调度器自身轮询间隔
 	stop     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // NewScheduler 创建调度器。interval<=0 时默认 10s。
@@ -171,11 +125,15 @@ func NewScheduler(store Store, launcher SessionLauncher, interval time.Duration)
 
 // Start 启动后台调度 goroutine。
 func (s *Scheduler) Start(ctx context.Context) {
+	s.wg.Add(1)
 	go s.loop(ctx)
 }
 
-// Stop 停止调度。
-func (s *Scheduler) Stop() { close(s.stop) }
+// Stop 停止调度并等待后台 goroutine 退出。可安全多次调用。
+func (s *Scheduler) Stop() {
+	s.stopOnce.Do(func() { close(s.stop) })
+	s.wg.Wait()
+}
 
 // Trigger 立即触发一次 DAG（忽略 cron）。
 // 把 DAG 拷贝一份运行实例，按依赖关系派发可执行任务。
@@ -190,6 +148,8 @@ func (s *Scheduler) Trigger(ctx context.Context, id string) error {
 	if d.HasCycle() {
 		return fmt.Errorf("dag %s has cycle", id)
 	}
+	// 深拷贝一份运行实例，避免修改 store 返回的原始 DAG。
+	d = cloneDAG(d)
 	// 重置所有 task 状态为 pending
 	for _, t := range d.Tasks {
 		t.Status = TaskStatusPending
@@ -206,6 +166,7 @@ func (s *Scheduler) Trigger(ctx context.Context, id string) error {
 
 // loop 调度主循环。
 func (s *Scheduler) loop(ctx context.Context) {
+	defer s.wg.Done()
 	tick := time.NewTicker(s.interval)
 	defer tick.Stop()
 	for {
@@ -332,10 +293,56 @@ func (s *Scheduler) Snapshot() map[string]*DAG {
 	out := make(map[string]*DAG, len(s.running))
 	for k, v := range s.running {
 		// 深拷贝避免外部修改
-		b, _ := json.Marshal(v)
-		var cp DAG
-		_ = json.Unmarshal(b, &cp)
-		out[k] = &cp
+		out[k] = cloneDAG(v)
 	}
 	return out
+}
+
+// cloneTask returns a deep copy of a Task. nil slices remain nil, empty slices
+// remain empty, and pointer fields are allocated independently.
+func cloneTask(t *Task) *Task {
+	if t == nil {
+		return nil
+	}
+	cp := &Task{
+		ID:        t.ID,
+		Goal:      t.Goal,
+		Status:    t.Status,
+		SessionID: t.SessionID,
+	}
+	if t.DependsOn != nil {
+		cp.DependsOn = make([]string, len(t.DependsOn))
+		copy(cp.DependsOn, t.DependsOn)
+	}
+	if t.StartedAt != nil {
+		v := *t.StartedAt
+		cp.StartedAt = &v
+	}
+	if t.FinishedAt != nil {
+		v := *t.FinishedAt
+		cp.FinishedAt = &v
+	}
+	return cp
+}
+
+// cloneDAG returns a deep copy of a DAG, including a deep copy of every Task.
+func cloneDAG(d *DAG) *DAG {
+	if d == nil {
+		return nil
+	}
+	cp := &DAG{
+		ID:        d.ID,
+		Name:      d.Name,
+		Cron:      d.Cron,
+		Enabled:   d.Enabled,
+		CreatedAt: d.CreatedAt,
+		UpdatedAt: d.UpdatedAt,
+	}
+	if d.Tasks != nil {
+		cp.Tasks = make([]*Task, len(d.Tasks))
+		for i, t := range d.Tasks {
+			cp.Tasks[i] = cloneTask(t)
+		}
+	}
+	return cp
 }
