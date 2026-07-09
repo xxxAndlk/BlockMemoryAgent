@@ -19,7 +19,7 @@ func TestMemorySearchEndpoint(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rec := (&memory.BlockMemoryRecord{
+	rec, err := (&memory.BlockMemoryRecord{
 		SessionID: "session-1",
 		Domain:    "test_domain",
 		Goal:      "integration test goal",
@@ -28,7 +28,10 @@ func TestMemorySearchEndpoint(t *testing.T) {
 			{Key: "status", Value: "ok", Scope: memory.FactScopeDomain},
 		},
 		CreatedAt: time.Now(),
-	}).ToKnowledgeRecord(768)
+	}).ToKnowledgeRecord(ctx, nil, 768)
+	if err != nil {
+		t.Fatalf("convert block memory: %v", err)
+	}
 	if err := f.Server.Deps.Postgres.SaveKnowledge(ctx, rec); err != nil {
 		t.Fatalf("seed knowledge: %v", err)
 	}
