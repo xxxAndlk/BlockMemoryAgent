@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import type { SessionEvent } from '@/types'
-import { renderMd } from '@/utils/markdown'
+import MarkdownRenderer from '@/components/MarkdownRenderer.vue'
 import { kindTagType, agentTextColor, fmtTime, hasDetail } from '@/views/chat/utils/eventStyles'
 
 const props = defineProps<{
@@ -89,7 +89,7 @@ const progressStatus = computed(() => {
           <el-tag size="small" :type="kindTagType(ev.kind, ev.type)" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-90">{{ ev.kind || ev.type }}</el-tag>
         </div>
         <div class="flex-1 min-w-0">
-          <div class="text-gray-300 break-words leading-relaxed pt-0.5 markdown-body" v-html="renderMd(ev.message)"></div>
+          <MarkdownRenderer :content="ev.message" class="text-gray-300 break-words leading-relaxed pt-0.5" />
 
           <div v-if="hasDetail(ev)" class="mt-2">
             <div class="text-gray-400 mb-1 flex items-center gap-1 cursor-pointer hover:text-gray-300" @click="toggle(index)"
