@@ -10,8 +10,23 @@ Go module: `github.com/blockmemory/agent/backend` (source under `backend/`, root
 
 ## Common commands
 
+Makefile targets wrap the most common workflows:
+
 ```bash
-# Run HTTP server (main entrypoint — delegates all wiring to testserver.BuildHandler)
+make run            # build web UI and run the HTTP server
+make backend-test   # run all backend tests
+make test-test      # run integration tests
+make lint           # run go vet on backend and test modules
+make up             # start PostgreSQL + Redis via docker compose
+make down           # stop docker compose services
+make migrate        # apply SQL migrations (requires POSTGRES_DSN)
+make help           # list all targets
+```
+
+Raw equivalents:
+
+```bash
+# Run HTTP server (main entrypoint — delegates all wiring to bootstrap.Build)
 go run ./backend
 
 # Run CLI demo (three-layer flow, prints role instances created)
@@ -23,7 +38,7 @@ go run ./backend/cmd/tui/main.go
 # Memory inspection console
 go run ./backend/cmd/memory-console/main.go
 
-# All tests
+# All backend tests
 GOTOOLCHAIN=local go test ./backend/... -count=1
 
 # Single package / test

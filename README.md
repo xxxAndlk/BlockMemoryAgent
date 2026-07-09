@@ -125,6 +125,17 @@ cp .env.example .env  # 填 OPENAI_API_KEY / OPENAI_BASE_URL / POSTGRES_DSN / RE
 
 ### 运行
 
+常用操作已封装到根目录 `Makefile`，可直接使用：
+
+```bash
+make up       # 启动 PostgreSQL + Redis
+make migrate  # 应用 migrations/*.sql（需 POSTGRES_DSN）
+make web-build
+make run      # 构建前端并启动 HTTP 服务
+```
+
+等价的原始命令如下：
+
 ```bash
 # 1. 启动 PostgreSQL + Redis
 docker compose -f docker/docker-compose.yml up -d
@@ -273,6 +284,22 @@ Assistant 走 Blades 原生 function-calling：`blades.NewAgent` + `WithTools` +
 - **MCP / Computer Use / RAG / LLM Wiki 插件**：接口预留，实现后做（P3-5）
 - **模型分层可观测性**：已支持按 meta/domain/lightweight/assistant/other 聚合的 token 统计（P3-7），前端配置页待后续（P3-4）
 - **多协议模型接入**：原生 OpenAI / Anthropic / Ollama 协议已落地（P3-6），通过 `provider` 字段区分
+
+---
+
+## 常用开发命令
+
+```bash
+make backend-test   # 运行 backend 单元/包测试
+make test-test      # 运行 test 模块集成测试
+make lint           # go vet backend 与 test 模块
+make up             # docker compose 启动依赖服务
+make down           # docker compose 停止依赖服务
+make migrate        # 应用 SQL 迁移（需 POSTGRES_DSN）
+make web-build      # 构建前端
+make run            # 构建前端并启动后端
+make help           # 显示所有目标
+```
 
 ---
 
