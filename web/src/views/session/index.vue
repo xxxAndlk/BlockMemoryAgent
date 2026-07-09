@@ -1,14 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch, onUnmounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { Session, AgentNode, TaskBoardData } from '@/types'
 import {
-  listSessions,
   getSession,
   getSessionBoard,
   getSessionAgents,
-  streamSession,
   getSessionWatchdog,
   getSessionMailbox,
   getSessionLogs,
@@ -23,20 +21,31 @@ import {
   type SessionMetrics,
   type SessionTokenMetricsResponse,
 } from '@/api/metrics'
+import { useSessionStream } from '@/composables/useSessionStream'
+import { usePanelRefresh } from '@/composables/usePanelRefresh'
+import { useRoleTree } from '@/composables/useRoleTree'
+import { useTaskBoard } from '@/composables/useTaskBoard'
+import { useSessionList } from '@/composables/useSessionList'
+import { useSessionStatus } from '@/composables/useSessionStatus'
 import ExecutionLog from './components/ExecutionLog.vue'
 import MemoryExplorer from './components/MemoryExplorer.vue'
 import SkillSet from './components/SkillSet.vue'
 import FilePreview from './components/FilePreview.vue'
 
 const route = useRoute()
-const sessions = ref<Session[]>([])
+const { sessions, loadSessions } = useSessionList()
+const stream = useSessionStream()
+const panel = usePanelRefresh()
+const { healthDotClass, healthStatusText } = useSessionStatus()
+
 const activeSession = ref<Session | null>(null)
 const activeTab = ref('log')
 const loading = ref(false)
-const closeStream = ref<(() => void) | null>(null)
 
 const agents = ref<AgentNode[]>([])
 const board = ref<TaskBoardData | null>(null)
+const { roleTree, defaultProps } = useRoleTree(agents)
+const { tasks, constraints, taskProgress: progress } = useTaskBoard(board)
 
 const metrics = ref<SessionMetrics | null>(null)
 const watchdogDecisions = ref<WatchdogDecision[]>([])
@@ -61,22 +70,9 @@ onMounted(async () => {
   }
 })
 
-onUnmounted(() => {
-  closeStream.value?.()
-})
-
 watch(() => route.query.id, (id) => {
   if (id && typeof id === 'string') selectSessionById(id)
 })
-
-async function loadSessions() {
-  try {
-    sessions.value = await listSessions()
-  } catch (e) {
-    sessions.value = []
-    ElMessage.error('加载会话列表失败：' + (e instanceof Error ? e.message : String(e)))
-  }
-}
 
 async function selectSessionById(id: string) {
   loading.value = true
@@ -97,65 +93,39 @@ async function selectSessionById(id: string) {
 
 async function selectSession(s: Session) {
   activeSession.value = s
-  closeStream.value?.()
+  stream.close()
+  panel.invalidate()
   startStream(s)
   await loadSessionPanels(s.id)
 }
 
 async function loadSessionPanels(sessionID: string) {
-  try {
-    const boardRes = await getSessionBoard(sessionID)
-    board.value = boardRes.board || null
-  } catch {
-    board.value = null
-  }
-  try {
-    const agentRes = await getSessionAgents(sessionID)
-    agents.value = agentRes.agents || []
-  } catch {
-    agents.value = []
-  }
-  try {
-    metrics.value = await getSessionMetrics(sessionID)
-  } catch {
-    metrics.value = null
-  }
-  try {
-    const wdRes = await getSessionWatchdog(sessionID)
-    watchdogDecisions.value = wdRes.decisions || []
-  } catch {
-    watchdogDecisions.value = []
-  }
-  try {
-    const mbRes = await getSessionMailbox(sessionID)
-    mailboxMessages.value = mbRes.messages || []
-  } catch {
-    mailboxMessages.value = []
-  }
-  try {
-    health.value = await getHealth()
-  } catch {
-    health.value = null
-  }
+  const boardRes = await panel.run(() => getSessionBoard(sessionID))
+  board.value = boardRes?.board || null
+  const agentRes = await panel.run(() => getSessionAgents(sessionID))
+  agents.value = agentRes?.agents || []
+  const metricsRes = await panel.run(() => getSessionMetrics(sessionID))
+  metrics.value = metricsRes || null
+  const wdRes = await panel.run(() => getSessionWatchdog(sessionID))
+  watchdogDecisions.value = wdRes?.decisions || []
+  const mbRes = await panel.run(() => getSessionMailbox(sessionID))
+  mailboxMessages.value = mbRes?.messages || []
+  const healthRes = await panel.run(() => getHealth())
+  health.value = healthRes || null
   await loadSessionLogs(sessionID)
 }
 
 async function loadSessionLogs(sessionID: string) {
-  try {
-    const res = await getSessionLogs(sessionID, {
+  const logsRes = await panel.run(() =>
+    getSessionLogs(sessionID, {
       agent: logFilterAgent.value || undefined,
       level: logFilterLevel.value || undefined,
       limit: logLimit.value,
     })
-    sessionLogs.value = res.logs || []
-  } catch {
-    sessionLogs.value = []
-  }
-  try {
-    tokenMetrics.value = await getSessionTokenMetrics(sessionID)
-  } catch {
-    tokenMetrics.value = null
-  }
+  )
+  sessionLogs.value = logsRes?.logs || []
+  const tokenRes = await panel.run(() => getSessionTokenMetrics(sessionID))
+  tokenMetrics.value = tokenRes || null
 }
 
 function applyLogFilters() {
@@ -163,89 +133,27 @@ function applyLogFilters() {
 }
 
 function startStream(s: Session) {
-  closeStream.value = streamSession(
-    s.id,
-    (ev) => {
-      // SSE 连接建立 / 重连时后端推送完整 Session 快照（含 id/goal/events）。
-      // F12 修复：原实现直接 return 丢弃快照，导致 activeSession.status 永不更新
-      // （header 一直显示 running 即使会话已 completed/error）。
-      // 改为用快照刷新 activeSession 状态 + events（重连去重靠快照重置）。
-      if (ev && 'id' in ev && 'goal' in ev && 'events' in ev) {
-        const snap = ev as unknown as Session
-        if (activeSession.value?.id === snap.id) {
-          activeSession.value = { ...activeSession.value, status: snap.status, events: snap.events || [] }
-        }
-        return
+  stream.startStream(s.id, {
+    onSnapshot(snap) {
+      if (activeSession.value?.id === snap.id) {
+        activeSession.value = { ...activeSession.value, status: snap.status, events: snap.events || [] }
       }
+    },
+    onEvent(ev) {
       // 推到 activeSession.events（非 sessions 列表项的 s），避免污染共享对象
       if (activeSession.value && activeSession.value.id === s.id) {
         activeSession.value = { ...activeSession.value, events: [...(activeSession.value.events || []), ev] }
       }
     },
-    () => {
+    onDone() {
       loadSessions()
     },
-    (err) => {
+    onError(err) {
       console.error('SSE error:', err)
       ElMessage.error('实时连接异常，请检查网络或刷新页面')
-    }
-  )
-}
-
-const roleTree = computed(() => {
-  const root: any[] = []
-  const map = new Map<string, any>()
-  agents.value.forEach(a => {
-    const node = {
-      label: a.name,
-      status: a.status,
-      statusType: a.status === 'active' ? 'success' : a.status === 'running' ? 'warning' : 'info',
-      active: a.status === 'active' || a.status === 'running',
-      isUser: a.type === 'domain' || a.type === 'subdomain',
-      iconColor: a.status === 'active' ? 'text-green-500' : a.status === 'running' ? 'text-yellow-500' : 'text-gray-500',
-      children: [] as any[],
-    }
-    map.set(a.inst_id, node)
-    if (!a.parent_id) root.push(node)
+    },
   })
-  agents.value.forEach(a => {
-    if (a.parent_id && map.has(a.parent_id)) {
-      map.get(a.parent_id)!.children.push(map.get(a.inst_id))
-    }
-  })
-  // 无 Agent 数据时返回空数组，模板渲染空状态占位，不再展示伪造的角色树
-  return root
-})
-
-interface TaskItem {
-  title?: string
-  name?: string
-  assignee?: string
-  status: string
 }
-
-const tasks = computed(() => {
-  if (board.value?.tasks?.length) {
-    return board.value.tasks.map(t => ({ title: t.title, assignee: t.assignee, status: t.status })) as TaskItem[]
-  }
-  // 无任务数据返回空数组，模板展示空状态，不再伪造任务
-  return [] as TaskItem[]
-})
-
-const constraints = computed(() => {
-  if (board.value?.constraints) return Object.entries(board.value.constraints)
-  // 无约束数据返回空数组
-  return [] as [string, string][]
-})
-
-
-const progress = computed(() => {
-  const done = tasks.value.filter(t => t.status === 'done').length
-  const total = tasks.value.length
-  return total ? Math.round((done / total) * 100) : 0
-})
-
-const defaultProps = { children: 'children', label: 'label' }
 
 function fmtTime(iso: string) {
   return new Date(iso).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -295,14 +203,6 @@ function mailboxIcon(type: string) {
     case 'info': return 'Document'
     default: return 'Message'
   }
-}
-
-function healthDotClass(service?: { online?: boolean }) {
-  return service?.online ? 'text-green-500' : 'text-red-500'
-}
-
-function healthStatusText(service?: { online?: boolean; detail?: string }) {
-  return service?.online ? (service.detail || 'Connected') : (service?.detail || 'Offline')
 }
 
 </script>

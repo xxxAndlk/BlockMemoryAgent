@@ -1,20 +1,24 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { Session, SessionEvent, AgentNode, TaskBoardData } from '@/types'
 import {
-  listSessions,
   createSession,
   sendMessage,
   clarifySession,
   cancelSession,
   getSession,
-  streamSession,
   getSessionAgents,
   getSessionBoard,
 } from '@/api/session'
 import { getSessionMetrics, type SessionMetrics } from '@/api/metrics'
+import { useSessionStream } from '@/composables/useSessionStream'
+import { usePanelRefresh } from '@/composables/usePanelRefresh'
+import { useRoleTree } from '@/composables/useRoleTree'
+import { useTaskBoard } from '@/composables/useTaskBoard'
+import { useSessionList } from '@/composables/useSessionList'
+import { useSessionStatus } from '@/composables/useSessionStatus'
 import MessageList from './components/MessageList.vue'
 import ChatInput from './components/ChatInput.vue'
 import ChatHeader from './components/ChatHeader.vue'
@@ -22,17 +26,22 @@ import ChatHeader from './components/ChatHeader.vue'
 const route = useRoute()
 const router = useRouter()
 
-const sessions = ref<Session[]>([])
+const { sessions, loadSessions } = useSessionList()
+const stream = useSessionStream()
+const panel = usePanelRefresh()
+const { statusDotClass, statusText } = useSessionStatus()
+
 const activeSession = ref<Session | null>(null)
 const events = ref<SessionEvent[]>([])
 const agents = ref<AgentNode[]>([])
 const metrics = ref<SessionMetrics | null>(null)
 const board = ref<TaskBoardData | null>(null)
 
+const { roleTree, defaultProps } = useRoleTree(agents)
+const { tasks, taskProgress } = useTaskBoard(board)
+
 const loading = ref(false)
 const sending = ref(false)
-const closeStream = ref<(() => void) | null>(null)
-const panelTimer = ref<ReturnType<typeof setInterval> | null>(null)
 
 // 用户偏好
 const verbose = ref(false)
@@ -55,30 +64,18 @@ onMounted(async () => {
   }
 })
 
-onUnmounted(() => {
-  closeStream.value?.()
-  stopPanelTimer()
-})
-
 watch(() => route.query.id, (id) => {
   if (id && typeof id === 'string' && id !== activeSession.value?.id) {
     openSession(id)
   }
 })
 
-async function loadSessions() {
-  try {
-    sessions.value = (await listSessions()) || []
-  } catch {
-    sessions.value = []
-  }
-}
-
 async function openSession(id: string) {
   loading.value = true
-  closeStream.value?.()
+  stream.close()
+  panel.stopPanelTimer()
+  panel.invalidate()
   events.value = []
-  panelEpoch.value++ // 作废旧 refreshPanels 响应（F17）
   try {
     const s = await getSession(id)
     activeSession.value = s
@@ -95,56 +92,27 @@ async function openSession(id: string) {
   }
 }
 
-function stopPanelTimer() {
-  if (panelTimer.value !== null) {
-    clearInterval(panelTimer.value)
-    panelTimer.value = null
-  }
-}
-
-function startPanelTimer(sessionId: string) {
-  stopPanelTimer()
-  panelTimer.value = setInterval(() => refreshPanels(sessionId), 3000)
-}
-
-// F17 修复：原 refreshPanels 无请求竞态保护。会话切换时旧请求可能在新请求后返回，
-// 用 epoch 计数器丢弃过期响应（比 abort 更简单，且不依赖 AbortController 透传）。
-const panelEpoch = ref(0)
-
 async function refreshPanels(id: string) {
-  const epoch = ++panelEpoch.value
-  try {
-    const a = await getSessionAgents(id)
-    if (epoch !== panelEpoch.value) return // 已被新会话切换作废
-    agents.value = a.agents || []
-  } catch { if (epoch === panelEpoch.value) agents.value = [] }
-  try {
-    const b = await getSessionBoard(id)
-    if (epoch !== panelEpoch.value) return
-    board.value = b.board || null
-  } catch { if (epoch === panelEpoch.value) board.value = null }
-  try {
-    metrics.value = await getSessionMetrics(id)
-    if (epoch !== panelEpoch.value) return
-  } catch { if (epoch === panelEpoch.value) metrics.value = null }
+  const agentsRes = await panel.run(() => getSessionAgents(id))
+  if (agentsRes) agents.value = agentsRes.agents || []
+  const boardRes = await panel.run(() => getSessionBoard(id))
+  if (boardRes) board.value = boardRes.board || null
+  const metricsRes = await panel.run(() => getSessionMetrics(id))
+  if (metricsRes) metrics.value = metricsRes
 }
 
 function startStream(s: Session) {
-  startPanelTimer(s.id)
-  closeStream.value = streamSession(
-    s.id,
-    (ev) => {
-      // 首条会带完整 session 快照（含 id/goal/events）
-      if (ev && 'id' in ev && 'goal' in ev && 'events' in ev) {
-        const snap = ev as unknown as Session
-        activeSession.value = snap
-        events.value = [...(snap.events || [])]
-        return
-      }
-      events.value.push(ev as SessionEvent)
+  panel.startAutoRefresh(s.id, refreshPanels)
+  stream.startStream(s.id, {
+    onSnapshot(snap) {
+      activeSession.value = snap
+      events.value = [...(snap.events || [])]
     },
-    (finalStatus?: string) => {
-      stopPanelTimer()
+    onEvent(ev) {
+      events.value.push(ev)
+    },
+    onDone(finalStatus?: string) {
+      panel.stopPanelTimer()
       // 完成：使用后端 done 帧携带的真实 status，避免把 error/awaiting_clarify 误显示为 completed
       refreshPanels(s.id)
       loadSessions()
@@ -154,15 +122,14 @@ function startStream(s: Session) {
       }
       sending.value = false
     },
-    (err) => {
-      stopPanelTimer()
+    onError(err) {
+      panel.stopPanelTimer()
       console.error('SSE error:', err)
       // SSE 错误必须重置 sending，否则发送按钮永久禁用（F2 修复）。
-      // 原 onError 仅 console.error，sending 保持 true 导致 UI 死锁只能刷新。
       sending.value = false
       ElMessage.error('实时连接异常，请检查网络或刷新页面')
     },
-  )
+  })
 }
 
 async function handleSubmit(content: string) {
@@ -197,7 +164,6 @@ async function handleSubmit(content: string) {
   } catch (e) {
     console.error('submit failed:', e)
     // API 异常时 SSE 不会建立，onDone 永不触发，必须在此重置 sending（F11 修复）。
-    // 原 finally 注释说"SSE done will close it"，但 API 抛错路径下 sending 永久 true。
     sending.value = false
     ElMessage.error('发送失败：' + (e instanceof Error ? e.message : String(e)))
   }
@@ -214,8 +180,8 @@ async function handleCancel() {
 }
 
 async function handleNewSession() {
-  closeStream.value?.()
-  stopPanelTimer()
+  stream.close()
+  panel.stopPanelTimer()
   events.value = []
   activeSession.value = null
   agents.value = []
@@ -224,54 +190,6 @@ async function handleNewSession() {
   router.replace({ path: '/chat' })
 }
 
-// Agent编排栏 - 角色层级树
-const roleTree = computed(() => {
-  const root: any[] = []
-  const map = new Map<string, any>()
-  agents.value.forEach(a => {
-    const node = {
-      label: a.name,
-      status: a.status,
-      statusType: a.status === 'active' ? 'success' : a.status === 'running' ? 'warning' : 'info',
-      active: a.status === 'active' || a.status === 'running',
-      isUser: a.type === 'domain' || a.type === 'subdomain',
-      iconColor: a.status === 'active' ? 'text-green-500' : a.status === 'running' ? 'text-yellow-500' : 'text-gray-500',
-      children: [] as any[],
-    }
-    map.set(a.inst_id, node)
-    if (!a.parent_id) root.push(node)
-  })
-  agents.value.forEach(a => {
-    if (a.parent_id && map.has(a.parent_id)) {
-      map.get(a.parent_id)!.children.push(map.get(a.inst_id))
-    }
-  })
-  return root
-})
-
-interface TaskItem {
-  title?: string
-  name?: string
-  assignee?: string
-  status: string
-}
-
-// 任务栏 - 任务看板数据
-const tasks = computed(() => {
-  if (board.value?.tasks?.length) {
-    return board.value.tasks.map(t => ({ title: t.title, assignee: t.assignee, status: t.status })) as TaskItem[]
-  }
-  return [] as TaskItem[]
-})
-
-const taskProgress = computed(() => {
-  const done = tasks.value.filter(t => t.status === 'done').length
-  const total = tasks.value.length
-  return total ? Math.round((done / total) * 100) : 0
-})
-
-const defaultProps = { children: 'children', label: 'label' }
-
 const filteredSessions = computed(() => {
   const q = sessionFilter.value.trim().toLowerCase()
   if (!q) return sessions.value
@@ -279,26 +197,6 @@ const filteredSessions = computed(() => {
     s.id.toLowerCase().includes(q) ||
     (s.goal || '').toLowerCase().includes(q))
 })
-
-function statusDotClass(status: string) {
-  switch (status) {
-    case 'running': return 'bg-blue-400 animate-pulse'
-    case 'completed': return 'bg-green-500'
-    case 'error': return 'bg-red-500'
-    case 'awaiting_clarify': return 'bg-yellow-400 animate-pulse'
-    default: return 'bg-gray-500'
-  }
-}
-
-function statusText(status: string) {
-  const map: Record<string, string> = {
-    running: '运行中',
-    completed: '完成',
-    error: '失败',
-    awaiting_clarify: '待澄清',
-  }
-  return map[status] || status
-}
 
 function fmtDateTime(iso: string) {
   if (!iso) return ''
