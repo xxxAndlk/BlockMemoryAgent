@@ -75,52 +75,10 @@ func (e *ToolExecutor) writeFile(ctx context.Context, args map[string]any) *Tool
 		return &ToolResult{Tool: "WriteFile", Error: "path is required"}
 	}
 
-	// 工作区污染拦截：禁止 Agent 写到后端源码树 / 测试模块 / 根 go.mod / go.work。
-	// 塔防 demo 事故中，Agent 把 Go 包写到 backend/internal/tdcombat/、改根 go.work、
-	// 在 workspace/ 建 go.mod，污染项目结构。Agent 只能写 workspace/ 子目录下的用户产物。
-	if err := rejectProtectedPath(path); err != nil {
+	// 通过 GuardRegistry 统一执行写前业务策略校验（受保护路径、邮箱文件化、
+	// 临时脚本反模式、邮箱 Go 程序绕过、路径段空格等）。
+	if err := e.guards.CheckWrite(path, content, allowSpaces); err != nil {
 		return &ToolResult{Tool: "WriteFile", Path: path, Error: err.Error()}
-	}
-
-	// 邮箱文件化拦截：Agent 偶尔把跨域邮箱当成 JSON 文件写到 workspace/.../mailbox/
-	// 目录（参见塔防 demo 事故）。系统内置 runtime.Mailbox 投递，禁止用 WriteFile
-	// 伪造邮箱消息。命中模式：路径段含 "mailbox" + 文件名 to-*/from-*/msg-*.json。
-	if isMailboxFilePath(path) {
-		return &ToolResult{Tool: "WriteFile", Path: path,
-			Error: "禁止用 WriteFile 写邮箱消息文件。跨域协作请通过 runtime.Mailbox 投递（DomainAgent 内部 API），或在任务输出中声明『请把 X 发给 Y 领域』由 MetaAgent 转发。直接写 mailbox/*.json 不会被下游领域消费。"}
-	}
-
-	// 临时脚本反模式拦截：Agent 偶尔用 WriteFile 写 Python/Shell 脚本去读文件、
-	// 列目录、搜文本，而不是直接用 ReadFile/ListDir/SearchInFiles（参见塔防 demo
-	// 事故：写了 10+ 个 read_game_js.py / check_game_js.py / dump_game.py 浪费 token）。
-	// 命中典型模式：.py 脚本含 open(...).read() + print，或 os.listdir + print。
-	if reason := detectFileHelperScript(path, content); reason != "" {
-		return &ToolResult{Tool: "WriteFile", Path: path,
-			Error: "禁止写脚本做文件读取/列目录/搜索: " + reason +
-				"。直接用 ReadFile / ListDir / SearchInFiles 工具，无需写中间脚本。" +
-				"此反模式浪费 token 与执行时间（塔防事故中 Agent 写 10+ 个 .py 读 game.js）。"}
-	}
-
-	// 邮箱 Go 程序绕过拦截：Agent 写 Go 源码（send_interface.go 等）调用
-	// runtime.Mailbox.Send 绕过 JSON 文件化检测（参见塔防 demo 事故：
-	// Agent 写 backend/cmd/send_interface/main.go 伪造跨域邮箱投递）。
-	// 这类 Go 程序不会被编译进后端二进制，纯浪费 token；且直接写 backend/ 已被
-	// rejectProtectedPath 拦截，但 workspace/ 下的 .go 仍可能漏过。
-	if reason := detectMailboxGoProgram(path, content); reason != "" {
-		return &ToolResult{Tool: "WriteFile", Path: path,
-			Error: "禁止写 Go 程序伪造邮箱投递: " + reason +
-				"。跨域协作请通过 runtime.Mailbox 投递（DomainAgent 内部 API，Agent 不应直接调用），" +
-				"或在任务输出中声明『请把 X 发给 Y 领域』由 MetaAgent 转发。" +
-				"写 Go 源码绕过邮箱检测不会被编译，纯属浪费 token（塔防事故 Agent 写 send_interface.go）。"}
-	}
-
-	// 路径段空格校验：LLM 偶尔把 "docs/workspace" 错写成 "docs workspace"，
-	// 导致创建带空格的错误目录。拒绝此类路径，强制 LLM 用 / 或 \ 分隔。
-	// allow_spaces=true 时放行（罕见场景，如文件名确需含空格）。
-	if !allowSpaces {
-		if err := validateNoSpacesInSegments(path); err != nil {
-			return &ToolResult{Tool: "WriteFile", Path: path, Error: err.Error()}
-		}
 	}
 
 	// 解析为绝对路径；临时文件写入会话级临时目录，防止污染工作目录

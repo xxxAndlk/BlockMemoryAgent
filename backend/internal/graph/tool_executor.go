@@ -103,15 +103,17 @@ type ProgressCallback func(ctx context.Context, ev ProgressEvent)
 //   - workDir：工具执行的基准目录，相对路径基于此解析。
 //   - timeout：默认超时（命令/HTTP），可被入参覆盖（上限 60s）。
 //   - callback：可选回调，每次 Execute 后触发。
+//   - guards：工具执行前的业务策略守卫注册表。
 //
-// 并发安全：workDir/timeout/callback 在 SetCallback 后不再变化；
+// 并发安全：workDir/timeout/callback/guards 在 SetCallback 后不再变化；
 //
 //	Execute 可被多 goroutine 并发调用（无共享可变状态）。
 type ToolExecutor struct {
-	workDir  string        // 工具执行基准目录
-	timeout  time.Duration // 默认超时
-	callback ToolCallback  // 工具执行回调
-	sandbox  SandboxConfig // 轻量级沙箱策略（命令黑名单 + 路径逃逸检测）
+	workDir  string          // 工具执行基准目录
+	timeout  time.Duration   // 默认超时
+	callback ToolCallback    // 工具执行回调
+	sandbox  SandboxConfig   // 轻量级沙箱策略（命令黑名单 + 路径逃逸检测）
+	guards   *GuardRegistry  // 业务策略守卫（写保护、命令拦截等）
 }
 
 // NewToolExecutor 创建工具执行器。
@@ -119,17 +121,57 @@ type ToolExecutor struct {
 // 参数：
 //   - workDir：基准工作目录；空串时回退到当前进程工作目录。
 //
-// 返回：初始化好的 *ToolExecutor，默认超时 30s，启用默认沙箱，callback 为 nil。
+// 返回：初始化好的 *ToolExecutor，默认超时 30s，启用默认沙箱与默认守卫，callback 为 nil。
 // 副作用：workDir 为空时调用 os.Getwd()。
 func NewToolExecutor(workDir string) *ToolExecutor {
 	// workDir 为空时回退到进程当前目录，避免相对路径解析失败
 	if workDir == "" {
 		workDir, _ = os.Getwd()
 	}
-	return &ToolExecutor{
+	e := &ToolExecutor{
 		workDir: workDir,
 		timeout: 30 * time.Second, // 默认 30s 超时
 		sandbox: DefaultSandboxConfig(),
+	}
+	e.guards = e.defaultGuardRegistry()
+	return e
+}
+
+// defaultGuardRegistry 返回工具执行器默认启用的守卫集合。
+func (e *ToolExecutor) defaultGuardRegistry() *GuardRegistry {
+	g := NewGuardRegistry()
+	g.RegisterWriteGuard(protectedPathGuard{})
+	g.RegisterWriteGuard(mailboxFileGuard{})
+	g.RegisterWriteGuard(fileHelperScriptGuard{})
+	g.RegisterWriteGuard(mailboxGoProgramGuard{})
+	g.RegisterWriteGuard(pathWhitespaceGuard{})
+	g.RegisterCommandGuard(longRunningServerGuard{})
+	g.RegisterCommandGuard(&funcCommandGuard{
+		name: "sandbox-block",
+		check: func(cmd string) (blocked bool, reason string) {
+			pattern, blocked := e.isCommandBlocked(cmd)
+			if !blocked {
+				return false, ""
+			}
+			return true, fmt.Sprintf("blocked command matches sandbox rule: %s", pattern)
+		},
+	})
+	return g
+}
+
+// SetGuardRegistry 注入自定义守卫注册表；nil 时恢复默认。
+func (e *ToolExecutor) SetGuardRegistry(g *GuardRegistry) {
+	if g == nil {
+		e.guards = e.defaultGuardRegistry()
+		return
+	}
+	e.guards = g
+}
+
+// ensureGuardDefaults 保证 guards 字段非空。
+func (e *ToolExecutor) ensureGuardDefaults() {
+	if e.guards == nil {
+		e.guards = e.defaultGuardRegistry()
 	}
 }
 
@@ -156,8 +198,9 @@ func (e *ToolExecutor) SetCallback(cb ToolCallback) {
 // 副作用：通过具体工具实现产生文件/命令/网络副作用；通过 callback 通知订阅方。
 // 并发安全：可被多 goroutine 并发调用。
 func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[string]any) *ToolResult {
-	// 确保通过旧构造函数或未设置沙箱的 executor 仍有默认安全策略
+	// 确保通过旧构造函数或未设置沙箱/守卫的 executor 仍有默认安全策略
 	e.ensureSandboxDefaults()
+	e.ensureGuardDefaults()
 
 	// 兼容 snake_case 工具名（LLM 可能输出 skill_id 而非 ToolRef）。
 	// 例如 write_file -> WriteFile。

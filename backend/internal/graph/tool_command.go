@@ -57,20 +57,9 @@ func (e *ToolExecutor) runCommand(ctx context.Context, args map[string]any) *Too
 		return &ToolResult{Tool: "RunCommand", Error: "command is required"}
 	}
 
-	// 命令黑名单检测
-	if pattern, blocked := e.isCommandBlocked(cmdStr); blocked {
-		return &ToolResult{Tool: "RunCommand", Error: fmt.Sprintf("blocked command matches sandbox rule: %s", pattern)}
-	}
-
-	// 长运行服务器命令检测：禁止 Agent 启动 http.server/flask/node server 等
-	// 会进入主循环的进程。这类命令即使 timeout 也会因 Windows taskkill /T 无法
-	// 杀掉脱离 cmd 父进程的子进程而导致 graph loop 阻塞、TUI 冻结（参见塔防 demo 事故）。
-	// Agent 应只做编译/语法检查，不应启动服务。
-	if reason := detectLongRunningServer(cmdStr); reason != "" {
-		return &ToolResult{Tool: "RunCommand", Error: "禁止启动长运行服务器进程: " + reason +
-			"。此类命令会进入主循环阻塞执行器，且 Windows timeout 无法可靠杀掉子进程。" +
-			"如需验证可玩性，请用 RunCommand 做 node --check / python -m py_compile 语法检查，" +
-			"或由用户手动启动服务。"}
+	// 通过 GuardRegistry 统一执行命令前业务策略校验（黑名单 + 长运行服务器拦截）。
+	if blocked, reason := e.guards.CheckCommand(cmdStr); blocked {
+		return &ToolResult{Tool: "RunCommand", Error: reason}
 	}
 
 	// 跨平台 mkdir：直接用 os.MkdirAll，绕过 shell 差异（Windows mkdir 不支持 -p）
