@@ -95,7 +95,7 @@ type ProgressCallback func(ctx context.Context, ev ProgressEvent)
 
 // ToolExecutor 本地工具执行器（沙箱）。
 //
-// 职责：在受限工作目录下执行 7 个内置工具，统一封装路径解析、超时控制、
+// 职责：在受限工作目录下执行内置工具，统一封装路径解析、超时控制、
 //
 //	输出截断与回调通知。
 //
@@ -103,17 +103,20 @@ type ProgressCallback func(ctx context.Context, ev ProgressEvent)
 //   - workDir：工具执行的基准目录，相对路径基于此解析。
 //   - timeout：默认超时（命令/HTTP），可被入参覆盖（上限 60s）。
 //   - callback：可选回调，每次 Execute 后触发。
+//   - sandbox：轻量级沙箱策略（命令黑名单 + 路径逃逸检测）。
 //   - guards：工具执行前的业务策略守卫注册表。
+//   - toolRegistry：工具注册表，按名/别名分发到具体 Tool 实现。
 //
-// 并发安全：workDir/timeout/callback/guards 在 SetCallback 后不再变化；
+// 并发安全：workDir/timeout/callback/guards/toolRegistry 在 SetCallback 后不再变化；
 //
 //	Execute 可被多 goroutine 并发调用（无共享可变状态）。
 type ToolExecutor struct {
-	workDir  string          // 工具执行基准目录
-	timeout  time.Duration   // 默认超时
-	callback ToolCallback    // 工具执行回调
-	sandbox  SandboxConfig   // 轻量级沙箱策略（命令黑名单 + 路径逃逸检测）
-	guards   *GuardRegistry  // 业务策略守卫（写保护、命令拦截等）
+	workDir      string          // 工具执行基准目录
+	timeout      time.Duration   // 默认超时
+	callback     ToolCallback    // 工具执行回调
+	sandbox      SandboxConfig   // 轻量级沙箱策略（命令黑名单 + 路径逃逸检测）
+	guards       *GuardRegistry  // 业务策略守卫（写保护、命令拦截等）
+	toolRegistry *ToolRegistry   // 工具注册表
 }
 
 // NewToolExecutor 创建工具执行器。
@@ -121,7 +124,7 @@ type ToolExecutor struct {
 // 参数：
 //   - workDir：基准工作目录；空串时回退到当前进程工作目录。
 //
-// 返回：初始化好的 *ToolExecutor，默认超时 30s，启用默认沙箱与默认守卫，callback 为 nil。
+// 返回：初始化好的 *ToolExecutor，默认超时 30s，启用默认沙箱、守卫与工具注册表，callback 为 nil。
 // 副作用：workDir 为空时调用 os.Getwd()。
 func NewToolExecutor(workDir string) *ToolExecutor {
 	// workDir 为空时回退到进程当前目录，避免相对路径解析失败
@@ -134,6 +137,7 @@ func NewToolExecutor(workDir string) *ToolExecutor {
 		sandbox: DefaultSandboxConfig(),
 	}
 	e.guards = e.defaultGuardRegistry()
+	e.toolRegistry = e.defaultToolRegistry()
 	return e
 }
 
@@ -157,6 +161,39 @@ func (e *ToolExecutor) defaultGuardRegistry() *GuardRegistry {
 		},
 	})
 	return g
+}
+
+// defaultToolRegistry 返回工具执行器默认注册的工具集合。
+func (e *ToolExecutor) defaultToolRegistry() *ToolRegistry {
+	r := NewToolRegistry()
+	r.Register(&readFileTool{exec: e})
+	r.Register(&writeFileTool{exec: e})
+	r.Register(&listDirTool{exec: e})
+	r.Register(&runCommandTool{exec: e})
+	r.Register(&searchInFilesTool{exec: e})
+	r.Register(&httpGetTool{exec: e})
+	r.Register(&httpPostTool{exec: e})
+	r.Register(&gitDiffTool{exec: e})
+	r.Register(&gitStatusTool{exec: e})
+	r.Register(&gitLogTool{exec: e})
+	r.Register(&gitBlameTool{exec: e})
+	return r
+}
+
+// SetToolRegistry 注入自定义工具注册表；nil 时恢复默认。
+func (e *ToolExecutor) SetToolRegistry(r *ToolRegistry) {
+	if r == nil {
+		e.toolRegistry = e.defaultToolRegistry()
+		return
+	}
+	e.toolRegistry = r
+}
+
+// ensureToolRegistryDefaults 保证 toolRegistry 字段非空。
+func (e *ToolExecutor) ensureToolRegistryDefaults() {
+	if e.toolRegistry == nil {
+		e.toolRegistry = e.defaultToolRegistry()
+	}
 }
 
 // SetGuardRegistry 注入自定义守卫注册表；nil 时恢复默认。
@@ -198,44 +235,17 @@ func (e *ToolExecutor) SetCallback(cb ToolCallback) {
 // 副作用：通过具体工具实现产生文件/命令/网络副作用；通过 callback 通知订阅方。
 // 并发安全：可被多 goroutine 并发调用。
 func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[string]any) *ToolResult {
-	// 确保通过旧构造函数或未设置沙箱/守卫的 executor 仍有默认安全策略
+	// 确保通过旧构造函数或未设置沙箱/守卫/注册表的 executor 仍有默认安全策略
 	e.ensureSandboxDefaults()
 	e.ensureGuardDefaults()
+	e.ensureToolRegistryDefaults()
 
-	// 兼容 snake_case 工具名（LLM 可能输出 skill_id 而非 ToolRef）。
-	// 例如 write_file -> WriteFile。
-	toolName = normalizeToolName(toolName)
-
-	var result *ToolResult
 	// 从 ctx 取 sessionID，后续填入 result 用于事件归属
 	sessionID := SessionIDFromContext(ctx)
-	// 按工具名分发到具体实现
-	switch toolName {
-	case "ReadFile":
-		result = e.readFile(args)
-	case "WriteFile":
-		result = e.writeFile(ctx, args)
-	case "ListDir":
-		result = e.listDir(args)
-	case "RunCommand":
-		result = e.runCommand(ctx, args) // 命令需要 ctx 做超时控制
-	case "SearchInFiles":
-		result = e.searchInFiles(args)
-	case "HTTPGet":
-		result = e.httpGet(ctx, args) // HTTP 需要 ctx 做超时控制
-	case "HTTPPost":
-		result = e.httpPost(ctx, args)
-	case "GitDiff":
-		result = e.gitDiff(args)
-	case "GitStatus":
-		result = e.gitStatus(args)
-	case "GitLog":
-		result = e.gitLog(args)
-	case "GitBlame":
-		result = e.gitBlame(args)
-	default:
-		// 未知工具：返回带错误的空结果，不 panic
-		result = &ToolResult{Tool: toolName, Error: fmt.Sprintf("unknown tool: %s", toolName)}
+	// 通过工具注册表按名/别名分发到具体 Tool 实现
+	result, err := e.toolRegistry.Execute(ctx, toolName, args)
+	if err != nil {
+		result = &ToolResult{Tool: toolName, Error: err.Error()}
 	}
 	// 统一填入 sessionID，便于上层按会话过滤事件
 	result.SessionID = sessionID
@@ -255,37 +265,6 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 		e.callback(result)
 	}
 	return result
-}
-
-// normalizeToolName 把 snake_case 工具名转为 CamelCase。
-// 已是 CamelCase 的原样返回。
-//
-// 职责：兼容 LLM 输出的 snake_case 工具名（如 write_file），统一映射到内部 CamelCase。
-// 参数：
-//   - name：原始工具名。
-//
-// 返回：归一化后的工具名；未命中别名时原样返回。
-// 副作用：无。
-// 并发安全：纯函数（每次构建 map，无共享状态）。
-func normalizeToolName(name string) string {
-	// 别名表：LLM 偶尔输出 snake_case，这里统一翻译回 CamelCase
-	aliases := map[string]string{
-		"read_file":       "ReadFile",
-		"write_file":      "WriteFile",
-		"list_dir":        "ListDir",
-		"run_command":     "RunCommand",
-		"search_in_files": "SearchInFiles",
-		"http_get":        "HTTPGet",
-		"http_post":       "HTTPPost",
-		"git_diff":        "GitDiff",
-		"git_status":      "GitStatus",
-		"git_log":         "GitLog",
-		"git_blame":       "GitBlame",
-	}
-	if v, ok := aliases[name]; ok {
-		return v
-	}
-	return name // 已是 CamelCase 或未知名，原样返回
 }
 
 // resolvePath 把路径解析为绝对路径。

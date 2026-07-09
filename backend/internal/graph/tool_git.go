@@ -104,32 +104,3 @@ func (e *ToolExecutor) gitBlame(args map[string]any) *ToolResult {
 	return e.runGit(gitArgs, absPath)
 }
 
-// normalizeGitToolName 把 git_diff / git_status 等 snake_case 转为 CamelCase。
-func normalizeGitToolName(name string) string {
-	aliases := map[string]string{
-		"git_diff":   "GitDiff",
-		"git_status": "GitStatus",
-		"git_log":    "GitLog",
-		"git_blame":  "GitBlame",
-	}
-	if v, ok := aliases[name]; ok {
-		return v
-	}
-	return name
-}
-
-// init 注册 Git 工具别名到 normalizeToolName 的别名表。
-// 因 aliases 是函数内局部变量，这里直接扩展 normalizeToolName 更稳妥。
-func init() {
-	// Git 工具别名在 tool_executor.go 的 switch 中通过 gitAliases 单独处理。
-}
-
-// gitAliases 返回 Git 工具 snake_case → CamelCase 映射。
-func gitAliases() map[string]string {
-	return map[string]string{
-		"git_diff":   "GitDiff",
-		"git_status": "GitStatus",
-		"git_log":    "GitLog",
-		"git_blame":  "GitBlame",
-	}
-}
