@@ -5,7 +5,7 @@ import (
 )
 
 func TestAllocateTokenBudget(t *testing.T) {
-	budget := allocateTokenBudget(64000)
+	budget := allocateTokenBudget(64000, nil)
 	if budget.Total() > 64000 {
 		t.Fatalf("total budget %d exceeds context window 64000", budget.Total())
 	}
@@ -21,7 +21,7 @@ func TestAllocateTokenBudget(t *testing.T) {
 }
 
 func TestAllocateTokenBudgetZeroFallback(t *testing.T) {
-	budget := allocateTokenBudget(0)
+	budget := allocateTokenBudget(0, nil)
 	if budget.Total() > 32000 {
 		t.Fatalf("zero context window should fallback to 32k, got total %d", budget.Total())
 	}

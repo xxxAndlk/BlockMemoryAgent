@@ -96,6 +96,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("connect postgres: %v", err)
 	}
+	pgStore.SetEmbeddingDim(cfg.PgVector.Dimensions)
+	pgStore.SetSearchBlockMemoryMaxTokens(cfg.Agent.SearchBlockMemoryMaxTokens)
 	defer pgStore.Close()
 	if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
 		log.Fatalf("ensure session_history schema: %v", err)

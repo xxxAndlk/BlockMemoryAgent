@@ -25,6 +25,8 @@ func (f *fakeSearcher) Embed(ctx context.Context, text string) ([]float32, error
 	return make([]float32, f.dim), nil
 }
 
+func (f *fakeSearcher) SearchBlockMemoryMaxTokens() int { return 800 }
+
 func TestToKnowledgeRecordFacts(t *testing.T) {
 	rec := &BlockMemoryRecord{
 		SessionID: "s1",

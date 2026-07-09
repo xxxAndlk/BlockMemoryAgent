@@ -44,6 +44,20 @@ type LoggingConfig struct {
 	Enabled bool   `yaml:"enabled"` // 是否启用文件日志；false 时仅输出到 stderr
 }
 
+// MemoryPolicyConfig 记忆管线策略配置。
+// 控制上下文装配时的分段比例、私有记忆裁剪参数等，替代 memory 包中的硬编码魔法数。
+type MemoryPolicyConfig struct {
+	ContextWindow      int `yaml:"context_window"`       // 模型上下文窗口总 token 数
+	SystemSegmentRatio int `yaml:"system_segment_ratio"` // System 段占比（百分之 N）
+	TopicGlobalRatio   int `yaml:"topic_global_ratio"`   // TopicGlobal 段占比（百分之 N）
+	SharedStateRatio   int `yaml:"shared_state_ratio"`   // SharedState 段占比（百分之 N）
+	GlobalKBRatio      int `yaml:"global_kb_ratio"`      // GlobalKB 段占比（百分之 N）
+	PrivateMemoryRatio int `yaml:"private_memory_ratio"` // PrivateMemory 段占比（百分之 N）
+	TaskRatio          int `yaml:"task_ratio"`           // TaskQuery 段占比（百分之 N）
+	ReserveRatio       int `yaml:"reserve_ratio"`        // Reserve 预留段占比（百分之 N）
+	DefaultTokensPerItem int `yaml:"default_tokens_per_item"` // 私有记忆单条默认 token 数，用于按预算裁剪
+}
+
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
 // 替代散落在 graph 包中的硬编码常量（maxSteps=200、skillSetSize=8、
 // retry=3、LLM 软/硬超时 30s/90s 等），让运维可以通过 config.yaml 调整。
@@ -106,6 +120,8 @@ type AgentConfig struct {
 	DomainMemoryRecallMaxChars int `yaml:"domain_memory_recall_max_chars"` // DomainAgent 记忆召回事件截断字符数
 	DomainMemoryContextMaxChars int `yaml:"domain_memory_context_max_chars"` // DomainAgent 记忆上下文注入截断字符数
 	DomainResultLogMaxChars    int `yaml:"domain_result_log_max_chars"`    // DomainAgent 结果日志截断字符数
+	// 记忆管线策略（替代 memory 包硬编码比例与单条 token 估算）
+	MemoryPolicy MemoryPolicyConfig `yaml:"memory_policy"`
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -299,6 +315,34 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.Agent.ContextWindow == 0 {
 		c.Agent.ContextWindow = 32000
+	}
+	// 记忆管线策略默认值（与 assembler.go 原硬编码比例一致：6/12/25/12/25/6/14）
+	if c.Agent.MemoryPolicy.ContextWindow == 0 {
+		c.Agent.MemoryPolicy.ContextWindow = c.Agent.ContextWindow
+	}
+	if c.Agent.MemoryPolicy.SystemSegmentRatio == 0 {
+		c.Agent.MemoryPolicy.SystemSegmentRatio = 6
+	}
+	if c.Agent.MemoryPolicy.TopicGlobalRatio == 0 {
+		c.Agent.MemoryPolicy.TopicGlobalRatio = 12
+	}
+	if c.Agent.MemoryPolicy.SharedStateRatio == 0 {
+		c.Agent.MemoryPolicy.SharedStateRatio = 25
+	}
+	if c.Agent.MemoryPolicy.GlobalKBRatio == 0 {
+		c.Agent.MemoryPolicy.GlobalKBRatio = 12
+	}
+	if c.Agent.MemoryPolicy.PrivateMemoryRatio == 0 {
+		c.Agent.MemoryPolicy.PrivateMemoryRatio = 25
+	}
+	if c.Agent.MemoryPolicy.TaskRatio == 0 {
+		c.Agent.MemoryPolicy.TaskRatio = 6
+	}
+	if c.Agent.MemoryPolicy.ReserveRatio == 0 {
+		c.Agent.MemoryPolicy.ReserveRatio = 14
+	}
+	if c.Agent.MemoryPolicy.DefaultTokensPerItem == 0 {
+		c.Agent.MemoryPolicy.DefaultTokensPerItem = 200
 	}
 	if c.Agent.HumanClarifyTimeoutSec == 0 {
 		c.Agent.HumanClarifyTimeoutSec = 120

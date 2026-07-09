@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -33,11 +34,12 @@ type GlobalRetriever interface {
 // 段划分：System（角色+约束）/ TopicGlobal（话题目标）/ SharedState（上游输出+全局知识）/
 // PrivateMemory（私有记忆+快照）。各段受 TokenBudget 限制。
 type ContextAssembler struct {
-	workspace WorkspaceReader    // 工作区读取句柄，提供共享状态
-	globalKB  GlobalRetriever    // 全局知识检索句柄
-	store     PrivateStore       // 私有记忆存储句柄，提供 Episode 读取
-	budget    *types.TokenBudget // 4 段 Token 预算配置
-	scorer    *SearchScorer      // 多信号评分器（可选），nil 时退回重要性排序
+	workspace    WorkspaceReader            // 工作区读取句柄，提供共享状态
+	globalKB     GlobalRetriever            // 全局知识检索句柄
+	store        PrivateStore               // 私有记忆存储句柄，提供 Episode 读取
+	budget       *types.TokenBudget         // 4 段 Token 预算配置
+	scorer       *SearchScorer              // 多信号评分器（可选），nil 时退回重要性排序
+	memoryPolicy *config.MemoryPolicyConfig // 记忆管线策略（可选），nil 时使用旧硬编码比例
 }
 
 // NewContextAssembler 创建上下文构建器并按 contextWindow 动态分配 Token 预算。
@@ -53,22 +55,55 @@ func NewContextAssembler(workspace WorkspaceReader, globalKB GlobalRetriever, st
 		workspace: workspace,
 		globalKB:  globalKB,
 		store:     store,
-		budget:    allocateTokenBudget(contextWindow),
+		budget:    allocateTokenBudget(contextWindow, nil),
+	}
+}
+
+// SetMemoryPolicy 注入记忆管线策略配置，替换默认硬编码比例。
+func (a *ContextAssembler) SetMemoryPolicy(policy *config.MemoryPolicyConfig) {
+	a.memoryPolicy = policy
+	if policy != nil && policy.ContextWindow > 0 {
+		a.budget = allocateTokenBudget(policy.ContextWindow, policy)
 	}
 }
 
 // allocateTokenBudget 按总上下文窗口比例分配各段预算。
 // 比例依据：System/Topic 占比较小，SharedState 与 PrivateMemory 占大头，Reserve 留缓冲。
 // 当 contextWindow 变化时，所有段位同比缩放，保持结构稳定。
-func allocateTokenBudget(contextWindow int) *types.TokenBudget {
+func allocateTokenBudget(contextWindow int, policy *config.MemoryPolicyConfig) *types.TokenBudget {
+	// 未提供策略时使用旧硬编码默认值，保持行为兼容
+	systemRatio, topicRatio, sharedRatio, kbRatio, privateRatio, taskRatio, reserveRatio := 6, 12, 25, 12, 25, 6, 14
+	if policy != nil {
+		if policy.SystemSegmentRatio > 0 {
+			systemRatio = policy.SystemSegmentRatio
+		}
+		if policy.TopicGlobalRatio > 0 {
+			topicRatio = policy.TopicGlobalRatio
+		}
+		if policy.SharedStateRatio > 0 {
+			sharedRatio = policy.SharedStateRatio
+		}
+		if policy.GlobalKBRatio > 0 {
+			kbRatio = policy.GlobalKBRatio
+		}
+		if policy.PrivateMemoryRatio > 0 {
+			privateRatio = policy.PrivateMemoryRatio
+		}
+		if policy.TaskRatio > 0 {
+			taskRatio = policy.TaskRatio
+		}
+		if policy.ReserveRatio > 0 {
+			reserveRatio = policy.ReserveRatio
+		}
+	}
 	return &types.TokenBudget{
-		SystemRole:    max(contextWindow*6/100, 512),   // 系统角色段：soul.md + 角色定义
-		TopicGlobal:   max(contextWindow*12/100, 1024), // 话题全局段：目标与状态
-		SharedState:   max(contextWindow*25/100, 2048), // 共享状态段：上游 Agent 输出
-		GlobalKB:      max(contextWindow*12/100, 1024), // 全局知识段：KnowledgeRecord
-		PrivateMemory: max(contextWindow*25/100, 2048), // 私有记忆段：本 Agent 的 Episode
-		TaskQuery:     max(contextWindow*6/100, 512),   // 任务查询段：当前任务描述
-		Reserve:       max(contextWindow*14/100, 1024), // 预留缓冲，防止超出模型上下文窗口
+		SystemRole:    max(contextWindow*systemRatio/100, 512),    // 系统角色段：soul.md + 角色定义
+		TopicGlobal:   max(contextWindow*topicRatio/100, 1024),   // 话题全局段：目标与状态
+		SharedState:   max(contextWindow*sharedRatio/100, 2048),  // 共享状态段：上游 Agent 输出
+		GlobalKB:      max(contextWindow*kbRatio/100, 1024),      // 全局知识段：KnowledgeRecord
+		PrivateMemory: max(contextWindow*privateRatio/100, 2048), // 私有记忆段：本 Agent 的 Episode
+		TaskQuery:     max(contextWindow*taskRatio/100, 512),     // 任务查询段：当前任务描述
+		Reserve:       max(contextWindow*reserveRatio/100, 1024), // 预留缓冲，防止超出模型上下文窗口
 	}
 }
 
@@ -182,6 +217,9 @@ func (a *ContextAssembler) allocateByRelevance(ctx context.Context, episodes []*
 	}
 
 	avgTokens := 200
+	if a.memoryPolicy != nil && a.memoryPolicy.DefaultTokensPerItem > 0 {
+		avgTokens = a.memoryPolicy.DefaultTokensPerItem
+	}
 	maxCount := budget / avgTokens
 	if maxCount > len(sorted) {
 		maxCount = len(sorted)

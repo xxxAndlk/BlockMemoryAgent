@@ -96,6 +96,8 @@ type BlockMemorySearcher interface {
 	EmbeddingDim() int
 	// Embed 将查询文本编码为向量（P3-3：由 store 层统一封装嵌入实现）。
 	Embed(ctx context.Context, text string) ([]float32, error)
+	// SearchBlockMemoryMaxTokens 返回块记忆检索摘要的 token 上限；<=0 时使用默认值 800。
+	SearchBlockMemoryMaxTokens() int
 }
 
 // SearchBlockMemory 按领域过滤检索块记忆，返回结构化记录。
@@ -116,7 +118,10 @@ func SearchBlockMemory(ctx context.Context, searcher BlockMemorySearcher, domain
 	}
 	var out []*BlockMemoryRecord
 	totalTokens := 0
-	maxTokens := 800 // TokenBudget 20% 保守上限
+	maxTokens := searcher.SearchBlockMemoryMaxTokens()
+	if maxTokens <= 0 {
+		maxTokens = 800 // TokenBudget 20% 保守上限
+	}
 	for _, rec := range recs {
 		if totalTokens >= maxTokens {
 			break

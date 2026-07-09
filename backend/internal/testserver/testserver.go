@@ -96,6 +96,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		return nil, nil, nil, fmt.Errorf("connect postgres with DSN from %s: %w", cfgPath, err)
 	}
 	pgStore.SetEmbeddingDim(cfg.PgVector.Dimensions)
+	pgStore.SetSearchBlockMemoryMaxTokens(cfg.Agent.SearchBlockMemoryMaxTokens)
 
 	embedder, err := EmbedderFactory(cfg, roleCfg)
 	if err != nil {
@@ -147,6 +148,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		pgStore,
 		cfg.Agent.ContextWindow,
 	)
+	contextAssembler.SetMemoryPolicy(&cfg.Agent.MemoryPolicy)
 
 	modelFactory := model.NewModelFactory(roleCfg)
 	if err := modelFactory.WarmUp(ctx); err != nil {
