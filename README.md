@@ -129,8 +129,10 @@ cp .env.example .env  # 填 OPENAI_API_KEY / OPENAI_BASE_URL / POSTGRES_DSN / RE
 # 1. 启动 PostgreSQL + Redis
 docker compose -f docker/docker-compose.yml up -d
 
-# 2. 应用数据库迁移（migrations 001-006，全部应用）
+# 2. 应用数据库迁移（按顺序应用 migrations/*.sql 中所有文件）
 for f in migrations/*.sql; do psql "$POSTGRES_DSN" -f "$f"; done
+# 注：004_memory_write_failures.sql 为历史遗留表，step_count 列与幂等索引
+#     已在 001_init.sql 中创建，应用 004 时不会重复创建或删除现有数据。
 
 # 3. （首次）构建 Web UI
 cd web && pnpm install && pnpm build   # 产物到 web/dist/
@@ -144,7 +146,7 @@ go run ./backend/cmd/demo             # CLI 三层流演示
 go run ./backend/cmd/memory-console   # 记忆检查控制台
 ```
 
-> **关于自动迁移**：`main.go` 把所有装配委托给 `testserver.BuildHandler`，后者启动时会幂等 `Ensure*` 自动建 `session_history` / `session_events` / 001 记忆表。但 `005_session_logs` 与 `006_session_history_meta_memory`（`meta_memory` 列）不在自动迁移覆盖范围内，**必须通过上面的迁移文件应用**，否则 `persistHistory` 写入会失败。
+> **关于自动迁移**：`main.go` 把所有装配委托给 `testserver.BuildHandler`，后者启动时会幂等 `Ensure*` 自动建 `session_history` / `session_events` / 001 记忆表。但 `005_session_logs` 与 `006_session_history_meta_memory`（`meta_memory` 列）不在自动迁移覆盖范围内，**必须按顺序应用 `migrations/*.sql` 中所有文件**，否则 `persistHistory` 写入会失败。`004_memory_write_failures.sql` 为历史遗留死信表，应用时不会创建/删除任何业务数据。
 
 flags：`-config config/config.yaml -roles config/roles.yaml -env .env -soul config/soul.md -skills config/skills.yaml`
 

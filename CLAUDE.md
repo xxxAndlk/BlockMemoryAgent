@@ -32,8 +32,10 @@ go test ./backend/internal/board/...
 # Postgres + Redis via docker (pgvector image)
 docker compose -f docker/docker-compose.yml up -d
 
-# Apply DB schema (migrations 001-006). 005 session_logs & 006 meta_memory column
-# are NOT covered by BuildHandler's idempotent Ensure* auto-migration — apply all files.
+# Apply DB schema (apply all migrations/*.sql in order). 005 session_logs &
+# 006 meta_memory column are NOT covered by BuildHandler's idempotent Ensure*
+# auto-migration. 004_memory_write_failures.sql is a legacy dead-letter table
+# whose step_count/index already live in 001_init.sql — apply all files in order.
 for f in migrations/*.sql; do psql "$POSTGRES_DSN" -f "$f"; done
 ```
 
