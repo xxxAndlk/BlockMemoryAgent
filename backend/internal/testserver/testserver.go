@@ -242,7 +242,24 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	}))
-	mux.HandleFunc("/api/sessions/", wrap(sessionRouter(sessionMgr)))
+
+	// Session subresources use Go 1.22 path variables so handlers can read r.PathValue("id").
+	mux.HandleFunc("/api/sessions/{id}/stream", wrap(sessionMgr.HandleSessionStream))
+	mux.HandleFunc("/api/sessions/{id}/message", wrap(sessionMgr.HandleSessionMessage))
+	mux.HandleFunc("/api/sessions/{id}/board", wrap(sessionMgr.HandleSessionBoard))
+	mux.HandleFunc("/api/sessions/{id}/agents", wrap(sessionMgr.HandleSessionAgents))
+	mux.HandleFunc("/api/sessions/{id}/metrics", wrap(sessionMgr.HandleSessionMetrics))
+	mux.HandleFunc("/api/sessions/{id}/logs", wrap(sessionMgr.HandleSessionLogs))
+	mux.HandleFunc("/api/sessions/{id}/token-metrics", wrap(sessionMgr.HandleSessionTokenMetrics))
+	mux.HandleFunc("/api/sessions/{id}/watchdog", wrap(sessionMgr.HandleSessionWatchdog))
+	mux.HandleFunc("/api/sessions/{id}/mailbox", wrap(sessionMgr.HandleSessionMailbox))
+	mux.HandleFunc("/api/sessions/{id}/clarify", wrap(sessionMgr.HandleSessionClarify))
+	mux.HandleFunc("/api/sessions/{id}/interrupt", wrap(sessionMgr.HandleSessionInterrupt))
+	mux.HandleFunc("/api/sessions/{id}/enqueue", wrap(sessionMgr.HandleSessionEnqueue))
+	mux.HandleFunc("/api/sessions/{id}/cancel", wrap(sessionMgr.HandleSessionCancel))
+	mux.HandleFunc("/api/sessions/{id}/topic", wrap(sessionMgr.HandleSessionTopic))
+	mux.HandleFunc("/api/sessions/{id}", wrap(sessionMgr.HandleGetSession))
+
 	mux.HandleFunc("/api/health", apiHandler.HealthHandler)
 	mux.HandleFunc("/api/metrics", wrap(apiHandler.MetricsHandler))
 	mux.HandleFunc("/api/status", wrap(apiHandler.StatusHandler))
@@ -262,7 +279,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	mux.HandleFunc("/api/memory/levels", wrap(apiHandler.MemoryLevelsHandler))
 	mux.HandleFunc("/api/memory/eval", wrap(apiHandler.MemoryEvalHandler))
 	mux.HandleFunc("/api/skills", wrap(apiHandler.SkillsHandler))
-	mux.HandleFunc("/api/agents/", wrap(agentRouter(apiHandler)))
+	mux.HandleFunc("/api/agents/{id}/skills", wrap(apiHandler.AgentSkillsHandler))
 	mux.HandleFunc("/api/files", wrap(apiHandler.FilesHandler))
 	mux.HandleFunc("/api/files/content", wrap(apiHandler.FileContentHandler))
 
@@ -299,84 +316,6 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	}
 
 	return mux, deps, cleanup, nil
-}
-
-func agentRouter(handler *server.APIHandler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		if len(path) > len("/api/agents/") && path[len(path)-len("/skills"):] == "/skills" {
-			handler.AgentSkillsHandler(w, r)
-			return
-		}
-		http.NotFound(w, r)
-	}
-}
-
-func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/stream"):] == "/stream" {
-			mgr.HandleSessionStream(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/message"):] == "/message" {
-			mgr.HandleSessionMessage(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/board"):] == "/board" {
-			mgr.HandleSessionBoard(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/agents"):] == "/agents" {
-			mgr.HandleSessionAgents(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/metrics"):] == "/metrics" {
-			mgr.HandleSessionMetrics(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/logs"):] == "/logs" {
-			mgr.HandleSessionLogs(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/token-metrics"):] == "/token-metrics" {
-			mgr.HandleSessionTokenMetrics(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/watchdog"):] == "/watchdog" {
-			mgr.HandleSessionWatchdog(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/mailbox"):] == "/mailbox" {
-			mgr.HandleSessionMailbox(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/clarify"):] == "/clarify" {
-			mgr.HandleSessionClarify(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/interrupt"):] == "/interrupt" {
-			mgr.HandleSessionInterrupt(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/enqueue"):] == "/enqueue" {
-			mgr.HandleSessionEnqueue(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/cancel"):] == "/cancel" {
-			mgr.HandleSessionCancel(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") && path[len(path)-len("/topic"):] == "/topic" {
-			mgr.HandleSessionTopic(w, r)
-			return
-		}
-		if len(path) > len("/api/sessions/") {
-			mgr.HandleGetSession(w, r)
-			return
-		}
-		http.NotFound(w, r)
-	}
 }
 
 type pgBlockMemoryAdapter struct {

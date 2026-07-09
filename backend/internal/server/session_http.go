@@ -7,12 +7,12 @@ import (
 	"log"           // 日志输出
 	"net/http"      // HTTP 处理器
 	"sort"          // 会话列表按时间排序
-	"strings"       // 字符串处理
 	"time"          // 时间戳
 
-	"github.com/blockmemory/agent/backend/internal/cmdqueue" // 用户指令队列（特性6）
-	"github.com/blockmemory/agent/backend/pkg/enums"         // 枚举常量
-	"github.com/blockmemory/agent/backend/pkg/types"         // 共享类型
+	"github.com/blockmemory/agent/backend/internal/cmdqueue"         // 用户指令队列（特性6）
+	"github.com/blockmemory/agent/backend/internal/server/eventkind" // 事件类型常量
+	"github.com/blockmemory/agent/backend/pkg/enums"                 // 枚举常量
+	"github.com/blockmemory/agent/backend/pkg/types"                 // 共享类型
 )
 
 // HandleCreateSession 处理 POST /api/sessions，创建并启动新会话。
@@ -25,10 +25,10 @@ func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	var req struct {
+	req, err := DecodeBody[struct {
 		Goal string `json:"goal"`
-	}
-	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
@@ -46,7 +46,7 @@ func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Requ
 // HandleGetSession 处理 GET /api/sessions/{id}，返回单个会话详情。
 // 先查内存，未命中且配置了 Postgres 时回退到 session_history 表，返回最小记录。
 func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Path[len("/api/sessions/"):] // 截取 id
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
@@ -137,8 +137,11 @@ func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Reque
 // HandleSessionBoard 处理 GET /api/sessions/{id}/board，返回任务看板。
 // 返回该会话的 TaskBoard 快照（领域子任务、约束、状态）。若无则返回 null。
 func (m *SessionManager) HandleSessionBoard(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-	id = strings.TrimSuffix(id, "/board") // 剥离 /board 后缀
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+		return
+	}
 
 	session := m.GetSession(id)
 	if session == nil {
@@ -176,8 +179,11 @@ type agentNode struct {
 // HandleSessionAgents 处理 GET /api/sessions/{id}/agents，返回会话内角色实例。
 // 返回该会话所有 RoleInstance（带 RoleDefinition 名称），并附上对应 SessionBlock 的目标。
 func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-	id = strings.TrimSuffix(id, "/agents") // 剥离 /agents 后缀
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+		return
+	}
 
 	session := m.GetSession(id)
 	if session == nil {
@@ -236,18 +242,17 @@ func (m *SessionManager) HandleSessionTopic(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-	id = strings.TrimSuffix(id, "/topic")
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
 
-	var req struct {
+	req, err := DecodeBody[struct {
 		Name string `json:"name"`
 		Goal string `json:"goal,omitempty"`
-	}
-	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
@@ -275,10 +280,10 @@ func (m *SessionManager) HandleSessionTopic(w http.ResponseWriter, r *http.Reque
 	}
 	// 记录话题切换事件
 	session.Events = append(session.Events, SessionEvent{
-		Type:      "progress",
+		Type:      eventkind.Progress,
 		Agent:     "User",
 		Message:   fmt.Sprintf("切换话题: 从 [%s] 到 [%s]", oldDomain, req.Name),
-		Kind:      "topic_switch",
+		Kind:      eventkind.TopicSwitch,
 		Success:   true,
 		Timestamp: time.Now(),
 	})
@@ -313,17 +318,16 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	id := r.URL.Path[len("/api/sessions/"):]
-	id = id[:len(id)-len("/message")] // 剥离 /message 后缀
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
 
-	var req struct {
+	req, err := DecodeBody[struct {
 		Content string `json:"content"`
-	}
-	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
@@ -362,7 +366,7 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 		Timestamp: time.Now(),
 	})
 	session.Events = append(session.Events, SessionEvent{
-		Type:      "user_message",
+		Type:      eventkind.UserMessage,
 		Agent:     "User",
 		Message:   req.Content,
 		Success:   true,

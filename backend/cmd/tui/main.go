@@ -212,7 +212,20 @@ func main() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
-	mux.HandleFunc("/api/sessions/", sessionRouter(sessionMgr))
+
+	// Session subresources use Go 1.22 path variables so handlers can read r.PathValue("id").
+	mux.HandleFunc("/api/sessions/{id}/stream", sessionMgr.HandleSessionStream)
+	mux.HandleFunc("/api/sessions/{id}/message", sessionMgr.HandleSessionMessage)
+	mux.HandleFunc("/api/sessions/{id}/clarify", sessionMgr.HandleSessionClarify)
+	mux.HandleFunc("/api/sessions/{id}/interrupt", sessionMgr.HandleSessionInterrupt)
+	mux.HandleFunc("/api/sessions/{id}/enqueue", sessionMgr.HandleSessionEnqueue)
+	mux.HandleFunc("/api/sessions/{id}/cancel", sessionMgr.HandleSessionCancel)
+	mux.HandleFunc("/api/sessions/{id}/board", sessionMgr.HandleSessionBoard)
+	mux.HandleFunc("/api/sessions/{id}/agents", sessionMgr.HandleSessionAgents)
+	mux.HandleFunc("/api/sessions/{id}/metrics", sessionMgr.HandleSessionMetrics)
+	mux.HandleFunc("/api/sessions/{id}/watchdog", sessionMgr.HandleSessionWatchdog)
+	mux.HandleFunc("/api/sessions/{id}/topic", sessionMgr.HandleSessionTopic)
+	mux.HandleFunc("/api/sessions/{id}", sessionMgr.HandleGetSession)
 
 	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
 	mux.Handle("/api/dag", dagHandler)
@@ -265,51 +278,6 @@ func main() {
 	// 未取消 graph.Invoke goroutine（SSE 流 / goroutine 泄漏到 os.Exit）。
 	ln.Close()
 	agentSvc.Shutdown(context.Background())
-}
-
-// sessionRouter 把 /api/sessions/{id}/{suffix} 路径分发到对应 handler。
-// 路径解析：剥离前缀 → 按 / 切两段 → 第一段为 sessionID，第二段为操作后缀。
-// 未识别后缀走 HandleGetSession（取单会话详情），保持 RESTful 路径风格。
-func sessionRouter(mgr *server.SessionManager) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-		parts := strings.SplitN(path, "/", 2)
-		id := parts[0]
-		suffix := ""
-		if len(parts) == 2 {
-			suffix = parts[1]
-		}
-		if id == "" {
-			http.Error(w, "session id required", http.StatusBadRequest)
-			return
-		}
-		switch suffix {
-		case "stream":
-			mgr.HandleSessionStream(w, r) // SSE 流：实时推送 graph 事件到 TUI
-		case "message":
-			mgr.HandleSessionMessage(w, r)
-		case "clarify":
-			mgr.HandleSessionClarify(w, r) // 特性5：人机对话答复
-		case "interrupt":
-			mgr.HandleSessionInterrupt(w, r) // 特性6：抢占中断
-		case "enqueue":
-			mgr.HandleSessionEnqueue(w, r) // 特性6：队列注入
-		case "cancel":
-			mgr.HandleSessionCancel(w, r) // 取消运行中会话
-		case "board":
-			mgr.HandleSessionBoard(w, r)
-		case "agents":
-			mgr.HandleSessionAgents(w, r)
-		case "metrics":
-			mgr.HandleSessionMetrics(w, r)
-		case "watchdog":
-			mgr.HandleSessionWatchdog(w, r)
-		case "topic":
-			mgr.HandleSessionTopic(w, r)
-		default:
-			mgr.HandleGetSession(w, r) // 无后缀：单会话详情
-		}
-	}
 }
 
 type sinkerNode struct{}

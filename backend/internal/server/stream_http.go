@@ -13,8 +13,11 @@ import (
 // SSE 长连接：先推送当前 session 全量快照，再轮询增量事件，直到会话结束或客户端断开。
 // 副作用：阻塞当前 goroutine 直到 session 结束或客户端断开。
 func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Path[len("/api/sessions/"):]
-	id = id[:len(id)-len("/stream")] // 剥离 /stream 后缀
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+		return
+	}
 
 	session := m.GetSession(id)
 	if session == nil {

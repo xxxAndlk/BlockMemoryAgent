@@ -14,12 +14,13 @@ import (
 	"strings"            // 字符串处理
 	"time"               // 超时与时间戳
 
-	"github.com/blockmemory/agent/backend/internal/memory"      // BlockMemory 检索
-	"github.com/blockmemory/agent/backend/internal/model"       // ModelFactory
-	"github.com/blockmemory/agent/backend/internal/runtime"     // Runtime
-	"github.com/blockmemory/agent/backend/internal/store"       // Postgres / Redis
-	pkgconfig "github.com/blockmemory/agent/backend/pkg/config" // RoleConfigFile
-	"github.com/blockmemory/agent/backend/pkg/types"            // 共享类型
+	"github.com/blockmemory/agent/backend/internal/memory"           // BlockMemory 检索
+	"github.com/blockmemory/agent/backend/internal/model"            // ModelFactory
+	"github.com/blockmemory/agent/backend/internal/runtime"          // Runtime
+	"github.com/blockmemory/agent/backend/internal/server/eventkind" // 事件类型常量
+	"github.com/blockmemory/agent/backend/internal/store"            // Postgres / Redis
+	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"      // RoleConfigFile
+	"github.com/blockmemory/agent/backend/pkg/types"                 // 共享类型
 )
 
 // APIHandler TUI / Web API 处理器
@@ -110,12 +111,12 @@ func (h *APIHandler) RetrieveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
+	req, err := DecodeBody[struct {
 		TopicID string `json:"topic_id"`
 		AgentID string `json:"agent_id"`
 		Query   string `json:"query"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -138,11 +139,11 @@ func (h *APIHandler) EventResolveHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var req struct {
+	req, err := DecodeBody[struct {
 		TopicID string `json:"topic_id"`
 		EventID string `json:"event_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -167,18 +168,17 @@ func (h *APIHandler) SnapshotInspectHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	var req struct {
+	req, err := DecodeBody[struct {
 		TopicID string `json:"topic_id"`
 		AgentID string `json:"agent_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	var snapshot *types.AgentSnapshot
 	if h.snapshotMgr != nil {
-		var err error
 		snapshot, err = h.snapshotMgr.Load(r.Context(), req.AgentID, req.TopicID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -201,10 +201,10 @@ func (h *APIHandler) GraphPauseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
+	req, err := DecodeBody[struct {
 		TopicID string `json:"topic_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -227,10 +227,10 @@ func (h *APIHandler) GraphResumeHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var req struct {
+	req, err := DecodeBody[struct {
 		TopicID string `json:"topic_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -415,7 +415,7 @@ func (h *APIHandler) TimelineHandler(w http.ResponseWriter, r *http.Request) {
 	if h.sessionMgr != nil {
 		for _, s := range h.sessionMgr.ListSessions() {
 			for _, ev := range s.Events {
-				if ev.Kind != "token_usage" {
+				if ev.Kind != eventkind.TokenUsage {
 					continue // 仅统计 token_usage
 				}
 				hourIdx := points - 1 - int(now.Sub(ev.Timestamp).Hours()) // 计算落在第几个时间点
@@ -479,17 +479,16 @@ func (h *APIHandler) SnapshotHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var req struct {
+	req, err := DecodeBody[struct {
 		AgentID string `json:"agent_id"`
 		TopicID string `json:"topic_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	var snap *types.AgentSnapshot
 	if h.snapshotMgr != nil {
-		var err error
 		snap, err = h.snapshotMgr.Load(r.Context(), req.AgentID, req.TopicID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -512,14 +511,14 @@ func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var req struct {
+	req, err := DecodeBody[struct {
 		AgentID string `json:"agent_id"`
 		TopicID string `json:"topic_id"`
 		Domain  string `json:"domain"`
 		Query   string `json:"query"`
 		Limit   int    `json:"limit"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -715,10 +714,10 @@ func (h *APIHandler) MemoryEvalHandler(w http.ResponseWriter, r *http.Request) {
 		switch level {
 		case 0:
 			p.Levels["raw"] = count
-		 grandRaw += count
+			grandRaw += count
 		case 1:
 			p.Levels["standard"] = count
-		 grandStandard += count
+			grandStandard += count
 		default:
 			// 未预期 level：跳过，避免 raw+standard != total 的不一致
 			continue
@@ -776,8 +775,7 @@ func (h *APIHandler) AgentSkillsHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/agents/")
-	id = strings.TrimSuffix(id, "/skills") // 剥离 /skills 后缀
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "agent id required", http.StatusBadRequest)
 		return
@@ -813,7 +811,7 @@ func (h *APIHandler) FilesHandler(w http.ResponseWriter, r *http.Request) {
 		if s != nil {
 			seen := make(map[string]bool) // 文件路径去重
 			for _, ev := range s.Events {
-				if ev.Type != "tool_exec" || ev.Tool != "WriteFile" || !ev.Success || ev.ToolPath == "" {
+				if ev.Type != eventkind.ToolExec || ev.Tool != "WriteFile" || !ev.Success || ev.ToolPath == "" {
 					continue // 仅成功的 WriteFile 事件
 				}
 				if seen[ev.ToolPath] {

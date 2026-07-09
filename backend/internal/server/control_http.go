@@ -4,12 +4,12 @@ import (
 	"encoding/json" // JSON 编解码
 	"log"           // 日志输出
 	"net/http"      // HTTP 处理器
-	"strings"       // 路径处理
 	"time"          // 时间戳
 
-	"github.com/blockmemory/agent/backend/internal/cmdqueue" // 用户指令队列（特性6）
-	"github.com/blockmemory/agent/backend/pkg/enums"         // 枚举常量
-	"github.com/blockmemory/agent/backend/pkg/types"         // 共享类型
+	"github.com/blockmemory/agent/backend/internal/cmdqueue"         // 用户指令队列（特性6）
+	"github.com/blockmemory/agent/backend/internal/server/eventkind" // 事件类型常量
+	"github.com/blockmemory/agent/backend/pkg/enums"                 // 枚举常量
+	"github.com/blockmemory/agent/backend/pkg/types"                 // 共享类型
 )
 
 // HandleSessionClarify 处理 POST /api/sessions/{id}/clarify，提交人机对话答复。
@@ -21,18 +21,17 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-	id = strings.TrimSuffix(id, "/clarify")
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
 
-	var req struct {
+	req, err := DecodeBody[struct {
 		Answer     string `json:"answer"`
 		QuestionID string `json:"question_id"`
-	}
-	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
@@ -67,7 +66,7 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 	session.Status = enums.SessionStatusRunning
 	// 直接 append 事件，避免 addEvent 再次取锁自死锁（此处已持 m.mu）
 	session.Events = append(session.Events, SessionEvent{
-		Type:      "clarify",
+		Type:      eventkind.Clarify,
 		Agent:     "User",
 		Message:   "用户答复: " + req.Answer,
 		Success:   true,
@@ -96,16 +95,15 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-	id = strings.TrimSuffix(id, "/interrupt")
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
-	var req struct {
+	req, err := DecodeBody[struct {
 		Content string `json:"content"`
-	}
-	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
@@ -135,7 +133,7 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 	}
 	// 直接 append 事件，避免 addEvent 再次取锁自死锁
 	session.Events = append(session.Events, SessionEvent{
-		Type:      "interrupt",
+		Type:      eventkind.Interrupt,
 		Agent:     "User",
 		Message:   "抢占中断: " + req.Content,
 		Success:   true,
@@ -170,16 +168,15 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-	id = strings.TrimSuffix(id, "/enqueue")
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
-	var req struct {
+	req, err := DecodeBody[struct {
 		Content string `json:"content"`
-	}
-	if err := DecodeJSONRequest(r.Body, &req); err != nil {
+	}](r)
+	if err != nil {
 		http.Error(w, "请求体无效", http.StatusBadRequest)
 		return
 	}
@@ -209,7 +206,7 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 	}
 	// 直接 append 事件，避免 addEvent 再次取锁自死锁
 	session.Events = append(session.Events, SessionEvent{
-		Type:      "enqueue",
+		Type:      eventkind.Enqueue,
 		Agent:     "User",
 		Message:   "队列注入: " + req.Content,
 		Success:   true,
@@ -242,8 +239,7 @@ func (m *SessionManager) HandleSessionCancel(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-	id = strings.TrimSuffix(id, "/cancel")
+	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "session id required", http.StatusBadRequest)
 		return
@@ -268,7 +264,7 @@ func (m *SessionManager) HandleSessionCancel(w http.ResponseWriter, r *http.Requ
 	now := time.Now()
 	session.EndedAt = &now
 	session.Events = append(session.Events, SessionEvent{
-		Type:      "system",
+		Type:      eventkind.System,
 		Agent:     "System",
 		Message:   "会话已被用户取消",
 		Success:   true,
