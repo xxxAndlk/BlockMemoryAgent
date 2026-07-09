@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/pkg/httputil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -18,7 +19,7 @@ import (
 type OpenAIEmbedder struct {
 	cfg    types.EmbedConfig
 	dim    int
-	client *http.Client
+	client *httputil.RetryableClient
 }
 
 // NewOpenAIEmbedder 创建 OpenAI 兼容 embedding 客户端。
@@ -35,9 +36,11 @@ func NewOpenAIEmbedder(cfg types.EmbedConfig, dim int) *OpenAIEmbedder {
 	return &OpenAIEmbedder{
 		cfg: cfg,
 		dim: dim,
-		client: &http.Client{
-			Timeout: 60 * time.Second,
-		},
+		client: httputil.NewRetryableClient(httputil.RetryConfig{
+			MaxRetries: 3,
+			BaseDelay:  500 * time.Millisecond,
+			MaxDelay:   5 * time.Second,
+		}),
 	}
 }
 
