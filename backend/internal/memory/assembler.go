@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/blockmemory/agent/backend/internal/graph"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -84,10 +83,10 @@ func (a *ContextAssembler) SetScorer(scorer *SearchScorer) { a.scorer = scorer }
 //   - ctx: 取消信号。
 //   - req: 构建请求，包含 AgentID / TopicID / 依赖 / 当前任务 / 快照。
 //
-// 返回：组装好的 *graph.ContextPack（含消息列表与 Token 预算）；失败时返回错误。
+// 返回：组装好的 *types.ContextPack（含消息列表与 Token 预算）；失败时返回错误。
 // 副作用：可能触发 store / workspace / globalKB 的读取操作。
 // 并发安全：实例本身无共享可变状态；底层依赖由实现方保证。
-func (a *ContextAssembler) BuildContext(ctx context.Context, req *graph.BuildRequest) (*graph.ContextPack, error) {
+func (a *ContextAssembler) BuildContext(ctx context.Context, req *types.BuildRequest) (*types.ContextPack, error) {
 	// 1. 获取话题元数据，用于 System 与 TopicGlobal 段。
 	topicMeta, err := a.workspace.GetTopicMeta(ctx, req.TopicID)
 	if err != nil {
@@ -138,7 +137,7 @@ func (a *ContextAssembler) BuildContext(ctx context.Context, req *graph.BuildReq
 	messages := a.buildMessages(topicMeta, constraints, sharedOutputs, selectedEpisodes, globalRecords, req)
 
 	// 返回 ContextPack，包含消息列表与本次使用的 Token 预算。
-	return &graph.ContextPack{
+	return &types.ContextPack{
 		Messages:    messages,
 		TokenBudget: a.budget,
 	}, nil
@@ -206,7 +205,7 @@ func (a *ContextAssembler) allocateByRelevance(ctx context.Context, episodes []*
 //   - globalRecords: 全局知识库召回记录。
 //   - req: 原始构建请求，用于读取 Snapshot 与 TaskQuery。
 //
-// 返回：组装好的 graph.Message 切片。
+// 返回：组装好的 types.Message 切片。
 // 副作用：无。
 func (a *ContextAssembler) buildMessages(
 	topicMeta *types.TopicMeta,
@@ -214,10 +213,10 @@ func (a *ContextAssembler) buildMessages(
 	sharedOutputs []*types.AgentOutput,
 	selectedEpisodes []*types.Episode,
 	globalRecords []*types.KnowledgeRecord,
-	req *graph.BuildRequest,
-) []*graph.Message {
+	req *types.BuildRequest,
+) []*types.Message {
 	// 预声明消息切片，按段位顺序 append。
-	var messages []*graph.Message
+	var messages []*types.Message
 
 	// [System] 角色定义 + 全局约束：固定前缀 + 话题目标 + 约束键值对。
 	systemContent := "You are an AI agent working on a specific task."
@@ -233,14 +232,14 @@ func (a *ContextAssembler) buildMessages(
 		}
 	}
 	// 以 system 角色注入约束段。
-	messages = append(messages, &graph.Message{
+	messages = append(messages, &types.Message{
 		Role:    enums.ChatRoleSystem,
 		Content: systemContent,
 	})
 
 	// [TopicGlobal] 话题目标 + 当前状态：以 user 角色强化目标。
 	if topicMeta != nil {
-		messages = append(messages, &graph.Message{
+		messages = append(messages, &types.Message{
 			Role:    enums.ChatRoleUser,
 			Content: fmt.Sprintf("Topic Goal: %s", topicMeta.Goal),
 		})
@@ -254,7 +253,7 @@ func (a *ContextAssembler) buildMessages(
 			// 每条输出格式：- AgentID (v版本): 摘要。
 			content += fmt.Sprintf("- %s (v%d): %s\n", output.AgentID, output.Version, output.Summary)
 		}
-		messages = append(messages, &graph.Message{
+		messages = append(messages, &types.Message{
 			Role:    enums.ChatRoleUser,
 			Content: content,
 		})
@@ -268,7 +267,7 @@ func (a *ContextAssembler) buildMessages(
 			// 每条知识格式：- [类型] 正文。
 			content += fmt.Sprintf("- [%s] %s\n", rec.KnowledgeType, rec.Content)
 		}
-		messages = append(messages, &graph.Message{
+		messages = append(messages, &types.Message{
 			Role:    enums.ChatRoleUser,
 			Content: content,
 		})
@@ -282,7 +281,7 @@ func (a *ContextAssembler) buildMessages(
 			// 每条历史格式：- [StepID] 摘要 (importance: 分值)。
 			content += fmt.Sprintf("- [%s] %s (importance: %.2f)\n", ep.StepID, ep.ObservationSummary, ep.Importance)
 		}
-		messages = append(messages, &graph.Message{
+		messages = append(messages, &types.Message{
 			Role:    enums.ChatRoleUser,
 			Content: content,
 		})
@@ -296,14 +295,14 @@ func (a *ContextAssembler) buildMessages(
 			// 每条问题格式：- 问题ID: 描述。
 			content += fmt.Sprintf("- %s: %s\n", issue.ID, issue.Description)
 		}
-		messages = append(messages, &graph.Message{
+		messages = append(messages, &types.Message{
 			Role:    enums.ChatRoleUser,
 			Content: content,
 		})
 	}
 
 	// [Task] 当前任务：最后一条消息，明确本次调用需要 LLM 解决的问题。
-	messages = append(messages, &graph.Message{
+	messages = append(messages, &types.Message{
 		Role:    enums.ChatRoleUser,
 		Content: fmt.Sprintf("Current task: %s", req.TaskQuery),
 	})

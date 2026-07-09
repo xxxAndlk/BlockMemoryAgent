@@ -6,7 +6,6 @@ package graph
 import (
 	"context"
 
-	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -80,26 +79,8 @@ func getString(m map[string]any, key string) string {
 	return "" // key 不存在或类型不符
 }
 
-// BuildRequest 上下文构建请求。
-// 由节点向 memory 模块发起，请求组装一段上下文（消息列表 + Token 预算）。
-type BuildRequest struct {
-	AgentID   string               // 请求方实例 ID
-	TopicID   string               // 主题 ID（记忆检索锚点）
-	DependsOn []string             // 依赖的其他 Agent 输出 ID
-	TaskQuery string               // 任务查询串（用于语义检索）
-	Snapshot  *types.AgentSnapshot // 快照（可选，用于恢复上下文）
-}
-
-// ContextPack 上下文包。
-// BuildRequest 的响应：组装好的消息列表 + Token 预算信息。
-type ContextPack struct {
-	Messages    []*Message         // 组装好的对话消息（System/User/Assistant）
-	TokenBudget *types.TokenBudget // Token 预算（分四段：System/TopicGlobal/SharedState/PrivateMemory）
-}
-
-// Message 消息。
-// 轻量级消息结构，与 Eino SDK 解耦，便于在节点间传递。
-type Message struct {
-	Role    enums.ChatRole // 角色：system / user / assistant
-	Content string         // 消息内容
-}
+// BuildRequest、ContextPack、Message 已下移到 pkg/types，避免 memory 包反向依赖 graph。
+// 这里保留类型别名，保证 graph 包内部调用点无需修改，同时让外部消费者逐步迁移到 pkg/types。
+type BuildRequest = types.BuildRequest
+type ContextPack = types.ContextPack
+type Message = types.Message
