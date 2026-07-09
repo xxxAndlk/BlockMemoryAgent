@@ -15,6 +15,9 @@ import (
 	"time" // 记录 Decision.OccurredAt 时间戳
 )
 
+// defaultEstimator 是包级默认估算器，供 Estimator 兼容函数使用。
+var defaultEstimator TokenEstimator = ByteRatioEstimator{}
+
 // Estimator 根据文本长度粗略估算 token 数（4 字符 ≈ 1 token）。
 //
 // 职责：用 "4 字符 ≈ 1 token" 的经验值把字符串长度映射为 token 估计值，
@@ -31,16 +34,10 @@ import (
 //
 // 注意：v3 文档显式提示当前估算"不准确"，但相对值能够稳定区分
 // "正常 / 接近阈值 / 已超阈值"，已足够 Watchdog 决策使用。
+//
+// 本函数为兼容旧调用方的包级入口，内部委托给 defaultEstimator。
 func Estimator(text string) int {
-	// 空文本直接返回 0，避免后续无意义计算
-	if text == "" {
-		return 0
-	}
-	// 取字节数（非 rune 数）；中文每 rune 约 3 字节，折算后约 1.5 token/rune，
-	// 英文按 4 char ≈ 1 token，整体误差在 Watchdog 决策可接受范围内
-	bytes := len(text)
-	// +1 保证非空文本至少记 1 token，避免整数除法下溢为 0
-	return bytes/4 + 1
+	return defaultEstimator.Estimate(text)
 }
 
 // Level 表示 Watchdog 一次检查所判定的触发级别（OK/Warn/Compress/Evict）。
@@ -120,10 +117,11 @@ func ConfigForWindow(contextWindow int) Config {
 //
 // 并发安全：所有方法均通过 mu 保护 decisions，可被多 goroutine 并发调用。
 type Watchdog struct {
-	cfg       Config       // 软/硬阈值配置
-	mu        sync.RWMutex // 保护 decisions 切片的读写锁
-	decisions []Decision   // 历史决策缓冲（最新追加到尾部，超出 max 丢弃最旧）
-	max       int          // 历史决策最大保留数，超出则丢弃最旧
+	cfg       Config         // 软/硬阈值配置
+	mu        sync.RWMutex   // 保护 decisions 切片的读写锁
+	decisions []Decision     // 历史决策缓冲（最新追加到尾部，超出 max 丢弃最旧）
+	max       int            // 历史决策最大保留数，超出则丢弃最旧
+	estimator TokenEstimator // token 估算策略
 }
 
 // New 创建一个 Watchdog 实例。
@@ -140,7 +138,7 @@ type Watchdog struct {
 func New(cfg Config) *Watchdog {
 	cfg = normalizeConfig(cfg)
 	// max=200 限制历史决策条数，防止长会话内存无限增长
-	return &Watchdog{cfg: cfg, max: 200}
+	return &Watchdog{cfg: cfg, max: 200, estimator: ByteRatioEstimator{}}
 }
 
 // SetConfig 运行时更新 Watchdog 阈值。
@@ -150,6 +148,17 @@ func (w *Watchdog) SetConfig(cfg Config) {
 	cfg = normalizeConfig(cfg)
 	w.mu.Lock()
 	w.cfg = cfg
+	w.mu.Unlock()
+}
+
+// SetTokenEstimator 运行时更新 token 估算策略；传入 nil 时恢复为 ByteRatioEstimator。
+// 并发安全：持写锁更新 estimator。
+func (w *Watchdog) SetTokenEstimator(e TokenEstimator) {
+	if e == nil {
+		e = ByteRatioEstimator{}
+	}
+	w.mu.Lock()
+	w.estimator = e
 	w.mu.Unlock()
 }
 
@@ -179,8 +188,12 @@ func normalizeConfig(cfg Config) Config {
 //
 // 并发安全：写 decisions 时持写锁，可并发调用。
 func (w *Watchdog) Check(agentID string, contextText string) Decision {
+	// 在锁保护下读取 estimator，避免与 SetTokenEstimator 并发竞态
+	w.mu.RLock()
+	estimator := w.estimator
+	w.mu.RUnlock()
 	// 估算当前上下文 token 数
-	tokens := Estimator(contextText)
+	tokens := estimator.Estimate(contextText)
 	// 组装决策结构体，时间戳取当前时刻
 	d := Decision{
 		AgentID:    agentID,

@@ -39,15 +39,21 @@ type LLMClient interface {
 // 并发安全：所有读写均经 mu 保护。
 // 副作用：无外部副作用，纯内存结构。
 type Pool struct {
-	mu     sync.RWMutex
-	skills map[string]*types.Skill // skill_id -> skill，键为 SkillID
+	mu              sync.RWMutex
+	skills          map[string]*types.Skill // skill_id -> skill，键为 SkillID
+	selectionPolicy SkillSelectionPolicy    // 二次选择策略（AssembleSet 使用）
+	pickOnePolicy   SkillPickOnePolicy      // “1 选 1”策略（SelectOne 使用）
 }
 
 // NewPool 创建空 Skill 池
 //
 // 返回：指向已初始化 skills map 的 *Pool，可直接 Register。
 func NewPool() *Pool {
-	return &Pool{skills: make(map[string]*types.Skill)}
+	return &Pool{
+		skills:          make(map[string]*types.Skill),
+		selectionPolicy: &DefaultSkillPolicy{},
+		pickOnePolicy:   &DefaultSkillPolicy{},
+	}
 }
 
 // NewPoolFromSkills 从已有 Skill 列表构建（常用于 yaml 启动加载）
@@ -60,6 +66,26 @@ func NewPoolFromSkills(skills []*types.Skill) *Pool {
 		p.Register(s) // 逐个注册，复用 Register 的空值/空 ID 校验
 	}
 	return p
+}
+
+// SetSelectionPolicy 设置 Skill 二次选择策略；传入 nil 时恢复为默认策略。
+func (p *Pool) SetSelectionPolicy(policy SkillSelectionPolicy) {
+	if policy == nil {
+		policy = &DefaultSkillPolicy{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.selectionPolicy = policy
+}
+
+// SetPickOnePolicy 设置“1 选 1”决策策略；传入 nil 时恢复为默认策略。
+func (p *Pool) SetPickOnePolicy(policy SkillPickOnePolicy) {
+	if policy == nil {
+		policy = &DefaultSkillPolicy{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pickOnePolicy = policy
 }
 
 // Register 注册一个 Skill；同 ID 覆盖
@@ -165,8 +191,12 @@ func (p *Pool) AssembleSet(ctx context.Context, llm LLMClient, ownerAgent, domai
 		}
 	}
 
-	// 候选过多，交 LLM 做相关性二次选择
-	picked := llmPickSkills(ctx, llm, candidates, domain, goal, maxKeep)
+	// 候选过多，注入运行时 LLM 并委托给选择策略
+	policy := p.selectionPolicy
+	if dp, ok := policy.(*DefaultSkillPolicy); ok {
+		policy = dp.WithLLM(llm)
+	}
+	picked, _ := policy.Select(ctx, candidates, domain, goal, maxKeep)
 	if len(picked) == 0 {
 		// LLM 失败兜底：按 Cost 升序排序后截断，保证不空返
 		picked = trimSkills(candidates, maxKeep)
@@ -174,7 +204,7 @@ func (p *Pool) AssembleSet(ctx context.Context, llm LLMClient, ownerAgent, domai
 	return &types.SkillSet{
 		OwnerAgent: ownerAgent,
 		Domain:     domain,
-		Skills:     picked, // LLM 选出的子集
+		Skills:     picked, // 策略选出的子集
 		CreatedAt:  time.Now(),
 	}
 }
@@ -300,34 +330,36 @@ func llmPickSkills(ctx context.Context, llm LLMClient, candidates []*types.Skill
 //
 // 如果 LLM 认为现有 Skill 都不合适，返回 ""，调用方可决定是否
 // 走"扩展技能"分支（v3 §5.3）。
+// SelectOne 给定 SkillSet 与具体 task，请 LLM 返回最合适的一个 SkillID。
+//
+// 本函数为兼容旧调用方的包级入口，内部委托给 DefaultSkillPolicy。
 func SelectOne(ctx context.Context, llm LLMClient, set *types.SkillSet, task string) string {
-	// 防御：空 set、空 Skills、无 LLM 时直接放弃决策
 	if set == nil || len(set.Skills) == 0 || llm == nil {
 		return ""
 	}
-	// 决策 prompt：仅给 ID + 描述，要求输出单一 skill_id 或 NONE
-	prompt := fmt.Sprintf(`你是 Skill 调用决策器。当前 Agent 持有以下 Skill：
-%s
-请基于任务选择最合适的一个 Skill，输出其 skill_id。
-若无任何 Skill 合适，输出 "NONE"。
-任务: %s
+	picked, _ := NewDefaultSkillPolicy(llm).PickOne(ctx, set.Skills, task)
+	if picked == nil {
+		return ""
+	}
+	return picked.SkillID
+}
 
-仅输出 skill_id 或 NONE，不要其他文字。`, set.PromptList(), task)
-	resp, err := llm.Generate(ctx, prompt)
-	if err != nil {
-		return "" // LLM 调用失败，返回空交由调用方处理
+// SelectOne 在 Pool 持有的 pickOnePolicy 上执行“1 选 1”决策。
+func (p *Pool) SelectOne(ctx context.Context, llm LLMClient, set *types.SkillSet, task string) string {
+	if set == nil || len(set.Skills) == 0 || llm == nil {
+		return ""
 	}
-	resp = strings.TrimSpace(resp)
-	if resp == "" || strings.EqualFold(resp, "NONE") {
-		return "" // LLM 明确表示无合适 Skill
+	p.mu.RLock()
+	policy := p.pickOnePolicy
+	p.mu.RUnlock()
+	if dp, ok := policy.(*DefaultSkillPolicy); ok {
+		policy = dp.WithLLM(llm)
 	}
-	// 校验 ID 合法：必须命中 set 内已有 Skill，防止 LLM 幻觉输出不存在的 ID
-	for _, s := range set.Skills {
-		if strings.EqualFold(strings.TrimSpace(resp), s.SkillID) {
-			return s.SkillID
-		}
+	picked, _ := policy.PickOne(ctx, set.Skills, task)
+	if picked == nil {
+		return ""
 	}
-	return "" // LLM 输出的 ID 不在 set 中，视为无效
+	return picked.SkillID
 }
 
 // extractJSONArray 从 LLM 响应中提取第一个 JSON 数组

@@ -31,9 +31,11 @@ type Persona struct {
 //   - current 用 atomic.Pointer 实现 RCU 风格的读多写少场景，避免读路径加锁；
 //   - 写路径（Load/Reload）通过 Store 原子发布新 Persona，旧读者持有旧快照不受影响。
 type Loader struct {
-	mu      sync.RWMutex            // 保留以扩展静态字段；当前 path 不可变
-	path    string                  // soul.md 文件路径，空串表示无文件
-	current atomic.Pointer[Persona] // 当前人格快照，可能为 nil（未加载）
+	mu          sync.RWMutex            // 保留以扩展静态字段；当前 path 不可变
+	path        string                  // soul.md 文件路径，空串表示无文件
+	current     atomic.Pointer[Persona] // 当前人格快照，可能为 nil（未加载）
+	classifier  TaskKindClassifier      // 任务类别分类策略
+	temperature TemperaturePolicy       // 温度策略
 }
 
 // NewLoader 创建加载器。
@@ -42,7 +44,12 @@ type Loader struct {
 // 即便文件缺失，后续 Current() 仍会返回空 Persona，保证服务可启动。
 func NewLoader(path string) *Loader {
 	// 记录 soul.md 路径；current 为 nil，待 Load/Current 填充。
-	return &Loader{path: path}
+	// 分类与温度策略默认使用当前逻辑，保持行为不变。
+	return &Loader{
+		path:        path,
+		classifier:  KeywordClassifier{},
+		temperature: NewDefaultTemperaturePolicy(),
+	}
 }
 
 // Load 立即加载 soul.md 并原子发布新 Persona。
@@ -139,6 +146,36 @@ func (l *Loader) Inject(systemPrompt string) string {
 	return content + "\n\n---\n\n" + systemPrompt
 }
 
+// Classify 使用 Loader 持有的分类策略推断任务类别。
+func (l *Loader) Classify(text string) TaskKind {
+	return l.classifier.Classify(text)
+}
+
+// Temperature 使用 Loader 持有的温度策略返回推荐温度。
+func (l *Loader) Temperature(kind TaskKind, base float64) float64 {
+	return l.temperature.Temperature(kind, base)
+}
+
+// SetClassifier 设置任务类别分类策略；传入 nil 时恢复默认。
+func (l *Loader) SetClassifier(c TaskKindClassifier) {
+	if c == nil {
+		c = KeywordClassifier{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.classifier = c
+}
+
+// SetTemperaturePolicy 设置温度策略；传入 nil 时恢复默认。
+func (l *Loader) SetTemperaturePolicy(tp TemperaturePolicy) {
+	if tp == nil {
+		tp = NewDefaultTemperaturePolicy()
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.temperature = tp
+}
+
 // TaskKind 表示调节 temperature 时使用的任务类别。
 //
 // 用字符串枚举而非 int，便于日志可读与 YAML 配置直接映射。
@@ -154,6 +191,12 @@ const (
 	KindGeneric   TaskKind = "generic"   // 默认 → 配置温度
 )
 
+// 包级默认策略实例，保证旧有包级函数行为不变。
+var (
+	defaultClassifier      TaskKindClassifier = KeywordClassifier{}
+	defaultTemperaturePolicy TemperaturePolicy = NewDefaultTemperaturePolicy()
+)
+
 // Temperature 返回任务类别对应的推荐温度。
 //
 // 参数：
@@ -162,33 +205,9 @@ const (
 //	base - 当前角色配置文件里的默认温度，仅作为 KindGeneric 的回退。
 //
 // 返回：0~1 之间的推荐 temperature。
-// 设计意图：路由/总结类需要确定性输出（0），代码类略放开（0.15），
-//
-//	分析推理中度（0.3），创意类最宽松（0.8），其余沿用配置默认值。
-//
 // 副作用：无。并发安全：纯函数。
 func Temperature(kind TaskKind, base float64) float64 {
-	// 按类别分发到推荐温度值。
-	switch kind {
-	case KindRouting, KindSummarize:
-		// 需要稳定可复现的输出，温度置 0。
-		return 0.0
-	case KindCode:
-		// 代码生成保留极低随机性，兼顾多样性与正确性。
-		return 0.15
-	case KindAnalysis:
-		// 推理类适度放开，允许探索不同思路分支。
-		return 0.3
-	case KindCreative:
-		// 创意类大幅放开，鼓励发散。
-		return 0.8
-	case KindGeneric:
-		// 显式 fallthrough 到 default，复用配置默认温度。
-		fallthrough
-	default:
-		// 未知类别或 Generic：回退到角色配置温度。
-		return base
-	}
+	return defaultTemperaturePolicy.Temperature(kind, base)
 }
 
 // InferKind 根据自然语言任务描述启发式推断 TaskKind。
@@ -200,50 +219,6 @@ func Temperature(kind TaskKind, base float64) float64 {
 //
 // 返回：推断出的 TaskKind；无匹配时返回 KindGeneric。
 // 副作用：无。并发安全：纯函数。
-// 匹配顺序按优先级排列：路由 > 总结 > 代码 > 创意 > 分析，先命中先返回。
 func InferKind(text string) TaskKind {
-	// 大小写归一，提升英文关键词匹配命中率。
-	lower := strings.ToLower(text)
-	// 按优先级逐类匹配关键词集合。
-	switch {
-	case containsAny(lower, []string{"路由", "选择 skill", "select skill", "判断", "决定"}):
-		// 命中路由/决策类词汇。
-		return KindRouting
-	case containsAny(lower, []string{"总结", "摘要", "压缩", "summary", "summarize"}):
-		// 命中总结/压缩类词汇。
-		return KindSummarize
-	case containsAny(lower, []string{"代码", "code", "bug", "重构", "math"}):
-		// 命中代码/数学类词汇。
-		return KindCode
-	case containsAny(lower, []string{"创意", "头脑风暴", "brainstorm", "文案", "营销"}):
-		// 命中创意/文案类词汇。
-		return KindCreative
-	case containsAny(lower, []string{"分析", "排查", "诊断", "为什么", "why"}):
-		// 命中分析/诊断类词汇。
-		return KindAnalysis
-	}
-	// 无任何关键词命中：返回默认类别，交由 Temperature 使用 base。
-	return KindGeneric
-}
-
-// containsAny 判断 s 是否包含 words 中任意一个子串。
-//
-// 用于 InferKind 的关键词集合匹配；命中任一即返回 true。
-// 参数：
-//
-//	s     - 已归一化的待匹配文本；
-//	words - 关键词列表（顺序无关）。
-//
-// 返回：true 表示至少命中一个关键词。
-// 副作用：无。并发安全：纯函数。
-func containsAny(s string, words []string) bool {
-	// 线性扫描关键词列表。
-	for _, w := range words {
-		// 子串命中即提前返回。
-		if strings.Contains(s, w) {
-			return true
-		}
-	}
-	// 全部未命中。
-	return false
+	return defaultClassifier.Classify(text)
 }
