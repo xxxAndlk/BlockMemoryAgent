@@ -1,8 +1,8 @@
 package main
 
-// cmd/tui 是 bubbletea 终端 UI 入口：在进程内直接持有 Runtime / SessionManager / Graph，
-// 同时启动一个本地 HTTP 端口供 TUI 输入栏调用 /api/sessions/* /api/dag/*。
-// 启动策略为严格模式：任一必需配置文件缺失，或 PostgreSQL / LLM 后端不可达，立即失败并明确报告。
+// cmd/tui is the bubbletea terminal UI entry point. It bootstraps the same
+// backend wiring as the HTTP server, then starts a local auth-free HTTP server
+// so the TUI input bar can POST to /api/sessions/* and /api/dag/*.
 
 import (
 	"context"
@@ -13,29 +13,16 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-isatty"
 	"github.com/mattn/go-runewidth"
 
-	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/bootstrap"
 	"github.com/blockmemory/agent/backend/internal/config"
-	"github.com/blockmemory/agent/backend/internal/dag"
-	"github.com/blockmemory/agent/backend/internal/embed"
-	"github.com/blockmemory/agent/backend/internal/graph"
-	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/logging"
-	"github.com/blockmemory/agent/backend/internal/memory"
-	"github.com/blockmemory/agent/backend/internal/model"
-	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
-	"github.com/blockmemory/agent/backend/internal/skill"
-	"github.com/blockmemory/agent/backend/internal/store"
 	"github.com/blockmemory/agent/backend/internal/tui"
-	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
-	"github.com/blockmemory/agent/backend/pkg/enums"
-	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 func main() {
@@ -90,113 +77,22 @@ func main() {
 
 	ctx := context.Background()
 
-	if cfg.Postgres.DSN == "" {
-		log.Fatalf("postgres DSN not configured in %s", *configPath)
-	}
-	pgStore, err := store.NewPostgresStore(ctx, cfg.Postgres.DSN)
+	app, err := bootstrap.Build(ctx, bootstrap.ConfigPaths{
+		ConfigPath: *configPath,
+		RolePath:   *rolePath,
+		EnvPath:    *envPath,
+		SoulPath:   *soulPath,
+		SkillPath:  *skillPath,
+	})
 	if err != nil {
-		log.Fatalf("connect postgres: %v", err)
-	}
-	pgStore.SetEmbeddingDim(cfg.PgVector.Dimensions)
-	pgStore.SetSearchBlockMemoryMaxTokens(cfg.Agent.SearchBlockMemoryMaxTokens)
-	defer pgStore.Close()
-	if err := store.EnsureSessionHistorySchema(ctx, pgStore.DB()); err != nil {
-		log.Fatalf("ensure session_history schema: %v", err)
-	}
-	if err := store.EnsureSessionEventsSchema(ctx, pgStore.DB()); err != nil {
-		log.Fatalf("ensure session_events schema: %v", err)
-	}
-	if err := store.EnsureDAGSchema(ctx, pgStore.DB()); err != nil {
-		log.Fatalf("ensure dag_jobs schema: %v", err)
-	}
-	if err := store.EnsureInitialMemorySchema(ctx, pgStore.DB()); err != nil {
-		log.Fatalf("ensure memory schema: %v", err)
-	}
-
-	roleCfg, err := pkgconfig.LoadRoleConfig(*rolePath)
-	if err != nil {
-		log.Fatalf("load roles: %v", err)
-	}
-
-	embedder, err := embed.NewEmbedder(roleCfg.Embed, cfg.PgVector.Dimensions)
-	if err != nil {
-		log.Fatalf("create embedder: %v", err)
-	}
-	pgStore.SetEmbedder(embedder)
-
-	modelFactory := model.NewModelFactory(roleCfg)
-	if err := modelFactory.WarmUp(ctx); err != nil {
-		log.Fatalf("warmup models: %v", err)
-	}
-	// P0-1：启动期 LLM 连通性校验，失败则启动失败并报告未连通角色。
-	if err := modelFactory.VerifyConnectivity(ctx); err != nil {
 		// logging.Init(silent=true) 已把 log 输出重定向到日志文件，
 		// log.Fatalf 不会在终端显示失败原因，用户只看到 "exit status 1"。
 		// 这里先 fmt.Fprintln 到 stderr 让终端可见，再 log.Fatal 写文件留痕并退出。
-		msg := fmt.Sprintf("启动失败：LLM 连通性校验未通过: %v", err)
+		msg := fmt.Sprintf("启动失败：backend wiring 未通过: %v", err)
 		fmt.Fprintln(os.Stderr, msg)
 		log.Fatal(msg)
 	}
-
-	registry := graph.NewRoleRegistry(roleCfg)
-	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
-
-	skillPool, err := skill.LoadFromYAML(*skillPath)
-	if err != nil {
-		log.Fatalf("load skills: %v", err)
-	}
-
-	rt, err := runtime.New(*soulPath, skillPool)
-	if err != nil {
-		log.Fatalf("init runtime: %v", err)
-	}
-	if cfg.Agent.StallSteps > 0 {
-		rt.SetAgentConfig(&cfg.Agent)
-	}
-
-	// 结构化日志器：TUI 模式下与标准 log 共用同一文件 writer，避免 JSON 日志刷到终端顶乱布局。
-	// 仍写 session_logs 表。
-	var sessionLogger *logger.Logger
-	logWriter := logging.Writer()
-	if logWriter == nil {
-		logWriter = os.Stderr
-	}
-	sessionLogger = logger.NewWithWriter(pgStore, logWriter)
-
-	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
-	metaAgent.SetModelFactory(modelFactory)
-	metaAgent.SetRuntime(rt)
-	metaAgent.SetHistoryStore(&pgHistoryAdapter{pg: pgStore})
-	escalation := graph.NewEscalationHandlerNode()
-	sinker := &sinkerNode{}
-
-	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
-	builder.SetModelFactory(modelFactory)
-	builder.SetRuntime(rt)
-	builder.SetLogger(sessionLogger)
-	builder.AddNode(metaAgent)
-	builder.AddNode(escalation)
-	builder.AddNode(sinker)
-	threeLayerGraph := builder.Build()
-
-	sessionMgr := server.NewSessionManager(threeLayerGraph, registry)
-	sessionMgr.SetPostgresStore(pgStore)
-	sessionMgr.SetModelFactory(modelFactory) // 注入模型工厂，续话时调轻量模型总结历史
-
-	agentSvc := agent.NewService(threeLayerGraph, registry, rt,
-		agent.WithSessionManager(sessionMgr),
-		agent.WithPostgresStore(pgStore),
-		agent.WithModelFactory(modelFactory),
-	)
-
-	// 每次对话作为新对话，不加载跨会话历史。仅在子Agent领域需要时检索块记忆。
-	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, embedder: embedder, dim: cfg.PgVector.Dimensions})
-
-	var dagScheduler *dag.Scheduler
-	if cfg.Agent.DAGEnabled {
-		dagScheduler = dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
-		dagScheduler.Start(ctx)
-	}
+	defer app.Close()
 
 	// Start a local HTTP server so the TUI input bar can POST to /api/sessions/* and /api/dag/*.
 	// 这里不直接复用 server.api.go 是因为 TUI 进程内已持有 SessionManager/Graph 实例，
@@ -205,34 +101,33 @@ func main() {
 	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			sessionMgr.HandleListSessions(w, r)
+			app.Server.HandleListSessions(w, r)
 		case http.MethodPost:
-			sessionMgr.HandleCreateSession(w, r)
+			app.Server.HandleCreateSession(w, r)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
 
 	// Session subresources use Go 1.22 path variables so handlers can read r.PathValue("id").
-	mux.HandleFunc("/api/sessions/{id}/stream", sessionMgr.HandleSessionStream)
-	mux.HandleFunc("/api/sessions/{id}/message", sessionMgr.HandleSessionMessage)
-	mux.HandleFunc("/api/sessions/{id}/clarify", sessionMgr.HandleSessionClarify)
-	mux.HandleFunc("/api/sessions/{id}/interrupt", sessionMgr.HandleSessionInterrupt)
-	mux.HandleFunc("/api/sessions/{id}/enqueue", sessionMgr.HandleSessionEnqueue)
-	mux.HandleFunc("/api/sessions/{id}/cancel", sessionMgr.HandleSessionCancel)
-	mux.HandleFunc("/api/sessions/{id}/board", sessionMgr.HandleSessionBoard)
-	mux.HandleFunc("/api/sessions/{id}/agents", sessionMgr.HandleSessionAgents)
-	mux.HandleFunc("/api/sessions/{id}/metrics", sessionMgr.HandleSessionMetrics)
-	mux.HandleFunc("/api/sessions/{id}/watchdog", sessionMgr.HandleSessionWatchdog)
-	mux.HandleFunc("/api/sessions/{id}/topic", sessionMgr.HandleSessionTopic)
-	mux.HandleFunc("/api/sessions/{id}", sessionMgr.HandleGetSession)
+	mux.HandleFunc("/api/sessions/{id}/stream", app.Server.HandleSessionStream)
+	mux.HandleFunc("/api/sessions/{id}/message", app.Server.HandleSessionMessage)
+	mux.HandleFunc("/api/sessions/{id}/clarify", app.Server.HandleSessionClarify)
+	mux.HandleFunc("/api/sessions/{id}/interrupt", app.Server.HandleSessionInterrupt)
+	mux.HandleFunc("/api/sessions/{id}/enqueue", app.Server.HandleSessionEnqueue)
+	mux.HandleFunc("/api/sessions/{id}/cancel", app.Server.HandleSessionCancel)
+	mux.HandleFunc("/api/sessions/{id}/board", app.Server.HandleSessionBoard)
+	mux.HandleFunc("/api/sessions/{id}/agents", app.Server.HandleSessionAgents)
+	mux.HandleFunc("/api/sessions/{id}/metrics", app.Server.HandleSessionMetrics)
+	mux.HandleFunc("/api/sessions/{id}/watchdog", app.Server.HandleSessionWatchdog)
+	mux.HandleFunc("/api/sessions/{id}/topic", app.Server.HandleSessionTopic)
+	mux.HandleFunc("/api/sessions/{id}", app.Server.HandleGetSession)
 
-	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
-	mux.Handle("/api/dag", dagHandler)
-	mux.Handle("/api/dag/", dagHandler)
+	mux.Handle("/api/dag", app.DAGHandler)
+	mux.Handle("/api/dag/", app.DAGHandler)
 
 	apiHandler := server.NewAPIHandler(nil)
-	apiHandler.SetSessionManager(sessionMgr)
+	apiHandler.SetSessionManager(app.Server)
 	mux.HandleFunc("/api/metrics", apiHandler.MetricsHandler)
 
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -254,8 +149,8 @@ func main() {
 	httpAddr := "http://" + ln.Addr().String()
 	log.Printf("TUI backend listening at %s", httpAddr)
 
-	modelName := roleCfg.MetaAgent.ModelConfig.Model
-	model := tui.NewModel(agentSvc, rt, dagHandler, pgStore, httpAddr, modelName, modelFactory)
+	modelName := app.RoleConfig.MetaAgent.ModelConfig.Model
+	model := tui.NewModel(app.Agent, app.Runtime, app.DAGHandler, app.Postgres, httpAddr, modelName, app.ModelFactory)
 
 	// CI 环境或 stdin 非 TTY 时自动禁用 alt-screen，避免输出被吞或光标异常。
 	useAltScreen := !*noAltScreen && os.Getenv("CI") == "" && isatty.IsTerminal(os.Stdin.Fd())
@@ -277,80 +172,5 @@ func main() {
 	// 原实现仅靠 defer pgStore.Close()，未关闭 ln（端口悬挂到进程退出）、
 	// 未取消 graph.Invoke goroutine（SSE 流 / goroutine 泄漏到 os.Exit）。
 	ln.Close()
-	agentSvc.Shutdown(context.Background())
-}
-
-type sinkerNode struct{}
-
-func (s *sinkerNode) Name() string { return "Sinker" }
-
-func (s *sinkerNode) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	state.NextAction = enums.ActionFinish
-	return state, nil
-}
-
-type pgBlockMemoryAdapter struct {
-	pg       *store.PostgresStore
-	embedder embed.Embedder
-	dim      int
-}
-
-func (a *pgBlockMemoryAdapter) SaveBlockMemory(ctx context.Context, sessionID, domain, goal, summary string, facts []graph.BlockMemoryFact) error {
-	memFacts := make([]memory.Fact, 0, len(facts))
-	for _, f := range facts {
-		memFacts = append(memFacts, memory.Fact{Key: f.Key, Value: f.Value, Scope: memory.FactScope(f.Scope)})
-	}
-	rec, err := (&memory.BlockMemoryRecord{
-		SessionID: sessionID,
-		Domain:    domain,
-		Goal:      goal,
-		Summary:   summary,
-		Facts:     memFacts,
-		CreatedAt: time.Now(),
-	}).ToKnowledgeRecord(ctx, a.embedder, a.dim)
-	if err != nil {
-		return fmt.Errorf("convert block memory: %w", err)
-	}
-	return a.pg.SaveKnowledge(ctx, rec)
-}
-
-func (a *pgBlockMemoryAdapter) SearchBlockMemory(ctx context.Context, domain, query string, topK int) (string, error) {
-	recs, err := memory.SearchBlockMemory(ctx, a.pg, domain, query, topK)
-	if err != nil {
-		return "", err
-	}
-	var sb strings.Builder
-	for _, rec := range recs {
-		sb.WriteString(rec.Summary)
-		sb.WriteString("\n")
-		if facts := memory.FormatBlockMemoryFacts(rec.Facts); facts != "" {
-			sb.WriteString("facts:\n")
-			sb.WriteString(facts)
-		}
-		sb.WriteString("---\n")
-	}
-	return sb.String(), nil
-}
-
-type pgHistoryAdapter struct {
-	pg *store.PostgresStore
-}
-
-func (a *pgHistoryAdapter) RecentSessionHistories(ctx context.Context, limit int) ([]graph.HistoryEntry, error) {
-	recs, err := a.pg.RecentSessionHistories(ctx, limit)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]graph.HistoryEntry, 0, len(recs))
-	for _, rec := range recs {
-		out = append(out, graph.HistoryEntry{
-			SessionID:   rec.SessionID,
-			Goal:        rec.Goal,
-			Summary:     rec.Summary,
-			ToolResults: rec.ToolResults,
-			MetaMemory:  rec.MetaMemory,
-			CreatedAt:   rec.CreatedAt,
-		})
-	}
-	return out, nil
+	app.Agent.Shutdown(context.Background())
 }

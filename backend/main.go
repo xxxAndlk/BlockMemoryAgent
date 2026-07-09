@@ -1,8 +1,8 @@
 package main
 
-// main.go 是 HTTP 服务入口，负责解析命令行参数、初始化文件日志、调用 testserver
+// main.go 是 HTTP 服务入口，负责解析命令行参数、初始化文件日志、调用 bootstrap
 // 装配依赖、启动 HTTP 监听、等待信号优雅关闭。所有可复用的 wiring 逻辑已下沉到
-// internal/testserver 包，保证生产二进制与集成测试使用同一份初始化路径。
+// internal/bootstrap 包，保证生产二进制、TUI 与集成测试使用同一份初始化路径。
 
 import (
 	"context"       // 上下文，用于取消与超时控制
@@ -15,9 +15,9 @@ import (
 	"syscall"       // SIGINT/SIGTERM 信号常量
 	"time"          // HTTP 超时
 
+	"github.com/blockmemory/agent/backend/internal/bootstrap" // 统一后端 wiring
 	"github.com/blockmemory/agent/backend/internal/config"      // 基础设施配置加载
 	"github.com/blockmemory/agent/backend/internal/logging"     // 日志文件按天分割
-	"github.com/blockmemory/agent/backend/internal/testserver" // 可复用的 wiring 封装
 )
 
 // main 是服务入口。职责: 解析 flag → 初始化日志 → 装配依赖 → 启动 HTTP → 等待信号优雅关闭。
@@ -33,7 +33,7 @@ func main() {
 	flag.Parse() // 解析 flag，解析后上述指针才指向实际值
 
 	// 加载 .env 文件: 若存在则把其中 KEY=VALUE 注入进程环境变量
-	// testserver.BuildHandler 内部也会加载一次；此处提前加载是为了让日志路径等配置生效。
+	// bootstrap.Build 内部也会加载一次；此处提前加载是为了让日志路径等配置生效。
 	if _, err := os.Stat(*envPath); err == nil {
 		if err := config.LoadEnvFile(*envPath); err != nil {
 			log.Fatalf("加载 .env 文件失败: %v", err) // 解析失败直接退出
@@ -65,12 +65,20 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // 兜底取消
 
-	// 使用 testserver 装配与 main.go 完全一致的路由和依赖
-	mux, _, cleanup, err := testserver.BuildHandler(ctx, *configPath, *rolePath, *envPath, *soulPath, *skillPath)
+	// 使用 bootstrap 装配与生产一致的路由和依赖
+	app, err := bootstrap.Build(ctx, bootstrap.ConfigPaths{
+		ConfigPath: *configPath,
+		RolePath:   *rolePath,
+		EnvPath:    *envPath,
+		SoulPath:   *soulPath,
+		SkillPath:  *skillPath,
+	})
 	if err != nil {
 		log.Fatalf("装配依赖失败: %v", err)
 	}
-	defer cleanup()
+	defer app.Close()
+
+	mux := bootstrap.NewDefaultMux(app)
 
 	// 静态文件: Vue 构建产物目录支持相对可执行文件路径解析，避免从其他目录启动时失效
 	webDist := resolveWebDistPath(*webDistPath)
