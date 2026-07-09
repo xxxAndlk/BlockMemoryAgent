@@ -31,8 +31,13 @@ type Logger struct {
 
 // New 创建默认 Logger，JSON 输出到 stderr；store 可选。
 // store 可以是 logger.LogStore 或历史接口 *store.PostgresStore/fake store。
-func New(store any) *Logger {
-	return NewWithWriter(store, os.Stderr)
+// 如果传入 fileWriter，则 JSON 日志输出到该 writer 而不是 stderr。
+func New(store any, fileWriter ...io.Writer) *Logger {
+	var w io.Writer = os.Stderr
+	if len(fileWriter) > 0 && fileWriter[0] != nil {
+		w = fileWriter[0]
+	}
+	return NewWithWriter(store, w)
 }
 
 // NewWithWriter 创建 Logger 并指定 JSON 日志输出目标；store 可选。

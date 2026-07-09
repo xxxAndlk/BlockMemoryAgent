@@ -60,7 +60,7 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	// 日志文件输出（TUI 入口）：按天分割到 logs/tui-YYYY-MM-DD.log
+	// 日志文件输出（TUI 入口）：按天分割到 logs/tui/YYYY-MM-DD.log
 	// bubbletea 用 alt-screen 全屏接管终端，日志若走 stderr 会刷到屏幕上顶乱布局。
 	// TUI 必须静默 stderr，始终写文件。即使配置中未启用文件日志，也写入默认目录兜底，
 	// 避免日志完全丢入 io.Discard 导致排障无据可查。
@@ -68,10 +68,13 @@ func main() {
 	if !cfg.Logging.Enabled || logDir == "" {
 		logDir = "logs"
 	}
-	if _, err := logging.Init(logging.EntryTUI, logDir, true); err != nil {
+	logWriter, err := logging.Init(logging.EntryTUI, logDir, true)
+	if err != nil {
 		fmt.Println("warning: init file logging:", err)
 	} else {
-		defer logging.Close()
+		log.SetOutput(logWriter)
+		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+		defer logWriter.Close()
 	}
 	log.Printf("BlockMemoryAgent TUI entry starting, log dir=%s", logDir)
 
@@ -83,6 +86,7 @@ func main() {
 		EnvPath:    *envPath,
 		SoulPath:   *soulPath,
 		SkillPath:  *skillPath,
+		LogWriter:  logWriter,
 	})
 	if err != nil {
 		// logging.Init(silent=true) 已把 log 输出重定向到日志文件，

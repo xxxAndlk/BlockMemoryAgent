@@ -7,6 +7,7 @@ package main
 import (
 	"context"       // 上下文，用于取消与超时控制
 	"flag"          // 命令行参数解析
+	"io"            // 日志 writer 接口
 	"log"           // 日志输出
 	"net/http"      // HTTP 服务与路由
 	"os"            // 文件信息、信号
@@ -52,11 +53,16 @@ func main() {
 	// 日志文件输出（后台入口）：按天分割到 logs/backend/YYYY-MM-DD.log
 	// 失败不 fatal：文件日志缺失时仍用 stderr，保证服务可启动。
 	// silent=false：HTTP 入口无 alt-screen，stderr + 文件双写便于开发期实时查看。
+	var logWriter io.WriteCloser
 	if cfg.Logging.Enabled {
-		if _, err := logging.Init(logging.EntryBackend, cfg.Logging.Dir, false); err != nil {
+		w, err := logging.Init(logging.EntryBackend, cfg.Logging.Dir, false)
+		if err != nil {
 			log.Printf("警告: 初始化文件日志失败: %v (仅输出到 stderr)", err)
 		} else {
-			defer logging.Close() // 进程退出时关闭文件句柄
+			logWriter = w
+			log.SetOutput(logWriter)
+			log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+			defer logWriter.Close() // 进程退出时关闭文件句柄
 		}
 	}
 	log.Printf("BlockMemoryAgent 后台服务启动中, 日志目录=%s", cfg.Logging.Dir)
@@ -72,6 +78,7 @@ func main() {
 		EnvPath:    *envPath,
 		SoulPath:   *soulPath,
 		SkillPath:  *skillPath,
+		LogWriter:  logWriter,
 	})
 	if err != nil {
 		log.Fatalf("装配依赖失败: %v", err)

@@ -9,6 +9,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"time"
 
@@ -36,6 +38,9 @@ type ConfigPaths struct {
 	EnvPath    string
 	SoulPath   string
 	SkillPath  string
+	// LogWriter is an optional writer for the structured session logger.
+	// When nil the logger writes to os.Stderr.
+	LogWriter io.Writer
 }
 
 // App is the result of bootstrap.Build. Exported fields are the surfaces needed
@@ -128,7 +133,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	writeProcessor.SetAgentConfig(&cfg.Agent)
 	memoryCallbackHandler := memory.NewCallbackHandler(writeProcessor, snapshotMgr, nil)
 	episodeCompressor := memory.NewCompressor(pgStore, &cfg.Agent)
-	sessionLogger := logger.New(pgStore)
+	sessionLogger := logger.New(pgStore, paths.LogWriter)
 	contextAssembler := memory.NewContextAssembler(
 		memory.NewSimpleWorkspaceReader(),
 		&globalKBAdapter{pg: pgStore, embedder: embedder},
@@ -275,7 +280,9 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 }
 
 func closeStores(pg *store.PostgresStore, redis *store.RedisStore, mch *memory.CallbackHandler) {
-	_ = mch.Close()
+	if err := mch.Close(); err != nil {
+		slog.Debug("close memory callback handler failed", slog.String("error", err.Error()))
+	}
 	redis.Close()
 	pg.Close()
 }
