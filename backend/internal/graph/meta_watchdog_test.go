@@ -90,10 +90,14 @@ func TestDrainCommandQueueFeatureFlags(t *testing.T) {
 			node.SetRuntime(rt)
 
 			if tt.pushInterrupt {
-				mgr.Push(sessionID, cmdqueue.Item{Content: "新指令", Intent: cmdqueue.IntentInterrupt})
+				if err := mgr.Enqueue(sessionID, cmdqueue.Item{Content: "新指令", Intent: cmdqueue.IntentInterrupt}); err != nil {
+					t.Fatalf("enqueue interrupt: %v", err)
+				}
 			}
 			if tt.pushEnqueue {
-				mgr.Push(sessionID, cmdqueue.Item{Content: "追加指令", Intent: cmdqueue.IntentEnqueue})
+				if err := mgr.Enqueue(sessionID, cmdqueue.Item{Content: "追加指令", Intent: cmdqueue.IntentEnqueue}); err != nil {
+					t.Fatalf("enqueue enqueue: %v", err)
+				}
 			}
 
 			state := &types.ThreeLayerState{SessionID: sessionID, ActiveBlocks: make(map[string]*types.SessionBlock)}

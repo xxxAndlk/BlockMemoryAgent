@@ -1329,7 +1329,11 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 		return
 	}
 	// 先入队再判断会话状态，避免运行中会话被漏掉：MetaAgent 下个 tick Drain 时会拿到这条指令
-	rt.CmdQueue.Push(id, cmdqueue.Item{Content: req.Content, Intent: cmdqueue.IntentInterrupt})
+	if err := rt.CmdQueue.Enqueue(id, cmdqueue.Item{Content: req.Content, Intent: cmdqueue.IntentInterrupt}); err != nil {
+		log.Printf("HandleSessionInterrupt: queue full for session %s: %v", id, err)
+		http.Error(w, "命令队列已满", http.StatusServiceUnavailable)
+		return
+	}
 
 	m.mu.Lock()
 	session, ok := m.sessions[id]
@@ -1399,7 +1403,11 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 		return
 	}
 	// 与 interrupt 同序：先入队，再判断是否需要 resume；enqueue 不重置上下文，仅追加消息
-	rt.CmdQueue.Push(id, cmdqueue.Item{Content: req.Content, Intent: cmdqueue.IntentEnqueue})
+	if err := rt.CmdQueue.Enqueue(id, cmdqueue.Item{Content: req.Content, Intent: cmdqueue.IntentEnqueue}); err != nil {
+		log.Printf("HandleSessionEnqueue: queue full for session %s: %v", id, err)
+		http.Error(w, "命令队列已满", http.StatusServiceUnavailable)
+		return
+	}
 
 	m.mu.Lock()
 	session, ok := m.sessions[id]
@@ -1568,7 +1576,11 @@ func (m *SessionManager) HandleSessionTopic(w http.ResponseWriter, r *http.Reque
 	if wasRunning {
 		rt := m.graph.Runtime()
 		if rt != nil && rt.CmdQueue != nil {
-			rt.CmdQueue.Push(id, cmdqueue.Item{Content: goal, Intent: cmdqueue.IntentInterrupt})
+			if err := rt.CmdQueue.Enqueue(id, cmdqueue.Item{Content: goal, Intent: cmdqueue.IntentInterrupt}); err != nil {
+				log.Printf("HandleSessionTopicSwitch: queue full for session %s: %v", id, err)
+				http.Error(w, "命令队列已满", http.StatusServiceUnavailable)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running", "topic": req.Name})

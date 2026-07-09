@@ -7,6 +7,8 @@
 package cmdqueue
 
 import (
+	"errors"
+	"log"
 	"sync"
 )
 
@@ -24,10 +26,16 @@ type Item struct {
 	Intent  Intent // 处置意图
 }
 
+const defaultQueueCap = 100
+
+// ErrQueueFull 当队列达到容量上限时返回。
+var ErrQueueFull = errors.New("queue full")
+
 // Queue 单会话指令队列。并发安全。
 type Queue struct {
 	mu    sync.Mutex
 	items []Item
+	cap   int
 }
 
 // Manager 进程级队列管理器，按 sessionID 隔离。
@@ -55,17 +63,35 @@ func (m *Manager) getOrCreate(sessionID string) *Queue {
 	if q, ok = m.queues[sessionID]; ok {
 		return q
 	}
-	q = &Queue{}
+	q = &Queue{cap: defaultQueueCap}
 	m.queues[sessionID] = q
 	return q
 }
 
-// Push 追加一条指令到会话队列。
-func (m *Manager) Push(sessionID string, item Item) {
+// Enqueue 追加一条指令到会话队列；队列满时返回 ErrQueueFull。
+func (m *Manager) Enqueue(sessionID string, item Item) error {
 	q := m.getOrCreate(sessionID)
+	return q.Enqueue(item)
+}
+
+// Enqueue 追加一条指令到队列；队列满时返回 ErrQueueFull。
+func (q *Queue) Enqueue(item Item) error {
 	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.items) >= q.cap {
+		return ErrQueueFull
+	}
 	q.items = append(q.items, item)
-	q.mu.Unlock()
+	return nil
+}
+
+// Push 是 Enqueue 的兼容包装：队列满时记录警告并丢弃指令。
+//
+// 已废弃：新代码应直接使用 Enqueue 并处理 ErrQueueFull。
+func (m *Manager) Push(sessionID string, item Item) {
+	if err := m.Enqueue(sessionID, item); err != nil {
+		log.Printf("cmdqueue: Push dropped item for session %s: %v", sessionID, err)
+	}
 }
 
 // Drain 取出并清空会话队列。返回切片顺序按入队时间升序。

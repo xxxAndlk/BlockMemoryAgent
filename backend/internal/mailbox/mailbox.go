@@ -15,6 +15,7 @@ package mailbox
 
 import (
 	"sort"        // 用于按优先级排序消息
+	"strconv"     // int64 → string 转换
 	"sync"        // 提供 RWMutex 保护并发访问
 	"sync/atomic" // 提供原子计数器生成消息 ID
 	"time"        // 用于时间戳与 ID 格式化
@@ -189,25 +190,7 @@ func (m *Mailbox) Drain(agentID string) []*Message {
 	// 加写锁，因为要修改消息状态。
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// 取出该 Agent 的全部消息引用。
-	src := m.inbox[agentID]
-	// 统一记录本次拉取时间，作为 ReadAt。
-	now := time.Now()
-	// 结果数量未知，初始为 nil，按需扩容。
-	var out []*Message
-	for _, msg := range src {
-		// 仅处理未读消息。
-		if msg.Status == StatusUnread {
-			// 翻转状态为已读。
-			msg.Status = StatusRead
-			// 记录首次读取时间。
-			msg.ReadAt = &now
-			out = append(out, msg)
-		}
-	}
-	// 按优先级排序后返回。
-	sortByPriority(out)
-	return out
+	return drainMessages(m.inbox[agentID], true)
 }
 
 // DrainBroadcast 主 Agent 专用：拉取广播桶中的全部未读消息并标记为已读。
@@ -224,21 +207,32 @@ func (m *Mailbox) DrainBroadcast() []*Message {
 	// 加写锁，因为要修改消息状态。
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// 统一记录本次拉取时间。
+	return drainMessages(m.bcast, true)
+}
+
+// drainMessages 从消息切片中筛选未读消息，可选标记为已读并返回按优先级排序的副本。
+//
+// 职责：被 Drain / DrainBroadcast 共用，消除重复的状态翻转与排序逻辑。
+// 参数：
+//   - msgs：待扫描消息切片。
+//   - markRead：true 时将未读消息翻转为已读并记录 ReadAt。
+//
+// 返回：未读消息列表（已排序）。
+//
+// 并发安全：调用方必须已持有 m.mu 写锁。
+func drainMessages(msgs []*Message, markRead bool) []*Message {
 	now := time.Now()
-	// 结果数量未知，初始为 nil。
-	var out []*Message
-	for _, msg := range m.bcast {
-		// 仅处理未读广播消息。
-		if msg.Status == StatusUnread {
-			// 翻转状态为已读。
-			msg.Status = StatusRead
-			// 记录首次读取时间。
-			msg.ReadAt = &now
-			out = append(out, msg)
+	out := make([]*Message, 0, len(msgs))
+	for _, msg := range msgs {
+		if msg.Status != StatusUnread {
+			continue
 		}
+		if markRead {
+			msg.Status = StatusRead
+			msg.ReadAt = &now
+		}
+		out = append(out, msg)
 	}
-	// 按优先级排序后返回。
 	sortByPriority(out)
 	return out
 }
@@ -352,46 +346,8 @@ func sortByPriority(msgs []*Message) {
 // 副作用：无。
 // 并发安全：无状态，纯函数。
 func formatID(n int64) string {
-	// 时间部分取 HHMMSS，便于人工识别；序号部分由 itoa 转换。
-	return "msg_" + time.Now().Format("150405") + "_" + itoa(n)
+	// 时间部分取 HHMMSS，便于人工识别；序号部分由 strconv.FormatInt 转换。
+	return "msg_" + time.Now().Format("150405") + "_" + strconv.FormatInt(n, 10)
 }
 
-// itoa 极简 int64 → string 转换，避免引入 strconv 依赖。
-//
-// 职责：手写数字转字符串，支持负数。
-// 参数：
-//   - n：待转换的整数。
-//
-// 返回：对应的十进制字符串。
-// 副作用：无。
-// 并发安全：无状态，纯函数。
-func itoa(n int64) string {
-	// 0 需要特判，否则循环不执行返回空串。
-	if n == 0 {
-		return "0"
-	}
-	// 固定 20 字节缓冲区，足够容纳 int64 最大位数。
-	var buf [20]byte
-	// 从缓冲区尾部向前填充。
-	i := len(buf)
-	// 记录负号标志。
-	neg := n < 0
-	if neg {
-		// 转为正数处理，最后再补符号。
-		n = -n
-	}
-	// 逐位取余写入缓冲区。
-	for n > 0 {
-		i--
-		// 取最低位数字对应的 ASCII。
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		// 负数在前补 '-'。
-		i--
-		buf[i] = '-'
-	}
-	// 将有效部分转为字符串返回。
-	return string(buf[i:])
-}
+

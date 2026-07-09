@@ -31,7 +31,7 @@ func TestTaskBoard_LifeCycle(t *testing.T) {
 	if err := b.MarkFailed(id2, "DB outage"); err != nil {
 		t.Fatalf("mark failed: %v", err)
 	}
-	if b.Status != "FAILED" {
+	if b.Status != BoardStatusFailed {
 		t.Fatalf("expected board FAILED, got %s", b.Status)
 	}
 

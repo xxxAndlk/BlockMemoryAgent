@@ -7,11 +7,12 @@
 package board
 
 import (
-	"errors" // errors.New 构造任务不存在等错误
-	"fmt"    // fmt.Sprintf 生成任务 ID 与 Brief 文本
-	"sort"   // sort.Strings 稳定化约束键输出顺序
-	"sync"   // sync.RWMutex 保护 TaskBoard / Manager 的并发访问
-	"time"   // time.Now / time.Time 记录时间戳
+	"errors"      // errors.New 构造任务不存在等错误
+	"fmt"         // fmt.Sprintf 生成任务 ID 与 Brief 文本
+	"sort"        // sort.Strings 稳定化约束键输出顺序
+	"sync"        // sync.RWMutex 保护 TaskBoard / Manager 的并发访问
+	"sync/atomic" // atomic.Int64 生成唯一任务 ID
+	"time"        // time.Now / time.Time 记录时间戳
 )
 
 // TaskStatus 子任务状态枚举类型
@@ -24,6 +25,17 @@ const (
 	TaskBlocked    TaskStatus = "blocked"     // 阻塞：等待外部条件或依赖
 	TaskDone       TaskStatus = "done"        // 完成：执行成功
 	TaskFailed     TaskStatus = "failed"      // 失败：执行出错或被否决
+)
+
+// BoardStatus 看板整体状态枚举类型。
+type BoardStatus string
+
+// 看板整体状态枚举：覆盖从创建到终态的完整生命周期。
+const (
+	BoardStatusNew        BoardStatus = "NEW"
+	BoardStatusInProgress BoardStatus = "IN_PROGRESS"
+	BoardStatusDone       BoardStatus = "DONE"
+	BoardStatusFailed     BoardStatus = "FAILED"
 )
 
 // SubTask 看板上的一个子任务
@@ -44,11 +56,12 @@ type TaskBoard struct {
 
 	TopicID     string              // 话题 ID（=会话 ID）
 	Goal        string              // 全局目标
-	Status      string              // NEW / IN_PROGRESS / DONE / FAILED
+	Status      BoardStatus         // NEW / IN_PROGRESS / DONE / FAILED
 	Constraints map[string]string   // 全局约束（如"兼容旧版 API"）
 	Tasks       map[string]*SubTask // 子任务表，按 ID 索引
 	Order       []string            // 子任务展示顺序（创建序）
 	UpdatedAt   time.Time           // 看板最近变更时间
+	seq         atomic.Int64        // 原子计数器，生成唯一任务序号
 }
 
 // NewTaskBoard 新建空看板
@@ -68,7 +81,7 @@ func NewTaskBoard(topicID, goal string) *TaskBoard {
 	return &TaskBoard{
 		TopicID:     topicID,                   // 绑定话题 ID
 		Goal:        goal,                      // 记录全局目标
-		Status:      "NEW",                     // 初始状态为 NEW
+		Status:      BoardStatusNew,            // 初始状态为 NEW
 		Constraints: make(map[string]string),   // 预分配约束 map，避免后续 nil 写入
 		Tasks:       make(map[string]*SubTask), // 预分配任务 map
 		UpdatedAt:   time.Now(),                // 记录创建时间
@@ -97,8 +110,8 @@ func (b *TaskBoard) AddSubTask(title string) string {
 			return id
 		}
 	}
-	// 生成新 ID：<topicID>_t<序号>，序号基于当前任务数 +1
-	id := fmt.Sprintf("%s_t%d", b.TopicID, len(b.Order)+1)
+	// 生成新 ID：<topicID>_t<序号>，序号由原子计数器保证唯一。
+	id := fmt.Sprintf("%s_t%d", b.TopicID, b.seq.Add(1))
 	now := time.Now() // 统一时间戳，保证 CreatedAt == UpdatedAt
 	b.Tasks[id] = &SubTask{
 		ID:        id,          // 回填 ID，便于外部引用
@@ -107,9 +120,9 @@ func (b *TaskBoard) AddSubTask(title string) string {
 		CreatedAt: now,         // 创建时间
 		UpdatedAt: now,         // 首次更新时间
 	}
-	b.Order = append(b.Order, id) // 维持创建顺序，Brief 按此输出
-	b.Status = "IN_PROGRESS"      // 只要有任务，看板即进入进行中
-	b.UpdatedAt = now             // 刷新看板更新时间
+	b.Order = append(b.Order, id)   // 维持创建顺序，Brief 按此输出
+	b.Status = BoardStatusInProgress // 只要有任务，看板即进入进行中
+	b.UpdatedAt = now               // 刷新看板更新时间
 	return id
 }
 
@@ -255,7 +268,7 @@ func (b *TaskBoard) transition(taskID string, status TaskStatus, result string) 
 // 并发安全：非线程安全，仅供持锁路径调用。
 func (b *TaskBoard) recomputeStatusLocked() {
 	if len(b.Tasks) == 0 {
-		b.Status = "NEW" // 空看板归零
+		b.Status = BoardStatusNew // 空看板归零
 		return
 	}
 	allTerminal, anyFailed := true, false // 终态标记与失败标记
@@ -271,11 +284,11 @@ func (b *TaskBoard) recomputeStatusLocked() {
 	}
 	switch {
 	case allTerminal && anyFailed:
-		b.Status = "FAILED" // 全终态但含失败
+		b.Status = BoardStatusFailed // 全终态但含失败
 	case allTerminal:
-		b.Status = "DONE" // 全部成功完成
+		b.Status = BoardStatusDone // 全部成功完成
 	default:
-		b.Status = "IN_PROGRESS" // 仍有任务未结束
+		b.Status = BoardStatusInProgress // 仍有任务未结束
 	}
 }
 
@@ -286,7 +299,7 @@ func (b *TaskBoard) recomputeStatusLocked() {
 type Snapshot struct {
 	TopicID     string            `json:"topic_id"`    // 话题 ID
 	Goal        string            `json:"goal"`        // 全局目标
-	Status      string            `json:"status"`      // 看板状态
+	Status      BoardStatus       `json:"status"`      // 看板状态
 	Constraints map[string]string `json:"constraints"` // 全局约束快照
 	Tasks       []SubTask         `json:"tasks"`       // 子任务列表（按创建序）
 	UpdatedAt   time.Time         `json:"updated_at"`  // 快照时间
