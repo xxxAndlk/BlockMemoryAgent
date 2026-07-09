@@ -3,12 +3,14 @@ package agent
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/blockmemory/agent/backend/internal/graph"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/internal/store"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
 // Service is a thin Agent facade that wraps server.SessionManager.
@@ -101,11 +103,52 @@ func (s *Service) Send(ctx context.Context, sessionID string, msg Message) error
 	return fmt.Errorf("not implemented")
 }
 
-// Stream returns a real-time event channel for the session. A proper
-// implementation requires significant refactoring, so it is left for a later
-// task.
+// Stream returns a real-time event channel for the session.
+// The current implementation polls SnapshotSession every 100ms and emits new
+// events; this matches the existing SSE behavior without requiring a full
+// EventBus migration.
 func (s *Service) Stream(ctx context.Context, sessionID string) (<-chan Event, error) {
-	return nil, fmt.Errorf("not implemented")
+	if s.sessions.SnapshotSession(sessionID) == nil {
+		return nil, ErrSessionNotFound
+	}
+
+	out := make(chan Event, 16)
+	go func() {
+		defer close(out)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		seen := 0
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sess := s.sessions.SnapshotSession(sessionID)
+				if sess == nil {
+					return
+				}
+				for i := seen; i < len(sess.Events); i++ {
+					select {
+					case out <- *toAgentEvent(&sess.Events[i]):
+					case <-ctx.Done():
+						return
+					}
+				}
+				seen = len(sess.Events)
+				if sess.Status != enums.SessionStatusRunning && sess.Status != enums.SessionStatusAwaitingClarify {
+					// Session reached a terminal state; keep emitting briefly then exit.
+					select {
+					case <-time.After(200 * time.Millisecond):
+					case <-ctx.Done():
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	return out, nil
 }
 
 // ResumeSession continues a previously finished or paused session.
