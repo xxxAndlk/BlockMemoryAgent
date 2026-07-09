@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
 	"github.com/blockmemory/agent/backend/internal/embed"
@@ -47,6 +48,7 @@ type Deps struct {
 	Embedder              embed.Embedder
 	Runtime               *runtime.Runtime
 	SessionManager        *server.SessionManager
+	Agent                 agent.Agent
 	Graph                 *graph.ThreeLayerGraph
 	MemoryCallbackHandler *memory.CallbackHandler
 	SnapshotManager       *memory.SnapshotManager
@@ -286,6 +288,11 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	// Static SPA assets are not wired here; integration tests should hit API
 	// endpoints only. The root fallback is omitted to avoid serving web/dist.
 
+	agentSvc := agent.NewService(threeLayerGraph, registry, rt,
+		agent.WithPostgresStore(pgStore),
+		agent.WithModelFactory(modelFactory),
+	)
+
 	deps := &Deps{
 		Config:                cfg,
 		RoleConfig:            roleCfg,
@@ -295,6 +302,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		Embedder:              embedder,
 		Runtime:               rt,
 		SessionManager:        sessionMgr,
+		Agent:                 agentSvc,
 		Graph:                 threeLayerGraph,
 		MemoryCallbackHandler: memoryCallbackHandler,
 		SnapshotManager:       snapshotMgr,
