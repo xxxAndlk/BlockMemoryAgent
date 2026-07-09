@@ -139,14 +139,6 @@ func ParseInterval(cron string) (time.Duration, error) {
 	return 0, fmt.Errorf("unsupported cron unit: %c", unit)
 }
 
-// Store DAG 持久化接口（由 store.PostgresStore 实现）。
-type Store interface {
-	SaveDAG(ctx context.Context, d *DAG) error
-	GetDAG(ctx context.Context, id string) (*DAG, error)
-	ListDAGs(ctx context.Context) ([]*DAG, error)
-	DeleteDAG(ctx context.Context, id string) error
-}
-
 // SessionLauncher 把一个 task.goal 派发为新 session。
 // 由 server.SessionManager 实现并注入到 Scheduler。
 type SessionLauncher interface {
