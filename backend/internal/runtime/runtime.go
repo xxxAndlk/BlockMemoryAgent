@@ -94,11 +94,13 @@ func New(soulPath string, skillPool *skill.Pool, opts ...RuntimeOption) (*Runtim
 		opt(rt)
 	}
 
-	// 若未通过选项注入 Soul，则从 soulPath 加载人格
+	// 若未通过选项注入 Soul，则从 soulPath 加载人格；空路径视为未配置，使用空 Persona。
 	if rt.Soul == nil {
 		loader := soul.NewLoader(soulPath)
-		if err := loader.Load(); err != nil {
-			return nil, fmt.Errorf("load soul.md: %w", err)
+		if soulPath != "" {
+			if err := loader.Load(); err != nil {
+				return nil, fmt.Errorf("load soul.md: %w", err)
+			}
 		}
 		rt.Soul = loader
 	}

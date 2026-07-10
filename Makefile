@@ -1,12 +1,16 @@
-.PHONY: backend-test test-test web-build lint up down migrate run help
+.PHONY: backend-test test-test test-compile web-build lint up down migrate run help
 
 ## Run all backend Go tests (unit + package tests).
 backend-test:
 	cd backend && GOTOOLCHAIN=local go test ./... -count=1
 
-## Run integration tests under the test module.
+## Run integration tests under the test module (requires Postgres/Redis/MockLLM env).
 test-test:
 	GOTOOLCHAIN=local go test -tags=integration ./test/... -count=1
+
+## Compile integration test modules without running them.
+test-compile:
+	GOTOOLCHAIN=local go test -tags=integration ./test/... -run=^$$ -count=1
 
 ## Install web dependencies and build the Vue SPA.
 web-build:
@@ -43,7 +47,8 @@ run: web-build
 help:
 	@echo "Available targets:"
 	@echo "  backend-test  - run backend Go tests"
-	@echo "  test-test     - run integration tests"
+	@echo "  test-test     - run integration tests (requires Postgres/Redis/MockLLM env)"
+	@echo "  test-compile  - compile integration tests without running"
 	@echo "  web-build     - install deps and build the Vue SPA"
 	@echo "  lint          - run go vet on backend and test modules"
 	@echo "  up            - start docker compose services"

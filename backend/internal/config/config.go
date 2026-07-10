@@ -384,16 +384,16 @@ func (c *Config) applyAgentDefaults() error {
 }
 
 func (c *Config) applyGraphPolicyDefaults() error {
-	// 例外：Graph 死循环防护三项 (StallSteps/MaxRepeatFingerprint/SessionTimeoutMin)
-	// 不做默认值兜底，config.yaml 必须显式提供，缺失即报错 — 配置问题不应让程序运行起来。
+	// Graph 死循环防护三项提供默认值，保持向后兼容。
+	// 0 仍表示“未配置”；如需显式禁用请在配置中使用对应的特性开关。
 	if c.Agent.StallSteps == 0 {
-		return fmt.Errorf("config agent.stall_steps 未配置：Graph 死循环防护必需，请在 config.yaml 显式设置")
+		c.Agent.StallSteps = 30
 	}
 	if c.Agent.MaxRepeatFingerprint == 0 {
-		return fmt.Errorf("config agent.max_repeat_fingerprint 未配置：Graph 死循环防护必需，请在 config.yaml 显式设置")
+		c.Agent.MaxRepeatFingerprint = 3
 	}
 	if c.Agent.SessionTimeoutMin == 0 {
-		return fmt.Errorf("config agent.session_timeout_min 未配置：Graph wall-clock 超时必需，请在 config.yaml 显式设置")
+		c.Agent.SessionTimeoutMin = 240
 	}
 	return nil
 }
