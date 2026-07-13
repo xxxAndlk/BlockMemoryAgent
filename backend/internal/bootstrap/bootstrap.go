@@ -30,8 +30,9 @@ import (
 )
 
 // ConfigPaths groups the file-system locations required to boot the backend.
-// All paths are required except SkillPath, which may be empty when no skill pool
-// is configured.
+// ConfigPath, RolePath and EnvPath are required. SoulPath and SkillPath are
+// optional: an empty SoulPath falls back to an empty Persona, and an empty
+// SkillPath falls back to the built-in skill pool.
 type ConfigPaths struct {
 	ConfigPath string
 	RolePath   string
@@ -155,10 +156,16 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	registry := graph.NewRoleRegistry(roleCfg)
 	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
 
-	skillPool, err := skill.LoadFromYAML(paths.SkillPath)
-	if err != nil {
-		closeStores(pgStore, redisStore, memoryCallbackHandler)
-		return nil, fmt.Errorf("load skills %s: %w", paths.SkillPath, err)
+	var skillPool *skill.Pool
+	if paths.SkillPath == "" {
+		skillPool = skill.BuiltinPool()
+	} else {
+		var err error
+		skillPool, err = skill.LoadFromYAML(paths.SkillPath)
+		if err != nil {
+			closeStores(pgStore, redisStore, memoryCallbackHandler)
+			return nil, fmt.Errorf("load skills %s: %w", paths.SkillPath, err)
+		}
 	}
 
 	rt, err := runtime.New(paths.SoulPath, skillPool)
@@ -184,7 +191,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	builder.AddNode(sinker)
 	threeLayerGraph := builder.Build()
 
-	sessionMgr := server.NewSessionManager(threeLayerGraph, registry)
+	agentSvc := agent.NewService(threeLayerGraph, registry, rt,
+		agent.WithPostgresStore(pgStore),
+		agent.WithModelFactory(modelFactory),
+	)
+
+	sessionMgr := server.NewSessionManager(agentSvc)
 	sessionMgr.SetPostgresStore(pgStore)
 	sessionMgr.SetModelFactory(modelFactory)
 
@@ -199,12 +211,6 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		dagScheduler = dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
 		dagScheduler.Start(ctx)
 	}
-
-	agentSvc := agent.NewService(threeLayerGraph, registry, rt,
-		agent.WithSessionManager(sessionMgr),
-		agent.WithPostgresStore(pgStore),
-		agent.WithModelFactory(modelFactory),
-	)
 
 	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
 
@@ -248,14 +254,23 @@ func validatePaths(paths ConfigPaths) error {
 		paths.ConfigPath: "config file",
 		paths.RolePath:   "roles file",
 		paths.EnvPath:    "env file",
-		paths.SoulPath:   "soul file",
-		paths.SkillPath:  "skills file",
 	} {
 		if path == "" {
 			return fmt.Errorf("%s path is required", name)
 		}
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("%s not found: %s", name, path)
+		}
+	}
+	// SoulPath 与 SkillPath 可选：空值时 runtime.New 使用空 Persona，skill 使用 BuiltinPool。
+	if paths.SoulPath != "" {
+		if _, err := os.Stat(paths.SoulPath); err != nil {
+			return fmt.Errorf("soul file not found: %s", paths.SoulPath)
+		}
+	}
+	if paths.SkillPath != "" {
+		if _, err := os.Stat(paths.SkillPath); err != nil {
+			return fmt.Errorf("skills file not found: %s", paths.SkillPath)
 		}
 	}
 	return nil

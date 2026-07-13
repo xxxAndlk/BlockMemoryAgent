@@ -16,4 +16,7 @@ type Agent interface {
 	Get(ctx context.Context, sessionID string) (*Session, error)
 	ListAgents(ctx context.Context, sessionID string) ([]AgentInstance, error)
 	Shutdown(ctx context.Context) error
+	// SummarizeTaskTitle returns a brief display title for a long task title.
+	// It is exposed on the facade so the TUI does not need the ModelFactory.
+	SummarizeTaskTitle(ctx context.Context, title string) string
 }

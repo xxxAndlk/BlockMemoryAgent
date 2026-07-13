@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/graph"
 	"github.com/blockmemory/agent/backend/internal/runtime"
@@ -45,11 +47,53 @@ func (n *fakeSinkerForRender) Invoke(ctx context.Context, state *types.ThreeLaye
 	return state, nil
 }
 
-// testAgent wraps an existing SessionManager with the agent.Agent facade so
-// tests can construct a tui.Model without direct SessionManager/Registry fields.
-func testAgent(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry, sessionMgr *server.SessionManager) agent.Agent {
-	return agent.NewService(g, registry, nil, agent.WithSessionManager(sessionMgr))
+// testAgent creates an agent.Agent facade for tests.
+func testAgent(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry, rt *runtime.Runtime) agent.Agent {
+	return agent.NewService(g, registry, rt)
 }
+
+// mockAgentForPlan is a minimal agent.Agent implementation used by
+// TestPlanPanelReflectsAgentStatuses so the test does not need *runtime.Runtime.
+type mockAgentForPlan struct {
+	sessionID   string
+	goal        string
+	boardSnap   board.Snapshot
+	agentInsts  []agent.AgentInstance
+}
+
+func (m *mockAgentForPlan) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) {
+	return nil, nil
+}
+func (m *mockAgentForPlan) ResumeSession(ctx context.Context, sessionID string, req agent.ResumeRequest) (*agent.Session, error) {
+	return nil, nil
+}
+func (m *mockAgentForPlan) Send(ctx context.Context, sessionID string, msg agent.Message) error { return nil }
+func (m *mockAgentForPlan) Stream(ctx context.Context, sessionID string) (<-chan agent.Event, error) {
+	return nil, nil
+}
+func (m *mockAgentForPlan) Query(ctx context.Context, sessionID string, q agent.Query) (agent.Result, error) {
+	if sessionID == m.sessionID && q.Kind == agent.QueryKindBoard {
+		return agent.Result{Data: m.boardSnap}, nil
+	}
+	return agent.Result{}, nil
+}
+func (m *mockAgentForPlan) Control(ctx context.Context, sessionID string, cmd agent.ControlCommand) error {
+	return nil
+}
+func (m *mockAgentForPlan) List(ctx context.Context, filter agent.Filter) ([]*agent.Session, error) {
+	return []*agent.Session{{ID: m.sessionID, Goal: m.goal}}, nil
+}
+func (m *mockAgentForPlan) Get(ctx context.Context, sessionID string) (*agent.Session, error) {
+	if sessionID == m.sessionID {
+		return &agent.Session{ID: m.sessionID, Goal: m.goal}, nil
+	}
+	return nil, fmt.Errorf("not found")
+}
+func (m *mockAgentForPlan) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
+	return m.agentInsts, nil
+}
+func (m *mockAgentForPlan) Shutdown(ctx context.Context) error { return nil }
+func (m *mockAgentForPlan) SummarizeTaskTitle(ctx context.Context, title string) string { return title }
 
 func minimalRoleConfigForRender() *pkgconfig.RoleConfigFile {
 	return &pkgconfig.RoleConfigFile{
@@ -100,14 +144,14 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 	builder.AddNode(sinker)
 	g := builder.Build()
 
-	sessionMgr := server.NewSessionManager(g, registry)
+	agentSvc := testAgent(g, registry, rt)
 
 	m := &Model{
 		styles:       NewStyles(),
 		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:        80,
 		height:       24,
-		agent:        testAgent(g, registry, sessionMgr),
+		agent:        agentSvc,
 		streamEvents: make(chan agent.Event, 16),
 		httpAddr:     "http://127.0.0.1:1",
 		flashMu:      &sync.Mutex{},
@@ -125,11 +169,11 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 	}
 
 	// 模拟后端会话创建完成（直接创建，跳过异步 HTTP）
-	session := sessionMgr.CreateSession(context.Background(), "hello")
+	session, _ := agentSvc.CreateSession(context.Background(), agent.CreateRequest{Goal: "hello"})
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		snap := sessionMgr.SnapshotSession(session.ID)
-		if snap != nil && snap.Status == enums.SessionStatusCompleted {
+		snap, _ := agentSvc.Get(context.Background(), session.ID)
+		if snap != nil && enums.SessionStatus(snap.Status) == enums.SessionStatusCompleted {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -188,16 +232,16 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 	builder.AddNode(sinker)
 	g := builder.Build()
 
-	sessionMgr := server.NewSessionManager(g, registry)
+	agentSvc := testAgent(g, registry, rt)
 
 	// 创建会话；fake MetaAgent 立即结束，不会并发修改 Messages
-	session := sessionMgr.CreateSession(context.Background(), "a")
+	session, _ := agentSvc.CreateSession(context.Background(), agent.CreateRequest{Goal: "a"})
 
 	// 等待会话完成，确保 Messages 已追加助手总结
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		snap := sessionMgr.SnapshotSession(session.ID)
-		if snap != nil && snap.Status == enums.SessionStatusCompleted {
+		snap, _ := agentSvc.Get(context.Background(), session.ID)
+		if snap != nil && enums.SessionStatus(snap.Status) == enums.SessionStatusCompleted {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -208,7 +252,7 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:        80,
 		height:       24,
-		agent:        testAgent(g, registry, sessionMgr),
+		agent:        agentSvc,
 		streamEvents: make(chan agent.Event, 16),
 		httpAddr:     "http://127.0.0.1:1",
 		flashMu:      &sync.Mutex{},
@@ -346,13 +390,13 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 	builder.AddNode(sinker)
 	g := builder.Build()
 
-	sessionMgr := server.NewSessionManager(g, registry)
-	session := sessionMgr.CreateSession(context.Background(), "x")
+	agentSvc := testAgent(g, registry, rt)
+	session, _ := agentSvc.CreateSession(context.Background(), agent.CreateRequest{Goal: "x"})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		snap := sessionMgr.SnapshotSession(session.ID)
-		if snap != nil && snap.Status == enums.SessionStatusCompleted {
+		snap, _ := agentSvc.Get(context.Background(), session.ID)
+		if snap != nil && enums.SessionStatus(snap.Status) == enums.SessionStatusCompleted {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -363,7 +407,7 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:        80,
 		height:       24,
-		agent:        testAgent(g, registry, sessionMgr),
+		agent:        agentSvc,
 		streamEvents: make(chan agent.Event, 16),
 		httpAddr:     "http://127.0.0.1:1",
 		flashMu:      &sync.Mutex{},
@@ -428,13 +472,13 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 	builder.AddNode(sinker)
 	g := builder.Build()
 
-	sessionMgr := server.NewSessionManager(g, registry)
-	session := sessionMgr.CreateSession(context.Background(), "x")
+	agentSvc := testAgent(g, registry, rt)
+	session, _ := agentSvc.CreateSession(context.Background(), agent.CreateRequest{Goal: "x"})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		snap := sessionMgr.SnapshotSession(session.ID)
-		if snap != nil && snap.Status == enums.SessionStatusCompleted {
+		snap, _ := agentSvc.Get(context.Background(), session.ID)
+		if snap != nil && enums.SessionStatus(snap.Status) == enums.SessionStatusCompleted {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -445,7 +489,7 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:        120,
 		height:       40,
-		agent:        testAgent(g, registry, sessionMgr),
+		agent:        agentSvc,
 		streamEvents: make(chan agent.Event, 16),
 		httpAddr:     "http://127.0.0.1:1",
 		flashMu:      &sync.Mutex{},
@@ -526,25 +570,25 @@ func TestLongUserMessageWrapsAtRightPanelBoundary(t *testing.T) {
 // TestPlanPanelReflectsAgentStatuses 验证：当后端 TaskBoard 未及时更新时，
 // 右侧面板的计划进度仍会根据 Agent 实例的真实状态显示完成率与 Done 标记。
 func TestPlanPanelReflectsAgentStatuses(t *testing.T) {
-	soulPath := filepath.Join(t.TempDir(), "soul.md")
-	if err := os.WriteFile(soulPath, []byte("test"), 0644); err != nil {
-		t.Fatalf("write soul: %v", err)
+	mock := &mockAgentForPlan{
+		sessionID: "session-1",
+		goal:      "塔防游戏 demo",
+		boardSnap: board.Snapshot{
+			Goal: "塔防游戏 demo",
+			Tasks: []board.SubTask{
+				{ID: "t1", Title: "战斗领域 - 实现怪物路径"},
+				{ID: "t2", Title: "UI领域 - Canvas 渲染"},
+				{ID: "t3", Title: "经济领域 - 金币系统"},
+			},
+		},
 	}
-	rt, err := runtime.New(soulPath, skill.BuiltinPool())
-	if err != nil {
-		t.Fatalf("init runtime: %v", err)
-	}
-	bd := rt.Boards.GetOrCreate("session-1", "塔防游戏 demo")
-	bd.AddSubTask("战斗领域 - 实现怪物路径")
-	bd.AddSubTask("UI领域 - Canvas 渲染")
-	bd.AddSubTask("经济领域 - 金币系统")
 
 	m := &Model{
 		styles:           NewStyles(),
 		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
 		width:            120,
 		height:           40,
-		rt:               rt,
+		agent:            mock,
 		rightPanelForced: 1,
 		flashMu:          &sync.Mutex{},
 		sessions: []*server.Session{

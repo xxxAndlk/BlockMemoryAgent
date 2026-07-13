@@ -11,12 +11,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
-	"github.com/blockmemory/agent/backend/internal/model"
-	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
-	"github.com/blockmemory/agent/backend/internal/store"
 	"github.com/blockmemory/agent/backend/pkg/enums"
-	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // Model is the top-level bubbletea model for the BlockMemoryAgent TUI.
@@ -24,13 +20,10 @@ type Model struct {
 	width  int
 	height int
 
-	agent        agent.Agent
-	rt           *runtime.Runtime
-	dagHandler   *server.DAGHandler
-	pgStore      *store.PostgresStore
-	httpAddr     string
-	modelName    string
-	modelFactory *model.ModelFactory
+	agent      agent.Agent
+	dagHandler *server.DAGHandler
+	httpAddr   string
+	modelName  string
 
 	styles *Styles
 
@@ -78,21 +71,15 @@ type Model struct {
 // NewModel builds a TUI model wired to backend dependencies.
 func NewModel(
 	agentFacade agent.Agent,
-	rt *runtime.Runtime,
 	dagHandler *server.DAGHandler,
-	pgStore *store.PostgresStore,
 	httpAddr string,
 	modelName string,
-	modelFactory *model.ModelFactory,
 ) *Model {
 	m := &Model{
 		agent:          agentFacade,
-		rt:             rt,
 		dagHandler:     dagHandler,
-		pgStore:        pgStore,
 		httpAddr:       httpAddr,
 		modelName:      modelName,
-		modelFactory:   modelFactory,
 		styles:         NewStyles(),
 		focus:          panelChat,
 		chatPanel:      NewChatPanel(),
@@ -240,8 +227,8 @@ func (m *Model) refreshSessions() {
 	if m.sessionsCursor >= 0 && m.sessionsCursor < len(m.sessions) {
 		prevID = m.sessions[m.sessionsCursor].ID
 	}
-	// TUI only shows sessions created during this TUI run. Historical sessions
-	// are kept for Agent internal retrieval; they are not surfaced here.
+	// List all sessions from the agent facade (including restored history) and
+	// keep the cursor on the previously selected session when possible.
 	sessions, err := m.agent.List(context.Background(), agent.Filter{})
 	if err != nil {
 		log.Printf("[tui] refreshSessions: %v", err)
@@ -268,89 +255,9 @@ func (m *Model) refreshSessions() {
 
 // toServerSession converts an agent.Session DTO back to the server.Session type
 // that the TUI still uses internally for chat rendering and plan panels.
-// This adapter keeps the boundary at agent.Agent while avoiding a wholesale
-// rewrite of the view/helpers in this refactoring step.
+// It delegates to the canonical conversion in the server package to avoid drift.
 func toServerSession(a *agent.Session) *server.Session {
-	if a == nil {
-		return nil
-	}
-
-	var state *types.ThreeLayerState
-	if a.State != "" || len(a.ActiveBlocks) > 0 || a.PendingClarify != nil {
-		state = &types.ThreeLayerState{
-			CurrentDomain: a.State,
-		}
-		if len(a.ActiveBlocks) > 0 {
-			state.ActiveBlocks = make(map[string]*types.SessionBlock, len(a.ActiveBlocks))
-			for _, b := range a.ActiveBlocks {
-				state.ActiveBlocks[b.ID] = &types.SessionBlock{
-					ID:     b.ID,
-					Domain: b.Domain,
-					Goal:   b.Goal,
-				}
-			}
-		}
-		if a.PendingClarify != nil {
-			req := a.PendingClarify
-			state.PendingClarify = &types.ClarifyRequest{
-				ID:         req.ID,
-				Question:   req.Question,
-				Context:    req.Context,
-				AgentID:    req.AgentID,
-				CreatedAt:  req.CreatedAt,
-				Answer:     req.Answer,
-				AnsweredAt: req.AnsweredAt,
-			}
-		}
-	}
-
-	var endedAt *time.Time
-	if !a.EndedAt.IsZero() {
-		t := a.EndedAt
-		endedAt = &t
-	}
-
-	events := make([]server.SessionEvent, len(a.Events))
-	for i, e := range a.Events {
-		events[i] = server.SessionEvent{
-			Type:         e.Type,
-			Agent:        e.Agent,
-			Message:      e.Message,
-			Kind:         e.Kind,
-			Tool:         e.Tool,
-			ToolPath:     e.ToolPath,
-			ToolOutput:   e.ToolOutput,
-			ToolError:    e.ToolError,
-			Success:      e.Success,
-			Timestamp:    e.Timestamp,
-			Prompt:       e.Prompt,
-			InputTokens:  e.InputTokens,
-			OutputTokens: e.OutputTokens,
-			DetailJSON:   e.DetailJSON,
-		}
-	}
-
-	messages := make([]types.ChatMessage, len(a.Messages))
-	for i, msg := range a.Messages {
-		messages[i] = types.ChatMessage{
-			Role:      enums.ChatRole(msg.Role),
-			Content:   msg.Content,
-			Timestamp: msg.Timestamp,
-		}
-	}
-
-	return &server.Session{
-		ID:        a.ID,
-		Goal:      a.Goal,
-		Status:    enums.SessionStatus(a.Status),
-		Result:    a.Result,
-		State:     state,
-		StartedAt: a.StartedAt,
-		EndedAt:   endedAt,
-		Events:    events,
-		Messages:  messages,
-		TempDir:   a.TempDir,
-	}
+	return server.ToServerSession(a)
 }
 
 func (m *Model) selectedSession() *server.Session {

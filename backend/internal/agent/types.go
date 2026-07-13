@@ -36,11 +36,33 @@ type Result struct {
 	Data any
 }
 
+// QueryKind constants identify read-only questions answered by Query.
+const (
+	QueryKindBoard        = "board"
+	QueryKindMailbox      = "mailbox"
+	QueryKindMetrics      = "metrics"
+	QueryKindWatchdog     = "watchdog"
+	QueryKindTokenMetrics = "token-metrics"
+	QueryKindLogs         = "logs"
+	QueryKindSessionCount = "session-count"
+	QueryKindLLMStats     = "llm-stats"
+)
+
 // ControlCommand sends an operational command to a session.
 type ControlCommand struct {
 	Op   string
 	Args map[string]any
 }
+
+// Control operations.
+const (
+	ControlOpMessage   = "message"
+	ControlOpClarify   = "clarify"
+	ControlOpInterrupt = "interrupt"
+	ControlOpEnqueue   = "enqueue"
+	ControlOpCancel    = "cancel"
+	ControlOpTopic     = "topic"
+)
 
 // Filter selects sessions when listing.
 type Filter struct {

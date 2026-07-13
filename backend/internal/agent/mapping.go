@@ -3,12 +3,11 @@ package agent
 import (
 	"time"
 
-	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
-// toAgentSession converts a server.Session DTO to an agent.Session DTO.
-func toAgentSession(s *server.Session) *Session {
+// toAgentSession converts an internal session to the public Session DTO.
+func toAgentSession(s *internalSession) *Session {
 	if s == nil {
 		return nil
 	}
@@ -84,8 +83,8 @@ func toAgentSession(s *server.Session) *Session {
 	}
 }
 
-// toAgentEvent converts a server.SessionEvent DTO to an agent.Event DTO.
-func toAgentEvent(e *server.SessionEvent) *Event {
+// toAgentEvent converts an internal event to the public Event DTO.
+func toAgentEvent(e *internalEvent) *Event {
 	if e == nil {
 		return nil
 	}
@@ -107,7 +106,7 @@ func toAgentEvent(e *server.SessionEvent) *Event {
 	}
 }
 
-// toAgentInstance converts a runtime RoleInstance to an agent.AgentInstance DTO.
+// toAgentInstance converts a runtime RoleInstance to an AgentInstance DTO.
 func toAgentInstance(inst *types.RoleInstance) *AgentInstance {
 	if inst == nil {
 		return nil

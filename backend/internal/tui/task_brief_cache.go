@@ -2,14 +2,13 @@ package tui
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mattn/go-runewidth"
 
-	"github.com/blockmemory/agent/backend/internal/model"
+	"github.com/blockmemory/agent/backend/internal/agent"
 )
 
 const (
@@ -72,19 +71,18 @@ func (c *TaskBriefCache) Set(title, brief string) {
 // Warm requests an LLM brief for title asynchronously, respecting the cache's
 // concurrency semaphore. ctx is used for cancellation; a 3-second timeout is
 // applied to the LLM call.
-func (c *TaskBriefCache) Warm(ctx context.Context, mf *model.ModelFactory, title string) {
-	if mf == nil {
+func (c *TaskBriefCache) Warm(ctx context.Context, a agent.Agent, title string) {
+	if a == nil {
 		return
 	}
 	select {
 	case c.sem <- struct{}{}:
 		go func() {
 			defer func() { <-c.sem }()
-			prompt := fmt.Sprintf("将以下任务描述压缩成 %d 字以内的简短任务名，保留核心动作与对象，不要解释：\n%s", taskTitleMaxBriefWidth, title)
 			callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			defer cancel()
-			brief, err := mf.CallLightweightWithRetry(callCtx, prompt)
-			if err != nil || strings.TrimSpace(brief) == "" {
+			brief := a.SummarizeTaskTitle(callCtx, title)
+			if strings.TrimSpace(brief) == "" {
 				return
 			}
 			brief = strings.TrimSpace(brief)
@@ -98,7 +96,7 @@ func (c *TaskBriefCache) Warm(ctx context.Context, mf *model.ModelFactory, title
 	}
 }
 
-func (c *TaskBriefCache) summarize(mf *model.ModelFactory, title string) string {
+func (c *TaskBriefCache) summarize(a agent.Agent, title string) string {
 	w := runewidth.StringWidth(title)
 	if w <= taskTitleSummarizeThreshold {
 		return title
@@ -108,11 +106,11 @@ func (c *TaskBriefCache) summarize(mf *model.ModelFactory, title string) string 
 	}
 	fallback := truncate(title, taskTitleMaxBriefWidth)
 	c.Set(title, fallback)
-	c.Warm(context.Background(), mf, title)
+	c.Warm(context.Background(), a, title)
 	return fallback
 }
 
 // summarizeTaskTitle is the Model-facing entrypoint kept for callers/tests.
 func (m Model) summarizeTaskTitle(title string) string {
-	return m.taskBriefCache.summarize(m.modelFactory, title)
+	return m.taskBriefCache.summarize(m.agent, title)
 }

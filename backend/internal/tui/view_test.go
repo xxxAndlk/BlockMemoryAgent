@@ -1,10 +1,12 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
@@ -64,11 +66,28 @@ func TestAgentCardLineRendersGoalAndBadge(t *testing.T) {
 	}
 }
 
+// stubAgent returns titles unchanged so the brief cache falls back to truncation.
+type stubAgent struct{}
+
+func (stubAgent) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) { return nil, nil }
+func (stubAgent) ResumeSession(ctx context.Context, sessionID string, req agent.ResumeRequest) (*agent.Session, error) {
+	return nil, nil
+}
+func (stubAgent) Send(ctx context.Context, sessionID string, msg agent.Message) error { return nil }
+func (stubAgent) Stream(ctx context.Context, sessionID string) (<-chan agent.Event, error) { return nil, nil }
+func (stubAgent) Query(ctx context.Context, sessionID string, q agent.Query) (agent.Result, error) { return agent.Result{}, nil }
+func (stubAgent) Control(ctx context.Context, sessionID string, cmd agent.ControlCommand) error { return nil }
+func (stubAgent) List(ctx context.Context, filter agent.Filter) ([]*agent.Session, error) { return nil, nil }
+func (stubAgent) Get(ctx context.Context, sessionID string) (*agent.Session, error) { return nil, nil }
+func (stubAgent) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) { return nil, nil }
+func (stubAgent) Shutdown(ctx context.Context) error { return nil }
+func (stubAgent) SummarizeTaskTitle(ctx context.Context, title string) string { return title }
+
 func TestSummarizeTaskTitleFallback(t *testing.T) {
 	m := &Model{
 		styles:         NewStyles(),
 		taskBriefCache: NewTaskBriefCache(),
-		modelFactory:   nil,
+		agent:          stubAgent{},
 	}
 	long := strings.Repeat("设计并实现一个完整的后台管理系统前端页面包含商品管理和订单管理以及用户管理模块", 2)
 	got := m.summarizeTaskTitle(long)

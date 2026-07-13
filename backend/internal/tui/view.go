@@ -11,6 +11,9 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
+// Note: board snapshot access now goes through agent.Query("board") so the TUI
+// no longer needs *runtime.Runtime directly.
+
 // View renders the entire TUI in single-column chat-focused layout.
 func (m Model) View() string {
 	if m.width == 0 || m.height == 0 {
@@ -157,10 +160,8 @@ func (m Model) renderPlanPanel(w, h int) string {
 
 	s := m.selectedSession()
 	var snap board.Snapshot
-	if s != nil && m.rt != nil && m.rt.Boards != nil {
-		if b := m.rt.Boards.Get(s.ID); b != nil {
-			snap = b.Snapshot()
-		}
+	if s != nil {
+		snap = m.boardSnapshot(s.ID)
 	}
 
 	// 没有看板时（如 direct_tool），用会话目标生成一个最小计划视图，
@@ -412,11 +413,7 @@ func (m Model) renderPlanBar(w int) string {
 	var toolLabel string
 	if s := m.selectedSession(); s != nil {
 		toolLabel = lastToolLabel(s)
-		if m.rt != nil && m.rt.Boards != nil {
-			if b := m.rt.Boards.Get(s.ID); b != nil {
-				snap = b.Snapshot()
-			}
-		}
+		snap = m.boardSnapshot(s.ID)
 	}
 	line := formatPlanBar(m.styles, snap, toolLabel)
 	return lipgloss.NewStyle().Width(w).Height(1).Render(line)

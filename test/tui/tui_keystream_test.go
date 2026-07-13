@@ -19,12 +19,9 @@ func TestTUIKeyStream(t *testing.T) {
 	// Build a TUI model wired to the same backend as the HTTP tests.
 	m := tui.NewModel(
 		f.Server.Deps.Agent,
-		f.Server.Deps.Runtime,
 		f.Server.Deps.DAGHandler,
-		f.Server.Deps.Postgres,
 		f.Server.URL(),
 		"mock-model",
-		f.Server.Deps.ModelFactory,
 	)
 
 	// Ensure the model starts with a sane initial state.

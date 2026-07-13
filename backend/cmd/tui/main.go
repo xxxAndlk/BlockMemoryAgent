@@ -154,7 +154,7 @@ func main() {
 	log.Printf("TUI backend listening at %s", httpAddr)
 
 	modelName := app.RoleConfig.MetaAgent.ModelConfig.Model
-	model := tui.NewModel(app.Agent, app.Runtime, app.DAGHandler, app.Postgres, httpAddr, modelName, app.ModelFactory)
+	model := tui.NewModel(app.Agent, app.DAGHandler, httpAddr, modelName)
 
 	// CI 环境或 stdin 非 TTY 时自动禁用 alt-screen，避免输出被吞或光标异常。
 	useAltScreen := !*noAltScreen && os.Getenv("CI") == "" && isatty.IsTerminal(os.Stdin.Fd())

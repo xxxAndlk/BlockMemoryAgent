@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"sort"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -56,16 +58,30 @@ func (m *Model) showChatDetail() {
 	m.overlayPanel.open(item.title, strings.Split(detail, "\n"))
 }
 
+func (m *Model) boardSnapshot(sessionID string) board.Snapshot {
+	if m.agent == nil || sessionID == "" {
+		return board.Snapshot{}
+	}
+	res, err := m.agent.Query(context.Background(), sessionID, agent.Query{Kind: agent.QueryKindBoard})
+	if err != nil || res.Data == nil {
+		return board.Snapshot{}
+	}
+	snap, ok := res.Data.(board.Snapshot)
+	if !ok {
+		return board.Snapshot{}
+	}
+	return snap
+}
+
 func (m *Model) showPlanDetailByIndex(idx int) {
 	s := m.selectedSession()
-	if s == nil || m.rt == nil || m.rt.Boards == nil {
+	if s == nil {
 		return
 	}
-	b := m.rt.Boards.Get(s.ID)
-	if b == nil {
+	snap := m.boardSnapshot(s.ID)
+	if len(snap.Tasks) == 0 {
 		return
 	}
-	snap := b.Snapshot()
 	if idx < 0 || idx >= len(snap.Tasks) {
 		return
 	}
@@ -115,10 +131,8 @@ type chatItem struct {
 func (m *Model) buildPlanLines() []string {
 	s := m.selectedSession()
 	var snap board.Snapshot
-	if s != nil && m.rt != nil && m.rt.Boards != nil {
-		if b := m.rt.Boards.Get(s.ID); b != nil {
-			snap = b.Snapshot()
-		}
+	if s != nil {
+		snap = m.boardSnapshot(s.ID)
 	}
 
 	// 没有看板时（如 direct_tool），用会话目标生成最小计划视图，

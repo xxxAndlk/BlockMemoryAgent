@@ -2,10 +2,15 @@ package agent
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/internal/runtime"
+	"github.com/blockmemory/agent/backend/internal/skill"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -34,13 +39,27 @@ func newTestService(t *testing.T) *Service {
 	cfg := &pkgconfig.RoleConfigFile{}
 	registry := graph.NewRoleRegistry(cfg)
 	factory := graph.NewRoleFactory(registry, nil, cfg)
+
+	rt, err := runtime.New("", skill.BuiltinPool())
+	if err != nil {
+		t.Fatalf("init runtime: %v", err)
+	}
+	rt.SetAgentConfig(&config.AgentConfig{
+		GraphPolicyConfig: config.GraphPolicyConfig{
+			StallSteps:           30,
+			MaxRepeatFingerprint: 3,
+			SessionTimeoutMin:    60,
+		},
+	})
+
 	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
+	builder.SetRuntime(rt)
 	builder.AddNode(&fakeMetaAgentForService{})
 	builder.AddNode(graph.NewEscalationHandlerNode())
 	builder.AddNode(&fakeSinkerForService{})
 	g := builder.Build()
 
-	return NewService(g, registry, nil)
+	return NewService(g, registry, rt)
 }
 
 func TestServiceCreateAndGetSession(t *testing.T) {
@@ -146,4 +165,64 @@ func TestServiceShutdown(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("session did not leave running state after Shutdown")
+}
+
+func TestServiceCleansTempDirOnCompletion(t *testing.T) {
+	workDir := t.TempDir()
+
+	// 在会话启动前预先创建临时目录，避免与会话 goroutine 的清理产生竞态。
+	tempDir := filepath.Join(workDir, ".bma", "tmp", "session-1")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	tempFile := filepath.Join(tempDir, "script.py")
+	if err := os.WriteFile(tempFile, []byte("print('temp')"), 0644); err != nil {
+		t.Fatalf("写临时文件失败: %v", err)
+	}
+
+	svc := newTestService(t)
+	svc.store.workDir = workDir
+
+	session, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "test goal"})
+	if err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if session.TempDir != tempDir {
+		t.Fatalf("TempDir 期望 %q，got %q", tempDir, session.TempDir)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	cleaned := false
+	for time.Now().Before(deadline) {
+		snap, _ := svc.Get(context.Background(), session.ID)
+		if snap != nil && snap.Status != string(enums.SessionStatusRunning) {
+			if _, err := os.Stat(tempDir); os.IsNotExist(err) {
+				cleaned = true
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !cleaned {
+		t.Fatalf("会话完成后临时目录应被删除，但仍存在: %s", tempDir)
+	}
+	if _, err := os.Stat(tempFile); !os.IsNotExist(err) {
+		t.Fatalf("会话完成后临时文件应被删除，但仍存在: %s", tempFile)
+	}
+}
+
+func TestServiceTempDirLocation(t *testing.T) {
+	workDir := t.TempDir()
+
+	svc := newTestService(t)
+	svc.store.workDir = workDir
+
+	session, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "location test"})
+	if err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	expected := filepath.Join(workDir, ".bma", "tmp", session.ID)
+	if session.TempDir != expected {
+		t.Fatalf("TempDir 期望 %q，got %q", expected, session.TempDir)
+	}
 }

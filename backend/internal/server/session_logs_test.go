@@ -1,6 +1,10 @@
-package server
+package server_test
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/blockmemory/agent/backend/pkg/textutil"
+)
 
 func TestRedactSensitive(t *testing.T) {
 	cases := []struct {
@@ -26,9 +30,9 @@ func TestRedactSensitive(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		got := redactSensitive(c.input)
+		got := textutil.RedactSensitive(c.input)
 		if got != c.want {
-			t.Fatalf("redactSensitive(%q) = %q, want %q", c.input, got, c.want)
+			t.Fatalf("RedactSensitive(%q) = %q, want %q", c.input, got, c.want)
 		}
 	}
 }
@@ -63,9 +67,9 @@ func TestParseTokenUsage(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		gotIn, gotOut := parseTokenUsage(c.msg)
+		gotIn, gotOut := textutil.ParseTokenUsage(c.msg)
 		if gotIn != c.wantIn || gotOut != c.wantOut {
-			t.Fatalf("parseTokenUsage(%q) = (%d, %d), want (%d, %d)",
+			t.Fatalf("ParseTokenUsage(%q) = (%d, %d), want (%d, %d)",
 				c.msg, gotIn, gotOut, c.wantIn, c.wantOut)
 		}
 	}
