@@ -201,9 +201,9 @@ type openAIResponse struct {
 }
 
 type responseMessage struct {
-	Role      string          `json:"role"`
-	Content   string          `json:"content"`
-	ToolCalls []MockToolCall  `json:"tool_calls,omitempty"`
+	Role      string         `json:"role"`
+	Content   string         `json:"content"`
+	ToolCalls []MockToolCall `json:"tool_calls,omitempty"`
 }
 
 func openAICompletionResponse(model string, res MockResponse) openAIResponse {

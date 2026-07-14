@@ -13,8 +13,8 @@ import (
 // TestServer wraps an httptest.Server running the full backend handler plus the
 // live dependencies returned by testserver.BuildHandler.
 type TestServer struct {
-	Server *httptest.Server
-	Deps   *testserver.Deps
+	Server  *httptest.Server
+	Deps    *testserver.Deps
 	cleanup func()
 }
 

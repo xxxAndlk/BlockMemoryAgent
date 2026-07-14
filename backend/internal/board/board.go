@@ -120,9 +120,9 @@ func (b *TaskBoard) AddSubTask(title string) string {
 		CreatedAt: now,         // 创建时间
 		UpdatedAt: now,         // 首次更新时间
 	}
-	b.Order = append(b.Order, id)   // 维持创建顺序，Brief 按此输出
+	b.Order = append(b.Order, id)    // 维持创建顺序，Brief 按此输出
 	b.Status = BoardStatusInProgress // 只要有任务，看板即进入进行中
-	b.UpdatedAt = now               // 刷新看板更新时间
+	b.UpdatedAt = now                // 刷新看板更新时间
 	return id
 }
 

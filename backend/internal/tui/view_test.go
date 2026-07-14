@@ -21,8 +21,8 @@ func TestAgentTreePrefix(t *testing.T) {
 	}
 
 	cases := []struct {
-		idx    int
-		want   string
+		idx  int
+		want string
 	}{
 		{0, ""},
 		{1, "├─ "},
@@ -69,18 +69,30 @@ func TestAgentCardLineRendersGoalAndBadge(t *testing.T) {
 // stubAgent returns titles unchanged so the brief cache falls back to truncation.
 type stubAgent struct{}
 
-func (stubAgent) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) { return nil, nil }
+func (stubAgent) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) {
+	return nil, nil
+}
 func (stubAgent) ResumeSession(ctx context.Context, sessionID string, req agent.ResumeRequest) (*agent.Session, error) {
 	return nil, nil
 }
 func (stubAgent) Send(ctx context.Context, sessionID string, msg agent.Message) error { return nil }
-func (stubAgent) Stream(ctx context.Context, sessionID string) (<-chan agent.Event, error) { return nil, nil }
-func (stubAgent) Query(ctx context.Context, sessionID string, q agent.Query) (agent.Result, error) { return agent.Result{}, nil }
-func (stubAgent) Control(ctx context.Context, sessionID string, cmd agent.ControlCommand) error { return nil }
-func (stubAgent) List(ctx context.Context, filter agent.Filter) ([]*agent.Session, error) { return nil, nil }
+func (stubAgent) Stream(ctx context.Context, sessionID string) (<-chan agent.Event, error) {
+	return nil, nil
+}
+func (stubAgent) Query(ctx context.Context, sessionID string, q agent.Query) (agent.Result, error) {
+	return agent.Result{}, nil
+}
+func (stubAgent) Control(ctx context.Context, sessionID string, cmd agent.ControlCommand) error {
+	return nil
+}
+func (stubAgent) List(ctx context.Context, filter agent.Filter) ([]*agent.Session, error) {
+	return nil, nil
+}
 func (stubAgent) Get(ctx context.Context, sessionID string) (*agent.Session, error) { return nil, nil }
-func (stubAgent) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) { return nil, nil }
-func (stubAgent) Shutdown(ctx context.Context) error { return nil }
+func (stubAgent) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
+	return nil, nil
+}
+func (stubAgent) Shutdown(ctx context.Context) error                          { return nil }
 func (stubAgent) SummarizeTaskTitle(ctx context.Context, title string) string { return title }
 
 func TestSummarizeTaskTitleFallback(t *testing.T) {

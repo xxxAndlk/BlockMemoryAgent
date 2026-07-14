@@ -37,7 +37,7 @@ type ChatMessage struct {
 }
 
 // ClarifyRequest 人机对话请求：Agent 在执行中遇到需要用户确认的问题时挂起，
-// 由 server 层通过 HTTP 暴露给前端，用户答复后回填 Answer 并恢复 graph。
+// 由 server 层通过 HTTP 暴露给前端，用户答复后恢复会话。
 type ClarifyRequest struct {
 	ID         string     `json:"id"`                    // 请求唯一 ID（用于答复对齐）
 	Question   string     `json:"question"`              // Agent 提给用户的问题
@@ -46,31 +46,6 @@ type ClarifyRequest struct {
 	CreatedAt  time.Time  `json:"created_at"`            // 创建时间
 	Answer     string     `json:"answer,omitempty"`      // 用户答复（回填）
 	AnsweredAt *time.Time `json:"answered_at,omitempty"` // 答复时间
-}
-
-// GraphState 三层图共享状态：早期版本的全局状态载体（向后兼容保留）。
-// 运行时主路径使用 ThreeLayerState，本结构用于事件序列化与外部 API。
-type GraphState struct {
-	// TopicID 当前话题 ID。
-	TopicID string `json:"topic_id"`
-	// TopicGoal 话题目标描述。
-	TopicGoal string `json:"topic_goal"`
-	// Constraints 话题级约束（键值对）。
-	Constraints map[string]string `json:"constraints"`
-	// EventQueue 待处理事件队列。
-	EventQueue []*Event `json:"event_queue"`
-	// CurrentAgent 当前活跃 Agent ID。
-	CurrentAgent string `json:"current_agent"`
-	// AgentOutputs 各 Agent 的最新公开输出。
-	AgentOutputs map[string]*AgentOutput `json:"agent_outputs"`
-	// SnapshotRefs 各 Agent 的快照存储键。
-	SnapshotRefs map[string]string `json:"snapshot_refs"`
-	// NextAction 下一步控制信号。
-	NextAction enums.ActionType `json:"next_action"`
-	// TargetAgent Switch 动作的目标 Agent ID。
-	TargetAgent string `json:"target_agent"`
-	// Reason 本次动作的理由，供审计与调试。
-	Reason string `json:"reason"`
 }
 
 // UIEvent TUI 推送事件：向 bubbletea TUI / Web SSE 订阅者广播的事件信封。

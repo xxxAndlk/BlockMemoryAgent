@@ -15,7 +15,7 @@ import (
 // KnowledgeStore 是全局知识库/块记忆相关的 PostgreSQL 存储子层。
 // 职责: global_knowledge 表的写入、按类型查询、向量相似搜索、归档与访问计数。
 type KnowledgeStore struct {
-	db *sql.DB       // 共享连接池
+	db *sql.DB        // 共享连接池
 	pg *PostgresStore // 反向引用，用于复用 Embed / EmbeddingDim 能力
 }
 

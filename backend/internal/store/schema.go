@@ -1,11 +1,11 @@
 package store
 
 import (
-	"context"       // 上下文，贯穿所有数据库调用以支持超时与取消
-	"database/sql"  // 标准库 SQL 抽象层
-	"fmt"           // 格式化错误信息与 pgvector 字符串
-	"strconv"       // 解析 vector(768) 维度数字（ValidateEmbeddingDimension）
-	"strings"       // 拼接 pgvector 的逗号分隔向量分量
+	"context"      // 上下文，贯穿所有数据库调用以支持超时与取消
+	"database/sql" // 标准库 SQL 抽象层
+	"fmt"          // 格式化错误信息与 pgvector 字符串
+	"strconv"      // 解析 vector(768) 维度数字（ValidateEmbeddingDimension）
+	"strings"      // 拼接 pgvector 的逗号分隔向量分量
 )
 
 // pgVector 将 float32 切片转为 pgvector 字符串格式 [1,2,3]。

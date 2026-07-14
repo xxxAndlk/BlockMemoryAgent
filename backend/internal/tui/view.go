@@ -544,5 +544,3 @@ func truncate(s string, n int) string {
 	b.WriteString("…")
 	return b.String()
 }
-
-

@@ -1,8 +1,8 @@
 package types
 
-// 本文件定义 Plan-and-Execute 的计划类型（TODO #1）。
-// 放在 pkg/types 以避免 graph ↔ types 循环依赖：SessionBlock（types）引用 ExecutionPlan，
-// 而 graph 的 generatePlan/reflectOnResult 逻辑使用这些类型。
+// 本文件定义 Plan-and-Execute 的计划类型（保留供未来扩展）。
+// 当前 ReAct 引擎不再使用 ExecutionPlan，但类型本身无外部依赖，保留以避免
+// 一旦恢复计划执行能力时产生循环依赖。
 
 // PlanStepStatus 步骤状态。
 type PlanStepStatus string

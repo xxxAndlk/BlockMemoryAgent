@@ -40,7 +40,7 @@ func (r *AgentResult) Text() string {
 }
 
 // MetaMemoryEntry 单条 MetaAgent 调度记忆。
-// 写入 SessionBlock.MetaMemory，随块一起归档；关键决策也可写入全局会话记忆。
+// 可沉淀到会话记忆或全局知识库，供后续路由与上下文注入使用。
 type MetaMemoryEntry struct {
 	// Timestamp 记忆创建时间。
 	Timestamp time.Time `json:"timestamp"`

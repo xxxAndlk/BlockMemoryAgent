@@ -57,7 +57,6 @@ func NewDefaultMux(app *App) *http.ServeMux {
 	apiHandler.SetStores(app.Postgres, app.Redis)
 	apiHandler.SetRoleConfig(app.RoleConfig)
 	apiHandler.SetModelFactory(app.ModelFactory)
-	apiHandler.SetSnapshotManager(app.SnapshotManager)
 
 	mux.HandleFunc("/api/health", apiHandler.HealthHandler)
 	mux.HandleFunc("/api/metrics", wrap(apiHandler.MetricsHandler))

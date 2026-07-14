@@ -10,12 +10,12 @@ import (
 // test: ephemeral database, temporary workspace, mock LLM, generated config, and
 // the in-process backend server.
 type IntegrationFixture struct {
-	T        testing.TB
-	DB       *TestDatabase
-	WS       *TestWorkspace
-	LLM      *MockLLMServer
-	Config   *TestConfigPaths
-	Server   *TestServer
+	T      testing.TB
+	DB     *TestDatabase
+	WS     *TestWorkspace
+	LLM    *MockLLMServer
+	Config *TestConfigPaths
+	Server *TestServer
 }
 
 // NewIntegrationFixture creates a full integration-test fixture. It skips the

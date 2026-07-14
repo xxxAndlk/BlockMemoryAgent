@@ -266,12 +266,12 @@ func titlesOf(items []chatItem) []string {
 // 并高亮展示用户输入，而不是继续显示欢迎页（修复“第一个问题未记录”的错觉）。
 func TestFirstMessagePendingDisplay(t *testing.T) {
 	m := &Model{
-		styles:   NewStyles(),
+		styles:    NewStyles(),
 		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
-		width:    80,
-		height:   24,
-		httpAddr: "http://127.0.0.1:1", // 让后台 createSession 快速失败，避免测试被网络阻塞
-		flashMu:  &sync.Mutex{},
+		width:     80,
+		height:    24,
+		httpAddr:  "http://127.0.0.1:1", // 让后台 createSession 快速失败，避免测试被网络阻塞
+		flashMu:   &sync.Mutex{},
 	}
 	m.chatPanel.vp.SetContent("")
 

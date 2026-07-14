@@ -349,5 +349,3 @@ func formatID(n int64) string {
 	// 时间部分取 HHMMSS，便于人工识别；序号部分由 strconv.FormatInt 转换。
 	return "msg_" + time.Now().Format("150405") + "_" + strconv.FormatInt(n, 10)
 }
-
-

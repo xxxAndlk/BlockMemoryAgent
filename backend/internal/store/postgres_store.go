@@ -19,16 +19,16 @@ import (
 //
 // 并发安全: 内部仅持有 *sql.DB 连接池,database/sql 自身线程安全,可在多 goroutine 间共享。
 type PostgresStore struct {
-	db                       *sql.DB             // 共享连接池,所有子存储通过该句柄执行 SQL
-	dim                      int                 // 向量维度，由 SetEmbeddingDim 设置；默认 768，需与 schema 中 VECTOR(N) 一致
-	embedder                 embed.Embedder      // 文本嵌入实现（P3-3）；nil 时回退 PseudoEmbed
-	searchBlockMemoryMaxTokens int               // 块记忆检索摘要 token 上限；由配置注入
-	Episode                  *EpisodeStore       // 私有 Episode 存储
-	Snapshot                 *SnapshotStore      // Agent 快照存储
-	Knowledge                *KnowledgeStore     // 全局知识/块记忆存储
-	Topic                    *TopicStore         // 话题元数据与归档存储
-	AgentRegistry            *AgentRegistryStore // Agent 注册表与决策日志存储
-	Session                  *SessionStore       // 会话历史/事件存储
+	db                         *sql.DB             // 共享连接池,所有子存储通过该句柄执行 SQL
+	dim                        int                 // 向量维度，由 SetEmbeddingDim 设置；默认 768，需与 schema 中 VECTOR(N) 一致
+	embedder                   embed.Embedder      // 文本嵌入实现（P3-3）；nil 时回退 PseudoEmbed
+	searchBlockMemoryMaxTokens int                 // 块记忆检索摘要 token 上限；由配置注入
+	Episode                    *EpisodeStore       // 私有 Episode 存储
+	Snapshot                   *SnapshotStore      // Agent 快照存储
+	Knowledge                  *KnowledgeStore     // 全局知识/块记忆存储
+	Topic                      *TopicStore         // 话题元数据与归档存储
+	AgentRegistry              *AgentRegistryStore // Agent 注册表与决策日志存储
+	Session                    *SessionStore       // 会话历史/事件存储
 }
 
 // NewPostgresStore 创建 PostgreSQL 存储实例。

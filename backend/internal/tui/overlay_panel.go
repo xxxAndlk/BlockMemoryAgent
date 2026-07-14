@@ -203,4 +203,3 @@ func (m *Model) clampOverlayCursor() {
 func (m Model) renderOverlay(w, h int) string {
 	return m.overlayPanel.render(m.styles, w, h, m.buildPlanLines(), m.agentTreePanel.buildLines(), m.buildTranscriptLines())
 }
-

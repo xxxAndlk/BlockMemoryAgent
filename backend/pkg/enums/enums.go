@@ -15,38 +15,7 @@
 package enums
 
 // ============================================================
-// 1. Graph 控制信号
-// ============================================================
-
-// ActionType Graph 控制信号:三层图状态机的下一步动作语义。
-// 由各 Node 的 Invoke 返回,驱动 ThreeLayerGraph 的循环。
-// 修改值等同于改变 Graph 状态机协议,需同步 ThreeLayerGraph.determineNext 路由逻辑。
-type ActionType string
-
-const (
-	// ActionContinue 继续:当前节点继续推进,不切换上下文。
-	// 典型场景:DomainAgent 内部多步 ReAct 循环未结束,需要继续执行下一步。
-	ActionContinue ActionType = "Continue"
-
-	// ActionSwitch 切换:切换当前活跃 DomainAgent / SessionBlock。
-	// 典型场景:MetaAgent 完成一个领域的子任务后,切到下一个领域继续执行。
-	ActionSwitch ActionType = "Switch"
-
-	// ActionEscalate 升级:上抛给 MetaAgent 或 EscalationHandlerNode 仲裁。
-	// 典型场景:DomainAgent 遇到无法决策的歧义、超出权限的操作、或检测到跨域冲突。
-	ActionEscalate ActionType = "Escalate"
-
-	// ActionFinish 完成:结束整个 Graph 循环,进入收尾。
-	// 典型场景:所有领域子任务完成,MetaAgent 汇总结果后返回。
-	ActionFinish ActionType = "Finish"
-
-	// ActionWait 等待:暂停 Graph 循环,等待外部输入 (如人机对话答复) 后由 server 侧恢复执行。
-	// 典型场景:Agent 触发 ClarifyRequest,Graph 返回此信号挂起,server 把会话置为 awaiting_clarify。
-	ActionWait ActionType = "Wait"
-)
-
-// ============================================================
-// 2. 工作区事件
+// 1. 工作区事件
 // ============================================================
 
 // EventType 工作区事件类型:刻画 Agent 间协作事件的语义分类。
@@ -179,7 +148,7 @@ const (
 	RoleStatusDone RoleStatus = "done"
 
 	// RoleStatusError 错误:执行失败,需升级或重试。
-	// 终态,触发 ActionEscalate 上抛 MetaAgent 处理。
+	// 终态,触发升级/上抛给更高层 Agent 处理。
 	RoleStatusError RoleStatus = "error"
 )
 
@@ -205,7 +174,7 @@ const (
 	// 终态,前端展示错误信息。
 	SessionStatusError SessionStatus = "error"
 
-	// SessionStatusAwaitingClarify 等待澄清:Graph 因 ActionWait 挂起,等待用户答复。
+	// SessionStatusAwaitingClarify 等待澄清:会话因等待用户答复而挂起。
 	// 中间态,用户通过 /clarify 提交答复后回到 running。
 	SessionStatusAwaitingClarify SessionStatus = "awaiting_clarify"
 )
@@ -229,30 +198,7 @@ const (
 )
 
 // ============================================================
-// 6. 会话块状态
-// ============================================================
-
-// BlockStatus 会话块状态:SessionBlock 在 DomainAgent 执行过程中的阶段。
-// 见 pkg/types/role.go SessionBlock.Status。
-// 流转:active → completed | failed。
-type BlockStatus string
-
-const (
-	// BlockStatusActive 活跃:DomainAgent 正在处理此会话块。
-	// 初始状态,DomainAgent 创建会话块后置此状态。
-	BlockStatusActive BlockStatus = "active"
-
-	// BlockStatusCompleted 已完成:DomainAgent 成功完成此会话块的所有子任务。
-	// 终态,会话块进入 CompletedBlocks 列表,不再参与调度。
-	BlockStatusCompleted BlockStatus = "completed"
-
-	// BlockStatusFailed 失败:DomainAgent 执行此会话块失败。
-	// 终态,触发升级或会话级错误处理。
-	BlockStatusFailed BlockStatus = "failed"
-)
-
-// ============================================================
-// 7. 话题状态
+// 6. 话题状态
 // ============================================================
 
 // TopicStatus 话题状态:TopicMeta.Status 的取值,描述话题生命周期。

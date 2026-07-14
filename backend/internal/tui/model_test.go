@@ -13,11 +13,13 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/go-kratos/blades"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/config"
-	"github.com/blockmemory/agent/backend/internal/graph"
+	"github.com/blockmemory/agent/backend/internal/domain/role"
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/internal/skill"
@@ -26,39 +28,34 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
-// fakeMetaAgentForRender 是一个立即结束的 MetaAgent 节点，用于在测试中
-// 快速得到一个包含用户消息和助手回复的已完成会话。
-type fakeMetaAgentForRender struct {
-	summary string
+// mockProviderForTUI is a blades provider that always returns a fixed plain
+// text response, letting ReAct sessions complete without real API calls.
+type mockProviderForTUI struct {
+	response string
 }
 
-func (n *fakeMetaAgentForRender) Name() string { return "MetaAgent" }
-func (n *fakeMetaAgentForRender) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	state.SessionSummary = n.summary
-	state.NextAction = enums.ActionFinish
-	return state, nil
+func (p *mockProviderForTUI) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	return &blades.ModelResponse{Message: blades.AssistantMessage(p.response)}, nil
 }
 
-type fakeSinkerForRender struct{}
-
-func (n *fakeSinkerForRender) Name() string { return "Sinker" }
-func (n *fakeSinkerForRender) Invoke(ctx context.Context, state *types.ThreeLayerState) (*types.ThreeLayerState, error) {
-	state.NextAction = enums.ActionFinish
-	return state, nil
-}
-
-// testAgent creates an agent.Agent facade for tests.
-func testAgent(g *graph.ThreeLayerGraph, registry *graph.RoleRegistry, rt *runtime.Runtime) agent.Agent {
-	return agent.NewService(g, registry, rt)
+// testAgent creates a ReAct-backed agent.Agent facade for tests.
+func testAgent(t *testing.T, summary string) agent.Agent {
+	t.Helper()
+	cfg := minimalRoleConfigForRender()
+	roleRegistry := role.NewRegistry(cfg)
+	toolRegistry := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	s := agent.NewReactService(roleRegistry, nil, toolRegistry, nil, agent.NopMemoryPipeline{}, nil)
+	s.SetModelProvider(&mockProviderForTUI{response: summary})
+	return s
 }
 
 // mockAgentForPlan is a minimal agent.Agent implementation used by
 // TestPlanPanelReflectsAgentStatuses so the test does not need *runtime.Runtime.
 type mockAgentForPlan struct {
-	sessionID   string
-	goal        string
-	boardSnap   board.Snapshot
-	agentInsts  []agent.AgentInstance
+	sessionID  string
+	goal       string
+	boardSnap  board.Snapshot
+	agentInsts []agent.AgentInstance
 }
 
 func (m *mockAgentForPlan) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) {
@@ -67,7 +64,9 @@ func (m *mockAgentForPlan) CreateSession(ctx context.Context, req agent.CreateRe
 func (m *mockAgentForPlan) ResumeSession(ctx context.Context, sessionID string, req agent.ResumeRequest) (*agent.Session, error) {
 	return nil, nil
 }
-func (m *mockAgentForPlan) Send(ctx context.Context, sessionID string, msg agent.Message) error { return nil }
+func (m *mockAgentForPlan) Send(ctx context.Context, sessionID string, msg agent.Message) error {
+	return nil
+}
 func (m *mockAgentForPlan) Stream(ctx context.Context, sessionID string) (<-chan agent.Event, error) {
 	return nil, nil
 }
@@ -92,7 +91,7 @@ func (m *mockAgentForPlan) Get(ctx context.Context, sessionID string) (*agent.Se
 func (m *mockAgentForPlan) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return m.agentInsts, nil
 }
-func (m *mockAgentForPlan) Shutdown(ctx context.Context) error { return nil }
+func (m *mockAgentForPlan) Shutdown(ctx context.Context) error                          { return nil }
 func (m *mockAgentForPlan) SummarizeTaskTitle(ctx context.Context, title string) string { return title }
 
 func minimalRoleConfigForRender() *pkgconfig.RoleConfigFile {
@@ -100,6 +99,7 @@ func minimalRoleConfigForRender() *pkgconfig.RoleConfigFile {
 		MetaAgent: pkgconfig.MetaAgentConfig{
 			MaxBlocks:       4,
 			SummaryInterval: 1,
+			SystemPrompt:    "You are a helpful assistant.",
 			ModelConfig:     types.AgentModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test-key"},
 		},
 		DomainAgent: pkgconfig.DomainAgentConfig{
@@ -117,38 +117,17 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 		t.Fatalf("write soul: %v", err)
 	}
 
-	cfg := minimalRoleConfigForRender()
-	registry := graph.NewRoleRegistry(cfg)
-	factory := graph.NewRoleFactory(registry, nil, cfg)
-
 	rt, err := runtime.New(soulPath, skill.BuiltinPool())
 	if err != nil {
 		t.Fatalf("init runtime: %v", err)
 	}
-	rt.SetAgentConfig(&config.AgentConfig{
-		GraphPolicyConfig: config.GraphPolicyConfig{
-			StallSteps:           30,
-			MaxRepeatFingerprint: 3,
-			SessionTimeoutMin:    60,
-		},
-	})
+	rt.SetAgentConfig(&config.AgentConfig{})
 
-	meta := &fakeMetaAgentForRender{summary: "收到，开始处理。"}
-	escalation := graph.NewEscalationHandlerNode()
-	sinker := &fakeSinkerForRender{}
-
-	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
-	builder.SetRuntime(rt)
-	builder.AddNode(meta)
-	builder.AddNode(escalation)
-	builder.AddNode(sinker)
-	g := builder.Build()
-
-	agentSvc := testAgent(g, registry, rt)
+	agentSvc := testAgent(t, "收到，开始处理。")
 
 	m := &Model{
 		styles:       NewStyles(),
-		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
+		chatPanel:    ChatPanel{vp: viewport.New(80, 20)},
 		width:        80,
 		height:       24,
 		agent:        agentSvc,
@@ -205,36 +184,15 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 		t.Fatalf("write soul: %v", err)
 	}
 
-	cfg := minimalRoleConfigForRender()
-	registry := graph.NewRoleRegistry(cfg)
-	factory := graph.NewRoleFactory(registry, nil, cfg)
-
 	rt, err := runtime.New(soulPath, skill.BuiltinPool())
 	if err != nil {
 		t.Fatalf("init runtime: %v", err)
 	}
-	rt.SetAgentConfig(&config.AgentConfig{
-		GraphPolicyConfig: config.GraphPolicyConfig{
-			StallSteps:           30,
-			MaxRepeatFingerprint: 3,
-			SessionTimeoutMin:    60,
-		},
-	})
+	rt.SetAgentConfig(&config.AgentConfig{})
 
-	meta := &fakeMetaAgentForRender{summary: "你好！我是你的多 Agent 编排助手 BlockMemoryAgent。"}
-	escalation := graph.NewEscalationHandlerNode()
-	sinker := &fakeSinkerForRender{}
+	agentSvc := testAgent(t, "你好！我是你的多 Agent 编排助手 BlockMemoryAgent。")
 
-	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
-	builder.SetRuntime(rt)
-	builder.AddNode(meta)
-	builder.AddNode(escalation)
-	builder.AddNode(sinker)
-	g := builder.Build()
-
-	agentSvc := testAgent(g, registry, rt)
-
-	// 创建会话；fake MetaAgent 立即结束，不会并发修改 Messages
+	// 创建会话；mock provider 立即结束，不会并发修改 Messages
 	session, _ := agentSvc.CreateSession(context.Background(), agent.CreateRequest{Goal: "a"})
 
 	// 等待会话完成，确保 Messages 已追加助手总结
@@ -249,7 +207,7 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 
 	m := &Model{
 		styles:       NewStyles(),
-		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
+		chatPanel:    ChatPanel{vp: viewport.New(80, 20)},
 		width:        80,
 		height:       24,
 		agent:        agentSvc,
@@ -281,11 +239,11 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 // TestScrollbarDragScrollsChat 验证：鼠标拖动聊天区滚动条滑块时，viewport 会跟随滚动。
 func TestScrollbarDragScrollsChat(t *testing.T) {
 	m := &Model{
-		styles:  NewStyles(),
+		styles:    NewStyles(),
 		chatPanel: ChatPanel{vp: viewport.New(80, 5)},
-		width:   80,
-		height:  12,
-		flashMu: &sync.Mutex{},
+		width:     80,
+		height:    12,
+		flashMu:   &sync.Mutex{},
 	}
 	// 顶栏 1 行 + 主内容区 8 行 + 输入栏 3 行 = 12 行
 	// mainContentHeight = 12 - 1 - 3 - 1 = 7
@@ -363,34 +321,13 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 		t.Fatalf("write soul: %v", err)
 	}
 
-	cfg := minimalRoleConfigForRender()
-	registry := graph.NewRoleRegistry(cfg)
-	factory := graph.NewRoleFactory(registry, nil, cfg)
-
 	rt, err := runtime.New(soulPath, skill.BuiltinPool())
 	if err != nil {
 		t.Fatalf("init runtime: %v", err)
 	}
-	rt.SetAgentConfig(&config.AgentConfig{
-		GraphPolicyConfig: config.GraphPolicyConfig{
-			StallSteps:           30,
-			MaxRepeatFingerprint: 3,
-			SessionTimeoutMin:    60,
-		},
-	})
+	rt.SetAgentConfig(&config.AgentConfig{})
 
-	meta := &fakeMetaAgentForRender{summary: "收到，开始处理。"}
-	escalation := graph.NewEscalationHandlerNode()
-	sinker := &fakeSinkerForRender{}
-
-	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
-	builder.SetRuntime(rt)
-	builder.AddNode(meta)
-	builder.AddNode(escalation)
-	builder.AddNode(sinker)
-	g := builder.Build()
-
-	agentSvc := testAgent(g, registry, rt)
+	agentSvc := testAgent(t, "收到，开始处理。")
 	session, _ := agentSvc.CreateSession(context.Background(), agent.CreateRequest{Goal: "x"})
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -404,7 +341,7 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 
 	m := &Model{
 		styles:       NewStyles(),
-		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
+		chatPanel:    ChatPanel{vp: viewport.New(80, 20)},
 		width:        80,
 		height:       24,
 		agent:        agentSvc,
@@ -445,34 +382,13 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 		t.Fatalf("write soul: %v", err)
 	}
 
-	cfg := minimalRoleConfigForRender()
-	registry := graph.NewRoleRegistry(cfg)
-	factory := graph.NewRoleFactory(registry, nil, cfg)
-
 	rt, err := runtime.New(soulPath, skill.BuiltinPool())
 	if err != nil {
 		t.Fatalf("init runtime: %v", err)
 	}
-	rt.SetAgentConfig(&config.AgentConfig{
-		GraphPolicyConfig: config.GraphPolicyConfig{
-			StallSteps:           30,
-			MaxRepeatFingerprint: 3,
-			SessionTimeoutMin:    60,
-		},
-	})
+	rt.SetAgentConfig(&config.AgentConfig{})
 
-	meta := &fakeMetaAgentForRender{summary: "收到，开始处理。"}
-	escalation := graph.NewEscalationHandlerNode()
-	sinker := &fakeSinkerForRender{}
-
-	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
-	builder.SetRuntime(rt)
-	builder.AddNode(meta)
-	builder.AddNode(escalation)
-	builder.AddNode(sinker)
-	g := builder.Build()
-
-	agentSvc := testAgent(g, registry, rt)
+	agentSvc := testAgent(t, "收到，开始处理。")
 	session, _ := agentSvc.CreateSession(context.Background(), agent.CreateRequest{Goal: "x"})
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -486,7 +402,7 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 
 	m := &Model{
 		styles:       NewStyles(),
-		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
+		chatPanel:    ChatPanel{vp: viewport.New(80, 20)},
 		width:        120,
 		height:       40,
 		agent:        agentSvc,
@@ -518,7 +434,7 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 func TestRightPanelShowsBothPanelsEvenWhenShort(t *testing.T) {
 	m := &Model{
 		styles:           NewStyles(),
-		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
+		chatPanel:        ChatPanel{vp: viewport.New(80, 20)},
 		width:            80,
 		height:           12,
 		rightPanelForced: 1,
@@ -540,7 +456,7 @@ func TestRightPanelShowsBothPanelsEvenWhenShort(t *testing.T) {
 func TestLongUserMessageWrapsAtRightPanelBoundary(t *testing.T) {
 	m := &Model{
 		styles:           NewStyles(),
-		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
+		chatPanel:        ChatPanel{vp: viewport.New(80, 20)},
 		width:            80,
 		height:           24,
 		rightPanelForced: 1, // 强制显示右侧栏，模拟右侧栏出现后的窄对话区
@@ -585,7 +501,7 @@ func TestPlanPanelReflectsAgentStatuses(t *testing.T) {
 
 	m := &Model{
 		styles:           NewStyles(),
-		chatPanel: ChatPanel{vp: viewport.New(80, 20)},
+		chatPanel:        ChatPanel{vp: viewport.New(80, 20)},
 		width:            120,
 		height:           40,
 		agent:            mock,

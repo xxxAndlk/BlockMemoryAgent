@@ -1,5 +1,9 @@
 # BlockMemoryAgent 架构解耦与代码清晰化重构计划
 
+> **状态：本路线图已被 `2026-07-13-react-loop-architecture-refactor.md` 替代并大部分失效。**
+>
+> ReAct 重构已完成：删除了 `internal/graph/` 与大部分 `internal/memory/`，用单一 ReAct 主循环 + `call_sub_agent` 工具递归替代了四层图状态机。本文件保留作历史参考，其中 Track 1-4 的任务（graph 解耦、memory 解耦、runtime 治理、Agent 模块封装）所针对的代码已不存在；Track 5-7（frontend、tests/config/docs 清理、工程化补齐）部分仍可能适用，但需在 ReAct 新架构下重新评估。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 通过提取通用基类/接口、拆分神文件、反转错误依赖、策略配置化、参数对象化，将当前臃肿的 backend/frontend 代码重构为边界清晰、职责单一、可测试、可演进的架构。**核心交付物为 `internal/agent` 模块**：把 Agent 编排能力（graph + runtime + session 生命周期）封装为稳定 Go 接口，对话模块（HTTP）、TUI 模块（in-process）通过该接口调用 Agent，不再直接依赖 `internal/graph` / `internal/runtime` 内部类型。测试模块作为后期需求延期，本次不涉及测试基础设施改造。

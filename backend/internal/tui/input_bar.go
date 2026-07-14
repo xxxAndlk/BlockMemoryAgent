@@ -186,4 +186,3 @@ func (m Model) renderInput(w int) string {
 	}
 	return m.inputBar.render(m.styles, w, m.focus == panelInput, flash)
 }
-

@@ -20,10 +20,10 @@ func (f *fakeLLM) Generate(ctx context.Context, prompt string) (string, error) {
 
 // flakyLLM 前 failN 次返回 err，之后返回 resp。用于验证重试。
 type flakyLLM struct {
-	resp   string
-	failN  int
-	calls  int
-	mu     sync.Mutex
+	resp  string
+	failN int
+	calls int
+	mu    sync.Mutex
 }
 
 func (f *flakyLLM) Generate(ctx context.Context, prompt string) (string, error) {

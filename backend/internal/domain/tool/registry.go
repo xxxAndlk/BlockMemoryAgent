@@ -1,0 +1,607 @@
+package tool
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/blockmemory/agent/backend/internal/config"
+	"github.com/go-kratos/blades/tools"
+)
+
+// maxConsecutiveFailures 定义单个工具连续失败的最大次数，
+// 超过此次数将触发循环退出，避免无限重试。
+const maxConsecutiveFailures = 3
+
+// maxReadFilePerTask 定义单个任务中允许 ReadFile 读取的不同文件数量上限，
+// 用于防止模型反复读取相同内容造成冗余。
+const maxReadFilePerTask = 5
+
+// Tool 是内置工具的通用接口，所有具体工具都需要实现该接口。
+type Tool interface {
+	// Name 返回工具的标准名称，作为主键用于注册和调度。
+	Name() string
+	// Aliases 返回工具的别名列表，用于兼容不同的调用习惯。
+	Aliases() []string
+	// Execute 执行工具的核心方法，接收上下文和参数映射，返回执行结果。
+	Execute(ctx context.Context, args map[string]any) *Result
+}
+
+// failureCounter 用于按工具名称统计连续失败次数，
+// 支持并发安全地增加计数和重置计数。
+type failureCounter struct {
+	// mu 保护 counts 的读写锁，避免并发竞争。
+	mu sync.Mutex
+	// counts 记录每个工具名称对应的连续失败次数。
+	counts map[string]int
+}
+
+// newFailureCounter 创建一个新的失败计数器，内部 map 已经初始化。
+func newFailureCounter() *failureCounter {
+	return &failureCounter{counts: make(map[string]int)}
+}
+
+// fail 将指定工具的连续失败次数加 1，并返回当前次数。
+func (f *failureCounter) fail(name string) int {
+	// 加锁保护 counts 的并发修改。
+	f.mu.Lock()
+	// 函数退出时释放锁，避免遗忘。
+	defer f.mu.Unlock()
+	// 对应工具计数加 1。
+	f.counts[name]++
+	// 返回增加后的次数，供调用方判断是否达到阈值。
+	return f.counts[name]
+}
+
+// reset 将指定工具的连续失败次数清零（从 map 中删除）。
+func (f *failureCounter) reset(name string) {
+	// 加锁保护 counts 的并发修改。
+	f.mu.Lock()
+	// 函数退出时释放锁。
+	defer f.mu.Unlock()
+	// 删除该工具的计数记录，表示失败状态已恢复。
+	delete(f.counts, name)
+}
+
+// Registry 是工具注册表，保存所有内置工具、执行器、进度回调以及任务级状态。
+type Registry struct {
+	// exec 是实际负责工具执行的 Executor 实例。
+	exec *Executor
+	// progress 是进度事件回调函数，用于向外部报告工具调用和结果。
+	progress ProgressCallback
+	// failures 管理每个工具的连续失败计数。
+	failures *failureCounter
+	// tools 按标准名称存储已注册的工具实例。
+	tools map[string]Tool
+	// aliases 存储别名到标准名称的映射。
+	aliases map[string]string
+	// readMu 保护 readFiles 切片，防止并发读写。
+	readMu sync.Mutex
+	// readFiles 记录本任务已经读取过的文件路径，用于 ReadFile 预算控制。
+	readFiles []string
+}
+
+// NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
+// workDir 是工作目录；cfg 是代理配置；progress 是进度回调。
+func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress ProgressCallback) *Registry {
+	// 使用指定工作目录创建执行器。
+	exec := NewExecutor(workDir)
+	// 如果传入配置，则设置到执行器中，供后续读取配置项。
+	if cfg != nil {
+		exec.SetAgentConfig(cfg)
+	}
+	// 初始化 Registry 结构体，各 map 也一并初始化。
+	r := &Registry{
+		exec:     exec,
+		progress: progress,
+		failures: newFailureCounter(),
+		tools:    make(map[string]Tool),
+		aliases:  make(map[string]string),
+	}
+	// 注册系统内置的默认工具列表。
+	r.registerDefaults()
+	// 返回构造完成的注册表。
+	return r
+}
+
+// registerDefaults 将项目内置的所有工具注册到当前 Registry。
+func (r *Registry) registerDefaults() {
+	// 依次注册文件、命令、HTTP、Git 等类别的内置工具。
+	r.Register(&readFileTool{exec: r.exec})
+	r.Register(&writeFileTool{exec: r.exec})
+	r.Register(&listDirTool{exec: r.exec})
+	r.Register(&runCommandTool{exec: r.exec})
+	r.Register(&searchInFilesTool{exec: r.exec})
+	r.Register(&httpGetTool{exec: r.exec})
+	r.Register(&httpPostTool{exec: r.exec})
+	r.Register(&gitDiffTool{exec: r.exec})
+	r.Register(&gitStatusTool{exec: r.exec})
+	r.Register(&gitLogTool{exec: r.exec})
+	r.Register(&gitBlameTool{exec: r.exec})
+}
+
+// Register 将工具及其别名注册到注册表中；若传入 nil 则忽略。
+func (r *Registry) Register(t Tool) {
+	// 防御性判断，避免空指针导致 panic。
+	if t == nil {
+		return
+	}
+	// 以工具标准名称为键存入 tools map。
+	r.tools[t.Name()] = t
+	// 遍历工具别名，将别名映射到标准名称。
+	for _, alias := range t.Aliases() {
+		r.aliases[alias] = t.Name()
+	}
+}
+
+// SetProgressCallback 在构造完成后替换进度回调函数。
+// 这允许引导流程先创建注册表，随后由 agent service 注入自身回调。
+func (r *Registry) SetProgressCallback(cb ProgressCallback) {
+	// 直接覆盖注册表中的 progress 字段。
+	r.progress = cb
+}
+
+// Dispatch 根据名称调度并执行工具，返回 JSON 序列化后的 Result。
+// name 可以是标准名称或已注册别名；args 为工具参数映射。
+func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]any) (*Result, error) {
+	// 若 name 是别名，则解析为工具的标准名称。
+	if canonical, ok := r.aliases[name]; ok {
+		name = canonical
+	}
+	// 从注册表中查找工具；未找到则返回错误。
+	t, ok := r.tools[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown tool: %s", name)
+	}
+
+	// 将参数序列化为 JSON 字符串，忽略错误（参数可能为空）。
+	argsStr, _ := marshalNoHTMLEscape(args)
+	// 发送工具调用进度事件，便于外部观测当前调用。
+	r.emitTool(ctx, "tool_call", name, "调用工具 "+name, string(argsStr))
+
+	// ReadFile 预算控制：防止同一任务中重复读取或读取过多文件。
+	if name == "ReadFile" {
+		// 从参数中读取目标文件路径。
+		path, _ := args["path"].(string)
+		// 将路径解析为绝对路径，便于后续统一比较。
+		normalizedPath := r.exec.resolvePath(path)
+		// 检查当前读取是否被预算规则拦截。
+		if blocked := r.checkReadFileBudget(ctx, normalizedPath); blocked != "" {
+			// 被拦截时构造一个带有错误信息的结果。
+			result := &Result{Tool: "ReadFile", Path: normalizedPath, Error: blocked}
+			// 填充 SessionID、ArgsJSON 等通用字段。
+			r.fillResult(ctx, result, args)
+			// 如果上下文携带了 blades tool context，则要求退出当前循环。
+			if tc, ok := tools.FromContext(ctx); ok {
+				tc.SetAction(tools.ActionLoopExit, true)
+			}
+			// 发送结果事件后返回。
+			r.emitResult(ctx, result)
+			return result, nil
+		}
+	}
+
+	// 确保上下文中携带 SessionID，供后续结果填充和日志关联。
+	ctx = WithSessionID(ctx, SessionIDFromContext(ctx))
+	// 调用工具实现获取执行结果。
+	result := t.Execute(ctx, args)
+
+	// ReadFile 成功读取后，记录已读文件并在输出末尾追加已读清单提示。
+	if name == "ReadFile" && result.Success && result.Path != "" {
+		// 将本次成功读取的文件路径加入任务记录。
+		r.recordReadFile(result.Path)
+		// 生成已读文件清单提示文本。
+		if hint := r.readListHint(); hint != "" {
+			// 将提示追加到结果输出中，提醒模型不要重复读取。
+			result.Output = result.Output + "\n" + hint
+		}
+	}
+
+	// 填充结果的通用字段，如 SessionID、ArgsJSON 以及执行器回调。
+	r.fillResult(ctx, result, args)
+
+	// 根据执行成功与否更新失败计数。
+	if result.Success {
+		// 成功则重置该工具的连续失败计数。
+		r.failures.reset(name)
+	} else {
+		// 失败则累加连续失败计数。
+		n := r.failures.fail(name)
+		// 达到阈值时通知 blades 退出循环，避免无效重试。
+		if n >= maxConsecutiveFailures {
+			if tc, ok := tools.FromContext(ctx); ok {
+				tc.SetAction(tools.ActionLoopExit, true)
+			}
+		}
+	}
+
+	// 发送工具执行结果进度事件。
+	r.emitResult(ctx, result)
+	// 返回执行结果和错误（工具内部错误已封装在 result 中，此处 error 通常为 nil）。
+	return result, nil
+}
+
+// fillResult 填充 Result 的 SessionID、ArgsJSON，并触发执行器回调。
+func (r *Registry) fillResult(ctx context.Context, result *Result, args map[string]any) {
+	// 从上下文中提取 SessionID 并写入结果。
+	result.SessionID = SessionIDFromContext(ctx)
+	// 将参数序列化为 JSON，失败则跳过。
+	if argsJSON, err := marshalNoHTMLEscape(args); err == nil {
+		// 将 JSON 字节切片转为字符串。
+		argsStr := string(argsJSON)
+		// 获取配置允许的最大参数字节数。
+		maxBytes := r.exec.agentConfig().ToolExecMaxBytes
+		// 如果参数字符串过长，则截断并追加提示，避免结果过大。
+		if len(argsStr) > maxBytes {
+			argsStr = argsStr[:maxBytes] + "...(truncated)"
+		}
+		// 将处理后的参数 JSON 写入结果。
+		result.ArgsJSON = argsStr
+	}
+	// 如果执行器设置了回调函数，则把结果透传给回调。
+	if r.exec.callback != nil {
+		r.exec.callback(result)
+	}
+}
+
+// emitTool 发送一次工具调用相关的进度事件。
+func (r *Registry) emitTool(ctx context.Context, kind, tool, msg, detail string) {
+	// 如果未设置进度回调，直接返回，不做任何操作。
+	if r.progress == nil {
+		return
+	}
+	// 构造 ProgressEvent 并调用回调通知外部。
+	r.progress(ctx, ProgressEvent{SessionID: SessionIDFromContext(ctx), Kind: kind, Tool: tool, Message: msg, Detail: detail})
+}
+
+// emitResult 发送一次工具执行结果的进度事件。
+func (r *Registry) emitResult(ctx context.Context, result *Result) {
+	// 如果未设置进度回调，直接返回。
+	if r.progress == nil {
+		return
+	}
+	// 将 result 序列化为 JSON，忽略序列化错误。
+	detail, _ := marshalNoHTMLEscape(result)
+	// 构造结果事件并调用回调。
+	r.progress(ctx, ProgressEvent{
+		SessionID: SessionIDFromContext(ctx),
+		Kind:      "tool_result",
+		Tool:      result.Tool,
+		Message:   "工具结果 " + result.Tool,
+		Detail:    string(detail),
+	})
+}
+
+// checkReadFileBudget 检查指定路径是否允许在本次任务中读取。
+// 返回空字符串表示允许；否则返回拦截原因。
+func (r *Registry) checkReadFileBudget(ctx context.Context, path string) string {
+	// 空路径无需拦截，直接放行。
+	if path == "" {
+		return ""
+	}
+	// 规范化路径，用于统一比较。
+	cleanPath := filepath.Clean(path)
+	// 加锁保护 readFiles 的读取。
+	r.readMu.Lock()
+	// 函数退出时释放锁。
+	defer r.readMu.Unlock()
+	// 遍历已读文件列表，若发现重复路径则拦截。
+	for _, p := range r.readFiles {
+		if filepath.Clean(p) == cleanPath {
+			// 返回中文提示，告知模型已读过并应使用 SearchInFiles 定位。
+			return fmt.Sprintf("该文件本任务已读过（%s），禁止重读。复用已返回内容推进任务；如需看其他段落请用 SearchInFiles 精确定位。", cleanPath)
+		}
+	}
+	// 若已读文件数量达到上限，则拦截新的读取。
+	if len(r.readFiles) >= maxReadFilePerTask {
+		return fmt.Sprintf("已达单任务 ReadFile 上限 %d 次（已读: %s）。请基于已读内容推进任务，或用 SearchInFiles 定位新内容。", maxReadFilePerTask, strings.Join(r.readFiles, ", "))
+	}
+	// 允许读取。
+	return ""
+}
+
+// recordReadFile 将成功读取的文件路径记录到任务级列表中。
+func (r *Registry) recordReadFile(path string) {
+	// 加锁保护 readFiles 的并发修改。
+	r.readMu.Lock()
+	// 函数退出时释放锁。
+	defer r.readMu.Unlock()
+	// 规范化路径后存入列表。
+	cleanPath := filepath.Clean(path)
+	// 检查列表中是否已存在该路径，避免重复记录。
+	for _, p := range r.readFiles {
+		if filepath.Clean(p) == cleanPath {
+			return
+		}
+	}
+	// 追加到已读列表。
+	r.readFiles = append(r.readFiles, cleanPath)
+}
+
+// readListHint 生成当前任务已读文件清单的提示文本。
+func (r *Registry) readListHint() string {
+	// 加锁读取 readFiles。
+	r.readMu.Lock()
+	// 函数退出时释放锁。
+	defer r.readMu.Unlock()
+	// 没有已读文件时返回空字符串，避免在输出中追加无意义提示。
+	if len(r.readFiles) == 0 {
+		return ""
+	}
+	// 返回格式化的中文提示，包含数量与路径列表。
+	return fmt.Sprintf("[已读文件清单 (%d/%d): %s — 禁止重读]",
+		len(r.readFiles), maxReadFilePerTask, strings.Join(r.readFiles, ", "))
+}
+
+// Schema 返回所有已注册工具对应的 blades Tool 定义列表，
+// 供外部框架（如 blades）动态发现和调用工具。
+func (r *Registry) Schema() []tools.Tool {
+	// 初始化空列表，用于收集所有工具定义。
+	var toolsList []tools.Tool
+	// 注册 ReadFile 工具：读取文件内容。
+	if t, err := tools.NewFunc("ReadFile", "读取文件内容。", func(ctx context.Context, in readFileInput) (string, error) {
+		// 通过 Dispatch 调用内部 ReadFile 工具，忽略 Dispatch 返回的 error。
+		res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": in.Path})
+		// 将结果序列化为 JSON 字符串。
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		// 创建成功则加入列表。
+		toolsList = append(toolsList, t)
+	}
+	// 注册 WriteFile 工具：写入文件。
+	if t, err := tools.NewFunc("WriteFile", "写入文件。若文件仅作为临时产物使用（例如运行脚本、中间分析、一次性计算），请设置 temporary=true，文件会写入会话级临时目录并在会话结束后自动清理；用户明确要求保留的文件请保持 temporary=false（默认）。", func(ctx context.Context, in writeFileInput) (string, error) {
+		// 转发到内部 WriteFile 工具，包含路径、内容和 temporary 标志。
+		res, _ := r.Dispatch(ctx, "WriteFile", map[string]any{"path": in.Path, "content": in.Content, "temporary": in.Temporary})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 ListDir 工具：列出目录内容。
+	if t, err := tools.NewFunc("ListDir", "列出目录内容。", func(ctx context.Context, in listDirInput) (string, error) {
+		res, _ := r.Dispatch(ctx, "ListDir", map[string]any{"path": in.Path})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 RunCommand 工具：执行 shell 命令。
+	if t, err := tools.NewFunc("RunCommand", "执行 shell 命令。命令执行时环境变量 BMA_SESSION_TEMP_DIR 指向本会话的临时目录，如需创建临时文件请写入该目录，会话结束后会自动清理。", func(ctx context.Context, in runCommandInput) (string, error) {
+		// 构造参数映射，命令为必填。
+		args := map[string]any{"command": in.Command}
+		// 若超时时间大于 0，则加入参数中。
+		if in.Timeout > 0 {
+			args["timeout"] = in.Timeout
+		}
+		res, _ := r.Dispatch(ctx, "RunCommand", args)
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 SearchInFiles 工具：在文件中搜索文本。
+	if t, err := tools.NewFunc("SearchInFiles", "在文件中搜索文本。", func(ctx context.Context, in searchInFilesInput) (string, error) {
+		res, _ := r.Dispatch(ctx, "SearchInFiles", map[string]any{"pattern": in.Pattern, "dir": in.Dir})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 HTTPGet 工具：发起 HTTP GET 请求。
+	if t, err := tools.NewFunc("HTTPGet", "发起 HTTP GET 请求。", func(ctx context.Context, in httpGetInput) (string, error) {
+		args := map[string]any{"url": in.URL, "headers": in.Headers}
+		if in.Timeout > 0 {
+			args["timeout"] = in.Timeout
+		}
+		res, _ := r.Dispatch(ctx, "HTTPGet", args)
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 HTTPPost 工具：发起 HTTP POST 请求。
+	if t, err := tools.NewFunc("HTTPPost", "发起 HTTP POST 请求（默认 JSON body）。", func(ctx context.Context, in httpPostInput) (string, error) {
+		args := map[string]any{"url": in.URL, "headers": in.Headers, "body": in.Body}
+		if in.Timeout > 0 {
+			args["timeout"] = in.Timeout
+		}
+		res, _ := r.Dispatch(ctx, "HTTPPost", args)
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 GitDiff 工具：查看 Git 差异。
+	if t, err := tools.NewFunc("GitDiff", `查看 Git 差异。target 为空时显示未暂存变更；"--staged" 显示暂存区变更；"HEAD~1..HEAD" 等显示历史区间差异。`, func(ctx context.Context, in gitDiffInput) (string, error) {
+		res, _ := r.Dispatch(ctx, "GitDiff", map[string]any{"target": in.Target, "path": in.Path})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 GitStatus 工具：查看 Git 工作区状态。
+	if t, err := tools.NewFunc("GitStatus", "查看 Git 工作区状态（简短格式）。", func(ctx context.Context, in gitStatusInput) (string, error) {
+		res, _ := r.Dispatch(ctx, "GitStatus", map[string]any{})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 GitLog 工具：查看 Git 提交历史。
+	if t, err := tools.NewFunc("GitLog", "查看 Git 提交历史。limit 控制返回条数（默认 20），path 可限定文件/目录。", func(ctx context.Context, in gitLogInput) (string, error) {
+		res, _ := r.Dispatch(ctx, "GitLog", map[string]any{"limit": in.Limit, "path": in.Path})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 GitBlame 工具：查看指定文件每行最后修改者。
+	if t, err := tools.NewFunc("GitBlame", "查看指定文件每行的最后修改者（git blame）。", func(ctx context.Context, in gitBlameInput) (string, error) {
+		res, _ := r.Dispatch(ctx, "GitBlame", map[string]any{"path": in.Path})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 返回收集到的所有 blades 工具定义。
+	return toolsList
+}
+
+// ---- 工具实现 ----
+
+// readFileTool 是 ReadFile 工具的封装，内部委托 Executor 执行。
+type readFileTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 ReadFile。
+func (t *readFileTool) Name() string { return "ReadFile" }
+
+// Aliases 返回 ReadFile 的别名列表。
+func (t *readFileTool) Aliases() []string { return []string{"read_file", "readFile"} }
+
+// Execute 调用 Executor 的 readFile 方法完成读取。
+func (t *readFileTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.readFile(args)
+}
+
+// writeFileTool 是 WriteFile 工具的封装。
+type writeFileTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 WriteFile。
+func (t *writeFileTool) Name() string { return "WriteFile" }
+
+// Aliases 返回 WriteFile 的别名列表。
+func (t *writeFileTool) Aliases() []string { return []string{"write_file", "writeFile"} }
+
+// Execute 调用 Executor 的 writeFile 方法完成写入。
+func (t *writeFileTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.writeFile(ctx, args)
+}
+
+// listDirTool 是 ListDir 工具的封装。
+type listDirTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 ListDir。
+func (t *listDirTool) Name() string { return "ListDir" }
+
+// Aliases 返回 ListDir 的别名列表。
+func (t *listDirTool) Aliases() []string { return []string{"list_dir", "listDir"} }
+
+// Execute 调用 Executor 的 listDir 方法完成目录列出。
+func (t *listDirTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.listDir(args)
+}
+
+// runCommandTool 是 RunCommand 工具的封装。
+type runCommandTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 RunCommand。
+func (t *runCommandTool) Name() string { return "RunCommand" }
+
+// Aliases 返回 RunCommand 的别名列表。
+func (t *runCommandTool) Aliases() []string { return []string{"run_command", "runCommand"} }
+
+// Execute 调用 Executor 的 runCommand 方法执行命令。
+func (t *runCommandTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.runCommand(ctx, args)
+}
+
+// searchInFilesTool 是 SearchInFiles 工具的封装。
+type searchInFilesTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 SearchInFiles。
+func (t *searchInFilesTool) Name() string { return "SearchInFiles" }
+
+// Aliases 返回 SearchInFiles 的别名列表。
+func (t *searchInFilesTool) Aliases() []string { return []string{"search_in_files", "searchInFiles"} }
+
+// Execute 调用 Executor 的 searchInFiles 方法完成搜索。
+func (t *searchInFilesTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.searchInFiles(args)
+}
+
+// httpGetTool 是 HTTPGet 工具的封装。
+type httpGetTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 HTTPGet。
+func (t *httpGetTool) Name() string { return "HTTPGet" }
+
+// Aliases 返回 HTTPGet 的别名列表。
+func (t *httpGetTool) Aliases() []string { return []string{"http_get", "httpGet"} }
+
+// Execute 调用 Executor 的 httpGet 方法发起 GET 请求。
+func (t *httpGetTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.httpGet(ctx, args)
+}
+
+// httpPostTool 是 HTTPPost 工具的封装。
+type httpPostTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 HTTPPost。
+func (t *httpPostTool) Name() string { return "HTTPPost" }
+
+// Aliases 返回 HTTPPost 的别名列表。
+func (t *httpPostTool) Aliases() []string { return []string{"http_post", "httpPost"} }
+
+// Execute 调用 Executor 的 httpPost 方法发起 POST 请求。
+func (t *httpPostTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.httpPost(ctx, args)
+}
+
+// gitDiffTool 是 GitDiff 工具的封装。
+type gitDiffTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 GitDiff。
+func (t *gitDiffTool) Name() string { return "GitDiff" }
+
+// Aliases 返回 GitDiff 的别名列表。
+func (t *gitDiffTool) Aliases() []string { return []string{"git_diff", "gitDiff"} }
+
+// Execute 调用 Executor 的 gitDiff 方法查看差异。
+func (t *gitDiffTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.gitDiff(args)
+}
+
+// gitStatusTool 是 GitStatus 工具的封装。
+type gitStatusTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 GitStatus。
+func (t *gitStatusTool) Name() string { return "GitStatus" }
+
+// Aliases 返回 GitStatus 的别名列表。
+func (t *gitStatusTool) Aliases() []string { return []string{"git_status", "gitStatus"} }
+
+// Execute 调用 Executor 的 gitStatus 方法查看状态。
+func (t *gitStatusTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.gitStatus(args)
+}
+
+// gitLogTool 是 GitLog 工具的封装。
+type gitLogTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 GitLog。
+func (t *gitLogTool) Name() string { return "GitLog" }
+
+// Aliases 返回 GitLog 的别名列表。
+func (t *gitLogTool) Aliases() []string { return []string{"git_log", "gitLog"} }
+
+// Execute 调用 Executor 的 gitLog 方法查看提交历史。
+func (t *gitLogTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.gitLog(args)
+}
+
+// gitBlameTool 是 GitBlame 工具的封装。
+type gitBlameTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 GitBlame。
+func (t *gitBlameTool) Name() string { return "GitBlame" }
+
+// Aliases 返回 GitBlame 的别名列表。
+func (t *gitBlameTool) Aliases() []string { return []string{"git_blame", "gitBlame"} }
+
+// Execute 调用 Executor 的 gitBlame 方法查看行级 blame 信息。
+func (t *gitBlameTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.gitBlame(args)
+}

@@ -1,9 +1,9 @@
 # Package Dependency Rules
 
 This document defines the allowed dependency directions for the backend
-packages after the architecture decoupling tracks. The goal is to keep the
+packages after the ReAct-loop architecture refactor. The goal is to keep the
 codebase layered: shared primitives at the bottom, infrastructure in the
-middle, orchestration above it, and adapters/entry points at the top.
+middle, domain services above it, and adapters/entry points at the top.
 
 ## Layer Overview
 
@@ -17,14 +17,19 @@ middle, orchestration above it, and adapters/entry points at the top.
 │  Agent Facade                               │
 │  internal/agent                              │
 ├─────────────────────────────────────────────┤
-│  Orchestration & Runtime                    │
-│  internal/graph, internal/runtime,          │
-│  internal/dag, internal/skill,              │
-│  internal/soul, internal/watchdog,          │
-│  internal/board, internal/mailbox           │
+│  Domain Services                            │
+│  internal/domain/tool, internal/domain/role,│
+│  internal/domain/memory,                    │
+│  internal/domain/subagent                   │
+├─────────────────────────────────────────────┤
+│  Runtime Components                         │
+│  internal/runtime, internal/dag,            │
+│  internal/skill, internal/soul,             │
+│  internal/watchdog, internal/board,         │
+│  internal/mailbox, internal/cmdqueue        │
 ├─────────────────────────────────────────────┤
 │  Infrastructure                             │
-│  internal/store, internal/memory,           │
+│  internal/store, internal/memory (legacy),  │
 │  internal/model, internal/logger,           │
 │  internal/embed, internal/config            │
 ├─────────────────────────────────────────────┤
@@ -44,36 +49,35 @@ middle, orchestration above it, and adapters/entry points at the top.
 2. **`internal/store`, `internal/memory`, `internal/model`, `internal/logger`,
    `internal/embed`, `internal/config` are infrastructure.**
    - They may depend on `pkg/*` and each other as needed for wiring.
-   - They must not depend on `internal/graph`, `internal/runtime`,
+   - They must not depend on `internal/domain/*`, `internal/runtime`,
      `internal/server`, `internal/tui`, `internal/agent`, or other upper-layer
-     orchestration/adapter packages.
+     packages.
 
-3. **`internal/dag`, `internal/skill`, `internal/soul`, `internal/watchdog`,
-   `internal/board`, `internal/mailbox` are runtime components.**
+3. **`internal/domain/*` are domain services used by the ReAct engine.**
+   - They may depend on `pkg/*`, infrastructure, and lower runtime component
+     packages (e.g. `mailbox`).
+   - They must not depend on `internal/server`, `internal/tui`, `internal/agent`,
+     or entry-point packages.
+
+4. **`internal/dag`, `internal/skill`, `internal/soul`, `internal/watchdog`,
+   `internal/board`, `internal/mailbox`, `internal/cmdqueue` are runtime
+   components.**
    - They may depend on `pkg/*` and infrastructure packages.
-   - They must not depend on `internal/graph`, `internal/server`,
+   - They must not depend on `internal/domain/*`, `internal/server`,
      `internal/tui`, `internal/agent`, or `internal/runtime` (runtime is the
      aggregator, not a dependency of its parts).
 
-4. **`internal/runtime` aggregates runtime components.**
+5. **`internal/runtime` aggregates runtime components.**
    - It may depend on the runtime component packages and infrastructure.
-   - It must not depend on `internal/graph`, `internal/server`, `internal/tui`,
-     or `internal/agent`.
-
-5. **`internal/graph` is the orchestration layer.**
-   - It may depend on `internal/runtime`, `internal/model`, `internal/memory`,
-     `internal/store`, `internal/logger`, `pkg/*`, and lower runtime
-     components.
-   - It must not depend on `internal/server`, `internal/tui`, `internal/agent`,
-     or entry-point packages.
+   - It must not depend on `internal/domain/*`, `internal/server`,
+     `internal/tui`, or `internal/agent`.
 
 6. **`internal/agent` is the facade.**
-   - It encapsulates `internal/graph`, `internal/runtime`, and related
-     orchestration packages.
+   - It encapsulates the ReAct loop, domain services, and runtime.
    - Adapters (`internal/server`, `internal/tui`, `internal/testserver`,
      `test/*`, `backend/main.go`, `backend/cmd/*`) should consume the agent
      through the `agent.Agent` interface rather than directly importing
-     `internal/graph` or `internal/runtime` internals.
+     `internal/domain/*` or `internal/runtime` internals.
 
 7. **Entry points own wiring.**
    - `backend/main.go`, `backend/cmd/*`, and integration tests wire the system
@@ -87,8 +91,8 @@ The following commands confirm the critical dependency directions are clean:
 
 ```bash
 cd backend
-# memory must not depend on graph
-GOTOOLCHAIN=local go list -deps ./internal/memory/... | grep internal/graph
+# domain/memory must not depend on agent
+GOTOOLCHAIN=local go list -deps ./internal/domain/memory/... | grep internal/agent
 
 # store must not depend on dag
 GOTOOLCHAIN=local go list -deps ./internal/store/... | grep internal/dag

@@ -10,17 +10,19 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
+	"github.com/blockmemory/agent/backend/internal/domain/memory"
+	"github.com/blockmemory/agent/backend/internal/domain/role"
+	"github.com/blockmemory/agent/backend/internal/domain/subagent"
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/embed"
-	"github.com/blockmemory/agent/backend/internal/graph"
 	"github.com/blockmemory/agent/backend/internal/logger"
-	"github.com/blockmemory/agent/backend/internal/memory"
+	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
@@ -45,26 +47,24 @@ type ConfigPaths struct {
 }
 
 // App is the result of bootstrap.Build. Exported fields are the surfaces needed
-// by HTTP/TUI/test callers; internal wiring (graph, runtime, registry) is kept
-// unexported to prevent upper layers from depending on bootstrap internals.
+// by HTTP/TUI/test callers; internal wiring is kept unexported to prevent upper
+// layers from depending on bootstrap internals.
+//
+// During the ReAct refactor the old graph-based fields are removed; Runtime is
+// retained for soul/skills/watchdog API compatibility.
 type App struct {
-	Agent                 agent.Agent
-	Server                *server.SessionManager
-	DAGHandler            *server.DAGHandler
-	Runtime               *runtime.Runtime
-	Postgres              *store.PostgresStore
-	Redis                 *store.RedisStore
-	ModelFactory          *model.ModelFactory
-	Embedder              embed.Embedder
-	Config                *config.Config
-	RoleConfig            *pkgconfig.RoleConfigFile
-	Graph                 *graph.ThreeLayerGraph
-	MemoryCallbackHandler *memory.CallbackHandler
-	SnapshotManager       *memory.SnapshotManager
-	ContextAssembler      *memory.ContextAssembler
-	EpisodeCompressor     *memory.Compressor
-	DAGScheduler          *dag.Scheduler
-	Logger                *logger.Logger
+	Agent        agent.Agent
+	Server       *server.SessionManager
+	DAGHandler   *server.DAGHandler
+	Runtime      *runtime.Runtime
+	Postgres     *store.PostgresStore
+	Redis        *store.RedisStore
+	ModelFactory *model.ModelFactory
+	Embedder     embed.Embedder
+	Config       *config.Config
+	RoleConfig   *pkgconfig.RoleConfigFile
+	DAGScheduler *dag.Scheduler
+	Logger       *logger.Logger
 
 	// cleanup holds the resources that must be released when the App shuts down.
 	cleanup []func() error
@@ -82,9 +82,10 @@ func (a *App) Close() error {
 }
 
 // Build wires the backend with the same initialization order as the original
-// main.go/testserver: env -> config -> stores -> models -> graph -> session
-// manager -> agent facade. The returned App owns the constructed resources;
-// callers must invoke App.Close when shutting down.
+// main.go/testserver: env -> config -> stores -> models -> agent -> session
+// manager. The ReAct engine is the canonical execution path. The returned App
+// owns the constructed resources; callers must invoke App.Close when
+// shutting down.
 func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err := validatePaths(paths); err != nil {
 		return nil, err
@@ -129,32 +130,17 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		return nil, fmt.Errorf("connect redis with addr from %s: %w", paths.ConfigPath, err)
 	}
 
-	snapshotMgr := memory.NewSnapshotManager(redisStore, pgStore, &cfg.Agent)
-	writeProcessor := memory.NewWriteProcessor(pgStore)
-	writeProcessor.SetAgentConfig(&cfg.Agent)
-	memoryCallbackHandler := memory.NewCallbackHandler(writeProcessor, snapshotMgr, nil)
-	episodeCompressor := memory.NewCompressor(pgStore, &cfg.Agent)
 	sessionLogger := logger.New(pgStore, paths.LogWriter)
-	contextAssembler := memory.NewContextAssembler(
-		memory.NewSimpleWorkspaceReader(),
-		&globalKBAdapter{pg: pgStore, embedder: embedder},
-		pgStore,
-		cfg.Agent.ContextWindow,
-	)
-	contextAssembler.SetMemoryPolicy(&cfg.Agent.MemoryPolicy)
 
 	modelFactory := model.NewModelFactory(roleCfg)
 	if err := modelFactory.WarmUp(ctx); err != nil {
-		closeStores(pgStore, redisStore, memoryCallbackHandler)
+		closeStores(pgStore, redisStore)
 		return nil, fmt.Errorf("warmup models: %w", err)
 	}
 	if err := modelFactory.VerifyConnectivity(ctx); err != nil {
-		closeStores(pgStore, redisStore, memoryCallbackHandler)
+		closeStores(pgStore, redisStore)
 		return nil, fmt.Errorf("verify LLM connectivity: %w", err)
 	}
-
-	registry := graph.NewRoleRegistry(roleCfg)
-	factory := graph.NewRoleFactory(registry, modelFactory, roleCfg)
 
 	var skillPool *skill.Pool
 	if paths.SkillPath == "" {
@@ -163,48 +149,39 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		var err error
 		skillPool, err = skill.LoadFromYAML(paths.SkillPath)
 		if err != nil {
-			closeStores(pgStore, redisStore, memoryCallbackHandler)
+			closeStores(pgStore, redisStore)
 			return nil, fmt.Errorf("load skills %s: %w", paths.SkillPath, err)
 		}
 	}
 
-	rt, err := runtime.New(paths.SoulPath, skillPool)
+	// The shared mailbox is used by both Runtime (legacy API compatibility) and
+	// the ReAct sub-agent dispatcher.
+	sharedMailbox := mailbox.New()
+
+	rt, err := runtime.New(paths.SoulPath, skillPool, runtime.WithMailbox(sharedMailbox))
 	if err != nil {
-		closeStores(pgStore, redisStore, memoryCallbackHandler)
+		closeStores(pgStore, redisStore)
 		return nil, fmt.Errorf("init runtime: %w", err)
 	}
 	rt.SetAgentConfig(&cfg.Agent)
 
-	metaAgent := graph.NewMetaAgentNode(registry, factory, roleCfg.MetaAgent.MaxBlocks, roleCfg.MetaAgent.SummaryInterval)
-	metaAgent.SetModelFactory(modelFactory)
-	metaAgent.SetRuntime(rt)
-	metaAgent.SetHistoryStore(&pgHistoryAdapter{pg: pgStore})
-	escalation := graph.NewEscalationHandlerNode()
-	sinker := graph.NewSinkerNode()
+	// ReAct engine wiring.
+	workDir, err := os.Getwd()
+	if err != nil {
+		workDir = "."
+	}
+	roleRegistry := role.NewRegistry(roleCfg)
+	toolRegistry := tool.NewBuiltinRegistry(workDir, &cfg.Agent, nil)
+	memoryPipeline := memory.NewPipeline(memory.NewInMemoryStore())
 
-	builder := graph.NewThreeLayerGraphBuilder(registry, factory)
-	builder.SetModelFactory(modelFactory)
-	builder.SetRuntime(rt)
-	builder.SetLogger(sessionLogger)
-	builder.AddNode(metaAgent)
-	builder.AddNode(escalation)
-	builder.AddNode(sinker)
-	threeLayerGraph := builder.Build()
+	subAgentDispatcher := subagent.NewDispatcher(roleRegistry, &reactModelFactory{modelFactory}, toolRegistry, sharedMailbox, memoryPipeline)
+	subAgentDispatcher.RegisterCallTool(toolRegistry)
 
-	agentSvc := agent.NewService(threeLayerGraph, registry, rt,
-		agent.WithPostgresStore(pgStore),
-		agent.WithModelFactory(modelFactory),
-	)
+	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
 
 	sessionMgr := server.NewSessionManager(agentSvc)
 	sessionMgr.SetPostgresStore(pgStore)
 	sessionMgr.SetModelFactory(modelFactory)
-
-	threeLayerGraph.SetBlockMemoryStore(&pgBlockMemoryAdapter{pg: pgStore, embedder: embedder, dim: cfg.PgVector.Dimensions})
-	threeLayerGraph.SetMemoryCallbackHandler(memoryCallbackHandler)
-	threeLayerGraph.SetContextAssembler(contextAssembler)
-	threeLayerGraph.SetEpisodeCompressor(episodeCompressor)
-	threeLayerGraph.SetAgentSnapshotManager(snapshotMgr)
 
 	var dagScheduler *dag.Scheduler
 	if cfg.Agent.DAGEnabled {
@@ -215,23 +192,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
 
 	app := &App{
-		Agent:                 agentSvc,
-		Server:                sessionMgr,
-		DAGHandler:            dagHandler,
-		Runtime:               rt,
-		Postgres:              pgStore,
-		Redis:                 redisStore,
-		ModelFactory:          modelFactory,
-		Embedder:              embedder,
-		Config:                cfg,
-		RoleConfig:            roleCfg,
-		Graph:                 threeLayerGraph,
-		MemoryCallbackHandler: memoryCallbackHandler,
-		SnapshotManager:       snapshotMgr,
-		ContextAssembler:      contextAssembler,
-		EpisodeCompressor:     episodeCompressor,
-		DAGScheduler:          dagScheduler,
-		Logger:                sessionLogger,
+		Agent:        agentSvc,
+		Server:       sessionMgr,
+		DAGHandler:   dagHandler,
+		Runtime:      rt,
+		Postgres:     pgStore,
+		Redis:        redisStore,
+		ModelFactory: modelFactory,
+		Embedder:     embedder,
+		Config:       cfg,
+		RoleConfig:   roleCfg,
+		DAGScheduler: dagScheduler,
+		Logger:       sessionLogger,
 	}
 
 	app.cleanup = []func() error{
@@ -241,7 +213,6 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			}
 			return nil
 		},
-		memoryCallbackHandler.Close,
 		func() error { redisStore.Close(); return nil },
 		func() error { pgStore.Close(); return nil },
 	}
@@ -294,10 +265,17 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 	return nil
 }
 
-func closeStores(pg *store.PostgresStore, redis *store.RedisStore, mch *memory.CallbackHandler) {
-	if err := mch.Close(); err != nil {
-		slog.Debug("close memory callback handler failed", slog.String("error", err.Error()))
-	}
+func closeStores(pg *store.PostgresStore, redis *store.RedisStore) {
 	redis.Close()
 	pg.Close()
+}
+
+// reactModelFactory adapts model.ModelFactory to the narrower agent provider
+// factory expected by the sub-agent dispatcher.
+type reactModelFactory struct {
+	inner *model.ModelFactory
+}
+
+func (f *reactModelFactory) GetBladesProvider(ctx context.Context, roleID string) (agent.ModelProvider, error) {
+	return f.inner.GetBladesProvider(ctx, roleID)
 }

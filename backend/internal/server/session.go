@@ -179,11 +179,17 @@ func (m *SessionManager) ClearSessionChat(id string) bool {
 }
 
 // ToServerSession converts an agent.Session DTO to the server.Session wire type.
+//
+// Legacy bridge: the ThreeLayerState shape is retained only for frontend/API
+// compatibility. It will be removed once the frontend stops depending on
+// current_domain / active_blocks.
 func ToServerSession(a *agent.Session) *Session {
 	if a == nil {
 		return nil
 	}
 
+	// Legacy bridge: map the new ReAct Session DTO back to the old ThreeLayerState
+	// wire shape so existing HTTP clients keep working.
 	state := &types.ThreeLayerState{
 		CurrentDomain: a.State,
 	}

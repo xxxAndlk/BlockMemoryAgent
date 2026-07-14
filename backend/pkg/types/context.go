@@ -13,16 +13,16 @@ type Message struct {
 // ContextPack 上下文包。
 // BuildRequest 的响应：组装好的消息列表 + Token 预算信息。
 type ContextPack struct {
-	Messages    []*Message    // 组装好的对话消息（System/User/Assistant）
-	TokenBudget *TokenBudget  // Token 预算（分四段：System/TopicGlobal/SharedState/PrivateMemory）
+	Messages    []*Message   // 组装好的对话消息（System/User/Assistant）
+	TokenBudget *TokenBudget // Token 预算（分四段：System/TopicGlobal/SharedState/PrivateMemory）
 }
 
 // BuildRequest 上下文构建请求。
 // 由节点向 memory 模块发起，请求组装一段上下文（消息列表 + Token 预算）。
 type BuildRequest struct {
-	AgentID   string          // 请求方实例 ID
-	TopicID   string          // 主题 ID（记忆检索锚点）
-	DependsOn []string        // 依赖的其他 Agent 输出 ID
-	TaskQuery string          // 任务查询串（用于语义检索）
-	Snapshot  *AgentSnapshot  // 快照（可选，用于恢复上下文）
+	AgentID   string         // 请求方实例 ID
+	TopicID   string         // 主题 ID（记忆检索锚点）
+	DependsOn []string       // 依赖的其他 Agent 输出 ID
+	TaskQuery string         // 任务查询串（用于语义检索）
+	Snapshot  *AgentSnapshot // 快照（可选，用于恢复上下文）
 }

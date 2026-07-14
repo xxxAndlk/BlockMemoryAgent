@@ -439,7 +439,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		// 点击轨道但不在滑块上：跳转（以滑块中心对齐鼠标位置）。
 		thumbH := thumbEnd - thumbStart + 1
-		m.chatPanel.scrollToThumbY(relY - thumbH/2, m.mainContentHeight())
+		m.chatPanel.scrollToThumbY(relY-thumbH/2, m.mainContentHeight())
 		return m, nil
 	}
 

@@ -95,18 +95,18 @@ type LayerStats struct {
 // LLMCallTracker LLM调用全量追踪器（超时统计 + Token 消耗 + Prompt 记录 + 模型分层统计）。
 // 设计意图：统一负责 LLM 调用的自适应超时、Token 统计、Prompt/Response 记录与持久化回调。
 type LLMCallTracker struct {
-	mu             sync.RWMutex                      // 读写锁保护所有字段
-	callCount      int                               // 累计调用次数
-	timeoutCount   int                               // 连续超时次数（成功时清零）
-	consecutiveCancel int                            // 连续取消次数（成功时清零）
-	consecutiveError  int                            // 连续其它错误次数（成功时清零）
-	totalDur       time.Duration                     // 累计耗时，用于计算平均
-	maxDur         time.Duration                     // 历史最大耗时
-	lastDur        time.Duration                     // 最近一次耗时
-	slowMode       bool                              // 连续超时后进入慢速模式，跳过 LLM
-	records        []CallRecord                      // 每次调用的详细记录
-	recordCallback func(context.Context, CallRecord) // 可选：每次记录后的回调（用于写入 session_logs）
-	layerStats     map[string]*LayerStats            // 按模型层聚合的统计（P3-7）
+	mu                sync.RWMutex                      // 读写锁保护所有字段
+	callCount         int                               // 累计调用次数
+	timeoutCount      int                               // 连续超时次数（成功时清零）
+	consecutiveCancel int                               // 连续取消次数（成功时清零）
+	consecutiveError  int                               // 连续其它错误次数（成功时清零）
+	totalDur          time.Duration                     // 累计耗时，用于计算平均
+	maxDur            time.Duration                     // 历史最大耗时
+	lastDur           time.Duration                     // 最近一次耗时
+	slowMode          bool                              // 连续超时后进入慢速模式，跳过 LLM
+	records           []CallRecord                      // 每次调用的详细记录
+	recordCallback    func(context.Context, CallRecord) // 可选：每次记录后的回调（用于写入 session_logs）
+	layerStats        map[string]*LayerStats            // 按模型层聚合的统计（P3-7）
 }
 
 // NewLLMCallTracker 创建调用追踪器。

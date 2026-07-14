@@ -29,8 +29,8 @@ func (d *fakeDriver) Open(name string) (driver.Conn, error) {
 type fakeConn struct{}
 
 func (c *fakeConn) Prepare(query string) (driver.Stmt, error) { return &fakeStmt{}, nil }
-func (c *fakeConn) Close() error                             { return nil }
-func (c *fakeConn) Begin() (driver.Tx, error)                { return &fakeTx{}, nil }
+func (c *fakeConn) Close() error                              { return nil }
+func (c *fakeConn) Begin() (driver.Tx, error)                 { return &fakeTx{}, nil }
 
 func (c *fakeConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	return driver.ResultNoRows, nil
@@ -42,10 +42,10 @@ func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver
 
 type fakeStmt struct{}
 
-func (s *fakeStmt) Close() error                                     { return nil }
-func (s *fakeStmt) NumInput() int                                    { return -1 }
-func (s *fakeStmt) Exec(args []driver.Value) (driver.Result, error)  { return driver.ResultNoRows, nil }
-func (s *fakeStmt) Query(args []driver.Value) (driver.Rows, error)   { return &fakeRows{}, nil }
+func (s *fakeStmt) Close() error                                    { return nil }
+func (s *fakeStmt) NumInput() int                                   { return -1 }
+func (s *fakeStmt) Exec(args []driver.Value) (driver.Result, error) { return driver.ResultNoRows, nil }
+func (s *fakeStmt) Query(args []driver.Value) (driver.Rows, error)  { return &fakeRows{}, nil }
 
 type fakeRows struct{}
 

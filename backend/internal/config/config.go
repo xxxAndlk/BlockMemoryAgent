@@ -47,14 +47,14 @@ type LoggingConfig struct {
 // MemoryPolicyConfig 记忆管线策略配置。
 // 控制上下文装配时的分段比例、私有记忆裁剪参数等，替代 memory 包中的硬编码魔法数。
 type MemoryPolicyConfig struct {
-	ContextWindow        int `yaml:"context_window"`        // 模型上下文窗口总 token 数
-	SystemSegmentRatio   int `yaml:"system_segment_ratio"`  // System 段占比（百分之 N）
-	TopicGlobalRatio     int `yaml:"topic_global_ratio"`    // TopicGlobal 段占比（百分之 N）
-	SharedStateRatio     int `yaml:"shared_state_ratio"`    // SharedState 段占比（百分之 N）
-	GlobalKBRatio        int `yaml:"global_kb_ratio"`       // GlobalKB 段占比（百分之 N）
-	PrivateMemoryRatio   int `yaml:"private_memory_ratio"`  // PrivateMemory 段占比（百分之 N）
-	TaskRatio            int `yaml:"task_ratio"`            // TaskQuery 段占比（百分之 N）
-	ReserveRatio         int `yaml:"reserve_ratio"`         // Reserve 预留段占比（百分之 N）
+	ContextWindow        int `yaml:"context_window"`          // 模型上下文窗口总 token 数
+	SystemSegmentRatio   int `yaml:"system_segment_ratio"`    // System 段占比（百分之 N）
+	TopicGlobalRatio     int `yaml:"topic_global_ratio"`      // TopicGlobal 段占比（百分之 N）
+	SharedStateRatio     int `yaml:"shared_state_ratio"`      // SharedState 段占比（百分之 N）
+	GlobalKBRatio        int `yaml:"global_kb_ratio"`         // GlobalKB 段占比（百分之 N）
+	PrivateMemoryRatio   int `yaml:"private_memory_ratio"`    // PrivateMemory 段占比（百分之 N）
+	TaskRatio            int `yaml:"task_ratio"`              // TaskQuery 段占比（百分之 N）
+	ReserveRatio         int `yaml:"reserve_ratio"`           // Reserve 预留段占比（百分之 N）
 	DefaultTokensPerItem int `yaml:"default_tokens_per_item"` // 私有记忆单条默认 token 数，用于按预算裁剪
 }
 
@@ -84,13 +84,13 @@ type SafetyConfig struct {
 
 // FeatureTogglesConfig Agent 特性开关配置。
 type FeatureTogglesConfig struct {
-	InterruptEnabled     bool `yaml:"interrupt_enabled"`         // 是否启用抢占中断
-	QueueInjectEnabled   bool `yaml:"queue_inject_enabled"`      // 是否启用队列注入
-	HumanClarifyEnabled  bool `yaml:"human_clarify_enabled"`     // 是否启用人机对话
-	HumanClarifyTimeoutSec int  `yaml:"human_clarify_timeout_sec"` // 等待用户回答超时（秒）
-	DAGEnabled           bool `yaml:"dag_enabled"`               // 是否启动 DAG 调度器
-	PlanEnabled          bool `yaml:"plan_enabled"`              // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
-	ReflectionEnabled    bool `yaml:"reflection_enabled"`        // 是否在助手执行后做 Self-Reflection（不达标重试一次）
+	InterruptEnabled         bool `yaml:"interrupt_enabled"`           // 是否启用抢占中断
+	QueueInjectEnabled       bool `yaml:"queue_inject_enabled"`        // 是否启用队列注入
+	HumanClarifyEnabled      bool `yaml:"human_clarify_enabled"`       // 是否启用人机对话
+	HumanClarifyTimeoutSec   int  `yaml:"human_clarify_timeout_sec"`   // 等待用户回答超时（秒）
+	DAGEnabled               bool `yaml:"dag_enabled"`                 // 是否启动 DAG 调度器
+	PlanEnabled              bool `yaml:"plan_enabled"`                // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
+	ReflectionEnabled        bool `yaml:"reflection_enabled"`          // 是否在助手执行后做 Self-Reflection（不达标重试一次）
 	AssistantSelfTestEnabled bool `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证
 	DomainSelfTestEnabled    bool `yaml:"domain_self_test_enabled"`    // 领域 Agent 完成后是否派遣测试助手验证完整模块
 }
@@ -109,33 +109,33 @@ type AgentConfig struct {
 	MemoryPolicy MemoryPolicyConfig `yaml:"memory_policy"`
 
 	// 其余不适合归入上述子配置的独立字段。
-	SkillSetSize      int `yaml:"skill_set_size"`       // 每个 DomainAgent 装配的 Skill 子集上限
-	ContextWindow     int `yaml:"context_window"`       // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
-	SnapshotSummaryCount       int     `yaml:"snapshot_summary_count"`        // 快照保留的最近摘要条数（默认 20）
-	SnapshotOpenIssueThreshold float64 `yaml:"snapshot_open_issue_threshold"` // 未决问题重要性阈值（默认 0.7）
-	SummaryMaxRunes             int     `yaml:"summary_max_runes"`             // 摘要最大 rune 数（默认 400）
-	FactMaxSentences            int     `yaml:"fact_max_sentences"`            // 事实提取最大句数（默认 5）
-	CompressImportanceThreshold float64 `yaml:"compress_importance_threshold"` // 压缩保留 Raw 的重要性阈值（默认 0.7）
-	CompressAgeHours            int     `yaml:"compress_age_hours"`            // 压缩保留 Raw 的最大年龄（小时，默认 24）
-	ReadFileMaxChars            int `yaml:"read_file_max_chars"`            // ReadFile / SearchInFiles 输出截断字符数
-	RunCommandMaxOutput         int `yaml:"run_command_max_output"`         // RunCommand 输出截断字符数
-	RunCommandTimeoutSec        int `yaml:"run_command_timeout_sec"`        // RunCommand 最大允许超时（秒）
-	ToolExecMaxBytes            int `yaml:"tool_exec_max_bytes"`            // Execute 入参 JSON 摘要截断字节数
-	LLMPromptMaxChars           int `yaml:"llm_prompt_max_chars"`           // prompt / response 日志摘要截断字符数
-	LLMTrackerSlowModeThreshold int `yaml:"llm_tracker_slow_mode_threshold"` // 连续多少次 LLM 失败进入 slow mode
-	LoggerRetryCount            int `yaml:"logger_retry_count"`             // 日志异步写表重试次数
-	ContextExplodeSoftLimit     int `yaml:"context_explode_soft_limit"`     // blades 上下文爆炸软阈值（input tokens）
-	ContextExplodeHardLimit     int `yaml:"context_explode_hard_limit"`     // blades 上下文爆炸硬阈值（input tokens）
-	SummaryTruncateChars        int `yaml:"summary_truncate_chars"`         // CommonCollectTaskSummaries 单条结果截断字符数
-	SearchBlockMemoryMaxTokens  int `yaml:"search_block_memory_max_tokens"` // 块记忆检索摘要 token 上限
-	SummaryBaseLimit            int `yaml:"summary_base_limit"`             // MetaAgent 最终总结基础字数
-	SummaryExtendedLimit        int `yaml:"summary_extended_limit"`         // MetaAgent 最终总结每子 Agent 增加字数
-	LoopDetectorWindowSize      int `yaml:"loop_detector_window_size"`      // 循环检测器窗口大小
-	LoopDetectorMaxRepeat       int `yaml:"loop_detector_max_repeat"`       // 循环检测器重复阈值
-	LoopDetectorMaxEmpty        int `yaml:"loop_detector_max_empty"`        // 循环检测器连续空转阈值
-	DomainMemoryRecallMaxChars  int `yaml:"domain_memory_recall_max_chars"` // DomainAgent 记忆召回事件截断字符数
-	DomainMemoryContextMaxChars int `yaml:"domain_memory_context_max_chars"` // DomainAgent 记忆上下文注入截断字符数
-	DomainResultLogMaxChars     int `yaml:"domain_result_log_max_chars"`    // DomainAgent 结果日志截断字符数
+	SkillSetSize                int     `yaml:"skill_set_size"`                  // 每个 DomainAgent 装配的 Skill 子集上限
+	ContextWindow               int     `yaml:"context_window"`                  // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
+	SnapshotSummaryCount        int     `yaml:"snapshot_summary_count"`          // 快照保留的最近摘要条数（默认 20）
+	SnapshotOpenIssueThreshold  float64 `yaml:"snapshot_open_issue_threshold"`   // 未决问题重要性阈值（默认 0.7）
+	SummaryMaxRunes             int     `yaml:"summary_max_runes"`               // 摘要最大 rune 数（默认 400）
+	FactMaxSentences            int     `yaml:"fact_max_sentences"`              // 事实提取最大句数（默认 5）
+	CompressImportanceThreshold float64 `yaml:"compress_importance_threshold"`   // 压缩保留 Raw 的重要性阈值（默认 0.7）
+	CompressAgeHours            int     `yaml:"compress_age_hours"`              // 压缩保留 Raw 的最大年龄（小时，默认 24）
+	ReadFileMaxChars            int     `yaml:"read_file_max_chars"`             // ReadFile / SearchInFiles 输出截断字符数
+	RunCommandMaxOutput         int     `yaml:"run_command_max_output"`          // RunCommand 输出截断字符数
+	RunCommandTimeoutSec        int     `yaml:"run_command_timeout_sec"`         // RunCommand 最大允许超时（秒）
+	ToolExecMaxBytes            int     `yaml:"tool_exec_max_bytes"`             // Execute 入参 JSON 摘要截断字节数
+	LLMPromptMaxChars           int     `yaml:"llm_prompt_max_chars"`            // prompt / response 日志摘要截断字符数
+	LLMTrackerSlowModeThreshold int     `yaml:"llm_tracker_slow_mode_threshold"` // 连续多少次 LLM 失败进入 slow mode
+	LoggerRetryCount            int     `yaml:"logger_retry_count"`              // 日志异步写表重试次数
+	ContextExplodeSoftLimit     int     `yaml:"context_explode_soft_limit"`      // blades 上下文爆炸软阈值（input tokens）
+	ContextExplodeHardLimit     int     `yaml:"context_explode_hard_limit"`      // blades 上下文爆炸硬阈值（input tokens）
+	SummaryTruncateChars        int     `yaml:"summary_truncate_chars"`          // CommonCollectTaskSummaries 单条结果截断字符数
+	SearchBlockMemoryMaxTokens  int     `yaml:"search_block_memory_max_tokens"`  // 块记忆检索摘要 token 上限
+	SummaryBaseLimit            int     `yaml:"summary_base_limit"`              // MetaAgent 最终总结基础字数
+	SummaryExtendedLimit        int     `yaml:"summary_extended_limit"`          // MetaAgent 最终总结每子 Agent 增加字数
+	LoopDetectorWindowSize      int     `yaml:"loop_detector_window_size"`       // 循环检测器窗口大小
+	LoopDetectorMaxRepeat       int     `yaml:"loop_detector_max_repeat"`        // 循环检测器重复阈值
+	LoopDetectorMaxEmpty        int     `yaml:"loop_detector_max_empty"`         // 循环检测器连续空转阈值
+	DomainMemoryRecallMaxChars  int     `yaml:"domain_memory_recall_max_chars"`  // DomainAgent 记忆召回事件截断字符数
+	DomainMemoryContextMaxChars int     `yaml:"domain_memory_context_max_chars"` // DomainAgent 记忆上下文注入截断字符数
+	DomainResultLogMaxChars     int     `yaml:"domain_result_log_max_chars"`     // DomainAgent 结果日志截断字符数
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。

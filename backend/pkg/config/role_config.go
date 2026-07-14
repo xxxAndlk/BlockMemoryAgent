@@ -37,7 +37,7 @@ type RoleConfigFile struct {
 // 字段:
 //   - ModelConfig:     模型提供商/密钥/温度等。
 //   - SystemPrompt:    系统提示词。
-//   - MaxBlocks:       单会话最大 SessionBlock 数量，超过将触发压缩或结束。
+//   - MaxBlocks:       单会话最大活跃块数量（旧 API 兼容字段）。
 //   - SummaryInterval: 每 N 步触发一次会话总结，控制上下文膨胀。
 type MetaAgentConfig struct {
 	ModelConfig     types.AgentModelConfig `yaml:"model_config"`     // 模型配置(提供商/密钥/温度等)

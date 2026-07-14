@@ -1,6 +1,6 @@
 // Package runtime 把 v3 §4-7 中各运行时组件（任务看板 / 邮箱 /
-// Watchdog / 人格 / Skill 注册表）聚合成单一对象，供 graph 层
-// 与 server 层共享访问，避免在 MetaAgent / DomainAgent 上挂太多字段。
+// Watchdog / 人格 / Skill 注册表）聚合成单一对象，供 ReAct 引擎
+// 与 server 层共享访问，避免在多个 Agent 结构上挂太多字段。
 package runtime
 
 import (
@@ -21,8 +21,8 @@ import (
 // 若让 MetaAgent / DomainAgent / SubDomainAgent 各自持有这些指针，
 // 会出现“每个 Agent 结构体都挂一串字段、构造函数都传一遍”的散乱局面，
 // 且动态构造的 DomainAgent 节点容易漏注。Runtime 把它们收口到单一
-// 对象，在 main.go 一次性装配、经 ThreeLayerGraphBuilder.SetRuntime
-// 注入图，再向下游节点透明传播，避免散挂指针与漏注风险。
+// 对象，在 main.go 一次性装配、注入 ReAct Service 与 server 层，
+// 再向下游组件透明传播，避免散挂指针与漏注风险。
 type Runtime struct {
 	Boards   *board.Manager      // 多看板管理器：每会话一个 TaskBoard，记录目标/子任务/约束/进度
 	Mailbox  *mailbox.Mailbox    // Agent 间异步邮箱：事件投递与拉取，避免上下文交叉污染

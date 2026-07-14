@@ -62,10 +62,10 @@ func GenerateWithTemperature(ctx context.Context, c LLMClient, prompt string, te
 // ModelFactory 模型工厂，按角色缓存模型实例。
 // 设计意图：避免重复构造 provider（连接池/鉴权开销），按角色复用。
 type ModelFactory struct {
-	mu              sync.RWMutex           // 读写锁保护 models 并发访问
-	models          map[string]LLMClient   // key: roleDefID or "meta" or "domain"
-	cfg             *config.RoleConfigFile // 角色配置，用于解析每个角色的 ModelConfig
-	dynamicConfigs  map[string]types.AgentModelConfig // 运行时动态角色的模型配置（P3-4）
+	mu             sync.RWMutex                      // 读写锁保护 models 并发访问
+	models         map[string]LLMClient              // key: roleDefID or "meta" or "domain"
+	cfg            *config.RoleConfigFile            // 角色配置，用于解析每个角色的 ModelConfig
+	dynamicConfigs map[string]types.AgentModelConfig // 运行时动态角色的模型配置（P3-4）
 }
 
 // NewModelFactory 创建模型工厂。
@@ -80,7 +80,7 @@ type ModelFactory struct {
 // 并发安全：返回实例可被多协程共享调用。
 func NewModelFactory(cfg *config.RoleConfigFile) *ModelFactory {
 	return &ModelFactory{
-		models:         make(map[string]LLMClient),           // 初始化空缓存
+		models:         make(map[string]LLMClient), // 初始化空缓存
 		cfg:            cfg,
 		dynamicConfigs: make(map[string]types.AgentModelConfig), // 动态角色模型配置
 	}

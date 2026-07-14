@@ -17,8 +17,8 @@ import (
 	"time"          // HTTP 超时
 
 	"github.com/blockmemory/agent/backend/internal/bootstrap" // 统一后端 wiring
-	"github.com/blockmemory/agent/backend/internal/config"      // 基础设施配置加载
-	"github.com/blockmemory/agent/backend/internal/logging"     // 日志文件按天分割
+	"github.com/blockmemory/agent/backend/internal/config"    // 基础设施配置加载
+	"github.com/blockmemory/agent/backend/internal/logging"   // 日志文件按天分割
 )
 
 // main 是服务入口。职责: 解析 flag → 初始化日志 → 装配依赖 → 启动 HTTP → 等待信号优雅关闭。

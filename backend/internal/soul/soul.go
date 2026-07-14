@@ -193,8 +193,8 @@ const (
 
 // 包级默认策略实例，保证旧有包级函数行为不变。
 var (
-	defaultClassifier      TaskKindClassifier = KeywordClassifier{}
-	defaultTemperaturePolicy TemperaturePolicy = NewDefaultTemperaturePolicy()
+	defaultClassifier        TaskKindClassifier = KeywordClassifier{}
+	defaultTemperaturePolicy TemperaturePolicy  = NewDefaultTemperaturePolicy()
 )
 
 // Temperature 返回任务类别对应的推荐温度。

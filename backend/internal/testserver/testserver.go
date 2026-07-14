@@ -15,8 +15,6 @@ import (
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
 	"github.com/blockmemory/agent/backend/internal/embed"
-	"github.com/blockmemory/agent/backend/internal/graph"
-	"github.com/blockmemory/agent/backend/internal/memory"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
@@ -33,28 +31,22 @@ var EmbedderFactory = func(cfg *config.Config, roleCfg *pkgconfig.RoleConfigFile
 // use it to access stores, the session manager, runtime, and the model factory
 // directly when HTTP alone is not enough.
 type Deps struct {
-	Config                *config.Config
-	RoleConfig            *pkgconfig.RoleConfigFile
-	Postgres              *store.PostgresStore
-	Redis                 *store.RedisStore
-	ModelFactory          *model.ModelFactory
-	Embedder              embed.Embedder
-	Runtime               *runtime.Runtime
-	SessionManager        *server.SessionManager
-	Agent                 agent.Agent
-	Graph                 *graph.ThreeLayerGraph
-	MemoryCallbackHandler *memory.CallbackHandler
-	SnapshotManager       *memory.SnapshotManager
-	ContextAssembler      *memory.ContextAssembler
-	EpisodeCompressor     *memory.Compressor
-	DAGScheduler          *dag.Scheduler
-	DAGHandler            *server.DAGHandler
+	Config         *config.Config
+	RoleConfig     *pkgconfig.RoleConfigFile
+	Postgres       *store.PostgresStore
+	Redis          *store.RedisStore
+	ModelFactory   *model.ModelFactory
+	Embedder       embed.Embedder
+	Runtime        *runtime.Runtime
+	SessionManager *server.SessionManager
+	Agent          agent.Agent
+	DAGScheduler   *dag.Scheduler
+	DAGHandler     *server.DAGHandler
 }
 
 // BuildHandler wires the backend by delegating to bootstrap.Build and returns the
 // root mux plus the live dependencies. Callers own ctx cancellation. The
-// returned cleanup function closes stores and the memory callback handler; it
-// should be deferred by callers.
+// returned cleanup function closes stores; it should be deferred by callers.
 func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, skillPath string) (*http.ServeMux, *Deps, func(), error) {
 	// 严格启动：任意配置文件不存在即失败，明确告知缺失项。
 	for path, name := range map[string]string{
@@ -84,22 +76,17 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 	}
 
 	deps := &Deps{
-		Config:                app.Config,
-		RoleConfig:            app.RoleConfig,
-		Postgres:              app.Postgres,
-		Redis:                 app.Redis,
-		ModelFactory:          app.ModelFactory,
-		Embedder:              app.Embedder,
-		Runtime:               app.Runtime,
-		SessionManager:        app.Server,
-		Agent:                 app.Agent,
-		Graph:                 app.Graph,
-		MemoryCallbackHandler: app.MemoryCallbackHandler,
-		SnapshotManager:       app.SnapshotManager,
-		ContextAssembler:      app.ContextAssembler,
-		EpisodeCompressor:     app.EpisodeCompressor,
-		DAGScheduler:          app.DAGScheduler,
-		DAGHandler:            app.DAGHandler,
+		Config:         app.Config,
+		RoleConfig:     app.RoleConfig,
+		Postgres:       app.Postgres,
+		Redis:          app.Redis,
+		ModelFactory:   app.ModelFactory,
+		Embedder:       app.Embedder,
+		Runtime:        app.Runtime,
+		SessionManager: app.Server,
+		Agent:          app.Agent,
+		DAGScheduler:   app.DAGScheduler,
+		DAGHandler:     app.DAGHandler,
 	}
 
 	cleanup := func() {

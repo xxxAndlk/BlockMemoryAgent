@@ -42,14 +42,13 @@ type APIHandler struct {
 	paused   map[string]bool // topic_id -> 是否暂停
 	pausedMu sync.RWMutex    // 保护 paused 的并发读写
 
-	rt            *runtime.Runtime          // 聚合运行时
-	sessionMgr    *SessionManager           // 会话管理器
-	pgStore       *store.PostgresStore      // Postgres 存储
-	redisStore    *store.RedisStore         // Redis 存储
-	roleCfg       *pkgconfig.RoleConfigFile // 角色配置
-	modelFactory  *model.ModelFactory       // 模型工厂
-	memoryService *MemoryService            // 记忆查询/评分服务
-	statsService  *StatsService             // 会话统计聚合服务
+	rt           *runtime.Runtime          // 聚合运行时
+	sessionMgr   *SessionManager           // 会话管理器
+	pgStore      *store.PostgresStore      // Postgres 存储
+	redisStore   *store.RedisStore         // Redis 存储
+	roleCfg      *pkgconfig.RoleConfigFile // 角色配置
+	modelFactory *model.ModelFactory       // 模型工厂
+	statsService *StatsService             // 会话统计聚合服务
 }
 
 // NewAPIHandler 创建 API 处理器
@@ -95,14 +94,6 @@ func (h *APIHandler) SetStatsService(s *StatsService) {
 func (h *APIHandler) SetStores(pg *store.PostgresStore, redis *store.RedisStore) {
 	h.pgStore = pg
 	h.redisStore = redis
-	if h.memoryService == nil {
-		h.memoryService = NewMemoryService(pg)
-	}
-}
-
-// SetMemoryService 显式注入记忆服务（测试用）。
-func (h *APIHandler) SetMemoryService(s *MemoryService) {
-	h.memoryService = s
 }
 
 // SetRoleConfig 注入角色配置
@@ -176,9 +167,18 @@ func (h *APIHandler) EventResolveHandler(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(map[string]string{"status": "resolved"})
 }
 
-// SnapshotInspectHandler 查看快照详情（与 SnapshotHandler 共享实现）。
+// SnapshotInspectHandler 查看快照详情（已移除，保留端点兼容）。
 func (h *APIHandler) SnapshotInspectHandler(w http.ResponseWriter, r *http.Request) {
-	h.handleSnapshot(w, r)
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"agent_id": "",
+		"snapshot": nil,
+		"note":     "snapshot manager removed in ReAct refactor",
+	})
 }
 
 // GraphPauseHandler 暂停 Graph
@@ -426,138 +426,61 @@ func (h *APIHandler) ActivityHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"activities": activities})
 }
 
-// SnapshotHandler POST /api/snapshot — 查看 Agent 快照（与 SnapshotInspectHandler 共享实现）。
+// SnapshotHandler POST /api/snapshot — 查看 Agent 快照（已移除，保留端点兼容）。
 func (h *APIHandler) SnapshotHandler(w http.ResponseWriter, r *http.Request) {
-	h.handleSnapshot(w, r)
-}
-
-// handleSnapshot 是 SnapshotHandler / SnapshotInspectHandler 的共享实现。
-func (h *APIHandler) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	req, err := DecodeBody[struct {
-		AgentID string `json:"agent_id"`
-		TopicID string `json:"topic_id"`
-	}](r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	var snap *types.AgentSnapshot
-	if h.snapshotMgr != nil {
-		snap, err = h.snapshotMgr.Load(r.Context(), req.AgentID, req.TopicID)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"agent_id": req.AgentID,
-		"snapshot": snap,
+		"agent_id": "",
+		"snapshot": nil,
+		"note":     "snapshot manager removed in ReAct refactor",
 	})
 }
 
-// MemorySearchHandler POST /api/memory/search — 检索 Agent 记忆
-// 职责：委托 MemoryService 按 domain 做块记忆向量检索或回退到 Episode 关键词评分。
-// 参数：?limit=N - 默认 10。
+// MemorySearchHandler POST /api/memory/search — 已移除（ReAct 重构）。
 func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	req, err := DecodeBody[struct {
-		AgentID string `json:"agent_id"`
-		TopicID string `json:"topic_id"`
-		Domain  string `json:"domain"`
-		Query   string `json:"query"`
-		Limit   int    `json:"limit"`
-	}](r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if req.Limit <= 0 {
-		req.Limit = 10 // 默认 10 条
-	}
-
-	if h.memoryService == nil {
-		http.Error(w, "memory service not available", http.StatusServiceUnavailable)
-		return
-	}
-
-	results, err := h.memoryService.Search(r.Context(), req.AgentID, req.TopicID, req.Domain, req.Query, req.Limit)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"agent_id": req.AgentID,
-		"query":    req.Query,
-		"domain":   req.Domain,
-		"results":  results,
+		"results": []any{},
+		"note":    "memory search removed in ReAct refactor",
 	})
 }
 
-// MemoryLevelsHandler GET /api/memory/levels — 返回压缩层级分布
-// 职责：委托 MemoryService 统计两级压缩层级（Raw=0 / Standard=1）的 Episode 数。
-// 参数：?agent_id=...&topic_id=...
+// MemoryLevelsHandler GET /api/memory/levels — 已移除（ReAct 重构）。
 func (h *APIHandler) MemoryLevelsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	agentID := r.URL.Query().Get("agent_id")
-	topicID := r.URL.Query().Get("topic_id")
-
-	if h.memoryService == nil {
-		http.Error(w, "memory service not available", http.StatusServiceUnavailable)
-		return
-	}
-
-	levels, total, err := h.memoryService.Levels(r.Context(), agentID, topicID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"agent_id": agentID,
-		"topic_id": topicID,
-		"total":    total,
-		"levels":   levels,
+		"total":  0,
+		"levels": map[string]int{"raw": 0, "standard": 0},
+		"note":   "memory levels removed in ReAct refactor",
 	})
 }
 
-// MemoryEvalHandler GET /api/memory/eval — 记忆层简化评测入口（P3-1）
-// 职责：委托 MemoryService 汇总所有 (agent_id, topic_id) 下的 Raw/Standard 分布。
-// 调用方应先跑 test/coding/ 与 test/api/ 集成测试，再请求本端点获取分布数据。
+// MemoryEvalHandler GET /api/memory/eval — 已移除（ReAct 重构）。
 func (h *APIHandler) MemoryEvalHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if h.memoryService == nil {
-		http.Error(w, "memory service not available", http.StatusServiceUnavailable)
-		return
-	}
-
-	resp, err := h.memoryService.Eval(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(map[string]any{
+		"total_episodes": 0,
+		"raw":            0,
+		"standard":       0,
+		"pairs":          []any{},
+		"note":           "memory eval removed in ReAct refactor",
+	})
 }
 
 // SkillsHandler GET /api/skills — 返回 Skill 池全部技能

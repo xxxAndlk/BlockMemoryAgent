@@ -1,0 +1,247 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/blockmemory/agent/backend/internal/mailbox"
+	"github.com/blockmemory/agent/backend/pkg/types"
+	"github.com/go-kratos/blades"
+)
+
+// ReActAgent 实现单个 ReAct 循环：LLM 生成 -> 工具调用 -> 工具结果 -> 重复。
+// 它在多次运行之间刻意保持无状态；所有可变状态都保存在传入并返回的
+// History 切片中，便于上层按需持久化或续跑。
+type ReActAgent struct {
+	llm     ModelProvider        // llm 是当前使用的语言模型提供者，负责生成回复。
+	tools   ToolRegistry         // tools 是已注册的工具集合，提供 JSON Schema 与分发执行能力。
+	memory  MemoryPipeline       // memory 是记忆流水线，用于在每次 LLM 调用前组装上下文、写入事件。
+	mailbox *mailbox.Mailbox     // mailbox 是共享邮箱，用于接收异步子代理摘要；为空时不轮询。
+	role    types.RoleDefinition // role 是当前代理的角色定义，包含系统提示等配置。
+	name    string               // name 是代理唯一标识，也用于上下文中的 agent ID。
+	maxIter int                  // maxIter 是单次 Run 中允许的最大 LLM 调用次数，防止死循环。
+}
+
+// NewReActAgent 根据具体角色构造一个 ReActAgent 实例。
+// 参数 name 为代理标识；role 为角色定义；llm 为模型提供者；tools 为工具注册表。
+func NewReActAgent(name string, role types.RoleDefinition, llm ModelProvider, tools ToolRegistry) *ReActAgent {
+	// 使用构造参数与默认值填充结构体字段。
+	return &ReActAgent{
+		name:    name,
+		role:    role,
+		llm:     llm,
+		tools:   tools,
+		memory:  NopMemoryPipeline{}, // 默认使用空实现，避免 nil 调用 panic。
+		maxIter: 50,                  // 默认最多 50 轮 LLM 调用。
+	}
+}
+
+// WithMemory 注入记忆流水线。
+// 参数 m 为要实现记忆逻辑的对象；如果传入 nil，则视为无操作记忆。
+func (a *ReActAgent) WithMemory(m MemoryPipeline) *ReActAgent {
+	// 显式处理 nil 值，确保内部 memory 字段始终非空，后续调用无需重复判空。
+	if m == nil {
+		a.memory = NopMemoryPipeline{}
+	} else {
+		a.memory = m
+	}
+	return a
+}
+
+// WithMailbox 注入共享邮箱，使主循环可以轮询异步子代理摘要。
+// 参数 m 为共享邮箱实例；传入 nil 将禁用轮询。
+func (a *ReActAgent) WithMailbox(m *mailbox.Mailbox) *ReActAgent {
+	// 直接保存邮箱引用，RunWithHistory 中通过判空决定是否轮询。
+	a.mailbox = m
+	return a
+}
+
+// WithMaxIterations 限制单次运行中 LLM 调用的最大次数。
+// 参数 n 为期望的上限；默认值是 50，传入非正数会恢复默认值。
+func (a *ReActAgent) WithMaxIterations(n int) *ReActAgent {
+	// 对非法输入做兜底，避免因为 0 或负数导致循环无法执行或逻辑异常。
+	if n <= 0 {
+		n = 50
+	}
+	a.maxIter = n
+	return a
+}
+
+// Run 针对给定的用户输入执行 ReAct 循环。
+// 参数 ctx 用于取消/超时控制；input 为用户输入文本。
+// 返回值 ReactResult 包含助手最终回复与完整会话历史；error 表示执行过程中的错误。
+func (a *ReActAgent) Run(ctx context.Context, input string) (ReactResult, error) {
+	// 委托给 RunWithHistory，从空历史开始新的会话。
+	return a.RunWithHistory(ctx, input, nil)
+}
+
+// RunWithHistory 从已有历史开始执行 ReAct 循环。
+// 参数 ctx 用于取消/超时控制；input 为新的用户输入；history 为已有会话历史。
+// 新输入会被追加到传入的历史中，便于会话续跑并保留之前的轮次。
+// 返回值 ReactResult 包含最终回复与完整历史；error 表示执行错误。
+func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history []ReactMessage) (ReactResult, error) {
+	// 将当前代理标识写入上下文，便于链路追踪、日志和工具调用时识别身份。
+	ctx = WithAgentID(ctx, a.name)
+
+	// 如果外部传入 nil 历史，则初始化为空切片，保证后续 append 安全。
+	if history == nil {
+		history = []ReactMessage{}
+	}
+
+	// 将本轮用户输入作为一条 user 消息追加到历史中，开启新一轮 ReAct。
+	history = append(history, ReactMessage{Role: "user", Content: input})
+
+	// 根据当前角色构建系统提示词，作为模型行为约束。
+	system := a.systemPrompt()
+
+	// 进入 ReAct 主循环，最多执行 maxIter 次 LLM 调用。
+	// 每次循环对应一次“思考-行动-观察”的迭代。
+	for i := 0; i < a.maxIter; i++ {
+		// 在每次调用 LLM 之前，通过记忆流水线组装上下文消息。
+		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
+		messages := a.memory.Assemble(a.role, a.name, history)
+
+		// 将内部消息格式转换为 blades 库所需的模型消息格式。
+		bladesMsgs := ToBladesMessages(messages)
+
+		// 构造模型请求：包含系统提示、历史消息和可用工具 schema。
+		req := &blades.ModelRequest{
+			Instruction: blades.SystemMessage(system),
+			Messages:    bladesMsgs,
+			Tools:       a.tools.Schema(),
+		}
+
+		// 调用 LLM 生成回复，err 非空时立即返回并包装错误信息。
+		resp, err := a.llm.Generate(ctx, req)
+		if err != nil {
+			return ReactResult{}, fmt.Errorf("llm generate: %w", err)
+		}
+
+		// 如果响应为空或没有消息内容，说明模型返回异常，返回明确错误。
+		if resp == nil || resp.Message == nil {
+			return ReactResult{}, errors.New("empty model response")
+		}
+
+		// 将 blades 返回的消息转换为内部 Assistant 消息并追加到历史中。
+		assistant := AssistantMessageFromBlades(resp.Message)
+		history = append(history, assistant)
+
+		// 在判断本轮是否结束之前，先轮询邮箱并注入任何新的异步消息。
+		// 第一阶段 mailbox 通常为 nil，因此该分支多数情况下不执行。
+		if a.mailbox != nil {
+			// Drain 取出所有以当前代理为收件人的未读消息。
+			for _, m := range a.mailbox.Drain(a.name) {
+				// 将 mailbox 消息转为模型可见的 user 角色消息并加入历史。
+				history = append(history, mailboxMessageToReact(m))
+
+				// 同时把子代理摘要作为记忆事件写入，供后续上下文组装使用。
+				a.memory.Write(a.name, MemoryEvent{
+					Type:     "sub_agent_summary",
+					AgentID:  a.name,
+					Role:     m.From,
+					Content:  m.Body,
+					Occurred: time.Now(),
+				})
+			}
+		}
+
+		// 如果助手消息中没有任何工具调用，说明本轮已产生最终答案。
+		if len(assistant.ToolCalls) == 0 {
+			// 将最终答案作为记忆事件写入。
+			a.memory.Write(a.name, MemoryEvent{
+				Type:     "answer",
+				AgentID:  a.name,
+				Content:  assistant.Content,
+				Occurred: time.Now(),
+			})
+
+			// 返回最终结果与完整历史。
+			return ReactResult{Text: assistant.Content, History: history}, nil
+		}
+
+		// 否则，按顺序执行助手请求的所有工具调用，并将结果反馈回会话。
+		// 工具调用顺序执行，以保持追踪顺序与模型调用顺序一致。
+		for _, tc := range assistant.ToolCalls {
+			// 分发执行单个工具调用；出错时构造包含错误信息的 ToolResult。
+			result, err := a.tools.Dispatch(ctx, tc)
+			if err != nil {
+				result = ToolResult{Tool: tc.Name, Error: err.Error()}
+			}
+
+			// 将工具执行结果以 tool 角色消息追加到历史中，供下一次 LLM 调用使用。
+			history = append(history, ReactMessage{
+				Role:    "tool",
+				Content: ToolResultJSON(result),
+			})
+
+			// 把工具调用细节与结果写入记忆流水线。
+			a.memory.Write(a.name, MemoryEvent{
+				Type:     "tool_call",
+				AgentID:  a.name,
+				ToolName: tc.Name,
+				Input:    mustMarshal(tc.Input),
+				Output:   result.Output,
+				Occurred: time.Now(),
+			})
+		}
+	}
+
+	// 达到最大迭代次数仍未返回最终答案，返回超时/超限错误。
+	return ReactResult{}, fmt.Errorf("exceeded maximum iterations (%d)", a.maxIter)
+}
+
+// systemPrompt 为当前角色构建系统提示词。
+// 基础提示来自角色配置；末尾追加一段硬编码的执行纪律，用于减少常见反模式。
+func (a *ReActAgent) systemPrompt() string {
+	// 取角色配置中的系统提示作为基础。
+	base := a.role.SystemPrompt
+
+	// 如果角色未配置系统提示，则使用默认兜底文案。
+	if base == "" {
+		base = "You are a helpful assistant."
+	}
+
+	// 在基础提示后追加执行纪律块，提醒模型按需调用工具、验证结果并及时停止。
+	return base + "\n\n" +
+		"【执行纪律】\n" +
+		"1. Only call a tool when it is necessary to fulfill the task.\n" +
+		"2. When writing code or files, use WriteFile and verify with RunCommand if needed.\n" +
+		"3. Stop calling tools once the task is complete and reply to the user.\n"
+}
+
+// mailboxMessageToReact 把异步 mailbox 消息转换为模型可见的 ReactMessage。
+// 使用 user role 并在内容前加 [mailbox] 前缀，兼容 Anthropic Messages API
+// （该 API 不允许在会话中途插入 system 消息）。
+func mailboxMessageToReact(m *mailbox.Message) ReactMessage {
+	// 主题作为消息正文的基础部分。
+	body := m.Subject
+
+	// 如果邮件有正文，则追加到主题之后。
+	if m.Body != "" {
+		body += "\n" + m.Body
+	}
+
+	// 如果邮件携带结构化载荷，则序列化为 JSON 字符串并追加，方便模型读取。
+	if len(m.Payload) > 0 {
+		b, _ := json.Marshal(m.Payload)
+		body += "\n" + string(b)
+	}
+
+	// 组合成带发送者标记的 user 消息返回。
+	return ReactMessage{Role: "user", Content: fmt.Sprintf("[mailbox from %s] %s", m.From, body)}
+}
+
+// mustMarshal 将任意值序列化为 JSON 字符串；如果序列化失败则返回空字符串。
+// 用于工具调用参数等场景的容错记录。
+func mustMarshal(v any) string {
+	// 尝试 JSON 序列化。
+	b, err := json.Marshal(v)
+	if err != nil {
+		// 失败时静默返回空字符串，避免影响主流程。
+		return ""
+	}
+	return string(b)
+}

@@ -39,12 +39,12 @@ func TestCloneTaskMatchesJSONDeepCopy(t *testing.T) {
 		{
 			name: "non-empty depends_on",
 			orig: &Task{
-				ID:        "t3",
-				Goal:      "goal three",
-				DependsOn: []string{"t1", "t2"},
-				Status:    TaskStatusCompleted,
-				SessionID: "sess-123",
-				StartedAt: &now,
+				ID:         "t3",
+				Goal:       "goal three",
+				DependsOn:  []string{"t1", "t2"},
+				Status:     TaskStatusCompleted,
+				SessionID:  "sess-123",
+				StartedAt:  &now,
 				FinishedAt: &later,
 			},
 		},
@@ -329,10 +329,10 @@ func TestSchedulerStopWaitsForLoop(t *testing.T) {
 
 type fakeStore struct{}
 
-func (fakeStore) SaveDAG(context.Context, *DAG) error   { return nil }
+func (fakeStore) SaveDAG(context.Context, *DAG) error          { return nil }
 func (fakeStore) GetDAG(context.Context, string) (*DAG, error) { return nil, nil }
-func (fakeStore) ListDAGs(context.Context) ([]*DAG, error)      { return nil, nil }
-func (fakeStore) DeleteDAG(context.Context, string) error       { return nil }
+func (fakeStore) ListDAGs(context.Context) ([]*DAG, error)     { return nil, nil }
+func (fakeStore) DeleteDAG(context.Context, string) error      { return nil }
 
 type fakeLauncher struct{}
 
