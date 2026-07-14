@@ -49,21 +49,37 @@ func NewBladesClient(ctx context.Context, cfg types.AgentModelConfig) (*BladesCl
 //
 // 设计意图：工具循环需要访问 provider 的 Chat/ToolCall 等扩展能力，
 // 而 LLMClient 接口只暴露 Generate；通过此方法把底层 provider 透出去。
+//
+// 返回：底层 blades.ModelProvider 实例。
 // 并发安全：只读返回字段，本身线程安全。
 func (c *BladesClient) Provider() blades.ModelProvider {
-	return c.provider // 直接返回底层 provider 引用
+	// 直接返回底层 provider 引用
+	return c.provider
 }
 
 // doGenerate 执行 blades 生成请求并做通用校验。
 // 四个 Generate* 方法共享此 helper，避免重复构造请求与空响应检查。
+//
+// 参数：
+//   - ctx: 上下文
+//   - provider: 实际使用的 blades.ModelProvider
+//   - req: 已构造好的请求
+//
+// 返回：
+//   - *blades.ModelResponse: 成功响应
+//   - error: 生成失败或响应为空时返回错误
 func (c *BladesClient) doGenerate(ctx context.Context, provider blades.ModelProvider, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	// 调用底层 provider 的 Generate
 	resp, err := provider.Generate(ctx, req)
 	if err != nil {
+		// 包装错误，标明发生在 model generate 阶段
 		return nil, fmt.Errorf("model generate: %w", err)
 	}
+	// 校验响应非空且包含消息
 	if resp == nil || resp.Message == nil {
 		return nil, fmt.Errorf("empty model response")
 	}
+	// 返回校验后的响应
 	return resp, nil
 }
 
@@ -81,13 +97,17 @@ func (c *BladesClient) doGenerate(ctx context.Context, provider blades.ModelProv
 // 副作用：无（除底层 HTTP 调用外）。
 // 并发安全：底层 provider 线程安全，可并发调用。
 func (c *BladesClient) Generate(ctx context.Context, prompt string) (string, error) {
+	// 构造仅含一条 user 消息的请求
 	req := &blades.ModelRequest{
 		Messages: []*blades.Message{blades.UserMessage(prompt)},
 	}
+	// 调用通用生成 helper
 	resp, err := c.doGenerate(ctx, c.provider, req)
 	if err != nil {
+		// 出错直接返回
 		return "", err
 	}
+	// 提取并返回消息文本
 	return resp.Message.Text(), nil
 }
 
@@ -106,13 +126,17 @@ func (c *BladesClient) Generate(ctx context.Context, prompt string) (string, err
 //   - blades.TokenUsage: token 用量（InputTokens/OutputTokens/TotalTokens）
 //   - error: 调用失败或响应为空
 func (c *BladesClient) GenerateWithUsage(ctx context.Context, prompt string) (string, blades.TokenUsage, error) {
+	// 构造仅含一条 user 消息的请求
 	req := &blades.ModelRequest{
 		Messages: []*blades.Message{blades.UserMessage(prompt)},
 	}
+	// 调用通用生成 helper
 	resp, err := c.doGenerate(ctx, c.provider, req)
 	if err != nil {
+		// 出错时返回空字符串与零值 TokenUsage
 		return "", blades.TokenUsage{}, err
 	}
+	// 返回文本与底层 provider 提供的 token 用量
 	return resp.Message.Text(), resp.Message.TokenUsage, nil
 }
 
@@ -131,14 +155,17 @@ func (c *BladesClient) GenerateWithUsage(ctx context.Context, prompt string) (st
 // 副作用：无。
 // 并发安全：底层 provider 线程安全。
 func (c *BladesClient) GenerateWithSystem(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	// 构造包含 system instruction 与 user message 的请求
 	req := &blades.ModelRequest{
 		Instruction: blades.SystemMessage(systemPrompt),
 		Messages:    []*blades.Message{blades.UserMessage(userPrompt)},
 	}
+	// 调用通用生成 helper
 	resp, err := c.doGenerate(ctx, c.provider, req)
 	if err != nil {
 		return "", err
 	}
+	// 返回模型回复文本
 	return resp.Message.Text(), nil
 }
 
@@ -175,13 +202,16 @@ func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, t
 		return c.Generate(ctx, prompt)
 	}
 
+	// 构造仅含一条 user 消息的请求
 	req := &blades.ModelRequest{
 		Messages: []*blades.Message{blades.UserMessage(prompt)},
 	}
+	// 使用临时 provider 生成
 	resp, err := c.doGenerate(ctx, override, req)
 	if err != nil {
 		return "", err
 	}
+	// 返回模型回复文本
 	return resp.Message.Text(), nil
 }
 
@@ -202,12 +232,16 @@ func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, t
 // 副作用：无外部状态变更。
 // 并发安全：纯函数式构造，可并发调用。
 func createBladesProvider(cfg types.AgentModelConfig) (blades.ModelProvider, error) {
+	// 根据 provider 名称分发
 	switch cfg.Provider {
-	case "openai", "": // 空字符串视为 openai 兼容默认值
+	case "openai", "":
+		// 空字符串视为 openai 兼容默认值
 		return newOpenAIProvider(cfg), nil
 	case "anthropic":
+		// Anthropic 原生 Messages API
 		return newAnthropicProvider(cfg), nil
 	case "ollama":
+		// Ollama 本地 /api/chat
 		return newOllamaProvider(cfg)
 	default:
 		// 后续可在此扩展 azure/bedrock 等分支

@@ -21,25 +21,28 @@ type KnowledgeStore struct {
 
 // Save 写入一条全局知识记录 (含向量)。
 // 参数:
+//   - ctx: 请求上下文。
 //   - rec: 知识记录,含 KnowledgeType/TopicID/Content/Embedding/Meta 等
 //
 // 返回: SQL 执行错误。
 // 副作用: embedding 通过 pgVector 转为字符串文本,依赖 pgvector 扩展解析。
 func (s *KnowledgeStore) Save(ctx context.Context, rec *types.KnowledgeRecord) error {
-	// meta 即使为 nil 也写入 "{}",保证列非空
+	// meta 即使为 nil 也写入 "{}",保证列非空，避免下游 JSONB 操作报错
 	meta, err := json.Marshal(rec.Meta)
 	if err != nil {
 		return fmt.Errorf("marshal knowledge meta: %w", err)
 	}
+	// 执行 INSERT，向量以 pgVector 文本形式传入
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO global_knowledge (knowledge_type, topic_id, content, embedding, meta, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, rec.KnowledgeType, rec.TopicID, rec.Content, pgVector(rec.Embedding), meta, rec.CreatedAt)
+			INSERT INTO global_knowledge (knowledge_type, topic_id, content, embedding, meta, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, rec.KnowledgeType, rec.TopicID, rec.Content, pgVector(rec.Embedding), meta, rec.CreatedAt)
 	return err
 }
 
 // GetByType 按知识类型列出记录 (按最近访问时间倒序)。
 // 参数:
+//   - ctx: 请求上下文。
 //   - knowledgeType: 例如 "playbook"/"postmortem"
 //   - limit: 返回上限,<=0 时默认 10
 //
@@ -47,19 +50,21 @@ func (s *KnowledgeStore) Save(ctx context.Context, rec *types.KnowledgeRecord) e
 // 设计意图: 排除已归档记录,优先返回热数据。
 func (s *KnowledgeStore) GetByType(ctx context.Context, knowledgeType string, limit int) ([]*types.KnowledgeRecord, error) {
 	if limit <= 0 {
-		// 兜底默认值
+		// 兜底默认值，防止因 limit 非法导致 SQL 报错
 		limit = 10
 	}
+	// 查询未归档记录，按最近访问时间倒序，NULL 排最后
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
-		FROM global_knowledge
-		WHERE knowledge_type = $1 AND archived = false
-		ORDER BY last_accessed DESC NULLS LAST
-		LIMIT $2
-	`, knowledgeType, limit)
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE knowledge_type = $1 AND archived = false
+			ORDER BY last_accessed DESC NULLS LAST
+			LIMIT $2
+		`, knowledgeType, limit)
 	if err != nil {
 		return nil, err
 	}
+	// 确保结果集关闭，避免连接泄漏
 	defer rows.Close()
 
 	// 复用统一的行扫描逻辑
@@ -68,6 +73,7 @@ func (s *KnowledgeStore) GetByType(ctx context.Context, knowledgeType string, li
 
 // Search 向量相似搜索 (依赖 pgvector)。
 // 参数:
+//   - ctx: 请求上下文。
 //   - embedding: 查询向量
 //   - topK: 返回前 K 条,<=0 时默认 5
 //
@@ -78,16 +84,18 @@ func (s *KnowledgeStore) Search(ctx context.Context, embedding []float32, topK i
 		// 兜底默认值
 		topK = 5
 	}
+	// 使用 L2 距离算子 <=> 排序，未归档记录中搜索最相似的 topK 条
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
-		FROM global_knowledge
-		WHERE archived = false
-		ORDER BY embedding <=> $1
-		LIMIT $2
-	`, pgVector(embedding), topK)
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE archived = false
+			ORDER BY embedding <=> $1
+			LIMIT $2
+		`, pgVector(embedding), topK)
 	if err != nil {
 		return nil, err
 	}
+	// 确保结果集关闭
 	defer rows.Close()
 
 	return scanKnowledgeRows(rows)
@@ -98,27 +106,32 @@ func (s *KnowledgeStore) Search(ctx context.Context, embedding []float32, topK i
 // 避免不同领域块记忆之间的串扰。
 //
 // 参数：
+//   - ctx：请求上下文。
 //   - knowledgeType：必填过滤条件（如 KnowledgeTypeBlockMemory）
 //   - domain：meta->>'domain' 精确匹配值
 //   - embedding：查询向量
 //   - topK：返回上限
+//
+// 返回: 按相似度排序的知识记录切片与错误。
 func (s *KnowledgeStore) SearchByTypeAndDomain(ctx context.Context, knowledgeType enums.KnowledgeType, domain string, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
 	if topK <= 0 {
 		topK = 5
 	}
-	// pgvector 检索可能因数据量大或索引失效而变慢，加独立超时防止阻塞主流程。
+	// pgvector 检索可能因数据量大或索引失效而变慢，加独立超时防止阻塞主流程
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	// 双重过滤：类型 + 领域，再按向量距离排序
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
-		FROM global_knowledge
-		WHERE archived = false AND knowledge_type = $1 AND meta->>'domain' = $2
-		ORDER BY embedding <=> $3
-		LIMIT $4
-	`, knowledgeType, domain, pgVector(embedding), topK)
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE archived = false AND knowledge_type = $1 AND meta->>'domain' = $2
+			ORDER BY embedding <=> $3
+			LIMIT $4
+		`, knowledgeType, domain, pgVector(embedding), topK)
 	if err != nil {
 		return nil, err
 	}
+	// 确保结果集关闭
 	defer rows.Close()
 	return scanKnowledgeRows(rows)
 }
@@ -126,74 +139,92 @@ func (s *KnowledgeStore) SearchByTypeAndDomain(ctx context.Context, knowledgeTyp
 // SearchBlockMemory 按 domain 过滤后再语义匹配检索块记忆。
 // 先通过 meta->>'domain' 做精确过滤，再在过滤后的结果中按向量相似度排序，
 // 避免不同领域块记忆之间的串扰。
+// 参数:
+//   - ctx: 请求上下文。
+//   - domain: 领域标识。
+//   - goal:   目标文本，用于生成查询向量。
+//   - topK:   返回上限。
+//
+// 返回: 知识记录切片与错误。
 func (s *KnowledgeStore) SearchBlockMemory(ctx context.Context, domain, goal string, topK int) ([]*types.KnowledgeRecord, error) {
 	if topK <= 0 {
 		topK = 5
 	}
+	// 组合 domain 与 goal 生成查询文本，提升语义匹配精度
 	query := fmt.Sprintf("领域:%s\n目标:%s", domain, goal)
+	// 调用 PostgresStore.Embed 将查询文本转为向量（支持外部 embedder 回退）
 	emb, err := s.pg.Embed(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
+	// 复用 SearchByTypeAndDomain 完成类型+领域过滤的向量检索
 	return s.SearchByTypeAndDomain(ctx, enums.KnowledgeTypeBlockMemory, domain, emb, topK)
 }
 
 // SearchByType 按 knowledge_type 过滤的向量相似搜索（特性3使用）。
 // 职责：限定返回记录的 KnowledgeType，便于把 block_memory / playbook 等分类检索。
 // 参数：
+//   - ctx：请求上下文。
 //   - knowledgeType：必填过滤条件
 //   - embedding：查询向量
 //   - topK：返回上限
+//
+// 返回: 知识记录切片与错误。
 func (s *KnowledgeStore) SearchByType(ctx context.Context, knowledgeType enums.KnowledgeType, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
 	if topK <= 0 {
 		topK = 5
 	}
+	// 按类型过滤后，使用 L2 距离排序
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
-		FROM global_knowledge
-		WHERE archived = false AND knowledge_type = $1
-		ORDER BY embedding <=> $2
-		LIMIT $3
-	`, knowledgeType, pgVector(embedding), topK)
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE archived = false AND knowledge_type = $1
+			ORDER BY embedding <=> $2
+			LIMIT $3
+		`, knowledgeType, pgVector(embedding), topK)
 	if err != nil {
 		return nil, err
 	}
+	// 确保结果集关闭
 	defer rows.Close()
 	return scanKnowledgeRows(rows)
 }
 
 // Archive 归档指定 ID 的知识 (软删除)。
 // 参数:
+//   - ctx: 请求上下文。
 //   - id: 知识记录主键
 //
 // 返回: SQL 执行错误。
 // 副作用: archived 置 true,后续查询自动排除该记录。
 func (s *KnowledgeStore) Archive(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE global_knowledge SET archived = true WHERE id = $1
-	`, id)
+			UPDATE global_knowledge SET archived = true WHERE id = $1
+		`, id)
 	return err
 }
 
 // IncrementAccessCount 自增访问计数并刷新最近访问时间。
 // 参数:
+//   - ctx: 请求上下文。
 //   - id: 知识记录主键
 //
 // 返回: SQL 执行错误。
 // 设计意图: 配合 GetByType 的排序,实现简单的热度衰减。
 func (s *KnowledgeStore) IncrementAccessCount(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE global_knowledge
-		SET access_count = access_count + 1, last_accessed = NOW()
-		WHERE id = $1
-	`, id)
+			UPDATE global_knowledge
+			SET access_count = access_count + 1, last_accessed = NOW()
+			WHERE id = $1
+		`, id)
 	return err
 }
 
 // scanKnowledgeRows 扫描知识库查询结果集,统一处理 NULL 字段与 JSONB 反序列化。
 // 参数:
-//   - rows: 已执行的 *sql.Rows,列顺序固定为
-//     id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+//   - rows: 已执行的 *sql.Rows,列顺序固定为：
+//     id(ID)、knowledge_type(知识类型)、topic_id(话题 ID)、content(内容)、meta(元数据)、
+//     access_count(访问计数)、last_accessed(最后访问时间)、created_at(创建时间)、archived(是否归档)
 //
 // 返回: 知识记录切片;扫描/反序列化失败的单行被跳过。
 func scanKnowledgeRows(rows *sql.Rows) ([]*types.KnowledgeRecord, error) {
@@ -202,6 +233,7 @@ func scanKnowledgeRows(rows *sql.Rows) ([]*types.KnowledgeRecord, error) {
 		var r types.KnowledgeRecord
 		var metaRaw []byte
 		var lastAccessed sql.NullTime
+		// 按固定列顺序扫描，last_accessed 用 NullTime 处理 NULL
 		err := rows.Scan(&r.ID, &r.KnowledgeType, &r.TopicID, &r.Content, &metaRaw,
 			&r.AccessCount, &lastAccessed, &r.CreatedAt, &r.Archived)
 		if err != nil {

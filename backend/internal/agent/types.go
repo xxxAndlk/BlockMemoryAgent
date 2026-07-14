@@ -1,3 +1,5 @@
+// Package agent 定义了会话、消息、查询等核心 DTO 与常量，
+// 作为 Agent 编排层与上层（HTTP/TUI）之间的数据契约。
 package agent
 
 import (

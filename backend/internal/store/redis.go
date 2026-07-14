@@ -15,13 +15,13 @@ import (
 // 并通过委托包装保留原有公开方法签名,保证接口实现不中断。
 // 并发安全: go-redis 客户端内部维护连接池,可在多 goroutine 间共享。
 type RedisStore struct {
-	client *redis.Client
+	client *redis.Client // 共享 Redis 客户端
 
-	Topic    *TopicRedisStore
-	Output   *OutputRedisStore
-	Event    *EventRedisStore
-	Snapshot *SnapshotRedisStore
-	TTL      *TTLRedisStore
+	Topic    *TopicRedisStore    // 话题维度元数据/约束/依赖图/归档
+	Output   *OutputRedisStore   // Agent 输出 Sorted Set
+	Event    *EventRedisStore    // 事件流 Stream 与决策日志 List
+	Snapshot *SnapshotRedisStore // Agent 快照热缓存
+	TTL      *TTLRedisStore      // 话题 TTL 与整话题删除
 
 	// eventCursors 维护每个 topic events stream 的已读游标（last message ID）。
 	// C4 修复：原 PollEvents 用 XRead "0" 起始，每次返回全量消息，
@@ -41,6 +41,7 @@ type RedisStore struct {
 //   - *RedisStore: 已通过 Ping 校验的存储实例
 //   - error: Ping 失败时返回包装错误
 func NewRedisStore(ctx context.Context, addr, password string, db int) (*RedisStore, error) {
+	// 初始化 go-redis 客户端，尚未真正建连
 	client := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: password,
@@ -52,6 +53,7 @@ func NewRedisStore(ctx context.Context, addr, password string, db int) (*RedisSt
 	if err := client.Ping(pingCtx).Err(); err != nil {
 		return nil, fmt.Errorf("ping redis: %w", err)
 	}
+	// 装配各子 Store，注入共享 client
 	return &RedisStore{
 		client:       client,
 		eventCursors: make(map[string]string),
@@ -133,22 +135,33 @@ func (s *RedisStore) PushEvent(ctx context.Context, topicID string, event *types
 // 实现: 维护 per-topic 的 stream 游标（last message ID），从游标位置 XRead 增量拉取，
 // 避免 stream 增长后每次全量读取导致 O(n) 退化（C4 修复）。游标在内存中，
 // 进程重启会回退到 "0" 重新读取——可接受，因为 Pending 事件幂等处理。
+// 参数:
+//   - ctx:    请求上下文。
+//   - topicID:话题 ID。
+//   - count:  本次最多拉取条数，<=0 时默认 10。
+//
+// 返回: Pending 事件切片与错误。
 func (s *RedisStore) PollEvents(ctx context.Context, topicID string, count int64) ([]*types.Event, error) {
 	if count <= 0 {
 		count = 10
 	}
+	// 生成 topic events stream 的统一 key
 	key := topicKey(topicID, "events")
+	// 加锁读取当前游标；不长时间持有锁，避免阻塞其他 topic 操作
 	s.eventCursorsMu.Lock()
 	cursor, ok := s.eventCursors[key]
 	s.eventCursorsMu.Unlock()
 	if !ok {
+		// 首次拉取或进程重启，从 stream 起始处读取
 		cursor = "0"
 	}
 
+	// 委托 Event 子 Store 执行实际 XRead，返回事件与最后一条消息 ID
 	events, lastID, err := s.Event.pollEvents(ctx, topicID, count, cursor)
 	if err != nil {
 		return nil, err
 	}
+	// 如果有读到消息，原子更新游标，下次从增量位置开始
 	if lastID != "" {
 		s.eventCursorsMu.Lock()
 		s.eventCursors[key] = lastID

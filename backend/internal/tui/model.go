@@ -15,34 +15,49 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
-// Model is the top-level bubbletea model for the BlockMemoryAgent TUI.
+// Model 是 BlockMemoryAgent TUI 的顶层 bubbletea 模型，持有全部状态与依赖。
 type Model struct {
+	// width 与 height 是当前终端尺寸。
 	width  int
 	height int
 
-	agent      agent.Agent
+	// agent 是后端 Agent facade，用于会话管理、事件流等。
+	agent agent.Agent
+	// dagHandler 处理 DAG 相关请求（预留）。
 	dagHandler *server.DAGHandler
-	httpAddr   string
-	modelName  string
+	// httpAddr 是本地 TUI 后端地址，postJSON/getJSON 使用。
+	httpAddr string
+	// modelName 是当前使用的模型名称，用于欢迎页与顶栏展示。
+	modelName string
 
+	// styles 是全局样式集合。
 	styles *Styles
 
-	focus int // panelChat / panelInput
+	// focus 是当前焦点面板，取值 panelChat 或 panelInput。
+	focus int
 
-	sessions       []*server.Session
+	// sessions 是会话列表。
+	sessions []*server.Session
+	// sessionsCursor 是当前选中会话的索引。
 	sessionsCursor int
 
-	chatPanel      ChatPanel
-	inputBar       InputBar
-	overlayPanel   OverlayPanel
+	// chatPanel 是对话面板。
+	chatPanel ChatPanel
+	// inputBar 是底部输入栏。
+	inputBar InputBar
+	// overlayPanel 是弹窗状态。
+	overlayPanel OverlayPanel
+	// agentTreePanel 是 Agent 编排面板状态。
 	agentTreePanel AgentTreePanel
+	// taskBriefCache 是任务标题摘要缓存。
 	taskBriefCache TaskBriefCache
 
-	// accumulated token counts from token_usage events
+	// totalInputTokens 与 totalOutputTokens 分别累计输入/输出 Token 数量。
 	totalInputTokens  int
 	totalOutputTokens int
 
 	// v2.0 面板开关
+	// agentPanelVisible 与 planBarVisible 控制旧版面板显示（部分已弃用）。
 	agentPanelVisible bool
 	planBarVisible    bool
 
@@ -50,10 +65,13 @@ type Model struct {
 	// 0=自动（按宽度和内容），1=强制显示，-1=强制隐藏。
 	rightPanelForced int
 
-	// flash banner
-	flash      string
+	// flash 是临时闪屏提示文本。
+	flash string
+	// flashUntil 是闪屏提示过期时间。
 	flashUntil time.Time
-	flashMu    *sync.Mutex // 保护 flash/flashUntil 的并发读写（T2 修复：后台 HTTP goroutine 写，主循环 View 读）。用指针避免 bubbletea 值语义 Model 拷贝 Mutex
+	// flashMu 保护 flash/flashUntil 的并发读写（T2 修复：后台 HTTP goroutine 写，主循环 View 读）。
+	// 用指针避免 bubbletea 值语义 Model 拷贝 Mutex。
+	flashMu *sync.Mutex
 
 	// pendingSelectID 由后台 createSession goroutine 写入，tick handler 消费：
 	// 成功创建会话后选中它需操作 m.sessions/cursor，不能在后台 goroutine 直接改
@@ -65,10 +83,11 @@ type Model struct {
 	// streamCancel 关闭当前会话的事件流 goroutine。
 	streamCancel context.CancelFunc
 
+	// tickCount 记录 tick 次数，用于按周期执行不同刷新任务。
 	tickCount int
 }
 
-// NewModel builds a TUI model wired to backend dependencies.
+// NewModel 构造一个 TUI Model，连接后端依赖，初始化默认状态并加载会话列表。
 func NewModel(
 	agentFacade agent.Agent,
 	dagHandler *server.DAGHandler,
@@ -91,35 +110,36 @@ func NewModel(
 	}
 	m.refreshSessions()
 	if len(m.sessions) > 0 {
+		// 有会话时默认选中第一个。
 		m.selectSession(0)
 	} else {
-		// No sessions — drop user into the input bar so they can /new one.
+		// 当前无会话，将焦点切换到输入栏，让用户可以通过 /new 创建会话。
 		m.focus = panelInput
 		m.inputBar.mode = inputNormal
 	}
 	return m
 }
 
-// Init starts background ticks and the agent stream listener.
+// Init 启动后台 tick 与 agent 事件流监听器。
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(tickCmd(), streamCmd(m.streamEvents))
 }
 
+// tickCmd 返回每 100ms 触发一次的 tick 命令。
+// v2.0：100ms 快速 tick 保证对话区流畅；Agent 面板/顶栏等耗时操作每 10 tick（1s）刷新一次。
 func tickCmd() tea.Cmd {
-	// v2.0：100ms 快速 tick 保证对话区流畅；Agent 面板/顶栏等耗时操作每 10 tick（1s）刷新一次。
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg{} })
 }
 
+// tickMsg 是 tick 命令产生的消息类型。
 type tickMsg struct{}
 
-// streamEventMsg is emitted when the agent.Stream channel for the selected
-// session delivers a new event. It triggers the same refresh path as tickMsg
-// so the TUI stays in sync with live graph output.
+// streamEventMsg 在选中会话的 agent.Stream 通道产生新事件时发出，
+// 触发与 tickMsg 相同的刷新路径，保证 TUI 与实时输出同步。
 type streamEventMsg struct{ event agent.Event }
 
-// streamCmd returns a bubbletea Cmd that waits for the next event on the
-// shared streamEvents channel. The goroutine feeding the channel is restarted
-// whenever the selected session changes.
+// streamCmd 返回一个 bubbletea 命令，等待 streamEvents 通道的下一个事件。
+// 选中会话改变时会重新启动向通道写入事件的 goroutine。
 func streamCmd(ch <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
 		ev, ok := <-ch
@@ -159,6 +179,7 @@ func (m *Model) selectSession(idx int) {
 			log.Printf("[tui] selectSession: session %s 尚未同步首条用户消息，保留本地预展示", m.sessions[idx].ID)
 		}
 	}
+	// 重置对话面板滚动状态。
 	m.chatPanel.cursor = 0
 	m.chatPanel.followBottom = true
 	m.chatPanel.anchorUser = false
@@ -176,9 +197,8 @@ func (m *Model) selectSession(idx int) {
 	}
 }
 
-// startStream cancels any previous agent.Stream goroutine for this model and
-// starts a new one that follows the currently selected session. Events are
-// pushed into streamEvents so the bubbletea message loop can refresh the view.
+// startStream 取消之前的事件流 goroutine，并启动一个监听当前选中会话的新 goroutine。
+// 事件被写入 streamEvents，由 bubbletea 消息循环消费以刷新视图。
 func (m *Model) startStream() {
 	if m.streamCancel != nil {
 		m.streamCancel()
@@ -207,28 +227,31 @@ func (m *Model) startStream() {
 				case <-ctx.Done():
 					return
 				default:
-					// Buffer full: drop the event; the next tick will refresh via
-					// agent.Get anyway.
+					// 事件流缓冲区已满，丢弃该事件；
+					// 下次 tick 会通过 agent.Get 重新刷新。
 				}
 			}
 		}
 	}()
 }
 
+// rebuildAgents 根据当前选中会话重建 Agent 树。
 func (m *Model) rebuildAgents() {
 	m.agentTreePanel.rebuild(m.agent, m.selectedSession())
 }
 
+// refreshSessions 从 agent facade 重新加载会话列表，并尽量保持对原选中会话的光标位置。
 func (m *Model) refreshSessions() {
 	if m.agent == nil {
 		return
 	}
+	// 记录当前选中的会话 ID，用于刷新后恢复光标。
 	prevID := ""
 	if m.sessionsCursor >= 0 && m.sessionsCursor < len(m.sessions) {
 		prevID = m.sessions[m.sessionsCursor].ID
 	}
-	// List all sessions from the agent facade (including restored history) and
-	// keep the cursor on the previously selected session when possible.
+	// 从 agent facade 加载全部会话（包括已恢复的历史会话），
+	// 并尽可能保持光标停留在之前选中的会话上。
 	sessions, err := m.agent.List(context.Background(), agent.Filter{})
 	if err != nil {
 		log.Printf("[tui] refreshSessions: %v", err)
@@ -238,6 +261,7 @@ func (m *Model) refreshSessions() {
 	for _, s := range sessions {
 		m.sessions = append(m.sessions, toServerSession(s))
 	}
+	// 在原列表中查找 previously selected session。
 	found := -1
 	for i, s := range m.sessions {
 		if s.ID == prevID {
@@ -248,18 +272,18 @@ func (m *Model) refreshSessions() {
 	if found >= 0 {
 		m.sessionsCursor = found
 	} else if m.sessionsCursor >= len(m.sessions) && len(m.sessions) > 0 {
+		// 原光标越界且仍有会话时，移到末尾并重建 Agent 树。
 		m.sessionsCursor = len(m.sessions) - 1
 		m.rebuildAgents()
 	}
 }
 
-// toServerSession converts an agent.Session DTO back to the server.Session type
-// that the TUI still uses internally for chat rendering and plan panels.
-// It delegates to the canonical conversion in the server package to avoid drift.
+// toServerSession 将 agent.Session DTO 转换为 TUI 内部仍在使用的 server.Session 类型。
 func toServerSession(a *agent.Session) *server.Session {
 	return server.ToServerSession(a)
 }
 
+// selectedSession 返回当前选中的会话；若 agent 不可用则返回本地缓存的浅拷贝作为降级。
 func (m *Model) selectedSession() *server.Session {
 	if m.sessionsCursor < 0 || m.sessionsCursor >= len(m.sessions) {
 		return nil
@@ -280,10 +304,11 @@ func (m *Model) selectedSession() *server.Session {
 	return toServerSession(sess)
 }
 
-// Update handles messages.
+// Update 是 bubbletea 消息处理入口，根据消息类型更新 Model 并返回命令。
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		// 终端尺寸变化时更新尺寸、viewport 尺寸并重建对话内容。
 		m.width = msg.Width
 		m.height = msg.Height
 		m.chatPanel.vp.Width = m.chatContentWidth()
@@ -303,7 +328,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rebuildAgents()
 			m.accumulateTokens()
 		}
-		// Auto-scroll to bottom when following.
 		// 清理过期闪屏提示（持锁，T2 修复）
 		m.flashMu.Lock()
 		if m.flash != "" && time.Now().After(m.flashUntil) {
@@ -327,9 +351,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// refreshView contains the view-refresh logic shared by tickMsg and
-// streamEventMsg: pending session selection, scroll-to-user, chat content
-// rebuild, and overlay refresh.
+// refreshView 包含 tickMsg 与 streamEventMsg 共享的视图刷新逻辑：
+// 待处理会话选中、滚动到用户消息、重建对话内容、刷新弹窗。
 func (m *Model) refreshView() {
 	// 消费后台 createSession 写入的 pendingSelectID：在主循环内 refresh+select
 	// 避免后台 goroutine 直接改 m.sessions/cursor 与 View 产生 race（T2 修复）
@@ -389,8 +412,9 @@ func (m *Model) refreshView() {
 	}
 }
 
+// handleMouse 处理鼠标消息，包括弹窗滚轮、对话区滚轮、滚动条拖动等。
 func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	// When popup is open, wheel scrolls popup contents.
+	// 弹窗打开时，滚轮用于滚动弹窗内容。
 	if m.overlayPanel.mode != overlayNone && m.overlayPanel.mode != overlayHelp {
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
@@ -451,6 +475,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// handleKey 处理键盘消息，包括全局快捷键、弹窗导航、输入栏路由、对话区导航。
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Ctrl+L 全局开关"完整记录"面板：无论当前焦点在输入栏还是对话区、
 	// 无论是否已打开其它弹窗，都可随时翻阅全部输出。这是查看长输出的主入口，
@@ -465,9 +490,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Overlay mode: navigate or close.
+	// 弹窗模式：导航或关闭。
 	if m.overlayPanel.mode != overlayNone {
-		// Keep popup content / cursor in sync with live state.
+		// 保持弹窗内容与光标和实时状态同步。
 		m.refreshOverlay()
 		switch msg.String() {
 		case "ctrl+c":
@@ -500,12 +525,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Input bar: route all keys to input handler.
+	// 输入栏模式：将所有按键交给输入处理器。
 	if m.focus == panelInput {
 		return m.handleInputKey(msg)
 	}
 
-	// Chat navigation mode.
+	// 对话区导航模式。
 	switch msg.String() {
 	case "ctrl+c", "q", "Q":
 		return m, tea.Quit
@@ -527,8 +552,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = panelInput
 		m.inputBar.mode = inputNormal
 	case "/":
-		// Focus the input bar empty — for slash commands. Other printable chars
-		// fall through to the default case and seed the buffer directly.
+		// "/" 聚焦到空输入栏，用于输入斜杠命令；其他可打印字符
+		// 直接进入 default 分支并填充到输入缓冲区。
 		m.focus = panelInput
 		m.inputBar.mode = inputNormal
 	case "?":
@@ -552,7 +577,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "end":
 		m.chatPanel.gotoBottom()
 	default:
-		// Any printable rune jumps to input mode and seeds the buffer.
+		// 任意可打印字符都会进入输入模式并填充缓冲区。
 		if len(msg.Runes) > 0 && unicode.IsPrint(msg.Runes[0]) {
 			m.focus = panelInput
 			m.inputBar.mode = inputNormal
@@ -563,14 +588,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// chatCurrentItem 返回当前 viewport 顶部对应的 chatItem 索引。
-// chatScrollToItem 滚动到指定 item 顶部，并更新 followBottom 状态。
-// chatScrollToItemBottom 滚动到指定 item 完全可见，用于把刚发送的用户问题
-// 固定在屏幕内。若 item 高度不超过视口高度，则让 item 顶部对齐视口顶部，
-// 避免短消息被后续内容顶出视口；若 item 高于视口，则底部对齐以便看最新部分，
-// 同时保留上方历史记录可见。
-// rebuildChatContent 根据当前窗口尺寸把当前会话内容渲染成带样式的字符串，
-// 并同步到 viewport。ScrollToBottom 由调用方按需执行。
 // rightPanelVisible 返回是否显示右侧计划/Agent 分栏。
 // 显示条件（满足其一即可）：
 //   - 用户手动强制显示（ctrl+b）
@@ -635,7 +652,6 @@ func (m *Model) mainContentHeight() int {
 	return h
 }
 
-// refreshOverlay rebuilds popup lines for plan/agents so live state stays in sync.
 // toggleRightPanel 切换右侧计划/Agent 分栏的强制显示/隐藏状态。
 // 循环：自动 → 强制显示 → 强制隐藏 → 自动。
 func (m *Model) toggleRightPanel() {
@@ -655,7 +671,7 @@ func (m *Model) toggleRightPanel() {
 // toggleLogPopup 打开/关闭"完整记录"面板：把整段对话铺成可滚动行列表，
 // 用户可用 j/k/g/G 翻阅全部 LLM 输出 / 工具调用 / 思考，不受对话区高度限制。
 // 内容每次渲染实时刷新（refreshOverlay），保证新输出立即可见。
-// accumulateTokens sums token_usage events and updates total counts.
+// accumulateTokens 累加 token_usage 事件的输入/输出 Token 数量。
 func (m *Model) accumulateTokens() {
 	s := m.selectedSession()
 	if s == nil {
@@ -670,6 +686,7 @@ func (m *Model) accumulateTokens() {
 	m.totalOutputTokens = out
 }
 
+// clamp 将整数 v 限制在 [lo, hi] 范围内；若 lo > hi 则返回 lo。
 func clamp(v, lo, hi int) int {
 	if lo > hi {
 		return lo
@@ -685,8 +702,8 @@ func clamp(v, lo, hi int) int {
 
 // scrollbarArea 返回聊天区滚动条在屏幕上的范围（x, y, w, h）。
 // 顶栏占 1 行，滚动条位于对话区最右侧，宽度 1。
-// scrollbarThumbBounds 返回滑块在滚动条区域内的起始/结束行索引（含）。
+// thumbBounds 返回滑块在滚动条区域内的起始/结束行索引（含）。
 // 若内容无需滚动则返回 (-1, -1)。
-// updateScrollbarDrag 根据当前鼠标 Y 坐标更新 viewport 滚动位置。
+// updateDrag 根据当前鼠标 Y 坐标更新 viewport 滚动位置。
 // 以 dragStartY/dragStartOffset 为基准，按滑块可移动范围与内容可滚动范围的比率映射。
 // scrollToThumbY 将滑块中心对齐到滚动条区域内的指定 Y 坐标（相对于滚动条顶部）。

@@ -56,6 +56,7 @@ const (
 //
 // 并发安全：纯函数。
 func (l Level) String() string {
+	// switch 分支将内部枚举映射为可读大写字符串。
 	switch l {
 	case LevelOK:
 		return "OK"
@@ -102,11 +103,15 @@ func DefaultConfig() Config {
 // 比例：soft = 50% contextWindow，hard = 80% contextWindow，
 // 保证硬阈值始终比软阈值大至少 600 token 的安全余量。
 func ConfigForWindow(contextWindow int) Config {
+	// 非法窗口大小时回退到 32k，避免除零或负数阈值。
 	if contextWindow <= 0 {
 		contextWindow = 32000
 	}
+	// 软阈值取窗口的 50%。
 	soft := contextWindow * 50 / 100
+	// 硬阈值取窗口的 80%。
 	hard := contextWindow * 80 / 100
+	// 保证软硬阈值之间至少有 600 token 余量，防止阈值过近导致决策抖动。
 	if hard <= soft+600 {
 		hard = soft + 600
 	}
@@ -146,27 +151,30 @@ func New(cfg Config) *Watchdog {
 // 并发安全：持写锁更新 cfg。
 func (w *Watchdog) SetConfig(cfg Config) {
 	cfg = normalizeConfig(cfg)
-	w.mu.Lock()
+	w.mu.Lock()         // 加写锁：修改 cfg
+	defer w.mu.Unlock() // 函数退出时释放锁
 	w.cfg = cfg
-	w.mu.Unlock()
 }
 
 // SetTokenEstimator 运行时更新 token 估算策略；传入 nil 时恢复为 ByteRatioEstimator。
 // 并发安全：持写锁更新 estimator。
 func (w *Watchdog) SetTokenEstimator(e TokenEstimator) {
+	// nil 时回退到默认字节比例估算器，避免 Check 时空指针。
 	if e == nil {
 		e = ByteRatioEstimator{}
 	}
-	w.mu.Lock()
+	w.mu.Lock()         // 加写锁：修改 estimator
+	defer w.mu.Unlock() // 函数退出时释放锁
 	w.estimator = e
-	w.mu.Unlock()
 }
 
 // normalizeConfig 对阈值做兜底修正。
 func normalizeConfig(cfg Config) Config {
+	// 软阈值非法时回退到默认配置中的软阈值。
 	if cfg.SoftLimit <= 0 {
 		cfg.SoftLimit = DefaultConfig().SoftLimit
 	}
+	// 硬阈值必须大于软阈值，否则设置为软阈值 + 600，确保决策区间存在。
 	if cfg.HardLimit <= cfg.SoftLimit {
 		cfg.HardLimit = cfg.SoftLimit + 600
 	}
@@ -240,8 +248,8 @@ func (w *Watchdog) Check(agentID string, contextText string) Decision {
 //
 // 并发安全：持读锁拷贝，可并发调用。
 func (w *Watchdog) History() []Decision {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
+	w.mu.RLock()         // 加读锁：读取 decisions
+	defer w.mu.RUnlock() // 函数退出时释放锁
 	// 预分配等长切片并 copy，确保返回的是独立副本
 	out := make([]Decision, len(w.decisions))
 	copy(out, w.decisions)
@@ -254,8 +262,8 @@ func (w *Watchdog) History() []Decision {
 //
 // 并发安全：持读锁遍历，可并发调用。
 func (w *Watchdog) LastNonOK() *Decision {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
+	w.mu.RLock()         // 加读锁：读取 decisions
+	defer w.mu.RUnlock() // 函数退出时释放锁
 	// 从尾部向前遍历，命中第一条非 OK 即返回（即时间最近的一条告警）
 	for i := len(w.decisions) - 1; i >= 0; i-- {
 		if w.decisions[i].Level != LevelOK {

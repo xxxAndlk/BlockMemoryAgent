@@ -1,3 +1,5 @@
+// Package agent 实现领域层工具注册表到 agent 层 ToolRegistry 接口的适配，
+// 避免 agent 包与 domain/tool 包之间产生循环导入。
 package agent
 
 import (

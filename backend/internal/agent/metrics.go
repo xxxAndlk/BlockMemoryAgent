@@ -1,3 +1,5 @@
+// Package agent 聚合 LLM 调用相关的统计指标，
+// 包括调用次数、超时次数以及平均/最大耗时。
 package agent
 
 import (

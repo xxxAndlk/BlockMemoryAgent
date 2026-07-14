@@ -1,8 +1,8 @@
 package model
 
 import (
-	"fmt"
-	"unicode/utf8"
+	"fmt"          // 字符串格式化
+	"unicode/utf8" // UTF-8 rune 统计
 )
 
 // EstimateTokens 粗略估算文本的 token 数量。
@@ -18,22 +18,23 @@ import (
 // 副作用：无。
 // 并发安全：纯函数。
 func EstimateTokens(text string) int {
+	// 空文本直接返回 0，避免无意义计算
 	if text == "" {
-		return 0 // 空文本直接返回 0
+		return 0
 	}
+	// 默认 token 数
 	var tokens int
 	// 第一遍粗估：遍历 rune，非 ASCII 计 1，ASCII 也计 1（后续会被 refine 修正）
 	for _, r := range text {
 		if r > 127 {
-			// 非 ASCII（中文、 emoji 等）按 1 字 1 token
+			// 非 ASCII（中文、emoji 等）按 1 字 1 token
 			tokens++
 		} else {
-			// ASCII 按 4 字符 1 token，至少 1 token
+			// ASCII 按 4 字符 1 token，先每个字符计 1（后续 refine 会总体除 4）
 			tokens += 1
 		}
 	}
-	// 对 ASCII 总体再除 4，避免每个字符都累加导致偏高的误差
-	// 重新用更精确的算法：统计 rune 数量
+	// 使用更精确的算法重算 token 数
 	return refineEstimate(text, tokens)
 }
 
@@ -47,9 +48,13 @@ func EstimateTokens(text string) int {
 //
 // 副作用：无。
 func refineEstimate(text string, rough int) int {
-	runes := utf8.RuneCountInString(text) // rune 总数
-	asciiCount := 0                       // ASCII 字符数
-	nonAsciiCount := 0                    // 非 ASCII 字符数
+	// 统计 rune 总数
+	runes := utf8.RuneCountInString(text)
+	// ASCII 字符数
+	asciiCount := 0
+	// 非 ASCII 字符数
+	nonAsciiCount := 0
+	// 遍历 rune 分类统计
 	for _, r := range text {
 		if r <= 127 {
 			asciiCount++
@@ -59,10 +64,11 @@ func refineEstimate(text string, rough int) int {
 	}
 	// ASCII 部分 4 字符 ≈ 1 token，非 ASCII 1 字符 ≈ 1 token
 	tokens := nonAsciiCount + asciiCount/4
-	// 至少返回 1（若文本非空）
+	// 若文本非空但计算结果小于 1，则至少返回 1
 	if tokens < 1 && runes > 0 {
 		tokens = 1
 	}
+	// 返回修正后的估算值（rough 参数保留以兼容旧签名）
 	return tokens
 }
 
@@ -78,7 +84,7 @@ func refineEstimate(text string, rough int) int {
 //
 // 副作用：无。
 func SummarizePrompt(prompt string, maxLen int) string {
-	// 短 prompt 直接返回
+	// 短 prompt 直接返回，无需截断
 	if len(prompt) <= maxLen {
 		return prompt
 	}

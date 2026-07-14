@@ -1,3 +1,5 @@
+// Package agent 提供基于 ReAct 引擎的 Agent 服务实现，
+// 负责会话生命周期管理与外部接口适配。
 package agent
 
 import (

@@ -19,7 +19,7 @@ import (
 type Registry struct {
 	pool *Pool // 全局 Skill 池，只读引用，用于按 ID 取 Skill
 
-	mu    sync.RWMutex
+	mu    sync.RWMutex               // 读写锁：保护 owned map 的并发访问
 	owned map[string]*types.SkillSet // owner agent instance id -> skill set
 }
 
@@ -48,11 +48,12 @@ func (r *Registry) Pool() *Pool { return r.pool }
 // 设计意图：在 Agent 构造阶段完成 SkillSet 与 Agent 实例的关联，
 // 后续 GetForAgent/AddSkillToAgent 均以此为入口。
 func (r *Registry) Bind(set *types.SkillSet) {
+	// 防御：无 OwnerAgent 无法建立映射，直接跳过。
 	if set == nil || set.OwnerAgent == "" {
-		return // 防御：无 OwnerAgent 无法建立映射
+		return
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.Lock()                   // 加写锁：修改 owned map
+	defer r.mu.Unlock()           // 函数退出时释放锁
 	r.owned[set.OwnerAgent] = set // 同 Agent 覆盖，保证最新装配生效
 }
 
@@ -62,8 +63,8 @@ func (r *Registry) Bind(set *types.SkillSet) {
 // 返回：命中的 *types.SkillSet；未绑定返回 nil。
 // 并发安全：加读锁。
 func (r *Registry) GetForAgent(agentID string) *types.SkillSet {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.RLock()         // 加读锁：只读访问 owned map
+	defer r.mu.RUnlock() // 函数退出时释放锁
 	return r.owned[agentID]
 }
 
@@ -79,21 +80,23 @@ func (r *Registry) GetForAgent(agentID string) *types.SkillSet {
 // 并发安全：加写锁，避免与 GetForAgent 并发读冲突。
 // 设计意图：为"扩展技能"分支提供运行时增量入口，无需重建整个 SkillSet。
 func (r *Registry) AddSkillToAgent(agentID, skillID string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.Lock()         // 加写锁：可能修改 set.Skills
+	defer r.mu.Unlock() // 函数退出时释放锁
 	set := r.owned[agentID]
+	// Agent 尚未绑定 SkillSet，无法追加，返回失败。
 	if set == nil {
-		return false // Agent 尚未绑定 SkillSet，无法追加
+		return false
 	}
-	// 幂等检查：Skill 已在 set 中则直接返回成功，避免重复注入
+	// 幂等检查：Skill 已在 set 中则直接返回成功，避免重复注入。
 	for _, s := range set.Skills {
 		if s.SkillID == skillID {
 			return true
 		}
 	}
 	sk := r.pool.Get(skillID) // 从全局池按 ID 取 Skill 定义
+	// 池中无此 Skill，扩展失败，返回 false。
 	if sk == nil {
-		return false // 池中无此 Skill，扩展失败
+		return false
 	}
 	set.Skills = append(set.Skills, sk) // 追加到 Agent 的 SkillSet
 	return true
@@ -108,25 +111,29 @@ func (r *Registry) AddSkillToAgent(agentID, skillID string) bool {
 //
 // 文件格式：
 //
-//	skills:
-//	  - skill_id: read_file
-//	    name: 读取文件
-//	    description: 读取本地文件返回文本
-//	    domain: code,doc
-//	    tool_ref: ReadFile
-//	    tags: [io,fs]
+//	示例 YAML 片段：
+//	  skills:                                 // 顶层 skills 列表
+//	    - skill_id: read_file                // 技能标识
+//	      name: 读取文件                      // 显示名称
+//	      description: 读取本地文件返回文本  // 功能描述
+//	      domain: code,doc                   // 适用领域
+//	      tool_ref: ReadFile                 // 关联工具
+//	      tags: [io,fs]                      // 标签
 func LoadFromYAML(path string) (*Pool, error) {
+	// 读取 yaml 文件内容；失败时包装错误返回。
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read skill yaml: %w", err)
 	}
+	// 临时结构体，仅解析顶层 skills 数组。
 	var raw struct {
 		Skills []*types.Skill `yaml:"skills"` // 仅解析顶层 skills 数组
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse skill yaml: %w", err)
 	}
-	return NewPoolFromSkills(raw.Skills), nil // 复用 NewPoolFromSkills 完成逐个注册
+	// 复用 NewPoolFromSkills 完成逐个注册。
+	return NewPoolFromSkills(raw.Skills), nil
 }
 
 // BuiltinPool 返回内置 Skill 集（覆盖当前工具执行器与常用动作）

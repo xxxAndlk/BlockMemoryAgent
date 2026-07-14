@@ -1,3 +1,5 @@
+// Package agent 提供会话事件的内部表示与事件流的辅助处理函数
+// （如调试事件裁剪、UTF-8 清理），供旧版会话存储与 ReAct 会话存储共用。
 package agent
 
 import (

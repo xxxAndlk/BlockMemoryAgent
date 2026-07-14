@@ -7,32 +7,34 @@ import (
 )
 
 // Event 工作区事件：跨 Agent 协作的原子语义消息，由 Mailbox 分发。
+// 每个事件携带类型、来源、目标与负载，消费方按 Type 走不同处理分支。
 type Event struct {
-	// ID 事件唯一标识。
+	// ID 事件唯一标识，用于去重、追踪与日志。
 	ID string `json:"id"`
 	// Type 事件类型，决定消费方的处理分支。
 	Type enums.EventType `json:"type"`
 	// SourceAgent 发起事件的 Agent ID。
 	SourceAgent string `json:"source_agent"`
-	// TargetAgent 目标 Agent ID；空表示广播。
+	// TargetAgent 目标 Agent ID；空字符串表示广播，由所有相关 Agent 消费。
 	TargetAgent string `json:"target_agent"`
-	// Payload 事件负载，结构由 Type 决定。
+	// Payload 事件负载，结构由 Type 决定，通常按约定反序列化。
 	Payload map[string]any `json:"payload"`
 	// Priority 优先级（数值越大越优先），影响 Mailbox 投递顺序。
 	Priority int `json:"priority"`
-	// CreatedAt 创建时间。
+	// CreatedAt 创建时间，用于排序与超时判断。
 	CreatedAt time.Time `json:"created_at"`
-	// Status 当前处理状态。
+	// Status 当前处理状态，记录事件在生命周期中的阶段。
 	Status enums.EventStatus `json:"status"`
 }
 
 // ChatMessage 对话消息：与用户/系统对话的逐条记录，用于上下文构造。
+// 作为 LLM Chat Completion 接口的消息单元，Role 与 OpenAI 协议对齐。
 type ChatMessage struct {
 	// Role 角色：ChatRoleSystem / ChatRoleUser / ChatRoleAssistant。
 	Role enums.ChatRole `json:"role"`
-	// Content 消息正文。
+	// Content 消息正文，直接作为 LLM 输入。
 	Content string `json:"content"`
-	// Timestamp 消息时间。
+	// Timestamp 消息时间，用于展示与时间衰减。
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -49,16 +51,18 @@ type ClarifyRequest struct {
 }
 
 // UIEvent TUI 推送事件：向 bubbletea TUI / Web SSE 订阅者广播的事件信封。
+// 发送方与消费方通过 Type 约定 Payload 结构。
 type UIEvent struct {
 	// Type 事件类型字符串，由发送方约定。
 	Type string `json:"type"`
-	// Timestamp 事件时间。
+	// Timestamp 事件时间，用于排序与展示。
 	Timestamp time.Time `json:"timestamp"`
 	// Payload 事件负载，结构由 Type 决定。
 	Payload any `json:"payload"`
 }
 
 // GraphStepPayload Graph 步骤事件负载：描述一次 Node 执行的统计信息。
+// 主要用于 UI 展示单次节点执行的耗时与 Token 消耗。
 type GraphStepPayload struct {
 	// NodeName 执行节点名（如 MetaAgent / DomainAgent）。
 	NodeName string `json:"node_name"`
@@ -75,6 +79,7 @@ type GraphStepPayload struct {
 }
 
 // AgentStatusPayload Agent 状态事件负载：向 UI 广播 Agent 运行态变化。
+// 前端据此更新 Agent 列表或详情面板。
 type AgentStatusPayload struct {
 	// AgentID Agent 实例 ID。
 	AgentID string `json:"agent_id"`
@@ -87,6 +92,7 @@ type AgentStatusPayload struct {
 }
 
 // EpisodePayload Episode 事件负载：向 UI 广播新增 Episode 的精简信息。
+// 让前端无需读取完整记忆即可展示最新执行摘要。
 type EpisodePayload struct {
 	// AgentID 产出 Episode 的 Agent。
 	AgentID string `json:"agent_id"`
@@ -105,6 +111,7 @@ type EpisodePayload struct {
 }
 
 // EventPayload Event 事件负载：向 UI 广播工作区事件的精简信息。
+// 用于事件列表或通知面板展示。
 type EventPayload struct {
 	// ID 事件 ID。
 	ID string `json:"id"`
@@ -119,6 +126,7 @@ type EventPayload struct {
 }
 
 // StatsView 统计面板数据：供 TUI / Web 展示的运行时统计快照。
+// 由后台定时聚合后推送到前端。
 type StatsView struct {
 	// TopicID 所属话题。
 	TopicID string `json:"topic_id"`

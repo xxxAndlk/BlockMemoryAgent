@@ -61,6 +61,7 @@ func NewLoader(path string) *Loader {
 //
 // 并发安全：原子写，与并发读互不阻塞。
 func (l *Loader) Load() error {
+	// 读取 soul.md 完整内容；失败时直接返回错误，保持 current 不变。
 	data, err := os.ReadFile(l.path)
 	if err != nil {
 		return err
@@ -158,21 +159,23 @@ func (l *Loader) Temperature(kind TaskKind, base float64) float64 {
 
 // SetClassifier 设置任务类别分类策略；传入 nil 时恢复默认。
 func (l *Loader) SetClassifier(c TaskKindClassifier) {
+	// nil 时回退到默认关键词分类器，避免后续 Classify 空指针。
 	if c == nil {
 		c = KeywordClassifier{}
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.Lock()         // 加写锁：修改 classifier 字段
+	defer l.mu.Unlock() // 函数退出时释放锁
 	l.classifier = c
 }
 
 // SetTemperaturePolicy 设置温度策略；传入 nil 时恢复默认。
 func (l *Loader) SetTemperaturePolicy(tp TemperaturePolicy) {
+	// nil 时回退到默认温度策略，避免后续 Temperature 空指针。
 	if tp == nil {
 		tp = NewDefaultTemperaturePolicy()
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.Lock()         // 加写锁：修改 temperature 字段
+	defer l.mu.Unlock() // 函数退出时释放锁
 	l.temperature = tp
 }
 
@@ -207,6 +210,7 @@ var (
 // 返回：0~1 之间的推荐 temperature。
 // 副作用：无。并发安全：纯函数。
 func Temperature(kind TaskKind, base float64) float64 {
+	// 委托给包级默认温度策略，保持与旧调用方兼容。
 	return defaultTemperaturePolicy.Temperature(kind, base)
 }
 
@@ -220,5 +224,6 @@ func Temperature(kind TaskKind, base float64) float64 {
 // 返回：推断出的 TaskKind；无匹配时返回 KindGeneric。
 // 副作用：无。并发安全：纯函数。
 func InferKind(text string) TaskKind {
+	// 委托给包级默认分类器，保持与旧调用方兼容。
 	return defaultClassifier.Classify(text)
 }

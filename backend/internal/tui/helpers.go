@@ -20,10 +20,12 @@ import (
 // tool_output 含 ANSI（如 colored log）会让 bubbletea 渲染错位。
 var ansiRegex = regexp.MustCompile("\x1b\\[[0-9;]*[A-Za-z]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)|\x1b[@-Z\\-_]")
 
+// stripANSI 移除字符串中的 ANSI 转义序列，避免渲染错位。
 func stripANSI(s string) string {
 	return ansiRegex.ReplaceAllString(s, "")
 }
 
+// flashMsg 设置一条 2 秒后过期的闪屏提示，使用互斥锁保证并发安全（T2 修复）。
 func (m *Model) flashMsg(msg string) {
 	// 加锁保护：postJSON/createSession 后台 goroutine 与主循环 View 并发读写 flash（T2 修复）
 	m.flashMu.Lock()
@@ -32,13 +34,14 @@ func (m *Model) flashMsg(msg string) {
 	m.flashMu.Unlock()
 }
 
+// hasPlan 判断当前是否可展示计划弹窗；只要有激活会话即认为有计划（包括 direct_tool 的合成计划）。
 func (m *Model) hasPlan() bool {
 	// 只要有激活会话就认为有计划可展示（包括 direct_tool 的合成计划），
 	// 避免计划弹窗在大多数会话里被禁用。
 	return m.selectedSession() != nil
 }
 
-// showChatDetail opens a popup with the full content of the selected chat item.
+// showChatDetail 打开当前选中对话条目的详情弹窗，展示完整内容。
 func (m *Model) showChatDetail() {
 	s := m.selectedSession()
 	if s == nil {
@@ -58,6 +61,7 @@ func (m *Model) showChatDetail() {
 	m.overlayPanel.open(item.title, strings.Split(detail, "\n"))
 }
 
+// boardSnapshot 通过 agent facade 查询指定会话的看板快照，失败时返回空快照。
 func (m *Model) boardSnapshot(sessionID string) board.Snapshot {
 	if m.agent == nil || sessionID == "" {
 		return board.Snapshot{}
@@ -73,6 +77,7 @@ func (m *Model) boardSnapshot(sessionID string) board.Snapshot {
 	return snap
 }
 
+// showPlanDetailByIndex 打开指定索引计划任务的详情弹窗。
 func (m *Model) showPlanDetailByIndex(idx int) {
 	s := m.selectedSession()
 	if s == nil {
@@ -98,6 +103,7 @@ func (m *Model) showPlanDetailByIndex(idx int) {
 	m.overlayPanel.open("Plan Task", lines)
 }
 
+// showAgentDetailByIndex 打开指定索引 Agent 节点的详情弹窗。
 func (m *Model) showAgentDetailByIndex(idx int) {
 	if idx < 0 || idx >= len(m.agentTreePanel.nodes) {
 		return
@@ -118,16 +124,23 @@ func (m *Model) showAgentDetailByIndex(idx int) {
 	m.overlayPanel.open("Agent", lines)
 }
 
+// chatItem 表示对话区可展示的一项，可以是消息或事件。
 type chatItem struct {
-	title     string
-	detail    string // 主对话区展示的 compact 详情（工具输出可能被截断）
-	rawDetail string // 完整详情，用于弹窗/完整记录面板
+	// title 是主对话区展示的主要文本。
+	title string
+	// detail 是主对话区展示的 compact 详情（工具输出可能被截断）。
+	detail string
+	// rawDetail 是完整详情，用于弹窗/完整记录面板。
+	rawDetail string
+	// timestamp 是消息/事件发生时间，用于排序与时间戳显示。
 	timestamp time.Time
-	isEvent   bool           // true 表示来自 SessionEvent，false 表示来自 ChatMessage
-	role      enums.ChatRole // 仅对 ChatMessage 有效
+	// isEvent 为 true 表示来自 SessionEvent，false 表示来自 ChatMessage。
+	isEvent bool
+	// role 仅对 ChatMessage 有效，标识消息角色。
+	role enums.ChatRole
 }
 
-// buildPlanLines renders the current session's TaskBoard as flat lines for the popup.
+// buildPlanLines 将当前会话的任务看板渲染为弹窗用的扁平行列表。
 func (m *Model) buildPlanLines() []string {
 	s := m.selectedSession()
 	var snap board.Snapshot
@@ -166,6 +179,7 @@ func (m *Model) buildPlanLines() []string {
 		}
 	}
 
+	// 统计完成数量。
 	done, total := 0, len(snap.Tasks)
 	for _, t := range snap.Tasks {
 		if t.Status == board.TaskDone {
@@ -177,6 +191,7 @@ func (m *Model) buildPlanLines() []string {
 		fmt.Sprintf("Progress: %d/%d", done, total),
 		"",
 	}
+	// 每条任务一行，当前光标处加上选中标记。
 	for i, t := range snap.Tasks {
 		marker := " "
 		if i == m.overlayPanel.cursor {
@@ -187,13 +202,14 @@ func (m *Model) buildPlanLines() []string {
 	return lines
 }
 
-// buildAgentsLines renders the agent topology as flat lines for the popup.
+// buildAgentsLines 将 Agent 拓扑渲染为弹窗用的扁平行列表。
 func (m *Model) buildAgentsLines() []string {
 	if len(m.agentTreePanel.nodes) == 0 {
 		return []string{"(no agents)"}
 	}
 	var lines []string
 	for i, node := range m.agentTreePanel.nodes {
+		// 缩进由深度决定。
 		prefix := strings.Repeat("  ", node.depth)
 		var icon string
 		switch node.roleType {
@@ -222,13 +238,16 @@ func (m *Model) buildAgentsLines() []string {
 	return lines
 }
 
+// chatItems 将会话消息与关键事件合并为可展示的 chatItem 列表，按时间戳稳定排序，
+// 并在 compact=true 时进行聚合与去重处理。
 func chatItems(s *server.Session, compact bool) []chatItem {
-	// TUI chat interleaves conversation messages with key Agent events
-	// (tool calls, LLM/think output, errors), merged by timestamp so the ReAct
-	// sequence (think → tool → result → next think) is visible. Pure-debug
-	// events (token_usage/graph_step/agent_created/prompt/stats) are filtered
-	// to keep the view readable.
+	// TUI 对话区按时间戳交错展示会话消息与关键 Agent 事件
+	// （tool_call、LLM/思考输出、错误等），使 ReAct 序列
+	// （思考 → 工具 → 结果 → 下一步思考）清晰可见。调试类事件
+	// （token_usage/graph_step/agent_created/prompt/stats）已被过滤，
+	// 以保持界面可读。
 	var items []chatItem
+	// 遍历 ChatMessage，根据角色生成 title。
 	for _, msg := range s.Messages {
 		// v2.5：用户输入前缀 ">"，助手回复普通文本，
 		// 初始 "Goal: ..." 系统提示作为噪声过滤。
@@ -275,6 +294,7 @@ func chatItems(s *server.Session, compact bool) []chatItem {
 		recallKeep[recallIdxs[k]] = true
 	}
 
+	// 遍历事件，转换为 chatItem。
 	for i, ev := range s.Events {
 		// 超出限额的 memory_recall 不内联展示（仍在右侧 Agent 面板的 Memory 区可见）
 		if ev.Kind == "memory_recall" && !recallKeep[i] {
@@ -367,6 +387,7 @@ func aggregateToolEvents(items []chatItem) []chatItem {
 		}
 		paths := []string{}
 		j := i
+		// 向后查找连续的同一工具完成事件。
 		for j < len(items) {
 			nextTool, ok := collapsibleToolTitle(items[j])
 			if !ok || nextTool != tool {
@@ -498,6 +519,7 @@ func truncateToolOutput(output string, maxLines int) string {
 // 返回 ok=false 表示该事件类型不展示（调试噪声）。
 func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDetail string, ok bool) {
 	switch {
+	// 工具执行/调用事件。
 	case ev.Type == "tool_exec" || ev.Kind == "tool_call":
 		tool := ev.Tool
 		if tool == "" {
@@ -563,9 +585,11 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 			detail = rawDetail
 		}
 		return title, detail, rawDetail, true
+	// 记忆召回事件。
 	case ev.Kind == "memory_recall":
 		title = "🧠 recalled: " + strings.TrimSpace(ev.Message)
 		return title, "", title, true
+	// 话题切换事件。
 	case ev.Kind == "topic_switch":
 		msg := ev.Message
 		if msg == "" {
@@ -573,6 +597,7 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		}
 		title = "─── " + msg + " ───"
 		return title, "", title, true
+	// LLM/思考/等待等事件。
 	case ev.Kind == "llm_result" || ev.Kind == "think" || ev.Kind == "llm" || ev.Kind == "intend" || ev.Kind == "wait":
 		agent := ev.Agent
 		if agent == "" {
@@ -580,6 +605,7 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		}
 		title = agent + ": " + ev.Message
 		return title, "", title, true
+	// Agent 完成事件。
 	case ev.Type == "agent_done":
 		agent := ev.Agent
 		if agent == "" {
@@ -587,6 +613,7 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		}
 		title = agent + " 完成: " + ev.Message
 		return title, "", title, true
+	// 系统事件：只展示会话完成总结。
 	case ev.Type == "system":
 		// 只展示会话完成总结，避免 "会话启动/继续执行" 等噪声淹没对话。
 		if strings.Contains(ev.Message, "会话完成") {
@@ -599,6 +626,7 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 			return title, "", title, true
 		}
 		return "", "", "", false
+	// 错误事件。
 	case ev.Kind == "error" || ev.Type == "error":
 		title = "✗ Error: " + ev.Message
 		return title, "", title, true
@@ -606,8 +634,8 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 	return "", "", "", false
 }
 
-// formatMarkdown applies light Markdown formatting for the chat view.
-// Supports: headers, bold, italic, inline code, code blocks, lists, blockquotes.
+// formatMarkdown 对聊天文本做轻量 Markdown 格式化，支持标题、加粗、斜体、行内代码、
+// 代码块、列表、引用等。
 // 行级状态机：按行扫描，遇 ``` 切换 inCodeBlock；代码块内原样累积，块外按行类型渲染。
 func formatMarkdown(text string) string {
 	var out []string
@@ -693,21 +721,20 @@ func formatMarkdown(text string) string {
 	return strings.Join(out, "\n")
 }
 
-// applyInlineMarkdown handles **bold**, *italic*, and `inline code`.
+// applyInlineMarkdown 处理行内 Markdown：**粗体**、*斜体*、`行内代码`。
 // 顺序很重要：先处理 `code`（避免其中 ** 被吃掉），再 **bold，最后 *italic。
 // 这样 ** 会优先于 * 被匹配，避免 bold 内容被识别成 italic。
 func applyInlineMarkdown(text string, bold, italic, code lipgloss.Style) string {
-	// Inline code
+	// 行内代码
 	text = replacePairs(text, "`", func(s string) string { return code.Render(s) })
-	// Bold
+	// 粗体
 	text = replacePairs(text, "**", func(s string) string { return bold.Render(s) })
-	// Italic (single asterisks not already consumed by bold)
+	// 斜体（未被粗体消耗的单星号）
 	text = replacePairs(text, "*", func(s string) string { return italic.Render(s) })
 	return text
 }
 
-// replacePairs replaces matching pairs of markers with the result of f(content).
-// 简易成对替换：找到首个 marker 作为开标记，再找其后第一个 marker 作为闭标记，
+// replacePairs 简易成对替换：找到首个 marker 作为开标记，再找其后第一个 marker 作为闭标记，
 // 把中间内容传给 f 渲染；循环到没有配对为止。不支持嵌套。
 func replacePairs(text, marker string, f func(string) string) string {
 	for {
@@ -784,6 +811,7 @@ func formatDurationShort(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
+// statusIcon 将状态字符串映射为展示图标，用于计划栏、Agent 栏等。
 func statusIcon(status string) string {
 	switch status {
 	case "running", string(enums.RoleStatusActive), string(board.TaskInProgress):
@@ -803,7 +831,7 @@ func statusIcon(status string) string {
 
 // agentStatusBadge 把 Agent 状态渲染成短标签徽章，用于 Agent 编排栏。
 // formatTopBar 按 v2.0 格式渲染顶部状态栏：
-// BlockMemoryAgent > {sessionID}  ●running  {N} agents active  in:{in} out:{out}
+// 示例输出：BlockMemoryAgent > {sessionID}  ●running  {N} agents active  in:{in} out:{out}
 func formatTopBar(styles *Styles, sessionID, status string, agentCount, inTokens, outTokens int) string {
 	if sessionID == "" {
 		sessionID = "-"
@@ -826,8 +854,7 @@ func formatTopBar(styles *Styles, sessionID, status string, agentCount, inTokens
 	return left + mid + right
 }
 
-// formatPlanBar 渲染计划进度栏。
-// 有任务看板时显示当前计划步骤与进度；无计划时显示 [direct] 直接回答。
+// formatPlanBar 渲染计划进度栏。有任务看板时显示当前计划步骤与进度；无计划时显示 [direct] 直接回答。
 func formatPlanBar(styles *Styles, snap board.Snapshot, toolLabel string) string {
 	if len(snap.Tasks) == 0 {
 		// 无 plan 时：若仍有工具在执行，展示工具状态（文档 §2.3 "plan 进度+工具状态"）
@@ -836,6 +863,7 @@ func formatPlanBar(styles *Styles, snap board.Snapshot, toolLabel string) string
 		}
 		return styles.Dim.Render("[direct] 直接回答")
 	}
+	// 统计已完成数与当前步骤索引。
 	done := 0
 	current := 0
 	for i, t := range snap.Tasks {
@@ -908,6 +936,7 @@ func recentMemoryRecalls(s *server.Session, limit int) []string {
 		limit = 3
 	}
 	var out []string
+	// 从后向前遍历，最多取 limit 条非空记忆召回。
 	for i := len(s.Events) - 1; i >= 0 && len(out) < limit; i-- {
 		ev := s.Events[i]
 		if ev.Kind == "memory_recall" && strings.TrimSpace(ev.Message) != "" {

@@ -1,3 +1,5 @@
+// Package agent 实现单代理的 ReAct（推理-行动）循环：
+// LLM 生成 -> 工具调用 -> 工具结果 -> 重复，直到产生最终答案或达到迭代上限。
 package agent
 
 import (

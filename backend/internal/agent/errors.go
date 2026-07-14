@@ -1,3 +1,5 @@
+// Package agent 声明 agent 模块对外暴露的预定义错误，
+// 调用方可通过 errors.Is 进行精确匹配与统一错误处理。
 package agent
 
 // import 标准库的 errors 包，用于创建预定义的哨兵错误。

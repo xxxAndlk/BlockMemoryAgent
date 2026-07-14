@@ -18,26 +18,34 @@ type SnapshotStore struct {
 
 // Save 保存 Agent 快照 (UPSERT)。
 // 参数:
+//   - ctx:      请求上下文。
 //   - snapshot: 含 AgentID/TopicID 与完整上下文状态
 //
 // 返回: SQL 执行错误。
 // 设计意图: 每个 (agent, topic) 仅保留一份最新快照,供热加载使用。
 // 副作用: ON CONFLICT 命中主键则更新 snapshot 与 updated_at。
 func (s *SnapshotStore) Save(ctx context.Context, snapshot *types.AgentSnapshot) error {
+	// 将快照整体序列化为 JSON，存入 JSONB 列
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
+	// 使用 (agent_id, topic_id) 唯一约束实现 UPSERT
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO agent_snapshots (agent_id, topic_id, snapshot, updated_at)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (agent_id, topic_id)
-		DO UPDATE SET snapshot = $3, updated_at = $4
-	`, snapshot.AgentID, snapshot.TopicID, data, time.Now())
+			INSERT INTO agent_snapshots (agent_id, topic_id, snapshot, updated_at)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (agent_id, topic_id)
+			DO UPDATE SET snapshot = $3, updated_at = $4
+		`, snapshot.AgentID, snapshot.TopicID, data, time.Now())
 	return err
 }
 
 // Get 读取 Agent 快照。
+// 参数:
+//   - ctx:     请求上下文。
+//   - agentID: Agent ID。
+//   - topicID: 话题 ID。
+//
 // 返回:
 //   - *types.AgentSnapshot: 命中时返回;不存在时返回 (nil, nil)
 //   - error: 其他 SQL/反序列化错误
@@ -45,10 +53,11 @@ func (s *SnapshotStore) Save(ctx context.Context, snapshot *types.AgentSnapshot)
 // 设计意图: 配合 Redis 缓存做热加载,未命中时回源 PG。
 func (s *SnapshotStore) Get(ctx context.Context, agentID, topicID string) (*types.AgentSnapshot, error) {
 	var raw []byte
+	// 查询单条 snapshot JSONB
 	err := s.db.QueryRowContext(ctx, `
-		SELECT snapshot FROM agent_snapshots
-		WHERE agent_id = $1 AND topic_id = $2
-	`, agentID, topicID).Scan(&raw)
+			SELECT snapshot FROM agent_snapshots
+			WHERE agent_id = $1 AND topic_id = $2
+		`, agentID, topicID).Scan(&raw)
 	// 行不存在视为正常情况,返回 (nil, nil)
 	if err == sql.ErrNoRows {
 		return nil, nil

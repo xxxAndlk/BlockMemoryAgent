@@ -1,7 +1,7 @@
 package plugins
 
 import (
-	"context"
+	"context" // 上下文，用于知识检索取消与超时
 )
 
 // Chunk 表示一段检索到的知识片段。

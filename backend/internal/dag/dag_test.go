@@ -1,22 +1,26 @@
 package dag
 
 import (
-	"context"
-	"testing"
-	"time"
+	"context" // 测试用上下文
+	"testing" // Go 测试框架
+	"time"    // 时间构造与比较
 )
 
-// TestCloneTaskMatchesJSONDeepCopy verifies that cloneTask produces the same
-// semantics as the previous JSON Marshal/Unmarshal deep copy, except that nil
-// slices are explicitly preserved (which JSON also does, but we make it
-// explicit and deterministic).
+// TestCloneTaskMatchesJSONDeepCopy 验证 cloneTask 产生的语义与之前
+// JSON 序列化/反序列化深拷贝一致，同时显式保证 nil 切片与空切片被原样保留。
+//
+// 覆盖场景：
+//   - depends_on 为 nil
+//   - depends_on 为空切片
+//   - depends_on 含多个依赖且时间指针非空
 func TestCloneTaskMatchesJSONDeepCopy(t *testing.T) {
+	// 构造固定的 UTC 时间，避免时区导致比较失败
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	later := now.Add(time.Hour)
 
 	cases := []struct {
-		name string
-		orig *Task
+		name string // 用例名称
+		orig *Task  // 原始 task
 	}{
 		{
 			name: "nil depends_on",
@@ -50,13 +54,16 @@ func TestCloneTaskMatchesJSONDeepCopy(t *testing.T) {
 		},
 	}
 
+	// 遍历所有测试用例
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cp := cloneTask(tc.orig)
 
+			// 深拷贝必须返回不同指针
 			if cp == tc.orig {
 				t.Fatal("cloneTask returned the same pointer")
 			}
+			// 标量字段必须保持一致
 			if cp.ID != tc.orig.ID {
 				t.Errorf("ID mismatch: got %q, want %q", cp.ID, tc.orig.ID)
 			}
@@ -70,20 +77,21 @@ func TestCloneTaskMatchesJSONDeepCopy(t *testing.T) {
 				t.Errorf("SessionID mismatch: got %q, want %q", cp.SessionID, tc.orig.SessionID)
 			}
 
-			// nil vs empty slice must be preserved exactly.
+			// nil 与空切片的 nil-ness 必须原样保留
 			if (cp.DependsOn == nil) != (tc.orig.DependsOn == nil) {
 				t.Errorf("DependsOn nil-ness changed: got nil=%v, want nil=%v", cp.DependsOn == nil, tc.orig.DependsOn == nil)
 			}
 			if len(cp.DependsOn) != len(tc.orig.DependsOn) {
 				t.Fatalf("DependsOn length mismatch: got %d, want %d", len(cp.DependsOn), len(tc.orig.DependsOn))
 			}
+			// 逐个元素比较依赖 ID
 			for i := range tc.orig.DependsOn {
 				if cp.DependsOn[i] != tc.orig.DependsOn[i] {
 					t.Errorf("DependsOn[%d] mismatch: got %q, want %q", i, cp.DependsOn[i], tc.orig.DependsOn[i])
 				}
 			}
 
-			// Pointer fields: values equal but distinct pointers.
+			// 指针字段：值相等但指针地址不同
 			if (cp.StartedAt == nil) != (tc.orig.StartedAt == nil) {
 				t.Errorf("StartedAt nil-ness changed")
 			}
@@ -110,12 +118,14 @@ func TestCloneTaskMatchesJSONDeepCopy(t *testing.T) {
 	}
 }
 
-// TestCloneDAGMatchesJSONDeepCopy verifies cloneDAG semantics against the
-// previous JSON round-trip behavior.
+// TestCloneDAGMatchesJSONDeepCopy 验证 cloneDAG 语义与之前 JSON 往返行为一致。
+//
+// 校验点：标量字段不变、时间字段相等、每个 Task 都是独立深拷贝。
 func TestCloneDAGMatchesJSONDeepCopy(t *testing.T) {
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	later := now.Add(2 * time.Hour)
 
+	// 构造包含多种 depends_on 情况的测试 DAG
 	orig := &DAG{
 		ID:        "dag-1",
 		Name:      "test dag",
@@ -132,21 +142,26 @@ func TestCloneDAGMatchesJSONDeepCopy(t *testing.T) {
 
 	cp := cloneDAG(orig)
 
+	// 必须返回不同指针
 	if cp == orig {
 		t.Fatal("cloneDAG returned the same pointer")
 	}
+	// 标量字段必须一致
 	if cp.ID != orig.ID || cp.Name != orig.Name || cp.Cron != orig.Cron || cp.Enabled != orig.Enabled {
 		t.Errorf("scalar fields changed: got %+v, want %+v", cp, orig)
 	}
+	// 时间字段必须相等
 	if !cp.CreatedAt.Equal(orig.CreatedAt) {
 		t.Errorf("CreatedAt mismatch: got %v, want %v", cp.CreatedAt, orig.CreatedAt)
 	}
 	if !cp.UpdatedAt.Equal(orig.UpdatedAt) {
 		t.Errorf("UpdatedAt mismatch: got %v, want %v", cp.UpdatedAt, orig.UpdatedAt)
 	}
+	// Task 数量一致
 	if len(cp.Tasks) != len(orig.Tasks) {
 		t.Fatalf("Tasks length mismatch: got %d, want %d", len(cp.Tasks), len(orig.Tasks))
 	}
+	// 每个 Task 都是独立深拷贝
 	for i, want := range orig.Tasks {
 		got := cp.Tasks[i]
 		if got == want {
@@ -161,8 +176,7 @@ func TestCloneDAGMatchesJSONDeepCopy(t *testing.T) {
 	}
 }
 
-// TestCloneDAGIndependence ensures mutations on the clone do not affect the
-// original DAG.
+// TestCloneDAGIndependence 确保修改克隆后的 DAG 不会影响原始 DAG。
 func TestCloneDAGIndependence(t *testing.T) {
 	orig := &DAG{
 		ID: "dag-2",
@@ -174,7 +188,7 @@ func TestCloneDAGIndependence(t *testing.T) {
 
 	cp := cloneDAG(orig)
 
-	// Mutate clone.
+	// 修改副本：变更 Goal、追加依赖、设置时间指针
 	cp.Tasks[0].Goal = "mutated"
 	cp.Tasks[0].DependsOn = append(cp.Tasks[0].DependsOn, "c")
 	cp.Tasks[1].StartedAt = &time.Time{}
@@ -182,6 +196,7 @@ func TestCloneDAGIndependence(t *testing.T) {
 		cp.Tasks[0].StartedAt = &time.Time{}
 	}
 
+	// 验证原始对象未被污染
 	if orig.Tasks[0].Goal != "do a" {
 		t.Errorf("original Goal mutated: got %q", orig.Tasks[0].Goal)
 	}
@@ -193,8 +208,7 @@ func TestCloneDAGIndependence(t *testing.T) {
 	}
 }
 
-// TestTopoSortDeterminism verifies that TopoSort is deterministic by sorting
-// ready nodes by ID.
+// TestTopoSortDeterminism 验证 TopoSort 按 ID 排序就绪节点，输出结果稳定。
 func TestTopoSortDeterminism(t *testing.T) {
 	d := &DAG{
 		ID: "dag",
@@ -209,10 +223,12 @@ func TestTopoSortDeterminism(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TopoSort failed: %v", err)
 	}
+	// 提取排序后的 ID 列表
 	ids := make([]string, len(got))
 	for i, tsk := range got {
 		ids[i] = tsk.ID
 	}
+	// 期望顺序：a -> m -> z
 	want := []string{"a", "m", "z"}
 	for i := range want {
 		if ids[i] != want[i] {
@@ -221,21 +237,24 @@ func TestTopoSortDeterminism(t *testing.T) {
 	}
 }
 
-// TestTopoSortErrors checks duplicate IDs, missing dependencies, and cycles.
+// TestTopoSortErrors 检查重复 ID、缺失依赖与环三种错误场景。
 func TestTopoSortErrors(t *testing.T) {
 	t.Run("duplicate id", func(t *testing.T) {
+		// 两个 task 使用相同 ID，应报错
 		d := &DAG{Tasks: []*Task{{ID: "a"}, {ID: "a"}}}
 		if _, err := d.TopoSort(); err == nil {
 			t.Error("expected error for duplicate task id")
 		}
 	})
 	t.Run("missing dependency", func(t *testing.T) {
+		// 依赖指向不存在的 task，应报错
 		d := &DAG{Tasks: []*Task{{ID: "a", DependsOn: []string{"missing"}}}}
 		if _, err := d.TopoSort(); err == nil {
 			t.Error("expected error for missing dependency")
 		}
 	})
 	t.Run("cycle", func(t *testing.T) {
+		// a <-> b 形成环，应报错且 HasCycle 返回 true
 		d := &DAG{Tasks: []*Task{
 			{ID: "a", DependsOn: []string{"b"}},
 			{ID: "b", DependsOn: []string{"a"}},
@@ -249,12 +268,14 @@ func TestTopoSortErrors(t *testing.T) {
 	})
 }
 
-// TestDAGRunnerDispatchesReadyTasks verifies that DAGRunner clones the DAG,
-// topologically sorts it, and launches tasks whose dependencies are satisfied.
+// TestDAGRunnerDispatchesReadyTasks 验证 DAGRunner 会克隆 DAG、拓扑排序，
+// 并仅派发依赖已满足的任务。
 func TestDAGRunnerDispatchesReadyTasks(t *testing.T) {
+	// 记录被派发的 goal
 	launches := []string{}
 	rl := &recordingLauncher{launched: &launches}
 
+	// 构造 DAG：a 无依赖，b/c 都依赖 a；本次 runner 只应派发 a
 	d := &DAG{
 		ID: "runner-dag",
 		Tasks: []*Task{
@@ -269,12 +290,13 @@ func TestDAGRunnerDispatchesReadyTasks(t *testing.T) {
 		t.Fatalf("Run failed: %v", err)
 	}
 
+	// 只有 task a 被派发
 	if len(launches) != 1 || launches[0] != "goal a" {
 		t.Errorf("expected only task a to be launched, got %v", launches)
 	}
 }
 
-// TestDAGRunnerReturnsTopoError ensures Run returns an error for cyclic DAGs.
+// TestDAGRunnerReturnsTopoError 确保 Run 对含环 DAG 返回错误。
 func TestDAGRunnerReturnsTopoError(t *testing.T) {
 	d := &DAG{
 		ID: "runner-cycle",
@@ -289,10 +311,13 @@ func TestDAGRunnerReturnsTopoError(t *testing.T) {
 	}
 }
 
+// recordingLauncher 是一个测试用的 SessionLauncher 实现，
+// 将被派发的 goal 追加到 launched 切片中。
 type recordingLauncher struct {
-	launched *[]string
+	launched *[]string // 记录所有 LaunchSession 收到的 goal
 }
 
+// LaunchSession 记录 goal 并返回 goal + "-session" 作为伪 sessionID。
 func (r *recordingLauncher) LaunchSession(goal string) string {
 	if r.launched != nil {
 		*r.launched = append(*r.launched, goal)
@@ -300,19 +325,18 @@ func (r *recordingLauncher) LaunchSession(goal string) string {
 	return goal + "-session"
 }
 
-// TestSchedulerStopWaitsForLoop ensures Stop waits for the loop goroutine to
-// exit and can be called multiple times without panic.
+// TestSchedulerStopWaitsForLoop 验证 Stop 会等待 loop goroutine 退出，
+// 且可多次调用而不会 panic 或永久阻塞。
 func TestSchedulerStopWaitsForLoop(t *testing.T) {
 	s := NewScheduler(&fakeStore{}, &fakeLauncher{}, 0)
 	s.Start(t.Context())
 
-	// Give loop a moment to start.
+	// 给 loop 一点启动时间
 	time.Sleep(10 * time.Millisecond)
 
 	s.Stop()
 
-	// WaitGroup should have been decremented; a second Stop must not block
-	// forever and must not panic on closed channel.
+	// WaitGroup 应该已经归零；第二次 Stop 不能永久阻塞，也不能重复关闭 channel panic
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -321,12 +345,13 @@ func TestSchedulerStopWaitsForLoop(t *testing.T) {
 
 	select {
 	case <-done:
-		// ok
+		// 符合预期
 	case <-time.After(time.Second):
 		t.Fatal("second Stop blocked")
 	}
 }
 
+// fakeStore 是 Store 接口的测试桩，所有方法返回 nil 错误。
 type fakeStore struct{}
 
 func (fakeStore) SaveDAG(context.Context, *DAG) error          { return nil }
@@ -334,6 +359,7 @@ func (fakeStore) GetDAG(context.Context, string) (*DAG, error) { return nil, nil
 func (fakeStore) ListDAGs(context.Context) ([]*DAG, error)     { return nil, nil }
 func (fakeStore) DeleteDAG(context.Context, string) error      { return nil }
 
+// fakeLauncher 是 SessionLauncher 接口的测试桩，总是返回空字符串。
 type fakeLauncher struct{}
 
 func (fakeLauncher) LaunchSession(string) string { return "" }

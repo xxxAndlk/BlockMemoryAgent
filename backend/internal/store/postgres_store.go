@@ -61,7 +61,9 @@ func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 	// 连接最长存活 1 小时,促进后端重新负载均衡
 	db.SetConnMaxLifetime(time.Hour)
 
-	s := &PostgresStore{db: db, dim: 768} // 默认 768 维，可通过 SetEmbeddingDim 覆盖
+	// 初始化复合存储，默认 768 维；可通过 SetEmbeddingDim 覆盖
+	s := &PostgresStore{db: db, dim: 768}
+	// 装配各子存储，Knowledge 需要反向引用 PostgresStore 以复用 Embed 能力
 	s.Episode = &EpisodeStore{db: db}
 	s.Snapshot = &SnapshotStore{db: db}
 	s.Knowledge = &KnowledgeStore{db: db, pg: s}
@@ -74,6 +76,8 @@ func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 // SetEmbeddingDim 设置向量维度（H6 修复：原块记忆硬编码 768，
 // 不随 config.PgVector.Dimensions 走，导致维度不匹配时 pgvector 查询报错）。
 // 必须在 SaveKnowledge / SearchKnowledge 之前调用，且需与 schema 中 VECTOR(N) 一致。
+// 参数:
+//   - dim: 目标维度，仅正数生效。
 func (s *PostgresStore) SetEmbeddingDim(dim int) {
 	if dim > 0 {
 		s.dim = dim
@@ -81,6 +85,7 @@ func (s *PostgresStore) SetEmbeddingDim(dim int) {
 }
 
 // EmbeddingDim 返回当前向量维度。
+// 返回值: 正数维度；未设置或设置无效时返回 768 默认值。
 func (s *PostgresStore) EmbeddingDim() int {
 	if s.dim > 0 {
 		return s.dim
@@ -91,25 +96,37 @@ func (s *PostgresStore) EmbeddingDim() int {
 // SetEmbedder 注入文本嵌入实现（P3-3）。
 // 注入后 SearchKnowledge / SearchBlockMemory 等将向量化委托给该实现；
 // nil 时仍使用兼容旧行为的 embed.PseudoEmbed。
+// 参数:
+//   - e: 嵌入器接口实现。
 func (s *PostgresStore) SetEmbedder(e embed.Embedder) {
 	s.embedder = e
 }
 
 // Embed 实现 memory.BlockMemorySearcher 接口，将查询文本编码为向量。
 // 优先使用注入的 embedder，否则回退 embed.PseudoEmbed。
+// 参数:
+//   - ctx: 请求上下文。
+//   - text: 待编码文本。
+//
+// 返回: 浮点向量与错误。
 func (s *PostgresStore) Embed(ctx context.Context, text string) ([]float32, error) {
 	if s.embedder != nil {
+		// 注入外部嵌入服务时使用外部实现
 		return s.embedder.Embed(ctx, text)
 	}
+	// 无外部实现时回退到本地伪嵌入，保证离线可用
 	return embed.PseudoEmbed(text, s.EmbeddingDim()), nil
 }
 
 // SetSearchBlockMemoryMaxTokens 设置块记忆检索摘要的 token 上限。
+// 参数:
+//   - n: 最大 token 数。
 func (s *PostgresStore) SetSearchBlockMemoryMaxTokens(n int) {
 	s.searchBlockMemoryMaxTokens = n
 }
 
 // SearchBlockMemoryMaxTokens 实现 memory.BlockMemorySearcher 接口。
+// 返回值: 当前配置的 token 上限。
 func (s *PostgresStore) SearchBlockMemoryMaxTokens() int {
 	return s.searchBlockMemoryMaxTokens
 }
@@ -123,6 +140,7 @@ func (s *PostgresStore) Close() error {
 
 // DB 暴露原始 *sql.DB 连接,用于迁移脚本或外部工具。
 // 设计意图: 让 main.go 在启动时执行 schema 迁移而无需暴露内部字段。
+// 返回: 底层 *sql.DB。
 func (s *PostgresStore) DB() *sql.DB {
 	return s.db
 }

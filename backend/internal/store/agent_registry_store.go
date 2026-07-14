@@ -14,6 +14,7 @@ type AgentRegistryStore struct {
 
 // Register 注册或更新 Agent 元信息 (UPSERT)。
 // 参数:
+//   - ctx:          请求上下文。
 //   - id, name, description, moduleID: 基础标识
 //   - keywords, dependencies, capabilities: 三个标签切片,分别序列化为 JSONB
 //
@@ -25,22 +26,25 @@ func (s *AgentRegistryStore) Register(ctx context.Context, id, name, description
 	deps, _ := json.Marshal(dependencies)
 	caps, _ := json.Marshal(capabilities)
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO agent_registry (id, name, description, module_id, keywords, dependencies, capabilities, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-		ON CONFLICT (id) DO UPDATE
-		SET name = $2, description = $3, module_id = $4, keywords = $5, dependencies = $6, capabilities = $7
-	`, id, name, description, moduleID, kw, deps, caps)
+			INSERT INTO agent_registry (id, name, description, module_id, keywords, dependencies, capabilities, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+			ON CONFLICT (id) DO UPDATE
+			SET name = $2, description = $3, module_id = $4, keywords = $5, dependencies = $6, capabilities = $7
+		`, id, name, description, moduleID, kw, deps, caps)
 	return err
 }
 
 // GetAll 列出全部已注册 Agent。
+// 参数:
+//   - ctx: 请求上下文。
+//
 // 返回: 每行以 map[string]any 形式返回,keywords 等仍为 JSON 字节。
 // 设计意图: 给路由/调度器读取注册表,字段保持原始 JSONB 字节由调用方按需解析。
 func (s *AgentRegistryStore) GetAll(ctx context.Context) ([]map[string]any, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, description, module_id, keywords, dependencies, capabilities
-		FROM agent_registry
-	`)
+			SELECT id, name, description, module_id, keywords, dependencies, capabilities
+			FROM agent_registry
+		`)
 	if err != nil {
 		return nil, err
 	}
@@ -69,16 +73,20 @@ func (s *AgentRegistryStore) GetAll(ctx context.Context) ([]map[string]any, erro
 
 // SaveDecisionLog 记录一条决策日志。
 // 参数:
-//   - topicID, agentID, decision: 决策主体与文本
-//   - context: 附加上下文,序列化为 JSONB
+//   - ctx:      请求上下文。
+//   - topicID:  话题 ID。
+//   - agentID:  Agent ID。
+//   - decision: 决策文本。
+//   - context:  附加上下文,序列化为 JSONB。
 //
 // 返回: SQL 执行错误。
 // 副作用: created_at 由数据库 NOW() 生成。
 func (s *AgentRegistryStore) SaveDecisionLog(ctx context.Context, topicID, agentID, decision string, context map[string]any) error {
+	// 序列化上下文；空 map 会生成 "{}"
 	ctxData, _ := json.Marshal(context)
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO decision_logs (topic_id, agent_id, decision, context, created_at)
-		VALUES ($1, $2, $3, $4, NOW())
-	`, topicID, agentID, decision, ctxData)
+			INSERT INTO decision_logs (topic_id, agent_id, decision, context, created_at)
+			VALUES ($1, $2, $3, $4, NOW())
+		`, topicID, agentID, decision, ctxData)
 	return err
 }

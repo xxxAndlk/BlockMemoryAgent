@@ -5,8 +5,8 @@
 package retriever
 
 import (
-	"context"
-	"fmt"
+	"context" // 上下文，用于超时/取消控制
+	"fmt"     // 错误格式化
 
 	"github.com/blockmemory/agent/backend/pkg/types"
 )

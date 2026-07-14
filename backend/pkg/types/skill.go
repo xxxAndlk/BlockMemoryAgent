@@ -56,25 +56,34 @@ type SkillSet struct {
 // 避免 LLM 输出 {"tool":"write_file",...} 这种 snake_case 导致
 // "unknown tool" 错误。
 //
-// 返回：多行字符串；nil 接收者或空集时返回 "(无可用 Skill)"。副作用：无。
+// 返回：多行字符串；nil 接收者或空集时返回 "(无可用 Skill)"。
 func (s *SkillSet) PromptList() string {
+	// 防御 nil 接收者与空技能集，统一返回提示字符串。
 	if s == nil || len(s.Skills) == 0 {
 		return "(无可用 Skill)"
 	}
+	// 使用字符串拼接累积输出（数量少，无需 Builder）。
 	out := ""
+	// 遍历每个 Skill，生成一行 "- toolName: 描述. 参数: schema"。
 	for _, sk := range s.Skills {
+		// 优先使用 ToolRef 作为工具名；未配置时回退到 SkillID。
 		toolName := sk.ToolRef
 		if toolName == "" {
 			toolName = sk.SkillID
 		}
+		// 拼接一行工具描述与参数 schema。
 		out += "- " + toolName + ": " + sk.Description + ". 参数: " + schemaFor(toolName) + "\n"
 	}
+	// 返回完整的多行字符串。
 	return out
 }
 
 // schemaFor 返回各工具的参数 schema 提示，让 LLM 知道如何构造 args。
-// 参数：toolRef 工具引用名。返回：JSON 参数模板字符串。副作用：无。
+//
+// 参数: toolRef 工具引用名。
+// 返回: JSON 参数模板字符串；未知工具返回通用 "{...}"。
 func schemaFor(toolRef string) string {
+	// 根据工具名返回对应参数模板。
 	switch toolRef {
 	case "ReadFile":
 		return `{"path": "文件路径"}`
@@ -91,6 +100,7 @@ func schemaFor(toolRef string) string {
 	case "HTTPPost":
 		return `{"url": "...", "headers": {...}, "body": {...}}`
 	default:
+		// 未知工具不暴露具体字段，仅给出通用对象占位。
 		return `{...}`
 	}
 }

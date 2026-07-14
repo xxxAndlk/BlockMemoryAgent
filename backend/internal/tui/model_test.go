@@ -28,17 +28,18 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
-// mockProviderForTUI is a blades provider that always returns a fixed plain
-// text response, letting ReAct sessions complete without real API calls.
+// mockProviderForTUI 是一个 blades 模型提供者，始终返回固定纯文本响应，
+// 让 ReAct 会话无需真实 API 调用即可结束。
 type mockProviderForTUI struct {
 	response string
 }
 
+// Generate 返回固定的助手回复。
 func (p *mockProviderForTUI) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
 	return &blades.ModelResponse{Message: blades.AssistantMessage(p.response)}, nil
 }
 
-// testAgent creates a ReAct-backed agent.Agent facade for tests.
+// testAgent 构造一个基于 ReAct 的 agent.Agent facade 用于测试。
 func testAgent(t *testing.T, summary string) agent.Agent {
 	t.Helper()
 	cfg := minimalRoleConfigForRender()
@@ -49,8 +50,8 @@ func testAgent(t *testing.T, summary string) agent.Agent {
 	return s
 }
 
-// mockAgentForPlan is a minimal agent.Agent implementation used by
-// TestPlanPanelReflectsAgentStatuses so the test does not need *runtime.Runtime.
+// mockAgentForPlan 是一个最小化的 agent.Agent 实现，用于 TestPlanPanelReflectsAgentStatuses，
+// 避免测试依赖 *runtime.Runtime。
 type mockAgentForPlan struct {
 	sessionID  string
 	goal       string
@@ -58,42 +59,64 @@ type mockAgentForPlan struct {
 	agentInsts []agent.AgentInstance
 }
 
+// CreateSession 是 mockAgentForPlan 的空实现。
 func (m *mockAgentForPlan) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) {
 	return nil, nil
 }
+
+// ResumeSession 是 mockAgentForPlan 的空实现。
 func (m *mockAgentForPlan) ResumeSession(ctx context.Context, sessionID string, req agent.ResumeRequest) (*agent.Session, error) {
 	return nil, nil
 }
+
+// Send 是 mockAgentForPlan 的空实现。
 func (m *mockAgentForPlan) Send(ctx context.Context, sessionID string, msg agent.Message) error {
 	return nil
 }
+
+// Stream 是 mockAgentForPlan 的空实现。
 func (m *mockAgentForPlan) Stream(ctx context.Context, sessionID string) (<-chan agent.Event, error) {
 	return nil, nil
 }
+
+// Query 返回预设的看板快照（当查询类型为 Board 时）。
 func (m *mockAgentForPlan) Query(ctx context.Context, sessionID string, q agent.Query) (agent.Result, error) {
 	if sessionID == m.sessionID && q.Kind == agent.QueryKindBoard {
 		return agent.Result{Data: m.boardSnap}, nil
 	}
 	return agent.Result{}, nil
 }
+
+// Control 是 mockAgentForPlan 的空实现。
 func (m *mockAgentForPlan) Control(ctx context.Context, sessionID string, cmd agent.ControlCommand) error {
 	return nil
 }
+
+// List 返回一个仅包含当前会话的列表。
 func (m *mockAgentForPlan) List(ctx context.Context, filter agent.Filter) ([]*agent.Session, error) {
 	return []*agent.Session{{ID: m.sessionID, Goal: m.goal}}, nil
 }
+
+// Get 返回当前会话。
 func (m *mockAgentForPlan) Get(ctx context.Context, sessionID string) (*agent.Session, error) {
 	if sessionID == m.sessionID {
 		return &agent.Session{ID: m.sessionID, Goal: m.goal}, nil
 	}
 	return nil, fmt.Errorf("not found")
 }
+
+// ListAgents 返回预设的 Agent 实例列表。
 func (m *mockAgentForPlan) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return m.agentInsts, nil
 }
-func (m *mockAgentForPlan) Shutdown(ctx context.Context) error                          { return nil }
+
+// Shutdown 是 mockAgentForPlan 的空实现。
+func (m *mockAgentForPlan) Shutdown(ctx context.Context) error { return nil }
+
+// SummarizeTaskTitle 是 mockAgentForPlan 的标题摘要实现，直接返回原标题。
 func (m *mockAgentForPlan) SummarizeTaskTitle(ctx context.Context, title string) string { return title }
 
+// minimalRoleConfigForRender 返回一个用于测试的最小角色配置。
 func minimalRoleConfigForRender() *pkgconfig.RoleConfigFile {
 	return &pkgconfig.RoleConfigFile{
 		MetaAgent: pkgconfig.MetaAgentConfig{
@@ -246,7 +269,7 @@ func TestScrollbarDragScrollsChat(t *testing.T) {
 		flashMu:   &sync.Mutex{},
 	}
 	// 顶栏 1 行 + 主内容区 8 行 + 输入栏 3 行 = 12 行
-	// mainContentHeight = 12 - 1 - 3 - 1 = 7
+	// mainContentHeight = 12 - 1（顶栏） - 3（输入栏） - 1（快捷键栏） = 7
 	if h := m.mainContentHeight(); h != 7 {
 		t.Fatalf("mainContentHeight 应为 7，got %d", h)
 	}
@@ -303,6 +326,7 @@ func TestScrollbarDragScrollsChat(t *testing.T) {
 	}
 }
 
+// modelPtr 将 tea.Model 转换为 *Model，支持指针与值两种形式。
 func modelPtr(m tea.Model) *Model {
 	if mv, ok := m.(*Model); ok {
 		return mv

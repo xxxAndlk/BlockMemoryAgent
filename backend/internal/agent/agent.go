@@ -1,3 +1,5 @@
+// Package agent 定义 Agent 编排模块的统一外观接口（Facade），
+// 降低上层（HTTP/TUI）与内部实现之间的耦合度。
 package agent
 
 import "context"

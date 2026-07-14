@@ -15,16 +15,21 @@ import (
 	"time"        // time.Now / time.Time 记录时间戳
 )
 
-// TaskStatus 子任务状态枚举类型
+// TaskStatus 子任务状态枚举类型。
 type TaskStatus string
 
 // 子任务状态枚举：覆盖从创建到终态的完整生命周期。
 const (
-	TaskPending    TaskStatus = "pending"     // 待处理：刚创建，尚未分配
-	TaskInProgress TaskStatus = "in_progress" // 进行中：已被某 Agent 认领
-	TaskBlocked    TaskStatus = "blocked"     // 阻塞：等待外部条件或依赖
-	TaskDone       TaskStatus = "done"        // 完成：执行成功
-	TaskFailed     TaskStatus = "failed"      // 失败：执行出错或被否决
+	// TaskPending 表示待处理：刚创建，尚未分配。
+	TaskPending TaskStatus = "pending"
+	// TaskInProgress 表示进行中：已被某 Agent 认领。
+	TaskInProgress TaskStatus = "in_progress"
+	// TaskBlocked 表示阻塞：等待外部条件或依赖。
+	TaskBlocked TaskStatus = "blocked"
+	// TaskDone 表示完成：执行成功。
+	TaskDone TaskStatus = "done"
+	// TaskFailed 表示失败：执行出错或被否决。
+	TaskFailed TaskStatus = "failed"
 )
 
 // BoardStatus 看板整体状态枚举类型。
@@ -32,13 +37,17 @@ type BoardStatus string
 
 // 看板整体状态枚举：覆盖从创建到终态的完整生命周期。
 const (
-	BoardStatusNew        BoardStatus = "NEW"
+	// BoardStatusNew 表示新建状态：看板尚无子任务。
+	BoardStatusNew BoardStatus = "NEW"
+	// BoardStatusInProgress 表示进行中：至少有一个子任务尚未到达终态。
 	BoardStatusInProgress BoardStatus = "IN_PROGRESS"
-	BoardStatusDone       BoardStatus = "DONE"
-	BoardStatusFailed     BoardStatus = "FAILED"
+	// BoardStatusDone 表示完成：所有子任务都已成功完成。
+	BoardStatusDone BoardStatus = "DONE"
+	// BoardStatusFailed 表示失败：所有子任务都已结束但至少有一个失败。
+	BoardStatusFailed BoardStatus = "FAILED"
 )
 
-// SubTask 看板上的一个子任务
+// SubTask 看板上的一个子任务。
 type SubTask struct {
 	ID        string     `json:"id"`                   // 子任务唯一 ID，格式 <topicID>_t<n>
 	Title     string     `json:"title"`                // 子任务标题（由 MetaAgent 推断）
@@ -50,7 +59,12 @@ type SubTask struct {
 	UpdatedAt time.Time  `json:"updated_at"`           // 最近变更时间
 }
 
-// TaskBoard 任务看板：单个 topic 的全局状态容器
+// TaskBoard 任务看板：单个 topic 的全局状态容器。
+//
+// 并发说明：
+//   - 所有会修改内部状态的公开方法都持有 mu 写锁或读锁。
+//   - 外部禁止直接读写字段；应通过 AddSubTask / Assign / MarkDone 等方法访问。
+//   - Snapshot() 返回的是值拷贝，可安全序列化。
 type TaskBoard struct {
 	mu sync.RWMutex // 读写锁：读多写少场景下允许并发 Snapshot
 
@@ -64,13 +78,13 @@ type TaskBoard struct {
 	seq         atomic.Int64        // 原子计数器，生成唯一任务序号
 }
 
-// NewTaskBoard 新建空看板
+// NewTaskBoard 新建空看板。
 //
 // 职责：创建一个处于 NEW 状态、不含任何子任务的看板实例。
 //
 // 参数：
-//   - topicID：话题标识，通常等于会话 ID
-//   - goal：全局目标文本，将注入到所有子 Agent 上下文
+//   - topicID：话题标识，通常等于会话 ID。
+//   - goal：全局目标文本，将注入到所有子 Agent 上下文。
 //
 // 返回：初始化好的 *TaskBoard，Constraints / Tasks 内置 map 已预分配。
 //
@@ -88,13 +102,13 @@ func NewTaskBoard(topicID, goal string) *TaskBoard {
 	}
 }
 
-// AddSubTask 追加一个子任务，title 重复时返回已有 ID
+// AddSubTask 追加一个子任务，title 重复时返回已有 ID。
 //
 // 职责：向看板追加新子任务；若同名任务已存在则幂等返回旧 ID，
 // 避免重复创建导致看板膨胀。追加后看板状态自动切到 IN_PROGRESS。
 //
 // 参数：
-//   - title：子任务标题
+//   - title：子任务标题。
 //
 // 返回：新创建或已存在的子任务 ID。
 //
@@ -126,13 +140,13 @@ func (b *TaskBoard) AddSubTask(title string) string {
 	return id
 }
 
-// SetConstraint 设置全局约束
+// SetConstraint 设置全局约束。
 //
 // 职责：写入或覆盖一条全局约束（key-value）。
 //
 // 参数：
-//   - key：约束键，如 "api_compat"
-//   - value：约束值，如 "v1"
+//   - key：约束键，如 "api_compat"。
+//   - value：约束值，如 "v1"。
 //
 // 副作用：更新 Constraints 与 UpdatedAt。
 //
@@ -144,13 +158,13 @@ func (b *TaskBoard) SetConstraint(key, value string) {
 	b.UpdatedAt = time.Now()   // 刷新更新时间
 }
 
-// Assign 把某个子任务分配给某 Agent
+// Assign 把某个子任务分配给某 Agent。
 //
 // 职责：将子任务指派给指定 Agent，并把状态置为 in_progress。
 //
 // 参数：
-//   - taskID：子任务 ID
-//   - assignee：被分配 Agent 的实例 ID
+//   - taskID：子任务 ID。
+//   - assignee：被分配 Agent 的实例 ID。
 //
 // 返回：taskID 不存在时返回 errors.New("task not found")。
 //
@@ -171,13 +185,13 @@ func (b *TaskBoard) Assign(taskID, assignee string) error {
 	return nil
 }
 
-// MarkDone 标记任务完成（带结果）
+// MarkDone 标记任务完成（带结果）。
 //
 // 职责：将子任务置为 done，并记录结果文本。
 //
 // 参数：
-//   - taskID：子任务 ID
-//   - result：完成结果描述
+//   - taskID：子任务 ID。
+//   - result：完成结果描述。
 //
 // 返回：taskID 不存在时返回错误。
 //
@@ -188,13 +202,13 @@ func (b *TaskBoard) MarkDone(taskID, result string) error {
 	return b.transition(taskID, TaskDone, result)
 }
 
-// MarkFailed 标记任务失败
+// MarkFailed 标记任务失败。
 //
 // 职责：将子任务置为 failed，并记录失败原因。
 //
 // 参数：
-//   - taskID：子任务 ID
-//   - reason：失败原因
+//   - taskID：子任务 ID。
+//   - reason：失败原因。
 //
 // 返回：taskID 不存在时返回错误。
 //
@@ -205,13 +219,13 @@ func (b *TaskBoard) MarkFailed(taskID, reason string) error {
 	return b.transition(taskID, TaskFailed, reason)
 }
 
-// MarkBlocked 标记任务被阻塞
+// MarkBlocked 标记任务被阻塞。
 //
 // 职责：将子任务置为 blocked，并记录阻塞原因。
 //
 // 参数：
-//   - taskID：子任务 ID
-//   - reason：阻塞原因
+//   - taskID：子任务 ID。
+//   - reason：阻塞原因。
 //
 // 返回：taskID 不存在时返回错误。
 //
@@ -222,16 +236,16 @@ func (b *TaskBoard) MarkBlocked(taskID, reason string) error {
 	return b.transition(taskID, TaskBlocked, reason)
 }
 
-// transition 子任务状态转换的内部统一实现
+// transition 子任务状态转换的内部统一实现。
 //
 // 职责：在持写锁的前提下，更新任务状态、结果与时间戳，
 // 并联动重算看板整体状态。MarkDone/MarkFailed/MarkBlocked 共用此函数，
 // 以保证状态转换路径的一致性。
 //
 // 参数：
-//   - taskID：子任务 ID
-//   - status：目标状态
-//   - result：结果或原因文本
+//   - taskID：子任务 ID。
+//   - status：目标状态。
+//   - result：结果或原因文本。
 //
 // 返回：taskID 不存在时返回 errors.New("task not found")。
 //
@@ -253,7 +267,7 @@ func (b *TaskBoard) transition(taskID string, status TaskStatus, result string) 
 	return nil
 }
 
-// recomputeStatusLocked 重新计算看板整体状态（mu 已加锁时调用）
+// recomputeStatusLocked 重新计算看板整体状态（mu 已加锁时调用）。
 //
 // 职责：遍历所有子任务，根据其终态推导看板 Status：
 //   - 无任务 → NEW
@@ -292,7 +306,7 @@ func (b *TaskBoard) recomputeStatusLocked() {
 	}
 }
 
-// Snapshot 返回看板的只读视图（拷贝），供注入 Agent 上下文使用
+// Snapshot 返回看板的只读视图（拷贝），供注入 Agent 上下文使用。
 //
 // 注入时必须只用 Snapshot()，禁止把 *TaskBoard 直接序列化，
 // 防止外部代码绕过锁修改内部状态。
@@ -305,7 +319,7 @@ type Snapshot struct {
 	UpdatedAt   time.Time         `json:"updated_at"`  // 快照时间
 }
 
-// Snapshot 返回看板视图
+// Snapshot 返回看板视图。
 //
 // 职责：在持读锁下深拷贝约束 map 与子任务列表，返回值可被外部
 // 安全持有与序列化，不会受后续看板变更影响。
@@ -340,7 +354,7 @@ func (b *TaskBoard) Snapshot() Snapshot {
 	}
 }
 
-// Brief 紧凑文字表示，用于注入子 Agent 上下文（≈200 token）
+// Brief 紧凑文字表示，用于注入子 Agent 上下文（≈200 token）。
 //
 // 严格遵循 v3 §4.4：主 Agent 上下文不超过 1000 token；
 // 子 Agent 看到的是看板摘要，不是完整任务列表。
@@ -348,7 +362,7 @@ func (b *TaskBoard) Snapshot() Snapshot {
 // 职责：基于 Snapshot 生成可读的多行文本，截断到 maxTasks 个任务。
 //
 // 参数：
-//   - maxTasks：最多展示的任务数；<=0 时取默认 6
+//   - maxTasks：最多展示的任务数；<=0 时取默认 6。
 //
 // 返回：拼接好的字符串，包含目标、约束与子任务列表。
 //
@@ -394,13 +408,15 @@ func (b *TaskBoard) Brief(maxTasks int) string {
 	return out
 }
 
-// Manager 多看板管理器（一个会话一个 TaskBoard）
+// Manager 多看板管理器（一个会话一个 TaskBoard）。
+//
+// 并发说明：boards map 受 mu 保护；读用 RLock，写用 Lock。
 type Manager struct {
 	mu     sync.RWMutex          // 读写锁保护 boards map
 	boards map[string]*TaskBoard // 按 topicID 索引的看板表
 }
 
-// NewManager 创建管理器
+// NewManager 创建管理器。
 //
 // 职责：构造空的 Manager，预分配 boards map。
 //
@@ -413,12 +429,12 @@ func NewManager() *Manager {
 	return &Manager{boards: make(map[string]*TaskBoard)}
 }
 
-// Get 获取看板，没有则返回 nil
+// Get 获取看板，没有则返回 nil。
 //
 // 职责：按 topicID 查找看板。
 //
 // 参数：
-//   - topicID：话题 ID
+//   - topicID：话题 ID。
 //
 // 返回：找到的 *TaskBoard，或 nil。
 //
@@ -431,14 +447,14 @@ func (m *Manager) Get(topicID string) *TaskBoard {
 	return m.boards[topicID] // map 缺键时返回 nil
 }
 
-// GetOrCreate 取或新建看板
+// GetOrCreate 取或新建看板。
 //
 // 职责：若 topicID 已有看板则返回旧的；否则新建并登记。
 // 用于会话首次访问时惰性创建看板。
 //
 // 参数：
-//   - topicID：话题 ID
-//   - goal：新建时使用的全局目标
+//   - topicID：话题 ID。
+//   - goal：新建时使用的全局目标。
 //
 // 返回：已存在或新建的 *TaskBoard。
 //
@@ -456,12 +472,12 @@ func (m *Manager) GetOrCreate(topicID, goal string) *TaskBoard {
 	return b
 }
 
-// Remove 移除看板
+// Remove 移除看板。
 //
 // 职责：从管理器中删除指定 topicID 的看板，通常在会话结束时清理。
 //
 // 参数：
-//   - topicID：话题 ID
+//   - topicID：话题 ID。
 //
 // 副作用：删除 boards 中的条目（看板本身由 GC 回收）。
 //

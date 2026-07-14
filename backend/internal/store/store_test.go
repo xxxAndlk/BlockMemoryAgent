@@ -1,102 +1,145 @@
 package store
 
 import (
-	"context"
-	"database/sql"
+	"context"      // 上下文，控制测试生命周期
+	"database/sql" // 标准库 SQL 抽象层
 	"database/sql/driver"
-	"errors"
-	"fmt"
-	"strings"
-	"testing"
-	"time"
+	"errors"  // 构造测试用错误
+	"fmt"     // 包装错误以测试 errors.As
+	"strings" // 断言错误消息内容
+	"testing" // Go 测试框架
+	"time"    // 构造时间戳
 
-	"github.com/blockmemory/agent/backend/pkg/enums"
-	"github.com/blockmemory/agent/backend/pkg/types"
-	"github.com/lib/pq"
+	"github.com/blockmemory/agent/backend/pkg/enums" // 知识类型枚举
+	"github.com/blockmemory/agent/backend/pkg/types" // 领域模型
+	"github.com/lib/pq"                              // PostgreSQL 错误码
 )
 
+// init 在包加载时注册一个最小化的 fake SQL 驱动。
+// 目的：构造非 nil 的 *sql.DB 而无需真实数据库，KnowledgeStore 测试中只校验序列化失败路径。
 func init() {
-	// 注册一个最小化的 fake SQL 驱动，用于构造非 nil 的 *sql.DB 而不依赖真实数据库。
+	// 注册 fake 驱动到 database/sql 全局注册表
 	sql.Register("fake_store_test_driver", &fakeDriver{})
 }
 
+// fakeDriver 是一个不连接真实数据库的驱动桩。
 type fakeDriver struct{}
 
+// Open 返回一个伪造连接；name 参数在此桩中不使用。
 func (d *fakeDriver) Open(name string) (driver.Conn, error) {
 	return &fakeConn{}, nil
 }
 
+// fakeConn 实现 driver.Conn 及上下文相关扩展接口。
 type fakeConn struct{}
 
+// Prepare 返回空语句桩。
 func (c *fakeConn) Prepare(query string) (driver.Stmt, error) { return &fakeStmt{}, nil }
-func (c *fakeConn) Close() error                              { return nil }
-func (c *fakeConn) Begin() (driver.Tx, error)                 { return &fakeTx{}, nil }
 
+// Close 无任何资源需要释放。
+func (c *fakeConn) Close() error { return nil }
+
+// Begin 返回空事务桩。
+func (c *fakeConn) Begin() (driver.Tx, error) { return &fakeTx{}, nil }
+
+// ExecContext 假装执行成功，返回无影响行。
 func (c *fakeConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	return driver.ResultNoRows, nil
 }
 
+// QueryContext 假装查询成功，返回空结果集。
 func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	return &fakeRows{}, nil
 }
 
+// fakeStmt 实现 driver.Stmt。
 type fakeStmt struct{}
 
-func (s *fakeStmt) Close() error                                    { return nil }
-func (s *fakeStmt) NumInput() int                                   { return -1 }
-func (s *fakeStmt) Exec(args []driver.Value) (driver.Result, error) { return driver.ResultNoRows, nil }
-func (s *fakeStmt) Query(args []driver.Value) (driver.Rows, error)  { return &fakeRows{}, nil }
+// Close 关闭空语句。
+func (s *fakeStmt) Close() error { return nil }
 
+// NumInput 返回 -1 表示不校验参数数量。
+func (s *fakeStmt) NumInput() int { return -1 }
+
+// Exec 假装执行成功。
+func (s *fakeStmt) Exec(args []driver.Value) (driver.Result, error) { return driver.ResultNoRows, nil }
+
+// Query 假装查询成功，返回空结果集。
+func (s *fakeStmt) Query(args []driver.Value) (driver.Rows, error) { return &fakeRows{}, nil }
+
+// fakeRows 实现 driver.Rows，模拟空结果。
 type fakeRows struct{}
 
-func (r *fakeRows) Columns() []string              { return nil }
-func (r *fakeRows) Close() error                   { return nil }
+// Columns 返回空列定义。
+func (r *fakeRows) Columns() []string { return nil }
+
+// Close 关闭空结果集。
+func (r *fakeRows) Close() error { return nil }
+
+// Next 始终返回“无更多行”，模拟空结果。
 func (r *fakeRows) Next(dest []driver.Value) error { return errors.New("no rows") }
 
+// fakeTx 实现 driver.Tx。
 type fakeTx struct{}
 
-func (t *fakeTx) Commit() error   { return nil }
+// Commit 假装提交成功。
+func (t *fakeTx) Commit() error { return nil }
+
+// Rollback 假装回滚成功。
 func (t *fakeTx) Rollback() error { return nil }
 
+// TestEpisodeStore_IsDuplicateError_Wrapped 验证 IsDuplicateError 能识别被 fmt.Errorf 包装的 pq.Error 23505。
 func TestEpisodeStore_IsDuplicateError_Wrapped(t *testing.T) {
+	// 构造零值 EpisodeStore，仅用于调用 IsDuplicateError 方法
 	s := &EpisodeStore{}
 
+	// 23505 是 PostgreSQL 唯一约束冲突的错误码
 	duplicate := &pq.Error{Code: "23505"}
+	// 用 fmt.Errorf 包装，模拟实际 SQL 执行后的错误链路
 	wrapped := fmt.Errorf("insert episode: %w", duplicate)
 	if !s.IsDuplicateError(wrapped) {
 		t.Fatal("expected IsDuplicateError to recognize wrapped pq.Error 23505")
 	}
 
+	// 非 pq 错误应返回 false
 	if s.IsDuplicateError(errors.New("some other error")) {
 		t.Fatal("expected IsDuplicateError to return false for non-pq error")
 	}
 
+	// 其他 pq 错误码（23503 外键约束）不应被误判为重复
 	otherPq := &pq.Error{Code: "23503"}
 	if s.IsDuplicateError(fmt.Errorf("wrapped: %w", otherPq)) {
 		t.Fatal("expected IsDuplicateError to return false for non-23505 pq error")
 	}
 }
 
+// TestKnowledgeStore_Save_MetaMarshalError 验证 Meta 包含不可序列化值时 Save 返回明确错误。
 func TestKnowledgeStore_Save_MetaMarshalError(t *testing.T) {
+	// 打开 fake 数据库连接，仅用于构造 KnowledgeStore
 	db, err := sql.Open("fake_store_test_driver", "")
 	if err != nil {
 		t.Fatalf("open fake db: %v", err)
 	}
+	// 测试结束后关闭连接，即使后续出错也保证释放
 	defer db.Close()
 
+	// 初始化 KnowledgeStore，注入 fake DB
 	s := &KnowledgeStore{db: db}
 	rec := &types.KnowledgeRecord{
 		KnowledgeType: enums.KnowledgeTypeBlockMemory,
 		TopicID:       "topic-1",
 		Content:       "content",
-		Meta:          map[string]any{"bad": make(chan int)}, // channel 不可 JSON 序列化
-		CreatedAt:     time.Now(),
+		// channel 不可 JSON 序列化，用于触发 json.Marshal 失败
+		Meta:      map[string]any{"bad": make(chan int)},
+		CreatedAt: time.Now(),
 	}
 
+	// 调用 Save，期望在序列化 Meta 时出错
 	err = s.Save(context.Background(), rec)
 	if err == nil {
 		t.Fatal("expected error when meta JSON marshaling fails, got nil")
 	}
+	// 断言错误消息包含 “marshal knowledge meta”，便于调用方识别错误阶段
 	if !strings.Contains(err.Error(), "marshal knowledge meta") {
 		t.Fatalf("expected error wrapping 'marshal knowledge meta', got %v", err)
 	}

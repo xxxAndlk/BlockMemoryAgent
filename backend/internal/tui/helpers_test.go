@@ -21,6 +21,7 @@ func TestEventChatItemToolOutputCollapsed(t *testing.T) {
 	collapsedTools := []string{"ReadFile", "SearchInFiles", "ListDir", "HTTPGet", "HTTPPost"}
 	verboseTools := []string{"WriteFile", "RunCommand"}
 
+	// 验证折叠工具的 output 在 detail 中被隐藏，但在 rawDetail 中保留。
 	for _, tool := range collapsedTools {
 		ev := server.SessionEvent{
 			Type:       "tool_exec",
@@ -47,6 +48,7 @@ func TestEventChatItemToolOutputCollapsed(t *testing.T) {
 		}
 	}
 
+	// 验证 verbose 工具的 output 在 detail 中展开。
 	for _, tool := range verboseTools {
 		ev := server.SessionEvent{
 			Type:       "tool_exec",
@@ -254,6 +256,7 @@ func TestChatItemsDeduplicateSummary(t *testing.T) {
 	}
 }
 
+// titlesOf 从 chatItem 列表中提取标题，用于测试诊断输出。
 func titlesOf(items []chatItem) []string {
 	out := make([]string, len(items))
 	for i, it := range items {

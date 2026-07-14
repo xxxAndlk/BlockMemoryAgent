@@ -10,24 +10,35 @@ import (
 
 // pgVector 将 float32 切片转为 pgvector 字符串格式 [1,2,3]。
 // 设计意图: database/sql 不直接支持 pgvector 类型,需以文本字面量形式传入 SQL。
+// 参数:
+//   - v: 待转换的向量分量切片。
+//
 // 返回: 形如 "[0.123000,0.456000]" 的字符串;空切片返回 "[]"。
 func pgVector(v []float32) string {
 	if len(v) == 0 {
-		// 空向量返回 "[]",避免插入 NULL
+		// 空向量返回 "[]",避免插入 NULL，保持与 pgvector 空向量语义一致
 		return "[]"
 	}
+	// 预分配 parts 切片，每个元素对应一个分量字符串
 	parts := make([]string, len(v))
 	for i, f := range v {
-		// 每个分量按 %f 格式化,保留小数位
+		// 每个分量按 %f 格式化，保留小数位，确保 pgvector 能正确解析
 		parts[i] = fmt.Sprintf("%f", f)
 	}
+	// 用逗号拼接并加上方括号，得到 pgvector 文本格式
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
 // EnsureSessionHistorySchema 自动创建 session_history 表 (幂等)。
 // 同时确保 006_session_history_meta_memory.sql 中声明的 meta_memory 列已存在，
 // 避免 SaveSessionHistory 因列缺失而失败。
+// 参数:
+//   - ctx: 超时与取消控制。
+//   - db:  *sql.DB 连接池。
+//
+// 返回: 建表/索引错误。
 func EnsureSessionHistorySchema(ctx context.Context, db *sql.DB) error {
+	// 执行幂等 DDL：IF NOT EXISTS 保证重复调用不会报错
 	_, err := db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS session_history (
     id           BIGSERIAL PRIMARY KEY,
@@ -46,6 +57,11 @@ CREATE INDEX IF NOT EXISTS idx_session_history_created_at
 
 // EnsureSessionLogsSchema 自动创建 session_logs 表 (幂等)。
 // 对应 migrations/005_session_logs.sql，供 logger 持久化结构化 Agent IO 日志。
+// 参数:
+//   - ctx: 超时与取消控制。
+//   - db:  *sql.DB 连接池。
+//
+// 返回: 建表/索引错误。
 func EnsureSessionLogsSchema(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS session_logs (
@@ -73,6 +89,11 @@ CREATE INDEX IF NOT EXISTS idx_session_logs_created_at ON session_logs(created_a
 }
 
 // EnsureSessionEventsSchema 自动创建 session_events 表 (幂等)。
+// 参数:
+//   - ctx: 超时与取消控制。
+//   - db:  *sql.DB 连接池。
+//
+// 返回: 建表/索引错误。
 func EnsureSessionEventsSchema(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS session_events (
@@ -102,6 +123,11 @@ CREATE INDEX IF NOT EXISTS idx_session_events_session_ts
 // EnsureInitialMemorySchema 自动创建 001_init.sql 中定义的记忆/知识/注册表相关表 (幂等)。
 // 负责在启动时补齐 global_knowledge / agent_private_memory / agent_snapshots / topics /
 // agent_registry / decision_logs / topic_archives 等表,避免块记忆、私有记忆、快照写入失败。
+// 参数:
+//   - ctx: 超时与取消控制。
+//   - db:  *sql.DB 连接池。
+//
+// 返回: 建表/索引/迁移错误。
 func EnsureInitialMemorySchema(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, `
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -210,9 +236,8 @@ WITH (lists = 100);
 // ValidateEmbeddingDimension 校验 global_knowledge.embedding 列的实际向量维度与配置一致。
 //
 // 职责：pgvector 的 VECTOR(N) 列维度在建表时固定；若 config 的 pgvector.dimensions 与列维度
-//
-//	不一致，所有 SaveKnowledge 的 INSERT 会因维度不匹配静默失败（仅日志），导致块记忆/归档
-//	无法落库。启动期显式校验，不一致则返回错误，由调用方 fatal 退出（TODO #4 D3）。
+// 不一致，所有 SaveKnowledge 的 INSERT 会因维度不匹配静默失败（仅日志），导致块记忆/归档
+// 无法落库。启动期显式校验，不一致则返回错误，由调用方 fatal 退出（TODO #4 D3）。
 //
 // 参数：
 //   - ctx：请求上下文。
@@ -237,13 +262,17 @@ WHERE a.attrelid = 'global_knowledge'::regclass AND a.attname = 'embedding'
 		return nil
 	}
 	if actual != expectedDim {
-		return fmt.Errorf("embedding 维度不一致: 数据库 VECTOR(%d) ≠ 配置 pgvector.dimensions(%d)；"+
+		return fmt.Errorf("embedding 维度不一致: 数据库 VECTOR(%d) ≠ 配置 pgvector.dimensions(%d);"+
 			"请调整配置或重建 global_knowledge 表（DROP 后重启自动建表）", actual, expectedDim)
 	}
 	return nil
 }
 
 // parseVectorDim 从 "vector(768)" 这类类型字符串中解析出维度数字。
+// 参数:
+//   - typeStr: pgvector 类型文本，例如 "vector(768)" 或 "public.vector(768)"。
+//
+// 返回: 解析出的维度；格式不符时返回 0。
 func parseVectorDim(typeStr string) int {
 	// 取 '(' 与 ')' 之间的数字
 	start := strings.Index(typeStr, "(")

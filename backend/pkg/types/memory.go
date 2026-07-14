@@ -177,6 +177,7 @@ type TokenBudget struct {
 // Total 返回所有段预算之和，即上下文总 Token 上限。
 // 副作用：无。参数：无。返回：各段预算累加值。
 func (b *TokenBudget) Total() int {
+	// 累加全部预算段，包括预留缓冲。
 	return b.SystemRole + b.TopicGlobal + b.SharedState + b.GlobalKB +
 		b.PrivateMemory + b.TaskQuery + b.Reserve
 }

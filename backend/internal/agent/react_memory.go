@@ -1,3 +1,5 @@
+// Package agent 定义 ReAct 循环所需的记忆流水线接口与空实现，
+// 负责在每次 LLM 调用前组装上下文、写入可观察事件。
 package agent
 
 import (

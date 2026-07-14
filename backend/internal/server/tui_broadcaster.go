@@ -34,7 +34,7 @@ func NewTUIBroadcaster() *TUIBroadcaster {
 
 // Subscribe 为指定 topic 注册一个新的 SSE 客户端。
 // 职责：创建带缓冲通道的 Client，追加到 clients[topicID]。
-// 参数：topicID - 订阅的主题 ID。
+// 参数 topicID：订阅的主题 ID。
 // 返回值：*Client - 订阅者句柄，用于后续接收事件与取消订阅。
 // 并发安全：通过 mu.Lock 保护。
 func (b *TUIBroadcaster) Subscribe(topicID string) *Client {
@@ -51,7 +51,7 @@ func (b *TUIBroadcaster) Subscribe(topicID string) *Client {
 
 // Unsubscribe 取消订阅并移除客户端。
 // 职责：关闭 Done 信号，从 clients 列表中删除该 Client；若 topic 列表清空则删除映射键。
-// 参数：client - 待移除的订阅者。
+// 参数 client：待移除的订阅者。
 // 副作用：close(client.Done) 触发 SSEHandler 退出 select 循环。
 // 并发安全：通过 mu.Lock 保护列表修改。
 func (b *TUIBroadcaster) Unsubscribe(client *Client) {
@@ -72,7 +72,7 @@ func (b *TUIBroadcaster) Unsubscribe(client *Client) {
 
 // Broadcast 向指定 topic 的所有订阅者广播一个事件。
 // 职责：非阻塞地把事件塞入每个客户端的缓冲通道；缓冲满则丢弃，防止慢客户端背压。
-// 参数：topicID - 目标 topic；ev - 待广播事件。
+// 参数 topicID：目标 topic；ev：待广播事件。
 // 并发安全：使用 RLock 读取客户端列表快照后再投递，避免长时间持锁。
 func (b *TUIBroadcaster) Broadcast(topicID string, ev types.UIEvent) {
 	b.mu.RLock()
@@ -88,7 +88,7 @@ func (b *TUIBroadcaster) Broadcast(topicID string, ev types.UIEvent) {
 }
 
 // BroadcastAgentStatus 广播 Agent 状态变化事件（type=agent.status）。
-// 参数：topicID - 目标 topic；payload - Agent 状态载荷。
+// 参数 topicID：目标 topic；payload：Agent 状态载荷。
 func (b *TUIBroadcaster) BroadcastAgentStatus(topicID string, payload types.AgentStatusPayload) {
 	b.Broadcast(topicID, types.UIEvent{
 		Type:      "agent.status", // 事件类型
@@ -98,7 +98,7 @@ func (b *TUIBroadcaster) BroadcastAgentStatus(topicID string, payload types.Agen
 }
 
 // BroadcastGraphStep 广播 Graph 执行步骤事件（type=graph.step）。
-// 参数：topicID - 目标 topic；payload - Graph 步骤载荷。
+// 参数 topicID：目标 topic；payload：Graph 步骤载荷。
 func (b *TUIBroadcaster) BroadcastGraphStep(topicID string, payload types.GraphStepPayload) {
 	b.Broadcast(topicID, types.UIEvent{
 		Type:      "graph.step", // 事件类型
@@ -108,7 +108,7 @@ func (b *TUIBroadcaster) BroadcastGraphStep(topicID string, payload types.GraphS
 }
 
 // BroadcastEpisode 广播新 Episode 事件（type=episode.new）。
-// 参数：topicID - 目标 topic；payload - Episode 载荷。
+// 参数 topicID：目标 topic；payload：Episode 载荷。
 func (b *TUIBroadcaster) BroadcastEpisode(topicID string, payload types.EpisodePayload) {
 	b.Broadcast(topicID, types.UIEvent{
 		Type:      "episode.new", // 事件类型
@@ -118,7 +118,7 @@ func (b *TUIBroadcaster) BroadcastEpisode(topicID string, payload types.EpisodeP
 }
 
 // BroadcastEvent 广播 workspace Event 事件（type=workspace.event）。
-// 参数：topicID - 目标 topic；payload - Event 载荷。
+// 参数 topicID：目标 topic；payload：Event 载荷。
 func (b *TUIBroadcaster) BroadcastEvent(topicID string, payload types.EventPayload) {
 	b.Broadcast(topicID, types.UIEvent{
 		Type:      "workspace.event", // 事件类型
@@ -128,7 +128,7 @@ func (b *TUIBroadcaster) BroadcastEvent(topicID string, payload types.EventPaylo
 }
 
 // BroadcastStats 广播统计快照事件（type=stats.tick）。
-// 参数：topicID - 目标 topic；payload - 统计视图载荷。
+// 参数 topicID：目标 topic；payload：统计视图载荷。
 func (b *TUIBroadcaster) BroadcastStats(topicID string, payload types.StatsView) {
 	b.Broadcast(topicID, types.UIEvent{
 		Type:      "stats.tick", // 事件类型
@@ -140,7 +140,7 @@ func (b *TUIBroadcaster) BroadcastStats(topicID string, payload types.StatsView)
 // SSEHandler 处理 HTTP SSE 订阅请求，建立长连接并持续推送事件。
 // 路由：通常挂在 /api/events 或类似 SSE 端点。
 // 职责：解析 topic_id，设置 SSE 响应头，订阅广播器，循环把事件 / 心跳 / 关闭信号写入响应。
-// 参数：w - HTTP 响应；r - HTTP 请求。
+// 参数 w：HTTP 响应；r：HTTP 请求。
 // 副作用：阻塞当前 goroutine 直到客户端断开或 Unsubscribe。
 func (b *TUIBroadcaster) SSEHandler(w http.ResponseWriter, r *http.Request) {
 	topicID := r.URL.Query().Get("topic_id") // 从 query 解析 topic_id

@@ -1,76 +1,82 @@
 package server
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"log"
-	"net/http"
-	"strconv"
-	"time"
+	"context"       // 用于传递请求上下文与超时控制
+	"encoding/json" // 用于 HTTP 响应的 JSON 编码
+	"errors"        // 用于错误判断（errors.Is）
+	"log"           // 用于记录服务端错误日志
+	"net/http"      // HTTP 处理器与状态码
+	"strconv"       // 字符串与数字转换
+	"time"          // 时间类型与持续时间
 
-	"github.com/blockmemory/agent/backend/internal/agent"
-	"github.com/blockmemory/agent/backend/internal/model"
-	"github.com/blockmemory/agent/backend/internal/store"
-	"github.com/blockmemory/agent/backend/pkg/enums"
-	"github.com/blockmemory/agent/backend/pkg/types"
+	"github.com/blockmemory/agent/backend/internal/agent" // Agent 门面接口
+	"github.com/blockmemory/agent/backend/internal/model" // ModelFactory（兼容注入）
+	"github.com/blockmemory/agent/backend/internal/store" // PostgresStore（兼容注入）
+	"github.com/blockmemory/agent/backend/pkg/enums"      // 会话状态、聊天角色等枚举
+	"github.com/blockmemory/agent/backend/pkg/types"      // 共享类型（ThreeLayerState 等）
 )
 
-// Session represents the runtime state of a single conversation.
-// It remains the on-the-wire DTO for the HTTP API; the canonical lifecycle owner
-// is now agent.Service.
+// Session 表示单个会话的运行时状态，同时作为 HTTP API 的传输对象（DTO）。
+// 注意：会话的完整生命周期管理现在由 agent.Service 负责，SessionManager 仅作为薄适配层。
 type Session struct {
-	ID        string                 `json:"id"`
-	Goal      string                 `json:"goal"`
-	Status    enums.SessionStatus    `json:"status"`
-	Result    string                 `json:"result,omitempty"`
-	State     *types.ThreeLayerState `json:"state,omitempty"`
-	StartedAt time.Time              `json:"started_at"`
-	EndedAt   *time.Time             `json:"ended_at,omitempty"`
-	Events    []SessionEvent         `json:"events"`
-	Messages  []types.ChatMessage    `json:"messages"`
-	TempDir   string                 `json:"temp_dir,omitempty"`
+	ID        string                 `json:"id"`                 // 会话唯一标识
+	Goal      string                 `json:"goal"`               // 用户最初设定的目标
+	Status    enums.SessionStatus    `json:"status"`             // 当前会话状态（running / completed / error 等）
+	Result    string                 `json:"result,omitempty"`   // 最终结果摘要（可选）
+	State     *types.ThreeLayerState `json:"state,omitempty"`    // 三层状态桥接对象（兼容旧前端，可选）
+	StartedAt time.Time              `json:"started_at"`         // 会话开始时间
+	EndedAt   *time.Time             `json:"ended_at,omitempty"` // 会话结束时间（可选）
+	Events    []SessionEvent         `json:"events"`             // 会话事件流
+	Messages  []types.ChatMessage    `json:"messages"`           // 用户与助手消息列表
+	TempDir   string                 `json:"temp_dir,omitempty"` // 临时工作目录（可选）
 }
 
-// SessionEvent is a single event in the session event stream.
+// SessionEvent 是会话事件流中的单个事件，对应前端展示的一条日志/消息。
 type SessionEvent struct {
-	Type         string    `json:"type"`
-	Agent        string    `json:"agent"`
-	Message      string    `json:"message"`
-	Kind         string    `json:"kind,omitempty"`
-	Tool         string    `json:"tool,omitempty"`
-	ToolPath     string    `json:"tool_path,omitempty"`
-	ToolOutput   string    `json:"tool_output,omitempty"`
-	ToolError    string    `json:"tool_error,omitempty"`
-	Success      bool      `json:"success,omitempty"`
-	Timestamp    time.Time `json:"timestamp"`
-	Prompt       string    `json:"prompt,omitempty"`
-	InputTokens  int       `json:"input_tokens,omitempty"`
-	OutputTokens int       `json:"output_tokens,omitempty"`
-	DetailJSON   string    `json:"detail_json,omitempty"`
+	Type         string    `json:"type"`                    // 事件类型（如 think / tool_exec / token_usage 等）
+	Agent        string    `json:"agent"`                   // 产生事件的 Agent 名称
+	Message      string    `json:"message"`                 // 人类可读的事件描述
+	Kind         string    `json:"kind,omitempty"`          // 事件细分种类（可选）
+	Tool         string    `json:"tool,omitempty"`          // 工具名（可选）
+	ToolPath     string    `json:"tool_path,omitempty"`     // 工具输出路径（可选）
+	ToolOutput   string    `json:"tool_output,omitempty"`   // 工具标准输出（可选）
+	ToolError    string    `json:"tool_error,omitempty"`    // 工具错误信息（可选）
+	Success      bool      `json:"success,omitempty"`       // 工具/操作是否成功（可选）
+	Timestamp    time.Time `json:"timestamp"`               // 事件发生时间
+	Prompt       string    `json:"prompt,omitempty"`        // 关联的 LLM Prompt（可选）
+	InputTokens  int       `json:"input_tokens,omitempty"`  // 输入 token 数（可选）
+	OutputTokens int       `json:"output_tokens,omitempty"` // 输出 token 数（可选）
+	DetailJSON   string    `json:"detail_json,omitempty"`   // 额外结构化详情（JSON 字符串，可选）
 }
 
-// SessionManager is a thin HTTP adapter around agent.Agent.
-// All session mutations and read-only queries are delegated to the Agent facade.
+// SessionManager 是 agent.Agent 之上的薄 HTTP 适配层。
+// 所有会话的变更与只读查询都委托给 Agent 门面，避免在 HTTP 层重复实现业务逻辑。
 type SessionManager struct {
-	agent agent.Agent
+	agent agent.Agent // Agent 门面接口
 }
 
-// NewSessionManager creates an HTTP adapter that delegates to the supplied Agent.
+// NewSessionManager 创建一个委托给指定 Agent 门面的 HTTP 适配器。
+// 参数 agentFacade：实现 agent.Agent 接口的对象。
+// 返回值：*SessionManager，供 HTTP 路由注册使用。
 func NewSessionManager(agentFacade agent.Agent) *SessionManager {
 	return &SessionManager{agent: agentFacade}
 }
 
-// SetPostgresStore is retained for interface compatibility but is now a no-op;
-// persistence is configured on agent.Service.
+// SetPostgresStore 保留该方法以保持接口兼容，但实际为无操作（no-op）。
+// 原因：持久化配置已迁移到 agent.Service，HTTP 层不再直接持有存储。
+// 参数 pg：PostgresStore 实例（被忽略）。
 func (m *SessionManager) SetPostgresStore(pg *store.PostgresStore) {}
 
-// SetModelFactory is retained for interface compatibility but is now a no-op;
-// the model factory is configured on agent.Service.
+// SetModelFactory 保留该方法以保持接口兼容，但实际为无操作（no-op）。
+// 原因：模型工厂已配置在 agent.Service 上，HTTP 层不再直接使用。
+// 参数 mf：ModelFactory 实例（被忽略）。
 func (m *SessionManager) SetModelFactory(mf *model.ModelFactory) {}
 
-// LaunchSession implements dag.SessionLauncher.
+// LaunchSession 实现 dag.SessionLauncher 接口，用于通过目标文本启动会话。
+// 参数 goal：用户目标描述。
+// 返回值：新创建会话的 ID；创建失败时返回空字符串。
 func (m *SessionManager) LaunchSession(goal string) string {
+	// 使用后台上下文创建会话，因为 DAG 触发器不依赖具体请求上下文。
 	s, err := m.agent.CreateSession(context.Background(), agent.CreateRequest{Goal: goal})
 	if err != nil || s == nil {
 		return ""
@@ -78,8 +84,11 @@ func (m *SessionManager) LaunchSession(goal string) string {
 	return s.ID
 }
 
-// RestoreSessions delegates to the Agent facade.
+// RestoreSessions 将会话恢复工作委托给 Agent 门面。
+// 参数 ctx：请求上下文；limit：最大恢复数量。
+// 返回值：实际恢复的会话数。
 func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
+	// 通过局部接口做鸭子类型判断，兼容不同 Agent 实现。
 	type restorer interface {
 		RestoreSessions(ctx context.Context, limit int) int
 	}
@@ -89,7 +98,9 @@ func (m *SessionManager) RestoreSessions(ctx context.Context, limit int) int {
 	return 0
 }
 
-// GetSession returns a server.Session by ID, converting from the Agent DTO.
+// GetSession 根据 ID 获取 server.Session，内部把 agent.Session DTO 转换为 HTTP 线型。
+// 参数 id：会话 ID。
+// 返回值：转换后的 *Session；会话不存在或出错时返回 nil。
 func (m *SessionManager) GetSession(id string) *Session {
 	s, err := m.agent.Get(context.Background(), id)
 	if err != nil || s == nil {
@@ -98,14 +109,18 @@ func (m *SessionManager) GetSession(id string) *Session {
 	return ToServerSession(s)
 }
 
-// LLMStats returns aggregated LLM call statistics via the Agent facade.
+// LLMStats 通过 Agent 门面聚合 LLM 调用统计。
+// 返回值：调用次数、超时次数、平均耗时、最大耗时。
 func (m *SessionManager) LLMStats() (callCount, timeoutCount int, avgDur, maxDur time.Duration) {
+	// 优先使用直接实现 LLMStats() 的 Agent。
 	type statsProvider interface {
 		LLMStats() (callCount, timeoutCount int, avgDur, maxDur time.Duration)
 	}
 	if sp, ok := m.agent.(statsProvider); ok {
 		return sp.LLMStats()
 	}
+
+	// 退而使用通用 Query 接口查询 LLM 统计。
 	res, err := m.agent.Query(context.Background(), "", agent.Query{Kind: agent.QueryKindLLMStats})
 	if err != nil {
 		return 0, 0, 0, 0
@@ -125,14 +140,17 @@ func (m *SessionManager) LLMStats() (callCount, timeoutCount int, avgDur, maxDur
 	return
 }
 
-// SessionCount returns the number of sessions currently held in memory.
+// SessionCount 返回当前内存中持有的会话数量。
+// 返回值：会话数量；Agent 不支持时返回 0。
 func (m *SessionManager) SessionCount() int {
+	// 优先使用直接实现 SessionCount() 的 Agent。
 	type counter interface {
 		SessionCount() int
 	}
 	if c, ok := m.agent.(counter); ok {
 		return c.SessionCount()
 	}
+	// 退而使用通用 Query 接口查询。
 	res, err := m.agent.Query(context.Background(), "", agent.Query{Kind: agent.QueryKindSessionCount})
 	if err != nil {
 		return 0
@@ -143,7 +161,8 @@ func (m *SessionManager) SessionCount() int {
 	return 0
 }
 
-// ListSessions returns all sessions, converted from the Agent DTO.
+// ListSessions 返回所有会话，均由 agent.Session 转换为 server.Session。
+// 返回值：会话指针切片；出错时记录日志并返回 nil。
 func (m *SessionManager) ListSessions() []*Session {
 	sessions, err := m.agent.List(context.Background(), agent.Filter{})
 	if err != nil {
@@ -157,17 +176,21 @@ func (m *SessionManager) ListSessions() []*Session {
 	return out
 }
 
-// Shutdown cancels all running sessions.
+// Shutdown 取消所有运行中的会话，通常用于服务优雅停机。
 func (m *SessionManager) Shutdown() {
 	_ = m.agent.Shutdown(context.Background())
 }
 
-// SnapshotSession returns a deep copy of the session in server.Session form.
+// SnapshotSession 返回指定会话在 server.Session 形式下的深拷贝快照。
+// 参数 id：会话 ID。
+// 返回值：当前会话状态的快照。
 func (m *SessionManager) SnapshotSession(id string) *Session {
 	return m.GetSession(id)
 }
 
-// ClearSessionChat delegates to the Agent facade.
+// ClearSessionChat 委托给 Agent 门面清空会话聊天历史。
+// 参数 id：会话 ID。
+// 返回值：是否成功。
 func (m *SessionManager) ClearSessionChat(id string) bool {
 	type clearer interface {
 		ClearSessionChat(id string) bool
@@ -178,18 +201,17 @@ func (m *SessionManager) ClearSessionChat(id string) bool {
 	return false
 }
 
-// ToServerSession converts an agent.Session DTO to the server.Session wire type.
+// ToServerSession 将 agent.Session DTO 转换为 server.Session HTTP 线型。
 //
-// Legacy bridge: the ThreeLayerState shape is retained only for frontend/API
-// compatibility. It will be removed once the frontend stops depending on
-// current_domain / active_blocks.
+// 遗留桥接：ThreeLayerState 结构仅用于前端/API 兼容；
+// 当前保留 current_domain / active_blocks 字段，等前端不再依赖后即可移除。
 func ToServerSession(a *agent.Session) *Session {
 	if a == nil {
 		return nil
 	}
 
-	// Legacy bridge: map the new ReAct Session DTO back to the old ThreeLayerState
-	// wire shape so existing HTTP clients keep working.
+	// 遗留桥接：把新的 ReAct Session DTO 映射回旧的 ThreeLayerState 线型，
+	// 使现有 HTTP 客户端在不改动的情况下继续工作。
 	state := &types.ThreeLayerState{
 		CurrentDomain: a.State,
 	}
@@ -215,16 +237,19 @@ func ToServerSession(a *agent.Session) *Session {
 			AnsweredAt: req.AnsweredAt,
 		}
 	}
+	// 如果没有任何三层状态内容，则把 state 置为 nil，避免返回空对象。
 	if a.State == "" && len(a.ActiveBlocks) == 0 && a.PendingClarify == nil {
 		state = nil
 	}
 
+	// 处理结束时间：agent 使用 time.Time 零值表示未结束，HTTP 线型使用指针表示可选。
 	var endedAt *time.Time
 	if !a.EndedAt.IsZero() {
 		t := a.EndedAt
 		endedAt = &t
 	}
 
+	// 复制事件切片，保持顺序与内容一致。
 	events := make([]SessionEvent, len(a.Events))
 	for i, e := range a.Events {
 		events[i] = SessionEvent{
@@ -245,6 +270,7 @@ func ToServerSession(a *agent.Session) *Session {
 		}
 	}
 
+	// 复制消息切片，角色字段使用枚举转换。
 	messages := make([]types.ChatMessage, len(a.Messages))
 	for i, msg := range a.Messages {
 		messages[i] = types.ChatMessage{
@@ -268,7 +294,8 @@ func ToServerSession(a *agent.Session) *Session {
 	}
 }
 
-// HandleSessionMetrics GET /api/sessions/{id}/metrics.
+// HandleSessionMetrics 处理 GET /api/sessions/{id}/metrics。
+// 返回指定会话的指标数据。
 func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -291,7 +318,8 @@ func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Req
 	json.NewEncoder(w).Encode(res.Data)
 }
 
-// HandleSessionWatchdog GET /api/sessions/{id}/watchdog.
+// HandleSessionWatchdog 处理 GET /api/sessions/{id}/watchdog。
+// 返回看门狗对会话的决策记录。
 func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -317,7 +345,8 @@ func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// HandleSessionMailbox GET /api/sessions/{id}/mailbox.
+// HandleSessionMailbox 处理 GET /api/sessions/{id}/mailbox。
+// 返回会话邮箱中的消息列表。
 func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -343,7 +372,8 @@ func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// HandleSessionLogs GET /api/sessions/{id}/logs.
+// HandleSessionLogs 处理 GET /api/sessions/{id}/logs。
+// 支持 query 参数：agent、level、limit、offset。
 func (m *SessionManager) HandleSessionLogs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -356,6 +386,7 @@ func (m *SessionManager) HandleSessionLogs(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// 解析分页参数，转换失败时默认为 0（Atoi 返回 0）。
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
@@ -378,7 +409,8 @@ func (m *SessionManager) HandleSessionLogs(w http.ResponseWriter, r *http.Reques
 	json.NewEncoder(w).Encode(res.Data)
 }
 
-// HandleSessionTokenMetrics GET /api/sessions/{id}/token-metrics.
+// HandleSessionTokenMetrics 处理 GET /api/sessions/{id}/token-metrics。
+// 返回会话级别的 Token 消耗聚合。
 func (m *SessionManager) HandleSessionTokenMetrics(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -402,8 +434,10 @@ func (m *SessionManager) HandleSessionTokenMetrics(w http.ResponseWriter, r *htt
 	json.NewEncoder(w).Encode(res.Data)
 }
 
-// agentErrorStatus maps agent sentinel errors to HTTP status codes.
-// Unknown errors are returned as 500 with their message.
+// agentErrorStatus 将 agent 的哨兵错误映射为 HTTP 状态码与可读消息。
+// 未知错误返回 500 并附带原始错误信息。
+// 参数 err：原始错误。
+// 返回值：响应文本、HTTP 状态码。
 func agentErrorStatus(err error) (string, int) {
 	if err == nil {
 		return "", 0

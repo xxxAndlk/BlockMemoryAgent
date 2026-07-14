@@ -1,5 +1,6 @@
 package memory
 
+// 导入上下文与同步包：context 用于接口签名；sync 提供读写锁保证并发安全。
 import (
 	"context"
 	"sync"

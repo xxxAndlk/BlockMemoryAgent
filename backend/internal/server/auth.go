@@ -5,8 +5,8 @@ package server
 // 如需更复杂的鉴权（OAuth2、RBAC），应在此基础上扩展。
 
 import (
-	"net/http"
-	"strings"
+	"net/http" // HTTP 中间件与状态码
+	"strings"  // 字符串前缀匹配
 )
 
 // AuthMiddleware 返回一个 HTTP 中间件，校验请求头中的 Authorization Bearer Token。

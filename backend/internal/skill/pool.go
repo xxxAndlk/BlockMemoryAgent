@@ -39,7 +39,7 @@ type LLMClient interface {
 // 并发安全：所有读写均经 mu 保护。
 // 副作用：无外部副作用，纯内存结构。
 type Pool struct {
-	mu              sync.RWMutex
+	mu              sync.RWMutex            // 读写锁：保护 skills / policy 字段的并发访问
 	skills          map[string]*types.Skill // skill_id -> skill，键为 SkillID
 	selectionPolicy SkillSelectionPolicy    // 二次选择策略（AssembleSet 使用）
 	pickOnePolicy   SkillPickOnePolicy      // “1 选 1”策略（SelectOne 使用）
@@ -49,6 +49,7 @@ type Pool struct {
 //
 // 返回：指向已初始化 skills map 的 *Pool，可直接 Register。
 func NewPool() *Pool {
+	// 初始化 skills map 并安装默认策略，保证返回的 Pool 立即可用。
 	return &Pool{
 		skills:          make(map[string]*types.Skill),
 		selectionPolicy: &DefaultSkillPolicy{},
@@ -62,6 +63,7 @@ func NewPool() *Pool {
 // 返回：填充后的 *Pool。
 func NewPoolFromSkills(skills []*types.Skill) *Pool {
 	p := NewPool() // 先建空池
+	// 遍历输入列表，逐个注册；复用 Register 完成空值/空 ID 校验与加锁。
 	for _, s := range skills {
 		p.Register(s) // 逐个注册，复用 Register 的空值/空 ID 校验
 	}
@@ -70,21 +72,23 @@ func NewPoolFromSkills(skills []*types.Skill) *Pool {
 
 // SetSelectionPolicy 设置 Skill 二次选择策略；传入 nil 时恢复为默认策略。
 func (p *Pool) SetSelectionPolicy(policy SkillSelectionPolicy) {
+	// 防御：nil 策略回退到默认实现，避免后续 AssembleSet 出现空指针。
 	if policy == nil {
 		policy = &DefaultSkillPolicy{}
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.Lock()         // 加写锁：修改策略字段
+	defer p.mu.Unlock() // 函数退出时释放锁，保证锁的成对释放
 	p.selectionPolicy = policy
 }
 
 // SetPickOnePolicy 设置“1 选 1”决策策略；传入 nil 时恢复为默认策略。
 func (p *Pool) SetPickOnePolicy(policy SkillPickOnePolicy) {
+	// 防御：nil 策略回退到默认实现，避免后续 SelectOne 出现空指针。
 	if policy == nil {
 		policy = &DefaultSkillPolicy{}
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.Lock()         // 加写锁：修改策略字段
+	defer p.mu.Unlock() // 函数退出时释放锁
 	p.pickOnePolicy = policy
 }
 
@@ -94,11 +98,12 @@ func (p *Pool) SetPickOnePolicy(policy SkillPickOnePolicy) {
 // 副作用：写入 p.skills，可能覆盖同 ID 旧值。
 // 并发安全：加写锁。
 func (p *Pool) Register(s *types.Skill) {
+	// 防御：空 Skill 或缺 ID 直接跳过，防止 map 中出现空键或 nil 值。
 	if s == nil || s.SkillID == "" {
-		return // 防御：空 Skill 或缺 ID 直接跳过
+		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.Lock()             // 加写锁：修改 skills map
+	defer p.mu.Unlock()     // 函数退出时释放锁
 	p.skills[s.SkillID] = s // 同 ID 覆盖，保证最新定义生效
 }
 
@@ -108,8 +113,8 @@ func (p *Pool) Register(s *types.Skill) {
 // 返回：命中则返回 *types.Skill，未命中返回 nil。
 // 并发安全：加读锁。
 func (p *Pool) Get(id string) *types.Skill {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.RLock()         // 加读锁：只读访问 skills map
+	defer p.mu.RUnlock() // 函数退出时释放锁
 	return p.skills[id]
 }
 
@@ -118,9 +123,11 @@ func (p *Pool) Get(id string) *types.Skill {
 // 返回：新建切片，包含池中全部 Skill 指针（指针共享，调用方不应修改 Skill 字段）。
 // 并发安全：加读锁后拷贝。
 func (p *Pool) All() []*types.Skill {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make([]*types.Skill, 0, len(p.skills)) // 预分配容量，避免扩容
+	p.mu.RLock()         // 加读锁：只读遍历 skills map
+	defer p.mu.RUnlock() // 函数退出时释放锁
+	// 预分配容量，避免后续 append 触发扩容拷贝。
+	out := make([]*types.Skill, 0, len(p.skills))
+	// 遍历 map，将 Skill 指针追加到新切片；外部 append/重排不影响内部 map。
 	for _, s := range p.skills {
 		out = append(out, s) // 拷贝指针到新切片，外部 append/重排不影响内部 map
 	}
@@ -133,20 +140,26 @@ func (p *Pool) All() []*types.Skill {
 // 返回：命中的 Skill 切片（按 Domain 子串或 Tags 命中即纳入）。
 // 设计意图：仅做粗筛，不评估 Skill 相关性；精细化收敛交给 AssembleSet 的 LLM。
 func (p *Pool) FilterByDomain(domain string) []*types.Skill {
+	// 无领域约束时直接返回全量，避免无意义的字符串匹配。
 	if domain == "" {
-		return p.All() // 无领域约束，返回全量
+		return p.All()
 	}
-	domainLower := strings.ToLower(domain) // 统一小写做不区分大小写匹配
+	// 统一小写做不区分大小写匹配，避免大小写差异导致漏匹配。
+	domainLower := strings.ToLower(domain)
+	// 结果切片按需增长，domain 为空的情况已在上面返回，此处一定有筛选。
 	var out []*types.Skill
+	// 遍历全量 Skill，按 domain 与 tags 做子串匹配。
 	for _, s := range p.All() {
-		dm := strings.ToLower(s.Domain) // Skill 的 Domain 字段小写化
+		// Skill 的 Domain 字段小写化，用于不区分大小写比较。
+		dm := strings.ToLower(s.Domain)
 		// 命中条件：Domain 为空/通配 "*"、或双向子串匹配（覆盖 "code,doc" 这类多领域写法）
 		if dm == "" || dm == "*" || strings.Contains(dm, domainLower) || strings.Contains(domainLower, dm) {
 			out = append(out, s)
-			continue
+			continue // 已命中 Domain，无需再检查 Tags
 		}
-		// Domain 未命中则回退到 Tags 匹配，标签作为补充领域信号
+		// Domain 未命中则回退到 Tags 匹配，标签作为补充领域信号。
 		for _, tag := range s.Tags {
+			// 只要 domain 包含任一 tag 子串，即认为命中。
 			if strings.Contains(domainLower, strings.ToLower(tag)) {
 				out = append(out, s)
 				break // 命中一个标签即可，避免重复 append
@@ -176,12 +189,13 @@ func (p *Pool) FilterByDomain(domain string) []*types.Skill {
 // 副作用：仅读池与调 LLM；不写池、不写 Registry。
 // 并发安全：依赖 FilterByDomain/Lock 的并发安全保证。
 func (p *Pool) AssembleSet(ctx context.Context, llm LLMClient, ownerAgent, domain, goal string, maxKeep int) *types.SkillSet {
+	// maxKeep 非法时回退到默认值 8，对应 v3 §5 "≤8" 的上下文预算约束。
 	if maxKeep <= 0 {
-		maxKeep = 8 // 默认上限 8，对应 v3 §5 "≤8" 的上下文预算约束
+		maxKeep = 8
 	}
 
 	candidates := p.FilterByDomain(domain) // 第一步：规则粗筛
-	// 候选数已在预算内，或无 LLM 可用，直接走规则路径
+	// 候选数已在预算内，或无 LLM 可用，直接走规则路径，避免不必要的 LLM 调用。
 	if len(candidates) <= maxKeep || llm == nil {
 		return &types.SkillSet{
 			OwnerAgent: ownerAgent,
@@ -191,11 +205,13 @@ func (p *Pool) AssembleSet(ctx context.Context, llm LLMClient, ownerAgent, domai
 		}
 	}
 
-	// 候选过多，注入运行时 LLM 并委托给选择策略
+	// 候选过多，注入运行时 LLM 并委托给选择策略。
 	policy := p.selectionPolicy
+	// 默认策略需要 LLM 实例，此处生成带 LLM 的副本，不修改原策略。
 	if dp, ok := policy.(*DefaultSkillPolicy); ok {
 		policy = dp.WithLLM(llm)
 	}
+	// 由策略完成二次选择；忽略 error，因为下方有兜底逻辑。
 	picked, _ := policy.Select(ctx, candidates, domain, goal, maxKeep)
 	if len(picked) == 0 {
 		// LLM 失败兜底：按 Cost 升序排序后截断，保证不空返
@@ -215,11 +231,13 @@ func (p *Pool) AssembleSet(ctx context.Context, llm LLMClient, ownerAgent, domai
 // 返回：长度 ≤ max 的切片。若 in 长度已 ≤ max，原样返回（零拷贝）。
 // 设计意图：LLM 不可用或失败时的确定性兜底，避免 SkillSet 超长。
 func trimSkills(in []*types.Skill, max int) []*types.Skill {
+	// 已在预算内，直接返回原切片，避免无意义拷贝与排序。
 	if len(in) <= max {
-		return in // 已在预算内，直接返回
+		return in
 	}
+	// 拷贝后再排序，避免改动调用方传入的切片。
 	cp := make([]*types.Skill, len(in))
-	copy(cp, in) // 拷贝后再排序，避免改动调用方切片
+	copy(cp, in)
 	// 简单选择排序：cost 升序，再 id 升序（O(n^2)，Skill 数量小可接受）
 	for i := 0; i < len(cp); i++ {
 		for j := i + 1; j < len(cp); j++ {
@@ -244,9 +262,10 @@ func trimSkills(in []*types.Skill, max int) []*types.Skill {
 //
 // 返回：装配好的 *types.SkillSet；ids 为空或全部不存在时返回空 SkillSet。
 func (p *Pool) AssembleFromIDs(ownerAgent string, ids []string) *types.SkillSet {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.RLock()         // 加读锁：只读访问 skills map
+	defer p.mu.RUnlock() // 函数退出时释放锁
 	var skills []*types.Skill
+	// 按 ID 顺序遍历，从 skills map 中反查；缺失或 nil 项静默跳过。
 	for _, id := range ids {
 		if s, ok := p.skills[id]; ok && s != nil {
 			skills = append(skills, s)
@@ -265,7 +284,8 @@ func (p *Pool) AssembleFromIDs(ownerAgent string, ids []string) *types.SkillSet 
 // 返回：LLM 选中的 Skill 切片（长度 ≤ maxKeep）；LLM 失败或 JSON 解析失败返回 nil。
 // 设计意图：让 LLM 基于领域 + 目标做相关性判断，弥补纯规则筛选的语义盲区。
 func llmPickSkills(ctx context.Context, llm LLMClient, candidates []*types.Skill, domain, goal string, maxKeep int) []*types.Skill {
-	listing := strings.Builder{} // 拼接候选清单，仅暴露 ID + Description，不泄露完整定义
+	// 拼接候选清单，仅暴露 ID + Description，不泄露完整 Skill 定义，保护上下文空间。
+	listing := strings.Builder{}
 	for _, s := range candidates {
 		listing.WriteString("- ")
 		listing.WriteString(s.SkillID)
@@ -288,8 +308,9 @@ func llmPickSkills(ctx context.Context, llm LLMClient, candidates []*types.Skill
 示例：["read_file","run_command"]`, maxKeep, domain, goal, listing.String())
 
 	resp, err := llm.Generate(ctx, prompt) // 调用 LLM
+	// LLM 出错或空响应，返回 nil，交由调用方兜底。
 	if err != nil || resp == "" {
-		return nil // LLM 出错或空响应，交由调用方兜底
+		return nil
 	}
 	jsonStr := extractJSONArray(resp) // 从可能含 ```json ``` 包裹的响应中提取数组文本
 	var picked []string
@@ -308,8 +329,9 @@ func llmPickSkills(ctx context.Context, llm LLMClient, candidates []*types.Skill
 		if _, ok := idSet[s.SkillID]; ok {
 			out = append(out, s)
 		}
+		// 达到上限即停，防止 LLM 多选越界。
 		if len(out) >= maxKeep {
-			break // 达到上限即停，防止 LLM 多选越界
+			break
 		}
 	}
 	return out
@@ -334,9 +356,11 @@ func llmPickSkills(ctx context.Context, llm LLMClient, candidates []*types.Skill
 //
 // 本函数为兼容旧调用方的包级入口，内部委托给 DefaultSkillPolicy。
 func SelectOne(ctx context.Context, llm LLMClient, set *types.SkillSet, task string) string {
+	// 前置校验：空 SkillSet 或无 LLM 时无法做选择，直接返回空串。
 	if set == nil || len(set.Skills) == 0 || llm == nil {
 		return ""
 	}
+	// 用运行时 LLM 构造默认策略并执行 PickOne；忽略 error，由返回 nil 表示失败。
 	picked, _ := NewDefaultSkillPolicy(llm).PickOne(ctx, set.Skills, task)
 	if picked == nil {
 		return ""
@@ -346,12 +370,14 @@ func SelectOne(ctx context.Context, llm LLMClient, set *types.SkillSet, task str
 
 // SelectOne 在 Pool 持有的 pickOnePolicy 上执行“1 选 1”决策。
 func (p *Pool) SelectOne(ctx context.Context, llm LLMClient, set *types.SkillSet, task string) string {
+	// 前置校验：空 SkillSet 或无 LLM 时无法做选择，直接返回空串。
 	if set == nil || len(set.Skills) == 0 || llm == nil {
 		return ""
 	}
-	p.mu.RLock()
+	p.mu.RLock() // 加读锁：读取当前 pickOnePolicy
 	policy := p.pickOnePolicy
-	p.mu.RUnlock()
+	p.mu.RUnlock() // 立即释放读锁，避免持有锁期间调用 LLM
+	// 默认策略需要运行时 LLM，生成副本后执行。
 	if dp, ok := policy.(*DefaultSkillPolicy); ok {
 		policy = dp.WithLLM(llm)
 	}
@@ -381,6 +407,7 @@ func extractJSONArray(s string) string {
 	}
 	start := strings.Index(s, "[")   // 第一个左方括号
 	end := strings.LastIndex(s, "]") // 最后一个右方括号
+	// 只有找到成对的方括号才返回截取区间，否则原样返回让上层解析报错。
 	if start >= 0 && end > start {
 		return s[start : end+1] // 返回最外层数组区间
 	}

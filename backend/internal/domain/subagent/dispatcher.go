@@ -1,19 +1,20 @@
 package subagent
 
+// 导入所需标准库与项目内部包。
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
+	"context"       // context 用于控制子 Agent 的生命周期与超时
+	"encoding/json" // encoding/json 用于序列化 tool.Result
+	"fmt"           // fmt 用于格式化子 Agent ID 与错误信息
+	"strings"       // strings 用于从 Agent ID 中提取角色 ID
+	"sync"          // sync 提供 sync.Map 存储运行中的子 Agent
+	"sync/atomic"   // sync/atomic 提供原子递增序列号
+	"time"          // time 用于设置子 Agent 独立超时
 
-	"github.com/blockmemory/agent/backend/internal/agent"
-	"github.com/blockmemory/agent/backend/internal/domain/role"
-	"github.com/blockmemory/agent/backend/internal/domain/tool"
-	"github.com/blockmemory/agent/backend/internal/mailbox"
-	"github.com/blockmemory/agent/backend/pkg/types"
+	"github.com/blockmemory/agent/backend/internal/agent"       // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
+	"github.com/blockmemory/agent/backend/internal/domain/role" // role 包提供角色注册表
+	"github.com/blockmemory/agent/backend/internal/domain/tool" // tool 包提供工具注册表与 Result 类型
+	"github.com/blockmemory/agent/backend/internal/mailbox"     // mailbox 包用于子 Agent 向父 Agent 发送完成通知
+	"github.com/blockmemory/agent/backend/pkg/types"            // types 包提供 RoleDefinition 类型
 )
 
 // subAgentTimeout 定义子 Agent 独立执行的最大超时时间。

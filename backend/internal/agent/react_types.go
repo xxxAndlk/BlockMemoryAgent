@@ -1,3 +1,5 @@
+// Package agent 定义 ReActAgent 运行时使用的基础类型、接口与消息转换函数，
+// 使 agent 包对外提供稳定的小型 DTO。
 package agent
 
 import (

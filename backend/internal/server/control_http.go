@@ -1,13 +1,14 @@
 package server
 
 import (
-	"encoding/json"
-	"net/http"
+	"encoding/json" // JSON 编解码
+	"net/http"      // HTTP 处理器与状态码
 
-	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/agent" // Agent 门面与控制命令
 )
 
-// HandleSessionClarify POST /api/sessions/{id}/clarify.
+// HandleSessionClarify 处理 POST /api/sessions/{id}/clarify。
+// 职责：接收用户对澄清问题的回答，转发给 Agent 继续会话。
 func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
@@ -51,7 +52,8 @@ func (m *SessionManager) HandleSessionClarify(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// HandleSessionInterrupt POST /api/sessions/{id}/interrupt.
+// HandleSessionInterrupt 处理 POST /api/sessions/{id}/interrupt。
+// 职责：向会话发送中断内容，打断当前 Agent 执行。
 func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
@@ -87,7 +89,8 @@ func (m *SessionManager) HandleSessionInterrupt(w http.ResponseWriter, r *http.R
 	json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running"})
 }
 
-// HandleSessionEnqueue POST /api/sessions/{id}/enqueue.
+// HandleSessionEnqueue 处理 POST /api/sessions/{id}/enqueue。
+// 职责：将用户内容入队，供会话后续处理。
 func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
@@ -123,7 +126,8 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 	json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running"})
 }
 
-// HandleSessionCancel POST /api/sessions/{id}/cancel.
+// HandleSessionCancel 处理 POST /api/sessions/{id}/cancel。
+// 职责：取消会话当前任务。
 func (m *SessionManager) HandleSessionCancel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

@@ -115,7 +115,7 @@ type (
 	}
 )
 
-// ---- ReadFile ----
+// ---- ReadFile（读取文件） ----
 
 // readFile 读取指定路径的文本内容，并按配置截断过长输出。
 func (e *Executor) readFile(args map[string]any) *Result {
@@ -147,7 +147,7 @@ func (e *Executor) readFile(args map[string]any) *Result {
 	return &Result{Tool: "ReadFile", Success: true, Output: content, Path: absPath}
 }
 
-// ---- WriteFile ----
+// ---- WriteFile（写入文件） ----
 
 // writeFile 将内容写入指定路径，支持普通文件与会话临时文件两种模式。
 func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
@@ -220,7 +220,7 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	return result
 }
 
-// ---- ListDir ----
+// ---- ListDir（列出目录） ----
 
 // listDir 列出指定目录下的条目，并标注每个条目的类型与大小。
 func (e *Executor) listDir(args map[string]any) *Result {
@@ -263,7 +263,7 @@ func (e *Executor) listDir(args map[string]any) *Result {
 	return &Result{Tool: "ListDir", Success: true, Output: strings.Join(lines, "\n"), Path: absPath}
 }
 
-// ---- SearchInFiles ----
+// ---- SearchInFiles（文件内搜索） ----
 
 // searchInFiles 在指定目录下按扩展名白名单递归搜索包含指定模式的文本行。
 func (e *Executor) searchInFiles(args map[string]any) *Result {
@@ -345,7 +345,7 @@ func (e *Executor) searchInFiles(args map[string]any) *Result {
 	return result
 }
 
-// ---- RunCommand ----
+// ---- RunCommand（执行命令） ----
 
 // parseMkdirDir 解析形如 "mkdir -p /some/dir" 的命令字符串，尝试提取目标目录。
 func parseMkdirDir(cmd string) string {
@@ -673,7 +673,7 @@ func extractPortFromCommand(cmdStr string) string {
 	return lastNum
 }
 
-// ---- HTTP ----
+// ---- HTTP 工具 ----
 
 // parseStringMap 将任意类型的输入转换为 map[string]string，用于解析 headers 等字段。
 func parseStringMap(raw any) map[string]string {
@@ -832,7 +832,7 @@ func (e *Executor) httpPost(ctx context.Context, args map[string]any) *Result {
 	}
 }
 
-// ---- Git ----
+// ---- Git 工具 ----
 
 // gitMaxOutput 限制 Git 工具返回文本的最大长度。
 const gitMaxOutput = 10000

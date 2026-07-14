@@ -5,7 +5,7 @@
 package plugins
 
 import (
-	"context"
+	"context" // 上下文，用于工具执行取消与超时
 )
 
 // Tool 是 Agent 可调用的工具抽象。
@@ -32,7 +32,7 @@ type ToolRegistry interface {
 
 // StaticToolRegistry 是 ToolRegistry 的内存实现，作为默认兜底。
 type StaticToolRegistry struct {
-	tools map[string]Tool
+	tools map[string]Tool // 工具名 → Tool 实例
 }
 
 // NewStaticToolRegistry 创建空注册表。
@@ -42,6 +42,7 @@ func NewStaticToolRegistry() *StaticToolRegistry {
 
 // Register 实现 ToolRegistry。
 func (r *StaticToolRegistry) Register(tool Tool) error {
+	// nil 工具静默忽略，避免 map 中存入空值。
 	if tool == nil {
 		return nil
 	}
@@ -57,6 +58,7 @@ func (r *StaticToolRegistry) Get(name string) (Tool, bool) {
 
 // List 实现 ToolRegistry。
 func (r *StaticToolRegistry) List() []string {
+	// 预分配容量，遍历 map 收集工具名。
 	out := make([]string, 0, len(r.tools))
 	for name := range r.tools {
 		out = append(out, name)

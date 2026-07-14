@@ -11,11 +11,11 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
-// Note: board snapshot access now goes through agent.Query("board") so the TUI
-// no longer needs *runtime.Runtime directly.
+// 注：看板快照现在通过 agent.Query("board") 获取，TUI 不再需要直接依赖 *runtime.Runtime。
 
-// View renders the entire TUI in single-column chat-focused layout.
+// View 渲染整个 TUI，采用单列以对话为主的布局。
 func (m Model) View() string {
+	// 终端尺寸未就绪时显示初始化提示。
 	if m.width == 0 || m.height == 0 {
 		return "Initializing..."
 	}
@@ -28,6 +28,7 @@ func (m Model) singleColumnView() string {
 	contentH := m.mainContentHeight()
 
 	var mainRow string
+	// 根据右侧面板可见性决定主内容区布局。
 	if m.rightPanelVisible() {
 		chatW := m.chatAreaWidth()
 		rightW := m.rightPanelWidth()
@@ -38,6 +39,7 @@ func (m Model) singleColumnView() string {
 		mainRow = m.renderChat(m.width, contentH)
 	}
 
+	// 垂直拼接：顶栏、主内容区、输入栏、快捷键栏。
 	view := lipgloss.JoinVertical(lipgloss.Top,
 		m.renderTopBar(m.width),
 		mainRow,
@@ -45,6 +47,7 @@ func (m Model) singleColumnView() string {
 		m.renderShortcutBar(m.width),
 	)
 
+	// 若有弹窗，则在底部追加覆盖层。
 	if m.overlayPanel.mode != overlayNone {
 		overlayH := m.height / 3
 		if overlayH < 6 {
@@ -56,6 +59,7 @@ func (m Model) singleColumnView() string {
 	return view
 }
 
+// renderTopBar 渲染顶部状态栏，展示版本、模型、会话、状态等信息。
 func (m Model) renderTopBar(w int) string {
 	// 左侧：版本、模型、Memory、Skills、MCP、Workspace
 	version := m.styles.TopBarLabel.Render("BlockMemoryAgent") + m.styles.TopBarSep.Render(" v0.8.0")
@@ -74,6 +78,7 @@ func (m Model) renderTopBar(w int) string {
 		status = string(s.Status)
 		sessionID = "#" + s.ID
 	}
+	// 根据状态选择颜色。
 	statusColor := cStatusIdle
 	switch status {
 	case "running":
@@ -96,14 +101,18 @@ func (m Model) renderTopBar(w int) string {
 	timeStr := m.styles.TopBarLabel.Render("Time") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render("00:00:00")
 	right := lipgloss.JoinHorizontal(lipgloss.Left, sessionStr, "  ", statusStr, "  ", timeStr)
 
+	// 左右分栏，中间用空白填充。
 	line := lipgloss.JoinHorizontal(lipgloss.Top, left, lipgloss.NewStyle().Width(w-lipgloss.Width(left)-lipgloss.Width(right)).Render(""), right)
+	// 超出宽度时仅显示左侧，避免折行。
 	if lipgloss.Width(line) > w {
 		line = left
 	}
 	return m.styles.TopBar.Width(w).Height(1).Render(line)
 }
 
+// renderRightPanels 渲染右侧上下堆叠的计划面板与 Agent 编排面板。
 func (m Model) renderRightPanels(w, h int) string {
+	// 保证最小宽度。
 	if w < 20 {
 		w = 20
 	}
@@ -144,7 +153,9 @@ func (m Model) renderRightPanels(w, h int) string {
 	return lipgloss.JoinVertical(lipgloss.Top, m.renderPlanPanel(w, topH), m.renderAgentsPanel(w, bottomH))
 }
 
+// renderPlanPanel 渲染右侧计划面板，展示目标、进度条与任务列表。
 func (m Model) renderPlanPanel(w, h int) string {
+	// 构建标题栏。
 	titleLeft := "执行计划"
 	titleRight := "[P] 关闭"
 	titlePadding := w - lipgloss.Width(titleLeft) - lipgloss.Width(titleRight) - 2
@@ -153,11 +164,13 @@ func (m Model) renderPlanPanel(w, h int) string {
 	}
 	headerText := titleLeft + strings.Repeat(" ", titlePadding) + titleRight
 	header := m.styles.PanelHeader.Width(w).Render(headerText)
+	// 内容区可用宽度。
 	innerW := w - 4
 	if innerW < 10 {
 		innerW = 10
 	}
 
+	// 获取当前会话的看板快照。
 	s := m.selectedSession()
 	var snap board.Snapshot
 	if s != nil {
@@ -208,6 +221,7 @@ func (m Model) renderPlanPanel(w, h int) string {
 		snap.Tasks = tasks
 	}
 
+	// 渲染计划内容行。
 	lines := m.formatPlanSnapshot(innerW, snap)
 	body := strings.Join(lines, "\n")
 	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
@@ -215,6 +229,7 @@ func (m Model) renderPlanPanel(w, h int) string {
 
 // formatPlanSnapshot 把看板快照渲染成计划面板内的文本行。
 func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
+	// 统计已完成数与当前进行中的任务索引。
 	done, total := 0, len(snap.Tasks)
 	current := -1
 	for i, t := range snap.Tasks {
@@ -225,16 +240,19 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
 			current = i
 		}
 	}
+	// 没有明确进行中任务但还有未完成时，默认将 done 索引作为当前任务。
 	if current == -1 && total > 0 && done < total {
 		current = done
 	}
 
 	var lines []string
 	lines = append(lines, m.styles.Dim.Render("Goal: ")+truncate(snap.Goal, innerW-6))
+	// 计算完成百分比。
 	pct := 0
 	if total > 0 {
 		pct = done * 100 / total
 	}
+	// 进度条宽度。
 	barW := innerW - 8
 	if barW < 4 {
 		barW = 4
@@ -247,6 +265,7 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
 	lines = append(lines, fmt.Sprintf("%s %d%%", bar, pct))
 	lines = append(lines, "")
 
+	// 逐条渲染任务。
 	for i, t := range snap.Tasks {
 		icon := statusIcon(string(t.Status))
 		prefix := fmt.Sprintf("%d. ", i+1)
@@ -272,6 +291,7 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
 			padding = 1
 		}
 		line := titlePart + strings.Repeat(" ", padding) + meta
+		// 当前任务高亮，已完成任务暗淡，其他任务默认。
 		if i == current {
 			line = m.styles.StatValue.Render(truncate(line, innerW))
 		} else if t.Status == board.TaskDone {
@@ -336,7 +356,7 @@ func planTaskDomain(title string) string {
 
 // agentCardLine 渲染单个 Agent 卡片行，返回可能占多行的字符串切片。
 // 参考“新TUI页.png”设计：状态色点 + 按角色着色的名称 + 状态徽章 + 时间戳 + 任务描述。
-// agentRoleColor 返回不同 Agent 类型的主题色。
+
 // statusColor 返回状态对应的颜色。
 func statusColor(status string) string {
 	switch status {
@@ -353,11 +373,6 @@ func statusColor(status string) string {
 	}
 }
 
-// agentTreePrefix 根据节点在扁平树中的位置生成树状连接符前缀。
-// collectChatItems 收集当前应展示的全部 chatItem，包含真实会话消息/事件，
-// 以及尚未同步到服务端的本地预展示首条用户消息。
-// buildChatContent 把当前会话的全部 chatItem 渲染成 viewport 可滚动的字符串，
-// 并同步更新 m.chatPanel.itemOffsets。
 // renderScrollbar 绘制右侧垂直滚动条。
 // w/h 为滚动条区域宽高；viewportH/totalLines/startLine 决定滑块位置与高度。
 func (m Model) renderScrollbar(w, h, viewportH, totalLines, startLine int) string {
@@ -402,12 +417,12 @@ func (m Model) renderScrollbar(w, h, viewportH, totalLines, startLine int) strin
 	return lipgloss.NewStyle().Width(w).Height(h).Render(strings.Join(rows, "\n"))
 }
 
-// clipChat applies a fixed Width/Height style so the borderless chat area
-// never grows beyond its allocated space and pushes the input bar down.
+// clipChat 给无边框对话区应用固定宽高样式，防止其超出分配空间并挤下输入栏。
 func (m Model) clipChat(content string, w, h int) string {
 	return lipgloss.NewStyle().Width(w).Height(h).Render(content)
 }
 
+// renderPlanBar 渲染旧版计划进度栏。
 func (m Model) renderPlanBar(w int) string {
 	var snap board.Snapshot
 	var toolLabel string
@@ -419,7 +434,7 @@ func (m Model) renderPlanBar(w int) string {
 	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
 }
 
-// inputIsMultiline 判断当前输入是否包含换行（粘贴大段/多行内容）。
+// renderShortcutBar 渲染底部快捷键栏，展示常用按键提示。
 func (m Model) renderShortcutBar(w int) string {
 	shortcuts := []struct {
 		key   string
@@ -477,18 +492,21 @@ func wrapToWidth(s string, width int) []string {
 	inAnsi := false
 	for _, r := range s {
 		if r == '\x1b' {
+			// 进入 ANSI 转义序列。
 			inAnsi = true
 			b.WriteRune(r)
 			continue
 		}
 		if inAnsi {
 			b.WriteRune(r)
+			// 字母表示 ANSI 序列结束。
 			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
 				inAnsi = false
 			}
 			continue
 		}
 		if r == '\n' {
+			// 保留原有换行。
 			lines = append(lines, b.String())
 			b.Reset()
 			curW = 0
@@ -510,8 +528,8 @@ func wrapToWidth(s string, width int) []string {
 	return lines
 }
 
-// displayDetailLines returns detail lines as they will be rendered.
-// Tool output (🔧 prefix) is truncated to 5 lines + "    ..." to keep the TUI compact.
+// displayDetailLines 返回详情行的实际渲染内容。
+// 工具输出（🔧 前缀）在主对话区最多展示 5 行，并追加 "    ..." 以保持 TUI 紧凑。
 func displayDetailLines(title, detail string) []string {
 	lines := strings.Split(detail, "\n")
 	if strings.HasPrefix(title, "🔧") && len(lines) > 5 {
@@ -521,6 +539,7 @@ func displayDetailLines(title, detail string) []string {
 	return lines
 }
 
+// truncate 按显示宽度截断字符串并在末尾追加省略号（占 1 列）。
 func truncate(s string, n int) string {
 	if n <= 0 {
 		return ""

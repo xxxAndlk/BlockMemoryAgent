@@ -84,38 +84,41 @@ type DynamicRoleTemplate struct {
 //
 // 副作用: 无外部状态修改，仅读取文件与环境变量。
 func LoadRoleConfig(path string) (*RoleConfigFile, error) {
-	// 读取整个配置文件内容
+	// 读取整个配置文件内容到内存。
 	data, err := os.ReadFile(path)
 	if err != nil {
-		// 包装错误便于上层定位
+		// 包装错误便于上层定位是读文件阶段失败。
 		return nil, fmt.Errorf("read role config: %w", err)
 	}
 
-	// 反序列化 YAML 到结构体
+	// 反序列化 YAML 到结构体变量 cfg。
 	var cfg RoleConfigFile
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		// 包装错误便于上层定位是 YAML 解析阶段失败。
 		return nil, fmt.Errorf("unmarshal role config: %w", err)
 	}
 
-	// 解析配置中的环境变量引用(如 ${OPENAI_API_KEY})
+	// 解析配置中的环境变量引用(如 ${OPENAI_API_KEY})。
 	cfg.resolveEnvVars()
 
-	// 设置默认值: MaxBlocks 默认 10
+	// 设置默认值: MaxBlocks 默认 10，避免零值导致旧 API 兼容性异常。
 	if cfg.MetaAgent.MaxBlocks <= 0 {
 		cfg.MetaAgent.MaxBlocks = 10
 	}
-	// SummaryInterval 默认 5 步
+	// SummaryInterval 默认 5 步，使会话总结机制默认生效。
 	if cfg.MetaAgent.SummaryInterval <= 0 {
 		cfg.MetaAgent.SummaryInterval = 5
 	}
-	// Embed 默认值: provider 为空时回退 pseudo, batch_size 默认 1
+	// Embed 默认值: provider 为空时回退 pseudo，避免嵌入模块因空 provider 崩溃。
 	if cfg.Embed.Provider == "" {
 		cfg.Embed.Provider = "pseudo"
 	}
+	// BatchSize 默认 1，保持与原有逐条嵌入行为一致。
 	if cfg.Embed.BatchSize <= 0 {
 		cfg.Embed.BatchSize = 1
 	}
 
+	// 返回解析并填充默认值后的配置指针。
 	return &cfg, nil
 }
 
@@ -124,24 +127,24 @@ func LoadRoleConfig(path string) (*RoleConfigFile, error) {
 // 覆盖范围: MetaAgent / DomainAgent / 每个 FixedRoles 的 APIKey 与 BaseURL。
 // 副作用: 直接修改接收者内部字段。
 func (c *RoleConfigFile) resolveEnvVars() {
-	// MetaAgent 模型配置: 密钥与 BaseURL
+	// MetaAgent 模型配置: 密钥与 BaseURL。
 	c.MetaAgent.ModelConfig.APIKey = resolveEnv(c.MetaAgent.ModelConfig.APIKey)
 	c.MetaAgent.ModelConfig.BaseURL = resolveEnv(c.MetaAgent.ModelConfig.BaseURL)
-	// DomainAgent 模型配置: 密钥与 BaseURL
+	// DomainAgent 模型配置: 密钥与 BaseURL。
 	c.DomainAgent.ModelConfig.APIKey = resolveEnv(c.DomainAgent.ModelConfig.APIKey)
 	c.DomainAgent.ModelConfig.BaseURL = resolveEnv(c.DomainAgent.ModelConfig.BaseURL)
-	// 轻量模型配置: 密钥与 BaseURL
+	// 轻量模型配置: 密钥与 BaseURL。
 	c.LightweightModel.APIKey = resolveEnv(c.LightweightModel.APIKey)
 	c.LightweightModel.BaseURL = resolveEnv(c.LightweightModel.BaseURL)
-	// 文本嵌入模型配置: 密钥与 BaseURL
+	// 文本嵌入模型配置: 密钥与 BaseURL。
 	c.Embed.APIKey = resolveEnv(c.Embed.APIKey)
 	c.Embed.BaseURL = resolveEnv(c.Embed.BaseURL)
-	// 逐个固定角色: 密钥与 BaseURL
+	// 逐个固定角色: 密钥与 BaseURL。
 	for i := range c.FixedRoles {
 		c.FixedRoles[i].ModelConfig.APIKey = resolveEnv(c.FixedRoles[i].ModelConfig.APIKey)
 		c.FixedRoles[i].ModelConfig.BaseURL = resolveEnv(c.FixedRoles[i].ModelConfig.BaseURL)
 	}
-	// 动态角色模板: 密钥与 BaseURL（P3-4）
+	// 动态角色模板: 密钥与 BaseURL（P3-4）。
 	for i := range c.DynamicTemplates {
 		c.DynamicTemplates[i].ModelConfig.APIKey = resolveEnv(c.DynamicTemplates[i].ModelConfig.APIKey)
 		c.DynamicTemplates[i].ModelConfig.BaseURL = resolveEnv(c.DynamicTemplates[i].ModelConfig.BaseURL)
@@ -157,13 +160,15 @@ func (c *RoleConfigFile) resolveEnvVars() {
 //   - 命中返回角色定义指针(指向内部切片元素，调用方不应长期持有)。
 //   - 未命中返回 nil。
 func (c *RoleConfigFile) GetFixedRole(roleID string) *types.RoleDefinition {
-	// 线性扫描 FixedRoles 切片
+	// 线性扫描 FixedRoles 切片。
 	for i := range c.FixedRoles {
+		// ID 匹配则返回该元素的指针，避免拷贝整个结构体。
 		if c.FixedRoles[i].ID == roleID {
-			// 返回元素指针，避免拷贝
+			// 返回元素指针，调用方需注意切片扩容会使该指针失效。
 			return &c.FixedRoles[i]
 		}
 	}
+	// 未命中返回 nil，调用方需做 nil 检查。
 	return nil
 }
 
@@ -174,13 +179,16 @@ func (c *RoleConfigFile) GetFixedRole(roleID string) *types.RoleDefinition {
 //
 // 返回: 新切片(可能为空)，不修改内部状态。
 func (c *RoleConfigFile) GetFixedRolesByType(roleType enums.RoleType) []types.RoleDefinition {
+	// 初始化空结果切片，保持 nil/empty 语义由 append 决定。
 	var result []types.RoleDefinition
+	// 遍历所有固定角色，按类型匹配筛选。
 	for _, r := range c.FixedRoles {
-		// 类型匹配则追加到结果
+		// 类型匹配则追加到结果。
 		if r.Type == roleType {
 			result = append(result, r)
 		}
 	}
+	// 返回新切片，原配置不受影响。
 	return result
 }
 
@@ -191,11 +199,14 @@ func (c *RoleConfigFile) GetFixedRolesByType(roleType enums.RoleType) []types.Ro
 //
 // 返回: 命中返回模板指针，未命中返回 nil。
 func (c *RoleConfigFile) GetDynamicTemplate(templateID string) *DynamicRoleTemplate {
+	// 线性扫描 DynamicTemplates 切片。
 	for i := range c.DynamicTemplates {
+		// ID 匹配立即返回指针。
 		if c.DynamicTemplates[i].ID == templateID {
 			return &c.DynamicTemplates[i]
 		}
 	}
+	// 未命中返回 nil。
 	return nil
 }
 
@@ -212,25 +223,27 @@ func (c *RoleConfigFile) GetDynamicTemplate(templateID string) *DynamicRoleTempl
 //
 // 返回: true 允许调用; false 拒绝。
 func (c *RoleConfigFile) CanCall(callerRoleDefID, calleeRoleDefID string) bool {
-	// 取调用方角色定义
+	// 取调用方角色定义，若不存在则无法授权，直接拒绝。
 	caller := c.GetFixedRole(callerRoleDefID)
 	if caller == nil {
-		// 调用方不存在，直接拒绝
+		// 调用方不存在，直接拒绝。
 		return false
 	}
-	// 规则2: meta/domain 可调用任意 fixed/dynamic 助手
+	// 规则2: meta/domain 可调用任意 fixed/dynamic 助手。
 	if caller.Type == enums.RoleTypeMeta || caller.Type == enums.RoleTypeDomain {
+		// 查询被调用方角色定义。
 		callee := c.GetFixedRole(calleeRoleDefID)
+		// 被调用方存在且类型为固定或动态助手时允许调用。
 		if callee != nil && (callee.Type == enums.RoleTypeFixed || callee.Type == enums.RoleTypeDynamic) {
 			return true
 		}
 	}
-	// 规则3: 检查 Parents 显式声明
+	// 规则3: 检查 Parents 显式声明，命中则允许调用。
 	for _, parent := range caller.Parents {
 		if parent == calleeRoleDefID {
 			return true
 		}
 	}
-	// 默认拒绝
+	// 默认拒绝：未通过任何授权规则。
 	return false
 }

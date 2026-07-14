@@ -10,7 +10,9 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
+// TestAgentTreePrefix 验证 Agent 树前缀连接符的渲染结果。
 func TestAgentTreePrefix(t *testing.T) {
+	// 构造一个三层扁平节点列表，用于测试前缀生成。
 	nodes := []agentTreeNode{
 		{depth: 0, name: "Meta"},
 		{depth: 1, name: "A"},
@@ -20,6 +22,7 @@ func TestAgentTreePrefix(t *testing.T) {
 		{depth: 1, name: "C"},
 	}
 
+	// 期望每个索引对应的前缀。
 	cases := []struct {
 		idx  int
 		want string
@@ -32,6 +35,7 @@ func TestAgentTreePrefix(t *testing.T) {
 		{5, "└─ "},
 	}
 
+	// 逐个断言。
 	for _, c := range cases {
 		got := agentTreePrefix(nodes, c.idx)
 		if got != c.want {
@@ -40,16 +44,19 @@ func TestAgentTreePrefix(t *testing.T) {
 	}
 }
 
+// TestAgentCardLineRendersGoalAndBadge 验证 Agent 卡片行能正确渲染名称、状态徽章与目标。
 func TestAgentCardLineRendersGoalAndBadge(t *testing.T) {
 	m := &Model{
 		styles:         NewStyles(),
 		taskBriefCache: NewTaskBriefCache(),
 	}
+	// 构造一个包含 MetaAgent 与 UI 领域 Agent 的扁平节点列表。
 	nodes := []agentTreeNode{
 		{depth: 0, name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive, createdAt: time.Now()},
 		{depth: 1, name: "UI", roleType: enums.RoleTypeDomain, status: enums.RoleStatusDone, goal: "设计后台前端页面", createdAt: time.Now()},
 	}
 	lines := m.agentCardLine(nodes[1], 1, 80)
+	// 有目标的 Agent 应渲染两行。
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 lines for agent with goal, got %d: %v", len(lines), lines)
 	}
@@ -66,41 +73,65 @@ func TestAgentCardLineRendersGoalAndBadge(t *testing.T) {
 	}
 }
 
-// stubAgent returns titles unchanged so the brief cache falls back to truncation.
+// stubAgent 是一个最小化的 agent.Agent 实现，SummarizeTaskTitle 直接返回原标题，
+// 使 taskBriefCache 在测试中回退到截断逻辑。
 type stubAgent struct{}
 
+// CreateSession 是 stubAgent 的空实现。
 func (stubAgent) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) {
 	return nil, nil
 }
+
+// ResumeSession 是 stubAgent 的空实现。
 func (stubAgent) ResumeSession(ctx context.Context, sessionID string, req agent.ResumeRequest) (*agent.Session, error) {
 	return nil, nil
 }
+
+// Send 是 stubAgent 的空实现。
 func (stubAgent) Send(ctx context.Context, sessionID string, msg agent.Message) error { return nil }
+
+// Stream 是 stubAgent 的空实现。
 func (stubAgent) Stream(ctx context.Context, sessionID string) (<-chan agent.Event, error) {
 	return nil, nil
 }
+
+// Query 是 stubAgent 的空实现。
 func (stubAgent) Query(ctx context.Context, sessionID string, q agent.Query) (agent.Result, error) {
 	return agent.Result{}, nil
 }
+
+// Control 是 stubAgent 的空实现。
 func (stubAgent) Control(ctx context.Context, sessionID string, cmd agent.ControlCommand) error {
 	return nil
 }
+
+// List 是 stubAgent 的空实现。
 func (stubAgent) List(ctx context.Context, filter agent.Filter) ([]*agent.Session, error) {
 	return nil, nil
 }
+
+// Get 是 stubAgent 的空实现。
 func (stubAgent) Get(ctx context.Context, sessionID string) (*agent.Session, error) { return nil, nil }
+
+// ListAgents 是 stubAgent 的空实现。
 func (stubAgent) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return nil, nil
 }
-func (stubAgent) Shutdown(ctx context.Context) error                          { return nil }
+
+// Shutdown 是 stubAgent 的空实现。
+func (stubAgent) Shutdown(ctx context.Context) error { return nil }
+
+// SummarizeTaskTitle 是 stubAgent 的标题摘要实现，直接返回原标题。
 func (stubAgent) SummarizeTaskTitle(ctx context.Context, title string) string { return title }
 
+// TestSummarizeTaskTitleFallback 验证 summarizeTaskTitle 对长标题的截断兜底与短标题的保留行为。
 func TestSummarizeTaskTitleFallback(t *testing.T) {
 	m := &Model{
 		styles:         NewStyles(),
 		taskBriefCache: NewTaskBriefCache(),
 		agent:          stubAgent{},
 	}
+	// 构造一个超长标题。
 	long := strings.Repeat("设计并实现一个完整的后台管理系统前端页面包含商品管理和订单管理以及用户管理模块", 2)
 	got := m.summarizeTaskTitle(long)
 	if strings.Contains(got, long) {

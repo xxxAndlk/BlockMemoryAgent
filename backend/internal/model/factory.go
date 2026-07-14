@@ -19,12 +19,14 @@ import (
 // LLMClient 大模型客户端接口（与 graph 包兼容）。
 // 设计意图：解耦 graph 层与具体 provider 实现，便于测试与替换。
 type LLMClient interface {
-	Generate(ctx context.Context, prompt string) (string, error) // 单轮文本生成
+	// Generate 执行单轮文本生成。
+	Generate(ctx context.Context, prompt string) (string, error)
 }
 
 // TemperatureAware 可选接口：支持 per-call temperature 覆盖。
 // BladesClient 实现此接口。
 type TemperatureAware interface {
+	// GenerateWithOptions 按指定温度生成文本。
 	GenerateWithOptions(ctx context.Context, prompt string, temperature float64) (string, error)
 }
 
@@ -32,6 +34,7 @@ type TemperatureAware interface {
 // BladesClient 实现此接口；仅需要真实 token 计量的路径（blades 工具循环的 mock 退化路径）使用。
 // 设计意图（P0-4）：不破坏 LLMClient.Generate 的两返回值签名，需要用量的调用方类型断言到本接口。
 type UsageAware interface {
+	// GenerateWithUsage 执行生成并返回 token 用量。
 	GenerateWithUsage(ctx context.Context, prompt string) (text string, usage blades.TokenUsage, err error)
 }
 
@@ -53,6 +56,7 @@ type UsageAware interface {
 func GenerateWithTemperature(ctx context.Context, c LLMClient, prompt string, temperature float64) (string, error) {
 	// 类型断言：判断是否支持温度覆盖
 	if t, ok := c.(TemperatureAware); ok {
+		// 支持则按指定温度调用
 		return t.GenerateWithOptions(ctx, prompt, temperature)
 	}
 	// 不支持则忽略温度，走默认 Generate
@@ -79,6 +83,7 @@ type ModelFactory struct {
 // 副作用：无（不做网络请求）。
 // 并发安全：返回实例可被多协程共享调用。
 func NewModelFactory(cfg *config.RoleConfigFile) *ModelFactory {
+	// 初始化工厂，创建空缓存与动态配置 map
 	return &ModelFactory{
 		models:         make(map[string]LLMClient), // 初始化空缓存
 		cfg:            cfg,
@@ -103,13 +108,16 @@ func (f *ModelFactory) GetModel(ctx context.Context, roleDefID string) (LLMClien
 	// 快路径：读锁查缓存
 	f.mu.RLock()
 	if m, ok := f.models[roleDefID]; ok {
+		// 缓存命中，释放读锁并返回
 		f.mu.RUnlock()
 		return m, nil
 	}
+	// 缓存未命中，释放读锁准备升级写锁
 	f.mu.RUnlock()
 
 	// 慢路径：升级为写锁构造
 	f.mu.Lock()
+	// 函数退出时释放写锁
 	defer f.mu.Unlock()
 
 	// 双重检查：防止等待锁期间已被其他协程构造
@@ -154,11 +162,13 @@ func (f *ModelFactory) GetBladesProvider(ctx context.Context, roleDefID string) 
 	// 先取 LLMClient（带缓存）
 	client, err := f.GetModel(ctx, roleDefID)
 	if err != nil {
+		// 构造失败直接返回错误
 		return nil, err
 	}
 	// 类型断言为 BladesClient
 	bc, ok := client.(*BladesClient)
 	if !ok {
+		// 非 BladesClient 无法提供底层 provider
 		return nil, fmt.Errorf("blades provider unavailable for %s", roleDefID)
 	}
 	// 返回底层 provider
@@ -170,13 +180,21 @@ func (f *ModelFactory) GetBladesProvider(ctx context.Context, roleDefID string) 
 // 当 GetModel 遇到非 meta/domain/lightweight/FixedRole 的角色 ID 时，优先使用此处注册的配置，
 // 未注册再回退到 DomainAgent 模型。
 //
+// 参数：
+//   - roleDefID: 动态角色 ID
+//   - cfg: 该角色的模型配置
+//
 // 并发安全：内部持锁。
 func (f *ModelFactory) RegisterDynamicModelConfig(roleDefID string, cfg types.AgentModelConfig) {
+	// 加写锁保护 dynamicConfigs
 	f.mu.Lock()
+	// 退出时释放写锁
 	defer f.mu.Unlock()
+	// 防御性初始化 map
 	if f.dynamicConfigs == nil {
 		f.dynamicConfigs = make(map[string]types.AgentModelConfig)
 	}
+	// 注册动态角色配置
 	f.dynamicConfigs[roleDefID] = cfg
 }
 
@@ -184,14 +202,16 @@ func (f *ModelFactory) RegisterDynamicModelConfig(roleDefID string, cfg types.Ag
 // 设计意图：MetaAgent 是图入口节点，使用独立（通常更轻量）的模型配置。
 // 并发安全：委托 GetModel。
 func (f *ModelFactory) GetMetaModel(ctx context.Context) (LLMClient, error) {
-	return f.GetModel(ctx, "meta") // "meta" 为 MetaAgent 的固定缓存键
+	// "meta" 为 MetaAgent 的固定缓存键
+	return f.GetModel(ctx, "meta")
 }
 
 // GetDomainModel 获取 DomainAgent 的模型（所有 DomainAgent 共用）。
 // 设计意图：DomainAgent 数量可变，统一复用同一模型配置以减少开销。
 // 并发安全：委托 GetModel。
 func (f *ModelFactory) GetDomainModel(ctx context.Context) (LLMClient, error) {
-	return f.GetModel(ctx, "domain") // "domain" 为 Domain/SubDomain 共用缓存键
+	// "domain" 为 Domain/SubDomain 共用缓存键
+	return f.GetModel(ctx, "domain")
 }
 
 // GetLightweightModel 获取轻量模型，用于历史总结/检索 query 改写等低开销任务。
@@ -199,7 +219,8 @@ func (f *ModelFactory) GetDomainModel(ctx context.Context) (LLMClient, error) {
 // 未配置 lightweight_model 时回退到 DomainAgent 模型（见 resolveConfig）。
 // 并发安全：委托 GetModel。
 func (f *ModelFactory) GetLightweightModel(ctx context.Context) (LLMClient, error) {
-	return f.GetModel(ctx, "lightweight") // "lightweight" 为轻量模型固定缓存键
+	// "lightweight" 为轻量模型固定缓存键
+	return f.GetModel(ctx, "lightweight")
 }
 
 // resolveConfig 根据角色ID解析模型配置。
@@ -218,11 +239,14 @@ func (f *ModelFactory) GetLightweightModel(ctx context.Context) (LLMClient, erro
 // 副作用：无。
 // 并发安全：只读 cfg，无锁。
 func (f *ModelFactory) resolveConfig(roleDefID string) types.AgentModelConfig {
+	// 根据角色 ID 进入不同分支
 	switch roleDefID {
 	case "meta":
-		return f.cfg.MetaAgent.ModelConfig // MetaAgent 专用配置
+		// MetaAgent 专用配置
+		return f.cfg.MetaAgent.ModelConfig
 	case "domain":
-		return f.cfg.DomainAgent.ModelConfig // DomainAgent 共用配置
+		// DomainAgent 共用配置
+		return f.cfg.DomainAgent.ModelConfig
 	case "lightweight":
 		// 轻量模型：用于历史总结/检索 query 改写等低开销任务。
 		// 未配置时回退到 DomainAgent 配置，保证启动不中断。
@@ -268,6 +292,7 @@ func (f *ModelFactory) WarmUp(ctx context.Context) error {
 	if _, err := f.GetLightweightModel(ctx); err != nil {
 		return fmt.Errorf("warmup lightweight model: %w", err)
 	}
+	// 全部预热成功
 	return nil
 }
 
@@ -282,6 +307,9 @@ const probePrompt = "ping"
 //   - APIKey 为空视为未配置，加入失败列表，不允许 Mock/无 key 跳过启动
 //   - 每个唯一后端用 probeLLM 探测（3 次重试，短超时）
 //
+// 参数：
+//   - ctx: 上下文
+//
 // 返回：
 //   - error: 任一角色不可达或未配置时返回聚合错误（列出全部失败角色），全部可达则返回 nil
 //
@@ -290,25 +318,34 @@ const probePrompt = "ping"
 func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 	// 候选角色列表：三个内置角色 + 全部固定角色
 	roles := []string{"meta", "domain", "lightweight"}
+	// 遍历固定角色配置，追加非空 ID
 	for _, fr := range f.cfg.FixedRoles {
 		if fr.ID != "" {
 			roles = append(roles, fr.ID)
 		}
 	}
 
-	seen := make(map[string]bool) // 按 (provider,model,key,baseURL) 去重
+	// 按 (provider,model,key,baseURL) 去重，避免同一后端重复探测
+	seen := make(map[string]bool)
+	// 收集所有失败角色的描述
 	var failed []string
+	// 遍历每个候选角色
 	for _, roleID := range roles {
+		// 解析该角色的模型配置
 		cfg := f.resolveConfig(roleID)
 		// 严格启动：未配置 API Key 视为不可达，不跳过。
 		if cfg.APIKey == "" {
 			failed = append(failed, fmt.Sprintf("%s (api_key not configured)", roleID))
+			// 跳过本次循环，继续检查下一个角色
 			continue
 		}
+		// 用 \x00 拼接配置字段作为去重 key
 		key := cfg.Provider + "\x00" + cfg.Model + "\x00" + cfg.APIKey + "\x00" + cfg.BaseURL
+		// 若同一后端已探测，则跳过
 		if seen[key] {
-			continue // 同一后端已探测，跳过
+			continue
 		}
+		// 标记该后端已探测
 		seen[key] = true
 
 		// 构造一个 MaxTokens=1 的临时探测客户端：连通性探测只需模型"能应答"，
@@ -317,30 +354,44 @@ func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 		// 端点/模型名）通常在 <1s 内返回 4xx，仍能快速失败。
 		probeCfg := cfg
 		probeCfg.MaxTokens = 1
+		// 创建临时探测客户端
 		probeClient, err := NewBladesClient(ctx, probeCfg)
 		if err != nil {
+			// 构造失败计入失败列表
 			failed = append(failed, fmt.Sprintf("%s (构造失败: %v)", roleID, err))
+			// 继续探测下一个角色
 			continue
 		}
 		// 探测：整体 60s（容纳 2 次重试 + 退避 + 冷启动），单次 30s
 		// deepseek-v4-flash 等推理类模型首包冷启动可能 >12s，拉长单次超时避免误杀
 		probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		// 发起最小化调用验证连通性
 		if err := probeLLM(probeCtx, probeClient); err != nil {
+			// 探测失败，记录失败原因
 			failed = append(failed, fmt.Sprintf("%s (model=%s: %v)", roleID, cfg.Model, err))
 		}
+		// 释放探测上下文
 		cancel()
 	}
 
+	// 若存在失败角色，返回聚合错误
 	if len(failed) > 0 {
 		return fmt.Errorf("LLM 连通性校验未通过: %s", strings.Join(failed, "; "))
 	}
+	// 全部通过
 	return nil
 }
 
 // probeLLM 对已构造的探测客户端发起一次最小化调用（2 次重试，单次 30s），验证可连通性。
 // 注：传入的 client 应已用 MaxTokens=1 构造，确保正常 LLM 快速应答。
-// 返回 nil 表示连通。
+//
+// 参数：
+//   - ctx: 上下文
+//   - client: LLM 客户端
+//
+// 返回：nil 表示连通，非 nil 表示失败。
 func probeLLM(ctx context.Context, client LLMClient) error {
+	// 调用 retryGenerate 进行最多 3 次尝试（含退避）
 	_, err, _ := retryGenerate(ctx, client, probePrompt, 30*time.Second)
 	return err
 }
@@ -350,11 +401,22 @@ func probeLLM(ctx context.Context, client LLMClient) error {
 // 设计意图（P0-1）：reflectOnResult / summarizeHistoryForGoal 等轻量直连 callers
 // 原本绕过 tracker 直调 llm.Generate 无重试；统一收敛到本方法，落实"轻量级总结模型优化"。
 // per-attempt 超时 30s，整体取消由 ctx 控制。
+//
+// 参数：
+//   - ctx: 上下文
+//   - prompt: 提示词
+//
+// 返回：
+//   - string: 模型回复
+//   - error: 调用错误
 func (f *ModelFactory) CallLightweightWithRetry(ctx context.Context, prompt string) (string, error) {
+	// 获取轻量模型客户端
 	llm, err := f.GetLightweightModel(ctx)
 	if err != nil {
+		// 获取失败直接返回错误
 		return "", err
 	}
+	// 调用带重试的生成，单次超时 30 秒
 	resp, err, _ := retryGenerate(ctx, llm, prompt, 30*time.Second)
 	return resp, err
 }

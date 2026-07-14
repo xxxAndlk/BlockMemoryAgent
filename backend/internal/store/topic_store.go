@@ -16,6 +16,7 @@ type TopicStore struct {
 
 // Create 创建话题元数据。
 // 参数:
+//   - ctx:   请求上下文。
 //   - topic: 含 ID/Goal/Status/CreatedAt/ExpiresAt
 //
 // 返回: SQL 执行错误。
@@ -24,14 +25,15 @@ func (s *TopicStore) Create(ctx context.Context, topic *types.TopicMeta) error {
 	// 暂以空 map 占位,后续通过 SetTopicConstraints 维护
 	constraints, _ := json.Marshal(map[string]string{})
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO topics (id, goal, status, constraints, created_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, topic.ID, topic.Goal, topic.Status, constraints, topic.CreatedAt, topic.ExpiresAt)
+			INSERT INTO topics (id, goal, status, constraints, created_at, expires_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, topic.ID, topic.Goal, topic.Status, constraints, topic.CreatedAt, topic.ExpiresAt)
 	return err
 }
 
 // Get 读取话题元数据。
 // 参数:
+//   - ctx:     请求上下文。
 //   - topicID: 话题 ID
 //
 // 返回: 命中返回 *TopicMeta;不存在返回 (nil, nil)。
@@ -41,9 +43,9 @@ func (s *TopicStore) Get(ctx context.Context, topicID string) (*types.TopicMeta,
 	var constraintsRaw []byte
 	var expiresAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, goal, status, constraints, created_at, expires_at
-		FROM topics WHERE id = $1
-	`, topicID).Scan(&t.ID, &t.Goal, &t.Status, &constraintsRaw, &t.CreatedAt, &expiresAt)
+			SELECT id, goal, status, constraints, created_at, expires_at
+			FROM topics WHERE id = $1
+		`, topicID).Scan(&t.ID, &t.Goal, &t.Status, &constraintsRaw, &t.CreatedAt, &expiresAt)
 	// 行不存在视为正常情况
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -60,6 +62,7 @@ func (s *TopicStore) Get(ctx context.Context, topicID string) (*types.TopicMeta,
 
 // SaveArchive 持久化话题归档摘要 (UPSERT)。
 // 参数:
+//   - ctx:       请求上下文。
 //   - topicID:   话题 ID
 //   - summary:   归档摘要文本
 //   - outputs:   产出 JSON (RawMessage)
@@ -70,10 +73,10 @@ func (s *TopicStore) Get(ctx context.Context, topicID string) (*types.TopicMeta,
 // 副作用: 同一 topic_id 重复归档会覆盖原记录。
 func (s *TopicStore) SaveArchive(ctx context.Context, topicID, summary string, outputs, decisions json.RawMessage, embedding []float32) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO topic_archives (topic_id, summary, outputs, decisions, embedding, archived_at)
-		VALUES ($1, $2, $3, $4, $5, NOW())
-		ON CONFLICT (topic_id) DO UPDATE
-		SET summary = $2, outputs = $3, decisions = $4, embedding = $5, archived_at = NOW()
-	`, topicID, summary, outputs, decisions, pgVector(embedding))
+			INSERT INTO topic_archives (topic_id, summary, outputs, decisions, embedding, archived_at)
+			VALUES ($1, $2, $3, $4, $5, NOW())
+			ON CONFLICT (topic_id) DO UPDATE
+			SET summary = $2, outputs = $3, decisions = $4, embedding = $5, archived_at = NOW()
+		`, topicID, summary, outputs, decisions, pgVector(embedding))
 	return err
 }

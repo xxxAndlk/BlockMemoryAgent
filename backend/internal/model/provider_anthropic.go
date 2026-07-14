@@ -1,38 +1,46 @@
 package model
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
+	"context"       // 上下文传递
+	"encoding/json" // JSON 序列化
+	"fmt"           // 错误格式化
 
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
-	"github.com/blockmemory/agent/backend/pkg/types"
-	"github.com/go-kratos/blades"
-	bladestools "github.com/go-kratos/blades/tools"
-	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/anthropics/anthropic-sdk-go"         // Anthropic Go SDK
+	"github.com/anthropics/anthropic-sdk-go/option"  // Anthropic 客户端选项
+	"github.com/blockmemory/agent/backend/pkg/types" // 共享配置类型
+	"github.com/go-kratos/blades"                    // ModelProvider 抽象
+	bladestools "github.com/go-kratos/blades/tools"  // blades 工具定义
+	"github.com/google/jsonschema-go/jsonschema"     // JSON Schema 处理
 )
 
 // anthropicProvider 基于 Anthropic Go SDK 原生 Messages API 的 provider 封装。
 type anthropicProvider struct {
-	client      anthropic.Client
-	modelName   string
-	maxTokens   int64
-	temperature float64
+	client      anthropic.Client // Anthropic SDK 客户端
+	modelName   string           // 模型名称
+	maxTokens   int64            // 最大输出 token 数
+	temperature float64          // 采样温度
 }
 
 // newAnthropicProvider 构造一个 Anthropic 原生 provider。
+//
+// 参数：
+//   - cfg: 模型配置
+//
+// 返回：blades.ModelProvider 实例。
 func newAnthropicProvider(cfg types.AgentModelConfig) blades.ModelProvider {
+	// 若未配置 baseURL，使用 Anthropic 官方默认端点
 	baseURL := cfg.BaseURL
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
 
+	// 解析 MaxTokens，未配置或非法时回退到 4096
 	maxTokens := int64(cfg.MaxTokens)
 	if maxTokens <= 0 {
 		maxTokens = 4096
 	}
 
+	// 创建 Anthropic 客户端并封装为 provider
 	return &anthropicProvider{
 		client:      anthropic.NewClient(option.WithAPIKey(cfg.APIKey), option.WithBaseURL(baseURL)),
 		modelName:   cfg.Model,
@@ -41,14 +49,26 @@ func newAnthropicProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 	}
 }
 
+// Name 返回 provider 使用的模型名称。
 func (p *anthropicProvider) Name() string { return p.modelName }
 
+// Generate 调用 Anthropic Messages API 完成生成。
+//
+// 参数：
+//   - ctx: 上下文
+//   - req: blades 模型请求
+//
+// 返回：
+//   - *blades.ModelResponse: 模型响应
+//   - error: 生成或转换错误
 func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	// 转换 messages
 	messages, err := p.convertMessages(req.Messages)
 	if err != nil {
 		return nil, fmt.Errorf("convert messages: %w", err)
 	}
 
+	// 构造 Anthropic 请求参数
 	params := anthropic.MessageNewParams{
 		Model:       anthropic.Model(p.modelName),
 		MaxTokens:   p.maxTokens,
@@ -58,30 +78,51 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 		Temperature: anthropic.Float(p.temperature),
 	}
 
+	// 调用 Anthropic Messages API
 	resp, err := p.client.Messages.New(ctx, params)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic messages: %w", err)
 	}
 
+	// 转换响应为 blades 格式
 	msg := p.convertResponse(resp)
 	return &blades.ModelResponse{Message: msg}, nil
 }
 
+// NewStreaming 创建流式生成器（当前为简化实现，非真正流式）。
+//
+// 参数：
+//   - ctx: 上下文
+//   - req: blades 模型请求
+//
+// 返回：blades.Generator 流式生成器。
 func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
+	// 返回一个只产生一次完整响应的 generator
 	return func(yield func(*blades.ModelResponse, error) bool) {
+		// 调用普通生成
 		resp, err := p.Generate(ctx, req)
+		// 将结果交给消费者，若消费者不继续则直接返回
 		if !yield(resp, err) {
 			return
 		}
 	}
 }
 
+// convertSystem 将 blades 的 Instruction 消息转换为 Anthropic system blocks。
+//
+// 参数：
+//   - inst: blades system 消息
+//
+// 返回：Anthropic system text blocks 切片。
 func (p *anthropicProvider) convertSystem(inst *blades.Message) []anthropic.TextBlockParam {
+	// 空 system 消息直接返回 nil
 	if inst == nil {
 		return nil
 	}
+	// 收集所有文本 part
 	var blocks []anthropic.TextBlockParam
 	for _, part := range inst.Parts {
+		// 仅处理文本 part
 		text, ok := part.(blades.TextPart)
 		if !ok {
 			continue
@@ -91,9 +132,20 @@ func (p *anthropicProvider) convertSystem(inst *blades.Message) []anthropic.Text
 	return blocks
 }
 
+// convertMessages 将 blades 消息列表转换为 Anthropic 消息参数列表。
+//
+// 参数：
+//   - messages: blades 消息切片
+//
+// 返回：
+//   - []anthropic.MessageParam: Anthropic 消息参数
+//   - error: 转换错误
 func (p *anthropicProvider) convertMessages(messages []*blades.Message) ([]anthropic.MessageParam, error) {
+	// 预分配等长切片
 	out := make([]anthropic.MessageParam, 0, len(messages))
+	// 逐条转换
 	for _, m := range messages {
+		// 跳过 nil 消息
 		if m == nil {
 			continue
 		}
@@ -106,7 +158,16 @@ func (p *anthropicProvider) convertMessages(messages []*blades.Message) ([]anthr
 	return out, nil
 }
 
+// convertMessage 将单条 blades.Message 转换为 Anthropic MessageParam。
+//
+// 参数：
+//   - m: blades 消息
+//
+// 返回：
+//   - anthropic.MessageParam: Anthropic 消息参数
+//   - error: 转换错误（当前不会返回错误，保留签名以兼容未来扩展）
 func (p *anthropicProvider) convertMessage(m *blades.Message) (anthropic.MessageParam, error) {
+	// 根据 blades 角色映射到 Anthropic 角色
 	var role anthropic.MessageParamRole
 	switch m.Role {
 	case blades.RoleUser, blades.RoleTool:
@@ -119,16 +180,19 @@ func (p *anthropicProvider) convertMessage(m *blades.Message) (anthropic.Message
 		role = anthropic.MessageParamRoleUser
 	}
 
+	// 预分配 content blocks
 	blocks := make([]anthropic.ContentBlockParamUnion, 0, len(m.Parts))
+	// 逐个 part 转换
 	for _, part := range m.Parts {
 		switch v := part.(type) {
 		case blades.TextPart:
+			// 文本块直接追加
 			blocks = append(blocks, anthropic.ContentBlockParamUnion{
 				OfText: &anthropic.TextBlockParam{Text: v.Text},
 			})
 		case blades.ToolPart:
 			if v.Response != "" {
-				// 工具结果块，必须以 user message 形式返回给模型。
+				// 工具结果块，必须以 user message 形式返回给模型
 				blocks = append(blocks, anthropic.ContentBlockParamUnion{
 					OfToolResult: &anthropic.ToolResultBlockParam{
 						ToolUseID: v.ID,
@@ -138,8 +202,9 @@ func (p *anthropicProvider) convertMessage(m *blades.Message) (anthropic.Message
 					},
 				})
 			} else if m.Role == blades.RoleAssistant {
-				// assistant 发起的 tool_use 调用。
+				// assistant 发起的 tool_use 调用
 				input := json.RawMessage(v.Request)
+				// 若请求为空，使用空对象占位
 				if len(input) == 0 {
 					input = json.RawMessage("{}")
 				}
@@ -152,16 +217,25 @@ func (p *anthropicProvider) convertMessage(m *blades.Message) (anthropic.Message
 				})
 			}
 		default:
-			// 忽略不支持的 part 类型。
+			// 忽略不支持的 part 类型
 		}
 	}
 
 	return anthropic.MessageParam{Role: role, Content: blocks}, nil
 }
 
+// convertTools 将 blades 工具列表转换为 Anthropic 工具参数列表。
+//
+// 参数：
+//   - tools: blades 工具切片
+//
+// 返回：Anthropic 工具参数切片。
 func (p *anthropicProvider) convertTools(tools []bladestools.Tool) []anthropic.ToolUnionParam {
+	// 预分配等长切片
 	out := make([]anthropic.ToolUnionParam, 0, len(tools))
+	// 逐个工具转换
 	for _, t := range tools {
+		// 将 JSON Schema 转为 map
 		schemaMap, _ := schemaToMap(t.InputSchema())
 		if schemaMap == nil {
 			schemaMap = map[string]any{"type": "object"}
@@ -180,38 +254,63 @@ func (p *anthropicProvider) convertTools(tools []bladestools.Tool) []anthropic.T
 	return out
 }
 
+// convertResponse 将 Anthropic 响应转换为 blades.Message。
+//
+// 参数：
+//   - resp: Anthropic Messages API 响应
+//
+// 返回：blades 消息。
 func (p *anthropicProvider) convertResponse(resp *anthropic.Message) *blades.Message {
+	// 创建 assistant 完成消息
 	msg := blades.NewAssistantMessage(blades.StatusCompleted)
+	// 预分配 parts
 	parts := make([]blades.Part, 0, len(resp.Content))
 
+	// 遍历响应内容块
 	for _, block := range resp.Content {
 		switch v := block.AsAny().(type) {
 		case anthropic.TextBlock:
+			// 文本块
 			parts = append(parts, blades.TextPart{Text: v.Text})
 		case anthropic.ToolUseBlock:
+			// 工具调用块
 			input := string(v.Input)
 			parts = append(parts, blades.NewToolPart(v.ID, v.Name, input))
 		}
 	}
 
+	// 设置消息 parts
 	msg.Parts = parts
+	// 设置 token 用量
 	msg.TokenUsage = blades.TokenUsage{
 		InputTokens:  resp.Usage.InputTokens,
 		OutputTokens: resp.Usage.OutputTokens,
 		TotalTokens:  resp.Usage.InputTokens + resp.Usage.OutputTokens,
 	}
+	// 设置完成原因
 	msg.FinishReason = string(resp.StopReason)
 	return msg
 }
 
+// schemaToMap 将 jsonschema.Schema 序列化为 map[string]any。
+//
+// 参数：
+//   - s: JSON Schema 指针
+//
+// 返回：
+//   - map[string]any: 转换后的 map
+//   - error: 序列化/反序列化错误
 func schemaToMap(s *jsonschema.Schema) (map[string]any, error) {
+	// nil schema 直接返回 nil
 	if s == nil {
 		return nil, nil
 	}
+	// 序列化为 JSON
 	b, err := json.Marshal(s)
 	if err != nil {
 		return nil, err
 	}
+	// 反序列化为 map
 	var m map[string]any
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, err

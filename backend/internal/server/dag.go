@@ -10,22 +10,24 @@
 package server
 
 import (
-	"context"
-	"encoding/json"
-	"net/http"
-	"strings"
-	"time"
+	"context"       // 请求上下文与超时
+	"encoding/json" // JSON 编解码
+	"net/http"      // HTTP 处理器与状态码
+	"strings"       // 路径裁剪与分割
+	"time"          // 超时与更新时间
 
-	"github.com/blockmemory/agent/backend/internal/dag"
+	"github.com/blockmemory/agent/backend/internal/dag" // DAG 领域对象与调度器
 )
 
 // DAGHandler DAG HTTP 处理器。
 type DAGHandler struct {
-	Store     dag.Store
-	Scheduler *dag.Scheduler
+	Store     dag.Store      // DAG 持久化存储
+	Scheduler *dag.Scheduler // DAG 调度器
 }
 
 // NewDAGHandler 创建处理器。store/scheduler 由 main.go 注入。
+// 参数 store：DAG 存储；sched：调度器。
+// 返回值：*DAGHandler。
 func NewDAGHandler(store dag.Store, sched *dag.Scheduler) *DAGHandler {
 	return &DAGHandler{Store: store, Scheduler: sched}
 }
@@ -100,7 +102,7 @@ func (h *DAGHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /api/dag/{id}[/trigger]
+	// REST 路径：/api/dag/{id}[/trigger]
 	parts := strings.SplitN(path, "/", 2)
 	id := parts[0]
 	// trigger 子路径：跳过 cron 检查直接派发一次
@@ -145,6 +147,7 @@ func (h *DAGHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeJSON 写入 JSON 响应。
+// 参数 w：HTTP 响应；v：要编码的值。
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)

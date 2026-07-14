@@ -1,14 +1,15 @@
 package tool
 
+// 导入所需标准库与项目内部包。
 import (
-	"context"
-	"fmt"
-	"path/filepath"
-	"strings"
-	"sync"
+	"context"       // context 用于传递上下文与取消信号
+	"fmt"           // fmt 用于格式化错误信息
+	"path/filepath" // filepath 用于规范化文件路径
+	"strings"       // strings 用于拼接已读文件列表
+	"sync"          // sync 提供互斥锁保护并发状态
 
-	"github.com/blockmemory/agent/backend/internal/config"
-	"github.com/go-kratos/blades/tools"
+	"github.com/blockmemory/agent/backend/internal/config" // config 包提供 Agent 阈值配置
+	"github.com/go-kratos/blades/tools"                    // blades tools 包提供对外暴露的工具定义
 )
 
 // maxConsecutiveFailures 定义单个工具连续失败的最大次数，

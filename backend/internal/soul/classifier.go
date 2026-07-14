@@ -6,6 +6,10 @@ import "strings"
 //
 // 用于将自然语言描述映射到 TaskKind，以决定后续温度、路由等策略。
 type TaskKindClassifier interface {
+	// Classify 推断任务类别。
+	//
+	// 参数 text：任务描述文本。
+	// 返回：对应的 TaskKind。
 	Classify(text string) TaskKind
 }
 
@@ -18,7 +22,9 @@ type KeywordClassifier struct{}
 // 匹配顺序按优先级排列：路由 > 总结 > 代码 > 创意 > 分析，先命中先返回；
 // 无匹配时返回 KindGeneric。
 func (KeywordClassifier) Classify(text string) TaskKind {
+	// 统一转小写，使中英文关键词都能大小写无关地匹配。
 	lower := strings.ToLower(text)
+	// switch 语句按优先级依次检查各类别关键词。
 	switch {
 	case containsAny(lower, []string{"路由", "选择 skill", "select skill", "判断", "决定"}):
 		return KindRouting
@@ -31,11 +37,13 @@ func (KeywordClassifier) Classify(text string) TaskKind {
 	case containsAny(lower, []string{"分析", "排查", "诊断", "为什么", "why"}):
 		return KindAnalysis
 	}
+	// 所有关键词均未命中，返回通用类别。
 	return KindGeneric
 }
 
 // containsAny 判断 s 是否包含 words 中任意一个子串。
 func containsAny(s string, words []string) bool {
+	// 遍历关键词列表，命中任一即返回 true。
 	for _, w := range words {
 		if strings.Contains(s, w) {
 			return true

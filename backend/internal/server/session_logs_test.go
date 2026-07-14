@@ -1,15 +1,16 @@
 package server_test
 
 import (
-	"testing"
+	"testing" // 测试框架
 
-	"github.com/blockmemory/agent/backend/pkg/textutil"
+	"github.com/blockmemory/agent/backend/pkg/textutil" // 敏感信息脱敏与 token 解析工具
 )
 
+// TestRedactSensitive 测试 RedactSensitive 对不同形式密钥的脱敏行为。
 func TestRedactSensitive(t *testing.T) {
 	cases := []struct {
-		input string
-		want  string
+		input string // 输入字符串
+		want  string // 期望输出
 	}{
 		{
 			input: "Authorization: Bearer sk-abc12345678901234567890",
@@ -37,12 +38,13 @@ func TestRedactSensitive(t *testing.T) {
 	}
 }
 
+// TestParseTokenUsage 测试 ParseTokenUsage 从日志消息中提取输入/输出 token 数。
 func TestParseTokenUsage(t *testing.T) {
 	cases := []struct {
-		msg       string
-		wantIn    int
-		wantOut   int
-		wantCalls int // 此字段本测试未使用，仅保留结构清晰
+		msg       string // 输入消息
+		wantIn    int    // 期望输入 token 数
+		wantOut   int    // 期望输出 token 数
+		wantCalls int    // 此字段本测试未使用，仅保留结构清晰
 	}{
 		{
 			msg:     "[MetaAgent] Token 消耗: in=123 out=456 dur=789ms",

@@ -1,13 +1,14 @@
 package memory
 
+// 导入所需标准库与项目内部包。
 import (
-	"context"
-	"fmt"
-	"sync"
-	"time"
+	"context" // context 用于持久化存储接口的上下文传递
+	"fmt"     // fmt 用于格式化错误信息
+	"sync"    // sync 提供读写锁，保证并发安全
+	"time"    // time 用于为事件填充发生时间
 
-	"github.com/blockmemory/agent/backend/internal/agent"
-	"github.com/blockmemory/agent/backend/pkg/types"
+	"github.com/blockmemory/agent/backend/internal/agent" // agent 包提供 MemoryEvent、MemoryPipeline、ReactMessage 等类型
+	"github.com/blockmemory/agent/backend/pkg/types"      // types 包提供 RoleDefinition 类型
 )
 
 // DefaultEventLimit 定义当 Assemble 未配置事件数量上限时，默认注入上下文的近期事件条数。

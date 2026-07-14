@@ -1,28 +1,33 @@
 package server
 
 import (
-	"context"
-	"fmt"
-	"sync"
-	"testing"
-	"time"
+	"context" // 测试用上下文
+	"fmt"     // 构造会话 ID
+	"sync"    // 并发保护 mock 数据
+	"testing" // 测试框架
+	"time"    // 时间戳
 
-	"github.com/blockmemory/agent/backend/internal/agent"
-	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/internal/agent" // agent 门面接口
+	"github.com/blockmemory/agent/backend/pkg/enums"      // 会话状态与角色枚举
 )
 
-// mockAgentForServer is a minimal agent.Agent implementation for testing the
-// HTTP adapter layer without wiring a real ReAct engine or graph.
+// mockAgentForServer 是一个最小化的 agent.Agent 实现，
+// 用于在不连接真实 ReAct 引擎或图的情况下测试 HTTP 适配层。
 type mockAgentForServer struct {
-	mu       sync.RWMutex
-	sessions map[string]*agent.Session
-	seq      int
+	mu       sync.RWMutex              // 保护 sessions 并发访问
+	sessions map[string]*agent.Session // 会话 ID -> 会话对象
+	seq      int                       // 自增 ID 序列号
 }
 
+// newMockAgentForServer 创建并初始化一个 mock Agent。
+// 返回值：*mockAgentForServer。
 func newMockAgentForServer() *mockAgentForServer {
 	return &mockAgentForServer{sessions: make(map[string]*agent.Session)}
 }
 
+// CreateSession 创建一个新的测试会话。
+// 参数 ctx：上下文；req：创建请求。
+// 返回值：创建的会话与错误。
 func (m *mockAgentForServer) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -42,39 +47,49 @@ func (m *mockAgentForServer) CreateSession(ctx context.Context, req agent.Create
 	return s, nil
 }
 
+// ResumeSession 恢复会话，测试实现直接返回 Get 结果。
 func (m *mockAgentForServer) ResumeSession(ctx context.Context, sessionID string, req agent.ResumeRequest) (*agent.Session, error) {
 	return m.Get(ctx, sessionID)
 }
 
+// Send 发送消息，测试实现为空操作。
 func (m *mockAgentForServer) Send(ctx context.Context, sessionID string, msg agent.Message) error {
 	return nil
 }
 
+// Stream 返回事件流，测试实现返回 nil。
 func (m *mockAgentForServer) Stream(ctx context.Context, sessionID string) (<-chan agent.Event, error) {
 	return nil, nil
 }
 
+// Query 通用查询，测试实现返回空结果。
 func (m *mockAgentForServer) Query(ctx context.Context, sessionID string, q agent.Query) (agent.Result, error) {
 	return agent.Result{}, nil
 }
 
+// Control 控制命令，测试实现为空操作。
 func (m *mockAgentForServer) Control(ctx context.Context, sessionID string, cmd agent.ControlCommand) error {
 	return nil
 }
 
+// List 按过滤条件列出会话。
+// 参数 ctx：上下文；filter：过滤条件（目前仅按 Status 过滤）。
+// 返回值：会话指针切片与错误。
 func (m *mockAgentForServer) List(ctx context.Context, filter agent.Filter) ([]*agent.Session, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]*agent.Session, 0, len(m.sessions))
 	for _, s := range m.sessions {
 		if filter.Status != "" && s.Status != filter.Status {
-			continue
+			continue // 状态不匹配则跳过
 		}
 		out = append(out, s)
 	}
 	return out, nil
 }
 
+// Get 根据 ID 获取会话。
+// 返回值：会话指针；不存在时返回 ErrSessionNotFound。
 func (m *mockAgentForServer) Get(ctx context.Context, sessionID string) (*agent.Session, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -85,21 +100,28 @@ func (m *mockAgentForServer) Get(ctx context.Context, sessionID string) (*agent.
 	return s, nil
 }
 
+// ListAgents 列出会话中的 Agent 实例，测试实现返回 nil。
 func (m *mockAgentForServer) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return nil, nil
 }
 
+// Shutdown 关闭 Agent，测试实现为空操作。
 func (m *mockAgentForServer) Shutdown(ctx context.Context) error { return nil }
 
+// SummarizeTaskTitle 总结任务标题，测试实现直接返回原值。
 func (m *mockAgentForServer) SummarizeTaskTitle(ctx context.Context, title string) string {
 	return title
 }
 
+// newTestAgent 构造一个用于测试的 agent.Agent 实例。
+// 参数 t：测试对象。
+// 返回值：agent.Agent。
 func newTestAgent(t *testing.T) agent.Agent {
 	t.Helper()
 	return newMockAgentForServer()
 }
 
+// TestSessionManagerDelegatesCreateAndGet 测试创建会话与按 ID 获取是否正确委托。
 func TestSessionManagerDelegatesCreateAndGet(t *testing.T) {
 	agentFacade := newTestAgent(t)
 	mgr := NewSessionManager(agentFacade)
@@ -121,6 +143,7 @@ func TestSessionManagerDelegatesCreateAndGet(t *testing.T) {
 	}
 }
 
+// TestSessionManagerListSessions 测试 ListSessions 返回所有会话。
 func TestSessionManagerListSessions(t *testing.T) {
 	agentFacade := newTestAgent(t)
 	mgr := NewSessionManager(agentFacade)
@@ -134,6 +157,7 @@ func TestSessionManagerListSessions(t *testing.T) {
 	}
 }
 
+// TestSessionManagerLaunchSession 测试 LaunchSession 能成功返回会话 ID 并最终完成。
 func TestSessionManagerLaunchSession(t *testing.T) {
 	agentFacade := newTestAgent(t)
 	mgr := NewSessionManager(agentFacade)

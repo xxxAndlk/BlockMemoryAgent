@@ -1,109 +1,143 @@
 package main
 
-// main.go 是 HTTP 服务入口，负责解析命令行参数、初始化文件日志、调用 bootstrap
-// 装配依赖、启动 HTTP 监听、等待信号优雅关闭。所有可复用的 wiring 逻辑已下沉到
-// internal/bootstrap 包，保证生产二进制、TUI 与集成测试使用同一份初始化路径。
+// main.go 是 HTTP 服务入口文件，承担以下职责：
+//   1. 解析命令行参数，确定各配置文件与前端产物目录的位置；
+//   2. 初始化文件日志，将运行期日志按天落盘；
+//   3. 调用 bootstrap 包完成依赖装配（数据库、缓存、LLM、路由等）；
+//   4. 注册静态资源与 SPA 首页路由；
+//   5. 启动 HTTP 服务并监听中断信号，收到信号后优雅关闭。
+// 所有可复用的 wiring 逻辑已下沉到 internal/bootstrap 包，保证生产二进制、
+// TUI 与集成测试使用同一份初始化路径，避免重复实现导致行为不一致。
 
 import (
-	"context"       // 上下文，用于取消与超时控制
-	"flag"          // 命令行参数解析
-	"io"            // 日志 writer 接口
-	"log"           // 日志输出
-	"net/http"      // HTTP 服务与路由
-	"os"            // 文件信息、信号
-	"os/signal"     // 信号监听
+	"context"       // 上下文，用于跨 goroutine 传递取消信号与设置超时
+	"flag"          // 标准库命令行参数解析
+	"io"            // 日志 writer 接口，用于把 log 输出重定向到文件
+	"log"           // 标准日志输出， fatal / printf 等
+	"net/http"      // HTTP 服务与路由注册
+	"os"            // 文件状态、信号、标准错误等
+	"os/signal"     // 注册操作系统信号监听器
 	"path/filepath" // 可执行文件相对路径解析
-	"syscall"       // SIGINT/SIGTERM 信号常量
-	"time"          // HTTP 超时
+	"syscall"       // SIGINT/SIGTERM 等信号常量
+	"time"          // HTTP 超时与持续时间计算
 
-	"github.com/blockmemory/agent/backend/internal/bootstrap" // 统一后端 wiring
-	"github.com/blockmemory/agent/backend/internal/config"    // 基础设施配置加载
-	"github.com/blockmemory/agent/backend/internal/logging"   // 日志文件按天分割
+	"github.com/blockmemory/agent/backend/internal/bootstrap" // 统一后端依赖装配（wiring）
+	"github.com/blockmemory/agent/backend/internal/config"    // 基础设施配置加载与环境变量注入
+	"github.com/blockmemory/agent/backend/internal/logging"   // 日志文件按天分割与静默模式
 )
 
-// main 是服务入口。职责: 解析 flag → 初始化日志 → 装配依赖 → 启动 HTTP → 等待信号优雅关闭。
-// 副作用: 打开/关闭 Postgres、Redis 连接；监听端口；注册路由。
+// main 是服务入口函数，按顺序完成：
+//  1. 解析 flag；
+//  2. 加载 .env 与 config.yaml；
+//  3. 初始化文件日志；
+//  4. 装配应用上下文与依赖；
+//  5. 构造 HTTP 路由并启动监听；
+//  6. 等待信号后触发优雅关闭。
+//
+// 副作用：会打开/关闭 Postgres、Redis 等连接，监听网络端口，注册路由。
 func main() {
-	// 命令行 flag: 各类配置文件路径，默认值指向仓库内标准位置
+	// ---- 命令行参数解析 ----
+	// flag.String 注册字符串类型命令行参数；第一个参数是 flag 名，第二个是默认值，
+	// 第三个是帮助信息。解析后指针才会指向实际传入值。
 	configPath := flag.String("config", "config/config.yaml", "基础设施配置路径")
 	rolePath := flag.String("roles", "config/roles.yaml", "角色配置路径")
 	envPath := flag.String("env", ".env", "环境变量文件路径")
 	soulPath := flag.String("soul", "config/soul.md", "人格定义文件路径")
 	skillPath := flag.String("skills", "config/skills.yaml", "Skill 池 YAML 路径（可选）")
 	webDistPath := flag.String("web-dist", "web/dist", "前端构建产物目录路径（相对路径将基于可执行文件目录解析）")
-	flag.Parse() // 解析 flag，解析后上述指针才指向实际值
+	flag.Parse() // 解析命令行输入；未解析前 *configPath 等指针仍为默认值
 
-	// 加载 .env 文件: 若存在则把其中 KEY=VALUE 注入进程环境变量
-	// bootstrap.Build 内部也会加载一次；此处提前加载是为了让日志路径等配置生效。
+	// ---- 加载 .env 文件 ----
+	// os.Stat 判断文件是否存在；若存在则把其中 KEY=VALUE 注入进程环境变量。
+	// bootstrap.Build 内部也会加载一次；此处提前加载是为了让日志路径等配置在
+	// 后续 config.Load 之前即可从环境变量读取，保证行为一致。
 	if _, err := os.Stat(*envPath); err == nil {
+		// 文件存在：调用 LoadEnvFile 逐行解析
 		if err := config.LoadEnvFile(*envPath); err != nil {
-			log.Fatalf("加载 .env 文件失败: %v", err) // 解析失败直接退出
+			// .env 解析失败属于启动期致命错误，直接退出
+			log.Fatalf("加载 .env 文件失败: %v", err)
 		}
 		log.Printf("已加载环境变量: %s", *envPath)
 	} else {
+		// 文件不存在或无法访问：降级使用系统环境变量，保证容器化部署时仍可用
 		log.Printf("未找到 .env 文件 (%s)，使用系统环境变量", *envPath)
 	}
 
-	// 加载基础设施配置（config.yaml: Postgres DSN、pgvector、Redis、HTTP 地址、记忆间隔等）
+	// ---- 加载基础设施配置 ----
+	// config.Load 读取 config.yaml，解析 Postgres DSN、pgvector、Redis、
+	// HTTP 地址、记忆间隔等核心运行参数。
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err) // 配置加载失败不可恢复
+		// 配置加载失败不可恢复，立即退出
+		log.Fatalf("加载配置失败: %v", err)
 	}
 
-	// 日志文件输出（后台入口）：按天分割到 logs/backend/YYYY-MM-DD.log
+	// ---- 初始化文件日志 ----
+	// 后台入口按天分割日志到 logs/backend/YYYY-MM-DD.log。
+	// silent=false：HTTP 入口不使用 alt-screen，stderr + 文件双写便于开发期实时查看。
 	// 失败不 fatal：文件日志缺失时仍用 stderr，保证服务可启动。
-	// silent=false：HTTP 入口无 alt-screen，stderr + 文件双写便于开发期实时查看。
 	var logWriter io.WriteCloser
 	if cfg.Logging.Enabled {
+		// logging.Init 返回一个按天滚动的 io.WriteCloser；EntryBackend 区分入口
 		w, err := logging.Init(logging.EntryBackend, cfg.Logging.Dir, false)
 		if err != nil {
+			// 初始化失败仅记录警告，保持 stderr 可用
 			log.Printf("警告: 初始化文件日志失败: %v (仅输出到 stderr)", err)
 		} else {
 			logWriter = w
-			log.SetOutput(logWriter)
+			log.SetOutput(logWriter) // 后续 log 写入文件
 			log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
-			defer logWriter.Close() // 进程退出时关闭文件句柄
+			defer logWriter.Close() // 进程退出时关闭文件句柄，避免资源泄漏
 		}
 	}
 	log.Printf("BlockMemoryAgent 后台服务启动中, 日志目录=%s", cfg.Logging.Dir)
 
-	// 根上下文，cancel 在收到信号时触发，用于通知后台任务退出
+	// ---- 构造根上下文 ----
+	// context.WithCancel 创建可取消的上下文；cancel 在收到信号时触发，
+	// 通知后台任务（如记忆循环）退出。defer cancel() 作为兜底，防止 main 提前返回时泄漏。
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // 兜底取消
+	defer cancel()
 
-	// 使用 bootstrap 装配与生产一致的路由和依赖
+	// ---- 装配应用依赖 ----
+	// bootstrap.Build 统一构造 repository、service、handler、SSE broker 等组件，
+	// 返回的 app 对象提供 Close() 用于释放资源。
 	app, err := bootstrap.Build(ctx, bootstrap.ConfigPaths{
-		ConfigPath: *configPath,
-		RolePath:   *rolePath,
-		EnvPath:    *envPath,
-		SoulPath:   *soulPath,
-		SkillPath:  *skillPath,
-		LogWriter:  logWriter,
+		ConfigPath: *configPath, // 基础设施配置路径
+		RolePath:   *rolePath,   // 角色配置路径
+		EnvPath:    *envPath,    // 环境变量文件路径
+		SoulPath:   *soulPath,   // 人格定义文件路径
+		SkillPath:  *skillPath,  // Skill 池 YAML 路径
+		LogWriter:  logWriter,   // 文件日志 writer，组件内部可共用
 	})
 	if err != nil {
+		// 依赖装配失败无法继续，退出前 log 已落盘或输出到 stderr
 		log.Fatalf("装配依赖失败: %v", err)
 	}
-	defer app.Close()
+	defer app.Close() // main 返回时释放数据库连接、缓存连接等资源
 
+	// ---- 构造默认 HTTP 路由 ----
+	// NewDefaultMux 已注册 API 路由；此处继续注册静态文件与首页。
 	mux := bootstrap.NewDefaultMux(app)
 
-	// 静态文件: Vue 构建产物目录支持相对可执行文件路径解析，避免从其他目录启动时失效
+	// 静态文件：Vue 构建产物目录支持相对可执行文件路径解析，
+	// 避免服务从其他工作目录启动时找不到 web/dist。
 	webDist := resolveWebDistPath(*webDistPath)
 	fs := http.FileServer(http.Dir(webDist))
-	mux.Handle("/assets/", fs)
-	mux.Handle("/favicon.svg", fs)
+	mux.Handle("/assets/", fs)     // 静态资源目录（JS/CSS/图片）
+	mux.Handle("/favicon.svg", fs) // 站点图标
 
-	// 首页: Vue SPA，history 路由统一回退 index.html
+	// 首页：Vue SPA 使用 history 路由，所有未匹配路径统一回退 index.html。
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// ServeFile 直接读取 webDist/index.html 作为响应体
 		http.ServeFile(w, r, filepath.Join(webDist, "index.html"))
 	})
 
-	// 启动 HTTP 服务
+	// ---- 启动 HTTP 服务 ----
 	addr := cfg.HTTP.Addr
 	log.Printf("BlockMemoryAgent 服务启动: http://localhost%s", addr)
 
-	// 构造 http.Server，Handler 指向上面注册好的 mux
-	// P0-01 修复：配置读/写超时，避免慢客户端攻击；IdleTimeout 兜底 120s。
+	// 构造 http.Server 实例，Handler 指向上面注册好的 mux。
+	// P0-01 修复：显式配置读/写超时，避免慢客户端攻击；IdleTimeout 兜底 120s。
 	httpServer := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
@@ -112,40 +146,46 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// 后台 goroutine 监听并服务；非 ErrServerClosed 错误视为致命
+	// 在独立 goroutine 中监听并服务；非 ErrServerClosed 的错误视为致命。
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP 服务错误: %v", err)
 		}
 	}()
 
-	// 等待中断信号（Ctrl+C 或 kill）
+	// ---- 等待中断信号 ----
+	// 注册对 SIGINT（Ctrl+C）和 SIGTERM（kill）的监听，容量 1 避免信号丢失。
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh // 阻塞直到收到信号
+	<-sigCh // 阻塞当前 goroutine，直到收到信号
 
-	// 优雅关闭: 取消上下文并关闭 HTTP 服务
+	// ---- 优雅关闭 ----
+	// 触发上下文取消，通知后台任务退出；随后关闭 HTTP server。
 	log.Println("正在关闭服务...")
 	cancel()
 	httpServer.Close()
 }
 
 // resolveWebDistPath 解析前端构建产物目录路径。
-// 若 path 为绝对路径则原样返回；若为相对路径，则基于当前可执行文件所在目录解析，
-// 避免服务从其他工作目录启动时找不到 web/dist。
+// 参数 path 既可以是绝对路径，也可以是相对路径：
+//   - 绝对路径：直接原样返回，不做修改；
+//   - 相对路径：基于当前可执行文件所在目录拼接，避免服务从其他工作目录启动时找不到 web/dist。
+//
+// 返回值是最终用于 http.Dir 的绝对路径字符串。
 func resolveWebDistPath(path string) string {
 	if filepath.IsAbs(path) {
+		// 绝对路径无需解析，直接返回以减少不确定性
 		return path
 	}
+	// 获取当前可执行文件路径；失败时回退到原始相对路径（保持旧行为）
 	exe, err := os.Executable()
 	if err != nil {
-		// 无法获取可执行文件路径时，回退到原始相对路径（保持旧行为）
 		return path
 	}
-	// 处理符号链接：取最终实际路径
+	// 处理符号链接：取最终实际路径，避免软链接导致相对位置错误
 	if real, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = real
 	}
-	baseDir := filepath.Dir(exe)
-	return filepath.Join(baseDir, path)
+	baseDir := filepath.Dir(exe)        // 可执行文件所在目录
+	return filepath.Join(baseDir, path) // 拼接为绝对路径
 }

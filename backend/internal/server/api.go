@@ -20,19 +20,21 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"                 // 共享类型
 )
 
-// APIHandler TUI / Web API 处理器
+// APIHandler TUI / Web API 处理器。
 // 职责：聚合 broadcaster / snapshotMgr / 各存储与配置，统一暴露 HTTP 接口给前端。
 //
 // 字段说明：
-//   - broadcaster: SSE 广播器
-//   - snapshotMgr: 快照管理器（鸭子类型，避免循环依赖）
-//   - paused: topic_id -> 是否暂停（用于 graphControl）
-//   - rt: 聚合运行时（boards / mailbox / skills / soul / watchdog）
-//   - sessionMgr: 会话管理器
-//   - pgStore: Postgres 存储
-//   - redisStore: Redis 存储
-//   - roleCfg: 角色配置
-//   - modelFactory: 模型工厂
+//   - broadcaster：SSE 广播器
+//   - snapshotMgr：快照管理器（鸭子类型，避免循环依赖）
+//   - paused：topic_id -> 是否暂停（用于 graphControl）
+//   - pausedMu：保护 paused 的并发读写
+//   - rt：聚合运行时（boards / mailbox / skills / soul / watchdog）
+//   - sessionMgr：会话管理器
+//   - pgStore：Postgres 存储
+//   - redisStore：Redis 存储
+//   - roleCfg：角色配置
+//   - modelFactory：模型工厂
+//   - statsService：会话统计聚合服务
 type APIHandler struct {
 	broadcaster *TUIBroadcaster // SSE 广播器
 	snapshotMgr interface {     // 快照管理器（鸭子类型，避免循环依赖）
@@ -51,8 +53,8 @@ type APIHandler struct {
 	statsService *StatsService             // 会话统计聚合服务
 }
 
-// NewAPIHandler 创建 API 处理器
-// 参数：broadcaster - SSE 广播器。
+// NewAPIHandler 创建 API 处理器。
+// 参数 broadcaster：SSE 广播器。
 // 返回值：*APIHandler（其余字段需通过 Set* 方法注入）。
 func NewAPIHandler(broadcaster *TUIBroadcaster) *APIHandler {
 	return &APIHandler{
@@ -61,22 +63,22 @@ func NewAPIHandler(broadcaster *TUIBroadcaster) *APIHandler {
 	}
 }
 
-// SetSnapshotManager 设置快照管理器
-// 参数：mgr - 实现了 Load(ctx, agentID, topicID) 的对象。
+// SetSnapshotManager 设置快照管理器。
+// 参数 mgr：实现了 Load(ctx, agentID, topicID) 的对象。
 func (h *APIHandler) SetSnapshotManager(mgr interface {
 	Load(ctx context.Context, agentID, topicID string) (*types.AgentSnapshot, error)
 }) {
 	h.snapshotMgr = mgr
 }
 
-// SetRuntime 注入 Runtime
-// 参数：rt - 聚合运行时。
+// SetRuntime 注入 Runtime。
+// 参数 rt：聚合运行时。
 func (h *APIHandler) SetRuntime(rt *runtime.Runtime) {
 	h.rt = rt
 }
 
-// SetSessionManager 注入会话管理器
-// 参数：mgr - 会话管理器。
+// SetSessionManager 注入会话管理器。
+// 参数 mgr：会话管理器。
 func (h *APIHandler) SetSessionManager(mgr *SessionManager) {
 	h.sessionMgr = mgr
 	if h.statsService == nil {
@@ -85,32 +87,33 @@ func (h *APIHandler) SetSessionManager(mgr *SessionManager) {
 }
 
 // SetStatsService 显式注入统计服务（测试用）。
+// 参数 s：统计服务实例。
 func (h *APIHandler) SetStatsService(s *StatsService) {
 	h.statsService = s
 }
 
-// SetStores 注入存储层
-// 参数：pg - Postgres；redis - Redis。
+// SetStores 注入存储层。
+// 参数 pg：Postgres；redis：Redis。
 func (h *APIHandler) SetStores(pg *store.PostgresStore, redis *store.RedisStore) {
 	h.pgStore = pg
 	h.redisStore = redis
 }
 
-// SetRoleConfig 注入角色配置
-// 参数：cfg - 角色配置文件。
+// SetRoleConfig 注入角色配置。
+// 参数 cfg：角色配置文件。
 func (h *APIHandler) SetRoleConfig(cfg *pkgconfig.RoleConfigFile) {
 	h.roleCfg = cfg
 }
 
-// SetModelFactory 注入模型工厂
-// 参数：mf - 模型工厂。
+// SetModelFactory 注入模型工厂。
+// 参数 mf：模型工厂。
 func (h *APIHandler) SetModelFactory(mf *model.ModelFactory) {
 	h.modelFactory = mf
 }
 
-// RetrieveHandler 手动检索记忆
+// RetrieveHandler 手动检索记忆。
 // 职责：解析 POST body，广播 retrieve.request 事件给订阅者。
-// 参数：w / r - HTTP 标准参数。
+// 参数 w / r：HTTP 标准参数。
 // 副作用：广播 UIEvent；不做实际检索，只触发前端展示。
 func (h *APIHandler) RetrieveHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -118,6 +121,7 @@ func (h *APIHandler) RetrieveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 解析请求体，提取 topic_id / agent_id / query。
 	req, err := DecodeBody[struct {
 		TopicID string `json:"topic_id"`
 		AgentID string `json:"agent_id"`
@@ -128,7 +132,7 @@ func (h *APIHandler) RetrieveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 广播检索请求事件
+	// 广播检索请求事件，通知订阅者展示检索意图。
 	h.broadcaster.Broadcast(req.TopicID, types.UIEvent{
 		Type:    "retrieve.request",
 		Payload: map[string]string{"agent_id": req.AgentID, "query": req.Query},
@@ -138,7 +142,7 @@ func (h *APIHandler) RetrieveHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// EventResolveHandler 标记 Event 已处理
+// EventResolveHandler 标记 Event 已处理。
 // 职责：解析 POST body，广播 workspace.event 事件（status=Done），通知前端关闭事件。
 func (h *APIHandler) EventResolveHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -181,7 +185,7 @@ func (h *APIHandler) SnapshotInspectHandler(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// GraphPauseHandler 暂停 Graph
+// GraphPauseHandler 暂停 Graph。
 // 职责：把 topic 标记为暂停，广播 graph.control(action=pause) 事件。
 func (h *APIHandler) GraphPauseHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -210,7 +214,7 @@ func (h *APIHandler) GraphPauseHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "paused"})
 }
 
-// GraphResumeHandler 恢复 Graph
+// GraphResumeHandler 恢复 Graph。
 // 职责：从 paused 表删除 topic，广播 graph.control(action=resume) 事件。
 func (h *APIHandler) GraphResumeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -239,8 +243,8 @@ func (h *APIHandler) GraphResumeHandler(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(map[string]string{"status": "resumed"})
 }
 
-// IsPaused 检查话题是否已暂停
-// 参数：topicID - 话题 ID。
+// IsPaused 检查话题是否已暂停。
+// 参数 topicID：话题 ID。
 // 返回值：bool - true 表示已暂停。
 func (h *APIHandler) IsPaused(topicID string) bool {
 	h.pausedMu.RLock()
@@ -248,7 +252,7 @@ func (h *APIHandler) IsPaused(topicID string) bool {
 	return h.paused[topicID]
 }
 
-// MetricsHandler GET /api/metrics — 返回 Prometheus 格式运行时指标
+// MetricsHandler 处理 GET /api/metrics — 返回 Prometheus 格式运行时指标。
 // 指标：goroutine 数、内存分配、内存中会话数、LLM 调用/超时次数。
 func (h *APIHandler) MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -274,7 +278,7 @@ func (h *APIHandler) MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP bma_llm_timeouts_total Total LLM timeouts\n# TYPE bma_llm_timeouts_total counter\nbma_llm_timeouts_total %d\n", timeoutCount)
 }
 
-// HealthHandler GET /api/health — 返回 Postgres / Redis / LLM 连接状态
+// HealthHandler 处理 GET /api/health — 返回 Postgres / Redis / LLM 连接状态。
 // 职责：分别 ping Postgres、Redis，统计 LLM 调用健康度，返回 JSON 报告。
 func (h *APIHandler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -298,6 +302,7 @@ func (h *APIHandler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // checkPostgres 检查 Postgres 连接。
+// 参数 ctx：探活超时上下文；pg：Postgres 存储实例。
 // 返回值：map - 含 name / online / detail / latency_ms。
 func checkPostgres(ctx context.Context, pg *store.PostgresStore) map[string]any {
 	status := map[string]any{"name": "Postgres", "online": false, "detail": "not configured"}
@@ -316,6 +321,7 @@ func checkPostgres(ctx context.Context, pg *store.PostgresStore) map[string]any 
 }
 
 // checkRedis 检查 Redis 连接。
+// 参数 ctx：探活超时上下文；redis：Redis 存储实例。
 // 返回值：map - 含 name / online / detail / latency_ms。
 func checkRedis(ctx context.Context, redis *store.RedisStore) map[string]any {
 	status := map[string]any{"name": "Redis", "online": false, "detail": "not configured"}
@@ -335,6 +341,7 @@ func checkRedis(ctx context.Context, redis *store.RedisStore) map[string]any {
 
 // checkLLM 通过 SessionManager 的 LLM 调用统计判断 LLM 健康。
 // 健康判定：calls>0 且 timeouts<calls。
+// 参数 mgr：会话管理器。
 // 返回值：map - 含 name / online / detail。
 func checkLLM(mgr *SessionManager) map[string]any {
 	status := map[string]any{"name": "LLM API", "online": false, "detail": "not configured"}
@@ -351,7 +358,7 @@ func checkLLM(mgr *SessionManager) map[string]any {
 	return status
 }
 
-// StatusHandler GET /api/status — 返回程序、模式、人格、LLM 配置概览
+// StatusHandler 处理 GET /api/status — 返回程序、模式、人格、LLM 配置概览。
 // 职责：聚合 Soul 名称与角色配置中的 LLM provider / model，返回静态信息。
 func (h *APIHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -382,9 +389,9 @@ func (h *APIHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// TimelineHandler GET /api/metrics/timeline — 返回最近会话 / LLM 时间线
+// TimelineHandler 处理 GET /api/metrics/timeline — 返回最近会话 / LLM 时间线。
 // 职责：按小时聚合所有会话的 token_usage 事件，返回 N 个时间点的 calls / tokens。
-// 参数：?points=N - 时间点数（默认 12）。
+// 参数 w / r：HTTP 标准参数；?points=N - 时间点数（默认 12）。
 func (h *APIHandler) TimelineHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -404,9 +411,9 @@ func (h *APIHandler) TimelineHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"points": data})
 }
 
-// ActivityHandler GET /api/activity — 返回最近活动流
+// ActivityHandler 处理 GET /api/activity — 返回最近活动流。
 // 职责：聚合所有会话事件，倒序取前 N 条作为活动流。
-// 参数：?limit=N - 返回条数（默认 10）。
+// 参数 w / r：HTTP 标准参数；?limit=N - 返回条数（默认 10）。
 func (h *APIHandler) ActivityHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -426,7 +433,7 @@ func (h *APIHandler) ActivityHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"activities": activities})
 }
 
-// SnapshotHandler POST /api/snapshot — 查看 Agent 快照（已移除，保留端点兼容）。
+// SnapshotHandler 处理 POST /api/snapshot — 查看 Agent 快照（已移除，保留端点兼容）。
 func (h *APIHandler) SnapshotHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -440,7 +447,7 @@ func (h *APIHandler) SnapshotHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// MemorySearchHandler POST /api/memory/search — 已移除（ReAct 重构）。
+// MemorySearchHandler 处理 POST /api/memory/search — 已移除（ReAct 重构）。
 func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -453,7 +460,7 @@ func (h *APIHandler) MemorySearchHandler(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// MemoryLevelsHandler GET /api/memory/levels — 已移除（ReAct 重构）。
+// MemoryLevelsHandler 处理 GET /api/memory/levels — 已移除（ReAct 重构）。
 func (h *APIHandler) MemoryLevelsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -467,7 +474,7 @@ func (h *APIHandler) MemoryLevelsHandler(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// MemoryEvalHandler GET /api/memory/eval — 已移除（ReAct 重构）。
+// MemoryEvalHandler 处理 GET /api/memory/eval — 已移除（ReAct 重构）。
 func (h *APIHandler) MemoryEvalHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -483,7 +490,7 @@ func (h *APIHandler) MemoryEvalHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// SkillsHandler GET /api/skills — 返回 Skill 池全部技能
+// SkillsHandler 处理 GET /api/skills — 返回 Skill 池全部技能。
 // 职责：从 Runtime.Skills.Pool 取所有技能，返回 JSON 列表。
 func (h *APIHandler) SkillsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -498,7 +505,7 @@ func (h *APIHandler) SkillsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"skills": skills})
 }
 
-// AgentSkillsHandler GET /api/agents/{id}/skills — 返回 Agent 已装配 SkillSet
+// AgentSkillsHandler 处理 GET /api/agents/{id}/skills — 返回 Agent 已装配 SkillSet。
 // 职责：从 URL 解析 agent id，查询其 SkillSet。
 func (h *APIHandler) AgentSkillsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -521,9 +528,9 @@ func (h *APIHandler) AgentSkillsHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// FilesHandler GET /api/files — 返回某会话 WriteFile 输出文件列表
+// FilesHandler 处理 GET /api/files — 返回某会话 WriteFile 输出文件列表。
 // 职责：扫描会话事件中的 WriteFile 工具调用，去重后返回文件路径 / 大小 / 名称。
-// 参数：?session=session-N
+// 参数 w / r：HTTP 标准参数；?session=session-N。
 func (h *APIHandler) FilesHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -565,7 +572,7 @@ func (h *APIHandler) FilesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// FileContentHandler GET /api/files/content — 读取文件内容
+// FileContentHandler 处理 GET /api/files/content — 读取文件内容。
 // 职责：按 ?path=... 读取文件全文，返回 JSON（content 为字符串）。
 func (h *APIHandler) FileContentHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -590,7 +597,7 @@ func (h *APIHandler) FileContentHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 // fileSize 安全地获取文件大小，info 为 nil 时返回 0。
-// 参数：info - os.FileInfo（可为 nil）。
+// 参数 info：os.FileInfo（可为 nil）。
 // 返回值：int64 - 文件字节数。
 func fileSize(info os.FileInfo) int64 {
 	if info == nil {

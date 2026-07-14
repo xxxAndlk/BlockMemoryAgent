@@ -34,29 +34,45 @@ type Runtime struct {
 }
 
 // RuntimeOption 用于在构造 Runtime 时注入或覆盖依赖。
+// 它接收 *Runtime 指针，可直接修改字段。
 type RuntimeOption func(*Runtime)
 
-// WithBoards 注入多看板管理器。
+// WithBoards 注入多看板管理器；常用于测试或需要预置 Board 的场景。
+//
+// 参数：bm 为待注入的 board.Manager 实例。
+// 返回：一个 RuntimeOption，供 runtime.New 使用。
 func WithBoards(bm *board.Manager) RuntimeOption {
 	return func(r *Runtime) { r.Boards = bm }
 }
 
 // WithMailbox 注入 Agent 间异步邮箱。
+//
+// 参数：mb 为待注入的 mailbox.Mailbox 实例。
+// 返回：一个 RuntimeOption，供 runtime.New 使用。
 func WithMailbox(mb *mailbox.Mailbox) RuntimeOption {
 	return func(r *Runtime) { r.Mailbox = mb }
 }
 
 // WithWatchdog 注入上下文看门狗。
+//
+// 参数：w 为待注入的 watchdog.Watchdog 实例。
+// 返回：一个 RuntimeOption，供 runtime.New 使用。
 func WithWatchdog(w *watchdog.Watchdog) RuntimeOption {
 	return func(r *Runtime) { r.Watchdog = w }
 }
 
 // WithCmdQueue 注入用户指令队列。
+//
+// 参数：cq 为待注入的 cmdqueue.Manager 实例。
+// 返回：一个 RuntimeOption，供 runtime.New 使用。
 func WithCmdQueue(cq *cmdqueue.Manager) RuntimeOption {
 	return func(r *Runtime) { r.CmdQueue = cq }
 }
 
 // WithSoul 注入人格加载器；提供时跳过从 soulPath 加载。
+//
+// 参数：loader 为待注入的 soul.Loader 实例。
+// 返回：一个 RuntimeOption，供 runtime.New 使用。
 func WithSoul(loader *soul.Loader) RuntimeOption {
 	return func(r *Runtime) { r.Soul = loader }
 }
@@ -76,12 +92,12 @@ func WithSoul(loader *soul.Loader) RuntimeOption {
 //
 // 副作用：触发一次 loader.Load()；文件读取失败返回包装错误，不再 panic。
 func New(soulPath string, skillPool *skill.Pool, opts ...RuntimeOption) (*Runtime, error) {
-	// skillPool 为 nil 时退回内置技能池作为兜底
+	// skillPool 为 nil 时退回内置技能池作为兜底，确保 Skills 字段始终非空。
 	if skillPool == nil {
 		skillPool = skill.BuiltinPool()
 	}
 
-	// 先用默认值装配 Runtime，再通过选项覆盖依赖
+	// 先用默认值装配 Runtime，再通过选项覆盖依赖；这样保证所有字段都有合理初始值。
 	rt := &Runtime{
 		Boards:   board.NewManager(),                     // 空看板管理器，会话启动时由 MetaAgent 按需 GetOrCreate
 		Mailbox:  mailbox.New(),                          // 空邮箱，各 Agent 通过 Send/Drain 异步通信
@@ -90,6 +106,7 @@ func New(soulPath string, skillPool *skill.Pool, opts ...RuntimeOption) (*Runtim
 		CmdQueue: cmdqueue.NewManager(),                  // 用户指令队列（特性6）
 	}
 
+	// 应用所有选项注入/覆盖依赖。
 	for _, opt := range opts {
 		opt(rt)
 	}
@@ -98,6 +115,7 @@ func New(soulPath string, skillPool *skill.Pool, opts ...RuntimeOption) (*Runtim
 	if rt.Soul == nil {
 		loader := soul.NewLoader(soulPath)
 		if soulPath != "" {
+			// 路径非空时尝试加载人格文件；失败返回错误，避免启动时使用未配置的人格。
 			if err := loader.Load(); err != nil {
 				return nil, fmt.Errorf("load soul.md: %w", err)
 			}
@@ -111,8 +129,12 @@ func New(soulPath string, skillPool *skill.Pool, opts ...RuntimeOption) (*Runtim
 // SetAgentConfig 注入 Agent 运行时动态参数。
 // 由 main.go 在装载 Runtime 后调用；nil 时下游节点应回退到各自默认值。
 // 副作用：根据 cfg.ContextWindow 同步更新 Watchdog 软/硬阈值。
+//
+// 参数：cfg 为 Agent 运行时配置指针；为 nil 时不更新 Watchdog。
 func (r *Runtime) SetAgentConfig(cfg *config.AgentConfig) {
+	// 保存配置指针，供下游组件读取上下文窗口、最大工具轮数等参数。
 	r.AgentCfg = cfg
+	// 仅在配置非空且声明了有效上下文窗口时，重新计算 watchdog 阈值。
 	if cfg != nil && cfg.ContextWindow > 0 {
 		r.Watchdog.SetConfig(watchdog.ConfigForWindow(cfg.ContextWindow))
 	}

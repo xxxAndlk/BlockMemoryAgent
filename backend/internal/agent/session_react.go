@@ -1,3 +1,5 @@
+// Package agent 维护 ReAct 会话的内存存储、持久化与恢复逻辑，
+// 是 ReactService 的后台会话仓库实现。
 package agent
 
 // 标准库导入：上下文控制、格式化、日志、文件系统、路径处理、排序、字符串解析、并发与同步、原子操作、时间
@@ -327,8 +329,8 @@ func (st *reactSessionStore) evictCompletedSessions() {
 	}
 	// kv 用于临时保存已完成会话的 ID 与结束时间。
 	type kv struct {
-		id    string
-		ended time.Time
+		id    string    // id 会话唯一标识
+		ended time.Time // ended 会话结束时间，用于排序决定淘汰顺序
 	}
 	// completed 收集所有可被驱逐的会话。
 	var completed []kv

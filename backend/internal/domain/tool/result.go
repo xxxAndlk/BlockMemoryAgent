@@ -1,5 +1,7 @@
 package tool
 
+// 导入所需标准库：bytes 用于无 HTML 转义的 JSON 序列化；context 用于进度回调上下文；
+// encoding/json 用于 JSON 编码；strings 用于 UTF-8 修复；unicode/utf8 用于判断字节序列是否为合法 UTF-8。
 import (
 	"bytes"
 	"context"

@@ -12,7 +12,8 @@ import (
 )
 
 // PrivateStore 私有记忆存储接口。
-// 抽象 Episode 的持久化与查询能力，使 WriteProcessor/Compressor 可对接
+//
+// 设计说明：抽象 Episode 的持久化与查询能力，使 WriteProcessor/Compressor 可对接
 // Postgres、Redis 或任意后端，便于单测注入 fake 实现。
 type PrivateStore interface {
 	// SaveEpisode 将单条 Episode 写入指定 Agent + Topic 的私有记忆空间。
@@ -26,48 +27,60 @@ type PrivateStore interface {
 }
 
 // Summarizer 摘要生成器接口。
-// 输入原始观察文本，输出短摘要；用于压缩层级的 Standard/Compact 展示。
+//
+// 设计说明：输入原始观察文本，输出短摘要；用于压缩层级的 Standard/Compact 展示。
 type Summarizer interface {
 	// Summarize 返回 content 的摘要文本。
 	Summarize(content string) string
 }
 
 // FactExtractor 事实提取器接口。
-// 从原始观察中抽取关键事实短句，参与实体重叠评分与重要性计算。
+//
+// 设计说明：从原始观察中抽取关键事实短句，参与实体重叠评分与重要性计算。
 type FactExtractor interface {
 	// ExtractFacts 返回提取出的事实列表。
 	ExtractFacts(content string) []string
 }
 
 // ImportanceScorer 重要性评分器接口。
-// 基于摘要与事实给出 [0,1] 重要性分数，决定 Episode 是否进入长期记忆与压缩层级。
+//
+// 设计说明：基于摘要与事实给出 [0,1] 重要性分数，决定 Episode 是否进入长期记忆与压缩层级。
 type ImportanceScorer interface {
 	// Score 返回重要性分数，范围 [0,1]。
 	Score(summary string, facts []string) float64
 }
 
 // TopicDetector 话题边界检测器接口。
-// 判断当前内容是否触发话题切换，用于 Episode 的话题绑定决策。
+//
+// 设计说明：判断当前内容是否触发话题切换，用于 Episode 的话题绑定决策。
 type TopicDetector interface {
 	// DetectBoundary 返回 true 表示检测到话题边界。
 	DetectBoundary(currentTopic string, content string) bool
 }
 
 // SimpleSummarizer 简单摘要器。
-// 短文本原样返回，长文本截断到 maxRunes 字符并加省略号。
+//
+// 行为：短文本原样返回，长文本截断到 maxRunes 个字符并加省略号。
 type SimpleSummarizer struct {
-	maxRunes int
+	maxRunes int // 摘要最大 rune 数
 }
 
 // Summarize 生成摘要。
-// 职责: 对 content 做长度截断式摘要。
-// 参数: content - 原始观察文本。
-// 返回: 不超过 maxRunes 个 rune 的摘要字符串。
-// 副作用: 无。
-// 并发安全: 是（无共享状态）。
-// 实现: 按 rune 截断而非字节，避免在 UTF-8 多字节字符中间切断产生无效字符串（H3）。
+//
+// 职责：对 content 做长度截断式摘要。
+//
+// 参数：content - 原始观察文本。
+//
+// 返回：不超过 maxRunes 个 rune 的摘要字符串。
+//
+// 副作用：无。
+//
+// 并发安全：是（无共享状态）。
+//
+// 实现说明：按 rune 截断而非字节，避免在 UTF-8 多字节字符中间切断产生无效字符串。
 func (s *SimpleSummarizer) Summarize(content string) string {
 	limit := s.maxRunes
+	// 非法上限回退到默认值
 	if limit <= 0 {
 		limit = 200
 	}
@@ -81,22 +94,29 @@ func (s *SimpleSummarizer) Summarize(content string) string {
 }
 
 // SimpleFactExtractor 简单事实提取器。
-// 将 content 按句分割，取前 maxSentences 句作为事实条目。
+//
+// 行为：将 content 按句分割，取前 maxSentences 句作为事实条目。
 type SimpleFactExtractor struct {
-	maxSentences int
+	maxSentences int // 最多返回的事实句数
 }
 
 // ExtractFacts 提取关键事实。
-// 职责: 将 content 按句分割，取前 maxSentences 句作为事实条目。
-// 参数: content - 原始观察文本。
-// 返回: 事实字符串切片；空输入返回 nil。
-// 副作用: 无。
-// 并发安全: 是（无共享状态）。
+//
+// 职责：将 content 按句分割，取前 maxSentences 句作为事实条目。
+//
+// 参数：content - 原始观察文本。
+//
+// 返回：事实字符串切片；空输入返回 nil。
+//
+// 副作用：无。
+//
+// 并发安全：是（无共享状态）。
 func (e *SimpleFactExtractor) ExtractFacts(content string) []string {
 	if len(content) == 0 {
 		return nil
 	}
 	max := e.maxSentences
+	// 非法上限回退到默认值
 	if max <= 0 {
 		max = 3
 	}
@@ -108,12 +128,13 @@ func (e *SimpleFactExtractor) ExtractFacts(content string) []string {
 		if len(s) > 0 {
 			facts = append(facts, s)
 		}
+		// 达到上限即停止
 		if len(facts) >= max {
 			break
 		}
 	}
+	// 若未分出有效句子，则按 rune 截断前 100 字符作为兜底事实
 	if len(facts) == 0 {
-		// 按 rune 截断前 100 字符，避免破坏 UTF-8（H3）
 		runes := []rune(content)
 		if len(runes) > 100 {
 			runes = runes[:100]
@@ -124,19 +145,29 @@ func (e *SimpleFactExtractor) ExtractFacts(content string) []string {
 }
 
 // splitSentences 按标点符号分割句子。
+//
+// 识别分隔符：中文句号、感叹号、问号以及英文 .!? 与换行符。
+//
+// 参数：text 待分割文本。
+//
+// 返回：分割出的句子切片。
 func splitSentences(text string) []string {
 	var sentences []string
 	start := 0
+	// 转换为 rune 切片，避免多字节字符被截断
 	runes := []rune(text)
 	for i, r := range runes {
 		switch r {
 		case '。', '！', '？', '.', '!', '?', '\n':
+			// 遇到句末标点且前面有内容，截取一句
 			if i > start {
 				sentences = append(sentences, string(runes[start:i+1]))
 			}
+			// 下一句从当前标点后开始
 			start = i + 1
 		}
 	}
+	// 处理末尾未以标点结尾的剩余文本
 	if start < len(runes) {
 		remain := strings.TrimSpace(string(runes[start:]))
 		if len(remain) > 0 {
@@ -147,18 +178,27 @@ func splitSentences(text string) []string {
 }
 
 // SimpleImportanceScorer 简单重要性评分器。
-// 基于摘要长度、事实数量、错误/决策/变更关键词加权打分，上限 1.0。
+//
+// 行为：基于摘要长度、事实数量、错误/决策/变更关键词加权打分，上限 1.0。
 type SimpleImportanceScorer struct{}
 
 // Score 计算重要性分数。
-// 职责: 综合长度、事实数、关键词命中给出重要性分数。
-// 参数: summary - 已生成的摘要；facts - 已提取的事实列表。
-// 返回: [0,1] 的重要性分数，越大越值得长期保留。
-// 副作用: 无。
-// 并发安全: 是（无共享状态）。
-// 设计: 时间衰减由调用方处理，此处只反映内容本身的静态权重。
+//
+// 职责：综合长度、事实数、关键词命中给出重要性分数。
+//
+// 参数：
+//   - summary：已生成的摘要。
+//   - facts：已提取的事实列表。
+//
+// 返回：[0,1] 的重要性分数，越大越值得长期保留。
+//
+// 副作用：无。
+//
+// 并发安全：是（无共享状态）。
+//
+// 设计说明：时间衰减由调用方处理，此处只反映内容本身的静态权重。
 func (s *SimpleImportanceScorer) Score(summary string, facts []string) float64 {
-	// 平滑评分：用连续函数替代硬阈值跳跃，让不同长度/事实数的重要性区分更细腻。
+	// 平滑评分：用连续函数替代硬阈值跳跃，让不同长度/事实数的重要性区分更细腻
 	score := 0.0
 
 	// 长度因子：0~0.15，随 rune 数平滑增长，避免 50/51 的断崖
@@ -206,22 +246,31 @@ func (s *SimpleImportanceScorer) Score(summary string, facts []string) float64 {
 }
 
 // SimpleTopicDetector 简单话题边界检测器。
-// 通过关键词匹配判断是否发生显式话题切换。
+//
+// 行为：通过关键词匹配判断是否发生显式话题切换。
 type SimpleTopicDetector struct{}
 
 // DetectBoundary 检测话题边界。
-// 职责: 判断 content 是否包含话题切换信号。
-// 参数: currentTopic - 当前话题标识；content - 待检测文本。
-// 返回: true 表示检测到话题边界。
-// 副作用: 无。
-// 并发安全: 是（无共享状态）。
+//
+// 职责：判断 content 是否包含话题切换信号。
+//
+// 参数：
+//   - currentTopic：当前话题标识。
+//   - content：待检测文本。
+//
+// 返回：true 表示检测到话题边界。
+//
+// 副作用：无。
+//
+// 并发安全：是（无共享状态）。
 func (d *SimpleTopicDetector) DetectBoundary(currentTopic, content string) bool {
-	// 简单实现: 检查是否包含话题切换信号词
+	// 简单实现：检查是否包含话题切换信号词
 	return containsAny(content, []string{"switch topic", "change topic", "新话题", "话题切换"})
 }
 
 // WriteProcessor 写入处理器。
-// 串联 Summarizer → FactExtractor → ImportanceScorer → TopicDetector 四阶段流水线，
+//
+// 设计说明：串联 Summarizer → FactExtractor → ImportanceScorer → TopicDetector 四阶段流水线，
 // 完成一条 Episode 的构建与持久化。所有依赖以接口形式注入，便于替换实现。
 type WriteProcessor struct {
 	store      PrivateStore     // 私有记忆存储后端
@@ -233,11 +282,16 @@ type WriteProcessor struct {
 }
 
 // NewWriteProcessor 创建写入处理器。
-// 职责: 装配默认的 Simple* 实现并绑定存储后端。
-// 参数: store - PrivateStore 实现，用于 Episode 持久化。
-// 返回: 装配完成的 WriteProcessor 指针。
-// 副作用: 无。
-// 并发安全: 返回对象本身可被多协程共享使用（字段只读）。
+//
+// 职责：装配默认的 Simple* 实现并绑定存储后端。
+//
+// 参数：store - PrivateStore 实现，用于 Episode 持久化。
+//
+// 返回：装配完成的 WriteProcessor 指针。
+//
+// 副作用：无。
+//
+// 并发安全：返回对象本身可被多协程共享使用（字段只读）。
 func NewWriteProcessor(store PrivateStore) *WriteProcessor {
 	return &WriteProcessor{
 		store:      store,                     // 注入存储后端
@@ -249,11 +303,14 @@ func NewWriteProcessor(store PrivateStore) *WriteProcessor {
 }
 
 // SetAgentConfig 注入 Agent 运行时配置，动态调整摘要/事实提取参数。
+//
+// 参数：cfg - AgentConfig 指针；nil 表示清空配置。
 func (wp *WriteProcessor) SetAgentConfig(cfg *config.AgentConfig) {
 	wp.cfg = cfg
 	if cfg == nil {
 		return
 	}
+	// 如果当前是默认实现，则用配置覆盖其参数
 	if s, ok := wp.summarizer.(*SimpleSummarizer); ok && cfg.SummaryMaxRunes > 0 {
 		s.maxRunes = cfg.SummaryMaxRunes
 	}
@@ -263,32 +320,37 @@ func (wp *WriteProcessor) SetAgentConfig(cfg *config.AgentConfig) {
 }
 
 // Process 处理写入。
-// 职责: 将一条原始观察加工为 Episode 并持久化，是 write 阶段的主入口。
-// 参数:
-//   - ctx: 上下文，用于取消与超时。
-//   - agentID: 归属 Agent 标识。
-//   - topicID: 归属 Topic 标识。
-//   - action: 本步动作摘要（如 "调用工具 X"）。
-//   - rawContent: 原始完整观察文本。
 //
-// 返回: 构建完成的 Episode；持久化失败时返回 wrapped error。
-// 副作用: 向 PrivateStore 写入一条 Episode。
-// 并发安全: 自身无共享可变状态，并发安全性取决于底层 store 实现。
-// 设计: 流水线四步——摘要 → 事实 → 评分 → 话题绑定，再组装与持久化。
+// 职责：将一条原始观察加工为 Episode 并持久化，是 write 阶段的主入口。
+//
+// 参数：
+//   - ctx：上下文，用于取消与超时。
+//   - agentID：归属 Agent 标识。
+//   - topicID：归属 Topic 标识。
+//   - action：本步动作摘要（如 "调用工具 X"）。
+//   - rawContent：原始完整观察文本。
+//
+// 返回：构建完成的 Episode；持久化失败时返回 wrapped error。
+//
+// 副作用：向 PrivateStore 写入一条 Episode。
+//
+// 并发安全：自身无共享可变状态，并发安全性取决于底层 store 实现。
+//
+// 设计说明：流水线四步——摘要 → 事实 → 评分 → 话题绑定，再组装与持久化。
 func (wp *WriteProcessor) Process(ctx context.Context, agentID, topicID, action, rawContent string) (*types.Episode, error) {
-	// 1. 生成摘要: 压缩原始内容供后续展示与评分
+	// 1. 生成摘要：压缩原始内容供后续展示与评分
 	summary := wp.summarizer.Summarize(rawContent)
 
-	// 2. 提取关键事实: 供实体重叠评分与重要性计算
+	// 2. 提取关键事实：供实体重叠评分与重要性计算
 	facts := wp.extractor.ExtractFacts(rawContent)
 
-	// 3. 重要性评分: 决定压缩层级与是否进入长期记忆
+	// 3. 重要性评分：决定压缩层级与是否进入长期记忆
 	importance := wp.scorer.Score(summary, facts)
 
-	// 4. 话题边界检测: 判断是否触发话题切换
+	// 4. 话题边界检测：判断是否触发话题切换
 	topicBound := wp.detector.DetectBoundary(topicID, rawContent)
 
-	// 5. 构建 Episode: 装配步骤 ID、时间戳与各字段
+	// 5. 构建 Episode：装配步骤 ID、时间戳与各字段
 	episode := &types.Episode{
 		StepID:             generateStepID(agentID), // 全局唯一步骤 ID
 		Timestamp:          time.Now(),              // 当前时间作为发生时间
@@ -300,7 +362,7 @@ func (wp *WriteProcessor) Process(ctx context.Context, agentID, topicID, action,
 		TopicBound:         topicBound,              // 话题绑定标志
 	}
 
-	// 6. 持久化: 写入私有记忆存储，失败时包装错误返回
+	// 6. 持久化：写入私有记忆存储，失败时包装错误返回
 	if err := wp.store.SaveEpisode(ctx, agentID, topicID, episode); err != nil {
 		return nil, fmt.Errorf("save episode: %w", err)
 	}
@@ -309,16 +371,18 @@ func (wp *WriteProcessor) Process(ctx context.Context, agentID, topicID, action,
 }
 
 // ProcessWithStepCount 处理写入（带 stepCount 幂等键）。
-// 职责: 将一条原始观察加工为 Episode 并持久化，stepCount 用于幂等去重。
-// 参数:
-//   - ctx: 上下文。
-//   - agentID: 归属 Agent 标识。
-//   - topicID: 归属 Topic 标识。
-//   - action: 本步动作摘要。
-//   - rawContent: 原始完整观察文本。
-//   - stepCount: 当前步骤序号，作为幂等键。
 //
-// 返回: 构建完成的 Episode；持久化失败时返回 wrapped error。
+// 职责：将一条原始观察加工为 Episode 并持久化，stepCount 用于幂等去重。
+//
+// 参数：
+//   - ctx：上下文。
+//   - agentID：归属 Agent 标识。
+//   - topicID：归属 Topic 标识。
+//   - action：本步动作摘要。
+//   - rawContent：原始完整观察文本。
+//   - stepCount：当前步骤序号，作为幂等键。
+//
+// 返回：构建完成的 Episode；持久化失败时返回 wrapped error。
 func (wp *WriteProcessor) ProcessWithStepCount(ctx context.Context, agentID, topicID, action, rawContent string, stepCount int) (*types.Episode, error) {
 	// 1. 生成摘要
 	summary := wp.summarizer.Summarize(rawContent)
@@ -353,21 +417,33 @@ func (wp *WriteProcessor) ProcessWithStepCount(ctx context.Context, agentID, top
 }
 
 // generateStepID 生成步骤 ID。
-// 职责: 以 agentID + 纳秒时间戳拼接出全局唯一步骤标识。
-// 参数: agentID - 归属 Agent 标识。
-// 返回: 形如 "{agentID}_{unixNano}" 的字符串。
-// 副作用: 无。
-// 并发安全: 是（time.Now 线程安全，无共享状态）。
+//
+// 职责：以 agentID + 纳秒时间戳拼接出全局唯一步骤标识。
+//
+// 参数：agentID - 归属 Agent 标识。
+//
+// 返回：形如 "{agentID}_{unixNano}" 的字符串。
+//
+// 副作用：无。
+//
+// 并发安全：是（time.Now 线程安全，无共享状态）。
 func generateStepID(agentID string) string {
 	return fmt.Sprintf("%s_%d", agentID, time.Now().UnixNano())
 }
 
 // containsAny 检查字符串是否包含任意关键词（大小写不敏感）。
-// 职责: 对 s 做小写化后逐个匹配 keywords。
-// 参数: s - 待检测文本；keywords - 关键词列表。
-// 返回: 命中任意关键词返回 true，否则 false。
-// 副作用: 无。
-// 并发安全: 是（纯函数）。
+//
+// 职责：对 s 做小写化后逐个匹配 keywords。
+//
+// 参数：
+//   - s：待检测文本。
+//   - keywords：关键词列表。
+//
+// 返回：命中任意关键词返回 true，否则 false。
+//
+// 副作用：无。
+//
+// 并发安全：是（纯函数）。
 func containsAny(s string, keywords []string) bool {
 	// 统一小写化以做大小写不敏感匹配
 	lower := strings.ToLower(s)

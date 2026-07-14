@@ -1,5 +1,8 @@
 package tool
 
+// 导入所需标准库：context 用于在上下文中传递 SessionID；fmt 用于格式化错误信息；
+// os 用于获取当前工作目录；path/filepath 用于路径处理；regexp 用于命令黑名单正则匹配；
+// strings 用于字符串前缀判断与空白处理。
 import (
 	"context"
 	"fmt"

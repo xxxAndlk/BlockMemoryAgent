@@ -20,6 +20,7 @@ import (
 // 连续两次按键间隔小于该阈值时，Enter 被当作多行粘贴的一部分，插入换行而非提交。
 const pasteEnterThreshold = 80 * time.Millisecond
 
+// handleInputKey 在输入栏获得焦点时处理键盘事件，返回更新后的 Model 与 bubbletea 命令。
 func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	now := time.Now()
 	// 记录按键时间，用于区分终端粘贴产生的快速连续 Enter 与手动回车。
@@ -27,6 +28,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.Type {
 	case tea.KeyEsc:
+		// Esc 离开输入栏，清空输入并回到对话面板。
 		m.focus = panelChat
 		m.inputBar.runes = nil
 		m.inputBar.cursor = 0
@@ -43,10 +45,12 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			isPasteEnter = true
 		}
 		if isPasteEnter {
+			// 在光标位置插入换行符。
 			m.inputBar.runes = append(m.inputBar.runes[:m.inputBar.cursor], append([]rune{'\n'}, m.inputBar.runes[m.inputBar.cursor:]...)...)
 			m.inputBar.cursor++
 			return m, nil
 		}
+		// 非粘贴 Enter：提交输入。
 		cmd := string(m.inputBar.runes)
 		if strings.TrimSpace(cmd) != "" {
 			m.pushHistory(cmd)
@@ -60,15 +64,17 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// 避免长回答直接顶掉用户问题。
 		m.chatPanel.followBottom = false
 		m.chatPanel.pendingScrollToUser = true
-		// Keep focus in input so the user can immediately type the next message.
+		// 保持焦点在输入栏，方便用户连续输入下一条消息。
 		m.focus = panelInput
 		return m, nil
 
 	case tea.KeyTab:
+		// Tab 切换焦点到对话面板。
 		m.focus = panelChat
 		return m, nil
 
 	case tea.KeyUp:
+		// 向上浏览历史输入。
 		h := m.sessionHistory()
 		if len(h) == 0 {
 			return m, nil
@@ -84,6 +90,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyDown:
+		// 向下浏览历史输入。
 		h := m.sessionHistory()
 		if m.inputBar.histIdx == -1 {
 			return m, nil
@@ -140,10 +147,11 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyCtrlC:
-		// ctrl+c quits the TUI from anywhere, including the input bar.
+		// ctrl+c 在任意位置退出 TUI。
 		return m, tea.Quit
 
 	case tea.KeyRunes:
+		// 在光标位置插入输入字符。
 		m.inputBar.runes = append(m.inputBar.runes[:m.inputBar.cursor], append(msg.Runes, m.inputBar.runes[m.inputBar.cursor:]...)...)
 		m.inputBar.cursor += len(msg.Runes)
 		return m, nil
@@ -176,7 +184,7 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
-	// /new <goal...> works without a selected session.
+	// /new <goal...> 无需选中会话即可创建新会话。
 	if parts[0] == "/new" && len(parts) > 1 {
 		goal := strings.TrimSpace(strings.TrimPrefix(trimmed, "/new "))
 		m.createSession(goal)
@@ -200,7 +208,6 @@ func (m *Model) submitInput(cmd string) {
 
 	s := m.selectedSession()
 	if s == nil {
-		// No session yet: treat plain input as a new conversation goal.
 		// 先本地预展示首条消息，确保用户按下回车后立刻在对话区看到自己的输入，
 		// 避免欢迎页停留造成"第一个问题未记录"的错觉。
 		m.chatPanel.pendingFirstMessage = cmd
@@ -250,7 +257,7 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
-	// /clarify <id> <answer...>
+	// /clarify <id> <answer...>：回复指定 id 的澄清问题。
 	if parts[0] == "/clarify" && len(parts) >= 3 {
 		id := parts[1]
 		// 用 TrimPrefix 而非 Fields 拼接 answer，保留 answer 内的空格
@@ -266,7 +273,7 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
-	// /interrupt <goal...>
+	// /interrupt <goal...>：以新目标抢占当前会话。
 	if parts[0] == "/interrupt" && len(parts) > 1 {
 		content := strings.TrimSpace(strings.TrimPrefix(trimmed, "/interrupt "))
 		m.postJSON(fmt.Sprintf("/api/sessions/%s/interrupt", s.ID), map[string]string{"content": content})
@@ -274,20 +281,20 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
-	// /enqueue <text...>
+	// /enqueue <text...>：将文本注入当前会话队列。
 	if parts[0] == "/enqueue" && len(parts) > 1 {
 		content := strings.TrimSpace(strings.TrimPrefix(trimmed, "/enqueue "))
 		m.postJSON(fmt.Sprintf("/api/sessions/%s/enqueue", s.ID), map[string]string{"content": content})
 		return
 	}
 
-	// /dag trigger <id>
+	// /dag trigger <id>：触发指定 id 的 DAG。
 	if len(parts) >= 3 && parts[0] == "/dag" && parts[1] == "trigger" {
 		m.postJSON(fmt.Sprintf("/api/dag/%s/trigger", parts[2]), map[string]any{})
 		return
 	}
 
-	// /dag new <json...>
+	// /dag new <json...>：以内联 JSON 创建新 DAG。
 	if len(parts) >= 3 && parts[0] == "/dag" && parts[1] == "new" {
 		var d dag.DAG
 		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(trimmed, "/dag new "))), &d); err != nil {
@@ -323,6 +330,7 @@ func (m *Model) postJSON(path string, body any) {
 		var lastErr error
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			if attempt > 0 {
+				// 重试前等待 500ms。
 				time.Sleep(500 * time.Millisecond)
 			}
 			req, err := http.NewRequest(http.MethodPost, addr+path, bytes.NewReader(data))
@@ -336,7 +344,7 @@ func (m *Model) postJSON(path string, body any) {
 				lastErr = err
 				continue
 			}
-			// Drain body for connection reuse (Step 8)
+			// 排空响应体以便连接复用（Step 8）。
 			_, _ = io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode >= 400 {
@@ -348,7 +356,6 @@ func (m *Model) postJSON(path string, body any) {
 	}()
 }
 
-// createSession creates a new session through the agent.Agent facade.
 // 异步执行（T2 修复）：成功后写 pendingSelectID，由 tick handler 在主循环内
 // 执行 refreshSessions + selectSession，避免后台 goroutine 直接改 m.sessions/cursor
 // 与 View 产生 race。
@@ -369,8 +376,6 @@ func (m *Model) createSession(goal string) {
 	}()
 }
 
-// sessionHistory returns the input history slice for the currently selected session.
-// pushHistory appends a command to the current session's input history.
 // getJSON 向本地 TUI 后端发 GET 请求并 JSON 解码到 dst。
 // 失败返回 error，调用方自行处理（如显示 flash 或退回空结果）。
 func (m *Model) getJSON(path string, dst any) error {
@@ -391,4 +396,5 @@ func (m *Model) getJSON(path string, dst any) error {
 	return json.NewDecoder(resp.Body).Decode(dst)
 }
 
+// requestTimeout 是本地 HTTP 请求的超时时间。
 const requestTimeout = 3 * time.Second

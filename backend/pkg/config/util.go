@@ -21,22 +21,22 @@ import (
 func resolveEnv(s string) string {
 	// 快速过滤: 长度至少 3 (${x}) 且首尾匹配 ${...}
 	if len(s) > 3 && s[0] == '$' && s[1] == '{' && s[len(s)-1] == '}' {
-		// 取出大括号内部内容
+		// 取出大括号内部内容。
 		inner := s[2 : len(s)-1]
-		// 尝试切分 "VAR:default" 形式
+		// 尝试切分 "VAR:default" 形式。
 		if varName, defaultPart, ok := strings.Cut(inner, ":"); ok {
-			// 去掉 default 外层双引号
+			// 去掉 default 外层双引号。
 			defaultVal := strings.Trim(defaultPart, "\"")
-			// 环境变量优先; 非空则返回
+			// 环境变量优先; 非空则返回。
 			if v := os.Getenv(varName); v != "" {
 				return v
 			}
-			// 回退到默认值
+			// 回退到默认值。
 			return defaultVal
 		}
-		// 无默认值: 直接返回环境变量值(可能为空)
+		// 无默认值: 直接返回环境变量值(可能为空)。
 		return os.Getenv(inner)
 	}
-	// 非引用格式: 原样返回
+	// 非引用格式: 原样返回。
 	return s
 }

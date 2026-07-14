@@ -83,10 +83,10 @@ type Message struct {
 //
 // 并发安全：所有公开方法均自行加锁，可被多 goroutine 同时调用。
 type Mailbox struct {
-	mu    sync.RWMutex
+	mu    sync.RWMutex          // 读写锁：保护 inbox 与 bcast 的并发访问
 	inbox map[string][]*Message // agentID -> messages
 	bcast []*Message            // To == "*" 等待主 Agent 决议
-	seq   atomic.Int64
+	seq   atomic.Int64          // 全局递增序号，用于生成消息 ID
 }
 
 // New 创建并返回一个新的邮箱管理器实例。
@@ -224,6 +224,7 @@ func drainMessages(msgs []*Message, markRead bool) []*Message {
 	now := time.Now()
 	out := make([]*Message, 0, len(msgs))
 	for _, msg := range msgs {
+		// 只处理未读消息，已读消息跳过。
 		if msg.Status != StatusUnread {
 			continue
 		}

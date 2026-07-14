@@ -1,14 +1,17 @@
 package mailbox
 
 import (
-	"testing"
+	"testing" // Go 测试框架
 )
 
+// TestMailbox_DirectSendAndDrain 验证定向投递、Drain 与优先级排序。
 func TestMailbox_DirectSendAndDrain(t *testing.T) {
 	m := New()
+	// 向 agentB 投递两条消息：普通 info 与高优先级 milestone。
 	m.Send(&Message{From: "agentA", To: "agentB", Type: MsgInfo, Subject: "hello"})
 	m.Send(&Message{From: "agentA", To: "agentB", Type: MsgMilestone, Subject: "done", Priority: 1})
 
+	// 未读计数应为 2。
 	if got := m.Count("agentB"); got != 2 {
 		t.Fatalf("expected 2 unread, got %d", got)
 	}
@@ -16,15 +19,17 @@ func TestMailbox_DirectSendAndDrain(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("expected 2 drained, got %d", len(got))
 	}
-	// 优先级排序：Priority=1 应排在前
+	// 优先级排序：Priority=1 应排在前。
 	if got[0].Subject != "done" {
 		t.Fatalf("priority sort failed: %s", got[0].Subject)
 	}
+	// Drain 后未读计数应为 0。
 	if m.Count("agentB") != 0 {
 		t.Fatalf("after drain, expected 0 unread")
 	}
 }
 
+// TestMailbox_BroadcastAndForward 验证广播消息的投递、DrainBroadcast 与幂等消费。
 func TestMailbox_BroadcastAndForward(t *testing.T) {
 	m := New()
 	id := m.Send(&Message{From: "meta", To: "*", Type: MsgEscalate, Subject: "needs help"})
@@ -43,6 +48,7 @@ func TestMailbox_BroadcastAndForward(t *testing.T) {
 	}
 }
 
+// TestMailbox_Purge 验证 Purge 能清空指定 Agent 的全部邮件。
 func TestMailbox_Purge(t *testing.T) {
 	m := New()
 	m.Send(&Message{To: "x", Subject: "1"})

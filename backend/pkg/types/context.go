@@ -2,8 +2,7 @@ package types
 
 import "github.com/blockmemory/agent/backend/pkg/enums"
 
-// Message 消息。
-// 轻量级消息结构，与 Eino SDK 解耦，便于在节点间传递。
+// Message 消息：轻量级消息结构，与 Eino SDK 解耦，便于在节点间传递。
 // 已从 internal/graph 下移到 pkg/types，供 memory / graph 共享，避免 memory→graph 依赖。
 type Message struct {
 	Role    enums.ChatRole // 角色：system / user / assistant

@@ -1,11 +1,12 @@
 package server
 
 import (
-	"net/http"
-	"net/http/httptest"
-	"testing"
+	"net/http"          // HTTP 方法与状态码
+	"net/http/httptest" // 测试 HTTP 请求/响应
+	"testing"           // 测试框架
 )
 
+// TestAuthMiddleware 测试 AuthMiddleware 的鉴权行为。
 func TestAuthMiddleware(t *testing.T) {
 	handler := AuthMiddleware("secret", []string{"/api/health"}, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -13,10 +14,10 @@ func TestAuthMiddleware(t *testing.T) {
 	})
 
 	cases := []struct {
-		name       string
-		path       string
-		auth       string
-		wantStatus int
+		name       string // 用例名称
+		path       string // 请求路径
+		auth       string // Authorization 头内容
+		wantStatus int    // 期望 HTTP 状态码
 	}{
 		{"public path without token", "/api/health", "", http.StatusOK},
 		{"protected path with valid token", "/api/sessions", "Bearer secret", http.StatusOK},
@@ -29,6 +30,7 @@ func TestAuthMiddleware(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			h := handler
+			// 空 token 场景需要构造独立的中间件。
 			if c.name == "empty token disables auth" {
 				h = AuthMiddleware("", []string{}, func(w http.ResponseWriter, r *http.Request) {
 					w.WriteHeader(http.StatusOK)
