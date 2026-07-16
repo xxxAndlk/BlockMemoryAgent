@@ -9,7 +9,7 @@ import (
 	"context"  // 上下文，用于 bootstrap 装配与优雅关闭
 	"flag"     // 命令行参数解析
 	"fmt"      // 格式化输出与字符串拼接
-	"log"      // 运行期日志输出
+	"log"      // 标准库日志；保留以统一业务代码中尚未迁移的 log.Printf 输出格式
 	"net"      // 监听本地 TCP 端口
 	"net/http" // 本地 HTTP 服务
 	"os"       // 文件状态、标准错误、环境变量、TTY 检测
@@ -21,6 +21,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/bootstrap" // 统一后端依赖装配
 	"github.com/blockmemory/agent/backend/internal/config"    // 配置与环境变量加载
+	"github.com/blockmemory/agent/backend/internal/logger"    // 结构化日志器
 	"github.com/blockmemory/agent/backend/internal/logging"   // 文件日志按天分割
 	"github.com/blockmemory/agent/backend/internal/server"    // HTTP handler 集合
 	"github.com/blockmemory/agent/backend/internal/tui"       // TUI 模型与更新逻辑
@@ -51,6 +52,10 @@ func main() {
 	noAltScreen := flag.Bool("no-alt-screen", false, "禁用 alt-screen（CI 或非 TTY 自动禁用）")
 	flag.Parse() // 解析命令行输入
 
+	// ---- 启动早期日志器 ----
+	// 配置文件校验失败等早期错误需要落到终端，避免用户只看到 exit status 1。
+	earlyLogger := logger.NewWithConfig(config.LoggingConfig{Level: "info", Format: "console", Timezone: "Local"}, nil, os.Stderr)
+
 	// ---- 校验必需配置文件 ----
 	// 严格启动：任一必需配置文件缺失即失败，避免运行期因缺配置产生隐式错误。
 	for path, name := range map[string]string{
@@ -62,19 +67,22 @@ func main() {
 	} {
 		if _, err := os.Stat(path); err != nil {
 			// 文件缺失或不可访问，记录致命错误并退出
-			log.Fatalf("%s not found: %s", name, path)
+			earlyLogger.Error(context.Background(), fmt.Sprintf("%s not found: %s", name, path), err)
+			os.Exit(1)
 		}
 	}
 
 	// 加载 .env 文件，把 KEY=VALUE 注入进程环境变量。
 	if err := config.LoadEnvFile(*envPath); err != nil {
-		log.Fatalf("load .env: %v", err)
+		earlyLogger.Error(context.Background(), "load .env", err)
+		os.Exit(1)
 	}
 
 	// 加载基础设施配置。
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		earlyLogger.Error(context.Background(), "load config", err)
+		os.Exit(1)
 	}
 
 	// ---- 初始化文件日志 ----
@@ -82,6 +90,7 @@ func main() {
 	// bubbletea 使用 alt-screen 全屏接管终端，若日志走 stderr 会刷到屏幕上顶乱布局，
 	// 因此 TUI 必须静默 stderr，始终写文件。即使配置未启用文件日志，也写入默认目录兜底，
 	// 避免日志完全丢弃导致排障无据可查。
+	var tuiLogger *logger.Logger
 	logDir := cfg.Logging.Dir
 	if !cfg.Logging.Enabled || logDir == "" {
 		// 配置未启用或目录为空时，使用默认 logs 目录
@@ -92,12 +101,18 @@ func main() {
 	if err != nil {
 		// 初始化失败时向终端打印警告，然后继续使用默认 log 输出
 		fmt.Println("warning: init file logging:", err)
+		tuiLogger = logger.NewWithConfig(cfg.Logging, nil, os.Stderr)
 	} else {
-		log.SetOutput(logWriter) // 后续 log 写入文件
-		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+		tuiLogger = logger.NewWithConfig(cfg.Logging, nil, logWriter)
 		defer logWriter.Close() // 退出时关闭日志文件句柄
 	}
-	log.Printf("BlockMemoryAgent TUI entry starting, log dir=%s", logDir)
+	tuiLogger.Info(context.Background(), fmt.Sprintf("BlockMemoryAgent TUI entry starting, log dir=%s", logDir))
+
+	// ---- 统一尚未迁移的标准库 log 输出格式 ----
+	// 业务代码中仍有少量 log.Printf 未注入 logger；将其输出转发到 tuiLogger，避免 TUI 界面被刷乱。
+	log.SetOutput(tuiLogger.StdLogWriter())
+	log.SetFlags(0)
+	log.SetPrefix("")
 
 	// ---- 构造根上下文 ----
 	// bootstrap.Build 需要上下文；当前未设置超时，使用 background。
@@ -115,11 +130,12 @@ func main() {
 	})
 	if err != nil {
 		// logging.Init(silent=true) 已把 log 输出重定向到日志文件，
-		// log.Fatalf 不会在终端显示失败原因，用户只看到 "exit status 1"。
-		// 这里先 fmt.Fprintln 到 stderr 让终端可见，再 log.Fatal 写文件留痕并退出。
+		// 日志 Fatal 不会在终端显示失败原因，用户只看到 "exit status 1"。
+		// 这里先 fmt.Fprintln 到 stderr 让终端可见，再写文件留痕并退出。
 		msg := fmt.Sprintf("启动失败：backend wiring 未通过: %v", err)
 		fmt.Fprintln(os.Stderr, msg)
-		log.Fatal(msg)
+		tuiLogger.Error(ctx, msg, err)
+		os.Exit(1)
 	}
 	defer app.Close() // main 返回时释放数据库、缓存等资源
 
@@ -176,17 +192,18 @@ func main() {
 	// 实际端口通过 ln.Addr() 回传给 TUI。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		log.Fatalf("listen: %v", err)
+		tuiLogger.Error(context.Background(), "listen", err)
+		os.Exit(1)
 	}
 	// 在独立 goroutine 中服务 HTTP 请求
 	go func() {
 		// 关闭 listener 时的 "use of closed network connection" 是正常退出信号，不当作错误
 		if err := http.Serve(ln, mux); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-			log.Printf("http server: %v", err)
+			tuiLogger.Error(context.Background(), "http server", err)
 		}
 	}()
 	httpAddr := "http://" + ln.Addr().String()
-	log.Printf("TUI backend listening at %s", httpAddr)
+	tuiLogger.Info(context.Background(), fmt.Sprintf("TUI backend listening at %s", httpAddr))
 
 	// ---- 构造 TUI 模型 ----
 	// 从角色配置中读取模型名称，传递给 TUI 用于标题栏显示
@@ -206,13 +223,14 @@ func main() {
 	// panic 恢复：确保异常退出时记录堆栈；bubbletea 自身会恢复终端，无需额外处理。
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("TUI panic recovered: %v (terminal may need reset)", r)
+			tuiLogger.Error(context.Background(), fmt.Sprintf("TUI panic recovered: %v (terminal may need reset)", r), nil)
 		}
 	}()
 
 	// 进入 TUI 主循环；出错则记录并退出
 	if _, err := p.Run(); err != nil {
-		log.Fatalf("TUI error: %v", err)
+		tuiLogger.Error(context.Background(), "TUI error", err)
+		os.Exit(1)
 	}
 
 	// ---- 退出清理 ----

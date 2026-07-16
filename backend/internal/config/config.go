@@ -40,8 +40,13 @@ type PluginToggle struct {
 // LoggingConfig 日志文件输出配置。
 // 不同入口（浏览器 HTTP 服务 / TUI）写入独立文件，便于按入口排查问题。
 type LoggingConfig struct {
-	Dir     string `yaml:"dir"`     // 日志目录，空则默认 ./logs；自动按入口 + 日期生成文件名
-	Enabled bool   `yaml:"enabled"` // 是否启用文件日志；false 时仅输出到 stderr
+	Dir          string `yaml:"dir"`           // 日志目录，空则默认 ./logs；自动按入口 + 日期生成文件名
+	Enabled      bool   `yaml:"enabled"`       // 是否启用文件日志；false 时仅输出到 stderr
+	Format       string `yaml:"format"`        // 输出格式：console（默认）或 json
+	Level        string `yaml:"level"`         // 日志级别：debug | info（默认）| warn | error
+	Timezone     string `yaml:"timezone"`      // 时区：Local（默认）| UTC | 如 Asia/Shanghai
+	StackEnabled *bool  `yaml:"stack_enabled"` // error 级别是否打印调用栈，默认 true
+	NoColor      *bool  `yaml:"no_color"`      // 是否禁用 ANSI 颜色，文件日志建议 true，默认 true
 }
 
 // MemoryPolicyConfig 记忆管线策略配置。
@@ -545,6 +550,23 @@ func (c *Config) applyLoggingDefaults() {
 	// —— 日志默认值：默认目录 ./logs ——
 	if c.Logging.Dir == "" {
 		c.Logging.Dir = "logs"
+	}
+	if c.Logging.Format == "" {
+		c.Logging.Format = "console"
+	}
+	if c.Logging.Level == "" {
+		c.Logging.Level = "info"
+	}
+	if c.Logging.Timezone == "" {
+		c.Logging.Timezone = "Local"
+	}
+	if c.Logging.StackEnabled == nil {
+		t := true
+		c.Logging.StackEnabled = &t
+	}
+	if c.Logging.NoColor == nil {
+		t := true
+		c.Logging.NoColor = &t
 	}
 }
 

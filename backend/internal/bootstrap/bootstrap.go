@@ -151,7 +151,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	}
 
 	// 第九步：创建结构化会话日志器。
-	sessionLogger := logger.New(pgStore, paths.LogWriter)
+	sessionLogger := logger.NewWithConfig(cfg.Logging, pgStore, paths.LogWriter)
 
 	// 第十步：创建模型工厂并预热、校验连通性。
 	modelFactory := model.NewModelFactory(roleCfg)

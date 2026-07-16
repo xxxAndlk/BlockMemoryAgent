@@ -4,6 +4,8 @@ import (
 	"context"       // 上下文传递
 	"encoding/json" // JSON 序列化
 	"fmt"           // 错误格式化
+	"net/http"      // 自定义 RoundTripper
+	"strings"       // 路径后缀剥离
 
 	"github.com/anthropics/anthropic-sdk-go"         // Anthropic Go SDK
 	"github.com/anthropics/anthropic-sdk-go/option"  // Anthropic 客户端选项
@@ -13,12 +15,28 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"     // JSON Schema 处理
 )
 
+// stripMessagesTransport 剥离 SDK 硬编码追加的 /v1/messages 后缀。
+// .env 里的 base_url 即为完整端点，不应再被追加路径。
+// 直接改原 req.URL.Path（不 clone），让 SDK 的错误信息也显示剥离后的 URL。
+type stripMessagesTransport struct {
+	base http.RoundTripper
+}
+
+func (t *stripMessagesTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.URL.Path = strings.TrimSuffix(req.URL.Path, "/v1/messages")
+	if req.URL.RawPath != "" {
+		req.URL.RawPath = strings.TrimSuffix(req.URL.RawPath, "/v1/messages")
+	}
+	return t.base.RoundTrip(req)
+}
+
 // anthropicProvider 基于 Anthropic Go SDK 原生 Messages API 的 provider 封装。
 type anthropicProvider struct {
 	client      anthropic.Client // Anthropic SDK 客户端
 	modelName   string           // 模型名称
 	maxTokens   int64            // 最大输出 token 数
 	temperature float64          // 采样温度
+	baseURL     string           // .env 配置的完整端点（实际请求 URL）
 }
 
 // newAnthropicProvider 构造一个 Anthropic 原生 provider。
@@ -42,10 +60,15 @@ func newAnthropicProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 
 	// 创建 Anthropic 客户端并封装为 provider
 	return &anthropicProvider{
-		client:      anthropic.NewClient(option.WithAPIKey(cfg.APIKey), option.WithBaseURL(baseURL)),
+		client: anthropic.NewClient(
+			option.WithAPIKey(cfg.APIKey),
+			option.WithBaseURL(baseURL),
+			option.WithHTTPClient(&http.Client{Transport: &stripMessagesTransport{base: http.DefaultTransport}}),
+		),
 		modelName:   cfg.Model,
 		maxTokens:   maxTokens,
 		temperature: cfg.Temperature,
+		baseURL:     baseURL,
 	}
 }
 
@@ -81,7 +104,11 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 	// 调用 Anthropic Messages API
 	resp, err := p.client.Messages.New(ctx, params)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic messages: %w", err)
+		// SDK 内部克隆请求再传 transport，错误信息用原 cfg.Request.URL（含 /v1/messages）。
+		// 实际请求经 stripMessagesTransport 剥离后打到 p.baseURL。
+		// 从 SDK 错误字符串里剔除 /v1/messages，避免误导。
+		cleaned := strings.ReplaceAll(err.Error(), "/v1/messages", "")
+		return nil, fmt.Errorf("anthropic messages POST %s: %s", p.baseURL, cleaned)
 	}
 
 	// 转换响应为 blades 格式

@@ -82,8 +82,13 @@ plugins:
     enabled: false               # Computer Use 浏览器/GUI 自动化
 
 # 日志文件输出（按天分割，按入口分文件）
-# 浏览器入口 → logs/browser-YYYY-MM-DD.log
-# TUI 入口    → logs/tui-YYYY-MM-DD.log
+# 后端入口 → logs/backend/YYYY-MM-DD.log
+# TUI 入口 → logs/tui/YYYY-MM-DD.log
 logging:
   enabled: true                  # false 时仅输出到 stderr，不写文件
   dir: logs                      # 日志目录，自动创建
+  format: console                # console（纯文本，便于阅读）或 json（结构化）
+  level: info                    # debug | info | warn | error
+  timezone: Local                # Local | UTC | Asia/Shanghai
+  stack_enabled: true            # error 级别是否打印调用栈
+  no_color: true                 # 是否禁用 ANSI 颜色，文件日志建议 true

@@ -12,8 +12,9 @@ package main
 import (
 	"context"       // 上下文，用于跨 goroutine 传递取消信号与设置超时
 	"flag"          // 标准库命令行参数解析
+	"fmt"           // 格式化字符串
 	"io"            // 日志 writer 接口，用于把 log 输出重定向到文件
-	"log"           // 标准日志输出， fatal / printf 等
+	"log"           // 标准库日志；保留以统一业务代码中尚未迁移的 log.Printf 输出格式
 	"net/http"      // HTTP 服务与路由注册
 	"os"            // 文件状态、信号、标准错误等
 	"os/signal"     // 注册操作系统信号监听器
@@ -23,6 +24,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/bootstrap" // 统一后端依赖装配（wiring）
 	"github.com/blockmemory/agent/backend/internal/config"    // 基础设施配置加载与环境变量注入
+	"github.com/blockmemory/agent/backend/internal/logger"    // 结构化日志器
 	"github.com/blockmemory/agent/backend/internal/logging"   // 日志文件按天分割与静默模式
 )
 
@@ -47,6 +49,11 @@ func main() {
 	webDistPath := flag.String("web-dist", "web/dist", "前端构建产物目录路径（相对路径将基于可执行文件目录解析）")
 	flag.Parse() // 解析命令行输入；未解析前 *configPath 等指针仍为默认值
 
+	// ---- 启动早期日志器 ----
+	// 在配置文件加载之前，任何致命错误都需要落到 stderr；此处使用一个最小配置的
+	// zerolog logger，保证启动早期日志格式与运行期一致。
+	earlyLogger := logger.NewWithConfig(config.LoggingConfig{Level: "info", Format: "console", Timezone: "Local"}, nil, os.Stderr)
+
 	// ---- 加载 .env 文件 ----
 	// os.Stat 判断文件是否存在；若存在则把其中 KEY=VALUE 注入进程环境变量。
 	// bootstrap.Build 内部也会加载一次；此处提前加载是为了让日志路径等配置在
@@ -55,12 +62,13 @@ func main() {
 		// 文件存在：调用 LoadEnvFile 逐行解析
 		if err := config.LoadEnvFile(*envPath); err != nil {
 			// .env 解析失败属于启动期致命错误，直接退出
-			log.Fatalf("加载 .env 文件失败: %v", err)
+			earlyLogger.Error(context.Background(), "加载 .env 文件失败", err)
+			os.Exit(1)
 		}
-		log.Printf("已加载环境变量: %s", *envPath)
+		earlyLogger.Info(context.Background(), "已加载环境变量: "+*envPath)
 	} else {
 		// 文件不存在或无法访问：降级使用系统环境变量，保证容器化部署时仍可用
-		log.Printf("未找到 .env 文件 (%s)，使用系统环境变量", *envPath)
+		earlyLogger.Info(context.Background(), fmt.Sprintf("未找到 .env 文件 (%s)，使用系统环境变量", *envPath))
 	}
 
 	// ---- 加载基础设施配置 ----
@@ -69,7 +77,8 @@ func main() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		// 配置加载失败不可恢复，立即退出
-		log.Fatalf("加载配置失败: %v", err)
+		earlyLogger.Error(context.Background(), "加载配置失败", err)
+		os.Exit(1)
 	}
 
 	// ---- 初始化文件日志 ----
@@ -77,20 +86,30 @@ func main() {
 	// silent=false：HTTP 入口不使用 alt-screen，stderr + 文件双写便于开发期实时查看。
 	// 失败不 fatal：文件日志缺失时仍用 stderr，保证服务可启动。
 	var logWriter io.WriteCloser
+	var srvLogger *logger.Logger
 	if cfg.Logging.Enabled {
 		// logging.Init 返回一个按天滚动的 io.WriteCloser；EntryBackend 区分入口
 		w, err := logging.Init(logging.EntryBackend, cfg.Logging.Dir, false)
 		if err != nil {
 			// 初始化失败仅记录警告，保持 stderr 可用
-			log.Printf("警告: 初始化文件日志失败: %v (仅输出到 stderr)", err)
+			earlyLogger.Error(context.Background(), "初始化文件日志失败，降级到 stderr", err)
+			srvLogger = logger.NewWithConfig(cfg.Logging, nil, os.Stderr)
 		} else {
 			logWriter = w
-			log.SetOutput(logWriter) // 后续 log 写入文件
-			log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+			srvLogger = logger.NewWithConfig(cfg.Logging, nil, logWriter)
 			defer logWriter.Close() // 进程退出时关闭文件句柄，避免资源泄漏
 		}
+	} else {
+		// 文件日志关闭时统一输出到 stderr
+		srvLogger = logger.NewWithConfig(cfg.Logging, nil, os.Stderr)
 	}
-	log.Printf("BlockMemoryAgent 后台服务启动中, 日志目录=%s", cfg.Logging.Dir)
+	srvLogger.Info(context.Background(), fmt.Sprintf("BlockMemoryAgent 后台服务启动中, 日志目录=%s", cfg.Logging.Dir))
+
+	// ---- 统一尚未迁移的标准库 log 输出格式 ----
+	// 业务代码中仍有少量 log.Printf 未注入 logger；将其输出转发到 srvLogger，避免格式割裂。
+	log.SetOutput(srvLogger.StdLogWriter())
+	log.SetFlags(0)
+	log.SetPrefix("")
 
 	// ---- 构造根上下文 ----
 	// context.WithCancel 创建可取消的上下文；cancel 在收到信号时触发，
@@ -111,7 +130,8 @@ func main() {
 	})
 	if err != nil {
 		// 依赖装配失败无法继续，退出前 log 已落盘或输出到 stderr
-		log.Fatalf("装配依赖失败: %v", err)
+		srvLogger.Error(ctx, "装配依赖失败", err)
+		os.Exit(1)
 	}
 	defer app.Close() // main 返回时释放数据库连接、缓存连接等资源
 
@@ -134,7 +154,7 @@ func main() {
 
 	// ---- 启动 HTTP 服务 ----
 	addr := cfg.HTTP.Addr
-	log.Printf("BlockMemoryAgent 服务启动: http://localhost%s", addr)
+	srvLogger.Info(ctx, fmt.Sprintf("BlockMemoryAgent 服务启动: http://localhost%s", addr))
 
 	// 构造 http.Server 实例，Handler 指向上面注册好的 mux。
 	// P0-01 修复：显式配置读/写超时，避免慢客户端攻击；IdleTimeout 兜底 120s。
@@ -149,7 +169,8 @@ func main() {
 	// 在独立 goroutine 中监听并服务；非 ErrServerClosed 的错误视为致命。
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP 服务错误: %v", err)
+			srvLogger.Error(ctx, "HTTP 服务错误", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -161,7 +182,7 @@ func main() {
 
 	// ---- 优雅关闭 ----
 	// 触发上下文取消，通知后台任务退出；随后关闭 HTTP server。
-	log.Println("正在关闭服务...")
+	srvLogger.Info(ctx, "正在关闭服务...")
 	cancel()
 	httpServer.Close()
 }

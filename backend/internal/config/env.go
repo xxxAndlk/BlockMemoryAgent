@@ -8,8 +8,9 @@ import (
 )
 
 // LoadEnvFile 从指定路径的 .env 文件加载环境变量到进程环境。
-// 职责：逐行解析 KEY=VALUE，跳过空行与注释；已存在的环境变量不会被覆盖
-// （保证命令行或系统环境注入的变量优先级最高）。
+// 职责：逐行解析 KEY=VALUE，跳过空行与注释；.env 文件优先级高于 shell 环境变量，
+// 已存在的同名变量会被覆盖（.env 为项目配置的唯一真相源，避免 shell 侧 Claude Code
+// 等工具注入的 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 等变量污染项目配置）。
 // 参数：path 为 .env 文件路径。
 // 返回：文件打开或扫描出错时返回包装后的 error；正常解析返回 nil。
 // 副作用：调用 os.Setenv 写入进程环境变量，影响后续配置插值与程序运行。
@@ -44,12 +45,7 @@ func LoadEnvFile(path string) error {
 			continue
 		}
 
-		// 已存在的环境变量不覆盖（命令行/系统环境优先）
-		if os.Getenv(key) != "" {
-			continue
-		}
-
-		// 写入进程环境变量，供后续配置插值使用
+		// .env 优先级高于 shell：无条件覆盖，确保项目配置不被外部 env 污染
 		os.Setenv(key, value)
 	}
 
