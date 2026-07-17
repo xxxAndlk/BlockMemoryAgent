@@ -6,7 +6,6 @@ import (
 	"database/sql"  // 标准库 SQL 抽象层
 	"encoding/json" // 结构体与 JSONB/JSON 列之间的序列化
 	"fmt"           // 格式化错误与动态 SQL 拼接
-	"log"           // 反序列化失败日志
 	"strings"       // 校验/清洗 UTF-8
 	"time"          // 时间戳
 )
@@ -149,7 +148,7 @@ func (s *PostgresStore) QuerySessionLogs(ctx context.Context, sessionID, agent, 
 		return nil, fmt.Errorf("query session_logs: %w", err)
 	}
 	defer rows.Close()
-	return scanSessionLogRows(rows)
+	return s.scanSessionLogRows(ctx, rows)
 }
 
 // AggregateSessionTokens 按 agent + model 聚合会话的 token 消耗。
@@ -197,10 +196,11 @@ func (s *PostgresStore) AggregateSessionTokens(ctx context.Context, sessionID st
 
 // scanSessionLogRows 扫描 session_logs 结果集。
 // 参数:
+//   - ctx: 请求上下文，用于记录反序列化失败日志。
 //   - rows: 已执行的 *sql.Rows。
 //
 // 返回: 日志记录切片与迭代错误；扫描/反序列化失败的单行被跳过。
-func scanSessionLogRows(rows *sql.Rows) ([]*SessionLogRecord, error) {
+func (s *PostgresStore) scanSessionLogRows(ctx context.Context, rows *sql.Rows) ([]*SessionLogRecord, error) {
 	var out []*SessionLogRecord
 	for rows.Next() {
 		var r SessionLogRecord
@@ -215,7 +215,7 @@ func scanSessionLogRows(rows *sql.Rows) ([]*SessionLogRecord, error) {
 		}
 		if len(metaRaw) > 0 {
 			if err := json.Unmarshal(metaRaw, &r.Meta); err != nil {
-				log.Printf("[store] unmarshal session_logs.meta_json failed: id=%d err=%v", r.ID, err)
+				logError(s.log, ctx, fmt.Sprintf("[store] unmarshal session_logs.meta_json failed: id=%d", r.ID), err)
 			}
 		}
 		out = append(out, &r)

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
@@ -85,6 +87,9 @@ type Model struct {
 
 	// tickCount 记录 tick 次数，用于按周期执行不同刷新任务。
 	tickCount int
+
+	// log 是结构化日志器，由 SetLogger 注入；nil 时回退标准库 log。
+	log *logger.Logger
 }
 
 // NewModel 构造一个 TUI Model，连接后端依赖，初始化默认状态并加载会话列表。
@@ -123,6 +128,30 @@ func NewModel(
 // Init 启动后台 tick 与 agent 事件流监听器。
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(tickCmd(), streamCmd(m.streamEvents))
+}
+
+// SetLogger 注入结构化日志器，使后端交互错误以 [ERRO] 级别输出。
+// 参数 l：已初始化的 Logger 指针；未注入时回退标准库 log（级别固定 INFO）。
+func (m *Model) SetLogger(l *logger.Logger) {
+	m.log = l
+}
+
+// logInfo 记录信息类日志；未注入 logger 时回退标准库 log，保持旧行为。
+func (m *Model) logInfo(msg string) {
+	if m.log != nil {
+		m.log.Info(context.Background(), msg)
+		return
+	}
+	log.Print(msg)
+}
+
+// logError 记录错误类日志；未注入 logger 时回退标准库 log，保持旧行为。
+func (m *Model) logError(msg string, err error) {
+	if m.log != nil {
+		m.log.Error(context.Background(), msg, err)
+		return
+	}
+	log.Printf("%s: %v", msg, err)
 }
 
 // tickCmd 返回每 100ms 触发一次的 tick 命令。
@@ -176,7 +205,7 @@ func (m *Model) selectSession(idx int) {
 		if found {
 			m.chatPanel.pendingFirstMessage = ""
 		} else {
-			log.Printf("[tui] selectSession: session %s 尚未同步首条用户消息，保留本地预展示", m.sessions[idx].ID)
+			m.logInfo(fmt.Sprintf("[tui] selectSession: session %s 尚未同步首条用户消息，保留本地预展示", m.sessions[idx].ID))
 		}
 	}
 	// 重置对话面板滚动状态。
@@ -254,7 +283,7 @@ func (m *Model) refreshSessions() {
 	// 并尽可能保持光标停留在之前选中的会话上。
 	sessions, err := m.agent.List(context.Background(), agent.Filter{})
 	if err != nil {
-		log.Printf("[tui] refreshSessions: %v", err)
+		m.logError("[tui] refreshSessions", err)
 		return
 	}
 	m.sessions = make([]*server.Session, 0, len(sessions))
@@ -296,7 +325,7 @@ func (m *Model) selectedSession() *server.Session {
 	// 通过 agent.Agent facade 获取会话快照，避免直接依赖 SessionManager 内部方法。
 	sess, err := m.agent.Get(context.Background(), m.sessions[m.sessionsCursor].ID)
 	if err != nil {
-		log.Printf("[tui] selectedSession: %v", err)
+		m.logError("[tui] selectedSession", err)
 		// 降级：返回本地缓存的会话。
 		s := *m.sessions[m.sessionsCursor]
 		return &s

@@ -13,13 +13,14 @@ package dag
 import (
 	"context" // 上下文，用于取消与超时传递
 	"fmt"     // 格式化错误信息
-	"log"     // 记录调度错误日志
+	"log"     // 未注入 logger 时的回退输出
 	"strconv" // 字符串与整数转换
 	"strings" // 字符串裁剪
 	"sync"    // 互斥锁与 WaitGroup
 	"time"    // 时间解析与定时器
 
-	"github.com/blockmemory/agent/backend/pkg/types" // Task / DAG 等公共类型
+	"github.com/blockmemory/agent/backend/internal/logger" // 结构化日志器
+	"github.com/blockmemory/agent/backend/pkg/types"       // Task / DAG 等公共类型
 )
 
 // TaskStatus 是 task 状态类型别名，指向 pkg/types.TaskStatus。
@@ -108,6 +109,7 @@ type SessionLauncher interface {
 type Scheduler struct {
 	store    Store           // DAG 持久化存储
 	launcher SessionLauncher // session 派发器
+	log      *logger.Logger  // 结构化日志器，由 SetLogger 注入；nil 时回退标准库 log
 	mu       sync.Mutex      // 保护 running map
 	running  map[string]*DAG // 正在执行的 DAG 实例（含运行中 task 状态）
 	interval time.Duration   // 调度器自身轮询间隔
@@ -145,6 +147,21 @@ func NewScheduler(store Store, launcher SessionLauncher, interval time.Duration)
 func (s *Scheduler) Start(ctx context.Context) {
 	s.wg.Add(1)
 	go s.loop(ctx)
+}
+
+// SetLogger 注入结构化日志器，使调度错误以 [ERRO] 级别输出。
+// 参数 l：已初始化的 Logger 指针；未注入时回退标准库 log（级别固定 INFO）。
+func (s *Scheduler) SetLogger(l *logger.Logger) {
+	s.log = l
+}
+
+// logError 记录错误类日志；未注入 logger 时回退标准库 log，保持旧行为。
+func (s *Scheduler) logError(ctx context.Context, msg string, err error) {
+	if s.log != nil {
+		s.log.Error(ctx, msg, err)
+		return
+	}
+	log.Printf("%s: %v", msg, err)
 }
 
 // Stop 停止调度并等待后台 goroutine 退出。
@@ -256,13 +273,13 @@ func (s *Scheduler) tick(ctx context.Context) {
 		// 简化：若距 updatedAt 超过 interval，则触发该 DAG
 		if now.Sub(d.UpdatedAt) >= interval {
 			if err := s.Trigger(ctx, d.ID); err != nil {
-				log.Printf("[DAG] trigger failed: id=%s err=%v", d.ID, err)
+				s.logError(ctx, fmt.Sprintf("[DAG] trigger failed: id=%s", d.ID), err)
 			}
 			// 更新 updatedAt 为当前时间，避免同一周期重复触发
 			d.UpdatedAt = now
 			// 持久化新的 updatedAt，避免进程重启后重复触发
 			if err := s.store.SaveDAG(ctx, d); err != nil {
-				log.Printf("[DAG] save dag failed: id=%s err=%v", d.ID, err)
+				s.logError(ctx, fmt.Sprintf("[DAG] save dag failed: id=%s", d.ID), err)
 			}
 		}
 	}

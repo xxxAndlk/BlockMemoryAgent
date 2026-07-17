@@ -152,6 +152,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第九步：创建结构化会话日志器。
 	sessionLogger := logger.NewWithConfig(cfg.Logging, pgStore, paths.LogWriter)
+	// 同步注入存储层，让反序列化失败等错误日志以 [ERRO] 级别输出。
+	pgStore.SetLogger(sessionLogger)
 
 	// 第十步：创建模型工厂并预热、校验连通性。
 	modelFactory := model.NewModelFactory(roleCfg)
@@ -187,6 +189,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		return nil, fmt.Errorf("init runtime: %w", err)
 	}
 	rt.SetAgentConfig(&cfg.Agent)
+	// 向指令队列注入日志器，丢弃指令等错误以 [ERRO] 输出。
+	rt.CmdQueue.SetLogger(sessionLogger)
 
 	// 第十四步：装配 ReAct 引擎依赖。
 	// 获取当前工作目录，用于工具注册表定位工作区；失败时回退到 "."。
@@ -204,9 +208,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
+	agentSvc.SetLogger(sessionLogger)
 
 	// 第十七步：创建 HTTP SessionManager 并注入依赖。
 	sessionMgr := server.NewSessionManager(agentSvc)
+	sessionMgr.SetLogger(sessionLogger)
 	sessionMgr.SetPostgresStore(pgStore)
 	sessionMgr.SetModelFactory(modelFactory)
 
@@ -214,6 +220,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	var dagScheduler *dag.Scheduler
 	if cfg.Agent.DAGEnabled {
 		dagScheduler = dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
+		dagScheduler.SetLogger(sessionLogger)
 		dagScheduler.Start(ctx)
 	}
 

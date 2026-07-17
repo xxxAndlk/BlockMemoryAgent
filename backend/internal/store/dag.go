@@ -15,7 +15,6 @@ import (
 	"database/sql"  // 标准库 SQL 抽象层
 	"encoding/json" // Task 列表 JSON 序列化
 	"fmt"           // 格式化错误
-	"log"           // 反序列化失败日志
 
 	"github.com/blockmemory/agent/backend/pkg/types" // DAG 领域模型
 )
@@ -116,7 +115,7 @@ func (s *PostgresStore) GetDAG(ctx context.Context, id string) (*types.DAG, erro
 	// 反序列化 tasks JSONB
 	if len(tasksJSON) > 0 {
 		if err := json.Unmarshal(tasksJSON, &d.Tasks); err != nil {
-			log.Printf("[store] unmarshal dag_jobs.tasks failed: id=%s err=%v", d.ID, err)
+			logError(s.log, ctx, fmt.Sprintf("[store] unmarshal dag_jobs.tasks failed: id=%s", d.ID), err)
 		}
 	}
 	return &d, nil
@@ -152,7 +151,7 @@ func (s *PostgresStore) ListDAGs(ctx context.Context) ([]*types.DAG, error) {
 		// 逐行反序列化 tasks
 		if len(tasksJSON) > 0 {
 			if err := json.Unmarshal(tasksJSON, &d.Tasks); err != nil {
-				log.Printf("[store] unmarshal dag_jobs.tasks failed: id=%s err=%v", d.ID, err)
+				logError(s.log, ctx, fmt.Sprintf("[store] unmarshal dag_jobs.tasks failed: id=%s", d.ID), err)
 			}
 		}
 		out = append(out, &d)

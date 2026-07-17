@@ -5,7 +5,6 @@ import (
 	"database/sql"  // 标准库 SQL 抽象层
 	"encoding/json" // 结构体与 JSONB/JSON 列之间的序列化
 	"fmt"           // 格式化错误信息
-	"log"           // 反序列化失败时记录坏数据
 	"time"          // 时间戳
 )
 
@@ -42,7 +41,8 @@ type SessionEventRecord struct {
 // SessionStore 是会话历史/事件相关的 PostgreSQL 存储子层。
 // 职责: session_history 与 session_events 表的读写。
 type SessionStore struct {
-	db *sql.DB // 共享连接池
+	db  *sql.DB // 共享连接池
+	log Logger  // 结构化日志器，由 PostgresStore.SetLogger 传播注入；nil 时回退标准库 log
 }
 
 // SaveHistory 持久化一次会话的 goal/summary/工具调用结果/调度记忆。
@@ -177,12 +177,12 @@ func (s *SessionStore) RecentHistories(ctx context.Context, limit int) ([]*Sessi
 		// 仅在非空时反序列化 tool_results / meta_memory
 		if len(toolRaw) > 0 {
 			if err := json.Unmarshal(toolRaw, &r.ToolResults); err != nil {
-				log.Printf("[store] unmarshal session_history.tool_results failed: session=%s err=%v", r.SessionID, err)
+				logError(s.log, ctx, fmt.Sprintf("[store] unmarshal session_history.tool_results failed: session=%s", r.SessionID), err)
 			}
 		}
 		if len(memRaw) > 0 {
 			if err := json.Unmarshal(memRaw, &r.MetaMemory); err != nil {
-				log.Printf("[store] unmarshal session_history.meta_memory failed: session=%s err=%v", r.SessionID, err)
+				logError(s.log, ctx, fmt.Sprintf("[store] unmarshal session_history.meta_memory failed: session=%s", r.SessionID), err)
 			}
 		}
 		out = append(out, &r)
@@ -214,12 +214,12 @@ func (s *SessionStore) GetHistoryByID(ctx context.Context, id string) (*SessionH
 	}
 	if len(toolRaw) > 0 {
 		if err := json.Unmarshal(toolRaw, &r.ToolResults); err != nil {
-			log.Printf("[store] unmarshal session_history.tool_results failed: session=%s err=%v", r.SessionID, err)
+			logError(s.log, ctx, fmt.Sprintf("[store] unmarshal session_history.tool_results failed: session=%s", r.SessionID), err)
 		}
 	}
 	if len(memRaw) > 0 {
 		if err := json.Unmarshal(memRaw, &r.MetaMemory); err != nil {
-			log.Printf("[store] unmarshal session_history.meta_memory failed: session=%s err=%v", r.SessionID, err)
+			logError(s.log, ctx, fmt.Sprintf("[store] unmarshal session_history.meta_memory failed: session=%s", r.SessionID), err)
 		}
 	}
 	return &r, nil

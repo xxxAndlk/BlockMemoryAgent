@@ -22,6 +22,7 @@ type PostgresStore struct {
 	db                         *sql.DB             // 共享连接池,所有子存储通过该句柄执行 SQL
 	dim                        int                 // 向量维度，由 SetEmbeddingDim 设置；默认 768，需与 schema 中 VECTOR(N) 一致
 	embedder                   embed.Embedder      // 文本嵌入实现（P3-3）；nil 时回退 PseudoEmbed
+	log                        Logger              // 结构化日志器，由 SetLogger 注入；nil 时回退标准库 log
 	searchBlockMemoryMaxTokens int                 // 块记忆检索摘要 token 上限；由配置注入
 	Episode                    *EpisodeStore       // 私有 Episode 存储
 	Snapshot                   *SnapshotStore      // Agent 快照存储
@@ -100,6 +101,21 @@ func (s *PostgresStore) EmbeddingDim() int {
 //   - e: 嵌入器接口实现。
 func (s *PostgresStore) SetEmbedder(e embed.Embedder) {
 	s.embedder = e
+}
+
+// SetLogger 注入结构化日志器，用于反序列化失败等错误日志的 [ERRO] 输出，
+// 并传播到持有日志能力的子存储（Session/Knowledge）。
+// 未调用时各存储回退标准库 log，保持旧行为。
+// 参数:
+//   - l: 日志器实现，通常为 *logger.Logger（经窄接口 Logger 注入，避免循环导入）。
+func (s *PostgresStore) SetLogger(l Logger) {
+	s.log = l
+	if s.Session != nil {
+		s.Session.log = l
+	}
+	if s.Knowledge != nil {
+		s.Knowledge.log = l
+	}
 }
 
 // Embed 实现 memory.BlockMemorySearcher 接口，将查询文本编码为向量。

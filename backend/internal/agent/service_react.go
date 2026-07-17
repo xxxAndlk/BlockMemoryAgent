@@ -11,6 +11,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
@@ -38,6 +39,12 @@ type ReactService struct {
 // 主要用于需要在无真实 API 密钥情况下运行 ReAct 循环的测试场景。
 func (s *ReactService) SetModelProvider(p ModelProvider) {
 	s.testProvider = p
+}
+
+// SetLogger 注入结构化日志器，使会话存储的错误类日志以 [ERRO] 级别输出。
+// 参数 l：已初始化的 Logger 指针；未注入时回退标准库 log。
+func (s *ReactService) SetLogger(l *logger.Logger) {
+	s.store.setLogger(l)
 }
 
 // NewReactService 创建 ReactService，并注入 ReAct 引擎运行时所需的所有依赖。

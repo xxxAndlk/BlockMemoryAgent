@@ -7,9 +7,13 @@
 package cmdqueue
 
 import (
-	"errors" // 构造 ErrQueueFull 等哨兵错误
-	"log"    // 记录 Push 丢弃指令的警告日志
-	"sync"   // 读写锁与互斥锁
+	"context" // 日志调用上下文
+	"errors"  // 构造 ErrQueueFull 等哨兵错误
+	"fmt"     // 格式化日志消息
+	"log"     // 未注入 logger 时的回退输出
+	"sync"    // 读写锁与互斥锁
+
+	"github.com/blockmemory/agent/backend/internal/logger" // 结构化日志器
 )
 
 // Intent 表示用户指令的处置意图。
@@ -52,6 +56,7 @@ type Queue struct {
 type Manager struct {
 	mu     sync.RWMutex      // 保护 queues map
 	queues map[string]*Queue // 按 sessionID 索引的队列表
+	log    *logger.Logger    // 结构化日志器，由 SetLogger 注入；nil 时回退标准库 log
 }
 
 // NewManager 创建空的队列管理器。
@@ -59,6 +64,13 @@ type Manager struct {
 // 返回：已初始化 queues map 的 *Manager。
 func NewManager() *Manager {
 	return &Manager{queues: make(map[string]*Queue)}
+}
+
+// SetLogger 注入结构化日志器，使丢弃指令等错误以 [ERRO] 级别输出。
+//
+// 参数：l 为已初始化的 Logger 指针；未注入时回退标准库 log（级别固定 INFO）。
+func (m *Manager) SetLogger(l *logger.Logger) {
+	m.log = l
 }
 
 // getOrCreate 取或创建指定会话的队列。
@@ -117,7 +129,7 @@ func (q *Queue) Enqueue(item Item) error {
 	return nil
 }
 
-// Push 是 Enqueue 的兼容包装：队列满时记录警告并丢弃指令。
+// Push 是 Enqueue 的兼容包装：队列满时记录错误并丢弃指令。
 //
 // 已废弃：新代码应直接使用 Enqueue 并处理 ErrQueueFull。
 //
@@ -127,7 +139,11 @@ func (q *Queue) Enqueue(item Item) error {
 func (m *Manager) Push(sessionID string, item Item) {
 	// 委托给 Enqueue；失败只记录日志，不向上传播错误
 	if err := m.Enqueue(sessionID, item); err != nil {
-		log.Printf("cmdqueue: Push dropped item for session %s: %v", sessionID, err)
+		if m.log != nil {
+			m.log.Error(context.Background(), fmt.Sprintf("cmdqueue: Push dropped item for session %s", sessionID), err)
+		} else {
+			log.Printf("cmdqueue: Push dropped item for session %s: %v", sessionID, err)
+		}
 	}
 }
 

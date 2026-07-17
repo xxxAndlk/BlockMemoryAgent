@@ -9,7 +9,7 @@ import (
 	"context"  // 上下文，用于 bootstrap 装配与优雅关闭
 	"flag"     // 命令行参数解析
 	"fmt"      // 格式化输出与字符串拼接
-	"log"      // 标准库日志；保留以统一业务代码中尚未迁移的 log.Printf 输出格式
+	"log"      // 标准库日志；保留以兜底转发未注入 logger 路径的 log 输出
 	"net"      // 监听本地 TCP 端口
 	"net/http" // 本地 HTTP 服务
 	"os"       // 文件状态、标准错误、环境变量、TTY 检测
@@ -108,8 +108,9 @@ func main() {
 	}
 	tuiLogger.Info(context.Background(), fmt.Sprintf("BlockMemoryAgent TUI entry starting, log dir=%s", logDir))
 
-	// ---- 统一尚未迁移的标准库 log 输出格式 ----
-	// 业务代码中仍有少量 log.Printf 未注入 logger；将其输出转发到 tuiLogger，避免 TUI 界面被刷乱。
+	// ---- 兜底转发标准库 log 输出 ----
+	// 业务代码已统一注入 *logger.Logger；少数未注入路径（如测试直接构造的结构体）
+	// 仍回退标准库 log。将其输出转发到 tuiLogger，避免 TUI 界面被刷乱。
 	log.SetOutput(tuiLogger.StdLogWriter())
 	log.SetFlags(0)
 	log.SetPrefix("")
@@ -209,6 +210,7 @@ func main() {
 	// 从角色配置中读取模型名称，传递给 TUI 用于标题栏显示
 	modelName := app.RoleConfig.MetaAgent.ModelConfig.Model
 	model := tui.NewModel(app.Agent, app.DAGHandler, httpAddr, modelName)
+	model.SetLogger(app.Logger)
 
 	// ---- 配置 bubbletea 程序选项 ----
 	// CI 环境或 stdin 非 TTY 时自动禁用 alt-screen，避免输出被吞或光标异常。

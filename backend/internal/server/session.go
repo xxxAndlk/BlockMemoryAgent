@@ -4,16 +4,18 @@ import (
 	"context"       // 用于传递请求上下文与超时控制
 	"encoding/json" // 用于 HTTP 响应的 JSON 编码
 	"errors"        // 用于错误判断（errors.Is）
-	"log"           // 用于记录服务端错误日志
+	"fmt"           // 格式化日志消息
+	"log"           // 未注入 logger 时的回退输出
 	"net/http"      // HTTP 处理器与状态码
 	"strconv"       // 字符串与数字转换
 	"time"          // 时间类型与持续时间
 
-	"github.com/blockmemory/agent/backend/internal/agent" // Agent 门面接口
-	"github.com/blockmemory/agent/backend/internal/model" // ModelFactory（兼容注入）
-	"github.com/blockmemory/agent/backend/internal/store" // PostgresStore（兼容注入）
-	"github.com/blockmemory/agent/backend/pkg/enums"      // 会话状态、聊天角色等枚举
-	"github.com/blockmemory/agent/backend/pkg/types"      // 共享类型（ThreeLayerState 等）
+	"github.com/blockmemory/agent/backend/internal/agent"  // Agent 门面接口
+	"github.com/blockmemory/agent/backend/internal/logger" // 结构化日志器
+	"github.com/blockmemory/agent/backend/internal/model"  // ModelFactory（兼容注入）
+	"github.com/blockmemory/agent/backend/internal/store"  // PostgresStore（兼容注入）
+	"github.com/blockmemory/agent/backend/pkg/enums"       // 会话状态、聊天角色等枚举
+	"github.com/blockmemory/agent/backend/pkg/types"       // 共享类型（ThreeLayerState 等）
 )
 
 // Session 表示单个会话的运行时状态，同时作为 HTTP API 的传输对象（DTO）。
@@ -52,7 +54,8 @@ type SessionEvent struct {
 // SessionManager 是 agent.Agent 之上的薄 HTTP 适配层。
 // 所有会话的变更与只读查询都委托给 Agent 门面，避免在 HTTP 层重复实现业务逻辑。
 type SessionManager struct {
-	agent agent.Agent // Agent 门面接口
+	agent agent.Agent    // Agent 门面接口
+	log   *logger.Logger // 结构化日志器，由 SetLogger 注入；nil 时回退标准库 log
 }
 
 // NewSessionManager 创建一个委托给指定 Agent 门面的 HTTP 适配器。
@@ -60,6 +63,21 @@ type SessionManager struct {
 // 返回值：*SessionManager，供 HTTP 路由注册使用。
 func NewSessionManager(agentFacade agent.Agent) *SessionManager {
 	return &SessionManager{agent: agentFacade}
+}
+
+// SetLogger 注入结构化日志器，使服务端错误以 [ERRO] 级别输出。
+// 参数 l：已初始化的 Logger 指针；未注入时回退标准库 log（级别固定 INFO）。
+func (m *SessionManager) SetLogger(l *logger.Logger) {
+	m.log = l
+}
+
+// logError 记录错误类日志；未注入 logger 时回退标准库 log，保持旧行为。
+func (m *SessionManager) logError(ctx context.Context, msg string, err error) {
+	if m.log != nil {
+		m.log.Error(ctx, msg, err)
+		return
+	}
+	log.Printf("%s: %v", msg, err)
 }
 
 // SetPostgresStore 保留该方法以保持接口兼容，但实际为无操作（no-op）。
@@ -166,7 +184,7 @@ func (m *SessionManager) SessionCount() int {
 func (m *SessionManager) ListSessions() []*Session {
 	sessions, err := m.agent.List(context.Background(), agent.Filter{})
 	if err != nil {
-		log.Printf("ListSessions error: %v", err)
+		m.logError(context.Background(), "ListSessions error", err)
 		return nil
 	}
 	out := make([]*Session, 0, len(sessions))
@@ -400,7 +418,7 @@ func (m *SessionManager) HandleSessionLogs(w http.ResponseWriter, r *http.Reques
 		},
 	})
 	if err != nil {
-		log.Printf("[SessionManager] 查询 session_logs 失败: session=%s err=%v", id, err)
+		m.logError(r.Context(), fmt.Sprintf("[SessionManager] 查询 session_logs 失败: session=%s", id), err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -425,7 +443,7 @@ func (m *SessionManager) HandleSessionTokenMetrics(w http.ResponseWriter, r *htt
 
 	res, err := m.agent.Query(r.Context(), id, agent.Query{Kind: agent.QueryKindTokenMetrics})
 	if err != nil {
-		log.Printf("[SessionManager] 聚合 token 消耗失败: session=%s err=%v", id, err)
+		m.logError(r.Context(), fmt.Sprintf("[SessionManager] 聚合 token 消耗失败: session=%s", id), err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

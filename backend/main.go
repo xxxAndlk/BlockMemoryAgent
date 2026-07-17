@@ -14,7 +14,7 @@ import (
 	"flag"          // 标准库命令行参数解析
 	"fmt"           // 格式化字符串
 	"io"            // 日志 writer 接口，用于把 log 输出重定向到文件
-	"log"           // 标准库日志；保留以统一业务代码中尚未迁移的 log.Printf 输出格式
+	"log"           // 标准库日志；保留以兜底转发未注入 logger 路径的 log 输出
 	"net/http"      // HTTP 服务与路由注册
 	"os"            // 文件状态、信号、标准错误等
 	"os/signal"     // 注册操作系统信号监听器
@@ -105,8 +105,9 @@ func main() {
 	}
 	srvLogger.Info(context.Background(), fmt.Sprintf("BlockMemoryAgent 后台服务启动中, 日志目录=%s", cfg.Logging.Dir))
 
-	// ---- 统一尚未迁移的标准库 log 输出格式 ----
-	// 业务代码中仍有少量 log.Printf 未注入 logger；将其输出转发到 srvLogger，避免格式割裂。
+	// ---- 兜底转发标准库 log 输出 ----
+	// 业务代码已统一注入 *logger.Logger；少数未注入路径（如测试直接构造的结构体）
+	// 仍回退标准库 log。将其输出转发到 srvLogger，避免格式割裂。
 	log.SetOutput(srvLogger.StdLogWriter())
 	log.SetFlags(0)
 	log.SetPrefix("")

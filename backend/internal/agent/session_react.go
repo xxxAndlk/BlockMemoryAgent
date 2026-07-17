@@ -17,6 +17,7 @@ import (
 	"time"
 
 	// 内部包：模型工厂、事件类型、持久化存储、枚举、文本工具
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	"github.com/blockmemory/agent/backend/internal/store"
@@ -74,6 +75,8 @@ type reactSessionStore struct {
 	workDir string
 	// metrics 收集 LLM 调用指标（调用次数、延迟等）。
 	metrics *metricsCollector
+	// log 是结构化日志器，由 setLogger 注入；nil 时回退标准库 log，保持旧行为。
+	log *logger.Logger
 }
 
 // newReactSessionStore 创建一个新的 reactSessionStore 实例。
@@ -101,6 +104,31 @@ func (st *reactSessionStore) setPostgresStore(pg *store.PostgresStore) {
 func (st *reactSessionStore) setModelFactory(mf *model.ModelFactory) {
 	// 保存依赖，供推理时按需获取模型实例。
 	st.modelFactory = mf
+}
+
+// setLogger 注入结构化日志器，让错误类日志以 [ERRO] 级别输出。
+// l: 已初始化的 Logger 指针；未注入时回退标准库 log（级别固定 INFO）。
+func (st *reactSessionStore) setLogger(l *logger.Logger) {
+	st.log = l
+}
+
+// logInfo 记录信息类日志；未注入 logger 时回退标准库 log。
+func (st *reactSessionStore) logInfo(msg string) {
+	if st.log != nil {
+		st.log.Info(context.Background(), msg)
+		return
+	}
+	log.Print(msg)
+}
+
+// logError 记录错误类日志；未注入 logger 时回退标准库 log。
+// ctx 供日志器内部异步落库做超时/取消控制；无上下文可用处传 context.Background()。
+func (st *reactSessionStore) logError(ctx context.Context, msg string, err error) {
+	if st.log != nil {
+		st.log.Error(ctx, msg, err)
+		return
+	}
+	log.Printf("%s: %v", msg, err)
 }
 
 // createSession 创建一个运行中的 React 会话。
@@ -293,7 +321,7 @@ func (st *reactSessionStore) addEventDebug(session *reactInternalSession, eventT
 	st.mu.Unlock()
 
 	// 在标准日志中打印事件摘要，便于实时排查问题。
-	log.Printf("[%s] %s: %s", session.ID, agentName, message)
+	st.logInfo(fmt.Sprintf("[%s] %s: %s", session.ID, agentName, message))
 }
 
 // cleanupSessionTempDir 清理指定会话的临时目录。
@@ -307,12 +335,12 @@ func (st *reactSessionStore) cleanupSessionTempDir(sessionID, tempDir string) {
 	if _, err := os.Stat(tempDir); os.IsNotExist(err) {
 		return
 	}
-	// 递归删除临时目录；出错时记录警告日志。
+	// 递归删除临时目录；出错时记录错误日志。
 	if err := os.RemoveAll(tempDir); err != nil {
-		log.Printf("[%s] 清理临时目录失败: %v", sessionID, err)
+		st.logError(context.Background(), fmt.Sprintf("[%s] 清理临时目录失败", sessionID), err)
 	} else {
 		// 删除成功记录信息日志。
-		log.Printf("[%s] 已清理临时目录: %s", sessionID, tempDir)
+		st.logInfo(fmt.Sprintf("[%s] 已清理临时目录: %s", sessionID, tempDir))
 	}
 }
 
@@ -357,7 +385,7 @@ func (st *reactSessionStore) evictCompletedSessions() {
 	}
 	// 若有淘汰，打印日志说明保留数量。
 	if dropped > 0 {
-		log.Printf("从内存淘汰了 %d 个已完成会话 (保留 %d)", dropped, len(st.sessions))
+		st.logInfo(fmt.Sprintf("从内存淘汰了 %d 个已完成会话 (保留 %d)", dropped, len(st.sessions)))
 	}
 }
 
@@ -400,7 +428,7 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 	defer cancel()
 	// 调用持久化接口；失败仅记录日志，不中断业务流程。
 	if err := st.pgStore.SaveSessionHistory(ctx, rec); err != nil {
-		log.Printf("[%s] 持久化会话历史失败: %v", session.ID, err)
+		st.logError(ctx, fmt.Sprintf("[%s] 持久化会话历史失败", session.ID), err)
 	}
 }
 
@@ -439,7 +467,7 @@ func (st *reactSessionStore) persistEvents(session *reactInternalSession) {
 	defer cancel()
 	// 批量保存；失败仅记录日志。
 	if err := st.pgStore.SaveSessionEvents(ctx, session.ID, records); err != nil {
-		log.Printf("[%s] 持久化会话事件失败: %v", session.ID, err)
+		st.logError(ctx, fmt.Sprintf("[%s] 持久化会话事件失败", session.ID), err)
 	}
 }
 
@@ -494,7 +522,7 @@ func (st *reactSessionStore) restoreSessions(ctx context.Context, limit int) int
 	recs, err := st.pgStore.RecentSessionHistories(ctx, limit)
 	// 若查询失败，记录日志并返回 0。
 	if err != nil {
-		log.Printf("恢复会话失败: %v", err)
+		st.logError(ctx, "恢复会话失败", err)
 		return 0
 	}
 
@@ -552,7 +580,7 @@ func (st *reactSessionStore) restoreSessions(ctx context.Context, limit int) int
 
 	// 若有恢复，打印日志说明数量。
 	if restored > 0 {
-		log.Printf("从历史恢复了 %d 个会话", restored)
+		st.logInfo(fmt.Sprintf("从历史恢复了 %d 个会话", restored))
 	}
 	// 返回实际恢复数量。
 	return restored

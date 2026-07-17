@@ -5,7 +5,6 @@ import (
 	"database/sql"  // 标准库 SQL 抽象层
 	"encoding/json" // 结构体与 JSONB/JSON 列之间的序列化
 	"fmt"           // 格式化错误信息
-	"log"           // 反序列化失败时记录坏数据
 	"time"          // 超时与 NULL 时间处理
 
 	"github.com/blockmemory/agent/backend/pkg/enums" // 枚举常量
@@ -15,8 +14,9 @@ import (
 // KnowledgeStore 是全局知识库/块记忆相关的 PostgreSQL 存储子层。
 // 职责: global_knowledge 表的写入、按类型查询、向量相似搜索、归档与访问计数。
 type KnowledgeStore struct {
-	db *sql.DB        // 共享连接池
-	pg *PostgresStore // 反向引用，用于复用 Embed / EmbeddingDim 能力
+	db  *sql.DB        // 共享连接池
+	pg  *PostgresStore // 反向引用，用于复用 Embed / EmbeddingDim 能力
+	log Logger         // 结构化日志器，由 PostgresStore.SetLogger 传播注入；nil 时回退标准库 log
 }
 
 // Save 写入一条全局知识记录 (含向量)。
@@ -68,7 +68,7 @@ func (s *KnowledgeStore) GetByType(ctx context.Context, knowledgeType string, li
 	defer rows.Close()
 
 	// 复用统一的行扫描逻辑
-	return scanKnowledgeRows(rows)
+	return s.scanKnowledgeRows(ctx, rows)
 }
 
 // Search 向量相似搜索 (依赖 pgvector)。
@@ -98,7 +98,7 @@ func (s *KnowledgeStore) Search(ctx context.Context, embedding []float32, topK i
 	// 确保结果集关闭
 	defer rows.Close()
 
-	return scanKnowledgeRows(rows)
+	return s.scanKnowledgeRows(ctx, rows)
 }
 
 // SearchByTypeAndDomain 按 knowledge_type 与 meta->>'domain' 双重过滤的向量相似搜索。
@@ -133,7 +133,7 @@ func (s *KnowledgeStore) SearchByTypeAndDomain(ctx context.Context, knowledgeTyp
 	}
 	// 确保结果集关闭
 	defer rows.Close()
-	return scanKnowledgeRows(rows)
+	return s.scanKnowledgeRows(ctx, rows)
 }
 
 // SearchBlockMemory 按 domain 过滤后再语义匹配检索块记忆。
@@ -187,7 +187,7 @@ func (s *KnowledgeStore) SearchByType(ctx context.Context, knowledgeType enums.K
 	}
 	// 确保结果集关闭
 	defer rows.Close()
-	return scanKnowledgeRows(rows)
+	return s.scanKnowledgeRows(ctx, rows)
 }
 
 // Archive 归档指定 ID 的知识 (软删除)。
@@ -222,12 +222,13 @@ func (s *KnowledgeStore) IncrementAccessCount(ctx context.Context, id int64) err
 
 // scanKnowledgeRows 扫描知识库查询结果集,统一处理 NULL 字段与 JSONB 反序列化。
 // 参数:
+//   - ctx: 请求上下文，用于记录反序列化失败日志。
 //   - rows: 已执行的 *sql.Rows,列顺序固定为：
 //     id(ID)、knowledge_type(知识类型)、topic_id(话题 ID)、content(内容)、meta(元数据)、
 //     access_count(访问计数)、last_accessed(最后访问时间)、created_at(创建时间)、archived(是否归档)
 //
 // 返回: 知识记录切片;扫描/反序列化失败的单行被跳过。
-func scanKnowledgeRows(rows *sql.Rows) ([]*types.KnowledgeRecord, error) {
+func (s *KnowledgeStore) scanKnowledgeRows(ctx context.Context, rows *sql.Rows) ([]*types.KnowledgeRecord, error) {
 	var results []*types.KnowledgeRecord
 	for rows.Next() {
 		var r types.KnowledgeRecord
@@ -243,7 +244,7 @@ func scanKnowledgeRows(rows *sql.Rows) ([]*types.KnowledgeRecord, error) {
 		// 仅在 meta 非空时反序列化
 		if len(metaRaw) > 0 {
 			if err := json.Unmarshal(metaRaw, &r.Meta); err != nil {
-				log.Printf("[store] unmarshal global_knowledge.meta failed: id=%d err=%v", r.ID, err)
+				logError(s.log, ctx, fmt.Sprintf("[store] unmarshal global_knowledge.meta failed: id=%d", r.ID), err)
 			}
 		}
 		// last_accessed 可能为 NULL,有效时填充指针
