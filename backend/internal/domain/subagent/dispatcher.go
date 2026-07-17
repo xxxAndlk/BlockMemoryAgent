@@ -88,6 +88,21 @@ func (t *callSubAgentTool) Name() string { return "call_sub_agent" }
 // Aliases 返回工具别名列表，当前无别名。
 func (t *callSubAgentTool) Aliases() []string { return nil }
 
+// Description 返回工具的 LLM 可见描述，包含当前可调用角色的动态清单。
+// domain/tool.Registry.Schema 通过可选接口断言读取该描述，
+// 使工具 schema 始终反映 roles.yaml 的最新角色配置。
+func (t *callSubAgentTool) Description() string {
+	// 角色清单：内置 domain 角色 + 所有声明可被调用的固定角色。
+	entries := []string{"domain（通用领域负责人，任务不属于任何专业领域时）"}
+	for _, fr := range t.dispatcher.registry.CallableFixedRoles() {
+		entries = append(entries, fmt.Sprintf("%s（%s）", fr.ID, fr.Description))
+	}
+	return "将子任务派发给指定角色的子 Agent 异步执行。调用立即返回 sub_agent_id；" +
+		"子 Agent 完成后，其结果摘要会以 [mailbox from <sub_agent_id>] 消息送达，请在后续轮次中阅读并整合。\n" +
+		"task 必须自包含：背景、目标、相关文件路径、前置结论与验收标准——子 Agent 看不到当前对话历史。\n" +
+		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
+}
+
 // Execute 执行 call_sub_agent 工具调用。
 // 参数 args 由大模型提供，包含 role_id 与 task；返回值 *tool.Result 表示调用结果。
 func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *tool.Result {

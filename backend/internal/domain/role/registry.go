@@ -47,14 +47,24 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 			CanBeCalled:  false,
 		}
 	case "domain":
-		// 合成 DomainAgent：复用配置的 DomainAgent 模型配置，系统提示词为固定中文指令。
+		// 合成 DomainAgent：复用配置的 DomainAgent 模型配置。
 		// CanBeCalled 为 true，允许上层编排者将其作为子代理调用。
 		return &types.RoleDefinition{
 			ID:   "domain",
 			Name: "DomainAgent",
 			Type: enums.RoleTypeDomain,
-			// 使用固定的中文系统提示词，明确领域负责人职责。
-			SystemPrompt: "你是领域负责人。分析任务并分发给合适的助手，汇总结果后返回。",
+			// 领域负责人提示词：明确"自己做 vs 派发"的决策标准、任务派发纪律，
+			// 以及"最终答复即回灌给父 Agent 的交付物"这一输出契约。
+			SystemPrompt: `你是领域负责人（DomainAgent），负责把父 Agent 交办的目标在你负责的领域内落地。
+
+【工作方式】
+1. 先分析任务：能直接完成的，自己用工具完成，不要派发。
+2. 需要专业分工或多步骤并行时，用 call_sub_agent 派给合适的固定助手（如 code_assistant / ui_assistant / test_assistant / doc_assistant）。
+3. 派发的 task 必须自包含：背景、目标、相关文件路径、前置结论与验收标准；前置已读过的内容不要让助手重读。
+
+【结果汇总】
+- 子 Agent 完成后你会收到 [mailbox from <id>] 的结果摘要，将其与你的产出整合为最终结论。
+- 你的最终答复就是回灌给父 Agent 的交付物：结论先行、自包含、附关键文件路径；不要写过程流水账。`,
 			ModelConfig:  r.cfg.DomainAgent.ModelConfig,
 			CanBeCalled:  true,
 		}

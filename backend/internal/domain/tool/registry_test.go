@@ -121,3 +121,45 @@ func TestUnknownTool(t *testing.T) {
 		t.Fatalf("expected unknown tool error, got: %v", err)
 	}
 }
+
+// stubCallSubAgent 是 call_sub_agent 的测试桩，模拟 subagent.Dispatcher
+// 安装的工具（带 Description 可选接口）。
+type stubCallSubAgent struct{}
+
+func (s *stubCallSubAgent) Name() string      { return "call_sub_agent" }
+func (s *stubCallSubAgent) Aliases() []string { return nil }
+func (s *stubCallSubAgent) Description() string {
+	return "stub: 派发自包含子任务给子 Agent。"
+}
+func (s *stubCallSubAgent) Execute(ctx context.Context, args map[string]any) *Result {
+	return &Result{Tool: "call_sub_agent", Success: true, Output: "sub-1"}
+}
+
+// TestSchemaIncludesCallSubAgent 验证：call_sub_agent 注册后出现在 LLM 工具
+// schema 中，且描述文本来自工具的 Description()；未注册时 schema 只有 11 个内置工具。
+func TestSchemaIncludesCallSubAgent(t *testing.T) {
+	// 未安装 call_sub_agent 时，schema 恰为 11 个内置工具。
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	if n := len(r.Schema()); n != 11 {
+		t.Fatalf("expected 11 builtin tools without call_sub_agent, got %d", n)
+	}
+	// 安装后应出现在 schema 中，且描述来自 Description()。
+	r.Register(&stubCallSubAgent{})
+	schema := r.Schema()
+	if len(schema) != 12 {
+		t.Fatalf("expected 12 tools with call_sub_agent, got %d", len(schema))
+	}
+	// 遍历查找 call_sub_agent 并校验描述文本。
+	found := false
+	for _, tl := range schema {
+		if tl.Name() == "call_sub_agent" {
+			found = true
+			if !strings.Contains(tl.Description(), "stub:") {
+				t.Fatalf("expected description from Description(), got %q", tl.Description())
+			}
+		}
+	}
+	if !found {
+		t.Fatal("call_sub_agent not found in schema after Register")
+	}
+}

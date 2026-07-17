@@ -209,6 +209,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
 	agentSvc.SetLogger(sessionLogger)
+	// 默认不恢复历史会话：每次启动都是全新会话列表，旧会话仅在内存中淘汰；
+	// 设置 agent.restore_sessions: true 时，从 session_history 恢复最近 50 个会话到内存。
+	// 恢复失败仅记录日志，不阻断启动。
+	if cfg.Agent.RestoreSessions {
+		agentSvc.RestoreSessions(ctx, 50)
+	}
 
 	// 第十七步：创建 HTTP SessionManager 并注入依赖。
 	sessionMgr := server.NewSessionManager(agentSvc)

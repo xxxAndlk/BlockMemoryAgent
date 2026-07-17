@@ -342,7 +342,7 @@ func (r *Registry) Schema() []tools.Tool {
 	// 初始化空列表，用于收集所有工具定义。
 	var toolsList []tools.Tool
 	// 注册 ReadFile 工具：读取文件内容。
-	if t, err := tools.NewFunc("ReadFile", "读取文件内容。", func(ctx context.Context, in readFileInput) (string, error) {
+	if t, err := tools.NewFunc("ReadFile", "读取文件内容。path 为相对或绝对路径。建议先用 SearchInFiles/ListDir 定位再精读；同一任务中已读过的文件会被拒绝重读，且最多读取 5 个不同文件。", func(ctx context.Context, in readFileInput) (string, error) {
 		// 通过 Dispatch 调用内部 ReadFile 工具，忽略 Dispatch 返回的 error。
 		res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": in.Path})
 		// 将结果序列化为 JSON 字符串。
@@ -362,7 +362,7 @@ func (r *Registry) Schema() []tools.Tool {
 		toolsList = append(toolsList, t)
 	}
 	// 注册 ListDir 工具：列出目录内容。
-	if t, err := tools.NewFunc("ListDir", "列出目录内容。", func(ctx context.Context, in listDirInput) (string, error) {
+	if t, err := tools.NewFunc("ListDir", "列出目录内容。path 为空时默认当前工作目录；用于了解项目结构、定位文件。", func(ctx context.Context, in listDirInput) (string, error) {
 		res, _ := r.Dispatch(ctx, "ListDir", map[string]any{"path": in.Path})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
@@ -384,7 +384,7 @@ func (r *Registry) Schema() []tools.Tool {
 		toolsList = append(toolsList, t)
 	}
 	// 注册 SearchInFiles 工具：在文件中搜索文本。
-	if t, err := tools.NewFunc("SearchInFiles", "在文件中搜索文本。", func(ctx context.Context, in searchInFilesInput) (string, error) {
+	if t, err := tools.NewFunc("SearchInFiles", "在文件中搜索文本（大小写不敏感）。pattern 为待搜索文本，dir 为起始目录（默认当前工作目录）；适合先定位再精读，返回匹配行及上下文。", func(ctx context.Context, in searchInFilesInput) (string, error) {
 		res, _ := r.Dispatch(ctx, "SearchInFiles", map[string]any{"pattern": in.Pattern, "dir": in.Dir})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
@@ -392,7 +392,7 @@ func (r *Registry) Schema() []tools.Tool {
 		toolsList = append(toolsList, t)
 	}
 	// 注册 HTTPGet 工具：发起 HTTP GET 请求。
-	if t, err := tools.NewFunc("HTTPGet", "发起 HTTP GET 请求。", func(ctx context.Context, in httpGetInput) (string, error) {
+	if t, err := tools.NewFunc("HTTPGet", "发起 HTTP GET 请求。url 必填，headers/timeout（秒）可选；返回状态码与响应体。", func(ctx context.Context, in httpGetInput) (string, error) {
 		args := map[string]any{"url": in.URL, "headers": in.Headers}
 		if in.Timeout > 0 {
 			args["timeout"] = in.Timeout
@@ -404,7 +404,7 @@ func (r *Registry) Schema() []tools.Tool {
 		toolsList = append(toolsList, t)
 	}
 	// 注册 HTTPPost 工具：发起 HTTP POST 请求。
-	if t, err := tools.NewFunc("HTTPPost", "发起 HTTP POST 请求（默认 JSON body）。", func(ctx context.Context, in httpPostInput) (string, error) {
+	if t, err := tools.NewFunc("HTTPPost", "发起 HTTP POST 请求（默认 JSON body）。url 必填，headers/body/timeout（秒）可选；返回状态码与响应体。", func(ctx context.Context, in httpPostInput) (string, error) {
 		args := map[string]any{"url": in.URL, "headers": in.Headers, "body": in.Body}
 		if in.Timeout > 0 {
 			args["timeout"] = in.Timeout
@@ -446,6 +446,22 @@ func (r *Registry) Schema() []tools.Tool {
 		return string(b), nil
 	}); err == nil {
 		toolsList = append(toolsList, t)
+	}
+	// 暴露 call_sub_agent 工具（若已由 subagent.Dispatcher 安装到注册表）。
+	// 该工具不在 registerDefaults 中注册，而是启动期由调度器按需安装；
+	// 描述文本由工具实现通过 Description() 提供（含当前可调用角色的动态清单）。
+	if ct, ok := r.tools["call_sub_agent"]; ok {
+		desc := "将子任务派发给指定角色的子 Agent 异步执行。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("call_sub_agent", desc, func(ctx context.Context, in callSubAgentInput) (string, error) {
+			res, _ := r.Dispatch(ctx, "call_sub_agent", map[string]any{"role_id": in.RoleID, "task": in.Task})
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
 	}
 	// 返回收集到的所有 blades 工具定义。
 	return toolsList

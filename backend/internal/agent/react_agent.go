@@ -132,7 +132,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		history = append(history, assistant)
 
 		// 在判断本轮是否结束之前，先轮询邮箱并注入任何新的异步消息。
-		// 第一阶段 mailbox 通常为 nil，因此该分支多数情况下不执行。
+		// mailbox 由服务装配层注入共享邮箱（用于接收异步子代理摘要）；未注入时跳过。
 		if a.mailbox != nil {
 			// Drain 取出所有以当前代理为收件人的未读消息。
 			for _, m := range a.mailbox.Drain(a.name) {
@@ -196,7 +196,8 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 }
 
 // systemPrompt 为当前角色构建系统提示词。
-// 基础提示来自角色配置；末尾追加一段硬编码的执行纪律，用于减少常见反模式。
+// 基础提示来自角色配置；末尾追加一段统一的执行纪律，用于减少常见反模式
+// （无目的工具调用、未验证就声称完成、忘记 mailbox 消息语义等）。
 func (a *ReActAgent) systemPrompt() string {
 	// 取角色配置中的系统提示作为基础。
 	base := a.role.SystemPrompt
@@ -206,12 +207,14 @@ func (a *ReActAgent) systemPrompt() string {
 		base = "You are a helpful assistant."
 	}
 
-	// 在基础提示后追加执行纪律块，提醒模型按需调用工具、验证结果并及时停止。
+	// 在基础提示后追加执行纪律块，与角色提示同语言（中文），覆盖：
+	// 工具使用节制、修改后验证、完成即停、mailbox 消息语义。
 	return base + "\n\n" +
 		"【执行纪律】\n" +
-		"1. Only call a tool when it is necessary to fulfill the task.\n" +
-		"2. When writing code or files, use WriteFile and verify with RunCommand if needed.\n" +
-		"3. Stop calling tools once the task is complete and reply to the user.\n"
+		"1. 只在必要时调用工具；先用 SearchInFiles/ListDir 定位，再按需 ReadFile；不重复读取已读过的文件。\n" +
+		"2. 修改代码或文件后，用 RunCommand 验证（构建/测试/检查），没有验证证据不得声称完成。\n" +
+		"3. 任务完成立即停止调用工具，输出最终答复；答复必须自包含：做了什么、结果如何、关键文件路径。\n" +
+		"4. 形如 [mailbox from <agent_id>] 的消息是异步子 Agent 回传的结果摘要，阅读后整合进当前结论；若摘要表明失败，决定重试、自己接手或在答复中说明。\n"
 }
 
 // mailboxMessageToReact 把异步 mailbox 消息转换为模型可见的 ReactMessage。

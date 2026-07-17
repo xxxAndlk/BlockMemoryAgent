@@ -94,6 +94,7 @@ type FeatureTogglesConfig struct {
 	HumanClarifyEnabled      bool `yaml:"human_clarify_enabled"`       // 是否启用人机对话
 	HumanClarifyTimeoutSec   int  `yaml:"human_clarify_timeout_sec"`   // 等待用户回答超时（秒）
 	DAGEnabled               bool `yaml:"dag_enabled"`                 // 是否启动 DAG 调度器
+	RestoreSessions          bool `yaml:"restore_sessions"`            // 启动时是否从 session_history 恢复最近会话到内存（默认关闭，每次启动都是全新会话列表）
 	PlanEnabled              bool `yaml:"plan_enabled"`                // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
 	ReflectionEnabled        bool `yaml:"reflection_enabled"`          // 是否在助手执行后做 Self-Reflection（不达标重试一次）
 	AssistantSelfTestEnabled bool `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证

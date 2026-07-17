@@ -113,6 +113,14 @@ type (
 		// Path 为待执行 blame 的文件路径。
 		Path string `json:"path"`
 	}
+	// callSubAgentInput 表示 call_sub_agent 工具的输入参数。
+	// 与 subagent 包内部入参结构保持一致（按字段名 JSON 解码）。
+	callSubAgentInput struct {
+		// RoleID 为被调用子 Agent 的角色标识。
+		RoleID string `json:"role_id"`
+		// Task 为交给子 Agent 执行的自包含任务描述。
+		Task string `json:"task"`
+	}
 )
 
 // ---- ReadFile（读取文件） ----
