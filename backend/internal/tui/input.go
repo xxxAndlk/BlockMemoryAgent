@@ -147,8 +147,8 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyCtrlC:
-		// ctrl+c 在任意位置退出 TUI。
-		return m, tea.Quit
+		// ctrl+c：仍有运行中会话时需二次确认，防止误杀长任务。
+		return m.ctrlCQuit()
 
 	case tea.KeyRunes:
 		// 在光标位置插入输入字符。

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
@@ -28,6 +29,17 @@ type ToolCall struct {
 	Input map[string]any `json:"input"` // Input 是传递给工具的参数键值对
 }
 
+// LastAssistantText 从 ReAct 历史中提取最后一条非空 assistant 文本，
+// 用于执行失败/超时时向调用方回传已达成的部分进度；没有时返回空串。
+func LastAssistantText(history []ReactMessage) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "assistant" && strings.TrimSpace(history[i].Content) != "" {
+			return history[i].Content
+		}
+	}
+	return ""
+}
+
 // ToolResult 表示执行一次 ToolCall 后的结果。
 type ToolResult struct {
 	Tool    string `json:"tool"`            // Tool 是产生该结果的工具名称
@@ -40,6 +52,9 @@ type ToolResult struct {
 type ReactResult struct {
 	Text    string         `json:"text"`    // Text 是模型最终生成的文本答案
 	History []ReactMessage `json:"history"` // History 是本次完整对话历史，包含所有轮次
+	// LimitReached 为 true 表示达到最大轮数上限而暂停（非错误）：
+	// Text 为空，History 保留全部进度，上层应暂停会话并等待用户消息续跑。
+	LimitReached bool `json:"limit_reached,omitempty"`
 }
 
 // ToolRegistry 抽象了 ReActAgent 可调用的工具集合。

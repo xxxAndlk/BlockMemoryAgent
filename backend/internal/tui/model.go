@@ -75,6 +75,12 @@ type Model struct {
 	// 用指针避免 bubbletea 值语义 Model 拷贝 Mutex。
 	flashMu *sync.Mutex
 
+	// quitArmedUntil 是 Ctrl+C 退出确认的武装截止时间：
+	// 仍有运行中会话时，首次按 Ctrl+C 只提示，3 秒内再按才真正退出（防误杀长任务）。
+	quitArmedUntil time.Time
+	// tokenWarnLevel 记录已提醒过的输入 Token 成本预警档位（每 50 万为一档）。
+	tokenWarnLevel int
+
 	// pendingSelectID 由后台 createSession goroutine 写入，tick handler 消费：
 	// 成功创建会话后选中它需操作 m.sessions/cursor，不能在后台 goroutine 直接改
 	// （与主循环 View 读产生 race），改为 tick 在主循环内执行 refresh+select。
@@ -525,7 +531,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.refreshOverlay()
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			return m.ctrlCQuit()
 		case "esc", "q":
 			m.overlayPanel.mode = overlayNone
 			return m, nil
@@ -561,7 +567,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 对话区导航模式。
 	switch msg.String() {
-	case "ctrl+c", "q", "Q":
+	case "ctrl+c":
+		return m.ctrlCQuit()
+	case "q", "Q":
 		return m, tea.Quit
 	case "1", "esc":
 		m.overlayPanel.mode = overlayNone
@@ -615,6 +623,24 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// ctrlCQuit 处理退出请求：仍有会话在运行时，首次按下只提示，
+// 3 秒内再次按下 Ctrl+C 才真正退出——避免误关终端把执行了数小时的长任务杀掉
+// （退出时 app.Agent.Shutdown 会取消全部运行中会话）。
+func (m *Model) ctrlCQuit() (tea.Model, tea.Cmd) {
+	running := 0
+	for _, s := range m.sessions {
+		if s != nil && s.Status == enums.SessionStatusRunning {
+			running++
+		}
+	}
+	if running > 0 && time.Now().After(m.quitArmedUntil) {
+		m.quitArmedUntil = time.Now().Add(3 * time.Second)
+		m.flashMsg(fmt.Sprintf("仍有 %d 个会话在运行，3 秒内再按一次 Ctrl+C 确认退出", running))
+		return m, nil
+	}
+	return m, tea.Quit
 }
 
 // rightPanelVisible 返回是否显示右侧计划/Agent 分栏。
@@ -713,6 +739,12 @@ func (m *Model) accumulateTokens() {
 	}
 	m.totalInputTokens = in
 	m.totalOutputTokens = out
+	// 成本预警：输入 Token 每跨过 50 万一档提醒一次（仅提示，不阻断执行）。
+	const warnStep = 500000
+	if level := in / warnStep; level > m.tokenWarnLevel {
+		m.tokenWarnLevel = level
+		m.flashMsg(fmt.Sprintf("本会话输入 Token 已达 %d 万，注意模型成本", in/10000))
+	}
 }
 
 // clamp 将整数 v 限制在 [lo, hi] 范围内；若 lo > hi 则返回 lo。

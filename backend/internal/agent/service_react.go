@@ -29,10 +29,61 @@ type ReactService struct {
 	toolRegistry *tool.Registry      // 工具注册表，提供 ReAct 可调用的工具
 	mailbox      *mailbox.Mailbox    // 邮箱，用于跨组件消息通知
 	memory       MemoryPipeline      // 记忆管道，负责会话记忆的写入与查询
+	runtimeCfg   ReactRuntimeConfig  // ReAct 主循环运行时参数（轮数/超时/重试/历史滑窗）
 
 	// testProvider 是包内部测试使用的钩子，
 	// 允许单元测试注入 mock 的 ModelProvider，从而无需真实 API 密钥即可运行 ReAct 循环。
 	testProvider ModelProvider
+}
+
+// ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
+// 由 bootstrap 从 cfg.Agent 派生注入，避免 agent 包反向依赖 config 包；
+// 未注入时全部取零值，由 loopConfig 回退到合理默认值。
+type ReactRuntimeConfig struct {
+	MaxIterations           int // ReAct 最大 LLM 轮数；<0 表示不限制
+	LLMTimeoutSec           int // 单次 LLM 调用超时（秒）；<0 表示仅受会话取消控制
+	RetryCount              int // LLM 失败重试次数（不含首次）
+	RetryBackoffMs          int // 重试初始退避（毫秒）
+	HistoryMaxMessages      int // 单次请求最大历史消息数；<0 表示不裁剪
+	ToolOutputHistoryMaxRunes int // 写入历史的工具输出最大字符数；<0 表示不截断
+}
+
+// SetRuntimeConfig 注入 ReAct 主循环运行时参数（见 ReactRuntimeConfig）。
+func (s *ReactService) SetRuntimeConfig(c ReactRuntimeConfig) {
+	s.runtimeCfg = c
+}
+
+// LoopConfig 把服务级配置映射为 ReActAgent 的 LoopConfig：
+// 负数（配置语义"不限制"）归一为 0（agent 语义"不启用该限制"），
+// 零值（未注入配置）回退到与旧行为一致的默认值。
+func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
+	lc := LoopConfig{
+		MaxIterations:      50,
+		LLMTimeout:         300 * time.Second,
+		RetryCount:         3,
+		RetryBackoff:       100 * time.Millisecond,
+		HistoryMaxMessages: 40,
+		ToolOutputMaxRunes: 2000,
+	}
+	if c.MaxIterations != 0 {
+		lc.MaxIterations = max(c.MaxIterations, 0)
+	}
+	if c.LLMTimeoutSec != 0 {
+		lc.LLMTimeout = time.Duration(max(c.LLMTimeoutSec, 0)) * time.Second
+	}
+	if c.RetryCount != 0 {
+		lc.RetryCount = max(c.RetryCount, 0)
+	}
+	if c.RetryBackoffMs != 0 {
+		lc.RetryBackoff = time.Duration(max(c.RetryBackoffMs, 0)) * time.Millisecond
+	}
+	if c.HistoryMaxMessages != 0 {
+		lc.HistoryMaxMessages = max(c.HistoryMaxMessages, 0)
+	}
+	if c.ToolOutputHistoryMaxRunes != 0 {
+		lc.ToolOutputMaxRunes = max(c.ToolOutputHistoryMaxRunes, 0)
+	}
+	return lc
 }
 
 // SetModelProvider 注入一个 mock 或替代的模型 provider。
@@ -505,10 +556,11 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		provider = p
 	}
 
-	// 构造 ReActAgent，并注入邮箱与记忆管道。
+	// 构造 ReActAgent，并注入邮箱、记忆管道与主循环运行时配置。
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapter(s.toolRegistry)).
 		WithMailbox(s.mailbox).
-		WithMemory(s.memory)
+		WithMemory(s.memory).
+		WithLoopConfig(s.runtimeCfg.LoopConfig())
 
 	// 将会话 ID 注入工具上下文，便于工具内部识别当前会话。
 	runCtx := tool.WithSessionID(ctx, session.ID)
@@ -518,6 +570,12 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	if err != nil {
 		// 运行出错时标记会话错误并退出。
 		s.setSessionError(session, err.Error())
+		return
+	}
+
+	// 达到轮数上限：不视为失败——暂停会话、保留全部进度，等待用户消息续跑。
+	if result.LimitReached {
+		s.pauseSession(session, result.History)
 		return
 	}
 
@@ -568,7 +626,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 构造并配置 ReActAgent。
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapter(s.toolRegistry)).
 		WithMailbox(s.mailbox).
-		WithMemory(s.memory)
+		WithMemory(s.memory).
+		WithLoopConfig(s.runtimeCfg.LoopConfig())
 
 	// 注入会话 ID 到工具上下文。
 	runCtx := tool.WithSessionID(ctx, session.ID)
@@ -592,6 +651,12 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		return
 	}
 
+	// 达到轮数上限：不视为失败——暂停会话、保留全部进度，等待用户消息续跑。
+	if result.LimitReached {
+		s.pauseSession(session, result.History)
+		return
+	}
+
 	// 更新会话状态为已完成。
 	now := time.Now()
 	s.store.mu.Lock()
@@ -610,10 +675,33 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 // finalizeSession 在会话结束时执行清理工作。
 func (s *ReactService) finalizeSession(session *reactInternalSession) {
-	// 清理会话临时目录。
-	s.store.cleanupSessionTempDir(session.ID, session.TempDir)
+	// 暂停待续（awaiting_clarify）的会话保留临时目录，用户续跑时仍需其中的中间产物。
+	if session.Status != enums.SessionStatusAwaitingClarify {
+		// 清理会话临时目录。
+		s.store.cleanupSessionTempDir(session.ID, session.TempDir)
+	}
 	// 淘汰已完成的会话，避免内存无限增长。
 	s.store.evictCompletedSessions()
+}
+
+// pauseSession 在达到最大轮数上限时将会话置为"暂停待续"而非错误：
+// 状态置为 awaiting_clarify（TUI/Web 显示等待态），History 完整保留，
+// 并提示用户发送消息即可从当前进度续跑（sendMessage → resumeSession → RunWithHistory）。
+func (s *ReactService) pauseSession(session *reactInternalSession, history []ReactMessage) {
+	s.store.mu.Lock()
+	session.Status = enums.SessionStatusAwaitingClarify
+	session.History = history
+	session.Result = "已达最大轮数上限，会话暂停，等待用户消息续跑"
+	s.store.mu.Unlock()
+
+	// 记录暂停事件并给出明确的续跑指引。
+	maxIter := s.runtimeCfg.LoopConfig().MaxIterations
+	msg := fmt.Sprintf("已达最大轮数上限（%d 轮），会话已暂停。发送任意消息（如\"继续\"）将从当前进度继续执行。", maxIter)
+	s.store.addEvent(session, eventkind.System, "System", msg, "", "", "", "", "", true)
+
+	// 持久化历史与事件，保证重启后仍可续跑。
+	s.store.persistHistory(session)
+	s.store.persistEvents(session)
 }
 
 // setSessionError 将会话标记为错误状态，并记录相关事件与持久化。

@@ -17,11 +17,9 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types"            // types 包提供 RoleDefinition 类型
 )
 
-// subAgentTimeout 定义子 Agent 独立执行的最大超时时间。
-// 该超时与父会话的 ctx 故意隔离：
+// 子 Agent 的上下文与父会话故意隔离（context.Background 派生）：
 //   - 父会话若被用户手动取消，子 Agent 仍可在独立上下文中继续运行，避免长任务结果丢失。
-//   - 30 分钟足以覆盖大多数子任务，同时防止无限制挂起。
-const subAgentTimeout = 30 * time.Minute
+//   - 超时仅用于防止无限制挂起，由 WithTimeout 配置；<=0 表示不限制。
 
 // callSubAgentInput 定义 call_sub_agent 工具的 JSON 入参结构。
 // 大模型在调用 call_sub_agent 时应提供 role_id（被调用角色）与 task（任务描述）。
@@ -48,6 +46,11 @@ type Dispatcher struct {
 	memory   agent.MemoryPipeline // memory 可选的记忆管道，为 nil 时内部会使用空实现。
 	seq      atomic.Uint64        // seq 原子递增序列号，保证生成的子 Agent ID 唯一。
 	running  sync.Map             // running 存储正在运行的子 Agent，键为 subAgentID，值为 *agent.ReActAgent。
+
+	// timeout 是子 Agent 独立执行的最大时长；<=0 表示不限制。默认 30 分钟。
+	timeout time.Duration
+	// loopCfg 是子 Agent ReAct 主循环的运行时配置（轮数/重试/历史滑窗等）。
+	loopCfg agent.LoopConfig
 }
 
 // NewDispatcher 创建一个新的子 Agent 调度器。
@@ -66,7 +69,20 @@ func NewDispatcher(
 		tools:    tools,
 		mailbox:  mailbox,
 		memory:   memory,
+		timeout:  30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
 	}
+}
+
+// WithTimeout 配置子 Agent 独立执行的最大时长；<=0 表示不限制（仅防挂起的保底由调用方负责）。
+func (d *Dispatcher) WithTimeout(t time.Duration) *Dispatcher {
+	d.timeout = t
+	return d
+}
+
+// WithLoopConfig 配置子 Agent ReAct 主循环的运行时参数（轮数/重试/历史滑窗等）。
+func (d *Dispatcher) WithLoopConfig(c agent.LoopConfig) *Dispatcher {
+	d.loopCfg = c
+	return d
 }
 
 // RegisterCallTool 将 call_sub_agent 工具安装到传入的工具注册表中。
@@ -139,10 +155,14 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	subAgentID := fmt.Sprintf("%s/%s-%d", parentID, roleID, d.seq.Add(1))
 
 	// 异步启动子 Agent，并立即返回子 Agent ID 作为句柄。
-	// 使用 context.Background() + Timeout 创建独立于父 ctx 的上下文：
+	// 使用 context.Background() 创建独立于父 ctx 的上下文：
 	//   - 父会话取消不会波及子 Agent，避免长任务结果丢失。
-	//   - defer cancel 确保 goroutine 退出时释放上下文资源。
-	subAgentCtx, cancel := context.WithTimeout(context.Background(), subAgentTimeout)
+	//   - timeout>0 时才叠加超时；defer cancel 确保 goroutine 退出时释放上下文资源。
+	subAgentCtx := context.Background()
+	cancel := context.CancelFunc(func() {})
+	if d.timeout > 0 {
+		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, d.timeout)
+	}
 	go func() {
 		defer cancel()
 		d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task)
@@ -177,10 +197,11 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	//   - roleDef 提供角色配置。
 	//   - provider 提供模型调用能力。
 	//   - ToolRegistryAdapter 将 domain/tool 注册表适配为 agent 层可用的工具注册表。
-	// 随后通过 WithMailbox 与 WithMemory 注入邮箱和记忆管道。
+	// 随后通过 WithMailbox、WithMemory 与 WithLoopConfig 注入邮箱、记忆管道与循环配置。
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapter(d.tools)).
 		WithMailbox(d.mailbox).
-		WithMemory(mem)
+		WithMemory(mem).
+		WithLoopConfig(d.loopCfg)
 
 	// 将子 Agent 记录到 running 映射，便于外部查询运行状态。
 	d.running.Store(subAgentID, sub)
@@ -190,8 +211,24 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	// 驱动子 Agent 执行具体任务。
 	result, err := sub.Run(ctx, task)
 	if err != nil {
-		// 执行失败时向父 Agent 发送失败通知。
-		d.notify(parentID, subAgentID, fmt.Sprintf("sub-agent failed: %v", err))
+		// 失败/超时时尽量回传已达成的部分进度（最后一条 assistant 输出），
+		// 避免长时间执行后父 Agent 拿不到任何信息。
+		partial := agent.LastAssistantText(result.History)
+		if partial != "" {
+			partial = truncateRunes(partial, 500)
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			d.notify(parentID, subAgentID, fmt.Sprintf("子 Agent 执行超时（已运行 %v），已被终止。%s", d.timeout, partialSuffix(partial)))
+			return
+		}
+		d.notify(parentID, subAgentID, fmt.Sprintf("sub-agent failed: %v%s", err, partialSuffix(partial)))
+		return
+	}
+
+	// 轮数上限：子 Agent 暂停而非失败，同样回传部分进度并说明原因。
+	if result.LimitReached {
+		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
+		d.notify(parentID, subAgentID, fmt.Sprintf("子 Agent 已达最大轮数上限并暂停。%s", partialSuffix(partial)))
 		return
 	}
 
@@ -205,6 +242,23 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 
 	// 向父 Agent 邮箱发送任务完成通知，Body 为子 Agent 产出的总结文本。
 	d.notify(parentID, subAgentID, result.Text)
+}
+
+// partialSuffix 把部分进度文本拼接到通知末尾；为空时返回空串。
+func partialSuffix(partial string) string {
+	if partial == "" {
+		return ""
+	}
+	return "\n当前已完成的部分进度：\n" + partial
+}
+
+// truncateRunes 按 rune 数截断字符串并追加省略提示。
+func truncateRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "...(truncated)"
 }
 
 // notify 向父 Agent 邮箱发送一条子 Agent 完成或失败的通知消息。

@@ -431,3 +431,20 @@ func TestChatItemsClarifyPrefixStripped(t *testing.T) {
 		t.Fatalf("澄清答复前缀应被剥离，got: %s", items[0].title)
 	}
 }
+
+// TestEventChatItemSystemPauseShown 验证"已达最大轮数"暂停系统事件以 ⏸ 前缀展示，
+// 普通系统事件（会话启动等）仍被过滤。
+func TestEventChatItemSystemPauseShown(t *testing.T) {
+	ev := server.SessionEvent{Type: "system", Message: "已达最大轮数上限（50 轮），会话已暂停。发送任意消息（如\"继续\"）将从当前进度继续执行。", Timestamp: time.Now()}
+	title, _, _, ok := eventChatItem(ev, true)
+	if !ok {
+		t.Fatal("暂停事件应被展示")
+	}
+	if !strings.HasPrefix(title, "⏸ ") {
+		t.Fatalf("标题应有 ⏸ 前缀，got: %s", title)
+	}
+	ev2 := server.SessionEvent{Type: "system", Message: "会话启动", Timestamp: time.Now()}
+	if _, _, _, ok := eventChatItem(ev2, true); ok {
+		t.Fatal("会话启动事件不应展示")
+	}
+}

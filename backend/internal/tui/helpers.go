@@ -681,8 +681,13 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		}
 		title = agent + ": " + ev.Message
 		return title, "", title, true
-	// 系统事件：只展示会话完成总结。
+	// 系统事件：只展示会话完成总结与轮数暂停提示。
 	case ev.Type == "system":
+		// 轮数上限暂停（非错误）：提示用户发送消息即可续跑。
+		if strings.Contains(ev.Message, "已达最大轮数") {
+			title = "⏸ " + ev.Message
+			return title, "", title, true
+		}
 		// 只展示会话完成总结，避免 "会话启动/继续执行" 等噪声淹没对话。
 		if strings.Contains(ev.Message, "会话完成") {
 			agent := ev.Agent

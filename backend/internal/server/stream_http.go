@@ -32,6 +32,11 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
+	// SSE 是长连接：清除 server 级 WriteTimeout 对本连接设置的写截止时间，
+	// 避免长任务下连接在 WriteTimeout（默认 30s）后被强制断开。
+	// 客户端断开仍由 r.Context().Done() 感知，不受影响。
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+
 	// 断言 http.Flusher，不支持流式则返回 500。
 	flusher, ok := w.(http.Flusher)
 	if !ok {

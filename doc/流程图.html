@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BlockMemoryAgent 项目流程图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #1A1B26; --bg-card: #1F2335; --fg: #C0CAF5; --dim: #565F89;
+    --accent: #7AA2F7; --green: #9ECE6A; --yellow: #E0AF68; --red: #F7768E;
+    --purple: #BB9AF7; --border: #414868;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 64px;
+    background: var(--bg); color: var(--fg);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    line-height: 1.6;
+  }
+  header { max-width: 1200px; margin: 0 auto 32px; }
+  h1 { color: var(--accent); font-size: 28px; margin: 0 0 8px; }
+  header p { color: var(--dim); margin: 4px 0; }
+  header code { color: var(--green); background: var(--bg-card); padding: 1px 6px; border-radius: 4px; }
+  section {
+    max-width: 1200px; margin: 0 auto 28px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px 24px;
+  }
+  h2 { font-size: 19px; margin: 0 0 4px; color: var(--fg); }
+  h2 .num { color: var(--accent); margin-right: 10px; }
+  .anchor { color: var(--dim); font-size: 13px; margin-bottom: 14px; }
+  .anchor code { color: var(--purple); }
+  .mermaid { display: flex; justify-content: center; overflow-x: auto; padding: 8px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--bg); color: var(--accent); }
+  td code { color: var(--green); font-size: 12.5px; }
+  tr:nth-child(even) td { background: rgba(65,72,104,.18); }
+  .layout { font-family: Consolas, "Courier New", monospace; font-size: 12.5px; line-height: 1.45; overflow-x: auto; color: var(--fg); }
+  footer { max-width: 1200px; margin: 0 auto; color: var(--dim); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BlockMemoryAgent 项目流程图</h1>
+  <p>逐步骤检查项目运行全貌 · 与 <code>doc/流程图.md</code> 同源 · 配色 Tokyo Night（与 TUI 一致）</p>
+</header>
+
+<section>
+  <h2><span class="num">1</span>系统总体架构</h2>
+  <div class="anchor">入口层 → bootstrap 装配 → 核心层（ReactService / 工具 / 子代理 / 记忆）→ 存储层</div>
+  <div class="mermaid">
+flowchart LR
+    subgraph ENTRY["入口层"]
+        TUI["cmd/tui<br/>bubbletea 终端 UI"]
+        SRV["backend/main.go<br/>HTTP 服务入口"]
+        WEB["web/dist<br/>Vue SPA 浏览器 UI"]
+    end
+    subgraph BOOT["装配层"]
+        APP["bootstrap.Build<br/>21 步依赖装配 → App 聚合"]
+    end
+    subgraph CORE["核心层 internal/"]
+        RS["ReactService<br/>会话生命周期 + ReAct 主循环"]
+        SM["SessionManager<br/>/api/sessions/* handler"]
+        TR["ToolRegistry<br/>内置工具注册表"]
+        SA["SubAgentDispatcher<br/>call_sub_agent 异步子代理"]
+        MB["Mailbox<br/>子代理摘要邮箱"]
+        MEM["MemoryPipeline<br/>记忆组装 / 写入"]
+    end
+    subgraph DATA["存储层"]
+        PG[("PostgreSQL<br/>session_history / events / logs<br/>+ pgvector 记忆")]
+        RD[("Redis<br/>缓存 / 快照")]
+    end
+    TUI -->|"进程内本地 HTTP<br/>127.0.0.1:随机端口"| SM
+    SRV --> SM
+    WEB -->|"HTTP + SSE 事件流"| SRV
+    ENTRY --> BOOT
+    BOOT --> RS
+    RS --> SM
+    RS --> TR
+    RS --> MB
+    RS --> MEM
+    SA --> MB
+    SA --> TR
+    RS --> PG
+    RS --> RD
+    classDef entry fill:#7AA2F7,stroke:#3D59A1,color:#1A1B26
+    classDef core fill:#24283B,stroke:#7AA2F7,color:#C0CAF5
+    classDef store fill:#24283B,stroke:#BB9AF7,color:#C0CAF5
+    class TUI,SRV,WEB entry
+    class RS,SM,TR,SA,MB,MEM,APP core
+    class PG,RD store
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">2</span>启动装配流程（bootstrap.Build）</h2>
+  <div class="anchor"><code>backend/internal/bootstrap/bootstrap.go:101</code> · HTTP 与 TUI 入口共用</div>
+  <div class="mermaid">
+flowchart TD
+    A["① 校验路径<br/>config / roles / env 必填<br/>soul / skills 可选"] --> B["② 加载 .env 注入环境变量"]
+    B --> C["③ 加载 config.yaml<br/>④ 加载 roles.yaml"]
+    C --> D["⑤ 连接 PostgreSQL<br/>设置向量维度 / 检索 token 上限"]
+    D --> E["⑥ 创建 Embedder<br/>⑦ ensureSchemas 建表 + 校验维度"]
+    E --> F["⑧ 连接 Redis<br/>⑨ 创建结构化日志器"]
+    F --> G["⑩ ModelFactory<br/>WarmUp 预热 + 连通性校验"]
+    G --> H["⑪ 加载技能池<br/>⑫ 共享 Mailbox<br/>⑬ Runtime（soul / watchdog）"]
+    H --> I["⑭ ReAct 依赖<br/>roleRegistry / toolRegistry / memoryPipeline"]
+    I --> J["⑮ SubAgentDispatcher<br/>注册 call_sub_agent 工具"]
+    J --> K["⑯ NewReactService<br/>可选: 恢复最近 50 个历史会话"]
+    K --> L["⑰ SessionManager<br/>⑱ DAG Scheduler（DAGEnabled 时启动）"]
+    L --> M["⑲ DAGHandler<br/>⑳ 组装 App<br/>㉑ 注册逆序清理回调"]
+    G -.->|任一步失败| X["按序 closeStores<br/>释放已建资源"]
+    D -.->|失败| X
+    E -.->|失败| X
+    F -.->|失败| X
+    classDef step fill:#24283B,stroke:#7AA2F7,color:#C0CAF5
+    classDef err fill:#3B2A33,stroke:#F7768E,color:#F7768E
+    class A,B,C,D,E,F,G,H,I,J,K,L,M step
+    class X err
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">3</span>会话生命周期</h2>
+  <div class="anchor"><code>service_react.go</code> runSession:457 / resumeSession:520 / sendMessage:632</div>
+  <div class="mermaid">
+flowchart TD
+    START([用户输入目标]) --> CREATE["CreateSession<br/>Messages: system(Goal) + user<br/>Status = running"]
+    CREATE --> GO["goroutine runSession"]
+    GO --> SYS["事件: 会话启动"]
+    SYS --> ROLE{"meta 角色存在?"}
+    ROLE -->|"否"| ERR
+    ROLE -->|"是"| PROV["ModelFactory<br/>获取 meta 模型 Provider"]
+    PROV --> REACT["ReActAgent.Run<br/>（见第 4 张 ReAct 循环）"]
+    REACT -->|"成功"| DONE["Status = completed<br/>Result = 最终答复<br/>History 落盘"]
+    REACT -->|"出错 / 超迭代"| ERR["setSessionError<br/>Status = error<br/>事件: error"]
+    DONE --> AD["事件: agent_done（最终答复）"]
+    AD --> PERSIST["persistHistory + persistEvents<br/>写入 PostgreSQL"]
+    ERR --> PERSIST
+    PERSIST --> FIN["finalizeSession<br/>清理会话临时目录<br/>淘汰已完成会话"]
+    FIN --> IDLE([等待用户下一条消息])
+    IDLE -->|"sendMessage"| RESUME
+    IDLE -->|"answerClarify 澄清答复"| RESUME
+    IDLE -->|"interrupt 抢占 / enqueue 注入"| RESUME
+    IDLE -->|"cancel"| CANCEL["Status = cancelled<br/>事件: 会话已被用户取消"]
+    RESUME["resumeSession<br/>取最后一条 user 消息<br/>RunWithHistory 续跑"] --> REACT
+    classDef start fill:#2E4A35,stroke:#9ECE6A,color:#9ECE6A
+    classDef step fill:#24283B,stroke:#7AA2F7,color:#C0CAF5
+    classDef decision fill:#3B3624,stroke:#E0AF68,color:#E0AF68
+    classDef err fill:#3B2A33,stroke:#F7768E,color:#F7768E
+    class START,IDLE start
+    class CREATE,GO,SYS,PROV,DONE,AD,PERSIST,FIN,RESUME,CANCEL step
+    class ROLE decision
+    class ERR err
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">4</span>ReAct 主循环（推理 → 行动 → 观察）</h2>
+  <div class="anchor"><code>backend/internal/agent/react_agent.go:87</code> RunWithHistory · maxIter = 50</div>
+  <div class="mermaid">
+flowchart TD
+    IN["input 入 history<br/>构造 system 提示（角色 + 执行纪律）"] --> LOOP{"迭代次数 < maxIter（50）?"}
+    LOOP -->|"否（超限）"| MAX["返回错误<br/>exceeded maximum iterations"]
+    LOOP -->|"是"| ASM["memory.Assemble<br/>组装上下文（压缩 / 注入记忆）"]
+    ASM --> REQ["ModelRequest<br/>system + messages + 工具 Schema"]
+    REQ --> GEN["llm.Generate 调用模型"]
+    GEN -->|"err / 空响应"| FAIL["返回错误"]
+    GEN --> ASSIST["assistant 消息入 history"]
+    ASSIST --> MBOX["mailbox.Drain<br/>取回异步子代理摘要<br/>写入 sub_agent_summary 记忆"]
+    MBOX --> TC{"assistant 含 ToolCalls?"}
+    TC -->|"否 → 最终答案"| ANS["写入 answer 记忆事件<br/>返回 ReactResult（答复 + history）"]
+    TC -->|"是"| DISP["tools.Dispatch<br/>顺序执行每个工具调用"]
+    DISP --> TRES["tool 结果消息入 history<br/>写入 tool_call 记忆事件"]
+    TRES --> LOOP
+    classDef step fill:#24283B,stroke:#7AA2F7,color:#C0CAF5
+    classDef decision fill:#3B3624,stroke:#E0AF68,color:#E0AF68
+    classDef err fill:#3B2A33,stroke:#F7768E,color:#F7768E
+    classDef done fill:#2E4A35,stroke:#9ECE6A,color:#9ECE6A
+    class IN,ASM,REQ,GEN,ASSIST,MBOX,DISP,TRES step
+    class LOOP,TC decision
+    class MAX,FAIL err
+    class ANS done
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">5</span>工具执行与事件流管线</h2>
+  <div class="anchor"><code>registry.go:163/222</code> → <code>service_react.go:416</code> handleToolEvent → <code>session_react.go:286</code> addEvent</div>
+  <div class="mermaid">
+flowchart LR
+    DISP["ReActAgent<br/>tools.Dispatch"] --> REG["ToolRegistry.Execute"]
+    REG --> E1["emitTool<br/>kind = tool_call<br/>Message = '调用工具 X'<br/>Detail = 参数 JSON"]
+    REG --> EXEC["工具执行器<br/>ReadFile / WriteFile /<br/>RunCommand / ListDir /<br/>SearchInFiles / HTTPGet ..."]
+    EXEC --> E2["emitResult<br/>kind = tool_result<br/>Detail = Result JSON<br/>（output / error / path / args_json）"]
+    E1 --> HTE["ReactService.handleToolEvent"]
+    E2 --> HTE
+    HTE --> CHK{"会话存在<br/>且运行中?"}
+    CHK -->|"否"| DROP["丢弃该事件"]
+    CHK -->|"是"| PARSE["tool_call:<br/>toolArgsLabel 提取 path/command/url<br/>tool_result:<br/>解析 output / error / path"]
+    PARSE --> AE["store.addEvent<br/>output 截断 4096 字符"]
+    AE --> TRIM{"事件数 > 500?"}
+    TRIM -->|"是"| CUT["从头裁剪到 200 条"]
+    TRIM -->|"否"| MEM["session.Events 追加"]
+    CUT --> MEM
+    MEM --> STREAM["TUI Stream / Web SSE<br/>实时推送界面"]
+    MEM --> LOG["结构化日志<br/>logs/tui|backend/*.log"]
+    classDef step fill:#24283B,stroke:#7AA2F7,color:#C0CAF5
+    classDef event fill:#2A2F45,stroke:#9ECE6A,color:#9ECE6A
+    classDef decision fill:#3B3624,stroke:#E0AF68,color:#E0AF68
+    classDef drop fill:#3B2A33,stroke:#F7768E,color:#F7768E
+    class DISP,REG,EXEC,HTE,PARSE,AE,MEM,STREAM,LOG step
+    class E1,E2 event
+    class CHK,TRIM decision
+    class DROP drop
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">6</span>TUI 对话区渲染管线（chatItems 六步）</h2>
+  <div class="anchor"><code>backend/internal/tui/helpers.go</code> chatItems · 精简展示的核心管道，每步可单独检查</div>
+  <div class="mermaid">
+flowchart TD
+    SRC["Session<br/>Messages + Events"] --> S1
+    subgraph PIPE["chatItems 处理管道"]
+        S1["① Messages 转换<br/>user → '&gt; ' 前缀（剥离 [澄清答复]）<br/>过滤 'Goal: ' 系统消息"] --> S2["② Events 转换<br/>memory_recall 最多保留 2 条<br/>agent_done → assistant 条目<br/>非 verbose 工具隐藏 [●] pending<br/>'调用工具 X / 工具结果 X' 噪声剔除"]
+        S2 --> S3["③ 按时间戳稳定排序"]
+        S3 --> S4["④ mergeToolCallPairs<br/>相邻 [●]调用 + [✓]/[✗]结果 → 单行<br/>（每个工具调用只占一行）"]
+        S4 --> S5["⑤ aggregateToolEvents<br/>连续同工具完成 → '[✓] Tool × N'<br/>（路径列表折叠 ≤ 5 条）"]
+        S5 --> S6["⑥ 去重<br/>旧版 '会话完成' summary 事件<br/>相邻重复 assistant（遇 user 重置）"]
+    end
+    S6 --> RENDER["buildContent 渲染<br/>You / Assistant（Markdown）/ 工具行<br/>verbose 工具输出 ≤ 5 行 + 省略号<br/>detail 兜底 ≤ 8 行"]
+    RENDER --> VP["对话 viewport + 滚动条<br/>（Ctrl+L 完整记录含全部 rawDetail）"]
+    classDef pipe fill:#24283B,stroke:#7AA2F7,color:#C0CAF5
+    classDef render fill:#2E4A35,stroke:#9ECE6A,color:#9ECE6A
+    class SRC,RENDER pipe
+    class S1,S2,S3,S4,S5,S6 pipe
+    class VP render
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">7</span>TUI 界面布局与数据来源</h2>
+  <div class="anchor">右栏：board.Snapshot（执行计划） + agent.ListAgents（Agent 编排）</div>
+<pre class="layout">
+┌──────────────────────────────────────────────────────────────────────┐
+│ 顶栏: BlockMemoryAgent v0.8.0 | Model | Memory | Session | Status     │
+├──────────────────────────────────────────────┬───────────────────────┤
+│                                              │ 📋 执行计划 (45%)      │
+│  对话区（chatItems 六步管道）                  │  任务行 + 总体进度      │
+│  · You      用户问题                          │  + 预计剩余            │
+│  · Assistant 大模型输出（Markdown）           │  ← board.Snapshot     │
+│  · [✓]/[✗] 工具行（合并/聚合后）              ├───────────────────────┤
+│  · [●]     执行中工具                         │ 🧠 Agent 编排 (55%)    │
+│                                              │  MetaAgent 卡片        │
+│                                              │  └─ 子 Agent 卡片网格  │
+│                                              │  ← agent.ListAgents   │
+├──────────────────────────────────────────────┴───────────────────────┤
+│ 输入栏: > Type your message...                                        │
+│ 快捷键: [K] [P] [A] [L] [B] [M] [G] [S] [?] [Ctrl+C]                  │
+└──────────────────────────────────────────────────────────────────────┘
+</pre>
+</section>
+
+<section>
+  <h2><span class="num">8</span>步骤检查清单</h2>
+  <table>
+    <tr><th>#</th><th>步骤</th><th>代码位置</th><th>检查点</th></tr>
+    <tr><td>1</td><td>配置加载</td><td><code>cmd/tui/main.go:47</code></td><td>必需文件（config/roles/env/soul/skills）缺失即退出</td></tr>
+    <tr><td>2</td><td>文件日志</td><td><code>cmd/tui/main.go:100</code></td><td>TUI 静默 stderr，日志只写 logs/tui/</td></tr>
+    <tr><td>3</td><td>依赖装配</td><td><code>bootstrap/bootstrap.go:101</code></td><td>21 步；任一步失败按序释放已建资源</td></tr>
+    <tr><td>4</td><td>本地 HTTP</td><td><code>cmd/tui/main.go:146</code></td><td>监听 127.0.0.1:0 随机端口，无需认证</td></tr>
+    <tr><td>5</td><td>会话创建</td><td><code>service_react.go:457</code></td><td>goroutine 执行；meta 角色缺失 → error</td></tr>
+    <tr><td>6</td><td>ReAct 循环</td><td><code>react_agent.go:87</code></td><td>maxIter=50；每轮 Assemble → Generate → ToolCalls?</td></tr>
+    <tr><td>7</td><td>mailbox 注入</td><td><code>react_agent.go:136</code></td><td>子代理摘要在每轮 assistant 后注入</td></tr>
+    <tr><td>8</td><td>工具事件产生</td><td><code>registry.go:163/222</code></td><td>tool_call 带参数 JSON；tool_result 带 Result JSON</td></tr>
+    <tr><td>9</td><td>工具事件入库</td><td><code>service_react.go:416</code></td><td>会话非运行中丢弃；path/output/error 解析入库</td></tr>
+    <tr><td>10</td><td>事件内存上限</td><td><code>session_react.go:296/318</code></td><td>output 截断 4096；事件 &gt;500 裁 200</td></tr>
+    <tr><td>11</td><td>TUI 刷新触发</td><td><code>tui/model.go:350</code></td><td>tick 100ms；streamEvent 即时刷新</td></tr>
+    <tr><td>12</td><td>chatItems 管道</td><td><code>tui/helpers.go:243</code></td><td>第 6 张图的 ①~⑥ 逐步核对</td></tr>
+    <tr><td>13</td><td>工具行合并</td><td><code>tui/helpers.go</code></td><td>[●]+[✓] 相邻同工具 → 单行</td></tr>
+    <tr><td>14</td><td>工具行聚合</td><td><code>tui/helpers.go:375</code></td><td>仅无 detail 的连续同工具完成行</td></tr>
+    <tr><td>15</td><td>assistant 去重</td><td><code>tui/helpers.go</code></td><td>相邻重复删除；遇 user 消息重置</td></tr>
+    <tr><td>16</td><td>输出截断</td><td><code>tui/helpers.go</code></td><td>主对话区 ≤5 行；完整在 Ctrl+L</td></tr>
+    <tr><td>17</td><td>计划面板</td><td><code>tui/view.go</code></td><td>状态由 agent 树覆盖看板；预计剩余=已完成均值×剩余</td></tr>
+    <tr><td>18</td><td>Agent 编排</td><td><code>tui/agent_tree_panel.go</code></td><td>MetaAgent 置顶；宽度 ≥44 两列、≥72 三列</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2><span class="num">9</span>关键裁剪 / 过滤点汇总（检查重点）</h2>
+  <table>
+    <tr><th>位置</th><th>规则</th><th>目的</th></tr>
+    <tr><td><code>chatItems</code></td><td>memory_recall 最多内联 2 条</td><td>防召回刷屏</td></tr>
+    <tr><td><code>chatItems</code></td><td>非 verbose 工具隐藏 [●] pending 行</td><td>高频工具降噪</td></tr>
+    <tr><td><code>eventChatItem</code></td><td>"调用工具 X / 工具结果 X" 固定文案剔除</td><td>去噪声</td></tr>
+    <tr><td><code>mergeToolCallPairs</code></td><td>调用/结果合并一行</td><td>每个工具调用一行</td></tr>
+    <tr><td><code>aggregateToolEvents</code></td><td>连续同工具 → × N，路径 ≤5 条</td><td>重复调用折叠</td></tr>
+    <tr><td><code>compactToolOutputLines</code></td><td>verbose 输出 ≤5 行</td><td>中间结果折叠</td></tr>
+    <tr><td><code>displayDetailLines</code></td><td>工具 detail ≤8 行</td><td>兜底截断</td></tr>
+    <tr><td><code>addEvent</code></td><td>output ≤4096 字符；事件 &gt;500 裁 200</td><td>内存/DB 防爆</td></tr>
+    <tr><td>计划/编排面板</td><td>超高内容裁剪 + "… 还有 N" 提示</td><td>布局不溢出</td></tr>
+  </table>
+</section>
+
+<footer>
+  生成自项目源码（backend/）。修改流程请同步更新 doc/流程图.md 与本文件。
+</footer>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      background: '#1A1B26',
+      primaryColor: '#24283B',
+      primaryTextColor: '#C0CAF5',
+      primaryBorderColor: '#7AA2F7',
+      lineColor: '#565F89',
+      clusterBkg: 'rgba(65,72,104,0.15)',
+      clusterBorder: '#414868',
+      titleColor: '#C0CAF5',
+      edgeLabelBackground: '#1F2335',
+      fontFamily: '"Segoe UI", "Microsoft YaHei", system-ui, sans-serif',
+      fontSize: '14px'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true }
+  });
+</script>
+</body>
+</html>

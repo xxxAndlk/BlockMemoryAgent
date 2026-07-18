@@ -203,16 +203,31 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	memoryPipeline := memory.NewPipeline(memory.NewInMemoryStore())   // 记忆流水线
 
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
+	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
+	reactCfg := agent.ReactRuntimeConfig{
+		MaxIterations:             cfg.Agent.ToolCallMaxRounds,
+		LLMTimeoutSec:             cfg.Agent.ReactLLMTimeoutSec,
+		RetryCount:                cfg.Agent.RetryCount,
+		RetryBackoffMs:            cfg.Agent.RetryBackoffMs,
+		HistoryMaxMessages:        cfg.Agent.HistoryMaxMessages,
+		ToolOutputHistoryMaxRunes: cfg.Agent.ToolOutputHistoryMaxRunes,
+	}
+	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute
+	if subAgentTimeout < 0 {
+		subAgentTimeout = 0 // 负数表示不限制
+	}
 	subAgentDispatcher := subagent.NewDispatcher(roleRegistry, &reactModelFactory{modelFactory}, toolRegistry, sharedMailbox, memoryPipeline)
+	subAgentDispatcher.WithTimeout(subAgentTimeout).WithLoopConfig(reactCfg.LoopConfig())
 	subAgentDispatcher.RegisterCallTool(toolRegistry)
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
 	agentSvc.SetLogger(sessionLogger)
-	// 默认不恢复历史会话：每次启动都是全新会话列表，旧会话仅在内存中淘汰；
-	// 设置 agent.restore_sessions: true 时，从 session_history 恢复最近 50 个会话到内存。
+	agentSvc.SetRuntimeConfig(reactCfg)
+	// 默认恢复历史会话：从 session_history 恢复最近 50 个会话到内存，
+	// 保证重启后长任务上下文可见；显式 restore_sessions: false 关闭。
 	// 恢复失败仅记录日志，不阻断启动。
-	if cfg.Agent.RestoreSessions {
+	if cfg.Agent.RestoreSessions == nil || *cfg.Agent.RestoreSessions {
 		agentSvc.RestoreSessions(ctx, 50)
 	}
 

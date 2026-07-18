@@ -5,6 +5,8 @@ import (
 	// context 用于在测试中传递请求上下文与超时控制。
 	"context"
 	// os 与 path/filepath 用于在临时目录相关测试中创建/校验目录与文件。
+	// strings 用于断言事件消息内容。
+	"strings"
 	"os"
 	"path/filepath"
 	// testing 提供 Go 标准测试框架。
@@ -297,4 +299,75 @@ func TestReactService_CleansTempDirOnCompletion(t *testing.T) {
 	if _, err := os.Stat(tempFile); !os.IsNotExist(err) {
 		t.Fatalf("会话完成后临时文件应被删除，但仍存在: %s", tempFile)
 	}
+}
+
+// TestReactService_PausesOnIterationLimit 验证达到最大轮数上限时会话进入
+// awaiting_clarify（暂停待续）而非 error，且用户发送消息后可从进度续跑直至完成。
+func TestReactService_PausesOnIterationLimit(t *testing.T) {
+	// 模型持续请求工具调用（触发轮数上限），恢复后给出最终答案。
+	toolCallMsg := &blades.Message{
+		Role: blades.RoleAssistant,
+		Parts: []blades.Part{
+			blades.ToolPart{Name: "ListDir", Request: `{"path":"."}`},
+		},
+	}
+	llm := &mockReactModelProvider{
+		responses: []*blades.Message{toolCallMsg, toolCallMsg, toolCallMsg, blades.AssistantMessage("final answer")},
+	}
+	svc := newReactServiceForTest(llm, t.TempDir())
+	svc.SetRuntimeConfig(ReactRuntimeConfig{MaxIterations: 2})
+	ctx := context.Background()
+
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "long task"})
+	if err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+
+	// 轮询等待会话进入暂停待续状态（而不是 error）。
+	deadline := time.Now().Add(3 * time.Second)
+	paused := false
+	for time.Now().Before(deadline) {
+		snap, _ := svc.Get(ctx, created.ID)
+		if snap != nil && snap.Status == string(enums.SessionStatusAwaitingClarify) {
+			paused = true
+			break
+		}
+		if snap != nil && snap.Status == string(enums.SessionStatusError) {
+			t.Fatalf("达到轮数上限不应进入 error 状态: %s", snap.Result)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !paused {
+		t.Fatal("会话未进入暂停待续状态")
+	}
+
+	// 校验暂停提示事件已记录。
+	snap, _ := svc.Get(ctx, created.ID)
+	found := false
+	for _, ev := range snap.Events {
+		if strings.Contains(ev.Message, "已达最大轮数上限") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("应记录'已达最大轮数上限'暂停事件")
+	}
+
+	// 用户发送"继续"后应从进度续跑并最终完成。
+	if err := svc.Send(ctx, created.ID, Message{Role: "user", Content: "继续"}); err != nil {
+		t.Fatalf("Send error: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snap, _ := svc.Get(ctx, created.ID)
+		if snap != nil && snap.Status == string(enums.SessionStatusCompleted) {
+			if snap.Result != "final answer" {
+				t.Fatalf("续跑结果 = %q, want %q", snap.Result, "final answer")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("续跑后会话未完成")
 }

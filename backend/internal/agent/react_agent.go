@@ -25,6 +25,28 @@ type ReActAgent struct {
 	role    types.RoleDefinition // role 是当前代理的角色定义，包含系统提示等配置。
 	name    string               // name 是代理唯一标识，也用于上下文中的 agent ID。
 	maxIter int                  // maxIter 是单次 Run 中允许的最大 LLM 调用次数，防止死循环。
+
+	// llmTimeout 是单次 LLM 调用的超时；<=0 时仅受会话 ctx 取消控制。
+	llmTimeout time.Duration
+	// retryCount 是 LLM 调用失败后的重试次数（不含首次）。
+	retryCount int
+	// retryBackoff 是重试初始退避时长，每次重试翻倍。
+	retryBackoff time.Duration
+	// historyMaxMessages 是单次 LLM 请求携带的最大历史消息数（滑动窗口）；<=0 不裁剪。
+	historyMaxMessages int
+	// toolOutputMaxRunes 是写入历史的单条工具输出最大字符数；<=0 不截断。
+	toolOutputMaxRunes int
+}
+
+// LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。
+// 各字段 <=0 的语义见 ReActAgent 对应字段注释。
+type LoopConfig struct {
+	MaxIterations      int           // 最大 LLM 轮数；<=0 不限制
+	LLMTimeout         time.Duration // 单次 LLM 调用超时；<=0 仅受会话取消控制
+	RetryCount         int           // 失败重试次数（不含首次）；<0 视为 0
+	RetryBackoff       time.Duration // 重试初始退避；<=0 用默认 100ms
+	HistoryMaxMessages int           // 单次请求最大历史消息数；<=0 不裁剪
+	ToolOutputMaxRunes int           // 写入历史的工具输出最大字符数；<=0 不截断
 }
 
 // NewReActAgent 根据具体角色构造一个 ReActAgent 实例。
@@ -72,6 +94,20 @@ func (a *ReActAgent) WithMaxIterations(n int) *ReActAgent {
 	return a
 }
 
+// WithLoopConfig 注入主循环运行时参数（轮数/超时/重试/历史滑窗/输出截断）。
+func (a *ReActAgent) WithLoopConfig(c LoopConfig) *ReActAgent {
+	a.maxIter = c.MaxIterations // <=0 表示不限制（循环条件已兼容）
+	a.llmTimeout = c.LLMTimeout
+	a.retryCount = c.RetryCount
+	if a.retryCount < 0 {
+		a.retryCount = 0
+	}
+	a.retryBackoff = c.RetryBackoff
+	a.historyMaxMessages = c.HistoryMaxMessages
+	a.toolOutputMaxRunes = c.ToolOutputMaxRunes
+	return a
+}
+
 // Run 针对给定的用户输入执行 ReAct 循环。
 // 参数 ctx 用于取消/超时控制；input 为用户输入文本。
 // 返回值 ReactResult 包含助手最终回复与完整会话历史；error 表示执行过程中的错误。
@@ -99,12 +135,16 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// 根据当前角色构建系统提示词，作为模型行为约束。
 	system := a.systemPrompt()
 
-	// 进入 ReAct 主循环，最多执行 maxIter 次 LLM 调用。
+	// 进入 ReAct 主循环，最多执行 maxIter 次 LLM 调用（maxIter<=0 时不限制）。
 	// 每次循环对应一次“思考-行动-观察”的迭代。
-	for i := 0; i < a.maxIter; i++ {
+	for i := 0; a.maxIter <= 0 || i < a.maxIter; i++ {
 		// 在每次调用 LLM 之前，通过记忆流水线组装上下文消息。
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
 		messages := a.memory.Assemble(a.role, a.name, history)
+
+		// 滑动窗口裁剪：防止长任务历史无限增长导致 token 爆炸与上下文窗口溢出。
+		// 仅影响本次请求，不修改 history 本身（完整历史仍用于持久化与续跑）。
+		messages = windowMessages(messages, a.historyMaxMessages)
 
 		// 将内部消息格式转换为 blades 库所需的模型消息格式。
 		bladesMsgs := ToBladesMessages(messages)
@@ -116,15 +156,11 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			Tools:       a.tools.Schema(),
 		}
 
-		// 调用 LLM 生成回复，err 非空时立即返回并包装错误信息。
-		resp, err := a.llm.Generate(ctx, req)
+		// 调用 LLM 生成回复（带重试与单次超时）；重试耗尽后返回错误。
+		resp, err := a.generate(ctx, req)
 		if err != nil {
-			return ReactResult{}, fmt.Errorf("llm generate: %w", err)
-		}
-
-		// 如果响应为空或没有消息内容，说明模型返回异常，返回明确错误。
-		if resp == nil || resp.Message == nil {
-			return ReactResult{}, errors.New("empty model response")
+			// 出错时返回已累计的历史，便于上层回传部分进度或排查。
+			return ReactResult{History: history}, fmt.Errorf("llm generate: %w", err)
 		}
 
 		// 将 blades 返回的消息转换为内部 Assistant 消息并追加到历史中。
@@ -173,13 +209,19 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				result = ToolResult{Tool: tc.Name, Error: err.Error()}
 			}
 
+			// 截断工具输出后再写入历史，避免单次大输出（如整文件/长日志）
+			// 在历史中无限累积，导致后续每轮请求 token 爆炸。
+			if a.toolOutputMaxRunes > 0 {
+				result.Output = truncateRunes(result.Output, a.toolOutputMaxRunes)
+			}
+
 			// 将工具执行结果以 tool 角色消息追加到历史中，供下一次 LLM 调用使用。
 			history = append(history, ReactMessage{
 				Role:    "tool",
 				Content: ToolResultJSON(result),
 			})
 
-			// 把工具调用细节与结果写入记忆流水线。
+			// 把工具调用细节与结果写入记忆流水线（保留完整输出，展示层自行截断）。
 			a.memory.Write(a.name, MemoryEvent{
 				Type:     "tool_call",
 				AgentID:  a.name,
@@ -191,8 +233,106 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		}
 	}
 
-	// 达到最大迭代次数仍未返回最终答案，返回超时/超限错误。
-	return ReactResult{}, fmt.Errorf("exceeded maximum iterations (%d)", a.maxIter)
+	// 达到最大迭代次数上限（仅 maxIter>0 时可能触发）：
+	// 不视为错误——返回 LimitReached 标记与完整历史，
+	// 由上层将会话置为暂停并提示用户发送消息续跑，而不是判定任务失败。
+	return ReactResult{History: history, LimitReached: true}, nil
+}
+
+// generate 包装一次 LLM 调用：带单次超时与指数退避重试。
+// 重试次数为 retryCount+1 次尝试；会话被取消（ctx.Err() 非空）时不重试，直接返回。
+func (a *ReActAgent) generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	attempts := a.retryCount + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	backoff := a.retryBackoff
+	if backoff <= 0 {
+		backoff = 100 * time.Millisecond
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		// 首次之后的尝试先按指数退避等待。
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+		// 单次调用超时从会话 ctx 派生，不影响会话整体的取消语义。
+		callCtx := ctx
+		cancel := context.CancelFunc(func() {})
+		if a.llmTimeout > 0 {
+			callCtx, cancel = context.WithTimeout(ctx, a.llmTimeout)
+		}
+		resp, err := a.llm.Generate(callCtx, req)
+		cancel()
+		if err != nil {
+			lastErr = err
+			// 会话本身被取消/超时，属用户或上层主动行为，不再重试。
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			continue
+		}
+		// 响应为空属模型异常，不重试（重试大概率同样为空），直接报错。
+		if resp == nil || resp.Message == nil {
+			return nil, errors.New("empty model response")
+		}
+		return resp, nil
+	}
+	return nil, lastErr
+}
+
+// windowMessages 把发送给 LLM 的消息裁剪到最多 max 条（滑动窗口）：
+// 保留开头的 system 消息（记忆注入）与最近的对话，并在保留段的最早 user 消息
+// 边界下刀，保证 assistant 的 tool_calls 与后续 tool 结果成对完整（部分 provider
+// 校验不成对会报错）。被省略的条数以一条说明消息占位。max<=0 或未超限时原样返回。
+func windowMessages(messages []ReactMessage, max int) []ReactMessage {
+	if max <= 0 || len(messages) <= max {
+		return messages
+	}
+	// 保留开头的 system 消息（记忆流水线注入的"近期事件"上下文）。
+	keep := 0
+	for keep < len(messages) && messages[keep].Role == "system" {
+		keep++
+	}
+	// 预算：system 前缀 + 省略说明各占 1 条，其余留给最近消息。
+	budget := max - keep - 1
+	if budget < 1 {
+		budget = 1
+	}
+	start := len(messages) - budget
+	if start < keep {
+		start = keep
+	}
+	// 向前移动 start 到最近的 user 边界，保证 tool 调用链完整。
+	for start < len(messages) && start > keep && messages[start].Role != "user" {
+		start++
+	}
+	omitted := start - keep
+	if omitted <= 0 {
+		return messages
+	}
+	out := make([]ReactMessage, 0, len(messages)-omitted+1)
+	out = append(out, messages[:keep]...)
+	out = append(out, ReactMessage{
+		Role:    "user",
+		Content: fmt.Sprintf("（上下文省略：此处之前还有 %d 条早期对话，已从本次请求中裁剪，关键结论见上方近期事件）", omitted),
+	})
+	out = append(out, messages[start:]...)
+	return out
+}
+
+// truncateRunes 按 rune 数截断字符串并追加省略提示。
+func truncateRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "...(truncated)"
 }
 
 // systemPrompt 为当前角色构建系统提示词。

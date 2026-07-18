@@ -73,11 +73,16 @@ type GraphPolicyConfig struct {
 
 // LLMRuntimeConfig LLM 调用与重试运行时参数配置。
 type LLMRuntimeConfig struct {
-	ToolCallMaxRounds int `yaml:"tool_call_max_rounds"` // Assistant 单任务 ReAct 工具调用循环最大轮数（含重复调用/空转检测提前退出）
+	ToolCallMaxRounds int `yaml:"tool_call_max_rounds"` // Assistant 单任务 ReAct 工具调用循环最大轮数（含重复调用/空转检测提前退出）；负数表示不限制
 	RetryCount        int `yaml:"retry_count"`          // Assistant 任务执行指数退避重试次数
 	RetryBackoffMs    int `yaml:"retry_backoff_ms"`     // 重试初始退避时长（毫秒）
 	LLMSoftTimeoutSec int `yaml:"llm_soft_timeout_sec"` // LLM 调用软超时（秒，建议取消）
 	LLMHardTimeoutSec int `yaml:"llm_hard_timeout_sec"` // LLM 调用硬超时（秒，强制取消）
+
+	ReactLLMTimeoutSec        int `yaml:"react_llm_timeout_sec"`         // ReAct 单次 LLM 调用超时（秒，默认 300；负数表示仅受会话取消控制）
+	SubAgentTimeoutMin        int `yaml:"sub_agent_timeout_min"`         // 子 Agent 独立执行超时（分钟，默认 30；负数表示不限制）
+	HistoryMaxMessages        int `yaml:"history_max_messages"`          // 单次 LLM 请求携带的最大历史消息数（默认 40，滑动窗口防 token 爆炸；负数表示不裁剪）
+	ToolOutputHistoryMaxRunes int `yaml:"tool_output_history_max_runes"` // 写入历史的单条工具输出最大字符数（默认 2000；负数表示不截断）
 }
 
 // SafetyConfig 工具沙箱与安全策略配置。
@@ -94,7 +99,7 @@ type FeatureTogglesConfig struct {
 	HumanClarifyEnabled      bool `yaml:"human_clarify_enabled"`       // 是否启用人机对话
 	HumanClarifyTimeoutSec   int  `yaml:"human_clarify_timeout_sec"`   // 等待用户回答超时（秒）
 	DAGEnabled               bool `yaml:"dag_enabled"`                 // 是否启动 DAG 调度器
-	RestoreSessions          bool `yaml:"restore_sessions"`            // 启动时是否从 session_history 恢复最近会话到内存（默认关闭，每次启动都是全新会话列表）
+	RestoreSessions          *bool `yaml:"restore_sessions"`            // 启动时是否从 session_history 恢复最近会话到内存（默认 true；显式 false 关闭）
 	PlanEnabled              bool `yaml:"plan_enabled"`                // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
 	ReflectionEnabled        bool `yaml:"reflection_enabled"`          // 是否在助手执行后做 Self-Reflection（不达标重试一次）
 	AssistantSelfTestEnabled bool `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证
@@ -419,6 +424,18 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.LLMHardTimeoutSec == 0 {
 		c.Agent.LLMHardTimeoutSec = 90
+	}
+	if c.Agent.ReactLLMTimeoutSec == 0 {
+		c.Agent.ReactLLMTimeoutSec = 300
+	}
+	if c.Agent.SubAgentTimeoutMin == 0 {
+		c.Agent.SubAgentTimeoutMin = 30
+	}
+	if c.Agent.HistoryMaxMessages == 0 {
+		c.Agent.HistoryMaxMessages = 40
+	}
+	if c.Agent.ToolOutputHistoryMaxRunes == 0 {
+		c.Agent.ToolOutputHistoryMaxRunes = 2000
 	}
 }
 
