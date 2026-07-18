@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/board"
@@ -27,6 +26,8 @@ type agentTreeNode struct {
 	domain string
 	// roleType 是 Agent 角色类型（Meta/Domain/SubDomain/Fixed/Dynamic）。
 	roleType enums.RoleType
+	// role 是 Agent 担任的角色名称（如 Designer/Developer），MetaAgent 固定为 Orchestrator。
+	role string
 	// status 是 Agent 当前状态。
 	status enums.RoleStatus
 	// goal 是 Agent 的目标描述，可能为空。
@@ -88,6 +89,7 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 		instID:    "MetaAgent",
 		name:      "MetaAgent",
 		roleType:  enums.RoleTypeMeta,
+		role:      "Orchestrator",
 		status:    metaStatus,
 		goal:      metaGoal,
 		createdAt: s.StartedAt,
@@ -125,6 +127,7 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 			name:      inst.Name,
 			domain:    inst.Domain,
 			roleType:  inst.RoleType,
+			role:      inst.Role,
 			status:    enums.RoleStatus(inst.Status),
 			goal:      goal,
 			createdAt: inst.CreatedAt,
@@ -145,6 +148,7 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 					name:      child.Name,
 					domain:    child.Domain,
 					roleType:  child.RoleType,
+					role:      child.Role,
 					status:    enums.RoleStatus(child.Status),
 					createdAt: child.CreatedAt,
 				})
@@ -159,6 +163,7 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 						name:      sub.Name,
 						domain:    sub.Domain,
 						roleType:  sub.RoleType,
+						role:      sub.Role,
 						status:    enums.RoleStatus(sub.Status),
 						createdAt: sub.CreatedAt,
 					})
@@ -171,6 +176,7 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 					name:      child.Name,
 					domain:    child.Domain,
 					roleType:  child.RoleType,
+					role:      child.Role,
 					status:    enums.RoleStatus(child.Status),
 					createdAt: child.CreatedAt,
 				})
@@ -254,7 +260,9 @@ func (at *AgentTreePanel) buildLines() []string {
 	return lines
 }
 
-// renderAgentsPanel 渲染右侧 Agent 编排面板，包含标题栏与 Agent 卡片列表。
+// renderAgentsPanel 渲染右侧 Agent 编排面板。
+// 布局参考"新TUI页.png"：顶部为居中的 MetaAgent 卡片，经连接线引出
+// 子 Agent 卡片网格（宽度足够时两列），底部为状态图例。
 func (m Model) renderAgentsPanel(w, h int) string {
 	// 保证最小宽度，避免卡片过度压缩。
 	if w < 20 {
@@ -262,7 +270,7 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	}
 
 	// 构建标题栏：左侧标题 + 右侧关闭提示，中间用空格填充。
-	titleLeft := "Agent 编排"
+	titleLeft := "🧠 Agent 编排"
 	titleRight := "[A] 关闭"
 	titlePadding := w - lipgloss.Width(titleLeft) - lipgloss.Width(titleRight) - 2
 	if titlePadding < 1 {
@@ -275,83 +283,257 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	if innerW < 10 {
 		innerW = 10
 	}
-
-	// 构建 Agent 卡片行。
-	var lines []string
-	if len(m.agentTreePanel.nodes) == 0 {
-		lines = append(lines, "(no agents)")
-	} else {
-		for i, node := range m.agentTreePanel.nodes {
-			// 过滤掉二级以下、无目标且已完成/空闲的节点，避免面板过于拥挤。
-			if node.depth >= 2 && node.goal == "" &&
-				(node.status == enums.RoleStatusDone || node.status == enums.RoleStatusIdle) {
-				continue
-			}
-			card := m.agentCardLine(node, i, innerW)
-			lines = append(lines, card...)
-		}
+	// 内容区最大行数（PanelBox Height(h-3)），超出部分按卡片行粒度裁剪。
+	maxBody := h - 3
+	if maxBody < 1 {
+		maxBody = 1
 	}
 
-	// 拼接标题栏与内容区。
+	// 分离 MetaAgent 与子 Agent 节点；过滤掉二级以下、无目标且已完成/空闲的节点，
+	// 避免面板过于拥挤。
+	var meta *agentTreeNode
+	var children []agentTreeNode
+	for i := range m.agentTreePanel.nodes {
+		node := m.agentTreePanel.nodes[i]
+		if node.depth == 0 && !node.isClarify {
+			n := node
+			meta = &n
+			continue
+		}
+		if node.depth >= 2 && node.goal == "" &&
+			(node.status == enums.RoleStatusDone || node.status == enums.RoleStatusIdle) {
+			continue
+		}
+		children = append(children, node)
+	}
+
+	if meta == nil && len(children) == 0 {
+		body := m.styles.Dim.Render("(no agents)")
+		return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
+	}
+
+	// 网格布局参数：宽度足够时两列（更宽时三列），否则单列。
+	cols := 1
+	if innerW >= 72 {
+		cols = 3
+	} else if innerW >= 44 {
+		cols = 2
+	}
+	gap := 2
+	cardW := (innerW - gap*(cols-1)) / cols
+	if cardW < 14 {
+		cardW = 14
+	}
+
+	// 分段组装：MetaAgent 卡片（居中）、连接线、子 Agent 卡片行、图例。
+	// 裁剪时优先丢图例、再丢末尾卡片行，保证 MetaAgent 始终可见。
+	var metaLines []string
+	if meta != nil {
+		metaCard := m.buildAgentCard(*meta, cardW)
+		padLeft := (innerW - cardW) / 2
+		if padLeft < 0 {
+			padLeft = 0
+		}
+		pad := strings.Repeat(" ", padLeft)
+		for _, l := range strings.Split(metaCard, "\n") {
+			metaLines = append(metaLines, pad+l)
+		}
+	}
+	// 子 Agent 卡片按行拼接（行内 JoinHorizontal）；放不下的整行丢弃。
+	connLines := m.agentConnectorLines(cols, cardW, gap, innerW)
+	rowBudget := maxBody - len(metaLines) - len(connLines)
+	var rowLines []string
+	omitted := 0
+	for row := 0; row < len(children); row += cols {
+		end := row + cols
+		if end > len(children) {
+			end = len(children)
+		}
+		var cards []string
+		for _, n := range children[row:end] {
+			cards = append(cards, m.buildAgentCard(n, cardW))
+		}
+		rl := strings.Split(joinHorizontalWithGap(cards, gap), "\n")
+		if len(rowLines)+len(rl) > rowBudget {
+			omitted = len(children) - row
+			break
+		}
+		rowLines = append(rowLines, rl...)
+	}
+	// 一个卡片行也放不下时，不画悬空的连接线。
+	if len(children) == 0 || (omitted == len(children) && len(children) > 0) {
+		connLines = nil
+	}
+	lines := append(metaLines, connLines...)
+	lines = append(lines, rowLines...)
+
+	// 图例：仅在所有卡片都放下且还有余量时显示，并插入空行贴底对齐。
+	if omitted == 0 && len(lines)+1 <= maxBody {
+		for len(lines)+1 < maxBody {
+			lines = append(lines, "")
+		}
+		lines = append(lines, m.agentLegendLine())
+	} else if omitted > 0 && len(lines) < maxBody {
+		lines = append(lines, m.styles.Dim.Render(fmt.Sprintf("… 还有 %d 个 Agent", omitted)))
+	}
+	// 兜底硬裁剪，防止极端高度下内容溢出面板挤乱整体布局。
+	if len(lines) > maxBody {
+		lines = lines[:maxBody]
+	}
+
 	body := strings.Join(lines, "\n")
 	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
 }
 
-// agentCardLine 渲染单个 Agent 卡片，返回一行或两行字符串（第二行展示目标）。
-func (m Model) agentCardLine(node agentTreeNode, idx, innerW int) []string {
-	// 根据节点在树中的位置生成树状前缀并计算其显示宽度。
-	prefix := agentTreePrefix(m.agentTreePanel.nodes, idx)
-	prefixW := runewidth.StringWidth(prefix)
-	// 可用宽度需扣除前缀占位。
-	avail := innerW - prefixW
-	if avail < 10 {
-		avail = 10
+// buildAgentCard 把单个 Agent 节点渲染为圆角边框卡片：
+// 彩色加粗名称 + 角色/领域副标题 + 状态色点文本 + 时间 + 任务描述，固定 5 行内容。
+// 卡片总宽恒为 cardW：lipgloss Width 含左右内边距（各 1），边框另加 2 列，保证网格列对齐。
+func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
+	// 文本区宽度 = 总宽 - 边框 2 - 内边距 2。
+	inner := cardW - 4
+	if inner < 4 {
+		inner = 4
 	}
-
-	// 状态图标与颜色。
-	icon := statusIcon(string(node.status))
-	iconStyled := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor(string(node.status)))).Render(icon)
-	// 根据角色类型选择名称颜色并加粗。
-	nameColor := agentRoleColor(node.roleType)
-	nameStyled := lipgloss.NewStyle().Foreground(lipgloss.Color(nameColor)).Bold(true).Render(node.name)
-	// 状态徽章。
-	badge := agentStatusBadge(m.styles, node.status)
-
-	// 创建时间戳，非零时显示在右侧。
-	ts := ""
+	// 名称：按角色类型着色并加粗。
+	name := lipgloss.NewStyle().Foreground(lipgloss.Color(agentRoleColor(node.roleType))).Bold(true).
+		Render(truncate(node.name, inner))
+	// 副标题：优先角色名（如 Designer），其次领域，最后角色类型。
+	sub := node.role
+	if sub == "" {
+		sub = node.domain
+	}
+	if sub == "" {
+		sub = roleTypeText(node.roleType)
+	}
+	subLine := m.styles.Dim.Render(truncate(sub, inner))
+	// 状态行：彩色图标 + 英文状态文本。
+	stLine := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor(string(node.status)))).
+		Render(statusIcon(string(node.status)) + " " + roleStatusText(node.status))
+	// 时间行：按状态显示 启动/完成/创建 后缀。
+	timeLine := ""
 	if !node.createdAt.IsZero() {
-		ts = node.createdAt.Format("15:04:05")
-	}
-	tsStyled := m.styles.Dim.Render(ts)
-
-	// 拼接第一行：前缀 + 图标 + 名称 + 徽章。
-	line := fmt.Sprintf("%s%s %s %s", prefix, iconStyled, nameStyled, badge)
-	// 若时间戳非空，则右对齐放置。
-	if ts != "" {
-		gap := avail - lipgloss.Width(line) + prefixW - lipgloss.Width(tsStyled)
-		if gap < 1 {
-			gap = 1
+		suffix := "创建"
+		switch node.status {
+		case enums.RoleStatusActive:
+			suffix = "启动"
+		case enums.RoleStatusDone:
+			suffix = "完成"
 		}
-		line += strings.Repeat(" ", gap) + tsStyled
+		timeLine = m.styles.Dim.Render(node.createdAt.Format("15:04:05") + " " + suffix)
 	}
-	// 按可用宽度截断，防止溢出。
-	line = truncate(line, innerW)
-
-	lines := []string{line}
-
-	// 若节点有目标且不是待澄清占位，则在第二行展示目标摘要。
+	// 任务行：无目标时留空，保持卡片高度一致。
+	goalLine := ""
 	if node.goal != "" && !node.isClarify {
-		goal := strings.ReplaceAll(node.goal, "\n", " ")
-		goalPrefix := strings.Repeat(" ", prefixW) + "  "
-		goalAvail := innerW - runewidth.StringWidth(goalPrefix)
-		if goalAvail < 10 {
-			goalAvail = 10
-		}
-		goalLine := goalPrefix + m.styles.Dim.Render(truncate(goal, goalAvail))
-		lines = append(lines, goalLine)
+		goalLine = m.styles.Dim.Render(truncate("任务: "+strings.ReplaceAll(node.goal, "\n", " "), inner))
 	}
+	// 运行中/错误的 Agent 用状态色边框突出，其余用普通暗色边框。
+	borderColor := cBlur
+	switch node.status {
+	case enums.RoleStatusActive:
+		borderColor = cStatusRun
+	case enums.RoleStatusError:
+		borderColor = cStatusErr
+	}
+	content := strings.Join([]string{name, subLine, stLine, timeLine, goalLine}, "\n")
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(borderColor)).
+		Padding(0, 1).
+		Width(cardW - 2).
+		Render(content)
+}
 
-	return lines
+// agentConnectorLines 生成 MetaAgent 卡片与子 Agent 网格之间的连接线。
+// 单列时为居中的竖线；多列时为带 ┌ ┐ ┬ ┴ 的分流横线，对齐各列中心。
+func (m Model) agentConnectorLines(cols, cardW, gap, innerW int) []string {
+	center := innerW / 2
+	vline := strings.Repeat(" ", center) + m.styles.Dim.Render("│")
+	if cols <= 1 {
+		return []string{vline, vline}
+	}
+	// 计算各列中心位置。
+	centers := make([]int, cols)
+	for i := 0; i < cols; i++ {
+		centers[i] = i*(cardW+gap) + cardW/2
+	}
+	bar := []rune(strings.Repeat(" ", centers[cols-1]+1))
+	for i := centers[0]; i <= centers[cols-1]; i++ {
+		bar[i] = '─'
+	}
+	mid := (centers[0] + centers[cols-1]) / 2
+	bar[mid] = '┴'
+	for i, c := range centers {
+		switch {
+		case c == mid:
+			bar[c] = '┼'
+		case i == 0:
+			bar[c] = '┌'
+		case i == cols-1:
+			bar[c] = '┐'
+		default:
+			bar[c] = '┬'
+		}
+	}
+	return []string{vline, m.styles.Dim.Render(string(bar))}
+}
+
+// agentLegendLine 渲染 Agent 编排面板底部的状态图例。
+func (m Model) agentLegendLine() string {
+	item := func(icon, label, color string) string {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(icon) + " " + m.styles.Dim.Render(label)
+	}
+	return item("✓", "Done", cStatusDone) + "   " +
+		item("●", "Running", cStatusRun) + "   " +
+		item("○", "Waiting", cStatusIdle)
+}
+
+// joinHorizontalWithGap 以固定空格间隔水平拼接多个同高文本块。
+func joinHorizontalWithGap(blocks []string, gap int) string {
+	if len(blocks) == 1 {
+		return blocks[0]
+	}
+	parts := make([]string, 0, len(blocks)*2-1)
+	for i, b := range blocks {
+		if i > 0 {
+			parts = append(parts, strings.Repeat(" ", gap))
+		}
+		parts = append(parts, b)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+}
+
+// roleStatusText 把 Agent 状态映射为英文短文本，用于卡片状态行。
+func roleStatusText(s enums.RoleStatus) string {
+	switch s {
+	case enums.RoleStatusActive:
+		return "Running"
+	case enums.RoleStatusDone:
+		return "Done"
+	case enums.RoleStatusWaiting:
+		return "Waiting"
+	case enums.RoleStatusError:
+		return "Error"
+	default:
+		return "Idle"
+	}
+}
+
+// roleTypeText 把角色类型映射为展示用短文本，作为卡片的兜底副标题。
+func roleTypeText(t enums.RoleType) string {
+	switch t {
+	case enums.RoleTypeMeta:
+		return "Orchestrator"
+	case enums.RoleTypeDomain:
+		return "Domain"
+	case enums.RoleTypeSubDomain:
+		return "SubDomain"
+	case enums.RoleTypeFixed:
+		return "Fixed"
+	case enums.RoleTypeDynamic:
+		return "Dynamic"
+	default:
+		return "Agent"
+	}
 }
 
 // agentTreePrefix 根据节点深度与兄弟关系生成树状连接符前缀（如 ├─ / └─ / │  ）。
@@ -424,22 +606,6 @@ func agentRoleColor(roleType enums.RoleType) string {
 		return cAssist
 	default:
 		return cInfo
-	}
-}
-
-// agentStatusBadge 将 Agent 状态渲染为短标签徽章，用于 Agent 编排栏。
-func agentStatusBadge(styles *Styles, status enums.RoleStatus) string {
-	switch status {
-	case enums.RoleStatusActive:
-		return styles.BadgeWarn.Render(" 运行 ")
-	case enums.RoleStatusDone:
-		return styles.BadgeOk.Render(" 完成 ")
-	case enums.RoleStatusError:
-		return styles.BadgeWarn.Render(" 错误 ")
-	case enums.RoleStatusWaiting:
-		return styles.Badge.Render(" 等待 ")
-	default:
-		return styles.Badge.Render(" 空闲 ")
 	}
 }
 

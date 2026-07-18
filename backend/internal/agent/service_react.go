@@ -428,12 +428,12 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 	success := ev.Kind != eventkind.Error
 	// 工具调用事件：直接记录工具执行事件。
 	if ev.Kind == "tool_call" || ev.Kind == eventkind.ToolCall {
-		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, ev.Message, ev.Kind, ev.Tool, "", "", "", success)
+		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, ev.Message, ev.Kind, ev.Tool, toolArgsLabel(ev.Detail), "", "", success)
 		return
 	}
-	// 工具结果事件：尝试解析 Detail 中的 output 与 error 字段。
+	// 工具结果事件：尝试解析 Detail 中的 output、error 与 path 字段。
 	if ev.Kind == "tool_result" || ev.Kind == eventkind.ToolResult {
-		var output, toolErr string
+		var output, toolErr, toolPath string
 		if ev.Detail != "" {
 			var detail map[string]any
 			// 解析 JSON 详情，忽略解析失败的情况。
@@ -444,18 +444,40 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 				if v, ok := detail["error"].(string); ok {
 					toolErr = v
 				}
+				// path 由工具执行器填充（如 ReadFile 的文件路径、HTTPGet 的 URL），
+				// 供 TUI 在工具行显示操作对象。
+				if v, ok := detail["path"].(string); ok {
+					toolPath = v
+				}
 			}
 		}
-		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, ev.Message, ev.Kind, ev.Tool, "", output, toolErr, success)
+		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, ev.Message, ev.Kind, ev.Tool, toolPath, output, toolErr, success)
 		return
 	}
 	// 其他类型事件作为进度事件记录。
 	s.store.addEvent(session, eventkind.Progress, ev.Agent, ev.Message, ev.Kind, ev.Tool, "", "", "", success)
 }
 
+// toolArgsLabel 从工具调用参数 JSON 中提取一个简短的展示标签（路径/命令/URL 等），
+// 供 TUI 在工具调用行中显示操作对象；无法解析时返回空串。
+func toolArgsLabel(argsJSON string) string {
+	if argsJSON == "" {
+		return ""
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return ""
+	}
+	for _, k := range []string{"path", "command", "url", "pattern", "dir", "query", "file"} {
+		if v, ok := args[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // runSession 为新创建的会话执行 ReAct 主循环。
-func (s *ReactService) runSession(session *reactInternalSession) {
-	// 获取会话上下文；若不存在则使用 Background。
+func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会话上下文；若不存在则使用 Background。
 	ctx := sessionContext(session)
 	// 会话结束后清理临时目录并淘汰已完成会话。
 	defer s.finalizeSession(session)

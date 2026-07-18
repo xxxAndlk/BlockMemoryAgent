@@ -170,11 +170,11 @@ func TestEventChatItemVerboseOutputTruncated(t *testing.T) {
 	if !ok {
 		t.Fatal("RunCommand 事件应被展示")
 	}
-	if !strings.Contains(detailCompact, "line-0") || !strings.Contains(detailCompact, "line-19") {
-		t.Fatalf("compact detail 应包含前 20 行，got: %s", detailCompact)
+	if !strings.Contains(detailCompact, "line-0") || !strings.Contains(detailCompact, "line-4") {
+		t.Fatalf("compact detail 应包含前 5 行，got: %s", detailCompact)
 	}
-	if strings.Contains(detailCompact, "line-20") {
-		t.Fatalf("compact detail 不应包含第 20 行及以后，got: %s", detailCompact)
+	if strings.Contains(detailCompact, "line-5") {
+		t.Fatalf("compact detail 不应包含第 5 行及以后，got: %s", detailCompact)
 	}
 	if !strings.Contains(detailCompact, "  ...") {
 		t.Fatalf("compact detail 应有省略提示，got: %s", detailCompact)
@@ -340,5 +340,94 @@ func TestFirstMessageFallbackWhenSessionMissingUserMessage(t *testing.T) {
 	}
 	if !strings.Contains(view, "hello fallback") {
 		t.Fatalf("pendingFirstMessage 内容应在对话区可见，got:\n%s", view)
+	}
+}
+
+// TestChatItemsMergeToolCallPairs 验证相邻的 [●] 工具调用行与同工具的 [✓] 结果行
+// 被合并为单条结果行；未等到结果的 [●] 行保留。
+func TestChatItemsMergeToolCallPairs(t *testing.T) {
+	now := time.Now()
+	s := &server.Session{
+		Messages: []types.ChatMessage{
+			{Role: enums.ChatRoleUser, Content: "跑个命令", Timestamp: now},
+		},
+		Events: []server.SessionEvent{
+			{Type: "progress", Kind: "tool_call", Tool: "RunCommand", ToolPath: "go build ./...", Message: "调用工具 RunCommand", Timestamp: now.Add(time.Second)},
+			{Type: "tool_exec", Kind: "tool_result", Tool: "RunCommand", ToolPath: "go build ./...", Message: "工具结果 RunCommand", ToolOutput: "ok", Success: true, Timestamp: now.Add(2 * time.Second)},
+			{Type: "progress", Kind: "tool_call", Tool: "WriteFile", ToolPath: "a.go", Message: "调用工具 WriteFile", Timestamp: now.Add(3 * time.Second)},
+		},
+	}
+	items := chatItems(s, true)
+	// 用户消息 + 合并后的 RunCommand 结果行 + 仍在执行的 WriteFile [●] 行
+	if len(items) != 3 {
+		t.Fatalf("合并后应有 3 条，got %d: %+v", len(items), titlesOf(items))
+	}
+	if !strings.HasPrefix(items[1].title, "[✓] RunCommand") {
+		t.Fatalf("RunCommand 应合并为单条 [✓] 结果行，got: %s", items[1].title)
+	}
+	if !strings.Contains(items[1].detail, "ok") {
+		t.Fatalf("合并后的结果行应保留输出详情，got: %s", items[1].detail)
+	}
+	if strings.Contains(items[1].detail, "工具结果") {
+		t.Fatalf("合并后的结果行不应包含噪声文案，got: %s", items[1].detail)
+	}
+	if !strings.HasPrefix(items[2].title, "[●] WriteFile") {
+		t.Fatalf("未等到结果的 WriteFile 应保留 [●] 行，got: %s", items[2].title)
+	}
+}
+
+// TestChatItemsAgentDoneAsAssistant 验证 agent_done 事件转为 assistant 条目，
+// 且与相邻重复 Assistant 消息去重（恢复历史会话场景）。
+func TestChatItemsAgentDoneAsAssistant(t *testing.T) {
+	now := time.Now()
+	answer := "任务完成，报告已写入 workspace/report.md"
+	s := &server.Session{
+		Messages: []types.ChatMessage{
+			{Role: enums.ChatRoleUser, Content: "写个报告", Timestamp: now},
+			{Role: enums.ChatRoleAssistant, Content: answer, Timestamp: now.Add(time.Second)},
+		},
+		Events: []server.SessionEvent{
+			{Type: "agent_done", Agent: "MetaAgent", Message: answer, Timestamp: now.Add(2 * time.Second)},
+		},
+	}
+	items := chatItems(s, true)
+	if len(items) != 2 {
+		t.Fatalf("同一答复只应出现一次（用户 + assistant），got %d: %+v", len(items), titlesOf(items))
+	}
+	if items[1].isEvent || items[1].role != enums.ChatRoleAssistant {
+		t.Fatalf("答复应以 assistant 条目展示，got: %+v", items[1])
+	}
+
+	// 无历史消息时（进行中的会话），agent_done 单独作为 assistant 条目出现。
+	s2 := &server.Session{
+		Messages: []types.ChatMessage{
+			{Role: enums.ChatRoleUser, Content: "写个报告", Timestamp: now},
+		},
+		Events: []server.SessionEvent{
+			{Type: "agent_done", Agent: "MetaAgent", Message: answer, Timestamp: now.Add(time.Second)},
+		},
+	}
+	items2 := chatItems(s2, true)
+	if len(items2) != 2 {
+		t.Fatalf("agent_done 应转为 assistant 条目，got %d: %+v", len(items2), titlesOf(items2))
+	}
+	if items2[1].title != answer {
+		t.Fatalf("assistant 条目应直接展示答复内容（无前缀），got: %s", items2[1].title)
+	}
+}
+
+// TestChatItemsClarifyPrefixStripped 验证澄清答复的内部标记前缀不在对话区展示。
+func TestChatItemsClarifyPrefixStripped(t *testing.T) {
+	s := &server.Session{
+		Messages: []types.ChatMessage{
+			{Role: enums.ChatRoleUser, Content: "[澄清答复] 用 PostgreSQL", Timestamp: time.Now()},
+		},
+	}
+	items := chatItems(s, true)
+	if len(items) != 1 {
+		t.Fatalf("应有 1 条，got %d", len(items))
+	}
+	if items[0].title != "> 用 PostgreSQL" {
+		t.Fatalf("澄清答复前缀应被剥离，got: %s", items[0].title)
 	}
 }

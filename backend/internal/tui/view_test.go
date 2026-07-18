@@ -44,32 +44,30 @@ func TestAgentTreePrefix(t *testing.T) {
 	}
 }
 
-// TestAgentCardLineRendersGoalAndBadge 验证 Agent 卡片行能正确渲染名称、状态徽章与目标。
-func TestAgentCardLineRendersGoalAndBadge(t *testing.T) {
+// TestBuildAgentCardRendersStatusAndGoal 验证 Agent 卡片能正确渲染名称、状态文本与目标。
+func TestBuildAgentCardRendersStatusAndGoal(t *testing.T) {
 	m := &Model{
 		styles:         NewStyles(),
 		taskBriefCache: NewTaskBriefCache(),
 	}
-	// 构造一个包含 MetaAgent 与 UI 领域 Agent 的扁平节点列表。
-	nodes := []agentTreeNode{
-		{depth: 0, name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive, createdAt: time.Now()},
-		{depth: 1, name: "UI", roleType: enums.RoleTypeDomain, status: enums.RoleStatusDone, goal: "设计后台前端页面", createdAt: time.Now()},
+	// 构造一个已完成、带目标的 UI 领域 Agent 节点。
+	node := agentTreeNode{
+		depth:     1,
+		name:      "UI",
+		roleType:  enums.RoleTypeDomain,
+		status:    enums.RoleStatusDone,
+		goal:      "设计后台前端页面",
+		createdAt: time.Now(),
 	}
-	lines := m.agentCardLine(nodes[1], 1, 80)
-	// 有目标的 Agent 应渲染两行。
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 lines for agent with goal, got %d: %v", len(lines), lines)
+	card := m.buildAgentCard(node, 40)
+	if !strings.Contains(card, "UI") {
+		t.Errorf("card missing agent name UI:\n%s", card)
 	}
-	first := lines[0]
-	if !strings.Contains(first, "UI") {
-		t.Errorf("first line missing agent name UI: %s", first)
+	if !strings.Contains(card, "Done") {
+		t.Errorf("card missing status Done:\n%s", card)
 	}
-	if !strings.Contains(first, "完成") {
-		t.Errorf("first line missing status badge 完成: %s", first)
-	}
-	second := lines[1]
-	if !strings.Contains(second, "设计后台前端页面") {
-		t.Errorf("second line missing goal: %s", second)
+	if !strings.Contains(card, "设计后台前端页面") {
+		t.Errorf("card missing goal:\n%s", card)
 	}
 }
 

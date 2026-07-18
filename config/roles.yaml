@@ -52,7 +52,7 @@ meta_agent:
 domain_agent:
   model_config: &domain_model
     provider: anthropic
-    model: kimi-for-coding
+    model: k3
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.5
@@ -107,7 +107,7 @@ fixed_roles:
     skills: ["代码编写", "代码审查", "重构", "单元测试", "调试"]
     model_config: &coding_model
       provider: anthropic
-      model: kimi-for-coding
+      model: k3
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4

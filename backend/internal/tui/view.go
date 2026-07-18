@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
@@ -118,9 +119,11 @@ func (m Model) renderRightPanels(w, h int) string {
 	}
 
 	// 右侧面板始终同时展示计划与 Agent 编排两个面板。
+	// 参考“新TUI页.png”：Agent 编排为卡片式布局，需要更多纵向空间，
+	// 因此计划面板占 45%、Agent 编排占 55%。
 	// 即使终端高度紧张，也优先保证两个面板都有可见区域（标题+至少一行内容），
 	// 避免计划栏被完全丢弃导致"内容没有显示"。
-	topH := h * 55 / 100
+	topH := h * 45 / 100
 	if topH < 3 {
 		topH = 3
 	}
@@ -131,7 +134,7 @@ func (m Model) renderRightPanels(w, h int) string {
 	// 极小高度下两者之和可能超过 h，按 h 裁剪并确保计划面板至少 2 行。
 	if topH+bottomH > h {
 		if h >= 5 {
-			topH = h * 55 / 100
+			topH = h * 45 / 100
 			if topH < 3 {
 				topH = 3
 			}
@@ -155,8 +158,8 @@ func (m Model) renderRightPanels(w, h int) string {
 
 // renderPlanPanel 渲染右侧计划面板，展示目标、进度条与任务列表。
 func (m Model) renderPlanPanel(w, h int) string {
-	// 构建标题栏。
-	titleLeft := "执行计划"
+	// 构建标题栏（参考"新TUI页.png"：带 📋 图标）。
+	titleLeft := "📋 执行计划"
 	titleRight := "[P] 关闭"
 	titlePadding := w - lipgloss.Width(titleLeft) - lipgloss.Width(titleRight) - 2
 	if titlePadding < 1 {
@@ -221,39 +224,120 @@ func (m Model) renderPlanPanel(w, h int) string {
 		snap.Tasks = tasks
 	}
 
-	// 渲染计划内容行。
-	lines := m.formatPlanSnapshot(innerW, snap)
+	// 渲染计划内容行。内容区高度受 PanelBox 限制（Height(h-3)），
+	// 超长任务列表在 formatPlanSnapshot 内裁剪，保证底部"总体进度/预计剩余"始终可见。
+	maxBody := h - 3
+	if maxBody < 1 {
+		maxBody = 1
+	}
+	lines := m.formatPlanSnapshot(innerW, snap, maxBody)
 	body := strings.Join(lines, "\n")
 	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
 }
 
 // formatPlanSnapshot 把看板快照渲染成计划面板内的文本行。
-func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
-	// 统计已完成数与当前进行中的任务索引。
+// 布局参考"新TUI页.png"：
+//   - 上方为编号任务列表：序号 + 标题 + 彩色状态单元格 + 右对齐 hh:mm:ss 时长；
+//   - 底部固定为"总体进度"进度条与"预计剩余"时间，内容不足时贴底显示；
+//   - 任务数超出 maxLines 时截断列表并追加"… 还有 N 项"，保证底部统计始终可见。
+func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot, maxLines int) []string {
+	// 统计已完成数与总时长（用于预计剩余时间）。
 	done, total := 0, len(snap.Tasks)
-	current := -1
-	for i, t := range snap.Tasks {
+	var doneElapsed time.Duration
+	for _, t := range snap.Tasks {
 		if t.Status == board.TaskDone {
 			done++
+			doneElapsed += taskElapsed(t)
 		}
-		if current == -1 && (t.Status == board.TaskInProgress || t.Status == board.TaskBlocked) {
-			current = i
-		}
-	}
-	// 没有明确进行中任务但还有未完成时，默认将 done 索引作为当前任务。
-	if current == -1 && total > 0 && done < total {
-		current = done
 	}
 
-	var lines []string
-	lines = append(lines, m.styles.Dim.Render("Goal: ")+truncate(snap.Goal, innerW-6))
-	// 计算完成百分比。
+	// 逐条渲染任务行。
+	var taskLines []string
+	for i, t := range snap.Tasks {
+		taskLines = append(taskLines, m.planTaskLine(i, t, total, innerW))
+	}
+
+	// 底部统计区：空行 + 总体进度 + 预计剩余。
+	footer := m.planFooterLines(innerW, done, total, doneElapsed)
+
+	// 高度预算：footer 固定保留，任务列表按剩余空间裁剪。
+	budget := maxLines - len(footer)
+	if budget < 0 {
+		budget = 0
+	}
+	switch {
+	case len(taskLines) > budget:
+		if budget == 0 {
+			taskLines = nil
+		} else {
+			keep := budget - 1
+			if keep < 0 {
+				keep = 0
+			}
+			omitted := len(taskLines) - keep
+			taskLines = append(taskLines[:keep], m.styles.Dim.Render(fmt.Sprintf("… 还有 %d 项", omitted)))
+		}
+	}
+
+	lines := append([]string{}, taskLines...)
+	// 内容不足一屏时插入空行，让底部统计贴底（对齐设计稿）。
+	if pad := maxLines - len(lines) - len(footer); pad > 0 {
+		for i := 0; i < pad; i++ {
+			lines = append(lines, "")
+		}
+	}
+	lines = append(lines, footer...)
+	return lines
+}
+
+// planTaskLine 渲染单条计划任务：序号 + 标题 + 彩色状态单元格 + 右对齐时长。
+func (m Model) planTaskLine(i int, t board.SubTask, total, innerW int) string {
+	// 序号列宽按任务总数对齐（如 10 条以上占 2 列）。
+	numW := len(fmt.Sprintf("%d", total))
+	if numW < 1 {
+		numW = 1
+	}
+	num := fmt.Sprintf("%-*d", numW, i+1)
+
+	// 状态单元格：彩色图标 + 英文状态文本，固定 9 列（"● Running"）。
+	icon := statusIcon(string(t.Status))
+	color := statusColor(string(t.Status))
+	statusText := strings.TrimSpace(planStatusText(t.Status))
+	statusCell := lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(fmt.Sprintf("%s %-7s", icon, statusText))
+
+	// 时长列：待处理任务显示占位符，其余显示 hh:mm:ss。
+	elapsed := "--:--:--"
+	if t.Status != board.TaskPending {
+		elapsed = taskElapsedHMS(t)
+	}
+
+	// 标题可用宽度 = 总宽 - 序号 - 状态 - 时长 - 3 个间隔空格。
+	titleAvail := innerW - numW - 9 - 8 - 3
+	if titleAvail < 6 {
+		titleAvail = 6
+	}
+	// P3-3：过长标题先经 LLM 语义精简，再按显示宽度截断。
+	title := truncate(m.summarizeTaskTitle(t.Title), titleAvail)
+	pad := titleAvail - runewidth.StringWidth(title)
+	if pad < 0 {
+		pad = 0
+	}
+	titleStyled := title
+	if t.Status == board.TaskDone {
+		titleStyled = m.styles.Dim.Render(title)
+	}
+	return m.styles.Dim.Render(num) + " " + titleStyled + strings.Repeat(" ", pad) + " " + statusCell + " " + m.styles.Dim.Render(elapsed)
+}
+
+// planFooterLines 渲染计划面板底部的总体进度条与预计剩余时间。
+func (m Model) planFooterLines(innerW, done, total int, doneElapsed time.Duration) []string {
+	// 完成百分比。
 	pct := 0
 	if total > 0 {
 		pct = done * 100 / total
 	}
-	// 进度条宽度。
-	barW := innerW - 8
+	// 进度条宽度 = 总宽 - 标签(8) - 百分比(4) - 2 个间隔空格。
+	barW := innerW - 8 - 4 - 2
 	if barW < 4 {
 		barW = 4
 	}
@@ -261,47 +345,23 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot) []string {
 	if total > 0 {
 		filled = barW * done / total
 	}
-	bar := strings.Repeat("█", filled) + strings.Repeat("─", barW-filled)
-	lines = append(lines, fmt.Sprintf("%s %d%%", bar, pct))
-	lines = append(lines, "")
+	bar := lipgloss.NewStyle().Foreground(lipgloss.Color(cSub)).Render(strings.Repeat("█", filled)) +
+		m.styles.Dim.Render(strings.Repeat("░", barW-filled))
+	progress := m.styles.Dim.Render("总体进度") + " " + bar + " " + m.styles.StatValue.Render(fmt.Sprintf("%d%%", pct))
 
-	// 逐条渲染任务。
-	for i, t := range snap.Tasks {
-		icon := statusIcon(string(t.Status))
-		prefix := fmt.Sprintf("%d. ", i+1)
-		statusText := planStatusText(t.Status)
-		var elapsed string
-		if t.Status == board.TaskPending {
-			elapsed = "--:--"
-		} else {
-			elapsed = formatTaskElapsed(t)
-		}
-		meta := fmt.Sprintf("%s %s", icon+statusText, elapsed)
-		// 保留序号+标题，右侧对齐状态与耗时
-		// P3-3：过长标题先经 LLM 语义精简，再按显示宽度截断
-		briefTitle := m.summarizeTaskTitle(t.Title)
-		titlePart := prefix + briefTitle
-		avail := innerW - lipgloss.Width(meta) - 1
-		if avail < lipgloss.Width(prefix)+4 {
-			avail = lipgloss.Width(prefix) + 4
-		}
-		titlePart = truncate(titlePart, avail)
-		padding := innerW - lipgloss.Width(titlePart) - lipgloss.Width(meta)
-		if padding < 1 {
-			padding = 1
-		}
-		line := titlePart + strings.Repeat(" ", padding) + meta
-		// 当前任务高亮，已完成任务暗淡，其他任务默认。
-		if i == current {
-			line = m.styles.StatValue.Render(truncate(line, innerW))
-		} else if t.Status == board.TaskDone {
-			line = m.styles.Dim.Render(truncate(line, innerW))
-		} else {
-			line = truncate(line, innerW)
-		}
-		lines = append(lines, line)
+	// 预计剩余：按已完成任务的平均耗时 × 剩余任务数估算；无完成样本时显示占位符。
+	estimate := "--:--:--"
+	remaining := total - done
+	switch {
+	case total > 0 && remaining == 0:
+		estimate = "00:00:00"
+	case done > 0:
+		avg := doneElapsed / time.Duration(done)
+		estimate = formatDurationHMS(avg * time.Duration(remaining))
 	}
-	return lines
+	rest := m.styles.Dim.Render("预计剩余: ") + m.styles.StatValue.Render(estimate)
+
+	return []string{"", progress, rest}
 }
 
 // deriveDomainTaskStatuses 从 Agent 拓扑中汇总每个领域的实际状态，
@@ -354,8 +414,8 @@ func planTaskDomain(title string) string {
 	return strings.TrimSpace(parts[0])
 }
 
-// agentCardLine 渲染单个 Agent 卡片行，返回可能占多行的字符串切片。
-// 参考“新TUI页.png”设计：状态色点 + 按角色着色的名称 + 状态徽章 + 时间戳 + 任务描述。
+// Agent 编排面板采用卡片式布局（见 agent_tree_panel.go renderAgentsPanel）：
+// 状态色点 + 按角色着色的名称 + 状态文本 + 时间戳 + 任务描述。
 
 // statusColor 返回状态对应的颜色。
 func statusColor(status string) string {
@@ -529,11 +589,13 @@ func wrapToWidth(s string, width int) []string {
 }
 
 // displayDetailLines 返回详情行的实际渲染内容。
-// 工具输出（🔧 前缀）在主对话区最多展示 5 行，并追加 "    ..." 以保持 TUI 紧凑。
+// 工具结果详情（[✓]/[✗] 前缀的条目）在主对话区最多展示 8 行，超出折叠并追加提示，
+// 完整内容可在弹窗 / Ctrl+L 完整记录中查看。
 func displayDetailLines(title, detail string) []string {
 	lines := strings.Split(detail, "\n")
-	if strings.HasPrefix(title, "🔧") && len(lines) > 5 {
-		lines = lines[:5]
+	const maxLines = 8
+	if (strings.HasPrefix(title, "[✓] ") || strings.HasPrefix(title, "[✗] ")) && len(lines) > maxLines {
+		lines = lines[:maxLines]
 		lines = append(lines, "    ...")
 	}
 	return lines

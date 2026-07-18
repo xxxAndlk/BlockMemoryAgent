@@ -260,7 +260,8 @@ func chatItems(s *server.Session, compact bool) []chatItem {
 		var detail string
 		switch msg.Role {
 		case enums.ChatRoleUser:
-			title = "> " + content
+			// 澄清答复的内部标记前缀不展示，保持用户问题干净。
+			title = "> " + strings.TrimPrefix(content, "[澄清答复] ")
 		case enums.ChatRoleAssistant:
 			title = content
 			detail = ""
@@ -300,6 +301,17 @@ func chatItems(s *server.Session, compact bool) []chatItem {
 		if ev.Kind == "memory_recall" && !recallKeep[i] {
 			continue
 		}
+		// agent_done 是大模型最终答复：转为 assistant 条目，与 Assistant 消息同样式渲染
+		// （Markdown + Assistant 标签），避免 "MetaAgent 完成: " 前缀噪音；
+		// 恢复历史会话时同一答复已有 Assistant 消息，由后面的相邻去重消除重复。
+		if ev.Type == "agent_done" {
+			text := strings.TrimSpace(ev.Message)
+			if text == "" {
+				continue
+			}
+			items = append(items, chatItem{title: text, timestamp: ev.Timestamp, isEvent: false, role: enums.ChatRoleAssistant})
+			continue
+		}
 		title, detail, rawDetail, ok := eventChatItem(ev, compact)
 		if !ok {
 			continue
@@ -310,6 +322,10 @@ func chatItems(s *server.Session, compact bool) []chatItem {
 	sort.SliceStable(items, func(i, j int) bool {
 		return items[i].timestamp.Before(items[j].timestamp)
 	})
+
+	// 合并：把相邻的 [●] 工具调用行与同工具的 [✓]/[✗] 结果行合并为单条，
+	// 让每个工具调用在对话区只占一行；未等到结果的 [●] 行保留，表示仍在执行。
+	items = mergeToolCallPairs(items)
 
 	// 聚合：把连续的无详情非 verbose 工具完成事件合并为 [✓] ToolName × N，
 	// 大幅减少 ListDir/ReadFile 等高频工具在对话区的刷屏。
@@ -351,7 +367,70 @@ func chatItems(s *server.Session, compact bool) []chatItem {
 		}
 	}
 
+	// 去重：相邻且内容相同的 assistant 条目只保留第一条。
+	// 恢复历史会话时，最终答复会同时以 Assistant 消息（历史）与 agent_done 转换条目出现；
+	// 遇到新的用户消息则重置比较，避免误删多轮对话中的正当重复。
+	{
+		deduped := make([]chatItem, 0, len(items))
+		lastAssistant := ""
+		for _, it := range items {
+			if !it.isEvent && it.role == enums.ChatRoleAssistant {
+				norm := normalizeChatText(it.title)
+				if norm != "" && norm == lastAssistant {
+					continue
+				}
+				lastAssistant = norm
+			} else if !it.isEvent && it.role == enums.ChatRoleUser {
+				lastAssistant = ""
+			}
+			deduped = append(deduped, it)
+		}
+		items = deduped
+	}
+
 	return items
+}
+
+// mergeToolCallPairs 把相邻的 [●] 工具调用行与同工具的 [✓]/[✗] 结果行合并为单条结果行，
+// 让每个工具调用在对话区只占一行（标题随结果状态确定）；未等到结果的 [●] 行保留，
+// 表示工具仍在执行。
+func mergeToolCallPairs(items []chatItem) []chatItem {
+	out := make([]chatItem, 0, len(items))
+	for i := 0; i < len(items); i++ {
+		tool, ok := toolRowStatus(items[i], "●")
+		if ok && i+1 < len(items) {
+			if resTool, done := toolRowAnyResult(items[i+1]); done && resTool == tool {
+				// 丢弃 [●] 行，只保留结果行（含详情）。
+				out = append(out, items[i+1])
+				i++
+				continue
+			}
+		}
+		out = append(out, items[i])
+	}
+	return out
+}
+
+// toolRowStatus 提取工具行的工具名，仅当条目是指定状态的事件工具行时返回 true。
+func toolRowStatus(it chatItem, status string) (string, bool) {
+	if !it.isEvent {
+		return "", false
+	}
+	rest, ok := strings.CutPrefix(it.title, "["+status+"] ")
+	if !ok {
+		return "", false
+	}
+	tool, _, _ := strings.Cut(rest, ":")
+	tool = strings.TrimSpace(tool)
+	return tool, tool != ""
+}
+
+// toolRowAnyResult 提取工具结果行（[✓] 或 [✗]）的工具名。
+func toolRowAnyResult(it chatItem) (string, bool) {
+	if tool, ok := toolRowStatus(it, "✓"); ok {
+		return tool, true
+	}
+	return toolRowStatus(it, "✗")
 }
 
 // normalizeChatText 把聊天文本归一化，用于去重比较：
@@ -499,7 +578,7 @@ var verboseTools = map[string]bool{
 
 // compactToolOutputLines 是 verbose 工具输出在主对话区最多展示的行数，
 // 超出部分折叠，可在弹窗/Ctrl+L 完整记录中查看。
-const compactToolOutputLines = 20
+const compactToolOutputLines = 5
 
 // truncateToolOutput 截断工具输出到指定行数，超出部分显示 "  ..." 提示。
 func truncateToolOutput(output string, maxLines int) string {
@@ -537,14 +616,20 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		if !ev.Success && ev.Type == "tool_exec" {
 			status = "✗"
 		}
-		title = fmt.Sprintf("[%s] %s: %s", status, tool, ev.ToolPath)
-		if title == fmt.Sprintf("[%s] %s: ", status, tool) {
-			title = fmt.Sprintf("[%s] %s", status, tool)
+		title = fmt.Sprintf("[%s] %s", status, tool)
+		if strings.TrimSpace(ev.ToolPath) != "" {
+			title += ": " + ev.ToolPath
+		}
+		// 工具注册表产生的固定文案（"调用工具 X"/"工具结果 X"）是噪声，不展示；
+		// 其他来源的 Message 仍保留在完整记录中。
+		msg := ev.Message
+		if strings.HasPrefix(msg, "调用工具 ") || strings.HasPrefix(msg, "工具结果 ") {
+			msg = ""
 		}
 		// rawDetail 始终保留完整信息，用于弹窗/完整记录面板
 		var full strings.Builder
-		if ev.Message != "" {
-			full.WriteString(ev.Message)
+		if msg != "" {
+			full.WriteString(msg)
 			full.WriteByte('\n')
 		}
 		if ev.ToolOutput != "" {
@@ -559,21 +644,12 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		}
 		rawDetail = strings.TrimRight(full.String(), "\n")
 
-		// compact detail：verbose 工具展示 Message + 截断 Output + Error；
+		// compact detail：verbose 工具只展示截断后的输出（完整内容见完整记录）；
 		// 非 verbose 工具仅展示 Error，避免输出刷屏但保证错误可见。
 		var compactDetail strings.Builder
-		if verboseTools[tool] {
-			if ev.Message != "" {
-				compactDetail.WriteString(ev.Message)
-				compactDetail.WriteByte('\n')
-			}
-			if ev.ToolOutput != "" {
-				compactDetail.WriteString("结果:\n")
-				compactDetail.WriteString(truncateToolOutput(stripANSI(ev.ToolOutput), compactToolOutputLines))
-				if compactDetail.Len() > len("结果:\n") {
-					compactDetail.WriteByte('\n')
-				}
-			}
+		if verboseTools[tool] && ev.ToolOutput != "" {
+			compactDetail.WriteString(truncateToolOutput(stripANSI(ev.ToolOutput), compactToolOutputLines))
+			compactDetail.WriteByte('\n')
 		}
 		if ev.ToolError != "" {
 			compactDetail.WriteString("错误: ")
@@ -604,14 +680,6 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 			agent = "Assistant"
 		}
 		title = agent + ": " + ev.Message
-		return title, "", title, true
-	// Agent 完成事件。
-	case ev.Type == "agent_done":
-		agent := ev.Agent
-		if agent == "" {
-			agent = "Agent"
-		}
-		title = agent + " 完成: " + ev.Message
 		return title, "", title, true
 	// 系统事件：只展示会话完成总结。
 	case ev.Type == "system":
@@ -785,19 +853,20 @@ func taskElapsed(t board.SubTask) time.Duration {
 	return end.Sub(t.CreatedAt)
 }
 
-// formatTaskElapsed 格式化任务已用时长；看板时间戳缺失时返回占位符而非异常大值。
-func formatTaskElapsed(t board.SubTask) string {
+// taskElapsedHMS 格式化任务已用时长为 hh:mm:ss；看板时间戳缺失时返回占位符而非异常大值。
+func taskElapsedHMS(t board.SubTask) string {
 	if t.CreatedAt.IsZero() {
-		return "--:--"
+		return "--:--:--"
 	}
 	if (t.Status == board.TaskDone || t.Status == board.TaskFailed) && t.UpdatedAt.IsZero() {
-		return "--:--"
+		return "--:--:--"
 	}
-	return formatDurationShort(taskElapsed(t))
+	return formatDurationHMS(taskElapsed(t))
 }
 
-// formatDurationShort 把时长格式化为 mm:ss 或 hh:mm:ss。
-func formatDurationShort(d time.Duration) string {
+// formatDurationHMS 把时长固定格式化为 hh:mm:ss（不足 1 小时也补前导零），
+// 对齐"新TUI页.png"设计稿中执行计划面板的时长列。
+func formatDurationHMS(d time.Duration) string {
 	if d < 0 {
 		d = 0
 	}
@@ -805,10 +874,7 @@ func formatDurationShort(d time.Duration) string {
 	h := int(d.Hours())
 	m := int(d.Minutes()) % 60
 	s := int(d.Seconds()) % 60
-	if h > 0 {
-		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
-	}
-	return fmt.Sprintf("%02d:%02d", m, s)
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
 // statusIcon 将状态字符串映射为展示图标，用于计划栏、Agent 栏等。
@@ -829,7 +895,6 @@ func statusIcon(status string) string {
 	}
 }
 
-// agentStatusBadge 把 Agent 状态渲染成短标签徽章，用于 Agent 编排栏。
 // formatTopBar 按 v2.0 格式渲染顶部状态栏：
 // 示例输出：BlockMemoryAgent > {sessionID}  ●running  {N} agents active  in:{in} out:{out}
 func formatTopBar(styles *Styles, sessionID, status string, agentCount, inTokens, outTokens int) string {
