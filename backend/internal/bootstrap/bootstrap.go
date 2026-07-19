@@ -217,7 +217,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		subAgentTimeout = 0 // 负数表示不限制
 	}
 	subAgentDispatcher := subagent.NewDispatcher(roleRegistry, &reactModelFactory{modelFactory}, toolRegistry, sharedMailbox, memoryPipeline)
-	subAgentDispatcher.WithTimeout(subAgentTimeout).WithLoopConfig(reactCfg.LoopConfig())
+	subAgentDispatcher.WithTimeout(subAgentTimeout).WithLoopConfig(reactCfg.LoopConfig()).WithBlockMemorySearcher(pgStore)
 	subAgentDispatcher.RegisterCallTool(toolRegistry)
 
 	// 第十六步：创建 ReAct Agent 服务。

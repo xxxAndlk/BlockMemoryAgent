@@ -99,7 +99,16 @@ func (m Model) renderTopBar(w int) string {
 	statusDot := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor)).Render(statusIcon)
 	sessionStr := m.styles.TopBarLabel.Render("Session") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render(sessionID)
 	statusStr := m.styles.TopBarLabel.Render("Status") + m.styles.TopBarSep.Render(": ") + statusDot + " " + m.styles.TopBarValue.Render(status)
-	timeStr := m.styles.TopBarLabel.Render("Time") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render("00:00:00")
+	// 运行时长：从会话开始时间实时计算，已结束的会话冻结在结束时刻。
+	elapsed := "00:00:00"
+	if s != nil && !s.StartedAt.IsZero() {
+		end := time.Now()
+		if s.EndedAt != nil {
+			end = *s.EndedAt
+		}
+		elapsed = formatDurationHMS(end.Sub(s.StartedAt))
+	}
+	timeStr := m.styles.TopBarLabel.Render("Time") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render(elapsed)
 	right := lipgloss.JoinHorizontal(lipgloss.Left, sessionStr, "  ", statusStr, "  ", timeStr)
 
 	// 左右分栏，中间用空白填充。
@@ -180,20 +189,21 @@ func (m Model) renderPlanPanel(w, h int) string {
 		snap = m.boardSnapshot(s.ID)
 	}
 
-	// 没有看板时（如 direct_tool），用会话目标生成一个最小计划视图，
+	// 没有看板时（如 direct_tool），用当前轮任务生成一个最小计划视图，
 	// 避免右侧面板出现空白的 "(no plan)"。
 	if len(snap.Tasks) == 0 {
 		goal := ""
 		status := board.TaskDone
 		if s != nil {
-			goal = s.Goal
-			if goal == "" && len(s.Messages) > 0 {
-				for _, msg := range s.Messages {
-					if msg.Role == enums.ChatRoleUser {
-						goal = strings.TrimSpace(msg.Content)
-						break
-					}
+			// 当前轮任务：取最后一条用户消息（多轮会话中反映最新任务），回退到会话 Goal。
+			for i := len(s.Messages) - 1; i >= 0; i-- {
+				if s.Messages[i].Role == enums.ChatRoleUser {
+					goal = strings.TrimSpace(s.Messages[i].Content)
+					break
 				}
+			}
+			if goal == "" {
+				goal = s.Goal
 			}
 			switch s.Status {
 			case enums.SessionStatusRunning:
@@ -208,6 +218,30 @@ func (m Model) renderPlanPanel(w, h int) string {
 		snap = board.Snapshot{
 			Goal:  goal,
 			Tasks: []board.SubTask{{ID: "direct", Title: "直接执行", Status: status}},
+		}
+		// 有子 Agent 派发时，把每个派发的领域 Agent/助手追加为一行任务，
+		// 状态从会话事件流派生（运行中/完成/失败），保证任务面板随编排实时更新。
+		if s != nil {
+			for i, n := range deriveSubAgentNodes(s.Events) {
+				tStatus := board.TaskInProgress
+				switch n.status {
+				case enums.RoleStatusDone:
+					tStatus = board.TaskDone
+				case enums.RoleStatusError:
+					tStatus = board.TaskFailed
+				}
+				title := "派发 " + n.name
+				if n.goal != "" {
+					title += ": " + n.goal
+				}
+				snap.Tasks = append(snap.Tasks, board.SubTask{
+					ID:        fmt.Sprintf("sub-%d", i+1),
+					Title:     title,
+					Status:    tStatus,
+					CreatedAt: n.createdAt,
+					UpdatedAt: n.createdAt,
+				})
+			}
 		}
 	} else {
 		// 看板子任务状态可能未被后端及时更新，用 Agent 实例的真实状态覆盖，
@@ -505,9 +539,8 @@ func (m Model) renderShortcutBar(w int) string {
 		{"A", "Agents"},
 		{"L", "Logs"},
 		{"B", "Side Panel"},
-		{"M", "Memory"},
-		{"G", "Git Diff"},
-		{"S", "Settings"},
+		{"Tab", "对话区"},
+		{"Pg↑/Pg↓", "滚动"},
 		{"?", "Help"},
 		{"Ctrl+C", "Exit"},
 	}

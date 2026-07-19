@@ -144,3 +144,53 @@ func TestKnowledgeStore_Save_MetaMarshalError(t *testing.T) {
 		t.Fatalf("expected error wrapping 'marshal knowledge meta', got %v", err)
 	}
 }
+
+// TestSanitizeUTF8 验证存储层 UTF-8 清洗：NUL 字节被剥离（Postgres text/jsonb 拒绝 0x00），
+// 非法 UTF-8 序列被替换为 U+FFFD，合法文本原样保留。
+func TestSanitizeUTF8(t *testing.T) {
+	if got := sanitizeUTF8("a\x00b\x00c"); got != "abc" {
+		t.Fatalf("NUL 字节应被剥离，got %q", got)
+	}
+	if got := sanitizeUTF8("hello 世界"); got != "hello 世界" {
+		t.Fatalf("合法 UTF-8 不应改变，got %q", got)
+	}
+	if got := sanitizeUTF8(string([]byte{'a', 0xff, 'b'})); !strings.Contains(got, "�") {
+		t.Fatalf("非法 UTF-8 应被替换为 U+FFFD，got %q", got)
+	}
+	if got := sanitizeUTF8(""); got != "" {
+		t.Fatalf("空字符串应原样返回，got %q", got)
+	}
+}
+
+// TestSanitizeJSONValue 验证 jsonb 写入前的递归清洗：字符串值与 map 键中的
+// NUL 被剥离，嵌套结构与非字符串值保持不变，字面 "" 文本不受影响。
+func TestSanitizeJSONValue(t *testing.T) {
+	in := map[string]any{
+		"output": "line1\x00line2",
+		"ok":     true,
+		"n":      42,
+		"nested": map[string]any{"k\x00ey": "v\x00"},
+		"list":   []any{"a\x00", 1.5},
+	}
+	out := sanitizeJSONValue(in).(map[string]any)
+	if out["output"] != "line1line2" {
+		t.Fatalf("字符串值中的 NUL 应被剥离，got %q", out["output"])
+	}
+	if out["ok"] != true || out["n"] != 42 {
+		t.Fatal("非字符串值不应改变")
+	}
+	nested := out["nested"].(map[string]any)
+	if nested["key"] != "v" {
+		t.Fatalf("嵌套 map 的键与值都应被清洗，got %v", nested)
+	}
+	list := out["list"].([]any)
+	if list[0] != "a" || list[1] != 1.5 {
+		t.Fatalf("切片元素应被清洗，got %v", list)
+	}
+	// 字面 6 字符  文本是合法 ASCII，不应被破坏。
+	literal := map[string]any{"s": `\u0000`}
+	got := sanitizeJSONValue(literal).(map[string]any)
+	if got["s"] != `\u0000` {
+		t.Fatalf("字面 \u0000 文本不应被破坏，got %q", got["s"])
+	}
+}

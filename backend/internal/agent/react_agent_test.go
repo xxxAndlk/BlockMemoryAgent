@@ -300,3 +300,70 @@ func TestWindowMessages(t *testing.T) {
 		t.Fatal("未超限时不应裁剪")
 	}
 }
+
+// TestReActAgent_EmptyResponseNudged 验证模型返回空响应（无文本、无工具调用）时，
+// 不会被误判为"最终答复"导致任务静默中断，而是注入提示让模型继续。
+func TestReActAgent_EmptyResponseNudged(t *testing.T) {
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			// 第一条是空 assistant 消息（无 Parts），模拟端点异常/max_tokens 截断。
+			{Role: blades.RoleAssistant},
+			blades.AssistantMessage("real answer"),
+		},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	agent := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg))
+
+	res, err := agent.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("空响应后恢复不应返回错误: %v", err)
+	}
+	if res.Text != "real answer" {
+		t.Fatalf("expected 'real answer', got %q", res.Text)
+	}
+	if llm.calls != 2 {
+		t.Fatalf("空响应应触发一次额外 LLM 调用，got %d calls", llm.calls)
+	}
+	// 历史中应包含空响应提示消息，且不应残留空 assistant 消息。
+	foundNudge := false
+	for _, m := range res.History {
+		if m.Role == "user" && strings.Contains(m.Content, "上一条回复为空") {
+			foundNudge = true
+		}
+		if m.Role == "assistant" && strings.TrimSpace(m.Content) == "" && len(m.ToolCalls) == 0 {
+			t.Fatal("空 assistant 消息不应写入历史")
+		}
+	}
+	if !foundNudge {
+		t.Fatal("空响应后应向历史注入提示消息")
+	}
+}
+
+// TestReActAgent_EmptyResponseStreakFails 验证连续空响应达到上限后返回显式错误，
+// 而不是把空文本当作最终答复静默完成。
+func TestReActAgent_EmptyResponseStreakFails(t *testing.T) {
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			{Role: blades.RoleAssistant},
+			{Role: blades.RoleAssistant},
+			{Role: blades.RoleAssistant},
+			{Role: blades.RoleAssistant},
+		},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	agent := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg))
+
+	res, err := agent.Run(context.Background(), "hi")
+	if err == nil {
+		t.Fatal("连续空响应达到上限后应返回错误")
+	}
+	if !strings.Contains(err.Error(), "empty responses") {
+		t.Fatalf("错误信息应说明是连续空响应，got: %v", err)
+	}
+	if res.Text != "" {
+		t.Fatal("出错时不应产生最终答复文本")
+	}
+	if llm.calls != maxEmptyResponses {
+		t.Fatalf("应在第 %d 次空响应后报错，got %d calls", maxEmptyResponses, llm.calls)
+	}
+}

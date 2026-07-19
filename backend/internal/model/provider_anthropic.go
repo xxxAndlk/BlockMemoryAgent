@@ -116,7 +116,8 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 	return &blades.ModelResponse{Message: msg}, nil
 }
 
-// NewStreaming 创建流式生成器（当前为简化实现，非真正流式）。
+// NewStreaming 创建真正的 SSE 流式生成器：
+// 中间产出增量文本块（驱动 UI 逐 token 渲染），最后一个产出值是累积完整的响应。
 //
 // 参数：
 //   - ctx: 上下文
@@ -124,15 +125,117 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 //
 // 返回：blades.Generator 流式生成器。
 func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
-	// 返回一个只产生一次完整响应的 generator
 	return func(yield func(*blades.ModelResponse, error) bool) {
-		// 调用普通生成
-		resp, err := p.Generate(ctx, req)
-		// 将结果交给消费者，若消费者不继续则直接返回
-		if !yield(resp, err) {
+		// 转换 messages
+		messages, err := p.convertMessages(req.Messages)
+		if err != nil {
+			yield(nil, fmt.Errorf("convert messages: %w", err))
 			return
 		}
+
+		// 构造与 Generate 一致的请求参数
+		params := anthropic.MessageNewParams{
+			Model:       anthropic.Model(p.modelName),
+			MaxTokens:   p.maxTokens,
+			Messages:    messages,
+			System:      p.convertSystem(req.Instruction),
+			Tools:       p.convertTools(req.Tools),
+			Temperature: anthropic.Float(p.temperature),
+		}
+
+		stream := p.client.Messages.NewStreaming(ctx, params)
+		defer stream.Close()
+
+		// 累积状态：全文文本、思考过程文本、按块序累积的工具调用、token 用量与结束原因。
+		var text strings.Builder
+		var thinking strings.Builder
+		type toolAcc struct {
+			id, name, input string
+		}
+		var tools []toolAcc
+		var inputTokens, outputTokens int64
+		stopReason := ""
+
+		for stream.Next() {
+			event := stream.Current()
+			switch ev := event.AsAny().(type) {
+			case anthropic.MessageStartEvent:
+				inputTokens = ev.Message.Usage.InputTokens
+			case anthropic.ContentBlockStartEvent:
+				// 工具调用块开始：记录 id/name，后续 input_json_delta 累积入参。
+				if ev.ContentBlock.Type == "tool_use" {
+					tools = append(tools, toolAcc{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name})
+				}
+			case anthropic.ContentBlockDeltaEvent:
+				switch ev.Delta.Type {
+				case "text_delta":
+					// 文本增量：累积并产出增量块（消费方停止则终止流）。
+					text.WriteString(ev.Delta.Text)
+					msg := blades.NewAssistantMessage(blades.StatusCompleted)
+					msg.Parts = []blades.Part{blades.TextPart{Text: ev.Delta.Text}}
+					if !yield(&blades.ModelResponse{Message: msg}, nil) {
+						return
+					}
+				case "thinking_delta":
+					// 思考过程增量：累积并产出携带累积思考文本的中间块（无文本 part），
+					// 消费方据此实时展示思考过程；思考内容不进入答复文本。
+					thinking.WriteString(ev.Delta.Thinking)
+					msg := blades.NewAssistantMessage(blades.StatusInProgress)
+					msg.Metadata = map[string]any{"thinking": thinking.String()}
+					if !yield(&blades.ModelResponse{Message: msg}, nil) {
+						return
+					}
+				case "input_json_delta":
+					// 工具入参增量：追加到最近开始的工具调用块。
+					if len(tools) > 0 {
+						tools[len(tools)-1].input += ev.Delta.PartialJSON
+					}
+				}
+			case anthropic.MessageDeltaEvent:
+				stopReason = string(ev.Delta.StopReason)
+				outputTokens = ev.Usage.OutputTokens
+			}
+		}
+		if err := stream.Err(); err != nil {
+			cleaned := strings.ReplaceAll(err.Error(), "/v1/messages", "")
+			yield(nil, fmt.Errorf("anthropic messages stream POST %s: %s", p.baseURL, cleaned))
+			return
+		}
+
+		// 产出累积完整的最终响应（文本 + 工具调用 + 用量 + 结束原因）。
+		msg := blades.NewAssistantMessage(blades.StatusCompleted)
+		parts := make([]blades.Part, 0, len(tools)+1)
+		if text.Len() > 0 {
+			parts = append(parts, blades.TextPart{Text: text.String()})
+		}
+		for _, t := range tools {
+			parts = append(parts, blades.NewToolPart(t.id, t.name, t.input))
+		}
+		msg.Parts = parts
+		msg.TokenUsage = blades.TokenUsage{
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+			TotalTokens:  inputTokens + outputTokens,
+		}
+		msg.FinishReason = stopReason
+		// 思考过程经 Metadata 传递（blades 无对应 Part 类型），截断防止超长。
+		if thinking.Len() > 0 {
+			msg.Metadata = map[string]any{"thinking": truncateThinking(thinking.String())}
+		}
+		yield(&blades.ModelResponse{Message: msg}, nil)
 	}
+}
+
+// thinkingMaxRunes 限制单次响应携带的思考过程文本长度，防止超长思考挤占展示与存储。
+const thinkingMaxRunes = 4000
+
+// truncateThinking 按 rune 数截断思考过程文本并追加省略提示。
+func truncateThinking(s string) string {
+	runes := []rune(s)
+	if len(runes) <= thinkingMaxRunes {
+		return s
+	}
+	return string(runes[:thinkingMaxRunes]) + "...(truncated)"
 }
 
 // convertSystem 将 blades 的 Instruction 消息转换为 Anthropic system blocks。
@@ -294,6 +397,7 @@ func (p *anthropicProvider) convertResponse(resp *anthropic.Message) *blades.Mes
 	parts := make([]blades.Part, 0, len(resp.Content))
 
 	// 遍历响应内容块
+	var thinking strings.Builder
 	for _, block := range resp.Content {
 		switch v := block.AsAny().(type) {
 		case anthropic.TextBlock:
@@ -303,11 +407,18 @@ func (p *anthropicProvider) convertResponse(resp *anthropic.Message) *blades.Mes
 			// 工具调用块
 			input := string(v.Input)
 			parts = append(parts, blades.NewToolPart(v.ID, v.Name, input))
+		case anthropic.ThinkingBlock:
+			// 思考过程块：累积后经 Metadata 传递（blades 无对应 Part 类型）
+			thinking.WriteString(v.Thinking)
 		}
 	}
 
 	// 设置消息 parts
 	msg.Parts = parts
+	// 思考过程截断后放入 Metadata，供上层作为"思考过程"事件展示。
+	if thinking.Len() > 0 {
+		msg.Metadata = map[string]any{"thinking": truncateThinking(thinking.String())}
+	}
 	// 设置 token 用量
 	msg.TokenUsage = blades.TokenUsage{
 		InputTokens:  resp.Usage.InputTokens,

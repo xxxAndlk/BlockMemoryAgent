@@ -136,3 +136,64 @@ func TestDispatcher_CannotCallUncallable(t *testing.T) {
 		t.Fatal("expected failure for non-callable role")
 	}
 }
+
+// mockBlockMemorySearcher 是一个模拟的块记忆检索器，返回固定记录或错误。
+type mockBlockMemorySearcher struct {
+	// recs 是 SearchBlockMemoryByGoal 返回的固定记录切片。
+	recs []*types.KnowledgeRecord
+	// err 是 SearchBlockMemoryByGoal 返回的固定错误。
+	err error
+}
+
+// SearchBlockMemoryByGoal 实现 BlockMemorySearcher 接口，忽略查询并返回预设结果。
+func (m *mockBlockMemorySearcher) SearchBlockMemoryByGoal(ctx context.Context, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+	return m.recs, m.err
+}
+
+// TestInjectRecalledMemory 验证块记忆召回注入的三种情形：
+// 命中时拼接【相关记忆】前缀、无命中与未配置检索器时任务原样返回。
+func TestInjectRecalledMemory(t *testing.T) {
+	// 情形一：命中两条记忆，任务前应拼入编号记忆段与【当前任务】分隔。
+	d := NewDispatcher(nil, nil, nil, nil, nil).
+		WithBlockMemorySearcher(&mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{
+			{Content: "记忆一"},
+			{Content: "记忆二"},
+		}})
+	got := d.injectRecalledMemory(context.Background(), "原始任务")
+	want := "【相关记忆】\n1. 记忆一\n2. 记忆二\n\n【当前任务】\n原始任务"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+
+	// 情形二：检索无命中，任务原样返回。
+	d = NewDispatcher(nil, nil, nil, nil, nil).
+		WithBlockMemorySearcher(&mockBlockMemorySearcher{})
+	if got := d.injectRecalledMemory(context.Background(), "原始任务"); got != "原始任务" {
+		t.Fatalf("expected unchanged task, got %q", got)
+	}
+
+	// 情形三：未配置检索器，任务原样返回。
+	d = NewDispatcher(nil, nil, nil, nil, nil)
+	if got := d.injectRecalledMemory(context.Background(), "原始任务"); got != "原始任务" {
+		t.Fatalf("expected unchanged task, got %q", got)
+	}
+}
+
+// TestRoleIDFromAgentID 验证从 Agent 句柄还原角色 ID：
+// 子 Agent 句柄去序号；顶层会话 ID（session-N）恒还原为 meta。
+func TestRoleIDFromAgentID(t *testing.T) {
+	cases := map[string]string{
+		"session-1":                    "meta",
+		"session-42":                   "meta",
+		"meta":                         "meta",
+		"session-1/code_assistant-3":   "code_assistant",
+		"session-2/domain-1":           "domain",
+		"session-2/domain-1/code-4":    "code",
+		"session-2/my_role-7":          "my_role",
+	}
+	for in, want := range cases {
+		if got := roleIDFromAgentID(in); got != want {
+			t.Fatalf("roleIDFromAgentID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

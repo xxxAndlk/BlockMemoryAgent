@@ -68,7 +68,7 @@ agent:
   queue_inject_enabled: false    # 队列注入（默认关闭）
   human_clarify_enabled: false   # 人机对话（默认关闭）
   dag_enabled: false             # DAG 定时任务调度（默认关闭）
-  restore_sessions: true         # 启动时从 session_history 恢复最近 50 个会话到内存（默认 true，重启后可继续查看/续跑长任务；显式 false 关闭）
+  restore_sessions: false        # 启动时从 session_history 恢复最近 50 个会话到内存（默认 true；TUI 不需要历史记录，显式 false 关闭，启动即为全新会话）
   plan_enabled: false            # Plan-and-Execute（默认关闭）
   reflection_enabled: false      # Self-Reflection（默认关闭）
   human_clarify_timeout_sec: 120 # 等待用户回答超时（秒）

@@ -114,6 +114,8 @@ type Session struct {
 	Events         []Event         // Events 会话生命周期中产生的事件列表
 	Messages       []Message       // Messages 会话中的聊天消息列表
 	TempDir        string          // TempDir 会话使用的临时目录路径
+	StreamingText  string          // StreamingText 当前正在流式生成的助手文本（仅运行中有值）
+	ThinkingText   string          // ThinkingText 当前思考阶段的过程文本（瞬时，仅运行中有值）
 	ActiveBlocks   []ActiveBlock   // ActiveBlocks 当前正在运行的会话块视图
 	PendingClarify *ClarifyRequest // PendingClarify 待处理的澄清请求，无则为 nil
 }

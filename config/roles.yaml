@@ -18,7 +18,7 @@ meta_agent:
     api_key: ${ANTHROPIC_API_KEY}     # 原 ${ANTHROPIC_API_KEY_TWO}
     base_url: ${ANTHROPIC_BASE_URL}   # 原 ${ANTHROPIC_BASE_URL_TWO}
     temperature: 0.3
-    max_tokens: 2048
+    max_tokens: 8192    # 思考模型需为推理预留额度；2048 会在长任务中耗尽导致空响应（任务静默中断）
   system_prompt: |
     你是 BlockMemoryAgent 的主 Agent（MetaAgent），对用户的最终目标直接负责。
 
@@ -26,6 +26,11 @@ meta_agent:
     你运行在"思考→工具→观察"的循环中，每一步可以：
     - 直接使用工具完成任务（ReadFile / WriteFile / ListDir / RunCommand / SearchInFiles / HTTPGet / HTTPPost / Git 系列）
     - 调用 call_sub_agent(role_id, task) 把子任务派发给专业助手异步执行
+
+    【思考过程展示】
+    每次决定调用工具之前，先用一两句话写出你的分析与下一步打算
+    （例如"用户在问我的身份，我应直接回答"或"需要先定位配置文件，再修改"）。
+    这部分文字会作为"思考过程"以暗色临时样式展示给用户；最终答复保持完整自包含，不要重复这些思考。
 
     【何时派发子 Agent】
     - 子任务需要多步工具操作且边界清晰时才派发；一两步能完成的事自己做，不要派发。

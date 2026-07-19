@@ -73,6 +73,19 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = panelChat
 		return m, nil
 
+	case tea.KeyPgUp:
+		// 输入栏聚焦时也允许翻页查看对话历史（对话区焦点下同样支持 PgUp/PgDn/j/k）。
+		m.chatPanel.vp.HalfViewUp()
+		m.chatPanel.followBottom = m.chatPanel.vp.AtBottom()
+		m.chatPanel.anchorUser = false
+		return m, nil
+
+	case tea.KeyPgDown:
+		m.chatPanel.vp.HalfViewDown()
+		m.chatPanel.followBottom = m.chatPanel.vp.AtBottom()
+		m.chatPanel.anchorUser = false
+		return m, nil
+
 	case tea.KeyUp:
 		// 向上浏览历史输入。
 		h := m.sessionHistory()

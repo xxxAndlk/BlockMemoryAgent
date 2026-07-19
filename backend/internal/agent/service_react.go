@@ -18,6 +18,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/store"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 )
 
 // ReactService 是基于 ReAct（Reasoning + Acting）引擎的 Agent 接口实现。
@@ -242,11 +243,15 @@ func (s *ReactService) Stream(ctx context.Context, sessionID string) (<-chan Eve
 	// 在独立 goroutine 中持续轮询会话事件并推送到通道。
 	go func() {
 		defer close(out)
-		// 创建 100 毫秒的轮询 ticker。
-		ticker := time.NewTicker(100 * time.Millisecond)
+		// 轮询间隔 50ms：流式文本/思考文本的增量更新也走该通道推送，
+		// 间隔越短，TUI 吐词的跟手度越高。
+		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 		// seen 记录已经推送过的事件数量，避免重复发送。
 		seen := 0
+		// lastStream/lastThink/lastStatus 记录上次推送时的瞬时状态，
+		// 变化时推送一个轻量 live_update 事件，驱动 TUI 立即重绘（不等 tick）。
+		var lastStream, lastThink, lastStatus string
 
 		for {
 			select {
@@ -270,6 +275,17 @@ func (s *ReactService) Stream(ctx context.Context, sessionID string) (<-chan Eve
 				}
 				// 更新已推送位置。
 				seen = len(sess.Events)
+				// 流式文本/思考文本/会话状态变化：推送轻量刷新事件。
+				if sess.StreamingText != lastStream || sess.ThinkingText != lastThink || string(sess.Status) != lastStatus {
+					lastStream = sess.StreamingText
+					lastThink = sess.ThinkingText
+					lastStatus = string(sess.Status)
+					select {
+					case out <- *toAgentEvent(&internalEvent{Type: "live_update", Timestamp: time.Now()}):
+					case <-ctx.Done():
+						return
+					}
+				}
 				// 如果会话已不在运行或等待澄清状态，等待短暂时间后结束，
 				// 确保客户端收到最终的收尾事件。
 				if sess.Status != enums.SessionStatusRunning && sess.Status != enums.SessionStatusAwaitingClarify {
@@ -474,6 +490,11 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 	if !isRunning {
 		return
 	}
+	// call_sub_agent 的事件由 LiveEvent 通道以更丰富的形式记录（sub_agent_dispatch
+	// 含角色与任务摘要、tool_exec 含子 Agent ID），跳过注册表侧的固定文案事件，避免重复。
+	if ev.Tool == "call_sub_agent" {
+		return
+	}
 
 	// 只要不是 Error 类型事件，就视为成功。
 	success := ev.Kind != eventkind.Error
@@ -527,6 +548,22 @@ func toolArgsLabel(argsJSON string) string {
 	return ""
 }
 
+// subAgentDispatchInfo 从 call_sub_agent 的入参 JSON 中提取角色 ID 与任务摘要（截断 100 字符），
+// 供子 Agent 派发事件记录使用；解析失败时返回空角色与原始输入的截断。
+func subAgentDispatchInfo(argsJSON string) (roleID, taskBrief string) {
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", textutil.TruncateRunes(argsJSON, 100, "…")
+	}
+	if v, ok := args["role_id"].(string); ok {
+		roleID = v
+	}
+	if v, ok := args["task"].(string); ok {
+		taskBrief = textutil.TruncateRunes(strings.ReplaceAll(strings.TrimSpace(v), "\n", " "), 100, "…")
+	}
+	return roleID, taskBrief
+}
+
 // runSession 为新创建的会话执行 ReAct 主循环。
 func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会话上下文；若不存在则使用 Background。
 	ctx := sessionContext(session)
@@ -560,7 +597,8 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapter(s.toolRegistry)).
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).
-		WithLoopConfig(s.runtimeCfg.LoopConfig())
+		WithLoopConfig(s.runtimeCfg.LoopConfig()).
+		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) })
 
 	// 将会话 ID 注入工具上下文，便于工具内部识别当前会话。
 	runCtx := tool.WithSessionID(ctx, session.ID)
@@ -627,7 +665,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapter(s.toolRegistry)).
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).
-		WithLoopConfig(s.runtimeCfg.LoopConfig())
+		WithLoopConfig(s.runtimeCfg.LoopConfig()).
+		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) })
 
 	// 注入会话 ID 到工具上下文。
 	runCtx := tool.WithSessionID(ctx, session.ID)
@@ -675,6 +714,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 // finalizeSession 在会话结束时执行清理工作。
 func (s *ReactService) finalizeSession(session *reactInternalSession) {
+	// 会话结束（完成/出错/暂停）时清空流式输出与思考过程状态，UI 停止渲染瞬时内容。
+	s.store.setStreamingText(session, "")
+	s.store.setThinkingText(session, "")
 	// 暂停待续（awaiting_clarify）的会话保留临时目录，用户续跑时仍需其中的中间产物。
 	if session.Status != enums.SessionStatusAwaitingClarify {
 		// 清理会话临时目录。
@@ -682,6 +724,37 @@ func (s *ReactService) finalizeSession(session *reactInternalSession) {
 	}
 	// 淘汰已完成的会话，避免内存无限增长。
 	s.store.evictCompletedSessions()
+}
+
+// handleLiveEvent 把 ReAct 运行中的实时进度事件写入会话：
+// LLM/思考流式增量原位更新对应文本字段（不产生事件记录，避免事件流/数据库被 token 级事件淹没）；
+// 工具调用/执行完成与子 Agent 完成追加为会话事件（少量且有审计价值，随 persistEvents 持久化）。
+func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEvent) {
+	switch ev.Kind {
+	case LiveEventLLMDelta:
+		// 答复文本开始输出时，思考阶段结束，清空瞬时思考展示。
+		s.store.setThinkingText(session, "")
+		s.store.setStreamingText(session, ev.Text)
+	case LiveEventThinkDelta:
+		s.store.setThinkingText(session, ev.Text)
+	case LiveEventToolCall:
+		// call_sub_agent 是子 Agent 派发：记录专用派发事件（角色 ID 与任务摘要），
+		// 供 TUI 对话区展示阶段标记、编排面板派生子 Agent 节点。
+		if ev.Tool == "call_sub_agent" {
+			roleID, taskBrief := subAgentDispatchInfo(ev.Input)
+			s.store.addEvent(session, eventkind.Message, ev.Agent, taskBrief, "sub_agent_dispatch", roleID, "", "", "", true)
+		}
+		// 其他工具的调用事件已由工具注册表的进度回调记录（handleToolEvent），此处不重复。
+	case LiveEventToolExec:
+		// 其他工具的执行事件已由工具注册表的进度回调记录（handleToolEvent），
+		// 这里只补 call_sub_agent：其 Output 是子 Agent ID，记入 ToolPath 供 UI 统计"等待中的子 Agent"。
+		if ev.Tool != "call_sub_agent" {
+			return
+		}
+		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, "", "", ev.Tool, strings.TrimSpace(ev.Output), ev.Output, ev.Error, ev.Success)
+	case LiveEventSubAgentDone:
+		s.store.addEvent(session, eventkind.Message, "SubAgent", ev.Tool, "sub_agent_done", "", "", "", "", true)
+	}
 }
 
 // pauseSession 在达到最大轮数上限时将会话置为"暂停待续"而非错误：
@@ -948,6 +1021,8 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		Events:         events,
 		Messages:       messages,
 		TempDir:        s.TempDir,
+		StreamingText:  s.StreamingText,
+		ThinkingText:   s.ThinkingText,
 		ActiveBlocks:   []ActiveBlock{},
 		PendingClarify: nil,
 	}

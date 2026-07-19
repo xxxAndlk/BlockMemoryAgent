@@ -229,6 +229,12 @@ func (s *PostgresStore) SearchBlockMemory(ctx context.Context, domain, goal stri
 	return s.Knowledge.SearchBlockMemory(ctx, domain, goal, topK)
 }
 
+// SearchBlockMemoryByGoal 不按 domain 过滤、仅按目标文本语义检索块记忆；
+// 委托给 KnowledgeStore.SearchBlockMemoryByGoal。
+func (s *PostgresStore) SearchBlockMemoryByGoal(ctx context.Context, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+	return s.Knowledge.SearchBlockMemoryByGoal(ctx, goal, topK)
+}
+
 // SearchKnowledgeByType 按 knowledge_type 过滤的向量搜索；委托给 KnowledgeStore.SearchByType。
 func (s *PostgresStore) SearchKnowledgeByType(ctx context.Context, knowledgeType enums.KnowledgeType, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
 	return s.Knowledge.SearchByType(ctx, knowledgeType, embedding, topK)

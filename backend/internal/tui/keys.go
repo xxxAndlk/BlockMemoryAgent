@@ -61,6 +61,7 @@ const fullHelpText = `
 	  j/k  按 item 上下滚动  g/G 首/尾  PgUp/PgDn 半屏滚动  Enter 展开详情
 	  Home/End  跳到首/尾
 	  鼠标滚轮可在对话区滚动
+	  对话区只显示最近记录，更早的记录按 Ctrl+L 查看完整记录
 	  发送消息后焦点停在输入栏，按 Esc 可切回对话面板用 j/k 滚动；
 	  或随时按 Ctrl+L 打开完整记录面板查看全部输出
 

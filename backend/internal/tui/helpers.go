@@ -388,7 +388,130 @@ func chatItems(s *server.Session, compact bool) []chatItem {
 		items = deduped
 	}
 
+	// 运行中会话追加实时状态条目（不走事件流，避免 token 级事件淹没事件列表）：
+	// 有流式文本时展示"正在输出"的助手条目；否则按是否有未完成的工具调用
+	// 分别展示"工具执行中"与"思考中"等待状态，保证等待期界面始终有反馈。
+	if s.Status == enums.SessionStatusRunning {
+		items = appendLiveItems(items, s)
+	}
+
 	return items
+}
+
+// appendLiveItems 为运行中会话追加一条实时状态条目（均为瞬时展示，不进事件流）：
+// 答复流式输出 > 思考过程 > 工具执行中 > 等待子 Agent > 思考中，任一时刻只展示一条。
+func appendLiveItems(items []chatItem, s *server.Session) []chatItem {
+	now := time.Now()
+	// 有答复流式文本：作为助手条目展示截至当前的累积输出，末尾加光标符提示仍在生成。
+	if strings.TrimSpace(s.StreamingText) != "" {
+		return append(items, chatItem{
+			title:     s.StreamingText + " ▍",
+			timestamp: now,
+			isEvent:   false,
+			role:      enums.ChatRoleAssistant,
+		})
+	}
+	// 有思考过程文本：暗色 💭 展示（瞬时，答复开始或会话结束时消失）。
+	if strings.TrimSpace(s.ThinkingText) != "" {
+		return append(items, chatItem{
+			title:     "💭 " + strings.TrimSpace(s.ThinkingText) + " ▍",
+			timestamp: now,
+			isEvent:   true,
+		})
+	}
+	// 无流式文本：有未完成的工具调用则提示工具执行中。
+	if tool := inflightTool(s.Events); tool != "" {
+		return append(items, chatItem{
+			title:     "⚙ 正在执行工具: " + tool,
+			timestamp: now,
+			isEvent:   true,
+		})
+	}
+	// 有已派发但未完成的子 Agent：提示等待子 Agent。
+	if sub := waitingSubAgent(s.Events); sub != "" {
+		return append(items, chatItem{
+			title:     "⏳ 等待子 Agent 执行: " + sub,
+			timestamp: now,
+			isEvent:   true,
+		})
+	}
+	// 否则处于 LLM 调用等待期，提示思考中。
+	return append(items, chatItem{
+		title:     "⏳ MetaAgent 思考中…",
+		timestamp: now,
+		isEvent:   true,
+	})
+}
+
+// waitingSubAgent 返回当前仍处于"已派发未回传"状态的子 Agent ID；没有时返回空串。
+// 判定：tool_exec(Tool=call_sub_agent) 次数多于 sub_agent_done 事件数，
+// 最近一个未完成 ID 取自对应 tool_exec 事件的 ToolPath。
+func waitingSubAgent(events []server.SessionEvent) string {
+	dispatched := []string{}
+	done := 0
+	for _, ev := range events {
+		switch {
+		case ev.Type == "tool_exec" && ev.Tool == "call_sub_agent" && ev.Success:
+			dispatched = append(dispatched, ev.ToolPath)
+		case ev.Kind == "sub_agent_done":
+			done++
+		}
+	}
+	if len(dispatched) <= done {
+		return ""
+	}
+	last := dispatched[len(dispatched)-1]
+	if last == "" {
+		last = "sub-agent"
+	}
+	return last
+}
+
+// subAgentRoleFromID 从子 Agent ID（形如 session-1/code_assistant-1）还原角色 ID。
+func subAgentRoleFromID(id string) string {
+	seg := id
+	if idx := strings.LastIndex(seg, "/"); idx >= 0 {
+		seg = seg[idx+1:]
+	}
+	// 去掉尾部序号（"-N"）。
+	if dash := strings.LastIndex(seg, "-"); dash > 0 {
+		return seg[:dash]
+	}
+	return seg
+}
+
+// subAgentRoleLabel 返回角色的人类可读类别标签：domain 为"领域 Agent"，其余为"助手"。
+func subAgentRoleLabel(role string) string {
+	if role == "domain" || strings.HasPrefix(role, "domain") {
+		return "领域 Agent"
+	}
+	return "助手"
+}
+
+// inflightTool 返回当前仍处于"已调用未返回"状态的工具名；没有时返回空串。
+func inflightTool(events []server.SessionEvent) string {
+	pending := map[string]int{}
+	last := ""
+	for _, ev := range events {
+		switch {
+		case ev.Kind == "tool_call":
+			pending[ev.Tool]++
+			last = ev.Tool
+		case ev.Type == "tool_exec":
+			if pending[ev.Tool] > 0 {
+				pending[ev.Tool]--
+			}
+		}
+	}
+	if last != "" && pending[last] > 0 {
+		return last
+	}
+	for t, n := range pending {
+		if n > 0 {
+			return t
+		}
+	}
+	return ""
 }
 
 // mergeToolCallPairs 把相邻的 [●] 工具调用行与同工具的 [✓]/[✗] 结果行合并为单条结果行，
@@ -673,8 +796,36 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		}
 		title = "─── " + msg + " ───"
 		return title, "", title, true
+	// 思考过程（中间推理步骤）事件：以 💭 前缀标识，渲染时用暗色区别于正式答复。
+	case ev.Kind == "think":
+		msg := strings.TrimSpace(ev.Message)
+		if msg == "" {
+			return "", "", "", false
+		}
+		title = "💭 " + msg
+		return title, "", title, true
+	// 子 Agent 派发事件：Tool 携带角色 ID，Message 为任务摘要。
+	case ev.Kind == "sub_agent_dispatch":
+		role := ev.Tool
+		if role == "" {
+			role = "sub-agent"
+		}
+		title = "🚀 派发" + subAgentRoleLabel(role) + ": " + role
+		if msg := strings.TrimSpace(ev.Message); msg != "" {
+			title += " — " + msg
+		}
+		return title, "", title, true
+	// 子 Agent 完成事件：Message 携带子 Agent ID（形如 session-1/code_assistant-1）。
+	case ev.Kind == "sub_agent_done":
+		id := strings.TrimSpace(ev.Message)
+		if id == "" {
+			id = "sub-agent"
+		}
+		role := subAgentRoleFromID(id)
+		title = "✓ " + subAgentRoleLabel(role) + "执行完成: " + id
+		return title, "", title, true
 	// LLM/思考/等待等事件。
-	case ev.Kind == "llm_result" || ev.Kind == "think" || ev.Kind == "llm" || ev.Kind == "intend" || ev.Kind == "wait":
+	case ev.Kind == "llm_result" || ev.Kind == "llm" || ev.Kind == "intend" || ev.Kind == "wait":
 		agent := ev.Agent
 		if agent == "" {
 			agent = "Assistant"

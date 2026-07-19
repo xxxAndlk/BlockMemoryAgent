@@ -60,11 +60,13 @@ func (s *SessionStore) SaveHistory(ctx context.Context, rec *SessionHistoryRecor
 	if rec.MetaMemory == nil {
 		rec.MetaMemory = []map[string]any{}
 	}
-	toolData, err := json.Marshal(rec.ToolResults)
+	// 先递归清洗字符串值中的 NUL/非法 UTF-8：jsonb 拒绝  转义与裸 0x00，
+	// 工具输出夹带 NUL 会导致整行写入失败（调用方清洗不完整时在此兜底）。
+	toolData, err := json.Marshal(sanitizeJSONValue(rec.ToolResults))
 	if err != nil {
 		return fmt.Errorf("marshal tool_results: %w", err)
 	}
-	memData, err := json.Marshal(rec.MetaMemory)
+	memData, err := json.Marshal(sanitizeJSONValue(rec.MetaMemory))
 	if err != nil {
 		return fmt.Errorf("marshal meta_memory: %w", err)
 	}
@@ -73,7 +75,7 @@ func (s *SessionStore) SaveHistory(ctx context.Context, rec *SessionHistoryRecor
 			INSERT INTO session_history (session_id, goal, summary, tool_results, meta_memory, created_at)
 			VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()))
 			ON CONFLICT DO NOTHING
-		`, rec.SessionID, rec.Goal, rec.Summary, toolData, memData, rec.CreatedAt)
+		`, rec.SessionID, sanitizeUTF8(rec.Goal), sanitizeUTF8(rec.Summary), toolData, memData, rec.CreatedAt)
 	return err
 }
 
@@ -104,7 +106,9 @@ func (s *SessionStore) SaveEvents(ctx context.Context, sessionID string, events 
 	defer stmt.Close()
 
 	for _, e := range events {
-		_, err := stmt.ExecContext(ctx, sessionID, e.Type, e.Agent, e.Message, e.Kind, e.Tool, e.ToolPath, e.ToolOutput, e.ToolError, e.Success, e.Timestamp, e.Prompt, e.InputTokens, e.OutputTokens, e.DetailJSON)
+		// 存储层兜底清洗：调用方未必都做过 sanitize，
+		// NUL/非法 UTF-8 会让整批写入被 Postgres 拒绝（22021）。
+		_, err := stmt.ExecContext(ctx, sessionID, e.Type, e.Agent, sanitizeUTF8(e.Message), e.Kind, e.Tool, sanitizeUTF8(e.ToolPath), sanitizeUTF8(e.ToolOutput), sanitizeUTF8(e.ToolError), e.Success, e.Timestamp, sanitizeUTF8(e.Prompt), e.InputTokens, e.OutputTokens, sanitizeUTF8(e.DetailJSON))
 		if err != nil {
 			return fmt.Errorf("insert event: %w", err)
 		}

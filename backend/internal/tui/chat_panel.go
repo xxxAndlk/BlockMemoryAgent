@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -31,6 +32,9 @@ type ChatPanel struct {
 	anchorUser bool
 	// pendingFirstMessage 是在会话创建前本地预展示的首条用户消息。
 	pendingFirstMessage string
+	// lastLiveTitle 是上次重建时最后一条 chatItem 的标题，
+	// 用于检测流式文本增长/等待状态切换等"条目数不变但内容变化"的情况。
+	lastLiveTitle string
 	// scrollbarDragging 表示当前是否正在拖动滚动条滑块。
 	scrollbarDragging bool
 	// dragStartY 是开始拖动时鼠标的 Y 坐标。
@@ -341,7 +345,13 @@ func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Sessio
 	return lipgloss.JoinHorizontal(lipgloss.Top, content, bar)
 }
 
+// maxChatItems 是主对话区最多展示的条目数。长会话会产生数百条工具事件，
+// 全部加载会让用户滚动时陷入历史记录、找不到最新内容；更早的记录不进对话区，
+// 需要翻阅时通过 Ctrl+L 完整记录面板查看全部输出。
+const maxChatItems = 50
+
 // collectItems 收集当前应展示的全部 chatItem，包含本地预展示的首条用户消息兜底。
+// 仅保留最近 maxChatItems 条，更早的条目以一条省略提示代替。
 func (cp *ChatPanel) collectItems(s *server.Session) []chatItem {
 	var items []chatItem
 	if s != nil {
@@ -351,7 +361,8 @@ func (cp *ChatPanel) collectItems(s *server.Session) []chatItem {
 	if cp.pendingFirstMessage != "" {
 		already := false
 		for _, it := range items {
-			if strings.TrimPrefix(it.title, "> ") == cp.pendingFirstMessage {
+			// 两侧都去空白比较，避免尾随换行/空格差异导致同一条问题重复显示。
+			if strings.TrimSpace(strings.TrimPrefix(it.title, "> ")) == strings.TrimSpace(cp.pendingFirstMessage) {
 				already = true
 				break
 			}
@@ -370,6 +381,18 @@ func (cp *ChatPanel) collectItems(s *server.Session) []chatItem {
 			})
 		}
 	}
+	// 裁剪到最近 maxChatItems 条：更早的记录不加载进对话区（完整内容见 Ctrl+L），
+	// 顶部放一条省略提示，滚动到顶即止步于此，不会再深入历史。
+	if len(items) > maxChatItems {
+		omitted := len(items) - maxChatItems
+		kept := make([]chatItem, 0, maxChatItems+1)
+		kept = append(kept, chatItem{
+			title:     fmt.Sprintf("─── 已省略 %d 条较早记录 · 按 Ctrl+L 查看完整记录 ───", omitted),
+			timestamp: items[omitted].timestamp,
+			isEvent:   true,
+		})
+		items = append(kept, items[omitted:]...)
+	}
 	return items
 }
 
@@ -378,6 +401,7 @@ func (cp *ChatPanel) rebuildContent(items []chatItem, styles *Styles, width int)
 	if len(items) == 0 {
 		cp.vp.SetContent("")
 		cp.lastItems = 0
+		cp.lastLiveTitle = ""
 		return
 	}
 	w := width
@@ -387,6 +411,7 @@ func (cp *ChatPanel) rebuildContent(items []chatItem, styles *Styles, width int)
 	content := cp.buildContent(items, styles, w)
 	cp.vp.SetContent(content)
 	cp.lastItems = len(items)
+	cp.lastLiveTitle = items[len(items)-1].title
 	cp.lastWidth = w
 }
 
@@ -439,6 +464,9 @@ func (cp *ChatPanel) buildContent(items []chatItem, styles *Styles, width int) s
 			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, styles.LogError, width)...)
 		// 记忆召回事件：使用暗淡色。
 		case strings.HasPrefix(item.title, "🧠 recalled: "):
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, styles.Dim, width)...)
+		// 思考过程（中间推理步骤）：使用暗淡色，模拟主流 Agent 的"临时思考"观感。
+		case strings.HasPrefix(item.title, "💭 "):
 			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, styles.Dim, width)...)
 		// 话题切换分隔线。
 		case strings.HasPrefix(item.title, "─── ") && strings.HasSuffix(item.title, " ───"):

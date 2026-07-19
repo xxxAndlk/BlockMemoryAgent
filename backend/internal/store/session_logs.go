@@ -10,9 +10,10 @@ import (
 	"time"          // 时间戳
 )
 
-// sanitizeUTF8 清洗字符串中的非法 UTF8 字节序列。
+// sanitizeUTF8 清洗字符串中的非法 UTF8 字节序列与 NUL 字节。
 // Postgres 拒绝 0xe7 0xbb 0x2e 这类不完整的多字节序列（错误码 22021），
-// 用 strings.ToValidUTF8 把非法字节替换为 U+FFFD。
+// text/jsonb 字段也同样拒绝 NUL 字节（0x00）——0x00 本身是合法 UTF-8，
+// ToValidUTF8 不会处理，必须显式剥离；工具输出/命令日志常夹带 NUL。
 // 参数:
 //   - s: 原始字符串。
 //
@@ -21,12 +22,44 @@ func sanitizeUTF8(s string) string {
 	if s == "" {
 		return s
 	}
+	// 先剥离 NUL 字节
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
 	// 如果已经合法，直接返回，避免拷贝
 	if strings.ToValidUTF8(s, "") == s {
 		return s
 	}
 	// 替换非法字节为 �
 	return strings.ToValidUTF8(s, "�")
+}
+
+// sanitizeJSONValue 递归清洗待序列化为 jsonb 的值中的字符串（含 map 键）：
+// 剥离 NUL 与非法 UTF-8。Postgres jsonb 拒绝字符串中的  转义与裸 0x00，
+// 必须在序列化前清洗值——序列化后做字节替换会破坏字面 "" 文本的转义结构。
+func sanitizeJSONValue(v any) any {
+	switch t := v.(type) {
+	case string:
+		return sanitizeUTF8(t)
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[sanitizeUTF8(k)] = sanitizeJSONValue(val)
+		}
+		return out
+	case []map[string]any:
+		for i, val := range t {
+			t[i] = sanitizeJSONValue(val).(map[string]any)
+		}
+		return t
+	case []any:
+		for i, val := range t {
+			t[i] = sanitizeJSONValue(val)
+		}
+		return t
+	default:
+		return v
+	}
 }
 
 // SessionLogRecord 单条结构化会话日志。
@@ -83,8 +116,8 @@ func (s *PostgresStore) SaveSessionLog(ctx context.Context, rec *SessionLogRecor
 	rec.Prompt = sanitizeUTF8(rec.Prompt)
 	rec.Response = sanitizeUTF8(rec.Response)
 	rec.Model = sanitizeUTF8(rec.Model)
-	// 序列化扩展元数据
-	metaRaw, err := json.Marshal(rec.Meta)
+	// 序列化扩展元数据（先递归清洗字符串值，jsonb 同样拒绝 NUL）
+	metaRaw, err := json.Marshal(sanitizeJSONValue(rec.Meta))
 	if err != nil {
 		return fmt.Errorf("marshal meta: %w", err)
 	}

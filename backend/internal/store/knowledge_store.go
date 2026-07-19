@@ -161,6 +161,28 @@ func (s *KnowledgeStore) SearchBlockMemory(ctx context.Context, domain, goal str
 	return s.SearchByTypeAndDomain(ctx, enums.KnowledgeTypeBlockMemory, domain, emb, topK)
 }
 
+// SearchBlockMemoryByGoal 不按 domain 过滤、仅按目标文本做语义匹配检索块记忆。
+// 适用于当前架构中没有显式 domain 概念的场景（如按拆分出的子任务文本召回），
+// 避免 meta->>'domain' 精确过滤导致召回恒为空。
+// 参数:
+//   - ctx:  请求上下文。
+//   - goal: 目标文本，用于生成查询向量。
+//   - topK: 返回上限。
+//
+// 返回: 知识记录切片与错误。
+func (s *KnowledgeStore) SearchBlockMemoryByGoal(ctx context.Context, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	// 调用 PostgresStore.Embed 将查询文本转为向量（支持外部 embedder 回退）
+	emb, err := s.pg.Embed(ctx, goal)
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
+	// 仅按 knowledge_type 过滤做向量检索，不做 domain 精确过滤
+	return s.SearchByType(ctx, enums.KnowledgeTypeBlockMemory, emb, topK)
+}
+
 // SearchByType 按 knowledge_type 过滤的向量相似搜索（特性3使用）。
 // 职责：限定返回记录的 KnowledgeType，便于把 block_memory / playbook 等分类检索。
 // 参数：

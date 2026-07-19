@@ -71,17 +71,21 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 	case "awaiting_clarify":
 		metaStatus = enums.RoleStatusWaiting
 	}
-	// 推导 MetaAgent 目标：优先用会话 Goal，否则取第一条用户消息内容。
+	// 推导 MetaAgent 目标：展示当前轮任务——取最后一条用户消息（多轮会话中反映最新任务），
+	// 没有用户消息时回退到会话 Goal；任务开始时间取该消息时间（新一轮的开始时刻）。
 	metaGoal := ""
-	if s.Goal != "" {
-		metaGoal = s.Goal
-	} else if len(s.Messages) > 0 {
-		for _, msg := range s.Messages {
-			if msg.Role == enums.ChatRoleUser {
-				metaGoal = strings.TrimSpace(msg.Content)
-				break
+	taskStart := s.StartedAt
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].Role == enums.ChatRoleUser {
+			metaGoal = strings.TrimSpace(s.Messages[i].Content)
+			if !s.Messages[i].Timestamp.IsZero() {
+				taskStart = s.Messages[i].Timestamp
 			}
+			break
 		}
+	}
+	if metaGoal == "" {
+		metaGoal = s.Goal
 	}
 	// 添加顶层 MetaAgent 节点。
 	at.nodes = append(at.nodes, agentTreeNode{
@@ -92,7 +96,7 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 		role:      "Orchestrator",
 		status:    metaStatus,
 		goal:      metaGoal,
-		createdAt: s.StartedAt,
+		createdAt: taskStart,
 	})
 
 	// 获取会话的 Agent 实例列表。
@@ -195,6 +199,66 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 			isClarify: true,
 		})
 	}
+
+	// 新架构（ReAct）下子 Agent 由 Dispatcher 直接创建，不会注册为 AgentInstance，
+	// ListAgents 看不到；改为从会话事件流（派发/执行/完成）派生子 Agent 节点，
+	// 使编排面板能实时展示领域 Agent 与助手的执行状态。
+	at.nodes = append(at.nodes, deriveSubAgentNodes(s.Events)...)
+}
+
+// deriveSubAgentNodes 从会话事件流派生子 Agent 节点：
+// sub_agent_dispatch（派发，含角色与任务摘要）创建运行中节点；
+// call_sub_agent 的 tool_exec 回填子 Agent ID（失败则标记错误）；
+// sub_agent_done（完成）按 ID 将节点标记为完成。
+func deriveSubAgentNodes(events []server.SessionEvent) []agentTreeNode {
+	var nodes []*agentTreeNode
+	for i := range events {
+		ev := events[i]
+		switch {
+		case ev.Kind == "sub_agent_dispatch":
+			role := ev.Tool
+			if role == "" {
+				role = "sub-agent"
+			}
+			roleType := enums.RoleTypeFixed
+			if strings.HasPrefix(role, "domain") {
+				roleType = enums.RoleTypeDomain
+			}
+			nodes = append(nodes, &agentTreeNode{
+				depth:     1,
+				name:      role,
+				domain:    role,
+				roleType:  roleType,
+				role:      role,
+				status:    enums.RoleStatusActive,
+				goal:      ev.Message,
+				createdAt: ev.Timestamp,
+			})
+		case ev.Type == "tool_exec" && ev.Tool == "call_sub_agent":
+			// 回填最早一个尚无 ID 的节点（tool_exec 与派发顺序一一对应，FIFO 匹配）。
+			for j := 0; j < len(nodes); j++ {
+				if nodes[j].instID == "" {
+					nodes[j].instID = ev.ToolPath
+					if !ev.Success {
+						nodes[j].status = enums.RoleStatusError
+					}
+					break
+				}
+			}
+		case ev.Kind == "sub_agent_done":
+			id := strings.TrimSpace(ev.Message)
+			for _, n := range nodes {
+				if n.instID == id {
+					n.status = enums.RoleStatusDone
+				}
+			}
+		}
+	}
+	out := make([]agentTreeNode, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, *n)
+	}
+	return out
 }
 
 // deriveDomainTaskStatuses 从 Agent 树中汇总每个领域的真实状态，用于覆盖看板中可能滞后的状态。

@@ -40,7 +40,8 @@ type Model struct {
 
 	// sessions 是会话列表。
 	sessions []*server.Session
-	// sessionsCursor 是当前选中会话的索引。
+	// sessionsCursor 是当前选中会话的索引；-1 表示无选中（启动初始状态，
+	// 避免零值 0 隐式指向第一个恢复的历史会话而被当作记忆渲染出来）。
 	sessionsCursor int
 
 	// chatPanel 是对话面板。
@@ -112,6 +113,7 @@ func NewModel(
 		modelName:      modelName,
 		styles:         NewStyles(),
 		focus:          panelChat,
+		sessionsCursor: -1, // 启动不选中任何会话：聊天区保持空白新会话状态
 		chatPanel:      NewChatPanel(),
 		planBarVisible: true,
 		inputBar:       NewInputBar(),
@@ -120,14 +122,11 @@ func NewModel(
 		streamEvents:   make(chan agent.Event, 16),
 	}
 	m.refreshSessions()
-	if len(m.sessions) > 0 {
-		// 有会话时默认选中第一个。
-		m.selectSession(0)
-	} else {
-		// 当前无会话，将焦点切换到输入栏，让用户可以通过 /new 创建会话。
-		m.focus = panelInput
-		m.inputBar.mode = inputNormal
-	}
+	// 启动时不自动选中任何历史会话：保持空白新会话状态（无选中会话），
+	// 避免旧会话内容被当作"记忆"加载；用户直接输入即创建全新会话。
+	// 历史会话仍列在侧边栏，可手动切换查看。
+	m.focus = panelInput
+	m.inputBar.mode = inputNormal
 	return m
 }
 
@@ -202,7 +201,8 @@ func (m *Model) selectSession(idx int) {
 		found := false
 		if s != nil {
 			for _, msg := range s.Messages {
-				if msg.Role == enums.ChatRoleUser && strings.TrimSpace(msg.Content) == m.chatPanel.pendingFirstMessage {
+				// 两侧都去空白比较，容忍输入带尾随换行/空格造成的差异。
+				if msg.Role == enums.ChatRoleUser && strings.TrimSpace(msg.Content) == strings.TrimSpace(m.chatPanel.pendingFirstMessage) {
 					found = true
 					break
 				}
@@ -415,10 +415,9 @@ func (m *Model) refreshView() {
 				m.chatPanel.followBottom = false
 				m.chatPanel.anchorUser = true
 				m.chatPanel.pendingScrollToUser = false
-				// 找到真实用户消息后，若其内容与本地预展示一致，清除预展示标记
-				if m.chatPanel.pendingFirstMessage != "" && strings.TrimPrefix(items[idx].title, "> ") == m.chatPanel.pendingFirstMessage {
-					m.chatPanel.pendingFirstMessage = ""
-				}
+				// 注意：此处不得清除 pendingFirstMessage——命中的可能只是本地兜底
+				// 条目（自我匹配），提前清除会让首条问题在服务端消息同步前消失。
+				// 清除只在 selectSession 确认服务端已含该消息后进行。
 				break
 			}
 		}
@@ -427,16 +426,31 @@ func (m *Model) refreshView() {
 	// viewport 内容随会话事件/消息增长而重建；跟随底部时自动滚到最新。
 	// 锚定到用户问题时仅重建内容、不自动滚动，避免用户问题被顶出视口。
 	if s := m.selectedSession(); s != nil {
-		itemsChanged := len(chatItems(s, true)) != m.chatPanel.lastItems
+		items := m.collectChatItems()
+		itemsChanged := len(items) != m.chatPanel.lastItems
 		widthChanged := m.chatContentWidth() != m.chatPanel.lastWidth
-		if itemsChanged || widthChanged {
+		// 条目数不变但末条内容变化（流式文本增长、思考中/执行中状态切换）也需重建。
+		lastTitle := ""
+		if len(items) > 0 {
+			lastTitle = items[len(items)-1].title
+		}
+		liveChanged := lastTitle != m.chatPanel.lastLiveTitle
+		if itemsChanged || widthChanged || liveChanged {
 			wasAtBottom := m.chatPanel.vp.AtBottom() || m.chatPanel.followBottom
-			m.rebuildChatContent()
+			m.chatPanel.rebuildContent(items, m.styles, m.chatContentWidth())
 			if !m.chatPanel.anchorUser && wasAtBottom {
 				m.chatPanel.vp.GotoBottom()
 				m.chatPanel.followBottom = true
 			}
 		}
+	}
+	// 内容已溢出视口时解除用户问题锚定并跟随底部：
+	// 锚定只在全部内容可见时有意义（问题不被顶走）；一旦流式输出使内容超过
+	// 视口高度，必须恢复自动跟随，否则流式尾部与最终结果永远停留在视口外。
+	if m.chatPanel.anchorUser && m.chatPanel.vp.TotalLineCount() > m.chatPanel.vp.VisibleLineCount() {
+		m.chatPanel.anchorUser = false
+		m.chatPanel.followBottom = true
+		m.chatPanel.vp.GotoBottom()
 	}
 	if !m.chatPanel.anchorUser && m.chatPanel.followBottom {
 		m.chatPanel.vp.GotoBottom()
@@ -691,7 +705,10 @@ func (m *Model) chatContentWidth() int {
 // mainContentHeight 返回中间主内容区高度（已扣除顶栏、输入栏、底部快捷键栏、弹窗占位）。
 func (m *Model) mainContentHeight() int {
 	topH := 1
-	inputH := 3
+	// 输入栏实际是 5 行：带边框样式的 Height(3) 只算内容区，上下边框再加 2 行。
+	// 预算必须按真实高度计算，否则整页比终端高出 2 行，
+	// alt-screen 只保留底部 N 行，顶栏与对话区首行（首个问题）会被顶出屏幕。
+	inputH := 5
 	shortcutH := 1
 	overlayH := 0
 	if m.overlayPanel.mode != overlayNone {

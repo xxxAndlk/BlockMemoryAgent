@@ -19,6 +19,10 @@ type ReactMessage struct {
 	Role      string     `json:"role"`                 // Role 表示消息角色，例如 user/assistant/tool/system
 	Content   string     `json:"content"`              // Content 是消息的文本内容
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"` // ToolCalls 是 assistant 消息附带的工具调用请求列表
+	// ToolCallID 仅 role="tool" 使用：标记该工具结果对应的工具调用 ID。
+	// Anthropic/OpenAI 原生工具协议要求 tool_result 必须引用存在的 tool_use id，
+	// 缺失会导致下一轮请求被 API 拒绝（400 tool_call_id is not found）。
+	ToolCallID string `json:"tool_call_id,omitempty"`
 }
 
 // ToolCall 表示模型请求执行某个命名工具的调用。
@@ -55,6 +59,36 @@ type ReactResult struct {
 	// LimitReached 为 true 表示达到最大轮数上限而暂停（非错误）：
 	// Text 为空，History 保留全部进度，上层应暂停会话并等待用户消息续跑。
 	LimitReached bool `json:"limit_reached,omitempty"`
+}
+
+// 实时进度事件种类：用于向 UI 推送 ReAct 运行过程中的中间状态。
+const (
+	// LiveEventLLMDelta 是 LLM 流式输出增量事件，Text 为截至当前的累积文本（非单块增量）。
+	LiveEventLLMDelta = "llm_delta"
+	// LiveEventToolCall 是工具调用开始事件（工具尚未执行完）。
+	LiveEventToolCall = "tool_call"
+	// LiveEventToolExec 是工具执行完成事件。
+	LiveEventToolExec = "tool_exec"
+	// LiveEventThinkDelta 是模型"思考过程"增量事件，Text 为截至当前的累积思考文本。
+	// 思考内容是瞬时的：仅用于展示当前 LLM 调用思考阶段的实时过程，
+	// 答复文本开始输出或会话结束时即被清除，不持久化。
+	LiveEventThinkDelta = "think_delta"
+	// LiveEventSubAgentDone 是子 Agent 完成事件（mailbox 收到子 Agent 结果摘要时触发），
+	// Tool 字段携带子 Agent ID。
+	LiveEventSubAgentDone = "sub_agent_done"
+)
+
+// LiveEvent 是 ReAct 运行过程中的实时进度事件，
+// 由 WithLiveEvents 注册的回调接收，供会话层写入事件流/流式状态以驱动 UI 实时渲染。
+type LiveEvent struct {
+	Kind    string // Kind 事件种类（LiveEventLLMDelta / LiveEventToolCall / LiveEventToolExec）
+	Agent   string // Agent 产生事件的 Agent 标识（emit 时自动填充）
+	Text    string // Text 仅 llm_delta 使用：截至当前的累积文本
+	Tool    string // Tool 工具名（tool_call / tool_exec 使用）
+	Input   string // Input 工具入参 JSON（tool_call 使用）
+	Output  string // Output 工具输出（tool_exec 使用）
+	Error   string // Error 工具错误信息（tool_exec 使用）
+	Success bool   // Success 工具是否执行成功（tool_exec 使用）
 }
 
 // ToolRegistry 抽象了 ReActAgent 可调用的工具集合。
@@ -117,11 +151,12 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 			out = append(out, msg)
 		case "tool":
 			// tool 角色表示工具执行结果，编码为一个带有 Response 字段的 ToolPart。
-			// 调用方应把工具产生的 JSON 结果设置到 Content 中传入。
+			// 调用方应把工具产生的 JSON 结果设置到 Content 中传入；
+			// ID 必须携带对应的工具调用 ID，否则 API 会因 tool_call_id 不匹配拒绝请求。
 			out = append(out, &blades.Message{
 				Role: blades.RoleTool,
 				Parts: []blades.Part{
-					blades.ToolPart{Response: m.Content},
+					blades.ToolPart{ID: m.ToolCallID, Response: m.Content},
 				},
 			})
 		case "system":

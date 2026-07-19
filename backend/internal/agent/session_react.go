@@ -48,6 +48,12 @@ type reactInternalSession struct {
 	TempDir string
 	// History 保存 React 对话历史，用于后续推理与恢复。
 	History []ReactMessage
+	// StreamingText 保存当前正在流式生成的助手文本（累积值，运行中才有意义），
+	// 供 TUI/Web 实时渲染"正在输出"的内容；会话结束时清空。
+	StreamingText string
+	// ThinkingText 保存当前 LLM 调用思考阶段的过程文本（累积值，瞬时不持久化），
+	// 答复文本开始输出或会话结束时清空。
+	ThinkingText string
 	// ctx 是会话的运行上下文，用于控制生命周期与取消。
 	ctx context.Context
 	// cancelFn 用于取消 ctx，通常在会话结束或关闭时调用。
@@ -288,6 +294,20 @@ func (st *reactSessionStore) addEvent(session *reactInternalSession, eventType, 
 	st.addEventDebug(session, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError, success, "", 0, 0, "")
 }
 
+// setStreamingText 更新会话当前正在流式生成的累积文本；传空串表示流式结束。
+func (st *reactSessionStore) setStreamingText(session *reactInternalSession, text string) {
+	st.mu.Lock()
+	session.StreamingText = text
+	st.mu.Unlock()
+}
+
+// setThinkingText 更新会话当前思考阶段的累积文本；传空串表示思考阶段结束。
+func (st *reactSessionStore) setThinkingText(session *reactInternalSession, text string) {
+	st.mu.Lock()
+	session.ThinkingText = text
+	st.mu.Unlock()
+}
+
 // addEventDebug 向会话追加一条带调试信息的事件，并同步打印日志。
 // session: 目标会话；eventType/agentName/message/kind/tool/toolPath/toolOutput/toolError/success: 事件字段；
 // prompt: 原始提示词；inputTokens/outputTokens: token 用量；detailJSON: 额外调试 JSON。
@@ -405,19 +425,21 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 			continue
 		}
 		// 将工具名、路径、输出、错误、成功标志加入结果集，并对输出截断。
+		// 文本字段统一过 sanitizeUTF8：Postgres jsonb 同样拒绝 NUL（），
+		// 工具输出夹带 0x00 会导致整条历史写入失败。
 		toolResults = append(toolResults, map[string]any{
 			"tool":   ev.Tool,
-			"path":   ev.ToolPath,
-			"output": textutil.TruncateRunes(ev.ToolOutput, 500, "...(truncated)"),
-			"error":  ev.ToolError,
+			"path":   sanitizeUTF8(ev.ToolPath),
+			"output": sanitizeUTF8(textutil.TruncateRunes(ev.ToolOutput, 500, "...(truncated)")),
+			"error":  sanitizeUTF8(ev.ToolError),
 			"ok":     ev.Success,
 		})
 	}
 	// rec 组装为数据库存储所需的历史记录结构。
 	rec := &store.SessionHistoryRecord{
 		SessionID:   session.ID,
-		Goal:        session.Goal,
-		Summary:     session.Result,
+		Goal:        sanitizeUTF8(session.Goal),
+		Summary:     sanitizeUTF8(session.Result),
 		ToolResults: toolResults,
 		MetaMemory:  []map[string]any{},
 		CreatedAt:   time.Now(),

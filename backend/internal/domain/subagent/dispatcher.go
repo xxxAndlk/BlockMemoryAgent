@@ -35,6 +35,16 @@ type ModelProviderFactory interface {
 	GetBladesProvider(ctx context.Context, roleID string) (agent.ModelProvider, error)
 }
 
+// BlockMemorySearcher 抽象块记忆（block_memory）的语义检索能力，
+// 由 store.PostgresStore 实现；为 nil 时跳过召回，不影响子 Agent 派发。
+type BlockMemorySearcher interface {
+	// SearchBlockMemoryByGoal 按目标文本做向量语义匹配，返回最相关的 topK 条块记忆。
+	SearchBlockMemoryByGoal(ctx context.Context, goal string, topK int) ([]*types.KnowledgeRecord, error)
+}
+
+// blockMemoryRecallTopK 是派发子 Agent 时召回块记忆的条数上限。
+const blockMemoryRecallTopK = 3
+
 // Dispatcher 负责创建并跟踪异步运行的子 Agent。
 // 它会将 call_sub_agent 工具注册到 domain/tool 注册表中，
 // 这样任何 ReActAgent 都可以在运行过程中动态生成子 Agent。
@@ -51,6 +61,8 @@ type Dispatcher struct {
 	timeout time.Duration
 	// loopCfg 是子 Agent ReAct 主循环的运行时配置（轮数/重试/历史滑窗等）。
 	loopCfg agent.LoopConfig
+	// searcher 可选的块记忆检索器；为 nil 时跳过拆分任务的块记忆召回。
+	searcher BlockMemorySearcher
 }
 
 // NewDispatcher 创建一个新的子 Agent 调度器。
@@ -82,6 +94,13 @@ func (d *Dispatcher) WithTimeout(t time.Duration) *Dispatcher {
 // WithLoopConfig 配置子 Agent ReAct 主循环的运行时参数（轮数/重试/历史滑窗等）。
 func (d *Dispatcher) WithLoopConfig(c agent.LoopConfig) *Dispatcher {
 	d.loopCfg = c
+	return d
+}
+
+// WithBlockMemorySearcher 注入块记忆检索器，使子 Agent 启动前能按拆分任务文本召回相关块记忆。
+// 传 nil 表示关闭召回（默认关闭）。
+func (d *Dispatcher) WithBlockMemorySearcher(s BlockMemorySearcher) *Dispatcher {
+	d.searcher = s
 	return d
 }
 
@@ -208,6 +227,10 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	// defer 确保无论运行成功或失败，子 Agent 结束时都从 running 中移除，防止内存泄漏。
 	defer d.running.Delete(subAgentID)
 
+	// 记忆只在拆分后按拆分任务匹配注入：以子任务文本做块记忆语义召回，
+	// 命中时把记忆内容拼到任务前；未命中或召回失败时任务原样执行。
+	task = d.injectRecalledMemory(ctx, task)
+
 	// 驱动子 Agent 执行具体任务。
 	result, err := sub.Run(ctx, task)
 	if err != nil {
@@ -244,6 +267,27 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	d.notify(parentID, subAgentID, result.Text)
 }
 
+// injectRecalledMemory 按拆分出的子任务文本召回块记忆，并把命中内容拼到任务前。
+// 未配置检索器、无命中或召回出错时返回原任务，保证派发主流程不受影响。
+func (d *Dispatcher) injectRecalledMemory(ctx context.Context, task string) string {
+	if d.searcher == nil {
+		return task
+	}
+	recs, err := d.searcher.SearchBlockMemoryByGoal(ctx, task, blockMemoryRecallTopK)
+	if err != nil || len(recs) == 0 {
+		return task
+	}
+	// 拼接命中记忆：编号列出，便于大模型区分多条记忆条目。
+	var sb strings.Builder
+	sb.WriteString("【相关记忆】\n")
+	for i, rec := range recs {
+		fmt.Fprintf(&sb, "%d. %s\n", i+1, strings.TrimSpace(rec.Content))
+	}
+	sb.WriteString("\n【当前任务】\n")
+	sb.WriteString(task)
+	return sb.String()
+}
+
 // partialSuffix 把部分进度文本拼接到通知末尾；为空时返回空串。
 func partialSuffix(partial string) string {
 	if partial == "" {
@@ -278,7 +322,8 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string) {
 }
 
 // roleIDFromAgentID 从 Agent 句柄中还原出角色 ID。
-// 顶层 Agent 直接使用角色 ID 作为标识；子 Agent 的标识格式为 "parent/role-n"。
+// 子 Agent 的标识格式为 "parent/role-n"，取最后一段并去掉序号；
+// 顶层 Agent 以会话 ID（session-N）命名，其角色恒为 MetaAgent，返回 "meta"。
 func roleIDFromAgentID(agentID string) string {
 	// 查找最后一个 '/'，若存在则取最后一段 "role-n"。
 	if idx := strings.LastIndex(agentID, "/"); idx >= 0 {
@@ -289,8 +334,9 @@ func roleIDFromAgentID(agentID string) string {
 		}
 		return seg
 	}
-	// 顶层 Agent 没有 '/'，直接返回整个 agentID 作为角色 ID。
-	return agentID
+	// 顶层 Agent 没有 '/'：生产环境中其名称为会话 ID（session-N），
+	// 由 runSession/resumeSession 以 meta 角色创建，故角色恒为 "meta"。
+	return "meta"
 }
 
 // MarshalResult 将 tool.Result 序列化为 JSON 字符串，用于 blades 工具响应。

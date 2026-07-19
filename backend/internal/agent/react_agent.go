@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/mailbox"
@@ -36,6 +37,8 @@ type ReActAgent struct {
 	historyMaxMessages int
 	// toolOutputMaxRunes 是写入历史的单条工具输出最大字符数；<=0 不截断。
 	toolOutputMaxRunes int
+	// liveFn 是实时进度事件回调，由 WithLiveEvents 注入；nil 时不推送任何进度事件。
+	liveFn func(LiveEvent)
 }
 
 // LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。
@@ -108,6 +111,22 @@ func (a *ReActAgent) WithLoopConfig(c LoopConfig) *ReActAgent {
 	return a
 }
 
+// WithLiveEvents 注入实时进度事件回调，用于向 UI 推送 LLM 流式输出与工具执行进度。
+// 传 nil 表示关闭进度推送（默认关闭）。
+func (a *ReActAgent) WithLiveEvents(fn func(LiveEvent)) *ReActAgent {
+	a.liveFn = fn
+	return a
+}
+
+// emitLive 发送一条实时进度事件；未注册回调时直接丢弃，Agent 标识在此统一填充。
+func (a *ReActAgent) emitLive(ev LiveEvent) {
+	if a.liveFn == nil {
+		return
+	}
+	ev.Agent = a.name
+	a.liveFn(ev)
+}
+
 // Run 针对给定的用户输入执行 ReAct 循环。
 // 参数 ctx 用于取消/超时控制；input 为用户输入文本。
 // 返回值 ReactResult 包含助手最终回复与完整会话历史；error 表示执行过程中的错误。
@@ -115,6 +134,13 @@ func (a *ReActAgent) Run(ctx context.Context, input string) (ReactResult, error)
 	// 委托给 RunWithHistory，从空历史开始新的会话。
 	return a.RunWithHistory(ctx, input, nil)
 }
+
+// maxEmptyResponses 是允许的连续空响应次数上限：超过即判定模型异常，显式报错，
+// 避免任务被"无声完成"（用户看到的就是任务莫名其妙中断）。
+const maxEmptyResponses = 3
+
+// emptyResponseNudge 是收到空响应时注入的用户提示，要求模型继续推进任务。
+const emptyResponseNudge = "（系统提示：你上一条回复为空，未包含任何文本或工具调用。请继续推进当前任务；若任务确已全部完成，请直接输出完整的最终答复。）"
 
 // RunWithHistory 从已有历史开始执行 ReAct 循环。
 // 参数 ctx 用于取消/超时控制；input 为新的用户输入；history 为已有会话历史。
@@ -137,6 +163,8 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 
 	// 进入 ReAct 主循环，最多执行 maxIter 次 LLM 调用（maxIter<=0 时不限制）。
 	// 每次循环对应一次“思考-行动-观察”的迭代。
+	// emptyStreak 记录连续空响应次数，用于空响应保护（见循环内注释）。
+	emptyStreak := 0
 	for i := 0; a.maxIter <= 0 || i < a.maxIter; i++ {
 		// 在每次调用 LLM 之前，通过记忆流水线组装上下文消息。
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
@@ -163,8 +191,26 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			return ReactResult{History: history}, fmt.Errorf("llm generate: %w", err)
 		}
 
-		// 将 blades 返回的消息转换为内部 Assistant 消息并追加到历史中。
+		// 将 blades 返回的消息转换为内部 Assistant 消息。
 		assistant := AssistantMessageFromBlades(resp.Message)
+
+		// 空响应保护：模型既未输出文本也未调用工具（常见于思考阶段耗尽
+		// max_tokens、端点异常或流被中途截断）。若当作最终答复返回，任务会
+		// "无声完成"——用户看到的就是任务莫名其妙中断。改为注入提示消息让
+		// 模型继续；连续空响应达到上限则显式报错，让上层以可见错误结束。
+		if len(assistant.ToolCalls) == 0 && strings.TrimSpace(assistant.Content) == "" {
+			emptyStreak++
+			if emptyStreak >= maxEmptyResponses {
+				return ReactResult{History: history}, fmt.Errorf("model returned %d consecutive empty responses (finish_reason=%s)", emptyStreak, resp.Message.FinishReason)
+			}
+			// 空 assistant 消息不写入历史（空 content 块可能被 API 拒绝），
+			// 仅以一条提示消息要求模型继续。
+			history = append(history, ReactMessage{Role: "user", Content: emptyResponseNudge})
+			continue
+		}
+		emptyStreak = 0
+
+		// 非空响应才追加到历史中。
 		history = append(history, assistant)
 
 		// 在判断本轮是否结束之前，先轮询邮箱并注入任何新的异步消息。
@@ -174,6 +220,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			for _, m := range a.mailbox.Drain(a.name) {
 				// 将 mailbox 消息转为模型可见的 user 角色消息并加入历史。
 				history = append(history, mailboxMessageToReact(m))
+
+				// 实时推送子 Agent 完成事件，UI 可据此更新"等待子 Agent"状态。
+				a.emitLive(LiveEvent{Kind: LiveEventSubAgentDone, Tool: m.From, Text: truncateRunes(m.Body, 200)})
 
 				// 同时把子代理摘要作为记忆事件写入，供后续上下文组装使用。
 				a.memory.Write(a.name, MemoryEvent{
@@ -203,11 +252,23 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 否则，按顺序执行助手请求的所有工具调用，并将结果反馈回会话。
 		// 工具调用顺序执行，以保持追踪顺序与模型调用顺序一致。
 		for _, tc := range assistant.ToolCalls {
+			// 实时推送工具调用开始事件，UI 可据此展示"执行中"状态。
+			a.emitLive(LiveEvent{Kind: LiveEventToolCall, Tool: tc.Name, Input: mustMarshal(tc.Input)})
+
 			// 分发执行单个工具调用；出错时构造包含错误信息的 ToolResult。
 			result, err := a.tools.Dispatch(ctx, tc)
 			if err != nil {
 				result = ToolResult{Tool: tc.Name, Error: err.Error()}
 			}
+
+			// 实时推送工具执行完成事件（成功/失败与输出）。
+			a.emitLive(LiveEvent{
+				Kind:    LiveEventToolExec,
+				Tool:    tc.Name,
+				Output:  result.Output,
+				Error:   result.Error,
+				Success: err == nil && result.Error == "",
+			})
 
 			// 截断工具输出后再写入历史，避免单次大输出（如整文件/长日志）
 			// 在历史中无限累积，导致后续每轮请求 token 爆炸。
@@ -216,9 +277,12 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			}
 
 			// 将工具执行结果以 tool 角色消息追加到历史中，供下一次 LLM 调用使用。
+			// ToolCallID 携带本次调用的 ID：Anthropic/OpenAI 原生工具协议要求
+			// tool_result 必须引用对应的 tool_use id，否则下一轮请求会被 API 拒绝。
 			history = append(history, ReactMessage{
-				Role:    "tool",
-				Content: ToolResultJSON(result),
+				Role:       "tool",
+				Content:    ToolResultJSON(result),
+				ToolCallID: tc.ID,
 			})
 
 			// 把工具调用细节与结果写入记忆流水线（保留完整输出，展示层自行截断）。
@@ -267,7 +331,7 @@ func (a *ReActAgent) generate(ctx context.Context, req *blades.ModelRequest) (*b
 		if a.llmTimeout > 0 {
 			callCtx, cancel = context.WithTimeout(ctx, a.llmTimeout)
 		}
-		resp, err := a.llm.Generate(callCtx, req)
+		resp, err := a.generateOnce(callCtx, req)
 		cancel()
 		if err != nil {
 			lastErr = err
@@ -284,6 +348,77 @@ func (a *ReActAgent) generate(ctx context.Context, req *blades.ModelRequest) (*b
 		return resp, nil
 	}
 	return nil, lastErr
+}
+
+// streamingModelProvider 是 blades.ModelProvider 的可选流式接口子集。
+// 具体 provider（如 contrib/openai）通常同时实现 Generate 与 NewStreaming；
+// 仅实现 Generate 的 provider（含测试 mock）自动回退到一次性调用。
+type streamingModelProvider interface {
+	// NewStreaming 执行请求并返回一个逐块产出响应的生成器；
+	// 最后一个产出值是完整累积响应（contrib/openai 由 accumulator 保证）。
+	NewStreaming(context.Context, *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error]
+}
+
+// generateOnce 执行单次 LLM 调用：provider 支持流式时走流式并推送 llm_delta 实时事件，
+// 否则回退到一次性 Generate。
+func (a *ReActAgent) generateOnce(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	if sp, ok := a.llm.(streamingModelProvider); ok {
+		return a.generateStreaming(ctx, req, sp)
+	}
+	return a.llm.Generate(ctx, req)
+}
+
+// generateStreaming 消费流式响应：中间块只用于向 UI 推送累积文本，
+// 最后一个产出值作为本次调用的完整响应返回（文本/工具调用均以它为准）。
+func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelRequest, sp streamingModelProvider) (*blades.ModelResponse, error) {
+	var final *blades.ModelResponse
+	// display 是截至当前累积的展示文本。
+	// 不同 provider 的块语义不同：增量块追加、全量（累积）块替换——
+	// 用"块文本是否以已有累积文本为前缀"区分两种形态，兼容两类 provider。
+	display := ""
+	for resp, err := range sp.NewStreaming(ctx, req) {
+		if err != nil {
+			return nil, err
+		}
+		if resp == nil || resp.Message == nil {
+			continue
+		}
+		final = resp
+		// 思考过程增量（provider 经 Metadata 传递）：瞬时推送，答复文本开始输出后由
+		// 上层清除；思考内容不进入答复文本，避免与正式输出混淆。
+		if thinking, ok := resp.Message.Metadata["thinking"].(string); ok && thinking != "" {
+			a.emitLive(LiveEvent{Kind: LiveEventThinkDelta, Text: thinking})
+			continue
+		}
+		text := bladesText(resp.Message)
+		if text == "" {
+			continue
+		}
+		if display == "" || strings.HasPrefix(text, display) {
+			display = text
+		} else {
+			display += text
+		}
+		a.emitLive(LiveEvent{Kind: LiveEventLLMDelta, Text: display})
+	}
+	if final == nil {
+		return nil, errors.New("empty model stream")
+	}
+	return final, nil
+}
+
+// bladesText 提取 blades 消息中的全部文本部分（忽略工具调用等非文本部分）。
+func bladesText(m *blades.Message) string {
+	if m == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, p := range m.Parts {
+		if tp, ok := p.(blades.TextPart); ok {
+			sb.WriteString(tp.Text)
+		}
+	}
+	return sb.String()
 }
 
 // windowMessages 把发送给 LLM 的消息裁剪到最多 max 条（滑动窗口）：

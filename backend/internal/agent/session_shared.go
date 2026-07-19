@@ -87,6 +87,11 @@ func trimDebugEvents(events []internalEvent, maxDrop int) []internalEvent {
 // 如果字符串已经是合法 UTF-8，则直接返回原字符串以节省拷贝。
 // 否则使用 Unicode 替换字符 "�" 替换非法字节序列。
 func sanitizeUTF8(s string) string {
+	// PostgreSQL text 字段拒绝 NUL 字节（0x00），先剥离；
+	// 工具输出/命令日志常夹带 NUL，不入库会报 invalid byte sequence。
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
 	// 快速路径：字符串合法则直接返回
 	if utf8.ValidString(s) {
 		return s
