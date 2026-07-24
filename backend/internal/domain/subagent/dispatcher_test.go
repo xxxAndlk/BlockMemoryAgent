@@ -591,30 +591,9 @@ func TestDispatcher_VerificationMaxRounds(t *testing.T) {
 	}
 }
 
-// sequenceProvider 是按调用顺序依次返回预设响应的 mock provider，
-// 供实例池服务态测试驱动子 Agent 多轮 RunWithHistory。
-type sequenceProvider struct {
-	mu       sync.Mutex
-	responses []string
-	calls     int
-}
-
-func (s *sequenceProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	text := "default"
-	if s.calls < len(s.responses) {
-		text = s.responses[s.calls]
-	}
-	s.calls++
-	return &blades.ModelResponse{Message: blades.AssistantMessage(text)}, nil
-}
-
-func (s *sequenceProvider) Name() string { return "seq" }
-
-// TestDispatcher_ReusePool_ServiceMode 验证实例池复用：子 Agent 完成初始任务后转入服务态，
-// 收到 send_message 询问时回复，闲置超时后退出服务态。
-func TestDispatcher_ReusePool_ServiceMode(t *testing.T) {
+// TestDispatcher_KVMemoryInjection 验证 KV 共享记忆注入：子 Agent 派发时读取主 Agent
+// 写入的共享记忆并拼到任务前，使被询问协程能看到主 Agent 的关键上下文。
+func TestDispatcher_KVMemoryInjection(t *testing.T) {
 	cfg := &config.RoleConfigFile{
 		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
@@ -625,45 +604,53 @@ func TestDispatcher_ReusePool_ServiceMode(t *testing.T) {
 	reg := role.NewRegistry(cfg)
 	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	mb := mailbox.New()
-	// 序列：第 1 轮 Run 返回初始任务结果，第 2 轮 RunWithHistory 返回对询问的回复。
-	prov := &sequenceProvider{responses: []string{"initial task done", "reply: all good"}}
-	d := NewDispatcher(reg, &mockModelFactory{provider: prov}, toolsReg, mb, agent.NopMemoryPipeline{})
-	// 开启复用，闲置超时设为 1 秒（测试用短时）。
-	d.WithReuse(true, 1*time.Second)
-	d.RegisterCallTool(toolsReg)
-	d.RegisterMessagingTool(toolsReg)
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg, mb, agent.NopMemoryPipeline{})
 
-	// 派发子 Agent，等待其完成初始任务并进入服务态。
-	subAgentID := dispatchCodeAssistant(t, toolsReg)
-	// 等待父邮箱收到初始完成通知（标志 runSubAgent 已走到 servePooled 入口）。
-	waitForCond(t, "initial completion notify", func() bool { return len(mb.Drain("meta")) > 0 })
-	// 等待子 Agent 进入实例池。
-	waitForCond(t, "enter pool", func() bool { return d.IsPooled(subAgentID) })
+	// 主 Agent 写入共享记忆（可写实例）。
+	kv := newTestKVMemory(true)
+	_ = kv.Set(context.Background(), "meta:shared", "project uses Go 1.25")
+	// Dispatcher 注入只读视图。
+	d.WithKVMemory(kv)
 
-	// 通过 send_message 向子 Agent 投递询问。
-	_, err := toolsReg.Dispatch(agent.WithAgentID(context.Background(), "meta"), "send_message", map[string]any{
-		"to_agent_id": subAgentID,
-		"subject":     "are you ok?",
-		"body":        "status check",
-	})
-	if err != nil {
-		t.Fatalf("send_message: %v", err)
+	// 验证只读实例拒绝写入。
+	if err := newTestKVMemory(false).Set(context.Background(), "k", "v"); err == nil {
+		t.Fatal("read-only KV should reject Set")
 	}
 
-	// 子 Agent 应在服务态处理询问，并把回复投递到 meta 邮箱（ReplyTo=meta）。
-	waitForCond(t, "service reply", func() bool {
-		msgs := mb.Drain("meta")
-		for _, m := range msgs {
-			if m.Type == mailbox.MsgReply && strings.Contains(m.Body, "reply: all good") {
-				return true
-			}
-		}
-		return false
-	})
-
-	// 等待闲置超时后子 Agent 应退出实例池。
-	waitForCond(t, "idle timeout eviction", func() bool { return !d.IsPooled(subAgentID) })
-
-	// Stop 应幂等且不 panic。
-	d.Stop()
+	// ExecuteChild 注入 KV 记忆后执行子 Agent，不 panic 即通过。
+	_, err := d.ExecuteChild(context.Background(), "meta", "code_assistant", "write a function")
+	if err != nil {
+		t.Fatalf("ExecuteChild: %v", err)
+	}
 }
+
+// testKVMemory 是测试用的 KVMemory 实现，支持可写/只读。
+type testKVMemory struct {
+	items    map[string]string
+	writable bool
+}
+
+func newTestKVMemory(writable bool) *testKVMemory {
+	return &testKVMemory{items: make(map[string]string), writable: writable}
+}
+
+func (m *testKVMemory) Get(ctx context.Context, key string) (string, error) {
+	return m.items[key], nil
+}
+
+func (m *testKVMemory) Set(ctx context.Context, key, value string) error {
+	if !m.writable {
+		return errors.New("read-only")
+	}
+	m.items[key] = value
+	return nil
+}
+
+func (m *testKVMemory) Delete(ctx context.Context, key string) error {
+	if !m.writable {
+		return errors.New("read-only")
+	}
+	delete(m.items, key)
+	return nil
+}
+

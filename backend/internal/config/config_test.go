@@ -37,15 +37,16 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if cfg.Agent.BlockMemoryWriteEnabled == nil || !*cfg.Agent.BlockMemoryWriteEnabled {
 		t.Fatal("block_memory_write_enabled 默认应为 true")
 	}
-	// 子 Agent 实例池默认关闭，需显式开启。
-	if cfg.Agent.SubAgentReuseEnabled == nil || *cfg.Agent.SubAgentReuseEnabled {
-		t.Fatal("sub_agent_reuse_enabled 默认应为 false")
-	}
-	// 闲置超时与验证往返上限应有非零默认值。
-	if cfg.Agent.SubAgentIdleTimeoutSec != 300 {
-		t.Fatalf("sub_agent_idle_timeout_sec 默认应为 300, got %d", cfg.Agent.SubAgentIdleTimeoutSec)
-	}
+	// 验证往返上限应有非零默认值。
 	if cfg.Agent.VerificationMaxRounds != 5 {
 		t.Fatalf("verification_max_rounds 默认应为 5, got %d", cfg.Agent.VerificationMaxRounds)
+	}
+	// 验证角色对应回退默认 [{code_assistant, test_assistant}]。
+	if len(cfg.Agent.VerificationRolePairs) != 1 {
+		t.Fatalf("expected 1 default role pair, got %d", len(cfg.Agent.VerificationRolePairs))
+	}
+	p := cfg.Agent.VerificationRolePairs[0]
+	if p.CodeRole != "code_assistant" || p.TestRole != "test_assistant" {
+		t.Fatalf("default pair mismatch: %+v", p)
 	}
 }

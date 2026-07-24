@@ -72,6 +72,18 @@ agent:
   plan_enabled: false            # Plan-and-Execute（默认关闭）
   reflection_enabled: false      # Self-Reflection（默认关闭）
   human_clarify_timeout_sec: 120 # 等待用户回答超时（秒）
+  # 多 Agent 协作验证闭环（verifyloop 编排器原生驱动，不依赖主 Agent 提示词）
+  assistant_self_test_enabled: false # code_assistant 完成后自动触发"自测->修正->上级统一测试"状态机（默认关闭）
+  domain_self_test_enabled: false    # 领域 Agent 完成后触发模块级统一测试（默认关闭，待 service_react 接线）
+  verification_max_rounds: 5         # 验证闭环往返上限，防止 code<->test 平级互问死循环
+  # 验证角色对：产出角色完成后由测试角色验证。为空时回退默认 [{code_assistant, test_assistant}]。
+  # 显式配置可扩展多角色对，如 UI 任务由 test_assistant 验证：
+  #   - code_role: ui_assistant
+  #     test_role: test_assistant
+  verification_role_pairs:
+    - code_role: code_assistant
+      test_role: test_assistant
+  block_memory_write_enabled: true   # 子 Agent 完成后沉淀结果摘要到块记忆知识库
   # 工具沙箱（安全）
   tool_sandbox_disabled: false   # true 时关闭写路径逃逸检测（保留命令黑名单）
   tool_sandbox_allowed_paths: [] # 允许读写的额外绝对路径白名单

@@ -2,7 +2,6 @@ package mailbox
 
 import (
 	"testing" // Go 测试框架
-	"time"
 )
 
 // TestMailbox_DirectSendAndDrain 验证定向投递、Drain 与优先级排序。
@@ -85,47 +84,5 @@ func TestMailbox_ReplyToAndThreadID(t *testing.T) {
 	}
 	if msgs[0].Type != MsgRequest {
 		t.Fatalf("Type mismatch: got %q", msgs[0].Type)
-	}
-}
-
-// TestMailbox_WaitForMessage_Immediate 验证已有未读消息时 WaitForMessage 立即返回 true。
-func TestMailbox_WaitForMessage_Immediate(t *testing.T) {
-	m := New()
-	m.Send(&Message{To: "a", Subject: "hi"})
-	if !m.WaitForMessage("a", 100*time.Millisecond) {
-		t.Fatal("expected immediate return when message already present")
-	}
-}
-
-// TestMailbox_WaitForMessage_BlocksAndSignals 验证无消息时 WaitForMessage 阻塞，
-// 收到新消息后被唤醒返回 true。
-func TestMailbox_WaitForMessage_BlocksAndSignals(t *testing.T) {
-	m := New()
-	done := make(chan bool, 1)
-	go func() {
-		done <- m.WaitForMessage("worker", 500*time.Millisecond)
-	}()
-	// 给 goroutine 一点时间进入阻塞等待。
-	time.Sleep(30 * time.Millisecond)
-	m.Send(&Message{To: "worker", Subject: "wake up"})
-	select {
-	case ok := <-done:
-		if !ok {
-			t.Fatal("expected true after signal, got false")
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("WaitForMessage did not return after signal")
-	}
-}
-
-// TestMailbox_WaitForMessage_Timeout 验证无消息且超时后返回 false。
-func TestMailbox_WaitForMessage_Timeout(t *testing.T) {
-	m := New()
-	start := time.Now()
-	if m.WaitForMessage("nobody", 50*time.Millisecond) {
-		t.Fatal("expected false on timeout")
-	}
-	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
-		t.Fatalf("expected to wait at least 50ms, got %v", elapsed)
 	}
 }

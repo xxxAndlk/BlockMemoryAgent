@@ -4,6 +4,7 @@ package subagent
 import (
 	"context"       // context 用于控制子 Agent 的生命周期与超时
 	"encoding/json" // encoding/json 用于序列化 tool.Result
+	"errors"        // errors 提供哨兵错误 errLimitReached 与 errors.Is 判定
 	"fmt"           // fmt 用于格式化子 Agent ID 与错误信息
 	"log"           // log 用于记录块记忆写入失败等不影响主流程的错误
 	"strings"       // strings 用于从 Agent ID 中提取角色 ID
@@ -83,15 +84,14 @@ type Dispatcher struct {
 	// 键为 "callerRoleID->calleeRoleID"，值为 *atomic.Int64。
 	roundCounts sync.Map
 
-	// pool 存储已完成初始任务、进入"服务态"等待复用的子 Agent，键为 subAgentID，
-	// 值为 *pooledAgent。仅在 reuseEnabled=true 时填充。对应"被询问时开协程回复"
-	// 的协作验证闭环底座：子 Agent 不立即销毁，转为闲置态等待 send_message 询问。
-	pool sync.Map
+	// onSubAgentDone 是子 Agent 异步成功完成时的钩子，供 verifyloop 编排器接管自测流程。
+	// 为 nil 时关闭钩子；仅在 call_sub_agent 异步路径触发，ExecuteChild 同步路径不触发。
+	onSubAgentDone SubAgentDoneHandler
 
-	// reuseEnabled 控制子 Agent 完成后是否进入实例池等待复用（默认 false）。
-	reuseEnabled bool
-	// idleTimeout 实例池中子 Agent 的闲置超时：超过该时长未收到任何消息则被回收销毁。
-	idleTimeout time.Duration
+	// kvMemory 是可选的键值对共享记忆（只读视图），供"协程 Agent 共享主 Agent 记忆"语义使用。
+	// 子 Agent 派发时按 kvKey 读取共享记忆注入任务前缀，使被询问协程能看到主 Agent 的关键记忆。
+	// 为 nil 时关闭共享记忆注入，不影响派发主流程。写入由主线程 Agent 直接持可写 KVMemory 完成。
+	kvMemory KVMemoryReader
 
 	// verificationMaxRounds 验证闭环往返上限：同一父 Agent 派发同一角色的次数超过该值时
 	// 拒绝进一步派发，防止 code<->test 平级互问死循环。<=0 表示不限制。
@@ -230,49 +230,6 @@ func (d *Dispatcher) WithBlockMemorySearcher(s BlockMemorySearcher) *Dispatcher 
 func (d *Dispatcher) WithVerificationMaxRounds(n int) *Dispatcher {
 	d.verificationMaxRounds = n
 	return d
-}
-
-// WithReuse 注入实例池复用开关与闲置超时，使子 Agent 完成初始任务后不立即销毁，
-// 转为"服务态"等待 send_message 询问。对应"被询问时开协程回复"的协作验证闭环底座。
-// enabled 为 false 时关闭复用（默认）；idleTimeout<=0 时回退到 5 分钟。
-func (d *Dispatcher) WithReuse(enabled bool, idleTimeout time.Duration) *Dispatcher {
-	d.reuseEnabled = enabled
-	d.idleTimeout = idleTimeout
-	if d.idleTimeout <= 0 {
-		d.idleTimeout = 5 * time.Minute
-	}
-	return d
-}
-
-// pooledAgent 描述一个已完成初始任务、进入服务态等待复用的子 Agent。
-type pooledAgent struct {
-	agent    *agent.ReActAgent // agent 子 Agent 实例，复用其 LLM/工具/记忆装配
-	roleDef  types.RoleDefinition
-	parentID string
-	lastUsed time.Time
-	cancel   context.CancelFunc // 取消后终止服务循环
-}
-
-// IsPooled 报告指定 subAgentID 是否仍在实例池中（即处于服务态）。
-// 供 send_message 工具与上层判断目标 Agent 是否可被询问。
-func (d *Dispatcher) IsPooled(subAgentID string) bool {
-	if !d.reuseEnabled {
-		return false
-	}
-	_, ok := d.pool.Load(subAgentID)
-	return ok
-}
-
-// Stop 释放实例池中所有闲置子 Agent，供 bootstrap 在进程退出时调用。
-// 幂等：多次调用安全。
-func (d *Dispatcher) Stop() {
-	d.pool.Range(func(k, v any) bool {
-		if pa, ok := v.(*pooledAgent); ok && pa.cancel != nil {
-			pa.cancel()
-		}
-		d.pool.Delete(k)
-		return true
-	})
 }
 
 // WithBlockMemorySaver 注入块记忆写入器与写入开关，使子 Agent 成功完成后
@@ -475,74 +432,76 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 
 // runSubAgent 为指定角色创建 ReActAgent，驱动其运行，
 // 并在完成后将最终结果推送到父 Agent 的邮箱。
+// 这是 call_sub_agent 工具的异步执行路径：runSubAgentOnce 纯执行 + notify + 钩子。
 func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task string) {
-	// 根据角色 ID 获取模型提供者，失败则通知父 Agent 并结束。
-	provider, err := d.models.GetBladesProvider(ctx, roleDef.ID)
+	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task)
 	if err != nil {
-		d.notify(parentID, subAgentID, fmt.Sprintf("sub-agent failed: get model: %v", err))
+		partial := ""
+		if result.History != nil {
+			partial = truncateRunes(agent.LastAssistantText(result.History), 500)
+		}
+		d.notify(parentID, subAgentID, formatSubAgentFailure(err, result, d.timeout, partial))
 		return
 	}
 
-	// 若调度器未配置记忆管道，则使用空实现 NopMemoryPipeline，避免后续调用出现 nil 指针。
+	// 成功：通知父 Agent，触发完成钩子。
+	d.notify(parentID, subAgentID, result.Text)
+
+	// 完成钩子：供 verifyloop 编排器接管"代码->测试->修正->统一测试"原生状态机。
+	// 仅在异步 call_sub_agent 路径触发；ExecuteChild 同步路径不触发，避免编排器递归。
+	if d.onSubAgentDone != nil {
+		d.onSubAgentDone(parentID, subAgentID, roleDef.ID, task, result.Text)
+	}
+}
+
+// runSubAgentOnce 纯执行路径：创建子 Agent、注入块记忆、驱动 Run、沉淀块记忆，
+// 返回子 Agent 实例 + 完整结果 + 错误。不 notify、不触发钩子、不进入实例池。
+// 供异步 runSubAgent 包装器与同步 ExecuteChild（编排器）共用。
+//
+// 错误语义：
+//   - 获取 provider 失败、Run 返回 error、LimitReached 均返回非 nil err；
+//   - 成功时 err == nil，result.Text 为最终答复。
+func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task string) (*agent.ReActAgent, agent.ReactResult, error) {
+	provider, err := d.models.GetBladesProvider(ctx, roleDef.ID)
+	if err != nil {
+		return nil, agent.ReactResult{}, fmt.Errorf("get model: %w", err)
+	}
+
 	mem := d.memory
 	if mem == nil {
 		mem = agent.NopMemoryPipeline{}
 	}
 
-	// 创建子 Agent 实例：
-	//   - 使用 subAgentID 作为 Agent 唯一标识。
-	//   - roleDef 提供角色配置。
-	//   - provider 提供模型调用能力。
-	//   - ToolRegistryAdapter 将 domain/tool 注册表适配为 agent 层可用的工具注册表。
-	// 随后通过 WithMailbox、WithMemory 与 WithLoopConfig 注入邮箱、记忆管道与循环配置。
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapter(d.tools)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopCfg)
 
-	// 将子 Agent 记录到 running 映射，便于外部查询运行状态。
 	d.running.Store(subAgentID, sub)
-	// defer 确保无论运行成功或失败，子 Agent 结束时都从 running 中移除，防止内存泄漏。
 	defer d.running.Delete(subAgentID)
-	// defer 确保子 Agent 结束后回收其收件箱（含未读/已读消息），
-	// 避免 inbox map 中该 subAgentID 键长期残留造成内存泄漏；Purge 为幂等删除，可安全调用。
 	defer func() {
 		if d.mailbox != nil {
 			d.mailbox.Purge(subAgentID)
 		}
 	}()
 
-	// 记忆只在拆分后按拆分任务匹配注入：以子任务文本做块记忆语义召回，
-	// 命中时把记忆内容拼到任务前；未命中或召回失败时任务原样执行。
 	// 保留原始任务文本，供块记忆沉淀时作为 goal 标签使用（避免混入召回前缀）。
 	origTask := task
+	// KV 共享记忆注入：按 parentID 派生键读取主 Agent 写入的关键记忆，拼到任务前。
+	// 使被询问协程 Agent 能看到主 Agent 的上下文，对应"协程 Agent 共享主 Agent 记忆"语义。
+	task = d.injectKVMemory(ctx, parentID, task)
+	// 块记忆召回注入：以子任务文本做语义检索，命中则拼到任务前。
 	task = d.injectRecalledMemory(ctx, task)
 
-	// 驱动子 Agent 执行具体任务。
 	result, err := sub.Run(ctx, task)
 	if err != nil {
-		// 失败/超时时尽量回传已达成的部分进度（最后一条 assistant 输出），
-		// 避免长时间执行后父 Agent 拿不到任何信息。
-		partial := agent.LastAssistantText(result.History)
-		if partial != "" {
-			partial = truncateRunes(partial, 500)
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			d.notify(parentID, subAgentID, fmt.Sprintf("子 Agent 执行超时（已运行 %v），已被终止。%s", d.timeout, partialSuffix(partial)))
-			return
-		}
-		d.notify(parentID, subAgentID, fmt.Sprintf("sub-agent failed: %v%s", err, partialSuffix(partial)))
-		return
+		return sub, result, fmt.Errorf("run: %w", err)
 	}
 
-	// 轮数上限：子 Agent 暂停而非失败，同样回传部分进度并说明原因。
 	if result.LimitReached {
-		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
-		d.notify(parentID, subAgentID, fmt.Sprintf("子 Agent 已达最大轮数上限并暂停。%s", partialSuffix(partial)))
-		return
+		return sub, result, errLimitReached
 	}
 
-	// 将任务结果以 task_goal_summary 事件写入记忆管道，便于后续检索与复盘。
 	_ = mem.Write(subAgentID, agent.MemoryEvent{
 		Type:    "task_goal_summary",
 		AgentID: subAgentID,
@@ -550,114 +509,81 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		Content: result.Text,
 	})
 
-	// 块记忆沉淀：将子 Agent 结果摘要写入块记忆知识库，
-	// 与派发前的 injectRecalledMemory 召回形成"召回→执行→沉淀"闭环。
-	// 写入失败仅记日志，不影响主流程的完成通知投递。
 	d.saveBlockMemory(ctx, subAgentID, roleDef.ID, origTask, result.Text)
 
-	// 向父 Agent 邮箱发送任务完成通知，Body 为子 Agent 产出的总结文本。
-	d.notify(parentID, subAgentID, result.Text)
-
-	// 实例池复用：子 Agent 成功完成后不立即销毁，转入服务态等待 send_message 询问。
-	// 对应"被询问时开协程回复"的协作验证闭环底座；未开启时函数直接返回，runSubAgent 结束。
-	// servePooled 返回前会自行清理 pool/mailbox，runSubAgent 的 defer Purge 为幂等兜底。
-	d.servePooled(subAgentID, parentID, roleDef, sub, result.History)
+	return sub, result, nil
 }
 
-// pooledHistoryMax 是实例池中子 Agent 保留的历史消息上限。
-// 超过时丢弃最旧的非 system 消息，防止长生命周期服务态下历史无限增长。
-const pooledHistoryMax = 100
+// errLimitReached 是子 Agent 达到最大轮数的哨兵错误，供 formatSubAgentFailure 区分通知文案。
+var errLimitReached = errors.New("sub-agent limit reached")
 
-// servePooled 让已完成初始任务的子 Agent 进入服务态：阻塞等待 mailbox 询问，
-// 收到消息时以消息正文为新输入驱动子 Agent RunWithHistory，并把回复投递给 ReplyTo。
-// 闲置超过 idleTimeout 则退出服务态、销毁子 Agent；serveCtx 被外部 cancel（如 Dispatcher.Stop）时也退出。
-// 未开启复用、未配置邮箱或子 Agent 为 nil 时直接返回。
-func (d *Dispatcher) servePooled(subAgentID, parentID string, roleDef types.RoleDefinition, sub *agent.ReActAgent, history []agent.ReactMessage) {
-	if !d.reuseEnabled || d.mailbox == nil || sub == nil {
-		return
+// formatSubAgentFailure 把 runSubAgentOnce 返回的错误格式化为父邮箱通知文案，
+// 保留原有"超时/轮数上限/通用失败"三段语义与部分进度回传。
+func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Duration, partial string) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Sprintf("子 Agent 执行超时（已运行 %v），已被终止。%s", timeout, partialSuffix(partial))
 	}
-
-	serveCtx, cancel := context.WithCancel(context.Background())
-	pa := &pooledAgent{
-		agent:    sub,
-		roleDef:  roleDef,
-		parentID: parentID,
-		lastUsed: time.Now(),
-		cancel:   cancel,
+	if errors.Is(err, errLimitReached) {
+		return fmt.Sprintf("子 Agent 已达最大轮数上限并暂停。%s", partialSuffix(partial))
 	}
-	d.pool.Store(subAgentID, pa)
-	defer d.pool.Delete(subAgentID)
-	defer cancel()
-	// 服务态结束后清理收件箱：与 runSubAgent 的 defer Purge 幂等叠加，保证无残留。
-	defer d.mailbox.Purge(subAgentID)
-
-	for {
-		select {
-		case <-serveCtx.Done():
-			return
-		default:
-		}
-
-		// 阻塞等待新消息，最长 idleTimeout；超时表示闲置过久，退出服务态。
-		if !d.mailbox.WaitForMessage(subAgentID, d.idleTimeout) {
-			return
-		}
-
-		// 取出所有未读消息并依次处理。
-		msgs := d.mailbox.Drain(subAgentID)
-		for _, m := range msgs {
-			pa.lastUsed = time.Now()
-			// 以消息正文作为新输入驱动子 Agent；RunWithHistory 内部会先 Drain mailbox
-			// 注入其他未读消息作为上下文，再调用 LLM 生成回复。
-			result, err := sub.RunWithHistory(serveCtx, m.Body, history)
-			if err != nil {
-				// LLM 失败时跳过回复，历史保持不变；下一轮继续服务。
-				continue
-			}
-			history = trimPooledHistory(result.History)
-			// 回复给 ReplyTo（默认回退到 From），使请求-响应配对闭环。
-			replyTo := m.ReplyTo
-			if replyTo == "" {
-				replyTo = m.From
-			}
-			if replyTo != "" && replyTo != subAgentID {
-				d.mailbox.Send(&mailbox.Message{
-					From:     subAgentID,
-					To:       replyTo,
-					Type:     mailbox.MsgReply,
-					Subject:  "回复: " + m.Subject,
-					Body:     result.Text,
-					ReplyTo:  m.ID,
-					ThreadID: m.ThreadID,
-				})
-			}
-		}
-	}
+	return fmt.Sprintf("sub-agent failed: %v%s", err, partialSuffix(partial))
 }
 
-// trimPooledHistory 裁剪实例池子 Agent 的历史，保留开头的 system 消息与最近的对话，
-// 防止长生命周期服务态下历史无限增长。超过 pooledHistoryMax 时丢弃中间旧消息。
-func trimPooledHistory(h []agent.ReactMessage) []agent.ReactMessage {
-	if len(h) <= pooledHistoryMax {
-		return h
+// ExecuteChild 同步执行一个子 Agent 并返回其最终答复文本。
+// 供 verifyloop 编排器驱动"代码->测试->修正->统一测试"状态机使用：
+//   - 同步阻塞至子 Agent 完成，调用方直接拿到结果；
+//   - 不 notify 父邮箱（编排器自行决定何时通知）；
+//   - 不触发 onSubAgentDone 钩子，避免编排器内部的修正轮触发递归自测；
+//   - 不进入实例池服务态（一次性执行）。
+//
+// 权限校验与 ID 生成与 call_sub_agent 工具一致；失败时返回 partial 结果与 err。
+func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task string) (string, error) {
+	roleDef := d.registry.Get(roleID)
+	if roleDef == nil {
+		return "", fmt.Errorf("unknown role: %s", roleID)
 	}
-	keep := 0
-	for keep < len(h) && h[keep].Role == "system" {
-		keep++
+	if !d.registry.CanCall(roleIDFromAgentID(parentID), roleID) {
+		return "", fmt.Errorf("role %s cannot be called by %s", roleID, parentID)
 	}
-	budget := pooledHistoryMax - keep
-	if budget < 1 {
-		budget = 1
+	subAgentID := fmt.Sprintf("%s/%s-%d", parentID, roleID, d.seq.Add(1))
+	d.trackChildStart(parentID)
+	defer d.trackChildDone(parentID)
+	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, *roleDef, task)
+	if err != nil {
+		return result.Text, err
 	}
-	start := len(h) - budget
-	if start < keep {
-		start = keep
-	}
-	out := make([]agent.ReactMessage, 0, len(h[:keep])+len(h[start:]))
-	out = append(out, h[:keep]...)
-	out = append(out, h[start:]...)
-	return out
+	return result.Text, nil
 }
+
+// SubAgentDoneHandler 是子 Agent 成功完成时的回调签名。
+// parentID 为派发者 Agent ID；subAgentID 为子 Agent ID；roleID 为子 Agent 角色；
+// task 为原始派发任务；result 为子 Agent 最终答复文本。
+type SubAgentDoneHandler func(parentID, subAgentID, roleID, task, result string)
+
+// SetOnSubAgentDone 注入子 Agent 完成钩子，供 verifyloop 编排器接管自测流程。
+// 传入 nil 清除钩子。钩子仅在异步 call_sub_agent 路径触发，ExecuteChild 同步路径不触发。
+func (d *Dispatcher) SetOnSubAgentDone(h SubAgentDoneHandler) {
+	d.onSubAgentDone = h
+}
+
+// KVMemoryReader 是键值对共享记忆的窄接口（仅读），由 domain/memory.InMemoryKV 等实现。
+// 用窄接口避免 subagent 反向依赖 domain/memory 包（memory 是更底层包）。
+// 写入由主线程 Agent 直接持 *memory.InMemoryKV（可写实例）完成，不经 Dispatcher。
+type KVMemoryReader interface {
+	// Get 按键读取记忆值，不存在返回空串与 nil error。
+	Get(ctx context.Context, key string) (string, error)
+}
+
+// kvMemoryKeyPrefix 是共享记忆注入任务前缀时的标记，便于子 Agent 区分"共享记忆"与"当前任务"。
+const kvMemoryKeyPrefix = "【共享记忆】\n"
+
+// WithKVMemory 注入只读 KV 共享记忆视图，使子 Agent 派发时能读取主 Agent 写入的关键记忆。
+// 传 nil 关闭共享记忆注入（默认）。
+func (d *Dispatcher) WithKVMemory(r KVMemoryReader) *Dispatcher {
+	d.kvMemory = r
+	return d
+}
+
 
 // saveBlockMemory 将子 Agent 成功完成后的结果摘要沉淀到块记忆知识库。
 // 未配置写入器、开关关闭或结果为空时跳过；写入失败仅记日志，不影响派发主流程。
@@ -710,6 +636,21 @@ func (d *Dispatcher) injectRecalledMemory(ctx context.Context, task string) stri
 	sb.WriteString("\n【当前任务】\n")
 	sb.WriteString(task)
 	return sb.String()
+}
+
+// injectKVMemory 按 parentID 派生键读取主 Agent 写入的 KV 共享记忆，拼到任务前。
+// 未配置 kvMemory、键不存在或读取出错时返回原任务，保证派发主流程不受影响。
+// 键格式 "parentID:shared"，主 Agent 在派发前用同键写入关键上下文。
+func (d *Dispatcher) injectKVMemory(ctx context.Context, parentID, task string) string {
+	if d.kvMemory == nil {
+		return task
+	}
+	key := parentID + ":shared"
+	val, err := d.kvMemory.Get(ctx, key)
+	if err != nil || strings.TrimSpace(val) == "" {
+		return task
+	}
+	return kvMemoryKeyPrefix + val + "\n\n【当前任务】\n" + task
 }
 
 // partialSuffix 把部分进度文本拼接到通知末尾；为空时返回空串。

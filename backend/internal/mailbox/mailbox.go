@@ -89,16 +89,13 @@ type Message struct {
 //   - inbox：按 agentID 索引的消息队列，存放定向投递的消息。
 //   - bcast：广播桶，存放 To == "*" 的消息，等待主 Agent 决议。
 //   - seq：原子计数器，用于生成全局唯一的消息 ID。
-//   - waiters：按 agentID 索引的通知信号通道，Send 投递消息时向其非阻塞发送一个空值，
-//     供在 WaitForMessage 中阻塞的消费者（如实例池中闲置子 Agent）被唤醒。
 //
 // 并发安全：所有公开方法均自行加锁，可被多 goroutine 同时调用。
 type Mailbox struct {
-	mu      sync.RWMutex          // 读写锁：保护 inbox 与 bcast 的并发访问
-	inbox   map[string][]*Message // agentID -> messages
-	bcast   []*Message            // To == "*" 等待主 Agent 决议
-	seq     atomic.Int64          // 全局递增序号，用于生成消息 ID
-	waiters sync.Map              // agentID -> chan struct{}（缓冲 1，非阻塞发送）
+	mu    sync.RWMutex          // 读写锁：保护 inbox 与 bcast 的并发访问
+	inbox map[string][]*Message // agentID -> messages
+	bcast []*Message            // To == "*" 等待主 Agent 决议
+	seq   atomic.Int64          // 全局递增序号，用于生成消息 ID
 }
 
 // New 创建并返回一个新的邮箱管理器实例。
@@ -154,47 +151,8 @@ func (m *Mailbox) Send(msg *Message) string {
 	} else {
 		// 定向投递：追加到目标 Agent 的收件箱末尾。
 		m.inbox[msg.To] = append(m.inbox[msg.To], msg)
-		// 非阻塞通知该 Agent 的等待信号通道：若有消费者在 WaitForMessage 中阻塞，
-		// 会被唤醒；若通道已满（缓冲 1）或无等待者，发送被丢弃，不影响消息本身。
-		if v, ok := m.waiters.Load(msg.To); ok {
-			select {
-			case v.(chan struct{}) <- struct{}{}:
-			default:
-			}
-		}
 	}
 	return id
-}
-
-// WaitForMessage 阻塞等待指定 Agent 收到新消息，最长 timeout。
-// 返回 true 表示有新消息到达（或调用时已有未读消息）；false 表示超时。
-// 供实例池中闲置子 Agent 的服务循环消费：避免轮询，收到消息即被唤醒处理。
-func (m *Mailbox) WaitForMessage(agentID string, timeout time.Duration) bool {
-	// 快速路径：已有未读消息直接返回。
-	if m.Count(agentID) > 0 {
-		return true
-	}
-	if timeout <= 0 {
-		return false
-	}
-	// 取或创建该 Agent 的信号通道（缓冲 1，允许多次 Send 合并信号不阻塞发送方）。
-	v, _ := m.waiters.LoadOrStore(agentID, make(chan struct{}, 1))
-	sig := v.(chan struct{})
-	// 双重检查：LoadOrStore 与 Count 之间存在竞态，消息可能在两步之间到达。
-	if m.Count(agentID) > 0 {
-		return true
-	}
-	select {
-	case <-sig:
-		// 收到信号后清空缓冲，使下一次等待能再次阻塞。
-		select {
-		case <-sig:
-		default:
-		}
-		return true
-	case <-time.After(timeout):
-		return false
-	}
 }
 
 // Peek 拉取目标 Agent 的所有未读消息，但不修改其状态。

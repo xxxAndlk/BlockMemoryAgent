@@ -77,3 +77,29 @@ func promptContains(f *fixtures.IntegrationFixture, substr string) bool {
 	}
 	return false
 }
+
+// toolCall 构造一个 OpenAI 格式的 mock 工具调用。
+func toolCall(id, name string, args map[string]any) fixtures.MockToolCall {
+	raw, err := json.Marshal(args)
+	if err != nil {
+		panic(err)
+	}
+	tc := fixtures.MockToolCall{ID: id, Type: "function"}
+	tc.Function.Name = name
+	tc.Function.Arguments = string(raw)
+	return tc
+}
+
+// writeFileCall 构造写入会话临时目录的 WriteFile 工具调用（temporary=true）。
+func writeFileCall(id, path, content string) fixtures.MockToolCall {
+	return toolCall(id, "WriteFile", map[string]any{
+		"path":      path,
+		"content":   content,
+		"temporary": true,
+	})
+}
+
+// readFileCall 构造一个 ReadFile 工具调用。
+func readFileCall(id, path string) fixtures.MockToolCall {
+	return toolCall(id, "ReadFile", map[string]any{"path": path})
+}

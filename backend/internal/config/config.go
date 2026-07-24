@@ -105,17 +105,20 @@ type FeatureTogglesConfig struct {
 	AssistantSelfTestEnabled bool `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证
 	DomainSelfTestEnabled    bool `yaml:"domain_self_test_enabled"`    // 领域 Agent 完成后是否派遣测试助手验证完整模块
 	BlockMemoryWriteEnabled  *bool `yaml:"block_memory_write_enabled"` // 子 Agent 成功完成后是否将结果摘要沉淀到块记忆知识库（默认 true；显式 false 关闭）
-	// SubAgentReuseEnabled 控制子 Agent 完成后是否进入实例池等待复用（默认 false）。
-	// 开启后子 Agent 不立即销毁，转为闲置态等待 send_message 询问或闲置超时回收，
-	// 对应"被询问时开协程回复"的协作验证闭环底座。
-	SubAgentReuseEnabled *bool `yaml:"sub_agent_reuse_enabled"`
-	// SubAgentIdleTimeoutSec 子 Agent 闲置超时（秒）：实例池中的子 Agent 超过该时长
-	// 未收到任何消息则被回收销毁。默认 300（5 分钟）；<=0 时回退默认。
-	SubAgentIdleTimeoutSec int `yaml:"sub_agent_idle_timeout_sec"`
 	// VerificationMaxRounds 多 Agent 协作验证闭环的最大往返轮数上限：
 	// 代码 Agent <-> 测试 Agent 互相询问/纠正的次数超过该值时，Dispatcher 拒绝
 	// 进一步的同线程派发，防止循环调用死锁。默认 5；<=0 时回退默认。
 	VerificationMaxRounds int `yaml:"verification_max_rounds"`
+	// VerificationRolePairs 是验证闭环的角色对列表：产出角色 -> 测试角色。
+	// AssistantSelfTestEnabled 开启时，bootstrap 按此列表注册 OnSubAgentDone 钩子，
+	// 产出角色完成时用对应测试角色触发 verifyloop。为空时回退默认 [{code_assistant, test_assistant}]。
+	VerificationRolePairs []VerificationRolePair `yaml:"verification_role_pairs"`
+}
+
+// VerificationRolePair 描述一个验证闭环角色对：CodeRole 完成后由 TestRole 验证。
+type VerificationRolePair struct {
+	CodeRole string `yaml:"code_role"` // 产出角色 ID（如 code_assistant）
+	TestRole string `yaml:"test_role"` // 测试角色 ID（如 test_assistant）
 }
 
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
@@ -464,20 +467,17 @@ func (c *Config) applyFeatureTogglesDefaults() {
 		t := true
 		c.Agent.BlockMemoryWriteEnabled = &t
 	}
-	// 子 Agent 实例池默认关闭：需显式 sub_agent_reuse_enabled: true 开启，
-	// 避免在未评估内存占用的场景下默认常驻子 Agent。
-	if c.Agent.SubAgentReuseEnabled == nil {
-		f := false
-		c.Agent.SubAgentReuseEnabled = &f
-	}
-	// 闲置超时默认 5 分钟：足够支撑验证闭环的往返时延，又不至于长期占用内存。
-	if c.Agent.SubAgentIdleTimeoutSec == 0 {
-		c.Agent.SubAgentIdleTimeoutSec = 300
-	}
 	// 验证闭环往返上限默认 5：覆盖"代码->测试->修正->复测->确认"的常见路径，
 	// 超过即拒绝派发以防循环死锁。
 	if c.Agent.VerificationMaxRounds == 0 {
 		c.Agent.VerificationMaxRounds = 5
+	}
+	// 验证角色对默认 [{code_assistant, test_assistant}]：未显式配置时覆盖代码自测主路径。
+	// 显式配置空列表则关闭所有角色对（不触发 verifyloop）。
+	if c.Agent.VerificationRolePairs == nil {
+		c.Agent.VerificationRolePairs = []VerificationRolePair{
+			{CodeRole: "code_assistant", TestRole: "test_assistant"},
+		}
 	}
 }
 
