@@ -14,7 +14,7 @@
 meta_agent:
   model_config: &meta_model
     provider: anthropic
-    model: k3            # 暂切 Kimi（原 glm-5.2 @ 火山方舟 key 失效，修复后可改回）
+    model: glm-5.2            # 暂切 Kimi（原 glm-5.2 @ 火山方舟 key 失效，修复后可改回）
     api_key: ${ANTHROPIC_API_KEY}     # 原 ${ANTHROPIC_API_KEY_TWO}
     base_url: ${ANTHROPIC_BASE_URL}   # 原 ${ANTHROPIC_BASE_URL_TWO}
     temperature: 0.3
@@ -57,7 +57,7 @@ meta_agent:
 domain_agent:
   model_config: &domain_model
     provider: anthropic
-    model: k3
+    model: kimi-k2.7-code
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.5
@@ -112,7 +112,7 @@ fixed_roles:
     skills: ["代码编写", "代码审查", "重构", "单元测试", "调试"]
     model_config: &coding_model
       provider: anthropic
-      model: k3
+      model: kimi-k2.7-code
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
