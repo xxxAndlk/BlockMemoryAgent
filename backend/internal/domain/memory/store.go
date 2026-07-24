@@ -17,12 +17,29 @@ type InMemoryStore struct {
 	// events 以 agentID 为键保存每个代理的事件切片。
 	// 键为代理唯一标识，值为该代理按时间顺序追加的记忆事件列表。
 	events map[string][]agent.MemoryEvent
+
+	// maxEventsPerAgent 控制每个代理在内存中最多保留的事件条数，超出时丢弃最旧事件。
+	maxEventsPerAgent int
 }
 
 // NewInMemoryStore 创建并返回一个空的内存存储实例。
 func NewInMemoryStore() *InMemoryStore {
 	// 初始化 InMemoryStore，并分配空的事件字典，避免后续空指针访问。
-	return &InMemoryStore{events: make(map[string][]agent.MemoryEvent)}
+	// maxEventsPerAgent 默认使用 DefaultMaxEventsPerAgent，防止事件流无限增长。
+	return &InMemoryStore{events: make(map[string][]agent.MemoryEvent), maxEventsPerAgent: DefaultMaxEventsPerAgent}
+}
+
+// WithMaxEventsPerAgent 配置每个代理在内存中最多保留的事件条数。
+// 参数 n 不大于 DefaultEventLimit 时回退到 DefaultMaxEventsPerAgent，
+// 保证容量上限始终大于 Pipeline 的默认注入上限。
+func (s *InMemoryStore) WithMaxEventsPerAgent(n int) *InMemoryStore {
+	if n <= DefaultEventLimit {
+		// n 不合法或过小时回退到默认值，维持容量上限大于 DefaultEventLimit 的不变式
+		n = DefaultMaxEventsPerAgent
+	}
+	s.maxEventsPerAgent = n
+	// 返回自身以支持链式调用，例如 NewInMemoryStore().WithMaxEventsPerAgent(500)
+	return s
 }
 
 // SaveEvent 将指定事件追加到对应代理的内存事件流中。
@@ -44,6 +61,11 @@ func (s *InMemoryStore) SaveEvent(_ context.Context, agentID string, event agent
 
 	// 将事件追加到对应 agentID 的事件切片末尾。
 	s.events[agentID] = append(s.events[agentID], event)
+
+	// 超过每代理容量上限时丢弃最旧事件，仅保留最新 maxEventsPerAgent 条，防止内存无限增长。
+	if s.maxEventsPerAgent > 0 && len(s.events[agentID]) > s.maxEventsPerAgent {
+		s.events[agentID] = s.events[agentID][len(s.events[agentID])-s.maxEventsPerAgent:]
+	}
 
 	// 保存成功，返回 nil 错误。
 	return nil

@@ -104,6 +104,18 @@ type FeatureTogglesConfig struct {
 	ReflectionEnabled        bool `yaml:"reflection_enabled"`          // 是否在助手执行后做 Self-Reflection（不达标重试一次）
 	AssistantSelfTestEnabled bool `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证
 	DomainSelfTestEnabled    bool `yaml:"domain_self_test_enabled"`    // 领域 Agent 完成后是否派遣测试助手验证完整模块
+	BlockMemoryWriteEnabled  *bool `yaml:"block_memory_write_enabled"` // 子 Agent 成功完成后是否将结果摘要沉淀到块记忆知识库（默认 true；显式 false 关闭）
+	// SubAgentReuseEnabled 控制子 Agent 完成后是否进入实例池等待复用（默认 false）。
+	// 开启后子 Agent 不立即销毁，转为闲置态等待 send_message 询问或闲置超时回收，
+	// 对应"被询问时开协程回复"的协作验证闭环底座。
+	SubAgentReuseEnabled *bool `yaml:"sub_agent_reuse_enabled"`
+	// SubAgentIdleTimeoutSec 子 Agent 闲置超时（秒）：实例池中的子 Agent 超过该时长
+	// 未收到任何消息则被回收销毁。默认 300（5 分钟）；<=0 时回退默认。
+	SubAgentIdleTimeoutSec int `yaml:"sub_agent_idle_timeout_sec"`
+	// VerificationMaxRounds 多 Agent 协作验证闭环的最大往返轮数上限：
+	// 代码 Agent <-> 测试 Agent 互相询问/纠正的次数超过该值时，Dispatcher 拒绝
+	// 进一步的同线程派发，防止循环调用死锁。默认 5；<=0 时回退默认。
+	VerificationMaxRounds int `yaml:"verification_max_rounds"`
 }
 
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
@@ -446,6 +458,26 @@ func (c *Config) applySafetyDefaults() {
 func (c *Config) applyFeatureTogglesDefaults() {
 	if c.Agent.HumanClarifyTimeoutSec == 0 {
 		c.Agent.HumanClarifyTimeoutSec = 120
+	}
+	// 块记忆写入默认开启，与 RestoreSessions 同样采用 *bool 以区分"未配置"与"显式 false"。
+	if c.Agent.BlockMemoryWriteEnabled == nil {
+		t := true
+		c.Agent.BlockMemoryWriteEnabled = &t
+	}
+	// 子 Agent 实例池默认关闭：需显式 sub_agent_reuse_enabled: true 开启，
+	// 避免在未评估内存占用的场景下默认常驻子 Agent。
+	if c.Agent.SubAgentReuseEnabled == nil {
+		f := false
+		c.Agent.SubAgentReuseEnabled = &f
+	}
+	// 闲置超时默认 5 分钟：足够支撑验证闭环的往返时延，又不至于长期占用内存。
+	if c.Agent.SubAgentIdleTimeoutSec == 0 {
+		c.Agent.SubAgentIdleTimeoutSec = 300
+	}
+	// 验证闭环往返上限默认 5：覆盖"代码->测试->修正->复测->确认"的常见路径，
+	// 超过即拒绝派发以防循环死锁。
+	if c.Agent.VerificationMaxRounds == 0 {
+		c.Agent.VerificationMaxRounds = 5
 	}
 }
 

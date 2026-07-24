@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
@@ -107,6 +108,18 @@ type RoleProvider interface {
 	Get(roleID string) *types.RoleDefinition
 	// CanCall 判断 callerID 是否有权限调用 calleeID 对应的子代理。
 	CanCall(callerID, calleeID string) bool
+}
+
+// PendingChildrenChecker 抽象"父 Agent 当前是否有未决子 Agent"的查询与等待能力，
+// 由 subagent.Dispatcher 实现。ReActAgent 在给出终答前调用它检查：若有未决子 Agent，
+// 则阻塞等待其完成而非终结会话，防止迟到 mailbox 消息随会话销毁丢失
+// （多 Agent 协作验证闭环的关键正确性保障）。
+type PendingChildrenChecker interface {
+	// PendingChildren 返回指定父 Agent 当前未完成的子 Agent 数量。
+	PendingChildren(parentID string) int
+	// WaitForAnyChild 阻塞等待父 Agent 任一子 Agent 完成，最长 timeout。
+	// 返回 true 表示收到完成信号（或调用时已无未决）；false 表示超时。
+	WaitForAnyChild(parentID string, timeout time.Duration) bool
 }
 
 // ModelProvider 是 ReActAgent 所需的 blades.ModelProvider 的最小子集。

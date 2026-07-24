@@ -39,6 +39,9 @@ type ReActAgent struct {
 	toolOutputMaxRunes int
 	// liveFn 是实时进度事件回调，由 WithLiveEvents 注入；nil 时不推送任何进度事件。
 	liveFn func(LiveEvent)
+	// pendingChecker 可选的未决子 Agent 检查器，由 WithPendingChildrenChecker 注入；
+	// 为 nil 时关闭终结保护（默认关闭，仅在 bootstrap 装配 Dispatcher 后开启）。
+	pendingChecker PendingChildrenChecker
 }
 
 // LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。
@@ -115,6 +118,14 @@ func (a *ReActAgent) WithLoopConfig(c LoopConfig) *ReActAgent {
 // 传 nil 表示关闭进度推送（默认关闭）。
 func (a *ReActAgent) WithLiveEvents(fn func(LiveEvent)) *ReActAgent {
 	a.liveFn = fn
+	return a
+}
+
+// WithPendingChildrenChecker 注入未决子 Agent 检查器，开启父会话终结保护：
+// 主循环在产生最终答复前会先查询 checker，若有未决子 Agent 则阻塞等待，
+// 防止迟到 mailbox 消息随会话销毁丢失。传 nil 关闭保护（默认关闭）。
+func (a *ReActAgent) WithPendingChildrenChecker(p PendingChildrenChecker) *ReActAgent {
+	a.pendingChecker = p
 	return a
 }
 
@@ -237,6 +248,17 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 
 		// 如果助手消息中没有任何工具调用，说明本轮已产生最终答案。
 		if len(assistant.ToolCalls) == 0 {
+			// 父会话终结保护：若仍有未决子 Agent（call_sub_agent 派发后尚未回传结果），
+			// 阻塞等待其完成而非立即终结，防止迟到 mailbox 消息随会话销毁丢失。
+			// 多 Agent 协作验证闭环（code<->test 互问互答）的关键正确性保障。
+			if a.pendingChecker != nil && a.pendingChecker.PendingChildren(a.name) > 0 {
+				// 阻塞等待任一子 Agent 完成或超时；超时后继续循环由 maxIter 兜底。
+				// 收到信号后 continue，下一轮迭代会 Drain mailbox 取到子 Agent 结果摘要，
+				// 模型基于新信息重新生成答复（可能再次给出终答，此时若仍有未决则继续等待）。
+				a.pendingChecker.WaitForAnyChild(a.name, 30*time.Second)
+				continue
+			}
+
 			// 将最终答案作为记忆事件写入。
 			a.memory.Write(a.name, MemoryEvent{
 				Type:     "answer",

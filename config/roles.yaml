@@ -118,7 +118,9 @@ fixed_roles:
       temperature: 0.4
       max_tokens: 4096
     can_be_called: true
-    parents: []
+    # parents 即"本角色可调用的角色"白名单（见 domain/role.registry.go CanCall）。
+    # 列入 test_assistant 使代码助手完成后可派发验证子任务，形成协作验证闭环。
+    parents: [test_assistant]
 
   # UI助手
   - id: ui_assistant
@@ -208,7 +210,9 @@ fixed_roles:
     skills: ["单元测试", "集成测试", "边界测试", "性能测试"]
     model_config: *coding_model
     can_be_called: true
-    parents: []
+    # parents 即"本角色可调用的角色"白名单。
+    # 列入 code_assistant 使测试助手验证后可回退给代码助手修正，形成协作验证闭环。
+    parents: [code_assistant]
 
   # 文档助手
   - id: doc_assistant

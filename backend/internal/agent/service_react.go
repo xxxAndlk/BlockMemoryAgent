@@ -32,6 +32,11 @@ type ReactService struct {
 	memory       MemoryPipeline      // 记忆管道，负责会话记忆的写入与查询
 	runtimeCfg   ReactRuntimeConfig  // ReAct 主循环运行时参数（轮数/超时/重试/历史滑窗）
 
+	// pendingChecker 注入到每个 ReActAgent，用于父会话终结保护
+	// （有未决子 Agent 时阻止终结，防止迟到 mailbox 消息丢失）。
+	// 为 nil 时关闭保护；由 bootstrap 注入 subagent.Dispatcher 实现。
+	pendingChecker PendingChildrenChecker
+
 	// testProvider 是包内部测试使用的钩子，
 	// 允许单元测试注入 mock 的 ModelProvider，从而无需真实 API 密钥即可运行 ReAct 循环。
 	testProvider ModelProvider
@@ -52,6 +57,12 @@ type ReactRuntimeConfig struct {
 // SetRuntimeConfig 注入 ReAct 主循环运行时参数（见 ReactRuntimeConfig）。
 func (s *ReactService) SetRuntimeConfig(c ReactRuntimeConfig) {
 	s.runtimeCfg = c
+}
+
+// SetPendingChildrenChecker 注入未决子 Agent 检查器，使后续创建的每个 ReActAgent
+// 都开启父会话终结保护。由 bootstrap 在装配 subagent.Dispatcher 后调用。
+func (s *ReactService) SetPendingChildrenChecker(p PendingChildrenChecker) {
+	s.pendingChecker = p
 }
 
 // LoopConfig 把服务级配置映射为 ReActAgent 的 LoopConfig：
@@ -599,6 +610,10 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		WithMemory(s.memory).
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) })
+	// 注入未决子 Agent 检查器，开启父会话终结保护。
+	if s.pendingChecker != nil {
+		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
+	}
 
 	// 将会话 ID 注入工具上下文，便于工具内部识别当前会话。
 	runCtx := tool.WithSessionID(ctx, session.ID)
@@ -667,6 +682,10 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithMemory(s.memory).
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) })
+	// 注入未决子 Agent 检查器，开启父会话终结保护。
+	if s.pendingChecker != nil {
+		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
+	}
 
 	// 注入会话 ID 到工具上下文。
 	runCtx := tool.WithSessionID(ctx, session.ID)

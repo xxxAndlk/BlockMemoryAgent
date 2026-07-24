@@ -14,6 +14,10 @@ import (
 // DefaultEventLimit 定义当 Assemble 未配置事件数量上限时，默认注入上下文的近期事件条数。
 const DefaultEventLimit = 20
 
+// DefaultMaxEventsPerAgent 定义每个 agent 在内存中最多保留的事件条数默认值。
+// 该值必须大于 DefaultEventLimit，保证 Assemble 在容量裁减后仍能取满注入上限。
+const DefaultMaxEventsPerAgent = 200
+
 // Pipeline 实现了 agent.MemoryPipeline 接口，作为一个基于内存的事件流。
 // 每个智能体（agent）的事件按插入顺序保存在内存中；如果配置了 Store，事件还可以被持久化。
 type Pipeline struct {
@@ -21,6 +25,8 @@ type Pipeline struct {
 	events map[string][]agent.MemoryEvent // events 按 agentID 分组保存内存中的事件列表
 	store  Store                          // store 是可选的持久化存储接口；为 nil 时只在内存中保留事件
 	limit  int                            // limit 控制 Assemble 时最多向上下文注入多少条近期事件
+	// maxEventsPerAgent 控制每个 agent 在内存中最多保留的事件条数，超出时丢弃最旧事件
+	maxEventsPerAgent int
 }
 
 // Store 抽象了事件流的持久化能力，实现者负责把事件保存到磁盘或数据库。
@@ -35,9 +41,10 @@ type Store interface {
 // 参数 store 可为 nil：传入 nil 时事件仅在内存中保留，不会持久化。
 func NewPipeline(store Store) *Pipeline {
 	return &Pipeline{
-		events: make(map[string][]agent.MemoryEvent), // 初始化空的 agentID -> 事件列表映射
-		store:  store,                                // 保存外部传入的持久化存储实现
-		limit:  DefaultEventLimit,                    // 默认使用 DefaultEventLimit 作为注入上限
+		events:            make(map[string][]agent.MemoryEvent), // 初始化空的 agentID -> 事件列表映射
+		store:             store,                                // 保存外部传入的持久化存储实现
+		limit:             DefaultEventLimit,                    // 默认使用 DefaultEventLimit 作为注入上限
+		maxEventsPerAgent: DefaultMaxEventsPerAgent,             // 默认每个 agent 最多保留 DefaultMaxEventsPerAgent 条事件
 	}
 }
 
@@ -50,6 +57,19 @@ func (p *Pipeline) WithLimit(n int) *Pipeline {
 	}
 	p.limit = n
 	// 返回自身以支持链式调用，例如 NewPipeline(nil).WithLimit(10)
+	return p
+}
+
+// WithMaxEventsPerAgent 配置每个 agent 在内存中最多保留的事件条数。
+// 参数 n 不大于 DefaultEventLimit 时回退到 DefaultMaxEventsPerAgent，
+// 保证容量上限始终大于 Assemble 注入上限，避免注入逻辑取不满近期事件。
+func (p *Pipeline) WithMaxEventsPerAgent(n int) *Pipeline {
+	if n <= DefaultEventLimit {
+		// n 不合法或过小时回退到默认值，维持 maxEventsPerAgent > DefaultEventLimit 的不变式
+		n = DefaultMaxEventsPerAgent
+	}
+	p.maxEventsPerAgent = n
+	// 返回自身以支持链式调用，例如 NewPipeline(nil).WithMaxEventsPerAgent(500)
 	return p
 }
 
@@ -117,6 +137,10 @@ func (p *Pipeline) Write(agentID string, event agent.MemoryEvent) error {
 	p.mu.Lock()
 	// 在内存中追加事件：直接 append 到该 agent 对应切片末尾
 	p.events[agentID] = append(p.events[agentID], event)
+	// 超过每 agent 容量上限时丢弃最旧事件，仅保留最新 maxEventsPerAgent 条，防止内存无限增长
+	if p.maxEventsPerAgent > 0 && len(p.events[agentID]) > p.maxEventsPerAgent {
+		p.events[agentID] = p.events[agentID][len(p.events[agentID])-p.maxEventsPerAgent:]
+	}
 	p.mu.Unlock()
 
 	if p.store != nil {

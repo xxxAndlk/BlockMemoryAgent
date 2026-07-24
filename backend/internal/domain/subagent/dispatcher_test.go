@@ -3,6 +3,9 @@ package subagent
 // 导入测试与项目依赖包。
 import (
 	"context"
+	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,15 +35,15 @@ func (m *mockProvider) Generate(ctx context.Context, req *blades.ModelRequest) (
 // Name 返回模拟提供者的名称标识。
 func (m *mockProvider) Name() string { return "mock" }
 
-// mockModelFactory 是一个模拟的模型工厂，总是返回同一个 mockProvider。
+// mockModelFactory 是一个模拟的模型工厂，总是返回同一个 provider。
 type mockModelFactory struct {
 	// provider 是工厂内部持有的固定提供者实例。
-	provider *mockProvider
+	provider agent.ModelProvider
 }
 
 // GetBladesProvider 实现 ModelProviderFactory 接口，忽略 roleID 并返回固定提供者。
 func (f *mockModelFactory) GetBladesProvider(ctx context.Context, roleID string) (agent.ModelProvider, error) {
-	// 无论请求哪个角色，都返回工厂中预设的 mockProvider。
+	// 无论请求哪个角色，都返回工厂中预设的 provider。
 	return f.provider, nil
 }
 
@@ -180,20 +183,487 @@ func TestInjectRecalledMemory(t *testing.T) {
 }
 
 // TestRoleIDFromAgentID 验证从 Agent 句柄还原角色 ID：
-// 子 Agent 句柄去序号；顶层会话 ID（session-N）恒还原为 meta。
+// 子 Agent 句柄去序号；顶层会话 ID（session-N）恒还原为 meta；
+// 角色 ID 含连字符时必须保留完整角色名（仅去掉末尾序号）。
 func TestRoleIDFromAgentID(t *testing.T) {
 	cases := map[string]string{
-		"session-1":                    "meta",
-		"session-42":                   "meta",
-		"meta":                         "meta",
-		"session-1/code_assistant-3":   "code_assistant",
-		"session-2/domain-1":           "domain",
-		"session-2/domain-1/code-4":    "code",
-		"session-2/my_role-7":          "my_role",
+		"session-1":                  "meta",
+		"session-42":                 "meta",
+		"meta":                       "meta",
+		"session-1/code_assistant-3": "code_assistant",
+		"session-2/domain-1":         "domain",
+		"session-2/domain-1/code-4":  "code",
+		"session-2/my_role-7":        "my_role",
+		// 含连字符角色 ID：必须按最后一个 '-' 截断序号，保留完整角色名。
+		"session-3/code-assistant-5":              "code-assistant",
+		"session-3/search-agent-12":               "search-agent",
+		"session-3/domain-1/code-review-bot-2":    "code-review-bot",
+		"session-3/search-agent-1/worker-9":       "worker",
 	}
 	for in, want := range cases {
 		if got := roleIDFromAgentID(in); got != want {
 			t.Fatalf("roleIDFromAgentID(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// mockBlockMemorySaver 是一个模拟的块记忆写入器，记录每次 Save 调用并可返回预设错误。
+type mockBlockMemorySaver struct {
+	// mu 保护 recs，Save 在子 Agent goroutine 中执行，断言在测试 goroutine 中执行。
+	mu sync.Mutex
+	// recs 依次记录每次 Save 收到的知识记录。
+	recs []*types.KnowledgeRecord
+	// err 是 Save 返回的预设错误。
+	err error
+}
+
+// Save 实现 BlockMemorySaver 接口，记录写入内容并返回预设错误。
+func (m *mockBlockMemorySaver) Save(ctx context.Context, rec *types.KnowledgeRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recs = append(m.recs, rec)
+	return m.err
+}
+
+// savedCount 返回已记录的写入条数（线程安全）。
+func (m *mockBlockMemorySaver) savedCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.recs)
+}
+
+// lastSaved 返回最后一条写入记录；无写入时返回 nil。
+func (m *mockBlockMemorySaver) lastSaved() *types.KnowledgeRecord {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.recs) == 0 {
+		return nil
+	}
+	return m.recs[len(m.recs)-1]
+}
+
+// blockingSaver 是一个阻塞式块记忆写入器：Save 进入后先关闭 entered 通知调用方，
+// 再阻塞直至 release 被关闭，用于精确控制 runSubAgent 的执行时序。
+type blockingSaver struct {
+	// entered 在 Save 首次被调用时关闭（一次性信号）。
+	entered chan struct{}
+	// release 关闭后 Save 才返回。
+	release chan struct{}
+}
+
+// Save 实现 BlockMemorySaver 接口，阻塞至 release 通道关闭。
+func (m *blockingSaver) Save(ctx context.Context, rec *types.KnowledgeRecord) error {
+	close(m.entered)
+	<-m.release
+	return nil
+}
+
+// newWriteTestEnv 构造可派发 code_assistant 子 Agent 的测试环境：
+// 返回工具注册表与邮箱，并把 saver/enabled 注入 Dispatcher 的块记忆写入闭环。
+func newWriteTestEnv(t *testing.T, saver BlockMemorySaver, enabled bool) (*tool.Registry, *mailbox.Mailbox) {
+	t.Helper()
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{
+			SystemPrompt: "meta",
+			ModelConfig:  types.AgentModelConfig{Provider: "mock"},
+		},
+		DomainAgent: config.DomainAgentConfig{
+			ModelConfig: types.AgentModelConfig{Provider: "mock"},
+		},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.WithBlockMemorySaver(saver, enabled)
+	d.RegisterCallTool(toolsReg)
+	return toolsReg, mb
+}
+
+// dispatchCodeAssistant 以 meta 身份派发一个 code_assistant 子 Agent，返回其句柄。
+func dispatchCodeAssistant(t *testing.T, toolsReg *tool.Registry) string {
+	t.Helper()
+	res, err := toolsReg.Dispatch(agent.WithAgentID(context.Background(), "meta"), "call_sub_agent", map[string]any{
+		"role_id": "code_assistant",
+		"task":    "write tests",
+	})
+	if err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("expected success, got error: %s", res.Error)
+	}
+	return res.Output
+}
+
+// waitForCond 轮询等待条件满足，超时则测试失败。
+func waitForCond(t *testing.T, name string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", name)
+}
+
+// TestRunSubAgent_SavesBlockMemory 验证块记忆写入闭环：
+// 开关开启时子 Agent 成功完成后结果摘要被沉淀到块记忆知识库；
+// 开关关闭时不写入；写入失败时父 Agent 仍能收到完成通知。
+func TestRunSubAgent_SavesBlockMemory(t *testing.T) {
+	// 情形一：开关开启，子 Agent 成功后写入一条 block_memory 记录，
+	// 内容应包含目标与结果摘要，Meta 携带 goal/domain 标签。
+	saver := &mockBlockMemorySaver{}
+	toolsReg, _ := newWriteTestEnv(t, saver, true)
+	dispatchCodeAssistant(t, toolsReg)
+	waitForCond(t, "block memory save", func() bool { return saver.savedCount() > 0 })
+	rec := saver.lastSaved()
+	if rec.KnowledgeType != enums.KnowledgeTypeBlockMemory {
+		t.Fatalf("expected knowledge type %q, got %q", enums.KnowledgeTypeBlockMemory, rec.KnowledgeType)
+	}
+	if !strings.Contains(rec.Content, "write tests") || !strings.Contains(rec.Content, "done") {
+		t.Fatalf("expected content to contain goal and result, got %q", rec.Content)
+	}
+	if rec.Meta["goal"] != "write tests" {
+		t.Fatalf("expected meta goal=write tests, got %v", rec.Meta["goal"])
+	}
+	if rec.Meta["domain"] != "code_assistant" {
+		t.Fatalf("expected meta domain=code_assistant, got %v", rec.Meta["domain"])
+	}
+
+	// 情形二：开关关闭，子 Agent 完成后不应产生任何写入。
+	saver2 := &mockBlockMemorySaver{}
+	toolsReg2, mb2 := newWriteTestEnv(t, saver2, false)
+	dispatchCodeAssistant(t, toolsReg2)
+	// 先等父邮箱收到完成通知，确保 runSubAgent 已走完成功路径。
+	waitForCond(t, "parent notify", func() bool { return len(mb2.Drain("meta")) > 0 })
+	if saver2.savedCount() != 0 {
+		t.Fatalf("expected no block memory save when disabled, got %d", saver2.savedCount())
+	}
+
+	// 情形三：写入失败仅记日志，不影响主流程——父 Agent 仍应收到完成通知。
+	saver3 := &mockBlockMemorySaver{err: errors.New("db down")}
+	toolsReg3, mb3 := newWriteTestEnv(t, saver3, true)
+	dispatchCodeAssistant(t, toolsReg3)
+	waitForCond(t, "block memory save attempt", func() bool { return saver3.savedCount() > 0 })
+	waitForCond(t, "parent notify after save failure", func() bool { return len(mb3.Drain("meta")) > 0 })
+}
+
+// TestRunSubAgent_PurgesMailbox 验证子 Agent 结束后其收件箱被 Purge 清理：
+// 利用阻塞式 saver 将 runSubAgent 停在"Run 已结束、defer 未执行"的时刻，
+// 此时投递的未读消息必须随 defer 中的 Purge 一并被清除。
+func TestRunSubAgent_PurgesMailbox(t *testing.T) {
+	saver := &blockingSaver{entered: make(chan struct{}), release: make(chan struct{})}
+	toolsReg, mb := newWriteTestEnv(t, saver, true)
+	subAgentID := dispatchCodeAssistant(t, toolsReg)
+
+	// 等待 Save 被调用：此时子 Agent Run 已成功结束，不会再 Drain 自己的收件箱，
+	// 而 runSubAgent 尚未返回（defer 中的 Purge 尚未执行）。
+	select {
+	case <-saver.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for block memory save")
+	}
+
+	// 向子 Agent 收件箱投递一条未读消息。
+	mb.Send(&mailbox.Message{From: "meta", To: subAgentID, Type: mailbox.MsgInfo, Subject: "late"})
+	if mb.Count(subAgentID) != 1 {
+		t.Fatalf("expected 1 unread message before purge, got %d", mb.Count(subAgentID))
+	}
+
+	// 放行 Save，runSubAgent 返回并触发 defer 中的 Purge。
+	close(saver.release)
+	// Purge 删除整个 inbox 键，该未读消息随之被清理；若未调用 Purge，消息将残留导致超时。
+	waitForCond(t, "mailbox purge", func() bool { return mb.Count(subAgentID) == 0 })
+}
+
+// TestSendMessageTool 验证 send_message 工具能向目标 Agent 邮箱投递消息，
+// 消息携带 ReplyTo=发送方 与调用方指定的 message_type/thread_id。
+func TestSendMessageTool(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "x"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.RegisterMessagingTool(toolsReg)
+
+	// 以 caller=meta 身份执行 send_message。
+	res, err := toolsReg.Dispatch(agent.WithAgentID(context.Background(), "meta"), "send_message", map[string]any{
+		"to_agent_id":  "session-1/test_assistant-2",
+		"subject":      "please verify",
+		"body":         "run go test ./...",
+		"message_type": "request",
+		"thread_id":    "verify-1",
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("expected success, got error: %s", res.Error)
+	}
+
+	// 校验目标收件箱收到消息，字段保留完整。
+	msgs := mb.Drain("session-1/test_assistant-2")
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message in target inbox, got %d", len(msgs))
+	}
+	m := msgs[0]
+	if m.From != "meta" {
+		t.Fatalf("From mismatch: got %q", m.From)
+	}
+	if m.ReplyTo != "meta" {
+		t.Fatalf("ReplyTo mismatch: got %q", m.ReplyTo)
+	}
+	if m.ThreadID != "verify-1" {
+		t.Fatalf("ThreadID mismatch: got %q", m.ThreadID)
+	}
+	if m.Type != mailbox.MsgRequest {
+		t.Fatalf("Type mismatch: got %q", m.Type)
+	}
+}
+
+// TestSendMessageTool_MissingArgs 验证 send_message 工具在缺少必填参数时返回错误。
+func TestSendMessageTool_MissingArgs(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "x"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.RegisterMessagingTool(toolsReg)
+
+	// 缺少 subject。
+	res, _ := toolsReg.Dispatch(agent.WithAgentID(context.Background(), "meta"), "send_message", map[string]any{
+		"to_agent_id": "x",
+	})
+	if res.Success {
+		t.Fatal("expected error when subject missing")
+	}
+	if !strings.Contains(res.Error, "to_agent_id and subject are required") {
+		t.Fatalf("unexpected error: %s", res.Error)
+	}
+}
+
+// TestRegistry_CanCall_PeerPermissions 验证 roles.yaml 中 parents 白名单
+// 允许 code_assistant <-> test_assistant 平级互调，支撑验证闭环。
+func TestRegistry_CanCall_PeerPermissions(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"test_assistant"}},
+			{ID: "test_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"code_assistant"}},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+
+	// code_assistant 可调用 test_assistant（平级验证闭环正向）。
+	if !reg.CanCall("code_assistant", "test_assistant") {
+		t.Fatal("code_assistant should be able to call test_assistant")
+	}
+	// test_assistant 可调用 code_assistant（平级验证闭环反向：打回修正）。
+	if !reg.CanCall("test_assistant", "code_assistant") {
+		t.Fatal("test_assistant should be able to call code_assistant")
+	}
+	// 未在 parents 中的角色不可调用。
+	if reg.CanCall("code_assistant", "ui_assistant") {
+		t.Fatal("code_assistant should NOT be able to call ui_assistant (not in parents)")
+	}
+}
+
+// TestDispatcher_PendingChildren 验证父会话终结保护的未决子 Agent 计数：
+// 派发时递增、子 Agent 结束时递减，并发出完成信号唤醒 WaitForAnyChild。
+func TestDispatcher_PendingChildren(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	// 阻塞式 provider：使子 Agent Run 不立即返回，保证计数窗口可观测。
+	saver := &blockingSaver{entered: make(chan struct{}), release: make(chan struct{})}
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "ok"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.WithBlockMemorySaver(saver, true)
+	d.RegisterCallTool(toolsReg)
+
+	if d.PendingChildren("meta") != 0 {
+		t.Fatal("initial pending should be 0")
+	}
+
+	// 派发一个子 Agent，但用 saver 阻塞在 runSubAgent 末尾，使计数保持 > 0。
+	dispatchCodeAssistant(t, toolsReg)
+
+	// 等待 saver 被触发：此时子 Agent 已完成 Run，但 runSubAgent 仍阻塞在 saveBlockMemory。
+	select {
+	case <-saver.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("saver not entered")
+	}
+
+	// 子 Agent Run 已结束，但 runSubAgent 未返回（defer trackChildDone 未执行），计数应为 1。
+	if got := d.PendingChildren("meta"); got != 1 {
+		t.Fatalf("expected 1 pending child, got %d", got)
+	}
+
+	// 在另一 goroutine 中等待任一子 Agent 完成。
+	waitDone := make(chan bool, 1)
+	go func() { waitDone <- d.WaitForAnyChild("meta", 2*time.Second) }()
+
+	// 放行 saver，runSubAgent 返回，defer trackChildDone 递减计数并发出信号。
+	close(saver.release)
+
+	select {
+	case ok := <-waitDone:
+		if !ok {
+			t.Fatal("WaitForAnyChild should return true after child done")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForAnyChild did not return after child completed")
+	}
+
+	// 最终计数应归 0。
+	waitForCond(t, "pending to reach 0", func() bool { return d.PendingChildren("meta") == 0 })
+}
+
+// TestDispatcher_VerificationMaxRounds 验证验证闭环往返上限：
+// 同一 (callerRole -> calleeRole) 派发次数超过 verificationMaxRounds 时，
+// call_sub_agent 返回错误，防止 code<->test 平级互问死循环。
+func TestDispatcher_VerificationMaxRounds(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"test_assistant"}, SystemPrompt: "code"},
+			{ID: "test_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"code_assistant"}, SystemPrompt: "test"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "ok"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	// 设置上限为 2：第 3 次派发应被拒绝。
+	d.WithVerificationMaxRounds(2)
+	d.RegisterCallTool(toolsReg)
+
+	// 以 test_assistant 身份向 code_assistant 派发 3 次（test_assistant 是 code_assistant 的 parent）。
+	// 注意：CanCall 检查的是 callerRole -> calleeRole，test_assistant 的 Parents 含 code_assistant，
+	// 故 test_assistant 可调用 code_assistant。
+	ctx := agent.WithAgentID(context.Background(), "session-1/test_assistant-1")
+	for i := 0; i < 2; i++ {
+		res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+			"role_id": "code_assistant",
+			"task":    "round",
+		})
+		if err != nil {
+			t.Fatalf("dispatch %d: %v", i, err)
+		}
+		if !res.Success {
+			t.Fatalf("dispatch %d should succeed: %s", i, res.Error)
+		}
+	}
+	// 第 3 次应被拒绝。
+	res, _ := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+		"role_id": "code_assistant",
+		"task":    "round",
+	})
+	if res.Success {
+		t.Fatal("3rd dispatch should be rejected by verification round limit")
+	}
+	if !strings.Contains(res.Error, "verification round limit reached") {
+		t.Fatalf("unexpected error: %s", res.Error)
+	}
+}
+
+// sequenceProvider 是按调用顺序依次返回预设响应的 mock provider，
+// 供实例池服务态测试驱动子 Agent 多轮 RunWithHistory。
+type sequenceProvider struct {
+	mu       sync.Mutex
+	responses []string
+	calls     int
+}
+
+func (s *sequenceProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	text := "default"
+	if s.calls < len(s.responses) {
+		text = s.responses[s.calls]
+	}
+	s.calls++
+	return &blades.ModelResponse{Message: blades.AssistantMessage(text)}, nil
+}
+
+func (s *sequenceProvider) Name() string { return "seq" }
+
+// TestDispatcher_ReusePool_ServiceMode 验证实例池复用：子 Agent 完成初始任务后转入服务态，
+// 收到 send_message 询问时回复，闲置超时后退出服务态。
+func TestDispatcher_ReusePool_ServiceMode(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	// 序列：第 1 轮 Run 返回初始任务结果，第 2 轮 RunWithHistory 返回对询问的回复。
+	prov := &sequenceProvider{responses: []string{"initial task done", "reply: all good"}}
+	d := NewDispatcher(reg, &mockModelFactory{provider: prov}, toolsReg, mb, agent.NopMemoryPipeline{})
+	// 开启复用，闲置超时设为 1 秒（测试用短时）。
+	d.WithReuse(true, 1*time.Second)
+	d.RegisterCallTool(toolsReg)
+	d.RegisterMessagingTool(toolsReg)
+
+	// 派发子 Agent，等待其完成初始任务并进入服务态。
+	subAgentID := dispatchCodeAssistant(t, toolsReg)
+	// 等待父邮箱收到初始完成通知（标志 runSubAgent 已走到 servePooled 入口）。
+	waitForCond(t, "initial completion notify", func() bool { return len(mb.Drain("meta")) > 0 })
+	// 等待子 Agent 进入实例池。
+	waitForCond(t, "enter pool", func() bool { return d.IsPooled(subAgentID) })
+
+	// 通过 send_message 向子 Agent 投递询问。
+	_, err := toolsReg.Dispatch(agent.WithAgentID(context.Background(), "meta"), "send_message", map[string]any{
+		"to_agent_id": subAgentID,
+		"subject":     "are you ok?",
+		"body":        "status check",
+	})
+	if err != nil {
+		t.Fatalf("send_message: %v", err)
+	}
+
+	// 子 Agent 应在服务态处理询问，并把回复投递到 meta 邮箱（ReplyTo=meta）。
+	waitForCond(t, "service reply", func() bool {
+		msgs := mb.Drain("meta")
+		for _, m := range msgs {
+			if m.Type == mailbox.MsgReply && strings.Contains(m.Body, "reply: all good") {
+				return true
+			}
+		}
+		return false
+	})
+
+	// 等待闲置超时后子 Agent 应退出实例池。
+	waitForCond(t, "idle timeout eviction", func() bool { return !d.IsPooled(subAgentID) })
+
+	// Stop 应幂等且不 panic。
+	d.Stop()
 }

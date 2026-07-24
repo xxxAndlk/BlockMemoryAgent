@@ -463,8 +463,42 @@ func (r *Registry) Schema() []tools.Tool {
 			toolsList = append(toolsList, t)
 		}
 	}
+	// 暴露 send_message 工具（若已由 subagent.Dispatcher 安装到注册表）。
+	// 该工具支持任意 Agent 向另一个 Agent 实例邮箱投递消息，是多 Agent 协作验证闭环的原语。
+	if ct, ok := r.tools["send_message"]; ok {
+		desc := "向另一个 Agent 实例邮箱投递消息。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("send_message", desc, func(ctx context.Context, in sendMessageInput) (string, error) {
+			args := map[string]any{"to_agent_id": in.ToAgentID, "subject": in.Subject}
+			if in.Body != "" {
+				args["body"] = in.Body
+			}
+			if in.MessageType != "" {
+				args["message_type"] = in.MessageType
+			}
+			if in.ThreadID != "" {
+				args["thread_id"] = in.ThreadID
+			}
+			res, _ := r.Dispatch(ctx, "send_message", args)
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
 	// 返回收集到的所有 blades 工具定义。
 	return toolsList
+}
+
+// sendMessageInput 是 send_message 工具的入参结构。
+type sendMessageInput struct {
+	ToAgentID   string `json:"to_agent_id" description:"目标 Agent 实例 ID"`
+	Subject     string `json:"subject" description:"一行摘要"`
+	Body        string `json:"body" description:"详情正文（可空）"`
+	MessageType string `json:"message_type" description:"消息类型：request（默认，期望回复）/ info（单向通知）/ reply（对先前 request 的回复）"`
+	ThreadID    string `json:"thread_id" description:"会话线程标识（可空，同一问答链共享）"`
 }
 
 // ---- 工具实现 ----

@@ -30,6 +30,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/internal/store"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
+	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // ConfigPaths 汇总启动后端所需的文件系统路径。
@@ -218,12 +219,30 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	}
 	subAgentDispatcher := subagent.NewDispatcher(roleRegistry, &reactModelFactory{modelFactory}, toolRegistry, sharedMailbox, memoryPipeline)
 	subAgentDispatcher.WithTimeout(subAgentTimeout).WithLoopConfig(reactCfg.LoopConfig()).WithBlockMemorySearcher(pgStore)
+	// 块记忆写入闭环：默认开启（applyFeatureTogglesDefaults 兜底为 true）；
+	// 显式 block_memory_write_enabled: false 时 Dispatcher 内部跳过沉淀。
+	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)
+	// 验证闭环往返上限：防止 code<->test 平级互问死循环；<=0 表示不限制。
+	subAgentDispatcher.WithVerificationMaxRounds(cfg.Agent.VerificationMaxRounds)
+	// 实例池复用：默认关闭，需显式 sub_agent_reuse_enabled: true 开启。
+	// 开启后子 Agent 完成初始任务不销毁，转入服务态等待 send_message 询问，
+	// 闲置超过 sub_agent_idle_timeout_sec 被回收。
+	subAgentDispatcher.WithReuse(
+		cfg.Agent.SubAgentReuseEnabled != nil && *cfg.Agent.SubAgentReuseEnabled,
+		time.Duration(cfg.Agent.SubAgentIdleTimeoutSec)*time.Second,
+	)
 	subAgentDispatcher.RegisterCallTool(toolRegistry)
+	// 注册 send_message 工具：支持任意 Agent 向另一个 Agent 实例邮箱投递消息，
+	// 是多 Agent 协作验证闭环（代码 Agent <-> 测试 Agent 互问互答）的基础原语。
+	subAgentDispatcher.RegisterMessagingTool(toolRegistry)
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
 	agentSvc.SetLogger(sessionLogger)
 	agentSvc.SetRuntimeConfig(reactCfg)
+	// 注入未决子 Agent 检查器，开启父会话终结保护：
+	// 父 Agent 给出终答前若有未决子 Agent，阻塞等待其完成，防止迟到 mailbox 消息丢失。
+	agentSvc.SetPendingChildrenChecker(subAgentDispatcher)
 	// 默认恢复历史会话：从 session_history 恢复最近 50 个会话到内存，
 	// 保证重启后长任务上下文可见；显式 restore_sessions: false 关闭。
 	// 恢复失败仅记录日志，不阻断启动。
@@ -271,6 +290,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			if dagScheduler != nil {
 				dagScheduler.Stop()
 			}
+			return nil
+		},
+		func() error {
+			// 释放实例池中所有闲置子 Agent，避免 goroutine 泄漏。
+			subAgentDispatcher.Stop()
 			return nil
 		},
 		func() error { redisStore.Close(); return nil }, // 关闭 Redis 连接
@@ -364,4 +388,31 @@ type reactModelFactory struct {
 // 返回：该角色对应的 agent.ModelProvider，或获取过程中的错误。
 func (f *reactModelFactory) GetBladesProvider(ctx context.Context, roleID string) (agent.ModelProvider, error) {
 	return f.inner.GetBladesProvider(ctx, roleID)
+}
+
+// blockMemorySaver 将 store.PostgresStore 适配为子 Agent 调度器期望的
+// 块记忆写入接口（subagent.BlockMemorySaver）：
+// 先用 PostgresStore.Embed 为记录内容生成向量，再委托 SaveKnowledge 落库，
+// 保证写入的块记忆带有效 embedding（global_knowledge.embedding 为 VECTOR(N) 列，
+// 空向量无法插入），可被后续 SearchBlockMemoryByGoal 语义召回命中。
+type blockMemorySaver struct {
+	pg *store.PostgresStore
+}
+
+// Save 实现 subagent.BlockMemorySaver 接口。
+//
+// 参数：
+//   - ctx: 请求上下文。
+//   - rec: 待写入的块记忆记录（Content/Meta/KnowledgeType 已由调用方填充）。
+//
+// 返回：向量化或落库过程中的错误。
+func (s *blockMemorySaver) Save(ctx context.Context, rec *types.KnowledgeRecord) error {
+	// 生成与检索侧同源的查询向量（Embed 内部走同一 embedder / PseudoEmbed 回退）。
+	emb, err := s.pg.Embed(ctx, rec.Content)
+	if err != nil {
+		return fmt.Errorf("embed block memory: %w", err)
+	}
+	rec.Embedding = emb
+	// 复用既有 SaveKnowledge（委托 KnowledgeStore.Save），不新增存储路径。
+	return s.pg.SaveKnowledge(ctx, rec)
 }
