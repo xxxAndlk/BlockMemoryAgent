@@ -9,8 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 )
+
+// isWindows 标记当前是否运行在 Windows 平台，用于路径大小写归一化决策。
+var isWindows = runtime.GOOS == "windows"
 
 // SandboxConfig 定义了 Executor 使用的轻量级沙箱策略。
 // 该结构体控制哪些命令被禁止执行，以及允许写入哪些路径。
@@ -124,6 +128,13 @@ func (e *Executor) isPathAllowed(absPath string) bool {
 		}
 		// 规范化配置的允许路径。
 		allowedClean := filepath.Clean(p)
+		// Windows 下大小写不敏感，统一转小写比较；非 Windows 保持原样。
+		if isWindows {
+			if strings.EqualFold(absPath, allowedClean) || hasPathPrefix(absPath, allowedClean) {
+				return true
+			}
+			continue
+		}
 		// 如果目标路径等于允许路径，或位于允许路径之下，则允许访问。
 		if absPath == allowedClean || hasPathPrefix(absPath, allowedClean) {
 			return true
@@ -135,7 +146,13 @@ func (e *Executor) isPathAllowed(absPath string) bool {
 
 // hasPathPrefix 安全地判断 child 是否位于 parent 目录下。
 // 该方法通过显式追加路径分隔符来避免类似 /foo 与 /foobar 的误判。
+// Windows 文件系统大小写不敏感，需归一化后再比较；否则 d:\... 与 D:\... 会被误判为越界。
 func hasPathPrefix(child, parent string) bool {
+	// Windows 下统一转小写做比较；非 Windows 保持原样。
+	if isWindows {
+		child = strings.ToLower(child)
+		parent = strings.ToLower(parent)
+	}
 	// 如果两个路径完全相同，也视为在范围内。
 	if child == parent {
 		return true

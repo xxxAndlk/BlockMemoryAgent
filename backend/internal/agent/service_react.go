@@ -492,6 +492,11 @@ func (s *ReactService) SwitchTopic(ctx context.Context, sessionID, name, goal st
 
 // handleToolEvent 接收工具注册表产生的进度事件，并将其注入到对应运行中会话的事件流。
 func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEvent) {
+	// 从 ctx 提取调用方 Agent ID（ReActAgent.Run 经 WithAgentID 注入）。
+	// ProgressEvent.Agent 字段未被 emitTool/emitResult 填充，始终为空；
+	// 不在此回填会导致日志 agentName 永远空串，sub-agent 工具事件无法归属。
+	// MetaAgent 的 agent ID = session-ID（"session-1"），sub-agent = "session-1/code_assistant-5"。
+	agentID := AgentIDFromContext(ctx)
 	// 加读锁判断会话是否存在且处于运行状态。
 	s.store.mu.RLock()
 	session, ok := s.store.sessions[ev.SessionID]
@@ -511,7 +516,7 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 	success := ev.Kind != eventkind.Error
 	// 工具调用事件：直接记录工具执行事件。
 	if ev.Kind == "tool_call" || ev.Kind == eventkind.ToolCall {
-		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, ev.Message, ev.Kind, ev.Tool, toolArgsLabel(ev.Detail), "", "", success)
+		s.store.addEvent(session, eventkind.ToolExec, agentID, ev.Message, ev.Kind, ev.Tool, toolArgsLabel(ev.Detail), "", "", success)
 		return
 	}
 	// 工具结果事件：尝试解析 Detail 中的 output、error 与 path 字段。
@@ -534,11 +539,21 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 				}
 			}
 		}
-		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, ev.Message, ev.Kind, ev.Tool, toolPath, output, toolErr, success)
+		// 失败时把 path+error 拼进 message，让 logInfo 输出可见失败原因；
+		// 否则日志只显示"工具结果 WriteFile"，错误细节只存在 DB 事件里，排查困难。
+		msg := ev.Message
+		if toolErr != "" {
+			extra := ""
+			if toolPath != "" {
+				extra = " path=" + toolPath
+			}
+			msg = fmt.Sprintf("%s [FAIL]%s err=%s", ev.Message, extra, toolErr)
+		}
+		s.store.addEvent(session, eventkind.ToolExec, agentID, msg, ev.Kind, ev.Tool, toolPath, output, toolErr, success)
 		return
 	}
 	// 其他类型事件作为进度事件记录。
-	s.store.addEvent(session, eventkind.Progress, ev.Agent, ev.Message, ev.Kind, ev.Tool, "", "", "", success)
+	s.store.addEvent(session, eventkind.Progress, agentID, ev.Message, ev.Kind, ev.Tool, "", "", "", success)
 }
 
 // toolArgsLabel 从工具调用参数 JSON 中提取一个简短的展示标签（路径/命令/URL 等），
@@ -605,7 +620,8 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	}
 
 	// 构造 ReActAgent，并注入邮箱、记忆管道与主循环运行时配置。
-	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapter(s.toolRegistry)).
+	// MetaAgent 只暴露 call_sub_agent 工具（metaRole.Tools 限定），防止越位直接读写文件。
+	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).
@@ -677,7 +693,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	}
 
 	// 构造并配置 ReActAgent。
-	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapter(s.toolRegistry)).
+	// MetaAgent 只暴露 call_sub_agent 工具（metaRole.Tools 限定），防止越位直接读写文件。
+	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).

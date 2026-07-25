@@ -2,6 +2,7 @@ package model
 
 import (
 	"context" // 上下文传递
+	"strings" // 字符串判断
 
 	"github.com/blockmemory/agent/backend/pkg/types" // AgentModelConfig 类型
 	"github.com/go-kratos/blades"                    // ModelProvider 抽象
@@ -32,6 +33,16 @@ func newOpenAIProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 		APIKey:          cfg.APIKey,
 		Temperature:     cfg.Temperature,
 		MaxOutputTokens: int64(cfg.MaxTokens),
+	}
+	// DeepSeek 思考模型（deepseek-v4-flash 等）默认开启 thinking，返回 reasoning_content；
+	// 后续请求须把 reasoning_content 回传，否则 400 "reasoning_content must be passed back"。
+	// blades contrib openai v0.3.0 不捕获也不回传 reasoning_content，直接关闭 thinking 最简。
+	// 通过 ExtraFields 注入 enable_thinking=false；DeepSeek 端点识别此参数。
+	if strings.Contains(strings.ToLower(baseURL), "deepseek.com") {
+		if ocfg.ExtraFields == nil {
+			ocfg.ExtraFields = map[string]any{}
+		}
+		ocfg.ExtraFields["enable_thinking"] = false
 	}
 	// 返回封装后的 provider
 	return &openAIProvider{

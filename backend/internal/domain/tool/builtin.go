@@ -418,9 +418,11 @@ func (e *Executor) runCommand(ctx context.Context, args map[string]any) *Result 
 
 	// cmd 为待执行的外部命令对象。
 	var cmd *exec.Cmd
-	// 根据操作系统选择命令解释器：Windows 使用 cmd /c，类 Unix 使用 sh -c。
+	// 根据操作系统选择命令解释器：Windows 使用 powershell -Command，类 Unix 使用 sh -c。
+	// powershell 比 cmd /c 更可靠：Write-Host 输出到 stdout 可捕获；$ 变量不会被错误展开；
+	// 复合管道命令正确执行。
 	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/c", cmdStr)
+		cmd = exec.CommandContext(ctx, "powershell", "-NoLogo", "-NoProfile", "-Command", cmdStr)
 	} else {
 		cmd = exec.CommandContext(ctx, "sh", "-c", cmdStr)
 	}

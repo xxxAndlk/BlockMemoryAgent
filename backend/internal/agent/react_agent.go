@@ -134,7 +134,9 @@ func (a *ReActAgent) emitLive(ev LiveEvent) {
 	if a.liveFn == nil {
 		return
 	}
-	ev.Agent = a.name
+	// 用 role.Name 作展示名（"MetaAgent"/"代码助手"），避免 MetaAgent 的 a.name=session-ID
+	// 让日志全显 "session-1"。mailbox 路由仍用 a.name，与此处无关。
+	ev.Agent = a.role.Name
 	a.liveFn(ev)
 }
 

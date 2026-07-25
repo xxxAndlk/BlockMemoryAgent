@@ -38,34 +38,52 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 	case "meta":
 		// 合成 MetaAgent：从配置的 MetaAgent 字段提取系统提示词与模型配置。
 		// CanBeCalled 为 false，因为元代理作为顶层协调者，不应被其他角色直接调用。
+		// Tools 限定为 call_sub_agent：MetaAgent 只做领域派发与简单任务转发，
+		// 不直接读写文件/跑命令，防止越位（详见 meta_agent.system_prompt）。
 		return &types.RoleDefinition{
 			ID:           "meta",
 			Name:         "MetaAgent",
 			Type:         enums.RoleTypeMeta,
 			SystemPrompt: r.cfg.MetaAgent.SystemPrompt,
 			ModelConfig:  r.cfg.MetaAgent.ModelConfig,
+			Tools:        []string{"call_sub_agent"},
 			CanBeCalled:  false,
 		}
 	case "domain":
 		// 合成 DomainAgent：复用配置的 DomainAgent 模型配置。
 		// CanBeCalled 为 true，允许上层编排者将其作为子代理调用。
+		// Tools 限定为 call_sub_agent：DomainAgent 只做函数级任务拆分与派发，
+		// 不直接读写文件，所有执行交给固定助手。
 		return &types.RoleDefinition{
 			ID:   "domain",
 			Name: "DomainAgent",
 			Type: enums.RoleTypeDomain,
-			// 领域负责人提示词：明确"自己做 vs 派发"的决策标准、任务派发纪律，
-			// 以及"最终答复即回灌给父 Agent 的交付物"这一输出契约。
-			SystemPrompt: `你是领域负责人（DomainAgent），负责把父 Agent 交办的目标在你负责的领域内落地。
+			// 领域负责人提示词：函数级拆分纪律、派发契约、最终答复即回灌给父 Agent 的交付物。
+			SystemPrompt: `你是领域负责人（DomainAgent），负责把父 Agent 交办的目标在你负责的领域内落地。你只做拆分与派发，不直接执行。
 
-【工作方式】
-1. 先分析任务：能直接完成的，自己用工具完成，不要派发。
-2. 需要专业分工或多步骤并行时，用 call_sub_agent 派给合适的固定助手（如 code_assistant / ui_assistant / test_assistant / doc_assistant）。
-3. 派发的 task 必须自包含：背景、目标、相关文件路径、前置结论与验收标准；前置已读过的内容不要让助手重读。
+【唯一工作方式】
+1. 接到任务先拆分：把领域目标拆到"单函数 / 单文件 / 单个具体改动"级别，每个子任务边界清晰、可独立验收。
+2. 用 call_sub_agent(role_id, task) 把每个子任务派给合适的固定助手执行：
+   - code_assistant：代码编写、审查、重构、调试
+   - ui_assistant：前端 UI、样式、组件
+   - test_assistant：测试编写与执行
+   - doc_assistant：技术文档与注释
+   - prompt_reviewer：提示词审查
+3. 拆分粒度纪律：
+   - 一个子任务对应一个函数或一个文件改动，不要"把整个模块实现"塞给一个子任务。
+   - 子任务之间有依赖时，等前一个 mailbox 摘要回来再派发下一个；无依赖可并行。
+   - task 必须自包含：背景、目标、相关文件路径与行号、前置结论、验收标准；子 Agent 看不到本次对话历史。
+
+【不要做的事】
+- 不要直接调用 ReadFile / WriteFile / RunCommand 等执行类工具--你没有这些工具。
+- 不要把整个领域目标不拆分就丢给一个子 Agent。
+- 不要重复派发同一子任务；mailbox 摘要回来就整合进结论。
 
 【结果汇总】
-- 子 Agent 完成后你会收到 [mailbox from <id>] 的结果摘要，将其与你的产出整合为最终结论。
-- 你的最终答复就是回灌给父 Agent 的交付物：结论先行、自包含、附关键文件路径；不要写过程流水账。`,
+- 子 Agent 完成后你会收到 [mailbox from <id>] 的结果摘要，按拆分顺序整合为最终结论。
+- 你的最终答复就是回灌给父 Agent 的交付物：结论先行、自包含、附关键文件路径与验收证据；不要写过程流水账。`,
 			ModelConfig:  r.cfg.DomainAgent.ModelConfig,
+			Tools:        []string{"call_sub_agent"},
 			CanBeCalled:  true,
 		}
 	default:

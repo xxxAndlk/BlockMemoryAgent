@@ -4,8 +4,7 @@ import (
 	"context"       // 上下文传递
 	"encoding/json" // JSON 序列化
 	"fmt"           // 错误格式化
-	"net/http"      // 自定义 RoundTripper
-	"strings"       // 路径后缀剥离
+	"strings"       // 字符串拼接
 
 	"github.com/anthropics/anthropic-sdk-go"         // Anthropic Go SDK
 	"github.com/anthropics/anthropic-sdk-go/option"  // Anthropic 客户端选项
@@ -14,21 +13,6 @@ import (
 	bladestools "github.com/go-kratos/blades/tools"  // blades 工具定义
 	"github.com/google/jsonschema-go/jsonschema"     // JSON Schema 处理
 )
-
-// stripMessagesTransport 剥离 SDK 硬编码追加的 /v1/messages 后缀。
-// .env 里的 base_url 即为完整端点，不应再被追加路径。
-// 直接改原 req.URL.Path（不 clone），让 SDK 的错误信息也显示剥离后的 URL。
-type stripMessagesTransport struct {
-	base http.RoundTripper
-}
-
-func (t *stripMessagesTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.URL.Path = strings.TrimSuffix(req.URL.Path, "/v1/messages")
-	if req.URL.RawPath != "" {
-		req.URL.RawPath = strings.TrimSuffix(req.URL.RawPath, "/v1/messages")
-	}
-	return t.base.RoundTrip(req)
-}
 
 // anthropicProvider 基于 Anthropic Go SDK 原生 Messages API 的 provider 封装。
 type anthropicProvider struct {
@@ -63,7 +47,6 @@ func newAnthropicProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 		client: anthropic.NewClient(
 			option.WithAPIKey(cfg.APIKey),
 			option.WithBaseURL(baseURL),
-			option.WithHTTPClient(&http.Client{Transport: &stripMessagesTransport{base: http.DefaultTransport}}),
 		),
 		modelName:   cfg.Model,
 		maxTokens:   maxTokens,
@@ -104,11 +87,7 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 	// 调用 Anthropic Messages API
 	resp, err := p.client.Messages.New(ctx, params)
 	if err != nil {
-		// SDK 内部克隆请求再传 transport，错误信息用原 cfg.Request.URL（含 /v1/messages）。
-		// 实际请求经 stripMessagesTransport 剥离后打到 p.baseURL。
-		// 从 SDK 错误字符串里剔除 /v1/messages，避免误导。
-		cleaned := strings.ReplaceAll(err.Error(), "/v1/messages", "")
-		return nil, fmt.Errorf("anthropic messages POST %s: %s", p.baseURL, cleaned)
+		return nil, fmt.Errorf("anthropic messages POST %s: %w", p.baseURL, err)
 	}
 
 	// 转换响应为 blades 格式
@@ -197,8 +176,7 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 			}
 		}
 		if err := stream.Err(); err != nil {
-			cleaned := strings.ReplaceAll(err.Error(), "/v1/messages", "")
-			yield(nil, fmt.Errorf("anthropic messages stream POST %s: %s", p.baseURL, cleaned))
+			yield(nil, fmt.Errorf("anthropic messages stream POST %s: %w", p.baseURL, err))
 			return
 		}
 
@@ -274,12 +252,45 @@ func (p *anthropicProvider) convertMessages(messages []*blades.Message) ([]anthr
 	// 预分配等长切片
 	out := make([]anthropic.MessageParam, 0, len(messages))
 	// 逐条转换
-	for _, m := range messages {
+	for i := 0; i < len(messages); i++ {
 		// 跳过 nil 消息
-		if m == nil {
+		if messages[i] == nil {
 			continue
 		}
-		param, err := p.convertMessage(m)
+		// Anthropic 协议要求：若上一条 assistant 含 N 个 tool_use，下一条 user 消息
+		// 必须包含全部 N 个 tool_result。我们的 ReactMessage 把每个 tool 结果拆成
+		// 独立 RoleTool 消息；不合并会导致 Ark/Anthropic 端点 400 InvalidParameter。
+		// 这里把连续的 RoleTool 消息合并为单条 user 消息，content 含全部 ToolResultBlock。
+		if messages[i].Role == blades.RoleTool {
+			merged := anthropic.MessageParam{Role: anthropic.MessageParamRoleUser}
+			for i < len(messages) && messages[i] != nil && messages[i].Role == blades.RoleTool {
+				for _, part := range messages[i].Parts {
+					tp, ok := part.(blades.ToolPart)
+					if !ok {
+						continue
+					}
+					if tp.Response == "" {
+						continue
+					}
+					merged.Content = append(merged.Content, anthropic.ContentBlockParamUnion{
+						OfToolResult: &anthropic.ToolResultBlockParam{
+							ToolUseID: tp.ID,
+							Content: []anthropic.ToolResultBlockParamContentUnion{
+								{OfText: &anthropic.TextBlockParam{Text: tp.Response}},
+							},
+						},
+					})
+				}
+				i++
+			}
+			// 回退一位，外层 for 会再 +1，确保下一条非 RoleTool 消息正常处理。
+			i--
+			if len(merged.Content) > 0 {
+				out = append(out, merged)
+			}
+			continue
+		}
+		param, err := p.convertMessage(messages[i])
 		if err != nil {
 			return nil, err
 		}
@@ -361,21 +372,35 @@ func (p *anthropicProvider) convertMessage(m *blades.Message) (anthropic.Message
 //
 // 返回：Anthropic 工具参数切片。
 func (p *anthropicProvider) convertTools(tools []bladestools.Tool) []anthropic.ToolUnionParam {
+	// 无工具时返回 nil，避免序列化为 "tools": [] 触发端点 InvalidParameter
+	if len(tools) == 0 {
+		return nil
+	}
 	// 预分配等长切片
 	out := make([]anthropic.ToolUnionParam, 0, len(tools))
 	// 逐个工具转换
 	for _, t := range tools {
 		// 将 JSON Schema 转为 map
 		schemaMap, _ := schemaToMap(t.InputSchema())
-		if schemaMap == nil {
-			schemaMap = map[string]any{"type": "object"}
+		// ToolInputSchemaParam.Properties 只接受内部 properties 映射，
+		// 传入整个 schema 会导致 input_schema 结构错乱（嵌套一层 type/properties/required），
+		// 触发 Ark 端点 400 InvalidParameter。
+		var properties any
+		if schemaMap != nil {
+			if props, ok := schemaMap["properties"]; ok {
+				properties = props
+			} else {
+				properties = map[string]any{}
+			}
+		} else {
+			properties = map[string]any{}
 		}
 		out = append(out, anthropic.ToolUnionParam{
 			OfTool: &anthropic.ToolParam{
 				Name:        t.Name(),
 				Description: anthropic.String(t.Description()),
 				InputSchema: anthropic.ToolInputSchemaParam{
-					Properties: schemaMap,
+					Properties: properties,
 					Required:   t.InputSchema().Required,
 				},
 			},

@@ -1,6 +1,6 @@
 # Agent 角色配置文件
 #
-# 架构：MetaAgent 运行单一 ReAct 主循环（LLM → 工具 → 结果 → 循环），
+# 架构：MetaAgent 运行单一 ReAct 主循环（LLM -> 工具 -> 结果 -> 循环），
 # 通过 call_sub_agent 工具按 role_id 异步派发子 Agent（固定角色或领域负责人），
 # 子 Agent 完成后结果摘要经 Mailbox 回灌父 Agent。
 #
@@ -10,46 +10,51 @@
 #   - anthropic：Anthropic 原生 Messages API，默认 https://api.anthropic.com
 # 三种 provider 分别使用对应 SDK，不再统一转成 OpenAI 兼容端点。
 
-# 主Agent (MetaAgent)：会话入口，对最终目标负责
+# 主Agent (MetaAgent)：会话入口，对最终目标负责。只做派发与汇总，不直接执行。
 meta_agent:
   model_config: &meta_model
     provider: anthropic
-    model: glm-5.2            # 暂切 Kimi（原 glm-5.2 @ 火山方舟 key 失效，修复后可改回）
+    model: glm-5.2
     api_key: ${ANTHROPIC_API_KEY}     # 原 ${ANTHROPIC_API_KEY_TWO}
     base_url: ${ANTHROPIC_BASE_URL}   # 原 ${ANTHROPIC_BASE_URL_TWO}
     temperature: 0.3
-    max_tokens: 8192    # 思考模型需为推理预留额度；2048 会在长任务中耗尽导致空响应（任务静默中断）
+    max_tokens: 16384   # 思考模型需为推理预留额度；8192 在长任务+多子 Agent 派发时会耗尽导致输出截断
   system_prompt: |
     你是 BlockMemoryAgent 的主 Agent（MetaAgent），对用户的最终目标直接负责。
+    你只做派发与汇总，不直接执行任何文件或命令操作。
 
-    【工作方式】
-    你运行在"思考→工具→观察"的循环中，每一步可以：
-    - 直接使用工具完成任务（ReadFile / WriteFile / ListDir / RunCommand / SearchInFiles / HTTPGet / HTTPPost / Git 系列）
-    - 调用 call_sub_agent(role_id, task) 把子任务派发给专业助手异步执行
+    【唯一工作方式】
+    你只有一个工具：call_sub_agent(role_id, task)。不要试图调用 ReadFile/WriteFile/RunCommand 等--你没有这些工具，防止越位直接改文件。
+
+    【派发决策：领域拆分 vs 简单转发】
+    1. 复杂任务（涉及多领域 / 多步骤 / 多文件改动）：
+       先按业务领域拆分，每个领域目标用 call_sub_agent(role_id="domain", task="<领域目标 + 验收标准>") 派给 DomainAgent。
+       DomainAgent 会进一步把领域目标拆到函数级，派给固定助手执行。
+    2. 简单任务（单一问题、单步可答、无需多文件改动）：
+       直接 call_sub_agent 派给对应的固定助手，把助手的回灌摘要复制并整理为最终答复。
+       - code_assistant：代码问题、单点 bug、单函数实现
+       - ui_assistant：单点 UI/CSS 问题
+       - test_assistant：单点测试问题
+       - doc_assistant：单点文档问题
+       - prompt_reviewer：提示词审查
+    3. 不确定走哪条？倾向走 domain：让 DomainAgent 决定是否需要进一步拆分。
 
     【思考过程展示】
-    每次决定调用工具之前，先用一两句话写出你的分析与下一步打算
+    每次决定派发之前，先用一两句话写出你的分析与下一步打算
     （例如"用户在问我的身份，我应直接回答"或"需要先定位配置文件，再修改"）。
     这部分文字会作为"思考过程"以暗色临时样式展示给用户；最终答复保持完整自包含，不要重复这些思考。
 
-    【何时派发子 Agent】
-    - 子任务需要多步工具操作且边界清晰时才派发；一两步能完成的事自己做，不要派发。
-    - 多个子任务相互独立时可分别派发、并行推进；有依赖关系时，等前一个结果再派发下一个。
-    - 派发的 task 必须自包含：背景、目标、相关文件路径、验收标准——子 Agent 看不到本次对话历史。
+    【派发契约】
+    - task 必须自包含：背景、目标、相关文件路径、验收标准--子 Agent 看不到本次对话历史。
     - call_sub_agent 立即返回 sub_agent_id，子 Agent 在后台运行；完成后你会收到 [mailbox from <sub_agent_id>] 消息，内含其结果摘要。
-
-    【可派发的角色】
-    - code_assistant：代码编写、审查、重构、调试
-    - ui_assistant：前端 UI、样式、组件开发
-    - test_assistant：测试编写、执行与结果分析
-    - doc_assistant：技术文档与代码注释
-    - prompt_reviewer：提示词审查与优化
-    - domain：通用领域负责人，任务不属于上述专业领域时使用
+    - 多个领域相互独立时可分别派发、并行推进；有依赖关系时，等前一个结果再派发下一个。
+    - 收到 mailbox 摘要后及时整合进结论；不要空等，可以继续派发其他独立子任务。
 
     【目标管理】
-    1. 接到目标先规划：拆解为可执行步骤，明确哪些自己做、哪些派发。
-    2. 派发后不要空等：继续推进自己能做的部分；收到 mailbox 摘要后及时整合进结论。
+    1. 接到目标先规划：拆解为领域或简单子任务，明确派发顺序。
+    2. 派发后不要空等：继续推进可并行的派发；收到 mailbox 摘要后及时整合。
     3. 全部子任务完成并验证后，输出最终答复：目标达成情况 + 关键产出 + 涉及文件路径。
+    4. 简单任务的最终答复 = 助手回灌摘要的整理版（去掉过程流水账，保留结论与文件路径）。
   max_blocks: 20
   summary_interval: 10
 
@@ -61,7 +66,7 @@ domain_agent:
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.5
-    max_tokens: 4096
+    max_tokens: 8192
 
 # 轻量模型配置（用于历史会话总结、检索 query 改写等低开销任务）
 # 可指向更便宜更快的模型；留空 model 时回退到 domain_agent 模型
@@ -76,14 +81,21 @@ lightweight_model:
 # 文本嵌入模型配置（P3-3）
 # provider: pseudo（默认，零依赖字符哈希） | openai（OpenAI 兼容端点） | local（本地 ollama/xinference）
 # 向量维度需与上方 pgvector.dimensions 一致。
+# 当前 provider=pseudo：用户方舟账号未激活 doubao-embedding-vision，且 EMBEDDING_API_KEY 鉴权失败。
+# 切回真实嵌入需：1) 方舟控制台激活 doubao-embedding-text-240715 等模型；2) 注入有效 Embedding API Key；
+# 3) 把 provider 改回 openai，model 改为已激活模型名；4) 校对 pgvector.dimensions 与模型维度一致。
 embed:
-  provider: openai               # 默认 pseudo；接入真实模型时改为 openai/local
-  model: doubao-embedding-vision # 如 text-embedding-3-small、bge-m3
+  provider: pseudo             # 默认 pseudo；接入真实模型时改为 openai/local
+  model: pseudo-hash           # 真实模型示例：doubao-embedding-text-240715、bge-m3
   api_key: ${EMBEDDING_API_KEY}  # openai/local 需要；pseudo 时忽略
   base_url: ${EMBEDDING_BASE_URL} # 自定义 OpenAI 兼容端点；为空时 openai 走官方地址
   batch_size: 1                  # 单次嵌入条数上限
 
 # 固定助手角色（配置文件预定义，长期存在，可被 call_sub_agent 派发）
+# 这些角色是叶子执行者：拥有 ReadFile/WriteFile/RunCommand 等执行类工具，
+# 但不再拥有 call_sub_agent（不能派发子任务，避免越位）。
+# 验证闭环（code_assistant <-> test_assistant）由 verifyloop 编排器在代码层接管，
+# 不再依赖 parents 字段做 peer 派发。
 fixed_roles:
   # 代码助手
   - id: code_assistant
@@ -93,6 +105,7 @@ fixed_roles:
     description: 专业的代码编写与审查助手，擅长Go/JavaScript/Python等语言
     system_prompt: |
       你是一位资深代码工程师，专注高质量代码的编写、审查与重构。
+      你是叶子执行者：只完成父 Agent 交办的单一任务，不要再派发子任务（你没有 call_sub_agent 工具）。
 
       【职责】
       1. 编写高质量、可维护的代码，遵循项目既有编码规范与风格
@@ -110,17 +123,16 @@ fixed_roles:
       修改摘要 + 验证结果（命令与结论）+ 涉及的文件路径。
     keywords: ["代码", "编程", "开发", "bug", "修复", "重构", "review", "code"]
     skills: ["代码编写", "代码审查", "重构", "单元测试", "调试"]
+    # 只暴露执行类工具；call_sub_agent 由 dispatcher 注册但不在此白名单中。
+    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &coding_model
       provider: anthropic
       model: kimi-k2.7-code
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
-      max_tokens: 4096
+      max_tokens: 8192
     can_be_called: true
-    # parents 即"本角色可调用的角色"白名单（见 domain/role.registry.go CanCall）。
-    # 列入 test_assistant 使代码助手完成后可派发验证子任务，形成协作验证闭环。
-    parents: [test_assistant]
 
   # UI助手
   - id: ui_assistant
@@ -130,6 +142,7 @@ fixed_roles:
     description: 前端UI/UX设计与实现助手，擅长CSS/HTML/组件开发
     system_prompt: |
       你是一位前端 UI 专家，负责界面样式、布局与组件开发。
+      你是叶子执行者：只完成父 Agent 交办的单一任务，不要再派发子任务（你没有 call_sub_agent 工具）。
 
       【职责】
       1. 分析和修复 UI 问题（样式/布局/交互）
@@ -146,9 +159,9 @@ fixed_roles:
       改动摘要 + 验证结果 + 涉及的文件路径。
     keywords: ["UI", "界面", "前端", "CSS", "HTML", "样式", "布局", "page"]
     skills: ["UI修复", "组件开发", "响应式设计", "CSS优化", "交互实现"]
+    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: *domain_model
     can_be_called: true
-    parents: []
 
   # 提示词审查助手
   - id: prompt_reviewer
@@ -158,6 +171,7 @@ fixed_roles:
     description: 专门审查和优化AI提示词（Prompt）的助手
     system_prompt: |
       你是一位 Prompt Engineering 专家，负责审查和优化 AI 提示词。
+      你是叶子执行者：只完成父 Agent 交办的单一任务，不要再派发子任务（你没有 call_sub_agent 工具）。
 
       【职责】
       1. 审查提示词的清晰度、完整性、一致性与安全性
@@ -173,15 +187,15 @@ fixed_roles:
       最终答复 = 按严重度排序的问题清单 + 改写后的提示词全文，自包含。
     keywords: ["提示词", "prompt", "审查", "优化", "template"]
     skills: ["Prompt审查", "Prompt优化", "安全检测", "偏见检测"]
+    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &review_model
       provider: openai
-      model: deepseek-v4-flash
+      model: deepseek-v4-pro
       api_key: ${OPENAI_API_KEY}
       base_url: ${OPENAI_BASE_URL}
       temperature: 0.2
-      max_tokens: 2048
+      max_tokens: 4096
     can_be_called: true
-    parents: []
 
   # 测试助手
   - id: test_assistant
@@ -191,6 +205,7 @@ fixed_roles:
     description: 自动化测试与质量保障助手
     system_prompt: |
       你是一位测试工程师，负责自动化测试与质量保障。
+      你是叶子执行者：只完成父 Agent 交办的单一任务，不要再派发子任务（你没有 call_sub_agent 工具）。
 
       【职责】
       1. 编写单元测试与集成测试，覆盖主路径与异常路径
@@ -208,11 +223,9 @@ fixed_roles:
       新增/修改的测试文件 + 运行结果 + 覆盖说明。
     keywords: ["测试", "test", "验证", "QA", "assert", "coverage"]
     skills: ["单元测试", "集成测试", "边界测试", "性能测试"]
+    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: *coding_model
     can_be_called: true
-    # parents 即"本角色可调用的角色"白名单。
-    # 列入 code_assistant 使测试助手验证后可回退给代码助手修正，形成协作验证闭环。
-    parents: [code_assistant]
 
   # 文档助手
   - id: doc_assistant
@@ -222,6 +235,7 @@ fixed_roles:
     description: 技术文档编写与维护助手
     system_prompt: |
       你是一位技术文档工程师，负责技术文档的编写与维护。
+      你是叶子执行者：只完成父 Agent 交办的单一任务，不要再派发子任务（你没有 call_sub_agent 工具）。
 
       【职责】
       1. 编写清晰的技术文档与 API 文档
@@ -240,17 +254,17 @@ fixed_roles:
       文档摘要 + 涉及的文件路径。
     keywords: ["文档", "doc", "README", "注释", "example"]
     skills: ["技术文档", "API文档", "代码注释", "示例编写"]
+    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &doc_model
       provider: openai
-      model: deepseek-v4-flash
+      model: deepseek-v4-pro
       api_key: ${OPENAI_API_KEY}
       base_url: ${OPENAI_BASE_URL}
       temperature: 0.5
-      max_tokens: 4096
+      max_tokens: 8192
     can_be_called: true
-    parents: []
 
-# 动态角色模板（大模型生成临时角色时参考）
+# 动态角色模板
 # 每个模板均可选填 model_config；未配置时，由该模板动态生成的角色回退到 domain_agent.model_config。
 # provider 取值与 fixed_roles 一致：openai / ollama / anthropic（均走 OpenAI 兼容协议）。
 dynamic_templates:

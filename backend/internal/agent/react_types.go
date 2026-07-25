@@ -133,6 +133,19 @@ type ModelProvider interface {
 // ToBladesMessages 将我们的对话历史转换为 blades 消息切片，用于构造模型请求。
 // 返回的切片不会与源切片共享可变状态，避免后续修改相互影响。
 func ToBladesMessages(history []ReactMessage) []*blades.Message {
+	// 预先建立 tool_call_id -> ToolCall 索引，供后续 tool 结果消息回填 Name + Request。
+	// blades contrib openai v0.3.0 的 toToolCallMessage 期望 RoleTool 消息的 ToolPart
+	// 携带全部字段（ID/Name/Request/Response）；若 Name 与 Request 为空，
+	// ChatCompletionMessageFunctionToolCallFunctionParam 为零值，被 omitzero 标签省略，
+	// 序列化出的 tool_call 对象缺 `function` 字段，DeepSeek/OpenAI 严格校验会回 400
+	// "missing field `function`"。回填 Name + Request 后即与 blades 协议契合。
+	toolCallsByID := make(map[string]ToolCall, len(history))
+	for _, m := range history {
+		for _, tc := range m.ToolCalls {
+			toolCallsByID[tc.ID] = tc
+		}
+	}
+
 	// 预分配与 history 长度相同的容量，减少 append 过程中的内存分配。
 	out := make([]*blades.Message, 0, len(history))
 	// 遍历每一轮对话消息，根据角色转换为 blades 对应的消息类型。
@@ -163,13 +176,20 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 			// 将组装好的 assistant 消息追加到结果切片。
 			out = append(out, msg)
 		case "tool":
-			// tool 角色表示工具执行结果，编码为一个带有 Response 字段的 ToolPart。
-			// 调用方应把工具产生的 JSON 结果设置到 Content 中传入；
-			// ID 必须携带对应的工具调用 ID，否则 API 会因 tool_call_id 不匹配拒绝请求。
+			// tool 角色表示工具执行结果。blades contrib 期望 RoleTool 消息携带
+			// 完整 ToolPart（ID/Name/Request/Response），由 toToolCallMessage 抽取
+			// Name+Request 构造 assistant tool_call，再由 ToolMessage 抽取 Response
+			// 构造 tool 结果。回填 Name + Request 避免 function 字段缺失。
+			part := blades.ToolPart{ID: m.ToolCallID, Response: m.Content}
+			if tc, ok := toolCallsByID[m.ToolCallID]; ok {
+				part.Name = tc.Name
+				req, _ := json.Marshal(tc.Input)
+				part.Request = string(req)
+			}
 			out = append(out, &blades.Message{
 				Role: blades.RoleTool,
 				Parts: []blades.Part{
-					blades.ToolPart{ID: m.ToolCallID, Response: m.Content},
+					part,
 				},
 			})
 		case "system":

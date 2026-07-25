@@ -202,6 +202,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	}
 	roleRegistry := role.NewRegistry(roleCfg)                         // 角色注册表
 	toolRegistry := tool.NewBuiltinRegistry(workDir, &cfg.Agent, nil) // 内置工具注册表
+	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
+	// Executor 永远跑 DefaultSandboxConfig（默认禁写工作目录外、保留命令黑名单）。
+	toolRegistry.SetSandboxConfig(&cfg.Agent.SafetyConfig)
 	memoryPipeline := memory.NewPipeline(memory.NewInMemoryStore())   // 记忆流水线
 
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。

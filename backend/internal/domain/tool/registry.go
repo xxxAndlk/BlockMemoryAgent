@@ -16,9 +16,7 @@ import (
 // 超过此次数将触发循环退出，避免无限重试。
 const maxConsecutiveFailures = 3
 
-// maxReadFilePerTask 定义单个任务中允许 ReadFile 读取的不同文件数量上限，
-// 用于防止模型反复读取相同内容造成冗余。
-const maxReadFilePerTask = 5
+// maxReadFilePerTask 已废弃：ReadFile 不再限制不同文件数量，仅拦截同一文件重读。
 
 // Tool 是内置工具的通用接口，所有具体工具都需要实现该接口。
 type Tool interface {
@@ -135,6 +133,24 @@ func (r *Registry) Register(t Tool) {
 	for _, alias := range t.Aliases() {
 		r.aliases[alias] = t.Name()
 	}
+}
+
+// SetSandboxConfig 把 SafetyConfig 翻译成 Executor 的 SandboxConfig 并注入。
+// yaml 中的 tool_sandbox_disabled / tool_sandbox_allowed_paths / tool_sandbox_blocked_cmds
+// 经此方法才真正生效；否则 Executor 始终用 DefaultSandboxConfig。
+func (r *Registry) SetSandboxConfig(cfg *config.SafetyConfig) {
+	// cfg 为 nil 时退化为默认沙箱（保留命令黑名单、限制写路径）。
+	if cfg == nil {
+		return
+	}
+	sbCfg := &SandboxConfig{
+		AllowedPaths:             cfg.ToolSandboxAllowedPaths,
+		AllowWriteOutsideWorkDir: cfg.ToolSandboxDisabled,
+	}
+	// 追加用户配置的额外命令黑名单到默认黑名单尾部。
+	defaultBlocked := DefaultSandboxConfig().BlockedCmds
+	sbCfg.BlockedCmds = append(append([]string{}, defaultBlocked...), cfg.ToolSandboxBlockedCmds...)
+	r.exec.SetSandboxConfig(sbCfg)
 }
 
 // SetProgressCallback 在构造完成后替换进度回调函数。
@@ -288,18 +304,14 @@ func (r *Registry) checkReadFileBudget(ctx context.Context, path string) string 
 	r.readMu.Lock()
 	// 函数退出时释放锁。
 	defer r.readMu.Unlock()
-	// 遍历已读文件列表，若发现重复路径则拦截。
+	// 遍历已读文件列表，若发现重复路径则拦截（防止短时间重复读取同一文件）。
 	for _, p := range r.readFiles {
 		if filepath.Clean(p) == cleanPath {
 			// 返回中文提示，告知模型已读过并应使用 SearchInFiles 定位。
 			return fmt.Sprintf("该文件本任务已读过（%s），禁止重读。复用已返回内容推进任务；如需看其他段落请用 SearchInFiles 精确定位。", cleanPath)
 		}
 	}
-	// 若已读文件数量达到上限，则拦截新的读取。
-	if len(r.readFiles) >= maxReadFilePerTask {
-		return fmt.Sprintf("已达单任务 ReadFile 上限 %d 次（已读: %s）。请基于已读内容推进任务，或用 SearchInFiles 定位新内容。", maxReadFilePerTask, strings.Join(r.readFiles, ", "))
-	}
-	// 允许读取。
+	// 不同文件数量不再设上限；允许读取。
 	return ""
 }
 
@@ -332,8 +344,8 @@ func (r *Registry) readListHint() string {
 		return ""
 	}
 	// 返回格式化的中文提示，包含数量与路径列表。
-	return fmt.Sprintf("[已读文件清单 (%d/%d): %s — 禁止重读]",
-		len(r.readFiles), maxReadFilePerTask, strings.Join(r.readFiles, ", "))
+	return fmt.Sprintf("[已读文件清单 (%d): %s — 禁止重读]",
+		len(r.readFiles), strings.Join(r.readFiles, ", "))
 }
 
 // Schema 返回所有已注册工具对应的 blades Tool 定义列表，

@@ -409,17 +409,25 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	// 使用 context.Background() 创建独立于父 ctx 的上下文：
 	//   - 父会话取消不会波及子 Agent，避免长任务结果丢失。
 	//   - timeout>0 时才叠加超时；defer cancel 确保 goroutine 退出时释放上下文资源。
+	//   - 继承父 ctx 的 sessionID：子 Agent 工具事件经 handleToolEvent 写入会话日志，
+	//     否则事件 SessionID 为空被静默丢弃（参见 service_react.handleToolEvent 的 isRunning 分支）。
 	subAgentCtx := context.Background()
+	if sid := tool.SessionIDFromContext(ctx); sid != "" {
+		subAgentCtx = tool.WithSessionID(subAgentCtx, sid)
+	}
 	cancel := context.CancelFunc(func() {})
 	if d.timeout > 0 {
 		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, d.timeout)
 	}
+	taskBrief := truncateRunes(strings.ReplaceAll(strings.TrimSpace(task), "\n", " "), 100)
+	log.Printf("[subagent] dispatch: parent=%s sub=%s role=%s task=%q", parentID, subAgentID, roleID, taskBrief)
+	started := time.Now()
 	go func() {
 		defer cancel()
 		// 无论 runSubAgent 以何种方式结束，都递减父 Agent 的未决计数并发出完成信号，
 		// 唤醒可能在 WaitForAnyChild 中等待的父 Agent。
 		defer d.trackChildDone(parentID)
-		d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task)
+		d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, started)
 	}()
 
 	// 返回成功结果，Output 为子 Agent ID，父 Agent 可用该 ID 查询或接收后续通知。
@@ -433,18 +441,22 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 // runSubAgent 为指定角色创建 ReActAgent，驱动其运行，
 // 并在完成后将最终结果推送到父 Agent 的邮箱。
 // 这是 call_sub_agent 工具的异步执行路径：runSubAgentOnce 纯执行 + notify + 钩子。
-func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task string) {
+// started 为派发起始时间，用于计算耗时并写入完成/失败日志。
+func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task string, started time.Time) {
 	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task)
+	duration := time.Since(started)
 	if err != nil {
 		partial := ""
 		if result.History != nil {
 			partial = truncateRunes(agent.LastAssistantText(result.History), 500)
 		}
+		log.Printf("[subagent] FAIL: sub=%s role=%s duration=%s err=%v partial=%q", subAgentID, roleDef.ID, duration, err, truncateRunes(partial, 200))
 		d.notify(parentID, subAgentID, formatSubAgentFailure(err, result, d.timeout, partial))
 		return
 	}
 
 	// 成功：通知父 Agent，触发完成钩子。
+	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
 	d.notify(parentID, subAgentID, result.Text)
 
 	// 完成钩子：供 verifyloop 编排器接管"代码->测试->修正->统一测试"原生状态机。
@@ -472,7 +484,11 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		mem = agent.NopMemoryPipeline{}
 	}
 
-	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapter(d.tools)).
+	// 按角色 Tools 白名单过滤暴露给子 Agent 的工具：
+	// - DomainAgent 只见 call_sub_agent（继续拆分到函数级派发）；
+	// - 固定助手只见 ReadFile/WriteFile/RunCommand 等执行类工具，不再能 call_sub_agent（叶子执行者）。
+	// Dispatch 路径不受白名单限制，verifyloop 的 ExecuteChild 仍可直接调任意工具。
+	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopCfg)
