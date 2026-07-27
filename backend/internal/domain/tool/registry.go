@@ -80,6 +80,9 @@ type Registry struct {
 	readMu sync.Mutex
 	// readFiles 记录本任务已经读取过的文件路径，用于 ReadFile 预算控制。
 	readFiles []string
+	// sharedMemory 是 WriteSharedMemory 工具的 KV 后端，由 bootstrap 注入。
+	// 为 nil 时 WriteSharedMemory 注册但不生效，调用返回 store 未配置错误。
+	sharedMemory SharedMemoryStore
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -101,6 +104,9 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	}
 	// 注册系统内置的默认工具列表。
 	r.registerDefaults()
+	// 注册 WriteSharedMemory 工具；store 在 SetSharedMemory 注入后生效。
+	// 注册始终发生，使 Schema 中可见；调用时若 store 未注入返回错误。
+	r.Register(&writeSharedMemoryTool{})
 	// 返回构造完成的注册表。
 	return r
 }
@@ -158,6 +164,16 @@ func (r *Registry) SetSandboxConfig(cfg *config.SafetyConfig) {
 func (r *Registry) SetProgressCallback(cb ProgressCallback) {
 	// 直接覆盖注册表中的 progress 字段。
 	r.progress = cb
+}
+
+// SetSharedMemory 注入 WriteSharedMemory 工具的 KV 后端。
+// bootstrap 在创建 sharedKV 后调用；为 nil 时 WriteSharedMemory 调用返回未配置错误。
+// 同时把 store 写入已注册的 writeSharedMemoryTool 实例，使其立即可用。
+func (r *Registry) SetSharedMemory(store SharedMemoryStore) {
+	r.sharedMemory = store
+	if t, ok := r.tools["WriteSharedMemory"].(*writeSharedMemoryTool); ok {
+		t.store = store
+	}
 }
 
 // Dispatch 根据名称调度并执行工具，返回 JSON 序列化后的 Result。
@@ -454,6 +470,15 @@ func (r *Registry) Schema() []tools.Tool {
 	// 注册 GitBlame 工具：查看指定文件每行最后修改者。
 	if t, err := tools.NewFunc("GitBlame", "查看指定文件每行的最后修改者（git blame）。", func(ctx context.Context, in gitBlameInput) (string, error) {
 		res, _ := r.Dispatch(ctx, "GitBlame", map[string]any{"path": in.Path})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 WriteSharedMemory 工具：写入 KV 共享记忆，供子 Agent 经 dispatcher.injectKVMemory 自动读取。
+	// 仅暴露给 MetaAgent（meta 角色白名单），固定助手/DomainAgent 的白名单不含此工具。
+	if t, err := tools.NewFunc("WriteSharedMemory", "把派发前采集的关键上下文（文件路径、行号、函数签名、前置结论、验收标准）写入共享记忆。被派发的子 Agent 会自动读取，避免重读全文件。仅 MetaAgent 可用。", func(ctx context.Context, in writeSharedMemoryInput) (string, error) {
+		res, _ := r.Dispatch(ctx, "WriteSharedMemory", map[string]any{"content": in.Content})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
 	}); err == nil {

@@ -497,6 +497,12 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 	// 不在此回填会导致日志 agentName 永远空串，sub-agent 工具事件无法归属。
 	// MetaAgent 的 agent ID = session-ID（"session-1"），sub-agent = "session-1/code_assistant-5"。
 	agentID := AgentIDFromContext(ctx)
+	// 展示名优先取 role.Name（"MetaAgent"/"代码助手"/"领域Agent:xxx"），
+	// 使日志与对话页可读；缺失时回退到 agentID，保证不空串。
+	agentName := AgentDisplayNameFromContext(ctx)
+	if agentName == "" {
+		agentName = agentID
+	}
 	// 加读锁判断会话是否存在且处于运行状态。
 	s.store.mu.RLock()
 	session, ok := s.store.sessions[ev.SessionID]
@@ -516,7 +522,7 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 	success := ev.Kind != eventkind.Error
 	// 工具调用事件：直接记录工具执行事件。
 	if ev.Kind == "tool_call" || ev.Kind == eventkind.ToolCall {
-		s.store.addEvent(session, eventkind.ToolExec, agentID, ev.Message, ev.Kind, ev.Tool, toolArgsLabel(ev.Detail), "", "", success)
+		s.store.addEvent(session, eventkind.ToolExec, agentName, ev.Message, ev.Kind, ev.Tool, toolArgsLabel(ev.Detail), "", "", success)
 		return
 	}
 	// 工具结果事件：尝试解析 Detail 中的 output、error 与 path 字段。
@@ -549,11 +555,11 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 			}
 			msg = fmt.Sprintf("%s [FAIL]%s err=%s", ev.Message, extra, toolErr)
 		}
-		s.store.addEvent(session, eventkind.ToolExec, agentID, msg, ev.Kind, ev.Tool, toolPath, output, toolErr, success)
+		s.store.addEvent(session, eventkind.ToolExec, agentName, msg, ev.Kind, ev.Tool, toolPath, output, toolErr, success)
 		return
 	}
 	// 其他类型事件作为进度事件记录。
-	s.store.addEvent(session, eventkind.Progress, agentID, ev.Message, ev.Kind, ev.Tool, "", "", "", success)
+	s.store.addEvent(session, eventkind.Progress, agentName, ev.Message, ev.Kind, ev.Tool, "", "", "", success)
 }
 
 // toolArgsLabel 从工具调用参数 JSON 中提取一个简短的展示标签（路径/命令/URL 等），
@@ -620,7 +626,8 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	}
 
 	// 构造 ReActAgent，并注入邮箱、记忆管道与主循环运行时配置。
-	// MetaAgent 只暴露 call_sub_agent 工具（metaRole.Tools 限定），防止越位直接读写文件。
+	// MetaAgent 暴露 call_sub_agent + 只读/信息类工具（ReadFile/ListDir/SearchInFiles/HTTPGet），
+	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).
@@ -693,7 +700,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	}
 
 	// 构造并配置 ReActAgent。
-	// MetaAgent 只暴露 call_sub_agent 工具（metaRole.Tools 限定），防止越位直接读写文件。
+	// MetaAgent 暴露 call_sub_agent + 只读/信息类工具（ReadFile/ListDir/SearchInFiles/HTTPGet），
+	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).

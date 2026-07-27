@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
 	"github.com/go-kratos/blades/tools"
@@ -248,25 +249,37 @@ func ToolResultJSON(r ToolResult) string {
 	return string(b)
 }
 
-// agentIDKey 是用于在 context 中携带当前代理 ID 的键类型。
-// 工具处理器（例如 call_sub_agent）需要通过它识别父代理。
-type agentIDKey struct{}
-
 // WithAgentID 返回一个携带当前代理 ID 的 context。
-// ctx 是基础上下文；agentID 是要携带的代理标识。
+// 委托给 tool.WithAgentID，使 tool 包的 WriteSharedMemory 等工具能读到同一值；
+// 保留 agent 包侧导出仅为不破坏既有调用方（dispatcher_test.go 等）。
 func WithAgentID(ctx context.Context, agentID string) context.Context {
-	// 使用私有类型作为键，避免与其他包使用字符串键发生冲突。
-	return context.WithValue(ctx, agentIDKey{}, agentID)
+	return tool.WithAgentID(ctx, agentID)
 }
 
 // AgentIDFromContext 从 ctx 中取出存储的代理 ID。
-// 如果不存在则返回空字符串。
+// 委托给 tool.AgentIDFromContext，与 WithAgentID 共享同一 key 类型。
 func AgentIDFromContext(ctx context.Context) string {
-	// 尝试从 context 中读取并类型断言为字符串。
-	if v, ok := ctx.Value(agentIDKey{}).(string); ok {
-		// 类型断言成功，返回代理 ID。
+	return tool.AgentIDFromContext(ctx)
+}
+
+// agentDisplayNameKey 用于在 context 中携带代理展示名（"MetaAgent" / "代码助手" / "领域Agent:xxx"）。
+// 与 agentIDKey 解耦：agentIDKey 走 mailbox 路由，agentDisplayNameKey 专供日志与 UI 展示。
+type agentDisplayNameKey struct{}
+
+// WithAgentDisplayName 返回一个携带代理展示名的 context。
+// displayName 为空时直接返回原 ctx，避免覆盖既有展示名。
+func WithAgentDisplayName(ctx context.Context, displayName string) context.Context {
+	if displayName == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, agentDisplayNameKey{}, displayName)
+}
+
+// AgentDisplayNameFromContext 从 ctx 中取出代理展示名。
+// 不存在时返回空串，调用方应回退到 AgentIDFromContext。
+func AgentDisplayNameFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(agentDisplayNameKey{}).(string); ok {
 		return v
 	}
-	// context 中没有值或类型不匹配，返回空字符串。
 	return ""
 }

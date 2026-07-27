@@ -162,6 +162,10 @@ const emptyResponseNudge = "（系统提示：你上一条回复为空，未包�
 func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history []ReactMessage) (ReactResult, error) {
 	// 将当前代理标识写入上下文，便于链路追踪、日志和工具调用时识别身份。
 	ctx = WithAgentID(ctx, a.name)
+	// 同步注入展示名（role.Name），供 handleToolEvent 写日志与 UI 时显示
+	// "MetaAgent"/"代码助手" 而非 session-ID（"session-1"）。sub-agent 的
+	// 展示名在 dispatcher 侧覆写 roleDef.Name 后同样经此注入。
+	ctx = WithAgentDisplayName(ctx, a.role.Name)
 
 	// 如果外部传入 nil 历史，则初始化为空切片，保证后续 append 安全。
 	if history == nil {

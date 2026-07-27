@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
@@ -200,6 +201,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err != nil {
 		workDir = "."
 	}
+	// 确保 workspace/ 存在：Agent 的用户产物落点（guards 仅允许写 workspace/ 子树）。
+	// 缺失会导致 ListDir workspace 失败、子 Agent 误写到 web/ 等受保护目录。
+	// 幂等：已存在时 MkdirAll 不报错。
+	if mkErr := os.MkdirAll(filepath.Join(workDir, "workspace"), 0o755); mkErr != nil {
+		return nil, fmt.Errorf("create workspace dir: %w", mkErr)
+	}
 	roleRegistry := role.NewRegistry(roleCfg)                         // 角色注册表
 	toolRegistry := tool.NewBuiltinRegistry(workDir, &cfg.Agent, nil) // 内置工具注册表
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
@@ -233,6 +240,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 默认仅内存；需持久化时传 PostgresStore 适配的 KVStore（待后续实现）。
 	sharedKV := memory.NewInMemoryKV(true, nil)
 	subAgentDispatcher.WithKVMemory(sharedKV)
+	// 把同一 sharedKV 注入工具注册表，使 WriteSharedMemory 工具能写入；
+	// MetaAgent 在派发复杂任务前调用 WriteSharedMemory 写入关键上下文，
+	// 子 Agent 经 dispatcher.injectKVMemory 自动读取。
+	toolRegistry.SetSharedMemory(sharedKV)
 	subAgentDispatcher.RegisterCallTool(toolRegistry)
 	// 注册 send_message 工具：支持任意 Agent 向另一个 Agent 实例邮箱投递消息，
 	// 是多 Agent 协作验证闭环（代码 Agent <-> 测试 Agent 互问互答）的基础原语。

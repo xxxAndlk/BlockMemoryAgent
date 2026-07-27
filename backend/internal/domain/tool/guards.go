@@ -269,7 +269,9 @@ func rejectProtectedPath(path string) error {
 	segments := strings.Split(lower, "/")
 
 	// protectedRoots 列出禁止写入的根级目录名。
-	protectedRoots := []string{"backend", "test", "cmd", "config", "migrations", ".git", ".github", ".claude", ".idea", ".vscode", "doc", "docs", "scripts", "docker"}
+	// web/ 是前端构建产物（被 main.go 静态托管），写入会被下次构建覆盖；
+	// node_modules / dist / build / bin / pkg / logs 同属构建产物或运行时目录，不应被 Agent 污染。
+	protectedRoots := []string{"backend", "test", "cmd", "config", "migrations", ".git", ".github", ".claude", ".idea", ".vscode", "doc", "docs", "scripts", "docker", "web", "node_modules", "dist", "build", "bin", "pkg", "logs"}
 
 	// 遍历每一段，检查是否为受保护的根目录。
 	for i, seg := range segments {

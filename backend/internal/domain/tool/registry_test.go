@@ -136,17 +136,18 @@ func (s *stubCallSubAgent) Execute(ctx context.Context, args map[string]any) *Re
 }
 
 // TestSchemaIncludesCallSubAgent 验证：call_sub_agent 注册后出现在 LLM 工具
-// schema 中，且描述文本来自工具的 Description()；未注册时 schema 只有 11 个内置工具。
+// schema 中，且描述文本来自工具的 Description()；未注册时 schema 只有 12 个内置工具
+// （ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles/HTTPGet/HTTPPost/GitDiff/GitStatus/GitLog/GitBlame/WriteSharedMemory）。
 func TestSchemaIncludesCallSubAgent(t *testing.T) {
-	// 未安装 call_sub_agent 时，schema 恰为 11 个内置工具。
+	// 未安装 call_sub_agent 时，schema 恰为 12 个内置工具。
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	if n := len(r.Schema()); n != 11 {
-		t.Fatalf("expected 11 builtin tools without call_sub_agent, got %d", n)
+	if n := len(r.Schema()); n != 12 {
+		t.Fatalf("expected 12 builtin tools without call_sub_agent, got %d", n)
 	}
 	// 安装后应出现在 schema 中，且描述来自 Description()。
 	r.Register(&stubCallSubAgent{})
 	schema := r.Schema()
-	if len(schema) != 12 {
+	if len(schema) != 13 {
 		t.Fatalf("expected 12 tools with call_sub_agent, got %d", len(schema))
 	}
 	// 遍历查找 call_sub_agent 并校验描述文本。

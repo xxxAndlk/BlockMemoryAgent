@@ -50,7 +50,8 @@ type MetaAgentConfig struct {
 //
 // 设计意图: 所有 Domain/SubDomain 共享同一份模型配置，简化部署与调参。
 type DomainAgentConfig struct {
-	ModelConfig types.AgentModelConfig `yaml:"model_config"` // 共享模型配置
+	ModelConfig  types.AgentModelConfig `yaml:"model_config"`  // 共享模型配置
+	SystemPrompt string                `yaml:"system_prompt"` // DomainAgent 系统提示词（含 skim/WriteSharedMemory/拆分纪律）
 }
 
 // DynamicRoleTemplate 动态角色模板。

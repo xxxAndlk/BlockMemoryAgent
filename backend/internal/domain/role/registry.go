@@ -4,10 +4,47 @@ package role
 
 // 导入 Registry 依赖的外部包。
 import (
+	"strings"
+
 	"github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
+
+// defaultDomainAgentSystemPrompt 是 DomainAgent 系统提示词的兜底默认值。
+// roles.yaml 未配置 domain_agent.system_prompt 时使用，保证空配置可启动。
+// 内容与 config/roles.yaml 中 domain_agent.system_prompt 保持一致；
+// 任一处修改需同步另一处，避免行为漂移。
+const defaultDomainAgentSystemPrompt = `你是领域负责人（DomainAgent），负责把父 Agent 交办的目标在你负责的领域内落地。你只做拆分与派发，不直接执行。
+
+【可用工具】
+- call_sub_agent(role_id, task)：派发子 Agent 执行叶子任务。
+- 你没有 ReadFile / WriteFile / RunCommand 等执行类工具--所有执行交给固定助手。
+- MetaAgent 已在派发前用 WriteSharedMemory 写入关键上下文（路径/行号/签名/前置结论），
+  派发时经 dispatcher 自动注入你的任务前，直接复用，不要要求子 Agent 重读全文件。
+
+【工作模式】
+1. 接到任务先拆分：把领域目标拆到"单函数 / 单文件 / 单个具体改动"级别，每个子任务边界清晰、可独立验收。
+2. 用 call_sub_agent(role_id, task) 把每个子任务派给合适的固定助手执行：
+   - code_assistant：代码编写、审查、重构、调试
+   - ui_assistant：前端 UI、样式、组件
+   - test_assistant：测试编写与执行
+   - doc_assistant：技术文档与注释
+   - prompt_reviewer：提示词审查
+3. 拆分粒度纪律：
+   - 一个子任务对应一个函数或一个文件改动，不要"把整个模块实现"塞给一个子任务。
+   - 子任务之间有依赖时，等前一个 mailbox 摘要回来再派发下一个；无依赖可并行。
+   - task 必须自包含：背景、目标、相关文件路径与行号、前置结论、验收标准；子 Agent 看不到本次对话历史。
+   - 不要把 MetaAgent 注入的共享记忆原文塞进 task；只提炼子 Agent 落地所需的关键点。
+
+【不要做的事】
+- 不要直接调用 ReadFile / WriteFile / RunCommand 等执行类工具--你没有这些工具。
+- 不要把整个领域目标不拆分就丢给一个子 Agent。
+- 不要重复派发同一子任务；mailbox 摘要回来就整合进结论。
+
+【结果汇总】
+- 子 Agent 完成后你会收到 [mailbox from <id>] 的结果摘要，按拆分顺序整合为最终结论。
+- 你的最终答复就是回灌给父 Agent 的交付物：结论先行、自包含、附关键文件路径与验收证据；不要写过程流水账。`
 
 // Registry 运行时角色注册表，封装已加载的角色配置。
 // 它向上层提供统一接口，用于查询角色定义、判断调用权限以及枚举可调用的固定角色。
@@ -38,50 +75,34 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 	case "meta":
 		// 合成 MetaAgent：从配置的 MetaAgent 字段提取系统提示词与模型配置。
 		// CanBeCalled 为 false，因为元代理作为顶层协调者，不应被其他角色直接调用。
-		// Tools 限定为 call_sub_agent：MetaAgent 只做领域派发与简单任务转发，
-		// 不直接读写文件/跑命令，防止越位（详见 meta_agent.system_prompt）。
+		// Tools 在 call_sub_agent 基础上暴露只读/信息获取类工具（ReadFile / ListDir /
+		// SearchInFiles / HTTPGet）+ WriteSharedMemory（KV 共享记忆写入）：
+		// MetaAgent 需先采集上下文再拆分派发，但仍禁止 WriteFile / RunCommand 等执行类工具，
+		// 防止越位改文件或跑命令（详见 meta_agent.system_prompt）。
 		return &types.RoleDefinition{
 			ID:           "meta",
 			Name:         "MetaAgent",
 			Type:         enums.RoleTypeMeta,
 			SystemPrompt: r.cfg.MetaAgent.SystemPrompt,
 			ModelConfig:  r.cfg.MetaAgent.ModelConfig,
-			Tools:        []string{"call_sub_agent"},
+			Tools:        []string{"call_sub_agent", "ReadFile", "ListDir", "SearchInFiles", "HTTPGet", "WriteSharedMemory"},
 			CanBeCalled:  false,
 		}
 	case "domain":
-		// 合成 DomainAgent：复用配置的 DomainAgent 模型配置。
-		// CanBeCalled 为 true，允许上层编排者将其作为子代理调用。
+		// 合成 DomainAgent：复用配置的 DomainAgent 模型配置与系统提示词。
+		// CanBeCalled 为 true，允许上层编排者（MetaAgent）将其作为子代理调用。
 		// Tools 限定为 call_sub_agent：DomainAgent 只做函数级任务拆分与派发，
 		// 不直接读写文件，所有执行交给固定助手。
+		// 提示词默认值兜底：未在 roles.yaml 配置时使用内置默认值，保证空配置可启动。
+		domainPrompt := r.cfg.DomainAgent.SystemPrompt
+		if strings.TrimSpace(domainPrompt) == "" {
+			domainPrompt = defaultDomainAgentSystemPrompt
+		}
 		return &types.RoleDefinition{
-			ID:   "domain",
-			Name: "DomainAgent",
-			Type: enums.RoleTypeDomain,
-			// 领域负责人提示词：函数级拆分纪律、派发契约、最终答复即回灌给父 Agent 的交付物。
-			SystemPrompt: `你是领域负责人（DomainAgent），负责把父 Agent 交办的目标在你负责的领域内落地。你只做拆分与派发，不直接执行。
-
-【唯一工作方式】
-1. 接到任务先拆分：把领域目标拆到"单函数 / 单文件 / 单个具体改动"级别，每个子任务边界清晰、可独立验收。
-2. 用 call_sub_agent(role_id, task) 把每个子任务派给合适的固定助手执行：
-   - code_assistant：代码编写、审查、重构、调试
-   - ui_assistant：前端 UI、样式、组件
-   - test_assistant：测试编写与执行
-   - doc_assistant：技术文档与注释
-   - prompt_reviewer：提示词审查
-3. 拆分粒度纪律：
-   - 一个子任务对应一个函数或一个文件改动，不要"把整个模块实现"塞给一个子任务。
-   - 子任务之间有依赖时，等前一个 mailbox 摘要回来再派发下一个；无依赖可并行。
-   - task 必须自包含：背景、目标、相关文件路径与行号、前置结论、验收标准；子 Agent 看不到本次对话历史。
-
-【不要做的事】
-- 不要直接调用 ReadFile / WriteFile / RunCommand 等执行类工具--你没有这些工具。
-- 不要把整个领域目标不拆分就丢给一个子 Agent。
-- 不要重复派发同一子任务；mailbox 摘要回来就整合进结论。
-
-【结果汇总】
-- 子 Agent 完成后你会收到 [mailbox from <id>] 的结果摘要，按拆分顺序整合为最终结论。
-- 你的最终答复就是回灌给父 Agent 的交付物：结论先行、自包含、附关键文件路径与验收证据；不要写过程流水账。`,
+			ID:           "domain",
+			Name:         "DomainAgent",
+			Type:         enums.RoleTypeDomain,
+			SystemPrompt: domainPrompt,
 			ModelConfig:  r.cfg.DomainAgent.ModelConfig,
 			Tools:        []string{"call_sub_agent"},
 			CanBeCalled:  true,
@@ -111,13 +132,20 @@ func (r *Registry) CanCall(callerRoleID, calleeRoleID string) bool {
 
 	// 元代理与领域代理属于编排者：它们可以把任务分发给固定角色或动态角色，
 	// 但前提是目标角色自身声明了可被调用（CanBeCalled 为 true）。
+	// 例外：MetaAgent（Type=Meta）允许调用 DomainAgent（Type=Domain），
+	// DomainAgent 是 MetaAgent 的下一级拆分者，非平级互调；DomainAgent 调用 DomainAgent
+	// 仍属平级互调，被下面的 RoleTypeDomain 分支拒绝，避免递归。
 	if caller.Type == enums.RoleTypeMeta || caller.Type == enums.RoleTypeDomain {
+		// DomainAgent 作为 MetaAgent 的下级拆分者，允许被 MetaAgent 调用。
+		if caller.Type == enums.RoleTypeMeta && callee.Type == enums.RoleTypeDomain {
+			return callee.CanBeCalled
+		}
 		// 目标必须是固定角色或动态角色，才允许被编排者调用。
 		if callee.Type == enums.RoleTypeFixed || callee.Type == enums.RoleTypeDynamic {
 			// 返回目标角色是否显式声明可调用。
 			return callee.CanBeCalled
 		}
-		// 编排者不能直接调用其他编排者角色，避免循环调用。
+		// 编排者不能直接调用其他编排者角色（Meta->Meta、Domain->Domain、Domain->Meta），避免循环调用。
 		return false
 	}
 

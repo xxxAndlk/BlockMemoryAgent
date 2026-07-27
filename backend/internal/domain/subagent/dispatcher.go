@@ -17,6 +17,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/domain/tool" // tool 包提供工具注册表与 Result 类型
 	"github.com/blockmemory/agent/backend/internal/mailbox"     // mailbox 包用于子 Agent 向父 Agent 发送完成通知
 	"github.com/blockmemory/agent/backend/pkg/enums"            // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
+	"github.com/blockmemory/agent/backend/pkg/textutil"         // textutil 提供截断展示名用工具
 	"github.com/blockmemory/agent/backend/pkg/types"            // types 包提供 RoleDefinition 类型
 )
 
@@ -488,6 +489,16 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// - DomainAgent 只见 call_sub_agent（继续拆分到函数级派发）；
 	// - 固定助手只见 ReadFile/WriteFile/RunCommand 等执行类工具，不再能 call_sub_agent（叶子执行者）。
 	// Dispatch 路径不受白名单限制，verifyloop 的 ExecuteChild 仍可直接调任意工具。
+	//
+	// DomainAgent 是合成角色，roleDef.Name 固定为 "DomainAgent"，所有 DomainAgent 实例无法区分；
+	// 按任务首行派生一个简短展示名（"领域Agent:实现登录"），让日志/对话页一眼看出在做什么领域。
+	// 固定助手的 roleDef.Name 已是 "代码助手"/"UI助手" 等，无需覆写。
+	if roleDef.ID == "domain" {
+		firstLine := strings.SplitN(strings.TrimSpace(task), "\n", 2)[0]
+		if hint := textutil.TruncateRunes(firstLine, 16, "…"); hint != "" {
+			roleDef.Name = "领域Agent:" + hint
+		}
+	}
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
