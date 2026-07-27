@@ -120,6 +120,9 @@ type (
 		RoleID string `json:"role_id"`
 		// Task 为交给子 Agent 执行的自包含任务描述。
 		Task string `json:"task"`
+		// Domain 为领域分类简称（如 金融/认证/UI/数据库），仅 role_id="domain" 时有效，
+		// 用于 DomainAgent 展示名（如"金融领域Agent"）。空时回退到 task 首行兜底。
+		Domain string `json:"domain"`
 	}
 )
 

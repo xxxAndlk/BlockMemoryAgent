@@ -11,6 +11,7 @@ import (
 	"sync"          // sync 提供 sync.Map 存储运行中的子 Agent
 	"sync/atomic"   // sync/atomic 提供原子递增序列号
 	"time"          // time 用于设置子 Agent 独立超时
+	"unicode/utf8"  // unicode/utf8 用于 RuneCountInString 统计 task 字符数
 
 	"github.com/blockmemory/agent/backend/internal/agent"       // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
 	"github.com/blockmemory/agent/backend/internal/domain/role" // role 包提供角色注册表
@@ -27,10 +28,12 @@ import (
 //   - 超时仅用于防止无限制挂起，由 WithTimeout 配置；<=0 表示不限制。
 
 // callSubAgentInput 定义 call_sub_agent 工具的 JSON 入参结构。
-// 大模型在调用 call_sub_agent 时应提供 role_id（被调用角色）与 task（任务描述）。
+// 大模型在调用 call_sub_agent 时应提供 role_id（被调用角色）与 task（任务描述），
+// 可选 domain（领域分类简称，仅 role_id="domain" 时有效，用于子 Agent 展示名）。
 type callSubAgentInput struct {
 	RoleID string `json:"role_id"` // RoleID 被调用子 Agent 的角色标识。
 	Task   string `json:"task"`    // Task 交给子 Agent 执行的具体任务描述。
+	Domain string `json:"domain"`  // Domain 领域分类简称（金融/认证/UI 等），仅 role_id="domain" 时有效。
 }
 
 // ModelProviderFactory 是 model.ModelFactory 的子集，
@@ -369,14 +372,20 @@ func (t *callSubAgentTool) Aliases() []string { return nil }
 // domain/tool.Registry.Schema 通过可选接口断言读取该描述，
 // 使工具 schema 始终反映 roles.yaml 的最新角色配置。
 func (t *callSubAgentTool) Description() string {
-	// 角色清单：内置 domain 角色 + 所有声明可被调用的固定角色。
-	entries := []string{"domain（通用领域负责人，任务不属于任何专业领域时）"}
+	// 角色清单：domain 作为默认派发入口列首，固定助手标为叶子执行者。
+	entries := []string{"domain（默认派发入口：复杂任务/不确定范围走这里，由 DomainAgent 读文件/联网/拆到单函数级再派助手或自执行）"}
 	for _, fr := range t.dispatcher.registry.CallableFixedRoles() {
-		entries = append(entries, fmt.Sprintf("%s（%s）", fr.ID, fr.Description))
+		entries = append(entries, fmt.Sprintf("%s（叶子执行者：%s；仅在任务已单函数级、单文件、领域明确时直派）", fr.ID, fr.Description))
 	}
 	return "将子任务派发给指定角色的子 Agent 异步执行。调用立即返回 sub_agent_id；" +
 		"子 Agent 完成后，其结果摘要会以 [mailbox from <sub_agent_id>] 消息送达，请在后续轮次中阅读并整合。\n" +
-		"task 必须自包含：背景、目标、相关文件路径、前置结论与验收标准——子 Agent 看不到当前对话历史。\n" +
+		"task 必须自包含：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。\n\n" +
+		"【路由规则】\n" +
+		"1. 默认走 domain：多文件/多函数/多步骤/不确定范围 -> role_id=\"domain\"，由 DomainAgent 拆分后再派助手。\n" +
+		"2. 直派固定助手：仅当任务已单函数级、单文件、领域明确（如\"修改 X 函数签名\"、\"补一个测试\"）时直派对应助手。\n" +
+		"3. 不确定走哪条？走 domain。domain 可自执行单点改动，不会无谓下拆。\n\n" +
+		"【domain 字段】role_id=\"domain\" 时填领域分类简称（如 金融/认证/UI/数据库/配置），" +
+		"用于子 Agent 展示名（\"金融领域Agent\"）。固定助手忽略此字段，用其角色名。\n\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
@@ -389,10 +398,21 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	// 从 args 中提取 role_id 与 task，类型断言失败时得到空字符串。
 	roleID, _ := args["role_id"].(string)
 	task, _ := args["task"].(string)
+	// domain 可选：仅 role_id="domain" 时用于子 Agent 展示名（如"金融领域Agent"）。
+	domain, _ := args["domain"].(string)
 
 	// 校验必要参数：role_id 与 task 均不能为空。
 	if roleID == "" || task == "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: "role_id and task are required"}
+	}
+
+	// task 长度上限：强制 MetaAgent 把规格写入 WriteSharedMemory，task 只写目标+验收标准。
+	// 2000 runes ≈ 4-6k chars，足够描述单领域目标；超了拒绝并提示。
+	const maxTaskRunes = 2000
+	if n := utf8.RuneCountInString(task); n > maxTaskRunes {
+		return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf(
+			"task too long: %d runes (max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准",
+			n, maxTaskRunes)}
 	}
 
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
@@ -453,7 +473,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		// 无论 runSubAgent 以何种方式结束，都递减父 Agent 的未决计数并发出完成信号，
 		// 唤醒可能在 WaitForAnyChild 中等待的父 Agent。
 		defer d.trackChildDone(parentID)
-		d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, started)
+		d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, started)
 	}()
 
 	// 返回成功结果，Output 为子 Agent ID，父 Agent 可用该 ID 查询或接收后续通知。
@@ -468,8 +488,9 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 // 并在完成后将最终结果推送到父 Agent 的邮箱。
 // 这是 call_sub_agent 工具的异步执行路径：runSubAgentOnce 纯执行 + notify + 钩子。
 // started 为派发起始时间，用于计算耗时并写入完成/失败日志。
-func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task string, started time.Time) {
-	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task)
+// domain 为领域分类简称（仅 role_id="domain" 时有效，用于子 Agent 展示名）。
+func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain string, started time.Time) {
+	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain)
 	duration := time.Since(started)
 	if err != nil {
 		partial := ""
@@ -499,7 +520,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 // 错误语义：
 //   - 获取 provider 失败、Run 返回 error、LimitReached 均返回非 nil err；
 //   - 成功时 err == nil，result.Text 为最终答复。
-func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task string) (*agent.ReActAgent, agent.ReactResult, error) {
+func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain string) (*agent.ReActAgent, agent.ReactResult, error) {
 	provider, err := d.models.GetBladesProvider(ctx, roleDef.ID)
 	if err != nil {
 		return nil, agent.ReactResult{}, fmt.Errorf("get model: %w", err)
@@ -516,12 +537,16 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// Dispatch 路径不受白名单限制，verifyloop 的 ExecuteChild 仍可直接调任意工具。
 	//
 	// DomainAgent 是合成角色，roleDef.Name 固定为 "DomainAgent"，所有 DomainAgent 实例无法区分；
-	// 按任务首行派生一个简短展示名（"领域Agent:实现登录"），让日志/对话页一眼看出在做什么领域。
-	// 固定助手的 roleDef.Name 已是 "代码助手"/"UI助手" 等，无需覆写。
+	// 优先用 LLM 提供的 domain 字段命名（如"金融"->"金融领域Agent"），无则按 task 首行兜底，
+	// 让日志/对话页一眼看出在做什么领域。固定助手用 roleDef.Name（"代码助手"/"UI助手" 等），不覆写。
 	if roleDef.ID == "domain" {
-		firstLine := strings.SplitN(strings.TrimSpace(task), "\n", 2)[0]
-		if hint := textutil.TruncateRunes(firstLine, 16, "…"); hint != "" {
-			roleDef.Name = "领域Agent:" + hint
+		if hint := strings.TrimSpace(domain); hint != "" {
+			roleDef.Name = textutil.TruncateRunes(hint, 16, "…") + "领域Agent"
+		} else {
+			firstLine := strings.SplitN(strings.TrimSpace(task), "\n", 2)[0]
+			if hint := textutil.TruncateRunes(firstLine, 16, "…"); hint != "" {
+				roleDef.Name = "领域Agent:" + hint
+			}
 		}
 	}
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
@@ -635,7 +660,7 @@ func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task st
 	subAgentID := fmt.Sprintf("%s/%s-%d", parentID, roleID, d.seq.Add(1))
 	d.trackChildStart(parentID)
 	defer d.trackChildDone(parentID)
-	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, *roleDef, task)
+	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, *roleDef, task, "")
 	if err != nil {
 		return result.Text, err
 	}

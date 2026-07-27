@@ -927,6 +927,13 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		Timestamp: time.Now(),
 	})
 
+	// 新用户消息 = 新任务起点：清空该 session 的 ReadFile 已读记录。
+	// 设计意图：原始事故是单任务内反复读同一文件；任务完成后用户提新需求（如修 bug）
+	// 需重读已改文件，不应被历史记录卡死。重复读限制为单任务级而非整个 session 级。
+	if s.toolRegistry != nil {
+		s.toolRegistry.ResetReadHistory(sessionID)
+	}
+
 	// 记录会话原先是否处于运行状态。
 	wasRunning := session.Status == enums.SessionStatusRunning
 	// 如果不在运行，则重新置为运行状态，清除结束时间，并重建上下文。

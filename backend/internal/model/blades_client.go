@@ -57,6 +57,12 @@ func (c *BladesClient) Provider() blades.ModelProvider {
 	return c.provider
 }
 
+// ModelName 返回当前配置的模型名，供 react_agent 日志记录 model 字段。
+// 实现 react_agent.llmModelName 期望的 interface{ ModelName() string } 接口。
+func (c *BladesClient) ModelName() string {
+	return c.cfg.Model
+}
+
 // doGenerate 执行 blades 生成请求并做通用校验。
 // 四个 Generate* 方法共享此 helper，避免重复构造请求与空响应检查。
 //

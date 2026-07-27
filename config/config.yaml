@@ -43,9 +43,9 @@ memory:
 # Agent 运行时动态参数（替代散落在 graph 包中的硬编码常量）
 agent:
   # —— Graph 死循环防护（三层防御，替代硬步数上限）——
-  summarize_every: 10            # 每 10 步压缩；<=0 关闭
+  summarize_every: 5             # 每 5 步压缩；<=0 关闭
   summarize_keep_recent: 10      # 保留最近 10 条
-  history_max_messages: -1       # 滑动窗口关闭（summarize 接管），单次 LLM 请求携带的最大历史消息数（滑动窗口防 token 爆炸），负数表示不裁剪
+  history_max_messages: 30       # 滑动窗口上限 30 条（system 前缀 + 最近消息），防 token 爆炸；负数表示不裁剪
   stall_steps: 30                # 无进展步数阈值：连续 N 步状态指纹无变化 → 判死循环
   max_repeat_fingerprint: 3      # 状态指纹重复阈值：同一指纹连续出现 N 次 → 判死循环
   session_timeout_min: 240       # 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死

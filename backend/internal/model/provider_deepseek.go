@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -216,19 +217,40 @@ func (p *deepseekProvider) NewStreaming(ctx context.Context, req *blades.ModelRe
 		}
 		final.FinishReason = finishReason
 		final.TokenUsage = blades.TokenUsage{
-			InputTokens:  int64(usage.PromptTokens),
-			OutputTokens: int64(usage.CompletionTokens),
+			InputTokens:  int64(usage.inputTokens()),
+			OutputTokens: int64(usage.outputTokens()),
 			TotalTokens:  int64(usage.TotalTokens),
 		}
 		yield(&blades.ModelResponse{Message: final}, nil)
 	}
 }
 
-// promptUsage 是 OpenAI 兼容的 usage 字段。
+// promptUsage 是 OpenAI 兼容的 usage 字段，兼容 DeepSeek V4 的 cache 字段。
+// DeepSeek V3+ 拆分 prompt_tokens 为 prompt_cache_hit_tokens + prompt_cache_miss_tokens；
+// 部分 V4 思考模型 prompt_tokens 返回 0，需用 cache 字段合计还原真实输入 token。
 type promptUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens          int `json:"prompt_tokens"`
+	CompletionTokens      int `json:"completion_tokens"`
+	TotalTokens           int `json:"total_tokens"`
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+	ReasoningTokens       int `json:"reasoning_tokens"`
+}
+
+// inputTokens 返回真实输入 token 数：优先 prompt_tokens，为 0 时回退 cache 合计。
+func (u promptUsage) inputTokens() int {
+	if u.PromptTokens > 0 {
+		return u.PromptTokens
+	}
+	return u.PromptCacheHitTokens + u.PromptCacheMissTokens
+}
+
+// outputTokens 返回真实输出 token 数：completion_tokens 优先，为 0 时回退 reasoning+completion。
+func (u promptUsage) outputTokens() int {
+	if u.CompletionTokens > 0 {
+		return u.CompletionTokens
+	}
+	return u.CompletionTokens + u.ReasoningTokens
 }
 
 // deepseekTool 是 OpenAI 兼容的 tool_call 增量结构。
@@ -434,10 +456,18 @@ func parseDeepSeekResponse(raw []byte) (*blades.ModelResponse, error) {
 		return nil, fmt.Errorf("deepseek unmarshal: %w", err)
 	}
 
+	// 调试日志：当 prompt_tokens=0 时打印 raw usage，定位 DeepSeek V4 字段名差异。
+	// 定位后可移除。保留至 input_tokens 统计稳定非 0。
+	if resp.Usage.PromptTokens == 0 && (resp.Usage.PromptCacheHitTokens > 0 || resp.Usage.PromptCacheMissTokens > 0) {
+		log.Printf("[deepseek] usage fallback: prompt_tokens=0 cache_hit=%d cache_miss=%d completion=%d total=%d",
+			resp.Usage.PromptCacheHitTokens, resp.Usage.PromptCacheMissTokens,
+			resp.Usage.CompletionTokens, resp.Usage.TotalTokens)
+	}
+
 	msg := blades.NewAssistantMessage(blades.StatusCompleted)
 	msg.TokenUsage = blades.TokenUsage{
-		InputTokens:  int64(resp.Usage.PromptTokens),
-		OutputTokens: int64(resp.Usage.CompletionTokens),
+		InputTokens:  int64(resp.Usage.inputTokens()),
+		OutputTokens: int64(resp.Usage.outputTokens()),
 		TotalTokens:  int64(resp.Usage.TotalTokens),
 	}
 	for _, choice := range resp.Choices {

@@ -76,10 +76,11 @@ type Registry struct {
 	tools map[string]Tool
 	// aliases 存储别名到标准名称的映射。
 	aliases map[string]string
-	// readMu 保护 readFiles 切片，防止并发读写。
+	// readMu 保护 readFiles map，防止并发读写。
 	readMu sync.Mutex
-	// readFiles 记录本任务已经读取过的文件路径，用于 ReadFile 预算控制。
-	readFiles []string
+	// readFiles 按 sessionID 记录本任务已读文件路径，用于 ReadFile 预算控制。
+	// session 维度隔离：不同会话不共享已读列表；新用户消息进入时 ResetReadHistory 清空。
+	readFiles map[string][]string
 	// sharedMemory 是 WriteSharedMemory 工具的 KV 后端，由 bootstrap 注入。
 	// 为 nil 时 WriteSharedMemory 注册但不生效，调用返回 store 未配置错误。
 	sharedMemory SharedMemoryStore
@@ -96,11 +97,12 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	}
 	// 初始化 Registry 结构体，各 map 也一并初始化。
 	r := &Registry{
-		exec:     exec,
-		progress: progress,
-		failures: newFailureCounter(),
-		tools:    make(map[string]Tool),
-		aliases:  make(map[string]string),
+		exec:      exec,
+		progress:  progress,
+		failures:  newFailureCounter(),
+		tools:     make(map[string]Tool),
+		aliases:   make(map[string]string),
+		readFiles: make(map[string][]string),
 	}
 	// 注册系统内置的默认工具列表。
 	r.registerDefaults()
@@ -206,10 +208,8 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 			result := &Result{Tool: "ReadFile", Path: normalizedPath, Error: blocked}
 			// 填充 SessionID、ArgsJSON 等通用字段。
 			r.fillResult(ctx, result, args)
-			// 如果上下文携带了 blades tool context，则要求退出当前循环。
-			if tc, ok := tools.FromContext(ctx); ok {
-				tc.SetAction(tools.ActionLoopExit, true)
-			}
+			// 不再 LoopExit：重复读只返回错误提示，让模型改用 SearchInFiles 或继续其他路径。
+			// LoopExit 会直接终止 ReAct 循环，误伤正常多任务流（如修 bug 时需重读已改文件）。
 			// 发送结果事件后返回。
 			r.emitResult(ctx, result)
 			return result, nil
@@ -223,10 +223,10 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 
 	// ReadFile 成功读取后，记录已读文件并在输出末尾追加已读清单提示。
 	if name == "ReadFile" && result.Success && result.Path != "" {
-		// 将本次成功读取的文件路径加入任务记录。
-		r.recordReadFile(result.Path)
+		// 将本次成功读取的文件路径加入 session 级任务记录。
+		r.recordReadFile(ctx, result.Path)
 		// 生成已读文件清单提示文本。
-		if hint := r.readListHint(); hint != "" {
+		if hint := r.readListHint(ctx); hint != "" {
 			// 将提示追加到结果输出中，提醒模型不要重复读取。
 			result.Output = result.Output + "\n" + hint
 		}
@@ -307,11 +307,17 @@ func (r *Registry) emitResult(ctx context.Context, result *Result) {
 	})
 }
 
-// checkReadFileBudget 检查指定路径是否允许在本次任务中读取。
+// checkReadFileBudget 检查指定路径是否允许在当前 session 任务中读取。
 // 返回空字符串表示允许；否则返回拦截原因。
+// sessionID 从 ctx 取；空 sessionID 时放行（无隔离维度无法判重）。
 func (r *Registry) checkReadFileBudget(ctx context.Context, path string) string {
 	// 空路径无需拦截，直接放行。
 	if path == "" {
+		return ""
+	}
+	// 取 sessionID；为空时无法判重，放行。
+	sessionID := SessionIDFromContext(ctx)
+	if sessionID == "" {
 		return ""
 	}
 	// 规范化路径，用于统一比较。
@@ -320,8 +326,8 @@ func (r *Registry) checkReadFileBudget(ctx context.Context, path string) string 
 	r.readMu.Lock()
 	// 函数退出时释放锁。
 	defer r.readMu.Unlock()
-	// 遍历已读文件列表，若发现重复路径则拦截（防止短时间重复读取同一文件）。
-	for _, p := range r.readFiles {
+	// 遍历该 session 的已读文件列表，若发现重复路径则拦截。
+	for _, p := range r.readFiles[sessionID] {
 		if filepath.Clean(p) == cleanPath {
 			// 返回中文提示，告知模型已读过并应使用 SearchInFiles 定位。
 			return fmt.Sprintf("该文件本任务已读过（%s），禁止重读。复用已返回内容推进任务；如需看其他段落请用 SearchInFiles 精确定位。", cleanPath)
@@ -331,8 +337,13 @@ func (r *Registry) checkReadFileBudget(ctx context.Context, path string) string 
 	return ""
 }
 
-// recordReadFile 将成功读取的文件路径记录到任务级列表中。
-func (r *Registry) recordReadFile(path string) {
+// recordReadFile 将成功读取的文件路径记录到 session 级列表中。
+func (r *Registry) recordReadFile(ctx context.Context, path string) {
+	// 取 sessionID；为空时不记录（无隔离维度）。
+	sessionID := SessionIDFromContext(ctx)
+	if sessionID == "" {
+		return
+	}
 	// 加锁保护 readFiles 的并发修改。
 	r.readMu.Lock()
 	// 函数退出时释放锁。
@@ -340,28 +351,47 @@ func (r *Registry) recordReadFile(path string) {
 	// 规范化路径后存入列表。
 	cleanPath := filepath.Clean(path)
 	// 检查列表中是否已存在该路径，避免重复记录。
-	for _, p := range r.readFiles {
+	for _, p := range r.readFiles[sessionID] {
 		if filepath.Clean(p) == cleanPath {
 			return
 		}
 	}
-	// 追加到已读列表。
-	r.readFiles = append(r.readFiles, cleanPath)
+	// 追加到该 session 的已读列表。
+	r.readFiles[sessionID] = append(r.readFiles[sessionID], cleanPath)
 }
 
-// readListHint 生成当前任务已读文件清单的提示文本。
-func (r *Registry) readListHint() string {
+// readListHint 生成当前 session 已读文件清单的提示文本。
+func (r *Registry) readListHint(ctx context.Context) string {
+	// 取 sessionID；为空时返回空串。
+	sessionID := SessionIDFromContext(ctx)
+	if sessionID == "" {
+		return ""
+	}
 	// 加锁读取 readFiles。
 	r.readMu.Lock()
 	// 函数退出时释放锁。
 	defer r.readMu.Unlock()
+	files := r.readFiles[sessionID]
 	// 没有已读文件时返回空字符串，避免在输出中追加无意义提示。
-	if len(r.readFiles) == 0 {
+	if len(files) == 0 {
 		return ""
 	}
 	// 返回格式化的中文提示，包含数量与路径列表。
 	return fmt.Sprintf("[已读文件清单 (%d): %s — 禁止重读]",
-		len(r.readFiles), strings.Join(r.readFiles, ", "))
+		len(files), strings.Join(files, ", "))
+}
+
+// ResetReadHistory 清空指定 session 的已读文件记录。
+// 在新用户消息进入时调用，使重复读限制为单任务级而非整个 session 级。
+// 设计意图：原始事故是单任务内反复读同一文件；任务完成后用户提新需求（如修 bug）
+// 需重读已改文件，不应被历史记录卡死。
+func (r *Registry) ResetReadHistory(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	delete(r.readFiles, sessionID)
 }
 
 // Schema 返回所有已注册工具对应的 blades Tool 定义列表，
@@ -493,7 +523,7 @@ func (r *Registry) Schema() []tools.Tool {
 			desc = d.Description()
 		}
 		if t, err := tools.NewFunc("call_sub_agent", desc, func(ctx context.Context, in callSubAgentInput) (string, error) {
-			res, _ := r.Dispatch(ctx, "call_sub_agent", map[string]any{"role_id": in.RoleID, "task": in.Task})
+			res, _ := r.Dispatch(ctx, "call_sub_agent", map[string]any{"role_id": in.RoleID, "task": in.Task, "domain": in.Domain})
 			b, _ := marshalNoHTMLEscape(res)
 			return string(b), nil
 		}); err == nil {
