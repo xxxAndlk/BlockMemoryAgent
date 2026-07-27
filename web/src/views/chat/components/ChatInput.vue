@@ -6,6 +6,8 @@ const props = defineProps<{
   sessionActive?: boolean
   verbose?: boolean
   memoryEnabled?: boolean
+  inputTokens?: number
+  outputTokens?: number
 }>()
 
 const emit = defineEmits<{
@@ -27,6 +29,19 @@ const quickTags = [
 ]
 
 const canSend = computed(() => content.value.trim().length > 0 && !props.loading)
+
+// token 数值格式化：≥1000 显示为 1.2k，否则原样显示。
+function fmtTokens(n: number): string {
+  if (!n) return '0'
+  if (n < 1000) return String(n)
+  return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
+}
+
+const tokenLabel = computed(() => {
+  const input = props.inputTokens || 0
+  const output = props.outputTokens || 0
+  return `↑ ${fmtTokens(input)}  ↓ ${fmtTokens(output)}`
+})
 
 function handleSubmit() {
   if (!canSend.value) return
@@ -62,7 +77,7 @@ const memoryModel = computed({
 
 <template>
   <div class="border-t border-[#2a2d35] bg-[#14161a] px-6 py-3">
-    <!-- 模式开关 + 快捷标签 -->
+    <!-- 模式开关 + 快捷标签 + Token 计数 -->
     <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
       <div class="flex items-center gap-4 text-xs text-gray-400">
         <label class="flex items-center gap-2 cursor-pointer">
@@ -79,10 +94,17 @@ const memoryModel = computed({
         </span>
         <span v-else class="text-gray-500">将创建新会话</span>
       </div>
-      <el-button size="small" plain class="!bg-transparent !border-[#2a2d35] !text-gray-400 hover:!text-white"
-                 @click="emit('new-session')">
-        <el-icon class="mr-1"><Plus /></el-icon> 新建会话
-      </el-button>
+      <div class="flex items-center gap-3 text-xs">
+        <span class="text-gray-500 font-mono" :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
+          <span class="text-gray-600">Token</span>
+          <span class="ml-2 text-blue-400">↑{{ fmtTokens(props.inputTokens || 0) }}</span>
+          <span class="ml-1 text-green-400">↓{{ fmtTokens(props.outputTokens || 0) }}</span>
+        </span>
+        <el-button size="small" plain class="!bg-transparent !border-[#2a2d35] !text-gray-400 hover:!text-white"
+                   @click="emit('new-session')">
+          <el-icon class="mr-1"><Plus /></el-icon> 新建会话
+        </el-button>
+      </div>
     </div>
 
     <div class="flex gap-2 mb-2 flex-wrap">
@@ -111,6 +133,7 @@ const memoryModel = computed({
                  class="!bg-blue-600 !border-blue-600 hover:!bg-blue-500 h-[68px]! w-24"
                  @click="handleSubmit">
         <el-icon class="mr-1"><Promotion /></el-icon> 发送
+        <span class="sr-only">{{ tokenLabel }}</span>
       </el-button>
     </div>
   </div>

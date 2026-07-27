@@ -83,6 +83,8 @@ type LLMRuntimeConfig struct {
 	SubAgentTimeoutMin        int `yaml:"sub_agent_timeout_min"`         // 子 Agent 独立执行超时（分钟，默认 30；负数表示不限制）
 	HistoryMaxMessages        int `yaml:"history_max_messages"`          // 单次 LLM 请求携带的最大历史消息数（默认 40，滑动窗口防 token 爆炸；负数表示不裁剪）
 	ToolOutputHistoryMaxRunes int `yaml:"tool_output_history_max_runes"` // 写入历史的单条工具输出最大字符数（默认 2000；负数表示不截断）
+	SummarizeEvery            int `yaml:"summarize_every"`              // 每 N 步触发一次历史压缩（默认 10；<=0 关闭压缩，仅用滑动窗口）
+	SummarizeKeepRecent       int `yaml:"summarize_keep_recent"`        // 压缩时保留最近 K 条原始消息（默认 10；<=0 视为 10）
 }
 
 // SafetyConfig 工具沙箱与安全策略配置。
@@ -451,6 +453,12 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.ToolOutputHistoryMaxRunes == 0 {
 		c.Agent.ToolOutputHistoryMaxRunes = 2000
+	}
+	if c.Agent.SummarizeEvery == 0 {
+		c.Agent.SummarizeEvery = 10
+	}
+	if c.Agent.SummarizeKeepRecent == 0 {
+		c.Agent.SummarizeKeepRecent = 10
 	}
 }
 

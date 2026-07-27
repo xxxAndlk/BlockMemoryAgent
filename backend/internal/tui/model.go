@@ -702,9 +702,11 @@ func (m *Model) chatContentWidth() int {
 	return w
 }
 
-// mainContentHeight 返回中间主内容区高度（已扣除顶栏、输入栏、底部快捷键栏、弹窗占位）。
+// mainContentHeight 返回中间主内容区高度（已扣除顶栏、Token 栏、输入栏、底部快捷键栏、弹窗占位）。
 func (m *Model) mainContentHeight() int {
 	topH := 1
+	// Token 用量栏：输入栏上方 1 行实时展示当前会话累计 token。
+	tokenBarH := 1
 	// 输入栏实际是 5 行：带边框样式的 Height(3) 只算内容区，上下边框再加 2 行。
 	// 预算必须按真实高度计算，否则整页比终端高出 2 行，
 	// alt-screen 只保留底部 N 行，顶栏与对话区首行（首个问题）会被顶出屏幕。
@@ -717,7 +719,7 @@ func (m *Model) mainContentHeight() int {
 			overlayH = 6
 		}
 	}
-	h := m.height - topH - inputH - shortcutH - overlayH
+	h := m.height - topH - tokenBarH - inputH - shortcutH - overlayH
 	if h < 4 {
 		h = 4
 	}

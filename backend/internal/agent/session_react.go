@@ -118,6 +118,11 @@ func (st *reactSessionStore) setLogger(l *logger.Logger) {
 	st.log = l
 }
 
+// logger 返回注入的结构化日志器；未注入时返回 nil。
+func (st *reactSessionStore) logger() *logger.Logger {
+	return st.log
+}
+
 // logInfo 记录信息类日志；未注入 logger 时回退标准库 log。
 func (st *reactSessionStore) logInfo(msg string) {
 	if st.log != nil {
@@ -654,4 +659,18 @@ func (st *reactSessionStore) llmStats() (callCount, timeoutCount int, avgDur, ma
 		snap.TimeoutCount,
 		time.Duration(snap.AvgDurationMs) * time.Millisecond,
 		time.Duration(snap.MaxDurationMs) * time.Millisecond
+}
+
+// queryLogs 查询会话的 session_logs（含完整 LLM I/O）。
+// 直接代理到 pgStore.QuerySessionLogs；pgStore 缺失时返回空切片。
+func (st *reactSessionStore) queryLogs(ctx context.Context, sessionID, agent, level string, limit, offset int) []*store.SessionLogRecord {
+	if st.pgStore == nil {
+		return nil
+	}
+	recs, err := st.pgStore.QuerySessionLogs(ctx, sessionID, agent, level, limit, offset)
+	if err != nil {
+		st.logError(ctx, fmt.Sprintf("[%s] 查询 session_logs 失败", sessionID), err)
+		return nil
+	}
+	return recs
 }

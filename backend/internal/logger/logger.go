@@ -288,8 +288,9 @@ func (l *Logger) Error(ctx context.Context, msg string, err error, extra ...slog
 }
 
 // LLMCall 记录一次 LLM 调用（phase=llm_call）。
+// 控制台与 session_logs 均保留完整 prompt/response，不截断，便于排查 LLM I/O 问题。
 func (l *Logger) LLMCall(ctx context.Context, rec LLMCallRecord, extra ...slog.Attr) {
-	summary := truncate(rec.Prompt, 200) + " -> " + truncate(rec.Response, 200)
+	summary := rec.Prompt + " -> " + rec.Response
 
 	event := l.zl.Info()
 	if event == nil {

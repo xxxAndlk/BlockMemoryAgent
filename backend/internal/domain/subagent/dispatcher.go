@@ -15,6 +15,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/agent"       // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
 	"github.com/blockmemory/agent/backend/internal/domain/role" // role 包提供角色注册表
 	"github.com/blockmemory/agent/backend/internal/domain/tool" // tool 包提供工具注册表与 Result 类型
+	"github.com/blockmemory/agent/backend/internal/logger"      // logger 包提供会话级日志器，记录子 Agent LLM I/O
 	"github.com/blockmemory/agent/backend/internal/mailbox"     // mailbox 包用于子 Agent 向父 Agent 发送完成通知
 	"github.com/blockmemory/agent/backend/pkg/enums"            // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
 	"github.com/blockmemory/agent/backend/pkg/textutil"         // textutil 提供截断展示名用工具
@@ -108,6 +109,15 @@ type Dispatcher struct {
 	saver BlockMemorySaver
 	// writeEnabled 块记忆写入开关，由配置（agent.block_memory_write_enabled）注入。
 	writeEnabled bool
+
+	// log 是会话级日志器，用于记录子 Agent LLM I/O（完整 prompt/response）到 session_logs。
+	// 为 nil 时子 Agent 不写 LLM I/O 日志，不影响派发主流程。
+	log *logger.Logger
+
+	// liveFn 是子 Agent 实时事件转发器：把子 Agent 的 LiveEvent（token 用量/流式增量/工具事件）
+	// 按 sessionID 路由回所属会话的 service.handleLiveEvent，使子 Agent token 也计入会话累计。
+	// 为 nil 时子 Agent 不推送实时事件（不影响主流程）。
+	liveFn func(sessionID string, ev agent.LiveEvent)
 }
 
 // pendingState 跟踪单个父 Agent 的未决子 Agent 计数与完成信号。
@@ -230,6 +240,21 @@ func (d *Dispatcher) WithBlockMemorySearcher(s BlockMemorySearcher) *Dispatcher 
 // 互相派发死循环。n<=0 表示不限制。
 func (d *Dispatcher) WithVerificationMaxRounds(n int) *Dispatcher {
 	d.verificationMaxRounds = n
+	return d
+}
+
+// WithLogger 注入会话级日志器，使子 Agent 的 LLM I/O 写入 session_logs。
+// 传 nil 关闭子 Agent LLM I/O 日志（默认关闭）。
+func (d *Dispatcher) WithLogger(l *logger.Logger) *Dispatcher {
+	d.log = l
+	return d
+}
+
+// WithLiveEvents 注入实时事件转发器，使子 Agent 的 LiveEvent（token 用量/流式/工具）
+// 按 sessionID 路由回所属会话的 service.handleLiveEvent。
+// 传 nil 关闭子 Agent 实时事件推送（默认关闭）。
+func (d *Dispatcher) WithLiveEvents(fn func(sessionID string, ev agent.LiveEvent)) *Dispatcher {
+	d.liveFn = fn
 	return d
 }
 
@@ -504,6 +529,19 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		WithMemory(mem).
 		WithLoopConfig(d.loopCfg)
 
+	// 注入会话级日志器：派生 session-scoped logger，使子 Agent LLM I/O 写入同一会话的 session_logs。
+	// sessionID 从 ctx 取（call_sub_agent 异步路径已 WithSessionID），agentName 用 roleDef.Name（DomainAgent 已按任务首行覆写）。
+	sid := tool.SessionIDFromContext(ctx)
+	if d.log != nil {
+		sub = sub.WithLogger(d.log.WithSession(sid).WithAgent(roleDef.Name))
+	}
+	// 注入实时事件转发器：子 Agent emitLive 时按 sessionID 路由回会话 service，
+	// 使子 Agent token 用量计入会话累计（TUI/Web 总和展示）。
+	if d.liveFn != nil && sid != "" {
+		forwarder := d.liveFn
+		sub = sub.WithLiveEvents(func(ev agent.LiveEvent) { forwarder(sid, ev) })
+	}
+
 	d.running.Store(subAgentID, sub)
 	defer d.running.Delete(subAgentID)
 	defer func() {
@@ -516,9 +554,31 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	origTask := task
 	// KV 共享记忆注入：按 parentID 派生键读取主 Agent 写入的关键记忆，拼到任务前。
 	// 使被询问协程 Agent 能看到主 Agent 的上下文，对应"协程 Agent 共享主 Agent 记忆"语义。
+	kvBefore := task
 	task = d.injectKVMemory(ctx, parentID, task)
+	if task != kvBefore {
+		val, _ := d.kvMemory.Get(ctx, parentID+":shared")
+		log.Printf("[subagent] inject kv-memory: sub=%s role=%s parent=%s val_len=%d val=%q",
+			subAgentID, roleDef.ID, parentID, len(val), truncateRunes(strings.TrimSpace(val), 300))
+	}
 	// 块记忆召回注入：以子任务文本做语义检索，命中则拼到任务前。
+	bmBefore := task
 	task = d.injectRecalledMemory(ctx, task)
+	if task != bmBefore {
+		recs, _ := d.searcher.SearchBlockMemoryByGoal(ctx, origTask, blockMemoryRecallTopK)
+		log.Printf("[subagent] inject block-memory: sub=%s role=%s hits=%d task_len=%d",
+			subAgentID, roleDef.ID, len(recs), len(origTask))
+		for i, rec := range recs {
+			domain := ""
+			if rec.Meta != nil {
+				if v, ok := rec.Meta["domain"].(string); ok {
+					domain = v
+				}
+			}
+			log.Printf("[subagent]   hit[%d] domain=%s goal=%q content=%q",
+				i+1, domain, truncateRunes(fmt.Sprintf("%v", rec.Meta["goal"]), 80), truncateRunes(strings.TrimSpace(rec.Content), 200))
+		}
+	}
 
 	result, err := sub.Run(ctx, task)
 	if err != nil {

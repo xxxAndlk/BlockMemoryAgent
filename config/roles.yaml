@@ -15,8 +15,8 @@ meta_agent:
   model_config: &meta_model
     provider: anthropic
     model: glm-5.2
-    api_key: ${ANTHROPIC_API_KEY}     # 原 ${ANTHROPIC_API_KEY_TWO}
-    base_url: ${ANTHROPIC_BASE_URL}   # 原 ${ANTHROPIC_BASE_URL_TWO}
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.3
     max_tokens: 16384   # 思考模型需为推理预留额度；8192 在长任务+多子 Agent 派发时会耗尽导致输出截断
   system_prompt: |
@@ -119,7 +119,7 @@ domain_agent:
 # 轻量模型配置（用于历史会话总结、检索 query 改写等低开销任务）
 # 可指向更便宜更快的模型；留空 model 时回退到 domain_agent 模型
 lightweight_model:
-  provider: openai
+  provider: openai-deepseek
   model: deepseek-v4-flash
   api_key: ${OPENAI_API_KEY}
   base_url: ${OPENAI_BASE_URL}
@@ -208,7 +208,13 @@ fixed_roles:
     keywords: ["UI", "界面", "前端", "CSS", "HTML", "样式", "布局", "page"]
     skills: ["UI修复", "组件开发", "响应式设计", "CSS优化", "交互实现"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
-    model_config: *domain_model
+    model_config: &domain_model
+      provider: anthropic
+      model: kimi-k2.7-code
+      api_key: ${ANTHROPIC_API_KEY}
+      base_url: ${ANTHROPIC_BASE_URL}
+      temperature: 0.7
+      max_tokens: 4096
     can_be_called: true
 
   # 提示词审查助手
@@ -237,7 +243,7 @@ fixed_roles:
     skills: ["Prompt审查", "Prompt优化", "安全检测", "偏见检测"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &review_model
-      provider: openai
+      provider: openai-deepseek
       model: deepseek-v4-pro
       api_key: ${OPENAI_API_KEY}
       base_url: ${OPENAI_BASE_URL}
@@ -272,7 +278,11 @@ fixed_roles:
     keywords: ["测试", "test", "验证", "QA", "assert", "coverage"]
     skills: ["单元测试", "集成测试", "边界测试", "性能测试"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
-    model_config: *coding_model
+    model_config: &coding_model
+      provider: openai-deepseek
+      model: deepseek-v4-pro
+      api_key: ${OPENAI_API_KEY}
+      base_url: ${OPENAI_BASE_URL}
     can_be_called: true
 
   # 文档助手
@@ -304,8 +314,8 @@ fixed_roles:
     skills: ["技术文档", "API文档", "代码注释", "示例编写"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &doc_model
-      provider: openai
-      model: deepseek-v4-pro
+      provider: openai-deepseek
+      model: deepseek-v4-flash
       api_key: ${OPENAI_API_KEY}
       base_url: ${OPENAI_BASE_URL}
       temperature: 0.5
@@ -356,7 +366,7 @@ dynamic_templates:
     skills: []
     max_lifetime: 3600  # 1小时
     model_config: &assistant_model
-      provider: openai
+      provider: openai-deepseek
       model: deepseek-v4-flash
       api_key: ${OPENAI_API_KEY}
       base_url: ${OPENAI_BASE_URL}

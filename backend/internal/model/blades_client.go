@@ -234,8 +234,13 @@ func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, t
 func createBladesProvider(cfg types.AgentModelConfig) (blades.ModelProvider, error) {
 	// 根据 provider 名称分发
 	switch cfg.Provider {
-	case "openai", "":
-		// 空字符串视为 openai 兼容默认值
+	case "openai", "openai-deepseek", "":
+		// openai-deepseek 走专用 provider：捕获并回传 reasoning_content，
+		// 避免 DeepSeek V4 思考模型 400 "reasoning_content must be passed back"。
+		// 空字符串视为 openai 兼容默认值。
+		if cfg.Provider == "openai-deepseek" {
+			return newDeepSeekProvider(cfg), nil
+		}
 		return newOpenAIProvider(cfg), nil
 	case "anthropic":
 		// Anthropic 原生 Messages API

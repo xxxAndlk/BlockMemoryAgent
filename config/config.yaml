@@ -43,18 +43,20 @@ memory:
 # Agent 运行时动态参数（替代散落在 graph 包中的硬编码常量）
 agent:
   # —— Graph 死循环防护（三层防御，替代硬步数上限）——
+  summarize_every: 10            # 每 10 步压缩；<=0 关闭
+  summarize_keep_recent: 10      # 保留最近 10 条
+  history_max_messages: -1       # 滑动窗口关闭（summarize 接管），单次 LLM 请求携带的最大历史消息数（滑动窗口防 token 爆炸），负数表示不裁剪
   stall_steps: 30                # 无进展步数阈值：连续 N 步状态指纹无变化 → 判死循环
   max_repeat_fingerprint: 3      # 状态指纹重复阈值：同一指纹连续出现 N 次 → 判死循环
   session_timeout_min: 240       # 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
   skill_set_size: 8              # 每个 DomainAgent 装配的 Skill 子集上限
-  tool_call_max_rounds: 200      # ReAct 最大 LLM 轮数（达到上限暂停等待用户续跑，不判失败），负数表示不限制
+  tool_call_max_rounds: -1       # ReAct 最大 LLM 轮数（达到上限暂停等待用户续跑，不判失败），负数表示不限制
   retry_count: 3                 # Assistant 任务指数退避重试次数
   retry_backoff_ms: 100          # 重试初始退避时长（毫秒）
   llm_soft_timeout_sec: 30       # LLM 软超时（建议取消）
   llm_hard_timeout_sec: 90       # LLM 硬超时（强制取消）
   react_llm_timeout_sec: 600     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制
   sub_agent_timeout_min: 30      # 子 Agent 独立执行超时（分钟），负数表示不限制
-  history_max_messages: -1       # 单次 LLM 请求携带的最大历史消息数（滑动窗口防 token 爆炸），负数表示不裁剪
   tool_output_history_max_runes: 2000 # 写入历史的单条工具输出最大字符数，负数表示不截断
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
   snapshot_summary_count: 20     # 私有快照保留的最近 Episode 摘要条数（默认 20）

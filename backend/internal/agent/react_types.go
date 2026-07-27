@@ -25,6 +25,11 @@ type ReactMessage struct {
 	// Anthropic/OpenAI 原生工具协议要求 tool_result 必须引用存在的 tool_use id，
 	// 缺失会导致下一轮请求被 API 拒绝（400 tool_call_id is not found）。
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	// ReasoningContent 是思考模型（DeepSeek V4 reasoner 等）返回的推理过程文本。
+	// DeepSeek V4 API 要求后续请求把 reasoning_content 回传到对应 assistant 消息，
+	// 否则 400 "reasoning_content must be passed back"。
+	// R1 等"不回传"模型在序列化时由 provider 决定是否携带。
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // ToolCall 表示模型请求执行某个命名工具的调用。
@@ -78,6 +83,9 @@ const (
 	// LiveEventSubAgentDone 是子 Agent 完成事件（mailbox 收到子 Agent 结果摘要时触发），
 	// Tool 字段携带子 Agent ID。
 	LiveEventSubAgentDone = "sub_agent_done"
+	// LiveEventTokenUsage 是单次 LLM 调用 token 用量事件，
+	// InputTokens/OutputTokens 字段携带用量；provider 未返回用量时不发射。
+	LiveEventTokenUsage = "token_usage"
 )
 
 // LiveEvent 是 ReAct 运行过程中的实时进度事件，
@@ -91,6 +99,9 @@ type LiveEvent struct {
 	Output  string // Output 工具输出（tool_exec 使用）
 	Error   string // Error 工具错误信息（tool_exec 使用）
 	Success bool   // Success 工具是否执行成功（tool_exec 使用）
+	// InputTokens/OutputTokens 仅 token_usage 使用：本次 LLM 调用的输入/输出 token 数。
+	InputTokens  int64
+	OutputTokens int64
 }
 
 // ToolRegistry 抽象了 ReActAgent 可调用的工具集合。
@@ -174,6 +185,15 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 					Request: string(req),
 				})
 			}
+			// 回传思考模型的推理过程：DeepSeek V4 reasoner 等要求 assistant 消息携带
+			// reasoning_content 字段，否则 400。通过 Metadata 传递，由 deepseekProvider
+			// 序列化到请求 JSON；其他 provider 忽略。
+			if m.ReasoningContent != "" {
+				if msg.Metadata == nil {
+					msg.Metadata = make(map[string]any)
+				}
+				msg.Metadata["reasoning_content"] = m.ReasoningContent
+			}
 			// 将组装好的 assistant 消息追加到结果切片。
 			out = append(out, msg)
 		case "tool":
@@ -238,6 +258,13 @@ func AssistantMessageFromBlades(m *blades.Message) ReactMessage {
 		}
 	}
 	// 返回组装好的 ReactMessage。
+	// 提取思考模型的推理过程（DeepSeek V4 reasoner 等），存入 ReasoningContent，
+	// 供下一轮请求经 ToBladesMessages 回传给 API。
+	if m.Metadata != nil {
+		if v, ok := m.Metadata["reasoning_content"].(string); ok {
+			msg.ReasoningContent = v
+		}
+	}
 	return msg
 }
 

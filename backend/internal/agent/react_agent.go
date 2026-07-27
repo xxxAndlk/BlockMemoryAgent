@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
@@ -37,11 +38,19 @@ type ReActAgent struct {
 	historyMaxMessages int
 	// toolOutputMaxRunes 是写入历史的单条工具输出最大字符数；<=0 不截断。
 	toolOutputMaxRunes int
+	// summarizeEvery 是触发历史压缩的步频：每 N 轮 ReAct 迭代把中间历史暴力压缩。
+	// <=0 关闭压缩，仅用 historyMaxMessages 滑动窗口。
+	summarizeEvery int
+	// summarizeKeepRecent 是压缩时保留的最近原始消息条数；<=0 视为 10。
+	summarizeKeepRecent int
 	// liveFn 是实时进度事件回调，由 WithLiveEvents 注入；nil 时不推送任何进度事件。
 	liveFn func(LiveEvent)
 	// pendingChecker 可选的未决子 Agent 检查器，由 WithPendingChildrenChecker 注入；
 	// 为 nil 时关闭终结保护（默认关闭，仅在 bootstrap 装配 Dispatcher 后开启）。
 	pendingChecker PendingChildrenChecker
+	// log 是会话级日志器，用于记录每次 LLM 调用的完整 prompt/response 到 session_logs。
+	// 为 nil 时跳过 LLM I/O 日志（不影响主流程）。
+	log *logger.Logger
 }
 
 // LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。
@@ -53,6 +62,8 @@ type LoopConfig struct {
 	RetryBackoff       time.Duration // 重试初始退避；<=0 用默认 100ms
 	HistoryMaxMessages int           // 单次请求最大历史消息数；<=0 不裁剪
 	ToolOutputMaxRunes int           // 写入历史的工具输出最大字符数；<=0 不截断
+	SummarizeEvery     int           // 每 N 步触发一次历史压缩；<=0 关闭压缩
+	SummarizeKeepRecent int          // 压缩时保留最近 K 条原始消息；<=0 视为 10
 }
 
 // NewReActAgent 根据具体角色构造一个 ReActAgent 实例。
@@ -111,6 +122,8 @@ func (a *ReActAgent) WithLoopConfig(c LoopConfig) *ReActAgent {
 	a.retryBackoff = c.RetryBackoff
 	a.historyMaxMessages = c.HistoryMaxMessages
 	a.toolOutputMaxRunes = c.ToolOutputMaxRunes
+	a.summarizeEvery = c.SummarizeEvery
+	a.summarizeKeepRecent = c.SummarizeKeepRecent
 	return a
 }
 
@@ -126,6 +139,13 @@ func (a *ReActAgent) WithLiveEvents(fn func(LiveEvent)) *ReActAgent {
 // 防止迟到 mailbox 消息随会话销毁丢失。传 nil 关闭保护（默认关闭）。
 func (a *ReActAgent) WithPendingChildrenChecker(p PendingChildrenChecker) *ReActAgent {
 	a.pendingChecker = p
+	return a
+}
+
+// WithLogger 注入会话级日志器，使每次 LLM 调用的完整 prompt/response 落 session_logs，
+// 供 TUI/Web 完整查看输入输出。传 nil 关闭 LLM I/O 日志（默认关闭）。
+func (a *ReActAgent) WithLogger(l *logger.Logger) *ReActAgent {
+	a.log = l
 	return a
 }
 
@@ -185,11 +205,19 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	for i := 0; a.maxIter <= 0 || i < a.maxIter; i++ {
 		// 在每次调用 LLM 之前，通过记忆流水线组装上下文消息。
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
-		messages := a.memory.Assemble(a.role, a.name, history)
+		assembled := a.memory.Assemble(a.role, a.name, history)
 
-		// 滑动窗口裁剪：防止长任务历史无限增长导致 token 爆炸与上下文窗口溢出。
-		// 仅影响本次请求，不修改 history 本身（完整历史仍用于持久化与续跑）。
-		messages = windowMessages(messages, a.historyMaxMessages)
+		// 上下文裁剪策略：
+		//   - 每 summarizeEvery 步触发一次 summarizeWindow（保留 system 前缀 + 首条 user
+		//     任务目标 + 中段暴力压缩摘要 + 最近 K 条原始消息），大幅降低长任务 token。
+		//   - 其余步走 windowMessages 滑动窗口（硬上限，防 API 上下文溢出）。
+		//   - 两者都只影响本次请求，不修改 history（完整历史仍用于持久化与续跑）。
+		var messages []ReactMessage
+		if a.summarizeEvery > 0 && i > 0 && i%a.summarizeEvery == 0 {
+			messages = summarizeWindow(assembled, a.summarizeKeepRecent)
+		} else {
+			messages = windowMessages(assembled, a.historyMaxMessages)
+		}
 
 		// 将内部消息格式转换为 blades 库所需的模型消息格式。
 		bladesMsgs := ToBladesMessages(messages)
@@ -206,6 +234,15 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		if err != nil {
 			// 出错时返回已累计的历史，便于上层回传部分进度或排查。
 			return ReactResult{History: history}, fmt.Errorf("llm generate: %w", err)
+		}
+
+		// 推送本次 LLM 调用的 token 用量；provider 未填充用量时跳过（mock/测试）。
+		if usage := resp.Message.TokenUsage; usage.InputTokens > 0 || usage.OutputTokens > 0 {
+			a.emitLive(LiveEvent{
+				Kind:         LiveEventTokenUsage,
+				InputTokens:  usage.InputTokens,
+				OutputTokens: usage.OutputTokens,
+			})
 		}
 
 		// 将 blades 返回的消息转换为内部 Assistant 消息。
@@ -390,10 +427,126 @@ type streamingModelProvider interface {
 // generateOnce 执行单次 LLM 调用：provider 支持流式时走流式并推送 llm_delta 实时事件，
 // 否则回退到一次性 Generate。
 func (a *ReActAgent) generateOnce(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	start := time.Now()
+	var resp *blades.ModelResponse
+	var err error
 	if sp, ok := a.llm.(streamingModelProvider); ok {
-		return a.generateStreaming(ctx, req, sp)
+		resp, err = a.generateStreaming(ctx, req, sp)
+	} else {
+		resp, err = a.llm.Generate(ctx, req)
 	}
-	return a.llm.Generate(ctx, req)
+	// 无论成功失败都记录完整 LLM I/O 到 session_logs，便于排查 token 暴涨/失忆问题。
+	a.logLLMCall(ctx, req, resp, err, time.Since(start))
+	return resp, err
+}
+
+// logLLMCall 把单次 LLM 调用的完整输入输出写入 session_logs。
+// prompt 序列化为含 system/messages/tools 的 JSON；response 取消息文本+工具调用摘要。
+// 未注入 logger 时跳过；resp 为 nil（调用失败）时只记录 prompt 与错误。
+func (a *ReActAgent) logLLMCall(ctx context.Context, req *blades.ModelRequest, resp *blades.ModelResponse, callErr error, dur time.Duration) {
+	if a.log == nil {
+		return
+	}
+	prompt := serializePromptForLog(req)
+	response := ""
+	var inTok, outTok int64
+	if resp != nil && resp.Message != nil {
+		response = serializeResponseForLog(resp.Message)
+		inTok = resp.Message.TokenUsage.InputTokens
+		outTok = resp.Message.TokenUsage.OutputTokens
+	}
+	errStr := ""
+	if callErr != nil {
+		errStr = callErr.Error()
+		response = "[ERROR] " + errStr + "\n" + response
+	}
+	a.log.LLMCall(ctx, logger.LLMCallRecord{
+		Agent:        a.role.Name,
+		Model:        a.llmModelName(),
+		Prompt:       prompt,
+		Response:     response,
+		InputTokens:  int(inTok),
+		OutputTokens: int(outTok),
+		LatencyMs:    int(dur.Milliseconds()),
+	})
+}
+
+// llmModelName 返回 llm provider 的模型名标识，用于日志记录。
+// 通过类型断言读取可选的 ModelNamer 接口；未实现时返回空串。
+func (a *ReActAgent) llmModelName() string {
+	if mn, ok := a.llm.(interface{ ModelName() string }); ok {
+		return mn.ModelName()
+	}
+	return ""
+}
+
+// serializePromptForLog 把 ModelRequest 序列化为可读 JSON 字符串，含 system/messages/tools。
+func serializePromptForLog(req *blades.ModelRequest) string {
+	if req == nil {
+		return ""
+	}
+	type msgOut struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type toolOut struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	out := struct {
+		System   string    `json:"system"`
+		Messages []msgOut  `json:"messages"`
+		Tools    []toolOut `json:"tools"`
+	}{
+		System:   systemText(req),
+		Messages: make([]msgOut, 0, len(req.Messages)),
+		Tools:    make([]toolOut, 0, len(req.Tools)),
+	}
+	for _, m := range req.Messages {
+		if m == nil {
+			continue
+		}
+		out.Messages = append(out.Messages, msgOut{Role: string(m.Role), Content: bladesText(m)})
+	}
+	for _, t := range req.Tools {
+		out.Tools = append(out.Tools, toolOut{Name: t.Name(), Description: t.Description()})
+	}
+	b, _ := json.MarshalIndent(out, "", "  ")
+	return string(b)
+}
+
+// serializeResponseForLog 把 blades.Message 序列化为含文本与工具调用的可读字符串。
+func serializeResponseForLog(m *blades.Message) string {
+	if m == nil {
+		return ""
+	}
+	var sb strings.Builder
+	if text := bladesText(m); text != "" {
+		sb.WriteString(text)
+	}
+	for _, p := range m.Parts {
+		if tp, ok := p.(blades.ToolPart); ok {
+			if sb.Len() > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString("[tool_call] name=" + tp.Name + " id=" + tp.ID + "\n" + tp.Request)
+		}
+	}
+	if m.FinishReason != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("[finish_reason=" + m.FinishReason + "]")
+	}
+	return sb.String()
+}
+
+// systemText 提取 ModelRequest.Instruction 的文本内容。
+func systemText(req *blades.ModelRequest) string {
+	if req == nil || req.Instruction == nil {
+		return ""
+	}
+	return bladesText(req.Instruction)
 }
 
 // generateStreaming 消费流式响应：中间块只用于向 UI 推送累积文本，
@@ -447,6 +600,80 @@ func bladesText(m *blades.Message) string {
 		}
 	}
 	return sb.String()
+}
+
+// summarizeWindow 把历史压缩为：system 前缀 + 首条 user 任务目标 + 中段暴力压缩摘要 + 最近 K 条原始消息。
+// 用于每 N 步触发一次的上下文压缩，避免长任务 token O(N²) 增长。
+//
+// 压缩规则：
+//   - system 前缀全保留（记忆流水线注入的近期事件）；
+//   - 首条 user 消息原样保留（任务目标，防"失忆"）；
+//   - 中段每条消息压成 "[role] 前 200 字符" 拼成一条 system 摘要消息；
+//   - 最近 K 条原样保留（含 tool_call/tool_result 对，边界对齐 user）。
+//
+// keepRecent<=0 视为 10；消息总数不足时原样返回。
+func summarizeWindow(messages []ReactMessage, keepRecent int) []ReactMessage {
+	if keepRecent <= 0 {
+		keepRecent = 10
+	}
+	if len(messages) <= keepRecent+2 {
+		return messages
+	}
+
+	// 1) system 前缀
+	keep := 0
+	for keep < len(messages) && messages[keep].Role == "system" {
+		keep++
+	}
+
+	// 2) 首条 user（任务目标）。若无 user（仅 system），原样返回。
+	firstUserIdx := -1
+	for i := keep; i < len(messages); i++ {
+		if messages[i].Role == "user" {
+			firstUserIdx = i
+			break
+		}
+	}
+	if firstUserIdx < 0 {
+		return messages
+	}
+
+	// 3) 最近 K 条边界：从末尾向前找 user 边界，保证 tool_call/tool_result 对完整。
+	if keepRecent > len(messages)-firstUserIdx-1 {
+		keepRecent = len(messages) - firstUserIdx - 1
+	}
+	recentStart := len(messages) - keepRecent
+	for recentStart < len(messages) && recentStart > firstUserIdx+1 && messages[recentStart].Role != "user" {
+		recentStart++
+	}
+
+	// 4) 中段暴力压缩：每条 -> "[role] 前 200 字符"。
+	middle := messages[firstUserIdx+1 : recentStart]
+	const midChunkMax = 200
+	var sb strings.Builder
+	sb.WriteString("【历史压缩摘要】\n")
+	for _, m := range middle {
+		role := m.Role
+		if role == "" {
+			role = "?"
+		}
+		content := strings.ReplaceAll(strings.TrimSpace(m.Content), "\n", " ")
+		if content == "" && len(m.ToolCalls) > 0 {
+			content = fmt.Sprintf("[tool_calls: %d]", len(m.ToolCalls))
+		}
+		if r := []rune(content); len(r) > midChunkMax {
+			content = string(r[:midChunkMax]) + "…"
+		}
+		fmt.Fprintf(&sb, "- [%s] %s\n", role, content)
+	}
+	sb.WriteString("\n（以上为早期对话压缩摘要，关键结论见上方近期事件与下方最近消息）")
+
+	out := make([]ReactMessage, 0, keep+1+1+1+(len(messages)-recentStart))
+	out = append(out, messages[:keep]...)
+	out = append(out, messages[firstUserIdx]) // 首条 user 任务目标
+	out = append(out, ReactMessage{Role: "system", Content: sb.String()})
+	out = append(out, messages[recentStart:]...)
+	return out
 }
 
 // windowMessages 把发送给 LLM 的消息裁剪到最多 max 条（滑动窗口）：

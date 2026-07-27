@@ -40,10 +40,11 @@ func (m Model) singleColumnView() string {
 		mainRow = m.renderChat(m.width, contentH)
 	}
 
-	// 垂直拼接：顶栏、主内容区、输入栏、快捷键栏。
+	// 垂直拼接：顶栏、主内容区、Token 统计栏、输入栏、快捷键栏。
 	view := lipgloss.JoinVertical(lipgloss.Top,
 		m.renderTopBar(m.width),
 		mainRow,
+		m.renderTokenBar(m.width),
 		m.renderInput(m.width),
 		m.renderShortcutBar(m.width),
 	)
@@ -526,6 +527,38 @@ func (m Model) renderPlanBar(w int) string {
 	}
 	line := formatPlanBar(m.styles, snap, toolLabel)
 	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
+}
+
+// renderTokenBar 渲染输入栏上方的 Token 用量栏，实时展示当前会话累计输入/输出 token。
+// ≥1000 时以 1.2k 形式显示，避免长数字挤占宽度。
+func (m Model) renderTokenBar(w int) string {
+	in, out := m.totalInputTokens, m.totalOutputTokens
+	label := m.styles.Dim.Render("Token")
+	inStr := fmtTokensK(in)
+	outStr := fmtTokensK(out)
+	inPart := m.styles.StatValue.Render("↑" + inStr)
+	outPart := m.styles.StatValue.Render("↓" + outStr)
+	left := lipgloss.JoinHorizontal(lipgloss.Left, label, " ", inPart, " ", outPart)
+	// 右侧提示：会话运行中显示 cost warn 门槛说明，空会话显示占位。
+	right := m.styles.Dim.Render("(本会话累计 · 每 1s 刷新)")
+	line := lipgloss.JoinHorizontal(lipgloss.Top, left, lipgloss.NewStyle().Width(w-lipgloss.Width(left)-lipgloss.Width(right)).Render(""), right)
+	if lipgloss.Width(line) > w {
+		line = left
+	}
+	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
+}
+
+// fmtTokensK 将 token 数格式化为短字符串：≥1000 显示为 1.2k，否则原样。
+func fmtTokensK(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	s := fmt.Sprintf("%.1fk", float64(n)/1000)
+	// 去掉 .0 后缀，避免 1000 -> 1.0k -> 1k。
+	if strings.HasSuffix(s, ".0k") {
+		s = strings.TrimSuffix(s, ".0k") + "k"
+	}
+	return s
 }
 
 // renderShortcutBar 渲染底部快捷键栏，展示常用按键提示。

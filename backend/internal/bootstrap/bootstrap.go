@@ -223,6 +223,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		RetryBackoffMs:            cfg.Agent.RetryBackoffMs,
 		HistoryMaxMessages:        cfg.Agent.HistoryMaxMessages,
 		ToolOutputHistoryMaxRunes: cfg.Agent.ToolOutputHistoryMaxRunes,
+		SummarizeEvery:            cfg.Agent.SummarizeEvery,
+		SummarizeKeepRecent:       cfg.Agent.SummarizeKeepRecent,
 	}
 	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute
 	if subAgentTimeout < 0 {
@@ -240,6 +242,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 默认仅内存；需持久化时传 PostgresStore 适配的 KVStore（待后续实现）。
 	sharedKV := memory.NewInMemoryKV(true, nil)
 	subAgentDispatcher.WithKVMemory(sharedKV)
+	// 注入会话级日志器：使子 Agent LLM I/O（完整 prompt/response）写入 session_logs，
+	// 与 MetaAgent 共用同一 sessionLogger 基础实例，子 Agent 运行时按 ctx 派生 session-scoped 视图。
+	subAgentDispatcher.WithLogger(sessionLogger)
 	// 把同一 sharedKV 注入工具注册表，使 WriteSharedMemory 工具能写入；
 	// MetaAgent 在派发复杂任务前调用 WriteSharedMemory 写入关键上下文，
 	// 子 Agent 经 dispatcher.injectKVMemory 自动读取。
@@ -326,6 +331,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
 	agentSvc.SetLogger(sessionLogger)
 	agentSvc.SetRuntimeConfig(reactCfg)
+	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
+	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。
+	subAgentDispatcher.WithLiveEvents(agentSvc.ForwardLiveEvent)
 	// 注入未决子 Agent 检查器，开启父会话终结保护：
 	// 父 Agent 给出终答前若有未决子 Agent，阻塞等待其完成，防止迟到 mailbox 消息丢失。
 	agentSvc.SetPendingChildrenChecker(subAgentDispatcher)

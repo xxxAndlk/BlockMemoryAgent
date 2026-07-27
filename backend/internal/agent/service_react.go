@@ -52,6 +52,8 @@ type ReactRuntimeConfig struct {
 	RetryBackoffMs          int // 重试初始退避（毫秒）
 	HistoryMaxMessages      int // 单次请求最大历史消息数；<0 表示不裁剪
 	ToolOutputHistoryMaxRunes int // 写入历史的工具输出最大字符数；<0 表示不截断
+	SummarizeEvery          int // 每 N 步触发历史压缩；<=0 关闭
+	SummarizeKeepRecent     int // 压缩时保留最近 K 条原始消息；<=0 视为 10
 }
 
 // SetRuntimeConfig 注入 ReAct 主循环运行时参数（见 ReactRuntimeConfig）。
@@ -65,6 +67,21 @@ func (s *ReactService) SetPendingChildrenChecker(p PendingChildrenChecker) {
 	s.pendingChecker = p
 }
 
+// ForwardLiveEvent 是子 Agent 实时事件转发入口：Dispatcher 派发子 Agent 时注入的
+// WithLiveEvents 回调按 sessionID 路由到这里，使子 Agent token 用量/流式增量/工具事件
+// 也走会话级 handleLiveEvent，让 TUI/Web 看到所有 Agent 的累计 token。
+// sessionID 来自子 Agent ctx（call_sub_agent 异步路径已 WithSessionID）。
+func (s *ReactService) ForwardLiveEvent(sessionID string, ev LiveEvent) {
+	if sessionID == "" {
+		return
+	}
+	sess := s.store.snapshotSessionByID(sessionID)
+	if sess == nil {
+		return
+	}
+	s.handleLiveEvent(sess, ev)
+}
+
 // LoopConfig 把服务级配置映射为 ReActAgent 的 LoopConfig：
 // 负数（配置语义"不限制"）归一为 0（agent 语义"不启用该限制"），
 // 零值（未注入配置）回退到与旧行为一致的默认值。
@@ -76,6 +93,8 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 		RetryBackoff:       100 * time.Millisecond,
 		HistoryMaxMessages: 40,
 		ToolOutputMaxRunes: 2000,
+		SummarizeEvery:     10,
+		SummarizeKeepRecent: 10,
 	}
 	if c.MaxIterations != 0 {
 		lc.MaxIterations = max(c.MaxIterations, 0)
@@ -95,6 +114,12 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 	if c.ToolOutputHistoryMaxRunes != 0 {
 		lc.ToolOutputMaxRunes = max(c.ToolOutputHistoryMaxRunes, 0)
 	}
+	if c.SummarizeEvery != 0 {
+		lc.SummarizeEvery = max(c.SummarizeEvery, 0)
+	}
+	if c.SummarizeKeepRecent != 0 {
+		lc.SummarizeKeepRecent = max(c.SummarizeKeepRecent, 0)
+	}
 	return lc
 }
 
@@ -108,6 +133,16 @@ func (s *ReactService) SetModelProvider(p ModelProvider) {
 // 参数 l：已初始化的 Logger 指针；未注入时回退标准库 log。
 func (s *ReactService) SetLogger(l *logger.Logger) {
 	s.store.setLogger(l)
+}
+
+// sessionLogger 返回绑定 sessionID 与 agentName 的日志器，供 ReActAgent 记录 LLM I/O。
+// 未注入全局 logger 时返回 nil，ReActAgent 侧跳过 LLM I/O 日志。
+func (s *ReactService) sessionLogger(sessionID, agentName string) *logger.Logger {
+	base := s.store.logger()
+	if base == nil {
+		return nil
+	}
+	return base.WithSession(sessionID).WithAgent(agentName)
 }
 
 // NewReactService 创建 ReactService，并注入 ReAct 引擎运行时所需的所有依赖。
@@ -329,6 +364,14 @@ func (s *ReactService) Query(ctx context.Context, sessionID string, q Query) (Re
 			"avg_duration": avg.Round(time.Millisecond).String(),
 			"max_duration": max.Round(time.Millisecond).String(),
 		}}, nil
+	case QueryKindLogs:
+		// 返回 session_logs（含完整 LLM I/O prompt/response）。
+		// agent/level 可空；limit<=0 时 QuerySessionLogs 默认 100。
+		agent, _ := q.Args["agent"].(string)
+		level, _ := q.Args["level"].(string)
+		limit, _ := q.Args["limit"].(int)
+		offset, _ := q.Args["offset"].(int)
+		return Result{Data: s.store.queryLogs(ctx, sessionID, agent, level, limit, offset)}, nil
 	default:
 		// 未知查询类型返回空结果。
 		return Result{}, nil
@@ -632,7 +675,8 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).
-		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) })
+		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
+		WithLogger(s.sessionLogger(session.ID, metaRole.Name))
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -706,7 +750,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).
-		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) })
+		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
+		WithLogger(s.sessionLogger(session.ID, metaRole.Name))
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -798,6 +843,11 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, "", "", ev.Tool, strings.TrimSpace(ev.Output), ev.Output, ev.Error, ev.Success)
 	case LiveEventSubAgentDone:
 		s.store.addEvent(session, eventkind.Message, "SubAgent", ev.Tool, "sub_agent_done", "", "", "", "", true)
+	case LiveEventTokenUsage:
+		// 单次 LLM 调用 token 用量：记为 token_usage 调试事件，供前端实时累加展示。
+		// 消息格式 in=<n> out=<n> 与 textutil.ParseTokenUsage 兼容，便于后端日志解析复用。
+		msg := fmt.Sprintf("in=%d out=%d", ev.InputTokens, ev.OutputTokens)
+		s.store.addEventDebug(session, eventkind.Stats, ev.Agent, msg, eventkind.TokenUsage, "", "", "", "", true, "", int(ev.InputTokens), int(ev.OutputTokens), "")
 	}
 }
 

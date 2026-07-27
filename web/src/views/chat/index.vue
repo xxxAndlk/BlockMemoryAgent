@@ -198,6 +198,18 @@ const filteredSessions = computed(() => {
     (s.goal || '').toLowerCase().includes(q))
 })
 
+// 累加当前会话 token_usage 事件的输入/输出 token，供 ChatInput 实时展示。
+const tokenUsage = computed(() => {
+  let input = 0
+  let output = 0
+  for (const ev of events.value) {
+    if (ev.kind !== 'token_usage') continue
+    input += ev.input_tokens || 0
+    output += ev.output_tokens || 0
+  }
+  return { input, output }
+})
+
 function fmtDateTime(iso: string) {
   if (!iso) return ''
   return new Date(iso).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
@@ -247,6 +259,8 @@ function fmtDateTime(iso: string) {
       <MessageList :events="events" :verbose="verbose" />
       <ChatInput :loading="sending"
                  :session-active="activeSession?.status === 'running'"
+                 :input-tokens="tokenUsage.input"
+                 :output-tokens="tokenUsage.output"
                  v-model:verbose="verbose"
                  v-model:memory-enabled="memoryEnabled"
                  @submit="handleSubmit"
