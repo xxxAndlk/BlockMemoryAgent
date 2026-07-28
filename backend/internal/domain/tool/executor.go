@@ -154,3 +154,9 @@ func (e *Executor) readWorkDir() string {
 	// 返回已配置的工作目录，即使获取 cwd 失败也能返回原值
 	return e.workDir
 }
+
+// WorkDir 公开 Executor 的工作目录，供 ReActAgent 在系统提示词中注入环境信息。
+// 与 readWorkDir 同语义，但命名公开导出，便于跨包调用。
+func (e *Executor) WorkDir() string {
+	return e.readWorkDir()
+}

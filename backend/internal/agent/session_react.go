@@ -5,6 +5,8 @@ package agent
 // 标准库导入：上下文控制、格式化、日志、文件系统、路径处理、排序、字符串解析、并发与同步、原子操作、时间
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -71,8 +73,16 @@ type reactSessionStore struct {
 	mu sync.RWMutex
 	// sessions 是会话 ID 到 reactInternalSession 的内存映射。
 	sessions map[string]*reactInternalSession
-	// seq 用于生成单调递增的会话序号，使用原子操作避免锁竞争。
+	// seq 用于生成进程内单调递增的会话序号，使用原子操作避免锁竞争。
 	seq atomic.Int64
+	// bootEpoch 进程启动 Unix 纳秒，注入 sessionID 前缀保证跨重启唯一。
+	// 实证问题：旧实现 sessionID = "session-N"，N 由进程内 seq 自增；重启后回到 1。
+	// block-memory 按 meta->>'session_id' 过滤召回旧 session 数据时，新 session-1 命中
+	// 旧 session-1 写入的"重写全部 JS"记录，污染 HTML+CSS 任务上下文。
+	// bootEpoch + bootRand 双保险：Windows 时钟精度低，连续两次创建 ReactService
+	// 可能拿到相同纳秒，追加 4 字节随机确保全局唯一。
+	bootEpoch int64
+	bootRand  string
 	// pgStore 是 PostgreSQL 持久化存储，用于保存历史与事件。
 	pgStore *store.PostgresStore
 	// modelFactory 提供 LLM 模型实例，供推理时调用。
@@ -90,12 +100,25 @@ type reactSessionStore struct {
 func newReactSessionStore() *reactSessionStore {
 	// workDir 获取进程当前工作目录；若失败则空字符串，后续用相对路径。
 	workDir, _ := os.Getwd()
-	// 返回仓库实例，此时 Postgres 与 ModelFactory 尚未注入。
+	// 生成 4 字节随机 hex 作为实例唯一后缀，防止 Windows 低精度时钟导致 bootEpoch 相同。
+	bootRand := genBootRand()
 	return &reactSessionStore{
-		sessions: make(map[string]*reactInternalSession),
-		workDir:  workDir,
-		metrics:  newMetricsCollector(),
+		sessions:  make(map[string]*reactInternalSession),
+		workDir:    workDir,
+		metrics:    newMetricsCollector(),
+		bootEpoch:  time.Now().UnixNano(),
+		bootRand:   bootRand,
 	}
+}
+
+// genBootRand 生成 8 字符 hex 随机串作为 sessionID 实例后缀。
+// crypto/rand 失败时回退时间戳，保证测试可重复。
+func genBootRand() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(b)
 }
 
 // setPostgresStore 注入 PostgreSQL 持久化存储。
@@ -146,8 +169,10 @@ func (st *reactSessionStore) logError(ctx context.Context, msg string, err error
 // goal: 用户输入的任务目标字符串。
 // 返回: 已注册到内存中的新会话指针。
 func (st *reactSessionStore) createSession(goal string) *reactInternalSession {
-	// sessionID 通过原子自增 seq 生成，保证唯一且有序。
-	sessionID := fmt.Sprintf("session-%d", st.seq.Add(1))
+	// sessionID = "session-<bootEpoch>-<bootRand>-<seq>"：bootEpoch+bootRand 跨重启唯一；
+	// seq 进程内单调递增。旧实现 "session-N" 重启后回 1，block-memory 按 session_id
+	// 召回旧 session 数据污染新 session。
+	sessionID := fmt.Sprintf("session-%d-%s-%d", st.bootEpoch, st.bootRand, st.seq.Add(1))
 
 	// session 初始化基础字段：设置 ID、目标、运行状态、开始时间、
 	// 空事件列表以及基于 workDir 构建的临时目录。
@@ -589,15 +614,22 @@ func (st *reactSessionStore) restoreSessions(ctx context.Context, limit int) int
 	}
 
 	// maxSeq 用于恢复后同步自增序号，避免新会话 ID 与历史 ID 冲突。
+	// 新格式 sessionID = "session-<bootEpoch>-<bootRand>-<seq>"，解析取最后段 seq；
+	// 旧格式 "session-N" 解析整段为 N。取两者最大值确保新 seq 更大。
 	var maxSeq int64
-	// 遍历历史记录，解析 "session-N" 格式的 ID 并找出最大值。
+	// 遍历历史记录，解析 ID 并找出最大序号。
 	for _, rec := range recs {
-		if id := rec.SessionID; strings.HasPrefix(id, "session-") {
-			// 去掉前缀并解析整数。
-			if n, err := strconv.ParseInt(strings.TrimPrefix(id, "session-"), 10, 64); err == nil && n > maxSeq {
-				// 更新当前最大序号。
-				maxSeq = n
-			}
+		id := rec.SessionID
+		if !strings.HasPrefix(id, "session-") {
+			continue
+		}
+		rest := strings.TrimPrefix(id, "session-")
+		// 新格式含多段 "-"：取最后一段作为 seq。
+		if idx := strings.LastIndex(rest, "-"); idx >= 0 {
+			rest = rest[idx+1:]
+		}
+		if n, err := strconv.ParseInt(rest, 10, 64); err == nil && n > maxSeq {
+			maxSeq = n
 		}
 	}
 	// 若解析到有效序号，将其写入原子变量，确保后续 createSession 生成的 ID 更大。

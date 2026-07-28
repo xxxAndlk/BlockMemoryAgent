@@ -4,8 +4,10 @@ package memory
 import (
 	"context" // context 用于持久化存储接口的上下文传递
 	"fmt"     // fmt 用于格式化错误信息
-	"sync"    // sync 提供读写锁，保证并发安全
-	"time"    // time 用于为事件填充发生时间
+	"log/slog" // slog 用于摘要失败时记录警告
+	"strings"  // strings 用于事件摘要拼装
+	"sync"     // sync 提供读写锁，保证并发安全
+	"time"     // time 用于为事件填充发生时间
 
 	"github.com/blockmemory/agent/backend/internal/agent" // agent 包提供 MemoryEvent、MemoryPipeline、ReactMessage 等类型
 	"github.com/blockmemory/agent/backend/pkg/types"      // types 包提供 RoleDefinition 类型
@@ -18,6 +20,15 @@ const DefaultEventLimit = 20
 // 该值必须大于 DefaultEventLimit，保证 Assemble 在容量裁减后仍能取满注入上限。
 const DefaultMaxEventsPerAgent = 200
 
+// eventSummarizeThreshold 是触发轻量模型摘要的事件条数阈值：事件数 <= 该值时直接拼装，
+// 避免短任务为 3-5 条事件也额外调一次轻量模型。超过阈值时走摘要路径压缩 token。
+const eventSummarizeThreshold = 8
+
+// EventSummarizer 把一组格式化后的事件文本摘要成更短的上下文片段。
+// bootstrap 侧用 modelFactory.CallLightweightWithRetry 实现，注入到 Pipeline。
+// 为 nil 时关闭摘要路径，injectEvents 直接拼装原始事件。
+type EventSummarizer func(ctx context.Context, events []string) (string, error)
+
 // Pipeline 实现了 agent.MemoryPipeline 接口，作为一个基于内存的事件流。
 // 每个智能体（agent）的事件按插入顺序保存在内存中；如果配置了 Store，事件还可以被持久化。
 type Pipeline struct {
@@ -27,6 +38,9 @@ type Pipeline struct {
 	limit  int                            // limit 控制 Assemble 时最多向上下文注入多少条近期事件
 	// maxEventsPerAgent 控制每个 agent 在内存中最多保留的事件条数，超出时丢弃最旧事件
 	maxEventsPerAgent int
+	// summarizer 是可选的轻量模型摘要器：事件数超过 eventSummarizeThreshold 时调用，
+	// 把原始事件列表压成短摘要注入上下文，显著降低长任务的 token 占用。
+	summarizer EventSummarizer
 }
 
 // Store 抽象了事件流的持久化能力，实现者负责把事件保存到磁盘或数据库。
@@ -73,6 +87,13 @@ func (p *Pipeline) WithMaxEventsPerAgent(n int) *Pipeline {
 	return p
 }
 
+// WithSummarizer 注入轻量模型摘要器，事件数超过阈值时把原始事件压成短摘要注入上下文。
+// 传 nil 关闭摘要路径（默认关闭）。摘要失败时降级为直接拼装，不影响主流程。
+func (p *Pipeline) WithSummarizer(s EventSummarizer) *Pipeline {
+	p.summarizer = s
+	return p
+}
+
 // Assemble 把 agent 的近期事件作为一条 system 角色上下文消息注入到历史记录中。
 // 返回的新切片不会修改传入的 history 参数，调用方可以安全复用原切片。
 func (p *Pipeline) Assemble(_ types.RoleDefinition, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
@@ -80,7 +101,7 @@ func (p *Pipeline) Assemble(_ types.RoleDefinition, agentID string, history []ag
 }
 
 // injectEvents 完成实际的事件注入工作：先按 agentID 取事件，再截取最近 limit 条，
-// 格式化为文本后拼装成一条 system 消息并插入到 history 的最前面。
+// 格式化为文本后拼装成一条 system 消息并追加到 history 末尾（不破坏前缀缓存）。
 func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []agent.ReactMessage {
 	if agentID == "" {
 		// agentID 为空无法定位事件列表，直接返回原始历史，不做任何注入
@@ -109,17 +130,39 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 		summary = append(summary, formatEvent(ev))
 	}
 
-	// ctxMsg 是注入到上下文的 system 消息，头部用中文标签便于大模型识别
+	// 注入文本：事件数超过阈值且配置了摘要器时，调轻量模型压缩；
+	// 否则直接 join 原始事件文本。摘要失败降级为直接 join，不影响主流程。
+	body := joinNonEmpty("\n", summary)
+	if p.summarizer != nil && len(summary) > eventSummarizeThreshold {
+		// 给摘要调用设 15 秒超时：轻量模型（deepseek-v4-flash 等）在事件数 10-20 条时
+		// 经常 5-10s 才返回，5s 全部超时降级 raw join，反而把 token 撑爆。15s 平衡主循环卡顿与摘要命中率。
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		summarized, err := p.summarizer(ctx, summary)
+		cancel()
+		if err != nil {
+			// 摘要失败：记录警告，降级为原始 join，主流程不中断。
+			slog.Warn("pipeline: summarize events failed, fallback to raw join",
+				"agent_id", agentID, "event_count", len(summary), "err", err)
+		} else if trimmed := strings.TrimSpace(summarized); trimmed != "" {
+			// 摘要成功且非空：用摘要替换原始 body，显著降低 token 占用。
+			// 保留原始事件数标注，便于 LLM 识别这是压缩后的快照。
+			body = fmt.Sprintf("[已摘要 %d 条事件] %s", len(summary), trimmed)
+		}
+	}
+
+	// ctxMsg 是注入到上下文的 system 消息，头部用中文标签便于大模型识别。
+	// 放在 history 末尾而非开头：内容每轮随事件增长变化，放末尾不破坏前缀缓存
+	// （DeepSeek 自动前缀缓存命中 system 指令 + history 前缀，events 摘要位于不可缓存尾部）。
 	ctxMsg := agent.ReactMessage{
 		Role:    "system",
-		Content: "【近期事件】\n" + joinNonEmpty("\n", summary),
+		Content: "【近期事件】\n" + body,
 	}
 	// out 预先按 history 长度 +1 分配容量，减少扩容开销
 	out := make([]agent.ReactMessage, 0, len(history)+1)
-	// 先把上下文消息放到最前面，让大模型优先看到近期事件
-	out = append(out, ctxMsg)
-	// 再追加原始历史消息
+	// 先追加原始历史消息（构成稳定前缀，供 DeepSeek 前缀缓存命中）
 	out = append(out, history...)
+	// 再把上下文消息放到末尾，避免每轮变化的内容破坏前缀缓存。
+	out = append(out, ctxMsg)
 	return out
 }
 

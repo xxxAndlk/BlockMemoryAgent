@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 
@@ -51,19 +52,22 @@ type ReActAgent struct {
 	// log 是会话级日志器，用于记录每次 LLM 调用的完整 prompt/response 到 session_logs。
 	// 为 nil 时跳过 LLM I/O 日志（不影响主流程）。
 	log *logger.Logger
+	// workDir 是当前 Agent 的工作目录，注入到系统提示词中供 LLM 使用相对路径。
+	// 为空时回退到进程 cwd（systemPrompt 中仍会显示）。
+	workDir string
 }
 
 // LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。
 // 各字段 <=0 的语义见 ReActAgent 对应字段注释。
 type LoopConfig struct {
-	MaxIterations      int           // 最大 LLM 轮数；<=0 不限制
-	LLMTimeout         time.Duration // 单次 LLM 调用超时；<=0 仅受会话取消控制
-	RetryCount         int           // 失败重试次数（不含首次）；<0 视为 0
-	RetryBackoff       time.Duration // 重试初始退避；<=0 用默认 100ms
-	HistoryMaxMessages int           // 单次请求最大历史消息数；<=0 不裁剪
-	ToolOutputMaxRunes int           // 写入历史的工具输出最大字符数；<=0 不截断
-	SummarizeEvery     int           // 每 N 步触发一次历史压缩；<=0 关闭压缩
-	SummarizeKeepRecent int          // 压缩时保留最近 K 条原始消息；<=0 视为 10
+	MaxIterations       int           // 最大 LLM 轮数；<=0 不限制
+	LLMTimeout          time.Duration // 单次 LLM 调用超时；<=0 仅受会话取消控制
+	RetryCount          int           // 失败重试次数（不含首次）；<0 视为 0
+	RetryBackoff        time.Duration // 重试初始退避；<=0 用默认 100ms
+	HistoryMaxMessages  int           // 单次请求最大历史消息数；<=0 不裁剪
+	ToolOutputMaxRunes  int           // 写入历史的工具输出最大字符数；<=0 不截断
+	SummarizeEvery      int           // 每 N 步触发一次历史压缩；<=0 关闭压缩
+	SummarizeKeepRecent int           // 压缩时保留最近 K 条原始消息；<=0 视为 10
 }
 
 // NewReActAgent 根据具体角色构造一个 ReActAgent 实例。
@@ -89,6 +93,13 @@ func (a *ReActAgent) WithMemory(m MemoryPipeline) *ReActAgent {
 	} else {
 		a.memory = m
 	}
+	return a
+}
+
+// WithWorkDir 注入工作目录，会在系统提示词中作为环境信息暴露给 LLM。
+// 用于让 LLM 用相对路径定位文件、判断 OS 上下文。空字符串表示回退到进程 cwd。
+func (a *ReActAgent) WithWorkDir(wd string) *ReActAgent {
+	a.workDir = wd
 	return a
 }
 
@@ -269,25 +280,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 
 		// 在判断本轮是否结束之前，先轮询邮箱并注入任何新的异步消息。
 		// mailbox 由服务装配层注入共享邮箱（用于接收异步子代理摘要）；未注入时跳过。
-		if a.mailbox != nil {
-			// Drain 取出所有以当前代理为收件人的未读消息。
-			for _, m := range a.mailbox.Drain(a.name) {
-				// 将 mailbox 消息转为模型可见的 user 角色消息并加入历史。
-				history = append(history, mailboxMessageToReact(m))
-
-				// 实时推送子 Agent 完成事件，UI 可据此更新"等待子 Agent"状态。
-				a.emitLive(LiveEvent{Kind: LiveEventSubAgentDone, Tool: m.From, Text: truncateRunes(m.Body, 200)})
-
-				// 同时把子代理摘要作为记忆事件写入，供后续上下文组装使用。
-				a.memory.Write(a.name, MemoryEvent{
-					Type:     "sub_agent_summary",
-					AgentID:  a.name,
-					Role:     m.From,
-					Content:  m.Body,
-					Occurred: time.Now(),
-				})
-			}
-		}
+		history, _ = a.drainMailbox(history)
 
 		// 如果助手消息中没有任何工具调用，说明本轮已产生最终答案。
 		if len(assistant.ToolCalls) == 0 {
@@ -295,10 +288,18 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// 阻塞等待其完成而非立即终结，防止迟到 mailbox 消息随会话销毁丢失。
 			// 多 Agent 协作验证闭环（code<->test 互问互答）的关键正确性保障。
 			if a.pendingChecker != nil && a.pendingChecker.PendingChildren(a.name) > 0 {
-				// 阻塞等待任一子 Agent 完成或超时；超时后继续循环由 maxIter 兜底。
-				// 收到信号后 continue，下一轮迭代会 Drain mailbox 取到子 Agent 结果摘要，
-				// 模型基于新信息重新生成答复（可能再次给出终答，此时若仍有未决则继续等待）。
-				a.pendingChecker.WaitForAnyChild(a.name, 30*time.Second)
+				// 等待期间不烧 LLM 轮次：纯阻塞等子 Agent 完成信号，仅当 mailbox
+				// 取到新摘要时才 break 回主循环调 LLM 整合；超时无新消息则继续等。
+				// 旧实现每 30s 超时白跑一次 LLM，50 轮上限烧完后会话停摆等用户
+				// 人工续跑（实证：塔防任务死等 46 分钟）。
+				for a.pendingChecker.PendingChildren(a.name) > 0 {
+					a.pendingChecker.WaitForAnyChild(a.name, 30*time.Second)
+					var n int
+					history, n = a.drainMailbox(history)
+					if n > 0 || a.mailbox == nil || ctx.Err() != nil {
+						break
+					}
+				}
 				continue
 			}
 
@@ -529,14 +530,21 @@ func serializeResponseForLog(m *blades.Message) string {
 			if sb.Len() > 0 {
 				sb.WriteString("\n")
 			}
-			sb.WriteString("[tool_call] name=" + tp.Name + " id=" + tp.ID + "\n" + tp.Request)
+			sb.WriteString("[tool_call] name=")
+			sb.WriteString(tp.Name)
+			sb.WriteString(" id=")
+			sb.WriteString(tp.ID)
+			sb.WriteString("\n")
+			sb.WriteString(tp.Request)
 		}
 	}
 	if m.FinishReason != "" {
 		if sb.Len() > 0 {
 			sb.WriteString("\n")
 		}
-		sb.WriteString("[finish_reason=" + m.FinishReason + "]")
+		sb.WriteString("[finish_reason=")
+		sb.WriteString(m.FinishReason)
+		sb.WriteString("]")
 	}
 	return sb.String()
 }
@@ -606,7 +614,7 @@ func bladesText(m *blades.Message) string {
 // 用于每 N 步触发一次的上下文压缩，避免长任务 token O(N²) 增长。
 //
 // 压缩规则：
-//   - system 前缀全保留（记忆流水线注入的近期事件）；
+//   - system 前缀全保留（若存在；记忆流水线已将近期事件移至末尾，此处通常无 system 前缀）；
 //   - 首条 user 消息原样保留（任务目标，防"失忆"）；
 //   - 中段每条消息压成 "[role] 前 200 字符" 拼成一条 system 摘要消息；
 //   - 最近 K 条原样保留（含 tool_call/tool_result 对，边界对齐 user）。
@@ -666,7 +674,7 @@ func summarizeWindow(messages []ReactMessage, keepRecent int) []ReactMessage {
 		}
 		fmt.Fprintf(&sb, "- [%s] %s\n", role, content)
 	}
-	sb.WriteString("\n（以上为早期对话压缩摘要，关键结论见上方近期事件与下方最近消息）")
+	sb.WriteString("\n（以上为早期对话压缩摘要，关键结论见下方近期事件与下方最近消息）")
 
 	out := make([]ReactMessage, 0, keep+1+1+1+(len(messages)-recentStart))
 	out = append(out, messages[:keep]...)
@@ -684,7 +692,7 @@ func windowMessages(messages []ReactMessage, max int) []ReactMessage {
 	if max <= 0 || len(messages) <= max {
 		return messages
 	}
-	// 保留开头的 system 消息（记忆流水线注入的"近期事件"上下文）。
+	// 保留开头的 system 消息（防御性扫描；记忆流水线已将近期事件移至末尾，此处通常无 system 前缀）。
 	keep := 0
 	for keep < len(messages) && messages[keep].Role == "system" {
 		keep++
@@ -708,9 +716,10 @@ func windowMessages(messages []ReactMessage, max int) []ReactMessage {
 	}
 	out := make([]ReactMessage, 0, len(messages)-omitted+1)
 	out = append(out, messages[:keep]...)
+	// 占位文本固定（不含动态计数）：避免每轮 omitted 变化导致前缀缓存失效。
 	out = append(out, ReactMessage{
 		Role:    "user",
-		Content: fmt.Sprintf("（上下文省略：此处之前还有 %d 条早期对话，已从本次请求中裁剪，关键结论见上方近期事件）", omitted),
+		Content: "（上下文已省略早期对话，关键结论见下方近期事件）",
 	})
 	out = append(out, messages[start:]...)
 	return out
@@ -726,7 +735,8 @@ func truncateRunes(s string, n int) string {
 }
 
 // systemPrompt 为当前角色构建系统提示词。
-// 基础提示来自角色配置；末尾追加一段统一的执行纪律，用于减少常见反模式
+// 基础提示来自角色配置；头部插入运行环境（OS/时区/时间/工作目录），
+// 末尾追加一段统一的执行纪律，用于减少常见反模式
 // （无目的工具调用、未验证就声称完成、忘记 mailbox 消息语义等）。
 func (a *ReActAgent) systemPrompt() string {
 	// 取角色配置中的系统提示作为基础。
@@ -737,14 +747,55 @@ func (a *ReActAgent) systemPrompt() string {
 		base = "You are a helpful assistant."
 	}
 
+	// 头部环境信息：OS、时区、当前时间、工作目录。让 LLM 用对 OS 的 shell 语法
+	// （Windows 用 PowerShell，Linux/macOS 用 bash/sh）与正确的相对路径。
+	envBlock := buildEnvBlock(a.workDir)
+
 	// 在基础提示后追加执行纪律块，与角色提示同语言（中文），覆盖：
 	// 工具使用节制、修改后验证、完成即停、mailbox 消息语义。
-	return base + "\n\n" +
+	return envBlock + "\n\n" + base + "\n\n" +
 		"【执行纪律】\n" +
 		"1. 只在必要时调用工具；先用 SearchInFiles/ListDir 定位，再按需 ReadFile；不重复读取已读过的文件。\n" +
 		"2. 修改代码或文件后，用 RunCommand 验证（构建/测试/检查），没有验证证据不得声称完成。\n" +
 		"3. 任务完成立即停止调用工具，输出最终答复；答复必须自包含：做了什么、结果如何、关键文件路径。\n" +
 		"4. 形如 [mailbox from <agent_id>] 的消息是异步子 Agent 回传的结果摘要，阅读后整合进当前结论；若摘要表明失败，决定重试、自己接手或在答复中说明。\n"
+}
+
+// buildEnvBlock 构造环境信息块，注入到系统提示词头部。
+// 包含 OS（含 Windows 主版本判断）、时区、当前时间、工作目录。
+// workDir 为空时回退到进程 cwd。
+func buildEnvBlock(workDir string) string {
+	osName := runtime.GOOS
+	// Windows 主版本细判：仅给 LLM "windows" 足够，但显式标注能让 LLM 选择正确的 shell 语法。
+	osLabel := osName
+	switch osName {
+	case "windows":
+		osLabel = "Windows（PowerShell，命令需用 PS 语法：2>$null 而非 2>nul，Get-ChildItem 而非 dir）"
+	case "linux":
+		osLabel = "Linux（bash/sh）"
+	case "darwin":
+		osLabel = "macOS（bash/zsh）"
+	}
+
+	// 时区与当前时间：用本地时区名 + RFC3339 时间，便于 LLM 处理时间相关任务。
+	tzName := "UTC"
+	now := time.Now()
+	if loc := now.Location(); loc != nil && loc.String() != "" {
+		tzName = loc.String()
+	}
+	timeStr := now.Format("2006-01-02 15:04:05 MST")
+
+	// 工作目录：为空时回退到 cwd，保证始终有值。
+	wd := workDir
+	if wd == "" {
+		wd = "(进程当前目录)"
+	}
+
+	return "【运行环境】\n" +
+		fmt.Sprintf("- 操作系统: %s\n", osLabel) +
+		fmt.Sprintf("- 时区: %s\n", tzName) +
+		fmt.Sprintf("- 当前时间: %s\n", timeStr) +
+		fmt.Sprintf("- 工作目录: %s", wd)
 }
 
 // mailboxMessageToReact 把异步 mailbox 消息转换为模型可见的 ReactMessage。
@@ -767,6 +818,33 @@ func mailboxMessageToReact(m *mailbox.Message) ReactMessage {
 
 	// 组合成带发送者标记的 user 消息返回。
 	return ReactMessage{Role: "user", Content: fmt.Sprintf("[mailbox from %s] %s", m.From, body)}
+}
+
+// drainMailbox 取出所有以当前 Agent 为收件人的未读 mailbox 消息，
+// 转为 user 消息追加到 history，并推送实时事件 + 写记忆事件。
+// 返回更新后的 history 与新注入的消息数；mailbox 未注入时原样返回 0。
+func (a *ReActAgent) drainMailbox(history []ReactMessage) ([]ReactMessage, int) {
+	if a.mailbox == nil {
+		return history, 0
+	}
+	msgs := a.mailbox.Drain(a.name)
+	for _, m := range msgs {
+		// 将 mailbox 消息转为模型可见的 user 角色消息并加入历史。
+		history = append(history, mailboxMessageToReact(m))
+
+		// 实时推送子 Agent 完成事件，UI 可据此更新"等待子 Agent"状态。
+		a.emitLive(LiveEvent{Kind: LiveEventSubAgentDone, Tool: m.From, Text: truncateRunes(m.Body, 200)})
+
+		// 同时把子代理摘要作为记忆事件写入，供后续上下文组装使用。
+		a.memory.Write(a.name, MemoryEvent{
+			Type:     "sub_agent_summary",
+			AgentID:  a.name,
+			Role:     m.From,
+			Content:  m.Body,
+			Occurred: time.Now(),
+		})
+	}
+	return history, len(msgs)
 }
 
 // mustMarshal 将任意值序列化为 JSON 字符串；如果序列化失败则返回空字符串。

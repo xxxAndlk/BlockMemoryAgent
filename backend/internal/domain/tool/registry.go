@@ -3,6 +3,7 @@ package tool
 // 导入所需标准库与项目内部包。
 import (
 	"context"       // context 用于传递上下文与取消信号
+	"encoding/json" // encoding/json 解析 SharedEntry 做失效反查
 	"fmt"           // fmt 用于格式化错误信息
 	"path/filepath" // filepath 用于规范化文件路径
 	"strings"       // strings 用于拼接已读文件列表
@@ -79,8 +80,12 @@ type Registry struct {
 	// readMu 保护 readFiles map，防止并发读写。
 	readMu sync.Mutex
 	// readFiles 按 sessionID 记录本任务已读文件路径，用于 ReadFile 预算控制。
-	// session 维度隔离：不同会话不共享已读列表；新用户消息进入时 ResetReadHistory 清空。
+	// session 维度隔离：不同会话不分享已读列表；新用户消息进入时 ResetReadHistory 清空。
 	readFiles map[string][]string
+	// writtenFiles 按 sessionID 记录本任务内 WriteFile 成功写过的路径。
+	// 这些路径允许重复 ReadFile：LLM 写完文件后常需重读以验证修改/定位 syntax 错误，
+	// 简单的"已读过即拦截"会卡住修复循环。该集合在 WriteFile 成功时写入，readCheck 命中即放行。
+	writtenFiles map[string]map[string]bool
 	// sharedMemory 是 WriteSharedMemory 工具的 KV 后端，由 bootstrap 注入。
 	// 为 nil 时 WriteSharedMemory 注册但不生效，调用返回 store 未配置错误。
 	sharedMemory SharedMemoryStore
@@ -102,7 +107,8 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		failures:  newFailureCounter(),
 		tools:     make(map[string]Tool),
 		aliases:   make(map[string]string),
-		readFiles: make(map[string][]string),
+		readFiles:     make(map[string][]string),
+		writtenFiles: make(map[string]map[string]bool),
 	}
 	// 注册系统内置的默认工具列表。
 	r.registerDefaults()
@@ -141,6 +147,14 @@ func (r *Registry) Register(t Tool) {
 	for _, alias := range t.Aliases() {
 		r.aliases[alias] = t.Name()
 	}
+}
+
+// WorkDir 返回 Executor 的工作目录，供 ReActAgent 在系统提示词中注入环境信息。
+func (r *Registry) WorkDir() string {
+	if r == nil || r.exec == nil {
+		return ""
+	}
+	return r.exec.WorkDir()
 }
 
 // SetSandboxConfig 把 SafetyConfig 翻译成 Executor 的 SandboxConfig 并注入。
@@ -232,6 +246,16 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		}
 	}
 
+	// WriteFile 成功后失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
+	// 防止子 Agent 改文件后，父 Agent 下次派发仍把旧摘要注入新子 Agent task 导致幻觉。
+	// 同时清掉该 path 的已读记录：文件已被改写，旧 ReadFile 缓存的 tool_result 不再新鲜，
+	// 必须允许后续 ReadFile 重读，否则 LLM 只能看到 history 里的旧内容（脏数据）。
+	if name == "WriteFile" && result.Success && result.Path != "" {
+		r.invalidateSharedMemoryForPath(ctx, result.Path)
+		r.clearReadHistoryForPath(ctx, result.Path)
+		r.recordWrittenFile(ctx, result.Path)
+	}
+
 	// 填充结果的通用字段，如 SessionID、ArgsJSON 以及执行器回调。
 	r.fillResult(ctx, result, args)
 
@@ -254,6 +278,35 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	r.emitResult(ctx, result)
 	// 返回执行结果和错误（工具内部错误已封装在 result 中，此处 error 通常为 nil）。
 	return result, nil
+}
+
+// invalidateSharedMemoryForPath 遍历 sharedKV，删除引用指定 path 的 entry（Layer 2 缓存一致性）。
+// 在 WriteFile 成功后调用，防止子 Agent 改文件后父 Agent 下次派发仍注入旧摘要。
+// 失败静默（仅影响缓存，不影响 WriteFile 主路径）；path 规范化为绝对路径比较。
+// 旧格式 value（非 JSON）无法判断引用关系，保留不删，由 Layer 3 stat 校验兜底。
+func (r *Registry) invalidateSharedMemoryForPath(ctx context.Context, path string) {
+	if r.sharedMemory == nil || path == "" {
+		return
+	}
+	cleanPath := filepath.Clean(path)
+	keys := r.sharedMemory.Keys(ctx)
+	for _, key := range keys {
+		val, err := r.sharedMemory.Get(ctx, key)
+		if err != nil || val == "" {
+			continue
+		}
+		var entry SharedEntry
+		if json.Unmarshal([]byte(val), &entry) != nil {
+			// 旧格式（纯字符串 content）：无法判断引用关系，保留。
+			continue
+		}
+		for fp := range entry.Files {
+			if filepath.Clean(fp) == cleanPath {
+				_ = r.sharedMemory.Delete(ctx, key)
+				break
+			}
+		}
+	}
 }
 
 // fillResult 填充 Result 的 SessionID、ArgsJSON，并触发执行器回调。
@@ -329,6 +382,11 @@ func (r *Registry) checkReadFileBudget(ctx context.Context, path string) string 
 	// 遍历该 session 的已读文件列表，若发现重复路径则拦截。
 	for _, p := range r.readFiles[sessionID] {
 		if filepath.Clean(p) == cleanPath {
+			// 例外：该路径在本 session 内被 WriteFile 写过则放行。
+			// LLM 写完文件后常需重读以验证修改或定位 syntax 错误，硬拦截会卡住修复循环。
+			if r.writtenFiles[sessionID] != nil && r.writtenFiles[sessionID][cleanPath] {
+				return ""
+			}
 			// 返回中文提示，告知模型已读过并应使用 SearchInFiles 定位。
 			return fmt.Sprintf("该文件本任务已读过（%s），禁止重读。复用已返回内容推进任务；如需看其他段落请用 SearchInFiles 精确定位。", cleanPath)
 		}
@@ -392,15 +450,58 @@ func (r *Registry) ResetReadHistory(sessionID string) {
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
 	delete(r.readFiles, sessionID)
+	delete(r.writtenFiles, sessionID)
 }
 
-// Schema 返回所有已注册工具对应的 blades Tool 定义列表，
+// clearReadHistoryForPath 从当前 session 的已读列表中移除指定 path 的记录。
+// 用于 WriteFile 成功后：文件已被改写，旧 ReadFile 缓存的 tool_result 不再反映最新内容，
+// 必须允许后续 ReadFile 重新读取，否则 LLM 只能看到 history 里的旧内容（脏数据）。
+// 仅清当前 session（子 Agent 派发经 WithSessionID 继承同一 sessionID，覆盖主/子 Agent 协作场景）。
+func (r *Registry) clearReadHistoryForPath(ctx context.Context, path string) {
+	sessionID := SessionIDFromContext(ctx)
+	if sessionID == "" {
+		return
+	}
+	cleanPath := filepath.Clean(path)
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	files := r.readFiles[sessionID]
+	if len(files) == 0 {
+		return
+	}
+	out := files[:0]
+	for _, p := range files {
+		if filepath.Clean(p) != cleanPath {
+			out = append(out, p)
+		}
+	}
+	r.readFiles[sessionID] = out
+}
+
+// recordWrittenFile 把 path 加入本 session 的已写集合，使后续 ReadFile 跳过"已读过"拦截。
+// 用于 WriteFile 成功后：LLM 写完文件常需重读以验证修改或定位 syntax 错误，
+// 硬拦截会卡住修复循环。集合在 session 维度隔离，ResetReadHistory 一并清空。
+func (r *Registry) recordWrittenFile(ctx context.Context, path string) {
+	sessionID := SessionIDFromContext(ctx)
+	if sessionID == "" {
+		return
+	}
+	cleanPath := filepath.Clean(path)
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	if r.writtenFiles[sessionID] == nil {
+		r.writtenFiles[sessionID] = make(map[string]bool)
+	}
+	r.writtenFiles[sessionID][cleanPath] = true
+}
+
+
 // 供外部框架（如 blades）动态发现和调用工具。
 func (r *Registry) Schema() []tools.Tool {
 	// 初始化空列表，用于收集所有工具定义。
 	var toolsList []tools.Tool
 	// 注册 ReadFile 工具：读取文件内容。
-	if t, err := tools.NewFunc("ReadFile", "读取文件内容。path 为相对或绝对路径。建议先用 SearchInFiles/ListDir 定位再精读；同一任务中已读过的文件会被拒绝重读，且最多读取 5 个不同文件。", func(ctx context.Context, in readFileInput) (string, error) {
+	if t, err := tools.NewFunc("ReadFile", "读取文件内容。path 为相对或绝对路径。建议先用 SearchInFiles/ListDir 定位再精读；同一 session 中已读过的文件会返回提示不复读；单次最多 4000 字符，需看其他段落用 SearchInFiles 精确定位。", func(ctx context.Context, in readFileInput) (string, error) {
 		// 通过 Dispatch 调用内部 ReadFile 工具，忽略 Dispatch 返回的 error。
 		res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": in.Path})
 		// 将结果序列化为 JSON 字符串。
@@ -428,7 +529,7 @@ func (r *Registry) Schema() []tools.Tool {
 		toolsList = append(toolsList, t)
 	}
 	// 注册 RunCommand 工具：执行 shell 命令。
-	if t, err := tools.NewFunc("RunCommand", "执行 shell 命令。命令执行时环境变量 BMA_SESSION_TEMP_DIR 指向本会话的临时目录，如需创建临时文件请写入该目录，会话结束后会自动清理。", func(ctx context.Context, in runCommandInput) (string, error) {
+	if t, err := tools.NewFunc("RunCommand", "执行 shell 命令。命令执行时环境变量 BMA_SESSION_TEMP_DIR 指向本会话的临时目录，如需创建临时文件请写入该目录，会话结束后会自动清理。\n注意：Windows 下走 PowerShell（不是 cmd），需用 PS 语法：`Get-ChildItem` 而非 `dir`，`2>$null` 而非 `2>nul`，`$env:VAR` 而非 `%VAR%`，`-and`/`-or` 而非 `&&`/`||`（PS7+ 才支持 &&）；Linux/macOS 走 bash/sh。系统提示词已注入当前 OS。", func(ctx context.Context, in runCommandInput) (string, error) {
 		// 构造参数映射，命令为必填。
 		args := map[string]any{"command": in.Command}
 		// 若超时时间大于 0，则加入参数中。
@@ -507,8 +608,17 @@ func (r *Registry) Schema() []tools.Tool {
 	}
 	// 注册 WriteSharedMemory 工具：写入 KV 共享记忆，供子 Agent 经 dispatcher.injectKVMemory 自动读取。
 	// 仅暴露给 MetaAgent（meta 角色白名单），固定助手/DomainAgent 的白名单不含此工具。
-	if t, err := tools.NewFunc("WriteSharedMemory", "把派发前采集的关键上下文（文件路径、行号、函数签名、前置结论、验收标准）写入共享记忆。被派发的子 Agent 会自动读取，避免重读全文件。仅 MetaAgent 可用。", func(ctx context.Context, in writeSharedMemoryInput) (string, error) {
-		res, _ := r.Dispatch(ctx, "WriteSharedMemory", map[string]any{"content": in.Content})
+	// files 字段填涉及的文件路径列表，写入时记录 mtime；任一文件被 WriteFile 修改后该记忆自动失效。
+	if t, err := tools.NewFunc("WriteSharedMemory", "把派发前采集的关键上下文（文件路径、行号、函数签名、前置结论、验收标准）写入共享记忆。被派发的子 Agent 会自动读取，避免重读全文件。files 字段填涉及的文件路径列表，写入时记录 mtime，任一文件被 WriteFile 修改后该记忆自动失效。仅 MetaAgent 可用。", func(ctx context.Context, in writeSharedMemoryInput) (string, error) {
+		args := map[string]any{"content": in.Content}
+		if len(in.Files) > 0 {
+			files := make([]any, 0, len(in.Files))
+			for _, f := range in.Files {
+				files = append(files, f)
+			}
+			args["files"] = files
+		}
+		res, _ := r.Dispatch(ctx, "WriteSharedMemory", args)
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
 	}); err == nil {
@@ -523,7 +633,7 @@ func (r *Registry) Schema() []tools.Tool {
 			desc = d.Description()
 		}
 		if t, err := tools.NewFunc("call_sub_agent", desc, func(ctx context.Context, in callSubAgentInput) (string, error) {
-			res, _ := r.Dispatch(ctx, "call_sub_agent", map[string]any{"role_id": in.RoleID, "task": in.Task, "domain": in.Domain})
+			res, _ := r.Dispatch(ctx, "call_sub_agent", map[string]any{"role_id": in.RoleID, "task": in.Task, "domain": in.Domain, "responsibility": in.Responsibility})
 			b, _ := marshalNoHTMLEscape(res)
 			return string(b), nil
 		}); err == nil {

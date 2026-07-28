@@ -12,7 +12,7 @@ import (
 
 // TestPipeline_WriteAndAssemble 验证 Pipeline 的 Write 与 Assemble 行为。
 // 测试场景：先写入一条 tool_call 事件，再调用 Assemble 组装历史消息，
-// 期望返回的历史长度比原始历史多一条 system 上下文消息。
+// 期望返回的历史长度比原始历史多一条 system 上下文消息（位于末尾，不破坏前缀缓存）。
 func TestPipeline_WriteAndAssemble(t *testing.T) {
 	// 创建一个不带持久化存储的 Pipeline 实例。
 	pipe := NewPipeline(nil)
@@ -31,12 +31,17 @@ func TestPipeline_WriteAndAssemble(t *testing.T) {
 	if len(out) != len(history)+1 {
 		t.Fatalf("expected %d messages, got %d", len(history)+1, len(out))
 	}
-	// 校验第一条消息角色为 system，表示上下文注入成功。
-	if out[0].Role != "system" {
-		t.Fatalf("expected injected system message, got %s", out[0].Role)
+	// 校验原始历史仍在前位（构成稳定前缀，供前缀缓存命中）。
+	if out[0].Role != "user" || out[0].Content != "read the file" {
+		t.Fatalf("expected original history at front, got role=%s content=%q", out[0].Role, out[0].Content)
+	}
+	// 校验末尾消息角色为 system，表示上下文注入成功。
+	last := out[len(out)-1]
+	if last.Role != "system" {
+		t.Fatalf("expected injected system message at end, got %s", last.Role)
 	}
 	// 校验 system 消息内容非空。
-	if out[0].Content == "" {
+	if last.Content == "" {
 		t.Fatal("expected non-empty context injection")
 	}
 }
@@ -116,7 +121,7 @@ func TestPipeline_MaxEventsPerAgent(t *testing.T) {
 
 // TestPipeline_MaxEventsPerAgent_AssembleLatest 验证容量裁减后 Assemble 仍能注入最新事件。
 // 测试场景：容量上限 25、注入上限 3，写入 30 条事件后调用 Assemble，
-// 期望注入的 system 消息包含最新事件 ev-29，且不包含已被丢弃的 ev-0。
+// 期望注入的 system 消息（位于末尾）包含最新事件 ev-29，且不包含已被丢弃的 ev-0。
 func TestPipeline_MaxEventsPerAgent_AssembleLatest(t *testing.T) {
 	// 创建一个容量上限为 25、注入上限为 3 的 Pipeline 实例。
 	pipe := NewPipeline(nil).WithMaxEventsPerAgent(25).WithLimit(3)
@@ -137,17 +142,19 @@ func TestPipeline_MaxEventsPerAgent_AssembleLatest(t *testing.T) {
 	if len(out) != len(history)+1 {
 		t.Fatalf("expected %d messages, got %d", len(history)+1, len(out))
 	}
+	// 注入的 system 消息位于末尾（不破坏前缀缓存）。
+	last := out[len(out)-1]
 	// 校验注入的上下文包含最新事件 ev-29。
-	if !strings.Contains(out[0].Content, "ev-29") {
-		t.Fatalf("expected injected context to contain latest event 'ev-29', got %q", out[0].Content)
+	if !strings.Contains(last.Content, "ev-29") {
+		t.Fatalf("expected injected context to contain latest event 'ev-29', got %q", last.Content)
 	}
 	// 校验注入的上下文不包含注入窗口之前的 ev-26（注入上限为 3，只应包含 ev-27 及之后）。
-	if strings.Contains(out[0].Content, "ev-26") {
-		t.Fatalf("expected injected context to exclude event 'ev-26' beyond limit, got %q", out[0].Content)
+	if strings.Contains(last.Content, "ev-26") {
+		t.Fatalf("expected injected context to exclude event 'ev-26' beyond limit, got %q", last.Content)
 	}
 	// 校验已被容量裁减丢弃的 ev-0 不出现在上下文中。
-	if strings.Contains(out[0].Content, "ev-0") {
-		t.Fatalf("expected injected context to exclude trimmed event 'ev-0', got %q", out[0].Content)
+	if strings.Contains(last.Content, "ev-0") {
+		t.Fatalf("expected injected context to exclude trimmed event 'ev-0', got %q", last.Content)
 	}
 }
 

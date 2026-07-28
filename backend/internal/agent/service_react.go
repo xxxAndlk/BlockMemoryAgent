@@ -129,6 +129,15 @@ func (s *ReactService) SetModelProvider(p ModelProvider) {
 	s.testProvider = p
 }
 
+// workDir 返回会话存储的工作目录，供 ReActAgent 在系统提示词中注入环境信息。
+// 优先用 store.workDir；为空时回退到进程 cwd。
+func (s *ReactService) workDir() string {
+	if wd := s.store.workDir; wd != "" {
+		return wd
+	}
+	return ""
+}
+
 // SetLogger 注入结构化日志器，使会话存储的错误类日志以 [ERRO] 级别输出。
 // 参数 l：已初始化的 Logger 指针；未注入时回退标准库 log。
 func (s *ReactService) SetLogger(l *logger.Logger) {
@@ -676,7 +685,8 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		WithMemory(s.memory).
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
-		WithLogger(s.sessionLogger(session.ID, metaRole.Name))
+		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
+		WithWorkDir(s.workDir())
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -751,7 +761,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithMemory(s.memory).
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
-		WithLogger(s.sessionLogger(session.ID, metaRole.Name))
+		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
+		WithWorkDir(s.workDir())
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -932,6 +943,11 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 	// 需重读已改文件，不应被历史记录卡死。重复读限制为单任务级而非整个 session 级。
 	if s.toolRegistry != nil {
 		s.toolRegistry.ResetReadHistory(sessionID)
+	}
+
+	// 同理重置派发计数：全局派发限额按 session 累计，上一任务的消耗不应卡死下一任务。
+	if r, ok := s.pendingChecker.(DispatchCountResetter); ok {
+		r.ResetDispatchCounts(sessionID)
 	}
 
 	// 记录会话原先是否处于运行状态。

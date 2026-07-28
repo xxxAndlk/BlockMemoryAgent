@@ -132,6 +132,20 @@ func (m *InMemoryKV) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Keys 返回当前内存中所有键的快照。供失效逻辑（如 WriteFile hook 反查引用某 path 的 entry）
+// 遍历使用。只读实例可读。返回顺序无保证。
+// 注意：仅返回内存中键，不主动从 store 加载；store 中存在但未加载到内存的键不会被枚举。
+// 当前 InMemoryKV 用法（sharedKV 进程级单实例）下，所有写入先落内存，因此枚举完整。
+func (m *InMemoryKV) Keys(ctx context.Context) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	keys := make([]string, 0, len(m.items))
+	for k := range m.items {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // IsWritable 报告该实例是否可写。供调用方在写入前判断（避免依赖错误返回）。
 func (m *InMemoryKV) IsWritable() bool {
 	return m.writable

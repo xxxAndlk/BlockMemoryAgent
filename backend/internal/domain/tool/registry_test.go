@@ -3,6 +3,7 @@ package tool
 // 导入测试所需标准库与项目包。
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -47,6 +48,127 @@ func TestReadFile(t *testing.T) {
 	// 校验输出内容包含 "world"。
 	if !strings.Contains(res.Output, "world") {
 		t.Fatalf("expected output to contain 'world', got: %s", res.Output)
+	}
+}
+
+// TestReadFile_DedupAndReset 验证已读守卫拦截重读，且 ResetReadHistory 后可重读。
+// 对应日志事故：test_assistant-23 反复读 kv.go 被拒 14 分钟；现有修复应让其在新任务重读。
+func TestReadFile_DedupAndReset(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("v1"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s1")
+
+	// 首次读取应成功。
+	res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
+	if err != nil || !res.Success {
+		t.Fatalf("first read should succeed: err=%v success=%v", err, res.Success)
+	}
+
+	// 同 session 内第二次读取应被守卫拦截。
+	res2, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
+	if res2.Success {
+		t.Fatal("second read should be blocked by dedup guard")
+	}
+	if !strings.Contains(res2.Error, "已读过") {
+		t.Fatalf("expected dedup error, got: %s", res2.Error)
+	}
+
+	// 模拟用户新消息：ResetReadHistory 清空记录。
+	r.ResetReadHistory("s1")
+
+	// 清空后应可再次读取。
+	res3, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
+	if err != nil || !res3.Success {
+		t.Fatalf("read after reset should succeed: err=%v success=%v", err, res3.Success)
+	}
+}
+
+// TestWriteFile_ClearsReadHistory 验证 WriteFile 成功后清掉同 path 的已读记录，
+// 允许后续 ReadFile 重读改后内容（防 Agent history 脏数据：文件被改但 LLM 只看旧 tool_result）。
+func TestWriteFile_ClearsReadHistory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("v1"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s1")
+
+	// 首次读取成功，记录进已读列表。
+	res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
+	if err != nil || !res.Success {
+		t.Fatalf("first read should succeed: err=%v success=%v", err, res.Success)
+	}
+	if !strings.Contains(res.Output, "v1") {
+		t.Fatalf("expected v1 content, got: %s", res.Output)
+	}
+
+	// 第二次读取应被拦截。
+	res2, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
+	if res2.Success {
+		t.Fatal("second read should be blocked by dedup guard")
+	}
+
+	// WriteFile 改写 a.txt 内容为 v2，触发清同 path 已读记录。
+	wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{
+		"path":    "a.txt",
+		"content": "v2",
+	})
+	if err != nil || !wres.Success {
+		t.Fatalf("WriteFile should succeed: err=%v success=%v", err, wres.Success)
+	}
+
+	// 改写后 ReadFile 应能再次读取，返回最新内容 v2。
+	res3, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
+	if err != nil || !res3.Success {
+		t.Fatalf("read after WriteFile should succeed: err=%v success=%v", err, res3.Success)
+	}
+	if !strings.Contains(res3.Output, "v2") {
+		t.Fatalf("expected v2 content after rewrite, got: %s", res3.Output)
+	}
+}
+
+// TestWriteFile_ClearsReadHistory_PreservesOthers 验证 WriteFile 只清同 path 的已读记录，
+// 不误清其他文件的已读记录（保持其他文件的防重读语义）。
+func TestWriteFile_ClearsReadHistory_PreservesOthers(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b"), 0644); err != nil {
+		t.Fatalf("write b.txt: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s1")
+
+	// 读 a.txt 与 b.txt，两者都进已读列表。
+	if _, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"}); err != nil {
+		t.Fatalf("read a.txt: %v", err)
+	}
+	if _, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "b.txt"}); err != nil {
+		t.Fatalf("read b.txt: %v", err)
+	}
+
+	// WriteFile 改 a.txt：只清 a.txt 的已读记录，b.txt 仍被拦截。
+	if _, err := r.Dispatch(ctx, "WriteFile", map[string]any{
+		"path":    "a.txt",
+		"content": "a2",
+	}); err != nil {
+		t.Fatalf("WriteFile a.txt: %v", err)
+	}
+
+	// a.txt 应能重读（已清）。
+	resA, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
+	if err != nil || !resA.Success {
+		t.Fatalf("read a.txt after WriteFile should succeed: err=%v success=%v", err, resA.Success)
+	}
+
+	// b.txt 仍应被拦截（未清）。
+	resB, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "b.txt"})
+	if resB.Success {
+		t.Fatal("b.txt should still be blocked by dedup guard (WriteFile touched a.txt only)")
 	}
 }
 
@@ -162,5 +284,187 @@ func TestSchemaIncludesCallSubAgent(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("call_sub_agent not found in schema after Register")
+	}
+}
+
+// fakeSharedMemoryStore 是测试用 SharedMemoryStore 实现，内存版，无持久化。
+type fakeSharedMemoryStore struct {
+	items map[string]string
+}
+
+func newFakeSharedMemoryStore() *fakeSharedMemoryStore {
+	return &fakeSharedMemoryStore{items: make(map[string]string)}
+}
+
+func (s *fakeSharedMemoryStore) Set(ctx context.Context, key, value string) error {
+	s.items[key] = value
+	return nil
+}
+
+func (s *fakeSharedMemoryStore) Get(ctx context.Context, key string) (string, error) {
+	return s.items[key], nil
+}
+
+func (s *fakeSharedMemoryStore) Delete(ctx context.Context, key string) error {
+	delete(s.items, key)
+	return nil
+}
+
+func (s *fakeSharedMemoryStore) Keys(ctx context.Context) []string {
+	keys := make([]string, 0, len(s.items))
+	for k := range s.items {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// TestWriteSharedMemory_StructuredAndFileTracking 验证 Layer 1：WriteSharedMemory
+// 入参 files 被结构化存为 SharedEntry JSON，含 mtime 戳。files 缺省时退化为旧格式兼容。
+func TestWriteSharedMemory_StructuredAndFileTracking(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "foo.go")
+	if err := os.WriteFile(target, []byte("package foo"), 0644); err != nil {
+		t.Fatalf("write foo.go: %v", err)
+	}
+
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	// 带 files 调用：KV value 应为 JSON，含 foo.go 的 mtime。
+	res, err := r.Dispatch(ctx, "WriteSharedMemory", map[string]any{
+		"content": "foo.go defines package foo",
+		"files":   []any{target},
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("expected success, got: %s", res.Error)
+	}
+
+	val, _ := store.Get(ctx, "meta-1:shared")
+	if val == "" {
+		t.Fatal("expected KV entry after WriteSharedMemory")
+	}
+	var entry SharedEntry
+	if err := json.Unmarshal([]byte(val), &entry); err != nil {
+		t.Fatalf("KV value not JSON: %v (val=%q)", err, val)
+	}
+	if entry.Content != "foo.go defines package foo" {
+		t.Fatalf("unexpected content: %q", entry.Content)
+	}
+	if len(entry.Files) != 1 {
+		t.Fatalf("expected 1 tracked file, got %d", len(entry.Files))
+	}
+	if _, ok := entry.Files[target]; !ok {
+		t.Fatalf("expected %s in Files map, got %v", target, entry.Files)
+	}
+
+	// files 缺省调用：仍写 KV，Files 为空 map。
+	res2, err := r.Dispatch(ctx, "WriteSharedMemory", map[string]any{
+		"content": "no files summary",
+	})
+	if err != nil {
+		t.Fatalf("dispatch2: %v", err)
+	}
+	if !res2.Success {
+		t.Fatalf("expected success2, got: %s", res2.Error)
+	}
+	val2, _ := store.Get(ctx, "meta-1:shared")
+	var entry2 SharedEntry
+	if err := json.Unmarshal([]byte(val2), &entry2); err != nil {
+		t.Fatalf("KV value2 not JSON: %v", err)
+	}
+	if entry2.Content != "no files summary" {
+		t.Fatalf("unexpected content2: %q", entry2.Content)
+	}
+	if len(entry2.Files) != 0 {
+		t.Fatalf("expected 0 tracked files, got %d", len(entry2.Files))
+	}
+}
+
+// TestWriteFile_InvalidatesSharedMemory 验证 Layer 2：WriteFile 成功后，
+// 引用同 path 的 KV entry 被删除，防止子 Agent 读到旧摘要。
+func TestWriteFile_InvalidatesSharedMemory(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "bar.go")
+	if err := os.WriteFile(target, []byte("package bar"), 0644); err != nil {
+		t.Fatalf("write bar.go: %v", err)
+	}
+
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	// 写共享记忆，引用 bar.go。
+	_, err := r.Dispatch(ctx, "WriteSharedMemory", map[string]any{
+		"content": "bar.go defines package bar",
+		"files":   []any{target},
+	})
+	if err != nil {
+		t.Fatalf("WriteSharedMemory: %v", err)
+	}
+	if _, ok := store.items["meta-1:shared"]; !ok {
+		t.Fatal("expected KV entry before WriteFile")
+	}
+
+	// WriteFile 修改 bar.go，触发失效 hook。
+	wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{
+		"path":    target,
+		"content": "package bar // modified",
+	})
+	if err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if !wres.Success {
+		t.Fatalf("WriteFile failed: %s", wres.Error)
+	}
+
+	// KV entry 应被删除。
+	if _, ok := store.items["meta-1:shared"]; ok {
+		t.Fatal("expected KV entry deleted after WriteFile invalidated it")
+	}
+}
+
+// TestWriteFile_DoesNotInvalidateUnrelatedEntry 验证 Layer 2 精确性：
+// WriteFile 只删引用同 path 的 entry，不误删引用其他 path 的 entry。
+func TestWriteFile_DoesNotInvalidateUnrelatedEntry(t *testing.T) {
+	dir := t.TempDir()
+	foo := filepath.Join(dir, "foo.go")
+	bar := filepath.Join(dir, "bar.go")
+	if err := os.WriteFile(foo, []byte("foo"), 0644); err != nil {
+		t.Fatalf("write foo: %v", err)
+	}
+	if err := os.WriteFile(bar, []byte("bar"), 0644); err != nil {
+		t.Fatalf("write bar: %v", err)
+	}
+
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	// 写共享记忆只引用 foo.go。
+	_, _ = r.Dispatch(ctx, "WriteSharedMemory", map[string]any{
+		"content": "foo summary",
+		"files":   []any{foo},
+	})
+
+	// WriteFile 修改 bar.go：foo 引用的 entry 不应被删。
+	wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{
+		"path":    bar,
+		"content": "bar modified",
+	})
+	if err != nil || !wres.Success {
+		t.Fatalf("WriteFile bar: err=%v res=%+v", err, wres)
+	}
+	if _, ok := store.items["meta-1:shared"]; !ok {
+		t.Fatal("KV entry should NOT be deleted: WriteFile touched bar.go, entry references foo.go only")
 	}
 }

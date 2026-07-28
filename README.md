@@ -20,9 +20,14 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 
 - **单一 ReAct 主循环**：MetaAgent 跑 LLM → 工具 → 结果循环（默认上限 50 轮），直到输出纯文本回答
 - **层级即调用栈**：`call_sub_agent(role_id, task)` 起 goroutine 跑子 Agent，子 Agent 完成后把摘要推 Mailbox，父 Agent 每轮 LLM 前 Drain 邮箱注入上下文——任意深度递归，无图状态机
-- **11 个内置工具**：文件/命令（ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles）、HTTP（HTTPGet/HTTPPost）、Git（GitDiff/GitStatus/GitLog/GitBlame），统一经沙箱守卫
+- **历史压缩**：每 `summarize_every` 步（默认 5）`summarizeWindow` 把中段历史压成"系统前缀 + 用户目标 + 摘要 + 最近 K 条"，防 token 爆炸与注意力衰减
+- **共享记忆**：`WriteSharedMemory` 工具让主 Agent 把关键上下文（文件路径/行号/函数签名/验收标准）写入 `sharedKV`，子 Agent 自动读取，避免重读全文件；`task` 入参 2000 runes 上限强制规格走共享记忆
+- **验证闭环编排器**：`verifyloop` 原生驱动"产出 -> 自测 -> 修正 -> 上级统一测试"状态机，`Verifier`/`Fixer`/`Reporter` 三接口解耦，`PlanConfirmVerifier` 支持"测试方向不明确 -> 列方案 -> 产出方确认 -> 符合才自测"前置
+- **角色工具白名单**：`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集；MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet` 防越位，DomainAgent 开放完整权限承担上下文采集 + 任务拆分 + 派发执行
+- **14 个内置工具**：文件/命令（ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles）、HTTP（HTTPGet/HTTPPost）、Git（GitDiff/GitStatus/GitLog/GitBlame）、共享内存（WriteSharedMemory）、Agent 通信（call_sub_agent/send_message），统一经沙箱守卫
 - **两段事件流记忆**：`Write` 追加事件（tool_call / call_sub_agent / sub_agent_summary / answer），`Assemble` 在 LLM 调用前注入最近 N 条作为上下文；无压缩、无 RAG
 - **会话持久化，默认全新启动**：会话历史（goal/summary/工具结果）与事件流写入 PostgreSQL；每次启动默认是全新会话列表，`agent.restore_sessions: true` 时才恢复最近 50 个会话到内存
+- **LLM 调用全链路日志**：`sessionLogger` 把每次 LLM I/O 写 `session_logs` 表，`QueryKindLogs` 按会话回看完整调用链；`LiveEventTokenUsage` 实时推送 token 用量；DeepSeek V4 缓存模式与 `reasoning_content` 字段适配
 - **结构化日志**：所有 Agent 关键事件写 `session_logs` 表并按 session/agent/level 可查；各组件注入 `*logger.Logger`，错误类日志真实输出 `[ERRO]`；文件日志按天分割（`logs/backend/`、`logs/tui/`）
 - **严格启动**：config/roles/env/soul/skills 任一配置文件缺失，或 PG/Redis/LLM 后端不可达，启动即失败并明确报错
 - **双入口 + 可观测**：HTTP Web UI（Vue 3 SPA）+ bubbletea TUI；SSE 实时推送事件；`/api/metrics` 输出 Prometheus 格式指标
@@ -134,29 +139,33 @@ flags：`-config config/config.yaml -roles config/roles.yaml -env .env -soul con
 
 ### 1. ReAct 主循环（`internal/agent/react_agent.go`）
 
-`ReActAgent.RunWithHistory()`：prepend system prompt → `model.Generate`（带工具 schema）→ 有 `ToolPart` 则经 `ToolRegistry.Dispatch` 执行并回灌结果 → 直到纯文本回答或达到上限（默认 50 轮）。每轮 LLM 前 Drain Mailbox，把子 Agent 摘要注入历史并写入记忆事件。
+`ReActAgent.RunWithHistory()`：prepend system prompt → `model.Generate`（带工具 schema）→ 有 `ToolPart` 则经 `ToolRegistry.Dispatch` 执行并回灌结果 → 直到纯文本回答或达到上限（默认 50 轮）。每轮 LLM 前 Drain Mailbox，把子 Agent 摘要注入历史并写入记忆事件。 每 `summarize_every` 步（默认 5）`summarizeWindow` 压缩中段历史防 token 爆炸。`sessionLogger` 写 LLM I/O 到 `session_logs`，`QueryKindLogs` 按会话回看。
 
 ### 2. 异步子 Agent 分发（`internal/domain/subagent/dispatcher.go`）
 
-`call_sub_agent` 工具起 goroutine 跑子 ReActAgent，立即返回 `sub_agent_id`；子 Agent 完成后摘要推 Mailbox。角色权限由 `roles.yaml` 的 `can_be_called` / `parents` 控制。
+`call_sub_agent` 工具起 goroutine 跑子 ReActAgent，立即返回 `sub_agent_id`；子 Agent 完成后摘要推 Mailbox。角色权限由 `roles.yaml` 的 `can_be_called` / `parents` 控制；`domain` 字段定制 DomainAgent 展示名；`task` 入参 2000 runes 上限强制规格走 `WriteSharedMemory`。`WithKVMemory` 注入共享 KV 只读视图，`injectKVMemory` 自动读取主 Agent 写入的关键上下文。父会话终结保护：有未决子 Agent 时阻塞等待，防迟到 mailbox 消息丢失。
 
 ### 3. 工具域（`internal/domain/tool/`）
 
-`Registry.Schema()` 为每个工具生成 JSON schema，`Registry.Dispatch` 按名执行；`executor.go` + `sandbox.go` + `guards.go` 提供路径逃逸检测与命令黑名单。`ReactService.SetModelProvider` 支持注入 mock provider 跑测试。
+`Registry.Schema()` 为每个工具生成 JSON schema，`Registry.Dispatch` 按名执行；`executor.go` + `sandbox.go` + `guards.go` 提供路径逃逸检测与命令黑名单。`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集（MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet`，DomainAgent 开放完整权限）。`WriteSharedMemory` 工具写 `sharedKV`，仅 MetaAgent 白名单可用。`ReactService.SetModelProvider` 支持注入 mock provider 跑测试。
 
 ### 4. 记忆（`internal/domain/memory/`）
 
-两段事件流：`Write` 追加 `MemoryEvent`，`Assemble` 注入最近 N 条。默认 `InMemoryStore`（进程内存），Postgres 事件持久化是开放项（`doc/TODO.md` #3）。遗留 `internal/memory/write.go` 仅负责 Episode 持久化，不在 ReAct 热路径上。
+两段事件流：`Write` 追加 `MemoryEvent`，`Assemble` 注入最近 N 条。默认 `InMemoryStore`（进程内存），Postgres 事件持久化是开放项（`doc/TODO.md` #3）。`InMemoryKV` 提供共享 KV 记忆（主 Agent 写、子 Agent 读）。`WithMaxEventsPerAgent` 防事件流无限增长。遗留 `internal/memory/write.go` 仅负责 Episode 持久化，不在 ReAct 热路径上。
+
+### 5. 验证闭环编排器（`internal/domain/verifyloop/`，默认关闭）
+
+原生状态机驱动"产出 -> 自测 -> 修正 -> 上级统一测试"，不依赖主 Agent 提示词。三接口解耦：`Verifier`（SelfTest/UnifiedTest 返回结构化 `Verdict`）+ `Fixer`（修正产出）+ `Reporter`（上报结果）。`PlanConfirmVerifier` 可选接口实现"测试方向不明确 -> 列方案 -> 产出方确认 -> 符合才自测"前置。`maxRounds` 防死循环。bootstrap 按 `verification_role_pairs` 注册 `OnSubAgentDone` 钩子，`assistant_self_test_enabled` / `domain_self_test_enabled` 控制开关。`ComputerUseVerifier`/`CLIVerifier`/`MCPVerifier` 留扩展口子。
 
 ### 5. 日志（`internal/logger/` + `internal/logging/`）
 
-zerolog 实现，console/json 两种格式；error 级别可附调用栈（`logging.stack_enabled`）。`BatchingLogStore` 批量写 `session_logs` 表。各组件通过 `SetLogger` 注入；`store` 包因循环导入约束使用窄接口 `store.Logger`。入口把标准库 `log` 输出兜底转发到统一格式。
+zerolog 实现，console/json 两种格式；error 级别可附调用栈（`logging.stack_enabled`）。`BatchingLogStore` 批量写 `session_logs` 表。各组件通过 `SetLogger` 注入；`store` 包因循环导入约束使用窄接口 `store.Logger`。入口把标准库 `log` 输出兜底转发到统一格式。`sessionLogger` 把每次 LLM 调用 I/O 写 `session_logs`，`LiveEventTokenUsage` 实时推送 token 用量。
 
 ### 6. 运行时聚合（`internal/runtime/runtime.go`）
 
-单一 `Runtime` 持有 Boards / Mailbox / Skills / Soul / Watchdog / CmdQueue。当前接线现状：**Mailbox 是活的**（子 Agent 摘要回灌主循环）；Board → TUI 面板与 board API；Skill 池 → `/api/skills` 查询（prompt 装配未接入 ReAct）；Soul → 加载并经 API 暴露（未注入 prompt）；Watchdog → 阈值经 Query API 暴露（未在主循环执行）；CmdQueue → enqueue/interrupt 端点。见 `doc/TODO.md`。
+单一 `Runtime` 持有 Boards / Mailbox / Skills / Soul / Watchdog / CmdQueue。当前接线现状：**Mailbox 是活的**（子 Agent 摘要回灌主循环）；Board → TUI 面板与 board API；Skill 池 → `/api/skills` 查询（prompt 装配未接入 ReAct）；Soul → 加载并经 API 暴露（未注入 prompt）；Watchdog → 阈值经 Query API 暴露（未在主循环执行，历史压缩在 ReAct 层部分缓解）；CmdQueue → enqueue/interrupt 端点。见 `doc/TODO.md`。
 
-### 7. DAG 调度（`internal/dag/`，默认关闭）
+### 8. DAG 调度（`internal/dag/`，默认关闭）
 
 `agent.dag_enabled: true` 后，调度器按简易 cron（`Ns`/`Nm`/`Nh`）轮询 `dag_jobs` 表，按 `depends_on` 依赖把 task 派发为新会话。HTTP 端点：`GET/POST /api/dag`、`GET/DELETE /api/dag/{id}`、`POST /api/dag/{id}/trigger`、`GET /api/dag/running`。
 
@@ -187,7 +196,9 @@ zerolog 实现，console/json 两种格式；error 级别可附调用栈（`logg
 
 ## 扩展方向
 
-近期开放项见 `doc/TODO.md`（ReAct 端到端测试重写、TUI Agent 树运行时构建、记忆事件 Postgres 持久化、Watchdog 事件流截断、配置清理、v3 文档漂移清理）。远期"Agent 工作流平台"愿景（工作流编排 / 测试自动化 / 研究 / 团队协作）见 `doc/扩展设计_Agent工作流平台.md`。
+近期开放项见 `doc/TODO.md`（e2e mock LLM 连通性校验回归排查、`assembly` 包清理或重新接线、`ComputerUseVerifier`/`CLIVerifier`/`MCPVerifier` 实现、watchdog 与 ReAct 历史压缩联动、记忆事件 Postgres 持久化、TUI Agent 树运行时构建、配置清理、v3 文档漂移清理、指标埋点）。远期"Agent 工作流平台"愿景（工作流编排 / 测试自动化 / 研究 / 团队协作）见 `doc/扩展设计_Agent工作流平台.md`。
+
+阶段 0-9 已完成：测试基线修复 -> 块记忆闭环 -> 协作验证闭环 -> verifyloop 原生编排器 -> 评估产出 -> KVMemory 共享记忆 -> assembly 任务拆解抽象（未接线）-> ReAct 历史压缩 + LLM 调用日志 + 代理展示名 + 共享内存工具 + 角色工具白名单 + DeepSeek V4 适配。详见 `doc/TODO.md` "已完成"段。
 
 ---
 

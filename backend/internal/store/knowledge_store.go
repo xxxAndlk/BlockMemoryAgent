@@ -161,16 +161,18 @@ func (s *KnowledgeStore) SearchBlockMemory(ctx context.Context, domain, goal str
 	return s.SearchByTypeAndDomain(ctx, enums.KnowledgeTypeBlockMemory, domain, emb, topK)
 }
 
-// SearchBlockMemoryByGoal 不按 domain 过滤、仅按目标文本做语义匹配检索块记忆。
-// 适用于当前架构中没有显式 domain 概念的场景（如按拆分出的子任务文本召回），
-// 避免 meta->>'domain' 精确过滤导致召回恒为空。
+// SearchBlockMemoryByGoal 按 sessionID 过滤后做语义匹配检索块记忆。
+// sessionID 非空时仅召回该 session 写入的记录，避免跨 session 污染
+// （实证：旧 session 的"重写全部 JS"任务文本被召回，污染新 session 任务上下文）。
+// sessionID 为空时退化为全局检索（向后兼容旧调用与测试）。
 // 参数:
-//   - ctx:  请求上下文。
-//   - goal: 目标文本，用于生成查询向量。
-//   - topK: 返回上限。
+//   - ctx:       请求上下文。
+//   - sessionID: 会话 ID；空串表示不过滤。
+//   - goal:      目标文本，用于生成查询向量。
+//   - topK:      返回上限。
 //
 // 返回: 知识记录切片与错误。
-func (s *KnowledgeStore) SearchBlockMemoryByGoal(ctx context.Context, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+func (s *KnowledgeStore) SearchBlockMemoryByGoal(ctx context.Context, sessionID, goal string, topK int) ([]*types.KnowledgeRecord, error) {
 	if topK <= 0 {
 		topK = 5
 	}
@@ -179,8 +181,34 @@ func (s *KnowledgeStore) SearchBlockMemoryByGoal(ctx context.Context, goal strin
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
-	// 仅按 knowledge_type 过滤做向量检索，不做 domain 精确过滤
+	// sessionID 非空：按 session_id 精确过滤后做向量检索。
+	if sessionID != "" {
+		return s.SearchByTypeAndSession(ctx, enums.KnowledgeTypeBlockMemory, sessionID, emb, topK)
+	}
+	// 仅按 knowledge_type 过滤做向量检索，不做 domain/session 过滤
 	return s.SearchByType(ctx, enums.KnowledgeTypeBlockMemory, emb, topK)
+}
+
+// SearchByTypeAndSession 按 knowledge_type + session_id 过滤的向量相似搜索。
+// 供 block-memory 召回侧按 session 隔离使用，避免跨 session 污染。
+func (s *KnowledgeStore) SearchByTypeAndSession(ctx context.Context, knowledgeType enums.KnowledgeType, sessionID string, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE archived = false AND knowledge_type = $1 AND meta->>'session_id' = $2
+			ORDER BY embedding <=> $3
+			LIMIT $4
+		`, knowledgeType, sessionID, pgVector(embedding), topK)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return s.scanKnowledgeRows(ctx, rows)
 }
 
 // SearchByType 按 knowledge_type 过滤的向量相似搜索（特性3使用）。

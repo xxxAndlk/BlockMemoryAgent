@@ -3,10 +3,11 @@ package subagent
 // 导入所需标准库与项目内部包。
 import (
 	"context"       // context 用于控制子 Agent 的生命周期与超时
-	"encoding/json" // encoding/json 用于序列化 tool.Result
+	"encoding/json" // encoding/json 解析 SharedEntry 做 stat 校验
 	"errors"        // errors 提供哨兵错误 errLimitReached 与 errors.Is 判定
 	"fmt"           // fmt 用于格式化子 Agent ID 与错误信息
 	"log"           // log 用于记录块记忆写入失败等不影响主流程的错误
+	"os"            // os 用于 stat 文件 mtime 校验（Layer 3 缓存一致性）
 	"strings"       // strings 用于从 Agent ID 中提取角色 ID
 	"sync"          // sync 提供 sync.Map 存储运行中的子 Agent
 	"sync/atomic"   // sync/atomic 提供原子递增序列号
@@ -34,6 +35,9 @@ type callSubAgentInput struct {
 	RoleID string `json:"role_id"` // RoleID 被调用子 Agent 的角色标识。
 	Task   string `json:"task"`    // Task 交给子 Agent 执行的具体任务描述。
 	Domain string `json:"domain"`  // Domain 领域分类简称（金融/认证/UI 等），仅 role_id="domain" 时有效。
+	// Responsibility 职责边界描述（仅 role_id="domain" 时有效），注入子 Agent 系统提示词，
+	// 防止长 ReAct 循环中 task 被历史压缩后领域身份丢失。
+	Responsibility string `json:"responsibility"`
 }
 
 // ModelProviderFactory 是 model.ModelFactory 的子集，
@@ -47,7 +51,9 @@ type ModelProviderFactory interface {
 // 由 store.PostgresStore 实现；为 nil 时跳过召回，不影响子 Agent 派发。
 type BlockMemorySearcher interface {
 	// SearchBlockMemoryByGoal 按目标文本做向量语义匹配，返回最相关的 topK 条块记忆。
-	SearchBlockMemoryByGoal(ctx context.Context, goal string, topK int) ([]*types.KnowledgeRecord, error)
+	// sessionID 非空时仅召回该 session 写入的记录，避免跨 session 污染（实证：旧 session
+	// 的"重写全部 JS"任务文本被召回，污染新 session 的 HTML+CSS 任务上下文）。
+	SearchBlockMemoryByGoal(ctx context.Context, sessionID, goal string, topK int) ([]*types.KnowledgeRecord, error)
 }
 
 // blockMemoryRecallTopK 是派发子 Agent 时召回块记忆的条数上限。
@@ -85,9 +91,9 @@ type Dispatcher struct {
 	// 应等待其完成再终结，防止迟到 mailbox 消息丢失（参见 agent.ReActAgent 的终结保护分支）。
 	pending sync.Map
 
-	// roundCounts 跟踪每个 (callerRole -> calleeRole) 派发对的累计次数，用于验证闭环往返上限。
-	// 键为 "callerRoleID->calleeRoleID"，值为 *atomic.Int64。
-	roundCounts sync.Map
+	// sessionCounts 跟踪每个 session 的累计派发总数（所有角色合计），用于全局派发限额。
+	// 键为 sessionID（parentID 首段），值为 *atomic.Int64。用户发送新消息时重置。
+	sessionCounts sync.Map
 
 	// onSubAgentDone 是子 Agent 异步成功完成时的钩子，供 verifyloop 编排器接管自测流程。
 	// 为 nil 时关闭钩子；仅在 call_sub_agent 异步路径触发，ExecuteChild 同步路径不触发。
@@ -98,9 +104,9 @@ type Dispatcher struct {
 	// 为 nil 时关闭共享记忆注入，不影响派发主流程。写入由主线程 Agent 直接持可写 KVMemory 完成。
 	kvMemory KVMemoryReader
 
-	// verificationMaxRounds 验证闭环往返上限：同一父 Agent 派发同一角色的次数超过该值时
-	// 拒绝进一步派发，防止 code<->test 平级互问死循环。<=0 表示不限制。
-	verificationMaxRounds int
+	// maxTotalDispatches 全局派发总数上限：同一 session 内所有角色的派发合计超过该值时
+	// 拒绝进一步派发，防止编排失控。<=0 表示不限制。计数随用户新消息重置。
+	maxTotalDispatches int
 
 	// timeout 是子 Agent 独立执行的最大时长；<=0 表示不限制。默认 30 分钟。
 	timeout time.Duration
@@ -239,11 +245,20 @@ func (d *Dispatcher) WithBlockMemorySearcher(s BlockMemorySearcher) *Dispatcher 
 	return d
 }
 
-// WithVerificationMaxRounds 注入验证闭环往返上限，防止 code<->test 等平级角色
-// 互相派发死循环。n<=0 表示不限制。
-func (d *Dispatcher) WithVerificationMaxRounds(n int) *Dispatcher {
-	d.verificationMaxRounds = n
+// WithMaxTotalDispatches 注入全局派发总数上限：同一 session 内所有角色派发合计
+// 超过 n 时拒绝。n<=0 表示不限制。计数在用户发送新消息时经 ResetDispatchCounts 重置。
+func (d *Dispatcher) WithMaxTotalDispatches(n int) *Dispatcher {
+	d.maxTotalDispatches = n
 	return d
+}
+
+// ResetDispatchCounts 清空指定 session 的派发计数。
+// 新用户消息 = 新任务起点：上一任务的限额消耗不应卡死下一任务。
+func (d *Dispatcher) ResetDispatchCounts(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	d.sessionCounts.Delete(sessionID)
 }
 
 // WithLogger 注入会话级日志器，使子 Agent 的 LLM I/O 写入 session_logs。
@@ -379,13 +394,16 @@ func (t *callSubAgentTool) Description() string {
 	}
 	return "将子任务派发给指定角色的子 Agent 异步执行。调用立即返回 sub_agent_id；" +
 		"子 Agent 完成后，其结果摘要会以 [mailbox from <sub_agent_id>] 消息送达，请在后续轮次中阅读并整合。\n" +
-		"task 必须自包含：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。\n\n" +
+		"task 必须自包含 <= 500 字：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。" +
+		"规格原文走 WriteSharedMemory，不塞进 task。\n\n" +
 		"【路由规则】\n" +
 		"1. 默认走 domain：多文件/多函数/多步骤/不确定范围 -> role_id=\"domain\"，由 DomainAgent 拆分后再派助手。\n" +
 		"2. 直派固定助手：仅当任务已单函数级、单文件、领域明确（如\"修改 X 函数签名\"、\"补一个测试\"）时直派对应助手。\n" +
 		"3. 不确定走哪条？走 domain。domain 可自执行单点改动，不会无谓下拆。\n\n" +
 		"【domain 字段】role_id=\"domain\" 时填领域分类简称（如 金融/认证/UI/数据库/配置），" +
-		"用于子 Agent 展示名（\"金融领域Agent\"）。固定助手忽略此字段，用其角色名。\n\n" +
+		"用于子 Agent 展示名（\"金融领域Agent\"）。固定助手忽略此字段，用其角色名。\n" +
+		"【responsibility 字段】role_id=\"domain\" 时必填：该领域 Agent 的职责边界（<= 200 字），" +
+		"写明负责哪些文件/模块、不碰哪些。会注入子 Agent 系统提示词，长跑不丢。\n\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
@@ -400,18 +418,28 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	task, _ := args["task"].(string)
 	// domain 可选：仅 role_id="domain" 时用于子 Agent 展示名（如"金融领域Agent"）。
 	domain, _ := args["domain"].(string)
+	// responsibility 可选：仅 role_id="domain" 时注入子 Agent 系统提示词，钉住职责边界。
+	responsibility, _ := args["responsibility"].(string)
 
 	// 校验必要参数：role_id 与 task 均不能为空。
 	if roleID == "" || task == "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: "role_id and task are required"}
 	}
 
+	// role_id="domain" 时 responsibility 必填：dispatcher 把它注入子 Agent 系统提示词头部，
+	// 防止长 ReAct 循环中 task 被历史压缩后领域身份丢失（实证：领域 Agent 越界实现他域文件）。
+	// LLM 经常省略该字段，导致 DomainAgent 拿到的是通用 prompt 无职责边界——此处硬拒绝强制回填。
+	if roleID == "domain" && strings.TrimSpace(responsibility) == "" {
+		return &tool.Result{Tool: "call_sub_agent", Error: "responsibility is required when role_id=domain: 填该领域 Agent 的职责边界（<=200 字，负责哪些文件/模块、不碰哪些），会注入子 Agent 系统提示词"}
+	}
+
 	// task 长度上限：强制 MetaAgent 把规格写入 WriteSharedMemory，task 只写目标+验收标准。
-	// 2000 runes ≈ 4-6k chars，足够描述单领域目标；超了拒绝并提示。
-	const maxTaskRunes = 2000
+	// 500 runes ≈ 500 汉字 / 1.5k 英文 chars，足够描述单领域目标+验收；
+	// 实证 MetaAgent 倾向把规格塞进 task（事故日志：3521/2315 runes），500 字硬卡逼走共享记忆。
+	const maxTaskRunes = 500
 	if n := utf8.RuneCountInString(task); n > maxTaskRunes {
 		return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf(
-			"task too long: %d runes (max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准",
+			"task too long: %d runes (max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（500 字内）",
 			n, maxTaskRunes)}
 	}
 
@@ -432,16 +460,17 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf("role %s cannot be called by %s", roleID, parentID)}
 	}
 
-	// 验证闭环往返上限：同一父 Agent 对同一角色的派发次数超过 verificationMaxRounds 时拒绝，
-	// 防止 code<->test 平级互问死循环。<=0 表示不限制。
-	callerRole := roleIDFromAgentID(parentID)
-	if d.verificationMaxRounds > 0 {
-		key := callerRole + "->" + roleID
-		v, _ := d.roundCounts.LoadOrStore(key, new(atomic.Int64))
+	// 全局派发总数限额：同一 session 内所有角色的派发合计超过 maxTotalDispatches 时拒绝。
+	// 早期实现按 (callerRole->calleeRole) 对计数，实为"每角色最多 N 次"，多文件编排任务
+	// 中途即被卡死（实证：meta->code_assistant 5 次烧光后剩余文件无法派发）。
+	// 改为 session 级总数，用户发送新消息时重置（ReactService.AddUserMessage）。
+	if d.maxTotalDispatches > 0 {
+		sessionID := sessionIDFromAgentID(parentID)
+		v, _ := d.sessionCounts.LoadOrStore(sessionID, new(atomic.Int64))
 		count := v.(*atomic.Int64)
-		if count.Add(1) > int64(d.verificationMaxRounds) {
+		if count.Add(1) > int64(d.maxTotalDispatches) {
 			count.Add(-1)
-			return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf("verification round limit reached for %s -> %s (max %d)", callerRole, roleID, d.verificationMaxRounds)}
+			return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf("dispatch total limit reached for session %s (max %d). 派发总数已耗尽，请直接整合已有结果答复用户", sessionID, d.maxTotalDispatches)}
 		}
 	}
 
@@ -473,7 +502,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		// 无论 runSubAgent 以何种方式结束，都递减父 Agent 的未决计数并发出完成信号，
 		// 唤醒可能在 WaitForAnyChild 中等待的父 Agent。
 		defer d.trackChildDone(parentID)
-		d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, started)
+		d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, started)
 	}()
 
 	// 返回成功结果，Output 为子 Agent ID，父 Agent 可用该 ID 查询或接收后续通知。
@@ -489,8 +518,9 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 // 这是 call_sub_agent 工具的异步执行路径：runSubAgentOnce 纯执行 + notify + 钩子。
 // started 为派发起始时间，用于计算耗时并写入完成/失败日志。
 // domain 为领域分类简称（仅 role_id="domain" 时有效，用于子 Agent 展示名）。
-func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain string, started time.Time) {
-	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain)
+// responsibility 为职责边界描述，注入 DomainAgent 系统提示词。
+func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string, started time.Time) {
+	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
 	duration := time.Since(started)
 	if err != nil {
 		partial := ""
@@ -520,7 +550,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 // 错误语义：
 //   - 获取 provider 失败、Run 返回 error、LimitReached 均返回非 nil err；
 //   - 成功时 err == nil，result.Text 为最终答复。
-func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain string) (*agent.ReActAgent, agent.ReactResult, error) {
+func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string) (*agent.ReActAgent, agent.ReactResult, error) {
 	provider, err := d.models.GetBladesProvider(ctx, roleDef.ID)
 	if err != nil {
 		return nil, agent.ReactResult{}, fmt.Errorf("get model: %w", err)
@@ -548,11 +578,26 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 				roleDef.Name = "领域Agent:" + hint
 			}
 		}
+		// 职责槽注入：responsibility 非空时在通用领域 prompt 前加身份头。
+		// task 文本在长 ReAct 循环中会被历史压缩摘要掉，system prompt 不会，
+		// 领域身份钉在系统提示词里防止跑偏（实证：领域 Agent 越界实现他域文件）。
+		if resp := strings.TrimSpace(responsibility); resp != "" {
+			domainLabel := strings.TrimSpace(domain)
+			if domainLabel == "" {
+				domainLabel = "综合"
+			}
+			header := fmt.Sprintf("你是负责【%s】领域的 DomainAgent。\n你的职责：%s\n"+
+				"只实现/改写职责内的文件与模块；职责外的文件禁止创建或修改，"+
+				"需要的跨领域数据从共享记忆契约或 ReadFile 读取。",
+				textutil.TruncateRunes(domainLabel, 16, "…"), textutil.TruncateRunes(resp, 200, "…"))
+			roleDef.SystemPrompt = header + "\n\n" + roleDef.SystemPrompt
+		}
 	}
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
-		WithLoopConfig(d.loopCfg)
+		WithLoopConfig(d.loopCfg).
+		WithWorkDir(d.subAgentWorkDir())
 
 	// 注入会话级日志器：派生 session-scoped logger，使子 Agent LLM I/O 写入同一会话的 session_logs。
 	// sessionID 从 ctx 取（call_sub_agent 异步路径已 WithSessionID），agentName 用 roleDef.Name（DomainAgent 已按任务首行覆写）。
@@ -577,20 +622,36 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 
 	// 保留原始任务文本，供块记忆沉淀时作为 goal 标签使用（避免混入召回前缀）。
 	origTask := task
-	// KV 共享记忆注入：按 parentID 派生键读取主 Agent 写入的关键记忆，拼到任务前。
-	// 使被询问协程 Agent 能看到主 Agent 的上下文，对应"协程 Agent 共享主 Agent 记忆"语义。
-	kvBefore := task
-	task = d.injectKVMemory(ctx, parentID, task)
-	if task != kvBefore {
-		val, _ := d.kvMemory.Get(ctx, parentID+":shared")
-		log.Printf("[subagent] inject kv-memory: sub=%s role=%s parent=%s val_len=%d val=%q",
-			subAgentID, roleDef.ID, parentID, len(val), truncateRunes(strings.TrimSpace(val), 300))
+	// 上下文前缀注入：KV 共享记忆 + 块记忆召回。两段独立前缀统一拼装，避免嵌套
+	// 【当前任务】标记（实证：嵌套后 UI 助手把 KV 内容当作任务主体，空转 16 分钟）。
+	var prefixes []string
+	if kv := d.injectKVMemory(ctx, parentID, ""); kv != "" {
+		prefixes = append(prefixes, kv)
+		// 枚举所有 parentID: 前缀键统计槽位数与总长度，避免只查 :shared 误导
+		// （MetaAgent 用命名槽位 key=xxx 写入时 :shared 为空，但 injectKVMemory 仍能读到命名槽位）。
+		prefix := parentID + ":"
+		slotCount, totalLen, preview := 0, 0, ""
+		for _, k := range d.kvMemory.Keys(ctx) {
+			if !strings.HasPrefix(k, prefix) || k == prefix {
+				continue
+			}
+			val, err := d.kvMemory.Get(ctx, k)
+			if err != nil || strings.TrimSpace(val) == "" {
+				continue
+			}
+			slotCount++
+			totalLen += len(val)
+			if len(val) > len(preview) {
+				preview = val
+			}
+		}
+		log.Printf("[subagent] inject kv-memory: sub=%s role=%s parent=%s slots=%d total_len=%d preview=%q",
+			subAgentID, roleDef.ID, parentID, slotCount, totalLen, truncateRunes(strings.TrimSpace(preview), 300))
 	}
-	// 块记忆召回注入：以子任务文本做语义检索，命中则拼到任务前。
-	bmBefore := task
-	task = d.injectRecalledMemory(ctx, task)
-	if task != bmBefore {
-		recs, _ := d.searcher.SearchBlockMemoryByGoal(ctx, origTask, blockMemoryRecallTopK)
+	if bm := d.injectRecalledMemory(ctx, ""); bm != "" {
+		prefixes = append(prefixes, bm)
+		sid := tool.SessionIDFromContext(ctx)
+		recs, _ := d.searcher.SearchBlockMemoryByGoal(ctx, sid, origTask, blockMemoryRecallTopK)
 		log.Printf("[subagent] inject block-memory: sub=%s role=%s hits=%d task_len=%d",
 			subAgentID, roleDef.ID, len(recs), len(origTask))
 		for i, rec := range recs {
@@ -603,6 +664,17 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			log.Printf("[subagent]   hit[%d] domain=%s goal=%q content=%q",
 				i+1, domain, truncateRunes(fmt.Sprintf("%v", rec.Meta["goal"]), 80), truncateRunes(strings.TrimSpace(rec.Content), 200))
 		}
+	}
+	// 领域标签前缀：与系统提示词职责槽互补（prompt 管长效，前缀管当下），
+	// 让子 Agent 每次读任务时都看到自己的领域归属。
+	if roleDef.ID == "domain" {
+		if label := strings.TrimSpace(domain); label != "" {
+			task = "【你的领域】" + textutil.TruncateRunes(label, 16, "…") + "\n" + task
+		}
+	}
+	// 统一拼装前缀与原任务：单一【当前任务】标记，避免嵌套混淆模型。
+	if len(prefixes) > 0 {
+		task = strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + task
 	}
 
 	result, err := sub.Run(ctx, task)
@@ -660,7 +732,7 @@ func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task st
 	subAgentID := fmt.Sprintf("%s/%s-%d", parentID, roleID, d.seq.Add(1))
 	d.trackChildStart(parentID)
 	defer d.trackChildDone(parentID)
-	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, *roleDef, task, "")
+	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, *roleDef, task, "", "")
 	if err != nil {
 		return result.Text, err
 	}
@@ -684,10 +756,22 @@ func (d *Dispatcher) SetOnSubAgentDone(h SubAgentDoneHandler) {
 type KVMemoryReader interface {
 	// Get 按键读取记忆值，不存在返回空串与 nil error。
 	Get(ctx context.Context, key string) (string, error)
+	// Keys 返回当前内存中所有键的快照，供 injectKVMemory 枚举某父 Agent 的全部命名槽位。
+	// 实现方应保证不持锁调用外部代码，避免死锁。
+	Keys(ctx context.Context) []string
 }
 
 // kvMemoryKeyPrefix 是共享记忆注入任务前缀时的标记，便于子 Agent 区分"共享记忆"与"当前任务"。
 const kvMemoryKeyPrefix = "【共享记忆】\n"
+
+// subAgentWorkDir 返回子 Agent 的工作目录，从工具注册表取，供 ReActAgent 注入系统提示词。
+// 为空时 ReActAgent 回退到进程 cwd。
+func (d *Dispatcher) subAgentWorkDir() string {
+	if d == nil || d.tools == nil {
+		return ""
+	}
+	return d.tools.WorkDir()
+}
 
 // WithKVMemory 注入只读 KV 共享记忆视图，使子 Agent 派发时能读取主 Agent 写入的关键记忆。
 // 传 nil 关闭共享记忆注入（默认）。
@@ -711,14 +795,17 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, go
 	}
 	// goal 为注入召回前缀之前的原始拆分任务文本，截断保留前部即可满足召回匹配所需的语义信息。
 	trimmedGoal := truncateRunes(strings.TrimSpace(goal), blockMemoryGoalMaxRunes)
-	// 内容采用"目标/角色/结果"三段式，同时把 domain 标签写入 Meta，
-	// 与 global_knowledge 表 meta->>'domain' 过滤条件对齐。
+	// 从 ctx 取 sessionID 写入 Meta，召回侧据此过滤跨 session 污染。
+	sid := tool.SessionIDFromContext(ctx)
+	// 内容采用"目标/角色/结果"三段式，同时把 domain/session_id 标签写入 Meta，
+	// 与 global_knowledge 表 meta->>'domain' / meta->>'session_id' 过滤条件对齐。
 	rec := &types.KnowledgeRecord{
 		KnowledgeType: enums.KnowledgeTypeBlockMemory,
 		Content:       fmt.Sprintf("目标:%s\n角色:%s\n结果:%s", trimmedGoal, roleID, truncateRunes(content, blockMemoryResultMaxRunes)),
 		Meta: map[string]any{
 			"goal":         trimmedGoal,
 			"domain":       roleID,
+			"session_id":   sid,
 			"sub_agent_id": subAgentID,
 			"source":       "sub_agent_result",
 		},
@@ -730,12 +817,17 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, go
 }
 
 // injectRecalledMemory 按拆分出的子任务文本召回块记忆，并把命中内容拼到任务前。
-// 未配置检索器、无命中或召回出错时返回原任务，保证派发主流程不受影响。
+// 未配置检索器、无命中或召回出错时返回原 task，保证派发主流程不受影响。
+// sessionID 从 ctx 取：仅召回当前 session 写入的记录，防跨 session 污染。
+//
+// task 为空时返回纯前缀（不含【当前任务】标记），供调用方统一拼装；非空时按旧逻辑
+// 返回完整 "前缀 + 【当前任务】 + task"（向后兼容 TestInjectRecalledMemory）。
 func (d *Dispatcher) injectRecalledMemory(ctx context.Context, task string) string {
 	if d.searcher == nil {
 		return task
 	}
-	recs, err := d.searcher.SearchBlockMemoryByGoal(ctx, task, blockMemoryRecallTopK)
+	sid := tool.SessionIDFromContext(ctx)
+	recs, err := d.searcher.SearchBlockMemoryByGoal(ctx, sid, task, blockMemoryRecallTopK)
 	if err != nil || len(recs) == 0 {
 		return task
 	}
@@ -745,24 +837,107 @@ func (d *Dispatcher) injectRecalledMemory(ctx context.Context, task string) stri
 	for i, rec := range recs {
 		fmt.Fprintf(&sb, "%d. %s\n", i+1, strings.TrimSpace(rec.Content))
 	}
+	// task 非空：旧语义，返回完整拼装；task 为空：仅返回前缀，由调用方统一拼装。
+	if task == "" {
+		return strings.TrimRight(sb.String(), "\n")
+	}
 	sb.WriteString("\n【当前任务】\n")
 	sb.WriteString(task)
 	return sb.String()
 }
 
 // injectKVMemory 按 parentID 派生键读取主 Agent 写入的 KV 共享记忆，拼到任务前。
-// 未配置 kvMemory、键不存在或读取出错时返回原任务，保证派发主流程不受影响。
-// 键格式 "parentID:shared"，主 Agent 在派发前用同键写入关键上下文。
+// 未配置 kvMemory、键不存在或读取出错时返回原 task，保证派发主流程不受影响。
+//
+// 键枚举：父 Agent 可用 WriteSharedMemory 写多个命名槽位（key 参数），存储为 "parentID:<key>"。
+// 默认 key="shared"，即旧 "parentID:shared"。本函数枚举所有 "parentID:" 前缀的键，
+// 按 key 字典序拼装前缀，子 Agent 一次看到全部命名槽位。
+//
+// task 为空时返回纯前缀（不含【当前任务】标记），供调用方统一拼装；非空时按旧逻辑
+// 返回完整 "前缀 + 【当前任务】 + task"（向后兼容 TestInjectKVMemory_*）。
+//
+// 缓存一致性（Layer 3）：value 为 SharedEntry JSON 时，stat 各 path 对比 mtime，
+// 任一不匹配（文件被改过）丢弃该槽位，防子 Agent 读到旧摘要幻觉。
+// 旧格式 value（纯字符串 content）直接用，向后兼容。
 func (d *Dispatcher) injectKVMemory(ctx context.Context, parentID, task string) string {
 	if d.kvMemory == nil {
 		return task
 	}
-	key := parentID + ":shared"
-	val, err := d.kvMemory.Get(ctx, key)
-	if err != nil || strings.TrimSpace(val) == "" {
+	// 枚举所有 parentID: 前缀的键，按字典序稳定拼装。
+	prefix := parentID + ":"
+	var slots []string
+	for _, k := range d.kvMemory.Keys(ctx) {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		// 跳过空槽位名（理论上不会出现，防御性）。
+		if k == prefix {
+			continue
+		}
+		val, err := d.kvMemory.Get(ctx, k)
+		if err != nil || strings.TrimSpace(val) == "" {
+			continue
+		}
+		// 尝试解析为 SharedEntry JSON（Layer 1+ 新格式）。
+		content, ok := decodeSharedEntry(val)
+		if !ok {
+			// 旧格式（纯字符串）：直接用。
+			slots = append(slots, val)
+			continue
+		}
+		// stat 校验各 path mtime（Layer 3）：任一不匹配丢弃该槽位。
+		if !verifyFileMtimes(content.Files) {
+			continue
+		}
+		slots = append(slots, content.Content)
+	}
+	if len(slots) == 0 {
 		return task
 	}
-	return kvMemoryKeyPrefix + val + "\n\n【当前任务】\n" + task
+	return buildKVPrefix(strings.Join(slots, "\n\n---\n\n"), task)
+}
+
+// buildKVPrefix 拼装 KV 前缀。task 非空时附【当前任务】标记，task 为空时仅返回前缀。
+// 拆出独立函数使调用方可在 task="" 时取得纯前缀，统一拼装多段前缀避免嵌套。
+func buildKVPrefix(kvContent, task string) string {
+	if task == "" {
+		return strings.TrimRight(kvMemoryKeyPrefix+kvContent, "\n")
+	}
+	return kvMemoryKeyPrefix + kvContent + "\n\n【当前任务】\n" + task
+}
+
+// decodeSharedEntry 把 KV value 解析为 SharedEntry。
+// 解析失败（旧格式纯字符串）返回 ok=false，调用方按旧格式处理。
+// 隐式依赖 tool.SharedEntry 结构；为避免 subagent 反向依赖 tool 包，这里用本地 mirror 结构解码。
+func decodeSharedEntry(val string) (*sharedEntryMirror, bool) {
+	var e sharedEntryMirror
+	if err := json.Unmarshal([]byte(val), &e); err != nil {
+		return nil, false
+	}
+	return &e, true
+}
+
+// sharedEntryMirror 是 tool.SharedEntry 的本地镜像，避免 subagent 反向 import tool 包。
+// 字段名与 JSON tag 必须与 tool.SharedEntry 保持一致。
+type sharedEntryMirror struct {
+	Files   map[string]int64 `json:"files,omitempty"`
+	Content string           `json:"content"`
+}
+
+// verifyFileMtimes 校验各 path 当前 mtime 与 KV 中记录的是否一致。
+// 任一 path stat 失败或 mtime 不匹配返回 false（视为 stale）。
+// 空 Files 视为通过（无 path 需校验，可能是旧 entry 或纯结论摘要）。
+func verifyFileMtimes(files map[string]int64) bool {
+	for path, stamped := range files {
+		fi, err := os.Stat(path)
+		if err != nil {
+			return false
+		}
+		if fi.ModTime().Unix() != stamped {
+			return false
+		}
+	}
+	return true
 }
 
 // partialSuffix 把部分进度文本拼接到通知末尾；为空时返回空串。
@@ -818,6 +993,15 @@ func roleIDFromAgentID(agentID string) string {
 	// 顶层 Agent 没有 '/'：生产环境中其名称为会话 ID（session-N），
 	// 由 runSession/resumeSession 以 meta 角色创建，故角色恒为 "meta"。
 	return "meta"
+}
+
+// sessionIDFromAgentID 从 Agent 句柄中提取所属 session ID（首段）。
+// 句柄格式 "session-N[/parent/role-n]"，无 '/' 时整体即 session ID。
+func sessionIDFromAgentID(agentID string) string {
+	if idx := strings.Index(agentID, "/"); idx >= 0 {
+		return agentID[:idx]
+	}
+	return agentID
 }
 
 // MarshalResult 将 tool.Result 序列化为 JSON 字符串，用于 blades 工具响应。

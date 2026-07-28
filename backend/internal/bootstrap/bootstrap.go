@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
@@ -212,7 +213,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
 	// Executor 永远跑 DefaultSandboxConfig（默认禁写工作目录外、保留命令黑名单）。
 	toolRegistry.SetSandboxConfig(&cfg.Agent.SafetyConfig)
-	memoryPipeline := memory.NewPipeline(memory.NewInMemoryStore())   // 记忆流水线
+	memoryPipeline := memory.NewPipeline(memory.NewInMemoryStore()).WithSummarizer(newEventSummarizer(modelFactory))   // 记忆流水线
 
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
@@ -235,8 +236,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 块记忆写入闭环：默认开启（applyFeatureTogglesDefaults 兜底为 true）；
 	// 显式 block_memory_write_enabled: false 时 Dispatcher 内部跳过沉淀。
 	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)
-	// 验证闭环往返上限：防止 code<->test 平级互问死循环；<=0 表示不限制。
-	subAgentDispatcher.WithVerificationMaxRounds(cfg.Agent.VerificationMaxRounds)
+	// 全局派发总数上限：单 session 所有角色派发合计超限拒绝；用户新消息重置。
+	subAgentDispatcher.WithMaxTotalDispatches(cfg.Agent.MaxTotalDispatches)
 	// KV 共享记忆：主线程 Agent（meta/domain）持可写实例写关键上下文，
 	// 子 Agent 派发时经 Dispatcher 的只读视图读取并注入任务前。
 	// 默认仅内存；需持久化时传 PostgresStore 适配的 KVStore（待后续实现）。
@@ -477,6 +478,22 @@ type reactModelFactory struct {
 // 返回：该角色对应的 agent.ModelProvider，或获取过程中的错误。
 func (f *reactModelFactory) GetBladesProvider(ctx context.Context, roleID string) (agent.ModelProvider, error) {
 	return f.inner.GetBladesProvider(ctx, roleID)
+}
+
+// newEventSummarizer 构造一个 memory.EventSummarizer，把近期事件列表交给轻量模型压成短摘要。
+// 失败时返回错误，由 Pipeline 降级为直接 join 原始事件，主流程不受影响。
+func newEventSummarizer(f *model.ModelFactory) memory.EventSummarizer {
+	if f == nil {
+		return nil
+	}
+	return func(ctx context.Context, events []string) (string, error) {
+		// 拼装提示词：要求保留时间顺序与关键事实，丢弃冗余 I/O 细节。
+		prompt := "将以下 ReAct Agent 近期事件按时间顺序压成 200 字以内的紧凑摘要，" +
+			"保留：调用过哪些工具（工具名+关键参数）、关键产出文件路径、子 Agent 摘要要点。" +
+			"丢弃：冗长输出、重复读文件、空响应 nudge。直接输出摘要，不要解释：\n" +
+			strings.Join(events, "\n")
+		return f.CallLightweightWithRetry(ctx, prompt)
+	}
 }
 
 // blockMemorySaver 将 store.PostgresStore 适配为子 Agent 调度器期望的

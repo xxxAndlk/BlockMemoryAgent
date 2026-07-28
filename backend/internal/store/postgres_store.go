@@ -229,10 +229,10 @@ func (s *PostgresStore) SearchBlockMemory(ctx context.Context, domain, goal stri
 	return s.Knowledge.SearchBlockMemory(ctx, domain, goal, topK)
 }
 
-// SearchBlockMemoryByGoal 不按 domain 过滤、仅按目标文本语义检索块记忆；
+// SearchBlockMemoryByGoal 按 sessionID 过滤后做语义检索块记忆；
 // 委托给 KnowledgeStore.SearchBlockMemoryByGoal。
-func (s *PostgresStore) SearchBlockMemoryByGoal(ctx context.Context, goal string, topK int) ([]*types.KnowledgeRecord, error) {
-	return s.Knowledge.SearchBlockMemoryByGoal(ctx, goal, topK)
+func (s *PostgresStore) SearchBlockMemoryByGoal(ctx context.Context, sessionID, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+	return s.Knowledge.SearchBlockMemoryByGoal(ctx, sessionID, goal, topK)
 }
 
 // SearchKnowledgeByType 按 knowledge_type 过滤的向量搜索；委托给 KnowledgeStore.SearchByType。

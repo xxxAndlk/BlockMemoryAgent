@@ -139,7 +139,12 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 			event := stream.Current()
 			switch ev := event.AsAny().(type) {
 			case anthropic.MessageStartEvent:
-				inputTokens = ev.Message.Usage.InputTokens
+				// input_tokens 是非缓存输入；缓存部分在 cache_creation/cache_read。
+				// 代理网关（glm/kimi 经 ANTHROPIC_BASE_URL）常把所有 input 算进 cache_read，
+				// 仅取 InputTokens 会让日志显示 input_tokens=0。三字段合计才是真实输入。
+				inputTokens = ev.Message.Usage.InputTokens +
+					ev.Message.Usage.CacheCreationInputTokens +
+					ev.Message.Usage.CacheReadInputTokens
 			case anthropic.ContentBlockStartEvent:
 				// 工具调用块开始：记录 id/name，后续 input_json_delta 累积入参。
 				if ev.ContentBlock.Type == "tool_use" {
@@ -173,6 +178,12 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 			case anthropic.MessageDeltaEvent:
 				stopReason = string(ev.Delta.StopReason)
 				outputTokens = ev.Usage.OutputTokens
+				// 部分网关在 message_start 不填 usage，仅在 message_delta 提供；
+				// 且 cache 命中时 input_tokens 恒为 0，真实输入在 cache_read 字段。
+				// 累计 cache tokens 补全 inputTokens（已是累积值，直接覆盖）。
+				if u := ev.Usage; u.InputTokens+u.CacheCreationInputTokens+u.CacheReadInputTokens > 0 {
+					inputTokens = u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+				}
 			}
 		}
 		if err := stream.Err(); err != nil {
@@ -444,11 +455,12 @@ func (p *anthropicProvider) convertResponse(resp *anthropic.Message) *blades.Mes
 	if thinking.Len() > 0 {
 		msg.Metadata = map[string]any{"thinking": truncateThinking(thinking.String())}
 	}
-	// 设置 token 用量
+	// 设置 token 用量：三字段合计还原真实输入（cache 命中时 input_tokens 恒 0）
+	inTok := resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens
 	msg.TokenUsage = blades.TokenUsage{
-		InputTokens:  resp.Usage.InputTokens,
+		InputTokens:  inTok,
 		OutputTokens: resp.Usage.OutputTokens,
-		TotalTokens:  resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		TotalTokens:  inTok + resp.Usage.OutputTokens,
 	}
 	// 设置完成原因
 	msg.FinishReason = string(resp.StopReason)

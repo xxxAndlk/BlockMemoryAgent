@@ -17,6 +17,8 @@ import (
 
 	// tool 提供内建工具注册表，用于构造可调用的工具环境。
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
+	// mailbox 提供共享邮箱，用于异步子 Agent 摘要投递测试。
+	"github.com/blockmemory/agent/backend/internal/mailbox"
 	// types 提供角色定义等 DTO。
 	"github.com/blockmemory/agent/backend/pkg/types"
 	// blades 提供模型消息与 provider 接口。
@@ -149,6 +151,59 @@ func TestReActAgent_Run_MaxIterations(t *testing.T) {
 func mustJSON(v any) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// fakePendingChecker 模拟父 Agent 有未决子 Agent 的场景。
+// PendingChildren 在 mailbox 投递前返 1，WaitForAnyChild 调用时投递邮箱消息并切到 0。
+type fakePendingChecker struct {
+	mb        *mailbox.Mailbox
+	parentID  string
+	delivered bool
+}
+
+func (f *fakePendingChecker) PendingChildren(parentID string) int {
+	if parentID != f.parentID || f.delivered {
+		return 0
+	}
+	return 1
+}
+
+func (f *fakePendingChecker) WaitForAnyChild(parentID string, timeout time.Duration) bool {
+	// 投递一条 mailbox 消息模拟子 Agent 完成。
+	if !f.delivered && f.mb != nil {
+		_ = f.mb.Send(&mailbox.Message{From: "session-1/code_assistant-1", To: parentID, Type: mailbox.MsgInfo, Body: "子 Agent 完成: ok"})
+		f.delivered = true
+	}
+	return true
+}
+
+// TestReActAgent_WakeOnMailbox 验证：父 Agent 给出终答前若有未决子 Agent，
+// 应阻塞等待 mailbox 而非立刻终结；mailbox 到达后续跑 ReAct 整合结果。
+// 旧实现 30s 超时白跑 LLM 烧 maxIter，塔防任务死等 46 分钟；新实现纯阻塞等信号。
+func TestReActAgent_WakeOnMailbox(t *testing.T) {
+	mb := mailbox.New()
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			blades.AssistantMessage("待子 Agent 完成"), // 第一轮：终答但子 Agent 未决
+			blades.AssistantMessage("整合完毕：ok"),    // 第二轮：吸收 mailbox 摘要后给最终答复
+		},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	checker := &fakePendingChecker{mb: mb, parentID: "test"}
+	ag := NewReActAgent("test", types.RoleDefinition{SystemPrompt: ""}, llm, NewToolRegistryAdapter(reg)).
+		WithMailbox(mb).
+		WithPendingChildrenChecker(checker)
+
+	res, err := ag.Run(context.Background(), "wait for sub")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(res.Text, "整合完毕") {
+		t.Fatalf("expected final answer after mailbox drain, got %q", res.Text)
+	}
+	if llm.calls != 2 {
+		t.Fatalf("expected 2 LLM calls (initial + post-mailbox), got %d", llm.calls)
+	}
 }
 
 // flakyModelProvider 前 failTimes 次 Generate 返回错误，之后返回成功响应，用于重试测试。

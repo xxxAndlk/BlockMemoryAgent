@@ -134,6 +134,12 @@ type PendingChildrenChecker interface {
 	WaitForAnyChild(parentID string, timeout time.Duration) bool
 }
 
+// DispatchCountResetter 由 subagent.Dispatcher 实现：清空指定 session 的派发计数。
+// ReactService 在新用户消息到达时调用，使全局派发限额按任务粒度重置。
+type DispatchCountResetter interface {
+	ResetDispatchCounts(sessionID string)
+}
+
 // ModelProvider 是 ReActAgent 所需的 blades.ModelProvider 的最小子集。
 // 保留一个窄接口，使测试只需模拟 Generate 方法即可。
 type ModelProvider interface {

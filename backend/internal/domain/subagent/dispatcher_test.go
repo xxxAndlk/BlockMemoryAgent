@@ -3,7 +3,10 @@ package subagent
 // 导入测试与项目依赖包。
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -146,10 +149,13 @@ type mockBlockMemorySearcher struct {
 	recs []*types.KnowledgeRecord
 	// err 是 SearchBlockMemoryByGoal 返回的固定错误。
 	err error
+	// lastSession 记录最近一次调用传入的 sessionID，测试可断言过滤行为。
+	lastSession string
 }
 
 // SearchBlockMemoryByGoal 实现 BlockMemorySearcher 接口，忽略查询并返回预设结果。
-func (m *mockBlockMemorySearcher) SearchBlockMemoryByGoal(ctx context.Context, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+func (m *mockBlockMemorySearcher) SearchBlockMemoryByGoal(ctx context.Context, sessionID, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+	m.lastSession = sessionID
 	return m.recs, m.err
 }
 
@@ -157,15 +163,21 @@ func (m *mockBlockMemorySearcher) SearchBlockMemoryByGoal(ctx context.Context, g
 // 命中时拼接【相关记忆】前缀、无命中与未配置检索器时任务原样返回。
 func TestInjectRecalledMemory(t *testing.T) {
 	// 情形一：命中两条记忆，任务前应拼入编号记忆段与【当前任务】分隔。
+	mock := &mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{
+		{Content: "记忆一"},
+		{Content: "记忆二"},
+	}}
 	d := NewDispatcher(nil, nil, nil, nil, nil).
-		WithBlockMemorySearcher(&mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{
-			{Content: "记忆一"},
-			{Content: "记忆二"},
-		}})
-	got := d.injectRecalledMemory(context.Background(), "原始任务")
+		WithBlockMemorySearcher(mock)
+	// 注入 sessionID 到 ctx，验证召回侧按 session 过滤。
+	ctx := tool.WithSessionID(context.Background(), "session-42")
+	got := d.injectRecalledMemory(ctx, "原始任务")
 	want := "【相关记忆】\n1. 记忆一\n2. 记忆二\n\n【当前任务】\n原始任务"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
+	}
+	if mock.lastSession != "session-42" {
+		t.Fatalf("expected sessionID passed through to searcher, got %q", mock.lastSession)
 	}
 
 	// 情形二：检索无命中，任务原样返回。
@@ -179,6 +191,56 @@ func TestInjectRecalledMemory(t *testing.T) {
 	d = NewDispatcher(nil, nil, nil, nil, nil)
 	if got := d.injectRecalledMemory(context.Background(), "原始任务"); got != "原始任务" {
 		t.Fatalf("expected unchanged task, got %q", got)
+	}
+}
+
+// TestInjectRecalledMemory_PurePrefixMode 验证 task="" 时返回纯前缀（不含【当前任务】）。
+// 对应 ui_assistant-5 任务丢失事故：双前缀注入嵌套【当前任务】使模型把 KV 内容当任务主体。
+func TestInjectRecalledMemory_PurePrefixMode(t *testing.T) {
+	mock := &mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{{Content: "记忆一"}}}
+	d := NewDispatcher(nil, nil, nil, nil, nil).WithBlockMemorySearcher(mock)
+	got := d.injectRecalledMemory(context.Background(), "")
+	if strings.Contains(got, "【当前任务】") {
+		t.Fatalf("pure prefix mode should not include 【当前任务】 marker, got: %q", got)
+	}
+	if !strings.Contains(got, "【相关记忆】") {
+		t.Fatalf("expected 【相关记忆】 prefix, got: %q", got)
+	}
+}
+
+// TestAssembleTaskWithDualPrefixes_NoNestedMarker 验证 KV + block memory 双前缀拼装后
+// 只含一个【当前任务】标记，原始任务位于末尾。回归 ui_assistant-5 嵌套事故。
+func TestAssembleTaskWithDualPrefixes_NoNestedMarker(t *testing.T) {
+	kv := newTestKVMemory(true)
+	_ = kv.Set(context.Background(), "meta:shared", "KV 内容")
+	mock := &mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{{Content: "记忆一"}}}
+	d := NewDispatcher(nil, nil, nil, nil, nil).
+		WithKVMemory(kv).
+		WithBlockMemorySearcher(mock)
+
+	// 模拟 runSubAgentOnce 中的拼装逻辑（直接调用两函数的纯前缀模式）。
+	var prefixes []string
+	if p := d.injectKVMemory(context.Background(), "meta", ""); p != "" {
+		prefixes = append(prefixes, p)
+	}
+	if p := d.injectRecalledMemory(context.Background(), ""); p != "" {
+		prefixes = append(prefixes, p)
+	}
+	task := strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + "原任务"
+
+	// 应只出现一次【当前任务】。
+	if c := strings.Count(task, "【当前任务】"); c != 1 {
+		t.Fatalf("expected exactly 1 【当前任务】 marker, got %d: %q", c, task)
+	}
+	// 原任务应位于末尾，KV 内容与相关记忆在其前。
+	if !strings.HasPrefix(task, "【共享记忆】") {
+		t.Fatalf("expected KV prefix at start, got: %q", task)
+	}
+	if !strings.Contains(task, "【相关记忆】") {
+		t.Fatalf("expected block-memory prefix, got: %q", task)
+	}
+	if !strings.HasSuffix(task, "原任务") {
+		t.Fatalf("expected original task at end, got: %q", task)
 	}
 }
 
@@ -542,10 +604,10 @@ func TestDispatcher_PendingChildren(t *testing.T) {
 	waitForCond(t, "pending to reach 0", func() bool { return d.PendingChildren("meta") == 0 })
 }
 
-// TestDispatcher_VerificationMaxRounds 验证验证闭环往返上限：
-// 同一 (callerRole -> calleeRole) 派发次数超过 verificationMaxRounds 时，
-// call_sub_agent 返回错误，防止 code<->test 平级互问死循环。
-func TestDispatcher_VerificationMaxRounds(t *testing.T) {
+// TestDispatcher_MaxTotalDispatches 验证全局派发总数上限：
+// 同一 session 内所有角色派发合计超过 maxTotalDispatches 时被拒绝；
+// ResetDispatchCounts（用户新消息）后计数清零可继续派发。
+func TestDispatcher_MaxTotalDispatches(t *testing.T) {
 	cfg := &config.RoleConfigFile{
 		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
@@ -558,18 +620,17 @@ func TestDispatcher_VerificationMaxRounds(t *testing.T) {
 	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	mb := mailbox.New()
 	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "ok"}}, toolsReg, mb, agent.NopMemoryPipeline{})
-	// 设置上限为 2：第 3 次派发应被拒绝。
-	d.WithVerificationMaxRounds(2)
+	// 设置总数上限为 2：跨角色合计第 3 次派发应被拒绝。
+	d.WithMaxTotalDispatches(2)
 	d.RegisterCallTool(toolsReg)
 
-	// 以 test_assistant 身份向 code_assistant 派发 3 次（test_assistant 是 code_assistant 的 parent）。
-	// 注意：CanCall 检查的是 callerRole -> calleeRole，test_assistant 的 Parents 含 code_assistant，
-	// 故 test_assistant 可调用 code_assistant。
-	ctx := agent.WithAgentID(context.Background(), "session-1/test_assistant-1")
-	for i := 0; i < 2; i++ {
+	// 以 meta 身份（顶层，agentID 即 sessionID）派发：限额按 session 合计，与角色对无关。
+	ctx := agent.WithAgentID(context.Background(), "session-1")
+	targets := []string{"code_assistant", "test_assistant"}
+	for i, roleID := range targets {
 		res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
-			"role_id": "code_assistant",
-			"task":    "round",
+			"role_id": roleID,
+			"task":    "job",
 		})
 		if err != nil {
 			t.Fatalf("dispatch %d: %v", i, err)
@@ -578,16 +639,26 @@ func TestDispatcher_VerificationMaxRounds(t *testing.T) {
 			t.Fatalf("dispatch %d should succeed: %s", i, res.Error)
 		}
 	}
-	// 第 3 次应被拒绝。
+	// 第 3 次（不同角色）应被总数限额拒绝。
 	res, _ := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
 		"role_id": "code_assistant",
-		"task":    "round",
+		"task":    "job",
 	})
 	if res.Success {
-		t.Fatal("3rd dispatch should be rejected by verification round limit")
+		t.Fatal("3rd dispatch should be rejected by dispatch total limit")
 	}
-	if !strings.Contains(res.Error, "verification round limit reached") {
+	if !strings.Contains(res.Error, "dispatch total limit reached") {
 		t.Fatalf("unexpected error: %s", res.Error)
+	}
+
+	// 用户新消息触发重置后，可继续派发。
+	d.ResetDispatchCounts("session-1")
+	res, _ = toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+		"role_id": "code_assistant",
+		"task":    "job",
+	})
+	if !res.Success {
+		t.Fatalf("dispatch after reset should succeed: %s", res.Error)
 	}
 }
 
@@ -652,5 +723,196 @@ func (m *testKVMemory) Delete(ctx context.Context, key string) error {
 	}
 	delete(m.items, key)
 	return nil
+}
+
+// Keys 返回当前内存中所有键的快照，实现 KVMemoryReader.Keys。
+func (m *testKVMemory) Keys(ctx context.Context) []string {
+	keys := make([]string, 0, len(m.items))
+	for k := range m.items {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// TestInjectKVMemory_Layer3StaleDetection 验证 Layer 3：KV value 为 SharedEntry JSON 时，
+// injectKVMemory 解析后 stat 各 path mtime，不匹配（文件被改）丢弃 KV 降级 fresh read。
+// 旧格式（纯字符串）直接用，向后兼容。
+func TestInjectKVMemory_Layer3StaleDetection(t *testing.T) {
+	// 准备临时文件并记录初始 mtime。
+	dir := t.TempDir()
+	target := filepath.Join(dir, "stale.go")
+	if err := os.WriteFile(target, []byte("v1"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	fi, _ := os.Stat(target)
+	origMtime := fi.ModTime().Unix()
+
+	// 构造 dispatcher（不需要真实 provider，只测 injectKVMemory 纯函数行为）。
+	d := &Dispatcher{}
+
+	// Case 1: SharedEntry JSON，mtime 匹配 -> 拼接 Content 前缀。
+	kv := newTestKVMemory(true)
+	entry := sharedEntryMirror{
+		Files:   map[string]int64{target: origMtime},
+		Content: "stale.go is v1",
+	}
+	val, _ := json.Marshal(entry)
+	_ = kv.Set(context.Background(), "meta:shared", string(val))
+	d.WithKVMemory(kv)
+
+	got := d.injectKVMemory(context.Background(), "meta", "do task")
+	if !strings.Contains(got, "stale.go is v1") {
+		t.Fatalf("expected KV content injected, got: %q", got)
+	}
+	if !strings.Contains(got, "do task") {
+		t.Fatalf("expected task preserved, got: %q", got)
+	}
+
+	// Case 2: 文件被改，mtime 不匹配 -> 丢弃 KV，降级 fresh read。
+	// 改 mtime：写新内容并 SetModTime 确保 mtime 变化。
+	if err := os.WriteFile(target, []byte("v2"), 0644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+	// 强制 mtime 与 origMtime 不同（避免同秒写入 mtime 未变）。
+	newTime := time.Now().Add(5 * time.Second)
+	_ = os.Chtimes(target, newTime, newTime)
+
+	got2 := d.injectKVMemory(context.Background(), "meta", "do task")
+	if strings.Contains(got2, "stale.go is v1") {
+		t.Fatalf("expected stale KV discarded, got: %q", got2)
+	}
+	if !strings.Contains(got2, "do task") {
+		t.Fatalf("expected task preserved after stale discard, got: %q", got2)
+	}
+	if strings.Contains(got2, "【共享记忆】") {
+		t.Fatalf("expected no shared memory prefix for stale entry, got: %q", got2)
+	}
+
+	// Case 3: 旧格式（纯字符串）-> 直接用，不校验 mtime。
+	kvOld := newTestKVMemory(true)
+	_ = kvOld.Set(context.Background(), "meta:shared", "legacy plain summary")
+	dOld := &Dispatcher{}
+	dOld.WithKVMemory(kvOld)
+
+	got3 := dOld.injectKVMemory(context.Background(), "meta", "do task")
+	if !strings.Contains(got3, "legacy plain summary") {
+		t.Fatalf("expected legacy content used as-is, got: %q", got3)
+	}
+}
+
+// TestInjectKVMemory_NoFilesSkipsStatCheck 验证 Layer 3 边界：SharedEntry.Files 为空时
+// 跳过 stat 校验（无 path 需校验），Content 直接拼接。
+func TestInjectKVMemory_NoFilesSkipsStatCheck(t *testing.T) {
+	d := &Dispatcher{}
+	kv := newTestKVMemory(true)
+	entry := sharedEntryMirror{Content: "pure conclusion no files"}
+	val, _ := json.Marshal(entry)
+	_ = kv.Set(context.Background(), "meta:shared", string(val))
+	d.WithKVMemory(kv)
+
+	got := d.injectKVMemory(context.Background(), "meta", "do task")
+	if !strings.Contains(got, "pure conclusion no files") {
+		t.Fatalf("expected content injected when Files empty, got: %q", got)
+	}
+}
+
+// captureProvider 捕获最后一次 Generate 收到的请求，用于断言系统提示词与任务文本。
+type captureProvider struct {
+	lastReq *blades.ModelRequest
+}
+
+func (m *captureProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	m.lastReq = req
+	return &blades.ModelResponse{Message: blades.AssistantMessage("done")}, nil
+}
+
+func (m *captureProvider) Name() string { return "capture" }
+
+// TestDispatcher_DomainResponsibilityInjection 验证 role_id="domain" 且携带
+// domain+responsibility 时：身份头注入系统提示词（含原通用领域纪律），
+// 任务文本带【你的领域】前缀；固定助手不受影响。
+func TestDispatcher_DomainResponsibilityInjection(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{
+			SystemPrompt: "meta",
+			ModelConfig:  types.AgentModelConfig{Provider: "mock"},
+		},
+		DomainAgent: config.DomainAgentConfig{
+			ModelConfig:  types.AgentModelConfig{Provider: "mock"},
+			SystemPrompt: "通用领域纪律",
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	cp := &captureProvider{}
+	d := NewDispatcher(reg, &mockModelFactory{provider: cp}, toolsReg, nil, agent.NopMemoryPipeline{})
+
+	roleDef := reg.Get("domain")
+	if roleDef == nil {
+		t.Fatal("domain role not registered")
+	}
+	_, _, err := d.runSubAgentOnce(context.Background(), "meta", "meta/domain-1", *roleDef,
+		"实现 config.js 数值表", "配置", "负责 config.js/index.html/css；禁止碰 js/engine 下文件")
+	if err != nil {
+		t.Fatalf("runSubAgentOnce: %v", err)
+	}
+	if cp.lastReq == nil {
+		t.Fatal("provider not called")
+	}
+	// 系统提示词：身份头 + 职责 + 原通用纪律。
+	instr := cp.lastReq.Instruction.Text()
+	if !strings.Contains(instr, "你是负责【配置】领域的 DomainAgent") {
+		t.Fatalf("system prompt missing identity header: %q", instr)
+	}
+	if !strings.Contains(instr, "负责 config.js/index.html/css") {
+		t.Fatalf("system prompt missing responsibility: %q", instr)
+	}
+	if !strings.Contains(instr, "通用领域纪律") {
+		t.Fatalf("system prompt lost base template: %q", instr)
+	}
+	// 任务文本：带【你的领域】前缀。
+	if len(cp.lastReq.Messages) == 0 {
+		t.Fatal("no messages in request")
+	}
+	first := cp.lastReq.Messages[0].Text()
+	if !strings.Contains(first, "【你的领域】配置") {
+		t.Fatalf("task missing domain prefix: %q", first)
+	}
+	if !strings.Contains(first, "实现 config.js 数值表") {
+		t.Fatalf("task lost original text: %q", first)
+	}
+}
+
+// TestDispatcher_DomainResponsibilityRequired 验证 role_id="domain" 但缺 responsibility
+// 时被硬拒绝：LLM 经常省略该字段导致 DomainAgent 拿到通用 prompt 无职责边界，
+// 此处强制报错让 MetaAgent 在下一轮补填。
+func TestDispatcher_DomainResponsibilityRequired(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{
+			SystemPrompt: "meta",
+			ModelConfig:  types.AgentModelConfig{Provider: "mock"},
+		},
+		DomainAgent: config.DomainAgentConfig{
+			ModelConfig:  types.AgentModelConfig{Provider: "mock"},
+			SystemPrompt: "通用领域纪律",
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg, nil, agent.NopMemoryPipeline{})
+	d.RegisterCallTool(toolsReg)
+
+	ctx := agent.WithAgentID(context.Background(), "meta")
+	res, _ := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+		"role_id": "domain",
+		"domain":  "配置",
+		"task":    "实现 config.js",
+	})
+	if res.Success {
+		t.Fatal("expected rejection when role_id=domain lacks responsibility")
+	}
+	if !strings.Contains(res.Error, "responsibility is required") {
+		t.Fatalf("unexpected error: %s", res.Error)
+	}
 }
 

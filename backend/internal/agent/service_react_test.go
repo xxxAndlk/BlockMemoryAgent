@@ -25,6 +25,9 @@ import (
 type mockReactModelProvider struct {
 	responses []*blades.Message // responses 预设的模型响应队列
 	calls     int               // calls 记录 Generate 已被调用的次数
+	// block 非空时，第二次及之后 Generate 调用阻塞到该 channel 被关闭。
+	// 用于让测试在会话结束前完成 tempDir 准备工作，避免 race。
+	block <-chan struct{}
 }
 
 // Generate 实现 blades.ModelProvider 接口，按顺序返回预设响应。
@@ -39,6 +42,14 @@ type mockReactModelProvider struct {
 //	*blades.ModelResponse - 包含下一条预设消息的响应；
 //	error                - 本 mock 实现始终返回 nil。
 func (m *mockReactModelProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	// 第二次及之后调用，若 block 非空则等待关闭信号，让测试有机会在会话结束前建 tempDir。
+	if m.calls >= 1 && m.block != nil {
+		select {
+		case <-m.block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	// 如果已调用次数达到预设响应数量，则返回默认结束消息，避免测试死循环。
 	if m.calls >= len(m.responses) {
 		return &blades.ModelResponse{Message: blades.AssistantMessage("done")}, nil
@@ -255,20 +266,18 @@ func TestReactService_SendMessage(t *testing.T) {
 func TestReactService_CleansTempDirOnCompletion(t *testing.T) {
 	workDir := t.TempDir()
 
-	// 预先创建临时目录及文件，让服务在结束时能够观察到并清理它们。
-	tempDir := filepath.Join(workDir, ".bma", "tmp", "session-1")
-	if err := os.MkdirAll(tempDir, 0755); err != nil {
-		t.Fatalf("创建临时目录失败: %v", err)
-	}
-	tempFile := filepath.Join(tempDir, "script.py")
-	if err := os.WriteFile(tempFile, []byte("print('temp')"), 0644); err != nil {
-		t.Fatalf("写临时文件失败: %v", err)
-	}
-
-	llm := &mockReactModelProvider{
-		responses: []*blades.Message{
-			blades.AssistantMessage("done"),
+	// mock LLM 第一轮调 ListDir（让会话持续到工具执行），第二轮返回 done 触发结束+cleanup。
+	// 用 block channel 阻塞第二轮，让测试有机会在会话结束前建 tempDir+文件，race-free。
+	block := make(chan struct{})
+	toolCallMsg := &blades.Message{
+		Role: blades.RoleAssistant,
+		Parts: []blades.Part{
+			blades.ToolPart{Name: "ListDir", Request: `{"path":"."}`},
 		},
+	}
+	llm := &mockReactModelProvider{
+		responses: []*blades.Message{toolCallMsg, blades.AssistantMessage("done")},
+		block:     block,
 	}
 	svc := newReactServiceForTest(llm, workDir)
 
@@ -276,8 +285,28 @@ func TestReactService_CleansTempDirOnCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession error: %v", err)
 	}
-	if session.TempDir != tempDir {
-		t.Fatalf("TempDir 期望 %q，got %q", tempDir, session.TempDir)
+	tempDir := session.TempDir
+	// 等会话完成第一轮 LLM 调用（避免第一轮还没跑就放行 block）。
+	waitDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		if llm.calls >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// 在会话运行期间建 tempDir + 文件，让 cleanup 在会话结束时能命中并删除。
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	tempFile := filepath.Join(tempDir, "script.py")
+	if err := os.WriteFile(tempFile, []byte("print('temp')"), 0644); err != nil {
+		t.Fatalf("写临时文件失败: %v", err)
+	}
+	// 放行第二轮 LLM 调用，会话进入结束流程 -> cleanup 删 tempDir。
+	close(block)
+	// 确认 TempDir 路径含 session- 前缀（跨重启唯一格式校验）。
+	if !strings.Contains(tempDir, "session-") {
+		t.Fatalf("TempDir 应含 session- 前缀, got %q", tempDir)
 	}
 
 	// 轮询等待会话结束并确认临时目录被删除。
@@ -298,6 +327,35 @@ func TestReactService_CleansTempDirOnCompletion(t *testing.T) {
 	}
 	if _, err := os.Stat(tempFile); !os.IsNotExist(err) {
 		t.Fatalf("会话完成后临时文件应被删除，但仍存在: %s", tempFile)
+	}
+}
+
+// TestReactService_SessionIDUniqueAcrossInstances 验证两次独立创建的 ReactService
+// 生成的 sessionID 不冲突。旧实现 "session-N" 重启回 1，block-memory 按 session_id
+// 召回旧 session 数据污染新 session。
+func TestReactService_SessionIDUniqueAcrossInstances(t *testing.T) {
+	llm := &mockReactModelProvider{
+		responses: []*blades.Message{blades.AssistantMessage("done")},
+	}
+	// 实例 1
+	svc1 := newReactServiceForTest(llm, t.TempDir())
+	s1, err := svc1.CreateSession(context.Background(), CreateRequest{Goal: "first"})
+	if err != nil {
+		t.Fatalf("svc1 CreateSession: %v", err)
+	}
+	// 实例 2（模拟进程重启）
+	svc2 := newReactServiceForTest(llm, t.TempDir())
+	s2, err := svc2.CreateSession(context.Background(), CreateRequest{Goal: "second"})
+	if err != nil {
+		t.Fatalf("svc2 CreateSession: %v", err)
+	}
+	// 两个实例的 sessionID 必须不同，否则跨实例数据隔离失效。
+	if s1.ID == s2.ID {
+		t.Fatalf("两个 ReactService 实例生成相同 sessionID: %s", s1.ID)
+	}
+	// 都应含 session- 前缀且格式为 session-<bootEpoch>-<seq>。
+	if !strings.HasPrefix(s1.ID, "session-") || !strings.HasPrefix(s2.ID, "session-") {
+		t.Fatalf("sessionID 应含 session- 前缀, got %q / %q", s1.ID, s2.ID)
 	}
 }
 

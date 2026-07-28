@@ -111,6 +111,9 @@ type FeatureTogglesConfig struct {
 	// 代码 Agent <-> 测试 Agent 互相询问/纠正的次数超过该值时，Dispatcher 拒绝
 	// 进一步的同线程派发，防止循环调用死锁。默认 5；<=0 时回退默认。
 	VerificationMaxRounds int `yaml:"verification_max_rounds"`
+	// MaxTotalDispatches 单 session 内所有角色派发总数上限（合计），超过拒绝派发。
+	// 计数在用户发送新消息时重置。默认 30；<=0 时回退默认，负数表示不限制。
+	MaxTotalDispatches int `yaml:"max_total_dispatches"`
 	// VerificationRolePairs 是验证闭环的角色对列表：产出角色 -> 测试角色。
 	// AssistantSelfTestEnabled 开启时，bootstrap 按此列表注册 OnSubAgentDone 钩子，
 	// 产出角色完成时用对应测试角色触发 verifyloop。为空时回退默认 [{code_assistant, test_assistant}]。
@@ -479,6 +482,11 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	// 超过即拒绝派发以防循环死锁。
 	if c.Agent.VerificationMaxRounds == 0 {
 		c.Agent.VerificationMaxRounds = 5
+	}
+	// 全局派发总数默认 30：按"13 文件级编排任务约需 25-30 次派发"的实证校准；
+	// 旧的按角色对 5 次限额会在多文件任务中途卡死派发。
+	if c.Agent.MaxTotalDispatches == 0 {
+		c.Agent.MaxTotalDispatches = 30
 	}
 	// 验证角色对默认 [{code_assistant, test_assistant}]：未显式配置时覆盖代码自测主路径。
 	// 显式配置空列表则关闭所有角色对（不触发 verifyloop）。
