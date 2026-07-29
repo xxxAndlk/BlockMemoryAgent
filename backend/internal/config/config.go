@@ -114,6 +114,19 @@ type FeatureTogglesConfig struct {
 	// MaxTotalDispatches 单 session 内所有角色派发总数上限（合计），超过拒绝派发。
 	// 计数在用户发送新消息时重置。默认 30；<=0 时回退默认，负数表示不限制。
 	MaxTotalDispatches int `yaml:"max_total_dispatches"`
+	// SpecEnforcementEnabled 派发方调用 call_sub_agent 前是否强制先写 WriteSpec。
+	// 默认 true：MetaAgent/DomainAgent 派发子 Agent 前必须先 WriteSpec(goal, acceptance, ...)，
+	// dispatcher 在 Execute 入口校验 parentID:spec 存在且新鲜，缺失则拒绝派发。
+	// 显式 false 关闭强制，spec 注入仍生效（graceful degrade）。
+	SpecEnforcementEnabled *bool `yaml:"spec_enforcement_enabled"`
+	// PlanSkipEnabled 是否跳过 verifyloop 的 PlanConfirm 阶段。
+	// 默认 false：PlanConfirm 强制执行（AgentVerifier 已实现，测试方列方案交产出方确认）。
+	// 显式 true 跳过，向后兼容无 PlanConfirm 实现的自定义 Verifier。
+	PlanSkipEnabled bool `yaml:"plan_skip_enabled"`
+	// ReviewEnabled 是否在 verifyloop 中插入 Review 阶段（code_reviewer 静态审查）。
+	// 默认 true：PlanConfirm 通过后、SelfTest 前派发 code_reviewer 审查产出。
+	// 显式 false 跳过 Review，verifyloop 退化为 PlanConfirm -> SelfTest -> UnifiedTest。
+	ReviewEnabled *bool `yaml:"review_enabled"`
 	// VerificationRolePairs 是验证闭环的角色对列表：产出角色 -> 测试角色。
 	// AssistantSelfTestEnabled 开启时，bootstrap 按此列表注册 OnSubAgentDone 钩子，
 	// 产出角色完成时用对应测试角色触发 verifyloop。为空时回退默认 [{code_assistant, test_assistant}]。
@@ -495,6 +508,18 @@ func (c *Config) applyFeatureTogglesDefaults() {
 			{CodeRole: "code_assistant", TestRole: "test_assistant"},
 		}
 	}
+	// Spec 强制默认开启：派发方必须先 WriteSpec 再 call_sub_agent。
+	// *bool 区分"未配置"（默认 true）与"显式 false"（关闭强制）。
+	if c.Agent.SpecEnforcementEnabled == nil {
+		t := true
+		c.Agent.SpecEnforcementEnabled = &t
+	}
+	// Review 阶段默认开启：PlanConfirm 通过后、SelfTest 前派 code_reviewer 静态审查。
+	if c.Agent.ReviewEnabled == nil {
+		t := true
+		c.Agent.ReviewEnabled = &t
+	}
+	// PlanSkipEnabled 默认 false（零值），无需显式设置：PlanConfirm 强制执行。
 }
 
 func (c *Config) applyAgentStandaloneDefaults() {

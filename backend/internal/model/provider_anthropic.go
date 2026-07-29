@@ -58,51 +58,137 @@ func newAnthropicProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 // Name 返回 provider 使用的模型名称。
 func (p *anthropicProvider) Name() string { return p.modelName }
 
+// maxContinueRounds 限制 stop_reason=max_tokens 时的自动续写轮数上限。
+// 每轮允许 maxTokens 输出；8 轮 = 8*maxTokens 总输出（128K 时即 1M），覆盖任意单次响应需求。
+// 超过仍返回截断结果，由上层 ReAct 循环处理（不会死循环）。
+const maxContinueRounds = 8
+
 // Generate 调用 Anthropic Messages API 完成生成。
 //
-// 参数：
-//   - ctx: 上下文
-//   - req: blades 模型请求
+// stop_reason=max_tokens 时自动续写：把本轮 assistant 内容（text+tool_use）追加到 messages
+// 再发一次，模型从截断处继续。跨轮文本拼接、tool_use 按 ID 去重（续写轮返回完整 input 覆盖
+// 前轮部分），thinking 累积。达到 maxContinueRounds 仍 max_tokens 时返回截断结果。
 //
-// 返回：
-//   - *blades.ModelResponse: 模型响应
-//   - error: 生成或转换错误
+// 该机制防 LLM 单次写大文件（如 game.js 1000+行）被 max_tokens 截断 mid-WriteFile JSON
+// 导致 tool parser fail -> 空响应 -> ReAct nudge 死循环（实证见 logs/tui/2026-07-28.log）。
 func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
 	// 转换 messages
 	messages, err := p.convertMessages(req.Messages)
 	if err != nil {
 		return nil, fmt.Errorf("convert messages: %w", err)
 	}
+	system := p.convertSystem(req.Instruction)
+	tools := p.convertTools(req.Tools)
 
-	// 构造 Anthropic 请求参数
-	params := anthropic.MessageNewParams{
-		Model:       anthropic.Model(p.modelName),
-		MaxTokens:   p.maxTokens,
-		Messages:    messages,
-		System:      p.convertSystem(req.Instruction),
-		Tools:       p.convertTools(req.Tools),
-		Temperature: anthropic.Float(p.temperature),
+	var (
+		accText    strings.Builder
+		toolByID   = map[string]anthropic.ToolUseBlock{}
+		toolOrder  []string
+		inTok      int64
+		outTok     int64
+		stopReason string
+	)
+
+	for round := 0; round < maxContinueRounds; round++ {
+		params := anthropic.MessageNewParams{
+			Model:       anthropic.Model(p.modelName),
+			MaxTokens:   p.maxTokens,
+			Messages:    messages,
+			System:      system,
+			Tools:       tools,
+			Temperature: anthropic.Float(p.temperature),
+		}
+		resp, err := p.client.Messages.New(ctx, params)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic messages POST %s: %w", p.baseURL, err)
+		}
+
+		// 累积本轮 text 与 tool_use；tool_use 按 ID 去重（续写轮返回完整 input 覆盖前轮部分）。
+		for _, block := range resp.Content {
+			switch v := block.AsAny().(type) {
+			case anthropic.TextBlock:
+				accText.WriteString(v.Text)
+			case anthropic.ToolUseBlock:
+				if _, ok := toolByID[v.ID]; !ok {
+					toolOrder = append(toolOrder, v.ID)
+				}
+				toolByID[v.ID] = v
+			}
+		}
+		// 输入 token 只取第 0 轮（= 原始会话输入大小）；输出 token 累加（每轮新增输出）。
+		if round == 0 {
+			inTok = resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens
+		}
+		outTok += resp.Usage.OutputTokens
+		stopReason = string(resp.StopReason)
+
+		// 非 max_tokens 表示正常结束（end_turn/tool_use/stop_sequence），停止续写。
+		if stopReason != "max_tokens" {
+			break
+		}
+		// 最后一轮仍 max_tokens：不再续写，返回截断结果让上层处理。
+		if round == maxContinueRounds-1 {
+			break
+		}
+
+		// 构造本轮 assistant 消息追加到 messages，让下一轮从截断处续写。
+		// 必须含本轮全部 text + tool_use 块，模型据此恢复上下文继续输出。
+		assistantMsg := anthropic.MessageParam{Role: anthropic.MessageParamRoleAssistant}
+		for _, block := range resp.Content {
+			switch v := block.AsAny().(type) {
+			case anthropic.TextBlock:
+				if v.Text != "" {
+					assistantMsg.Content = append(assistantMsg.Content, anthropic.ContentBlockParamUnion{
+						OfText: &anthropic.TextBlockParam{Text: v.Text},
+					})
+				}
+			case anthropic.ToolUseBlock:
+				// 部分截断的 tool_use JSON 也按原样传回，Anthropic 后端会续写补全。
+				input := json.RawMessage(v.Input)
+				if len(input) == 0 {
+					input = json.RawMessage("{}")
+				}
+				assistantMsg.Content = append(assistantMsg.Content, anthropic.ContentBlockParamUnion{
+					OfToolUse: &anthropic.ToolUseBlockParam{
+						ID: v.ID, Name: v.Name, Input: input,
+					},
+				})
+			}
+		}
+		// 本轮无任何 content 块（如 MaxTokens=1 命中 max_tokens 前未产出任何 token）：
+		// 追加空 content 的 assistant 消息会触发 Ark/Anthropic 端点 400 MissingParameter
+		// messages[i].content。无内容可续写，直接跳出返回截断结果。
+		if len(assistantMsg.Content) == 0 {
+			break
+		}
+		messages = append(messages, assistantMsg)
 	}
 
-	// 调用 Anthropic Messages API
-	resp, err := p.client.Messages.New(ctx, params)
-	if err != nil {
-		return nil, fmt.Errorf("anthropic messages POST %s: %w", p.baseURL, err)
+	msg := blades.NewAssistantMessage(blades.StatusCompleted)
+	parts := make([]blades.Part, 0, len(toolOrder)+1)
+	if accText.Len() > 0 {
+		parts = append(parts, blades.TextPart{Text: accText.String()})
 	}
-
-	// 转换响应为 blades 格式
-	msg := p.convertResponse(resp)
+	for _, id := range toolOrder {
+		t := toolByID[id]
+		parts = append(parts, blades.NewToolPart(t.ID, t.Name, string(t.Input)))
+	}
+	msg.Parts = parts
+	msg.TokenUsage = blades.TokenUsage{
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+		TotalTokens:  inTok + outTok,
+	}
+	msg.FinishReason = stopReason
 	return &blades.ModelResponse{Message: msg}, nil
 }
 
 // NewStreaming 创建真正的 SSE 流式生成器：
 // 中间产出增量文本块（驱动 UI 逐 token 渲染），最后一个产出值是累积完整的响应。
 //
-// 参数：
-//   - ctx: 上下文
-//   - req: blades 模型请求
-//
-// 返回：blades.Generator 流式生成器。
+// stop_reason=max_tokens 时自动续写：把本轮 assistant 内容追加到 messages 再开下一轮流，
+// 跨轮 text/tool_use/thinking 累积，增量 deltas 继续向 yield 推送。
+// 上限 maxContinueRounds 轮，仍 max_tokens 则返回截断结果。
 func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
 	return func(yield func(*blades.ModelResponse, error) bool) {
 		// 转换 messages
@@ -111,93 +197,166 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 			yield(nil, fmt.Errorf("convert messages: %w", err))
 			return
 		}
+		system := p.convertSystem(req.Instruction)
+		tools := p.convertTools(req.Tools)
 
-		// 构造与 Generate 一致的请求参数
-		params := anthropic.MessageNewParams{
-			Model:       anthropic.Model(p.modelName),
-			MaxTokens:   p.maxTokens,
-			Messages:    messages,
-			System:      p.convertSystem(req.Instruction),
-			Tools:       p.convertTools(req.Tools),
-			Temperature: anthropic.Float(p.temperature),
-		}
-
-		stream := p.client.Messages.NewStreaming(ctx, params)
-		defer stream.Close()
-
-		// 累积状态：全文文本、思考过程文本、按块序累积的工具调用、token 用量与结束原因。
-		var text strings.Builder
-		var thinking strings.Builder
 		type toolAcc struct {
 			id, name, input string
 		}
-		var tools []toolAcc
-		var inputTokens, outputTokens int64
-		stopReason := ""
+		var (
+			accText     strings.Builder
+			accThinking strings.Builder
+			// toolByID 跨轮去重：续写轮返回完整 tool_use input 覆盖前轮部分截断。
+			toolByID  = map[string]*toolAcc{}
+			toolOrder []string
+			// 跨轮累积：输出 token 累加（每轮新增输出），输入 token 只取第 0 轮。
+			inputTokens, outputTokens int64
+			stopReason                string
+		)
 
-		for stream.Next() {
-			event := stream.Current()
-			switch ev := event.AsAny().(type) {
-			case anthropic.MessageStartEvent:
-				// input_tokens 是非缓存输入；缓存部分在 cache_creation/cache_read。
-				// 代理网关（glm/kimi 经 ANTHROPIC_BASE_URL）常把所有 input 算进 cache_read，
-				// 仅取 InputTokens 会让日志显示 input_tokens=0。三字段合计才是真实输入。
-				inputTokens = ev.Message.Usage.InputTokens +
-					ev.Message.Usage.CacheCreationInputTokens +
-					ev.Message.Usage.CacheReadInputTokens
-			case anthropic.ContentBlockStartEvent:
-				// 工具调用块开始：记录 id/name，后续 input_json_delta 累积入参。
-				if ev.ContentBlock.Type == "tool_use" {
-					tools = append(tools, toolAcc{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name})
-				}
-			case anthropic.ContentBlockDeltaEvent:
-				switch ev.Delta.Type {
-				case "text_delta":
-					// 文本增量：累积并产出增量块（消费方停止则终止流）。
-					text.WriteString(ev.Delta.Text)
-					msg := blades.NewAssistantMessage(blades.StatusCompleted)
-					msg.Parts = []blades.Part{blades.TextPart{Text: ev.Delta.Text}}
-					if !yield(&blades.ModelResponse{Message: msg}, nil) {
-						return
+		for round := 0; round < maxContinueRounds; round++ {
+			// 构造与 Generate 一致的请求参数
+			params := anthropic.MessageNewParams{
+				Model:       anthropic.Model(p.modelName),
+				MaxTokens:   p.maxTokens,
+				Messages:    messages,
+				System:      system,
+				Tools:       tools,
+				Temperature: anthropic.Float(p.temperature),
+			}
+
+			stream := p.client.Messages.NewStreaming(ctx, params)
+
+			// 本轮局部累积：用于续写时构造 assistant 消息追加到 messages。
+			var roundText strings.Builder
+			var roundTools []toolAcc
+
+			for stream.Next() {
+				event := stream.Current()
+				switch ev := event.AsAny().(type) {
+				case anthropic.MessageStartEvent:
+					// input_tokens 只取第 0 轮（= 原始会话输入大小；后续轮含追加的 assistant 输出会膨胀）。
+					// 三字段合计还原真实输入（cache 命中时 input_tokens 恒 0，真实值在 cache_read）。
+					if round == 0 {
+						inputTokens = ev.Message.Usage.InputTokens +
+							ev.Message.Usage.CacheCreationInputTokens +
+							ev.Message.Usage.CacheReadInputTokens
 					}
-				case "thinking_delta":
-					// 思考过程增量：累积并产出携带累积思考文本的中间块（无文本 part），
-					// 消费方据此实时展示思考过程；思考内容不进入答复文本。
-					thinking.WriteString(ev.Delta.Thinking)
-					msg := blades.NewAssistantMessage(blades.StatusInProgress)
-					msg.Metadata = map[string]any{"thinking": thinking.String()}
-					if !yield(&blades.ModelResponse{Message: msg}, nil) {
-						return
+				case anthropic.ContentBlockStartEvent:
+					// 工具调用块开始：记录 id/name，后续 input_json_delta 累积入参。
+					if ev.ContentBlock.Type == "tool_use" {
+						roundTools = append(roundTools, toolAcc{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name})
+						if _, ok := toolByID[ev.ContentBlock.ID]; !ok {
+							toolOrder = append(toolOrder, ev.ContentBlock.ID)
+						}
 					}
-				case "input_json_delta":
-					// 工具入参增量：追加到最近开始的工具调用块。
-					if len(tools) > 0 {
-						tools[len(tools)-1].input += ev.Delta.PartialJSON
+				case anthropic.ContentBlockDeltaEvent:
+					switch ev.Delta.Type {
+					case "text_delta":
+						// 文本增量：累积并产出增量块（消费方停止则终止流）。
+						roundText.WriteString(ev.Delta.Text)
+						accText.WriteString(ev.Delta.Text)
+						msg := blades.NewAssistantMessage(blades.StatusCompleted)
+						msg.Parts = []blades.Part{blades.TextPart{Text: ev.Delta.Text}}
+						if !yield(&blades.ModelResponse{Message: msg}, nil) {
+							stream.Close()
+							return
+						}
+					case "thinking_delta":
+						// 思考过程增量：累积并产出携带累积思考文本的中间块（无文本 part），
+						// 消费方据此实时展示思考过程；思考内容不进入答复文本。
+						accThinking.WriteString(ev.Delta.Thinking)
+						msg := blades.NewAssistantMessage(blades.StatusInProgress)
+						msg.Metadata = map[string]any{"thinking": accThinking.String()}
+						if !yield(&blades.ModelResponse{Message: msg}, nil) {
+							stream.Close()
+							return
+						}
+					case "input_json_delta":
+						// 工具入参增量：追加到最近开始的工具调用块。
+						if len(roundTools) > 0 {
+							roundTools[len(roundTools)-1].input += ev.Delta.PartialJSON
+						}
 					}
-				}
-			case anthropic.MessageDeltaEvent:
-				stopReason = string(ev.Delta.StopReason)
-				outputTokens = ev.Usage.OutputTokens
-				// 部分网关在 message_start 不填 usage，仅在 message_delta 提供；
-				// 且 cache 命中时 input_tokens 恒为 0，真实输入在 cache_read 字段。
-				// 累计 cache tokens 补全 inputTokens（已是累积值，直接覆盖）。
-				if u := ev.Usage; u.InputTokens+u.CacheCreationInputTokens+u.CacheReadInputTokens > 0 {
-					inputTokens = u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+				case anthropic.MessageDeltaEvent:
+					stopReason = string(ev.Delta.StopReason)
+					outputTokens += ev.Usage.OutputTokens
+					// 部分网关在 message_start 不填 usage，仅在 message_delta 提供；
+					// 且 cache 命中时 input_tokens 恒为 0，真实输入在 cache_read 字段。
+					// 第 0 轮累计 cache tokens 补全 inputTokens（已是累积值，直接覆盖）。
+					if round == 0 {
+						if u := ev.Usage; u.InputTokens+u.CacheCreationInputTokens+u.CacheReadInputTokens > 0 {
+							inputTokens = u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+						}
+					}
 				}
 			}
-		}
-		if err := stream.Err(); err != nil {
-			yield(nil, fmt.Errorf("anthropic messages stream POST %s: %w", p.baseURL, err))
-			return
+			if err := stream.Err(); err != nil {
+				stream.Close()
+				yield(nil, fmt.Errorf("anthropic messages stream POST %s: %w", p.baseURL, err))
+				return
+			}
+			stream.Close()
+
+			// 跨轮累积 tool_use：续写轮返回完整 input 覆盖前轮部分截断。
+			for i := range roundTools {
+				t := roundTools[i]
+				if existing, ok := toolByID[t.id]; ok {
+					if t.input != "" {
+						existing.input = t.input
+					}
+				} else {
+					tc := t
+					toolByID[t.id] = &tc
+				}
+			}
+
+			// 非 max_tokens 表示正常结束（end_turn/tool_use/stop_sequence），停止续写。
+			if stopReason != "max_tokens" {
+				break
+			}
+			// 最后一轮仍 max_tokens：不再续写，进入最终响应构造。
+			if round == maxContinueRounds-1 {
+				break
+			}
+
+			// 构造本轮 assistant 消息追加到 messages，让下一轮从截断处续写。
+			// 必须含本轮全部 text + tool_use 块，模型据此恢复上下文继续输出。
+			assistantMsg := anthropic.MessageParam{Role: anthropic.MessageParamRoleAssistant}
+			if roundText.Len() > 0 {
+				assistantMsg.Content = append(assistantMsg.Content, anthropic.ContentBlockParamUnion{
+					OfText: &anthropic.TextBlockParam{Text: roundText.String()},
+				})
+			}
+			for _, t := range roundTools {
+				// 部分截断的 tool_use JSON 也按原样传回，Anthropic 后端会续写补全。
+				input := json.RawMessage(t.input)
+				if len(input) == 0 {
+					input = json.RawMessage("{}")
+				}
+				assistantMsg.Content = append(assistantMsg.Content, anthropic.ContentBlockParamUnion{
+					OfToolUse: &anthropic.ToolUseBlockParam{
+						ID: t.id, Name: t.name, Input: input,
+					},
+				})
+			}
+			// 本轮无任何 content 块（如 MaxTokens=1 命中 max_tokens 前未产出任何 token）：
+			// 追加空 content 的 assistant 消息会触发 Ark/Anthropic 端点 400 MissingParameter
+			// messages[i].content。无内容可续写，直接跳出进入最终响应构造。
+			if len(assistantMsg.Content) == 0 {
+				break
+			}
+			messages = append(messages, assistantMsg)
 		}
 
 		// 产出累积完整的最终响应（文本 + 工具调用 + 用量 + 结束原因）。
 		msg := blades.NewAssistantMessage(blades.StatusCompleted)
-		parts := make([]blades.Part, 0, len(tools)+1)
-		if text.Len() > 0 {
-			parts = append(parts, blades.TextPart{Text: text.String()})
+		parts := make([]blades.Part, 0, len(toolOrder)+1)
+		if accText.Len() > 0 {
+			parts = append(parts, blades.TextPart{Text: accText.String()})
 		}
-		for _, t := range tools {
+		for _, id := range toolOrder {
+			t := toolByID[id]
 			parts = append(parts, blades.NewToolPart(t.id, t.name, t.input))
 		}
 		msg.Parts = parts
@@ -208,8 +367,8 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 		}
 		msg.FinishReason = stopReason
 		// 思考过程经 Metadata 传递（blades 无对应 Part 类型），截断防止超长。
-		if thinking.Len() > 0 {
-			msg.Metadata = map[string]any{"thinking": truncateThinking(thinking.String())}
+		if accThinking.Len() > 0 {
+			msg.Metadata = map[string]any{"thinking": truncateThinking(accThinking.String())}
 		}
 		yield(&blades.ModelResponse{Message: msg}, nil)
 	}
@@ -420,52 +579,8 @@ func (p *anthropicProvider) convertTools(tools []bladestools.Tool) []anthropic.T
 	return out
 }
 
-// convertResponse 将 Anthropic 响应转换为 blades.Message。
-//
-// 参数：
-//   - resp: Anthropic Messages API 响应
-//
-// 返回：blades 消息。
-func (p *anthropicProvider) convertResponse(resp *anthropic.Message) *blades.Message {
-	// 创建 assistant 完成消息
-	msg := blades.NewAssistantMessage(blades.StatusCompleted)
-	// 预分配 parts
-	parts := make([]blades.Part, 0, len(resp.Content))
-
-	// 遍历响应内容块
-	var thinking strings.Builder
-	for _, block := range resp.Content {
-		switch v := block.AsAny().(type) {
-		case anthropic.TextBlock:
-			// 文本块
-			parts = append(parts, blades.TextPart{Text: v.Text})
-		case anthropic.ToolUseBlock:
-			// 工具调用块
-			input := string(v.Input)
-			parts = append(parts, blades.NewToolPart(v.ID, v.Name, input))
-		case anthropic.ThinkingBlock:
-			// 思考过程块：累积后经 Metadata 传递（blades 无对应 Part 类型）
-			thinking.WriteString(v.Thinking)
-		}
-	}
-
-	// 设置消息 parts
-	msg.Parts = parts
-	// 思考过程截断后放入 Metadata，供上层作为"思考过程"事件展示。
-	if thinking.Len() > 0 {
-		msg.Metadata = map[string]any{"thinking": truncateThinking(thinking.String())}
-	}
-	// 设置 token 用量：三字段合计还原真实输入（cache 命中时 input_tokens 恒 0）
-	inTok := resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens
-	msg.TokenUsage = blades.TokenUsage{
-		InputTokens:  inTok,
-		OutputTokens: resp.Usage.OutputTokens,
-		TotalTokens:  inTok + resp.Usage.OutputTokens,
-	}
-	// 设置完成原因
-	msg.FinishReason = string(resp.StopReason)
-	return msg
-}
+// convertResponse 已移除：Generate 改为带续写的累积逻辑，单轮响应转换被内联。
+// 如需单次转换可参考 Generate 中 round 循环内的 text/tool_use 累积分支。
 
 // schemaToMap 将 jsonschema.Schema 序列化为 map[string]any。
 //

@@ -238,15 +238,24 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)
 	// 全局派发总数上限：单 session 所有角色派发合计超限拒绝；用户新消息重置。
 	subAgentDispatcher.WithMaxTotalDispatches(cfg.Agent.MaxTotalDispatches)
-	// KV 共享记忆：主线程 Agent（meta/domain）持可写实例写关键上下文，
+	// Spec 强制：开启时 call_sub_agent 前必须先 WriteSpec(goal, acceptance, ...)，
+	// dispatcher 校验 parentID:spec 存在且新鲜，缺失则拒绝派发。默认 true。
+	if cfg.Agent.SpecEnforcementEnabled != nil {
+		subAgentDispatcher.WithSpecEnforcement(*cfg.Agent.SpecEnforcementEnabled)
+	} else {
+		subAgentDispatcher.WithSpecEnforcement(true)
+	}
+	// 共享记忆/spec：文件后端落盘到 <workDir>/.bma/shared/<hex(agentID)>__<slot>.md。
+	// 主线程 Agent（meta/domain）持可写实例写关键上下文与 spec，
 	// 子 Agent 派发时经 Dispatcher 的只读视图读取并注入任务前。
-	// 默认仅内存；需持久化时传 PostgresStore 适配的 KVStore（待后续实现）。
-	sharedKV := memory.NewInMemoryKV(true, nil)
+	// 文件 MD 格式：frontmatter 含 agent/slot/files mtime（+ spec 的 goal/acceptance/constraints），
+	// body 为人读文本。进程重启后文件保留（当前会话不主动恢复，避免旧 spec 复用）。
+	sharedKV := tool.NewFileSharedMemoryStore(workDir)
 	subAgentDispatcher.WithKVMemory(sharedKV)
 	// 注入会话级日志器：使子 Agent LLM I/O（完整 prompt/response）写入 session_logs，
 	// 与 MetaAgent 共用同一 sessionLogger 基础实例，子 Agent 运行时按 ctx 派生 session-scoped 视图。
 	subAgentDispatcher.WithLogger(sessionLogger)
-	// 把同一 sharedKV 注入工具注册表，使 WriteSharedMemory 工具能写入；
+	// 把同一 sharedKV 注入工具注册表，使 WriteSharedMemory/WriteSpec 工具能写入；
 	// MetaAgent 在派发复杂任务前调用 WriteSharedMemory 写入关键上下文，
 	// 子 Agent 经 dispatcher.injectKVMemory 自动读取。
 	toolRegistry.SetSharedMemory(sharedKV)
@@ -304,9 +313,15 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			rolePairByCode[p.CodeRole] = p
 		}
 		// 每个角色对独立编排器实例（AgentVerifier/Fixer 绑定各自角色）。
+		// ReviewEnabled 开启时装配 code_reviewer 作为 Reviewer，插入 PlanConfirm 与 SelfTest 之间。
+		// PlanSkipEnabled 默认 false（PlanConfirm 强制执行）；显式 true 跳过 PlanConfirm。
+		reviewRole := ""
+		if cfg.Agent.ReviewEnabled == nil || *cfg.Agent.ReviewEnabled {
+			reviewRole = "code_reviewer"
+		}
 		orchestrators := make(map[string]*verifyloop.Orchestrator, len(activePairs))
 		for _, p := range activePairs {
-			orchestrators[p.CodeRole] = verifyloop.New(subAgentDispatcher, sharedMailbox, cfg.Agent.VerificationMaxRounds, p.CodeRole, p.TestRole)
+			orchestrators[p.CodeRole] = verifyloop.NewWithReviewer(subAgentDispatcher, sharedMailbox, cfg.Agent.VerificationMaxRounds, p.CodeRole, p.TestRole, reviewRole, cfg.Agent.PlanSkipEnabled)
 		}
 		subAgentDispatcher.SetOnSubAgentDone(func(parentID, subAgentID, roleID, task, resultText string) {
 			pair, ok := rolePairByCode[roleID]

@@ -223,39 +223,51 @@ func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, t
 
 // createBladesProvider 根据配置中的 Provider 字段选择对应的 blades.ModelProvider 实现。
 //
-// 职责：provider 类型分发。
+// 职责：provider 类型分发 + 统一包装 3 次重试。
 //   - openai（或空）：使用 blades/contrib/openai 的 OpenAI 兼容 provider。
 //   - anthropic：使用 Anthropic Go SDK 原生 Messages API。
 //   - ollama：使用 Ollama Go SDK 原生 /api/chat。
+//
+// 所有 provider 构造后经 wrapWithRetry 包装，Generate 调用失败时自动重试 3 次，
+// 覆盖 429/503/超时/空响应等可重试状态；3 次后仍失败返回错误给上级。
 //
 // 参数：
 //   - cfg: 模型配置
 //
 // 返回：
-//   - blades.ModelProvider: 构造好的 provider
+//   - blades.ModelProvider: 构造好的 provider（已包装重试）
 //   - error: 不支持的 provider 类型
 //
 // 副作用：无外部状态变更。
 // 并发安全：纯函数式构造，可并发调用。
 func createBladesProvider(cfg types.AgentModelConfig) (blades.ModelProvider, error) {
 	// 根据 provider 名称分发
+	var inner blades.ModelProvider
+	var err error
 	switch cfg.Provider {
 	case "openai", "openai-deepseek", "":
 		// openai-deepseek 走专用 provider：捕获并回传 reasoning_content，
 		// 避免 DeepSeek V4 思考模型 400 "reasoning_content must be passed back"。
 		// 空字符串视为 openai 兼容默认值。
 		if cfg.Provider == "openai-deepseek" {
-			return newDeepSeekProvider(cfg), nil
+			inner = newDeepSeekProvider(cfg)
+		} else {
+			inner = newOpenAIProvider(cfg)
 		}
-		return newOpenAIProvider(cfg), nil
 	case "anthropic":
 		// Anthropic 原生 Messages API
-		return newAnthropicProvider(cfg), nil
+		inner = newAnthropicProvider(cfg)
 	case "ollama":
 		// Ollama 本地 /api/chat
-		return newOllamaProvider(cfg)
+		inner, err = newOllamaProvider(cfg)
+		if err != nil {
+			return nil, err
+		}
 	default:
 		// 后续可在此扩展 azure/bedrock 等分支
 		return nil, fmt.Errorf("unsupported provider: %s", cfg.Provider)
 	}
+	// 统一包装 3 次重试：覆盖所有 provider 的 Generate 调用，
+	// 非成功状态（含 402 余额不足、429 限速、5xx 服务端错误、超时、空响应）自动重试。
+	return wrapWithRetry(inner, cfg.Model), nil
 }

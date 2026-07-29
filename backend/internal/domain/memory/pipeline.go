@@ -41,6 +41,10 @@ type Pipeline struct {
 	// summarizer 是可选的轻量模型摘要器：事件数超过 eventSummarizeThreshold 时调用，
 	// 把原始事件列表压成短摘要注入上下文，显著降低长任务的 token 占用。
 	summarizer EventSummarizer
+	// consecutiveBalanceErrors 记录摘要器连续返回 Insufficient Balance（402）错误的次数。
+	// 达到 2 次后关闭摘要路径，直接用 raw join，避免每次调用白等 5s 超时（实证 DeepSeek 余额耗尽）。
+	// 摘要成功时重置为 0。受 mu 保护。
+	consecutiveBalanceErrors int
 }
 
 // Store 抽象了事件流的持久化能力，实现者负责把事件保存到磁盘或数据库。
@@ -134,19 +138,42 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 	// 否则直接 join 原始事件文本。摘要失败降级为直接 join，不影响主流程。
 	body := joinNonEmpty("\n", summary)
 	if p.summarizer != nil && len(summary) > eventSummarizeThreshold {
-		// 给摘要调用设 15 秒超时：轻量模型（deepseek-v4-flash 等）在事件数 10-20 条时
-		// 经常 5-10s 才返回，5s 全部超时降级 raw join，反而把 token 撑爆。15s 平衡主循环卡顿与摘要命中率。
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		summarized, err := p.summarizer(ctx, summary)
-		cancel()
-		if err != nil {
-			// 摘要失败：记录警告，降级为原始 join，主流程不中断。
-			slog.Warn("pipeline: summarize events failed, fallback to raw join",
-				"agent_id", agentID, "event_count", len(summary), "err", err)
-		} else if trimmed := strings.TrimSpace(summarized); trimmed != "" {
-			// 摘要成功且非空：用摘要替换原始 body，显著降低 token 占用。
-			// 保留原始事件数标注，便于 LLM 识别这是压缩后的快照。
-			body = fmt.Sprintf("[已摘要 %d 条事件] %s", len(summary), trimmed)
+		// 给摘要调用设 5 秒超时：轻量模型 15s 等待在 DeepSeek 余额不足时白等（实证 11 次 402 错误），
+		// 5s 足够正常摘要返回；超时立即降级 raw join，避免主循环卡顿。
+		// 若连续 2 次 Insufficient Balance，关闭摘要路径降级到 raw join 直到进程重启。
+		summarizerDisabled := false
+		p.mu.RLock()
+		summarizerDisabled = p.consecutiveBalanceErrors >= 2
+		p.mu.RUnlock()
+		if !summarizerDisabled {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			summarized, err := p.summarizer(ctx, summary)
+			cancel()
+			if err != nil {
+				// 检测余额不足：DeepSeek 402 错误持续重试无意义，连续 2 次后关闭摘要路径。
+				if strings.Contains(err.Error(), "Insufficient Balance") || strings.Contains(err.Error(), "402") {
+					p.mu.Lock()
+					p.consecutiveBalanceErrors++
+					count := p.consecutiveBalanceErrors
+					p.mu.Unlock()
+					slog.Warn("pipeline: summarize got Insufficient Balance, will disable after 2 consecutive errors",
+						"agent_id", agentID, "consecutive_count", count)
+					if count >= 2 {
+						slog.Warn("pipeline: summarizer disabled (Insufficient Balance x2), falling back to raw join until restart")
+					}
+				}
+				// 摘要失败：记录警告，降级为原始 join，主流程不中断。
+				slog.Warn("pipeline: summarize events failed, fallback to raw join",
+					"agent_id", agentID, "event_count", len(summary), "err", err)
+			} else if trimmed := strings.TrimSpace(summarized); trimmed != "" {
+				// 摘要成功：重置连续错误计数。
+				p.mu.Lock()
+				p.consecutiveBalanceErrors = 0
+				p.mu.Unlock()
+				// 摘要成功且非空：用摘要替换原始 body，显著降低 token 占用。
+				// 保留原始事件数标注，便于 LLM 识别这是压缩后的快照。
+				body = fmt.Sprintf("[已摘要 %d 条事件] %s", len(summary), trimmed)
+			}
 		}
 	}
 

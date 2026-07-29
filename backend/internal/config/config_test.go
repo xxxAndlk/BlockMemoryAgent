@@ -49,4 +49,16 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if p.CodeRole != "code_assistant" || p.TestRole != "test_assistant" {
 		t.Fatalf("default pair mismatch: %+v", p)
 	}
+	// Spec 强制默认开启：派发方必须先 WriteSpec 再 call_sub_agent。
+	if cfg.Agent.SpecEnforcementEnabled == nil || !*cfg.Agent.SpecEnforcementEnabled {
+		t.Fatal("spec_enforcement_enabled 默认应为 true")
+	}
+	// Review 阶段默认开启：verifyloop 插入 code_reviewer 静态审查。
+	if cfg.Agent.ReviewEnabled == nil || !*cfg.Agent.ReviewEnabled {
+		t.Fatal("review_enabled 默认应为 true")
+	}
+	// PlanSkipEnabled 默认 false（零值）：PlanConfirm 强制执行。
+	if cfg.Agent.PlanSkipEnabled {
+		t.Fatal("plan_skip_enabled 默认应为 false")
+	}
 }

@@ -3,7 +3,6 @@ package subagent
 // 导入测试与项目依赖包。
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -750,14 +749,10 @@ func TestInjectKVMemory_Layer3StaleDetection(t *testing.T) {
 	// 构造 dispatcher（不需要真实 provider，只测 injectKVMemory 纯函数行为）。
 	d := &Dispatcher{}
 
-	// Case 1: SharedEntry JSON，mtime 匹配 -> 拼接 Content 前缀。
+	// Case 1: MD frontmatter mtime 匹配 -> 拼接 body 前缀。
 	kv := newTestKVMemory(true)
-	entry := sharedEntryMirror{
-		Files:   map[string]int64{target: origMtime},
-		Content: "stale.go is v1",
-	}
-	val, _ := json.Marshal(entry)
-	_ = kv.Set(context.Background(), "meta:shared", string(val))
+	md := tool.EncodeSharedMD("meta", "shared", map[string]int64{target: origMtime}, "stale.go is v1")
+	_ = kv.Set(context.Background(), "meta:shared", md)
 	d.WithKVMemory(kv)
 
 	got := d.injectKVMemory(context.Background(), "meta", "do task")
@@ -800,19 +795,112 @@ func TestInjectKVMemory_Layer3StaleDetection(t *testing.T) {
 	}
 }
 
-// TestInjectKVMemory_NoFilesSkipsStatCheck 验证 Layer 3 边界：SharedEntry.Files 为空时
-// 跳过 stat 校验（无 path 需校验），Content 直接拼接。
+// TestInjectKVMemory_NoFilesSkipsStatCheck 验证 Layer 3 边界：frontmatter files 为空时
+// 跳过 stat 校验（无 path 需校验），body 直接拼接。
 func TestInjectKVMemory_NoFilesSkipsStatCheck(t *testing.T) {
 	d := &Dispatcher{}
 	kv := newTestKVMemory(true)
-	entry := sharedEntryMirror{Content: "pure conclusion no files"}
-	val, _ := json.Marshal(entry)
-	_ = kv.Set(context.Background(), "meta:shared", string(val))
+	md := tool.EncodeSharedMD("meta", "shared", nil, "pure conclusion no files")
+	_ = kv.Set(context.Background(), "meta:shared", md)
 	d.WithKVMemory(kv)
 
 	got := d.injectKVMemory(context.Background(), "meta", "do task")
 	if !strings.Contains(got, "pure conclusion no files") {
 		t.Fatalf("expected content injected when Files empty, got: %q", got)
+	}
+}
+
+// TestInjectSpec_RendersPrefix 验证 injectSpec 把 parentID:spec 渲染为【任务规范】前缀。
+// spec 存在且新鲜时返回前缀；缺失/stale/解析失败时返回空串。
+func TestInjectSpec_RendersPrefix(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "game.js")
+	if err := os.WriteFile(target, []byte("var x = 1"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	fi, _ := os.Stat(target)
+	mtime := fi.ModTime().Unix()
+
+	// Case 1: spec 存在且新鲜 -> 渲染前缀。
+	kv := newTestKVMemory(true)
+	spec := tool.Spec{
+		Goal:        "canvas 宽度改为 1280",
+		Acceptance:  []string{"node -c game.js 通过"},
+		Constraints: []string{"不碰其他配置"},
+		Files:       []string{target},
+	}
+	md := tool.EncodeSpecMD("meta", spec, map[string]int64{target: mtime})
+	_ = kv.Set(context.Background(), "meta:spec", md)
+
+	d := &Dispatcher{}
+	d.WithKVMemory(kv)
+	got := d.injectSpec(context.Background(), "meta")
+	if !strings.Contains(got, "【任务规范】") {
+		t.Fatalf("expected spec prefix marker, got: %q", got)
+	}
+	if !strings.Contains(got, "canvas 宽度改为 1280") {
+		t.Fatalf("expected goal in prefix, got: %q", got)
+	}
+	if !strings.Contains(got, "node -c game.js 通过") {
+		t.Fatalf("expected acceptance in prefix, got: %q", got)
+	}
+	if !strings.Contains(got, "不碰其他配置") {
+		t.Fatalf("expected constraint in prefix, got: %q", got)
+	}
+
+	// Case 2: 缺失 spec -> 空串。
+	d2 := &Dispatcher{}
+	d2.WithKVMemory(newTestKVMemory(true))
+	if got := d2.injectSpec(context.Background(), "meta"); got != "" {
+		t.Fatalf("expected empty when spec missing, got: %q", got)
+	}
+
+	// Case 3: stale（文件被改 mtime 不匹配）-> 空串。
+	newTime := time.Now().Add(5 * time.Second)
+	_ = os.Chtimes(target, newTime, newTime)
+	if got := d.injectSpec(context.Background(), "meta"); got != "" {
+		t.Fatalf("expected empty when spec stale, got: %q", got)
+	}
+}
+
+// TestHasFreshSpec 验证 SpecEnforcementEnabled 校验逻辑。
+// spec 存在、新鲜、Goal 非空、Acceptance 非空时返回 true。
+func TestHasFreshSpec(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "foo.js")
+	if err := os.WriteFile(target, []byte("v1"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	fi, _ := os.Stat(target)
+	mtime := fi.ModTime().Unix()
+
+	// Case 1: 合法 spec -> true。
+	kv := newTestKVMemory(true)
+	spec := tool.Spec{Goal: "g", Acceptance: []string{"a"}}
+	md := tool.EncodeSpecMD("meta", spec, map[string]int64{target: mtime})
+	_ = kv.Set(context.Background(), "meta:spec", md)
+	d := &Dispatcher{}
+	d.WithKVMemory(kv)
+	if !d.hasFreshSpec(context.Background(), "meta") {
+		t.Fatal("expected hasFreshSpec=true for valid spec")
+	}
+
+	// Case 2: spec 缺失 -> false。
+	d2 := &Dispatcher{}
+	d2.WithKVMemory(newTestKVMemory(true))
+	if d2.hasFreshSpec(context.Background(), "meta") {
+		t.Fatal("expected hasFreshSpec=false when spec missing")
+	}
+
+	// Case 3: Acceptance 空 -> false。
+	spec3 := tool.Spec{Goal: "g"}
+	md3 := tool.EncodeSpecMD("meta", spec3, nil)
+	kv3 := newTestKVMemory(true)
+	_ = kv3.Set(context.Background(), "meta:spec", md3)
+	d3 := &Dispatcher{}
+	d3.WithKVMemory(kv3)
+	if d3.hasFreshSpec(context.Background(), "meta") {
+		t.Fatal("expected hasFreshSpec=false when acceptance empty")
 	}
 }
 

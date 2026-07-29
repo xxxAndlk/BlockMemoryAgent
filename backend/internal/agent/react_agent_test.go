@@ -336,12 +336,16 @@ func TestWindowMessages(t *testing.T) {
 	if out[0].Role != "system" {
 		t.Fatal("应保留 system 前缀")
 	}
-	if !strings.Contains(out[1].Content, "省略") {
-		t.Fatalf("第 2 条应为省略说明，got: %s", out[1].Content)
+	// 首条 user（任务目标）必须保留，避免子 Agent 跑几轮后 task 被占位替换。
+	if out[1].Content != "g" {
+		t.Fatalf("第 2 条应为保留的首条 user 任务目标，got: %s", out[1].Content)
+	}
+	if !strings.Contains(out[2].Content, "省略") {
+		t.Fatalf("第 3 条应为省略说明，got: %s", out[2].Content)
 	}
 	// 保留段应从 user 边界开始，不能出现悬空的 tool 消息。
-	if out[2].Role != "user" {
-		t.Fatalf("保留段应从 user 边界开始，got role=%s", out[2].Role)
+	if out[3].Role != "user" {
+		t.Fatalf("保留段应从 user 边界开始，got role=%s", out[3].Role)
 	}
 	if out[len(out)-1].Content != "a3" {
 		t.Fatal("最近消息应保留")

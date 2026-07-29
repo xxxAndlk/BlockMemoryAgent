@@ -72,10 +72,27 @@ type Verifier interface {
 //   - 实现且 PlanConfirm 返回 Verdict.Passed=true 才进 SelfTest；
 //   - 实现且返回 false 则 Fixer.Fix 后再确认（受 maxRounds 约束）；
 //   - 未实现则跳过，直接进 SelfTest（向后兼容）。
+//
+// PlanConfirm 强制开关：planSkipEnabled=true 时跳过本阶段（向后兼容无 PlanConfirm 实现的自定义 Verifier）；
+// 默认 false（强制执行），AgentVerifier 已实现 PlanConfirm。
 type PlanConfirmVerifier interface {
 	// PlanConfirm 让测试方列方案并交产出方确认。
 	// produced 为当前产出；返回 Verdict.Passed=true 表示方案确认通过，可进 SelfTest。
 	PlanConfirm(ctx context.Context, req Request, produced string) (Verdict, error)
+}
+
+// Reviewer 是可选的静态审查接口：PlanConfirm 通过后、SelfTest 前对产出做代码审查。
+// 实现方决定审查方式：派发 code_reviewer Agent、调 lint CLI、跑静态分析工具等均可。
+// 引擎 Run 通过 reviewer 字段是否为 nil 决定是否执行 Review 阶段（向后兼容）。
+//
+// Review 与 SelfTest/UnifiedTest 的区别：
+//   - Review 关注静态质量（bug/安全/风格/边界/错误处理），不执行代码；
+//   - SelfTest 关注单元/功能级动态验证（跑测试）；
+//   - UnifiedTest 关注模块/集成级动态验证（构建+跨模块回归）。
+type Reviewer interface {
+	// Review 对产出做静态审查，返回 Verdict。
+	// 未通过时引擎用 Fixer 修正产出后再次审查（受 maxRounds 约束）。
+	Review(ctx context.Context, req Request, produced string) (Verdict, error)
 }
 
 // Fixer 基于验证失败反馈修正产出，返回新的产出文本。
@@ -109,28 +126,32 @@ type Request struct {
 
 // Result 描述一次验证闭环的最终结果。
 type Result struct {
-	Passed            bool    // 整体是否通过（自测 + 上级统一测试均通过）
-	Rounds            int     // 实际往返轮数（自测 + 修正循环次数）
-	FinalProduced     string  // 最终产出（最后一轮修正后的产出）
-	PlanConfirmVerdict Verdict // 最后一轮方案确认结论（仅 Verifier 实现 PlanConfirmVerifier 时有值）
-	SelfTestVerdict   Verdict  // 最后一轮自测结论
-	UnifiedVerdict    Verdict  // 最后一轮上级统一测试结论（仅通过自测后才有）
-	FailReason        string   // 未通过时的失败原因
+	Passed             bool     // 整体是否通过（自测 + 上级统一测试均通过）
+	Rounds             int      // 实际往返轮数（自测 + 修正循环次数）
+	FinalProduced      string   // 最终产出（最后一轮修正后的产出）
+	PlanConfirmVerdict Verdict  // 最后一轮方案确认结论（仅 Verifier 实现 PlanConfirmVerifier 且未跳过时有值）
+	ReviewVerdict       Verdict  // 最后一轮静态审查结论（仅 reviewer != nil 时有值）
+	SelfTestVerdict    Verdict   // 最后一轮自测结论
+	UnifiedVerdict     Verdict   // 最后一轮上级统一测试结论（仅通过自测后才有）
+	FailReason         string   // 未通过时的失败原因
 }
 
 // Orchestrator 是验证闭环状态机引擎。零值不可用，须通过 New 构造。
 // 引擎只消费 Verifier/Fixer/Reporter 接口，不绑定具体验证方式。
 type Orchestrator struct {
-	verifier Verifier
-	fixer    Fixer
-	reporter Reporter
-	maxRounds int
+	verifier       Verifier
+	reviewer       Reviewer // 可选静态审查器，nil 跳过 Review 阶段
+	fixer          Fixer
+	reporter       Reporter
+	maxRounds      int
+	planSkipEnabled bool // true 跳过 PlanConfirm（向后兼容无实现的自定义 Verifier）
 }
 
 // New 创建编排器，使用默认的 AgentVerifier + AgentFixer + MailboxReporter 装配。
 // runner 提供 ExecuteChild 能力（通常 *subagent.Dispatcher）；mb 用于默认 Reporter；
 // codeRole/testRole 为 Agent 验证器派发的角色 ID；maxRounds<=0 时回退 defaultMaxRounds。
 // 这是向后兼容的快捷构造入口；需要自定义验证器/修正器/上报器时用 NewWith。
+// 默认不启用 Review 阶段（reviewer=nil），需要 code_reviewer 静态审查时用 NewWithReviewer。
 func New(runner Runner, mb *mailbox.Mailbox, maxRounds int, codeRole, testRole string) *Orchestrator {
 	if maxRounds <= 0 {
 		maxRounds = defaultMaxRounds
@@ -143,8 +164,23 @@ func New(runner Runner, mb *mailbox.Mailbox, maxRounds int, codeRole, testRole s
 	}
 }
 
+// NewWithReviewer 在 New 基础上启用 Review 阶段：派发 reviewRole 做 code_reviewer 静态审查。
+// reviewRole 为空时退化为 New（不启用 Review）。
+// planSkipEnabled 为 true 时跳过 PlanConfirm（向后兼容）；默认 false 强制执行。
+// 这是 Spec->Plan->Code->Review->Test 标准流程的默认装配入口。
+func NewWithReviewer(runner Runner, mb *mailbox.Mailbox, maxRounds int, codeRole, testRole, reviewRole string, planSkipEnabled bool) *Orchestrator {
+	o := New(runner, mb, maxRounds, codeRole, testRole)
+	o.planSkipEnabled = planSkipEnabled
+	if reviewRole != "" {
+		o.reviewer = NewAgentReviewer(runner, reviewRole, verifyMarkerPass, verifyMarkerFail)
+	}
+	return o
+}
+
 // NewWith 用自定义 Verifier/Fixer/Reporter 装配编排器，支持 ComputerUse/CLI/MCP 等非 Agent 验证场景。
 // maxRounds<=0 时回退 defaultMaxRounds。任一接口为 nil 时引擎在对应步骤 panic（调用方应确保装配完整）。
+// 默认不启用 Review 阶段；PlanConfirm 按 type-assert 触发（Verifier 实现 PlanConfirmVerifier 即执行，
+// 否则跳过）。planSkipEnabled=true 可显式跳过 PlanConfirm。
 func NewWith(verifier Verifier, fixer Fixer, reporter Reporter, maxRounds int) *Orchestrator {
 	if maxRounds <= 0 {
 		maxRounds = defaultMaxRounds
@@ -176,24 +212,54 @@ func (o *Orchestrator) runEngine(ctx context.Context, req Request) Result {
 			return result
 		}
 
-		// 步骤 0（可选）：方案确认前置。
-		// Verifier 实现 PlanConfirmVerifier 时先列测试方案交产出方确认，
-		// 未通过则 Fixer 修正后再次确认（受 maxRounds 约束）。
-		if pc, ok := o.verifier.(PlanConfirmVerifier); ok {
-			planVerdict, err := pc.PlanConfirm(ctx, req, produced)
+		// 步骤 0：方案确认前置（type-assert 触发，planSkipEnabled=true 显式跳过）。
+		// Verifier 实现 PlanConfirmVerifier 且 planSkipEnabled=false 时执行：
+		// 先列测试方案交产出方确认，未通过则 Fixer 修正后再次确认（受 maxRounds 约束）。
+		// 默认装配（NewWithReviewer）传 AgentVerifier，已实现 PlanConfirm，默认执行。
+		if !o.planSkipEnabled {
+			if pc, ok := o.verifier.(PlanConfirmVerifier); ok {
+				planVerdict, err := pc.PlanConfirm(ctx, req, produced)
+				if err != nil {
+					if cerr := ctx.Err(); cerr != nil {
+						result.FailReason = fmt.Sprintf("round %d cancelled: %v", round, cerr)
+						return result
+					}
+					result.FailReason = fmt.Sprintf("round %d plan-confirm failed: %v", round, err)
+					return result
+				}
+				result.PlanConfirmVerdict = planVerdict
+				if !planVerdict.Passed {
+					fixed, ferr := o.fixer.Fix(ctx, req, produced, failFeedback(planVerdict))
+					if ferr != nil {
+						result.FailReason = fmt.Sprintf("round %d fix after plan-reject: %v", round, ferr)
+						return result
+					}
+					produced = fixed
+					result.FinalProduced = produced
+					continue
+				}
+			}
+		}
+
+		// 步骤 0.5（可选）：静态审查（code_reviewer）。
+		// reviewer == nil 时跳过（CLIVerifier/MCPVerifier 等场景）。
+		// PlanConfirm 通过后、SelfTest 前对产出做 bug/安全/风格/边界审查，
+		// 未通过则 Fixer 修正后再次审查（受 maxRounds 约束）。
+		if o.reviewer != nil {
+			reviewVerdict, err := o.reviewer.Review(ctx, req, produced)
 			if err != nil {
 				if cerr := ctx.Err(); cerr != nil {
 					result.FailReason = fmt.Sprintf("round %d cancelled: %v", round, cerr)
 					return result
 				}
-				result.FailReason = fmt.Sprintf("round %d plan-confirm failed: %v", round, err)
+				result.FailReason = fmt.Sprintf("round %d review failed: %v", round, err)
 				return result
 			}
-			result.PlanConfirmVerdict = planVerdict
-			if !planVerdict.Passed {
-				fixed, ferr := o.fixer.Fix(ctx, req, produced, failFeedback(planVerdict))
+			result.ReviewVerdict = reviewVerdict
+			if !reviewVerdict.Passed {
+				fixed, ferr := o.fixer.Fix(ctx, req, produced, failFeedback(reviewVerdict))
 				if ferr != nil {
-					result.FailReason = fmt.Sprintf("round %d fix after plan-reject: %v", round, ferr)
+					result.FailReason = fmt.Sprintf("round %d fix after review-reject: %v", round, ferr)
 					return result
 				}
 				produced = fixed

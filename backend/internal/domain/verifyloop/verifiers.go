@@ -96,6 +96,42 @@ func (v *AgentVerifier) execute(ctx context.Context, parentID, task string) (str
 	return v.runner.ExecuteChild(childCtx, parentID, v.testRole, task)
 }
 
+// AgentReviewer 通过派发 code_reviewer 角色做静态代码审查，解析 [VERIFY:PASS/FAIL] 标记归一为 Verdict。
+// reviewRole 为审查角色 ID（如 code_reviewer）；passMarker/failMarker 与 AgentVerifier 共用包级常量。
+// 实现 Reviewer 接口，供 Orchestrator 在 PlanConfirm 通过后、SelfTest 前调用。
+type AgentReviewer struct {
+	runner     Runner
+	reviewRole string
+	passMarker string
+	failMarker string
+}
+
+// NewAgentReviewer 创建默认的 Agent 审查器。reviewRole 为审查角色 ID（如 code_reviewer）。
+func NewAgentReviewer(r Runner, reviewRole, passMarker, failMarker string) *AgentReviewer {
+	return &AgentReviewer{runner: r, reviewRole: reviewRole, passMarker: passMarker, failMarker: failMarker}
+}
+
+// Review 派发 code_reviewer 角色对产出做静态审查（bug/安全/风格/边界/错误处理）。
+// 不执行代码，只读 ReadFile/SearchInFiles/GitDiff 产出 findings。
+// 最终答复末尾必须单独一行输出 [VERIFY:PASS] 或 [VERIFY:FAIL] + 原因。
+func (v *AgentReviewer) Review(ctx context.Context, req Request, produced string) (Verdict, error) {
+	task := fmt.Sprintf("【代码审查】对以下产出做静态审查，判断是否可发布。\n\n"+
+		"【原始任务】\n%s\n\n"+
+		"【产出】\n%s\n\n"+
+		"审查维度：bug/逻辑错误、安全漏洞、风格一致性、边界遗漏、错误处理缺失。\n"+
+		"用 ReadFile/SearchInFiles/GitDiff 审查，不执行代码、不重写实现。\n"+
+		"只输出 findings 列表（按严重度排序）。"+
+		"最终答复末尾必须单独一行输出 %s（无阻断性问题）或 %s（附阻断原因与受影响范围）。",
+		req.InitialTask, produced, v.passMarker, v.failMarker)
+	childCtx, cancel := context.WithTimeout(ctx, defaultChildTimeout)
+	defer cancel()
+	report, err := v.runner.ExecuteChild(childCtx, req.ParentID, v.reviewRole, task)
+	if err != nil {
+		return Verdict{}, err
+	}
+	return ParseAgentVerdict(report), nil
+}
+
 // AgentFixer 通过派发编码 Agent 修正产出。
 type AgentFixer struct {
 	runner   Runner
@@ -243,4 +279,5 @@ var (
 	_ Verifier = (*MCPVerifier)(nil)
 	_ Fixer    = (*AgentFixer)(nil)
 	_ Reporter = (*MailboxReporter)(nil)
+	_ Reviewer = (*AgentReviewer)(nil)
 )

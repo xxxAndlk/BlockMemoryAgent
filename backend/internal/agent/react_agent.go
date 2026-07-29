@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"runtime"
 	"strings"
 	"time"
@@ -429,6 +430,8 @@ type streamingModelProvider interface {
 // 否则回退到一次性 Generate。
 func (a *ReActAgent) generateOnce(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
 	start := time.Now()
+	role := a.role.Name
+	log.Printf("[react] llm start: role=%s model=%s msgs=%d", role, a.llmModelName(), len(req.Messages))
 	var resp *blades.ModelResponse
 	var err error
 	if sp, ok := a.llm.(streamingModelProvider); ok {
@@ -436,8 +439,14 @@ func (a *ReActAgent) generateOnce(ctx context.Context, req *blades.ModelRequest)
 	} else {
 		resp, err = a.llm.Generate(ctx, req)
 	}
+	dur := time.Since(start)
+	if err != nil {
+		log.Printf("[react] llm FAIL: role=%s dur=%s err=%v", role, dur, err)
+	} else {
+		log.Printf("[react] llm done: role=%s dur=%s", role, dur)
+	}
 	// 无论成功失败都记录完整 LLM I/O 到 session_logs，便于排查 token 暴涨/失忆问题。
-	a.logLLMCall(ctx, req, resp, err, time.Since(start))
+	a.logLLMCall(ctx, req, resp, err, dur)
 	return resp, err
 }
 
@@ -697,25 +706,38 @@ func windowMessages(messages []ReactMessage, max int) []ReactMessage {
 	for keep < len(messages) && messages[keep].Role == "system" {
 		keep++
 	}
-	// 预算：system 前缀 + 省略说明各占 1 条，其余留给最近消息。
-	budget := max - keep - 1
+	// 首条 user（任务目标）必须保留：与 summarizeWindow 行为对齐。
+	// 不保留会导致子 Agent 跑几轮后 task 被中间占位替换，报告"只看到前导语，看不到 task 正文"。
+	firstUserIdx := -1
+	for i := keep; i < len(messages); i++ {
+		if messages[i].Role == "user" {
+			firstUserIdx = i
+			break
+		}
+	}
+	if firstUserIdx < 0 {
+		return messages
+	}
+	// 预算：system 前缀 + 首条 user + 省略说明各占 1 条，其余留给最近消息。
+	budget := max - keep - 2
 	if budget < 1 {
 		budget = 1
 	}
 	start := len(messages) - budget
-	if start < keep {
-		start = keep
+	if start < firstUserIdx+1 {
+		start = firstUserIdx + 1
 	}
 	// 向前移动 start 到最近的 user 边界，保证 tool 调用链完整。
-	for start < len(messages) && start > keep && messages[start].Role != "user" {
+	for start < len(messages) && start > firstUserIdx+1 && messages[start].Role != "user" {
 		start++
 	}
-	omitted := start - keep
+	omitted := start - firstUserIdx - 1
 	if omitted <= 0 {
 		return messages
 	}
 	out := make([]ReactMessage, 0, len(messages)-omitted+1)
 	out = append(out, messages[:keep]...)
+	out = append(out, messages[firstUserIdx]) // 首条 user 任务目标
 	// 占位文本固定（不含动态计数）：避免每轮 omitted 变化导致前缀缓存失效。
 	out = append(out, ReactMessage{
 		Role:    "user",

@@ -3,7 +3,6 @@ package tool
 // 导入测试所需标准库与项目包。
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -258,19 +257,19 @@ func (s *stubCallSubAgent) Execute(ctx context.Context, args map[string]any) *Re
 }
 
 // TestSchemaIncludesCallSubAgent 验证：call_sub_agent 注册后出现在 LLM 工具
-// schema 中，且描述文本来自工具的 Description()；未注册时 schema 只有 12 个内置工具
-// （ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles/HTTPGet/HTTPPost/GitDiff/GitStatus/GitLog/GitBlame/WriteSharedMemory）。
+// schema 中，且描述文本来自工具的 Description()；未注册时 schema 有 13 个内置工具
+// （ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles/HTTPGet/HTTPPost/GitDiff/GitStatus/GitLog/GitBlame/WriteSharedMemory/WriteSpec）。
 func TestSchemaIncludesCallSubAgent(t *testing.T) {
-	// 未安装 call_sub_agent 时，schema 恰为 12 个内置工具。
+	// 未安装 call_sub_agent 时，schema 恰为 13 个内置工具（含 WriteSpec）。
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	if n := len(r.Schema()); n != 12 {
-		t.Fatalf("expected 12 builtin tools without call_sub_agent, got %d", n)
+	if n := len(r.Schema()); n != 13 {
+		t.Fatalf("expected 13 builtin tools without call_sub_agent, got %d", n)
 	}
 	// 安装后应出现在 schema 中，且描述来自 Description()。
 	r.Register(&stubCallSubAgent{})
 	schema := r.Schema()
-	if len(schema) != 13 {
-		t.Fatalf("expected 12 tools with call_sub_agent, got %d", len(schema))
+	if len(schema) != 14 {
+		t.Fatalf("expected 13 tools with call_sub_agent, got %d", len(schema))
 	}
 	// 遍历查找 call_sub_agent 并校验描述文本。
 	found := false
@@ -319,7 +318,7 @@ func (s *fakeSharedMemoryStore) Keys(ctx context.Context) []string {
 }
 
 // TestWriteSharedMemory_StructuredAndFileTracking 验证 Layer 1：WriteSharedMemory
-// 入参 files 被结构化存为 SharedEntry JSON，含 mtime 戳。files 缺省时退化为旧格式兼容。
+// 入参 files 被结构化存为 MD frontmatter（files mtime map），body 为 content 原文。
 func TestWriteSharedMemory_StructuredAndFileTracking(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "foo.go")
@@ -333,7 +332,7 @@ func TestWriteSharedMemory_StructuredAndFileTracking(t *testing.T) {
 
 	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
 
-	// 带 files 调用：KV value 应为 JSON，含 foo.go 的 mtime。
+	// 带 files 调用：MD frontmatter 含 foo.go 的 mtime，body 为 content。
 	res, err := r.Dispatch(ctx, "WriteSharedMemory", map[string]any{
 		"content": "foo.go defines package foo",
 		"files":   []any{target},
@@ -349,18 +348,18 @@ func TestWriteSharedMemory_StructuredAndFileTracking(t *testing.T) {
 	if val == "" {
 		t.Fatal("expected KV entry after WriteSharedMemory")
 	}
-	var entry SharedEntry
-	if err := json.Unmarshal([]byte(val), &entry); err != nil {
-		t.Fatalf("KV value not JSON: %v (val=%q)", err, val)
+	fm, body, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatalf("KV value not MD: %q", val)
 	}
-	if entry.Content != "foo.go defines package foo" {
-		t.Fatalf("unexpected content: %q", entry.Content)
+	if body != "foo.go defines package foo" {
+		t.Fatalf("unexpected body: %q", body)
 	}
-	if len(entry.Files) != 1 {
-		t.Fatalf("expected 1 tracked file, got %d", len(entry.Files))
+	if len(fm.Files) != 1 {
+		t.Fatalf("expected 1 tracked file, got %d", len(fm.Files))
 	}
-	if _, ok := entry.Files[target]; !ok {
-		t.Fatalf("expected %s in Files map, got %v", target, entry.Files)
+	if _, ok := fm.Files[target]; !ok {
+		t.Fatalf("expected %s in Files map, got %v", target, fm.Files)
 	}
 
 	// files 缺省调用：仍写 KV，Files 为空 map。
@@ -374,15 +373,15 @@ func TestWriteSharedMemory_StructuredAndFileTracking(t *testing.T) {
 		t.Fatalf("expected success2, got: %s", res2.Error)
 	}
 	val2, _ := store.Get(ctx, "meta-1:shared")
-	var entry2 SharedEntry
-	if err := json.Unmarshal([]byte(val2), &entry2); err != nil {
-		t.Fatalf("KV value2 not JSON: %v", err)
+	fm2, body2, ok := DecodeSharedMD(val2)
+	if !ok {
+		t.Fatalf("KV value2 not MD: %q", val2)
 	}
-	if entry2.Content != "no files summary" {
-		t.Fatalf("unexpected content2: %q", entry2.Content)
+	if body2 != "no files summary" {
+		t.Fatalf("unexpected body2: %q", body2)
 	}
-	if len(entry2.Files) != 0 {
-		t.Fatalf("expected 0 tracked files, got %d", len(entry2.Files))
+	if len(fm2.Files) != 0 {
+		t.Fatalf("expected 0 tracked files, got %d", len(fm2.Files))
 	}
 }
 
@@ -466,5 +465,122 @@ func TestWriteFile_DoesNotInvalidateUnrelatedEntry(t *testing.T) {
 	}
 	if _, ok := store.items["meta-1:shared"]; !ok {
 		t.Fatal("KV entry should NOT be deleted: WriteFile touched bar.go, entry references foo.go only")
+	}
+}
+
+// TestWriteSpec_Structured 验证 WriteSpec 入参结构化存为 MD：frontmatter 含
+// goal/acceptance/constraints/files mtime，body 为人读结构化 MD。
+// 存储键为 "<agentID>:spec"。
+func TestWriteSpec_Structured(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "game.js")
+	if err := os.WriteFile(target, []byte("var x = 1"), 0644); err != nil {
+		t.Fatalf("write game.js: %v", err)
+	}
+
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":        "把 canvas 宽度从 960 改为 1280",
+		"acceptance":  []any{"node -c game.js 通过", "CONFIG.canvas.width=1280"},
+		"constraints": []any{"不改动其他配置项"},
+		"files":       []any{target},
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("expected success, got: %s", res.Error)
+	}
+
+	val, _ := store.Get(ctx, "meta-1:spec")
+	if val == "" {
+		t.Fatal("expected KV entry at meta-1:spec")
+	}
+	fm, _, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatalf("KV value not MD: %q", val)
+	}
+	if fm.Goal != "把 canvas 宽度从 960 改为 1280" {
+		t.Fatalf("unexpected goal: %q", fm.Goal)
+	}
+	if len(fm.Acceptance) != 2 {
+		t.Fatalf("expected 2 acceptance, got %d", len(fm.Acceptance))
+	}
+	if len(fm.Constraints) != 1 {
+		t.Fatalf("expected 1 constraint, got %d", len(fm.Constraints))
+	}
+	if len(fm.Files) != 1 {
+		t.Fatalf("expected 1 tracked file, got %d", len(fm.Files))
+	}
+	if _, ok := fm.Files[target]; !ok {
+		t.Fatalf("expected %s in Files map", target)
+	}
+}
+
+// TestWriteSpec_RequiresGoalAndAcceptance 验证 goal/acceptance 必填校验。
+func TestWriteSpec_RequiresGoalAndAcceptance(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.SetSharedMemory(newFakeSharedMemoryStore())
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	// 缺 goal：应失败。
+	res, _ := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"acceptance": []any{"a"},
+	})
+	if res.Success {
+		t.Fatal("expected fail when goal missing")
+	}
+
+	// 缺 acceptance：应失败。
+	res2, _ := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g",
+	})
+	if res2.Success {
+		t.Fatal("expected fail when acceptance missing")
+	}
+}
+
+// TestWriteSpec_InvalidatesOnWriteFile 验证 Layer 2：WriteFile 成功后引用同 path 的 spec entry 被删除。
+func TestWriteSpec_InvalidatesOnWriteFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "foo.js")
+	if err := os.WriteFile(target, []byte("var x = 1"), 0644); err != nil {
+		t.Fatalf("write foo.js: %v", err)
+	}
+
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	// 写 spec，引用 foo.js。
+	_, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "g",
+		"acceptance": []any{"a"},
+		"files":      []any{target},
+	})
+	if err != nil {
+		t.Fatalf("WriteSpec: %v", err)
+	}
+	if _, ok := store.items["meta-1:spec"]; !ok {
+		t.Fatal("expected spec entry before WriteFile")
+	}
+
+	// WriteFile 修改 foo.js，触发失效。
+	wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{
+		"path":    target,
+		"content": "var x = 2",
+	})
+	if err != nil || !wres.Success {
+		t.Fatalf("WriteFile: err=%v res=%+v", err, wres)
+	}
+	if _, ok := store.items["meta-1:spec"]; ok {
+		t.Fatal("expected spec entry deleted after WriteFile invalidated it")
 	}
 }

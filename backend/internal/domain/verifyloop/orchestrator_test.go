@@ -614,3 +614,120 @@ func TestAgentVerifier_PlanConfirm(t *testing.T) {
 		t.Fatalf("detail should contain plan, got: %s", verdict.Detail)
 	}
 }
+
+// TestOrchestrator_ReviewPass 验证 Review 阶段：PlanConfirm -> Review -> SelfTest -> UnifiedTest。
+// NewWithReviewer 装配 code_reviewer 作为 Reviewer，产出全通过时一轮完成，4 次 ExecuteChild 调用。
+func TestOrchestrator_ReviewPass(t *testing.T) {
+	r := newFakeRunner()
+	// PlanConfirm 通过 -> Review 通过 -> SelfTest 通过 -> UnifiedTest 通过。
+	r.scripts["test_assistant:0"] = verifyMarkerPass                       // PlanConfirm
+	r.scripts["code_reviewer:0"] = "no blocking issues\n" + verifyMarkerPass // Review
+	r.scripts["test_assistant:1"] = "tests passed\n" + verifyMarkerPass    // SelfTest
+	r.scripts["test_assistant:2"] = "unified passed\n" + verifyMarkerPass   // UnifiedTest
+	o := NewWithReviewer(r, nil, 5, "code_assistant", "test_assistant", "code_reviewer", false)
+
+	res := o.Run(context.Background(), baseRequest("write calc.go", "func Add(a,b int)int{return a+b}"))
+
+	if !res.Passed {
+		t.Fatalf("expected pass, got fail: %s", res.FailReason)
+	}
+	if res.Rounds != 1 {
+		t.Fatalf("expected 1 round, got %d", res.Rounds)
+	}
+	// PlanConfirm + Review + SelfTest + UnifiedTest = 4 次。
+	if got := len(r.calls); got != 4 {
+		t.Fatalf("expected 4 ExecuteChild calls, got %d", got)
+	}
+	if r.calls[1].RoleID != "code_reviewer" {
+		t.Fatalf("expected 2nd call to code_reviewer, got %s", r.calls[1].RoleID)
+	}
+	if !res.ReviewVerdict.Passed {
+		t.Fatal("expected ReviewVerdict.Passed=true")
+	}
+}
+
+// TestOrchestrator_ReviewFailLoopsBack 验证 Review 失败 -> Fix -> 下一轮 Review 通过。
+func TestOrchestrator_ReviewFailLoopsBack(t *testing.T) {
+	r := newFakeRunner()
+	// round 1: PlanConfirm 通过 -> Review 失败 -> Fix
+	// round 2: PlanConfirm 通过 -> Review 通过 -> SelfTest 通过 -> UnifiedTest 通过
+	r.scripts["test_assistant:0"] = verifyMarkerPass                          // PlanConfirm r1
+	r.scripts["code_reviewer:0"] = "nil pointer deref\n" + verifyMarkerFail   // Review r1 fail
+	r.scripts["code_assistant:0"] = "fixed: nil check added"                  // Fix r1
+	r.scripts["test_assistant:1"] = verifyMarkerPass                          // PlanConfirm r2
+	r.scripts["code_reviewer:1"] = "nil check ok\n" + verifyMarkerPass        // Review r2 pass
+	r.scripts["test_assistant:2"] = verifyMarkerPass                          // SelfTest r2
+	r.scripts["test_assistant:3"] = verifyMarkerPass                         // UnifiedTest r2
+	o := NewWithReviewer(r, nil, 5, "code_assistant", "test_assistant", "code_reviewer", false)
+
+	res := o.Run(context.Background(), baseRequest("write calc.go", "func Add(a,b int)int{return a+b}"))
+
+	if !res.Passed {
+		t.Fatalf("expected pass, got fail: %s", res.FailReason)
+	}
+	if res.Rounds != 2 {
+		t.Fatalf("expected 2 rounds, got %d", res.Rounds)
+	}
+	// 验证 Review 失败反馈传给 Fixer：code_assistant:0 的 task 应含 Review 失败原因。
+	fixIdx := -1
+	for i, c := range r.calls {
+		if c.RoleID == "code_assistant" {
+			fixIdx = i
+			break
+		}
+	}
+	if fixIdx < 0 {
+		t.Fatal("no code_assistant fix call recorded")
+	}
+	if !strings.Contains(r.calls[fixIdx].Task, "nil pointer deref") {
+		t.Fatalf("fix task should contain review feedback, got: %s", r.calls[fixIdx].Task)
+	}
+}
+
+// TestOrchestrator_ReviewSkippedWhenNilReviewer 验证 reviewer==nil 时跳过 Review 阶段。
+// 退化为 PlanConfirm -> SelfTest -> UnifiedTest，3 次调用（与 New 行为一致）。
+func TestOrchestrator_ReviewSkippedWhenNilReviewer(t *testing.T) {
+	r := newFakeRunner()
+	r.scripts["test_assistant:0"] = verifyMarkerPass                       // PlanConfirm
+	r.scripts["test_assistant:1"] = "tests passed\n" + verifyMarkerPass    // SelfTest
+	r.scripts["test_assistant:2"] = "unified passed\n" + verifyMarkerPass   // UnifiedTest
+	// reviewRole="" 时不装配 Reviewer，跳过 Review。
+	o := NewWithReviewer(r, nil, 5, "code_assistant", "test_assistant", "", false)
+
+	res := o.Run(context.Background(), baseRequest("write calc.go", "v1"))
+
+	if !res.Passed {
+		t.Fatalf("expected pass, got fail: %s", res.FailReason)
+	}
+	if got := len(r.calls); got != 3 {
+		t.Fatalf("expected 3 ExecuteChild calls (no Review), got %d", got)
+	}
+	for _, c := range r.calls {
+		if c.RoleID == "code_reviewer" {
+			t.Fatal("code_reviewer should not be called when reviewer nil")
+		}
+	}
+}
+
+// TestAgentReviewer_Review 验证 AgentReviewer.Review 派发 code_reviewer 并解析标记。
+func TestAgentReviewer_Review(t *testing.T) {
+	r := newFakeRunner()
+	// FAIL 标记后须附原因文本，extractReason 取标记之后的内容。
+	r.scripts["code_reviewer:0"] = verifyMarkerFail + " nil check missing on line 5"
+	v := NewAgentReviewer(r, "code_reviewer", verifyMarkerPass, verifyMarkerFail)
+
+	req := baseRequest("write calc.go", "func Add(a,b int)int{return a+b}")
+	verdict, err := v.Review(context.Background(), req, req.Produced)
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if verdict.Passed {
+		t.Fatal("expected fail verdict")
+	}
+	if !strings.Contains(verdict.Reason, "nil check missing") {
+		t.Fatalf("expected reason contain finding, got: %s", verdict.Reason)
+	}
+	if !strings.Contains(verdict.Detail, verifyMarkerFail) {
+		t.Fatalf("expected detail contain FAIL marker, got: %s", verdict.Detail)
+	}
+}

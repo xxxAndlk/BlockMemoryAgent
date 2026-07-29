@@ -55,7 +55,7 @@ agent:
   retry_backoff_ms: 100          # 重试初始退避时长（毫秒）
   llm_soft_timeout_sec: 30       # LLM 软超时（建议取消）
   llm_hard_timeout_sec: 90       # LLM 硬超时（强制取消）
-  react_llm_timeout_sec: 600     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制
+  react_llm_timeout_sec: 180     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制
   sub_agent_timeout_min: 30      # 子 Agent 独立执行超时（分钟），负数表示不限制
   tool_output_history_max_runes: 2000 # 写入历史的单条工具输出最大字符数，负数表示不截断
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
