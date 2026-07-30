@@ -21,6 +21,8 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 - **单一 ReAct 主循环**：MetaAgent 跑 LLM → 工具 → 结果循环（默认上限 50 轮），直到输出纯文本回答
 - **层级即调用栈**：`call_sub_agent(role_id, task)` 起 goroutine 跑子 Agent，子 Agent 完成后把摘要推 Mailbox，父 Agent 每轮 LLM 前 Drain 邮箱注入上下文——任意深度递归，无图状态机
 - **历史压缩**：每 `summarize_every` 步（默认 5）`summarizeWindow` 把中段历史压成"系统前缀 + 用户目标 + 摘要 + 最近 K 条"，防 token 爆炸与注意力衰减
+- **权威 Agent 树**：`internal/domain/orchestrator/tree.go` 维护派发树快照，HTTP 暴露 `GET /api/sessions/{id}/tree` 读子 Agent 节点状态 + `POST /api/sessions/{id}/agents/{aid}/cancel` 取消子 Agent（补 ReAct 重构后丢失的 introspect/cancel 能力）
+- **块记忆事实提取**：子 Agent 完成后调轻量模型提取 1-5 条关键事实，每条单独向量化落 KnowledgeRecord，替代原始 result.Text 整段落库；提取失败自动回退原始保存
 - **共享记忆**：`WriteSharedMemory` 工具让主 Agent 把关键上下文（文件路径/行号/函数签名/验收标准）写入 `sharedKV`，子 Agent 自动读取，避免重读全文件；`task` 入参 2000 runes 上限强制规格走共享记忆
 - **验证闭环编排器**：`verifyloop` 原生驱动"产出 -> 自测 -> 修正 -> 上级统一测试"状态机，`Verifier`/`Fixer`/`Reporter` 三接口解耦，`PlanConfirmVerifier` 支持"测试方向不明确 -> 列方案 -> 产出方确认 -> 符合才自测"前置
 - **角色工具白名单**：`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集；MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet` 防越位，DomainAgent 开放完整权限承担上下文采集 + 任务拆分 + 派发执行
@@ -114,8 +116,8 @@ flags：`-config config/config.yaml -roles config/roles.yaml -env .env -soul con
 │   ├── cmd/                    # tui / memory-console
 │   ├── internal/
 │   │   ├── agent/              # ReAct 主循环 + Agent facade + 会话生命周期
-│   │   ├── domain/             # tool（注册表+内置工具）/ role / memory（事件流）/ subagent
-│   │   ├── bootstrap/          # 统一依赖装配（生产/TUI/测试共用）
+│   │   ├── domain/             # tool（注册表+内置工具）/ role / memory（事件流）/ subagent / verifyloop / orchestrator
+│   │   ├── bootstrap/          # 统一依赖装配（生产/TUI/测试共用）+ fact_extractor（块记忆事实提取 LLM）
 │   │   ├── model/              # Blades 模型工厂 + LLM 追踪/超时
 │   │   ├── store/              # PostgreSQL（领域子存储）+ Redis
 │   │   ├── logger/ logging/    # 结构化日志 + 文件按天分割
@@ -143,7 +145,11 @@ flags：`-config config/config.yaml -roles config/roles.yaml -env .env -soul con
 
 ### 2. 异步子 Agent 分发（`internal/domain/subagent/dispatcher.go`）
 
-`call_sub_agent` 工具起 goroutine 跑子 ReActAgent，立即返回 `sub_agent_id`；子 Agent 完成后摘要推 Mailbox。角色权限由 `roles.yaml` 的 `can_be_called` / `parents` 控制；`domain` 字段定制 DomainAgent 展示名；`task` 入参 2000 runes 上限强制规格走 `WriteSharedMemory`。`WithKVMemory` 注入共享 KV 只读视图，`injectKVMemory` 自动读取主 Agent 写入的关键上下文。父会话终结保护：有未决子 Agent 时阻塞等待，防迟到 mailbox 消息丢失。
+`call_sub_agent` 工具起 goroutine 跑子 ReActAgent，立即返回 `sub_agent_id`；子 Agent 完成后摘要推 Mailbox。角色权限由 `roles.yaml` 的 `can_be_called` / `parents` 控制；`domain` 字段定制 DomainAgent 展示名；`task` 入参 2000 runes 上限强制规格走 `WriteSharedMemory`。`WithSharedMemory` 注入共享 KV 只读视图，`buildSharedPrefix` 自动读取主 Agent 写入的关键上下文并做 Layer 3 mtime 校验（文件改动后 KV 失效）。父会话终结保护：有未决子 Agent 时阻塞等待，防迟到 mailbox 消息丢失。`WithFactExtractor` 注入事实提取器，`saveBlockMemory` 先调轻量模型提取关键事实再落库；`WithTree` 注入权威 Agent 树，派发时 Register/SetCancel/Finish。
+
+### 3. 权威 Agent 树（`internal/domain/orchestrator/tree.go`）
+
+ReAct 重构后子 Agent 由 Dispatcher 直接 goroutine 创建，不注册为 `AgentInstance`，原"层级即调用栈"丢失 introspect/cancel 能力。补 `Tree` struct 作元数据层：Dispatcher 派发前 `Register` 节点（ID/ParentID/Role/Domain/Task/Started/Status=Running）+ `SetCancel` 绑定 cancel func，完成时 `Finish` 写终态（Done/Failed/Cancelled + Summary/Err）。HTTP 暴露 `GET /api/sessions/{id}/tree` 返回快照，`POST /api/sessions/{id}/agents/{aid}/cancel` 调 cancel func 取消子 Agent。`context.CancelFunc` 幂等，与 goroutine `defer cancel()` 重复调用安全。树不持久化，服务重启清空，TUI `deriveSubAgentNodes` 保留作 fallback。`verifyloop.ExecuteChild` 同步路径暂不入树（phase 2）。`agent.Agent` 接口扩展 `Tree`/`CancelAgent` 两方法。
 
 ### 3. 工具域（`internal/domain/tool/`）
 
@@ -196,9 +202,9 @@ zerolog 实现，console/json 两种格式；error 级别可附调用栈（`logg
 
 ## 扩展方向
 
-近期开放项见 `doc/TODO.md`（e2e mock LLM 连通性校验回归排查、`assembly` 包清理或重新接线、`ComputerUseVerifier`/`CLIVerifier`/`MCPVerifier` 实现、watchdog 与 ReAct 历史压缩联动、记忆事件 Postgres 持久化、TUI Agent 树运行时构建、配置清理、v3 文档漂移清理、指标埋点）。远期"Agent 工作流平台"愿景（工作流编排 / 测试自动化 / 研究 / 团队协作）见 `doc/扩展设计_Agent工作流平台.md`。
+近期开放项见 `doc/TODO.md`（记忆 hot/cold 2 阶段分层、话题隔离轻量版、动态角色注册中心、verifyloop 折叠进 ReAct、硬 Token 预算、`Soul.Inject` 死代码清理、记忆事件 Postgres 持久化、`设计文档_v3.md` 漂移清理）。远期"Agent 工作流平台"愿景（工作流编排 / 测试自动化 / 研究 / 团队协作）见 `doc/扩展设计_Agent工作流平台.md`。
 
-阶段 0-9 已完成：测试基线修复 -> 块记忆闭环 -> 协作验证闭环 -> verifyloop 原生编排器 -> 评估产出 -> KVMemory 共享记忆 -> assembly 任务拆解抽象（未接线）-> ReAct 历史压缩 + LLM 调用日志 + 代理展示名 + 共享内存工具 + 角色工具白名单 + DeepSeek V4 适配。详见 `doc/TODO.md` "已完成"段。
+阶段 0-9 已完成 + 2026-07-30 两步：测试基线修复 -> 块记忆闭环 -> 协作验证闭环 -> verifyloop 原生编排器 -> 评估产出 -> KVMemory 共享记忆 -> assembly 任务拆解抽象（已删）-> ReAct 历史压缩 + LLM 调用日志 + 代理展示名 + 共享内存工具 + 角色工具白名单 + DeepSeek V4 适配 -> **投机性泛化清理**（assembly/computeruse/verifiers 占位/KV 三套抽象/强制门/死配置，~1400 行净减）-> **Agent 树显式化**（`orchestrator.Tree` + `/tree` + `/cancel` 端点）-> **块记忆事实提取**（`FactExtractor` 接口 + 轻量模型提取关键事实）。详见 `doc/TODO.md` "已完成"段。
 
 ---
 
