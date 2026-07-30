@@ -13,9 +13,9 @@
    - 背景：`domain/memory.Pipeline` 当前使用 `InMemoryStore`，会话结束后事件丢失。
    - 开放动作：实现 `domain/memory.Store` 的 Postgres 适配器,把 agent 事件流写入新表 `agent_events`（旧 `session_events` 保留只读）。
 
-4. **记忆 hot/cold 2 阶段分层**（未做）
-   - 背景：`summarizeWindow` 在 `react_agent.go` 压缩历史,职责错位到 ReAct 层。`saveBlockMemory` 已加 LLM 事实提取（commit `c57f22b`）,但 read 侧 `injectRecalledMemory` 仅子 Agent 派发时触发,MetaAgent 根任务无 recall 注入。
-   - 开放动作：`domain/memory/pipeline.go` 实现 hot/cold 分层（最近 N 条 hot + 旧压缩 cold summary），删 `react_agent.go` `summarizeWindow`；MetaAgent 拆分任务前注入相关事实。
+4. **记忆 hot/cold 2 阶段分层**（部分完成,commit `ced2e07`）
+   - 当前状态：`summarizeWindow` 从 `react_agent.go` 迁入 `domain/memory/pipeline.go` 的 `compressHistory`。Pipeline 加 `WithCompression(every, keepRecent)` + 按 agentID 步频计数器,Assemble 在步频命中时调 `compressHistory`。ReActAgent 主循环简化为仅 `windowMessages` 硬上限。`config.go` 的 `SummarizeEvery`/`SummarizeKeepRecent` 改由 Pipeline 消费。
+   - 开放动作：MetaAgent 根任务仍无 recall 注入（仅子 Agent 有 `injectRecalledMemory`）。需要 BlockMemorySearcher 接口跨域注入到 Pipeline,scope 较大留独立 commit。
 
 5. **配置清理**（已完成）
    - 当前状态：`config.go` 707 -> ~370 行,死字段已删（`GraphPolicyConfig`/`MemoryPolicyConfig`/`PluginsConfig` 等）。见 #10 与 cleanup commit。
@@ -33,9 +33,8 @@
    - 背景：旧 `SessionBlock` 物理话题隔离已随 graph 删除,痛点二（话题切换污染）回归。
    - 开放动作：Session 加 `active_topic_id` 字段；切换话题时压缩当前 Agent 树摘要 -> 写 sharedKV `topic:{id}:summary` -> 旧 Agent 树终结 -> 新 Agent 树起。无状态机,纯 KV + 树切换。依赖 #2 Agent 树持久化。
 
-9. **动态角色注册中心**（未做）
-   - 背景：`roles.yaml` 静态,新角色需重启。旧 `role_factory` 模板渲染已删除。
-   - 开放动作：`domain/role/registry.go` 加运行时 API `Register/Unregister/List`；`roles.yaml` 启动加载填 registry；MetaAgent 工具箱加 `create_role`/`list_roles`（白名单限 MetaAgent）；直接 yaml-like 结构传入,不回收模板渲染。
+9. **动态角色注册中心**（已完成,commit `f27b166`）
+   - 当前状态：`domain/role/registry.go` 加 RWMutex + dynamic map + `Register`/`Unregister`/`List` 运行时 API。`Get` 优先查 dynamic 层再回退 cfg;`CallableFixedRoles` 含动态角色;`CanCall` 现有逻辑已覆盖 `RoleTypeDynamic` 分支。新增 `role/tools.go`:`create_role`/`list_roles` 工具实现 Tool 接口,`Registry.RegisterTools` 注入 `tool.Registry`,Schema 暴露两个工具。MetaAgent Tools 白名单加 `create_role`/`list_roles`。Register 校验:ID 非空、不撞内置、Type 必须为 Dynamic、SystemPrompt 非空;ID 冲突拒绝。进程重启不保留（roles.yaml 才持久化）,与 Agent 树不持久化同 scope。
 
 10. **verifyloop 折叠进 ReAct**（未做,依赖 Agent 树终结语义）
     - 背景：当前双控制流（ReAct loop + verifyloop 状态机）不统一,`OnSubAgentDone` 钩子自动触发编排器。
