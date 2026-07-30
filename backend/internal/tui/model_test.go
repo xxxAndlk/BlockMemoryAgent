@@ -18,6 +18,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/config"
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/runtime"
@@ -108,6 +109,16 @@ func (m *mockAgentForPlan) Get(ctx context.Context, sessionID string) (*agent.Se
 // ListAgents 返回预设的 Agent 实例列表。
 func (m *mockAgentForPlan) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return m.agentInsts, nil
+}
+
+// Tree 返回 Agent 树快照，测试实现返回 nil。
+func (m *mockAgentForPlan) Tree(ctx context.Context, sessionID string) ([]orchestrator.Node, error) {
+	return nil, nil
+}
+
+// CancelAgent 取消子 Agent，测试实现返回 nil。
+func (m *mockAgentForPlan) CancelAgent(ctx context.Context, sessionID, instID string) error {
+	return nil
 }
 
 // Shutdown 是 mockAgentForPlan 的空实现。

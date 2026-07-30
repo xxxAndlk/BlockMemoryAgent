@@ -56,6 +56,8 @@ func NewDefaultMux(app *App) *http.ServeMux {
 	mux.HandleFunc("/api/sessions/{id}/message", wrap(sessionMgr.HandleSessionMessage))            // 向会话发送消息
 	mux.HandleFunc("/api/sessions/{id}/board", wrap(sessionMgr.HandleSessionBoard))                // 获取/更新任务看板
 	mux.HandleFunc("/api/sessions/{id}/agents", wrap(sessionMgr.HandleSessionAgents))              // 获取会话内 Agent 列表
+	mux.HandleFunc("/api/sessions/{id}/tree", wrap(sessionMgr.HandleSessionTree))                    // 获取权威 Agent 树快照
+	mux.HandleFunc("/api/sessions/{id}/agents/{aid}/cancel", wrap(sessionMgr.HandleSessionAgentCancel)) // 取消子 Agent 实例
 	mux.HandleFunc("/api/sessions/{id}/metrics", wrap(sessionMgr.HandleSessionMetrics))            // 会话级指标
 	mux.HandleFunc("/api/sessions/{id}/logs", wrap(sessionMgr.HandleSessionLogs))                  // 会话日志查询
 	mux.HandleFunc("/api/sessions/{id}/token-metrics", wrap(sessionMgr.HandleSessionTokenMetrics)) // Token 消耗指标

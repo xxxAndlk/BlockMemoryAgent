@@ -2,7 +2,11 @@
 // 降低上层（HTTP/TUI）与内部实现之间的耦合度。
 package agent
 
-import "context"
+import (
+	"context"
+
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
+)
 
 // Agent 是 Agent 编排模块的统一外观接口（Facade）。
 // HTTP 层与 TUI 层应依赖此接口，而不是直接访问 internal/graph 或 internal/runtime 等内部包，
@@ -52,6 +56,15 @@ type Agent interface {
 	// ctx 用于控制请求的超时与取消；sessionID 为目标会话 ID。
 	// 返回 AgentInstance 切片，若会话不存在或查询失败则返回 error。
 	ListAgents(ctx context.Context, sessionID string) ([]AgentInstance, error)
+
+	// Tree 返回会话的 Agent 树快照（权威，由 Dispatcher 在派发时维护）。
+	// 包含运行中/已完成/已取消的所有子 Agent 节点，按启动时间升序。
+	Tree(ctx context.Context, sessionID string) ([]orchestrator.Node, error)
+
+	// CancelAgent 取消指定子 Agent 实例。
+	// instID 对应 call_sub_agent 返回的 sub_agent_id。
+	// 节点不存在或已 terminal 返回 ErrAgentNotFound。
+	CancelAgent(ctx context.Context, sessionID, instID string) error
 
 	// Shutdown 优雅关闭整个 Agent 编排模块，释放资源并停止后台任务。
 	// ctx 用于控制关闭操作的超时与取消。

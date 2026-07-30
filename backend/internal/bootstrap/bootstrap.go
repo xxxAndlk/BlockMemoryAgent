@@ -354,6 +354,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
 	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。
 	subAgentDispatcher.WithLiveEvents(agentSvc.ForwardLiveEvent)
+	// 注入权威 Agent 树访问器：Dispatcher 派发时 Register/Finish/SetCancel，
+	// HTTP API 的 /tree 与 /agents/{aid}/cancel 端点通过 ReactService.TreeFor 读取。
+	subAgentDispatcher.WithTree(agentSvc.TreeFor)
 	// 注入未决子 Agent 检查器，开启父会话终结保护：
 	// 父 Agent 给出终答前若有未决子 Agent，阻塞等待其完成，防止迟到 mailbox 消息丢失。
 	agentSvc.SetPendingChildrenChecker(subAgentDispatcher)

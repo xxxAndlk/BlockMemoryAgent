@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"  // unicode/utf8 用于 RuneCountInString 统计 task 字符数
 
 	"github.com/blockmemory/agent/backend/internal/agent"       // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // orchestrator 提供 Agent 树元数据层
 	"github.com/blockmemory/agent/backend/internal/domain/role" // role 包提供角色注册表
 	"github.com/blockmemory/agent/backend/internal/domain/tool" // tool 包提供工具注册表与 Result 类型
 	"github.com/blockmemory/agent/backend/internal/logger"      // logger 包提供会话级日志器，记录子 Agent LLM I/O
@@ -135,6 +136,11 @@ type Dispatcher struct {
 	// 按 sessionID 路由回所属会话的 service.handleLiveEvent，使子 Agent token 也计入会话累计。
 	// 为 nil 时子 Agent 不推送实时事件（不影响主流程）。
 	liveFn func(sessionID string, ev agent.LiveEvent)
+
+	// treeFn 按 sessionID 取得权威 Agent 树（lazy init）。
+	// 派发前 Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
+	// 为 nil 时关闭树跟踪（测试场景），不影响派发主流程。
+	treeFn func(sessionID string) *orchestrator.Tree
 }
 
 // pendingState 跟踪单个父 Agent 的未决子 Agent 计数与完成信号。
@@ -281,6 +287,15 @@ func (d *Dispatcher) WithLogger(l *logger.Logger) *Dispatcher {
 // 传 nil 关闭子 Agent 实时事件推送（默认关闭）。
 func (d *Dispatcher) WithLiveEvents(fn func(sessionID string, ev agent.LiveEvent)) *Dispatcher {
 	d.liveFn = fn
+	return d
+}
+
+// WithTree 注入权威 Agent 树访问器。
+// fn 按 sessionID 返回 *orchestrator.Tree（lazy init），供 Dispatcher 在派发时
+// Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
+// 传 nil 关闭树跟踪（默认关闭）；HTTP API 的 /tree 与 /cancel 端点依赖此树。
+func (d *Dispatcher) WithTree(fn func(sessionID string) *orchestrator.Tree) *Dispatcher {
+	d.treeFn = fn
 	return d
 }
 
@@ -527,6 +542,24 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	taskBrief := truncateRunes(strings.ReplaceAll(strings.TrimSpace(task), "\n", " "), 100)
 	log.Printf("[subagent] dispatch: parent=%s sub=%s role=%s task=%q", parentID, subAgentID, roleID, taskBrief)
 	started := time.Now()
+	// 权威树注册：在 goroutine 启动前同步 Register + SetCancel，保证 Cancel 端点不会因时序漏掉句柄。
+	// treeFn 为 nil 时（测试场景）跳过，不影响派发主流程。
+	if d.treeFn != nil {
+		if sid := tool.SessionIDFromContext(ctx); sid != "" {
+			if t := d.treeFn(sid); t != nil {
+				t.Register(orchestrator.Node{
+					ID:       subAgentID,
+					ParentID: parentID,
+					Role:     roleID,
+					Domain:   domain,
+					Task:     taskBrief,
+					Started:  started,
+					Status:   orchestrator.StatusRunning,
+				})
+				t.SetCancel(subAgentID, cancel)
+			}
+		}
+	}
 	go func() {
 		defer cancel()
 		// 无论 runSubAgent 以何种方式结束，都递减父 Agent 的未决计数并发出完成信号，
@@ -558,18 +591,35 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 			partial = truncateRunes(agent.LastAssistantText(result.History), 500)
 		}
 		log.Printf("[subagent] FAIL: sub=%s role=%s duration=%s err=%v partial=%q", subAgentID, roleDef.ID, duration, err, truncateRunes(partial, 200))
+		d.treeFinish(ctx, subAgentID, partial, err)
 		d.notify(parentID, subAgentID, formatSubAgentFailure(err, result, d.timeout, partial))
 		return
 	}
 
 	// 成功：通知父 Agent，触发完成钩子。
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
+	d.treeFinish(ctx, subAgentID, result.Text, nil)
 	d.notify(parentID, subAgentID, result.Text)
 
 	// 完成钩子：供 verifyloop 编排器接管"代码->测试->修正->统一测试"原生状态机。
 	// 仅在异步 call_sub_agent 路径触发；ExecuteChild 同步路径不触发，避免编排器递归。
 	if d.onSubAgentDone != nil {
 		d.onSubAgentDone(parentID, subAgentID, roleDef.ID, task, result.Text)
+	}
+}
+
+// treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
+// 幂等：orchestrator.Tree.Finish 对已 terminal 节点 no-op。
+func (d *Dispatcher) treeFinish(ctx context.Context, subAgentID, summary string, err error) {
+	if d.treeFn == nil {
+		return
+	}
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		return
+	}
+	if t := d.treeFn(sid); t != nil {
+		t.Finish(subAgentID, summary, err)
 	}
 }
 

@@ -22,4 +22,7 @@ var (
 
 	// ErrPostgresUnavailable 表示 PostgreSQL 数据库连接不可用或服务未响应。
 	ErrPostgresUnavailable = errors.New("agent: postgres unavailable")
+
+	// ErrAgentNotFound 表示按实例 ID 查找的 Agent 节点不存在或已终结，无法取消。
+	ErrAgentNotFound = errors.New("agent: agent not found")
 )

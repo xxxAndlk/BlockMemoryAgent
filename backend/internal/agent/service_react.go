@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
@@ -40,6 +42,11 @@ type ReactService struct {
 	// testProvider 是包内部测试使用的钩子，
 	// 允许单元测试注入 mock 的 ModelProvider，从而无需真实 API 密钥即可运行 ReAct 循环。
 	testProvider ModelProvider
+
+	// trees 按 sessionID 维护权威 Agent 树（lazy init）。
+	// Dispatcher 通过 TreeFor(sid) 取得 *orchestrator.Tree 后 Register/Finish/SetCancel。
+	// Snapshot/Cancel 经由 Tree()/CancelAgent() 暴露给 HTTP API。
+	trees sync.Map
 }
 
 // ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
@@ -444,6 +451,45 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 			Status:   status,
 		},
 	}, nil
+}
+
+// TreeFor 按 sessionID 取得权威 Agent 树（不存在则 lazy 创建）。
+// Dispatcher 在派发子 Agent 时调用此方法注入 Register/Finish/SetCancel。
+// 树不持久化，服务重启后清空；HTTP API 通过 Tree()/CancelAgent() 读取。
+func (s *ReactService) TreeFor(sessionID string) *orchestrator.Tree {
+	if v, ok := s.trees.Load(sessionID); ok {
+		return v.(*orchestrator.Tree)
+	}
+	t := orchestrator.NewTree()
+	v, loaded := s.trees.LoadOrStore(sessionID, t)
+	if loaded {
+		return v.(*orchestrator.Tree)
+	}
+	return t
+}
+
+// Tree 返回会话 Agent 树快照，按启动时间升序。
+// 会话不存在返回 ErrSessionNotFound；树为空时返回空切片。
+func (s *ReactService) Tree(ctx context.Context, sessionID string) ([]orchestrator.Node, error) {
+	if sess := s.store.snapshotSessionByID(sessionID); sess == nil {
+		return nil, ErrSessionNotFound
+	}
+	t := s.TreeFor(sessionID)
+	return t.Snapshot(), nil
+}
+
+// CancelAgent 取消指定子 Agent 实例。
+// instID 对应 call_sub_agent 返回的 sub_agent_id。
+// 节点不存在或已 terminal 返回 ErrAgentNotFound。
+func (s *ReactService) CancelAgent(ctx context.Context, sessionID, instID string) error {
+	if sess := s.store.snapshotSessionByID(sessionID); sess == nil {
+		return ErrSessionNotFound
+	}
+	t := s.TreeFor(sessionID)
+	if !t.Cancel(instID) {
+		return ErrAgentNotFound
+	}
+	return nil
 }
 
 // Shutdown 取消所有正在运行的会话。

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
@@ -115,6 +116,14 @@ func (stubAgent) Get(ctx context.Context, sessionID string) (*agent.Session, err
 func (stubAgent) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return nil, nil
 }
+
+// Tree 是 stubAgent 的空实现。
+func (stubAgent) Tree(ctx context.Context, sessionID string) ([]orchestrator.Node, error) {
+	return nil, nil
+}
+
+// CancelAgent 是 stubAgent 的空实现。
+func (stubAgent) CancelAgent(ctx context.Context, sessionID, instID string) error { return nil }
 
 // Shutdown 是 stubAgent 的空实现。
 func (stubAgent) Shutdown(ctx context.Context) error { return nil }

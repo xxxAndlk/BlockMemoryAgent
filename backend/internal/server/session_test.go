@@ -7,8 +7,9 @@ import (
 	"testing" // 测试框架
 	"time"    // 时间戳
 
-	"github.com/blockmemory/agent/backend/internal/agent" // agent 门面接口
-	"github.com/blockmemory/agent/backend/pkg/enums"      // 会话状态与角色枚举
+	"github.com/blockmemory/agent/backend/internal/agent"                // agent 门面接口
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // Agent 树节点类型
+	"github.com/blockmemory/agent/backend/pkg/enums"                     // 会话状态与角色枚举
 )
 
 // mockAgentForServer 是一个最小化的 agent.Agent 实现，
@@ -103,6 +104,16 @@ func (m *mockAgentForServer) Get(ctx context.Context, sessionID string) (*agent.
 // ListAgents 列出会话中的 Agent 实例，测试实现返回 nil。
 func (m *mockAgentForServer) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return nil, nil
+}
+
+// Tree 返回 Agent 树快照，测试实现返回 nil。
+func (m *mockAgentForServer) Tree(ctx context.Context, sessionID string) ([]orchestrator.Node, error) {
+	return nil, nil
+}
+
+// CancelAgent 取消子 Agent，测试实现返回 nil。
+func (m *mockAgentForServer) CancelAgent(ctx context.Context, sessionID, instID string) error {
+	return nil
 }
 
 // Shutdown 关闭 Agent，测试实现为空操作。

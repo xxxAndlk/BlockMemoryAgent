@@ -278,3 +278,58 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ToServerSession(session))
 }
+
+// HandleSessionTree 处理 GET /api/sessions/{id}/tree。
+// 职责：返回会话的权威 Agent 树快照，按启动时间升序。
+func (m *SessionManager) HandleSessionTree(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+		return
+	}
+	nodes, err := m.agent.Tree(r.Context(), id)
+	if err != nil {
+		msg, status := agentErrorStatus(err)
+		http.Error(w, msg, status)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id": id,
+		"tree":       nodes,
+	})
+}
+
+// HandleSessionAgentCancel 处理 POST /api/sessions/{id}/agents/{aid}/cancel。
+// 职责：取消指定子 Agent 实例，调用其绑定的 cancel func。
+func (m *SessionManager) HandleSessionAgentCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+		return
+	}
+	instID := r.PathValue("aid")
+	if instID == "" {
+		http.Error(w, "缺少 Agent 实例 ID", http.StatusBadRequest)
+		return
+	}
+	if err := m.agent.CancelAgent(r.Context(), id, instID); err != nil {
+		msg, status := agentErrorStatus(err)
+		http.Error(w, msg, status)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id": id,
+		"agent_id":   instID,
+		"status":     "cancelled",
+	})
+}

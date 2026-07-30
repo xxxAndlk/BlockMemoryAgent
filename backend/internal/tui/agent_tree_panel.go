@@ -203,6 +203,10 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 	// 新架构（ReAct）下子 Agent 由 Dispatcher 直接创建，不会注册为 AgentInstance，
 	// ListAgents 看不到；改为从会话事件流（派发/执行/完成）派生子 Agent 节点，
 	// 使编排面板能实时展示领域 Agent 与助手的执行状态。
+	//
+	// TODO: 权威树已通过 /api/sessions/{id}/tree 暴露（orchestrator.Tree，Dispatcher 维护）。
+	// 待树持久化后切换为读 Tree() 接口，淘汰 deriveSubAgentNodes 派生路径。
+	// 当前保留派生作 fallback：服务重启后 tree 清空，事件流仍能渲染历史子 Agent。
 	at.nodes = append(at.nodes, deriveSubAgentNodes(s.Events)...)
 }
 

@@ -475,6 +475,8 @@ func agentErrorStatus(err error) (string, int) {
 		return err.Error(), http.StatusBadRequest
 	case errors.Is(err, agent.ErrPostgresUnavailable):
 		return "存储后端不可用", http.StatusServiceUnavailable
+	case errors.Is(err, agent.ErrAgentNotFound):
+		return "Agent 不存在或已结束", http.StatusNotFound
 	default:
 		return err.Error(), http.StatusInternalServerError
 	}
