@@ -314,14 +314,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		}
 		// 每个角色对独立编排器实例（AgentVerifier/Fixer 绑定各自角色）。
 		// ReviewEnabled 开启时装配 code_reviewer 作为 Reviewer，插入 PlanConfirm 与 SelfTest 之间。
-		// PlanSkipEnabled 默认 false（PlanConfirm 强制执行）；显式 true 跳过 PlanConfirm。
+		// PlanSkipEnabled 默认 true（PlanConfirm 整体移除中）；显式 false 仍走 PlanConfirm。
 		reviewRole := ""
 		if cfg.Agent.ReviewEnabled == nil || *cfg.Agent.ReviewEnabled {
 			reviewRole = "code_reviewer"
 		}
+		planSkip := true
+		if cfg.Agent.PlanSkipEnabled != nil {
+			planSkip = *cfg.Agent.PlanSkipEnabled
+		}
 		orchestrators := make(map[string]*verifyloop.Orchestrator, len(activePairs))
 		for _, p := range activePairs {
-			orchestrators[p.CodeRole] = verifyloop.NewWithReviewer(subAgentDispatcher, sharedMailbox, cfg.Agent.VerificationMaxRounds, p.CodeRole, p.TestRole, reviewRole, cfg.Agent.PlanSkipEnabled)
+			orchestrators[p.CodeRole] = verifyloop.NewWithReviewer(subAgentDispatcher, sharedMailbox, cfg.Agent.VerificationMaxRounds, p.CodeRole, p.TestRole, reviewRole, planSkip)
 		}
 		subAgentDispatcher.SetOnSubAgentDone(func(parentID, subAgentID, roleID, task, resultText string) {
 			pair, ok := rolePairByCode[roleID]

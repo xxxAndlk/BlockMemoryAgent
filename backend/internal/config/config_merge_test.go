@@ -34,7 +34,7 @@ redis:
 	// agent-policy.yaml 覆盖 Agent 参数
 	policy := []byte(`
 agent:
-  skill_set_size: 42
+  max_total_dispatches: 42
 `)
 	if err := os.WriteFile(filepath.Join(tmp, "agent-policy.yaml"), policy, 0644); err != nil {
 		t.Fatalf("写入 agent-policy.yaml 失败: %v", err)
@@ -47,8 +47,8 @@ agent:
 	if cfg.Redis.Addr != "redis-override:6379" {
 		t.Fatalf("infrastructure.yaml 未生效: redis.addr=%q", cfg.Redis.Addr)
 	}
-	if cfg.Agent.SkillSetSize != 42 {
-		t.Fatalf("agent-policy.yaml 未生效: agent.skill_set_size=%d", cfg.Agent.SkillSetSize)
+	if cfg.Agent.MaxTotalDispatches != 42 {
+		t.Fatalf("agent-policy.yaml 未生效: agent.max_total_dispatches=%d", cfg.Agent.MaxTotalDispatches)
 	}
 	// 未覆盖字段仍保留原值
 	if cfg.Postgres.MaxOpenConns != 25 {
@@ -76,7 +76,7 @@ func TestLoadBackwardCompatibleWhenSplitFilesMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("独立 config.yaml 加载失败: %v", err)
 	}
-	if cfg.Agent.SkillSetSize != 8 {
-		t.Fatalf("默认值异常: agent.skill_set_size=%d", cfg.Agent.SkillSetSize)
+	if cfg.Agent.MaxTotalDispatches != 30 {
+		t.Fatalf("默认值异常: agent.max_total_dispatches=%d", cfg.Agent.MaxTotalDispatches)
 	}
 }

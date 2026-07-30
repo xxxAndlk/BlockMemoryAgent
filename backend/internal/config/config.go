@@ -10,7 +10,7 @@ import (
 )
 
 // Config 是后端服务的顶层配置结构，对应 config/config.yaml 的根节点。
-// 它聚合了 Postgres、PgVector、Redis、HTTP、Memory、Agent、Logging 六个子配置模块，
+// 它聚合了 Postgres、PgVector、Redis、HTTP、Memory、Agent、Logging 五个子配置模块，
 // 注：文本嵌入模型配置（EmbedConfig）已迁移到 roles.yaml，由 pkg/config 解析。
 // 由 Load 函数从 YAML 文件读取并填充后返回。
 type Config struct {
@@ -21,20 +21,6 @@ type Config struct {
 	Memory   MemoryConfig   `yaml:"memory"`   // 记忆管线运行参数（批写/刷新/快照间隔）
 	Agent    AgentConfig    `yaml:"agent"`    // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
 	Logging  LoggingConfig  `yaml:"logging"`  // 日志文件输出（按天分割，按入口分文件）
-	Plugins  PluginsConfig  `yaml:"plugins"`  // 插件预留开关（P3-5）
-}
-
-// PluginsConfig 插件预留配置（P3-5）。
-// 当前仅作开关，后续接入 MCP / RAG / Computer Use 时展开字段。
-type PluginsConfig struct {
-	MCP         PluginToggle `yaml:"mcp"`          // MCP 工具接入
-	RAG         PluginToggle `yaml:"rag"`          // 外部 RAG 知识源
-	ComputerUse PluginToggle `yaml:"computer_use"` // Computer Use 浏览器/GUI 自动化
-}
-
-// PluginToggle 单个插件开关。
-type PluginToggle struct {
-	Enabled bool `yaml:"enabled"`
 }
 
 // LoggingConfig 日志文件输出配置。
@@ -49,35 +35,11 @@ type LoggingConfig struct {
 	NoColor      *bool  `yaml:"no_color"`      // 是否禁用 ANSI 颜色，文件日志建议 true，默认 true
 }
 
-// MemoryPolicyConfig 记忆管线策略配置。
-// 控制上下文装配时的分段比例、私有记忆裁剪参数等，替代 memory 包中的硬编码魔法数。
-type MemoryPolicyConfig struct {
-	ContextWindow        int `yaml:"context_window"`          // 模型上下文窗口总 token 数
-	SystemSegmentRatio   int `yaml:"system_segment_ratio"`    // System 段占比（百分之 N）
-	TopicGlobalRatio     int `yaml:"topic_global_ratio"`      // TopicGlobal 段占比（百分之 N）
-	SharedStateRatio     int `yaml:"shared_state_ratio"`      // SharedState 段占比（百分之 N）
-	GlobalKBRatio        int `yaml:"global_kb_ratio"`         // GlobalKB 段占比（百分之 N）
-	PrivateMemoryRatio   int `yaml:"private_memory_ratio"`    // PrivateMemory 段占比（百分之 N）
-	TaskRatio            int `yaml:"task_ratio"`              // TaskQuery 段占比（百分之 N）
-	ReserveRatio         int `yaml:"reserve_ratio"`           // Reserve 预留段占比（百分之 N）
-	DefaultTokensPerItem int `yaml:"default_tokens_per_item"` // 私有记忆单条默认 token 数，用于按预算裁剪
-}
-
-// GraphPolicyConfig Graph 死循环防护与全局步数策略配置。
-type GraphPolicyConfig struct {
-	StallSteps           int `yaml:"stall_steps"`            //  Graph 死循环防护 无进展步数阈值：连续 N 步未产生新 Episode / 工具结果 / state 变化 → 判死循环
-	MaxRepeatFingerprint int `yaml:"max_repeat_fingerprint"` // 状态指纹重复阈值：同一 state 指纹连续出现 N 次 → 判死循环
-	SessionTimeoutMin    int `yaml:"session_timeout_min"`    // 单次 Graph Invoke 的 wall-clock 超时（分钟），防 LLM/工具卡死
-	MaxSteps             int `yaml:"max_steps"`              //  Graph 绝对步数上限（安全网，超出即使无死循环也终止），0 表示不限制
-}
-
 // LLMRuntimeConfig LLM 调用与重试运行时参数配置。
 type LLMRuntimeConfig struct {
 	ToolCallMaxRounds int `yaml:"tool_call_max_rounds"` // Assistant 单任务 ReAct 工具调用循环最大轮数（含重复调用/空转检测提前退出）；负数表示不限制
 	RetryCount        int `yaml:"retry_count"`          // Assistant 任务执行指数退避重试次数
 	RetryBackoffMs    int `yaml:"retry_backoff_ms"`     // 重试初始退避时长（毫秒）
-	LLMSoftTimeoutSec int `yaml:"llm_soft_timeout_sec"` // LLM 调用软超时（秒，建议取消）
-	LLMHardTimeoutSec int `yaml:"llm_hard_timeout_sec"` // LLM 调用硬超时（秒，强制取消）
 
 	ReactLLMTimeoutSec        int `yaml:"react_llm_timeout_sec"`         // ReAct 单次 LLM 调用超时（秒，默认 300；负数表示仅受会话取消控制）
 	SubAgentTimeoutMin        int `yaml:"sub_agent_timeout_min"`         // 子 Agent 独立执行超时（分钟，默认 30；负数表示不限制）
@@ -96,17 +58,11 @@ type SafetyConfig struct {
 
 // FeatureTogglesConfig Agent 特性开关配置。
 type FeatureTogglesConfig struct {
-	InterruptEnabled         bool `yaml:"interrupt_enabled"`           // 是否启用抢占中断
-	QueueInjectEnabled       bool `yaml:"queue_inject_enabled"`        // 是否启用队列注入
-	HumanClarifyEnabled      bool `yaml:"human_clarify_enabled"`       // 是否启用人机对话
-	HumanClarifyTimeoutSec   int  `yaml:"human_clarify_timeout_sec"`   // 等待用户回答超时（秒）
-	DAGEnabled               bool `yaml:"dag_enabled"`                 // 是否启动 DAG 调度器
-	RestoreSessions          *bool `yaml:"restore_sessions"`            // 启动时是否从 session_history 恢复最近会话到内存（默认 true；显式 false 关闭）
-	PlanEnabled              bool `yaml:"plan_enabled"`                // 是否为复杂任务启用 Plan 层（多任务时生成结构化计划）
-	ReflectionEnabled        bool `yaml:"reflection_enabled"`          // 是否在助手执行后做 Self-Reflection（不达标重试一次）
-	AssistantSelfTestEnabled bool `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证
-	DomainSelfTestEnabled    bool `yaml:"domain_self_test_enabled"`    // 领域 Agent 完成后是否派遣测试助手验证完整模块
-	BlockMemoryWriteEnabled  *bool `yaml:"block_memory_write_enabled"` // 子 Agent 成功完成后是否将结果摘要沉淀到块记忆知识库（默认 true；显式 false 关闭）
+	DAGEnabled               bool  `yaml:"dag_enabled"`                  // 是否启动 DAG 调度器
+	RestoreSessions          *bool `yaml:"restore_sessions"`             // 启动时是否从 session_history 恢复最近会话到内存（默认 true；显式 false 关闭）
+	AssistantSelfTestEnabled bool  `yaml:"assistant_self_test_enabled"`  // 助手完成子任务后是否派遣测试助手验证
+	DomainSelfTestEnabled    bool  `yaml:"domain_self_test_enabled"`     // 领域 Agent 完成后是否派遣测试助手验证完整模块
+	BlockMemoryWriteEnabled  *bool `yaml:"block_memory_write_enabled"`   // 子 Agent 成功完成后是否将结果摘要沉淀到块记忆知识库（默认 true；显式 false 关闭）
 	// VerificationMaxRounds 多 Agent 协作验证闭环的最大往返轮数上限：
 	// 代码 Agent <-> 测试 Agent 互相询问/纠正的次数超过该值时，Dispatcher 拒绝
 	// 进一步的同线程派发，防止循环调用死锁。默认 5；<=0 时回退默认。
@@ -115,17 +71,13 @@ type FeatureTogglesConfig struct {
 	// 计数在用户发送新消息时重置。默认 30；<=0 时回退默认，负数表示不限制。
 	MaxTotalDispatches int `yaml:"max_total_dispatches"`
 	// SpecEnforcementEnabled 派发方调用 call_sub_agent 前是否强制先写 WriteSpec。
-	// 默认 true：MetaAgent/DomainAgent 派发子 Agent 前必须先 WriteSpec(goal, acceptance, ...)，
-	// dispatcher 在 Execute 入口校验 parentID:spec 存在且新鲜，缺失则拒绝派发。
-	// 显式 false 关闭强制，spec 注入仍生效（graceful degrade）。
+	// 默认 false（基础任务先跑通）；Pipeline 重构后由 PlanStage 替代，配置项整体移除。
 	SpecEnforcementEnabled *bool `yaml:"spec_enforcement_enabled"`
 	// PlanSkipEnabled 是否跳过 verifyloop 的 PlanConfirm 阶段。
-	// 默认 false：PlanConfirm 强制执行（AgentVerifier 已实现，测试方列方案交产出方确认）。
-	// 显式 true 跳过，向后兼容无 PlanConfirm 实现的自定义 Verifier。
-	PlanSkipEnabled bool `yaml:"plan_skip_enabled"`
+	// 默认 true：跳过 PlanConfirm（PlanConfirm 整体移除中）。
+	PlanSkipEnabled *bool `yaml:"plan_skip_enabled"`
 	// ReviewEnabled 是否在 verifyloop 中插入 Review 阶段（code_reviewer 静态审查）。
-	// 默认 true：PlanConfirm 通过后、SelfTest 前派发 code_reviewer 审查产出。
-	// 显式 false 跳过 Review，verifyloop 退化为 PlanConfirm -> SelfTest -> UnifiedTest。
+	// 默认 false：基础任务先跑通；显式 true 开启。
 	ReviewEnabled *bool `yaml:"review_enabled"`
 	// VerificationRolePairs 是验证闭环的角色对列表：产出角色 -> 测试角色。
 	// AssistantSelfTestEnabled 开启时，bootstrap 按此列表注册 OnSubAgentDone 钩子，
@@ -141,45 +93,18 @@ type VerificationRolePair struct {
 
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
 // 通过嵌入若干聚焦的子配置，既保持 cfg.Agent.Xxx 的既有访问方式，又将相关字段按职责分组。
-// 替代散落在 graph 包中的硬编码常量（maxSteps=200、skillSetSize=8、
-// retry=3、LLM 软/硬超时 30s/90s 等），让运维可以通过 config.yaml 调整。
 type AgentConfig struct {
-	GraphPolicyConfig    `yaml:",inline"`
 	LLMRuntimeConfig     `yaml:",inline"`
 	SafetyConfig         `yaml:",inline"`
 	FeatureTogglesConfig `yaml:",inline"`
 
-	// 记忆管线策略保持为具名字段，以维持 agent.memory_policy 的 YAML 路径不变。
-	MemoryPolicy MemoryPolicyConfig `yaml:"memory_policy"`
-
 	// 其余不适合归入上述子配置的独立字段。
-	SkillSetSize                int     `yaml:"skill_set_size"`                  // 每个 DomainAgent 装配的 Skill 子集上限
-	ContextWindow               int     `yaml:"context_window"`                  // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
-	SnapshotSummaryCount        int     `yaml:"snapshot_summary_count"`          // 快照保留的最近摘要条数（默认 20）
-	SnapshotOpenIssueThreshold  float64 `yaml:"snapshot_open_issue_threshold"`   // 未决问题重要性阈值（默认 0.7）
-	SummaryMaxRunes             int     `yaml:"summary_max_runes"`               // 摘要最大 rune 数（默认 400）
-	FactMaxSentences            int     `yaml:"fact_max_sentences"`              // 事实提取最大句数（默认 5）
-	CompressImportanceThreshold float64 `yaml:"compress_importance_threshold"`   // 压缩保留 Raw 的重要性阈值（默认 0.7）
-	CompressAgeHours            int     `yaml:"compress_age_hours"`              // 压缩保留 Raw 的最大年龄（小时，默认 24）
-	ReadFileMaxChars            int     `yaml:"read_file_max_chars"`             // ReadFile / SearchInFiles 输出截断字符数
-	RunCommandMaxOutput         int     `yaml:"run_command_max_output"`          // RunCommand 输出截断字符数
-	RunCommandTimeoutSec        int     `yaml:"run_command_timeout_sec"`         // RunCommand 最大允许超时（秒）
-	ToolExecMaxBytes            int     `yaml:"tool_exec_max_bytes"`             // Execute 入参 JSON 摘要截断字节数
-	LLMPromptMaxChars           int     `yaml:"llm_prompt_max_chars"`            // prompt / response 日志摘要截断字符数
-	LLMTrackerSlowModeThreshold int     `yaml:"llm_tracker_slow_mode_threshold"` // 连续多少次 LLM 失败进入 slow mode
-	LoggerRetryCount            int     `yaml:"logger_retry_count"`              // 日志异步写表重试次数
-	ContextExplodeSoftLimit     int     `yaml:"context_explode_soft_limit"`      // blades 上下文爆炸软阈值（input tokens）
-	ContextExplodeHardLimit     int     `yaml:"context_explode_hard_limit"`      // blades 上下文爆炸硬阈值（input tokens）
-	SummaryTruncateChars        int     `yaml:"summary_truncate_chars"`          // CommonCollectTaskSummaries 单条结果截断字符数
-	SearchBlockMemoryMaxTokens  int     `yaml:"search_block_memory_max_tokens"`  // 块记忆检索摘要 token 上限
-	SummaryBaseLimit            int     `yaml:"summary_base_limit"`              // MetaAgent 最终总结基础字数
-	SummaryExtendedLimit        int     `yaml:"summary_extended_limit"`          // MetaAgent 最终总结每子 Agent 增加字数
-	LoopDetectorWindowSize      int     `yaml:"loop_detector_window_size"`       // 循环检测器窗口大小
-	LoopDetectorMaxRepeat       int     `yaml:"loop_detector_max_repeat"`        // 循环检测器重复阈值
-	LoopDetectorMaxEmpty        int     `yaml:"loop_detector_max_empty"`         // 循环检测器连续空转阈值
-	DomainMemoryRecallMaxChars  int     `yaml:"domain_memory_recall_max_chars"`  // DomainAgent 记忆召回事件截断字符数
-	DomainMemoryContextMaxChars int     `yaml:"domain_memory_context_max_chars"` // DomainAgent 记忆上下文注入截断字符数
-	DomainResultLogMaxChars     int     `yaml:"domain_result_log_max_chars"`     // DomainAgent 结果日志截断字符数
+	ContextWindow              int `yaml:"context_window"`                  // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
+	ReadFileMaxChars           int `yaml:"read_file_max_chars"`             // ReadFile / SearchInFiles 输出截断字符数
+	RunCommandMaxOutput        int `yaml:"run_command_max_output"`          // RunCommand 输出截断字符数
+	RunCommandTimeoutSec       int `yaml:"run_command_timeout_sec"`         // RunCommand 最大允许超时（秒）
+	ToolExecMaxBytes           int `yaml:"tool_exec_max_bytes"`             // Execute 入参 JSON 摘要截断字节数
+	SearchBlockMemoryMaxTokens int `yaml:"search_block_memory_max_tokens"`  // 块记忆检索摘要 token 上限
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -233,8 +158,8 @@ type MemoryConfig struct {
 }
 
 // Load 从指定路径读取 YAML 配置文件并构造 *Config。
-// 职责：读取文件 → 反序列化为 Config → 合并同目录下的 infrastructure.yaml / agent-policy.yaml
-// （如果存在）→ 填充默认值 → 解析环境变量引用。
+// 职责：读取文件 -> 反序列化为 Config -> 合并同目录下的 infrastructure.yaml / agent-policy.yaml
+// （如果存在）-> 填充默认值 -> 解析环境变量引用。
 // 参数：path 为 config.yaml 的文件路径。
 // 返回：填充完成的 *Config；任一阶段失败均返回包装后的 error。
 // 副作用：仅读取文件系统与进程环境变量，不修改它们。
@@ -328,7 +253,7 @@ func (c *Config) applyDefaults() error {
 }
 
 func (c *Config) applyPostgresDefaults() {
-	// —— Postgres 默认值：本地开发 DSN 与中等规模连接池 ——
+	// -- Postgres 默认值：本地开发 DSN 与中等规模连接池 --
 	if c.Postgres.DSN == "" {
 		c.Postgres.DSN = "postgres://user:pass@localhost:5432/blockmemory?sslmode=disable"
 	}
@@ -344,7 +269,7 @@ func (c *Config) applyPostgresDefaults() {
 }
 
 func (c *Config) applyPgVectorDefaults() {
-	// —— pgvector 默认值：768 维、ivfflat 索引、cosine 距离 ——
+	// -- pgvector 默认值：768 维、ivfflat 索引、cosine 距离 --
 	if c.PgVector.Dimensions == 0 {
 		c.PgVector.Dimensions = 768
 	}
@@ -357,7 +282,7 @@ func (c *Config) applyPgVectorDefaults() {
 }
 
 func (c *Config) applyRedisDefaults() {
-	// —— Redis 默认值：本地地址、小型连接池、毫秒级超时、7 天快照 TTL ——
+	// -- Redis 默认值：本地地址、小型连接池、毫秒级超时、7 天快照 TTL --
 	if c.Redis.Addr == "" {
 		c.Redis.Addr = "localhost:6379"
 	}
@@ -382,7 +307,7 @@ func (c *Config) applyRedisDefaults() {
 }
 
 func (c *Config) applyHTTPDefaults() error {
-	// —— HTTP 默认值：10010 端口、30 秒超时 ——
+	// -- HTTP 默认值：10010 端口、30 秒超时 --
 	if c.HTTP.Addr == "" {
 		c.HTTP.Addr = ":10010"
 	}
@@ -399,7 +324,7 @@ func (c *Config) applyHTTPDefaults() error {
 }
 
 func (c *Config) applyMemoryDefaults() {
-	// —— 记忆管线默认值：100 条/批、5 秒刷新、300 秒快照 ——
+	// -- 记忆管线默认值：100 条/批、5 秒刷新、300 秒快照 --
 	if c.Memory.WriteBatchSize == 0 {
 		c.Memory.WriteBatchSize = 100
 	}
@@ -412,33 +337,14 @@ func (c *Config) applyMemoryDefaults() {
 }
 
 func (c *Config) applyAgentDefaults() error {
-	// —— Agent 运行时参数默认值 ——
+	// -- Agent 运行时参数默认值 --
 	// 约定：所有数值字段以 0 表示"未配置"，按字段语义填充默认。
 	// 因此配置侧无法把任一项显式设为 0；如需禁用某参数，请改用对应的
-	// 布尔开关（如 InterruptEnabled）而非将其置 0。
-	if err := c.applyGraphPolicyDefaults(); err != nil {
-		return err
-	}
+	// 布尔开关（如 DAGEnabled）而非将其置 0。
 	c.applyLLMRuntimeDefaults()
 	c.applySafetyDefaults()
 	c.applyFeatureTogglesDefaults()
 	c.applyAgentStandaloneDefaults()
-	c.applyMemoryPolicyDefaults()
-	return nil
-}
-
-func (c *Config) applyGraphPolicyDefaults() error {
-	// Graph 死循环防护三项提供默认值，保持向后兼容。
-	// 0 仍表示“未配置”；如需显式禁用请在配置中使用对应的特性开关。
-	if c.Agent.StallSteps == 0 {
-		c.Agent.StallSteps = 30
-	}
-	if c.Agent.MaxRepeatFingerprint == 0 {
-		c.Agent.MaxRepeatFingerprint = 3
-	}
-	if c.Agent.SessionTimeoutMin == 0 {
-		c.Agent.SessionTimeoutMin = 240
-	}
 	return nil
 }
 
@@ -451,12 +357,6 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.RetryBackoffMs == 0 {
 		c.Agent.RetryBackoffMs = 100
-	}
-	if c.Agent.LLMSoftTimeoutSec == 0 {
-		c.Agent.LLMSoftTimeoutSec = 30
-	}
-	if c.Agent.LLMHardTimeoutSec == 0 {
-		c.Agent.LLMHardTimeoutSec = 90
 	}
 	if c.Agent.ReactLLMTimeoutSec == 0 {
 		c.Agent.ReactLLMTimeoutSec = 300
@@ -483,9 +383,6 @@ func (c *Config) applySafetyDefaults() {
 }
 
 func (c *Config) applyFeatureTogglesDefaults() {
-	if c.Agent.HumanClarifyTimeoutSec == 0 {
-		c.Agent.HumanClarifyTimeoutSec = 120
-	}
 	// 块记忆写入默认开启，与 RestoreSessions 同样采用 *bool 以区分"未配置"与"显式 false"。
 	if c.Agent.BlockMemoryWriteEnabled == nil {
 		t := true
@@ -508,44 +405,27 @@ func (c *Config) applyFeatureTogglesDefaults() {
 			{CodeRole: "code_assistant", TestRole: "test_assistant"},
 		}
 	}
-	// Spec 强制默认开启：派发方必须先 WriteSpec 再 call_sub_agent。
-	// *bool 区分"未配置"（默认 true）与"显式 false"（关闭强制）。
+	// Spec 强制默认关闭：基础任务先跑通。Pipeline 重构后由 PlanStage 替代。
+	// *bool 区分"未配置"（默认 false）与"显式 true"（开启强制）。
 	if c.Agent.SpecEnforcementEnabled == nil {
-		t := true
-		c.Agent.SpecEnforcementEnabled = &t
+		f := false
+		c.Agent.SpecEnforcementEnabled = &f
 	}
-	// Review 阶段默认开启：PlanConfirm 通过后、SelfTest 前派 code_reviewer 静态审查。
+	// PlanSkipEnabled 默认 true：跳过 PlanConfirm（PlanConfirm 整体移除中）。
+	if c.Agent.PlanSkipEnabled == nil {
+		t := true
+		c.Agent.PlanSkipEnabled = &t
+	}
+	// Review 阶段默认关闭：基础任务先跑通；显式 true 开启。
 	if c.Agent.ReviewEnabled == nil {
-		t := true
-		c.Agent.ReviewEnabled = &t
+		f := false
+		c.Agent.ReviewEnabled = &f
 	}
-	// PlanSkipEnabled 默认 false（零值），无需显式设置：PlanConfirm 强制执行。
 }
 
 func (c *Config) applyAgentStandaloneDefaults() {
-	if c.Agent.SkillSetSize == 0 {
-		c.Agent.SkillSetSize = 8
-	}
 	if c.Agent.ContextWindow == 0 {
 		c.Agent.ContextWindow = 32000
-	}
-	if c.Agent.SnapshotSummaryCount == 0 {
-		c.Agent.SnapshotSummaryCount = 20
-	}
-	if c.Agent.SnapshotOpenIssueThreshold == 0 {
-		c.Agent.SnapshotOpenIssueThreshold = 0.7
-	}
-	if c.Agent.SummaryMaxRunes == 0 {
-		c.Agent.SummaryMaxRunes = 400
-	}
-	if c.Agent.FactMaxSentences == 0 {
-		c.Agent.FactMaxSentences = 5
-	}
-	if c.Agent.CompressImportanceThreshold == 0 {
-		c.Agent.CompressImportanceThreshold = 0.7
-	}
-	if c.Agent.CompressAgeHours == 0 {
-		c.Agent.CompressAgeHours = 24
 	}
 	if c.Agent.ReadFileMaxChars == 0 {
 		c.Agent.ReadFileMaxChars = 4000
@@ -559,86 +439,13 @@ func (c *Config) applyAgentStandaloneDefaults() {
 	if c.Agent.ToolExecMaxBytes == 0 {
 		c.Agent.ToolExecMaxBytes = 300
 	}
-	if c.Agent.LLMPromptMaxChars == 0 {
-		c.Agent.LLMPromptMaxChars = 500
-	}
-	if c.Agent.LLMTrackerSlowModeThreshold == 0 {
-		c.Agent.LLMTrackerSlowModeThreshold = 3
-	}
-	if c.Agent.LoggerRetryCount == 0 {
-		c.Agent.LoggerRetryCount = 3
-	}
-	if c.Agent.ContextExplodeSoftLimit == 0 {
-		c.Agent.ContextExplodeSoftLimit = 50000
-	}
-	if c.Agent.ContextExplodeHardLimit == 0 {
-		c.Agent.ContextExplodeHardLimit = 80000
-	}
-	if c.Agent.SummaryTruncateChars == 0 {
-		c.Agent.SummaryTruncateChars = 100
-	}
 	if c.Agent.SearchBlockMemoryMaxTokens == 0 {
 		c.Agent.SearchBlockMemoryMaxTokens = 800
-	}
-	if c.Agent.SummaryBaseLimit == 0 {
-		c.Agent.SummaryBaseLimit = 500
-	}
-	if c.Agent.SummaryExtendedLimit == 0 {
-		c.Agent.SummaryExtendedLimit = 200
-	}
-	if c.Agent.LoopDetectorWindowSize == 0 {
-		c.Agent.LoopDetectorWindowSize = 20
-	}
-	if c.Agent.LoopDetectorMaxRepeat == 0 {
-		c.Agent.LoopDetectorMaxRepeat = 1
-	}
-	if c.Agent.LoopDetectorMaxEmpty == 0 {
-		c.Agent.LoopDetectorMaxEmpty = 4
-	}
-	if c.Agent.DomainMemoryRecallMaxChars == 0 {
-		c.Agent.DomainMemoryRecallMaxChars = 300
-	}
-	if c.Agent.DomainMemoryContextMaxChars == 0 {
-		c.Agent.DomainMemoryContextMaxChars = 500
-	}
-	if c.Agent.DomainResultLogMaxChars == 0 {
-		c.Agent.DomainResultLogMaxChars = 200
-	}
-}
-
-func (c *Config) applyMemoryPolicyDefaults() {
-	// 记忆管线策略默认值（与 assembler.go 原硬编码比例一致：6/12/25/12/25/6/14）
-	if c.Agent.MemoryPolicy.ContextWindow == 0 {
-		c.Agent.MemoryPolicy.ContextWindow = c.Agent.ContextWindow
-	}
-	if c.Agent.MemoryPolicy.SystemSegmentRatio == 0 {
-		c.Agent.MemoryPolicy.SystemSegmentRatio = 6
-	}
-	if c.Agent.MemoryPolicy.TopicGlobalRatio == 0 {
-		c.Agent.MemoryPolicy.TopicGlobalRatio = 12
-	}
-	if c.Agent.MemoryPolicy.SharedStateRatio == 0 {
-		c.Agent.MemoryPolicy.SharedStateRatio = 25
-	}
-	if c.Agent.MemoryPolicy.GlobalKBRatio == 0 {
-		c.Agent.MemoryPolicy.GlobalKBRatio = 12
-	}
-	if c.Agent.MemoryPolicy.PrivateMemoryRatio == 0 {
-		c.Agent.MemoryPolicy.PrivateMemoryRatio = 25
-	}
-	if c.Agent.MemoryPolicy.TaskRatio == 0 {
-		c.Agent.MemoryPolicy.TaskRatio = 6
-	}
-	if c.Agent.MemoryPolicy.ReserveRatio == 0 {
-		c.Agent.MemoryPolicy.ReserveRatio = 14
-	}
-	if c.Agent.MemoryPolicy.DefaultTokensPerItem == 0 {
-		c.Agent.MemoryPolicy.DefaultTokensPerItem = 200
 	}
 }
 
 func (c *Config) applyLoggingDefaults() {
-	// —— 日志默认值：默认目录 ./logs ——
+	// -- 日志默认值：默认目录 ./logs --
 	if c.Logging.Dir == "" {
 		c.Logging.Dir = "logs"
 	}

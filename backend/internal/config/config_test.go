@@ -15,23 +15,8 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载 config.yaml 失败: %v", err)
 	}
-	if cfg.Agent.InterruptEnabled {
-		t.Fatal("interrupt_enabled 应为 false")
-	}
-	if cfg.Agent.QueueInjectEnabled {
-		t.Fatal("queue_inject_enabled 应为 false")
-	}
-	if cfg.Agent.HumanClarifyEnabled {
-		t.Fatal("human_clarify_enabled 应为 false")
-	}
 	if cfg.Agent.DAGEnabled {
 		t.Fatal("dag_enabled 应为 false")
-	}
-	if cfg.Agent.PlanEnabled {
-		t.Fatal("plan_enabled 应为 false")
-	}
-	if cfg.Agent.ReflectionEnabled {
-		t.Fatal("reflection_enabled 应为 false")
 	}
 	// 块记忆写入开关未在 config.yaml 中显式配置时，applyDefaults 应兜底为 true。
 	if cfg.Agent.BlockMemoryWriteEnabled == nil || !*cfg.Agent.BlockMemoryWriteEnabled {
@@ -49,16 +34,16 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if p.CodeRole != "code_assistant" || p.TestRole != "test_assistant" {
 		t.Fatalf("default pair mismatch: %+v", p)
 	}
-	// Spec 强制默认开启：派发方必须先 WriteSpec 再 call_sub_agent。
-	if cfg.Agent.SpecEnforcementEnabled == nil || !*cfg.Agent.SpecEnforcementEnabled {
-		t.Fatal("spec_enforcement_enabled 默认应为 true")
+	// Spec 强制默认关闭：基础任务先跑通。
+	if cfg.Agent.SpecEnforcementEnabled == nil || *cfg.Agent.SpecEnforcementEnabled {
+		t.Fatal("spec_enforcement_enabled 默认应为 false")
 	}
-	// Review 阶段默认开启：verifyloop 插入 code_reviewer 静态审查。
-	if cfg.Agent.ReviewEnabled == nil || !*cfg.Agent.ReviewEnabled {
-		t.Fatal("review_enabled 默认应为 true")
+	// Review 阶段默认关闭：基础任务先跑通。
+	if cfg.Agent.ReviewEnabled == nil || *cfg.Agent.ReviewEnabled {
+		t.Fatal("review_enabled 默认应为 false")
 	}
-	// PlanSkipEnabled 默认 false（零值）：PlanConfirm 强制执行。
-	if cfg.Agent.PlanSkipEnabled {
-		t.Fatal("plan_skip_enabled 默认应为 false")
+	// PlanSkipEnabled 默认 true：跳过 PlanConfirm（整体移除中）。
+	if cfg.Agent.PlanSkipEnabled == nil || !*cfg.Agent.PlanSkipEnabled {
+		t.Fatal("plan_skip_enabled 默认应为 true")
 	}
 }
