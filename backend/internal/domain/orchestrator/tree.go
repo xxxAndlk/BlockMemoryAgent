@@ -3,13 +3,27 @@
 // Dispatcher 在派发子 Agent 时调用 Register/SetCancel/Finish 维护权威树，
 // HTTP API 与 TUI 通过 Snapshot 读取，Cancel 端点通过存储的 cancel func 取消子 Agent。
 // 不参与 ReAct 循环控制流，仅作可观测/可取消的元数据层。
+//
+// 持久化：Tree 可选注入 TreeStore,Register/Finish/Cancel 后 best-effort 写入 PG。
+// 服务重启后 TreeFor 调 LoadNodes 恢复节点元数据（cancel func 无法恢复,已运行中的
+// 子 Agent 重启后视为失联,需外部清理）。store 为 nil 时纯内存,与原行为一致。
 package orchestrator
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 )
+
+// TreeStore 抽象 Agent 树节点的持久化能力。
+// 实现者负责把节点保存到磁盘或数据库,并按 sessionID 加载全部节点。
+// SaveNode 应为 upsert 语义(同 sessionID+nodeID 覆盖)。
+// LoadNodes 返回空切片表示 session 无持久化节点(新会话或首次访问)。
+type TreeStore interface {
+	SaveNode(ctx context.Context, sessionID string, node Node) error
+	LoadNodes(ctx context.Context, sessionID string) ([]Node, error)
+}
 
 // Status 表示 Agent 节点在树中的生命周期状态。
 type Status int
@@ -58,25 +72,47 @@ type Node struct {
 // Tree 维护单个会话的 Agent 树权威状态。
 // nodes 存储节点元数据，cancels 存储对应 subAgentID 的 cancel func。
 // 两个 map 同步生命周期：Register/Finish/Cancel 都先持锁再操作。
+//
+// store 与 sessionID 用于持久化:store 非 nil 时,Register/Finish/Cancel 后
+// best-effort 调 SaveNode 写入 PG;TreeFor lazy init 时调 LoadNodes 恢复节点。
+// store 为 nil 时纯内存,与原行为一致(测试场景)。
 type Tree struct {
-	mu      sync.RWMutex
-	nodes   map[string]*Node
-	cancels map[string]context.CancelFunc
+	mu       sync.RWMutex
+	nodes    map[string]*Node
+	cancels  map[string]context.CancelFunc
+	store    TreeStore
+	sessionID string
 }
 
-// NewTree 构造空树。
-func NewTree() *Tree {
+// NewTree 构造空树。store 可为 nil(纯内存,测试场景)。
+// sessionID 用于持久化时标识会话归属;store 为 nil 时 sessionID 可为空。
+func NewTree(sessionID string, store TreeStore) *Tree {
 	return &Tree{
-		nodes:   make(map[string]*Node),
-		cancels: make(map[string]context.CancelFunc),
+		nodes:    make(map[string]*Node),
+		cancels:  make(map[string]context.CancelFunc),
+		store:    store,
+		sessionID: sessionID,
+	}
+}
+
+// persistNode best-effort 写入持久化层。失败仅记日志,不影响主流程。
+// 2 秒超时防止 DB 阻塞 ReAct 循环。store 为 nil 时 no-op。
+func (t *Tree) persistNode(node Node) {
+	if t.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := t.store.SaveNode(ctx, t.sessionID, node); err != nil {
+		log.Printf("[orchestrator] persist node failed: session=%s node=%s err=%v", t.sessionID, node.ID, err)
 	}
 }
 
 // Register 写入新节点。若同 ID 已存在则覆盖（派发竞态保护）。
 // 不设置 cancels 条目；SetCancel 单独调用以解耦 Register 与 ctx 创建时机。
+// 持久化:store 非 nil 时 best-effort 写入,失败仅记日志。
 func (t *Tree) Register(n Node) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if n.Started.IsZero() {
 		n.Started = time.Now()
 	}
@@ -85,6 +121,8 @@ func (t *Tree) Register(n Node) {
 	}
 	node := n
 	t.nodes[node.ID] = &node
+	t.mu.Unlock()
+	t.persistNode(node)
 }
 
 // SetCancel 绑定 subAgentID 对应的 cancel func。
@@ -102,14 +140,16 @@ func (t *Tree) SetCancel(id string, cancel context.CancelFunc) {
 // Finish 标记节点结束。err 非 nil 则 StatusFailed，否则 StatusDone。
 // summary 为最终文本或部分结果。删除 cancels[id] 防止 map 无界增长。
 // 幂等：已 terminal 的节点重复调用 no-op。
+// 持久化:store 非 nil 时 best-effort 更新节点状态。
 func (t *Tree) Finish(id, summary string, err error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	node, ok := t.nodes[id]
 	if !ok {
+		t.mu.Unlock()
 		return
 	}
 	if node.Status == StatusDone || node.Status == StatusFailed || node.Status == StatusCancelled {
+		t.mu.Unlock()
 		return
 	}
 	node.Finished = time.Now()
@@ -121,16 +161,21 @@ func (t *Tree) Finish(id, summary string, err error) {
 		node.Status = StatusDone
 	}
 	delete(t.cancels, id)
+	snapshot := *node
+	t.mu.Unlock()
+	t.persistNode(snapshot)
 }
 
 // Cancel 调用已绑定的 cancel func 并将状态置为 StatusCancelled。
 // 返回是否找到对应节点且处于可取消状态（Running）。
 // context.CancelFunc 幂等（Go doc），与 goroutine defer cancel 重复调用安全。
 // 已 terminal 的节点 no-op。
+// 持久化:store 非 nil 时 best-effort 更新状态为 cancelled。
 func (t *Tree) Cancel(id string) bool {
 	t.mu.Lock()
 	node, ok := t.nodes[id]
 	if !ok {
+		t.mu.Unlock()
 		return false
 	}
 	if node.Status != StatusRunning {
@@ -141,11 +186,36 @@ func (t *Tree) Cancel(id string) bool {
 	node.Status = StatusCancelled
 	node.Finished = time.Now()
 	delete(t.cancels, id)
+	snapshot := *node
 	t.mu.Unlock()
 	if hasCancel && cancel != nil {
 		cancel()
 	}
+	t.persistNode(snapshot)
 	return true
+}
+
+// LoadFromStore 从持久化层加载节点到内存。store 为 nil 时 no-op。
+// 用于 TreeFor lazy init 时恢复历史节点。cancel func 无法恢复,
+// 已 Running 的节点重启后状态保留但不可外部 cancel(需等其自然 Finish 或超时)。
+func (t *Tree) LoadFromStore(ctx context.Context) error {
+	if t.store == nil {
+		return nil
+	}
+	nodes, err := t.store.LoadNodes(ctx, t.sessionID)
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range nodes {
+		n := nodes[i]
+		// 已存在的内存节点优先(Race 场景:本会话已 Register 过的不覆盖)。
+		if _, exists := t.nodes[n.ID]; !exists {
+			t.nodes[n.ID] = &n
+		}
+	}
+	return nil
 }
 
 // Get 返回指定 ID 的节点拷贝。不存在返回 false。

@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -8,7 +9,7 @@ import (
 )
 
 func TestRegisterDefaults(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	tr.Register(Node{ID: "a", Role: "dev"})
 	node, ok := tr.Get("a")
 	if !ok {
@@ -23,7 +24,7 @@ func TestRegisterDefaults(t *testing.T) {
 }
 
 func TestFinishSuccessSetsDone(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	tr.Register(Node{ID: "a"})
 	tr.Finish("a", "done text", nil)
 	node, _ := tr.Get("a")
@@ -39,7 +40,7 @@ func TestFinishSuccessSetsDone(t *testing.T) {
 }
 
 func TestFinishErrorSetsFailed(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	tr.Register(Node{ID: "a"})
 	tr.Finish("a", "partial", errors.New("boom"))
 	node, _ := tr.Get("a")
@@ -52,7 +53,7 @@ func TestFinishErrorSetsFailed(t *testing.T) {
 }
 
 func TestFinishIdempotent(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	tr.Register(Node{ID: "a"})
 	tr.Finish("a", "first", nil)
 	tr.Finish("a", "second", nil)
@@ -63,7 +64,7 @@ func TestFinishIdempotent(t *testing.T) {
 }
 
 func TestCancelRunningNode(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	cancelled := false
 	cancel := func() { cancelled = true }
 	tr.Register(Node{ID: "a"})
@@ -81,7 +82,7 @@ func TestCancelRunningNode(t *testing.T) {
 }
 
 func TestCancelTerminalNodeNoOp(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	called := false
 	tr.Register(Node{ID: "a"})
 	tr.SetCancel("a", func() { called = true })
@@ -95,21 +96,21 @@ func TestCancelTerminalNodeNoOp(t *testing.T) {
 }
 
 func TestCancelUnknownNode(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	if tr.Cancel("nope") {
 		t.Error("Cancel returned true for unknown node")
 	}
 }
 
 func TestSetCancelSkipsUnregistered(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	tr.SetCancel("ghost", func() {})
 	// 不应 panic，不应写入 cancels
 	tr.Cancel("ghost")
 }
 
 func TestSnapshotIsCopy(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	tr.Register(Node{ID: "a", Role: "r1"})
 	snap := tr.Snapshot()
 	if len(snap) != 1 {
@@ -123,7 +124,7 @@ func TestSnapshotIsCopy(t *testing.T) {
 }
 
 func TestSnapshotSortedByStarted(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	t0 := time.Now()
 	tr.Register(Node{ID: "a", Started: t0.Add(2 * time.Second)})
 	tr.Register(Node{ID: "b", Started: t0.Add(1 * time.Second)})
@@ -138,7 +139,7 @@ func TestSnapshotSortedByStarted(t *testing.T) {
 }
 
 func TestConcurrentRegisterFinishCancel(t *testing.T) {
-	tr := NewTree()
+	tr := NewTree("", nil)
 	const n = 100
 	var wg sync.WaitGroup
 	for i := range n {
@@ -204,4 +205,102 @@ func itoa(i int) string {
 		b[pos] = '-'
 	}
 	return string(b[pos:])
+}
+
+// fakeTreeStore 是测试用的 TreeStore 内存实现,记录 SaveNode 调用并支持 LoadNodes 返回预设数据。
+type fakeTreeStore struct {
+	saved   map[string]Node // 按 nodeID 索引
+	loadErr error
+}
+
+func newFakeTreeStore() *fakeTreeStore {
+	return &fakeTreeStore{saved: make(map[string]Node)}
+}
+
+func (f *fakeTreeStore) SaveNode(_ context.Context, _ string, node Node) error {
+	f.saved[node.ID] = node
+	return nil
+}
+
+func (f *fakeTreeStore) LoadNodes(_ context.Context, _ string) ([]Node, error) {
+	if f.loadErr != nil {
+		return nil, f.loadErr
+	}
+	out := make([]Node, 0, len(f.saved))
+	for _, n := range f.saved {
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// TestTree_PersistOnRegister 验证 Register 后节点写入 store。
+func TestTree_PersistOnRegister(t *testing.T) {
+	store := newFakeTreeStore()
+	tr := NewTree("sess-1", store)
+	tr.Register(Node{ID: "n1", Role: "code_assistant", Task: "do X"})
+
+	if _, ok := store.saved["n1"]; !ok {
+		t.Fatal("expected node saved to store after Register")
+	}
+	if store.saved["n1"].Status != StatusRunning {
+		t.Errorf("expected saved status running, got %s", store.saved["n1"].Status)
+	}
+}
+
+// TestTree_PersistOnFinish 验证 Finish 后状态更新写入 store。
+func TestTree_PersistOnFinish(t *testing.T) {
+	store := newFakeTreeStore()
+	tr := NewTree("sess-1", store)
+	tr.Register(Node{ID: "n1", Role: "code_assistant"})
+	tr.Finish("n1", "done summary", nil)
+
+	if store.saved["n1"].Status != StatusDone {
+		t.Errorf("expected saved status done, got %s", store.saved["n1"].Status)
+	}
+	if store.saved["n1"].Summary != "done summary" {
+		t.Errorf("expected saved summary, got %q", store.saved["n1"].Summary)
+	}
+}
+
+// TestTree_PersistOnCancel 验证 Cancel 后状态更新写入 store。
+func TestTree_PersistOnCancel(t *testing.T) {
+	store := newFakeTreeStore()
+	tr := NewTree("sess-1", store)
+	tr.Register(Node{ID: "n1", Role: "code_assistant"})
+	tr.SetCancel("n1", func() {})
+	tr.Cancel("n1")
+
+	if store.saved["n1"].Status != StatusCancelled {
+		t.Errorf("expected saved status cancelled, got %s", store.saved["n1"].Status)
+	}
+}
+
+// TestTree_LoadFromStore 验证从 store 恢复节点。
+func TestTree_LoadFromStore(t *testing.T) {
+	store := newFakeTreeStore()
+	// 预设一个节点
+	store.saved["n1"] = Node{ID: "n1", Role: "code_assistant", Status: StatusDone, Summary: "prior"}
+
+	tr := NewTree("sess-1", store)
+	if err := tr.LoadFromStore(context.Background()); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	node, ok := tr.Get("n1")
+	if !ok {
+		t.Fatal("expected node loaded from store")
+	}
+	if node.Summary != "prior" {
+		t.Errorf("expected prior summary, got %q", node.Summary)
+	}
+}
+
+// TestTree_NilStoreNoOp 验证 store 为 nil 时不 panic 且行为正常。
+func TestTree_NilStoreNoOp(t *testing.T) {
+	tr := NewTree("", nil)
+	tr.Register(Node{ID: "n1", Role: "code_assistant"})
+	tr.Finish("n1", "done", nil)
+	tr.Cancel("n1")
+	if err := tr.LoadFromStore(context.Background()); err != nil {
+		t.Errorf("expected nil error with nil store, got %v", err)
+	}
 }

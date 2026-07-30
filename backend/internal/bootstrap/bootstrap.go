@@ -358,6 +358,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
 	agentSvc.SetLogger(sessionLogger)
 	agentSvc.SetRuntimeConfig(reactCfg)
+	// 注入 Agent 树持久化层：Register/Finish/Cancel 后 best-effort 写入 PG,
+	// 服务重启后 TreeFor lazy init 调 LoadFromStore 恢复历史节点(元数据恢复)。
+	agentSvc.SetTreeStore(store.NewPostgresTreeStore(pgStore.DB()))
 	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
 	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。
 	subAgentDispatcher.WithLiveEvents(agentSvc.ForwardLiveEvent)
@@ -473,6 +476,7 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 		"session_logs":    store.EnsureSessionLogsSchema,
 		"dag":             store.EnsureDAGSchema,
 		"memory":          store.EnsureInitialMemorySchema,
+		"agent_tree":      store.EnsureAgentTreeSchema,
 	} {
 		if err := fn(ctx, pgStore.DB()); err != nil {
 			return fmt.Errorf("ensure %s schema: %w", name, err)

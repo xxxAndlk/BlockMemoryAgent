@@ -46,7 +46,17 @@ type ReactService struct {
 	// trees 按 sessionID 维护权威 Agent 树（lazy init）。
 	// Dispatcher 通过 TreeFor(sid) 取得 *orchestrator.Tree 后 Register/Finish/SetCancel。
 	// Snapshot/Cancel 经由 Tree()/CancelAgent() 暴露给 HTTP API。
+	// treeStore 非 nil 时 TreeFor lazy init 会调 LoadFromStore 恢复历史节点(重启不丢)。
 	trees sync.Map
+	// treeStore 可选的 Agent 树持久化层。为 nil 时纯内存。
+	// 由 bootstrap 注入 store.PostgresTreeStore;测试场景保持 nil。
+	treeStore orchestrator.TreeStore
+}
+
+// SetTreeStore 注入 Agent 树持久化层。bootstrap 在创建 ReactService 后调用。
+// 传 nil 关闭持久化(纯内存,测试场景)。
+func (s *ReactService) SetTreeStore(ts orchestrator.TreeStore) {
+	s.treeStore = ts
 }
 
 // ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
@@ -443,14 +453,20 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 	}, nil
 }
 
-// TreeFor 按 sessionID 取得权威 Agent 树（不存在则 lazy 创建）。
+// TreeFor 按 sessionID 取得权威 Agent 树（不存在则 lazy 创建并从持久化层恢复）。
 // Dispatcher 在派发子 Agent 时调用此方法注入 Register/Finish/SetCancel。
-// 树不持久化，服务重启后清空；HTTP API 通过 Tree()/CancelAgent() 读取。
+// treeStore 非 nil 时,新建 Tree 会调 LoadFromStore 恢复历史节点(重启不丢);
+// 为 nil 时纯内存,与原行为一致。
 func (s *ReactService) TreeFor(sessionID string) *orchestrator.Tree {
 	if v, ok := s.trees.Load(sessionID); ok {
 		return v.(*orchestrator.Tree)
 	}
-	t := orchestrator.NewTree()
+	t := orchestrator.NewTree(sessionID, s.treeStore)
+	if s.treeStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = t.LoadFromStore(ctx)
+		cancel()
+	}
 	v, loaded := s.trees.LoadOrStore(sessionID, t)
 	if loaded {
 		return v.(*orchestrator.Tree)
