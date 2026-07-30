@@ -103,6 +103,19 @@ ORDER BY started ASC
 	return out, rows.Err()
 }
 
+// DeleteNodesBySession 删除 session 的全部节点。用于话题切换时终结旧树。
+// 幂等:session 无节点时返回 nil。
+func (s *PostgresTreeStore) DeleteNodesBySession(ctx context.Context, sessionID string) error {
+	if s.db == nil {
+		return fmt.Errorf("postgres tree store: db is nil")
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_tree_nodes WHERE session_id = $1`, sessionID)
+	if err != nil {
+		return fmt.Errorf("delete agent tree nodes by session: %w", err)
+	}
+	return nil
+}
+
 // parseStatus 把字符串状态映射回 Status 枚举。未知值视为 StatusRunning(安全默认)。
 func parseStatus(s string) orchestrator.Status {
 	switch s {

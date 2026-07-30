@@ -118,6 +118,10 @@ type Session struct {
 	ThinkingText   string          // ThinkingText 当前思考阶段的过程文本（瞬时，仅运行中有值）
 	ActiveBlocks   []ActiveBlock   // ActiveBlocks 当前正在运行的会话块视图
 	PendingClarify *ClarifyRequest // PendingClarify 待处理的澄清请求，无则为 nil
+	// ActiveTopicID 当前活跃话题 ID。切换话题时旧 Agent 树终结 + 新树起,
+	// 旧话题摘要写入 sharedKV `topic:{id}:summary` 供新话题 MetaAgent 召回。
+	// 空表示尚未切换过话题(单话题会话)。
+	ActiveTopicID string
 }
 
 // Event 是会话事件的 DTO，按字段逐一对齐 server.SessionEvent。

@@ -20,9 +20,11 @@ import (
 // 实现者负责把节点保存到磁盘或数据库,并按 sessionID 加载全部节点。
 // SaveNode 应为 upsert 语义(同 sessionID+nodeID 覆盖)。
 // LoadNodes 返回空切片表示 session 无持久化节点(新会话或首次访问)。
+// DeleteNodesBySession 清空 session 的全部节点,用于话题切换时终结旧树。
 type TreeStore interface {
 	SaveNode(ctx context.Context, sessionID string, node Node) error
 	LoadNodes(ctx context.Context, sessionID string) ([]Node, error)
+	DeleteNodesBySession(ctx context.Context, sessionID string) error
 }
 
 // Status 表示 Agent 节点在树中的生命周期状态。
@@ -216,6 +218,52 @@ func (t *Tree) LoadFromStore(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// EndCurrentTopic 终结当前话题:取消所有 Running 节点,返回快照供调用方压缩为 KV 摘要,
+// 清空内存节点并删除持久化层该 session 的全部节点。store 为 nil 时仅清内存。
+//
+// 用于话题切换:旧 Agent 树终结 + 新 Agent 树起(同 Tree 实例,内存清空)。
+// 旧话题的摘要由调用方(ReactService.SwitchTopic)写入 sharedKV `topic:{id}:summary`。
+// PG 节点删除后,新话题的节点从空开始,LoadNodes 不会混入旧话题节点。
+//
+// 返回的快照按 Started 升序,调用方可据此构造摘要文本。
+func (t *Tree) EndCurrentTopic() []Node {
+	t.mu.Lock()
+	for id, node := range t.nodes {
+		if node.Status == StatusRunning {
+			node.Status = StatusCancelled
+			node.Finished = time.Now()
+			if cancel, ok := t.cancels[id]; ok && cancel != nil {
+				cancel()
+			}
+			delete(t.cancels, id)
+		}
+	}
+	snapshot := make([]Node, 0, len(t.nodes))
+	for _, node := range t.nodes {
+		snapshot = append(snapshot, *node)
+	}
+	// 清空内存节点,新话题从空树开始。
+	t.nodes = make(map[string]*Node)
+	t.mu.Unlock()
+
+	// 排序快照(按 Started 升序),与 Snapshot 行为一致。
+	for i := 1; i < len(snapshot); i++ {
+		for j := i; j > 0 && snapshot[j].Started.Before(snapshot[j-1].Started); j-- {
+			snapshot[j], snapshot[j-1] = snapshot[j-1], snapshot[j]
+		}
+	}
+
+	// best-effort 删除 PG 节点。失败仅记日志,不影响新话题启动。
+	if t.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := t.store.DeleteNodesBySession(ctx, t.sessionID); err != nil {
+			log.Printf("[orchestrator] delete nodes for topic end failed: session=%s err=%v", t.sessionID, err)
+		}
+	}
+	return snapshot
 }
 
 // Get 返回指定 ID 的节点拷贝。不存在返回 false。

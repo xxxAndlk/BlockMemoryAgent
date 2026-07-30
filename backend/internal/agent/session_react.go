@@ -60,6 +60,10 @@ type reactInternalSession struct {
 	ctx context.Context
 	// cancelFn 用于取消 ctx，通常在会话结束或关闭时调用。
 	cancelFn context.CancelFunc
+	// activeTopicID 当前活跃话题 ID。切换话题时旧 Agent 树终结 + 新树起,
+	// 旧话题摘要写入 sharedKV `topic:{id}:summary`。空表示单话题(未切换过)。
+	// 话题 ID 也在切换时用于emetries 标签(若需)。
+	activeTopicID string
 }
 
 // maxReactInMemorySessions 限制 ReactService 同时保留在内存中的最大会话数，

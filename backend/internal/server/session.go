@@ -35,6 +35,9 @@ type Session struct {
 	StreamingText string `json:"streaming_text,omitempty"`
 	// ThinkingText 是当前思考阶段的过程文本（瞬时，仅运行中有值），答复输出或结束时清空。
 	ThinkingText string `json:"thinking_text,omitempty"`
+	// ActiveTopicID 当前活跃话题 ID。话题切换时旧 Agent 树终结 + 新树起,
+	// 旧话题摘要写入 sharedKV。空表示单话题(未切换过)。前端可据此展示话题列表。
+	ActiveTopicID string `json:"active_topic_id,omitempty"`
 }
 
 // SessionEvent 是会话事件流中的单个事件，对应前端展示的一条日志/消息。
@@ -315,6 +318,7 @@ func ToServerSession(a *agent.Session) *Session {
 		TempDir:       a.TempDir,
 		StreamingText: a.StreamingText,
 		ThinkingText:  a.ThinkingText,
+		ActiveTopicID: a.ActiveTopicID,
 	}
 }
 

@@ -361,6 +361,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入 Agent 树持久化层：Register/Finish/Cancel 后 best-effort 写入 PG,
 	// 服务重启后 TreeFor lazy init 调 LoadFromStore 恢复历史节点(元数据恢复)。
 	agentSvc.SetTreeStore(store.NewPostgresTreeStore(pgStore.DB()))
+	// 注入共享记忆 KV：话题切换时把旧 Agent 树摘要写入 `topic:{id}:summary`,
+	// 供新话题 MetaAgent 召回(召回注入侧步骤 4 part C 未做,摘要已落 KV)。
+	agentSvc.SetSharedMemoryStore(sharedKV)
 	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
 	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。
 	subAgentDispatcher.WithLiveEvents(agentSvc.ForwardLiveEvent)

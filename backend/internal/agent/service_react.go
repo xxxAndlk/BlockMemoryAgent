@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,12 +52,22 @@ type ReactService struct {
 	// treeStore 可选的 Agent 树持久化层。为 nil 时纯内存。
 	// 由 bootstrap 注入 store.PostgresTreeStore;测试场景保持 nil。
 	treeStore orchestrator.TreeStore
+	// sharedMemoryStore 可选的共享记忆 KV,用于话题切换时写入旧话题摘要。
+	// key 格式 `topic:{topicID}:summary`。为 nil 时跳过摘要写入(测试场景)。
+	// MetaAgent 在新话题召回该摘要依赖步骤 4 part C(MetaAgent 根 recall 注入,未做)。
+	sharedMemoryStore tool.SharedMemoryStore
 }
 
 // SetTreeStore 注入 Agent 树持久化层。bootstrap 在创建 ReactService 后调用。
 // 传 nil 关闭持久化(纯内存,测试场景)。
 func (s *ReactService) SetTreeStore(ts orchestrator.TreeStore) {
 	s.treeStore = ts
+}
+
+// SetSharedMemoryStore 注入共享记忆 KV,用于话题切换时写入旧话题摘要。
+// bootstrap 在创建 sharedKV 后调用。传 nil 关闭摘要写入(测试场景)。
+func (s *ReactService) SetSharedMemoryStore(store tool.SharedMemoryStore) {
+	s.sharedMemoryStore = store
 }
 
 // ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
@@ -558,40 +569,102 @@ func (s *ReactService) LLMStats() (callCount, timeoutCount int, avgDur, maxDur t
 	return s.store.llmStats()
 }
 
-// SwitchTopic 切换会话的当前话题。
-// 对于运行中的会话，记录话题切换事件；
-// 对于非运行中的会话，创建新会话并返回。
+// SwitchTopic 切换会话的当前话题(轻量话题隔离)。
+//
+// 流程:
+//  1. 终结旧话题:取消当前 Agent 树所有 Running 节点 -> 压缩旧树快照为摘要 ->
+//     写入 sharedKV `topic:{oldTopicID}:summary`(store 非 nil 时) -> 删除 PG 旧节点。
+//  2. 起新话题:生成本会话内单调递增的 topicID,更新 session.activeTopicID,
+//     新话题从空 Agent 树开始(同 Tree 实例,内存已清空)。
+//
+// 运行中与已完成会话均支持:已完成会话会重启 running 状态承载新话题。
+// 无状态机,纯 KV 摘要 + 树切换。MetaAgent 在新话题召回旧摘要依赖步骤 4 part C(未做)。
+//
+// name 为新话题显示名;goal 为话题目标,空时回退到 name。
 func (s *ReactService) SwitchTopic(ctx context.Context, sessionID, name, goal string) (*Session, error) {
-	// 话题名称不能为空。
 	if name == "" {
 		return nil, fmt.Errorf("name cannot be empty")
 	}
-	// 若未提供目标，则默认使用话题名称作为目标。
 	if goal == "" {
 		goal = name
 	}
 
-	// 加锁访问会话映射，查找目标会话。
+	// 查找会话并记录切换前状态。
 	s.store.mu.Lock()
 	session, ok := s.store.sessions[sessionID]
 	if !ok {
 		s.store.mu.Unlock()
 		return nil, ErrSessionNotFound
 	}
-
-	// 记录切换前是否处于运行状态，随后解锁。
+	oldTopicID := session.activeTopicID
 	wasRunning := session.Status == enums.SessionStatusRunning
 	s.store.mu.Unlock()
 
-	// 添加话题切换事件，供前端展示。
-	s.store.addEvent(session, eventkind.Progress, "User", fmt.Sprintf("切换话题: 到 [%s]", name), eventkind.TopicSwitch, "", "", "", "", true)
-
-	// 若会话仍在运行，返回当前会话快照；否则创建新会话承载新话题。
-	if wasRunning {
-		return toReactAgentSession(s.store.snapshotSessionByID(sessionID)), nil
+	// 终结旧话题的 Agent 树:取消 Running 节点 + 压缩摘要 + 清内存 + 删 PG。
+	tree := s.TreeFor(sessionID)
+	snapshot := tree.EndCurrentTopic()
+	// 旧话题有节点时压缩摘要写入 sharedKV,供新话题召回(步骤 4 part C 未做注入侧,
+	// 但摘要已落 KV,后续 part C 可按 topic:{id}:summary key 读)。
+	if oldTopicID != "" && s.sharedMemoryStore != nil && len(snapshot) > 0 {
+		summary := summarizeTopicSnapshot(oldTopicID, snapshot)
+		kvCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		if err := s.sharedMemoryStore.Set(kvCtx, "topic:"+oldTopicID+":summary", summary); err != nil {
+			s.store.logError(ctx, "switch topic: write old topic summary to KV failed", err)
+		}
+		cancel()
 	}
 
-	return toReactAgentSession(s.store.createSession(goal)), nil
+	// 生成新话题 ID:本会话内单调递增,首话题用 "1",后续 +1。
+	newTopicID := nextTopicID(oldTopicID)
+
+	s.store.mu.Lock()
+	session.activeTopicID = newTopicID
+	// 已完成会话切换话题时重启为 running,承载新任务。
+	if !wasRunning {
+		session.Status = enums.SessionStatusRunning
+		session.Result = ""
+		endedAt := time.Time{}
+		session.EndedAt = &endedAt
+	}
+	s.store.mu.Unlock()
+
+	// 记录话题切换事件(含旧/新 topic ID,便于审计)。
+	s.store.addEvent(session, eventkind.Progress, "User",
+		fmt.Sprintf("切换话题: [%s] -> [%s] (topic %s -> %s)", session.Goal, name, oldTopicID, newTopicID),
+		eventkind.TopicSwitch, "", "", "", "", true)
+	session.Goal = goal
+
+	return toReactAgentSession(s.store.snapshotSessionByID(sessionID)), nil
+}
+
+// nextTopicID 根据旧 topic ID 生成本会话内下一个单调递增 ID。
+// 旧 ID 空返回 "1";旧 ID 为纯数字返回 N+1;解析失败回退带 "-2" 后缀保证唯一。
+func nextTopicID(old string) string {
+	if old == "" {
+		return "1"
+	}
+	if n, err := strconv.Atoi(old); err == nil {
+		return strconv.Itoa(n + 1)
+	}
+	return old + "-2"
+}
+
+// summarizeTopicSnapshot 把旧话题 Agent 树快照压缩为 KV 摘要文本。
+// 格式:话题 ID 头 + 每节点一行(角色/状态/摘要/错误)。供新话题召回参考。
+func summarizeTopicSnapshot(topicID string, nodes []orchestrator.Node) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "【话题 %s 摘要】\n", topicID)
+	for _, n := range nodes {
+		fmt.Fprintf(&sb, "- [%s/%s] %s", n.Role, n.Status.String(), n.Task)
+		if n.Summary != "" {
+			fmt.Fprintf(&sb, " => %s", n.Summary)
+		}
+		if n.Err != "" {
+			fmt.Fprintf(&sb, " (err: %s)", n.Err)
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 // handleToolEvent 接收工具注册表产生的进度事件，并将其注入到对应运行中会话的事件流。
@@ -1194,6 +1267,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		ThinkingText:   s.ThinkingText,
 		ActiveBlocks:   []ActiveBlock{},
 		PendingClarify: nil,
+		ActiveTopicID:  s.activeTopicID,
 	}
 }
 

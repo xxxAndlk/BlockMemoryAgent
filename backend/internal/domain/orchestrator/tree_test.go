@@ -233,6 +233,11 @@ func (f *fakeTreeStore) LoadNodes(_ context.Context, _ string) ([]Node, error) {
 	return out, nil
 }
 
+func (f *fakeTreeStore) DeleteNodesBySession(_ context.Context, _ string) error {
+	f.saved = make(map[string]Node)
+	return nil
+}
+
 // TestTree_PersistOnRegister 验证 Register 后节点写入 store。
 func TestTree_PersistOnRegister(t *testing.T) {
 	store := newFakeTreeStore()
@@ -302,5 +307,54 @@ func TestTree_NilStoreNoOp(t *testing.T) {
 	tr.Cancel("n1")
 	if err := tr.LoadFromStore(context.Background()); err != nil {
 		t.Errorf("expected nil error with nil store, got %v", err)
+	}
+}
+
+// TestTree_EndCurrentTopic 验证终结话题:取消 Running 节点 + 清内存 + 返回快照 + 删 PG。
+func TestTree_EndCurrentTopic(t *testing.T) {
+	store := newFakeTreeStore()
+	tr := NewTree("sess-1", store)
+	tr.Register(Node{ID: "running-1", Role: "code_assistant", Task: "task A"})
+	tr.Register(Node{ID: "done-1", Role: "ui_assistant", Task: "task B"})
+	tr.Finish("done-1", "done summary", nil)
+
+	cancelCalled := false
+	tr.SetCancel("running-1", func() { cancelCalled = true })
+
+	snapshot := tr.EndCurrentTopic()
+
+	// 快照应含两个节点。
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 nodes in snapshot, got %d", len(snapshot))
+	}
+	// Running 节点应取消且 cancel func 被调用。
+	if !cancelCalled {
+		t.Error("expected cancel func called for Running node")
+	}
+	var runningNode *Node
+	for i := range snapshot {
+		if snapshot[i].ID == "running-1" {
+			runningNode = &snapshot[i]
+		}
+	}
+	if runningNode == nil || runningNode.Status != StatusCancelled {
+		t.Error("expected running-1 cancelled in snapshot")
+	}
+	// 内存应清空。
+	if nodes := tr.Snapshot(); len(nodes) != 0 {
+		t.Errorf("expected tree cleared, got %d nodes", len(nodes))
+	}
+	// store 应清空(DeleteNodesBySession called)。
+	if len(store.saved) != 0 {
+		t.Errorf("expected store cleared, got %d nodes", len(store.saved))
+	}
+}
+
+// TestTree_EndCurrentTopicEmpty 验证空树终结无 panic。
+func TestTree_EndCurrentTopicEmpty(t *testing.T) {
+	tr := NewTree("sess-1", nil)
+	snapshot := tr.EndCurrentTopic()
+	if len(snapshot) != 0 {
+		t.Errorf("expected empty snapshot, got %d", len(snapshot))
 	}
 }

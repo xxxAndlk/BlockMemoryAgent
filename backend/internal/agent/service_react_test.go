@@ -18,6 +18,9 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	// blades 提供可编程的模型消息与 provider 接口。
 	"github.com/go-kratos/blades"
+
+	// orchestrator 提供 Agent 树结构,供话题切换测试 Register 节点。
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 )
 
 // mockReactModelProvider 是一个可编程的 blades.ModelProvider，用于 ReactService 测试。
@@ -428,4 +431,58 @@ func TestReactService_PausesOnIterationLimit(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("续跑后会话未完成")
+}
+
+// TestReactService_SwitchTopic 验证话题切换:终结旧 Agent 树 + 更新 ActiveTopicID。
+func TestReactService_SwitchTopic(t *testing.T) {
+	llm := &mockReactModelProvider{
+		responses: []*blades.Message{blades.AssistantMessage("done")},
+	}
+	svc := newReactServiceForTest(llm, t.TempDir())
+	ctx := context.Background()
+
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "first topic"})
+	if err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+
+	// 在树上 Register 一个 Running 节点(模拟派发的子 Agent)。
+	tree := svc.TreeFor(created.ID)
+	tree.Register(orchestrator.Node{ID: "sub-1", Role: "code_assistant", Task: "do X"})
+
+	// 切换话题。
+	switched, err := svc.SwitchTopic(ctx, created.ID, "second topic", "do Y")
+	if err != nil {
+		t.Fatalf("SwitchTopic error: %v", err)
+	}
+	if switched.ActiveTopicID != "1" {
+		t.Errorf("expected ActiveTopicID=1, got %q", switched.ActiveTopicID)
+	}
+	if switched.Goal != "do Y" {
+		t.Errorf("expected Goal=do Y, got %q", switched.Goal)
+	}
+
+	// 旧节点应被取消(Running -> Cancelled),树清空。
+	if nodes := tree.Snapshot(); len(nodes) != 0 {
+		t.Errorf("expected tree cleared after topic switch, got %d nodes", len(nodes))
+	}
+
+	// 再次切换:topic ID 递增。
+	switched2, err := svc.SwitchTopic(ctx, created.ID, "third", "")
+	if err != nil {
+		t.Fatalf("second SwitchTopic error: %v", err)
+	}
+	if switched2.ActiveTopicID != "2" {
+		t.Errorf("expected ActiveTopicID=2, got %q", switched2.ActiveTopicID)
+	}
+}
+
+// TestReactService_SwitchTopicNotFound 验证会话不存在时返回 ErrSessionNotFound。
+func TestReactService_SwitchTopicNotFound(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	ctx := context.Background()
+	_, err := svc.SwitchTopic(ctx, "nope", "name", "")
+	if err != ErrSessionNotFound {
+		t.Errorf("expected ErrSessionNotFound, got %v", err)
+	}
 }
