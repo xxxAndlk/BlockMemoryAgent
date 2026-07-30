@@ -6,8 +6,8 @@
    - 开放动作：持续补充覆盖 Agent 树 cancel、事实提取回退路径等新端点的 e2e。
 
 2. **TUI Agent 树运行时构建**（部分完成）
-   - 当前状态：`internal/domain/orchestrator/tree.go` 权威树 struct 已落地（commit `2e97eff`）。Dispatcher 派发时 Register/SetCancel/Finish,HTTP 暴露 `GET /api/sessions/{id}/tree` + `POST /api/sessions/{id}/agents/{aid}/cancel`。`ReactService.ListAgents` 仍返回单 MetaAgent,但 `Tree()` 方法返回权威树快照。TUI `deriveSubAgentNodes` 保留作 fallback。
-   - 开放动作：TUI 改为读 `Tree()` 替代事件流派生（待树持久化后做）；`verifyloop.ExecuteChild` 同步路径入树（phase 2）；树持久化到 PG（重启不丢）。
+   - 当前状态：`internal/domain/orchestrator/tree.go` 权威树 struct 已落地（commit `2e97eff`）,PG 持久化已落地（commit `5a1134d`）。Dispatcher 派发时 Register/SetCancel/Finish,HTTP 暴露 `GET /api/sessions/{id}/tree` + `POST /api/sessions/{id}/agents/{aid}/cancel`。`ReactService.ListAgents` 仍返回单 MetaAgent,但 `Tree()` 方法返回权威树快照。TUI `deriveSubAgentNodes` 保留作 fallback。
+   - 开放动作：TUI 改为读 `Tree()` 替代事件流派生（树已持久化,可切）；`verifyloop.ExecuteChild` 同步路径入树（phase 2）。
 
 3. **记忆事件持久化**
    - 背景：`domain/memory.Pipeline` 当前使用 `InMemoryStore`，会话结束后事件丢失。
@@ -29,9 +29,9 @@
    - 背景：`soul.Loader` 加载 `soul.md` 正常,人格名经 API 暴露,但 `Inject(systemPrompt)` 方法从未被调用,人格内容未注入任何 ReAct prompt。
    - 开放动作：在 `react_agent.go systemPrompt()` 头部调 `soulLoader.Inject(base)` 注入人格前缀；或在 `service_react.go` 构造子 Agent 时注入；或确认 Soul 仅用于温度策略后删除 `Inject` 方法。
 
-8. **话题隔离轻量版**（未做,依赖 Agent 树）
-   - 背景：旧 `SessionBlock` 物理话题隔离已随 graph 删除,痛点二（话题切换污染）回归。
-   - 开放动作：Session 加 `active_topic_id` 字段；切换话题时压缩当前 Agent 树摘要 -> 写 sharedKV `topic:{id}:summary` -> 旧 Agent 树终结 -> 新 Agent 树起。无状态机,纯 KV + 树切换。依赖 #2 Agent 树持久化。
+8. **话题隔离轻量版**（已完成,commit `2b68d51`）
+   - 当前状态：`SwitchTopic` 重写为轻量话题隔离:`Tree.EndCurrentTopic` 取消 Running 节点 + 快照 + 清内存 + best-effort 删 PG(`DeleteNodesBySession`);旧树快照压缩为摘要写入 sharedKV `topic:{id}:summary`;生成本会话单调递增 topicID(`nextTopicID`),新话题从空树开始。无状态机,纯 KV 摘要 + 树切换。`Session`/`server.Session` 加 `ActiveTopicID` 字段透传前端。`reactInternalSession.activeTopicID` 字段。依赖 Agent 树持久化(commit `5a1134d`)已满足。
+   - 开放动作：MetaAgent 新话题召回旧摘要依赖步骤 4 part C(MetaAgent 根 recall 注入),摘要已落 KV,part C 按 `topic:{id}:summary` key 读即可。
 
 9. **动态角色注册中心**（已完成,commit `f27b166`）
    - 当前状态：`domain/role/registry.go` 加 RWMutex + dynamic map + `Register`/`Unregister`/`List` 运行时 API。`Get` 优先查 dynamic 层再回退 cfg;`CallableFixedRoles` 含动态角色;`CanCall` 现有逻辑已覆盖 `RoleTypeDynamic` 分支。新增 `role/tools.go`:`create_role`/`list_roles` 工具实现 Tool 接口,`Registry.RegisterTools` 注入 `tool.Registry`,Schema 暴露两个工具。MetaAgent Tools 白名单加 `create_role`/`list_roles`。Register 校验:ID 非空、不撞内置、Type 必须为 Dynamic、SystemPrompt 非空;ID 冲突拒绝。进程重启不保留（roles.yaml 才持久化）,与 Agent 树不持久化同 scope。
