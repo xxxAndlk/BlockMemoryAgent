@@ -848,6 +848,25 @@ func (r *Registry) Schema() []tools.Tool {
 			toolsList = append(toolsList, t)
 		}
 	}
+	// 暴露 verify_and_fix 工具(若已由 subagent.Dispatcher.RegisterVerifyTool 安装)。
+	// 仅 MetaAgent/DomainAgent 白名单含此工具,显式触发验证闭环(步骤 5:折叠进 ReAct)。
+	if ct, ok := r.tools["verify_and_fix"]; ok {
+		desc := "显式触发验证闭环:对已完成产出做自测+修正+上级统一测试往返。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("verify_and_fix", desc, func(ctx context.Context, in verifyAndFixInput) (string, error) {
+			args := map[string]any{"task": in.Task, "produced": in.Produced}
+			if in.CodeRole != "" {
+				args["code_role"] = in.CodeRole
+			}
+			res, _ := r.Dispatch(ctx, "verify_and_fix", args)
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
 	// 暴露 create_role 工具（若已由 role.Registry.RegisterTools 安装到注册表）。
 	// 仅 MetaAgent 白名单含此工具，运行时注册动态角色供 call_sub_agent 派发。
 	if ct, ok := r.tools["create_role"]; ok {
@@ -910,6 +929,13 @@ type sendMessageInput struct {
 	Body        string `json:"body" description:"详情正文（可空）"`
 	MessageType string `json:"message_type" description:"消息类型：request（默认，期望回复）/ info（单向通知）/ reply（对先前 request 的回复）"`
 	ThreadID    string `json:"thread_id" description:"会话线程标识（可空，同一问答链共享）"`
+}
+
+// verifyAndFixInput 是 verify_and_fix 工具的入参结构。
+type verifyAndFixInput struct {
+	Task     string `json:"task" description:"原始任务文本(供验证 Agent 知道验什么)"`
+	Produced string `json:"produced" description:"待验证的当前产出文本"`
+	CodeRole string `json:"code_role,omitempty" description:"可选:产出角色 ID(如 code_assistant/domain),默认用配置的第一对"`
 }
 
 // createRoleInput 是 create_role 工具的入参结构。

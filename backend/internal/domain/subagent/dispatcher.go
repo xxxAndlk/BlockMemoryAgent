@@ -18,6 +18,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // orchestrator 提供 Agent 树元数据层
 	"github.com/blockmemory/agent/backend/internal/domain/role" // role 包提供角色注册表
 	"github.com/blockmemory/agent/backend/internal/domain/tool" // tool 包提供工具注册表与 Result 类型
+	"github.com/blockmemory/agent/backend/internal/domain/verifyloop" // verifyloop 提供 Orchestrator/Verifier/Fixer/Reporter 状态机,供 verify_and_fix 工具复用
 	"github.com/blockmemory/agent/backend/internal/logger"      // logger 包提供会话级日志器，记录子 Agent LLM I/O
 	"github.com/blockmemory/agent/backend/internal/mailbox"     // mailbox 包用于子 Agent 向父 Agent 发送完成通知
 	"github.com/blockmemory/agent/backend/pkg/enums"            // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
@@ -95,10 +96,6 @@ type Dispatcher struct {
 	// sessionCounts 跟踪每个 session 的累计派发总数（所有角色合计），用于全局派发限额。
 	// 键为 sessionID（parentID 首段），值为 *atomic.Int64。用户发送新消息时重置。
 	sessionCounts sync.Map
-
-	// onSubAgentDone 是子 Agent 异步成功完成时的钩子，供 verifyloop 编排器接管自测流程。
-	// 为 nil 时关闭钩子；仅在 call_sub_agent 异步路径触发，ExecuteChild 同步路径不触发。
-	onSubAgentDone SubAgentDoneHandler
 
 	// sharedMem 是共享记忆的只读视图（tool.SharedMemoryStore 接口的子集），
 	// 供子 Agent 派发时读取主 Agent 写入的关键上下文与任务规范。
@@ -347,6 +344,14 @@ func (d *Dispatcher) RegisterMessagingTool(r *tool.Registry) {
 	r.Register(&sendMessageTool{dispatcher: d})
 }
 
+// RegisterVerifyTool 将 verify_and_fix 工具安装到工具注册表,并把按 code_role 索引的
+// verifyloop.Orchestrator 集合传入工具实例。工具内部由 MetaAgent/DomainAgent 显式调用,
+// 不再依赖 OnSubAgentDone 钩子自动触发(步骤 5:双控制流合并,verifyloop 折叠进 ReAct)。
+// orchestrators 为空时仍注册工具但 Execute 返回"未配置验证角色对"错误。
+func (d *Dispatcher) RegisterVerifyTool(r *tool.Registry, orchestrators map[string]*verifyloop.Orchestrator) {
+	r.Register(&verifyAndFixTool{dispatcher: d, orchs: orchestrators})
+}
+
 // sendMessageTool 实现 send_message 工具：向指定 Agent 实例邮箱投递一条消息。
 // 消息 Type 为 MsgRequest，携带 ReplyTo=caller Agent ID，使接收方可按请求-响应
 // 语义回投递回复（用 send_message 再发一条 Type=MsgReply 的消息）。
@@ -414,6 +419,86 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 		Tool:    "send_message",
 		Success: true,
 		Output:  id,
+	}
+}
+
+// verifyAndFixTool 实现 verify_and_fix 工具:MetaAgent/DomainAgent 显式调起验证闭环。
+// 折叠进 ReAct 作工具调用,而非独立编排器自动触发(步骤 5)。内部复用 verifyloop.Orchestrator
+// 状态机(SelfTest -> Fix -> UnifiedTest 往返),Reporter 把结果投递父 Agent 邮箱。
+type verifyAndFixTool struct {
+	dispatcher *Dispatcher
+	orchs      map[string]*verifyloop.Orchestrator
+}
+
+// Name 返回工具名称。
+func (t *verifyAndFixTool) Name() string { return "verify_and_fix" }
+
+// Aliases 返回工具别名列表,当前无别名。
+func (t *verifyAndFixTool) Aliases() []string { return nil }
+
+// Description 返回 LLM 可见描述。
+func (t *verifyAndFixTool) Description() string {
+	entries := []string{}
+	for k := range t.orchs {
+		entries = append(entries, k)
+	}
+	pairs := "无"
+	if len(entries) > 0 {
+		pairs = strings.Join(entries, ", ")
+	}
+	return "显式触发验证闭环:对已完成的产出做自测 + 修正 + 上级统一测试往返(最多 max_rounds 轮)。" +
+		"仅 MetaAgent/DomainAgent 可调用。MetaAgent 派发的复杂任务完成后,显式调用本工具决定何时验证," +
+		"替代旧 OnSubAgentDone 钩子自动触发(双控制流合并)。\n\n" +
+		"参数 task 为原始任务文本(供验证 Agent 知道验什么);produced 为待验证的当前产出文本;" +
+		"code_role 可选,选该产出对应的角色(如 code_assistant/domain),默认用配置的第一对。" +
+		"通过即返回 passed=true + 最终产出;未通过返回 passed=false + 失败原因,Reporter 同时投递结果到邮箱。\n\n" +
+		"已配置验证角色对(code_role): " + pairs + "。"
+}
+
+// Execute 执行 verify_and_fix 工具调用。
+func (t *verifyAndFixTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
+	parentID := agent.AgentIDFromContext(ctx)
+	if parentID == "" {
+		return &tool.Result{Tool: "verify_and_fix", Error: "missing caller agent context"}
+	}
+	task, _ := args["task"].(string)
+	produced, _ := args["produced"].(string)
+	if produced == "" {
+		return &tool.Result{Tool: "verify_and_fix", Error: "produced is required"}
+	}
+	codeRole, _ := args["code_role"].(string)
+	if codeRole == "" {
+		// 默认取第一对(遍历 map 顺序不保证,但配置通常单对)。
+		for k := range t.orchs {
+			codeRole = k
+			break
+		}
+	}
+	if codeRole == "" {
+		return &tool.Result{Tool: "verify_and_fix", Error: "no verify pair configured: 未配置验证角色对(self_test_enabled 关闭或 verification_role_pairs 为空)"}
+	}
+	o, ok := t.orchs[codeRole]
+	if !ok {
+		return &tool.Result{Tool: "verify_and_fix", Error: fmt.Sprintf("no orchestrator for code_role=%s", codeRole)}
+	}
+	// ProducerID 用 caller 自身:旧钩子路径传 subAgentID,工具路径无独立产出方 ID,复用 parentID。
+	// Reporter 投递结果到 parentID 邮箱,供调用方在下一轮 ReAct 迭代 Drain 收件箱读取。
+	req := verifyloop.Request{
+		ParentID:    parentID,
+		ProducerID:  parentID,
+		InitialTask: task,
+		Produced:    produced,
+	}
+	result := o.Run(ctx, req)
+	out := fmt.Sprintf("passed=%v rounds=%d", result.Passed, result.Rounds)
+	if !result.Passed {
+		out += "\nfail_reason: " + result.FailReason
+	}
+	out += "\n\n【最终产出】\n" + result.FinalProduced
+	return &tool.Result{
+		Tool:    "verify_and_fix",
+		Success: result.Passed,
+		Output:  out,
 	}
 }
 
@@ -609,16 +694,10 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		return
 	}
 
-	// 成功：通知父 Agent，触发完成钩子。
+	// 成功：通知父 Agent。
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
 	d.treeFinish(ctx, subAgentID, result.Text, nil)
 	d.notify(parentID, subAgentID, result.Text)
-
-	// 完成钩子：供 verifyloop 编排器接管"代码->测试->修正->统一测试"原生状态机。
-	// 仅在异步 call_sub_agent 路径触发；ExecuteChild 同步路径不触发，避免编排器递归。
-	if d.onSubAgentDone != nil {
-		d.onSubAgentDone(parentID, subAgentID, roleDef.ID, task, result.Text)
-	}
 }
 
 // treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
@@ -787,10 +866,9 @@ func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Dur
 }
 
 // ExecuteChild 同步执行一个子 Agent 并返回其最终答复文本。
-// 供 verifyloop 编排器驱动"代码->测试->修正->统一测试"状态机使用：
+// 供 verify_and_fix 工具驱动"代码->测试->修正->统一测试"循环使用：
 //   - 同步阻塞至子 Agent 完成，调用方直接拿到结果；
-//   - 不 notify 父邮箱（编排器自行决定何时通知）；
-//   - 不触发 onSubAgentDone 钩子，避免编排器内部的修正轮触发递归自测；
+//   - 不 notify 父邮箱（工具自行决定如何反馈）；
 //   - 不进入实例池服务态（一次性执行）。
 //
 // 权限校验与 ID 生成与 call_sub_agent 工具一致；失败时返回 partial 结果与 err。
@@ -810,17 +888,6 @@ func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task st
 		return result.Text, err
 	}
 	return result.Text, nil
-}
-
-// SubAgentDoneHandler 是子 Agent 成功完成时的回调签名。
-// parentID 为派发者 Agent ID；subAgentID 为子 Agent ID；roleID 为子 Agent 角色；
-// task 为原始派发任务；result 为子 Agent 最终答复文本。
-type SubAgentDoneHandler func(parentID, subAgentID, roleID, task, result string)
-
-// SetOnSubAgentDone 注入子 Agent 完成钩子，供 verifyloop 编排器接管自测流程。
-// 传入 nil 清除钩子。钩子仅在异步 call_sub_agent 路径触发，ExecuteChild 同步路径不触发。
-func (d *Dispatcher) SetOnSubAgentDone(h SubAgentDoneHandler) {
-	d.onSubAgentDone = h
 }
 
 // specPrefixMarker 是任务规范注入任务前缀时的标记，便于子 Agent 区分"任务规范"与"当前任务"。

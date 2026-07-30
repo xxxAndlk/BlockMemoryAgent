@@ -193,8 +193,6 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		return nil, fmt.Errorf("init runtime: %w", err)
 	}
 	rt.SetAgentConfig(&cfg.Agent)
-	// 向指令队列注入日志器，丢弃指令等错误以 [ERRO] 输出。
-	rt.CmdQueue.SetLogger(sessionLogger)
 
 	// 第十四步：装配 ReAct 引擎依赖。
 	// 获取当前工作目录，用于工具注册表定位工作区；失败时回退到 "."。
@@ -271,23 +269,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 其他角色看不到它们。Registry 持 closure 引用，Execute 直接读写 dynamic 层。
 	roleRegistry.RegisterTools(toolRegistry)
 
-	// verifyloop 编排器：原生驱动"代码->自测->修正->上级统一测试"状态机。
-	// AssistantSelfTestEnabled 开启时，code_assistant 异步完成后自动触发编排器，
-	// 不再依赖主 Agent 提示词自觉。编排器通过 ExecuteChild 同步驱动子 Agent，
-	// 不触发 onSubAgentDone 钩子，避免修正轮递归自测。
-	// verifyloop 编排器：原生驱动"自测->修正->上级统一测试"状态机。
-	// AssistantSelfTestEnabled 开启 code_assistant 等产出角色的自测；
-	// DomainSelfTestEnabled 开启 domain 角色的模块级统一测试。
-	// 两者共享 OnSubAgentDone 钩子，按 config.VerificationRolePairs 匹配角色对触发。
-	// 角色对默认 [{code_assistant, test_assistant}]；DomainSelfTestEnabled 开启时追加 {domain, test_assistant}。
-	// 需 ComputerUse/CLI/MCP 验证器时改用 NewWith 自定义装配。
+	// verify_and_fix 工具:把 verifyloop 状态机折叠进 ReAct,作为 MetaAgent/DomainAgent
+	// 可显式调用的工具。编排器内部仍跑 Verifier/Fixer/Reporter 三接口,但由调用方
+	// 显式决定何时验证,不再经 OnSubAgentDone 钩子自动触发(双控制流合并)。
+	// AssistantSelfTestEnabled 开 code_assistant 等产出角色的验证;DomainSelfTestEnabled
+	// 开 domain 角色的模块级统一测试。角色对默认 [{code_assistant, test_assistant}]。
 	selfTestEnabled := cfg.Agent.AssistantSelfTestEnabled || cfg.Agent.DomainSelfTestEnabled
 	if selfTestEnabled {
 		// 合并配置角色对与 domain 运行时角色对。
 		pairs := make([]config.VerificationRolePair, 0, len(cfg.Agent.VerificationRolePairs)+1)
 		pairs = append(pairs, cfg.Agent.VerificationRolePairs...)
 		if cfg.Agent.DomainSelfTestEnabled {
-			// domain 产出的模块级验证：用 test_assistant 做上级统一测试。
+			// domain 产出的模块级验证:用 test_assistant 做上级统一测试。
 			// 避免重复追加用户已显式配置的 domain 对。
 			dup := false
 			for _, p := range pairs {
@@ -300,7 +293,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 				pairs = append(pairs, config.VerificationRolePair{CodeRole: "domain", TestRole: "test_assistant"})
 			}
 		}
-		// 仅保留开关启用的角色对：AssistantSelfTestEnabled 控制 code_assistant 等，
+		// 仅保留开关启用的角色对:AssistantSelfTestEnabled 控制 code_assistant 等,
 		// DomainSelfTestEnabled 控制 domain。
 		activePairs := pairs[:0]
 		for _, p := range pairs {
@@ -314,14 +307,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 				activePairs = append(activePairs, p)
 			}
 		}
-		// 按 codeRole 索引角色对，供钩子快速查找。
-		rolePairByCode := make(map[string]config.VerificationRolePair, len(activePairs))
-		for _, p := range activePairs {
-			rolePairByCode[p.CodeRole] = p
-		}
-		// 每个角色对独立编排器实例（AgentVerifier/Fixer 绑定各自角色）。
-		// ReviewEnabled 开启时装配 code_reviewer 作为 Reviewer，插入 PlanConfirm 与 SelfTest 之间。
-		// PlanSkipEnabled 默认 true（PlanConfirm 整体移除中）；显式 false 仍走 PlanConfirm。
+		// 每个角色对独立编排器实例(AgentVerifier/Fixer 绑定各自角色)。
+		// ReviewEnabled 开启时装配 code_reviewer 作为 Reviewer,插入 PlanConfirm 与 SelfTest 之间。
+		// PlanSkipEnabled 默认 true(PlanConfirm 整体移除中);显式 false 仍走 PlanConfirm。
 		reviewRole := ""
 		if cfg.Agent.ReviewEnabled == nil || *cfg.Agent.ReviewEnabled {
 			reviewRole = "code_reviewer"
@@ -334,24 +322,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		for _, p := range activePairs {
 			orchestrators[p.CodeRole] = verifyloop.NewWithReviewer(subAgentDispatcher, sharedMailbox, cfg.Agent.VerificationMaxRounds, p.CodeRole, p.TestRole, reviewRole, planSkip)
 		}
-		subAgentDispatcher.SetOnSubAgentDone(func(parentID, subAgentID, roleID, task, resultText string) {
-			pair, ok := rolePairByCode[roleID]
-			if !ok {
-				return // 该角色无验证角色对配置或开关未开，不触发。
-			}
-			o, ok := orchestrators[pair.CodeRole]
-			if !ok {
-				return
-			}
-			// 异步运行验证闭环，避免阻塞 call_sub_agent 的 notify 路径。
-			// Run 内部已调用 Reporter.Report 投递结果到父邮箱。
-			go o.Run(ctx, verifyloop.Request{
-				ParentID:    parentID,
-				ProducerID:  subAgentID,
-				InitialTask: task,
-				Produced:    resultText,
-			})
-		})
+		// 注册 verify_and_fix 工具:内部按 code_role 索引编排器,MetaAgent/DomainAgent 白名单含此工具。
+		subAgentDispatcher.RegisterVerifyTool(toolRegistry, orchestrators)
 	}
 
 	// 第十六步：创建 ReAct Agent 服务。

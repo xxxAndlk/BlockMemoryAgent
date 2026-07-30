@@ -1118,3 +1118,64 @@ func TestDispatcher_DomainResponsibilityRequired(t *testing.T) {
 	}
 }
 
+// TestDispatcher_VerifyAndFixTool_NoOrchestrator 验证 verify_and_fix 工具在未配置
+// 验证角色对(orchestrators map 为空)时返回明确错误,而非 panic。
+// 步骤 5:verifyloop 折叠进 ReAct 作工具调用,取代 OnSubAgentDone 钩子自动触发。
+func TestDispatcher_VerifyAndFixTool_NoOrchestrator(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{
+			SystemPrompt: "meta",
+			ModelConfig:  types.AgentModelConfig{Provider: "mock"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "x"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	// 注册工具但传空 orchestrators map(等价 self_test_enabled=false)。
+	d.RegisterVerifyTool(toolsReg, nil)
+
+	ctx := agent.WithAgentID(context.Background(), "meta")
+	res, err := toolsReg.Dispatch(ctx, "verify_and_fix", map[string]any{
+		"task":     "原始任务",
+		"produced": "产出文本",
+	})
+	if err != nil {
+		t.Fatalf("dispatch err: %v", err)
+	}
+	if res.Success {
+		t.Fatal("expected failure when no orchestrator configured")
+	}
+	if !strings.Contains(res.Error, "no verify pair configured") {
+		t.Fatalf("unexpected error: %s", res.Error)
+	}
+}
+
+// TestDispatcher_VerifyAndFixTool_MissingCallerContext 验证 verify_and_fix 工具在
+// 缺失 caller agent 上下文时返回明确错误。
+func TestDispatcher_VerifyAndFixTool_MissingCallerContext(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{
+			SystemPrompt: "meta",
+			ModelConfig:  types.AgentModelConfig{Provider: "mock"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "x"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.RegisterVerifyTool(toolsReg, nil)
+
+	// 无 WithAgentID 的 ctx。
+	res, err := toolsReg.Dispatch(context.Background(), "verify_and_fix", map[string]any{
+		"task":     "x",
+		"produced": "y",
+	})
+	if err != nil {
+		t.Fatalf("dispatch err: %v", err)
+	}
+	if !strings.Contains(res.Error, "missing caller agent context") {
+		t.Fatalf("unexpected error: %s", res.Error)
+	}
+}
+

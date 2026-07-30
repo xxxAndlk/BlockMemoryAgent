@@ -36,11 +36,15 @@
 9. **动态角色注册中心**（已完成,commit `f27b166`）
    - 当前状态：`domain/role/registry.go` 加 RWMutex + dynamic map + `Register`/`Unregister`/`List` 运行时 API。`Get` 优先查 dynamic 层再回退 cfg;`CallableFixedRoles` 含动态角色;`CanCall` 现有逻辑已覆盖 `RoleTypeDynamic` 分支。新增 `role/tools.go`:`create_role`/`list_roles` 工具实现 Tool 接口,`Registry.RegisterTools` 注入 `tool.Registry`,Schema 暴露两个工具。MetaAgent Tools 白名单加 `create_role`/`list_roles`。Register 校验:ID 非空、不撞内置、Type 必须为 Dynamic、SystemPrompt 非空;ID 冲突拒绝。进程重启不保留（roles.yaml 才持久化）,与 Agent 树不持久化同 scope。
 
-10. **verifyloop 折叠进 ReAct**（未做,依赖 Agent 树终结语义）
-    - 背景：当前双控制流（ReAct loop + verifyloop 状态机）不统一,`OnSubAgentDone` 钩子自动触发编排器。
-    - 开放动作：删 `OnSubAgentDone` 钩子；加 `verify_and_fix` 工具（白名单限 MetaAgent/DomainAgent）；工具内部仍跑 `Verifier`/`Fixer`/`Reporter` 三接口,但作为工具调用而非独立编排器。MetaAgent 显式决定何时验证。
+10. **verifyloop 折叠进 ReAct**（已完成,2026-07-30）
+    - 当前状态：删 `Dispatcher.onSubAgentDone` 字段 + `SetOnSubAgentDone` 方法 + `SubAgentDoneHandler` 类型 + 异步完成钩子触发点。新增 `verify_and_fix` 工具(`Dispatcher.RegisterVerifyTool`),内部按 `code_role` 索引 `verifyloop.Orchestrator` map,Execute 直接同步调 `o.Run(ctx, Request{ParentID, ProducerID, InitialTask, Produced})`。白名单限 MetaAgent/DomainAgent(`registry.go` meta/domain 角色 Tools 列加 `verify_and_fix`)。`tool.Registry.Schema` 暴露 `verify_and_fix` 工具(若已安装)。`bootstrap` 由旧 `SetOnSubAgentDone` 钩子自动触发改为 `RegisterVerifyTool(toolRegistry, orchestrators)` 注册工具,编排器实例装配逻辑(NewWithReviewer + ReviewEnabled + PlanSkipEnabled)不变。`verifyloop` 包保留(Orchestrator + Verifier/Fixer/Reporter 接口 + AgentVerifier/AgentFixer/MailboxReporter 默认实现),仅入口从钩子改为工具。`ExecuteChild` 注释同步更新(去 onSubAgentDone 提及)。新增 `verify_and_fix` 工具单元测试(空 orchestrators / 缺 caller context 两路径)。
+    - 开放动作：MetaAgent 系统提示词需显式教何时调 `verify_and_fix`(派发产出后、终答前);当前 roles.yaml meta 提示词未提及该工具。
 
-11. **硬 Token 预算（每用户目标上限）**【已规划落地,待编码】
+11. **删 Runtime 死重**（已完成,2026-07-30,步骤 6）
+    - 当前状态：`internal/watchdog` + `internal/cmdqueue` 包整体删除,`runtime.Runtime` struct 去 `Watchdog`/`CmdQueue` 字段 + `WithWatchdog`/`WithCmdQueue` 选项 + `SetAgentConfig` 中 `Watchdog.SetConfig` 调用。`bootstrap` 去 `rt.CmdQueue.SetLogger`。死重判定依据:`Watchdog` 无 `.Check()` 热路径调用方(仅 runtime 自建自配置,`meta_watchdog.go` 注释为陈旧引用);`CmdQueue` 无消费方(仅 `SetLogger` 写日志,无 `Enqueue`/`Dequeue` 调用)。保留 `Board`/`Skill`/`Soul`:`Board` 被 TUI 作类型消费(`Snapshot`/`TaskStatus`),`Skill`/`Soul` 被 server API 作字典消费(`/api/skills`、`/api/agent/info`)。
+    - 开放动作：`Skill` 未接 ReAct 热路径(从未把 SkillSet 注入 prompt);`Soul.Inject` 从未被调用(仅 `Soul.Name()` 作 API 元数据)。两者仍未接热路径,但保留 API 字典消费。后续若确认 Skill/Soul 不再需要可继续删。
+
+12. **硬 Token 预算（每用户目标上限）**【已规划落地,待编码】
     - 背景：`maxIter=50` 仅防死循环,无累计 token 上限。
     - 开放动作（约 15 行代码）：`config.go AgentConfig` 加 `TokenBudgetPerGoal int`；`config.yaml` 加 `token_budget_per_goal: 100000`；`react_agent.go` `RunWithHistory` 每轮累加 `resp.Message.TokenUsage.TotalTokens`,超限 break 返回部分完成。与 `maxIter=50` 正交。
 
