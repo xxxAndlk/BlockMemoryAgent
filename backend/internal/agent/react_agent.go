@@ -40,11 +40,6 @@ type ReActAgent struct {
 	historyMaxMessages int
 	// toolOutputMaxRunes 是写入历史的单条工具输出最大字符数；<=0 不截断。
 	toolOutputMaxRunes int
-	// summarizeEvery 是触发历史压缩的步频：每 N 轮 ReAct 迭代把中间历史暴力压缩。
-	// <=0 关闭压缩，仅用 historyMaxMessages 滑动窗口。
-	summarizeEvery int
-	// summarizeKeepRecent 是压缩时保留的最近原始消息条数；<=0 视为 10。
-	summarizeKeepRecent int
 	// liveFn 是实时进度事件回调，由 WithLiveEvents 注入；nil 时不推送任何进度事件。
 	liveFn func(LiveEvent)
 	// pendingChecker 可选的未决子 Agent 检查器，由 WithPendingChildrenChecker 注入；
@@ -61,14 +56,12 @@ type ReActAgent struct {
 // LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。
 // 各字段 <=0 的语义见 ReActAgent 对应字段注释。
 type LoopConfig struct {
-	MaxIterations       int           // 最大 LLM 轮数；<=0 不限制
-	LLMTimeout          time.Duration // 单次 LLM 调用超时；<=0 仅受会话取消控制
-	RetryCount          int           // 失败重试次数（不含首次）；<0 视为 0
-	RetryBackoff        time.Duration // 重试初始退避；<=0 用默认 100ms
-	HistoryMaxMessages  int           // 单次请求最大历史消息数；<=0 不裁剪
-	ToolOutputMaxRunes  int           // 写入历史的工具输出最大字符数；<=0 不截断
-	SummarizeEvery      int           // 每 N 步触发一次历史压缩；<=0 关闭压缩
-	SummarizeKeepRecent int           // 压缩时保留最近 K 条原始消息；<=0 视为 10
+	MaxIterations      int           // 最大 LLM 轮数；<=0 不限制
+	LLMTimeout         time.Duration // 单次 LLM 调用超时；<=0 仅受会话取消控制
+	RetryCount         int           // 失败重试次数（不含首次）；<0 视为 0
+	RetryBackoff       time.Duration // 重试初始退避；<=0 用默认 100ms
+	HistoryMaxMessages int           // 单次请求最大历史消息数；<=0 不裁剪
+	ToolOutputMaxRunes int           // 写入历史的工具输出最大字符数；<=0 不截断
 }
 
 // NewReActAgent 根据具体角色构造一个 ReActAgent 实例。
@@ -134,8 +127,6 @@ func (a *ReActAgent) WithLoopConfig(c LoopConfig) *ReActAgent {
 	a.retryBackoff = c.RetryBackoff
 	a.historyMaxMessages = c.HistoryMaxMessages
 	a.toolOutputMaxRunes = c.ToolOutputMaxRunes
-	a.summarizeEvery = c.SummarizeEvery
-	a.summarizeKeepRecent = c.SummarizeKeepRecent
 	return a
 }
 
@@ -219,17 +210,11 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
 		assembled := a.memory.Assemble(a.role, a.name, history)
 
-		// 上下文裁剪策略：
-		//   - 每 summarizeEvery 步触发一次 summarizeWindow（保留 system 前缀 + 首条 user
-		//     任务目标 + 中段暴力压缩摘要 + 最近 K 条原始消息），大幅降低长任务 token。
-		//   - 其余步走 windowMessages 滑动窗口（硬上限，防 API 上下文溢出）。
-		//   - 两者都只影响本次请求，不修改 history（完整历史仍用于持久化与续跑）。
-		var messages []ReactMessage
-		if a.summarizeEvery > 0 && i > 0 && i%a.summarizeEvery == 0 {
-			messages = summarizeWindow(assembled, a.summarizeKeepRecent)
-		} else {
-			messages = windowMessages(assembled, a.historyMaxMessages)
-		}
+		// 上下文裁剪策略：仅 windowMessages 滑动窗口（硬上限，防 API 上下文溢出）。
+		// 历史压缩（hot/cold 分层）已迁入 memory.Pipeline.Assemble，按步频触发；
+		// ReActAgent 不再直接做历史压缩，职责归位到记忆层。
+		// windowMessages 只影响本次请求，不修改 history（完整历史仍用于持久化与续跑）。
+		messages := windowMessages(assembled, a.historyMaxMessages)
 
 		// 将内部消息格式转换为 blades 库所需的模型消息格式。
 		bladesMsgs := ToBladesMessages(messages)
@@ -619,79 +604,9 @@ func bladesText(m *blades.Message) string {
 	return sb.String()
 }
 
-// summarizeWindow 把历史压缩为：system 前缀 + 首条 user 任务目标 + 中段暴力压缩摘要 + 最近 K 条原始消息。
-// 用于每 N 步触发一次的上下文压缩，避免长任务 token O(N²) 增长。
-//
-// 压缩规则：
-//   - system 前缀全保留（若存在；记忆流水线已将近期事件移至末尾，此处通常无 system 前缀）；
-//   - 首条 user 消息原样保留（任务目标，防"失忆"）；
-//   - 中段每条消息压成 "[role] 前 200 字符" 拼成一条 system 摘要消息；
-//   - 最近 K 条原样保留（含 tool_call/tool_result 对，边界对齐 user）。
-//
-// keepRecent<=0 视为 10；消息总数不足时原样返回。
-func summarizeWindow(messages []ReactMessage, keepRecent int) []ReactMessage {
-	if keepRecent <= 0 {
-		keepRecent = 10
-	}
-	if len(messages) <= keepRecent+2 {
-		return messages
-	}
-
-	// 1) system 前缀
-	keep := 0
-	for keep < len(messages) && messages[keep].Role == "system" {
-		keep++
-	}
-
-	// 2) 首条 user（任务目标）。若无 user（仅 system），原样返回。
-	firstUserIdx := -1
-	for i := keep; i < len(messages); i++ {
-		if messages[i].Role == "user" {
-			firstUserIdx = i
-			break
-		}
-	}
-	if firstUserIdx < 0 {
-		return messages
-	}
-
-	// 3) 最近 K 条边界：从末尾向前找 user 边界，保证 tool_call/tool_result 对完整。
-	if keepRecent > len(messages)-firstUserIdx-1 {
-		keepRecent = len(messages) - firstUserIdx - 1
-	}
-	recentStart := len(messages) - keepRecent
-	for recentStart < len(messages) && recentStart > firstUserIdx+1 && messages[recentStart].Role != "user" {
-		recentStart++
-	}
-
-	// 4) 中段暴力压缩：每条 -> "[role] 前 200 字符"。
-	middle := messages[firstUserIdx+1 : recentStart]
-	const midChunkMax = 200
-	var sb strings.Builder
-	sb.WriteString("【历史压缩摘要】\n")
-	for _, m := range middle {
-		role := m.Role
-		if role == "" {
-			role = "?"
-		}
-		content := strings.ReplaceAll(strings.TrimSpace(m.Content), "\n", " ")
-		if content == "" && len(m.ToolCalls) > 0 {
-			content = fmt.Sprintf("[tool_calls: %d]", len(m.ToolCalls))
-		}
-		if r := []rune(content); len(r) > midChunkMax {
-			content = string(r[:midChunkMax]) + "…"
-		}
-		fmt.Fprintf(&sb, "- [%s] %s\n", role, content)
-	}
-	sb.WriteString("\n（以上为早期对话压缩摘要，关键结论见下方近期事件与下方最近消息）")
-
-	out := make([]ReactMessage, 0, keep+1+1+1+(len(messages)-recentStart))
-	out = append(out, messages[:keep]...)
-	out = append(out, messages[firstUserIdx]) // 首条 user 任务目标
-	out = append(out, ReactMessage{Role: "system", Content: sb.String()})
-	out = append(out, messages[recentStart:]...)
-	return out
-}
+// summarizeWindow 已迁入 domain/memory/pipeline.go 的 compressHistory 函数。
+// 历史压缩（hot/cold 分层）属记忆层职责，ReActAgent 不再直接做历史压缩。
+// 触发由 memory.Pipeline.WithCompression(every, keepRecent) 配置，bootstrap 注入。
 
 // windowMessages 把发送给 LLM 的消息裁剪到最多 max 条（滑动窗口）：
 // 保留开头的 system 消息（记忆注入）与最近的对话，并在保留段的最早 user 消息

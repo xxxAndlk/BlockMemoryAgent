@@ -208,3 +208,84 @@ func TestInMemoryStore_MaxEventsPerAgent(t *testing.T) {
 		t.Fatalf("expected latest event 'ev-29', got %q", events[24].Content)
 	}
 }
+
+// TestPipeline_Compression 验证 Pipeline 的历史压缩（hot/cold 分层）。
+// 消息数超过 keepRecent+2 且步频命中时，中段被压缩为摘要消息。
+func TestPipeline_Compression(t *testing.T) {
+	pipe := NewPipeline(nil).WithCompression(1, 3) // 每步都压缩，保留最近 3 条
+
+	// 构造 10 条历史：1 个 user（任务目标）+ 8 个 assistant/user 中段 + 1 个 user 末尾。
+	history := []agent.ReactMessage{{Role: "user", Content: "task goal"}}
+	for i := 0; i < 8; i++ {
+		history = append(history, agent.ReactMessage{
+			Role:    "assistant",
+			Content: fmt.Sprintf("mid %d", i),
+		})
+		history = append(history, agent.ReactMessage{
+			Role:    "user",
+			Content: fmt.Sprintf("reply %d", i),
+		})
+	}
+
+	out := pipe.Assemble(types.RoleDefinition{}, "agent-1", history)
+	if len(out) >= len(history) {
+		t.Fatalf("expected compressed output shorter than input, got %d vs %d", len(out), len(history))
+	}
+
+	// 首条 user（任务目标）必须保留。
+	if out[0].Role != "user" || out[0].Content != "task goal" {
+		t.Fatalf("expected first user preserved, got role=%s content=%q", out[0].Role, out[0].Content)
+	}
+
+	// 应有 system 摘要消息。
+	var foundSummary bool
+	for _, m := range out {
+		if m.Role == "system" && strings.Contains(m.Content, "【历史压缩摘要】") {
+			foundSummary = true
+			break
+		}
+	}
+	if !foundSummary {
+		t.Error("expected compressed summary system message")
+	}
+}
+
+// TestPipeline_CompressionDisabled 验证 compressEvery<=0 时关闭压缩。
+func TestPipeline_CompressionDisabled(t *testing.T) {
+	pipe := NewPipeline(nil) // 未配置 WithCompression
+
+	history := []agent.ReactMessage{{Role: "user", Content: "task"}}
+	for i := 0; i < 20; i++ {
+		history = append(history, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("m %d", i)})
+	}
+	out := pipe.Assemble(types.RoleDefinition{}, "agent-1", history)
+	if len(out) != len(history) {
+		t.Fatalf("expected no compression when disabled, got %d vs %d", len(out), len(history))
+	}
+}
+
+// TestPipeline_CompressionStepFrequency 验证压缩仅在步频命中时触发。
+func TestPipeline_CompressionStepFrequency(t *testing.T) {
+	pipe := NewPipeline(nil).WithCompression(3, 2) // 每 3 步压缩一次
+
+	history := []agent.ReactMessage{{Role: "user", Content: "task"}}
+	for i := 0; i < 15; i++ {
+		history = append(history, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("m %d", i)})
+	}
+
+	// 第 1 步：不压缩。
+	out1 := pipe.Assemble(types.RoleDefinition{}, "a", history)
+	if len(out1) != len(history) {
+		t.Fatalf("step 1 should not compress, got %d vs %d", len(out1), len(history))
+	}
+	// 第 2 步：不压缩。
+	out2 := pipe.Assemble(types.RoleDefinition{}, "a", history)
+	if len(out2) != len(history) {
+		t.Fatalf("step 2 should not compress, got %d vs %d", len(out2), len(history))
+	}
+	// 第 3 步：压缩。
+	out3 := pipe.Assemble(types.RoleDefinition{}, "a", history)
+	if len(out3) >= len(history) {
+		t.Fatalf("step 3 should compress, got %d vs %d", len(out3), len(history))
+	}
+}

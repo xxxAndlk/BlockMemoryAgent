@@ -213,7 +213,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
 	// Executor 永远跑 DefaultSandboxConfig（默认禁写工作目录外、保留命令黑名单）。
 	toolRegistry.SetSandboxConfig(&cfg.Agent.SafetyConfig)
-	memoryPipeline := memory.NewPipeline(memory.NewInMemoryStore()).WithSummarizer(newEventSummarizer(modelFactory))   // 记忆流水线
+	memoryPipeline := memory.NewPipeline(memory.NewInMemoryStore()).
+		WithSummarizer(newEventSummarizer(modelFactory)).
+		WithCompression(cfg.Agent.SummarizeEvery, cfg.Agent.SummarizeKeepRecent) // 记忆流水线
 
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
@@ -224,8 +226,6 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		RetryBackoffMs:            cfg.Agent.RetryBackoffMs,
 		HistoryMaxMessages:        cfg.Agent.HistoryMaxMessages,
 		ToolOutputHistoryMaxRunes: cfg.Agent.ToolOutputHistoryMaxRunes,
-		SummarizeEvery:            cfg.Agent.SummarizeEvery,
-		SummarizeKeepRecent:       cfg.Agent.SummarizeKeepRecent,
 	}
 	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute
 	if subAgentTimeout < 0 {

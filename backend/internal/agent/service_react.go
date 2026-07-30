@@ -59,8 +59,6 @@ type ReactRuntimeConfig struct {
 	RetryBackoffMs          int // 重试初始退避（毫秒）
 	HistoryMaxMessages      int // 单次请求最大历史消息数；<0 表示不裁剪
 	ToolOutputHistoryMaxRunes int // 写入历史的工具输出最大字符数；<0 表示不截断
-	SummarizeEvery          int // 每 N 步触发历史压缩；<=0 关闭
-	SummarizeKeepRecent     int // 压缩时保留最近 K 条原始消息；<=0 视为 10
 }
 
 // SetRuntimeConfig 注入 ReAct 主循环运行时参数（见 ReactRuntimeConfig）。
@@ -100,8 +98,6 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 		RetryBackoff:       100 * time.Millisecond,
 		HistoryMaxMessages: 40,
 		ToolOutputMaxRunes: 2000,
-		SummarizeEvery:     10,
-		SummarizeKeepRecent: 10,
 	}
 	if c.MaxIterations != 0 {
 		lc.MaxIterations = max(c.MaxIterations, 0)
@@ -120,12 +116,6 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 	}
 	if c.ToolOutputHistoryMaxRunes != 0 {
 		lc.ToolOutputMaxRunes = max(c.ToolOutputHistoryMaxRunes, 0)
-	}
-	if c.SummarizeEvery != 0 {
-		lc.SummarizeEvery = max(c.SummarizeEvery, 0)
-	}
-	if c.SummarizeKeepRecent != 0 {
-		lc.SummarizeKeepRecent = max(c.SummarizeKeepRecent, 0)
 	}
 	return lc
 }

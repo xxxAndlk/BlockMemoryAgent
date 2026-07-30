@@ -45,6 +45,15 @@ type Pipeline struct {
 	// 达到 2 次后关闭摘要路径，直接用 raw join，避免每次调用白等 5s 超时（实证 DeepSeek 余额耗尽）。
 	// 摘要成功时重置为 0。受 mu 保护。
 	consecutiveBalanceErrors int
+	// compressEvery 是历史压缩步频：每 N 轮 ReAct 迭代把中段历史暴力压缩为摘要。
+	// <=0 关闭压缩，仅用 ReActAgent 的 windowMessages 滑动窗口。
+	// 原 summarizeWindow 逻辑从 react_agent.go 迁入此处，职责归位到记忆层。
+	compressEvery int
+	// compressKeepRecent 是压缩时保留的最近原始消息条数；<=0 视为 10。
+	compressKeepRecent int
+	// compressCounters 按 agentID 记录 Assemble 调用次数，用于步频触发压缩。
+	// 受 mu 保护。进程生命周期内不清理，与 events map 同生命周期。
+	compressCounters map[string]int
 }
 
 // Store 抽象了事件流的持久化能力，实现者负责把事件保存到磁盘或数据库。
@@ -63,6 +72,7 @@ func NewPipeline(store Store) *Pipeline {
 		store:             store,                                // 保存外部传入的持久化存储实现
 		limit:             DefaultEventLimit,                    // 默认使用 DefaultEventLimit 作为注入上限
 		maxEventsPerAgent: DefaultMaxEventsPerAgent,             // 默认每个 agent 最多保留 DefaultMaxEventsPerAgent 条事件
+		compressCounters:  make(map[string]int),                 // 初始化空的 agentID -> 步频计数器映射
 	}
 }
 
@@ -98,10 +108,42 @@ func (p *Pipeline) WithSummarizer(s EventSummarizer) *Pipeline {
 	return p
 }
 
+// WithCompression 配置历史压缩步频与保留条数。
+// every<=0 关闭压缩（仅用 ReActAgent 的 windowMessages 滑动窗口）。
+// keepRecent<=0 视为 10。原 summarizeWindow 逻辑从 react_agent.go 迁入此处。
+// 职责归位：历史压缩属记忆层，不属 ReAct 层。
+func (p *Pipeline) WithCompression(every, keepRecent int) *Pipeline {
+	p.compressEvery = every
+	if keepRecent <= 0 {
+		keepRecent = 10
+	}
+	p.compressKeepRecent = keepRecent
+	return p
+}
+
 // Assemble 把 agent 的近期事件作为一条 system 角色上下文消息注入到历史记录中。
 // 返回的新切片不会修改传入的 history 参数，调用方可以安全复用原切片。
+//
+// 历史压缩（hot/cold 分层）：
+//   - 每 compressEvery 步触发一次压缩（保留 system 前缀 + 首条 user + 中段压缩摘要 + 最近 K 条）；
+//   - 其余步直接注入事件，由 ReActAgent 的 windowMessages 做硬上限保护。
 func (p *Pipeline) Assemble(_ types.RoleDefinition, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
-	return p.injectEvents(agentID, history)
+	assembled := p.injectEvents(agentID, history)
+
+	if p.compressEvery <= 0 {
+		return assembled
+	}
+
+	p.mu.Lock()
+	p.compressCounters[agentID]++
+	step := p.compressCounters[agentID]
+	p.mu.Unlock()
+
+	// step%every==0 时触发压缩（与原 summarizeWindow 触发条件一致）。
+	if step%p.compressEvery != 0 {
+		return assembled
+	}
+	return compressHistory(assembled, p.compressKeepRecent)
 }
 
 // injectEvents 完成实际的事件注入工作：先按 agentID 取事件，再截取最近 limit 条，
@@ -287,4 +329,80 @@ func joinNonEmpty(sep string, parts []string) string {
 		result += p
 	}
 	return result
+}
+
+// compressHistory 把历史压缩为：system 前缀 + 首条 user 任务目标 + 中段暴力压缩摘要 + 最近 K 条原始消息。
+// 用于每 N 步触发一次的上下文压缩，避免长任务 token O(N²) 增长。
+//
+// 压缩规则：
+//   - system 前缀全保留（若存在；记忆流水线已将近期事件移至末尾，此处通常无 system 前缀）；
+//   - 首条 user 消息原样保留（任务目标，防"失忆"）；
+//   - 中段每条消息压成 "[role] 前 200 字符" 拼成一条 system 摘要消息；
+//   - 最近 K 条原样保留（含 tool_call/tool_result 对，边界对齐 user）。
+//
+// keepRecent<=0 视为 10；消息总数不足时原样返回。
+//
+// 该函数从 react_agent.go 迁入，职责归位到记忆层。ReActAgent 不再直接做历史压缩。
+func compressHistory(messages []agent.ReactMessage, keepRecent int) []agent.ReactMessage {
+	if keepRecent <= 0 {
+		keepRecent = 10
+	}
+	if len(messages) <= keepRecent+2 {
+		return messages
+	}
+
+	// 1) system 前缀
+	keep := 0
+	for keep < len(messages) && messages[keep].Role == "system" {
+		keep++
+	}
+
+	// 2) 首条 user（任务目标）。若无 user（仅 system），原样返回。
+	firstUserIdx := -1
+	for i := keep; i < len(messages); i++ {
+		if messages[i].Role == "user" {
+			firstUserIdx = i
+			break
+		}
+	}
+	if firstUserIdx < 0 {
+		return messages
+	}
+
+	// 3) 最近 K 条边界：从末尾向前找 user 边界，保证 tool_call/tool_result 对完整。
+	if keepRecent > len(messages)-firstUserIdx-1 {
+		keepRecent = len(messages) - firstUserIdx - 1
+	}
+	recentStart := len(messages) - keepRecent
+	for recentStart < len(messages) && recentStart > firstUserIdx+1 && messages[recentStart].Role != "user" {
+		recentStart++
+	}
+
+	// 4) 中段暴力压缩：每条 -> "[role] 前 200 字符"。
+	middle := messages[firstUserIdx+1 : recentStart]
+	const midChunkMax = 200
+	var sb strings.Builder
+	sb.WriteString("【历史压缩摘要】\n")
+	for _, m := range middle {
+		role := m.Role
+		if role == "" {
+			role = "?"
+		}
+		content := strings.ReplaceAll(strings.TrimSpace(m.Content), "\n", " ")
+		if content == "" && len(m.ToolCalls) > 0 {
+			content = fmt.Sprintf("[tool_calls: %d]", len(m.ToolCalls))
+		}
+		if r := []rune(content); len(r) > midChunkMax {
+			content = string(r[:midChunkMax]) + "…"
+		}
+		fmt.Fprintf(&sb, "- [%s] %s\n", role, content)
+	}
+	sb.WriteString("\n（以上为早期对话压缩摘要，关键结论见下方近期事件与下方最近消息）")
+
+	out := make([]agent.ReactMessage, 0, keep+1+1+1+(len(messages)-recentStart))
+	out = append(out, messages[:keep]...)
+	out = append(out, messages[firstUserIdx]) // 首条 user 任务目标
+	out = append(out, agent.ReactMessage{Role: "system", Content: sb.String()})
+	out = append(out, messages[recentStart:]...)
+	return out
 }
