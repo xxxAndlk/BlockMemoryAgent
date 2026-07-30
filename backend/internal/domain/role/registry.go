@@ -4,7 +4,10 @@ package role
 
 // 导入 Registry 依赖的外部包。
 import (
+	"errors"
+	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -55,31 +58,132 @@ const defaultDomainAgentSystemPrompt = `你是领域负责人（DomainAgent）�
 - 自执行的部分直接写入结论。
 - 你的最终答复就是回灌给父 Agent 的交付物：结论先行、自包含、附关键文件路径与验收证据；不要写过程流水账。`
 
-// Registry 运行时角色注册表，封装已加载的角色配置。
+// Registry 运行时角色注册表，封装已加载的角色配置与动态注册的角色。
 // 它向上层提供统一接口，用于查询角色定义、判断调用权限以及枚举可调用的固定角色。
 type Registry struct {
-	// cfg 指向已加载的角色配置文件，是 Registry 的唯一依赖。
+	// cfg 指向已加载的角色配置文件，是静态角色的来源。
 	cfg *config.RoleConfigFile
+
+	// mu 保护 dynamic map 的并发读写。
+	mu sync.RWMutex
+	// dynamic 存储运行时注册的动态角色，按 ID 索引。
+	// Get 优先查 dynamic，再回退 cfg；Unregister 仅删 dynamic（不能删 yaml 加载的固定角色）。
+	dynamic map[string]*types.RoleDefinition
 }
 
 // NewRegistry 使用一个已经加载的角色配置构造 Registry。
 // 参数 cfg 是从 config/roles.yaml 解析得到的角色配置；返回指向新 Registry 实例的指针。
 func NewRegistry(cfg *config.RoleConfigFile) *Registry {
 	// 直接封装配置指针，Registry 不负责深拷贝，保持轻量。
-	return &Registry{cfg: cfg}
+	return &Registry{cfg: cfg, dynamic: make(map[string]*types.RoleDefinition)}
+}
+
+// ErrRoleAlreadyExists 注册时 ID 已存在（动态层或静态层）。
+var ErrRoleAlreadyExists = errors.New("role: already exists")
+
+// ErrRoleNotFound 查询或注销时角色不存在。
+var ErrRoleNotFound = errors.New("role: not found")
+
+// reservedRoleIDs 是禁止动态注册的内置角色 ID。
+// meta/domain 由配置层合成，不允许被运行时覆盖。
+var reservedRoleIDs = map[string]bool{"meta": true, "domain": true}
+
+// Register 在运行时注册一个动态角色。
+// 校验：ID 非空、不撞内置 ID、Type 必须为 Dynamic（禁止创建新编排者）；SystemPrompt 非空。
+// ID 冲突（dynamic 或 yaml 已有）返回 ErrRoleAlreadyExists。
+// 传入指针被持有，调用方注册后不应再修改字段。
+func (r *Registry) Register(role *types.RoleDefinition) error {
+	if r == nil {
+		return errors.New("role: registry is nil")
+	}
+	if role == nil {
+		return errors.New("role: definition is nil")
+	}
+	id := strings.TrimSpace(role.ID)
+	if id == "" {
+		return errors.New("role: id is required")
+	}
+	if reservedRoleIDs[id] {
+		return fmt.Errorf("role: id %q is reserved", id)
+	}
+	if role.Type != enums.RoleTypeDynamic {
+		return fmt.Errorf("role: only dynamic type can be registered, got %q", role.Type)
+	}
+	if strings.TrimSpace(role.SystemPrompt) == "" {
+		return errors.New("role: system_prompt is required")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.dynamic[id]; exists {
+		return fmt.Errorf("role: dynamic role %q already exists: %w", id, ErrRoleAlreadyExists)
+	}
+	if r.cfg != nil && r.cfg.GetFixedRole(id) != nil {
+		return fmt.Errorf("role: fixed role %q already exists in yaml: %w", id, ErrRoleAlreadyExists)
+	}
+	r.dynamic[id] = role
+	return nil
+}
+
+// Unregister 删除运行时注册的动态角色。
+// 仅能删 dynamic 层；yaml 加载的固定角色不可删，返回 ErrRoleNotFound。
+func (r *Registry) Unregister(id string) error {
+	if r == nil {
+		return errors.New("role: registry is nil")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.dynamic[id]; !exists {
+		return fmt.Errorf("role: dynamic role %q not found: %w", id, ErrRoleNotFound)
+	}
+	delete(r.dynamic, id)
+	return nil
+}
+
+// List 返回所有角色：静态（meta/domain + fixed）+ 动态。
+// 顺序：meta, domain, 然后按 yaml 顺序的 fixed，最后按 map 遍历的 dynamic（顺序不保证）。
+// 返回拷贝切片，外部修改不影响内部。
+func (r *Registry) List() []types.RoleDefinition {
+	if r == nil {
+		return nil
+	}
+	var out []types.RoleDefinition
+	if meta := r.Get("meta"); meta != nil {
+		out = append(out, *meta)
+	}
+	if domain := r.Get("domain"); domain != nil {
+		out = append(out, *domain)
+	}
+	if r.cfg != nil {
+		for _, fr := range r.cfg.FixedRoles {
+			out = append(out, fr)
+		}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, dr := range r.dynamic {
+		out = append(out, *dr)
+	}
+	return out
 }
 
 // Get 根据逻辑角色 ID 返回对应的角色定义。
 // 内置 ID "meta" 与 "domain" 由配置顶层字段合成；
-// 其余固定角色 ID 从 fixed_roles 列表中查找。
+// 其余 ID 优先查动态层（运行时注册的角色），再回退 fixed_roles。
 // 参数 roleID 为待查询的角色逻辑 ID；若 Registry 未初始化或角色不存在则返回 nil。
 func (r *Registry) Get(roleID string) *types.RoleDefinition {
 	// 防御性检查：Registry 未初始化或配置未加载时无法提供角色定义，直接返回 nil。
 	if r == nil || r.cfg == nil {
+		// 即便 cfg 为 nil，动态层仍可查询（测试场景可能直接用 dynamic）。
+		if r != nil {
+			r.mu.RLock()
+			defer r.mu.RUnlock()
+			return r.dynamic[roleID]
+		}
 		return nil
 	}
 
-	// 根据角色 ID 分发到内置合成角色或固定角色。
+	// 根据角色 ID 分发到内置合成角色或可调用角色。
 	switch roleID {
 	case "meta":
 		// 合成 MetaAgent：从配置的 MetaAgent 字段提取系统提示词与模型配置。
@@ -94,7 +198,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 			Type:         enums.RoleTypeMeta,
 			SystemPrompt: r.cfg.MetaAgent.SystemPrompt,
 			ModelConfig:  r.cfg.MetaAgent.ModelConfig,
-			Tools:        []string{"call_sub_agent", "WriteSharedMemory", "WriteSpec", "HTTPGet"},
+			Tools:        []string{"call_sub_agent", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles"},
 			CanBeCalled:  false,
 		}
 	case "domain":
@@ -121,7 +225,13 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 			CanBeCalled: true,
 		}
 	default:
-		// 非内置角色：交给底层配置查找 fixed_roles 中是否存在对应 ID 的角色。
+		// 非内置角色：优先查动态层（运行时注册的角色），未命中再查 fixed_roles。
+		r.mu.RLock()
+		dr := r.dynamic[roleID]
+		r.mu.RUnlock()
+		if dr != nil {
+			return dr
+		}
 		return r.cfg.GetFixedRole(roleID)
 	}
 }
@@ -173,22 +283,32 @@ func (r *Registry) CanCall(callerRoleID, calleeRoleID string) bool {
 	return false
 }
 
-// CallableFixedRoles 返回所有标记为可调用的固定角色。
+// CallableFixedRoles 返回所有标记为可调用的固定角色与动态角色。
 // 这些角色可以被暴露为子代理工具供上层调用。
 func (r *Registry) CallableFixedRoles() []types.RoleDefinition {
-	// Registry 或配置未初始化时，没有可用角色，返回 nil。
-	if r == nil || r.cfg == nil {
+	// Registry 或配置未初始化时，仅返回动态层。
+	if r == nil {
 		return nil
 	}
 
-	// out 用于收集可调用的固定角色切片，初始为空。
+	// out 用于收集可调用的角色切片，初始为空。
 	var out []types.RoleDefinition
 	// 遍历配置中所有固定角色，筛选出 CanBeCalled 为 true 的角色。
-	for _, role := range r.cfg.FixedRoles {
-		// 仅当角色显式声明可被调用时才加入结果集。
+	if r.cfg != nil {
+		for _, role := range r.cfg.FixedRoles {
+			// 仅当角色显式声明可被调用时才加入结果集。
+			if role.CanBeCalled {
+				// 将符合条件的角色追加到结果切片。
+				out = append(out, role)
+			}
+		}
+	}
+	// 追加动态层中 CanBeCalled 为 true 的角色。
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, role := range r.dynamic {
 		if role.CanBeCalled {
-			// 将符合条件的角色追加到结果切片。
-			out = append(out, role)
+			out = append(out, *role)
 		}
 	}
 	// 返回筛选后的角色列表；若无匹配角色则返回空切片或 nil。

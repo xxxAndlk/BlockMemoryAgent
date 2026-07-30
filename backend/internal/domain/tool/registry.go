@@ -848,6 +848,57 @@ func (r *Registry) Schema() []tools.Tool {
 			toolsList = append(toolsList, t)
 		}
 	}
+	// 暴露 create_role 工具（若已由 role.Registry.RegisterTools 安装到注册表）。
+	// 仅 MetaAgent 白名单含此工具，运行时注册动态角色供 call_sub_agent 派发。
+	if ct, ok := r.tools["create_role"]; ok {
+		desc := "运行时注册一个新的动态角色。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("create_role", desc, func(ctx context.Context, in createRoleInput) (string, error) {
+			args := map[string]any{
+				"id":            in.ID,
+				"name":          in.Name,
+				"system_prompt": in.SystemPrompt,
+				"description":   in.Description,
+				"can_be_called": in.CanBeCalled,
+			}
+			if len(in.Tools) > 0 {
+				tools := make([]any, 0, len(in.Tools))
+				for _, t := range in.Tools {
+					tools = append(tools, t)
+				}
+				args["tools"] = tools
+			}
+			if len(in.Parents) > 0 {
+				parents := make([]any, 0, len(in.Parents))
+				for _, p := range in.Parents {
+					parents = append(parents, p)
+				}
+				args["parents"] = parents
+			}
+			res, _ := r.Dispatch(ctx, "create_role", args)
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
+	// 暴露 list_roles 工具（若已由 role.Registry.RegisterTools 安装到注册表）。
+	// 仅 MetaAgent 白名单含此工具，列出当前所有角色供派发决策参考。
+	if ct, ok := r.tools["list_roles"]; ok {
+		desc := "列出当前所有可用角色。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("list_roles", desc, func(ctx context.Context, in listRolesInput) (string, error) {
+			res, _ := r.Dispatch(ctx, "list_roles", map[string]any{})
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
 	// 返回收集到的所有 blades 工具定义。
 	return toolsList
 }
@@ -860,6 +911,20 @@ type sendMessageInput struct {
 	MessageType string `json:"message_type" description:"消息类型：request（默认，期望回复）/ info（单向通知）/ reply（对先前 request 的回复）"`
 	ThreadID    string `json:"thread_id" description:"会话线程标识（可空，同一问答链共享）"`
 }
+
+// createRoleInput 是 create_role 工具的入参结构。
+type createRoleInput struct {
+	ID           string   `json:"id" description:"角色唯一 ID。不可为 meta/domain（内置保留）。"`
+	Name         string   `json:"name" description:"角色人类可读名称。"`
+	SystemPrompt string   `json:"system_prompt" description:"角色系统提示词。决定角色行为边界与工作模式。"`
+	Description  string   `json:"description" description:"角色职责描述，供 LLM 在选择派发目标时参考。"`
+	Tools        []string `json:"tools" description:"该角色可用的工具名列表（如 ReadFile/WriteFile/call_sub_agent）。"`
+	CanBeCalled  bool     `json:"can_be_called" description:"是否可被其他 Agent 调用。默认 true；false 表示纯调度型。"`
+	Parents      []string `json:"parents" description:"可调用此角色的父角色 ID 列表。空表示任何编排者可调用。"`
+}
+
+// listRolesInput 是 list_roles 工具的入参结构，无字段。
+type listRolesInput struct{}
 
 // ---- 工具实现 ----
 

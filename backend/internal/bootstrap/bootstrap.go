@@ -266,6 +266,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注册 send_message 工具：支持任意 Agent 向另一个 Agent 实例邮箱投递消息，
 	// 是多 Agent 协作验证闭环（代码 Agent <-> 测试 Agent 互问互答）的基础原语。
 	subAgentDispatcher.RegisterMessagingTool(toolRegistry)
+	// 注册 create_role / list_roles 工具：让 MetaAgent 运行时注册动态角色。
+	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools 字段），
+	// 其他角色看不到它们。Registry 持 closure 引用，Execute 直接读写 dynamic 层。
+	roleRegistry.RegisterTools(toolRegistry)
 
 	// verifyloop 编排器：原生驱动"代码->自测->修正->上级统一测试"状态机。
 	// AssistantSelfTestEnabled 开启时，code_assistant 异步完成后自动触发编排器，
