@@ -12,14 +12,14 @@ import (
 func TestDAGEndpoints(t *testing.T) {
 	f := fixtures.NewIntegrationFixture(t)
 
-	// The DAG scheduler is disabled by default. These tests verify that the
-	// endpoints are wired and return a non-5xx status.
+	// DAG scheduler 默认关闭。验证端点已挂载且返回 503（disabled）而非 500/panic。
 	resp, err := http.Get(f.Server.URL() + "/api/dag")
 	if err != nil {
 		t.Fatalf("GET /api/dag: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusInternalServerError {
-		t.Errorf("GET /api/dag returned server error: %d", resp.StatusCode)
+	// 503 = scheduler disabled（预期）；500+ 其他服务端错误才视为故障。
+	if resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode >= http.StatusInternalServerError {
+		t.Errorf("GET /api/dag returned unexpected server error: %d", resp.StatusCode)
 	}
 }

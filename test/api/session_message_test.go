@@ -34,8 +34,8 @@ func TestSessionMessage(t *testing.T) {
 	}
 	sessionID := sess["id"].(string)
 
-	// Send a follow-up message.
-	msgBody, _ := json.Marshal(map[string]string{"message": "hello again"})
+	// Send a follow-up message（handler 期望 content 字段）。
+	msgBody, _ := json.Marshal(map[string]string{"content": "hello again"})
 	resp, err = http.Post(f.Server.URL()+"/api/sessions/"+sessionID+"/message", "application/json", bytes.NewReader(msgBody))
 	if err != nil {
 		t.Fatalf("POST message: %v", err)

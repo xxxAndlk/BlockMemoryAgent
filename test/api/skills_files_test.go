@@ -38,10 +38,23 @@ func TestFilesEndpoint(t *testing.T) {
 	// Write a test file into the workspace.
 	f.WS.WriteFile("test.txt", []byte("hello world"))
 
-	listBody, _ := json.Marshal(map[string]string{"path": f.WS.Root})
-	resp, err := http.Post(f.Server.URL()+"/api/files", "application/json", bytes.NewReader(listBody))
+	// 列文件：GET /api/files?session=...（ReAct 重构后端点改 GET）。
+	// 无 session 创建一个，handler 需要 session 参数。
+	createBody, _ := json.Marshal(map[string]string{"goal": "list files"})
+	createResp, err := http.Post(f.Server.URL()+"/api/sessions", "application/json", bytes.NewReader(createBody))
 	if err != nil {
-		t.Fatalf("POST /api/files: %v", err)
+		t.Fatalf("POST /api/sessions: %v", err)
+	}
+	var sess map[string]any
+	if err := json.NewDecoder(createResp.Body).Decode(&sess); err != nil {
+		t.Fatalf("decode session: %v", err)
+	}
+	createResp.Body.Close()
+	sessionID, _ := sess["id"].(string)
+
+	resp, err := http.Get(f.Server.URL() + "/api/files?session=" + sessionID)
+	if err != nil {
+		t.Fatalf("GET /api/files: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -53,13 +66,12 @@ func TestFilesEndpoint(t *testing.T) {
 		t.Fatalf("decode files: %v", err)
 	}
 
-	contentBody, _ := json.Marshal(map[string]string{"path": f.WS.Path("test.txt")})
-	resp, err = http.Post(f.Server.URL()+"/api/files/content", "application/json", bytes.NewReader(contentBody))
+	contentResp, err := http.Get(f.Server.URL() + "/api/files/content?path=" + f.WS.Path("test.txt"))
 	if err != nil {
-		t.Fatalf("POST /api/files/content: %v", err)
+		t.Fatalf("GET /api/files/content: %v", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("file content unexpected status: %d", resp.StatusCode)
+	defer contentResp.Body.Close()
+	if contentResp.StatusCode != http.StatusOK {
+		t.Fatalf("file content unexpected status: %d", contentResp.StatusCode)
 	}
 }
