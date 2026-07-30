@@ -4,9 +4,11 @@ package fixtures
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -48,13 +50,46 @@ type MockLLMServer struct {
 
 type mockRequest struct {
 	Model    string          `json:"model"`
-	Messages []mockMessage   `json:"messages"`
+	Messages []mockMessage  `json:"messages"`
 	Tools    json.RawMessage `json:"tools"`
 }
 
+// mockMessage 兼容 OpenAI 两种 content 格式：
+//   - 字符串："content": "hello"
+//   - 数组（多模态/文本块）："content": [{"type":"text","text":"hello"}]
+//
+// blades contrib/openai provider 默认发送数组格式，旧 mock 只接受字符串导致 400。
 type mockMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+// textContent 把 mockMessage.Content（字符串或数组）归一为纯文本。
+// 数组格式取所有 type=text 块的 text 字段拼接；其他类型块忽略。
+func (m mockMessage) textContent() string {
+	if len(m.Content) == 0 {
+		return ""
+	}
+	// 尝试作为字符串解析。
+	var s string
+	if err := json.Unmarshal(m.Content, &s); err == nil {
+		return s
+	}
+	// 尝试作为 content 块数组解析。
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err == nil {
+		var parts []string
+		for _, b := range blocks {
+			if b.Type == "text" || b.Type == "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
 }
 
 // NewMockLLMServer creates and starts a new mock LLM server.
@@ -138,13 +173,18 @@ func (m *MockLLMServer) handle(w http.ResponseWriter, r *http.Request) {
 
 	var req mockRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		preview := string(body)
+		if len(preview) > 1024 {
+			preview = preview[:1024] + "..."
+		}
+		fmt.Fprintf(os.Stderr, "[mock-llm] unmarshal error: %v\nbody: %s\n", err, preview)
+		http.Error(w, "unmarshal: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	m.mu.Lock()
 	m.requests = append(m.requests, req)
-	res := m.pickResponse(req)
+	res := m.pickResponseLocked(req)
 	m.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -152,17 +192,14 @@ func (m *MockLLMServer) handle(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(openAICompletionResponse(req.Model, res))
 }
 
-func (m *MockLLMServer) pickResponse(req mockRequest) MockResponse {
-	// 优先消费 FIFO 序列队列（确定性多轮驱动）
-	m.mu.Lock()
+// pickResponseLocked 选取响应，调用方必须已持有 m.mu。
+// 优先消费 FIFO 序列队列（确定性多轮驱动）；其次按 substring 匹配；最后回退 default。
+func (m *MockLLMServer) pickResponseLocked(req mockRequest) MockResponse {
 	if len(m.sequence) > 0 {
 		res := m.sequence[0]
 		m.sequence = m.sequence[1:]
-		m.mu.Unlock()
 		return res
 	}
-	m.mu.Unlock()
-
 	prompt := m.promptText(req)
 	for sub, res := range m.responses {
 		if strings.Contains(prompt, sub) {
@@ -178,7 +215,7 @@ func (m *MockLLMServer) pickResponse(req mockRequest) MockResponse {
 func (m *MockLLMServer) promptText(req mockRequest) string {
 	var parts []string
 	for _, msg := range req.Messages {
-		parts = append(parts, msg.Content)
+		parts = append(parts, msg.textContent())
 	}
 	return strings.Join(parts, "\n")
 }
