@@ -486,3 +486,75 @@ func TestReactService_SwitchTopicNotFound(t *testing.T) {
 		t.Errorf("expected ErrSessionNotFound, got %v", err)
 	}
 }
+
+// recallMemStore 是 SharedMemoryStore 的内存测试实现,支持 Set/Get/Delete/Keys。
+type recallMemStore struct {
+	data map[string]string
+}
+
+func newRecallMemStore() *recallMemStore { return &recallMemStore{data: map[string]string{}} }
+
+func (s *recallMemStore) Set(_ context.Context, k, v string) error    { s.data[k] = v; return nil }
+func (s *recallMemStore) Get(_ context.Context, k string) (string, error) { return s.data[k], nil }
+func (s *recallMemStore) Delete(_ context.Context, k string) error   { delete(s.data, k); return nil }
+func (s *recallMemStore) Keys(_ context.Context) []string {
+	out := make([]string, 0, len(s.data))
+	for k := range s.data {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestReactService_RecallTopicSummaries 验证按 session 前缀召回旧话题摘要:
+// 跳过当前话题、跳过其他 session 的同 ID 摘要(防跨 session 污染)。
+func TestReactService_RecallTopicSummaries(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	store := newRecallMemStore()
+	svc.SetSharedMemoryStore(store)
+	ctx := context.Background()
+
+	// session-A 的两个旧话题 + 当前话题(2),session-B 的同 ID 话题(跨 session 污染源)。
+	store.data["topic:session-A:1:summary"] = "【话题 1 摘要】旧任务A"
+	store.data["topic:session-A:2:summary"] = "【话题 2 摘要】当前话题A"
+	store.data["topic:session-B:1:summary"] = "【话题 1 摘要】他处任务B"
+
+	got := svc.recallTopicSummaries(ctx, "session-A", "2")
+	if strings.Contains(got, "当前话题A") {
+		t.Errorf("不应召回当前话题摘要, got: %s", got)
+	}
+	if strings.Contains(got, "他处任务B") {
+		t.Errorf("不应召回其他 session 的摘要(跨 session 污染), got: %s", got)
+	}
+	if !strings.Contains(got, "旧任务A") {
+		t.Errorf("应召回旧话题摘要, got: %s", got)
+	}
+}
+
+// TestReactService_InjectTopicRecall 验证旧话题摘要注入 input 前,且同一话题只注入一次。
+func TestReactService_InjectTopicRecall(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	store := newRecallMemStore()
+	svc.SetSharedMemoryStore(store)
+	ctx := context.Background()
+
+	// 构造一个内存会话:activeTopicID="2",recalledTopicID=""(未注入过)。
+	sess := &reactInternalSession{ID: "s1", Goal: "g", activeTopicID: "2"}
+	store.data["topic:s1:1:summary"] = "【话题 1 摘要】前置结论"
+
+	out := svc.injectTopicRecall(ctx, sess, "继续")
+	if !strings.Contains(out, "前置结论") || !strings.Contains(out, "继续") {
+		t.Fatalf("应注入旧话题摘要并保留原 input, got: %s", out)
+	}
+	if sess.recalledTopicID != "2" {
+		t.Fatalf("recalledTopicID 应更新为 2, got %q", sess.recalledTopicID)
+	}
+
+	// 第二次调用同一话题:不应重复注入(返回原 input)。
+	out2 := svc.injectTopicRecall(ctx, sess, "再来")
+	if strings.Contains(out2, "前置结论") {
+		t.Fatalf("同一话题不应重复注入摘要, got: %s", out2)
+	}
+	if !strings.Contains(out2, "再来") {
+		t.Fatalf("应保留原 input, got: %s", out2)
+	}
+}

@@ -211,7 +211,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
 	// Executor 永远跑 DefaultSandboxConfig（默认禁写工作目录外、保留命令黑名单）。
 	toolRegistry.SetSandboxConfig(&cfg.Agent.SafetyConfig)
-	memoryPipeline := memory.NewPipeline(memory.NewInMemoryStore()).
+	memoryPipeline := memory.NewPipeline(memory.NewPostgresEventStore(pgStore.DB())).
 		WithSummarizer(newEventSummarizer(modelFactory)).
 		WithCompression(cfg.Agent.SummarizeEvery, cfg.Agent.SummarizeKeepRecent) // 记忆流水线
 
@@ -224,6 +224,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		RetryBackoffMs:            cfg.Agent.RetryBackoffMs,
 		HistoryMaxMessages:        cfg.Agent.HistoryMaxMessages,
 		ToolOutputHistoryMaxRunes: cfg.Agent.ToolOutputHistoryMaxRunes,
+		TokenBudgetPerGoal:       cfg.Agent.TokenBudgetPerGoal,
 	}
 	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute
 	if subAgentTimeout < 0 {
@@ -339,6 +340,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
 	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。
 	subAgentDispatcher.WithLiveEvents(agentSvc.ForwardLiveEvent)
+	// 注入人格加载器（soul.Loader）：MetaAgent 与子 Agent 共享同一用户级人格，
+	// 在 systemPrompt 头部拼入人格前缀。人格为空时无副作用（Inject 原样返回）。
+	agentSvc.SetPersonaInjector(rt.Soul)
+	subAgentDispatcher.WithPersonaInjector(rt.Soul)
 	// 注入权威 Agent 树访问器：Dispatcher 派发时 Register/Finish/SetCancel，
 	// HTTP API 的 /tree 与 /agents/{aid}/cancel 端点通过 ReactService.TreeFor 读取。
 	subAgentDispatcher.WithTree(agentSvc.TreeFor)
@@ -448,6 +453,7 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 	for name, fn := range map[string]func(context.Context, *sql.DB) error{
 		"session_history": store.EnsureSessionHistorySchema,
 		"session_events":  store.EnsureSessionEventsSchema,
+		"agent_events":    store.EnsureAgentEventsSchema,
 		"session_logs":    store.EnsureSessionLogsSchema,
 		"dag":             store.EnsureDAGSchema,
 		"memory":          store.EnsureInitialMemorySchema,

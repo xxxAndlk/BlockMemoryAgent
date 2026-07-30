@@ -120,6 +120,34 @@ CREATE INDEX IF NOT EXISTS idx_session_events_session_ts
 	return err
 }
 
+// EnsureAgentEventsSchema 自动创建 agent_events 表 (幂等)。
+// 供 domain/memory.PostgresEventStore 持久化 ReAct Agent 事件流
+// (tool_call / answer / sub_agent_summary 等)。
+// 与 session_events 分表:session_events 记 UI 进度事件 (旧,只读),
+// agent_events 记记忆流水线事件 (Pipeline.Write 落库)。
+// session_id 从 agentID 派生 (MetaAgent agentID==sessionID; 子 Agent "session-N/role-K" 取前段)。
+func EnsureAgentEventsSchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS agent_events (
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  VARCHAR(64) NOT NULL DEFAULT '',
+    agent_id    VARCHAR(256) NOT NULL DEFAULT '',
+    type        VARCHAR(64) NOT NULL DEFAULT '',
+    role        VARCHAR(64) NOT NULL DEFAULT '',
+    content     TEXT NOT NULL DEFAULT '',
+    tool_name   VARCHAR(128) NOT NULL DEFAULT '',
+    input       TEXT NOT NULL DEFAULT '',
+    output      TEXT NOT NULL DEFAULT '',
+    occurred    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_events_agent_occurred
+    ON agent_events (agent_id, occurred DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_events_session
+    ON agent_events (session_id);
+`)
+	return err
+}
+
 // EnsureInitialMemorySchema 自动创建 001_init.sql 中定义的记忆/知识/注册表相关表 (幂等)。
 // 负责在启动时补齐 global_knowledge / agent_private_memory / agent_snapshots / topics /
 // agent_registry / decision_logs / topic_archives 等表,避免块记忆、私有记忆、快照写入失败。

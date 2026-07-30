@@ -206,6 +206,110 @@ func TestReActAgent_WakeOnMailbox(t *testing.T) {
 	}
 }
 
+// tokenUsageProvider 返回带 TokenUsage 的响应，用于测试 token 预算上限。
+// 每次响应固定 InputTokens/OutputTokens，第 calls 次后给空响应收尾防死循环。
+type tokenUsageProvider struct {
+	input  int64
+	output int64
+	calls  int
+}
+
+func (m *tokenUsageProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	m.calls++
+	msg := blades.AssistantMessage("working")
+	msg.TokenUsage = blades.TokenUsage{InputTokens: m.input, OutputTokens: m.output, TotalTokens: m.input + m.output}
+	return &blades.ModelResponse{Message: msg}, nil
+}
+
+func (m *tokenUsageProvider) Name() string { return "tokenUsage" }
+
+// TestReActAgent_TokenBudgetExceeded 验证累计 token 超预算时返回部分完成（LimitReached），
+// 而非错误或继续烧轮次。与 maxIter 轮数上限正交。
+func TestReActAgent_TokenBudgetExceeded(t *testing.T) {
+	llm := &tokenUsageProvider{input: 60, output: 60} // 单轮 120 tokens
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	ag := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).
+		WithLoopConfig(LoopConfig{TokenBudget: 100, MaxIterations: 50})
+
+	res, err := ag.Run(context.Background(), "budget test")
+	if err != nil {
+		t.Fatalf("超预算不应返回错误（应 LimitReached 暂停）: %v", err)
+	}
+	if !res.LimitReached {
+		t.Fatal("超预算时 LimitReached 应为 true")
+	}
+	if llm.calls != 1 {
+		t.Fatalf("第一轮即超预算应只调 1 次 LLM，got %d", llm.calls)
+	}
+}
+
+// TestReActAgent_TokenBudgetZeroUnlimited 验证 tokenBudget<=0（默认）时不触发预算限制，
+// 模型直接给终答正常返回。
+func TestReActAgent_TokenBudgetZeroUnlimited(t *testing.T) {
+	llm := &mockModelProvider{
+		responses: []*blades.Message{blades.AssistantMessage("done")},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	ag := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).
+		WithLoopConfig(LoopConfig{TokenBudget: 0}) // 0 = 不限制
+
+	res, err := ag.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.LimitReached {
+		t.Fatal("tokenBudget=0 时不应触发 LimitReached")
+	}
+	if res.Text != "done" {
+		t.Fatalf("expected 'done', got %q", res.Text)
+	}
+}
+
+// fakePersonaInjector 测试用 PersonaInjector，固定前缀人格内容。
+type fakePersonaInjector struct{ prefix string }
+
+func (f fakePersonaInjector) Inject(systemPrompt string) string {
+	if f.prefix == "" {
+		return systemPrompt
+	}
+	return f.prefix + "\n\n---\n\n" + systemPrompt
+}
+
+// TestReActAgent_PersonaInjected 验证注入 PersonaInjector 后，系统提示词头部带人格前缀；
+// nil 时不注入，原样返回。
+func TestReActAgent_PersonaInjected(t *testing.T) {
+	llm := &mockModelProvider{responses: []*blades.Message{blades.AssistantMessage("ok")}}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	ag := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "base"}, llm, NewToolRegistryAdapter(reg)).
+		WithPersonaInjector(fakePersonaInjector{prefix: "【人格】谦逊严谨"})
+
+	res, err := ag.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Text != "ok" {
+		t.Fatalf("expected 'ok', got %q", res.Text)
+	}
+	if llm.calls != 1 {
+		t.Fatalf("expected 1 LLM call, got %d", llm.calls)
+	}
+}
+
+// TestReActAgent_NilPersonaNoOp 验证 nil PersonaInjector 时 systemPrompt 不注入人格（无副作用）。
+func TestReActAgent_NilPersonaNoOp(t *testing.T) {
+	llm := &mockModelProvider{responses: []*blades.Message{blades.AssistantMessage("ok")}}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	ag := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "base"}, llm, NewToolRegistryAdapter(reg))
+
+	// systemPrompt 不应包含人格分隔符（nil persona 不注入）。
+	if strings.Contains(ag.systemPrompt(), "---") {
+		t.Fatal("nil persona 时 systemPrompt 不应注入人格分隔符")
+	}
+	if _, err := ag.Run(context.Background(), "hi"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // flakyModelProvider 前 failTimes 次 Generate 返回错误，之后返回成功响应，用于重试测试。
 type flakyModelProvider struct {
 	failTimes int

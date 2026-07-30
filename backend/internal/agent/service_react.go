@@ -56,6 +56,9 @@ type ReactService struct {
 	// key 格式 `topic:{topicID}:summary`。为 nil 时跳过摘要写入(测试场景)。
 	// MetaAgent 在新话题召回该摘要依赖步骤 4 part C(MetaAgent 根 recall 注入,未做)。
 	sharedMemoryStore tool.SharedMemoryStore
+	// persona 可选的人格注入器（soul.Loader 实现该接口）；为 nil 时不注入人格前缀。
+	// bootstrap 注入 runtime.Soul；runSession/resumeSession 构造 MetaAgent 时调用 WithPersonaInjector。
+	persona PersonaInjector
 }
 
 // SetTreeStore 注入 Agent 树持久化层。bootstrap 在创建 ReactService 后调用。
@@ -70,6 +73,12 @@ func (s *ReactService) SetSharedMemoryStore(store tool.SharedMemoryStore) {
 	s.sharedMemoryStore = store
 }
 
+// SetPersonaInjector 注入人格注入器(soul.Loader),使 MetaAgent 系统提示词头部带人格前缀。
+// bootstrap 注入 runtime.Soul;传 nil 关闭人格注入(测试场景)。
+func (s *ReactService) SetPersonaInjector(p PersonaInjector) {
+	s.persona = p
+}
+
 // ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
 // 由 bootstrap 从 cfg.Agent 派生注入，避免 agent 包反向依赖 config 包；
 // 未注入时全部取零值，由 loopConfig 回退到合理默认值。
@@ -80,6 +89,9 @@ type ReactRuntimeConfig struct {
 	RetryBackoffMs          int // 重试初始退避（毫秒）
 	HistoryMaxMessages      int // 单次请求最大历史消息数；<0 表示不裁剪
 	ToolOutputHistoryMaxRunes int // 写入历史的工具输出最大字符数；<0 表示不截断
+	// TokenBudgetPerGoal 单次 RunWithHistory 累计 token 上限（input+output 之和）。
+	// <=0 不限制；>0 超限后主循环 break 返回部分完成（LimitReached）。
+	TokenBudgetPerGoal int
 }
 
 // SetRuntimeConfig 注入 ReAct 主循环运行时参数（见 ReactRuntimeConfig）。
@@ -137,6 +149,9 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 	}
 	if c.ToolOutputHistoryMaxRunes != 0 {
 		lc.ToolOutputMaxRunes = max(c.ToolOutputHistoryMaxRunes, 0)
+	}
+	if c.TokenBudgetPerGoal > 0 {
+		lc.TokenBudget = c.TokenBudgetPerGoal
 	}
 	return lc
 }
@@ -603,12 +618,13 @@ func (s *ReactService) SwitchTopic(ctx context.Context, sessionID, name, goal st
 	// 终结旧话题的 Agent 树:取消 Running 节点 + 压缩摘要 + 清内存 + 删 PG。
 	tree := s.TreeFor(sessionID)
 	snapshot := tree.EndCurrentTopic()
-	// 旧话题有节点时压缩摘要写入 sharedKV,供新话题召回(步骤 4 part C 未做注入侧,
-	// 但摘要已落 KV,后续 part C 可按 topic:{id}:summary key 读)。
+	// 旧话题有节点时压缩摘要写入 sharedKV,供新话题召回。
+	// key 格式 `topic:{sessionID}:{topicID}:summary`:sessionID 前缀隔离,防跨 session 污染
+	// (与块记忆 recall 同原则)。召回侧 recallTopicSummaries 按 session 前缀读取。
 	if oldTopicID != "" && s.sharedMemoryStore != nil && len(snapshot) > 0 {
 		summary := summarizeTopicSnapshot(oldTopicID, snapshot)
 		kvCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		if err := s.sharedMemoryStore.Set(kvCtx, "topic:"+oldTopicID+":summary", summary); err != nil {
+		if err := s.sharedMemoryStore.Set(kvCtx, "topic:"+sessionID+":"+oldTopicID+":summary", summary); err != nil {
 			s.store.logError(ctx, "switch topic: write old topic summary to KV failed", err)
 		}
 		cancel()
@@ -665,6 +681,55 @@ func summarizeTopicSnapshot(topicID string, nodes []orchestrator.Node) string {
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+// recallTopicSummaries 召回当前 session 历史话题摘要,供新话题 MetaAgent 续接上下文。
+// key 格式 `topic:{sessionID}:{topicID}:summary`:按 session 前缀过滤防跨 session 污染,
+// 跳过 currentTopicID(当前话题摘要未写,只在切换时落 KV)。无配置/无历史返回空串。
+func (s *ReactService) recallTopicSummaries(ctx context.Context, sessionID, currentTopicID string) string {
+	if s.sharedMemoryStore == nil {
+		return ""
+	}
+	keys := s.sharedMemoryStore.Keys(ctx)
+	prefix := "topic:" + sessionID + ":"
+	var summaries []string
+	for _, k := range keys {
+		if !strings.HasPrefix(k, prefix) || !strings.HasSuffix(k, ":summary") {
+			continue
+		}
+		topicID := strings.TrimSuffix(strings.TrimPrefix(k, prefix), ":summary")
+		if topicID == "" || topicID == currentTopicID {
+			continue
+		}
+		v, err := s.sharedMemoryStore.Get(ctx, k)
+		if err != nil || strings.TrimSpace(v) == "" {
+			continue
+		}
+		summaries = append(summaries, v)
+	}
+	return strings.Join(summaries, "\n\n")
+}
+
+// injectTopicRecall 按 activeTopicID 召回旧话题摘要并拼到 input 前。
+// 用 recalledTopicID 去重:同一话题只注入一次,避免每次 resume 重复烧 token。
+// 无历史摘要时也标记 recalledTopicID,避免反复扫 KV。
+// 返回注入后的 input(无摘要时原样),以及是否已处理(recalledTopicID 已更新)。
+func (s *ReactService) injectTopicRecall(ctx context.Context, session *reactInternalSession, input string) string {
+	s.store.mu.Lock()
+	active := session.activeTopicID
+	done := session.recalledTopicID
+	s.store.mu.Unlock()
+	if done == active {
+		return input
+	}
+	prefix := s.recallTopicSummaries(ctx, session.ID, active)
+	s.store.mu.Lock()
+	session.recalledTopicID = active
+	s.store.mu.Unlock()
+	if prefix == "" {
+		return input
+	}
+	return prefix + "\n\n【当前话题目标】\n" + input
 }
 
 // handleToolEvent 接收工具注册表产生的进度事件，并将其注入到对应运行中会话的事件流。
@@ -811,7 +876,8 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
-		WithWorkDir(s.workDir())
+		WithWorkDir(s.workDir()).
+		WithPersonaInjector(s.persona)
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -820,8 +886,11 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 将会话 ID 注入工具上下文，便于工具内部识别当前会话。
 	runCtx := tool.WithSessionID(ctx, session.ID)
 
+	// 召回旧话题摘要拼到目标前(切换话题后续接上下文);同一话题只注入一次。
+	goal := s.injectTopicRecall(ctx, session, session.Goal)
+
 	// 运行 ReAct 主循环，传入会话目标。
-	result, err := agent.Run(runCtx, session.Goal)
+	result, err := agent.Run(runCtx, goal)
 	if err != nil {
 		// 运行出错时标记会话错误并退出。
 		s.setSessionError(session, err.Error())
@@ -887,7 +956,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLoopConfig(s.runtimeCfg.LoopConfig()).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
-		WithWorkDir(s.workDir())
+		WithWorkDir(s.workDir()).
+		WithPersonaInjector(s.persona)
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -907,6 +977,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	history := make([]ReactMessage, len(session.History))
 	copy(history, session.History)
 	s.store.mu.RUnlock()
+
+	// 召回旧话题摘要拼到本轮输入前(切换话题后续接上下文);同一话题只注入一次。
+	input = s.injectTopicRecall(ctx, session, input)
 
 	// 调用带历史的 ReAct 运行接口。
 	result, err := agent.RunWithHistory(runCtx, input, history)

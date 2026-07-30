@@ -10,6 +10,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/board"
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
@@ -99,93 +100,12 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 		createdAt: taskStart,
 	})
 
-	// 获取会话的 Agent 实例列表。
-	insts, err := agentFacade.ListAgents(context.Background(), s.ID)
-	if err != nil {
-		return
-	}
-	// 构建 ModuleID 到实例的映射，便于查找父子关系。
-	byID := make(map[string]agent.AgentInstance)
-	for _, inst := range insts {
-		byID[inst.ModuleID] = inst
-	}
-	// 遍历实例，仅处理领域 Agent 作为一级子节点。
-	for _, inst := range insts {
-		if inst.RoleType != enums.RoleTypeDomain {
-			continue
-		}
-		// 从会话状态中查找该领域当前的目标。
-		goal := ""
-		if s.State != nil {
-			for _, b := range s.State.ActiveBlocks {
-				if b.Domain == inst.Domain {
-					goal = b.Goal
-					break
-				}
-			}
-		}
-		// 添加领域 Agent 节点。
-		at.nodes = append(at.nodes, agentTreeNode{
-			depth:     1,
-			instID:    inst.ModuleID,
-			name:      inst.Name,
-			domain:    inst.Domain,
-			roleType:  inst.RoleType,
-			role:      inst.Role,
-			status:    enums.RoleStatus(inst.Status),
-			goal:      goal,
-			createdAt: inst.CreatedAt,
-		})
-		// 处理领域 Agent 的子节点。
-		for _, childID := range inst.Children {
-			child := byID[childID]
-			// 子节点不存在时跳过。
-			if child.ModuleID == "" {
-				continue
-			}
-			depth := 2
-			// 子领域 Agent 继续展开其子节点。
-			if child.RoleType == enums.RoleTypeSubDomain {
-				at.nodes = append(at.nodes, agentTreeNode{
-					depth:     depth,
-					instID:    child.ModuleID,
-					name:      child.Name,
-					domain:    child.Domain,
-					roleType:  child.RoleType,
-					role:      child.Role,
-					status:    enums.RoleStatus(child.Status),
-					createdAt: child.CreatedAt,
-				})
-				for _, subID := range child.Children {
-					sub := byID[subID]
-					if sub.ModuleID == "" {
-						continue
-					}
-					at.nodes = append(at.nodes, agentTreeNode{
-						depth:     3,
-						instID:    sub.ModuleID,
-						name:      sub.Name,
-						domain:    sub.Domain,
-						roleType:  sub.RoleType,
-						role:      sub.Role,
-						status:    enums.RoleStatus(sub.Status),
-						createdAt: sub.CreatedAt,
-					})
-				}
-			} else if child.RoleType == enums.RoleTypeFixed || child.RoleType == enums.RoleTypeDynamic {
-				// 固定/动态 Agent 直接作为二级节点。
-				at.nodes = append(at.nodes, agentTreeNode{
-					depth:     depth,
-					instID:    child.ModuleID,
-					name:      child.Name,
-					domain:    child.Domain,
-					roleType:  child.RoleType,
-					role:      child.Role,
-					status:    enums.RoleStatus(child.Status),
-					createdAt: child.CreatedAt,
-				})
-			}
-		}
+	// 读取权威 Agent 树(Dispatcher 维护,已 PG 持久化,重启后 lazy 恢复)。
+	// 替代旧事件流派生(deriveSubAgentNodes):树是单一真相源,事件流派生有竞态/遗漏。
+	// Tree() 返回 []orchestrator.Node,按启动时间升序;MetaAgent 非节点,已在上方作为根加入。
+	nodes, err := agentFacade.Tree(context.Background(), s.ID)
+	if err == nil {
+		at.nodes = append(at.nodes, orchestratorNodesToTreeNodes(nodes, s.ID)...)
 	}
 
 	// 若会话处于待澄清状态，追加一个占位节点提示用户。
@@ -199,70 +119,70 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 			isClarify: true,
 		})
 	}
-
-	// 新架构（ReAct）下子 Agent 由 Dispatcher 直接创建，不会注册为 AgentInstance，
-	// ListAgents 看不到；改为从会话事件流（派发/执行/完成）派生子 Agent 节点，
-	// 使编排面板能实时展示领域 Agent 与助手的执行状态。
-	//
-	// TODO: 权威树已通过 /api/sessions/{id}/tree 暴露（orchestrator.Tree，Dispatcher 维护）。
-	// 待树持久化后切换为读 Tree() 接口，淘汰 deriveSubAgentNodes 派生路径。
-	// 当前保留派生作 fallback：服务重启后 tree 清空，事件流仍能渲染历史子 Agent。
-	at.nodes = append(at.nodes, deriveSubAgentNodes(s.Events)...)
 }
 
-// deriveSubAgentNodes 从会话事件流派生子 Agent 节点：
-// sub_agent_dispatch（派发，含角色与任务摘要）创建运行中节点；
-// call_sub_agent 的 tool_exec 回填子 Agent ID（失败则标记错误）；
-// sub_agent_done（完成）按 ID 将节点标记为完成。
-func deriveSubAgentNodes(events []server.SessionEvent) []agentTreeNode {
-	var nodes []*agentTreeNode
-	for i := range events {
-		ev := events[i]
-		switch {
-		case ev.Kind == "sub_agent_dispatch":
-			role := ev.Tool
-			if role == "" {
-				role = "sub-agent"
-			}
-			roleType := enums.RoleTypeFixed
-			if strings.HasPrefix(role, "domain") {
-				roleType = enums.RoleTypeDomain
-			}
-			nodes = append(nodes, &agentTreeNode{
-				depth:     1,
-				name:      role,
-				domain:    role,
-				roleType:  roleType,
-				role:      role,
-				status:    enums.RoleStatusActive,
-				goal:      ev.Message,
-				createdAt: ev.Timestamp,
-			})
-		case ev.Type == "tool_exec" && ev.Tool == "call_sub_agent":
-			// 回填最早一个尚无 ID 的节点（tool_exec 与派发顺序一一对应，FIFO 匹配）。
-			for j := 0; j < len(nodes); j++ {
-				if nodes[j].instID == "" {
-					nodes[j].instID = ev.ToolPath
-					if !ev.Success {
-						nodes[j].status = enums.RoleStatusError
-					}
-					break
-				}
-			}
-		case ev.Kind == "sub_agent_done":
-			id := strings.TrimSpace(ev.Message)
-			for _, n := range nodes {
-				if n.instID == id {
-					n.status = enums.RoleStatusDone
-				}
-			}
-		}
+// orchestratorNodesToTreeNodes 把权威树节点 []orchestrator.Node 映射为扁平渲染节点,
+// 按 ParentID 链计算 depth:根(MetaAgent,rootID)的直接子节点 depth=1,逐级 +1。
+// 状态映射:Running->Active / Done->Done / Failed->Error / Cancelled->Done(终态)。
+func orchestratorNodesToTreeNodes(nodes []orchestrator.Node, rootID string) []agentTreeNode {
+	byID := make(map[string]int, len(nodes))
+	for i, n := range nodes {
+		byID[n.ID] = i
 	}
 	out := make([]agentTreeNode, 0, len(nodes))
 	for _, n := range nodes {
-		out = append(out, *n)
+		roleType := enums.RoleTypeFixed
+		if n.Role == "domain" || strings.HasPrefix(n.Role, "domain") {
+			roleType = enums.RoleTypeDomain
+		}
+		out = append(out, agentTreeNode{
+			depth:     orchestratorNodeDepth(n, nodes, byID, rootID),
+			instID:    n.ID,
+			name:      n.Role,
+			domain:    n.Domain,
+			roleType:  roleType,
+			role:      n.Role,
+			status:    orchestratorStatusToRole(n.Status),
+			goal:      n.Task,
+			createdAt: n.Started,
+		})
 	}
 	return out
+}
+
+// orchestratorNodeDepth 沿 ParentID 链向上数祖先数:直接子节点(rootID 为父)depth=1。
+// 循环/缺失父节点兜底 depth=1。深度上限为节点总数,防环。
+func orchestratorNodeDepth(n orchestrator.Node, nodes []orchestrator.Node, byID map[string]int, rootID string) int {
+	depth := 1
+	pid := n.ParentID
+	for i := 0; i < len(nodes); i++ {
+		if pid == "" || pid == rootID {
+			break
+		}
+		idx, ok := byID[pid]
+		if !ok {
+			break
+		}
+		depth++
+		pid = nodes[idx].ParentID
+	}
+	return depth
+}
+
+// orchestratorStatusToRole 把 orchestrator.Status 映射为 TUI RoleStatus。
+// Cancelled 归入 Done(终态,非错误)。
+func orchestratorStatusToRole(s orchestrator.Status) enums.RoleStatus {
+	switch s {
+	case orchestrator.StatusRunning:
+		return enums.RoleStatusActive
+	case orchestrator.StatusDone:
+		return enums.RoleStatusDone
+	case orchestrator.StatusFailed:
+		return enums.RoleStatusError
+	case orchestrator.StatusCancelled:
+		return enums.RoleStatusDone
+	}
+	return enums.RoleStatusIdle
 }
 
 // deriveDomainTaskStatuses 从 Agent 树中汇总每个领域的真实状态，用于覆盖看板中可能滞后的状态。

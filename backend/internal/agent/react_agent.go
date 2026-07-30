@@ -40,6 +40,8 @@ type ReActAgent struct {
 	historyMaxMessages int
 	// toolOutputMaxRunes 是写入历史的单条工具输出最大字符数；<=0 不截断。
 	toolOutputMaxRunes int
+	// tokenBudget 单次 RunWithHistory 累计 token 上限；<=0 不限制。超限 break 返回部分完成。
+	tokenBudget int
 	// liveFn 是实时进度事件回调，由 WithLiveEvents 注入；nil 时不推送任何进度事件。
 	liveFn func(LiveEvent)
 	// pendingChecker 可选的未决子 Agent 检查器，由 WithPendingChildrenChecker 注入；
@@ -51,6 +53,16 @@ type ReActAgent struct {
 	// workDir 是当前 Agent 的工作目录，注入到系统提示词中供 LLM 使用相对路径。
 	// 为空时回退到进程 cwd（systemPrompt 中仍会显示）。
 	workDir string
+	// persona 可选的人格注入器（soul.Loader 实现该接口）；为 nil 时不注入人格前缀。
+	// 在 systemPrompt() 头部把人格内容拼到环境块之前，使所有 Agent 共享用户级人格。
+	persona PersonaInjector
+}
+
+// PersonaInjector 把人格内容拼接到系统提示词之前；soul.Loader 实现该接口。
+// 接口分离避免 agent 包反向依赖 soul 包；为 nil 时 systemPrompt 原样返回。
+type PersonaInjector interface {
+	// Inject 返回拼入人格前缀后的系统提示词；人格为空时原样返回 systemPrompt。
+	Inject(systemPrompt string) string
 }
 
 // LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。
@@ -62,6 +74,9 @@ type LoopConfig struct {
 	RetryBackoff       time.Duration // 重试初始退避；<=0 用默认 100ms
 	HistoryMaxMessages int           // 单次请求最大历史消息数；<=0 不裁剪
 	ToolOutputMaxRunes int           // 写入历史的工具输出最大字符数；<=0 不截断
+	// TokenBudget 单次 RunWithHistory 累计 token 上限（input+output 之和，跨轮累加）。
+	// <=0 不限制；>0 超限后主循环 break 返回部分完成（LimitReached）。
+	TokenBudget int
 }
 
 // NewReActAgent 根据具体角色构造一个 ReActAgent 实例。
@@ -127,6 +142,7 @@ func (a *ReActAgent) WithLoopConfig(c LoopConfig) *ReActAgent {
 	a.retryBackoff = c.RetryBackoff
 	a.historyMaxMessages = c.HistoryMaxMessages
 	a.toolOutputMaxRunes = c.ToolOutputMaxRunes
+	a.tokenBudget = c.TokenBudget
 	return a
 }
 
@@ -149,6 +165,13 @@ func (a *ReActAgent) WithPendingChildrenChecker(p PendingChildrenChecker) *ReAct
 // 供 TUI/Web 完整查看输入输出。传 nil 关闭 LLM I/O 日志（默认关闭）。
 func (a *ReActAgent) WithLogger(l *logger.Logger) *ReActAgent {
 	a.log = l
+	return a
+}
+
+// WithPersonaInjector 注入人格注入器（soul.Loader），在 systemPrompt 头部拼入人格前缀。
+// 传 nil 关闭人格注入（默认关闭）。人格为空时 systemPrompt 原样返回，无副作用。
+func (a *ReActAgent) WithPersonaInjector(p PersonaInjector) *ReActAgent {
+	a.persona = p
 	return a
 }
 
@@ -205,6 +228,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// 每次循环对应一次“思考-行动-观察”的迭代。
 	// emptyStreak 记录连续空响应次数，用于空响应保护（见循环内注释）。
 	emptyStreak := 0
+	// usedTokens 累计本次 RunWithHistory 的 LLM token 消耗（input+output 之和）。
+	// tokenBudget>0 时，超限即 break 返回部分完成，防止单目标 token 成本无上限累积。
+	var usedTokens int64
 	for i := 0; a.maxIter <= 0 || i < a.maxIter; i++ {
 		// 在每次调用 LLM 之前，通过记忆流水线组装上下文消息。
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
@@ -240,6 +266,21 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				InputTokens:  usage.InputTokens,
 				OutputTokens: usage.OutputTokens,
 			})
+		}
+		// 累计 token 预算：优先 TotalTokens（provider 填充时），否则用 input+output 之和。
+		// 空响应（mock/测试）不计入，避免误触预算上限。
+		if usage := resp.Message.TokenUsage; usage.InputTokens > 0 || usage.OutputTokens > 0 {
+			delta := usage.TotalTokens
+			if delta <= 0 {
+				delta = usage.InputTokens + usage.OutputTokens
+			}
+			usedTokens += delta
+		}
+		// 超预算：不视为错误，返回部分完成 + 完整历史，由上层暂停会话等用户续跑。
+		// 与 maxIter 轮数上限正交：先到哪个用哪个。
+		if a.tokenBudget > 0 && usedTokens > int64(a.tokenBudget) {
+			log.Printf("[react] token budget exceeded: role=%s used=%d budget=%d", a.role.Name, usedTokens, a.tokenBudget)
+			return ReactResult{History: history, LimitReached: true}, nil
 		}
 
 		// 将 blades 返回的消息转换为内部 Assistant 消息。
@@ -690,12 +731,18 @@ func (a *ReActAgent) systemPrompt() string {
 
 	// 在基础提示后追加执行纪律块，与角色提示同语言（中文），覆盖：
 	// 工具使用节制、修改后验证、完成即停、mailbox 消息语义。
-	return envBlock + "\n\n" + base + "\n\n" +
+	prompt := envBlock + "\n\n" + base + "\n\n" +
 		"【执行纪律】\n" +
 		"1. 只在必要时调用工具；先用 SearchInFiles/ListDir 定位，再按需 ReadFile；不重复读取已读过的文件。\n" +
 		"2. 修改代码或文件后，用 RunCommand 验证（构建/测试/检查），没有验证证据不得声称完成。\n" +
 		"3. 任务完成立即停止调用工具，输出最终答复；答复必须自包含：做了什么、结果如何、关键文件路径。\n" +
 		"4. 形如 [mailbox from <agent_id>] 的消息是异步子 Agent 回传的结果摘要，阅读后整合进当前结论；若摘要表明失败，决定重试、自己接手或在答复中说明。\n"
+	// 人格注入器非 nil 时，把人格内容拼到完整 prompt 最前（envBlock 之前），
+	// 作为用户级人格前缀。人格为空时 Inject 原样返回，无副作用。
+	if a.persona != nil {
+		prompt = a.persona.Inject(prompt)
+	}
+	return prompt
 }
 
 // buildEnvBlock 构造环境信息块，注入到系统提示词头部。

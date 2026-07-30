@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/blockmemory/agent/backend/internal/board"
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
@@ -220,27 +222,28 @@ func (m Model) renderPlanPanel(w, h int) string {
 			Goal:  goal,
 			Tasks: []board.SubTask{{ID: "direct", Title: "直接执行", Status: status}},
 		}
-		// 有子 Agent 派发时，把每个派发的领域 Agent/助手追加为一行任务，
-		// 状态从会话事件流派生（运行中/完成/失败），保证任务面板随编排实时更新。
-		if s != nil {
-			for i, n := range deriveSubAgentNodes(s.Events) {
+		// 有子 Agent 派发时,把每个权威树节点追加为一行任务,
+		// 状态从 Tree()(Dispatcher 维护,已持久化)读取,保证任务面板随编排实时更新。
+		if s != nil && m.agent != nil {
+			treeNodes, _ := m.agent.Tree(context.Background(), s.ID)
+			for i, n := range treeNodes {
 				tStatus := board.TaskInProgress
-				switch n.status {
-				case enums.RoleStatusDone:
+				switch n.Status {
+				case orchestrator.StatusDone, orchestrator.StatusCancelled:
 					tStatus = board.TaskDone
-				case enums.RoleStatusError:
+				case orchestrator.StatusFailed:
 					tStatus = board.TaskFailed
 				}
-				title := "派发 " + n.name
-				if n.goal != "" {
-					title += ": " + n.goal
+				title := "派发 " + n.Role
+				if n.Task != "" {
+					title += ": " + n.Task
 				}
 				snap.Tasks = append(snap.Tasks, board.SubTask{
 					ID:        fmt.Sprintf("sub-%d", i+1),
 					Title:     title,
 					Status:    tStatus,
-					CreatedAt: n.createdAt,
-					UpdatedAt: n.createdAt,
+					CreatedAt: n.Started,
+					UpdatedAt: n.Started,
 				})
 			}
 		}

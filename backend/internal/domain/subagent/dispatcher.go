@@ -133,6 +133,9 @@ type Dispatcher struct {
 	// 按 sessionID 路由回所属会话的 service.handleLiveEvent，使子 Agent token 也计入会话累计。
 	// 为 nil 时子 Agent 不推送实时事件（不影响主流程）。
 	liveFn func(sessionID string, ev agent.LiveEvent)
+	// persona 可选的人格注入器（soul.Loader 实现该接口）；为 nil 时子 Agent 不注入人格前缀。
+	// 与 MetaAgent 共享同一用户级人格，由 bootstrap 注入 runtime.Soul。
+	persona agent.PersonaInjector
 
 	// treeFn 按 sessionID 取得权威 Agent 树（lazy init）。
 	// 派发前 Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
@@ -289,6 +292,13 @@ func (d *Dispatcher) WithLogger(l *logger.Logger) *Dispatcher {
 // 传 nil 关闭子 Agent 实时事件推送（默认关闭）。
 func (d *Dispatcher) WithLiveEvents(fn func(sessionID string, ev agent.LiveEvent)) *Dispatcher {
 	d.liveFn = fn
+	return d
+}
+
+// WithPersonaInjector 注入人格注入器（soul.Loader），使子 Agent 系统提示词头部带人格前缀，
+// 与 MetaAgent 共享用户级人格。传 nil 关闭人格注入（默认关闭）。
+func (d *Dispatcher) WithPersonaInjector(p agent.PersonaInjector) *Dispatcher {
+	d.persona = p
 	return d
 }
 
@@ -769,7 +779,8 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopCfg).
-		WithWorkDir(d.subAgentWorkDir())
+		WithWorkDir(d.subAgentWorkDir()).
+		WithPersonaInjector(d.persona)
 
 	// 注入会话级日志器：派生 session-scoped logger，使子 Agent LLM I/O 写入同一会话的 session_logs。
 	// sessionID 从 ctx 取（call_sub_agent 异步路径已 WithSessionID），agentName 用 roleDef.Name（DomainAgent 已按任务首行覆写）。
