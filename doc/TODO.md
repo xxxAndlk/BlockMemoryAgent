@@ -79,6 +79,17 @@
    - 回退策略：每层独立开关 `config.shared_memory_invalidation_enabled`（默认 true，当前未加配置开关，行为默认开启；如需关闭可后续加）。Layer 1 入参改 schema 已向后兼容（`files` 可选，缺省退化旧逻辑）。
    - 验证：`GOTOOLCHAIN=local go test ./backend/internal/domain/memory/... ./backend/internal/domain/tool/... ./backend/internal/domain/subagent/... -count=1` 全通过。
 
+10. **已删除的投机性泛化代码（待真正需要时重写）**
+   - 背景：阶段 0-9 累积多处"建了拆、拆了建"的投机性抽象，零引用占位与重叠机制叠加，导致 LLM 派发链路长到不可达、基础任务跑不通。本次清理把已删项的设计思路留档，避免未来重蹈覆辙。
+   - **assembly 包**（`internal/domain/assembly/`，已删）：`Splitter`/`Executor`/`Aggregator` 三接口 + `Assembly` 编排器，按 DAG 拓扑序执行小任务。删除理由：阶段 8 实现后零引用，commit `0969335` 改走 DomainAgent 原生工具权限 + `call_sub_agent` domain 字段方案（DomainAgent 在 ReAct 循环内直接做上下文采集+拆分+派发），未走 `assembly.Run`。重写前提：DomainAgent 方案被证明不足以覆盖跨多 Domain 的并行编排需求。
+   - **verifiers.go 扩展占位**（`internal/domain/verifyloop/verifiers.go` 中 `ComputerUseVerifier`/`CLIVerifier`/`MCPVerifier`，已删）：三占位返回 "not implemented"。删除理由：未实现的接口 = 没需求的抽象。重写前提：`computeruse` 包 / `RunCommand` 工具 / MCP 客户端对应基础设施就绪后，按 `Verifier` 接口契约填入实现（`SelfTest(ctx, produced) -> Verdict` / `UnifiedTest(ctx, produced) -> Verdict`）。
+   - **computeruse 包**（`internal/computeruse/doc.go`，已删）：仅 doc.go 占位。重写前提：浏览器/GUI 自动化需求明确后，按 `Verifier` 接口契约实现。
+   - **实例池**（阶段 7 已删并归档）：`WithReuse`/`servePooled`/`pool`/`IsPooled`/`Stop`/`mailbox.WaitForMessage`/`config.sub_agent_reuse_enabled`/`sub_agent_idle_timeout_sec`。评估结论"实例池引入上下文污染与 Token 激增（原文痛点），收益已被 verifyloop 覆盖"，不可与 verifyloop 共存。重写前提：明确"协程 Agent 常驻共享代码 Agent 记忆"需求且 verifyloop 无法覆盖。
+   - **KV 缓存三套抽象合并为一套**（已合并）：原 `KVMemory`（`domain/memory/kv.go`）+ `SharedMemoryStore`（`domain/tool/shared_memory.go`）+ `Spec`（`domain/tool/spec.go`）三套并存，功能重叠。合并为单一 `SharedMemoryStore` 接口，`Spec` 退化为命名 key `<agentID>:spec`。dispatcher 三路 inject（`injectSpec`/`injectKVMemory`/`injectRecalledMemory`）合并为单路 `buildTaskPrefix`。重写前提：无；合并后抽象足够。
+   - **强制门默认关闭**（已改默认值）：`SpecEnforcementEnabled` 原 default true 改 false；`ReviewEnabled` 原 default true 改 false；`PlanSkipEnabled` 原 default false 改 true（PlanConfirm 阶段整体移除）。理由：默认开启的强制门叠加使 LLM 完成基础任务链路长到不可达（WriteSpec -> call_sub_agent -> 子自测 -> reviewer 审查 -> 上级 unified test -> 终答，任一环节失误即任务失败），且 e2e mock LLM 400 回归阻塞验证。Pipeline 重构后 `SpecEnforcementEnabled` 与 `PlanSkipEnabled` 配置项整体删除（PlanStage 替代 WriteSpec 工具）。
+   - **配置死字段**（已删）：`GraphPolicyConfig`（graph 包已删）/`MemoryPolicyConfig`（assembler 已删）/`LLMRuntimeConfig.RetryCount`/`RetryBackoffMs`/`LLMSoftTimeoutSec`/`LLMHardTimeoutSec`（旧 graph 重试，ReAct 用 `ReactLLMTimeoutSec`）/`FeatureTogglesConfig.PlanEnabled`/`ReflectionEnabled`/`InterruptEnabled`/`QueueInjectEnabled`/`HumanClarify*`（零引用）/`PluginsConfig`（MCP/RAG/ComputerUse 预留未实现）。
+   - 涉及代码：见 git 历史 `feat(cleanup): 删除投机性泛化与重叠抽象` 系列 commit。
+
 ## 已完成（已归档到 git 历史）
 
 - ReAct 主循环骨架（`internal/agent/react_agent.go`）
