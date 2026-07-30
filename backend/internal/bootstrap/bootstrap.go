@@ -251,7 +251,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 文件 MD 格式：frontmatter 含 agent/slot/files mtime（+ spec 的 goal/acceptance/constraints），
 	// body 为人读文本。进程重启后文件保留（当前会话不主动恢复，避免旧 spec 复用）。
 	sharedKV := tool.NewFileSharedMemoryStore(workDir)
-	subAgentDispatcher.WithKVMemory(sharedKV)
+	subAgentDispatcher.WithSharedMemory(sharedKV)
 	// 注入会话级日志器：使子 Agent LLM I/O（完整 prompt/response）写入 session_logs，
 	// 与 MetaAgent 共用同一 sessionLogger 基础实例，子 Agent 运行时按 ctx 派生 session-scoped 视图。
 	subAgentDispatcher.WithLogger(sessionLogger)

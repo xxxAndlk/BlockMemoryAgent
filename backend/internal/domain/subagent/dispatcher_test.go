@@ -207,19 +207,19 @@ func TestInjectRecalledMemory_PurePrefixMode(t *testing.T) {
 	}
 }
 
-// TestAssembleTaskWithDualPrefixes_NoNestedMarker 验证 KV + block memory 双前缀拼装后
-// 只含一个【当前任务】标记，原始任务位于末尾。回归 ui_assistant-5 嵌套事故。
+// TestAssembleTaskWithDualPrefixes_NoNestedMarker 验证 shared memory + block memory 双前缀
+// 拼装后只含一个【当前任务】标记，原始任务位于末尾。回归 ui_assistant-5 嵌套事故。
 func TestAssembleTaskWithDualPrefixes_NoNestedMarker(t *testing.T) {
 	kv := newTestKVMemory(true)
 	_ = kv.Set(context.Background(), "meta:shared", "KV 内容")
 	mock := &mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{{Content: "记忆一"}}}
 	d := NewDispatcher(nil, nil, nil, nil, nil).
-		WithKVMemory(kv).
+		WithSharedMemory(kv).
 		WithBlockMemorySearcher(mock)
 
 	// 模拟 runSubAgentOnce 中的拼装逻辑（直接调用两函数的纯前缀模式）。
 	var prefixes []string
-	if p := d.injectKVMemory(context.Background(), "meta", ""); p != "" {
+	if p := d.buildSharedPrefix(context.Background(), "meta"); p != "" {
 		prefixes = append(prefixes, p)
 	}
 	if p := d.injectRecalledMemory(context.Background(), ""); p != "" {
@@ -231,9 +231,9 @@ func TestAssembleTaskWithDualPrefixes_NoNestedMarker(t *testing.T) {
 	if c := strings.Count(task, "【当前任务】"); c != 1 {
 		t.Fatalf("expected exactly 1 【当前任务】 marker, got %d: %q", c, task)
 	}
-	// 原任务应位于末尾，KV 内容与相关记忆在其前。
+	// 原任务应位于末尾，共享记忆与相关记忆在其前。
 	if !strings.HasPrefix(task, "【共享记忆】") {
-		t.Fatalf("expected KV prefix at start, got: %q", task)
+		t.Fatalf("expected shared memory prefix at start, got: %q", task)
 	}
 	if !strings.Contains(task, "【相关记忆】") {
 		t.Fatalf("expected block-memory prefix, got: %q", task)
@@ -679,22 +679,22 @@ func TestDispatcher_KVMemoryInjection(t *testing.T) {
 	// 主 Agent 写入共享记忆（可写实例）。
 	kv := newTestKVMemory(true)
 	_ = kv.Set(context.Background(), "meta:shared", "project uses Go 1.25")
-	// Dispatcher 注入只读视图。
-	d.WithKVMemory(kv)
+	// Dispatcher 注入共享记忆后端。
+	d.WithSharedMemory(kv)
 
 	// 验证只读实例拒绝写入。
 	if err := newTestKVMemory(false).Set(context.Background(), "k", "v"); err == nil {
 		t.Fatal("read-only KV should reject Set")
 	}
 
-	// ExecuteChild 注入 KV 记忆后执行子 Agent，不 panic 即通过。
+	// ExecuteChild 注入共享记忆后执行子 Agent，不 panic 即通过。
 	_, err := d.ExecuteChild(context.Background(), "meta", "code_assistant", "write a function")
 	if err != nil {
 		t.Fatalf("ExecuteChild: %v", err)
 	}
 }
 
-// testKVMemory 是测试用的 KVMemory 实现，支持可写/只读。
+// testKVMemory 是测试用的 SharedMemoryStore 实现，支持可写/只读。
 type testKVMemory struct {
 	items    map[string]string
 	writable bool
@@ -724,7 +724,7 @@ func (m *testKVMemory) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// Keys 返回当前内存中所有键的快照，实现 KVMemoryReader.Keys。
+// Keys 返回当前内存中所有键的快照，实现 SharedMemoryStore.Keys。
 func (m *testKVMemory) Keys(ctx context.Context) []string {
 	keys := make([]string, 0, len(m.items))
 	for k := range m.items {
@@ -733,10 +733,9 @@ func (m *testKVMemory) Keys(ctx context.Context) []string {
 	return keys
 }
 
-// TestInjectKVMemory_Layer3StaleDetection 验证 Layer 3：KV value 为 SharedEntry JSON 时，
-// injectKVMemory 解析后 stat 各 path mtime，不匹配（文件被改）丢弃 KV 降级 fresh read。
-// 旧格式（纯字符串）直接用，向后兼容。
-func TestInjectKVMemory_Layer3StaleDetection(t *testing.T) {
+// TestBuildSharedPrefix_Layer3StaleDetection 验证 Layer 3：MD frontmatter mtime 不匹配
+// （文件被改）时丢弃该槽位降级 fresh read。旧格式（纯字符串）直接用，向后兼容。
+func TestBuildSharedPrefix_Layer3StaleDetection(t *testing.T) {
 	// 准备临时文件并记录初始 mtime。
 	dir := t.TempDir()
 	target := filepath.Join(dir, "stale.go")
@@ -746,38 +745,33 @@ func TestInjectKVMemory_Layer3StaleDetection(t *testing.T) {
 	fi, _ := os.Stat(target)
 	origMtime := fi.ModTime().Unix()
 
-	// 构造 dispatcher（不需要真实 provider，只测 injectKVMemory 纯函数行为）。
+	// 构造 dispatcher（不需要真实 provider，只测 buildSharedPrefix 纯函数行为）。
 	d := &Dispatcher{}
 
 	// Case 1: MD frontmatter mtime 匹配 -> 拼接 body 前缀。
 	kv := newTestKVMemory(true)
 	md := tool.EncodeSharedMD("meta", "shared", map[string]int64{target: origMtime}, "stale.go is v1")
 	_ = kv.Set(context.Background(), "meta:shared", md)
-	d.WithKVMemory(kv)
+	d.WithSharedMemory(kv)
 
-	got := d.injectKVMemory(context.Background(), "meta", "do task")
+	got := d.buildSharedPrefix(context.Background(), "meta")
 	if !strings.Contains(got, "stale.go is v1") {
-		t.Fatalf("expected KV content injected, got: %q", got)
+		t.Fatalf("expected shared content injected, got: %q", got)
 	}
-	if !strings.Contains(got, "do task") {
-		t.Fatalf("expected task preserved, got: %q", got)
+	if !strings.Contains(got, "【共享记忆】") {
+		t.Fatalf("expected shared memory marker, got: %q", got)
 	}
 
-	// Case 2: 文件被改，mtime 不匹配 -> 丢弃 KV，降级 fresh read。
-	// 改 mtime：写新内容并 SetModTime 确保 mtime 变化。
+	// Case 2: 文件被改，mtime 不匹配 -> 丢弃该槽位。
 	if err := os.WriteFile(target, []byte("v2"), 0644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
-	// 强制 mtime 与 origMtime 不同（避免同秒写入 mtime 未变）。
 	newTime := time.Now().Add(5 * time.Second)
 	_ = os.Chtimes(target, newTime, newTime)
 
-	got2 := d.injectKVMemory(context.Background(), "meta", "do task")
+	got2 := d.buildSharedPrefix(context.Background(), "meta")
 	if strings.Contains(got2, "stale.go is v1") {
-		t.Fatalf("expected stale KV discarded, got: %q", got2)
-	}
-	if !strings.Contains(got2, "do task") {
-		t.Fatalf("expected task preserved after stale discard, got: %q", got2)
+		t.Fatalf("expected stale shared discarded, got: %q", got2)
 	}
 	if strings.Contains(got2, "【共享记忆】") {
 		t.Fatalf("expected no shared memory prefix for stale entry, got: %q", got2)
@@ -787,32 +781,33 @@ func TestInjectKVMemory_Layer3StaleDetection(t *testing.T) {
 	kvOld := newTestKVMemory(true)
 	_ = kvOld.Set(context.Background(), "meta:shared", "legacy plain summary")
 	dOld := &Dispatcher{}
-	dOld.WithKVMemory(kvOld)
+	dOld.WithSharedMemory(kvOld)
 
-	got3 := dOld.injectKVMemory(context.Background(), "meta", "do task")
+	got3 := dOld.buildSharedPrefix(context.Background(), "meta")
 	if !strings.Contains(got3, "legacy plain summary") {
 		t.Fatalf("expected legacy content used as-is, got: %q", got3)
 	}
 }
 
-// TestInjectKVMemory_NoFilesSkipsStatCheck 验证 Layer 3 边界：frontmatter files 为空时
+// TestBuildSharedPrefix_NoFilesSkipsStatCheck 验证 Layer 3 边界：frontmatter files 为空时
 // 跳过 stat 校验（无 path 需校验），body 直接拼接。
-func TestInjectKVMemory_NoFilesSkipsStatCheck(t *testing.T) {
+func TestBuildSharedPrefix_NoFilesSkipsStatCheck(t *testing.T) {
 	d := &Dispatcher{}
 	kv := newTestKVMemory(true)
 	md := tool.EncodeSharedMD("meta", "shared", nil, "pure conclusion no files")
 	_ = kv.Set(context.Background(), "meta:shared", md)
-	d.WithKVMemory(kv)
+	d.WithSharedMemory(kv)
 
-	got := d.injectKVMemory(context.Background(), "meta", "do task")
+	got := d.buildSharedPrefix(context.Background(), "meta")
 	if !strings.Contains(got, "pure conclusion no files") {
 		t.Fatalf("expected content injected when Files empty, got: %q", got)
 	}
 }
 
-// TestInjectSpec_RendersPrefix 验证 injectSpec 把 parentID:spec 渲染为【任务规范】前缀。
-// spec 存在且新鲜时返回前缀；缺失/stale/解析失败时返回空串。
-func TestInjectSpec_RendersPrefix(t *testing.T) {
+// TestBuildSharedPrefix_RendersSpecAndShared 验证 buildSharedPrefix 同时渲染 spec 槽位与
+// 自由槽位：spec 渲染为【任务规范】，自由槽位渲染为【共享记忆】。
+// spec 缺失/stale/解析失败时仅返回【共享记忆】段；两者皆空时返回空串。
+func TestBuildSharedPrefix_RendersSpecAndShared(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "game.js")
 	if err := os.WriteFile(target, []byte("var x = 1"), 0644); err != nil {
@@ -821,7 +816,7 @@ func TestInjectSpec_RendersPrefix(t *testing.T) {
 	fi, _ := os.Stat(target)
 	mtime := fi.ModTime().Unix()
 
-	// Case 1: spec 存在且新鲜 -> 渲染前缀。
+	// Case 1: spec + 自由槽位共存 -> 两段前缀都渲染。
 	kv := newTestKVMemory(true)
 	spec := tool.Spec{
 		Goal:        "canvas 宽度改为 1280",
@@ -831,10 +826,11 @@ func TestInjectSpec_RendersPrefix(t *testing.T) {
 	}
 	md := tool.EncodeSpecMD("meta", spec, map[string]int64{target: mtime})
 	_ = kv.Set(context.Background(), "meta:spec", md)
+	_ = kv.Set(context.Background(), "meta:shared", "project context summary")
 
 	d := &Dispatcher{}
-	d.WithKVMemory(kv)
-	got := d.injectSpec(context.Background(), "meta")
+	d.WithSharedMemory(kv)
+	got := d.buildSharedPrefix(context.Background(), "meta")
 	if !strings.Contains(got, "【任务规范】") {
 		t.Fatalf("expected spec prefix marker, got: %q", got)
 	}
@@ -844,22 +840,42 @@ func TestInjectSpec_RendersPrefix(t *testing.T) {
 	if !strings.Contains(got, "node -c game.js 通过") {
 		t.Fatalf("expected acceptance in prefix, got: %q", got)
 	}
-	if !strings.Contains(got, "不碰其他配置") {
-		t.Fatalf("expected constraint in prefix, got: %q", got)
+	if !strings.Contains(got, "【共享记忆】") {
+		t.Fatalf("expected shared memory marker, got: %q", got)
+	}
+	if !strings.Contains(got, "project context summary") {
+		t.Fatalf("expected shared content in prefix, got: %q", got)
 	}
 
-	// Case 2: 缺失 spec -> 空串。
+	// Case 2: 缺失 spec -> 仅返回【共享记忆】段。
 	d2 := &Dispatcher{}
-	d2.WithKVMemory(newTestKVMemory(true))
-	if got := d2.injectSpec(context.Background(), "meta"); got != "" {
-		t.Fatalf("expected empty when spec missing, got: %q", got)
+	kv2 := newTestKVMemory(true)
+	_ = kv2.Set(context.Background(), "meta:shared", "only shared")
+	d2.WithSharedMemory(kv2)
+	got2 := d2.buildSharedPrefix(context.Background(), "meta")
+	if strings.Contains(got2, "【任务规范】") {
+		t.Fatalf("expected no spec marker when missing, got: %q", got2)
+	}
+	if !strings.Contains(got2, "only shared") {
+		t.Fatalf("expected shared content, got: %q", got2)
 	}
 
-	// Case 3: stale（文件被改 mtime 不匹配）-> 空串。
+	// Case 3: 完全无槽位 -> 空串。
+	d3 := &Dispatcher{}
+	d3.WithSharedMemory(newTestKVMemory(true))
+	if got3 := d3.buildSharedPrefix(context.Background(), "meta"); got3 != "" {
+		t.Fatalf("expected empty when no slots, got: %q", got3)
+	}
+
+	// Case 4: spec stale（文件被改 mtime 不匹配）-> 跳过 spec 段。
 	newTime := time.Now().Add(5 * time.Second)
 	_ = os.Chtimes(target, newTime, newTime)
-	if got := d.injectSpec(context.Background(), "meta"); got != "" {
-		t.Fatalf("expected empty when spec stale, got: %q", got)
+	got4 := d.buildSharedPrefix(context.Background(), "meta")
+	if strings.Contains(got4, "【任务规范】") {
+		t.Fatalf("expected no spec marker when stale, got: %q", got4)
+	}
+	if !strings.Contains(got4, "project context summary") {
+		t.Fatalf("expected shared content still present, got: %q", got4)
 	}
 }
 
@@ -880,14 +896,14 @@ func TestHasFreshSpec(t *testing.T) {
 	md := tool.EncodeSpecMD("meta", spec, map[string]int64{target: mtime})
 	_ = kv.Set(context.Background(), "meta:spec", md)
 	d := &Dispatcher{}
-	d.WithKVMemory(kv)
+	d.WithSharedMemory(kv)
 	if !d.hasFreshSpec(context.Background(), "meta") {
 		t.Fatal("expected hasFreshSpec=true for valid spec")
 	}
 
 	// Case 2: spec 缺失 -> false。
 	d2 := &Dispatcher{}
-	d2.WithKVMemory(newTestKVMemory(true))
+	d2.WithSharedMemory(newTestKVMemory(true))
 	if d2.hasFreshSpec(context.Background(), "meta") {
 		t.Fatal("expected hasFreshSpec=false when spec missing")
 	}
@@ -898,7 +914,7 @@ func TestHasFreshSpec(t *testing.T) {
 	kv3 := newTestKVMemory(true)
 	_ = kv3.Set(context.Background(), "meta:spec", md3)
 	d3 := &Dispatcher{}
-	d3.WithKVMemory(kv3)
+	d3.WithSharedMemory(kv3)
 	if d3.hasFreshSpec(context.Background(), "meta") {
 		t.Fatal("expected hasFreshSpec=false when acceptance empty")
 	}

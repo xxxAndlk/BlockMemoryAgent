@@ -99,11 +99,12 @@ type Dispatcher struct {
 	// 为 nil 时关闭钩子；仅在 call_sub_agent 异步路径触发，ExecuteChild 同步路径不触发。
 	onSubAgentDone SubAgentDoneHandler
 
-	// kvMemory 是可选的键值对共享记忆（只读视图），供"协程 Agent 共享主 Agent 记忆"语义使用。
-	// 子 Agent 派发时按 kvKey 读取共享记忆注入任务前缀，使被询问协程能看到主 Agent 的关键记忆。
-	// 为 nil 时关闭共享记忆注入，不影响派发主流程。写入由主线程 Agent 直接持可写 KVMemory 完成。
-	// 同一 KV 后端还承载 WriteSpec 工具写入的 "parentID:spec" 槽位（injectSpec 读取）。
-	kvMemory KVMemoryReader
+	// sharedMem 是共享记忆的只读视图（tool.SharedMemoryStore 接口的子集），
+	// 供子 Agent 派发时读取主 Agent 写入的关键上下文与任务规范。
+	// 为 nil 时关闭共享记忆注入，不影响派发主流程。
+	// 写入由主线程 Agent 直接通过 WriteSharedMemory/WriteSpec 工具完成，不经 Dispatcher。
+	// 同一后端承载两类槽位：自由槽位（WriteSharedMemory）与固定 spec 槽位（WriteSpec）。
+	sharedMem tool.SharedMemoryStore
 
 	// specEnforcementEnabled 派发方调用 call_sub_agent 前是否强制先写 WriteSpec。
 	// 为 true 时 Execute 入口校验 parentID:spec 存在且新鲜（Spec.Goal 非空 + 至少一条 Acceptance），
@@ -651,37 +652,11 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 
 	// 保留原始任务文本，供块记忆沉淀时作为 goal 标签使用（避免混入召回前缀）。
 	origTask := task
-	// 上下文前缀注入：KV 共享记忆 + 块记忆召回。两段独立前缀统一拼装，避免嵌套
+	// 上下文前缀注入：共享记忆（spec + 自由槽位）+ 块记忆召回。两段独立前缀统一拼装，避免嵌套
 	// 【当前任务】标记（实证：嵌套后 UI 助手把 KV 内容当作任务主体，空转 16 分钟）。
 	var prefixes []string
-	if spec := d.injectSpec(ctx, parentID); spec != "" {
-		prefixes = append(prefixes, spec)
-		log.Printf("[subagent] inject spec: sub=%s role=%s parent=%s", subAgentID, roleDef.ID, parentID)
-	}
-	if kv := d.injectKVMemory(ctx, parentID, ""); kv != "" {
-		prefixes = append(prefixes, kv)
-		// 枚举所有 parentID: 前缀键统计槽位数与总长度，避免只查 :shared 误导
-		// （MetaAgent 用命名槽位 key=xxx 写入时 :shared 为空，但 injectKVMemory 仍能读到命名槽位）。
-		prefix := parentID + ":"
-		slotCount, totalLen, preview, slotNames := 0, 0, "", []string{}
-		for _, k := range d.kvMemory.Keys(ctx) {
-			if !strings.HasPrefix(k, prefix) || k == prefix {
-				continue
-			}
-			val, err := d.kvMemory.Get(ctx, k)
-			if err != nil || strings.TrimSpace(val) == "" {
-				continue
-			}
-			slotCount++
-			totalLen += len(val)
-			slotName := strings.TrimPrefix(k, prefix)
-			slotNames = append(slotNames, slotName)
-			if len(val) > len(preview) {
-				preview = val
-			}
-		}
-		log.Printf("[subagent] inject kv-memory: sub=%s role=%s parent=%s slots=%d total_len=%d slot_names=%v preview=%q",
-			subAgentID, roleDef.ID, parentID, slotCount, totalLen, slotNames, truncateRunes(strings.TrimSpace(preview), 300))
+	if sp := d.buildSharedPrefix(ctx, parentID); sp != "" {
+		prefixes = append(prefixes, sp)
 	}
 	if bm := d.injectRecalledMemory(ctx, ""); bm != "" {
 		prefixes = append(prefixes, bm)
@@ -785,81 +760,128 @@ func (d *Dispatcher) SetOnSubAgentDone(h SubAgentDoneHandler) {
 	d.onSubAgentDone = h
 }
 
-// KVMemoryReader 是键值对共享记忆的窄接口（仅读），由 domain/memory.InMemoryKV 等实现。
-// 用窄接口避免 subagent 反向依赖 domain/memory 包（memory 是更底层包）。
-// 写入由主线程 Agent 直接持 *memory.InMemoryKV（可写实例）完成，不经 Dispatcher。
-type KVMemoryReader interface {
-	// Get 按键读取记忆值，不存在返回空串与 nil error。
-	Get(ctx context.Context, key string) (string, error)
-	// Keys 返回当前内存中所有键的快照，供 injectKVMemory 枚举某父 Agent 的全部命名槽位。
-	// 实现方应保证不持锁调用外部代码，避免死锁。
-	Keys(ctx context.Context) []string
-}
-
-// kvMemoryKeyPrefix 是共享记忆注入任务前缀时的标记，便于子 Agent 区分"共享记忆"与"当前任务"。
-const kvMemoryKeyPrefix = "【共享记忆】\n"
-
 // specPrefixMarker 是任务规范注入任务前缀时的标记，便于子 Agent 区分"任务规范"与"当前任务"。
-// 与 kvMemoryKeyPrefix 同语义，独立标记便于子 Agent 在日志/UI 中辨识。
 const specPrefixMarker = "【任务规范】\n"
 
-// injectSpec 读取 parentID:spec 槽位的 MD，解析 frontmatter 取 Spec 字段后渲染为前缀文本。
+// sharedPrefixMarker 是共享记忆注入任务前缀时的标记，便于子 Agent 区分"共享记忆"与"当前任务"。
+const sharedPrefixMarker = "【共享记忆】\n"
+
+// specSlotName 是 WriteSpec 写入的固定 slot 名，与 tool.SpecSlot 保持一致。
+const specSlotName = "spec"
+
+// specMirror 是 tool.Spec 的本地镜像，避免 subagent 反向 import tool 包。
+// 字段名与 JSON tag 必须与 tool.Spec 保持一致。
+type specMirror struct {
+	Goal        string   `json:"goal"`
+	Acceptance  []string `json:"acceptance,omitempty"`
+	Constraints []string `json:"constraints,omitempty"`
+	Files       []string `json:"files,omitempty"`
+}
+
+// buildSharedPrefix 读取 parentID 下所有共享记忆槽位，渲染为【任务规范】+【共享记忆】前缀。
 // 缺失/stale/解析失败时返回空串（graceful degrade，不阻塞派发主流程）。
-// 校验逻辑与 injectKVMemory 一致：verifyFileMtimes 任一不匹配视为 stale。
 //
-// 渲染格式：
-//   【任务规范】
-//   目标: ...
-//   验收:
-//     - ...
-//   约束:
-//     - ...
-//   涉及文件:
-//     - ...
+// 槽位两类：
+//   - spec 槽位（"<parentID>:spec"）：WriteSpec 写入，MD frontmatter 含 goal/acceptance/constraints/files。
+//     渲染为【任务规范】段，files mtime 校验失败视为 stale 跳过。
+//   - 自由槽位（"<parentID>:<key>"，key != spec）：WriteSharedMemory 写入，MD body 为 content。
+//     渲染为【共享记忆】段，files mtime 校验失败跳过。
 //
-// task 为空时返回纯前缀（不含【当前任务】标记），供 runSubAgentOnce 统一拼装多段前缀。
-func (d *Dispatcher) injectSpec(ctx context.Context, parentID string) string {
-	if d.kvMemory == nil {
+// 返回纯前缀（不含【当前任务】标记），供 runSubAgentOnce 统一拼装多段前缀避免嵌套。
+func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID string) string {
+	if d.sharedMem == nil {
 		return ""
 	}
-	key := parentID + ":" + specSlotName
-	val, err := d.kvMemory.Get(ctx, key)
-	if err != nil || strings.TrimSpace(val) == "" {
+	prefix := parentID + ":"
+	var specPart, sharedParts []string
+	slotCount, totalLen := 0, 0
+	slotNames := []string{}
+	for _, k := range d.sharedMem.Keys(ctx) {
+		if !strings.HasPrefix(k, prefix) || k == prefix {
+			continue
+		}
+		val, err := d.sharedMem.Get(ctx, k)
+		if err != nil || strings.TrimSpace(val) == "" {
+			continue
+		}
+		slotCount++
+		totalLen += len(val)
+		slotName := strings.TrimPrefix(k, prefix)
+		slotNames = append(slotNames, slotName)
+
+		fm, body, ok := tool.DecodeSharedMD(val)
+		if !ok {
+			// 旧格式（无 frontmatter 的纯字符串）：直接当共享内容用，向后兼容。
+			if slotName == specSlotName {
+				continue
+			}
+			sharedParts = append(sharedParts, val)
+			continue
+		}
+		// Layer 3 mtime 校验：任一 file stat 不匹配视为 stale，丢弃避免子 Agent 读旧摘要。
+		if !verifyFileMtimes(fm.Files) {
+			continue
+		}
+		if slotName == specSlotName {
+			// spec 槽位需 goal + 至少一条 acceptance 才视为合法规范。
+			if strings.TrimSpace(fm.Goal) == "" || len(fm.Acceptance) == 0 {
+				continue
+			}
+			files := make([]string, 0, len(fm.Files))
+			for fp := range fm.Files {
+				files = append(files, fp)
+			}
+			specPart = []string{renderSpecPrefix(specMirror{
+				Goal:        fm.Goal,
+				Acceptance:  fm.Acceptance,
+				Constraints: fm.Constraints,
+				Files:       files,
+			})}
+			continue
+		}
+		sharedParts = append(sharedParts, body)
+	}
+	if len(specPart) == 0 && len(sharedParts) == 0 {
 		return ""
 	}
-	fm, _, ok := tool.DecodeSharedMD(val)
-	if !ok {
-		return ""
+	log.Printf("[subagent] inject shared-memory: parent=%s slots=%d total_len=%d slot_names=%v spec=%v shared=%d",
+		parentID, slotCount, totalLen, slotNames, len(specPart) > 0, len(sharedParts))
+
+	// 风险兜底：有共享槽位但缺 file_tree slot 时，注入提示让首个探索者写入供后续兄弟 Agent 复用。
+	hasFileTree := false
+	for _, name := range slotNames {
+		if name == "file_tree" {
+			hasFileTree = true
+			break
+		}
 	}
-	// Layer 3 mtime 校验：任一 file stat 不匹配视为 stale，丢弃避免子 Agent 读旧规范。
-	if !verifyFileMtimes(fm.Files) {
-		return ""
+	if len(sharedParts) > 0 && !hasFileTree {
+		log.Printf("[subagent] shared-memory missing file_tree: parent=%s - injecting exploration hint", parentID)
+		sharedParts = append(sharedParts, "【项目结构未知】共享记忆缺 file_tree slot。请用 ListDir 扫项目结构 + ReadFile 抽签名，WriteSharedMemory(key=\"file_tree\", files=[只读参照文件]) 写入紧凑树供后续兄弟 Agent 复用。")
 	}
-	if strings.TrimSpace(fm.Goal) == "" || len(fm.Acceptance) == 0 {
-		return ""
+
+	var parts []string
+	parts = append(parts, specPart...)
+	if len(sharedParts) > 0 {
+		joined := strings.Join(sharedParts, "\n\n---\n\n")
+		// 共享前缀长度上限：防极端情况（如规格全文塞 KV）撑爆；超限截断尾部并标提示。
+		const sharedPrefixMaxRunes = 30000
+		if r := []rune(joined); len(r) > sharedPrefixMaxRunes {
+			joined = string(r[:sharedPrefixMaxRunes]) + "\n\n…（共享记忆超过 30KB 上限，已截断尾部；完整规格请用 ReadFile 读取相关文件）"
+		}
+		parts = append(parts, sharedPrefixMarker+joined)
 	}
-	// Files 从 frontmatter mtime map 的键取（绝对路径），渲染"涉及文件"段。
-	// frontmatter 不单独存 Files 列表，避免重复；mtime map 的键即为涉及文件集合。
-	files := make([]string, 0, len(fm.Files))
-	for fp := range fm.Files {
-		files = append(files, fp)
-	}
-	return renderSpecPrefix(specMirror{
-		Goal:        fm.Goal,
-		Acceptance:  fm.Acceptance,
-		Constraints: fm.Constraints,
-		Files:       files,
-	})
+	return strings.TrimRight(strings.Join(parts, "\n\n"), "\n")
 }
 
 // hasFreshSpec 校验 parentID:spec 是否存在且新鲜（Spec.Goal 非空 + 至少一条 Acceptance + files mtime 一致）。
 // 供 callSubAgentTool.Execute 在 SpecEnforcementEnabled 开启时调用，缺失则拒绝派发。
 func (d *Dispatcher) hasFreshSpec(ctx context.Context, parentID string) bool {
-	if d.kvMemory == nil {
+	if d.sharedMem == nil {
 		return false
 	}
 	key := parentID + ":" + specSlotName
-	val, err := d.kvMemory.Get(ctx, key)
+	val, err := d.sharedMem.Get(ctx, key)
 	if err != nil || strings.TrimSpace(val) == "" {
 		return false
 	}
@@ -874,7 +896,6 @@ func (d *Dispatcher) hasFreshSpec(ctx context.Context, parentID string) bool {
 }
 
 // renderSpecPrefix 把 Spec 渲染为【任务规范】前缀文本。
-// 抽出独立函数便于 injectSpec 与单元测试复用。
 func renderSpecPrefix(s specMirror) string {
 	var b strings.Builder
 	b.WriteString(specPrefixMarker)
@@ -908,19 +929,6 @@ func renderSpecPrefix(s specMirror) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// specSlotName 是 WriteSpec 写入 KV 的固定 slot 名，与 tool.SpecSlot 保持一致。
-// 独立常量避免 subagent 反向 import tool 包。
-const specSlotName = "spec"
-
-// specMirror 是 tool.Spec 的本地镜像，避免 subagent 反向 import tool 包。
-// 字段名与 JSON tag 必须与 tool.Spec 保持一致。
-type specMirror struct {
-	Goal        string   `json:"goal"`
-	Acceptance  []string `json:"acceptance,omitempty"`
-	Constraints []string `json:"constraints,omitempty"`
-	Files       []string `json:"files,omitempty"`
-}
-
 // subAgentWorkDir 返回子 Agent 的工作目录，从工具注册表取，供 ReActAgent 注入系统提示词。
 // 为空时 ReActAgent 回退到进程 cwd。
 func (d *Dispatcher) subAgentWorkDir() string {
@@ -930,10 +938,11 @@ func (d *Dispatcher) subAgentWorkDir() string {
 	return d.tools.WorkDir()
 }
 
-// WithKVMemory 注入只读 KV 共享记忆视图，使子 Agent 派发时能读取主 Agent 写入的关键记忆。
+// WithSharedMemory 注入共享记忆后端（tool.SharedMemoryStore），使子 Agent 派发时能读取
+// 主 Agent 通过 WriteSharedMemory/WriteSpec 工具写入的关键上下文与任务规范。
 // 传 nil 关闭共享记忆注入（默认）。
-func (d *Dispatcher) WithKVMemory(r KVMemoryReader) *Dispatcher {
-	d.kvMemory = r
+func (d *Dispatcher) WithSharedMemory(r tool.SharedMemoryStore) *Dispatcher {
+	d.sharedMem = r
 	return d
 }
 
@@ -1001,89 +1010,6 @@ func (d *Dispatcher) injectRecalledMemory(ctx context.Context, task string) stri
 	sb.WriteString("\n【当前任务】\n")
 	sb.WriteString(task)
 	return sb.String()
-}
-
-// injectKVMemory 按 parentID 派生键读取主 Agent 写入的 KV 共享记忆，拼到任务前。
-// 未配置 kvMemory、键不存在或读取出错时返回原 task，保证派发主流程不受影响。
-//
-// 键枚举：父 Agent 可用 WriteSharedMemory 写多个命名槽位（key 参数），存储为 "parentID:<key>"。
-// 默认 key="shared"，即旧 "parentID:shared"。本函数枚举所有 "parentID:" 前缀的键，
-// 按 key 字典序拼装前缀，子 Agent 一次看到全部命名槽位。
-//
-// task 为空时返回纯前缀（不含【当前任务】标记），供调用方统一拼装；非空时按旧逻辑
-// 返回完整 "前缀 + 【当前任务】 + task"（向后兼容 TestInjectKVMemory_*）。
-//
-// 缓存一致性（Layer 3）：value 为 SharedEntry JSON 时，stat 各 path 对比 mtime，
-// 任一不匹配（文件被改过）丢弃该槽位，防子 Agent 读到旧摘要幻觉。
-// 旧格式 value（纯字符串 content）直接用，向后兼容。
-func (d *Dispatcher) injectKVMemory(ctx context.Context, parentID, task string) string {
-	if d.kvMemory == nil {
-		return task
-	}
-	// 枚举所有 parentID: 前缀的键，按字典序稳定拼装。
-	prefix := parentID + ":"
-	var slots []string
-	for _, k := range d.kvMemory.Keys(ctx) {
-		if !strings.HasPrefix(k, prefix) {
-			continue
-		}
-		// 跳过空槽位名（理论上不会出现，防御性）。
-		if k == prefix {
-			continue
-		}
-		val, err := d.kvMemory.Get(ctx, k)
-		if err != nil || strings.TrimSpace(val) == "" {
-			continue
-		}
-		// 解析 MD：frontmatter 含 files mtime，body 为 content。
-		fm, body, ok := tool.DecodeSharedMD(val)
-		if !ok {
-			// 旧格式（无 frontmatter 的纯字符串）：直接用，向后兼容。
-			slots = append(slots, val)
-			continue
-		}
-		// stat 校验各 path mtime（Layer 3）：任一不匹配丢弃该槽位。
-		if !verifyFileMtimes(fm.Files) {
-			continue
-		}
-		slots = append(slots, body)
-	}
-	// 风险 3 兜底：slots 非空但缺 file_tree slot 时，注入提示让首个探索者写入供后续兄弟 Agent 复用。
-	// 实证：首个 DomainAgent 探索超时或漏写 file_tree -> 后续 Agent 全盲各自探索 -> 重蹈覆辙。
-	// slots 为空时（KV 完全无内容）不注入提示，保持原行为：返回纯 task 无前缀。
-	if len(slots) == 0 {
-		return task
-	}
-	hasFileTree := false
-	for _, k := range d.kvMemory.Keys(ctx) {
-		if strings.HasSuffix(k, ":file_tree") {
-			hasFileTree = true
-			break
-		}
-	}
-	kvJoined := strings.Join(slots, "\n\n---\n\n")
-	if !hasFileTree {
-		log.Printf("[subagent] kv-memory missing file_tree: parent=%s slots=%d - injecting exploration hint",
-			parentID, len(slots))
-		kvJoined += "\n\n【项目结构未知】共享记忆缺 file_tree slot。请用 ListDir 扫项目结构 + ReadFile 抽签名，WriteSharedMemory(key=\"file_tree\", files=[只读参照文件]) 写入紧凑树供后续兄弟 Agent 复用。树格式见 DomainAgent 提示词。"
-	}
-	// KV 前缀长度上限：实证塔防任务 12 slots 共 15KB 淹没 task 正文（84 字符），
-	// 子 Agent 注意力丢失 task。但模型上下文 256K-1M，30KB 前缀可接受。
-	// 上限 30KB 防止极端情况（如规格全文塞 KV）撑爆；超限截断尾部并标提示。
-	const kvPrefixMaxRunes = 30000
-	if r := []rune(kvJoined); len(r) > kvPrefixMaxRunes {
-		kvJoined = string(r[:kvPrefixMaxRunes]) + "\n\n…（KV 共享记忆超过 30KB 上限，已截断尾部；完整规格请用 ReadFile 读取相关文件）"
-	}
-	return buildKVPrefix(kvJoined, task)
-}
-
-// buildKVPrefix 拼装 KV 前缀。task 非空时附【当前任务】标记，task 为空时仅返回前缀。
-// 拆出独立函数使调用方可在 task="" 时取得纯前缀，统一拼装多段前缀避免嵌套。
-func buildKVPrefix(kvContent, task string) string {
-	if task == "" {
-		return strings.TrimRight(kvMemoryKeyPrefix+kvContent, "\n")
-	}
-	return kvMemoryKeyPrefix + kvContent + "\n\n【当前任务】\n" + task
 }
 
 // verifyFileMtimes 校验各 path 当前 mtime 与 frontmatter 中记录的是否一致。
