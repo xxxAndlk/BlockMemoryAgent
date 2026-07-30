@@ -460,44 +460,6 @@ func (c *customReporter) Report(req Request, result Result) {
 	c.lastResult = result
 }
 
-// TestComputerUseVerifier_NotImplemented 验证扩展验证器口子存在且未实现，
-// 确保后续接入 computeruse 包时有明确实现点。
-func TestComputerUseVerifier_NotImplemented(t *testing.T) {
-	cv := &ComputerUseVerifier{}
-	v, err := cv.SelfTest(context.Background(), Request{}, "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if v.Passed {
-		t.Fatal("ComputerUseVerifier.SelfTest should not pass before implementation")
-	}
-	if !strings.Contains(v.Reason, "not implemented") {
-		t.Fatalf("reason should mention not implemented, got: %s", v.Reason)
-	}
-}
-
-func TestCLIVerifier_NotImplemented(t *testing.T) {
-	cv := &CLIVerifier{SelfTestCmd: "go test ./...", UnifiedCmd: "go build ./..."}
-	v, err := cv.SelfTest(context.Background(), Request{}, "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if v.Passed {
-		t.Fatal("CLIVerifier.SelfTest should not pass before implementation")
-	}
-}
-
-func TestMCPVerifier_NotImplemented(t *testing.T) {
-	mv := &MCPVerifier{SelfTestTool: "unit_test", UnifiedTestTool: "integration_test"}
-	v, err := mv.SelfTest(context.Background(), Request{}, "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if v.Passed {
-		t.Fatal("MCPVerifier.SelfTest should not pass before implementation")
-	}
-}
-
 // TestOrchestrator_PlanConfirm_Pass 验证 Verifier 实现 PlanConfirmVerifier 时
 // 引擎在 SelfTest 前调用 PlanConfirm，通过后进 SelfTest。
 func TestOrchestrator_PlanConfirm_Pass(t *testing.T) {

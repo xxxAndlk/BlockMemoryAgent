@@ -1,11 +1,10 @@
 package verifyloop
 
-// verifiers.go 提供 Verifier/Fixer/Reporter 接口的默认实现（Agent 驱动）与
-// 后续扩展实现的接口契约口子（ComputerUse / CLI / MCP）。
+// verifiers.go 提供 Verifier/Fixer/Reporter 接口的默认实现（Agent 驱动）。
 //
 // 设计意图：编排器引擎（Orchestrator）只消费接口，具体验证方式可插拔。
-// 默认实现覆盖当前"派发测试 Agent + 派发编码 Agent + 邮箱上报"主路径；
-// 扩展实现留接口契约与 TODO 标注，待 computeruse 包 / RunCommand 工具 / MCP 客户端就绪后填入。
+// 默认实现覆盖当前"派发测试 Agent + 派发编码 Agent + 邮箱上报"主路径。
+// 扩展验证器（ComputerUse/CLI/MCP）待对应基础设施就绪后按 Verifier 接口契约填入。
 
 import (
 	"context"
@@ -194,89 +193,9 @@ func (r *MailboxReporter) Report(req Request, result Result) {
 	})
 }
 
-// ---- 扩展实现口子：ComputerUse / CLI / MCP ----
-//
-// 以下类型留作后续接入点，当前未实现具体逻辑。编排器引擎通过接口消费，
-// 填入实现后即可替换 AgentVerifier，无需改 Orchestrator。
-
-// ComputerUseVerifier 通过 computer use（模拟点击/截图对比/UI 交互）验证产出。
-// 接入点：internal/computeruse 包就绪后，实现 SelfTest/UnifiedTest 调用其能力。
-//
-// TODO（computeruse 接入后填入）:
-//   - SelfTest：对产出（如前端代码）启动 headless 浏览器，渲染后截图对比基线，
-//     返回 Verdict{Passed: 截图相似度>=阈值, Detail: 截图描述+diff}。
-//   - UnifiedTest：跨页面交互回归（登录->下单->退出），断言关键路径无异常。
-type ComputerUseVerifier struct {
-	// Driver 是 computer use 驱动接口，待 computeruse 包定义后注入。
-	// Driver computeruse.Driver
-}
-
-// SelfTest TODO: 接入 computeruse 包后实现。
-func (c *ComputerUseVerifier) SelfTest(ctx context.Context, req Request, produced string) (Verdict, error) {
-	return Verdict{Passed: false, Reason: "ComputerUseVerifier not implemented yet"}, nil
-}
-
-// UnifiedTest TODO: 接入 computeruse 包后实现。
-func (c *ComputerUseVerifier) UnifiedTest(ctx context.Context, req Request, produced string) (Verdict, error) {
-	return Verdict{Passed: false, Reason: "ComputerUseVerifier not implemented yet"}, nil
-}
-
-// CLIVerifier 通过运行 CLI 命令并断言退出码/输出验证产出。
-// 接入点：复用 domain/tool.Executor 的 RunCommand 能力，或直接 exec.Command。
-//
-// TODO（接入后填入）:
-//   - SelfTest：跑 `go test ./...` / `pytest` 等，退出码 0 为通过，非 0 失败附 stdout。
-//   - UnifiedTest：跑 `go build ./...` + `go vet` + 集成测试套件。
-type CLIVerifier struct {
-	// WorkDir 是命令执行工作目录。
-	WorkDir string
-	// SelfTestCmd 是自测命令（如 "go test ./..."）。
-	SelfTestCmd string
-	// UnifiedCmd 是上级统一测试命令（如 "go build ./... && go vet ./..."）。
-	UnifiedCmd string
-}
-
-// SelfTest TODO: 接入 exec/Executor 后实现。
-func (c *CLIVerifier) SelfTest(ctx context.Context, req Request, produced string) (Verdict, error) {
-	return Verdict{Passed: false, Reason: "CLIVerifier not implemented yet"}, nil
-}
-
-// UnifiedTest TODO: 接入 exec/Executor 后实现。
-func (c *CLIVerifier) UnifiedTest(ctx context.Context, req Request, produced string) (Verdict, error) {
-	return Verdict{Passed: false, Reason: "CLIVerifier not implemented yet"}, nil
-}
-
-// MCPVerifier 通过调用 MCP（Model Context Protocol）服务器的测试工具验证产出。
-// 接入点：MCP 客户端就绪后，实现 SelfTest/UnifiedTest 调用 MCP 服务器的 test 工具。
-//
-// TODO（MCP 客户端接入后填入）:
-//   - SelfTest：调用 MCP 服务器的 unit_test 工具，传入产出，解析返回的 pass/fail。
-//   - UnifiedTest：调用 MCP 服务器的 integration_test 工具。
-type MCPVerifier struct {
-	// Server 是 MCP 服务器地址/句柄，待 MCP 客户端定义后注入。
-	// Server mcp.Client
-	// SelfTestTool 是自测工具名。
-	SelfTestTool string
-	// UnifiedTestTool 是上级统一测试工具名。
-	UnifiedTestTool string
-}
-
-// SelfTest TODO: 接入 MCP 客户端后实现。
-func (m *MCPVerifier) SelfTest(ctx context.Context, req Request, produced string) (Verdict, error) {
-	return Verdict{Passed: false, Reason: "MCPVerifier not implemented yet"}, nil
-}
-
-// UnifiedTest TODO: 接入 MCP 客户端后实现。
-func (m *MCPVerifier) UnifiedTest(ctx context.Context, req Request, produced string) (Verdict, error) {
-	return Verdict{Passed: false, Reason: "MCPVerifier not implemented yet"}, nil
-}
-
-// 编译期断言：扩展验证器实现 Verifier 接口，确保后续填入实现时签名正确。
+// 编译期断言：默认实现满足各接口契约。
 var (
 	_ Verifier = (*AgentVerifier)(nil)
-	_ Verifier = (*ComputerUseVerifier)(nil)
-	_ Verifier = (*CLIVerifier)(nil)
-	_ Verifier = (*MCPVerifier)(nil)
 	_ Fixer    = (*AgentFixer)(nil)
 	_ Reporter = (*MailboxReporter)(nil)
 	_ Reviewer = (*AgentReviewer)(nil)

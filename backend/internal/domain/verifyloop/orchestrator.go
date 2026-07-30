@@ -7,8 +7,8 @@
 //   - Engine（Orchestrator）：驱动"自测 -> 修正 -> 上级统一测试"状态机循环，
 //     不绑定具体验证方式，只消费 Verifier/Fixer/Reporter 三个接口。
 //   - Verifier：执行一次验证并返回结构化结论 Verdict。默认 AgentVerifier 派发测试 Agent；
-//     后续可替换为 ComputerUseVerifier（模拟点击/截图对比）、CLIVerifier（跑命令断言）、
-//     MCPVerifier（调用 MCP 服务器测试工具）等。
+//     后续可替换为 ComputerUse（模拟点击/截图对比）、CLI（跑命令断言）、
+//     MCP（调用 MCP 服务器测试工具）等实现，按 Verifier 接口契约填入。
 //   - Fixer：基于验证失败反馈修正产出。默认 AgentFixer 派发编码 Agent；
 //     后续可替换为 patch 工具、LLM 局部重写等。
 //   - Reporter：把最终结果通知上游。默认 MailboxReporter 投递父 Agent 邮箱；
@@ -116,7 +116,7 @@ const defaultMaxRounds = 5
 const defaultChildTimeout = 10 * time.Minute
 
 // Request 描述一次验证闭环的输入。字段与具体验证方式解耦，
-// AgentVerifier/CLIVerifier/MCPVerifier 等实现按需读取。
+// 各 Verifier 实现按需读取。
 type Request struct {
 	ParentID    string // 上级 Agent ID（通常为 domain 或 meta），Runner 以此为 caller
 	ProducerID  string // 产出方 Agent ID（如 session-1/code_assistant-1），用于 Reporter 标识来源
@@ -242,7 +242,7 @@ func (o *Orchestrator) runEngine(ctx context.Context, req Request) Result {
 		}
 
 		// 步骤 0.5（可选）：静态审查（code_reviewer）。
-		// reviewer == nil 时跳过（CLIVerifier/MCPVerifier 等场景）。
+		// reviewer == nil 时跳过（非 Agent 验证器场景）。
 		// PlanConfirm 通过后、SelfTest 前对产出做 bug/安全/风格/边界审查，
 		// 未通过则 Fixer 修正后再次审查（受 maxRounds 约束）。
 		if o.reviewer != nil {
@@ -344,7 +344,7 @@ const (
 
 // ParseAgentVerdict 从 Agent 答复文本解析 Verdict。
 // 优先匹配 FAIL（防止 PASS 出现在失败原因文本中误判），再匹配 PASS；无标记判失败。
-// 供 AgentVerifier 使用，CLIVerifier/MCPVerifier 等不解析文本的实现无需调用。
+// 供 AgentVerifier 使用，不解析文本的 Verifier 实现无需调用。
 func ParseAgentVerdict(report string) Verdict {
 	if strings.Contains(report, verifyMarkerFail) {
 		return Verdict{Passed: false, Reason: extractReason(report), Detail: report}
