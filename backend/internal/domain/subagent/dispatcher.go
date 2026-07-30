@@ -141,6 +141,11 @@ type Dispatcher struct {
 	// 派发前 Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
 	// 为 nil 时关闭树跟踪（测试场景），不影响派发主流程。
 	treeFn func(sessionID string) *orchestrator.Tree
+
+	// factExtractor 从子 Agent 输出中提取关键事实，替代原始 result.Text 直接落库。
+	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
+	// 提取失败（LLM 出错或返回空）自动回退原始保存，保证不丢结果。
+	factExtractor FactExtractor
 }
 
 // pendingState 跟踪单个父 Agent 的未决子 Agent 计数与完成信号。
@@ -296,6 +301,14 @@ func (d *Dispatcher) WithLiveEvents(fn func(sessionID string, ev agent.LiveEvent
 // 传 nil 关闭树跟踪（默认关闭）；HTTP API 的 /tree 与 /cancel 端点依赖此树。
 func (d *Dispatcher) WithTree(fn func(sessionID string) *orchestrator.Tree) *Dispatcher {
 	d.treeFn = fn
+	return d
+}
+
+// WithFactExtractor 注入事实提取器，使 saveBlockMemory 先尝试 LLM 提取关键事实
+// 再落库（每条事实单独 KnowledgeRecord，向量化后召回精度更高）。
+// 传 nil 关闭提取（默认关闭），saveBlockMemory 回退原始文本保存。
+func (d *Dispatcher) WithFactExtractor(e FactExtractor) *Dispatcher {
+	d.factExtractor = e
 	return d
 }
 
@@ -997,10 +1010,12 @@ func (d *Dispatcher) WithSharedMemory(r tool.SharedMemoryStore) *Dispatcher {
 }
 
 
-// saveBlockMemory 将子 Agent 成功完成后的结果摘要沉淀到块记忆知识库。
+// saveBlockMemory 将子 Agent 成功完成后的结果沉淀到块记忆知识库。
 // 未配置写入器、开关关闭或结果为空时跳过；写入失败仅记日志，不影响派发主流程。
-// 内容与 Meta 携带 goal/domain 标签，便于召回侧（SearchBlockMemoryByGoal /
-// SearchBlockMemory）按目标文本与领域匹配命中。
+//
+// 提取策略：若 factExtractor 已注入，先调用 LLM 提取 1-5 条关键事实，
+// 每条事实单独落 KnowledgeRecord（向量化后召回精度更高）。
+// 提取失败或未注入时回退到原始 result.Text 落库（向后兼容）。
 func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, goal, result string) {
 	if d.saver == nil || !d.writeEnabled {
 		return
@@ -1009,12 +1024,23 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, go
 	if content == "" {
 		return
 	}
-	// goal 为注入召回前缀之前的原始拆分任务文本，截断保留前部即可满足召回匹配所需的语义信息。
+	if d.factExtractor != nil {
+		facts, err := d.factExtractor.Extract(ctx, content, goal, roleID)
+		if err == nil && len(facts) > 0 {
+			d.saveFacts(ctx, subAgentID, roleID, goal, facts)
+			return
+		}
+		log.Printf("[subagent] extract facts failed, fallback raw: sub=%s err=%v facts=%d", subAgentID, err, len(facts))
+	}
+	d.saveRawBlockMemory(ctx, subAgentID, roleID, goal, content)
+}
+
+// saveRawBlockMemory 把原始 result.Text 作为单条 KnowledgeRecord 落库。
+// 内容采用"目标/角色/结果"三段式，meta 携带 goal/domain/session_id 标签，
+// 便于召回侧（SearchBlockMemoryByGoal / SearchBlockMemory）按目标文本与领域匹配命中。
+func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID, goal, content string) {
 	trimmedGoal := truncateRunes(strings.TrimSpace(goal), blockMemoryGoalMaxRunes)
-	// 从 ctx 取 sessionID 写入 Meta，召回侧据此过滤跨 session 污染。
 	sid := tool.SessionIDFromContext(ctx)
-	// 内容采用"目标/角色/结果"三段式，同时把 domain/session_id 标签写入 Meta，
-	// 与 global_knowledge 表 meta->>'domain' / meta->>'session_id' 过滤条件对齐。
 	rec := &types.KnowledgeRecord{
 		KnowledgeType: enums.KnowledgeTypeBlockMemory,
 		Content:       fmt.Sprintf("目标:%s\n角色:%s\n结果:%s", trimmedGoal, roleID, truncateRunes(content, blockMemoryResultMaxRunes)),
@@ -1029,6 +1055,35 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, go
 	}
 	if err := d.saver.Save(ctx, rec); err != nil {
 		log.Printf("[subagent] save block memory failed: sub_agent=%s err=%v", subAgentID, err)
+	}
+}
+
+// saveFacts 把提取出的事实逐条落库，每条单独向量化以提升召回精度。
+// 失败仅记日志，不影响其他事实或派发主流程。
+func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, goal string, facts []string) {
+	trimmedGoal := truncateRunes(strings.TrimSpace(goal), blockMemoryGoalMaxRunes)
+	sid := tool.SessionIDFromContext(ctx)
+	for i, fact := range facts {
+		fact = strings.TrimSpace(fact)
+		if fact == "" {
+			continue
+		}
+		rec := &types.KnowledgeRecord{
+			KnowledgeType: enums.KnowledgeTypeBlockMemory,
+			Content:       fact,
+			Meta: map[string]any{
+				"goal":         trimmedGoal,
+				"domain":       roleID,
+				"session_id":   sid,
+				"sub_agent_id": subAgentID,
+				"source":       "fact_extraction",
+				"fact_index":   i,
+			},
+			CreatedAt: time.Now(),
+		}
+		if err := d.saver.Save(ctx, rec); err != nil {
+			log.Printf("[subagent] save fact failed: sub=%s idx=%d err=%v", subAgentID, i, err)
+		}
 	}
 }
 

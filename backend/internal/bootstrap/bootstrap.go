@@ -236,6 +236,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 块记忆写入闭环：默认开启（applyFeatureTogglesDefaults 兜底为 true）；
 	// 显式 block_memory_write_enabled: false 时 Dispatcher 内部跳过沉淀。
 	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)
+	// 事实提取：子 Agent 完成后用轻量模型提取 1-5 条关键事实，每条单独落 KnowledgeRecord，
+	// 替代原始 result.Text 整段落库。提取失败自动回退原始保存（saveBlockMemory 内部处理）。
+	subAgentDispatcher.WithFactExtractor(&llmFactExtractor{factory: modelFactory})
 	// 全局派发总数上限：单 session 所有角色派发合计超限拒绝；用户新消息重置。
 	subAgentDispatcher.WithMaxTotalDispatches(cfg.Agent.MaxTotalDispatches)
 	// Spec 强制：开启时 call_sub_agent 前必须先 WriteSpec(goal, acceptance, ...)，

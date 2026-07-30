@@ -415,6 +415,104 @@ func TestRunSubAgent_SavesBlockMemory(t *testing.T) {
 	waitForCond(t, "parent notify after save failure", func() bool { return len(mb3.Drain("meta")) > 0 })
 }
 
+// mockFactExtractor 是测试用 FactExtractor，返回预设事实或错误。
+type mockFactExtractor struct {
+	facts []string
+	err   error
+	calls int
+}
+
+func (m *mockFactExtractor) Extract(ctx context.Context, text, goal, roleID string) ([]string, error) {
+	m.calls++
+	return m.facts, m.err
+}
+
+// TestRunSubAgent_FactExtraction 验证注入 FactExtractor 时,
+// 子 Agent 完成后调用 Extract 并把每条事实作为独立 KnowledgeRecord 落库。
+// 同时验证提取失败时回退到原始 result.Text 保存。
+func TestRunSubAgent_FactExtraction(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+
+	// 情形一：提取成功，每条事实独立落库。
+	saver := &mockBlockMemorySaver{}
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.WithBlockMemorySaver(saver, true)
+	d.WithFactExtractor(&mockFactExtractor{facts: []string{"事实一", "事实二"}})
+	d.RegisterCallTool(toolsReg)
+
+	dispatchCodeAssistant(t, toolsReg)
+	waitForCond(t, "fact saves", func() bool { return saver.savedCount() >= 2 })
+
+	if saver.savedCount() != 2 {
+		t.Fatalf("expected 2 fact records, got %d", saver.savedCount())
+	}
+	rec0 := saver.recs[0]
+	if rec0.Content != "事实一" {
+		t.Errorf("rec[0].Content = %q, want '事实一'", rec0.Content)
+	}
+	if rec0.Meta["source"] != "fact_extraction" {
+		t.Errorf("rec[0].Meta[source] = %v, want fact_extraction", rec0.Meta["source"])
+	}
+	if rec0.Meta["fact_index"] != 0 {
+		t.Errorf("rec[0].Meta[fact_index] = %v, want 0", rec0.Meta["fact_index"])
+	}
+	rec1 := saver.recs[1]
+	if rec1.Content != "事实二" {
+		t.Errorf("rec[1].Content = %q, want '事实二'", rec1.Content)
+	}
+	if rec1.Meta["fact_index"] != 1 {
+		t.Errorf("rec[1].Meta[fact_index] = %v, want 1", rec1.Meta["fact_index"])
+	}
+
+	// 情形二：提取失败（err），回退到原始文本保存。
+	saver2 := &mockBlockMemorySaver{}
+	toolsReg2 := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb2 := mailbox.New()
+	d2 := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg2, mb2, agent.NopMemoryPipeline{})
+	d2.WithBlockMemorySaver(saver2, true)
+	d2.WithFactExtractor(&mockFactExtractor{err: errors.New("llm down")})
+	d2.RegisterCallTool(toolsReg2)
+
+	dispatchCodeAssistant(t, toolsReg2)
+	waitForCond(t, "fallback raw save", func() bool { return saver2.savedCount() > 0 })
+
+	if saver2.savedCount() != 1 {
+		t.Fatalf("expected 1 raw record on extract failure, got %d", saver2.savedCount())
+	}
+	raw := saver2.lastSaved()
+	if !strings.Contains(raw.Content, "目标:") {
+		t.Errorf("raw content missing 目标 prefix, got %q", raw.Content)
+	}
+	if raw.Meta["source"] != "sub_agent_result" {
+		t.Errorf("raw Meta[source] = %v, want sub_agent_result", raw.Meta["source"])
+	}
+
+	// 情形三：提取返回空切片，回退到原始文本保存。
+	saver3 := &mockBlockMemorySaver{}
+	toolsReg3 := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb3 := mailbox.New()
+	d3 := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg3, mb3, agent.NopMemoryPipeline{})
+	d3.WithBlockMemorySaver(saver3, true)
+	d3.WithFactExtractor(&mockFactExtractor{facts: []string{}})
+	d3.RegisterCallTool(toolsReg3)
+
+	dispatchCodeAssistant(t, toolsReg3)
+	waitForCond(t, "fallback raw save on empty", func() bool { return saver3.savedCount() > 0 })
+
+	if saver3.savedCount() != 1 {
+		t.Fatalf("expected 1 raw record on empty facts, got %d", saver3.savedCount())
+	}
+}
+
 // TestRunSubAgent_PurgesMailbox 验证子 Agent 结束后其收件箱被 Purge 清理：
 // 利用阻塞式 saver 将 runSubAgent 停在"Run 已结束、defer 未执行"的时刻，
 // 此时投递的未读消息必须随 defer 中的 Purge 一并被清除。
