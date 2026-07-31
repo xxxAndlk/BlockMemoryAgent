@@ -53,6 +53,15 @@ agent:
   sub_agent_timeout_min: 30      # 子 Agent 独立执行超时（分钟），负数表示不限制
   tool_output_history_max_runes: 2000 # 写入历史的单条工具输出最大字符数，负数表示不截断
   token_budget_per_goal: 100000   # 单次目标累计 token 上限（input+output 之和，跨轮累加），超限暂停等用户续跑；<=0 不限制
+  token_budget_per_role:          # 按角色单 Agent token 上限（resume 重置；覆盖 token_budget_per_goal）。未列角色按默认:domain 50000 / 叶子助手 20000 / meta 200000(安全网,防不收敛死循环)
+    domain: 50000
+    meta: 200000
+    code_assistant: 20000
+    ui_assistant: 20000
+    prompt_reviewer: 20000
+    code_reviewer: 20000
+    test_assistant: 20000
+    doc_assistant: 20000
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
 
   # -- DAG / 会话恢复 --

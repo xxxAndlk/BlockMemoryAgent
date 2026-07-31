@@ -206,6 +206,42 @@ func TestReActAgent_WakeOnMailbox(t *testing.T) {
 	}
 }
 
+// fakePausedChildChecker 模拟父 Agent 有未决子 Agent 且其中一个为 Paused domain 的场景。
+// PendingChildren 恒返 1（不完成），HasPausedChild 恒返 true，使 wait loop 命中 PausedOnChild 分支。
+type fakePausedChildChecker struct{}
+
+func (f *fakePausedChildChecker) PendingChildren(string) int       { return 1 }
+func (f *fakePausedChildChecker) WaitForAnyChild(string, time.Duration) bool { return false }
+func (f *fakePausedChildChecker) HasPausedChild(string) bool      { return true }
+
+// TestReActAgent_PausedOnChild 验证：父 Agent 给出终答前若有未决子 Agent 且存在 Paused 子 domain，
+// wait loop 应跳出返回 ReactResult{LimitReached:true, PausedOnChild:true}，由上层置会话暂停态。
+func TestReActAgent_PausedOnChild(t *testing.T) {
+	mb := mailbox.New()
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			blades.AssistantMessage("终答但子 domain 暂停"), // 第一轮终答，但子 Agent 未决 + Paused
+		},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	checker := &fakePausedChildChecker{}
+	ag := NewReActAgent("test", types.RoleDefinition{SystemPrompt: ""}, llm, NewToolRegistryAdapter(reg)).
+		WithMailbox(mb).
+		WithPendingChildrenChecker(checker).
+		WithPausedChildChecker(checker)
+
+	res, err := ag.Run(context.Background(), "wait for sub")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.LimitReached {
+		t.Error("expected LimitReached=true when paused child detected")
+	}
+	if !res.PausedOnChild {
+		t.Error("expected PausedOnChild=true when HasPausedChild returns true")
+	}
+}
+
 // tokenUsageProvider 返回带 TokenUsage 的响应，用于测试 token 预算上限。
 // 每次响应固定 InputTokens/OutputTokens，第 calls 次后给空响应收尾防死循环。
 type tokenUsageProvider struct {

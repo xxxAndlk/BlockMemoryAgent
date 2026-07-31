@@ -225,13 +225,14 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		HistoryMaxMessages:        cfg.Agent.HistoryMaxMessages,
 		ToolOutputHistoryMaxRunes: cfg.Agent.ToolOutputHistoryMaxRunes,
 		TokenBudgetPerGoal:       cfg.Agent.TokenBudgetPerGoal,
+		TokenBudgetPerRole:       cfg.Agent.TokenBudgetPerRole,
 	}
 	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute
 	if subAgentTimeout < 0 {
 		subAgentTimeout = 0 // 负数表示不限制
 	}
 	subAgentDispatcher := subagent.NewDispatcher(roleRegistry, &reactModelFactory{modelFactory}, toolRegistry, sharedMailbox, memoryPipeline)
-	subAgentDispatcher.WithTimeout(subAgentTimeout).WithLoopConfig(reactCfg.LoopConfig()).WithBlockMemorySearcher(pgStore)
+	subAgentDispatcher.WithTimeout(subAgentTimeout).WithLoopConfigByRole(reactCfg.LoopConfigByRole).WithBlockMemorySearcher(pgStore)
 	// 块记忆写入闭环：默认开启（applyFeatureTogglesDefaults 兜底为 true）；
 	// 显式 block_memory_write_enabled: false 时 Dispatcher 内部跳过沉淀。
 	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)
@@ -350,6 +351,13 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入未决子 Agent 检查器，开启父会话终结保护：
 	// 父 Agent 给出终答前若有未决子 Agent，阻塞等待其完成，防止迟到 mailbox 消息丢失。
 	agentSvc.SetPendingChildrenChecker(subAgentDispatcher)
+	// 注入 Paused 子 Agent 检查器：MetaAgent 无限 budget 不会因自身 token 暂停，
+	// 靠此检查在 wait loop 检测 Paused 子 DomainAgent（触达 token 上限）后主动暂停会话，
+	// 置 PausedOnChild 态等用户"继续"恢复该 domain。
+	agentSvc.SetPausedChildChecker(subAgentDispatcher)
+	// 注入 Paused DomainAgent 恢复器：sendMessage 在 PausedOnChild 态优先恢复 earliest paused domain，
+	// 从 agent_messages 加载历史用 fresh budget 续跑（各 Agent 独立上下文）。
+	agentSvc.SetPausedDomainResumer(subAgentDispatcher)
 	// 默认恢复历史会话：从 session_history 恢复最近 50 个会话到内存，
 	// 保证重启后长任务上下文可见；显式 restore_sessions: false 关闭。
 	// 恢复失败仅记录日志，不阻断启动。
@@ -454,6 +462,7 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 		"session_history": store.EnsureSessionHistorySchema,
 		"session_events":  store.EnsureSessionEventsSchema,
 		"agent_events":    store.EnsureAgentEventsSchema,
+		"agent_messages":  store.EnsureAgentMessagesSchema,
 		"session_logs":    store.EnsureSessionLogsSchema,
 		"dag":             store.EnsureDAGSchema,
 		"memory":          store.EnsureInitialMemorySchema,

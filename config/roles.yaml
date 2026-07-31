@@ -366,7 +366,7 @@ fixed_roles:
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &review_model
       provider: openai-deepseek
-      model: deepseek-v4-pro
+      model: deepseek-v4-flash
       api_key: ${OPENAI_API_KEY}
       base_url: ${OPENAI_BASE_URL}
       temperature: 0.2
@@ -443,7 +443,7 @@ fixed_roles:
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &coding_model
       provider: openai-deepseek
-      model: deepseek-v4-pro
+      model: deepseek-v4-flash
       api_key: ${OPENAI_API_KEY}
       base_url: ${OPENAI_BASE_URL}
     can_be_called: true

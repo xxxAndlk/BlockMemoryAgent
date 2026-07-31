@@ -178,6 +178,11 @@ const (
 	// SessionStatusAwaitingClarify 等待澄清:会话因等待用户答复而挂起。
 	// 中间态,用户通过 /clarify 提交答复后回到 running。
 	SessionStatusAwaitingClarify SessionStatus = "awaiting_clarify"
+
+	// SessionStatusPausedOnChild 暂停于子 Agent:某 DomainAgent 触达 token 上限进入 Paused,
+	// MetaAgent 检测到后主动暂停会话。用户发任意消息(如"继续")将优先恢复该 Paused DomainAgent。
+	// 与 AwaitingClarify 区分:后者等澄清答复,前者等恢复暂停的子 Agent。
+	SessionStatusPausedOnChild SessionStatus = "paused_on_child"
 )
 
 // ChatRole 对话角色:ChatMessage 的角色分类,与 OpenAI Chat Completion 协议对齐。

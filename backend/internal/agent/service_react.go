@@ -40,6 +40,17 @@ type ReactService struct {
 	// 为 nil 时关闭保护；由 bootstrap 注入 subagent.Dispatcher 实现。
 	pendingChecker PendingChildrenChecker
 
+	// pausedChecker 注入到 MetaAgent ReActAgent，用于父终结保护 wait loop 检测
+	// Paused 子 DomainAgent（触达 token 上限）。MetaAgent 无限 budget 不会自行暂停，
+	// 靠此检查跳出 wait loop 返回 PausedOnChild，由上层 pauseSession 置会话暂停态。
+	// 为 nil 时关闭检查；由 bootstrap 注入 subagent.Dispatcher 实现。
+	pausedChecker PausedChildChecker
+
+	// resumeDispatcher 注入 Paused DomainAgent 恢复器，sendMessage 在会话处于
+	// PausedOnChild 态时调用其 ResumePaused 从 agent_messages 加载历史续跑。
+	// 为 nil 时 PausedOnChild 会话回退到普通 resumeSession（不恢复暂停的 domain）。
+	resumeDispatcher PausedDomainResumer
+
 	// testProvider 是包内部测试使用的钩子，
 	// 允许单元测试注入 mock 的 ModelProvider，从而无需真实 API 密钥即可运行 ReAct 循环。
 	testProvider ModelProvider
@@ -91,7 +102,12 @@ type ReactRuntimeConfig struct {
 	ToolOutputHistoryMaxRunes int // 写入历史的工具输出最大字符数；<0 表示不截断
 	// TokenBudgetPerGoal 单次 RunWithHistory 累计 token 上限（input+output 之和）。
 	// <=0 不限制；>0 超限后主循环 break 返回部分完成（LimitReached）。
+	// 被 TokenBudgetPerRole 覆盖:按角色设预算时此项对该角色无效。
 	TokenBudgetPerGoal int
+	// TokenBudgetPerRole 按角色 ID 设单 Agent token 上限。未列出角色按默认:
+	// domain=50000, meta=200000(安全网,不为 0 因 maxIter=-1 已无界), 其他(叶子助手)=20000。
+	// nil 时全部走默认。显式值覆盖默认,resume 时重置(各 Agent 独立预算)。
+	TokenBudgetPerRole map[string]int
 }
 
 // SetRuntimeConfig 注入 ReAct 主循环运行时参数（见 ReactRuntimeConfig）。
@@ -103,6 +119,18 @@ func (s *ReactService) SetRuntimeConfig(c ReactRuntimeConfig) {
 // 都开启父会话终结保护。由 bootstrap 在装配 subagent.Dispatcher 后调用。
 func (s *ReactService) SetPendingChildrenChecker(p PendingChildrenChecker) {
 	s.pendingChecker = p
+}
+
+// SetPausedChildChecker 注入 Paused 子 Agent 检查器，使 MetaAgent 在父终结保护
+// wait loop 中能检测 Paused 子 DomainAgent 并主动暂停会话。由 bootstrap 注入。
+func (s *ReactService) SetPausedChildChecker(p PausedChildChecker) {
+	s.pausedChecker = p
+}
+
+// SetPausedDomainResumer 注入 Paused DomainAgent 恢复器，使 sendMessage 在
+// PausedOnChild 态能优先恢复暂停的 domain。由 bootstrap 注入 subagent.Dispatcher。
+func (s *ReactService) SetPausedDomainResumer(r PausedDomainResumer) {
+	s.resumeDispatcher = r
 }
 
 // ForwardLiveEvent 是子 Agent 实时事件转发入口：Dispatcher 派发子 Agent 时注入的
@@ -154,6 +182,34 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 		lc.TokenBudget = c.TokenBudgetPerGoal
 	}
 	return lc
+}
+
+// LoopConfigByRole 返回按角色定制的 LoopConfig:在 LoopConfig() 基础上按 roleID 覆盖 TokenBudget。
+// 预算分级:DomainAgent 50000(到限暂停可恢复),叶子助手 20000(到限返回部分产出),
+// meta 200000(安全网,不收敛时暂停等续跑;不为 0 因 maxIter=-1 已无界,双无界会死循环)。
+// TokenBudgetPerRole 显式配置覆盖默认;未列出角色按上述默认。
+// resume 时 usedTokens 局部变量自动重置,即每个 Agent 各自独立预算。
+func (c ReactRuntimeConfig) LoopConfigByRole(roleID string) LoopConfig {
+	lc := c.LoopConfig()
+	lc.TokenBudget = c.roleTokenBudget(roleID)
+	return lc
+}
+
+// roleTokenBudget 返回角色 token 预算:显式配置优先,否则按角色默认(domain 50000 / meta 200000 / 其他 20000)。
+// meta 不给 0(无限):config tool_call_max_rounds=-1 已使 maxIter 无界,若 budget 也无界,
+// 模型不收敛时会无限循环(实证:TUI 重复思考不前进)。200K 安全网让 meta 不收敛时暂停等续跑。
+func (c ReactRuntimeConfig) roleTokenBudget(roleID string) int {
+	if v, ok := c.TokenBudgetPerRole[roleID]; ok {
+		return max(v, 0)
+	}
+	switch roleID {
+	case "domain":
+		return 50000
+	case "meta":
+		return 200000
+	default:
+		return 20000
+	}
 }
 
 // SetModelProvider 注入一个 mock 或替代的模型 provider。
@@ -873,7 +929,7 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).
-		WithLoopConfig(s.runtimeCfg.LoopConfig()).
+		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(s.workDir()).
@@ -881,6 +937,10 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
+	}
+	// 注入 Paused 子 Agent 检查器，使 MetaAgent 在 wait loop 检测 Paused 子 domain 并主动暂停。
+	if s.pausedChecker != nil {
+		agent = agent.WithPausedChildChecker(s.pausedChecker)
 	}
 
 	// 将会话 ID 注入工具上下文，便于工具内部识别当前会话。
@@ -899,7 +959,11 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 
 	// 达到轮数上限：不视为失败——暂停会话、保留全部进度，等待用户消息续跑。
 	if result.LimitReached {
-		s.pauseSession(session, result.History)
+		kind := PauseIterationLimit
+		if result.PausedOnChild {
+			kind = PauseOnChild
+		}
+		s.pauseSession(session, result.History, kind)
 		return
 	}
 
@@ -953,7 +1017,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
 		WithMailbox(s.mailbox).
 		WithMemory(s.memory).
-		WithLoopConfig(s.runtimeCfg.LoopConfig()).
+		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(s.workDir()).
@@ -961,6 +1025,10 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
+	}
+	// 注入 Paused 子 Agent 检查器，使 MetaAgent 在 wait loop 检测 Paused 子 domain 并主动暂停。
+	if s.pausedChecker != nil {
+		agent = agent.WithPausedChildChecker(s.pausedChecker)
 	}
 
 	// 注入会话 ID 到工具上下文。
@@ -990,7 +1058,11 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 	// 达到轮数上限：不视为失败——暂停会话、保留全部进度，等待用户消息续跑。
 	if result.LimitReached {
-		s.pauseSession(session, result.History)
+		kind := PauseIterationLimit
+		if result.PausedOnChild {
+			kind = PauseOnChild
+		}
+		s.pauseSession(session, result.History, kind)
 		return
 	}
 
@@ -1015,8 +1087,8 @@ func (s *ReactService) finalizeSession(session *reactInternalSession) {
 	// 会话结束（完成/出错/暂停）时清空流式输出与思考过程状态，UI 停止渲染瞬时内容。
 	s.store.setStreamingText(session, "")
 	s.store.setThinkingText(session, "")
-	// 暂停待续（awaiting_clarify）的会话保留临时目录，用户续跑时仍需其中的中间产物。
-	if session.Status != enums.SessionStatusAwaitingClarify {
+	// 暂停待续（awaiting_clarify / paused_on_child）的会话保留临时目录，用户续跑时仍需其中的中间产物。
+	if session.Status != enums.SessionStatusAwaitingClarify && session.Status != enums.SessionStatusPausedOnChild {
 		// 清理会话临时目录。
 		s.store.cleanupSessionTempDir(session.ID, session.TempDir)
 	}
@@ -1060,22 +1132,53 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 	}
 }
 
-// pauseSession 在达到最大轮数上限时将会话置为"暂停待续"而非错误：
-// 状态置为 awaiting_clarify（TUI/Web 显示等待态），History 完整保留，
-// 并提示用户发送消息即可从当前进度续跑（sendMessage → resumeSession → RunWithHistory）。
-func (s *ReactService) pauseSession(session *reactInternalSession, history []ReactMessage) {
+// PauseKind 区分会话暂停的原因，供 pauseSession 选择目标状态与文案。
+type PauseKind int
+
+const (
+	// PauseIterationLimit MetaAgent 达到最大轮数上限（budget=0 不触 token，仅轮数）。
+	PauseIterationLimit PauseKind = iota
+	// PauseTokenBudget 达到 token 预算上限（非 meta 角色路径，预留）。
+	PauseTokenBudget
+	// PauseOnChild 子 DomainAgent 触达 token 上限暂停，MetaAgent 检测后主动暂停会话。
+	PauseOnChild
+)
+
+// pauseMessage 按 PauseKind 返回面向用户的暂停提示文案。
+func (s *ReactService) pauseMessage(kind PauseKind) string {
+	switch kind {
+	case PauseOnChild:
+		return "子领域 Agent 触达 token 上限已暂停（完整历史已持久化，可恢复）。发送任意消息（如\"继续\"）将优先恢复暂停的领域 Agent 继续执行。"
+	case PauseTokenBudget:
+		return "已达 token 预算上限，会话已暂停。发送任意消息（如\"继续\"）将从当前进度继续执行。"
+	default:
+		// PauseIterationLimit：maxIter<=0（不限制）时不显示具体轮数，避免 "0 轮" 误报。
+		maxIter := s.runtimeCfg.LoopConfig().MaxIterations
+		if maxIter <= 0 {
+			return "已达轮数上限，会话已暂停。发送任意消息（如\"继续\"）将从当前进度继续执行。"
+		}
+		return fmt.Sprintf("已达最大轮数上限（%d 轮），会话已暂停。发送任意消息（如\"继续\"）将从当前进度继续执行。", maxIter)
+	}
+}
+
+// pauseSession 按暂停原因将会话置为对应暂停态而非错误：
+// PauseOnChild -> paused_on_child（优先恢复暂停的 domain）；其他 -> awaiting_clarify（普通续跑）。
+// History 完整保留，sendMessage -> resumeSession/resumePausedDomain 从当前进度续跑。
+func (s *ReactService) pauseSession(session *reactInternalSession, history []ReactMessage, kind PauseKind) {
 	s.store.mu.Lock()
-	session.Status = enums.SessionStatusAwaitingClarify
 	session.History = history
-	session.Result = "已达最大轮数上限，会话暂停，等待用户消息续跑"
+	switch kind {
+	case PauseOnChild:
+		session.Status = enums.SessionStatusPausedOnChild
+		session.Result = "子领域 Agent 触达 token 上限暂停，发\"继续\"恢复该领域"
+	default:
+		session.Status = enums.SessionStatusAwaitingClarify
+		session.Result = "已达上限，会话暂停，等待用户消息续跑"
+	}
 	s.store.mu.Unlock()
 
-	// 记录暂停事件并给出明确的续跑指引。
-	maxIter := s.runtimeCfg.LoopConfig().MaxIterations
-	msg := fmt.Sprintf("已达最大轮数上限（%d 轮），会话已暂停。发送任意消息（如\"继续\"）将从当前进度继续执行。", maxIter)
-	s.store.addEvent(session, eventkind.System, "System", msg, "", "", "", "", "", true)
+	s.store.addEvent(session, eventkind.System, "System", s.pauseMessage(kind), "", "", "", "", "", true)
 
-	// 持久化历史与事件，保证重启后仍可续跑。
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
 }
@@ -1148,8 +1251,9 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		r.ResetDispatchCounts(sessionID)
 	}
 
-	// 记录会话原先是否处于运行状态。
-	wasRunning := session.Status == enums.SessionStatusRunning
+	// 记录会话原先状态：Running 在跑；非 Running 需恢复（paused_on_child 优先恢复暂停的 domain）。
+	priorStatus := session.Status
+	wasRunning := priorStatus == enums.SessionStatusRunning
 	// 如果不在运行，则重新置为运行状态，清除结束时间，并重建上下文。
 	if !wasRunning {
 		session.Status = enums.SessionStatusRunning
@@ -1163,9 +1267,66 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 
 	// 如果会话原先未运行，则在 goroutine 中恢复执行。
 	if !wasRunning {
+		// PausedOnChild: 优先恢复 earliest paused domain（任意消息，含"继续"与新任务，D1）。
+		// 各 Agent 独立上下文：domain 从 agent_messages 加载 history 续跑，fresh budget。
+		// 无 paused domain 或未注入恢复器时回退普通 resumeSession（MetaAgent 续跑）。
+		if priorStatus == enums.SessionStatusPausedOnChild && s.resumeDispatcher != nil {
+			if pausedID := s.findEarliestPausedDomain(session.ID); pausedID != "" {
+				go s.resumePausedDomain(session, pausedID)
+				return nil
+			}
+		}
 		go s.resumeSession(session)
 	}
 	return nil
+}
+
+// resumePausedDomain 恢复一个因触达 token 上限而 Paused 的 DomainAgent。
+// 委托 dispatcher.ResumePaused：从 agent_messages 加载历史，用 fresh budget 重建 domain Agent 续跑
+// （各 Agent 独立上下文，不强制压缩，靠 Assemble 步频自动压缩）。
+//   - 完成：dispatcher 已 tree.Finish + notify 父 + trackChildDone（父 MetaAgent 解除阻塞）；
+//     此处 go resumeSession 让 MetaAgent drain mailbox 整合结果续跑。
+//   - 再触限：dispatcher 已覆盖存 history + tree.Pause；此处 pauseSession(PauseOnChild) 等下次"继续"。
+//   - 出错：回退 pauseSession(PauseOnChild)，不丢已持久化上下文（防跑飞）。
+func (s *ReactService) resumePausedDomain(session *reactInternalSession, pausedNodeID string) {
+	ctx := sessionContext(session)
+	res, err := s.resumeDispatcher.ResumePaused(tool.WithSessionID(ctx, session.ID), pausedNodeID)
+	if err != nil {
+		s.store.addEvent(session, eventkind.Error, "System", fmt.Sprintf("恢复暂停领域 Agent 失败，已回退暂停态: %v", err), "", "", "", "", "", false)
+		s.pauseSession(session, session.History, PauseOnChild)
+		s.finalizeSession(session)
+		return
+	}
+	if res.LimitReached {
+		// 再触限：dispatcher 已 re-pause（覆盖存 history + tree.Pause）。会话置 PausedOnChild 等下次"继续"。
+		s.pauseSession(session, session.History, PauseOnChild)
+		s.finalizeSession(session)
+		return
+	}
+	// 完成：MetaAgent 解除阻塞，go resumeSession 让其 drain mailbox 整合 domain 结果续跑。
+	s.store.addEvent(session, eventkind.System, "System", "暂停的领域 Agent 已恢复完成，主 Agent 继续整合。", "", "", "", "", "", true)
+	go s.resumeSession(session)
+}
+
+// findEarliestPausedDomain 扫描会话 Agent 树，返回最早 Started 的 Paused domain 节点 ID。
+// 无则返回空串。供 sendMessage 在 PausedOnChild 态决定恢复目标（一次恢复一个，D1）。
+func (s *ReactService) findEarliestPausedDomain(sessionID string) string {
+	t := s.TreeFor(sessionID)
+	if t == nil {
+		return ""
+	}
+	var earliest string
+	var earliestTime time.Time
+	for _, n := range t.Snapshot() {
+		if n.Role != "domain" || n.Status != orchestrator.StatusPaused {
+			continue
+		}
+		if earliest == "" || n.Started.Before(earliestTime) {
+			earliest = n.ID
+			earliestTime = n.Started
+		}
+	}
+	return earliest
 }
 
 // answerClarify 处理用户对澄清问题的答复。
@@ -1181,9 +1342,12 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 		s.store.mu.Unlock()
 		return ErrSessionNotFound
 	}
-	// 只有处于等待澄清状态的会话才能接收澄清答复。
+	// 只有处于等待澄清状态的会话才能接收澄清答复（paused_on_child 走 sendMessage 恢复 domain）。
 	if session.Status != enums.SessionStatusAwaitingClarify {
 		s.store.mu.Unlock()
+		if session.Status == enums.SessionStatusPausedOnChild {
+			return fmt.Errorf("%w: session is paused on child, send a message to resume the paused domain", ErrInvalidSessionState)
+		}
 		return fmt.Errorf("%w: session is not awaiting clarification", ErrInvalidSessionState)
 	}
 	// 将澄清答复作为用户消息追加。

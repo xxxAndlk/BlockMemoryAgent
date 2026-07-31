@@ -56,6 +56,11 @@ type ReActAgent struct {
 	// persona 可选的人格注入器（soul.Loader 实现该接口）；为 nil 时不注入人格前缀。
 	// 在 systemPrompt() 头部把人格内容拼到环境块之前，使所有 Agent 共享用户级人格。
 	persona PersonaInjector
+	// pausedChecker 可选的"是否有 Paused 子 DomainAgent"检查器，由 WithPausedChildChecker 注入。
+	// 父终结保护 wait loop 中检查：若有 Paused 子节点（触达 token 上限），父 MetaAgent
+	// 无限 budget 不会自行暂停，需靠此检查跳出 wait loop 返回 PausedOnChild，由上层 pauseSession
+	// 置会话暂停态。为 nil 时不检查（默认关闭，仅 MetaAgent 注入）。
+	pausedChecker PausedChildChecker
 }
 
 // PersonaInjector 把人格内容拼接到系统提示词之前；soul.Loader 实现该接口。
@@ -172,6 +177,14 @@ func (a *ReActAgent) WithLogger(l *logger.Logger) *ReActAgent {
 // 传 nil 关闭人格注入（默认关闭）。人格为空时 systemPrompt 原样返回，无副作用。
 func (a *ReActAgent) WithPersonaInjector(p PersonaInjector) *ReActAgent {
 	a.persona = p
+	return a
+}
+
+// WithPausedChildChecker 注入 Paused 子 Agent 检查器，用于父终结保护 wait loop。
+// MetaAgent 无限 budget 不会因 token 暂停，需在有 Paused 子 DomainAgent 时主动暂停会话。
+// 传 nil 关闭检查（默认关闭，仅 MetaAgent 注入）。
+func (a *ReActAgent) WithPausedChildChecker(p PausedChildChecker) *ReActAgent {
+	a.pausedChecker = p
 	return a
 }
 
@@ -320,6 +333,13 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				// 旧实现每 30s 超时白跑一次 LLM，50 轮上限烧完后会话停摆等用户
 				// 人工续跑（实证：塔防任务死等 46 分钟）。
 				for a.pendingChecker.PendingChildren(a.name) > 0 {
+					// Paused 子 DomainAgent 检查：MetaAgent 无限 budget 不会因自身 token 暂停，
+					// 但子 domain 触达上限进入 Paused 后,父在此 wait loop 会永久阻塞。
+					// 检测到 Paused 子节点时跳出，返回 PausedOnChild 让上层 pauseSession
+					// 置会话暂停态，等用户"继续"恢复该 domain（各 Agent 独立上下文）。
+					if a.pausedChecker != nil && a.pausedChecker.HasPausedChild(a.name) {
+						return ReactResult{History: history, LimitReached: true, PausedOnChild: true}, nil
+					}
 					a.pendingChecker.WaitForAnyChild(a.name, 30*time.Second)
 					var n int
 					history, n = a.drainMailbox(history)

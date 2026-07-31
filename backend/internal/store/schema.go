@@ -148,6 +148,33 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_session
 	return err
 }
 
+// EnsureAgentMessagesSchema 自动创建 agent_messages 表 (幂等)。
+// 存 Paused DomainAgent 的完整 ReAct 消息历史,供 resume 时 LoadMessages 重建上下文。
+// 与 agent_events 分表:agent_events 记事件流(tool_call/answer 摘要,按 occurred DESC);
+// agent_messages 记完整消息(role/content/tool_calls/tool_call_id/reasoning,按 seq ASC)。
+// 仅 DomainAgent 触达 token 上限时写入;叶子助手不持久化 history。
+func EnsureAgentMessagesSchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id           BIGSERIAL PRIMARY KEY,
+    session_id   VARCHAR(64)  NOT NULL DEFAULT '',
+    agent_id     VARCHAR(256) NOT NULL DEFAULT '',
+    seq          INT          NOT NULL,
+    role         VARCHAR(16)  NOT NULL DEFAULT '',
+    content      TEXT         NOT NULL DEFAULT '',
+    tool_call_id VARCHAR(64)  NOT NULL DEFAULT '',
+    tool_calls   JSONB        NOT NULL DEFAULT '[]',
+    reasoning    TEXT         NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_agent_seq
+    ON agent_messages (agent_id, seq ASC);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_session
+    ON agent_messages (session_id);
+`)
+	return err
+}
+
 // EnsureInitialMemorySchema 自动创建 001_init.sql 中定义的记忆/知识/注册表相关表 (幂等)。
 // 负责在启动时补齐 global_knowledge / agent_private_memory / agent_snapshots / topics /
 // agent_registry / decision_logs / topic_archives 等表,避免块记忆、私有记忆、快照写入失败。

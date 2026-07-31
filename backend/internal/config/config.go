@@ -50,7 +50,12 @@ type LLMRuntimeConfig struct {
 	// TokenBudgetPerGoal 单次 RunWithHistory 累计 token 上限（input+output 之和，跨轮累加）。
 	// 超限后主循环 break 返回部分完成（LimitReached），与 maxIter 轮数上限正交。
 	// 默认 0 表示不限制；config.yaml 设 token_budget_per_goal: 100000 启用。
+	// 被 TokenBudgetPerRole 覆盖:按角色设预算时此项对该角色无效。
 	TokenBudgetPerGoal int `yaml:"token_budget_per_goal"`
+	// TokenBudgetPerRole 按角色 ID 设单 Agent 累计 token 上限（resume 重置）。
+	// DomainAgent 默认 50000;叶子助手默认 20000;meta 默认 200000(安全网,不为 0 因 config tool_call_max_rounds=-1 使 maxIter 无界,双无界会死循环)。
+	// 未列出的角色按上述默认。显式配置覆盖默认,如 token_budget_per_role: {domain: 50000}。
+	TokenBudgetPerRole map[string]int `yaml:"token_budget_per_role"`
 }
 
 // SafetyConfig 工具沙箱与安全策略配置。

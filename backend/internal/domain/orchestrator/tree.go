@@ -35,6 +35,10 @@ const (
 	StatusDone
 	StatusFailed
 	StatusCancelled
+	// StatusPaused 标记 DomainAgent 触达 token 上限暂停(可恢复)。
+	// 仅 Running 节点可 Pause;resume 完成后 Finish 转 Done。
+	// 与 Failed/Cancelled 区分:Paused 保留可恢复语义,history 持久化在 agent_messages。
+	StatusPaused
 )
 
 // String 返回状态的可读名称，用于日志与 JSON 序列化。
@@ -48,6 +52,8 @@ func (s Status) String() string {
 		return "failed"
 	case StatusCancelled:
 		return "cancelled"
+	case StatusPaused:
+		return "paused"
 	}
 	return "unknown"
 }
@@ -154,6 +160,7 @@ func (t *Tree) Finish(id, summary string, err error) {
 		t.mu.Unlock()
 		return
 	}
+	// Paused 节点允许 Finish(resume 完成路径),不视为 terminal。
 	node.Finished = time.Now()
 	node.Summary = summary
 	if err != nil {
@@ -168,6 +175,48 @@ func (t *Tree) Finish(id, summary string, err error) {
 	t.persistNode(snapshot)
 }
 
+// Pause 标记 DomainAgent 触达 token 上限暂停。仅 Running 节点可 Pause;
+// 已 terminal(Done/Failed/Cancelled)或已 Paused 的节点 no-op。
+// 删除 cancels[id](暂停即停止执行,resume 时重建 Agent)。持久化:best-effort SaveNode。
+// summary 记暂停原因(如 "token budget exhausted")。
+func (t *Tree) Pause(id, summary string) {
+	t.mu.Lock()
+	node, ok := t.nodes[id]
+	if !ok || node.Status != StatusRunning {
+		t.mu.Unlock()
+		return
+	}
+	node.Status = StatusPaused
+	node.Summary = summary
+	node.Finished = time.Now()
+	delete(t.cancels, id)
+	snapshot := *node
+	t.mu.Unlock()
+	t.persistNode(snapshot)
+}
+
+// Resume 把 Paused 节点置回 Running 并绑定新 cancel func（resume 重建 Agent 后调用）。
+// 仅 Paused 节点可 Resume；非 Paused no-op，返回 false。清空 Finished/Summary 恢复运行态。
+// 持久化：best-effort SaveNode。
+func (t *Tree) Resume(id string, cancel context.CancelFunc) bool {
+	t.mu.Lock()
+	node, ok := t.nodes[id]
+	if !ok || node.Status != StatusPaused {
+		t.mu.Unlock()
+		return false
+	}
+	node.Status = StatusRunning
+	node.Finished = time.Time{}
+	node.Summary = ""
+	if cancel != nil {
+		t.cancels[id] = cancel
+	}
+	snapshot := *node
+	t.mu.Unlock()
+	t.persistNode(snapshot)
+	return true
+}
+
 // Cancel 调用已绑定的 cancel func 并将状态置为 StatusCancelled。
 // 返回是否找到对应节点且处于可取消状态（Running）。
 // context.CancelFunc 幂等（Go doc），与 goroutine defer cancel 重复调用安全。
@@ -180,7 +229,9 @@ func (t *Tree) Cancel(id string) bool {
 		t.mu.Unlock()
 		return false
 	}
-	if node.Status != StatusRunning {
+	// Running 与 Paused 均可 Cancel(Running 取消执行;Paused 丢弃暂停态)。
+	// 已 terminal(Done/Failed/Cancelled)no-op。
+	if node.Status != StatusRunning && node.Status != StatusPaused {
 		t.mu.Unlock()
 		return false
 	}
@@ -231,7 +282,7 @@ func (t *Tree) LoadFromStore(ctx context.Context) error {
 func (t *Tree) EndCurrentTopic() []Node {
 	t.mu.Lock()
 	for id, node := range t.nodes {
-		if node.Status == StatusRunning {
+		if node.Status == StatusRunning || node.Status == StatusPaused {
 			node.Status = StatusCancelled
 			node.Finished = time.Now()
 			if cancel, ok := t.cancels[id]; ok && cancel != nil {

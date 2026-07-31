@@ -558,3 +558,211 @@ func TestReactService_InjectTopicRecall(t *testing.T) {
 		t.Fatalf("应保留原 input, got: %s", out2)
 	}
 }
+
+// TestLoopConfigByRole 验证按角色返回的 token 预算分级：
+// domain=50000 / meta=200000(安全网) / 其他=20000；TokenBudgetPerRole 显式配置覆盖默认(含显式 meta:0=不限制)。
+func TestLoopConfigByRole(t *testing.T) {
+	cfg := ReactRuntimeConfig{TokenBudgetPerRole: map[string]int{
+		"domain":         50000,
+		"meta":           0,
+		"code_assistant": 20000,
+	}}
+	cases := map[string]int{
+		"domain":         50000,
+		"meta":           0, // 显式设 0 -> 不限制(override 默认 200000)
+		"code_assistant": 20000,
+		"ui_assistant":   20000, // 未在 map 中 -> 默认 20000
+		"unknown_role":   20000, // 默认
+	}
+	for role, want := range cases {
+		got := cfg.LoopConfigByRole(role).TokenBudget
+		if got != want {
+			t.Errorf("LoopConfigByRole(%q).TokenBudget = %d, want %d", role, got, want)
+		}
+	}
+}
+
+// TestLoopConfigByRoleDefault 验证未注入 TokenBudgetPerRole 时按角色默认值。
+func TestLoopConfigByRoleDefault(t *testing.T) {
+	cfg := ReactRuntimeConfig{}
+	if got := cfg.LoopConfigByRole("domain").TokenBudget; got != 50000 {
+		t.Errorf("domain default = %d, want 50000", got)
+	}
+	if got := cfg.LoopConfigByRole("meta").TokenBudget; got != 200000 {
+		t.Errorf("meta default = %d, want 200000 (safety net, not 0)", got)
+	}
+	if got := cfg.LoopConfigByRole("code_assistant").TokenBudget; got != 20000 {
+		t.Errorf("assistant default = %d, want 20000", got)
+	}
+}
+
+// TestLoopConfigByRoleOverride 验证显式配置覆盖默认。
+func TestLoopConfigByRoleOverride(t *testing.T) {
+	cfg := ReactRuntimeConfig{TokenBudgetPerRole: map[string]int{
+		"domain": 30000, // 覆盖默认 50000
+	}}
+	if got := cfg.LoopConfigByRole("domain").TokenBudget; got != 30000 {
+		t.Errorf("override domain = %d, want 30000", got)
+	}
+	// 保留 LoopConfig() 的其他字段（MaxIterations 等）。
+	if lc := cfg.LoopConfigByRole("domain"); lc.MaxIterations == 0 {
+		t.Error("LoopConfigByRole 应继承 LoopConfig() 的 MaxIterations 默认值")
+	}
+}
+
+// mockPausedDomainResumer 记录 ResumePaused 调用，返回预设 result/err。
+type mockPausedDomainResumer struct {
+	result ReactResult
+	err    error
+	calls  int
+	nodeID string
+}
+
+func (m *mockPausedDomainResumer) ResumePaused(_ context.Context, pausedNodeID string) (ReactResult, error) {
+	m.calls++
+	m.nodeID = pausedNodeID
+	return m.result, m.err
+}
+
+// setSessionPausedOnChild 把会话置为 PausedOnChild 并在树上注册一个 Paused domain 节点，
+// 模拟"子领域 Agent 触达 token 上限暂停"现场。返回注入的 paused 节点 ID。
+func setSessionPausedOnChild(t *testing.T, svc *ReactService, sessionID string) string {
+	t.Helper()
+	pausedNodeID := sessionID + "/domain-1"
+	svc.store.mu.Lock()
+	sess, ok := svc.store.sessions[sessionID]
+	if !ok {
+		svc.store.mu.Unlock()
+		t.Fatalf("session %s not found", sessionID)
+	}
+	sess.Status = enums.SessionStatusPausedOnChild
+	// 重建可取消 ctx，供 resumeSession 使用。
+	ctx, cancel := context.WithCancel(context.Background())
+	sess.ctx = ctx
+	sess.cancelFn = cancel
+	svc.store.mu.Unlock()
+	tr := svc.TreeFor(sessionID)
+	tr.Register(orchestrator.Node{ID: pausedNodeID, ParentID: sessionID, Role: "domain", Status: orchestrator.StatusRunning, Started: time.Now()})
+	tr.Pause(pausedNodeID, "token budget exhausted")
+	return pausedNodeID
+}
+
+// waitForStatus 轮询直至会话状态匹配 want，超时失败。
+func waitForStatus(t *testing.T, svc *ReactService, sessionID string, want enums.SessionStatus, name string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snap, _ := svc.Get(context.Background(), sessionID)
+		if snap != nil && snap.Status == string(want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("会话未进入 %s 状态", name)
+}
+
+// TestSendMessageRoutesToPausedDomain 验证 PausedOnChild 态发消息优先恢复 earliest paused domain：
+// resumeDispatcher.ResumePaused 被调用 + 完成后 MetaAgent 经 resumeSession 整合结果。
+func TestSendMessageRoutesToPausedDomain(t *testing.T) {
+	llm := &mockReactModelProvider{responses: []*blades.Message{
+		blades.AssistantMessage("init"),
+		blades.AssistantMessage("整合完毕：ok"),
+	}}
+	svc := newReactServiceForTest(llm, t.TempDir())
+	resumer := &mockPausedDomainResumer{result: ReactResult{Text: "domain done"}}
+	svc.SetPausedDomainResumer(resumer)
+
+	created, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "g"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	// 等初始 runSession 完成，避免其覆盖即将设置的 PausedOnChild 态。
+	waitForStatus(t, svc, created.ID, enums.SessionStatusCompleted, "initial completed")
+	pausedID := setSessionPausedOnChild(t, svc, created.ID)
+
+	if err := svc.sendMessage(context.Background(), created.ID, "继续"); err != nil {
+		t.Fatalf("sendMessage: %v", err)
+	}
+	// 完成后 MetaAgent resumeSession 接管整合 -> 会话 Completed。
+	waitForStatus(t, svc, created.ID, enums.SessionStatusCompleted, "completed")
+	if resumer.calls != 1 {
+		t.Errorf("ResumePaused calls = %d, want 1 (should route to paused domain)", resumer.calls)
+	}
+	if resumer.nodeID != pausedID {
+		t.Errorf("ResumePaused nodeID = %q, want %q", resumer.nodeID, pausedID)
+	}
+}
+
+// TestResumePausedDomainRePause 验证 domain resume 再触限（LimitReached）时回退 PausedOnChild。
+func TestResumePausedDomainRePause(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	resumer := &mockPausedDomainResumer{result: ReactResult{LimitReached: true}}
+	svc.SetPausedDomainResumer(resumer)
+
+	created, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "g"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	waitForStatus(t, svc, created.ID, enums.SessionStatusCompleted, "initial completed")
+	setSessionPausedOnChild(t, svc, created.ID)
+
+	if err := svc.sendMessage(context.Background(), created.ID, "继续"); err != nil {
+		t.Fatalf("sendMessage: %v", err)
+	}
+	// 再触限 -> 回退 PausedOnChild 等下次"继续"。
+	waitForStatus(t, svc, created.ID, enums.SessionStatusPausedOnChild, "paused_on_child (re-pause)")
+	if resumer.calls != 1 {
+		t.Errorf("ResumePaused calls = %d, want 1", resumer.calls)
+	}
+}
+
+// TestResumePausedDomainCompletes 验证 domain resume 完成后 MetaAgent resumeSession 整合结果。
+func TestResumePausedDomainCompletes(t *testing.T) {
+	llm := &mockReactModelProvider{responses: []*blades.Message{
+		blades.AssistantMessage("init"),
+		blades.AssistantMessage("最终整合答案"),
+	}}
+	svc := newReactServiceForTest(llm, t.TempDir())
+	resumer := &mockPausedDomainResumer{result: ReactResult{Text: "domain done"}}
+	svc.SetPausedDomainResumer(resumer)
+
+	created, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "g"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	waitForStatus(t, svc, created.ID, enums.SessionStatusCompleted, "initial completed")
+	setSessionPausedOnChild(t, svc, created.ID)
+
+	if err := svc.sendMessage(context.Background(), created.ID, "继续"); err != nil {
+		t.Fatalf("sendMessage: %v", err)
+	}
+	waitForStatus(t, svc, created.ID, enums.SessionStatusCompleted, "completed")
+	snap, _ := svc.Get(context.Background(), created.ID)
+	if !strings.Contains(snap.Result, "最终整合答案") {
+		t.Errorf("result = %q, want contain '最终整合答案'", snap.Result)
+	}
+}
+
+// TestFindEarliestPausedDomain 验证按 Started 最早返回 Paused domain 节点 ID。
+func TestFindEarliestPausedDomain(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	created, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "g"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	tr := svc.TreeFor(created.ID)
+	t0 := time.Now()
+	// 后注册的更早 Started，应被选中。
+	tr.Register(orchestrator.Node{ID: "late", ParentID: created.ID, Role: "domain", Status: orchestrator.StatusRunning, Started: t0.Add(2 * time.Second)})
+	tr.Pause("late", "x")
+	tr.Register(orchestrator.Node{ID: "early", ParentID: created.ID, Role: "domain", Status: orchestrator.StatusRunning, Started: t0.Add(1 * time.Second)})
+	tr.Pause("early", "x")
+	// 非 domain 的 Paused 节点应被忽略。
+	tr.Register(orchestrator.Node{ID: "other", ParentID: created.ID, Role: "code_assistant", Status: orchestrator.StatusRunning, Started: t0})
+	tr.Pause("other", "x")
+
+	got := svc.findEarliestPausedDomain(created.ID)
+	if got != "early" {
+		t.Errorf("findEarliestPausedDomain = %q, want 'early'", got)
+	}
+}

@@ -66,6 +66,10 @@ type ReactResult struct {
 	// LimitReached 为 true 表示达到最大轮数上限而暂停（非错误）：
 	// Text 为空，History 保留全部进度，上层应暂停会话并等待用户消息续跑。
 	LimitReached bool `json:"limit_reached,omitempty"`
+	// PausedOnChild 为 true 表示因有子 DomainAgent 触达 token 上限进入 Paused 而暂停。
+	// 与 LimitReached 互斥语义:LimitReached=自身到限,PausedOnChild=子到限。
+	// 上层据此将会话置 PausedOnChild 态,等用户"继续"恢复该 domain。
+	PausedOnChild bool `json:"paused_on_child,omitempty"`
 }
 
 // 实时进度事件种类：用于向 UI 推送 ReAct 运行过程中的中间状态。
@@ -132,6 +136,24 @@ type PendingChildrenChecker interface {
 	// WaitForAnyChild 阻塞等待父 Agent 任一子 Agent 完成，最长 timeout。
 	// 返回 true 表示收到完成信号（或调用时已无未决）；false 表示超时。
 	WaitForAnyChild(parentID string, timeout time.Duration) bool
+}
+
+// PausedChildChecker 抽象"父 Agent 是否有 Paused 子 DomainAgent"的查询能力,
+// 由 subagent.Dispatcher 实现。ReActAgent 在父终结保护 wait loop 中调用它检查:
+// 若有 Paused 子 Agent(触达 token 上限),父 MetaAgent 无限 budget 不会自行暂停,
+// 需靠此检查跳出 wait loop 返回 PausedOnChild,由上层 pauseSession 置会话暂停态。
+type PausedChildChecker interface {
+	// HasPausedChild 返回父 Agent 是否有 StatusPaused 的子节点。
+	HasPausedChild(parentID string) bool
+}
+
+// PausedDomainResumer 抽象"恢复一个 Paused DomainAgent 续跑"的能力,
+// 由 subagent.Dispatcher 实现。ReactService 在 sendMessage 检测会话处于 PausedOnChild
+// 时调用,从 agent_messages 加载历史重建 domain Agent 用 fresh budget 续跑(各 Agent 独立上下文)。
+type PausedDomainResumer interface {
+	// ResumePaused 恢复指定 Paused 节点的 DomainAgent。
+	// 返回 result.LimitReached=true 表示再触限(已 re-pause);err 非 nil 表示恢复出错。
+	ResumePaused(ctx context.Context, pausedNodeID string) (ReactResult, error)
 }
 
 // DispatchCountResetter 由 subagent.Dispatcher 实现：清空指定 session 的派发计数。

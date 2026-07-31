@@ -207,6 +207,107 @@ func itoa(i int) string {
 	return string(b[pos:])
 }
 
+// captureStore 记录所有 SaveNode 调用，供 Pause/Resume 持久化验证。
+type captureStore struct {
+	saved []Node
+}
+
+func (c *captureStore) SaveNode(_ context.Context, _ string, n Node) error {
+	c.saved = append(c.saved, n)
+	return nil
+}
+func (c *captureStore) LoadNodes(context.Context, string) ([]Node, error) { return nil, nil }
+func (c *captureStore) DeleteNodesBySession(context.Context, string) error { return nil }
+
+func TestPauseRunningNode(t *testing.T) {
+	st := &captureStore{}
+	tr := NewTree("s1", st)
+	tr.Register(Node{ID: "d1", Role: "domain"})
+	tr.Pause("d1", "token budget exhausted")
+	node, ok := tr.Get("d1")
+	if !ok || node.Status != StatusPaused {
+		t.Fatalf("Status = %s, want paused", node.Status)
+	}
+	if node.Summary != "token budget exhausted" {
+		t.Errorf("Summary = %q", node.Summary)
+	}
+	if node.Finished.IsZero() {
+		t.Error("Finished not set on Pause")
+	}
+	if len(st.saved) == 0 || st.saved[len(st.saved)-1].Status != StatusPaused {
+		t.Errorf("persistNode not called with paused status; saved=%v", st.saved)
+	}
+}
+
+func TestPauseIdempotent(t *testing.T) {
+	tr := NewTree("", nil)
+	tr.Register(Node{ID: "d1"})
+	tr.Pause("d1", "first")
+	tr.Pause("d1", "second") // 已 Paused，应 no-op
+	node, _ := tr.Get("d1")
+	if node.Summary != "first" {
+		t.Errorf("Summary = %q, want 'first' (Pause should be idempotent on non-running)", node.Summary)
+	}
+}
+
+func TestFinishOnPaused(t *testing.T) {
+	tr := NewTree("", nil)
+	tr.Register(Node{ID: "d1"})
+	tr.Pause("d1", "paused")
+	tr.Finish("d1", "done after resume", nil) // Paused 允许 Finish（resume 完成路径）
+	node, _ := tr.Get("d1")
+	if node.Status != StatusDone {
+		t.Errorf("Status = %s, want done (Paused->Done)", node.Status)
+	}
+	if node.Summary != "done after resume" {
+		t.Errorf("Summary = %q", node.Summary)
+	}
+}
+
+func TestResumePaused(t *testing.T) {
+	st := &captureStore{}
+	tr := NewTree("s1", st)
+	tr.Register(Node{ID: "d1", Role: "domain"})
+	tr.Pause("d1", "token budget exhausted")
+	cancelled := false
+	if !tr.Resume("d1", func() { cancelled = true }) {
+		t.Fatal("Resume returned false for paused node")
+	}
+	node, _ := tr.Get("d1")
+	if node.Status != StatusRunning {
+		t.Errorf("Status = %s, want running", node.Status)
+	}
+	if !node.Finished.IsZero() {
+		t.Error("Finished not cleared on Resume")
+	}
+	if node.Summary != "" {
+		t.Errorf("Summary = %q, want empty after Resume", node.Summary)
+	}
+	// persistNode 应已写入 running（Cancel 之后会再写 cancelled，故扫描而非取末尾）。
+	var hasRunning bool
+	for _, n := range st.saved {
+		if n.Status == StatusRunning {
+			hasRunning = true
+		}
+	}
+	if !hasRunning {
+		t.Errorf("persistNode not called with running status; saved=%v", st.saved)
+	}
+	// cancel 应已绑定：Cancel 触发。
+	tr.Cancel("d1")
+	if !cancelled {
+		t.Error("Resume-bound cancel not invoked by Cancel")
+	}
+}
+
+func TestResumeNonPausedNoOp(t *testing.T) {
+	tr := NewTree("", nil)
+	tr.Register(Node{ID: "d1"})
+	if tr.Resume("d1", func() {}) {
+		t.Error("Resume returned true for running (non-paused) node")
+	}
+}
+
 // fakeTreeStore 是测试用的 TreeStore 内存实现,记录 SaveNode 调用并支持 LoadNodes 返回预设数据。
 type fakeTreeStore struct {
 	saved   map[string]Node // 按 nodeID 索引

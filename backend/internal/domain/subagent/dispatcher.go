@@ -116,8 +116,10 @@ type Dispatcher struct {
 
 	// timeout 是子 Agent 独立执行的最大时长；<=0 表示不限制。默认 30 分钟。
 	timeout time.Duration
-	// loopCfg 是子 Agent ReAct 主循环的运行时配置（轮数/重试/历史滑窗等）。
-	loopCfg agent.LoopConfig
+	// loopCfgByRole 按角色返回 ReAct 主循环配置:不同角色 token 预算分级
+	// (domain 50K 暂停可恢复 / 叶子助手 20K 部分回灌 / meta 0 不限制)。
+	// 为 nil 时用 agent.NopLoopConfig 兜底(测试场景)。
+	loopCfgByRole func(string) agent.LoopConfig
 	// searcher 可选的块记忆检索器；为 nil 时跳过拆分任务的块记忆召回。
 	searcher BlockMemorySearcher
 	// saver 可选的块记忆写入器；为 nil 或 writeEnabled 为 false 时跳过子 Agent 结果沉淀。
@@ -141,6 +143,11 @@ type Dispatcher struct {
 	// 派发前 Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
 	// 为 nil 时关闭树跟踪（测试场景），不影响派发主流程。
 	treeFn func(sessionID string) *orchestrator.Tree
+
+	// msgStore 持久化 Paused DomainAgent 的完整 ReAct 消息历史。
+	// DomainAgent 触达 token 上限时 SaveMessages 落库,resume 时 LoadMessages 重建上下文。
+	// 为 nil 时跳过持久化(测试场景:domain 到限仍返 errPaused 但 history 不存,无法 resume)。
+	msgStore agent.MessagesStore
 
 	// factExtractor 从子 Agent 输出中提取关键事实，替代原始 result.Text 直接落库。
 	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
@@ -225,6 +232,33 @@ func (d *Dispatcher) WaitForAnyChild(parentID string, timeout time.Duration) boo
 	}
 }
 
+// HasPausedChild 返回父 Agent 是否有 StatusPaused 的子 DomainAgent 节点。
+// 实现 agent.PausedChildChecker 接口，供 MetaAgent 父终结保护 wait loop 检测：
+// 子 domain 触达 token 上限进入 Paused 后，父 MetaAgent 无限 budget 不会自行暂停，
+// 在 wait loop 中调此方法检测，命中则跳出返回 PausedOnChild，由上层 pauseSession
+// 置会话暂停态，等用户"继续"恢复该 domain（各 Agent 独立上下文）。
+// parentID 对 MetaAgent 即 sessionID（其 a.name）；含 "/" 时取前段（防御性，子 Agent 派发场景不达）。
+// treeFn 为 nil 时返回 false（测试场景）。
+func (d *Dispatcher) HasPausedChild(parentID string) bool {
+	if d.treeFn == nil || parentID == "" {
+		return false
+	}
+	sid := parentID
+	if i := strings.Index(parentID, "/"); i > 0 {
+		sid = parentID[:i]
+	}
+	t := d.treeFn(sid)
+	if t == nil {
+		return false
+	}
+	for _, n := range t.Snapshot() {
+		if n.ParentID == parentID && n.Status == orchestrator.StatusPaused {
+			return true
+		}
+	}
+	return false
+}
+
 // NewDispatcher 创建一个新的子 Agent 调度器。
 // registry、models、tools、mailbox 必须传入；memory 可以为 nil，nil 时内部使用 NopMemoryPipeline。
 func NewDispatcher(
@@ -251,10 +285,20 @@ func (d *Dispatcher) WithTimeout(t time.Duration) *Dispatcher {
 	return d
 }
 
-// WithLoopConfig 配置子 Agent ReAct 主循环的运行时参数（轮数/重试/历史滑窗等）。
-func (d *Dispatcher) WithLoopConfig(c agent.LoopConfig) *Dispatcher {
-	d.loopCfg = c
+// WithLoopConfigByRole 注入按角色返回 LoopConfig 的函数,使不同角色 token 预算分级
+// (domain 50K / 叶子助手 20K / meta 0)。bootstrap 传 reactCfg.LoopConfigByRole 方法值。
+func (d *Dispatcher) WithLoopConfigByRole(fn func(string) agent.LoopConfig) *Dispatcher {
+	d.loopCfgByRole = fn
 	return d
+}
+
+// loopConfigFor 返回角色的 LoopConfig。loopCfgByRole 未注入(测试场景)时用零值默认:
+// 由 ReActAgent 的 WithLoopConfig 兜底(MaxIterations=0 即不限制,budget=0 不限制)。
+func (d *Dispatcher) loopConfigFor(roleID string) agent.LoopConfig {
+	if d.loopCfgByRole != nil {
+		return d.loopCfgByRole(roleID)
+	}
+	return agent.LoopConfig{}
 }
 
 // WithBlockMemorySearcher 注入块记忆检索器，使子 Agent 启动前能按拆分任务文本召回相关块记忆。
@@ -308,6 +352,14 @@ func (d *Dispatcher) WithPersonaInjector(p agent.PersonaInjector) *Dispatcher {
 // 传 nil 关闭树跟踪（默认关闭）；HTTP API 的 /tree 与 /cancel 端点依赖此树。
 func (d *Dispatcher) WithTree(fn func(sessionID string) *orchestrator.Tree) *Dispatcher {
 	d.treeFn = fn
+	return d
+}
+
+// WithMessagesStore 注入 Paused DomainAgent 消息历史持久化层。
+// DomainAgent 触达 token 上限时 SaveMessages 落库,resume 时 LoadMessages 重建上下文。
+// 为 nil 时跳过持久化(测试场景)。
+func (d *Dispatcher) WithMessagesStore(s agent.MessagesStore) *Dispatcher {
+	d.msgStore = s
 	return d
 }
 
@@ -670,10 +722,12 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	}
 	go func() {
 		defer cancel()
-		// 无论 runSubAgent 以何种方式结束，都递减父 Agent 的未决计数并发出完成信号，
-		// 唤醒可能在 WaitForAnyChild 中等待的父 Agent。
-		defer d.trackChildDone(parentID)
-		d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, started)
+		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
+		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
+		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, started)
+		if !paused {
+			d.trackChildDone(parentID)
+		}
 	}()
 
 	// 返回成功结果，Output 为子 Agent ID，父 Agent 可用该 ID 查询或接收后续通知。
@@ -690,9 +744,24 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 // started 为派发起始时间，用于计算耗时并写入完成/失败日志。
 // domain 为领域分类简称（仅 role_id="domain" 时有效，用于子 Agent 展示名）。
 // responsibility 为职责边界描述，注入 DomainAgent 系统提示词。
-func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string, started time.Time) {
+// 返回 paused=true 表示 DomainAgent 触达 token 上限进入 Paused(已存 history + tree.Pause),
+// 调用方不应 trackChildDone(保持父未决计数 >0 触发 MetaAgent 暂停)。
+func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string, started time.Time) bool {
 	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
 	duration := time.Since(started)
+	if errors.Is(err, errPaused) {
+		// DomainAgent 暂停:history 已存,tree 已 Pause。不 notify、不 treeFinish、不 trackChildDone。
+		log.Printf("[subagent] PAUSED: sub=%s role=%s duration=%s (token budget, awaiting resume)", subAgentID, roleDef.ID, duration)
+		return true
+	}
+	if errors.Is(err, errPartialReturn) {
+		// 叶子助手部分回灌:treeFinish Done + notify 父部分产出。trackChildDone 照常减。
+		partial := result.Text
+		log.Printf("[subagent] PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
+		d.treeFinish(ctx, subAgentID, "部分完成: "+partial, nil)
+		d.notify(parentID, subAgentID, "子 Agent 已达 token 上限,返回部分完成。\n"+partial)
+		return false
+	}
 	if err != nil {
 		partial := ""
 		if result.History != nil {
@@ -701,13 +770,14 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		log.Printf("[subagent] FAIL: sub=%s role=%s duration=%s err=%v partial=%q", subAgentID, roleDef.ID, duration, err, truncateRunes(partial, 200))
 		d.treeFinish(ctx, subAgentID, partial, err)
 		d.notify(parentID, subAgentID, formatSubAgentFailure(err, result, d.timeout, partial))
-		return
+		return false
 	}
 
 	// 成功：通知父 Agent。
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
 	d.treeFinish(ctx, subAgentID, result.Text, nil)
 	d.notify(parentID, subAgentID, result.Text)
+	return false
 }
 
 // treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
@@ -778,7 +848,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
-		WithLoopConfig(d.loopCfg).
+		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
 		WithWorkDir(d.subAgentWorkDir()).
 		WithPersonaInjector(d.persona)
 
@@ -846,7 +916,29 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	}
 
 	if result.LimitReached {
-		return sub, result, errLimitReached
+		if roleDef.ID == "domain" {
+			// DomainAgent 触达 token 上限:存完整 history + tree.Pause,不 notify 父、不 trackChildDone。
+			// 父 MetaAgent 经 PausedChildChecker 检测后主动暂停会话;用户"继续"时 resumePausedDomain
+			// 从 agent_messages 加载 history 续跑(resume 重置 budget 给新 50K)。
+			sid := tool.SessionIDFromContext(ctx)
+			if d.msgStore != nil && sid != "" {
+				if err := d.msgStore.SaveMessages(ctx, subAgentID, sid, result.History); err != nil {
+					log.Printf("[subagent] PAUSE save messages failed: sub=%s err=%v", subAgentID, err)
+				}
+			}
+			if d.treeFn != nil && sid != "" {
+				if t := d.treeFn(sid); t != nil {
+					t.Pause(subAgentID, "token budget exhausted")
+				}
+			}
+			log.Printf("[subagent] PAUSED: sub=%s role=domain (token budget, history persisted)", subAgentID)
+			return sub, result, errPaused
+		}
+		// 叶子助手触达 token 上限:不持久化,把部分产出塞 result.Text 返回给父 mailbox + 标 Done。
+		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
+		result.Text = partial
+		log.Printf("[subagent] PARTIAL: sub=%s role=%s (token budget, partial returned)", subAgentID, roleDef.ID)
+		return sub, result, errPartialReturn
 	}
 
 	_ = mem.Write(subAgentID, agent.MemoryEvent{
@@ -861,8 +953,136 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	return sub, result, nil
 }
 
+// ResumePaused 恢复一个因触达 token 上限而 Paused 的 DomainAgent。
+// 从 msgStore 加载其完整消息历史，用 fresh budget（usedTokens 局部变量自动重置）重建
+// domain ReActAgent 续跑。不强制压缩——靠 Assemble 步频自动压缩（Pipeline 状态延续：
+// 同 subAgentID -> compressCounters/events 跨 resume 保留）。
+//
+// 生命周期：
+//   - 再触限：SaveMessages 覆盖 + tree.Pause + 返回 result.LimitReached=true（ReactService 置会话 PausedOnChild）。
+//   - 完成：tree.Finish Done + notify 父 mailbox + trackChildDone（父 MetaAgent 解除阻塞）。
+//   - 出错：treeFinish Failed + notify 失败 + trackChildDone + 返回 err。
+//
+// pausedNodeID 为 Paused 节点 ID；parentID 从节点 ParentID 取。
+// 前置缺失（sid/treeFn/msgStore 为空）或加载空时返回错误，调用方应回退 pauseSession 不跑（防丢上下文）。
+func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (agent.ReactResult, error) {
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" || d.treeFn == nil || d.msgStore == nil {
+		return agent.ReactResult{}, fmt.Errorf("resume prerequisites not met (sid/tree/msgStore)")
+	}
+	t := d.treeFn(sid)
+	if t == nil {
+		return agent.ReactResult{}, fmt.Errorf("tree not found for session %s", sid)
+	}
+	var pausedNode orchestrator.Node
+	found := false
+	for _, n := range t.Snapshot() {
+		if n.ID == pausedNodeID {
+			pausedNode = n
+			found = true
+			break
+		}
+	}
+	if !found {
+		return agent.ReactResult{}, fmt.Errorf("paused node not found: %s", pausedNodeID)
+	}
+	if pausedNode.Role != "domain" {
+		return agent.ReactResult{}, fmt.Errorf("paused node %s is not a domain agent (role=%s)", pausedNodeID, pausedNode.Role)
+	}
+	parentID := pausedNode.ParentID
+
+	msgs, err := d.msgStore.LoadMessages(ctx, pausedNodeID)
+	if err != nil {
+		return agent.ReactResult{}, fmt.Errorf("load messages: %w", err)
+	}
+	if len(msgs) == 0 {
+		return agent.ReactResult{}, fmt.Errorf("no persisted messages for %s", pausedNodeID)
+	}
+
+	roleDef := d.registry.Get("domain")
+	if roleDef == nil {
+		return agent.ReactResult{}, fmt.Errorf("domain role not found")
+	}
+	if hint := strings.TrimSpace(pausedNode.Domain); hint != "" {
+		roleDef.Name = textutil.TruncateRunes(hint, 16, "…") + "领域Agent"
+	}
+
+	provider, err := d.models.GetBladesProvider(ctx, "domain")
+	if err != nil {
+		return agent.ReactResult{}, fmt.Errorf("get model: %w", err)
+	}
+	mem := d.memory
+	if mem == nil {
+		mem = agent.NopMemoryPipeline{}
+	}
+	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
+		WithMailbox(d.mailbox).
+		WithMemory(mem).
+		WithLoopConfig(d.loopConfigFor("domain")).
+		WithWorkDir(d.subAgentWorkDir()).
+		WithPersonaInjector(d.persona)
+	if d.log != nil {
+		sub = sub.WithLogger(d.log.WithSession(sid).WithAgent(roleDef.Name))
+	}
+	if d.liveFn != nil {
+		forwarder := d.liveFn
+		sub = sub.WithLiveEvents(func(ev agent.LiveEvent) { forwarder(sid, ev) })
+	}
+
+	subCtx := context.Background()
+	subCtx = tool.WithSessionID(subCtx, sid)
+	cancel := context.CancelFunc(func() {})
+	if d.timeout > 0 {
+		subCtx, cancel = context.WithTimeout(subCtx, d.timeout)
+	}
+	t.Resume(pausedNodeID, cancel)
+	d.running.Store(pausedNodeID, sub)
+	defer d.running.Delete(pausedNodeID)
+	defer cancel()
+	defer func() {
+		if d.mailbox != nil {
+			d.mailbox.Purge(pausedNodeID)
+		}
+	}()
+
+	log.Printf("[subagent] resume: sub=%s parent=%s domain=%s msgs=%d", pausedNodeID, parentID, pausedNode.Domain, len(msgs))
+	result, err := sub.RunWithHistory(subCtx, "继续", msgs)
+	if err != nil {
+		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
+		log.Printf("[subagent] resume FAIL: sub=%s err=%v", pausedNodeID, err)
+		d.treeFinish(subCtx, pausedNodeID, partial, err)
+		d.notify(parentID, pausedNodeID, formatSubAgentFailure(err, result, d.timeout, partial))
+		d.trackChildDone(parentID)
+		return result, err
+	}
+	if result.LimitReached {
+		if saveErr := d.msgStore.SaveMessages(subCtx, pausedNodeID, sid, result.History); saveErr != nil {
+			log.Printf("[subagent] resume re-pause save messages failed: sub=%s err=%v", pausedNodeID, saveErr)
+		}
+		t.Pause(pausedNodeID, "token budget exhausted (resume)")
+		log.Printf("[subagent] resume RE-PAUSED: sub=%s (token budget)", pausedNodeID)
+		return result, nil
+	}
+
+	log.Printf("[subagent] resume DONE: sub=%s result_len=%d", pausedNodeID, len(result.Text))
+	d.treeFinish(subCtx, pausedNodeID, result.Text, nil)
+	d.notify(parentID, pausedNodeID, result.Text)
+	d.trackChildDone(parentID)
+	return result, nil
+}
+
 // errLimitReached 是子 Agent 达到最大轮数的哨兵错误，供 formatSubAgentFailure 区分通知文案。
 var errLimitReached = errors.New("sub-agent limit reached")
+
+// errPaused 标记 DomainAgent 触达 token 上限进入 Paused(runSubAgentOnce 已存 history + tree.Pause)。
+// runSubAgent 见此信号:不 notify 父、不 treeFinish、不 trackChildDone,父 PendingChildren 保持 >0,
+// 由 MetaAgent 经 PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复该 domain。
+var errPaused = errors.New("sub-agent paused on token budget")
+
+// errPartialReturn 标记叶子助手触达 token 上限,已把部分产出(LastAssistantText)塞入 result.Text。
+// runSubAgent 见此信号:treeFinish Done("部分完成")+ notify 父 mailbox 部分 + trackChildDone 照常减
+// (叶子是叶子,不持久化 history,父 domain 收部分后自行决定重派或接手)。
+var errPartialReturn = errors.New("sub-agent partial return on token budget")
 
 // formatSubAgentFailure 把 runSubAgentOnce 返回的错误格式化为父邮箱通知文案，
 // 保留原有"超时/轮数上限/通用失败"三段语义与部分进度回传。
