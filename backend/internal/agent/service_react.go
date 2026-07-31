@@ -105,7 +105,7 @@ type ReactRuntimeConfig struct {
 	// 被 TokenBudgetPerRole 覆盖:按角色设预算时此项对该角色无效。
 	TokenBudgetPerGoal int
 	// TokenBudgetPerRole 按角色 ID 设单 Agent token 上限。未列出角色按默认:
-	// domain=50000, meta=200000(安全网,不为 0 因 maxIter=-1 已无界), 其他(叶子助手)=20000。
+	// domain=120000, meta=200000(安全网,不为 0 因 maxIter=-1 已无界), 其他(叶子助手)=40000。
 	// nil 时全部走默认。显式值覆盖默认,resume 时重置(各 Agent 独立预算)。
 	TokenBudgetPerRole map[string]int
 }
@@ -185,8 +185,9 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 }
 
 // LoopConfigByRole 返回按角色定制的 LoopConfig:在 LoopConfig() 基础上按 roleID 覆盖 TokenBudget。
-// 预算分级:DomainAgent 50000(到限暂停可恢复),叶子助手 20000(到限返回部分产出),
+// 预算分级:DomainAgent 120000(到限暂停可恢复),叶子助手 40000(到限返回部分产出),
 // meta 200000(安全网,不收敛时暂停等续跑;不为 0 因 maxIter=-1 已无界,双无界会死循环)。
+// codegen 单次可吐 10K+ token(如塔防 config.js),旧值 50K/20K 扛不住多文件生成,抬至 120K/40K。
 // TokenBudgetPerRole 显式配置覆盖默认;未列出角色按上述默认。
 // resume 时 usedTokens 局部变量自动重置,即每个 Agent 各自独立预算。
 func (c ReactRuntimeConfig) LoopConfigByRole(roleID string) LoopConfig {
@@ -195,7 +196,7 @@ func (c ReactRuntimeConfig) LoopConfigByRole(roleID string) LoopConfig {
 	return lc
 }
 
-// roleTokenBudget 返回角色 token 预算:显式配置优先,否则按角色默认(domain 50000 / meta 200000 / 其他 20000)。
+// roleTokenBudget 返回角色 token 预算:显式配置优先,否则按角色默认(domain 120000 / meta 200000 / 其他 40000)。
 // meta 不给 0(无限):config tool_call_max_rounds=-1 已使 maxIter 无界,若 budget 也无界,
 // 模型不收敛时会无限循环(实证:TUI 重复思考不前进)。200K 安全网让 meta 不收敛时暂停等续跑。
 func (c ReactRuntimeConfig) roleTokenBudget(roleID string) int {
@@ -204,11 +205,11 @@ func (c ReactRuntimeConfig) roleTokenBudget(roleID string) int {
 	}
 	switch roleID {
 	case "domain":
-		return 50000
+		return 120000
 	case "meta":
 		return 200000
 	default:
-		return 20000
+		return 40000
 	}
 }
 

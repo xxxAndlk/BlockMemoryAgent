@@ -452,6 +452,12 @@ func (a *ReActAgent) generate(ctx context.Context, req *blades.ModelRequest) (*b
 			if ctx.Err() != nil {
 				return nil, err
 			}
+			// 单次调用超时（callCtx deadline）：慢推理模型（如 glm-5.2 thinking）重试只会
+			// 重复同样的超时，白等 N×timeout（实证：180s ×4 重试 = 12min "重复思考不前进"）。
+			// 直接返回，让上层以可见错误结束或暂停，而非重试风暴卡死。
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
 			continue
 		}
 		// 响应为空属模型异常，不重试（重试大概率同样为空），直接报错。

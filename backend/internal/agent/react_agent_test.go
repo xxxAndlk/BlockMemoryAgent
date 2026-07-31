@@ -403,6 +403,36 @@ func TestReActAgent_GenerateRetryExhausted(t *testing.T) {
 	}
 }
 
+// deadlineProvider 模拟单次调用超时（返回 context.DeadlineExceeded），
+// 用于验证 generate() 不在 deadline 上重试（避免慢推理模型 180s×N 重试风暴）。
+type deadlineProvider struct{ calls int }
+
+func (m *deadlineProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	m.calls++
+	return nil, context.DeadlineExceeded
+}
+func (m *deadlineProvider) Name() string { return "deadline" }
+
+// TestReActAgent_GenerateNoRetryOnDeadline 验证单次调用超时（DeadlineExceeded）
+// 不会重试：慢推理模型重试只会重复同样超时，白等 N×timeout（实证 12min 卡死）。
+func TestReActAgent_GenerateNoRetryOnDeadline(t *testing.T) {
+	llm := &deadlineProvider{}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	agent := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).
+		WithLoopConfig(LoopConfig{RetryCount: 3, RetryBackoff: time.Millisecond})
+
+	_, err := agent.Run(context.Background(), "hi")
+	if err == nil {
+		t.Fatal("deadline 应返回错误")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err 应为 DeadlineExceeded, got %v", err)
+	}
+	if llm.calls != 1 {
+		t.Fatalf("deadline 不应重试, want 1 call, got %d", llm.calls)
+	}
+}
+
 // stubToolRegistry 返回固定大输出的工具注册表，用于输出截断测试。
 type stubToolRegistry struct {
 	output string

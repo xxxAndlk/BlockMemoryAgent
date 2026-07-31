@@ -49,19 +49,19 @@ agent:
   tool_call_max_rounds: -1       # ReAct 最大 LLM 轮数（达到上限暂停等待用户续跑，不判失败），负数表示不限制
   retry_count: 3                 # Assistant 任务指数退避重试次数
   retry_backoff_ms: 100          # 重试初始退避时长（毫秒）
-  react_llm_timeout_sec: 180     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制
+  react_llm_timeout_sec: 600     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断,改 600s 给一次调用留够跑完。配合 generate() 不在 deadline 上重试,卡死时 600s 即报错而非 4×180=12min。
   sub_agent_timeout_min: 30      # 子 Agent 独立执行超时（分钟），负数表示不限制
   tool_output_history_max_runes: 2000 # 写入历史的单条工具输出最大字符数，负数表示不截断
   token_budget_per_goal: 100000   # 单次目标累计 token 上限（input+output 之和，跨轮累加），超限暂停等用户续跑；<=0 不限制
-  token_budget_per_role:          # 按角色单 Agent token 上限（resume 重置；覆盖 token_budget_per_goal）。未列角色按默认:domain 50000 / 叶子助手 20000 / meta 200000(安全网,防不收敛死循环)
-    domain: 50000
+  token_budget_per_role:          # 按角色单 Agent token 上限（resume 重置；覆盖 token_budget_per_goal）。未列角色按默认:domain 120000 / 叶子助手 40000 / meta 200000(安全网,防不收敛死循环)。codegen 单次可吐 10K+ token,旧值 50K/20K 扛不住塔防这类多文件生成,撞限暂停改 120K/40K。
+    domain: 120000
     meta: 200000
-    code_assistant: 20000
-    ui_assistant: 20000
-    prompt_reviewer: 20000
-    code_reviewer: 20000
-    test_assistant: 20000
-    doc_assistant: 20000
+    code_assistant: 40000
+    ui_assistant: 40000
+    prompt_reviewer: 40000
+    code_reviewer: 40000
+    test_assistant: 40000
+    doc_assistant: 40000
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
 
   # -- DAG / 会话恢复 --

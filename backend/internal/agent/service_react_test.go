@@ -560,7 +560,7 @@ func TestReactService_InjectTopicRecall(t *testing.T) {
 }
 
 // TestLoopConfigByRole 验证按角色返回的 token 预算分级：
-// domain=50000 / meta=200000(安全网) / 其他=20000；TokenBudgetPerRole 显式配置覆盖默认(含显式 meta:0=不限制)。
+// domain=120000 / meta=200000(安全网) / 其他=40000；TokenBudgetPerRole 显式配置覆盖默认(含显式 meta:0=不限制)。
 func TestLoopConfigByRole(t *testing.T) {
 	cfg := ReactRuntimeConfig{TokenBudgetPerRole: map[string]int{
 		"domain":         50000,
@@ -571,8 +571,8 @@ func TestLoopConfigByRole(t *testing.T) {
 		"domain":         50000,
 		"meta":           0, // 显式设 0 -> 不限制(override 默认 200000)
 		"code_assistant": 20000,
-		"ui_assistant":   20000, // 未在 map 中 -> 默认 20000
-		"unknown_role":   20000, // 默认
+		"ui_assistant":   40000, // 未在 map 中 -> 默认 40000
+		"unknown_role":   40000, // 默认
 	}
 	for role, want := range cases {
 		got := cfg.LoopConfigByRole(role).TokenBudget
@@ -585,21 +585,21 @@ func TestLoopConfigByRole(t *testing.T) {
 // TestLoopConfigByRoleDefault 验证未注入 TokenBudgetPerRole 时按角色默认值。
 func TestLoopConfigByRoleDefault(t *testing.T) {
 	cfg := ReactRuntimeConfig{}
-	if got := cfg.LoopConfigByRole("domain").TokenBudget; got != 50000 {
-		t.Errorf("domain default = %d, want 50000", got)
+	if got := cfg.LoopConfigByRole("domain").TokenBudget; got != 120000 {
+		t.Errorf("domain default = %d, want 120000", got)
 	}
 	if got := cfg.LoopConfigByRole("meta").TokenBudget; got != 200000 {
 		t.Errorf("meta default = %d, want 200000 (safety net, not 0)", got)
 	}
-	if got := cfg.LoopConfigByRole("code_assistant").TokenBudget; got != 20000 {
-		t.Errorf("assistant default = %d, want 20000", got)
+	if got := cfg.LoopConfigByRole("code_assistant").TokenBudget; got != 40000 {
+		t.Errorf("assistant default = %d, want 40000", got)
 	}
 }
 
 // TestLoopConfigByRoleOverride 验证显式配置覆盖默认。
 func TestLoopConfigByRoleOverride(t *testing.T) {
 	cfg := ReactRuntimeConfig{TokenBudgetPerRole: map[string]int{
-		"domain": 30000, // 覆盖默认 50000
+		"domain": 30000, // 覆盖默认 120000
 	}}
 	if got := cfg.LoopConfigByRole("domain").TokenBudget; got != 30000 {
 		t.Errorf("override domain = %d, want 30000", got)

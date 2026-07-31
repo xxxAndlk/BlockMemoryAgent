@@ -53,8 +53,8 @@ type LLMRuntimeConfig struct {
 	// 被 TokenBudgetPerRole 覆盖:按角色设预算时此项对该角色无效。
 	TokenBudgetPerGoal int `yaml:"token_budget_per_goal"`
 	// TokenBudgetPerRole 按角色 ID 设单 Agent 累计 token 上限（resume 重置）。
-	// DomainAgent 默认 50000;叶子助手默认 20000;meta 默认 200000(安全网,不为 0 因 config tool_call_max_rounds=-1 使 maxIter 无界,双无界会死循环)。
-	// 未列出的角色按上述默认。显式配置覆盖默认,如 token_budget_per_role: {domain: 50000}。
+	// DomainAgent 默认 120000;叶子助手默认 40000;meta 默认 200000(安全网,不为 0 因 config tool_call_max_rounds=-1 使 maxIter 无界,双无界会死循环)。
+	// codegen 单次可吐 10K+ token,旧值 50K/20K 扛不住多文件生成。未列出的角色按上述默认。显式配置覆盖默认,如 token_budget_per_role: {domain: 120000}。
 	TokenBudgetPerRole map[string]int `yaml:"token_budget_per_role"`
 }
 
