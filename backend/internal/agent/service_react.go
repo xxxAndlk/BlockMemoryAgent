@@ -1441,8 +1441,12 @@ func (s *ReactService) cancel(ctx context.Context, sessionID string) error {
 		s.store.mu.Unlock()
 		return ErrSessionNotFound
 	}
-	// 只有运行中的会话才能被取消。
-	if session.Status != enums.SessionStatusRunning {
+	// 运行中或暂停待续（awaiting_clarify / paused_on_child）的会话都可取消：
+	// 暂停态没有运行中的 goroutine，但必须允许用户退出暂停死锁/死等场景
+	// （实证：paused_on_child 态拒绝取消，会话无任何逃生通道，永久卡死）。
+	switch session.Status {
+	case enums.SessionStatusRunning, enums.SessionStatusAwaitingClarify, enums.SessionStatusPausedOnChild:
+	default:
 		s.store.mu.Unlock()
 		return fmt.Errorf("%w: session is not running", ErrInvalidSessionState)
 	}

@@ -259,6 +259,39 @@ func (d *Dispatcher) HasPausedChild(parentID string) bool {
 	return false
 }
 
+// findPendingDomainSibling 在 Agent 树快照中查找同一父 Agent 下仍在执行/暂停的
+// 同领域（domain 相同）domain 子 Agent，命中返回其子 Agent ID，无则返回空串。
+// domain 为空时不去重（LLM 漏填 domain 的场景无法可靠判重，放行）。
+// 供 call_sub_agent 重复派发去重使用。
+func (d *Dispatcher) findPendingDomainSibling(ctx context.Context, parentID, domain string) string {
+	if d.treeFn == nil || parentID == "" {
+		return ""
+	}
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		if i := strings.Index(parentID, "/"); i > 0 {
+			sid = parentID[:i]
+		}
+	}
+	t := d.treeFn(sid)
+	if t == nil {
+		return ""
+	}
+	wantDomain := strings.TrimSpace(domain)
+	for _, n := range t.Snapshot() {
+		if n.ParentID != parentID || n.Role != "domain" {
+			continue
+		}
+		if n.Status != orchestrator.StatusRunning && n.Status != orchestrator.StatusPaused {
+			continue
+		}
+		if wantDomain != "" && strings.TrimSpace(n.Domain) == wantDomain {
+			return n.ID
+		}
+	}
+	return ""
+}
+
 // NewDispatcher 创建一个新的子 Agent 调度器。
 // registry、models、tools、mailbox 必须传入；memory 可以为 nil，nil 时内部使用 NopMemoryPipeline。
 func NewDispatcher(
@@ -665,6 +698,18 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf("role %s cannot be called by %s", roleID, parentID)}
 	}
 
+	// 重复派发去重：同一父 Agent 已有同领域（domain 相同）的子 Agent 在执行/暂停中时拒绝。
+	// 实证：MetaAgent 未等 mailbox 回传即重复派发同一任务（渲染引擎×3、游戏逻辑×2），
+	// 多个子 Agent 并发写同一批文件互相覆盖、接口漂移。Agent 树是权威状态，直接查快照，
+	// 不另维护计数（杜绝清理遗漏）。拒绝发生在限额计数之前，不烧派发配额。
+	if roleID == "domain" {
+		if dup := d.findPendingDomainSibling(ctx, parentID, domain); dup != "" {
+			return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf(
+				"duplicate dispatch: 同领域子 Agent %s 正在执行中（domain=%s）。请等待其 [mailbox from %s] 回传结果后再做下一步；如需补充或修正需求，等其完成后再派发",
+				dup, domain, dup)}
+		}
+	}
+
 	// 全局派发总数限额：同一 session 内所有角色的派发合计超过 maxTotalDispatches 时拒绝。
 	// 早期实现按 (callerRole->calleeRole) 对计数，实为"每角色最多 N 次"，多文件编排任务
 	// 中途即被卡死（实证：meta->code_assistant 5 次烧光后剩余文件无法派发）。
@@ -851,6 +896,12 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
 		WithWorkDir(d.subAgentWorkDir()).
 		WithPersonaInjector(d.persona)
+	// 注入未决子 Agent 检查器：子 Agent 也能递归派发（domain -> 叶子助手），
+	// 无此检查时子 Agent 会在派发后立刻给出中间汇报式终答（不等待 mailbox），
+	// 父链路上的 Agent 会把“中间状态”误当最终结果（实证：domain-1 拆两个子任务后
+	// 直接 DONE，MetaAgent 把“等待 mailbox 结果”当终答，会话 completed 但产出缺失）。
+	// Dispatcher 自身实现 PendingChildrenChecker（PendingChildren/WaitForAnyChild）。
+	sub = sub.WithPendingChildrenChecker(d)
 
 	// 注入会话级日志器：派生 session-scoped logger，使子 Agent LLM I/O 写入同一会话的 session_logs。
 	// sessionID 从 ctx 取（call_sub_agent 异步路径已 WithSessionID），agentName 用 roleDef.Name（DomainAgent 已按任务首行覆写）。
@@ -1021,6 +1072,9 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		WithLoopConfig(d.loopConfigFor("domain")).
 		WithWorkDir(d.subAgentWorkDir()).
 		WithPersonaInjector(d.persona)
+	// 同 runSubAgentOnce：resume 重建的 domain Agent 也可能继续递归派发，
+	// 需要终结保护等待自己的子 Agent（Dispatcher 自身实现 PendingChildrenChecker）。
+	sub = sub.WithPendingChildrenChecker(d)
 	if d.log != nil {
 		sub = sub.WithLogger(d.log.WithSession(sid).WithAgent(roleDef.Name))
 	}

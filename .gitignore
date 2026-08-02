@@ -39,3 +39,4 @@ go.work.sum
 /.bma
 /test
 /.claude
+/.tui-driver

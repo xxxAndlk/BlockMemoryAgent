@@ -348,6 +348,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入权威 Agent 树访问器：Dispatcher 派发时 Register/Finish/SetCancel，
 	// HTTP API 的 /tree 与 /agents/{aid}/cancel 端点通过 ReactService.TreeFor 读取。
 	subAgentDispatcher.WithTree(agentSvc.TreeFor)
+	// 注入 Paused DomainAgent 消息历史持久化层：domain 触达 token 上限时
+	// SaveMessages 落库 agent_messages，用户"继续"时 ResumePaused 从该表
+	// LoadMessages 重建 domain Agent 续跑。缺失会导致暂停后无法恢复
+	// （ResumePaused 前置校验 msgStore == nil 直接失败）。
+	subAgentDispatcher.WithMessagesStore(agent.NewPostgresMessagesStore(pgStore.DB()))
 	// 注入未决子 Agent 检查器，开启父会话终结保护：
 	// 父 Agent 给出终答前若有未决子 Agent，阻塞等待其完成，防止迟到 mailbox 消息丢失。
 	agentSvc.SetPendingChildrenChecker(subAgentDispatcher)

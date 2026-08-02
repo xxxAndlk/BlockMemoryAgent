@@ -8,6 +8,9 @@ import (
 	"encoding/json"
 	// errors 用于构造模拟的瞬时 LLM 错误。
 	"errors"
+	// os 与 path/filepath 用于校验工具落盘文件内容。
+	"os"
+	"path/filepath"
 	// strings 用于构造长字符串与断言内容。
 	"strings"
 	// time 用于重试退避等时间参数。
@@ -594,5 +597,105 @@ func TestReActAgent_EmptyResponseStreakFails(t *testing.T) {
 	}
 	if llm.calls != maxEmptyResponses {
 		t.Fatalf("应在第 %d 次空响应后报错，got %d calls", maxEmptyResponses, llm.calls)
+	}
+}
+
+// TestReActAgent_TruncatesToolCallInputsInHistory 验证超长工具入参（如 WriteFile 全文）
+// 只在写入历史的副本中截断，派发执行仍用完整入参：
+//   - 磁盘文件内容为完整的 3000 字（派发未被截断影响）；
+//   - 历史中 assistant 消息的 ToolCalls input 被截断（防止滑动窗口内逐轮重发耗尽预算）。
+func TestReActAgent_TruncatesToolCallInputsInHistory(t *testing.T) {
+	dir := t.TempDir()
+	reg := tool.NewBuiltinRegistry(dir, nil, nil)
+
+	full := strings.Repeat("字", 3000)
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			{
+				Role: blades.RoleAssistant,
+				Parts: []blades.Part{
+					blades.ToolPart{Name: "WriteFile", Request: string(mustJSON(map[string]any{"path": "big.txt", "content": full}))},
+				},
+			},
+			blades.AssistantMessage("done"),
+		},
+	}
+
+	agent := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg))
+	res, err := agent.Run(context.Background(), "write big.txt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 派发执行用完整入参：磁盘文件内容不被截断。
+	b, err := os.ReadFile(filepath.Join(dir, "big.txt"))
+	if err != nil {
+		t.Fatalf("read written file: %v", err)
+	}
+	if string(b) != full {
+		t.Fatalf("dispatched content truncated: got %d runes, want %d", len([]rune(string(b))), 3000)
+	}
+
+	// 历史中的工具入参被截断：assistant(tool) 消息的 content 值带截断标记。
+	var stored string
+	for _, m := range res.History {
+		for _, tc := range m.ToolCalls {
+			if tc.Name == "WriteFile" {
+				stored, _ = tc.Input["content"].(string)
+			}
+		}
+	}
+	if stored == "" {
+		t.Fatal("history missing WriteFile tool call")
+	}
+	if !strings.Contains(stored, "truncated") {
+		t.Fatalf("history tool input not truncated: len=%d runes", len([]rune(stored)))
+	}
+	if len([]rune(stored)) >= len([]rune(full)) {
+		t.Fatalf("history tool input should be shorter than full content: got %d runes", len([]rune(stored)))
+	}
+}
+
+// TestWindowMessages_WorkHistoryNotCollapsed 验证纯工作型历史（首条 user 后全是
+// assistant/tool 交替、窗口内无 user）裁剪后不塌缩：
+// 回归：旧实现锚定 user 边界，窗口内无 user 时走空整个窗口，只剩首条 user + 占位符
+// 两条消息，Agent 每轮失忆（实证：塔防配置 Agent msgs=2 反复重写 config.js 不收敛）。
+func TestWindowMessages_WorkHistoryNotCollapsed(t *testing.T) {
+	msgs := []ReactMessage{{Role: "user", Content: "task"}}
+	for i := 0; i < 20; i++ {
+		msgs = append(msgs,
+			ReactMessage{Role: "assistant", ToolCalls: []ToolCall{{ID: "c" + string(rune('a'+i)), Name: "WriteFile", Input: map[string]any{"path": "f"}}}},
+			ReactMessage{Role: "tool", Content: "ok"},
+		)
+	}
+	out := windowMessages(msgs, 30)
+	if len(out) < 10 {
+		t.Fatalf("工作型历史不应塌缩到 %d 条", len(out))
+	}
+	if out[0].Content != "task" {
+		t.Fatal("应保留首条 user 任务目标")
+	}
+	if !strings.Contains(out[1].Content, "省略") {
+		t.Fatalf("第 2 条应为省略说明，got: %s", out[1].Content)
+	}
+	// 保留段不得以孤立 tool 结果起刀（须从 assistant/user 开始，保证调用对完整）。
+	if out[2].Role == "tool" {
+		t.Fatalf("保留段不应从孤立 tool 结果开始")
+	}
+	// 最近的 assistant/tool 对应完整保留。
+	if out[len(out)-1].Content != "ok" {
+		t.Fatalf("最近消息应保留，got: %v", out[len(out)-1])
+	}
+
+	// 窗口下刀恰落在 tool 上时应前进到 assistant，不得产出孤立 tool 起始。
+	out2 := windowMessages(msgs, 29)
+	for _, m := range out2[2:] {
+		if m.Role == "tool" {
+			// 首个非占位消息不能是 tool；此处只需保证 out2[2] 非 tool。
+			break
+		}
+	}
+	if out2[2].Role == "tool" {
+		t.Fatal("保留段不应从孤立 tool 结果开始(max=29)")
 	}
 }

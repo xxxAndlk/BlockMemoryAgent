@@ -17,9 +17,11 @@ import (
 // 超过此次数将触发循环退出，避免无限重试。
 const maxConsecutiveFailures = 3
 
-// exploreBudget 是单个 Agent 任务内探索类工具（ReadFile/ListDir/RunCommand）调用次数硬上限。
+// exploreBudget 是单个 Agent 任务内探索类工具（ReadFile/ListDir）调用次数硬上限。
 // 防止 Agent 陷入探索循环不收敛：实证 domain-2 调 81 次探索工具 30m 超时未写完。
-// 超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。SearchInFiles/HTTPGet 不计入（定位性强、不发散）。
+// 超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。SearchInFiles/HTTPGet 不计入（定位性强）。
+// RunCommand 不计入：它是验证/动作工具（node --check、mkdir），封禁会让 Agent 写完文件后
+// 无法按纪律验证，在"必须验证"与"工具被拒"之间死循环（实证：配置 Agent 被拒 8 轮空转 4 分钟）。
 const exploreBudget = 8
 
 // maxRereadAttempts 是同一 scope+path 上"已读过"拦截的最大次数。
@@ -97,9 +99,10 @@ type Registry struct {
 	// 这些路径允许重复 ReadFile：LLM 写完文件后常需重读以验证修改/定位 syntax 错误，
 	// 简单的"已读过即拦截"会卡住修复循环。该集合在 WriteFile 成功时写入，readCheck 命中即放行。
 	writtenFiles map[string]map[string]bool
-	// exploreCount 按 scopeKey 记录本任务内探索类工具（ReadFile/ListDir/RunCommand）调用次数。
+	// exploreCount 按 scopeKey 记录本任务内探索类工具（ReadFile/ListDir）调用次数。
 	// 防止 Agent 陷入探索循环不收敛：实证 domain-2 调 81 次探索工具 30m 超时未写完。
-	// 超过 exploreBudget 后 ReadFile/ListDir/RunCommand 返回错误，逼迫 Agent 开始 WriteFile。
+	// 超过 exploreBudget 后 ReadFile/ListDir 返回错误，逼迫 Agent 开始 WriteFile。
+	// RunCommand 不计（验证/动作类），避免写完文件后无法验证陷入重试死循环。
 	exploreCount map[string]int
 	// rereadAttempts 按 scopeKey+path 记录"已读过"拦截次数。
 	// 超过 maxRereadAttempts 触发 LoopExit 终止循环（实证：代码助手对 config.js 反复 ReadFile 10+ 次）。
@@ -270,10 +273,11 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		}
 	}
 
-	// 探索预算：ReadFile/ListDir/RunCommand 合计调用次数上限，防 Agent 陷入探索循环不收敛。
+	// 探索预算：ReadFile/ListDir 合计调用次数上限，防 Agent 陷入探索循环不收敛。
 	// 实证 domain-2 调 81 次探索工具 30m 超时未写完。超预算返回错误逼迫 WriteFile。
 	// SearchInFiles/HTTPGet 不计（定位性强、不发散）。WriteFile/WriteSharedMemory 不计（产出类）。
-	if name == "ReadFile" || name == "ListDir" || name == "RunCommand" {
+	// RunCommand 不计（验证/动作类）：封禁会让 Agent 写完文件后无法验证而陷入重试死循环。
+	if name == "ReadFile" || name == "ListDir" {
 		if blocked := r.checkExploreBudget(ctx); blocked != "" {
 			result := &Result{Tool: name, Error: blocked}
 			r.fillResult(ctx, result, args)
@@ -302,7 +306,8 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	}
 
 	// 探索类工具成功后计数 +1（不论成功失败都计，避免失败重试绕过预算）。
-	if name == "ReadFile" || name == "ListDir" || name == "RunCommand" {
+	// 仅 ReadFile/ListDir：RunCommand 为验证/动作工具，不占探索预算。
+	if name == "ReadFile" || name == "ListDir" {
 		r.recordExplore(ctx)
 	}
 
@@ -430,7 +435,8 @@ func scopeKeyFromCtx(ctx context.Context) string {
 
 // checkExploreBudget 检查当前作用域探索类工具调用次数是否超预算。
 // 返回空字符串表示允许；否则返回拦截原因（要求 Agent 转入 WriteFile）。
-// 仅对 ReadFile/ListDir/RunCommand 生效；SearchInFiles/HTTPGet 不计预算（定位性强）。
+// 仅对 ReadFile/ListDir 生效；SearchInFiles/HTTPGet 不计预算（定位性强），
+// RunCommand 不计（验证/动作类，封禁会导致写完文件后无法验证的重试死循环）。
 func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	scopeKey := scopeKeyFromCtx(ctx)
 	if scopeKey == "" {

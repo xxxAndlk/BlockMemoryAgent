@@ -766,3 +766,47 @@ func TestFindEarliestPausedDomain(t *testing.T) {
 		t.Errorf("findEarliestPausedDomain = %q, want 'early'", got)
 	}
 }
+
+// TestCancelPausedOnChildSession 验证 paused_on_child 态会话可被取消：
+// 暂停态没有运行中的 goroutine，但必须允许用户退出暂停死锁
+// （回归：旧实现拒绝非 running 态取消，会话无任何逃生通道）。
+func TestCancelPausedOnChildSession(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	created, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "g"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	waitForStatus(t, svc, created.ID, enums.SessionStatusCompleted, "initial completed")
+	setSessionPausedOnChild(t, svc, created.ID)
+
+	if err := svc.cancel(context.Background(), created.ID); err != nil {
+		t.Fatalf("cancel paused_on_child session should succeed, got: %v", err)
+	}
+	snap, _ := svc.Get(context.Background(), created.ID)
+	if snap.Status != string(enums.SessionStatusError) {
+		t.Errorf("status = %q, want %q (cancelled)", snap.Status, enums.SessionStatusError)
+	}
+}
+
+// TestCancelAwaitingClarifySession 验证 awaiting_clarify 态会话同样可被取消。
+func TestCancelAwaitingClarifySession(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	created, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "g"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	waitForStatus(t, svc, created.ID, enums.SessionStatusCompleted, "initial completed")
+	svc.store.mu.Lock()
+	if sess, ok := svc.store.sessions[created.ID]; ok {
+		sess.Status = enums.SessionStatusAwaitingClarify
+	}
+	svc.store.mu.Unlock()
+
+	if err := svc.cancel(context.Background(), created.ID); err != nil {
+		t.Fatalf("cancel awaiting_clarify session should succeed, got: %v", err)
+	}
+	snap, _ := svc.Get(context.Background(), created.ID)
+	if snap.Status != string(enums.SessionStatusError) {
+		t.Errorf("status = %q, want %q (cancelled)", snap.Status, enums.SessionStatusError)
+	}
+}

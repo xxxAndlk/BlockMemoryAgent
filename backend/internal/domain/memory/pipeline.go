@@ -369,12 +369,14 @@ func compressHistory(messages []agent.ReactMessage, keepRecent int) []agent.Reac
 		return messages
 	}
 
-	// 3) 最近 K 条边界：从末尾向前找 user 边界，保证 tool_call/tool_result 对完整。
+	// 3) 最近 K 条边界：避开孤立的 tool 结果起刀（tool 结果须跟随其 assistant tool_calls）。
+	// 不锚 user 边界：纯工作段（assistant/tool 交替）无 user，锚 user 会走空保留段
+	// （实证：windowMessages 同款缺陷致塔防配置 Agent 上下文塌缩成 2 条失忆空转）。
 	if keepRecent > len(messages)-firstUserIdx-1 {
 		keepRecent = len(messages) - firstUserIdx - 1
 	}
 	recentStart := len(messages) - keepRecent
-	for recentStart < len(messages) && recentStart > firstUserIdx+1 && messages[recentStart].Role != "user" {
+	for recentStart < len(messages) && messages[recentStart].Role == "tool" {
 		recentStart++
 	}
 

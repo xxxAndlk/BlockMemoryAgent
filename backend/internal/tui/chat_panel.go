@@ -316,7 +316,7 @@ func (cp *ChatPanel) renderScrollbar(w, h, viewportH, totalLines, startLine int,
 }
 
 // renderChat 渲染对话区，包括 viewport 内容与滚动条。
-func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Session, items []chatItem, modelName string) string {
+func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Session, items []chatItem, modelName, workDir string) string {
 	const scrollbarW = 1
 	gap := 1
 	// 内容区宽度扣除滚动条与间隔。
@@ -328,7 +328,7 @@ func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Sessio
 	// 无 item 时展示欢迎页或空会话提示。
 	if len(items) == 0 {
 		if session == nil {
-			return renderWelcome(styles, contentW, h, modelName)
+			return renderWelcome(styles, contentW, h, modelName, workDir)
 		}
 		return renderEmptyChat(styles, contentW, h)
 	}
@@ -513,10 +513,10 @@ func (cp *ChatPanel) buildContent(items []chatItem, styles *Styles, width int) s
 }
 
 // renderWelcome 渲染无会话时的欢迎页。
-func renderWelcome(styles *Styles, w, h int, modelName string) string {
+func renderWelcome(styles *Styles, w, h int, modelName, workDir string) string {
 	title := styles.WelcomeTitle.Render("BlockMemoryAgent")
 	subtitle := styles.WelcomeSub.Render("AI Agent for Code, Memory and More.")
-	info := renderWelcomeInfo(styles, w, modelName)
+	info := renderWelcomeInfo(styles, w, modelName, workDir)
 	content := lipgloss.JoinVertical(lipgloss.Center, title, "", subtitle, "", info)
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, content)
 }
@@ -531,14 +531,14 @@ func renderEmptyChat(styles *Styles, w, h int) string {
 }
 
 // renderWelcomeInfo 渲染欢迎页底部的信息框，分两列展示模型、工作区、记忆等信息。
-func renderWelcomeInfo(styles *Styles, w int, modelName string) string {
+func renderWelcomeInfo(styles *Styles, w int, modelName, workDir string) string {
 	pairs := []struct {
 		icon  string
 		label string
 		value string
 	}{
 		{"🖥", "Model", modelName},
-		{"📁", "Workspace", "~/demo"},
+		{"📁", "Workspace", workDir},
 		{"🧠", "Memory", "Enabled"},
 		{"#", "Session", "#12"},
 		{"⚡", "Skills", "38"},
@@ -585,5 +585,5 @@ func (m *Model) rebuildChatContent() {
 // renderChat 为 Model 渲染对话区。
 func (m Model) renderChat(w, h int) string {
 	s := m.selectedSession()
-	return m.chatPanel.renderChat(w, h, m.styles, s, m.chatPanel.collectItems(s), m.modelName)
+	return m.chatPanel.renderChat(w, h, m.styles, s, m.chatPanel.collectItems(s), m.modelName, m.workDir)
 }

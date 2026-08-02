@@ -20,8 +20,8 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 
 - **单一 ReAct 主循环**：MetaAgent 跑 LLM → 工具 → 结果循环（默认上限 50 轮），直到输出纯文本回答
 - **层级即调用栈**：`call_sub_agent(role_id, task)` 起 goroutine 跑子 Agent，子 Agent 完成后把摘要推 Mailbox，父 Agent 每轮 LLM 前 Drain 邮箱注入上下文——任意深度递归，无图状态机
-- **历史压缩**：每 `summarize_every` 步（默认 5）`summarizeWindow` 把中段历史压成"系统前缀 + 用户目标 + 摘要 + 最近 K 条"，防 token 爆炸与注意力衰减
-- **权威 Agent 树**：`internal/domain/orchestrator/tree.go` 维护派发树快照，HTTP 暴露 `GET /api/sessions/{id}/tree` 读子 Agent 节点状态 + `POST /api/sessions/{id}/agents/{aid}/cancel` 取消子 Agent（补 ReAct 重构后丢失的 introspect/cancel 能力）
+- **历史压缩**：每 `summarize_every` 步（默认 5）`compressHistory` 把中段历史压成"系统前缀 + 用户目标 + 摘要 + 最近 K 条"；assistant 入史副本截断超长工具入参（单值 2000 runes），滑动窗口/压缩下刀只避开孤立 tool 结果（不锚 user 边界），防 token 爆炸、单轮 input 爆预算与上下文塌缩
+- **权威 Agent 树**：`internal/domain/orchestrator/tree.go` 维护派发树快照，HTTP 暴露 `GET /api/sessions/{id}/tree` 读子 Agent 节点状态 + `POST /api/sessions/{id}/agents/{aid}/cancel` 取消子 Agent（补 ReAct 重构后丢失的 introspect/cancel 能力）；`call_sub_agent` 同父 Agent 下同领域重复派发查树快照自动去重；暂停态（paused_on_child/awaiting_clarify）会话可取消
 - **块记忆事实提取**：子 Agent 完成后调轻量模型提取 1-5 条关键事实，每条单独向量化落 KnowledgeRecord，替代原始 result.Text 整段落库；提取失败自动回退原始保存
 - **共享记忆**：`WriteSharedMemory` 工具让主 Agent 把关键上下文（文件路径/行号/函数签名/验收标准）写入 `sharedKV`，子 Agent 自动读取，避免重读全文件；`task` 入参 2000 runes 上限强制规格走共享记忆
 - **验证闭环编排器**：`verifyloop` 原生驱动"产出 -> 自测 -> 修正 -> 上级统一测试"状态机，`Verifier`/`Fixer`/`Reporter` 三接口解耦，`PlanConfirmVerifier` 支持"测试方向不明确 -> 列方案 -> 产出方确认 -> 符合才自测"前置
@@ -141,15 +141,15 @@ flags：`-config config/config.yaml -roles config/roles.yaml -env .env -soul con
 
 ### 1. ReAct 主循环（`internal/agent/react_agent.go`）
 
-`ReActAgent.RunWithHistory()`：prepend system prompt → `model.Generate`（带工具 schema）→ 有 `ToolPart` 则经 `ToolRegistry.Dispatch` 执行并回灌结果 → 直到纯文本回答或达到上限（默认 50 轮）。每轮 LLM 前 Drain Mailbox，把子 Agent 摘要注入历史并写入记忆事件。 每 `summarize_every` 步（默认 5）`summarizeWindow` 压缩中段历史防 token 爆炸。`sessionLogger` 写 LLM I/O 到 `session_logs`，`QueryKindLogs` 按会话回看。
+`ReActAgent.RunWithHistory()`：prepend system prompt → `model.Generate`（带工具 schema）→ 有 `ToolPart` 则经 `ToolRegistry.Dispatch` 执行并回灌结果 → 直到纯文本回答或达到上限（默认 50 轮）。每轮 LLM 前 Drain Mailbox，把子 Agent 摘要注入历史并写入记忆事件。 每 `summarize_every` 步（默认 5）`compressHistory` 压缩中段历史防 token 爆炸；assistant 消息入史时 `truncateToolCallInputsForHistory` 截断超长工具入参（单值 2000 runes，派发执行仍用原始入参），防 WriteFile 全文逐轮重发耗尽 token 预算；`windowMessages`/`compressHistory` 下刀只避开孤立 tool 结果、不锚 user 边界，防工作型历史上下文塌缩。`sessionLogger` 写 LLM I/O 到 `session_logs`，`QueryKindLogs` 按会话回看。
 
 ### 2. 异步子 Agent 分发（`internal/domain/subagent/dispatcher.go`）
 
-`call_sub_agent` 工具起 goroutine 跑子 ReActAgent，立即返回 `sub_agent_id`；子 Agent 完成后摘要推 Mailbox。角色权限由 `roles.yaml` 的 `can_be_called` / `parents` 控制；`domain` 字段定制 DomainAgent 展示名；`task` 入参 2000 runes 上限强制规格走 `WriteSharedMemory`。`WithSharedMemory` 注入共享 KV 只读视图，`buildSharedPrefix` 自动读取主 Agent 写入的关键上下文并做 Layer 3 mtime 校验（文件改动后 KV 失效）。父会话终结保护：有未决子 Agent 时阻塞等待，防迟到 mailbox 消息丢失。`WithFactExtractor` 注入事实提取器，`saveBlockMemory` 先调轻量模型提取关键事实再落库；`WithTree` 注入权威 Agent 树，派发时 Register/SetCancel/Finish。
+`call_sub_agent` 工具起 goroutine 跑子 ReActAgent，立即返回 `sub_agent_id`；子 Agent 完成后摘要推 Mailbox。角色权限由 `roles.yaml` 的 `can_be_called` / `parents` 控制；`domain` 字段定制 DomainAgent 展示名；`task` 入参 2000 runes 上限强制规格走 `WriteSharedMemory`。`WithSharedMemory` 注入共享 KV 只读视图，`buildSharedPrefix` 自动读取主 Agent 写入的关键上下文并做 Layer 3 mtime 校验（文件改动后 KV 失效）。父会话终结保护：有未决子 Agent 时阻塞等待，防迟到 mailbox 消息丢失。`WithFactExtractor` 注入事实提取器，`saveBlockMemory` 先调轻量模型提取关键事实再落库；`WithTree` 注入权威 Agent 树，派发时 Register/SetCancel/Finish。派 domain 角色时 `findPendingDomainSibling` 查树快照去重（同父同 domain Running/Paused 即拒，不烧派发配额）；递归派发的子 Agent 注入 `WithPendingChildrenChecker`，终答前须等自己的子 Agent 回传。
 
 ### 3. 权威 Agent 树（`internal/domain/orchestrator/tree.go`）
 
-ReAct 重构后子 Agent 由 Dispatcher 直接 goroutine 创建，不注册为 `AgentInstance`，原"层级即调用栈"丢失 introspect/cancel 能力。补 `Tree` struct 作元数据层：Dispatcher 派发前 `Register` 节点（ID/ParentID/Role/Domain/Task/Started/Status=Running）+ `SetCancel` 绑定 cancel func，完成时 `Finish` 写终态（Done/Failed/Cancelled + Summary/Err）。HTTP 暴露 `GET /api/sessions/{id}/tree` 返回快照，`POST /api/sessions/{id}/agents/{aid}/cancel` 调 cancel func 取消子 Agent。`context.CancelFunc` 幂等，与 goroutine `defer cancel()` 重复调用安全。树不持久化，服务重启清空，TUI `deriveSubAgentNodes` 保留作 fallback。`verifyloop.ExecuteChild` 同步路径暂不入树（phase 2）。`agent.Agent` 接口扩展 `Tree`/`CancelAgent` 两方法。
+ReAct 重构后子 Agent 由 Dispatcher 直接 goroutine 创建，不注册为 `AgentInstance`，原"层级即调用栈"丢失 introspect/cancel 能力。补 `Tree` struct 作元数据层：Dispatcher 派发前 `Register` 节点（ID/ParentID/Role/Domain/Task/Started/Status=Running）+ `SetCancel` 绑定 cancel func，完成时 `Finish` 写终态（Done/Failed/Cancelled + Summary/Err）。HTTP 暴露 `GET /api/sessions/{id}/tree` 返回快照，`POST /api/sessions/{id}/agents/{aid}/cancel` 调 cancel func 取消子 Agent。`context.CancelFunc` 幂等，与 goroutine `defer cancel()` 重复调用安全。树经 PG 持久化（`agent_tree_nodes` 表），`TreeFor` lazy init 时 `LoadNodes` 恢复节点元数据，TUI 面板直读 `Tree()` 快照（旧事件流派生 `deriveSubAgentNodes` 已删）。`call_sub_agent` 派 domain 角色时基于树快照做同领域重复派发去重（`findPendingDomainSibling`）。`verifyloop.ExecuteChild` 同步路径暂不入树（phase 2）。`agent.Agent` 接口扩展 `Tree`/`CancelAgent` 两方法。
 
 ### 3. 工具域（`internal/domain/tool/`）
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,8 @@ type Model struct {
 	httpAddr string
 	// modelName 是当前使用的模型名称，用于欢迎页与顶栏展示。
 	modelName string
+	// workDir 是进程工作目录，用于欢迎页与顶栏 Workspace 展示（替代原硬编码 "~/demo"）。
+	workDir string
 
 	// styles 是全局样式集合。
 	styles *Styles
@@ -111,6 +114,7 @@ func NewModel(
 		dagHandler:     dagHandler,
 		httpAddr:       httpAddr,
 		modelName:      modelName,
+		workDir:        currentWorkDir(),
 		styles:         NewStyles(),
 		focus:          panelChat,
 		sessionsCursor: -1, // 启动不选中任何会话：聊天区保持空白新会话状态
@@ -128,6 +132,16 @@ func NewModel(
 	m.focus = panelInput
 	m.inputBar.mode = inputNormal
 	return m
+}
+
+// currentWorkDir 返回进程当前工作目录，用于顶栏与欢迎页的 Workspace 展示。
+// 获取失败时回退 "."，保证展示始终有值。
+func currentWorkDir() string {
+	wd, err := os.Getwd()
+	if err != nil || wd == "" {
+		return "."
+	}
+	return wd
 }
 
 // Init 启动后台 tick 与 agent 事件流监听器。

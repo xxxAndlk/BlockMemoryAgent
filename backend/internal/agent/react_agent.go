@@ -214,6 +214,43 @@ const maxEmptyResponses = 3
 // emptyResponseNudge 是收到空响应时注入的用户提示，要求模型继续推进任务。
 const emptyResponseNudge = "（系统提示：你上一条回复为空，未包含任何文本或工具调用。请继续推进当前任务；若任务确已全部完成，请直接输出完整的最终答复。）"
 
+// historyToolCallInputMaxRunes 是写入历史的工具入参单字符串值最大 rune 数。
+// 与 ToolOutputMaxRunes（工具输出截断）对称：工具入参（WriteFile 全文、codegen 大段代码）
+// 不截断会在滑动窗口内累积成单轮 100K+ input tokens，使续跑预算一次耗尽、暂停/恢复零进展。
+const historyToolCallInputMaxRunes = 2000
+
+// truncateToolCallInputsForHistory 返回 assistant 消息的入史副本：
+// ToolCalls 的 Input 中超长字符串值被截断（附原始长度标记），其余字段与原消息共享。
+// 派发执行仍使用原消息，截断只影响历史持久化与后续请求的上下文回发。
+func truncateToolCallInputsForHistory(m ReactMessage, maxRunes int) ReactMessage {
+	if len(m.ToolCalls) == 0 || maxRunes <= 0 {
+		return m
+	}
+	out := m
+	out.ToolCalls = make([]ToolCall, len(m.ToolCalls))
+	for i, tc := range m.ToolCalls {
+		out.ToolCalls[i] = ToolCall{ID: tc.ID, Name: tc.Name, Input: truncateStringValues(tc.Input, maxRunes)}
+	}
+	return out
+}
+
+// truncateStringValues 返回 map 的浅拷贝，其中超过 maxRunes 的字符串值被截断并附长度标记。
+func truncateStringValues(in map[string]any, maxRunes int) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		if s, ok := v.(string); ok {
+			if r := []rune(s); len(r) > maxRunes {
+				v = string(r[:maxRunes]) + fmt.Sprintf("...(truncated, total %d runes)", len(r))
+			}
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // RunWithHistory 从已有历史开始执行 ReAct 循环。
 // 参数 ctx 用于取消/超时控制；input 为新的用户输入；history 为已有会话历史。
 // 新输入会被追加到传入的历史中，便于会话续跑并保留之前的轮次。
@@ -315,8 +352,11 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		}
 		emptyStreak = 0
 
-		// 非空响应才追加到历史中。
-		history = append(history, assistant)
+		// 非空响应才追加到历史中。入史副本截断超长工具入参（如 WriteFile 全文件内容）：
+		// 完整入参仅用于本次派发执行；历史/持久化/续跑只保留截断副本。
+		// 否则大文件内容在滑动窗口内逐轮重发，单轮 input 即可耗尽整份 token 预算
+		// （实证：塔防 domain 续跑首轮即再触限，pause/resume 零进展死锁）。
+		history = append(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
 
 		// 在判断本轮是否结束之前，先轮询邮箱并注入任何新的异步消息。
 		// mailbox 由服务装配层注入共享邮箱（用于接收异步子代理摘要）；未注入时跳过。
@@ -676,9 +716,10 @@ func bladesText(m *blades.Message) string {
 // 触发由 memory.Pipeline.WithCompression(every, keepRecent) 配置，bootstrap 注入。
 
 // windowMessages 把发送给 LLM 的消息裁剪到最多 max 条（滑动窗口）：
-// 保留开头的 system 消息（记忆注入）与最近的对话，并在保留段的最早 user 消息
-// 边界下刀，保证 assistant 的 tool_calls 与后续 tool 结果成对完整（部分 provider
-// 校验不成对会报错）。被省略的条数以一条说明消息占位。max<=0 或未超限时原样返回。
+// 保留开头的 system 消息（记忆注入）与最近的对话，下刀处避开孤立的 tool 结果
+// （assistant 的 tool_calls 与后续 tool 结果须成对，部分 provider 校验不成对会报错；
+// 从 assistant/user 起刀即天然成对，仅 tool 起刀会孤立）。被省略的条数以一条说明消息占位。
+// max<=0 或未超限时原样返回。
 func windowMessages(messages []ReactMessage, max int) []ReactMessage {
 	if max <= 0 || len(messages) <= max {
 		return messages
@@ -709,8 +750,12 @@ func windowMessages(messages []ReactMessage, max int) []ReactMessage {
 	if start < firstUserIdx+1 {
 		start = firstUserIdx + 1
 	}
-	// 向前移动 start 到最近的 user 边界，保证 tool 调用链完整。
-	for start < len(messages) && start > firstUserIdx+1 && messages[start].Role != "user" {
+	// 向前移动 start 避开孤立的 tool 结果消息：tool 结果必须跟随其 assistant tool_calls，
+	// 窗口从 tool 结果开始会被 API 拒绝（orphaned tool_result）。
+	// 不能锚定 user 边界：工作型历史是 [user, assistant, tool, assistant, tool…]，
+	// 最近窗口内常无 user，锚 user 会走空整个窗口，只剩首条 user + 占位符两条消息
+	// （实证：塔防配置 Agent 上下文塌缩成 msgs=2，每轮失忆重写 config.js 不收敛）。
+	for start < len(messages) && messages[start].Role == "tool" {
 		start++
 	}
 	omitted := start - firstUserIdx - 1

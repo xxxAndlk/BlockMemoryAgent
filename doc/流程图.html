@@ -168,7 +168,7 @@ flowchart TD
     ASM --> REQ["ModelRequest<br/>system + messages + 工具 Schema"]
     REQ --> GEN["llm.Generate 调用模型"]
     GEN -->|"err / 空响应"| FAIL["返回错误"]
-    GEN --> ASSIST["assistant 消息入 history"]
+    GEN --> ASSIST["assistant 消息入 history<br/>（入史副本截断超长工具入参 2000 runes）"]
     ASSIST --> MBOX["mailbox.Drain<br/>取回异步子代理摘要<br/>写入 sub_agent_summary 记忆"]
     MBOX --> TC{"assistant 含 ToolCalls?"}
     TC -->|"否 → 最终答案"| ANS["写入 answer 记忆事件<br/>返回 ReactResult（答复 + history）"]
@@ -286,6 +286,10 @@ flowchart TD
     <tr><td>16</td><td>输出截断</td><td><code>tui/helpers.go</code></td><td>主对话区 ≤5 行；完整在 Ctrl+L</td></tr>
     <tr><td>17</td><td>计划面板</td><td><code>tui/view.go</code></td><td>状态由 agent 树覆盖看板；预计剩余=已完成均值×剩余</td></tr>
     <tr><td>18</td><td>Agent 编排</td><td><code>tui/agent_tree_panel.go</code></td><td>MetaAgent 置顶；宽度 ≥44 两列、≥72 三列</td></tr>
+    <tr><td>19</td><td>入史入参截断</td><td><code>react_agent.go</code>（truncateToolCallInputsForHistory）</td><td>工具入参单值 &gt;2000 runes 截断；派发执行仍用原始入参</td></tr>
+    <tr><td>20</td><td>窗口/压缩下刀</td><td><code>react_agent.go</code>（windowMessages）/ <code>pipeline.go</code>（compressHistory）</td><td>只避开孤立 tool 结果，不锚 user 边界</td></tr>
+    <tr><td>21</td><td>重复派发去重</td><td><code>dispatcher.go</code>（findPendingDomainSibling）</td><td>同父同 domain Running/Paused 即拒，不烧派发配额</td></tr>
+    <tr><td>22</td><td>会话取消</td><td><code>service_react.go</code>（cancel）</td><td>running / awaiting_clarify / paused_on_child 可取消</td></tr>
   </table>
 </section>
 
@@ -301,6 +305,8 @@ flowchart TD
     <tr><td><code>compactToolOutputLines</code></td><td>verbose 输出 ≤5 行</td><td>中间结果折叠</td></tr>
     <tr><td><code>displayDetailLines</code></td><td>工具 detail ≤8 行</td><td>兜底截断</td></tr>
     <tr><td><code>addEvent</code></td><td>output ≤4096 字符；事件 &gt;500 裁 200</td><td>内存/DB 防爆</td></tr>
+    <tr><td><code>truncateToolCallInputsForHistory</code></td><td>入史工具入参单值 ≤2000 runes</td><td>防单轮 input 爆 token 预算</td></tr>
+    <tr><td><code>windowMessages</code> / <code>compressHistory</code></td><td>下刀只避开孤立 tool 结果</td><td>防上下文塌缩 + tool 对完整</td></tr>
     <tr><td>计划/编排面板</td><td>超高内容裁剪 + "… 还有 N" 提示</td><td>布局不溢出</td></tr>
   </table>
 </section>
