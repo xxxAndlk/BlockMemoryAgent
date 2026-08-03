@@ -1,16 +1,18 @@
 package model
 
 // retry_provider.go 在 provider 层包装 blades.ModelProvider，对 Generate 调用做 3 次重试。
-// 所有非成功状态（HTTP 4xx/5xx、超时、空响应、网络错误）都触发重试，3 次后仍失败返回错误给上级。
+// 可重试状态（超时、网络错误、空响应、5xx、429）触发重试，3 次后仍失败返回错误给上级；
+// 4xx 客户端错误（400/401/403/404/422，请求本身非法）不重试，快速失败避免白等。
 // ctx 主动取消（context.Canceled）不重试，直接返回，避免用户取消后继续烧 token。
-// NewStreaming 直接委托底层，不在 wrapper 层重试（流式重试需重建 stream 过于复杂；
-// react_agent.generate 在更高层已有重试，覆盖流式路径）。
+// NewStreaming 直接委托底层，仅首错（未产出任何增量时）重试；
+// react_agent.generate 在更高层已有重试，覆盖流式路径。
 
 import (
 	"context" // 上下文传递与取消判定
 	"errors"  // errors.Is 判定取消类型
 	"fmt"     // 错误格式化
 	"log"     // 记录每次重试与最终失败，便于排查
+	"strings" // 4xx 错误标记匹配
 	"time"    // 退避与超时
 
 	"github.com/go-kratos/blades" // blades.ModelProvider 与 ModelRequest/Response
@@ -27,6 +29,29 @@ var providerRetryInitialBackoff = 500 * time.Millisecond
 
 // providerRetryMaxBackoff 是退避时长上限，避免指数退避无限增长。
 const providerRetryMaxBackoff = 2 * time.Second
+
+// nonRetryableStatusMarkers 是不可重试的 HTTP 状态码片段（如 " 400 "）。
+// 4xx 客户端错误（请求格式/鉴权/参数）由请求本身决定，重试必然同样失败：
+// 实证 domain 的 400 配对错误被完整重发 3 次，白等 3 倍拒绝耗时。
+// 408（超时）与 429（限速）可重试，不在列表内。
+var nonRetryableStatusMarkers = []string{
+	" 400 ", " 401 ", " 403 ", " 404 ", " 422 ",
+	"invalid_request_error", "authentication_error", "permission_error", "not_found_error",
+}
+
+// isNonRetryableErr 判定错误是否为不可重试的客户端错误（4xx）。
+func isNonRetryableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, marker := range nonRetryableStatusMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // retryProvider 包装 blades.ModelProvider，对 Generate 做 3 次重试。
 // NewStreaming 直接委托底层，保留流式语义与 react_agent 层的重试覆盖。
@@ -70,6 +95,11 @@ func (p *retryProvider) Generate(ctx context.Context, req *blades.ModelRequest) 
 		// 用户主动取消不重试，直接返回。
 		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		// 4xx 客户端错误由请求本身决定，重试必然同样失败，快速返回。
+		if isNonRetryableErr(lastErr) {
+			log.Printf("[model] Generate non-retryable: provider=%s attempt=%d err=%v", p.name, attempt, lastErr)
+			return nil, lastErr
 		}
 		// 末次尝试失败不再退避，直接结束循环返回错误。
 		if attempt < providerMaxRetries {
@@ -137,6 +167,12 @@ func (p *retryProvider) NewStreaming(ctx context.Context, req *blades.ModelReque
 			}
 			// 用户主动取消不重试
 			if errors.Is(finalErr, context.Canceled) || ctx.Err() != nil {
+				yield(nil, finalErr)
+				return
+			}
+			// 4xx 客户端错误由请求本身决定，重试必然同样失败，快速返回。
+			if isNonRetryableErr(finalErr) {
+				log.Printf("[model] stream non-retryable: provider=%s attempt=%d err=%v", p.name, attempt, finalErr)
 				yield(nil, finalErr)
 				return
 			}

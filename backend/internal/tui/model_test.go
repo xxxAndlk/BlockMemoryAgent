@@ -16,7 +16,6 @@ import (
 	"github.com/go-kratos/blades"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
-	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
@@ -56,7 +55,7 @@ func testAgent(t *testing.T, summary string) agent.Agent {
 type mockAgentForPlan struct {
 	sessionID  string
 	goal       string
-	boardSnap  board.Snapshot
+	treeNodes  []orchestrator.Node
 	agentInsts []agent.AgentInstance
 }
 
@@ -80,11 +79,8 @@ func (m *mockAgentForPlan) Stream(ctx context.Context, sessionID string) (<-chan
 	return nil, nil
 }
 
-// Query 返回预设的看板快照（当查询类型为 Board 时）。
+// Query 是 mockAgentForPlan 的空实现（TUI 看板已改走 Tree 路径，不再使用 Query）。
 func (m *mockAgentForPlan) Query(ctx context.Context, sessionID string, q agent.Query) (agent.Result, error) {
-	if sessionID == m.sessionID && q.Kind == agent.QueryKindBoard {
-		return agent.Result{Data: m.boardSnap}, nil
-	}
 	return agent.Result{}, nil
 }
 
@@ -111,9 +107,9 @@ func (m *mockAgentForPlan) ListAgents(ctx context.Context, sessionID string) ([]
 	return m.agentInsts, nil
 }
 
-// Tree 返回 Agent 树快照，测试实现返回 nil。
+// Tree 返回预设的 Agent 树节点（看板快照的数据源）。
 func (m *mockAgentForPlan) Tree(ctx context.Context, sessionID string) ([]orchestrator.Node, error) {
-	return nil, nil
+	return m.treeNodes, nil
 }
 
 // CancelAgent 取消子 Agent，测试实现返回 nil。
@@ -518,19 +514,16 @@ func TestLongUserMessageWrapsAtRightPanelBoundary(t *testing.T) {
 	}
 }
 
-// TestPlanPanelReflectsAgentStatuses 验证：当后端 TaskBoard 未及时更新时，
-// 右侧面板的计划进度仍会根据 Agent 实例的真实状态显示完成率与 Done 标记。
+// TestPlanPanelReflectsAgentStatuses 验证：右侧计划面板的任务列表与完成进度
+// 直接来自权威 Agent 树节点的实时状态（boardSnapshot 走 Tree 路径）。
 func TestPlanPanelReflectsAgentStatuses(t *testing.T) {
 	mock := &mockAgentForPlan{
 		sessionID: "session-1",
 		goal:      "塔防游戏 demo",
-		boardSnap: board.Snapshot{
-			Goal: "塔防游戏 demo",
-			Tasks: []board.SubTask{
-				{ID: "t1", Title: "战斗领域 - 实现怪物路径"},
-				{ID: "t2", Title: "UI领域 - Canvas 渲染"},
-				{ID: "t3", Title: "经济领域 - 金币系统"},
-			},
+		treeNodes: []orchestrator.Node{
+			{ID: "session-1/combat-1", ParentID: "session-1", Role: "战斗领域", Task: "实现怪物路径", Status: orchestrator.StatusDone, Started: time.Now()},
+			{ID: "session-1/ui-1", ParentID: "session-1", Role: "UI领域", Task: "Canvas 渲染", Status: orchestrator.StatusRunning, Started: time.Now()},
+			{ID: "session-1/econ-1", ParentID: "session-1", Role: "经济领域", Task: "金币系统", Status: orchestrator.StatusPaused, Started: time.Now()},
 		},
 	}
 

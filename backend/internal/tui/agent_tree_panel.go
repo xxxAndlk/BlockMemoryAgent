@@ -33,6 +33,10 @@ type agentTreeNode struct {
 	status enums.RoleStatus
 	// goal 是 Agent 的目标描述，可能为空。
 	goal string
+	// summary 是终态 Agent 的结果摘要（来自 orchestrator.Node.Summary），可能为空。
+	summary string
+	// err 是失败 Agent 的错误信息（来自 orchestrator.Node.Err），可能为空。
+	err string
 	// isClarify 标识该节点是否为待澄清占位节点。
 	isClarify bool
 	// createdAt 是 Agent 创建时间，用于显示时间戳。
@@ -144,6 +148,8 @@ func orchestratorNodesToTreeNodes(nodes []orchestrator.Node, rootID string) []ag
 			role:      n.Role,
 			status:    orchestratorStatusToRole(n.Status),
 			goal:      n.Task,
+			summary:   n.Summary,
+			err:       n.Err,
 			createdAt: n.Started,
 		})
 	}
@@ -374,7 +380,8 @@ func (m Model) renderAgentsPanel(w, h int) string {
 }
 
 // buildAgentCard 把单个 Agent 节点渲染为圆角边框卡片：
-// 彩色加粗名称 + 角色/领域副标题 + 状态色点文本 + 时间 + 任务描述，固定 5 行内容。
+// 彩色加粗名称 + 角色/领域副标题 + 状态色点文本 + 时间 + 任务描述，固定 5 行内容；
+// 终态（Done/Error）且带有结果摘要/错误信息的节点追加第 6 行结果行。
 // 卡片总宽恒为 cardW：lipgloss Width 含左右内边距（各 1），边框另加 2 列，保证网格列对齐。
 func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
 	// 文本区宽度 = 总宽 - 边框 2 - 内边距 2。
@@ -414,6 +421,19 @@ func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
 	if node.goal != "" && !node.isClarify {
 		goalLine = m.styles.Dim.Render(truncate("任务: "+strings.ReplaceAll(node.goal, "\n", " "), inner))
 	}
+	// 结果行：仅终态（Done/Error）节点展示。错误优先并以错误色显示；
+	// 原始文本先截断到约 80 字符防止超长内容拖累渲染，再按卡片宽度截断。
+	resultLine := ""
+	if node.status == enums.RoleStatusDone || node.status == enums.RoleStatusError {
+		if node.err != "" {
+			errText := truncate(strings.ReplaceAll(node.err, "\n", " "), 80)
+			resultLine = lipgloss.NewStyle().Foreground(lipgloss.Color(cStatusErr)).
+				Render(truncate("错误: "+errText, inner))
+		} else if node.summary != "" {
+			sumText := truncate(strings.ReplaceAll(node.summary, "\n", " "), 80)
+			resultLine = m.styles.Dim.Render(truncate("结果: "+sumText, inner))
+		}
+	}
 	// 运行中/错误的 Agent 用状态色边框突出，其余用普通暗色边框。
 	borderColor := cBlur
 	switch node.status {
@@ -422,7 +442,11 @@ func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
 	case enums.RoleStatusError:
 		borderColor = cStatusErr
 	}
-	content := strings.Join([]string{name, subLine, stLine, timeLine, goalLine}, "\n")
+	lines := []string{name, subLine, stLine, timeLine, goalLine}
+	if resultLine != "" {
+		lines = append(lines, resultLine)
+	}
+	content := strings.Join(lines, "\n")
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(borderColor)).

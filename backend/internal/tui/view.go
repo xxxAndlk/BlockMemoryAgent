@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -10,11 +9,10 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/blockmemory/agent/backend/internal/board"
-	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
-// 注：看板快照现在通过 agent.Query("board") 获取，TUI 不再需要直接依赖 *runtime.Runtime。
+// 注：看板快照通过 agent.Tree（权威 Agent 树）构建，TUI 不再需要直接依赖 *runtime.Runtime。
 
 // View 渲染整个 TUI，采用单列以对话为主的布局。
 func (m Model) View() string {
@@ -192,8 +190,9 @@ func (m Model) renderPlanPanel(w, h int) string {
 		snap = m.boardSnapshot(s.ID)
 	}
 
-	// 没有看板时（如 direct_tool），用当前轮任务生成一个最小计划视图，
-	// 避免右侧面板出现空白的 "(no plan)"。
+	// 没有看板时（如 direct_tool 会话、Agent 树为空），用当前轮任务生成一个最小计划视图，
+	// 避免右侧面板出现空白的 "(no plan)"。有子 Agent 派发时，boardSnapshot 已从权威
+	// Agent 树构建任务列表（状态实时取自树节点），无需在此补充或二次覆盖。
 	if len(snap.Tasks) == 0 {
 		goal := ""
 		status := board.TaskDone
@@ -222,44 +221,6 @@ func (m Model) renderPlanPanel(w, h int) string {
 			Goal:  goal,
 			Tasks: []board.SubTask{{ID: "direct", Title: "直接执行", Status: status}},
 		}
-		// 有子 Agent 派发时,把每个权威树节点追加为一行任务,
-		// 状态从 Tree()(Dispatcher 维护,已持久化)读取,保证任务面板随编排实时更新。
-		if s != nil && m.agent != nil {
-			treeNodes, _ := m.agent.Tree(context.Background(), s.ID)
-			for i, n := range treeNodes {
-				tStatus := board.TaskInProgress
-				switch n.Status {
-				case orchestrator.StatusDone, orchestrator.StatusCancelled:
-					tStatus = board.TaskDone
-				case orchestrator.StatusFailed:
-					tStatus = board.TaskFailed
-				}
-				title := "派发 " + n.Role
-				if n.Task != "" {
-					title += ": " + n.Task
-				}
-				snap.Tasks = append(snap.Tasks, board.SubTask{
-					ID:        fmt.Sprintf("sub-%d", i+1),
-					Title:     title,
-					Status:    tStatus,
-					CreatedAt: n.Started,
-					UpdatedAt: n.Started,
-				})
-			}
-		}
-	} else {
-		// 看板子任务状态可能未被后端及时更新，用 Agent 实例的真实状态覆盖，
-		// 这样进度条和状态才能反映实际完成情况。
-		domainStatus := m.agentTreePanel.deriveDomainTaskStatuses()
-		tasks := make([]board.SubTask, len(snap.Tasks))
-		copy(tasks, snap.Tasks)
-		for i := range tasks {
-			domain := planTaskDomain(tasks[i].Title)
-			if st, ok := domainStatus[domain]; ok {
-				tasks[i].Status = st
-			}
-		}
-		snap.Tasks = tasks
 	}
 
 	// 渲染计划内容行。内容区高度受 PanelBox 限制（Height(h-3)），

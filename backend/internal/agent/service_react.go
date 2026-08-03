@@ -145,6 +145,12 @@ func (s *ReactService) ForwardLiveEvent(sessionID string, ev LiveEvent) {
 	if sess == nil {
 		return
 	}
+	// 子 Agent 的流式文本与主会话共用单一瞬时展示字段（StreamingText/ThinkingText），
+	// 且多路并发会互相覆盖；加来源前缀让 UI 能分辨当前是谁在输出。
+	// 主 Agent 的流式事件走 WithLiveEvents 直连 handleLiveEvent，不经过此处，不会被加前缀。
+	if (ev.Kind == LiveEventLLMDelta || ev.Kind == LiveEventThinkDelta) && ev.Agent != "" {
+		ev.Text = "【" + ev.Agent + "】\n" + ev.Text
+	}
 	s.handleLiveEvent(sess, ev)
 }
 

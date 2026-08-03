@@ -699,3 +699,138 @@ func TestWindowMessages_WorkHistoryNotCollapsed(t *testing.T) {
 		t.Fatal("保留段不应从孤立 tool 结果开始(max=29)")
 	}
 }
+
+
+// TestSanitizeToolPairing 验证发送前的 tool 配对兜底：
+// 孤立 tool 结果被丢弃、缺失响应的 tool_calls 就地补合成错误结果、已配对的原样保留。
+func TestSanitizeToolPairing(t *testing.T) {
+	paired := []ReactMessage{
+		{Role: "user", Content: "task"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "WriteFile"}}},
+		{Role: "tool", ToolCallID: "c1", Content: "ok"},
+		{Role: "assistant", Content: "done"},
+	}
+	if got := sanitizeToolPairing(paired); len(got) != len(paired) {
+		t.Fatalf("已配对的消息不应被改动，got %d 条", len(got))
+	}
+
+	// 孤立 tool 结果（窗口起刀残留）应被丢弃。
+	orphan := []ReactMessage{
+		{Role: "tool", ToolCallID: "cX", Content: "stale"},
+		{Role: "user", Content: "task"},
+	}
+	got := sanitizeToolPairing(orphan)
+	if len(got) != 1 || got[0].Role != "user" {
+		t.Fatalf("孤立 tool 结果应被丢弃，got: %+v", got)
+	}
+
+	// mailbox user 消息插在 assistant tool_calls 与 tool 结果之间（实证 400 的序列）：
+	// 应在 assistant 后立即补合成结果，后续真实结果因孤立被丢弃。
+	interposed := []ReactMessage{
+		{Role: "user", Content: "task"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_sub_agent:10", Name: "call_sub_agent"}}},
+		{Role: "user", Content: "[mailbox from sub] done"},
+		{Role: "tool", ToolCallID: "call_sub_agent:10", Content: "real result"},
+	}
+	got = sanitizeToolPairing(interposed)
+	if len(got) != 4 {
+		t.Fatalf("修正后应为 4 条，got %d: %+v", len(got), got)
+	}
+	if got[2].Role != "tool" || got[2].ToolCallID != "call_sub_agent:10" {
+		t.Fatalf("assistant tool_calls 后应紧随合成的 tool 结果，got: %+v", got[2])
+	}
+	if !strings.Contains(got[2].Content, "tool result missing") {
+		t.Fatalf("合成结果应标注缺失原因，got: %s", got[2].Content)
+	}
+	if got[3].Role != "user" {
+		t.Fatalf("mailbox user 消息应保留在 tool 结果之后，got: %+v", got[3])
+	}
+
+	// 并行 tool_calls 只有部分响应：只为缺失的补合成结果，保留真实结果。
+	partial := []ReactMessage{
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "a", Name: "T1"}, {ID: "b", Name: "T2"}}},
+		{Role: "tool", ToolCallID: "a", Content: "ok"},
+		{Role: "user", Content: "next"},
+	}
+	got = sanitizeToolPairing(partial)
+	if len(got) != 4 || got[2].ToolCallID != "b" || got[2].Role != "tool" {
+		t.Fatalf("缺失的 tool_calls=b 应补合成结果，got: %+v", got)
+	}
+}
+
+// TestReActAgent_MailboxAfterToolResult 验证 mailbox 注入时序：
+// 有 tool_calls 的轮次，mailbox user 消息必须排在 tool 结果之后，
+// 不得插在 assistant tool_calls 与其 tool 结果之间（Anthropic 400 回归，
+// 实证 domain-2 白跑 31m43s 后整轮被拒）。
+func TestReActAgent_MailboxAfterToolResult(t *testing.T) {
+	mb := mailbox.New()
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			{
+				Role: blades.RoleAssistant,
+				Parts: []blades.Part{
+					blades.ToolPart{Name: "WriteFile", Request: string(mustJSON(map[string]any{"path": "a.txt", "content": "1"}))},
+				},
+			},
+			blades.AssistantMessage("done"),
+		},
+	}
+	agent := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).WithMailbox(mb)
+
+	// 子 Agent 完成通知在 Agent 执行工具前已到达 mailbox。
+	_ = mb.Send(&mailbox.Message{From: "sub-1", To: "test", Type: mailbox.MsgInfo, Body: "子 Agent 完成"})
+
+	res, err := agent.Run(context.Background(), "write a.txt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 期望历史：user, assistant(tool_calls), tool, user(mailbox), assistant(final)。
+	if len(res.History) != 5 {
+		t.Fatalf("expected 5 history messages, got %d: %+v", len(res.History), res.History)
+	}
+	if res.History[1].Role != "assistant" || len(res.History[1].ToolCalls) == 0 {
+		t.Fatalf("第 2 条应为带 tool_calls 的 assistant，got: %+v", res.History[1])
+	}
+	if res.History[2].Role != "tool" {
+		t.Fatalf("assistant tool_calls 后必须紧随 tool 结果，got role=%s", res.History[2].Role)
+	}
+	if res.History[3].Role != "user" || !strings.Contains(res.History[3].Content, "mailbox from") {
+		t.Fatalf("mailbox 消息应排在 tool 结果之后，got: %+v", res.History[3])
+	}
+}
+
+
+// TestSerializePromptForLog_ToolParts 验证 prompt 日志渲染 tool 调用与结果：
+// 纯 tool_call 的 assistant 消息与 tool 结果消息不再序列化为空 content
+// （回归：日志里大量 {"role":"tool","content":""} 被误以为上下文为空）。
+func TestSerializePromptForLog_ToolParts(t *testing.T) {
+	req := &blades.ModelRequest{
+		Messages: []*blades.Message{
+			blades.UserMessage("write a file"),
+			{
+				Role: blades.RoleAssistant,
+				Parts: []blades.Part{
+					blades.ToolPart{ID: "c1", Name: "WriteFile", Request: `{"path":"a.txt"}`},
+				},
+			},
+			{
+				Role:  blades.RoleTool,
+				Parts: []blades.Part{blades.ToolPart{ID: "c1", Response: `{"ok":true}`}},
+			},
+		},
+	}
+	out := serializePromptForLog(req)
+	if !strings.Contains(out, "[tool_call] name=WriteFile") {
+		t.Fatalf("assistant 的 tool_call 应渲染进日志，got: %s", out)
+	}
+	if !strings.Contains(out, `{\"path\":\"a.txt\"}`) {
+		t.Fatalf("tool_call 入参应渲染进日志，got: %s", out)
+	}
+	if !strings.Contains(out, "[tool_result] id=c1") {
+		t.Fatalf("tool 结果应渲染进日志，got: %s", out)
+	}
+	if strings.Contains(out, `"content": ""`) {
+		t.Fatalf("不应再出现空 content，got: %s", out)
+	}
+}

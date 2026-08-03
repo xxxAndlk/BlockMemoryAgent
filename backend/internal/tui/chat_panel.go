@@ -316,7 +316,9 @@ func (cp *ChatPanel) renderScrollbar(w, h, viewportH, totalLines, startLine int,
 }
 
 // renderChat 渲染对话区，包括 viewport 内容与滚动条。
-func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Session, items []chatItem, modelName, workDir string) string {
+// hasItems 表示最近一次内容重建（rebuildContent）时是否有对话条目，仅用于选择
+// 欢迎页/空会话占位；内容本体始终渲染 viewport 缓存，避免每帧重复全量 collectItems 计算。
+func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Session, hasItems bool, modelName, workDir string) string {
 	const scrollbarW = 1
 	gap := 1
 	// 内容区宽度扣除滚动条与间隔。
@@ -326,7 +328,7 @@ func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Sessio
 	}
 
 	// 无 item 时展示欢迎页或空会话提示。
-	if len(items) == 0 {
+	if !hasItems {
 		if session == nil {
 			return renderWelcome(styles, contentW, h, modelName, workDir)
 		}
@@ -583,7 +585,10 @@ func (m *Model) rebuildChatContent() {
 }
 
 // renderChat 为 Model 渲染对话区。
+// 是否有对话条目复用 rebuildContent 记录的 lastItems，不再每帧重算 collectItems：
+// 条目状态由 tick/stream 驱动的 refreshView（或 selectSession/submitInput 的
+// rebuildChatContent）负责更新，最多个别 0↔非0 切换延迟一个刷新周期（≤100ms）。
 func (m Model) renderChat(w, h int) string {
 	s := m.selectedSession()
-	return m.chatPanel.renderChat(w, h, m.styles, s, m.chatPanel.collectItems(s), m.modelName, m.workDir)
+	return m.chatPanel.renderChat(w, h, m.styles, s, m.chatPanel.lastItems > 0, m.modelName, m.workDir)
 }

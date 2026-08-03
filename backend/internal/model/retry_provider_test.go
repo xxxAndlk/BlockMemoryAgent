@@ -226,3 +226,55 @@ func TestWrapWithRetry_WrapsProvider(t *testing.T) {
 		t.Fatalf("expected name 'fake', got %q", rp.name)
 	}
 }
+
+
+// TestRetryProvider_ClientErrorNotRetried 验证 4xx 客户端错误（请求本身非法）不重试：
+// 实证 domain 的 400 配对错误被完整重发 3 次才放弃，白等 3 倍拒绝耗时。
+func TestRetryProvider_ClientErrorNotRetried(t *testing.T) {
+	inner := &fakeProvider{
+		name: "fake",
+		errors: []error{
+			errors.New(`POST "https://api.example.com/v1/messages": 400 Bad Request {"error":{"type":"invalid_request_error","message":"tool_call_ids did not have response messages"}}`),
+		},
+	}
+	p := &retryProvider{inner: inner, name: "fake"}
+	_, err := p.Generate(context.Background(), &blades.ModelRequest{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if inner.calls != 1 {
+		t.Fatalf("4xx 应快速失败不重试，got %d calls", inner.calls)
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Fatalf("应透传原始 4xx 错误，got: %v", err)
+	}
+}
+
+// TestIsNonRetryableErr 验证 4xx 标记判定：4xx（除 408/429）不可重试，5xx/429/网络错误可重试。
+func TestIsNonRetryableErr(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{`POST "https://x/v1/messages": 400 Bad Request {"error":{"type":"invalid_request_error"}}`, true},
+		{"401 Unauthorized", false}, // 无空格边界不匹配 " 401 "，按可重试处理（保守）
+		{" 401 ", true},
+		{" 403 ", true},
+		{" 404 ", true},
+		{" 422 ", true},
+		{"invalid_request_error: bad tool use", true},
+		{" 408 request timeout", false},
+		{" 429 rate limited", false},
+		{" 500 internal error", false},
+		{" 503 service unavailable", false},
+		{"connection refused", false},
+	}
+	for _, c := range cases {
+		if got := isNonRetryableErr(errors.New(c.msg)); got != c.want {
+			t.Errorf("isNonRetryableErr(%q) = %v, want %v", c.msg, got, c.want)
+		}
+	}
+	if isNonRetryableErr(nil) {
+		t.Error("nil error 应判定为可重试（false）")
+	}
+}

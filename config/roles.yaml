@@ -113,9 +113,9 @@ meta_agent:
 domain_agent:
   model_config: &domain_model
     provider: anthropic
-    model: glm-5.2
-    api_key: ${ANTHROPIC_API_KEY}
-    base_url: ${ANTHROPIC_BASE_URL}
+    model: k3
+    api_key: ${ANTHROPIC_API_KEY_TWO}
+    base_url: ${ANTHROPIC_BASE_URL_TWO}
     temperature: 0.5
     max_tokens: 128000  # DomainAgent 自执行 WriteFile 时需容纳大文件 + 派发推理；Volces ark 硬上限 128000，顶格设
   system_prompt: |
@@ -321,9 +321,9 @@ fixed_roles:
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &domain_model
       provider: anthropic
-      model: kimi-k2.7-code
-      api_key: ${ANTHROPIC_API_KEY}
-      base_url: ${ANTHROPIC_BASE_URL}
+      model: k3
+      api_key: ${ANTHROPIC_API_KEY_TWO}
+      base_url: ${ANTHROPIC_BASE_URL_TWO}
       temperature: 0.7
       max_tokens: 16384  # UI 助手：CSS/HTML 单文件一般 < 16K
     can_be_called: true

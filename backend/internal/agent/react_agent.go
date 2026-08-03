@@ -291,6 +291,10 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// ReActAgent 不再直接做历史压缩，职责归位到记忆层。
 		// windowMessages 只影响本次请求，不修改 history（完整历史仍用于持久化与续跑）。
 		messages := windowMessages(assembled, a.historyMaxMessages)
+		// 兜底防线：任何裁剪/注入路径若留下不配对的 tool 调用（assistant tool_calls
+		// 未紧随 tool 结果，或孤立 tool 结果），Anthropic/OpenAI 会以 400 拒绝整轮请求，
+		// 此前所有 LLM 耗时全部作废（实证 domain-2 白跑 31m43s）。发送前强制配对。
+		messages = sanitizeToolPairing(messages)
 
 		// 将内部消息格式转换为 blades 库所需的模型消息格式。
 		bladesMsgs := ToBladesMessages(messages)
@@ -358,12 +362,13 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// （实证：塔防 domain 续跑首轮即再触限，pause/resume 零进展死锁）。
 		history = append(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
 
-		// 在判断本轮是否结束之前，先轮询邮箱并注入任何新的异步消息。
-		// mailbox 由服务装配层注入共享邮箱（用于接收异步子代理摘要）；未注入时跳过。
-		history, _ = a.drainMailbox(history)
-
 		// 如果助手消息中没有任何工具调用，说明本轮已产生最终答案。
 		if len(assistant.ToolCalls) == 0 {
+			// 在判断本轮是否结束之前，先轮询邮箱并注入任何新的异步消息。
+			// mailbox 由服务装配层注入共享邮箱（用于接收异步子代理摘要）；未注入时跳过。
+			// 仅在无 tool_calls 分支注入：mailbox 消息是 user 角色，若插在 assistant
+			// tool_calls 与其 tool 结果之间，Anthropic 配对校验会以 400 拒绝整轮请求。
+			history, _ = a.drainMailbox(history)
 			// 父会话终结保护：若仍有未决子 Agent（call_sub_agent 派发后尚未回传结果），
 			// 阻塞等待其完成而非立即终结，防止迟到 mailbox 消息随会话销毁丢失。
 			// 多 Agent 协作验证闭环（code<->test 互问互答）的关键正确性保障。
@@ -448,6 +453,11 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				Occurred: time.Now(),
 			})
 		}
+
+		// 工具结果全部入史后再注入 mailbox：user 角色的 mailbox 消息若插在 assistant
+		// tool_calls 与其 tool 结果之间，会触发 Anthropic 配对校验 400（整轮请求作废，
+		// 实证：domain 派发子 Agent 后收到子 Agent 完成通知，白跑 31m43s 后失败）。
+		history, _ = a.drainMailbox(history)
 	}
 
 	// 达到最大迭代次数上限（仅 maxIter>0 时可能触发）：
@@ -608,13 +618,46 @@ func serializePromptForLog(req *blades.ModelRequest) string {
 		if m == nil {
 			continue
 		}
-		out.Messages = append(out.Messages, msgOut{Role: string(m.Role), Content: bladesText(m)})
+		out.Messages = append(out.Messages, msgOut{Role: string(m.Role), Content: messageLogText(m)})
 	}
 	for _, t := range req.Tools {
 		out.Tools = append(out.Tools, toolOut{Name: t.Name(), Description: t.Description()})
 	}
 	b, _ := json.MarshalIndent(out, "", "  ")
 	return string(b)
+}
+
+// messageLogText 提取消息的可读日志文本：文本部分 + 工具调用/结果部分。
+// bladesText 只读 TextPart，纯 tool_call 的 assistant 消息与 tool 结果消息会被
+// 序列化成空 content（实证：日志里大量 "role":"tool"/"assistant","content":""
+// 被误以为上下文为空；实际请求中 tool 数据完整，只是日志没渲染）。
+// 单个 part 截断 2000 runes：与入史截断（historyToolCallInputMaxRunes）对齐，防日志爆炸。
+func messageLogText(m *blades.Message) string {
+	var sb strings.Builder
+	sb.WriteString(bladesText(m))
+	for _, p := range m.Parts {
+		tp, ok := p.(blades.ToolPart)
+		if !ok {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		if tp.Response != "" {
+			sb.WriteString("[tool_result] id=")
+			sb.WriteString(tp.ID)
+			sb.WriteString("\n")
+			sb.WriteString(truncateRunes(tp.Response, 2000))
+		} else {
+			sb.WriteString("[tool_call] name=")
+			sb.WriteString(tp.Name)
+			sb.WriteString(" id=")
+			sb.WriteString(tp.ID)
+			sb.WriteString("\n")
+			sb.WriteString(truncateRunes(tp.Request, 2000))
+		}
+	}
+	return sb.String()
 }
 
 // serializeResponseForLog 把 blades.Message 序列化为含文本与工具调用的可读字符串。
@@ -771,6 +814,65 @@ func windowMessages(messages []ReactMessage, max int) []ReactMessage {
 		Content: "（上下文已省略早期对话，关键结论见下方近期事件）",
 	})
 	out = append(out, messages[start:]...)
+	return out
+}
+
+// sanitizeToolPairing 发送给 LLM 前强制修正 tool 调用配对（Anthropic/OpenAI 协议要求）：
+//  1. assistant 消息的每个 tool_calls 必须紧随对应的 tool 结果消息；
+//     缺失的（如被窗口裁剪/注入打断）就地补一条合成错误结果，保证整轮请求不被 400 拒绝；
+//  2. 孤立的 tool 结果消息（前面没有匹配的 tool_calls）同样会被 API 拒绝，直接丢弃。
+//
+// 正常路径（mailbox 已在 tool 结果入史后注入、windowMessages/compressHistory 避开 tool 起刀）
+// 不会触发修正，原样返回；这是各裁剪/续跑路径的最后防线。
+func sanitizeToolPairing(messages []ReactMessage) []ReactMessage {
+	var out []ReactMessage
+	changed := false
+	for i := 0; i < len(messages); i++ {
+		m := messages[i]
+		if m.Role == "tool" {
+			// 配对的 tool 结果已在下方 assistant 分支里被消费（i 随之前移）；
+			// 能走到这里的是孤立结果，丢弃。
+			changed = true
+			continue
+		}
+		out = append(out, m)
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		// 收集紧随其后的连续 tool 结果并按 ToolCallID 配对。
+		pending := make(map[string]bool, len(m.ToolCalls))
+		for _, tc := range m.ToolCalls {
+			pending[tc.ID] = true
+		}
+		for i+1 < len(messages) && messages[i+1].Role == "tool" {
+			i++
+			t := messages[i]
+			if pending[t.ToolCallID] {
+				delete(pending, t.ToolCallID)
+				out = append(out, t)
+			} else {
+				changed = true // 与当前 tool_calls 不匹配的结果：丢弃
+			}
+		}
+		// 缺失响应的 tool_calls 按原顺序补合成错误结果。
+		for _, tc := range m.ToolCalls {
+			if !pending[tc.ID] {
+				continue
+			}
+			changed = true
+			out = append(out, ReactMessage{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content: ToolResultJSON(ToolResult{
+					Tool:  tc.Name,
+					Error: "tool result missing: interrupted by context windowing or message injection",
+				}),
+			})
+		}
+	}
+	if !changed {
+		return messages
+	}
 	return out
 }
 

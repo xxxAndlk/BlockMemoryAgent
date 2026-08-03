@@ -10,8 +10,8 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/board"
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
@@ -61,20 +61,46 @@ func (m *Model) showChatDetail() {
 	m.overlayPanel.open(item.title, strings.Split(detail, "\n"))
 }
 
-// boardSnapshot 通过 agent facade 查询指定会话的看板快照，失败时返回空快照。
+// boardSnapshot 从权威 Agent 树（Dispatcher 维护，已持久化）构建指定会话的看板快照：
+// 每个树节点映射为一条任务，状态直接取节点的实时状态；树为空或查询失败时返回空快照。
+// 注：历史上这里用 agent.Query(QueryKindBoard) 拉取看板，但后端 Query 的 switch 没有
+// board 分支，查询永远落空（default 返回空 Result），因此死查询已删除，只保留 Tree 路径
+// （与原 renderPlanPanel 的 fallback 逻辑一致）。
 func (m *Model) boardSnapshot(sessionID string) board.Snapshot {
 	if m.agent == nil || sessionID == "" {
 		return board.Snapshot{}
 	}
-	res, err := m.agent.Query(context.Background(), sessionID, agent.Query{Kind: agent.QueryKindBoard})
-	if err != nil || res.Data == nil {
+	nodes, err := m.agent.Tree(context.Background(), sessionID)
+	if err != nil || len(nodes) == 0 {
 		return board.Snapshot{}
 	}
-	snap, ok := res.Data.(board.Snapshot)
-	if !ok {
-		return board.Snapshot{}
+	tasks := make([]board.SubTask, 0, len(nodes))
+	for i, n := range nodes {
+		st := board.TaskInProgress
+		switch n.Status {
+		case orchestrator.StatusDone, orchestrator.StatusCancelled:
+			st = board.TaskDone
+		case orchestrator.StatusFailed:
+			st = board.TaskFailed
+		}
+		title := "派发 " + n.Role
+		if n.Task != "" {
+			title += ": " + n.Task
+		}
+		// 完成/失败的任务用 Finished 作为结束时间，使时长统计正确；缺失时回退 Started。
+		updated := n.Started
+		if !n.Finished.IsZero() {
+			updated = n.Finished
+		}
+		tasks = append(tasks, board.SubTask{
+			ID:        fmt.Sprintf("sub-%d", i+1),
+			Title:     title,
+			Status:    st,
+			CreatedAt: n.Started,
+			UpdatedAt: updated,
+		})
 	}
-	return snap
+	return board.Snapshot{Tasks: tasks}
 }
 
 // showPlanDetailByIndex 打开指定索引计划任务的详情弹窗。
@@ -120,6 +146,13 @@ func (m *Model) showAgentDetailByIndex(idx int) {
 	}
 	if node.goal != "" {
 		lines = append(lines, fmt.Sprintf("Goal: %s", node.goal))
+	}
+	// 终态节点的完整结果摘要/错误信息（卡片上只显示截断版）。
+	if node.summary != "" {
+		lines = append(lines, fmt.Sprintf("Summary: %s", node.summary))
+	}
+	if node.err != "" {
+		lines = append(lines, fmt.Sprintf("Error: %s", node.err))
 	}
 	m.overlayPanel.open("Agent", lines)
 }
@@ -177,6 +210,10 @@ func (m *Model) buildPlanLines() []string {
 			Goal:  goal,
 			Tasks: []board.SubTask{{ID: "direct", Title: "直接执行", Status: status}},
 		}
+	}
+	// Tree 路径的看板快照不带 Goal：用会话目标补充，避免弹窗 Goal 行空白。
+	if snap.Goal == "" && s != nil {
+		snap.Goal = s.Goal
 	}
 
 	// 统计完成数量。
@@ -742,6 +779,12 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		title = fmt.Sprintf("[%s] %s", status, tool)
 		if strings.TrimSpace(ev.ToolPath) != "" {
 			title += ": " + ev.ToolPath
+		}
+		// 子 Agent 产生的工具事件在标题末尾追加归属（如 "[✓] WriteFile · 代码助手"），
+		// 让用户能区分主流程与子 Agent 的工具调用；主会话 MetaAgent 与空归属不标注，
+		// 保持主流程标题干净（Agent 展示名由后端 role.Name 提供：MetaAgent/代码助手/领域Agent:xxx）。
+		if ev.Agent != "" && ev.Agent != "MetaAgent" {
+			title += " · " + ev.Agent
 		}
 		// 工具注册表产生的固定文案（"调用工具 X"/"工具结果 X"）是噪声，不展示；
 		// 其他来源的 Message 仍保留在完整记录中。

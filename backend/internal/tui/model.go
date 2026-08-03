@@ -98,6 +98,10 @@ type Model struct {
 	// tickCount 记录 tick 次数，用于按周期执行不同刷新任务。
 	tickCount int
 
+	// dirty 标记有待上屏的流式变更：streamEventMsg 只置脏而不立即 refreshView，
+	// 由 tickMsg 按 100ms 粒度合并刷新，避免每个流式 delta 都全量重算重绘造成卡顿。
+	dirty bool
+
 	// log 是结构化日志器，由 SetLogger 注入；nil 时回退标准库 log。
 	log *logger.Logger
 }
@@ -383,11 +387,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flash = ""
 		}
 		m.flashMu.Unlock()
-		m.refreshView()
+		// 有待消费的会话选中/滚动锚定请求时立即刷新，不等流式事件驱动，
+		// 保证发送消息后视图在一个 tick 内响应。
+		if m.pendingSelectID != "" || m.chatPanel.pendingScrollToUser {
+			m.dirty = true
+		}
+		// 流式事件已在 streamEventMsg 中置脏，这里按 tick 粒度合并刷新；
+		// 每 10 tick 额外强制刷新一次，保证 rebuildAgents/refreshSessions 带来的
+		// 变化（不经过 dirty 标记）也能及时上屏。
+		if m.dirty || m.tickCount%10 == 0 {
+			m.dirty = false
+			m.refreshView()
+		}
 		return m, tickCmd()
 
 	case streamEventMsg:
-		m.refreshView()
+		// 只置脏标记并继续监听事件流；实际刷新合并到下一个 tick，
+		// 避免高频流式 delta 每个都触发全量 refreshView。
+		m.dirty = true
 		return m, streamCmd(m.streamEvents)
 
 	case tea.MouseMsg:
@@ -400,7 +417,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// refreshView 包含 tickMsg 与 streamEventMsg 共享的视图刷新逻辑：
+// refreshView 是 tickMsg 驱动的视图刷新逻辑（streamEventMsg 只置 dirty 标记，由 tick 合并触发）：
 // 待处理会话选中、滚动到用户消息、重建对话内容、刷新弹窗。
 func (m *Model) refreshView() {
 	// 消费后台 createSession 写入的 pendingSelectID：在主循环内 refresh+select
@@ -416,13 +433,15 @@ func (m *Model) refreshView() {
 			}
 		}
 	}
+	// 对话条目只全量收集一次，供下方滚动锚定与内容重建两个分支复用
+	// （原先各算一次 collectChatItems，长会话下是双倍开销）。
+	items := m.collectChatItems()
 	// 发送消息后，优先滚动到最后一条用户问题，确保用户能看到自己的输入。
 	// 该逻辑必须排在内容重建/自动跟随底部之前，防止新内容把用户问题顶出视口。
 	if m.chatPanel.pendingScrollToUser {
-		items := m.collectChatItems()
 		for idx := len(items) - 1; idx >= 0; idx-- {
 			if strings.HasPrefix(items[idx].title, "> ") {
-				m.rebuildChatContent()
+				m.chatPanel.rebuildContent(items, m.styles, m.chatContentWidth())
 				// 把用户问题底部对齐视口底部，保留上方历史可见；
 				// 同时锚定，让后续流式输出在下方展开而不把用户问题顶走。
 				m.chatPanel.scrollToItemBottom(idx, m.chatPanel.vp.TotalLineCount(), m.chatPanel.vp.VisibleLineCount())
@@ -440,7 +459,6 @@ func (m *Model) refreshView() {
 	// viewport 内容随会话事件/消息增长而重建；跟随底部时自动滚到最新。
 	// 锚定到用户问题时仅重建内容、不自动滚动，避免用户问题被顶出视口。
 	if s := m.selectedSession(); s != nil {
-		items := m.collectChatItems()
 		itemsChanged := len(items) != m.chatPanel.lastItems
 		widthChanged := m.chatContentWidth() != m.chatPanel.lastWidth
 		// 条目数不变但末条内容变化（流式文本增长、思考中/执行中状态切换）也需重建。
