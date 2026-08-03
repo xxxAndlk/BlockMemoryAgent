@@ -53,11 +53,11 @@ agent:
   sub_agent_timeout_min: 60      # 子 Agent 独立执行超时（分钟），负数表示不限制。预算抬至 400K 后单 domain 需跑完多文件生成，30min 易在慢推理（thinking）下超时。
   tool_output_history_max_runes: 2000 # 写入历史的单条工具输出最大字符数，负数表示不截断
   token_budget_per_goal: 100000   # 单次目标累计 token 上限（input+output 之和，跨轮累加），超限暂停等用户续跑；<=0 不限制
-  token_budget_per_role:          # 按角色单 Agent token 上限（resume 重置；覆盖 token_budget_per_goal）。未列角色按默认:domain 120000 / 叶子助手 40000 / meta 200000(安全网,防不收敛死循环)。入史工具入参截断(2000 runes)后 input 增长受控，但 codegen 输出（thinking 模型含推理 token）单文件可达 15-30K；塔防级多文件任务一次交付不暂停需 domain 400K / 叶子 100K。
-    domain: 400000
+  token_budget_per_role:          # 按角色单 Agent token 上限（resume 重置；覆盖 token_budget_per_goal）。未列角色按默认:domain 120000 / 叶子助手 40000 / meta 200000(安全网,防不收敛死循环)。入史工具入参截断(2000 runes)后 input 增长受控，但 codegen 输出（thinking 模型含推理 token）单文件可达 15-30K；塔防级多文件任务一次交付不暂停需 domain 400K / 叶子 100K。实证 code_assistant 写 tower.js 撞 100K 截断被迫由 domain 重写返工，编码类叶子抬至 200K。实证 domain 集成走查阶段撞 400K 暂停(第二轮 23:49)，暂停=交付流程中断，抬至 600K 做安全网(摘要走 k3 后上下文收紧,正常不应触顶)。
+    domain: 600000
     meta: 400000
-    code_assistant: 100000
-    ui_assistant: 100000
+    code_assistant: 200000
+    ui_assistant: 200000
     prompt_reviewer: 100000
     code_reviewer: 100000
     test_assistant: 100000

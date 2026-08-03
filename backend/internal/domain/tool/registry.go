@@ -20,9 +20,31 @@ const maxConsecutiveFailures = 3
 // exploreBudget 是单个 Agent 任务内探索类工具（ReadFile/ListDir）调用次数硬上限。
 // 防止 Agent 陷入探索循环不收敛：实证 domain-2 调 81 次探索工具 30m 超时未写完。
 // 超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。SearchInFiles/HTTPGet 不计入（定位性强）。
-// RunCommand 不计入：它是验证/动作工具（node --check、mkdir），封禁会让 Agent 写完文件后
+// RunCommand 仅"只读型命令"（cat/Get-Content/type/head/tail/more）计入：实证集成验证 Agent
+// 用 RunCommand 逐文件 cat 绕过 ReadFile 预算，串行读文件 19 分钟不收敛（logs/tui/2026-08-03.log）。
+// 验证/动作类 RunCommand（node --check、go build、mkdir）仍不计入：封禁会让 Agent 写完文件后
 // 无法按纪律验证，在"必须验证"与"工具被拒"之间死循环（实证：配置 Agent 被拒 8 轮空转 4 分钟）。
 const exploreBudget = 8
+
+// readLikeCmdPrefixes 是只读型 shell 命令前缀（小写匹配，覆盖 bash 与 PowerShell 两侧）。
+// RunCommand 以这些前缀读文件时按探索工具计费；批量读取（如 cat a b c）只算 1 次，
+// 借此把"逐文件多次读"逼成"单条命令批量读"。
+var readLikeCmdPrefixes = []string{
+	"cat ", "type ", "more ", "head ", "tail ",
+	"get-content", "gc ", // PowerShell
+}
+
+// isReadLikeCommand 判断 RunCommand 参数是否为只读型文件查看命令。
+func isReadLikeCommand(args map[string]any) bool {
+	cmd, _ := args["command"].(string)
+	c := strings.ToLower(strings.TrimSpace(cmd))
+	for _, p := range readLikeCmdPrefixes {
+		if strings.HasPrefix(c, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // maxRereadAttempts 是同一 scope+path 上"已读过"拦截的最大次数。
 // 超过后视为 LLM 陷入死循环（实证：代码助手对 config.js/path.js 反复 ReadFile 10+ 次），
@@ -276,8 +298,10 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 探索预算：ReadFile/ListDir 合计调用次数上限，防 Agent 陷入探索循环不收敛。
 	// 实证 domain-2 调 81 次探索工具 30m 超时未写完。超预算返回错误逼迫 WriteFile。
 	// SearchInFiles/HTTPGet 不计（定位性强、不发散）。WriteFile/WriteSharedMemory 不计（产出类）。
-	// RunCommand 不计（验证/动作类）：封禁会让 Agent 写完文件后无法验证而陷入重试死循环。
-	if name == "ReadFile" || name == "ListDir" {
+	// RunCommand 只读型命令（cat/Get-Content 等）按探索计费：防逐文件 cat 绕过预算串行读；
+	// 验证/动作类 RunCommand 不计，封禁会让 Agent 写完文件后无法验证而陷入重试死循环。
+	exploreLike := name == "ReadFile" || name == "ListDir" || (name == "RunCommand" && isReadLikeCommand(args))
+	if exploreLike {
 		if blocked := r.checkExploreBudget(ctx); blocked != "" {
 			result := &Result{Tool: name, Error: blocked}
 			r.fillResult(ctx, result, args)
@@ -305,9 +329,9 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		}
 	}
 
-	// 探索类工具成功后计数 +1（不论成功失败都计，避免失败重试绕过预算）。
-	// 仅 ReadFile/ListDir：RunCommand 为验证/动作工具，不占探索预算。
-	if name == "ReadFile" || name == "ListDir" {
+	// 探索类工具调用后计数 +1（不论成功失败都计，避免失败重试绕过预算）。
+	// ReadFile/ListDir 与只读型 RunCommand 计入；验证/动作类 RunCommand 不计。
+	if exploreLike {
 		r.recordExplore(ctx)
 	}
 
@@ -435,8 +459,8 @@ func scopeKeyFromCtx(ctx context.Context) string {
 
 // checkExploreBudget 检查当前作用域探索类工具调用次数是否超预算。
 // 返回空字符串表示允许；否则返回拦截原因（要求 Agent 转入 WriteFile）。
-// 仅对 ReadFile/ListDir 生效；SearchInFiles/HTTPGet 不计预算（定位性强），
-// RunCommand 不计（验证/动作类，封禁会导致写完文件后无法验证的重试死循环）。
+// 对 ReadFile/ListDir 与只读型 RunCommand 生效；SearchInFiles/HTTPGet 不计预算（定位性强），
+// 验证/动作类 RunCommand 不计（封禁会导致写完文件后无法验证的重试死循环）。
 func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	scopeKey := scopeKeyFromCtx(ctx)
 	if scopeKey == "" {

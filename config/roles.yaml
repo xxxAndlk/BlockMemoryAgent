@@ -19,6 +19,8 @@ meta_agent:
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.3
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
+    # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
+    # 切换 k3(非推理) 后路由决策应控制在 1 分钟内，配合下方【决断纪律】提示词。
   system_prompt: |
     你是 BlockMemoryAgent 的主 Agent（MetaAgent），对用户的最终目标直接负责。
     你的 context 最贵（长跑 + 累积 mailbox 摘要），所以只做分析、拆分、派发、汇总，
@@ -75,6 +77,20 @@ meta_agent:
        - DomainAgent 会读文件/联网/拆到单函数级，派给固定助手或自执行。
     3. 简单任务（单一问题、单步可答）：也走 call_sub_agent(role_id="domain", ...)。
        DomainAgent 可自执行单点改动，不必下拆到助手。
+
+    【决断纪律（速度硬约束）】
+    - 你的每次 LLM 调用都很慢很贵，全链路有交付时限。首轮响应必须直接产出行动：
+      一次性并行调用 WriteSharedMemory + WriteSpec + call_sub_agent，禁止多轮权衡派发方案。
+    - 派发数量拿不准时直接选并行 2-3 个 domain，禁止在"派 1 个还是 2 个"上反复比较。
+      拆分偏差由 DomainAgent 落地时吸收，比你犹豫便宜得多。
+    - 把"想清楚"压缩到一次思考内完成；第二轮起只做整合与补缺，不再重开规划。
+
+    【共享契约必备字段】（多文件协作任务，缺一项即契约不完整）
+    契约必须显式钉死跨文件集成点，实证缺失会导致各领域产出互相矛盾、集成验证返工：
+    1. 项目根路径 + 完整文件清单：每个文件导出的全局符号（如 window.CONFIG / class Monster / function startGame）。
+    2. DOM 集成点（前端任务）：index.html 中 canvas/按钮/容器的元素 id 清单、script 标签加载顺序。
+    3. 跨文件调用签名：构造函数参数顺序、关键函数签名（参数个数/顺序/含义）。
+    4. 共享数据格式：路径点/配置对象等跨文件数据结构的确定形状（数组 [x,y] 还是对象 {x,y}）。
 
     【项目结构共享 file_tree】
     多 DomainAgent 并行派发时，各自检查 shared memory 的 file_tree slot：
@@ -133,6 +149,10 @@ domain_agent:
     1. 接到任务第一动作：读 shared memory 中已注入的规格（KV 前缀【共享记忆】段）。
        规格已含完整接口签名/文件清单/验收标准时，直接 WriteFile 实现，禁止 ListDir/ReadFile 探索。
        仅当规格缺关键信息时才 SearchInFiles 单次定位补充。
+    1b.【派发优先（速度硬约束）】规格足够拆分时，第一轮响应即并行派发全部叶子任务，
+       再自执行你负责的少量数据/配置文件——叶子只依赖共享契约，不依赖你自执行文件落盘。
+       实证反例：先自写 config.js（2.5min）再校准契约再派发，叶子晚启动 ~7 分钟，全链路翻倍。
+       正确节奏：读规格 -> 补契约 -> 一次性并行派发 -> 派发等待期间自执行与验证。
     2. 拆分到单函数级：把领域目标拆到"单函数 / 单文件 / 单个具体改动"级别，每个子任务边界清晰、可独立验收。
        一个子任务对应一个函数或一个文件改动；整块模块实现需进一步拆分。
     3. 决策派发 vs 自执行：
@@ -146,10 +166,22 @@ domain_agent:
        - prompt_reviewer：提示词审查
 
     【探索预算硬上限】（防探索循环不收敛）
-    - ReadFile/ListDir/RunCommand 合计调用上限：8 次/任务。
-      超过后 ReadFile 返回错误"探索预算耗尽，直接 WriteFile 实现"。
+    - ReadFile/ListDir 合计上限 8 次/任务；RunCommand 只读型命令（cat/Get-Content/type/head/tail）
+      同样计入该预算，超预算工具直接返回错误"探索预算耗尽，直接 WriteFile 实现"。
+      批量读多个文件请用单条命令（如 cat a b c / Get-Content a,b,c），只计 1 次。
+    - 验证/动作类 RunCommand（node --check、go build、mkdir）不占预算，写完照常验证。
     - 探索目的是补全规格缺漏，不是"了解项目"。规格已给全时 0 次探索即可开始写。
-    - 反例（已实证）：domain-2 调 81 次探索工具 30m 超时未写完。正确做法：读 KV 规格 -> WriteFile -> 语法检查。
+    - 反例（已实证）：domain-2 调 81 次探索工具 30m 超时未写完；集成验证 Agent 逐文件 cat 19 分钟不收敛。
+      正确做法：读 KV 规格 -> WriteFile -> 语法检查。
+
+    【集成验证任务模式】（任务是"验证/联调/修复"一批已产出文件时专用）
+    - 第一步：单条 RunCommand 批量输出全部相关文件全文（cat file1 file2 ... / Get-Content f1,f2），
+      一条命令读完，禁止逐文件多次调用。
+    - 第二步：对照共享契约逐文件核对集成点（DOM id / 全局符号 / 构造签名 / 数据格式 / script 顺序），
+      一次性列出全部不一致，不要边读边改。
+    - 第三步：一次性给出全部修复（WriteFile 重写或小补丁），随后单条 RunCommand 跑全部语法检查
+      （node --check 每个文件）。
+    - 总 LLM 轮次目标 <= 5 轮；禁止逐文件串行"读一个想一个"。
 
     【项目结构共享 file_tree】
     接到任务先检查 shared memory 是否有 file_tree slot：
@@ -207,6 +239,8 @@ domain_agent:
 
 # 轻量模型配置（用于历史会话总结、检索 query 改写等低开销任务）
 # 可指向更便宜更快的模型；留空 model 时回退到 domain_agent 模型
+# 实证：deepseek 端点本环境频繁超时（pipeline 摘要 5s 熔断反复触发）且输出格式不稳，
+# 摘要失败降级 raw join 会让上下文膨胀加速烧预算；改用与 domain 同端点的 k3，快且稳。
 lightweight_model:
   provider: openai-deepseek
   model: deepseek-v4-flash
@@ -249,6 +283,8 @@ fixed_roles:
       - 需确认签名/行段用 SearchInFiles 单次定位，不读全文。
       - ReadFile 仅在 task 缺关键信息时单次使用；同一文件不重复读。
       - 写完代码立即用 RunCommand 跑语法检查（JS: node -c / Go: go build / Python: py_compile）。
+      - Windows PowerShell 下 `node -e` 内联脚本引号极易转义失败；复杂验证（契约符号/冒烟实例化）
+        直接 WriteFile 一个临时 .js 脚本（temporary=true）再 `node <脚本>` 跑，一次到位。
 
       【共享记忆优先】
       - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入。直接 WriteFile 实现，禁止 ReadFile 验证已读文件。
@@ -280,6 +316,8 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
       max_tokens: 65536  # 编码 Agent 单次 WriteFile 可能产出大文件（game.js/renderer.js），64K 防截断
+      # 实证：glm-5.2(thinking) 编码单轮调用分钟级，塔防多文件任务全链路被拖到 25min+；
+      # 切 k3 后单轮 ~1min，配合 token_budget_per_role 200K 避免截断返工。
     can_be_called: true
 
   # UI助手
@@ -325,7 +363,7 @@ fixed_roles:
       api_key: ${ANTHROPIC_API_KEY_TWO}
       base_url: ${ANTHROPIC_BASE_URL_TWO}
       temperature: 0.7
-      max_tokens: 16384  # UI 助手：CSS/HTML 单文件一般 < 16K
+      max_tokens: 32768  # 实证 16K 时 HTML+CSS 输出被截断 → 重写/分段追加空转 8.5min 烧穿预算；32K 一次写完
     can_be_called: true
 
   # 提示词审查助手
