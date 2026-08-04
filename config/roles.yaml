@@ -5,29 +5,33 @@
 # 子 Agent 完成后结果摘要经 Mailbox 回灌父 Agent。
 #
 # provider 支持：
-#   - openai：OpenAI 兼容协议（/v1/chat/completions），适用于 OpenAI / DeepSeek / Kimi / 豆包等
+#   - openai-chat：OpenAI Chat Completions 协议（/v1/chat/completions），适用于 OpenAI / DeepSeek / Kimi / GLM / 豆包等；
+#     自研实现，内置字段兼容（reasoning_content 回传、max_tokens vs max_completion_tokens 按模型名自适应、usage cache 字段回退）。
+#     旧名 openai / openai-deepseek 作为其别名仍可用。
+#   - openai-responses：OpenAI Responses API 协议（/v1/responses），适用于 gpt-4.1 / o 系 / gpt-5 等新一代接口。
 #   - ollama：Ollama 原生 /api/chat 协议，默认 http://localhost:11434
 #   - anthropic：Anthropic 原生 Messages API，默认 https://api.anthropic.com
-# 三种 provider 分别使用对应 SDK，不再统一转成 OpenAI 兼容端点。
+# openai 系两种格式与 ollama/anthropic 均为自研或原生 SDK 直连，不再统一转单一协议。
 
 # 主Agent (MetaAgent)：会话入口，对最终目标负责。只做派发与汇总，不直接执行。
 meta_agent:
   model_config: &meta_model
     provider: anthropic
-    model: glm-5.2
-    api_key: ${ANTHROPIC_API_KEY}
-    base_url: ${ANTHROPIC_BASE_URL}
+    model: k3
+    api_key: ${ANTHROPIC_API_KEY_TWO}
+    base_url: ${ANTHROPIC_BASE_URL_TWO}
     temperature: 0.3
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
     # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
-    # 切换 k3(非推理) 后路由决策应控制在 1 分钟内，配合下方【决断纪律】提示词。
+    # 已切换 k3(非推理, 与 domain 同端点)：2026-08-04 基线运行 glm-5.2 路由 3m18s + 汇总多次 thinking 共 322s，
+    # k3 路由决策应控制在 1 分钟内，配合下方【决断纪律】提示词。
   system_prompt: |
     你是 BlockMemoryAgent 的主 Agent（MetaAgent），对用户的最终目标直接负责。
     你的 context 最贵（长跑 + 累积 mailbox 摘要），所以只做分析、拆分、派发、汇总，
     所有执行交给 DomainAgent。
 
     【可用工具】
-    - call_sub_agent(role_id, task)：派发子 Agent 执行领域或叶子任务。task 自包含 <= 500 字（按 rune 计数，中文字符算1字；背景+目标+验收），只详写该子 Agent 负责的部分，禁止贴全量规格；共享契约走 WriteSharedMemory。立即返回 sub_agent_id，完成后收到 [mailbox from <sub_agent_id>] 摘要。超长 task 将被拒绝，错误提示"task too long: N runes (max 500)"。
+    - call_sub_agent(role_id, task)：派发子 Agent 执行领域或叶子任务。task 自包含 <= 2000 字（按 rune 计数，中文字符算1字；背景+目标+验收），只详写该子 Agent 负责的部分，禁止贴全量规格；共享契约走 WriteSharedMemory。立即返回 sub_agent_id，完成后收到 [mailbox from <sub_agent_id>] 摘要。超长 task 将被拒绝，错误提示"task too long: N runes (max 2000)"。
     - WriteSharedMemory(content)：写入跨领域共享契约：项目路径、文件清单、接口签名、验收标准，
       精简 <= 500 字。禁止塞全量数据/规格原文——全量数据由负责领域 Agent 直接写入目标文件，
       其他 Agent 按需 ReadFile 读取。files 字段只列只读参照文件；列出将被改写的文件会导致
@@ -83,6 +87,8 @@ meta_agent:
       一次性并行调用 WriteSharedMemory + WriteSpec + call_sub_agent，禁止多轮权衡派发方案。
     - 派发数量拿不准时直接选并行 2-3 个 domain，禁止在"派 1 个还是 2 个"上反复比较。
       拆分偏差由 DomainAgent 落地时吸收，比你犹豫便宜得多。
+      多文件创建类任务（>= 4 文件）必须并行派 >= 2 个 domain：单 domain 串行搭契约+派发实证 4.5 分钟，
+      双 domain 并行 2.3 分钟。
     - 把"想清楚"压缩到一次思考内完成；第二轮起只做整合与补缺，不再重开规划。
 
     【共享契约必备字段】（多文件协作任务，缺一项即契约不完整）
@@ -121,6 +127,8 @@ meta_agent:
     1. 接到目标先规划：拆解为领域子任务，明确派发顺序。
     2. 派发后继续推进可并行的派发；收到 mailbox 摘要后及时整合。
     3. 全部子任务完成并验证后，输出最终答复：目标达成情况 + 关键产出 + 涉及文件路径。
+       DomainAgent 上报即视为已验证：禁止再派独立"集成验证"领域做全量复核（实证该相位单烧 7+ 分钟）；
+       仅当某领域明确上报失败或产出互相矛盾时，才针对该点派单个修复任务。
     4. 最终答复 = DomainAgent 回灌摘要的整理版，保留结论与文件路径。
   max_blocks: 20
   summary_interval: 10
@@ -138,7 +146,7 @@ domain_agent:
     你是领域负责人（DomainAgent），负责把父 Agent 交办的目标在你负责的领域内落地。你可读文件/联网采集上下文，拆分到单函数级后派发或自执行。
 
     【可用工具】
-    - call_sub_agent(role_id, task)：派发子 Agent 执行叶子任务。task 自包含 <= 500 字
+    - call_sub_agent(role_id, task)：派发子 Agent 执行叶子任务。task 自包含 <= 2000 字
       （背景+目标+相关文件路径与行号+验收）；规格原文走 WriteSharedMemory。
     - ReadFile / ListDir / SearchInFiles：读文件、列目录、符号检索，用于采集上下文、定位关键代码。
     - HTTPGet：联网获取文档/API/参考资料。
@@ -183,6 +191,16 @@ domain_agent:
       （node --check 每个文件）。
     - 总 LLM 轮次目标 <= 5 轮；禁止逐文件串行"读一个想一个"。
 
+    【收尾纪律（速度硬约束）】
+    - 全部叶子回传后，只允许一条组合命令完成全部确认：
+      node --check 每个产出文件（一条命令串行列出）+ 需要冒烟时合并进同一条命令。
+      禁止逐文件 ReadFile/SearchInFiles 复核契约、禁止再派"验证"子任务、禁止逐文件逐条 RunCommand。
+    - 确认发现问题：最多 1 轮修复（一次 WriteFile 修完全部问题 + 一条复查命令），随即上报。
+      验证阶段 LLM 总轮次硬上限 3 轮，到轮立即按当前状态上报。
+    - 实证：domain 收尾阶段逐文件复核 + 多轮 RunCommand + 叶子交叉互改，收尾单独烧掉 ~5 分钟。
+    - 拆分粒度：单文件目标 <= 300 行；超大文件先按类/模块拆成多文件并行派叶子，
+      缩短单轮生成时长、降低截断返工风险。game.js 主循环易超限：渲染(renderer.js)与界面(ui.js)独立成文件。
+
     【项目结构共享 file_tree】
     接到任务先检查 shared memory 是否有 file_tree slot：
     - 有：直接消费，按树用 SearchInFiles 拿具体行段，禁止 ListDir 重新探索项目结构。
@@ -198,6 +216,8 @@ domain_agent:
       并行场景下多个 DomainAgent 同时写 file_tree 可接受（结构一致，最后写入覆盖）。
 
     【派发固定助手前的任务准备】
+    - 规格从简：共享契约正文 <= 1200 字；每个叶子 task <= 300 字，只写该文件负责的部分 + 签名引用，
+      禁止向 task 转贴契约全文（叶子自动读共享记忆）。实证：单响应塞 7500 token 规格，首轮调用 3 分钟。
     派 code_assistant/ui_assistant/test_assistant 前，用 SearchInFiles 抽目标签名 + 行段写入 task：
       call_sub_agent(role_id="code_assistant", task="
       写 workspace/js/game.js。
@@ -240,12 +260,14 @@ domain_agent:
 # 轻量模型配置（用于历史会话总结、检索 query 改写等低开销任务）
 # 可指向更便宜更快的模型；留空 model 时回退到 domain_agent 模型
 # 实证：deepseek 端点本环境频繁超时（pipeline 摘要 5s 熔断反复触发）且输出格式不稳，
-# 摘要失败降级 raw join 会让上下文膨胀加速烧预算；改用与 domain 同端点的 k3，快且稳。
+# 摘要失败降级 raw join 会让上下文膨胀加速烧预算；已改用与 domain 同端点的 k3，快且稳。
+# 2026-08-04 基线运行实证：deepseek-v4-flash 多次 503 "Service is too busy" 重试耗尽，
+# 事实提取连续失败，故切换。
 lightweight_model:
-  provider: openai-deepseek
-  model: deepseek-v4-flash
-  api_key: ${OPENAI_API_KEY}
-  base_url: ${OPENAI_BASE_URL}
+  provider: anthropic
+  model: k3
+  api_key: ${ANTHROPIC_API_KEY_TWO}
+  base_url: ${ANTHROPIC_BASE_URL_TWO}
   temperature: 0.2
   max_tokens: 2048
 
@@ -285,6 +307,9 @@ fixed_roles:
       - 写完代码立即用 RunCommand 跑语法检查（JS: node -c / Go: go build / Python: py_compile）。
       - Windows PowerShell 下 `node -e` 内联脚本引号极易转义失败；复杂验证（契约符号/冒烟实例化）
         直接 WriteFile 一个临时 .js 脚本（temporary=true）再 `node <脚本>` 跑，一次到位。
+      - 【终止纪律（速度硬约束）】WriteFile 落盘 + 一次语法检查通过 = 任务完成，立即输出最终答复。
+        禁止重读/SearchInFiles 核对其他文件（含契约里列出的兄弟文件）——跨文件集成核对由上级统一负责。
+        实证：叶子写完后交叉核对契约再互改，单任务多烧 5+ 分钟且与同层其他叶子互相覆盖。
 
       【共享记忆优先】
       - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入。直接 WriteFile 实现，禁止 ReadFile 验证已读文件。
@@ -311,13 +336,14 @@ fixed_roles:
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &coding_model
       provider: anthropic
-      model: glm-5.2
-      api_key: ${ANTHROPIC_API_KEY}
-      base_url: ${ANTHROPIC_BASE_URL}
+      model: k3
+      api_key: ${ANTHROPIC_API_KEY_TWO}
+      base_url: ${ANTHROPIC_BASE_URL_TWO}
       temperature: 0.4
       max_tokens: 65536  # 编码 Agent 单次 WriteFile 可能产出大文件（game.js/renderer.js），64K 防截断
       # 实证：glm-5.2(thinking) 编码单轮调用分钟级，塔防多文件任务全链路被拖到 25min+；
-      # 切 k3 后单轮 ~1min，配合 token_budget_per_role 200K 避免截断返工。
+      # 已切 k3(非推理)：2026-08-04 基线运行 code_assistant 90 轮调用累计 1370s 为最大耗时源，
+      # k3 单轮 ~1min 内，配合 token_budget_per_role 200K 避免截断返工。
     can_be_called: true
 
   # UI助手
@@ -335,6 +361,8 @@ fixed_roles:
       - 需确认签名/行段用 SearchInFiles 单次定位，不读全文。
       - ReadFile 仅在 task 缺关键信息时单次使用；同一文件不重复读。
       - 写完代码立即用 RunCommand 跑语法检查（JS: node -c / Go: go build / Python: py_compile）。
+      - 【终止纪律（速度硬约束）】WriteFile 落盘 + 一次语法检查通过 = 任务完成，立即输出最终答复。
+        禁止重读/SearchInFiles 核对其他文件（含契约里列出的兄弟文件）——跨文件集成核对由上级统一负责。
 
       【共享记忆优先】
       - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入。直接 WriteFile 实现，禁止 ReadFile 验证已读文件。
@@ -403,12 +431,13 @@ fixed_roles:
     skills: ["Prompt审查", "Prompt优化", "安全检测", "偏见检测"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &review_model
-      provider: openai-deepseek
-      model: deepseek-v4-flash
-      api_key: ${OPENAI_API_KEY}
-      base_url: ${OPENAI_BASE_URL}
+      provider: anthropic
+      model: k3
+      api_key: ${ANTHROPIC_API_KEY_TWO}
+      base_url: ${ANTHROPIC_BASE_URL_TWO}
       temperature: 0.2
       max_tokens: 16384  # 提示词审查：完整 prompt 改写可能较长
+      # deepseek-v4-flash 端点频繁超时/503，strict 启动连通性校验会被其拖死（2026-08-04 实证启动失败），统一切 k3
     can_be_called: true
 
   # 代码审查助手
@@ -480,10 +509,11 @@ fixed_roles:
     skills: ["单元测试", "集成测试", "边界测试", "性能测试"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &coding_model
-      provider: openai-deepseek
-      model: deepseek-v4-flash
-      api_key: ${OPENAI_API_KEY}
-      base_url: ${OPENAI_BASE_URL}
+      provider: anthropic
+      model: k3
+      api_key: ${ANTHROPIC_API_KEY_TWO}
+      base_url: ${ANTHROPIC_BASE_URL_TWO}
+      # deepseek 端点不稳会拖死 strict 启动校验（2026-08-04 实证），统一切 k3
     can_be_called: true
 
   # 文档助手
@@ -526,17 +556,18 @@ fixed_roles:
     skills: ["技术文档", "API文档", "代码注释", "示例编写"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &doc_model
-      provider: openai-deepseek
-      model: deepseek-v4-flash
-      api_key: ${OPENAI_API_KEY}
-      base_url: ${OPENAI_BASE_URL}
+      provider: anthropic
+      model: k3
+      api_key: ${ANTHROPIC_API_KEY_TWO}
+      base_url: ${ANTHROPIC_BASE_URL_TWO}
       temperature: 0.5
       max_tokens: 16384  # 文档助手：README/CHANGELOG 中等长度
     can_be_called: true
 
 # 动态角色模板
 # 每个模板均可选填 model_config；未配置时，由该模板动态生成的角色回退到 domain_agent.model_config。
-# provider 取值与 fixed_roles 一致：openai / ollama / anthropic（均走 OpenAI 兼容协议）。
+# provider 取值与 fixed_roles 一致：openai-chat / openai-responses / ollama / anthropic
+#（openai 为 openai-chat 的别名）。
 dynamic_templates:
   # 领域Agent模板
   - id: domain_template
@@ -575,9 +606,9 @@ dynamic_templates:
     skills: []
     max_lifetime: 3600  # 1小时
     model_config: &assistant_model
-      provider: openai-deepseek
-      model: deepseek-v4-flash
-      api_key: ${OPENAI_API_KEY}
-      base_url: ${OPENAI_BASE_URL}
+      provider: anthropic
+      model: k3
+      api_key: ${ANTHROPIC_API_KEY_TWO}
+      base_url: ${ANTHROPIC_BASE_URL_TWO}
       temperature: 0.4
       max_tokens: 16384  # 临时助手：基线 16K

@@ -56,7 +56,7 @@ func isNonRetryableErr(err error) bool {
 // retryProvider 包装 blades.ModelProvider，对 Generate 做 3 次重试。
 // NewStreaming 直接委托底层，保留流式语义与 react_agent 层的重试覆盖。
 type retryProvider struct {
-	inner blades.ModelProvider // 底层真实 provider（anthropic/openai/deepseek/ollama）
+	inner blades.ModelProvider // 底层真实 provider（anthropic/openai-chat/openai-responses/ollama）
 	name  string               // provider 名称，用于日志定位
 }
 
@@ -201,7 +201,7 @@ func (p *retryProvider) NewStreaming(ctx context.Context, req *blades.ModelReque
 }
 
 // wrapWithRetry 用 retryProvider 包装底层 provider。
-// 在 createBladesProvider 中调用，确保所有 provider（anthropic/openai/deepseek/ollama）
+// 在 createBladesProvider 中调用，确保所有 provider（anthropic/openai-chat/openai-responses/ollama）
 // 都获得 3 次重试能力。name 用 cfg.Model 便于日志定位具体模型。
 func wrapWithRetry(inner blades.ModelProvider, name string) blades.ModelProvider {
 	if inner == nil {

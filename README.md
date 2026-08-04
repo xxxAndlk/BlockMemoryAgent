@@ -78,7 +78,7 @@ Wiring:  bootstrap.Build（HTTP 服务 / TUI / 集成测试共用同一份装配
 cp .env.example .env  # 填 OPENAI_API_KEY / OPENAI_BASE_URL / POSTGRES_DSN / REDIS_ADDR
 ```
 
-编辑 `config/roles.yaml` 配置各角色模型（meta_agent / domain_agent / lightweight_model / fixed_roles / dynamic_templates 均可独立配置 `model_config`，provider 支持 `openai` / `anthropic` / `ollama`）。
+编辑 `config/roles.yaml` 配置各角色模型（meta_agent / domain_agent / lightweight_model / fixed_roles / dynamic_templates 均可独立配置 `model_config`，provider 支持 `openai-chat`（别名 `openai`）/ `openai-responses` / `anthropic` / `ollama`）。
 
 ### 运行
 

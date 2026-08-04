@@ -368,7 +368,16 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// mailbox 由服务装配层注入共享邮箱（用于接收异步子代理摘要）；未注入时跳过。
 			// 仅在无 tool_calls 分支注入：mailbox 消息是 user 角色，若插在 assistant
 			// tool_calls 与其 tool 结果之间，Anthropic 配对校验会以 400 拒绝整轮请求。
-			history, _ = a.drainMailbox(history)
+			var drained int
+			history, drained = a.drainMailbox(history)
+			// 竞态修复：子 Agent 完成摘要在本轮 LLM 生成期间才抵达 mailbox 时，刚生成的文本
+			// 并未整合该摘要。典型序列：模型生成"请稍候"等待文本期间子 Agent 恰好完成，
+			// PendingChildren 已归 0，下方终结保护不再拦截，进度汇报被误当终答
+			// （实证：塔防 run4 meta 以"请稍候。"提前终结会话，domain-2 摘要从未进入终答）。
+			// 只要 drain 到新消息就 continue 回主循环，让模型基于完整摘要重新生成本轮答复。
+			if drained > 0 {
+				continue
+			}
 			// 父会话终结保护：若仍有未决子 Agent（call_sub_agent 派发后尚未回传结果），
 			// 阻塞等待其完成而非立即终结，防止迟到 mailbox 消息随会话销毁丢失。
 			// 多 Agent 协作验证闭环（code<->test 互问互答）的关键正确性保障。
@@ -520,11 +529,11 @@ func (a *ReActAgent) generate(ctx context.Context, req *blades.ModelRequest) (*b
 }
 
 // streamingModelProvider 是 blades.ModelProvider 的可选流式接口子集。
-// 具体 provider（如 contrib/openai）通常同时实现 Generate 与 NewStreaming；
+// 具体 provider（openai-chat/openai-responses/anthropic 等）通常同时实现 Generate 与 NewStreaming；
 // 仅实现 Generate 的 provider（含测试 mock）自动回退到一次性调用。
 type streamingModelProvider interface {
 	// NewStreaming 执行请求并返回一个逐块产出响应的生成器；
-	// 最后一个产出值是完整累积响应（contrib/openai 由 accumulator 保证）。
+	// 最后一个产出值是完整累积响应（各 provider 由内部累积器保证）。
 	NewStreaming(context.Context, *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error]
 }
 

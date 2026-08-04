@@ -619,7 +619,7 @@ func (t *callSubAgentTool) Description() string {
 	}
 	return "将子任务派发给指定角色的子 Agent 异步执行。调用立即返回 sub_agent_id；" +
 		"子 Agent 完成后，其结果摘要会以 [mailbox from <sub_agent_id>] 消息送达，请在后续轮次中阅读并整合。\n" +
-		"task 必须自包含 <= 500 字（按 rune 计数，含中文字符）：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。" +
+		"task 必须自包含 <= 2000 字（按 rune 计数，含中文字符）：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。" +
 		"规格原文走 WriteSharedMemory，不塞进 task。超长 task 将被拒绝，错误提示\"task too long\"。\n\n" +
 		"【前置依赖】派发前必须先调 WriteSpec(goal, acceptance, constraints, files) 写入任务规范，否则返回错误\"spec missing or stale\"。" +
 		"WriteSpec 与 WriteSharedMemory 是不同工具：WriteSharedMemory 写自由 KV 供子 Agent 读，" +
@@ -662,12 +662,14 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	}
 
 	// task 长度上限：强制 MetaAgent 把规格写入 WriteSharedMemory，task 只写目标+验收标准。
-	// 500 runes ≈ 500 汉字 / 1.5k 英文 chars，足够描述单领域目标+验收；
-	// 实证 MetaAgent 倾向把规格塞进 task（事故日志：3521/2315 runes），500 字硬卡逼走共享记忆。
-	const maxTaskRunes = 500
+	// 原 500 runes 实证过紧：塔防类任务的自然派发文本 ~1200-1500 runes，每轮必触发
+	// "task too long" 拒绝-重写循环（单次运行最多 4 次拒绝，白烧 1-2 分钟路由轮次）。
+	// 放宽到 2000 runes：容纳"背景+目标+文件清单+验收"的完整自包含描述，
+	// 仍拦截 3500+ runes 的全量规格转贴（事故日志：3521/2315 runes）。
+	const maxTaskRunes = 2000
 	if n := utf8.RuneCountInString(task); n > maxTaskRunes {
 		return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf(
-			"task too long: %d runes (max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（500 字内）",
+			"task too long: %d runes (max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（2000 字内）",
 			n, maxTaskRunes)}
 	}
 

@@ -214,8 +214,8 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 				})
 			}
 			// 回传思考模型的推理过程：DeepSeek V4 reasoner 等要求 assistant 消息携带
-			// reasoning_content 字段，否则 400。通过 Metadata 传递，由 deepseekProvider
-			// 序列化到请求 JSON；其他 provider 忽略。
+			// reasoning_content 字段，否则 400。通过 Metadata 传递，由 openai-chat
+			// provider 序列化到请求 JSON；其他 provider 忽略。
 			if m.ReasoningContent != "" {
 				if msg.Metadata == nil {
 					msg.Metadata = make(map[string]any)

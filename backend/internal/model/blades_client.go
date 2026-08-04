@@ -224,7 +224,12 @@ func (c *BladesClient) GenerateWithOptions(ctx context.Context, prompt string, t
 // createBladesProvider 根据配置中的 Provider 字段选择对应的 blades.ModelProvider 实现。
 //
 // 职责：provider 类型分发 + 统一包装 3 次重试。
-//   - openai（或空）：使用 blades/contrib/openai 的 OpenAI 兼容 provider。
+//   - openai-chat：OpenAI Chat Completions 兼容端点（/chat/completions），自研实现，
+//     兼容 DeepSeek/Kimi/GLM/豆包等三方端点的字段变体（reasoning_content 回传、
+//     max_tokens vs max_completion_tokens、usage cache 字段等）。
+//     openai / openai-deepseek / 空串 均为其别名（向后兼容旧配置）。
+//   - openai-responses：OpenAI Responses API 端点（/responses），自研实现，
+//     适用于 gpt-4.1/o 系/gpt-5 等新一代接口及其实现该协议的第三方端点。
 //   - anthropic：使用 Anthropic Go SDK 原生 Messages API。
 //   - ollama：使用 Ollama Go SDK 原生 /api/chat。
 //
@@ -245,15 +250,14 @@ func createBladesProvider(cfg types.AgentModelConfig) (blades.ModelProvider, err
 	var inner blades.ModelProvider
 	var err error
 	switch cfg.Provider {
-	case "openai", "openai-deepseek", "":
-		// openai-deepseek 走专用 provider：捕获并回传 reasoning_content，
-		// 避免 DeepSeek V4 思考模型 400 "reasoning_content must be passed back"。
-		// 空字符串视为 openai 兼容默认值。
-		if cfg.Provider == "openai-deepseek" {
-			inner = newDeepSeekProvider(cfg)
-		} else {
-			inner = newOpenAIProvider(cfg)
-		}
+	case "openai", "openai-chat", "openai-deepseek", "":
+		// openai / openai-deepseek / 空串 是 openai-chat 的别名：
+		// openai-chat 原生支持 reasoning_content 捕获与回传（DeepSeek V4 要求），
+		// 并按模型名自动选择 max_tokens / max_completion_tokens 字段。
+		inner = newOpenAIChatProvider(cfg)
+	case "openai-responses":
+		// OpenAI Responses API（/responses 端点）。
+		inner = newOpenAIResponsesProvider(cfg)
 	case "anthropic":
 		// Anthropic 原生 Messages API
 		inner = newAnthropicProvider(cfg)
