@@ -17,9 +17,9 @@
 meta_agent:
   model_config: &meta_model
     provider: anthropic
-    model: k3
-    api_key: ${ANTHROPIC_API_KEY_TWO}
-    base_url: ${ANTHROPIC_BASE_URL_TWO}
+    model: glm-5.2
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.3
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
     # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
@@ -137,9 +137,9 @@ meta_agent:
 domain_agent:
   model_config: &domain_model
     provider: anthropic
-    model: k3
-    api_key: ${ANTHROPIC_API_KEY_TWO}
-    base_url: ${ANTHROPIC_BASE_URL_TWO}
+    model: glm-5.2
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.5
     max_tokens: 128000  # DomainAgent 自执行 WriteFile 时需容纳大文件 + 派发推理；Volces ark 硬上限 128000，顶格设
   system_prompt: |
@@ -264,10 +264,10 @@ domain_agent:
 # 2026-08-04 基线运行实证：deepseek-v4-flash 多次 503 "Service is too busy" 重试耗尽，
 # 事实提取连续失败，故切换。
 lightweight_model:
-  provider: anthropic
-  model: k3
-  api_key: ${ANTHROPIC_API_KEY_TWO}
-  base_url: ${ANTHROPIC_BASE_URL_TWO}
+  provider: openai-responses
+  model: deepseek-v4-flash
+  api_key: ${OPENAI_API_KEY}
+  base_url: ${OPENAI_BASE_URL}
   temperature: 0.2
   max_tokens: 2048
 
@@ -335,10 +335,10 @@ fixed_roles:
     # 只暴露执行类工具；call_sub_agent 由 dispatcher 注册但不在此白名单中。
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &coding_model
-      provider: anthropic
-      model: k3
-      api_key: ${ANTHROPIC_API_KEY_TWO}
-      base_url: ${ANTHROPIC_BASE_URL_TWO}
+      provider: openai-responses
+      model: deepseek-v4-flash
+      api_key: ${OPENAI_API_KEY}
+      base_url: ${OPENAI_BASE_URL}
       temperature: 0.4
       max_tokens: 65536  # 编码 Agent 单次 WriteFile 可能产出大文件（game.js/renderer.js），64K 防截断
       # 实证：glm-5.2(thinking) 编码单轮调用分钟级，塔防多文件任务全链路被拖到 25min+；
@@ -387,9 +387,9 @@ fixed_roles:
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &domain_model
       provider: anthropic
-      model: k3
-      api_key: ${ANTHROPIC_API_KEY_TWO}
-      base_url: ${ANTHROPIC_BASE_URL_TWO}
+      model: doubao-seed-2.1-turbo
+      api_key: ${ANTHROPIC_API_KEY}
+      base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.7
       max_tokens: 32768  # 实证 16K 时 HTML+CSS 输出被截断 → 重写/分段追加空转 8.5min 烧穿预算；32K 一次写完
     can_be_called: true
@@ -431,10 +431,10 @@ fixed_roles:
     skills: ["Prompt审查", "Prompt优化", "安全检测", "偏见检测"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &review_model
-      provider: anthropic
-      model: k3
-      api_key: ${ANTHROPIC_API_KEY_TWO}
-      base_url: ${ANTHROPIC_BASE_URL_TWO}
+      provider: openai-responses
+      model: deepseek-v4-flash
+      api_key: ${OPENAI_API_KEY}
+      base_url: ${OPENAI_BASE_URL}
       temperature: 0.2
       max_tokens: 16384  # 提示词审查：完整 prompt 改写可能较长
       # deepseek-v4-flash 端点频繁超时/503，strict 启动连通性校验会被其拖死（2026-08-04 实证启动失败），统一切 k3
@@ -509,10 +509,10 @@ fixed_roles:
     skills: ["单元测试", "集成测试", "边界测试", "性能测试"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &coding_model
-      provider: anthropic
-      model: k3
-      api_key: ${ANTHROPIC_API_KEY_TWO}
-      base_url: ${ANTHROPIC_BASE_URL_TWO}
+      provider: openai-responses
+      model: deepseek-v4-flash
+      api_key: ${OPENAI_API_KEY}
+      base_url: ${OPENAI_BASE_URL}
       # deepseek 端点不稳会拖死 strict 启动校验（2026-08-04 实证），统一切 k3
     can_be_called: true
 
@@ -556,10 +556,10 @@ fixed_roles:
     skills: ["技术文档", "API文档", "代码注释", "示例编写"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &doc_model
-      provider: anthropic
-      model: k3
-      api_key: ${ANTHROPIC_API_KEY_TWO}
-      base_url: ${ANTHROPIC_BASE_URL_TWO}
+      provider: openai-responses
+      model: deepseek-v4-flash
+      api_key: ${OPENAI_API_KEY}
+      base_url: ${OPENAI_BASE_URL}
       temperature: 0.5
       max_tokens: 16384  # 文档助手：README/CHANGELOG 中等长度
     can_be_called: true
@@ -606,9 +606,9 @@ dynamic_templates:
     skills: []
     max_lifetime: 3600  # 1小时
     model_config: &assistant_model
-      provider: anthropic
-      model: k3
-      api_key: ${ANTHROPIC_API_KEY_TWO}
-      base_url: ${ANTHROPIC_BASE_URL_TWO}
+      provider: openai-responses
+      model: deepseek-v4-flash
+      api_key: ${OPENAI_API_KEY}
+      base_url: ${OPENAI_BASE_URL}
       temperature: 0.4
       max_tokens: 16384  # 临时助手：基线 16K
