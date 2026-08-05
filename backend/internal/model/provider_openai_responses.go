@@ -22,6 +22,18 @@ package model
 //     不回传 reasoning 项（跨轮状态管理超出本层职责；推理模型 + 多轮 function calling
 //     在严格端点上可能要求回传，遇此场景请改用 openai-chat 或官方 SDK）；
 //   - 流式事件宽松解析：只识别关心的事件类型，未知事件跳过，兼容第三方实现的扩展事件。
+//
+// DeepSeek Responses API 兼容性（https://api-docs.deepseek.com/zh-cn/guides/responses_api）：
+//   - base_url https://api.deepseek.com，endpoint {base}/responses，与 OpenAI 同形；
+//   - 已兼容：model/input/instructions/stream/temperature/max_output_tokens/tools/tool_choice；
+//   - DeepSeek 不支持且本 provider 也不发送：previous_response_id/store/metadata/include/
+//     truncation/service_tier/stream_options/prompt_cache_key/context_management/background；
+//   - DeepSeek 不发 data: [DONE]，流以 response.completed/incomplete/failed 结束；
+//     本 provider 的 [DONE] break 对 DeepSeek 无害（永不触发），靠 scanner EOF 收尾；
+//   - DeepSeek reasoning 输入项仅支持明文 content（summary/encrypted_content 不支持），
+//     本 provider 不回传 reasoning 项，与 DeepSeek 兼容；
+//   - 流式 function_call 兜底：DeepSeek 在 response.completed 事件的 response.output[]
+//     携带完整 function_call 项；若 output_item.done 事件漏发，从 completed.output[] 提取兜底。
 
 import (
 	"bufio"
@@ -172,6 +184,18 @@ func (p *openAIResponsesProvider) NewStreaming(ctx context.Context, req *blades.
 			case "response.completed", "response.incomplete":
 				if ev.Response != nil {
 					usage = ev.Response.Usage
+					// 兜底：若 output_item.done 事件漏发，从 completed 事件的 output[] 提取 function_call。
+					if len(toolCalls) == 0 {
+						for _, item := range ev.Response.Output {
+							if item.Type == "function_call" {
+								toolCalls = append(toolCalls, responsesFunctionCall{
+									CallID:    item.CallID,
+									Name:      item.Name,
+									Arguments: item.Arguments,
+								})
+							}
+						}
+					}
 					finishReason = responsesFinishReason(ev.Response, len(toolCalls) > 0)
 				}
 			case "response.failed":

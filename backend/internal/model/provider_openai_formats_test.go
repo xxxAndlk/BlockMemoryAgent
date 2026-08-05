@@ -431,6 +431,45 @@ func TestResponsesProvider_Streaming(t *testing.T) {
 	}
 }
 
+// TestResponsesProvider_StreamingFallback 验证 function_call 兜底：
+// 端点漏发 output_item.done 时，从 response.completed.output[] 提取 function_call。
+func TestResponsesProvider_StreamingFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+		// 故意不发 response.output_item.done；function_call 仅出现在 completed.output[]。
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_fb\",\"name\":\"tool\",\"arguments\":\"{\\\"a\\\":1}\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}\n\n")
+	}))
+	defer srv.Close()
+	p := newOpenAIResponsesProvider(types.AgentModelConfig{Model: "m", APIKey: "k", BaseURL: srv.URL})
+	stream := p.NewStreaming(context.Background(), &blades.ModelRequest{Messages: []*blades.Message{blades.UserMessage("hi")}})
+	var final *blades.ModelResponse
+	for resp, err := range stream {
+		if err != nil {
+			t.Fatalf("stream err: %v", err)
+		}
+		final = resp
+	}
+	if final == nil || final.Message.Text() != "hi" {
+		t.Fatalf("final = %v", final)
+	}
+	if final.Message.FinishReason != "tool_calls" {
+		t.Errorf("finish = %q", final.Message.FinishReason)
+	}
+	var tp *blades.ToolPart
+	for _, part := range final.Message.Parts {
+		if p2, ok := part.(blades.ToolPart); ok {
+			tp = &p2
+		}
+	}
+	if tp == nil || tp.ID != "call_fb" || tp.Name != "tool" || tp.Request != `{"a":1}` {
+		t.Errorf("fallback tool call = %+v", tp)
+	}
+	if final.Message.TokenUsage.TotalTokens != 5 {
+		t.Errorf("usage = %+v", final.Message.TokenUsage)
+	}
+}
+
 // TestResponsesProvider_FailedStatus 验证 status=failed 返回错误。
 func TestResponsesProvider_FailedStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

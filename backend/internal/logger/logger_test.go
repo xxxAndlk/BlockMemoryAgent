@@ -80,7 +80,7 @@ func TestLoggerWithoutSessionDoesNotPersist(t *testing.T) {
 	}
 }
 
-// TestLoggerLLMCall 验证 LLMCall 能正确记录 token 数、模型与耗时。
+// TestLoggerLLMCall 验证 LLMCall 拆为 llm_input/llm_output 两事件后字段正确分配。
 func TestLoggerLLMCall(t *testing.T) {
 	fs := &fakeLogStore{}
 	l := New(fs).WithSession("s2")
@@ -95,14 +95,41 @@ func TestLoggerLLMCall(t *testing.T) {
 		LatencyMs:    800,
 	})
 
-	recs := waitForRecords(fs, 1)
-	if len(recs) != 1 {
-		t.Fatalf("应写入 1 条 LLM 日志，got %d", len(recs))
+	recs := waitForRecords(fs, 2)
+	if len(recs) != 2 {
+		t.Fatalf("应写入 2 条 LLM 日志（input+output），got %d", len(recs))
 	}
-	if recs[0].InputTokens != 100 || recs[0].OutputTokens != 50 {
-		t.Fatalf("token 数不匹配，got in=%d out=%d", recs[0].InputTokens, recs[0].OutputTokens)
+	var in, out *store.SessionLogRecord
+	for _, r := range recs {
+		switch r.Phase {
+		case "llm_input":
+			in = r
+		case "llm_output":
+			out = r
+		}
 	}
-	if recs[0].LatencyMs != 800 {
-		t.Fatalf("latency 应为 800，got %d", recs[0].LatencyMs)
+	if in == nil || out == nil {
+		t.Fatalf("缺少 llm_input/llm_output 事件，phases=%v", phasesOf(recs))
 	}
+	if in.Prompt != "prompt" || in.Response != "" {
+		t.Fatalf("llm_input 应只含 prompt，got prompt=%q response=%q", in.Prompt, in.Response)
+	}
+	if in.InputTokens != 100 || in.OutputTokens != 0 {
+		t.Fatalf("llm_input token 错误，got in=%d out=%d", in.InputTokens, in.OutputTokens)
+	}
+	if out.Response != "response" || out.Prompt != "" {
+		t.Fatalf("llm_output 应只含 response，got prompt=%q response=%q", out.Prompt, out.Response)
+	}
+	if out.OutputTokens != 50 || out.LatencyMs != 800 {
+		t.Fatalf("llm_output token/latency 错误，got out=%d latency=%d", out.OutputTokens, out.LatencyMs)
+	}
+}
+
+// phasesOf 收集记录的 phase 列表，用于断言失败时定位。
+func phasesOf(recs []*store.SessionLogRecord) []string {
+	out := make([]string, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, r.Phase)
+	}
+	return out
 }

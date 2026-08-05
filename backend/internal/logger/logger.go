@@ -287,25 +287,34 @@ func (l *Logger) Error(ctx context.Context, msg string, err error, extra ...slog
 	l.log(ctx, zerolog.ErrorLevel, fullMsg, &SessionLogRecord{Message: msg}, extra...)
 }
 
-// LLMCall 记录一次 LLM 调用（phase=llm_call）。
-// 控制台与 session_logs 均保留完整 prompt/response，不截断，便于排查 LLM I/O 问题。
+// LLMCall 记录一次 LLM 调用，拆为 llm_input 与 llm_output 两个事件。
+// 拆分动机：单事件 message=prompt+"->"+response 时，prompt JSON 占满视区，
+// response 被埋在 "->" 之后难辨认；拆后输入输出各自带时间戳/级别/phase，输出天然显形。
+// 控制台与 session_logs 均保留完整 prompt/response，不截断。
 func (l *Logger) LLMCall(ctx context.Context, rec LLMCallRecord, extra ...slog.Attr) {
-	summary := rec.Prompt + " -> " + rec.Response
+	l.llmEvent(ctx, "llm_input", rec.Agent, rec.Model, rec.Prompt, "", rec.InputTokens, 0, 0, extra)
+	l.llmEvent(ctx, "llm_output", rec.Agent, rec.Model, "", rec.Response, 0, rec.OutputTokens, rec.LatencyMs, extra)
+}
 
+// llmEvent 发送一个 LLM I/O 事件到控制台与 session_logs。
+// prompt/response 二者其一为空：llm_input 行只填 prompt，llm_output 行只填 response。
+// 这样 DB 查询时按 phase 过滤即可分别取输入/输出，互不冗余。
+func (l *Logger) llmEvent(ctx context.Context, phase, agent, model, prompt, response string, inputTokens, outputTokens, latencyMs int, extra []slog.Attr) {
+	msg := prompt + response
 	event := l.zl.Info()
 	if event == nil {
 		return
 	}
-	event = event.Str("agent", rec.Agent).
-		Str("phase", "llm_call").
-		Str("model", rec.Model).
-		Int("input_tokens", rec.InputTokens).
-		Int("output_tokens", rec.OutputTokens).
-		Int("latency_ms", rec.LatencyMs)
+	event = event.Str("agent", agent).
+		Str("phase", phase).
+		Str("model", model).
+		Int("input_tokens", inputTokens).
+		Int("output_tokens", outputTokens).
+		Int("latency_ms", latencyMs)
 	for _, attr := range extra {
 		event = attrToEvent(event, attr)
 	}
-	event.Msg(summary)
+	event.Msg(msg)
 
 	if l.batch == nil {
 		return
@@ -317,15 +326,15 @@ func (l *Logger) LLMCall(ctx context.Context, rec LLMCallRecord, extra ...slog.A
 	now := time.Now()
 	l.enqueue(ctx, &SessionLogRecord{
 		SessionID:    sessionID,
-		Agent:        firstNonEmpty(l.fields["agent"], rec.Agent),
-		Phase:        "llm_call",
-		Message:      summary,
-		Prompt:       rec.Prompt,
-		Response:     rec.Response,
-		Model:        rec.Model,
-		InputTokens:  rec.InputTokens,
-		OutputTokens: rec.OutputTokens,
-		LatencyMs:    rec.LatencyMs,
+		Agent:        firstNonEmpty(l.fields["agent"], agent),
+		Phase:        phase,
+		Message:      msg,
+		Prompt:       prompt,
+		Response:     response,
+		Model:        model,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		LatencyMs:    latencyMs,
 		CreatedAt:    now,
 		Timestamp:    now.UnixMilli(),
 	})
