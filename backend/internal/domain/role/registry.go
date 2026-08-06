@@ -199,7 +199,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 			Type:         enums.RoleTypeMeta,
 			SystemPrompt: r.cfg.MetaAgent.SystemPrompt,
 			ModelConfig:  r.cfg.MetaAgent.ModelConfig,
-			Tools:        []string{"call_sub_agent", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles", "verify_and_fix"},
+			Tools:        []string{"call_sub_agent", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles", "verify_and_fix", "RefreshProjectDoc"},
 			CanBeCalled:  false,
 		}
 	case "domain":
@@ -223,7 +223,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 				"call_sub_agent",
 				"ReadFile", "ListDir", "SearchInFiles", "HTTPGet",
 				"WriteSharedMemory", "WriteSpec", "WriteFile", "RunCommand",
-				"verify_and_fix",
+				"verify_and_fix", "RefreshProjectDoc",
 			},
 			CanBeCalled: true,
 		}

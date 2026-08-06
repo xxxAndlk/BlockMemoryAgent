@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -200,13 +199,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err != nil {
 		workDir = "."
 	}
-	// 确保 workspace/ 存在：Agent 的用户产物落点（guards 仅允许写 workspace/ 子树）。
-	// 缺失会导致 ListDir workspace 失败、子 Agent 误写到 web/ 等受保护目录。
-	// 幂等：已存在时 MkdirAll 不报错。
-	if mkErr := os.MkdirAll(filepath.Join(workDir, "workspace"), 0o755); mkErr != nil {
-		return nil, fmt.Errorf("create workspace dir: %w", mkErr)
-	}
-	roleRegistry := role.NewRegistry(roleCfg)                         // 角色注册表
+	// workDir 本身即沙箱：Agent 直接在用户项目目录内读写，不再创建 workspace/ 子区。
+	// guards 仅挡 VCS/IDE/构建产物目录；sandbox.go 拦截路径逃逸 workDir。
+	roleRegistry := role.NewRegistry(roleCfg)
 	toolRegistry := tool.NewBuiltinRegistry(workDir, &cfg.Agent, nil) // 内置工具注册表
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
 	// Executor 永远跑 DefaultSandboxConfig（默认禁写工作目录外、保留命令黑名单）。
@@ -224,15 +219,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		RetryBackoffMs:            cfg.Agent.RetryBackoffMs,
 		HistoryMaxMessages:        cfg.Agent.HistoryMaxMessages,
 		ToolOutputHistoryMaxRunes: cfg.Agent.ToolOutputHistoryMaxRunes,
-		TokenBudgetPerGoal:       cfg.Agent.TokenBudgetPerGoal,
-		TokenBudgetPerRole:       cfg.Agent.TokenBudgetPerRole,
+		TokenBudgetPerGoal:        cfg.Agent.TokenBudgetPerGoal,
+		TokenBudgetPerRole:        cfg.Agent.TokenBudgetPerRole,
 	}
 	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute
 	if subAgentTimeout < 0 {
 		subAgentTimeout = 0 // 负数表示不限制
 	}
 	subAgentDispatcher := subagent.NewDispatcher(roleRegistry, &reactModelFactory{modelFactory}, toolRegistry, sharedMailbox, memoryPipeline)
-	subAgentDispatcher.WithTimeout(subAgentTimeout).WithLoopConfigByRole(reactCfg.LoopConfigByRole).WithBlockMemorySearcher(pgStore)
+	// 心跳检活：叶子 Agent 超过该时长无 generateOnce/工具派发判定假死，巡检主动 cancel+notify 父，
+	// 比等满 sub_agent_timeout（60min）早暴露第二次 session 卡死（LLM 流式挂起等）。<=0 关闭。
+	subAgentHeartbeat := time.Duration(cfg.Agent.SubAgentHeartbeatTimeoutMin) * time.Minute
+	subAgentDispatcher.WithTimeout(subAgentTimeout).WithHeartbeatTimeout(subAgentHeartbeat).WithLoopConfigByRole(reactCfg.LoopConfigByRole).WithBlockMemorySearcher(pgStore)
 	// 块记忆写入闭环：默认开启（applyFeatureTogglesDefaults 兜底为 true）；
 	// 显式 block_memory_write_enabled: false 时 Dispatcher 内部跳过沉淀。
 	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)
@@ -330,6 +328,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
+	// 串联权威 workDir：bootstrap 持有的 os.Getwd() 结果注入 session store，
+	// 消除 newReactSessionStore 内不再自取 cwd 的双源漂移。
+	agentSvc.SetWorkDir(workDir)
 	agentSvc.SetLogger(sessionLogger)
 	agentSvc.SetRuntimeConfig(reactCfg)
 	// 注入 Agent 树持久化层：Register/Finish/Cancel 后 best-effort 写入 PG,

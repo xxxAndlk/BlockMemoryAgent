@@ -41,12 +41,13 @@ type LLMRuntimeConfig struct {
 	RetryCount        int `yaml:"retry_count"`          // Assistant 任务执行指数退避重试次数
 	RetryBackoffMs    int `yaml:"retry_backoff_ms"`     // 重试初始退避时长（毫秒）
 
-	ReactLLMTimeoutSec        int `yaml:"react_llm_timeout_sec"`         // ReAct 单次 LLM 调用超时（秒，默认 300；负数表示仅受会话取消控制）
-	SubAgentTimeoutMin        int `yaml:"sub_agent_timeout_min"`         // 子 Agent 独立执行超时（分钟，默认 30；负数表示不限制）
-	HistoryMaxMessages        int `yaml:"history_max_messages"`          // 单次 LLM 请求携带的最大历史消息数（默认 40，滑动窗口防 token 爆炸；负数表示不裁剪）
-	ToolOutputHistoryMaxRunes int `yaml:"tool_output_history_max_runes"` // 写入历史的单条工具输出最大字符数（默认 2000；负数表示不截断）
-	SummarizeEvery            int `yaml:"summarize_every"`              // 每 N 步触发一次历史压缩（默认 10；<=0 关闭压缩，仅用滑动窗口）
-	SummarizeKeepRecent       int `yaml:"summarize_keep_recent"`        // 压缩时保留最近 K 条原始消息（默认 10；<=0 视为 10）
+	ReactLLMTimeoutSec          int `yaml:"react_llm_timeout_sec"`           // ReAct 单次 LLM 调用超时（秒，默认 300；负数表示仅受会话取消控制）
+	SubAgentTimeoutMin          int `yaml:"sub_agent_timeout_min"`           // 子 Agent 独立执行超时（分钟，默认 30；负数表示不限制）
+	SubAgentHeartbeatTimeoutMin int `yaml:"sub_agent_heartbeat_timeout_min"` // 子 Agent 心跳超时（分钟，默认 5；<=0 关闭巡检，仅靠 sub_agent_timeout 兜底）
+	HistoryMaxMessages          int `yaml:"history_max_messages"`            // 单次 LLM 请求携带的最大历史消息数（默认 40，滑动窗口防 token 爆炸；负数表示不裁剪）
+	ToolOutputHistoryMaxRunes   int `yaml:"tool_output_history_max_runes"`   // 写入历史的单条工具输出最大字符数（默认 2000；负数表示不截断）
+	SummarizeEvery              int `yaml:"summarize_every"`                 // 每 N 步触发一次历史压缩（默认 10；<=0 关闭压缩，仅用滑动窗口）
+	SummarizeKeepRecent         int `yaml:"summarize_keep_recent"`           // 压缩时保留最近 K 条原始消息（默认 10；<=0 视为 10）
 	// TokenBudgetPerGoal 单次 RunWithHistory 累计 token 上限（input+output 之和，跨轮累加）。
 	// 超限后主循环 break 返回部分完成（LimitReached），与 maxIter 轮数上限正交。
 	// 默认 0 表示不限制；config.yaml 设 token_budget_per_goal: 100000 启用。
@@ -67,11 +68,11 @@ type SafetyConfig struct {
 
 // FeatureTogglesConfig Agent 特性开关配置。
 type FeatureTogglesConfig struct {
-	DAGEnabled               bool  `yaml:"dag_enabled"`                  // 是否启动 DAG 调度器
-	RestoreSessions          *bool `yaml:"restore_sessions"`             // 启动时是否从 session_history 恢复最近会话到内存（默认 true；显式 false 关闭）
-	AssistantSelfTestEnabled bool  `yaml:"assistant_self_test_enabled"`  // 助手完成子任务后是否派遣测试助手验证
-	DomainSelfTestEnabled    bool  `yaml:"domain_self_test_enabled"`     // 领域 Agent 完成后是否派遣测试助手验证完整模块
-	BlockMemoryWriteEnabled  *bool `yaml:"block_memory_write_enabled"`   // 子 Agent 成功完成后是否将结果摘要沉淀到块记忆知识库（默认 true；显式 false 关闭）
+	DAGEnabled               bool  `yaml:"dag_enabled"`                 // 是否启动 DAG 调度器
+	RestoreSessions          *bool `yaml:"restore_sessions"`            // 启动时是否从 session_history 恢复最近会话到内存（默认 true；显式 false 关闭）
+	AssistantSelfTestEnabled bool  `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证
+	DomainSelfTestEnabled    bool  `yaml:"domain_self_test_enabled"`    // 领域 Agent 完成后是否派遣测试助手验证完整模块
+	BlockMemoryWriteEnabled  *bool `yaml:"block_memory_write_enabled"`  // 子 Agent 成功完成后是否将结果摘要沉淀到块记忆知识库（默认 true；显式 false 关闭）
 	// VerificationMaxRounds 多 Agent 协作验证闭环的最大往返轮数上限：
 	// 代码 Agent <-> 测试 Agent 互相询问/纠正的次数超过该值时，Dispatcher 拒绝
 	// 进一步的同线程派发，防止循环调用死锁。默认 5；<=0 时回退默认。
@@ -108,12 +109,12 @@ type AgentConfig struct {
 	FeatureTogglesConfig `yaml:",inline"`
 
 	// 其余不适合归入上述子配置的独立字段。
-	ContextWindow              int `yaml:"context_window"`                  // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
-	ReadFileMaxChars           int `yaml:"read_file_max_chars"`             // ReadFile / SearchInFiles 输出截断字符数
-	RunCommandMaxOutput        int `yaml:"run_command_max_output"`          // RunCommand 输出截断字符数
-	RunCommandTimeoutSec       int `yaml:"run_command_timeout_sec"`         // RunCommand 最大允许超时（秒）
-	ToolExecMaxBytes           int `yaml:"tool_exec_max_bytes"`             // Execute 入参 JSON 摘要截断字节数
-	SearchBlockMemoryMaxTokens int `yaml:"search_block_memory_max_tokens"`  // 块记忆检索摘要 token 上限
+	ContextWindow              int `yaml:"context_window"`                 // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
+	ReadFileMaxChars           int `yaml:"read_file_max_chars"`            // ReadFile / SearchInFiles 输出截断字符数
+	RunCommandMaxOutput        int `yaml:"run_command_max_output"`         // RunCommand 输出截断字符数
+	RunCommandTimeoutSec       int `yaml:"run_command_timeout_sec"`        // RunCommand 最大允许超时（秒）
+	ToolExecMaxBytes           int `yaml:"tool_exec_max_bytes"`            // Execute 入参 JSON 摘要截断字节数
+	SearchBlockMemoryMaxTokens int `yaml:"search_block_memory_max_tokens"` // 块记忆检索摘要 token 上限
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -372,6 +373,9 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.SubAgentTimeoutMin == 0 {
 		c.Agent.SubAgentTimeoutMin = 30
+	}
+	if c.Agent.SubAgentHeartbeatTimeoutMin == 0 {
+		c.Agent.SubAgentHeartbeatTimeoutMin = 5
 	}
 	if c.Agent.HistoryMaxMessages == 0 {
 		c.Agent.HistoryMaxMessages = 40

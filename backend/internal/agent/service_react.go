@@ -234,6 +234,15 @@ func (s *ReactService) workDir() string {
 	return ""
 }
 
+// SetWorkDir 注入权威工作目录，覆盖 session store 默认空值。
+// bootstrap 从 os.Getwd() 取得后串入，消除 newReactSessionStore 不再自取 cwd 的双源漂移。
+// 空值忽略，保留 store 现值（测试场景可能已直设）。
+func (s *ReactService) SetWorkDir(wd string) {
+	if wd != "" {
+		s.store.workDir = wd
+	}
+}
+
 // SetLogger 注入结构化日志器，使会话存储的错误类日志以 [ERRO] 级别输出。
 // 参数 l：已初始化的 Logger 指针；未注入时回退标准库 log。
 func (s *ReactService) SetLogger(l *logger.Logger) {

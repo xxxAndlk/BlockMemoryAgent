@@ -14,6 +14,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
+	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
 )
@@ -61,6 +62,11 @@ type ReActAgent struct {
 	// 无限 budget 不会自行暂停，需靠此检查跳出 wait loop 返回 PausedOnChild，由上层 pauseSession
 	// 置会话暂停态。为 nil 时不检查（默认关闭，仅 MetaAgent 注入）。
 	pausedChecker PausedChildChecker
+	// activityReporter 可选的活动上报回调，由 Dispatcher 心跳巡检注入。
+	// 每次 generateOnce 与工具派发时触发，更新 Dispatcher 侧最后活动时间戳；
+	// 巡检发现超阈值无活动则判定子 Agent 假死（LLM 流式挂起等），主动 cancel。
+	// 为 nil 时跳过（测试场景或 DomainAgent/MetaAgent 不注入），不影响主流程。
+	activityReporter func()
 }
 
 // PersonaInjector 把人格内容拼接到系统提示词之前；soul.Loader 实现该接口。
@@ -186,6 +192,21 @@ func (a *ReActAgent) WithPersonaInjector(p PersonaInjector) *ReActAgent {
 func (a *ReActAgent) WithPausedChildChecker(p PausedChildChecker) *ReActAgent {
 	a.pausedChecker = p
 	return a
+}
+
+// WithActivityReporter 注入活动上报回调，供 Dispatcher 心跳巡检判断子 Agent 是否假死。
+// 每次 generateOnce 与工具派发触发；传 nil 关闭（默认关闭）。
+// 仅叶子 Agent 注入：DomainAgent/MetaAgent 有自身 wait loop，注入会误杀合法等待。
+func (a *ReActAgent) WithActivityReporter(fn func()) *ReActAgent {
+	a.activityReporter = fn
+	return a
+}
+
+// touchActivity 上报一次活动；未注入回调时为空操作。
+func (a *ReActAgent) touchActivity() {
+	if a.activityReporter != nil {
+		a.activityReporter()
+	}
 }
 
 // emitLive 发送一条实时进度事件；未注册回调时直接丢弃，Agent 标识在此统一填充。
@@ -422,6 +443,8 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// 实时推送工具调用开始事件，UI 可据此展示"执行中"状态。
 			a.emitLive(LiveEvent{Kind: LiveEventToolCall, Tool: tc.Name, Input: mustMarshal(tc.Input)})
 
+			// 工具派发前上报活动：工具 hang 时无后续活动，心跳巡检可捕获。
+			a.touchActivity()
 			// 分发执行单个工具调用；出错时构造包含错误信息的 ToolResult。
 			result, err := a.tools.Dispatch(ctx, tc)
 			if err != nil {
@@ -540,6 +563,7 @@ type streamingModelProvider interface {
 // generateOnce 执行单次 LLM 调用：provider 支持流式时走流式并推送 llm_delta 实时事件，
 // 否则回退到一次性 Generate。
 func (a *ReActAgent) generateOnce(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	a.touchActivity()
 	start := time.Now()
 	role := a.role.Name
 	log.Printf("[react] llm start: role=%s model=%s msgs=%d", role, a.llmModelName(), len(req.Messages))
@@ -957,11 +981,18 @@ func buildEnvBlock(workDir string) string {
 		wd = "(进程当前目录)"
 	}
 
-	return "【运行环境】\n" +
+	env := "【运行环境】\n" +
 		fmt.Sprintf("- 操作系统: %s\n", osLabel) +
 		fmt.Sprintf("- 时区: %s\n", tzName) +
 		fmt.Sprintf("- 当前时间: %s\n", timeStr) +
 		fmt.Sprintf("- 工作目录: %s", wd)
+
+	// 项目概览：注入 .bma/PROJECT.md 的 managed 区正文（首个 session 启动时启发式生成）。
+	// 缺失或无标记返回空串，略去本段。让 Agent 了解工作目录的模块/领域拆分/命令/文档地图。
+	if projDoc := project.LoadProjectDoc(workDir); projDoc != "" {
+		env += "\n\n【项目概览】\n" + projDoc
+	}
+	return env
 }
 
 // mailboxMessageToReact 把异步 mailbox 消息转换为模型可见的 ReactMessage。

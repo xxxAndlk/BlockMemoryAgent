@@ -21,6 +21,7 @@ import (
 	// 内部包：模型工厂、事件类型、持久化存储、枚举、文本工具
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
+	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	"github.com/blockmemory/agent/backend/internal/store"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -104,15 +105,13 @@ type reactSessionStore struct {
 }
 
 // newReactSessionStore 创建一个新的 reactSessionStore 实例。
-// 它会获取当前工作目录并初始化空的会话映射和指标收集器。
+// workDir 不在此自取：由 bootstrap 经 ReactService.SetWorkDir 注入权威值，
+// 消除与 bootstrap.go 各自 os.Getwd 的双源漂移；未注入时为空，createSession 退回相对路径。
 func newReactSessionStore() *reactSessionStore {
-	// workDir 获取进程当前工作目录；若失败则空字符串，后续用相对路径。
-	workDir, _ := os.Getwd()
 	// 生成 4 字节随机 hex 作为实例唯一后缀，防止 Windows 低精度时钟导致 bootEpoch 相同。
 	bootRand := genBootRand()
 	return &reactSessionStore{
 		sessions:  make(map[string]*reactInternalSession),
-		workDir:    workDir,
 		metrics:    newMetricsCollector(),
 		bootEpoch:  time.Now().UnixNano(),
 		bootRand:   bootRand,
@@ -207,6 +206,12 @@ func (st *reactSessionStore) createSession(goal string) *reactInternalSession {
 	st.mu.Lock()
 	st.sessions[sessionID] = session
 	st.mu.Unlock()
+
+	// 首个 session 启动时确保 workDir 下存在 .bma/PROJECT.md（缺失则启发式生成）。
+	// 失败仅记录日志，不阻断会话：PROJECT.md 是辅助上下文，缺失时系统提示词略去项目概览段。
+	if err := project.EnsureProjectDoc(st.workDir); err != nil {
+		st.logError(context.Background(), "ensure project doc", err)
+	}
 
 	// 返回刚创建的会话指针，调用方可立即使用。
 	return session

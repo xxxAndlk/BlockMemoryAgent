@@ -182,6 +182,8 @@ func (r *Registry) registerDefaults() {
 	r.Register(&gitStatusTool{exec: r.exec})
 	r.Register(&gitLogTool{exec: r.exec})
 	r.Register(&gitBlameTool{exec: r.exec})
+	// RefreshProjectDoc：重写 .bma/PROJECT.md managed 区。仅 MetaAgent/DomainAgent 白名单含。
+	r.Register(&refreshProjectDocTool{exec: r.exec})
 }
 
 // Register 将工具及其别名注册到注册表中；若传入 nil 则忽略。
@@ -782,6 +784,15 @@ func (r *Registry) Schema() []tools.Tool {
 	// 注册 GitBlame 工具：查看指定文件每行最后修改者。
 	if t, err := tools.NewFunc("GitBlame", "查看指定文件每行的最后修改者（git blame）。", func(ctx context.Context, in gitBlameInput) (string, error) {
 		res, _ := r.Dispatch(ctx, "GitBlame", map[string]any{"path": in.Path})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 RefreshProjectDoc 工具：重写 .bma/PROJECT.md 的 managed 区。
+	// 仅 MetaAgent/DomainAgent 白名单含。大改动后显式调用同步项目概览，标记区外的人手补充保留。
+	if t, err := tools.NewFunc("RefreshProjectDoc", "重写 .bma/PROJECT.md 的 managed 区（启发式扫描当前工作目录：模块/语言/命令/推荐领域拆分/文档地图）。大改动后调用以同步项目概览。标记区外的人手补充保留。无参数。仅 MetaAgent/DomainAgent。", func(ctx context.Context, in refreshProjectDocInput) (string, error) {
+		res, _ := r.Dispatch(ctx, "RefreshProjectDoc", map[string]any{})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
 	}); err == nil {

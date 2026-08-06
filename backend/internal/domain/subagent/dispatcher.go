@@ -14,16 +14,16 @@ import (
 	"time"          // time 用于设置子 Agent 独立超时
 	"unicode/utf8"  // unicode/utf8 用于 RuneCountInString 统计 task 字符数
 
-	"github.com/blockmemory/agent/backend/internal/agent"       // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
+	"github.com/blockmemory/agent/backend/internal/agent"               // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // orchestrator 提供 Agent 树元数据层
-	"github.com/blockmemory/agent/backend/internal/domain/role" // role 包提供角色注册表
-	"github.com/blockmemory/agent/backend/internal/domain/tool" // tool 包提供工具注册表与 Result 类型
-	"github.com/blockmemory/agent/backend/internal/domain/verifyloop" // verifyloop 提供 Orchestrator/Verifier/Fixer/Reporter 状态机,供 verify_and_fix 工具复用
-	"github.com/blockmemory/agent/backend/internal/logger"      // logger 包提供会话级日志器，记录子 Agent LLM I/O
-	"github.com/blockmemory/agent/backend/internal/mailbox"     // mailbox 包用于子 Agent 向父 Agent 发送完成通知
-	"github.com/blockmemory/agent/backend/pkg/enums"            // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
-	"github.com/blockmemory/agent/backend/pkg/textutil"         // textutil 提供截断展示名用工具
-	"github.com/blockmemory/agent/backend/pkg/types"            // types 包提供 RoleDefinition 类型
+	"github.com/blockmemory/agent/backend/internal/domain/role"         // role 包提供角色注册表
+	"github.com/blockmemory/agent/backend/internal/domain/tool"         // tool 包提供工具注册表与 Result 类型
+	"github.com/blockmemory/agent/backend/internal/domain/verifyloop"   // verifyloop 提供 Orchestrator/Verifier/Fixer/Reporter 状态机,供 verify_and_fix 工具复用
+	"github.com/blockmemory/agent/backend/internal/logger"              // logger 包提供会话级日志器，记录子 Agent LLM I/O
+	"github.com/blockmemory/agent/backend/internal/mailbox"             // mailbox 包用于子 Agent 向父 Agent 发送完成通知
+	"github.com/blockmemory/agent/backend/pkg/enums"                    // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
+	"github.com/blockmemory/agent/backend/pkg/textutil"                 // textutil 提供截断展示名用工具
+	"github.com/blockmemory/agent/backend/pkg/types"                    // types 包提供 RoleDefinition 类型
 )
 
 // 子 Agent 的上下文与父会话故意隔离（context.Background 派生）：
@@ -153,6 +153,20 @@ type Dispatcher struct {
 	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
 	// 提取失败（LLM 出错或返回空）自动回退原始保存，保证不丢结果。
 	factExtractor FactExtractor
+
+	// heartbeatTimeout 子 Agent 心跳超时：叶子 Agent 超过该时长无活动（generateOnce/工具派发）
+	// 判定假死（LLM 流式挂起/工具 hang），巡检 goroutine 主动 cancel + notify 父 + trackChildDone，
+	// 比等满 sub_agent_timeout（默认 60min）早暴露。<=0 关闭巡检（测试场景默认关闭）。
+	heartbeatTimeout time.Duration
+	// activity 存叶子子 Agent 最后活动时间戳（unix nano），键 subAgentID -> *atomic.Int64。
+	// 仅叶子 Agent 注入（DomainAgent/MetaAgent 有 wait loop 不注入，避免误杀合法等待）。
+	activity sync.Map
+	// subMeta 存子 Agent 的 cancel/parentID/sessionID/doneOnce，供巡检卡死时主动 cancel + 兜底递减。
+	// doneOnce 保证 patrol 与 goroutine 任一方 trackChildDone 仅触发一次，防双递减。
+	subMeta sync.Map // subAgentID -> *subAgentMeta
+	// patrolOnce 保证巡检 goroutine 只启动一次；patrolStop 关闭后巡检退出（测试用 ClosePatrol）。
+	patrolOnce sync.Once
+	patrolStop chan struct{}
 }
 
 // pendingState 跟踪单个父 Agent 的未决子 Agent 计数与完成信号。
@@ -190,6 +204,103 @@ func (d *Dispatcher) trackChildDone(parentID string) {
 	select {
 	case ps.notify <- struct{}{}:
 	default:
+	}
+}
+
+// subAgentMeta 存子 Agent 巡检所需元数据：cancel 用于主动取消卡死子 Agent ctx；
+// parentID/sessionID 用于 notify 父与 treeFinish；doneOnce 保证 trackChildDone 仅触发一次
+//（patrol 与 goroutine 竞争时防双递减，PendingChildren 不会为负）。
+type subAgentMeta struct {
+	cancel    context.CancelFunc
+	parentID  string
+	sessionID string
+	doneOnce  sync.Once
+}
+
+// WithHeartbeatTimeout 配置子 Agent 心跳超时；<=0 关闭巡检（测试场景默认关闭）。
+// bootstrap 从 config.SubAgentHeartbeatTimeoutMin 注入（默认 5min）。
+func (d *Dispatcher) WithHeartbeatTimeout(t time.Duration) *Dispatcher {
+	d.heartbeatTimeout = t
+	return d
+}
+
+// ensurePatrol 幂等启动心跳巡检 goroutine：仅 heartbeatTimeout>0 时启动，Dispatcher 生命周期内一次。
+func (d *Dispatcher) ensurePatrol() {
+	if d.heartbeatTimeout <= 0 {
+		return
+	}
+	d.patrolOnce.Do(func() {
+		d.patrolStop = make(chan struct{})
+		go d.patrol()
+	})
+}
+
+// ClosePatrol 关闭心跳巡检 goroutine，供测试清理；生产生命周期内无需调用。
+func (d *Dispatcher) ClosePatrol() {
+	if d.patrolStop != nil {
+		close(d.patrolStop)
+		d.patrolStop = nil
+	}
+}
+
+// patrol 周期扫描叶子子 Agent，超 heartbeatTimeout 无活动则判定假死并 kill。
+func (d *Dispatcher) patrol() {
+	interval := d.heartbeatTimeout / 2
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.patrolStop:
+			return
+		case <-ticker.C:
+			d.scanStuck()
+		}
+	}
+}
+
+// scanStuck 扫描 activity map，对超阈值无活动的子 Agent 执行 killStuckSubAgent。
+func (d *Dispatcher) scanStuck() {
+	if d.heartbeatTimeout <= 0 {
+		return
+	}
+	threshold := time.Now().Add(-d.heartbeatTimeout).UnixNano()
+	d.activity.Range(func(k, v any) bool {
+		act := v.(*atomic.Int64)
+		if act.Load() > threshold {
+			return true // 仍活跃
+		}
+		d.killStuckSubAgent(k.(string))
+		return true
+	})
+}
+
+// killStuckSubAgent 主动取消假死子 Agent：cancel ctx + 兜底 trackChildDone + notify 父 +
+// 树节点置 Failed + 清理 activity/subMeta/running。runSubAgent goroutine 若因 cancel 返回，
+// 其 doneOnce.Do 为 no-op；若不尊重 ctx（流式挂起），此处 doneOnce 兜底递减防父永久空等。
+func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
+	v, ok := d.subMeta.LoadAndDelete(subAgentID)
+	if !ok {
+		return
+	}
+	meta := v.(*subAgentMeta)
+	log.Printf("[subagent] HEARTBEAT KILL: sub=%s parent=%s idle>%s - cancel+notify",
+		subAgentID, meta.parentID, d.heartbeatTimeout)
+	meta.cancel()
+	meta.doneOnce.Do(func() { d.trackChildDone(meta.parentID) })
+	d.notify(meta.parentID, subAgentID,
+		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, d.heartbeatTimeout))
+	if d.treeFn != nil && meta.sessionID != "" {
+		if t := d.treeFn(meta.sessionID); t != nil {
+			t.Finish(subAgentID, "心跳超时疑似卡死", errors.New("heartbeat timeout"))
+		}
+	}
+	d.activity.Delete(subAgentID)
+	d.running.Delete(subAgentID)
+	if d.mailbox != nil {
+		d.mailbox.Purge(subAgentID)
 	}
 }
 
@@ -767,13 +878,27 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 			}
 		}
 	}
+	// 心跳检活元数据：subMeta 存 cancel/parentID/sessionID/doneOnce 供巡检卡死时兜底；
+	// activity 仅叶子 Agent 存（DomainAgent/MetaAgent 有 wait loop 不存，避免误杀合法等待）。
+	isLeaf := roleDef.ID != "domain" && roleDef.ID != "meta"
+	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(ctx)}
+	d.subMeta.Store(subAgentID, meta)
+	if isLeaf {
+		act := new(atomic.Int64)
+		act.Store(time.Now().UnixNano())
+		d.activity.Store(subAgentID, act)
+	}
+	d.ensurePatrol()
 	go func() {
 		defer cancel()
+		defer d.subMeta.Delete(subAgentID)
+		defer d.activity.Delete(subAgentID)
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
+		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
 		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, started)
 		if !paused {
-			d.trackChildDone(parentID)
+			meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
 		}
 	}()
 
@@ -904,6 +1029,13 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// 直接 DONE，MetaAgent 把“等待 mailbox 结果”当终答，会话 completed 但产出缺失）。
 	// Dispatcher 自身实现 PendingChildrenChecker（PendingChildren/WaitForAnyChild）。
 	sub = sub.WithPendingChildrenChecker(d)
+
+	// 心跳检活：注入活动上报回调（仅叶子 Agent 有 activity 条目，DomainAgent/MetaAgent 无则跳过）。
+	// 回调闭包捕获 *atomic.Int64，generateOnce/工具派发时 Store 当前时间，巡检据此判假死。
+	if actVal, ok := d.activity.Load(subAgentID); ok {
+		act := actVal.(*atomic.Int64)
+		sub = sub.WithActivityReporter(func() { act.Store(time.Now().UnixNano()) })
+	}
 
 	// 注入会话级日志器：派生 session-scoped logger，使子 Agent LLM I/O 写入同一会话的 session_logs。
 	// sessionID 从 ctx 取（call_sub_agent 异步路径已 WithSessionID），agentName 用 roleDef.Name（DomainAgent 已按任务首行覆写）。
@@ -1362,7 +1494,6 @@ func (d *Dispatcher) WithSharedMemory(r tool.SharedMemoryStore) *Dispatcher {
 	d.sharedMem = r
 	return d
 }
-
 
 // saveBlockMemory 将子 Agent 成功完成后的结果沉淀到块记忆知识库。
 // 未配置写入器、开关关闭或结果为空时跳过；写入失败仅记日志，不影响派发主流程。

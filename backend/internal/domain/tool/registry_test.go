@@ -171,7 +171,9 @@ func TestWriteFile_ClearsReadHistory_PreservesOthers(t *testing.T) {
 	}
 }
 
-// TestWriteFileProtectedPath 验证 WriteFile 工具不能写入受保护的 backend/ 目录。
+// TestWriteFileProtectedPath 验证 WriteFile 工具不能写入受保护的 .git/ 目录。
+// 源码目录名（backend/ 等）已不再受保护：workDir 是用户项目，Agent 需直接编辑用户代码；
+// 仅 VCS/IDE/构建产物根目录被挡。此处用 .git/ 代表受保护目录。
 func TestWriteFileProtectedPath(t *testing.T) {
 	// 创建临时目录作为工作目录。
 	dir := t.TempDir()
@@ -179,9 +181,9 @@ func TestWriteFileProtectedPath(t *testing.T) {
 	r := NewBuiltinRegistry(dir, nil, nil)
 	// 构造携带 SessionID 的上下文。
 	ctx := WithSessionID(context.Background(), "s1")
-	// 尝试写入 backend/foo.go，该路径命中受保护目录规则。
+	// 尝试写入 .git/foo，该路径命中受保护目录规则（VCS 元数据）。
 	res, err := r.Dispatch(ctx, "WriteFile", map[string]any{
-		"path":    "backend/foo.go",
+		"path":    ".git/foo",
 		"content": "package foo",
 	})
 	// 校验调度未返回底层错误。
@@ -190,7 +192,7 @@ func TestWriteFileProtectedPath(t *testing.T) {
 	}
 	// 校验写入被拦截，Success 为 false。
 	if res.Success {
-		t.Fatal("expected write to backend/ to fail")
+		t.Fatal("expected write to .git/ to fail")
 	}
 	// 校验错误信息包含中文或英文的受保护路径提示。
 	if !strings.Contains(res.Error, "受保护") && !strings.Contains(res.Error, "protected") {
@@ -257,19 +259,19 @@ func (s *stubCallSubAgent) Execute(ctx context.Context, args map[string]any) *Re
 }
 
 // TestSchemaIncludesCallSubAgent 验证：call_sub_agent 注册后出现在 LLM 工具
-// schema 中，且描述文本来自工具的 Description()；未注册时 schema 有 13 个内置工具
-// （ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles/HTTPGet/HTTPPost/GitDiff/GitStatus/GitLog/GitBlame/WriteSharedMemory/WriteSpec）。
+// schema 中，且描述文本来自工具的 Description()；未注册时 schema 有 14 个内置工具
+// （ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles/HTTPGet/HTTPPost/GitDiff/GitStatus/GitLog/GitBlame/RefreshProjectDoc/WriteSharedMemory/WriteSpec）。
 func TestSchemaIncludesCallSubAgent(t *testing.T) {
-	// 未安装 call_sub_agent 时，schema 恰为 13 个内置工具（含 WriteSpec）。
+	// 未安装 call_sub_agent 时，schema 恰为 14 个内置工具（含 RefreshProjectDoc/WriteSpec）。
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	if n := len(r.Schema()); n != 13 {
-		t.Fatalf("expected 13 builtin tools without call_sub_agent, got %d", n)
+	if n := len(r.Schema()); n != 14 {
+		t.Fatalf("expected 14 builtin tools without call_sub_agent, got %d", n)
 	}
 	// 安装后应出现在 schema 中，且描述来自 Description()。
 	r.Register(&stubCallSubAgent{})
 	schema := r.Schema()
-	if len(schema) != 14 {
-		t.Fatalf("expected 13 tools with call_sub_agent, got %d", len(schema))
+	if len(schema) != 15 {
+		t.Fatalf("expected 15 tools with call_sub_agent, got %d", len(schema))
 	}
 	// 遍历查找 call_sub_agent 并校验描述文本。
 	found := false

@@ -11,9 +11,9 @@ import (
 	"strings"       // strings 提供字符串匹配、切分等工具
 )
 
-// protectedPathGuard 用于阻止写入受保护的项目目录。
-// 受保护目录包括项目源码树、配置、文档、版本控制与构建脚本等，
-// Agent 只能写 workspace/ 下的用户产物。
+// protectedPathGuard 用于阻止写入受保护的目录（版本控制/IDE 配置/构建产物）。
+// workDir 本身即沙箱：Agent 可直接读写 workDir 内用户项目文件，
+// 仅 VCS/IDE/产物根目录被挡；路径逃逸 workDir 由 sandbox.go 处理。
 type protectedPathGuard struct{}
 
 // Name 返回守卫的标识名，供外部注册与日志使用。
@@ -268,10 +268,10 @@ func rejectProtectedPath(path string) error {
 	// 按 / 切分得到路径段。
 	segments := strings.Split(lower, "/")
 
-	// protectedRoots 列出禁止写入的根级目录名。
-	// web/ 是前端构建产物（被 main.go 静态托管），写入会被下次构建覆盖；
-	// node_modules / dist / build / bin / pkg / logs 同属构建产物或运行时目录，不应被 Agent 污染。
-	protectedRoots := []string{"backend", "test", "cmd", "config", "migrations", ".git", ".github", ".claude", ".idea", ".vscode", "doc", "docs", "scripts", "docker", "web", "node_modules", "dist", "build", "bin", "pkg", "logs"}
+	// protectedRoots 列出禁止写入的根级目录名：仅版本控制、IDE 配置与构建产物。
+	// 源码目录名（backend/test/cmd/config/doc/...）不再保护——workDir 是用户项目，
+	// Agent 需直接编辑用户代码；仅挡 VCS/IDE/产物，防污染元数据与可重建目录。
+	protectedRoots := []string{".git", ".github", ".idea", ".vscode", "node_modules", "dist", "build", "bin", "logs", ".cache"}
 
 	// 遍历每一段，检查是否为受保护的根目录。
 	for i, seg := range segments {
@@ -289,18 +289,9 @@ func rejectProtectedPath(path string) error {
 				}
 				// 若前一段为空、盘符或当前目录，说明该段是根级目录，禁止写入。
 				if prev == "" || strings.HasSuffix(prev, ":") || prev == "." {
-					return fmt.Errorf("禁止写入受保护目录 %s/（项目源码树/配置/元数据）。Agent 只能写 workspace/ 子目录下的用户产物。如确需修改后端代码请由人工操作", root)
+					return fmt.Errorf("禁止写入受保护目录 %s/（版本控制/IDE 配置/构建产物）。本工作目录即沙箱,可直接读写其余子目录;如确需改此目录请由人工操作", root)
 				}
 			}
-		}
-	}
-
-	// 针对 go.mod 与 go.work 做额外保护：不能写在项目根。
-	base := strings.ToLower(filepath.Base(cleaned))
-	if base == "go.mod" || base == "go.work" {
-		// 若路径中不包含 workspace/，说明不是 workspace 子项目，禁止写入根配置。
-		if !strings.Contains(lower, "workspace/") {
-			return fmt.Errorf("禁止写入根 %s（污染 Go module 配置）。如需 Go 子项目请放到 workspace/ 下", base)
 		}
 	}
 

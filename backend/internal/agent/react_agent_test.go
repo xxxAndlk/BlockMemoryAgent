@@ -108,6 +108,34 @@ func TestReActAgent_Run_WithToolCall(t *testing.T) {
 	}
 }
 
+// TestReActAgent_ActivityReporter 验证 generateOnce 与工具派发均触发 activityReporter 回调，
+// 供 Dispatcher 心跳巡检判活。Run 单协程同步执行，plain int 计数器无需加锁。
+func TestReActAgent_ActivityReporter(t *testing.T) {
+	dir := t.TempDir()
+	reg := tool.NewBuiltinRegistry(dir, nil, nil)
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			{
+				Role: blades.RoleAssistant,
+				Parts: []blades.Part{
+					blades.ToolPart{Name: "WriteFile", Request: string(mustJSON(map[string]any{"path": "a.txt", "content": "x"}))},
+				},
+			},
+			blades.AssistantMessage("done"),
+		},
+	}
+	var touches int
+	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "You are a tester."}, llm, NewToolRegistryAdapter(reg)).
+		WithActivityReporter(func() { touches++ })
+	if _, err := a.Run(context.Background(), "write a.txt"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 至少 3 次：第一轮 generateOnce + 工具派发，第二轮 generateOnce。
+	if touches < 3 {
+		t.Fatalf("expected >=3 activity touches (generateOnce+tool+generateOnce), got %d", touches)
+	}
+}
+
 // TestReActAgent_Run_MaxIterations 验证当模型持续请求工具调用且达到最大迭代次数时：
 // 不返回错误，而是返回 LimitReached 标记与完整历史，由上层暂停会话等待用户续跑。
 func TestReActAgent_Run_MaxIterations(t *testing.T) {
@@ -188,7 +216,7 @@ func TestReActAgent_WakeOnMailbox(t *testing.T) {
 	llm := &mockModelProvider{
 		responses: []*blades.Message{
 			blades.AssistantMessage("待子 Agent 完成"), // 第一轮：终答但子 Agent 未决
-			blades.AssistantMessage("整合完毕：ok"),    // 第二轮：吸收 mailbox 摘要后给最终答复
+			blades.AssistantMessage("整合完毕：ok"),     // 第二轮：吸收 mailbox 摘要后给最终答复
 		},
 	}
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
@@ -213,9 +241,9 @@ func TestReActAgent_WakeOnMailbox(t *testing.T) {
 // PendingChildren 恒返 1（不完成），HasPausedChild 恒返 true，使 wait loop 命中 PausedOnChild 分支。
 type fakePausedChildChecker struct{}
 
-func (f *fakePausedChildChecker) PendingChildren(string) int       { return 1 }
+func (f *fakePausedChildChecker) PendingChildren(string) int                 { return 1 }
 func (f *fakePausedChildChecker) WaitForAnyChild(string, time.Duration) bool { return false }
-func (f *fakePausedChildChecker) HasPausedChild(string) bool      { return true }
+func (f *fakePausedChildChecker) HasPausedChild(string) bool                 { return true }
 
 // TestReActAgent_PausedOnChild 验证：父 Agent 给出终答前若有未决子 Agent 且存在 Paused 子 domain，
 // wait loop 应跳出返回 ReactResult{LimitReached:true, PausedOnChild:true}，由上层置会话暂停态。
@@ -700,7 +728,6 @@ func TestWindowMessages_WorkHistoryNotCollapsed(t *testing.T) {
 	}
 }
 
-
 // TestSanitizeToolPairing 验证发送前的 tool 配对兜底：
 // 孤立 tool 结果被丢弃、缺失响应的 tool_calls 就地补合成错误结果、已配对的原样保留。
 func TestSanitizeToolPairing(t *testing.T) {
@@ -800,7 +827,6 @@ func TestReActAgent_MailboxAfterToolResult(t *testing.T) {
 	}
 }
 
-
 // TestSerializePromptForLog_ToolParts 验证 prompt 日志渲染 tool 调用与结果：
 // 纯 tool_call 的 assistant 消息与 tool 结果消息不再序列化为空 content
 // （回归：日志里大量 {"role":"tool","content":""} 被误以为上下文为空）。
@@ -832,5 +858,40 @@ func TestSerializePromptForLog_ToolParts(t *testing.T) {
 	}
 	if strings.Contains(out, `"content": ""`) {
 		t.Fatalf("不应再出现空 content，got: %s", out)
+	}
+}
+
+// TestBuildEnvBlock_InjectsProjectDoc 验证 buildEnvBlock 在存在 .bma/PROJECT.md 时
+// 把 managed 区正文作为【项目概览】段注入；缺失时不附该段。
+func TestBuildEnvBlock_InjectsProjectDoc(t *testing.T) {
+	// 无 PROJECT.md 的工作目录：不应出现项目概览段。
+	emptyDir := t.TempDir()
+	env := buildEnvBlock(emptyDir)
+	if strings.Contains(env, "【项目概览】") {
+		t.Fatalf("空 workDir 不应注入项目概览，got: %s", env)
+	}
+
+	// 构造带 managed 区的 PROJECT.md。
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".bma"), 0o755); err != nil {
+		t.Fatalf("mkdir .bma: %v", err)
+	}
+	managed := "# 项目概览\n\n- 模块: github.com/example/demo\n## 推荐领域拆分\n### `backend/` - 后端服务\n"
+	content := "<!-- bma:managed begin -->\n" + managed + "\n<!-- bma:managed end -->\n"
+	if err := os.WriteFile(filepath.Join(dir, ".bma", "PROJECT.md"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write PROJECT.md: %v", err)
+	}
+	env = buildEnvBlock(dir)
+	if !strings.Contains(env, "【项目概览】") {
+		t.Fatalf("应注入项目概览段，got: %s", env)
+	}
+	if !strings.Contains(env, "github.com/example/demo") {
+		t.Fatalf("应含 managed 正文，got: %s", env)
+	}
+	if !strings.Contains(env, "### `backend/` - 后端服务") {
+		t.Fatalf("应含领域拆分条目，got: %s", env)
+	}
+	if strings.Contains(env, "bma:managed") {
+		t.Fatalf("不应把标记本身注入提示词，got: %s", env)
 	}
 }

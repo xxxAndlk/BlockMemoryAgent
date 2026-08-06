@@ -113,6 +113,8 @@ type (
 		// Path 为待执行 blame 的文件路径。
 		Path string `json:"path"`
 	}
+	// refreshProjectDocInput 表示 RefreshProjectDoc 工具的输入参数（当前无字段）。
+	refreshProjectDocInput struct{}
 	// callSubAgentInput 表示 call_sub_agent 工具的输入参数。
 	// 与 subagent 包内部入参结构保持一致（按字段名 JSON 解码）。
 	callSubAgentInput struct {
