@@ -264,10 +264,10 @@ domain_agent:
 # 2026-08-04 基线运行实证：deepseek-v4-flash 多次 503 "Service is too busy" 重试耗尽，
 # 事实提取连续失败，故切换。
 lightweight_model:
-  provider: openai-responses
+  provider: anthropic
   model: deepseek-v4-flash
   api_key: ${OPENAI_API_KEY}
-  base_url: ${OPENAI_BASE_URL}
+  base_url: ${ANTHROPIC_BASE_URL_THREE}
   temperature: 0.2
   max_tokens: 2048
 

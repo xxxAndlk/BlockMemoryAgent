@@ -3,6 +3,7 @@ package tool
 // 导入测试所需标准库与项目包。
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -50,9 +51,11 @@ func TestReadFile(t *testing.T) {
 	}
 }
 
-// TestReadFile_DedupAndReset 验证已读守卫拦截重读，且 ResetReadHistory 后可重读。
-// 对应日志事故：test_assistant-23 反复读 kv.go 被拒 14 分钟；现有修复应让其在新任务重读。
-func TestReadFile_DedupAndReset(t *testing.T) {
+// TestReadFile_ConsecutiveSameCallLoopGuard 验证"参数完全相同的连续 ReadFile"循环检测：
+// 重读不再拦截（每次直返磁盘最新内容），第 2 次连续相同调用附翻页提醒，
+// 第 3 次判定死循环拦截并请求 LoopExit；ResetReadHistory 后计数清零。
+// 对应日志事故：代码助手对 config.js 反复 ReadFile 10+ 次烧 token。
+func TestReadFile_ConsecutiveSameCallLoopGuard(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("v1"), 0644); err != nil {
 		t.Fatalf("write file: %v", err)
@@ -66,28 +69,48 @@ func TestReadFile_DedupAndReset(t *testing.T) {
 		t.Fatalf("first read should succeed: err=%v success=%v", err, res.Success)
 	}
 
-	// 同 session 内第二次读取应被守卫拦截。
-	res2, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
-	if res2.Success {
-		t.Fatal("second read should be blocked by dedup guard")
+	// 第 2 次相同参数调用：仍直返内容（不拦截），但结果末尾附翻页提醒。
+	res2, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
+	if err != nil || !res2.Success {
+		t.Fatalf("second identical read should still serve content: err=%v success=%v", err, res2.Success)
 	}
-	if !strings.Contains(res2.Error, "已读过") {
-		t.Fatalf("expected dedup error, got: %s", res2.Error)
+	if !strings.Contains(res2.Output, "v1") {
+		t.Fatalf("second read should return content, got: %s", res2.Output)
+	}
+	if !strings.Contains(res2.Output, "勿重复读取") {
+		t.Fatalf("second identical read should carry reminder, got: %s", res2.Output)
 	}
 
-	// 模拟用户新消息：ResetReadHistory 清空记录。
+	// 参数有变化（翻页）即归零重计，不触发循环检测。
+	paged := map[string]any{"path": "a.txt", "offset": float64(1), "limit": float64(1)}
+	if res, err := r.Dispatch(ctx, "ReadFile", paged); err != nil || !res.Success {
+		t.Fatalf("read with different params should succeed: err=%v success=%v", err, res.Success)
+	}
+	// 同参数第 2 次：仍成功（附提醒）。
+	if res, err := r.Dispatch(ctx, "ReadFile", paged); err != nil || !res.Success {
+		t.Fatalf("2nd consecutive identical read should succeed: err=%v success=%v", err, res.Success)
+	}
+	// 同参数第 3 次：判定死循环，拦截。
+	res3, _ := r.Dispatch(ctx, "ReadFile", paged)
+	if res3.Success {
+		t.Fatal("3rd consecutive identical read should be blocked as loop")
+	}
+	if !strings.Contains(res3.Error, "死循环") {
+		t.Fatalf("expected loop error, got: %s", res3.Error)
+	}
+
+	// 模拟用户新消息：ResetReadHistory 清空连读计数后可重读。
 	r.ResetReadHistory("s1")
-
-	// 清空后应可再次读取。
-	res3, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
-	if err != nil || !res3.Success {
-		t.Fatalf("read after reset should succeed: err=%v success=%v", err, res3.Success)
+	res4, err := r.Dispatch(ctx, "ReadFile", paged)
+	if err != nil || !res4.Success {
+		t.Fatalf("read after reset should succeed: err=%v success=%v", err, res4.Success)
 	}
 }
 
-// TestWriteFile_ClearsReadHistory 验证 WriteFile 成功后清掉同 path 的已读记录，
-// 允许后续 ReadFile 重读改后内容（防 Agent history 脏数据：文件被改但 LLM 只看旧 tool_result）。
-func TestWriteFile_ClearsReadHistory(t *testing.T) {
+// TestReadFile_AfterWriteFile_ReturnsFreshContent 脏数据回归测试：
+// ReadFile 每次直返磁盘最新内容，WriteFile 改写后按相同参数重读必须看到新内容，
+// 不依赖任何"已读记录清理"机制（WriteFile/sed/外部进程改写均被天然覆盖）。
+func TestReadFile_AfterWriteFile_ReturnsFreshContent(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("v1"), 0644); err != nil {
 		t.Fatalf("write file: %v", err)
@@ -95,7 +118,7 @@ func TestWriteFile_ClearsReadHistory(t *testing.T) {
 	r := NewBuiltinRegistry(dir, nil, nil)
 	ctx := WithSessionID(context.Background(), "s1")
 
-	// 首次读取成功，记录进已读列表。
+	// 首次读取成功，看到 v1。
 	res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
 	if err != nil || !res.Success {
 		t.Fatalf("first read should succeed: err=%v success=%v", err, res.Success)
@@ -104,13 +127,7 @@ func TestWriteFile_ClearsReadHistory(t *testing.T) {
 		t.Fatalf("expected v1 content, got: %s", res.Output)
 	}
 
-	// 第二次读取应被拦截。
-	res2, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
-	if res2.Success {
-		t.Fatal("second read should be blocked by dedup guard")
-	}
-
-	// WriteFile 改写 a.txt 内容为 v2，触发清同 path 已读记录。
+	// WriteFile 改写 a.txt 内容为 v2。
 	wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{
 		"path":    "a.txt",
 		"content": "v2",
@@ -119,7 +136,7 @@ func TestWriteFile_ClearsReadHistory(t *testing.T) {
 		t.Fatalf("WriteFile should succeed: err=%v success=%v", err, wres.Success)
 	}
 
-	// 改写后 ReadFile 应能再次读取，返回最新内容 v2。
+	// 相同参数重读：直返磁盘最新内容 v2，绝无脏数据。
 	res3, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
 	if err != nil || !res3.Success {
 		t.Fatalf("read after WriteFile should succeed: err=%v success=%v", err, res3.Success)
@@ -129,45 +146,59 @@ func TestWriteFile_ClearsReadHistory(t *testing.T) {
 	}
 }
 
-// TestWriteFile_ClearsReadHistory_PreservesOthers 验证 WriteFile 只清同 path 的已读记录，
-// 不误清其他文件的已读记录（保持其他文件的防重读语义）。
-func TestWriteFile_ClearsReadHistory_PreservesOthers(t *testing.T) {
+// TestReadFile_Pagination 验证 offset/limit 行区间分页：
+// 分页头（输出首行）给出总行数/本页区间/下一页起点，翻页返回后续区间，
+// 末页标注"已到文件末尾"，offset 越界报错并告知总行数。
+func TestReadFile_Pagination(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0644); err != nil {
-		t.Fatalf("write a.txt: %v", err)
+	// 构造 10 行文件。
+	var lines []string
+	for i := 1; i <= 10; i++ {
+		lines = append(lines, fmt.Sprintf("line-%d", i))
 	}
-	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b"), 0644); err != nil {
-		t.Fatalf("write b.txt: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, "p.txt"), []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
 	}
 	r := NewBuiltinRegistry(dir, nil, nil)
 	ctx := WithSessionID(context.Background(), "s1")
 
-	// 读 a.txt 与 b.txt，两者都进已读列表。
-	if _, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"}); err != nil {
-		t.Fatalf("read a.txt: %v", err)
+	// 第一页：offset=1, limit=4，返回 1-4 行，分页头指向 offset=5。
+	res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "p.txt", "offset": float64(1), "limit": float64(4)})
+	if err != nil || !res.Success {
+		t.Fatalf("first page should succeed: err=%v success=%v", err, res.Success)
 	}
-	if _, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "b.txt"}); err != nil {
-		t.Fatalf("read b.txt: %v", err)
+	if !strings.Contains(res.Output, "共 10 行") || !strings.Contains(res.Output, "本页 1-4 行") || !strings.Contains(res.Output, "offset=5") {
+		t.Fatalf("first page header wrong: %s", res.Output)
 	}
-
-	// WriteFile 改 a.txt：只清 a.txt 的已读记录，b.txt 仍被拦截。
-	if _, err := r.Dispatch(ctx, "WriteFile", map[string]any{
-		"path":    "a.txt",
-		"content": "a2",
-	}); err != nil {
-		t.Fatalf("WriteFile a.txt: %v", err)
+	if !strings.Contains(res.Output, "line-1") || !strings.Contains(res.Output, "line-4") || strings.Contains(res.Output, "line-5") {
+		t.Fatalf("first page content wrong: %s", res.Output)
 	}
 
-	// a.txt 应能重读（已清）。
-	resA, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt"})
-	if err != nil || !resA.Success {
-		t.Fatalf("read a.txt after WriteFile should succeed: err=%v success=%v", err, resA.Success)
+	// 第二页：offset=5, limit=4，返回 5-8 行（不含上一页内容）。
+	res2, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "p.txt", "offset": float64(5), "limit": float64(4)})
+	if err != nil || !res2.Success {
+		t.Fatalf("second page should succeed: err=%v success=%v", err, res2.Success)
+	}
+	if strings.Contains(res2.Output, "line-4") || !strings.Contains(res2.Output, "line-5") || !strings.Contains(res2.Output, "line-8") {
+		t.Fatalf("second page content wrong: %s", res2.Output)
 	}
 
-	// b.txt 仍应被拦截（未清）。
-	resB, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "b.txt"})
-	if resB.Success {
-		t.Fatal("b.txt should still be blocked by dedup guard (WriteFile touched a.txt only)")
+	// 末页：limit 超出末尾时截到文件末尾并标注。
+	res3, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "p.txt", "offset": float64(9), "limit": float64(4)})
+	if err != nil || !res3.Success {
+		t.Fatalf("last page should succeed: err=%v success=%v", err, res3.Success)
+	}
+	if !strings.Contains(res3.Output, "本页 9-10 行") || !strings.Contains(res3.Output, "已到文件末尾") {
+		t.Fatalf("last page header wrong: %s", res3.Output)
+	}
+
+	// offset 越界：报错并告知总行数。
+	res4, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "p.txt", "offset": float64(11), "limit": float64(4)})
+	if res4.Success {
+		t.Fatal("out-of-range offset should fail")
+	}
+	if !strings.Contains(res4.Error, "总行数 10") {
+		t.Fatalf("expected total-lines error, got: %s", res4.Error)
 	}
 }
 

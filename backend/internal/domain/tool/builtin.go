@@ -43,6 +43,10 @@ type (
 	readFileInput struct {
 		// Path 为待读取文件的相对或绝对路径。
 		Path string `json:"path"`
+		// Offset 为起始行号（1-based，默认 1）。
+		Offset float64 `json:"offset,omitempty"`
+		// Limit 为本次读取的最大行数（默认 defaultReadFileLimit 行）。
+		Limit float64 `json:"limit,omitempty"`
 	}
 	// writeFileInput 表示 WriteFile 工具的输入参数。
 	writeFileInput struct {
@@ -133,7 +137,15 @@ type (
 
 // ---- ReadFile（读取文件） ----
 
-// readFile 读取指定路径的文本内容，并按配置截断过长输出。
+// defaultReadFileLimit 是 ReadFile 未显式指定 limit 时的默认读取行数。
+// 与 ReadFileMaxChars 字符上限共同生效（先到先截），保证单页输出可控。
+const defaultReadFileLimit = 120
+
+// readFile 按行区间读取指定路径的文本内容（1-based offset + limit 分页）。
+// 输出带行号（cat -n 风格），顶部首行放置分页头（总行数/本页区间/下一页 offset），
+// 放在顶部是因为写历史的 tool_output_history_max_runes 截断保头不保尾，
+// 页脚式分页信息会在历史里丢失，导致模型忘记如何翻页。
+// 超出 ReadFileMaxChars 时按行截停，分页头中给出实际返回区间，保证"继续读"指引始终准确。
 func (e *Executor) readFile(args map[string]any) *Result {
 	// 从参数中取出 path，要求必须是非空字符串。
 	path, ok := args["path"].(string)
@@ -153,14 +165,54 @@ func (e *Executor) readFile(args map[string]any) *Result {
 		// 文件不存在或无权限时返回错误。
 		return &Result{Tool: "ReadFile", Path: absPath, Error: err.Error()}
 	}
-	// 将字节转换为字符串以便后续处理与返回。
-	content := string(data)
-	// 如果内容长度超过配置的最大字符数，则进行截断并追加提示信息。
-	if maxChars := e.agentConfig().ReadFileMaxChars; len(content) > maxChars {
-		content = content[:maxChars] + "\n... (truncated, total " + fmt.Sprintf("%d", len(string(data))) + " chars)"
+
+	// 解析分页参数：offset 为 1-based 起始行，limit 为本页最大行数。
+	offset := 1
+	if v, ok := args["offset"].(float64); ok && v > 0 {
+		offset = int(v)
 	}
-	// 返回成功结果，包含文件路径与（可能截断后的）内容。
-	return &Result{Tool: "ReadFile", Success: true, Output: content, Path: absPath}
+	limit := defaultReadFileLimit
+	if v, ok := args["limit"].(float64); ok && v > 0 {
+		limit = int(v)
+	}
+
+	// 按行切分文件内容。
+	lines := strings.Split(string(data), "\n")
+	total := len(lines)
+	// offset 越界时直接报错并告知总行数，引导模型给出合法区间。
+	if offset > total {
+		return &Result{Tool: "ReadFile", Path: absPath,
+			Error: fmt.Sprintf("offset %d 超出文件总行数 %d，请用 1-%d 之间的 offset", offset, total, total)}
+	}
+	// 计算本页结束行（含），不超出文件末尾。
+	end := offset - 1 + limit
+	if end > total {
+		end = total
+	}
+
+	// 逐行拼接待行号内容；超出字符上限时提前截停，actualEnd 记录实际返回到哪一行。
+	maxChars := e.agentConfig().ReadFileMaxChars
+	var b strings.Builder
+	actualEnd := offset - 1
+	for i := offset - 1; i < end; i++ {
+		line := fmt.Sprintf("%6d\t%s\n", i+1, lines[i])
+		// 至少保留第一行，避免 maxChars 极小时返回空内容。
+		if b.Len()+len(line) > maxChars && actualEnd >= offset {
+			break
+		}
+		b.WriteString(line)
+		actualEnd = i + 1
+	}
+
+	// 分页头放在输出顶部：历史截断保留头部，模型始终知道文件规模与下一页起点。
+	header := fmt.Sprintf("[共 %d 行 | 本页 %d-%d 行", total, offset, actualEnd)
+	if actualEnd < total {
+		header += fmt.Sprintf(" | 继续读请 ReadFile(path, offset=%d)]\n", actualEnd+1)
+	} else {
+		header += " | 已到文件末尾]\n"
+	}
+	// 返回成功结果，包含文件路径与分页头 + （可能截停后的）本页内容。
+	return &Result{Tool: "ReadFile", Success: true, Output: header + b.String(), Path: absPath}
 }
 
 // ---- WriteFile（写入文件） ----

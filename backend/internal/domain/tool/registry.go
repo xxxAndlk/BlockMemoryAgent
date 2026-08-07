@@ -47,12 +47,11 @@ func isReadLikeCommand(args map[string]any) bool {
 	return false
 }
 
-// maxRereadAttempts 是同一 scope+path 上"已读过"拦截的最大次数。
-// 超过后视为 LLM 陷入死循环（实证：代码助手对 config.js/path.js 反复 ReadFile 10+ 次），
-// 触发 ActionLoopExit 终止 ReAct 循环，让上层子 Agent 失败回灌摘要，避免烧 token 与时间。
-const maxRereadAttempts = 2
-
-// maxReadFilePerTask 已废弃：ReadFile 不再限制不同文件数量，仅拦截同一文件重读。
+// maxConsecutiveSameRead 是同一 scope 内"参数完全相同的 ReadFile"连续调用次数上限。
+// 重读不再被拦截（每次直返磁盘最新内容，天然无脏数据），但参数完全不变的连续重复
+// 调用意味着模型未吸收内容、陷入死循环（实证：代码助手对 config.js 反复 ReadFile 10+ 次）：
+// 第 2 次直返内容并附一句提醒，第 3 次触发 ActionLoopExit 终止 ReAct 循环兜底。
+const maxConsecutiveSameRead = 3
 
 // Tool 是内置工具的通用接口，所有具体工具都需要实现该接口。
 type Tool interface {
@@ -112,25 +111,22 @@ type Registry struct {
 	tools map[string]Tool
 	// aliases 存储别名到标准名称的映射。
 	aliases map[string]string
-	// readMu 保护 readFiles map，防止并发读写。
+	// readMu 保护下列 per-scope 读取状态 map，防止并发读写。
 	readMu sync.Mutex
-	// readFiles 按 agentID 记录本任务已读文件路径，用于 ReadFile 预算控制。
-	// per-agent 维度隔离：兄弟 DomainAgent 同 session 各有独立读预算，互不拦截；
+	// lastReadKey 按 agentID 记录该 scope 最近一次 ReadFile 的调用键
+	// （cleanPath+"\x00"+offset+"\x00"+limit），用于连续相同调用检测。
+	// per-agent 维度隔离：兄弟 DomainAgent 同 session 各自独立，互不影响；
 	// 新用户消息进入时 ResetReadHistory 按主 Agent agentID 清空。
-	readFiles map[string][]string
-	// writtenFiles 按 agentID 记录本任务内 WriteFile 成功写过的路径。
-	// 这些路径允许重复 ReadFile：LLM 写完文件后常需重读以验证修改/定位 syntax 错误，
-	// 简单的"已读过即拦截"会卡住修复循环。该集合在 WriteFile 成功时写入，readCheck 命中即放行。
-	writtenFiles map[string]map[string]bool
+	lastReadKey map[string]string
+	// sameReadCount 按 agentID 记录"参数与上一次完全相同"的 ReadFile 连续次数。
+	// 达 maxConsecutiveSameRead 触发 LoopExit（真死循环兜底）；
+	// 参数有任何变化（翻页/换文件）即归零——重读本身合法，每次直返磁盘最新内容。
+	sameReadCount map[string]int
 	// exploreCount 按 scopeKey 记录本任务内探索类工具（ReadFile/ListDir）调用次数。
 	// 防止 Agent 陷入探索循环不收敛：实证 domain-2 调 81 次探索工具 30m 超时未写完。
 	// 超过 exploreBudget 后 ReadFile/ListDir 返回错误，逼迫 Agent 开始 WriteFile。
 	// RunCommand 不计（验证/动作类），避免写完文件后无法验证陷入重试死循环。
 	exploreCount map[string]int
-	// rereadAttempts 按 scopeKey+path 记录"已读过"拦截次数。
-	// 超过 maxRereadAttempts 触发 LoopExit 终止循环（实证：代码助手对 config.js 反复 ReadFile 10+ 次）。
-	// key 格式为 scopeKey + "\x00" + cleanPath，value 为连续拦截次数。
-	rereadAttempts map[string]int
 	// sharedMemory 是 WriteSharedMemory 工具的 KV 后端，由 bootstrap 注入。
 	// 为 nil 时 WriteSharedMemory 注册但不生效，调用返回 store 未配置错误。
 	sharedMemory SharedMemoryStore
@@ -155,10 +151,9 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		failures:  newFailureCounter(),
 		tools:     make(map[string]Tool),
 		aliases:       make(map[string]string),
-		readFiles:     make(map[string][]string),
-		writtenFiles: make(map[string]map[string]bool),
-		exploreCount: make(map[string]int),
-		rereadAttempts: make(map[string]int),
+		lastReadKey:   make(map[string]string),
+		sameReadCount: make(map[string]int),
+		exploreCount:  make(map[string]int),
 	}
 	// 去抖异步刷新 PROJECT.md：文件增删改后安静期触发 LLM 按职责重分区。
 	// cls nil（测试）时 RefreshProjectDoc 走启发式，刷新仍更新文件列表。
@@ -284,36 +279,43 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 发送工具调用进度事件，便于外部观测当前调用。
 	r.emitTool(ctx, "tool_call", name, "调用工具 "+name, string(argsStr))
 
-	// ReadFile 预算控制：防止同一任务中重复读取或读取过多文件。
+	// ReadFile 连读检测：重读不再拦截（每次直返磁盘最新内容，天然无脏数据，
+	// 也兼容 WriteFile/sed/外部进程改写等一切修改途径）。仅检测"参数完全相同"的连续
+	// 调用：第 2 次直返内容并附提醒，第 maxConsecutiveSameRead 次判定死循环触发 LoopExit。
+	readNote := ""
 	if name == "ReadFile" {
-		// 从参数中读取目标文件路径。
+		// 注入 offset/limit 默认值，使执行器与连读检测使用同一取值。
+		if v, ok := args["offset"].(float64); !ok || v <= 0 {
+			args["offset"] = float64(1)
+		}
+		if v, ok := args["limit"].(float64); !ok || v <= 0 {
+			args["limit"] = float64(defaultReadFileLimit)
+		}
+		// 从参数中读取目标文件路径并解析为绝对路径，拼装调用键（path+offset+limit）。
 		path, _ := args["path"].(string)
-		// 将路径解析为绝对路径，便于后续统一比较。
 		normalizedPath := r.exec.resolvePath(path)
-		// 检查当前读取是否被预算规则拦截。
-		if blocked := r.checkReadFileBudget(ctx, normalizedPath); blocked != "" {
-			// 被拦截时构造一个带有错误信息的结果。
-			result := &Result{Tool: "ReadFile", Path: normalizedPath, Error: blocked}
-			// 填充 SessionID、ArgsJSON 等通用字段。
+		key := fmt.Sprintf("%s\x00%d\x00%d", filepath.Clean(normalizedPath),
+			int(args["offset"].(float64)), int(args["limit"].(float64)))
+		scope := scopeKeyFromCtx(ctx)
+		n := r.bumpSameRead(scope, key)
+		// 连续相同调用达上限：LLM 陷入死循环（内容已直返过仍原样再调），
+		// 触发 LoopExit 终止 ReAct 循环，让上层子 Agent 失败回灌摘要，避免烧 token 与时间。
+		if n >= maxConsecutiveSameRead {
+			result := &Result{Tool: "ReadFile", Path: normalizedPath,
+				Error: fmt.Sprintf("已连续 %d 次以完全相同的参数读取该文件区间，内容均已返回，疑似死循环。需要其他段落应调整 offset 翻页；本次任务终止。", n)}
 			r.fillResult(ctx, result, args)
-			// 记录拦截事件：含 scope/file/次数，便于排查为何 Agent 反复读同一文件。
-			scope := scopeKeyFromCtx(ctx)
-			attempts := r.bumpRereadAttempt(scope, normalizedPath)
-			log.Printf("[tool] ReadFile blocked: scope=%s path=%s attempts=%d/%d reason=%q",
-				scope, normalizedPath, attempts, maxRereadAttempts, blocked)
-			// 连续拦截达上限：LLM 陷入死循环，触发 LoopExit 终止 ReAct 循环。
-			// 实证：代码助手对 config.js 反复 ReadFile 10+ 次烧 token，每次返回相同错误。
-			// 不 LoopExit 会继续烧；LoopExit 让子 Agent 失败回灌摘要，上层重派或自接。
-			if attempts >= maxRereadAttempts {
-				log.Printf("[tool] ReadFile LoopExit: scope=%s path=%s attempts=%d reached max, exiting ReAct loop",
-					scope, normalizedPath, attempts)
-				if tc, ok := tools.FromContext(ctx); ok {
-					tc.SetAction(tools.ActionLoopExit, true)
-				}
+			log.Printf("[tool] ReadFile LoopExit: scope=%s path=%s consecutive=%d reached max, exiting ReAct loop",
+				scope, normalizedPath, n)
+			if tc, ok := tools.FromContext(ctx); ok {
+				tc.SetAction(tools.ActionLoopExit, true)
 			}
 			// 发送结果事件后返回。
 			r.emitResult(ctx, result)
 			return result, nil
+		}
+		// 第 2 次连续相同调用：直返内容，并在结果末尾附一句提醒引导翻页。
+		if n == 2 {
+			readNote = "\n[注意] 该区间刚刚已原样返回过，如需其他段落请用 ReadFile(offset=起始行) 翻页，勿重复读取同一区间。"
 		}
 	}
 
@@ -340,15 +342,9 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 调用工具实现获取执行结果。
 	result := t.Execute(ctx, args)
 
-	// ReadFile 成功读取后，记录已读文件并在输出末尾追加已读清单提示。
-	if name == "ReadFile" && result.Success && result.Path != "" {
-		// 将本次成功读取的文件路径加入 agent 级任务记录。
-		r.recordReadFile(ctx, result.Path)
-		// 生成已读文件清单提示文本。
-		if hint := r.readListHint(ctx); hint != "" {
-			// 将提示追加到结果输出中，提醒模型不要重复读取。
-			result.Output = result.Output + "\n" + hint
-		}
+	// ReadFile 成功读取后：连续第 2 次相同参数调用时附上翻页提醒（内容直返，不拦截）。
+	if name == "ReadFile" && result.Success && readNote != "" {
+		result.Output += readNote
 	}
 
 	// 探索类工具调用后计数 +1（不论成功失败都计，避免失败重试绕过预算）。
@@ -359,12 +355,9 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 
 	// WriteFile 成功后失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
 	// 防止子 Agent 改文件后，父 Agent 下次派发仍把旧摘要注入新子 Agent task 导致幻觉。
-	// 同时清掉该 path 的已读记录：文件已被改写，旧 ReadFile 缓存的 tool_result 不再新鲜，
-	// 必须允许后续 ReadFile 重读，否则 LLM 只能看到 history 里的旧内容（脏数据）。
+	// ReadFile 无需清已读记录：重读本就直返磁盘最新内容，不存在脏数据问题。
 	if name == "WriteFile" && result.Success && result.Path != "" {
 		r.invalidateSharedMemoryForPath(ctx, result.Path)
-		r.clearReadHistoryForPath(ctx, result.Path)
-		r.recordWrittenFile(ctx, result.Path)
 		// 文件新增/修改触发去抖刷新 PROJECT.md 领域影响范围（安静期一次 LLM 重分区）。
 		r.scheduleProjectRefresh()
 	}
@@ -526,195 +519,37 @@ func (r *Registry) recordExplore(ctx context.Context) {
 	r.exploreCount[scopeKey]++
 }
 
-// checkReadFileBudget 检查指定路径是否允许在当前 agent 任务中读取。
-// 返回空字符串表示允许；否则返回拦截原因。
-// 作用域键：优先 agentID（per-agent 隔离，兄弟 DomainAgent 互不拦截）；
-// agentID 为空时回退 sessionID（兼容仅设 sessionID 的调用方，如旧测试）。
-func (r *Registry) checkReadFileBudget(ctx context.Context, path string) string {
-	// 空路径无需拦截，直接放行。
-	if path == "" {
-		return ""
-	}
-	// 取隔离键：优先 agentID，回退 sessionID。
-	scopeKey := AgentIDFromContext(ctx)
+// bumpSameRead 记录一次 ReadFile 调用键，返回"与上一次完全相同"的连续次数（含本次）。
+// 参数有任何变化（翻页/换文件/改 limit）即归零重计：重读本身合法，每次直返磁盘最新内容；
+// 只有参数完全不变的连续重复才意味着模型未吸收内容、陷入死循环。scope 为空时不计数返回 0。
+func (r *Registry) bumpSameRead(scopeKey, key string) int {
 	if scopeKey == "" {
-		scopeKey = SessionIDFromContext(ctx)
-	}
-	if scopeKey == "" {
-		return ""
-	}
-	// 规范化路径，用于统一比较。
-	cleanPath := filepath.Clean(path)
-	// 加锁保护 readFiles 的读取。
-	r.readMu.Lock()
-	// 函数退出时释放锁。
-	defer r.readMu.Unlock()
-	// 遍历该作用域的已读文件列表，若发现重复路径则拦截。
-	for _, p := range r.readFiles[scopeKey] {
-		if filepath.Clean(p) == cleanPath {
-			// 例外：该路径在本作用域内被 WriteFile 写过则放行。
-			// LLM 写完文件后常需重读以验证修改或定位 syntax 错误，硬拦截会卡住修复循环。
-			if r.writtenFiles[scopeKey] != nil && r.writtenFiles[scopeKey][cleanPath] {
-				return ""
-			}
-			// 返回中文提示，告知模型已读过并应使用 SearchInFiles 定位。
-			// 强调"内容在历史中可翻看"，并警告继续尝试会触发 LoopExit，逼 LLM 转向 WriteFile/SearchInFiles。
-			return fmt.Sprintf("该文件本任务已读过（%s），禁止重读。已读内容在你的历史消息中，向前翻看即可。如需看其他段落用 SearchInFiles 精确定位；继续尝试 ReadFile 同一文件将触发 LoopExit 终止任务。", cleanPath)
-		}
-	}
-	// 不同文件数量不再设上限；允许读取。
-	return ""
-}
-
-// bumpRereadAttempt 递增 scope+path 维度的"已读过"拦截次数，返回递增后的次数。
-// 用于检测 LLM 是否陷入对同一文件的死循环重读。WriteFile 后该 path 计数清零（文件已变，允许重读）。
-func (r *Registry) bumpRereadAttempt(scopeKey, path string) int {
-	if scopeKey == "" || path == "" {
 		return 0
 	}
-	cleanPath := filepath.Clean(path)
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
-	k := scopeKey + "\x00" + cleanPath
-	r.rereadAttempts[k]++
-	return r.rereadAttempts[k]
+	if r.lastReadKey[scopeKey] == key {
+		r.sameReadCount[scopeKey]++
+	} else {
+		r.lastReadKey[scopeKey] = key
+		r.sameReadCount[scopeKey] = 1
+	}
+	return r.sameReadCount[scopeKey]
 }
 
-// resetRereadAttempt 清零指定 scope+path 的拦截计数。
-// WriteFile 成功后调用：文件已变，允许 LLM 重新 ReadFile 验证修改，不应被 LoopExit 卡死。
-func (r *Registry) resetRereadAttempt(scopeKey, path string) {
-	if scopeKey == "" || path == "" {
-		return
-	}
-	cleanPath := filepath.Clean(path)
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
-	delete(r.rereadAttempts, scopeKey+"\x00"+cleanPath)
-}
-
-// recordReadFile 将成功读取的文件路径记录到当前作用域的已读列表中。
-// 作用域键：优先 agentID（per-agent 隔离），回退 sessionID（兼容仅设 sessionID 的调用方）。
-func (r *Registry) recordReadFile(ctx context.Context, path string) {
-	// 取隔离键；为空时不记录（无隔离维度）。
-	scopeKey := AgentIDFromContext(ctx)
-	if scopeKey == "" {
-		scopeKey = SessionIDFromContext(ctx)
-	}
-	if scopeKey == "" {
-		return
-	}
-	// 加锁保护 readFiles 的并发修改。
-	r.readMu.Lock()
-	// 函数退出时释放锁。
-	defer r.readMu.Unlock()
-	// 规范化路径后存入列表。
-	cleanPath := filepath.Clean(path)
-	// 检查列表中是否已存在该路径，避免重复记录。
-	for _, p := range r.readFiles[scopeKey] {
-		if filepath.Clean(p) == cleanPath {
-			return
-		}
-	}
-	// 追加到该作用域的已读列表。
-	r.readFiles[scopeKey] = append(r.readFiles[scopeKey], cleanPath)
-}
-
-// readListHint 生成当前作用域已读文件清单的提示文本。
-func (r *Registry) readListHint(ctx context.Context) string {
-	// 取隔离键；为空时返回空串。
-	scopeKey := AgentIDFromContext(ctx)
-	if scopeKey == "" {
-		scopeKey = SessionIDFromContext(ctx)
-	}
-	if scopeKey == "" {
-		return ""
-	}
-	// 加锁读取 readFiles。
-	r.readMu.Lock()
-	// 函数退出时释放锁。
-	defer r.readMu.Unlock()
-	files := r.readFiles[scopeKey]
-	// 没有已读文件时返回空字符串，避免在输出中追加无意义提示。
-	if len(files) == 0 {
-		return ""
-	}
-	// 返回格式化的中文提示，包含数量与路径列表。
-	return fmt.Sprintf("[已读文件清单 (%d): %s — 禁止重读]",
-		len(files), strings.Join(files, ", "))
-}
-
-// ResetReadHistory 清空指定 agent 的已读文件记录。
-// 在新用户消息进入时调用，使重复读限制为单任务级而非整个会话级。
-// 设计意图：原始事故是单任务内反复读同一文件；任务完成后用户提新需求（如修 bug）
-// 需重读已改文件，不应被历史记录卡死。
-// per-agent 作用域后：sessionID 仍可用作 MetaAgent 的 agentID（派发时 MetaAgent 持 sessionID 作 agentID），
-// 子 Agent 各有独立 agentID，自行累积与清理；调用方无需改动。
+// ResetReadHistory 清空指定 agent 的读取状态（连读计数 + 探索预算）。
+// 在新用户消息进入时调用，使连读循环检测与探索预算为单任务级而非整个会话级。
+// per-agent 作用域：sessionID 仍可用作 MetaAgent 的 agentID（派发时 MetaAgent 持 sessionID 作 agentID），
+// 子 Agent 各有独立 agentID，每次派发新 ID 自然隔离；调用方无需改动。
 func (r *Registry) ResetReadHistory(sessionID string) {
 	if sessionID == "" {
 		return
 	}
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
-	delete(r.readFiles, sessionID)
-	delete(r.writtenFiles, sessionID)
+	delete(r.lastReadKey, sessionID)
+	delete(r.sameReadCount, sessionID)
 	delete(r.exploreCount, sessionID)
-	// 清掉该 scope 下所有 path 的 rereadAttempt 计数，避免新任务受旧计数影响触发 LoopExit。
-	prefix := sessionID + "\x00"
-	for k := range r.rereadAttempts {
-		if strings.HasPrefix(k, prefix) {
-			delete(r.rereadAttempts, k)
-		}
-	}
-}
-
-// clearReadHistoryForPath 从当前作用域的已读列表中移除指定 path 的记录。
-// 用于 WriteFile 成功后：文件已被改写，旧 ReadFile 缓存的 tool_result 不再反映最新内容，
-// 必须允许后续 ReadFile 重新读取，否则 LLM 只能看到 history 里的旧内容（脏数据）。
-// 仅清当前作用域（per-agent；兄弟 Agent 的已读记录不受影响，各自独立）。
-func (r *Registry) clearReadHistoryForPath(ctx context.Context, path string) {
-	scopeKey := AgentIDFromContext(ctx)
-	if scopeKey == "" {
-		scopeKey = SessionIDFromContext(ctx)
-	}
-	if scopeKey == "" {
-		return
-	}
-	cleanPath := filepath.Clean(path)
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
-	files := r.readFiles[scopeKey]
-	if len(files) == 0 {
-		return
-	}
-	out := files[:0]
-	for _, p := range files {
-		if filepath.Clean(p) != cleanPath {
-			out = append(out, p)
-		}
-	}
-	r.readFiles[scopeKey] = out
-	// 文件被 WriteFile 改写后允许重读，重置 rereadAttempt 计数避免 LoopExit 卡死修复循环。
-	delete(r.rereadAttempts, scopeKey+"\x00"+cleanPath)
-}
-
-// recordWrittenFile 把 path 加入当前作用域的已写集合，使后续 ReadFile 跳过"已读过"拦截。
-// 用于 WriteFile 成功后：LLM 写完文件常需重读以验证修改或定位 syntax 错误，
-// 硬拦截会卡住修复循环。集合按作用域键隔离，ResetReadHistory 一并清空。
-func (r *Registry) recordWrittenFile(ctx context.Context, path string) {
-	scopeKey := AgentIDFromContext(ctx)
-	if scopeKey == "" {
-		scopeKey = SessionIDFromContext(ctx)
-	}
-	if scopeKey == "" {
-		return
-	}
-	cleanPath := filepath.Clean(path)
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
-	if r.writtenFiles[scopeKey] == nil {
-		r.writtenFiles[scopeKey] = make(map[string]bool)
-	}
-	r.writtenFiles[scopeKey][cleanPath] = true
 }
 
 
@@ -723,9 +558,9 @@ func (r *Registry) Schema() []tools.Tool {
 	// 初始化空列表，用于收集所有工具定义。
 	var toolsList []tools.Tool
 	// 注册 ReadFile 工具：读取文件内容。
-	if t, err := tools.NewFunc("ReadFile", "读取文件内容。path 为相对或绝对路径。建议先用 SearchInFiles/ListDir 定位再精读；同一 session 中已读过的文件会返回提示不复读；单次最多 4000 字符，需看其他段落用 SearchInFiles 精确定位。", func(ctx context.Context, in readFileInput) (string, error) {
+	if t, err := tools.NewFunc("ReadFile", "按行区间读取文件内容，输出带行号。path 为相对或绝对路径；offset 为起始行（1-based，默认 1），limit 为读取行数（默认 120，单页另受字符上限截停）。文件较大时用 offset 翻页，输出首行会给出总行数与下一页起点。建议先用 SearchInFiles/ListDir 定位再按区间精读；重读同一区间会直接返回磁盘最新内容。", func(ctx context.Context, in readFileInput) (string, error) {
 		// 通过 Dispatch 调用内部 ReadFile 工具，忽略 Dispatch 返回的 error。
-		res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": in.Path})
+		res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": in.Path, "offset": in.Offset, "limit": in.Limit})
 		// 将结果序列化为 JSON 字符串。
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
