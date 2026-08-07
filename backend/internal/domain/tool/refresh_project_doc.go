@@ -30,6 +30,7 @@ func (t *refreshProjectDocTool) Description() string {
 }
 
 // Execute 调用 project.RefreshProjectDoc 重写 managed 区，返回新正文摘要。
+// 注入的 DomainClassifier 非 nil 时调 LLM 语义命名簇；nil 走启发式（永不留空标注）。
 func (t *refreshProjectDocTool) Execute(ctx context.Context, args map[string]any) *Result {
 	if t.exec == nil {
 		return &Result{Tool: "RefreshProjectDoc", Error: "executor not configured"}
@@ -38,7 +39,8 @@ func (t *refreshProjectDocTool) Execute(ctx context.Context, args map[string]any
 	if wd == "" {
 		return &Result{Tool: "RefreshProjectDoc", Error: "workDir is empty"}
 	}
-	if err := project.RefreshProjectDoc(wd); err != nil {
+	// DomainClassifier() 为 nil 时 RefreshProjectDoc 走启发式命名（boot 兼容）。
+	if err := project.RefreshProjectDoc(ctx, wd, t.exec.DomainClassifier()); err != nil {
 		return &Result{Tool: "RefreshProjectDoc", Error: fmt.Sprintf("refresh: %v", err)}
 	}
 	body := project.LoadProjectDoc(wd)

@@ -69,6 +69,16 @@
     - 不 adopt（归档决策）：9 层固定分层（开放任务僵化）/ 纯状态机主循环（verifyloop 已示范「固定流程折叠为工具」正确用法，不推广为主循环）/ 黑板替代 mailbox（杀紧耦合协作）/ 三道安全闸门（混沌工程特有，编码无爆炸半径语义）/ 完整权重飞轮（样本稀疏）/ 无外部需求时的 A2A + AgentCard（P2 按需，仅当开放外部 Agent 接入）。
     - 开放动作：按 P0 -> P1 顺序落地；每项配单测（outcome 排序 / 心跳巡检 / slot CAS / destructive 确认事件）。
 
+18. **PROJECT.md 领域按职责 LLM 分区 + 文件变更去抖刷新 + shared 清理**（已完成,2026-08-07,迭代 v2）
+    - v1 问题（本次修）：v1 按依赖图连通分量聚类 + LLM 仅给预聚类簇命名。tower-defense 实证 hub 合并病：`index.html` 用 `<script src>` 连 6 js + css，CC 把全图并为 1 领域；但 6 js 零 import 边（纯 browser global），静态分析拆不开 -> 只出 1 领域，违反"越细越好"。且输出只列文件数未列影响目录/文件；文件增删改不自动刷新 PROJECT.md；`.bma/shared` 跨 session 堆积（agentID session 级，跨 session 不覆盖不清理）。
+    - 聚类改 LLM 按职责分区（project 包）：`DomainClassifier` 接口改 `Partition(ctx, root, files) ([]DomainPartition, error)`（替旧 `Classify`）。`llmDomainClassifier.Partition`（bootstrap/domain_classifier.go）读各文件首 4096 字节样本，调 `ModelFactory.CallLightweightWithRetry` + `ParsePartitionJSON`，要求按职责/实体分组返 `[{name,purpose,files}]`（同职责跨文件夹亦同域，越细越好，每文件恰好归一域）。文件数超 `maxPartitionFiles=200` 返 nil 走启发式兜底。`scanDomains(ctx,root,cls)`：cls 非 nil 走 LLM 分区，未覆盖文件 + LLM 失败/空走 `clusterByDeps`（v1 依赖图）+ `heuristicName` 兜底补齐，不丢文件；cls nil 走启发式。**永不留空标注**。
+    - 输出列影响目录+文件：`domainInfo` 加 `Files`/`Dirs`；`scanProject` 每域输出 `影响目录: ...` + `影响文件 (N):` 列表（>50 显前 20 + `...(+N more)`）+ 语言/入口。`EnsureProjectDoc` 签名改 `(ctx, workDir, cls)`；boot 首生成用 LLM（cls 经 `ReactService.SetDomainClassifier` 注入 session store），后续幂等跳过。
+    - 文件变更去抖刷新（tool 包）：新 `project_refresh.go` `projectRefresher`（`sync.Mutex`+`time.Timer`，delay 3s）。`Registry.refresher` 在 `NewBuiltinRegistry` 初始化，refresh 闭包调 `project.RefreshProjectDoc(ctx, wd, exec.DomainClassifier())`。`Dispatch` WriteFile 成功 + RunCommand 命中删改类命令（`commandAffectsFiles`：rm/mv/mkdir/touch/cp + git rm/git mv）触发 `scheduleProjectRefresh`。去抖：连续写仅安静期触发一次 LLM 重分区；背景 ctx 不阻 WriteFile，错误仅 log。
+    - shared session 清理：`FileSharedMemoryStore.Clear(ctx)` 删 root 下所有 .md。`ReactService.SetSharedMemoryStore` 鸭子断言 `interface{ Clear(ctx) error }`，桥接闭包到 `reactSessionStore.setSharedMemoryReset`；`createSession` 启动时先清 .bma/shared 旧 session 残留（spec/file_tree 不跨 session 复用，丢历史无损失）。
+    - 验证：`go build/vet/test ./...` 全绿。新增 `TestDomainClassifier_PartitionByResponsibility`（5 域拆分+文件列表）/`TestEnsureProjectDoc_LLMClassifierUsed`/`TestProjectRefresher_Debounce`/`TestProjectRefresher_LastWorkDirWins`/`TestProjectRefresher_EmptyWorkDirNoop`/`TestCommandAffectsFiles`/`TestFileSharedMemoryStore_Clear`。v1 测试改 fakeClassifier 实现 Partition + 断言 `影响文件 (N):`。
+    - 开放动作：真 PG+模型端到端验收 tower-defense（删 .bma/PROJECT.md + shared，跑 session 期多域 + 各域影响文件 + WriteFile 后自动刷新）；并发 session shared 互清风险（TUI 单 session 主路径，server 多并发需按 sessionID 前缀保留）；更多语言样本解析（Java/C#/Ruby）；LLM 分区 prompt 调参（簇粒度/命名质量）。
+    - v1 残留（保留作 nil-cls 兜底）：`clusterByDeps`/`heuristicName`/`makeCluster`/`enumerateNodes`/`extractEdges`/`domainPurpose`/`entryCandidates` 全保留，dep 解析器（HTML/JS/Go/Python/CSS）沿用。
+
 
 ## 已完成（已归档到 git 历史）
 

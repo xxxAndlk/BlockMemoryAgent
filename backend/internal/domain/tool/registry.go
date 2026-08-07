@@ -10,6 +10,7 @@ import (
 	"sync"          // sync 提供互斥锁保护并发状态
 
 	"github.com/blockmemory/agent/backend/internal/config" // config 包提供 Agent 阈值配置
+	"github.com/blockmemory/agent/backend/internal/project" // project 包提供 DomainClassifier 接口
 	"github.com/go-kratos/blades/tools"                    // blades tools 包提供对外暴露的工具定义
 )
 
@@ -133,6 +134,9 @@ type Registry struct {
 	// sharedMemory 是 WriteSharedMemory 工具的 KV 后端，由 bootstrap 注入。
 	// 为 nil 时 WriteSharedMemory 注册但不生效，调用返回 store 未配置错误。
 	sharedMemory SharedMemoryStore
+	// refresher 去抖异步刷新 .bma/PROJECT.md：WriteFile/删改类 RunCommand 成功后 schedule，
+	// 安静期触发 LLM 按职责重分区，使领域影响范围随文件增删改自动更新。
+	refresher *projectRefresher
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -156,6 +160,13 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		exploreCount: make(map[string]int),
 		rereadAttempts: make(map[string]int),
 	}
+	// 去抖异步刷新 PROJECT.md：文件增删改后安静期触发 LLM 按职责重分区。
+	// cls nil（测试）时 RefreshProjectDoc 走启发式，刷新仍更新文件列表。
+	r.refresher = newProjectRefresher(projectRefreshDelay, func(ctx context.Context, workDir string) {
+		if err := project.RefreshProjectDoc(ctx, workDir, r.exec.DomainClassifier()); err != nil {
+			log.Printf("project refresh failed: workDir=%s err=%v", workDir, err)
+		}
+	})
 	// 注册系统内置的默认工具列表。
 	r.registerDefaults()
 	// 注册 WriteSharedMemory 工具；store 在 SetSharedMemory 注入后生效。
@@ -231,6 +242,15 @@ func (r *Registry) SetSandboxConfig(cfg *config.SafetyConfig) {
 func (r *Registry) SetProgressCallback(cb ProgressCallback) {
 	// 直接覆盖注册表中的 progress 字段。
 	r.progress = cb
+}
+
+// SetDomainClassifier 注入 LLM 领域命名器到内部 Executor，供 RefreshProjectDoc 工具调用。
+// bootstrap 在构造 ModelFactory 后调用；nil 时 RefreshProjectDoc 走启发式命名。
+func (r *Registry) SetDomainClassifier(cls project.DomainClassifier) {
+	if r == nil || r.exec == nil {
+		return
+	}
+	r.exec.SetDomainClassifier(cls)
 }
 
 // SetSharedMemory 注入 WriteSharedMemory 与 WriteSpec 工具共享的 KV 后端。
@@ -345,6 +365,16 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		r.invalidateSharedMemoryForPath(ctx, result.Path)
 		r.clearReadHistoryForPath(ctx, result.Path)
 		r.recordWrittenFile(ctx, result.Path)
+		// 文件新增/修改触发去抖刷新 PROJECT.md 领域影响范围（安静期一次 LLM 重分区）。
+		r.scheduleProjectRefresh()
+	}
+
+	// RunCommand 命中删改类命令（rm/mv/mkdir/touch/cp/git rm/git mv）触发去抖刷新，
+	// 使文件删除/移动后领域范围同步更新。best-effort，漏匹配滞后到下次显式 RefreshProjectDoc。
+	if name == "RunCommand" && result.Success {
+		if cmd, _ := args["command"].(string); commandAffectsFiles(cmd) {
+			r.scheduleProjectRefresh()
+		}
 	}
 
 	// 填充结果的通用字段，如 SessionID、ArgsJSON 以及执行器回调。
@@ -369,6 +399,15 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	r.emitResult(ctx, result)
 	// 返回执行结果和错误（工具内部错误已封装在 result 中，此处 error 通常为 nil）。
 	return result, nil
+}
+
+// scheduleProjectRefresh 去抖调度一次 PROJECT.md 刷新（文件增删改后调用）。
+// workDir 取 Executor 权威值；refresher 未初始化（测试 Registry）时无操作。
+func (r *Registry) scheduleProjectRefresh() {
+	if r == nil || r.refresher == nil {
+		return
+	}
+	r.refresher.schedule(r.exec.WorkDir())
 }
 
 // invalidateSharedMemoryForPath 遍历共享记忆，删除引用指定 path 的 entry（Layer 2 缓存一致性）。

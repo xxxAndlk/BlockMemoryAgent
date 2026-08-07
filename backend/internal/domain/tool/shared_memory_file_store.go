@@ -118,6 +118,33 @@ func (s *FileSharedMemoryStore) Keys(ctx context.Context) []string {
 	return keys
 }
 
+// Clear 删除 root 下所有 MD 文件，幂等。供新 session 启动清理旧 session 残留
+//（spec/file_tree 不跨 session 复用，丢历史无损失）。非 file-store 后端不实现此方法。
+func (s *FileSharedMemoryStore) Clear(ctx context.Context) error {
+	if s == nil {
+		return fmt.Errorf("file shared memory store not initialized")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read shared dir: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.root, e.Name())); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s: %w", e.Name(), err)
+		}
+	}
+	return nil
+}
+
 // filePath 返回 key 对应的绝对文件路径。
 func (s *FileSharedMemoryStore) filePath(key string) string {
 	return filepath.Join(s.root, sanitizeKey(key)+".md")

@@ -169,3 +169,31 @@ func TestFileSharedMemoryStore_DeleteMissingIdempotent(t *testing.T) {
 		t.Fatalf("Delete missing should be idempotent, got: %v", err)
 	}
 }
+
+// TestFileSharedMemoryStore_Clear 验证 Clear 删全部 MD 文件，供 session 启动清理旧残留。
+func TestFileSharedMemoryStore_Clear(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFileSharedMemoryStore(dir)
+
+	ctx := context.Background()
+	for _, k := range []string{"session-1:spec", "session-1:file_tree", "session-1:shared"} {
+		if err := s.Set(ctx, k, "v"); err != nil {
+			t.Fatalf("Set %s: %v", k, err)
+		}
+	}
+	if len(s.Keys(ctx)) != 3 {
+		t.Fatalf("expected 3 keys before Clear, got %d", len(s.Keys(ctx)))
+	}
+
+	if err := s.Clear(ctx); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	if keys := s.Keys(ctx); len(keys) != 0 {
+		t.Fatalf("expected 0 keys after Clear, got %d: %v", len(keys), keys)
+	}
+
+	// Clear 空目录幂等。
+	if err := s.Clear(ctx); err != nil {
+		t.Fatalf("Clear empty should be idempotent, got: %v", err)
+	}
+}

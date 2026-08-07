@@ -206,6 +206,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
 	// Executor 永远跑 DefaultSandboxConfig（默认禁写工作目录外、保留命令黑名单）。
 	toolRegistry.SetSandboxConfig(&cfg.Agent.SafetyConfig)
+	// 注入 LLM 领域分区器：RefreshProjectDoc 工具（MetaAgent 侧）与 EnsureProjectDoc（首 session）
+	// 均调轻量模型读文件样本按职责/实体分区（如"游戏运行时""炮塔实体"）；失败/超限回退启发式依赖图兜底，永不留空标注。
+	cls := &llmDomainClassifier{factory: modelFactory}
+	toolRegistry.SetDomainClassifier(cls)
 	memoryPipeline := memory.NewPipeline(memory.NewPostgresEventStore(pgStore.DB())).
 		WithSummarizer(newEventSummarizer(modelFactory)).
 		WithCompression(cfg.Agent.SummarizeEvery, cfg.Agent.SummarizeKeepRecent) // 记忆流水线
@@ -331,6 +335,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 串联权威 workDir：bootstrap 持有的 os.Getwd() 结果注入 session store，
 	// 消除 newReactSessionStore 内不再自取 cwd 的双源漂移。
 	agentSvc.SetWorkDir(workDir)
+	// 注入 LLM 领域分区器：首 session 缺失 PROJECT.md 时 EnsureProjectDoc 调 cls.Partition
+	// 读文件按职责分区生成；后续 session 幂等跳过（文件已存在）。
+	agentSvc.SetDomainClassifier(cls)
 	agentSvc.SetLogger(sessionLogger)
 	agentSvc.SetRuntimeConfig(reactCfg)
 	// 注入 Agent 树持久化层：Register/Finish/Cancel 后 best-effort 写入 PG,

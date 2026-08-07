@@ -7,6 +7,7 @@ import (
 	"time"     // 时间类型与常量，用于设置执行超时
 
 	"github.com/blockmemory/agent/backend/internal/config" // 项目配置包，注入 Agent 阈值配置
+	"github.com/blockmemory/agent/backend/internal/project"
 )
 
 // Callback 是工具执行完成后的回调函数类型。
@@ -20,8 +21,9 @@ type Executor struct {
 	timeout  time.Duration       // 默认执行超时时间
 	sandbox  SandboxConfig       // 沙箱配置，控制允许/禁止的行为
 	guards   *GuardRegistry      // Guard 注册表，用于拦截危险的写操作或命令
-	agentCfg *config.AgentConfig // Agent 阈值配置，控制资源使用上限
-	callback Callback            // 执行完成后的回调函数
+	agentCfg        *config.AgentConfig // Agent 阈值配置，控制资源使用上限
+	callback        Callback            // 执行完成后的回调函数
+	domainClassifier project.DomainClassifier // LLM 领域命名器，供 RefreshProjectDoc 工具调用；nil 走启发式
 }
 
 // NewExecutor 创建一个新的 Executor 实例。
@@ -96,6 +98,17 @@ func (e *Executor) ensureGuardDefaults() {
 func (e *Executor) SetAgentConfig(cfg *config.AgentConfig) {
 	// 直接保存配置引用，后续 agentConfig() 会优先返回该配置
 	e.agentCfg = cfg
+}
+
+// SetDomainClassifier 注入 LLM 领域命名器，供 RefreshProjectDoc 工具调用。
+// nil 时 RefreshProjectDoc 走启发式命名（boot 路径兼容）。
+func (e *Executor) SetDomainClassifier(cls project.DomainClassifier) {
+	e.domainClassifier = cls
+}
+
+// DomainClassifier 返回注入的领域命名器（可能为 nil）。
+func (e *Executor) DomainClassifier() project.DomainClassifier {
+	return e.domainClassifier
 }
 
 // agentConfig 返回非空的 Agent 阈值配置。

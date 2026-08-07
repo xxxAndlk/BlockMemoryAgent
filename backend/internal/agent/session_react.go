@@ -102,6 +102,12 @@ type reactSessionStore struct {
 	metrics *metricsCollector
 	// log 是结构化日志器，由 setLogger 注入；nil 时回退标准库 log，保持旧行为。
 	log *logger.Logger
+	// domainClassifier 是 LLM 领域分区器，供 EnsureProjectDoc 首生成 PROJECT.md 时按职责分区。
+	// nil（测试）走启发式依赖图兜底。由 bootstrap 经 ReactService.SetDomainClassifier 注入。
+	domainClassifier project.DomainClassifier
+	// sharedMemoryReset 在新 session 启动时调用，清理 .bma/shared 下旧 session 残留文件
+	//（spec/file_tree 不跨 session 复用）。由 bootstrap 经 ReactService.SetSharedMemoryStore 桥接注入。
+	sharedMemoryReset func()
 }
 
 // newReactSessionStore 创建一个新的 reactSessionStore 实例。
@@ -146,6 +152,16 @@ func (st *reactSessionStore) setModelFactory(mf *model.ModelFactory) {
 // l: 已初始化的 Logger 指针；未注入时回退标准库 log（级别固定 INFO）。
 func (st *reactSessionStore) setLogger(l *logger.Logger) {
 	st.log = l
+}
+
+// setDomainClassifier 注入 LLM 领域分区器，供 EnsureProjectDoc 首生成按职责分区。
+func (st *reactSessionStore) setDomainClassifier(cls project.DomainClassifier) {
+	st.domainClassifier = cls
+}
+
+// setSharedMemoryReset 注入 session 启动时的 shared 清理闭包（清 .bma/shared 旧 session 残留）。
+func (st *reactSessionStore) setSharedMemoryReset(fn func()) {
+	st.sharedMemoryReset = fn
 }
 
 // logger 返回注入的结构化日志器；未注入时返回 nil。
@@ -207,9 +223,15 @@ func (st *reactSessionStore) createSession(goal string) *reactInternalSession {
 	st.sessions[sessionID] = session
 	st.mu.Unlock()
 
-	// 首个 session 启动时确保 workDir 下存在 .bma/PROJECT.md（缺失则启发式生成）。
+	// 新 session 启动时清理 .bma/shared 下旧 session 残留文件（spec/file_tree 不跨 session 复用）。
+	// 失败静默：仅影响共享记忆初态，旧文件留存由 Layer 3 mtime 校验兜底，不阻断会话。
+	if st.sharedMemoryReset != nil {
+		st.sharedMemoryReset()
+	}
+
+	// 首个 session 启动时确保 workDir 下存在 .bma/PROJECT.md（缺失则按职责分区生成）。
 	// 失败仅记录日志，不阻断会话：PROJECT.md 是辅助上下文，缺失时系统提示词略去项目概览段。
-	if err := project.EnsureProjectDoc(st.workDir); err != nil {
+	if err := project.EnsureProjectDoc(context.Background(), st.workDir, st.domainClassifier); err != nil {
 		st.logError(context.Background(), "ensure project doc", err)
 	}
 

@@ -1,6 +1,7 @@
 package project
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,7 +35,7 @@ func writeTestProject(t *testing.T) string {
 
 func TestEnsureProjectDoc_GeneratesAndIdempotent(t *testing.T) {
 	root := writeTestProject(t)
-	if err := EnsureProjectDoc(root); err != nil {
+	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	p := ProjectDocPath(root)
@@ -67,7 +68,7 @@ func TestEnsureProjectDoc_GeneratesAndIdempotent(t *testing.T) {
 
 	// 二次调用幂等：不覆盖。
 	before, _ := os.ReadFile(p)
-	if err := EnsureProjectDoc(root); err != nil {
+	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {
 		t.Fatalf("Ensure again: %v", err)
 	}
 	after, _ := os.ReadFile(p)
@@ -78,7 +79,7 @@ func TestEnsureProjectDoc_GeneratesAndIdempotent(t *testing.T) {
 
 func TestLoadProjectDoc_ReturnsManagedBody(t *testing.T) {
 	root := writeTestProject(t)
-	if err := EnsureProjectDoc(root); err != nil {
+	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	body := LoadProjectDoc(root)
@@ -102,7 +103,7 @@ func TestLoadProjectDoc_EmptyWhenMissing(t *testing.T) {
 
 func TestRefreshProjectDoc_PreservesHumanEdits(t *testing.T) {
 	root := writeTestProject(t)
-	if err := EnsureProjectDoc(root); err != nil {
+	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	p := ProjectDocPath(root)
@@ -120,7 +121,7 @@ func TestRefreshProjectDoc_PreservesHumanEdits(t *testing.T) {
 		t.Fatalf("write build.sh: %v", err)
 	}
 
-	if err := RefreshProjectDoc(root); err != nil {
+	if err := RefreshProjectDoc(context.Background(), root, nil); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	refreshed, _ := os.ReadFile(p)
@@ -140,7 +141,7 @@ func TestRefreshProjectDoc_PreservesHumanEdits(t *testing.T) {
 func TestRefreshProjectDoc_CreatesWhenMissing(t *testing.T) {
 	root := writeTestProject(t)
 	// 不先 Ensure，直接 Refresh 应等价于生成。
-	if err := RefreshProjectDoc(root); err != nil {
+	if err := RefreshProjectDoc(context.Background(), root, nil); err != nil {
 		t.Fatalf("Refresh on missing: %v", err)
 	}
 	if _, err := os.ReadFile(ProjectDocPath(root)); err != nil {
@@ -158,7 +159,7 @@ func TestRefreshProjectDoc_NoMarkersPrepends(t *testing.T) {
 	if err := os.WriteFile(p, []byte(humanOnly), 0o644); err != nil {
 		t.Fatalf("write human-only: %v", err)
 	}
-	if err := RefreshProjectDoc(root); err != nil {
+	if err := RefreshProjectDoc(context.Background(), root, nil); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	s, _ := os.ReadFile(p)
@@ -172,5 +173,193 @@ func TestRefreshProjectDoc_NoMarkersPrepends(t *testing.T) {
 	// managed 区在前，人手内容在后。
 	if strings.Index(body, ManagedEnd) > strings.Index(body, "纯人手内容") {
 		t.Fatalf("managed block should be prepended before existing human content")
+	}
+}
+
+// fakeClassifier 注入假 LLM 分区结果，供 DomainClassifier 路径测试。
+type fakeClassifier struct {
+	parts     []DomainPartition
+	called    bool
+	callCount int
+}
+
+func (f *fakeClassifier) Partition(ctx context.Context, root string, files []string) ([]DomainPartition, error) {
+	f.called = true
+	f.callCount++
+	return f.parts, nil
+}
+
+// writeWebFixture 构造一个类 tower-defense 的最小 Web 项目：index.html 用 <script src>
+// 聚合 js/a.js + js/b.js，<link> 聚合 css/s.css。4 文件应聚成一个依赖簇。
+func writeWebFixture(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	must := func(p, c string) {
+		full := filepath.Join(root, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+		if err := os.WriteFile(full, []byte(c), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	must("index.html", `<!DOCTYPE html><html><head>
+<link rel="stylesheet" href="css/s.css">
+</head><body>
+<script src="js/a.js"></script>
+<script src="js/b.js"></script>
+</body></html>`)
+	must("js/a.js", "window.A = {};\n")
+	must("js/b.js", "window.B = {};\n")
+	must("css/s.css", "body{margin:0}\n")
+	return root
+}
+
+func TestScanDomains_DependencyGraphMergesCluster(t *testing.T) {
+	root := writeWebFixture(t)
+	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	s, _ := os.ReadFile(ProjectDocPath(root))
+	body := string(s)
+	// 4 文件应聚成一个簇（影响文件 4），而非切成 js/ css/ 多个领域。
+	if !strings.Contains(body, "- 影响文件 (4):") {
+		t.Fatalf("expected one merged cluster of 4 files, got:\n%s", body)
+	}
+	if strings.Contains(body, "待人工标注") {
+		t.Fatalf("blank label leaked:\n%s", body)
+	}
+	// 只应有一个领域标题（### `）。index.html 是入口锚点。
+	if c := strings.Count(body, "### `"); c != 1 {
+		t.Fatalf("expected 1 domain header, got %d:\n%s", c, body)
+	}
+	if !strings.Contains(body, "index.html") {
+		t.Fatalf("expected index.html anchor in body:\n%s", body)
+	}
+}
+
+func TestDomainClassifier_LLMNaming(t *testing.T) {
+	root := writeWebFixture(t)
+	cls := &fakeClassifier{parts: []DomainPartition{{Name: "游戏运行时", Purpose: "塔防游戏运行时主控", Files: []string{"index.html", "js/a.js", "js/b.js", "css/s.css"}}}}
+	if err := RefreshProjectDoc(context.Background(), root, cls); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	s, _ := os.ReadFile(ProjectDocPath(root))
+	body := string(s)
+	if !strings.Contains(body, "游戏运行时") {
+		t.Fatalf("LLM semantic name missing:\n%s", body)
+	}
+	if !strings.Contains(body, "塔防游戏运行时主控") {
+		t.Fatalf("LLM purpose missing:\n%s", body)
+	}
+	if strings.Contains(body, "待人工标注") {
+		t.Fatalf("blank label leaked:\n%s", body)
+	}
+}
+
+func TestDomainClassifier_NilFallbackNoBlank(t *testing.T) {
+	root := writeWebFixture(t)
+	if err := RefreshProjectDoc(context.Background(), root, nil); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	s, _ := os.ReadFile(ProjectDocPath(root))
+	body := string(s)
+	if strings.Contains(body, "待人工标注") {
+		t.Fatalf("nil classifier must not produce blank labels:\n%s", body)
+	}
+	// 兜底应有锚点命名（index.html）。
+	if !strings.Contains(body, "index.html") {
+		t.Fatalf("heuristic anchor missing:\n%s", body)
+	}
+}
+
+// writeTowerFixture 构造一个类 tower-defense 的最小项目：index.html 聚合 4 个 js + css。
+// js 文件零 import 边（纯 browser global），静态依赖图会把全图并成一簇；
+// 用 fakeClassifier 模拟 LLM 按职责拆成多域（游戏运行时/炮塔实体/怪物实体/配置/渲染入口）。
+func writeTowerFixture(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	must := func(p, c string) {
+		full := filepath.Join(root, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+		if err := os.WriteFile(full, []byte(c), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	must("index.html", `<!DOCTYPE html><html><head>
+<link rel="stylesheet" href="css/style.css">
+</head><body>
+<script src="js/config.js"></script>
+<script src="js/monster.js"></script>
+<script src="js/tower.js"></script>
+<script src="js/game.js"></script>
+</body></html>`)
+	must("js/config.js", "window.Config = {};\n")
+	must("js/game.js", "window.Game = {};\n")
+	must("js/tower.js", "window.Tower = {};\n")
+	must("js/monster.js", "window.Monster = {};\n")
+	must("css/style.css", "body{margin:0}\n")
+	return root
+}
+
+func TestDomainClassifier_PartitionByResponsibility(t *testing.T) {
+	root := writeTowerFixture(t)
+	cls := &fakeClassifier{parts: []DomainPartition{
+		{Name: "游戏运行时", Purpose: "主循环与调度", Files: []string{"js/game.js"}},
+		{Name: "炮塔实体", Purpose: "炮塔逻辑", Files: []string{"js/tower.js"}},
+		{Name: "怪物实体", Purpose: "怪物逻辑", Files: []string{"js/monster.js"}},
+		{Name: "配置", Purpose: "全局配置数据", Files: []string{"js/config.js"}},
+		{Name: "渲染入口", Purpose: "HTML 入口与样式", Files: []string{"index.html", "css/style.css"}},
+	}}
+	if err := RefreshProjectDoc(context.Background(), root, cls); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	s, _ := os.ReadFile(ProjectDocPath(root))
+	body := string(s)
+	// 5 个领域标题。
+	if c := strings.Count(body, "### `"); c != 5 {
+		t.Fatalf("expected 5 domain headers, got %d:\n%s", c, body)
+	}
+	for _, want := range []string{"游戏运行时", "炮塔实体", "怪物实体", "配置", "渲染入口"} {
+		if !strings.Contains(body, "### `"+want+"`") {
+			t.Fatalf("missing domain %q:\n%s", want, body)
+		}
+	}
+	// 各域列影响文件。
+	if !strings.Contains(body, "- 影响文件 (1):\n  - js/game.js") {
+		t.Fatalf("missing game.js file listing:\n%s", body)
+	}
+	if !strings.Contains(body, "  - js/tower.js") {
+		t.Fatalf("missing tower.js file listing:\n%s", body)
+	}
+	if !strings.Contains(body, "- 影响文件 (2):") {
+		t.Fatalf("missing 2-file listing for 渲染入口:\n%s", body)
+	}
+	if strings.Contains(body, "待人工标注") {
+		t.Fatalf("blank label leaked:\n%s", body)
+	}
+}
+
+func TestEnsureProjectDoc_LLMClassifierUsed(t *testing.T) {
+	root := writeTowerFixture(t)
+	cls := &fakeClassifier{parts: []DomainPartition{
+		{Name: "游戏运行时", Purpose: "主循环", Files: []string{"js/game.js"}},
+	}}
+	if err := EnsureProjectDoc(context.Background(), root, cls); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !cls.called {
+		t.Fatalf("EnsureProjectDoc with non-nil cls must call cls.Partition")
+	}
+	s, _ := os.ReadFile(ProjectDocPath(root))
+	body := string(s)
+	// LLM 覆盖 js/game.js -> 游戏运行时；其余文件走 clusterByDeps 兜底（不丢文件）。
+	if !strings.Contains(body, "游戏运行时") {
+		t.Fatalf("LLM partition name missing:\n%s", body)
+	}
+	if strings.Contains(body, "待人工标注") {
+		t.Fatalf("blank label leaked:\n%s", body)
 	}
 }

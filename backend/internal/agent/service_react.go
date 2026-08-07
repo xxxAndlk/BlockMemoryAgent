@@ -17,6 +17,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/model"
+	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	"github.com/blockmemory/agent/backend/internal/store"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
@@ -80,8 +81,23 @@ func (s *ReactService) SetTreeStore(ts orchestrator.TreeStore) {
 
 // SetSharedMemoryStore 注入共享记忆 KV,用于话题切换时写入旧话题摘要。
 // bootstrap 在创建 sharedKV 后调用。传 nil 关闭摘要写入(测试场景)。
+// 若 store 实现 Clear(ctx) error（FileSharedMemoryStore），同时桥接清理闭包到 session store，
+// 使新 session 启动时清 .bma/shared 旧 session 残留（spec/file_tree 不跨 session 复用）。
 func (s *ReactService) SetSharedMemoryStore(store tool.SharedMemoryStore) {
 	s.sharedMemoryStore = store
+	if clearer, ok := store.(interface{ Clear(context.Context) error }); ok {
+		s.store.setSharedMemoryReset(func() {
+			if err := clearer.Clear(context.Background()); err != nil {
+				s.store.logError(context.Background(), "clear shared memory on session start", err)
+			}
+		})
+	}
+}
+
+// SetDomainClassifier 注入 LLM 领域分区器，供 EnsureProjectDoc 首生成 PROJECT.md 按职责分区。
+// bootstrap 在构造 ModelFactory 后调用；nil（测试）走启发式依赖图兜底。
+func (s *ReactService) SetDomainClassifier(cls project.DomainClassifier) {
+	s.store.setDomainClassifier(cls)
 }
 
 // SetPersonaInjector 注入人格注入器(soul.Loader),使 MetaAgent 系统提示词头部带人格前缀。
