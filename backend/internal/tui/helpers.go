@@ -61,19 +61,39 @@ func (m *Model) showChatDetail() {
 	m.overlayPanel.open(item.title, strings.Split(detail, "\n"))
 }
 
+// currentRoundStart 返回会话当前轮任务的开始时间：最后一条用户消息的时间；
+// 无用户消息或消息时间缺失时回退到会话开始时间。多轮会话中用它界定"当前轮"，
+// 编排面板与计划面板据此过滤上一轮残留的终态 Agent 节点。
+func currentRoundStart(s *server.Session) time.Time {
+	if s == nil {
+		return time.Time{}
+	}
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].Role == enums.ChatRoleUser {
+			if !s.Messages[i].Timestamp.IsZero() {
+				return s.Messages[i].Timestamp
+			}
+			break
+		}
+	}
+	return s.StartedAt
+}
+
 // boardSnapshot 从权威 Agent 树（Dispatcher 维护，已持久化）构建指定会话的看板快照：
 // 每个树节点映射为一条任务，状态直接取节点的实时状态；树为空或查询失败时返回空快照。
+// 只统计当前轮任务：上一轮已终结的节点被过滤，不再稀释进度条与任务列表。
 // 注：历史上这里用 agent.Query(QueryKindBoard) 拉取看板，但后端 Query 的 switch 没有
 // board 分支，查询永远落空（default 返回空 Result），因此死查询已删除，只保留 Tree 路径
 // （与原 renderPlanPanel 的 fallback 逻辑一致）。
-func (m *Model) boardSnapshot(sessionID string) board.Snapshot {
-	if m.agent == nil || sessionID == "" {
+func (m *Model) boardSnapshot(s *server.Session) board.Snapshot {
+	if m.agent == nil || s == nil || s.ID == "" {
 		return board.Snapshot{}
 	}
-	nodes, err := m.agent.Tree(context.Background(), sessionID)
+	nodes, err := m.agent.Tree(context.Background(), s.ID)
 	if err != nil || len(nodes) == 0 {
 		return board.Snapshot{}
 	}
+	nodes = filterPrevRoundNodes(nodes, currentRoundStart(s))
 	tasks := make([]board.SubTask, 0, len(nodes))
 	for i, n := range nodes {
 		st := board.TaskInProgress
@@ -82,8 +102,11 @@ func (m *Model) boardSnapshot(sessionID string) board.Snapshot {
 			st = board.TaskDone
 		case orchestrator.StatusFailed:
 			st = board.TaskFailed
+		case orchestrator.StatusPaused:
+			// 触达 token 上限暂停（待用户"继续"）：展示为 Blocked 而非 Running。
+			st = board.TaskBlocked
 		}
-		title := "派发 " + n.Role
+		title := "派发 " + agentNodeName(n)
 		if n.Task != "" {
 			title += ": " + n.Task
 		}
@@ -109,7 +132,7 @@ func (m *Model) showPlanDetailByIndex(idx int) {
 	if s == nil {
 		return
 	}
-	snap := m.boardSnapshot(s.ID)
+	snap := m.boardSnapshot(s)
 	if len(snap.Tasks) == 0 {
 		return
 	}
@@ -178,7 +201,7 @@ func (m *Model) buildPlanLines() []string {
 	s := m.selectedSession()
 	var snap board.Snapshot
 	if s != nil {
-		snap = m.boardSnapshot(s.ID)
+		snap = m.boardSnapshot(s)
 	}
 
 	// 没有看板时（如 direct_tool），用会话目标生成最小计划视图，

@@ -84,15 +84,27 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 验收：新增横切逻辑只需实现 `Middleware[C]` 并 `Use()`，不改主循环/ Dispatch 本体代码；链式调用形态如上示例；全量测试绿 + TUI 塔防任务回归。
 
 
-20. **LoopExit 死代码修复：循环守卫真正终止 ReAct 循环**（P0，bug，2026-08-08 分析发现）
-    - 背景：三层循环守卫——连读同一文件 ×3（`tool/registry.go:296-330`）、探索预算 8 次（`:332-348`）、单工具连续失败 ×3（`:386-399`）——都试图经 `tools.ActionLoopExit` 终止 ReAct 循环，但**全项目无 `tools.NewContext` 调用方**，`tools.FromContext` 永远失败，信号被静默丢弃（`:319-321`、`:395-397`）。守卫退化为一句错误文本，提示文案承诺的"触发 LoopExit 终止任务"是空话；犯轴的 Agent 只会被逐句拒绝、循环本身永不强制退出。
-    - 执行流程：
+20. **"domain 一直读文件不写直到超时"事故根治：LoopExit 接线 + 失败打捞 + 重派继承**（P0，bug，2026-08-08 分析发现 + 当日 TUI 实证事故）
+    - 事故还原：domain 一直阅读文件不写 → 探索预算守卫（8 次）早已触发但 LoopExit 是死代码杀不死循环 → 空转每轮白烧 LLM 调用 → 有活动心跳不杀、token 预算未耗尽，只能等 `sub_agent_timeout_min: 60` 墙钟终止 → 超时只回传最后一条 assistant 文本截断 500 runes（`dispatcher.go:1280-1288`），**已读文件与结论全丢**（事实提取只在成功路径跑，`dispatcher.go:1501-1576`）→ MetaAgent 中途无感知无手段，60 分钟后自由心证细粒度重派，新 Agent 从空白上下文重新探索，浪费翻倍。
+    - 第一层：LoopExit 死代码接线（原 #20 内容，治本——空转活不过探索预算）。背景：三层循环守卫——连读同一文件 ×3（`tool/registry.go:296-330`）、探索预算 8 次（`:332-348`）、单工具连续失败 ×3（`:386-399`）——都试图经 `tools.ActionLoopExit` 终止 ReAct 循环，但**全项目无 `tools.NewContext` 调用方**，`tools.FromContext` 永远失败，信号被静默丢弃（`:319-321`、`:395-397`），守卫退化为一句错误文本。执行：
       1. 定哨兵：`tool` 包加 `var ErrLoopExit = errors.New("loop guard: force exit")`；三处守卫命中时删掉写 ctx ActionLoopExit 的旧代码，改为返回包装哨兵（`fmt.Errorf("%w: %s", ErrLoopExit, msg)`），给 LLM 看的提示文案不变。
       2. Dispatch 透传：`registry.go Dispatch` 对 `errors.Is(err, ErrLoopExit)` 的守卫错误不再吞成普通工具结果，原样上抛（Result + 非 nil error），先确认现有调用点兼容。
       3. 主循环接住：`agent/react_agent.go` 工具派发/结果收集处检测 `errors.Is(err, ErrLoopExit)` → 终止循环并带原因返回（参照 `LimitReached` 既有路径 `:498-501`；子 Agent 经 `runSubAgent` 走 Failed 语义，父 mailbox 收到"被循环守卫终止"，级联解除父等待）。
-      4. 测试：同一 ReadFile 参数 ×3 → 循环以守卫原因退出；单工具连续失败 ×3 → 退出；普通工具错误不影响循环；探索预算耗尽只拒探索类调用、不误杀 RunCommand 等验证工具（#16 已确立 RunCommand 不计预算，回归保护）。
-    - 验收：`backend/` 与 `test/` 双模块 `go test ./...` 绿；TUI 塔防回归；日志 `[tool] LoopExit`（`registry.go:317`）出现后循环确实停止。
-    - 不做：不调三层守卫阈值/语义（3 次/8 次/3 连败维持现状）；不引入 blades `tools.NewContext` 那套上下文机制（项目自跑循环，哨兵错误是最小接线）。
+    - 第二层：失败打捞（超时/被杀/守卫终止时把探索成果捞回来，重派不再从零）。
+      1. 打捞点：`runSubAgent` 的失败路径（`dispatcher.go:940-947` `formatSubAgentFailure` 调用处）与 `killStuckSubAgent`（`:283-305`）、第一层新增的守卫终止路径，与成功路径的事实提取（`:1501-1576`）并列调用。
+      2. 提取：复用 `llmFactExtractor`/`ParseFactsJSON`（bootstrap 已接 `CallLightweightWithRetry`），prompt 改为产出"已读文件清单 + 已得结论 + 卡点"打捞摘要；轻量调用 5s 超时、失败回退末条文本截断，不阻塞主失败流程。
+      3. 去向一：打捞摘要追加进父 mailbox 失败消息（`formatSubAgentFailure` 文本后），MetaAgent 立即可见。
+      4. 去向二：写入共享记忆 slot（FileSharedMemoryStore，key = `<parentID>:salvage:<domain>`），后续同域派发经 `buildSharedPrefix`（`dispatcher.go:1343-1427`）自动注入新 Agent 上下文。
+      5. 与 #17 P0 关系：打捞**不进块记忆召回**（等 #17 P0 的 `outcome` 字段落地后再沉淀，避免失败记忆与成功记忆同权召回误导）；本期只走 mailbox + shared slot 两路。
+    - 第三层：同域重派自动带前序摘要（不依赖 MetaAgent 的记性，机制上保证不重复探索）。
+      1. `call_sub_agent` 校验段（`:818-824` 同域去重 `findPendingDomainSibling` 旁）查权威树快照：同父同 domain 存在 Failed/Cancelled 兄弟 → 取其打捞摘要（读第二层写的 shared slot）追加到新任务文本末尾，前缀 `【前序探索摘要】`。
+      2. 无前序兄弟 / 摘要为空 → 零行为变化；摘要截断（≤2000 runes，与任务文本上限同口径）。
+    - 测试：
+      1. 第一层：同一 ReadFile 参数 ×3 → 循环以守卫原因退出；单工具连续失败 ×3 → 退出；普通工具错误不影响循环；探索预算耗尽只拒探索类调用、不误杀 RunCommand（#16 回归保护）。
+      2. 第二层：失败/超时/守卫终止三路径都触发打捞；轻量提取失败回退截断文本不阻塞；mailbox 失败消息含打捞摘要；shared slot `<parentID>:salvage:<domain>` 可读。
+      3. 第三层：同域重派任务文本含 `【前序探索摘要】`；无失败兄弟时任务文本零变化。
+    - 验收：`backend/` 与 `test/` 双模块 `go test ./...` 绿；TUI 重现场景——人为让 domain 空转，探索预算耗尽即分钟级终止（不再等 60min），父收到含打捞摘要的失败消息，重派 Agent 任务文本带前序摘要。
+    - 不做：不调三层守卫阈值/语义（3 次/8 次/3 连败维持现状）；不引入 blades `tools.NewContext` 机制；不做 MetaAgent 中途干预（#25 的 cancel_agent 覆盖，本项落地后空转活不到需要干预）；打捞不进块记忆召回（等 #17 P0 outcome 字段）；不改 `sub_agent_timeout_min` 配置。
 
 21. **验收闭环：verifyloop 默认启用 + 按 spec 验收标准验收**（P0；吸收 #2 phase 2 与 #16 相关开放动作）
     - 背景：`verify_and_fix` + verifyloop 状态机（PlanConfirm→Review→SelfTest→UnifiedTest→Fix，≤5 轮，`verifyloop/orchestrator.go:202-325`）代码完整，但 `config/config.yaml:72-73` 两个 self_test 开关 false → `bootstrap.go:290-291` 不注册工具。当前 MetaAgent 只能盲信子 Agent 自述完成，唯一证据是 FilesModified 列表。隐患：`bootstrap.go:327` `ReviewEnabled == nil || *ReviewEnabled` 在 nil 时启用 reviewer，靠 applyDefaults 兜底掩盖。
@@ -161,6 +173,31 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
       6. legacy 清理：`agent_private_memory`/`agent_snapshots` 疑似 legacy 表（`schema.go:190-211`）、`max_blocks`/`summary_interval` 字段（`pkg/config/role_config.go:40-46`）——确认无消费方后删除或标注。
     - 验收：roles.yaml 改动跑 `test/` 的 role_config_sanity_test.go；双模块测试绿；无行为回归。
     - 不做：本项不加任何新功能。
+
+27. **外部知识库检索层：唤醒 retriever 抽象 + 混合检索 + 接编排热路径**（P2，2026-08-08）
+    - 背景：接口抽象已存在但 dormant——`internal/retriever/global_kb.go`（VectorDB/Embedder/MetaStore 三接口 + `GlobalKnowledgeRetriever`）与 `store.KnowledgeStore`（PG+pgvector 全局知识表）是现成底座，当前只服务块记忆（内部记忆）写读；扩展设计 §11 的 LLM wiki 决策「不上向量库」指 wiki 文件层本身，且 `embed`/`retriever` 本就留作 §11.1 触发器储备。缺的是**面向外部预置知识（只读为主、与块记忆分层）的检索通路**：无摄入 pipeline、无全文/混合检索（纯向量 + pseudo embed，见 #26-5）、编排热路径无消费方（#19 的 `RAG()` 中间件只有块记忆数据源，无 search_knowledge 工具）。
+    - 执行流程：
+      1. 存储隔离：复用 knowledge 表加 `namespace`/`source` 字段（或独立 external chunks 表，取简）区分外部知识与块记忆；migrations 加迁移。
+      2. 摄入：离线/管理态 ingestion（文档切块 → embed → 写库），先支持本地 Markdown/文本目录批量导入（`wiki/` 页可作来源之一），不做文档解析平台。
+      3. 检索升级：真实 embed provider（OpenAI 兼容 API，复用 roles.yaml embed 段配置模式，知识库路径弃用 pseudo）；PG `tsvector` 全文检索（中文 zhparser/pg_jieba 分词）+ pgvector（索引换 hnsw，`config.yaml pgvector.index_type` 已预留）RRF 混合；rerank（bge 类）列可选后置。
+      4. 热路径接线（先落地一条，另一条列开放动作）：a 注册 `search_knowledge` 工具进 meta/domain 白名单（显式按需检索，与 ReadFile 读 wiki 页互补）；b 作为 #19 LLM 链 `RAG()` 中间件的第二数据源（自动注入，带 token 上限与截断）。编排层只依赖 `retriever` 接口，不碰 PG 实现。
+    - 测试：`retriever` 接口 mock 注入编排层不依赖 PG；ingestion → 检索命中集成测试（沿用现有真 PG 测试范式）；RRF 融合排序纯函数单测。
+    - 验收：导入一批领域文档后，Agent 经工具或 RAG() 链路命中外部知识片段并在终答体现；双模块 `go test ./...` 绿。
+    - 不做：不做知识图谱/实体抽取（需要显式结构时评估 LightRAG 作为 retriever 另一实现，列开放动作）；不推翻 §11 wiki 决策（wiki 渐进披露保留，向量检索是补充不是替代）；不接 RAGFlow/Dify 等平台（需要时同为 retriever 实现选项）；不动块记忆 pseudo 召回（归 #26-5）。
+    - 开放动作：LightRAG 评估；rerank 接线；web 端知识库管理页；`search_knowledge` 与 `RAG()` 双通路中未先落地的一条。
+
+28. **用户画像层：记忆体系第四层（外部知识库/块记忆/wiki 之外补「人」）**（P2，2026-08-08）
+    - 背景：现有三层记忆的主体都是「事/知识」——外部知识库（#27，预置参考）、块记忆（任务经验流）、LLM wiki（§11 策展沉淀）——缺主体为「人」的画像层：MetaAgent 对用户偏好（沟通风格/技术栈/确认频率/任务拆解粒度）零感知，每轮会话从零对待用户。伏笔已有：§11.2 引 TencentDB Agent Memory 四层管道 L3 即用户画像；`soul.md` 的 `agent.PersonaInjector`（#7）已验证 system prompt 注入机制可复用。
+    - 与既有层关系（防重合）：画像不进向量库、不作检索语料（小体量结构化偏好，非知识条目）；不写 wiki（非项目知识）；不写块记忆（非任务经验）。四层各司其职：图书馆 / 工作日志 / 策展笔记 / 用户档案。
+    - 执行流程：
+      1. 存储：单文件 `config/user_profile.md`（与 `soul.md` 对称），结构化小节（偏好/技术栈/沟通风格/反馈记录），人可直接编辑、git 可追踪。
+      2. 注入：复用 `PersonaInjector` 模式加 UserProfileInjector（或扩展 soul 注入为「人格 + 画像」两段），只注入 MetaAgent system prompt（带 token 上限截断）；**不下发子 Agent**——干活 Agent 无需感知用户，防上下文膨胀与偏好泄露。
+      3. 写入双路：a 用户显式陈述（「记住我偏好 X」）立即写入，不等管道；b 话题结束/会话完成时轻量模型扫对话提取偏好增量（复用 `llmFactExtractor`/`ParseFactsJSON` 模式），自动写入带可审计记录（追加 log 段或 log.md）。
+      4. 可纠正：HTTP API + TUI `/profile` 查看编辑；画像错误必须可由用户一键修正，防 LLM 猜错自我固化。
+      5. 测试：注入点断言（meta prompt 含画像段、子 Agent prompt 不含）；提取失败回退零副作用；显式写入立即生效。
+    - 验收：两轮会话实证——第一轮用户表达偏好（如「直接改别问」），第二轮 MetaAgent 行为体现（减少确认）；双模块 `go test ./...` 绿。
+    - 不做：不做多用户/ACL（当前单用户，§11.1 触发器命中再议）；不做隐式行为追踪统计（只从对话内容提取）；画像不参与向量召回排序。
+    - 开放动作：web 端画像页；与 #24 ask_user 联动（画像不确定时主动问）。
 
 
 ## 已完成（已归档到 git 历史）

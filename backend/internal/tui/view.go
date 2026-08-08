@@ -187,7 +187,7 @@ func (m Model) renderPlanPanel(w, h int) string {
 	s := m.selectedSession()
 	var snap board.Snapshot
 	if s != nil {
-		snap = m.boardSnapshot(s.ID)
+		snap = m.boardSnapshot(s)
 	}
 
 	// 没有看板时（如 direct_tool 会话、Agent 树为空），用当前轮任务生成一个最小计划视图，
@@ -487,7 +487,7 @@ func (m Model) renderPlanBar(w int) string {
 	var toolLabel string
 	if s := m.selectedSession(); s != nil {
 		toolLabel = lastToolLabel(s)
-		snap = m.boardSnapshot(s.ID)
+		snap = m.boardSnapshot(s)
 	}
 	line := formatPlanBar(m.styles, snap, toolLabel)
 	return lipgloss.NewStyle().Width(w).Height(1).Render(line)

@@ -36,6 +36,16 @@ func TestOrchestratorNodesToTreeNodes_Depth(t *testing.T) {
 	if out[2].depth != 1 || out[2].status != enums.RoleStatusError {
 		t.Errorf("ui_assistant-3: depth=%d status=%v", out[2].depth, out[2].status)
 	}
+	// 展示名：domain 角色用 Domain 拼"XX领域"，固定助手用中文角色名
+	if out[0].name != "认证领域" {
+		t.Errorf("domain 节点展示名应为 认证领域, got %q", out[0].name)
+	}
+	if out[1].name != "代码助手" {
+		t.Errorf("code_assistant 展示名应为 代码助手, got %q", out[1].name)
+	}
+	if out[2].name != "UI助手" {
+		t.Errorf("ui_assistant 展示名应为 UI助手, got %q", out[2].name)
+	}
 	// instID 与 goal 透传
 	if out[1].instID != "session-1/domain-1/code_assistant-2" || out[1].goal != "写登录" {
 		t.Errorf("instID/goal 透传错误: instID=%q goal=%q", out[1].instID, out[1].goal)

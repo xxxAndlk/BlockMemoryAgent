@@ -45,30 +45,52 @@ func TestAgentTreePrefix(t *testing.T) {
 	}
 }
 
-// TestBuildAgentCardRendersStatusAndGoal 验证 Agent 卡片能正确渲染名称、状态文本与目标。
-func TestBuildAgentCardRendersStatusAndGoal(t *testing.T) {
+// TestBuildAgentCardRendersNameAndStatus 验证子 Agent 卡片简洁渲染：仅名称与运行状态，
+// 不再展示目标/时间等额外信息（完整详情在 [A] 编排弹窗中查看）。
+func TestBuildAgentCardRendersNameAndStatus(t *testing.T) {
 	m := &Model{
 		styles:         NewStyles(),
 		taskBriefCache: NewTaskBriefCache(),
 	}
-	// 构造一个已完成、带目标的 UI 领域 Agent 节点。
+	// 构造一个已完成、带目标的领域 Agent 节点。
 	node := agentTreeNode{
 		depth:     1,
-		name:      "UI",
+		name:      "游戏渲染领域",
 		roleType:  enums.RoleTypeDomain,
 		status:    enums.RoleStatusDone,
 		goal:      "设计后台前端页面",
 		createdAt: time.Now(),
 	}
 	card := m.buildAgentCard(node, 40)
-	if !strings.Contains(card, "UI") {
-		t.Errorf("card missing agent name UI:\n%s", card)
+	if !strings.Contains(card, "游戏渲染领域") {
+		t.Errorf("card missing agent name:\n%s", card)
 	}
 	if !strings.Contains(card, "Done") {
 		t.Errorf("card missing status Done:\n%s", card)
 	}
-	if !strings.Contains(card, "设计后台前端页面") {
-		t.Errorf("card missing goal:\n%s", card)
+	// 简洁展示：目标不再出现在卡片上。
+	if strings.Contains(card, "设计后台前端页面") {
+		t.Errorf("card 不应再展示目标详情:\n%s", card)
+	}
+}
+
+// TestBuildMetaCardRendersNameOnly 验证 MetaAgent 卡片只写名称，不带任何额外信息。
+func TestBuildMetaCardRendersNameOnly(t *testing.T) {
+	m := &Model{styles: NewStyles()}
+	node := agentTreeNode{
+		depth:    0,
+		name:     "MetaAgent",
+		roleType: enums.RoleTypeMeta,
+		role:     "Orchestrator",
+		status:   enums.RoleStatusActive,
+		goal:     "做一个塔防游戏",
+	}
+	card := m.buildMetaCard(node)
+	if !strings.Contains(card, "MetaAgent") {
+		t.Errorf("meta card missing name:\n%s", card)
+	}
+	if strings.Contains(card, "Orchestrator") || strings.Contains(card, "塔防") || strings.Contains(card, "Running") {
+		t.Errorf("meta card 不应展示角色/目标/状态文本:\n%s", card)
 	}
 }
 
