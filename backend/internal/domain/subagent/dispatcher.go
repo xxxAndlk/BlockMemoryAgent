@@ -299,7 +299,7 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
 	meta.cancel()
 	meta.doneOnce.Do(func() { d.trackChildDone(meta.parentID) })
 	d.notify(meta.parentID, subAgentID,
-		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, d.heartbeatTimeout))
+		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, d.heartbeatTimeout), nil)
 	if d.treeFn != nil && meta.sessionID != "" {
 		if t := d.treeFn(meta.sessionID); t != nil {
 			t.Finish(subAgentID, "心跳超时疑似卡死", errors.New("heartbeat timeout"))
@@ -931,6 +931,8 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 // 调用方不应 trackChildDone(保持父未决计数 >0 触发 MetaAgent 暂停)。
 func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string, started time.Time) bool {
 	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
+	// Layer 5：从子 Agent 历史扫 WriteFile 调用收集修改文件，随完成通知回灌父 LLM。
+	files := agent.FilesModifiedFromHistory(result.History)
 	duration := time.Since(started)
 	if errors.Is(err, errPaused) {
 		// DomainAgent 暂停:history 已存,tree 已 Pause。不 notify、不 treeFinish、不 trackChildDone。
@@ -942,7 +944,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		partial := result.Text
 		log.Printf("[subagent] PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
 		d.treeFinish(ctx, subAgentID, "部分完成: "+partial, nil)
-		d.notify(parentID, subAgentID, "子 Agent 已达 token 上限,返回部分完成。\n"+partial)
+		d.notify(parentID, subAgentID, "子 Agent 已达 token 上限,返回部分完成。\n"+partial, files)
 		return false
 	}
 	if err != nil {
@@ -952,7 +954,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		}
 		log.Printf("[subagent] FAIL: sub=%s role=%s duration=%s err=%v partial=%q", subAgentID, roleDef.ID, duration, err, truncateRunes(partial, 200))
 		d.treeFinish(ctx, subAgentID, partial, err)
-		d.notify(parentID, subAgentID, formatSubAgentFailure(err, result, d.timeout, partial))
+		d.notify(parentID, subAgentID, formatSubAgentFailure(err, result, d.timeout, partial), files)
 		return false
 	}
 
@@ -965,7 +967,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	d.activity.Delete(subAgentID)
 	summary := d.autoVerify(ctx, parentID, subAgentID, roleDef.ID, task, result.Text)
 	d.treeFinish(ctx, subAgentID, summary, nil)
-	d.notify(parentID, subAgentID, summary)
+	d.notify(parentID, subAgentID, result.Text, files)
 	return false
 }
 
@@ -1277,11 +1279,12 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 
 	log.Printf("[subagent] resume: sub=%s parent=%s domain=%s msgs=%d", pausedNodeID, parentID, pausedNode.Domain, len(msgs))
 	result, err := sub.RunWithHistory(subCtx, "继续", msgs)
+	files := agent.FilesModifiedFromHistory(result.History)
 	if err != nil {
 		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 		log.Printf("[subagent] resume FAIL: sub=%s err=%v", pausedNodeID, err)
 		d.treeFinish(subCtx, pausedNodeID, partial, err)
-		d.notify(parentID, pausedNodeID, formatSubAgentFailure(err, result, d.timeout, partial))
+		d.notify(parentID, pausedNodeID, formatSubAgentFailure(err, result, d.timeout, partial), files)
 		d.trackChildDone(parentID)
 		return result, err
 	}
@@ -1296,7 +1299,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 
 	log.Printf("[subagent] resume DONE: sub=%s result_len=%d", pausedNodeID, len(result.Text))
 	d.treeFinish(subCtx, pausedNodeID, result.Text, nil)
-	d.notify(parentID, pausedNodeID, result.Text)
+	d.notify(parentID, pausedNodeID, result.Text, files)
 	d.trackChildDone(parentID)
 	return result, nil
 }
@@ -1678,18 +1681,21 @@ func truncateRunes(s string, n int) string {
 }
 
 // notify 向父 Agent 邮箱发送一条子 Agent 完成或失败的通知消息。
-func (d *Dispatcher) notify(parentID, subAgentID, summary string) {
+// filesModified 为子 Agent 本次修改的文件路径列表（Layer 5，从 result.History 扫 WriteFile 得来），
+// 父 drainMailbox 时展示给父 LLM；无修改文件时传 nil。
+func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified []string) {
 	// 若未配置邮箱，直接返回，避免 nil 指针 panic。
 	if d.mailbox == nil {
 		return
 	}
 	// 构造并发送消息：发件人为子 Agent，收件人为父 Agent，主题为子 Agent 完成提示，正文为摘要。
 	d.mailbox.Send(&mailbox.Message{
-		From:    subAgentID,
-		To:      parentID,
-		Type:    mailbox.MsgInfo,
-		Subject: "子 Agent 完成: " + subAgentID,
-		Body:    summary,
+		From:          subAgentID,
+		To:            parentID,
+		Type:          mailbox.MsgInfo,
+		Subject:       "子 Agent 完成: " + subAgentID,
+		Body:          summary,
+		FilesModified: filesModified,
 	})
 }
 

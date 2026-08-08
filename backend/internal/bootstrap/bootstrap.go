@@ -206,6 +206,15 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
 	// Executor 永远跑 DefaultSandboxConfig（默认禁写工作目录外、保留命令黑名单）。
 	toolRegistry.SetSandboxConfig(&cfg.Agent.SafetyConfig)
+	// 注入角色级写路径解析器（Layer 4）：roleID -> 该角色 Sandbox.AllowedWritePaths。
+	// 角色未配 sandbox.allowed_write_paths 时返 nil，enforceRoleWritePath 跳过，现有写行为不变。
+	toolRegistry.SetRoleWritePathResolver(func(roleID string) []string {
+		rd := roleRegistry.Get(roleID)
+		if rd == nil || rd.Sandbox == nil {
+			return nil
+		}
+		return rd.Sandbox.AllowedWritePaths
+	})
 	// 注入 LLM 领域分区器：RefreshProjectDoc 工具（MetaAgent 侧）与 EnsureProjectDoc（首 session）
 	// 均调轻量模型读文件样本按职责/实体分区（如"游戏运行时""炮塔实体"）；失败/超限回退启发式依赖图兜底，永不留空标注。
 	cls := &llmDomainClassifier{factory: modelFactory}

@@ -232,6 +232,16 @@ func (r *Registry) SetSandboxConfig(cfg *config.SafetyConfig) {
 	r.exec.SetSandboxConfig(sbCfg)
 }
 
+// SetRoleWritePathResolver 注入角色级写路径解析器到内部 Executor（Layer 4）。
+// bootstrap 传入闭包：roleID -> roleRegistry.Get(roleID).Sandbox.AllowedWritePaths。
+// nil 解析器或角色无 Sandbox 配置时 enforceRoleWritePath 跳过，等价于不限制。
+func (r *Registry) SetRoleWritePathResolver(fn func(roleID string) []string) {
+	if r == nil || r.exec == nil {
+		return
+	}
+	r.exec.SetRoleWritePathResolver(fn)
+}
+
 // SetProgressCallback 在构造完成后替换进度回调函数。
 // 这允许引导流程先创建注册表，随后由 agent service 注入自身回调。
 func (r *Registry) SetProgressCallback(cb ProgressCallback) {

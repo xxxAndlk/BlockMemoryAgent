@@ -57,6 +57,10 @@ type mockAgentForPlan struct {
 	goal       string
 	treeNodes  []orchestrator.Node
 	agentInsts []agent.AgentInstance
+	// messages 模拟会话聊天消息（多轮会话测试用）；为空时 Get 返回无消息会话。
+	messages []agent.Message
+	// startedAt 模拟会话开始时间；零值表示未设置。
+	startedAt time.Time
 }
 
 // CreateSession 是 mockAgentForPlan 的空实现。
@@ -97,7 +101,7 @@ func (m *mockAgentForPlan) List(ctx context.Context, filter agent.Filter) ([]*ag
 // Get 返回当前会话。
 func (m *mockAgentForPlan) Get(ctx context.Context, sessionID string) (*agent.Session, error) {
 	if sessionID == m.sessionID {
-		return &agent.Session{ID: m.sessionID, Goal: m.goal}, nil
+		return &agent.Session{ID: m.sessionID, Goal: m.goal, Messages: m.messages, StartedAt: m.startedAt}, nil
 	}
 	return nil, fmt.Errorf("not found")
 }

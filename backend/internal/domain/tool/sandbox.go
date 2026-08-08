@@ -83,6 +83,13 @@ func (e *Executor) SetSandboxConfig(cfg *SandboxConfig) {
 	}
 }
 
+// SetRoleWritePathResolver 注入角色级写路径解析器。
+// 解析器按 roleID 返回该角色的 Sandbox.AllowedWritePaths；返 nil/空切片表示该角色不限制。
+// 由 bootstrap 注入（闭包查 roleRegistry.Get(roleID).Sandbox）。nil 解析器=全局不限制（当前行为）。
+func (e *Executor) SetRoleWritePathResolver(fn func(roleID string) []string) {
+	e.roleWritePaths = fn
+}
+
 // isCommandBlocked 检查给定的命令字符串是否命中黑名单。
 // 如果命中，返回匹配到的关键字以及 true；否则返回空字符串和 false。
 func (e *Executor) isCommandBlocked(cmd string) (string, bool) {
@@ -178,6 +185,39 @@ func (e *Executor) sanitizeWritePath(absPath string) error {
 	return fmt.Errorf("path escapes sandbox: %s (allowed base: %s)", absPath, filepath.Clean(e.workDir))
 }
 
+// enforceRoleWritePath 角色级写沙箱：当 ctx 携带 roleID 且解析器为该角色返回非空
+// AllowedWritePaths 时，要求 absPath 必须落在其中一条路径（相对 workDir 解析）下。
+// roleID 为空（未注入）、解析器为 nil、或角色无 Sandbox 配置（返空）时返回 nil，等价于不限制。
+// 这是 Layer 4 的 dormant opt-in：未配置 allowed_write_paths 的角色完全跳过，现有行为不变。
+func (e *Executor) enforceRoleWritePath(ctx context.Context, absPath string) error {
+	if e.roleWritePaths == nil {
+		return nil
+	}
+	roleID := RoleIDFromContext(ctx)
+	if roleID == "" {
+		return nil
+	}
+	paths := e.roleWritePaths(roleID)
+	if len(paths) == 0 {
+		return nil
+	}
+	absPath = filepath.Clean(absPath)
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		// 相对路径以 workDir 为基解析；绝对路径原样使用。
+		resolved := p
+		if !filepath.IsAbs(p) {
+			resolved = filepath.Join(e.workDir, p)
+		}
+		if hasPathPrefix(absPath, filepath.Clean(resolved)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("role %s not allowed to write: %s (allowed paths: %v)", roleID, absPath, paths)
+}
+
 // resolvePathWithSandbox 将相对路径解析为绝对路径，并执行读取访问检查。
 // 如果路径超出沙箱范围，则返回错误。
 func (e *Executor) resolvePathWithSandbox(path string) (string, error) {
@@ -249,6 +289,23 @@ func SessionIDFromContext(ctx context.Context) string {
 		return v
 	}
 	// 未找到或类型不匹配，返回空字符串。
+	return ""
+}
+
+// roleIDKey 用于在 context 中携带当前 Agent 的角色 ID，供角色级写沙箱校验读取。
+type roleIDKey struct{}
+
+// WithRoleID 返回一个携带角色 ID 的新 context。
+// 由 ReActAgent.Run 注入（a.role.ID），经 Dispatch 流到 WriteFile 的 enforceRoleWritePath。
+func WithRoleID(ctx context.Context, roleID string) context.Context {
+	return context.WithValue(ctx, roleIDKey{}, roleID)
+}
+
+// RoleIDFromContext 从 ctx 中取出角色 ID；未设置时返回空串（如顶层 MetaAgent 未注入则跳过角色级校验）。
+func RoleIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(roleIDKey{}).(string); ok {
+		return v
+	}
 	return ""
 }
 

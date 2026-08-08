@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -49,6 +50,39 @@ func LastAssistantText(history []ReactMessage) string {
 		}
 	}
 	return ""
+}
+
+// FilesModifiedFromHistory 从 ReAct 历史中收集所有成功执行之外不可知，仅按
+// assistant 消息携带的 WriteFile 工具调用入参 path 提取，返回去重保序的路径切片。
+// 用于 Layer 5：子 Agent 完成后把修改文件清单挂到 mailbox.Message.FilesModified，
+// 父 Agent drainMailbox 时展示。空 history 或无 WriteFile 调用时返回 nil。
+// 注意：仅扫 assistant 请求的 WriteFile，未校验对应 tool 结果是否 Success（历史中
+// 失败的 WriteFile 较少且路径信息对父 Agent 仍有参考价值，保守纳入）。
+func FilesModifiedFromHistory(history []ReactMessage) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range history {
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if tc.Name != "WriteFile" {
+				continue
+			}
+			p, _ := tc.Input["path"].(string)
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			cleaned := filepath.Clean(p)
+			if seen[cleaned] {
+				continue
+			}
+			seen[cleaned] = true
+			out = append(out, cleaned)
+		}
+	}
+	return out
 }
 
 // ToolResult 表示执行一次 ToolCall 后的结果。
@@ -315,6 +349,12 @@ func WithAgentID(ctx context.Context, agentID string) context.Context {
 // 委托给 tool.AgentIDFromContext，与 WithAgentID 共享同一 key 类型。
 func AgentIDFromContext(ctx context.Context) string {
 	return tool.AgentIDFromContext(ctx)
+}
+
+// WithRoleID 返回一个携带当前角色 ID 的 context。
+// 委托给 tool.WithRoleID，供 WriteFile 的角色级写沙箱（Layer 4）读取。
+func WithRoleID(ctx context.Context, roleID string) context.Context {
+	return tool.WithRoleID(ctx, roleID)
 }
 
 // agentDisplayNameKey 用于在 context 中携带代理展示名（"MetaAgent" / "代码助手" / "领域Agent:xxx"）。

@@ -80,6 +80,10 @@ type Message struct {
 	// ThreadID 会话线程标识：同一问答链上的消息共享 ThreadID，
 	// 便于多轮验证闭环中按线程聚合请求与回复。
 	ThreadID string `json:"thread_id,omitempty"`
+	// FilesModified 子 Agent 本次运行修改的文件路径列表（Layer 5）。
+	// 由 dispatcher.notify 从子 Agent result.History 扫 WriteFile 工具调用收集，
+	// 父 drainMailbox 时展示给父 LLM，使其知晓子改了哪些文件（非 KV 失效--Layer 2 已在写时 per-path 失效）。
+	FilesModified []string `json:"files_modified,omitempty"`
 }
 
 // Mailbox 多 Agent 邮箱管理器，维护每个 Agent 的收件箱与广播桶。

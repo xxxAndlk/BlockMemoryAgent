@@ -77,15 +77,12 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 		metaStatus = enums.RoleStatusWaiting
 	}
 	// 推导 MetaAgent 目标：展示当前轮任务——取最后一条用户消息（多轮会话中反映最新任务），
-	// 没有用户消息时回退到会话 Goal；任务开始时间取该消息时间（新一轮的开始时刻）。
+	// 没有用户消息时回退到会话 Goal；当前轮开始时间取该消息时间（新一轮的开始时刻）。
+	roundStart := currentRoundStart(s)
 	metaGoal := ""
-	taskStart := s.StartedAt
 	for i := len(s.Messages) - 1; i >= 0; i-- {
 		if s.Messages[i].Role == enums.ChatRoleUser {
 			metaGoal = strings.TrimSpace(s.Messages[i].Content)
-			if !s.Messages[i].Timestamp.IsZero() {
-				taskStart = s.Messages[i].Timestamp
-			}
 			break
 		}
 	}
@@ -101,15 +98,17 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 		role:      "Orchestrator",
 		status:    metaStatus,
 		goal:      metaGoal,
-		createdAt: taskStart,
+		createdAt: roundStart,
 	})
 
 	// 读取权威 Agent 树(Dispatcher 维护,已 PG 持久化,重启后 lazy 恢复)。
 	// 替代旧事件流派生(deriveSubAgentNodes):树是单一真相源,事件流派生有竞态/遗漏。
 	// Tree() 返回 []orchestrator.Node,按启动时间升序;MetaAgent 非节点,已在上方作为根加入。
+	// 过滤上一轮已终结的节点:旧完成卡片排在最前会一直占位,把新一轮派发的 Agent
+	// 挤出可视区(实证:第二轮运行时编排面板看似不刷新,全是上一轮 Done 卡片)。
 	nodes, err := agentFacade.Tree(context.Background(), s.ID)
 	if err == nil {
-		at.nodes = append(at.nodes, orchestratorNodesToTreeNodes(nodes, s.ID)...)
+		at.nodes = append(at.nodes, orchestratorNodesToTreeNodes(filterPrevRoundNodes(nodes, roundStart), s.ID)...)
 	}
 
 	// 若会话处于待澄清状态，追加一个占位节点提示用户。
@@ -142,7 +141,7 @@ func orchestratorNodesToTreeNodes(nodes []orchestrator.Node, rootID string) []ag
 		out = append(out, agentTreeNode{
 			depth:     orchestratorNodeDepth(n, nodes, byID, rootID),
 			instID:    n.ID,
-			name:      n.Role,
+			name:      agentNodeName(n),
 			domain:    n.Domain,
 			roleType:  roleType,
 			role:      n.Role,
@@ -152,6 +151,56 @@ func orchestratorNodesToTreeNodes(nodes []orchestrator.Node, rootID string) []ag
 			err:       n.Err,
 			createdAt: n.Started,
 		})
+	}
+	return out
+}
+
+// agentNodeName 返回树节点的展示名。
+// domain 角色优先用 LLM 提供的 Domain 字段拼"XX领域"（如 游戏渲染 -> 游戏渲染领域），
+// 顾名思义，替代原来所有领域 Agent 都叫 "domain"（对话流里则是裸 ID "session-N/domain-2"）
+// 无法区分的命名；固定助手映射为 roles.yaml 里的中文角色名；其余兜底返回 Role。
+func agentNodeName(n orchestrator.Node) string {
+	role := strings.TrimSpace(n.Role)
+	if role == "domain" || strings.HasPrefix(role, "domain") {
+		// TrimSuffix 防 LLM 已填"XX领域"时拼出"XX领域领域"。
+		if d := strings.TrimSuffix(strings.TrimSpace(n.Domain), "领域"); d != "" {
+			return d + "领域"
+		}
+		return "领域Agent"
+	}
+	if name, ok := fixedRoleDisplayNames[role]; ok {
+		return name
+	}
+	return role
+}
+
+// fixedRoleDisplayNames 固定助手 role_id -> 中文展示名（与 config/roles.yaml 的 name 对齐）。
+var fixedRoleDisplayNames = map[string]string{
+	"code_assistant":  "代码助手",
+	"ui_assistant":    "UI助手",
+	"test_assistant":  "测试助手",
+	"doc_assistant":   "文档助手",
+	"code_reviewer":   "代码审查助手",
+	"prompt_reviewer": "提示词审查助手",
+}
+
+// filterPrevRoundNodes 丢弃上一轮次已终结的 Agent 节点：
+// Started 早于 roundStart 且处于终态（Done/Failed/Cancelled）的节点被过滤；
+// 仍在 Running/Paused 的节点无论起始时间都保留（跨轮未完结的工作仍可见）。
+// roundStart 为零值（无用户消息时间戳，如恢复的历史会话）时不过滤。
+func filterPrevRoundNodes(nodes []orchestrator.Node, roundStart time.Time) []orchestrator.Node {
+	if roundStart.IsZero() {
+		return nodes
+	}
+	out := make([]orchestrator.Node, 0, len(nodes))
+	for _, n := range nodes {
+		switch n.Status {
+		case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled:
+			if n.Started.Before(roundStart) {
+				continue
+			}
+		}
+		out = append(out, n)
 	}
 	return out
 }
@@ -176,7 +225,7 @@ func orchestratorNodeDepth(n orchestrator.Node, nodes []orchestrator.Node, byID 
 }
 
 // orchestratorStatusToRole 把 orchestrator.Status 映射为 TUI RoleStatus。
-// Cancelled 归入 Done(终态,非错误)。
+// Cancelled 归入 Done(终态,非错误)；Paused(触达 token 上限待恢复)归入 Waiting。
 func orchestratorStatusToRole(s orchestrator.Status) enums.RoleStatus {
 	switch s {
 	case orchestrator.StatusRunning:
@@ -187,6 +236,8 @@ func orchestratorStatusToRole(s orchestrator.Status) enums.RoleStatus {
 		return enums.RoleStatusError
 	case orchestrator.StatusCancelled:
 		return enums.RoleStatusDone
+	case orchestrator.StatusPaused:
+		return enums.RoleStatusWaiting
 	}
 	return enums.RoleStatusIdle
 }
@@ -323,8 +374,9 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	// 裁剪时优先丢图例、再丢末尾卡片行，保证 MetaAgent 始终可见。
 	var metaLines []string
 	if meta != nil {
-		metaCard := m.buildAgentCard(*meta, cardW)
-		padLeft := (innerW - cardW) / 2
+		// MetaAgent 卡片只写名称（用户要求不带目标/角色等额外信息），宽度自适应内容。
+		metaCard := m.buildMetaCard(*meta)
+		padLeft := (innerW - lipgloss.Width(metaCard)) / 2
 		if padLeft < 0 {
 			padLeft = 0
 		}
@@ -379,9 +431,29 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
 }
 
-// buildAgentCard 把单个 Agent 节点渲染为圆角边框卡片：
-// 彩色加粗名称 + 角色/领域副标题 + 状态色点文本 + 时间 + 任务描述，固定 5 行内容；
-// 终态（Done/Error）且带有结果摘要/错误信息的节点追加第 6 行结果行。
+// buildMetaCard 渲染顶部 MetaAgent 卡片：只写名称，不带角色/目标/时间等额外信息。
+// 边框颜色仍随状态变化（运行绿/错误红），宽度自适应内容，由调用方居中。
+func (m Model) buildMetaCard(node agentTreeNode) string {
+	name := lipgloss.NewStyle().Foreground(lipgloss.Color(agentRoleColor(enums.RoleTypeMeta))).Bold(true).
+		Render("MetaAgent")
+	// 运行中/错误用状态色边框突出，其余用普通暗色边框。
+	borderColor := cBlur
+	switch node.status {
+	case enums.RoleStatusActive:
+		borderColor = cStatusRun
+	case enums.RoleStatusError:
+		borderColor = cStatusErr
+	}
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(borderColor)).
+		Padding(0, 2).
+		Render(name)
+}
+
+// buildAgentCard 把子 Agent 节点渲染为紧凑的圆角边框卡片，固定 2 行内容：
+// 彩色加粗名称（如"游戏渲染领域"）+ 状态色点文本（如"● Running"）。
+// 任务/结果/时间等详情不再上卡片（简洁展示要求），仍可在 [A] 编排弹窗中查看。
 // 卡片总宽恒为 cardW：lipgloss Width 含左右内边距（各 1），边框另加 2 列，保证网格列对齐。
 func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
 	// 文本区宽度 = 总宽 - 边框 2 - 内边距 2。
@@ -392,48 +464,9 @@ func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
 	// 名称：按角色类型着色并加粗。
 	name := lipgloss.NewStyle().Foreground(lipgloss.Color(agentRoleColor(node.roleType))).Bold(true).
 		Render(truncate(node.name, inner))
-	// 副标题：优先角色名（如 Designer），其次领域，最后角色类型。
-	sub := node.role
-	if sub == "" {
-		sub = node.domain
-	}
-	if sub == "" {
-		sub = roleTypeText(node.roleType)
-	}
-	subLine := m.styles.Dim.Render(truncate(sub, inner))
 	// 状态行：彩色图标 + 英文状态文本。
 	stLine := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor(string(node.status)))).
 		Render(statusIcon(string(node.status)) + " " + roleStatusText(node.status))
-	// 时间行：按状态显示 启动/完成/创建 后缀。
-	timeLine := ""
-	if !node.createdAt.IsZero() {
-		suffix := "创建"
-		switch node.status {
-		case enums.RoleStatusActive:
-			suffix = "启动"
-		case enums.RoleStatusDone:
-			suffix = "完成"
-		}
-		timeLine = m.styles.Dim.Render(node.createdAt.Format("15:04:05") + " " + suffix)
-	}
-	// 任务行：无目标时留空，保持卡片高度一致。
-	goalLine := ""
-	if node.goal != "" && !node.isClarify {
-		goalLine = m.styles.Dim.Render(truncate("任务: "+strings.ReplaceAll(node.goal, "\n", " "), inner))
-	}
-	// 结果行：仅终态（Done/Error）节点展示。错误优先并以错误色显示；
-	// 原始文本先截断到约 80 字符防止超长内容拖累渲染，再按卡片宽度截断。
-	resultLine := ""
-	if node.status == enums.RoleStatusDone || node.status == enums.RoleStatusError {
-		if node.err != "" {
-			errText := truncate(strings.ReplaceAll(node.err, "\n", " "), 80)
-			resultLine = lipgloss.NewStyle().Foreground(lipgloss.Color(cStatusErr)).
-				Render(truncate("错误: "+errText, inner))
-		} else if node.summary != "" {
-			sumText := truncate(strings.ReplaceAll(node.summary, "\n", " "), 80)
-			resultLine = m.styles.Dim.Render(truncate("结果: "+sumText, inner))
-		}
-	}
 	// 运行中/错误的 Agent 用状态色边框突出，其余用普通暗色边框。
 	borderColor := cBlur
 	switch node.status {
@@ -442,17 +475,12 @@ func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
 	case enums.RoleStatusError:
 		borderColor = cStatusErr
 	}
-	lines := []string{name, subLine, stLine, timeLine, goalLine}
-	if resultLine != "" {
-		lines = append(lines, resultLine)
-	}
-	content := strings.Join(lines, "\n")
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(borderColor)).
 		Padding(0, 1).
 		Width(cardW - 2).
-		Render(content)
+		Render(name + "\n" + stLine)
 }
 
 // agentConnectorLines 生成 MetaAgent 卡片与子 Agent 网格之间的连接线。
@@ -496,7 +524,7 @@ func (m Model) agentLegendLine() string {
 	}
 	return item("✓", "Done", cStatusDone) + "   " +
 		item("●", "Running", cStatusRun) + "   " +
-		item("○", "Waiting", cStatusIdle)
+		item("◐", "Waiting", cStatusWait)
 }
 
 // joinHorizontalWithGap 以固定空格间隔水平拼接多个同高文本块。
@@ -527,24 +555,6 @@ func roleStatusText(s enums.RoleStatus) string {
 		return "Error"
 	default:
 		return "Idle"
-	}
-}
-
-// roleTypeText 把角色类型映射为展示用短文本，作为卡片的兜底副标题。
-func roleTypeText(t enums.RoleType) string {
-	switch t {
-	case enums.RoleTypeMeta:
-		return "Orchestrator"
-	case enums.RoleTypeDomain:
-		return "Domain"
-	case enums.RoleTypeSubDomain:
-		return "SubDomain"
-	case enums.RoleTypeFixed:
-		return "Fixed"
-	case enums.RoleTypeDynamic:
-		return "Dynamic"
-	default:
-		return "Agent"
 	}
 }
 

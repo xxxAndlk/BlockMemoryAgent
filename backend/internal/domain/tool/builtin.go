@@ -260,6 +260,11 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 		if err := e.sanitizeWritePath(absPath); err != nil {
 			return &Result{Tool: "WriteFile", Path: absPath, Error: err.Error()}
 		}
+		// 角色级写沙箱（Layer 4）：角色配了 allowed_write_paths 时进一步限制写入范围。
+		// 未配置的角色（含 MetaAgent/DomainAgent/默认叶子助手）roleWritePaths 返空，跳过。
+		if err := e.enforceRoleWritePath(ctx, absPath); err != nil {
+			return &Result{Tool: "WriteFile", Path: absPath, Error: err.Error()}
+		}
 	}
 
 	// 确保目标文件所在目录存在，不存在时递归创建。

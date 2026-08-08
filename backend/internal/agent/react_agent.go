@@ -279,6 +279,9 @@ func truncateStringValues(in map[string]any, maxRunes int) map[string]any {
 func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history []ReactMessage) (ReactResult, error) {
 	// 将当前代理标识写入上下文，便于链路追踪、日志和工具调用时识别身份。
 	ctx = WithAgentID(ctx, a.name)
+	// 注入角色 ID，供 WriteFile 角色级写沙箱（Layer 4）按角色限制写入路径。
+	// 未配 Sandbox 的角色 enforceRoleWritePath 跳过，零开销。
+	ctx = WithRoleID(ctx, a.role.ID)
 	// 同步注入展示名（role.Name），供 handleToolEvent 写日志与 UI 时显示
 	// "MetaAgent"/"代码助手" 而非 session-ID（"session-1"）。sub-agent 的
 	// 展示名在 dispatcher 侧覆写 roleDef.Name 后同样经此注入。
@@ -1011,6 +1014,11 @@ func mailboxMessageToReact(m *mailbox.Message) ReactMessage {
 	if len(m.Payload) > 0 {
 		b, _ := json.Marshal(m.Payload)
 		body += "\n" + string(b)
+	}
+
+	// Layer 5：展示子 Agent 修改的文件清单，使父 LLM 知晓子改了哪些文件。
+	if len(m.FilesModified) > 0 {
+		body += "\n修改文件: " + strings.Join(m.FilesModified, ", ")
 	}
 
 	// 组合成带发送者标记的 user 消息返回。
