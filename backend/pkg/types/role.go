@@ -32,6 +32,17 @@ type RoleDefinition struct {
 	CanBeCalled bool `json:"can_be_called" yaml:"can_be_called"`
 	// Parents 可调用此角色的父角色 ID 列表，显式声明调用关系图。
 	Parents []string `json:"parents" yaml:"parents"`
+	// Sandbox 角色级写沙箱配置；nil 表示不限制（当前行为：workDir 下任意可写）。
+	// 非空 AllowedWritePaths 时，该角色 WriteFile 只能写到这些路径（相对 workDir 解析）下，
+	// 用于多 Agent 并发写隔离。dormant opt-in：未配置则零开销跳过。
+	Sandbox *RoleSandbox `json:"sandbox,omitempty" yaml:"sandbox,omitempty"`
+}
+
+// RoleSandbox 角色级写沙箱。AllowedWritePaths 为相对 workDir 的路径前缀列表
+// （如 "src/"、artifacts/code/）；空列表等价于不限制。
+type RoleSandbox struct {
+	// AllowedWritePaths 允许该角色写入的路径前缀列表（相对 workDir，非绝对则 Join workDir）。
+	AllowedWritePaths []string `json:"allowed_write_paths" yaml:"allowed_write_paths"`
 }
 
 // AgentModelConfig Agent 模型配置：单个角色所需的 LLM 接入参数。

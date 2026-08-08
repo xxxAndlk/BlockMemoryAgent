@@ -24,6 +24,7 @@ type Executor struct {
 	agentCfg        *config.AgentConfig // Agent 阈值配置，控制资源使用上限
 	callback        Callback            // 执行完成后的回调函数
 	domainClassifier project.DomainClassifier // LLM 领域命名器，供 RefreshProjectDoc 工具调用；nil 走启发式
+	roleWritePaths  func(roleID string) []string // 角色级写路径解析器：返角色 Sandbox.AllowedWritePaths；nil/空=不限制
 }
 
 // NewExecutor 创建一个新的 Executor 实例。
