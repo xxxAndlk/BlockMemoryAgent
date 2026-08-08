@@ -48,6 +48,7 @@ type LLMRuntimeConfig struct {
 	ToolOutputHistoryMaxRunes   int `yaml:"tool_output_history_max_runes"`   // 写入历史的单条工具输出最大字符数（默认 2000；负数表示不截断）
 	SummarizeEvery              int `yaml:"summarize_every"`                 // 每 N 步触发一次历史压缩（默认 10；<=0 关闭压缩，仅用滑动窗口）
 	SummarizeKeepRecent         int `yaml:"summarize_keep_recent"`           // 压缩时保留最近 K 条原始消息（默认 10；<=0 视为 10）
+	SummarizeTimeoutSec         int `yaml:"summarize_timeout_sec"`           // 事件摘要轻量模型调用超时（秒，默认 120）。旧硬编码 5s 对思考型模型必然超时，摘要全挂降级 raw join，上下文全量回注致 token 预算提前耗尽（实证 verify 子 Agent 300K 预算 7 分钟烧穿）
 	// TokenBudgetPerGoal 单次 RunWithHistory 累计 token 上限（input+output 之和，跨轮累加）。
 	// 超限后主循环 break 返回部分完成（LimitReached），与 maxIter 轮数上限正交。
 	// 默认 0 表示不限制；config.yaml 设 token_budget_per_goal: 100000 启用。
@@ -388,6 +389,9 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.SummarizeKeepRecent == 0 {
 		c.Agent.SummarizeKeepRecent = 10
+	}
+	if c.Agent.SummarizeTimeoutSec == 0 {
+		c.Agent.SummarizeTimeoutSec = 120
 	}
 }
 

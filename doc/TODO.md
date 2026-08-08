@@ -57,7 +57,8 @@
     - 预算/超时配置：`token_budget_per_role` domain/meta 400K、叶子助手 100K（原 120K/40K,扛不住塔防级多文件 codegen 一次交付）;`sub_agent_timeout_min` 30->60（预算抬高后单 domain 需在慢推理下跑完多文件生成）。
     - TUI 工作目录展示：`tui/model.go` 加 `workDir`（`currentWorkDir()`）,顶栏与欢迎页 Workspace 显示真实路径（原硬编码 `~/demo`）。
     - 回归测试：`TestReActAgent_TruncatesToolCallInputsInHistory` / `TestWindowMessages_WorkHistoryNotCollapsed` / `TestCancelPausedOnChildSession` / `TestCancelAwaitingClarifySession` / `TestDispatchDuplicateDomainRejected`。全量 `go test ./...` 绿。
-    - 开放动作：验收中暴露但未修的次要项--共享记忆契约文件十六进制命名漂移;MetaAgent 终答前不做端到端自验（本次靠用户反馈闭环补上）;verifyloop `domain_self_test_enabled` 仍待接线。
+    - 开放动作：验收中暴露但未修的次要项--共享记忆契约文件十六进制命名漂移;MetaAgent 终答前不做端到端自验（本次靠用户反馈闭环补上）。
+    - verifyloop 自动接线【已落地 2026-08-07】：`Dispatcher.RegisterVerifyTool` 把编排器集合存到 `d.orchs`，`runSubAgent` 成功完成路径新增 `autoVerify`——命中 code_role（code_assistant/domain，随两个 self_test 开关启停）的子 Agent 在 notify 父前同步驱动"自测->修正->上级统一测试"，结论以【验证闭环:通过/未通过】前缀并入回灌摘要，未通过含失败原因。验证/修正轮走 `ExecuteChild->runSubAgentOnce`，绕开 `runSubAgent` 包装器，无递归。`verify_and_fix` 工具保留为显式复检。`config.yaml` 两开关均开；roles.yaml meta 提示词【自测验证时机】段改写为【验证闭环（已自动接线）】。回归测试 `TestDispatcher_AutoVerify_PassPrefixesSummary` / `TestDispatcher_AutoVerify_FailPrefixesSummary` / `TestDispatcher_AutoVerify_SkipsUnpairedRole`。
 
 
 17. **编排加固：阿里 AICP 对比可落地项**（来源：`doc/编排对比_阿里AICP军团.md`，对照 AICP「Agent 军团 + 共享黑板」方案筛出的增量加固点，不动主架构）

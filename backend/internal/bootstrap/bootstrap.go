@@ -212,6 +212,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	toolRegistry.SetDomainClassifier(cls)
 	memoryPipeline := memory.NewPipeline(memory.NewPostgresEventStore(pgStore.DB())).
 		WithSummarizer(newEventSummarizer(modelFactory)).
+		WithSummarizeTimeout(time.Duration(cfg.Agent.SummarizeTimeoutSec) * time.Second). // 思考型模型摘要需 60-180s，旧 5s 硬编码致摘要全挂
 		WithCompression(cfg.Agent.SummarizeEvery, cfg.Agent.SummarizeKeepRecent) // 记忆流水线
 
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
@@ -274,8 +275,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	roleRegistry.RegisterTools(toolRegistry)
 
 	// verify_and_fix 工具:把 verifyloop 状态机折叠进 ReAct,作为 MetaAgent/DomainAgent
-	// 可显式调用的工具。编排器内部仍跑 Verifier/Fixer/Reporter 三接口,但由调用方
-	// 显式决定何时验证,不再经 OnSubAgentDone 钩子自动触发(双控制流合并)。
+	// 可显式调用的复检工具。同一 orchestrators 集合并由 dispatcher 完成路径自动消费:
+	// 命中 code_role 的子 Agent 成功完成后,notify 父 Agent 前同步驱动验证闭环
+	// (自测->修正->上级统一测试),结论以【验证闭环:通过/未通过】前缀并入回灌摘要——
+	// 验证由编排层原生驱动,不依赖 LLM 自觉调工具(显式工具保留用于存疑复检)。
 	// AssistantSelfTestEnabled 开 code_assistant 等产出角色的验证;DomainSelfTestEnabled
 	// 开 domain 角色的模块级统一测试。角色对默认 [{code_assistant, test_assistant}]。
 	selfTestEnabled := cfg.Agent.AssistantSelfTestEnabled || cfg.Agent.DomainSelfTestEnabled

@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
+	"github.com/blockmemory/agent/backend/internal/domain/verifyloop"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -1179,3 +1181,167 @@ func TestDispatcher_VerifyAndFixTool_MissingCallerContext(t *testing.T) {
 	}
 }
 
+
+// ---- 自动验证闭环接线（dispatcher 完成路径原生驱动 verifyloop）----
+
+// verifyFakeRunner 实现 verifyloop.Runner，记录派发的角色并返回固定答复。
+type verifyFakeRunner struct {
+	mu    sync.Mutex
+	calls []string
+	resp  string
+}
+
+// ExecuteChild 记录调用角色并返回预设答复。
+func (f *verifyFakeRunner) ExecuteChild(ctx context.Context, parentID, roleID, task string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, roleID)
+	return f.resp, nil
+}
+
+// callCount 统计某角色被派发的次数。
+func (f *verifyFakeRunner) callCount(roleID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if c == roleID {
+			n++
+		}
+	}
+	return n
+}
+
+// newAutoVerifyDispatcher 构造注册了验证编排器（planSkip、无 reviewer）的 Dispatcher。
+func newAutoVerifyDispatcher(t *testing.T, runner verifyloop.Runner, codeRole string, maxRounds int) *Dispatcher {
+	t.Helper()
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{
+			SystemPrompt: "meta",
+			ModelConfig:  types.AgentModelConfig{Provider: "mock"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "x"}}, toolsReg, nil, agent.NopMemoryPipeline{})
+	orch := verifyloop.NewWithReviewer(runner, nil, maxRounds, codeRole, "test_assistant", "", true)
+	d.RegisterVerifyTool(toolsReg, map[string]*verifyloop.Orchestrator{codeRole: orch})
+	return d
+}
+
+// TestDispatcher_AutoVerify_PassPrefixesSummary 验证命中验证对的角色完成时，
+// autoVerify 驱动"自测->上级统一测试"并在摘要前并入【验证闭环:通过】结论。
+func TestDispatcher_AutoVerify_PassPrefixesSummary(t *testing.T) {
+	runner := &verifyFakeRunner{resp: "验证报告 [VERIFY:PASS]"}
+	d := newAutoVerifyDispatcher(t, runner, "code_assistant", 3)
+
+	summary := d.autoVerify(context.Background(), "session-1", "session-1/code_assistant-1", "code_assistant", "原始任务", "原始产出")
+
+	if !strings.HasPrefix(summary, "【验证闭环:通过】") {
+		t.Fatalf("expected pass prefix, got: %s", summary)
+	}
+	if !strings.Contains(summary, "原始产出") {
+		t.Fatal("summary should carry final produced text")
+	}
+	// planSkip=true：SelfTest + UnifiedTest 各派发一次 test_assistant，无修正轮。
+	if n := runner.callCount("test_assistant"); n != 2 {
+		t.Fatalf("expected 2 test_assistant calls (self+unified), got %d", n)
+	}
+	if n := runner.callCount("code_assistant"); n != 0 {
+		t.Fatalf("pass path should not dispatch fixer, got %d", n)
+	}
+}
+
+// TestDispatcher_AutoVerify_FailPrefixesSummary 验证往返上限内未通过时，
+// 摘要并入【验证闭环:未通过】+ 失败原因，且修正器按轮派发。
+func TestDispatcher_AutoVerify_FailPrefixesSummary(t *testing.T) {
+	runner := &verifyFakeRunner{resp: "[VERIFY:FAIL] 功能缺失"}
+	d := newAutoVerifyDispatcher(t, runner, "code_assistant", 2)
+
+	summary := d.autoVerify(context.Background(), "session-1", "session-1/code_assistant-1", "code_assistant", "原始任务", "原始产出")
+
+	if !strings.HasPrefix(summary, "【验证闭环:未通过】") {
+		t.Fatalf("expected fail prefix, got: %s", summary)
+	}
+	if !strings.Contains(summary, "max rounds") {
+		t.Fatalf("expected max-rounds fail reason, got: %s", summary)
+	}
+	// 每轮 SelfTest 失败 -> Fixer 修正：2 轮各 1 次 test_assistant + 1 次 code_assistant。
+	if n := runner.callCount("test_assistant"); n != 2 {
+		t.Fatalf("expected 2 self-test calls, got %d", n)
+	}
+	if n := runner.callCount("code_assistant"); n != 2 {
+		t.Fatalf("expected 2 fixer calls, got %d", n)
+	}
+}
+
+// TestDispatcher_AutoVerify_SkipsUnpairedRole 验证未命中验证对的角色（含 orchs 为空时）
+// autoVerify 原样返回产出，不派发任何验证子 Agent。
+func TestDispatcher_AutoVerify_SkipsUnpairedRole(t *testing.T) {
+	runner := &verifyFakeRunner{resp: "[VERIFY:PASS]"}
+	d := newAutoVerifyDispatcher(t, runner, "domain", 3)
+
+	out := d.autoVerify(context.Background(), "session-1", "session-1/code_assistant-1", "code_assistant", "任务", "产出")
+	if out != "产出" {
+		t.Fatalf("unpaired role should pass through, got: %s", out)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("unpaired role should not dispatch verify children, got %v", runner.calls)
+	}
+
+	// orchs 为空（等价两个 self_test 开关全关）同样原样透传。
+	d2 := NewDispatcher(role.NewRegistry(&config.RoleConfigFile{}), &mockModelFactory{provider: &mockProvider{text: "x"}}, tool.NewBuiltinRegistry(t.TempDir(), nil, nil), nil, agent.NopMemoryPipeline{})
+	d2.RegisterVerifyTool(tool.NewBuiltinRegistry(t.TempDir(), nil, nil), nil)
+	if out := d2.autoVerify(context.Background(), "m", "m/code_assistant-1", "code_assistant", "任务", "产出"); out != "产出" {
+		t.Fatalf("nil orchestrators should pass through, got: %s", out)
+	}
+}
+
+// blockingVerifyRunner 在 ExecuteChild 进入时关闭 entered 通知测试协程，
+// 并阻塞直至 release 被关闭，用于把 autoVerify 精确停在"验证轮进行中"的时刻。
+type blockingVerifyRunner struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// ExecuteChild 首次调用时通知已进入，然后阻塞到 release 关闭，返回 PASS 答复。
+func (r *blockingVerifyRunner) ExecuteChild(ctx context.Context, parentID, roleID, task string) (string, error) {
+	r.once.Do(func() { close(r.entered) })
+	select {
+	case <-r.release:
+		return "验证报告 [VERIFY:PASS]", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// TestDispatcher_AutoVerify_RemovesHeartbeatEntry 回归验证：runSubAgent 成功路径在
+// autoVerify 前摘除 activity 心跳条目。叶子 Agent 的 ReAct 循环结束后 activity 不再更新，
+// 而 autoVerify 的验证/修正轮可能同步跑数分钟；不摘除会被 patrol 误判假死并 cancel
+// 共享 ctx（实证：VERIFY FAIL reason=round 1 cancelled: context canceled + HEARTBEAT KILL idle>5m）。
+func TestDispatcher_AutoVerify_RemovesHeartbeatEntry(t *testing.T) {
+	runner := &blockingVerifyRunner{entered: make(chan struct{}), release: make(chan struct{})}
+	d := newAutoVerifyDispatcher(t, runner, "code_assistant", 1)
+
+	subID := "session-1/code_assistant-1"
+	act := new(atomic.Int64)
+	act.Store(time.Now().UnixNano())
+	d.activity.Store(subID, act)
+
+	roleDef := types.RoleDefinition{ID: "code_assistant", Name: "代码助手", ModelConfig: types.AgentModelConfig{Provider: "mock"}}
+	done := make(chan struct{})
+	go func() {
+		d.runSubAgent(context.Background(), "session-1", subID, roleDef, "任务", "", "", time.Now())
+		close(done)
+	}()
+
+	// autoVerify 进行中（验证轮子 Agent 已被派发并阻塞）：activity 条目必须已摘除，
+	// 否则 patrol scanStuck 会在 heartbeatTimeout 后 killStuckSubAgent 取消共享 ctx。
+	<-runner.entered
+	if _, ok := d.activity.Load(subID); ok {
+		t.Fatal("activity entry should be removed before autoVerify to avoid patrol heartbeat kill")
+	}
+	close(runner.release)
+	<-done
+}

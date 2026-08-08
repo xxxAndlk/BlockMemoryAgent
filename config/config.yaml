@@ -45,6 +45,7 @@ agent:
   # -- ReAct 主循环 --
   summarize_every: 5             # 每 5 步压缩；<=0 关闭
   summarize_keep_recent: 10      # 保留最近 10 条
+  summarize_timeout_sec: 120     # 事件摘要轻量模型调用超时（秒）。思考型模型首 token 需数十秒，旧硬编码 5s 致摘要全挂、上下文全量回注、token 预算提前烧穿（实证 verify 子 Agent 300K 预算 7 分钟耗尽）
   history_max_messages: 30       # 滑动窗口上限 30 条（system 前缀 + 最近消息），防 token 爆炸；负数表示不裁剪
   tool_call_max_rounds: -1       # ReAct 最大 LLM 轮数（达到上限暂停等待用户续跑，不判失败），负数表示不限制
   retry_count: 1                 # Assistant 任务指数退避重试次数。provider 层已有 3 次重试（retry_provider），此处再重试会乘法放大尝试次数（最多 provider3 × agent(1+n)），瞬时故障已被下层覆盖，1 次足够
@@ -60,7 +61,7 @@ agent:
     ui_assistant: 200000
     prompt_reviewer: 100000
     code_reviewer: 100000
-    test_assistant: 100000
+    test_assistant: 600000   # 验证需读全部产出文件+写跑测试，实证 100K 部分回灌导致验证闭环全挂；300K 在塔防级任务单个验证轮 4.5 分钟烧穿（块记忆注入含完整工具输出，每步 ~20K input 重发）
     doc_assistant: 100000
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
 
@@ -69,8 +70,17 @@ agent:
   restore_sessions: false        # 启动时从 session_history 恢复最近 50 个会话到内存（默认 true；TUI 不需要历史记录，显式 false 关闭，启动即为全新会话）
 
   # -- 多 Agent 协作验证闭环（verifyloop 编排器原生驱动，不依赖主 Agent 提示词）--
-  assistant_self_test_enabled: false # code_assistant 完成后自动触发"自测->修正->上级统一测试"状态机（默认关闭）
-  domain_self_test_enabled: false    # 领域 Agent 完成后触发模块级统一测试（默认关闭，待 service_react 接线）
+  # 接线说明：命中的角色（code_role）子 Agent 成功完成后，dispatcher 在回灌父 Agent 前
+  # 同步驱动"自测->修正->上级统一测试"状态机，验证结论以【验证闭环:通过/未通过】前缀并入摘要；
+  # verify_and_fix 工具保留给 MetaAgent/DomainAgent 显式复检。验证/修正轮走 ExecuteChild 同步派发，
+  # 不递归触发自动验证。
+  # 2026-08-08 A/B 实证（test/benchmark/runs/multi-on vs multi-off，同二进制唯一变量=本开关）：
+  # 开=5/16 通过率 + 558 万 token（测试助手独占 71%）；关=16/16 + 284 万 token。
+  # 机制本身已跑通（VERIFY PASS 出现、0 心跳误杀、0 summarize 失败），但当前形态默认关闭：
+  # verifier 按累计 input 计费致文件级验证全部烧穿预算；零件级验证通过≠整品可用；
+  # 大量未通过摘要干扰父 Agent 决策致提前收尾。待验证改为"meta 层整品端到端单次验证"后再考虑开启。
+  assistant_self_test_enabled: false # code_assistant 等产出角色完成后自动触发"自测->修正->上级统一测试"状态机
+  domain_self_test_enabled: false    # 领域 Agent 完成后自动触发模块级统一测试（dispatcher 完成路径已接线）
   verification_max_rounds: 5         # 验证闭环往返上限，防止 code<->test 平级互问死循环
   # 验证角色对：产出角色完成后由测试角色验证。为空时回退默认 [{code_assistant, test_assistant}]。
   # 显式配置可扩展多角色对，如 UI 任务由 test_assistant 验证：

@@ -113,7 +113,10 @@ type Reporter interface {
 const defaultMaxRounds = 5
 
 // defaultChildTimeout 是单次子 Agent 执行的超时，防止挂起拖死整个闭环。
-const defaultChildTimeout = 10 * time.Minute
+// 实证：思考型模型（glm-5.2）单 LLM 调用 1-3 分钟，验证轮需读全产出+跑测试多轮往返，
+// 10 分钟在塔防级任务精确卡死（VERIFY FAIL: self-test failed: context deadline exceeded，
+// DONE->FAIL 间隔 9m59s/10m39s），放宽至 20 分钟。
+const defaultChildTimeout = 20 * time.Minute
 
 // Request 描述一次验证闭环的输入。字段与具体验证方式解耦，
 // 各 Verifier 实现按需读取。

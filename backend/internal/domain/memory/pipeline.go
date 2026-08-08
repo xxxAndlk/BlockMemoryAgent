@@ -41,8 +41,12 @@ type Pipeline struct {
 	// summarizer 是可选的轻量模型摘要器：事件数超过 eventSummarizeThreshold 时调用，
 	// 把原始事件列表压成短摘要注入上下文，显著降低长任务的 token 占用。
 	summarizer EventSummarizer
+	// summarizeTimeout 是单次摘要调用的超时。默认 5s 只适合秒回的非思考型轻量模型；
+	// 思考型模型（如 glm 系列）首 token 就要数十秒，须由 bootstrap 按配置注入更大值，
+	// 否则摘要全挂降级 raw join，上下文全量回注导致 token 预算提前耗尽。
+	summarizeTimeout time.Duration
 	// consecutiveBalanceErrors 记录摘要器连续返回 Insufficient Balance（402）错误的次数。
-	// 达到 2 次后关闭摘要路径，直接用 raw join，避免每次调用白等 5s 超时（实证 DeepSeek 余额耗尽）。
+	// 达到 2 次后关闭摘要路径，直接用 raw join，避免每次调用白等摘要超时（实证 DeepSeek 余额耗尽）。
 	// 摘要成功时重置为 0。受 mu 保护。
 	consecutiveBalanceErrors int
 	// compressEvery 是历史压缩步频：每 N 轮 ReAct 迭代把中段历史暴力压缩为摘要。
@@ -105,6 +109,13 @@ func (p *Pipeline) WithMaxEventsPerAgent(n int) *Pipeline {
 // 传 nil 关闭摘要路径（默认关闭）。摘要失败时降级为直接拼装，不影响主流程。
 func (p *Pipeline) WithSummarizer(s EventSummarizer) *Pipeline {
 	p.summarizer = s
+	return p
+}
+
+// WithSummarizeTimeout 配置单次摘要调用超时。<=0 时回退 5s 旧默认（仅适合秒回的非思考型
+// 轻量模型）。思考型/慢推理模型应由装配层注入 60-180s，否则摘要路径形同虚设。
+func (p *Pipeline) WithSummarizeTimeout(d time.Duration) *Pipeline {
+	p.summarizeTimeout = d
 	return p
 }
 
@@ -180,15 +191,20 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 	// 否则直接 join 原始事件文本。摘要失败降级为直接 join，不影响主流程。
 	body := joinNonEmpty("\n", summary)
 	if p.summarizer != nil && len(summary) > eventSummarizeThreshold {
-		// 给摘要调用设 5 秒超时：轻量模型 15s 等待在 DeepSeek 余额不足时白等（实证 11 次 402 错误），
-		// 5s 足够正常摘要返回；超时立即降级 raw join，避免主循环卡顿。
-		// 若连续 2 次 Insufficient Balance，关闭摘要路径降级到 raw join 直到进程重启。
+		// 若连续 2 次 Insufficient Balance，关闭摘要路径降级到 raw join 直到进程重启，
+		// 避免每次调用白等超时（实证 DeepSeek 余额耗尽持续 402）。
 		summarizerDisabled := false
 		p.mu.RLock()
 		summarizerDisabled = p.consecutiveBalanceErrors >= 2
 		p.mu.RUnlock()
 		if !summarizerDisabled {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// 超时取装配层注入值（默认 5s 仅适合秒回模型；思考型模型需 60-180s）。
+			// 超时立即降级 raw join，避免主循环无限卡顿。
+			timeout := p.summarizeTimeout
+			if timeout <= 0 {
+				timeout = 5 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			summarized, err := p.summarizer(ctx, summary)
 			cancel()
 			if err != nil {

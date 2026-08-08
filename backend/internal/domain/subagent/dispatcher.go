@@ -127,6 +127,14 @@ type Dispatcher struct {
 	// writeEnabled 块记忆写入开关，由配置（agent.block_memory_write_enabled）注入。
 	writeEnabled bool
 
+	// orchs 按 code_role 索引的验证闭环编排器集合，由 RegisterVerifyTool 注入。
+	// 非空时子 Agent 成功完成且其角色命中 orchs 键（如 code_assistant/domain），
+	// 在 notify 父 Agent 前同步驱动 verifyloop 状态机（自测->修正->上级统一测试），
+	// 验证结论并入回灌摘要——验证由编排层原生驱动，不依赖 LLM 自觉调 verify_and_fix。
+	// 编排器内部经 ExecuteChild->runSubAgentOnce 派发验证/修正 Agent，绕开 runSubAgent
+	// 包装器，不会递归触发本自动验证。为 nil/空时跳过自动验证（不影响显式工具调用）。
+	orchs map[string]*verifyloop.Orchestrator
+
 	// log 是会话级日志器，用于记录子 Agent LLM I/O（完整 prompt/response）到 session_logs。
 	// 为 nil 时子 Agent 不写 LLM I/O 日志，不影响派发主流程。
 	log *logger.Logger
@@ -553,8 +561,11 @@ func (d *Dispatcher) RegisterMessagingTool(r *tool.Registry) {
 // RegisterVerifyTool 将 verify_and_fix 工具安装到工具注册表,并把按 code_role 索引的
 // verifyloop.Orchestrator 集合传入工具实例。工具内部由 MetaAgent/DomainAgent 显式调用,
 // 不再依赖 OnSubAgentDone 钩子自动触发(步骤 5:双控制流合并,verifyloop 折叠进 ReAct)。
+// 同一集合并存到 d.orchs：子 Agent 完成路径（runSubAgent）按角色命中自动驱动验证闭环，
+// 补齐"产出->验证->修正->上级统一测试"的原生触发（显式工具保留用于复检）。
 // orchestrators 为空时仍注册工具但 Execute 返回"未配置验证角色对"错误。
 func (d *Dispatcher) RegisterVerifyTool(r *tool.Registry, orchestrators map[string]*verifyloop.Orchestrator) {
+	d.orchs = orchestrators
 	r.Register(&verifyAndFixTool{dispatcher: d, orchs: orchestrators})
 }
 
@@ -945,11 +956,42 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		return false
 	}
 
-	// 成功：通知父 Agent。
+	// 成功：先过验证闭环（该角色配置了验证对时），再把带验证结论的摘要通知父 Agent。
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
-	d.treeFinish(ctx, subAgentID, result.Text, nil)
-	d.notify(parentID, subAgentID, result.Text)
+	// 本 Agent 的 ReAct 循环已结束，activity 心跳不再更新；autoVerify 可能同步跑数分钟
+	// 验证/修正轮（独立子 Agent，有自己的生命周期），不摘除会被 patrol 误判假死 cancel 掉
+	// （实证：VERIFY FAIL reason=round 1 cancelled: context canceled，HEARTBEAT KILL idle>5m）。
+	// 摘除后该子 Agent 仅剩 d.timeout（默认 30min）兜底， goroutine defer 的重复 Delete 幂等无害。
+	d.activity.Delete(subAgentID)
+	summary := d.autoVerify(ctx, parentID, subAgentID, roleDef.ID, task, result.Text)
+	d.treeFinish(ctx, subAgentID, summary, nil)
+	d.notify(parentID, subAgentID, summary)
 	return false
+}
+
+// autoVerify 在子 Agent 成功完成后同步驱动验证闭环（该角色命中 d.orchs 验证对时）。
+// 未配置验证对（orchs 为空或角色未命中）时原样返回产出，零开销。
+// 通过/未通过结论以【验证闭环:...】前缀并入回灌摘要，父 Agent（domain/meta）在 mailbox
+// 摘要中直接看到验证结果；未通过时摘要含失败原因，由父 Agent 决定后续（重派/降级交付）。
+// 修正轮产生的最终产出（FinalProduced）替代原始产出回灌，保证父 Agent 拿到的是修复后版本。
+// 验证/修正子 Agent 经 ExecuteChild->runSubAgentOnce 同步派发，不回本包装器，无递归。
+func (d *Dispatcher) autoVerify(ctx context.Context, parentID, subAgentID, roleID, task, produced string) string {
+	o, ok := d.orchs[roleID]
+	if !ok || o == nil {
+		return produced
+	}
+	vres := o.Run(ctx, verifyloop.Request{
+		ParentID:    parentID,
+		ProducerID:  subAgentID,
+		InitialTask: task,
+		Produced:    produced,
+	})
+	if vres.Passed {
+		log.Printf("[subagent] VERIFY PASS: sub=%s role=%s rounds=%d", subAgentID, roleID, vres.Rounds)
+		return fmt.Sprintf("【验证闭环:通过】rounds=%d（自测+上级统一测试均通过）\n\n%s", vres.Rounds, vres.FinalProduced)
+	}
+	log.Printf("[subagent] VERIFY FAIL: sub=%s role=%s rounds=%d reason=%s", subAgentID, roleID, vres.Rounds, truncateRunes(vres.FailReason, 200))
+	return fmt.Sprintf("【验证闭环:未通过】rounds=%d\n【失败原因】%s\n\n【最后产出】\n%s", vres.Rounds, vres.FailReason, vres.FinalProduced)
 }
 
 // treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
