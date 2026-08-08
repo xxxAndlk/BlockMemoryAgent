@@ -926,7 +926,97 @@ Agent: 恢复工作流执行...
 
 ---
 
-## 11. 总结
+## 11. 外部记忆库演进：LLM Wiki 方案（选型决策 + 落地计划，2026-08-08）
+
+> 本节与 §1-§10 的愿景叙述不同：这是**基于当前代码库的已定稿演进计划**，文件与函数引用均为现状代码。本节 Phase 与 §10 平台化 Phase 正交，先于平台化落地。
+
+### 11.1 选型结论
+
+**按 LLM Wiki 模式（Karpathy 2026-04 提出的知识编译模式）演进现有记忆体系，不引入 TencentDB Agent Memory 外部服务。**
+
+| 维度 | LLM Wiki 模式 | TencentDB Agent Memory |
+|------|--------------|----------------------|
+| 形态 | 模式而非产品：`raw/` 原始资料 + `wiki/` LLM 维护的 Markdown + schema 维护规则 | TS 实现的分层记忆引擎，npm 包，OpenClaw/Hermes 插件形态 |
+| 技术栈契合 | 纯文件读写，Go 标准库即可，单二进制分发不变 | 需引入 Node 运行时或 Memory Hub 服务 + 自写 Go↔TS 桥接，无 Go SDK |
+| 本地性/隐私 | 完全本地，Git 可版本控制、可回滚 | 默认本地 SQLite、零外部 API（此项打平） |
+| 可审计性 | 人可读 Markdown，无黑箱 | 记忆在引擎内部管道中蒸馏，审计依赖其面板 |
+| 与现状重叠 | 项目已有约 70% 雏形（见 §11.3），是**演进** | 记忆体系整体替换，是**迁移** |
+| 团队能力 | 无 ACL/资产管控概念，需自建 | Memory Hub 提供 Team/Agent ACL、Agent Loadout——单机阶段用不上 |
+| 官方自述不适合场景 | 大规模库需补检索层 | "不想引入 Node 运行时的技术栈"、"已深度绑定自有框架的项目" |
+
+**重新评估触发器**（满足任一时回头重评 Memory Hub 或其他外部方案）：
+- §5 团队协作场景真正落地，出现多用户记忆资产复用与 ACL 需求；
+- wiki 页数超阈值（暂定 500 页）后召回质量明显下降，纯文件渐进式披露不够用时。
+
+### 11.2 候选方案事实依据
+
+- **TencentDB Agent Memory**（腾讯云数据库团队，2026-05-14 开源，MIT，v2.0.0 于 2026-08-03）：L0 原始对话 → L1 原子事实 → L2 场景归纳 → L3 用户画像的四层蒸馏管道；短期记忆用"上下文卸载 + Mermaid 任务画布"压缩（官方评测 token 降 30-61%）；v2.0 扩为四种记忆资产（Chat Memory / Skill / Wiki / CodeGraph）+ 团队级 Memory Hub。其 Wiki 资产本身就是 LLM Wiki 模式的实现——两候选并非完全互斥，真正的选择是"引入外部 TS 记忆服务"还是"在现有 Go 体系内按 wiki 模式演进"。
+- **LLM Wiki**（Karpathy 2026-04 提出的模式，非产品）：三层解耦——`raw/`（不可变原始资料，杜绝幻觉污染）、`wiki/`（LLM 全权读写的 Markdown 知识库，Obsidian 双向链接成图谱）、schema（AGENTS.md 式维护规则，定义命名/更新/矛盾处理）。LLM 承担"知识库管理员"：摄入时编译与交叉引用、定期 lint 体检（查矛盾/死链/膨胀）。检索走渐进式披露：先读 `index.md` 目录再按需读具体页，中小规模（数百页）效果足够。
+
+### 11.3 现状映射：项目已有的雏形
+
+| 现有组件 | 对应 wiki/L0-L3 层 | 差距 |
+|---------|------------------|------|
+| `PROJECT.md`（LLM 按职责分区 + WriteFile 后去抖刷新，`project` 包 + `tool/project_refresh.go`） | wiki 项目域页面 + 自动维护循环 | 无 `index.md` 目录、无变更日志、无矛盾标注 |
+| `.bma/shared/*.md` 共享记忆槽 + spec 文件 | wiki 共享页 | 无 schema（命名/更新规则）；**每 session 清空，不跨 session** |
+| 块记忆 `saveBlockMemory` + `saveFacts` 轻量模型事实提取（`dispatcher.go`） | L1 原子事实 | 散事实无聚合，缺 L2 场景层 |
+| 话题摘要 KV（`topic:{sessionID}:{topicID}:summary`） | 情景记忆压缩 | 压缩后原文不可追溯 |
+| `session_logs` 全量落库（`logLLMCall`） | L0 原始层 | 已有但未与压缩层用指针关联 |
+| `embed` / `retriever` 包 | 检索层 | dormant，本方案不依赖，留作 §11.1 触发器命中时的储备 |
+
+### 11.4 目标形态
+
+```
+.bma/
+├── PROJECT.md            # 现有：项目域分区概览（自动刷新，不变）
+├── SCHEMA.md             # 新增：wiki 维护规则（命名约定/页面结构/更新规则/矛盾标注/lint 规则）
+├── wiki/                 # 新增：跨 session 持久知识库（**不清空**）
+│   ├── index.md          #   目录页：全部页面 + 一句话摘要（召回入口）
+│   ├── log.md            #   变更日志：谁（哪个 Agent）在何时为何更新哪页
+│   ├── decisions/        #   决策记录页（ADR 式：背景/选项/结论/影响）
+│   ├── domains/          #   领域知识页（对齐 PROJECT.md 分区）
+│   └── pitfalls/         #   避坑页（失败记忆，配合 TODO #17 P0 outcome 降权）
+└── shared/               # 现有：per-session 共享槽（行为不变，仍每 session 清空）
+```
+
+- **SCHEMA.md 是 schema 层**：规定页面命名（`kebab-case.md`）、页面结构（摘要/正文/反向链接/来源）、更新规则（增量合并而非覆盖）、矛盾处理（不删除冲突内容，标注 `⚠️冲突` 并链向两来源）、lint 规则（死链/孤儿页/超阈值页）。
+- **写入路径**：子 Agent 完成时 `saveBlockMemory`/`saveFacts` 管道同步更新对应 wiki 页并追加 `log.md`；写文件走现有 Guard/写路径沙箱。
+- **召回路径**：渐进式披露——先注入 `index.md`（有 token 上限），Agent 按需 ReadFile 具体页；不把 wiki 整库塞进上下文。
+- **维护循环**：定期 lint 由轻量模型执行（查死链/矛盾/膨胀），产物是修页建议而非直接改，写入经 SCHEMA.md 规则约束。
+
+### 11.5 从 TencentDB Agent Memory 吸收的设计（偷思想，不引实现）
+
+1. **L2 场景聚合**：子 Agent 完成时把该任务的散 facts 聚合为一条场景记忆，聚合键 = domain 任务边界。落点在 `saveBlockMemory` 管道，与 TODO #17 P0（outcome 价值闭环）是同一改动点，一并做。
+2. **上下文卸载 + 指针回溯**：`compressHistory`（`memory/pipeline.go`）压缩段落时在被压缩位置留 `session_logs` 行 id 指针（session_logs 已全量落库），Agent 需要原文时按指针钻回。等价其"上下文卸载 + node_id 钻回"，零新存储。
+3. **Skill 提炼（远期）**：跑通任务的工作流沉淀为可复用 SOP，对应 TODO #13 评估项，挂在 middleware 链出站侧，本计划不含实现。
+
+### 11.6 与中间件层（TODO #19）的关系
+
+wiki 的写入与召回**不新开口子**，全部挂在 TODO #19 定义的链上：
+- 召回 → LLM 链 `RAG()` 中间件（读 `index.md` → 按需读页）；
+- 写入/日志 → Tool 链与出站链的 `PostHook()` 中间件；
+- lint → 由出站后异步任务触发，复用轻量模型路径（含其熔断逻辑）。
+因此本计划**依赖 TODO #19 Phase 1/2 先落地**；在 #19 完成前，可临时在现有 `Assemble`/`saveBlockMemory` 挂点上先行实现 Phase 0-1，#19 落地后搬家。
+
+### 11.7 阶段拆分
+
+- **Phase 0 骨架**：`SCHEMA.md` 定稿；`.bma/wiki/` 目录与 `index.md`/`log.md` 由 `EnsureProjectDoc` 同源在 boot 时幂等创建；`shared/` 清理逻辑不动。
+- **Phase 1 写入路径**：`saveBlockMemory`/`saveFacts` 同步写 wiki 页 + 追加 `log.md`；pitfalls 页接 TODO #17 P0 的 `outcome=fail` 记忆。
+- **Phase 2 召回路径**：`index.md` 注入 Assemble/RAG（带 token 上限与截断）；Agent 按需读页走现有 ReadFile（连读检测天然适用）。
+- **Phase 3 L2 聚合 + 指针回溯**：任务级场景记忆聚合；`compressHistory` 留 `session_logs` 指针。
+- **Phase 4 lint 体检**：轻量模型定期查死链/矛盾/膨胀，产出修页建议。
+- 每 Phase 验收：全量 `go test ./...` 绿 + TUI 塔防任务回归；wiki 文件人可读、可 `git diff`。
+
+### 11.8 不做（约束）
+
+- 不引入 Node 运行时或任何外部记忆服务进程；
+- 不上向量库（`embed`/`retriever` 维持 dormant，§11.1 触发器命中再说）；
+- wiki 不替代块记忆与 shared 槽，是叠加层——块记忆管"事实"，shared 管"本会话协作状态"，wiki 管"跨会话沉淀知识"；
+- wiki 写入一律经现有工具守卫与角色写路径沙箱，不开后门。
+
+---
+
+## 12. 总结
 
 BlockMemoryAgent 的扩展设计遵循一个核心原则：**底层架构统一（记忆、路由、Agent Core），上层场景扩展（编程、工作流、测试、研究、协作）**。
 

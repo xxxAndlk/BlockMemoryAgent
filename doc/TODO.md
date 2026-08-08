@@ -24,6 +24,144 @@
     - 不 adopt（归档决策）：9 层固定分层（开放任务僵化）/ 纯状态机主循环（verifyloop 已示范「固定流程折叠为工具」正确用法，不推广为主循环）/ 黑板替代 mailbox（杀紧耦合协作）/ 三道安全闸门（混沌工程特有，编码无爆炸半径语义）/ 完整权重飞轮（样本稀疏）/ 无外部需求时的 A2A + AgentCard（P2 按需，仅当开放外部 Agent 接入）。
     - 开放动作：按 P0 -> P1 顺序落地；每项配单测（outcome 排序 / 心跳巡检 / slot CAS / destructive 确认事件）。
 
+19. **Middleware 层抽象：统一拦截链（LLM 链 + 工具链）**（设计定稿 2026-08-08，待落地）
+    - 背景：链路上所有拦截点以 `if name == "ReadFile"` 式硬编码散落在两处主链路——`agent/react_agent.go RunWithHistory` 主循环（:308-496）与 `tool/registry.go Dispatch`（:276）。记忆注入/窗口截断/配对修复/预算/重试/审计在 agent 侧，守卫/探索预算/连读检测/派发守卫在 tool 侧，无统一挂载点，新增横切逻辑只能继续塞 if；重试逻辑三层重复且策略不一致（`generate` 对 DeadlineExceeded 不重试 vs `retryProvider` 重试）；工具白名单仅过滤 Schema 不过滤 Dispatch（`tool_adapter.go:22-24` 注释自认可绕过）；`plugins/registry.go` 预留插件接口未接线。设计目标：**抽象为一个方法进行调用**，链式可读（`middleware.Validate().RAG().Assemble().Call(...)`），任意扩展。
+    - 核心抽象（新包 `backend/internal/middleware/`，洋葱模型，泛型，纯标准库）：
+
+```go
+// Handler 链上可执行的下一步（终端 handler 或下一个中间件的包装结果）
+type Handler[C any] func(ctx context.Context, c *C) error
+
+// Middleware 标准洋葱签名：拿到 next，返回包装后的 Handler
+type Middleware[C any] func(next Handler[C]) Handler[C]
+
+// Chain 构建器；Use 顺序 = 入向执行顺序，出向逆序
+type Chain[C any] struct{ mws []Middleware[C] }
+func New[C any]() *Chain[C]
+func (c *Chain[C]) Use(mw ...Middleware[C]) *Chain[C] // 唯一扩展点
+func (c *Chain[C]) Then(final Handler[C]) Handler[C]  // 反向包裹成洋葱
+```
+
+    - 语义约定：中间件可读写 `*C`（改写请求消息/工具参数/结果）；返回 error 立即短路（哨兵错误区分校验失败/预算耗尽/熔断，上层按类型处理）；中间件实例无状态，跨调用状态（exploreBudget 计数、连读 map、token 用量）放 session/agent scope 的 store 由中间件持有引用——**保持现有 per-agent scope 隔离不变**（ReadFile 重构确立的约束，子 Agent 互不可见）。
+    - 链式 API（具名方法 = `Use(标准中间件)` 的语法糖，扩展性靠 `Use()`、可读性靠具名链；每个标准中间件独立文件 + 独立单测）：
+
+    LLM 链（挂载点：`react_agent.go` 主循环 generate 调用处）：
+
+```go
+err := middleware.NewLLM(llmCtx). // llmCtx: Session/Role/Request/Meta
+    Validate().          // 输入校验（新增：长度上限/空请求/注入检测）
+    Guard().             // 安全校验+脱敏（新增，可先空实现占位）
+    RAG().               // RAG 知识库注入（迁入 injectRecalledMemory/injectTopicRecall）
+    Memory().            // 块记忆注入+历史压缩（迁入 MemoryPipeline.Assemble）
+    Assemble().          // 上下文组装（迁入 windowMessages+sanitizeToolPairing+truncateToolCallInputs）
+    Budget().            // token 预算检查（迁入 tokenBudget/LimitReached）
+    Audit().             // 调用审计（迁入 logLLMCall → session_logs）
+    Retry(3).            // 重试/退避（收敛 generate 与 retryProvider 两套不一致策略）
+    Call(a.generateOnce) // 终端：真正的模型调用（流式走回调，Audit 在流结束后记完整响应）
+```
+
+    Tool 链（挂载点：`tool/registry.go Dispatch`）：
+
+```go
+err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/Meta
+    Permit().          // 角色工具白名单（新增：落实到 Dispatch 级，修 tool_adapter.go 仅滤 Schema 缺口）
+    Guard().           // 安全守卫链（GuardRegistry 适配迁入：protected-path/sandbox/角色写路径分区）
+    Budget().          // 探索预算+连读检测+连续失败 LoopExit（迁入 registry.go 现有逻辑）
+    PostHook().        // 出向：WriteFile 后共享记忆失效+PROJECT.md 去抖刷新（迁入 registry.go:369-373）
+    Audit().           // 工具调用审计（收敛 handleToolEvent → session_events）
+    Call(t.Execute)    // 终端：工具执行
+```
+
+    - 迁移映射（现拦截点 → 中间件，原则 = 行为不变搬家，先包后删）：
+      - LLM 链：`memory/pipeline.go:130 Assemble` → `Memory()`；`dispatcher.go injectRecalledMemory` + `service_react.go injectTopicRecall` → `RAG()`；`react_agent.go:317 windowMessages` + `:321 sanitizeToolPairing` + `:387 truncateToolCallInputs` → `Assemble()`；`:359 tokenBudget` → `Budget()`；`:594 logLLMCall` → `Audit()`；`:506 generate` 重试 + `model/retry_provider.go` → `Retry()`（策略在此层统一定死：4xx 快速失败、DeadlineExceeded 不重试、指数退避）。
+      - Tool 链：`tool/guard_registry.go` WriteGuard/CommandGuard → `Guard()`（GuardRegistry 接口不删，作为 Guard() 内部注册表）；`registry.go:296-330` 连读检测 + `:337-348` exploreBudget + `:386-399` 连续失败 → `Budget()`；`:369-373` WriteFile 事后 hook → `PostHook()`；`tool_adapter.go:55` 白名单 → `Permit()` 落实到 Dispatch。
+    - 阶段拆分：
+      - Phase 0 核心抽象：`middleware.go`（Handler/Middleware/Chain）+ `llmchain.go`/`toolchain.go` 具名糖。单测：执行顺序（入向 1→2→3、出向逆序）、error 短路、`Use()` 扩展、空链直调终端。
+      - Phase 1 LLM 链落地：按映射表搬家，`RunWithHistory` 主循环 generate 调用点替换为链式调用；`MemoryPipeline` 接口保留（变成 Memory() 的实现细节）；Retry 策略不一致问题在此层统一。约束：现有测试不改断言只可能改注入入口，全量 `go test ./...` 绿。
+      - Phase 2 Tool 链落地：同原则搬家 + `Permit()` 新增 Dispatch 级白名单校验；GuardRegistry 与现有守卫/连读/预算测试原样绿。
+      - Phase 3 出站链 + 配置化（可选后置）：终答/子 Agent 摘要的输出校验链（schema/内容过滤）；`config.yaml` 加 `middleware:` 段按名开关；`plugins/registry.go` 预留接口接线为 `Use()` 的中间件来源。
+    - 不做（约束）：不引入第三方中间件/AOP 库；不搞反射注册魔法；出站内容审核、人机审批闸不在本期（审批闸已由 #17 P1 destructive 确认项覆盖）；中间件不跨 Agent 共享状态。
+    - 验收：新增横切逻辑只需实现 `Middleware[C]` 并 `Use()`，不改主循环/ Dispatch 本体代码；链式调用形态如上示例；全量测试绿 + TUI 塔防任务回归。
+
+
+20. **LoopExit 死代码修复：循环守卫真正终止 ReAct 循环**（P0，bug，2026-08-08 分析发现）
+    - 背景：三层循环守卫——连读同一文件 ×3（`tool/registry.go:296-330`）、探索预算 8 次（`:332-348`）、单工具连续失败 ×3（`:386-399`）——都试图经 `tools.ActionLoopExit` 终止 ReAct 循环，但**全项目无 `tools.NewContext` 调用方**，`tools.FromContext` 永远失败，信号被静默丢弃（`:319-321`、`:395-397`）。守卫退化为一句错误文本，提示文案承诺的"触发 LoopExit 终止任务"是空话；犯轴的 Agent 只会被逐句拒绝、循环本身永不强制退出。
+    - 执行流程：
+      1. 定哨兵：`tool` 包加 `var ErrLoopExit = errors.New("loop guard: force exit")`；三处守卫命中时删掉写 ctx ActionLoopExit 的旧代码，改为返回包装哨兵（`fmt.Errorf("%w: %s", ErrLoopExit, msg)`），给 LLM 看的提示文案不变。
+      2. Dispatch 透传：`registry.go Dispatch` 对 `errors.Is(err, ErrLoopExit)` 的守卫错误不再吞成普通工具结果，原样上抛（Result + 非 nil error），先确认现有调用点兼容。
+      3. 主循环接住：`agent/react_agent.go` 工具派发/结果收集处检测 `errors.Is(err, ErrLoopExit)` → 终止循环并带原因返回（参照 `LimitReached` 既有路径 `:498-501`；子 Agent 经 `runSubAgent` 走 Failed 语义，父 mailbox 收到"被循环守卫终止"，级联解除父等待）。
+      4. 测试：同一 ReadFile 参数 ×3 → 循环以守卫原因退出；单工具连续失败 ×3 → 退出；普通工具错误不影响循环；探索预算耗尽只拒探索类调用、不误杀 RunCommand 等验证工具（#16 已确立 RunCommand 不计预算，回归保护）。
+    - 验收：`backend/` 与 `test/` 双模块 `go test ./...` 绿；TUI 塔防回归；日志 `[tool] LoopExit`（`registry.go:317`）出现后循环确实停止。
+    - 不做：不调三层守卫阈值/语义（3 次/8 次/3 连败维持现状）；不引入 blades `tools.NewContext` 那套上下文机制（项目自跑循环，哨兵错误是最小接线）。
+
+21. **验收闭环：verifyloop 默认启用 + 按 spec 验收标准验收**（P0；吸收 #2 phase 2 与 #16 相关开放动作）
+    - 背景：`verify_and_fix` + verifyloop 状态机（PlanConfirm→Review→SelfTest→UnifiedTest→Fix，≤5 轮，`verifyloop/orchestrator.go:202-325`）代码完整，但 `config/config.yaml:72-73` 两个 self_test 开关 false → `bootstrap.go:290-291` 不注册工具。当前 MetaAgent 只能盲信子 Agent 自述完成，唯一证据是 FilesModified 列表。隐患：`bootstrap.go:327` `ReviewEnabled == nil || *ReviewEnabled` 在 nil 时启用 reviewer，靠 applyDefaults 兜底掩盖。
+    - 执行流程：
+      1. 修隐患：`bootstrap.go:327` 改显式布尔判断，补单测覆盖 nil/显式 true/显式 false 三态。
+      2. 开开关：`config.yaml` `assistant_self_test_enabled`/`domain_self_test_enabled` 置 true；验证 `RegisterVerifyTool`（`dispatcher.go:557-559`）注册后 meta/domain 白名单可见（白名单已含 `verify_and_fix`，`role/registry.go:196-229`）。
+      3. 验收标准进 verifyloop：WriteSpec 已强制 `acceptance` 必填（`tool/spec.go:75-80`），把 acceptance 文本拼入 verifyloop PlanConfirm/SelfTest 的任务前缀（读取点复用 dispatcher 注入【任务规范】的 `dispatcher.go:1386-1392`），验收从"模型自由心证"变"对照白纸黑字验收标准"。
+      4. ExecuteChild 入树（吸收 #2 开放动作）：verifyloop 同步子 Agent 在 `Tree` Register/Finish，TUI 可见、可取消、heartbeat 覆盖（叶子语义同现有子 Agent）。
+      5. MetaAgent 规程：roles.yaml meta prompt 的【自测验证时机】段升级为硬规程——编码类任务终答前必须 `verify_and_fix` 或显式给出跳过理由；"终答前端到端自验"（#16 开放动作）由第 3 步验收标准支撑。
+      6. 测试：acceptance 注入断言 + ExecuteChild 入树断言；e2e（`test/coding/`）：故意失败的代码任务 → Fix 循环触发 → 修复后通过。
+    - 验收：开关默认 true；塔防全流程 `verify_and_fix` 至少触发一次且终答附验证证据；双模块测试绿。
+    - 不做：不引入独立 Critic Agent 角色（verifyloop 即"固定流程折叠为工具"的既有正确范式）；不强制非编码类任务走 verify。
+
+22. **真·执行计划：board.TaskBoard 接线 + 依赖派发门 + 面板真实进度**（P1）
+    - 背景：运行时无计划——`pkg/types/plan.go:3-4` 自我宣布退役；`board/board.go` 完整实现 TaskBoard（goal/约束/subtask/`DependsOn` `board.go:57`/状态重算/Brief）但生产零写入（`runtime/runtime.go:87` 只构造）；TUI"执行计划"面板是 Agent 树临时合成的派发日志（`tui/helpers.go:69-104`），"总体进度"恒为装饰；任务排序纯靠提示词自觉（`role/registry.go:46`），并行派发无依赖门（#16 实证：MetaAgent 未等回传重复派发渲染引擎 ×3 互相覆盖，当时同域去重治标，依赖门治本）。
+    - 执行流程：
+      1. Phase 0 写入侧：新增 MetaAgent 工具 `write_plan`（meta 白名单，`role/registry.go:196-204`），入参 = 子任务数组 `{id, title, domain, depends_on[], acceptance}`，实现调 `board.Manager.GetOrCreate` + `AddSubTask` 现有 API；校验失败（环依赖/未知依赖 id）返错误。meta prompt 加"拆任务先 write_plan 再派发"。
+      2. Phase 1 派发依赖门：`dispatcher.go` `call_sub_agent` 校验段（`:771-838` 现有校验群同款位置）加依赖检查——depends_on 对应 subtask 非 Done → 拒绝派发并提示等谁（复用 `findPendingDomainSibling` 拒绝模式，拒绝不烧派发配额）。subtask id 与树节点关联：dispatch 时写入 node，Finish 时回写 board 状态。
+      3. Phase 2 面板读真相源：TUI `renderPlanPanel`（`tui/view.go:169-172`）+ `helpers.go:69-104` 改读 `board.Snapshot`（出口参照 Tree() 快照同款）；行 = 子任务（标注依赖），进度 = Done/总数；board 为空（旧会话/未写计划）回退现有树合成逻辑。
+      4. Phase 3 重规划（LLM 驱动，不自动）：`write_plan` 支持改/删非 Done 子任务（板内 version 或全量覆盖，取简）；失败子任务由 #23 结构化失败驱动 MetaAgent 决定重派/改计划。
+      5. 测试：board 写入校验（环依赖/未知依赖）；依赖门拒绝+放行；面板快照映射；write_plan → dispatch → board Done 全链路。
+    - 验收：塔防任务 TUI 面板显示真实子任务与进度百分比；依赖未满足时派发被拒；双模块绿。
+    - 不做：不动 `pkg/types/plan.go`；DAG 不跨 session（`dag/` 包是会话级 cron 调度，不碰）；不做关键路径/甘特图等可视化增强。
+
+23. **结构化失败 + 自动重试 + 升级路径**（P1）
+    - 背景：子 Agent 失败回传是一段自然语言（`formatSubAgentFailure`，`dispatcher.go:1280-1288`），无类型无错误码；全库无自动 retry/fallback/escalation，失败后怎么办全靠 LLM 当场发挥（`react_agent.go:948` 仅提示词）；`MsgEscalate`/`MsgMilestone`/`MsgDependency` 定义了从不发送；`errLimitReached` 哨兵（`dispatcher.go:1266`）有匹配无产出，死代码；发给已死 Agent 的消息静默消失。
+    - 执行流程：
+      1. 失败类型化：`dispatcher` 加 `FailureKind`（timeout/error/budget_partial/killed/loop_guard）；`treeFinish` Failed 时 mailbox body 头部加一行机读标记（`[failure kind=timeout retryable=false]`）+ 原有人读文本（父 LLM 消费习惯不变）。
+      2. 自动重试（最小一档）：`kind=error 且 retryable` 的**叶子助手**失败由 dispatcher 自动重派 1 次（同任务同前缀）；复用 `config.yaml agent.retry_count: 1` 现存字段（先确认无消费方再接线）。domain 层与 timeout/killed 不自动重试（交 MetaAgent 决策，避免放大故障）。
+      3. 升级路径：叶子/domain 无法自治时经 `send_message` 发 `MsgEscalate` 给 parentID（类型已有，补发送点 + 父侧 drain 展示 `[升级]` 前缀）；meta prompt 加升级处置规程（重派/自己接手/回报用户三选一）。
+      4. 死信可见：`mailbox.Send` 对不存在/已完成收件人返回错误，发送方工具结果带"消息未送达"，消除静默消失。
+      5. 死代码清理：`errLimitReached` 接线或删除（倾向删除，budget/maxIter 路径已覆盖语义）。
+      6. 测试：每种 kind 的机读标记断言；error 重派一次后仍失败 → 父收到结构化失败；死信返错；escalate 父侧可见。
+    - 验收：人为制造一次叶子失败，日志可见自动重派 1 次 + 父收到结构化失败；双模块绿。
+    - 不做：不做指数退避/多档重试（只此一档一次）；不做熔断器（轻量模型 402 熔断 `pipeline.go` 已有范式，需要时再说）；MsgMilestone/MsgDependency 维持不用不删（见 #26）。
+
+24. **人在回路：ask_user 工具 + 工具审批门通用机制**（P1）
+    - 背景：Dispatch 无审批钩子（`tool/registry.go:276-405` 守卫直连执行）；无 ask-user 工具；`PendingClarify` 恒 nil（`service_react.go:1542` 硬编码），`awaiting_clarify` 被挪作"暂停等继续"（`pauseSession :1199-1216`）；TUI `/clarify`（`tui/input.go:273-278`）dormant。自动写文件跑命令的系统全程无人类检查点。与 #17 P1 关系：本项提供通用提问/确认通道，#17 P1（destructive 工具生产边界确认）作为其消费者落地，不重复建设；与 #19 中间件兼容（审批即 Tool 链一环）。
+    - 执行流程：
+      1. 会话态正名：`pauseSession` 的 PauseKind（#15 已有 IterationLimit/TokenBudget/OnChild）新增 `Clarify`，复用 `awaiting_clarify` 状态但真实填充 `PendingClarify{Question, Context}`（替换 `:1542` 硬编码 nil）；用户任意回复走 #15 既有恢复路由。
+      2. `ask_user` 工具：注册进 meta/domain 白名单；Execute 置 PendingClarify + 暂停会话 + 经 liveFn/session 事件推送问题；用户答复作为该工具 result 返回发问 Agent（恢复后工具结果入史，ReAct 继续）。超时（配置，默认 0=不限）未答 → 工具返回"用户未答复，自行决策"。
+      3. 审批门：`Registry.Dispatch` 加可选 `approvalHook(ctx, toolName, args) (bool, error)` 字段（nil = 全放行，零行为变化）；命中审批规则的调用 → 走 ask_user 同款通道等确认，拒绝 → 工具返回"用户拒绝"。本期审批规则只接 #17 P1 的 destructive+生产边界一条，不起规则引擎。
+      4. TUI：渲染 PendingClarify（问题 + 答复输入），答复走现有 input → sendMessage 路径；`/clarify` 命令视实现保留或删。
+      5. 测试：ask_user 暂停→答复→工具结果闭环；approvalHook nil 零行为变化；destructive 命中暂停等确认、拒绝返错；TUI 手测。
+    - 不做：不做多步表单/多选问题（一问一答文本即可）；不做权限角色矩阵；web 前端同步改造列开放动作。
+
+25. **MetaAgent 控制面 + 全局硬终止**（P1）
+    - 背景：MetaAgent 无取消子 Agent 的工具（`CancelAgent` 仅 HTTP `server/session_http.go:307`，TUI 不调用）；子 Agent `context.Background()` 脱离会话（`dispatcher.go:852-859`），用户取消会话杀不死在跑子 Agent（残留 goroutine 烧 token 直到 60min 超时）；心跳巡检只覆盖叶子（`:883-890` 注释：domain 有 wait loop 注入会误杀）；`tool_call_max_rounds: -1` 迭代无上限 + 无会话墙钟，唯一兜底是 token 预算→暂停，系统永远不会主动止损。
+    - 执行流程：
+      1. `cancel_agent` 工具（meta/domain 白名单）：入参 agent_id → `Tree.Cancel`（`orchestrator/tree.go:225-249`）+ `doneOnce.Do(trackChildDone)` 计数兜底（参照 `killStuckSubAgent` `:283-305` 模式）+ mailbox 通知父"已被上级取消"。
+      2. 会话取消级联：`service_react.go cancel`（`:1467-1499`）除取消 MetaAgent ctx 外，遍历树 Running 节点逐个 Cancel（detach 语义对 pause/resume 的好处保留，仅"会话终止"这一刻级联）；迟到结果被既有 purge 覆盖（`:1057-1061`）。
+      3. domain 层心跳（防误杀版）：domain 的"活动"= 自身 LLM/工具活动 **或** 任一后代活动/回信（子活动沿 parentID 链向上冒泡刷新时间戳，subMeta 已有 parentID）；domain 阈值单独配置（默认 2× 叶子）。先写测试证明"domain 合法等子不被杀"。
+      4. 全局硬终止：`config.yaml` 加 `session_max_wall_clock_min`（默认 0=关闭，保持现状语义）；到期 → 级联取消全部节点 + 会话置 error"超全局时限" + 树/日志已落库可复盘。`tool_call_max_rounds` 维持 -1（token 预算已兜底迭代失控）。
+      5. 测试：cancel_agent 闭环（树状态 + cancel func，参照 `tree_cancel_test.go`）；会话取消后子 goroutine 退出可观测；domain 等子 60min 不误杀 vs domain 假死被杀两例；全局时限到期级联。
+    - 验收：TUI 塔防回归 + 人为挂起一个 domain 验证心跳与止损；双模块绿。
+    - 不做：不做抢占式优先级/调度器；不改 detach ctx 基本设计（pause/resume 依赖它）。
+
+26. **一致性收尾：文案/开关/legacy 清理**（P2）
+    - 背景：一批"开关与文案/配置不一致"的小项，单独立项不值，放着会持续误导（LLM 读工具描述、人读注释）。
+    - 执行流程：
+      1. spec 强制对齐：`call_sub_agent` 工具描述声称 WriteSpec 强制（`dispatcher.go:735`）与 `spec_enforcement_enabled: false`（`config.yaml:85`）矛盾——决策：塔防实证 spec 有用，倾向开 true 跑回归；若过度阻塞则改工具描述为"建议"。同步修 `bootstrap.go:255-256` 陈旧注释"默认 true"。
+      2. "任意深度的递归调用"注释（`dispatcher.go:537-538`）改为实际三层语义（Meta→Domain→叶子，`CanCall` `role/registry.go:245-287` 拒绝 domain→domain）。
+      3. mailbox 未用类型（MsgMilestone/MsgDependency/广播桶）：加注释"预留无消费方"；#23 落地 escalate 后其余仍无场景则下次删。
+      4. 角色写沙箱样板：Layer 4 已接线但 dormant（#12 归档：无角色配 `allowed_write_paths`）——用 `code_assistant` 验证 `enforceRoleWritePath`（`sandbox.go:192-219`）真实生效后，把样例写进 roles.yaml 注释；默认配置维持空=不限制，行为不变。
+      5. 语义召回决策：embed `pseudo`（`roles.yaml:281` + `embed/pseudo.go:5-25` 字符哈希假向量）使块记忆召回非语义——决策项：配真实 embed provider（roles.yaml embed 段）或显式接受 pseudo 并在文档标注"召回为字符哈希近似"；不改代码。
+      6. legacy 清理：`agent_private_memory`/`agent_snapshots` 疑似 legacy 表（`schema.go:190-211`）、`max_blocks`/`summary_interval` 字段（`pkg/config/role_config.go:40-46`）——确认无消费方后删除或标注。
+    - 验收：roles.yaml 改动跑 `test/` 的 role_config_sanity_test.go；双模块测试绿；无行为回归。
+    - 不做：本项不加任何新功能。
+
 
 ## 已完成（已归档到 git 历史）
 
