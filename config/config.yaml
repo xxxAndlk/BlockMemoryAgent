@@ -61,40 +61,24 @@ agent:
     ui_assistant: 200000
     prompt_reviewer: 100000
     code_reviewer: 100000
-    test_assistant: 600000   # 验证需读全部产出文件+写跑测试，实证 100K 部分回灌导致验证闭环全挂；300K 在塔防级任务单个验证轮 4.5 分钟烧穿（块记忆注入含完整工具输出，每步 ~20K input 重发）
+    test_assistant: 200000   # 与编码叶子同级：自动验证闭环已下线，测试助手回归普通叶子（写测试+跑测试）
     doc_assistant: 100000
+  paused_domain_max_resumes: 1   # 同一 Paused DomainAgent 允许的最大续跑次数。续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证 v10 基准验收领域研磨 32 轮 30 分钟不收敛）；触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
 
   # -- DAG / 会话恢复 --
   dag_enabled: false             # DAG 定时任务调度（默认关闭）
   restore_sessions: false        # 启动时从 session_history 恢复最近 50 个会话到内存（默认 true；TUI 不需要历史记录，显式 false 关闭，启动即为全新会话）
 
-  # -- 多 Agent 协作验证闭环（verifyloop 编排器原生驱动，不依赖主 Agent 提示词）--
-  # 接线说明：命中的角色（code_role）子 Agent 成功完成后，dispatcher 在回灌父 Agent 前
-  # 同步驱动"自测->修正->上级统一测试"状态机，验证结论以【验证闭环:通过/未通过】前缀并入摘要；
-  # verify_and_fix 工具保留给 MetaAgent/DomainAgent 显式复检。验证/修正轮走 ExecuteChild 同步派发，
-  # 不递归触发自动验证。
-  # 2026-08-08 A/B 实证（test/benchmark/runs/multi-on vs multi-off，同二进制唯一变量=本开关）：
-  # 开=5/16 通过率 + 558 万 token（测试助手独占 71%）；关=16/16 + 284 万 token。
-  # 机制本身已跑通（VERIFY PASS 出现、0 心跳误杀、0 summarize 失败），但当前形态默认关闭：
-  # verifier 按累计 input 计费致文件级验证全部烧穿预算；零件级验证通过≠整品可用；
-  # 大量未通过摘要干扰父 Agent 决策致提前收尾。待验证改为"meta 层整品端到端单次验证"后再考虑开启。
-  assistant_self_test_enabled: false # code_assistant 等产出角色完成后自动触发"自测->修正->上级统一测试"状态机
-  domain_self_test_enabled: false    # 领域 Agent 完成后自动触发模块级统一测试（dispatcher 完成路径已接线）
-  verification_max_rounds: 5         # 验证闭环往返上限，防止 code<->test 平级互问死循环
-  # 验证角色对：产出角色完成后由测试角色验证。为空时回退默认 [{code_assistant, test_assistant}]。
-  # 显式配置可扩展多角色对，如 UI 任务由 test_assistant 验证：
-  #   - code_role: ui_assistant
-  #     test_role: test_assistant
-  verification_role_pairs:
-    - code_role: code_assistant
-      test_role: test_assistant
+  # -- 验证机制：分层自检（2026-08-08 起，替代已下线的 verifyloop 测试助手自动验证）--
+  # 叶子 Agent 自检（写完即语法检查）；领域 Agent 对叶子产出做整体性验收，不过则返工叶子；
+  # MetaAgent 对所有领域产出做整品验收，不过则返工领域。均走提示词纪律，无独立验证 Agent。
+  # A/B 实证自动验证闭环是负资产（开 5/16 + 558 万 token vs 关 16/16 + 284 万 token），
+  # 业务级测试（computer-use 点击页面 / CLI 跑命令断言）移至 doc/扩展设计_Agent工作流平台.md §12 作后期扩展。
   block_memory_write_enabled: true   # 子 Agent 完成后沉淀结果摘要到块记忆知识库
 
   # -- 强制门（默认全关，基础任务先跑通；Pipeline 重构后整体移除）--
   spec_enforcement_enabled: false    # call_sub_agent 前是否强制 WriteSpec
-  plan_skip_enabled: true            # 跳过 verifyloop PlanConfirm 阶段
-  review_enabled: false              # verifyloop 插入 code_reviewer 静态审查
   max_total_dispatches: 30           # 单 session 派发总数上限
 
   # -- 工具沙箱（安全）--

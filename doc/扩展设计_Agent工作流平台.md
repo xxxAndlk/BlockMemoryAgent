@@ -1016,7 +1016,66 @@ wiki 的写入与召回**不新开口子**，全部挂在 TODO #19 定义的链�
 
 ---
 
-## 12. 总结
+## 12. 业务验收测试工作流（Computer-Use / CLI，后期扩展）
+
+> 本节是已定稿的后期扩展方向（2026-08-08），当前**未实现**。活跃验证机制为分层自检
+> （叶子自检 / 领域整体性验收 / Meta 整品验收+返工，见 `config/roles.yaml` 提示词纪律），
+> 本节描述的是建在其上的独立业务测试层。
+
+### 12.1 背景：自动验证闭环为什么下线
+
+2026-08-08 A/B 实证（`test/benchmark/runs/multi-on` vs `multi-off`，同二进制唯一变量=验证开关）：
+
+| 组 | 通过率 | 耗时 | token |
+|---|---|---|---|
+| 验证闭环开（每个叶子完成后自动派 test_assistant 验证） | 5/16 = 31% | 60min | ≈558 万（测试助手独占 71%） |
+| 验证闭环关（分层自检） | 16/16 = 100% | 103min | ≈284 万 |
+
+根因三条：
+
+1. **计费模型不匹配**：verifier 子 Agent 按累计 input 计费（ReAct 每步全量重发历史，块记忆注入含完整工具输出），~25 次调用即烧穿 600K 预算，文件级验证全部 partial 夭折；
+2. **零件级验证通过 ≠ 整品可用**：逐文件 PASS 与最终集成断裂并存（Game 实例未建/HUD 缺失照样拿 PASS）；
+3. **失败摘要干扰父 Agent**：大量【验证闭环:未通过】回灌导致父 Agent 提前收尾。
+
+代码处置：`backend/internal/domain/verifyloop` 包作为原型保留（未接线）；`dispatcher` 的 `ExecuteChild` 仍实现其 `Runner` 接口；`assistant_self_test_enabled` / `domain_self_test_enabled` / `verification_role_pairs` / `verification_max_rounds` / `plan_skip_enabled` / `review_enabled` 配置已移除。复活时按下文重新设计配置形态，勿直接恢复旧开关。
+
+### 12.2 目标形态：业务测试作为工作流独立阶段
+
+业务测试不挂在"每个叶子完成后"（太碎、太贵），而是 §2 工作流 YAML 中的**独立阶段节点**，在 Meta 整品验收通过后运行：
+
+```yaml
+- id: business_acceptance
+  name: 业务验收测试
+  type: task
+  agent: test_assistant
+  action: |
+    以真实用户方式验收整品：
+    1. CLI 层：构建命令、node --check、冒烟脚本、API curl 断言
+    2. 页面层：computer-use 打开页面 -> 截图 -> 模拟点击/输入 -> 断言 DOM/截图
+    3. 输出结构化验收报告（逐条 通过/失败 + 证据），失败项回灌责任领域返工
+  depends_on: [meta_acceptance]
+  timeout: 20m
+```
+
+### 12.3 需要新建的能力
+
+- **ComputerUse 工具组**（新工具，挂 test_assistant 白名单）：打开页面/截图/点击/键盘输入/读取 DOM 快照。可走 Playwright/CDP（headless 浏览器）或平台原生 API；对应 verifyloop.Verifier 的 ComputerUse 实现（包注释已预留该扩展点）。
+- **CLI 断言 Verifier**：跑命令 + 断言退出码/输出，对应 verifyloop.Verifier 的 CLI 实现。
+- **预算双限**：单次验证调用上限 + 验证次数上限（替代旧的单一累计预算，防 §12.1 根因 1 复发）。
+- **验证任务 prompt 规范**：任务必须带文件清单 + 验收点 + 运行方式（复用领域提示词【集成验证任务模式】的批量读纪律），块记忆注入需摘要化（不带完整工具输出）。
+- **整品端到端单次验证**：只对最终整品验一次，不逐零件验；失败才下钻定位。
+
+### 12.4 实现步骤（建议）
+
+- [ ] CLI runner 工具原型 + verifyloop.Verifier 的 CLI 实现（含预算双限改造）
+- [ ] Playwright/CDP sidecar 或平台原生 computer-use 通道
+- [ ] ComputerUse Verifier 实现 + test_assistant 工具白名单扩展
+- [ ] 工作流引擎接入（依赖 §2 Phase 2）；过渡期由 meta 提示词的"整品验收领域"承载（已实现，见 `config/roles.yaml`【整品验收与返工】）
+- [ ] 塔防基准回归：开启业务测试层后通过率不降、token 增量 < 30%
+
+---
+
+## 13. 总结
 
 BlockMemoryAgent 的扩展设计遵循一个核心原则：**底层架构统一（记忆、路由、Agent Core），上层场景扩展（编程、工作流、测试、研究、协作）**。
 

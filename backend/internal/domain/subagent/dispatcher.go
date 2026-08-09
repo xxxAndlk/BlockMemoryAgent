@@ -18,7 +18,6 @@ import (
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // orchestrator 提供 Agent 树元数据层
 	"github.com/blockmemory/agent/backend/internal/domain/role"         // role 包提供角色注册表
 	"github.com/blockmemory/agent/backend/internal/domain/tool"         // tool 包提供工具注册表与 Result 类型
-	"github.com/blockmemory/agent/backend/internal/domain/verifyloop"   // verifyloop 提供 Orchestrator/Verifier/Fixer/Reporter 状态机,供 verify_and_fix 工具复用
 	"github.com/blockmemory/agent/backend/internal/logger"              // logger 包提供会话级日志器，记录子 Agent LLM I/O
 	"github.com/blockmemory/agent/backend/internal/mailbox"             // mailbox 包用于子 Agent 向父 Agent 发送完成通知
 	"github.com/blockmemory/agent/backend/pkg/enums"                    // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
@@ -127,14 +126,6 @@ type Dispatcher struct {
 	// writeEnabled 块记忆写入开关，由配置（agent.block_memory_write_enabled）注入。
 	writeEnabled bool
 
-	// orchs 按 code_role 索引的验证闭环编排器集合，由 RegisterVerifyTool 注入。
-	// 非空时子 Agent 成功完成且其角色命中 orchs 键（如 code_assistant/domain），
-	// 在 notify 父 Agent 前同步驱动 verifyloop 状态机（自测->修正->上级统一测试），
-	// 验证结论并入回灌摘要——验证由编排层原生驱动，不依赖 LLM 自觉调 verify_and_fix。
-	// 编排器内部经 ExecuteChild->runSubAgentOnce 派发验证/修正 Agent，绕开 runSubAgent
-	// 包装器，不会递归触发本自动验证。为 nil/空时跳过自动验证（不影响显式工具调用）。
-	orchs map[string]*verifyloop.Orchestrator
-
 	// log 是会话级日志器，用于记录子 Agent LLM I/O（完整 prompt/response）到 session_logs。
 	// 为 nil 时子 Agent 不写 LLM I/O 日志，不影响派发主流程。
 	log *logger.Logger
@@ -156,6 +147,14 @@ type Dispatcher struct {
 	// DomainAgent 触达 token 上限时 SaveMessages 落库,resume 时 LoadMessages 重建上下文。
 	// 为 nil 时跳过持久化(测试场景:domain 到限仍返 errPaused 但 history 不存,无法 resume)。
 	msgStore agent.MessagesStore
+
+	// pausedResumes 跟踪每个 Paused domain 节点已续跑的次数（nodeID -> *atomic.Int64）。
+	// ResumePaused 入口按 maxPausedResumes 校验，触顶后强制收口部分返回——
+	// 续跑重置 fresh budget 使 token 上限永不绑定（v10 实证：验收领域暂停-续跑研磨
+	// 30 分钟不收敛），绑定点必须落在续跑层。
+	pausedResumes sync.Map
+	// maxPausedResumes 同一 Paused domain 允许的最大续跑次数；<=0 时按默认值 1。
+	maxPausedResumes int
 
 	// factExtractor 从子 Agent 输出中提取关键事实，替代原始 result.Text 直接落库。
 	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
@@ -437,6 +436,15 @@ func (d *Dispatcher) WithTimeout(t time.Duration) *Dispatcher {
 	return d
 }
 
+	// WithMaxPausedResumes 设置同一 Paused domain 的最大续跑次数（<=0 按默认 1）。
+// 触顶后 ResumePaused 不再给 fresh budget 续跑，强制收口：部分产出 notify 父 + 标 Done，
+// 由 MetaAgent 决定返工——与叶子助手 errPartialReturn 同哲学。
+// bootstrap 按 cfg.Agent.PausedDomainMaxResumes 注入。
+func (d *Dispatcher) WithMaxPausedResumes(n int) *Dispatcher {
+	d.maxPausedResumes = n
+	return d
+}
+
 // WithLoopConfigByRole 注入按角色返回 LoopConfig 的函数,使不同角色 token 预算分级
 // (domain 50K / 叶子助手 20K / meta 0)。bootstrap 传 reactCfg.LoopConfigByRole 方法值。
 func (d *Dispatcher) WithLoopConfigByRole(fn func(string) agent.LoopConfig) *Dispatcher {
@@ -541,12 +549,13 @@ func (d *Dispatcher) WithSpecEnforcement(enabled bool) *Dispatcher {
 	return d
 }
 
-// RegisterCallTool 将 call_sub_agent 工具安装到传入的工具注册表中。
+// RegisterCallTool 将 call_sub_agent / call_sub_agents 工具安装到传入的工具注册表中。
 // 工具被注册到父 Agent 与子 Agent 共同使用的 registry 上，
 // 因此子 Agent 还能继续生成自己的子 Agent，形成任意深度的递归调用。
 func (d *Dispatcher) RegisterCallTool(r *tool.Registry) {
-	// 注册 callSubAgentTool 实例，工具内部持有当前 Dispatcher 以便执行时调用。
+	// 注册 callSubAgentTool / callSubAgentsTool 实例，工具内部持有当前 Dispatcher 以便执行时调用。
 	r.Register(&callSubAgentTool{dispatcher: d})
+	r.Register(&callSubAgentsTool{dispatcher: d})
 }
 
 // RegisterMessagingTool 将 send_message 工具安装到传入的工具注册表中。
@@ -556,17 +565,6 @@ func (d *Dispatcher) RegisterCallTool(r *tool.Registry) {
 // 其收件箱等待，但若目标已销毁则消息会被 Purge 一并清除。
 func (d *Dispatcher) RegisterMessagingTool(r *tool.Registry) {
 	r.Register(&sendMessageTool{dispatcher: d})
-}
-
-// RegisterVerifyTool 将 verify_and_fix 工具安装到工具注册表,并把按 code_role 索引的
-// verifyloop.Orchestrator 集合传入工具实例。工具内部由 MetaAgent/DomainAgent 显式调用,
-// 不再依赖 OnSubAgentDone 钩子自动触发(步骤 5:双控制流合并,verifyloop 折叠进 ReAct)。
-// 同一集合并存到 d.orchs：子 Agent 完成路径（runSubAgent）按角色命中自动驱动验证闭环，
-// 补齐"产出->验证->修正->上级统一测试"的原生触发（显式工具保留用于复检）。
-// orchestrators 为空时仍注册工具但 Execute 返回"未配置验证角色对"错误。
-func (d *Dispatcher) RegisterVerifyTool(r *tool.Registry, orchestrators map[string]*verifyloop.Orchestrator) {
-	d.orchs = orchestrators
-	r.Register(&verifyAndFixTool{dispatcher: d, orchs: orchestrators})
 }
 
 // sendMessageTool 实现 send_message 工具：向指定 Agent 实例邮箱投递一条消息。
@@ -639,86 +637,6 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 	}
 }
 
-// verifyAndFixTool 实现 verify_and_fix 工具:MetaAgent/DomainAgent 显式调起验证闭环。
-// 折叠进 ReAct 作工具调用,而非独立编排器自动触发(步骤 5)。内部复用 verifyloop.Orchestrator
-// 状态机(SelfTest -> Fix -> UnifiedTest 往返),Reporter 把结果投递父 Agent 邮箱。
-type verifyAndFixTool struct {
-	dispatcher *Dispatcher
-	orchs      map[string]*verifyloop.Orchestrator
-}
-
-// Name 返回工具名称。
-func (t *verifyAndFixTool) Name() string { return "verify_and_fix" }
-
-// Aliases 返回工具别名列表,当前无别名。
-func (t *verifyAndFixTool) Aliases() []string { return nil }
-
-// Description 返回 LLM 可见描述。
-func (t *verifyAndFixTool) Description() string {
-	entries := []string{}
-	for k := range t.orchs {
-		entries = append(entries, k)
-	}
-	pairs := "无"
-	if len(entries) > 0 {
-		pairs = strings.Join(entries, ", ")
-	}
-	return "显式触发验证闭环:对已完成的产出做自测 + 修正 + 上级统一测试往返(最多 max_rounds 轮)。" +
-		"仅 MetaAgent/DomainAgent 可调用。MetaAgent 派发的复杂任务完成后,显式调用本工具决定何时验证," +
-		"替代旧 OnSubAgentDone 钩子自动触发(双控制流合并)。\n\n" +
-		"参数 task 为原始任务文本(供验证 Agent 知道验什么);produced 为待验证的当前产出文本;" +
-		"code_role 可选,选该产出对应的角色(如 code_assistant/domain),默认用配置的第一对。" +
-		"通过即返回 passed=true + 最终产出;未通过返回 passed=false + 失败原因,Reporter 同时投递结果到邮箱。\n\n" +
-		"已配置验证角色对(code_role): " + pairs + "。"
-}
-
-// Execute 执行 verify_and_fix 工具调用。
-func (t *verifyAndFixTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
-	parentID := agent.AgentIDFromContext(ctx)
-	if parentID == "" {
-		return &tool.Result{Tool: "verify_and_fix", Error: "missing caller agent context"}
-	}
-	task, _ := args["task"].(string)
-	produced, _ := args["produced"].(string)
-	if produced == "" {
-		return &tool.Result{Tool: "verify_and_fix", Error: "produced is required"}
-	}
-	codeRole, _ := args["code_role"].(string)
-	if codeRole == "" {
-		// 默认取第一对(遍历 map 顺序不保证,但配置通常单对)。
-		for k := range t.orchs {
-			codeRole = k
-			break
-		}
-	}
-	if codeRole == "" {
-		return &tool.Result{Tool: "verify_and_fix", Error: "no verify pair configured: 未配置验证角色对(self_test_enabled 关闭或 verification_role_pairs 为空)"}
-	}
-	o, ok := t.orchs[codeRole]
-	if !ok {
-		return &tool.Result{Tool: "verify_and_fix", Error: fmt.Sprintf("no orchestrator for code_role=%s", codeRole)}
-	}
-	// ProducerID 用 caller 自身:旧钩子路径传 subAgentID,工具路径无独立产出方 ID,复用 parentID。
-	// Reporter 投递结果到 parentID 邮箱,供调用方在下一轮 ReAct 迭代 Drain 收件箱读取。
-	req := verifyloop.Request{
-		ParentID:    parentID,
-		ProducerID:  parentID,
-		InitialTask: task,
-		Produced:    produced,
-	}
-	result := o.Run(ctx, req)
-	out := fmt.Sprintf("passed=%v rounds=%d", result.Passed, result.Rounds)
-	if !result.Passed {
-		out += "\nfail_reason: " + result.FailReason
-	}
-	out += "\n\n【最终产出】\n" + result.FinalProduced
-	return &tool.Result{
-		Tool:    "verify_and_fix",
-		Success: result.Passed,
-		Output:  out,
-	}
-}
-
 // callSubAgentTool 实现内部 tool.Tool 接口，代表 call_sub_agent 这一可调用工具。
 type callSubAgentTool struct {
 	dispatcher *Dispatcher // dispatcher 持有调度器引用，工具执行时通过它创建子 Agent。
@@ -757,10 +675,47 @@ func (t *callSubAgentTool) Description() string {
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
+// validateDispatchArgs 校验单次派发的必要参数；返回空串表示通过，否则为错误文案。
+// 供 call_sub_agent 与 call_sub_agents 复用（批量工具逐项校验）。
+func validateDispatchArgs(roleID, task, responsibility string) string {
+	// 校验必要参数：role_id 与 task 均不能为空。
+	if roleID == "" || task == "" {
+		return "role_id and task are required"
+	}
+	// role_id="domain" 时 responsibility 必填：dispatcher 把它注入子 Agent 系统提示词头部，
+	// 防止长 ReAct 循环中 task 被历史压缩后领域身份丢失（实证：领域 Agent 越界实现他域文件）。
+	// LLM 经常省略该字段，导致 DomainAgent 拿到的是通用 prompt 无职责边界——此处硬拒绝强制回填。
+	if roleID == "domain" && strings.TrimSpace(responsibility) == "" {
+		return "responsibility is required when role_id=domain: 填该领域 Agent 的职责边界（<=200 字，负责哪些文件/模块、不碰哪些），会注入子 Agent 系统提示词"
+	}
+	// task 长度上限：强制 MetaAgent 把规格写入 WriteSharedMemory，task 只写目标+验收标准。
+	// 原 500 runes 实证过紧：塔防类任务的自然派发文本 ~1200-1500 runes，每轮必触发
+	// "task too long" 拒绝-重写循环（单次运行最多 4 次拒绝，白烧 1-2 分钟路由轮次）。
+	// 放宽到 2000 runes：容纳"背景+目标+文件清单+验收"的完整自包含描述，
+	// 仍拦截 3500+ runes 的全量规格转贴（事故日志：3521/2315 runes）。
+	const maxTaskRunes = 2000
+	if n := utf8.RuneCountInString(task); n > maxTaskRunes {
+		return fmt.Sprintf(
+			"task too long: %d runes (max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（2000 字内）",
+			n, maxTaskRunes)
+	}
+	return ""
+}
+
+// checkSpecBeforeDispatch 做 WriteSpec 强制校验：SpecEnforcementEnabled 开启时，
+// 派发前必须先 WriteSpec（校验 parentID:spec 存在、新鲜、Spec.Goal 非空且至少一条 Acceptance）。
+// 校验失败不区分 stale/missing：stale（文件被改过）等价于 spec 过期，同样要求重写。
+// 返回空串表示通过，否则为错误文案。批量派发（call_sub_agents）只校验一次。
+func (d *Dispatcher) checkSpecBeforeDispatch(ctx context.Context, parentID string) string {
+	if d.specEnforcementEnabled && !d.hasFreshSpec(ctx, parentID) {
+		return "spec missing or stale: 先调 WriteSpec(goal, acceptance, constraints, files) 写任务规范，再派发"
+	}
+	return ""
+}
+
 // Execute 执行 call_sub_agent 工具调用。
 // 参数 args 由大模型提供，包含 role_id 与 task；返回值 *tool.Result 表示调用结果。
 func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
-	// 取出工具持有的调度器引用，后续操作都通过它完成。
 	d := t.dispatcher
 
 	// 从 args 中提取 role_id 与 task，类型断言失败时得到空字符串。
@@ -771,55 +726,46 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	// responsibility 可选：仅 role_id="domain" 时注入子 Agent 系统提示词，钉住职责边界。
 	responsibility, _ := args["responsibility"].(string)
 
-	// 校验必要参数：role_id 与 task 均不能为空。
-	if roleID == "" || task == "" {
-		return &tool.Result{Tool: "call_sub_agent", Error: "role_id and task are required"}
+	if msg := validateDispatchArgs(roleID, task, responsibility); msg != "" {
+		return &tool.Result{Tool: "call_sub_agent", Error: msg}
 	}
-
-	// role_id="domain" 时 responsibility 必填：dispatcher 把它注入子 Agent 系统提示词头部，
-	// 防止长 ReAct 循环中 task 被历史压缩后领域身份丢失（实证：领域 Agent 越界实现他域文件）。
-	// LLM 经常省略该字段，导致 DomainAgent 拿到的是通用 prompt 无职责边界——此处硬拒绝强制回填。
-	if roleID == "domain" && strings.TrimSpace(responsibility) == "" {
-		return &tool.Result{Tool: "call_sub_agent", Error: "responsibility is required when role_id=domain: 填该领域 Agent 的职责边界（<=200 字，负责哪些文件/模块、不碰哪些），会注入子 Agent 系统提示词"}
-	}
-
-	// task 长度上限：强制 MetaAgent 把规格写入 WriteSharedMemory，task 只写目标+验收标准。
-	// 原 500 runes 实证过紧：塔防类任务的自然派发文本 ~1200-1500 runes，每轮必触发
-	// "task too long" 拒绝-重写循环（单次运行最多 4 次拒绝，白烧 1-2 分钟路由轮次）。
-	// 放宽到 2000 runes：容纳"背景+目标+文件清单+验收"的完整自包含描述，
-	// 仍拦截 3500+ runes 的全量规格转贴（事故日志：3521/2315 runes）。
-	const maxTaskRunes = 2000
-	if n := utf8.RuneCountInString(task); n > maxTaskRunes {
-		return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf(
-			"task too long: %d runes (max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（2000 字内）",
-			n, maxTaskRunes)}
-	}
-
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
 	if parentID == "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: "missing parent agent context"}
 	}
+	if msg := d.checkSpecBeforeDispatch(ctx, parentID); msg != "" {
+		return &tool.Result{Tool: "call_sub_agent", Error: msg}
+	}
 
-	// Spec 强制：SpecEnforcementEnabled 开启时，call_sub_agent 前必须先 WriteSpec。
-	// 校验 parentID:spec 存在、SharedEntry 新鲜（verifyFileMtimes）、Spec.Goal 非空且至少一条 Acceptance。
-	// 缺失则拒绝派发，逼派发方先写结构化规范，实现"规范先行"语义。
-	// 校验失败不区分 stale/missing：stale（文件被改过）等价于 spec 过期，同样要求重写。
-	if d.specEnforcementEnabled {
-		if !d.hasFreshSpec(ctx, parentID) {
-			return &tool.Result{Tool: "call_sub_agent", Error: "spec missing or stale: 先调 WriteSpec(goal, acceptance, constraints, files) 写任务规范，再 call_sub_agent"}
-		}
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility)
+	if errRes != nil {
+		errRes.Tool = "call_sub_agent"
+		return errRes
+	}
+	return &tool.Result{Tool: "call_sub_agent", Success: true, Output: subAgentID}
+}
+
+// dispatchOne 执行一次子 Agent 异步派发：权限校验→同领域去重→全局限额→注册树→goroutine。
+// 成功返回 subAgentID；失败返回 *tool.Result（Error 非空，Tool 字段由调用方按工具名覆盖）。
+// 前置：调用方已完成参数校验（validateDispatchArgs）与 spec 强制校验。
+// 供 call_sub_agent（单个）与 call_sub_agents（批量同波）两个工具复用。
+func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility string) (string, *tool.Result) {
+	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
+	parentID := agent.AgentIDFromContext(ctx)
+	if parentID == "" {
+		return "", &tool.Result{Error: "missing parent agent context"}
 	}
 
 	// 从角色注册表获取目标角色定义，若角色不存在则拒绝调用。
 	roleDef := d.registry.Get(roleID)
 	if roleDef == nil {
-		return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf("unknown role: %s", roleID)}
+		return "", &tool.Result{Error: fmt.Sprintf("unknown role: %s", roleID)}
 	}
 
 	// 校验调用权限：只有被允许的角色关系才能发起子 Agent 调用。
 	if !d.registry.CanCall(roleIDFromAgentID(parentID), roleID) {
-		return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf("role %s cannot be called by %s", roleID, parentID)}
+		return "", &tool.Result{Error: fmt.Sprintf("role %s cannot be called by %s", roleID, parentID)}
 	}
 
 	// 重复派发去重：同一父 Agent 已有同领域（domain 相同）的子 Agent 在执行/暂停中时拒绝。
@@ -828,7 +774,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	// 不另维护计数（杜绝清理遗漏）。拒绝发生在限额计数之前，不烧派发配额。
 	if roleID == "domain" {
 		if dup := d.findPendingDomainSibling(ctx, parentID, domain); dup != "" {
-			return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf(
+			return "", &tool.Result{Error: fmt.Sprintf(
 				"duplicate dispatch: 同领域子 Agent %s 正在执行中（domain=%s）。请等待其 [mailbox from %s] 回传结果后再做下一步；如需补充或修正需求，等其完成后再派发",
 				dup, domain, dup)}
 		}
@@ -844,7 +790,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		count := v.(*atomic.Int64)
 		if count.Add(1) > int64(d.maxTotalDispatches) {
 			count.Add(-1)
-			return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf("dispatch total limit reached for session %s (max %d). 派发总数已耗尽，请直接整合已有结果答复用户", sessionID, d.maxTotalDispatches)}
+			return "", &tool.Result{Error: fmt.Sprintf("dispatch total limit reached for session %s (max %d). 派发总数已耗尽，请直接整合已有结果答复用户", sessionID, d.maxTotalDispatches)}
 		}
 	}
 
@@ -913,12 +859,90 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		}
 	}()
 
-	// 返回成功结果，Output 为子 Agent ID，父 Agent 可用该 ID 查询或接收后续通知。
-	return &tool.Result{
-		Tool:    "call_sub_agent",
-		Success: true,
-		Output:  subAgentID,
+	// 返回子 Agent ID 作为句柄，父 Agent 可用该 ID 查询或接收后续通知。
+	return subAgentID, nil
+}
+
+// callSubAgentsTool 实现 call_sub_agents 工具：同一波多个子任务一次性原子并行派出。
+// 与连续多次 call_sub_agent 等长，但工具形态本身引导"同波一次派出"——
+// 实证 v6 基准 MetaAgent 把 4 个建设领域分 2 波串行（第二波晚 24 分钟判负），
+// v11 也有 3+1 迷你分波；提示词硬约束对模型只是软约束，批量工具是结构级引导。
+type callSubAgentsTool struct {
+	dispatcher *Dispatcher // dispatcher 持有调度器引用，工具执行时通过它创建子 Agent。
+}
+
+// Name 返回工具名称。
+func (t *callSubAgentsTool) Name() string { return "call_sub_agents" }
+
+// Aliases 返回工具别名列表，当前无别名。
+func (t *callSubAgentsTool) Aliases() []string { return nil }
+
+// Description 返回工具的 LLM 可见描述。
+func (t *callSubAgentsTool) Description() string {
+	return "把同一波多个子任务一次性原子并行派出（等价于连续多次 call_sub_agent，但保证同波同时启动）。\n" +
+		"多文件创建/多领域拆分任务的**全部建设领域必须用它一次派出**，禁止按依赖关系分波串行——" +
+		"共享契约已钉死集成点，领域产物互为独立文件，后写的不需要等先写的落盘" +
+		"（v6 实证：4 个建设领域分 2 波，第二波晚启动 24 分钟，交付死线直接判负）。\n" +
+		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?}，" +
+		"字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=2000 字）。\n" +
+		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
+		"否则返回 \"spec missing or stale\"。逐项返回派出结果：某项失败不影响其他项。"
+}
+
+// Execute 执行 call_sub_agents 工具调用：逐项校验→spec 校验一次→逐项 dispatchOne。
+// 逐项收集结果：失败项不阻塞其他项派出，最终在 Output 中汇总成功/失败清单。
+func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
+	d := t.dispatcher
+
+	raw, ok := args["tasks"].([]any)
+	if !ok || len(raw) == 0 {
+		return &tool.Result{Tool: "call_sub_agents", Error: "tasks is required: 非空数组，每项 {role_id, task, domain?, responsibility?}"}
 	}
+	const maxBatch = 6
+	if len(raw) > maxBatch {
+		return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("batch too large: %d 项（max %d）。超过请合并领域或分批", len(raw), maxBatch)}
+	}
+
+	type batchItem struct{ roleID, domain, task, responsibility string }
+	items := make([]batchItem, 0, len(raw))
+	for i, r := range raw {
+		m, ok := r.(map[string]any)
+		if !ok {
+			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d] 必须是对象 {role_id, task, ...}", i)}
+		}
+		it := batchItem{}
+		it.roleID, _ = m["role_id"].(string)
+		it.task, _ = m["task"].(string)
+		it.domain, _ = m["domain"].(string)
+		it.responsibility, _ = m["responsibility"].(string)
+		if msg := validateDispatchArgs(it.roleID, it.task, it.responsibility); msg != "" {
+			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg)}
+		}
+		items = append(items, it)
+	}
+
+	parentID := agent.AgentIDFromContext(ctx)
+	if parentID == "" {
+		return &tool.Result{Tool: "call_sub_agents", Error: "missing parent agent context"}
+	}
+	if msg := d.checkSpecBeforeDispatch(ctx, parentID); msg != "" {
+		return &tool.Result{Tool: "call_sub_agents", Error: msg}
+	}
+
+	var okIDs, errs []string
+	for _, it := range items {
+		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility)
+		if errRes != nil {
+			errs = append(errs, fmt.Sprintf("%s(%s): %s", it.roleID, it.domain, errRes.Error))
+			continue
+		}
+		okIDs = append(okIDs, subAgentID)
+	}
+	out := fmt.Sprintf("已并行派出 %d 个子 Agent：%s", len(okIDs), strings.Join(okIDs, ", "))
+	if len(errs) > 0 {
+		out += fmt.Sprintf("\n未派出 %d 个：%s", len(errs), strings.Join(errs, "；"))
+	}
+	return &tool.Result{Tool: "call_sub_agents", Success: len(errs) == 0, Output: out}
 }
 
 // runSubAgent 为指定角色创建 ReActAgent，驱动其运行，
@@ -958,42 +982,13 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		return false
 	}
 
-	// 成功：先过验证闭环（该角色配置了验证对时），再把带验证结论的摘要通知父 Agent。
+	// 成功：把结果摘要通知父 Agent。产出质量由分层自检保证（叶子自检 / 领域整体性验收 /
+	// meta 整品验收+返工，见 roles.yaml 提示词），完成路径不再自动派验证 Agent——
+	// A/B 实证自动验证闭环是负资产（开 5/16 vs 关 16/16），机制移至扩展设计文档 §12 作后期扩展。
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
-	// 本 Agent 的 ReAct 循环已结束，activity 心跳不再更新；autoVerify 可能同步跑数分钟
-	// 验证/修正轮（独立子 Agent，有自己的生命周期），不摘除会被 patrol 误判假死 cancel 掉
-	// （实证：VERIFY FAIL reason=round 1 cancelled: context canceled，HEARTBEAT KILL idle>5m）。
-	// 摘除后该子 Agent 仅剩 d.timeout（默认 30min）兜底， goroutine defer 的重复 Delete 幂等无害。
-	d.activity.Delete(subAgentID)
-	summary := d.autoVerify(ctx, parentID, subAgentID, roleDef.ID, task, result.Text)
-	d.treeFinish(ctx, subAgentID, summary, nil)
+	d.treeFinish(ctx, subAgentID, result.Text, nil)
 	d.notify(parentID, subAgentID, result.Text, files)
 	return false
-}
-
-// autoVerify 在子 Agent 成功完成后同步驱动验证闭环（该角色命中 d.orchs 验证对时）。
-// 未配置验证对（orchs 为空或角色未命中）时原样返回产出，零开销。
-// 通过/未通过结论以【验证闭环:...】前缀并入回灌摘要，父 Agent（domain/meta）在 mailbox
-// 摘要中直接看到验证结果；未通过时摘要含失败原因，由父 Agent 决定后续（重派/降级交付）。
-// 修正轮产生的最终产出（FinalProduced）替代原始产出回灌，保证父 Agent 拿到的是修复后版本。
-// 验证/修正子 Agent 经 ExecuteChild->runSubAgentOnce 同步派发，不回本包装器，无递归。
-func (d *Dispatcher) autoVerify(ctx context.Context, parentID, subAgentID, roleID, task, produced string) string {
-	o, ok := d.orchs[roleID]
-	if !ok || o == nil {
-		return produced
-	}
-	vres := o.Run(ctx, verifyloop.Request{
-		ParentID:    parentID,
-		ProducerID:  subAgentID,
-		InitialTask: task,
-		Produced:    produced,
-	})
-	if vres.Passed {
-		log.Printf("[subagent] VERIFY PASS: sub=%s role=%s rounds=%d", subAgentID, roleID, vres.Rounds)
-		return fmt.Sprintf("【验证闭环:通过】rounds=%d（自测+上级统一测试均通过）\n\n%s", vres.Rounds, vres.FinalProduced)
-	}
-	log.Printf("[subagent] VERIFY FAIL: sub=%s role=%s rounds=%d reason=%s", subAgentID, roleID, vres.Rounds, truncateRunes(vres.FailReason, 200))
-	return fmt.Sprintf("【验证闭环:未通过】rounds=%d\n【失败原因】%s\n\n【最后产出】\n%s", vres.Rounds, vres.FailReason, vres.FinalProduced)
 }
 
 // treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
@@ -1220,6 +1215,21 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	}
 	parentID := pausedNode.ParentID
 
+	// 续跑次数上限：续跑会重置 fresh budget，若不设上限，"触限-暂停-续跑"环路永不绑定
+	// （v10 实证：验收领域研磨 32 轮 30 分钟不收敛）。触顶后强制收口部分返回，
+	// 返回 (result, nil) 使上层 resumePausedDomain 走"完成"分支——MetaAgent drain mailbox
+	// 整合部分产出并决定返工，与叶子助手 errPartialReturn 同哲学。
+	maxRes := d.maxPausedResumes
+	if maxRes <= 0 {
+		maxRes = 1
+	}
+	resumeCntV, _ := d.pausedResumes.LoadOrStore(pausedNodeID, new(atomic.Int64))
+	resumeCnt := resumeCntV.(*atomic.Int64)
+	if resumeCnt.Load() >= int64(maxRes) {
+		return d.concludePaused(ctx, pausedNode, maxRes)
+	}
+	resumeCnt.Add(1)
+
 	msgs, err := d.msgStore.LoadMessages(ctx, pausedNodeID)
 	if err != nil {
 		return agent.ReactResult{}, fmt.Errorf("load messages: %w", err)
@@ -1304,6 +1314,38 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	return result, nil
 }
 
+// concludePaused 在 Paused domain 触达续跑上限时强制收口：
+// 从 msgStore 加载已持久化历史提取部分产出（LastAssistantText 截 500 字），
+// tree.Finish 标 Done + notify 父 mailbox（文案明确标注"触限强制收口"）+ trackChildDone + 清邮箱。
+// 与 ResumePaused 的完成分支同构；返回 (result, nil) 让上层走"完成"路径恢复 MetaAgent。
+func (d *Dispatcher) concludePaused(ctx context.Context, pausedNode orchestrator.Node, maxRes int) (agent.ReactResult, error) {
+	sid := tool.SessionIDFromContext(ctx)
+	pausedNodeID := pausedNode.ID
+	parentID := pausedNode.ParentID
+
+	var partial string
+	var files []string
+	if msgs, err := d.msgStore.LoadMessages(ctx, pausedNodeID); err == nil && len(msgs) > 0 {
+		partial = truncateRunes(agent.LastAssistantText(msgs), 500)
+		files = agent.FilesModifiedFromHistory(msgs)
+	}
+	note := fmt.Sprintf("子 Agent 已达续跑上限（%d 次）仍未收敛，已强制收口并部分返回；请据部分产出决定返工或接手", maxRes)
+	text := note + "。" + partialSuffix(partial)
+
+	subCtx := context.Background()
+	if sid != "" {
+		subCtx = tool.WithSessionID(subCtx, sid)
+	}
+	d.treeFinish(subCtx, pausedNodeID, text, nil)
+	d.notify(parentID, pausedNodeID, text, files)
+	d.trackChildDone(parentID)
+	if d.mailbox != nil {
+		d.mailbox.Purge(pausedNodeID)
+	}
+	log.Printf("[subagent] CONCLUDED: sub=%s parent=%s (resume cap %d reached, partial len=%d)", pausedNodeID, parentID, maxRes, len(partial))
+	return agent.ReactResult{Text: text}, nil
+}
+
 // errLimitReached 是子 Agent 达到最大轮数的哨兵错误，供 formatSubAgentFailure 区分通知文案。
 var errLimitReached = errors.New("sub-agent limit reached")
 
@@ -1330,9 +1372,10 @@ func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Dur
 }
 
 // ExecuteChild 同步执行一个子 Agent 并返回其最终答复文本。
-// 供 verify_and_fix 工具驱动"代码->测试->修正->统一测试"循环使用：
+// 实现 verifyloop.Runner 接口（verifyloop 当前未接线，保留为业务验收测试工作流原型，
+// 见 doc/扩展设计_Agent工作流平台.md §12）：
 //   - 同步阻塞至子 Agent 完成，调用方直接拿到结果；
-//   - 不 notify 父邮箱（工具自行决定如何反馈）；
+//   - 不 notify 父邮箱（调用方自行决定如何反馈）；
 //   - 不进入实例池服务态（一次性执行）。
 //
 // 权限校验与 ID 生成与 call_sub_agent 工具一致；失败时返回 partial 结果与 err。

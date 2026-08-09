@@ -1,5 +1,12 @@
 // Package verifyloop 实现多 Agent 协作验证闭环的原生状态机编排器引擎。
 //
+// 【现状：未接线保留】2026-08-08 A/B 实证（test/benchmark/runs/multi-on vs multi-off）：
+// 自动验证闭环开启后通过率 16/16 -> 5/16、token 翻倍（verifier 累计 input 计费烧穿预算、
+// 零件级通过≠整品可用、失败摘要干扰父 Agent 决策）。dispatcher/bootstrap 接线与
+// self_test 配置已整体移除，活跃机制改为分层自检（叶子自检 / 领域整体性验收 / meta 整品验收+返工，
+// 见 config/roles.yaml）。本包作为业务验收测试工作流的原型保留，复活方案见
+// doc/扩展设计_Agent工作流平台.md §12。
+//
 // 设计意图：把"产出 -> 验证 -> 不通过打回修正 -> 通过后上级统一测试"这条业务流程
 // 从主 Agent 提示词驱动转为编排器原生驱动，避免依赖 LLM 自觉。
 //
@@ -47,9 +54,9 @@ type Runner interface {
 // Verdict 是验证器返回的结构化结论，替代裸字符串的 [VERIFY:PASS/FAIL] 标记解析。
 // 验证器实现负责把自身媒介（Agent 答复/CLI 退出码/截图对比/MCP 响应）归一为 Verdict。
 type Verdict struct {
-	Passed  bool   // 是否通过
-	Reason  string // 未通过时的失败原因（通过时可留空）
-	Detail  string // 验证过程的完整报告（日志/输出/截图描述等），供 Fixer 与 Reporter 引用
+	Passed bool   // 是否通过
+	Reason string // 未通过时的失败原因（通过时可留空）
+	Detail string // 验证过程的完整报告（日志/输出/截图描述等），供 Fixer 与 Reporter 引用
 }
 
 // Verifier 执行验证动作。接口分 SelfTest（单元/功能级）与 UnifiedTest（模块/集成级）两层，
@@ -129,24 +136,24 @@ type Request struct {
 
 // Result 描述一次验证闭环的最终结果。
 type Result struct {
-	Passed             bool     // 整体是否通过（自测 + 上级统一测试均通过）
-	Rounds             int      // 实际往返轮数（自测 + 修正循环次数）
-	FinalProduced      string   // 最终产出（最后一轮修正后的产出）
-	PlanConfirmVerdict Verdict  // 最后一轮方案确认结论（仅 Verifier 实现 PlanConfirmVerifier 且未跳过时有值）
-	ReviewVerdict       Verdict  // 最后一轮静态审查结论（仅 reviewer != nil 时有值）
-	SelfTestVerdict    Verdict   // 最后一轮自测结论
-	UnifiedVerdict     Verdict   // 最后一轮上级统一测试结论（仅通过自测后才有）
-	FailReason         string   // 未通过时的失败原因
+	Passed             bool    // 整体是否通过（自测 + 上级统一测试均通过）
+	Rounds             int     // 实际往返轮数（自测 + 修正循环次数）
+	FinalProduced      string  // 最终产出（最后一轮修正后的产出）
+	PlanConfirmVerdict Verdict // 最后一轮方案确认结论（仅 Verifier 实现 PlanConfirmVerifier 且未跳过时有值）
+	ReviewVerdict      Verdict // 最后一轮静态审查结论（仅 reviewer != nil 时有值）
+	SelfTestVerdict    Verdict // 最后一轮自测结论
+	UnifiedVerdict     Verdict // 最后一轮上级统一测试结论（仅通过自测后才有）
+	FailReason         string  // 未通过时的失败原因
 }
 
 // Orchestrator 是验证闭环状态机引擎。零值不可用，须通过 New 构造。
 // 引擎只消费 Verifier/Fixer/Reporter 接口，不绑定具体验证方式。
 type Orchestrator struct {
-	verifier       Verifier
-	reviewer       Reviewer // 可选静态审查器，nil 跳过 Review 阶段
-	fixer          Fixer
-	reporter       Reporter
-	maxRounds      int
+	verifier        Verifier
+	reviewer        Reviewer // 可选静态审查器，nil 跳过 Review 阶段
+	fixer           Fixer
+	reporter        Reporter
+	maxRounds       int
 	planSkipEnabled bool // true 跳过 PlanConfirm（向后兼容无实现的自定义 Verifier）
 }
 

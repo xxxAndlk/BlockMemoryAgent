@@ -46,7 +46,7 @@ type savedMsg struct {
 	msgs      []agent.ReactMessage
 }
 
-// captureMessagesStore 记录 SaveMessages 调用，LoadMessages 返回 nil（resume 路径另有集成测试）。
+// captureMessagesStore 记录 SaveMessages 调用，LoadMessages 回放缓存的最近一份历史（供 resume 路径测试）。
 type captureMessagesStore struct {
 	saved []savedMsg
 }
@@ -55,7 +55,12 @@ func (c *captureMessagesStore) SaveMessages(_ context.Context, agentID, sessionI
 	c.saved = append(c.saved, savedMsg{agentID: agentID, sessionID: sessionID, msgs: msgs})
 	return nil
 }
-func (c *captureMessagesStore) LoadMessages(context.Context, string) ([]agent.ReactMessage, error) {
+func (c *captureMessagesStore) LoadMessages(_ context.Context, agentID string) ([]agent.ReactMessage, error) {
+	for i := len(c.saved) - 1; i >= 0; i-- {
+		if c.saved[i].agentID == agentID {
+			return c.saved[i].msgs, nil
+		}
+	}
 	return nil, nil
 }
 
@@ -149,7 +154,72 @@ func TestRunSubAgent_AssistantLimitReachedPartialReturn(t *testing.T) {
 	}
 }
 
-// TestDispatcher_HasPausedChild 验证父 Agent 是否有 Paused 子 domain 节点检测。
+// TestResumePaused_ConcludesAfterResumeCap 验证 Paused domain 的续跑次数上限（maxPausedResumes=1）：
+// 首次 ResumePaused 正常续跑（mock 仍触限 -> re-pause，父 pending 不减、mailbox 不 notify）；
+// 第二次 ResumePaused 触顶 -> 强制收口：tree.Finish Done + 父 mailbox notify（含"续跑上限"）+ 父 pending 减。
+// 绑定点在续跑层：续跑重置 fresh budget，无上限则"触限-暂停-续跑"环路永不收敛（v10 实证研磨 30 分钟）。
+func TestResumePaused_ConcludesAfterResumeCap(t *testing.T) {
+	d, _, mb, msgStore, tr, toolsReg := newPauseTestEnv(t, &tokenUsageProvider{text: "domain work"})
+	d.WithMaxPausedResumes(1)
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "实现 config.js",
+		"domain":         "配置",
+		"responsibility": "负责 config.js",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch domain failed: err=%v res=%+v", err, res)
+	}
+	subID := res.Output
+	waitForCond(t, "domain paused", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusPaused
+	})
+	if len(msgStore.saved) != 1 {
+		t.Fatalf("want 1 persisted history, got %d", len(msgStore.saved))
+	}
+
+	// 第一次续跑：正常路径，mock 继续触限 -> re-pause。
+	r1, err := d.ResumePaused(dispatchCtx(), subID)
+	if err != nil {
+		t.Fatalf("first resume should not error, got %v", err)
+	}
+	if !r1.LimitReached {
+		t.Fatalf("first resume should re-hit limit (re-pause), got %+v", r1)
+	}
+	if n, ok := tr.Get(subID); !ok || n.Status != orchestrator.StatusPaused {
+		t.Fatalf("after first resume node should be Paused again, got %+v", n)
+	}
+	if got := d.PendingChildren("s1"); got != 1 {
+		t.Fatalf("pending after re-pause = %d, want 1", got)
+	}
+	if drains := mb.Drain("s1"); len(drains) != 0 {
+		t.Fatalf("mailbox should stay empty on re-pause, got %d msgs", len(drains))
+	}
+
+	// 第二次续跑：触顶 -> 强制收口部分返回。
+	r2, err := d.ResumePaused(dispatchCtx(), subID)
+	if err != nil {
+		t.Fatalf("conclude should not error, got %v", err)
+	}
+	if !strings.Contains(r2.Text, "续跑上限") {
+		t.Fatalf("conclude text should mention resume cap, got %q", r2.Text)
+	}
+	waitForCond(t, "node done after conclude", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusDone
+	})
+	if got := d.PendingChildren("s1"); got != 0 {
+		t.Fatalf("pending after conclude = %d, want 0", got)
+	}
+	drains := mb.Drain("s1")
+	if len(drains) != 1 {
+		t.Fatalf("parent mailbox should have exactly 1 conclude notify, got %d", len(drains))
+	}
+	if !strings.Contains(drains[0].Body, "续跑上限") {
+		t.Fatalf("conclude notify should mention resume cap, got %q", drains[0].Body)
+	}
+}
 func TestDispatcher_HasPausedChild(t *testing.T) {
 	d, _, _, _, tr, _ := newPauseTestEnv(t, &tokenUsageProvider{text: "x"})
 	parentID := "s1"

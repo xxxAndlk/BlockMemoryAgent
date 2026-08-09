@@ -58,6 +58,10 @@ type LLMRuntimeConfig struct {
 	// DomainAgent 默认 120000;叶子助手默认 40000;meta 默认 200000(安全网,不为 0 因 config tool_call_max_rounds=-1 使 maxIter 无界,双无界会死循环)。
 	// codegen 单次可吐 10K+ token,旧值 50K/20K 扛不住多文件生成。未列出的角色按上述默认。显式配置覆盖默认,如 token_budget_per_role: {domain: 120000}。
 	TokenBudgetPerRole map[string]int `yaml:"token_budget_per_role"`
+	// PausedDomainMaxResumes 同一 Paused DomainAgent 允许的最大续跑次数（默认 1；<=0 按默认）。
+	// 续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证：验收领域研磨
+	// 32 轮 30 分钟不收敛）。触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工。
+	PausedDomainMaxResumes int `yaml:"paused_domain_max_resumes"`
 }
 
 // SafetyConfig 工具沙箱与安全策略配置。
@@ -69,37 +73,15 @@ type SafetyConfig struct {
 
 // FeatureTogglesConfig Agent 特性开关配置。
 type FeatureTogglesConfig struct {
-	DAGEnabled               bool  `yaml:"dag_enabled"`                 // 是否启动 DAG 调度器
-	RestoreSessions          *bool `yaml:"restore_sessions"`            // 启动时是否从 session_history 恢复最近会话到内存（默认 true；显式 false 关闭）
-	AssistantSelfTestEnabled bool  `yaml:"assistant_self_test_enabled"` // 助手完成子任务后是否派遣测试助手验证
-	DomainSelfTestEnabled    bool  `yaml:"domain_self_test_enabled"`    // 领域 Agent 完成后是否派遣测试助手验证完整模块
-	BlockMemoryWriteEnabled  *bool `yaml:"block_memory_write_enabled"`  // 子 Agent 成功完成后是否将结果摘要沉淀到块记忆知识库（默认 true；显式 false 关闭）
-	// VerificationMaxRounds 多 Agent 协作验证闭环的最大往返轮数上限：
-	// 代码 Agent <-> 测试 Agent 互相询问/纠正的次数超过该值时，Dispatcher 拒绝
-	// 进一步的同线程派发，防止循环调用死锁。默认 5；<=0 时回退默认。
-	VerificationMaxRounds int `yaml:"verification_max_rounds"`
+	DAGEnabled              bool  `yaml:"dag_enabled"`                // 是否启动 DAG 调度器
+	RestoreSessions         *bool `yaml:"restore_sessions"`           // 启动时是否从 session_history 恢复最近会话到内存（默认 true；显式 false 关闭）
+	BlockMemoryWriteEnabled *bool `yaml:"block_memory_write_enabled"` // 子 Agent 成功完成后是否将结果摘要沉淀到块记忆知识库（默认 true；显式 false 关闭）
 	// MaxTotalDispatches 单 session 内所有角色派发总数上限（合计），超过拒绝派发。
 	// 计数在用户发送新消息时重置。默认 30；<=0 时回退默认，负数表示不限制。
 	MaxTotalDispatches int `yaml:"max_total_dispatches"`
 	// SpecEnforcementEnabled 派发方调用 call_sub_agent 前是否强制先写 WriteSpec。
 	// 默认 false（基础任务先跑通）；Pipeline 重构后由 PlanStage 替代，配置项整体移除。
 	SpecEnforcementEnabled *bool `yaml:"spec_enforcement_enabled"`
-	// PlanSkipEnabled 是否跳过 verifyloop 的 PlanConfirm 阶段。
-	// 默认 true：跳过 PlanConfirm（PlanConfirm 整体移除中）。
-	PlanSkipEnabled *bool `yaml:"plan_skip_enabled"`
-	// ReviewEnabled 是否在 verifyloop 中插入 Review 阶段（code_reviewer 静态审查）。
-	// 默认 false：基础任务先跑通；显式 true 开启。
-	ReviewEnabled *bool `yaml:"review_enabled"`
-	// VerificationRolePairs 是验证闭环的角色对列表：产出角色 -> 测试角色。
-	// AssistantSelfTestEnabled 开启时，bootstrap 按此列表注册 OnSubAgentDone 钩子，
-	// 产出角色完成时用对应测试角色触发 verifyloop。为空时回退默认 [{code_assistant, test_assistant}]。
-	VerificationRolePairs []VerificationRolePair `yaml:"verification_role_pairs"`
-}
-
-// VerificationRolePair 描述一个验证闭环角色对：CodeRole 完成后由 TestRole 验证。
-type VerificationRolePair struct {
-	CodeRole string `yaml:"code_role"` // 产出角色 ID（如 code_assistant）
-	TestRole string `yaml:"test_role"` // 测试角色 ID（如 test_assistant）
 }
 
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
@@ -405,38 +387,16 @@ func (c *Config) applyFeatureTogglesDefaults() {
 		t := true
 		c.Agent.BlockMemoryWriteEnabled = &t
 	}
-	// 验证闭环往返上限默认 5：覆盖"代码->测试->修正->复测->确认"的常见路径，
-	// 超过即拒绝派发以防循环死锁。
-	if c.Agent.VerificationMaxRounds == 0 {
-		c.Agent.VerificationMaxRounds = 5
-	}
 	// 全局派发总数默认 30：按"13 文件级编排任务约需 25-30 次派发"的实证校准；
 	// 旧的按角色对 5 次限额会在多文件任务中途卡死派发。
 	if c.Agent.MaxTotalDispatches == 0 {
 		c.Agent.MaxTotalDispatches = 30
-	}
-	// 验证角色对默认 [{code_assistant, test_assistant}]：未显式配置时覆盖代码自测主路径。
-	// 显式配置空列表则关闭所有角色对（不触发 verifyloop）。
-	if c.Agent.VerificationRolePairs == nil {
-		c.Agent.VerificationRolePairs = []VerificationRolePair{
-			{CodeRole: "code_assistant", TestRole: "test_assistant"},
-		}
 	}
 	// Spec 强制默认关闭：基础任务先跑通。Pipeline 重构后由 PlanStage 替代。
 	// *bool 区分"未配置"（默认 false）与"显式 true"（开启强制）。
 	if c.Agent.SpecEnforcementEnabled == nil {
 		f := false
 		c.Agent.SpecEnforcementEnabled = &f
-	}
-	// PlanSkipEnabled 默认 true：跳过 PlanConfirm（PlanConfirm 整体移除中）。
-	if c.Agent.PlanSkipEnabled == nil {
-		t := true
-		c.Agent.PlanSkipEnabled = &t
-	}
-	// Review 阶段默认关闭：基础任务先跑通；显式 true 开启。
-	if c.Agent.ReviewEnabled == nil {
-		f := false
-		c.Agent.ReviewEnabled = &f
 	}
 }
 

@@ -617,3 +617,62 @@ func TestWriteSpec_InvalidatesOnWriteFile(t *testing.T) {
 		t.Fatal("expected spec entry deleted after WriteFile invalidated it")
 	}
 }
+
+// TestExploreBudget_WriteGateRaisesLimit 探索预算两档制回归测试：
+// 写入未开始：8 次探索后封锁（反空转）；首次 WriteFile 成功后升档到 40，
+// 修复期"读报错位置→改→复验"循环允许精读（v13 实证：验收领域 57 秒耗尽预算后
+// 被禁读，只能整文件盲重写，4 次巨型调用耗 29 分钟）。
+func TestExploreBudget_WriteGateRaisesLimit(t *testing.T) {
+	dir := t.TempDir()
+	// 准备足够多行，供不同 offset 的读取（避免触发连读循环守卫）。
+	var lines []string
+	for i := 0; i < 60; i++ {
+		lines = append(lines, fmt.Sprintf("line %d", i))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s-budget")
+
+	// 写前烧掉 8 次探索预算（每次 offset 不同，属合法翻页）。
+	for i := 1; i <= exploreBudget; i++ {
+		res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(i), "limit": float64(1)})
+		if err != nil || !res.Success {
+			t.Fatalf("read %d within budget should succeed: err=%v success=%v", i, err, res.Success)
+		}
+	}
+	// 第 9 次：写前预算耗尽，封锁。
+	res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(30), "limit": float64(1)})
+	if res.Success {
+		t.Fatal("read beyond pre-write budget should be blocked")
+	}
+	if !strings.Contains(res.Error, "探索预算耗尽") {
+		t.Fatalf("expected budget error, got: %s", res.Error)
+	}
+
+	// 首次 WriteFile 成功：预算升档，恢复精读能力。
+	wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{"path": "b.txt", "content": "fix"})
+	if err != nil || !wres.Success {
+		t.Fatalf("write should succeed: err=%v success=%v", err, wres.Success)
+	}
+	res, err = r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(30), "limit": float64(1)})
+	if err != nil || !res.Success {
+		t.Fatalf("read after first write should succeed (post-write budget): err=%v success=%v", err, res.Success)
+	}
+
+	// 升档后仍有上限：烧到 40 次后再次封锁（防逐文件通读式发散）。
+	for i := exploreBudget + 2; i <= exploreBudgetPostWrite; i++ {
+		res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(i), "limit": float64(1)})
+		if err != nil || !res.Success {
+			t.Fatalf("read %d within post-write budget should succeed: err=%v success=%v", i, err, res.Success)
+		}
+	}
+	res, _ = r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(59), "limit": float64(1)})
+	if res.Success {
+		t.Fatal("read beyond post-write budget should be blocked")
+	}
+	if !strings.Contains(res.Error, "修复期探索预算耗尽") {
+		t.Fatalf("expected post-write budget error, got: %s", res.Error)
+	}
+}

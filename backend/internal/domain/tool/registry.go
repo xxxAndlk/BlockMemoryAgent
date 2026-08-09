@@ -9,23 +9,31 @@ import (
 	"strings"       // strings 用于拼接已读文件列表
 	"sync"          // sync 提供互斥锁保护并发状态
 
-	"github.com/blockmemory/agent/backend/internal/config" // config 包提供 Agent 阈值配置
+	"github.com/blockmemory/agent/backend/internal/config"  // config 包提供 Agent 阈值配置
 	"github.com/blockmemory/agent/backend/internal/project" // project 包提供 DomainClassifier 接口
-	"github.com/go-kratos/blades/tools"                    // blades tools 包提供对外暴露的工具定义
+	"github.com/go-kratos/blades/tools"                     // blades tools 包提供对外暴露的工具定义
 )
 
 // maxConsecutiveFailures 定义单个工具连续失败的最大次数，
 // 超过此次数将触发循环退出，避免无限重试。
 const maxConsecutiveFailures = 3
 
-// exploreBudget 是单个 Agent 任务内探索类工具（ReadFile/ListDir）调用次数硬上限。
+// exploreBudget 是单个 Agent 任务内探索类工具（ReadFile/ListDir/SearchInFiles）调用次数上限。
 // 防止 Agent 陷入探索循环不收敛：实证 domain-2 调 81 次探索工具 30m 超时未写完。
-// 超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。SearchInFiles/HTTPGet 不计入（定位性强）。
+// 超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。HTTPGet 不计（联网查询场景不同）。
 // RunCommand 仅"只读型命令"（cat/Get-Content/type/head/tail/more）计入：实证集成验证 Agent
 // 用 RunCommand 逐文件 cat 绕过 ReadFile 预算，串行读文件 19 分钟不收敛（logs/tui/2026-08-03.log）。
 // 验证/动作类 RunCommand（node --check、go build、mkdir）仍不计入：封禁会让 Agent 写完文件后
 // 无法按纪律验证，在"必须验证"与"工具被拒"之间死循环（实证：配置 Agent 被拒 8 轮空转 4 分钟）。
 const exploreBudget = 8
+
+// exploreBudgetPostWrite 是"写入已开始"后的探索预算升档上限。
+// v13 基准实证：验收领域开工 57 秒读 8 个文件耗尽预算后被禁止再读，只能凭记忆整文件
+// 盲重写（4 次 25-40K output tokens 巨型调用耗 29 分钟），盲改回归震荡致 13/16 平台期
+// 30 分钟——修复期工作本质是"读报错位置→改→复验"循环，禁读等于逼盲改。
+// 首次 WriteFile 成功后预算升档到本常量：写前 8 次反空转纪律不变，写后放开精读修复。
+// 仍设上限防"逐文件通读"式发散（v2 实证 19 分钟不收敛），并有连读循环守卫与 token 预算兜底。
+const exploreBudgetPostWrite = 40
 
 // readLikeCmdPrefixes 是只读型 shell 命令前缀（小写匹配，覆盖 bash 与 PowerShell 两侧）。
 // RunCommand 以这些前缀读文件时按探索工具计费；批量读取（如 cat a b c）只算 1 次，
@@ -127,6 +135,9 @@ type Registry struct {
 	// 超过 exploreBudget 后 ReadFile/ListDir 返回错误，逼迫 Agent 开始 WriteFile。
 	// RunCommand 不计（验证/动作类），避免写完文件后无法验证陷入重试死循环。
 	exploreCount map[string]int
+	// writeCount 按 scopeKey 记录 WriteFile 成功次数：>0 后探索预算升档到
+	// exploreBudgetPostWrite（修复期"读报错→改→复验"循环需要精读，见常量注释）。
+	writeCount map[string]int
 	// sharedMemory 是 WriteSharedMemory 工具的 KV 后端，由 bootstrap 注入。
 	// 为 nil 时 WriteSharedMemory 注册但不生效，调用返回 store 未配置错误。
 	sharedMemory SharedMemoryStore
@@ -146,14 +157,15 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	}
 	// 初始化 Registry 结构体，各 map 也一并初始化。
 	r := &Registry{
-		exec:      exec,
-		progress:  progress,
-		failures:  newFailureCounter(),
-		tools:     make(map[string]Tool),
+		exec:          exec,
+		progress:      progress,
+		failures:      newFailureCounter(),
+		tools:         make(map[string]Tool),
 		aliases:       make(map[string]string),
 		lastReadKey:   make(map[string]string),
 		sameReadCount: make(map[string]int),
 		exploreCount:  make(map[string]int),
+		writeCount:    make(map[string]int),
 	}
 	// 去抖异步刷新 PROJECT.md：文件增删改后安静期触发 LLM 按职责重分区。
 	// cls nil（测试）时 RefreshProjectDoc 走启发式，刷新仍更新文件列表。
@@ -329,19 +341,21 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		}
 	}
 
-	// 探索预算：ReadFile/ListDir 合计调用次数上限，防 Agent 陷入探索循环不收敛。
+	// 探索预算：探索类工具合计调用次数上限，防 Agent 陷入探索循环不收敛。
 	// 实证 domain-2 调 81 次探索工具 30m 超时未写完。超预算返回错误逼迫 WriteFile。
-	// SearchInFiles/HTTPGet 不计（定位性强、不发散）。WriteFile/WriteSharedMemory 不计（产出类）。
+	// SearchInFiles 计入预算：v8 基准实证验收领域 ReadFile 预算耗尽后改用 SearchInFiles
+	// 连搜 14 次零 WriteFile，探索 17 分钟未修一处——"定位性强"同样是发散载体。
+	// HTTPGet 不计（联网查询场景不同）。WriteFile/WriteSharedMemory 不计（产出类）。
 	// RunCommand 只读型命令（cat/Get-Content 等）按探索计费：防逐文件 cat 绕过预算串行读；
 	// 验证/动作类 RunCommand 不计，封禁会让 Agent 写完文件后无法验证而陷入重试死循环。
-	exploreLike := name == "ReadFile" || name == "ListDir" || (name == "RunCommand" && isReadLikeCommand(args))
+	exploreLike := name == "ReadFile" || name == "ListDir" || name == "SearchInFiles" || (name == "RunCommand" && isReadLikeCommand(args))
 	if exploreLike {
 		if blocked := r.checkExploreBudget(ctx); blocked != "" {
 			result := &Result{Tool: name, Error: blocked}
 			r.fillResult(ctx, result, args)
 			scope := scopeKeyFromCtx(ctx)
 			log.Printf("[tool] explore budget exhausted: scope=%s tool=%s budget=%d reason=%q",
-				scope, name, exploreBudget, blocked)
+				scope, name, r.exploreLimit(scope), blocked)
 			r.emitResult(ctx, result)
 			return result, nil
 		}
@@ -370,6 +384,8 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		r.invalidateSharedMemoryForPath(ctx, result.Path)
 		// 文件新增/修改触发去抖刷新 PROJECT.md 领域影响范围（安静期一次 LLM 重分区）。
 		r.scheduleProjectRefresh()
+		// 写入已开始：探索预算升档（修复期允许精读，见 exploreBudgetPostWrite）。
+		r.recordWrite(ctx)
 	}
 
 	// RunCommand 命中删改类命令（rm/mv/mkdir/touch/cp/git rm/git mv）触发去抖刷新，
@@ -501,10 +517,23 @@ func scopeKeyFromCtx(ctx context.Context) string {
 	return SessionIDFromContext(ctx)
 }
 
+// exploreLimit 返回当前作用域生效的探索预算：
+// 写入未开始用 exploreBudget（反空转），写入已开始升档 exploreBudgetPostWrite（修复期精读）。
+func (r *Registry) exploreLimit(scopeKey string) int {
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	if r.writeCount[scopeKey] > 0 {
+		return exploreBudgetPostWrite
+	}
+	return exploreBudget
+}
+
 // checkExploreBudget 检查当前作用域探索类工具调用次数是否超预算。
 // 返回空字符串表示允许；否则返回拦截原因（要求 Agent 转入 WriteFile）。
-// 对 ReadFile/ListDir 与只读型 RunCommand 生效；SearchInFiles/HTTPGet 不计预算（定位性强），
+// 对 ReadFile/ListDir/SearchInFiles 与只读型 RunCommand 生效；
 // 验证/动作类 RunCommand 不计（封禁会导致写完文件后无法验证的重试死循环）。
+// 预算分两档：首次 WriteFile 前 8 次（反探索空转），写入已开始 40 次
+// （修复期"读报错位置→改→复验"循环合法；v13 实证禁读逼出整文件盲重写长尾）。
 func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	scopeKey := scopeKeyFromCtx(ctx)
 	if scopeKey == "" {
@@ -512,8 +541,15 @@ func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	}
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
-	if r.exploreCount[scopeKey] >= exploreBudget {
-		return fmt.Sprintf("探索预算耗尽（已调 %d 次探索工具，上限 %d）。规格已在【共享记忆】中，直接 WriteFile 实现；如确需补信息用 SearchInFiles 精确定位。", r.exploreCount[scopeKey], exploreBudget)
+	limit := exploreBudget
+	if r.writeCount[scopeKey] > 0 {
+		limit = exploreBudgetPostWrite
+	}
+	if r.exploreCount[scopeKey] >= limit {
+		if r.writeCount[scopeKey] > 0 {
+			return fmt.Sprintf("修复期探索预算耗尽（已调 %d 次，上限 %d）。凭已有信息与验收输出直接 WriteFile 修复；修错可在复跑中再校准。", r.exploreCount[scopeKey], limit)
+		}
+		return fmt.Sprintf("探索预算耗尽（已调 %d 次探索工具，上限 %d）。禁止再以任何工具探索/搜索/阅读，凭已有信息直接 WriteFile 实现或修复；修错可在复跑中再校准，空转探索零容忍。", r.exploreCount[scopeKey], limit)
 	}
 	return ""
 }
@@ -527,6 +563,17 @@ func (r *Registry) recordExplore(ctx context.Context) {
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
 	r.exploreCount[scopeKey]++
+}
+
+// recordWrite 把当前作用域 WriteFile 成功计数 +1（驱动探索预算升档）。
+func (r *Registry) recordWrite(ctx context.Context) {
+	scopeKey := scopeKeyFromCtx(ctx)
+	if scopeKey == "" {
+		return
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	r.writeCount[scopeKey]++
 }
 
 // bumpSameRead 记录一次 ReadFile 调用键，返回"与上一次完全相同"的连续次数（含本次）。
@@ -560,8 +607,8 @@ func (r *Registry) ResetReadHistory(sessionID string) {
 	delete(r.lastReadKey, sessionID)
 	delete(r.sameReadCount, sessionID)
 	delete(r.exploreCount, sessionID)
+	delete(r.writeCount, sessionID)
 }
-
 
 // 供外部框架（如 blades）动态发现和调用工具。
 func (r *Registry) Schema() []tools.Tool {
@@ -773,25 +820,6 @@ func (r *Registry) Schema() []tools.Tool {
 			toolsList = append(toolsList, t)
 		}
 	}
-	// 暴露 verify_and_fix 工具(若已由 subagent.Dispatcher.RegisterVerifyTool 安装)。
-	// 仅 MetaAgent/DomainAgent 白名单含此工具,显式触发验证闭环(步骤 5:折叠进 ReAct)。
-	if ct, ok := r.tools["verify_and_fix"]; ok {
-		desc := "显式触发验证闭环:对已完成产出做自测+修正+上级统一测试往返。"
-		if d, ok := ct.(interface{ Description() string }); ok {
-			desc = d.Description()
-		}
-		if t, err := tools.NewFunc("verify_and_fix", desc, func(ctx context.Context, in verifyAndFixInput) (string, error) {
-			args := map[string]any{"task": in.Task, "produced": in.Produced}
-			if in.CodeRole != "" {
-				args["code_role"] = in.CodeRole
-			}
-			res, _ := r.Dispatch(ctx, "verify_and_fix", args)
-			b, _ := marshalNoHTMLEscape(res)
-			return string(b), nil
-		}); err == nil {
-			toolsList = append(toolsList, t)
-		}
-	}
 	// 暴露 create_role 工具（若已由 role.Registry.RegisterTools 安装到注册表）。
 	// 仅 MetaAgent 白名单含此工具，运行时注册动态角色供 call_sub_agent 派发。
 	if ct, ok := r.tools["create_role"]; ok {
@@ -854,13 +882,6 @@ type sendMessageInput struct {
 	Body        string `json:"body" description:"详情正文（可空）"`
 	MessageType string `json:"message_type" description:"消息类型：request（默认，期望回复）/ info（单向通知）/ reply（对先前 request 的回复）"`
 	ThreadID    string `json:"thread_id" description:"会话线程标识（可空，同一问答链共享）"`
-}
-
-// verifyAndFixInput 是 verify_and_fix 工具的入参结构。
-type verifyAndFixInput struct {
-	Task     string `json:"task" description:"原始任务文本(供验证 Agent 知道验什么)"`
-	Produced string `json:"produced" description:"待验证的当前产出文本"`
-	CodeRole string `json:"code_role,omitempty" description:"可选:产出角色 ID(如 code_assistant/domain),默认用配置的第一对"`
 }
 
 // createRoleInput 是 create_role 工具的入参结构。

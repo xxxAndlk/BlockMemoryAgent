@@ -192,14 +192,19 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 		// （长跑 + 累积 mailbox 摘要），架构层禁 ReadFile/ListDir/SearchInFiles 防止越位读
 		// 文件 + 把原文粘进 task（log 实证 MetaAgent 违反 prompt 自律）。读文件交给 DomainAgent。
 		// 保留 HTTPGet：MetaAgent 偶尔需联网查文档/API 参考，不涉及大块上下文。
-		// verify_and_fix(步骤 5):显式触发验证闭环,替代旧 OnSubAgentDone 钩子自动触发。
+		// roles.yaml meta_agent.tools 非空时整体覆盖白名单（基准单 Agent 模式：
+		// 去掉 call_sub_agent、放开执行类工具）；为空保持上述内置默认。
+		tools := []string{"call_sub_agent", "call_sub_agents", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles", "RefreshProjectDoc"}
+		if len(r.cfg.MetaAgent.Tools) > 0 {
+			tools = r.cfg.MetaAgent.Tools
+		}
 		return &types.RoleDefinition{
 			ID:           "meta",
 			Name:         "MetaAgent",
 			Type:         enums.RoleTypeMeta,
 			SystemPrompt: r.cfg.MetaAgent.SystemPrompt,
 			ModelConfig:  r.cfg.MetaAgent.ModelConfig,
-			Tools:        []string{"call_sub_agent", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles", "verify_and_fix", "RefreshProjectDoc"},
+			Tools:        tools,
 			CanBeCalled:  false,
 		}
 	case "domain":
@@ -208,7 +213,6 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 		// Tools 暴露读+执行+派发全工具：DomainAgent 是 per-task 短命 agent，可承担读文件/联网
 		// 采集上下文 + 拆分到单函数级 + 派发助手 OR 自执行的完整职责。
 		// 提示词默认值兜底：未在 roles.yaml 配置时使用内置默认值，保证空配置可启动。
-		// verify_and_fix(步骤 5):DomainAgent 派发产出后可显式触发验证闭环。
 		domainPrompt := r.cfg.DomainAgent.SystemPrompt
 		if strings.TrimSpace(domainPrompt) == "" {
 			domainPrompt = defaultDomainAgentSystemPrompt
@@ -220,10 +224,10 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 			SystemPrompt: domainPrompt,
 			ModelConfig:  r.cfg.DomainAgent.ModelConfig,
 			Tools: []string{
-				"call_sub_agent",
+				"call_sub_agent", "call_sub_agents",
 				"ReadFile", "ListDir", "SearchInFiles", "HTTPGet",
 				"WriteSharedMemory", "WriteSpec", "WriteFile", "RunCommand",
-				"verify_and_fix", "RefreshProjectDoc",
+				"RefreshProjectDoc",
 			},
 			CanBeCalled: true,
 		}

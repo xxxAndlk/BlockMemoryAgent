@@ -22,7 +22,6 @@ import (
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/subagent"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
-	"github.com/blockmemory/agent/backend/internal/domain/verifyloop"
 	"github.com/blockmemory/agent/backend/internal/embed"
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
@@ -221,8 +220,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	toolRegistry.SetDomainClassifier(cls)
 	memoryPipeline := memory.NewPipeline(memory.NewPostgresEventStore(pgStore.DB())).
 		WithSummarizer(newEventSummarizer(modelFactory)).
-		WithSummarizeTimeout(time.Duration(cfg.Agent.SummarizeTimeoutSec) * time.Second). // 思考型模型摘要需 60-180s，旧 5s 硬编码致摘要全挂
-		WithCompression(cfg.Agent.SummarizeEvery, cfg.Agent.SummarizeKeepRecent) // 记忆流水线
+		WithSummarizeTimeout(time.Duration(cfg.Agent.SummarizeTimeoutSec)*time.Second). // 思考型模型摘要需 60-180s，旧 5s 硬编码致摘要全挂
+		WithCompression(cfg.Agent.SummarizeEvery, cfg.Agent.SummarizeKeepRecent)        // 记忆流水线
 
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
@@ -245,6 +244,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 比等满 sub_agent_timeout（60min）早暴露第二次 session 卡死（LLM 流式挂起等）。<=0 关闭。
 	subAgentHeartbeat := time.Duration(cfg.Agent.SubAgentHeartbeatTimeoutMin) * time.Minute
 	subAgentDispatcher.WithTimeout(subAgentTimeout).WithHeartbeatTimeout(subAgentHeartbeat).WithLoopConfigByRole(reactCfg.LoopConfigByRole).WithBlockMemorySearcher(pgStore)
+	// Paused domain 续跑次数上限：续跑重置 fresh budget，无上限则研磨环路永不绑定；
+	// 触顶后强制收口部分返回父 Agent（默认 1，cfg.Agent.PausedDomainMaxResumes 可调）。
+	subAgentDispatcher.WithMaxPausedResumes(cfg.Agent.PausedDomainMaxResumes)
 	// 块记忆写入闭环：默认开启（applyFeatureTogglesDefaults 兜底为 true）；
 	// 显式 block_memory_write_enabled: false 时 Dispatcher 内部跳过沉淀。
 	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)
@@ -282,65 +284,6 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools 字段），
 	// 其他角色看不到它们。Registry 持 closure 引用，Execute 直接读写 dynamic 层。
 	roleRegistry.RegisterTools(toolRegistry)
-
-	// verify_and_fix 工具:把 verifyloop 状态机折叠进 ReAct,作为 MetaAgent/DomainAgent
-	// 可显式调用的复检工具。同一 orchestrators 集合并由 dispatcher 完成路径自动消费:
-	// 命中 code_role 的子 Agent 成功完成后,notify 父 Agent 前同步驱动验证闭环
-	// (自测->修正->上级统一测试),结论以【验证闭环:通过/未通过】前缀并入回灌摘要——
-	// 验证由编排层原生驱动,不依赖 LLM 自觉调工具(显式工具保留用于存疑复检)。
-	// AssistantSelfTestEnabled 开 code_assistant 等产出角色的验证;DomainSelfTestEnabled
-	// 开 domain 角色的模块级统一测试。角色对默认 [{code_assistant, test_assistant}]。
-	selfTestEnabled := cfg.Agent.AssistantSelfTestEnabled || cfg.Agent.DomainSelfTestEnabled
-	if selfTestEnabled {
-		// 合并配置角色对与 domain 运行时角色对。
-		pairs := make([]config.VerificationRolePair, 0, len(cfg.Agent.VerificationRolePairs)+1)
-		pairs = append(pairs, cfg.Agent.VerificationRolePairs...)
-		if cfg.Agent.DomainSelfTestEnabled {
-			// domain 产出的模块级验证:用 test_assistant 做上级统一测试。
-			// 避免重复追加用户已显式配置的 domain 对。
-			dup := false
-			for _, p := range pairs {
-				if p.CodeRole == "domain" {
-					dup = true
-					break
-				}
-			}
-			if !dup {
-				pairs = append(pairs, config.VerificationRolePair{CodeRole: "domain", TestRole: "test_assistant"})
-			}
-		}
-		// 仅保留开关启用的角色对:AssistantSelfTestEnabled 控制 code_assistant 等,
-		// DomainSelfTestEnabled 控制 domain。
-		activePairs := pairs[:0]
-		for _, p := range pairs {
-			if p.CodeRole == "domain" {
-				if cfg.Agent.DomainSelfTestEnabled {
-					activePairs = append(activePairs, p)
-				}
-				continue
-			}
-			if cfg.Agent.AssistantSelfTestEnabled {
-				activePairs = append(activePairs, p)
-			}
-		}
-		// 每个角色对独立编排器实例(AgentVerifier/Fixer 绑定各自角色)。
-		// ReviewEnabled 开启时装配 code_reviewer 作为 Reviewer,插入 PlanConfirm 与 SelfTest 之间。
-		// PlanSkipEnabled 默认 true(PlanConfirm 整体移除中);显式 false 仍走 PlanConfirm。
-		reviewRole := ""
-		if cfg.Agent.ReviewEnabled == nil || *cfg.Agent.ReviewEnabled {
-			reviewRole = "code_reviewer"
-		}
-		planSkip := true
-		if cfg.Agent.PlanSkipEnabled != nil {
-			planSkip = *cfg.Agent.PlanSkipEnabled
-		}
-		orchestrators := make(map[string]*verifyloop.Orchestrator, len(activePairs))
-		for _, p := range activePairs {
-			orchestrators[p.CodeRole] = verifyloop.NewWithReviewer(subAgentDispatcher, sharedMailbox, cfg.Agent.VerificationMaxRounds, p.CodeRole, p.TestRole, reviewRole, planSkip)
-		}
-		// 注册 verify_and_fix 工具:内部按 code_role 索引编排器,MetaAgent/DomainAgent 白名单含此工具。
-		subAgentDispatcher.RegisterVerifyTool(toolRegistry, orchestrators)
-	}
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
