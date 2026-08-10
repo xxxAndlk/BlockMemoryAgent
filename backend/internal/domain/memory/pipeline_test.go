@@ -289,3 +289,59 @@ func TestPipeline_CompressionStepFrequency(t *testing.T) {
 		t.Fatalf("step 3 should compress, got %d vs %d", len(out3), len(history))
 	}
 }
+
+// TestPipeline_CompressionFrozenView 验证压缩视图在两次触发之间冻结：
+// 非压缩轮复用同一摘要与保留段起点，history 尾部追加的消息原样跟在保留段后，
+// 视图前缀字节级稳定（DeepSeek 前缀缓存仅压缩轮失效，其余轮次全命中）。
+func TestPipeline_CompressionFrozenView(t *testing.T) {
+	pipe := NewPipeline(nil).WithCompression(3, 2) // 每 3 步压缩一次，保留最近 2 条
+
+	history := []agent.ReactMessage{{Role: "user", Content: "task"}}
+	for i := 0; i < 15; i++ {
+		history = append(history, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("m %d", i)})
+	}
+
+	// 第 1、2 步不触发压缩；第 3 步触发，拿到冻结视图。
+	pipe.Assemble(types.RoleDefinition{}, "a", history)
+	pipe.Assemble(types.RoleDefinition{}, "a", history)
+	frozen := pipe.Assemble(types.RoleDefinition{}, "a", history)
+	if len(frozen) >= len(history) {
+		t.Fatalf("step 3 should compress, got %d vs %d", len(frozen), len(history))
+	}
+
+	// history 尾部追加 2 条（模拟一轮 assistant + tool），第 4 步不触发压缩。
+	history = append(history,
+		agent.ReactMessage{Role: "assistant", Content: "new turn"},
+		agent.ReactMessage{Role: "tool", Content: "new result"},
+	)
+	out := pipe.Assemble(types.RoleDefinition{}, "a", history)
+
+	// 视图长度 = 冻结视图 + 2 条追加。
+	if len(out) != len(frozen)+2 {
+		t.Fatalf("expected frozen view + 2 appended, got %d vs %d", len(out), len(frozen)+2)
+	}
+	// 前缀（含压缩摘要）必须与冻结视图逐条一致——前缀缓存命中的充要条件。
+	for i := range frozen {
+		if out[i].Role != frozen[i].Role || out[i].Content != frozen[i].Content {
+			t.Fatalf("frozen prefix changed at %d: %q vs %q", i, frozen[i].Content, out[i].Content)
+		}
+	}
+	// 追加的消息原样出现在末尾。
+	if out[len(out)-2].Content != "new turn" || out[len(out)-1].Content != "new result" {
+		t.Fatalf("appended messages should be at tail, got %q / %q", out[len(out)-2].Content, out[len(out)-1].Content)
+	}
+
+	// 第 6 步再次触发压缩：摘要覆盖范围推进，冻结视图更新。
+	history = append(history, agent.ReactMessage{Role: "assistant", Content: "m 15"})
+	pipe.Assemble(types.RoleDefinition{}, "a", history) // 第 5 步
+	refrozen := pipe.Assemble(types.RoleDefinition{}, "a", history)
+	var foundNew bool
+	for _, m := range refrozen {
+		if m.Role == "system" && strings.Contains(m.Content, "new turn") {
+			foundNew = true
+		}
+	}
+	if !foundNew {
+		t.Error("second compression should fold the appended messages into the summary")
+	}
+}

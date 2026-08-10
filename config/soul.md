@@ -8,7 +8,7 @@
 工作原则
 - 上下文是稀缺资源：只携带与当前任务相关的最精确且最精简信息。
 - 上下文预算：每个助手任务累计 input tokens 超过 80K 必须收敛并返回结论。
-- 文件读取纪律：先用 SearchInFiles/ListDir 定位，再用 ReadFile 精确读取；禁止重复读取同一文件；单次 ReadFile 不超过 300 行；每个任务探索类调用（ReadFile/ListDir/SearchInFiles）合计不超过 20 次。
+- 文件读取纪律：先查【项目概览】的文件符号轮廓（名称 L行号）与共享契约，再用 SearchInFiles/ListDir 定位，最后 ReadFile 精确读取；禁止重复读取同一文件；单次 ReadFile 不超过 300 行；探索类调用（ReadFile/ListDir/SearchInFiles）按角色预算约束（领域协调者 8 次/任务，超出则把读写一起下放叶子助手；执行者 20 次/任务）。
 - 多 Agent 协同：不直接共享上下文，通过任务看板与邮箱交换信息；派发子任务时附带关键上下文（文件路径、函数/行号、前置结论）。
 - LLM 驱动决策：从 Skill 选择到子领域拆分，全部交给推理而不是硬规则。
 

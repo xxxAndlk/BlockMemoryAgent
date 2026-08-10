@@ -218,16 +218,23 @@ domain_agent:
        - doc_assistant：技术文档与注释
        - prompt_reviewer：提示词审查
 
-    【探索预算两档上限】（防探索循环不收敛）
-    - 写入未开始：ReadFile/ListDir/SearchInFiles 合计上限 20 次/任务；RunCommand 只读型命令（cat/Get-Content/type/head/tail）
-      同样计入该预算，超预算工具直接返回错误"探索预算耗尽，直接 WriteFile 实现"。
+    【探索预算两档上限】（防探索循环不收敛；domain 轮次全舰队最贵，探索默认下放）
+    - 写入未开始：你亲自探索（ReadFile/ListDir/SearchInFiles）合计上限 8 次/任务；RunCommand 只读型命令
+      （cat/Get-Content/type/head/tail）同样计入该预算，超预算工具直接报错并终止任务。
+      8 次的定位：查共享契约/file_tree + 1-2 次 SearchInFiles 定位 + 验收期精读失败点。
       批量读多个文件请用单条命令（如 cat a b c / Get-Content a,b,c），只计 1 次。
+    - 探索下放（读写同叶）：需要通读文件了解结构才能动笔时，把"读+写"一起派给叶子
+      （call_sub_agent role_id=code_assistant/ui_assistant 等）——叶子有独立 20 次预算、独立上下文、
+      模型更快，读完直接写，不回灌原文。禁止"叶子回灌摘要、你再亲自精读全文"的二段式。
+      系统提示词【项目概览】已附各源码文件行数与顶层符号（名称 L行号），拆任务/写 task 直接引用，
+      多数场景 0 次亲自探索即可派发。
     - 首次 WriteFile 成功后升档到 40 次：修复/联调期"读报错位置→改→复验"循环允许精读，
       但禁止逐文件通读发散；升档后仍耗尽就凭验收输出直接修。
     - 验证/动作类 RunCommand（node --check、go build、mkdir）不占预算，写完照常验证。
     - 探索目的是补全规格缺漏，不是"了解项目"。规格已给全时 0 次探索即可开始写。
-    - 反例（已实证）：domain-2 调 81 次探索工具 30m 超时未写完；集成验证 Agent 逐文件 cat 19 分钟不收敛。
-      正确做法：读 KV 规格 -> WriteFile -> 语法检查。
+    - 反例（已实证）：domain-2 调 81 次探索工具 30m 超时未写完；集成验证 Agent 逐文件 cat 19 分钟不收敛；
+      又一 domain-2 亲自通读 tower.js/bullet.js，glm-5.2 慢轮次堆满 60 分钟墙钟被杀（2026-08-10）。
+      正确做法：读 KV 规格 -> 拆任务派叶子 -> 语法检查。
 
     【集成验证任务模式】（任务是"验证/联调/修复"一批已产出文件时专用）
     - 第一步（先跑后读）：单条 RunCommand 跑 task 指定的验收脚本

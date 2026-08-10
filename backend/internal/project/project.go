@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -360,7 +361,8 @@ func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (str
 	domains := scanDomains(ctx, abs, cls)
 	if len(domains) > 0 {
 		b.WriteString("\n## 推荐领域拆分\n\n")
-		b.WriteString("按文件职责/实体由 LLM 分区（无 LLM 时按依赖图聚类兜底）。Agent 无明确领域归属时参考本表定位。\n\n")
+		b.WriteString("按文件职责/实体由 LLM 分区（无 LLM 时按依赖图聚类兜底）。Agent 无明确领域归属时参考本表定位。\n")
+		b.WriteString("源码文件后括注总行数与顶层符号（`名称 L行号`，`()` 后缀为函数），可直接按符号带 offset 精读，跳过逐页扫描。\n\n")
 		for _, d := range domains {
 			fmt.Fprintf(&b, "### `%s` - %s\n", d.Name, d.Purpose)
 			if len(d.Dirs) > 0 {
@@ -375,7 +377,7 @@ func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (str
 					fmt.Fprintf(&b, "  ...(+%d more)\n", len(d.Files)-20)
 				} else {
 					for _, f := range d.Files {
-						fmt.Fprintf(&b, "  - %s\n", f)
+						fmt.Fprintf(&b, "  - %s%s\n", f, fileOutline(abs, f))
 					}
 				}
 			} else {
@@ -399,6 +401,85 @@ func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (str
 	}
 
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// outlineExts 是需要抽取符号轮廓的源码扩展名（其余文件只列路径与行数意义不大，不注）。
+var outlineExts = map[string]bool{
+	".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true,
+	".go": true, ".py": true, ".vue": true, ".svelte": true,
+}
+
+// outlineRule 是一条顶层符号抽取规则：近行首锚定正则 + 展示前缀/后缀。
+// 不解析语法树：允许 0-3 列缩进（兼容 `(function(){...})()` IIFE 包裹一层的 JS 风格），
+// 更深层级的类方法/局部变量天然跳过，只收近顶层符号。
+type outlineRule struct {
+	re     *regexp.Regexp
+	prefix string
+	suffix string
+}
+
+var outlineRules = []outlineRule{
+	{regexp.MustCompile(`^[ \t]{0,3}(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)`), "class ", ""}, // JS/TS class
+	{regexp.MustCompile(`^[ \t]{0,3}(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)`), "", "()"}, // JS/TS function
+	{regexp.MustCompile(`^[ \t]{0,3}(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=`), "", ""},     // JS/TS 顶层变量（含 CONFIG 等配置对象与箭头函数）
+	{regexp.MustCompile(`^[ \t]{0,3}window\.([A-Za-z_$][\w$]*)\s*=`), "window.", ""},                        // 浏览器全局暴露
+	{regexp.MustCompile(`^func\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)`), "", "()"},                             // Go func / method
+	{regexp.MustCompile(`^type\s+([A-Za-z_][\w]*)\s+`), "type ", ""},                                        // Go type
+	{regexp.MustCompile(`^(?:async\s+)?def\s+([A-Za-z_][\w]*)`), "", "()"},                                  // Python def
+	{regexp.MustCompile(`^class\s+([A-Za-z_][\w]*)`), "class ", ""},                                         // Python 裸 class
+}
+
+const (
+	// maxOutlineFileBytes 单文件轮廓抽取的读取上限，防超大/压缩文件拖慢扫描。
+	maxOutlineFileBytes = 1 << 20
+	// maxOutlineSymbols 单文件展示符号数上限，超出截断，防概览膨胀（注入每个 Agent 系统提示词）。
+	maxOutlineSymbols = 12
+)
+
+// fileOutline 读取源码文件并返回紧凑轮廓后缀：" (355 行): class Tower L15, fire() L120"。
+// 非轮廓扩展名返回空串；读失败/无符号时至少给出行数（拿不到行数才返回空串）。
+// best-effort：行首正则抽取，供 Agent 按符号带 offset 精读，消灭"找结构"式逐页盲扫。
+func fileOutline(absRoot, rel string) string {
+	if !outlineExts[strings.ToLower(filepath.Ext(rel))] {
+		return ""
+	}
+	f, err := os.Open(filepath.Join(absRoot, filepath.FromSlash(rel)))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	var symbols []string
+	seen := map[string]bool{}
+	lineNo := 0
+	sc := bufio.NewScanner(io.LimitReader(f, maxOutlineFileBytes))
+	sc.Buffer(make([]byte, 0, 64*1024), maxOutlineFileBytes)
+	for sc.Scan() {
+		lineNo++
+		// 符号到上限后仍继续扫描：行数统计需要完整遍历（只多付正则匹配，best-effort）。
+		if len(symbols) >= maxOutlineSymbols {
+			continue
+		}
+		line := sc.Text()
+		for _, rule := range outlineRules {
+			m := rule.re.FindStringSubmatch(line)
+			if m == nil {
+				continue
+			}
+			if !seen[m[1]] {
+				seen[m[1]] = true
+				symbols = append(symbols, fmt.Sprintf("%s%s%s L%d", rule.prefix, m[1], rule.suffix, lineNo))
+			}
+			break // 一行只取首个命中规则，避免 class 行被多条规则重复消费
+		}
+	}
+	if lineNo == 0 {
+		return ""
+	}
+	if len(symbols) == 0 {
+		return fmt.Sprintf(" (%d 行)", lineNo)
+	}
+	return fmt.Sprintf(" (%d 行): %s", lineNo, strings.Join(symbols, ", "))
 }
 
 // scanDomains 划分领域，返领域摘要列表（按 Name 排序，确定性）。永不留空标注。

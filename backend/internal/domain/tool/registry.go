@@ -30,6 +30,15 @@ const maxConsecutiveFailures = 3
 // 4 个领域 Agent 全部耗尽预算被 loop guard 判死；20 次 × 200 行/页覆盖 ~4000 行。
 const exploreBudget = 20
 
+// exploreBudgetDomain 是 DomainAgent（协调者）写入未开始前的探索预算。
+// domain 的职责是拆任务/派发/整合/验证，亲自探索是全舰队最贵路径（glm-5.2 thinking
+// 单轮 3min+；2026-08-10 塔防日志 domain-2 亲自读 tower.js/bullet.js，60 分钟墙钟
+// 超时被杀时 20 次预算远未耗尽——瓶颈是带大上下文的慢轮次，不是次数）。
+// 8 次足够协调者用：查共享契约/file_tree + 1-2 次 SearchInFiles 定位 + 验收期精读失败点。
+// 通读/多文件了解结构应连同实现一起下放叶子（叶子模型快、预算独立 20 次、失败隔离），
+// 耗尽文案导向 call_sub_agent 而非 WriteFile（与叶子文案相反——叶子不能派发才逼它写）。
+const exploreBudgetDomain = 8
+
 // exploreBudgetPostWrite 是"写入已开始"后的探索预算升档上限。
 // v13 基准实证：验收领域开工 57 秒读 8 个文件耗尽预算后被禁止再读，只能凭记忆整文件
 // 盲重写（4 次 25-40K output tokens 巨型调用耗 29 分钟），盲改回归震荡致 13/16 平台期
@@ -393,7 +402,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	}
 
 	// 探索预算：探索类工具合计调用次数上限，防 Agent 陷入探索循环不收敛。
-	// 实证 domain-2 调 81 次探索工具 30m 超时未写完。超预算返回错误逼迫 WriteFile。
+	// 实证 domain-2 调 81 次探索工具 30m 超时未写完。超预算返回错误并终止循环：叶子导向 WriteFile 落地（它不能派发），domain 导向 call_sub_agent 下放叶子。
 	// SearchInFiles 计入预算：v8 基准实证验收领域 ReadFile 预算耗尽后改用 SearchInFiles
 	// 连搜 14 次零 WriteFile，探索 17 分钟未修一处——"定位性强"同样是发散载体。
 	// HTTPGet 不计（联网查询场景不同）。WriteFile/WriteSharedMemory 不计（产出类）。
@@ -406,7 +415,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 			r.fillResult(ctx, result, args)
 			scope := scopeKeyFromCtx(ctx)
 			log.Printf("[tool] explore budget exhausted: scope=%s tool=%s budget=%d reason=%q",
-				scope, name, r.exploreLimit(scope), blocked)
+				scope, name, r.exploreLimit(ctx, scope), blocked)
 			// 探索预算耗尽 = 空转死循环信号（实证：domain 只读不写空转 60min）。
 			// 返回包装哨兵让主循环终止，而非吞成普通工具错误继续烧轮次。
 			r.emitResult(ctx, result)
@@ -589,23 +598,27 @@ func scopeKeyFromCtx(ctx context.Context) string {
 	return SessionIDFromContext(ctx)
 }
 
-// exploreLimit 返回当前作用域生效的探索预算：
-// 写入未开始用 exploreBudget（反空转），写入已开始升档 exploreBudgetPostWrite（修复期精读）。
-func (r *Registry) exploreLimit(scopeKey string) int {
+// exploreLimit 返回当前作用域生效的探索预算（仅用于日志，判定逻辑在 checkExploreBudget）：
+// 写入未开始用 exploreBudget（叶子反空转）/ exploreBudgetDomain（domain 协调者），
+// 写入已开始升档 exploreBudgetPostWrite（修复期精读）。
+func (r *Registry) exploreLimit(ctx context.Context, scopeKey string) int {
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
 	if r.writeCount[scopeKey] > 0 {
 		return exploreBudgetPostWrite
 	}
+	if RoleIDFromContext(ctx) == "domain" {
+		return exploreBudgetDomain
+	}
 	return exploreBudget
 }
 
 // checkExploreBudget 检查当前作用域探索类工具调用次数是否超预算。
-// 返回空字符串表示允许；否则返回拦截原因（要求 Agent 转入 WriteFile）。
+// 返回空字符串表示允许；否则返回拦截原因（叶子：转入 WriteFile；domain：转入派发叶子）。
 // 对 ReadFile/ListDir/SearchInFiles 与只读型 RunCommand 生效；
 // 验证/动作类 RunCommand 不计（封禁会导致写完文件后无法验证的重试死循环）。
-// 预算分两档：首次 WriteFile 前 20 次（反探索空转），写入已开始 40 次
-// （修复期"读报错位置→改→复验"循环合法；v13 实证禁读逼出整文件盲重写长尾）。
+// 预算分两档：首次 WriteFile 前叶子 20 次 / domain 8 次（反探索空转 + 倒逼探索下放），
+// 写入已开始 40 次（修复期"读报错位置→改→复验"循环合法；v13 实证禁读逼出整文件盲重写长尾）。
 func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	scopeKey := scopeKeyFromCtx(ctx)
 	if scopeKey == "" {
@@ -613,13 +626,20 @@ func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	}
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
+	postWrite := r.writeCount[scopeKey] > 0
+	isDomain := RoleIDFromContext(ctx) == "domain"
 	limit := exploreBudget
-	if r.writeCount[scopeKey] > 0 {
+	if postWrite {
 		limit = exploreBudgetPostWrite
+	} else if isDomain {
+		limit = exploreBudgetDomain
 	}
 	if r.exploreCount[scopeKey] >= limit {
-		if r.writeCount[scopeKey] > 0 {
+		if postWrite {
 			return fmt.Sprintf("修复期探索预算耗尽（已调 %d 次，上限 %d）。凭已有信息与验收输出直接 WriteFile 修复；修错可在复跑中再校准。", r.exploreCount[scopeKey], limit)
+		}
+		if isDomain {
+			return fmt.Sprintf("探索预算耗尽（domain 协调者上限 %d 次，已调 %d 次）。禁止再亲自探索/阅读：把剩余探索与实现按单文件/单函数拆给叶子助手（call_sub_agent，task 写清文件路径+关键签名+验收），你只负责拆任务、整合 mailbox 摘要与 RunCommand 验证。", limit, r.exploreCount[scopeKey])
 		}
 		return fmt.Sprintf("探索预算耗尽（已调 %d 次探索工具，上限 %d）。禁止再以任何工具探索/搜索/阅读，凭已有信息直接 WriteFile 实现或修复；修错可在复跑中再校准，空转探索零容忍。", r.exploreCount[scopeKey], limit)
 	}

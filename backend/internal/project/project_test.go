@@ -236,6 +236,56 @@ func TestScanDomains_DependencyGraphMergesCluster(t *testing.T) {
 	if !strings.Contains(body, "index.html") {
 		t.Fatalf("expected index.html anchor in body:\n%s", body)
 	}
+	// 轮廓注入：js 文件后应括注行数与顶层符号（window.A L1），css 不注。
+	if !strings.Contains(body, "js/a.js (1 行): window.A L1") {
+		t.Fatalf("expected outline suffix for js/a.js, got:\n%s", body)
+	}
+	if strings.Contains(body, "css/s.css (") {
+		t.Fatalf("css should not carry outline suffix, got:\n%s", body)
+	}
+}
+
+// TestFileOutline 直接验证符号轮廓抽取：JS 顶层符号 + Go func/type + 行数。
+func TestFileOutline(t *testing.T) {
+	root := t.TempDir()
+	js := `// tower.js 注释行
+import { cfg } from './config.js';
+const CONFIG = { towers: {} };
+class Tower {
+	fire() {}
+}
+export function spawnTower() {}
+window.TowerGlobal = Tower;
+`
+	if err := os.WriteFile(filepath.Join(root, "tower.js"), []byte(js), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := fileOutline(root, "tower.js")
+	for _, want := range []string{"(8 行)", "CONFIG L3", "class Tower L4", "spawnTower() L7", "window.TowerGlobal L8"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("outline %q missing %q", got, want)
+		}
+	}
+	// 类方法 fire 有缩进，不应出现在顶层轮廓。
+	if strings.Contains(got, "fire(") {
+		t.Fatalf("indented method should be skipped, got %q", got)
+	}
+
+	go_ := "package x\n\ntype Server struct{}\n\nfunc NewServer() *Server { return nil }\n\nfunc (s *Server) Start() {}\n"
+	if err := os.WriteFile(filepath.Join(root, "s.go"), []byte(go_), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got = fileOutline(root, "s.go")
+	for _, want := range []string{"type Server L3", "NewServer() L5", "Start() L7"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("go outline %q missing %q", got, want)
+		}
+	}
+
+	// 非轮廓扩展名返回空串。
+	if got := fileOutline(root, "s.css"); got != "" {
+		t.Fatalf("css should have no outline, got %q", got)
+	}
 }
 
 func TestDomainClassifier_LLMNaming(t *testing.T) {

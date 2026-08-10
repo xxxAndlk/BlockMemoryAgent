@@ -58,6 +58,16 @@ type Pipeline struct {
 	// compressCounters 按 agentID 记录 Assemble 调用次数，用于步频触发压缩。
 	// 受 mu 保护。进程生命周期内不清理，与 events map 同生命周期。
 	compressCounters map[string]int
+	// compressStates 按 agentID 保存已冻结的压缩视图（摘要 + 保留段起点）。
+	// 冻结视图在两次压缩之间字节级稳定：DeepSeek 前缀缓存只在压缩那一轮失效，
+	// 其余轮次 history 纯追加、前缀全命中。受 mu 保护，与 events map 同生命周期。
+	compressStates map[string]compressState
+}
+
+// compressState 是某 agent 已冻结的压缩视图状态。
+type compressState struct {
+	summary   string // 中段压缩摘要消息正文（含【历史压缩摘要】头尾）
+	tailStart int    // 摘要覆盖到的 history 下标（不含）；history[tailStart:] 原样保留
 }
 
 // Store 抽象了事件流的持久化能力，实现者负责把事件保存到磁盘或数据库。
@@ -77,6 +87,7 @@ func NewPipeline(store Store) *Pipeline {
 		limit:             DefaultEventLimit,                    // 默认使用 DefaultEventLimit 作为注入上限
 		maxEventsPerAgent: DefaultMaxEventsPerAgent,             // 默认每个 agent 最多保留 DefaultMaxEventsPerAgent 条事件
 		compressCounters:  make(map[string]int),                 // 初始化空的 agentID -> 步频计数器映射
+		compressStates:    make(map[string]compressState),       // 初始化空的 agentID -> 冻结压缩视图映射
 	}
 }
 
@@ -135,14 +146,22 @@ func (p *Pipeline) WithCompression(every, keepRecent int) *Pipeline {
 // Assemble 把 agent 的近期事件作为一条 system 角色上下文消息注入到历史记录中。
 // 返回的新切片不会修改传入的 history 参数，调用方可以安全复用原切片。
 //
-// 历史压缩（hot/cold 分层）：
-//   - 每 compressEvery 步触发一次压缩（保留 system 前缀 + 首条 user + 中段压缩摘要 + 最近 K 条）；
-//   - 其余步直接注入事件，由 ReActAgent 的 windowMessages 做硬上限保护。
+// 历史压缩（hot/cold 分层，冻结视图版）：
+//   - 每 compressEvery 步触发一次压缩：中段历史压成摘要并冻结为 compressState；
+//   - 两次压缩之间每轮都复用同一冻结视图（摘要与保留段起点不变），history 只在尾部追加，
+//     发给模型的消息前缀字节级稳定——DeepSeek 前缀缓存仅压缩那一轮全量失效，
+//     其余轮次全部命中（旧实现每轮从全量 history 重算摘要，前缀每压缩轮即被打断）；
+//   - 近期事件注入永远放在视图末尾（内容每轮变化，尾部变化不破坏前缀缓存）。
 func (p *Pipeline) Assemble(_ types.RoleDefinition, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
-	assembled := p.injectEvents(agentID, history)
+	return p.injectEvents(agentID, p.compressedView(agentID, history))
+}
 
+// compressedView 返回该 agent 的压缩视图：未触发过压缩时原样返回 history；
+// 触发过压缩后返回冻结视图（system 前缀 + 首条 user + 摘要消息 + history[tailStart:]）。
+// 步频命中时先从完整 history 重算并冻结新视图。
+func (p *Pipeline) compressedView(agentID string, history []agent.ReactMessage) []agent.ReactMessage {
 	if p.compressEvery <= 0 {
-		return assembled
+		return history
 	}
 
 	p.mu.Lock()
@@ -151,10 +170,24 @@ func (p *Pipeline) Assemble(_ types.RoleDefinition, agentID string, history []ag
 	p.mu.Unlock()
 
 	// step%every==0 时触发压缩（与原 summarizeWindow 触发条件一致）。
-	if step%p.compressEvery != 0 {
-		return assembled
+	// 压缩只作用于 history 本体；近期事件消息在 Assemble 里于压缩之后追加，
+	// 不会进入保留段、也不会在下个周期被压进中段摘要。
+	if step%p.compressEvery == 0 {
+		if summary, tailStart, ok := compressMiddle(history, p.compressKeepRecent); ok {
+			p.mu.Lock()
+			p.compressStates[agentID] = compressState{summary: summary, tailStart: tailStart}
+			p.mu.Unlock()
+		}
 	}
-	return compressHistory(assembled, p.compressKeepRecent)
+
+	p.mu.RLock()
+	st, ok := p.compressStates[agentID]
+	p.mu.RUnlock()
+	// history 在单次运行内只增不减；tailStart 越界说明状态陈旧（如外部重建 history），原样返回。
+	if !ok || st.tailStart > len(history) {
+		return history
+	}
+	return buildCompressedView(history, st)
 }
 
 // injectEvents 完成实际的事件注入工作：先按 agentID 取事件，再截取最近 limit 条，
@@ -347,24 +380,25 @@ func joinNonEmpty(sep string, parts []string) string {
 	return result
 }
 
-// compressHistory 把历史压缩为：system 前缀 + 首条 user 任务目标 + 中段暴力压缩摘要 + 最近 K 条原始消息。
+// compressMiddle 计算历史的中段压缩摘要与保留段起点。
 // 用于每 N 步触发一次的上下文压缩，避免长任务 token O(N²) 增长。
 //
 // 压缩规则：
 //   - system 前缀全保留（若存在；记忆流水线已将近期事件移至末尾，此处通常无 system 前缀）；
 //   - 首条 user 消息原样保留（任务目标，防"失忆"）；
-//   - 中段每条消息压成 "[role] 前 200 字符" 拼成一条 system 摘要消息；
-//   - 最近 K 条原样保留（含 tool_call/tool_result 对，边界对齐 user）。
+//   - 中段每条消息压成 "[role] 前 200 字符" 拼成一条摘要文本；
+//   - 最近 K 条原样保留（含 tool_call/tool_result 对，边界避开 tool 起刀）。
 //
-// keepRecent<=0 视为 10；消息总数不足时原样返回。
+// 返回 summary 摘要正文、tailStart 保留段起点（messages[tailStart:] 原样保留）。
+// keepRecent<=0 视为 10；消息总数不足或无 user 消息时 ok=false（不压缩）。
 //
 // 该函数从 react_agent.go 迁入，职责归位到记忆层。ReActAgent 不再直接做历史压缩。
-func compressHistory(messages []agent.ReactMessage, keepRecent int) []agent.ReactMessage {
+func compressMiddle(messages []agent.ReactMessage, keepRecent int) (summary string, tailStart int, ok bool) {
 	if keepRecent <= 0 {
 		keepRecent = 10
 	}
 	if len(messages) <= keepRecent+2 {
-		return messages
+		return "", 0, false
 	}
 
 	// 1) system 前缀
@@ -373,7 +407,7 @@ func compressHistory(messages []agent.ReactMessage, keepRecent int) []agent.Reac
 		keep++
 	}
 
-	// 2) 首条 user（任务目标）。若无 user（仅 system），原样返回。
+	// 2) 首条 user（任务目标）。若无 user（仅 system），不压缩。
 	firstUserIdx := -1
 	for i := keep; i < len(messages); i++ {
 		if messages[i].Role == "user" {
@@ -382,7 +416,7 @@ func compressHistory(messages []agent.ReactMessage, keepRecent int) []agent.Reac
 		}
 	}
 	if firstUserIdx < 0 {
-		return messages
+		return "", 0, false
 	}
 
 	// 3) 最近 K 条边界：避开孤立的 tool 结果起刀（tool 结果须跟随其 assistant tool_calls）。
@@ -416,11 +450,33 @@ func compressHistory(messages []agent.ReactMessage, keepRecent int) []agent.Reac
 		fmt.Fprintf(&sb, "- [%s] %s\n", role, content)
 	}
 	sb.WriteString("\n（以上为早期对话压缩摘要，关键结论见下方近期事件与下方最近消息）")
+	return sb.String(), recentStart, true
+}
 
-	out := make([]agent.ReactMessage, 0, keep+1+1+1+(len(messages)-recentStart))
+// buildCompressedView 按冻结状态拼装压缩视图：
+// system 前缀 + 首条 user 任务目标 + 摘要消息 + messages[tailStart:]（原样保留段）。
+// 同一 compressState 下输出前缀字节级稳定（DeepSeek 前缀缓存命中）；
+// 调用方保证 st.tailStart <= len(messages)。无首条 user 时原样返回（防御）。
+func buildCompressedView(messages []agent.ReactMessage, st compressState) []agent.ReactMessage {
+	keep := 0
+	for keep < len(messages) && messages[keep].Role == "system" {
+		keep++
+	}
+	firstUserIdx := -1
+	for i := keep; i < len(messages); i++ {
+		if messages[i].Role == "user" {
+			firstUserIdx = i
+			break
+		}
+	}
+	if firstUserIdx < 0 || st.tailStart < firstUserIdx+1 {
+		return messages
+	}
+
+	out := make([]agent.ReactMessage, 0, keep+2+(len(messages)-st.tailStart))
 	out = append(out, messages[:keep]...)
 	out = append(out, messages[firstUserIdx]) // 首条 user 任务目标
-	out = append(out, agent.ReactMessage{Role: "system", Content: sb.String()})
-	out = append(out, messages[recentStart:]...)
+	out = append(out, agent.ReactMessage{Role: "system", Content: st.summary})
+	out = append(out, messages[st.tailStart:]...)
 	return out
 }

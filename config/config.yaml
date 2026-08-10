@@ -43,10 +43,10 @@ memory:
 # Agent 运行时动态参数
 agent:
   # -- ReAct 主循环 --
-  summarize_every: 5             # 每 5 步压缩；<=0 关闭
+  summarize_every: 10            # 每 10 步压缩；<=0 关闭。压缩视图触发后冻结（pipeline compressState），压缩轮是 DeepSeek 前缀缓存唯一失效点；步频拉大=缓存命中升高+原文在历史里保留更久（防"压缩丢原文→重读"循环），过大则单轮 input 变长
   summarize_keep_recent: 10      # 保留最近 10 条
   summarize_timeout_sec: 120     # 事件摘要轻量模型调用超时（秒）。思考型模型首 token 需数十秒，旧硬编码 5s 致摘要全挂、上下文全量回注、token 预算提前烧穿（实证 verify 子 Agent 300K 预算 7 分钟耗尽）
-  history_max_messages: 30       # 滑动窗口上限 30 条（system 前缀 + 最近消息），防 token 爆炸；负数表示不裁剪
+  history_max_messages: 48       # 滑动窗口硬上限（system 前缀 + 最近消息），防 API 上下文溢出；负数表示不裁剪。配合 summarize_every=10+keep_recent=10，压缩周期内消息峰值 ~34 条，48 保证周期内窗口不滑动、发送历史纯追加（DeepSeek 前缀缓存全命中）；仅在超长会话兜底滑动
   tool_call_max_rounds: -1       # ReAct 最大 LLM 轮数（达到上限暂停等待用户续跑，不判失败），负数表示不限制
   retry_count: 1                 # Assistant 任务指数退避重试次数。provider 层已有 3 次重试（retry_provider），此处再重试会乘法放大尝试次数（最多 provider3 × agent(1+n)），瞬时故障已被下层覆盖，1 次足够
   retry_backoff_ms: 100          # 重试初始退避时长（毫秒）
