@@ -67,6 +67,7 @@ func NewDefaultMux(app *App) *http.ServeMux {
 	mux.HandleFunc("/api/sessions/{id}/interrupt", wrap(sessionMgr.HandleSessionInterrupt))        // 中断当前执行
 	mux.HandleFunc("/api/sessions/{id}/enqueue", wrap(sessionMgr.HandleSessionEnqueue))            // 将任务入队
 	mux.HandleFunc("/api/sessions/{id}/cancel", wrap(sessionMgr.HandleSessionCancel))              // 取消任务
+	mux.HandleFunc("/api/sessions/{id}/stop", wrap(sessionMgr.HandleSessionStop))                  // 软停止（可续跑，TODO #37）
 	mux.HandleFunc("/api/sessions/{id}/topic", wrap(sessionMgr.HandleSessionTopic))                // 主题管理
 	mux.HandleFunc("/api/sessions/{id}", wrap(sessionMgr.HandleGetSession))                        // 获取单个会话详情
 

@@ -248,6 +248,28 @@ func (t *Tree) Cancel(id string) bool {
 	return true
 }
 
+// StopRunning 触发运行中节点的取消回调但**不改状态**（TODO #37 软停止专用）：
+// 状态保持 Running，让 dispatcher 的 context.Canceled 收尾分支按会话软停止标记
+// 把 domain 落 Paused（存 history 可续跑）、叶子部分回灌——与硬取消（Cancel 直接标
+// Cancelled）分流。删除 cancels 绑定（停止后不再可外部 cancel，resume 时重新绑定）。
+// 已 terminal / Paused 节点 no-op，返回 false。
+// 状态不变故不触发持久化。
+func (t *Tree) StopRunning(id string) bool {
+	t.mu.Lock()
+	node, ok := t.nodes[id]
+	if !ok || node.Status != StatusRunning {
+		t.mu.Unlock()
+		return false
+	}
+	cancel, hasCancel := t.cancels[id]
+	delete(t.cancels, id)
+	t.mu.Unlock()
+	if hasCancel && cancel != nil {
+		cancel()
+	}
+	return true
+}
+
 // LoadFromStore 从持久化层加载节点到内存。store 为 nil 时 no-op。
 // 用于 TreeFor lazy init 时恢复历史节点。cancel func 无法恢复,
 // 已 Running 的节点重启后状态保留但不可外部 cancel(需等其自然 Finish 或超时)。

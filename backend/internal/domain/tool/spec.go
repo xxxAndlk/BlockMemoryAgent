@@ -56,6 +56,7 @@ func (t *writeSpecTool) Description() string {
 		"dispatcher 会强制 call_sub_agent 前先调本工具，并把规范作为【任务规范】前缀注入子 Agent。" +
 		"files 字段填涉及的文件路径列表，写入时记录 mtime；任一文件被 WriteFile 修改后该规范自动失效，" +
 		"下次派发子 Agent 不再注入旧规范。" +
+		"例外：logs/ 与 .bma/ 目录下的文件是系统持续写入的活体文件（日志等），豁免 mtime 校验、不会导致失效。" +
 		"\n覆盖语义：同一 parent 的写入覆盖前一次内容（不追加）。每个 parent 只存一份 spec，兄弟子 Agent 共享。"
 }
 
@@ -73,10 +74,10 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 	files := parseFilesArg(args["files"])
 
 	if goal == "" {
-		return &Result{Tool: "WriteSpec", Error: "goal is required"}
+		return &Result{Tool: "WriteSpec", Error: "goal is required", Category: ResultCategoryValidationRejected}
 	}
 	if len(acceptance) == 0 {
-		return &Result{Tool: "WriteSpec", Error: "acceptance is required (at least one verifiable condition)"}
+		return &Result{Tool: "WriteSpec", Error: "acceptance is required (at least one verifiable condition)", Category: ResultCategoryValidationRejected}
 	}
 
 	agentID := AgentIDFromContext(ctx)
@@ -110,10 +111,23 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 	if err := t.store.Set(ctx, key, md); err != nil {
 		return &Result{Tool: "WriteSpec", Error: fmt.Sprintf("set: %v", err)}
 	}
+	out := fmt.Sprintf("spec written (key=%s, goal=%q, %d acceptance, %d constraints, %d files tracked)", key, truncateRunesForLog(goal, 60), len(acceptance), len(constraints), len(filesMtime))
+	// 防御纵深（TODO #30）：files 含持续增长目录（logs/.bma）时当场提示——
+	// 这类文件 mtime 恒变（系统自己写日志），已豁免新鲜度校验，让模型知道
+	// "列出日志文件不会导致 spec stale"，避免误以为必须剔除或反复重写。
+	var growing []string
+	for _, p := range files {
+		if IsGrowingPath(p) {
+			growing = append(growing, p)
+		}
+	}
+	if len(growing) > 0 {
+		out += "。提示: files 含持续增长文件 [" + strings.Join(growing, ", ") + "]（logs/.bma 目录），其 mtime 已豁免校验、不会导致 spec 失效"
+	}
 	return &Result{
 		Tool:    "WriteSpec",
 		Success: true,
-		Output:  fmt.Sprintf("spec written (key=%s, goal=%q, %d acceptance, %d constraints, %d files tracked)", key, truncateRunesForLog(goal, 60), len(acceptance), len(constraints), len(filesMtime)),
+		Output:  out,
 	}
 }
 

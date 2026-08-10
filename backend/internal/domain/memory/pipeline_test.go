@@ -345,3 +345,71 @@ func TestPipeline_CompressionFrozenView(t *testing.T) {
 		t.Error("second compression should fold the appended messages into the summary")
 	}
 }
+
+// TestPipeline_RawJoinTruncated 摘要器缺失（raw join 路径）时注入文本超上限截断（TODO #33）：
+// 防"摘要两次失败降级 raw join → MetaAgent 上下文膨胀"事故；截断保留上限内前缀 + 标记。
+func TestPipeline_RawJoinTruncated(t *testing.T) {
+	pipe := NewPipeline(nil).WithLimit(100) // 无 summarizer：走 raw join；放宽注入上限制造超限
+	for i := 0; i < 100; i++ {
+		big := fmt.Sprintf("event %d: %s", i, strings.Repeat("很长的事件输出内容", 120))
+		if err := pipe.Write("agent-1", agent.MemoryEvent{Type: "tool_call", AgentID: "agent-1", ToolName: "ReadFile", Output: big}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	history := []agent.ReactMessage{{Role: "user", Content: "t"}}
+	out := pipe.Assemble(types.RoleDefinition{}, "agent-1", history)
+	last := out[len(out)-1]
+	if last.Role != "system" {
+		t.Fatalf("expected injected system message, got %s", last.Role)
+	}
+	runes := []rune(last.Content)
+	if len(runes) > maxRawEventJoinRunes+100 {
+		t.Fatalf("raw join should be truncated near %d, got %d runes", maxRawEventJoinRunes, len(runes))
+	}
+	if !strings.Contains(last.Content, "已截断") {
+		t.Fatalf("truncated body should carry 已截断 marker")
+	}
+	if !strings.Contains(last.Content, "【近期事件】") {
+		t.Fatalf("body should keep 近期事件 header")
+	}
+}
+
+// TestPipeline_Compression_UserMessageLongerBudget 中段 user 消息保前 500 字符（TODO #34/#35 结论）：
+// 多轮会话第二条用户指令（如"重新执行/自检"）语义不可压——压缩摘要中 user 行保留 >200 字符，
+// assistant/tool 行仍按 200 上限。
+func TestPipeline_Compression_UserMessageLongerBudget(t *testing.T) {
+	longUser := strings.Repeat("用户的第二条长指令内容", 40) // 480 chars，超 200 上限
+	longAssistant := strings.Repeat("a", 600)
+	history := []agent.ReactMessage{
+		{Role: "user", Content: "目标"},
+		{Role: "user", Content: longUser},
+		{Role: "assistant", Content: longAssistant},
+	}
+	for i := 0; i < 12; i++ {
+		history = append(history, agent.ReactMessage{Role: "assistant", Content: "recent work"})
+		history = append(history, agent.ReactMessage{Role: "tool", Content: "tool result"})
+	}
+	summary, _, ok := compressMiddle(history, 6)
+	if !ok {
+		t.Fatal("expected compression to trigger")
+	}
+	// 提取 user 行与 assistant 行内容（"- [role] content" 格式）。
+	var userLine, assistantLine string
+	for _, line := range strings.Split(summary, "\n") {
+		if strings.HasPrefix(line, "- [user] ") {
+			userLine = strings.TrimPrefix(line, "- [user] ")
+		}
+		if strings.HasPrefix(line, "- [assistant] ") {
+			assistantLine = strings.TrimPrefix(line, "- [assistant] ")
+		}
+	}
+	if userLine == "" {
+		t.Fatalf("user line missing from summary: %q", summary)
+	}
+	if n := len([]rune(userLine)); n <= 200 {
+		t.Fatalf("user message should keep up to 500 chars, got %d", n)
+	}
+	if n := len([]rune(assistantLine)); n > 201 {
+		t.Fatalf("assistant message should stay capped at 200, got %d", n)
+	}
+}

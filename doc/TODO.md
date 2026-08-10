@@ -10,6 +10,118 @@
     - 多Agent协作：类似人类之间互相交流询问是否正确。例如：代码Agent完成代码后测试Agent进行测试,不明确具体测试方向时需要先把方案列出,给开发处方案的代码Agent是否符合代码Agent的逻辑,不符合代码Agent纠正,符合测试Agent测试Agent进行测试。测试结果代码Agent代码Agent对比是否与需求符合,不一致则代码Agent重新修正。复合后代码Agent返回给上级的领域Agent或者主Agent,期间各Agent可以反复询问,纠正,需要Agent在被询问时开一个协程进行回复,需要携带关键记忆或者协程Agent常驻共享代码Agent记忆,可评估。测试流程最为重要,查看现在的测试是否严谨与多重确认。代码Agent完成开发,找到固定助手的测试助手,先进行自测试,返回结果成功后返回给上级Agent,上级Agent按更大范围模块进行统一测试,哪个部分不行打回。
     - Agent执行任务,先拆解任务,拆解为不会干涉的单元任务后,一个单元任务使用一个干净上下文的Agent编码助手执行,压缩Token成本。执行完成后暂时不销毁,一定时间不使用直接消耗,有使用则重置使用时间并加长使用时间。原因：我在使用claude时,经常会有不切换会话在同一个会话使用重复上下文一直执行任务。越到后面越会上下文污染严重导致模型幻觉,并且上下文上每一次输入的Token成本也会激增。可评估是否可以替换块记忆,块记忆过于抽象,可用性与传统感觉不明显,。或者把块记忆与每个单独感觉上下文的Agent进行集成融合等尝试。现在的领域子Agent排发就相当于这个方案的初始模式,每个领域干净上下文负责自己的事。
 
+30. **spec 新鲜度校验对活体文件永久 stale 的陷阱修复**（P0；来源：2026-08-10 塔防会话事故，`workspace/tower-defense/logs/tui/2026-08-10.log`）
+    - 事故还原：用户要求 MetaAgent 自检"为什么首次执行总失败"。MetaAgent 派发日志分析任务三连败，第三败为 `spec missing or stale`——该 spec 的 `files` 含 `logs/tui/2026-08-10.log`（被分析对象），`hasFreshSpec`（`dispatcher.go:1972`）经 `verifyFileMtimes`（`dispatcher.go:2235`）逐文件比对 mtime，而**系统自身持续往该日志写入**（含 WriteSpec 执行本身产生的日志行），spec 写完几秒内必然 stale。结论："分析活体日志/任何持续增长文件"的任务在机制上永远派发不出去。与 #12 的 WriteFile 失效机制同根但更难：那条是"别的 Agent 改文件"，这条是"系统自己改"。
+    - 执行流程：
+      1. `verifyFileMtimes` 对 `logs/`、`.bma/` 目录及持续增长文件豁免 mtime 检查（降级为存在性检查），或 WriteSpec 记录这类文件时改记"读取偏移/快照"而非 mtime。
+      2. stale 错误文案区分 missing / stale 并**列出失配文件路径**（当前文案不区分，LLM 只能瞎猜重写 spec，白烧一轮）。
+      3. 防御纵深：dispatcher 侧检测"spec.files 含日志目录文件"时在 WriteSpec 返回里直接警告，让模型当场改 files 而不是派发时才炸。
+    - 测试：spec.files 含一个被持续追加的文件 → WriteSpec 后立即 call_sub_agent 成功；含被 WriteFile 修改的普通源码文件 → 仍正确判 stale（#12 一致性语义不回归）。
+    - 验收：TUI 中让 MetaAgent"分析当前会话日志找失败原因"能一次派发成功。
+    - 不做：不改 spec 强制门开关决策（#26-1 已定为开启）。
+
+31. **SearchInFiles 零命中误杀：空结果语义修正 + 字面匹配声明**（P0；同上事故）
+    - 事故还原：全日志 85 次 SearchInFiles"失败"。根因叠加：实现是 `strings.Contains` 字面子串匹配（`builtin.go:395`），模型按 grep 习惯写 `a|b` 交替模式必零命中；而零命中被标 `success=false`（`builtin.go:414-417` 仅 `len(lines)>0` 才成功）→ 计入循环守卫连杀（`registry.go:489`，阈值 3）→ domain-1（游戏配置）15:44:12 被 LoopExit 强杀，17 分钟工作只剩 500 字符截断。"查无此物"是有效信息，不是失败。
+    - 执行流程：
+      1. 零命中改 `Success=true` + Output 为"（无匹配：pattern 未在任何文件命中）"类提示文案。
+      2. 工具描述（`registry.go:752` 注册处）明示："字面文本匹配（大小写不敏感），不支持正则与 `|` 交替；多关键词请拆多次搜索"。
+      3. 可选增强：pattern 含 `|` 时按 `|` 切分逐个 Contains 合并结果（贴近模型直觉，消除最大踩坑点）。
+    - 测试：不存在 pattern 返 success=true 且计数值不增；含 `|` pattern 按决策断言行为。
+    - 验收：塔防回归中不再出现 SearchInFiles 三连杀；日志中 SearchInFiles success=false 清零（除沙箱拒绝等真错误）。
+    - 联动：若保留任何"空结果计失败"的口径，必须先落 #32 的失败分级，否则换汤不换药。
+
+32. **循环守卫分级：校验类拒绝不计连杀 + LoopExit 从"终止"改"可恢复暂停"**（✅ 已完成 2026-08-10，doc/变更.md 任务 18；项 4 LoopExit 落盘并入 #35）
+    - 事故还原：MetaAgent 自检任务 call_sub_agent 三连败（task too long → role_id and task are required → spec stale）**全是可纠正的参数/前置校验拒绝，模型每次都在正确纠偏**，但第 3 次直接 `ErrLoopExit` 终止整个 goal（用户视角的"强行停止"）。同理 domain-8（整品验收）探索预算耗尽被杀时正在接近答案。当前 `registry.go:489` 对 `result.Success==false` 一刀切计数。
+    - 执行流程：
+      1. 失败分级：`tool.Result` 加机读类别（validation_rejected / execution_failed / empty_result），dispatcher 校验拒绝（task too long / spec stale / role_id required / responsibility required）打 validation_rejected。
+      2. 连杀计数只计 execution_failed；validation_rejected 单独计数（阈值更高，如 5）且提示文案明确"这是校验拒绝，修正参数即可，不计入失败"。
+      3. MetaAgent 的 call_sub_agent 豁免连杀终止（纠偏循环是编排者的正常工作方式）；或 LoopExit 对 meta 语义改为暂停等用户（复用 #15 `pauseSession`/`awaiting_clarify` 通道）。
+      4. LoopExit 触发时把当前 goal/看板状态落盘（与 #35 检查点联动），为续跑留锚点。
+    - 测试：连续 3 次校验拒绝 → 不终止 goal；连续 3 次执行失败 → 仍终止；meta 暂停后可经用户消息恢复。
+    - 验收：重放自检场景，MetaAgent 纠偏后第 4 次派发能成功；domain-8 类场景被杀后可恢复而非归零。
+    - 不做：不取消探索预算守卫本身（#20 实证必需）；不动三层守卫的执行失败阈值（3 次维持现状）。
+
+33. **轻量模型链路全线失效修复（打捞/摘要/提取残废）**（✅ 已完成 2026-08-10，doc/变更.md 任务 19）
+    - 事故还原：日志中轻量调用全部落到 glm-5.2（思考型模型）且走**非流式** POST，被方舟 coding 端点拒绝："streaming is required for operations that may take longer than 10 minutes"（5 组 `Generate exhausted retries`）。后果链：① 失败打捞 `salvageLLMTimeout=5s` 硬编码（`salvage.go:30`），思考型模型来不及出首 token → domain-1/2 打捞 `facts=0`，失败经验只剩末条截断文本；② 事件摘要两次失败降级 raw join（`pipeline.go:257`），MetaAgent 上下文膨胀；③ 块记忆事实提取未见成功日志，走 `saveRawBlockMemory` 原文截断降级——块记忆"能用"但只是原文片段级。**注意**：当前 `roles.yaml` 配 `lightweight_model.model=deepseek-v4-flash`，但运行时重试日志 `provider=glm-5.2`（=cfg.Model）——roles.yaml 于 17:08、tui.exe 于 17:09 被修改/重建（均在事故会话之后），会话期生效配置与磁盘现值不一致，需先查加载链。
+    - 执行流程：
+      1. 排查运行时配置加载：启动日志打印 lightweight 解析结果（provider/model/base_url 来源：lightweight_model 直配还是回退 domain）；确认 TUI 启动 CWD 与 `config/roles.yaml` 相对路径解析（日志落在 workspace 下，需确认配置从哪读）。
+      2. 轻量调用改流式（`NewStreaming` 累积收集）或换支持非流式的快模型端点；在 `CallLightweightWithRetry`（`factory.go:412`）注释固化决策。
+      3. `salvageLLMTimeout` 配置化（默认 ≥30s；思考型模型场景下限 60s），超时降级保留。
+      4. 事件摘要失败的 raw join 加总长度截断（防降级路径反而吹爆上下文）。
+    - 测试：mock 轻量模型验证 salvage facts>0；摘要失败降级输出有截断上限。
+    - 验收：人为杀掉一个 domain，父 mailbox 失败消息的【失败打捞】段非空且含已读文件清单+卡点。
+    - 不做：不动 embed pseudo 决策（#26-5 已单列）；不改打捞"不进块记忆召回"的既有结论（#20）。
+
+34. **记忆压缩机制评估：保留首条 user + 最近 N 条 + 中段压缩 —— 结论与改进方向**（✅ 已完成 2026-08-10，doc/变更.md 任务 17；纯分析项，代码改进并入 #35）
+    - 结论（对照 `pipeline.go` 源码逐条核实）：**方向合理、粒度太粗、状态未与历史分离**。
+      - 保留的合理部分实证成立：保头保尾压中段（首条 user 防目标失忆，16:13:10 MetaAgent 仍记得原始任务）；冻结视图保 DeepSeek 前缀缓存（#16 变更记录已实证缓存杀手修复）；机械压缩零 LLM 依赖（#33 未修前是唯一可靠路径）。
+      - 不合理的部分（均为 #35 吸收点）：① 中段 200 字符/条是纯截断不是摘要——ReadFile 几千行只留 200 字符≈全丢，形成"压缩丢内容→重读→被杀"死亡组合（15:28:36 domain 重读 config.js 实证）；② 只保第一条 user，多轮会话第二条指令（自检/"重新执行"）进中段被压成 200 字符——"重新执行"被误解的直接推手（#35 根因 1）；③ 编排状态（哪些领域完成/结论/失败原因）散落在 assistant 消息里被压扁，无结构化保护（#35 看板注入补齐）；④ 按步数而非 token 触发，单步 token 方差大时粒度太粗。
+    - 改进归并 #35 落地：状态（看板/完成度/spec 指针）走结构化注入永远新鲜不可压缩；历史对话才压缩；所有 user 消息保前 500 字符（指令语义不可压）。
+    - 执行流程（本项仅分析，无代码改动）：
+      1. 通读 `pipeline.go` compressMiddle/compressedView/buildCompressedView/injectEvents 全部压缩路径，逐条对照 TODO 事故记录核实结论。
+      2. 结论落档（本条目 + doc/变更.md 任务 17），改进点全部并入 #35 执行。
+    - 原机制细节（备查，`pipeline.go compressMiddle:396-454` + `compressedView:162-191`）：每 `summarize_every=10` 步触发；system 前缀 + 首条 user 原样保留；中段每条消息压成 `[role] 前 200 字符`（tool 结果全文只留 200 字符、tool_calls 只记个数）；最近 `summarize_keep_recent=10` 条原样保留；压缩视图冻结（compressState）保前缀缓存。
+
+35. **续跑机制：任务检查点 + 看板上下文注入 + 恢复路由扩展 + 会话级恢复**（✅ 已完成 2026-08-10：Phase 0 看板注入 + 压缩保护落地；Phase 1 由 #32/#37 吸收覆盖；Phase 2 部分落地、缺口如实列开放项，doc/变更.md 任务 22）
+    - 机制分析（2026-08-10 实证）："重新执行"后全量重编排**不是失忆**——MetaAgent 上下文完好（首条 user + 近期事件都在，in=19091），它明确引用"上一轮 4 领域完成并通过验收"。重跑根因有四：
+      1. **指令歧义**："重新执行"无宾语，用户指"续跑被强杀的自检"，模型锚定到上下文中**最完整的信息**=首条 user 的原始任务全文（自检任务的相关消息已被压成 200 字符片段，无结构化残留）。
+      2. **无机器可读的"未完成事项"锚点**：loop guard 杀掉自检任务后 goal 直接终止，无待恢复标记；`board.TaskBoard`（#22 已落地 write_plan/依赖门/状态回写）只喂 TUI 面板，**不进 LLM 上下文**。
+      3. **无续跑原语**：MetaAgent 唯一手段是派发新 Agent，"从未完成项继续"无机制承载。
+      4. **进程重启清零**：16:13:47 TUI 重启 + `restore_sessions: false`（`config.yaml:77`，注释明写"启动即为全新会话"）+ #15 D2（进程重启不恢复 paused session）→ 真正彻底的失忆点。
+    - 设计（四层，尽量复用既有件）：
+      1. **任务检查点（状态结构化）**：复用 `board.TaskBoard`——领域派发/完成/失败时回写看板（子任务 id/标题/状态/失败原因/交付物文件清单/spec key），持久化（复用 `agent_events` 或新表；#3 的写侧已通）。
+      2. **看板注入 LLM 上下文（消歧关键）**：Assemble（或 #19 的 `Memory()` 中间件）在【近期事件】旁注入【任务看板】段——每轮最新、压缩不可达。"重新执行"时模型看到机器可读的未完成项，歧义自然消解。
+      3. **恢复路由扩展**：#15 已有"PausedOnChild 态任意消息恢复 earliest paused domain"——扩展覆盖：loop guard/探索预算/连杀从 ErrLoopExit 终止改 Pause（与 #32 联动）使被杀任务进可恢复集合；"重新执行/继续"类消息先匹配"最近被杀/暂停任务"再考虑新 goal；恢复时给 MetaAgent 注入失败原因 + 打捞摘要槽位（#20 已有 `<parentID>:salvage:<domain>`）。
+      4. **会话级恢复**：TUI `restore_sessions` 打开或提供 `/resume`；落地 #3 开放动作（`agent_events` 读回内存）；解决 `.bma/shared` key 含 sessionID 前缀导致新会话看不到旧共享记忆的孤儿化（恢复时按 session 映射或重放关键槽位）。
+    - 执行流程（分期）：
+      1. Phase 0：看板状态注入 MetaAgent 上下文（只读、最小改动，立即消歧）。
+      2. Phase 1：#32 LoopExit→Pause + 恢复路由覆盖被杀任务。
+      3. Phase 2：看板持久化 + TUI `/resume` + agent_events 读回 + shared 槽位跨 session 映射。
+    - 测试：模拟"领域 A 完成、B 被杀 → 用户说重新执行"→ MetaAgent 只重派 B 而非全量；进程重启后看板状态可恢复。
+    - 验收：重放 2026-08-10 场景——自检任务被强杀后输入"重新执行"只续跑自检；TUI 重启后可恢复原会话上下文。
+    - 不做：不做跨会话长期任务队列（dag 包另管）；不做失败自动重规划（#29 已列 replan 后续项）；不做多会话并行恢复。
+36. **用户输入自动提示词补全：意图识别 + 消歧 + 结构化格式化**（✅ 已完成 2026-08-10：Phase 0 纯规则版落地；Phase 1 LLM 增强与 Phase 2 看板对齐随 #35 联动，doc/变更.md 任务 20）
+    - 背景：用户输入是高频歧义源——"重新执行""继续""修一下"这类短指令没有宾语，MetaAgent 只能锚定上下文里最完整的信息（首条 user 原文），导致语义漂移甚至全量重跑。#35 的看板注入解决"模型看得见状态"，本项解决"用户说得清楚意图"，两者互补：看板是被动消歧，本项是主动消歧。
+    - 设计（输入侧前置管线，三段式，全部失败可降级为原文直通）：
+      1. **意图分类（规则优先，LLM 兜底）**：TUI 提交输入后先过本地规则——匹配"继续/重新执行/接着做"等续跑词、"停/取消"等控制词、"为什么/查一下"等诊断词，给出意图标签 + 置信度；规则拿不准且轻量模型可用时，用轻量模型分类（单轮、超时 ≤3s）。轻量模型挂了（#33 未修前是常态）直接走规则结果，**绝不阻塞用户输入**。
+      2. **消歧绑定（核心）**：意图为"续跑/控制/诊断"时，把最近任务状态拼进提示词——数据来源是 `board.TaskBoard`（#22 已落地）+ 最近被杀/暂停任务记录（#35 Phase 1 后完备）。例：用户输入"重新执行"→ 补全为"继续执行最近被中断的任务：自检（失败原因：loop guard 三连败终止），不要重跑已完成的领域修复"。无绑定对象（无在看任务）时跳过消歧段，不编造。
+      3. **结构化格式化**：把用户原话包进固定模板段——【用户原始指令】（原文逐字保留，防篡改）+【系统补全】（意图标签 + 绑定状态 + 建议解释），两段分离让 MetaAgent 能区分"用户说的"和"系统推断的"，补全错了用户能在下一轮纠正。
+    - 边界与安全：
+      - 只增不改：永不改写/替换用户原文，只做附加；模板固定、无自由生成，避免补全本身引入新幻觉。
+      - 高歧义不猜：绑定期望对象有多个并列候选（如两个被杀任务）时，不替他选——走 #24 已落地的 ask_user 通道反问，或在【系统补全】里列出候选让 MetaAgent 自行 ask_user。
+      - 可开关：config 加 `prompt_enhance: true/false`（默认开），TUI 状态栏显示本输入是否被补全过，方便排查"模型为什么这样理解"。
+    - 执行流程：
+      1. Phase 0（纯规则版）：TUI 提交路径加 enhancePrompt 预处理——意图规则表 + 从 session/内存看板取最近任务状态，拼模板注入；无 LLM 依赖，#33 修好前即可上线。
+      2. Phase 1（LLM 增强）：规则置信度低时接轻量模型分类/改写建议（依赖 #33 修复）；超时/失败回退 Phase 0 结果。
+      3. Phase 2（联动 #35）：看板注入 LLM 上下文落地后，补全段与看板段对齐同一数据源，消除"补全说的"与"模型看到的"不一致。
+    - 测试：单测覆盖规则表（续跑词/控制词/普通任务输入不触发补全）；集成测"领域 A 完成、B 被杀 → 用户输入'重新执行'"→ MetaAgent 收到的消息含【系统补全】且锚定 B；轻量模型故障注入 → 输入不阻塞、直通原文+规则补全。
+    - 验收：重放 2026-08-10 场景——自检被强杀后输入"重新执行"，MetaAgent 收到的提示词明确指向续跑自检；补全段不含任何用户原文之外的伪造指令；开关关闭后行为与现状一致。
+    - 不做：不做自由式 LLM 改写用户提示词（幻觉风险大于收益）；不做多轮对话式澄清向导（ask_user 已够）；不做英文意图词表（当前用户群中文，规则表先中文）。
+37. **任务软停止：双击 ESC 停止当前会话全部 domain/子助手 + 销毁倒计时 + 可续跑**（✅ 已完成 2026-08-10，doc/变更.md 任务 21）
+    - 背景：现有停止手段全是硬销毁——Ctrl+C 退出进程、`/cancel` 走 `cascadeCancelTree`（`service_react.go:481`）把 Running/Paused 节点全标 Cancelled，history 不留恢复锚点，"停下来想想再决定"的场景无承载。而 #15 的 Pause/Resume 链路（SaveMessages 落 PG → Tree.Pause → ResumePaused 重建）已跑通"杀 goroutine、留 history、秒级重建"，软停止直接复用。
+    - 已确认决策（2026-08-10 与用户逐项澄清）：
+      1. **停止语义**：agent 与正常完成一样收尾退出（goroutine 释放、完整 history 落 PG），不做 goroutine 冻结；倒计时内可重建续跑，到期硬销毁。
+      2. **倒计时默认 300s**，配置项 `stop_destroy_countdown_sec`。
+      3. **续跑触发**：复用现有 PausedOnChild 路由——倒计时内任意消息恢复 earliest paused domain，不加新命令。
+      4. **停止范围**：仅当前查看会话，不动其他 Running 会话。
+    - 设计（四块，全部复用既有件，新增面集中在"收尾路径分流"）：
+      1. **TUI 双击 ESC**：当前会话 Running 时，第一次按 ESC 进入 2s 武装窗（仿 `ctrlCQuit` 的 `quitArmedUntil` 模式，`model.go:677`），`flashMsg("再按一次 ESC 停止所有任务")`，**不清空输入栏**（覆盖 `input.go:30` 现有 ESC 行为仅在 Running 时）；窗内第二次 ESC → `POST /api/sessions/{id}/stop`。无 Running 会话时 ESC 行为与现状完全一致。
+      2. **控制链路（核心改动）**：`ControlCommand` 新增 `ControlOpStop`；`ReactService` 给会话置"软停止中"标记 → 按 `cascadeCancelTree` 同款遍历 `Tree.Snapshot()` 取消 Running 节点 context → **分流点在 dispatcher 的 `context.Canceled` 收尾分支**：检测到停止标记则走 `SaveMessages + Tree.Pause("user stop")`（节点落 Paused），否则维持现有 Cancelled 语义。domain 全落 Paused 后 `PendingChildren>0` 触发既有父终结保护，MetaAgent 会话自然落入 `SessionStatusPausedOnChild`——恢复路由零改动生效。子助手（叶子）无 Pause 语义，走现有 errPartialReturn/salvage 路径记部分成果退出，domain 续跑后按需重派。
+      3. **销毁倒计时**：会话级 `destroyAt = now + stop_destroy_countdown_sec`；backend 定时器到期 → 直接调既有 `cascadeCancelTree` 硬销毁（含 Paused 节点）；续跑触发时取消定时器。TUI 状态栏/会话行显示倒计时（100ms tick 刷新链路现成）。
+      4. **续跑**：用户在倒计时内发任意消息 → 既有 `sendMessage` PausedOnChild 分支（`service_react.go:1636`）→ `findEarliestPausedDomain` → `ResumePaused` 重建 domain，同时取消销毁定时器、清除停止标记。
+    - 边界与竞态（实现时必须处理）：
+      - **停止中发消息**：软停止进行间（节点尚未全部落 Paused）用户发消息，消息入队等待，待会话落入 PausedOnChild 后按续跑路由处理，不得直接注入正在收尾的 MetaAgent。
+      - **停止与正常完成竞态**：某 domain 在停止标记下发前自然完成→正常 trackChildDone，不参与 Pause；续跑时由 MetaAgent 按 mailbox 结果继续编排。
+      - **倒计时 vs maxPausedResumes**：倒计时是时间维度销毁，与次数维度续跑上限（`dispatcher.go:1581`）独立；先触发哪个执行哪个。
+      - **进程重启**：倒计时随进程消亡，PG 中 Paused 节点留存但不自动恢复（与 #15 D2 决策一致）；如需跨重启恢复走 #35 Phase 2。
+    - 执行流程：
+      1. Phase 0（后端核心）：`ControlOpStop` + 停止标记 + dispatcher 收尾分流 + HTTP `POST /api/sessions/{id}/stop`；单测覆盖"3 domain 运行 → stop → 全落 Paused + session PausedOnChild"。
+      2. Phase 1（倒计时）：`stop_destroy_countdown_sec` 配置 + 会话级定时器 + 到期硬销毁 + 续跑取消；单测"到期全 Cancelled""续跑后定时器不再触发"。
+      3. Phase 2（TUI）：双击 ESC 武装窗 + flashMsg + stop 调用 + 倒计时显示。
+    - 测试：单测——停止标记下 cancel 收尾落 Paused 而非 Cancelled、叶子助手走 partial、倒计时到期/续跑取消两个定时器分支、武装窗超时 ESC 恢复清输入语义；集成测——派发 3 domain → 双击 ESC → 全 Paused → 发消息 → earliest domain 重建续跑、其余依次恢复；不发消息等 300s → 全 Cancelled。
+    - 验收：塔防任务跑到一半双击 ESC，TUI 显示"已停止 N 个 Agent，MM:SS 后销毁"；输入任意消息任务从断点续跑（不重跑已完成 domain）；不操作到期后任务树全销毁且 TUI 有明确反馈。
+    - 不做：不做 goroutine 真冻结（已决策假死语义）；不做全局停止（仅当前会话）；不做停止中的选择性保活（停哪留哪）；不做跨进程重启的倒计时持久化（归 #35 Phase 2）。
+
 
 ## 已完成（已归档到 git 历史）
 
@@ -303,3 +415,9 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
    - TUI 迁移（本次完成）：`agent_tree_panel.rebuild` 与 `view.go` 任务面板改读 `agent.Tree()` 替代旧事件流派生 `deriveSubAgentNodes`。新增 `orchestratorNodesToTreeNodes`（按 ParentID 链算 depth + 状态映射 Running->Active/Done->Done/Failed->Error/Cancelled->Done）。`deriveSubAgentNodes` + 其测试已删（树是单一真相源,事件流派生有竞态/遗漏;树已 PG 持久化重启 lazy 恢复,无需 fallback）。
    - 开放动作：`verifyloop.ExecuteChild` 同步路径入树（phase 2）。
 
+
+38. **TODO #30-37 实现期发现并修复的缺陷记录**（✅ 均已修复 2026-08-10，doc/变更.md 任务 21-22 附带落地）
+    - **软停止收尾 SaveMessages 用已取消 ctx 致 "no persisted messages"**（e2e 实证）：#37 的软停止 Pause 分支在 `context.Canceled` 收尾处调用 `msgStore.SaveMessages(ctx, ...)`——此时子 Agent 的 subAgentCtx 已被 `Tree.StopRunning` 取消，PG 写入必然失败，domain 虽落 Paused 但 resume 时无历史可加载（"恢复暂停领域 Agent 失败: no persisted messages"）。修复：`context.WithoutCancel(ctx)` + 10s 超时。教训：**在 cancel 收尾分支做任何持久化，必须显式脱离取消传播**。
+    - **父 wait loop 30s 才检测到 Paused 子节点，PausedOnChild 转换被拖慢**：软停止让 domain 落 Paused 后，MetaAgent 的终结保护 wait loop 阻塞在 `WaitForAnyChild(30s)` 内，要等满一个周期才走到 `HasPausedChild` 检查。修复：dispatcher 新增 `pokeParent`（`ps.notify <- struct{}{}`，不改计数），Pause 后立即唤醒父。教训：**wait loop 类阻塞路径的新状态转换，需显式唤醒信号，不能依赖超时周期兜底**。
+    - **`retryStreamGenerate` 首轮错误残留致成功轮被跳过**：#33 流式重试实现中 `lastErr` 未在每次 attempt 开头重置，首轮失败后第二轮成功也被 `lastErr != nil` 短路判为失败（单测 `TestRetryStreamGenerate_ErrorRetries` 1.5s 三次尝试全"失败"暴露）。修复：attempt 循环内 `lastErr = nil` 逐轮重置。教训：**重试循环的成功判定必须逐轮重置错误状态变量**（`retryGenerate` 非流式版无此问题因其在成功路径直接 return）。
+    - 另注（非缺陷，测试基建经验）：mock LLM FIFO 是全局队列——多 domain 的保活调用会与 meta 的下一条 FIFO 响应竞争吃掉派发序列（软停止 e2e 因此收敛为单 domain）；且 mock 永远返回工具调用时 meta 不会进入终结保护 wait loop（该分支在「无 tool_calls」时才会到达），e2e 需在 FIFO 末尾放纯文本响应。

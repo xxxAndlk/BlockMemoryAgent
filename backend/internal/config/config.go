@@ -49,6 +49,9 @@ type LLMRuntimeConfig struct {
 	SummarizeEvery              int `yaml:"summarize_every"`                 // 每 N 步触发一次历史压缩（默认 10；<=0 关闭压缩，仅用滑动窗口）
 	SummarizeKeepRecent         int `yaml:"summarize_keep_recent"`           // 压缩时保留最近 K 条原始消息（默认 10；<=0 视为 10）
 	SummarizeTimeoutSec         int `yaml:"summarize_timeout_sec"`           // 事件摘要轻量模型调用超时（秒，默认 120）。旧硬编码 5s 对思考型模型必然超时，摘要全挂降级 raw join，上下文全量回注致 token 预算提前耗尽（实证 verify 子 Agent 300K 预算 7 分钟烧穿）
+	// SalvageLLMTimeoutSec 失败打捞轻量调用超时（秒，默认 30；思考型模型场景建议 >=60）。
+	// 旧硬编码 5s 对思考型模型（glm/deepseek 推理系）来不及出首 token，打捞 facts=0 全降级（TODO #33）。
+	SalvageLLMTimeoutSec int `yaml:"salvage_llm_timeout_sec"`
 	// TokenBudgetPerGoal 单次 RunWithHistory 累计 token 上限（input+output 之和，跨轮累加）。
 	// 超限后主循环 break 返回部分完成（LimitReached），与 maxIter 轮数上限正交。
 	// 默认 0 表示不限制；config.yaml 设 token_budget_per_goal: 100000 启用。
@@ -62,6 +65,14 @@ type LLMRuntimeConfig struct {
 	// 续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证：验收领域研磨
 	// 32 轮 30 分钟不收敛）。触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工。
 	PausedDomainMaxResumes int `yaml:"paused_domain_max_resumes"`
+	// PromptEnhance 用户输入自动提示词补全开关（TODO #36 Phase 0 规则版，默认 true）。
+	// 指针三态：nil=默认开启（applyDefaults 兜底）；显式 true/false 尊重显式值。
+	// 开启时 sendMessage 对命中续跑/控制/诊断意图的输入附加【系统补全】段
+	// （意图标签 + 最近失败/未完成任务绑定），只增不改用户原文；关闭=原样直通。
+	PromptEnhance *bool `yaml:"prompt_enhance"`
+	// StopDestroyCountdownSec 软停止销毁倒计时（秒，TODO #37，默认 300；负数=关闭=永久暂停）。
+	// Stop 后到期未续跑则硬销毁全部节点（cascadeCancelTree + 会话 error）；续跑触发即取消。
+	StopDestroyCountdownSec int `yaml:"stop_destroy_countdown_sec"`
 }
 
 // SafetyConfig 工具沙箱与安全策略配置。
@@ -401,6 +412,9 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	if c.Agent.SummarizeTimeoutSec == 0 {
 		c.Agent.SummarizeTimeoutSec = 120
 	}
+	if c.Agent.SalvageLLMTimeoutSec == 0 {
+		c.Agent.SalvageLLMTimeoutSec = 30
+	}
 }
 
 func (c *Config) applySafetyDefaults() {
@@ -422,6 +436,15 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	if c.Agent.SpecEnforcementEnabled == nil {
 		t := true
 		c.Agent.SpecEnforcementEnabled = &t
+	}
+	// 输入补全默认开启（TODO #36）：*bool 区分"未配置"（默认 true）与"显式 false"。
+	if c.Agent.PromptEnhance == nil {
+		t := true
+		c.Agent.PromptEnhance = &t
+	}
+	// 软停止销毁倒计时默认 300s（TODO #37）。
+	if c.Agent.StopDestroyCountdownSec == 0 {
+		c.Agent.StopDestroyCountdownSec = 300
 	}
 }
 

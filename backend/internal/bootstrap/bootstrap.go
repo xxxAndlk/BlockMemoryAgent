@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -164,6 +165,16 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第十步：创建模型工厂并预热、校验连通性。
 	modelFactory := model.NewModelFactory(roleCfg)
+	// 启动即打印轻量模型解析结果（来源 direct / fallback-domain），排查配置加载漂移：
+	// 2026-08-10 事故 roles.yaml 配 deepseek-v4-flash 但运行时 provider=glm-5.2（domain 回退），
+	// 会话期生效配置与磁盘现值不一致（配置晚于会话加载 / CWD 路径漂移），启动日志当场暴露。
+	if lmCfg, lmSource := modelFactory.LightweightResolution(); lmSource == "direct" {
+		log.Printf("[bootstrap] lightweight model resolution: model=%q provider=%q base_url=%q source=direct (roles.yaml lightweight_model 段)",
+			lmCfg.Model, lmCfg.Provider, lmCfg.BaseURL)
+	} else {
+		log.Printf("[bootstrap] lightweight model resolution: source=fallback-domain model=%q provider=%q（roles.yaml 未配 lightweight_model，轻量调用回退 domain 模型——若预期为独立轻量模型请配置）",
+			lmCfg.Model, lmCfg.Provider)
+	}
 	if err := modelFactory.WarmUp(ctx); err != nil {
 		closeStores(pgStore, redisStore)
 		return nil, fmt.Errorf("warmup models: %w", err)
@@ -267,7 +278,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.WithFactExtractor(&llmFactExtractor{factory: modelFactory})
 	// 失败打捞（TODO #20 第二层）：子 Agent 失败（超时/被杀/循环守卫终止）时用轻量模型
 	// 提取"已读文件清单+已得结论+卡点"摘要，写共享槽位供同域重派带前序摘要 + 追加进父 mailbox。
-	subAgentDispatcher.WithSalvageExtractor(&llmSalvageExtractor{factory: modelFactory})
+	// 超时配置化（TODO #33）：思考型模型首 token 数十秒，旧 5s 硬编码致打捞全超时降级。
+	subAgentDispatcher.WithSalvageExtractor(&llmSalvageExtractor{factory: modelFactory}).
+		WithSalvageTimeout(time.Duration(cfg.Agent.SalvageLLMTimeoutSec) * time.Second)
 	// 全局派发总数上限：单 session 所有角色派发合计超限拒绝；用户新消息重置。
 	subAgentDispatcher.WithMaxTotalDispatches(cfg.Agent.MaxTotalDispatches)
 	// Spec 强制：开启时 call_sub_agent 前必须先 WriteSpec(goal, acceptance, ...)，
@@ -315,6 +328,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入任务看板（TODO #22 执行计划）：write_plan 写板、派发依赖门、TUI 面板真相源。
 	// 看板按 sessionID 惰性创建（write_plan 首次调用 GetOrCreate）。
 	agentSvc.SetBoard(rt.Boards.Get)
+	// 用户输入自动提示词补全（TODO #36 Phase 0 规则版）：命中续跑/控制/诊断意图时
+	// sendMessage 附加【系统补全】段（意图标签 + 看板/树失败任务绑定），只增不改原文。
+	agentSvc.SetPromptEnhance(cfg.Agent.PromptEnhance == nil || *cfg.Agent.PromptEnhance)
 	subAgentDispatcher.WithBoard(rt.Boards.Get, func(sid, goal string) *board.TaskBoard {
 		return rt.Boards.GetOrCreate(sid, goal)
 	})
@@ -401,6 +417,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入 Paused DomainAgent 恢复器：sendMessage 在 PausedOnChild 态优先恢复 earliest paused domain，
 	// 从 agent_messages 加载历史用 fresh budget 续跑（各 Agent 独立上下文）。
 	agentSvc.SetPausedDomainResumer(subAgentDispatcher)
+	// 软停止（TODO #37）：会话 Stop 先标记再触发子 Agent cancel，dispatcher 收尾分支
+	// 把 domain 落 Paused（存 history 可续跑）、叶子部分回灌；倒计时到期硬销毁。
+	agentSvc.SetSoftStopMarker(subAgentDispatcher)
+	agentSvc.SetStopCountdown(time.Duration(cfg.Agent.StopDestroyCountdownSec) * time.Second)
 	// 默认恢复历史会话：从 session_history 恢复最近 50 个会话到内存，
 	// 保证重启后长任务上下文可见；显式 restore_sessions: false 关闭。
 	// 恢复失败仅记录日志，不阻断启动。

@@ -402,6 +402,11 @@ func probeLLM(ctx context.Context, client LLMClient) error {
 // 原本绕过 tracker 直调 llm.Generate 无重试；统一收敛到本方法，落实"轻量级总结模型优化"。
 // per-attempt 超时 30s，整体取消由 ctx 控制。
 //
+// 决策固化（TODO #33）：本方法走流式累积（retryStreamGenerate）——方舟 coding 端点
+// 对"可能超过 10 分钟的操作"拒绝非流式 POST（2026-08-10 事故：5 组 Generate
+// exhausted retries，打捞/摘要/事实提取全挂降级），流式是长任务端点的事实要求；
+// 非流式仅作为客户端无流式实现（测试 fake）时的回退。
+//
 // 参数：
 //   - ctx: 上下文
 //   - prompt: 提示词
@@ -416,7 +421,18 @@ func (f *ModelFactory) CallLightweightWithRetry(ctx context.Context, prompt stri
 		// 获取失败直接返回错误
 		return "", err
 	}
-	// 调用带重试的生成，单次超时 30 秒
-	resp, err, _ := retryGenerate(ctx, llm, prompt, 30*time.Second)
+	// 流式累积 + 重试，单次超时 30 秒
+	resp, err, _ := retryStreamGenerate(ctx, llm, prompt, 30*time.Second)
 	return resp, err
+}
+
+// LightweightResolution 返回轻量模型解析结果与来源，供启动日志排查配置加载。
+// 2026-08-10 事故：roles.yaml 配 lightweight_model.model=deepseek-v4-flash，
+// 但运行时重试日志 provider=glm-5.2（=domain 模型）——生效配置与磁盘现值不一致
+// （配置晚于会话加载 / CWD 路径漂移），启动时打印解析结果可当场暴露此类漂移。
+func (f *ModelFactory) LightweightResolution() (cfg types.AgentModelConfig, source string) {
+	if f.cfg.LightweightModel.Model != "" {
+		return f.cfg.LightweightModel, "direct"
+	}
+	return f.cfg.DomainAgent.ModelConfig, "fallback-domain"
 }

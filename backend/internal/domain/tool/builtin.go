@@ -357,7 +357,18 @@ func (e *Executor) searchInFiles(args map[string]any) *Result {
 		return &Result{Tool: "SearchInFiles", Path: absDir, Error: err.Error()}
 	}
 	// 将搜索模式转为小写，实现大小写不敏感匹配。
+	// pattern 含 "|" 时按关键词拆分、任意命中即记一行（贴近模型 grep 习惯，
+	// 消除"a|b 交替模式零命中"的最大踩坑点；代价是字面含 | 的文本无法精确匹配，可接受）。
 	patternLower := strings.ToLower(pattern)
+	patterns := []string{patternLower}
+	if strings.Contains(patternLower, "|") {
+		patterns = nil
+		for _, p := range strings.Split(patternLower, "|") {
+			if p = strings.TrimSpace(p); p != "" {
+				patterns = append(patterns, p)
+			}
+		}
+	}
 	// exts 定义允许搜索的文件扩展名白名单。
 	exts := []string{".go", ".py", ".js", ".ts", ".java", ".yaml", ".yml", ".md", ".txt", ".json", ".toml", ".css", ".html"}
 	// lines 保存所有命中的搜索结果行。
@@ -390,15 +401,15 @@ func (e *Executor) searchInFiles(args map[string]any) *Result {
 		}
 		// 将字节转换为字符串以便逐行匹配。
 		content := string(data)
-		// 按行切分并逐行检查是否包含模式。
+		// 按行切分并逐行检查是否包含任一关键词。
 		for i, line := range strings.Split(content, "\n") {
-			if strings.Contains(strings.ToLower(line), patternLower) {
-				// 计算相对路径以提升结果可读性。
-				relPath, _ := filepath.Rel(absDir, path)
-				// 记录相对路径、行号、去空白后的内容。
-				lines = append(lines, fmt.Sprintf("%s:%d: %s", relPath, i+1, strings.TrimSpace(line)))
-				// 命中行数超过 500 时提前停止遍历当前文件。
-				if len(lines) > 500 {
+			lineLower := strings.ToLower(line)
+			for _, p := range patterns {
+				if strings.Contains(lineLower, p) {
+					// 计算相对路径以提升结果可读性。
+					relPath, _ := filepath.Rel(absDir, path)
+					// 记录相对路径、行号、去空白后的内容。
+					lines = append(lines, fmt.Sprintf("%s:%d: %s", relPath, i+1, strings.TrimSpace(line)))
 					break
 				}
 			}
@@ -410,10 +421,13 @@ func (e *Executor) searchInFiles(args map[string]any) *Result {
 		Tool:   "SearchInFiles",
 		Path:   absDir,
 		Output: strings.Join(lines, "\n"),
+		// 查无此物是有效信息而非失败：零命中标记成功，
+		// 输出提示文案供模型区分"确认不存在"与"工具出错"。
+		Success: true,
 	}
-	// 只要存在命中行，就将结果标记为成功。
-	if len(lines) > 0 {
-		result.Success = true
+	// 零命中时给出明确提示，避免模型误判为工具失败而无效重试。
+	if len(lines) == 0 {
+		result.Output = fmt.Sprintf("（无匹配：%d 个关键词未在任何扩展名白名单文件中命中。如需精确定位请检查关键词拼写或改用 ReadFile 逐文件查看）", len(patterns))
 	}
 	// 若输出过长，按配置的最大字符数截断。
 	if maxChars := e.agentConfig().ReadFileMaxChars; len(result.Output) > maxChars {

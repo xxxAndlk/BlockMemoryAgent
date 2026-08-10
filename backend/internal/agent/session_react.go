@@ -79,6 +79,11 @@ type reactInternalSession struct {
 	askUser chan string
 	// pendingClarify 是当前待用户答复的确认/澄清请求（含审批问题），随会话快照透出给前端。
 	pendingClarify *ClarifyRequest
+	// stopTimer 是软停止销毁倒计时定时器（TODO #37）：Stop 后启动，到期硬销毁；
+	// 续跑触发时取消。nil=无进行中的倒计时。
+	stopTimer *time.Timer
+	// destroyAt 是软停止销毁截止时间（倒计时期间非 nil，供 TUI 显示剩余时间）。
+	destroyAt *time.Time
 }
 
 // maxReactInMemorySessions 限制 ReactService 同时保留在内存中的最大会话数，

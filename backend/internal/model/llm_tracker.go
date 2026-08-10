@@ -10,6 +10,8 @@ import (
 	"strings" // caller 分层判断
 	"sync"    // 读写锁保护并发访问
 	"time"    // 时间统计
+
+	"github.com/go-kratos/blades" // blades.ModelProvider / Generator 用于流式累积
 )
 
 // maxRetries 单次逻辑调用的最大尝试次数（含首次）。
@@ -82,6 +84,85 @@ func retryGenerate(ctx context.Context, llm LLMClient, prompt string, perAttempt
 	}
 	// 全部尝试失败，返回最后一次错误与是否超时
 	return "", lastErr, timedOut
+}
+
+// streamingProvider 是 BladesClient 暴露底层流式能力的接口（Provider().NewStreaming）。
+type streamingProvider interface {
+	NewStreaming(context.Context, *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error]
+}
+
+// retryStreamGenerate 是 retryGenerate 的流式版本（同重试/退避/超时策略）：
+// 走 NewStreaming 累积完整响应，供 CallLightweightWithRetry 使用。
+// 决策固化（2026-08-10 事故）：方舟 coding 端点对"可能超过 10 分钟的操作"拒绝非流式 POST，
+// 轻量调用走非流式 Generate 时 5 组 exhausted retries 全挂（打捞/摘要/事实提取残废）——
+// 流式是长任务端点的事实要求，轻量链路必须走流式。
+// 客户端无流式实现（测试 fake 等）时回退非流式 retryGenerate（行为不变）。
+// 返回语义与 retryGenerate 一致：(文本, 错误, 是否超时过)。
+func retryStreamGenerate(ctx context.Context, llm LLMClient, prompt string, perAttemptTimeout time.Duration) (string, error, bool) {
+	sp, ok := llm.(streamingProvider)
+	if !ok {
+		return retryGenerate(ctx, llm, prompt, perAttemptTimeout)
+	}
+	var lastErr error
+	timedOut := false
+	backoff := 500 * time.Millisecond
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err, false
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
+		req := &blades.ModelRequest{Messages: []*blades.Message{blades.UserMessage(prompt)}}
+		// 累积流式分块：取最后一个非 nil 分块（各 provider 约定末块为完整累积响应）。
+		var text string
+		lastErr = nil // 逐轮重置：首轮错误不得残留导致成功轮被跳过
+		stream := sp.NewStreaming(attemptCtx, req)
+		for resp, err := range stream {
+			if err != nil {
+				lastErr = err
+				break
+			}
+			if resp != nil && resp.Message != nil {
+				text = streamMessageText(resp.Message)
+			}
+		}
+		// 在 cancel 前判定超时（cancel 后 Err() 会变为 Canceled）。
+		deadlineExceeded := attemptCtx.Err() == context.DeadlineExceeded
+		cancel()
+		if lastErr == nil {
+			if text == "" {
+				// 流式正常结束但无内容：视为空响应（与 retryGenerate 的空响应语义一致）。
+				lastErr = errors.New("empty streaming response")
+			} else {
+				return text, nil, false
+			}
+		}
+		if deadlineExceeded {
+			timedOut = true
+		}
+		if attempt < maxRetries {
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return "", ctx.Err(), false
+			}
+			backoff *= 2
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+		}
+	}
+	return "", lastErr, timedOut
+}
+
+// streamMessageText 提取 blades 消息的全部文本部分（忽略工具调用等非文本部分）。
+func streamMessageText(m *blades.Message) string {
+	var sb strings.Builder
+	for _, p := range m.Parts {
+		if tp, ok := p.(blades.TextPart); ok {
+			sb.WriteString(tp.Text)
+		}
+	}
+	return sb.String()
 }
 
 // CallRecord 单次 LLM 调用记录。

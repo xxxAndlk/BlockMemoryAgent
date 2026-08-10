@@ -82,6 +82,9 @@ type Model struct {
 	// quitArmedUntil 是 Ctrl+C 退出确认的武装截止时间：
 	// 仍有运行中会话时，首次按 Ctrl+C 只提示，3 秒内再按才真正退出（防误杀长任务）。
 	quitArmedUntil time.Time
+	// stopArmedUntil 是软停止（TODO #37）双击 ESC 的武装截止时间：
+	// 当前会话 Running 时首次 ESC 进入 2s 窗（不清空输入栏），窗内再按 → POST /stop。
+	stopArmedUntil time.Time
 	// tokenWarnLevel 记录已提醒过的输入 Token 成本预警档位（每 50 万为一档）。
 	tokenWarnLevel int
 

@@ -71,6 +71,7 @@ const (
 	ControlOpInterrupt = "interrupt" // ControlOpInterrupt 中断会话当前动作
 	ControlOpEnqueue   = "enqueue"   // ControlOpEnqueue 将任务/消息加入队列
 	ControlOpCancel    = "cancel"    // ControlOpCancel 取消会话或当前任务
+	ControlOpStop      = "stop"      // ControlOpStop 软停止（TODO #37）：停止当前会话全部子任务，可续跑
 	ControlOpTopic     = "topic"     // ControlOpTopic 切换/指定会话主题
 )
 
@@ -118,6 +119,9 @@ type Session struct {
 	ThinkingText   string          // ThinkingText 当前思考阶段的过程文本（瞬时，仅运行中有值）
 	ActiveBlocks   []ActiveBlock   // ActiveBlocks 当前正在运行的会话块视图
 	PendingClarify *ClarifyRequest // PendingClarify 待处理的澄清请求，无则为 nil
+	// DestroyAt 软停止销毁倒计时截止时间（TODO #37）：Stop 后非 nil，续跑/到期后清空；
+	// 供 TUI 显示"MM:SS 后销毁"。未软停止的会话为 nil。
+	DestroyAt *time.Time
 	// ActiveTopicID 当前活跃话题 ID。切换话题时旧 Agent 树终结 + 新树起,
 	// 旧话题摘要写入 sharedKV `topic:{id}:summary` 供新话题 MetaAgent 召回。
 	// 空表示尚未切换过话题(单话题会话)。

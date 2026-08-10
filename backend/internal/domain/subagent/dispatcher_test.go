@@ -1048,7 +1048,7 @@ func TestBuildSharedPrefix_RendersSpecAndShared(t *testing.T) {
 }
 
 // TestHasFreshSpec 验证 SpecEnforcementEnabled 校验逻辑。
-// spec 存在、新鲜、Goal 非空、Acceptance 非空时返回 true。
+// spec 存在、新鲜、Goal 非空、Acceptance 非空时返回 true；缺失/内容非法/文件 stale 分别给区分文案。
 func TestHasFreshSpec(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "foo.js")
@@ -1065,26 +1065,93 @@ func TestHasFreshSpec(t *testing.T) {
 	_ = kv.Set(context.Background(), "meta:spec", md)
 	d := &Dispatcher{}
 	d.WithSharedMemory(kv)
-	if !d.hasFreshSpec(context.Background(), "meta") {
-		t.Fatal("expected hasFreshSpec=true for valid spec")
+	ok, reason := d.hasFreshSpec(context.Background(), "meta")
+	if !ok {
+		t.Fatalf("expected hasFreshSpec=true for valid spec, got reason=%q", reason)
 	}
 
-	// Case 2: spec 缺失 -> false。
+	// Case 2: spec 缺失 -> false + missing 文案。
 	d2 := &Dispatcher{}
 	d2.WithSharedMemory(newTestKVMemory(true))
-	if d2.hasFreshSpec(context.Background(), "meta") {
-		t.Fatal("expected hasFreshSpec=false when spec missing")
+	ok2, reason2 := d2.hasFreshSpec(context.Background(), "meta")
+	if ok2 || !strings.Contains(reason2, "missing") {
+		t.Fatalf("expected missing reason, ok=%v reason=%q", ok2, reason2)
 	}
 
-	// Case 3: Acceptance 空 -> false。
+	// Case 3: Acceptance 空 -> false + invalid 文案。
 	spec3 := tool.Spec{Goal: "g"}
 	md3 := tool.EncodeSpecMD("meta", spec3, nil)
 	kv3 := newTestKVMemory(true)
 	_ = kv3.Set(context.Background(), "meta:spec", md3)
 	d3 := &Dispatcher{}
 	d3.WithSharedMemory(kv3)
-	if d3.hasFreshSpec(context.Background(), "meta") {
-		t.Fatal("expected hasFreshSpec=false when acceptance empty")
+	ok3, reason3 := d3.hasFreshSpec(context.Background(), "meta")
+	if ok3 || !strings.Contains(reason3, "invalid") {
+		t.Fatalf("expected invalid reason, ok=%v reason=%q", ok3, reason3)
+	}
+
+	// Case 4: 文件被改（mtime 不匹配）-> false + stale 文案 + 失配路径。
+	kv4 := newTestKVMemory(true)
+	_ = kv4.Set(context.Background(), "meta:spec", tool.EncodeSpecMD("meta", spec, map[string]int64{target: mtime}))
+	d4 := &Dispatcher{}
+	d4.WithSharedMemory(kv4)
+	// 先通过一次再改文件。
+	if ok, _ := d4.hasFreshSpec(context.Background(), "meta"); !ok {
+		t.Fatal("expected fresh before modification")
+	}
+	newT4 := fi.ModTime().Add(7 * time.Second)
+	_ = os.Chtimes(target, newT4, newT4)
+	if ok4, reason4 := d4.hasFreshSpec(context.Background(), "meta"); ok4 {
+		t.Fatal("expected stale=false after file modified")
+	} else if !strings.Contains(reason4, "stale") || !strings.Contains(reason4, target) {
+		t.Fatalf("stale reason should list mismatched path, got: %q", reason4)
+	}
+
+	// Case 5: files 只含持续增长目录（logs/）下文件 -> 豁免 mtime，视为新鲜。
+	// 模拟系统日志被持续追加：先记录 mtime 再触摸修改。
+	logDir := filepath.Join(dir, "logs", "tui")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	logFile := filepath.Join(logDir, "2026-08-10.log")
+	if err := os.WriteFile(logFile, []byte("line1\n"), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	lfi, _ := os.Stat(logFile)
+	kv5 := newTestKVMemory(true)
+	_ = kv5.Set(context.Background(), "meta:spec", tool.EncodeSpecMD("meta", spec, map[string]int64{logFile: lfi.ModTime().Unix()}))
+	d5 := &Dispatcher{}
+	d5.WithSharedMemory(kv5)
+	// 系统继续写日志（mtime 前移 10s），spec 仍应视为新鲜。
+	newTime := lfi.ModTime().Add(10 * time.Second)
+	_ = os.Chtimes(logFile, newTime, newTime)
+	if ok5, reason5 := d5.hasFreshSpec(context.Background(), "meta"); !ok5 {
+		t.Fatalf("growing file (logs/) should be exempt from mtime check, reason=%q", reason5)
+	}
+
+	// Case 6: logs/ 豁免不波及普通源码：普通文件 stale 仍判 stale（#12 一致性语义不回归）。
+	// 独立文件，避免 Case 4 的 Chtimes 污染本用例的初始 mtime。
+	target6 := filepath.Join(dir, "foo6.js")
+	if err := os.WriteFile(target6, []byte("v1"), 0644); err != nil {
+		t.Fatalf("write foo6.js: %v", err)
+	}
+	fi6, _ := os.Stat(target6)
+	kv6 := newTestKVMemory(true)
+	_ = kv6.Set(context.Background(), "meta:spec", tool.EncodeSpecMD("meta", spec, map[string]int64{target6: fi6.ModTime().Unix()}))
+	d6 := &Dispatcher{}
+	d6.WithSharedMemory(kv6)
+	d6.WithSpecEnforcement(true)
+	// 先通过校验一次。
+	if msg := d6.checkSpecBeforeDispatch(context.Background(), "meta"); msg != "" {
+		t.Fatalf("expected pass before modification, got: %q", msg)
+	}
+	// 改普通文件 → stale（checkSpecBeforeDispatch 文案区分且列出路径）。
+	newTime6 := fi6.ModTime().Add(5 * time.Second)
+	_ = os.Chtimes(target6, newTime6, newTime6)
+	if msg := d6.checkSpecBeforeDispatch(context.Background(), "meta"); msg == "" {
+		t.Fatal("expected spec check failure after normal file modified")
+	} else if !strings.Contains(msg, "stale") || !strings.Contains(msg, target6) {
+		t.Fatalf("stale message should distinguish and list path, got: %q", msg)
 	}
 }
 

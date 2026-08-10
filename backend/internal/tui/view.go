@@ -100,6 +100,17 @@ func (m Model) renderTopBar(w int) string {
 	statusDot := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor)).Render(statusIcon)
 	sessionStr := m.styles.TopBarLabel.Render("Session") + m.styles.TopBarSep.Render(": ") + m.styles.TopBarValue.Render(sessionID)
 	statusStr := m.styles.TopBarLabel.Render("Status") + m.styles.TopBarSep.Render(": ") + statusDot + " " + m.styles.TopBarValue.Render(status)
+	// 软停止销毁倒计时（TODO #37）：DestroyAt 非 nil 时显示"销毁 MM:SS"，
+	// tick 每帧重算剩余时间（100ms tick 刷新链路现成）。
+	if s != nil && s.DestroyAt != nil {
+		remaining := time.Until(*s.DestroyAt)
+		if remaining < 0 {
+			remaining = 0
+		}
+		mm := int(remaining.Minutes())
+		ss := int(remaining.Seconds()) % 60
+		statusStr += m.styles.TopBarSep.Render(" | ") + m.styles.TopBarLabel.Render("销毁") + m.styles.TopBarValue.Render(fmt.Sprintf(" %02d:%02d", mm, ss))
+	}
 	// 运行时长：从会话开始时间实时计算，已结束的会话冻结在结束时刻。
 	elapsed := "00:00:00"
 	if s != nil && !s.StartedAt.IsZero() {

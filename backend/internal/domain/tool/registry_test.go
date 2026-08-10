@@ -586,6 +586,39 @@ func TestWriteSpec_Structured(t *testing.T) {
 	}
 }
 
+// TestWriteSpec_GrowingFilesWarning files 含持续增长目录（logs/）文件时输出告警提示。
+func TestWriteSpec_GrowingFilesWarning(t *testing.T) {
+	dir := t.TempDir()
+	logDir := filepath.Join(dir, "logs", "tui")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	logFile := filepath.Join(logDir, "2026-08-10.log")
+	if err := os.WriteFile(logFile, []byte("line\n"), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	srcFile := filepath.Join(dir, "main.js")
+	if err := os.WriteFile(srcFile, []byte("x"), 0644); err != nil {
+		t.Fatalf("write main.js: %v", err)
+	}
+
+	r := NewBuiltinRegistry(dir, nil, nil)
+	r.SetSharedMemory(newFakeSharedMemoryStore())
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "分析日志找失败原因",
+		"acceptance": []any{"列出失败点"},
+		"files":      []any{logFile, srcFile},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch: err=%v res=%+v", err, res)
+	}
+	if !strings.Contains(res.Output, "豁免") || !strings.Contains(res.Output, logFile) {
+		t.Fatalf("expected growing-file warning with path, got: %q", res.Output)
+	}
+}
+
 // TestWriteSpec_RequiresGoalAndAcceptance 验证 goal/acceptance 必填校验。
 func TestWriteSpec_RequiresGoalAndAcceptance(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)

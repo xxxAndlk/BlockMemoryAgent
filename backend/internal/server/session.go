@@ -38,6 +38,9 @@ type Session struct {
 	// ActiveTopicID 当前活跃话题 ID。话题切换时旧 Agent 树终结 + 新树起,
 	// 旧话题摘要写入 sharedKV。空表示单话题(未切换过)。前端可据此展示话题列表。
 	ActiveTopicID string `json:"active_topic_id,omitempty"`
+	// DestroyAt 软停止销毁倒计时截止时间（TODO #37）：软停止后非 nil，续跑/到期后清空。
+	// 前端可显示"MM:SS 后销毁"倒计时。
+	DestroyAt *time.Time `json:"destroy_at,omitempty"`
 }
 
 // SessionEvent 是会话事件流中的单个事件，对应前端展示的一条日志/消息。
@@ -319,6 +322,7 @@ func ToServerSession(a *agent.Session) *Session {
 		StreamingText: a.StreamingText,
 		ThinkingText:  a.ThinkingText,
 		ActiveTopicID: a.ActiveTopicID,
+		DestroyAt:     a.DestroyAt,
 	}
 }
 

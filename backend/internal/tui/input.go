@@ -14,6 +14,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/dag"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
 // pasteEnterThreshold 用于区分终端粘贴产生的连续 Enter 与手动回车。
@@ -28,6 +29,25 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.Type {
 	case tea.KeyEsc:
+		// 软停止（TODO #37）：当前会话 Running 时第一次 ESC 进入 2s 武装窗（不清空输入栏），
+		// flashMsg 提示"再按一次 ESC 停止所有任务"；窗内第二次 ESC → POST /stop。
+		// 武装窗超时或非 Running 会话：行为与现状完全一致（清空输入并离开输入栏）。
+		if s := m.selectedSession(); s != nil && s.Status == enums.SessionStatusRunning && !m.stopArmedUntil.IsZero() && time.Now().Before(m.stopArmedUntil) {
+			m.stopArmedUntil = time.Time{}
+			m.postJSON(fmt.Sprintf("/api/sessions/%s/stop", s.ID), map[string]any{})
+			m.flashMsg("软停止已发出：子任务暂停中，可发消息续跑（有销毁倒计时）")
+			m.inputBar.runes = nil
+			m.inputBar.cursor = 0
+			m.inputBar.mode = inputNormal
+			m.inputBar.histIdx = -1
+			return m, nil
+		}
+		if s := m.selectedSession(); s != nil && s.Status == enums.SessionStatusRunning && m.stopArmedUntil.IsZero() {
+			m.stopArmedUntil = time.Now().Add(2 * time.Second)
+			m.flashMsg("再按一次 ESC 停止当前会话全部子任务（可续跑，倒计时内任意消息恢复；到期未续跑销毁）")
+			return m, nil
+		}
+		m.stopArmedUntil = time.Time{}
 		// Esc 离开输入栏，清空输入并回到对话面板。
 		m.focus = panelChat
 		m.inputBar.runes = nil

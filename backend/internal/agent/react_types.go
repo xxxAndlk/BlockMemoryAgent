@@ -196,6 +196,15 @@ type DispatchCountResetter interface {
 	ResetDispatchCounts(sessionID string)
 }
 
+// SoftStopMarker 由 subagent.Dispatcher 实现（TODO #37）：会话软停止标记。
+// ReactService.Stop 先标记再触发子 Agent cancel，dispatcher 的 context.Canceled 收尾
+// 分支据此刻意落 Paused（domain，可续跑）/部分回灌（叶子），而非静默跳过；
+// 续跑触发时清除标记。
+type SoftStopMarker interface {
+	SetSoftStop(sessionID string)
+	ClearSoftStop(sessionID string)
+}
+
 // ModelProvider 是 ReActAgent 所需的 blades.ModelProvider 的最小子集。
 // 保留一个窄接口，使测试只需模拟 Generate 方法即可。
 type ModelProvider interface {

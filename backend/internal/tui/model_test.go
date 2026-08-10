@@ -577,3 +577,75 @@ func TestPlanPanelReflectsAgentStatuses(t *testing.T) {
 		t.Fatalf("计划面板应显示完成标记，got:\n%s", view)
 	}
 }
+
+// TestEscSoftStop_ArmsThenStops 双击 ESC 软停止（TODO #37）：
+// Running 会话下首次 ESC 武装（2s 窗）不清空输入栏；窗内第二次 ESC 清空输入（已发 /stop）；
+// 武装窗超时后 ESC 恢复既有"清空输入 + 离开输入栏"语义；非 Running 会话行为与现状一致。
+func TestEscSoftStop_ArmsThenStops(t *testing.T) {
+	m := &Model{
+		styles:         NewStyles(),
+		chatPanel:      ChatPanel{vp: viewport.New(80, 20)},
+		flashMu:        &sync.Mutex{},
+		sessions:       []*server.Session{{ID: "session-1", Status: enums.SessionStatusRunning}},
+		sessionsCursor: 0,
+		focus:          panelInput,
+	}
+	m.inputBar.runes = []rune("半条消息")
+	m.inputBar.cursor = 4
+
+	// 首次 ESC：武装，输入保留、焦点不动。
+	m2, _ := m.handleInputKey(tea.KeyMsg{Type: tea.KeyEsc})
+	model := m2.(*Model)
+	if len(model.inputBar.runes) != 4 {
+		t.Fatalf("first ESC should keep input, got %q", string(model.inputBar.runes))
+	}
+	if model.focus != panelInput {
+		t.Fatalf("first ESC should stay in input, got focus=%v", model.focus)
+	}
+	if model.stopArmedUntil.IsZero() {
+		t.Fatal("stop should be armed after first ESC")
+	}
+
+	// 窗内第二次 ESC：清空输入（已发 /stop）。
+	m3, _ := model.handleInputKey(tea.KeyMsg{Type: tea.KeyEsc})
+	model2 := m3.(*Model)
+	if len(model2.inputBar.runes) != 0 {
+		t.Fatalf("second ESC should clear input after stop, got %q", string(model2.inputBar.runes))
+	}
+	if !model2.stopArmedUntil.IsZero() {
+		t.Fatal("stop arming should reset after firing")
+	}
+
+	// 武装窗超时：恢复既有语义（清空 + 离开输入栏）。
+	m4 := &Model{
+		styles:         NewStyles(),
+		chatPanel:      ChatPanel{vp: viewport.New(80, 20)},
+		flashMu:        &sync.Mutex{},
+		sessions:       []*server.Session{{ID: "s2", Status: enums.SessionStatusRunning}},
+		sessionsCursor: 0,
+		focus:          panelInput,
+	}
+	m4.inputBar.runes = []rune("x")
+	m4.stopArmedUntil = time.Now().Add(-1 * time.Second)
+	m5, _ := m4.handleInputKey(tea.KeyMsg{Type: tea.KeyEsc})
+	model3 := m5.(*Model)
+	if len(model3.inputBar.runes) != 0 || model3.focus != panelChat {
+		t.Fatalf("ESC after arming window expiry should behave as before, runes=%q focus=%v", string(model3.inputBar.runes), model3.focus)
+	}
+
+	// 非 Running 会话：不武装，直接清空 + 离开输入栏（现状语义）。
+	m6 := &Model{
+		styles:         NewStyles(),
+		chatPanel:      ChatPanel{vp: viewport.New(80, 20)},
+		flashMu:        &sync.Mutex{},
+		sessions:       []*server.Session{{ID: "s3", Status: enums.SessionStatusPausedOnChild}},
+		sessionsCursor: 0,
+		focus:          panelInput,
+	}
+	m6.inputBar.runes = []rune("y")
+	m7, _ := m6.handleInputKey(tea.KeyMsg{Type: tea.KeyEsc})
+	model4 := m7.(*Model)
+	if len(model4.inputBar.runes) != 0 || model4.focus != panelChat {
+		t.Fatalf("ESC on non-running session should keep legacy behavior, runes=%q focus=%v", string(model4.inputBar.runes), model4.focus)
+	}
+}

@@ -33,4 +33,16 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if cfg.Agent.PlanExecuteMaxSteps != 8 {
 		t.Fatalf("plan_execute_max_steps 应为 8，got %d", cfg.Agent.PlanExecuteMaxSteps)
 	}
+	// 失败打捞超时（TODO #33）：config.yaml 显式 60（思考型模型下限）。
+	if cfg.Agent.SalvageLLMTimeoutSec != 60 {
+		t.Fatalf("salvage_llm_timeout_sec 应为 60，got %d", cfg.Agent.SalvageLLMTimeoutSec)
+	}
+	// 输入补全默认开启（TODO #36）：config.yaml 显式 true。
+	if cfg.Agent.PromptEnhance == nil || !*cfg.Agent.PromptEnhance {
+		t.Fatal("prompt_enhance 默认应为 true")
+	}
+	// 软停止销毁倒计时（TODO #37）：config.yaml 显式 300。
+	if cfg.Agent.StopDestroyCountdownSec != 300 {
+		t.Fatalf("stop_destroy_countdown_sec 应为 300，got %d", cfg.Agent.StopDestroyCountdownSec)
+	}
 }

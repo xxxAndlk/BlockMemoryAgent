@@ -16,6 +16,11 @@ import (
 // DefaultEventLimit 定义当 Assemble 未配置事件数量上限时，默认注入上下文的近期事件条数。
 const DefaultEventLimit = 20
 
+// maxRawEventJoinRunes 是【近期事件】注入文本的最大 rune 数（TODO #33）：
+// 摘要器不可用降级 raw join 时全文拼接可能吹爆上下文（事故：摘要两次失败 raw join，
+// MetaAgent 上下文膨胀），超限截断并附标记。摘要成功路径输出已压缩，一般远低于该值。
+const maxRawEventJoinRunes = 4000
+
 // DefaultMaxEventsPerAgent 定义每个 agent 在内存中最多保留的事件条数默认值。
 // 该值必须大于 DefaultEventLimit，保证 Assemble 在容量裁减后仍能取满注入上限。
 const DefaultMaxEventsPerAgent = 200
@@ -271,6 +276,10 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 	// ctxMsg 是注入到上下文的 system 消息，头部用中文标签便于大模型识别。
 	// 放在 history 末尾而非开头：内容每轮随事件增长变化，放末尾不破坏前缀缓存
 	// （DeepSeek 自动前缀缓存命中 system 指令 + history 前缀，events 摘要位于不可缓存尾部）。
+	// 截断兜底（TODO #33）：摘要器缺失/失败走 raw join 时全文可能极长，超限截断防上下文膨胀。
+	if r := []rune(body); len(r) > maxRawEventJoinRunes {
+		body = string(r[:maxRawEventJoinRunes]) + fmt.Sprintf("\n...（近期事件超过 %d 字，已截断；只保留最新 %d 条事件中的前缀部分）", maxRawEventJoinRunes, len(summary))
+	}
 	ctxMsg := agent.ReactMessage{
 		Role:    "system",
 		Content: "【近期事件】\n" + body,
@@ -386,7 +395,9 @@ func joinNonEmpty(sep string, parts []string) string {
 // 压缩规则：
 //   - system 前缀全保留（若存在；记忆流水线已将近期事件移至末尾，此处通常无 system 前缀）；
 //   - 首条 user 消息原样保留（任务目标，防"失忆"）；
-//   - 中段每条消息压成 "[role] 前 200 字符" 拼成一条摘要文本；
+//   - 中段压缩（TODO #34/#35 结论）：assistant/tool 消息压成 "[role] 前 200 字符"，
+//     **user 消息保前 500 字符**——用户指令语义不可压（多轮会话第二条指令如"重新执行/
+//     自检"被压成 200 字符是"指令歧义→全量重跑"事故的直接推手）；
 //   - 最近 K 条原样保留（含 tool_call/tool_result 对，边界避开 tool 起刀）。
 //
 // 返回 summary 摘要正文、tailStart 保留段起点（messages[tailStart:] 原样保留）。
@@ -430,9 +441,12 @@ func compressMiddle(messages []agent.ReactMessage, keepRecent int) (summary stri
 		recentStart++
 	}
 
-	// 4) 中段暴力压缩：每条 -> "[role] 前 200 字符"。
+	// 4) 中段暴力压缩：user 消息保前 500 字符（指令语义不可压），其余 200。
 	middle := messages[firstUserIdx+1 : recentStart]
-	const midChunkMax = 200
+	const (
+		midChunkMax     = 200
+		midUserChunkMax = 500
+	)
 	var sb strings.Builder
 	sb.WriteString("【历史压缩摘要】\n")
 	for _, m := range middle {
@@ -444,8 +458,12 @@ func compressMiddle(messages []agent.ReactMessage, keepRecent int) (summary stri
 		if content == "" && len(m.ToolCalls) > 0 {
 			content = fmt.Sprintf("[tool_calls: %d]", len(m.ToolCalls))
 		}
-		if r := []rune(content); len(r) > midChunkMax {
-			content = string(r[:midChunkMax]) + "…"
+		limit := midChunkMax
+		if role == "user" {
+			limit = midUserChunkMax
+		}
+		if r := []rune(content); len(r) > limit {
+			content = string(r[:limit]) + "…"
 		}
 		fmt.Fprintf(&sb, "- [%s] %s\n", role, content)
 	}

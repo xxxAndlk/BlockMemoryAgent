@@ -18,6 +18,11 @@ import (
 // 超过此次数将触发循环退出，避免无限重试。
 const maxConsecutiveFailures = 3
 
+// maxConsecutiveValidationRejections 定义单个工具连续校验拒绝的最大次数（TODO #32）。
+// 校验拒绝是"修正参数即可"的前置条件问题，与执行失败分开计：阈值放宽到 5，
+// 仍防"模型复读同一错误参数"的无效循环（编造参数硬闯校验）。
+const maxConsecutiveValidationRejections = 5
+
 // exploreBudget 是单个 Agent 任务内探索类工具（ReadFile/ListDir/SearchInFiles）调用次数上限。
 // 防止 Agent 陷入探索循环不收敛：实证 domain-2 调 81 次探索工具 30m 超时未写完。
 // 超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。HTTPGet 不计（联网查询场景不同）。
@@ -85,16 +90,23 @@ type Tool interface {
 
 // failureCounter 用于按工具名称统计连续失败次数，
 // 支持并发安全地增加计数和重置计数。
+// 两类计数（TODO #32）：counts=执行失败（execution_failed，阈值 3 终止）；
+// validationCounts=校验拒绝（validation_rejected，阈值 5 终止）——分开计，互不共享。
 type failureCounter struct {
-	// mu 保护 counts 的读写锁，避免并发竞争。
+	// mu 保护 counts 与 validationCounts 的读写锁，避免并发竞争。
 	mu sync.Mutex
-	// counts 记录每个工具名称对应的连续失败次数。
+	// counts 记录每个工具名称对应的连续执行失败次数。
 	counts map[string]int
+	// validationCounts 记录每个工具名称对应的连续校验拒绝次数。
+	validationCounts map[string]int
 }
 
 // newFailureCounter 创建一个新的失败计数器，内部 map 已经初始化。
 func newFailureCounter() *failureCounter {
-	return &failureCounter{counts: make(map[string]int)}
+	return &failureCounter{
+		counts:           make(map[string]int),
+		validationCounts: make(map[string]int),
+	}
 }
 
 // fail 将指定工具的连续失败次数加 1，并返回当前次数。
@@ -109,6 +121,14 @@ func (f *failureCounter) fail(name string) int {
 	return f.counts[name]
 }
 
+// failValidation 将指定工具的连续校验拒绝次数加 1，并返回当前次数。
+func (f *failureCounter) failValidation(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validationCounts[name]++
+	return f.validationCounts[name]
+}
+
 // reset 将指定工具的连续失败次数清零（从 map 中删除）。
 func (f *failureCounter) reset(name string) {
 	// 加锁保护 counts 的并发修改。
@@ -117,6 +137,7 @@ func (f *failureCounter) reset(name string) {
 	defer f.mu.Unlock()
 	// 删除该工具的计数记录，表示失败状态已恢复。
 	delete(f.counts, name)
+	delete(f.validationCounts, name)
 }
 
 // Registry 是工具注册表，保存所有内置工具、执行器、进度回调以及任务级状态。
@@ -477,21 +498,47 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 填充结果的通用字段，如 SessionID、ArgsJSON 以及执行器回调。
 	r.fillResult(ctx, result, args)
 
-	// 根据执行成功与否更新失败计数。
+	// 根据执行成功与否更新失败计数（TODO #32 分级：校验拒绝与执行失败分开计，互不共享）。
 	if result.Success {
-		// 成功则重置该工具的连续失败计数。
+		// 成功则重置该工具的连续失败计数（两类一起清）。
 		r.failures.reset(name)
 	} else {
-		// 失败则累加连续失败计数。
-		n := r.failures.fail(name)
-		// 连续失败达阈值 = 无效重试死循环信号，返回包装哨兵终止 ReAct 循环
-		//（原为 blades ActionLoopExit 上下文信号，无注入方，静默丢弃成死代码）。
-		if n >= maxConsecutiveFailures {
-			msg := fmt.Sprintf("工具 %s 已连续失败 %d 次，疑似无效重试死循环，本次任务终止。", name, n)
-			log.Printf("[tool] consecutive failures LoopExit: scope=%s tool=%s failures=%d", scopeKeyFromCtx(ctx), name, n)
-			result.Error = msg
-			r.emitResult(ctx, result)
-			return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
+		// 无显式 Category 的失败按执行失败计（默认语义，保持既有行为）。
+		cat := result.Category
+		if cat == "" {
+			cat = ResultCategoryExecutionFailed
+		}
+		if cat == ResultCategoryValidationRejected {
+			// 校验拒绝：参数/前置条件问题，修正参数即可——单独计数（阈值更高），
+			// 文案明示"这是校验拒绝，不计入失败"，防止模型误以为工具坏了。
+			// MetaAgent 的 call_sub_agent/call_sub_agents 豁免连杀终止：编排者的纠偏循环是正常工作方式
+			//（事故实证：自检任务连续三次可纠正的校验拒绝，第 3 次即 ErrLoopExit 终止整个 goal）。
+			if isMetaDispatch(ctx, name) {
+				log.Printf("[tool] validation rejected (meta dispatch exempt): scope=%s tool=%s err=%q", scopeKeyFromCtx(ctx), name, result.Error)
+				r.emitResult(ctx, result)
+				return result, nil
+			}
+			n := r.failures.failValidation(name)
+			if n >= maxConsecutiveValidationRejections {
+				msg := fmt.Sprintf("工具 %s 已连续 %d 次被校验拒绝（参数/前置条件问题，如 task 超长、必填参数缺失、spec 缺失或过期）——"+
+					"这是校验拒绝不是执行失败，修正参数或补齐前置条件（如 WriteSpec）后重试即可；本次任务终止以防无限纠偏循环。", name, n)
+				log.Printf("[tool] validation rejections LoopExit: scope=%s tool=%s rejections=%d", scopeKeyFromCtx(ctx), name, n)
+				result.Error = msg
+				r.emitResult(ctx, result)
+				return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
+			}
+		} else {
+			// 执行失败（默认）：累加连续失败计数。
+			n := r.failures.fail(name)
+			// 连续失败达阈值 = 无效重试死循环信号，返回包装哨兵终止 ReAct 循环
+			//（原为 blades ActionLoopExit 上下文信号，无注入方，静默丢弃成死代码）。
+			if n >= maxConsecutiveFailures {
+				msg := fmt.Sprintf("工具 %s 已连续失败 %d 次，疑似无效重试死循环，本次任务终止。", name, n)
+				log.Printf("[tool] consecutive failures LoopExit: scope=%s tool=%s failures=%d", scopeKeyFromCtx(ctx), name, n)
+				result.Error = msg
+				r.emitResult(ctx, result)
+				return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
+			}
 		}
 	}
 
@@ -499,6 +546,16 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	r.emitResult(ctx, result)
 	// 返回执行结果和错误（工具内部错误已封装在 result 中，此处 error 通常为 nil）。
 	return result, nil
+}
+
+// isMetaDispatch 判断当前调用是否为 MetaAgent 的派发工具调用（TODO #32-3）：
+// 编排者的 call_sub_agent 校验拒绝是正常纠偏（改了参数/补了 spec 再派），
+// 豁免连杀终止，防止"正确纠偏的编排者"被守卫误杀。
+func isMetaDispatch(ctx context.Context, name string) bool {
+	if name != "call_sub_agent" && name != "call_sub_agents" {
+		return false
+	}
+	return RoleIDFromContext(ctx) == "meta"
 }
 
 // scheduleProjectRefresh 去抖调度一次 PROJECT.md 刷新（文件增删改后调用）。
@@ -749,7 +806,8 @@ func (r *Registry) Schema() []tools.Tool {
 		toolsList = append(toolsList, t)
 	}
 	// 注册 SearchInFiles 工具：在文件中搜索文本。
-	if t, err := tools.NewFunc("SearchInFiles", "在文件中搜索文本（大小写不敏感）。pattern 为待搜索文本，dir 为起始目录（默认当前工作目录）；适合先定位再精读，返回匹配行及上下文。", func(ctx context.Context, in searchInFilesInput) (string, error) {
+	// 描述显式声明字面匹配语义（不支持正则），防模型按 grep 习惯写正则导致零命中。
+	if t, err := tools.NewFunc("SearchInFiles", "在文件中搜索文本（字面文本匹配，大小写不敏感，不支持正则表达式）。pattern 含 | 时按关键词拆分、任意关键词命中即记一行（如 \"bug|error\" 等价于两次搜索的并集）；dir 为起始目录（默认当前工作目录）。适合先定位再精读，返回匹配行及上下文；无匹配时返回提示文案而非错误。", func(ctx context.Context, in searchInFilesInput) (string, error) {
 		res, _ := r.Dispatch(ctx, "SearchInFiles", map[string]any{"pattern": in.Pattern, "dir": in.Dir})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil

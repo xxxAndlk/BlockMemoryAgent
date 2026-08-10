@@ -230,6 +230,25 @@ func parseFilesArg(v any) []string {
 	}
 }
 
+// growingDirNames 是系统自身持续写入的目录名（路径段级匹配）：
+// 其下文件的 mtime 恒变（TUI/Agent 日志、.bma 内部元数据），spec/共享摘要记录它们必然 stale——
+// "系统自己改自己"，与"别的 Agent 改了源码"（#12 的失效语义）必须区分。
+// 对这类文件豁免 mtime 校验、降级为存在性检查，否则"分析活体日志"类任务机制上永远派发不出去。
+var growingDirNames = map[string]bool{"logs": true, ".bma": true}
+
+// IsGrowingPath 判断 path 任一路径段命中持续增长目录（logs/.bma）。
+// 路径段级匹配：workdir 下的 logs/tui/xxx.log、项目子目录 tower-defense/logs/ 均豁免；
+// 源码目录恰好名为 logs 的罕见场景接受误豁免（该类目录下 mtime 校验本身不可靠）。
+// 供 WriteSpec 告警与 subagent.verifyFileMtimes 豁免复用，保证两侧判定一致。
+func IsGrowingPath(path string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(filepath.Clean(path)), "/") {
+		if growingDirNames[seg] {
+			return true
+		}
+	}
+	return false
+}
+
 // statFile 规范化 path 为绝对路径并取 mtime（Unix 秒）。
 // 文件不存在或 stat 失败返回 ok=false，调用方跳过该 path。
 func statFile(p string) (absPath string, mtime int64, ok bool) {

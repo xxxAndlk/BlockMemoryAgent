@@ -26,8 +26,6 @@ const (
 	salvageSlotPrefix = "salvage:"
 	// salvageMaxRunes 是打捞摘要写入槽位/追加进任务文本的最大 rune 数。
 	salvageMaxRunes = 2000
-	// salvageLLMTimeout 打捞轻量调用的超时：超过即回退文本截断，不拖慢失败回灌。
-	salvageLLMTimeout = 5 * time.Second
 	// salvagePrefixMarker 是打捞摘要追加进父 mailbox 失败消息时的标记。
 	salvagePrefixMarker = "【失败打捞】\n"
 )
@@ -56,7 +54,13 @@ func (d *Dispatcher) salvageFailure(ctx context.Context, parentID, subAgentID st
 	// 仅在有真实历史时调 LLM 打捞提取；kill 场景（History nil）直接用回退文本，
 	// 避免对"心跳超时已取消"这类无信息文本空跑轻量模型。
 	if d.salvageExtractor != nil && result.History != nil {
-		scCtx, cancel := context.WithTimeout(ctx, salvageLLMTimeout)
+		// 超时取配置值（默认 30s，思考型模型场景 60s+）：思考型模型首 token 就要数十秒，
+		// 旧 5s 硬编码致打捞提取全超时降级 facts=0（TODO #33 事故链），超时兜底保留。
+		timeout := d.salvageTimeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		scCtx, cancel := context.WithTimeout(ctx, timeout)
 		facts, err := d.salvageExtractor.Extract(scCtx, text, "", roleDef.ID)
 		cancel()
 		if err == nil && len(facts) > 0 {

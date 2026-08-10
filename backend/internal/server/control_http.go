@@ -126,6 +126,30 @@ func (m *SessionManager) HandleSessionEnqueue(w http.ResponseWriter, r *http.Req
 	json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running"})
 }
 
+// HandleSessionStop 处理 POST /api/sessions/{id}/stop（TODO #37 软停止）。
+// 与 /cancel 的区别：不销毁——停止当前会话全部子任务（domain 落 Paused 可续跑、
+// 叶子部分回灌），会话转入 PausedOnChild；倒计时内任意消息续跑，到期未续跑硬销毁。
+func (m *SessionManager) HandleSessionStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+
+	if err := m.agent.Control(r.Context(), id, agent.ControlCommand{Op: agent.ControlOpStop}); err != nil {
+		msg, status := agentErrorStatus(err)
+		http.Error(w, msg, status)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "stopping"})
+}
+
 // HandleSessionCancel 处理 POST /api/sessions/{id}/cancel。
 // 职责：取消会话当前任务。
 func (m *SessionManager) HandleSessionCancel(w http.ResponseWriter, r *http.Request) {

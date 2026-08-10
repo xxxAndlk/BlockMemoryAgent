@@ -201,7 +201,17 @@ type Dispatcher struct {
 
 	// salvageExtractor 从失败子 Agent 输出中提取打捞摘要（已读文件清单/已得结论/卡点）。
 	// 为 nil 时回退末条 assistant 文本截断；bootstrap 注入轻量模型实现（prompt 与事实提取不同）。
+	// salvageExtractor 从失败子 Agent 输出中提取打捞摘要（已读文件清单/已得结论/卡点）。
+	// TODO #20 第二层：注入后失败路径尝试 LLM 提取，失败回退文本截断。
 	salvageExtractor SalvageExtractor
+	// salvageTimeout 打捞轻量调用的超时：思考型模型（glm/deepseek 推理系）首 token 就要数十秒，
+	// 旧 5s 硬编码致打捞提取全超时降级（TODO #33 事故链）；默认 30s，配置下限 60s 供思考型场景。
+	salvageTimeout time.Duration
+	// softStops 记录处于"软停止中"的 sessionID（TODO #37）：ReactService.Stop 先标记再
+	// 触发子 Agent cancel；dispatcher 的 context.Canceled 收尾分支据此分流——
+	// domain 落 Paused（存 history 可续跑）、叶子部分回灌，而非静默跳过。
+	softStops   map[string]bool
+	softStopMu  sync.Mutex
 
 	// heartbeatTimeout 子 Agent 心跳超时：叶子 Agent 超过该时长无活动（generateOnce/工具派发）
 	// 判定假死（LLM 流式挂起/工具 hang），巡检 goroutine 主动 cancel + notify 父 + trackChildDone，
@@ -449,6 +459,17 @@ func (d *Dispatcher) WaitForAnyChild(parentID string, timeout time.Duration) boo
 	}
 }
 
+// pokeParent 唤醒父 Agent 的终结保护 wait loop（不改变 PendingChildren 计数）。
+// 软停止 Pause 路径调用：让父 MetaAgent 尽快检测 Paused 子节点转为 PausedOnChild，
+// 否则父要等满 30s wait 周期。无缓冲竞争时丢弃（wait loop 会在下个周期自检）。
+func (d *Dispatcher) pokeParent(parentID string) {
+	ps := d.getOrCreatePending(parentID)
+	select {
+	case ps.notify <- struct{}{}:
+	default:
+	}
+}
+
 // HasPausedChild 返回父 Agent 是否有 StatusPaused 的子 DomainAgent 节点。
 // 实现 agent.PausedChildChecker 接口，供 MetaAgent 父终结保护 wait loop 检测：
 // 子 domain 触达 token 上限进入 Paused 后，父 MetaAgent 无限 budget 不会自行暂停，
@@ -520,13 +541,40 @@ func NewDispatcher(
 ) *Dispatcher {
 	// 构造 Dispatcher 实例，将依赖注入到对应字段。
 	return &Dispatcher{
-		registry: registry,
-		models:   models,
-		tools:    tools,
-		mailbox:  mailbox,
-		memory:   memory,
-		timeout:  30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
+		registry:       registry,
+		models:         models,
+		tools:          tools,
+		mailbox:        mailbox,
+		memory:         memory,
+		timeout:        30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
+		salvageTimeout: 30 * time.Second, // 默认 30s，可用 WithSalvageTimeout 覆盖（TODO #33）
+		softStops:      make(map[string]bool),
 	}
+}
+
+// SetSoftStop 标记会话进入软停止（TODO #37）：ReactService.Stop 调用，先标记再触发
+// 子 Agent cancel，dispatcher 收尾分支据此刻意落 Paused/部分回灌。幂等。
+func (d *Dispatcher) SetSoftStop(sessionID string) {
+	d.softStopMu.Lock()
+	defer d.softStopMu.Unlock()
+	d.softStops[sessionID] = true
+}
+
+// ClearSoftStop 清除会话软停止标记（续跑触发时调用）。幂等。
+func (d *Dispatcher) ClearSoftStop(sessionID string) {
+	d.softStopMu.Lock()
+	defer d.softStopMu.Unlock()
+	delete(d.softStops, sessionID)
+}
+
+// isSoftStop 查询会话是否处于软停止中。
+func (d *Dispatcher) isSoftStop(sessionID string) bool {
+	if d == nil {
+		return false
+	}
+	d.softStopMu.Lock()
+	defer d.softStopMu.Unlock()
+	return d.softStops[sessionID]
 }
 
 // WithTimeout 配置子 Agent 独立执行的最大时长；<=0 表示不限制（仅防挂起的保底由调用方负责）。
@@ -661,6 +709,16 @@ func (d *Dispatcher) WithEngineConfig(reflectionMaxRounds, planMaxSteps int) *Di
 // 传 nil 关闭 LLM 提取（默认关闭），回退末条 assistant 文本截断。
 func (d *Dispatcher) WithSalvageExtractor(e SalvageExtractor) *Dispatcher {
 	d.salvageExtractor = e
+	return d
+}
+
+// WithSalvageTimeout 配置打捞轻量调用的超时（默认 30s；思考型模型场景建议 >=60s）。
+// <=0 时按 30s 兜底。
+func (d *Dispatcher) WithSalvageTimeout(t time.Duration) *Dispatcher {
+	if t <= 0 {
+		t = 30 * time.Second
+	}
+	d.salvageTimeout = t
 	return d
 }
 
@@ -882,7 +940,7 @@ func (t *callSubAgentTool) Description() string {
 		"子 Agent 完成后，其结果摘要会以 [mailbox from <sub_agent_id>] 消息送达，请在后续轮次中阅读并整合。\n" +
 		"task 必须自包含 <= 2000 字（按 rune 计数，含中文字符）：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。" +
 		"规格原文走 WriteSharedMemory，不塞进 task。超长 task 将被拒绝，错误提示\"task too long\"。\n\n" +
-		"【前置依赖】派发前必须先调 WriteSpec(goal, acceptance, constraints, files) 写入任务规范，否则返回错误\"spec missing or stale\"。" +
+		"【前置依赖】派发前必须先调 WriteSpec(goal, acceptance, constraints, files) 写入任务规范，否则返回错误（spec missing=未写 / spec stale=涉及文件已变更且列出失配路径 / spec invalid=缺 goal 或验收）。" +
 		"WriteSpec 与 WriteSharedMemory 是不同工具：WriteSharedMemory 写自由 KV 供子 Agent 读，" +
 		"WriteSpec 写固定 slot \"spec\" 供 dispatcher 校验并注入子 Agent 任务体前缀。两者不可互相替代。\n\n" +
 		"【路由规则】\n" +
@@ -934,11 +992,13 @@ func validateDispatchArgs(roleID, task, responsibility, mode string) string {
 
 // checkSpecBeforeDispatch 做 WriteSpec 强制校验：SpecEnforcementEnabled 开启时，
 // 派发前必须先 WriteSpec（校验 parentID:spec 存在、新鲜、Spec.Goal 非空且至少一条 Acceptance）。
-// 校验失败不区分 stale/missing：stale（文件被改过）等价于 spec 过期，同样要求重写。
 // 返回空串表示通过，否则为错误文案。批量派发（call_sub_agents）只校验一次。
 func (d *Dispatcher) checkSpecBeforeDispatch(ctx context.Context, parentID string) string {
-	if d.specEnforcementEnabled && !d.hasFreshSpec(ctx, parentID) {
-		return "spec missing or stale: 先调 WriteSpec(goal, acceptance, constraints, files) 写任务规范，再派发"
+	if !d.specEnforcementEnabled {
+		return ""
+	}
+	if ok, reason := d.hasFreshSpec(ctx, parentID); !ok {
+		return reason + " 先调 WriteSpec(goal, acceptance, constraints, files) 写任务规范，再派发"
 	}
 	return ""
 }
@@ -959,7 +1019,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	mode, _ := args["mode"].(string)
 
 	if msg := validateDispatchArgs(roleID, task, responsibility, mode); msg != "" {
-		return &tool.Result{Tool: "call_sub_agent", Error: msg}
+		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
@@ -967,7 +1027,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: "missing parent agent context"}
 	}
 	if msg := d.checkSpecBeforeDispatch(ctx, parentID); msg != "" {
-		return &tool.Result{Tool: "call_sub_agent", Error: msg}
+		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
 	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode)
@@ -994,12 +1054,12 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// 从角色注册表获取目标角色定义，若角色不存在则拒绝调用。
 	roleDef := d.registry.Get(roleID)
 	if roleDef == nil {
-		return "", &tool.Result{Error: fmt.Sprintf("unknown role: %s", roleID)}
+		return "", &tool.Result{Error: fmt.Sprintf("unknown role: %s", roleID), Category: tool.ResultCategoryValidationRejected}
 	}
 
 	// 校验调用权限：只有被允许的角色关系才能发起子 Agent 调用。
 	if !d.registry.CanCall(roleIDFromAgentID(parentID), roleID) {
-		return "", &tool.Result{Error: fmt.Sprintf("role %s cannot be called by %s", roleID, parentID)}
+		return "", &tool.Result{Error: fmt.Sprintf("role %s cannot be called by %s", roleID, parentID), Category: tool.ResultCategoryValidationRejected}
 	}
 
 	// 派发依赖门（TODO #22 Phase 1）：计划中该领域子任务的 depends_on 未全部完成时拒绝，
@@ -1007,7 +1067,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// 无计划（board nil/领域未覆盖）零行为变化；拒绝不烧派发配额。
 	if roleID == "domain" {
 		if gate := d.checkDepGate(ctx, parentID, domain); gate != "" {
-			return "", &tool.Result{Error: gate}
+			return "", &tool.Result{Error: gate, Category: tool.ResultCategoryValidationRejected}
 		}
 	}
 
@@ -1019,7 +1079,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		if dup := d.findPendingDomainSibling(ctx, parentID, domain); dup != "" {
 			return "", &tool.Result{Error: fmt.Sprintf(
 				"duplicate dispatch: 同领域子 Agent %s 正在执行中（domain=%s）。请等待其 [mailbox from %s] 回传结果后再做下一步；如需补充或修正需求，等其完成后再派发",
-				dup, domain, dup)}
+				dup, domain, dup), Category: tool.ResultCategoryValidationRejected}
 		}
 		// 前序失败打捞（TODO #20 第三层）：同父同 domain 存在 Failed/Cancelled 兄弟时，
 		// 把其打捞摘要（<parentID>:salvage:<domain>）追加到新任务文本，机制上保证重派不重复探索。
@@ -1036,7 +1096,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		count := v.(*atomic.Int64)
 		if count.Add(1) > int64(d.maxTotalDispatches) {
 			count.Add(-1)
-			return "", &tool.Result{Error: fmt.Sprintf("dispatch total limit reached for session %s (max %d). 派发总数已耗尽，请直接整合已有结果答复用户", sessionID, d.maxTotalDispatches)}
+			return "", &tool.Result{Error: fmt.Sprintf("dispatch total limit reached for session %s (max %d). 派发总数已耗尽，请直接整合已有结果答复用户", sessionID, d.maxTotalDispatches), Category: tool.ResultCategoryValidationRejected}
 		}
 	}
 
@@ -1135,7 +1195,7 @@ func (t *callSubAgentsTool) Description() string {
 		"字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=2000 字；" +
 		"mode 可选 react/reflection/plan_execute，省略=react）。\n" +
 		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
-		"否则返回 \"spec missing or stale\"。逐项返回派出结果：某项失败不影响其他项。"
+		"否则返回 spec missing/stale 错误（stale 会列出已变更文件路径）。逐项返回派出结果：某项失败不影响其他项。"
 }
 
 // Execute 执行 call_sub_agents 工具调用：逐项校验→spec 校验一次→逐项 dispatchOne。
@@ -1145,11 +1205,11 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 
 	raw, ok := args["tasks"].([]any)
 	if !ok || len(raw) == 0 {
-		return &tool.Result{Tool: "call_sub_agents", Error: "tasks is required: 非空数组，每项 {role_id, task, domain?, responsibility?}"}
+		return &tool.Result{Tool: "call_sub_agents", Error: "tasks is required: 非空数组，每项 {role_id, task, domain?, responsibility?}", Category: tool.ResultCategoryValidationRejected}
 	}
 	const maxBatch = 6
 	if len(raw) > maxBatch {
-		return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("batch too large: %d 项（max %d）。超过请合并领域或分批", len(raw), maxBatch)}
+		return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("batch too large: %d 项（max %d）。超过请合并领域或分批", len(raw), maxBatch), Category: tool.ResultCategoryValidationRejected}
 	}
 
 	type batchItem struct{ roleID, domain, task, responsibility, mode string }
@@ -1157,7 +1217,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 	for i, r := range raw {
 		m, ok := r.(map[string]any)
 		if !ok {
-			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d] 必须是对象 {role_id, task, ...}", i)}
+			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d] 必须是对象 {role_id, task, ...}", i), Category: tool.ResultCategoryValidationRejected}
 		}
 		it := batchItem{}
 		it.roleID, _ = m["role_id"].(string)
@@ -1166,7 +1226,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.responsibility, _ = m["responsibility"].(string)
 		it.mode, _ = m["mode"].(string)
 		if msg := validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode); msg != "" {
-			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg)}
+			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
 		}
 		items = append(items, it)
 	}
@@ -1176,7 +1236,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		return &tool.Result{Tool: "call_sub_agents", Error: "missing parent agent context"}
 	}
 	if msg := d.checkSpecBeforeDispatch(ctx, parentID); msg != "" {
-		return &tool.Result{Tool: "call_sub_agents", Error: msg}
+		return &tool.Result{Tool: "call_sub_agents", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
 	var okIDs, errs []string
@@ -1226,6 +1286,42 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		// 取消路径（会话取消/cancel_agent/心跳杀）：通知与树收尾由取消方负责，
 		// 此处跳过避免双通知与覆盖 Cancelled 状态（TODO #25 控制面）。
 		if errors.Is(err, context.Canceled) {
+			// 软停止分流（TODO #37）：会话软停止标记命中时——
+			//   domain：SaveMessages 存完整 history + tree.Pause（可续跑），不 notify 不
+			//     trackChildDone（PendingChildren 保持 >0 → 父终结保护 → MetaAgent PausedOnChild，
+			//     恢复路由零改动生效）；
+			//   叶子助手：无 Pause 语义，部分回灌父（treeFinish Done + notify + trackChildDone），
+			//     domain 续跑后按需重派。
+			if sid := tool.SessionIDFromContext(ctx); d.isSoftStop(sid) {
+				if roleDef.ID == "domain" {
+					if d.msgStore != nil && result.History != nil {
+						// 本分支的 ctx 已被 StopRunning 取消：SaveMessages 必须用脱离取消的 ctx，
+						// 否则 history 存不进去、resume 无消息可加载（e2e 实证 "no persisted messages"）。
+						// 附加 10s 超时防慢 PG 阻塞子 Agent 收尾 goroutine。
+						saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+						err := d.msgStore.SaveMessages(saveCtx, subAgentID, sid, result.History)
+						cancelSave()
+						if err != nil {
+							log.Printf("[subagent] soft-stop save messages failed: sub=%s err=%v", subAgentID, err)
+						}
+					}
+					if d.treeFn != nil && sid != "" {
+						if t := d.treeFn(sid); t != nil {
+							t.Pause(subAgentID, "user stop")
+						}
+					}
+					// 唤醒父 MetaAgent 的 wait loop（不改变 PendingChildren 计数）：
+					// 否则父要等满 30s wait 周期才检测到 Paused 子节点，PausedOnChild 转换被拖慢。
+					d.pokeParent(parentID)
+					log.Printf("[subagent] SOFT-STOP PAUSED: sub=%s role=%s duration=%s (awaiting resume)", subAgentID, roleDef.ID, duration)
+					return true
+				}
+				partial := truncateRunes(agent.LastAssistantText(result.History), 500)
+				log.Printf("[subagent] SOFT-STOP LEAF PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
+				d.treeFinish(ctx, subAgentID, "软停止部分完成: "+partial, nil)
+				d.notify(parentID, subAgentID, "子 Agent 已被软停止（会话停止中），返回当前部分成果；续跑后可按需重派。\n"+partial, files)
+				return false
+			}
 			log.Printf("[subagent] CANCELLED: sub=%s role=%s duration=%s", subAgentID, roleDef.ID, duration)
 			return false
 		}
@@ -1969,23 +2065,28 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID string) str
 
 // hasFreshSpec 校验 parentID:spec 是否存在且新鲜（Spec.Goal 非空 + 至少一条 Acceptance + files mtime 一致）。
 // 供 callSubAgentTool.Execute 在 SpecEnforcementEnabled 开启时调用，缺失则拒绝派发。
-func (d *Dispatcher) hasFreshSpec(ctx context.Context, parentID string) bool {
+// 返回 (通过, 失败原因文案)：失败时区分 missing（未写）/ invalid（内容不合法）/ stale（文件已变更），
+// stale 精确列出失配文件路径，让 LLM 定向修正（重写被改文件或剔除无关文件）而非盲猜重写整个 spec。
+func (d *Dispatcher) hasFreshSpec(ctx context.Context, parentID string) (bool, string) {
 	if d.sharedMem == nil {
-		return false
+		return false, "spec missing: 共享记忆未启用"
 	}
 	key := parentID + ":" + specSlotName
 	val, err := d.sharedMem.Get(ctx, key)
 	if err != nil || strings.TrimSpace(val) == "" {
-		return false
+		return false, "spec missing: 未找到 WriteSpec 写入的任务规范"
 	}
 	fm, _, ok := tool.DecodeSharedMD(val)
 	if !ok {
-		return false
+		return false, "spec invalid: 规范文件解析失败（frontmatter 缺失或损坏）"
 	}
-	if !verifyFileMtimes(fm.Files) {
-		return false
+	if bad := staleFilePaths(fm.Files); len(bad) > 0 {
+		return false, "spec stale: 涉及文件已变更: " + strings.Join(bad, ", ") + "。请用 WriteSpec 重写（或剔除无关文件）"
 	}
-	return strings.TrimSpace(fm.Goal) != "" && len(fm.Acceptance) > 0
+	if strings.TrimSpace(fm.Goal) == "" || len(fm.Acceptance) == 0 {
+		return false, "spec invalid: 规范缺 goal 或验收标准（acceptance 至少一条）"
+	}
+	return true, ""
 }
 
 // renderSpecPrefix 把 Spec 渲染为【任务规范】前缀文本。
@@ -2229,20 +2330,28 @@ func blockReuseCount(meta map[string]any) int {
 	return 0
 }
 
+// staleFilePaths 返回未通过 mtime 校验的 path 列表（stat 失败或 mtime 不匹配），
+// 持续增长目录（logs/.bma，tool.IsGrowingPath）下的文件豁免。排序保证文案确定性。
+func staleFilePaths(files map[string]int64) []string {
+	var bad []string
+	for path, stamped := range files {
+		if tool.IsGrowingPath(path) {
+			continue
+		}
+		fi, err := os.Stat(path)
+		if err != nil || fi.ModTime().Unix() != stamped {
+			bad = append(bad, path)
+		}
+	}
+	sort.Strings(bad)
+	return bad
+}
+
 // verifyFileMtimes 校验各 path 当前 mtime 与 frontmatter 中记录的是否一致。
 // 任一 path stat 失败或 mtime 不匹配返回 false（视为 stale）。
 // 空 Files 视为通过（无 path 需校验，可能是旧 entry 或纯结论摘要）。
 func verifyFileMtimes(files map[string]int64) bool {
-	for path, stamped := range files {
-		fi, err := os.Stat(path)
-		if err != nil {
-			return false
-		}
-		if fi.ModTime().Unix() != stamped {
-			return false
-		}
-	}
-	return true
+	return len(staleFilePaths(files)) == 0
 }
 
 // partialSuffix 把部分进度文本拼接到通知末尾；为空时返回空串。

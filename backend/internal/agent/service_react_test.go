@@ -19,6 +19,8 @@ import (
 	// blades 提供可编程的模型消息与 provider 接口。
 	"github.com/go-kratos/blades"
 
+	// board 提供任务看板（TODO #36 输入补全的绑定数据源）。
+	"github.com/blockmemory/agent/backend/internal/board"
 	// orchestrator 提供 Agent 树结构,供话题切换测试 Register 节点。
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 )
@@ -263,6 +265,127 @@ func TestReactService_SendMessage(t *testing.T) {
 	if len(final.Messages) < 3 {
 		t.Errorf("expected at least 3 messages, got %d", len(final.Messages))
 	}
+}
+
+// TestReactService_PromptEnhance_AppendsCompletion 开启补全时 Send 的续跑意图消息
+// 被附加【系统补全】段（意图标签 + 看板失败任务绑定）；原文保留在【用户原始指令】段。
+func TestReactService_PromptEnhance_AppendsCompletion(t *testing.T) {
+	llm := &mockReactModelProvider{
+		responses: []*blades.Message{
+			blades.AssistantMessage("initial"),
+			blades.AssistantMessage("resumed"),
+		},
+	}
+	svc := newReactServiceForTest(llm, t.TempDir())
+	svc.SetPromptEnhance(true)
+
+	// 造带失败任务的看板（模拟"自检被 loop guard 三连败终止"）。
+	b := board.NewTaskBoard("s1", "做塔防")
+	if err := b.SetPlan("做塔防", []board.PlanTask{{ID: "t1", Title: "自检", Domain: "自检", Acceptance: []string{"a"}}}); err != nil {
+		t.Fatalf("SetPlan: %v", err)
+	}
+	if err := b.MarkFailed("t1", "loop guard 三连败终止"); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+	svc.SetBoard(func(string) *board.TaskBoard { return b })
+
+	ctx := context.Background()
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "做塔防"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	// 等待初始运行完成。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snap, _ := svc.Get(ctx, created.ID)
+		if snap != nil && snap.Status == string(enums.SessionStatusCompleted) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 发送续跑意图的短指令（事故场景原文）。
+	if err := svc.Send(ctx, created.ID, Message{Role: "user", Content: "重新执行"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// 等待会话再次完成，检查用户消息是否被补全。
+	deadline = time.Now().Add(2 * time.Second)
+	var final *Session
+	for time.Now().Before(deadline) {
+		final, _ = svc.Get(ctx, created.ID)
+		if final != nil && final.Status == string(enums.SessionStatusCompleted) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if final == nil {
+		t.Fatal("session not found after Send")
+	}
+	var lastUser string
+	for _, m := range final.Messages {
+		if m.Role == string(enums.ChatRoleUser) {
+			lastUser = m.Content
+		}
+	}
+	if !strings.Contains(lastUser, "【系统补全】") || !strings.Contains(lastUser, "意图: 续跑") {
+		t.Fatalf("enhanced message should carry 系统补全 + 续跑 intent, got: %q", lastUser)
+	}
+	if !strings.Contains(lastUser, "自检") || !strings.Contains(lastUser, "loop guard 三连败终止") {
+		t.Fatalf("failed task should be bound, got: %q", lastUser)
+	}
+	if !strings.Contains(lastUser, "【用户原始指令】\n重新执行") {
+		t.Fatalf("original text must be preserved verbatim, got: %q", lastUser)
+	}
+}
+
+// TestReactService_PromptEnhance_DisabledPassthrough 关闭补全时 Send 原样直通（零行为变化）。
+func TestReactService_PromptEnhance_DisabledPassthrough(t *testing.T) {
+	llm := &mockReactModelProvider{
+		responses: []*blades.Message{
+			blades.AssistantMessage("initial"),
+			blades.AssistantMessage("resumed"),
+		},
+	}
+	svc := newReactServiceForTest(llm, t.TempDir())
+	svc.SetPromptEnhance(false)
+
+	ctx := context.Background()
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "g"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snap, _ := svc.Get(ctx, created.ID)
+		if snap != nil && snap.Status == string(enums.SessionStatusCompleted) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := svc.Send(ctx, created.ID, Message{Role: "user", Content: "继续做"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var final *Session
+	for time.Now().Before(deadline) {
+		final, _ = svc.Get(ctx, created.ID)
+		if final != nil && final.Status == string(enums.SessionStatusCompleted) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if final == nil {
+		t.Fatal("session not found after Send")
+	}
+	for _, m := range final.Messages {
+		if m.Role == string(enums.ChatRoleUser) && strings.Contains(m.Content, "继续做") {
+			if strings.Contains(m.Content, "【系统补全】") {
+				t.Fatalf("disabled enhance should pass through verbatim, got: %q", m.Content)
+			}
+			return
+		}
+	}
+	t.Fatal("user message not found")
 }
 
 // TestReactService_CleansTempDirOnCompletion 验证会话完成后会清理其临时目录。

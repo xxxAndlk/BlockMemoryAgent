@@ -76,6 +76,17 @@ type ReactService struct {
 	persona PersonaInjector
 	// boardFn 按 sessionID 返回会话任务看板（TODO #22 执行计划）；nil 表示未接线。
 	boardFn func(sessionID string) *board.TaskBoard
+	// promptEnhance 用户输入自动提示词补全开关（TODO #36 Phase 0 规则版）。
+	// 开启时 sendMessage 对命中续跑/控制/诊断意图的输入附加【系统补全】段
+	// （意图标签 + 最近失败/未完成任务绑定），只增不改原文；关闭时零行为变化。
+	promptEnhance bool
+	// stopMarker 会话软停止标记器（TODO #37，subagent.Dispatcher 实现）：
+	// Stop 先标记再触发子 Agent cancel，dispatcher 收尾分支据此刻意落 Paused/部分回灌。
+	// nil 时 Stop 退化为仅级联取消（无暂停语义）。
+	stopMarker SoftStopMarker
+	// stopCountdown 软停止销毁倒计时（TODO #37）：Stop 后到期未续跑则硬销毁全部节点；
+	// <=0 关闭倒计时（永久暂停，靠用户续跑）。
+	stopCountdown time.Duration
 	// userProfile 用户画像存储（TODO #28 第四层记忆）；nil 表示未接线（不注入不提取）。
 	userProfile *userprofile.Store
 	// profileExtractor 会话完成时从对话提取偏好增量的轻量模型回调；nil 跳过提取。
@@ -146,6 +157,67 @@ func (s *ReactService) extractProfilePreferences(session *reactInternalSession) 
 // 由 bootstrap 注入 board.Manager.Get；传 nil 关闭看板功能（TUI 计划面板回退树合成）。
 func (s *ReactService) SetBoard(fn func(sessionID string) *board.TaskBoard) {
 	s.boardFn = fn
+}
+
+// SetPromptEnhance 开启/关闭用户输入自动提示词补全（TODO #36，默认关闭；
+// bootstrap 按 config.Agent.PromptEnhance 注入，config.yaml 默认 true）。
+// 关闭时 sendMessage 原样接收用户消息，零行为变化。
+func (s *ReactService) SetPromptEnhance(enabled bool) {
+	s.promptEnhance = enabled
+}
+
+// enhanceUserInput 对用户输入做意图分类 + 消歧绑定（TODO #36 Phase 0 规则版）。
+// 数据源：会话任务看板（board.Snapshot 失败/未完成任务）+ Agent 树失败/取消节点
+// （LoopExit 被杀/心跳杀/用户取消——看板未必回写，树是权威）。无绑定状态时仅给意图标签。
+// 开关关闭 / 意图未命中返回原文（零行为变化）。
+func (s *ReactService) enhanceUserInput(sessionID, content string) string {
+	if !s.promptEnhance {
+		return content
+	}
+	st := EnhanceState{}
+	if s.boardFn != nil {
+		if b := s.boardFn(sessionID); b != nil {
+			snap := b.Snapshot()
+			st.BoardGoal = snap.Goal
+			st.BoardState = string(snap.Status)
+			for _, t := range snap.Tasks {
+				et := EnhanceTask{Title: t.Title, Domain: t.Domain, Status: string(t.Status), Result: t.Result}
+				switch t.Status {
+				case board.TaskFailed:
+					st.FailedTasks = append(st.FailedTasks, et)
+				case board.TaskDone:
+					// 终态成功不绑定
+				default:
+					st.PendingTasks = append(st.PendingTasks, et)
+				}
+			}
+		}
+	}
+	// 树补充失败/取消节点（看板未覆盖时）：按 domain 去重，避免与看板失败任务重复列。
+	if t := s.TreeFor(sessionID); t != nil {
+		boardFailed := make(map[string]bool, len(st.FailedTasks))
+		for _, ft := range st.FailedTasks {
+			boardFailed[ft.Domain] = true
+		}
+		for _, n := range t.Snapshot() {
+			if n.Role != "domain" || (n.Status != orchestrator.StatusFailed && n.Status != orchestrator.StatusCancelled) {
+				continue
+			}
+			if boardFailed[n.Domain] {
+				continue
+			}
+			title := n.Domain
+			if title == "" {
+				title = n.Task
+			}
+			reason := n.Err
+			if reason == "" {
+				reason = n.Summary
+			}
+			st.FailedTasks = append(st.FailedTasks, EnhanceTask{Title: title, Domain: n.Domain, Status: n.Status.String(), Result: reason})
+		}
+	}
+	return EnhancePrompt(content, st)
 }
 
 // Board 返回会话任务看板快照（TODO #22 Phase 2 面板真相源）。
@@ -699,6 +771,9 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 	case ControlOpCancel:
 		// 取消会话。
 		return s.cancel(ctx, sessionID)
+	case ControlOpStop:
+		// 软停止（TODO #37）：停止当前会话全部子任务，可续跑。
+		return s.Stop(ctx, sessionID)
 	case ControlOpTopic:
 		// 话题切换：提取 name 与 goal 并切换话题。
 		name, _ := cmd.Args["name"].(string)
@@ -1251,9 +1326,12 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 构造 ReActAgent，并注入邮箱、记忆管道与主循环运行时配置。
 	// MetaAgent 暴露 call_sub_agent + 只读/信息类工具（ReadFile/ListDir/SearchInFiles/HTTPGet），
 	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
+	// 任务看板注入（TODO #35 Phase 0）：每轮上下文末尾追加【任务看板】段——编排状态
+	// 机器可读且压缩不可达，"重新执行"类短指令的消歧锚点。仅 meta 注入，子 Agent 不注入。
+	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
 		WithMailbox(s.mailbox).
-		WithMemory(s.memory).
+		WithMemory(metaMemory).
 		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
@@ -1342,9 +1420,11 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 构造并配置 ReActAgent。
 	// MetaAgent 暴露 call_sub_agent + 只读/信息类工具（ReadFile/ListDir/SearchInFiles/HTTPGet），
 	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
+	// 任务看板注入（TODO #35 Phase 0）：同 runSession，每轮末尾追加【任务看板】段。
+	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
 		WithMailbox(s.mailbox).
-		WithMemory(s.memory).
+		WithMemory(metaMemory).
 		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
@@ -1598,6 +1678,11 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		return nil
 	}
 
+	// 用户输入自动提示词补全（TODO #36 Phase 0 规则版）：命中续跑/控制/诊断意图时
+	// 附加【系统补全】段（意图标签 + 最近失败/未完成任务绑定），只增不改用户原文。
+	// askUser/approval 澄清答复分支在上面已提前返回，不经过补全（答复非新任务）。
+	content = s.enhanceUserInput(sessionID, content)
+
 	// 将用户消息追加到会话消息列表。
 	session.Messages = append(session.Messages, Message{
 		Role:      string(enums.ChatRoleUser),
@@ -1633,6 +1718,8 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 
 	// 如果会话原先未运行，则在 goroutine 中恢复执行。
 	if !wasRunning {
+		// 续跑触发：清除软停止状态（停倒计时定时器 + 清标记），幂等（TODO #37）。
+		s.cancelSoftStopState(sessionID)
 		// PausedOnChild: 优先恢复 earliest paused domain（任意消息，含"继续"与新任务，D1）。
 		// 各 Agent 独立上下文：domain 从 agent_messages 加载 history 续跑，fresh budget。
 		// 无 paused domain 或未注入恢复器时回退普通 resumeSession（MetaAgent 续跑）。
@@ -1862,6 +1949,128 @@ func (s *ReactService) cancel(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+// SetSoftStopMarker 注入会话软停止标记器（TODO #37，subagent.Dispatcher 实现）。
+// 传 nil 时 Stop 退化为级联取消（无暂停语义）。bootstrap 注入。
+func (s *ReactService) SetSoftStopMarker(m SoftStopMarker) {
+	s.stopMarker = m
+}
+
+// SetStopCountdown 配置软停止销毁倒计时（TODO #37，默认 300s；<=0 关闭）。
+// bootstrap 按 config.Agent.StopDestroyCountdownSec 注入。
+func (s *ReactService) SetStopCountdown(d time.Duration) {
+	s.stopCountdown = d
+}
+
+// Stop 软停止会话（TODO #37）：停止当前会话全部在跑子 Agent，可续跑。
+//
+// 与 cancel（硬销毁）的区别：不置 error、不标 Cancelled——先置软停止标记，
+// 再触发 Running 节点 cancel 回调（StopRunning 不改状态），dispatcher 收尾分支
+// 据此把 domain 落 Paused（存 history 可续跑）、叶子部分回灌；全部落定后
+// PendingChildren>0 触发父终结保护，会话自然落入 PausedOnChild，恢复路由零改动生效。
+// 之后启动销毁倒计时：到期未续跑则硬销毁（cascadeCancelTree + 会话 error）。
+//
+// 边界：仅 Running 会话可停止；停止中发消息照常入 Messages，待会话落入
+// PausedOnChild 后按既有恢复路由处理（不注入正在收尾的 MetaAgent）。
+func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
+	s.store.mu.Lock()
+	session, ok := s.store.sessions[sessionID]
+	if !ok {
+		s.store.mu.Unlock()
+		return ErrSessionNotFound
+	}
+	if session.Status != enums.SessionStatusRunning {
+		s.store.mu.Unlock()
+		return fmt.Errorf("%w: session is not running", ErrInvalidSessionState)
+	}
+	// 1. 置软停止标记（dispatcher 收尾分流依据）。
+	if s.stopMarker != nil {
+		s.stopMarker.SetSoftStop(sessionID)
+	}
+	// 2. 触发全部 Running 节点 cancel 回调（不改节点状态，Pause 由 dispatcher 收尾做）。
+	if t := s.TreeFor(sessionID); t != nil {
+		for _, n := range t.Snapshot() {
+			if n.Status == orchestrator.StatusRunning {
+				t.StopRunning(n.ID)
+			}
+		}
+	}
+	// 3. 销毁倒计时：到期未续跑则硬销毁（含 Paused 节点）。
+	if s.stopCountdown > 0 {
+		deadline := time.Now().Add(s.stopCountdown)
+		session.destroyAt = &deadline
+		session.stopTimer = time.AfterFunc(s.stopCountdown, func() {
+			s.destroyAfterSoftStop(sessionID)
+		})
+	}
+	s.store.mu.Unlock()
+
+	s.store.addEvent(session, eventkind.System, "System",
+		fmt.Sprintf("软停止: 已停止全部子任务（%s 后未续跑将销毁）", s.stopCountdown), "", "", "", "", "", true)
+	log.Printf("[service] SOFT-STOP: session=%s countdown=%s", sessionID, s.stopCountdown)
+	return nil
+}
+
+// destroyAfterSoftStop 软停止倒计时到期：硬销毁会话（cascadeCancelTree 含 Paused 节点），
+// 清停止标记与倒计时状态。幂等：会话已恢复/已终止时 no-op。
+// 触发条件：仍在软停止窗口内（destroyAt 非 nil）且会话处于 PausedOnChild（正常落定）
+// 或 Running（级联仍在进行）——两种状态都属于"停止后未续跑"，到期即销毁。
+func (s *ReactService) destroyAfterSoftStop(sessionID string) {
+	s.store.mu.Lock()
+	session, ok := s.store.sessions[sessionID]
+	if !ok || session.destroyAt == nil {
+		s.store.mu.Unlock()
+		return
+	}
+	switch session.Status {
+	case enums.SessionStatusPausedOnChild, enums.SessionStatusRunning:
+	default:
+		s.store.mu.Unlock()
+		return
+	}
+	if session.stopTimer != nil {
+		session.stopTimer.Stop()
+		session.stopTimer = nil
+	}
+	session.destroyAt = nil
+	cancelFn := session.cancelFn
+	session.cancelFn = nil
+	s.store.mu.Unlock()
+
+	if s.stopMarker != nil {
+		s.stopMarker.ClearSoftStop(sessionID)
+	}
+	if cancelFn != nil {
+		cancelFn()
+	}
+	s.cascadeCancelTree(sessionID)
+
+	s.store.mu.Lock()
+	if session.Status == enums.SessionStatusPausedOnChild || session.Status == enums.SessionStatusRunning {
+		session.Status = enums.SessionStatusError
+		session.Result = "软停止超时未续跑，任务已销毁"
+		now := time.Now()
+		session.EndedAt = &now
+	}
+	s.store.mu.Unlock()
+	s.store.addEvent(session, eventkind.System, "System", "软停止倒计时到期，任务已销毁（如需续跑请重开会话）", "", "", "", "", "", true)
+}
+
+// cancelSoftStopState 续跑触发时清除软停止状态：停倒计时定时器 + 清标记。
+// sendMessage 恢复路径（PausedOnChild / 普通 resume）调用，幂等。
+func (s *ReactService) cancelSoftStopState(sessionID string) {
+	s.store.mu.Lock()
+	session, ok := s.store.sessions[sessionID]
+	if ok && session.stopTimer != nil {
+		session.stopTimer.Stop()
+		session.stopTimer = nil
+		session.destroyAt = nil
+	}
+	s.store.mu.Unlock()
+	if s.stopMarker != nil {
+		s.stopMarker.ClearSoftStop(sessionID)
+	}
+}
+
 // toReactAgentSession 将内部 reactInternalSession 转换为公共 Session DTO。
 func toReactAgentSession(s *reactInternalSession) *Session {
 	// 空指针安全处理。
@@ -1901,6 +2110,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		ThinkingText:   s.ThinkingText,
 		ActiveBlocks:   []ActiveBlock{},
 		PendingClarify: s.pendingClarify,
+		DestroyAt:      s.destroyAt,
 		ActiveTopicID:  s.activeTopicID,
 	}
 }

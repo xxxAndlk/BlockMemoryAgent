@@ -20,6 +20,11 @@ type Result struct {
 	Output string `json:"output"`
 	// Error 记录工具调用失败时的错误信息；无错误时为空。
 	Error string `json:"error,omitempty"`
+	// Category 是机读失败分级（TODO #32）：仅失败时非空。
+	// validation_rejected=参数/前置校验拒绝（修正参数即可，不计入执行失败连杀）；
+	// execution_failed=执行失败（默认，无 Category 时按此计）；
+	// empty_result=查无此物/空结果（有效信息，非失败——SearchInFiles 零命中已按 Success=true 处理）。
+	Category string `json:"category,omitempty"`
 	// Path 记录工具操作所针对的文件或目录路径。
 	Path string `json:"path,omitempty"`
 	// ArgsJSON 记录工具调用参数的 JSON 序列化形式。
@@ -31,6 +36,17 @@ type Result struct {
 	// TempDir 记录本次调用使用的临时目录路径。
 	TempDir string `json:"temp_dir,omitempty"`
 }
+
+// 失败分级常量（TODO #32）：Dispatch 按 Category 区分连杀计数与终止语义。
+const (
+	// ResultCategoryExecutionFailed 执行失败（工具自身/环境错误）：计入单工具连续失败守卫（阈值 3）。
+	ResultCategoryExecutionFailed = "execution_failed"
+	// ResultCategoryValidationRejected 参数/前置校验拒绝（task too long / spec stale / role_id required 等）：
+	// 修正参数即可，单独计数（阈值 5），MetaAgent 的 call_sub_agent 豁免终止。
+	ResultCategoryValidationRejected = "validation_rejected"
+	// ResultCategoryEmptyResult 查无此物/空结果：有效信息而非失败（#31 后零命中已 Success=true，本类为兜底保留）。
+	ResultCategoryEmptyResult = "empty_result"
+)
 
 // ProgressEvent 表示代理执行过程中的单个进度事件，用于通知观察者（如 UI、日志等）。
 type ProgressEvent struct {
