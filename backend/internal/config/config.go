@@ -430,7 +430,9 @@ func (c *Config) applyAgentStandaloneDefaults() {
 		c.Agent.ContextWindow = 32000
 	}
 	if c.Agent.ReadFileMaxChars == 0 {
-		c.Agent.ReadFileMaxChars = 4000
+		// 16000 ≈ 200 行代码（含行号前缀与 UTF-8 中文注释字节）的整页容量；
+		// 旧值 4000 会把 200 行页截停到 60-110 行，抵消 defaultReadFileLimit=200。
+		c.Agent.ReadFileMaxChars = 16000
 	}
 	if c.Agent.RunCommandMaxOutput == 0 {
 		c.Agent.RunCommandMaxOutput = 10000

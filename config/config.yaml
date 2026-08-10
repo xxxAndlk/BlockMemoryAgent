@@ -58,7 +58,7 @@ agent:
   plan_execute_max_steps: 8      # 派发 mode=plan_execute 时最大执行步数（TODO #29 三引擎）：超限强制收口终答
   react_llm_timeout_sec: 600     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断,改 600s 给一次调用留够跑完。配合 generate() 不在 deadline 上重试,卡死时 600s 即报错而非 4×180=12min。
   sub_agent_timeout_min: 60      # 子 Agent 独立执行超时（分钟），负数表示不限制。预算抬至 400K 后单 domain 需跑完多文件生成，30min 易在慢推理（thinking）下超时。
-  tool_output_history_max_runes: 6000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 已改行区间分页（默认 120 行/页，约 4000 字符），6000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取
+  tool_output_history_max_runes: 20000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 行区间分页默认 200 行/页（read_file_max_chars 默认 16000 字符，ASCII 整页约 16000 runes），20000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取
   token_budget_per_goal: 100000   # 单次目标累计 token 上限（input+output 之和，跨轮累加），超限暂停等用户续跑；<=0 不限制
   token_budget_per_role:          # 按角色单 Agent token 上限（resume 重置；覆盖 token_budget_per_goal）。未列角色按默认:domain 120000 / 叶子助手 40000 / meta 200000(安全网,防不收敛死循环)。入史工具入参截断(2000 runes)后 input 增长受控，但 codegen 输出（thinking 模型含推理 token）单文件可达 15-30K；塔防级多文件任务一次交付不暂停需 domain 400K / 叶子 100K。实证 code_assistant 写 tower.js 撞 100K 截断被迫由 domain 重写返工，编码类叶子抬至 200K。实证 domain 集成走查阶段撞 400K 暂停(第二轮 23:49)，暂停=交付流程中断，抬至 600K 做安全网(摘要走 k3 后上下文收紧,正常不应触顶)。
     domain: 600000

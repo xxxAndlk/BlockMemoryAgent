@@ -25,13 +25,16 @@ const maxConsecutiveFailures = 3
 // 用 RunCommand 逐文件 cat 绕过 ReadFile 预算，串行读文件 19 分钟不收敛（logs/tui/2026-08-03.log）。
 // 验证/动作类 RunCommand（node --check、go build、mkdir）仍不计入：封禁会让 Agent 写完文件后
 // 无法按纪律验证，在"必须验证"与"工具被拒"之间死循环（实证：配置 Agent 被拒 8 轮空转 4 分钟）。
-const exploreBudget = 8
+// 取值 20：实证（2026-08-10 塔防日志）旧值 8 次 × 单页实测 60-110 行（4000 字符截停），
+// 单领域职责文件（如 game.js 849 行 + monster.js 521 行）需 ~17 页才能读完，
+// 4 个领域 Agent 全部耗尽预算被 loop guard 判死；20 次 × 200 行/页覆盖 ~4000 行。
+const exploreBudget = 20
 
 // exploreBudgetPostWrite 是"写入已开始"后的探索预算升档上限。
 // v13 基准实证：验收领域开工 57 秒读 8 个文件耗尽预算后被禁止再读，只能凭记忆整文件
 // 盲重写（4 次 25-40K output tokens 巨型调用耗 29 分钟），盲改回归震荡致 13/16 平台期
 // 30 分钟——修复期工作本质是"读报错位置→改→复验"循环，禁读等于逼盲改。
-// 首次 WriteFile 成功后预算升档到本常量：写前 8 次反空转纪律不变，写后放开精读修复。
+// 首次 WriteFile 成功后预算升档到本常量：写前 20 次反空转纪律不变，写后放开精读修复。
 // 仍设上限防"逐文件通读"式发散（v2 实证 19 分钟不收敛），并有连读循环守卫与 token 预算兜底。
 const exploreBudgetPostWrite = 40
 
@@ -601,7 +604,7 @@ func (r *Registry) exploreLimit(scopeKey string) int {
 // 返回空字符串表示允许；否则返回拦截原因（要求 Agent 转入 WriteFile）。
 // 对 ReadFile/ListDir/SearchInFiles 与只读型 RunCommand 生效；
 // 验证/动作类 RunCommand 不计（封禁会导致写完文件后无法验证的重试死循环）。
-// 预算分两档：首次 WriteFile 前 8 次（反探索空转），写入已开始 40 次
+// 预算分两档：首次 WriteFile 前 20 次（反探索空转），写入已开始 40 次
 // （修复期"读报错位置→改→复验"循环合法；v13 实证禁读逼出整文件盲重写长尾）。
 func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	scopeKey := scopeKeyFromCtx(ctx)
@@ -684,7 +687,7 @@ func (r *Registry) Schema() []tools.Tool {
 	// 初始化空列表，用于收集所有工具定义。
 	var toolsList []tools.Tool
 	// 注册 ReadFile 工具：读取文件内容。
-	if t, err := tools.NewFunc("ReadFile", "按行区间读取文件内容，输出带行号。path 为相对或绝对路径；offset 为起始行（1-based，默认 1），limit 为读取行数（默认 120，单页另受字符上限截停）。文件较大时用 offset 翻页，输出首行会给出总行数与下一页起点。建议先用 SearchInFiles/ListDir 定位再按区间精读；重读同一区间会直接返回磁盘最新内容。", func(ctx context.Context, in readFileInput) (string, error) {
+	if t, err := tools.NewFunc("ReadFile", "按行区间读取文件内容，输出带行号。path 为相对或绝对路径；offset 为起始行（1-based，默认 1），limit 为读取行数（默认 200，单页另受字符上限截停）。文件较大时用 offset 翻页，输出首行会给出总行数与下一页起点。建议先用 SearchInFiles/ListDir 定位再按区间精读；重读同一区间会直接返回磁盘最新内容。", func(ctx context.Context, in readFileInput) (string, error) {
 		// 通过 Dispatch 调用内部 ReadFile 工具，忽略 Dispatch 返回的 error。
 		res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": in.Path, "offset": in.Offset, "limit": in.Limit})
 		// 将结果序列化为 JSON 字符串。

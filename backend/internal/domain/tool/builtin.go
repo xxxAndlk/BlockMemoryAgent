@@ -142,7 +142,9 @@ type (
 
 // defaultReadFileLimit 是 ReadFile 未显式指定 limit 时的默认读取行数。
 // 与 ReadFileMaxChars 字符上限共同生效（先到先截），保证单页输出可控。
-const defaultReadFileLimit = 120
+// 取值 200：实证（2026-08-10 塔防日志）120 行/页被 4000 字符上限截停到单页 60-110 行，
+// 领域 Agent 读不完职责文件即耗尽探索预算被判死；升档后多数文件单页即可覆盖。
+const defaultReadFileLimit = 200
 
 // readFile 按行区间读取指定路径的文本内容（1-based offset + limit 分页）。
 // 输出带行号（cat -n 风格），顶部首行放置分页头（总行数/本页区间/下一页 offset），

@@ -121,7 +121,7 @@ func (e *Executor) agentConfig() *config.AgentConfig {
 	}
 	// 未注入配置时，返回硬编码的默认阈值
 	return &config.AgentConfig{
-		ReadFileMaxChars:     4000,  // 读取文件时最大字符数限制
+		ReadFileMaxChars:     16000, // 读取文件时最大字符数限制（匹配 200 行/页整页容量）
 		RunCommandMaxOutput:  10000, // 执行命令时最大输出字节数限制
 		RunCommandTimeoutSec: 60,    // 执行命令时默认超时秒数
 		ToolExecMaxBytes:     300,   // 工具执行结果最大字节数限制

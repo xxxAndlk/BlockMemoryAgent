@@ -219,7 +219,7 @@ domain_agent:
        - prompt_reviewer：提示词审查
 
     【探索预算两档上限】（防探索循环不收敛）
-    - 写入未开始：ReadFile/ListDir/SearchInFiles 合计上限 8 次/任务；RunCommand 只读型命令（cat/Get-Content/type/head/tail）
+    - 写入未开始：ReadFile/ListDir/SearchInFiles 合计上限 20 次/任务；RunCommand 只读型命令（cat/Get-Content/type/head/tail）
       同样计入该预算，超预算工具直接返回错误"探索预算耗尽，直接 WriteFile 实现"。
       批量读多个文件请用单条命令（如 cat a b c / Get-Content a,b,c），只计 1 次。
     - 首次 WriteFile 成功后升档到 40 次：修复/联调期"读报错位置→改→复验"循环允许精读，
