@@ -111,12 +111,16 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 		at.nodes = append(at.nodes, orchestratorNodesToTreeNodes(filterPrevRoundNodes(nodes, roundStart), s.ID)...)
 	}
 
-	// 若会话处于待澄清状态，追加一个占位节点提示用户。
+	// 若会话处于待澄清状态，追加一个占位节点提示用户（含问题文本，TODO #24）。
 	if s.State != nil && s.State.PendingClarify != nil {
+		label := "Clarify pending"
+		if q := strings.TrimSpace(s.State.PendingClarify.Question); q != "" {
+			label = "待答复: " + truncate(q, 40)
+		}
 		at.nodes = append(at.nodes, agentTreeNode{
 			depth:     1,
 			instID:    "clarify",
-			name:      "Clarify pending",
+			name:      label,
 			roleType:  enums.RoleTypeMeta,
 			status:    enums.RoleStatusWaiting,
 			isClarify: true,

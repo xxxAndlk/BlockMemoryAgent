@@ -194,7 +194,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 		// 保留 HTTPGet：MetaAgent 偶尔需联网查文档/API 参考，不涉及大块上下文。
 		// roles.yaml meta_agent.tools 非空时整体覆盖白名单（基准单 Agent 模式：
 		// 去掉 call_sub_agent、放开执行类工具）；为空保持上述内置默认。
-		tools := []string{"call_sub_agent", "call_sub_agents", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles", "RefreshProjectDoc"}
+		tools := []string{"call_sub_agent", "call_sub_agents", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles", "RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "write_plan", "remember_preference", "search_knowledge"}
 		if len(r.cfg.MetaAgent.Tools) > 0 {
 			tools = r.cfg.MetaAgent.Tools
 		}
@@ -227,7 +227,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 				"call_sub_agent", "call_sub_agents",
 				"ReadFile", "ListDir", "SearchInFiles", "HTTPGet",
 				"WriteSharedMemory", "WriteSpec", "WriteFile", "RunCommand",
-				"RefreshProjectDoc",
+				"RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "search_knowledge",
 			},
 			CanBeCalled: true,
 		}

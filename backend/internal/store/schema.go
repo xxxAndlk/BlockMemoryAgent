@@ -178,6 +178,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_messages_session
 // EnsureInitialMemorySchema 自动创建 001_init.sql 中定义的记忆/知识/注册表相关表 (幂等)。
 // 负责在启动时补齐 global_knowledge / agent_private_memory / agent_snapshots / topics /
 // agent_registry / decision_logs / topic_archives 等表,避免块记忆、私有记忆、快照写入失败。
+// 注意: agent_private_memory / agent_snapshots 两张表为 legacy——仅 EpisodeStore/SnapshotStore
+// （dormant，无运行时代码路径）与 server snapshot 兼容接口消费，保留 DDL 仅为不丢历史数据。
 // 参数:
 //   - ctx: 超时与取消控制。
 //   - db:  *sql.DB 连接池。
@@ -245,6 +247,10 @@ CREATE INDEX IF NOT EXISTS idx_gk_topic ON global_knowledge(topic_id);
 CREATE INDEX IF NOT EXISTS idx_gk_access ON global_knowledge(last_accessed, access_count);
 CREATE INDEX IF NOT EXISTS idx_gk_archived ON global_knowledge(archived);
 CREATE INDEX IF NOT EXISTS idx_global_knowledge_domain ON global_knowledge USING btree ((meta->>'domain'));
+-- 外部知识库全文检索（TODO #27）：生成列 + GIN 索引。
+-- 'simple' 配置对英文分词可用；中文需部署 zhparser/pg_jieba 后改 'zhparser'（见 retriever 文档）。
+ALTER TABLE global_knowledge ADD COLUMN IF NOT EXISTS content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;
+CREATE INDEX IF NOT EXISTS idx_gk_content_tsv ON global_knowledge USING GIN (content_tsv);
 
 CREATE TABLE IF NOT EXISTS agent_registry (
     id VARCHAR(64) PRIMARY KEY,

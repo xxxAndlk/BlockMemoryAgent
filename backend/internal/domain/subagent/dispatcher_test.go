@@ -599,7 +599,7 @@ func TestRunSubAgent_PurgesMailbox(t *testing.T) {
 	}
 
 	// 向子 Agent 收件箱投递一条未读消息。
-	mb.Send(&mailbox.Message{From: "meta", To: subAgentID, Type: mailbox.MsgInfo, Subject: "late"})
+	_, _ = mb.Send(&mailbox.Message{From: "meta", To: subAgentID, Type: mailbox.MsgInfo, Subject: "late"})
 	if mb.Count(subAgentID) != 1 {
 		t.Fatalf("expected 1 unread message before purge, got %d", mb.Count(subAgentID))
 	}

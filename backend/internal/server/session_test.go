@@ -8,6 +8,8 @@ import (
 	"time"    // 时间戳
 
 	"github.com/blockmemory/agent/backend/internal/agent"                // agent 门面接口
+	"github.com/blockmemory/agent/backend/internal/board"
+	"github.com/blockmemory/agent/backend/internal/userprofile"                // 看板快照类型
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // Agent 树节点类型
 	"github.com/blockmemory/agent/backend/pkg/enums"                     // 会话状态与角色枚举
 )
@@ -116,6 +118,12 @@ func (m *mockAgentForServer) CancelAgent(ctx context.Context, sessionID, instID 
 	return nil
 }
 
+// Profile 返回用户画像，测试实现返回空。
+func (m *mockAgentForServer) Profile(ctx context.Context) (*userprofile.Profile, error) { return &userprofile.Profile{}, nil }
+
+// SaveProfile 覆盖画像，测试实现为空操作。
+func (m *mockAgentForServer) SaveProfile(ctx context.Context, content string) error { return nil }
+
 // Shutdown 关闭 Agent，测试实现为空操作。
 func (m *mockAgentForServer) Shutdown(ctx context.Context) error { return nil }
 
@@ -187,4 +195,9 @@ func TestSessionManagerLaunchSession(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("LaunchSession did not complete")
+}
+
+// Board 返回看板快照，测试实现返回 nil（回退树合成）。
+func (m *mockAgentForServer) Board(ctx context.Context, sessionID string) (*board.Snapshot, error) {
+	return nil, nil
 }

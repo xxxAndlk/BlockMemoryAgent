@@ -10,6 +10,7 @@ import (
 	"errors"      // errors.New 构造任务不存在等错误
 	"fmt"         // fmt.Sprintf 生成任务 ID 与 Brief 文本
 	"sort"        // sort.Strings 稳定化约束键输出顺序
+	"strings"     // strings.TrimSpace 规范化计划任务 ID
 	"sync"        // sync.RWMutex 保护 TaskBoard / Manager 的并发访问
 	"sync/atomic" // atomic.Int64 生成唯一任务 ID
 	"time"        // time.Now / time.Time 记录时间戳
@@ -49,14 +50,25 @@ const (
 
 // SubTask 看板上的一个子任务。
 type SubTask struct {
-	ID        string     `json:"id"`                   // 子任务唯一 ID，格式 <topicID>_t<n>
+	ID        string     `json:"id"`                   // 子任务唯一 ID，格式 <topicID>_t<n>（write_plan 可显式指定）
 	Title     string     `json:"title"`                // 子任务标题（由 MetaAgent 推断）
+	Domain    string     `json:"domain,omitempty"`     // 所属领域（write_plan 指定，派发依赖门按它匹配）
 	Assignee  string     `json:"assignee,omitempty"`   // 责任 Agent 实例 ID（domainAgent / assistant）
 	Status    TaskStatus `json:"status"`               // 当前状态
 	Result    string     `json:"result,omitempty"`     // 完成结果或失败/阻塞原因
 	DependsOn []string   `json:"depends_on,omitempty"` // 依赖的其他子任务 ID 列表
+	Acceptance []string  `json:"acceptance,omitempty"` // 验收标准（write_plan 指定，展示用）
 	CreatedAt time.Time  `json:"created_at"`           // 创建时间
 	UpdatedAt time.Time  `json:"updated_at"`           // 最近变更时间
+}
+
+// PlanTask 是 write_plan 工具入参的子任务项（TODO #22）。
+type PlanTask struct {
+	ID         string   `json:"id"`         // 子任务 ID（LLM 指定，供 depends_on 引用；非空且唯一）
+	Title      string   `json:"title"`      // 标题
+	Domain     string   `json:"domain"`     // 领域（派发依赖门按 domain 匹配）
+	DependsOn  []string `json:"depends_on"` // 依赖的子任务 ID 列表
+	Acceptance []string `json:"acceptance"` // 验收标准
 }
 
 // TaskBoard 任务看板：单个 topic 的全局状态容器。
@@ -156,6 +168,149 @@ func (b *TaskBoard) SetConstraint(key, value string) {
 	defer b.mu.Unlock()
 	b.Constraints[key] = value // 写入或覆盖约束
 	b.UpdatedAt = time.Now()   // 刷新更新时间
+}
+
+// SetPlan 全量覆盖看板计划（write_plan 工具用，TODO #22）。
+//
+// 校验（任一项失败返回错误，不落盘）：
+//   - 任务 ID 非空且数组内唯一；
+//   - 每个 depends_on 引用必须存在（新任务数组内或既有看板任务）；
+//   - 新任务之间依赖无环（既有任务视为终态，不参与环判定）。
+//
+// 语义：已存在 ID 的任务保留状态与结果（重规划不改 Done 任务）；新增任务置 pending。
+// 看板进入 IN_PROGRESS；goal 非空时更新看板目标。
+//
+// 并发安全：内部持写锁。
+func (b *TaskBoard) SetPlan(goal string, tasks []PlanTask) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if goal != "" {
+		b.Goal = goal
+	}
+	// 校验新任务 ID 唯一。
+	seen := make(map[string]struct{}, len(tasks))
+	for _, t := range tasks {
+		id := strings.TrimSpace(t.ID)
+		if id == "" {
+			return fmt.Errorf("plan task id must be non-empty")
+		}
+		if _, dup := seen[id]; dup {
+			return fmt.Errorf("plan task id %q duplicated", id)
+		}
+		seen[id] = struct{}{}
+	}
+	// 校验依赖引用存在（新数组 ∪ 既有任务）。
+	exists := func(id string) bool {
+		if _, ok := seen[id]; ok {
+			return true
+		}
+		_, ok := b.Tasks[id]
+		return ok
+	}
+	for _, t := range tasks {
+		for _, dep := range t.DependsOn {
+			if !exists(dep) {
+				return fmt.Errorf("plan task %q depends on unknown task %q", t.ID, dep)
+			}
+		}
+	}
+	// 新任务依赖图环检测（DFS 三色标记，只在新任务子图上跑）。
+	color := make(map[string]int, len(tasks)) // 0=未访问 1=在栈 2=完成
+	var dfs func(id string) error
+	depOf := func(id string) []string {
+		for _, t := range tasks {
+			if t.ID == id {
+				return t.DependsOn
+			}
+		}
+		return nil
+	}
+	dfs = func(id string) error {
+		color[id] = 1
+		for _, dep := range depOf(id) {
+			if _, inNew := seen[dep]; !inNew {
+				continue // 既有任务视为终态，无出边
+			}
+			switch color[dep] {
+			case 1:
+				return fmt.Errorf("plan dependency cycle detected at %q -> %q", id, dep)
+			case 0:
+				if err := dfs(dep); err != nil {
+					return err
+				}
+			}
+		}
+		color[id] = 2
+		return nil
+	}
+	for _, t := range tasks {
+		if color[t.ID] == 0 {
+			if err := dfs(t.ID); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 落盘：已存在保留，新增追加。
+	now := time.Now()
+	for _, t := range tasks {
+		id := strings.TrimSpace(t.ID)
+		if existing, ok := b.Tasks[id]; ok {
+			existing.Domain = t.Domain
+			existing.Acceptance = t.Acceptance
+			existing.UpdatedAt = now
+			continue
+		}
+		b.Tasks[id] = &SubTask{
+			ID:         id,
+			Title:      t.Title,
+			Domain:     t.Domain,
+			Status:     TaskPending,
+			DependsOn:  append([]string{}, t.DependsOn...),
+			Acceptance: append([]string{}, t.Acceptance...),
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		b.Order = append(b.Order, id)
+	}
+	b.Status = BoardStatusInProgress
+	b.UpdatedAt = now
+	return nil
+}
+
+// FindByDomain 返回指定 domain 的子任务 ID（首个匹配）；未匹配返回空串。
+// 供派发依赖门（dispatchOne）按领域定位计划任务。
+//
+// 并发安全：内部持读锁。
+func (b *TaskBoard) FindByDomain(domain string) (string, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, id := range b.Order {
+		if t := b.Tasks[id]; t != nil && t.Domain == domain {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// DependsDone 报告任务的所有依赖是否均已 done；无依赖或任务不存在返回 true。
+// 供派发依赖门校验：依赖未全部完成时拒绝派发（TODO #22 Phase 1）。
+//
+// 并发安全：内部持读锁。
+func (b *TaskBoard) DependsDone(taskID string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	t, ok := b.Tasks[taskID]
+	if !ok {
+		return true
+	}
+	for _, dep := range t.DependsOn {
+		if d, ok := b.Tasks[dep]; !ok || d.Status != TaskDone {
+			return false
+		}
+	}
+	return true
 }
 
 // Assign 把某个子任务分配给某 Agent。

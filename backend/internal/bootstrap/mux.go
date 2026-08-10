@@ -105,6 +105,8 @@ func NewDefaultMux(app *App) *http.ServeMux {
 	mux.HandleFunc("/api/agents/{id}/skills", wrap(apiHandler.AgentSkillsHandler)) // Agent Skill 管理
 	mux.HandleFunc("/api/files", wrap(apiHandler.FilesHandler))                    // 文件列表
 	mux.HandleFunc("/api/files/content", wrap(apiHandler.FileContentHandler))      // 文件内容读取
+	mux.HandleFunc("/api/profile", wrap(apiHandler.ProfileHandler))     // 用户画像查看（TODO #28）
+	mux.HandleFunc("PUT /api/profile", wrap(apiHandler.SaveProfileHandler)) // 用户画像编辑
 
 	// 返回装配完成的路由复用器。
 	return mux

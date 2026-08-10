@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"github.com/blockmemory/agent/backend/internal/board"
+	"github.com/blockmemory/agent/backend/internal/userprofile"
 	"strings"
 	"testing"
 	"time"
@@ -97,6 +99,15 @@ func TestBuildMetaCardRendersNameOnly(t *testing.T) {
 // stubAgent 是一个最小化的 agent.Agent 实现，SummarizeTaskTitle 直接返回原标题，
 // 使 taskBriefCache 在测试中回退到截断逻辑。
 type stubAgent struct{}
+
+// Board 返回看板快照，测试实现返回 nil（回退树合成）。
+func (stubAgent) Board(ctx context.Context, sessionID string) (*board.Snapshot, error) { return nil, nil }
+
+// Profile 返回用户画像，测试实现返回空。
+func (stubAgent) Profile(ctx context.Context) (*userprofile.Profile, error) { return &userprofile.Profile{}, nil }
+
+// SaveProfile 覆盖画像，测试实现为空操作。
+func (stubAgent) SaveProfile(ctx context.Context, content string) error { return nil }
 
 // CreateSession 是 stubAgent 的空实现。
 func (stubAgent) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) {

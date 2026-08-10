@@ -37,16 +37,12 @@ type RoleConfigFile struct {
 // 字段:
 //   - ModelConfig:     模型提供商/密钥/温度等。
 //   - SystemPrompt:    系统提示词。
-//   - MaxBlocks:       单会话最大活跃块数量（旧 API 兼容字段）。
-//   - SummaryInterval: 每 N 步触发一次会话总结，控制上下文膨胀。
 //   - Tools:           工具白名单覆盖；为空时用内置默认（call_sub_agent 等编排工具）。
 //                      基准单 Agent 模式用它去掉 call_sub_agent、放开执行类工具。
 type MetaAgentConfig struct {
-	ModelConfig     types.AgentModelConfig `yaml:"model_config"`     // 模型配置(提供商/密钥/温度等)
-	SystemPrompt    string                 `yaml:"system_prompt"`    // MetaAgent 系统提示词
-	MaxBlocks       int                    `yaml:"max_blocks"`       // 单会话最大块数量
-	SummaryInterval int                    `yaml:"summary_interval"` // 每N步触发一次会话总结
-	Tools           []string               `yaml:"tools"`            // 工具白名单覆盖（空=内置默认编排工具集）
+	ModelConfig  types.AgentModelConfig `yaml:"model_config"`  // 模型配置(提供商/密钥/温度等)
+	SystemPrompt string                 `yaml:"system_prompt"` // MetaAgent 系统提示词
+	Tools        []string               `yaml:"tools"`         // 工具白名单覆盖（空=内置默认编排工具集）
 }
 
 // DomainAgentConfig DomainAgent 共用配置。
@@ -77,7 +73,7 @@ type DynamicRoleTemplate struct {
 // 职责:
 //   - 读取 YAML 文件并反序列化为 RoleConfigFile。
 //   - 解析其中的 ${VAR} / ${VAR:"default"} 环境变量引用。
-//   - 为 MaxBlocks/SummaryInterval 等字段填充默认值。
+//   - 为 Embed 等字段填充默认值。
 //
 // 参数:
 //   - path: roles.yaml 文件路径。
@@ -105,14 +101,6 @@ func LoadRoleConfig(path string) (*RoleConfigFile, error) {
 	// 解析配置中的环境变量引用(如 ${OPENAI_API_KEY})。
 	cfg.resolveEnvVars()
 
-	// 设置默认值: MaxBlocks 默认 10，避免零值导致旧 API 兼容性异常。
-	if cfg.MetaAgent.MaxBlocks <= 0 {
-		cfg.MetaAgent.MaxBlocks = 10
-	}
-	// SummaryInterval 默认 5 步，使会话总结机制默认生效。
-	if cfg.MetaAgent.SummaryInterval <= 0 {
-		cfg.MetaAgent.SummaryInterval = 5
-	}
 	// Embed 默认值: provider 为空时回退 pseudo，避免嵌入模块因空 provider 崩溃。
 	if cfg.Embed.Provider == "" {
 		cfg.Embed.Provider = "pseudo"

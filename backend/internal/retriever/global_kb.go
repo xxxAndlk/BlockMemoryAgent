@@ -45,17 +45,13 @@ type GlobalKnowledgeRetriever struct {
 	vectorDB VectorDB  // 向量数据库，用于语义召回
 	metaDB   MetaStore // 元数据存储，用于按类型查询与访问计数
 	embedder Embedder  // 文本向量化器，将查询转为向量
+	hybrid   HybridSearchBackend // 混合检索后端（TODO #27，SearchHybrid 用）
 }
 
 // NewGlobalKnowledgeRetriever 创建全局知识检索器。
 // 职责：将三个抽象依赖注入并组装为可用的检索器实例。
-// 参数：
-//   - vectorDB: 向量数据库实现，提供 Top-K 语义召回。
-//   - metaDB: 元数据存储实现，提供按类型查询与访问计数自增。
-//   - embedder: 文本嵌入实现，将查询字符串转为向量。
-//
-// 返回：组装完成的 *GlobalKnowledgeRetriever 指针。
-// 副作用：无；依赖的具体实现若未就绪需由调用方保证可用性。
+// 注意：vectorDB/metaDB 为 legacy Retrieve/RetrieveByType 路径的依赖（dormant）；
+// 混合检索（SearchHybrid，TODO #27 热路径）经 SetHybridBackend 注入，可为 nil。
 func NewGlobalKnowledgeRetriever(vectorDB VectorDB, metaDB MetaStore, embedder Embedder) *GlobalKnowledgeRetriever {
 	// 将传入依赖绑定到结构体字段，返回组装好的检索器实例。
 	return &GlobalKnowledgeRetriever{
@@ -77,6 +73,10 @@ func NewGlobalKnowledgeRetriever(vectorDB VectorDB, metaDB MetaStore, embedder E
 //
 //	计数失败被静默忽略，不影响主流程返回。
 func (r *GlobalKnowledgeRetriever) Retrieve(ctx context.Context, query string, topK int) ([]*types.KnowledgeRecord, error) {
+	// legacy 路径（dormant）：混合检索经 SearchHybrid 走。依赖未注入时返回错误。
+	if r.vectorDB == nil || r.metaDB == nil || r.embedder == nil {
+		return nil, fmt.Errorf("retriever dependencies not wired")
+	}
 	// topK 非正数时回退为默认召回数量 5，避免无效参数导致空召回。
 	if topK <= 0 {
 		topK = 5
@@ -120,6 +120,9 @@ func (r *GlobalKnowledgeRetriever) Retrieve(ctx context.Context, query string, t
 // 返回：该类型下的知识记录切片，或底层存储错误。
 // 副作用：无（不更新访问计数）。
 func (r *GlobalKnowledgeRetriever) RetrieveByType(ctx context.Context, knowledgeType string, limit int) ([]*types.KnowledgeRecord, error) {
+	if r.metaDB == nil {
+		return nil, fmt.Errorf("retriever dependencies not wired")
+	}
 	// 直接委托给元数据存储按类型查询并返回结果。
 	return r.metaDB.GetKnowledgeByType(ctx, knowledgeType, limit)
 }

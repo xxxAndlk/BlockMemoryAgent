@@ -71,6 +71,15 @@ func TestCallSubAgents_ItemValidation(t *testing.T) {
 	if res2.Success || !strings.Contains(res2.Error, "tasks is required") {
 		t.Fatalf("empty tasks should be rejected, got %+v", res2)
 	}
+	// 插入一次成功派发，重置同一工具的连续失败计数（连续失败 ×3 会触发 LoopExit 守卫终止）。
+	resOk, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agents", map[string]any{
+		"tasks": []any{
+			map[string]any{"role_id": "code_assistant", "task": "写 config.js"},
+		},
+	})
+	if err != nil || !resOk.Success {
+		t.Fatalf("valid batch should succeed, err=%v res=%+v", err, resOk)
+	}
 	// 超批量上限拒绝。
 	big := make([]any, 7)
 	for i := range big {

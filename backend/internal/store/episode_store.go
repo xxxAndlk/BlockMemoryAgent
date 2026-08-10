@@ -14,6 +14,8 @@ import (
 
 // EpisodeStore 是 Episode（私有记忆）相关的 PostgreSQL 存储子层。
 // 职责: agent_private_memory 表的 CRUD，包括压缩层级统计与重复冲突判断。
+// 注意: dormant——无运行时代码路径调用（ReAct 重构后私有记忆流已废弃），
+// 仅经 PostgresStore 薄包装暴露给 server/api.go 的 snapshot 兼容接口。
 type EpisodeStore struct {
 	db *sql.DB // 共享连接池
 }

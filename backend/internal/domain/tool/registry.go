@@ -193,6 +193,13 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	// 注册 WriteSpec 工具；store 同样在 SetSharedMemory 注入后生效。
 	// 与 WriteSharedMemory 共用同一 SharedMemoryStore 后端，固定 slot "spec"。
 	r.Register(&writeSpecTool{})
+	// 注册 ask_user 工具（TODO #24 人在回路）；hook 在 SetAskUserHook 注入后生效。
+	// 注册始终发生，使 Schema 中可见；调用时 hook 未注入返回错误。
+	r.Register(&askUserTool{})
+	// 注册 remember_preference 工具（TODO #28 用户画像）；hook 在 SetUserProfileHook 注入后生效。
+	r.Register(&rememberPreferenceTool{})
+	// 注册 search_knowledge 工具（TODO #27 外部知识库）；hook 在 SetKnowledgeSearchHook 注入后生效。
+	r.Register(&searchKnowledgeTool{})
 	// 返回构造完成的注册表。
 	return r
 }
@@ -367,17 +374,14 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		// 连续相同调用达上限：LLM 陷入死循环（内容已直返过仍原样再调），
 		// 触发 LoopExit 终止 ReAct 循环，让上层子 Agent 失败回灌摘要，避免烧 token 与时间。
 		if n >= maxConsecutiveSameRead {
-			result := &Result{Tool: "ReadFile", Path: normalizedPath,
-				Error: fmt.Sprintf("已连续 %d 次以完全相同的参数读取该文件区间，内容均已返回，疑似死循环。需要其他段落应调整 offset 翻页；本次任务终止。", n)}
+			msg := fmt.Sprintf("已连续 %d 次以完全相同的参数读取该文件区间，内容均已返回，疑似死循环。需要其他段落应调整 offset 翻页；本次任务终止。", n)
+			result := &Result{Tool: "ReadFile", Path: normalizedPath, Error: msg}
 			r.fillResult(ctx, result, args)
 			log.Printf("[tool] ReadFile LoopExit: scope=%s path=%s consecutive=%d reached max, exiting ReAct loop",
 				scope, normalizedPath, n)
-			if tc, ok := tools.FromContext(ctx); ok {
-				tc.SetAction(tools.ActionLoopExit, true)
-			}
-			// 发送结果事件后返回。
+			// 发送结果事件后返回包装哨兵错误：主循环 errors.Is 命中即终止循环。
 			r.emitResult(ctx, result)
-			return result, nil
+			return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
 		}
 		// 第 2 次连续相同调用：直返内容，并在结果末尾附一句提醒引导翻页。
 		if n == 2 {
@@ -400,8 +404,10 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 			scope := scopeKeyFromCtx(ctx)
 			log.Printf("[tool] explore budget exhausted: scope=%s tool=%s budget=%d reason=%q",
 				scope, name, r.exploreLimit(scope), blocked)
+			// 探索预算耗尽 = 空转死循环信号（实证：domain 只读不写空转 60min）。
+			// 返回包装哨兵让主循环终止，而非吞成普通工具错误继续烧轮次。
 			r.emitResult(ctx, result)
-			return result, nil
+			return result, fmt.Errorf("%w: %s", ErrLoopExit, blocked)
 		}
 	}
 
@@ -466,11 +472,14 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	} else {
 		// 失败则累加连续失败计数。
 		n := r.failures.fail(name)
-		// 达到阈值时通知 blades 退出循环，避免无效重试。
+		// 连续失败达阈值 = 无效重试死循环信号，返回包装哨兵终止 ReAct 循环
+		//（原为 blades ActionLoopExit 上下文信号，无注入方，静默丢弃成死代码）。
 		if n >= maxConsecutiveFailures {
-			if tc, ok := tools.FromContext(ctx); ok {
-				tc.SetAction(tools.ActionLoopExit, true)
-			}
+			msg := fmt.Sprintf("工具 %s 已连续失败 %d 次，疑似无效重试死循环，本次任务终止。", name, n)
+			log.Printf("[tool] consecutive failures LoopExit: scope=%s tool=%s failures=%d", scopeKeyFromCtx(ctx), name, n)
+			result.Error = msg
+			r.emitResult(ctx, result)
+			return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
 		}
 	}
 

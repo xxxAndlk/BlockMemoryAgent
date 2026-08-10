@@ -92,6 +92,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		RolePath:   rolePath,
 		EnvPath:    envPath,
 		SoulPath:   soulPath,
+		ProfilePath: "config/user_profile.md",
 		SkillPath:  skillPath,
 	})
 	if err != nil {

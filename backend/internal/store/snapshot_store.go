@@ -12,6 +12,8 @@ import (
 
 // SnapshotStore 是 Agent 快照相关的 PostgreSQL 存储子层。
 // 职责: agent_snapshots 表的 UPSERT 与读取，为 Redis 热存提供冷存回源。
+// 注意: dormant——无运行时代码路径调用（ReAct 重构后快照流已废弃），
+// 仅经 PostgresStore 薄包装暴露给 server/api.go 的 snapshot 兼容接口。
 type SnapshotStore struct {
 	db *sql.DB // 共享连接池
 }

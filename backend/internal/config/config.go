@@ -85,7 +85,7 @@ type FeatureTogglesConfig struct {
 	// 计数在用户发送新消息时重置。默认 30；<=0 时回退默认，负数表示不限制。
 	MaxTotalDispatches int `yaml:"max_total_dispatches"`
 	// SpecEnforcementEnabled 派发方调用 call_sub_agent 前是否强制先写 WriteSpec。
-	// 默认 false（基础任务先跑通）；Pipeline 重构后由 PlanStage 替代，配置项整体移除。
+	// 默认 true（塔防实证 WriteSpec 有用，config.yaml 显式配置覆盖）；Pipeline 重构后由 PlanStage 替代。
 	SpecEnforcementEnabled *bool `yaml:"spec_enforcement_enabled"`
 }
 
@@ -103,6 +103,21 @@ type AgentConfig struct {
 	RunCommandTimeoutSec       int `yaml:"run_command_timeout_sec"`        // RunCommand 最大允许超时（秒）
 	ToolExecMaxBytes           int `yaml:"tool_exec_max_bytes"`            // Execute 入参 JSON 摘要截断字节数
 	SearchBlockMemoryMaxTokens int `yaml:"search_block_memory_max_tokens"` // 块记忆检索摘要 token 上限
+	// DispatchRetryCount 叶子助手 kind=error 失败的自动重派次数（TODO #23，最小一档）。
+	// 默认 1：失败自动重跑一次（同任务同前缀）；domain/timeout/killed/loop_guard 不自动重试。
+	// 与 LLM 调用层重试（retry_count）正交：那层重试模型调用本身，这层重跑整个子 Agent。
+	DispatchRetryCount int `yaml:"dispatch_retry_count"`
+	// SessionMaxWallClockMin 会话全局墙钟上限（分钟）：从会话创建起超时未终止则级联取消
+	// 全部节点 + 会话置 error"超全局时限"（TODO #25-4 硬止损）。默认 0=关闭（保持现状）。
+	SessionMaxWallClockMin int `yaml:"session_max_wall_clock_min"`
+	// DomainHeartbeatTimeoutMin DomainAgent 心跳超时（分钟）（TODO #25-3 防误杀版）。
+	// 默认 0 = 2× sub_agent_heartbeat_timeout_min：domain 等子/等回信靠后代活动冒泡保活，
+	// 后代全静默后超该阈值判假死。
+	DomainHeartbeatTimeoutMin int `yaml:"domain_heartbeat_timeout_min"`
+	// AskUserTimeoutSec ask_user 工具提问默认超时（秒）（TODO #24 人在回路）。
+	// 默认 0=不限；>0 时超时未答复工具返回"用户未答复，自行决策"。单次调用可经
+	// ask_user(timeout_sec=N) 覆盖。
+	AskUserTimeoutSec int `yaml:"ask_user_timeout_sec"`
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -397,11 +412,10 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	if c.Agent.MaxTotalDispatches == 0 {
 		c.Agent.MaxTotalDispatches = 30
 	}
-	// Spec 强制默认关闭：基础任务先跑通。Pipeline 重构后由 PlanStage 替代。
-	// *bool 区分"未配置"（默认 false）与"显式 true"（开启强制）。
+	// Spec 强制默认开启：塔防实证 WriteSpec 有用；*bool 区分"未配置"（默认 true）与"显式 false"。
 	if c.Agent.SpecEnforcementEnabled == nil {
-		f := false
-		c.Agent.SpecEnforcementEnabled = &f
+		t := true
+		c.Agent.SpecEnforcementEnabled = &t
 	}
 }
 
@@ -423,6 +437,14 @@ func (c *Config) applyAgentStandaloneDefaults() {
 	}
 	if c.Agent.SearchBlockMemoryMaxTokens == 0 {
 		c.Agent.SearchBlockMemoryMaxTokens = 800
+	}
+	// 叶子助手 kind=error 失败自动重派一次（TODO #23）；<=0 关闭。
+	if c.Agent.DispatchRetryCount == 0 {
+		c.Agent.DispatchRetryCount = 1
+	}
+	// domain 心跳默认 0 = 2× 叶子（bootstrap 侧兜底），此处只保证非负。
+	if c.Agent.DomainHeartbeatTimeoutMin < 0 {
+		c.Agent.DomainHeartbeatTimeoutMin = 0
 	}
 }
 

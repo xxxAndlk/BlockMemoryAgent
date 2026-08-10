@@ -73,6 +73,10 @@ type reactInternalSession struct {
 	// 正在等用户确认，sendMessage/answerClarify 把答复写入通道；Agent goroutine 仍存活，
 	// 收到答复后工具调用返回裁决继续 ReAct 循环。会话取消时由 ctx 取消解除阻塞。
 	approval chan bool
+	// askUser 是 ask_user 工具（TODO #24 人在回路）的答复通道：非 nil 表示有 Agent 提问
+	// 正在等用户答复；sendMessage/answerClarify 把**原始答复文本**写入通道（不 parseApproval），
+	// ask_user 工具结果带回 ReAct 循环。与 approval 互斥（同时只能有一个待答复项）。
+	askUser chan string
 	// pendingClarify 是当前待用户答复的确认/澄清请求（含审批问题），随会话快照透出给前端。
 	pendingClarify *ClarifyRequest
 }

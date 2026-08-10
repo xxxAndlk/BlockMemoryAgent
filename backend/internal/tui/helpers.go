@@ -79,15 +79,18 @@ func currentRoundStart(s *server.Session) time.Time {
 	return s.StartedAt
 }
 
-// boardSnapshot 从权威 Agent 树（Dispatcher 维护，已持久化）构建指定会话的看板快照：
+// boardSnapshot 返回指定会话的看板快照（TODO #22 Phase 2）：
+// 优先读真实执行计划（agent.Board，write_plan 写入的 board.TaskBoard 权威快照）；
+// 无计划（未 write_plan / 旧会话）回退旧路径——从权威 Agent 树合成：
 // 每个树节点映射为一条任务，状态直接取节点的实时状态；树为空或查询失败时返回空快照。
 // 只统计当前轮任务：上一轮已终结的节点被过滤，不再稀释进度条与任务列表。
-// 注：历史上这里用 agent.Query(QueryKindBoard) 拉取看板，但后端 Query 的 switch 没有
-// board 分支，查询永远落空（default 返回空 Result），因此死查询已删除，只保留 Tree 路径
-// （与原 renderPlanPanel 的 fallback 逻辑一致）。
 func (m *Model) boardSnapshot(s *server.Session) board.Snapshot {
 	if m.agent == nil || s == nil || s.ID == "" {
 		return board.Snapshot{}
+	}
+	// 真实计划优先：board.Snapshot 是 write_plan 的权威真相源（含依赖/验收/领域）。
+	if snap, err := m.agent.Board(context.Background(), s.ID); err == nil && snap != nil && len(snap.Tasks) > 0 {
+		return *snap
 	}
 	nodes, err := m.agent.Tree(context.Background(), s.ID)
 	if err != nil || len(nodes) == 0 {

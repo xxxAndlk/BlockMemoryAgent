@@ -202,7 +202,7 @@ func (f *fakePendingChecker) PendingChildren(parentID string) int {
 func (f *fakePendingChecker) WaitForAnyChild(parentID string, timeout time.Duration) bool {
 	// 投递一条 mailbox 消息模拟子 Agent 完成。
 	if !f.delivered && f.mb != nil {
-		_ = f.mb.Send(&mailbox.Message{From: "session-1/code_assistant-1", To: parentID, Type: mailbox.MsgInfo, Body: "子 Agent 完成: ok"})
+		_, _ = f.mb.Send(&mailbox.Message{From: "session-1/code_assistant-1", To: parentID, Type: mailbox.MsgInfo, Body: "子 Agent 完成: ok"})
 		f.delivered = true
 	}
 	return true
@@ -806,7 +806,7 @@ func TestReActAgent_MailboxAfterToolResult(t *testing.T) {
 	agent := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).WithMailbox(mb)
 
 	// 子 Agent 完成通知在 Agent 执行工具前已到达 mailbox。
-	_ = mb.Send(&mailbox.Message{From: "sub-1", To: "test", Type: mailbox.MsgInfo, Body: "子 Agent 完成"})
+	_, _ = mb.Send(&mailbox.Message{From: "sub-1", To: "test", Type: mailbox.MsgInfo, Body: "子 Agent 完成"})
 
 	res, err := agent.Run(context.Background(), "write a.txt")
 	if err != nil {
@@ -893,5 +893,22 @@ func TestBuildEnvBlock_InjectsProjectDoc(t *testing.T) {
 	}
 	if strings.Contains(env, "bma:managed") {
 		t.Fatalf("不应把标记本身注入提示词，got: %s", env)
+	}
+}
+
+// TestMailboxMessageToReact_EscalatePrefix 验证 TODO #23 升级消息渲染：
+// MsgEscalate 类型消息在 [mailbox from X] 后带 [升级] 前缀，父 LLM 可识别干预类消息。
+func TestMailboxMessageToReact_EscalatePrefix(t *testing.T) {
+	plain := mailboxMessageToReact(&mailbox.Message{
+		From: "sub-1", To: "meta", Type: mailbox.MsgInfo, Subject: "完成",
+	})
+	if strings.Contains(plain.Content, "[升级]") {
+		t.Fatalf("info message should not carry escalate prefix, got: %s", plain.Content)
+	}
+	esc := mailboxMessageToReact(&mailbox.Message{
+		From: "sub-1", To: "meta", Type: mailbox.MsgEscalate, Subject: "验证未通过",
+	})
+	if !strings.Contains(esc.Content, "[mailbox from sub-1] [升级] 验证未通过") {
+		t.Fatalf("escalate message should carry [升级] prefix, got: %s", esc.Content)
 	}
 }

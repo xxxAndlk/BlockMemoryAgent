@@ -19,6 +19,9 @@ import (
 	"sync"        // 提供 RWMutex 保护并发访问
 	"sync/atomic" // 提供原子计数器生成消息 ID
 	"time"        // 用于时间戳与 ID 格式化
+
+	"errors" // errors 定义死信哨兵 ErrRecipientClosed
+	"fmt"    // fmt 包装死信错误
 )
 
 // MessageType 邮件类型，区分 Agent 间事件语义。
@@ -26,14 +29,17 @@ type MessageType string
 
 const (
 	// MsgMilestone 里程碑达成事件，表示某 Agent 完成关键节点。
+	// 预留类型：当前无发送方/消费方（#23 escalate 落地后仍无场景则删除）。
 	MsgMilestone MessageType = "milestone" // 完成里程碑
 	// MsgRequest 协助请求，要求目标 Agent 提供支持。
 	MsgRequest MessageType = "request" // 请求协助
 	// MsgInfo 普通通知，仅作信息同步，无需响应。
 	MsgInfo MessageType = "info" // 普通通知
 	// MsgEscalate 升级请求，需要上层 Agent 介入裁决。
+	// 消费方：#21 verifyloop 验证未通过时经此通知父 Agent（verifiers.go）。
 	MsgEscalate MessageType = "escalate" // 升级请求
 	// MsgDependency 依赖完成事件，通知等待方前置任务已就绪。
+	// 预留类型：当前无发送方/消费方（#22 board 依赖门不依赖 mailbox 事件，靠轮询树状态）。
 	MsgDependency MessageType = "dependency" // 依赖完成事件
 	// MsgReply 是对先前 MsgRequest 的回复：ReplyTo 字段指向原请求消息 ID，
 	// 用于多 Agent 验证闭环中"被询问方回复"的请求-响应配对。
@@ -86,20 +92,26 @@ type Message struct {
 	FilesModified []string `json:"files_modified,omitempty"`
 }
 
+// ErrRecipientClosed 是投递给已销毁（Purge 过）收件人的死信错误。
+// 发送方（send_message 工具）据此返回"消息未送达"，消除发给已死 Agent 的消息静默消失。
+var ErrRecipientClosed = errors.New("mailbox: recipient closed")
+
 // Mailbox 多 Agent 邮箱管理器，维护每个 Agent 的收件箱与广播桶。
 //
 // 字段说明：
 //   - mu：读写锁，保护 inbox 与 bcast 的并发访问。
 //   - inbox：按 agentID 索引的消息队列，存放定向投递的消息。
 //   - bcast：广播桶，存放 To == "*" 的消息，等待主 Agent 决议。
+//   - closed：已销毁（Purge 过）的收件人集合，向其 Send 返回 ErrRecipientClosed（死信可见）。
 //   - seq：原子计数器，用于生成全局唯一的消息 ID。
 //
 // 并发安全：所有公开方法均自行加锁，可被多 goroutine 同时调用。
 type Mailbox struct {
-	mu    sync.RWMutex          // 读写锁：保护 inbox 与 bcast 的并发访问
-	inbox map[string][]*Message // agentID -> messages
-	bcast []*Message            // To == "*" 等待主 Agent 决议
-	seq   atomic.Int64          // 全局递增序号，用于生成消息 ID
+	mu     sync.RWMutex          // 读写锁：保护 inbox 与 bcast 的并发访问
+	inbox  map[string][]*Message // agentID -> messages
+	bcast  []*Message            // To == "*" 等待主 Agent 决议
+	closed map[string]struct{}   // 已销毁收件人（Purge 过），Send 死信
+	seq    atomic.Int64          // 全局递增序号，用于生成消息 ID
 }
 
 // New 创建并返回一个新的邮箱管理器实例。
@@ -111,26 +123,21 @@ type Mailbox struct {
 // 并发安全：构造本身无并发风险。
 func New() *Mailbox {
 	return &Mailbox{
-		inbox: make(map[string][]*Message),
+		inbox:  make(map[string][]*Message),
+		closed: make(map[string]struct{}),
 	}
 }
 
 // Send 投递一条邮件到目标 Agent 的收件箱或广播桶。
 //
 // 职责：填充 ID/CreatedAt/Status，并按 To 字段路由消息。
-// 参数：
-//   - msg：待投递消息指针；若为 nil 直接返回空串。
-//
-// 返回：消息 ID（若 msg 为 nil 则返回空串）。
-// 副作用：
-//   - 修改 msg 的 ID/CreatedAt/Status 字段。
-//   - 若 To 为空或 "*"，消息进入 bcast；否则进入 inbox[To]。
-//
-// 并发安全：通过 m.mu 写锁保护 map 写入。
-func (m *Mailbox) Send(msg *Message) string {
+// 死信可见（TODO #23）：定向收件人已销毁（Purge 过）时返回 ErrRecipientClosed，
+// 发送方据此告知"消息未送达"，消除发给已死 Agent 的消息静默消失；广播不校验。
+// 返回：消息 ID 与投递错误（nil 表示已入箱；msg 为 nil 返回错误）。
+func (m *Mailbox) Send(msg *Message) (string, error) {
 	// 防御 nil 入参，避免后续解引用 panic。
 	if msg == nil {
-		return ""
+		return "", errors.New("mailbox: nil message")
 	}
 	// 优先复用调用方传入的 ID。
 	id := msg.ID
@@ -153,10 +160,14 @@ func (m *Mailbox) Send(msg *Message) string {
 		// 无明确收件人或广播：进入广播桶，交主 Agent 决议。
 		m.bcast = append(m.bcast, msg)
 	} else {
+		// 定向投递：目标已销毁则返回死信错误，不入箱。
+		if _, ok := m.closed[msg.To]; ok {
+			return "", fmt.Errorf("%w: %s", ErrRecipientClosed, msg.To)
+		}
 		// 定向投递：追加到目标 Agent 的收件箱末尾。
 		m.inbox[msg.To] = append(m.inbox[msg.To], msg)
 	}
-	return id
+	return id, nil
 }
 
 // Peek 拉取目标 Agent 的所有未读消息，但不修改其状态。
@@ -327,6 +338,8 @@ func (m *Mailbox) Purge(agentID string) {
 	defer m.mu.Unlock()
 	// 直接删除 key，消息切片随之被 GC 回收。
 	delete(m.inbox, agentID)
+	// 标记收件人已销毁：此后 Send 至该 ID 返回死信错误（TODO #23 死信可见）。
+	m.closed[agentID] = struct{}{}
 }
 
 // sortByPriority 按优先级降序、创建时间升序稳定排序消息。

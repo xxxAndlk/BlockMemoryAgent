@@ -12,8 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
+	"github.com/blockmemory/agent/backend/internal/middleware"
 	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
@@ -74,6 +76,63 @@ type ReActAgent struct {
 type PersonaInjector interface {
 	// Inject 返回拼入人格前缀后的系统提示词；人格为空时原样返回 systemPrompt。
 	Inject(systemPrompt string) string
+}
+
+// CombinePersonaInjectors 顺序组合多个注入器（TODO #28 用户画像）：
+// MetaAgent 需要"人格 + 用户画像"两段前缀，子 Agent 只需人格（dispatcher 注入 soul 单一注入器，
+// 画像不下发子 Agent）。任一注入器为 nil 时跳过。
+func CombinePersonaInjectors(injs ...PersonaInjector) PersonaInjector {
+	var live []PersonaInjector
+	for _, i := range injs {
+		if i != nil {
+			live = append(live, i)
+		}
+	}
+	if len(live) == 0 {
+		return nil
+	}
+	return &compositeInjector{injs: live}
+}
+
+type compositeInjector struct {
+	injs []PersonaInjector
+}
+
+func (c *compositeInjector) Inject(systemPrompt string) string {
+	for _, i := range c.injs {
+		systemPrompt = i.Inject(systemPrompt)
+	}
+	return systemPrompt
+}
+
+// NewUserProfileInjector 构造用户画像注入器（TODO #28 第四层记忆）：
+// 每次 Inject 读取画像全文，以【用户画像】前缀拼入系统提示词（带 rune 上限截断防膨胀）。
+// 仅注入 MetaAgent（runSession/resumeSession）；子 Agent 不注入（画像不下发）。
+// current 为 nil 或返回空串时原样返回（零副作用）。
+func NewUserProfileInjector(current func() string, maxRunes int) PersonaInjector {
+	if current == nil {
+		return nil
+	}
+	if maxRunes <= 0 {
+		maxRunes = 2000
+	}
+	return &userProfileInjector{current: current, maxRunes: maxRunes}
+}
+
+type userProfileInjector struct {
+	current  func() string
+	maxRunes int
+}
+
+func (p *userProfileInjector) Inject(systemPrompt string) string {
+	content := strings.TrimSpace(p.current())
+	if content == "" {
+		return systemPrompt
+	}
+	if len([]rune(content)) > p.maxRunes {
+		content = string([]rune(content)[:p.maxRunes]) + "\n...（画像截断）"
+	}
+	return "【用户画像】\n" + content + "\n\n" + systemPrompt
 }
 
 // LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。
@@ -451,6 +510,12 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// 分发执行单个工具调用；出错时构造包含错误信息的 ToolResult。
 			result, err := a.tools.Dispatch(ctx, tc)
 			if err != nil {
+				// 循环守卫命中（连读死循环/探索预算耗尽/连续失败）：终止循环并带原因返回，
+				// 不吞成普通工具结果继续烧轮次。子 Agent 经 runSubAgent 走 Failed 语义
+				//（失败打捞 + 父 mailbox 通知）；MetaAgent 直达时上层以错误结束会话。
+				if errors.Is(err, tool.ErrLoopExit) {
+					return ReactResult{History: history}, err
+				}
 				result = ToolResult{Tool: tc.Name, Error: err.Error()}
 			}
 
@@ -501,57 +566,21 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	return ReactResult{History: history, LimitReached: true}, nil
 }
 
-// generate 包装一次 LLM 调用：带单次超时与指数退避重试。
-// 重试次数为 retryCount+1 次尝试；会话被取消（ctx.Err() 非空）时不重试，直接返回。
+// generate 包装一次 LLM 调用：带单次超时与指数退避重试（TODO #19 LLM 链）。
+// 重试/退避/超时/空响应判定迁移到 middleware 包（RetryLLM + CallLLM + TerminalCall），
+// 行为不变：重试 retryCount+1 次尝试；会话取消（ctx.Err() 非空）与单次调用超时
+// （DeadlineExceeded，慢推理模型重试只会重复超时——实证 180s×4=12min）不重试；
+// 空响应不重试。链式形态即未来新增横切中间件的挂载点。
 func (a *ReActAgent) generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
-	attempts := a.retryCount + 1
-	if attempts < 1 {
-		attempts = 1
+	c := &middleware.LLMCtx{Request: req, Call: a.generateOnce}
+	chain := middleware.New[middleware.LLMCtx]().
+		Use(middleware.RetryLLM(a.retryCount, a.retryBackoff, nil)).
+		Use(middleware.CallLLM(a.llmTimeout)).
+		Then(middleware.TerminalCall)
+	if err := chain(ctx, c); err != nil {
+		return nil, err
 	}
-	backoff := a.retryBackoff
-	if backoff <= 0 {
-		backoff = 100 * time.Millisecond
-	}
-	var lastErr error
-	for i := 0; i < attempts; i++ {
-		// 首次之后的尝试先按指数退避等待。
-		if i > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff):
-			}
-			backoff *= 2
-		}
-		// 单次调用超时从会话 ctx 派生，不影响会话整体的取消语义。
-		callCtx := ctx
-		cancel := context.CancelFunc(func() {})
-		if a.llmTimeout > 0 {
-			callCtx, cancel = context.WithTimeout(ctx, a.llmTimeout)
-		}
-		resp, err := a.generateOnce(callCtx, req)
-		cancel()
-		if err != nil {
-			lastErr = err
-			// 会话本身被取消/超时，属用户或上层主动行为，不再重试。
-			if ctx.Err() != nil {
-				return nil, err
-			}
-			// 单次调用超时（callCtx deadline）：慢推理模型（如 glm-5.2 thinking）重试只会
-			// 重复同样的超时，白等 N×timeout（实证：180s ×4 重试 = 12min "重复思考不前进"）。
-			// 直接返回，让上层以可见错误结束或暂停，而非重试风暴卡死。
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, err
-			}
-			continue
-		}
-		// 响应为空属模型异常，不重试（重试大概率同样为空），直接报错。
-		if resp == nil || resp.Message == nil {
-			return nil, errors.New("empty model response")
-		}
-		return resp, nil
-	}
-	return nil, lastErr
+	return c.Resp, nil
 }
 
 // streamingModelProvider 是 blades.ModelProvider 的可选流式接口子集。
@@ -1004,6 +1033,12 @@ func buildEnvBlock(workDir string) string {
 func mailboxMessageToReact(m *mailbox.Message) ReactMessage {
 	// 主题作为消息正文的基础部分。
 	body := m.Subject
+
+	// 升级消息（TODO #23）加 [升级] 前缀，父 LLM 一眼识别"需要干预"类消息，
+	// 按 meta prompt 的升级处置规程（重派/接手/回报用户）决策。
+	if m.Type == mailbox.MsgEscalate {
+		body = "[升级] " + body
+	}
 
 	// 如果邮件有正文，则追加到主题之后。
 	if m.Body != "" {

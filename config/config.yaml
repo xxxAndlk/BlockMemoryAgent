@@ -50,6 +50,10 @@ agent:
   tool_call_max_rounds: -1       # ReAct 最大 LLM 轮数（达到上限暂停等待用户续跑，不判失败），负数表示不限制
   retry_count: 1                 # Assistant 任务指数退避重试次数。provider 层已有 3 次重试（retry_provider），此处再重试会乘法放大尝试次数（最多 provider3 × agent(1+n)），瞬时故障已被下层覆盖，1 次足够
   retry_backoff_ms: 100          # 重试初始退避时长（毫秒）
+  dispatch_retry_count: 1        # 叶子助手 kind=error 失败的自动重派次数（TODO #23 最小一档：同任务重跑一次）；domain/timeout/killed/loop_guard 不自动重试，交 MetaAgent 决策。与 retry_count 正交（那层重试模型调用本身）
+  session_max_wall_clock_min: 0  # 会话全局墙钟上限（分钟，TODO #25 硬止损）：从创建起超时未终止则级联取消全部子节点 + 会话置 error"超全局时限"；0=关闭（默认）
+  domain_heartbeat_timeout_min: 0  # DomainAgent 心跳超时（分钟，TODO #25 防误杀版）：0=默认 2× sub_agent_heartbeat_timeout_min；等子/等回信靠后代活动冒泡保活
+  ask_user_timeout_sec: 0        # ask_user 提问默认超时（秒，TODO #24 人在回路）：0=不限；>0 超时未答复工具返回"用户未答复，自行决策"。单次调用 timeout_sec 参数覆盖
   react_llm_timeout_sec: 600     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断,改 600s 给一次调用留够跑完。配合 generate() 不在 deadline 上重试,卡死时 600s 即报错而非 4×180=12min。
   sub_agent_timeout_min: 60      # 子 Agent 独立执行超时（分钟），负数表示不限制。预算抬至 400K 后单 domain 需跑完多文件生成，30min 易在慢推理（thinking）下超时。
   tool_output_history_max_runes: 6000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 已改行区间分页（默认 120 行/页，约 4000 字符），6000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取
@@ -77,8 +81,8 @@ agent:
   # 业务级测试（computer-use 点击页面 / CLI 跑命令断言）移至 doc/扩展设计_Agent工作流平台.md §12 作后期扩展。
   block_memory_write_enabled: true   # 子 Agent 完成后沉淀结果摘要到块记忆知识库
 
-  # -- 强制门（默认全关，基础任务先跑通；Pipeline 重构后整体移除）--
-  spec_enforcement_enabled: false    # call_sub_agent 前是否强制 WriteSpec
+  # -- 强制门（spec 强制默认开启：塔防实证 WriteSpec 有用；Pipeline 重构后由 PlanStage 替代）--
+  spec_enforcement_enabled: true     # call_sub_agent 前是否强制 WriteSpec
   max_total_dispatches: 30           # 单 session 派发总数上限
 
   # -- 工具沙箱（安全）--

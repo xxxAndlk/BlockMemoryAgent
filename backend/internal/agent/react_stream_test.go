@@ -119,7 +119,7 @@ func TestReActAgent_SubAgentDoneEvent(t *testing.T) {
 		WithMailbox(mb)
 
 	// 预置一封发给 "meta" 的子 Agent 完成通知。
-	mb.Send(&mailbox.Message{
+	_, _ = mb.Send(&mailbox.Message{
 		From:    "meta/code_assistant-1",
 		To:      "meta",
 		Type:    mailbox.MsgInfo,

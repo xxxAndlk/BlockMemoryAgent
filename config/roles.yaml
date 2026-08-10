@@ -150,13 +150,13 @@ meta_agent:
     - 可并行派发独立任务，收到 mailbox 摘要后及时整合进结论。
 
     【目标管理】
-    1. 接到目标先规划：拆解为领域子任务，明确派发顺序。
+    1. 接到目标先规划：拆解为领域子任务，明确派发顺序。**多领域任务先调 write_plan 写入执行计划**
+       （goal + 子任务数组 {id, title, domain, depends_on, acceptance}），再逐个派发——
+       计划驱动依赖门：depends_on 未完成的领域派发会被拒绝，TUI 计划面板显示真实进度。
     2. 派发后继续推进可并行的派发；收到 mailbox 摘要后及时整合。
     3. 全部子任务完成后进入整体验收（见【整品验收与返工】）：验收通过才输出最终答复
        （目标达成情况 + 关键产出 + 涉及文件路径）；未通过给责任领域返工（<= 2 轮），仍不过如实声明。
     4. 最终答复 = DomainAgent 回灌摘要的整理版，保留结论与文件路径。
-  max_blocks: 20
-  summary_interval: 10
 
 # 领域Agent配置（domain 角色共用模型；提示词由此处 system_prompt 提供，registry.go 仅兜底）
 domain_agent:
@@ -314,6 +314,13 @@ domain_agent:
     - 自执行的部分直接写入结论。
     - 你的最终答复就是回灌给父 Agent 的交付物：结论先行、自包含、附关键文件路径与验收证据。
 
+    【升级处置】
+    - 收到带 [升级] 前缀的 mailbox 消息表示子 Agent 无法自治（如验证未通过、任务无法继续），须三选一处置：
+      1. 重派：带前序失败原因与已探索成果重派同类子 Agent（打捞摘要会自动以【前序探索摘要】注入，不要重复探索）；
+      2. 自己接手：评估后由 MetaAgent 直接完成剩余部分；
+      3. 回报用户：无法完成时如实向用户说明卡点与建议。
+    - 子 Agent 失败消息以 [failure kind=...] 开头为机读标记，其后才是人读文案；整合结论时忽略标记本身。
+
 # 轻量模型配置（用于历史会话总结、检索 query 改写等低开销任务）
 # 可指向更便宜更快的模型；留空 model 时回退到 domain_agent 模型
 # 实证：deepseek 端点本环境频繁超时（pipeline 摘要 5s 熔断反复触发）且输出格式不稳，
@@ -349,6 +356,12 @@ embed:
 # 业务级测试（computer-use 点击页面 / CLI 断言）见 doc/扩展设计_Agent工作流平台.md §12。
 fixed_roles:
   # 代码助手
+  # 角色写沙箱（Layer 4，dormant opt-in）：配置 sandbox.allowed_write_paths 后，
+  # 该角色的 WriteFile 仅允许写入指定目录（相对 workDir 或绝对路径），越界拒绝。
+  # 样例（当前保持空=不限制，行为不变）：
+  #   sandbox:
+  #     allowed_write_paths: ["src/", "tests/", "./dist"]
+  # 机制由 tool/sandbox.go enforceRoleWritePath 实现（单测 TestEnforceRoleWritePath_* 覆盖）。
   - id: code_assistant
     name: 代码助手
     type: fixed

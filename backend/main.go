@@ -45,6 +45,7 @@ func main() {
 	rolePath := flag.String("roles", "config/roles.yaml", "角色配置路径")
 	envPath := flag.String("env", ".env", "环境变量文件路径")
 	soulPath := flag.String("soul", "config/soul.md", "人格定义文件路径")
+	profilePath := flag.String("profile", "config/user_profile.md", "用户画像文件路径（TODO #28）")
 	skillPath := flag.String("skills", "config/skills.yaml", "Skill 池 YAML 路径（可选）")
 	webDistPath := flag.String("web-dist", "web/dist", "前端构建产物目录路径（相对路径将基于可执行文件目录解析）")
 	flag.Parse() // 解析命令行输入；未解析前 *configPath 等指针仍为默认值
@@ -126,6 +127,7 @@ func main() {
 		RolePath:   *rolePath,   // 角色配置路径
 		EnvPath:    *envPath,    // 环境变量文件路径
 		SoulPath:   *soulPath,   // 人格定义文件路径
+		ProfilePath: *profilePath, // 用户画像文件路径
 		SkillPath:  *skillPath,  // Skill 池 YAML 路径
 		LogWriter:  logWriter,   // 文件日志 writer，组件内部可共用
 	})

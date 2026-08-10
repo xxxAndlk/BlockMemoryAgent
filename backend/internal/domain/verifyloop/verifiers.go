@@ -173,7 +173,7 @@ func (r *MailboxReporter) Report(req Request, result Result) {
 	}
 	from := "verifyloop/" + req.ProducerID
 	if result.Passed {
-		r.mb.Send(&mailbox.Message{
+		_, _ = r.mb.Send(&mailbox.Message{
 			From:    from,
 			To:      req.ParentID,
 			Type:    mailbox.MsgInfo,
@@ -183,7 +183,7 @@ func (r *MailboxReporter) Report(req Request, result Result) {
 		})
 		return
 	}
-	r.mb.Send(&mailbox.Message{
+	_, _ = r.mb.Send(&mailbox.Message{
 		From:    from,
 		To:      req.ParentID,
 		Type:    mailbox.MsgEscalate,

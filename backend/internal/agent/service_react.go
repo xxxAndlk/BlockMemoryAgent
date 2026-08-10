@@ -6,17 +6,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/board"          // board 提供任务看板快照（TODO #22）
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/model"
+	"github.com/blockmemory/agent/backend/internal/userprofile"
 	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	"github.com/blockmemory/agent/backend/internal/store"
@@ -71,6 +74,92 @@ type ReactService struct {
 	// persona 可选的人格注入器（soul.Loader 实现该接口）；为 nil 时不注入人格前缀。
 	// bootstrap 注入 runtime.Soul；runSession/resumeSession 构造 MetaAgent 时调用 WithPersonaInjector。
 	persona PersonaInjector
+	// boardFn 按 sessionID 返回会话任务看板（TODO #22 执行计划）；nil 表示未接线。
+	boardFn func(sessionID string) *board.TaskBoard
+	// userProfile 用户画像存储（TODO #28 第四层记忆）；nil 表示未接线（不注入不提取）。
+	userProfile *userprofile.Store
+	// profileExtractor 会话完成时从对话提取偏好增量的轻量模型回调；nil 跳过提取。
+	profileExtractor func(ctx context.Context, text string) ([]string, error)
+}
+
+// SetUserProfileStore 注入用户画像存储（TODO #28）。
+// 注入后 MetaAgent system prompt 自动带【用户画像】前缀（带 rune 上限截断），子 Agent 不下发。
+// 传 nil 关闭画像功能（测试场景）。
+func (s *ReactService) SetUserProfileStore(st *userprofile.Store) {
+	s.userProfile = st
+}
+
+// SetProfileExtractor 注入会话完成时的偏好提取回调（轻量模型扫对话）。
+// 传 nil 关闭自动提取（默认关闭）；显式写入（remember_preference / SaveProfile）不受影响。
+func (s *ReactService) SetProfileExtractor(fn func(ctx context.Context, text string) ([]string, error)) {
+	s.profileExtractor = fn
+}
+
+// Profile 返回用户画像全文快照（TODO #28 查看/编辑入口）。未接线返回空画像。
+func (s *ReactService) Profile(ctx context.Context) (*userprofile.Profile, error) {
+	if s.userProfile == nil {
+		return &userprofile.Profile{}, nil
+	}
+	return s.userProfile.Current(), nil
+}
+
+// SaveProfile 全量覆盖用户画像（HTTP PUT 用户手动编辑）。
+func (s *ReactService) SaveProfile(ctx context.Context, content string) error {
+	if s.userProfile == nil {
+		return fmt.Errorf("user profile store not wired")
+	}
+	return s.userProfile.Save(content)
+}
+
+// extractProfilePreferences 会话完成时扫对话提取偏好增量并写入画像（TODO #28 双路写入之 b）。
+// 仅提取用户消息（user 角色）；提取失败/空结果零副作用（不阻塞会话收尾）。
+func (s *ReactService) extractProfilePreferences(session *reactInternalSession) {
+	if s.userProfile == nil || s.profileExtractor == nil {
+		return
+	}
+	var sb strings.Builder
+	for _, m := range session.Messages {
+		if m.Role == string(enums.ChatRoleUser) {
+			sb.WriteString(m.Content)
+			sb.WriteByte('\n')
+		}
+	}
+	text := strings.TrimSpace(sb.String())
+	if text == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	prefs, err := s.profileExtractor(ctx, text)
+	if err != nil || len(prefs) == 0 {
+		log.Printf("[profile] extract preferences failed, skip: err=%v prefs=%d", err, len(prefs))
+		return
+	}
+	for _, p := range prefs {
+		if p = strings.TrimSpace(p); p != "" {
+			_ = s.userProfile.Append("反馈记录", p)
+		}
+	}
+}
+
+// SetBoard 注入会话任务看板访问器（TODO #22）。
+// 由 bootstrap 注入 board.Manager.Get；传 nil 关闭看板功能（TUI 计划面板回退树合成）。
+func (s *ReactService) SetBoard(fn func(sessionID string) *board.TaskBoard) {
+	s.boardFn = fn
+}
+
+// Board 返回会话任务看板快照（TODO #22 Phase 2 面板真相源）。
+// 未接线或会话无看板（未 write_plan）返回 (nil, nil)，调用方回退旧树合成。
+func (s *ReactService) Board(ctx context.Context, sessionID string) (*board.Snapshot, error) {
+	if s.boardFn == nil {
+		return nil, nil
+	}
+	b := s.boardFn(sessionID)
+	if b == nil {
+		return nil, nil
+	}
+	snap := b.Snapshot()
+	return &snap, nil
 }
 
 // SetTreeStore 注入 Agent 树持久化层。bootstrap 在创建 ReactService 后调用。
@@ -106,6 +195,18 @@ func (s *ReactService) SetPersonaInjector(p PersonaInjector) {
 	s.persona = p
 }
 
+// metaPersona 返回 MetaAgent 的注入器组合：人格（soul）+ 用户画像（TODO #28 第四层记忆）。
+// 画像仅注入 MetaAgent；子 Agent 由 dispatcher 注入人格单一注入器（画像不下发，
+// 防上下文膨胀与偏好泄露）。
+func (s *ReactService) metaPersona() PersonaInjector {
+	var current func() string
+	if s.userProfile != nil {
+		store := s.userProfile
+		current = func() string { return store.Current().Content }
+	}
+	return CombinePersonaInjectors(s.persona, NewUserProfileInjector(current, 2000))
+}
+
 // ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
 // 由 bootstrap 从 cfg.Agent 派生注入，避免 agent 包反向依赖 config 包；
 // 未注入时全部取零值，由 loopConfig 回退到合理默认值。
@@ -124,6 +225,9 @@ type ReactRuntimeConfig struct {
 	// domain=120000, meta=200000(安全网,不为 0 因 maxIter=-1 已无界), 其他(叶子助手)=40000。
 	// nil 时全部走默认。显式值覆盖默认,resume 时重置(各 Agent 独立预算)。
 	TokenBudgetPerRole map[string]int
+	// SessionMaxWallClockMin 会话全局墙钟上限（分钟，TODO #25-4 硬止损）。
+	// 从会话创建起超时未终止则级联取消全部节点 + 会话置 error；<=0 关闭（默认）。
+	SessionMaxWallClockMin int
 }
 
 // SetRuntimeConfig 注入 ReAct 主循环运行时参数（见 ReactRuntimeConfig）。
@@ -316,10 +420,74 @@ func NewReactService(
 func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*Session, error) {
 	// 在内存中创建会话对象。
 	sess := s.store.createSession(req.Goal)
+	s.maybeWatchWallClock(sess)
 	// 在独立 goroutine 中运行 ReAct 循环，避免阻塞调用方。
 	go s.runSession(sess)
 	// 返回转换后的公共 Session DTO。
 	return toReactAgentSession(sess), nil
+}
+
+// maybeWatchWallClock 启动会话全局墙钟看门狗（TODO #25-4 硬止损）：
+// SessionMaxWallClockMin>0 时，会话从创建起超时未终止则级联取消全部节点 +
+// 会话置 error"超全局时限"。0=关闭（保持现状语义，不启动 goroutine）。
+func (s *ReactService) maybeWatchWallClock(session *reactInternalSession) {
+	maxWall := s.runtimeCfg.SessionMaxWallClockMin
+	if maxWall <= 0 {
+		return
+	}
+	s.startWallClock(session, time.Duration(maxWall)*time.Minute)
+}
+
+// startWallClock 启动墙钟看门狗 goroutine（测试可注入短时长）。
+func (s *ReactService) startWallClock(session *reactInternalSession, wall time.Duration) {
+	maxWall := int(wall / time.Minute)
+	go func() {
+		timer := time.NewTimer(wall)
+		defer timer.Stop()
+		<-timer.C
+
+		s.store.mu.Lock()
+		cur := s.store.sessions[session.ID]
+		if cur == nil {
+			s.store.mu.Unlock()
+			return // 已淘汰
+		}
+		switch cur.Status {
+		case enums.SessionStatusRunning, enums.SessionStatusAwaitingClarify, enums.SessionStatusPausedOnChild:
+		default:
+			s.store.mu.Unlock()
+			return // 已终止
+		}
+		cancelFn := cur.cancelFn
+		cur.cancelFn = nil
+		cur.Status = enums.SessionStatusError
+		cur.Result = fmt.Sprintf("会话超全局时限（%d 分钟），已强制终止", maxWall)
+		now := time.Now()
+		cur.EndedAt = &now
+		s.store.mu.Unlock()
+
+		s.store.addEvent(session, eventkind.System, "System", "会话超全局时限，已强制终止", "", "", "", "", "", true)
+		// 级联取消全部在跑节点（与用户取消同语义）。
+		s.cascadeCancelTree(session.ID)
+		if cancelFn != nil {
+			cancelFn()
+		}
+	}()
+}
+
+// cascadeCancelTree 遍历会话权威树，取消所有 Running/Paused 节点（TODO #25-2/25-4）。
+// 供会话取消与全局墙钟到期时级联终止在跑子 Agent（detach ctx 的 pause/resume 好处保留，
+// 仅"会话终止"这一刻级联）。
+func (s *ReactService) cascadeCancelTree(sessionID string) {
+	t := s.TreeFor(sessionID)
+	if t == nil {
+		return
+	}
+	for _, n := range t.Snapshot() {
+		if n.Status == orchestrator.StatusRunning || n.Status == orchestrator.StatusPaused {
+			t.Cancel(n.ID)
+		}
+	}
 }
 
 // Get 根据会话 ID 获取会话。
@@ -611,6 +779,62 @@ func parseApproval(answer string) bool {
 	return false
 }
 
+// AskUserHook 返回 ask_user 工具的会话层回调（TODO #24 人在回路）。
+// 由 bootstrap 注入 tool.Registry.SetAskUserHook；meta/domain Agent 在任务执行中
+// 主动提问时触发。与 ApprovalHook 同通道范式：置 PendingClarify + 会话暂停
+// （awaiting_clarify）+ 推 clarify 事件 → 阻塞等用户答复（Agent goroutine 存活）→
+// sendMessage/answerClarify 把**原始答复文本**写入 askUser 通道 →
+// ask_user 工具结果带回 ReAct 循环。会话取消时返回 ctx 错误。
+func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
+	return func(ctx context.Context, question string) (string, error) {
+		sid := tool.SessionIDFromContext(ctx)
+		if sid == "" {
+			return "", fmt.Errorf("ask_user: missing session context")
+		}
+		s.store.mu.Lock()
+		sess := s.store.sessions[sid]
+		if sess == nil || sess.approval != nil || sess.askUser != nil {
+			s.store.mu.Unlock()
+			return "", fmt.Errorf("ask_user: 会话不存在或已有待答复项（审批/提问），暂不能提问")
+		}
+		ch := make(chan string, 1)
+		sess.askUser = ch
+		sess.pendingClarify = &ClarifyRequest{
+			ID:        fmt.Sprintf("ask-%d", time.Now().UnixNano()),
+			Question:  question,
+			Context:   "Agent 向用户提问（人在回路）",
+			AgentID:   tool.AgentIDFromContext(ctx),
+			CreatedAt: time.Now(),
+		}
+		sess.Status = enums.SessionStatusAwaitingClarify
+		s.store.mu.Unlock()
+
+		s.store.addEvent(sess, eventkind.Clarify, "System", "Agent 提问: "+question, "", "", "", "", "", true)
+
+		select {
+		case <-ctx.Done():
+			s.store.mu.Lock()
+			if sess.askUser == ch {
+				sess.askUser = nil
+				sess.pendingClarify = nil
+			}
+			s.store.mu.Unlock()
+			return "", ctx.Err()
+		case answer := <-ch:
+			s.store.mu.Lock()
+			if sess.askUser == ch {
+				sess.askUser = nil
+				sess.pendingClarify = nil
+			}
+			if sess.Status == enums.SessionStatusAwaitingClarify {
+				sess.Status = enums.SessionStatusRunning
+			}
+			s.store.mu.Unlock()
+			return answer, nil
+		}
+	}
+}
+
 // ListAgents 返回与会话关联的运行时 Agent 实例列表。
 // 在 ReAct 重构期间，这里返回单个 MetaAgent 节点，以保持 TUI 树形面板继续渲染；
 // 后续阶段将根据子 Agent 事件流构建完整树。
@@ -716,6 +940,7 @@ func (s *ReactService) SummarizeTaskTitle(ctx context.Context, title string) str
 func (s *ReactService) LaunchSession(goal string) string {
 	// 创建会话并异步启动 ReAct 循环。
 	sess := s.store.createSession(goal)
+	s.maybeWatchWallClock(sess)
 	go s.runSession(sess)
 	return sess.ID
 }
@@ -1033,7 +1258,7 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(s.workDir()).
-		WithPersonaInjector(s.persona)
+		WithPersonaInjector(s.metaPersona())
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -1079,6 +1304,9 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 添加 Agent 完成事件。
 	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
 
+	// 用户画像自动提取（TODO #28）：会话完成扫对话提偏好增量写入画像，失败零副作用。
+	s.extractProfilePreferences(session)
+
 	// 持久化历史与事件到 Postgres。
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
@@ -1121,7 +1349,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(s.workDir()).
-		WithPersonaInjector(s.persona)
+		WithPersonaInjector(s.metaPersona())
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -1177,6 +1405,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 	// 添加完成事件并持久化。
 	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
+
+	// 用户画像自动提取（TODO #28）：会话完成扫对话提偏好增量写入画像，失败零副作用。
+	s.extractProfilePreferences(session)
 
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
@@ -1288,6 +1519,12 @@ func (s *ReactService) setSessionError(session *reactInternalSession, msg string
 	now := time.Now()
 	// 更新会话状态、结果与结束时间。
 	s.store.mu.Lock()
+	// 首次错误胜出：会话已处于 Error 终态且已有结果时不覆盖（TODO #25-4——
+	// 墙钟到期先置"超全局时限"，随后 runSession 因 ctx 取消的 setSessionError 不应覆盖）。
+	if session.Status == enums.SessionStatusError && session.Result != "" {
+		s.store.mu.Unlock()
+		return
+	}
 	session.Status = enums.SessionStatusError
 	session.Result = msg
 	session.EndedAt = &now
@@ -1330,6 +1567,20 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 	if !ok {
 		s.store.mu.Unlock()
 		return ErrSessionNotFound
+	}
+
+	// 待答复的 Agent 提问（TODO #24 ask_user）：原始答复文本写入 askUser 通道，
+	// 由 ask_user 工具结果带回 ReAct 循环（不做 parseApproval 裁决）。
+	if session.askUser != nil {
+		session.askUser <- content
+		session.Messages = append(session.Messages, Message{
+			Role:      string(enums.ChatRoleUser),
+			Content:   "[澄清答复] " + content,
+			Timestamp: time.Now(),
+		})
+		s.store.mu.Unlock()
+		s.store.addEvent(session, eventkind.Clarify, "User", "提问答复: "+content, "", "", "", "", "", true)
+		return nil
 	}
 
 	// 待审批的破坏性操作（TODO #17 P1）：任意用户消息作为确认答复路由进审批通道。
@@ -1465,6 +1716,18 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 		}
 		return fmt.Errorf("%w: session is not awaiting clarification", ErrInvalidSessionState)
 	}
+	// 待答复的 Agent 提问（TODO #24 ask_user）：原始答复文本写入 askUser 通道。
+	if session.askUser != nil {
+		session.askUser <- answer
+		session.Messages = append(session.Messages, Message{
+			Role:      string(enums.ChatRoleUser),
+			Content:   "[澄清答复] " + answer,
+			Timestamp: time.Now(),
+		})
+		s.store.mu.Unlock()
+		s.store.addEvent(session, eventkind.Clarify, "User", "提问答复: "+answer, "", "", "", "", "", true)
+		return nil
+	}
 	// 待审批的破坏性操作确认（TODO #17 P1）：答复路由进审批通道，不重建会话（Agent goroutine 存活）。
 	if session.approval != nil {
 		session.approval <- parseApproval(answer)
@@ -1593,6 +1856,9 @@ func (s *ReactService) cancel(ctx context.Context, sessionID string) error {
 	if cancelFn != nil {
 		cancelFn()
 	}
+	// 级联取消在跑/暂停子 Agent（TODO #25-2）：会话终止这一刻，树中节点逐个 Cancel，
+	// 子 goroutine 经 context.Canceled 路径退出（runSubAgent 对该路径不重复通知）。
+	s.cascadeCancelTree(sessionID)
 	return nil
 }
 

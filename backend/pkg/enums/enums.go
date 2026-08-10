@@ -253,6 +253,11 @@ const (
 	// 见 internal/memory/block_vector.go,跨会话复用 DomainAgent 经验。
 	KnowledgeTypeBlockMemory KnowledgeType = "block_memory"
 
+	// KnowledgeTypeExternalKB 外部知识库:预置领域文档（TODO #27 外部知识库检索层）。
+	// 只读为主、与块记忆（block_memory）分层：摄入管道切块落库（meta.namespace=external），
+	// search_knowledge 工具 / 混合检索按此类型召回。
+	KnowledgeTypeExternalKB KnowledgeType = "external_kb"
+
 	// KnowledgeTypeDomainArchive 领域归档:历史遗留知识类型，召回机制已在 P1-1 删除
 	// （原 internal/store/domain_archive.go 已移除）。常量保留以兼容历史数据，
 	// 新代码不应再写入此类型，统一使用 KnowledgeTypeBlockMemory。

@@ -5,7 +5,9 @@ package agent
 import (
 	"context"
 
+	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
+	"github.com/blockmemory/agent/backend/internal/userprofile"
 )
 
 // Agent 是 Agent 编排模块的统一外观接口（Facade）。
@@ -65,6 +67,15 @@ type Agent interface {
 	// instID 对应 call_sub_agent 返回的 sub_agent_id。
 	// 节点不存在或已 terminal 返回 ErrAgentNotFound。
 	CancelAgent(ctx context.Context, sessionID, instID string) error
+
+	// Board 返回会话任务看板快照（TODO #22 执行计划面板真相源）。
+	// 未接线或会话无看板时返回 (nil, nil)，调用方回退旧树合成。
+	Board(ctx context.Context, sessionID string) (*board.Snapshot, error)
+
+	// Profile 返回用户画像全文快照（TODO #28 第四层记忆查看/编辑入口）。
+	// SaveProfile 全量覆盖（HTTP PUT 用户手动编辑，可纠正 LLM 猜错）。
+	Profile(ctx context.Context) (*userprofile.Profile, error)
+	SaveProfile(ctx context.Context, content string) error
 
 	// Shutdown 优雅关闭整个 Agent 编排模块，释放资源并停止后台任务。
 	// ctx 用于控制关闭操作的超时与取消。

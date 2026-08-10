@@ -810,3 +810,72 @@ func TestCancelAwaitingClarifySession(t *testing.T) {
 		t.Errorf("status = %q, want %q (cancelled)", snap.Status, enums.SessionStatusError)
 	}
 }
+
+// TestCancelSession_CascadesTree 验证 TODO #25-2 会话取消级联：
+// cancel() 遍历权威树取消 Running/Paused 节点。
+func TestCancelSession_CascadesTree(t *testing.T) {
+	svc := newReactServiceForTest(&deadlineProvider{}, t.TempDir())
+	created, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "g"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	// 手动注册两个在跑子节点（模拟派发中的子 Agent）。
+	tr := svc.TreeFor(created.ID)
+	if tr == nil {
+		t.Fatal("TreeFor returned nil")
+	}
+	tr.Register(orchestrator.Node{ID: created.ID + "/domain-1", ParentID: created.ID, Role: "domain", Status: orchestrator.StatusRunning})
+	tr.Register(orchestrator.Node{ID: created.ID + "/code_assistant-1", ParentID: created.ID, Role: "code_assistant", Status: orchestrator.StatusRunning})
+
+	if err := svc.cancel(context.Background(), created.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	for _, n := range tr.Snapshot() {
+		if n.Status != orchestrator.StatusCancelled {
+			t.Fatalf("node %s should be Cancelled after session cancel, got status=%v", n.ID, n.Status)
+		}
+	}
+}
+
+// TestWallClock_ExpiryTerminatesSession 验证 TODO #25-4 全局墙钟：
+// 会话超过时限未终止 -> 级联取消节点 + 会话置 error"超全局时限"。
+func TestWallClock_ExpiryTerminatesSession(t *testing.T) {
+	svc := newReactServiceForTest(&blockingLLMProvider{}, t.TempDir())
+	created, err := svc.CreateSession(context.Background(), CreateRequest{Goal: "g"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	tr := svc.TreeFor(created.ID)
+	tr.Register(orchestrator.Node{ID: created.ID + "/domain-1", ParentID: created.ID, Role: "domain", Status: orchestrator.StatusRunning})
+
+	sess := svc.store.snapshotSessionByID(created.ID)
+	svc.startWallClock(sess, 200*time.Millisecond)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		snap, _ := svc.Get(context.Background(), created.ID)
+		if snap.Status == string(enums.SessionStatusError) {
+			if !strings.Contains(snap.Result, "超全局时限") {
+				t.Fatalf("expected wall-clock error text, got: %s", snap.Result)
+			}
+			// 树节点应被级联取消。
+			for _, n := range tr.Snapshot() {
+				if n.Status != orchestrator.StatusCancelled {
+					t.Fatalf("node should be Cancelled after wall clock, got status=%v", n.Status)
+				}
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("session did not terminate within wall clock deadline")
+}
+
+// blockingLLMProvider Generate 阻塞直到 ctx 取消：模拟长跑会话（供墙钟测试保持 running 态）。
+type blockingLLMProvider struct{}
+
+func (p *blockingLLMProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (p *blockingLLMProvider) Name() string { return "blocking" }

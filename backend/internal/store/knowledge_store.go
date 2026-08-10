@@ -5,6 +5,7 @@ import (
 	"database/sql"  // 标准库 SQL 抽象层
 	"encoding/json" // 结构体与 JSONB/JSON 列之间的序列化
 	"fmt"           // 格式化错误信息
+	"strings"       // TrimSpace 空查询判定
 	"time"          // 超时与 NULL 时间处理
 
 	"github.com/blockmemory/agent/backend/pkg/enums" // 枚举常量
@@ -317,4 +318,30 @@ func (s *KnowledgeStore) scanKnowledgeRows(ctx context.Context, rows *sql.Rows) 
 		results = append(results, &r)
 	}
 	return results, rows.Err()
+}
+
+// SearchKeywords 按 knowledge_type 过滤的全文关键词检索（TODO #27 外部知识库混合检索）。
+// 使用生成列 content_tsv（to_tsvector('simple', content)，见 schema.go）做 tsvector 匹配，
+// 按 ts_rank 相关度排序取 topK。中文分词需部署 zhparser/pg_jieba 后把 'simple' 换 'zhparser'
+//（retriever 文档备注）；'simple' 对英文/代码/数字词元已可用。
+func (s *KnowledgeStore) SearchKeywords(ctx context.Context, knowledgeType enums.KnowledgeType, query string, topK int) ([]*types.KnowledgeRecord, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE archived = false AND knowledge_type = $1
+			  AND content_tsv @@ plainto_tsquery('simple', $2)
+			ORDER BY ts_rank(content_tsv, plainto_tsquery('simple', $2)) DESC
+			LIMIT $3
+		`, knowledgeType, query, topK)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return s.scanKnowledgeRows(ctx, rows)
 }

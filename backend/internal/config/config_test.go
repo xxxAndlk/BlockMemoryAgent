@@ -22,8 +22,8 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if cfg.Agent.BlockMemoryWriteEnabled == nil || !*cfg.Agent.BlockMemoryWriteEnabled {
 		t.Fatal("block_memory_write_enabled 默认应为 true")
 	}
-	// Spec 强制默认关闭：基础任务先跑通。
-	if cfg.Agent.SpecEnforcementEnabled == nil || *cfg.Agent.SpecEnforcementEnabled {
-		t.Fatal("spec_enforcement_enabled 默认应为 false")
+	// Spec 强制默认开启：config.yaml 显式 true（塔防实证 WriteSpec 有用）。
+	if cfg.Agent.SpecEnforcementEnabled == nil || !*cfg.Agent.SpecEnforcementEnabled {
+		t.Fatal("spec_enforcement_enabled 默认应为 true")
 	}
 }

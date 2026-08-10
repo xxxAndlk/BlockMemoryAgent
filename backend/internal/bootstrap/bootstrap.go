@@ -17,6 +17,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/config"
+	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/dag"
 	"github.com/blockmemory/agent/backend/internal/domain/memory"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
@@ -26,11 +27,14 @@ import (
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/model"
+	"github.com/blockmemory/agent/backend/internal/retriever"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/internal/store"
+	"github.com/blockmemory/agent/backend/internal/userprofile"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -44,6 +48,7 @@ type ConfigPaths struct {
 	RolePath   string // 角色配置文件路径（如 config/roles.yaml）
 	EnvPath    string // 环境变量文件路径（如 backend/.env）
 	SoulPath   string // 人格文件路径（如 config/soul.md），可为空
+	ProfilePath string // 用户画像文件路径（如 config/user_profile.md，TODO #28），可为空
 	SkillPath  string // 技能文件路径（如 config/skills.yaml），可为空
 	// LogWriter 是会话结构化日志的可选输出目标；为 nil 时日志写入 os.Stderr。
 	LogWriter io.Writer
@@ -234,6 +239,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		ToolOutputHistoryMaxRunes: cfg.Agent.ToolOutputHistoryMaxRunes,
 		TokenBudgetPerGoal:        cfg.Agent.TokenBudgetPerGoal,
 		TokenBudgetPerRole:        cfg.Agent.TokenBudgetPerRole,
+		SessionMaxWallClockMin:    cfg.Agent.SessionMaxWallClockMin,
 	}
 	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute
 	if subAgentTimeout < 0 {
@@ -244,24 +250,28 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 比等满 sub_agent_timeout（60min）早暴露第二次 session 卡死（LLM 流式挂起等）。<=0 关闭。
 	subAgentHeartbeat := time.Duration(cfg.Agent.SubAgentHeartbeatTimeoutMin) * time.Minute
 	subAgentDispatcher.WithTimeout(subAgentTimeout).WithHeartbeatTimeout(subAgentHeartbeat).WithLoopConfigByRole(reactCfg.LoopConfigByRole).WithBlockMemorySearcher(pgStore)
+	// DomainAgent 心跳（TODO #25-3 防误杀版）：默认 2× 叶子；等子/等回信靠后代活动冒泡保活。
+	subAgentDispatcher.WithDomainHeartbeatTimeout(time.Duration(cfg.Agent.DomainHeartbeatTimeoutMin) * time.Minute)
 	// Paused domain 续跑次数上限：续跑重置 fresh budget，无上限则研磨环路永不绑定；
 	// 触顶后强制收口部分返回父 Agent（默认 1，cfg.Agent.PausedDomainMaxResumes 可调）。
 	subAgentDispatcher.WithMaxPausedResumes(cfg.Agent.PausedDomainMaxResumes)
+	// 叶子助手 kind=error 失败自动重派（TODO #23）：默认 1 次，同任务同前缀重跑。
+	subAgentDispatcher.WithDispatchRetryCount(cfg.Agent.DispatchRetryCount)
 	// 块记忆写入闭环：默认开启（applyFeatureTogglesDefaults 兜底为 true）；
 	// 显式 block_memory_write_enabled: false 时 Dispatcher 内部跳过沉淀。
 	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)
 	// 事实提取：子 Agent 完成后用轻量模型提取 1-5 条关键事实，每条单独落 KnowledgeRecord，
 	// 替代原始 result.Text 整段落库。提取失败自动回退原始保存（saveBlockMemory 内部处理）。
 	subAgentDispatcher.WithFactExtractor(&llmFactExtractor{factory: modelFactory})
+	// 失败打捞（TODO #20 第二层）：子 Agent 失败（超时/被杀/循环守卫终止）时用轻量模型
+	// 提取"已读文件清单+已得结论+卡点"摘要，写共享槽位供同域重派带前序摘要 + 追加进父 mailbox。
+	subAgentDispatcher.WithSalvageExtractor(&llmSalvageExtractor{factory: modelFactory})
 	// 全局派发总数上限：单 session 所有角色派发合计超限拒绝；用户新消息重置。
 	subAgentDispatcher.WithMaxTotalDispatches(cfg.Agent.MaxTotalDispatches)
 	// Spec 强制：开启时 call_sub_agent 前必须先 WriteSpec(goal, acceptance, ...)，
-	// dispatcher 校验 parentID:spec 存在且新鲜，缺失则拒绝派发。默认 true。
-	if cfg.Agent.SpecEnforcementEnabled != nil {
-		subAgentDispatcher.WithSpecEnforcement(*cfg.Agent.SpecEnforcementEnabled)
-	} else {
-		subAgentDispatcher.WithSpecEnforcement(true)
-	}
+	// dispatcher 校验 parentID:spec 存在且新鲜，缺失则拒绝派发。config 层默认 true，
+	// config.yaml 可显式关闭；applyDefaults 保证非 nil，else 分支为防御。
+	subAgentDispatcher.WithSpecEnforcement(cfg.Agent.SpecEnforcementEnabled == nil || *cfg.Agent.SpecEnforcementEnabled)
 	// 共享记忆/spec：文件后端落盘到 <workDir>/.bma/shared/<hex(agentID)>__<slot>.md。
 	// 主线程 Agent（meta/domain）持可写实例写关键上下文与 spec，
 	// 子 Agent 派发时经 Dispatcher 的只读视图读取并注入任务前。
@@ -280,6 +290,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注册 send_message 工具：支持任意 Agent 向另一个 Agent 实例邮箱投递消息，
 	// 是多 Agent 协作验证闭环（代码 Agent <-> 测试 Agent 互问互答）的基础原语。
 	subAgentDispatcher.RegisterMessagingTool(toolRegistry)
+	// 注册 cancel_agent 工具（TODO #25 控制面）：MetaAgent/DomainAgent 主动取消跑偏子 Agent。
+	subAgentDispatcher.RegisterControlTool(toolRegistry)
 	// 注册 create_role / list_roles 工具：让 MetaAgent 运行时注册动态角色。
 	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools 字段），
 	// 其他角色看不到它们。Registry 持 closure 引用，Execute 直接读写 dynamic 层。
@@ -298,6 +310,13 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入 Agent 树持久化层：Register/Finish/Cancel 后 best-effort 写入 PG,
 	// 服务重启后 TreeFor lazy init 调 LoadFromStore 恢复历史节点(元数据恢复)。
 	agentSvc.SetTreeStore(store.NewPostgresTreeStore(pgStore.DB()))
+	// 注入任务看板（TODO #22 执行计划）：write_plan 写板、派发依赖门、TUI 面板真相源。
+	// 看板按 sessionID 惰性创建（write_plan 首次调用 GetOrCreate）。
+	agentSvc.SetBoard(rt.Boards.Get)
+	subAgentDispatcher.WithBoard(rt.Boards.Get, func(sid, goal string) *board.TaskBoard {
+		return rt.Boards.GetOrCreate(sid, goal)
+	})
+	subAgentDispatcher.RegisterPlanTool(toolRegistry)
 	// 注入共享记忆 KV：话题切换时把旧 Agent 树摘要写入 `topic:{id}:summary`,
 	// 供新话题 MetaAgent 召回(召回注入侧步骤 4 part C 未做,摘要已落 KV)。
 	agentSvc.SetSharedMemoryStore(sharedKV)
@@ -305,6 +324,39 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 工具调用暂停会话推「需确认」事件，用户答复经 sendMessage/answerClarify 路由回放行。
 	// approvalHook 非 nil 仅影响命中边界的调用，常规编码流零阻塞。
 	toolRegistry.SetApprovalHook(agentSvc.ApprovalHook())
+	// 外部知识库检索（TODO #27 热路径 a）：search_knowledge 工具 → retriever 混合检索。
+	// 混合检索后端 = KnowledgeStore（直接满足 HybridSearchBackend：SearchByType + SearchKeywords）。
+	// 嵌入用全局 embedder（roles.yaml embed 段；当前 pseudo，真实 embed 激活后自动升级）。
+	kbRetriever := retriever.NewGlobalKnowledgeRetriever(nil, nil, embedder)
+	kbRetriever.SetHybridBackend(pgStore.Knowledge)
+	toolRegistry.SetKnowledgeSearchHook(func(ctx context.Context, query string, topK int) (string, error) {
+		hits, err := kbRetriever.SearchHybrid(ctx, query, enums.KnowledgeTypeExternalKB, topK)
+		if err != nil {
+			return "", err
+		}
+		if len(hits) == 0 {
+			return "外部知识库未命中。", nil
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "外部知识库命中 %d 条：", len(hits))
+		for i, rec := range hits {
+			src, _ := rec.Meta["source"].(string)
+			doc, _ := rec.Meta["doc"].(string)
+			b.WriteString("\n--- ")
+			fmt.Fprintf(&b, "[%d] %s", i+1, src)
+			if doc != "" {
+				b.WriteString(" (文档: " + doc + ")")
+			}
+			b.WriteString(" ---\n")
+			b.WriteString(truncateForPrompt(rec.Content, 600))
+		}
+		return b.String(), nil
+	})
+	// 注入 ask_user 工具钩子（TODO #24 人在回路）：meta/domain Agent 主动提问时
+	// 置 PendingClarify + 暂停会话 + 阻塞等答复，答复作为工具结果带回 ReAct 循环。
+	// 默认超时从 config.AskUserTimeoutSec 注入（0=不限），单次调用 timeout_sec 可覆盖。
+	toolRegistry.SetAskUserHook(agentSvc.AskUserHook())
+	toolRegistry.SetAskUserTimeoutDefault(cfg.Agent.AskUserTimeoutSec)
 	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
 	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。
 	subAgentDispatcher.WithLiveEvents(agentSvc.ForwardLiveEvent)
@@ -312,6 +364,23 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 在 systemPrompt 头部拼入人格前缀。人格为空时无副作用（Inject 原样返回）。
 	agentSvc.SetPersonaInjector(rt.Soul)
 	subAgentDispatcher.WithPersonaInjector(rt.Soul)
+	// 用户画像（TODO #28 第四层记忆）：单文件 user_profile.md，人可编辑 + 程序结构化追加。
+	// 注入仅 MetaAgent（metaPersona 组合人格+画像），子 Agent 不下发（防上下文膨胀/偏好泄露）。
+	// 双路写入：remember_preference 工具（用户显式陈述，立即生效）+ 会话完成轻量模型提取。
+	if paths.ProfilePath != "" {
+		profileStore := userprofile.NewStore(paths.ProfilePath)
+		if err := profileStore.Load(); err != nil {
+			closeStores(pgStore, redisStore)
+			return nil, fmt.Errorf("load user profile %s: %w", paths.ProfilePath, err)
+		}
+		agentSvc.SetUserProfileStore(profileStore)
+		agentSvc.SetProfileExtractor(func(ctx context.Context, text string) ([]string, error) {
+			return extractProfilePreferences(ctx, modelFactory, text)
+		})
+		toolRegistry.SetUserProfileHook(func(ctx context.Context, text string) error {
+			return profileStore.Append("偏好", text)
+		})
+	}
 	// 注入权威 Agent 树访问器：Dispatcher 派发时 Register/Finish/SetCancel，
 	// HTTP API 的 /tree 与 /agents/{aid}/cancel 端点通过 ReactService.TreeFor 读取。
 	subAgentDispatcher.WithTree(agentSvc.TreeFor)

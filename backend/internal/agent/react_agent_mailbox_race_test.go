@@ -25,7 +25,7 @@ func (m *midGenMailboxProvider) Generate(ctx context.Context, req *blades.ModelR
 	m.calls++
 	if m.calls == 1 {
 		// 子 Agent 于本轮 LLM 生成期间完成：摘要进入 mailbox，PendingChildren 已归 0。
-		_ = m.mb.Send(&mailbox.Message{From: "session-1/domain-2", To: m.to, Type: mailbox.MsgInfo, Body: "domain-2 完成摘要：实体类三文件交付"})
+		_, _ = m.mb.Send(&mailbox.Message{From: "session-1/domain-2", To: m.to, Type: mailbox.MsgInfo, Body: "domain-2 完成摘要：实体类三文件交付"})
 		return &blades.ModelResponse{Message: blades.AssistantMessage("只差 domain-2 回灌，请稍候。")}, nil
 	}
 	return &blades.ModelResponse{Message: blades.AssistantMessage("最终交付说明：全部完成")}, nil

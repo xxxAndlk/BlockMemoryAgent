@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/go-kratos/blades"
 
+	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
@@ -23,6 +24,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/internal/skill"
+	"github.com/blockmemory/agent/backend/internal/userprofile"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -116,6 +118,11 @@ func (m *mockAgentForPlan) Tree(ctx context.Context, sessionID string) ([]orches
 	return m.treeNodes, nil
 }
 
+// Board 返回看板快照，测试实现返回 nil（回退树合成）。
+func (m *mockAgentForPlan) Board(ctx context.Context, sessionID string) (*board.Snapshot, error) {
+	return nil, nil
+}
+
 // CancelAgent 取消子 Agent，测试实现返回 nil。
 func (m *mockAgentForPlan) CancelAgent(ctx context.Context, sessionID, instID string) error {
 	return nil
@@ -124,6 +131,12 @@ func (m *mockAgentForPlan) CancelAgent(ctx context.Context, sessionID, instID st
 // Shutdown 是 mockAgentForPlan 的空实现。
 func (m *mockAgentForPlan) Shutdown(ctx context.Context) error { return nil }
 
+
+// Profile 返回用户画像，测试实现返回空。
+func (m *mockAgentForPlan) Profile(ctx context.Context) (*userprofile.Profile, error) { return &userprofile.Profile{}, nil }
+
+// SaveProfile 覆盖画像，测试实现为空操作。
+func (m *mockAgentForPlan) SaveProfile(ctx context.Context, content string) error { return nil }
 // SummarizeTaskTitle 是 mockAgentForPlan 的标题摘要实现，直接返回原标题。
 func (m *mockAgentForPlan) SummarizeTaskTitle(ctx context.Context, title string) string { return title }
 
@@ -131,10 +144,8 @@ func (m *mockAgentForPlan) SummarizeTaskTitle(ctx context.Context, title string)
 func minimalRoleConfigForRender() *pkgconfig.RoleConfigFile {
 	return &pkgconfig.RoleConfigFile{
 		MetaAgent: pkgconfig.MetaAgentConfig{
-			MaxBlocks:       4,
-			SummaryInterval: 1,
-			SystemPrompt:    "You are a helpful assistant.",
-			ModelConfig:     types.AgentModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test-key"},
+			SystemPrompt: "You are a helpful assistant.",
+			ModelConfig:  types.AgentModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test-key"},
 		},
 		DomainAgent: pkgconfig.DomainAgentConfig{
 			ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test-key"},

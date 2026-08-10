@@ -605,3 +605,41 @@ func fileSize(info os.FileInfo) int64 {
 	}
 	return info.Size()
 }
+
+// ProfileHandler 处理 GET /api/profile — 返回用户画像全文（TODO #28 查看入口）。
+func (h *APIHandler) ProfileHandler(w http.ResponseWriter, r *http.Request) {
+	if h.sessionMgr == nil {
+		writeJSON(w, map[string]any{"content": ""})
+		return
+	}
+	p, err := h.sessionMgr.agent.Profile(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	content := ""
+	if p != nil {
+		content = p.Content
+	}
+	writeJSON(w, map[string]any{"path": p.Path, "content": content})
+}
+
+// SaveProfileHandler 处理 PUT /api/profile — 全量覆盖用户画像（TODO #28 可纠正，用户手动编辑）。
+func (h *APIHandler) SaveProfileHandler(w http.ResponseWriter, r *http.Request) {
+	if h.sessionMgr == nil {
+		http.Error(w, "session manager not wired", http.StatusInternalServerError)
+		return
+	}
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.sessionMgr.agent.SaveProfile(r.Context(), req.Content); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}

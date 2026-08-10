@@ -15,7 +15,7 @@
     - 多Agent协作：类似人类之间互相交流询问是否正确。例如：代码Agent完成代码后测试Agent进行测试,不明确具体测试方向时需要先把方案列出,给开发处方案的代码Agent是否符合代码Agent的逻辑,不符合代码Agent纠正,符合测试Agent测试Agent进行测试。测试结果代码Agent代码Agent对比是否与需求符合,不一致则代码Agent重新修正。复合后代码Agent返回给上级的领域Agent或者主Agent,期间各Agent可以反复询问,纠正,需要Agent在被询问时开一个协程进行回复,需要携带关键记忆或者协程Agent常驻共享代码Agent记忆,可评估。测试流程最为重要,查看现在的测试是否严谨与多重确认。代码Agent完成开发,找到固定助手的测试助手,先进行自测试,返回结果成功后返回给上级Agent,上级Agent按更大范围模块进行统一测试,哪个部分不行打回。
     - Agent执行任务,先拆解任务,拆解为不会干涉的单元任务后,一个单元任务使用一个干净上下文的Agent编码助手执行,压缩Token成本。执行完成后暂时不销毁,一定时间不使用直接消耗,有使用则重置使用时间并加长使用时间。原因：我在使用claude时,经常会有不切换会话在同一个会话使用重复上下文一直执行任务。越到后面越会上下文污染严重导致模型幻觉,并且上下文上每一次输入的Token成本也会激增。可评估是否可以替换块记忆,块记忆过于抽象,可用性与传统感觉不明显,。或者把块记忆与每个单独感觉上下文的Agent进行集成融合等尝试。现在的领域子Agent排发就相当于这个方案的初始模式,每个领域干净上下文负责自己的事。
 
-19. **Middleware 层抽象：统一拦截链（LLM 链 + 工具链）**（设计定稿 2026-08-08，待落地）
+19. **Middleware 层抽象：统一拦截链（LLM 链 + 工具链）**（✅ 已完成 2026-08-10：Phase 0 核心抽象 + LLM 链 generate 重试迁移落地；Phase 1 剩余迁移与 Tool 链列为后续，见 doc/变更.md 任务 14）
     - 背景：链路上所有拦截点以 `if name == "ReadFile"` 式硬编码散落在两处主链路——`agent/react_agent.go RunWithHistory` 主循环（:308-496）与 `tool/registry.go Dispatch`（:276）。记忆注入/窗口截断/配对修复/预算/重试/审计在 agent 侧，守卫/探索预算/连读检测/派发守卫在 tool 侧，无统一挂载点，新增横切逻辑只能继续塞 if；重试逻辑三层重复且策略不一致（`generate` 对 DeadlineExceeded 不重试 vs `retryProvider` 重试）；工具白名单仅过滤 Schema 不过滤 Dispatch（`tool_adapter.go:22-24` 注释自认可绕过）；`plugins/registry.go` 预留插件接口未接线。设计目标：**抽象为一个方法进行调用**，链式可读（`middleware.Validate().RAG().Assemble().Call(...)`），任意扩展。
     - 核心抽象（新包 `backend/internal/middleware/`，洋葱模型，泛型，纯标准库）：
 
@@ -75,7 +75,7 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 验收：新增横切逻辑只需实现 `Middleware[C]` 并 `Use()`，不改主循环/ Dispatch 本体代码；链式调用形态如上示例；全量测试绿 + TUI 塔防任务回归。
 
 
-20. **"domain 一直读文件不写直到超时"事故根治：LoopExit 接线 + 失败打捞 + 重派继承**（P0，bug，2026-08-08 分析发现 + 当日 TUI 实证事故）
+20. **"domain 一直读文件不写直到超时"事故根治：LoopExit 接线 + 失败打捞 + 重派继承**（✅ 已完成 2026-08-10，doc/变更.md 任务 6）
     - 事故还原：domain 一直阅读文件不写 → 探索预算守卫（8 次）早已触发但 LoopExit 是死代码杀不死循环 → 空转每轮白烧 LLM 调用 → 有活动心跳不杀、token 预算未耗尽，只能等 `sub_agent_timeout_min: 60` 墙钟终止 → 超时只回传最后一条 assistant 文本截断 500 runes（`dispatcher.go:1280-1288`），**已读文件与结论全丢**（事实提取只在成功路径跑，`dispatcher.go:1501-1576`）→ MetaAgent 中途无感知无手段，60 分钟后自由心证细粒度重派，新 Agent 从空白上下文重新探索，浪费翻倍。
     - 第一层：LoopExit 死代码接线（原 #20 内容，治本——空转活不过探索预算）。背景：三层循环守卫——连读同一文件 ×3（`tool/registry.go:296-330`）、探索预算 8 次（`:332-348`）、单工具连续失败 ×3（`:386-399`）——都试图经 `tools.ActionLoopExit` 终止 ReAct 循环，但**全项目无 `tools.NewContext` 调用方**，`tools.FromContext` 永远失败，信号被静默丢弃（`:319-321`、`:395-397`），守卫退化为一句错误文本。执行：
       1. 定哨兵：`tool` 包加 `var ErrLoopExit = errors.New("loop guard: force exit")`；三处守卫命中时删掉写 ctx ActionLoopExit 的旧代码，改为返回包装哨兵（`fmt.Errorf("%w: %s", ErrLoopExit, msg)`），给 LLM 看的提示文案不变。
@@ -97,7 +97,7 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 验收：`backend/` 与 `test/` 双模块 `go test ./...` 绿；TUI 重现场景——人为让 domain 空转，探索预算耗尽即分钟级终止（不再等 60min），父收到含打捞摘要的失败消息，重派 Agent 任务文本带前序摘要。
     - 不做：不调三层守卫阈值/语义（3 次/8 次/3 连败维持现状）；不引入 blades `tools.NewContext` 机制；不做 MetaAgent 中途干预（#25 的 cancel_agent 覆盖，本项落地后空转活不到需要干预）；打捞不进块记忆召回（等 #17 P0 outcome 字段）；不改 `sub_agent_timeout_min` 配置。
 
-21. **验收闭环：verifyloop 默认启用 + 按 spec 验收标准验收**（P0；吸收 #2 phase 2 与 #16 相关开放动作）
+21. **验收闭环：verifyloop 默认启用 + 按 spec 验收标准验收**（✅ 已收口 2026-08-10：前提被 cc8dde7 移除接线推翻【A/B 实证负资产】；落地 ExecuteChild 入树 + spec 强制验收，doc/变更.md 任务 8）
     - 背景：`verify_and_fix` + verifyloop 状态机（PlanConfirm→Review→SelfTest→UnifiedTest→Fix，≤5 轮，`verifyloop/orchestrator.go:202-325`）代码完整，但 `config/config.yaml:72-73` 两个 self_test 开关 false → `bootstrap.go:290-291` 不注册工具。当前 MetaAgent 只能盲信子 Agent 自述完成，唯一证据是 FilesModified 列表。隐患：`bootstrap.go:327` `ReviewEnabled == nil || *ReviewEnabled` 在 nil 时启用 reviewer，靠 applyDefaults 兜底掩盖。
     - 执行流程：
       1. 修隐患：`bootstrap.go:327` 改显式布尔判断，补单测覆盖 nil/显式 true/显式 false 三态。
@@ -109,7 +109,7 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 验收：开关默认 true；塔防全流程 `verify_and_fix` 至少触发一次且终答附验证证据；双模块测试绿。
     - 不做：不引入独立 Critic Agent 角色（verifyloop 即"固定流程折叠为工具"的既有正确范式）；不强制非编码类任务走 verify。
 
-22. **真·执行计划：board.TaskBoard 接线 + 依赖派发门 + 面板真实进度**（P1）
+22. **真·执行计划：board.TaskBoard 接线 + 依赖派发门 + 面板真实进度**（✅ 已完成 2026-08-10，doc/变更.md 任务 11）
     - 背景：运行时无计划——`pkg/types/plan.go:3-4` 自我宣布退役；`board/board.go` 完整实现 TaskBoard（goal/约束/subtask/`DependsOn` `board.go:57`/状态重算/Brief）但生产零写入（`runtime/runtime.go:87` 只构造）；TUI"执行计划"面板是 Agent 树临时合成的派发日志（`tui/helpers.go:69-104`），"总体进度"恒为装饰；任务排序纯靠提示词自觉（`role/registry.go:46`），并行派发无依赖门（#16 实证：MetaAgent 未等回传重复派发渲染引擎 ×3 互相覆盖，当时同域去重治标，依赖门治本）。
     - 执行流程：
       1. Phase 0 写入侧：新增 MetaAgent 工具 `write_plan`（meta 白名单，`role/registry.go:196-204`），入参 = 子任务数组 `{id, title, domain, depends_on[], acceptance}`，实现调 `board.Manager.GetOrCreate` + `AddSubTask` 现有 API；校验失败（环依赖/未知依赖 id）返错误。meta prompt 加"拆任务先 write_plan 再派发"。
@@ -120,7 +120,7 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 验收：塔防任务 TUI 面板显示真实子任务与进度百分比；依赖未满足时派发被拒；双模块绿。
     - 不做：不动 `pkg/types/plan.go`；DAG 不跨 session（`dag/` 包是会话级 cron 调度，不碰）；不做关键路径/甘特图等可视化增强。
 
-23. **结构化失败 + 自动重试 + 升级路径**（P1）
+23. **结构化失败 + 自动重试 + 升级路径**（✅ 已完成 2026-08-10，doc/变更.md 任务 7）
     - 背景：子 Agent 失败回传是一段自然语言（`formatSubAgentFailure`，`dispatcher.go:1280-1288`），无类型无错误码；全库无自动 retry/fallback/escalation，失败后怎么办全靠 LLM 当场发挥（`react_agent.go:948` 仅提示词）；`MsgEscalate`/`MsgMilestone`/`MsgDependency` 定义了从不发送；`errLimitReached` 哨兵（`dispatcher.go:1266`）有匹配无产出，死代码；发给已死 Agent 的消息静默消失。
     - 执行流程：
       1. 失败类型化：`dispatcher` 加 `FailureKind`（timeout/error/budget_partial/killed/loop_guard）；`treeFinish` Failed 时 mailbox body 头部加一行机读标记（`[failure kind=timeout retryable=false]`）+ 原有人读文本（父 LLM 消费习惯不变）。
@@ -132,7 +132,7 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 验收：人为制造一次叶子失败，日志可见自动重派 1 次 + 父收到结构化失败；双模块绿。
     - 不做：不做指数退避/多档重试（只此一档一次）；不做熔断器（轻量模型 402 熔断 `pipeline.go` 已有范式，需要时再说）；MsgMilestone/MsgDependency 维持不用不删（见 #26）。
 
-24. **人在回路：ask_user 工具 + 工具审批门通用机制**（P1）
+24. **人在回路：ask_user 工具 + 工具审批门通用机制**（✅ 已完成 2026-08-10，doc/变更.md 任务 10）
     - 背景：Dispatch 无审批钩子（`tool/registry.go:276-405` 守卫直连执行）；无 ask-user 工具；`PendingClarify` 恒 nil（`service_react.go:1542` 硬编码），`awaiting_clarify` 被挪作"暂停等继续"（`pauseSession :1199-1216`）；TUI `/clarify`（`tui/input.go:273-278`）dormant。自动写文件跑命令的系统全程无人类检查点。与 #17 P1 关系：本项提供通用提问/确认通道，#17 P1（destructive 工具生产边界确认）作为其消费者落地，不重复建设；与 #19 中间件兼容（审批即 Tool 链一环）。
     - 执行流程：
       1. 会话态正名：`pauseSession` 的 PauseKind（#15 已有 IterationLimit/TokenBudget/OnChild）新增 `Clarify`，复用 `awaiting_clarify` 状态但真实填充 `PendingClarify{Question, Context}`（替换 `:1542` 硬编码 nil）；用户任意回复走 #15 既有恢复路由。
@@ -142,7 +142,7 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
       5. 测试：ask_user 暂停→答复→工具结果闭环；approvalHook nil 零行为变化；destructive 命中暂停等确认、拒绝返错；TUI 手测。
     - 不做：不做多步表单/多选问题（一问一答文本即可）；不做权限角色矩阵；web 前端同步改造列开放动作。
 
-25. **MetaAgent 控制面 + 全局硬终止**（P1）
+25. **MetaAgent 控制面 + 全局硬终止**（✅ 已完成 2026-08-10，doc/变更.md 任务 9）
     - 背景：MetaAgent 无取消子 Agent 的工具（`CancelAgent` 仅 HTTP `server/session_http.go:307`，TUI 不调用）；子 Agent `context.Background()` 脱离会话（`dispatcher.go:852-859`），用户取消会话杀不死在跑子 Agent（残留 goroutine 烧 token 直到 60min 超时）；心跳巡检只覆盖叶子（`:883-890` 注释：domain 有 wait loop 注入会误杀）；`tool_call_max_rounds: -1` 迭代无上限 + 无会话墙钟，唯一兜底是 token 预算→暂停，系统永远不会主动止损。
     - 执行流程：
       1. `cancel_agent` 工具（meta/domain 白名单）：入参 agent_id → `Tree.Cancel`（`orchestrator/tree.go:225-249`）+ `doneOnce.Do(trackChildDone)` 计数兜底（参照 `killStuckSubAgent` `:283-305` 模式）+ mailbox 通知父"已被上级取消"。
@@ -153,7 +153,7 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 验收：TUI 塔防回归 + 人为挂起一个 domain 验证心跳与止损；双模块绿。
     - 不做：不做抢占式优先级/调度器；不改 detach ctx 基本设计（pause/resume 依赖它）。
 
-26. **一致性收尾：文案/开关/legacy 清理**（P2）
+26. **一致性收尾：文案/开关/legacy 清理**（✅ 已完成 2026-08-10，doc/变更.md 任务 5）
     - 背景：一批"开关与文案/配置不一致"的小项，单独立项不值，放着会持续误导（LLM 读工具描述、人读注释）。
     - 执行流程：
       1. spec 强制对齐：`call_sub_agent` 工具描述声称 WriteSpec 强制（`dispatcher.go:735`）与 `spec_enforcement_enabled: false`（`config.yaml:85`）矛盾——决策：塔防实证 spec 有用，倾向开 true 跑回归；若过度阻塞则改工具描述为"建议"。同步修 `bootstrap.go:255-256` 陈旧注释"默认 true"。
@@ -165,7 +165,7 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 验收：roles.yaml 改动跑 `test/` 的 role_config_sanity_test.go；双模块测试绿；无行为回归。
     - 不做：本项不加任何新功能。
 
-27. **外部知识库检索层：唤醒 retriever 抽象 + 混合检索 + 接编排热路径**（P2，2026-08-08）
+27. **外部知识库检索层：唤醒 retriever 抽象 + 混合检索 + 接编排热路径**（✅ 已完成 2026-08-10：摄入/tsvector+pgvector RRF 混合/search_knowledge 工具；RAG() 第二数据源列开放动作，doc/变更.md 任务 13）
     - 背景：接口抽象已存在但 dormant——`internal/retriever/global_kb.go`（VectorDB/Embedder/MetaStore 三接口 + `GlobalKnowledgeRetriever`）与 `store.KnowledgeStore`（PG+pgvector 全局知识表）是现成底座，当前只服务块记忆（内部记忆）写读；扩展设计 §11 的 LLM wiki 决策「不上向量库」指 wiki 文件层本身，且 `embed`/`retriever` 本就留作 §11.1 触发器储备。缺的是**面向外部预置知识（只读为主、与块记忆分层）的检索通路**：无摄入 pipeline、无全文/混合检索（纯向量 + pseudo embed，见 #26-5）、编排热路径无消费方（#19 的 `RAG()` 中间件只有块记忆数据源，无 search_knowledge 工具）。
     - 执行流程：
       1. 存储隔离：复用 knowledge 表加 `namespace`/`source` 字段（或独立 external chunks 表，取简）区分外部知识与块记忆；migrations 加迁移。
@@ -177,7 +177,7 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 不做：不做知识图谱/实体抽取（需要显式结构时评估 LightRAG 作为 retriever 另一实现，列开放动作）；不推翻 §11 wiki 决策（wiki 渐进披露保留，向量检索是补充不是替代）；不接 RAGFlow/Dify 等平台（需要时同为 retriever 实现选项）；不动块记忆 pseudo 召回（归 #26-5）。
     - 开放动作：LightRAG 评估；rerank 接线；web 端知识库管理页；`search_knowledge` 与 `RAG()` 双通路中未先落地的一条。
 
-28. **用户画像层：记忆体系第四层（外部知识库/块记忆/wiki 之外补「人」）**（P2，2026-08-08）
+28. **用户画像层：记忆体系第四层（外部知识库/块记忆/wiki 之外补「人」）**（✅ 已完成 2026-08-10，doc/变更.md 任务 12）
     - 背景：现有三层记忆的主体都是「事/知识」——外部知识库（#27，预置参考）、块记忆（任务经验流）、LLM wiki（§11 策展沉淀）——缺主体为「人」的画像层：MetaAgent 对用户偏好（沟通风格/技术栈/确认频率/任务拆解粒度）零感知，每轮会话从零对待用户。伏笔已有：§11.2 引 TencentDB Agent Memory 四层管道 L3 即用户画像；`soul.md` 的 `agent.PersonaInjector`（#7）已验证 system prompt 注入机制可复用。
     - 与既有层关系（防重合）：画像不进向量库、不作检索语料（小体量结构化偏好，非知识条目）；不写 wiki（非项目知识）；不写块记忆（非任务经验）。四层各司其职：图书馆 / 工作日志 / 策展笔记 / 用户档案。
     - 执行流程：

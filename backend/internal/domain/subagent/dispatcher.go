@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"  // unicode/utf8 用于 RuneCountInString 统计 task 字符数
 
 	"github.com/blockmemory/agent/backend/internal/agent"               // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
+	"github.com/blockmemory/agent/backend/internal/board" // board 提供任务看板（TODO #22 执行计划）
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // orchestrator 提供 Agent 树元数据层
 	"github.com/blockmemory/agent/backend/internal/domain/role"         // role 包提供角色注册表
 	"github.com/blockmemory/agent/backend/internal/domain/tool"         // tool 包提供工具注册表与 Result 类型
@@ -158,6 +159,13 @@ type Dispatcher struct {
 	// 为 nil 时关闭树跟踪（测试场景），不影响派发主流程。
 	treeFn func(sessionID string) *orchestrator.Tree
 
+	// boardFn 按 sessionID 取得会话任务看板（TODO #22 执行计划）。
+	// 为 nil 时关闭计划功能（依赖门/回写/写计划工具均零行为变化）。
+	boardFn func(sessionID string) *board.TaskBoard
+	// boardFnCreate 按 sessionID 取或创建看板（write_plan 工具用）。
+	// 为 nil 时 write_plan 返回 board not available。
+	boardFnCreate func(sessionID, goal string) *board.TaskBoard
+
 	// msgStore 持久化 Paused DomainAgent 的完整 ReAct 消息历史。
 	// DomainAgent 触达 token 上限时 SaveMessages 落库,resume 时 LoadMessages 重建上下文。
 	// 为 nil 时跳过持久化(测试场景:domain 到限仍返 errPaused 但 history 不存,无法 resume)。
@@ -171,15 +179,28 @@ type Dispatcher struct {
 	// maxPausedResumes 同一 Paused domain 允许的最大续跑次数；<=0 时按默认值 1。
 	maxPausedResumes int
 
+	// dispatchRetryCount 叶子助手 kind=error 失败的自动重派次数（TODO #23，最小一档）。
+	// 同任务同前缀重跑一次；domain/timeout/killed/loop_guard 不自动重试（交 MetaAgent 决策）。
+	// 与 LLM 调用层重试（react_agent retry_count）正交：那层重试的是模型调用本身。
+	dispatchRetryCount int
+
 	// factExtractor 从子 Agent 输出中提取关键事实，替代原始 result.Text 直接落库。
 	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
 	// 提取失败（LLM 出错或返回空）自动回退原始保存，保证不丢结果。
 	factExtractor FactExtractor
 
+	// salvageExtractor 从失败子 Agent 输出中提取打捞摘要（已读文件清单/已得结论/卡点）。
+	// 为 nil 时回退末条 assistant 文本截断；bootstrap 注入轻量模型实现（prompt 与事实提取不同）。
+	salvageExtractor SalvageExtractor
+
 	// heartbeatTimeout 子 Agent 心跳超时：叶子 Agent 超过该时长无活动（generateOnce/工具派发）
 	// 判定假死（LLM 流式挂起/工具 hang），巡检 goroutine 主动 cancel + notify 父 + trackChildDone，
 	// 比等满 sub_agent_timeout（默认 60min）早暴露。<=0 关闭巡检（测试场景默认关闭）。
 	heartbeatTimeout time.Duration
+	// domainHeartbeatTimeout DomainAgent 心跳超时（TODO #25-3 防误杀版）：
+	// 默认 2× 叶子——domain 等子/等回信期间自身无 LLM/工具活动，靠后代活动冒泡保活；
+	// 后代全静默后超该阈值才判假死。<=0 时按 2× heartbeatTimeout 兜底。
+	domainHeartbeatTimeout time.Duration
 	// activity 存叶子子 Agent 最后活动时间戳（unix nano），键 subAgentID -> *atomic.Int64。
 	// 仅叶子 Agent 注入（DomainAgent/MetaAgent 有 wait loop 不注入，避免误杀合法等待）。
 	activity sync.Map
@@ -246,6 +267,34 @@ func (d *Dispatcher) WithHeartbeatTimeout(t time.Duration) *Dispatcher {
 	return d
 }
 
+// WithDomainHeartbeatTimeout 配置 DomainAgent 心跳超时（TODO #25-3 防误杀版）。
+// <=0 时按 2× heartbeatTimeout 兜底；bootstrap 从 config.DomainHeartbeatTimeoutMin 注入。
+func (d *Dispatcher) WithDomainHeartbeatTimeout(t time.Duration) *Dispatcher {
+	d.domainHeartbeatTimeout = t
+	return d
+}
+
+// bubbleActivity 把子 Agent 活动沿 parentID 链向上冒泡（TODO #25-3）：
+// domain 等子/等回信期间自身无 LLM/工具活动，靠后代活动刷新保持存活；
+// 后代全静默后 domain 超其阈值才判假死。subMeta 缺失或链顶（meta/会话）终止。
+func (d *Dispatcher) bubbleActivity(agentID string, now int64) {
+	cur := agentID
+	for depth := 0; depth < 32; depth++ { // 深度上限防御（三层 Agent 树足够）
+		v, ok := d.subMeta.Load(cur)
+		if !ok {
+			return
+		}
+		meta := v.(*subAgentMeta)
+		if meta.parentID == "" {
+			return
+		}
+		if av, ok := d.activity.Load(meta.parentID); ok {
+			av.(*atomic.Int64).Store(now)
+		}
+		cur = meta.parentID
+	}
+}
+
 // ensurePatrol 幂等启动心跳巡检 goroutine：仅 heartbeatTimeout>0 时启动，Dispatcher 生命周期内一次。
 func (d *Dispatcher) ensurePatrol() {
 	if d.heartbeatTimeout <= 0 {
@@ -284,14 +333,24 @@ func (d *Dispatcher) patrol() {
 }
 
 // scanStuck 扫描 activity map，对超阈值无活动的子 Agent 执行 killStuckSubAgent。
+// 叶子按 heartbeatTimeout；domain 按 domainHeartbeatTimeout（默认 2× 叶子，
+// 等子/等回信期间靠后代活动冒泡保活，防误杀合法等待，TODO #25-3）。
 func (d *Dispatcher) scanStuck() {
 	if d.heartbeatTimeout <= 0 {
 		return
 	}
-	threshold := time.Now().Add(-d.heartbeatTimeout).UnixNano()
+	now := time.Now().UnixNano()
+	domainThreshold := d.domainHeartbeatTimeout
+	if domainThreshold <= 0 {
+		domainThreshold = 2 * d.heartbeatTimeout
+	}
 	d.activity.Range(func(k, v any) bool {
 		act := v.(*atomic.Int64)
-		if act.Load() > threshold {
+		threshold := d.heartbeatTimeout
+		if roleIDFromAgentID(k.(string)) == "domain" {
+			threshold = domainThreshold
+		}
+		if act.Load() > now-int64(threshold) {
 			return true // 仍活跃
 		}
 		d.killStuckSubAgent(k.(string))
@@ -312,11 +371,26 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
 		subAgentID, meta.parentID, d.heartbeatTimeout)
 	meta.cancel()
 	meta.doneOnce.Do(func() { d.trackChildDone(meta.parentID) })
-	d.notify(meta.parentID, subAgentID,
-		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, d.heartbeatTimeout), nil)
+	killMsg := failureMarker(FailureKindKilled, false) + "\n" +
+		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, d.heartbeatTimeout)
+	d.notify(meta.parentID, subAgentID, killMsg, nil)
 	if d.treeFn != nil && meta.sessionID != "" {
 		if t := d.treeFn(meta.sessionID); t != nil {
 			t.Finish(subAgentID, "心跳超时疑似卡死", errors.New("heartbeat timeout"))
+		}
+	}
+	// 失败打捞（kill 场景）：从树节点取 domain，以 kill 消息文本作回退摘要写槽位，
+	// 供同域重派带前序摘要；goroutine 若尊重 cancel 会经 runSubAgent 失败路径覆盖为真实摘要。
+	if d.treeFn != nil && meta.sessionID != "" {
+		if t := d.treeFn(meta.sessionID); t != nil {
+			for _, n := range t.Snapshot() {
+				if n.ID != subAgentID {
+					continue
+				}
+				d.salvageFailure(context.Background(), meta.parentID, subAgentID,
+					types.RoleDefinition{ID: n.Role}, n.Domain, agent.ReactResult{}, killMsg)
+				break
+			}
 		}
 	}
 	d.activity.Delete(subAgentID)
@@ -530,6 +604,15 @@ func (d *Dispatcher) WithTree(fn func(sessionID string) *orchestrator.Tree) *Dis
 	return d
 }
 
+// WithBoard 注入任务看板访问器（TODO #22 执行计划）。
+// get 按 sessionID 取既有看板（无则 nil）；create 取或创建（write_plan 工具用）。
+// 传 nil 关闭计划功能（默认关闭）：依赖门/回写/写计划工具零行为变化。
+func (d *Dispatcher) WithBoard(get func(sessionID string) *board.TaskBoard, create func(sessionID, goal string) *board.TaskBoard) *Dispatcher {
+	d.boardFn = get
+	d.boardFnCreate = create
+	return d
+}
+
 // WithMessagesStore 注入 Paused DomainAgent 消息历史持久化层。
 // DomainAgent 触达 token 上限时 SaveMessages 落库,resume 时 LoadMessages 重建上下文。
 // 为 nil 时跳过持久化(测试场景)。
@@ -543,6 +626,21 @@ func (d *Dispatcher) WithMessagesStore(s agent.MessagesStore) *Dispatcher {
 // 传 nil 关闭提取（默认关闭），saveBlockMemory 回退原始文本保存。
 func (d *Dispatcher) WithFactExtractor(e FactExtractor) *Dispatcher {
 	d.factExtractor = e
+	return d
+}
+
+// WithDispatchRetryCount 设置叶子助手 kind=error 失败的自动重派次数（TODO #23）。
+// n<=0 关闭自动重派（默认关闭，测试场景）；bootstrap 按 cfg.Agent.DispatchRetryCount 注入。
+func (d *Dispatcher) WithDispatchRetryCount(n int) *Dispatcher {
+	d.dispatchRetryCount = n
+	return d
+}
+
+// WithSalvageExtractor 注入失败打捞提取器，使失败路径（超时/被杀/守卫终止）尝试
+// LLM 提取打捞摘要（已读文件/已得结论/卡点）写入共享槽位并回灌父 mailbox。
+// 传 nil 关闭 LLM 提取（默认关闭），回退末条 assistant 文本截断。
+func (d *Dispatcher) WithSalvageExtractor(e SalvageExtractor) *Dispatcher {
+	d.salvageExtractor = e
 	return d
 }
 
@@ -566,7 +664,7 @@ func (d *Dispatcher) WithSpecEnforcement(enabled bool) *Dispatcher {
 
 // RegisterCallTool 将 call_sub_agent / call_sub_agents 工具安装到传入的工具注册表中。
 // 工具被注册到父 Agent 与子 Agent 共同使用的 registry 上，
-// 因此子 Agent 还能继续生成自己的子 Agent，形成任意深度的递归调用。
+// 递归深度固定三层：MetaAgent -> DomainAgent -> 叶子助手（CanCall 拒绝 domain->domain 平级派发）。
 func (d *Dispatcher) RegisterCallTool(r *tool.Registry) {
 	// 注册 callSubAgentTool / callSubAgentsTool 实例，工具内部持有当前 Dispatcher 以便执行时调用。
 	r.Register(&callSubAgentTool{dispatcher: d})
@@ -597,11 +695,12 @@ func (t *sendMessageTool) Aliases() []string { return []string{"send_msg"} }
 
 // Description 返回 LLM 可见的工具描述。
 func (t *sendMessageTool) Description() string {
-	return "向另一个 Agent 实例的邮箱投递一条消息（请求或通知），立即返回。" +
+	return "向另一个 Agent 实例的邮箱投递一条消息（请求/通知/升级），立即返回。" +
 		"用于多 Agent 协作验证闭环：例如代码 Agent 完成后可向测试 Agent 发送验证请求，" +
 		"测试 Agent 在下一轮 ReAct 迭代中 Drain 收件箱即可看到该消息并据此回复。" +
 		"参数 to_agent_id 为目标 Agent 实例 ID（即 call_sub_agent 返回的 sub_agent_id，或父 Agent ID）；" +
-		"subject 为一行摘要；body 为详情正文（可空）。"
+		"subject 为一行摘要；body 为详情正文（可空）；message_type 可选 info（单向通知）/reply（回复）/escalate（升级求助，父 Agent 收到 [升级] 前缀消息需按规程处置）。" +
+		"目标 Agent 已销毁时返回\"消息未送达\"。"
 }
 
 // Execute 执行 send_message 工具调用。
@@ -624,18 +723,20 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 		return &tool.Result{Tool: "send_message", Error: "missing caller agent context"}
 	}
 
-	// message_type 可选：默认 request（期望回复）；显式 "info" 时为单向通知。
+	// message_type 可选：默认 request（期望回复）；"info" 单向通知；"reply" 回复；"escalate" 升级请求。
 	msgType := mailbox.MsgRequest
 	if mt, _ := args["message_type"].(string); mt == "info" {
 		msgType = mailbox.MsgInfo
 	} else if mt == "reply" {
 		msgType = mailbox.MsgReply
+	} else if mt == "escalate" {
+		msgType = mailbox.MsgEscalate
 	}
 
 	// thread_id 可选：同一问答链上的消息共享 ThreadID，便于多轮验证闭环聚合。
 	threadID, _ := args["thread_id"].(string)
 
-	id := d.mailbox.Send(&mailbox.Message{
+	id, err := d.mailbox.Send(&mailbox.Message{
 		From:     fromID,
 		To:       toID,
 		Type:     msgType,
@@ -644,11 +745,96 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 		ReplyTo:  fromID,
 		ThreadID: threadID,
 	})
+	if err != nil {
+		// 死信可见（TODO #23）：目标已销毁时告知发送方，不再静默消失。
+		return &tool.Result{Tool: "send_message", Error: fmt.Sprintf("消息未送达: %v", err)}
+	}
 
 	return &tool.Result{
 		Tool:    "send_message",
 		Success: true,
 		Output:  id,
+	}
+}
+
+// RegisterControlTool 将 cancel_agent 工具安装到传入的工具注册表中。
+// 供 MetaAgent/DomainAgent 主动取消失控/不再需要的子 Agent（TODO #25 控制面）。
+func (d *Dispatcher) RegisterControlTool(r *tool.Registry) {
+	r.Register(&cancelAgentTool{dispatcher: d})
+}
+
+// cancelAgentTool 实现 cancel_agent 工具：取消指定子 Agent（树节点 + cancel func + 父计数兜底）。
+// 目标已 terminal 或不存在时返回错误；取消后父 mailbox 收到"已被上级取消"通知。
+type cancelAgentTool struct {
+	dispatcher *Dispatcher
+}
+
+// Name 返回工具名称。
+func (t *cancelAgentTool) Name() string { return "cancel_agent" }
+
+// Aliases 返回工具别名列表，当前无别名。
+func (t *cancelAgentTool) Aliases() []string { return nil }
+
+// Description 返回 LLM 可见的工具描述。
+func (t *cancelAgentTool) Description() string {
+	return "取消一个正在运行的子 Agent（输入 call_sub_agent 返回的 sub_agent_id）。" +
+		"适用场景：子 Agent 跑偏/失控/不再需要（如需求变更）时主动止损。" +
+		"取消后该子 Agent 任务终止，父 Agent 会收到其失败回传；已完成的 Agent 无法取消。"
+}
+
+// Execute 执行 cancel_agent 工具调用。
+// 参数 args 由大模型提供，包含 agent_id。
+func (t *cancelAgentTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
+	d := t.dispatcher
+	agentID, _ := args["agent_id"].(string)
+	if agentID == "" {
+		return &tool.Result{Tool: "cancel_agent", Error: "agent_id is required"}
+	}
+	if d.treeFn == nil {
+		return &tool.Result{Tool: "cancel_agent", Error: "agent tree not available"}
+	}
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		if i := strings.Index(agentID, "/"); i > 0 {
+			sid = agentID[:i]
+		}
+	}
+	tr := d.treeFn(sid)
+	if tr == nil {
+		return &tool.Result{Tool: "cancel_agent", Error: "agent tree not available for session"}
+	}
+	// 父 ID 从调用方 ctx 取：取消动作的发起者。
+	callerID := agent.AgentIDFromContext(ctx)
+	// 从树快照取节点父 ID（通知父"已被上级取消"）。
+	parentID := ""
+	for _, n := range tr.Snapshot() {
+		if n.ID == agentID {
+			parentID = n.ParentID
+			break
+		}
+	}
+	if !tr.Cancel(agentID) {
+		return &tool.Result{Tool: "cancel_agent", Error: fmt.Sprintf("agent %s 不存在或已终止，无需取消", agentID)}
+	}
+	// 计数兜底（参照 killStuckSubAgent）：子 Agent 若挂起不尊重 ctx，父 PendingChildren
+	// 由此处 doneOnce 递减，父终结保护不会永久阻塞。
+	if metaV, ok := d.subMeta.LoadAndDelete(agentID); ok {
+		meta := metaV.(*subAgentMeta)
+		meta.doneOnce.Do(func() { d.trackChildDone(meta.parentID) })
+	}
+	if parentID != "" && d.mailbox != nil {
+		_, _ = d.mailbox.Send(&mailbox.Message{
+			From:    callerID,
+			To:      parentID,
+			Type:    mailbox.MsgInfo,
+			Subject: "子 Agent 被取消: " + agentID,
+			Body:    failureMarker(FailureKindKilled, false) + "\n子 Agent " + agentID + " 已被上级取消，任务终止。",
+		})
+	}
+	return &tool.Result{
+		Tool:    "cancel_agent",
+		Success: true,
+		Output:  "已取消 " + agentID,
 	}
 }
 
@@ -783,6 +969,15 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		return "", &tool.Result{Error: fmt.Sprintf("role %s cannot be called by %s", roleID, parentID)}
 	}
 
+	// 派发依赖门（TODO #22 Phase 1）：计划中该领域子任务的 depends_on 未全部完成时拒绝，
+	// 提示等谁（实证：MetaAgent 未等回传重复派发渲染引擎×3 互相覆盖——依赖门治本）。
+	// 无计划（board nil/领域未覆盖）零行为变化；拒绝不烧派发配额。
+	if roleID == "domain" {
+		if gate := d.checkDepGate(ctx, parentID, domain); gate != "" {
+			return "", &tool.Result{Error: gate}
+		}
+	}
+
 	// 重复派发去重：同一父 Agent 已有同领域（domain 相同）的子 Agent 在执行/暂停中时拒绝。
 	// 实证：MetaAgent 未等 mailbox 回传即重复派发同一任务（渲染引擎×3、游戏逻辑×2），
 	// 多个子 Agent 并发写同一批文件互相覆盖、接口漂移。Agent 树是权威状态，直接查快照，
@@ -793,6 +988,9 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 				"duplicate dispatch: 同领域子 Agent %s 正在执行中（domain=%s）。请等待其 [mailbox from %s] 回传结果后再做下一步；如需补充或修正需求，等其完成后再派发",
 				dup, domain, dup)}
 		}
+		// 前序失败打捞（TODO #20 第三层）：同父同 domain 存在 Failed/Cancelled 兄弟时，
+		// 把其打捞摘要（<parentID>:salvage:<domain>）追加到新任务文本，机制上保证重派不重复探索。
+		task = d.withPriorSalvage(ctx, parentID, domain, task)
 	}
 
 	// 全局派发总数限额：同一 session 内所有角色的派发合计超过 maxTotalDispatches 时拒绝。
@@ -850,12 +1048,14 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 			}
 		}
 	}
-	// 心跳检活元数据：subMeta 存 cancel/parentID/sessionID/doneOnce 供巡检卡死时兜底；
-	// activity 仅叶子 Agent 存（DomainAgent/MetaAgent 有 wait loop 不存，避免误杀合法等待）。
-	isLeaf := roleDef.ID != "domain" && roleDef.ID != "meta"
+	// 心跳检活元数据：subMeta 存 cancel/parentID/sessionID/doneOnce 供巡检卡死时兜底。
+	// activity：所有非 meta 子 Agent 注册（TODO #25-3 domain 防误杀版）——叶子活动沿
+	// parentID 链向上冒泡刷新祖先时间戳，domain 等子/等回信期间靠后代活动保持存活；
+	// 自身无 LLM/工具活动且无活跃后代超阈值才判假死。meta 不注册（会话级由用户/墙钟控制）。
+	isMeta := roleDef.ID == "meta"
 	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(ctx)}
 	d.subMeta.Store(subAgentID, meta)
-	if isLeaf {
+	if !isMeta {
 		act := new(atomic.Int64)
 		act.Store(time.Now().UnixNano())
 		d.activity.Store(subAgentID, act)
@@ -969,7 +1169,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 // 返回 paused=true 表示 DomainAgent 触达 token 上限进入 Paused(已存 history + tree.Pause),
 // 调用方不应 trackChildDone(保持父未决计数 >0 触发 MetaAgent 暂停)。
 func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string, started time.Time) bool {
-	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
+	result, err, retried := d.runSubAgentWithAutoRetry(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
 	// Layer 5：从子 Agent 历史扫 WriteFile 调用收集修改文件，随完成通知回灌父 LLM。
 	files := agent.FilesModifiedFromHistory(result.History)
 	duration := time.Since(started)
@@ -987,13 +1187,30 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		return false
 	}
 	if err != nil {
+		// 取消路径（会话取消/cancel_agent/心跳杀）：通知与树收尾由取消方负责，
+		// 此处跳过避免双通知与覆盖 Cancelled 状态（TODO #25 控制面）。
+		if errors.Is(err, context.Canceled) {
+			log.Printf("[subagent] CANCELLED: sub=%s role=%s duration=%s", subAgentID, roleDef.ID, duration)
+			return false
+		}
 		partial := ""
 		if result.History != nil {
 			partial = truncateRunes(agent.LastAssistantText(result.History), 500)
 		}
-		log.Printf("[subagent] FAIL: sub=%s role=%s duration=%s err=%v partial=%q", subAgentID, roleDef.ID, duration, err, truncateRunes(partial, 200))
+		log.Printf("[subagent] FAIL: sub=%s role=%s duration=%s retried=%t err=%v partial=%q", subAgentID, roleDef.ID, duration, retried, err, truncateRunes(partial, 200))
+		// 失败打捞（TODO #20 第二层）：提取已读文件/已得结论/卡点摘要双路送达——
+		// 写共享槽位 <parentID>:salvage:<domain> 供同域重派带前序摘要；追加进父 mailbox 失败消息。
+		salvage := d.salvageFailure(ctx, parentID, subAgentID, roleDef, domain, result, partial)
+		// 结构化失败（TODO #23）：头部机读标记 [failure kind=X retryable=Y]，人读文案在后。
+		kind := failureKindOf(err)
+		retryable := kind == FailureKindError && roleDef.ID != "domain" && roleDef.ID != "meta" && ctx.Err() == nil
+		msg := failureMarker(kind, retryable) + "\n" + formatSubAgentFailure(err, result, d.timeout, partial)
+		if salvage != "" {
+			msg += "\n\n" + salvagePrefixMarker + salvage
+		}
+		d.boardUpdate(ctx, parentID, domain, false, truncateRunes(msg, 300))
 		d.treeFinish(ctx, subAgentID, partial, err)
-		d.notify(parentID, subAgentID, formatSubAgentFailure(err, result, d.timeout, partial), files)
+		d.notify(parentID, subAgentID, msg, files)
 		return false
 	}
 
@@ -1001,9 +1218,30 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	// meta 整品验收+返工，见 roles.yaml 提示词），完成路径不再自动派验证 Agent——
 	// A/B 实证自动验证闭环是负资产（开 5/16 vs 关 16/16），机制移至扩展设计文档 §12 作后期扩展。
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
+	d.boardUpdate(ctx, parentID, domain, true, result.Text)
 	d.treeFinish(ctx, subAgentID, result.Text, nil)
 	d.notify(parentID, subAgentID, result.Text, files)
 	return false
+}
+
+// runSubAgentWithAutoRetry 包装 runSubAgentOnce：叶子助手 kind=error 失败自动重派一次
+//（TODO #23 最小一档，同任务同前缀，fresh 计数）。domain/timeout/killed/loop_guard/
+// 预算部分返回不自动重试——domain 交 MetaAgent 决策、墙钟类重试无意义，避免放大故障。
+// 与 LLM 调用层重试（react_agent retry_count）正交：那层重试模型调用本身，这层重跑整个 Agent。
+// 返回 (result, err, retried)：retried=true 表示本轮失败已重试过一次（二次失败终报）。
+func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string) (agent.ReactResult, error, bool) {
+	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
+	if err == nil || d.dispatchRetryCount <= 0 {
+		return result, err, false
+	}
+	kind := failureKindOf(err)
+	retryable := kind == FailureKindError && roleDef.ID != "domain" && roleDef.ID != "meta" && ctx.Err() == nil
+	if !retryable {
+		return result, err, false
+	}
+	log.Printf("[subagent] AUTO-RETRY: sub=%s role=%s err=%v (dispatch retry %d)", subAgentID, roleDef.ID, err, d.dispatchRetryCount)
+	_, result2, err2 := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
+	return result2, err2, true
 }
 
 // treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
@@ -1084,11 +1322,16 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// Dispatcher 自身实现 PendingChildrenChecker（PendingChildren/WaitForAnyChild）。
 	sub = sub.WithPendingChildrenChecker(d)
 
-	// 心跳检活：注入活动上报回调（仅叶子 Agent 有 activity 条目，DomainAgent/MetaAgent 无则跳过）。
-	// 回调闭包捕获 *atomic.Int64，generateOnce/工具派发时 Store 当前时间，巡检据此判假死。
+	// 心跳检活：注入活动上报回调（generateOnce/工具派发时 Store 当前时间，巡检据此判假死）。
+	// 回调同时把活动沿 parentID 链向上冒泡（TODO #25-3）：domain 等子期间自身无活动，
+	// 靠后代活动刷新保持存活，巡检不误杀合法等待。
 	if actVal, ok := d.activity.Load(subAgentID); ok {
 		act := actVal.(*atomic.Int64)
-		sub = sub.WithActivityReporter(func() { act.Store(time.Now().UnixNano()) })
+		sub = sub.WithActivityReporter(func() {
+			now := time.Now().UnixNano()
+			act.Store(now)
+			d.bubbleActivity(subAgentID, now)
+		})
 	}
 
 	// 注入会话级日志器：派生 session-scoped logger，使子 Agent LLM I/O 写入同一会话的 session_logs。
@@ -1293,6 +1536,12 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	}
 	t.Resume(pausedNodeID, cancel)
 	d.running.Store(pausedNodeID, sub)
+	// 心跳（TODO #25-3）：resume 的 domain 注册 activity，其子 Agent 活动冒泡保活；
+	// 巡检超 domain 阈值判假死。defer 清理与子 Agent 派发路径一致。
+	act := new(atomic.Int64)
+	act.Store(time.Now().UnixNano())
+	d.activity.Store(pausedNodeID, act)
+	defer d.activity.Delete(pausedNodeID)
 	defer d.running.Delete(pausedNodeID)
 	defer cancel()
 	defer func() {
@@ -1360,8 +1609,43 @@ func (d *Dispatcher) concludePaused(ctx context.Context, pausedNode orchestrator
 	return agent.ReactResult{Text: text}, nil
 }
 
-// errLimitReached 是子 Agent 达到最大轮数的哨兵错误，供 formatSubAgentFailure 区分通知文案。
-var errLimitReached = errors.New("sub-agent limit reached")
+// FailureKind 是子 Agent 失败的结构化类型（TODO #23），随父 mailbox 失败消息的
+// 机读标记 [failure kind=X retryable=Y] 透出，供上层（board/调度）按类型决策。
+type FailureKind string
+
+const (
+	// FailureKindTimeout 超时终止（sub_agent_timeout 墙钟）。
+	FailureKindTimeout FailureKind = "timeout"
+	// FailureKindError 通用执行错误（模型/运行错误，未知分类的兜底）。
+	FailureKindError FailureKind = "error"
+	// FailureKindBudget 触达 token 预算的部分返回（errPartialReturn）。
+	FailureKindBudget FailureKind = "budget_partial"
+	// FailureKindKilled 被心跳巡检判定假死主动取消。
+	FailureKindKilled FailureKind = "killed"
+	// FailureKindLoopGuard 被循环守卫（连读/探索预算/连败）终止。
+	FailureKindLoopGuard FailureKind = "loop_guard"
+)
+
+// failureKindOf 从失败错误分类失败类型；未知错误归 error。
+func failureKindOf(err error) FailureKind {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return FailureKindTimeout
+	case errors.Is(err, tool.ErrLoopExit):
+		return FailureKindLoopGuard
+	case errors.Is(err, errPartialReturn):
+		return FailureKindBudget
+	default:
+		return FailureKindError
+	}
+}
+
+// failureMarker 渲染失败消息头部的机读标记行。
+// retryable 表示该 kind+角色是否落入 dispatcher 自动重派策略（error + 叶子 + 未取消），
+// 供父 LLM 与未来结构化消费者判断该失败是否可自动恢复。
+func failureMarker(kind FailureKind, retryable bool) string {
+	return fmt.Sprintf("[failure kind=%s retryable=%t]", kind, retryable)
+}
 
 // errPaused 标记 DomainAgent 触达 token 上限进入 Paused(runSubAgentOnce 已存 history + tree.Pause)。
 // runSubAgent 见此信号:不 notify 父、不 treeFinish、不 trackChildDone,父 PendingChildren 保持 >0,
@@ -1374,13 +1658,14 @@ var errPaused = errors.New("sub-agent paused on token budget")
 var errPartialReturn = errors.New("sub-agent partial return on token budget")
 
 // formatSubAgentFailure 把 runSubAgentOnce 返回的错误格式化为父邮箱通知文案，
-// 保留原有"超时/轮数上限/通用失败"三段语义与部分进度回传。
+// 保留原有"超时/循环守卫/通用失败"三段语义与部分进度回传。
 func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Duration, partial string) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Sprintf("子 Agent 执行超时（已运行 %v），已被终止。%s", timeout, partialSuffix(partial))
 	}
-	if errors.Is(err, errLimitReached) {
-		return fmt.Sprintf("子 Agent 已达最大轮数上限并暂停。%s", partialSuffix(partial))
+	if errors.Is(err, tool.ErrLoopExit) {
+		reason := strings.TrimPrefix(err.Error(), tool.ErrLoopExit.Error()+": ")
+		return fmt.Sprintf("子 Agent 陷入循环被守卫终止（%s）。%s", reason, partialSuffix(partial))
 	}
 	return fmt.Sprintf("sub-agent failed: %v%s", err, partialSuffix(partial))
 }
@@ -1392,6 +1677,8 @@ func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Dur
 //   - 不 notify 父邮箱（调用方自行决定如何反馈）；
 //   - 不进入实例池服务态（一次性执行）。
 //
+// TODO #21 吸收 #2 开放动作：同步子 Agent 同样入权威树（Register/SetCancel/Finish）——
+// TUI 可见、HTTP cancel 可取消、叶子心跳覆盖（与异步派发同语义）。
 // 权限校验与 ID 生成与 call_sub_agent 工具一致；失败时返回 partial 结果与 err。
 func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task string) (string, error) {
 	roleDef := d.registry.Get(roleID)
@@ -1404,7 +1691,55 @@ func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task st
 	subAgentID := fmt.Sprintf("%s/%s-%d", parentID, roleID, d.seq.Add(1))
 	d.trackChildStart(parentID)
 	defer d.trackChildDone(parentID)
-	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, *roleDef, task, "", "")
+
+	// 树/心跳需要可取消子 ctx；无树无心跳时直接用调用方 ctx（零行为变化）。
+	childCtx := ctx
+	cancel := context.CancelFunc(func() {})
+	if d.treeFn != nil || d.heartbeatTimeout > 0 {
+		childCtx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+
+	sid := tool.SessionIDFromContext(ctx)
+	started := time.Now()
+	taskBrief := truncateRunes(strings.ReplaceAll(strings.TrimSpace(task), "\n", " "), 100)
+	if d.treeFn != nil && sid != "" {
+		if t := d.treeFn(sid); t != nil {
+			t.Register(orchestrator.Node{
+				ID:       subAgentID,
+				ParentID: parentID,
+				Role:     roleID,
+				Task:     taskBrief,
+				Started:  started,
+				Status:   orchestrator.StatusRunning,
+			})
+			t.SetCancel(subAgentID, cancel)
+		}
+	}
+	// 心跳检活：叶子注册 activity + subMeta（巡检超时 cancel -> childCtx err -> 本方法返回错误）。
+	isLeaf := roleDef.ID != "domain" && roleDef.ID != "meta"
+	if isLeaf && d.heartbeatTimeout > 0 {
+		act := new(atomic.Int64)
+		act.Store(time.Now().UnixNano())
+		d.activity.Store(subAgentID, act)
+		d.subMeta.Store(subAgentID, &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: sid})
+		d.ensurePatrol()
+		defer func() {
+			d.activity.Delete(subAgentID)
+			d.subMeta.Delete(subAgentID)
+		}()
+	}
+
+	_, result, err := d.runSubAgentOnce(childCtx, parentID, subAgentID, *roleDef, task, "", "")
+	if d.treeFn != nil && sid != "" {
+		if t := d.treeFn(sid); t != nil {
+			if err != nil {
+				t.Finish(subAgentID, truncateRunes(agent.LastAssistantText(result.History), 200), err)
+			} else {
+				t.Finish(subAgentID, result.Text, nil)
+			}
+		}
+	}
 	if err != nil {
 		return result.Text, err
 	}
@@ -1458,6 +1793,11 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID string) str
 		slotCount++
 		totalLen += len(val)
 		slotName := strings.TrimPrefix(k, prefix)
+		// 打捞槽位（salvage:<domain>）不走通用共享注入：域相关性强，通用注入会污染
+		// 无关子 Agent 上下文；由同域重派经 withPriorSalvage 显式读回（TODO #20 第三层）。
+		if strings.HasPrefix(slotName, salvageSlotPrefix) {
+			continue
+		}
 		slotNames = append(slotNames, slotName)
 
 		fm, body, ok := tool.DecodeSharedMD(val)
@@ -1829,14 +2169,17 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 		return
 	}
 	// 构造并发送消息：发件人为子 Agent，收件人为父 Agent，主题为子 Agent 完成提示，正文为摘要。
-	d.mailbox.Send(&mailbox.Message{
+	// 死信错误（父已销毁）仅记日志：notify 是 best-effort 通知，不阻塞失败主流程。
+	if _, err := d.mailbox.Send(&mailbox.Message{
 		From:          subAgentID,
 		To:            parentID,
 		Type:          mailbox.MsgInfo,
 		Subject:       "子 Agent 完成: " + subAgentID,
 		Body:          summary,
 		FilesModified: filesModified,
-	})
+	}); err != nil {
+		log.Printf("[subagent] notify dead-letter: to=%s from=%s err=%v", parentID, subAgentID, err)
+	}
 }
 
 // roleIDFromAgentID 从 Agent 句柄中还原出角色 ID。
