@@ -250,6 +250,11 @@ func (s *PostgresStore) IncrementAccessCount(ctx context.Context, id int64) erro
 	return s.Knowledge.IncrementAccessCount(ctx, id)
 }
 
+// BumpReuse 递增知识记录 Meta.reuse_count；委托给 KnowledgeStore.BumpReuse。
+func (s *PostgresStore) BumpReuse(ctx context.Context, id int64) error {
+	return s.Knowledge.BumpReuse(ctx, id)
+}
+
 // CreateTopic 创建话题；委托给 TopicStore.Create。
 func (s *PostgresStore) CreateTopic(ctx context.Context, topic *types.TopicMeta) error {
 	return s.Topic.Create(ctx, topic)

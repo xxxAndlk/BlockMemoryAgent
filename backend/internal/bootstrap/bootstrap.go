@@ -301,6 +301,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入共享记忆 KV：话题切换时把旧 Agent 树摘要写入 `topic:{id}:summary`,
 	// 供新话题 MetaAgent 召回(召回注入侧步骤 4 part C 未做,摘要已落 KV)。
 	agentSvc.SetSharedMemoryStore(sharedKV)
+	// 注入破坏性操作审批钩子（TODO #17 P1）：命中生产边界/危险命令模式时
+	// 工具调用暂停会话推「需确认」事件，用户答复经 sendMessage/answerClarify 路由回放行。
+	// approvalHook 非 nil 仅影响命中边界的调用，常规编码流零阻塞。
+	toolRegistry.SetApprovalHook(agentSvc.ApprovalHook())
 	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
 	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。
 	subAgentDispatcher.WithLiveEvents(agentSvc.ForwardLiveEvent)

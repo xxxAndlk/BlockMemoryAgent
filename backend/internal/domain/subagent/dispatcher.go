@@ -8,6 +8,7 @@ import (
 	"fmt"           // fmt 用于格式化子 Agent ID 与错误信息
 	"log"           // log 用于记录块记忆写入失败等不影响主流程的错误
 	"os"            // os 用于 stat 文件 mtime 校验（Layer 3 缓存一致性）
+	"sort"          // sort 用于召回结果按 outcome/reuse_count 价值排序
 	"strings"       // strings 用于从 Agent ID 中提取角色 ID
 	"sync"          // sync 提供 sync.Map 存储运行中的子 Agent
 	"sync/atomic"   // sync/atomic 提供原子递增序列号
@@ -74,6 +75,20 @@ const (
 	// blockMemoryResultMaxRunes 是写入块记忆时子 Agent 结果摘要的最大 rune 数。
 	blockMemoryResultMaxRunes = 500
 )
+
+// 块记忆 outcome 取值：沉淀结果的执行状态，召回排序按 success 优先。
+const (
+	blockOutcomeSuccess = "success"
+	blockOutcomePartial = "partial"
+	blockOutcomeFail    = "fail"
+)
+
+// reuseBumper 是 BlockMemorySearcher 的可选扩展接口：召回命中后递增 reuse_count。
+// 实现方（store.PostgresStore）用 jsonb_set 就地更新 Meta 字段；
+// 未实现时跳过递增，不影响召回（best-effort）。
+type reuseBumper interface {
+	BumpReuse(ctx context.Context, id int64) error
+}
 
 // Dispatcher 负责创建并跟踪异步运行的子 Agent。
 // 它会将 call_sub_agent 工具注册到 domain/tool 注册表中，
@@ -1105,10 +1120,8 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	if sp := d.buildSharedPrefix(ctx, parentID); sp != "" {
 		prefixes = append(prefixes, sp)
 	}
-	if bm := d.injectRecalledMemory(ctx, ""); bm != "" {
+	if bm, recs := d.injectRecalledMemory(ctx, origTask, ""); bm != "" {
 		prefixes = append(prefixes, bm)
-		sid := tool.SessionIDFromContext(ctx)
-		recs, _ := d.searcher.SearchBlockMemoryByGoal(ctx, sid, origTask, blockMemoryRecallTopK)
 		log.Printf("[subagent] inject block-memory: sub=%s role=%s hits=%d task_len=%d",
 			subAgentID, roleDef.ID, len(recs), len(origTask))
 		for i, rec := range recs {
@@ -1161,6 +1174,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		// 叶子助手触达 token 上限:不持久化,把部分产出塞 result.Text 返回给父 mailbox + 标 Done。
 		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 		result.Text = partial
+		d.saveBlockMemory(ctx, subAgentID, roleDef.ID, origTask, partial, blockOutcomePartial)
 		log.Printf("[subagent] PARTIAL: sub=%s role=%s (token budget, partial returned)", subAgentID, roleDef.ID)
 		return sub, result, errPartialReturn
 	}
@@ -1172,7 +1186,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		Content: result.Text,
 	})
 
-	d.saveBlockMemory(ctx, subAgentID, roleDef.ID, origTask, result.Text)
+	d.saveBlockMemory(ctx, subAgentID, roleDef.ID, origTask, result.Text, blockOutcomeSuccess)
 
 	return sub, result, nil
 }
@@ -1583,13 +1597,16 @@ func (d *Dispatcher) WithSharedMemory(r tool.SharedMemoryStore) *Dispatcher {
 	return d
 }
 
-// saveBlockMemory 将子 Agent 成功完成后的结果沉淀到块记忆知识库。
+// saveBlockMemory 将子 Agent 完成后的结果沉淀到块记忆知识库。
 // 未配置写入器、开关关闭或结果为空时跳过；写入失败仅记日志，不影响派发主流程。
+//
+// outcome 标记执行状态（blockOutcomeSuccess/Partial/Fail），写入 Meta 供召回侧排序：
+// success 优先、partial/fail 降权为避坑经验，避免失败记忆与成功记忆并列误导子 Agent。
 //
 // 提取策略：若 factExtractor 已注入，先调用 LLM 提取 1-5 条关键事实，
 // 每条事实单独落 KnowledgeRecord（向量化后召回精度更高）。
 // 提取失败或未注入时回退到原始 result.Text 落库（向后兼容）。
-func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, goal, result string) {
+func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, goal, result, outcome string) {
 	if d.saver == nil || !d.writeEnabled {
 		return
 	}
@@ -1600,18 +1617,18 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, go
 	if d.factExtractor != nil {
 		facts, err := d.factExtractor.Extract(ctx, content, goal, roleID)
 		if err == nil && len(facts) > 0 {
-			d.saveFacts(ctx, subAgentID, roleID, goal, facts)
+			d.saveFacts(ctx, subAgentID, roleID, goal, facts, outcome)
 			return
 		}
 		log.Printf("[subagent] extract facts failed, fallback raw: sub=%s err=%v facts=%d", subAgentID, err, len(facts))
 	}
-	d.saveRawBlockMemory(ctx, subAgentID, roleID, goal, content)
+	d.saveRawBlockMemory(ctx, subAgentID, roleID, goal, content, outcome)
 }
 
 // saveRawBlockMemory 把原始 result.Text 作为单条 KnowledgeRecord 落库。
-// 内容采用"目标/角色/结果"三段式，meta 携带 goal/domain/session_id 标签，
-// 便于召回侧（SearchBlockMemoryByGoal / SearchBlockMemory）按目标文本与领域匹配命中。
-func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID, goal, content string) {
+// 内容采用"目标/角色/结果"三段式，meta 携带 goal/domain/session_id/outcome/reuse_count 标签，
+// 便于召回侧（SearchBlockMemoryByGoal / SearchBlockMemory）按目标文本、领域与价值排序命中。
+func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID, goal, content, outcome string) {
 	trimmedGoal := truncateRunes(strings.TrimSpace(goal), blockMemoryGoalMaxRunes)
 	sid := tool.SessionIDFromContext(ctx)
 	rec := &types.KnowledgeRecord{
@@ -1623,6 +1640,8 @@ func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID,
 			"session_id":   sid,
 			"sub_agent_id": subAgentID,
 			"source":       "sub_agent_result",
+			"outcome":      outcome,
+			"reuse_count":  0,
 		},
 		CreatedAt: time.Now(),
 	}
@@ -1633,7 +1652,7 @@ func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID,
 
 // saveFacts 把提取出的事实逐条落库，每条单独向量化以提升召回精度。
 // 失败仅记日志，不影响其他事实或派发主流程。
-func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, goal string, facts []string) {
+func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, goal string, facts []string, outcome string) {
 	trimmedGoal := truncateRunes(strings.TrimSpace(goal), blockMemoryGoalMaxRunes)
 	sid := tool.SessionIDFromContext(ctx)
 	for i, fact := range facts {
@@ -1651,6 +1670,8 @@ func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, goal str
 				"sub_agent_id": subAgentID,
 				"source":       "fact_extraction",
 				"fact_index":   i,
+				"outcome":      outcome,
+				"reuse_count":  0,
 			},
 			CreatedAt: time.Now(),
 		}
@@ -1660,34 +1681,110 @@ func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, goal str
 	}
 }
 
-// injectRecalledMemory 按拆分出的子任务文本召回块记忆，并把命中内容拼到任务前。
+// injectRecalledMemory 按 query 文本召回块记忆，并把命中内容拼到任务前。
 // 未配置检索器、无命中或召回出错时返回原 task，保证派发主流程不受影响。
 // sessionID 从 ctx 取：仅召回当前 session 写入的记录，防跨 session 污染。
 //
-// task 为空时返回纯前缀（不含【当前任务】标记），供调用方统一拼装；非空时按旧逻辑
-// 返回完整 "前缀 + 【当前任务】 + task"（向后兼容 TestInjectRecalledMemory）。
-func (d *Dispatcher) injectRecalledMemory(ctx context.Context, task string) string {
+// query 与 task 分离：query 是语义检索的目标文本（用原始任务，避免空串向量召回垃圾），
+// task 是要拼装渲染的当前任务文本。task 为空时返回纯前缀（不含【当前任务】标记），
+// 供调用方统一拼装；非空时返回完整 "前缀 + 【当前任务】 + task"。
+//
+// 召回排序（价值反馈闭环）：outcome=success 优先、reuse_count 降序、新近优先；
+// 失败/部分记忆不丢，降权为独立的「避坑经验」段，避免与成功记忆并列误导子 Agent。
+// 返回命中的记录切片，供调用方日志留痕（避免重复检索）。
+func (d *Dispatcher) injectRecalledMemory(ctx context.Context, query, task string) (string, []*types.KnowledgeRecord) {
 	if d.searcher == nil {
-		return task
+		return task, nil
 	}
 	sid := tool.SessionIDFromContext(ctx)
-	recs, err := d.searcher.SearchBlockMemoryByGoal(ctx, sid, task, blockMemoryRecallTopK)
+	recs, err := d.searcher.SearchBlockMemoryByGoal(ctx, sid, query, blockMemoryRecallTopK)
 	if err != nil || len(recs) == 0 {
-		return task
+		return task, nil
 	}
-	// 拼接命中记忆：编号列出，便于大模型区分多条记忆条目。
+	sort.SliceStable(recs, func(i, j int) bool {
+		ri, rj := blockOutcomeRank(recs[i].Meta), blockOutcomeRank(recs[j].Meta)
+		if ri != rj {
+			return ri < rj
+		}
+		if ui, uj := blockReuseCount(recs[i].Meta), blockReuseCount(recs[j].Meta); ui != uj {
+			return ui > uj
+		}
+		return recs[i].CreatedAt.After(recs[j].CreatedAt)
+	})
+	// 召回命中后 best-effort 递增 reuse_count（JSONB 就地更新），失败仅记日志不阻塞派发。
+	if bumper, ok := d.searcher.(reuseBumper); ok {
+		for _, rec := range recs {
+			if rec.ID <= 0 {
+				continue
+			}
+			if err := bumper.BumpReuse(ctx, rec.ID); err != nil {
+				log.Printf("[subagent] bump block-memory reuse failed: id=%d err=%v", rec.ID, err)
+			}
+		}
+	}
+	// 拼接：成功经验在前，避坑经验（partial/fail）单列降权。
 	var sb strings.Builder
 	sb.WriteString("【相关记忆】\n")
-	for i, rec := range recs {
-		fmt.Fprintf(&sb, "%d. %s\n", i+1, strings.TrimSpace(rec.Content))
+	var successLines, pitfallLines []string
+	for _, rec := range recs {
+		if blockOutcomeRank(rec.Meta) == 0 {
+			successLines = append(successLines, strings.TrimSpace(rec.Content))
+		} else {
+			pitfallLines = append(pitfallLines, strings.TrimSpace(rec.Content))
+		}
+	}
+	if len(successLines) > 0 {
+		sb.WriteString("成功经验:\n")
+		for i, l := range successLines {
+			fmt.Fprintf(&sb, "%d. %s\n", i+1, l)
+		}
+	}
+	if len(pitfallLines) > 0 {
+		sb.WriteString("避坑经验:\n")
+		for i, l := range pitfallLines {
+			fmt.Fprintf(&sb, "%d. %s\n", i+1, l)
+		}
 	}
 	// task 非空：旧语义，返回完整拼装；task 为空：仅返回前缀，由调用方统一拼装。
 	if task == "" {
-		return strings.TrimRight(sb.String(), "\n")
+		return strings.TrimRight(sb.String(), "\n"), recs
 	}
 	sb.WriteString("\n【当前任务】\n")
 	sb.WriteString(task)
-	return sb.String()
+	return sb.String(), recs
+}
+
+// blockOutcomeRank 返回 outcome 的排序权重：success=0 优先召回，partial/fail 降权为避坑经验。
+// 历史记录缺 outcome 字段时按 success 处理（旧数据全部来自成功路径沉淀，向后兼容）。
+func blockOutcomeRank(meta map[string]any) int {
+	if meta == nil {
+		return 0
+	}
+	switch v, ok := meta["outcome"].(string); {
+	case !ok:
+		return 0
+	case v == blockOutcomePartial:
+		return 1
+	case v == blockOutcomeFail:
+		return 2
+	default:
+		return 0
+	}
+}
+
+// blockReuseCount 读取 Meta 中的 reuse_count（缺省 0）。
+// DB JSON 反序列化数值为 float64，测试构造可能为 int，兼容两者。
+func blockReuseCount(meta map[string]any) int {
+	if meta == nil {
+		return 0
+	}
+	switch v := meta["reuse_count"].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	}
+	return 0
 }
 
 // verifyFileMtimes 校验各 path 当前 mtime 与 frontmatter 中记录的是否一致。

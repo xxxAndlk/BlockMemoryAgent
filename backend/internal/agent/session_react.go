@@ -69,6 +69,12 @@ type reactInternalSession struct {
 	// 下次 MetaAgent 运行前 recallTopicSummaries 注入旧话题摘要并更新此字段,
 	// 避免同一话题多次 resume 重复注入(省 token)。
 	recalledTopicID string
+	// approval 是待审批的破坏性操作确认通道（TODO #17 P1）：非 nil 表示有工具调用
+	// 正在等用户确认，sendMessage/answerClarify 把答复写入通道；Agent goroutine 仍存活，
+	// 收到答复后工具调用返回裁决继续 ReAct 循环。会话取消时由 ctx 取消解除阻塞。
+	approval chan bool
+	// pendingClarify 是当前待用户答复的确认/澄清请求（含审批问题），随会话快照透出给前端。
+	pendingClarify *ClarifyRequest
 }
 
 // maxReactInMemorySessions 限制 ReactService 同时保留在内存中的最大会话数，

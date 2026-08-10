@@ -144,6 +144,13 @@ type Registry struct {
 	// refresher 去抖异步刷新 .bma/PROJECT.md：WriteFile/删改类 RunCommand 成功后 schedule，
 	// 安静期触发 LLM 按职责重分区，使领域影响范围随文件增删改自动更新。
 	refresher *projectRefresher
+	// approvalHook 是破坏性操作的用户确认回调（TODO #17 P1）。nil（默认）= 全放行，
+	// 零行为变化；非 nil 时仅对命中边界的调用触发（WriteFile 在生产目录 / 危险命令模式），
+	// 常规编码流不阻塞。由 bootstrap 注入 ReactService.ApprovalHook。
+	approvalHook ApprovalHookFunc
+	// productionWorkDir 是配置的生产环境工作目录（绝对路径）；空 = 未启用生产边界确认，
+	// 仅危险命令模式（isDangerousCommand）触发确认。
+	productionWorkDir string
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -157,15 +164,19 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	}
 	// 初始化 Registry 结构体，各 map 也一并初始化。
 	r := &Registry{
-		exec:          exec,
-		progress:      progress,
-		failures:      newFailureCounter(),
-		tools:         make(map[string]Tool),
-		aliases:       make(map[string]string),
-		lastReadKey:   make(map[string]string),
-		sameReadCount: make(map[string]int),
-		exploreCount:  make(map[string]int),
-		writeCount:    make(map[string]int),
+		exec:             exec,
+		progress:         progress,
+		failures:         newFailureCounter(),
+		tools:            make(map[string]Tool),
+		aliases:          make(map[string]string),
+		lastReadKey:      make(map[string]string),
+		sameReadCount:    make(map[string]int),
+		exploreCount:     make(map[string]int),
+		writeCount:       make(map[string]int),
+		productionWorkDir: "",
+	}
+	if cfg != nil {
+		r.productionWorkDir = cfg.ProductionWorkDir
 	}
 	// 去抖异步刷新 PROJECT.md：文件增删改后安静期触发 LLM 按职责重分区。
 	// cls nil（测试）时 RefreshProjectDoc 走启发式，刷新仍更新文件列表。
@@ -224,6 +235,39 @@ func (r *Registry) WorkDir() string {
 		return ""
 	}
 	return r.exec.WorkDir()
+}
+
+// SetApprovalHook 注入破坏性操作的用户确认回调（TODO #17 P1）。
+// nil（默认）= 全放行，零行为变化；非 nil 时仅对命中边界的调用触发，常规编码流不阻塞。
+func (r *Registry) SetApprovalHook(fn ApprovalHookFunc) {
+	if r != nil {
+		r.approvalHook = fn
+	}
+}
+
+// needsApproval 判定本次工具调用是否需要用户确认（破坏性工具分级）：
+//   - WriteFile（静态 destructive）：仅生产工作目录下触发；
+//   - RunCommand：命中危险命令模式（git push/rm -rf/drop table 等）恒触发（与目录无关）；
+//     生产目录下的写类命令（rm/mv/cp/touch/mkdir/git rm/git mv）亦触发；
+//   - 其余工具与普通命令：不触发，保持自主。
+//
+// approvalHook 为 nil 时不触发（零行为变化）。
+func (r *Registry) needsApproval(name string, args map[string]any) bool {
+	if r == nil || r.approvalHook == nil {
+		return false
+	}
+	prod := inProductionWorkDir(r.WorkDir(), r.productionWorkDir)
+	switch name {
+	case "WriteFile":
+		return prod
+	case "RunCommand":
+		cmd, _ := args["command"].(string)
+		if isDangerousCommand(cmd) {
+			return true
+		}
+		return prod && commandAffectsFiles(cmd)
+	}
+	return false
 }
 
 // SetSandboxConfig 把 SafetyConfig 翻译成 Executor 的 SandboxConfig 并注入。
@@ -356,6 +400,22 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 			scope := scopeKeyFromCtx(ctx)
 			log.Printf("[tool] explore budget exhausted: scope=%s tool=%s budget=%d reason=%q",
 				scope, name, r.exploreLimit(scope), blocked)
+			r.emitResult(ctx, result)
+			return result, nil
+		}
+	}
+
+	// 破坏性工具分级（TODO #17 P1）：命中生产边界/危险命令模式时先经 approvalHook 等用户确认。
+	// 拒绝则返回工具级错误（不执行），Agent 可见并自行决策；hook 错误上抛中止本次调用。
+	// 非生产环境与普通工具不经过此路径，保持自主。
+	if r.needsApproval(name, args) {
+		allowed, err := r.approvalHook(ctx, name, args)
+		if err != nil {
+			return nil, fmt.Errorf("%s approval failed: %w", name, err)
+		}
+		if !allowed {
+			result := &Result{Tool: name, Error: "破坏性操作已被用户拒绝，未执行。"}
+			r.fillResult(ctx, result, args)
 			r.emitResult(ctx, result)
 			return result, nil
 		}
@@ -922,6 +982,10 @@ func (t *writeFileTool) Name() string { return "WriteFile" }
 
 // Aliases 返回 WriteFile 的别名列表。
 func (t *writeFileTool) Aliases() []string { return []string{"write_file", "writeFile"} }
+
+// Destructive 标记 WriteFile 为破坏性操作（文件内容不可逆覆盖）：
+// 生产工作目录下触发用户确认（TODO #17 P1 破坏性工具分级）。
+func (t *writeFileTool) Destructive() bool { return true }
 
 // Execute 调用 Executor 的 writeFile 方法完成写入。
 func (t *writeFileTool) Execute(ctx context.Context, args map[string]any) *Result {

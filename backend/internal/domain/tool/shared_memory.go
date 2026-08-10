@@ -39,6 +39,31 @@ type SharedMemoryStore interface {
 	Keys(ctx context.Context) []string
 }
 
+// ErrVersionConflict 是 SetIfVersion 的冲突哨兵：当前版本与期望版本不一致，
+// 说明期间有并发写入（兄弟 Agent 覆盖），调用方应放弃写入或重读后重试。
+var ErrVersionConflict = errors.New("shared memory version conflict")
+
+// versionedSharedMemoryStore 是 SharedMemoryStore 的可选扩展接口：
+// 带版本期望的 CAS 写入（乐观锁，等价 AICP 黑板 Lua 原子写 + version 字段）。
+// 未实现该接口的存储后端退化为普通 Set 覆盖写（行为不变）。
+type versionedSharedMemoryStore interface {
+	// SetIfVersion 仅当当前版本等于 expectVersion 时写入（并自增至新版本返回）。
+	// 无既有值时版本视为 0。版本不一致返回 ErrVersionConflict。
+	SetIfVersion(ctx context.Context, key, value string, expectVersion int) (int, error)
+}
+
+// sharedMemoryVersion 读取存储中 key 当前值的版本号（无值/非 MD 格式视为 0）。
+func sharedMemoryVersion(ctx context.Context, store SharedMemoryStore, key string) int {
+	cur, err := store.Get(ctx, key)
+	if err != nil || strings.TrimSpace(cur) == "" {
+		return 0
+	}
+	if fm, _, ok := DecodeSharedMD(cur); ok {
+		return fm.Version
+	}
+	return 0
+}
+
 // writeSharedMemoryTool 是 WriteSharedMemory 工具的封装。
 type writeSharedMemoryTool struct {
 	store SharedMemoryStore
@@ -109,14 +134,71 @@ func (t *writeSharedMemoryTool) Execute(ctx context.Context, args map[string]any
 	md := encodeSharedMD(agentID, slot, filesMtime, content)
 
 	key := agentID + ":" + slot
-	if err := t.store.Set(ctx, key, md); err != nil {
+	// 单写多读 slot 的写入方校验：file_tree 等共享 slot 只允许首个写入者更新，
+	// 兄弟 Agent 拿到 parentID 也能写任意 key，防互相覆盖（AICP 黑板 per-agent 前缀隔离轻量版）。
+	if err := t.checkSlotOwnership(ctx, key, slot, agentID); err != nil {
+		return &Result{Tool: "WriteSharedMemory", Error: err.Error()}
+	}
+	// 乐观锁写入：存储后端支持版本 CAS 时走 SetIfVersion（冲突重读重试一次），否则退化普通覆盖。
+	newVersion, err := t.writeWithCAS(ctx, key, md)
+	if err != nil {
 		return &Result{Tool: "WriteSharedMemory", Error: fmt.Sprintf("set: %v", err)}
 	}
 	return &Result{
 		Tool:    "WriteSharedMemory",
 		Success: true,
-		Output:  fmt.Sprintf("shared memory written (key=%s, %d chars, %d files tracked)", key, len(content), len(filesMtime)),
+		Output:  fmt.Sprintf("shared memory written (key=%s, version=%d, %d chars, %d files tracked)", key, newVersion, len(content), len(filesMtime)),
 	}
+}
+
+// singleWriterSlots 是单写多读的共享记忆 slot：仅首个写入者（AgentID）可更新，
+// 兄弟 Agent 只读。防拿到 parentID 的任意子 Agent 覆盖共享探索成果
+// （实证风险：file_tree 并发互覆导致后续兄弟 Agent 读旧树）。
+var singleWriterSlots = map[string]bool{"file_tree": true}
+
+// checkSlotOwnership 校验单写多读 slot 的写入权：slot 已由其他 Agent 写入时拒绝，
+// 提示只读复用。多写 slot（非 singleWriterSlots）不做 owner 校验（靠 CAS 防并发覆盖）。
+func (t *writeSharedMemoryTool) checkSlotOwnership(ctx context.Context, key, slot, agentID string) error {
+	if !singleWriterSlots[slot] || t.store == nil {
+		return nil
+	}
+	existing, err := t.store.Get(ctx, key)
+	if err != nil || strings.TrimSpace(existing) == "" {
+		return nil // 无既有值：首个写入者，允许。
+	}
+	fm, _, ok := DecodeSharedMD(existing)
+	if !ok || fm.AgentID == "" || fm.AgentID == agentID {
+		return nil // 旧格式无 owner / 本人即 owner：允许覆盖。
+	}
+	return fmt.Errorf("slot %q 为单写多读：已由 Agent %s 写入，你是 %s，只读不可覆盖。请直接复用现有共享记忆，或用不同 key 另写新段",
+		slot, fm.AgentID, agentID)
+}
+
+// writeWithCAS 走版本 CAS 写入；冲突重读重试一次，仍冲突则返回错误（交 LLM 决策，避免盲覆盖）。
+// 存储后端不支持版本接口时退化为普通 Set 覆盖写（行为不变）。
+func (t *writeSharedMemoryTool) writeWithCAS(ctx context.Context, key, md string) (int, error) {
+	vs, ok := t.store.(versionedSharedMemoryStore)
+	if !ok {
+		if err := t.store.Set(ctx, key, md); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	const maxCASAttempts = 2 // 首次 + 冲突后重试一次
+	for attempt := 0; attempt < maxCASAttempts; attempt++ {
+		expect := sharedMemoryVersion(ctx, t.store, key)
+		newVer, err := vs.SetIfVersion(ctx, key, md, expect)
+		if err == nil {
+			return newVer, nil
+		}
+		if !errors.Is(err, ErrVersionConflict) {
+			return 0, err
+		}
+		if attempt == maxCASAttempts-1 {
+			return 0, fmt.Errorf("%w: 该 slot 并发被其他 Agent 更新，请重读最新内容后再决定写入", ErrVersionConflict)
+		}
+	}
+	return 0, fmt.Errorf("%w", ErrVersionConflict)
 }
 
 // writeSharedMemoryInput 是 WriteSharedMemory 工具的入参结构。

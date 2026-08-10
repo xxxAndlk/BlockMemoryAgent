@@ -53,6 +53,54 @@ func (s *FileSharedMemoryStore) Set(ctx context.Context, key, value string) erro
 	return nil
 }
 
+// SetIfVersion 实现 versionedSharedMemoryStore 可选接口：CAS 乐观锁写入。
+// 读当前文件 frontmatter 版本（无值/非 MD 视为 0），与 expectVersion 不一致返回
+// ErrVersionConflict（期间有并发写入）；一致则把 value 的 frontmatter Version 置为
+// expectVersion+1 后落盘并返回新版本。
+func (s *FileSharedMemoryStore) SetIfVersion(ctx context.Context, key, value string, expectVersion int) (int, error) {
+	if s == nil {
+		return 0, fmt.Errorf("file shared memory store not initialized")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	path := s.filePath(key)
+	cur, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return 0, fmt.Errorf("read %s: %w", path, err)
+	}
+	curVersion := 0
+	if len(cur) > 0 {
+		if fm, _, ok := DecodeSharedMD(string(cur)); ok {
+			curVersion = fm.Version
+		}
+		// 非 MD 旧格式：无版本概念，视为 0（可被期望 0 的写入覆盖）。
+	}
+	if curVersion != expectVersion {
+		return 0, fmt.Errorf("%w: key=%s expect=%d got=%d", ErrVersionConflict, key, expectVersion, curVersion)
+	}
+	newVersion := expectVersion + 1
+	value = stampVersion(value, newVersion)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return 0, fmt.Errorf("mkdir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
+		return 0, fmt.Errorf("write %s: %w", path, err)
+	}
+	return newVersion, nil
+}
+
+// stampVersion 把 MD 值 frontmatter 的 Version 置为 v 后重编码。
+// 值非 MD 格式（无法解码）时原样返回（无版本信息可注入）。
+func stampVersion(value string, v int) string {
+	fm, body, ok := DecodeSharedMD(value)
+	if !ok {
+		return value
+	}
+	fm.Version = v
+	return encodeMD(fm, body)
+}
+
 // Get 读取 key 对应的 MD 文件内容。
 // 文件不存在返回 ("", nil)（与 KV 语义一致：缺失不报错）。
 func (s *FileSharedMemoryStore) Get(ctx context.Context, key string) (string, error) {

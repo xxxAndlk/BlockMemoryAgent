@@ -445,7 +445,7 @@ fixed_roles:
     keywords: ["UI", "界面", "前端", "CSS", "HTML", "样式", "布局", "page"]
     skills: ["UI修复", "组件开发", "响应式设计", "CSS优化", "交互实现"]
     tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
-    model_config: &domain_model
+    model_config: &ui_model
       provider: anthropic
       model: doubao-seed-2.1-turbo
       api_key: ${ANTHROPIC_API_KEY}

@@ -543,6 +543,74 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 	}
 }
 
+// ApprovalHook 返回破坏性操作的用户确认回调（TODO #17 P1 生产边界确认）。
+// 由 bootstrap 注入 tool.Registry.SetApprovalHook；仅对命中边界的调用触发。
+//
+// 流程：置 PendingClarify + 会话暂停（awaiting_clarify）+ 推 clarify 事件 → 阻塞等用户答复
+// （Agent goroutine 存活，不重建会话）→ sendMessage/answerClarify 把答复写入 approval 通道 →
+// 返回裁决：true 放行执行，false 拒绝（工具结果带"已被用户拒绝"）。
+// 会话取消（ctx 取消）时返回 ctx 错误，ReAct 循环正常退出。
+func (s *ReactService) ApprovalHook() tool.ApprovalHookFunc {
+	return func(ctx context.Context, toolName string, args map[string]any) (bool, error) {
+		sid := tool.SessionIDFromContext(ctx)
+		if sid == "" {
+			return true, nil // 无法定位会话：放行保持自主。
+		}
+		s.store.mu.Lock()
+		sess := s.store.sessions[sid]
+		if sess == nil || sess.approval != nil {
+			s.store.mu.Unlock()
+			return true, nil // 会话不存在或已有待审批项：放行避免死锁。
+		}
+		ch := make(chan bool, 1)
+		sess.approval = ch
+		question := tool.ApprovalMessage(toolName, args)
+		sess.pendingClarify = &ClarifyRequest{
+			ID:        fmt.Sprintf("approve-%d", time.Now().UnixNano()),
+			Question:  question,
+			Context:   "破坏性工具调用待用户确认（生产边界/危险命令）",
+			AgentID:   tool.AgentIDFromContext(ctx),
+			CreatedAt: time.Now(),
+		}
+		sess.Status = enums.SessionStatusAwaitingClarify
+		s.store.mu.Unlock()
+
+		s.store.addEvent(sess, eventkind.Clarify, "System", question, "", "", "", "", "", true)
+
+		select {
+		case <-ctx.Done():
+			s.store.mu.Lock()
+			if sess.approval == ch {
+				sess.approval = nil
+				sess.pendingClarify = nil
+			}
+			s.store.mu.Unlock()
+			return false, ctx.Err()
+		case allow := <-ch:
+			s.store.mu.Lock()
+			if sess.approval == ch {
+				sess.approval = nil
+				sess.pendingClarify = nil
+			}
+			if sess.Status == enums.SessionStatusAwaitingClarify {
+				sess.Status = enums.SessionStatusRunning
+			}
+			s.store.mu.Unlock()
+			return allow, nil
+		}
+	}
+}
+
+// parseApproval 把用户对破坏性操作确认的答复解析为裁决：明确同意 → true；
+// 其余（拒绝及不明确文本）→ false。fail-closed：破坏性操作宁可拒绝不误执行。
+func parseApproval(answer string) bool {
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "确认", "同意", "允许", "批准", "yes", "y", "ok", "执行":
+		return true
+	}
+	return false
+}
+
 // ListAgents 返回与会话关联的运行时 Agent 实例列表。
 // 在 ReAct 重构期间，这里返回单个 MetaAgent 节点，以保持 TUI 树形面板继续渲染；
 // 后续阶段将根据子 Agent 事件流构建完整树。
@@ -1264,6 +1332,21 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		return ErrSessionNotFound
 	}
 
+	// 待审批的破坏性操作（TODO #17 P1）：任意用户消息作为确认答复路由进审批通道。
+	// Agent goroutine 存活，不重建会话不 resume（避免双跑）；答复不进入 LLM 对话历史，
+	// 由工具结果带回 ReAct 循环。明确同意才放行，其余按拒绝（fail-closed）。
+	if session.approval != nil {
+		session.approval <- parseApproval(content)
+		session.Messages = append(session.Messages, Message{
+			Role:      string(enums.ChatRoleUser),
+			Content:   "[澄清答复] " + content,
+			Timestamp: time.Now(),
+		})
+		s.store.mu.Unlock()
+		s.store.addEvent(session, eventkind.Clarify, "User", "审批答复: "+content, "", "", "", "", "", true)
+		return nil
+	}
+
 	// 将用户消息追加到会话消息列表。
 	session.Messages = append(session.Messages, Message{
 		Role:      string(enums.ChatRoleUser),
@@ -1381,6 +1464,18 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 			return fmt.Errorf("%w: session is paused on child, send a message to resume the paused domain", ErrInvalidSessionState)
 		}
 		return fmt.Errorf("%w: session is not awaiting clarification", ErrInvalidSessionState)
+	}
+	// 待审批的破坏性操作确认（TODO #17 P1）：答复路由进审批通道，不重建会话（Agent goroutine 存活）。
+	if session.approval != nil {
+		session.approval <- parseApproval(answer)
+		session.Messages = append(session.Messages, Message{
+			Role:      string(enums.ChatRoleUser),
+			Content:   "[澄清答复] " + answer,
+			Timestamp: time.Now(),
+		})
+		s.store.mu.Unlock()
+		s.store.addEvent(session, eventkind.Clarify, "User", "审批答复: "+answer, "", "", "", "", "", true)
+		return nil
 	}
 	// 将澄清答复作为用户消息追加。
 	session.Messages = append(session.Messages, Message{
@@ -1539,7 +1634,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		StreamingText:  s.StreamingText,
 		ThinkingText:   s.ThinkingText,
 		ActiveBlocks:   []ActiveBlock{},
-		PendingClarify: nil,
+		PendingClarify: s.pendingClarify,
 		ActiveTopicID:  s.activeTopicID,
 	}
 }

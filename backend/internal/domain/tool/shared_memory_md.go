@@ -21,10 +21,12 @@ import (
 
 // MDFrontmatter 是共享记忆 MD 文件的 YAML 头部结构。
 // 所有 slot 共用：spec slot 额外填 Goal/Acceptance/Constraints，其余 slot 仅填 AgentID/Slot/Files。
+// Version 供 CAS 乐观锁（SetIfVersion）使用：每次写入自增，冲突检测用。
 type MDFrontmatter struct {
 	AgentID string `yaml:"agent,omitempty"`
 	Slot    string `yaml:"slot,omitempty"`
 	Files   map[string]int64 `yaml:"files,omitempty"`
+	Version int    `yaml:"version,omitempty"`
 	// Spec 专属字段：仅 slot == SpecSlot 时填充。
 	// 其余 slot 这些字段为空，解码时忽略。
 	Goal        string   `yaml:"goal,omitempty"`

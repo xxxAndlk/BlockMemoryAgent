@@ -270,6 +270,19 @@ func (s *KnowledgeStore) IncrementAccessCount(ctx context.Context, id int64) err
 	return err
 }
 
+// BumpReuse 递增知识记录的 Meta.reuse_count（JSONB 就地更新，缺省 0）。
+// 供块记忆召回侧价值反馈闭环使用：召回命中后标记复用次数，下次排序按 reuse_count 降序。
+// 返回 SQL 执行错误，调用方 best-effort 处理（失败仅记日志，不阻塞派发）。
+func (s *KnowledgeStore) BumpReuse(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `
+			UPDATE global_knowledge
+			SET meta = jsonb_set(meta, '{reuse_count}',
+				to_jsonb((COALESCE((meta->>'reuse_count')::int, 0) + 1)::int))
+			WHERE id = $1
+		`, id)
+	return err
+}
+
 // scanKnowledgeRows 扫描知识库查询结果集,统一处理 NULL 字段与 JSONB 反序列化。
 // 参数:
 //   - ctx: 请求上下文，用于记录反序列化失败日志。

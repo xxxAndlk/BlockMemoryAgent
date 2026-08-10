@@ -150,18 +150,29 @@ type mockBlockMemorySearcher struct {
 	err error
 	// lastSession 记录最近一次调用传入的 sessionID，测试可断言过滤行为。
 	lastSession string
+	// lastGoal 记录最近一次调用传入的检索目标文本，测试可断言 query 透传。
+	lastGoal string
+	// bumpCalls 记录 BumpReuse 被调用的次数（reuseBumper 可选接口）。
+	bumpCalls int
 }
 
 // SearchBlockMemoryByGoal 实现 BlockMemorySearcher 接口，忽略查询并返回预设结果。
 func (m *mockBlockMemorySearcher) SearchBlockMemoryByGoal(ctx context.Context, sessionID, goal string, topK int) ([]*types.KnowledgeRecord, error) {
 	m.lastSession = sessionID
+	m.lastGoal = goal
 	return m.recs, m.err
+}
+
+// BumpReuse 实现 reuseBumper 可选接口，记录调用次数供断言。
+func (m *mockBlockMemorySearcher) BumpReuse(ctx context.Context, id int64) error {
+	m.bumpCalls++
+	return nil
 }
 
 // TestInjectRecalledMemory 验证块记忆召回注入的三种情形：
 // 命中时拼接【相关记忆】前缀、无命中与未配置检索器时任务原样返回。
 func TestInjectRecalledMemory(t *testing.T) {
-	// 情形一：命中两条记忆，任务前应拼入编号记忆段与【当前任务】分隔。
+	// 情形一：命中两条成功记忆，任务前应拼入成功经验段与【当前任务】分隔。
 	mock := &mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{
 		{Content: "记忆一"},
 		{Content: "记忆二"},
@@ -170,25 +181,31 @@ func TestInjectRecalledMemory(t *testing.T) {
 		WithBlockMemorySearcher(mock)
 	// 注入 sessionID 到 ctx，验证召回侧按 session 过滤。
 	ctx := tool.WithSessionID(context.Background(), "session-42")
-	got := d.injectRecalledMemory(ctx, "原始任务")
-	want := "【相关记忆】\n1. 记忆一\n2. 记忆二\n\n【当前任务】\n原始任务"
+	got, recs := d.injectRecalledMemory(ctx, "查询任务", "原始任务")
+	want := "【相关记忆】\n成功经验:\n1. 记忆一\n2. 记忆二\n\n【当前任务】\n原始任务"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
 	if mock.lastSession != "session-42" {
 		t.Fatalf("expected sessionID passed through to searcher, got %q", mock.lastSession)
 	}
+	if mock.lastGoal != "查询任务" {
+		t.Fatalf("expected query passed through to searcher, got %q", mock.lastGoal)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("expected 2 recalled records returned, got %d", len(recs))
+	}
 
 	// 情形二：检索无命中，任务原样返回。
 	d = NewDispatcher(nil, nil, nil, nil, nil).
 		WithBlockMemorySearcher(&mockBlockMemorySearcher{})
-	if got := d.injectRecalledMemory(context.Background(), "原始任务"); got != "原始任务" {
+	if got, _ := d.injectRecalledMemory(context.Background(), "查询任务", "原始任务"); got != "原始任务" {
 		t.Fatalf("expected unchanged task, got %q", got)
 	}
 
 	// 情形三：未配置检索器，任务原样返回。
 	d = NewDispatcher(nil, nil, nil, nil, nil)
-	if got := d.injectRecalledMemory(context.Background(), "原始任务"); got != "原始任务" {
+	if got, _ := d.injectRecalledMemory(context.Background(), "查询任务", "原始任务"); got != "原始任务" {
 		t.Fatalf("expected unchanged task, got %q", got)
 	}
 }
@@ -198,12 +215,64 @@ func TestInjectRecalledMemory(t *testing.T) {
 func TestInjectRecalledMemory_PurePrefixMode(t *testing.T) {
 	mock := &mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{{Content: "记忆一"}}}
 	d := NewDispatcher(nil, nil, nil, nil, nil).WithBlockMemorySearcher(mock)
-	got := d.injectRecalledMemory(context.Background(), "")
+	got, _ := d.injectRecalledMemory(context.Background(), "查询任务", "")
 	if strings.Contains(got, "【当前任务】") {
 		t.Fatalf("pure prefix mode should not include 【当前任务】 marker, got: %q", got)
 	}
 	if !strings.Contains(got, "【相关记忆】") {
 		t.Fatalf("expected 【相关记忆】 prefix, got: %q", got)
+	}
+	if mock.lastGoal != "查询任务" {
+		t.Fatalf("expected query used for search, got %q", mock.lastGoal)
+	}
+}
+
+// TestInjectRecalledMemory_OutcomeSections 验证价值排序与分段渲染：
+// outcome=success 进【成功经验】段优先，partial/fail 进【避坑经验】段降权，失败记忆不丢。
+func TestInjectRecalledMemory_OutcomeSections(t *testing.T) {
+	mock := &mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{
+		{Content: "上次这么改失败了", Meta: map[string]any{"outcome": "fail"}},
+		{Content: "成功实现", Meta: map[string]any{"outcome": "success"}},
+		{Content: "部分完成", Meta: map[string]any{"outcome": "partial"}},
+	}}
+	d := NewDispatcher(nil, nil, nil, nil, nil).WithBlockMemorySearcher(mock)
+	got, _ := d.injectRecalledMemory(context.Background(), "查询任务", "")
+	want := "【相关记忆】\n成功经验:\n1. 成功实现\n避坑经验:\n1. 部分完成\n2. 上次这么改失败了"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+// TestInjectRecalledMemory_ReuseCountSort 验证同 outcome 内按 reuse_count 降序。
+// 缺 outcome 的历史记录按 success 处理（向后兼容旧数据）。
+func TestInjectRecalledMemory_ReuseCountSort(t *testing.T) {
+	mock := &mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{
+		{Content: "未被复用", Meta: map[string]any{"outcome": "success"}},
+		{Content: "复用多次", Meta: map[string]any{"outcome": "success", "reuse_count": 5}},
+		{Content: "旧数据无字段"},
+	}}
+	d := NewDispatcher(nil, nil, nil, nil, nil).WithBlockMemorySearcher(mock)
+	got, _ := d.injectRecalledMemory(context.Background(), "查询任务", "")
+	pos := func(s string) int { return strings.Index(got, s) }
+	if pos("复用多次") < 0 || pos("未被复用") < 0 || pos("旧数据无字段") < 0 {
+		t.Fatalf("all records should be present, got: %q", got)
+	}
+	if !(pos("复用多次") < pos("未被复用") && pos("未被复用") < pos("旧数据无字段")) {
+		t.Fatalf("expected reuse_count desc order within success, got: %q", got)
+	}
+}
+
+// TestInjectRecalledMemory_BumpsReuse 验证召回命中后 best-effort 递增 reuse_count。
+func TestInjectRecalledMemory_BumpsReuse(t *testing.T) {
+	mock := &mockBlockMemorySearcher{recs: []*types.KnowledgeRecord{
+		{ID: 1, Content: "记忆一"},
+		{ID: 2, Content: "记忆二"},
+		{ID: 0, Content: "未落库记录（无 ID，跳过）"},
+	}}
+	d := NewDispatcher(nil, nil, nil, nil, nil).WithBlockMemorySearcher(mock)
+	d.injectRecalledMemory(context.Background(), "查询任务", "")
+	if mock.bumpCalls != 2 {
+		t.Fatalf("expected 2 bumps (ids 1,2), got %d", mock.bumpCalls)
 	}
 }
 
@@ -222,7 +291,7 @@ func TestAssembleTaskWithDualPrefixes_NoNestedMarker(t *testing.T) {
 	if p := d.buildSharedPrefix(context.Background(), "meta"); p != "" {
 		prefixes = append(prefixes, p)
 	}
-	if p := d.injectRecalledMemory(context.Background(), ""); p != "" {
+	if p, _ := d.injectRecalledMemory(context.Background(), "查询任务", ""); p != "" {
 		prefixes = append(prefixes, p)
 	}
 	task := strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + "原任务"

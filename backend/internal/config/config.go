@@ -69,6 +69,11 @@ type SafetyConfig struct {
 	ToolSandboxDisabled     bool     `yaml:"tool_sandbox_disabled"`      // true 时关闭写路径逃逸检测（保留命令黑名单）
 	ToolSandboxAllowedPaths []string `yaml:"tool_sandbox_allowed_paths"` // 允许读写的额外绝对路径白名单
 	ToolSandboxBlockedCmds  []string `yaml:"tool_sandbox_blocked_cmds"`  // 额外命令黑名单（追加到默认黑名单）
+	// ProductionWorkDir 生产环境工作目录（绝对路径，默认空=未启用）。
+	// 非空且当前工具工作目录等于/位于其下时，破坏性工具（WriteFile、写类/危险 RunCommand）
+	// 经 approvalHook 推「需确认」事件，上层暂停会话等用户确认；空时仅在命中危险命令模式
+	// （git push/rm -rf/drop table 等，见 tool/destructive.go）时要求确认。
+	ProductionWorkDir string `yaml:"production_workdir"`
 }
 
 // FeatureTogglesConfig Agent 特性开关配置。

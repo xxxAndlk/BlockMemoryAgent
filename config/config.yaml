@@ -85,6 +85,7 @@ agent:
   tool_sandbox_disabled: false   # true 时关闭写路径逃逸检测（保留命令黑名单）
   tool_sandbox_allowed_paths: [] # 允许读写的额外绝对路径白名单
   tool_sandbox_blocked_cmds: []  # 追加到默认命令黑名单的额外命令
+  production_workdir: ""         # 生产环境工作目录（绝对路径）；非空时其下的破坏性操作（WriteFile/写类命令）需用户确认；空=仅危险命令模式（git push/rm -rf 等）需确认
 
 # 日志文件输出（按天分割，按入口分文件）
 # 后端入口 -> logs/backend/YYYY-MM-DD.log
