@@ -132,6 +132,9 @@ type (
 		// Responsibility 为职责边界描述，仅 role_id="domain" 时必填，
 		// 注入 DomainAgent 系统提示词头部，防止长 ReAct 循环中越界实现他域文件。
 		Responsibility string `json:"responsibility" description:"职责边界（<=200 字）：写明该领域 Agent 负责哪些文件/模块、不碰哪些。role_id=domain 时必填，会注入子 Agent 系统提示词。"`
+		// Mode 为派发执行模式（TODO #29）：react（默认）/ reflection / plan_execute。
+		// 空串按 react 处理，零行为变化。
+		Mode string `json:"mode" description:"派发执行模式（可选）：react（默认，直接 ReAct 循环）/ reflection（产出后对照验收标准自检，不达标带反馈重试）/ plan_execute（先出步骤计划再逐步执行）。琐碎单步任务省略；正确性敏感任务用 reflection；多步骤长任务用 plan_execute。"`
 	}
 )
 

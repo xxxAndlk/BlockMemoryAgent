@@ -26,4 +26,11 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if cfg.Agent.SpecEnforcementEnabled == nil || !*cfg.Agent.SpecEnforcementEnabled {
 		t.Fatal("spec_enforcement_enabled 默认应为 true")
 	}
+	// 派发执行模式引擎参数（TODO #29）：config.yaml 显式配置 + applyDefaults 兜底。
+	if cfg.Agent.ReflectionMaxRounds != 2 {
+		t.Fatalf("reflection_max_rounds 应为 2，got %d", cfg.Agent.ReflectionMaxRounds)
+	}
+	if cfg.Agent.PlanExecuteMaxSteps != 8 {
+		t.Fatalf("plan_execute_max_steps 应为 8，got %d", cfg.Agent.PlanExecuteMaxSteps)
+	}
 }

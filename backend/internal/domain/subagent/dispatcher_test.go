@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
@@ -1123,7 +1124,7 @@ func TestDispatcher_DomainResponsibilityInjection(t *testing.T) {
 		t.Fatal("domain role not registered")
 	}
 	_, _, err := d.runSubAgentOnce(context.Background(), "meta", "meta/domain-1", *roleDef,
-		"实现 config.js 数值表", "配置", "负责 config.js/index.html/css；禁止碰 js/engine 下文件")
+		"实现 config.js 数值表", "配置", "负责 config.js/index.html/css；禁止碰 js/engine 下文件", "")
 	if err != nil {
 		t.Fatalf("runSubAgentOnce: %v", err)
 	}
@@ -1184,5 +1185,177 @@ func TestDispatcher_DomainResponsibilityRequired(t *testing.T) {
 	}
 	if !strings.Contains(res.Error, "responsibility is required") {
 		t.Fatalf("unexpected error: %s", res.Error)
+	}
+}
+
+// ---- TODO #29 派发执行模式：mode 穿透 + 三引擎 dispatch 级验证 ----
+
+// scriptedProvider 按调用顺序返回预设文本；供 mode 引擎穿透测试使用（超出脚本返回尾串）。
+type scriptedProvider struct {
+	mu      sync.Mutex
+	replies []string
+	calls   int
+}
+
+func (m *scriptedProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	text := "out of script"
+	if m.calls < len(m.replies) {
+		text = m.replies[m.calls]
+	}
+	m.calls++
+	return &blades.ModelResponse{Message: blades.AssistantMessage(text)}, nil
+}
+
+func (m *scriptedProvider) callsCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls
+}
+
+// waitMailboxDrain 轮询父邮箱直到收到一条消息，返回其正文。
+func waitMailboxDrain(t *testing.T, mb *mailbox.Mailbox, parent string) string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if msgs := mb.Drain(parent); len(msgs) > 0 {
+			return msgs[0].Body
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for sub-agent mailbox message")
+	return ""
+}
+
+// TestDispatch_ModeReflection 验证 mode=reflection 穿透到引擎：子 Agent 产出后
+// 经自检辅助 LLM 判定通过（额外一次 provider 调用 = 自检调用），结果回传父邮箱。
+func TestDispatch_ModeReflection(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	sp := &scriptedProvider{replies: []string{"done", `{"pass": true, "feedback": ""}`}}
+	d := NewDispatcher(reg, &mockModelFactory{provider: sp}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.RegisterCallTool(toolsReg)
+	d.WithEngineConfig(2, 8)
+
+	ctx := agent.WithAgentID(context.Background(), "meta")
+	res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+		"role_id": "code_assistant",
+		"task":    "write tests",
+		"mode":    "reflection",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
+	}
+	if body := waitMailboxDrain(t, mb, "meta"); body != "done" {
+		t.Fatalf("expected summary 'done', got %q", body)
+	}
+	// 1 次 ReAct 产出 + 1 次自检辅助调用（证明 reflection 引擎被选中执行）。
+	if got := sp.callsCount(); got != 2 {
+		t.Fatalf("expected 2 provider calls (1 react + 1 reflect), got %d", got)
+	}
+}
+
+// TestDispatch_ModePlanExecute 验证 mode=plan_execute 穿透：先规划（辅助调用）再
+// 逐步执行（2 步 + 汇总），计划落 board（TUI 可见），最终结果回传父邮箱。
+func TestDispatch_ModePlanExecute(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	bm := board.NewManager()
+	sp := &scriptedProvider{replies: []string{
+		`[{"title": "写配置", "instruction": "写 config.js"}, {"title": "写逻辑", "instruction": "写 game.js"}]`,
+		"s1 done", "s2 done", "final",
+	}}
+	d := NewDispatcher(reg, &mockModelFactory{provider: sp}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.RegisterCallTool(toolsReg)
+	d.WithEngineConfig(2, 8)
+	d.WithBoard(bm.Get, bm.GetOrCreate)
+
+	ctx := tool.WithSessionID(agent.WithAgentID(context.Background(), "session-1"), "session-1")
+	res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+		"role_id": "code_assistant",
+		"task":    "build a tower defense game",
+		"mode":    "plan_execute",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
+	}
+	if body := waitMailboxDrain(t, mb, "session-1"); body != "final" {
+		t.Fatalf("expected summary 'final', got %q", body)
+	}
+	// 1 次规划 + 2 步 + 1 次汇总 = 4 次 provider 调用。
+	if got := sp.callsCount(); got != 4 {
+		t.Fatalf("expected 4 provider calls (1 plan + 2 steps + 1 finalize), got %d", got)
+	}
+	// 计划落板：session-1 看板应含 2 个计划任务。
+	b := bm.Get("session-1")
+	if b == nil {
+		t.Fatal("board not created for session-1")
+	}
+	if tasks := b.Snapshot().Tasks; len(tasks) != 2 {
+		t.Fatalf("expected 2 plan tasks on board, got %d", len(tasks))
+	}
+}
+
+// TestDispatch_ModeValidation 非法 mode 拒绝（单派与批量逐项）。
+func TestDispatch_ModeValidation(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg, mailbox.New(), agent.NopMemoryPipeline{})
+	d.RegisterCallTool(toolsReg)
+
+	ctx := agent.WithAgentID(context.Background(), "meta")
+	// 单派非法 mode。
+	res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+		"role_id": "code_assistant", "task": "t", "mode": "hyper",
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if !strings.Contains(res.Error, "unknown mode") {
+		t.Fatalf("expected unknown mode error, got: %s", res.Error)
+	}
+	// 批量含非法 mode 项。
+	res2, _ := toolsReg.Dispatch(ctx, "call_sub_agents", map[string]any{
+		"tasks": []any{
+			map[string]any{"role_id": "code_assistant", "task": "t", "mode": "hyper"},
+		},
+	})
+	if !strings.Contains(res2.Error, "unknown mode") {
+		t.Fatalf("expected unknown mode error in batch, got: %s", res2.Error)
+	}
+	// 合法 mode 全枚举放行（react/reflection/plan_execute 空串）。
+	for _, mode := range []string{"", "react", "reflection", "plan_execute"} {
+		args := map[string]any{"role_id": "code_assistant", "task": "t"}
+		if mode != "" {
+			args["mode"] = mode
+		}
+		res3, _ := toolsReg.Dispatch(ctx, "call_sub_agent", args)
+		if !res3.Success {
+			t.Fatalf("mode=%q should pass validation, got: %s", mode, res3.Error)
+		}
 	}
 }

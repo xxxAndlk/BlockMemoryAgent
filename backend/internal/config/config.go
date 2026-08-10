@@ -118,6 +118,12 @@ type AgentConfig struct {
 	// 默认 0=不限；>0 时超时未答复工具返回"用户未答复，自行决策"。单次调用可经
 	// ask_user(timeout_sec=N) 覆盖。
 	AskUserTimeoutSec int `yaml:"ask_user_timeout_sec"`
+	// ReflectionMaxRounds 派发 mode=reflection 时自检不达标重试轮数上限（TODO #29）。
+	// 默认 2；<=0 引擎内部按默认。每轮自检成本 ≈ +1 次辅助 LLM 调用。
+	ReflectionMaxRounds int `yaml:"reflection_max_rounds"`
+	// PlanExecuteMaxSteps 派发 mode=plan_execute 时最大执行步数（TODO #29）。
+	// 默认 8；<=0 引擎内部按默认。超限后强制收口终答。
+	PlanExecuteMaxSteps int `yaml:"plan_execute_max_steps"`
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -445,6 +451,13 @@ func (c *Config) applyAgentStandaloneDefaults() {
 	// domain 心跳默认 0 = 2× 叶子（bootstrap 侧兜底），此处只保证非负。
 	if c.Agent.DomainHeartbeatTimeoutMin < 0 {
 		c.Agent.DomainHeartbeatTimeoutMin = 0
+	}
+	// 派发执行模式引擎参数（TODO #29）：reflection 自检轮数 / plan_execute 最大步数。
+	if c.Agent.ReflectionMaxRounds == 0 {
+		c.Agent.ReflectionMaxRounds = 2
+	}
+	if c.Agent.PlanExecuteMaxSteps == 0 {
+		c.Agent.PlanExecuteMaxSteps = 8
 	}
 }
 

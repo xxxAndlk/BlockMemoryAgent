@@ -190,6 +190,29 @@ err := middleware.NewTool(toolCtx). // toolCtx: Session/Caller/Name/Args/Result/
     - 不做：不做多用户/ACL（当前单用户，§11.1 触发器命中再议）；不做隐式行为追踪统计（只从对话内容提取）；画像不参与向量召回排序。
     - 开放动作：web 端画像页；与 #24 ask_user 联动（画像不确定时主动问）。
 
+29. **派发执行模式选择：ReAct / Plan-and-Execute / Reflection Loop 三引擎**（✅ 已完成 2026-08-10，doc/变更.md 任务 15）
+    - 背景：现行体制 kimi+K3 当 MetaAgent、claudecode+deepseek-v4-flash 当执行节点、deepseek 自检后再由 K3 复检——慢且成功率不高。根因之一：所有被派发 Agent 不分任务形态跑同一个裸 ReAct 循环（`agent/react_agent.go RunWithHistory`），简单任务白烧反思开销、复杂任务无规划直接上手翻车；"自检+复检"只靠提示词约定，无机制保证。目标：派发子 Agent 时可显式选择执行模式，MetaAgent 自身也可选模式。
+    - 落地（与原方案差异见下）：`agent/engine.go`——`Engine` 接口 + `ReflectEngine`（产出后对照验收标准自检、不达标带反馈重试、轮数上限默认 2、fail-open）+ `PlanExecuteEngine`（先出步骤计划落 board TUI 可见 → 逐步执行 → 汇总终答、超步数截断、规划失败降级纯 ReAct）；`ReActAgent.Run` 即默认 ReAct 引擎（省略 mode 零行为变化）。dispatcher `call_sub_agent`/`call_sub_agents` 加 `mode` 枚举（非法值拒绝）穿透到引擎；配置 `reflection_max_rounds`/`plan_execute_max_steps`；roles.yaml meta【执行模式选择】规程；bootstrap `WithEngineConfig` 接线。
+    - **差异一**：TODO 原写"Reflection Loop = ReAct 产出后套'对照验收标准自检'外壳，轻量调用走 `CallLightweightWithRetry`"——落地改为从模型工厂取**同角色 provider** 适配（`NewEngineLLM`），复用 dispatcher 既有 `GetBladesProvider` 通路（dispatcher 层不引入对 model 包的依赖，测试可注入 mock）；轻量模型仍可用于未来换低成本端点。
+    - **差异二**：TODO 原写 Plan-and-Execute"失败时 replan"——落地为"逐步执行 + 超步数截断 + 全部完成后汇总终答"，**未做失败 replan**（单步失败即整体失败回传父 Agent，与 #23 结构化失败+自动重派机制衔接，避免重规划环路无兜底）；replan 列为后续项。
+    - 未做（TODO 明确不做）：自动模式学习/路由；MetaAgent 默认不启用非 ReAct 模式（meta prompt 规程按任务复杂度选模式）。
+    - 已知语义弱化（注释留痕）：token 预算按步/按轮重置（各 RunWithHistory 独立计 budget），总成本由 sub_agent_timeout 墙钟兜底。
+    - 可行性：
+      - 三种模式共享同一 Agent 骨架（LLM 调用、工具派发、历史/记忆管理全部复用 ReActAgent 既有件），差异只在"循环策略"一层——抽 `Engine` 接口即可插拔，不动中间件链（#19 另线）、记忆层、dispatcher 主逻辑，风险可控。
+      - ReAct = 现有循环原样适配为默认引擎，省略 mode = 零行为变化。
+      - Reflection Loop = ReAct 产出后套"对照验收标准自检 → 不达标带反馈重试"外壳，轻量调用走 `CallLightweightWithRetry` 既有范式，每轮成本 ≈ +1 次轻量 LLM 调用，轮数硬上限兜底。
+      - Plan-and-Execute = 先出步骤计划再逐步执行、失败重规划；#22 已接线的 board.TaskBoard（write_plan / 依赖门 / 状态回写 / TUI 面板）全是现成底座，计划落板即可见。
+      - MetaAgent 侧：meta 本身也是 ReActAgent，同一 Engine 接口直接适用；但 meta 的价值在派发决策质量，建议默认 ReAct，把"按任务复杂度为每次派发选模式"写成 prompt 规程，不给 meta 套重壳。
+    - 执行流程：
+      1. Engine 抽象（`backend/internal/agent/` 新增）：`Engine` 接口统一执行入口，现有 `RunWithHistory` 主循环适配为 ReAct 引擎（默认）；构造子 Agent 处按 mode 选引擎。
+      2. ReflectEngine：包装 ReAct 循环，产出后对照任务验收标准自检，不达标带反馈重试；`config.go` 加 `reflection_max_rounds`（默认 2）。
+      3. PlanExecuteEngine：LLM 生成步骤计划（落 board，TUI 可见）→ 逐步执行 → 失败时 replan；`config.go` 加 `plan_execute_max_steps`。
+      4. dispatcher 穿线：`call_sub_agent` 链路加 mode 字段穿透到子 Agent 构造；`builtin.go` schema 加 `mode` 枚举（`react` / `reflection` / `plan_execute`，默认 react）。
+      5. bootstrap 接线 + roles.yaml：meta prompt 加【执行模式选择】段——琐碎/单步任务 react；正确性敏感任务 reflection；多步骤长任务 plan_execute；MetaAgent 自身默认 react。
+      6. 测试（TDD）：fake LLM 下三引擎行为单测（reflection 不达标带反馈重试 / plan_execute 先写计划再逐步执行 / react 零变化）；mode 穿透 dispatch 断言；schema 校验；双模块 `go test ./...` 绿。
+    - 验收：TUI 塔防回归中 MetaAgent 对多文件 codegen 任务选 plan_execute 或 reflection 并成功交付；省略 mode 的旧会话行为完全不变。
+    - 不做：不做自动模式学习/路由（先人工指定 + meta prompt 规程，样本够再议）；不动 #19 中间件另线与 #21 verifyloop 归档结论；MetaAgent 默认不启用非 ReAct 模式。
+
 
 ## 已完成（已归档到 git 历史）
 

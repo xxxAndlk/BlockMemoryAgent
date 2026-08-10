@@ -857,7 +857,7 @@ func (r *Registry) Schema() []tools.Tool {
 			desc = d.Description()
 		}
 		if t, err := tools.NewFunc("call_sub_agent", desc, func(ctx context.Context, in callSubAgentInput) (string, error) {
-			res, _ := r.Dispatch(ctx, "call_sub_agent", map[string]any{"role_id": in.RoleID, "task": in.Task, "domain": in.Domain, "responsibility": in.Responsibility})
+			res, _ := r.Dispatch(ctx, "call_sub_agent", map[string]any{"role_id": in.RoleID, "task": in.Task, "domain": in.Domain, "responsibility": in.Responsibility, "mode": in.Mode})
 			b, _ := marshalNoHTMLEscape(res)
 			return string(b), nil
 		}); err == nil {

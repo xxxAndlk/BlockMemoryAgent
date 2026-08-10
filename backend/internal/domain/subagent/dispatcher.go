@@ -41,6 +41,9 @@ type callSubAgentInput struct {
 	// Responsibility 职责边界描述（仅 role_id="domain" 时有效），注入子 Agent 系统提示词，
 	// 防止长 ReAct 循环中 task 被历史压缩后领域身份丢失。
 	Responsibility string `json:"responsibility"`
+	// Mode 派发执行模式（TODO #29）：react（默认）/ reflection / plan_execute。
+	// 空串按 react 处理（零行为变化）。
+	Mode string `json:"mode"`
 }
 
 // ModelProviderFactory 是 model.ModelFactory 的子集，
@@ -183,6 +186,13 @@ type Dispatcher struct {
 	// 同任务同前缀重跑一次；domain/timeout/killed/loop_guard 不自动重试（交 MetaAgent 决策）。
 	// 与 LLM 调用层重试（react_agent retry_count）正交：那层重试的是模型调用本身。
 	dispatchRetryCount int
+
+	// reflectionMaxRounds 派发 mode=reflection 时自检不达标重试轮数上限（TODO #29）。
+	// <=0 时引擎内部按默认 2 兜底；bootstrap 从 config.ReflectionMaxRounds 注入。
+	reflectionMaxRounds int
+	// planMaxSteps 派发 mode=plan_execute 时最大执行步数（TODO #29）。
+	// <=0 时引擎内部按默认 8 兜底；bootstrap 从 config.PlanExecuteMaxSteps 注入。
+	planMaxSteps int
 
 	// factExtractor 从子 Agent 输出中提取关键事实，替代原始 result.Text 直接落库。
 	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
@@ -636,6 +646,16 @@ func (d *Dispatcher) WithDispatchRetryCount(n int) *Dispatcher {
 	return d
 }
 
+// WithEngineConfig 配置派发执行模式引擎参数（TODO #29）。
+// reflectionMaxRounds 为 mode=reflection 自检重试轮数（<=0 引擎按默认 2）；
+// planMaxSteps 为 mode=plan_execute 最大执行步数（<=0 引擎按默认 8）。
+// bootstrap 按 cfg.Agent.ReflectionMaxRounds / PlanExecuteMaxSteps 注入。
+func (d *Dispatcher) WithEngineConfig(reflectionMaxRounds, planMaxSteps int) *Dispatcher {
+	d.reflectionMaxRounds = reflectionMaxRounds
+	d.planMaxSteps = planMaxSteps
+	return d
+}
+
 // WithSalvageExtractor 注入失败打捞提取器，使失败路径（超时/被杀/守卫终止）尝试
 // LLM 提取打捞摘要（已读文件/已得结论/卡点）写入共享槽位并回灌父 mailbox。
 // 传 nil 关闭 LLM 提取（默认关闭），回退末条 assistant 文本截断。
@@ -873,12 +893,15 @@ func (t *callSubAgentTool) Description() string {
 		"用于子 Agent 展示名（\"金融领域Agent\"）。固定助手忽略此字段，用其角色名。\n" +
 		"【responsibility 字段】role_id=\"domain\" 时必填：该领域 Agent 的职责边界（<= 200 字），" +
 		"写明负责哪些文件/模块、不碰哪些。会注入子 Agent 系统提示词，长跑不丢。\n\n" +
+		"【mode 字段】（可选）派发执行模式：react（默认）/ reflection / plan_execute。" +
+		"琐碎单步任务省略；正确性敏感任务（算法/迁移/重构）用 reflection——执行后自动对照验收标准自检，不达标带反馈重试；" +
+		"多步骤长任务（多文件/多阶段）用 plan_execute——先出步骤计划（TUI 可见）再逐步执行。判断不准时省略，默认 react。\n\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
 // validateDispatchArgs 校验单次派发的必要参数；返回空串表示通过，否则为错误文案。
 // 供 call_sub_agent 与 call_sub_agents 复用（批量工具逐项校验）。
-func validateDispatchArgs(roleID, task, responsibility string) string {
+func validateDispatchArgs(roleID, task, responsibility, mode string) string {
 	// 校验必要参数：role_id 与 task 均不能为空。
 	if roleID == "" || task == "" {
 		return "role_id and task are required"
@@ -899,6 +922,12 @@ func validateDispatchArgs(roleID, task, responsibility string) string {
 		return fmt.Sprintf(
 			"task too long: %d runes (max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（2000 字内）",
 			n, maxTaskRunes)
+	}
+	// mode 枚举校验（TODO #29）：空串=react（默认），非法值拒绝，防引擎拼错静默跑错模式。
+	switch mode {
+	case "", agent.ModeReact, agent.ModeReflection, agent.ModePlanExecute:
+	default:
+		return fmt.Sprintf("unknown mode %q: 可选 react / reflection / plan_execute（省略=react）", mode)
 	}
 	return ""
 }
@@ -926,8 +955,10 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	domain, _ := args["domain"].(string)
 	// responsibility 可选：仅 role_id="domain" 时注入子 Agent 系统提示词，钉住职责边界。
 	responsibility, _ := args["responsibility"].(string)
+	// mode 可选：派发执行模式（react/reflection/plan_execute），空串=react（默认）。
+	mode, _ := args["mode"].(string)
 
-	if msg := validateDispatchArgs(roleID, task, responsibility); msg != "" {
+	if msg := validateDispatchArgs(roleID, task, responsibility, mode); msg != "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: msg}
 	}
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
@@ -939,7 +970,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: msg}
 	}
 
-	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility)
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode)
 	if errRes != nil {
 		errRes.Tool = "call_sub_agent"
 		return errRes
@@ -949,9 +980,11 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 
 // dispatchOne 执行一次子 Agent 异步派发：权限校验→同领域去重→全局限额→注册树→goroutine。
 // 成功返回 subAgentID；失败返回 *tool.Result（Error 非空，Tool 字段由调用方按工具名覆盖）。
+// mode 为派发执行模式（react/reflection/plan_execute，空串=react，TODO #29），
+// 穿透到子 Agent 构造时的引擎选择。
 // 前置：调用方已完成参数校验（validateDispatchArgs）与 spec 强制校验。
 // 供 call_sub_agent（单个）与 call_sub_agents（批量同波）两个工具复用。
-func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility string) (string, *tool.Result) {
+func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode string) (string, *tool.Result) {
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
 	if parentID == "" {
@@ -1068,7 +1101,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
 		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
-		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, started)
+		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, mode, started)
 		if !paused {
 			meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
 		}
@@ -1098,8 +1131,9 @@ func (t *callSubAgentsTool) Description() string {
 		"多文件创建/多领域拆分任务的**全部建设领域必须用它一次派出**，禁止按依赖关系分波串行——" +
 		"共享契约已钉死集成点，领域产物互为独立文件，后写的不需要等先写的落盘" +
 		"（v6 实证：4 个建设领域分 2 波，第二波晚启动 24 分钟，交付死线直接判负）。\n" +
-		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?}，" +
-		"字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=2000 字）。\n" +
+		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?}，" +
+		"字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=2000 字；" +
+		"mode 可选 react/reflection/plan_execute，省略=react）。\n" +
 		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
 		"否则返回 \"spec missing or stale\"。逐项返回派出结果：某项失败不影响其他项。"
 }
@@ -1118,7 +1152,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("batch too large: %d 项（max %d）。超过请合并领域或分批", len(raw), maxBatch)}
 	}
 
-	type batchItem struct{ roleID, domain, task, responsibility string }
+	type batchItem struct{ roleID, domain, task, responsibility, mode string }
 	items := make([]batchItem, 0, len(raw))
 	for i, r := range raw {
 		m, ok := r.(map[string]any)
@@ -1130,7 +1164,8 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.task, _ = m["task"].(string)
 		it.domain, _ = m["domain"].(string)
 		it.responsibility, _ = m["responsibility"].(string)
-		if msg := validateDispatchArgs(it.roleID, it.task, it.responsibility); msg != "" {
+		it.mode, _ = m["mode"].(string)
+		if msg := validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode); msg != "" {
 			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg)}
 		}
 		items = append(items, it)
@@ -1146,7 +1181,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 
 	var okIDs, errs []string
 	for _, it := range items {
-		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility)
+		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode)
 		if errRes != nil {
 			errs = append(errs, fmt.Sprintf("%s(%s): %s", it.roleID, it.domain, errRes.Error))
 			continue
@@ -1166,10 +1201,11 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 // started 为派发起始时间，用于计算耗时并写入完成/失败日志。
 // domain 为领域分类简称（仅 role_id="domain" 时有效，用于子 Agent 展示名）。
 // responsibility 为职责边界描述，注入 DomainAgent 系统提示词。
+// mode 为派发执行模式（react/reflection/plan_execute，TODO #29），穿透到引擎选择。
 // 返回 paused=true 表示 DomainAgent 触达 token 上限进入 Paused(已存 history + tree.Pause),
 // 调用方不应 trackChildDone(保持父未决计数 >0 触发 MetaAgent 暂停)。
-func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string, started time.Time) bool {
-	result, err, retried := d.runSubAgentWithAutoRetry(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
+func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode string, started time.Time) bool {
+	result, err, retried := d.runSubAgentWithAutoRetry(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode)
 	// Layer 5：从子 Agent 历史扫 WriteFile 调用收集修改文件，随完成通知回灌父 LLM。
 	files := agent.FilesModifiedFromHistory(result.History)
 	duration := time.Since(started)
@@ -1228,9 +1264,10 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 //（TODO #23 最小一档，同任务同前缀，fresh 计数）。domain/timeout/killed/loop_guard/
 // 预算部分返回不自动重试——domain 交 MetaAgent 决策、墙钟类重试无意义，避免放大故障。
 // 与 LLM 调用层重试（react_agent retry_count）正交：那层重试模型调用本身，这层重跑整个 Agent。
+// mode 为派发执行模式，自动重派沿用同一模式。
 // 返回 (result, err, retried)：retried=true 表示本轮失败已重试过一次（二次失败终报）。
-func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string) (agent.ReactResult, error, bool) {
-	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
+func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode string) (agent.ReactResult, error, bool) {
+	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode)
 	if err == nil || d.dispatchRetryCount <= 0 {
 		return result, err, false
 	}
@@ -1240,7 +1277,7 @@ func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, sub
 		return result, err, false
 	}
 	log.Printf("[subagent] AUTO-RETRY: sub=%s role=%s err=%v (dispatch retry %d)", subAgentID, roleDef.ID, err, d.dispatchRetryCount)
-	_, result2, err2 := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility)
+	_, result2, err2 := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode)
 	return result2, err2, true
 }
 
@@ -1263,10 +1300,13 @@ func (d *Dispatcher) treeFinish(ctx context.Context, subAgentID, summary string,
 // 返回子 Agent 实例 + 完整结果 + 错误。不 notify、不触发钩子、不进入实例池。
 // 供异步 runSubAgent 包装器与同步 ExecuteChild（编排器）共用。
 //
+// mode 为派发执行模式（react/reflection/plan_execute，TODO #29）：
+// 空串/未知值走默认 ReAct 引擎；reflection/plan_execute 由 runEngine 按引擎包装。
+//
 // 错误语义：
 //   - 获取 provider 失败、Run 返回 error、LimitReached 均返回非 nil err；
 //   - 成功时 err == nil，result.Text 为最终答复。
-func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility string) (*agent.ReActAgent, agent.ReactResult, error) {
+func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode string) (*agent.ReActAgent, agent.ReactResult, error) {
 	provider, err := d.models.GetBladesProvider(ctx, roleDef.ID)
 	if err != nil {
 		return nil, agent.ReactResult{}, fmt.Errorf("get model: %w", err)
@@ -1390,7 +1430,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		task = strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + task
 	}
 
-	result, err := sub.Run(ctx, task)
+	result, err := d.runEngine(ctx, sub, subAgentID, roleDef.ID, mode, task)
 	if err != nil {
 		return sub, result, fmt.Errorf("run: %w", err)
 	}
@@ -1432,6 +1472,68 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	d.saveBlockMemory(ctx, subAgentID, roleDef.ID, origTask, result.Text, blockOutcomeSuccess)
 
 	return sub, result, nil
+}
+
+// runEngine 按派发执行模式（TODO #29）选择引擎驱动子 Agent：
+//   - react（默认/空串）= 裸 ReAct 主循环（零行为变化）；
+//   - reflection = ReflectEngine：产出后对照验收标准自检，不达标带反馈重试；
+//   - plan_execute = PlanExecuteEngine：先出步骤计划（落 board）再逐步执行。
+//
+// 引擎辅助 LLM（自检/规划）从模型工厂取同角色 provider 适配；缺失/失败时
+// 引擎内部 fail-open 降级为纯 ReAct，不阻塞派发主流程。
+func (d *Dispatcher) runEngine(ctx context.Context, sub *agent.ReActAgent, subAgentID, roleID, mode, task string) (agent.ReactResult, error) {
+	switch mode {
+	case agent.ModeReflection:
+		return agent.NewReflectEngine(sub, agent.EngineOptions{
+			LLM:                 d.engineLLM(ctx, roleID),
+			MaxReflectionRounds: d.reflectionMaxRounds,
+		}).Run(ctx, task)
+	case agent.ModePlanExecute:
+		return agent.NewPlanExecuteEngine(sub, agent.EngineOptions{
+			LLM:          d.engineLLM(ctx, roleID),
+			PlanMaxSteps: d.planMaxSteps,
+			PlanSink:     d.planSink(ctx, subAgentID),
+		}).Run(ctx, task)
+	default:
+		return sub.Run(ctx, task)
+	}
+}
+
+// engineLLM 构造引擎辅助 LLM（自检/规划）：从模型工厂取同角色 provider 适配为文本补全。
+// 取 provider 失败时返回的 LLMComplete 每次调用报错，引擎 fail-open 降级为纯 ReAct。
+func (d *Dispatcher) engineLLM(ctx context.Context, roleID string) agent.LLMComplete {
+	return func(ctx context.Context, prompt string) (string, error) {
+		p, err := d.models.GetBladesProvider(ctx, roleID)
+		if err != nil {
+			return "", err
+		}
+		return agent.NewEngineLLM(p)(ctx, prompt)
+	}
+}
+
+// planSink 把 plan_execute 引擎的步骤计划写入会话看板（TUI 可见，TODO #29）。
+// 任务 ID 用 subAgentID 前缀防与 MetaAgent write_plan 冲突；board 不可用时静默跳过。
+// 步骤不设 domain：plan_execute 步骤由执行 Agent 内部逐步跑，不经派发依赖门。
+func (d *Dispatcher) planSink(ctx context.Context, subAgentID string) func(goal string, steps []agent.PlanStep) error {
+	return func(goal string, steps []agent.PlanStep) error {
+		sid := tool.SessionIDFromContext(ctx)
+		if sid == "" || d.boardFnCreate == nil || len(steps) == 0 {
+			return nil
+		}
+		b := d.boardFnCreate(sid, goal)
+		if b == nil {
+			return nil
+		}
+		prefix := strings.ReplaceAll(subAgentID, "/", "_")
+		tasks := make([]board.PlanTask, 0, len(steps))
+		for i, st := range steps {
+			tasks = append(tasks, board.PlanTask{
+				ID:    fmt.Sprintf("%s_p%d", prefix, i+1),
+				Title: st.Title,
+			})
+		}
+		return b.SetPlan(goal, tasks)
+	}
 }
 
 // ResumePaused 恢复一个因触达 token 上限而 Paused 的 DomainAgent。
@@ -1730,7 +1832,7 @@ func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task st
 		}()
 	}
 
-	_, result, err := d.runSubAgentOnce(childCtx, parentID, subAgentID, *roleDef, task, "", "")
+	_, result, err := d.runSubAgentOnce(childCtx, parentID, subAgentID, *roleDef, task, "", "", "")
 	if d.treeFn != nil && sid != "" {
 		if t := d.treeFn(sid); t != nil {
 			if err != nil {

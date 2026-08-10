@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // TestRegistrySchema 验证内置工具注册表的 Schema 至少包含 11 个工具定义。
@@ -317,6 +319,35 @@ func TestSchemaIncludesCallSubAgent(t *testing.T) {
 	if !found {
 		t.Fatal("call_sub_agent not found in schema after Register")
 	}
+}
+
+// TestSchemaCallSubAgent_ModeField 验证 call_sub_agent 的 schema 含 mode 参数（TODO #29 三引擎）：
+// 派发执行模式枚举暴露给 LLM，缺失则 LLM 无法感知该字段。
+func TestSchemaCallSubAgent_ModeField(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.Register(&stubCallSubAgent{})
+	for _, tl := range r.Schema() {
+		if tl.Name() != "call_sub_agent" {
+			continue
+		}
+		props := tl.InputSchema().Properties
+		for _, want := range []string{"role_id", "task", "domain", "responsibility", "mode"} {
+			if _, ok := props[want]; !ok {
+				t.Fatalf("call_sub_agent schema missing parameter %q (have %v)", want, keysOf(props))
+			}
+		}
+		return
+	}
+	t.Fatal("call_sub_agent not found in schema")
+}
+
+// keysOf 提取 map 键切片，用于断言信息展示。
+func keysOf(m map[string]*jsonschema.Schema) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // fakeSharedMemoryStore 是测试用 SharedMemoryStore 实现，内存版，无持久化。
