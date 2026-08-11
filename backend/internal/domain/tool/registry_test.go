@@ -740,3 +740,34 @@ func TestExploreBudget_WriteGateRaisesLimit(t *testing.T) {
 		t.Fatalf("expected post-write budget error, got: %s", res.Error)
 	}
 }
+
+// TestWriteFile_TemporaryOutputHasAbsPath 临时文件写入结果带落盘绝对路径（TODO #38-4 根因 D）：
+// 临时文件落在会话级临时目录（.bma/tmp/<sid>/，路径不可预测），Output 必须携带绝对路径与
+// $env:BMA_SESSION_TEMP_DIR 运行提示——Agent 首次运行不再盲猜工作目录路径
+//（事故实证：ca-5 用 <工作目录>\verify-frost.js 找不到模块，白耗 1 条连杀额度）。
+func TestWriteFile_TemporaryOutputHasAbsPath(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s-temp-path")
+
+	res, err := r.Dispatch(ctx, "WriteFile", map[string]any{
+		"path":      "verify-frost.js",
+		"content":   "const x = 1;",
+		"temporary": true,
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("temporary write should succeed: err=%v success=%v", err, res.Success)
+	}
+	if !strings.Contains(res.Output, "bytes to ") || !strings.Contains(res.Output, "verify-frost.js") {
+		t.Fatalf("output should carry abs path + size, got: %q", res.Output)
+	}
+	if !strings.Contains(res.Output, "$env:BMA_SESSION_TEMP_DIR") {
+		t.Fatalf("output should tell how to reference the temp file, got: %q", res.Output)
+	}
+	if res.Path == "" || res.TempDir == "" {
+		t.Fatalf("result should carry Path/TempDir for cleanup, got path=%q tempdir=%q", res.Path, res.TempDir)
+	}
+	if _, err := os.Stat(res.Path); err != nil {
+		t.Fatalf("temp file should exist at %s: %v", res.Path, err)
+	}
+}

@@ -42,9 +42,11 @@ func TestLoopGuard_ConsecutiveSameRead_ReturnsErrLoopExit(t *testing.T) {
 	}
 }
 
-// TestLoopGuard_ExploreBudget_ReturnsErrLoopExit 探索预算耗尽（写前 8 次）：
-// 第 9 次探索类调用返回 ErrLoopExit；非探索类 RunCommand（验证/动作）不受影响。
-func TestLoopGuard_ExploreBudget_ReturnsErrLoopExit(t *testing.T) {
+// TestLoopGuard_ExploreBudget_SoftBlockThenEscalate 探索预算软阻断（TODO #38-1）：
+// 超预算首次=工具级错误（err nil，Agent 存活可立即改派：domain call_sub_agent 下放叶子、
+// 叶子 WriteFile）；软阻断后仍连续调探索类工具 exploreSoftBlockGrace 次才升级 ErrLoopExit。
+// 非探索类 RunCommand（验证/动作）不受影响。
+func TestLoopGuard_ExploreBudget_SoftBlockThenEscalate(t *testing.T) {
 	dir := t.TempDir()
 	var lines []string
 	for i := 0; i < 60; i++ {
@@ -62,15 +64,30 @@ func TestLoopGuard_ExploreBudget_ReturnsErrLoopExit(t *testing.T) {
 			t.Fatalf("read %d within budget should succeed: err=%v", i, err)
 		}
 	}
-	res9, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(30), "limit": float64(1)})
-	if res9.Success {
+	// 超预算第 1 次：软阻断——工具级错误、err nil，Agent 存活。
+	res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(30), "limit": float64(1)})
+	if res.Success {
 		t.Fatal("read beyond budget should be blocked")
 	}
-	if !strings.Contains(res9.Error, "探索预算耗尽") {
-		t.Fatalf("expected budget error, got: %s", res9.Error)
+	if !strings.Contains(res.Error, "探索预算耗尽") {
+		t.Fatalf("expected budget error, got: %s", res.Error)
 	}
-	if !errors.Is(err, ErrLoopExit) {
-		t.Fatalf("expected ErrLoopExit on explore budget exhaustion, got: %v", err)
+	if err != nil {
+		t.Fatalf("soft block should not kill agent, got: %v", err)
+	}
+	// 软阻断后仍连续调探索（宽限 exploreSoftBlockGrace 次内的被拦调用保持软阻断，
+	// 初始 1 次 + 宽限 2 次共 3 次软提示；offset 各不相同避开连读同参守卫——本测试验证
+	// 探索预算升级路径，不是连读守卫）。
+	for i := 1; i < exploreSoftBlockGrace; i++ {
+		res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(40 + i), "limit": float64(1)})
+		if res.Success || err != nil {
+			t.Fatalf("grace explore call %d should stay soft-blocked: success=%v err=%v", i, res.Success, err)
+		}
+	}
+	// 宽限用尽后下一次被拦调用：升级 ErrLoopExit（真死循环信号：收到改派指导仍复读探索）。
+	res, err = r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(31), "limit": float64(1)})
+	if res.Success || !errors.Is(err, ErrLoopExit) {
+		t.Fatalf("expected escalation to ErrLoopExit after grace, got: success=%v err=%v", res.Success, err)
 	}
 
 	// 回归（#16）：验证/动作类 RunCommand 不计探索预算，预算耗尽后仍可执行。
@@ -78,9 +95,9 @@ func TestLoopGuard_ExploreBudget_ReturnsErrLoopExit(t *testing.T) {
 	if cmdErr != nil || !cmdRes.Success {
 		t.Fatalf("RunCommand verify should survive explore budget exhaustion: err=%v res=%+v", cmdErr, cmdRes)
 	}
-	// 只读型 RunCommand（cat）按探索计费：预算已耗尽，命中守卫。
-	if catRes, catErr := r.Dispatch(ctx, "RunCommand", map[string]any{"command": "cat a.txt"}); catRes.Success || !errors.Is(catErr, ErrLoopExit) {
-		t.Fatalf("read-like RunCommand beyond budget should hit ErrLoopExit: res=%+v err=%v", catRes, catErr)
+	// 回归（#16）：只读型 RunCommand（cat）按探索计费：预算已耗尽 + 超宽限 → 升级强杀。
+	if catRes, catErr := r.Dispatch(ctx, "RunCommand", map[string]any{"command": "cat a.txt"}); catRes.Success || !strings.Contains(catRes.Error, "探索预算耗尽") || !errors.Is(catErr, ErrLoopExit) {
+		t.Fatalf("read-like RunCommand beyond budget should escalate: res=%+v err=%v", catRes, catErr)
 	}
 }
 
@@ -116,6 +133,113 @@ func TestLoopGuard_ConsecutiveFailures_ReturnsErrLoopExit(t *testing.T) {
 	otherRes, otherErr := r.Dispatch(ctx, "ListDir", map[string]any{"path": "no-such-dir"})
 	if otherRes.Success || otherErr != nil {
 		t.Fatalf("other tool failure should be ordinary, res=%+v err=%v", otherRes, otherErr)
+	}
+}
+
+// TestLoopGuard_ConsecutiveFailures_FingerprintVarying 连杀计数加错误指纹（TODO #38-2）：
+// 同一工具报错文本每次不同 = 正在推进（换命令/换报错），计数键变化从 1 重计，永不误杀。
+func TestLoopGuard_ConsecutiveFailures_FingerprintVarying(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	probe := &rejectTool{name: "probe-vary", cat: ResultCategoryExecutionFailed, msg: ""}
+	r.Register(probe)
+	ctx := WithSessionID(context.Background(), "s-fp-vary")
+	for i := 0; i < 10; i++ {
+		probe.msg = fmt.Sprintf("error variant %d", i)
+		res, err := r.Dispatch(ctx, "probe-vary", nil)
+		if res.Success || err != nil {
+			t.Fatalf("varying error should never kill: iter=%d success=%v err=%v", i, res.Success, err)
+		}
+	}
+}
+
+// TestLoopGuard_ConsecutiveFailures_FingerprintResetOnSuccess 同工具成功调用重置该工具全部指纹计数：
+// 同指纹失败 ×2 → 该工具成功 → 再失败 ×2 不触发，第 3 次同指纹失败才杀
+//（"完全相同调用连杀即终止"的真死循环检测保留；其他工具的成功不重置本工具计数，
+//  事故场景由验证类豁免 + 指纹变化两条路径覆盖）。
+func TestLoopGuard_ConsecutiveFailures_FingerprintResetOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(strings.Repeat("x\n", 60)), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s-fp-reset")
+	// offset 各不相同（避开连读同参守卫）；缺文件报错文本一致 → 同一指纹。
+	fail := func(offset float64) (*Result, error) {
+		return r.Dispatch(ctx, "ReadFile", map[string]any{"path": "missing.txt", "offset": offset, "limit": float64(1)})
+	}
+	for i := 1; i <= 2; i++ {
+		if res, err := fail(float64(i)); res.Success || err != nil {
+			t.Fatalf("fail %d should be ordinary: success=%v err=%v", i, res.Success, err)
+		}
+	}
+	// 中间同工具成功调用重置计数（成功即恢复正常）。
+	if res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(1), "limit": float64(1)}); err != nil || !res.Success {
+		t.Fatalf("read should succeed: err=%v success=%v", err, res.Success)
+	}
+	for i := 3; i <= 4; i++ {
+		if res, err := fail(float64(i)); res.Success || err != nil {
+			t.Fatalf("fail %d after reset should be ordinary: success=%v err=%v", i, res.Success, err)
+		}
+	}
+	// 第 3 次同指纹失败：真死循环信号，ErrLoopExit。
+	res, err := fail(5)
+	if res.Success || !errors.Is(err, ErrLoopExit) {
+		t.Fatalf("3rd same-fingerprint failure after reset should kill: success=%v err=%v", res.Success, err)
+	}
+}
+
+// TestLoopGuard_ConsecutiveFailures_RunCommandFingerprint 连杀指纹作用于 RunCommand：
+// 完全相同命令 + 相同 stderr 报错连续 3 次才 ErrLoopExit（真死循环保留）；
+// 命令不同（骨架变化）= 正在推进，不误杀。
+func TestLoopGuard_ConsecutiveFailures_RunCommandFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s-fp-cmd")
+
+	// 相同命令相同报错 ×3 → 第 3 次杀。
+	cmd := "Get-Content 'C:\\fp-missing-file-xyz.txt'"
+	for i := 1; i <= 2; i++ {
+		res, err := r.Dispatch(ctx, "RunCommand", map[string]any{"command": cmd})
+		if res.Success || err != nil {
+			t.Fatalf("run fail %d should be ordinary: success=%v err=%v", i, res.Success, err)
+		}
+	}
+	res3, err3 := r.Dispatch(ctx, "RunCommand", map[string]any{"command": cmd})
+	if res3.Success || !errors.Is(err3, ErrLoopExit) {
+		t.Fatalf("same command+error ×3 should kill: success=%v err=%v", res3.Success, err3)
+	}
+
+	// 命令骨架不同（换文件）→ 新指纹从 1 重计，连失败 3 次不杀。
+	ctx2 := WithSessionID(context.Background(), "s-fp-cmd2")
+	for _, c := range []string{
+		"Get-Content 'C:\\fp-missing-a.txt'",
+		"Get-Content 'C:\\fp-missing-b.txt'",
+		"Get-Content 'C:\\fp-missing-c.txt'",
+	} {
+		res, err := r.Dispatch(ctx2, "RunCommand", map[string]any{"command": c})
+		if res.Success || err != nil {
+			t.Fatalf("varying command should stay ordinary: success=%v err=%v", res.Success, err)
+		}
+	}
+}
+
+// TestLoopGuard_ConsecutiveFailures_VerificationExempt 验证类命令（--check 等，退出码即有效反馈）
+// 失败不计连杀（TODO #38-2）：同一验证命令同一报错连续 5 次不触发；
+// 模型以"跑检查→看报错→改→再跑"推进时的连续失败是正常调试节奏。
+func TestLoopGuard_ConsecutiveFailures_VerificationExempt(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s-fp-verify")
+	cmd := "Get-ChildItem 'C:\\fp-missing-verify-xyz' --check"
+	for i := 1; i <= 5; i++ {
+		res, err := r.Dispatch(ctx, "RunCommand", map[string]any{"command": cmd})
+		if res.Success {
+			t.Fatalf("verification command should fail (attempt %d)", i)
+		}
+		if err != nil {
+			t.Fatalf("verification failure %d must not kill, got: %v", i, err)
+		}
 	}
 }
 

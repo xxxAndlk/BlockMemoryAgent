@@ -293,6 +293,11 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	if temporary {
 		result.IsTemporary = true
 		result.TempDir = tempDir
+		// 输出落盘绝对路径（TODO #38-4 根因 D）：临时文件落在会话级 .bma/tmp/<sid>/ 下，
+		// 路径不可预测，只写 "wrote N bytes" 会让 Agent 首次运行必猜工作目录路径然后失败
+		//（事故实证：ca-5 用 <工作目录>\verify-frost.js 找不到模块，白耗 1 条连杀额度）。
+		result.Output = fmt.Sprintf("wrote %d bytes to %s（会话临时目录，运行用 $env:BMA_SESSION_TEMP_DIR\\%s）",
+			len(content), absPath, filepath.Base(absPath))
 	}
 	// 返回结果。
 	return result

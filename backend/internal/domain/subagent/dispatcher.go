@@ -939,7 +939,7 @@ func (t *callSubAgentTool) Description() string {
 	return "将子任务派发给指定角色的子 Agent 异步执行。调用立即返回 sub_agent_id；" +
 		"子 Agent 完成后，其结果摘要会以 [mailbox from <sub_agent_id>] 消息送达，请在后续轮次中阅读并整合。\n" +
 		"task 必须自包含 <= 2000 字（按 rune 计数，含中文字符）：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。" +
-		"规格原文走 WriteSharedMemory，不塞进 task。超长 task 将被拒绝，错误提示\"task too long\"。\n\n" +
+		"规格原文走 WriteSharedMemory，不塞进 task。超长 task 将被拒绝，错误提示\"task too long\"（2000-2600 字轻微超限会放行但附压缩警告，>2600 字硬拒）。\n\n" +
 		"【前置依赖】派发前必须先调 WriteSpec(goal, acceptance, constraints, files) 写入任务规范，否则返回错误（spec missing=未写 / spec stale=涉及文件已变更且列出失配路径 / spec invalid=缺 goal 或验收）。" +
 		"WriteSpec 与 WriteSharedMemory 是不同工具：WriteSharedMemory 写自由 KV 供子 Agent 读，" +
 		"WriteSpec 写固定 slot \"spec\" 供 dispatcher 校验并注入子 Agent 任务体前缀。两者不可互相替代。\n\n" +
@@ -957,18 +957,20 @@ func (t *callSubAgentTool) Description() string {
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
-// validateDispatchArgs 校验单次派发的必要参数；返回空串表示通过，否则为错误文案。
+// validateDispatchArgs 校验单次派发的必要参数；返回 (msg, warning)：
+// msg 非空=硬拒绝（校验拒绝，Category=validation_rejected）；否则通过，
+// warning 非空=放行但附提示（task 轻微超限软着陆，TODO #38-3）。
 // 供 call_sub_agent 与 call_sub_agents 复用（批量工具逐项校验）。
-func validateDispatchArgs(roleID, task, responsibility, mode string) string {
+func validateDispatchArgs(roleID, task, responsibility, mode string) (msg, warning string) {
 	// 校验必要参数：role_id 与 task 均不能为空。
 	if roleID == "" || task == "" {
-		return "role_id and task are required"
+		return "role_id and task are required", ""
 	}
 	// role_id="domain" 时 responsibility 必填：dispatcher 把它注入子 Agent 系统提示词头部，
 	// 防止长 ReAct 循环中 task 被历史压缩后领域身份丢失（实证：领域 Agent 越界实现他域文件）。
 	// LLM 经常省略该字段，导致 DomainAgent 拿到的是通用 prompt 无职责边界——此处硬拒绝强制回填。
 	if roleID == "domain" && strings.TrimSpace(responsibility) == "" {
-		return "responsibility is required when role_id=domain: 填该领域 Agent 的职责边界（<=200 字，负责哪些文件/模块、不碰哪些），会注入子 Agent 系统提示词"
+		return "responsibility is required when role_id=domain: 填该领域 Agent 的职责边界（<=200 字，负责哪些文件/模块、不碰哪些），会注入子 Agent 系统提示词", ""
 	}
 	// task 长度上限：强制 MetaAgent 把规格写入 WriteSharedMemory，task 只写目标+验收标准。
 	// 原 500 runes 实证过紧：塔防类任务的自然派发文本 ~1200-1500 runes，每轮必触发
@@ -976,18 +978,26 @@ func validateDispatchArgs(roleID, task, responsibility, mode string) string {
 	// 放宽到 2000 runes：容纳"背景+目标+文件清单+验收"的完整自包含描述，
 	// 仍拦截 3500+ runes 的全量规格转贴（事故日志：3521/2315 runes）。
 	const maxTaskRunes = 2000
+	// 硬上限 2600（TODO #38-3）：2000-2600 轻微超限与"task 自包含（背景+目标+验收）"要求
+	// 天然冲突，硬拒白烧一整轮 MetaAgent 往返（事故实证：2070/2201 runes 被拒后
+	// 第二轮以"精确行号+实现方案"重派才成功）——软着陆放行并附压缩警告；
+	// >2600 仍硬拒（全量规格转贴区间）。
+	const maxTaskRunesHard = 2600
 	if n := utf8.RuneCountInString(task); n > maxTaskRunes {
-		return fmt.Sprintf(
-			"task too long: %d runes (max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（2000 字内）",
-			n, maxTaskRunes)
+		if n > maxTaskRunesHard {
+			return fmt.Sprintf(
+				"task too long: %d runes (hard max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（2000 字内）",
+				n, maxTaskRunesHard), ""
+		}
+		return "", fmt.Sprintf("task 已 %d runes，超出 2000 字预算但未达硬上限 %d，本次放行；下次派发请压缩至 2000 字内", n, maxTaskRunesHard)
 	}
 	// mode 枚举校验（TODO #29）：空串=react（默认），非法值拒绝，防引擎拼错静默跑错模式。
 	switch mode {
 	case "", agent.ModeReact, agent.ModeReflection, agent.ModePlanExecute:
 	default:
-		return fmt.Sprintf("unknown mode %q: 可选 react / reflection / plan_execute（省略=react）", mode)
+		return fmt.Sprintf("unknown mode %q: 可选 react / reflection / plan_execute（省略=react）", mode), ""
 	}
-	return ""
+	return "", ""
 }
 
 // checkSpecBeforeDispatch 做 WriteSpec 强制校验：SpecEnforcementEnabled 开启时，
@@ -1018,7 +1028,8 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	// mode 可选：派发执行模式（react/reflection/plan_execute），空串=react（默认）。
 	mode, _ := args["mode"].(string)
 
-	if msg := validateDispatchArgs(roleID, task, responsibility, mode); msg != "" {
+	msg, warning := validateDispatchArgs(roleID, task, responsibility, mode)
+	if msg != "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
@@ -1035,7 +1046,12 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		errRes.Tool = "call_sub_agent"
 		return errRes
 	}
-	return &tool.Result{Tool: "call_sub_agent", Success: true, Output: subAgentID}
+	out := subAgentID
+	// task 轻微超限软着陆警告（TODO #38-3）：放行但提示下次压缩。
+	if warning != "" {
+		out += "。警告: " + warning
+	}
+	return &tool.Result{Tool: "call_sub_agent", Success: true, Output: out}
 }
 
 // dispatchOne 执行一次子 Agent 异步派发：权限校验→同领域去重→全局限额→注册树→goroutine。
@@ -1212,8 +1228,10 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("batch too large: %d 项（max %d）。超过请合并领域或分批", len(raw), maxBatch), Category: tool.ResultCategoryValidationRejected}
 	}
 
+	// 逐项校验参数；轻微超限（2000-2600 runes）软着陆放行并收集警告（TODO #38-3）。
 	type batchItem struct{ roleID, domain, task, responsibility, mode string }
 	items := make([]batchItem, 0, len(raw))
+	var batchWarnings []string
 	for i, r := range raw {
 		m, ok := r.(map[string]any)
 		if !ok {
@@ -1225,8 +1243,10 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.domain, _ = m["domain"].(string)
 		it.responsibility, _ = m["responsibility"].(string)
 		it.mode, _ = m["mode"].(string)
-		if msg := validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode); msg != "" {
+		if msg, warning := validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode); msg != "" {
 			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
+		} else if warning != "" {
+			batchWarnings = append(batchWarnings, fmt.Sprintf("tasks[%d]: %s", i, warning))
 		}
 		items = append(items, it)
 	}
@@ -1251,6 +1271,9 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 	out := fmt.Sprintf("已并行派出 %d 个子 Agent：%s", len(okIDs), strings.Join(okIDs, ", "))
 	if len(errs) > 0 {
 		out += fmt.Sprintf("\n未派出 %d 个：%s", len(errs), strings.Join(errs, "；"))
+	}
+	if len(batchWarnings) > 0 {
+		out += "\n警告: " + strings.Join(batchWarnings, "；")
 	}
 	return &tool.Result{Tool: "call_sub_agents", Success: len(errs) == 0, Output: out}
 }

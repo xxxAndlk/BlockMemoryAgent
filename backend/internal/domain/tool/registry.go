@@ -78,6 +78,12 @@ func isReadLikeCommand(args map[string]any) bool {
 // 第 2 次直返内容并附一句提醒，第 3 次触发 ActionLoopExit 终止 ReAct 循环兜底。
 const maxConsecutiveSameRead = 3
 
+// exploreSoftBlockGrace 是探索预算软阻断（TODO #38-1）的升级宽限：
+// 超预算后仍连续调探索类工具本数才升级 ErrLoopExit 强杀。
+// 1 次超预算可能是正常收尾（查完最后一个文件就写），软阻断文案已给改派指导，
+// 连续复读探索才是真死循环信号（事故实证 2026-08-10：被杀 domain 打捞文本均在正常推进）。
+const exploreSoftBlockGrace = 3
+
 // Tool 是内置工具的通用接口，所有具体工具都需要实现该接口。
 type Tool interface {
 	// Name 返回工具的标准名称，作为主键用于注册和调度。
@@ -88,14 +94,15 @@ type Tool interface {
 	Execute(ctx context.Context, args map[string]any) *Result
 }
 
-// failureCounter 用于按工具名称统计连续失败次数，
-// 支持并发安全地增加计数和重置计数。
+// failureCounter 用于统计连续失败次数，支持并发安全地增加计数和重置计数。
 // 两类计数（TODO #32）：counts=执行失败（execution_failed，阈值 3 终止）；
 // validationCounts=校验拒绝（validation_rejected，阈值 5 终止）——分开计，互不共享。
+// counts 键为 "工具名\x00错误指纹" 复合键（TODO #38-2）：指纹相同（相同命令与报错）才累加，
+// 命令/报错任何不同即新键从 1 重计——"换方式尝试"是正在推进而非无效重试。
 type failureCounter struct {
 	// mu 保护 counts 与 validationCounts 的读写锁，避免并发竞争。
 	mu sync.Mutex
-	// counts 记录每个工具名称对应的连续执行失败次数。
+	// counts 记录每个 "工具名\x00错误指纹" 对应的连续执行失败次数。
 	counts map[string]int
 	// validationCounts 记录每个工具名称对应的连续校验拒绝次数。
 	validationCounts map[string]int
@@ -109,16 +116,17 @@ func newFailureCounter() *failureCounter {
 	}
 }
 
-// fail 将指定工具的连续失败次数加 1，并返回当前次数。
-func (f *failureCounter) fail(name string) int {
+// fail 将指定工具的连续失败次数加 1（按 工具名\x00指纹 复合键），并返回当前次数。
+func (f *failureCounter) fail(name, fingerprint string) int {
 	// 加锁保护 counts 的并发修改。
 	f.mu.Lock()
 	// 函数退出时释放锁，避免遗忘。
 	defer f.mu.Unlock()
-	// 对应工具计数加 1。
-	f.counts[name]++
+	// 对应复合键计数加 1。
+	key := name + "\x00" + fingerprint
+	f.counts[key]++
 	// 返回增加后的次数，供调用方判断是否达到阈值。
-	return f.counts[name]
+	return f.counts[key]
 }
 
 // failValidation 将指定工具的连续校验拒绝次数加 1，并返回当前次数。
@@ -129,14 +137,19 @@ func (f *failureCounter) failValidation(name string) int {
 	return f.validationCounts[name]
 }
 
-// reset 将指定工具的连续失败次数清零（从 map 中删除）。
+// reset 将指定工具的全部连续失败计数清零（含所有指纹键，从 map 中删除）。
 func (f *failureCounter) reset(name string) {
 	// 加锁保护 counts 的并发修改。
 	f.mu.Lock()
 	// 函数退出时释放锁。
 	defer f.mu.Unlock()
-	// 删除该工具的计数记录，表示失败状态已恢复。
-	delete(f.counts, name)
+	// 该工具成功即视为恢复正常：清掉全部指纹键，而非只清当前指纹。
+	prefix := name + "\x00"
+	for k := range f.counts {
+		if strings.HasPrefix(k, prefix) {
+			delete(f.counts, k)
+		}
+	}
 	delete(f.validationCounts, name)
 }
 
@@ -168,6 +181,10 @@ type Registry struct {
 	// 超过 exploreBudget 后 ReadFile/ListDir 返回错误，逼迫 Agent 开始 WriteFile。
 	// RunCommand 不计（验证/动作类），避免写完文件后无法验证陷入重试死循环。
 	exploreCount map[string]int
+	// exploreBlockCount 按 scopeKey 记录探索预算软阻断的连续次数（TODO #38-1）：
+	// 超预算后每次被拦的探索调用 +1，达 exploreSoftBlockGrace 后升级 ErrLoopExit。
+	// 与 exploreCount 解耦：被拦调用不污染预算计数，WriteFile 升档/预算算术不受影响。
+	exploreBlockCount map[string]int
 	// writeCount 按 scopeKey 记录 WriteFile 成功次数：>0 后探索预算升档到
 	// exploreBudgetPostWrite（修复期"读报错→改→复验"循环需要精读，见常量注释）。
 	writeCount map[string]int
@@ -197,15 +214,16 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	}
 	// 初始化 Registry 结构体，各 map 也一并初始化。
 	r := &Registry{
-		exec:             exec,
-		progress:         progress,
-		failures:         newFailureCounter(),
-		tools:            make(map[string]Tool),
-		aliases:          make(map[string]string),
-		lastReadKey:      make(map[string]string),
-		sameReadCount:    make(map[string]int),
-		exploreCount:     make(map[string]int),
-		writeCount:       make(map[string]int),
+		exec:              exec,
+		progress:          progress,
+		failures:          newFailureCounter(),
+		tools:             make(map[string]Tool),
+		aliases:           make(map[string]string),
+		lastReadKey:       make(map[string]string),
+		sameReadCount:     make(map[string]int),
+		exploreCount:      make(map[string]int),
+		exploreBlockCount: make(map[string]int),
+		writeCount:        make(map[string]int),
 		productionWorkDir: "",
 	}
 	if cfg != nil {
@@ -423,7 +441,11 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	}
 
 	// 探索预算：探索类工具合计调用次数上限，防 Agent 陷入探索循环不收敛。
-	// 实证 domain-2 调 81 次探索工具 30m 超时未写完。超预算返回错误并终止循环：叶子导向 WriteFile 落地（它不能派发），domain 导向 call_sub_agent 下放叶子。
+	// 实证 domain-2 调 81 次探索工具 30m 超时未写完。超预算返回工具级错误（软阻断，TODO #38-1）：
+	// Agent 存活可立即执行文案里的改派建议——叶子 WriteFile 落地（它不能派发）、domain call_sub_agent 下放叶子；
+	// 软阻断后仍连续调探索类工具达 3 次才升级 ErrLoopExit 强杀（那才是真死循环信号，
+	// 事故实证 2026-08-10：4 个 domain 首轮被杀时打捞文本均显示正在正常推进——"我来读取 X""draw(ctx) 在 L165…"，
+	// 一刀切强杀用一整轮 Agent 生命换取 task 上下文精确化）。
 	// SearchInFiles 计入预算：v8 基准实证验收领域 ReadFile 预算耗尽后改用 SearchInFiles
 	// 连搜 14 次零 WriteFile，探索 17 分钟未修一处——"定位性强"同样是发散载体。
 	// HTTPGet 不计（联网查询场景不同）。WriteFile/WriteSharedMemory 不计（产出类）。
@@ -432,15 +454,22 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	exploreLike := name == "ReadFile" || name == "ListDir" || name == "SearchInFiles" || (name == "RunCommand" && isReadLikeCommand(args))
 	if exploreLike {
 		if blocked := r.checkExploreBudget(ctx); blocked != "" {
+			// 软阻断连续计数：超预算后每次被拦的探索调用 +1，达宽限后升级强杀。
+			// 与 exploreCount 解耦——被拦调用不污染预算计数（WriteFile 升档/预算算术不受影响）。
+			blocks := r.recordExploreBlock(ctx)
+			escalate := blocks > exploreSoftBlockGrace
 			result := &Result{Tool: name, Error: blocked}
 			r.fillResult(ctx, result, args)
 			scope := scopeKeyFromCtx(ctx)
-			log.Printf("[tool] explore budget exhausted: scope=%s tool=%s budget=%d reason=%q",
-				scope, name, r.exploreLimit(ctx, scope), blocked)
-			// 探索预算耗尽 = 空转死循环信号（实证：domain 只读不写空转 60min）。
-			// 返回包装哨兵让主循环终止，而非吞成普通工具错误继续烧轮次。
+			log.Printf("[tool] explore budget exhausted: scope=%s tool=%s budget=%d reason=%q escalate=%v",
+				scope, name, r.exploreLimit(ctx, scope), blocked, escalate)
 			r.emitResult(ctx, result)
-			return result, fmt.Errorf("%w: %s", ErrLoopExit, blocked)
+			// 软阻断：工具级错误，Agent 存活，按文案改派（下放叶子/转 WriteFile）。
+			// 升级路径（软阻断后仍连调探索超宽限）：返回包装哨兵让主循环终止，避免继续烧轮次。
+			if escalate {
+				return result, fmt.Errorf("%w: %s", ErrLoopExit, blocked)
+			}
+			return result, nil
 		}
 	}
 
@@ -529,15 +558,30 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 			}
 		} else {
 			// 执行失败（默认）：累加连续失败计数。
-			n := r.failures.fail(name)
-			// 连续失败达阈值 = 无效重试死循环信号，返回包装哨兵终止 ReAct 循环
-			//（原为 blades ActionLoopExit 上下文信号，无注入方，静默丢弃成死代码）。
-			if n >= maxConsecutiveFailures {
-				msg := fmt.Sprintf("工具 %s 已连续失败 %d 次，疑似无效重试死循环，本次任务终止。", name, n)
-				log.Printf("[tool] consecutive failures LoopExit: scope=%s tool=%s failures=%d", scopeKeyFromCtx(ctx), name, n)
-				result.Error = msg
-				r.emitResult(ctx, result)
-				return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
+			// 验证类命令（--check/lint/test 等，退出码即有效反馈）失败不计连杀（TODO #38-2）：
+			// 模型以"跑检查→改→再跑"方式推进时，连续不同报错是正常调试节奏，
+			// 硬阈值会把修复-验证循环误判为死循环（事故实证：ca-5 三次失败各不相同且每次在推进，
+			// 间隔还有成功的 WriteFile——被杀时 tower.js 已写入 4769 bytes、正在验证）。
+			skipCount := false
+			if name == "RunCommand" {
+				if cmd, _ := args["command"].(string); isVerificationCommand(cmd) {
+					r.failures.reset(name)
+					skipCount = true
+					log.Printf("[tool] verification failure (not counted): scope=%s tool=%s err=%q", scopeKeyFromCtx(ctx), name, result.Error)
+				}
+			}
+			if !skipCount {
+				// 指纹键计数：命令/报错不同=正在推进，新键从 1 重计；相同调用相同报错才累加。
+				n := r.failures.fail(name, failureFingerprint(name, args, result))
+				// 连续失败达阈值 = 无效重试死循环信号，返回包装哨兵终止 ReAct 循环
+				//（原为 blades ActionLoopExit 上下文信号，无注入方，静默丢弃成死代码）。
+				if n >= maxConsecutiveFailures {
+					msg := fmt.Sprintf("工具 %s 已连续 %d 次以相同方式失败（相同命令与报错），疑似无效重试死循环，本次任务终止。", name, n)
+					log.Printf("[tool] consecutive failures LoopExit: scope=%s tool=%s failures=%d", scopeKeyFromCtx(ctx), name, n)
+					result.Error = msg
+					r.emitResult(ctx, result)
+					return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
+				}
 			}
 		}
 	}
@@ -556,6 +600,69 @@ func isMetaDispatch(ctx context.Context, name string) bool {
 		return false
 	}
 	return RoleIDFromContext(ctx) == "meta"
+}
+
+// failureFingerprint 生成一次工具失败的归一化指纹（TODO #38-2）：
+// 指纹相同 = 完全相同调用 + 相同报错 = 无效重试死循环候选；指纹不同 = 正在推进，重新计数。
+// RunCommand 取命令骨架 + stderr 首行——"exit status 1" 这类通用 Error 无区分度，
+// 错误详情在 Output 的 [stderr] 段（事故实证：ca-5 三次失败 stderr 各不相同）。
+func failureFingerprint(name string, args map[string]any, result *Result) string {
+	if name == "RunCommand" {
+		cmd, _ := args["command"].(string)
+		return "RunCommand\x00" + normalizeFingerprint(cmd) + "\x00" + firstErrorLine(result)
+	}
+	return name + "\x00" + firstErrorLine(result)
+}
+
+// firstErrorLine 提取失败结果中最有区分度的一行：
+// RunCommand 优先 [stderr] 首行（截掉 port-conflict 提示后缀），其次 result.Error 首行，
+// 兜底 Output 首行。空白行跳过；返回截断版防长文本污染计数键。
+func firstErrorLine(result *Result) string {
+	src := ""
+	if i := strings.Index(result.Output, "[stderr]"); i >= 0 {
+		rest := result.Output[i+len("[stderr]"):]
+		if j := strings.Index(rest, "\n[port-conflict]"); j >= 0 {
+			rest = rest[:j]
+		}
+		src = rest
+	}
+	if src == "" && result.Error != "" {
+		src = result.Error
+	}
+	if src == "" {
+		src = result.Output
+	}
+	for _, line := range strings.Split(src, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return normalizeFingerprint(line)
+		}
+	}
+	return ""
+}
+
+// normalizeFingerprint 归一化指纹文本：小写 + 空白折叠 + 截断 200 字符。
+// 路径大小写/缩进差异不产生新指纹；报错实质变化必然改变首行文本。
+func normalizeFingerprint(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > 200 {
+		s = string(r[:200])
+	}
+	return s
+}
+
+// isVerificationCommand 判断命令是否为验证/检查类（--check/lint/test/verify 等，
+// 退出码即有效反馈）：失败不累计连杀（TODO #38-2）。
+// 模型以"跑检查→看报错→改→再跑"推进时，连续失败是正常调试节奏，硬阈值会误杀
+// 修复-验证循环（事故实证：ca-5 三次不同报错、间隔成功 WriteFile，仍被连杀 3 次终止）。
+func isVerificationCommand(cmd string) bool {
+	c := strings.ToLower(strings.TrimSpace(cmd))
+	for _, m := range []string{"--check", "lint", "verify", " test ", "test -"} {
+		if strings.Contains(c, m) {
+			return true
+		}
+	}
+	return strings.HasPrefix(c, "test ") || strings.HasSuffix(c, " test")
 }
 
 // scheduleProjectRefresh 去抖调度一次 PROJECT.md 刷新（文件增删改后调用）。
@@ -671,7 +778,9 @@ func (r *Registry) exploreLimit(ctx context.Context, scopeKey string) int {
 }
 
 // checkExploreBudget 检查当前作用域探索类工具调用次数是否超预算。
-// 返回空字符串表示允许；否则返回拦截原因（叶子：转入 WriteFile；domain：转入派发叶子）。
+// 返回空串表示允许；否则返回拦截原因（软阻断文案，Agent 存活可立即按文案改派——
+// 叶子转 WriteFile、domain call_sub_agent 下放叶子，TODO #38-1）。
+// 升级强杀（ErrLoopExit）由 recordExploreBlock 的连续计数驱动，本函数不判定。
 // 对 ReadFile/ListDir/SearchInFiles 与只读型 RunCommand 生效；
 // 验证/动作类 RunCommand 不计（封禁会导致写完文件后无法验证的重试死循环）。
 // 预算分两档：首次 WriteFile 前叶子 20 次 / domain 8 次（反探索空转 + 倒逼探索下放），
@@ -696,11 +805,27 @@ func (r *Registry) checkExploreBudget(ctx context.Context) string {
 			return fmt.Sprintf("修复期探索预算耗尽（已调 %d 次，上限 %d）。凭已有信息与验收输出直接 WriteFile 修复；修错可在复跑中再校准。", r.exploreCount[scopeKey], limit)
 		}
 		if isDomain {
+			// 软阻断文案保留改派指导（给活人的指导要等活着的人执行）：
+			// 下放叶子后本 domain 的探索计数归零，后续验收精读不受影响。
 			return fmt.Sprintf("探索预算耗尽（domain 协调者上限 %d 次，已调 %d 次）。禁止再亲自探索/阅读：把剩余探索与实现按单文件/单函数拆给叶子助手（call_sub_agent，task 写清文件路径+关键签名+验收），你只负责拆任务、整合 mailbox 摘要与 RunCommand 验证。", limit, r.exploreCount[scopeKey])
 		}
 		return fmt.Sprintf("探索预算耗尽（已调 %d 次探索工具，上限 %d）。禁止再以任何工具探索/搜索/阅读，凭已有信息直接 WriteFile 实现或修复；修错可在复跑中再校准，空转探索零容忍。", r.exploreCount[scopeKey], limit)
 	}
 	return ""
+}
+
+// recordExploreBlock 记录一次探索预算软阻断，返回该 scope 的连续软阻断次数。
+// 被拦的探索调用不计入 exploreCount（预算算术/升档不受污染），只累计阻断次数；
+// 达 exploreSoftBlockGrace 后的下一次调用升级 ErrLoopExit（收到改派指导仍复读探索=真死循环）。
+func (r *Registry) recordExploreBlock(ctx context.Context) int {
+	scopeKey := scopeKeyFromCtx(ctx)
+	if scopeKey == "" {
+		return 0
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	r.exploreBlockCount[scopeKey]++
+	return r.exploreBlockCount[scopeKey]
 }
 
 // recordExplore 把当前作用域探索类工具调用计数 +1。
@@ -756,6 +881,7 @@ func (r *Registry) ResetReadHistory(sessionID string) {
 	delete(r.lastReadKey, sessionID)
 	delete(r.sameReadCount, sessionID)
 	delete(r.exploreCount, sessionID)
+	delete(r.exploreBlockCount, sessionID)
 	delete(r.writeCount, sessionID)
 }
 

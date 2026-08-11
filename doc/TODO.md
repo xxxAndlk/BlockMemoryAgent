@@ -122,6 +122,23 @@
     - 验收：塔防任务跑到一半双击 ESC，TUI 显示"已停止 N 个 Agent，MM:SS 后销毁"；输入任意消息任务从断点续跑（不重跑已完成 domain）；不操作到期后任务树全销毁且 TUI 有明确反馈。
     - 不做：不做 goroutine 真冻结（已决策假死语义）；不做全局停止（仅当前会话）；不做停止中的选择性保活（停哪留哪）；不做跨进程重启的倒计时持久化（归 #35 Phase 2）。
 
+38. **首轮派发失败复盘（修复后重跑实证）：探索预算强杀 + RunCommand 连杀误杀 + task 超长拒绝 + 临时文件路径不可见**（✅ 已完成 2026-08-11，doc/变更.md 任务 23；来源：2026-08-10 17:22 重跑会话，`workspace/tower-defense/logs/tui/2026-08-10.log` 17:22 之后段，tui.exe 17:09 重建含 #30-#33 修复）
+    - 背景（先还修复一个公道）：本轮**未再出现** `spec missing or stale`（#30 生效）、SearchInFiles 零命中误杀（#31 生效）、校验拒绝杀 goal（#32 meta 豁免生效——3 次 task too long 拒绝均未终止 MetaAgent）。修复对各自靶向失效模式有效；仍存的"第一轮失败、第二轮重派成功"由下面四个根因构成，其中根因 A 是 #32/#35 互相吸收后落空的遗留项。
+    - 量化事故还原：MetaAgent 共派 9 个 domain，4 个第一轮被杀（domain-2/10/11/18，44%），死因同为"探索预算耗尽（domain 协调者上限 8 次，已调 8 次）"；叶子 code_assistant-5 死于"RunCommand 已连续失败 3 次"；另有 3 次 `task too long` 同步拒绝（3205/2201/2070 runes，上限 2000）。所有被杀领域都由 MetaAgent 第二轮以"task 内嵌精确行号+实现方案"重派才成功——**系统在用一整轮 Agent 生命换取 task 上下文精确化**。
+    - 根因 A（主因，#32 落空项）：探索预算耗尽仍是一刀切 ErrLoopExit 强杀（`registry.go:434-444`）。#32 完成说明写"项 4 LoopExit 落盘并入 #35"，#35 完成说明写"Phase 1 由 #32/#37 吸收覆盖"——互相吸收，"LoopExit 终止改可恢复暂停"无人落地。两处设计矛盾：① 杀因文案"禁止再亲自探索，把剩余探索拆给叶子助手"是给**活人**看的改派指导，接收者却已被杀死，指导只能经打捞摘要间接绕到 MetaAgent；② 8 次预算与实际文件规模脱节——game.js 500+ 行、单次 ReadFile ≤300 行，读完两个文件即耗 6-7 次；4 个被杀 domain 的打捞文本均显示正在正常推进（"我来读取 buildLevelSelect 和 syncHud 部分""我现在理解了这个结构，draw(ctx) 在 L165…"），不是空转。
+    - 根因 B：连杀计数器键只有工具名，不区分命令/错误内容（`registry.go:530-541`，`maxConsecutiveFailures=3`，仅同工具成功才重置）。code_assistant-5 三次失败原因各不相同且每次都在推进：① `node <工作目录>\verify-frost.js` 模块找不到（文件实际在 `.bma/tmp/<sid>/`，见根因 D）；② 改用 `$env:BMA_SESSION_TEMP_DIR` 自愈后命中脚本自身语法错误（:16:17）；③ `fix_syntax.js` 再次用工作目录相对路径找不到。三次失败间还隔着成功的 WriteFile。被杀时 tower.js 已写入 4769 bytes、正在验证——**正常的修复-验证循环被误判为无效重试死循环**。
+    - 根因 C：task too long 硬拒绝（`dispatcher.go:978` maxTaskRunes=2000）。meta 豁免使其不再杀 goal，但每次拒绝白烧一整轮 MetaAgent LLM 往返（本轮首轮 llm done 耗时 2m28s）；2070/2201 这类轻微超限与"task 自包含（背景+目标+验收）"的要求天然冲突。
+    - 根因 D（工具 UX，根因 B 的导火索）：WriteFile temporary=true 成功输出只有 "wrote N bytes"（`builtin.go:289`），`agent.ToolResult`（`react_types.go:89-94`）只含 tool/success/output/error——`Result.Path` 不到 LLM，Agent 不知道临时文件落在 `.bma/tmp/<sid>/`，首次运行必猜工作目录路径然后失败。ca-5 靠 RunCommand 工具描述里的 BMA_SESSION_TEMP_DIR 提示自愈，但已消耗 3 条连杀命中额度的第 1 条。（已实证：env 变量注入 `builtin.go:517` 工作正常，问题纯粹是写入结果不含落盘路径。）
+    - 执行流程：
+      1. ✅ **预算耗尽改软阻断**（根因 A 核心）：`checkExploreBudget` 返字符串拦截文案（不返 ErrLoopExit），Dispatch 软阻断路径返工具级错误 + `err=nil`（Agent 存活可立即 call_sub_agent 下放叶子/WriteFile 落地）；新增 `exploreBlockCount` 按 scopeKey 计数被拦调用，达 `exploreSoftBlockGrace=3` 后的下一次升级 ErrLoopExit。与 exploreCount 解耦--被拦调用不污染预算计数，WriteFile 升档/预算算术不受影响（事故根因 A ②“打捞文本均显示正在正常推进”由软阻断兜底：3 次软提示后再判死）。
+      2. ✅ **连杀计数加错误指纹**（根因 B）：`failureCounter.counts` 键改为 `工具名 错误指纹` 复合键；`failureFingerprint` 对 RunCommand 取 `命令骨架 + stderr 首行`（`firstErrorLine` 优先 `[stderr]` 段），其余工具取 `name + 错误首行`，归一化（小写+空白折叠+200 字符截断）；指纹不同=新键从 1 重计。验证类命令（`isVerificationCommand`：含 `--check`/`lint`/`verify`/` test` 退出码即反馈）失败 `reset` 不计数。“完全相同调用连杀即终止”的真死循环检测保留。
+      3. ✅ **task 超长软着陆**（根因 C）：`validateDispatchArgs` 返回 `(msg, warning)`；2000<n≤2600 放行附压缩警告（call_sub_agent 单/批量 Output 均拼警告）；>2600 硬拒。`WriteSpec` 成功 Output 追加“派发 task 预算 2000 字”提醒，把合规时机前移一轮。
+      4. ✅ **temporary WriteFile 输出带落盘路径**（根因 D）：`writeFile` temporary=true 分支 Output 改为 `wrote N bytes to <absPath>（会话临时目录，运行用 $env:BMA_SESSION_TEMP_DIR\<文件名>）`，消除盲猜。
+      5. ✅ 顺带核查：从 17:22 会话日志 27 条 call_sub_agent 调用中提取 20 个唯一 task，长度分布--19 个 ≤2000（559-1897 runes，覆盖全部“精确行号+实现方案”类第二轮成功派发）、1 个 2070（软着陆区，原本被拒白烧一整轮）、1 个 3205（全量规格转贴，>2600 仍硬拒正确）。阈值 2000/2600 与该类 task 自然长度无冲突。
+    - 测试（全绿）：软阻断--`TestLoopGuard_ExploreBudget_SoftBlockThenEscalate`（超预算首次软阻断 err=nil；宽限内持续软阻断；超宽限升级 ErrLoopExit；echo 不计探索预算存活、cat 按探索计费升级）。连杀指纹--`TestLoopGuard_ConsecutiveFailures_FingerprintVarying`（10 次不同报错永不误杀）、`..._FingerprintResetOnSuccess`（同工具成功重置计数）、`..._RunCommandFingerprint`（同命令同报错×3 杀、骨架变化不杀）、`..._VerificationExempt`（`--check` 类连失败 5 次不触发）。task 软着陆--`TestValidateDispatchArgs_TaskSoftLanding`（2000 干净放行 / 2100 软着陆附警告 / 3000 硬拒）、`TestCallSubAgent_TaskSoftLandingSuccess`（Execute 端：2100 派发成功 Output 含警告，3000 校验拒绝）。temporary--`TestWriteFile_TemporaryOutputHasAbsPath`（Output 含绝对路径 + `$env:BMA_SESSION_TEMP_DIR` 提示，文件存在）。
+    - 验收：阈值/守卫层修复完成；重跑实证（首轮派发存活率 5/9 -> 9/9、日志不再出现“探索预算耗尽”ErrLoopExit 与 RunCommand 误杀、task too long 拒绝数趋 0）待下次塔防任务运行验证。
+    - 不做：不取消探索预算本身（#20 实证必需）；不取消 2600 字以上的全量规格转贴拦截；不改 #32 已落地的失败分级与 meta 豁免；不在本项做 LoopExit→Pause 恢复路由（若日后需要归 #35 Phase 2 一并设计）。
+
 
 ## 已完成（已归档到 git 历史）
 

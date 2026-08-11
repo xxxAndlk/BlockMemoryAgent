@@ -112,6 +112,9 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 		return &Result{Tool: "WriteSpec", Error: fmt.Sprintf("set: %v", err)}
 	}
 	out := fmt.Sprintf("spec written (key=%s, goal=%q, %d acceptance, %d constraints, %d files tracked)", key, truncateRunesForLog(goal, 60), len(acceptance), len(constraints), len(filesMtime))
+	// 派发预算提醒（TODO #38-3）：把合规时机前移一轮——写规范时即提示 task 预算，
+	// 避免下轮 call_sub_agent 因 task 超长被拒（2000-2600 放行附警告，>2600 硬拒）。
+	out += "。派发 task 预算 2000 字（按 rune 计）：规格细节走本工具，task 只写目标+验收标准"
 	// 防御纵深（TODO #30）：files 含持续增长目录（logs/.bma）时当场提示——
 	// 这类文件 mtime 恒变（系统自己写日志），已豁免新鲜度校验，让模型知道
 	// "列出日志文件不会导致 spec stale"，避免误以为必须剔除或反复重写。
