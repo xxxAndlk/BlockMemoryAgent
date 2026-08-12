@@ -236,6 +236,8 @@ func (p *openAIChatProvider) NewStreaming(ctx context.Context, req *blades.Model
 			OutputTokens: int64(usage.outputTokens()),
 			TotalTokens:  int64(usage.totalTokens()),
 		}
+		// TODO #40 缓存可观测：DeepSeek 原生 prompt_cache_hit/miss_tokens 透传 Metadata。
+		setCacheUsageMeta(final, int64(usage.PromptCacheHitTokens), int64(usage.PromptCacheMissTokens))
 		yield(&blades.ModelResponse{Message: final}, nil)
 	}
 }
@@ -553,6 +555,8 @@ func parseChatResponse(raw []byte) (*blades.ModelResponse, error) {
 		OutputTokens: int64(resp.Usage.outputTokens()),
 		TotalTokens:  int64(resp.Usage.totalTokens()),
 	}
+	// TODO #40 缓存可观测：DeepSeek 原生 prompt_cache_hit/miss_tokens 透传 Metadata。
+	setCacheUsageMeta(msg, int64(resp.Usage.PromptCacheHitTokens), int64(resp.Usage.PromptCacheMissTokens))
 	for _, choice := range resp.Choices {
 		if choice.Message.Content.text != "" {
 			msg.Parts = append(msg.Parts, blades.TextPart{Text: choice.Message.Content.text})

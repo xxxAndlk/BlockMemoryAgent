@@ -58,6 +58,8 @@ type SessionEvent struct {
 	Prompt       string    `json:"prompt,omitempty"`        // 关联的 LLM Prompt（可选）
 	InputTokens  int       `json:"input_tokens,omitempty"`  // 输入 token 数（可选）
 	OutputTokens int       `json:"output_tokens,omitempty"` // 输出 token 数（可选）
+	CacheHitTokens  int    `json:"cache_hit_tokens,omitempty"`  // 缓存命中 token 数（TODO #40 可观测）
+	CacheMissTokens int    `json:"cache_miss_tokens,omitempty"` // 缓存未命中 token 数（TODO #40 可观测）
 	DetailJSON   string    `json:"detail_json,omitempty"`   // 额外结构化详情（JSON 字符串，可选）
 }
 
@@ -294,6 +296,8 @@ func ToServerSession(a *agent.Session) *Session {
 			Prompt:       e.Prompt,
 			InputTokens:  e.InputTokens,
 			OutputTokens: e.OutputTokens,
+			CacheHitTokens:  e.CacheHitTokens,
+			CacheMissTokens: e.CacheMissTokens,
 			DetailJSON:   e.DetailJSON,
 		}
 	}

@@ -371,7 +371,7 @@ func (st *reactSessionStore) shutdown() {
 // session: 目标会话；eventType/agentName/message/kind/tool/toolPath/toolOutput/toolError/success: 事件各字段。
 func (st *reactSessionStore) addEvent(session *reactInternalSession, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError string, success bool) {
 	// 直接调用完整版，prompt、token、detailJSON 使用零值。
-	st.addEventDebug(session, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError, success, "", 0, 0, "")
+	st.addEventDebug(session, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError, success, "", 0, 0, 0, 0, "")
 }
 
 // setStreamingText 更新会话当前正在流式生成的累积文本；传空串表示流式结束。
@@ -390,8 +390,9 @@ func (st *reactSessionStore) setThinkingText(session *reactInternalSession, text
 
 // addEventDebug 向会话追加一条带调试信息的事件，并同步打印日志。
 // session: 目标会话；eventType/agentName/message/kind/tool/toolPath/toolOutput/toolError/success: 事件字段；
-// prompt: 原始提示词；inputTokens/outputTokens: token 用量；detailJSON: 额外调试 JSON。
-func (st *reactSessionStore) addEventDebug(session *reactInternalSession, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError string, success bool, prompt string, inputTokens, outputTokens int, detailJSON string) {
+// prompt: 原始提示词；inputTokens/outputTokens: token 用量；cacheHit/cacheMiss: 缓存命中/未命中
+// token（TODO #40 可观测）；detailJSON: 额外调试 JSON。
+func (st *reactSessionStore) addEventDebug(session *reactInternalSession, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError string, success bool, prompt string, inputTokens, outputTokens, cacheHit, cacheMiss int, detailJSON string) {
 	// 对工具输出做截断，避免单条事件过大占用内存与数据库空间。
 	toolOutput = textutil.TruncateRunes(toolOutput, 4096, "...(truncated)")
 	// 组装内部事件结构体，填充所有字段。
@@ -409,6 +410,8 @@ func (st *reactSessionStore) addEventDebug(session *reactInternalSession, eventT
 		Prompt:       prompt,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
+		CacheHitTokens:  cacheHit,
+		CacheMissTokens: cacheMiss,
 		DetailJSON:   detailJSON,
 	}
 	// 加写锁后追加事件，保证并发安全。

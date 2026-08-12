@@ -80,6 +80,16 @@ type ReactService struct {
 	// 开启时 sendMessage 对命中续跑/控制/诊断意图的输入附加【系统补全】段
 	// （意图标签 + 最近失败/未完成任务绑定），只增不改原文；关闭时零行为变化。
 	promptEnhance bool
+	// promptEnhanceLLM L2 轻量模型仲裁开关（TODO #39）：灰区输入（L1 未命中但句中有
+	// 弱词信号）调仲裁器四分类；关闭时降级纯规则（Phase 0 行为）。
+	promptEnhanceLLM bool
+	// promptEnhanceArbiter L2 仲裁器（bootstrap 注入轻量模型实现）；nil 且开关开时
+	// L2 不可用，同样降级纯规则。
+	promptEnhanceArbiter IntentArbiter
+	// promptEnhanceTimeout L2 单次超时（<=0 用默认 10s）。
+	promptEnhanceTimeout time.Duration
+	// promptEnhanceMaxRunes L0 输入形态闸门长度上限（rune；<=0 用默认 30）。
+	promptEnhanceMaxRunes int
 	// stopMarker 会话软停止标记器（TODO #37，subagent.Dispatcher 实现）：
 	// Stop 先标记再触发子 Agent cancel，dispatcher 收尾分支据此刻意落 Paused/部分回灌。
 	// nil 时 Stop 退化为仅级联取消（无暂停语义）。
@@ -166,13 +176,26 @@ func (s *ReactService) SetPromptEnhance(enabled bool) {
 	s.promptEnhance = enabled
 }
 
-// enhanceUserInput 对用户输入做意图分类 + 消歧绑定（TODO #36 Phase 0 规则版）。
+// SetPromptEnhanceLLM 配置 L2 轻量模型仲裁（TODO #39）：
+// enabled = config prompt_enhance_llm；arbiter = 轻量模型四分类仲裁器（bootstrap 注入，
+// nil 时 L2 不可用降级纯规则）；timeout/maxRunes 覆盖 L2 超时与 L0 闸门长度（<=0 用默认）。
+func (s *ReactService) SetPromptEnhanceLLM(enabled bool, arbiter IntentArbiter, timeout time.Duration, maxRunes int) {
+	s.promptEnhanceLLM = enabled
+	s.promptEnhanceArbiter = arbiter
+	s.promptEnhanceTimeout = timeout
+	s.promptEnhanceMaxRunes = maxRunes
+}
+
+// enhanceUserInput 对用户输入做意图分类 + 消歧绑定（TODO #36 Phase 0 规则版 + #39 四层管线）。
 // 数据源：会话任务看板（board.Snapshot 失败/未完成任务）+ Agent 树失败/取消节点
 // （LoopExit 被杀/心跳杀/用户取消——看板未必回写，树是权威）。无绑定状态时仅给意图标签。
 // 开关关闭 / 意图未命中返回原文（零行为变化）。
-func (s *ReactService) enhanceUserInput(sessionID, content string) string {
+// 返回 (补全后文本, 判定路径事件备注)：备注供 sendMessage 落可观测事件
+// （gate_skip / rule_strong / rule_weak / llm_hit / llm_miss / llm_timeout / llm_error）。
+// L2 仲裁在调用方持 store.mu 期间执行（最长 ArbiterTimeout），单用户 TUI 主路径可接受。
+func (s *ReactService) enhanceUserInput(ctx context.Context, sessionID, content string) (string, string) {
 	if !s.promptEnhance {
-		return content
+		return content, ""
 	}
 	st := EnhanceState{}
 	if s.boardFn != nil {
@@ -217,7 +240,12 @@ func (s *ReactService) enhanceUserInput(sessionID, content string) string {
 			st.FailedTasks = append(st.FailedTasks, EnhanceTask{Title: title, Domain: n.Domain, Status: n.Status.String(), Result: reason})
 		}
 	}
-	return EnhancePrompt(content, st)
+	opts := EnhanceOptions{MaxInputRunes: s.promptEnhanceMaxRunes}
+	if s.promptEnhanceLLM && s.promptEnhanceArbiter != nil {
+		opts.Arbiter = s.promptEnhanceArbiter
+		opts.ArbiterTimeout = s.promptEnhanceTimeout
+	}
+	return EnhancePromptWithOptions(ctx, content, st, opts)
 }
 
 // Board 返回会话任务看板快照（TODO #22 Phase 2 面板真相源）。
@@ -1537,9 +1565,10 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		s.store.addEvent(session, eventkind.Message, "SubAgent", ev.Tool, "sub_agent_done", "", "", "", "", true)
 	case LiveEventTokenUsage:
 		// 单次 LLM 调用 token 用量：记为 token_usage 调试事件，供前端实时累加展示。
-		// 消息格式 in=<n> out=<n> 与 textutil.ParseTokenUsage 兼容，便于后端日志解析复用。
-		msg := fmt.Sprintf("in=%d out=%d", ev.InputTokens, ev.OutputTokens)
-		s.store.addEventDebug(session, eventkind.Stats, ev.Agent, msg, eventkind.TokenUsage, "", "", "", "", true, "", int(ev.InputTokens), int(ev.OutputTokens), "")
+		// 消息格式 in=<n> out=<n> cache_hit=<n> cache_miss=<n> 与 textutil.ParseTokenUsage
+		// 兼容（前缀 in=/out= 不变），便于后端日志解析复用。
+		msg := fmt.Sprintf("in=%d out=%d cache_hit=%d cache_miss=%d", ev.InputTokens, ev.OutputTokens, ev.CacheHitTokens, ev.CacheMissTokens)
+		s.store.addEventDebug(session, eventkind.Stats, ev.Agent, msg, eventkind.TokenUsage, "", "", "", "", true, "", int(ev.InputTokens), int(ev.OutputTokens), int(ev.CacheHitTokens), int(ev.CacheMissTokens), "")
 	}
 }
 
@@ -1678,10 +1707,12 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		return nil
 	}
 
-	// 用户输入自动提示词补全（TODO #36 Phase 0 规则版）：命中续跑/控制/诊断意图时
-	// 附加【系统补全】段（意图标签 + 最近失败/未完成任务绑定），只增不改用户原文。
+	// 用户输入自动提示词补全（TODO #36 Phase 0 规则版 + #39 四层管线）：命中续跑/控制/
+	// 诊断意图时附加【系统补全】段（意图标签 + 最近失败/未完成任务绑定），只增不改用户原文。
 	// askUser/approval 澄清答复分支在上面已提前返回，不经过补全（答复非新任务）。
-	content = s.enhanceUserInput(sessionID, content)
+	// 判定路径备注暂存，待 store.mu 释放后落 Prompt 事件（addEvent 自身要加锁，
+	// 持锁调用会死锁——approval 分支同款模式），便于复盘误判率与 L2 调用率（TODO #39 可观测性）。
+	content, enhanceNote := s.enhanceUserInput(ctx, sessionID, content)
 
 	// 将用户消息追加到会话消息列表。
 	session.Messages = append(session.Messages, Message{
@@ -1712,6 +1743,11 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		restartSessionContext(session)
 	}
 	s.store.mu.Unlock()
+
+	// 判定路径备注落 Prompt 事件（store.mu 已释放；addEvent 自身加锁，持锁调用死锁）。
+	if enhanceNote != "" {
+		s.store.addEvent(session, eventkind.Prompt, "System", "输入补全: "+enhanceNote, "", "", "", "", "", true)
+	}
 
 	// 添加用户消息事件。
 	s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)

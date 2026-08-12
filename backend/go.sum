@@ -42,8 +42,6 @@ github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f h1:Y/CXytFA4m6
 github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f/go.mod h1:vw97MGsxSvLiUE2X8qFplwetxpGLQrlU1Q9AUEIzCaM=
 github.com/go-kratos/blades v0.5.0 h1:n5yNSRV7YgCCVVqrqImb59f4UbalShCJfZxv7EWoDgA=
 github.com/go-kratos/blades v0.5.0/go.mod h1:ZCPoQ0qJ+YoRviQx3kWZQdltil10D6jVONgrptZA8a4=
-github.com/go-kratos/blades/contrib/openai v0.3.0 h1:lZQy3N+KiT0IeB6e9HaXJ6idD8tkzocTryc907BYJLM=
-github.com/go-kratos/blades/contrib/openai v0.3.0/go.mod h1:DrUkaJa5M1Hx+kDoWHJtnhymGJF2VFx/ZPrwhq9ifIw=
 github.com/go-kratos/kit v0.0.0-20251121083925-65298ad2aa44 h1:T2JdBeiSLO+WUmMW4WF32SmS7TtUYGshDlL0+iFoUJg=
 github.com/go-kratos/kit v0.0.0-20251121083925-65298ad2aa44/go.mod h1:TrUs5NEMicK0I4hOGNMp0JQmjF1kWyuKuiueOszGp+o=
 github.com/godbus/dbus/v5 v5.0.4/go.mod h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA=
@@ -87,8 +85,6 @@ github.com/muesli/termenv v0.16.0 h1:S5AlUN9dENB57rsbnkPyfdGuWIlkmzJjbFf0Tf5FWUc
 github.com/muesli/termenv v0.16.0/go.mod h1:ZRfOIKPFDYQoDFF4Olj7/QJbW60Ol/kL1pU3VfY/Cnk=
 github.com/ollama/ollama v0.5.13 h1:URBx4e6nyAaVhEGXH6AWVqORhebcSQcJ7hLTS0xkAPg=
 github.com/ollama/ollama v0.5.13/go.mod h1:tCNqO/GjOA24FD16QtC8RhI1BNV4SYowhugtIHgFij4=
-github.com/openai/openai-go/v3 v3.8.1 h1:b+YWsmwqXnbpSHWQEntZAkKciBZ5CJXwL68j+l59UDg=
-github.com/openai/openai-go/v3 v3.8.1/go.mod h1:UOpNxkqC9OdNXNUfpNByKOtB4jAL0EssQXq5p8gO0Xs=
 github.com/pb33f/ordered-map/v2 v2.3.1 h1:5319HDO0aw4DA4gzi+zv4FXU9UlSs3xGZ40wcP1nBjY=
 github.com/pb33f/ordered-map/v2 v2.3.1/go.mod h1:qxFQgd0PkVUtOMCkTapqotNgzRhMPL7VvaHKbd1HnmQ=
 github.com/pkg/diff v0.0.0-20210226163009-20ebb0f2a09e/go.mod h1:pJLUxLENpZxwdsKMEsNbx1VGcRFpLqf3715MtcvvzbA=
@@ -123,6 +119,8 @@ github.com/tidwall/sjson v1.2.5 h1:kLy8mja+1c9jlljvWTlSazM7cKDRfJuR/bOJhcY5NcY=
 github.com/tidwall/sjson v1.2.5/go.mod h1:Fvgq9kS/6ociJEDnK0Fk1cpYF4FIW6ZF7LAe+6jwd28=
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e h1:JVG44RsyaB9T2KIHavMF/ppJZNG9ZpyihvCd0w101no=
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e/go.mod h1:RbqR21r5mrJuqunuUZ/Dhy/avygyECGrLceyNeo4LiM=
+github.com/yalue/onnxruntime_go v1.32.1 h1:bjvmp0ONztctKBOkaU6hgphVoKPH3GTZAJvFfPHdtcI=
+github.com/yalue/onnxruntime_go v1.32.1/go.mod h1:b4X26A8pekNb1ACJ58wAXgNKeUCGEAQ9dmACut9Sm/4=
 github.com/zeebo/xxh3 v1.1.0 h1:s7DLGDK45Dyfg7++yxI0khrfwq9661w9EN78eP/UZVs=
 github.com/zeebo/xxh3 v1.1.0/go.mod h1:IisAie1LELR4xhVinxWS5+zf1lA4p0MW4T+w+W07F5s=
 go.uber.org/atomic v1.11.0 h1:ZvwS0R+56ePWxUNi+Atn9dWONBPp/AUETXlHW0DxSjE=

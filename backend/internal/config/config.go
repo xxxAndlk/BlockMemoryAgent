@@ -70,6 +70,16 @@ type LLMRuntimeConfig struct {
 	// 开启时 sendMessage 对命中续跑/控制/诊断意图的输入附加【系统补全】段
 	// （意图标签 + 最近失败/未完成任务绑定），只增不改用户原文；关闭=原样直通。
 	PromptEnhance *bool `yaml:"prompt_enhance"`
+	// PromptEnhanceLLM L2 轻量模型仲裁开关（TODO #39，默认 true）：灰区输入
+	// （L1 未命中但句中有弱词信号）调轻量模型四分类（none/resume/control/diagnose）；
+	// 超时/失败/低置信一律按普通任务直通（宁漏判不误判）。关闭=降级纯规则（Phase 0 行为）。
+	PromptEnhanceLLM *bool `yaml:"prompt_enhance_llm"`
+	// PromptEnhanceLLMTimeoutSec L2 仲裁单次超时秒（默认 10；<=0 按默认）。
+	// 轻量模型为推理系首 token 慢，宁可短超时降级也不阻塞用户输入（最坏延迟=本值）。
+	PromptEnhanceLLMTimeoutSec int `yaml:"prompt_enhance_llm_timeout_sec"`
+	// PromptEnhanceMaxInputRunes L0 输入形态闸门长度上限（rune，默认 30；<=0 按默认）。
+	// 续跑/控制/诊断本质是短指令（实证 ≤15 字），超过视为任务描述直接直通不分类。
+	PromptEnhanceMaxInputRunes int `yaml:"prompt_enhance_max_input_runes"`
 	// StopDestroyCountdownSec 软停止销毁倒计时（秒，TODO #37，默认 300；负数=关闭=永久暂停）。
 	// Stop 后到期未续跑则硬销毁全部节点（cascadeCancelTree + 会话 error）；续跑触发即取消。
 	StopDestroyCountdownSec int `yaml:"stop_destroy_countdown_sec"`
@@ -441,6 +451,18 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	if c.Agent.PromptEnhance == nil {
 		t := true
 		c.Agent.PromptEnhance = &t
+	}
+	// L2 仲裁默认开启（TODO #39）：灰区输入调轻量模型四分类，失败降级纯规则。
+	if c.Agent.PromptEnhanceLLM == nil {
+		t := true
+		c.Agent.PromptEnhanceLLM = &t
+	}
+	// L2 单次超时默认 10s；L0 闸门长度默认 30 rune。
+	if c.Agent.PromptEnhanceLLMTimeoutSec == 0 {
+		c.Agent.PromptEnhanceLLMTimeoutSec = 10
+	}
+	if c.Agent.PromptEnhanceMaxInputRunes == 0 {
+		c.Agent.PromptEnhanceMaxInputRunes = 30
 	}
 	// 软停止销毁倒计时默认 300s（TODO #37）。
 	if c.Agent.StopDestroyCountdownSec == 0 {

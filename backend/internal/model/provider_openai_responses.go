@@ -392,6 +392,11 @@ func buildResponsesFinalMessage(content, reasoning string, toolCalls []responses
 		OutputTokens: int64(usage.output()),
 		TotalTokens:  int64(usage.total()),
 	}
+	// TODO #40 缓存可观测：cached_tokens（input_tokens_details）作 hit，其余输入作 miss。
+	if usage.InputTokensDetails != nil {
+		cached := int64(usage.InputTokensDetails.CachedTokens)
+		setCacheUsageMeta(msg, cached, int64(usage.input())-cached)
+	}
 	return &blades.ModelResponse{Message: msg}
 }
 

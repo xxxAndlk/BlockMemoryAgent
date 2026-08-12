@@ -235,7 +235,7 @@ CREATE TABLE IF NOT EXISTS global_knowledge (
     knowledge_type VARCHAR(32) NOT NULL,
     topic_id VARCHAR(64),
     content TEXT NOT NULL,
-    embedding VECTOR(768),
+    embedding VECTOR(1024),
     meta JSONB DEFAULT '{}',
     access_count INT DEFAULT 0,
     last_accessed TIMESTAMPTZ,
@@ -279,7 +279,7 @@ CREATE TABLE IF NOT EXISTS topic_archives (
     summary TEXT NOT NULL,
     outputs JSONB DEFAULT '[]',
     decisions JSONB DEFAULT '[]',
-    embedding VECTOR(768),
+    embedding VECTOR(1024),
     archived_at TIMESTAMPTZ DEFAULT NOW()
 );
 

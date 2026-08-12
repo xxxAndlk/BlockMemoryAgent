@@ -10,7 +10,7 @@ postgres:
 # pgvector 配置（依赖 PostgreSQL）
 pgvector:
   enabled: true
-  dimensions: 768
+  dimensions: 1024  # bge-m3=1024 维（2026-08-12 切换 ollama 本地模型）；BGE-base-zh 用 768
   index_type: ivfflat  # ivfflat | hnsw
   distance_metric: cosine  # cosine | l2 | inner_product
 
@@ -88,6 +88,9 @@ agent:
   spec_enforcement_enabled: true     # call_sub_agent 前是否强制 WriteSpec
   max_total_dispatches: 30           # 单 session 派发总数上限
   prompt_enhance: true               # 用户输入自动提示词补全（TODO #36 Phase 0 规则版）：命中续跑/控制/诊断意图时附加【系统补全】段（意图标签+最近失败/未完成任务绑定），只增不改用户原文；false=原样直通
+  prompt_enhance_llm: true           # L2 轻量模型仲裁开关（TODO #39）：灰区输入（L1 未命中但句中有弱词信号）调轻量模型四分类（none/resume/control/diagnose）；超时/失败/低置信一律按普通任务直通（宁漏判不误判）；false=降级纯规则（Phase 0 行为）
+  prompt_enhance_llm_timeout_sec: 10 # L2 仲裁单次超时秒（TODO #39）：轻量模型首 token 慢，宁短超时降级也不阻塞用户输入（最坏延迟=本值）
+  prompt_enhance_max_input_runes: 30 # L0 输入形态闸门长度上限（rune，TODO #39）：续跑/控制/诊断本质是短指令（实证 ≤15 字），超过视为任务描述直接直通不分类
   stop_destroy_countdown_sec: 300    # 软停止销毁倒计时（秒，TODO #37）：双击 ESC 停止后到期未续跑则硬销毁全部任务节点；负数=关闭（永久暂停，靠续跑）
 
   # -- 工具沙箱（安全）--

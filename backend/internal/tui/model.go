@@ -61,6 +61,10 @@ type Model struct {
 	// totalInputTokens 与 totalOutputTokens 分别累计输入/输出 Token 数量。
 	totalInputTokens  int
 	totalOutputTokens int
+	// totalCacheHit / totalCacheMiss 累计缓存命中/未命中 token（TODO #40 可观测），
+	// 命中率 = hit/(hit+miss) 展示在 Token 栏。
+	totalCacheHit  int
+	totalCacheMiss int
 
 	// v2.0 面板开关
 	// agentPanelVisible 与 planBarVisible 控制旧版面板显示（部分已弃用）。
@@ -787,12 +791,17 @@ func (m *Model) accumulateTokens() {
 		return
 	}
 	in, out := 0, 0
+	cacheHit, cacheMiss := 0, 0
 	for _, ev := range s.Events {
 		in += ev.InputTokens
 		out += ev.OutputTokens
+		cacheHit += ev.CacheHitTokens
+		cacheMiss += ev.CacheMissTokens
 	}
 	m.totalInputTokens = in
 	m.totalOutputTokens = out
+	m.totalCacheHit = cacheHit
+	m.totalCacheMiss = cacheMiss
 	// 成本预警：输入 Token 每跨过 50 万一档提醒一次（仅提示，不阻断执行）。
 	const warnStep = 500000
 	if level := in / warnStep; level > m.tokenWarnLevel {

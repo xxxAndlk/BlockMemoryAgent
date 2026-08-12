@@ -504,7 +504,8 @@ func (m Model) renderPlanBar(w int) string {
 	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
 }
 
-// renderTokenBar 渲染输入栏上方的 Token 用量栏，实时展示当前会话累计输入/输出 token。
+// renderTokenBar 渲染输入栏上方的 Token 用量栏，实时展示当前会话累计输入/输出 token
+// 与缓存命中率（TODO #40 可观测；provider 未返回缓存字段时省略命中率）。
 // ≥1000 时以 1.2k 形式显示，避免长数字挤占宽度。
 func (m Model) renderTokenBar(w int) string {
 	in, out := m.totalInputTokens, m.totalOutputTokens
@@ -514,6 +515,12 @@ func (m Model) renderTokenBar(w int) string {
 	inPart := m.styles.StatValue.Render("↑" + inStr)
 	outPart := m.styles.StatValue.Render("↓" + outStr)
 	left := lipgloss.JoinHorizontal(lipgloss.Left, label, " ", inPart, " ", outPart)
+	// 缓存命中率：hit/(hit+miss)，无数据（provider 未解析或 mock）时不显示。
+	if hit, miss := m.totalCacheHit, m.totalCacheMiss; hit+miss > 0 {
+		rate := float64(hit) / float64(hit+miss) * 100
+		cachePart := m.styles.StatValue.Render(fmt.Sprintf("缓存命中率 %.0f%%", rate))
+		left = lipgloss.JoinHorizontal(lipgloss.Left, left, " ", cachePart)
+	}
 	// 右侧提示：会话运行中显示 cost warn 门槛说明，空会话显示占位。
 	right := m.styles.Dim.Render("(本会话累计 · 每 1s 刷新)")
 	line := lipgloss.JoinHorizontal(lipgloss.Top, left, lipgloss.NewStyle().Width(w-lipgloss.Width(left)-lipgloss.Width(right)).Render(""), right)

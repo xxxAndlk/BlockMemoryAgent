@@ -2,6 +2,7 @@ package embed
 
 import (
 	"context" // 上下文
+	"strings" // 字符串断言
 	"testing" // 测试框架
 
 	"github.com/blockmemory/agent/backend/pkg/types" // EmbedConfig 配置类型
@@ -93,5 +94,17 @@ func TestOpenAIEmbedderEmptyText(t *testing.T) {
 	// 校验向量长度
 	if len(vec) != 768 {
 		t.Fatalf("expected zero vector length 768, got %d", len(vec))
+	}
+}
+
+// TestNewEmbedderONNX_Stub 默认构建（无 -tags onnx）下 provider=onnx 编译期 stub
+// 返明确错误（TODO #41），指引 -tags onnx 构建。
+func TestNewEmbedderONNX_Stub(t *testing.T) {
+	_, err := NewEmbedder(types.EmbedConfig{Provider: "onnx"}, 768)
+	if err == nil {
+		t.Fatal("provider=onnx without -tags onnx must return error")
+	}
+	if !strings.Contains(err.Error(), "-tags onnx") {
+		t.Fatalf("stub error must mention -tags onnx, got: %v", err)
 	}
 }

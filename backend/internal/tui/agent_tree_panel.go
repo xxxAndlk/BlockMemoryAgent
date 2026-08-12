@@ -670,9 +670,13 @@ func renderAgentPanel(m *Model, w int) string {
 		}
 	}
 
-	// 追加 Tokens 区域：展示当前累计的输入/输出 Token 数。
+	// 追加 Tokens 区域：展示当前累计的输入/输出 Token 数与缓存命中率（TODO #40 可观测）。
 	lines = append(lines, "", m.styles.Header.Render("Tokens"))
-	lines = append(lines, fmt.Sprintf("  in:%d out:%d", m.totalInputTokens, m.totalOutputTokens))
+	cacheLine := fmt.Sprintf("  in:%d out:%d", m.totalInputTokens, m.totalOutputTokens)
+	if hit, miss := m.totalCacheHit, m.totalCacheMiss; hit+miss > 0 {
+		cacheLine += fmt.Sprintf("  缓存命中率 %.0f%%", float64(hit)/float64(hit+miss)*100)
+	}
+	lines = append(lines, cacheLine)
 
 	content := strings.Join(lines, "\n")
 	return m.styles.BlurBorder.Width(w).Height(m.height - 2).Render(content)

@@ -34,6 +34,8 @@ type SessionLogRecord struct {
 	Response     string         // LLM response（仅 llm_call 阶段使用）
 	InputTokens  int            // 输入 token 数
 	OutputTokens int            // 输出 token 数
+	CacheHitTokens  int         // 缓存命中 token 数（TODO #40 可观测）
+	CacheMissTokens int         // 缓存未命中 token 数（TODO #40 可观测）
 	Model        string         // 模型名称
 	LatencyMs    int            // 调用耗时（毫秒）
 	Meta         map[string]any // 扩展元数据

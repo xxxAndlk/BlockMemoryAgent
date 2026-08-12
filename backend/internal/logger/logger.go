@@ -292,14 +292,15 @@ func (l *Logger) Error(ctx context.Context, msg string, err error, extra ...slog
 // response 被埋在 "->" 之后难辨认；拆后输入输出各自带时间戳/级别/phase，输出天然显形。
 // 控制台与 session_logs 均保留完整 prompt/response，不截断。
 func (l *Logger) LLMCall(ctx context.Context, rec LLMCallRecord, extra ...slog.Attr) {
-	l.llmEvent(ctx, "llm_input", rec.Agent, rec.Model, rec.Prompt, "", rec.InputTokens, 0, 0, extra)
-	l.llmEvent(ctx, "llm_output", rec.Agent, rec.Model, "", rec.Response, 0, rec.OutputTokens, rec.LatencyMs, extra)
+	l.llmEvent(ctx, "llm_input", rec.Agent, rec.Model, rec.Prompt, "", rec.InputTokens, 0, 0, rec.CacheHitTokens, rec.CacheMissTokens, extra)
+	l.llmEvent(ctx, "llm_output", rec.Agent, rec.Model, "", rec.Response, 0, rec.OutputTokens, rec.LatencyMs, rec.CacheHitTokens, rec.CacheMissTokens, extra)
 }
 
 // llmEvent 发送一个 LLM I/O 事件到控制台与 session_logs。
 // prompt/response 二者其一为空：llm_input 行只填 prompt，llm_output 行只填 response。
 // 这样 DB 查询时按 phase 过滤即可分别取输入/输出，互不冗余。
-func (l *Logger) llmEvent(ctx context.Context, phase, agent, model, prompt, response string, inputTokens, outputTokens, latencyMs int, extra []slog.Attr) {
+// cacheHit/cacheMiss 两行都带（TODO #40 可观测），便于按会话聚合命中率。
+func (l *Logger) llmEvent(ctx context.Context, phase, agent, model, prompt, response string, inputTokens, outputTokens, latencyMs, cacheHitTokens, cacheMissTokens int, extra []slog.Attr) {
 	msg := prompt + response
 	event := l.zl.Info()
 	if event == nil {
@@ -310,6 +311,8 @@ func (l *Logger) llmEvent(ctx context.Context, phase, agent, model, prompt, resp
 		Str("model", model).
 		Int("input_tokens", inputTokens).
 		Int("output_tokens", outputTokens).
+		Int("cache_hit_tokens", cacheHitTokens).
+		Int("cache_miss_tokens", cacheMissTokens).
 		Int("latency_ms", latencyMs)
 	for _, attr := range extra {
 		event = attrToEvent(event, attr)
@@ -325,18 +328,20 @@ func (l *Logger) llmEvent(ctx context.Context, phase, agent, model, prompt, resp
 	}
 	now := time.Now()
 	l.enqueue(ctx, &SessionLogRecord{
-		SessionID:    sessionID,
-		Agent:        firstNonEmpty(l.fields["agent"], agent),
-		Phase:        phase,
-		Message:      msg,
-		Prompt:       prompt,
-		Response:     response,
-		Model:        model,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		LatencyMs:    latencyMs,
-		CreatedAt:    now,
-		Timestamp:    now.UnixMilli(),
+		SessionID:       sessionID,
+		Agent:           firstNonEmpty(l.fields["agent"], agent),
+		Phase:           phase,
+		Message:         msg,
+		Prompt:          prompt,
+		Response:        response,
+		Model:           model,
+		InputTokens:     inputTokens,
+		OutputTokens:    outputTokens,
+		CacheHitTokens:  cacheHitTokens,
+		CacheMissTokens: cacheMissTokens,
+		LatencyMs:       latencyMs,
+		CreatedAt:       now,
+		Timestamp:       now.UnixMilli(),
 	})
 }
 

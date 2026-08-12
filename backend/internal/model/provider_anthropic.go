@@ -87,6 +87,9 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 		inTok      int64
 		outTok     int64
 		stopReason string
+		// TODO #40 缓存可观测：CacheRead 作 hit、CacheCreation 作 miss（第 0 轮值）。
+		cacheHit  int64
+		cacheMiss int64
 	)
 
 	for round := 0; round < maxContinueRounds; round++ {
@@ -118,6 +121,8 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 		// 输入 token 只取第 0 轮（= 原始会话输入大小）；输出 token 累加（每轮新增输出）。
 		if round == 0 {
 			inTok = resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens
+			cacheHit = int64(resp.Usage.CacheReadInputTokens)
+			cacheMiss = int64(resp.Usage.CacheCreationInputTokens)
 		}
 		outTok += resp.Usage.OutputTokens
 		stopReason = string(resp.StopReason)
@@ -179,6 +184,8 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 		OutputTokens: outTok,
 		TotalTokens:  inTok + outTok,
 	}
+	// TODO #40 缓存可观测：CacheRead 作 hit、CacheCreation 作 miss（第 0 轮值）。
+	setCacheUsageMeta(msg, cacheHit, cacheMiss)
 	msg.FinishReason = stopReason
 	return &blades.ModelResponse{Message: msg}, nil
 }
@@ -211,6 +218,8 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 			toolOrder []string
 			// 跨轮累积：输出 token 累加（每轮新增输出），输入 token 只取第 0 轮。
 			inputTokens, outputTokens int64
+			// TODO #40 缓存可观测：跨轮累积 CacheRead（hit）/CacheCreation（miss）。
+			cacheHit, cacheMiss int64
 			stopReason                string
 		)
 
@@ -287,6 +296,8 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 					if round == 0 {
 						if u := ev.Usage; u.InputTokens+u.CacheCreationInputTokens+u.CacheReadInputTokens > 0 {
 							inputTokens = u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+							cacheHit += u.CacheReadInputTokens
+							cacheMiss += u.CacheCreationInputTokens
 						}
 					}
 				}
@@ -370,6 +381,8 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 		if accThinking.Len() > 0 {
 			msg.Metadata = map[string]any{"thinking": truncateThinking(accThinking.String())}
 		}
+		// TODO #40 缓存可观测：CacheRead 作 hit、CacheCreation 作 miss。
+		setCacheUsageMeta(msg, cacheHit, cacheMiss)
 		yield(&blades.ModelResponse{Message: msg}, nil)
 	}
 }

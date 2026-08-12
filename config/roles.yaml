@@ -332,10 +332,10 @@ domain_agent:
 
 # 轻量模型配置（用于历史会话总结、检索 query 改写等低开销任务）
 # 可指向更便宜更快的模型；留空 model 时回退到 domain_agent 模型
-# 实证：deepseek 端点本环境频繁超时（pipeline 摘要 5s 熔断反复触发）且输出格式不稳，
-# 摘要失败降级 raw join 会让上下文膨胀加速烧预算；已改用与 domain 同端点的 k3，快且稳。
-# 2026-08-04 基线运行实证：deepseek-v4-flash 多次 503 "Service is too busy" 重试耗尽，
-# 事实提取连续失败，故切换。
+# TODO #40 块 3：轻量模型归一 DeepSeek 原生 /chat/completions（provider=openai-chat），
+# 原生自动前缀缓存 + prompt_cache_hit/miss_tokens 字段（缓存可观测的基础）。
+# 历史注：2026-08-04 曾因 deepseek 端点不稳（503/超时）切 k3；#33 流式化+超时配置化后
+# 稳定性问题已缓解，现值 model=deepseek-v4-flash 与端点归一一致。
 lightweight_model:
   provider: anthropic
   model: deepseek-v4-flash
@@ -345,17 +345,20 @@ lightweight_model:
   max_tokens: 2048
 
 # 文本嵌入模型配置（P3-3）
-# provider: pseudo（默认，零依赖字符哈希） | openai（OpenAI 兼容端点） | local（本地 ollama/xinference）
+# provider: pseudo（默认，零依赖字符哈希） | openai（OpenAI 兼容端点） | local（本地 ollama/xinference HTTP 服务） | onnx（进程内 ONNX Runtime，TODO #41 真本地）
 # 向量维度需与上方 pgvector.dimensions 一致。
-# 当前 provider=pseudo：用户方舟账号未激活 doubao-embedding-vision，且 EMBEDDING_API_KEY 鉴权失败。
-# 切回真实嵌入需：1) 方舟控制台激活 doubao-embedding-text-240715 等模型；2) 注入有效 Embedding API Key；
-# 3) 把 provider 改回 openai，model 改为已激活模型名；4) 校对 pgvector.dimensions 与模型维度一致。
+# 2026-08-12 生效配置：provider=local + ollama bge-m3（OpenAI 兼容端点，零 api_key）。
+# 注意：base_url 只写主机根路径（EMBEDDING_BASE_URL=http://localhost:11434），客户端自行拼 /v1/embeddings；
+# 不要带 /api/embeddings（ollama 原生端点格式）——会拼出 /api/embeddings/v1/embeddings 404。
+# onnx（TODO #41，进程内零外部服务方向）：需 -tags onnx 构建 + models/bge-base-zh-v1.5/ 模型文件
+# （见 models/README），BGE-base-zh-v1.5 为 768 维；bge-m3 为 1024 维（当前 pgvector.dimensions）。
 embed:
-  provider: openai             # 默认 pseudo；接入真实模型时改为 openai/local
-  model: doubao-embedding-vision           # 真实模型示例：doubao-embedding-text-240715、bge-m3
-  api_key: ${EMBEDDING_API_KEY}  # openai/local 需要；pseudo 时忽略
-  base_url: ${EMBEDDING_BASE_URL} # 自定义 OpenAI 兼容端点；为空时 openai 走官方地址
+  provider: local             # 默认 pseudo；本地 HTTP 服务（ollama/xinference）用 local；进程内真本地改 onnx（-tags onnx）
+  model: bge-m3           # ollama 已拉取的嵌入模型；onnx 示例：bge-base-zh-v1.5
+  api_key: ""                  # openai 需要；ollama（local）与 onnx 忽略
+  base_url: ${EMBEDDING_BASE_URL} # OpenAI 兼容端点根路径（ollama: http://localhost:11434）；onnx 忽略
   batch_size: 1                  # 单次嵌入条数上限
+  # model_path: ./models/bge-base-zh-v1.5   # provider=onnx 专用（TODO #41）；默认 ./models/<model>/
 
 # 固定助手角色（配置文件预定义，长期存在，可被 call_sub_agent 派发）
 # 这些角色是叶子执行者：拥有 ReadFile/WriteFile/RunCommand 等执行类工具，
@@ -423,9 +426,8 @@ fixed_roles:
       base_url: ${OPENAI_BASE_URL}
       temperature: 0.4
       max_tokens: 65536  # 编码 Agent 单次 WriteFile 可能产出大文件（game.js/renderer.js），64K 防截断
-      # 实证：glm-5.2(thinking) 编码单轮调用分钟级，塔防多文件任务全链路被拖到 25min+；
-      # 已切 k3(非推理)：2026-08-04 基线运行 code_assistant 90 轮调用累计 1370s 为最大耗时源，
-      # k3 单轮 ~1min 内，配合 token_budget_per_role 200K 避免截断返工。
+      # 历史注：glm-5.2(thinking) 编码单轮分钟级曾拖慢全链路；k3(非推理) 单轮 ~1min。
+      # 现值 deepseek-v4-flash 经 openai-chat 原生端点，前缀缓存命中省计费省延迟。
     can_be_called: true
 
   # UI助手
@@ -519,7 +521,9 @@ fixed_roles:
       base_url: ${OPENAI_BASE_URL}
       temperature: 0.2
       max_tokens: 16384  # 提示词审查：完整 prompt 改写可能较长
-      # deepseek-v4-flash 端点频繁超时/503，strict 启动连通性校验会被其拖死（2026-08-04 实证启动失败），统一切 k3
+      # TODO #40 块 3：归一 DeepSeek 原生 /chat/completions（openai-chat 别名）——自动前缀缓存
+      # + 原生 cache 字段。历史注：2026-08-04 曾因端点不稳切 k3，strict 启动校验拖死风险由
+      # VerifyConnectivity 的宽松重试兜底（#33 后已流式化+超时配置化）。
     can_be_called: true
 
   # 代码审查助手

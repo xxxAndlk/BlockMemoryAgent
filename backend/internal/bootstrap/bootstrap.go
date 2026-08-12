@@ -9,6 +9,7 @@ package bootstrap
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -328,9 +329,17 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入任务看板（TODO #22 执行计划）：write_plan 写板、派发依赖门、TUI 面板真相源。
 	// 看板按 sessionID 惰性创建（write_plan 首次调用 GetOrCreate）。
 	agentSvc.SetBoard(rt.Boards.Get)
-	// 用户输入自动提示词补全（TODO #36 Phase 0 规则版）：命中续跑/控制/诊断意图时
-	// sendMessage 附加【系统补全】段（意图标签 + 看板/树失败任务绑定），只增不改原文。
+	// 用户输入自动提示词补全（TODO #36 Phase 0 规则版 + #39 四层管线）：命中续跑/控制/
+	// 诊断意图时 sendMessage 附加【系统补全】段（意图标签 + 看板/树失败任务绑定），
+	// 只增不改原文。L2 仲裁（#39）仅灰区触发：句首弱词/句中弱信号的短输入调轻量模型四分类，
+	// 超时/失败/低置信一律普通任务直通，绝不阻塞用户输入。
 	agentSvc.SetPromptEnhance(cfg.Agent.PromptEnhance == nil || *cfg.Agent.PromptEnhance)
+	agentSvc.SetPromptEnhanceLLM(
+		cfg.Agent.PromptEnhanceLLM == nil || *cfg.Agent.PromptEnhanceLLM,
+		newIntentArbiter(modelFactory),
+		time.Duration(cfg.Agent.PromptEnhanceLLMTimeoutSec)*time.Second,
+		cfg.Agent.PromptEnhanceMaxInputRunes,
+	)
 	subAgentDispatcher.WithBoard(rt.Boards.Get, func(sid, goal string) *board.TaskBoard {
 		return rt.Boards.GetOrCreate(sid, goal)
 	})
@@ -564,6 +573,63 @@ type reactModelFactory struct {
 // 返回：该角色对应的 agent.ModelProvider，或获取过程中的错误。
 func (f *reactModelFactory) GetBladesProvider(ctx context.Context, roleID string) (agent.ModelProvider, error) {
 	return f.inner.GetBladesProvider(ctx, roleID)
+}
+
+// newIntentArbiter 构造 TODO #39 L2 意图仲裁器：轻量模型对灰区输入四分类
+// （none/resume/control/diagnose + confidence）。
+// 超时/调用失败/解析失败/低置信一律返回错误 → 上层按 IntentNone 直通（宁漏判不误判：
+// 漏判退回无补全的旧行为，误判是 2026-08-11 事故）。
+func newIntentArbiter(f *model.ModelFactory) agent.IntentArbiter {
+	if f == nil {
+		return nil
+	}
+	return func(ctx context.Context, text string) (agent.IntentKind, error) {
+		prompt := "你是用户输入意图分类器。判断输入属于哪一类：\n" +
+			"- none: 普通任务/功能描述/一般疑问，不涉及会话控制\n" +
+			"- resume: 继续/续跑被中断或失败的任务\n" +
+			"- control: 停止/取消/暂停当前任务\n" +
+			"- diagnose: 询问失败原因/要求诊断分析\n" +
+			"只输出 JSON：{\"intent\": \"none|resume|control|diagnose\", \"confidence\": 0.0-1.0}\n" +
+			"输入: " + text
+		out, err := f.CallLightweightWithRetry(ctx, prompt)
+		if err != nil {
+			return agent.IntentNone, err
+		}
+		var r struct {
+			Intent     string  `json:"intent"`
+			Confidence float64 `json:"confidence"`
+		}
+		if err := parseStrictJSON(out, &r); err != nil {
+			return agent.IntentNone, fmt.Errorf("parse arbiter json: %w", err)
+		}
+		// 低置信不入流：0.6 阈值以下按无意图处理（防弱信号噪声带偏）。
+		if r.Confidence < 0.6 {
+			return agent.IntentNone, fmt.Errorf("low confidence %.2f", r.Confidence)
+		}
+		switch r.Intent {
+		case "resume":
+			return agent.IntentResume, nil
+		case "control":
+			return agent.IntentControl, nil
+		case "diagnose":
+			return agent.IntentDiagnose, nil
+		default:
+			return agent.IntentNone, nil
+		}
+	}
+}
+
+// parseStrictJSON 剥 markdown 围栏后严格解析 JSON（模型可能包 ```json 代码块）。
+func parseStrictJSON(s string, v any) error {
+	s = strings.TrimSpace(s)
+	if idx := strings.Index(s, "```"); idx != -1 {
+		s = s[idx+3:]
+		if end := strings.Index(s, "```"); end != -1 {
+			s = s[:end]
+		}
+	}
+	s = strings.TrimPrefix(strings.TrimSpace(s), "json")
+	return json.Unmarshal([]byte(strings.TrimSpace(s)), v)
 }
 
 // newEventSummarizer 构造一个 memory.EventSummarizer，把近期事件列表交给轻量模型压成短摘要。

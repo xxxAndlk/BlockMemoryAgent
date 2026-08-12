@@ -144,6 +144,8 @@ type Event struct {
 	Prompt       string    // Prompt 发送给 LLM 的提示词内容
 	InputTokens  int       // InputTokens LLM 输入 Token 数
 	OutputTokens int       // OutputTokens LLM 输出 Token 数
+	CacheHitTokens  int    // CacheHitTokens 缓存命中 token 数（TODO #40 可观测）
+	CacheMissTokens int    // CacheMissTokens 缓存未命中 token 数（TODO #40 可观测）
 	DetailJSON   string    // DetailJSON 事件的原始 JSON 详情，便于审计与调试
 }
 

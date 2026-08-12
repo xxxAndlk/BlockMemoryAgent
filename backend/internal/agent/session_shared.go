@@ -28,6 +28,8 @@ type internalEvent struct {
 	Prompt       string    `json:"prompt,omitempty"`        // Prompt 保存发送给模型的提示词内容
 	InputTokens  int       `json:"input_tokens,omitempty"`  // InputTokens 是输入 token 数量，用于统计成本
 	OutputTokens int       `json:"output_tokens,omitempty"` // OutputTokens 是输出 token 数量，用于统计成本
+	CacheHitTokens  int    `json:"cache_hit_tokens,omitempty"`  // CacheHitTokens 缓存命中 token 数（TODO #40 可观测）
+	CacheMissTokens int    `json:"cache_miss_tokens,omitempty"` // CacheMissTokens 缓存未命中 token 数（TODO #40 可观测）
 	DetailJSON   string    `json:"detail_json,omitempty"`   // DetailJSON 用于保存额外的结构化详情
 }
 
@@ -53,6 +55,8 @@ func toAgentEvent(e *internalEvent) *Event {
 		Prompt:       e.Prompt,
 		InputTokens:  e.InputTokens,
 		OutputTokens: e.OutputTokens,
+		CacheHitTokens:  e.CacheHitTokens,
+		CacheMissTokens: e.CacheMissTokens,
 		DetailJSON:   e.DetailJSON,
 	}
 }

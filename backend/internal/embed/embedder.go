@@ -23,13 +23,15 @@ type Embedder interface {
 // 职责：
 //   - provider=pseudo（或空） → PseudoEmbedder
 //   - provider=openai/local  → OpenAIEmbedder（OpenAI 兼容协议）
+//   - provider=onnx          → ONNXEmbedder（进程内 ONNX Runtime，TODO #41；
+//     需 `-tags onnx` 构建，默认构建编译期拒绝并指引）
 //
 // 参数：
 //   - cfg：embed 配置段。
 //   - dim：向量维度，由 pgvector.dimensions 传入；用于校验与 pseudo 实现。
 //
 // 返回：实现 Embedder 接口的实例；配置不合法时返回 error。
-// 副作用：无网络请求（OpenAI 实现延迟到首次 Embed 调用）。
+// 副作用：无网络请求（OpenAI 实现延迟到首次 Embed 调用；onnx 在构造期加载模型权重）。
 func NewEmbedder(cfg types.EmbedConfig, dim int) (Embedder, error) {
 	// 非法维度时回退到 768
 	if dim <= 0 {
@@ -43,6 +45,9 @@ func NewEmbedder(cfg types.EmbedConfig, dim int) (Embedder, error) {
 	case "openai", "local":
 		// openai / local 均走 OpenAI 兼容 embedding 协议
 		return NewOpenAIEmbedder(cfg, dim), nil
+	case "onnx":
+		// 进程内 ONNX Runtime 推理（TODO #41）：模型权重进进程内存，零 api_key/零外部服务。
+		return newONNXEmbedder(cfg, dim)
 	default:
 		// 不支持的 provider 返回错误
 		return nil, fmt.Errorf("unsupported embed provider: %s", cfg.Provider)

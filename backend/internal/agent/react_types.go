@@ -140,6 +140,10 @@ type LiveEvent struct {
 	// InputTokens/OutputTokens 仅 token_usage 使用：本次 LLM 调用的输入/输出 token 数。
 	InputTokens  int64
 	OutputTokens int64
+	// CacheHitTokens/CacheMissTokens 仅 token_usage 使用（TODO #40 可观测）：
+	// 本次调用的缓存命中/未命中 token 数（provider 未返回时为零）。
+	CacheHitTokens  int64
+	CacheMissTokens int64
 }
 
 // ToolRegistry 抽象了 ReActAgent 可调用的工具集合。

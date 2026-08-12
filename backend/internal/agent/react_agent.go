@@ -10,6 +10,7 @@ import (
 	"log"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
@@ -32,6 +33,11 @@ type ReActAgent struct {
 	role    types.RoleDefinition // role 是当前代理的角色定义，包含系统提示等配置。
 	name    string               // name 是代理唯一标识，也用于上下文中的 agent ID。
 	maxIter int                  // maxIter 是单次 Run 中允许的最大 LLM 调用次数，防止死循环。
+	// sysPromptOnce/sysPromptCache 冻结 systemPrompt 结果（TODO #40 块 4）：
+	// 环境块（含 PROJECT.md）与画像/人格在 Agent 存活期内字节稳定，跨轮前缀命中
+	// DeepSeek 缓存；resume 重建新实例时读到最新文件。sync.Once 保证并发安全。
+	sysPromptOnce  sync.Once
+	sysPromptCache string
 
 	// llmTimeout 是单次 LLM 调用的超时；<=0 时仅受会话 ctx 取消控制。
 	llmTimeout time.Duration
@@ -369,6 +375,10 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
 		assembled := a.memory.Assemble(a.role, a.name, history)
 
+		// 当前时间尾部注入（TODO #40 块 1）：时间每轮变化，放尾部不破坏前缀缓存。
+		// 所有 Agent（meta/domain/叶子）统一注入，与看板段同位（不可缓存尾部）。
+		assembled = append(assembled, buildTimeMessage())
+
 		// 上下文裁剪策略：仅 windowMessages 滑动窗口（硬上限，防 API 上下文溢出）。
 		// 历史压缩（hot/cold 分层）已迁入 memory.Pipeline.Assemble，按步频触发；
 		// ReActAgent 不再直接做历史压缩，职责归位到记忆层。
@@ -397,12 +407,22 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		}
 
 		// 推送本次 LLM 调用的 token 用量；provider 未填充用量时跳过（mock/测试）。
+		// 缓存命中/未命中（TODO #40 可观测）经 Metadata 透传，会话层聚合展示命中率。
 		if usage := resp.Message.TokenUsage; usage.InputTokens > 0 || usage.OutputTokens > 0 {
-			a.emitLive(LiveEvent{
+			ev := LiveEvent{
 				Kind:         LiveEventTokenUsage,
 				InputTokens:  usage.InputTokens,
 				OutputTokens: usage.OutputTokens,
-			})
+			}
+			if md := resp.Message.Metadata; md != nil {
+				if v, ok := md["cache_hit_tokens"].(int64); ok {
+					ev.CacheHitTokens = v
+				}
+				if v, ok := md["cache_miss_tokens"].(int64); ok {
+					ev.CacheMissTokens = v
+				}
+			}
+			a.emitLive(ev)
 		}
 		// 累计 token 预算：优先 TotalTokens（provider 填充时），否则用 input+output 之和。
 		// 空响应（mock/测试）不计入，避免误触预算上限。
@@ -626,11 +646,20 @@ func (a *ReActAgent) logLLMCall(ctx context.Context, req *blades.ModelRequest, r
 	}
 	prompt := serializePromptForLog(req)
 	response := ""
-	var inTok, outTok int64
+	var inTok, outTok, cacheHit, cacheMiss int64
 	if resp != nil && resp.Message != nil {
 		response = serializeResponseForLog(resp.Message)
 		inTok = resp.Message.TokenUsage.InputTokens
 		outTok = resp.Message.TokenUsage.OutputTokens
+		// TODO #40 缓存可观测：provider 侧经 Metadata 透传 cache_hit/miss tokens。
+		if md := resp.Message.Metadata; md != nil {
+			if v, ok := md["cache_hit_tokens"].(int64); ok {
+				cacheHit = v
+			}
+			if v, ok := md["cache_miss_tokens"].(int64); ok {
+				cacheMiss = v
+			}
+		}
 	}
 	errStr := ""
 	if callErr != nil {
@@ -638,13 +667,15 @@ func (a *ReActAgent) logLLMCall(ctx context.Context, req *blades.ModelRequest, r
 		response = "[ERROR] " + errStr + "\n" + response
 	}
 	a.log.LLMCall(ctx, logger.LLMCallRecord{
-		Agent:        a.role.Name,
-		Model:        a.llmModelName(),
-		Prompt:       prompt,
-		Response:     response,
-		InputTokens:  int(inTok),
-		OutputTokens: int(outTok),
-		LatencyMs:    int(dur.Milliseconds()),
+		Agent:          a.role.Name,
+		Model:          a.llmModelName(),
+		Prompt:         prompt,
+		Response:       response,
+		InputTokens:    int(inTok),
+		OutputTokens:   int(outTok),
+		CacheHitTokens: int(cacheHit),
+		CacheMissTokens: int(cacheMiss),
+		LatencyMs:      int(dur.Milliseconds()),
 	})
 }
 
@@ -951,10 +982,20 @@ func truncateRunes(s string, n int) string {
 }
 
 // systemPrompt 为当前角色构建系统提示词。
-// 基础提示来自角色配置；头部插入运行环境（OS/时区/时间/工作目录），
+// 基础提示来自角色配置；头部插入运行环境（OS/时区/工作目录），
 // 末尾追加一段统一的执行纪律，用于减少常见反模式
 // （无目的工具调用、未验证就声称完成、忘记 mailbox 消息语义等）。
+// TODO #40 块 4：结果按实例冻结（sync.Once）——envBlock（含 PROJECT.md）、画像/人格
+// 在 Agent 存活期内字节稳定，跨轮 DeepSeek 前缀缓存命中；resume 重建新实例读最新文件。
 func (a *ReActAgent) systemPrompt() string {
+	a.sysPromptOnce.Do(func() {
+		a.sysPromptCache = a.buildSystemPrompt()
+	})
+	return a.sysPromptCache
+}
+
+// buildSystemPrompt 是 systemPrompt 的实质实现（每实例只构建一次）。
+func (a *ReActAgent) buildSystemPrompt() string {
 	// 取角色配置中的系统提示作为基础。
 	base := a.role.SystemPrompt
 
@@ -963,8 +1004,10 @@ func (a *ReActAgent) systemPrompt() string {
 		base = "You are a helpful assistant."
 	}
 
-	// 头部环境信息：OS、时区、当前时间、工作目录。让 LLM 用对 OS 的 shell 语法
+	// 头部环境信息：OS、时区、工作目录（全部跨轮字节稳定）。让 LLM 用对 OS 的 shell 语法
 	// （Windows 用 PowerShell，Linux/macOS 用 bash/sh）与正确的相对路径。
+	// 注意：当前时间不在此处（TODO #40 缓存修复）——动态时间会打碎 system Instruction
+	// 前缀导致 DeepSeek 前缀缓存每轮失效，改为独立尾部 system 消息注入（buildTimeMessage）。
 	envBlock := buildEnvBlock(a.workDir)
 
 	// 在基础提示后追加执行纪律块，与角色提示同语言（中文），覆盖：
@@ -984,7 +1027,8 @@ func (a *ReActAgent) systemPrompt() string {
 }
 
 // buildEnvBlock 构造环境信息块，注入到系统提示词头部。
-// 包含 OS（含 Windows 主版本判断）、时区、当前时间、工作目录。
+// 包含 OS（含 Windows 主版本判断）、时区、工作目录——全部跨轮字节稳定
+// （TODO #40：动态时间已移出，见 buildTimeMessage；本函数输出可被 DeepSeek 前缀缓存命中）。
 // workDir 为空时回退到进程 cwd。
 func buildEnvBlock(workDir string) string {
 	osName := runtime.GOOS
@@ -999,13 +1043,11 @@ func buildEnvBlock(workDir string) string {
 		osLabel = "macOS（bash/zsh）"
 	}
 
-	// 时区与当前时间：用本地时区名 + RFC3339 时间，便于 LLM 处理时间相关任务。
+	// 时区：本地时区名。会话内稳定（用户不换时区），可入缓存前缀。
 	tzName := "UTC"
-	now := time.Now()
-	if loc := now.Location(); loc != nil && loc.String() != "" {
+	if loc := time.Now().Location(); loc != nil && loc.String() != "" {
 		tzName = loc.String()
 	}
-	timeStr := now.Format("2006-01-02 15:04:05 MST")
 
 	// 工作目录：为空时回退到 cwd，保证始终有值。
 	wd := workDir
@@ -1016,15 +1058,27 @@ func buildEnvBlock(workDir string) string {
 	env := "【运行环境】\n" +
 		fmt.Sprintf("- 操作系统: %s\n", osLabel) +
 		fmt.Sprintf("- 时区: %s\n", tzName) +
-		fmt.Sprintf("- 当前时间: %s\n", timeStr) +
 		fmt.Sprintf("- 工作目录: %s", wd)
 
 	// 项目概览：注入 .bma/PROJECT.md 的 managed 区正文（首个 session 启动时启发式生成）。
 	// 缺失或无标记返回空串，略去本段。让 Agent 了解工作目录的模块/领域拆分/命令/文档地图。
+	// TODO #40 块 4：会话级冻结（projectRefresher 刷新不污染当前会话前缀）另行处理。
 	if projDoc := project.LoadProjectDoc(workDir); projDoc != "" {
 		env += "\n\n【项目概览】\n" + projDoc
 	}
 	return env
+}
+
+// buildTimeMessage 构造当前时间尾部 system 消息（TODO #40 块 1 缓存修复核心）：
+// 时间每轮必变，放在系统提示词头部会把 system Instruction 前缀打碎、整条缓存失效；
+// 放在消息尾部（近期事件/看板段之后）——内容变化只影响不可缓存尾部，前缀稳定命中。
+// 时间精度不降（仍秒级），模型每轮可见。
+func buildTimeMessage() ReactMessage {
+	now := time.Now()
+	return ReactMessage{
+		Role:    "system",
+		Content: "【当前时间】" + now.Format("2006-01-02 15:04:05 MST"),
+	}
 }
 
 // mailboxMessageToReact 把异步 mailbox 消息转换为模型可见的 ReactMessage。

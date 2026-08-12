@@ -109,6 +109,11 @@ func LoadRoleConfig(path string) (*RoleConfigFile, error) {
 	if cfg.Embed.BatchSize <= 0 {
 		cfg.Embed.BatchSize = 1
 	}
+	// onnx provider（TODO #41）ModelPath 默认 ./models/<Model>/；
+	// 仅 provider=onnx 时填充，openai/local/pseudo 忽略该字段。
+	if cfg.Embed.Provider == "onnx" && cfg.Embed.ModelPath == "" && cfg.Embed.Model != "" {
+		cfg.Embed.ModelPath = "./models/" + cfg.Embed.Model
+	}
 
 	// 返回解析并填充默认值后的配置指针。
 	return &cfg, nil
