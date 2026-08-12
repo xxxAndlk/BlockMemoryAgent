@@ -743,6 +743,49 @@ func TestExploreBudget_WriteGateRaisesLimit(t *testing.T) {
 	}
 }
 
+// TestExploreBudget_VerifyTaskRaisesLimit 验证型任务（整品验收/边验边修）探索预算出生即按
+// postWrite 档（40 次），无需等首次 WriteFile：2026-08-12 整品验收事故实证——domain 16 次
+// 在"读 8 文件跨文件核对契约"阶段即耗尽，逼出凭记忆整文件盲改 + 超长 LLM 调用。
+// 验收任务读在写前，不该等首次 WriteFile 才升档。
+func TestExploreBudget_VerifyTaskRaisesLimit(t *testing.T) {
+	dir := t.TempDir()
+	var lines []string
+	for i := 0; i < 80; i++ {
+		lines = append(lines, fmt.Sprintf("line %d", i))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	// domain 角色 + 验证型任务标记：正常 domain 档 8 次应封，验证型直接升到 postWrite 档 40 次。
+	ctx := WithSessionID(context.Background(), "s-verify")
+	ctx = WithRoleID(ctx, "domain")
+	ctx = WithVerifyTask(ctx)
+
+	// 烧完正常 domain 档 8 次：全部应成功（验证型不受 domain 8 次限制）。
+	for i := 1; i <= exploreBudgetDomain; i++ {
+		res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(i), "limit": float64(1)})
+		if err != nil || !res.Success {
+			t.Fatalf("verify-task read %d within domain-tier should succeed: err=%v success=%v", i, err, res.Success)
+		}
+	}
+	// 第 9..40 次：postWrite 档内仍应成功。
+	for i := exploreBudgetDomain + 1; i <= exploreBudgetPostWrite; i++ {
+		res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(i), "limit": float64(1)})
+		if err != nil || !res.Success {
+			t.Fatalf("verify-task read %d within post-write tier should succeed: err=%v success=%v", i, err, res.Success)
+		}
+	}
+	// 第 41 次：postWrite 档耗尽，封锁（文案=修复期，非 domain 协调者文案）。
+	res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(75), "limit": float64(1)})
+	if res.Success {
+		t.Fatal("verify-task read beyond post-write budget should be blocked")
+	}
+	if !strings.Contains(res.Error, "修复期探索预算耗尽") {
+		t.Fatalf("expected post-write budget error, got: %s", res.Error)
+	}
+}
+
 // TestExploreBudget_ConfigOverride 验证 config.AgentConfig 覆盖探索预算三档默认值。
 // 配置 >0 生效；nil cfg 回落包级常量。
 func TestExploreBudget_ConfigOverride(t *testing.T) {

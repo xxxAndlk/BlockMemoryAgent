@@ -379,11 +379,17 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	return result
 }
 
+// snapshotRetention 是 WriteFile 快照的保留时长：超过即自动删除。
+// 取 24h：截断通常在写入后短时间内发现（同会话/次日），1 天足够恢复窗口；
+// 有 git 的项目历史版本更全，快照只是近期兜底。无 git 项目也按此时长，避免盘积压。
+const snapshotRetention = 24 * time.Hour
+
 // snapshotBeforeWrite 在覆盖前把原文件复制到 .bma/snapshots/<sessionID>/<relPath>.<timestamp>.bak。
 // 调用方须保证 absPath 指向已存在的常规文件。返回快照绝对路径；失败时返回空串（不阻塞写入）。
 // 设计：os.WriteFile 整文件覆盖不可逆，截断写入会把原文件写残（22495B->509B 事故），
 // 无备份只能靠 LLM 从片段记忆重建。快照给用户/Agent 一条恢复路径。
-// 快照不自动清理（.bma/snapshots/<sessionID>/），用户可手动删；保留全历史便于跨会话恢复。
+// 清理：每次写新快照后扫 .bma/snapshots/ 全目录，删 mtime 超过 snapshotRetention 的 .bak 文件。
+// 扫描全量（跨 sessionID）保证废弃会话的快照也能被回收，成本可接受（每次 WriteFile 一次 Walk）。
 func (e *Executor) snapshotBeforeWrite(ctx context.Context, absPath string) string {
 	sessionID := SessionIDFromContext(ctx)
 	if sessionID == "" || e.workDir == "" {
@@ -407,7 +413,32 @@ func (e *Executor) snapshotBeforeWrite(ctx context.Context, absPath string) stri
 	if err := os.WriteFile(snapPath, data, 0644); err != nil {
 		return ""
 	}
+	// 写完后异步清理过期快照：不阻塞当前写入，失败静默（best-effort）。
+	go e.cleanExpiredSnapshots()
 	return snapPath
+}
+
+// cleanExpiredSnapshots 扫描 .bma/snapshots/ 全目录，删除 mtime 超过 snapshotRetention 的 .bak 文件。
+// best-effort：Walk/Stat/Remove 任一错误均跳过，不影响主流程。空目录保留（无伤害）。
+func (e *Executor) cleanExpiredSnapshots() {
+	root := filepath.Join(e.workDir, ".bma", "snapshots")
+	cutoff := time.Now().Add(-snapshotRetention)
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // 父目录不可达等，跳过
+		}
+		if info.IsDir() {
+			return nil
+		}
+		// 仅清 .bak 文件，避免误删他物。
+		if !strings.HasSuffix(info.Name(), ".bak") {
+			return nil
+		}
+		if info.ModTime().Before(cutoff) {
+			_ = os.Remove(path)
+		}
+		return nil
+	})
 }
 
 // ---- ListDir（列出目录） ----

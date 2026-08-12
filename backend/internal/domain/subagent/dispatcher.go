@@ -47,6 +47,23 @@ type callSubAgentInput struct {
 	Mode string `json:"mode"`
 }
 
+// isVerificationTask 判定 domain 任务是"整品验收/边验边修"型（读重、验证优先）：
+// 探索预算出生即按 postWrite 档计算，无需等首次 WriteFile（见 tool.WithVerifyTask）。
+// 判定依据（meta 派发整品验收时固定模板）：
+//   - 任务文本含"验收清单"或"边验边修"（建设任务只有单条"验收：..."，无清单/边修边验）；
+//   - resume 场景任务被截成 100 字 brief，靠 domain 名（整品验收/集成验收/整体验收）兜底——
+//     domain 字段是唯一稳定出现在验收派发且绝不出现在建设派发的信号。
+// 误判方向是"过度授权"（建设任务误得 40 次预算）：安全，探索仍有软阻断+升级强杀兜底。
+func isVerificationTask(domain, task string) bool {
+	t := domain + "\n" + task
+	for _, m := range []string{"验收清单", "边验边修", "整品验收", "集成验收", "整体验收"} {
+		if strings.Contains(t, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // ModelProviderFactory 是 model.ModelFactory 的子集，
 // Dispatcher 只需要从中获取指定角色对应的模型提供者即可创建子 Agent。
 type ModelProviderFactory interface {
@@ -1559,6 +1576,15 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		task = strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + task
 	}
 
+	// 验证型任务标记：整品验收/边验边修型 domain 探索预算出生即按 postWrite 档（40 次）。
+	// 2026-08-12 整品验收事故实证：domain 16 次在"读 8 文件跨文件核对契约"阶段即耗尽，
+	// 只能凭记忆整文件盲改、触发超长 LLM 调用。验收任务读在写前，不该等首次 WriteFile 升档。
+	if roleDef.ID == "domain" && isVerificationTask(domain, task) {
+		ctx = tool.WithVerifyTask(ctx)
+		log.Printf("[subagent] verify-task: sub=%s domain=%q (explore budget => postWrite tier)",
+			subAgentID, domain)
+	}
+
 	result, err := d.runEngine(ctx, sub, subAgentID, roleDef.ID, mode, task)
 	if err != nil {
 		return sub, result, fmt.Errorf("run: %w", err)
@@ -1782,6 +1808,14 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	}()
 
 	log.Printf("[subagent] resume: sub=%s parent=%s domain=%s msgs=%d", pausedNodeID, parentID, pausedNode.Domain, len(msgs))
+	// 验证型任务标记沿用：resume 的 domain 若是整品验收型，探索预算继续按 postWrite 档。
+	// 判定靠 pausedNode.Domain/Task（任务文本已被截成 brief，domain 名是稳定信号）。
+	if isVerificationTask(pausedNode.Domain, pausedNode.Task) {
+		subCtx = tool.WithVerifyTask(subCtx)
+		log.Printf("[subagent] resume verify-task: sub=%s domain=%q (explore budget => postWrite tier)",
+			pausedNodeID, pausedNode.Domain)
+	}
+
 	result, err := sub.RunWithHistory(subCtx, "继续", msgs)
 	files := agent.FilesModifiedFromHistory(result.History)
 	if err != nil {

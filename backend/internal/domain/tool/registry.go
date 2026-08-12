@@ -786,11 +786,11 @@ func scopeKeyFromCtx(ctx context.Context) string {
 
 // exploreLimit 返回当前作用域生效的探索预算（仅用于日志，判定逻辑在 checkExploreBudget）：
 // 写入未开始用 exploreBudget（叶子反空转）/ exploreBudgetDomain（domain 协调者），
-// 写入已开始升档 exploreBudgetPostWrite（修复期精读）。
+// 写入已开始或验证型任务升档 exploreBudgetPostWrite（修复期/验收期精读）。
 func (r *Registry) exploreLimit(ctx context.Context, scopeKey string) int {
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
-	if r.writeCount[scopeKey] > 0 {
+	if r.writeCount[scopeKey] > 0 || VerifyTaskFromContext(ctx) {
 		return r.exploreBudgetPostWrite
 	}
 	if RoleIDFromContext(ctx) == "domain" {
@@ -806,7 +806,10 @@ func (r *Registry) exploreLimit(ctx context.Context, scopeKey string) int {
 // 对 ReadFile/ListDir/SearchInFiles 与只读型 RunCommand 生效；
 // 验证/动作类 RunCommand 不计（封禁会导致写完文件后无法验证的重试死循环）。
 // 预算分两档：首次 WriteFile 前叶子 20 次 / domain 8 次（反探索空转 + 倒逼探索下放），
-// 写入已开始 40 次（修复期"读报错位置→改→复验"循环合法；v13 实证禁读逼出整文件盲重写长尾）。
+// 写入已开始或验证型任务 40 次（修复/验收期"读报错位置→改→复验"循环合法；v13 实证禁读逼出
+// 整文件盲重写长尾；2026-08-12 整品验收事故实证：domain 16 次在"读 8 文件跨文件核对契约"
+// 阶段即耗尽，逼出凭记忆盲改 + 超长 LLM 调用。验证型任务经 dispatcher 注入 WithVerifyTask，
+// 出生即按 postWrite 档计算——验收任务读在写前，不该等首次 WriteFile 才升档）。
 func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	scopeKey := scopeKeyFromCtx(ctx)
 	if scopeKey == "" {
@@ -814,7 +817,7 @@ func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	}
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
-	postWrite := r.writeCount[scopeKey] > 0
+	postWrite := r.writeCount[scopeKey] > 0 || VerifyTaskFromContext(ctx)
 	isDomain := RoleIDFromContext(ctx) == "domain"
 	limit := r.exploreBudget
 	if postWrite {

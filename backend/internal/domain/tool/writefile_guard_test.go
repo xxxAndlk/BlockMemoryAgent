@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestWriteFile_ContentTooLargeRejected 验证超上限内容被拒收并给出拆分指引。
@@ -250,5 +251,63 @@ func TestWriteFile_SnapshotSkippedWithoutSession(t *testing.T) {
 	}
 	if strings.Contains(res.Output, "原文件已备份到") {
 		t.Errorf("output = %q, no-session must not snapshot", res.Output)
+	}
+}
+
+// TestWriteFile_SnapshotExpiredCleanup 验证快照过期自动清理：
+// 手工放置 25h 前的 .bak 文件 -> 触发一次新快照写入 -> 旧文件被清，新文件留。
+func TestWriteFile_SnapshotExpiredCleanup(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "a.js")
+	if err := os.WriteFile(target, []byte("v1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	e := NewExecutor(dir)
+	ctx := WithSessionID(context.Background(), "test-sess-clean")
+
+	// 手工放置一个 25h 前的过期快照。
+	snapDir := filepath.Join(dir, ".bma", "snapshots", "test-sess-clean")
+	if err := os.MkdirAll(snapDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	oldSnap := filepath.Join(snapDir, "a.js.20000101-000000.bak")
+	if err := os.WriteFile(oldSnap, []byte("OLD"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// 把 mtime 设到 25h 前。
+	oldTime := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(oldSnap, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// 触发一次 WriteFile（产生新快照 + 触发异步清理）。
+	res := e.writeFile(ctx, map[string]any{"path": "a.js", "content": "v2"})
+	if !res.Success {
+		t.Fatalf("write failed: %v", res.Error)
+	}
+
+	// 等异步清理完成（best-effort，给足时间）。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(oldSnap); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 旧快照应被删。
+	if _, err := os.Stat(oldSnap); err == nil {
+		t.Errorf("expired snapshot should be deleted: %s", oldSnap)
+	}
+	// 新快照应留（刚创建，mtime 当前）。
+	entries, err := os.ReadDir(snapDir)
+	if err != nil {
+		t.Fatalf("read snap dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want 1 fresh snapshot, got %d", len(entries))
+	}
+	if !strings.HasPrefix(entries[0].Name(), "a.js.2") {
+		t.Errorf("unexpected snapshot name: %s", entries[0].Name())
 	}
 }

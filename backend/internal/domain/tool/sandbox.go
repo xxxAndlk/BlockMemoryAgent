@@ -309,6 +309,22 @@ func RoleIDFromContext(ctx context.Context) string {
 	return ""
 }
 
+// verifyTaskKey 标记当前 domain 任务是"整品验收/边验边修"型（读重、验证优先）。
+// 探索预算据此直接按 postWrite 档计算——验收任务天生就是"读报错→改→复验"修复循环，
+// 无需等首次 WriteFile 才升档。由 dispatcher 按任务文本判定后注入（见 subagent.isVerificationTask）。
+type verifyTaskKey struct{}
+
+// WithVerifyTask 返回携带验证型任务标记的 context。
+func WithVerifyTask(ctx context.Context) context.Context {
+	return context.WithValue(ctx, verifyTaskKey{}, true)
+}
+
+// VerifyTaskFromContext 判断当前上下文是否验证型任务；未设置时返回 false。
+func VerifyTaskFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(verifyTaskKey{}).(bool)
+	return v
+}
+
 // resolvePath 将路径解析为相对于 Executor 工作目录的绝对路径。
 // 如果传入的 path 已经是绝对路径，则原样返回。
 func (e *Executor) resolvePath(path string) string {
