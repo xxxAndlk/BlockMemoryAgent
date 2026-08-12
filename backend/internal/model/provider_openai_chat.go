@@ -216,13 +216,17 @@ func (p *openAIChatProvider) NewStreaming(ctx context.Context, req *blades.Model
 		if contentBuf.Len() > 0 {
 			final.Parts = append(final.Parts, blades.TextPart{Text: contentBuf.String()})
 		}
-		for _, tc := range toolCalls {
-			final.Role = blades.RoleTool
-			final.Parts = append(final.Parts, blades.ToolPart{
-				ID:      fmt.Sprintf("%v", tc["id"]),
-				Name:    chatToolCallName(tc),
-				Request: chatToolCallArgs(tc),
-			})
+		// finish_reason=length 时丢弃工具调用：arguments 为流中断时累积的半截 JSON，
+		// 执行会把文件写残（实证 monster.js 被截断到 64 行）。文本保留（模型下轮可续）。
+		if finishReason != "length" {
+			for _, tc := range toolCalls {
+				final.Role = blades.RoleTool
+				final.Parts = append(final.Parts, blades.ToolPart{
+					ID:      fmt.Sprintf("%v", tc["id"]),
+					Name:    chatToolCallName(tc),
+					Request: chatToolCallArgs(tc),
+				})
+			}
 		}
 		if reasoningBuf.Len() > 0 {
 			if final.Metadata == nil {
@@ -574,6 +578,13 @@ func parseChatResponse(raw []byte) (*blades.ModelResponse, error) {
 		}
 		if choice.FinishReason != "" {
 			msg.FinishReason = choice.FinishReason
+		}
+		// finish_reason=length 表示响应被 max_tokens 截断：tool_calls 的 arguments
+		// 可能是半截 JSON（端点/网关常自动补齐引号括号使其"合法"但内容缺失）。
+		// 执行半截参数会把文件写残（实证：monster.js 730 行被截断写入 64 行）。
+		// 整轮丢弃工具调用，由 ReAct 空响应/下一轮让模型重试。
+		if choice.FinishReason == "length" {
+			continue
 		}
 		for _, call := range choice.Message.ToolCalls {
 			msg.Role = blades.RoleTool

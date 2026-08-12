@@ -174,9 +174,14 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 	if accText.Len() > 0 {
 		parts = append(parts, blades.TextPart{Text: accText.String()})
 	}
-	for _, id := range toolOrder {
-		t := toolByID[id]
-		parts = append(parts, blades.NewToolPart(t.ID, t.Name, string(t.Input)))
+	// stop_reason=max_tokens 且续写轮耗尽：本轮 tool_use input 可能是半截 JSON，
+	// 执行会把文件写残（实证 monster.js 被截断到 64 行）。整轮丢弃工具调用，
+	// 文本保留，由 ReAct 下一轮让模型重试。正常 tool_use 结束不受影响。
+	if stopReason != "max_tokens" {
+		for _, id := range toolOrder {
+			t := toolByID[id]
+			parts = append(parts, blades.NewToolPart(t.ID, t.Name, string(t.Input)))
+		}
 	}
 	msg.Parts = parts
 	msg.TokenUsage = blades.TokenUsage{
@@ -366,9 +371,12 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 		if accText.Len() > 0 {
 			parts = append(parts, blades.TextPart{Text: accText.String()})
 		}
-		for _, id := range toolOrder {
-			t := toolByID[id]
-			parts = append(parts, blades.NewToolPart(t.id, t.name, t.input))
+		// 同 Generate：续写轮耗尽仍 max_tokens 时丢弃 tool_use（半截 JSON 会写残文件）。
+		if stopReason != "max_tokens" {
+			for _, id := range toolOrder {
+				t := toolByID[id]
+				parts = append(parts, blades.NewToolPart(t.id, t.name, t.input))
+			}
 		}
 		msg.Parts = parts
 		msg.TokenUsage = blades.TokenUsage{

@@ -52,10 +52,15 @@ type (
 	writeFileInput struct {
 		// Path 为待写入文件的目标路径。
 		Path string `json:"path"`
-		// Content 为要写入文件的文本内容。
+		// Content 为要写入文件的文本内容。必须是文件的**完整内容**--WriteFile 是整文件覆盖，
+		// 不是局部替换/追加。修改局部须先 ReadFile 完整文件再写完整内容，禁止只发修改片段
+		// （只发片段会把原文件整文件覆盖为片段，造成数据丢失）。
 		Content string `json:"content"`
 		// Temporary 为 true 时表示写入到当前会话的临时目录，受会话上下文约束。
 		Temporary bool `json:"temporary"`
+		// ConfirmShrink 为 true 时显式确认"新内容远小于原文件"是有意精简，绕过极端缩小硬拒绝。
+		// 仅在确实要大幅删减文件时设置；常规修改不要设。
+		ConfirmShrink bool `json:"confirm_shrink"`
 	}
 	// listDirInput 表示 ListDir 工具的输入参数。
 	listDirInput struct {
@@ -222,6 +227,30 @@ func (e *Executor) readFile(args map[string]any) *Result {
 
 // ---- WriteFile（写入文件） ----
 
+// maxWriteFileContentRunes 是单次 WriteFile 内容上限：超限拒收要求拆分。
+// 提示词已有"单文件目标 <= 300 行"软约束，但大文件整写仍触发 LLM max_tokens
+// 截断（实证 monster.js 730 行被截断写入 64 行后 node --check 仍通过）。
+// 工具层硬上限兜底：单响应生成超长内容必截断，先拒绝并指导拆分。
+const maxWriteFileContentRunes = 100000
+
+// writeFileSizeWarnRatio 重写已有文件时，新内容小于原大小该比例（且原文件
+// 超过 minWriteFileSizeWarnBytes）则输出附警告，辅助模型发现截断写入。
+const (
+	writeFileSizeWarnRatio      = 0.3
+	minWriteFileSizeWarnBytes   = 1000
+)
+
+// 极端缩小硬拒绝阈值：原文件 >= minWriteFileShrinkRefuseBytes 且新内容 < 原文件
+// writeFileShrinkRefuseRatio 比例时，WriteFile 直接拒收（除非显式 confirm_shrink=true）。
+// 实证：模型把 WriteFile 当"局部替换"用，只发修改片段（509B/22495B = 2%、755B/59888B = 1%），
+// os.WriteFile 整文件覆盖把原文件截成 ~20 行数据丢失。warn 文案"若为有意的精简请忽略"
+// 给了模型逃避口（直接判"符合预期"），需硬拒绝强制模型 ReadFile 全文重写。
+// 阈值取 10% + 5KB：常规大幅精简（删半/重写更紧凑）不会触发；只触发"明显是片段"场景。
+const (
+	writeFileShrinkRefuseRatio    = 0.10
+	minWriteFileShrinkRefuseBytes = 5000
+)
+
 // writeFile 将内容写入指定路径，支持普通文件与会话临时文件两种模式。
 func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	// 从参数中取出各字段，缺失时使用零值。
@@ -229,10 +258,18 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	content, _ := args["content"].(string)
 	temporary, _ := args["temporary"].(bool)
 	allowSpaces, _ := args["allow_spaces"].(bool)
+	confirmShrink, _ := args["confirm_shrink"].(bool)
 
 	// path 为空时不允许写入，直接返回错误。
 	if path == "" {
 		return &Result{Tool: "WriteFile", Error: "path is required"}
+	}
+	// 内容硬上限：超长单次写入会被模型输出截断写残（provider 层丢弃截断
+	// tool_call 只是让模型重试，这里从源头拒绝并给拆分指引）。
+	if r := []rune(content); len(r) > maxWriteFileContentRunes {
+		return &Result{Tool: "WriteFile", Path: path, Error: fmt.Sprintf(
+			"content too large: %d runes (max %d)。单次 WriteFile 超长内容易被模型输出截断写残文件；"+
+				"请拆分写入（单文件目标 <= 300 行）或分多次 WriteFile", len(r), maxWriteFileContentRunes)}
 	}
 
 	// 调用写保护守卫进行策略校验（例如禁止写入某些目录、检查路径特征）。
@@ -277,6 +314,31 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return &Result{Tool: "WriteFile", Path: absPath, Error: "mkdir: " + err.Error()}
 	}
+	// 写入前记录原文件大小：供截断对比警告与快照决策（须在覆盖前取）。
+	var prevSize int64 = -1
+	if fi, err := os.Stat(absPath); err == nil && fi.Mode().IsRegular() {
+		prevSize = fi.Size()
+	}
+	// 极端缩小硬拒绝：原文件较大且新内容远小于原文件时，几乎肯定是模型把 WriteFile
+	// 当局部替换用了（只发修改片段）。拒收并引导模型 ReadFile 全文重写；若确为有意精简，
+	// 模型可显式传 confirm_shrink=true 绕过（合法大幅删减仍可放行）。
+	if prevSize >= minWriteFileShrinkRefuseBytes &&
+		int64(len(content)) < int64(float64(prevSize)*writeFileShrinkRefuseRatio) &&
+		!confirmShrink {
+		return &Result{Tool: "WriteFile", Path: absPath, Error: fmt.Sprintf(
+			"refused: 新内容 %d 字节，仅为原文件 %d 字节的 %d%%。"+
+				"WriteFile 是整文件覆盖，不是局部替换--只发修改片段会把原文件整文件覆盖为片段，造成数据丢失。"+
+				"请改用 ReadFile 读取完整文件后把完整内容写入；若确为有意的极端精简，请加参数 confirm_shrink=true。",
+			len(content), prevSize, int64(len(content))*100/prevSize)}
+	}
+	// 写入前快照原文件：os.WriteFile 是整文件覆盖，截断写入会把原文件写残（实证：
+	// 22495B->509B、59888B->755B），无备份则只能靠 LLM 从片段记忆重建。快照存到
+	// .bma/snapshots/<sessionID>/<relPath>.<timestamp>.bak，截断发现后可直接恢复。
+	// 仅对非 temporary 的已存在文件做快照；新文件与临时文件跳过。
+	var snapPath string
+	if !temporary && prevSize >= 0 {
+		snapPath = e.snapshotBeforeWrite(ctx, absPath)
+	}
 	// 执行文件写入。
 	if err := os.WriteFile(absPath, []byte(content), 0644); err != nil {
 		return &Result{Tool: "WriteFile", Path: absPath, Error: err.Error()}
@@ -288,6 +350,20 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 		Success: true,
 		Output:  fmt.Sprintf("wrote %d bytes", len(content)),
 		Path:    absPath,
+	}
+	// 截断对比警告：新内容远小于原文件时提醒。截断写入（LLM 输出被 max_tokens
+	// 切断、端点补齐 JSON）的新内容仅为原文件一小段，且 node --check 在截断
+	// 边界仍可能通过（实证 monster.js 730 行被截断写入 64 行后验收"通过"），
+	// 模型靠此警告自查重写完整文件。仅警告不拒绝（合法的大幅删减需放行，
+	// 极端缩小由上面的硬拒绝兜底）。
+	if prevSize >= minWriteFileSizeWarnBytes && int64(len(content)) < int64(float64(prevSize)*writeFileSizeWarnRatio) {
+		result.Output += fmt.Sprintf("；写入警告: 新内容 %d 字节，仅为原文件 %d 字节的 %d%%。"+
+			"若为意外截断（内容不完整）请 ReadFile 完整文件后重写；若为有意的精简可忽略（极端缩小需 confirm_shrink=true 才放行）",
+			len(content), prevSize, int64(len(content))*100/prevSize)
+	}
+	// 附加快照路径：截断发现后可从快照恢复，避免靠 LLM 重建。
+	if snapPath != "" {
+		result.Output += fmt.Sprintf("；原文件已备份到 %s", snapPath)
 	}
 	// 若为临时文件，标记结果并记录临时目录，便于会话结束后清理。
 	if temporary {
@@ -301,6 +377,37 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	}
 	// 返回结果。
 	return result
+}
+
+// snapshotBeforeWrite 在覆盖前把原文件复制到 .bma/snapshots/<sessionID>/<relPath>.<timestamp>.bak。
+// 调用方须保证 absPath 指向已存在的常规文件。返回快照绝对路径；失败时返回空串（不阻塞写入）。
+// 设计：os.WriteFile 整文件覆盖不可逆，截断写入会把原文件写残（22495B->509B 事故），
+// 无备份只能靠 LLM 从片段记忆重建。快照给用户/Agent 一条恢复路径。
+// 快照不自动清理（.bma/snapshots/<sessionID>/），用户可手动删；保留全历史便于跨会话恢复。
+func (e *Executor) snapshotBeforeWrite(ctx context.Context, absPath string) string {
+	sessionID := SessionIDFromContext(ctx)
+	if sessionID == "" || e.workDir == "" {
+		return ""
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return ""
+	}
+	rel, err := filepath.Rel(e.workDir, absPath)
+	if err != nil || rel == "" {
+		rel = filepath.Base(absPath)
+	}
+	// rel 用 OS 原生分隔符，快照路径在 Windows 下形如 css\style.css.20260812-150530.bak。
+	// 时间戳用秒级精度：同一文件秒内多次写入只保留最后一次快照（够用，避免噪声）。
+	stamp := time.Now().Format("20060102-150405")
+	snapPath := filepath.Join(e.workDir, ".bma", "snapshots", sessionID, rel+"."+stamp+".bak")
+	if err := os.MkdirAll(filepath.Dir(snapPath), 0755); err != nil {
+		return ""
+	}
+	if err := os.WriteFile(snapPath, data, 0644); err != nil {
+		return ""
+	}
+	return snapPath
 }
 
 // ---- ListDir（列出目录） ----

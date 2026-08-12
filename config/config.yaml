@@ -57,6 +57,9 @@ agent:
   ask_user_timeout_sec: 0        # ask_user 提问默认超时（秒，TODO #24 人在回路）：0=不限；>0 超时未答复工具返回"用户未答复，自行决策"。单次调用 timeout_sec 参数覆盖
   reflection_max_rounds: 2       # 派发 mode=reflection 时自检不达标重试轮数上限（TODO #29 三引擎）：每轮 ≈ +1 次辅助 LLM 调用
   plan_execute_max_steps: 8      # 派发 mode=plan_execute 时最大执行步数（TODO #29 三引擎）：超限强制收口终答
+  explore_budget: 20             # 叶子 Agent 探索类工具（ReadFile/ListDir/SearchInFiles/只读 RunCommand）调用次数上限；20 次 × 200 行/页覆盖 ~4000 行
+  explore_budget_domain: 16      # DomainAgent 协调者写入未开始前探索预算；原默认 8 在派发完子 Agent 后验证阶段不够用（domain-4 卡 running 4m+），抬到 16
+  explore_budget_post_write: 40  # 写入已开始后探索预算升档（修复期"读报错->改->复验"循环需精读）；禁读逼盲改回归震荡
   react_llm_timeout_sec: 600     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断,改 600s 给一次调用留够跑完。配合 generate() 不在 deadline 上重试,卡死时 600s 即报错而非 4×180=12min。
   sub_agent_timeout_min: 60      # 子 Agent 独立执行超时（分钟），负数表示不限制。预算抬至 400K 后单 domain 需跑完多文件生成，30min 易在慢推理（thinking）下超时。
   tool_output_history_max_runes: 20000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 行区间分页默认 200 行/页（read_file_max_chars 默认 16000 字符，ASCII 整页约 16000 runes），20000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取

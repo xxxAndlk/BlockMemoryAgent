@@ -33,6 +33,8 @@ const maxConsecutiveValidationRejections = 5
 // 取值 20：实证（2026-08-10 塔防日志）旧值 8 次 × 单页实测 60-110 行（4000 字符截停），
 // 单领域职责文件（如 game.js 849 行 + monster.js 521 行）需 ~17 页才能读完，
 // 4 个领域 Agent 全部耗尽预算被 loop guard 判死；20 次 × 200 行/页覆盖 ~4000 行。
+// exploreBudget 是单个叶子 Agent 任务内探索类工具调用次数上限的默认值。
+// 实际生效值由 config.AgentConfig.ExploreBudget 覆盖（配置 0 时回落本常量）。
 const exploreBudget = 20
 
 // exploreBudgetDomain 是 DomainAgent（协调者）写入未开始前的探索预算。
@@ -201,6 +203,12 @@ type Registry struct {
 	// productionWorkDir 是配置的生产环境工作目录（绝对路径）；空 = 未启用生产边界确认，
 	// 仅危险命令模式（isDangerousCommand）触发确认。
 	productionWorkDir string
+	// exploreBudget / exploreBudgetDomain / exploreBudgetPostWrite 是探索类工具调用次数上限，
+	// 由 config.AgentConfig 注入；零值回落到同名包级常量（默认 20/8/40）。
+	// 三档：叶子写入前 / domain 写入前 / 写入后修复期。详见常量注释。
+	exploreBudget           int
+	exploreBudgetDomain     int
+	exploreBudgetPostWrite  int
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -225,9 +233,23 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		exploreBlockCount: make(map[string]int),
 		writeCount:        make(map[string]int),
 		productionWorkDir: "",
+		// 探索预算三档：零值时 checkExploreBudget/exploreLimit 内部回落到包级常量。
+		exploreBudget:          exploreBudget,
+		exploreBudgetDomain:    exploreBudgetDomain,
+		exploreBudgetPostWrite: exploreBudgetPostWrite,
 	}
 	if cfg != nil {
 		r.productionWorkDir = cfg.ProductionWorkDir
+		// 配置覆盖探索预算三档：>0 才生效（0 表示未配置，保持常量默认）。
+		if cfg.ExploreBudget > 0 {
+			r.exploreBudget = cfg.ExploreBudget
+		}
+		if cfg.ExploreBudgetDomain > 0 {
+			r.exploreBudgetDomain = cfg.ExploreBudgetDomain
+		}
+		if cfg.ExploreBudgetPostWrite > 0 {
+			r.exploreBudgetPostWrite = cfg.ExploreBudgetPostWrite
+		}
 	}
 	// 去抖异步刷新 PROJECT.md：文件增删改后安静期触发 LLM 按职责重分区。
 	// cls nil（测试）时 RefreshProjectDoc 走启发式，刷新仍更新文件列表。
@@ -769,12 +791,12 @@ func (r *Registry) exploreLimit(ctx context.Context, scopeKey string) int {
 	r.readMu.Lock()
 	defer r.readMu.Unlock()
 	if r.writeCount[scopeKey] > 0 {
-		return exploreBudgetPostWrite
+		return r.exploreBudgetPostWrite
 	}
 	if RoleIDFromContext(ctx) == "domain" {
-		return exploreBudgetDomain
+		return r.exploreBudgetDomain
 	}
-	return exploreBudget
+	return r.exploreBudget
 }
 
 // checkExploreBudget 检查当前作用域探索类工具调用次数是否超预算。
@@ -794,11 +816,11 @@ func (r *Registry) checkExploreBudget(ctx context.Context) string {
 	defer r.readMu.Unlock()
 	postWrite := r.writeCount[scopeKey] > 0
 	isDomain := RoleIDFromContext(ctx) == "domain"
-	limit := exploreBudget
+	limit := r.exploreBudget
 	if postWrite {
-		limit = exploreBudgetPostWrite
+		limit = r.exploreBudgetPostWrite
 	} else if isDomain {
-		limit = exploreBudgetDomain
+		limit = r.exploreBudgetDomain
 	}
 	if r.exploreCount[scopeKey] >= limit {
 		if postWrite {
@@ -901,9 +923,9 @@ func (r *Registry) Schema() []tools.Tool {
 		toolsList = append(toolsList, t)
 	}
 	// 注册 WriteFile 工具：写入文件。
-	if t, err := tools.NewFunc("WriteFile", "写入文件。若文件仅作为临时产物使用（例如运行脚本、中间分析、一次性计算），请设置 temporary=true，文件会写入会话级临时目录并在会话结束后自动清理；用户明确要求保留的文件请保持 temporary=false（默认）。", func(ctx context.Context, in writeFileInput) (string, error) {
-		// 转发到内部 WriteFile 工具，包含路径、内容和 temporary 标志。
-		res, _ := r.Dispatch(ctx, "WriteFile", map[string]any{"path": in.Path, "content": in.Content, "temporary": in.Temporary})
+	if t, err := tools.NewFunc("WriteFile", "写入文件（整文件覆盖，不是局部替换/追加）。content 必须是文件的**完整内容**--修改局部须先 ReadFile 读取完整文件再写完整内容，禁止只发修改片段（只发片段会把原文件整文件覆盖为片段，造成数据丢失）。若文件仅作为临时产物使用（例如运行脚本、中间分析、一次性计算），请设置 temporary=true，文件会写入会话级临时目录并在会话结束后自动清理；用户明确要求保留的文件请保持 temporary=false（默认）。极端缩小（新内容 < 原文件 10% 且原文件 >= 5KB）默认拒收，确为有意精简时加 confirm_shrink=true 绕过。", func(ctx context.Context, in writeFileInput) (string, error) {
+		// 转发到内部 WriteFile 工具，包含路径、内容和 temporary/confirm_shrink 标志。
+		res, _ := r.Dispatch(ctx, "WriteFile", map[string]any{"path": in.Path, "content": in.Content, "temporary": in.Temporary, "confirm_shrink": in.ConfirmShrink})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
 	}); err == nil {

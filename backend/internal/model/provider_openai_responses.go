@@ -345,13 +345,14 @@ type responsesStreamEvent struct {
 	Error *responsesAPIError `json:"error"`
 }
 
-// responsesFinishReason 由响应状态推导 finish_reason（仅用于日志展示）：
-// 有 function_call → tool_calls；incomplete（max_output_tokens）→ length；completed → stop。
+// responsesFinishReason 由响应状态推导 finish_reason（仅用于日志展示与截断判定）：
+// incomplete（max_output_tokens）优先判为 length —— 即使 output 里带 function_call，
+// 其参数也可能是截断的半截 JSON（实证 monster.js 被写残）；其次 tool_calls / stop。
 func responsesFinishReason(r *responsesAPIResponseBody, hasToolCalls bool) string {
-	if hasToolCalls {
-		return "tool_calls"
-	}
 	if r == nil {
+		if hasToolCalls {
+			return "tool_calls"
+		}
 		return ""
 	}
 	if r.IncompleteDetails != nil && r.IncompleteDetails.Reason != "" {
@@ -360,6 +361,9 @@ func responsesFinishReason(r *responsesAPIResponseBody, hasToolCalls bool) strin
 		}
 		return r.IncompleteDetails.Reason
 	}
+	if hasToolCalls {
+		return "tool_calls"
+	}
 	if r.Status == "completed" {
 		return "stop"
 	}
@@ -367,18 +371,22 @@ func responsesFinishReason(r *responsesAPIResponseBody, hasToolCalls bool) strin
 }
 
 // buildResponsesFinalMessage 组装完整响应消息（流式末块与非流式解析共用）。
+// finishReason="length"（incomplete + max_output_tokens）时丢弃 function_call：
+// 参数为流中断时累积的半截 JSON，执行会把文件写残（与 openai-chat 同规则）。
 func buildResponsesFinalMessage(content, reasoning string, toolCalls []responsesFunctionCall, usage responsesUsage, finishReason string) *blades.ModelResponse {
 	msg := blades.NewAssistantMessage(blades.StatusCompleted)
 	if content != "" {
 		msg.Parts = append(msg.Parts, blades.TextPart{Text: content})
 	}
-	for _, tc := range toolCalls {
-		msg.Role = blades.RoleTool
-		msg.Parts = append(msg.Parts, blades.ToolPart{
-			ID:      tc.CallID,
-			Name:    tc.Name,
-			Request: tc.Arguments,
-		})
+	if finishReason != "length" {
+		for _, tc := range toolCalls {
+			msg.Role = blades.RoleTool
+			msg.Parts = append(msg.Parts, blades.ToolPart{
+				ID:      tc.CallID,
+				Name:    tc.Name,
+				Request: tc.Arguments,
+			})
+		}
 	}
 	if reasoning != "" {
 		if msg.Metadata == nil {

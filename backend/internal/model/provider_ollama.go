@@ -92,14 +92,16 @@ func (p *ollamaProvider) Generate(ctx context.Context, req *blades.ModelRequest)
 		},
 	}
 
-	// 保存最后一条消息与 token 用量
+	// 保存最后一条消息、结束原因与 token 用量
 	var lastMsg api.Message
+	var doneReason string
 	var usage blades.TokenUsage
 	// 调用 Ollama Chat API
 	err := p.client.Chat(ctx, chatReq, func(resp api.ChatResponse) error {
 		// 当响应完成时提取消息与用量
 		if resp.Done {
 			lastMsg = resp.Message
+			doneReason = resp.DoneReason
 			usage = blades.TokenUsage{
 				InputTokens:  int64(resp.Metrics.PromptEvalCount),
 				OutputTokens: int64(resp.Metrics.EvalCount),
@@ -114,6 +116,17 @@ func (p *ollamaProvider) Generate(ctx context.Context, req *blades.ModelRequest)
 
 	// 转换最后一条消息为 blades 格式并附加用量
 	msg := p.convertMessage(lastMsg)
+	// done_reason=length 表示 num_predict 截断：tool_calls 参数可能是半截 JSON，
+	// 执行会把文件写残（与 openai-chat 同规则）。丢弃工具调用，文本保留。
+	if doneReason == "length" {
+		kept := make([]blades.Part, 0, len(msg.Parts))
+		for _, part := range msg.Parts {
+			if _, isTool := part.(blades.ToolPart); !isTool {
+				kept = append(kept, part)
+			}
+		}
+		msg.Parts = kept
+	}
 	msg.TokenUsage = usage
 	return &blades.ModelResponse{Message: msg}, nil
 }

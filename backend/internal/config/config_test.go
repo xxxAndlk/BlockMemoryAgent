@@ -45,4 +45,31 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if cfg.Agent.StopDestroyCountdownSec != 300 {
 		t.Fatalf("stop_destroy_countdown_sec 应为 300，got %d", cfg.Agent.StopDestroyCountdownSec)
 	}
+	// 探索预算三档（任务 31 配置化）：config.yaml 显式 20/16/40。
+	if cfg.Agent.ExploreBudget != 20 {
+		t.Fatalf("explore_budget 应为 20，got %d", cfg.Agent.ExploreBudget)
+	}
+	if cfg.Agent.ExploreBudgetDomain != 16 {
+		t.Fatalf("explore_budget_domain 应为 16，got %d", cfg.Agent.ExploreBudgetDomain)
+	}
+	if cfg.Agent.ExploreBudgetPostWrite != 40 {
+		t.Fatalf("explore_budget_post_write 应为 40，got %d", cfg.Agent.ExploreBudgetPostWrite)
+	}
+}
+
+// TestApplyDefaults_ExploreBudgetDefaults 验证未配置时 applyDefaults 兜底 20/8/40。
+func TestApplyDefaults_ExploreBudgetDefaults(t *testing.T) {
+	c := &Config{}
+	if err := c.applyDefaults(); err != nil {
+		t.Fatalf("applyDefaults failed: %v", err)
+	}
+	if c.Agent.ExploreBudget != 20 {
+		t.Fatalf("ExploreBudget 默认应为 20，got %d", c.Agent.ExploreBudget)
+	}
+	if c.Agent.ExploreBudgetDomain != 8 {
+		t.Fatalf("ExploreBudgetDomain 默认应为 8，got %d", c.Agent.ExploreBudgetDomain)
+	}
+	if c.Agent.ExploreBudgetPostWrite != 40 {
+		t.Fatalf("ExploreBudgetPostWrite 默认应为 40，got %d", c.Agent.ExploreBudgetPostWrite)
+	}
 }

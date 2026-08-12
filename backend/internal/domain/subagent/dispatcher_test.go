@@ -183,7 +183,7 @@ func TestInjectRecalledMemory(t *testing.T) {
 	// 注入 sessionID 到 ctx，验证召回侧按 session 过滤。
 	ctx := tool.WithSessionID(context.Background(), "session-42")
 	got, recs := d.injectRecalledMemory(ctx, "查询任务", "原始任务")
-	want := "【相关记忆】\n成功经验:\n1. 记忆一\n2. 记忆二\n\n【当前任务】\n原始任务"
+	want := blockMemoryRecallHeader + "\n成功经验:\n1. 记忆一\n2. 记忆二\n\n【当前任务】\n原始任务"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
@@ -238,7 +238,7 @@ func TestInjectRecalledMemory_OutcomeSections(t *testing.T) {
 	}}
 	d := NewDispatcher(nil, nil, nil, nil, nil).WithBlockMemorySearcher(mock)
 	got, _ := d.injectRecalledMemory(context.Background(), "查询任务", "")
-	want := "【相关记忆】\n成功经验:\n1. 成功实现\n避坑经验:\n1. 部分完成\n2. 上次这么改失败了"
+	want := blockMemoryRecallHeader + "\n成功经验:\n1. 成功实现\n避坑经验:\n1. 部分完成\n2. 上次这么改失败了"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
@@ -1484,5 +1484,42 @@ func TestCallSubAgent_TaskSoftLandingSuccess(t *testing.T) {
 	}
 	if !strings.Contains(res2.Error, "task too long") || res2.Category != tool.ResultCategoryValidationRejected {
 		t.Fatalf("expected validation rejection with task too long, got: %q category=%q", res2.Error, res2.Category)
+	}
+}
+
+// TestSaveBlockRecord_FailureCounter 验证块记忆写入失败观测计数：
+// 连续失败累加、成功写入重置（计数仅为告警观测，不阻断主流程）。
+func TestSaveBlockRecord_FailureCounter(t *testing.T) {
+	rec := &types.KnowledgeRecord{Meta: map[string]any{"sub_agent_id": "s1"}}
+	ctx := context.Background()
+
+	// 连续失败：计数累加。
+	failSaver := &mockBlockMemorySaver{err: errors.New("embedding endpoint 404")}
+	d := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{}).
+		WithBlockMemorySaver(failSaver, true)
+	d.saveBlockRecord(ctx, rec, "block memory")
+	d.saveBlockRecord(ctx, rec, "block memory")
+	if got := d.blockSaveFailures.Load(); got != 2 {
+		t.Errorf("failures = %d, want 2", got)
+	}
+
+	// 成功写入：计数归零。
+	okSaver := &mockBlockMemorySaver{}
+	d2 := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{}).
+		WithBlockMemorySaver(okSaver, true)
+	d2.saveBlockRecord(ctx, rec, "block memory")
+	if got := d2.blockSaveFailures.Load(); got != 0 {
+		t.Errorf("failures after success = %d, want 0", got)
+	}
+
+	// 失败后转成功：计数重置。
+	d3 := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{}).
+		WithBlockMemorySaver(failSaver, true)
+	d3.saveBlockRecord(ctx, rec, "block memory")
+	d3.saveBlockRecord(ctx, rec, "block memory")
+	d3.saver = okSaver
+	d3.saveBlockRecord(ctx, rec, "block memory")
+	if got := d3.blockSaveFailures.Load(); got != 0 {
+		t.Errorf("failures after mixed = %d, want 0", got)
 	}
 }

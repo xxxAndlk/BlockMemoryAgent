@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/google/jsonschema-go/jsonschema"
+
+	"github.com/blockmemory/agent/backend/internal/config"
 )
 
 // TestRegistrySchema 验证内置工具注册表的 Schema 至少包含 11 个工具定义。
@@ -738,6 +740,48 @@ func TestExploreBudget_WriteGateRaisesLimit(t *testing.T) {
 	}
 	if !strings.Contains(res.Error, "修复期探索预算耗尽") {
 		t.Fatalf("expected post-write budget error, got: %s", res.Error)
+	}
+}
+
+// TestExploreBudget_ConfigOverride 验证 config.AgentConfig 覆盖探索预算三档默认值。
+// 配置 >0 生效；nil cfg 回落包级常量。
+func TestExploreBudget_ConfigOverride(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.AgentConfig{
+		ExploreBudget:           5,
+		ExploreBudgetDomain:     3,
+		ExploreBudgetPostWrite:  7,
+	}
+	r := NewBuiltinRegistry(dir, cfg, nil)
+	if r.exploreBudget != 5 {
+		t.Fatalf("exploreBudget = %d, want 5", r.exploreBudget)
+	}
+	if r.exploreBudgetDomain != 3 {
+		t.Fatalf("exploreBudgetDomain = %d, want 3", r.exploreBudgetDomain)
+	}
+	if r.exploreBudgetPostWrite != 7 {
+		t.Fatalf("exploreBudgetPostWrite = %d, want 7", r.exploreBudgetPostWrite)
+	}
+
+	// nil cfg 回落常量默认 20/8/40。
+	r2 := NewBuiltinRegistry(dir, nil, nil)
+	if r2.exploreBudget != 20 {
+		t.Fatalf("nil cfg: exploreBudget = %d, want 20", r2.exploreBudget)
+	}
+	if r2.exploreBudgetDomain != 8 {
+		t.Fatalf("nil cfg: exploreBudgetDomain = %d, want 8", r2.exploreBudgetDomain)
+	}
+	if r2.exploreBudgetPostWrite != 40 {
+		t.Fatalf("nil cfg: exploreBudgetPostWrite = %d, want 40", r2.exploreBudgetPostWrite)
+	}
+
+	// cfg 字段为 0（未配置）回落常量。
+	r3 := NewBuiltinRegistry(dir, &config.AgentConfig{}, nil)
+	if r3.exploreBudget != 20 {
+		t.Fatalf("zero cfg: exploreBudget = %d, want 20", r3.exploreBudget)
+	}
+	if r3.exploreBudgetDomain != 8 {
+		t.Fatalf("zero cfg: exploreBudgetDomain = %d, want 8", r3.exploreBudgetDomain)
 	}
 }
 

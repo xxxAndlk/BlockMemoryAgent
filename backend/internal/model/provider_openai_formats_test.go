@@ -234,6 +234,108 @@ func TestChatProvider_Streaming(t *testing.T) {
 	}
 }
 
+// TestChatProvider_TruncatedToolCallDropped 验证非流式 finish_reason=length 时
+// tool_calls 被整轮丢弃：半截 arguments（端点自动补齐引号括号后"合法"）执行会
+// 把文件写残（实证 monster.js 730 行被截断写入 64 行）。
+func TestChatProvider_TruncatedToolCallDropped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"WriteFile","arguments":"{\"path\":\"js/monster.js\",\"content\":\""}}]},"finish_reason":"length"}],"usage":{}}`)
+	}))
+	defer srv.Close()
+	p := newOpenAIChatProvider(types.AgentModelConfig{Provider: "openai-chat", Model: "m", BaseURL: srv.URL})
+	resp, err := p.Generate(context.Background(), chatTestRequest())
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for _, part := range resp.Message.Parts {
+		if _, ok := part.(blades.ToolPart); ok {
+			t.Fatal("truncated tool_call should be dropped, got ToolPart in parts")
+		}
+	}
+	if resp.Message.FinishReason != "length" {
+		t.Errorf("finish reason = %q, want length", resp.Message.FinishReason)
+	}
+}
+
+// TestChatProvider_StreamingTruncatedToolCallDropped 验证流式 finish_reason=length
+// 时末块不携带累积的半截 tool_call。
+func TestChatProvider_StreamingTruncatedToolCallDropped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"WriteFile\",\"arguments\":\"{\\\"path\\\":\\\"a.js\\\",\\\"content\\\":\\\"\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"partial\"}}]},\"finish_reason\":\"length\"}],\"usage\":{}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	p := newOpenAIChatProvider(types.AgentModelConfig{Provider: "openai-chat", Model: "m", BaseURL: srv.URL})
+	var final *blades.ModelResponse
+	for resp, err := range p.NewStreaming(context.Background(), chatTestRequest()) {
+		if err != nil {
+			t.Fatalf("stream err: %v", err)
+		}
+		final = resp
+	}
+	if final == nil {
+		t.Fatal("no final message")
+	}
+	for _, part := range final.Message.Parts {
+		if _, ok := part.(blades.ToolPart); ok {
+			t.Fatal("truncated tool_call should be dropped in streaming final")
+		}
+	}
+}
+
+// TestResponsesProvider_IncompleteToolCallDropped 验证非流式 status=incomplete +
+// max_output_tokens 时 function_call 被丢弃（半截 arguments 写残文件）。
+func TestResponsesProvider_IncompleteToolCallDropped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"r1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"function_call","call_id":"c1","name":"WriteFile","arguments":"{\"path\":\"a.js\",\"content\":\""}],"usage":{}}`)
+	}))
+	defer srv.Close()
+	p := newOpenAIResponsesProvider(types.AgentModelConfig{Provider: "openai-responses", Model: "m", BaseURL: srv.URL})
+	resp, err := p.Generate(context.Background(), chatTestRequest())
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for _, part := range resp.Message.Parts {
+		if _, ok := part.(blades.ToolPart); ok {
+			t.Fatal("incomplete function_call should be dropped, got ToolPart")
+		}
+	}
+	if resp.Message.FinishReason != "length" {
+		t.Errorf("finish reason = %q, want length", resp.Message.FinishReason)
+	}
+}
+
+// TestResponsesProvider_StreamingIncompleteDropsToolCalls 验证流式 response.incomplete
+// 事件（max_output_tokens）同样丢弃 function_call。
+func TestResponsesProvider_StreamingIncompleteDropsToolCalls(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"WriteFile\",\"arguments\":\"{\\\"path\\\":\\\"a.js\\\"\"}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[],\"usage\":{}}}\n\n")
+	}))
+	defer srv.Close()
+	p := newOpenAIResponsesProvider(types.AgentModelConfig{Provider: "openai-responses", Model: "m", BaseURL: srv.URL})
+	var final *blades.ModelResponse
+	for resp, err := range p.NewStreaming(context.Background(), chatTestRequest()) {
+		if err != nil {
+			t.Fatalf("stream err: %v", err)
+		}
+		final = resp
+	}
+	if final == nil {
+		t.Fatal("no final message")
+	}
+	for _, part := range final.Message.Parts {
+		if _, ok := part.(blades.ToolPart); ok {
+			t.Fatal("incomplete function_call should be dropped in streaming final")
+		}
+	}
+}
+
 // TestChatProvider_HTTPError 验证非 200 错误体透传（4xx 标记供 retry 层判定不重试）。
 func TestChatProvider_HTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -332,7 +434,8 @@ func TestResponsesProvider_RequestShape(t *testing.T) {
 }
 
 // TestResponsesProvider_ParseOutputItems 验证 output[] 多项解析：
-// reasoning summary 入 Metadata；function_call 入 ToolPart；incomplete → length。
+// reasoning summary 入 Metadata；incomplete（max_output_tokens）时 function_call
+// 被丢弃（截断的 arguments 不可信，执行会写残文件），finish_reason=length。
 func TestResponsesProvider_ParseOutputItems(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"id":"resp_2","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"想了"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"部分"}]},{"type":"function_call","call_id":"call_7","name":"f","arguments":"{\"x\":1}"}],"usage":{"input_tokens":3,"output_tokens":4}}`)
@@ -350,18 +453,14 @@ func TestResponsesProvider_ParseOutputItems(t *testing.T) {
 	if m.Metadata["reasoning_content"] != "想了" {
 		t.Errorf("reasoning = %v", m.Metadata)
 	}
-	// 有 function_call 时 finish_reason 优先 tool_calls。
-	if m.FinishReason != "tool_calls" {
+	// incomplete + max_output_tokens：function_call 参数不可信，整轮丢弃并判 length。
+	if m.FinishReason != "length" {
 		t.Errorf("finish = %q", m.FinishReason)
 	}
-	var tp *blades.ToolPart
 	for _, part := range m.Parts {
-		if p2, ok := part.(blades.ToolPart); ok {
-			tp = &p2
+		if _, ok := part.(blades.ToolPart); ok {
+			t.Errorf("incomplete function_call should be dropped, got ToolPart")
 		}
-	}
-	if tp == nil || tp.ID != "call_7" || tp.Name != "f" || tp.Request != `{"x":1}` {
-		t.Errorf("tool call = %+v", tp)
 	}
 	// total 缺失时 input+output 合计。
 	if m.TokenUsage.TotalTokens != 7 {

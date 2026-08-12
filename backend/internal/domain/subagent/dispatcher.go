@@ -7,6 +7,7 @@ import (
 	"errors"        // errors 提供哨兵错误 errLimitReached 与 errors.Is 判定
 	"fmt"           // fmt 用于格式化子 Agent ID 与错误信息
 	"log"           // log 用于记录块记忆写入失败等不影响主流程的错误
+	"log/slog"      // slog 用于块记忆连续失败阈值告警（单条 log 在长任务中被淹没）
 	"os"            // os 用于 stat 文件 mtime 校验（Layer 3 缓存一致性）
 	"sort"          // sort 用于召回结果按 outcome/reuse_count 价值排序
 	"strings"       // strings 用于从 Agent ID 中提取角色 ID
@@ -78,6 +79,10 @@ const (
 	blockMemoryGoalMaxRunes = 200
 	// blockMemoryResultMaxRunes 是写入块记忆时子 Agent 结果摘要的最大 rune 数。
 	blockMemoryResultMaxRunes = 500
+	// blockSaveFailAlertThreshold 是块记忆连续写入失败触发醒目告警的阈值。
+	// 单条失败 log 在长任务中被淹没；连续失败达阈值说明链路级损坏（embedding
+	// 端点 404/表缺失），应显式提示运维，而非继续静默降级。
+	blockSaveFailAlertThreshold = 10
 )
 
 // 块记忆 outcome 取值：沉淀结果的执行状态，召回排序按 success 优先。
@@ -198,6 +203,11 @@ type Dispatcher struct {
 	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
 	// 提取失败（LLM 出错或返回空）自动回退原始保存，保证不丢结果。
 	factExtractor FactExtractor
+
+	// blockSaveFailures 连续块记忆写入失败计数（观测）：达阈值触发醒目告警，
+	// 提示链路损坏（embedding 端点/DB 表缺失）。成功写入时重置为 0。
+	// 事故实证：embedding URL 配置错误导致 08-11 起全部写入静默失败两天无感知。
+	blockSaveFailures atomic.Int64
 
 	// salvageExtractor 从失败子 Agent 输出中提取打捞摘要（已读文件清单/已得结论/卡点）。
 	// 为 nil 时回退末条 assistant 文本截断；bootstrap 注入轻量模型实现（prompt 与事实提取不同）。
@@ -2191,6 +2201,23 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, go
 	d.saveRawBlockMemory(ctx, subAgentID, roleID, goal, content, outcome)
 }
 
+// saveBlockRecord 落库单条块记忆并维护失败观测计数。
+// 连续失败达到阈值时 slog.Warn 醒目告警（提示 embedding 端点/DB 链路损坏），
+// 成功时重置计数。best-effort：失败仅告警，不影响派发主流程。
+func (d *Dispatcher) saveBlockRecord(ctx context.Context, rec *types.KnowledgeRecord, tag string) {
+	if err := d.saver.Save(ctx, rec); err != nil {
+		n := d.blockSaveFailures.Add(1)
+		log.Printf("[subagent] save %s failed: sub=%v err=%v", tag, rec.Meta["sub_agent_id"], err)
+		if n == blockSaveFailAlertThreshold {
+			slog.Warn(fmt.Sprintf("block memory save failed consecutively %d times: "+
+				"块记忆写入链路可能损坏（embedding 端点 404 / global_knowledge 表缺失）。"+
+				"检查 EMBEDDING_BASE_URL 与数据库表；修复前块记忆沉淀/召回持续静默降级", n))
+		}
+		return
+	}
+	d.blockSaveFailures.Store(0)
+}
+
 // saveRawBlockMemory 把原始 result.Text 作为单条 KnowledgeRecord 落库。
 // 内容采用"目标/角色/结果"三段式，meta 携带 goal/domain/session_id/outcome/reuse_count 标签，
 // 便于召回侧（SearchBlockMemoryByGoal / SearchBlockMemory）按目标文本、领域与价值排序命中。
@@ -2211,9 +2238,7 @@ func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID,
 		},
 		CreatedAt: time.Now(),
 	}
-	if err := d.saver.Save(ctx, rec); err != nil {
-		log.Printf("[subagent] save block memory failed: sub_agent=%s err=%v", subAgentID, err)
-	}
+	d.saveBlockRecord(ctx, rec, "block memory")
 }
 
 // saveFacts 把提取出的事实逐条落库，每条单独向量化以提升召回精度。
@@ -2241,11 +2266,15 @@ func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, goal str
 			},
 			CreatedAt: time.Now(),
 		}
-		if err := d.saver.Save(ctx, rec); err != nil {
-			log.Printf("[subagent] save fact failed: sub=%s idx=%d err=%v", subAgentID, i, err)
-		}
+		d.saveBlockRecord(ctx, rec, "fact")
 	}
 }
+
+// blockMemoryRecallHeader 是块记忆召回注入段头部。
+// 标注"已完成结论"语义：这些是过去任务的沉淀事实，仅作参考背景，
+// 防止模型把旧任务结果当成当前任务的待办去重复执行（实证：怪物 UI 改动
+// 被后续 UI 任务再次执行）。
+const blockMemoryRecallHeader = "【相关记忆】（以下为已完成任务的结论沉淀，仅作背景参考，不得把其中已完成的改动当作当前任务的待办重复执行）"
 
 // injectRecalledMemory 按 query 文本召回块记忆，并把命中内容拼到任务前。
 // 未配置检索器、无命中或召回出错时返回原 task，保证派发主流程不受影响。
@@ -2290,7 +2319,7 @@ func (d *Dispatcher) injectRecalledMemory(ctx context.Context, query, task strin
 	}
 	// 拼接：成功经验在前，避坑经验（partial/fail）单列降权。
 	var sb strings.Builder
-	sb.WriteString("【相关记忆】\n")
+	sb.WriteString(blockMemoryRecallHeader + "\n")
 	var successLines, pitfallLines []string
 	for _, rec := range recs {
 		if blockOutcomeRank(rec.Meta) == 0 {

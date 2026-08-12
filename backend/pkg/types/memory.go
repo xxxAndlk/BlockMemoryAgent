@@ -139,6 +139,9 @@ type KnowledgeRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 	// Archived 是否归档；归档后不再参与默认检索。
 	Archived bool `json:"archived"`
+	// Score 检索时与查询向量的余弦相似度（1 - cosine distance）。
+	// 仅检索路径填充；直接读取/写入的记录为 0。召回侧可据此过滤弱相关命中。
+	Score float64 `json:"score,omitempty"`
 }
 
 // TopicMeta 话题元数据：描述一个话题的生命周期与目标。

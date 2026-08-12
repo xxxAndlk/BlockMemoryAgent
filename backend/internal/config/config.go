@@ -145,6 +145,18 @@ type AgentConfig struct {
 	// PlanExecuteMaxSteps 派发 mode=plan_execute 时最大执行步数（TODO #29）。
 	// 默认 8；<=0 引擎内部按默认。超限后强制收口终答。
 	PlanExecuteMaxSteps int `yaml:"plan_execute_max_steps"`
+	// ExploreBudget 单个叶子 Agent 任务内探索类工具（ReadFile/ListDir/SearchInFiles 与只读型 RunCommand）
+	// 调用次数上限。超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。
+	// 默认 20：单页 200 行 × 20 次 ≈ 4000 行，覆盖单领域职责文件全集。
+	ExploreBudget int `yaml:"explore_budget"`
+	// ExploreBudgetDomain DomainAgent（协调者）写入未开始前的探索预算。
+	// domain 职责是拆任务/派发/整合/验证，亲自探索是全舰队最贵路径，预算收紧倒逼下放叶子。
+	// 默认 8：查共享契约 + 1-2 次 SearchInFiles 定位 + 验收期精读失败点。
+	ExploreBudgetDomain int `yaml:"explore_budget_domain"`
+	// ExploreBudgetPostWrite 写入已开始后的探索预算升档上限。
+	// 修复期"读报错位置->改->复验"循环需要精读，禁读逼盲改回归震荡；写后放开精读。
+	// 默认 40：仍设上限防"逐文件通读"式发散，由连读循环守卫与 token 预算兜底。
+	ExploreBudgetPostWrite int `yaml:"explore_budget_post_write"`
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -424,6 +436,15 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.SalvageLLMTimeoutSec == 0 {
 		c.Agent.SalvageLLMTimeoutSec = 30
+	}
+	if c.Agent.ExploreBudget == 0 {
+		c.Agent.ExploreBudget = 20
+	}
+	if c.Agent.ExploreBudgetDomain == 0 {
+		c.Agent.ExploreBudgetDomain = 8
+	}
+	if c.Agent.ExploreBudgetPostWrite == 0 {
+		c.Agent.ExploreBudgetPostWrite = 40
 	}
 }
 

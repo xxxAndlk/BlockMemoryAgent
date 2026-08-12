@@ -321,9 +321,12 @@ func AssistantMessageFromBlades(m *blades.Message) ReactMessage {
 			msg.Content += v.Text
 		case blades.ToolPart:
 			// 将工具调用的 Request JSON 反序列化为 map。
-			// 忽略反序列化错误，若失败则 input 为 nil，后续调用方可以处理。
+			// 解析失败（半截/损坏 JSON，如 max_tokens 截断后端点补齐的假合法参数）
+			// 时丢弃该调用：以 nil 入参执行工具会静默写坏文件（如 WriteFile 空写）。
 			var input map[string]any
-			_ = json.Unmarshal([]byte(v.Request), &input)
+			if err := json.Unmarshal([]byte(v.Request), &input); err != nil {
+				continue
+			}
 			// 把解析后的工具调用追加到结果中。
 			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
 				ID:    v.ID,

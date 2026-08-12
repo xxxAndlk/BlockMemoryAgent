@@ -166,6 +166,7 @@ func main() {
 	mux.HandleFunc("/api/sessions/{id}/clarify", app.Server.HandleSessionClarify)
 	mux.HandleFunc("/api/sessions/{id}/interrupt", app.Server.HandleSessionInterrupt)
 	mux.HandleFunc("/api/sessions/{id}/enqueue", app.Server.HandleSessionEnqueue)
+	mux.HandleFunc("/api/sessions/{id}/stop", app.Server.HandleSessionStop)
 	mux.HandleFunc("/api/sessions/{id}/cancel", app.Server.HandleSessionCancel)
 	mux.HandleFunc("/api/sessions/{id}/board", app.Server.HandleSessionBoard)
 	mux.HandleFunc("/api/sessions/{id}/agents", app.Server.HandleSessionAgents)

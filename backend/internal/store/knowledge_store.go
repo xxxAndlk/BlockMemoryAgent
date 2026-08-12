@@ -12,6 +12,12 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/types" // 领域模型
 )
 
+// minBlockMemoryScore 是块记忆召回的最小余弦相似度阈值。
+// 低于该值的命中视为弱相关（不同任务语义擦边），不注入上下文，防旧任务事实
+// 诱导模型重复执行已完成改动。bge-m3 对"修改怪物血条 UI"vs"调整按钮样式"这类
+// 跨任务擦边的相似度通常低于该值；同域复用（"怪物路径"vs"怪物路径宽度"）高于该值。
+const minBlockMemoryScore = 0.4
+
 // KnowledgeStore 是全局知识库/块记忆相关的 PostgreSQL 存储子层。
 // 职责: global_knowledge 表的写入、按类型查询、向量相似搜索、归档与访问计数。
 type KnowledgeStore struct {
@@ -192,24 +198,30 @@ func (s *KnowledgeStore) SearchBlockMemoryByGoal(ctx context.Context, sessionID,
 
 // SearchByTypeAndSession 按 knowledge_type + session_id 过滤的向量相似搜索。
 // 供 block-memory 召回侧按 session 隔离使用，避免跨 session 污染。
+// 同时过滤弱相关命中（余弦相似度 < minBlockMemoryScore 不返回）：旧任务事实与
+// 新任务语义擦边时（如"怪物贴图"vs"UI 样式调整"）注入会诱导模型重复执行已完成
+// 改动，是上下文污染的主要来源（实证：塔防怪物 UI 被重复修改事故调查结论）。
 func (s *KnowledgeStore) SearchByTypeAndSession(ctx context.Context, knowledgeType enums.KnowledgeType, sessionID string, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
 	if topK <= 0 {
 		topK = 5
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	// SELECT 附带相似度分数（1 - cosine distance）；WHERE 按分数阈值过滤。
 	rows, err := s.db.QueryContext(ctx, `
-			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived,
+			       1 - (embedding <=> $3) AS score
 			FROM global_knowledge
 			WHERE archived = false AND knowledge_type = $1 AND meta->>'session_id' = $2
+			  AND embedding <=> $3 <= $4
 			ORDER BY embedding <=> $3
-			LIMIT $4
-		`, knowledgeType, sessionID, pgVector(embedding), topK)
+			LIMIT $5
+		`, knowledgeType, sessionID, pgVector(embedding), 1-minBlockMemoryScore, topK)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return s.scanKnowledgeRows(ctx, rows)
+	return s.scanKnowledgeRowsWithScore(ctx, rows)
 }
 
 // SearchByType 按 knowledge_type 过滤的向量相似搜索（特性3使用）。
@@ -312,6 +324,33 @@ func (s *KnowledgeStore) scanKnowledgeRows(ctx context.Context, rows *sql.Rows) 
 			}
 		}
 		// last_accessed 可能为 NULL,有效时填充指针
+		if lastAccessed.Valid {
+			r.LastAccessed = &lastAccessed.Time
+		}
+		results = append(results, &r)
+	}
+	return results, rows.Err()
+}
+
+// scanKnowledgeRowsWithScore 同 scanKnowledgeRows，额外扫描第 10 列相似度分数。
+// 列顺序：id, knowledge_type, topic_id, content, meta, access_count,
+// last_accessed, created_at, archived, score。
+func (s *KnowledgeStore) scanKnowledgeRowsWithScore(ctx context.Context, rows *sql.Rows) ([]*types.KnowledgeRecord, error) {
+	var results []*types.KnowledgeRecord
+	for rows.Next() {
+		var r types.KnowledgeRecord
+		var metaRaw []byte
+		var lastAccessed sql.NullTime
+		err := rows.Scan(&r.ID, &r.KnowledgeType, &r.TopicID, &r.Content, &metaRaw,
+			&r.AccessCount, &lastAccessed, &r.CreatedAt, &r.Archived, &r.Score)
+		if err != nil {
+			continue
+		}
+		if len(metaRaw) > 0 {
+			if err := json.Unmarshal(metaRaw, &r.Meta); err != nil {
+				logError(s.log, ctx, fmt.Sprintf("[store] unmarshal global_knowledge.meta failed: id=%d", r.ID), err)
+			}
+		}
 		if lastAccessed.Valid {
 			r.LastAccessed = &lastAccessed.Time
 		}

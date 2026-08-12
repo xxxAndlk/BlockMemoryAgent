@@ -18,8 +18,8 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
-	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/board"
+	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
 	"github.com/blockmemory/agent/backend/internal/domain/memory"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
@@ -46,12 +46,12 @@ import (
 // 可选项：SoulPath 为空时回退到空 Persona，SkillPath 为空时回退到内置
 // 技能池。
 type ConfigPaths struct {
-	ConfigPath string // 主配置文件路径（如 config/config.yaml）
-	RolePath   string // 角色配置文件路径（如 config/roles.yaml）
-	EnvPath    string // 环境变量文件路径（如 backend/.env）
-	SoulPath   string // 人格文件路径（如 config/soul.md），可为空
+	ConfigPath  string // 主配置文件路径（如 config/config.yaml）
+	RolePath    string // 角色配置文件路径（如 config/roles.yaml）
+	EnvPath     string // 环境变量文件路径（如 backend/.env）
+	SoulPath    string // 人格文件路径（如 config/soul.md），可为空
 	ProfilePath string // 用户画像文件路径（如 config/user_profile.md，TODO #28），可为空
-	SkillPath  string // 技能文件路径（如 config/skills.yaml），可为空
+	SkillPath   string // 技能文件路径（如 config/skills.yaml），可为空
 	// LogWriter 是会话结构化日志的可选输出目标；为 nil 时日志写入 os.Stderr。
 	LogWriter io.Writer
 }
@@ -372,7 +372,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			b.WriteString("\n--- ")
 			fmt.Fprintf(&b, "[%d] %s", i+1, src)
 			if doc != "" {
-				b.WriteString(" (文档: " + doc + ")")
+				b.WriteString(" (文档: ")
+				b.WriteString(doc)
+				b.WriteString(")")
 			}
 			b.WriteString(" ---\n")
 			b.WriteString(truncateForPrompt(rec.Content, 600))
