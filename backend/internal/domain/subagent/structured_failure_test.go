@@ -76,8 +76,9 @@ func TestDispatcher_AutoRetry_LeafErrorSucceedsOnSecondAttempt(t *testing.T) {
 	d.WithDispatchRetryCount(1)
 
 	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
-		"role_id": "code_assistant",
-		"task":    "写文件",
+		"role_id":     "code_assistant",
+		"task":        "写文件",
+		"verify_kind": "none", // 本测试验证自动重派机制，校验分层无关
 	})
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
@@ -111,8 +112,9 @@ func TestDispatcher_AutoRetry_LeafErrorFailsAfterRetry(t *testing.T) {
 	d.WithDispatchRetryCount(1)
 
 	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
-		"role_id": "code_assistant",
-		"task":    "写文件",
+		"role_id":     "code_assistant",
+		"task":        "写文件",
+		"verify_kind": "none", // 本测试验证自动重派机制，校验分层无关
 	})
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)

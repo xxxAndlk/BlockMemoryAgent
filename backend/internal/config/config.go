@@ -145,6 +145,10 @@ type AgentConfig struct {
 	// PlanExecuteMaxSteps 派发 mode=plan_execute 时最大执行步数（TODO #29）。
 	// 默认 8；<=0 引擎内部按默认。超限后强制收口终答。
 	PlanExecuteMaxSteps int `yaml:"plan_execute_max_steps"`
+	// JudgeRole 校验 judge 的角色 ID（TODO #43 交叉模型）：engineLLMForJudge 优先取该角色的
+	// provider（与被审角色不同模型，防同模型自评放水/幻觉 pass）。默认 "prompt_reviewer"
+	// （deepseek-v4-flash）；取不到时 dispatcher 回退同角色 provider（测试/角色未注册场景）。
+	JudgeRole string `yaml:"judge_role"`
 	// ExploreBudget 单个叶子 Agent 任务内探索类工具（ReadFile/ListDir/SearchInFiles 与只读型 RunCommand）
 	// 调用次数上限。超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。
 	// 默认 20：单页 200 行 × 20 次 ≈ 4000 行，覆盖单领域职责文件全集。
@@ -538,6 +542,10 @@ func (c *Config) applyAgentStandaloneDefaults() {
 	}
 	if c.Agent.PlanExecuteMaxSteps == 0 {
 		c.Agent.PlanExecuteMaxSteps = 8
+	}
+	// 校验 judge 角色（TODO #43 交叉模型）：默认 prompt_reviewer（与被审角色不同模型）。
+	if c.Agent.JudgeRole == "" {
+		c.Agent.JudgeRole = "prompt_reviewer"
 	}
 }
 

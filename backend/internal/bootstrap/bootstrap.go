@@ -273,6 +273,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.WithDispatchRetryCount(cfg.Agent.DispatchRetryCount)
 	// 派发执行模式引擎参数（TODO #29 三引擎）：reflection 自检轮数 / plan_execute 最大步数。
 	subAgentDispatcher.WithEngineConfig(cfg.Agent.ReflectionMaxRounds, cfg.Agent.PlanExecuteMaxSteps)
+	// 校验 judge 角色（TODO #43 交叉模型）：reflection/rubric 校验取该角色 provider 作评审
+	// （与被审角色不同模型）；取不到 dispatcher 回退同角色（测试场景不破）。
+	subAgentDispatcher.WithJudgeRole(cfg.Agent.JudgeRole)
 	// 块记忆写入闭环：默认开启（applyFeatureTogglesDefaults 兜底为 true）；
 	// 显式 block_memory_write_enabled: false 时 Dispatcher 内部跳过沉淀。
 	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)

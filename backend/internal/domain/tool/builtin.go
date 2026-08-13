@@ -140,6 +140,10 @@ type (
 		// Mode 为派发执行模式（TODO #29）：react（默认）/ reflection / plan_execute。
 		// 空串按 react 处理，零行为变化。
 		Mode string `json:"mode" description:"派发执行模式（可选）：react（默认，直接 ReAct 循环）/ reflection（产出后对照验收标准自检，不达标带反馈重试）/ plan_execute（先出步骤计划再逐步执行）。琐碎单步任务省略；正确性敏感任务用 reflection；多步骤长任务用 plan_execute。"`
+		// VerifyKind 为校验分层（TODO #43）：auto（默认，代码/测试助手→可执行证据，reflection→rubric）
+		// / executable（L0：须有验证命令成功执行的客观证据，无则反馈重试 1 轮）/ rubric（L2：交叉模型
+		// judge 按验收标准逐条判）/ none（不校验）。
+		VerifyKind string `json:"verify_kind" description:"校验分层（可选）：auto（默认，按角色/模式自动选）/ executable（必须有测试/lint/--check 成功运行的客观证据）/ rubric（交叉模型按验收标准逐条评审）/ none（跳过校验）。"`
 	}
 )
 

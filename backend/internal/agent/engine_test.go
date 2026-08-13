@@ -42,12 +42,13 @@ func (p *scriptedProvider) callsCount() int {
 	return p.calls
 }
 
-// scriptedLLM 按调用顺序返回预设文本的 LLMComplete。
+// scriptedLLM 按调用顺序返回预设文本的 LLMComplete，并记录每次 prompt 供断言。
 type scriptedLLM struct {
 	mu      sync.Mutex
 	replies []string
 	errs    []error
 	calls   int
+	prompts []string
 }
 
 func (l *scriptedLLM) Call(ctx context.Context, prompt string) (string, error) {
@@ -55,6 +56,7 @@ func (l *scriptedLLM) Call(ctx context.Context, prompt string) (string, error) {
 	defer l.mu.Unlock()
 	idx := l.calls
 	l.calls++
+	l.prompts = append(l.prompts, prompt)
 	if idx < len(l.errs) && l.errs[idx] != nil {
 		return "", l.errs[idx]
 	}
@@ -68,6 +70,15 @@ func (l *scriptedLLM) callsCount() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.calls
+}
+
+func (l *scriptedLLM) lastPrompt() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.prompts) == 0 {
+		return ""
+	}
+	return l.prompts[len(l.prompts)-1]
 }
 
 // newEngineTestAgent 构造测试用 ReActAgent（无工具、无 mailbox）。
@@ -142,6 +153,8 @@ func TestReflectEngine_MaxRoundsExhausted(t *testing.T) {
 }
 
 // TestReflectEngine_NoLLMFallback LLM 缺失时零变化（裸 ReAct）。
+// TestReflectEngine_NoLLMFallback 无 judge LLM 时 fail-closed（TODO #43）：
+// 标记 Unverified 而非静默通过（旧 fail-open 使自检形同虚设）。
 func TestReflectEngine_NoLLMFallback(t *testing.T) {
 	agentProvider := &scriptedProvider{replies: []string{"answer"}}
 	eng := NewReflectEngine(newEngineTestAgent(t, agentProvider), EngineOptions{})
@@ -152,13 +165,17 @@ func TestReflectEngine_NoLLMFallback(t *testing.T) {
 	if result.Text != "answer" {
 		t.Fatalf("expected answer, got %q", result.Text)
 	}
+	if !result.Unverified || result.VerifyNote == "" {
+		t.Fatalf("expected Unverified with note, got Unverified=%v note=%q", result.Unverified, result.VerifyNote)
+	}
 	if got := agentProvider.callsCount(); got != 1 {
 		t.Fatalf("expected single agent run, got %d", got)
 	}
 }
 
-// TestReflectEngine_LLMErrorFailOpen 自检 LLM 报错时按通过处理，不阻塞交付。
-func TestReflectEngine_LLMErrorFailOpen(t *testing.T) {
+// TestReflectEngine_LLMErrorFailClosed 自检 LLM 报错时 fail-closed（TODO #43）：
+// 标记 Unverified 附原因，绝不静默放行。
+func TestReflectEngine_LLMErrorFailClosed(t *testing.T) {
 	agentProvider := &scriptedProvider{replies: []string{"answer"}}
 	reflectLLM := &scriptedLLM{errs: []error{errors.New("llm down")}}
 	eng := NewReflectEngine(newEngineTestAgent(t, agentProvider), EngineOptions{LLM: reflectLLM.Call})
@@ -169,13 +186,16 @@ func TestReflectEngine_LLMErrorFailOpen(t *testing.T) {
 	if result.Text != "answer" {
 		t.Fatalf("expected answer, got %q", result.Text)
 	}
+	if !result.Unverified || !strings.Contains(result.VerifyNote, "llm down") {
+		t.Fatalf("expected Unverified with judge error reason, got Unverified=%v note=%q", result.Unverified, result.VerifyNote)
+	}
 	if got := agentProvider.callsCount(); got != 1 {
 		t.Fatalf("expected single agent run, got %d", got)
 	}
 }
 
-// TestReflectEngine_InvalidJSONFailOpen 自检返回非法 JSON 时按通过处理。
-func TestReflectEngine_InvalidJSONFailOpen(t *testing.T) {
+// TestReflectEngine_InvalidJSONFailClosed 自检返回非法 JSON 时 fail-closed（TODO #43）。
+func TestReflectEngine_InvalidJSONFailClosed(t *testing.T) {
 	agentProvider := &scriptedProvider{replies: []string{"answer"}}
 	reflectLLM := &scriptedLLM{replies: []string{"乱七八糟的输出"}}
 	eng := NewReflectEngine(newEngineTestAgent(t, agentProvider), EngineOptions{LLM: reflectLLM.Call})
@@ -185,6 +205,45 @@ func TestReflectEngine_InvalidJSONFailOpen(t *testing.T) {
 	}
 	if result.Text != "answer" {
 		t.Fatalf("expected answer, got %q", result.Text)
+	}
+	if !result.Unverified || !strings.Contains(result.VerifyNote, "invalid JSON") {
+		t.Fatalf("expected Unverified with invalid JSON reason, got Unverified=%v note=%q", result.Unverified, result.VerifyNote)
+	}
+}
+
+// TestReflectEngine_RubricChecks judge rubric 分项判定解析（TODO #43）：
+// judge 返 checks 数组时逐条解析；pass=true 时完成摘要置 VerifyNote="L2 rubric"。
+func TestReflectEngine_RubricChecks(t *testing.T) {
+	agentProvider := &scriptedProvider{replies: []string{"answer"}}
+	rubricJSON := `{"pass": true, "feedback": "", "checks": [{"item": "验收一", "pass": true, "evidence": "测试通过"}, {"item": "验收二", "pass": true, "evidence": "文件已写"}]}`
+	reflectLLM := &scriptedLLM{replies: []string{rubricJSON}}
+	eng := NewReflectEngine(newEngineTestAgent(t, agentProvider), EngineOptions{LLM: reflectLLM.Call})
+	result, err := eng.Run(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Unverified {
+		t.Fatalf("rubric pass should not be unverified, note=%q", result.VerifyNote)
+	}
+	if result.VerifyNote != "L2 rubric" {
+		t.Fatalf("expected VerifyNote 'L2 rubric', got %q", result.VerifyNote)
+	}
+}
+
+// TestReflectEngine_JudgePromptSections judge prompt 含客观证据段（TODO #43）：
+// 【修改文件】+【验证证据】+【验收标准】三段必在，堵幻觉 pass。
+func TestReflectEngine_JudgePromptSections(t *testing.T) {
+	agentProvider := &scriptedProvider{replies: []string{"answer"}}
+	reflectLLM := &scriptedLLM{replies: []string{reflectPass()}}
+	eng := NewReflectEngine(newEngineTestAgent(t, agentProvider), EngineOptions{LLM: reflectLLM.Call})
+	if _, err := eng.Run(context.Background(), "task with 验收标准"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	p := reflectLLM.lastPrompt()
+	for _, want := range []string{"【修改文件】", "【验证证据】", "【验收标准】", "checks"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("judge prompt missing %q, got: %s", want, p)
+		}
 	}
 }
 

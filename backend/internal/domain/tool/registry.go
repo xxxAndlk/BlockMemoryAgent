@@ -586,7 +586,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 			// 间隔还有成功的 WriteFile——被杀时 tower.js 已写入 4769 bytes、正在验证）。
 			skipCount := false
 			if name == "RunCommand" {
-				if cmd, _ := args["command"].(string); isVerificationCommand(cmd) {
+				if cmd, _ := args["command"].(string); IsVerificationCommand(cmd) {
 					r.failures.reset(name)
 					skipCount = true
 					log.Printf("[tool] verification failure (not counted): scope=%s tool=%s err=%q", scopeKeyFromCtx(ctx), name, result.Error)
@@ -673,11 +673,12 @@ func normalizeFingerprint(s string) string {
 	return s
 }
 
-// isVerificationCommand 判断命令是否为验证/检查类（--check/lint/test/verify 等，
+// IsVerificationCommand 判断命令是否为验证/检查类（--check/lint/test/verify 等，
 // 退出码即有效反馈）：失败不累计连杀（TODO #38-2）。
 // 模型以"跑检查→看报错→改→再跑"推进时，连续失败是正常调试节奏，硬阈值会误杀
 // 修复-验证循环（事故实证：ca-5 三次不同报错、间隔成功 WriteFile，仍被连杀 3 次终止）。
-func isVerificationCommand(cmd string) bool {
+// 导出供 agent 包 L0 证据扫描（HasExecutableVerification，TODO #43）复用同一判定口径。
+func IsVerificationCommand(cmd string) bool {
 	c := strings.ToLower(strings.TrimSpace(cmd))
 	for _, m := range []string{"--check", "lint", "verify", " test ", "test -"} {
 		if strings.Contains(c, m) {

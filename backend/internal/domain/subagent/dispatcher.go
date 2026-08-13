@@ -45,6 +45,9 @@ type callSubAgentInput struct {
 	// Mode 派发执行模式（TODO #29）：react（默认）/ reflection / plan_execute。
 	// 空串按 react 处理（零行为变化）。
 	Mode string `json:"mode"`
+	// VerifyKind 校验分层（TODO #43）：auto（默认，按角色/模式自动选）/ executable（L0 证据）/
+	// rubric（L2 交叉模型 judge）/ none。空串按 auto 处理。
+	VerifyKind string `json:"verify_kind"`
 }
 
 // isVerificationTask 判定 domain 任务是"整品验收/边验边修"型（读重、验证优先）：
@@ -78,6 +81,17 @@ type BlockMemorySearcher interface {
 	// sessionID 非空时仅召回该 session 写入的记录，避免跨 session 污染（实证：旧 session
 	// 的"重写全部 JS"任务文本被召回，污染新 session 的 HTML+CSS 任务上下文）。
 	SearchBlockMemoryByGoal(ctx context.Context, sessionID, goal string, topK int) ([]*types.KnowledgeRecord, error)
+}
+
+// BlackboardSearcher 抽象黑板模式（TODO #42）的 scope 确定性检索能力，由 store.PostgresStore 实现。
+// 在 BlockMemorySearcher 语义召回之上叠加 parent_id + task_domain 精确过滤：兄弟产出按 scope
+// 共享，每个 Agent 只取自己 scope 的切片（替 mailbox 全量广播 / 父注入全量 spec 的上下文互染）。
+//
+// query 非空：叠加向量语义排序（cosine 阈值过滤 + 距离排序）；
+// 空串：跳过 cosine（纯 scope 过滤 + created_at DESC），省 embedding，供每轮摄取等无需语义重排场景。
+// excludeSubAgentID 非空时排除自身产出（每轮摄取不回显自己刚写的结论）。
+type BlackboardSearcher interface {
+	Query(ctx context.Context, sessionID, parentID, taskDomain, query string, topK int, excludeSubAgentID string) ([]*types.KnowledgeRecord, error)
 }
 
 // blockMemoryRecallTopK 是派发子 Agent 时召回块记忆的条数上限。
@@ -217,6 +231,9 @@ type Dispatcher struct {
 	// planMaxSteps 派发 mode=plan_execute 时最大执行步数（TODO #29）。
 	// <=0 时引擎内部按默认 8 兜底；bootstrap 从 config.PlanExecuteMaxSteps 注入。
 	planMaxSteps int
+	// judgeRole 校验 judge 的角色 ID（TODO #43 交叉模型）：engineLLMForJudge 优先取该角色的
+	// provider（与被审角色不同模型），取不到回退同角色。空串=仅同角色回退。
+	judgeRole string
 
 	// factExtractor 从子 Agent 输出中提取关键事实，替代原始 result.Text 直接落库。
 	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
@@ -742,6 +759,14 @@ func (d *Dispatcher) WithEngineConfig(reflectionMaxRounds, planMaxSteps int) *Di
 	return d
 }
 
+// WithJudgeRole 配置校验 judge 的角色 ID（TODO #43 交叉模型）。
+// engineLLMForJudge 优先取该角色 provider（与被审角色不同模型，防同模型自评放水）；
+// 取不到回退同角色。bootstrap 按 cfg.Agent.JudgeRole 注入。
+func (d *Dispatcher) WithJudgeRole(roleID string) *Dispatcher {
+	d.judgeRole = roleID
+	return d
+}
+
 // WithSalvageExtractor 注入失败打捞提取器，使失败路径（超时/被杀/守卫终止）尝试
 // LLM 提取打捞摘要（已读文件/已得结论/卡点）写入共享槽位并回灌父 mailbox。
 // 传 nil 关闭 LLM 提取（默认关闭），回退末条 assistant 文本截断。
@@ -993,6 +1018,7 @@ func (t *callSubAgentTool) Description() string {
 		"【mode 字段】（可选）派发执行模式：react（默认）/ reflection / plan_execute。" +
 		"琐碎单步任务省略；正确性敏感任务（算法/迁移/重构）用 reflection——执行后自动对照验收标准自检，不达标带反馈重试；" +
 		"多步骤长任务（多文件/多阶段）用 plan_execute——先出步骤计划（TUI 可见）再逐步执行。判断不准时省略，默认 react。\n\n" +
+		"【verify_kind 字段】（可选）校验分层：auto（默认，代码/测试助手自动要求测试证据、reflection 自动 rubric 评审）/ executable（必须有测试/lint/--check 成功运行的客观证据，否则会反馈重试 1 轮）/ rubric（独立评审模型按验收标准逐条判）/ none（跳过校验）。判断不准时省略，默认 auto。\n\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
@@ -1000,7 +1026,7 @@ func (t *callSubAgentTool) Description() string {
 // msg 非空=硬拒绝（校验拒绝，Category=validation_rejected）；否则通过，
 // warning 非空=放行但附提示（task 轻微超限软着陆，TODO #38-3）。
 // 供 call_sub_agent 与 call_sub_agents 复用（批量工具逐项校验）。
-func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode string) (msg, warning string) {
+func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode, verifyKind string) (msg, warning string) {
 	// 校验必要参数：role_id 与 task 均不能为空。
 	if roleID == "" || task == "" {
 		return "role_id and task are required", ""
@@ -1033,6 +1059,12 @@ func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode str
 	default:
 		return fmt.Sprintf("unknown mode %q: 可选 react / reflection / plan_execute（省略=react）", mode), ""
 	}
+	// verify_kind 枚举校验（TODO #43）：空串=auto（默认），非法值拒绝。
+	switch verifyKind {
+	case "", "auto", "executable", "rubric", "none":
+	default:
+		return fmt.Sprintf("unknown verify_kind %q: 可选 auto / executable / rubric / none（省略=auto）", verifyKind), ""
+	}
 	return "", ""
 }
 
@@ -1063,8 +1095,10 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	responsibility, _ := args["responsibility"].(string)
 	// mode 可选：派发执行模式（react/reflection/plan_execute），空串=react（默认）。
 	mode, _ := args["mode"].(string)
+	// verify_kind 可选：校验分层（auto/executable/rubric/none），空串=auto（默认，TODO #43）。
+	verifyKind, _ := args["verify_kind"].(string)
 
-	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode)
+	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode, verifyKind)
 	if msg != "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
@@ -1077,7 +1111,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
-	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode)
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind)
 	if errRes != nil {
 		errRes.Tool = "call_sub_agent"
 		return errRes
@@ -1093,10 +1127,11 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 // dispatchOne 执行一次子 Agent 异步派发：权限校验→同领域去重→全局限额→注册树→goroutine。
 // 成功返回 subAgentID；失败返回 *tool.Result（Error 非空，Tool 字段由调用方按工具名覆盖）。
 // mode 为派发执行模式（react/reflection/plan_execute，空串=react，TODO #29），
-// 穿透到子 Agent 构造时的引擎选择。
+// verifyKind 为校验分层（auto/executable/rubric/none，空串=auto，TODO #43），
+// 均穿透到子 Agent 构造时的引擎选择与完成后校验。
 // 前置：调用方已完成参数校验（validateDispatchArgs）与 spec 强制校验。
 // 供 call_sub_agent（单个）与 call_sub_agents（批量同波）两个工具复用。
-func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode string) (string, *tool.Result) {
+func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string) (string, *tool.Result) {
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
 	if parentID == "" {
@@ -1213,7 +1248,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
 		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
-		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, mode, started)
+		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, mode, verifyKind, started)
 		if !paused {
 			meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
 		}
@@ -1243,9 +1278,9 @@ func (t *callSubAgentsTool) Description() string {
 		"多文件创建/多领域拆分任务的**全部建设领域必须用它一次派出**，禁止按依赖关系分波串行——" +
 		"共享契约已钉死集成点，领域产物互为独立文件，后写的不需要等先写的落盘" +
 		"（v6 实证：4 个建设领域分 2 波，第二波晚启动 24 分钟，交付死线直接判负）。\n" +
-		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?}，" +
+		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?, verify_kind?}，" +
 		fmt.Sprintf("字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=%d 字；", t.dispatcher.taskRuneSoftLimit) +
-		"mode 可选 react/reflection/plan_execute，省略=react）。\n" +
+		"mode 可选 react/reflection/plan_execute，省略=react；verify_kind 可选 auto/executable/rubric/none，省略=auto）。\n" +
 		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
 		"否则返回 spec missing/stale 错误（stale 会列出已变更文件路径）。逐项返回派出结果：某项失败不影响其他项。"
 }
@@ -1265,7 +1300,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 	}
 
 	// 逐项校验参数；轻微超限（2000-2600 runes）软着陆放行并收集警告（TODO #38-3）。
-	type batchItem struct{ roleID, domain, task, responsibility, mode string }
+	type batchItem struct{ roleID, domain, task, responsibility, mode, verifyKind string }
 	items := make([]batchItem, 0, len(raw))
 	var batchWarnings []string
 	for i, r := range raw {
@@ -1279,7 +1314,8 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.domain, _ = m["domain"].(string)
 		it.responsibility, _ = m["responsibility"].(string)
 		it.mode, _ = m["mode"].(string)
-		if msg, warning := t.dispatcher.validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode); msg != "" {
+		it.verifyKind, _ = m["verify_kind"].(string)
+		if msg, warning := t.dispatcher.validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode, it.verifyKind); msg != "" {
 			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
 		} else if warning != "" {
 			batchWarnings = append(batchWarnings, fmt.Sprintf("tasks[%d]: %s", i, warning))
@@ -1297,7 +1333,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 
 	var okIDs, errs []string
 	for _, it := range items {
-		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode)
+		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind)
 		if errRes != nil {
 			errs = append(errs, fmt.Sprintf("%s(%s): %s", it.roleID, it.domain, errRes.Error))
 			continue
@@ -1323,8 +1359,8 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 // mode 为派发执行模式（react/reflection/plan_execute，TODO #29），穿透到引擎选择。
 // 返回 paused=true 表示 DomainAgent 触达 token 上限进入 Paused(已存 history + tree.Pause),
 // 调用方不应 trackChildDone(保持父未决计数 >0 触发 MetaAgent 暂停)。
-func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode string, started time.Time) bool {
-	result, err, retried := d.runSubAgentWithAutoRetry(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode)
+func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode, verifyKind string, started time.Time) bool {
+	result, err, retried := d.runSubAgentWithAutoRetry(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode, verifyKind)
 	// Layer 5：从子 Agent 历史扫 WriteFile 调用收集修改文件，随完成通知回灌父 LLM。
 	files := agent.FilesModifiedFromHistory(result.History)
 	duration := time.Since(started)
@@ -1396,6 +1432,13 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		kind := failureKindOf(err)
 		retryable := kind == FailureKindError && roleDef.ID != "domain" && roleDef.ID != "meta" && ctx.Err() == nil
 		msg := failureMarker(kind, retryable) + "\n" + formatSubAgentFailure(err, result, d.timeout, partial)
+		// 校验分层（TODO #43）两类"未验证/缺证据"：附产出全文供父 Agent 自决
+		// （重派/降级/收口）——非"失败"语义，产出可能可用，不能只给 500 字截断。
+		if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
+			if t := strings.TrimSpace(result.Text); t != "" {
+				msg += "\n\n产出(未验证):\n" + t
+			}
+		}
 		if salvage != "" {
 			msg += "\n\n" + salvagePrefixMarker + salvage
 		}
@@ -1411,7 +1454,13 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
 	d.boardUpdate(ctx, parentID, domain, true, result.Text)
 	d.treeFinish(ctx, subAgentID, result.Text, nil)
-	d.notify(parentID, subAgentID, result.Text, files)
+	// 校验分层（TODO #43）状态标注：VerifyNote 非空=校验通过（L0 证据/L2 rubric），
+	// 完成摘要前缀一行，父 Agent 可见校验依据；空=未启用校验（none），零变化。
+	summary := result.Text
+	if result.VerifyNote != "" {
+		summary = fmt.Sprintf("【校验:通过(%s)】\n%s", result.VerifyNote, result.Text)
+	}
+	d.notify(parentID, subAgentID, summary, files)
 	return false
 }
 
@@ -1421,8 +1470,8 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 // 与 LLM 调用层重试（react_agent retry_count）正交：那层重试模型调用本身，这层重跑整个 Agent。
 // mode 为派发执行模式，自动重派沿用同一模式。
 // 返回 (result, err, retried)：retried=true 表示本轮失败已重试过一次（二次失败终报）。
-func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode string) (agent.ReactResult, error, bool) {
-	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode)
+func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode, verifyKind string) (agent.ReactResult, error, bool) {
+	_, result, err := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode, verifyKind)
 	if err == nil || d.dispatchRetryCount <= 0 {
 		return result, err, false
 	}
@@ -1432,7 +1481,7 @@ func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, sub
 		return result, err, false
 	}
 	log.Printf("[subagent] AUTO-RETRY: sub=%s role=%s err=%v (dispatch retry %d)", subAgentID, roleDef.ID, err, d.dispatchRetryCount)
-	_, result2, err2 := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode)
+	_, result2, err2 := d.runSubAgentOnce(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode, verifyKind)
 	return result2, err2, true
 }
 
@@ -1451,17 +1500,21 @@ func (d *Dispatcher) treeFinish(ctx context.Context, subAgentID, summary string,
 	}
 }
 
-// runSubAgentOnce 纯执行路径：创建子 Agent、注入块记忆、驱动 Run、沉淀块记忆，
+// runSubAgentOnce 纯执行路径：创建子 Agent、注入块记忆、驱动 Run、校验分层（TODO #43）、沉淀块记忆，
 // 返回子 Agent 实例 + 完整结果 + 错误。不 notify、不触发钩子、不进入实例池。
 // 供异步 runSubAgent 包装器与同步 ExecuteChild（编排器）共用。
 //
 // mode 为派发执行模式（react/reflection/plan_execute，TODO #29）：
 // 空串/未知值走默认 ReAct 引擎；reflection/plan_execute 由 runEngine 按引擎包装。
+// verifyKind 为校验分层（auto/executable/rubric/none，TODO #43）：auto 按角色/模式解析；
+// executable 完成后扫可执行验证证据（缺证据反馈重试 1 轮）；rubric 强制交叉模型 judge 引擎。
 //
 // 错误语义：
 //   - 获取 provider 失败、Run 返回 error、LimitReached 均返回非 nil err；
+//   - errVerifyMissing：L0 校验缺验证证据（重试 1 轮后仍缺）；
+//   - errUnverified：judge LLM 不可用（fail-closed，result.Unverified=true）；
 //   - 成功时 err == nil，result.Text 为最终答复。
-func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode string) (*agent.ReActAgent, agent.ReactResult, error) {
+func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode, verifyKind string) (*agent.ReActAgent, agent.ReactResult, error) {
 	provider, err := d.models.GetBladesProvider(ctx, roleDef.ID)
 	if err != nil {
 		return nil, agent.ReactResult{}, fmt.Errorf("get model: %w", err)
@@ -1510,6 +1563,16 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// （实证 2026-08-13：三个领域 Agent 与叶子 code_assistant 的思考流全是
 	// "三个领域 Agent 已成功派发，等待回传"，3 参数改动跑 12 分钟）。
 	// 子 Agent 身份只由角色提示词（叶子=执行者/领域=领域负责人）定义。
+	// 黑板模式（TODO #42）每轮兄弟产出摄取：仅 DomainAgent + 非空 domain + searcher 实现
+	// BlackboardSearcher 时包装记忆流水线，每轮 Assemble 末尾按 scope 查询兄弟产出注入【兄弟产出】段
+	// （等待兄弟时见其完成结论，替"等待回传"叙事空转）。持指针供播种召回后 seedSeen 去重。
+	var uptake *siblingUptakePipeline
+	if roleDef.ID == "domain" && strings.TrimSpace(domain) != "" {
+		if bb, ok := d.searcher.(BlackboardSearcher); ok {
+			uptake = newSiblingUptakePipeline(mem, bb, tool.SessionIDFromContext(ctx), parentID, domain, subAgentID)
+			mem = uptake
+		}
+	}
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
@@ -1563,7 +1626,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	if sp := d.buildSharedPrefix(ctx, parentID); sp != "" {
 		prefixes = append(prefixes, sp)
 	}
-	if bm, recs := d.injectRecalledMemory(ctx, origTask, ""); bm != "" {
+	if bm, recs := d.injectScopedRecall(ctx, parentID, domain, origTask, ""); bm != "" {
 		prefixes = append(prefixes, bm)
 		log.Printf("[subagent] inject block-memory: sub=%s role=%s hits=%d task_len=%d",
 			subAgentID, roleDef.ID, len(recs), len(origTask))
@@ -1576,6 +1639,10 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			}
 			log.Printf("[subagent]   hit[%d] domain=%s goal=%q content=%q",
 				i+1, domain, truncateRunes(fmt.Sprintf("%v", rec.Meta["goal"]), 80), truncateRunes(strings.TrimSpace(rec.Content), 200))
+		}
+		// seed uptake wrapper 的 seen：播种召回的事实标为已见，防每轮摄取重复注入同一条。
+		if uptake != nil {
+			uptake.seedSeen(recs)
 		}
 	}
 	// 领域标签前缀：与系统提示词职责槽互补（prompt 管长效，前缀管当下），
@@ -1599,9 +1666,36 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			subAgentID, domain)
 	}
 
-	result, err := d.runEngine(ctx, sub, subAgentID, roleDef.ID, mode, task)
+	vk := resolveVerifyKind(verifyKind, roleDef.ID, mode)
+	result, err := d.runEngine(ctx, sub, subAgentID, roleDef.ID, mode, vk, task)
 	if err != nil {
 		return sub, result, fmt.Errorf("run: %w", err)
+	}
+
+	// 校验分层（TODO #43）fail-closed：judge LLM 不可用时 result.Unverified=true，
+	// 上抛 errUnverified（绝不静默放行——旧 fail-open 使 reflection 自检形同虚设）。
+	if result.Unverified {
+		return sub, result, errUnverified
+	}
+
+	// L0 可执行校验：验证类命令成功执行的客观证据扫描（零 LLM 零执行）。
+	// 缺证据 → 1 轮反馈重试（"终答前必须运行验证命令"）→ 仍缺 → errVerifyMissing 报父。
+	if vk == verifyKindExecutable {
+		if !agent.HasExecutableVerification(result.History) {
+			log.Printf("[subagent] verify L0 missing evidence: sub=%s role=%s (retry 1 round)", subAgentID, roleDef.ID)
+			result, err = sub.RunWithHistory(ctx, l0RetryMessage, result.History)
+			if err != nil {
+				return sub, result, fmt.Errorf("run: %w", err)
+			}
+			if result.LimitReached {
+				return sub, result, errVerifyMissing
+			}
+			if !agent.HasExecutableVerification(result.History) {
+				log.Printf("[subagent] verify L0 still missing: sub=%s role=%s", subAgentID, roleDef.ID)
+				return sub, result, errVerifyMissing
+			}
+		}
+		result.VerifyNote = "L0 证据"
 	}
 
 	if result.LimitReached {
@@ -1626,7 +1720,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		// 叶子助手触达 token 上限:不持久化,把部分产出塞 result.Text 返回给父 mailbox + 标 Done。
 		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 		result.Text = partial
-		d.saveBlockMemory(ctx, subAgentID, roleDef.ID, origTask, partial, blockOutcomePartial)
+		d.saveBlockMemory(ctx, subAgentID, roleDef.ID, parentID, domain, origTask, partial, blockOutcomePartial, agent.FilesModifiedFromHistory(result.History))
 		log.Printf("[subagent] PARTIAL: sub=%s role=%s (token budget, partial returned)", subAgentID, roleDef.ID)
 		return sub, result, errPartialReturn
 	}
@@ -1638,7 +1732,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		Content: result.Text,
 	})
 
-	d.saveBlockMemory(ctx, subAgentID, roleDef.ID, origTask, result.Text, blockOutcomeSuccess)
+	d.saveBlockMemory(ctx, subAgentID, roleDef.ID, parentID, domain, origTask, result.Text, blockOutcomeSuccess, agent.FilesModifiedFromHistory(result.History))
 
 	return sub, result, nil
 }
@@ -1650,13 +1744,16 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 //
 // 引擎辅助 LLM（自检/规划）从模型工厂取同角色 provider 适配；缺失/失败时
 // 引擎内部 fail-open 降级为纯 ReAct，不阻塞派发主流程。
-func (d *Dispatcher) runEngine(ctx context.Context, sub *agent.ReActAgent, subAgentID, roleID, mode, task string) (agent.ReactResult, error) {
-	switch mode {
-	case agent.ModeReflection:
+func (d *Dispatcher) runEngine(ctx context.Context, sub *agent.ReActAgent, subAgentID, roleID, mode, verifyKind, task string) (agent.ReactResult, error) {
+	// reflection 模式或显式 rubric 校验：交叉模型 judge 引擎（TODO #43）。
+	// verifyKind=rubric 覆盖 mode（react+rubric = 完成后 judge 评审）。
+	if mode == agent.ModeReflection || verifyKind == verifyKindRubric {
 		return agent.NewReflectEngine(sub, agent.EngineOptions{
-			LLM:                 d.engineLLM(ctx, roleID),
+			LLM:                 d.engineLLMForJudge(ctx, roleID),
 			MaxReflectionRounds: d.reflectionMaxRounds,
 		}).Run(ctx, task)
+	}
+	switch mode {
 	case agent.ModePlanExecute:
 		return agent.NewPlanExecuteEngine(sub, agent.EngineOptions{
 			LLM:          d.engineLLM(ctx, roleID),
@@ -1667,6 +1764,54 @@ func (d *Dispatcher) runEngine(ctx context.Context, sub *agent.ReActAgent, subAg
 		return sub.Run(ctx, task)
 	}
 }
+
+// engineLLMForJudge 构造校验 judge 的 LLMComplete（TODO #43 交叉模型）：
+// 优先取配置 judgeRole（默认 prompt_reviewer，与被审角色不同模型/供应商——同模型自评
+// 偏放水/幻觉 pass）；judgeRole 取不到（mock 测试/角色未注册）回退同角色 provider，
+// 两者都失败返回恒 err 的 LLMComplete——ReflectEngine 收到错误走 fail-closed（Unverified），
+// 绝不静默放行。
+func (d *Dispatcher) engineLLMForJudge(ctx context.Context, roleID string) agent.LLMComplete {
+	if d.judgeRole != "" && d.judgeRole != roleID {
+		if p, err := d.models.GetBladesProvider(ctx, d.judgeRole); err == nil {
+			return agent.NewEngineLLM(p)
+		}
+	}
+	if p, err := d.models.GetBladesProvider(ctx, roleID); err == nil {
+		return agent.NewEngineLLM(p)
+	}
+	return func(ctx context.Context, prompt string) (string, error) {
+		return "", fmt.Errorf("judge provider unavailable for role=%s judge=%s", roleID, d.judgeRole)
+	}
+}
+
+// verifyKind 取值（TODO #43 校验分层，call_sub_agent 的 verify_kind 参数）。
+const (
+	verifyKindAuto       = "auto"
+	verifyKindExecutable = "executable"
+	verifyKindRubric     = "rubric"
+	verifyKindNone       = "none"
+)
+
+// resolveVerifyKind 解析校验分层（TODO #43）：显式值优先；auto/空串按任务形态推断——
+// reflection 模式 → rubric（引擎内 judge 即校验）；代码/测试/评审固定角色 → executable
+// （L0 客观证据）；其余（domain 编排/叶子默认 react）→ none（不加校验成本）。
+func resolveVerifyKind(verifyKind, roleID, mode string) string {
+	switch verifyKind {
+	case verifyKindExecutable, verifyKindRubric, verifyKindNone:
+		return verifyKind
+	}
+	if mode == agent.ModeReflection {
+		return verifyKindRubric
+	}
+	switch roleID {
+	case "code_assistant", "test_assistant", "code_reviewer":
+		return verifyKindExecutable
+	}
+	return verifyKindNone
+}
+
+// l0RetryMessage 是 L0 校验缺验证证据时的 1 轮反馈重试指令。
+const l0RetryMessage = "【验证要求】终答前必须运行验证命令（测试/lint/build 检查，如 node test.js、go test ./...、npm run lint），并依据结果修正问题。请运行验证命令后重新产出最终答复。"
 
 // engineLLM 构造引擎辅助 LLM（自检/规划）：从模型工厂取同角色 provider 适配为文本补全。
 // 取 provider 失败时返回的 LLMComplete 每次调用报错，引擎 fail-open 降级为纯 ReAct。
@@ -1781,6 +1926,11 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	mem := d.memory
 	if mem == nil {
 		mem = agent.NopMemoryPipeline{}
+	}
+	// 黑板模式（TODO #42）：resume 的 domain Agent 同样每轮摄取兄弟产出--它正是因等兄弟而暂停的，
+	// 恢复后兄弟可能已完成，uptake 让它立即见到兄弟结论而非空等/重做。
+	if bb, ok := d.searcher.(BlackboardSearcher); ok && strings.TrimSpace(pausedNode.Domain) != "" {
+		mem = newSiblingUptakePipeline(mem, bb, sid, pausedNode.ParentID, pausedNode.Domain, pausedNodeID)
 	}
 	// 不注入编排者人格（理由同 runSubAgentOnce：身份混淆实证）。
 	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
@@ -1903,6 +2053,12 @@ const (
 	FailureKindKilled FailureKind = "killed"
 	// FailureKindLoopGuard 被循环守卫（连读/探索预算/连败）终止。
 	FailureKindLoopGuard FailureKind = "loop_guard"
+	// FailureKindUnverified 校验 judge LLM 不可用，结论未验证（TODO #43 fail-closed）。
+	// 非"失败"而是"无法判定"：retryable=false，父 Agent 自决（重派/降级/收口）。
+	FailureKindUnverified FailureKind = "unverified"
+	// FailureKindVerifyMissing L0 可执行校验缺验证证据（无成功运行的测试/lint/--check，
+	// 重试 1 轮后仍缺）。retryable=false，父 Agent 自决。
+	FailureKindVerifyMissing FailureKind = "verify_missing"
 )
 
 // failureKindOf 从失败错误分类失败类型；未知错误归 error。
@@ -1914,6 +2070,10 @@ func failureKindOf(err error) FailureKind {
 		return FailureKindLoopGuard
 	case errors.Is(err, errPartialReturn):
 		return FailureKindBudget
+	case errors.Is(err, errUnverified):
+		return FailureKindUnverified
+	case errors.Is(err, errVerifyMissing):
+		return FailureKindVerifyMissing
 	default:
 		return FailureKindError
 	}
@@ -1936,8 +2096,18 @@ var errPaused = errors.New("sub-agent paused on token budget")
 // (叶子是叶子,不持久化 history,父 domain 收部分后自行决定重派或接手)。
 var errPartialReturn = errors.New("sub-agent partial return on token budget")
 
+// errUnverified 标记校验 judge LLM 不可用（TODO #43 fail-closed）：result.Unverified=true，
+// runSubAgent 见此信号按 FailureKindUnverified（retryable=false）notify 父并附未验证产出全文，
+// 绝不静默放行（旧 fail-open 使 reflection 自检形同虚设）。
+var errUnverified = errors.New("sub-agent result unverified: judge LLM unavailable")
+
+// errVerifyMissing 标记 L0 可执行校验缺验证证据（无成功运行的测试/lint/--check，
+// 重试 1 轮后仍缺）。runSubAgent 见此信号按 FailureKindVerifyMissing notify 父。
+var errVerifyMissing = errors.New("sub-agent missing executable verification evidence")
+
 // formatSubAgentFailure 把 runSubAgentOnce 返回的错误格式化为父邮箱通知文案，
-// 保留原有"超时/循环守卫/通用失败"三段语义与部分进度回传。
+// 保留原有"超时/循环守卫/通用失败"三段语义与部分进度回传；
+// 校验分层两类（TODO #43）单独文案，明确"未验证"而非"失败"语义。
 func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Duration, partial string) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Sprintf("子 Agent 执行超时（已运行 %v），已被终止。%s", timeout, partialSuffix(partial))
@@ -1945,6 +2115,12 @@ func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Dur
 	if errors.Is(err, tool.ErrLoopExit) {
 		reason := strings.TrimPrefix(err.Error(), tool.ErrLoopExit.Error()+": ")
 		return fmt.Sprintf("子 Agent 陷入循环被守卫终止（%s）。%s", reason, partialSuffix(partial))
+	}
+	if errors.Is(err, errUnverified) {
+		return fmt.Sprintf("子 Agent 校验不可用（judge LLM 失败：%s），结论未验证。", result.VerifyNote)
+	}
+	if errors.Is(err, errVerifyMissing) {
+		return "子 Agent 未提供可执行验证证据（没有成功运行的测试/lint/--check 命令）。"
 	}
 	return fmt.Sprintf("sub-agent failed: %v%s", err, partialSuffix(partial))
 }
@@ -2009,7 +2185,9 @@ func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task st
 		}()
 	}
 
-	_, result, err := d.runSubAgentOnce(childCtx, parentID, subAgentID, *roleDef, task, "", "", "")
+	// ExecuteChild 是 verifyloop 原型（未接线）的执行通道：verifyKind 传 "none" 保持原型
+	// 语义纯净（不引入校验分层副作用）。
+	_, result, err := d.runSubAgentOnce(childCtx, parentID, subAgentID, *roleDef, task, "", "", "", "none")
 	if d.treeFn != nil && sid != "" {
 		if t := d.treeFn(sid); t != nil {
 			if err != nil {
@@ -2231,10 +2409,14 @@ func (d *Dispatcher) WithSharedMemory(r tool.SharedMemoryStore) *Dispatcher {
 // outcome 标记执行状态（blockOutcomeSuccess/Partial/Fail），写入 Meta 供召回侧排序：
 // success 优先、partial/fail 降权为避坑经验，避免失败记忆与成功记忆并列误导子 Agent。
 //
+// parentID/taskDomain/filesModified 是黑板模式（TODO #42）scope 标签：写入 Meta 的 parent_id/
+// task_domain/files_modified，供 BlackboardSearcher.Query 按 scope 确定性过滤（兄弟产出按 scope
+// 共享，替纯语义召回的跨 scope 串扰）。taskDomain 为空时仅落语义召回可用字段，scope 查询召回不到。
+//
 // 提取策略：若 factExtractor 已注入，先调用 LLM 提取 1-5 条关键事实，
 // 每条事实单独落 KnowledgeRecord（向量化后召回精度更高）。
 // 提取失败或未注入时回退到原始 result.Text 落库（向后兼容）。
-func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, goal, result, outcome string) {
+func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, parentID, taskDomain, goal, result, outcome string, filesModified []string) {
 	if d.saver == nil || !d.writeEnabled {
 		return
 	}
@@ -2245,12 +2427,12 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, go
 	if d.factExtractor != nil {
 		facts, err := d.factExtractor.Extract(ctx, content, goal, roleID)
 		if err == nil && len(facts) > 0 {
-			d.saveFacts(ctx, subAgentID, roleID, goal, facts, outcome)
+			d.saveFacts(ctx, subAgentID, roleID, parentID, taskDomain, goal, facts, outcome, filesModified)
 			return
 		}
 		log.Printf("[subagent] extract facts failed, fallback raw: sub=%s err=%v facts=%d", subAgentID, err, len(facts))
 	}
-	d.saveRawBlockMemory(ctx, subAgentID, roleID, goal, content, outcome)
+	d.saveRawBlockMemory(ctx, subAgentID, roleID, parentID, taskDomain, goal, content, outcome, filesModified)
 }
 
 // saveBlockRecord 落库单条块记忆并维护失败观测计数。
@@ -2271,22 +2453,26 @@ func (d *Dispatcher) saveBlockRecord(ctx context.Context, rec *types.KnowledgeRe
 }
 
 // saveRawBlockMemory 把原始 result.Text 作为单条 KnowledgeRecord 落库。
-// 内容采用"目标/角色/结果"三段式，meta 携带 goal/domain/session_id/outcome/reuse_count 标签，
-// 便于召回侧（SearchBlockMemoryByGoal / SearchBlockMemory）按目标文本、领域与价值排序命中。
-func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID, goal, content, outcome string) {
+// 内容采用"目标/角色/结果"三段式，meta 携带 goal/domain/session_id/parent_id/task_domain/
+// files_modified/outcome/reuse_count 标签，便于召回侧（SearchBlockMemoryByGoal / BlackboardSearcher.Query）
+// 按目标文本、scope 与价值排序命中。
+func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID, parentID, taskDomain, goal, content, outcome string, filesModified []string) {
 	trimmedGoal := truncateRunes(strings.TrimSpace(goal), blockMemoryGoalMaxRunes)
 	sid := tool.SessionIDFromContext(ctx)
 	rec := &types.KnowledgeRecord{
 		KnowledgeType: enums.KnowledgeTypeBlockMemory,
 		Content:       fmt.Sprintf("目标:%s\n角色:%s\n结果:%s", trimmedGoal, roleID, truncateRunes(content, blockMemoryResultMaxRunes)),
 		Meta: map[string]any{
-			"goal":         trimmedGoal,
-			"domain":       roleID,
-			"session_id":   sid,
-			"sub_agent_id": subAgentID,
-			"source":       "sub_agent_result",
-			"outcome":      outcome,
-			"reuse_count":  0,
+			"goal":           trimmedGoal,
+			"domain":         roleID,
+			"session_id":     sid,
+			"sub_agent_id":   subAgentID,
+			"parent_id":      parentID,
+			"task_domain":    strings.TrimSpace(taskDomain),
+			"files_modified": filesModified,
+			"source":         "sub_agent_result",
+			"outcome":        outcome,
+			"reuse_count":    0,
 		},
 		CreatedAt: time.Now(),
 	}
@@ -2295,7 +2481,7 @@ func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID,
 
 // saveFacts 把提取出的事实逐条落库，每条单独向量化以提升召回精度。
 // 失败仅记日志，不影响其他事实或派发主流程。
-func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, goal string, facts []string, outcome string) {
+func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, parentID, taskDomain, goal string, facts []string, outcome string, filesModified []string) {
 	trimmedGoal := truncateRunes(strings.TrimSpace(goal), blockMemoryGoalMaxRunes)
 	sid := tool.SessionIDFromContext(ctx)
 	for i, fact := range facts {
@@ -2307,14 +2493,17 @@ func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, goal str
 			KnowledgeType: enums.KnowledgeTypeBlockMemory,
 			Content:       fact,
 			Meta: map[string]any{
-				"goal":         trimmedGoal,
-				"domain":       roleID,
-				"session_id":   sid,
-				"sub_agent_id": subAgentID,
-				"source":       "fact_extraction",
-				"fact_index":   i,
-				"outcome":      outcome,
-				"reuse_count":  0,
+				"goal":           trimmedGoal,
+				"domain":         roleID,
+				"session_id":     sid,
+				"sub_agent_id":   subAgentID,
+				"parent_id":      parentID,
+				"task_domain":    strings.TrimSpace(taskDomain),
+				"files_modified": filesModified,
+				"source":         "fact_extraction",
+				"fact_index":     i,
+				"outcome":        outcome,
+				"reuse_count":    0,
 			},
 			CreatedAt: time.Now(),
 		}
@@ -2328,26 +2517,9 @@ func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, goal str
 // 被后续 UI 任务再次执行）。
 const blockMemoryRecallHeader = "【相关记忆】（以下为已完成任务的结论沉淀，仅作背景参考，不得把其中已完成的改动当作当前任务的待办重复执行）"
 
-// injectRecalledMemory 按 query 文本召回块记忆，并把命中内容拼到任务前。
-// 未配置检索器、无命中或召回出错时返回原 task，保证派发主流程不受影响。
-// sessionID 从 ctx 取：仅召回当前 session 写入的记录，防跨 session 污染。
-//
-// query 与 task 分离：query 是语义检索的目标文本（用原始任务，避免空串向量召回垃圾），
-// task 是要拼装渲染的当前任务文本。task 为空时返回纯前缀（不含【当前任务】标记），
-// 供调用方统一拼装；非空时返回完整 "前缀 + 【当前任务】 + task"。
-//
-// 召回排序（价值反馈闭环）：outcome=success 优先、reuse_count 降序、新近优先；
-// 失败/部分记忆不丢，降权为独立的「避坑经验」段，避免与成功记忆并列误导子 Agent。
-// 返回命中的记录切片，供调用方日志留痕（避免重复检索）。
-func (d *Dispatcher) injectRecalledMemory(ctx context.Context, query, task string) (string, []*types.KnowledgeRecord) {
-	if d.searcher == nil {
-		return task, nil
-	}
-	sid := tool.SessionIDFromContext(ctx)
-	recs, err := d.searcher.SearchBlockMemoryByGoal(ctx, sid, query, blockMemoryRecallTopK)
-	if err != nil || len(recs) == 0 {
-		return task, nil
-	}
+// rankBlockMemory 就地按 outcome（success 优先）+ reuse_count 降序 + 新近优先排序。
+// 召回排序（价值反馈闭环）：成功记忆在前，失败/部分记忆降权为避坑经验段。
+func rankBlockMemory(recs []*types.KnowledgeRecord) {
 	sort.SliceStable(recs, func(i, j int) bool {
 		ri, rj := blockOutcomeRank(recs[i].Meta), blockOutcomeRank(recs[j].Meta)
 		if ri != rj {
@@ -2358,20 +2530,29 @@ func (d *Dispatcher) injectRecalledMemory(ctx context.Context, query, task strin
 		}
 		return recs[i].CreatedAt.After(recs[j].CreatedAt)
 	})
-	// 召回命中后 best-effort 递增 reuse_count（JSONB 就地更新），失败仅记日志不阻塞派发。
-	if bumper, ok := d.searcher.(reuseBumper); ok {
-		for _, rec := range recs {
-			if rec.ID <= 0 {
-				continue
-			}
-			if err := bumper.BumpReuse(ctx, rec.ID); err != nil {
-				log.Printf("[subagent] bump block-memory reuse failed: id=%d err=%v", rec.ID, err)
-			}
+}
+
+// bumpReuses best-effort 递增命中记录的 reuse_count（JSONB 就地更新），失败仅记日志。
+func (d *Dispatcher) bumpReuses(ctx context.Context, recs []*types.KnowledgeRecord) {
+	bumper, ok := d.searcher.(reuseBumper)
+	if !ok {
+		return
+	}
+	for _, rec := range recs {
+		if rec.ID <= 0 {
+			continue
+		}
+		if err := bumper.BumpReuse(ctx, rec.ID); err != nil {
+			log.Printf("[subagent] bump block-memory reuse failed: id=%d err=%v", rec.ID, err)
 		}
 	}
-	// 拼接：成功经验在前，避坑经验（partial/fail）单列降权。
+}
+
+// renderRecalledMemory 把命中记录渲染为成功经验/避坑经验两段文本。
+// header 由调用方指定（播种召回用【相关记忆】，每轮摄取用【兄弟产出】）。
+func renderRecalledMemory(header string, recs []*types.KnowledgeRecord) string {
 	var sb strings.Builder
-	sb.WriteString(blockMemoryRecallHeader + "\n")
+	sb.WriteString(header + "\n")
 	var successLines, pitfallLines []string
 	for _, rec := range recs {
 		if blockOutcomeRank(rec.Meta) == 0 {
@@ -2392,13 +2573,49 @@ func (d *Dispatcher) injectRecalledMemory(ctx context.Context, query, task strin
 			fmt.Fprintf(&sb, "%d. %s\n", i+1, l)
 		}
 	}
-	// task 非空：旧语义，返回完整拼装；task 为空：仅返回前缀，由调用方统一拼装。
-	if task == "" {
-		return strings.TrimRight(sb.String(), "\n"), recs
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// injectScopedRecall 黑板模式（TODO #42）scope 确定性召回：优先 BlackboardSearcher.Query
+// 按 parent_id + task_domain 过滤（兄弟产出按 scope 共享，每个 Agent 只取自己 scope 切片）；
+// searcher 未实现 BlackboardSearcher（mock）/ scope 0 命中 / 出错时回退 SearchBlockMemoryByGoal
+// 语义召回（向后兼容旧数据与现有测试）。query 为语义检索目标文本（原始任务，避免空串向量召回垃圾）。
+//
+// task 为空时返回纯前缀（不含【当前任务】标记），供调用方统一拼装；非空返回完整 "前缀 + 【当前任务】 + task"。
+// 返回命中记录切片，供调用方日志留痕与 uptake wrapper 去重 seed（防播种召回与每轮摄取重复）。
+func (d *Dispatcher) injectScopedRecall(ctx context.Context, parentID, taskDomain, query, task string) (string, []*types.KnowledgeRecord) {
+	if d.searcher == nil {
+		return task, nil
 	}
-	sb.WriteString("\n【当前任务】\n")
-	sb.WriteString(task)
-	return sb.String(), recs
+	sid := tool.SessionIDFromContext(ctx)
+	var recs []*types.KnowledgeRecord
+	// scope 确定性路径：BlackboardSearcher + 非空 parent/domain。
+	if bb, ok := d.searcher.(BlackboardSearcher); ok && strings.TrimSpace(parentID) != "" && strings.TrimSpace(taskDomain) != "" {
+		if rs, err := bb.Query(ctx, sid, parentID, taskDomain, query, blockMemoryRecallTopK, ""); err == nil && len(rs) > 0 {
+			recs = rs
+		}
+	}
+	// 回退：语义召回（旧数据无 parent_id/task_domain / mock 未实现 BlackboardSearcher / scope 0 命中）。
+	if len(recs) == 0 {
+		rs, err := d.searcher.SearchBlockMemoryByGoal(ctx, sid, query, blockMemoryRecallTopK)
+		if err != nil || len(rs) == 0 {
+			return task, nil
+		}
+		recs = rs
+	}
+	rankBlockMemory(recs)
+	d.bumpReuses(ctx, recs)
+	prefix := renderRecalledMemory(blockMemoryRecallHeader, recs)
+	if task == "" {
+		return prefix, recs
+	}
+	return prefix + "\n\n【当前任务】\n" + task, recs
+}
+
+// injectRecalledMemory 旧语义召回 wrapper（向后兼容现有测试调用点）：不带 scope，
+// 走 injectScopedRecall 的回退路径（纯语义 SearchBlockMemoryByGoal）。
+func (d *Dispatcher) injectRecalledMemory(ctx context.Context, query, task string) (string, []*types.KnowledgeRecord) {
+	return d.injectScopedRecall(ctx, "", "", query, task)
 }
 
 // blockOutcomeRank 返回 outcome 的排序权重：success=0 优先召回，partial/fail 降权为避坑经验。

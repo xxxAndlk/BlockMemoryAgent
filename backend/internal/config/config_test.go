@@ -33,6 +33,10 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if cfg.Agent.PlanExecuteMaxSteps != 12 {
 		t.Fatalf("plan_execute_max_steps 应为 12，got %d", cfg.Agent.PlanExecuteMaxSteps)
 	}
+	// 校验 judge 角色（TODO #43）：config.yaml 显式 prompt_reviewer。
+	if cfg.Agent.JudgeRole != "prompt_reviewer" {
+		t.Fatalf("judge_role 应为 prompt_reviewer，got %q", cfg.Agent.JudgeRole)
+	}
 	// 失败打捞超时（TODO #33）：config.yaml 显式 60（思考型模型下限）。
 	if cfg.Agent.SalvageLLMTimeoutSec != 60 {
 		t.Fatalf("salvage_llm_timeout_sec 应为 60，got %d", cfg.Agent.SalvageLLMTimeoutSec)

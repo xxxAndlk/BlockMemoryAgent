@@ -77,9 +77,11 @@ func TestDispatcher_RegisterAndCall(t *testing.T) {
 	// 构造携带父 Agent ID 的上下文，模拟 meta 代理调用子代理。
 	ctx := agent.WithAgentID(context.Background(), "meta")
 	// 调度 call_sub_agent 工具，请求 code_assistant 角色执行任务。
+	// verify_kind=none：本测试验证调度/邮箱机制，与校验分层无关。
 	res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
-		"role_id": "code_assistant",
-		"task":    "write tests",
+		"role_id":     "code_assistant",
+		"task":        "write tests",
+		"verify_kind": "none",
 	})
 	// 校验调度未返回错误。
 	if err != nil {
@@ -415,11 +417,14 @@ func newWriteTestEnv(t *testing.T, saver BlockMemorySaver, enabled bool) (*tool.
 }
 
 // dispatchCodeAssistant 以 meta 身份派发一个 code_assistant 子 Agent，返回其句柄。
+// verify_kind=none：本 helper 的服务对象是块记忆/计数等机制测试，与校验分层（TODO #43）无关，
+// 显式关校验防 L0 缺证据重试轮消耗脚本化 mock 的 FIFO 回复。
 func dispatchCodeAssistant(t *testing.T, toolsReg *tool.Registry) string {
 	t.Helper()
 	res, err := toolsReg.Dispatch(agent.WithAgentID(context.Background(), "meta"), "call_sub_agent", map[string]any{
-		"role_id": "code_assistant",
-		"task":    "write tests",
+		"role_id":     "code_assistant",
+		"task":        "write tests",
+		"verify_kind": "none",
 	})
 	if err != nil {
 		t.Fatalf("dispatch failed: %v", err)
@@ -1191,7 +1196,7 @@ func TestDispatcher_DomainResponsibilityInjection(t *testing.T) {
 		t.Fatal("domain role not registered")
 	}
 	_, _, err := d.runSubAgentOnce(context.Background(), "meta", "meta/domain-1", *roleDef,
-		"实现 config.js 数值表", "配置", "负责 config.js/index.html/css；禁止碰 js/engine 下文件", "")
+		"实现 config.js 数值表", "配置", "负责 config.js/index.html/css；禁止碰 js/engine 下文件", "", "none")
 	if err != nil {
 		t.Fatalf("runSubAgentOnce: %v", err)
 	}
@@ -1322,7 +1327,8 @@ func TestDispatch_ModeReflection(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
-	if body := waitMailboxDrain(t, mb, "meta"); body != "done" {
+	// reflection 引擎 judge 通过后完成摘要带【校验:通过(L2 rubric)】前缀（TODO #43）。
+	if body := waitMailboxDrain(t, mb, "meta"); body != "【校验:通过(L2 rubric)】\ndone" {
 		t.Fatalf("expected summary 'done', got %q", body)
 	}
 	// 1 次 ReAct 产出 + 1 次自检辅助调用（证明 reflection 引擎被选中执行）。
@@ -1356,9 +1362,10 @@ func TestDispatch_ModePlanExecute(t *testing.T) {
 
 	ctx := tool.WithSessionID(agent.WithAgentID(context.Background(), "session-1"), "session-1")
 	res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
-		"role_id": "code_assistant",
-		"task":    "build a tower defense game",
-		"mode":    "plan_execute",
+		"role_id":     "code_assistant",
+		"task":        "build a tower defense game",
+		"mode":        "plan_execute",
+		"verify_kind": "none", // 本测试验证 plan_execute 引擎步数，校验分层无关
 	})
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
@@ -1433,16 +1440,16 @@ func TestDispatch_ModeValidation(t *testing.T) {
 func TestValidateDispatchArgs_TaskSoftLanding(t *testing.T) {
 	d := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{})
 	ok := strings.Repeat("字", 3000)
-	if msg, warning := d.validateDispatchArgs("code_assistant", ok, "", ""); msg != "" || warning != "" {
+	if msg, warning := d.validateDispatchArgs("code_assistant", ok, "", "", ""); msg != "" || warning != "" {
 		t.Fatalf("<=3000 should pass clean: msg=%q warning=%q", msg, warning)
 	}
 	soft := strings.Repeat("字", 3100)
-	msg, warning := d.validateDispatchArgs("code_assistant", soft, "", "")
+	msg, warning := d.validateDispatchArgs("code_assistant", soft, "", "", "")
 	if msg != "" || warning == "" || !strings.Contains(warning, "放行") {
 		t.Fatalf("3000-4000 should soft-land with warning: msg=%q warning=%q", msg, warning)
 	}
 	hard := strings.Repeat("字", 4100)
-	msg, warning = d.validateDispatchArgs("code_assistant", hard, "", "")
+	msg, warning = d.validateDispatchArgs("code_assistant", hard, "", "", "")
 	if msg == "" || !strings.Contains(msg, "task too long") || warning != "" {
 		t.Fatalf(">4000 should hard reject: msg=%q warning=%q", msg, warning)
 	}
@@ -1451,18 +1458,18 @@ func TestValidateDispatchArgs_TaskSoftLanding(t *testing.T) {
 // TestValidateDispatchArgs_TaskRuneLimitsOverride WithTaskRuneLimits 覆盖默认档位（TODO #35）。
 func TestValidateDispatchArgs_TaskRuneLimitsOverride(t *testing.T) {
 	d := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{}).WithTaskRuneLimits(1000, 1500)
-	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1000), "", ""); msg != "" {
+	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1000), "", "", ""); msg != "" {
 		t.Fatalf("<=soft should pass: %q", msg)
 	}
-	if _, warning := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1200), "", ""); warning == "" {
+	if _, warning := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1200), "", "", ""); warning == "" {
 		t.Fatal("soft-hard range should soft-land with warning")
 	}
-	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1600), "", ""); msg == "" {
+	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1600), "", "", ""); msg == "" {
 		t.Fatal(">hard should reject")
 	}
 	// 0 值参数回落默认，不改档。
 	d2 := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{}).WithTaskRuneLimits(0, 0)
-	if msg, _ := d2.validateDispatchArgs("code_assistant", strings.Repeat("字", 3000), "", ""); msg != "" {
+	if msg, _ := d2.validateDispatchArgs("code_assistant", strings.Repeat("字", 3000), "", "", ""); msg != "" {
 		t.Fatalf("zero values should keep defaults: %q", msg)
 	}
 }

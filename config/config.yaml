@@ -57,6 +57,7 @@ agent:
   ask_user_timeout_sec: 0        # ask_user 提问默认超时（秒，TODO #24 人在回路）：0=不限；>0 超时未答复工具返回"用户未答复，自行决策"。单次调用 timeout_sec 参数覆盖
   reflection_max_rounds: 3       # 派发 mode=reflection 时自检不达标重试轮数上限（TODO #29 三引擎）：每轮 ≈ +1 次辅助 LLM 调用；强模型下 2 轮偏紧放开到 3
   plan_execute_max_steps: 12     # 派发 mode=plan_execute 时最大执行步数（TODO #29 三引擎）：超限强制收口终答；多阶段复杂装配 8 步偏紧放开到 12
+  judge_role: prompt_reviewer    # 校验 judge 角色（TODO #43 交叉模型）：reflection/rubric 校验取该角色 provider 作评审（deepseek-v4-flash，与被审角色不同模型，防同模型自评放水）；裸 LLM 调用不派 Agent，取不到回退同角色
   explore_budget: 60             # 叶子 Agent 探索类工具（ReadFile/ListDir/SearchInFiles/只读 RunCommand）调用次数上限；TODO #35 放开预算：20->60，60 次 × 200 行/页覆盖 ~12000 行
   explore_budget_domain: 60      # DomainAgent 协调者写入未开始前探索预算；TODO #35 放开预算：16->60，domain 被逼"只读规格不探索"过度下放，给强模型留直接通读空间
   explore_budget_post_write: 120 # 写入已开始后探索预算升档（修复期"读报错->改->复验"循环需精读）；TODO #35 放开预算：40->120，仍设上限防"逐文件通读"式发散（连读守卫+token 预算兜底）

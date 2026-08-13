@@ -104,6 +104,13 @@ type ReactResult struct {
 	// 与 LimitReached 互斥语义:LimitReached=自身到限,PausedOnChild=子到限。
 	// 上层据此将会话置 PausedOnChild 态,等用户"继续"恢复该 domain。
 	PausedOnChild bool `json:"paused_on_child,omitempty"`
+	// Unverified 为 true 表示校验层判定"结论未验证"（TODO #43 fail-closed）：
+	// judge LLM 不可用/坏 JSON 时置位，上层不得当成功交付，须显式上抛父 Agent 自决
+	// （替代旧 fail-open 静默放行——2026-08-13 实证全天 reflection 形同虚设）。
+	Unverified bool `json:"unverified,omitempty"`
+	// VerifyNote 是校验层状态标签：非空=校验通过（"L0 证据"/"L2 rubric"）；
+	// Unverified 时为 judge 失败原因。上层据此在完成摘要里标注校验状态。
+	VerifyNote string `json:"verify_note,omitempty"`
 }
 
 // 实时进度事件种类：用于向 UI 推送 ReAct 运行过程中的中间状态。

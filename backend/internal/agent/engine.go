@@ -65,12 +65,31 @@ type EngineOptions struct {
 // 适用正确性敏感任务（算法/迁移/重构/验收修复）。每轮成本 ≈ +1 次辅助 LLM 调用，
 // 轮数硬上限兜底（MaxReflectionRounds）。
 //
-// fail-open 语义：辅助 LLM 缺失/报错/返回非法 JSON 时按"通过"处理，不阻塞交付——
-// 自检是增值层，宁可放行也不让 Agent 卡在无法判定的循环里。
+// fail-closed 语义（TODO #43）：judge LLM 缺失/报错/返回非法 JSON 时 result.Unverified=true，
+// 绝不静默放行——旧 fail-open 使自检形同虚设（2026-08-13 实证全天 reflection 静默失效）。
+// 校验不可用时上抛父 Agent 自决，而非把未验证结论当成功交付。
 type ReflectEngine struct {
 	agent  *ReActAgent
 	llm    LLMComplete
 	rounds int
+}
+
+// ErrJudgeUnavailable 是 judge LLM 不可用（报错/坏 JSON）的哨兵，
+// 供测试断言 fail-closed 路径；对外表现为 result.Unverified=true 而非 error。
+var ErrJudgeUnavailable = errors.New("judge LLM unavailable")
+
+// rubricCheck 是 judge 对单条验收条目的判定。
+type rubricCheck struct {
+	Item     string `json:"item"`     // 验收条目文本
+	Pass     bool   `json:"pass"`     // 该条目是否达标
+	Evidence string `json:"evidence"` // 依据（引用执行结果/验证证据的具体内容）
+}
+
+// verdict 是 judge 的 rubric 分项判定结果。
+type verdict struct {
+	Pass     bool          `json:"pass"`     // 整体是否达标（所有条目 pass）
+	Feedback string        `json:"feedback"` // 不达标问题清单（达标为空串）
+	Checks   []rubricCheck `json:"checks"`   // 逐条判定
 }
 
 // NewReflectEngine 构造 ReflectEngine；rounds <=0 按默认 2。
@@ -85,16 +104,32 @@ func NewReflectEngine(a *ReActAgent, opts EngineOptions) *ReflectEngine {
 // Run 执行 ReAct 循环并自检重试。
 func (e *ReflectEngine) Run(ctx context.Context, input string) (ReactResult, error) {
 	result, err := e.agent.Run(ctx, input)
-	if err != nil || result.LimitReached || e.llm == nil {
+	if err != nil || result.LimitReached {
 		return result, err
+	}
+	if e.llm == nil {
+		// fail-closed：无 judge 即无法判定，标记未验证而非静默通过。
+		result.Unverified = true
+		result.VerifyNote = "judge LLM 未配置"
+		return result, nil
 	}
 	history := result.History
 	for round := 0; round < e.rounds; round++ {
-		pass, feedback := e.reflect(ctx, input, result.Text)
-		if pass {
+		// 每轮重算证据：重试轮的文件/验证输出随 history 更新。
+		files := FilesModifiedFromHistory(result.History)
+		evidence := RecentVerificationOutputs(result.History, 3)
+		v, err := e.reflect(ctx, input, result.Text, files, evidence)
+		if err != nil {
+			// fail-closed：judge 不可用（报错/坏 JSON）→ 未验证上抛，绝不静默 pass。
+			result.Unverified = true
+			result.VerifyNote = err.Error()
 			return result, nil
 		}
-		result, err = e.agent.RunWithHistory(ctx, reflectionRetryMessage(feedback), history)
+		if v.Pass {
+			result.VerifyNote = "L2 rubric"
+			return result, nil
+		}
+		result, err = e.agent.RunWithHistory(ctx, reflectionRetryMessage(v.Feedback), history)
 		if err != nil {
 			return result, err
 		}
@@ -106,24 +141,42 @@ func (e *ReflectEngine) Run(ctx context.Context, input string) (ReactResult, err
 	return result, nil
 }
 
-// reflect 对照任务（含验收标准）自检执行结果。
-// 返回 pass=true 表示达标（或无法判定，fail-open）；pass=false 表示不达标，附反馈。
-func (e *ReflectEngine) reflect(ctx context.Context, task, answer string) (bool, string) {
-	prompt := "【质量自检】对照任务与验收标准，检查执行结果是否达标。\n\n【任务】\n" + task +
+// reflect 对照任务验收标准，rubric 分项自检执行结果（TODO #43 改造）：
+// judge 被要求从任务提取验收条目逐条判定，并对照【修改文件】与【验证证据】客观段
+// 给出依据（堵幻觉 pass）。judge 报错/坏 JSON 返回 ErrJudgeUnavailable（fail-closed）。
+func (e *ReflectEngine) reflect(ctx context.Context, task, answer string, files, evidence []string) (verdict, error) {
+	prompt := "【质量自检】你是独立评审（与被评审者不同模型）。对照任务验收标准，逐条检查执行结果是否达标。\n\n【任务】\n" + task +
 		"\n\n【执行结果】\n" + answer +
-		"\n\n严格输出 JSON（不要其他文字）：{\"pass\": true 或 false, \"feedback\": \"不达标时的具体问题清单（达标则为空串）\"}"
+		"\n\n【修改文件】\n" + renderListOrNone(files, 10) +
+		"\n\n【验证证据】\n" + renderListOrNone(evidence, 0) +
+		"\n\n【验收标准】从【任务】中提取验收条目（无显式条目则推导 2-5 条），逐条判定。" +
+		"\n\n严格输出 JSON（不要其他文字）：{\"pass\": true 或 false, \"feedback\": \"不达标时的具体问题清单（达标则为空串）\", \"checks\": [{\"item\": \"验收条目\", \"pass\": true 或 false, \"evidence\": \"依据【执行结果】或【验证证据】的具体内容\"}]}"
 	resp, err := e.llm(ctx, prompt)
 	if err != nil {
-		return true, "" // fail-open：自检 LLM 失败不阻塞交付
+		return verdict{}, fmt.Errorf("%w: %v", ErrJudgeUnavailable, err)
 	}
-	var v struct {
-		Pass     bool   `json:"pass"`
-		Feedback string `json:"feedback"`
-	}
+	var v verdict
 	if json.Unmarshal([]byte(resp), &v) != nil {
-		return true, "" // fail-open：非法 JSON 按通过处理
+		return verdict{}, fmt.Errorf("%w: invalid JSON response", ErrJudgeUnavailable)
 	}
-	return v.Pass, truncateRunes(strings.TrimSpace(v.Feedback), 2000)
+	v.Feedback = truncateRunes(strings.TrimSpace(v.Feedback), 2000)
+	return v, nil
+}
+
+// renderListOrNone 把字符串列表渲染为编号行；空列表渲染为"无"。
+// maxLines>0 时截断到最近 maxLines 条。
+func renderListOrNone(items []string, maxLines int) string {
+	if len(items) == 0 {
+		return "无"
+	}
+	if maxLines > 0 && len(items) > maxLines {
+		items = items[len(items)-maxLines:]
+	}
+	var sb strings.Builder
+	for i, it := range items {
+		fmt.Fprintf(&sb, "%d. %s\n", i+1, it)
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // reflectionRetryMessage 构造自检未通过后的带反馈重试指令。

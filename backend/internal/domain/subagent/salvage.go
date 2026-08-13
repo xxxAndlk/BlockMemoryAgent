@@ -9,6 +9,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
+	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -80,15 +81,40 @@ func (d *Dispatcher) salvageFailure(ctx context.Context, parentID, subAgentID st
 			log.Printf("[subagent] salvage slot write failed: sub=%s key=%s err=%v", subAgentID, key, err)
 		}
 	}
+	// 黑板模式（TODO #42）dual-write：把打捞摘要写黑板块记忆（outcome=fail），供
+	// withPriorSalvage 经 BlackboardSearcher.Query 按 scope 检索（替 slot 文件读，统一黑板）。
+	// 经 d.saver 落库（embedding 由 blockMemorySaver.Save 处理）；best-effort 不阻塞主流程。
+	if domain != "" && d.saver != nil && d.writeEnabled {
+		sid := tool.SessionIDFromContext(ctx)
+		rec := &types.KnowledgeRecord{
+			KnowledgeType: enums.KnowledgeTypeBlockMemory,
+			Content:       salvage,
+			Meta: map[string]any{
+				"goal":         truncateRunes(salvage, blockMemoryGoalMaxRunes),
+				"domain":       roleDef.ID,
+				"task_domain":  strings.TrimSpace(domain),
+				"parent_id":    parentID,
+				"session_id":   sid,
+				"sub_agent_id": subAgentID,
+				"source":       "salvage",
+				"outcome":      blockOutcomeFail,
+				"reuse_count":  0,
+			},
+			CreatedAt: time.Now(),
+		}
+		d.saveBlockRecord(ctx, rec, "salvage")
+	}
 	return salvage
 }
 
-// withPriorSalvage 检查同父同 domain 是否有 Failed/Cancelled 兄弟节点；有则读取其
-// 打捞摘要槽位 <parentID>:salvage:<domain>，以【前序探索摘要】前缀追加到新任务文本末尾，
-// 使同域重派从机制上不重复探索（不依赖 MetaAgent 记性）。无兄弟/摘要为空返回原任务。
+// withPriorSalvage 检查同父同 domain 是否有前序失败/部分打捞记录，以【前序探索摘要】前缀
+// 追加到新任务文本末尾，使同域重派从机制上不重复探索（不依赖 MetaAgent 记性）。无记录返回原任务。
+//
+// 黑板优先（TODO #42）：BlackboardSearcher 按 scope（parent_id + task_domain）查 fail/partial
+// 打捞记录（salvageFailure dual-write 落库）；未实现 / 0 命中 / 出错回退 slot 文件读 + 树 Failed/Cancelled 检查。
 func (d *Dispatcher) withPriorSalvage(ctx context.Context, parentID, domain, task string) string {
 	domain = strings.TrimSpace(domain)
-	if domain == "" || d.sharedMem == nil || d.treeFn == nil {
+	if domain == "" {
 		return task
 	}
 	sid := tool.SessionIDFromContext(ctx)
@@ -96,6 +122,31 @@ func (d *Dispatcher) withPriorSalvage(ctx context.Context, parentID, domain, tas
 		if i := strings.Index(parentID, "/"); i > 0 {
 			sid = parentID[:i]
 		}
+	}
+	// 黑板优先：按 scope 查 fail/partial 打捞记录，替 slot 文件读。
+	if bb, ok := d.searcher.(BlackboardSearcher); ok && sid != "" {
+		recs, err := bb.Query(ctx, sid, parentID, domain, "", 3, "")
+		if err == nil {
+			var lines []string
+			for _, r := range recs {
+				if blockOutcomeRank(r.Meta) > 0 { // fail/partial
+					if t := strings.TrimSpace(r.Content); t != "" {
+						lines = append(lines, truncateRunes(t, salvageMaxRunes/2))
+					}
+				}
+			}
+			if n := len(lines); n > 0 {
+				if n > 2 {
+					lines = lines[:2]
+				}
+				log.Printf("[subagent] prior salvage from blackboard: parent=%s domain=%s hits=%d", parentID, domain, n)
+				return task + "\n\n【前序探索摘要】\n" + strings.Join(lines, "\n")
+			}
+		}
+	}
+	// 回退：slot 文件读（旧数据无黑板写入 / BlackboardSearcher 未实现 / scope 0 命中）。
+	if d.sharedMem == nil || d.treeFn == nil {
+		return task
 	}
 	t := d.treeFn(sid)
 	if t == nil {

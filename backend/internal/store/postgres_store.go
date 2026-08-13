@@ -235,6 +235,12 @@ func (s *PostgresStore) SearchBlockMemoryByGoal(ctx context.Context, sessionID, 
 	return s.Knowledge.SearchBlockMemoryByGoal(ctx, sessionID, goal, topK)
 }
 
+// Query 黑板模式（TODO #42）scope 确定性检索块记忆；委托给 KnowledgeStore.Query。
+// 实现 domain/subagent.BlackboardSearcher 接口（鸭子类型，store 不依赖 domain）。
+func (s *PostgresStore) Query(ctx context.Context, sessionID, parentID, taskDomain, query string, topK int, excludeSubAgentID string) ([]*types.KnowledgeRecord, error) {
+	return s.Knowledge.Query(ctx, sessionID, parentID, taskDomain, query, topK, excludeSubAgentID)
+}
+
 // SearchKnowledgeByType 按 knowledge_type 过滤的向量搜索；委托给 KnowledgeStore.SearchByType。
 func (s *PostgresStore) SearchKnowledgeByType(ctx context.Context, knowledgeType enums.KnowledgeType, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
 	return s.Knowledge.SearchByType(ctx, knowledgeType, embedding, topK)

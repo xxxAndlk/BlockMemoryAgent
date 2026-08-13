@@ -132,8 +132,9 @@ func TestRunSubAgent_DomainLimitReachedPauses(t *testing.T) {
 func TestRunSubAgent_AssistantLimitReachedPartialReturn(t *testing.T) {
 	d, _, mb, _, tr, toolsReg := newPauseTestEnv(t, &tokenUsageProvider{text: "partial work"})
 	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
-		"role_id": "code_assistant",
-		"task":    "write code",
+		"role_id":     "code_assistant",
+		"task":        "write code",
+		"verify_kind": "none", // 本测试验证 token 上限部分返回路径，校验分层无关
 	})
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch assistant failed: err=%v res=%+v", err, res)

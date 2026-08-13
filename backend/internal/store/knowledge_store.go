@@ -196,6 +196,63 @@ func (s *KnowledgeStore) SearchBlockMemoryByGoal(ctx context.Context, sessionID,
 	return s.SearchByType(ctx, enums.KnowledgeTypeBlockMemory, emb, topK)
 }
 
+// Query 黑板模式（TODO #42）scope 确定性检索：按 session_id + parent_id + task_domain
+// 精确过滤块记忆，替纯语义召回的"按兄弟真实 scope 取切片"。在 SearchBlockMemoryByGoal
+// 语义召回之上叠加 scope 过滤--兄弟产出按 scope 共享，每个 Agent 只取自己 scope 的切片，
+// 避免 mailbox 全量广播的上下文互染。
+//
+// query 非空：叠加向量语义排序（cosine 阈值过滤 + ORDER BY 距离），同语义召回但多 scope 过滤；
+// query 空串：跳过 cosine（纯 scope 过滤 + ORDER BY created_at DESC），省 embedding，供每轮摄取等
+// 无需语义重排的场景。excludeSubAgentID 非空时排除该 Agent 自身写入的记录（每轮摄取不回显自己结论）。
+func (s *KnowledgeStore) Query(ctx context.Context, sessionID, parentID, taskDomain, query string, topK int, excludeSubAgentID string) ([]*types.KnowledgeRecord, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	query = strings.TrimSpace(query)
+	// 语义分支：embedding + cosine 阈值过滤 + 距离排序。
+	if query != "" {
+		emb, err := s.pg.Embed(ctx, query)
+		if err != nil {
+			return nil, fmt.Errorf("embed query: %w", err)
+		}
+		rows, err := s.db.QueryContext(ctx, `
+				SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived,
+				       1 - (embedding <=> $3) AS score
+				FROM global_knowledge
+				WHERE archived = false AND knowledge_type = $1
+				  AND meta->>'session_id' = $2
+				  AND meta->>'parent_id' = $4 AND meta->>'task_domain' = $5
+				  AND ($6 = '' OR meta->>'sub_agent_id' <> $6)
+				  AND embedding <=> $3 <= $7
+				ORDER BY embedding <=> $3
+				LIMIT $8
+			`, enums.KnowledgeTypeBlockMemory, sessionID, pgVector(emb), parentID, taskDomain, excludeSubAgentID, 1-minBlockMemoryScore, topK)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return s.scanKnowledgeRowsWithScore(ctx, rows)
+	}
+	// 纯 scope 分支：无 cosine，省 embedding，按新近排序。
+	rows, err := s.db.QueryContext(ctx, `
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE archived = false AND knowledge_type = $1
+			  AND meta->>'session_id' = $2
+			  AND meta->>'parent_id' = $3 AND meta->>'task_domain' = $4
+			  AND ($5 = '' OR meta->>'sub_agent_id' <> $5)
+			ORDER BY created_at DESC
+			LIMIT $6
+		`, enums.KnowledgeTypeBlockMemory, sessionID, parentID, taskDomain, excludeSubAgentID, topK)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return s.scanKnowledgeRows(ctx, rows)
+}
+
 // SearchByTypeAndSession 按 knowledge_type + session_id 过滤的向量相似搜索。
 // 供 block-memory 召回侧按 session 隔离使用，避免跨 session 污染。
 // 同时过滤弱相关命中（余弦相似度 < minBlockMemoryScore 不返回）：旧任务事实与

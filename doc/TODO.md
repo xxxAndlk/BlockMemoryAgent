@@ -10,6 +10,47 @@
     - 多Agent协作：类似人类之间互相交流询问是否正确。例如：代码Agent完成代码后测试Agent进行测试,不明确具体测试方向时需要先把方案列出,给开发处方案的代码Agent是否符合代码Agent的逻辑,不符合代码Agent纠正,符合测试Agent测试Agent进行测试。测试结果代码Agent代码Agent对比是否与需求符合,不一致则代码Agent重新修正。复合后代码Agent返回给上级的领域Agent或者主Agent,期间各Agent可以反复询问,纠正,需要Agent在被询问时开一个协程进行回复,需要携带关键记忆或者协程Agent常驻共享代码Agent记忆,可评估。测试流程最为重要,查看现在的测试是否严谨与多重确认。代码Agent完成开发,找到固定助手的测试助手,先进行自测试,返回结果成功后返回给上级Agent,上级Agent按更大范围模块进行统一测试,哪个部分不行打回。
     - Agent执行任务,先拆解任务,拆解为不会干涉的单元任务后,一个单元任务使用一个干净上下文的Agent编码助手执行,压缩Token成本。执行完成后暂时不销毁,一定时间不使用直接消耗,有使用则重置使用时间并加长使用时间。原因：我在使用claude时,经常会有不切换会话在同一个会话使用重复上下文一直执行任务。越到后面越会上下文污染严重导致模型幻觉,并且上下文上每一次输入的Token成本也会激增。可评估是否可以替换块记忆,块记忆过于抽象,可用性与传统感觉不明显,。或者把块记忆与每个单独感觉上下文的Agent进行集成融合等尝试。现在的领域子Agent排发就相当于这个方案的初始模式,每个领域干净上下文负责自己的事。
 
+42. **通信架构重构：黑板模式（共享底座 + 选择性摄取）**  ← 来源：2026-08-13 CrewAI / MS Agent Framework 对比讨论
+    - 背景：当前 agent 间通信 = mailbox（显式点对点消息，隔离强）+ 父独占 history（子 Agent 间无共享态势）。MS Agent Framework GroupChat 全量重广播 transcript（共享强但上下文互染、token 爆）。两者都不理想。本项目 event 流 + block memory(pgvector) + agent tree + task board 已是 append-only 黑板底座，缺"选择性摄取"检索层。此重构是去硬化件（#44）与可信校验（#43 证据核对取兄弟产物）的前置依赖。
+    - 设计（blackboard architecture：共享底座 + 选择性摄取）：
+      1. 写侧统一：所有 agent 产出（工具结果/think/子 Agent 完成摘要/fact）落 append-only 黑板（复用 event 流 + block memory + shared slot），不点对点发完整内容。mailbox 降级为"有新产出"信号 + 产物指针，不再承载内容。
+      2. 读侧选择性摄取：agent 组上下文时不收全量，按 **scope + 相关性** 检索切片--自己 task 正文 + 相关 fact（块记忆 embedding 搜，复用 injectRecalledMemory）+ 触及本 scope 的兄弟产出。兄弟完成摘要作 fact 入库（outcome 已有），派发前检"有没有兄弟已做相关"。
+      3. scope 显式声明：task 带 scope 标签（domain/文件路径/模块），兄弟产出按 scope 索引，确定性匹配优先于语义（embedding 兜底）。防"不知道该查"漏项。
+      4. 父不再注入全量 global spec（08-13 身份混淆根因）：子 Agent 只取自己 scope 的 spec 切片（renderSpecPrefix【范围】锚定已部分做，扩展为按 scope 切片注入）。
+    - 收益（去硬化件根因）：杀同域重派（兄弟产出黑板可见，替 findPendingDomainSibling 去重件）+ DomainAgent 等兄弟时读黑板决"继续等 vs 收口"（替 08-13 等待叙事空转门）+ 子 Agent 第一身份=角色提示词（替 persona 去注入 bandaid）。
+    - 执行流程：
+      1. 黑板读 API：`blackboard.Query(ctx, agentID, scope, query)` 统一入口，内部聚合 event 流 + block memory + shared slot 按 scope/相关性检索返切片。先建接口 + 内存实现，PG 持久化后置。
+      2. 兄弟产出入库：dispatcher notify 父时同步把子 Agent 完成摘要（含 FilesModified + 结论）作 fact 写块记忆（outcome=success/partial），scope = task domain/路径。
+      3. 派发前摄取：call_sub_agent 派发前经黑板查同父同 scope 兄弟产出，命中追加【前序探索摘要】到 task（#20 第三层 salvage slot 已部分做，统一收口到黑板）。
+      4. 子 Agent 上下文摄取：ReActAgent Assemble 经黑板按本 task scope 取相关兄弟产出 + fact 切片注入，替代父注入全量 spec。
+      5. mailbox 降级：仅传"有新产出"信号 + 黑板 key 指针，父 drain 后按指针取黑板。
+    - 测试：兄弟完成摘要入黑板可按 scope 检索命中；派发前摄取命中【前序探索摘要】；子 Agent 上下文含本 scope 兄弟产出、不含无关 scope；mailbox 信号 + 指针取黑板闭环。
+    - 验收：塔防多域任务，同域重派不再发生（兄弟产出黑板可见模型主动复用）；DomainAgent 等兄弟时读黑板决收口而非空转叙事；TUI 可观测黑板检索命中。
+    - 不做：不做全量共享 transcript（MS GroupChat 模式，上下文互染 token 爆）；不做跨 session 黑板复用（会话级，#35 Phase 2 跨重启恢复另管）；不删 mailbox（降级为信号层保留）；不立即删去重件/空转门（#44 黑板稳定后再删）。
+    - 开放风险：检索质量依赖 retriever（embedding 可能漏"不知道该查"项）--scope 显式声明 + 确定性匹配优先缓解。
+
+43. **校验分层重构：可执行 > 证据核对 > 交叉模型 rubric，fail-closed**（✅ 已完成 2026-08-13，doc/变更.md 任务 41；来源：CrewAI/MS Agent Framework 对比讨论"当前校验很有问题"）
+    - **前提修正（重要）**：原设计"复用 verifyloop 作 L0/L1 壳"失效——verifyloop 接线已于 2026-08-08 整体移除（A/B 实证自动派验证 Agent 闭环=负资产）。落地**不碰 verifyloop、不派任何验证 Agent、不加开关**：L0=确定性证据扫描（零 LLM 零 spawn），L1 证据段并入 L2 rubric judge prompt（【修改文件】+【验证证据】段），verify_kind 枚举简化为 auto/executable/rubric/none。
+    - **落地**：L0 executable=扫历史 RunCommand 验证类命令（IsVerificationCommand 同口径）Success 证据，缺证据 1 轮反馈重试→verify_missing 报父（附产出全文）；L2=ReflectEngine judge 交叉模型（config judge_role 默认 prompt_reviewer）+ fail-closed（judge 错/坏 JSON→Unverified→kind=unverified 报父，绝不静默 pass）+ rubric 分项 checks；路由 verify_kind 默认 auto（reflection→rubric、code/test/reviewer→executable、其余 none）；成功摘要前缀【校验:通过(L0 证据/L2 rubric)】。
+    - 遗留：塔防回归观察 auto-executable 误报率（无测试基建任务会 verify_missing，噪音大可收紧 auto 推断）。
+
+44. **去调度硬化件：根因修复后退役补偿控制**  ← 来源：同上对比讨论（"调度硬化需经苦难去除"）
+    - 背景：当前调度硬化件（心跳 watchdog kill、派发预算 MaxTotalDispatches、同域去重 findPendingDomainSibling、等待叙事空转门、spec 强制门）= 系统不成熟期防 Token 爆炸/误杀的补偿控制，每条掩一个根因 bug。根因修了就该删，不是"生产成熟度特性"。目标：控制项数随版本递减到零（除 spec 门 + 终止条件）。前置依赖 #42 黑板（替去重/空转门）+ #43 校验（替预算 backstop）+ 08-13 流式活动上报（已替心跳假死判）。
+    - 退役映射（每条 = 根因修法 + 退役条件）：
+      1. **心跳 watchdog idle>5min kill**：根因=LLM 调用看起来假死。08-13 已修流式 delta 持续上报活动。退役条件=流式上报稳定运行 N 个塔防任务无 HEARTBEAT KILL 误杀 -> 删 patrol/killStuckSubAgent，仅留 provider 网络调用超时（归 LLM 调用层，非"假死"概念）。
+      2. **派发预算 MaxTotalDispatches**：根因=模型过度派发。退役条件=#42 黑板兄弟可见 + #43 校验派发纪律使派发数收敛到任务所需 -> 删预算计数，留终止条件（轮/token/墙钟）兜底。
+      3. **同域去重 findPendingDomainSibling**：根因=模型重派同域。退役条件=#42 黑板派发前摄取兄弟产出（同 scope 可见模型主动复用不重派）-> 删去重件。
+      4. **等待叙事空转门（waitForChildren/isWaitNarration/readOnlyToolNames）**：根因=等待叙事+只读重读烧 LLM。退役条件=#42 黑板 DomainAgent 等兄弟时读黑板决"继续等 vs 收口"（事件驱动阻塞替叙事空转）-> 删空转门，留事件驱动等待。
+      5. **spec 强制门（WriteSpec 前置）**：留。算流程卫生非 bandaid（派发欠规格是流程问题非系统误判）。
+      6. **轮/token/墙钟预算**：留但重定位=框架级终止条件（对齐 CrewAI max_iter / MS TerminationCondition），非"防爆炸"。
+    - 执行流程（按退役条件逐条，非一刀切）：
+      1. 观察期：#42 + #43 落地后跑 N 个塔防任务，日志核查--无 HEARTBEAT KILL、无同域重派、无等待叙事空转、派发数收敛。
+      2. 逐条退役：每条满足退役条件后单独删（含测试），跑回归确认根因未复发。先退役风险低项（去重件、空转门），后退役 watchdog/预算。
+      3. 文档：变更.md 记录每条退役 + 退役前观察数据。
+    - 验收：硬化件逐条删除后，塔防任务行为不退化（无 HEARTBEAT KILL、无重派、无空转、派发收敛）；控制项数递减。
+    - 不做：不一刀切全删（按退役条件逐条）；不删 spec 门 + 终止条件（保留）；不删 mailbox（#42 降级为信号层保留）；退役前必须有观察数据证根因未复发。
+    - 依赖：#42 黑板 + #43 校验落地 + 观察期数据。
+
 ## 已完成（已归档到 git 历史）
 
 - ReAct 主循环骨架（`internal/agent/react_agent.go`）
