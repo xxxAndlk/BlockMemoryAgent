@@ -22,11 +22,14 @@ type flowCard struct {
 	events []flowEvent
 }
 
-// maxFlowEvents 每张卡片最多展示的最近事件数。
+// maxFlowEvents 每个领域 Agent 最多展示的最近事件数。
 const maxFlowEvents = 3
 
-// flowCardW 卡片固定总宽（含边框），保证每行卡片列数计算确定。
-const flowCardW = 34
+// flowColW 单列固定总宽（标题行占满、事件行缩进 4 空格），保证每行列数计算确定。
+const flowColW = 30
+
+// flowColGap 相邻列之间的间隔空格数。
+const flowColGap = 4
 
 // collectFlowCards 从 Agent 树与会话事件构建领域 Agent 进度卡片（纯函数，便于测试）。
 // 仅领域 Agent（roleType==RoleTypeDomain）；每卡片事件取 DetailJSON 中 agent_id
@@ -123,8 +126,8 @@ func (m *Model) flowPanelCards() []flowCard {
 }
 
 // subAgentFlowPanelHeight 返回领域进度面板占用的行数（含标题行）：
-// 无领域 Agent 时为 0（面板不渲染）；有则为 1 + 6×卡片行数（卡片=名称 1 行+事件 3 行+边框 2 行）。
-// 行数按 ceil(卡片数/每行列数) 确定计算，保证 mainContentHeight 的预算与渲染一致。
+// 无领域 Agent 时为 0（面板不渲染）；有则为 1 + 4×块行数（块=名称行+3 事件行）。
+// 行数按 ceil(领域数/每行列数) 确定计算，保证 mainContentHeight 的预算与渲染一致。
 func (m *Model) subAgentFlowPanelHeight() int {
 	cards := m.flowPanelCards()
 	if len(cards) == 0 {
@@ -132,12 +135,12 @@ func (m *Model) subAgentFlowPanelHeight() int {
 	}
 	cols := flowPanelCols(m.width)
 	rows := (len(cards) + cols - 1) / cols
-	return 1 + 6*rows
+	return 1 + 4*rows
 }
 
-// flowPanelCols 返回面板每行可容纳的卡片列数（至少 1）。
+// flowPanelCols 返回面板每行可容纳的列数（至少 1）。
 func flowPanelCols(w int) int {
-	cols := w / flowCardW
+	cols := w / flowColW
 	if cols < 1 {
 		cols = 1
 	}
@@ -145,62 +148,52 @@ func flowPanelCols(w int) int {
 }
 
 // renderSubAgentFlowPanel 渲染对话栏下方的领域 Agent 进度面板：
-// 标题行 + 横向卡片网格（放不下换行）。每卡片：状态图标+名称、最近 3 次事件行。
+// 标题行 + 多列列表（放不下换行）。每列：`名称：` 标题行 + 缩进的最近 3 次事件行。
 func (m *Model) renderSubAgentFlowPanel(w int) string {
 	cards := m.flowPanelCards()
 	if len(cards) == 0 {
 		return ""
 	}
-	headerText := "🚀 领域 Agent 进度"
-	header := m.styles.PanelHeader.Width(w).Render(headerText)
+	header := m.styles.PanelHeader.Width(w).Render("🚀 领域 Agent 进度")
 
 	cols := flowPanelCols(w)
 	rows := (len(cards) + cols - 1) / cols
-	cardLines := make([]string, 0, rows)
+	blockLines := make([]string, 0, rows)
 	for r := 0; r < rows; r++ {
 		start := r * cols
 		end := start + cols
 		if end > len(cards) {
 			end = len(cards)
 		}
-		var rowCards []string
+		var rowCols []string
 		for _, c := range cards[start:end] {
-			rowCards = append(rowCards, m.buildFlowCard(c))
+			rowCols = append(rowCols, m.buildFlowCard(c))
 		}
-		cardLines = append(cardLines, joinHorizontalWithGap(rowCards, 2))
+		blockLines = append(blockLines, joinHorizontalWithGap(rowCols, flowColGap))
 	}
-	return lipgloss.JoinVertical(lipgloss.Top, header, strings.Join(cardLines, "\n"))
+	return lipgloss.JoinVertical(lipgloss.Top, header, strings.Join(blockLines, "\n"))
 }
 
-// buildFlowCard 渲染单张领域 Agent 卡片：状态色边框，行 1=状态图标+名称，行 2-4=最近事件。
+// buildFlowCard 渲染单个领域 Agent 列：行 1=`名称：`（状态着色），行 2-4=缩进事件行。
 func (m *Model) buildFlowCard(c flowCard) string {
-	inner := flowCardW - 4
-	if inner < 4 {
-		inner = 4
-	}
 	n := c.node
-	name := lipgloss.NewStyle().Foreground(lipgloss.Color(agentRoleColor(n.roleType))).Bold(true).
-		Render(statusIcon(string(n.status)) + " " + truncate(n.name, inner-3))
+	nameColor := agentRoleColor(n.roleType)
+	switch n.status {
+	case enums.RoleStatusActive:
+		nameColor = cStatusRun
+	case enums.RoleStatusError:
+		nameColor = cStatusErr
+	}
+	name := lipgloss.NewStyle().Foreground(lipgloss.Color(nameColor)).Bold(true).
+		Render(truncate(n.name+"：", flowColW))
 	lines := []string{name}
 	for i := 0; i < maxFlowEvents; i++ {
 		if i < len(c.events) {
 			ev := c.events[i]
-			lines = append(lines, ev.icon+" "+truncate(ev.text, inner-3))
+			lines = append(lines, "    "+ev.icon+" "+truncate(ev.text, flowColW-6))
 		} else {
-			lines = append(lines, m.styles.Dim.Render("…"))
+			lines = append(lines, "    "+m.styles.Dim.Render("…"))
 		}
 	}
-	borderColor := cBlur
-	switch n.status {
-	case enums.RoleStatusActive:
-		borderColor = cStatusRun
-	case enums.RoleStatusError:
-		borderColor = cStatusErr
-	}
-	return lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(borderColor)).
-		Padding(0, 1).
-		Width(flowCardW - 2).
-		Render(strings.Join(lines, "\n"))
+	return strings.Join(lines, "\n")
 }

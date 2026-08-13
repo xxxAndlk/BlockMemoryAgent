@@ -107,17 +107,17 @@ func TestFormatFlowEvent_Error(t *testing.T) {
 	}
 }
 
-// TestFlowPanelCols 验证每行卡片列数计算。
+// TestFlowPanelCols 验证每行列数计算。
 func TestFlowPanelCols(t *testing.T) {
-	if flowPanelCols(100) != 2 { // 100/34 = 2
-		t.Fatalf("宽 100 应 2 列，got %d", flowPanelCols(100))
+	if flowPanelCols(100) != 3 { // 100/30 = 3
+		t.Fatalf("宽 100 应 3 列，got %d", flowPanelCols(100))
 	}
 	if flowPanelCols(20) != 1 {
 		t.Fatalf("窄终端至少 1 列，got %d", flowPanelCols(20))
 	}
 }
 
-// TestSubAgentFlowPanelHeight 验证面板高度计算：无领域节点为 0，有则为 1+6×行数。
+// TestSubAgentFlowPanelHeight 验证面板高度计算：无领域节点为 0，有则为 1+4×行数。
 func TestSubAgentFlowPanelHeight(t *testing.T) {
 	sess := &server.Session{}
 	m := &Model{
@@ -132,12 +132,12 @@ func TestSubAgentFlowPanelHeight(t *testing.T) {
 		{instID: "s/domain-1", name: "A领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusActive},
 		{instID: "s/domain-2", name: "B领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusActive},
 	}
-	if h := m.subAgentFlowPanelHeight(); h != 7 { // 2 卡 1 行
-		t.Fatalf("2 领域单行高度应为 7，got %d", h)
+	if h := m.subAgentFlowPanelHeight(); h != 5 { // 2 领域 1 行
+		t.Fatalf("2 领域单行高度应为 5，got %d", h)
 	}
-	m.width = 30 // 单列：2 卡 2 行
-	if h := m.subAgentFlowPanelHeight(); h != 13 {
-		t.Fatalf("2 领域两行高度应为 13，got %d", h)
+	m.width = 30 // 单列：2 领域 2 行
+	if h := m.subAgentFlowPanelHeight(); h != 9 {
+		t.Fatalf("2 领域两行高度应为 9，got %d", h)
 	}
 }
 
@@ -161,14 +161,14 @@ func TestRenderSubAgentFlowPanel(t *testing.T) {
 	if out == "" {
 		t.Fatal("有领域节点时面板不应为空")
 	}
-	if !strings.Contains(out, "领域 Agent 进度") || !strings.Contains(out, "游戏渲染领域") {
-		t.Fatalf("面板应含标题与领域名，got:\n%s", out)
+	if !strings.Contains(out, "领域 Agent 进度") || !strings.Contains(out, "游戏渲染领域：") {
+		t.Fatalf("面板应含标题与领域名（名称+冒号），got:\n%s", out)
 	}
-	if !strings.Contains(out, "ReadFile: a.js") {
-		t.Fatalf("面板应含事件行，got:\n%s", out)
+	if !strings.Contains(out, "    ✓ ReadFile: a.js") {
+		t.Fatalf("面板应含缩进事件行，got:\n%s", out)
 	}
-	if s := m.renderSubAgentFlowPanel(100); strings.Count(s, "╭") != 1 {
-		t.Fatalf("单卡片应只有 1 个卡片边框，got:\n%s", s)
+	if strings.Contains(out, "╭") {
+		t.Fatalf("新样式不应有卡片边框，got:\n%s", out)
 	}
 	m.agentTreePanel.nodes = nil
 	if out := m.renderSubAgentFlowPanel(100); out != "" {

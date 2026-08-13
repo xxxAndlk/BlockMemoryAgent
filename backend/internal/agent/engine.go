@@ -10,6 +10,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -224,16 +225,40 @@ const engineAssistantSystem = "你是执行质量评审与任务规划助手。�
 
 // NewEngineLLM 把 ModelProvider 适配为 LLMComplete（引擎辅助调用）。
 // 每次调用构造"只给系统提示 + 单条用户消息"的极简请求，返回响应文本。
+// 流式优先：ark /api/coding 对 thinking 模型拒绝非流式长任务请求
+// （"streaming is required for operations that may take longer than 10 minutes"），
+// 2026-08-13 实证 Generate 路径全天 400、reflection 自检全部 fail-open 形同虚设。
 // provider 取不到或调用失败由调用方处理（引擎 fail-open 降级）。
 func NewEngineLLM(p ModelProvider) LLMComplete {
 	return func(ctx context.Context, prompt string) (string, error) {
-		resp, err := p.Generate(ctx, &blades.ModelRequest{
+		req := &blades.ModelRequest{
 			Instruction: blades.SystemMessage(engineAssistantSystem),
 			Messages:    []*blades.Message{blades.UserMessage(prompt)},
-		})
+		}
+		if sp, ok := p.(streamingModelProvider); ok {
+			return engineLLMStream(ctx, req, sp)
+		}
+		resp, err := p.Generate(ctx, req)
 		if err != nil {
 			return "", err
 		}
 		return bladesText(resp.Message), nil
 	}
+}
+
+// engineLLMStream 消费流式响应并返回最后一次有效产出的完整文本。
+func engineLLMStream(ctx context.Context, req *blades.ModelRequest, sp streamingModelProvider) (string, error) {
+	var final *blades.ModelResponse
+	for resp, err := range sp.NewStreaming(ctx, req) {
+		if err != nil {
+			return "", err
+		}
+		if resp != nil && resp.Message != nil {
+			final = resp
+		}
+	}
+	if final == nil {
+		return "", errors.New("engine llm: empty streaming response")
+	}
+	return bladesText(final.Message), nil
 }

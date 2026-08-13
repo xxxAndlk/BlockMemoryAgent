@@ -348,3 +348,61 @@ func TestEngineModeConstants(t *testing.T) {
 		t.Fatalf("mode constants drift: %q %q %q", ModeReact, ModeReflection, ModePlanExecute)
 	}
 }
+
+// streamEngineProvider 同时实现 Generate 与 NewStreaming：
+// Generate 返回 "from generate" 作为判别标记，NewStreaming 可编程（前 streamFails 次产出错误流）。
+// 用于验证 NewEngineLLM 流式优先（2026-08-13 ark 拒绝非流式致 reflection 自检全天 fail-open 的根因场景）。
+type streamEngineProvider struct {
+	scriptedProvider
+	streamFails int
+}
+
+// NewStreaming 满足 streamingModelProvider：错误流或单条成功产出。
+func (p *streamEngineProvider) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
+	return func(yield func(*blades.ModelResponse, error) bool) {
+		if p.streamFails > 0 {
+			p.streamFails--
+			yield(nil, errors.New("streaming is required for operations that may take longer than 10 minutes"))
+			return
+		}
+		yield(&blades.ModelResponse{Message: blades.AssistantMessage(`{"pass": true, "feedback": ""}`)}, nil)
+	}
+}
+
+// TestNewEngineLLM_PrefersStreaming 验证 provider 支持流式时走 NewStreaming 而非 Generate。
+func TestNewEngineLLM_PrefersStreaming(t *testing.T) {
+	p := &streamEngineProvider{scriptedProvider: scriptedProvider{replies: []string{"from generate"}}}
+	llm := NewEngineLLM(p)
+	got, err := llm(context.Background(), "自检")
+	if err != nil {
+		t.Fatalf("流式路径应成功，got err: %v", err)
+	}
+	if got != `{"pass": true, "feedback": ""}` {
+		t.Fatalf("应返回流式响应，got %q", got)
+	}
+	if p.calls != 0 {
+		t.Fatalf("不应调用 Generate，got %d calls", p.calls)
+	}
+}
+
+// TestNewEngineLLM_GenerateFallback 验证无流式接口的 provider 回退 Generate。
+func TestNewEngineLLM_GenerateFallback(t *testing.T) {
+	p := &scriptedProvider{replies: []string{"from generate"}}
+	llm := NewEngineLLM(p)
+	got, err := llm(context.Background(), "自检")
+	if err != nil {
+		t.Fatalf("回退路径应成功，got err: %v", err)
+	}
+	if got != "from generate" {
+		t.Fatalf("应返回 Generate 响应，got %q", got)
+	}
+}
+
+// TestNewEngineLLM_StreamingError 验证流式错误透传（引擎 fail-open 兜底）。
+func TestNewEngineLLM_StreamingError(t *testing.T) {
+	p := &streamEngineProvider{scriptedProvider: scriptedProvider{replies: []string{"x"}}, streamFails: 1}
+	llm := NewEngineLLM(p)
+	if _, err := llm(context.Background(), "自检"); err == nil {
+		t.Fatal("流式错误应透传")
+	}
+}

@@ -66,27 +66,32 @@ func (c *BladesClient) ModelName() string {
 // doGenerate 执行 blades 生成请求并做通用校验。
 // 四个 Generate* 方法共享此 helper，避免重复构造请求与空响应检查。
 //
+// 一律流式：ark /api/coding 对 thinking 模型拒绝非流式长任务请求
+// （"streaming is required for operations that may take longer than 10 minutes"），
+// 2026-08-13 实证非流式 Generate 全天 400（skill 选择/策略决策等辅助调用静默失效）。
+//
 // 参数：
 //   - ctx: 上下文
 //   - provider: 实际使用的 blades.ModelProvider
 //   - req: 已构造好的请求
 //
 // 返回：
-//   - *blades.ModelResponse: 成功响应
+//   - *blades.ModelResponse: 成功响应（最后一次有效产出）
 //   - error: 生成失败或响应为空时返回错误
 func (c *BladesClient) doGenerate(ctx context.Context, provider blades.ModelProvider, req *blades.ModelRequest) (*blades.ModelResponse, error) {
-	// 调用底层 provider 的 Generate
-	resp, err := provider.Generate(ctx, req)
-	if err != nil {
-		// 包装错误，标明发生在 model generate 阶段
-		return nil, fmt.Errorf("model generate: %w", err)
+	var final *blades.ModelResponse
+	for resp, err := range provider.NewStreaming(ctx, req) {
+		if err != nil {
+			return nil, fmt.Errorf("model generate: %w", err)
+		}
+		if resp != nil && resp.Message != nil {
+			final = resp
+		}
 	}
-	// 校验响应非空且包含消息
-	if resp == nil || resp.Message == nil {
+	if final == nil {
 		return nil, fmt.Errorf("empty model response")
 	}
-	// 返回校验后的响应
-	return resp, nil
+	return final, nil
 }
 
 // Generate 实现 LLMClient 接口的单轮文本生成。
