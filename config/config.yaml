@@ -62,7 +62,7 @@ agent:
   explore_budget_post_write: 120 # 写入已开始后探索预算升档（修复期"读报错->改->复验"循环需精读）；TODO #35 放开预算：40->120，仍设上限防"逐文件通读"式发散（连读守卫+token 预算兜底）
   task_max_runes: 3000           # 派发 task 文本软上限（TODO #35 放开预算）：超软限未达硬限放行附压缩警告；原 2000 偏紧逼压缩丢契约细节
   task_max_runes_hard: 4000      # 派发 task 文本硬上限（TODO #35）：超硬限拒绝；仍拦截全量规格转贴（事故日志 3521/2315 runes 区间已上移）
-  react_llm_timeout_sec: 600     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断,改 600s 给一次调用留够跑完。配合 generate() 不在 deadline 上重试,卡死时 600s 即报错而非 4×180=12min。
+  react_llm_timeout_sec: 1200    # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断；600s 仍不够——2026-08-13 实证 MetaAgent 汇总轮（4 领域摘要 ~20K input）10 分钟被掐断,整品验收没派出去,故 600->1200。配合 generate() 不在 deadline 上重试,卡死时 1200s 即报错。
   sub_agent_timeout_min: 120     # 子 Agent 独立执行超时（分钟），负数表示不限制。TODO #35 放开预算：60->120，慢推理（thinking）下长任务不再撞超时。
   tool_output_history_max_runes: 20000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 行区间分页默认 200 行/页（read_file_max_chars 默认 16000 字符，ASCII 整页约 16000 runes），20000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取
   token_budget_per_goal: 300000   # 单次目标累计 token 上限（input+output 之和，跨轮累加），超限暂停等用户续跑；<=0 不限制。TODO #35 放开预算：100K->300K

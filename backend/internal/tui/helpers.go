@@ -25,6 +25,15 @@ func stripANSI(s string) string {
 	return ansiRegex.ReplaceAllString(s, "")
 }
 
+// sanitizeToolText 净化工具输出/错误文本：剥离 ANSI，并把 CRLF 与孤立 \r 归一为 \n。
+// 工具输出夹带 \r（CRLF 文件内容、命令进度条）时，终端会把行内 \r 当回车、
+// 后续文本覆盖本行造成重叠乱码；归一后按普通换行渲染。
+func sanitizeToolText(s string) string {
+	s = stripANSI(s)
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
+}
+
 // flashMsg 设置一条 2 秒后过期的闪屏提示，使用互斥锁保证并发安全（T2 修复）。
 func (m *Model) flashMsg(msg string) {
 	// 加锁保护：postJSON/createSession 后台 goroutine 与主循环 View 并发读写 flash（T2 修复）
@@ -47,7 +56,7 @@ func (m *Model) showChatDetail() {
 	if s == nil {
 		return
 	}
-	items := chatItems(s, true)
+	items := chatItemsResolved(s, true, m.subAgentNameResolver())
 	idx := m.chatPanel.currentItem()
 	if idx < 0 || idx >= len(items) {
 		return
@@ -304,6 +313,13 @@ func (m *Model) buildAgentsLines() []string {
 // chatItems 将会话消息与关键事件合并为可展示的 chatItem 列表，按时间戳稳定排序，
 // 并在 compact=true 时进行聚合与去重处理。
 func chatItems(s *server.Session, compact bool) []chatItem {
+	return chatItemsResolved(s, compact, nil)
+}
+
+// chatItemsResolved 是 chatItems 的完整版本：resolver 把子 Agent 实例 ID
+// （如 session-1/code_assistant-5）映射为展示名，用于 llm_result 事件（子 Agent 结果摘要）
+// 的归属展示；resolver 为 nil 时保持事件原始 Agent 字段。
+func chatItemsResolved(s *server.Session, compact bool, resolver func(childID string) string) []chatItem {
 	// TUI 对话区按时间戳交错展示会话消息与关键 Agent 事件
 	// （tool_call、LLM/思考输出、错误等），使 ReAct 序列
 	// （思考 → 工具 → 结果 → 下一步思考）清晰可见。调试类事件
@@ -374,6 +390,13 @@ func chatItems(s *server.Session, compact bool) []chatItem {
 			}
 			items = append(items, chatItem{title: text, timestamp: ev.Timestamp, isEvent: false, role: enums.ChatRoleAssistant})
 			continue
+		}
+		// 子 Agent 结果摘要事件（llm_result，Tool=实例 ID）：把 "SubAgent" 替换为实例对应的
+		// 展示名（如"游戏渲染领域"），让用户直接看到是谁的产出。
+		if ev.Kind == "llm_result" && resolver != nil && ev.Tool != "" {
+			if name := resolver(ev.Tool); name != "" {
+				ev.Agent = name
+			}
 		}
 		title, detail, rawDetail, ok := eventChatItem(ev, compact)
 		if !ok {
@@ -549,6 +572,28 @@ func subAgentRoleLabel(role string) string {
 		return "领域 Agent"
 	}
 	return "助手"
+}
+
+// subAgentNameResolver 构建子 Agent 实例 ID → 展示名的解析器：
+// 优先查 Agent 树（instID→node.name，如 "游戏渲染领域"/"代码助手"），
+// 未命中回退角色类别标签（领域 Agent/助手）。树为空返回 nil（调用方保持事件原始 Agent）。
+func (m *Model) subAgentNameResolver() func(childID string) string {
+	nodes := m.agentTreePanel.nodes
+	if len(nodes) == 0 {
+		return nil
+	}
+	byID := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		if n.instID != "" {
+			byID[n.instID] = n.name
+		}
+	}
+	return func(childID string) string {
+		if name, ok := byID[childID]; ok {
+			return name
+		}
+		return subAgentRoleLabel(subAgentRoleFromID(childID))
+	}
 }
 
 // inflightTool 返回当前仍处于"已调用未返回"状态的工具名；没有时返回空串。
@@ -730,7 +775,7 @@ func (m *Model) buildTranscriptLines() []string {
 	if s == nil {
 		return []string{"(no active session)"}
 	}
-	items := chatItems(s, false)
+	items := chatItemsResolved(s, false, m.subAgentNameResolver())
 	if len(items) == 0 {
 		return []string{"(empty — send a message below)"}
 	}
@@ -826,12 +871,12 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		}
 		if ev.ToolOutput != "" {
 			full.WriteString("结果:\n")
-			full.WriteString(stripANSI(ev.ToolOutput))
+			full.WriteString(sanitizeToolText(ev.ToolOutput))
 			full.WriteByte('\n')
 		}
 		if ev.ToolError != "" {
 			full.WriteString("错误: ")
-			full.WriteString(stripANSI(ev.ToolError))
+			full.WriteString(sanitizeToolText(ev.ToolError))
 			full.WriteByte('\n')
 		}
 		rawDetail = strings.TrimRight(full.String(), "\n")
@@ -840,12 +885,12 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		// 非 verbose 工具仅展示 Error，避免输出刷屏但保证错误可见。
 		var compactDetail strings.Builder
 		if verboseTools[tool] && ev.ToolOutput != "" {
-			compactDetail.WriteString(truncateToolOutput(stripANSI(ev.ToolOutput), compactToolOutputLines))
+			compactDetail.WriteString(truncateToolOutput(sanitizeToolText(ev.ToolOutput), compactToolOutputLines))
 			compactDetail.WriteByte('\n')
 		}
 		if ev.ToolError != "" {
 			compactDetail.WriteString("错误: ")
-			compactDetail.WriteString(stripANSI(ev.ToolError))
+			compactDetail.WriteString(sanitizeToolText(ev.ToolError))
 			compactDetail.WriteByte('\n')
 		}
 		detail = strings.TrimRight(compactDetail.String(), "\n")

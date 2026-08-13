@@ -2,7 +2,8 @@ package model
 
 // retry_provider.go 在 provider 层包装 blades.ModelProvider，对 Generate 调用做 3 次重试。
 // 可重试状态（超时、网络错误、空响应、5xx、429）触发重试，3 次后仍失败返回错误给上级；
-// 4xx 客户端错误（400/401/403/404/422，请求本身非法）不重试，快速失败避免白等。
+// 4xx 客户端错误（400/401/403/404/422，请求本身非法）不重试，快速失败避免白等；
+// 例外：provider 实现 maxTokensClamper 且自愈成功（如 max_tokens 超限被钳制）时继续重试。
 // ctx 主动取消（context.Canceled）不重试，直接返回，避免用户取消后继续烧 token。
 // NewStreaming 直接委托底层，仅首错（未产出任何增量时）重试；
 // react_agent.generate 在更高层已有重试，覆盖流式路径。
@@ -53,6 +54,23 @@ func isNonRetryableErr(err error) bool {
 	return false
 }
 
+// maxTokensClamper 由 provider 选择性实现：检测到 max_tokens 超限错误时把自身
+// 输出上限钳制到端点声明的值并返回 true。retryProvider 据此把原本不可重试的 4xx
+// 视为可重试一次——请求参数已被修正，重试不再必然失败（如 ark 端点对 kimi 系
+// 硬上限 32768，配 65536 时全部 400；钳制后重试即通过）。
+type maxTokensClamper interface {
+	ClampMaxTokensOnError(err error) bool
+}
+
+// trySelfHeal 若底层 provider 支持自愈且本次错误可修复，返回 true（已修复，可重试）。
+func (p *retryProvider) trySelfHeal(err error) bool {
+	if err == nil {
+		return false
+	}
+	c, ok := p.inner.(maxTokensClamper)
+	return ok && c.ClampMaxTokensOnError(err)
+}
+
 // retryProvider 包装 blades.ModelProvider，对 Generate 做 3 次重试。
 // NewStreaming 直接委托底层，保留流式语义与 react_agent 层的重试覆盖。
 type retryProvider struct {
@@ -97,9 +115,14 @@ func (p *retryProvider) Generate(ctx context.Context, req *blades.ModelRequest) 
 			return nil, ctx.Err()
 		}
 		// 4xx 客户端错误由请求本身决定，重试必然同样失败，快速返回。
+		// 例外：provider 自愈成功（如 max_tokens 钳制）后参数已修正，继续重试。
 		if isNonRetryableErr(lastErr) {
-			log.Printf("[model] Generate non-retryable: provider=%s attempt=%d err=%v", p.name, attempt, lastErr)
-			return nil, lastErr
+			if p.trySelfHeal(lastErr) {
+				log.Printf("[model] Generate self-healed: provider=%s attempt=%d err=%v", p.name, attempt, lastErr)
+			} else {
+				log.Printf("[model] Generate non-retryable: provider=%s attempt=%d err=%v", p.name, attempt, lastErr)
+				return nil, lastErr
+			}
 		}
 		// 末次尝试失败不再退避，直接结束循环返回错误。
 		if attempt < providerMaxRetries {
@@ -171,10 +194,15 @@ func (p *retryProvider) NewStreaming(ctx context.Context, req *blades.ModelReque
 				return
 			}
 			// 4xx 客户端错误由请求本身决定，重试必然同样失败，快速返回。
+			// 例外：provider 自愈成功（如 max_tokens 钳制）后参数已修正，继续重试。
 			if isNonRetryableErr(finalErr) {
-				log.Printf("[model] stream non-retryable: provider=%s attempt=%d err=%v", p.name, attempt, finalErr)
-				yield(nil, finalErr)
-				return
+				if p.trySelfHeal(finalErr) {
+					log.Printf("[model] stream self-healed: provider=%s attempt=%d err=%v", p.name, attempt, finalErr)
+				} else {
+					log.Printf("[model] stream non-retryable: provider=%s attempt=%d err=%v", p.name, attempt, finalErr)
+					yield(nil, finalErr)
+					return
+				}
 			}
 			if attempt < providerMaxRetries {
 				log.Printf("[model] stream retry: provider=%s attempt=%d/%d backoff=%v err=%v",

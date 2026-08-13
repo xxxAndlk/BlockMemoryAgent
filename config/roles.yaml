@@ -272,7 +272,7 @@ fixed_roles:
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
-      max_tokens: 65536  # 编码 Agent 单次 WriteFile 可能产出大文件（game.js/renderer.js），64K 防截断
+      max_tokens: 32768  # 软偏好：超端点硬上限时 provider 自动钳制并重试（2026-08-13 实证 ark /api/coding 对 kimi 系硬限 32768，配 65536 全 400）；截断风险由跨轮续写（maxContinueRounds）兜底
       # 历史注：glm-5.2(thinking) 编码单轮分钟级曾拖慢全链路；k3(非推理) 单轮 ~1min。
       # 现值 deepseek-v4-flash 经 openai-chat 原生端点，前缀缓存命中省计费省延迟。
     can_be_called: true

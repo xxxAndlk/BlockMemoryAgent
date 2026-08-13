@@ -40,14 +40,20 @@ func (m Model) singleColumnView() string {
 		mainRow = m.renderChat(m.width, contentH)
 	}
 
-	// 垂直拼接：顶栏、主内容区、Token 统计栏、输入栏、快捷键栏。
-	view := lipgloss.JoinVertical(lipgloss.Top,
+	// 垂直拼接：顶栏、主内容区、领域进度面板（有领域 Agent 时）、Token 统计栏、输入栏、快捷键栏。
+	parts := []string{
 		m.renderTopBar(m.width),
 		mainRow,
+	}
+	if flow := m.renderSubAgentFlowPanel(m.width); flow != "" {
+		parts = append(parts, flow)
+	}
+	parts = append(parts,
 		m.renderTokenBar(m.width),
 		m.renderInput(m.width),
 		m.renderShortcutBar(m.width),
 	)
+	view := lipgloss.JoinVertical(lipgloss.Top, parts...)
 
 	// 若有弹窗，则在底部追加覆盖层。
 	if m.overlayPanel.mode != overlayNone {

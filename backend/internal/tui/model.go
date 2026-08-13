@@ -741,7 +741,7 @@ func (m *Model) chatContentWidth() int {
 	return w
 }
 
-// mainContentHeight 返回中间主内容区高度（已扣除顶栏、Token 栏、输入栏、底部快捷键栏、弹窗占位）。
+// mainContentHeight 返回中间主内容区高度（已扣除顶栏、领域进度面板、Token 栏、输入栏、底部快捷键栏、弹窗占位）。
 func (m *Model) mainContentHeight() int {
 	topH := 1
 	// Token 用量栏：输入栏上方 1 行实时展示当前会话累计 token。
@@ -758,7 +758,8 @@ func (m *Model) mainContentHeight() int {
 			overlayH = 6
 		}
 	}
-	h := m.height - topH - tokenBarH - inputH - shortcutH - overlayH
+	flowH := m.subAgentFlowPanelHeight()
+	h := m.height - topH - tokenBarH - inputH - shortcutH - overlayH - flowH
 	if h < 4 {
 		h = 4
 	}

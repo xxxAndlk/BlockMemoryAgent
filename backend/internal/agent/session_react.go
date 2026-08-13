@@ -374,6 +374,12 @@ func (st *reactSessionStore) addEvent(session *reactInternalSession, eventType, 
 	st.addEventDebug(session, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError, success, "", 0, 0, 0, 0, "")
 }
 
+// addEventDetail 与 addEvent 相同但携带 detailJSON（如 {"agent_id":"..."} 实例归属），
+// 供 TUI 领域进度面板按 Agent 实例匹配事件。
+func (st *reactSessionStore) addEventDetail(session *reactInternalSession, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError string, success bool, detailJSON string) {
+	st.addEventDebug(session, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError, success, "", 0, 0, 0, 0, detailJSON)
+}
+
 // setStreamingText 更新会话当前正在流式生成的累积文本；传空串表示流式结束。
 func (st *reactSessionStore) setStreamingText(session *reactInternalSession, text string) {
 	st.mu.Lock()

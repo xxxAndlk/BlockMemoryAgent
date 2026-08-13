@@ -130,7 +130,8 @@ const (
 // 由 WithLiveEvents 注册的回调接收，供会话层写入事件流/流式状态以驱动 UI 实时渲染。
 type LiveEvent struct {
 	Kind    string // Kind 事件种类（LiveEventLLMDelta / LiveEventToolCall / LiveEventToolExec）
-	Agent   string // Agent 产生事件的 Agent 标识（emit 时自动填充）
+	Agent   string // Agent 产生事件的展示名（emit 时自动填充 role.Name）
+	AgentID string // AgentID 产生事件的 Agent 实例 ID（emit 时自动填充；MetaAgent=session ID，子 Agent=session-1/code_assistant-5）
 	Text    string // Text 仅 llm_delta 使用：截至当前的累积文本
 	Tool    string // Tool 工具名（tool_call / tool_exec 使用）
 	Input   string // Input 工具入参 JSON（tool_call 使用）

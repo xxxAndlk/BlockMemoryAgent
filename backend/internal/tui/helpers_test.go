@@ -448,3 +448,71 @@ func TestEventChatItemSystemPauseShown(t *testing.T) {
 		t.Fatal("会话启动事件不应展示")
 	}
 }
+
+// TestSanitizeToolText 验证工具输出净化：剥离 ANSI，CRLF 与孤立 \r 归一为 \n。
+func TestSanitizeToolText(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"a\r\nb\r\nc", "a\nb\nc"},                          // CRLF 文件内容
+		{"进度 10%\r进度 20%", "进度 10%\n进度 20%"},            // 命令进度条（孤立 \r）
+		{"\x1b[31m红色\x1b[0m 文本", "红色 文本"},              // ANSI 剥离
+		{"a\r\n\x1b[1mb\r\n", "a\nb\n"},                     // 混合
+		{"普通文本\n无变化", "普通文本\n无变化"},                  // 无 \r 原样
+	}
+	for _, c := range cases {
+		if got := sanitizeToolText(c.in); got != c.want {
+			t.Fatalf("sanitizeToolText(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestEventChatItem_SanitizeCRLF 验证工具输出中的 \r 不会进入对话条目（乱码修复）。
+func TestEventChatItem_SanitizeCRLF(t *testing.T) {
+	ev := server.SessionEvent{
+		Type:       "tool_exec",
+		Tool:       "WriteFile",
+		ToolPath:   "f.txt",
+		ToolOutput: "第 1 行\r\n第 2 行\r\n",
+		Success:    true,
+		Timestamp:  time.Now(),
+	}
+	_, detail, rawDetail, ok := eventChatItem(ev, true)
+	if !ok {
+		t.Fatal("WriteFile 事件应被展示")
+	}
+	if strings.Contains(detail, "\r") || strings.Contains(rawDetail, "\r") {
+		t.Fatalf("工具输出不应含 \r，detail=%q rawDetail=%q", detail, rawDetail)
+	}
+	if !strings.Contains(rawDetail, "第 1 行\n第 2 行") {
+		t.Fatalf("CRLF 应归一为 \n，got %q", rawDetail)
+	}
+}
+
+// TestChatItemsResolved_LLMResultNameMapping 验证 llm_result 事件的 "SubAgent"
+// 会被 resolver 映射为 Agent 树中的展示名；nil resolver 保持原样。
+func TestChatItemsResolved_LLMResultNameMapping(t *testing.T) {
+	s := &server.Session{
+		Events: []server.SessionEvent{
+			{Type: "progress", Kind: "llm_result", Agent: "SubAgent", Tool: "session-1/domain-3",
+				Message: "游戏渲染完成", Timestamp: time.Now()},
+		},
+	}
+	resolver := func(childID string) string {
+		if childID == "session-1/domain-3" {
+			return "游戏渲染领域"
+		}
+		return ""
+	}
+	items := chatItemsResolved(s, true, resolver)
+	if len(items) != 1 || !strings.HasPrefix(items[0].title, "游戏渲染领域: ") {
+		t.Fatalf("resolver 命中时应显示展示名，got %+v", titlesOf(items))
+	}
+	itemsNil := chatItems(s, true)
+	if len(itemsNil) != 1 || !strings.HasPrefix(itemsNil[0].title, "SubAgent: ") {
+		t.Fatalf("nil resolver 应保持 Agent 原字段，got %+v", titlesOf(itemsNil))
+	}
+	// resolver 未命中（返回空）时保持 "SubAgent"。
+	itemsMiss := chatItemsResolved(s, true, func(string) string { return "" })
+	if !strings.HasPrefix(itemsMiss[0].title, "SubAgent: ") {
+		t.Fatalf("resolver 未命中应回退 SubAgent，got %+v", titlesOf(itemsMiss))
+	}
+}

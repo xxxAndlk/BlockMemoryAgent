@@ -282,6 +282,9 @@ func (a *ReActAgent) emitLive(ev LiveEvent) {
 	// 用 role.Name 作展示名（"MetaAgent"/"代码助手"），避免 MetaAgent 的 a.name=session-ID
 	// 让日志全显 "session-1"。mailbox 路由仍用 a.name，与此处无关。
 	ev.Agent = a.role.Name
+	// AgentID 填实例 ID（MetaAgent=session ID，子 Agent=session-1/code_assistant-5），
+	// 供会话层把 think/tool 事件归属到具体 Agent 实例（TUI 领域进度面板按此匹配）。
+	ev.AgentID = a.name
 	a.liveFn(ev)
 }
 

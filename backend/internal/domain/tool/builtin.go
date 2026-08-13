@@ -205,7 +205,8 @@ func (e *Executor) readFile(args map[string]any) *Result {
 	var b strings.Builder
 	actualEnd := offset - 1
 	for i := offset - 1; i < end; i++ {
-		line := fmt.Sprintf("%6d\t%s\n", i+1, lines[i])
+		// CRLF 文件每行尾部残留 \r：进入 TUI/日志后被终端当作回车导致同行覆盖乱码，先剥离。
+		line := fmt.Sprintf("%6d\t%s\n", i+1, strings.TrimSuffix(lines[i], "\r"))
 		// 至少保留第一行，避免 maxChars 极小时返回空内容。
 		if b.Len()+len(line) > maxChars && actualEnd >= offset {
 			break

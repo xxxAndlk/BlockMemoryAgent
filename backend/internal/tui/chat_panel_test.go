@@ -27,7 +27,7 @@ func TestCollectItemsCapsHistory(t *testing.T) {
 	}
 
 	cp := NewChatPanel()
-	items := cp.collectItems(s)
+	items := cp.collectItems(s, nil)
 
 	// 超过上限：保留最近 maxChatItems 条 + 顶部 1 条省略提示。
 	if len(items) != maxChatItems+1 {
@@ -58,7 +58,7 @@ func TestCollectItemsBelowCapKeepsAll(t *testing.T) {
 	}
 
 	cp := NewChatPanel()
-	items := cp.collectItems(s)
+	items := cp.collectItems(s, nil)
 
 	if len(items) != 5 {
 		t.Fatalf("未超上限时应全部保留，got %d", len(items))

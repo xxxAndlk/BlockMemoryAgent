@@ -1246,9 +1246,11 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 
 	// 只要不是 Error 类型事件，就视为成功。
 	success := ev.Kind != eventkind.Error
+	// 实例归属写入 DetailJSON，供 TUI 领域进度面板按 agent_id 匹配事件到 Agent 实例。
+	detailJSON := agentIDJSON(agentID)
 	// 工具调用事件：直接记录工具执行事件。
 	if ev.Kind == "tool_call" || ev.Kind == eventkind.ToolCall {
-		s.store.addEvent(session, eventkind.ToolExec, agentName, ev.Message, ev.Kind, ev.Tool, toolArgsLabel(ev.Detail), "", "", success)
+		s.store.addEventDetail(session, eventkind.ToolExec, agentName, ev.Message, ev.Kind, ev.Tool, toolArgsLabel(ev.Detail), "", "", success, detailJSON)
 		return
 	}
 	// 工具结果事件：尝试解析 Detail 中的 output、error 与 path 字段。
@@ -1281,11 +1283,11 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 			}
 			msg = fmt.Sprintf("%s [FAIL]%s err=%s", ev.Message, extra, toolErr)
 		}
-		s.store.addEvent(session, eventkind.ToolExec, agentName, msg, ev.Kind, ev.Tool, toolPath, output, toolErr, success)
+		s.store.addEventDetail(session, eventkind.ToolExec, agentName, msg, ev.Kind, ev.Tool, toolPath, output, toolErr, success, detailJSON)
 		return
 	}
 	// 其他类型事件作为进度事件记录。
-	s.store.addEvent(session, eventkind.Progress, agentName, ev.Message, ev.Kind, ev.Tool, "", "", "", success)
+	s.store.addEventDetail(session, eventkind.Progress, agentName, ev.Message, ev.Kind, ev.Tool, "", "", "", success, detailJSON)
 }
 
 // toolArgsLabel 从工具调用参数 JSON 中提取一个简短的展示标签（路径/命令/URL 等），
@@ -1535,18 +1537,56 @@ func (s *ReactService) finalizeSession(session *reactInternalSession) {
 	s.store.evictCompletedSessions()
 }
 
+// finalizeThinking 把累积的思考过程（session.ThinkingText）落为会话 think 事件并清空。
+// 调用时机：答复文本开始输出（LiveEventLLMDelta）或工具调用开始（LiveEventToolCall），
+// 即一次 LLM 轮次的思考阶段结束。思考不再只是瞬时展示，而是保留在事件流中，
+// 让 TUI/Web 能回看每个 Agent 每轮的推理（>500 事件时被 trimDebugEvents 头部裁剪，量有界）。
+func (s *ReactService) finalizeThinking(session *reactInternalSession, ev LiveEvent) {
+	if session == nil || strings.TrimSpace(session.ThinkingText) == "" {
+		return
+	}
+	text := session.ThinkingText
+	// 子 Agent 的思考文本经 ForwardLiveEvent 加过【展示名】前缀，落事件时剥掉，
+	// 事件本身已带 Agent 归属，避免前缀污染 Web 思考链与 TUI 展示。
+	if ev.Agent != "" {
+		text = strings.TrimPrefix(text, "【"+ev.Agent+"】\n")
+	}
+	text = textutil.TruncateRunes(strings.TrimSpace(text), 500, "…")
+	if text == "" {
+		s.store.setThinkingText(session, "")
+		return
+	}
+	s.store.addEventDetail(session, eventkind.Think, ev.Agent, text, eventkind.Think, "", "", "", "", true, agentIDJSON(ev.AgentID))
+	s.store.setThinkingText(session, "")
+}
+
+// agentIDJSON 把 Agent 实例 ID 编码为事件的 DetailJSON（{"agent_id":"..."}），
+// 供 TUI 领域进度面板按实例匹配事件；空 ID 返回空串。
+func agentIDJSON(agentID string) string {
+	if agentID == "" {
+		return ""
+	}
+	b, err := json.Marshal(map[string]string{"agent_id": agentID})
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // handleLiveEvent 把 ReAct 运行中的实时进度事件写入会话：
 // LLM/思考流式增量原位更新对应文本字段（不产生事件记录，避免事件流/数据库被 token 级事件淹没）；
 // 工具调用/执行完成与子 Agent 完成追加为会话事件（少量且有审计价值，随 persistEvents 持久化）。
 func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEvent) {
 	switch ev.Kind {
 	case LiveEventLLMDelta:
-		// 答复文本开始输出时，思考阶段结束，清空瞬时思考展示。
-		s.store.setThinkingText(session, "")
+		// 答复文本开始输出时，思考阶段结束：先落 think 事件，再清空瞬时思考展示。
+		s.finalizeThinking(session, ev)
 		s.store.setStreamingText(session, ev.Text)
 	case LiveEventThinkDelta:
 		s.store.setThinkingText(session, ev.Text)
 	case LiveEventToolCall:
+		// 工具调用开始同样意味着思考阶段结束（思考型模型常见 think→tool 而非 think→text）。
+		s.finalizeThinking(session, ev)
 		// call_sub_agent 是子 Agent 派发：记录专用派发事件（角色 ID 与任务摘要），
 		// 供 TUI 对话区展示阶段标记、编排面板派生子 Agent 节点。
 		if ev.Tool == "call_sub_agent" {
@@ -1563,6 +1603,11 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, "", "", ev.Tool, strings.TrimSpace(ev.Output), ev.Output, ev.Error, ev.Success)
 	case LiveEventSubAgentDone:
 		s.store.addEvent(session, eventkind.Message, "SubAgent", ev.Tool, "sub_agent_done", "", "", "", "", true)
+		// 子 Agent 结果摘要（react_agent 侧已截断 200 runes）落 llm_result 事件，
+		// 让 TUI/Web 直接看到领域 Agent 的关键产出；Tool 承载子 Agent ID 供 TUI 映射展示名。
+		if strings.TrimSpace(ev.Text) != "" {
+			s.store.addEventDetail(session, eventkind.Progress, "SubAgent", ev.Text, eventkind.LLMResult, ev.Tool, "", "", "", true, agentIDJSON(ev.Tool))
+		}
 	case LiveEventTokenUsage:
 		// 单次 LLM 调用 token 用量：记为 token_usage 调试事件，供前端实时累加展示。
 		// 消息格式 in=<n> out=<n> cache_hit=<n> cache_miss=<n> 与 textutil.ParseTokenUsage

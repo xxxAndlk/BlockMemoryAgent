@@ -278,3 +278,109 @@ func TestIsNonRetryableErr(t *testing.T) {
 		t.Error("nil error 应判定为可重试（false）")
 	}
 }
+
+// clampFakeProvider 在 fakeProvider 基础上实现 maxTokensClamper：
+// ClampMaxTokensOnError 恒返回 true（模拟 max_tokens 超限已钳制），
+// NewStreaming 前 streamFails 次产出错误流，之后产出成功流。
+type clampFakeProvider struct {
+	fakeProvider
+	clamped     bool
+	streamFails int
+}
+
+// ClampMaxTokensOnError 记录调用并声称修复成功。
+func (p *clampFakeProvider) ClampMaxTokensOnError(err error) bool {
+	p.clamped = true
+	return true
+}
+
+// NewStreaming 可编程流：前 streamFails 次产出 400 错误，之后产出成功响应。
+func (p *clampFakeProvider) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
+	return func(yield func(*blades.ModelResponse, error) bool) {
+		if p.streamFails > 0 {
+			p.streamFails--
+			yield(nil, errors.New(`POST "https://ark.cn-beijing.volces.com/api/coding/v1/messages": 400 Bad Request {"error":{"code":"InvalidParameter","message":"The parameter `+"`max_tokens`"+` specified in the request is not valid: integer above maximum value, expected a value <= 32768, but got 65536 instead."}}`))
+			return
+		}
+		yield(&blades.ModelResponse{Message: blades.AssistantMessage("ok")}, nil)
+	}
+}
+
+// TestRetryProvider_MaxTokensClampRetried 验证 4xx 中 max_tokens 超限被 provider 自愈后
+// 继续重试而非快速失败（2026-08-13 代码助手 65536>32768 全挂的根因场景）。
+func TestRetryProvider_MaxTokensClampRetried(t *testing.T) {
+	inner := &clampFakeProvider{fakeProvider: fakeProvider{
+		name: "fake",
+		errors: []error{
+			errors.New(`POST "https://ark.cn-beijing.volces.com/api/coding/v1/messages": 400 Bad Request {"error":{"code":"InvalidParameter","message":"The parameter ` + "`max_tokens`" + ` specified in the request is not valid: integer above maximum value, expected a value <= 32768, but got 65536 instead."}}`),
+			nil,
+		},
+		responses: []*blades.ModelResponse{
+			nil,
+			{Message: blades.AssistantMessage("ok")},
+		},
+	}}
+	orig := providerRetryInitialBackoff
+	providerRetryInitialBackoff = time.Millisecond
+	defer func() { providerRetryInitialBackoff = orig }()
+
+	p := &retryProvider{inner: inner, name: "fake"}
+	resp, err := p.Generate(context.Background(), &blades.ModelRequest{})
+	if err != nil {
+		t.Fatalf("钳制后重试应成功，got err: %v", err)
+	}
+	if resp == nil || resp.Message == nil {
+		t.Fatal("expected non-nil response")
+	}
+	if !inner.clamped {
+		t.Fatal("应调用 ClampMaxTokensOnError 自愈")
+	}
+	if inner.calls != 2 {
+		t.Fatalf("钳制后应重试一次成功，got %d calls", inner.calls)
+	}
+}
+
+// TestRetryProvider_MaxTokensClampStreaming 验证流式路径同样自愈：
+// 首错（未产出增量）时钳制并重试，成功后正常产出增量。
+func TestRetryProvider_MaxTokensClampStreaming(t *testing.T) {
+	inner := &clampFakeProvider{fakeProvider: fakeProvider{name: "fake"}, streamFails: 1}
+	orig := providerRetryInitialBackoff
+	providerRetryInitialBackoff = time.Millisecond
+	defer func() { providerRetryInitialBackoff = orig }()
+
+	p := &retryProvider{inner: inner, name: "fake"}
+	got := 0
+	for resp, err := range p.NewStreaming(context.Background(), &blades.ModelRequest{}) {
+		if err != nil {
+			t.Fatalf("钳制后流式重试应成功，got err: %v", err)
+		}
+		if resp != nil && resp.Message != nil {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Fatalf("应产出 1 个成功响应，got %d", got)
+	}
+	if !inner.clamped {
+		t.Fatal("应调用 ClampMaxTokensOnError 自愈")
+	}
+}
+
+// TestRetryProvider_ClientErrorWithoutClampNotRetried 验证未实现自愈接口的 provider
+// 保持原有 4xx 快速失败行为不变。
+func TestRetryProvider_ClientErrorWithoutClampNotRetried(t *testing.T) {
+	inner := &fakeProvider{
+		name: "fake",
+		errors: []error{
+			errors.New(`POST "https://ark.cn-beijing.volces.com/api/coding/v1/messages": 400 Bad Request {"error":{"code":"InvalidParameter","message":"The parameter ` + "`max_tokens`" + ` specified in the request is not valid: integer above maximum value, expected a value <= 32768, but got 65536 instead."}}`),
+		},
+	}
+	p := &retryProvider{inner: inner, name: "fake"}
+	_, err := p.Generate(context.Background(), &blades.ModelRequest{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if inner.calls != 1 {
+		t.Fatalf("无自愈能力时应快速失败不重试，got %d calls", inner.calls)
+	}
+}

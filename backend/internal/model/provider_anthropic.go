@@ -4,7 +4,11 @@ import (
 	"context"       // 上下文传递
 	"encoding/json" // JSON 序列化
 	"fmt"           // 错误格式化
+	"log"           // 钳制日志
+	"regexp"        // max_tokens 上限值提取
+	"strconv"       // 上限值解析
 	"strings"       // 字符串拼接
+	"sync/atomic"   // maxTokens 并发安全（多子 Agent 共享 provider 实例）
 
 	"github.com/anthropics/anthropic-sdk-go"         // Anthropic Go SDK
 	"github.com/anthropics/anthropic-sdk-go/option"  // Anthropic 客户端选项
@@ -18,7 +22,7 @@ import (
 type anthropicProvider struct {
 	client      anthropic.Client // Anthropic SDK 客户端
 	modelName   string           // 模型名称
-	maxTokens   int64            // 最大输出 token 数
+	maxTokens   atomic.Int64     // 最大输出 token 数（运行期可被端点上限钳制，需并发安全）
 	temperature float64          // 采样温度
 	baseURL     string           // .env 配置的完整端点（实际请求 URL）
 }
@@ -43,20 +47,57 @@ func newAnthropicProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 	}
 
 	// 创建 Anthropic 客户端并封装为 provider
-	return &anthropicProvider{
+	p := &anthropicProvider{
 		client: anthropic.NewClient(
 			option.WithAPIKey(cfg.APIKey),
 			option.WithBaseURL(baseURL),
 		),
 		modelName:   cfg.Model,
-		maxTokens:   maxTokens,
 		temperature: cfg.Temperature,
 		baseURL:     baseURL,
 	}
+	p.maxTokens.Store(maxTokens)
+	return p
 }
 
 // Name 返回 provider 使用的模型名称。
 func (p *anthropicProvider) Name() string { return p.modelName }
+
+// maxTokensLimitRe 匹配端点 max_tokens 超限错误中声明的上限值：
+//   - ark/火山: "expected a value <= 32768, but got 65536 instead"
+//   - OpenAI 系: "must be less than or equal to 32768"
+var maxTokensLimitRe = regexp.MustCompile(`(?:<=|less than or equal to)\s*(\d+)`)
+
+// ClampMaxTokensOnError 检测 max_tokens 超限错误并把 p.maxTokens 钳制到端点声明的上限，
+// 返回是否已钳制（调用方据此安全重试一次）。满足 retryProvider 的 maxTokensClamper 接口。
+//
+// 2026-08-13 实证：ark /api/coding 对 kimi 系模型硬上限 32768，roles.yaml 配 65536 导致
+// 代码助手全部调用 400 InvalidParameter、重派全挂；此前只能人手调配置，新用户直接踩死。
+// 钳制后 max_tokens 配置退化为软偏好，超限自动对齐端点能力。
+func (p *anthropicProvider) ClampMaxTokensOnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "max_tokens") {
+		return false
+	}
+	m := maxTokensLimitRe.FindStringSubmatch(msg)
+	if len(m) < 2 {
+		return false
+	}
+	limit, perr := strconv.ParseInt(m[1], 10, 64)
+	if perr != nil || limit <= 0 {
+		return false
+	}
+	old := p.maxTokens.Load()
+	if old <= limit {
+		return false
+	}
+	p.maxTokens.Store(limit)
+	log.Printf("[model] clamp max_tokens %d -> %d (endpoint limit, model=%s)", old, limit, p.modelName)
+	return true
+}
 
 // maxContinueRounds 限制 stop_reason=max_tokens 时的自动续写轮数上限。
 // 每轮允许 maxTokens 输出；8 轮 = 8*maxTokens 总输出（128K 时即 1M），覆盖任意单次响应需求。
@@ -95,7 +136,7 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 	for round := 0; round < maxContinueRounds; round++ {
 		params := anthropic.MessageNewParams{
 			Model:       anthropic.Model(p.modelName),
-			MaxTokens:   p.maxTokens,
+			MaxTokens:   p.maxTokens.Load(),
 			Messages:    messages,
 			System:      system,
 			Tools:       tools,
@@ -232,7 +273,7 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 			// 构造与 Generate 一致的请求参数
 			params := anthropic.MessageNewParams{
 				Model:       anthropic.Model(p.modelName),
-				MaxTokens:   p.maxTokens,
+				MaxTokens:   p.maxTokens.Load(),
 				Messages:    messages,
 				System:      system,
 				Tools:       tools,

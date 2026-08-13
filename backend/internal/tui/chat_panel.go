@@ -350,14 +350,17 @@ func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Sessio
 // maxChatItems 是主对话区最多展示的条目数。长会话会产生数百条工具事件，
 // 全部加载会让用户滚动时陷入历史记录、找不到最新内容；更早的记录不进对话区，
 // 需要翻阅时通过 Ctrl+L 完整记录面板查看全部输出。
-const maxChatItems = 50
+// 100（原 50）：think/子 Agent 摘要事件加入后条目增长更快，窗口过小会把
+// Agent 的关键输出与思考分析顶出可视区（用户反馈"只看到工具结果"）。
+const maxChatItems = 100
 
 // collectItems 收集当前应展示的全部 chatItem，包含本地预展示的首条用户消息兜底。
 // 仅保留最近 maxChatItems 条，更早的条目以一条省略提示代替。
-func (cp *ChatPanel) collectItems(s *server.Session) []chatItem {
+// resolver 为子 Agent 实例 ID → 展示名映射（llm_result 事件归属展示用），可为 nil。
+func (cp *ChatPanel) collectItems(s *server.Session, resolver func(childID string) string) []chatItem {
 	var items []chatItem
 	if s != nil {
-		items = chatItems(s, true)
+		items = chatItemsResolved(s, true, resolver)
 	}
 	// 若存在本地预展示消息，且服务端 items 中尚未包含该内容，则追加一条本地 item。
 	if cp.pendingFirstMessage != "" {
@@ -575,7 +578,7 @@ func renderWelcomeInfo(styles *Styles, w int, modelName, workDir string) string 
 
 // collectChatItems 返回当前选中会话应展示的 chatItem 列表。
 func (m *Model) collectChatItems() []chatItem {
-	return m.chatPanel.collectItems(m.selectedSession())
+	return m.chatPanel.collectItems(m.selectedSession(), m.subAgentNameResolver())
 }
 
 // rebuildChatContent 重建当前会话的对话内容。
