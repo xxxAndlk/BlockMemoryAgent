@@ -1427,28 +1427,48 @@ func TestDispatch_ModeValidation(t *testing.T) {
 	}
 }
 
-// TestValidateDispatchArgs_TaskSoftLanding task 超长软着陆（TODO #38-3）：
-// <=2000 runes 干净放行；2000-2600 轻微超限放行并附压缩警告（不再硬拒白烧 MetaAgent 往返）；
-// >2600 仍硬拒绝（全量规格转贴区间）。
+// TestValidateDispatchArgs_TaskSoftLanding task 超长软着陆（TODO #38-3；上限放开 3000/4000 见 TODO #35）：
+// <=3000 runes 干净放行；3000-4000 轻微超限放行并附压缩警告（不再硬拒白烧 MetaAgent 往返）；
+// >4000 仍硬拒绝（全量规格转贴区间）。
 func TestValidateDispatchArgs_TaskSoftLanding(t *testing.T) {
-	ok := strings.Repeat("字", 2000)
-	if msg, warning := validateDispatchArgs("code_assistant", ok, "", ""); msg != "" || warning != "" {
-		t.Fatalf("<=2000 should pass clean: msg=%q warning=%q", msg, warning)
+	d := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{})
+	ok := strings.Repeat("字", 3000)
+	if msg, warning := d.validateDispatchArgs("code_assistant", ok, "", ""); msg != "" || warning != "" {
+		t.Fatalf("<=3000 should pass clean: msg=%q warning=%q", msg, warning)
 	}
-	soft := strings.Repeat("字", 2100)
-	msg, warning := validateDispatchArgs("code_assistant", soft, "", "")
+	soft := strings.Repeat("字", 3100)
+	msg, warning := d.validateDispatchArgs("code_assistant", soft, "", "")
 	if msg != "" || warning == "" || !strings.Contains(warning, "放行") {
-		t.Fatalf("2000-2600 should soft-land with warning: msg=%q warning=%q", msg, warning)
+		t.Fatalf("3000-4000 should soft-land with warning: msg=%q warning=%q", msg, warning)
 	}
-	hard := strings.Repeat("字", 3000)
-	msg, warning = validateDispatchArgs("code_assistant", hard, "", "")
+	hard := strings.Repeat("字", 4100)
+	msg, warning = d.validateDispatchArgs("code_assistant", hard, "", "")
 	if msg == "" || !strings.Contains(msg, "task too long") || warning != "" {
-		t.Fatalf(">2600 should hard reject: msg=%q warning=%q", msg, warning)
+		t.Fatalf(">4000 should hard reject: msg=%q warning=%q", msg, warning)
+	}
+}
+
+// TestValidateDispatchArgs_TaskRuneLimitsOverride WithTaskRuneLimits 覆盖默认档位（TODO #35）。
+func TestValidateDispatchArgs_TaskRuneLimitsOverride(t *testing.T) {
+	d := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{}).WithTaskRuneLimits(1000, 1500)
+	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1000), "", ""); msg != "" {
+		t.Fatalf("<=soft should pass: %q", msg)
+	}
+	if _, warning := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1200), "", ""); warning == "" {
+		t.Fatal("soft-hard range should soft-land with warning")
+	}
+	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1600), "", ""); msg == "" {
+		t.Fatal(">hard should reject")
+	}
+	// 0 值参数回落默认，不改档。
+	d2 := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{}).WithTaskRuneLimits(0, 0)
+	if msg, _ := d2.validateDispatchArgs("code_assistant", strings.Repeat("字", 3000), "", ""); msg != "" {
+		t.Fatalf("zero values should keep defaults: %q", msg)
 	}
 }
 
 // TestCallSubAgent_TaskSoftLandingSuccess 软着陆穿透到工具结果：
-// 2100 runes 派发成功且 Output 含压缩警告；3000 runes 校验拒绝（Category=validation_rejected）。
+// 3100 runes 派发成功且 Output 含压缩警告；4100 runes 校验拒绝（Category=validation_rejected）。
 func TestCallSubAgent_TaskSoftLandingSuccess(t *testing.T) {
 	cfg := &config.RoleConfigFile{
 		MetaAgent:    config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
@@ -1462,25 +1482,25 @@ func TestCallSubAgent_TaskSoftLandingSuccess(t *testing.T) {
 	d.RegisterCallTool(toolsReg)
 	ctx := agent.WithAgentID(context.Background(), "meta")
 
-	// 2100 runes：软着陆——派发成功，Output 附警告。
+	// 3100 runes：软着陆——派发成功，Output 附警告。
 	res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
 		"role_id": "code_assistant",
-		"task":    strings.Repeat("字", 2100),
+		"task":    strings.Repeat("字", 3100),
 	})
 	if err != nil || !res.Success {
-		t.Fatalf("2100-rune task should dispatch with warning: success=%v err=%v error=%q", res.Success, err, res.Error)
+		t.Fatalf("3100-rune task should dispatch with warning: success=%v err=%v error=%q", res.Success, err, res.Error)
 	}
 	if !strings.Contains(res.Output, "警告") {
 		t.Fatalf("soft-landed dispatch output should carry warning, got: %q", res.Output)
 	}
 
-	// 3000 runes：硬拒。
+	// 4100 runes：硬拒。
 	res2, err2 := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
 		"role_id": "code_assistant",
-		"task":    strings.Repeat("字", 3000),
+		"task":    strings.Repeat("字", 4100),
 	})
 	if res2.Success || err2 != nil {
-		t.Fatalf("3000-rune task should be rejected: success=%v err=%v", res2.Success, err2)
+		t.Fatalf("4100-rune task should be rejected: success=%v err=%v", res2.Success, err2)
 	}
 	if !strings.Contains(res2.Error, "task too long") || res2.Category != tool.ResultCategoryValidationRejected {
 		t.Fatalf("expected validation rejection with task too long, got: %q category=%q", res2.Error, res2.Category)

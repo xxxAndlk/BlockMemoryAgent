@@ -157,6 +157,12 @@ type AgentConfig struct {
 	// 修复期"读报错位置->改->复验"循环需要精读，禁读逼盲改回归震荡；写后放开精读。
 	// 默认 40：仍设上限防"逐文件通读"式发散，由连读循环守卫与 token 预算兜底。
 	ExploreBudgetPostWrite int `yaml:"explore_budget_post_write"`
+	// TaskMaxRunes 派发 task 文本软上限（rune 计数，TODO #35 放开预算）。
+	// 超软限未达硬限放行附压缩警告（软着陆），超硬限拒绝。默认 3000（原 2000 实证过紧，
+	// 强模型+大上下文时代转贴代价低，放开容纳完整自包含描述）。
+	TaskMaxRunes int `yaml:"task_max_runes"`
+	// TaskMaxRunesHard 派发 task 文本硬上限。默认 4000（原 2600）：仍拦截全量规格转贴。
+	TaskMaxRunesHard int `yaml:"task_max_runes_hard"`
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -445,6 +451,12 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.ExploreBudgetPostWrite == 0 {
 		c.Agent.ExploreBudgetPostWrite = 40
+	}
+	if c.Agent.TaskMaxRunes == 0 {
+		c.Agent.TaskMaxRunes = 3000
+	}
+	if c.Agent.TaskMaxRunesHard == 0 {
+		c.Agent.TaskMaxRunesHard = 4000
 	}
 }
 

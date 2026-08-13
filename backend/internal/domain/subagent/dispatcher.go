@@ -156,8 +156,13 @@ type Dispatcher struct {
 
 	// timeout 是子 Agent 独立执行的最大时长；<=0 表示不限制。默认 30 分钟。
 	timeout time.Duration
+	// taskRuneSoftLimit / taskRuneHardLimit 是派发 task 文本长度双档上限（TODO #35 放开预算）。
+	// 超软上限但未达硬上限：放行并附压缩警告（软着陆）；超硬上限：拒绝（全量规格转贴区间）。
+	// 默认 3000/4000（原 2000/2600 实证过紧，强模型吃大上下文后转贴代价低），bootstrap 按配置覆盖。
+	taskRuneSoftLimit int
+	taskRuneHardLimit int
 	// loopCfgByRole 按角色返回 ReAct 主循环配置:不同角色 token 预算分级
-	// (domain 50K 暂停可恢复 / 叶子助手 20K 部分回灌 / meta 0 不限制)。
+	// (config.yaml token_budget_per_role，resume 重置，超限暂停可恢复)。
 	// 为 nil 时用 agent.NopLoopConfig 兜底(测试场景)。
 	loopCfgByRole func(string) agent.LoopConfig
 	// searcher 可选的块记忆检索器；为 nil 时跳过拆分任务的块记忆召回。
@@ -568,14 +573,16 @@ func NewDispatcher(
 ) *Dispatcher {
 	// 构造 Dispatcher 实例，将依赖注入到对应字段。
 	return &Dispatcher{
-		registry:       registry,
-		models:         models,
-		tools:          tools,
-		mailbox:        mailbox,
-		memory:         memory,
-		timeout:        30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
-		salvageTimeout: 30 * time.Second, // 默认 30s，可用 WithSalvageTimeout 覆盖（TODO #33）
-		softStops:      make(map[string]bool),
+		registry:          registry,
+		models:            models,
+		tools:             tools,
+		mailbox:           mailbox,
+		memory:            memory,
+		timeout:           30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
+		salvageTimeout:    30 * time.Second, // 默认 30s，可用 WithSalvageTimeout 覆盖（TODO #33）
+		taskRuneSoftLimit: 3000,             // task 文本软上限（TODO #35），WithTaskRuneLimits 覆盖
+		taskRuneHardLimit: 4000,
+		softStops:         make(map[string]bool),
 	}
 }
 
@@ -607,6 +614,19 @@ func (d *Dispatcher) isSoftStop(sessionID string) bool {
 // WithTimeout 配置子 Agent 独立执行的最大时长；<=0 表示不限制（仅防挂起的保底由调用方负责）。
 func (d *Dispatcher) WithTimeout(t time.Duration) *Dispatcher {
 	d.timeout = t
+	return d
+}
+
+// WithTaskRuneLimits 配置派发 task 文本双档上限（TODO #35 放开预算）：
+// 超 soft 未达 hard 软着陆放行附警告，超 hard 硬拒。<=0 按默认 3000/4000。
+// bootstrap 按 cfg.Agent.TaskMaxRunes / TaskMaxRunesHard 注入。
+func (d *Dispatcher) WithTaskRuneLimits(soft, hard int) *Dispatcher {
+	if soft > 0 {
+		d.taskRuneSoftLimit = soft
+	}
+	if hard > 0 {
+		d.taskRuneHardLimit = hard
+	}
 	return d
 }
 
@@ -965,8 +985,9 @@ func (t *callSubAgentTool) Description() string {
 	}
 	return "将子任务派发给指定角色的子 Agent 异步执行。调用立即返回 sub_agent_id；" +
 		"子 Agent 完成后，其结果摘要会以 [mailbox from <sub_agent_id>] 消息送达，请在后续轮次中阅读并整合。\n" +
-		"task 必须自包含 <= 2000 字（按 rune 计数，含中文字符）：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。" +
-		"规格原文走 WriteSharedMemory，不塞进 task。超长 task 将被拒绝，错误提示\"task too long\"（2000-2600 字轻微超限会放行但附压缩警告，>2600 字硬拒）。\n\n" +
+		fmt.Sprintf("task 必须自包含 <= %d 字（按 rune 计数，含中文字符）：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。", t.dispatcher.taskRuneSoftLimit) +
+		"规格原文走 WriteSharedMemory，不塞进 task。超长 task 将被拒绝，错误提示\"task too long\"（" +
+		fmt.Sprintf("%d-%d 字轻微超限会放行但附压缩警告，>%d 字硬拒）。\n\n", t.dispatcher.taskRuneSoftLimit, t.dispatcher.taskRuneHardLimit, t.dispatcher.taskRuneHardLimit) +
 		"【前置依赖】派发前必须先调 WriteSpec(goal, acceptance, constraints, files) 写入任务规范，否则返回错误（spec missing=未写 / spec stale=涉及文件已变更且列出失配路径 / spec invalid=缺 goal 或验收）。" +
 		"WriteSpec 与 WriteSharedMemory 是不同工具：WriteSharedMemory 写自由 KV 供子 Agent 读，" +
 		"WriteSpec 写固定 slot \"spec\" 供 dispatcher 校验并注入子 Agent 任务体前缀。两者不可互相替代。\n\n" +
@@ -988,7 +1009,7 @@ func (t *callSubAgentTool) Description() string {
 // msg 非空=硬拒绝（校验拒绝，Category=validation_rejected）；否则通过，
 // warning 非空=放行但附提示（task 轻微超限软着陆，TODO #38-3）。
 // 供 call_sub_agent 与 call_sub_agents 复用（批量工具逐项校验）。
-func validateDispatchArgs(roleID, task, responsibility, mode string) (msg, warning string) {
+func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode string) (msg, warning string) {
 	// 校验必要参数：role_id 与 task 均不能为空。
 	if roleID == "" || task == "" {
 		return "role_id and task are required", ""
@@ -999,24 +1020,21 @@ func validateDispatchArgs(roleID, task, responsibility, mode string) (msg, warni
 	if roleID == "domain" && strings.TrimSpace(responsibility) == "" {
 		return "responsibility is required when role_id=domain: 填该领域 Agent 的职责边界（<=200 字，负责哪些文件/模块、不碰哪些），会注入子 Agent 系统提示词", ""
 	}
-	// task 长度上限：强制 MetaAgent 把规格写入 WriteSharedMemory，task 只写目标+验收标准。
+	// task 长度双档上限（TODO #35 放开）：强制 MetaAgent 把规格写入 WriteSharedMemory，task 只写目标+验收。
 	// 原 500 runes 实证过紧：塔防类任务的自然派发文本 ~1200-1500 runes，每轮必触发
-	// "task too long" 拒绝-重写循环（单次运行最多 4 次拒绝，白烧 1-2 分钟路由轮次）。
-	// 放宽到 2000 runes：容纳"背景+目标+文件清单+验收"的完整自包含描述，
-	// 仍拦截 3500+ runes 的全量规格转贴（事故日志：3521/2315 runes）。
-	const maxTaskRunes = 2000
-	// 硬上限 2600（TODO #38-3）：2000-2600 轻微超限与"task 自包含（背景+目标+验收）"要求
-	// 天然冲突，硬拒白烧一整轮 MetaAgent 往返（事故实证：2070/2201 runes 被拒后
-	// 第二轮以"精确行号+实现方案"重派才成功）——软着陆放行并附压缩警告；
-	// >2600 仍硬拒（全量规格转贴区间）。
-	const maxTaskRunesHard = 2600
-	if n := utf8.RuneCountInString(task); n > maxTaskRunes {
-		if n > maxTaskRunesHard {
+	// "task too long" 拒绝-重写循环（单次运行最多 4 次拒绝，白烧 1-2 分钟路由轮次）；
+	// 2000/2600 档在强模型+大上下文时代仍偏紧，放开到 3000/4000（配置 task_max_runes 可调）。
+	// 软上限与"task 自包含（背景+目标+验收）"要求天然冲突，硬拒白烧一整轮 MetaAgent 往返——
+	// 超软限但未达硬限软着陆放行并附压缩警告；超硬限仍硬拒（全量规格转贴区间）。
+	softLimit, hardLimit := d.taskRuneSoftLimit, d.taskRuneHardLimit
+	if n := utf8.RuneCountInString(task); n > softLimit {
+		if n > hardLimit {
 			return fmt.Sprintf(
-				"task too long: %d runes (hard max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（2000 字内）",
-				n, maxTaskRunesHard), ""
+				"task too long: %d runes (hard max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（%d 字内）",
+				n, hardLimit, softLimit), ""
 		}
-		return "", fmt.Sprintf("task 已 %d runes，超出 2000 字预算但未达硬上限 %d，本次放行；下次派发请压缩至 2000 字内", n, maxTaskRunesHard)
+		return "", fmt.Sprintf("task 已 %d runes，超出 %d 字预算但未达硬上限 %d，本次放行；下次派发请压缩至 %d 字内",
+			n, softLimit, hardLimit, softLimit)
 	}
 	// mode 枚举校验（TODO #29）：空串=react（默认），非法值拒绝，防引擎拼错静默跑错模式。
 	switch mode {
@@ -1055,7 +1073,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	// mode 可选：派发执行模式（react/reflection/plan_execute），空串=react（默认）。
 	mode, _ := args["mode"].(string)
 
-	msg, warning := validateDispatchArgs(roleID, task, responsibility, mode)
+	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode)
 	if msg != "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
@@ -1235,7 +1253,7 @@ func (t *callSubAgentsTool) Description() string {
 		"共享契约已钉死集成点，领域产物互为独立文件，后写的不需要等先写的落盘" +
 		"（v6 实证：4 个建设领域分 2 波，第二波晚启动 24 分钟，交付死线直接判负）。\n" +
 		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?}，" +
-		"字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=2000 字；" +
+		fmt.Sprintf("字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=%d 字；", t.dispatcher.taskRuneSoftLimit) +
 		"mode 可选 react/reflection/plan_execute，省略=react）。\n" +
 		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
 		"否则返回 spec missing/stale 错误（stale 会列出已变更文件路径）。逐项返回派出结果：某项失败不影响其他项。"
@@ -1270,7 +1288,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.domain, _ = m["domain"].(string)
 		it.responsibility, _ = m["responsibility"].(string)
 		it.mode, _ = m["mode"].(string)
-		if msg, warning := validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode); msg != "" {
+		if msg, warning := t.dispatcher.validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode); msg != "" {
 			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
 		} else if warning != "" {
 			batchWarnings = append(batchWarnings, fmt.Sprintf("tasks[%d]: %s", i, warning))

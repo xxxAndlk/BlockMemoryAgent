@@ -267,6 +267,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// Paused domain 续跑次数上限：续跑重置 fresh budget，无上限则研磨环路永不绑定；
 	// 触顶后强制收口部分返回父 Agent（默认 1，cfg.Agent.PausedDomainMaxResumes 可调）。
 	subAgentDispatcher.WithMaxPausedResumes(cfg.Agent.PausedDomainMaxResumes)
+	// 派发 task 文本双档上限（TODO #35 放开预算）：soft 软着陆警告 / hard 硬拒。
+	subAgentDispatcher.WithTaskRuneLimits(cfg.Agent.TaskMaxRunes, cfg.Agent.TaskMaxRunesHard)
 	// 叶子助手 kind=error 失败自动重派（TODO #23）：默认 1 次，同任务同前缀重跑。
 	subAgentDispatcher.WithDispatchRetryCount(cfg.Agent.DispatchRetryCount)
 	// 派发执行模式引擎参数（TODO #29 三引擎）：reflection 自检轮数 / plan_execute 最大步数。

@@ -55,25 +55,27 @@ agent:
   session_max_wall_clock_min: 0  # 会话全局墙钟上限（分钟，TODO #25 硬止损）：从创建起超时未终止则级联取消全部子节点 + 会话置 error"超全局时限"；0=关闭（默认）
   domain_heartbeat_timeout_min: 0  # DomainAgent 心跳超时（分钟，TODO #25 防误杀版）：0=默认 2× sub_agent_heartbeat_timeout_min；等子/等回信靠后代活动冒泡保活
   ask_user_timeout_sec: 0        # ask_user 提问默认超时（秒，TODO #24 人在回路）：0=不限；>0 超时未答复工具返回"用户未答复，自行决策"。单次调用 timeout_sec 参数覆盖
-  reflection_max_rounds: 2       # 派发 mode=reflection 时自检不达标重试轮数上限（TODO #29 三引擎）：每轮 ≈ +1 次辅助 LLM 调用
-  plan_execute_max_steps: 8      # 派发 mode=plan_execute 时最大执行步数（TODO #29 三引擎）：超限强制收口终答
-  explore_budget: 20             # 叶子 Agent 探索类工具（ReadFile/ListDir/SearchInFiles/只读 RunCommand）调用次数上限；20 次 × 200 行/页覆盖 ~4000 行
-  explore_budget_domain: 16      # DomainAgent 协调者写入未开始前探索预算；原默认 8 在派发完子 Agent 后验证阶段不够用（domain-4 卡 running 4m+），抬到 16
-  explore_budget_post_write: 40  # 写入已开始后探索预算升档（修复期"读报错->改->复验"循环需精读）；禁读逼盲改回归震荡
+  reflection_max_rounds: 3       # 派发 mode=reflection 时自检不达标重试轮数上限（TODO #29 三引擎）：每轮 ≈ +1 次辅助 LLM 调用；强模型下 2 轮偏紧放开到 3
+  plan_execute_max_steps: 12     # 派发 mode=plan_execute 时最大执行步数（TODO #29 三引擎）：超限强制收口终答；多阶段复杂装配 8 步偏紧放开到 12
+  explore_budget: 60             # 叶子 Agent 探索类工具（ReadFile/ListDir/SearchInFiles/只读 RunCommand）调用次数上限；TODO #35 放开预算：20->60，60 次 × 200 行/页覆盖 ~12000 行
+  explore_budget_domain: 60      # DomainAgent 协调者写入未开始前探索预算；TODO #35 放开预算：16->60，domain 被逼"只读规格不探索"过度下放，给强模型留直接通读空间
+  explore_budget_post_write: 120 # 写入已开始后探索预算升档（修复期"读报错->改->复验"循环需精读）；TODO #35 放开预算：40->120，仍设上限防"逐文件通读"式发散（连读守卫+token 预算兜底）
+  task_max_runes: 3000           # 派发 task 文本软上限（TODO #35 放开预算）：超软限未达硬限放行附压缩警告；原 2000 偏紧逼压缩丢契约细节
+  task_max_runes_hard: 4000      # 派发 task 文本硬上限（TODO #35）：超硬限拒绝；仍拦截全量规格转贴（事故日志 3521/2315 runes 区间已上移）
   react_llm_timeout_sec: 600     # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断,改 600s 给一次调用留够跑完。配合 generate() 不在 deadline 上重试,卡死时 600s 即报错而非 4×180=12min。
-  sub_agent_timeout_min: 60      # 子 Agent 独立执行超时（分钟），负数表示不限制。预算抬至 400K 后单 domain 需跑完多文件生成，30min 易在慢推理（thinking）下超时。
+  sub_agent_timeout_min: 120     # 子 Agent 独立执行超时（分钟），负数表示不限制。TODO #35 放开预算：60->120，慢推理（thinking）下长任务不再撞超时。
   tool_output_history_max_runes: 20000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 行区间分页默认 200 行/页（read_file_max_chars 默认 16000 字符，ASCII 整页约 16000 runes），20000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取
-  token_budget_per_goal: 100000   # 单次目标累计 token 上限（input+output 之和，跨轮累加），超限暂停等用户续跑；<=0 不限制
-  token_budget_per_role:          # 按角色单 Agent token 上限（resume 重置；覆盖 token_budget_per_goal）。未列角色按默认:domain 120000 / 叶子助手 40000 / meta 200000(安全网,防不收敛死循环)。入史工具入参截断(2000 runes)后 input 增长受控，但 codegen 输出（thinking 模型含推理 token）单文件可达 15-30K；塔防级多文件任务一次交付不暂停需 domain 400K / 叶子 100K。实证 code_assistant 写 tower.js 撞 100K 截断被迫由 domain 重写返工，编码类叶子抬至 200K。实证 domain 集成走查阶段撞 400K 暂停(第二轮 23:49)，暂停=交付流程中断，抬至 600K 做安全网(摘要走 k3 后上下文收紧,正常不应触顶)。
-    domain: 600000
-    meta: 400000
-    code_assistant: 200000
-    ui_assistant: 200000
-    prompt_reviewer: 100000
-    code_reviewer: 100000
-    test_assistant: 200000   # 与编码叶子同级：自动验证闭环已下线，测试助手回归普通叶子（写测试+跑测试）
-    doc_assistant: 100000
-  paused_domain_max_resumes: 1   # 同一 Paused DomainAgent 允许的最大续跑次数。续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证 v10 基准验收领域研磨 32 轮 30 分钟不收敛）；触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工
+  token_budget_per_goal: 300000   # 单次目标累计 token 上限（input+output 之和，跨轮累加），超限暂停等用户续跑；<=0 不限制。TODO #35 放开预算：100K->300K
+  token_budget_per_role:          # 按角色单 Agent token 上限（resume 重置；覆盖 token_budget_per_goal）。未列角色按默认:domain 120000 / 叶子助手 40000 / meta 200000(安全网,防不收敛死循环)。TODO #35 放开预算（强模型+前缀缓存下暂停=交付流程中断，实证撞顶暂停零进展死锁）：domain 600K->1M / meta 400K->600K / 编码叶子 200K->400K / 轻叶子 100K->200K。
+    domain: 1000000
+    meta: 600000
+    code_assistant: 400000
+    ui_assistant: 400000
+    prompt_reviewer: 200000
+    code_reviewer: 200000
+    test_assistant: 400000   # 与编码叶子同级：自动验证闭环已下线，测试助手回归普通叶子（写测试+跑测试）
+    doc_assistant: 200000
+  paused_domain_max_resumes: 2   # 同一 Paused DomainAgent 允许的最大续跑次数。续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证 v10 基准验收领域研磨 32 轮 30 分钟不收敛）；触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工。TODO #35 放开：1->2 多给一次续跑机会
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
 
   # -- DAG / 会话恢复 --
