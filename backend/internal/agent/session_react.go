@@ -57,6 +57,11 @@ type reactInternalSession struct {
 	// ThinkingText 保存当前 LLM 调用思考阶段的过程文本（累积值，瞬时不持久化），
 	// 答复文本开始输出或会话结束时清空。
 	ThinkingText string
+	// lastThinkEventText 是已落事件流的最后一条 think 文本：finalizeThinking 去重依据。
+	// 思考流与答复流交错时每个 LLMDelta 都会触发 finalize，累积式思考文本每轮可触发
+	// 数十次完全相同的事件（实证：一条"等待回传"叙事在日志重复 40+ 行），
+	// 相同文本只落一次。
+	lastThinkEventText string
 	// ctx 是会话的运行上下文，用于控制生命周期与取消。
 	ctx context.Context
 	// cancelFn 用于取消 ctx，通常在会话结束或关闭时调用。

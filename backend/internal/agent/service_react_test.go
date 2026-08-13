@@ -1002,3 +1002,33 @@ func (p *blockingLLMProvider) Generate(ctx context.Context, req *blades.ModelReq
 	return nil, ctx.Err()
 }
 func (p *blockingLLMProvider) Name() string { return "blocking" }
+
+// TestFinalizeThinking_Dedupe 验证 think 事件去重：
+// 思考流与答复流交错时每个 LLMDelta 触发一次 finalize，累积式思考文本会产生
+// 数十条内容相同的 think 事件（实证同一条"等待回传"叙事日志重复 40+ 行）。
+// 相同文本只落一条，不同文本（新一轮思考）再落。
+func TestFinalizeThinking_Dedupe(t *testing.T) {
+	svc := newReactServiceForTest(nil, t.TempDir())
+	sess := &reactInternalSession{ID: "s1", ctx: context.Background()}
+	svc.store.mu.Lock()
+	svc.store.sessions["s1"] = sess
+	svc.store.mu.Unlock()
+
+	ev := LiveEvent{Agent: "代码助手", AgentID: "s1/code_assistant-1"}
+	sess.ThinkingText = "等待子 Agent 回传结果。"
+	svc.finalizeThinking(sess, ev)
+	svc.finalizeThinking(sess, ev)
+	svc.finalizeThinking(sess, ev)
+	if len(sess.Events) != 1 {
+		t.Fatalf("相同思考文本应只落 1 条 think 事件，got %d", len(sess.Events))
+	}
+	if sess.ThinkingText != "" {
+		t.Fatalf("finalize 后思考缓存应清空，got %q", sess.ThinkingText)
+	}
+	// 新一轮不同思考文本应再落一条。
+	sess.ThinkingText = "现在开始实现丧尸绘制分支。"
+	svc.finalizeThinking(sess, ev)
+	if len(sess.Events) != 2 {
+		t.Fatalf("不同思考文本应再落 1 条，got %d", len(sess.Events))
+	}
+}

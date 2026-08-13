@@ -391,10 +391,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
 	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。
 	subAgentDispatcher.WithLiveEvents(agentSvc.ForwardLiveEvent)
-	// 注入人格加载器（soul.Loader）：MetaAgent 与子 Agent 共享同一用户级人格，
-	// 在 systemPrompt 头部拼入人格前缀。人格为空时无副作用（Inject 原样返回）。
+	// 人格加载器（soul.Loader）仅注入 MetaAgent：编排者人格（"多 Agent 编排助手"）
+	// 首行即身份定义，子 Agent 若共享会与角色提示词（叶子=执行者/领域=领域负责人）
+	// 冲突，thinking 模型据此在"等待兄弟回传"叙事里空转（实证 2026-08-13）。
+	// 子 Agent 身份由 roles.yaml 角色提示词定义，不再下发人格。
 	agentSvc.SetPersonaInjector(rt.Soul)
-	subAgentDispatcher.WithPersonaInjector(rt.Soul)
 	// 用户画像（TODO #28 第四层记忆）：单文件 user_profile.md，人可编辑 + 程序结构化追加。
 	// 注入仅 MetaAgent（metaPersona 组合人格+画像），子 Agent 不下发（防上下文膨胀/偏好泄露）。
 	// 双路写入：remember_preference 工具（用户显式陈述，立即生效）+ 会话完成轻量模型提取。

@@ -1556,6 +1556,13 @@ func (s *ReactService) finalizeThinking(session *reactInternalSession, ev LiveEv
 		s.store.setThinkingText(session, "")
 		return
 	}
+	// 去重：思考流与答复流交错时每个 LLMDelta 触发一次 finalize，累积式思考文本
+	// 会产出数十条内容完全相同的 think 事件（日志重复刷屏，实证同一条等待叙事 40+ 行）。
+	if text == session.lastThinkEventText {
+		s.store.setThinkingText(session, "")
+		return
+	}
+	session.lastThinkEventText = text
 	s.store.addEventDetail(session, eventkind.Think, ev.Agent, text, eventkind.Think, "", "", "", "", true, agentIDJSON(ev.AgentID))
 	s.store.setThinkingText(session, "")
 }

@@ -492,20 +492,14 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				// 取到新摘要时才 break 回主循环调 LLM 整合；超时无新消息则继续等。
 				// 旧实现每 30s 超时白跑一次 LLM，50 轮上限烧完后会话停摆等用户
 				// 人工续跑（实证：塔防任务死等 46 分钟）。
-				for a.pendingChecker.PendingChildren(a.name) > 0 {
+				var paused bool
+				history, paused = a.waitForChildren(ctx, history)
+				if paused {
 					// Paused 子 DomainAgent 检查：MetaAgent 无限 budget 不会因自身 token 暂停，
 					// 但子 domain 触达上限进入 Paused 后,父在此 wait loop 会永久阻塞。
 					// 检测到 Paused 子节点时跳出，返回 PausedOnChild 让上层 pauseSession
 					// 置会话暂停态，等用户"继续"恢复该 domain（各 Agent 独立上下文）。
-					if a.pausedChecker != nil && a.pausedChecker.HasPausedChild(a.name) {
-						return ReactResult{History: history, LimitReached: true, PausedOnChild: true}, nil
-					}
-					a.pendingChecker.WaitForAnyChild(a.name, 30*time.Second)
-					var n int
-					history, n = a.drainMailbox(history)
-					if n > 0 || a.mailbox == nil || ctx.Err() != nil {
-						break
-					}
+					return ReactResult{History: history, LimitReached: true, PausedOnChild: true}, nil
 				}
 				continue
 			}
@@ -532,6 +526,8 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			a.touchActivity()
 			// 分发执行单个工具调用；出错时构造包含错误信息的 ToolResult。
 			result, err := a.tools.Dispatch(ctx, tc)
+			// 长工具（大文件写/长命令）执行完成后同样刷新活动，防巡检在工具执行期间误判。
+			a.touchActivity()
 			if err != nil {
 				// 循环守卫命中（连读死循环/探索预算耗尽/连续失败）：终止循环并带原因返回，
 				// 不吞成普通工具结果继续烧轮次。子 Agent 经 runSubAgent 走 Failed 语义
@@ -580,7 +576,24 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 工具结果全部入史后再注入 mailbox：user 角色的 mailbox 消息若插在 assistant
 		// tool_calls 与其 tool 结果之间，会触发 Anthropic 配对校验 400（整轮请求作废，
 		// 实证：domain 派发子 Agent 后收到子 Agent 完成通知，白跑 31m43s 后失败）。
-		history, _ = a.drainMailbox(history)
+		var drained int
+		history, drained = a.drainMailbox(history)
+		// 等待叙事门：本轮只输出等待文案 + 只读探索（无任何实质动作）、无新 mailbox 消息、
+		// 仍有未决子 Agent 时，改为事件驱动阻塞等待，不再逐轮烧 LLM 重复"等待回传"+重读文件
+		// （实证 2026-08-13：thinking 模型身份混淆后领域 Agent 与叶子每轮空转叙事，
+		// 3 参数改动跑 12 分钟，其中大部分轮次为零进展）。
+		// 注意：不能用 history, drained := ... —— := 会在循环体内新建遮蔽变量，
+		// mailbox 消息追加到遮蔽副本、随迭代结束丢失（实证：mailbox 消息整体失踪）。
+		if drained == 0 && a.mailbox != nil && a.pendingChecker != nil &&
+			a.pendingChecker.PendingChildren(a.name) > 0 &&
+			isWaitNarration(assistant.Content) && toolCallsAllReadOnly(assistant.ToolCalls) {
+			var paused bool
+			history, paused = a.waitForChildren(ctx, history)
+			if paused {
+				return ReactResult{History: history, LimitReached: true, PausedOnChild: true}, nil
+			}
+			continue
+		}
 	}
 
 	// 达到最大迭代次数上限（仅 maxIter>0 时可能触发）：
@@ -812,6 +825,10 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 		if err != nil {
 			return nil, err
 		}
+		// 流式块即活动证据：thinking 模型单次长生成可达 5-7 分钟（大段代码+深度推理），
+		// 期间无工具派发/generateOnce 结束，心跳巡检若无此刷新会误判假死杀掉活跃叶子
+		// （实证 2026-08-13 全天 4 次 HEARTBEAT KILL，被杀 LLM 调用均已在跑 5m40s-7m24s）。
+		a.touchActivity()
 		if resp == nil || resp.Message == nil {
 			continue
 		}
@@ -851,6 +868,69 @@ func bladesText(m *blades.Message) string {
 		}
 	}
 	return sb.String()
+}
+
+// waitForChildren 事件驱动阻塞等待任一子 Agent 完成：等待期间不烧 LLM 轮次。
+// mailbox 取到新摘要、无 mailbox 或上下文取消时返回；检测到 Paused 子节点时
+// 返回 paused=true，调用方应以 PausedOnChild 结束并让上层置会话暂停态。
+func (a *ReActAgent) waitForChildren(ctx context.Context, history []ReactMessage) ([]ReactMessage, bool) {
+	for a.pendingChecker.PendingChildren(a.name) > 0 {
+		if a.pausedChecker != nil && a.pausedChecker.HasPausedChild(a.name) {
+			return history, true
+		}
+		a.pendingChecker.WaitForAnyChild(a.name, 30*time.Second)
+		var n int
+		history, n = a.drainMailbox(history)
+		if n > 0 || a.mailbox == nil || ctx.Err() != nil {
+			return history, false
+		}
+	}
+	return history, false
+}
+
+// waitNarrationMarkers 是等待叙事文案的判定关键词：模型输出含其一且未做实质动作时，
+// 说明本轮在"等子 Agent 回传"叙事里空转而非推进任务。
+var waitNarrationMarkers = []string{"等待", "回传", "稍候", "waiting"}
+
+// isWaitNarration 判断模型输出文本是否为纯等待叙事。
+func isWaitNarration(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	for _, m := range waitNarrationMarkers {
+		if strings.Contains(t, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// readOnlyToolNames 是纯探索类工具集合：执行不产生任何外部状态变化。
+// 等待叙事轮只调这些工具 = 模型在空转重读而非推进任务，触发等待门。
+var readOnlyToolNames = map[string]bool{
+	"ReadFile":      true,
+	"ListDir":       true,
+	"SearchInFiles": true,
+	"HTTPGet":       true,
+	"GitStatus":     true,
+	"GitLog":        true,
+	"GitDiff":       true,
+	"GitBlame":      true,
+}
+
+// toolCallsAllReadOnly 判断本轮工具调用是否全部为只读探索类；空调用列表返回 false
+// （无工具调用的轮次走无工具分支的终结保护，不在此判定）。
+func toolCallsAllReadOnly(calls []ToolCall) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	for _, c := range calls {
+		if !readOnlyToolNames[c.Name] {
+			return false
+		}
+	}
+	return true
 }
 
 // summarizeWindow 已迁入 domain/memory/pipeline.go 的 compressHistory 函数。

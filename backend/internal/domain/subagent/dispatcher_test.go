@@ -1568,3 +1568,20 @@ func TestIsVerificationTask(t *testing.T) {
 		t.Fatal("construction task must not be detected")
 	}
 }
+
+// TestRenderSpecPrefix_ScopeNote 验证规范前缀带范围锚定说明：
+// 子 Agent 看到的是父 Agent 全局目标（常含多领域拆分），必须锚定自己的 task 范围，
+// 防止 thinking 模型把"其他 Agent 的职责/进度"当自己的状态空转等待（2026-08-13 实证）。
+func TestRenderSpecPrefix_ScopeNote(t *testing.T) {
+	got := renderSpecPrefix(specMirror{
+		Goal:       "对项目进行三项修改",
+		Acceptance: []string{"验收1"},
+		Files:      []string{"a.js"},
+	})
+	if !strings.Contains(got, specPrefixMarker) {
+		t.Fatalf("应带【任务规范】前缀，got: %s", got)
+	}
+	if !strings.Contains(got, "【范围】") || !strings.Contains(got, "父 Agent 的全局背景") {
+		t.Fatalf("应带范围锚定说明，got: %s", got)
+	}
+}

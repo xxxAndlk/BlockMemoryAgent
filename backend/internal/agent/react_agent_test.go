@@ -912,3 +912,167 @@ func TestMailboxMessageToReact_EscalatePrefix(t *testing.T) {
 		t.Fatalf("escalate message should carry [升级] prefix, got: %s", esc.Content)
 	}
 }
+
+// TestIsWaitNarration 验证等待叙事判定。
+func TestIsWaitNarration(t *testing.T) {
+	cases := []struct {
+		text string
+		want bool
+	}{
+		{"等待子 Agent 回传结果。", true},
+		{"正在等待 domain-2 和 domain-3 回传", true},
+		{"请稍候。", true},
+		{"waiting for results", true},
+		{"现在修改 monster.js 的 draw 方法", false},
+		{"", false},
+		{"   ", false},
+	}
+	for _, c := range cases {
+		if got := isWaitNarration(c.text); got != c.want {
+			t.Errorf("isWaitNarration(%q) = %v, want %v", c.text, got, c.want)
+		}
+	}
+}
+
+// TestToolCallsAllReadOnly 验证只读工具集合判定。
+func TestToolCallsAllReadOnly(t *testing.T) {
+	if !toolCallsAllReadOnly([]ToolCall{{Name: "ReadFile"}, {Name: "SearchInFiles"}}) {
+		t.Fatal("全只读应返回 true")
+	}
+	if toolCallsAllReadOnly([]ToolCall{{Name: "ReadFile"}, {Name: "WriteFile"}}) {
+		t.Fatal("含写工具应返回 false")
+	}
+	if toolCallsAllReadOnly(nil) || toolCallsAllReadOnly([]ToolCall{}) {
+		t.Fatal("空调用列表应返回 false")
+	}
+}
+
+// multiChunkStreamProvider 产出两个流式块的 provider，用于验证流式期间活动上报。
+type multiChunkStreamProvider struct {
+	genCalls int
+}
+
+func (p *multiChunkStreamProvider) Name() string { return "multichunk" }
+
+func (p *multiChunkStreamProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	p.genCalls++
+	return &blades.ModelResponse{Message: blades.AssistantMessage("from generate")}, nil
+}
+
+func (p *multiChunkStreamProvider) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
+	return func(yield func(*blades.ModelResponse, error) bool) {
+		yield(&blades.ModelResponse{Message: &blades.Message{Metadata: map[string]any{"thinking": "思考块1"}}}, nil)
+		yield(&blades.ModelResponse{Message: &blades.Message{Metadata: map[string]any{"thinking": "思考块2"}}}, nil)
+		yield(&blades.ModelResponse{Message: blades.AssistantMessage("final")}, nil)
+	}
+}
+
+// TestReActAgent_StreamingActivityReporter 验证流式长生成期间每个块都上报活动：
+// 心跳巡检据此不误杀正在长时间生成代码的活跃叶子（实证 5-7 分钟调用被杀）。
+func TestReActAgent_StreamingActivityReporter(t *testing.T) {
+	p := &multiChunkStreamProvider{}
+	var touches int
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, p, NewToolRegistryAdapter(reg)).
+		WithActivityReporter(func() { touches++ })
+	if _, err := a.Run(context.Background(), "hi"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.genCalls != 0 {
+		t.Fatalf("应走流式路径，不应调用 Generate，got %d", p.genCalls)
+	}
+	// generateOnce 起始 1 次 + 3 个流式块各 1 次，至少 4 次。
+	if touches < 4 {
+		t.Fatalf("流式块应触发活动上报，got %d touches", touches)
+	}
+}
+
+// TestReActAgent_WaitNarrationGate 验证等待叙事门：模型输出"等待回传"+只读工具、
+// 无新 mailbox 消息且有未决子 Agent 时，改为事件驱动阻塞等待而非继续烧 LLM 轮次。
+// 与无工具分支的终结保护（TestReActAgent_WakeOnMailbox）互补：本测试覆盖
+// 有只读工具调用的空转轮（实证：身份混淆后每轮"等待回传"+重读文件的烧轮模式）。
+func TestReActAgent_WaitNarrationGate(t *testing.T) {
+	mb := mailbox.New()
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			{
+				Role: blades.RoleAssistant,
+				Parts: []blades.Part{
+					blades.TextPart{Text: "等待子 Agent 回传结果。"},
+					blades.ToolPart{Name: "ReadFile", Request: string(mustJSON(map[string]any{"path": "a.txt", "limit": 10}))},
+				},
+			},
+			blades.AssistantMessage("done"),
+		},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	checker := &fakePendingChecker{mb: mb, parentID: "test"}
+	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).
+		WithMailbox(mb).
+		WithPendingChildrenChecker(checker)
+
+	res, err := a.Run(context.Background(), "wait for sub")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 门生效：首轮（等待+ReadFile）后不再烧 LLM，WaitForAnyChild 投递摘要后仅补一轮整合终答。
+	// 若门未生效，会多烧一轮空转（calls==3）。
+	if llm.calls != 2 {
+		t.Fatalf("等待叙事轮后应直接阻塞等待，LLM calls 应为 2，got %d", llm.calls)
+	}
+	found := false
+	for _, m := range res.History {
+		if m.Role == "user" && strings.Contains(m.Content, "[mailbox from") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("mailbox 摘要应进入历史，got: %+v", res.History)
+	}
+}
+
+// TestReActAgent_WaitNarrationGate_NotTriggered 验证门不误伤实质动作轮：
+// 等待文案 + 写工具（WriteFile）时照常继续循环，不经等待门短路。
+func TestReActAgent_WaitNarrationGate_NotTriggered(t *testing.T) {
+	mb := mailbox.New()
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			{
+				Role: blades.RoleAssistant,
+				Parts: []blades.Part{
+					blades.TextPart{Text: "等待子 Agent 回传结果。"},
+					blades.ToolPart{Name: "WriteFile", Request: string(mustJSON(map[string]any{"path": "a.txt", "content": "1"}))},
+				},
+			},
+			blades.AssistantMessage("done"),
+		},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	checker := &fakePendingChecker{mb: mb, parentID: "test"}
+	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).
+		WithMailbox(mb).
+		WithPendingChildrenChecker(checker)
+
+	res, err := a.Run(context.Background(), "write a.txt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 写操作轮不触发门：首轮 WriteFile 照常执行 → 次轮"done"无工具 → 走无工具分支
+	// 终结保护等待 → 摘要到后补一轮终答。mock 耗尽分支不计数，calls 为 2
+	// （若门误触发，首轮即阻塞等待，历史只有 5 条且 calls=1）。
+	if llm.calls != 2 {
+		t.Fatalf("写工具轮不应触发等待门，LLM calls 应为 2，got %d", llm.calls)
+	}
+	if len(res.History) != 6 {
+		t.Fatalf("expected 6 history messages, got %d: %+v", len(res.History), res.History)
+	}
+	found := false
+	for _, m := range res.History {
+		if m.Role == "user" && strings.Contains(m.Content, "[mailbox from") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("mailbox 摘要应进入历史，got: %+v", res.History)
+	}
+}

@@ -180,9 +180,6 @@ type Dispatcher struct {
 	// 按 sessionID 路由回所属会话的 service.handleLiveEvent，使子 Agent token 也计入会话累计。
 	// 为 nil 时子 Agent 不推送实时事件（不影响主流程）。
 	liveFn func(sessionID string, ev agent.LiveEvent)
-	// persona 可选的人格注入器（soul.Loader 实现该接口）；为 nil 时子 Agent 不注入人格前缀。
-	// 与 MetaAgent 共享同一用户级人格，由 bootstrap 注入 runtime.Soul。
-	persona agent.PersonaInjector
 
 	// treeFn 按 sessionID 取得权威 Agent 树（lazy init）。
 	// 派发前 Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
@@ -687,16 +684,10 @@ func (d *Dispatcher) WithLogger(l *logger.Logger) *Dispatcher {
 
 // WithLiveEvents 注入实时事件转发器，使子 Agent 的 LiveEvent（token 用量/流式/工具）
 // 按 sessionID 路由回所属会话的 service.handleLiveEvent。
+// WithLiveEvents 注入子 Agent 实时事件转发器：子 Agent emitLive 时按 sessionID 路由回会话 service。
 // 传 nil 关闭子 Agent 实时事件推送（默认关闭）。
 func (d *Dispatcher) WithLiveEvents(fn func(sessionID string, ev agent.LiveEvent)) *Dispatcher {
 	d.liveFn = fn
-	return d
-}
-
-// WithPersonaInjector 注入人格注入器（soul.Loader），使子 Agent 系统提示词头部带人格前缀，
-// 与 MetaAgent 共享用户级人格。传 nil 关闭人格注入（默认关闭）。
-func (d *Dispatcher) WithPersonaInjector(p agent.PersonaInjector) *Dispatcher {
-	d.persona = p
 	return d
 }
 
@@ -1513,12 +1504,17 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			roleDef.SystemPrompt = header + "\n\n" + roleDef.SystemPrompt
 		}
 	}
+	// 不注入用户级人格（soul.md"多 Agent 编排助手"）：人格前缀首行即编排者身份，
+	// 子 Agent（领域/叶子）读到的第一身份是"编排助手"，与角色提示词冲突，
+	// thinking 模型据此长期停留在"等待兄弟回传"的编排者叙事里空转
+	// （实证 2026-08-13：三个领域 Agent 与叶子 code_assistant 的思考流全是
+	// "三个领域 Agent 已成功派发，等待回传"，3 参数改动跑 12 分钟）。
+	// 子 Agent 身份只由角色提示词（叶子=执行者/领域=领域负责人）定义。
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
-		WithWorkDir(d.subAgentWorkDir()).
-		WithPersonaInjector(d.persona)
+		WithWorkDir(d.subAgentWorkDir())
 	// 注入未决子 Agent 检查器：子 Agent 也能递归派发（domain -> 叶子助手），
 	// 无此检查时子 Agent 会在派发后立刻给出中间汇报式终答（不等待 mailbox），
 	// 父链路上的 Agent 会把“中间状态”误当最终结果（实证：domain-1 拆两个子任务后
@@ -1786,12 +1782,12 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	if mem == nil {
 		mem = agent.NopMemoryPipeline{}
 	}
+	// 不注入编排者人格（理由同 runSubAgentOnce：身份混淆实证）。
 	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor("domain")).
-		WithWorkDir(d.subAgentWorkDir()).
-		WithPersonaInjector(d.persona)
+		WithWorkDir(d.subAgentWorkDir())
 	// 同 runSubAgentOnce：resume 重建的 domain Agent 也可能继续递归派发，
 	// 需要终结保护等待自己的子 Agent（Dispatcher 自身实现 PendingChildrenChecker）。
 	sub = sub.WithPendingChildrenChecker(d)
@@ -2205,6 +2201,10 @@ func renderSpecPrefix(s specMirror) string {
 			b.WriteByte('\n')
 		}
 	}
+	// 范围锚定：规范是父 Agent 的全局目标（常含多领域拆分与其他 Agent 职责），
+	// 你的执行范围以 task 正文为准。其他 Agent 的进度与你无关——不要等待、不要汇报、
+	// 不要模仿它们的状态；父 Agent 会统一整合各领域回传（实证 2026-08-13 身份混淆空转）。
+	b.WriteString("\n【范围】你的职责只在本任务 task 正文；上面的目标/验收是父 Agent 的全局背景。")
 	return strings.TrimRight(b.String(), "\n")
 }
 
