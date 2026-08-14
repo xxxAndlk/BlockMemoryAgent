@@ -2111,7 +2111,7 @@ var errVerifyMissing = errors.New("sub-agent missing executable verification evi
 // 校验分层两类（TODO #43）单独文案，明确"未验证"而非"失败"语义。
 func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Duration, partial string) string {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Sprintf("子 Agent 执行超时（已运行 %v），已被终止。%s", timeout, partialSuffix(partial))
+		return fmt.Sprintf("子 Agent 执行超时（上限 %v），已被终止。%s", timeout, partialSuffix(partial))
 	}
 	if errors.Is(err, tool.ErrLoopExit) {
 		reason := strings.TrimPrefix(err.Error(), tool.ErrLoopExit.Error()+": ")
@@ -2209,6 +2209,15 @@ const specPrefixMarker = "【任务规范】\n"
 
 // sharedPrefixMarker 是共享记忆注入任务前缀时的标记，便于子 Agent 区分"共享记忆"与"当前任务"。
 const sharedPrefixMarker = "【共享记忆】\n"
+
+// sharedPrefixDisciplineNote 是共享前缀尾部固定的反重读纪律行。
+// 实证（2026-08-14 塔防 9 叶子并行重绘）：契约已含共享方法签名清单，9 个叶子仍各自
+// ReadFile 重读共享代码区（合计 4722 行 ≈ 文件 3.7 倍）——注入内容必须显式声明
+// "视为已验证、禁止重读"，否则"认真查询"类通用纪律会驱使子 Agent 回读原文。
+// 注意：措辞不得含字面量【任务规范】/【共享记忆】/【当前任务】，避免干扰按标记切分前缀的既有逻辑与测试。
+const sharedPrefixDisciplineNote = "【读取纪律】以上注入的任务规范与共享记忆内容视为已验证事实：" +
+	"其中已给出的代码、签名与行号禁止再用 ReadFile 核对或重读；" +
+	"ReadFile 仅限当前任务指派给你的行号范围，不读兄弟任务的代码区段。"
 
 // specSlotName 是 WriteSpec 写入的固定 slot 名，与 tool.SpecSlot 保持一致。
 const specSlotName = "spec"
@@ -2320,6 +2329,8 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID string) str
 		}
 		parts = append(parts, sharedPrefixMarker+joined)
 	}
+	// 尾部固定反重读纪律行：注入内容视为已验证，禁止为其区间再 ReadFile。
+	parts = append(parts, sharedPrefixDisciplineNote)
 	return strings.TrimRight(strings.Join(parts, "\n\n"), "\n")
 }
 

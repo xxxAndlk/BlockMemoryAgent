@@ -37,7 +37,8 @@ Key rules: `pkg/*` must not import `internal/*`; infrastructure must not import 
 ## Tests
 
 - Per-package `_test.go` exist for `agent`, `board`, `mailbox`, `skill`, `soul`, `watchdog`, `config`, `model`, `logger`, `domain/tool`, `domain/role`, `domain/memory`, `domain/subagent`, `server`, `tui` - run when touching those packages.
-- Integration tests under `test/` (separate module): `test/api/*`, `test/coding/*` (e2e via mock LLM), `test/tui/*`, `test/fixtures/*`.
+- Integration tests under `test/` (separate module): `test/api/*`, `test/coding/*` (e2e via mock LLM), `test/tui/*`, `test/fixtures/*`. Fixtures use `docker/docker-compose.test.yml` (isolated ports PG 55432 / Redis 56380) — never point tests at the dev instance (5432/6380, VECTOR(1024)).
+- Eval suite under `test/eval/` (build tag `eval`, real LLM, costs API credits): scenario YAMLs + deterministic checkpoint judges + metrics, reports to `test/eval/runs/<ts>/report.{json,md}`. Dry-run: `cd test && EVAL_DRY_RUN=1 GOTOOLCHAIN=local go test -tags=eval ./eval/ -run TestEval -v`. Knobs: `EVAL_FILTER`, `EVAL_RUNS`, `JUDGE_*` for llm_judge checks.
 
 ## History
 

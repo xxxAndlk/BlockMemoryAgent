@@ -1,0 +1,33 @@
+version: '3.8'
+
+# 集成测试/评测专用实例：独立端口（PG 55432 / Redis 56380），
+# 不带固定 container_name 与数据卷，配合 `docker compose -p blockmemory-test`
+# 与开发实例（docker-compose.yml，5432/6380）完全隔离，随 down -v 销毁。
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: blockmemory
+      POSTGRES_PASSWORD: blockmemory_dev
+      POSTGRES_DB: blockmemory
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockmemory -d blockmemory"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass blockmemory_dev
+    ports:
+      - "56380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "blockmemory_dev", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

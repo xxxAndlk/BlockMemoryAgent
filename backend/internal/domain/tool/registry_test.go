@@ -243,6 +243,41 @@ func TestReadFile_Pagination(t *testing.T) {
 	}
 }
 
+// TestReadFile_LimitHardClamp 验证单次 ReadFile 行数硬上限：
+// limit > maxReadFileLimit 时钳到上限返回，分页头标注截断原因与下一页起点。
+// 对应日志事故：2026-08-14 塔防 9 叶子并行重绘，单次 ReadFile 401/410/450 行违反 300 行纪律。
+func TestReadFile_LimitHardClamp(t *testing.T) {
+	dir := t.TempDir()
+	// 构造 400 行文件。
+	var lines []string
+	for i := 1; i <= 400; i++ {
+		lines = append(lines, fmt.Sprintf("line-%d", i))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s1")
+
+	// limit=400 超上限：应只返回 1-300 行，分页头标注截断并指引 offset=301。
+	res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "big.txt", "offset": float64(1), "limit": float64(400)})
+	if err != nil || !res.Success {
+		t.Fatalf("clamped read should succeed: err=%v success=%v", err, res.Success)
+	}
+	if !strings.Contains(res.Output, "本页 1-300 行") {
+		t.Fatalf("expected clamped page range 1-300, got: %s", res.Output)
+	}
+	if !strings.Contains(res.Output, "已截断") {
+		t.Fatalf("expected clamp note in header, got: %s", res.Output)
+	}
+	if !strings.Contains(res.Output, "offset=301") {
+		t.Fatalf("expected next-page hint offset=301, got: %s", res.Output)
+	}
+	if !strings.Contains(res.Output, "line-300") || strings.Contains(res.Output, "line-301") {
+		t.Fatalf("expected content up to line-300 only, got: %s", res.Output)
+	}
+}
+
 // TestWriteFileProtectedPath 验证 WriteFile 工具不能写入受保护的 .git/ 目录。
 // 源码目录名（backend/ 等）已不再受保护：workDir 是用户项目，Agent 需直接编辑用户代码；
 // 仅 VCS/IDE/构建产物根目录被挡。此处用 .git/ 代表受保护目录。

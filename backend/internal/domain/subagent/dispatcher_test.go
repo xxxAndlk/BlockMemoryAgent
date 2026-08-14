@@ -962,6 +962,36 @@ func TestBuildSharedPrefix_Layer3StaleDetection(t *testing.T) {
 	}
 }
 
+// TestBuildSharedPrefix_AntiRereadDiscipline 验证共享前缀尾部固定携带反重读纪律行：
+// 注入内容视为已验证、禁止为其区间再 ReadFile；无槽位时前缀为空（纪律行不单独出现）。
+// 对应日志事故：2026-08-14 塔防 9 叶子重读契约已摘要的共享代码区（合计 3.7 倍行数）。
+func TestBuildSharedPrefix_AntiRereadDiscipline(t *testing.T) {
+	d := &Dispatcher{}
+	kv := newTestKVMemory(true)
+	md := tool.EncodeSharedMD("meta", "shared", nil, "shared helper code excerpt")
+	_ = kv.Set(context.Background(), "meta:shared", md)
+	d.WithSharedMemory(kv)
+
+	got := d.buildSharedPrefix(context.Background(), "meta")
+	if !strings.Contains(got, "【读取纪律】") {
+		t.Fatalf("expected anti-reread discipline note in prefix, got: %q", got)
+	}
+	if !strings.Contains(got, "视为已验证事实") || !strings.Contains(got, "禁止再用 ReadFile") {
+		t.Fatalf("discipline note content wrong, got: %q", got)
+	}
+	// 纪律行必须在共享记忆内容之后（尾部），不能盖住正文。
+	if strings.Index(got, "【读取纪律】") < strings.Index(got, "shared helper code excerpt") {
+		t.Fatalf("discipline note should come after shared content, got: %q", got)
+	}
+
+	// 无槽位时返回空前缀，纪律行不单独出现。
+	dEmpty := &Dispatcher{}
+	dEmpty.WithSharedMemory(newTestKVMemory(true))
+	if p := dEmpty.buildSharedPrefix(context.Background(), "meta"); p != "" {
+		t.Fatalf("expected empty prefix without slots, got: %q", p)
+	}
+}
+
 // TestBuildSharedPrefix_NoFilesSkipsStatCheck 验证 Layer 3 边界：frontmatter files 为空时
 // 跳过 stat 校验（无 path 需校验），body 直接拼接。
 func TestBuildSharedPrefix_NoFilesSkipsStatCheck(t *testing.T) {

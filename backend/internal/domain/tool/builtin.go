@@ -155,6 +155,12 @@ type (
 // 领域 Agent 读不完职责文件即耗尽探索预算被判死；升档后多数文件单页即可覆盖。
 const defaultReadFileLimit = 200
 
+// maxReadFileLimit 是单次 ReadFile 的硬性行数上限：limit 超过它一律钳到该值。
+// 原"单次 ReadFile 不超过 300 行"仅靠提示词纪律约束，实证被违反
+// （2026-08-14 塔防 9 叶子并行重绘：单次 401/410/450 行各出现）；改为工具层硬截断，
+// 并在分页头标注，让模型知道被钳制、可分页续读。
+const maxReadFileLimit = 300
+
 // readFile 按行区间读取指定路径的文本内容（1-based offset + limit 分页）。
 // 输出带行号（cat -n 风格），顶部首行放置分页头（总行数/本页区间/下一页 offset），
 // 放在顶部是因为写历史的 tool_output_history_max_runes 截断保头不保尾，
@@ -189,6 +195,12 @@ func (e *Executor) readFile(args map[string]any) *Result {
 	if v, ok := args["limit"].(float64); ok && v > 0 {
 		limit = int(v)
 	}
+	// 硬截断：limit 超 maxReadFileLimit 一律钳到上限（提示词纪律实证会被违反，工具层兜底）。
+	clamped := false
+	if limit > maxReadFileLimit {
+		limit = maxReadFileLimit
+		clamped = true
+	}
 
 	// 按行切分文件内容。
 	lines := strings.Split(string(data), "\n")
@@ -221,6 +233,9 @@ func (e *Executor) readFile(args map[string]any) *Result {
 
 	// 分页头放在输出顶部：历史截断保留头部，模型始终知道文件规模与下一页起点。
 	header := fmt.Sprintf("[共 %d 行 | 本页 %d-%d 行", total, offset, actualEnd)
+	if clamped {
+		header += fmt.Sprintf(" | limit 超单次上限 %d 行，已截断", maxReadFileLimit)
+	}
 	if actualEnd < total {
 		header += fmt.Sprintf(" | 继续读请 ReadFile(path, offset=%d)]\n", actualEnd+1)
 	} else {
