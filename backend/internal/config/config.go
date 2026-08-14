@@ -52,15 +52,17 @@ type LLMRuntimeConfig struct {
 	// SalvageLLMTimeoutSec 失败打捞轻量调用超时（秒，默认 30；思考型模型场景建议 >=60）。
 	// 旧硬编码 5s 对思考型模型（glm/deepseek 推理系）来不及出首 token，打捞 facts=0 全降级（TODO #33）。
 	SalvageLLMTimeoutSec int `yaml:"salvage_llm_timeout_sec"`
-	// TokenBudgetPerGoal 单次 RunWithHistory 累计 token 上限（input+output 之和，跨轮累加）。
-	// 超限后主循环 break 返回部分完成（LimitReached），与 maxIter 轮数上限正交。
-	// 默认 0 表示不限制；config.yaml 设 token_budget_per_goal: 100000 启用。
-	// 被 TokenBudgetPerRole 覆盖:按角色设预算时此项对该角色无效。
+	// TokenBudgetPerGoal 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。
+	// 保留不破坏旧配置加载，但不再驱动任何闸门。见 TokenBudgetPerRole。
 	TokenBudgetPerGoal int `yaml:"token_budget_per_goal"`
-	// TokenBudgetPerRole 按角色 ID 设单 Agent 累计 token 上限（resume 重置）。
-	// DomainAgent 默认 120000;叶子助手默认 40000;meta 默认 200000(安全网,不为 0 因 config tool_call_max_rounds=-1 使 maxIter 无界,双无界会死循环)。
-	// codegen 单次可吐 10K+ token,旧值 50K/20K 扛不住多文件生成。未列出的角色按上述默认。显式配置覆盖默认,如 token_budget_per_role: {domain: 120000}。
+	// TokenBudgetPerRole 按 roleID 设上下文 token 阈值：Assemble 压缩后估算 messages
+	// token >= 阈值即 LimitReached 暂停（近 N 单独就超、压不下去）。语义=上下文阈值非累计跨轮。
+	// 未列出角色默认 150000（bootstrap 注入）。显式配置覆盖，如 token_budget_per_role: {meta: 150000}。
 	TokenBudgetPerRole map[string]int `yaml:"token_budget_per_role"`
+	// ContextTokenBudget 上下文 token 阈值默认值（未在 TokenBudgetPerRole 列出的角色用此值）。
+	// 替换原累计 token 预算：Assemble 压缩后估算 messages token >= 阈值即 LimitReached 暂停，
+	// 每轮独立估算（各 Agent 独立上下文统计）。默认 150000；<=0 不限制。
+	ContextTokenBudget int `yaml:"context_token_budget"`
 	// PausedDomainMaxResumes 同一 Paused DomainAgent 允许的最大续跑次数（默认 1；<=0 按默认）。
 	// 续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证：验收领域研磨
 	// 32 轮 30 分钟不收敛）。触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工。
@@ -443,6 +445,9 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.SummarizeTimeoutSec == 0 {
 		c.Agent.SummarizeTimeoutSec = 120
+	}
+	if c.Agent.ContextTokenBudget == 0 {
+		c.Agent.ContextTokenBudget = 150000
 	}
 	if c.Agent.SalvageLLMTimeoutSec == 0 {
 		c.Agent.SalvageLLMTimeoutSec = 30

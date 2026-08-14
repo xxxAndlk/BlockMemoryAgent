@@ -238,7 +238,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	memoryPipeline := memory.NewPipeline(memory.NewPostgresEventStore(pgStore.DB())).
 		WithSummarizer(newEventSummarizer(modelFactory)).
 		WithSummarizeTimeout(time.Duration(cfg.Agent.SummarizeTimeoutSec)*time.Second). // 思考型模型摘要需 60-180s，旧 5s 硬编码致摘要全挂
-		WithCompression(cfg.Agent.SummarizeEvery, cfg.Agent.SummarizeKeepRecent)        // 记忆流水线
+		WithCompression(cfg.Agent.SummarizeEvery, cfg.Agent.SummarizeKeepRecent). // 记忆流水线
+		WithContextBudget(cfg.Agent.ContextTokenBudget, cfg.Agent.TokenBudgetPerRole). // 上下文 token 阈值触发压缩（默认 150K，保留近 10 旧压成摘要块）
+		WithTokenEstimator(agent.EstimateMessagesTokens) // 注入消息 token 估算器，避免 domain/memory 反向依赖 model
 
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
@@ -251,6 +253,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		ToolOutputHistoryMaxRunes: cfg.Agent.ToolOutputHistoryMaxRunes,
 		TokenBudgetPerGoal:        cfg.Agent.TokenBudgetPerGoal,
 		TokenBudgetPerRole:        cfg.Agent.TokenBudgetPerRole,
+		ContextTokenBudget:        cfg.Agent.ContextTokenBudget,
 		SessionMaxWallClockMin:    cfg.Agent.SessionMaxWallClockMin,
 	}
 	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute

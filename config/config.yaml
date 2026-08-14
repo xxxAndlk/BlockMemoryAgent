@@ -66,16 +66,17 @@ agent:
   react_llm_timeout_sec: 1200    # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断；600s 仍不够——2026-08-13 实证 MetaAgent 汇总轮（4 领域摘要 ~20K input）10 分钟被掐断,整品验收没派出去,故 600->1200。配合 generate() 不在 deadline 上重试,卡死时 1200s 即报错。
   sub_agent_timeout_min: 120     # 子 Agent 独立执行超时（分钟），负数表示不限制。TODO #35 放开预算：60->120，慢推理（thinking）下长任务不再撞超时。
   tool_output_history_max_runes: 20000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 行区间分页默认 200 行/页（read_file_max_chars 默认 16000 字符，ASCII 整页约 16000 runes），20000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取
-  token_budget_per_goal: 300000   # 单次目标累计 token 上限（input+output 之和，跨轮累加），超限暂停等用户续跑；<=0 不限制。TODO #35 放开预算：100K->300K
-  token_budget_per_role:          # 按角色单 Agent token 上限（resume 重置；覆盖 token_budget_per_goal）。未列角色按默认:domain 120000 / 叶子助手 40000 / meta 200000(安全网,防不收敛死循环)。TODO #35 放开预算（强模型+前缀缓存下暂停=交付流程中断，实证撞顶暂停零进展死锁）：domain 600K->1M / meta 400K->600K / 编码叶子 200K->400K / 轻叶子 100K->200K。
-    domain: 1000000
-    meta: 600000
-    code_assistant: 400000
-    ui_assistant: 400000
-    prompt_reviewer: 200000
-    code_reviewer: 200000
-    test_assistant: 400000   # 与编码叶子同级：自动验证闭环已下线，测试助手回归普通叶子（写测试+跑测试）
-    doc_assistant: 200000
+  token_budget_per_goal: 300000   # 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。保留不破坏旧配置加载，不再驱动任何闸门。
+  token_budget_per_role:          # 按角色上下文 token 阈值（替换原累计预算）：Assemble 压缩后估算 messages token >= 阈值即暂停（近 N 单独就超、压不下去），每轮独立估算（各 Agent 独立）。未列角色默认 150000。
+    domain: 150000
+    meta: 150000
+    code_assistant: 150000
+    ui_assistant: 150000
+    prompt_reviewer: 150000
+    code_reviewer: 150000
+    test_assistant: 150000
+    doc_assistant: 150000
+  context_token_budget: 150000   # 上下文 token 阈值默认值（未在 token_budget_per_role 列出的角色用此值）。替换原累计预算：每 Agent 独立估算上下文 token，达阈值即压缩（保留近 10，旧压成上下文内摘要块）；压缩后仍超=近 10 单独就超，暂停等续跑。<=0 不限制。
   paused_domain_max_resumes: 2   # 同一 Paused DomainAgent 允许的最大续跑次数。续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证 v10 基准验收领域研磨 32 轮 30 分钟不收敛）；触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工。TODO #35 放开：1->2 多给一次续跑机会
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
 

@@ -292,13 +292,14 @@ func (m *tokenUsageProvider) Generate(ctx context.Context, req *blades.ModelRequ
 
 func (m *tokenUsageProvider) Name() string { return "tokenUsage" }
 
-// TestReActAgent_TokenBudgetExceeded 验证累计 token 超预算时返回部分完成（LimitReached），
-// 而非错误或继续烧轮次。与 maxIter 轮数上限正交。
-func TestReActAgent_TokenBudgetExceeded(t *testing.T) {
-	llm := &tokenUsageProvider{input: 60, output: 60} // 单轮 120 tokens
+// TestReActAgent_ContextBudgetExceeded 验证上下文 token 超阈值（压缩后仍超=近 N 单独就超、
+// 压不下去）时返回部分完成（LimitReached），在首轮 LLM 调用前拦截，而非错误或继续烧轮次。
+// 与 maxIter 轮数上限正交。
+func TestReActAgent_ContextBudgetExceeded(t *testing.T) {
+	llm := &tokenUsageProvider{input: 60, output: 60} // 即使真调了也能计数
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	ag := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).
-		WithLoopConfig(LoopConfig{TokenBudget: 100, MaxIterations: 50})
+		WithLoopConfig(LoopConfig{TokenBudget: 5, MaxIterations: 50}) // 极小阈值：任务+时间消息估算即超
 
 	res, err := ag.Run(context.Background(), "budget test")
 	if err != nil {
@@ -307,8 +308,29 @@ func TestReActAgent_TokenBudgetExceeded(t *testing.T) {
 	if !res.LimitReached {
 		t.Fatal("超预算时 LimitReached 应为 true")
 	}
-	if llm.calls != 1 {
-		t.Fatalf("第一轮即超预算应只调 1 次 LLM，got %d", llm.calls)
+	if llm.calls != 0 {
+		t.Fatalf("上下文超阈值应在首轮 LLM 调用前拦截，got %d calls", llm.calls)
+	}
+}
+
+// TestEstimateMessagesTokens 验证消息切片 token 估算累加 Content + ToolCalls + ReasoningContent。
+func TestEstimateMessagesTokens(t *testing.T) {
+	if got := EstimateMessagesTokens(nil); got != 0 {
+		t.Fatalf("empty messages should estimate 0, got %d", got)
+	}
+	base := EstimateMessagesTokens([]ReactMessage{{Role: "user", Content: "任务目标"}})
+	if base <= 0 {
+		t.Fatalf("non-empty content should estimate > 0, got %d", base)
+	}
+	msgs := []ReactMessage{
+		{Role: "user", Content: "任务目标"},
+		{Role: "assistant", Content: "code", ToolCalls: []ToolCall{{ID: "c1", Name: "RunCommand", Input: map[string]any{"command": "node -c a.js"}}}},
+		{Role: "tool", ToolCallID: "c1", Content: `{"tool":"RunCommand","success":true,"output":"PASS"}`},
+		{Role: "assistant", ReasoningContent: "thinking...", Content: "done"},
+	}
+	total := EstimateMessagesTokens(msgs)
+	if total <= base {
+		t.Fatalf("should accumulate all parts (content+toolcalls+reasoning), got %d vs base %d", total, base)
 	}
 }
 

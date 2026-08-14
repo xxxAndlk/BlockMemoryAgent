@@ -317,14 +317,16 @@ type ReactRuntimeConfig struct {
 	RetryBackoffMs          int // 重试初始退避（毫秒）
 	HistoryMaxMessages      int // 单次请求最大历史消息数；<0 表示不裁剪
 	ToolOutputHistoryMaxRunes int // 写入历史的工具输出最大字符数；<0 表示不截断
-	// TokenBudgetPerGoal 单次 RunWithHistory 累计 token 上限（input+output 之和）。
-	// <=0 不限制；>0 超限后主循环 break 返回部分完成（LimitReached）。
-	// 被 TokenBudgetPerRole 覆盖:按角色设预算时此项对该角色无效。
+	// TokenBudgetPerGoal 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。
+	// 保留字段不破坏旧配置加载，但不再驱动任何闸门。见 roleTokenBudget。
 	TokenBudgetPerGoal int
-	// TokenBudgetPerRole 按角色 ID 设单 Agent token 上限。未列出角色按默认:
-	// domain=120000, meta=200000(安全网,不为 0 因 maxIter=-1 已无界), 其他(叶子助手)=40000。
-	// nil 时全部走默认。显式值覆盖默认,resume 时重置(各 Agent 独立预算)。
+	// TokenBudgetPerRole 按 roleID 设上下文 token 阈值（Assemble 压缩后 messages token
+	// >= 阈值即 LimitReached 暂停）。未列出角色默认 150000。nil 时全部走默认。
+	// 语义=上下文阈值非累计跨轮；每轮独立估算（各 Agent 独立）。
 	TokenBudgetPerRole map[string]int
+	// ContextTokenBudget 上下文 token 阈值默认值（未在 TokenBudgetPerRole 列出的角色用此值）。
+	// 默认 150000（config applyDefaults 兜底）；<=0 不限制。
+	ContextTokenBudget int
 	// SessionMaxWallClockMin 会话全局墙钟上限（分钟，TODO #25-4 硬止损）。
 	// 从会话创建起超时未终止则级联取消全部节点 + 会话置 error；<=0 关闭（默认）。
 	SessionMaxWallClockMin int
@@ -404,39 +406,33 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 	if c.ToolOutputHistoryMaxRunes != 0 {
 		lc.ToolOutputMaxRunes = max(c.ToolOutputHistoryMaxRunes, 0)
 	}
-	if c.TokenBudgetPerGoal > 0 {
-		lc.TokenBudget = c.TokenBudgetPerGoal
-	}
+	// TokenBudget 由 LoopConfigByRole 按角色注入（默认 150000，上下文阈值），
+	// 不再从累计 TokenBudgetPerGoal 取值（累计预算已退役，见 roleTokenBudget）。
 	return lc
 }
 
 // LoopConfigByRole 返回按角色定制的 LoopConfig:在 LoopConfig() 基础上按 roleID 覆盖 TokenBudget。
-// 预算分级:DomainAgent 120000(到限暂停可恢复),叶子助手 40000(到限返回部分产出),
-// meta 200000(安全网,不收敛时暂停等续跑;不为 0 因 maxIter=-1 已无界,双无界会死循环)。
-// codegen 单次可吐 10K+ token(如塔防 config.js),旧值 50K/20K 扛不住多文件生成,抬至 120K/40K。
-// TokenBudgetPerRole 显式配置覆盖默认;未列出角色按上述默认。
-// resume 时 usedTokens 局部变量自动重置,即每个 Agent 各自独立预算。
+// TokenBudget 语义=上下文 token 阈值（替换原累计跨轮 token 预算）:Assemble 压缩后估算
+// messages token >= 阈值即 LimitReached（近 N 单独就超、压不下去），暂停等续跑。
+// 默认 150000 全角色（domain/meta/叶子同）；TokenBudgetPerRole 显式配置覆盖。
+// 每轮独立估算（非跨轮累计），即每个 Agent 各自独立上下文预算。
 func (c ReactRuntimeConfig) LoopConfigByRole(roleID string) LoopConfig {
 	lc := c.LoopConfig()
 	lc.TokenBudget = c.roleTokenBudget(roleID)
 	return lc
 }
 
-// roleTokenBudget 返回角色 token 预算:显式配置优先,否则按角色默认(domain 120000 / meta 200000 / 其他 40000)。
-// meta 不给 0(无限):config tool_call_max_rounds=-1 已使 maxIter 无界,若 budget 也无界,
-// 模型不收敛时会无限循环(实证:TUI 重复思考不前进)。200K 安全网让 meta 不收敛时暂停等续跑。
+// roleTokenBudget 返回角色上下文 token 阈值:显式配置优先，否则默认 ContextTokenBudget
+//（未配时 150000）。meta 不给 0（无限）:config tool_call_max_rounds=-1 已使 maxIter 无界，
+// 若阈值也无界，模型不收敛时会无限循环（实证:TUI 重复思考不前进）。150K 安全网让不收敛时压缩到限暂停等续跑。
 func (c ReactRuntimeConfig) roleTokenBudget(roleID string) int {
 	if v, ok := c.TokenBudgetPerRole[roleID]; ok {
 		return max(v, 0)
 	}
-	switch roleID {
-	case "domain":
-		return 120000
-	case "meta":
-		return 200000
-	default:
-		return 40000
+	if c.ContextTokenBudget > 0 {
+		return c.ContextTokenBudget
 	}
+	return 150000
 }
 
 // SetModelProvider 注入一个 mock 或替代的模型 provider。

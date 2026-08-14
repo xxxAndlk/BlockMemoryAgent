@@ -290,6 +290,52 @@ func TestPipeline_CompressionStepFrequency(t *testing.T) {
 	}
 }
 
+// TestPipeline_CompressionTokenThreshold 验证压缩按上下文 token 阈值触发（主，替换步频语义）：
+// 估算视图 token >= 阈值即压缩（保留近 keepRecent，旧压成上下文内摘要块）；per-role 阈值覆盖默认；
+// 未达阈值不压缩。步频（WithCompression）为兜底，二者独立。
+func TestPipeline_CompressionTokenThreshold(t *testing.T) {
+	est := func(msgs []agent.ReactMessage) int { return len(msgs) * 1000 } // 1 条 = 1000 tokens
+	pipe := NewPipeline(nil).
+		WithCompression(0, 3). // 步频关闭，纯 token 触发
+		WithContextBudget(5000, map[string]int{"meta": 100000}). // 默认 5000；meta 例外 100000
+		WithTokenEstimator(est)
+
+	small := []agent.ReactMessage{{Role: "user", Content: "task"}}
+	small = append(small, agent.ReactMessage{Role: "assistant", Content: "m1"}, agent.ReactMessage{Role: "assistant", Content: "m2"})
+	// 3 条 = 3000 < 5000：不压缩。
+	if out := pipe.Assemble(types.RoleDefinition{ID: "domain"}, "a", small); len(out) != len(small) {
+		t.Fatalf("below threshold should not compress, got %d vs %d", len(out), len(small))
+	}
+
+	big := []agent.ReactMessage{{Role: "user", Content: "task"}}
+	for i := 0; i < 5; i++ {
+		big = append(big, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("m%d", i)})
+	}
+	// 6 条 = 6000 >= 5000：压缩（domain 走默认阈值）。
+	out := pipe.Assemble(types.RoleDefinition{ID: "domain"}, "b", big)
+	if len(out) >= len(big) {
+		t.Fatalf("above threshold should compress, got %d vs %d", len(out), len(big))
+	}
+	var found bool
+	for _, m := range out {
+		if m.Role == "system" && strings.Contains(m.Content, "【历史压缩摘要】") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected compressed summary after token threshold trigger")
+	}
+	// meta 角色阈值 100000：同一大历史（6000 < 100000）不压缩。
+	if out := pipe.Assemble(types.RoleDefinition{ID: "meta"}, "c", big); len(out) != len(big) {
+		t.Fatalf("meta per-role threshold should not compress, got %d vs %d", len(out), len(big))
+	}
+	// 阈值 <=0（WithContextBudget(0, ...)）时关闭 token 触发：不压缩。
+	pipe2 := NewPipeline(nil).WithContextBudget(0, nil).WithTokenEstimator(est)
+	if out := pipe2.Assemble(types.RoleDefinition{ID: "domain"}, "d", big); len(out) != len(big) {
+		t.Fatalf("contextBudget<=0 should disable token trigger, got %d vs %d", len(out), len(big))
+	}
+}
+
 // TestPipeline_CompressionFrozenView 验证压缩视图在两次触发之间冻结：
 // 非压缩轮复用同一摘要与保留段起点，history 尾部追加的消息原样跟在保留段后，
 // 视图前缀字节级稳定（DeepSeek 前缀缓存仅压缩轮失效，其余轮次全命中）。

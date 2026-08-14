@@ -1,8 +1,8 @@
-version: '3.8'
-
 # 集成测试/评测专用实例：独立端口（PG 55432 / Redis 56380），
 # 不带固定 container_name 与数据卷，配合 `docker compose -p blockmemory-test`
-# 与开发实例（docker-compose.yml，5432/6380）完全隔离，随 down -v 销毁。
+# 与开发实例（docker-compose.yml，5432/6380）完全隔离。容器常驻共享，
+# fixtures 为每个测试创建独立的 database / Redis 逻辑库实现隔离
+# （Redis 因此开 1024 个逻辑库）。手动销毁：docker compose -p blockmemory-test down -v。
 
 services:
   postgres:
@@ -23,7 +23,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --requirepass blockmemory_dev
+    command: redis-server --requirepass blockmemory_dev --databases 1024
     ports:
       - "56380:6379"
     healthcheck:

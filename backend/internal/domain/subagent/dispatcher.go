@@ -1851,9 +1851,9 @@ func (d *Dispatcher) planSink(ctx context.Context, subAgentID string) func(goal 
 	}
 }
 
-// ResumePaused 恢复一个因触达 token 上限而 Paused 的 DomainAgent。
-// 从 msgStore 加载其完整消息历史，用 fresh budget（usedTokens 局部变量自动重置）重建
-// domain ReActAgent 续跑。不强制压缩——靠 Assemble 步频自动压缩（Pipeline 状态延续：
+// ResumePaused 恢复一个因触达上下文 token 上限而 Paused 的 DomainAgent。
+// 从 msgStore 加载其完整消息历史，用 fresh budget（上下文 token 每轮独立估算）重建
+// domain ReActAgent 续跑。不强制压缩——靠 Assemble 压缩自动触发（Pipeline 状态延续：
 // 同 subAgentID -> compressCounters/events 跨 resume 保留）。
 //
 // 生命周期：

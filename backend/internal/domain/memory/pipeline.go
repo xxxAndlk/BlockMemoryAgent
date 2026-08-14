@@ -67,6 +67,15 @@ type Pipeline struct {
 	// 冻结视图在两次压缩之间字节级稳定：DeepSeek 前缀缓存只在压缩那一轮失效，
 	// 其余轮次 history 纯追加、前缀全命中。受 mu 保护，与 events map 同生命周期。
 	compressStates map[string]compressState
+	// contextBudget 是按上下文 token 阈值触发压缩的默认上限（每角色可由 contextBudgetPerRole 覆盖）。
+	// Assemble 后估算视图 token >= 阈值即触发压缩（保留近 compressKeepRecent，旧压成上下文内摘要块）。
+	// <=0 关闭 token 触发，仅靠 compressEvery 步频兜底。默认 150000（bootstrap 注入）。
+	contextBudget int
+	// contextBudgetPerRole 按 roleID 覆盖 contextBudget。未列出角色用 contextBudget。
+	contextBudgetPerRole map[string]int
+	// tokenEstimator 估算消息切片的 token 数；为 nil 时不按 token 触发压缩（仅步频兜底）。
+	// 由 bootstrap 注入 agent.EstimateMessagesTokens，避免 domain/memory 反向依赖 model 包。
+	tokenEstimator func([]agent.ReactMessage) int
 }
 
 // compressState 是某 agent 已冻结的压缩视图状态。
@@ -137,8 +146,12 @@ func (p *Pipeline) WithSummarizeTimeout(d time.Duration) *Pipeline {
 
 // WithCompression 配置历史压缩步频与保留条数。
 // every<=0 关闭压缩（仅用 ReActAgent 的 windowMessages 滑动窗口）。
+// WithCompression 配置历史压缩的步频与保留段长度（步频兜底安全网）。
 // keepRecent<=0 视为 10。原 summarizeWindow 逻辑从 react_agent.go 迁入此处。
 // 职责归位：历史压缩属记忆层，不属 ReAct 层。
+//
+// token 阈值触发（WithContextBudget + WithTokenEstimator）为主，步频为兜底：
+// 估算偏差或 estimator 未注入时，步频保证周期性压缩不缺位。
 func (p *Pipeline) WithCompression(every, keepRecent int) *Pipeline {
 	p.compressEvery = every
 	if keepRecent <= 0 {
@@ -146,6 +159,35 @@ func (p *Pipeline) WithCompression(every, keepRecent int) *Pipeline {
 	}
 	p.compressKeepRecent = keepRecent
 	return p
+}
+
+// WithContextBudget 配置上下文 token 阈值：Assemble 后视图 token 达阈值即触发压缩
+// （保留近 compressKeepRecent，旧消息压成上下文内摘要块，不落盘）。
+// perRole 按 roleID 覆盖 defaultBudget（如 meta/domain/叶子各配不同阈值）。
+// defaultBudget<=0 关闭 token 触发，仅靠 WithCompression 步频兜底。
+func (p *Pipeline) WithContextBudget(defaultBudget int, perRole map[string]int) *Pipeline {
+	p.contextBudget = defaultBudget
+	p.contextBudgetPerRole = perRole
+	return p
+}
+
+// WithTokenEstimator 注入消息切片 token 估算器。
+// bootstrap 注入 agent.EstimateMessagesTokens，避免 domain/memory 反向依赖 model 包。
+// 为 nil 时关闭 token 触发压缩，仅步频兜底。
+func (p *Pipeline) WithTokenEstimator(f func([]agent.ReactMessage) int) *Pipeline {
+	p.tokenEstimator = f
+	return p
+}
+
+// resolveContextBudget 返回 roleID 的上下文 token 阈值：
+// perRole 命中优先，否则 contextBudget；<=0 表示不限制（不按 token 触发）。
+func (p *Pipeline) resolveContextBudget(roleID string) int {
+	if p.contextBudgetPerRole != nil {
+		if v, ok := p.contextBudgetPerRole[roleID]; ok && v > 0 {
+			return v
+		}
+	}
+	return p.contextBudget
 }
 
 // Assemble 把 agent 的近期事件作为一条 system 角色上下文消息注入到历史记录中。
@@ -157,15 +199,21 @@ func (p *Pipeline) WithCompression(every, keepRecent int) *Pipeline {
 //     发给模型的消息前缀字节级稳定——DeepSeek 前缀缓存仅压缩那一轮全量失效，
 //     其余轮次全部命中（旧实现每轮从全量 history 重算摘要，前缀每压缩轮即被打断）；
 //   - 近期事件注入永远放在视图末尾（内容每轮变化，尾部变化不破坏前缀缓存）。
-func (p *Pipeline) Assemble(_ types.RoleDefinition, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
-	return p.injectEvents(agentID, p.compressedView(agentID, history))
+func (p *Pipeline) Assemble(role types.RoleDefinition, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
+	return p.injectEvents(agentID, p.compressedView(role.ID, agentID, history))
 }
 
 // compressedView 返回该 agent 的压缩视图：未触发过压缩时原样返回 history；
 // 触发过压缩后返回冻结视图（system 前缀 + 首条 user + 摘要消息 + history[tailStart:]）。
-// 步频命中时先从完整 history 重算并冻结新视图。
-func (p *Pipeline) compressedView(agentID string, history []agent.ReactMessage) []agent.ReactMessage {
-	if p.compressEvery <= 0 {
+//
+// 触发条件（二者或）：
+//   - token 阈值：估算候选视图 token >= roleID 的上下文阈值（主，与上下文实际大小挂钩）；
+//   - 步频兜底：step%every==0（防估算偏差或 estimator 未注入时缺位）。
+//
+// 压缩只作用于 history 本体；近期事件消息在 Assemble 里于压缩之后追加，
+// 不会进入保留段、也不会在下个周期被压进中段摘要。
+func (p *Pipeline) compressedView(roleID, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
+	if p.compressEvery <= 0 && p.tokenEstimator == nil {
 		return history
 	}
 
@@ -174,10 +222,21 @@ func (p *Pipeline) compressedView(agentID string, history []agent.ReactMessage) 
 	step := p.compressCounters[agentID]
 	p.mu.Unlock()
 
-	// step%every==0 时触发压缩（与原 summarizeWindow 触发条件一致）。
-	// 压缩只作用于 history 本体；近期事件消息在 Assemble 里于压缩之后追加，
-	// 不会进入保留段、也不会在下个周期被压进中段摘要。
-	if step%p.compressEvery == 0 {
+	// 候选视图：现冻结状态应用后的视图（或原 history）。token 触发据此判定。
+	p.mu.RLock()
+	st, ok := p.compressStates[agentID]
+	p.mu.RUnlock()
+	var candidate []agent.ReactMessage
+	if ok && st.tailStart <= len(history) {
+		candidate = buildCompressedView(history, st)
+	} else {
+		candidate = history
+	}
+
+	threshold := p.resolveContextBudget(roleID)
+	overBudget := threshold > 0 && p.tokenEstimator != nil && p.tokenEstimator(candidate) >= threshold
+	stepHit := p.compressEvery > 0 && step%p.compressEvery == 0
+	if overBudget || stepHit {
 		if summary, tailStart, ok := compressMiddle(history, p.compressKeepRecent); ok {
 			p.mu.Lock()
 			p.compressStates[agentID] = compressState{summary: summary, tailStart: tailStart}
@@ -186,7 +245,7 @@ func (p *Pipeline) compressedView(agentID string, history []agent.ReactMessage) 
 	}
 
 	p.mu.RLock()
-	st, ok := p.compressStates[agentID]
+	st, ok = p.compressStates[agentID]
 	p.mu.RUnlock()
 	// history 在单次运行内只增不减；tailStart 越界说明状态陈旧（如外部重建 history），原样返回。
 	if !ok || st.tailStart > len(history) {

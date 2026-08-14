@@ -49,7 +49,9 @@ type ReActAgent struct {
 	historyMaxMessages int
 	// toolOutputMaxRunes 是写入历史的单条工具输出最大字符数；<=0 不截断。
 	toolOutputMaxRunes int
-	// tokenBudget 单次 RunWithHistory 累计 token 上限；<=0 不限制。超限 break 返回部分完成。
+	// tokenBudget 上下文 token 阈值（替换原累计跨轮 token 预算）：Assemble 压缩后
+	// 估算 messages token >= 阈值即 LimitReached（近 N 单独就超、压不下去），暂停等续跑。
+	// <=0 不限制。默认 150000（service_react roleTokenBudget 按角色配）。
 	tokenBudget int
 	// liveFn 是实时进度事件回调，由 WithLiveEvents 注入；nil 时不推送任何进度事件。
 	liveFn func(LiveEvent)
@@ -154,8 +156,8 @@ type LoopConfig struct {
 	RetryBackoff       time.Duration // 重试初始退避；<=0 用默认 100ms
 	HistoryMaxMessages int           // 单次请求最大历史消息数；<=0 不裁剪
 	ToolOutputMaxRunes int           // 写入历史的工具输出最大字符数；<=0 不截断
-	// TokenBudget 单次 RunWithHistory 累计 token 上限（input+output 之和，跨轮累加）。
-	// <=0 不限制；>0 超限后主循环 break 返回部分完成（LimitReached）。
+	// TokenBudget 上下文 token 阈值（替换原累计跨轮 token 预算）：Assemble 压缩后
+	// 估算 messages token >= 阈值即 LimitReached（近 N 单独就超、压不下去）。<=0 不限制。
 	TokenBudget int
 }
 
@@ -380,9 +382,6 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// 每次循环对应一次“思考-行动-观察”的迭代。
 	// emptyStreak 记录连续空响应次数，用于空响应保护（见循环内注释）。
 	emptyStreak := 0
-	// usedTokens 累计本次 RunWithHistory 的 LLM token 消耗（input+output 之和）。
-	// tokenBudget>0 时，超限即 break 返回部分完成，防止单目标 token 成本无上限累积。
-	var usedTokens int64
 	for i := 0; a.maxIter <= 0 || i < a.maxIter; i++ {
 		// 在每次调用 LLM 之前，通过记忆流水线组装上下文消息。
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
@@ -401,6 +400,16 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 未紧随 tool 结果，或孤立 tool 结果），Anthropic/OpenAI 会以 400 拒绝整轮请求，
 		// 此前所有 LLM 耗时全部作废（实证 domain-2 白跑 31m43s）。发送前强制配对。
 		messages = sanitizeToolPairing(messages)
+
+		// 上下文 token 预算（替换原累计 token 预算，150K 唯一上限）：Assemble 已按阈值
+		// 压缩（保留近 N，旧压成上下文内摘要块）；压缩后仍超阈值 = 近 N 单独就超、压不下去，
+		// 触达上限返回部分完成，由上层暂停会话等续跑。与 windowMessages（消息数硬上限）正交。
+		if a.tokenBudget > 0 {
+			if est := EstimateMessagesTokens(messages); est >= a.tokenBudget {
+				log.Printf("[react] context budget exceeded: role=%s est_tokens=%d budget=%d", a.role.Name, est, a.tokenBudget)
+				return ReactResult{History: history, LimitReached: true}, nil
+			}
+		}
 
 		// 将内部消息格式转换为 blades 库所需的模型消息格式。
 		bladesMsgs := ToBladesMessages(messages)
@@ -436,21 +445,6 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				}
 			}
 			a.emitLive(ev)
-		}
-		// 累计 token 预算：优先 TotalTokens（provider 填充时），否则用 input+output 之和。
-		// 空响应（mock/测试）不计入，避免误触预算上限。
-		if usage := resp.Message.TokenUsage; usage.InputTokens > 0 || usage.OutputTokens > 0 {
-			delta := usage.TotalTokens
-			if delta <= 0 {
-				delta = usage.InputTokens + usage.OutputTokens
-			}
-			usedTokens += delta
-		}
-		// 超预算：不视为错误，返回部分完成 + 完整历史，由上层暂停会话等用户续跑。
-		// 与 maxIter 轮数上限正交：先到哪个用哪个。
-		if a.tokenBudget > 0 && usedTokens > int64(a.tokenBudget) {
-			log.Printf("[react] token budget exceeded: role=%s used=%d budget=%d", a.role.Name, usedTokens, a.tokenBudget)
-			return ReactResult{History: history, LimitReached: true}, nil
 		}
 
 		// 将 blades 返回的消息转换为内部 Assistant 消息。

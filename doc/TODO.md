@@ -54,6 +54,7 @@
 
 ## 已完成（已归档到 git 历史）
 
+- **评测体系落地 + 首次基线**（2026-08-14）：`test/eval/`（build tag `eval`）真实 LLM 任务完成率评测——场景 YAML + checkpoint 判分（command/file/regex/tree/llm_judge）+ token/子Agent 指标聚合 + TheAgentCompany 式全量/部分分报告（`test/eval/runs/`）；环境隔离修复：`docker/docker-compose.test.yml` 独立端口（PG 55432/Redis 56380）+ 无固定容器名，fixture 维度对齐 migrations（768）。首基线 12 场景 full pass 91.7%、加权 0.979，详见 `doc/eval/baseline_2026-08-14.md`。后续加固（同日）：fixture 改"共享容器常驻 + 每测试独立 PG database/Redis 逻辑库"（Redis 开 1024 逻辑库），并行包 `go test ./...` 不再互相拆台；`TestFactExtractionFallback` 序列对齐现行后端（verify_kind 校验分层 + 派发后不阻塞）。开放项：verifyloop 场景判分口径修正（自动验证闭环已下线，改测 verify_kind 证据）、EVAL_RUNS=3 可靠性、SWE-bench 20 题切片（Phase 2）。
 - ReAct 主循环骨架（`internal/agent/react_agent.go`）
 - 工具域（`internal/domain/tool/`）注册表 + 11 个内置工具
 - 角色域（`internal/domain/role/`）加载与权限

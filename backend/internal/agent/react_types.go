@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
+	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
 	"github.com/go-kratos/blades/tools"
@@ -39,6 +40,29 @@ type ToolCall struct {
 	ID    string         `json:"id"`    // ID 是本次工具调用的唯一标识，用于结果回传时匹配
 	Name  string         `json:"name"`  // Name 是要调用的工具名称
 	Input map[string]any `json:"input"` // Input 是传递给工具的参数键值对
+}
+
+// EstimateMessagesTokens 粗估消息切片占用的 token 数：逐条累加 Content + ReasoningContent
+// + 各 ToolCall 的 JSON 体积估算。注入 Pipeline 作用上下文阈值触发压缩（避免 domain/memory
+// 反向依赖 model 包），亦供 ReActAgent 在 Assemble 后判定是否触达上下文预算上限。
+// 估算仅字符串扫描，成本低；不追求与 provider tokenizer 对齐，偏高中均可由步频兜底吸收。
+func EstimateMessagesTokens(msgs []ReactMessage) int {
+	var total int
+	for _, m := range msgs {
+		total += model.EstimateTokens(m.Content)
+		total += model.EstimateTokens(m.ReasoningContent)
+		for _, tc := range m.ToolCalls {
+			// Input 是 map[string]any，序列化后按字符估算；序列化失败按 Name+ID 文本估。
+			if raw, err := json.Marshal(tc.Input); err == nil {
+				total += model.EstimateTokens(string(raw))
+			} else {
+				total += model.EstimateTokens(tc.Name) + model.EstimateTokens(tc.ID)
+			}
+			total += model.EstimateTokens(tc.Name) + model.EstimateTokens(tc.ID)
+		}
+		total += model.EstimateTokens(m.ToolCallID)
+	}
+	return total
 }
 
 // LastAssistantText 从 ReAct 历史中提取最后一条非空 assistant 文本，

@@ -107,3 +107,23 @@ func TestApplyDefaults_TaskRuneLimits(t *testing.T) {
 		t.Fatalf("显式配置应保留，got %d/%d", c2.Agent.TaskMaxRunes, c2.Agent.TaskMaxRunesHard)
 	}
 }
+
+// TestApplyDefaults_ContextTokenBudget 验证未配置时上下文 token 阈值兜底 150000。
+func TestApplyDefaults_ContextTokenBudget(t *testing.T) {
+	c := &Config{}
+	if err := c.applyDefaults(); err != nil {
+		t.Fatalf("applyDefaults failed: %v", err)
+	}
+	if c.Agent.ContextTokenBudget != 150000 {
+		t.Fatalf("ContextTokenBudget 默认应为 150000，got %d", c.Agent.ContextTokenBudget)
+	}
+	// 显式配置覆盖默认，不被兜底改写。
+	c2 := &Config{}
+	c2.Agent.ContextTokenBudget = 200000
+	if err := c2.applyDefaults(); err != nil {
+		t.Fatalf("applyDefaults failed: %v", err)
+	}
+	if c2.Agent.ContextTokenBudget != 200000 {
+		t.Fatalf("显式配置应保留，got %d", c2.Agent.ContextTokenBudget)
+	}
+}

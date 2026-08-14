@@ -682,8 +682,8 @@ func TestReactService_InjectTopicRecall(t *testing.T) {
 	}
 }
 
-// TestLoopConfigByRole 验证按角色返回的 token 预算分级：
-// domain=120000 / meta=200000(安全网) / 其他=40000；TokenBudgetPerRole 显式配置覆盖默认(含显式 meta:0=不限制)。
+// TestLoopConfigByRole 验证按角色返回的上下文 token 阈值：
+// TokenBudgetPerRole 显式配置覆盖默认 150000（含显式 meta:0=不限制）；未列出角色用默认。
 func TestLoopConfigByRole(t *testing.T) {
 	cfg := ReactRuntimeConfig{TokenBudgetPerRole: map[string]int{
 		"domain":         50000,
@@ -692,10 +692,10 @@ func TestLoopConfigByRole(t *testing.T) {
 	}}
 	cases := map[string]int{
 		"domain":         50000,
-		"meta":           0, // 显式设 0 -> 不限制(override 默认 200000)
+		"meta":           0, // 显式设 0 -> 不限制(override 默认)
 		"code_assistant": 20000,
-		"ui_assistant":   40000, // 未在 map 中 -> 默认 40000
-		"unknown_role":   40000, // 默认
+		"ui_assistant":   150000, // 未在 map 中 -> 默认 150000
+		"unknown_role":   150000, // 默认
 	}
 	for role, want := range cases {
 		got := cfg.LoopConfigByRole(role).TokenBudget
@@ -705,24 +705,24 @@ func TestLoopConfigByRole(t *testing.T) {
 	}
 }
 
-// TestLoopConfigByRoleDefault 验证未注入 TokenBudgetPerRole 时按角色默认值。
+// TestLoopConfigByRoleDefault 验证未注入 TokenBudgetPerRole 时按默认 150000 全角色。
 func TestLoopConfigByRoleDefault(t *testing.T) {
 	cfg := ReactRuntimeConfig{}
-	if got := cfg.LoopConfigByRole("domain").TokenBudget; got != 120000 {
-		t.Errorf("domain default = %d, want 120000", got)
+	for _, role := range []string{"domain", "meta", "code_assistant", "unknown_role"} {
+		if got := cfg.LoopConfigByRole(role).TokenBudget; got != 150000 {
+			t.Errorf("%s default = %d, want 150000", role, got)
+		}
 	}
-	if got := cfg.LoopConfigByRole("meta").TokenBudget; got != 200000 {
-		t.Errorf("meta default = %d, want 200000 (safety net, not 0)", got)
-	}
-	if got := cfg.LoopConfigByRole("code_assistant").TokenBudget; got != 40000 {
-		t.Errorf("assistant default = %d, want 40000", got)
+	// ContextTokenBudget 显式配置覆盖默认。
+	if got := (ReactRuntimeConfig{ContextTokenBudget: 200000}).LoopConfigByRole("unknown").TokenBudget; got != 200000 {
+		t.Errorf("ContextTokenBudget default = %d, want 200000", got)
 	}
 }
 
 // TestLoopConfigByRoleOverride 验证显式配置覆盖默认。
 func TestLoopConfigByRoleOverride(t *testing.T) {
 	cfg := ReactRuntimeConfig{TokenBudgetPerRole: map[string]int{
-		"domain": 30000, // 覆盖默认 120000
+		"domain": 30000, // 覆盖默认 150000
 	}}
 	if got := cfg.LoopConfigByRole("domain").TokenBudget; got != 30000 {
 		t.Errorf("override domain = %d, want 30000", got)
