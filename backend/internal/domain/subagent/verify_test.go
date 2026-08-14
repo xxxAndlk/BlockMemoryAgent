@@ -201,6 +201,37 @@ func TestDispatch_L0MissingEvidence(t *testing.T) {
 	}
 }
 
+// stubSalvageExtractor 返回固定打捞摘要，用于验证已附产出全文的失败不再追加打捞。
+type stubSalvageExtractor struct{}
+
+func (s *stubSalvageExtractor) Extract(ctx context.Context, text, goal, roleID string) ([]string, error) {
+	return []string{"SALVAGE-SUMMARY"}, nil
+}
+
+// TestDispatch_VerifyMissingSkipsSalvage 回归 08-13 塔防事故：verify_missing 已附产出全文，
+// 失败打捞提取器常整段回传同一答案，再追加致正文翻倍。
+func TestDispatch_VerifyMissingSkipsSalvage(t *testing.T) {
+	sp := &scriptedTextProvider{replies: []string{"done"}}
+	d, mb, toolsReg := newVerifyTestEnv(t, &mockModelFactory{provider: sp})
+	d.WithSalvageExtractor(&stubSalvageExtractor{})
+
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":     "code_assistant",
+		"task":        "写文件",
+		"verify_kind": "executable",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
+	}
+	body := waitMailboxBody(t, mb, "s1")
+	if !strings.Contains(body, "[failure kind=verify_missing retryable=false]") {
+		t.Fatalf("expected verify_missing marker, got: %q", body)
+	}
+	if strings.Contains(body, "失败打捞") || strings.Contains(body, "SALVAGE-SUMMARY") {
+		t.Fatalf("verify_missing 已附产出全文，不应再追加打捞摘要，got: %q", body)
+	}
+}
+
 // TestDispatch_L0RetryGainsEvidence 缺证据 → 反馈重试轮补上验证命令 → 通过。
 func TestDispatch_L0RetryGainsEvidence(t *testing.T) {
 	sp := &scriptedMsgProvider{msgs: []*blades.Message{

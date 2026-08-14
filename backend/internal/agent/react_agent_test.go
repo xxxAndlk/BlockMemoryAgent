@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	// strings 用于构造长字符串与断言内容。
 	"strings"
+	// sync/atomic 用于并发安全的活动计数。
+	"sync/atomic"
 	// time 用于重试退避等时间参数。
 	"time"
 	// testing 提供 Go 标准测试框架。
@@ -984,6 +986,47 @@ func TestReActAgent_StreamingActivityReporter(t *testing.T) {
 	// generateOnce 起始 1 次 + 3 个流式块各 1 次，至少 4 次。
 	if touches < 4 {
 		t.Fatalf("流式块应触发活动上报，got %d touches", touches)
+	}
+}
+
+// silentStreamProvider 流式 provider：先静默 silence 时长零 chunk（thinking 长考模拟），
+// 再产出最终块——复现 08-13 塔防 42K 输入 5m58s 无首 chunk 被心跳误杀的场景。
+type silentStreamProvider struct {
+	silence time.Duration
+}
+
+func (p *silentStreamProvider) Name() string { return "silent-stream" }
+
+func (p *silentStreamProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	return &blades.ModelResponse{Message: blades.AssistantMessage("from generate")}, nil
+}
+
+func (p *silentStreamProvider) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
+	return func(yield func(*blades.ModelResponse, error) bool) {
+		select {
+		case <-time.After(p.silence):
+		case <-ctx.Done():
+			return
+		}
+		yield(&blades.ModelResponse{Message: blades.AssistantMessage("final")}, nil)
+	}
+}
+
+// TestReActAgent_StreamKeepaliveDuringSilence 验证零 chunk 静默流期间保活定时器持续上报：
+// chunk 级上报救不了"首 token 前长考"，需定时器补上报防心跳误杀；真实挂死由墙钟超时兜底。
+func TestReActAgent_StreamKeepaliveDuringSilence(t *testing.T) {
+	p := &silentStreamProvider{silence: 150 * time.Millisecond}
+	var touches atomic.Int64
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, p, NewToolRegistryAdapter(reg)).
+		WithActivityReporter(func() { touches.Add(1) }).
+		WithStreamKeepalive(20 * time.Millisecond)
+	if _, err := a.Run(context.Background(), "hi"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 静默 150ms 零 chunk；保活每 20ms 一次，至少 5 次上报。
+	if n := touches.Load(); n < 5 {
+		t.Fatalf("零 chunk 静默流期间保活应持续上报，got %d touches", n)
 	}
 }
 

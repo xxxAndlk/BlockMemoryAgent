@@ -32,12 +32,12 @@
 43. **校验分层重构：可执行 > 证据核对 > 交叉模型 rubric，fail-closed**（✅ 已完成 2026-08-13，doc/变更.md 任务 41；来源：CrewAI/MS Agent Framework 对比讨论"当前校验很有问题"）
     - **前提修正（重要）**：原设计"复用 verifyloop 作 L0/L1 壳"失效——verifyloop 接线已于 2026-08-08 整体移除（A/B 实证自动派验证 Agent 闭环=负资产）。落地**不碰 verifyloop、不派任何验证 Agent、不加开关**：L0=确定性证据扫描（零 LLM 零 spawn），L1 证据段并入 L2 rubric judge prompt（【修改文件】+【验证证据】段），verify_kind 枚举简化为 auto/executable/rubric/none。
     - **落地**：L0 executable=扫历史 RunCommand 验证类命令（IsVerificationCommand 同口径）Success 证据，缺证据 1 轮反馈重试→verify_missing 报父（附产出全文）；L2=ReflectEngine judge 交叉模型（config judge_role 默认 prompt_reviewer）+ fail-closed（judge 错/坏 JSON→Unverified→kind=unverified 报父，绝不静默 pass）+ rubric 分项 checks；路由 verify_kind 默认 auto（reflection→rubric、code/test/reviewer→executable、其余 none）；成功摘要前缀【校验:通过(L0 证据/L2 rubric)】。
-    - 遗留：塔防回归观察 auto-executable 误报率（无测试基建任务会 verify_missing，噪音大可收紧 auto 推断）。
+    - 遗留：塔防回归观察 auto-executable 误报率（无测试基建任务会 verify_missing，噪音大可收紧 auto 推断）。08-14 实证一处误报已修：IsVerificationCommand 认不出 `node -c`（领域提示词规定的 JS 语法检查写法，塔防验收唯一证据来源），补 node -c/go build/go vet/py_compile/pytest 标记（变更.md 任务 42）；另修 verify_kind 描述诱导（模型抄 mode 值）+ verify_missing 通知正文翻倍（打捞摘要与产出全文重复）。继续观察。
 
 44. **去调度硬化件：根因修复后退役补偿控制**  ← 来源：同上对比讨论（"调度硬化需经苦难去除"）
     - 背景：当前调度硬化件（心跳 watchdog kill、派发预算 MaxTotalDispatches、同域去重 findPendingDomainSibling、等待叙事空转门、spec 强制门）= 系统不成熟期防 Token 爆炸/误杀的补偿控制，每条掩一个根因 bug。根因修了就该删，不是"生产成熟度特性"。目标：控制项数随版本递减到零（除 spec 门 + 终止条件）。前置依赖 #42 黑板（替去重/空转门）+ #43 校验（替预算 backstop）+ 08-13 流式活动上报（已替心跳假死判）。
     - 退役映射（每条 = 根因修法 + 退役条件）：
-      1. **心跳 watchdog idle>5min kill**：根因=LLM 调用看起来假死。08-13 已修流式 delta 持续上报活动。退役条件=流式上报稳定运行 N 个塔防任务无 HEARTBEAT KILL 误杀 -> 删 patrol/killStuckSubAgent，仅留 provider 网络调用超时（归 LLM 调用层，非"假死"概念）。
+      1. **心跳 watchdog idle>5min kill**：根因=LLM 调用看起来假死。08-13 已修流式 delta 持续上报活动；08-14 补零 chunk 盲区（首 token 前长考静默，流存活期间 30s 保活定时器上报，真实挂死由 sub_agent_timeout 墙钟兜底）。退役条件=N 个塔防任务无 HEARTBEAT KILL 误杀 -> 删 patrol/killStuckSubAgent，仅留 provider 网络调用超时（归 LLM 调用层，非"假死"概念）。
       2. **派发预算 MaxTotalDispatches**：根因=模型过度派发。退役条件=#42 黑板兄弟可见 + #43 校验派发纪律使派发数收敛到任务所需 -> 删预算计数，留终止条件（轮/token/墙钟）兜底。
       3. **同域去重 findPendingDomainSibling**：根因=模型重派同域。退役条件=#42 黑板派发前摄取兄弟产出（同 scope 可见模型主动复用不重派）-> 删去重件。
       4. **等待叙事空转门（waitForChildren/isWaitNarration/readOnlyToolNames）**：根因=等待叙事+只读重读烧 LLM。退役条件=#42 黑板 DomainAgent 等兄弟时读黑板决"继续等 vs 收口"（事件驱动阻塞替叙事空转）-> 删空转门，留事件驱动等待。
@@ -45,6 +45,7 @@
       6. **轮/token/墙钟预算**：留但重定位=框架级终止条件（对齐 CrewAI max_iter / MS TerminationCondition），非"防爆炸"。
     - 执行流程（按退役条件逐条，非一刀切）：
       1. 观察期：#42 + #43 落地后跑 N 个塔防任务，日志核查--无 HEARTBEAT KILL、无同域重派、无等待叙事空转、派发数收敛。
+         - **首次观察数据（08-13 塔防 18:14 会话，变更.md 任务 42）**：HEARTBEAT KILL 仍发生（code_assistant-2 被杀，5m58s 零 chunk 长考流——08-13 流式 delta 上报救不了"首 token 前静默"）。已修根因（流存活期间 30s 保活定时器上报，真实挂死由 sub_agent_timeout 墙钟兜底），观察期重开。同域重派/空转/派发收敛三项该会话未见复发（domain-1 被杀子 Agent 后自愈接管未重派）。
       2. 逐条退役：每条满足退役条件后单独删（含测试），跑回归确认根因未复发。先退役风险低项（去重件、空转门），后退役 watchdog/预算。
       3. 文档：变更.md 记录每条退役 + 退役前观察数据。
     - 验收：硬化件逐条删除后，塔防任务行为不退化（无 HEARTBEAT KILL、无重派、无空转、派发收敛）；控制项数递减。

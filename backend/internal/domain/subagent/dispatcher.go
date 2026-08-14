@@ -1018,7 +1018,7 @@ func (t *callSubAgentTool) Description() string {
 		"【mode 字段】（可选）派发执行模式：react（默认）/ reflection / plan_execute。" +
 		"琐碎单步任务省略；正确性敏感任务（算法/迁移/重构）用 reflection——执行后自动对照验收标准自检，不达标带反馈重试；" +
 		"多步骤长任务（多文件/多阶段）用 plan_execute——先出步骤计划（TUI 可见）再逐步执行。判断不准时省略，默认 react。\n\n" +
-		"【verify_kind 字段】（可选）校验分层：auto（默认，代码/测试助手自动要求测试证据、reflection 自动 rubric 评审）/ executable（必须有测试/lint/--check 成功运行的客观证据，否则会反馈重试 1 轮）/ rubric（独立评审模型按验收标准逐条判）/ none（跳过校验）。判断不准时省略，默认 auto。\n\n" +
+		"【verify_kind 字段】（可选）校验分层：auto（默认，按角色与执行模式自动选——代码/测试助手自动要求可执行证据、自检模式自动 rubric 评审）/ executable（必须有测试/lint/--check 成功运行的客观证据，否则会反馈重试 1 轮）/ rubric（独立评审模型按验收标准逐条判）/ none（跳过校验）。判断不准时省略，默认 auto。注意：verify_kind 与 mode 是不同字段，勿把 mode 的值填到本字段。\n\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
@@ -1438,8 +1438,9 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 			if t := strings.TrimSpace(result.Text); t != "" {
 				msg += "\n\n产出(未验证):\n" + t
 			}
-		}
-		if salvage != "" {
+			// 已附产出全文，不再追加失败打捞摘要：提取器常整段回传同一答案，
+			// 与全文重复（实证 08-13 塔防 verify_missing 正文翻倍）。槽位仍写，供重派用。
+		} else if salvage != "" {
 			msg += "\n\n" + salvagePrefixMarker + salvage
 		}
 		d.boardUpdate(ctx, parentID, domain, false, truncateRunes(msg, 300))

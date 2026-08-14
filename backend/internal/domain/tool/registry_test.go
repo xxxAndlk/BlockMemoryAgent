@@ -27,6 +27,43 @@ func TestRegistrySchema(t *testing.T) {
 	}
 }
 
+// TestIsVerificationCommand 验证验证类命令判定覆盖领域提示词规定的三种语法检查写法
+// （node -c / go build / py_compile）与常见测试运行器；非验证命令不误判。
+// 08-13 塔防实证：node -c 是塔防验收唯一证据来源却全不命中，致 verify_missing 误报。
+func TestIsVerificationCommand(t *testing.T) {
+	for _, cmd := range []string{
+		"node -c js/monster.js",
+		"cd D:\\x; node -c js/monster.js; node -c js/config.js",
+		"node --check js/a.js",
+		"go build ./pkg",
+		"go vet ./...",
+		"go test ./...",
+		"go test",
+		"python -m py_compile x.py",
+		"pytest tests/",
+		"npm test",
+		"npm run test",
+		"cargo test",
+		"eslint src/",
+		"npm run lint",
+	} {
+		if !IsVerificationCommand(cmd) {
+			t.Fatalf("IsVerificationCommand(%q) 应为 true", cmd)
+		}
+	}
+	for _, cmd := range []string{
+		"echo hello",
+		"node server.js",
+		"python app.py",
+		"cat README.md",
+		"git status",
+	} {
+		if IsVerificationCommand(cmd) {
+			t.Fatalf("IsVerificationCommand(%q) 应为 false", cmd)
+		}
+	}
+}
+
 // TestReadFile 验证 ReadFile 工具可以正确读取工作目录下的文件内容。
 func TestReadFile(t *testing.T) {
 	// 创建临时目录并在其中写入测试文件 hello.txt。

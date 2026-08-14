@@ -680,7 +680,9 @@ func normalizeFingerprint(s string) string {
 // 导出供 agent 包 L0 证据扫描（HasExecutableVerification，TODO #43）复用同一判定口径。
 func IsVerificationCommand(cmd string) bool {
 	c := strings.ToLower(strings.TrimSpace(cmd))
-	for _, m := range []string{"--check", "lint", "verify", " test ", "test -"} {
+	// node -c / go build / py_compile 是领域提示词规定的语法检查写法，与 --check 同义。
+	for _, m := range []string{"--check", "lint", "verify", " test ", "test -",
+		"node -c", "go build", "go vet", "py_compile", "pytest"} {
 		if strings.Contains(c, m) {
 			return true
 		}

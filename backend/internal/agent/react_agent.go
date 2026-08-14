@@ -75,6 +75,10 @@ type ReActAgent struct {
 	// 巡检发现超阈值无活动则判定子 Agent 假死（LLM 流式挂起等），主动 cancel。
 	// 为 nil 时跳过（测试场景或 DomainAgent/MetaAgent 不注入），不影响主流程。
 	activityReporter func()
+	// streamKeepalive 流式生成期间的保活上报间隔：thinking 模型首 token 前可能长时间
+	// 静默（零 chunk 无上报，实证 42K 输入 5m58s 无首 chunk 被心跳误杀），
+	// 定时器补上报防误判；真实挂死由 sub_agent_timeout 墙钟兜底。<=0 默认 30s。
+	streamKeepalive time.Duration
 }
 
 // PersonaInjector 把人格内容拼接到系统提示词之前；soul.Loader 实现该接口。
@@ -264,6 +268,12 @@ func (a *ReActAgent) WithPausedChildChecker(p PausedChildChecker) *ReActAgent {
 // 仅叶子 Agent 注入：DomainAgent/MetaAgent 有自身 wait loop，注入会误杀合法等待。
 func (a *ReActAgent) WithActivityReporter(fn func()) *ReActAgent {
 	a.activityReporter = fn
+	return a
+}
+
+// WithStreamKeepalive 设置流式保活上报间隔；<=0 用默认 30s。测试注入短间隔。
+func (a *ReActAgent) WithStreamKeepalive(d time.Duration) *ReActAgent {
+	a.streamKeepalive = d
 	return a
 }
 
@@ -821,6 +831,29 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 	// 不同 provider 的块语义不同：增量块追加、全量（累积）块替换——
 	// 用"块文本是否以已有累积文本为前缀"区分两种形态，兼容两类 provider。
 	display := ""
+	// 长考保活：thinking 模型首 token 前可静默数分钟，期间零 chunk 触发不了 touchActivity，
+	// 心跳巡检会误判假死杀掉活跃流；定时器补上报。真实挂死（流永久静默）由
+	// sub_agent_timeout 墙钟兜底，本保活不无限续命。
+	keepalive := a.streamKeepalive
+	if keepalive <= 0 {
+		keepalive = 30 * time.Second
+	}
+	keepaliveDone := make(chan struct{})
+	defer close(keepaliveDone)
+	go func() {
+		ticker := time.NewTicker(keepalive)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveDone:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.touchActivity()
+			}
+		}
+	}()
 	for resp, err := range sp.NewStreaming(ctx, req) {
 		if err != nil {
 			return nil, err

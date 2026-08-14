@@ -25,6 +25,19 @@ func TestHasExecutableVerification_SuccessEvidence(t *testing.T) {
 	}
 }
 
+// TestHasExecutableVerification_NodeCheckSyntax 回归 08-13 塔防事故：领域提示词规定
+// `node -c <file>` 作 JS 语法检查，但 IsVerificationCommand 旧标记全不命中，
+// 证据明明 success=true 却被判 verify_missing。
+func TestHasExecutableVerification_NodeCheckSyntax(t *testing.T) {
+	history := []ReactMessage{
+		runCommandCall("c1", `cd D:\data\project\tower-defense; node -c js/monster.js; node -c js/config.js`),
+		toolResultMsg("c1", ToolResult{Tool: "RunCommand", Success: true, Output: "PASS: monster.js\r\nPASS: config.js\r\n"}),
+	}
+	if !HasExecutableVerification(history) {
+		t.Fatal("node -c 成功执行应为验证证据")
+	}
+}
+
 func TestHasExecutableVerification_FailedCommand(t *testing.T) {
 	history := []ReactMessage{
 		runCommandCall("c1", "go test ./..."),
