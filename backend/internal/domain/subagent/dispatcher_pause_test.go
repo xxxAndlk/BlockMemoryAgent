@@ -249,34 +249,3 @@ func TestDispatcher_HasPausedChildNilTree(t *testing.T) {
 	}
 }
 
-// TestDispatchDuplicateDomainRejected 验证同父同领域的重复派发被拒绝：
-// 回归：MetaAgent 未等 mailbox 回传即重复派发同一任务（实证渲染引擎×3、游戏逻辑×2），
-// 多个子 Agent 并发写同一批文件互相覆盖。拒绝应发生在首次派发后、不同领域放行。
-func TestDispatchDuplicateDomainRejected(t *testing.T) {
-	d, _, _, _, _, toolsReg := newPauseTestEnv(t, &tokenUsageProvider{text: "domain work"})
-	ctx := dispatchCtx()
-	first, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
-		"role_id": "domain", "task": "实现 config.js", "domain": "配置", "responsibility": "负责 config.js",
-	})
-	if err != nil || !first.Success {
-		t.Fatalf("first dispatch failed: err=%v res=%+v", err, first)
-	}
-	// 同领域重复派发（task 文案不同也应命中 domain 去重）。
-	dup, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
-		"role_id": "domain", "task": "创建 config.js 定义 CONFIG", "domain": "配置", "responsibility": "负责 config.js",
-	})
-	if err != nil {
-		t.Fatalf("dispatch returned err: %v", err)
-	}
-	if dup.Success || !strings.Contains(dup.Error, "duplicate dispatch") {
-		t.Fatalf("duplicate dispatch should be rejected, got %+v", dup)
-	}
-	// 不同领域放行。
-	other, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
-		"role_id": "domain", "task": "实现 renderer.js", "domain": "渲染", "responsibility": "负责 renderer.js",
-	})
-	if err != nil || !other.Success {
-		t.Fatalf("different domain should pass, err=%v res=%+v", err, other)
-	}
-	_ = d
-}

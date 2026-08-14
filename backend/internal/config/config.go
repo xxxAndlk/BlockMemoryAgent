@@ -151,18 +151,6 @@ type AgentConfig struct {
 	// provider（与被审角色不同模型，防同模型自评放水/幻觉 pass）。默认 "prompt_reviewer"
 	// （deepseek-v4-flash）；取不到时 dispatcher 回退同角色 provider（测试/角色未注册场景）。
 	JudgeRole string `yaml:"judge_role"`
-	// ExploreBudget 单个叶子 Agent 任务内探索类工具（ReadFile/ListDir/SearchInFiles 与只读型 RunCommand）
-	// 调用次数上限。超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。
-	// 默认 20：单页 200 行 × 20 次 ≈ 4000 行，覆盖单领域职责文件全集。
-	ExploreBudget int `yaml:"explore_budget"`
-	// ExploreBudgetDomain DomainAgent（协调者）写入未开始前的探索预算。
-	// domain 职责是拆任务/派发/整合/验证，亲自探索是全舰队最贵路径，预算收紧倒逼下放叶子。
-	// 默认 8：查共享契约 + 1-2 次 SearchInFiles 定位 + 验收期精读失败点。
-	ExploreBudgetDomain int `yaml:"explore_budget_domain"`
-	// ExploreBudgetPostWrite 写入已开始后的探索预算升档上限。
-	// 修复期"读报错位置->改->复验"循环需要精读，禁读逼盲改回归震荡；写后放开精读。
-	// 默认 40：仍设上限防"逐文件通读"式发散，由连读循环守卫与 token 预算兜底。
-	ExploreBudgetPostWrite int `yaml:"explore_budget_post_write"`
 	// TaskMaxRunes 派发 task 文本软上限（rune 计数，TODO #35 放开预算）。
 	// 超软限未达硬限放行附压缩警告（软着陆），超硬限拒绝。默认 3000（原 2000 实证过紧，
 	// 强模型+大上下文时代转贴代价低，放开容纳完整自包含描述）。
@@ -451,15 +439,6 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.SalvageLLMTimeoutSec == 0 {
 		c.Agent.SalvageLLMTimeoutSec = 30
-	}
-	if c.Agent.ExploreBudget == 0 {
-		c.Agent.ExploreBudget = 20
-	}
-	if c.Agent.ExploreBudgetDomain == 0 {
-		c.Agent.ExploreBudgetDomain = 8
-	}
-	if c.Agent.ExploreBudgetPostWrite == 0 {
-		c.Agent.ExploreBudgetPostWrite = 40
 	}
 	if c.Agent.TaskMaxRunes == 0 {
 		c.Agent.TaskMaxRunes = 3000

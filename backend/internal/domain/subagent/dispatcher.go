@@ -50,23 +50,6 @@ type callSubAgentInput struct {
 	VerifyKind string `json:"verify_kind"`
 }
 
-// isVerificationTask 判定 domain 任务是"整品验收/边验边修"型（读重、验证优先）：
-// 探索预算出生即按 postWrite 档计算，无需等首次 WriteFile（见 tool.WithVerifyTask）。
-// 判定依据（meta 派发整品验收时固定模板）：
-//   - 任务文本含"验收清单"或"边验边修"（建设任务只有单条"验收：..."，无清单/边修边验）；
-//   - resume 场景任务被截成 100 字 brief，靠 domain 名（整品验收/集成验收/整体验收）兜底——
-//     domain 字段是唯一稳定出现在验收派发且绝不出现在建设派发的信号。
-// 误判方向是"过度授权"（建设任务误得 40 次预算）：安全，探索仍有软阻断+升级强杀兜底。
-func isVerificationTask(domain, task string) bool {
-	t := domain + "\n" + task
-	for _, m := range []string{"验收清单", "边验边修", "整品验收", "集成验收", "整体验收"} {
-		if strings.Contains(t, m) {
-			return true
-		}
-	}
-	return false
-}
-
 // ModelProviderFactory 是 model.ModelFactory 的子集，
 // Dispatcher 只需要从中获取指定角色对应的模型提供者即可创建子 Agent。
 type ModelProviderFactory interface {
@@ -541,39 +524,6 @@ func (d *Dispatcher) HasPausedChild(parentID string) bool {
 		}
 	}
 	return false
-}
-
-// findPendingDomainSibling 在 Agent 树快照中查找同一父 Agent 下仍在执行/暂停的
-// 同领域（domain 相同）domain 子 Agent，命中返回其子 Agent ID，无则返回空串。
-// domain 为空时不去重（LLM 漏填 domain 的场景无法可靠判重，放行）。
-// 供 call_sub_agent 重复派发去重使用。
-func (d *Dispatcher) findPendingDomainSibling(ctx context.Context, parentID, domain string) string {
-	if d.treeFn == nil || parentID == "" {
-		return ""
-	}
-	sid := tool.SessionIDFromContext(ctx)
-	if sid == "" {
-		if i := strings.Index(parentID, "/"); i > 0 {
-			sid = parentID[:i]
-		}
-	}
-	t := d.treeFn(sid)
-	if t == nil {
-		return ""
-	}
-	wantDomain := strings.TrimSpace(domain)
-	for _, n := range t.Snapshot() {
-		if n.ParentID != parentID || n.Role != "domain" {
-			continue
-		}
-		if n.Status != orchestrator.StatusRunning && n.Status != orchestrator.StatusPaused {
-			continue
-		}
-		if wantDomain != "" && strings.TrimSpace(n.Domain) == wantDomain {
-			return n.ID
-		}
-	}
-	return ""
 }
 
 // NewDispatcher 创建一个新的子 Agent 调度器。
@@ -1158,18 +1108,9 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		}
 	}
 
-	// 重复派发去重：同一父 Agent 已有同领域（domain 相同）的子 Agent 在执行/暂停中时拒绝。
-	// 实证：MetaAgent 未等 mailbox 回传即重复派发同一任务（渲染引擎×3、游戏逻辑×2），
-	// 多个子 Agent 并发写同一批文件互相覆盖、接口漂移。Agent 树是权威状态，直接查快照，
-	// 不另维护计数（杜绝清理遗漏）。拒绝发生在限额计数之前，不烧派发配额。
+	// 前序失败打捞（TODO #20 第三层）：同父同 domain 存在 Failed/Cancelled 兄弟时，
+	// 把其打捞摘要（<parentID>:salvage:<domain>）追加到新任务文本，机制上保证重派不重复探索。
 	if roleID == "domain" {
-		if dup := d.findPendingDomainSibling(ctx, parentID, domain); dup != "" {
-			return "", &tool.Result{Error: fmt.Sprintf(
-				"duplicate dispatch: 同领域子 Agent %s 正在执行中（domain=%s）。请等待其 [mailbox from %s] 回传结果后再做下一步；如需补充或修正需求，等其完成后再派发",
-				dup, domain, dup), Category: tool.ResultCategoryValidationRejected}
-		}
-		// 前序失败打捞（TODO #20 第三层）：同父同 domain 存在 Failed/Cancelled 兄弟时，
-		// 把其打捞摘要（<parentID>:salvage:<domain>）追加到新任务文本，机制上保证重派不重复探索。
 		task = d.withPriorSalvage(ctx, parentID, domain, task)
 	}
 
@@ -1658,15 +1599,6 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		task = strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + task
 	}
 
-	// 验证型任务标记：整品验收/边验边修型 domain 探索预算出生即按 postWrite 档（40 次）。
-	// 2026-08-12 整品验收事故实证：domain 16 次在"读 8 文件跨文件核对契约"阶段即耗尽，
-	// 只能凭记忆整文件盲改、触发超长 LLM 调用。验收任务读在写前，不该等首次 WriteFile 升档。
-	if roleDef.ID == "domain" && isVerificationTask(domain, task) {
-		ctx = tool.WithVerifyTask(ctx)
-		log.Printf("[subagent] verify-task: sub=%s domain=%q (explore budget => postWrite tier)",
-			subAgentID, domain)
-	}
-
 	vk := resolveVerifyKind(verifyKind, roleDef.ID, mode)
 	result, err := d.runEngine(ctx, sub, subAgentID, roleDef.ID, mode, vk, task)
 	if err != nil {
@@ -1973,13 +1905,6 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	}()
 
 	log.Printf("[subagent] resume: sub=%s parent=%s domain=%s msgs=%d", pausedNodeID, parentID, pausedNode.Domain, len(msgs))
-	// 验证型任务标记沿用：resume 的 domain 若是整品验收型，探索预算继续按 postWrite 档。
-	// 判定靠 pausedNode.Domain/Task（任务文本已被截成 brief，domain 名是稳定信号）。
-	if isVerificationTask(pausedNode.Domain, pausedNode.Task) {
-		subCtx = tool.WithVerifyTask(subCtx)
-		log.Printf("[subagent] resume verify-task: sub=%s domain=%q (explore budget => postWrite tier)",
-			pausedNodeID, pausedNode.Domain)
-	}
 
 	result, err := sub.RunWithHistory(subCtx, "继续", msgs)
 	files := agent.FilesModifiedFromHistory(result.History)

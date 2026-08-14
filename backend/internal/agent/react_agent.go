@@ -580,24 +580,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 工具结果全部入史后再注入 mailbox：user 角色的 mailbox 消息若插在 assistant
 		// tool_calls 与其 tool 结果之间，会触发 Anthropic 配对校验 400（整轮请求作废，
 		// 实证：domain 派发子 Agent 后收到子 Agent 完成通知，白跑 31m43s 后失败）。
-		var drained int
-		history, drained = a.drainMailbox(history)
-		// 等待叙事门：本轮只输出等待文案 + 只读探索（无任何实质动作）、无新 mailbox 消息、
-		// 仍有未决子 Agent 时，改为事件驱动阻塞等待，不再逐轮烧 LLM 重复"等待回传"+重读文件
-		// （实证 2026-08-13：thinking 模型身份混淆后领域 Agent 与叶子每轮空转叙事，
-		// 3 参数改动跑 12 分钟，其中大部分轮次为零进展）。
-		// 注意：不能用 history, drained := ... —— := 会在循环体内新建遮蔽变量，
-		// mailbox 消息追加到遮蔽副本、随迭代结束丢失（实证：mailbox 消息整体失踪）。
-		if drained == 0 && a.mailbox != nil && a.pendingChecker != nil &&
-			a.pendingChecker.PendingChildren(a.name) > 0 &&
-			isWaitNarration(assistant.Content) && toolCallsAllReadOnly(assistant.ToolCalls) {
-			var paused bool
-			history, paused = a.waitForChildren(ctx, history)
-			if paused {
-				return ReactResult{History: history, LimitReached: true, PausedOnChild: true}, nil
-			}
-			continue
-		}
+		history, _ = a.drainMailbox(history)
 	}
 
 	// 达到最大迭代次数上限（仅 maxIter>0 时可能触发）：
@@ -913,51 +896,6 @@ func (a *ReActAgent) waitForChildren(ctx context.Context, history []ReactMessage
 		}
 	}
 	return history, false
-}
-
-// waitNarrationMarkers 是等待叙事文案的判定关键词：模型输出含其一且未做实质动作时，
-// 说明本轮在"等子 Agent 回传"叙事里空转而非推进任务。
-var waitNarrationMarkers = []string{"等待", "回传", "稍候", "waiting"}
-
-// isWaitNarration 判断模型输出文本是否为纯等待叙事。
-func isWaitNarration(text string) bool {
-	t := strings.TrimSpace(text)
-	if t == "" {
-		return false
-	}
-	for _, m := range waitNarrationMarkers {
-		if strings.Contains(t, m) {
-			return true
-		}
-	}
-	return false
-}
-
-// readOnlyToolNames 是纯探索类工具集合：执行不产生任何外部状态变化。
-// 等待叙事轮只调这些工具 = 模型在空转重读而非推进任务，触发等待门。
-var readOnlyToolNames = map[string]bool{
-	"ReadFile":      true,
-	"ListDir":       true,
-	"SearchInFiles": true,
-	"HTTPGet":       true,
-	"GitStatus":     true,
-	"GitLog":        true,
-	"GitDiff":       true,
-	"GitBlame":      true,
-}
-
-// toolCallsAllReadOnly 判断本轮工具调用是否全部为只读探索类；空调用列表返回 false
-// （无工具调用的轮次走无工具分支的终结保护，不在此判定）。
-func toolCallsAllReadOnly(calls []ToolCall) bool {
-	if len(calls) == 0 {
-		return false
-	}
-	for _, c := range calls {
-		if !readOnlyToolNames[c.Name] {
-			return false
-		}
-	}
-	return true
 }
 
 // summarizeWindow 已迁入 domain/memory/pipeline.go 的 compressHistory 函数。

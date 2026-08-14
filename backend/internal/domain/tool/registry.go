@@ -14,77 +14,16 @@ import (
 	"github.com/go-kratos/blades/tools"                     // blades tools 包提供对外暴露的工具定义
 )
 
-// maxConsecutiveFailures 定义单个工具连续失败的最大次数，
-// 超过此次数将触发循环退出，避免无限重试。
-const maxConsecutiveFailures = 3
-
 // maxConsecutiveValidationRejections 定义单个工具连续校验拒绝的最大次数（TODO #32）。
 // 校验拒绝是"修正参数即可"的前置条件问题，与执行失败分开计：阈值放宽到 5，
 // 仍防"模型复读同一错误参数"的无效循环（编造参数硬闯校验）。
 const maxConsecutiveValidationRejections = 5
-
-// exploreBudget 是单个 Agent 任务内探索类工具（ReadFile/ListDir/SearchInFiles）调用次数上限。
-// 防止 Agent 陷入探索循环不收敛：实证 domain-2 调 81 次探索工具 30m 超时未写完。
-// 超过后这些工具返回错误，逼迫 Agent 开始 WriteFile。HTTPGet 不计（联网查询场景不同）。
-// RunCommand 仅"只读型命令"（cat/Get-Content/type/head/tail/more）计入：实证集成验证 Agent
-// 用 RunCommand 逐文件 cat 绕过 ReadFile 预算，串行读文件 19 分钟不收敛（logs/tui/2026-08-03.log）。
-// 验证/动作类 RunCommand（node --check、go build、mkdir）仍不计入：封禁会让 Agent 写完文件后
-// 无法按纪律验证，在"必须验证"与"工具被拒"之间死循环（实证：配置 Agent 被拒 8 轮空转 4 分钟）。
-// 取值 20：实证（2026-08-10 塔防日志）旧值 8 次 × 单页实测 60-110 行（4000 字符截停），
-// 单领域职责文件（如 game.js 849 行 + monster.js 521 行）需 ~17 页才能读完，
-// 4 个领域 Agent 全部耗尽预算被 loop guard 判死；20 次 × 200 行/页覆盖 ~4000 行。
-// exploreBudget 是单个叶子 Agent 任务内探索类工具调用次数上限的默认值。
-// 实际生效值由 config.AgentConfig.ExploreBudget 覆盖（配置 0 时回落本常量）。
-const exploreBudget = 20
-
-// exploreBudgetDomain 是 DomainAgent（协调者）写入未开始前的探索预算。
-// domain 的职责是拆任务/派发/整合/验证，亲自探索是全舰队最贵路径（glm-5.2 thinking
-// 单轮 3min+；2026-08-10 塔防日志 domain-2 亲自读 tower.js/bullet.js，60 分钟墙钟
-// 超时被杀时 20 次预算远未耗尽——瓶颈是带大上下文的慢轮次，不是次数）。
-// 8 次足够协调者用：查共享契约/file_tree + 1-2 次 SearchInFiles 定位 + 验收期精读失败点。
-// 通读/多文件了解结构应连同实现一起下放叶子（叶子模型快、预算独立 20 次、失败隔离），
-// 耗尽文案导向 call_sub_agent 而非 WriteFile（与叶子文案相反——叶子不能派发才逼它写）。
-const exploreBudgetDomain = 8
-
-// exploreBudgetPostWrite 是"写入已开始"后的探索预算升档上限。
-// v13 基准实证：验收领域开工 57 秒读 8 个文件耗尽预算后被禁止再读，只能凭记忆整文件
-// 盲重写（4 次 25-40K output tokens 巨型调用耗 29 分钟），盲改回归震荡致 13/16 平台期
-// 30 分钟——修复期工作本质是"读报错位置→改→复验"循环，禁读等于逼盲改。
-// 首次 WriteFile 成功后预算升档到本常量：写前 20 次反空转纪律不变，写后放开精读修复。
-// 仍设上限防"逐文件通读"式发散（v2 实证 19 分钟不收敛），并有连读循环守卫与 token 预算兜底。
-const exploreBudgetPostWrite = 40
-
-// readLikeCmdPrefixes 是只读型 shell 命令前缀（小写匹配，覆盖 bash 与 PowerShell 两侧）。
-// RunCommand 以这些前缀读文件时按探索工具计费；批量读取（如 cat a b c）只算 1 次，
-// 借此把"逐文件多次读"逼成"单条命令批量读"。
-var readLikeCmdPrefixes = []string{
-	"cat ", "type ", "more ", "head ", "tail ",
-	"get-content", "gc ", // PowerShell
-}
-
-// isReadLikeCommand 判断 RunCommand 参数是否为只读型文件查看命令。
-func isReadLikeCommand(args map[string]any) bool {
-	cmd, _ := args["command"].(string)
-	c := strings.ToLower(strings.TrimSpace(cmd))
-	for _, p := range readLikeCmdPrefixes {
-		if strings.HasPrefix(c, p) {
-			return true
-		}
-	}
-	return false
-}
 
 // maxConsecutiveSameRead 是同一 scope 内"参数完全相同的 ReadFile"连续调用次数上限。
 // 重读不再被拦截（每次直返磁盘最新内容，天然无脏数据），但参数完全不变的连续重复
 // 调用意味着模型未吸收内容、陷入死循环（实证：代码助手对 config.js 反复 ReadFile 10+ 次）：
 // 第 2 次直返内容并附一句提醒，第 3 次触发 ActionLoopExit 终止 ReAct 循环兜底。
 const maxConsecutiveSameRead = 3
-
-// exploreSoftBlockGrace 是探索预算软阻断（TODO #38-1）的升级宽限：
-// 超预算后仍连续调探索类工具本数才升级 ErrLoopExit 强杀。
-// 1 次超预算可能是正常收尾（查完最后一个文件就写），软阻断文案已给改派指导，
-// 连续复读探索才是真死循环信号（事故实证 2026-08-10：被杀 domain 打捞文本均在正常推进）。
-const exploreSoftBlockGrace = 3
 
 // Tool 是内置工具的通用接口，所有具体工具都需要实现该接口。
 type Tool interface {
@@ -96,16 +35,12 @@ type Tool interface {
 	Execute(ctx context.Context, args map[string]any) *Result
 }
 
-// failureCounter 用于统计连续失败次数，支持并发安全地增加计数和重置计数。
-// 两类计数（TODO #32）：counts=执行失败（execution_failed，阈值 3 终止）；
-// validationCounts=校验拒绝（validation_rejected，阈值 5 终止）——分开计，互不共享。
-// counts 键为 "工具名\x00错误指纹" 复合键（TODO #38-2）：指纹相同（相同命令与报错）才累加，
-// 命令/报错任何不同即新键从 1 重计——"换方式尝试"是正在推进而非无效重试。
+// failureCounter 用于统计连续校验拒绝次数，支持并发安全地增加计数和重置计数。
+// 校验拒绝（validation_rejected，阈值 5 终止）按工具名计数——"修正参数即可"
+// 的前置条件问题，修正参数后重试即恢复，无需指纹区分（TODO #32）。
 type failureCounter struct {
-	// mu 保护 counts 与 validationCounts 的读写锁，避免并发竞争。
+	// mu 保护 validationCounts 的读写锁，避免并发竞争。
 	mu sync.Mutex
-	// counts 记录每个 "工具名\x00错误指纹" 对应的连续执行失败次数。
-	counts map[string]int
 	// validationCounts 记录每个工具名称对应的连续校验拒绝次数。
 	validationCounts map[string]int
 }
@@ -113,22 +48,8 @@ type failureCounter struct {
 // newFailureCounter 创建一个新的失败计数器，内部 map 已经初始化。
 func newFailureCounter() *failureCounter {
 	return &failureCounter{
-		counts:           make(map[string]int),
 		validationCounts: make(map[string]int),
 	}
-}
-
-// fail 将指定工具的连续失败次数加 1（按 工具名\x00指纹 复合键），并返回当前次数。
-func (f *failureCounter) fail(name, fingerprint string) int {
-	// 加锁保护 counts 的并发修改。
-	f.mu.Lock()
-	// 函数退出时释放锁，避免遗忘。
-	defer f.mu.Unlock()
-	// 对应复合键计数加 1。
-	key := name + "\x00" + fingerprint
-	f.counts[key]++
-	// 返回增加后的次数，供调用方判断是否达到阈值。
-	return f.counts[key]
 }
 
 // failValidation 将指定工具的连续校验拒绝次数加 1，并返回当前次数。
@@ -139,19 +60,12 @@ func (f *failureCounter) failValidation(name string) int {
 	return f.validationCounts[name]
 }
 
-// reset 将指定工具的全部连续失败计数清零（含所有指纹键，从 map 中删除）。
+// reset 将指定工具的全部连续校验拒绝计数清零。
 func (f *failureCounter) reset(name string) {
-	// 加锁保护 counts 的并发修改。
+	// 加锁保护 validationCounts 的并发修改。
 	f.mu.Lock()
-	// 函数退出时释放锁。
+	// 函数退出时释放锁，避免遗忘。
 	defer f.mu.Unlock()
-	// 该工具成功即视为恢复正常：清掉全部指纹键，而非只清当前指纹。
-	prefix := name + "\x00"
-	for k := range f.counts {
-		if strings.HasPrefix(k, prefix) {
-			delete(f.counts, k)
-		}
-	}
 	delete(f.validationCounts, name)
 }
 
@@ -178,18 +92,6 @@ type Registry struct {
 	// 达 maxConsecutiveSameRead 触发 LoopExit（真死循环兜底）；
 	// 参数有任何变化（翻页/换文件）即归零——重读本身合法，每次直返磁盘最新内容。
 	sameReadCount map[string]int
-	// exploreCount 按 scopeKey 记录本任务内探索类工具（ReadFile/ListDir）调用次数。
-	// 防止 Agent 陷入探索循环不收敛：实证 domain-2 调 81 次探索工具 30m 超时未写完。
-	// 超过 exploreBudget 后 ReadFile/ListDir 返回错误，逼迫 Agent 开始 WriteFile。
-	// RunCommand 不计（验证/动作类），避免写完文件后无法验证陷入重试死循环。
-	exploreCount map[string]int
-	// exploreBlockCount 按 scopeKey 记录探索预算软阻断的连续次数（TODO #38-1）：
-	// 超预算后每次被拦的探索调用 +1，达 exploreSoftBlockGrace 后升级 ErrLoopExit。
-	// 与 exploreCount 解耦：被拦调用不污染预算计数，WriteFile 升档/预算算术不受影响。
-	exploreBlockCount map[string]int
-	// writeCount 按 scopeKey 记录 WriteFile 成功次数：>0 后探索预算升档到
-	// exploreBudgetPostWrite（修复期"读报错→改→复验"循环需要精读，见常量注释）。
-	writeCount map[string]int
 	// sharedMemory 是 WriteSharedMemory 工具的 KV 后端，由 bootstrap 注入。
 	// 为 nil 时 WriteSharedMemory 注册但不生效，调用返回 store 未配置错误。
 	sharedMemory SharedMemoryStore
@@ -203,12 +105,6 @@ type Registry struct {
 	// productionWorkDir 是配置的生产环境工作目录（绝对路径）；空 = 未启用生产边界确认，
 	// 仅危险命令模式（isDangerousCommand）触发确认。
 	productionWorkDir string
-	// exploreBudget / exploreBudgetDomain / exploreBudgetPostWrite 是探索类工具调用次数上限，
-	// 由 config.AgentConfig 注入；零值回落到同名包级常量（默认 20/8/40）。
-	// 三档：叶子写入前 / domain 写入前 / 写入后修复期。详见常量注释。
-	exploreBudget           int
-	exploreBudgetDomain     int
-	exploreBudgetPostWrite  int
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -229,27 +125,10 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		aliases:           make(map[string]string),
 		lastReadKey:       make(map[string]string),
 		sameReadCount:     make(map[string]int),
-		exploreCount:      make(map[string]int),
-		exploreBlockCount: make(map[string]int),
-		writeCount:        make(map[string]int),
 		productionWorkDir: "",
-		// 探索预算三档：零值时 checkExploreBudget/exploreLimit 内部回落到包级常量。
-		exploreBudget:          exploreBudget,
-		exploreBudgetDomain:    exploreBudgetDomain,
-		exploreBudgetPostWrite: exploreBudgetPostWrite,
 	}
 	if cfg != nil {
 		r.productionWorkDir = cfg.ProductionWorkDir
-		// 配置覆盖探索预算三档：>0 才生效（0 表示未配置，保持常量默认）。
-		if cfg.ExploreBudget > 0 {
-			r.exploreBudget = cfg.ExploreBudget
-		}
-		if cfg.ExploreBudgetDomain > 0 {
-			r.exploreBudgetDomain = cfg.ExploreBudgetDomain
-		}
-		if cfg.ExploreBudgetPostWrite > 0 {
-			r.exploreBudgetPostWrite = cfg.ExploreBudgetPostWrite
-		}
 	}
 	// 去抖异步刷新 PROJECT.md：文件增删改后安静期触发 LLM 按职责重分区。
 	// cls nil（测试）时 RefreshProjectDoc 走启发式，刷新仍更新文件列表。
@@ -462,39 +341,6 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		}
 	}
 
-	// 探索预算：探索类工具合计调用次数上限，防 Agent 陷入探索循环不收敛。
-	// 实证 domain-2 调 81 次探索工具 30m 超时未写完。超预算返回工具级错误（软阻断，TODO #38-1）：
-	// Agent 存活可立即执行文案里的改派建议——叶子 WriteFile 落地（它不能派发）、domain call_sub_agent 下放叶子；
-	// 软阻断后仍连续调探索类工具达 3 次才升级 ErrLoopExit 强杀（那才是真死循环信号，
-	// 事故实证 2026-08-10：4 个 domain 首轮被杀时打捞文本均显示正在正常推进——"我来读取 X""draw(ctx) 在 L165…"，
-	// 一刀切强杀用一整轮 Agent 生命换取 task 上下文精确化）。
-	// SearchInFiles 计入预算：v8 基准实证验收领域 ReadFile 预算耗尽后改用 SearchInFiles
-	// 连搜 14 次零 WriteFile，探索 17 分钟未修一处——"定位性强"同样是发散载体。
-	// HTTPGet 不计（联网查询场景不同）。WriteFile/WriteSharedMemory 不计（产出类）。
-	// RunCommand 只读型命令（cat/Get-Content 等）按探索计费：防逐文件 cat 绕过预算串行读；
-	// 验证/动作类 RunCommand 不计，封禁会让 Agent 写完文件后无法验证而陷入重试死循环。
-	exploreLike := name == "ReadFile" || name == "ListDir" || name == "SearchInFiles" || (name == "RunCommand" && isReadLikeCommand(args))
-	if exploreLike {
-		if blocked := r.checkExploreBudget(ctx); blocked != "" {
-			// 软阻断连续计数：超预算后每次被拦的探索调用 +1，达宽限后升级强杀。
-			// 与 exploreCount 解耦——被拦调用不污染预算计数（WriteFile 升档/预算算术不受影响）。
-			blocks := r.recordExploreBlock(ctx)
-			escalate := blocks > exploreSoftBlockGrace
-			result := &Result{Tool: name, Error: blocked}
-			r.fillResult(ctx, result, args)
-			scope := scopeKeyFromCtx(ctx)
-			log.Printf("[tool] explore budget exhausted: scope=%s tool=%s budget=%d reason=%q escalate=%v",
-				scope, name, r.exploreLimit(ctx, scope), blocked, escalate)
-			r.emitResult(ctx, result)
-			// 软阻断：工具级错误，Agent 存活，按文案改派（下放叶子/转 WriteFile）。
-			// 升级路径（软阻断后仍连调探索超宽限）：返回包装哨兵让主循环终止，避免继续烧轮次。
-			if escalate {
-				return result, fmt.Errorf("%w: %s", ErrLoopExit, blocked)
-			}
-			return result, nil
-		}
-	}
-
 	// 破坏性工具分级（TODO #17 P1）：命中生产边界/危险命令模式时先经 approvalHook 等用户确认。
 	// 拒绝则返回工具级错误（不执行），Agent 可见并自行决策；hook 错误上抛中止本次调用。
 	// 非生产环境与普通工具不经过此路径，保持自主。
@@ -521,12 +367,6 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		result.Output += readNote
 	}
 
-	// 探索类工具调用后计数 +1（不论成功失败都计，避免失败重试绕过预算）。
-	// ReadFile/ListDir 与只读型 RunCommand 计入；验证/动作类 RunCommand 不计。
-	if exploreLike {
-		r.recordExplore(ctx)
-	}
-
 	// WriteFile 成功后失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
 	// 防止子 Agent 改文件后，父 Agent 下次派发仍把旧摘要注入新子 Agent task 导致幻觉。
 	// ReadFile 无需清已读记录：重读本就直返磁盘最新内容，不存在脏数据问题。
@@ -534,8 +374,6 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		r.invalidateSharedMemoryForPath(ctx, result.Path)
 		// 文件新增/修改触发去抖刷新 PROJECT.md 领域影响范围（安静期一次 LLM 重分区）。
 		r.scheduleProjectRefresh()
-		// 写入已开始：探索预算升档（修复期允许精读，见 exploreBudgetPostWrite）。
-		r.recordWrite(ctx)
 	}
 
 	// RunCommand 命中删改类命令（rm/mv/mkdir/touch/cp/git rm/git mv）触发去抖刷新，
@@ -549,11 +387,11 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 填充结果的通用字段，如 SessionID、ArgsJSON 以及执行器回调。
 	r.fillResult(ctx, result, args)
 
-	// 根据执行成功与否更新失败计数（TODO #32 分级：校验拒绝与执行失败分开计，互不共享）。
-	if result.Success {
-		// 成功则重置该工具的连续失败计数（两类一起清）。
-		r.failures.reset(name)
-	} else {
+	// 校验拒绝计数（TODO #32）：校验拒绝按工具名计数，连续达
+	// maxConsecutiveValidationRejections 触发 ErrLoopExit 终止（防"复读同一错误参数"无效循环）。
+	// 执行失败不计数（连杀指纹已退役，TODO #44）：模型"改→试→复验"的正常调试节奏
+	// 不应被硬阈值误杀，真死循环由连读 guard 与 sub_agent_timeout 墙钟兜底。
+	if !result.Success {
 		// 无显式 Category 的失败按执行失败计（默认语义，保持既有行为）。
 		cat := result.Category
 		if cat == "" {
@@ -562,7 +400,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		if cat == ResultCategoryValidationRejected {
 			// 校验拒绝：参数/前置条件问题，修正参数即可——单独计数（阈值更高），
 			// 文案明示"这是校验拒绝，不计入失败"，防止模型误以为工具坏了。
-			// MetaAgent 的 call_sub_agent/call_sub_agents 豁免连杀终止：编排者的纠偏循环是正常工作方式
+			// MetaAgent 的 call_sub_agent/call_sub_agents 豁免校验拒绝终止：编排者的纠偏循环是正常工作方式
 			//（事故实证：自检任务连续三次可纠正的校验拒绝，第 3 次即 ErrLoopExit 终止整个 goal）。
 			if isMetaDispatch(ctx, name) {
 				log.Printf("[tool] validation rejected (meta dispatch exempt): scope=%s tool=%s err=%q", scopeKeyFromCtx(ctx), name, result.Error)
@@ -578,33 +416,6 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 				r.emitResult(ctx, result)
 				return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
 			}
-		} else {
-			// 执行失败（默认）：累加连续失败计数。
-			// 验证类命令（--check/lint/test 等，退出码即有效反馈）失败不计连杀（TODO #38-2）：
-			// 模型以"跑检查→改→再跑"方式推进时，连续不同报错是正常调试节奏，
-			// 硬阈值会把修复-验证循环误判为死循环（事故实证：ca-5 三次失败各不相同且每次在推进，
-			// 间隔还有成功的 WriteFile——被杀时 tower.js 已写入 4769 bytes、正在验证）。
-			skipCount := false
-			if name == "RunCommand" {
-				if cmd, _ := args["command"].(string); IsVerificationCommand(cmd) {
-					r.failures.reset(name)
-					skipCount = true
-					log.Printf("[tool] verification failure (not counted): scope=%s tool=%s err=%q", scopeKeyFromCtx(ctx), name, result.Error)
-				}
-			}
-			if !skipCount {
-				// 指纹键计数：命令/报错不同=正在推进，新键从 1 重计；相同调用相同报错才累加。
-				n := r.failures.fail(name, failureFingerprint(name, args, result))
-				// 连续失败达阈值 = 无效重试死循环信号，返回包装哨兵终止 ReAct 循环
-				//（原为 blades ActionLoopExit 上下文信号，无注入方，静默丢弃成死代码）。
-				if n >= maxConsecutiveFailures {
-					msg := fmt.Sprintf("工具 %s 已连续 %d 次以相同方式失败（相同命令与报错），疑似无效重试死循环，本次任务终止。", name, n)
-					log.Printf("[tool] consecutive failures LoopExit: scope=%s tool=%s failures=%d", scopeKeyFromCtx(ctx), name, n)
-					result.Error = msg
-					r.emitResult(ctx, result)
-					return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
-				}
-			}
 		}
 	}
 
@@ -616,7 +427,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 
 // isMetaDispatch 判断当前调用是否为 MetaAgent 的派发工具调用（TODO #32-3）：
 // 编排者的 call_sub_agent 校验拒绝是正常纠偏（改了参数/补了 spec 再派），
-// 豁免连杀终止，防止"正确纠偏的编排者"被守卫误杀。
+// 豁免校验拒绝终止，防止"正确纠偏的编排者"被守卫误杀。
 func isMetaDispatch(ctx context.Context, name string) bool {
 	if name != "call_sub_agent" && name != "call_sub_agents" {
 		return false
@@ -624,59 +435,8 @@ func isMetaDispatch(ctx context.Context, name string) bool {
 	return RoleIDFromContext(ctx) == "meta"
 }
 
-// failureFingerprint 生成一次工具失败的归一化指纹（TODO #38-2）：
-// 指纹相同 = 完全相同调用 + 相同报错 = 无效重试死循环候选；指纹不同 = 正在推进，重新计数。
-// RunCommand 取命令骨架 + stderr 首行——"exit status 1" 这类通用 Error 无区分度，
-// 错误详情在 Output 的 [stderr] 段（事故实证：ca-5 三次失败 stderr 各不相同）。
-func failureFingerprint(name string, args map[string]any, result *Result) string {
-	if name == "RunCommand" {
-		cmd, _ := args["command"].(string)
-		return "RunCommand\x00" + normalizeFingerprint(cmd) + "\x00" + firstErrorLine(result)
-	}
-	return name + "\x00" + firstErrorLine(result)
-}
-
-// firstErrorLine 提取失败结果中最有区分度的一行：
-// RunCommand 优先 [stderr] 首行（截掉 port-conflict 提示后缀），其次 result.Error 首行，
-// 兜底 Output 首行。空白行跳过；返回截断版防长文本污染计数键。
-func firstErrorLine(result *Result) string {
-	src := ""
-	if i := strings.Index(result.Output, "[stderr]"); i >= 0 {
-		rest := result.Output[i+len("[stderr]"):]
-		if j := strings.Index(rest, "\n[port-conflict]"); j >= 0 {
-			rest = rest[:j]
-		}
-		src = rest
-	}
-	if src == "" && result.Error != "" {
-		src = result.Error
-	}
-	if src == "" {
-		src = result.Output
-	}
-	for _, line := range strings.Split(src, "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			return normalizeFingerprint(line)
-		}
-	}
-	return ""
-}
-
-// normalizeFingerprint 归一化指纹文本：小写 + 空白折叠 + 截断 200 字符。
-// 路径大小写/缩进差异不产生新指纹；报错实质变化必然改变首行文本。
-func normalizeFingerprint(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.Join(strings.Fields(s), " ")
-	if r := []rune(s); len(r) > 200 {
-		s = string(r[:200])
-	}
-	return s
-}
-
 // IsVerificationCommand 判断命令是否为验证/检查类（--check/lint/test/verify 等，
-// 退出码即有效反馈）：失败不累计连杀（TODO #38-2）。
-// 模型以"跑检查→看报错→改→再跑"推进时，连续失败是正常调试节奏，硬阈值会误杀
-// 修复-验证循环（事故实证：ca-5 三次不同报错、间隔成功 WriteFile，仍被连杀 3 次终止）。
+// 退出码即有效反馈）。
 // 导出供 agent 包 L0 证据扫描（HasExecutableVerification，TODO #43）复用同一判定口径。
 func IsVerificationCommand(cmd string) bool {
 	c := strings.ToLower(strings.TrimSpace(cmd))
@@ -787,97 +547,6 @@ func scopeKeyFromCtx(ctx context.Context) string {
 	return SessionIDFromContext(ctx)
 }
 
-// exploreLimit 返回当前作用域生效的探索预算（仅用于日志，判定逻辑在 checkExploreBudget）：
-// 写入未开始用 exploreBudget（叶子反空转）/ exploreBudgetDomain（domain 协调者），
-// 写入已开始或验证型任务升档 exploreBudgetPostWrite（修复期/验收期精读）。
-func (r *Registry) exploreLimit(ctx context.Context, scopeKey string) int {
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
-	if r.writeCount[scopeKey] > 0 || VerifyTaskFromContext(ctx) {
-		return r.exploreBudgetPostWrite
-	}
-	if RoleIDFromContext(ctx) == "domain" {
-		return r.exploreBudgetDomain
-	}
-	return r.exploreBudget
-}
-
-// checkExploreBudget 检查当前作用域探索类工具调用次数是否超预算。
-// 返回空串表示允许；否则返回拦截原因（软阻断文案，Agent 存活可立即按文案改派——
-// 叶子转 WriteFile、domain call_sub_agent 下放叶子，TODO #38-1）。
-// 升级强杀（ErrLoopExit）由 recordExploreBlock 的连续计数驱动，本函数不判定。
-// 对 ReadFile/ListDir/SearchInFiles 与只读型 RunCommand 生效；
-// 验证/动作类 RunCommand 不计（封禁会导致写完文件后无法验证的重试死循环）。
-// 预算分两档：首次 WriteFile 前叶子 20 次 / domain 8 次（反探索空转 + 倒逼探索下放），
-// 写入已开始或验证型任务 40 次（修复/验收期"读报错位置→改→复验"循环合法；v13 实证禁读逼出
-// 整文件盲重写长尾；2026-08-12 整品验收事故实证：domain 16 次在"读 8 文件跨文件核对契约"
-// 阶段即耗尽，逼出凭记忆盲改 + 超长 LLM 调用。验证型任务经 dispatcher 注入 WithVerifyTask，
-// 出生即按 postWrite 档计算——验收任务读在写前，不该等首次 WriteFile 才升档）。
-func (r *Registry) checkExploreBudget(ctx context.Context) string {
-	scopeKey := scopeKeyFromCtx(ctx)
-	if scopeKey == "" {
-		return ""
-	}
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
-	postWrite := r.writeCount[scopeKey] > 0 || VerifyTaskFromContext(ctx)
-	isDomain := RoleIDFromContext(ctx) == "domain"
-	limit := r.exploreBudget
-	if postWrite {
-		limit = r.exploreBudgetPostWrite
-	} else if isDomain {
-		limit = r.exploreBudgetDomain
-	}
-	if r.exploreCount[scopeKey] >= limit {
-		if postWrite {
-			return fmt.Sprintf("修复期探索预算耗尽（已调 %d 次，上限 %d）。凭已有信息与验收输出直接 WriteFile 修复；修错可在复跑中再校准。", r.exploreCount[scopeKey], limit)
-		}
-		if isDomain {
-			// 软阻断文案保留改派指导（给活人的指导要等活着的人执行）：
-			// 下放叶子后本 domain 的探索计数归零，后续验收精读不受影响。
-			return fmt.Sprintf("探索预算耗尽（domain 协调者上限 %d 次，已调 %d 次）。禁止再亲自探索/阅读：把剩余探索与实现按单文件/单函数拆给叶子助手（call_sub_agent，task 写清文件路径+关键签名+验收），你只负责拆任务、整合 mailbox 摘要与 RunCommand 验证。", limit, r.exploreCount[scopeKey])
-		}
-		return fmt.Sprintf("探索预算耗尽（已调 %d 次探索工具，上限 %d）。禁止再以任何工具探索/搜索/阅读，凭已有信息直接 WriteFile 实现或修复；修错可在复跑中再校准，空转探索零容忍。", r.exploreCount[scopeKey], limit)
-	}
-	return ""
-}
-
-// recordExploreBlock 记录一次探索预算软阻断，返回该 scope 的连续软阻断次数。
-// 被拦的探索调用不计入 exploreCount（预算算术/升档不受污染），只累计阻断次数；
-// 达 exploreSoftBlockGrace 后的下一次调用升级 ErrLoopExit（收到改派指导仍复读探索=真死循环）。
-func (r *Registry) recordExploreBlock(ctx context.Context) int {
-	scopeKey := scopeKeyFromCtx(ctx)
-	if scopeKey == "" {
-		return 0
-	}
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
-	r.exploreBlockCount[scopeKey]++
-	return r.exploreBlockCount[scopeKey]
-}
-
-// recordExplore 把当前作用域探索类工具调用计数 +1。
-func (r *Registry) recordExplore(ctx context.Context) {
-	scopeKey := scopeKeyFromCtx(ctx)
-	if scopeKey == "" {
-		return
-	}
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
-	r.exploreCount[scopeKey]++
-}
-
-// recordWrite 把当前作用域 WriteFile 成功计数 +1（驱动探索预算升档）。
-func (r *Registry) recordWrite(ctx context.Context) {
-	scopeKey := scopeKeyFromCtx(ctx)
-	if scopeKey == "" {
-		return
-	}
-	r.readMu.Lock()
-	defer r.readMu.Unlock()
-	r.writeCount[scopeKey]++
-}
-
 // bumpSameRead 记录一次 ReadFile 调用键，返回"与上一次完全相同"的连续次数（含本次）。
 // 参数有任何变化（翻页/换文件/改 limit）即归零重计：重读本身合法，每次直返磁盘最新内容；
 // 只有参数完全不变的连续重复才意味着模型未吸收内容、陷入死循环。scope 为空时不计数返回 0。
@@ -896,8 +565,8 @@ func (r *Registry) bumpSameRead(scopeKey, key string) int {
 	return r.sameReadCount[scopeKey]
 }
 
-// ResetReadHistory 清空指定 agent 的读取状态（连读计数 + 探索预算）。
-// 在新用户消息进入时调用，使连读循环检测与探索预算为单任务级而非整个会话级。
+// ResetReadHistory 清空指定 agent 的连读状态（参数完全相同的 ReadFile 连续次数）。
+// 在新用户消息进入时调用，使连读循环检测为单任务级而非整个会话级。
 // per-agent 作用域：sessionID 仍可用作 MetaAgent 的 agentID（派发时 MetaAgent 持 sessionID 作 agentID），
 // 子 Agent 各有独立 agentID，每次派发新 ID 自然隔离；调用方无需改动。
 func (r *Registry) ResetReadHistory(sessionID string) {
@@ -908,9 +577,6 @@ func (r *Registry) ResetReadHistory(sessionID string) {
 	defer r.readMu.Unlock()
 	delete(r.lastReadKey, sessionID)
 	delete(r.sameReadCount, sessionID)
-	delete(r.exploreCount, sessionID)
-	delete(r.exploreBlockCount, sessionID)
-	delete(r.writeCount, sessionID)
 }
 
 // 供外部框架（如 blades）动态发现和调用工具。

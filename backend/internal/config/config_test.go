@@ -1,5 +1,4 @@
 package config
-
 import (
 	"os"
 	"path/filepath"
@@ -49,39 +48,12 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if cfg.Agent.StopDestroyCountdownSec != 300 {
 		t.Fatalf("stop_destroy_countdown_sec 应为 300，got %d", cfg.Agent.StopDestroyCountdownSec)
 	}
-	// 探索预算三档（任务 31 配置化；TODO #35 放开预算）：config.yaml 显式 60/60/120。
-	if cfg.Agent.ExploreBudget != 60 {
-		t.Fatalf("explore_budget 应为 60，got %d", cfg.Agent.ExploreBudget)
-	}
-	if cfg.Agent.ExploreBudgetDomain != 60 {
-		t.Fatalf("explore_budget_domain 应为 60，got %d", cfg.Agent.ExploreBudgetDomain)
-	}
-	if cfg.Agent.ExploreBudgetPostWrite != 120 {
-		t.Fatalf("explore_budget_post_write 应为 120，got %d", cfg.Agent.ExploreBudgetPostWrite)
-	}
 	// task 双档上限（TODO #35）：config.yaml 显式 3000/4000。
 	if cfg.Agent.TaskMaxRunes != 3000 {
 		t.Fatalf("task_max_runes 应为 3000，got %d", cfg.Agent.TaskMaxRunes)
 	}
 	if cfg.Agent.TaskMaxRunesHard != 4000 {
 		t.Fatalf("task_max_runes_hard 应为 4000，got %d", cfg.Agent.TaskMaxRunesHard)
-	}
-}
-
-// TestApplyDefaults_ExploreBudgetDefaults 验证未配置时 applyDefaults 兜底 20/8/40。
-func TestApplyDefaults_ExploreBudgetDefaults(t *testing.T) {
-	c := &Config{}
-	if err := c.applyDefaults(); err != nil {
-		t.Fatalf("applyDefaults failed: %v", err)
-	}
-	if c.Agent.ExploreBudget != 20 {
-		t.Fatalf("ExploreBudget 默认应为 20，got %d", c.Agent.ExploreBudget)
-	}
-	if c.Agent.ExploreBudgetDomain != 8 {
-		t.Fatalf("ExploreBudgetDomain 默认应为 8，got %d", c.Agent.ExploreBudgetDomain)
-	}
-	if c.Agent.ExploreBudgetPostWrite != 40 {
-		t.Fatalf("ExploreBudgetPostWrite 默认应为 40，got %d", c.Agent.ExploreBudgetPostWrite)
 	}
 }
 

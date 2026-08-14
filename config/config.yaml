@@ -58,9 +58,6 @@ agent:
   reflection_max_rounds: 3       # 派发 mode=reflection 时自检不达标重试轮数上限（TODO #29 三引擎）：每轮 ≈ +1 次辅助 LLM 调用；强模型下 2 轮偏紧放开到 3
   plan_execute_max_steps: 12     # 派发 mode=plan_execute 时最大执行步数（TODO #29 三引擎）：超限强制收口终答；多阶段复杂装配 8 步偏紧放开到 12
   judge_role: prompt_reviewer    # 校验 judge 角色（TODO #43 交叉模型）：reflection/rubric 校验取该角色 provider 作评审（deepseek-v4-flash，与被审角色不同模型，防同模型自评放水）；裸 LLM 调用不派 Agent，取不到回退同角色
-  explore_budget: 60             # 叶子 Agent 探索类工具（ReadFile/ListDir/SearchInFiles/只读 RunCommand）调用次数上限；TODO #35 放开预算：20->60，60 次 × 200 行/页覆盖 ~12000 行
-  explore_budget_domain: 60      # DomainAgent 协调者写入未开始前探索预算；TODO #35 放开预算：16->60，domain 被逼"只读规格不探索"过度下放，给强模型留直接通读空间
-  explore_budget_post_write: 120 # 写入已开始后探索预算升档（修复期"读报错->改->复验"循环需精读）；TODO #35 放开预算：40->120，仍设上限防"逐文件通读"式发散（连读守卫+token 预算兜底）
   task_max_runes: 3000           # 派发 task 文本软上限（TODO #35 放开预算）：超软限未达硬限放行附压缩警告；原 2000 偏紧逼压缩丢契约细节
   task_max_runes_hard: 4000      # 派发 task 文本硬上限（TODO #35）：超硬限拒绝；仍拦截全量规格转贴（事故日志 3521/2315 runes 区间已上移）
   react_llm_timeout_sec: 1200    # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断；600s 仍不够——2026-08-13 实证 MetaAgent 汇总轮（4 领域摘要 ~20K input）10 分钟被掐断,整品验收没派出去,故 600->1200。配合 generate() 不在 deadline 上重试,卡死时 1200s 即报错。

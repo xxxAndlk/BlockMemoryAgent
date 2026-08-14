@@ -12,7 +12,6 @@ import (
 
 	"github.com/google/jsonschema-go/jsonschema"
 
-	"github.com/blockmemory/agent/backend/internal/config"
 )
 
 // TestRegistrySchema 验证内置工具注册表的 Schema 至少包含 11 个工具定义。
@@ -756,154 +755,10 @@ func TestWriteSpec_InvalidatesOnWriteFile(t *testing.T) {
 	}
 }
 
-// TestExploreBudget_WriteGateRaisesLimit 探索预算两档制回归测试：
-// 写入未开始：8 次探索后封锁（反空转）；首次 WriteFile 成功后升档到 40，
-// 修复期"读报错位置→改→复验"循环允许精读（v13 实证：验收领域 57 秒耗尽预算后
-// 被禁读，只能整文件盲重写，4 次巨型调用耗 29 分钟）。
-func TestExploreBudget_WriteGateRaisesLimit(t *testing.T) {
-	dir := t.TempDir()
-	// 准备足够多行，供不同 offset 的读取（避免触发连读循环守卫）。
-	var lines []string
-	for i := 0; i < 60; i++ {
-		lines = append(lines, fmt.Sprintf("line %d", i))
-	}
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(strings.Join(lines, "\n")), 0644); err != nil {
-		t.Fatalf("write file: %v", err)
-	}
-	r := NewBuiltinRegistry(dir, nil, nil)
-	ctx := WithSessionID(context.Background(), "s-budget")
-
-	// 写前烧掉 8 次探索预算（每次 offset 不同，属合法翻页）。
-	for i := 1; i <= exploreBudget; i++ {
-		res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(i), "limit": float64(1)})
-		if err != nil || !res.Success {
-			t.Fatalf("read %d within budget should succeed: err=%v success=%v", i, err, res.Success)
-		}
-	}
-	// 第 9 次：写前预算耗尽，封锁。
-	res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(30), "limit": float64(1)})
-	if res.Success {
-		t.Fatal("read beyond pre-write budget should be blocked")
-	}
-	if !strings.Contains(res.Error, "探索预算耗尽") {
-		t.Fatalf("expected budget error, got: %s", res.Error)
-	}
-
-	// 首次 WriteFile 成功：预算升档，恢复精读能力。
-	wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{"path": "b.txt", "content": "fix"})
-	if err != nil || !wres.Success {
-		t.Fatalf("write should succeed: err=%v success=%v", err, wres.Success)
-	}
-	res, err = r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(30), "limit": float64(1)})
-	if err != nil || !res.Success {
-		t.Fatalf("read after first write should succeed (post-write budget): err=%v success=%v", err, res.Success)
-	}
-
-	// 升档后仍有上限：烧到 40 次后再次封锁（防逐文件通读式发散）。
-	for i := exploreBudget + 2; i <= exploreBudgetPostWrite; i++ {
-		res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(i), "limit": float64(1)})
-		if err != nil || !res.Success {
-			t.Fatalf("read %d within post-write budget should succeed: err=%v success=%v", i, err, res.Success)
-		}
-	}
-	res, _ = r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(59), "limit": float64(1)})
-	if res.Success {
-		t.Fatal("read beyond post-write budget should be blocked")
-	}
-	if !strings.Contains(res.Error, "修复期探索预算耗尽") {
-		t.Fatalf("expected post-write budget error, got: %s", res.Error)
-	}
-}
-
-// TestExploreBudget_VerifyTaskRaisesLimit 验证型任务（整品验收/边验边修）探索预算出生即按
-// postWrite 档（40 次），无需等首次 WriteFile：2026-08-12 整品验收事故实证——domain 16 次
-// 在"读 8 文件跨文件核对契约"阶段即耗尽，逼出凭记忆整文件盲改 + 超长 LLM 调用。
-// 验收任务读在写前，不该等首次 WriteFile 才升档。
-func TestExploreBudget_VerifyTaskRaisesLimit(t *testing.T) {
-	dir := t.TempDir()
-	var lines []string
-	for i := 0; i < 80; i++ {
-		lines = append(lines, fmt.Sprintf("line %d", i))
-	}
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(strings.Join(lines, "\n")), 0644); err != nil {
-		t.Fatalf("write file: %v", err)
-	}
-	r := NewBuiltinRegistry(dir, nil, nil)
-	// domain 角色 + 验证型任务标记：正常 domain 档 8 次应封，验证型直接升到 postWrite 档 40 次。
-	ctx := WithSessionID(context.Background(), "s-verify")
-	ctx = WithRoleID(ctx, "domain")
-	ctx = WithVerifyTask(ctx)
-
-	// 烧完正常 domain 档 8 次：全部应成功（验证型不受 domain 8 次限制）。
-	for i := 1; i <= exploreBudgetDomain; i++ {
-		res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(i), "limit": float64(1)})
-		if err != nil || !res.Success {
-			t.Fatalf("verify-task read %d within domain-tier should succeed: err=%v success=%v", i, err, res.Success)
-		}
-	}
-	// 第 9..40 次：postWrite 档内仍应成功。
-	for i := exploreBudgetDomain + 1; i <= exploreBudgetPostWrite; i++ {
-		res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(i), "limit": float64(1)})
-		if err != nil || !res.Success {
-			t.Fatalf("verify-task read %d within post-write tier should succeed: err=%v success=%v", i, err, res.Success)
-		}
-	}
-	// 第 41 次：postWrite 档耗尽，封锁（文案=修复期，非 domain 协调者文案）。
-	res, _ := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "a.txt", "offset": float64(75), "limit": float64(1)})
-	if res.Success {
-		t.Fatal("verify-task read beyond post-write budget should be blocked")
-	}
-	if !strings.Contains(res.Error, "修复期探索预算耗尽") {
-		t.Fatalf("expected post-write budget error, got: %s", res.Error)
-	}
-}
-
-// TestExploreBudget_ConfigOverride 验证 config.AgentConfig 覆盖探索预算三档默认值。
-// 配置 >0 生效；nil cfg 回落包级常量。
-func TestExploreBudget_ConfigOverride(t *testing.T) {
-	dir := t.TempDir()
-	cfg := &config.AgentConfig{
-		ExploreBudget:           5,
-		ExploreBudgetDomain:     3,
-		ExploreBudgetPostWrite:  7,
-	}
-	r := NewBuiltinRegistry(dir, cfg, nil)
-	if r.exploreBudget != 5 {
-		t.Fatalf("exploreBudget = %d, want 5", r.exploreBudget)
-	}
-	if r.exploreBudgetDomain != 3 {
-		t.Fatalf("exploreBudgetDomain = %d, want 3", r.exploreBudgetDomain)
-	}
-	if r.exploreBudgetPostWrite != 7 {
-		t.Fatalf("exploreBudgetPostWrite = %d, want 7", r.exploreBudgetPostWrite)
-	}
-
-	// nil cfg 回落常量默认 20/8/40。
-	r2 := NewBuiltinRegistry(dir, nil, nil)
-	if r2.exploreBudget != 20 {
-		t.Fatalf("nil cfg: exploreBudget = %d, want 20", r2.exploreBudget)
-	}
-	if r2.exploreBudgetDomain != 8 {
-		t.Fatalf("nil cfg: exploreBudgetDomain = %d, want 8", r2.exploreBudgetDomain)
-	}
-	if r2.exploreBudgetPostWrite != 40 {
-		t.Fatalf("nil cfg: exploreBudgetPostWrite = %d, want 40", r2.exploreBudgetPostWrite)
-	}
-
-	// cfg 字段为 0（未配置）回落常量。
-	r3 := NewBuiltinRegistry(dir, &config.AgentConfig{}, nil)
-	if r3.exploreBudget != 20 {
-		t.Fatalf("zero cfg: exploreBudget = %d, want 20", r3.exploreBudget)
-	}
-	if r3.exploreBudgetDomain != 8 {
-		t.Fatalf("zero cfg: exploreBudgetDomain = %d, want 8", r3.exploreBudgetDomain)
-	}
-}
-
 // TestWriteFile_TemporaryOutputHasAbsPath 临时文件写入结果带落盘绝对路径（TODO #38-4 根因 D）：
 // 临时文件落在会话级临时目录（.bma/tmp/<sid>/，路径不可预测），Output 必须携带绝对路径与
 // $env:BMA_SESSION_TEMP_DIR 运行提示——Agent 首次运行不再盲猜工作目录路径
-//（事故实证：ca-5 用 <工作目录>\verify-frost.js 找不到模块，白耗 1 条连杀额度）。
+//（事故实证：ca-5 用 <工作目录>\verify-frost.js 找不到模块，浪费一轮修复时间）。
 func TestWriteFile_TemporaryOutputHasAbsPath(t *testing.T) {
 	dir := t.TempDir()
 	r := NewBuiltinRegistry(dir, nil, nil)

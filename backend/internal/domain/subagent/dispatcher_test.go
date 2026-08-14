@@ -1581,31 +1581,6 @@ func TestSaveBlockRecord_FailureCounter(t *testing.T) {
 	}
 }
 
-// TestIsVerificationTask 验证型任务判定：meta 派发整品验收时 task 含"验收清单"/"边验边修"，
-// resume 场景 task 被截成 brief 时靠 domain 名（整品验收/集成验收/整体验收）兜底。
-// 建设任务（单条"验收：..."，无清单/边验边修）不被误判。
-func TestIsVerificationTask(t *testing.T) {
-	// 完整验收任务：验收清单 + 边验边修（meta 派发模板）。
-	if !isVerificationTask("整品验收", "整品集成验收。项目根目录: X\n验收清单（边验边修，发现断裂直接修复）:\n1. 语法检查...") {
-		t.Fatal("full acceptance task should be detected")
-	}
-	// resume 场景：task 是 100 字 brief 可能不含清单，靠 domain 名兜底。
-	if !isVerificationTask("整品验收", "整品集成验收。项目根目录: X 三个领域已分别完成修改...") {
-		t.Fatal("acceptance domain name should be detected")
-	}
-	// domain 空、任务文本含边验边修 → 命中。
-	if !isVerificationTask("", "这是整体验收任务，边验边修一次跑完") {
-		t.Fatal("verify keyword in task should be detected")
-	}
-	// 建设任务：单条验收行，无清单/边验边修 → 不命中。
-	if isVerificationTask("游戏逻辑", "实现核心逻辑。验收：node -c game.js 通过") {
-		t.Fatal("construction task must not be detected")
-	}
-	if isVerificationTask("CSS域", "改写 index.html 与样式，验收：浏览器打开无报错") {
-		t.Fatal("construction task must not be detected")
-	}
-}
-
 // TestRenderSpecPrefix_ScopeNote 验证规范前缀带范围锚定说明：
 // 子 Agent 看到的是父 Agent 全局目标（常含多领域拆分），必须锚定自己的 task 范围，
 // 防止 thinking 模型把"其他 Agent 的职责/进度"当自己的状态空转等待（2026-08-13 实证）。
