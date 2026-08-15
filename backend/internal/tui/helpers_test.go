@@ -3,7 +3,6 @@ package tui
 import (
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -274,7 +273,7 @@ func TestFirstMessagePendingDisplay(t *testing.T) {
 		width:     80,
 		height:    24,
 		httpAddr:  "http://127.0.0.1:1", // 让后台 createSession 快速失败，避免测试被网络阻塞
-		flashMu:   &sync.Mutex{},
+		shared:    newSharedState(),
 	}
 	m.chatPanel.vp.SetContent("")
 
@@ -317,7 +316,7 @@ func TestFirstMessageFallbackWhenSessionMissingUserMessage(t *testing.T) {
 		width:          80,
 		height:         24,
 		sessionsCursor: 0,
-		flashMu:        &sync.Mutex{},
+		shared:         newSharedState(),
 	}
 	m.chatPanel.vp.SetContent("")
 	// 构造一个已选中但 Messages 里暂时没有用户消息的会话
@@ -452,11 +451,11 @@ func TestEventChatItemSystemPauseShown(t *testing.T) {
 // TestSanitizeToolText 验证工具输出净化：剥离 ANSI，CRLF 与孤立 \r 归一为 \n。
 func TestSanitizeToolText(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"a\r\nb\r\nc", "a\nb\nc"},                          // CRLF 文件内容
-		{"进度 10%\r进度 20%", "进度 10%\n进度 20%"},            // 命令进度条（孤立 \r）
-		{"\x1b[31m红色\x1b[0m 文本", "红色 文本"},              // ANSI 剥离
-		{"a\r\n\x1b[1mb\r\n", "a\nb\n"},                     // 混合
-		{"普通文本\n无变化", "普通文本\n无变化"},                  // 无 \r 原样
+		{"a\r\nb\r\nc", "a\nb\nc"},           // CRLF 文件内容
+		{"进度 10%\r进度 20%", "进度 10%\n进度 20%"}, // 命令进度条（孤立 \r）
+		{"\x1b[31m红色\x1b[0m 文本", "红色 文本"},    // ANSI 剥离
+		{"a\r\n\x1b[1mb\r\n", "a\nb\n"},      // 混合
+		{"普通文本\n无变化", "普通文本\n无变化"},           // 无 \r 原样
 	}
 	for _, c := range cases {
 		if got := sanitizeToolText(c.in); got != c.want {

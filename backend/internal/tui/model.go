@@ -75,13 +75,8 @@ type Model struct {
 	// 0=自动（按宽度和内容），1=强制显示，-1=强制隐藏。
 	rightPanelForced int
 
-	// flash 是临时闪屏提示文本。
-	flash string
-	// flashUntil 是闪屏提示过期时间。
-	flashUntil time.Time
-	// flashMu 保护 flash/flashUntil 的并发读写（T2 修复：后台 HTTP goroutine 写，主循环 View 读）。
-	// 用指针避免 bubbletea 值语义 Model 拷贝 Mutex。
-	flashMu *sync.Mutex
+	// shared 是跨 bubbletea 值拷贝共享的可变状态（#47 修复），见 sharedState。
+	shared *sharedState
 
 	// quitArmedUntil 是 Ctrl+C 退出确认的武装截止时间：
 	// 仍有运行中会话时，首次按 Ctrl+C 只提示，3 秒内再按才真正退出（防误杀长任务）。
@@ -91,11 +86,6 @@ type Model struct {
 	stopArmedUntil time.Time
 	// tokenWarnLevel 记录已提醒过的输入 Token 成本预警档位（每 50 万为一档）。
 	tokenWarnLevel int
-
-	// pendingSelectID 由后台 createSession goroutine 写入，tick handler 消费：
-	// 成功创建会话后选中它需操作 m.sessions/cursor，不能在后台 goroutine 直接改
-	// （与主循环 View 读产生 race），改为 tick 在主循环内执行 refresh+select。
-	pendingSelectID string
 
 	// streamEvents 接收当前选中会话的 agent.Stream 事件，用于触发即时刷新。
 	streamEvents chan agent.Event
@@ -111,6 +101,81 @@ type Model struct {
 
 	// log 是结构化日志器，由 SetLogger 注入；nil 时回退标准库 log。
 	log *logger.Logger
+}
+
+// sharedState 是跨 bubbletea 值拷贝共享的可变状态（#47 修复）。
+// Model 采用值语义：每次 Update 返回一份拷贝，后台 goroutine（createSession/postJSON）
+// 若直接写 Model 字段，写入会落到已废弃的副本上，主循环永远看不到——T2 的互斥锁
+// 只消除了数据竞争，没解决值拷贝导致的写入丢失。因此把「后台 goroutine 写、主循环读」
+// 的字段集中到该指针共享结构体内：NewModel 构造一次，之后所有拷贝共享同一实例。
+type sharedState struct {
+	mu sync.Mutex
+	// flash 是临时闪屏提示文本，flashUntil 是其过期时间。
+	flash      string
+	flashUntil time.Time
+	// pendingSelectID 由后台 createSession goroutine 写入，tick handler 消费：
+	// 成功创建会话后选中它需操作 m.sessions/cursor，不能在后台 goroutine 直接改
+	// （与主循环 View 读产生 race），改为 tick 在主循环内执行 refresh+select。
+	pendingSelectID string
+}
+
+func newSharedState() *sharedState { return &sharedState{} }
+
+// setFlash 设置一条 2 秒后过期的闪屏提示。
+func (s *sharedState) setFlash(msg string) {
+	s.mu.Lock()
+	s.flash = msg
+	s.flashUntil = time.Now().Add(2 * time.Second)
+	s.mu.Unlock()
+}
+
+// getFlash 读取未过期的闪屏提示；过期或为空返回 ""。nil 接收者安全（测试字面量未初始化时）。
+func (s *sharedState) getFlash() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.flash == "" || time.Now().After(s.flashUntil) {
+		return ""
+	}
+	return s.flash
+}
+
+func (s *sharedState) setPendingSelect(id string) {
+	s.mu.Lock()
+	s.pendingSelectID = id
+	s.mu.Unlock()
+}
+
+// takePendingSelect 取出并清空待选中会话 ID；无待处理项返回 ""。nil 接收者安全。
+func (s *sharedState) takePendingSelect() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.pendingSelectID
+	s.pendingSelectID = ""
+	return id
+}
+
+// hasPendingSelect 仅检查是否有待选中会话（不消费）。nil 接收者安全。
+func (s *sharedState) hasPendingSelect() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingSelectID != ""
+}
+
+// ensureShared 惰性补齐 shared（测试中以 Model 字面量构造时可能未初始化）。
+func (m *Model) ensureShared() *sharedState {
+	if m.shared == nil {
+		m.shared = newSharedState()
+	}
+	return m.shared
 }
 
 // NewModel 构造一个 TUI Model，连接后端依赖，初始化默认状态并加载会话列表。
@@ -132,7 +197,7 @@ func NewModel(
 		chatPanel:      NewChatPanel(),
 		planBarVisible: true,
 		inputBar:       NewInputBar(),
-		flashMu:        &sync.Mutex{}, // 初始化 flash 互斥锁（T2 修复）
+		shared:         newSharedState(), // 跨值拷贝共享的可变状态（#47 修复）
 		taskBriefCache: NewTaskBriefCache(),
 		streamEvents:   make(chan agent.Event, 16),
 	}
@@ -388,15 +453,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rebuildAgents()
 			m.accumulateTokens()
 		}
-		// 清理过期闪屏提示（持锁，T2 修复）
-		m.flashMu.Lock()
-		if m.flash != "" && time.Now().After(m.flashUntil) {
-			m.flash = ""
-		}
-		m.flashMu.Unlock()
 		// 有待消费的会话选中/滚动锚定请求时立即刷新，不等流式事件驱动，
 		// 保证发送消息后视图在一个 tick 内响应。
-		if m.pendingSelectID != "" || m.chatPanel.pendingScrollToUser {
+		if m.shared.hasPendingSelect() || m.chatPanel.pendingScrollToUser {
 			m.dirty = true
 		}
 		// 流式事件已在 streamEventMsg 中置脏，这里按 tick 粒度合并刷新；
@@ -428,10 +487,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // 待处理会话选中、滚动到用户消息、重建对话内容、刷新弹窗。
 func (m *Model) refreshView() {
 	// 消费后台 createSession 写入的 pendingSelectID：在主循环内 refresh+select
-	// 避免后台 goroutine 直接改 m.sessions/cursor 与 View 产生 race（T2 修复）
-	if m.pendingSelectID != "" {
-		id := m.pendingSelectID
-		m.pendingSelectID = ""
+	// 避免后台 goroutine 直接改 m.sessions/cursor 与 View 产生 race（T2 修复；
+	// #47 修复：经 sharedState 指针共享，写入不再落到废弃的 Model 副本上）
+	if id := m.shared.takePendingSelect(); id != "" {
 		m.refreshSessions()
 		for i, s := range m.sessions {
 			if s.ID == id {

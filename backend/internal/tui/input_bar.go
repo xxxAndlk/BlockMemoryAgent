@@ -220,10 +220,9 @@ func (m *Model) pushHistory(cmd string) {
 
 // renderInput 为 Model 渲染输入栏，包括当前闪屏提示。
 func (m Model) renderInput(w int) string {
-	// 持锁读取 flash，避免与后台 goroutine 的并发写产生 race（T2 修复）。
-	m.flashMu.Lock()
-	curFlash := m.flash
-	m.flashMu.Unlock()
+	// 从指针共享状态读取 flash（含过期判断）；后台 goroutine 的写入经 sharedState
+	// 对所有 Model 拷贝可见（#47 修复）。
+	curFlash := m.shared.getFlash()
 	// 若有闪屏信息，则在输入栏右侧以错误样式渲染。
 	flash := ""
 	if curFlash != "" {

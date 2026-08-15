@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -15,8 +14,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/go-kratos/blades"
 
-	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
@@ -131,12 +130,14 @@ func (m *mockAgentForPlan) CancelAgent(ctx context.Context, sessionID, instID st
 // Shutdown 是 mockAgentForPlan 的空实现。
 func (m *mockAgentForPlan) Shutdown(ctx context.Context) error { return nil }
 
-
 // Profile 返回用户画像，测试实现返回空。
-func (m *mockAgentForPlan) Profile(ctx context.Context) (*userprofile.Profile, error) { return &userprofile.Profile{}, nil }
+func (m *mockAgentForPlan) Profile(ctx context.Context) (*userprofile.Profile, error) {
+	return &userprofile.Profile{}, nil
+}
 
 // SaveProfile 覆盖画像，测试实现为空操作。
 func (m *mockAgentForPlan) SaveProfile(ctx context.Context, content string) error { return nil }
+
 // SummarizeTaskTitle 是 mockAgentForPlan 的标题摘要实现，直接返回原标题。
 func (m *mockAgentForPlan) SummarizeTaskTitle(ctx context.Context, title string) string { return title }
 
@@ -178,7 +179,7 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 		agent:        agentSvc,
 		streamEvents: make(chan agent.Event, 16),
 		httpAddr:     "http://127.0.0.1:1",
-		flashMu:      &sync.Mutex{},
+		shared:       newSharedState(),
 	}
 	m.chatPanel.vp.SetContent("")
 
@@ -202,7 +203,7 @@ func TestFirstMessagePendingToRealSession(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	m.pendingSelectID = session.ID
+	m.ensureShared().setPendingSelect(session.ID)
 
 	// 触发 tick，让 selectSession 消费 pendingSelectID
 	nm, _ := m.Update(tickMsg{})
@@ -258,7 +259,7 @@ func TestFirstMessageRenderedInExistingSession(t *testing.T) {
 		agent:        agentSvc,
 		streamEvents: make(chan agent.Event, 16),
 		httpAddr:     "http://127.0.0.1:1",
-		flashMu:      &sync.Mutex{},
+		shared:       newSharedState(),
 	}
 	m.chatPanel.vp.SetContent("")
 	m.refreshSessions()
@@ -288,7 +289,7 @@ func TestScrollbarDragScrollsChat(t *testing.T) {
 		chatPanel: ChatPanel{vp: viewport.New(80, 5)},
 		width:     80,
 		height:    12,
-		flashMu:   &sync.Mutex{},
+		shared:    newSharedState(),
 	}
 	// 顶栏 1 行 + Token 栏 1 行 + 主内容区 4 行 + 输入栏 5 行（含边框） + 快捷键栏 1 行 = 12 行
 	// mainContentHeight = 12 - 1（顶栏） - 1（Token 栏） - 5（输入栏） - 1（快捷键栏） = 4
@@ -393,7 +394,7 @@ func TestRightPanelVisibleWithMetaAgent(t *testing.T) {
 		agent:        agentSvc,
 		streamEvents: make(chan agent.Event, 16),
 		httpAddr:     "http://127.0.0.1:1",
-		flashMu:      &sync.Mutex{},
+		shared:       newSharedState(),
 	}
 	m.chatPanel.vp.SetContent("")
 	m.refreshSessions()
@@ -454,7 +455,7 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 		agent:        agentSvc,
 		streamEvents: make(chan agent.Event, 16),
 		httpAddr:     "http://127.0.0.1:1",
-		flashMu:      &sync.Mutex{},
+		shared:       newSharedState(),
 	}
 	m.chatPanel.vp.SetContent("")
 	m.refreshSessions()
@@ -484,7 +485,7 @@ func TestRightPanelShowsBothPanelsEvenWhenShort(t *testing.T) {
 		width:            80,
 		height:           12,
 		rightPanelForced: 1,
-		flashMu:          &sync.Mutex{},
+		shared:           newSharedState(),
 	}
 	m.chatPanel.vp.SetContent("")
 
@@ -506,7 +507,7 @@ func TestLongUserMessageWrapsAtRightPanelBoundary(t *testing.T) {
 		width:            80,
 		height:           24,
 		rightPanelForced: 1, // 强制显示右侧栏，模拟右侧栏出现后的窄对话区
-		flashMu:          &sync.Mutex{},
+		shared:           newSharedState(),
 	}
 	m.chatPanel.vp.SetContent("")
 
@@ -549,7 +550,7 @@ func TestPlanPanelReflectsAgentStatuses(t *testing.T) {
 		height:           40,
 		agent:            mock,
 		rightPanelForced: 1,
-		flashMu:          &sync.Mutex{},
+		shared:           newSharedState(),
 		sessions: []*server.Session{
 			{ID: "session-1", Goal: "塔防游戏 demo"},
 		},
@@ -585,7 +586,7 @@ func TestEscSoftStop_ArmsThenStops(t *testing.T) {
 	m := &Model{
 		styles:         NewStyles(),
 		chatPanel:      ChatPanel{vp: viewport.New(80, 20)},
-		flashMu:        &sync.Mutex{},
+		shared:         newSharedState(),
 		sessions:       []*server.Session{{ID: "session-1", Status: enums.SessionStatusRunning}},
 		sessionsCursor: 0,
 		focus:          panelInput,
@@ -620,7 +621,7 @@ func TestEscSoftStop_ArmsThenStops(t *testing.T) {
 	m4 := &Model{
 		styles:         NewStyles(),
 		chatPanel:      ChatPanel{vp: viewport.New(80, 20)},
-		flashMu:        &sync.Mutex{},
+		shared:         newSharedState(),
 		sessions:       []*server.Session{{ID: "s2", Status: enums.SessionStatusRunning}},
 		sessionsCursor: 0,
 		focus:          panelInput,
@@ -637,7 +638,7 @@ func TestEscSoftStop_ArmsThenStops(t *testing.T) {
 	m6 := &Model{
 		styles:         NewStyles(),
 		chatPanel:      ChatPanel{vp: viewport.New(80, 20)},
-		flashMu:        &sync.Mutex{},
+		shared:         newSharedState(),
 		sessions:       []*server.Session{{ID: "s3", Status: enums.SessionStatusPausedOnChild}},
 		sessionsCursor: 0,
 		focus:          panelInput,

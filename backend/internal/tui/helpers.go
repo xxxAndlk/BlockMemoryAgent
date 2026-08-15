@@ -34,13 +34,11 @@ func sanitizeToolText(s string) string {
 	return strings.ReplaceAll(s, "\r", "\n")
 }
 
-// flashMsg 设置一条 2 秒后过期的闪屏提示，使用互斥锁保证并发安全（T2 修复）。
+// flashMsg 设置一条 2 秒后过期的闪屏提示。
+// 经 sharedState 指针共享写入（#47 修复）：后台 goroutine 调用时 Model 可能已被
+// tick 拷贝多轮，直接写字段会落到废弃副本上导致提示丢失。
 func (m *Model) flashMsg(msg string) {
-	// 加锁保护：postJSON/createSession 后台 goroutine 与主循环 View 并发读写 flash（T2 修复）
-	m.flashMu.Lock()
-	m.flash = msg
-	m.flashUntil = time.Now().Add(2 * time.Second)
-	m.flashMu.Unlock()
+	m.ensureShared().setFlash(msg)
 }
 
 // hasPlan 判断当前是否可展示计划弹窗；只要有激活会话即认为有计划（包括 direct_tool 的合成计划）。

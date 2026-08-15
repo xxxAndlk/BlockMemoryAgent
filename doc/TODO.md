@@ -52,6 +52,22 @@
     - 不做：不一刀切全删（按退役条件逐条）；不删 spec 门 + 终止条件（保留）；不删 mailbox（#42 降级为信号层保留）；退役前必须有观察数据证根因未复发。
     - 依赖：#42 黑板 + #43 校验落地 + 观察期数据。
 
+45. **子 Agent 收尾事实提取异步化**（同步阻塞 DONE 通知，实证最长 69s）  ← 来源：2026-08-15 评测耗时归因（test/eval/runs/20260815-135300）
+    - 现象：`dispatcher.go:2364` `factExtractor.Extract`（轻量模型）在子 Agent DONE 日志前同步执行，父 Agent 收到完成通知被拖住——route-code-test-doc 的 domain-4 收尾 35s、sharedmem-long-spec 的 domain-1 收尾 69s（常规值 4-7s）。
+    - 复杂原因：黑板模式（#42）的兄弟产出摄取依赖这些事实的落库顺序，异步化会引入"子 Agent 已 DONE 但事实未落库"的可见性竞态；失败打捞/校验分层消费同一结果，需要专门设计。
+    - 方向：事实提取挪异步 goroutine + 落库完成事件，摄取侧按事件等待而非假设 DONE 即可见。
+    - 附带记账缺口：事实提取/事件摘要走 `CallLightweightWithRetry` 不写 session_logs（llm_input/llm_output），耗时账算不平；`react_agent.go:624` `llmModelName()` 取不到值导致 logs/server.log 的 model= 全空。两者是小修，随下一轮评测基建一起落。
+
+46. **embedding 调用挂起阻塞派发主路径（需独立短超时 + 熔断）**  ← 来源：同上
+    - 现象：`injectScopedRecall`（dispatcher.go:1571）→ `knowledge_store.go:216` `pg.Embed` 走 60s HTTP 超时 × 重试（client.go:51），且 fallback `SearchBlockMemoryByGoal` 用派发 ctx（30 分钟超时）。embedding 端点间歇性挂起时阻塞派发 goroutine：实证 chain-dependency 出现 158s、longctx-multifile 出现 61s 的"派发→首次 LLM"沉默延迟（占两场景墙钟 ~12%）；pseudo embed 配置下同位置为 0s。
+    - 复杂原因：要给召回链路独立短超时 + 熔断，需权衡召回质量降级策略（熔断期间静默跳过召回 vs 降级注入），涉及 `PostgresStore.Embed`/Recall 链路多处调用点。
+    - 方向：embed/Recall 调用统一包独立 timeout（如 5-10s）+ 熔断器（连续失败 N 次直接跳过召回并记 WARN），降级策略显式化。
+
+47. ~~**TUI 新会话自动选中竞态（pendingSelectID 写入已废弃的 Model 副本）**~~ ✅ 已修复（2026-08-15）
+    - 现象：`input.go:395` `createSession` 后台 goroutine 写 `m.pendingSelectID`，但 bubbletea Update 是值语义——`agent.CreateSession` 阻塞期间（实证 ~15s：创建会话到图启动）tick 每 100ms 拷贝一次 Model，goroutine 完成时写入的是早已被丢弃的旧副本，`refreshView` 永远消费不到，新会话不自动选中（光标停在 -1，聊天区空白）。CreateSession 快时（<一次 tick 间隔）碰巧正常，慢时必现。
+    - 实证：TUI 多轮驱动 turn01 等 60s 未见选中会话，而后端会话 11s 已跑完；与 live_harness_test.go 注释的"首条问题不可见"调试历史同源。
+    - 修复：新增 `sharedState`（model.go）——`flash`/`flashUntil`/`pendingSelectID` 收进指针共享结构体（NewModel 构造一次，所有 Model 拷贝共享），配互斥锁 + nil 安全访问器 + `ensureShared` 惰性初始化；`flashMsg`/`renderInput`/`createSession`/`refreshView`/tick 全部改走该结构。flash 过期判断移到读取侧（`getFlash`）。同根因的后台 flash 丢失（post 报错不显示）一并修复。`go vet` + tui 包测试全绿（race 因本机无 gcc 未跑）。
+
 ## 已完成（已归档到 git 历史）
 
 - **评测体系落地 + 首次基线**（2026-08-14）：`test/eval/`（build tag `eval`）真实 LLM 任务完成率评测——场景 YAML + checkpoint 判分（command/file/regex/tree/llm_judge）+ token/子Agent 指标聚合 + TheAgentCompany 式全量/部分分报告（`test/eval/runs/`）；环境隔离修复：`docker/docker-compose.test.yml` 独立端口（PG 55432/Redis 56380）+ 无固定容器名，fixture 维度对齐 migrations（768）。首基线 12 场景 full pass 91.7%、加权 0.979，详见 `doc/eval/baseline_2026-08-14.md`。后续加固（同日）：fixture 改"共享容器常驻 + 每测试独立 PG database/Redis 逻辑库"（Redis 开 1024 逻辑库），并行包 `go test ./...` 不再互相拆台；`TestFactExtractionFallback` 序列对齐现行后端（verify_kind 校验分层 + 派发后不阻塞）。开放项：verifyloop 场景判分口径修正（自动验证闭环已下线，改测 verify_kind 证据）、EVAL_RUNS=3 可靠性、SWE-bench 20 题切片（Phase 2）。

@@ -1301,6 +1301,13 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 // 返回 paused=true 表示 DomainAgent 触达 token 上限进入 Paused(已存 history + tree.Pause),
 // 调用方不应 trackChildDone(保持父未决计数 >0 触发 MetaAgent 暂停)。
 func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode, verifyKind string, started time.Time) bool {
+	// 会话级 logger 挂 ctx：子 Agent 事实提取（saveBlockMemory）与失败打捞（salvageFailure）
+	// 的轻量 LLM 调用经 CallLightweightWithRetry 从 ctx 取 logger 写 session_logs。
+	if d.log != nil {
+		if sid := tool.SessionIDFromContext(ctx); sid != "" {
+			ctx = logger.NewContext(ctx, d.log.WithSession(sid).WithAgent(roleDef.Name))
+		}
+	}
 	result, err, retried := d.runSubAgentWithAutoRetry(ctx, parentID, subAgentID, roleDef, task, domain, responsibility, mode, verifyKind)
 	// Layer 5：从子 Agent 历史扫 WriteFile 调用收集修改文件，随完成通知回灌父 LLM。
 	files := agent.FilesModifiedFromHistory(result.History)

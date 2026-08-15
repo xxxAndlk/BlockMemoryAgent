@@ -2,7 +2,6 @@ package tui
 
 import (
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -13,11 +12,11 @@ import (
 // 但底层仍保留完整内容用于发送。
 func TestMultilinePasteCollapsesInput(t *testing.T) {
 	m := &Model{
-		styles:  NewStyles(),
-		width:   120,
-		height:  40,
-		focus:   panelInput,
-		flashMu: &sync.Mutex{},
+		styles: NewStyles(),
+		width:  120,
+		height: 40,
+		focus:  panelInput,
+		shared: newSharedState(),
 	}
 	m.chatPanel.vp.Width = 80
 	m.chatPanel.vp.Height = 20
@@ -55,7 +54,7 @@ func TestMultilineInputBackspaceClearsAll(t *testing.T) {
 			runes:  []rune("a\nb\nc"),
 			cursor: 5,
 		},
-		flashMu: &sync.Mutex{},
+		shared: newSharedState(),
 	}
 
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
@@ -77,7 +76,7 @@ func TestSingleLineInputStillShowsCursor(t *testing.T) {
 			runes:  []rune("hello"),
 			cursor: 2,
 		},
-		flashMu: &sync.Mutex{},
+		shared: newSharedState(),
 	}
 	m.chatPanel.vp.Width = 80
 	m.chatPanel.vp.Height = 20
@@ -96,11 +95,11 @@ func TestSingleLineInputStillShowsCursor(t *testing.T) {
 // 且未选中会话时被完整保留到本地预展示。
 func TestMultilineSubmitPreservesContent(t *testing.T) {
 	m := &Model{
-		styles:  NewStyles(),
-		width:   120,
-		height:  40,
-		focus:   panelInput,
-		flashMu: &sync.Mutex{},
+		styles: NewStyles(),
+		width:  120,
+		height: 40,
+		focus:  panelInput,
+		shared: newSharedState(),
 	}
 	m.chatPanel.vp.Width = 80
 	m.chatPanel.vp.Height = 20
@@ -121,11 +120,11 @@ func TestMultilineSubmitPreservesContent(t *testing.T) {
 // 而是作为文本换行插入，避免多行粘贴被拆成多次发送。
 func TestPasteEnterInsertsNewline(t *testing.T) {
 	m := &Model{
-		styles:  NewStyles(),
-		width:   120,
-		height:  40,
-		focus:   panelInput,
-		flashMu: &sync.Mutex{},
+		styles: NewStyles(),
+		width:  120,
+		height: 40,
+		focus:  panelInput,
+		shared: newSharedState(),
 	}
 	m.chatPanel.vp.Width = 80
 	m.chatPanel.vp.Height = 20
@@ -160,11 +159,11 @@ func TestPasteEnterInsertsNewline(t *testing.T) {
 // 仍会把所有行合并成一条消息，而不是逐行提交。
 func TestRapidPasteAccumulatesLines(t *testing.T) {
 	m := &Model{
-		styles:  NewStyles(),
-		width:   120,
-		height:  40,
-		focus:   panelInput,
-		flashMu: &sync.Mutex{},
+		styles: NewStyles(),
+		width:  120,
+		height: 40,
+		focus:  panelInput,
+		shared: newSharedState(),
 	}
 	m.chatPanel.vp.Width = 80
 	m.chatPanel.vp.Height = 20

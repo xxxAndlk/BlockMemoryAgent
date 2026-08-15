@@ -367,6 +367,12 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// 展示名在 dispatcher 侧覆写 roleDef.Name 后同样经此注入。
 	ctx = WithAgentDisplayName(ctx, a.role.Name)
 
+	// 把会话级 logger 挂到 ctx：轻量 LLM 调用（记忆流水线事件摘要等经
+	// ModelFactory.CallLightweightWithRetry）链路只持有 ctx，由此取出 logger 写 session_logs。
+	if a.log != nil {
+		ctx = logger.NewContext(ctx, a.log)
+	}
+
 	// 如果外部传入 nil 历史，则初始化为空切片，保证后续 append 安全。
 	if history == nil {
 		history = []ReactMessage{}

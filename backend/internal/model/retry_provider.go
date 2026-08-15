@@ -86,6 +86,17 @@ func (p *retryProvider) Name() string {
 	return p.inner.Name()
 }
 
+// ModelName 返回模型名（构造时传入的 cfg.Model，见 wrapWithRetry）。
+// 实现 react_agent.llmModelName 期望的 interface{ ModelName() string }：
+// ReActAgent.llm 持有的是本包装器（经 GetBladesProvider 透出），此前无此方法导致
+// session_logs.model 与 [react] llm start 日志的 model= 全空，无法按模型聚合耗时。
+func (p *retryProvider) ModelName() string {
+	if p == nil {
+		return ""
+	}
+	return p.name
+}
+
 // Generate 调用底层 provider.Generate，非成功状态重试最多 providerMaxRetries 次。
 // 成功条件：err == nil && resp != nil && resp.Message != nil。
 // ctx.Canceled 不重试（用户主动取消）；ctx.DeadlineExceeded 视为超时，重试。

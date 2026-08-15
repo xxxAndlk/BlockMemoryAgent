@@ -207,9 +207,9 @@ lightweight_model:
 # onnx（TODO #41，进程内零外部服务方向）：需 -tags onnx 构建 + models/bge-base-zh-v1.5/ 模型文件
 # （见 models/README），BGE-base-zh-v1.5 为 768 维；bge-m3 为 1024 维（当前 pgvector.dimensions）。
 embed:
-  provider: local             # 默认 pseudo；本地 HTTP 服务（ollama/xinference）用 local；进程内真本地改 onnx（-tags onnx）
-  model: bge-m3           # ollama 已拉取的嵌入模型；onnx 示例：bge-base-zh-v1.5
-  api_key: ""                  # openai 需要；ollama（local）与 onnx 忽略
+  provider: openai             # 默认 pseudo；本地 HTTP 服务（ollama/xinference）用 local；进程内真本地改 onnx（-tags onnx）
+  model: doubao-embedding-vision           # ollama 已拉取的嵌入模型；onnx 示例：bge-base-zh-v1.5
+  api_key: ${EMBEDDING_API_KEY}                  # openai 需要；ollama（local）与 onnx 忽略
   base_url: ${EMBEDDING_BASE_URL} # OpenAI 兼容端点根路径（ollama: http://localhost:11434）；onnx 忽略
   batch_size: 1                  # 单次嵌入条数上限
   # model_path: ./models/bge-base-zh-v1.5   # provider=onnx 专用（TODO #41）；默认 ./models/<model>/

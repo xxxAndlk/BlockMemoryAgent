@@ -389,9 +389,10 @@ func (m *Model) postJSON(path string, body any) {
 	}()
 }
 
-// 异步执行（T2 修复）：成功后写 pendingSelectID，由 tick handler 在主循环内
-// 执行 refreshSessions + selectSession，避免后台 goroutine 直接改 m.sessions/cursor
-// 与 View 产生 race。
+// 异步执行（T2 修复）：成功后经 sharedState 写 pendingSelectID，由 tick handler 在
+// 主循环内执行 refreshSessions + selectSession，避免后台 goroutine 直接改
+// m.sessions/cursor 与 View 产生 race。sharedState 为指针共享（#47 修复），
+// 写入对所有 Model 拷贝可见，不会因 bubbletea 值语义落到废弃副本上。
 func (m *Model) createSession(goal string) {
 	go func() {
 		if m.agent == nil {
@@ -404,7 +405,7 @@ func (m *Model) createSession(goal string) {
 			return
 		}
 		// 写 pendingSelectID，tick handler 消费时在主循环内 refresh+select
-		m.pendingSelectID = created.ID
+		m.ensureShared().setPendingSelect(created.ID)
 		m.flashMsg("session started: " + created.ID)
 	}()
 }

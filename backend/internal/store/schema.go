@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS session_history (
 );
 CREATE INDEX IF NOT EXISTS idx_session_history_created_at
     ON session_history (created_at DESC);
+-- 老库缺 meta_memory 列时补齐（CREATE TABLE IF NOT EXISTS 对存量表是空操作）。
+ALTER TABLE session_history ADD COLUMN IF NOT EXISTS meta_memory JSONB DEFAULT '[]';
 `)
 	return err
 }

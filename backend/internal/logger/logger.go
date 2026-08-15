@@ -292,15 +292,16 @@ func (l *Logger) Error(ctx context.Context, msg string, err error, extra ...slog
 // response 被埋在 "->" 之后难辨认；拆后输入输出各自带时间戳/级别/phase，输出天然显形。
 // 控制台与 session_logs 均保留完整 prompt/response，不截断。
 func (l *Logger) LLMCall(ctx context.Context, rec LLMCallRecord, extra ...slog.Attr) {
-	l.llmEvent(ctx, "llm_input", rec.Agent, rec.Model, rec.Prompt, "", rec.InputTokens, 0, 0, rec.CacheHitTokens, rec.CacheMissTokens, extra)
-	l.llmEvent(ctx, "llm_output", rec.Agent, rec.Model, "", rec.Response, 0, rec.OutputTokens, rec.LatencyMs, rec.CacheHitTokens, rec.CacheMissTokens, extra)
+	l.llmEvent(ctx, "llm_input", rec.Agent, rec.Model, rec.Prompt, "", rec.InputTokens, 0, 0, rec.CacheHitTokens, rec.CacheMissTokens, rec.Meta, extra)
+	l.llmEvent(ctx, "llm_output", rec.Agent, rec.Model, "", rec.Response, 0, rec.OutputTokens, rec.LatencyMs, rec.CacheHitTokens, rec.CacheMissTokens, rec.Meta, extra)
 }
 
 // llmEvent 发送一个 LLM I/O 事件到控制台与 session_logs。
 // prompt/response 二者其一为空：llm_input 行只填 prompt，llm_output 行只填 response。
 // 这样 DB 查询时按 phase 过滤即可分别取输入/输出，互不冗余。
 // cacheHit/cacheMiss 两行都带（TODO #40 可观测），便于按会话聚合命中率。
-func (l *Logger) llmEvent(ctx context.Context, phase, agent, model, prompt, response string, inputTokens, outputTokens, latencyMs, cacheHitTokens, cacheMissTokens int, extra []slog.Attr) {
+// meta 原样写入 session_logs.meta（如 layer=lightweight 区分轻量调用），nil 时不写。
+func (l *Logger) llmEvent(ctx context.Context, phase, agent, model, prompt, response string, inputTokens, outputTokens, latencyMs, cacheHitTokens, cacheMissTokens int, meta map[string]any, extra []slog.Attr) {
 	msg := prompt + response
 	event := l.zl.Info()
 	if event == nil {
@@ -340,6 +341,7 @@ func (l *Logger) llmEvent(ctx context.Context, phase, agent, model, prompt, resp
 		CacheHitTokens:  cacheHitTokens,
 		CacheMissTokens: cacheMissTokens,
 		LatencyMs:       latencyMs,
+		Meta:            meta,
 		CreatedAt:       now,
 		Timestamp:       now.UnixMilli(),
 	})

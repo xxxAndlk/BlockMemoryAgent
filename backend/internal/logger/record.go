@@ -11,4 +11,5 @@ type LLMCallRecord struct {
 	CacheHitTokens  int    // 缓存命中 token 数（TODO #40 可观测；provider 按端点语义映射）
 	CacheMissTokens int    // 缓存未命中 token 数（TODO #40 可观测）
 	LatencyMs       int    // 调用耗时（毫秒）
+	Meta            map[string]any // 扩展元数据（如 layer=lightweight 区分轻量调用），写入 session_logs.meta
 }

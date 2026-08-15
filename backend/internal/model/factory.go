@@ -11,8 +11,9 @@ import (
 	"sync"    // 读写锁，保护 models 缓存
 	"time"    // 探测超时
 
-	"github.com/blockmemory/agent/backend/pkg/config" // RoleConfigFile 角色配置
-	"github.com/blockmemory/agent/backend/pkg/types"  // AgentModelConfig 类型
+	"github.com/blockmemory/agent/backend/internal/logger" // logger 提供 ctx 携带的会话级日志器（轻量调用写 session_logs）
+	"github.com/blockmemory/agent/backend/pkg/config"      // RoleConfigFile 角色配置
+	"github.com/blockmemory/agent/backend/pkg/types"       // AgentModelConfig 类型
 	"github.com/go-kratos/blades"                     // blades.ModelProvider 类型引用
 )
 
@@ -422,8 +423,37 @@ func (f *ModelFactory) CallLightweightWithRetry(ctx context.Context, prompt stri
 		return "", err
 	}
 	// 流式累积 + 重试，单次超时 30 秒
+	start := time.Now()
 	resp, err, _ := retryStreamGenerate(ctx, llm, prompt, 30*time.Second)
+	// 写 session_logs（同普通调用 schema，Meta.layer=lightweight 可区分）；
+	// 补齐评测耗时归因缺口：轻量调用此前不产生 llm_input/llm_output 记录。
+	f.logLightweightCall(ctx, prompt, resp, err, time.Since(start))
 	return resp, err
+}
+
+// logLightweightCall 把一次轻量 LLM 调用写入 session_logs（复用 Logger.LLMCall 路径）。
+// ctx 未携带会话 logger（启动期/无会话场景）时跳过，不影响主流程。
+// 模型名取 LightweightResolution 的解析结果（与 GetLightweightModel 同一解析逻辑）；
+// token 为估算值（轻量链路走流式累积，未取 provider usage）。
+func (f *ModelFactory) logLightweightCall(ctx context.Context, prompt, resp string, callErr error, dur time.Duration) {
+	lg := logger.FromContext(ctx)
+	if lg == nil {
+		return
+	}
+	if callErr != nil {
+		resp = "[ERROR] " + callErr.Error() + "\n" + resp
+	}
+	cfg, _ := f.LightweightResolution()
+	lg.LLMCall(ctx, logger.LLMCallRecord{
+		Agent:        "lightweight",
+		Model:        cfg.Model,
+		Prompt:       prompt,
+		Response:     resp,
+		InputTokens:  EstimateTokens(prompt),
+		OutputTokens: EstimateTokens(resp),
+		LatencyMs:    int(dur.Milliseconds()),
+		Meta:         map[string]any{"layer": "lightweight"},
+	})
 }
 
 // LightweightResolution 返回轻量模型解析结果与来源，供启动日志排查配置加载。

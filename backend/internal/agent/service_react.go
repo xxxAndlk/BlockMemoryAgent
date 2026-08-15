@@ -149,7 +149,10 @@ func (s *ReactService) extractProfilePreferences(session *reactInternalSession) 
 	if text == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(
+		// 挂会话级 logger：画像提取的轻量 LLM 调用由此写 session_logs（BaseBackground 无 ctx 来源）。
+		logger.NewContext(context.Background(), s.sessionLogger(session.ID, "UserProfileExtractor")),
+		8*time.Second)
 	defer cancel()
 	prefs, err := s.profileExtractor(ctx, text)
 	if err != nil || len(prefs) == 0 {
@@ -197,6 +200,9 @@ func (s *ReactService) enhanceUserInput(ctx context.Context, sessionID, content 
 	if !s.promptEnhance {
 		return content, ""
 	}
+	// 挂会话级 logger：L2 意图仲裁的轻量 LLM 调用（arbiterDecide → CallLightweightWithRetry）
+	// 由此写 session_logs；sessionLogger 未注入全局 logger 时返回 nil，NewContext 原样透传。
+	ctx = logger.NewContext(ctx, s.sessionLogger(sessionID, "PromptEnhance"))
 	st := EnhanceState{}
 	if s.boardFn != nil {
 		if b := s.boardFn(sessionID); b != nil {

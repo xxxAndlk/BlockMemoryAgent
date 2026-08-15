@@ -101,10 +101,14 @@ func TestBuildMetaCardRendersNameOnly(t *testing.T) {
 type stubAgent struct{}
 
 // Board 返回看板快照，测试实现返回 nil（回退树合成）。
-func (stubAgent) Board(ctx context.Context, sessionID string) (*board.Snapshot, error) { return nil, nil }
+func (stubAgent) Board(ctx context.Context, sessionID string) (*board.Snapshot, error) {
+	return nil, nil
+}
 
 // Profile 返回用户画像，测试实现返回空。
-func (stubAgent) Profile(ctx context.Context) (*userprofile.Profile, error) { return &userprofile.Profile{}, nil }
+func (stubAgent) Profile(ctx context.Context) (*userprofile.Profile, error) {
+	return &userprofile.Profile{}, nil
+}
 
 // SaveProfile 覆盖画像，测试实现为空操作。
 func (stubAgent) SaveProfile(ctx context.Context, content string) error { return nil }
