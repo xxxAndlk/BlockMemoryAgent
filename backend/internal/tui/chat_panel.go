@@ -32,6 +32,9 @@ type ChatPanel struct {
 	anchorUser bool
 	// pendingFirstMessage 是在会话创建前本地预展示的首条用户消息。
 	pendingFirstMessage string
+	// goalBarH 是顶部固定目标栏占用的行数（0 或 1，renderChat 时按当前会话目标计算）：
+	// 滚动条区域/拖动映射据此下移，保证鼠标操作与视觉一致（TODO #48 子项 3）。
+	goalBarH int
 	// lastLiveTitle 是上次重建时最后一条 chatItem 的标题，
 	// 用于检测流式文本增长/等待状态切换等"条目数不变但内容变化"的情况。
 	lastLiveTitle string
@@ -151,15 +154,18 @@ func (cp *ChatPanel) gotoBottom() {
 }
 
 // scrollbarArea 返回聊天区滚动条在屏幕上的范围（x, y, w, h）。
-// 顶栏占 1 行，滚动条位于对话区最右侧，宽度 1。
+// 顶栏占 1 行，目标栏（goalBarH）再占 1 行；滚动条位于对话区最右侧，宽度 1。
 func (cp *ChatPanel) scrollbarArea(chatAreaWidth, contentH int) (x, y, w, h int) {
 	x = chatAreaWidth - 2 // 间隔 1 + 滚动条宽度 1
 	if x < 0 {
 		x = 0
 	}
-	y = 1 // 顶栏高度
+	y = 1 + cp.goalBarH // 顶栏高度 + 目标栏高度
 	w = 1
-	h = contentH
+	h = contentH - cp.goalBarH
+	if h < 1 {
+		h = 1
+	}
 	return
 }
 
@@ -168,7 +174,7 @@ func (cp *ChatPanel) scrollbarArea(chatAreaWidth, contentH int) (x, y, w, h int)
 func (cp *ChatPanel) thumbBounds(contentH int) (start, end int) {
 	totalLines := cp.vp.TotalLineCount()
 	viewportH := cp.vp.VisibleLineCount()
-	h := contentH
+	h := contentH - cp.goalBarH
 	// 内容不足或区域无效时无需滚动条。
 	if totalLines <= viewportH || viewportH <= 0 || h < 1 {
 		return -1, -1
@@ -201,7 +207,7 @@ func (cp *ChatPanel) thumbBounds(contentH int) (start, end int) {
 func (cp *ChatPanel) updateDrag(mouseY, contentH int) {
 	totalLines := cp.vp.TotalLineCount()
 	viewportH := cp.vp.VisibleLineCount()
-	h := contentH
+	h := contentH - cp.goalBarH
 	// 无需滚动时不更新。
 	if totalLines <= viewportH || viewportH <= 0 || h < 1 {
 		return
@@ -238,7 +244,7 @@ func (cp *ChatPanel) updateDrag(mouseY, contentH int) {
 func (cp *ChatPanel) scrollToThumbY(thumbCenterY, contentH int) {
 	totalLines := cp.vp.TotalLineCount()
 	viewportH := cp.vp.VisibleLineCount()
-	h := contentH
+	h := contentH - cp.goalBarH
 	if totalLines <= viewportH || viewportH <= 0 || h < 1 {
 		return
 	}
@@ -315,10 +321,11 @@ func (cp *ChatPanel) renderScrollbar(w, h, viewportH, totalLines, startLine int,
 	return lipgloss.NewStyle().Width(w).Height(h).Render(strings.Join(rows, "\n"))
 }
 
-// renderChat 渲染对话区，包括 viewport 内容与滚动条。
+// renderChat 渲染对话区，包括顶部固定目标栏（TODO #48 子项 3）、viewport 内容与滚动条。
 // hasItems 表示最近一次内容重建（rebuildContent）时是否有对话条目，仅用于选择
 // 欢迎页/空会话占位；内容本体始终渲染 viewport 缓存，避免每帧重复全量 collectItems 计算。
-func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Session, hasItems bool, modelName, workDir string) string {
+// goal 为当前会话主任务目标（看板 Goal 优先），非空时顶部固定展示、不随内容滚动。
+func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Session, hasItems bool, modelName, workDir, goal string) string {
 	const scrollbarW = 1
 	gap := 1
 	// 内容区宽度扣除滚动条与间隔。
@@ -327,24 +334,48 @@ func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Sessio
 		contentW = w
 	}
 
-	// 无 item 时展示欢迎页或空会话提示。
+	// 顶部固定目标栏：主任务目标常驻可见（任务看板 goal 首行优先），
+	// 等待子 Agent 等瞬时状态降级为对话区普通条目，不再顶替主任务展示。
+	goalH := 0
+	var goalBar string
+	if session != nil && strings.TrimSpace(goal) != "" {
+		goalH = 1
+		goalBar = styles.Dim.Render("🎯 ") + styles.TopBarValue.Render(truncate(goal, contentW-2))
+	}
+	cp.goalBarH = goalH
+	bodyH := h - goalH
+	if bodyH < 1 {
+		bodyH = 1
+	}
+
+	// 无 item 时展示欢迎页或空会话提示（目标栏保持置顶）。
 	if !hasItems {
+		var body string
 		if session == nil {
-			return renderWelcome(styles, contentW, h, modelName, workDir)
+			body = renderWelcome(styles, contentW, bodyH, modelName, workDir)
+		} else {
+			body = renderEmptyChat(styles, contentW, bodyH)
 		}
-		return renderEmptyChat(styles, contentW, h)
+		if goalH > 0 {
+			return lipgloss.JoinVertical(lipgloss.Top, goalBar, body)
+		}
+		return body
 	}
 
 	// 设置 viewport 尺寸并渲染内容。
 	cp.vp.Width = contentW
-	cp.vp.Height = h
+	cp.vp.Height = bodyH
 
-	content := lipgloss.NewStyle().Width(contentW).Height(h).Render(cp.vp.View())
+	content := lipgloss.NewStyle().Width(contentW).Height(bodyH).Render(cp.vp.View())
 	totalLines := cp.vp.TotalLineCount()
 	viewportH := cp.vp.VisibleLineCount()
 	startLine := cp.vp.YOffset
-	bar := cp.renderScrollbar(scrollbarW, h, viewportH, totalLines, startLine, styles)
-	return lipgloss.JoinHorizontal(lipgloss.Top, content, bar)
+	bar := cp.renderScrollbar(scrollbarW, bodyH, viewportH, totalLines, startLine, styles)
+	row := lipgloss.JoinHorizontal(lipgloss.Top, content, bar)
+	if goalH > 0 {
+		return lipgloss.JoinVertical(lipgloss.Top, goalBar, row)
+	}
+	return row
 }
 
 // maxChatItems 是主对话区最多展示的条目数。长会话会产生数百条工具事件，
@@ -593,5 +624,28 @@ func (m *Model) rebuildChatContent() {
 // rebuildChatContent）负责更新，最多个别 0↔非0 切换延迟一个刷新周期（≤100ms）。
 func (m Model) renderChat(w, h int) string {
 	s := m.selectedSession()
-	return m.chatPanel.renderChat(w, h, m.styles, s, m.chatPanel.lastItems > 0, m.modelName, m.workDir)
+	return m.chatPanel.renderChat(w, h, m.styles, s, m.chatPanel.lastItems > 0, m.modelName, m.workDir, m.currentGoalText())
+}
+
+// currentGoalText 返回当前会话的主任务目标（TODO #48 子项 3）：
+// 优先任务看板 Goal（write_plan 首行），回退最后一条用户消息，再回退会话 Goal。
+// 空会话返回空串（不渲染目标栏）。
+func (m *Model) currentGoalText() string {
+	s := m.selectedSession()
+	if s == nil {
+		return ""
+	}
+	goal := m.boardSnapshot(s).Goal
+	if goal == "" {
+		for i := len(s.Messages) - 1; i >= 0; i-- {
+			if s.Messages[i].Role == enums.ChatRoleUser {
+				goal = strings.TrimSpace(s.Messages[i].Content)
+				break
+			}
+		}
+	}
+	if goal == "" {
+		goal = s.Goal
+	}
+	return strings.TrimSpace(goal)
 }

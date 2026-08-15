@@ -8,8 +8,9 @@ package model
 //
 // 各 provider 的语义映射：
 //   - openai-chat（DeepSeek 原生）：prompt_cache_hit_tokens / prompt_cache_miss_tokens；
-//   - openai-responses：input_tokens_details.cached_tokens 作 hit，input - cached 作 miss；
-//   - anthropic：CacheReadInputTokens 作 hit，CacheCreationInputTokens 作 miss。
+//   - openai-responses：DeepSeek 原生 prompt_cache_hit/miss_tokens 优先（代理 DeepSeek 端点时），
+//     否则 input_tokens_details.cached_tokens 作 hit、input - cached 作 miss；
+//   - anthropic：CacheReadInputTokens 作 hit，InputTokens+CacheCreationInputTokens 作 miss。
 
 import "github.com/go-kratos/blades"
 

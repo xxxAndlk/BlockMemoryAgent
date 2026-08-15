@@ -63,16 +63,47 @@ func TestBuildAgentCardRendersNameAndStatus(t *testing.T) {
 		goal:      "设计后台前端页面",
 		createdAt: time.Now(),
 	}
-	card := m.buildAgentCard(node, 40)
+	card := m.buildAgentCard(node, 40, "")
 	if !strings.Contains(card, "游戏渲染领域") {
 		t.Errorf("card missing agent name:\n%s", card)
 	}
 	if !strings.Contains(card, "Done") {
 		t.Errorf("card missing status Done:\n%s", card)
 	}
-	// 简洁展示：目标不再出现在卡片上。
+	// 简洁展示：已完成卡片不展示目标详情（完整详情在 [A] 编排弹窗中查看）。
 	if strings.Contains(card, "设计后台前端页面") {
-		t.Errorf("card 不应再展示目标详情:\n%s", card)
+		t.Errorf("card 不应展示目标详情:\n%s", card)
+	}
+}
+
+// TestBuildAgentCardWaitingAnnotation 验证运行中分支卡片带"等待 XX 完成"标注（TODO #48 子项 1）。
+func TestBuildAgentCardWaitingAnnotation(t *testing.T) {
+	m := &Model{styles: NewStyles()}
+	node := agentTreeNode{
+		depth:    1,
+		name:     "游戏主控领域",
+		roleType: enums.RoleTypeDomain,
+		status:   enums.RoleStatusActive,
+	}
+	card := m.buildAgentCard(node, 40, "⏳ 等待 代码助手 完成")
+	if !strings.Contains(card, "⏳ 等待 代码助手 完成") {
+		t.Errorf("card missing waiting annotation:\n%s", card)
+	}
+}
+
+// TestBuildAgentCardActiveShowsGoal 验证运行中无子节点的卡片展示当前任务摘要（进度感）。
+func TestBuildAgentCardActiveShowsGoal(t *testing.T) {
+	m := &Model{styles: NewStyles()}
+	node := agentTreeNode{
+		depth:    1,
+		name:     "游戏主控领域",
+		roleType: enums.RoleTypeDomain,
+		status:   enums.RoleStatusActive,
+		goal:     "实现游戏主循环与 6 步改造计划",
+	}
+	card := m.buildAgentCard(node, 40, "")
+	if !strings.Contains(card, "实现游戏主循环") {
+		t.Errorf("active card missing goal line:\n%s", card)
 	}
 }
 
@@ -87,12 +118,27 @@ func TestBuildMetaCardRendersNameOnly(t *testing.T) {
 		status:   enums.RoleStatusActive,
 		goal:     "做一个塔防游戏",
 	}
-	card := m.buildMetaCard(node)
+	card := m.buildMetaCard(node, "")
 	if !strings.Contains(card, "MetaAgent") {
 		t.Errorf("meta card missing name:\n%s", card)
 	}
 	if strings.Contains(card, "Orchestrator") || strings.Contains(card, "塔防") || strings.Contains(card, "Running") {
 		t.Errorf("meta card 不应展示角色/目标/状态文本:\n%s", card)
+	}
+}
+
+// TestBuildMetaCardWaitingAnnotation 验证 MetaAgent 等待子 Agent 时卡片带等待标注（TODO #48 子项 1）。
+func TestBuildMetaCardWaitingAnnotation(t *testing.T) {
+	m := &Model{styles: NewStyles()}
+	node := agentTreeNode{
+		depth:    0,
+		name:     "MetaAgent",
+		roleType: enums.RoleTypeMeta,
+		status:   enums.RoleStatusActive,
+	}
+	card := m.buildMetaCard(node, "⏳ 等待 游戏主控领域 完成")
+	if !strings.Contains(card, "⏳ 等待 游戏主控领域 完成") {
+		t.Errorf("meta card missing waiting annotation:\n%s", card)
 	}
 }
 

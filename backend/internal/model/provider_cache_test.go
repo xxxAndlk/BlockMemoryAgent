@@ -83,6 +83,24 @@ func TestOpenAIResponses_CachedTokens(t *testing.T) {
 	}
 }
 
+// TestOpenAIResponses_DeepSeekNativeCacheFields responses 协议代理 DeepSeek 端点时，
+// usage 直接带 prompt_cache_hit/miss_tokens：优先于 cached_tokens 解析进 Metadata。
+func TestOpenAIResponses_DeepSeekNativeCacheFields(t *testing.T) {
+	raw := `{"id":"x","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}],
+	"usage":{"input_tokens":200,"output_tokens":50,"total_tokens":250,"prompt_cache_hit_tokens":150,"prompt_cache_miss_tokens":50,"input_tokens_details":{"cached_tokens":170}}}`
+	resp, err := parseResponsesAPIResponse([]byte(raw))
+	if err != nil {
+		t.Fatalf("parseResponsesAPIResponse: %v", err)
+	}
+	md := resp.Message.Metadata
+	if got := md["cache_hit_tokens"]; got != int64(150) {
+		t.Fatalf("cache_hit_tokens = %v, want 150（DeepSeek 原生字段优先于 cached_tokens）", got)
+	}
+	if got := md["cache_miss_tokens"]; got != int64(50) {
+		t.Fatalf("cache_miss_tokens = %v, want 50", got)
+	}
+}
+
 // TestResponsesFinishReason_NoToolCalls 防回归：工具调用场景 finish reason 不变。
 func TestResponsesFinishReason_NoToolCalls(t *testing.T) {
 	if r := responsesFinishReason(&responsesAPIResponseBody{Status: "completed"}, false); r != "stop" {

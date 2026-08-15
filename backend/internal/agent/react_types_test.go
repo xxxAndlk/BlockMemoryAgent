@@ -17,8 +17,8 @@ func TestAssistantMessageFromBlades_DropsBrokenToolCall(t *testing.T) {
 	m := blades.NewAssistantMessage(blades.StatusCompleted)
 	m.Parts = []blades.Part{
 		blades.TextPart{Text: "先写文件"},
-		blades.NewToolPart("c1", "WriteFile", `{"path":"a.js","content":"`),       // 半截 JSON
-		blades.NewToolPart("c2", "WriteFile", `{"path":"b.js","content":"ok"}`),   // 完整 JSON
+		blades.NewToolPart("c1", "WriteFile", `{"path":"a.js","content":"`),     // 半截 JSON
+		blades.NewToolPart("c2", "WriteFile", `{"path":"b.js","content":"ok"}`), // 完整 JSON
 	}
 	msg := AssistantMessageFromBlades(m)
 	if len(msg.ToolCalls) != 1 {
@@ -47,7 +47,7 @@ func TestAssistantMessageFromBlades_EmptyRequestKept(t *testing.T) {
 	}
 }
 
-// TestFilesModifiedFromHistory 验证从 ReAct 历史扫 WriteFile 调用收集修改文件路径。
+// TestFilesModifiedFromHistory 验证从 ReAct 历史扫 WriteFile/EditFile 调用收集修改文件路径。
 func TestFilesModifiedFromHistory(t *testing.T) {
 	history := []ReactMessage{
 		{Role: "user", Content: "fix bug"},
@@ -56,19 +56,19 @@ func TestFilesModifiedFromHistory(t *testing.T) {
 		}},
 		{Role: "tool", ToolCallID: "t1", Content: "wrote 10 bytes"},
 		{Role: "assistant", ToolCalls: []ToolCall{
-			{ID: "t2", Name: "ReadFile", Input: map[string]any{"path": "src/b.go"}}, // 非 WriteFile，忽略
-			{ID: "t3", Name: "WriteFile", Input: map[string]any{"path": "doc/b.md"}},
+			{ID: "t2", Name: "ReadFile", Input: map[string]any{"path": "src/b.go"}}, // 非写工具，忽略
+			{ID: "t3", Name: "EditFile", Input: map[string]any{"path": "doc/b.md"}}, // EditFile 同列修改文件
 		}},
 		{Role: "assistant", Content: "done", ToolCalls: []ToolCall{
 			{ID: "t4", Name: "WriteFile", Input: map[string]any{"path": "src/a.go"}}, // 重复路径，去重
-			{ID: "t5", Name: "WriteFile", Input: map[string]any{}},                  // 无 path 字段，跳过
-			{ID: "t6", Name: "WriteFile", Input: map[string]any{"path": "  "}},      // 空白 path，跳过
+			{ID: "t5", Name: "WriteFile", Input: map[string]any{}},                   // 无 path 字段，跳过
+			{ID: "t6", Name: "EditFile", Input: map[string]any{"path": "  "}},        // 空白 path，跳过
 		}},
 	}
 	got := FilesModifiedFromHistory(history)
 	want := []string{filepath.Clean("src/a.go"), filepath.Clean("doc/b.md")}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("FilesModifiedFromHistory = %v, want %v", got, want)
+		t.Fatalf("FilesModifiedFromHistory = %v, want %v", got, want)
 	}
 }
 

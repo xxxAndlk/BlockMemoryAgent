@@ -71,10 +71,12 @@ func TestCallLightweightWithRetryNoEndpoint(t *testing.T) {
 
 // fakeStreamingClient 实现 LLMClient + streamingProvider（BladesClient 同款能力），
 // 分块产出文本，用于验证轻量链路流式累积（TODO #33）。
+// meta 非空时挂在最后一个分块消息的 Metadata 上（验证缓存 token 透传，TODO #40）。
 type fakeStreamingClient struct {
 	chunks []string
 	err    error
 	calls  int
+	meta   map[string]any
 }
 
 func (c *fakeStreamingClient) Generate(ctx context.Context, prompt string) (string, error) {
@@ -85,8 +87,12 @@ func (c *fakeStreamingClient) Generate(ctx context.Context, prompt string) (stri
 func (c *fakeStreamingClient) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
 	c.calls++
 	return func(yield func(*blades.ModelResponse, error) bool) {
-		for _, ch := range c.chunks {
-			if !yield(&blades.ModelResponse{Message: blades.AssistantMessage(ch)}, nil) {
+		for i, ch := range c.chunks {
+			msg := blades.AssistantMessage(ch)
+			if c.meta != nil && i == len(c.chunks)-1 {
+				msg.Metadata = c.meta
+			}
+			if !yield(&blades.ModelResponse{Message: msg}, nil) {
 				return
 			}
 		}
@@ -94,6 +100,28 @@ func (c *fakeStreamingClient) NewStreaming(ctx context.Context, req *blades.Mode
 			yield(nil, c.err)
 			return
 		}
+	}
+}
+
+// TestRetryStreamGenerate_ReturnsMetadata 末块 Metadata（provider 透传的
+// cache_hit/miss_tokens）随返回值上传，供轻量链路落缓存命中率日志（TODO #40）。
+func TestRetryStreamGenerate_ReturnsMetadata(t *testing.T) {
+	client := &fakeStreamingClient{
+		chunks: []string{"部分", "完整响应"},
+		meta:   map[string]any{"cache_hit_tokens": int64(120), "cache_miss_tokens": int64(30)},
+	}
+	text, meta, err, _ := retryStreamGenerate(context.Background(), client, "prompt", 5*time.Second)
+	if err != nil {
+		t.Fatalf("stream generate: %v", err)
+	}
+	if text != "完整响应" {
+		t.Fatalf("expected last cumulative chunk, got: %q", text)
+	}
+	if got := meta["cache_hit_tokens"]; got != int64(120) {
+		t.Fatalf("cache_hit_tokens = %v, want 120", got)
+	}
+	if got := meta["cache_miss_tokens"]; got != int64(30) {
+		t.Fatalf("cache_miss_tokens = %v, want 30", got)
 	}
 }
 
@@ -106,7 +134,7 @@ func TestRetryStreamGenerate_AccumulatesChunks(t *testing.T) {
 		"已读文件: config.js\n结论: ",
 		"已读文件: config.js\n结论: 路径引用错误", // 末块 = 完整累积响应
 	}}
-	text, err, _ := retryStreamGenerate(context.Background(), client, "prompt", 5*time.Second)
+	text, _, err, _ := retryStreamGenerate(context.Background(), client, "prompt", 5*time.Second)
 	if err != nil {
 		t.Fatalf("stream generate: %v", err)
 	}
@@ -148,7 +176,7 @@ func TestRetryStreamGenerate_ErrorRetries(t *testing.T) {
 	client := &fakeStreamingClient{chunks: []string{"ok"}}
 	// 首次调用注入错误：calls=1 时报错，calls>=2 成功。
 	flaky := &flakyStreamWrapper{inner: client}
-	text, err, _ := retryStreamGenerate(context.Background(), flaky, "prompt", 5*time.Second)
+	text, _, err, _ := retryStreamGenerate(context.Background(), flaky, "prompt", 5*time.Second)
 	if err != nil {
 		t.Fatalf("should recover after retry: %v", err)
 	}
@@ -160,7 +188,7 @@ func TestRetryStreamGenerate_ErrorRetries(t *testing.T) {
 // TestRetryStreamGenerate_AllFail 全部 attempt 失败返回最后一次错误。
 func TestRetryStreamGenerate_AllFail(t *testing.T) {
 	client := &fakeStreamingClient{err: errors.New("endpoint rejected non-streaming")}
-	_, err, _ := retryStreamGenerate(context.Background(), client, "prompt", 5*time.Second)
+	_, _, err, _ := retryStreamGenerate(context.Background(), client, "prompt", 5*time.Second)
 	if err == nil {
 		t.Fatal("expected error when all attempts fail")
 	}

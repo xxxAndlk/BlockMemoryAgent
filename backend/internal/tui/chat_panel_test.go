@@ -67,3 +67,44 @@ func TestCollectItemsBelowCapKeepsAll(t *testing.T) {
 		t.Fatal("未超上限时不应出现省略提示")
 	}
 }
+
+// TestGoalBarPinnedOnTop 验证对话区顶部固定目标栏（TODO #48 子项 3）：
+// 主任务目标常驻展示在对话区顶部，等待/瞬时状态条目不会顶替它。
+func TestGoalBarPinnedOnTop(t *testing.T) {
+	now := time.Now()
+	s := &server.Session{
+		ID:        "session-1",
+		Goal:      "做一个塔防游戏",
+		Status:    enums.SessionStatusRunning,
+		StartedAt: now,
+		Messages: []types.ChatMessage{
+			{Role: enums.ChatRoleUser, Content: "做一个塔防游戏", Timestamp: now},
+		},
+	}
+	m := &Model{
+		styles:         NewStyles(),
+		sessions:       []*server.Session{s},
+		sessionsCursor: 0,
+	}
+	m.chatPanel.lastItems = 1 // 跳过欢迎页分支，直接渲染 viewport。
+	out := m.renderChat(80, 20)
+	if !strings.Contains(out, "🎯") || !strings.Contains(out, "做一个塔防游戏") {
+		t.Fatalf("目标栏应固定展示主任务目标:\n%s", out)
+	}
+	// 目标栏置顶：出现在对话内容第一行（内容本体仍在，未被顶替）。
+	if !strings.HasPrefix(out, "🎯") {
+		t.Errorf("目标栏应位于对话区顶部:\n%s", out)
+	}
+}
+
+// TestGoalBarAbsentWithoutGoal 验证无目标（无会话/无消息）时不渲染目标栏。
+func TestGoalBarAbsentWithoutGoal(t *testing.T) {
+	m := &Model{styles: NewStyles()}
+	out := m.renderChat(80, 20)
+	if strings.Contains(out, "🎯") {
+		t.Fatalf("无会话时不应渲染目标栏:\n%s", out)
+	}
+	if m.chatPanel.goalBarH != 0 {
+		t.Errorf("goalBarH = %d, want 0", m.chatPanel.goalBarH)
+	}
+}

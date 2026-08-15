@@ -226,7 +226,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 			Tools: []string{
 				"call_sub_agent", "call_sub_agents",
 				"ReadFile", "ListDir", "SearchInFiles", "HTTPGet",
-				"WriteSharedMemory", "WriteSpec", "WriteFile", "RunCommand",
+				"WriteSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RunCommand",
 				"RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "search_knowledge",
 			},
 			CanBeCalled: true,

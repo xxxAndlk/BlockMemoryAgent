@@ -96,24 +96,27 @@ type streamingProvider interface {
 // 决策固化（2026-08-10 事故）：方舟 coding 端点对"可能超过 10 分钟的操作"拒绝非流式 POST，
 // 轻量调用走非流式 Generate 时 5 组 exhausted retries 全挂（打捞/摘要/事实提取残废）——
 // 流式是长任务端点的事实要求，轻量链路必须走流式。
-// 客户端无流式实现（测试 fake 等）时回退非流式 retryGenerate（行为不变）。
-// 返回语义与 retryGenerate 一致：(文本, 错误, 是否超时过)。
-func retryStreamGenerate(ctx context.Context, llm LLMClient, prompt string, perAttemptTimeout time.Duration) (string, error, bool) {
+// 客户端无流式实现（测试 fake 等）时回退非流式 retryGenerate（行为不变，meta 为 nil）。
+// 返回语义在 retryGenerate 基础上增加第二个返回值：末次流式分块消息的 Metadata
+// （provider 侧透传的 cache_hit_tokens / cache_miss_tokens 经此上传，TODO #40）。
+func retryStreamGenerate(ctx context.Context, llm LLMClient, prompt string, perAttemptTimeout time.Duration) (string, map[string]any, error, bool) {
 	sp, ok := llm.(streamingProvider)
 	if !ok {
-		return retryGenerate(ctx, llm, prompt, perAttemptTimeout)
+		text, err, timedOut := retryGenerate(ctx, llm, prompt, perAttemptTimeout)
+		return text, nil, err, timedOut
 	}
 	var lastErr error
 	timedOut := false
 	backoff := 500 * time.Millisecond
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return "", err, false
+			return "", nil, err, false
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
 		req := &blades.ModelRequest{Messages: []*blades.Message{blades.UserMessage(prompt)}}
 		// 累积流式分块：取最后一个非 nil 分块（各 provider 约定末块为完整累积响应）。
 		var text string
+		var meta map[string]any
 		lastErr = nil // 逐轮重置：首轮错误不得残留导致成功轮被跳过
 		stream := sp.NewStreaming(attemptCtx, req)
 		for resp, err := range stream {
@@ -123,6 +126,9 @@ func retryStreamGenerate(ctx context.Context, llm LLMClient, prompt string, perA
 			}
 			if resp != nil && resp.Message != nil {
 				text = streamMessageText(resp.Message)
+				if resp.Message.Metadata != nil {
+					meta = resp.Message.Metadata
+				}
 			}
 		}
 		// 在 cancel 前判定超时（cancel 后 Err() 会变为 Canceled）。
@@ -133,7 +139,7 @@ func retryStreamGenerate(ctx context.Context, llm LLMClient, prompt string, perA
 				// 流式正常结束但无内容：视为空响应（与 retryGenerate 的空响应语义一致）。
 				lastErr = errors.New("empty streaming response")
 			} else {
-				return text, nil, false
+				return text, meta, nil, false
 			}
 		}
 		if deadlineExceeded {
@@ -143,7 +149,7 @@ func retryStreamGenerate(ctx context.Context, llm LLMClient, prompt string, perA
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
-				return "", ctx.Err(), false
+				return "", nil, ctx.Err(), false
 			}
 			backoff *= 2
 			if backoff > 2*time.Second {
@@ -151,7 +157,7 @@ func retryStreamGenerate(ctx context.Context, llm LLMClient, prompt string, perA
 			}
 		}
 	}
-	return "", lastErr, timedOut
+	return "", nil, lastErr, timedOut
 }
 
 // streamMessageText 提取 blades 消息的全部文本部分（忽略工具调用等非文本部分）。

@@ -195,3 +195,151 @@ func TestAgentsPanelSecondRoundRefresh(t *testing.T) {
 		t.Errorf("上一轮完成 Agent 不应再占位, got:\n%s", panel)
 	}
 }
+
+// TestGroupAgentTree_BranchesAndChildren 验证真树形分组（TODO #48 子项 2）：
+// meta 下按 depth=1 节点分叉，子节点沿 ParentID 链挂到所属分支。
+func TestGroupAgentTree_BranchesAndChildren(t *testing.T) {
+	nodes := []agentTreeNode{
+		{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive},
+		{depth: 1, instID: "s/domain-2", parentID: "s", name: "游戏主控领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusActive},
+		{depth: 1, instID: "s/domain-3", parentID: "s", name: "怪物领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusDone},
+		{depth: 2, instID: "s/domain-2/code_assistant-1", parentID: "s/domain-2", name: "代码助手", roleType: enums.RoleTypeFixed, status: enums.RoleStatusActive},
+		{depth: 2, instID: "s/domain-2/ui_assistant-1", parentID: "s/domain-2", name: "UI助手", roleType: enums.RoleTypeFixed, status: enums.RoleStatusActive},
+		{depth: 2, instID: "s/domain-3/code_assistant-2", parentID: "s/domain-3", name: "代码助手", roleType: enums.RoleTypeFixed, status: enums.RoleStatusActive},
+	}
+	meta, branches, loose := groupAgentTree(nodes)
+	if meta == nil || meta.instID != "MetaAgent" {
+		t.Fatalf("meta = %+v, want MetaAgent", meta)
+	}
+	if len(branches) != 2 {
+		t.Fatalf("want 2 branches, got %d", len(branches))
+	}
+	if branches[0].node.name != "游戏主控领域" || branches[1].node.name != "怪物领域" {
+		t.Fatalf("branch order wrong: %+v", branches)
+	}
+	// domain-2 的助手挂在 domain-2 分支下，domain-3 的助手挂在 domain-3 分支下。
+	if len(branches[0].children) != 2 {
+		t.Fatalf("domain-2 children = %d, want 2", len(branches[0].children))
+	}
+	if branches[0].children[0].instID != "s/domain-2/code_assistant-1" ||
+		branches[0].children[1].instID != "s/domain-2/ui_assistant-1" {
+		t.Errorf("domain-2 children mismatch: %+v", branches[0].children)
+	}
+	if len(branches[1].children) != 1 || branches[1].children[0].instID != "s/domain-3/code_assistant-2" {
+		t.Errorf("domain-3 children mismatch: %+v", branches[1].children)
+	}
+	if len(loose) != 0 {
+		t.Errorf("loose nodes = %+v, want none", loose)
+	}
+}
+
+// TestGroupAgentTree_ClutterFiltered 验证拥挤过滤沿用旧口径：
+// depth>=2 且无目标且已终结/空闲的节点不参与渲染。
+func TestGroupAgentTree_ClutterFiltered(t *testing.T) {
+	nodes := []agentTreeNode{
+		{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta},
+		{depth: 1, instID: "s/domain-2", parentID: "s", name: "游戏主控领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusActive},
+		// 无目标、已完成的助手：应被过滤。
+		{depth: 2, instID: "s/domain-2/code_assistant-1", parentID: "s/domain-2", name: "代码助手", roleType: enums.RoleTypeFixed, status: enums.RoleStatusDone},
+		// 有目标、已完成的助手：应保留。
+		{depth: 2, instID: "s/domain-2/code_assistant-2", parentID: "s/domain-2", name: "代码助手", roleType: enums.RoleTypeFixed, status: enums.RoleStatusDone, goal: "写游戏循环"},
+	}
+	_, branches, _ := groupAgentTree(nodes)
+	if len(branches) != 1 || len(branches[0].children) != 1 {
+		t.Fatalf("want 1 branch with 1 child, got %+v", branches)
+	}
+	if branches[0].children[0].instID != "s/domain-2/code_assistant-2" {
+		t.Errorf("kept wrong child: %+v", branches[0].children)
+	}
+}
+
+// TestWaitingChildNames 验证等待标注文案（TODO #48 子项 1）：1/2/多 三种形态。
+func TestWaitingChildNames(t *testing.T) {
+	active := agentTreeNode{name: "代码助手", status: enums.RoleStatusActive}
+	waiting := agentTreeNode{name: "UI助手", status: enums.RoleStatusWaiting}
+	done := agentTreeNode{name: "测试助手", status: enums.RoleStatusDone}
+	if got := waitingChildNames(nil); got != "" {
+		t.Errorf("empty = %q, want empty", got)
+	}
+	if got := waitingChildNames([]agentTreeNode{done}); got != "" {
+		t.Errorf("all done = %q, want empty", got)
+	}
+	if got := waitingChildNames([]agentTreeNode{active}); got != "⏳ 等待 代码助手 完成" {
+		t.Errorf("one = %q", got)
+	}
+	if got := waitingChildNames([]agentTreeNode{active, waiting}); got != "⏳ 等待 代码助手、UI助手 完成" {
+		t.Errorf("two = %q", got)
+	}
+	if got := waitingChildNames([]agentTreeNode{active, waiting, active}); got != "⏳ 等待 3 个子 Agent 完成" {
+		t.Errorf("many = %q", got)
+	}
+}
+
+// TestRenderAgentsPanel_TreeLayout 验证真树形渲染（TODO #48 子项 2 验收 (c)）：
+// 1/2/3 领域场景分叉形态正确（分支卡片都在、助手挂在所属领域下、无悬空连接线），
+// 且 meta 等待标注可见（验收 (b)）。
+func TestRenderAgentsPanel_TreeLayout(t *testing.T) {
+	mkNode := func(inst, parent, name string, depth int, status enums.RoleStatus) agentTreeNode {
+		return agentTreeNode{
+			depth:    depth,
+			instID:   inst,
+			parentID: parent,
+			name:     name,
+			roleType: enums.RoleTypeDomain,
+			status:   status,
+		}
+	}
+	cases := []struct {
+		name     string
+		nodes    []agentTreeNode
+		wantAll  []string // 必须全部出现
+		wantNone []string // 必须全部不出现
+	}{
+		{
+			name: "1 领域 1 助手",
+			nodes: []agentTreeNode{
+				{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive},
+				mkNode("s/d1", "s", "游戏主控领域", 1, enums.RoleStatusActive),
+				{depth: 2, instID: "s/d1/c1", parentID: "s/d1", name: "代码助手", roleType: enums.RoleTypeFixed, status: enums.RoleStatusActive},
+			},
+			wantAll:  []string{"MetaAgent", "游戏主控领域", "代码助手", "⏳ 等待 代码助手 完成"},
+			wantNone: []string{"┌", "┐"},
+		},
+		{
+			name: "2 领域并行",
+			nodes: []agentTreeNode{
+				{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive},
+				mkNode("s/d1", "s", "游戏主控领域", 1, enums.RoleStatusActive),
+				mkNode("s/d2", "s", "怪物领域", 1, enums.RoleStatusActive),
+			},
+			wantAll: []string{"MetaAgent", "游戏主控领域", "怪物领域", "⏳ 等待 游戏主控领域、怪物领域 完成"},
+		},
+		{
+			name: "3 领域并行",
+			nodes: []agentTreeNode{
+				{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive},
+				mkNode("s/d1", "s", "游戏主控领域", 1, enums.RoleStatusActive),
+				mkNode("s/d2", "s", "怪物领域", 1, enums.RoleStatusDone),
+				mkNode("s/d3", "s", "路径实体领域", 1, enums.RoleStatusDone),
+			},
+			wantAll: []string{"MetaAgent", "游戏主控领域", "怪物领域", "路径实体领域"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := &Model{styles: NewStyles()}
+			m.agentTreePanel.nodes = c.nodes
+			panel := m.renderAgentsPanel(80, 26)
+			for _, want := range c.wantAll {
+				if !strings.Contains(panel, want) {
+					t.Errorf("panel missing %q:\n%s", want, panel)
+				}
+			}
+			for _, no := range c.wantNone {
+				if strings.Contains(panel, no) {
+					t.Errorf("panel should not contain %q:\n%s", no, panel)
+				}
+			}
+		})
+	}
+}

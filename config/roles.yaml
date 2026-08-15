@@ -169,7 +169,7 @@ domain_agent:
     - WriteFile 写代码文件（.js/.go/.py/.ts 等）后立即用 RunCommand 跑语法检查：
       JS/TS `node -c <file>`；Go `go build ./<pkg>`；Python `python -m py_compile <file>`。
       发现 syntax error 先修再继续，不带病往下走。
-    - 写/改文件只用 WriteFile 工具：Windows PowerShell 重定向写文件（Set-Content / Out-File /
+    - 写/改文件只用 WriteFile/EditFile 工具（小改 <20% 文件优先 EditFile 精确替换，输出 token 与耗时远小于整文件重写；新建/大改才 WriteFile 整写）：Windows PowerShell 重定向写文件（Set-Content / Out-File /
       echo>）默认 GBK 编码会损坏中文与 emoji 并破坏语法。
 
     【结果汇总】
@@ -186,8 +186,9 @@ domain_agent:
 
 # 轻量模型配置（用于历史会话总结、检索 query 改写等低开销任务）
 # 可指向更便宜更快的模型；留空 model 时回退到 domain_agent 模型
-# TODO #40 块 3：轻量模型归一 DeepSeek 原生 /chat/completions（provider=openai-chat），
-# 原生自动前缀缓存 + prompt_cache_hit/miss_tokens 字段（缓存可观测的基础）。
+# TODO #40 块 3：轻量模型走 DeepSeek（经 responses 协议代理，provider=openai-responses），
+# 自动前缀缓存 + prompt_cache_hit/miss_tokens 字段（provider 端已补原生字段解析，
+# 缓存命中/未命中透传进 session_logs，轻量调用纳入命中率统计）。
 # 历史注：2026-08-04 曾因 deepseek 端点不稳（503/超时）切 k3；#33 流式化+超时配置化后
 # 稳定性问题已缓解，现值 model=deepseek-v4-flash 与端点归一一致。
 lightweight_model:
@@ -244,7 +245,7 @@ fixed_roles:
         syntax error 先修再继续。
       - Windows PowerShell 下 `node -e` 内联脚本引号极易转义失败；复杂验证（契约符号/冒烟实例化）
         直接 WriteFile 一个临时 .js 脚本（temporary=true）再 `node <脚本>` 跑。
-      - 写/改文件只用 WriteFile 工具：Windows PowerShell 重定向写文件（Set-Content / Out-File /
+      - 写/改文件只用 WriteFile/EditFile 工具（小改 <20% 文件优先 EditFile 精确替换，输出 token 与耗时远小于整文件重写；新建/大改才 WriteFile 整写）：Windows PowerShell 重定向写文件（Set-Content / Out-File /
         echo>）默认 GBK 编码会损坏中文与 emoji 并破坏语法。
       - 【终止纪律】WriteFile 落盘 + 一次语法检查通过 = 任务完成，立即输出最终答复。
         禁止重读/核对其他文件（含契约里列出的兄弟文件）——跨文件集成核对由上级统一负责。
@@ -264,7 +265,7 @@ fixed_roles:
     keywords: ["代码", "编程", "开发", "bug", "修复", "重构", "review", "code"]
     skills: ["代码编写", "代码审查", "重构", "单元测试", "调试"]
     # 只暴露执行类工具；call_sub_agent 由 dispatcher 注册但不在此白名单中。
-    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &coding_model
       provider: anthropic
       model: kimi-k2.7-code
@@ -308,7 +309,7 @@ fixed_roles:
       最终答复自包含：改动摘要 + 验证结果 + 涉及的文件路径。
     keywords: ["UI", "界面", "前端", "CSS", "HTML", "样式", "布局", "page"]
     skills: ["UI修复", "组件开发", "响应式设计", "CSS优化", "交互实现"]
-    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &ui_model
       provider: anthropic
       model: doubao-seed-2.1-turbo
@@ -353,7 +354,7 @@ fixed_roles:
       最终答复 = 按严重度排序的问题清单 + 改写后的提示词全文，自包含。
     keywords: ["提示词", "prompt", "审查", "优化", "template"]
     skills: ["Prompt审查", "Prompt优化", "安全检测", "偏见检测"]
-    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &review_model
       provider: openai-responses
       model: deepseek-v4-flash
@@ -432,7 +433,7 @@ fixed_roles:
       最终答复自包含：新增/修改的测试文件 + 运行结果 + 覆盖说明。
     keywords: ["测试", "test", "验证", "QA", "assert", "coverage"]
     skills: ["单元测试", "集成测试", "边界测试", "性能测试"]
-    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &test_model
       provider: openai-responses
       model: deepseek-v4-flash
@@ -475,7 +476,7 @@ fixed_roles:
       最终答复自包含：文档摘要 + 涉及的文件路径。
     keywords: ["文档", "doc", "README", "注释", "example"]
     skills: ["技术文档", "API文档", "代码注释", "示例编写"]
-    tools: [ReadFile, WriteFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &doc_model
       provider: openai-responses
       model: deepseek-v4-flash

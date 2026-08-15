@@ -401,6 +401,25 @@ func TestPlanExecuteEngine_MaxStepsCapped(t *testing.T) {
 	}
 }
 
+// TestPlanStepMessage_SlimReportFormat 验证步骤消息携带三段式瘦身报告模板（TODO #50）：
+// 结论/关键改动位置/验收证据三节齐全，且保留"验收标准逐条判 PASS/FAIL"纪律。
+func TestPlanStepMessage_SlimReportFormat(t *testing.T) {
+	msg := planStepMessage(PlanStep{Title: "步骤一", Instruction: "写 config.js"}, 1, 2)
+	for _, want := range []string{
+		"【执行计划 步骤 1/2】步骤一",
+		"写 config.js",
+		"① 结论",
+		"② 关键改动位置",
+		"③ 验收证据",
+		"PASS/FAIL",
+		"禁止整段复述 diff 与代码原文",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("step message missing %q:\n%s", want, msg)
+		}
+	}
+}
+
 // TestEngineModeConstants 模式常量三值稳定（schema/validateDispatchArgs 依赖）。
 func TestEngineModeConstants(t *testing.T) {
 	if ModeReact != "react" || ModeReflection != "reflection" || ModePlanExecute != "plan_execute" {

@@ -476,7 +476,7 @@ func chatItemsResolved(s *server.Session, compact bool, resolver func(childID st
 	// 有流式文本时展示"正在输出"的助手条目；否则按是否有未完成的工具调用
 	// 分别展示"工具执行中"与"思考中"等待状态，保证等待期界面始终有反馈。
 	if s.Status == enums.SessionStatusRunning {
-		items = appendLiveItems(items, s)
+		items = appendLiveItems(items, s, resolver)
 	}
 
 	return items
@@ -484,7 +484,9 @@ func chatItemsResolved(s *server.Session, compact bool, resolver func(childID st
 
 // appendLiveItems 为运行中会话追加一条实时状态条目（均为瞬时展示，不进事件流）：
 // 答复流式输出 > 思考过程 > 工具执行中 > 等待子 Agent > 思考中，任一时刻只展示一条。
-func appendLiveItems(items []chatItem, s *server.Session) []chatItem {
+// 等待子 Agent 是次要行（主任务目标由对话区顶部固定目标栏常驻展示，TODO #48 子项 3）；
+// resolver 把实例 ID 解析为展示名（领域名/角色中文名），nil 时回退原始 ID。
+func appendLiveItems(items []chatItem, s *server.Session, resolver func(childID string) string) []chatItem {
 	now := time.Now()
 	// 有答复流式文本：作为助手条目展示截至当前的累积输出，末尾加光标符提示仍在生成。
 	if strings.TrimSpace(s.StreamingText) != "" {
@@ -511,10 +513,16 @@ func appendLiveItems(items []chatItem, s *server.Session) []chatItem {
 			isEvent:   true,
 		})
 	}
-	// 有已派发但未完成的子 Agent：提示等待子 Agent。
+	// 有已派发但未完成的子 Agent：提示等待子 Agent（展示名优先，读不出"谁在等谁"）。
 	if sub := waitingSubAgent(s.Events); sub != "" {
+		name := sub
+		if resolver != nil {
+			if r := resolver(sub); r != "" {
+				name = r
+			}
+		}
 		return append(items, chatItem{
-			title:     "⏳ 等待子 Agent 执行: " + sub,
+			title:     "⏳ 等待子 Agent 执行: " + name,
 			timestamp: now,
 			isEvent:   true,
 		})

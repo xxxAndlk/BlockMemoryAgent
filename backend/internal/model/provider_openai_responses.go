@@ -253,9 +253,13 @@ type responsesUsage struct {
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
 	// 兼容个别代理端点沿用 chat 命名。
-	PromptTokens       int `json:"prompt_tokens"`
-	CompletionTokens   int `json:"completion_tokens"`
-	InputTokensDetails *struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	// DeepSeek 原生缓存拆分字段：经 responses 协议代理 DeepSeek 端点时可能直接返回，
+	// 优先级高于 input_tokens_details.cached_tokens（缓存可观测，TODO #40）。
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+	InputTokensDetails    *struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"input_tokens_details,omitempty"`
 	OutputTokensDetails *struct {
@@ -400,8 +404,12 @@ func buildResponsesFinalMessage(content, reasoning string, toolCalls []responses
 		OutputTokens: int64(usage.output()),
 		TotalTokens:  int64(usage.total()),
 	}
-	// TODO #40 缓存可观测：cached_tokens（input_tokens_details）作 hit，其余输入作 miss。
-	if usage.InputTokensDetails != nil {
+	// TODO #40 缓存可观测：DeepSeek 原生 prompt_cache_hit/miss_tokens 优先
+	// （responses 代理 DeepSeek 端点时直接返回）；否则回退 cached_tokens
+	// （input_tokens_details）作 hit，其余输入作 miss。
+	if usage.PromptCacheHitTokens > 0 || usage.PromptCacheMissTokens > 0 {
+		setCacheUsageMeta(msg, int64(usage.PromptCacheHitTokens), int64(usage.PromptCacheMissTokens))
+	} else if usage.InputTokensDetails != nil {
 		cached := int64(usage.InputTokensDetails.CachedTokens)
 		setCacheUsageMeta(msg, cached, int64(usage.input())-cached)
 	}

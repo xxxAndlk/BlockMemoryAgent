@@ -82,7 +82,7 @@ func inProductionWorkDir(workDir, production string) bool {
 func ApprovalMessage(toolName string, args map[string]any) string {
 	desc := "该工具为破坏性操作"
 	switch toolName {
-	case "WriteFile":
+	case "WriteFile", "EditFile":
 		if p, _ := args["path"].(string); p != "" {
 			desc = "将写入文件 " + p
 		}

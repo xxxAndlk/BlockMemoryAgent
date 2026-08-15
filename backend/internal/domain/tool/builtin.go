@@ -62,6 +62,21 @@ type (
 		// 仅在确实要大幅删减文件时设置；常规修改不要设。
 		ConfirmShrink bool `json:"confirm_shrink"`
 	}
+	// editFileInput 表示 EditFile 工具的输入参数。
+	// EditFile 是精确局部替换：old_string/new_string 语义对齐主流 Agent 工具的编辑能力，
+	// 小改（<20% 文件）优先 EditFile，避免 WriteFile 整文件重写导致的输出 token 黑洞（TODO #49）。
+	editFileInput struct {
+		// Path 为待编辑文件的目标路径。文件必须已存在；新建文件用 WriteFile。
+		Path string `json:"path"`
+		// OldString 为要替换的原文片段，必须与文件内容逐字符一致（含缩进/空白；
+		// 行尾 \r\n 与 \n 视为等价）。默认必须唯一匹配；多处匹配被拒绝并提示。
+		OldString string `json:"old_string"`
+		// NewString 为替换后的新文本。
+		NewString string `json:"new_string"`
+		// ReplaceAll 为 true 时替换所有匹配处（old_string 在文件中出现多次时使用）；
+		// 默认 false 只替换第一处且要求唯一匹配。
+		ReplaceAll bool `json:"replace_all"`
+	}
 	// listDirInput 表示 ListDir 工具的输入参数。
 	listDirInput struct {
 		// Path 为待列出目录的路径，空字符串时默认使用当前工作目录。
@@ -459,6 +474,138 @@ func (e *Executor) cleanExpiredSnapshots() {
 		}
 		return nil
 	})
+}
+
+// ---- EditFile（精确局部替换） ----
+
+// maxEditStringRunes 是 EditFile 单次 old_string/new_string 的长度上限。
+// EditFile 定位是"小改局部替换"（TODO #49）：替换片段超大说明改动面接近整文件，
+// 应退回 WriteFile 整写（含截断防护/缩小警告全套保护）。
+const maxEditStringRunes = 50000
+
+// editFile 在已存在文件中做精确局部替换：old_string 唯一匹配（或 replace_all）替换为
+// new_string。与 WriteFile 对齐的机制：写守卫/沙箱/角色写路径校验、.bma/snapshots 快照、
+// 成功后共享记忆失效与 PROJECT.md 去抖刷新（后者由 Registry.Dispatch 统一触发）。
+// 匹配健壮性：行尾 \r\n 与 \n 视为等价（按文件主行尾风格写回，保持全文件风格一致）。
+func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
+	// 从参数中取出各字段，缺失时使用零值。
+	path, _ := args["path"].(string)
+	oldStr, _ := args["old_string"].(string)
+	newStr, _ := args["new_string"].(string)
+	replaceAll, _ := args["replace_all"].(bool)
+	allowSpaces, _ := args["allow_spaces"].(bool)
+
+	if path == "" {
+		return &Result{Tool: "EditFile", Error: "path is required"}
+	}
+	if oldStr == "" {
+		return &Result{Tool: "EditFile", Path: path, Error: "old_string is required（要替换的原文片段不能为空）"}
+	}
+	if oldStr == newStr {
+		return &Result{Tool: "EditFile", Path: path, Error: "old_string 与 new_string 相同，无需编辑"}
+	}
+	if len([]rune(newStr)) > maxEditStringRunes {
+		return &Result{Tool: "EditFile", Path: path, Error: fmt.Sprintf(
+			"new_string too large: %d runes (max %d)。EditFile 是局部替换，替换片段不应超大；"+
+				"改动面接近整文件时请用 WriteFile 整文件重写", len([]rune(newStr)), maxEditStringRunes)}
+	}
+
+	// 调用写保护守卫进行策略校验（与 WriteFile 同口径：保护目录/邮箱文件等）。
+	if err := e.guards.CheckWrite(path, newStr, allowSpaces); err != nil {
+		return &Result{Tool: "EditFile", Path: path, Error: err.Error()}
+	}
+
+	// 解析目标路径并做沙箱/角色级写路径校验（与 WriteFile 一致）。
+	absPath := e.resolvePath(path)
+	if err := e.sanitizeWritePath(absPath); err != nil {
+		return &Result{Tool: "EditFile", Path: absPath, Error: err.Error()}
+	}
+	if err := e.enforceRoleWritePath(ctx, absPath); err != nil {
+		return &Result{Tool: "EditFile", Path: absPath, Error: err.Error()}
+	}
+
+	// 读取现有文件：EditFile 只编辑已存在文件。
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Result{Tool: "EditFile", Path: absPath, Error: "文件不存在: " + path +
+				"。EditFile 只能编辑已存在文件；新建文件请用 WriteFile。"}
+		}
+		return &Result{Tool: "EditFile", Path: absPath, Error: "read: " + err.Error()}
+	}
+
+	// 匹配：两侧行尾统一为 \n 再计数（\r\n 与 \n 等价），缩进/空格必须逐字符一致。
+	normContent := normalizeCRLF(string(data))
+	normOld := normalizeCRLF(oldStr)
+	normNew := normalizeCRLF(newStr)
+	count := strings.Count(normContent, normOld)
+	if count == 0 {
+		// 无匹配：返回就近上下文提示（文件开头片段）帮助模型自查，而非静默。
+		hint := truncateRunes(normContent, 200)
+		if hint == "" {
+			hint = "（文件为空）"
+		}
+		return &Result{Tool: "EditFile", Path: absPath, Error: fmt.Sprintf(
+			"old_string 未在文件中找到。old_string 必须与文件内容逐字符一致（含缩进/空格；"+
+				"行尾 \\r\\n 与 \\n 视为等价）。请先用 SearchInFiles 定位实际文本再重试。\n文件开头片段：\n%s", hint)}
+	}
+	if count > 1 && !replaceAll {
+		return &Result{Tool: "EditFile", Path: absPath, Error: fmt.Sprintf(
+			"old_string 在文件中出现 %d 次，不唯一。请扩大 old_string 的上下文（包含周围独特行）"+
+				"使其唯一，或显式传 replace_all=true 替换全部 %d 处。", count, count)}
+	}
+
+	// 应用替换：replace_all 全替换，否则仅第一处。
+	var newContent string
+	if replaceAll {
+		newContent = strings.ReplaceAll(normContent, normOld, normNew)
+	} else {
+		newContent = strings.Replace(normContent, normOld, normNew, 1)
+	}
+	// 首个匹配位置的行号（1-based），供结果报告。
+	firstIdx := strings.Index(normContent, normOld)
+	line := 1 + strings.Count(normContent[:firstIdx], "\n")
+
+	// 按文件主行尾风格写回：原文 CRLF 为主时整体转回 CRLF，保持全文件风格一致。
+	crlf := bytes.Count(data, []byte("\r\n"))
+	lfOnly := bytes.Count(data, []byte("\n")) - crlf
+	if crlf > 0 && crlf >= lfOnly {
+		newContent = strings.ReplaceAll(newContent, "\n", "\r\n")
+	}
+
+	// 写入前快照原文件（与 WriteFile 同一 .bma/snapshots 机制，覆盖前留恢复点）。
+	snapPath := e.snapshotBeforeWrite(ctx, absPath)
+	if err := os.WriteFile(absPath, []byte(newContent), 0644); err != nil {
+		return &Result{Tool: "EditFile", Path: absPath, Error: err.Error()}
+	}
+
+	result := &Result{
+		Tool:    "EditFile",
+		Success: true,
+		Output:  fmt.Sprintf("replaced %d occurrence(s) at line %d (%d -> %d bytes)", count, line, len(data), len(newContent)),
+		Path:    absPath,
+	}
+	if snapPath != "" {
+		result.Output += fmt.Sprintf("；原文件已备份到 %s", snapPath)
+	}
+	return result
+}
+
+// normalizeCRLF 把 \r\n 统一为 \n，用于匹配时行尾等价。
+func normalizeCRLF(s string) string {
+	if !strings.Contains(s, "\r\n") {
+		return s
+	}
+	return strings.ReplaceAll(s, "\r\n", "\n")
+}
+
+// truncateRunes 按 rune 数截断字符串并追加省略号（省略号占 1 个 rune）。
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // ---- ListDir（列出目录） ----

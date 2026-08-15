@@ -424,18 +424,20 @@ func (f *ModelFactory) CallLightweightWithRetry(ctx context.Context, prompt stri
 	}
 	// 流式累积 + 重试，单次超时 30 秒
 	start := time.Now()
-	resp, err, _ := retryStreamGenerate(ctx, llm, prompt, 30*time.Second)
+	resp, meta, err, _ := retryStreamGenerate(ctx, llm, prompt, 30*time.Second)
 	// 写 session_logs（同普通调用 schema，Meta.layer=lightweight 可区分）；
 	// 补齐评测耗时归因缺口：轻量调用此前不产生 llm_input/llm_output 记录。
-	f.logLightweightCall(ctx, prompt, resp, err, time.Since(start))
+	f.logLightweightCall(ctx, prompt, resp, meta, err, time.Since(start))
 	return resp, err
 }
 
 // logLightweightCall 把一次轻量 LLM 调用写入 session_logs（复用 Logger.LLMCall 路径）。
 // ctx 未携带会话 logger（启动期/无会话场景）时跳过，不影响主流程。
 // 模型名取 LightweightResolution 的解析结果（与 GetLightweightModel 同一解析逻辑）；
-// token 为估算值（轻量链路走流式累积，未取 provider usage）。
-func (f *ModelFactory) logLightweightCall(ctx context.Context, prompt, resp string, callErr error, dur time.Duration) {
+// token 为估算值（轻量链路走流式累积，blades.TokenUsage 未透传），
+// 但缓存命中/未命中 token 经流式末块 Metadata 透传（cache_hit/miss_tokens，TODO #40），
+// 使轻量调用（事件摘要/打捞/L2 仲裁）纳入缓存命中率统计。
+func (f *ModelFactory) logLightweightCall(ctx context.Context, prompt, resp string, meta map[string]any, callErr error, dur time.Duration) {
 	lg := logger.FromContext(ctx)
 	if lg == nil {
 		return
@@ -443,16 +445,27 @@ func (f *ModelFactory) logLightweightCall(ctx context.Context, prompt, resp stri
 	if callErr != nil {
 		resp = "[ERROR] " + callErr.Error() + "\n" + resp
 	}
+	var cacheHit, cacheMiss int
+	if meta != nil {
+		if v, ok := meta["cache_hit_tokens"].(int64); ok {
+			cacheHit = int(v)
+		}
+		if v, ok := meta["cache_miss_tokens"].(int64); ok {
+			cacheMiss = int(v)
+		}
+	}
 	cfg, _ := f.LightweightResolution()
 	lg.LLMCall(ctx, logger.LLMCallRecord{
-		Agent:        "lightweight",
-		Model:        cfg.Model,
-		Prompt:       prompt,
-		Response:     resp,
-		InputTokens:  EstimateTokens(prompt),
-		OutputTokens: EstimateTokens(resp),
-		LatencyMs:    int(dur.Milliseconds()),
-		Meta:         map[string]any{"layer": "lightweight"},
+		Agent:           "lightweight",
+		Model:           cfg.Model,
+		Prompt:          prompt,
+		Response:        resp,
+		InputTokens:     EstimateTokens(prompt),
+		OutputTokens:    EstimateTokens(resp),
+		CacheHitTokens:  cacheHit,
+		CacheMissTokens: cacheMiss,
+		LatencyMs:       int(dur.Milliseconds()),
+		Meta:            map[string]any{"layer": "lightweight"},
 	})
 }
 

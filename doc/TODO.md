@@ -68,6 +68,24 @@
     - 实证：TUI 多轮驱动 turn01 等 60s 未见选中会话，而后端会话 11s 已跑完；与 live_harness_test.go 注释的"首条问题不可见"调试历史同源。
     - 修复：新增 `sharedState`（model.go）——`flash`/`flashUntil`/`pendingSelectID` 收进指针共享结构体（NewModel 构造一次，所有 Model 拷贝共享），配互斥锁 + nil 安全访问器 + `ensureShared` 惰性初始化；`flashMsg`/`renderInput`/`createSession`/`refreshView`/tick 全部改走该结构。flash 过期判断移到读取侧（`getFlash`）。同根因的后台 flash 丢失（post 报错不显示）一并修复。`go vet` + tui 包测试全绿（race 因本机无 gcc 未跑）。
 
+48. **TUI Agent 编排展示优化：依赖关系可见 + 树结构按数量分叉 + 顶部任务栏只显主任务**（✅ 已完成 2026-08-15，doc/变更.md 任务 47）  ← 来源：2026-08-15 塔防三合一改造实战（workspace/logs/tui/2026-08-15.log，session-1786798928512925400-9a242b85-1）——游戏主控领域 plan_execute 长跑 20+ 分钟期间，TUI 只显示"等待子 Agent 执行"，用户完全无法判断是在干活还是卡死
+    - 实证背景：MetaAgent 21:31 并行派发 3 领域（domain-2 游戏主控 / domain-3 怪物 / domain-4 路径），怪物与路径 21:35 前已完成，游戏主控因自身 6 步 plan_execute（每步整文件重写 23-25KB + 逐项验收，单次 LLM 调用 14s-3m28s、输入 ~49k tokens）一直跑到 21:52+。期间 MetaAgent 空等，聊天区实时状态行恒为 `⏳ 等待子 Agent 执行: domain-2`（`helpers.go:514-521` `waitingSubAgent`），主任务目标不可见，观感等同"卡死"。
+    - 子项 1（依赖关系展示）：编排面板/状态行增加 Agent 间依赖与等待关系——谁在等谁（如"MetaAgent ⏳ 等待 游戏主控领域Agent"、"游戏主控领域Agent 依赖 路径实体领域Agent 的 GameGrid 交付"）。数据源：orchestrator 树父子关系 + `waitingSubAgent` 已算的"已派发未回传"集合 + spec/契约中的跨域依赖（可从 WriteSpec 依赖字段或 mailbox 等待状态提取）；等待中的节点卡片标注"等待 XX 完成"。
+    - 子项 2（编排树结构重构）：`agent_tree_panel.go` 当前把所有 depth≥1 节点扁平进同一个网格（`renderAgentsPanel:344-357` children 不分层级），连接线是一根对齐网格列的横杠（`agentConnectorLines:492-522`），领域与领域派发的助手混排无法区分归属。改为真树形：meta 下按领域数量动态分叉——1 个领域一条竖线、2 个分两叉、3 个分三叉（连接线按实际领域数生成而非按网格列数）；每个领域节点下再挂该领域自己派发的助手子分支，归属清晰。名称/描述过长时缩小字号或竖向换行展示，避免卡片被 truncate 后看不出谁是谁。
+    - 子项 3（顶部任务栏只显主任务）：聊天区实时状态行的"⏳ 等待子 Agent 执行： xxx"不应顶替主任务展示——顶部固定展示当前用户目标（任务看板 goal 首行），等待信息降级为次要行或并进编排面板。涉及 `helpers.go:486-528` `appendLiveItems` 的条目优先级与标题来源。
+    - 验收：重放同类三领域并行任务，(a) 任一时刻能从 TUI 直接读出主任务目标；(b) 能读出"谁在等谁"；(c) 1/2/3 领域场景下分叉形态正确且助手挂在所属领域下；(d) 长跑任务期间状态行有进度感（如当前步骤/最近工具调用），不再像卡死。
+
+49. **增量编辑工具（Edit/patch）：根治整文件重写导致的输出 token 黑洞**（✅ 已完成 2026-08-15，doc/变更.md 任务 47）  ← 来源：同 #48，2026-08-15 塔防三合一改造实战复盘——执行侧提速的第一优先级，收益大于执行模式调整
+    - 现象：当前 `WriteFile` 工具描述明确"整文件覆盖，禁止只发修改片段"，无增量编辑能力。实证：游戏主控领域改 `js/game.js` 每步都要全文重读（646 行分 3 页）+ 全文重写（单次 WriteFile 输出 23-25KB），改一处也要生成整个文件；单次 LLM 调用因此拖到 1-3.5 分钟，6 步 plan_execute 累计 20+ 分钟。react 模式同样受此制约——这是比 plan_execute ceremony 更大的耗时根因。
+    - 方向：新增 `EditFile`（或 `PatchFile`）工具，语义对齐主流 Agent 工具的精确替换：old_string/new_string 精确匹配替换（old_string 须唯一或带 replace_all），匹配失败返回就近上下文提示而非静默；与 WriteFile 的 mtime 失效机制（WriteSpec/WriteSharedMemory 的 stale 判定）对齐——EditFile 同样触发文件变更失效。工具描述引导：小改（<20% 文件）优先 EditFile，新建/大改才 WriteFile。
+    - 注意点：old_string 匹配的健壮性（缩进/空白差异）、与 `.bma/snapshots` 自动备份机制兼容（EditFile 也要先备份）、并发多 Agent 改同一文件的冲突语义（可后置，先单写者场景）。
+    - 验收：(a) 单测覆盖精确替换/多处匹配拒绝/replace_all/无匹配报错；(b) 重放塔防改造同类任务，同等改动量下输出 token 与墙钟时间显著下降（对照 #48 实证基线：单步 23-25KB 输出 → 预期降到 KB 级）；(c) EditFile 触发 WriteSpec stale 失效与 WriteFile 行为一致；(d) 双模块 `go test ./...` 绿。
+
+50. **plan_execute 步骤报告瘦身：验收输出约束为结论+证据行号**（✅ 已完成 2026-08-15，doc/变更.md 任务 47）  ← 来源：同 #48 复盘——步骤报告是 plan_execute 模式第二大输出开销
+    - 现象：实证游戏主控领域每步结束强制输出 2000+ token 的交付报告（改动清单表 + 验收证据表 + 备注，整段复述改动内容），6 步累计上万 token，单次 LLM 调用 output 最高 2499 tokens。报告详细度超出父 Agent 整合所需——父 Agent 只需要结论、验收结果、关键位置（文件+行号）。
+    - 方向：plan_execute 的步骤完成报告模板改为三段式瘦身格式：①结论（通过/未通过，一行）②关键改动位置（函数名+行号清单，不复述代码）③验收证据（逐项 验收标准→PASS/FAIL→证据引用，一行一条）。禁止整段复述 diff 与代码原文（父 Agent 需要细节可自行 ReadFile）。模板落 plan_execute 执行器的步骤提示词；验收标准逐条判的要求保留（这是步骤 3-5 抓到 PowerShell 引号吞字、CSS 类 MISS 等真实问题的纪律来源，不能瘦身掉）。
+    - 验收：重放同类多步骤任务，步骤报告 output token 下降 50%+，且验收纪律不退化（逐项 PASS/FAIL 仍在、仍能拦截不达标步骤）；父 Agent 整品验收所需信息不缺失。
+
 ## 已完成（已归档到 git 历史）
 
 - **评测体系落地 + 首次基线**（2026-08-14）：`test/eval/`（build tag `eval`）真实 LLM 任务完成率评测——场景 YAML + checkpoint 判分（command/file/regex/tree/llm_judge）+ token/子Agent 指标聚合 + TheAgentCompany 式全量/部分分报告（`test/eval/runs/`）；环境隔离修复：`docker/docker-compose.test.yml` 独立端口（PG 55432/Redis 56380）+ 无固定容器名，fixture 维度对齐 migrations（768）。首基线 12 场景 full pass 91.7%、加权 0.979，详见 `doc/eval/baseline_2026-08-14.md`。后续加固（同日）：fixture 改"共享容器常驻 + 每测试独立 PG database/Redis 逻辑库"（Redis 开 1024 逻辑库），并行包 `go test ./...` 不再互相拆台；`TestFactExtractionFallback` 序列对齐现行后端（verify_kind 校验分层 + 派发后不阻塞）。开放项：verifyloop 场景判分口径修正（自动验证闭环已下线，改测 verify_kind 证据）、EVAL_RUNS=3 可靠性、SWE-bench 20 题切片（Phase 2）。

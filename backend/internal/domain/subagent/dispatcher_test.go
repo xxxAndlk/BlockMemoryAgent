@@ -1244,6 +1244,11 @@ func TestDispatcher_DomainResponsibilityInjection(t *testing.T) {
 	if !strings.Contains(instr, "通用领域纪律") {
 		t.Fatalf("system prompt lost base template: %q", instr)
 	}
+	// 缓存优化（2026-08-15）：身份头须在通用模板之后（末尾），保证所有领域 Agent
+	// 共享 envBlock+通用 prompt 的逐字节一致前缀，DeepSeek/glm 前缀缓存可跨领域复用。
+	if strings.Index(instr, "你是负责【配置】领域") < strings.Index(instr, "通用领域纪律") {
+		t.Fatalf("identity header must come AFTER base template (prefix-cache sharing): %q", instr)
+	}
 	// 任务文本：带【你的领域】前缀。
 	if len(cp.lastReq.Messages) == 0 {
 		t.Fatal("no messages in request")

@@ -244,7 +244,8 @@ func (e *PlanExecuteEngine) plan(ctx context.Context, input string) ([]PlanStep,
 		return nil, false
 	}
 	prompt := "把以下任务拆解为 2-8 个可独立执行的步骤。每步指令必须自包含" +
-		"（目标、涉及文件路径、验收标准）：执行 Agent 只看得到该步指令与前序历史，看不到整体计划。\n\n【任务】\n" +
+		"（目标、涉及文件路径、验收标准——验收标准须逐条可判 PASS/FAIL，步骤报告将逐条判定）：" +
+		"执行 Agent 只看得到该步指令与前序历史，看不到整体计划。\n\n【任务】\n" +
 		input +
 		"\n\n严格输出 JSON 数组（不要其他文字）：[{\"title\": \"步骤名\", \"instruction\": \"自包含执行指令\"}]"
 	resp, err := e.llm(ctx, prompt)
@@ -263,9 +264,20 @@ func (e *PlanExecuteEngine) plan(ctx context.Context, input string) ([]PlanStep,
 	return steps, true
 }
 
-// planStepMessage 构造单步执行指令（带步骤序号，提示上下文位置）。
+// planStepReportFormat 是步骤完成报告的三段式瘦身模板（TODO #50）。
+// 背景：步骤报告是 plan_execute 模式第二大输出开销——实证每步强制输出 2000+ token 的
+// 交付报告（改动清单表 + 验收证据表 + 备注，整段复述改动内容），6 步累计上万 token。
+// 父 Agent 只需要结论、验收结果、关键位置（文件+行号），细节可自行 ReadFile。
+// 模板只约束报告形态，不删验收纪律：验收标准逐条判 PASS/FAIL 的要求保留。
+const planStepReportFormat = "【步骤完成报告（必须遵守，禁止整段复述 diff 与代码原文；父 Agent 需要细节会自行 ReadFile）】\n" +
+	"① 结论：通过 / 未通过（一行）\n" +
+	"② 关键改动位置：函数名 + 行号清单（每处一行：文件:行号 函数/位置），不复述代码\n" +
+	"③ 验收证据：步骤指令中的每条验收标准逐条判定，一行一条：验收标准 → PASS/FAIL → 证据引用（文件+行号或命令输出摘要）\n" +
+	"本步骤所有验收标准未全部 PASS 时，结论必须为未通过并列出失败项。"
+
+// planStepMessage 构造单步执行指令（带步骤序号，提示上下文位置，末尾附瘦身报告格式约束）。
 func planStepMessage(st PlanStep, idx, total int) string {
-	return fmt.Sprintf("【执行计划 步骤 %d/%d】%s\n\n%s", idx, total, st.Title, st.Instruction)
+	return fmt.Sprintf("【执行计划 步骤 %d/%d】%s\n\n%s\n\n%s", idx, total, st.Title, st.Instruction, planStepReportFormat)
 }
 
 // planExecuteFinalizeMessage 全部步骤完成后收口终答的指令。

@@ -77,11 +77,11 @@ func LastAssistantText(history []ReactMessage) string {
 }
 
 // FilesModifiedFromHistory 从 ReAct 历史中收集所有成功执行之外不可知，仅按
-// assistant 消息携带的 WriteFile 工具调用入参 path 提取，返回去重保序的路径切片。
+// assistant 消息携带的 WriteFile/EditFile 工具调用入参 path 提取，返回去重保序的路径切片。
 // 用于 Layer 5：子 Agent 完成后把修改文件清单挂到 mailbox.Message.FilesModified，
-// 父 Agent drainMailbox 时展示。空 history 或无 WriteFile 调用时返回 nil。
-// 注意：仅扫 assistant 请求的 WriteFile，未校验对应 tool 结果是否 Success（历史中
-// 失败的 WriteFile 较少且路径信息对父 Agent 仍有参考价值，保守纳入）。
+// 父 Agent drainMailbox 时展示。空 history 或无写类调用时返回 nil。
+// 注意：仅扫 assistant 请求的 WriteFile/EditFile，未校验对应 tool 结果是否 Success（历史中
+// 失败的写调用较少且路径信息对父 Agent 仍有参考价值，保守纳入）。
 func FilesModifiedFromHistory(history []ReactMessage) []string {
 	seen := make(map[string]bool)
 	var out []string
@@ -90,7 +90,7 @@ func FilesModifiedFromHistory(history []ReactMessage) []string {
 			continue
 		}
 		for _, tc := range m.ToolCalls {
-			if tc.Name != "WriteFile" {
+			if tc.Name != "WriteFile" && tc.Name != "EditFile" {
 				continue
 			}
 			p, _ := tc.Input["path"].(string)

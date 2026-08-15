@@ -1491,9 +1491,14 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 				roleDef.Name = "领域Agent:" + hint
 			}
 		}
-		// 职责槽注入：responsibility 非空时在通用领域 prompt 前加身份头。
+		// 职责槽注入：responsibility 非空时在通用领域 prompt 末尾加身份头。
 		// task 文本在长 ReAct 循环中会被历史压缩摘要掉，system prompt 不会，
 		// 领域身份钉在系统提示词里防止跑偏（实证：领域 Agent 越界实现他域文件）。
+		// 置于末尾而非开头（2026-08-15 缓存优化）：开头是逐领域分叉点，会把
+		// envBlock + 通用领域 prompt 的公共前缀截断在几百 token；挪到末尾后
+		// 所有领域 Agent 的 system 前缀逐字节一致，DeepSeek/glm 前缀缓存可跨
+		// 领域复用整个通用 prompt（公共前缀规则：2 次落盘、第 3 次起命中）。
+		// 末尾紧邻首条 user 消息，处于注意力近因区，身份约束力不降。
 		if resp := strings.TrimSpace(responsibility); resp != "" {
 			domainLabel := strings.TrimSpace(domain)
 			if domainLabel == "" {
@@ -1503,7 +1508,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 				"只实现/改写职责内的文件与模块；职责外的文件禁止创建或修改，"+
 				"需要的跨领域数据从共享记忆契约或 ReadFile 读取。",
 				textutil.TruncateRunes(domainLabel, 16, "…"), textutil.TruncateRunes(resp, 200, "…"))
-			roleDef.SystemPrompt = header + "\n\n" + roleDef.SystemPrompt
+			roleDef.SystemPrompt = roleDef.SystemPrompt + "\n\n" + header
 		}
 	}
 	// 不注入用户级人格（soul.md"多 Agent 编排助手"）：人格前缀首行即编排者身份，

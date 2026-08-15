@@ -39,6 +39,7 @@ const argSummary = computed(() => {
   switch (props.group.tool) {
     case 'ReadFile':
     case 'WriteFile':
+    case 'EditFile':
     case 'ListDir':
       return String(args.path || '')
     case 'RunCommand':

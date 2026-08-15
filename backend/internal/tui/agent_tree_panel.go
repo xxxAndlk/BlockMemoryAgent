@@ -19,6 +19,9 @@ import (
 type agentTreeNode struct {
 	// depth 是节点在树中的深度，0 为顶层 MetaAgent。
 	depth int
+	// parentID 是父节点实例 ID（orchestrator.Node.ParentID）：
+	// depth=1 节点的父为会话根（rootID），MetaAgent 节点为空。
+	parentID string
 	// instID 是 Agent 实例 ID。
 	instID string
 	// name 是 Agent 显示名称。
@@ -144,6 +147,7 @@ func orchestratorNodesToTreeNodes(nodes []orchestrator.Node, rootID string) []ag
 		}
 		out = append(out, agentTreeNode{
 			depth:     orchestratorNodeDepth(n, nodes, byID, rootID),
+			parentID:  n.ParentID,
 			instID:    n.ID,
 			name:      agentNodeName(n),
 			domain:    n.Domain,
@@ -309,9 +313,9 @@ func (at *AgentTreePanel) buildLines() []string {
 	return lines
 }
 
-// renderAgentsPanel 渲染右侧 Agent 编排面板。
-// 布局参考"新TUI页.png"：顶部为居中的 MetaAgent 卡片，经连接线引出
-// 子 Agent 卡片网格（宽度足够时两列），底部为状态图例。
+// renderAgentsPanel 渲染右侧 Agent 编排面板（TODO #48 真树形）：
+// 顶部为居中的 MetaAgent 卡片，经连接线按实际分支数分叉引出领域卡片，
+// 每个领域卡片下挂其派发的助手子分支（树状连接符），底部为状态图例。
 func (m Model) renderAgentsPanel(w, h int) string {
 	// 保证最小宽度，避免卡片过度压缩。
 	if w < 20 {
@@ -332,92 +336,99 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	if innerW < 10 {
 		innerW = 10
 	}
-	// 内容区最大行数（PanelBox Height(h-3)），超出部分按卡片行粒度裁剪。
+	// 内容区最大行数（PanelBox Height(h-3)），超出部分按行裁剪。
 	maxBody := h - 3
 	if maxBody < 1 {
 		maxBody = 1
 	}
 
-	// 分离 MetaAgent 与子 Agent 节点；过滤掉二级以下、无目标且已完成/空闲的节点，
-	// 避免面板过于拥挤。
-	var meta *agentTreeNode
-	var children []agentTreeNode
-	for i := range m.agentTreePanel.nodes {
-		node := m.agentTreePanel.nodes[i]
-		if node.depth == 0 && !node.isClarify {
-			n := node
-			meta = &n
-			continue
-		}
-		if node.depth >= 2 && node.goal == "" &&
-			(node.status == enums.RoleStatusDone || node.status == enums.RoleStatusIdle) {
-			continue
-		}
-		children = append(children, node)
-	}
-
-	if meta == nil && len(children) == 0 {
+	// 真树形分组：meta 下按分支（depth=1 节点，通常是领域 Agent）数量动态分叉，
+	// 每个分支下再挂其派发的助手子分支（TODO #48 子项 2）。
+	meta, branches, _ := groupAgentTree(m.agentTreePanel.nodes)
+	if meta == nil && len(branches) == 0 {
 		body := m.styles.Dim.Render("(no agents)")
 		return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
 	}
 
-	// 网格布局参数：宽度足够时两列（更宽时三列），否则单列。
-	cols := 1
-	if innerW >= 72 {
-		cols = 3
-	} else if innerW >= 44 {
-		cols = 2
-	}
-	gap := 2
-	cardW := (innerW - gap*(cols-1)) / cols
-	if cardW < 14 {
-		cardW = 14
+	// 无分支（仅 MetaAgent 或只有散节点）时回退旧网格布局。
+	if len(branches) == 0 {
+		return m.renderAgentsGridFallback(w, h, header, meta, maxBody, innerW)
 	}
 
-	// 分段组装：MetaAgent 卡片（居中）、连接线、子 Agent 卡片行、图例。
-	// 裁剪时优先丢图例、再丢末尾卡片行，保证 MetaAgent 始终可见。
-	var metaLines []string
+	// 分支列参数：宽度足够时每行最多 3 列（分三叉），否则 2 列/1 列（窄面板退化为竖向树）。
+	rowCols := 3
+	if innerW < 66 {
+		rowCols = 2
+	}
+	if innerW < 40 {
+		rowCols = 1
+	}
+	if rowCols > len(branches) {
+		rowCols = len(branches)
+	}
+	gap := 2
+	colW := (innerW - gap*(rowCols-1)) / rowCols
+	if colW < 10 {
+		colW = 10
+	}
+
+	// Meta 卡片：居中；运行中且有待完成分支时标注"谁在等谁"（TODO #48 子项 1）。
+	var lines []string
 	if meta != nil {
-		// MetaAgent 卡片只写名称（用户要求不带目标/角色等额外信息），宽度自适应内容。
-		metaCard := m.buildMetaCard(*meta)
+		// 等待标注按面板宽度截断，防窄面板下卡片超出内宽导致边框折行。
+		metaCard := m.buildMetaCard(*meta, truncate(waitingBranchNames(branches), innerW-6))
 		padLeft := (innerW - lipgloss.Width(metaCard)) / 2
 		if padLeft < 0 {
 			padLeft = 0
 		}
 		pad := strings.Repeat(" ", padLeft)
 		for _, l := range strings.Split(metaCard, "\n") {
-			metaLines = append(metaLines, pad+l)
+			lines = append(lines, pad+l)
 		}
 	}
-	// 子 Agent 卡片按行拼接（行内 JoinHorizontal）；放不下的整行丢弃。
-	connLines := m.agentConnectorLines(cols, cardW, gap, innerW)
-	rowBudget := maxBody - len(metaLines) - len(connLines)
-	var rowLines []string
+
+	// 逐行组装分支：连接线 + 分支卡片行 + 各分支子节点行，整行粒度裁剪（行放不下整行丢弃）。
 	omitted := 0
-	for row := 0; row < len(children); row += cols {
-		end := row + cols
-		if end > len(children) {
-			end = len(children)
+	firstRow := true
+	for row := 0; row < len(branches); row += rowCols {
+		end := row + rowCols
+		if end > len(branches) {
+			end = len(branches)
 		}
-		var cards []string
-		for _, n := range children[row:end] {
-			cards = append(cards, m.buildAgentCard(n, cardW))
+		rowBranches := branches[row:end]
+		centers := branchCenters(len(rowBranches), colW, gap, innerW)
+
+		// 连接线：首行从 Meta 引出（1/2/3 分叉形态按实际分支数生成），
+		// 后续行左缘竖线延续，表示仍是 Meta 的分支。
+		var rowLines []string
+		if firstRow && meta != nil {
+			rowLines = append(rowLines, m.agentBranchConnectorLines(centers, innerW/2)...)
+		} else {
+			rowLines = append(rowLines, m.styles.Dim.Render("  │"))
 		}
-		rl := strings.Split(joinHorizontalWithGap(cards, gap), "\n")
-		if len(rowLines)+len(rl) > rowBudget {
-			omitted = len(children) - row
+		// 分支卡片行：每个分支一张卡片（含等待标注/当前任务行）。
+		cards := make([]string, 0, len(rowBranches))
+		for _, b := range rowBranches {
+			cards = append(cards, m.buildAgentCard(b.node, colW, waitingChildNames(b.children)))
+		}
+		rowLines = append(rowLines, strings.Split(joinHorizontalWithGap(cards, gap), "\n")...)
+		// 各分支子节点行：树状连接符（├─ / └─），助手挂在所属分支下。
+		nodesInRow := len(rowBranches)
+		for _, b := range rowBranches {
+			cl := m.branchChildLines(b, colW)
+			rowLines = append(rowLines, cl...)
+			nodesInRow += len(b.children)
+		}
+
+		if len(lines)+len(rowLines) > maxBody {
+			omitted += nodesInRow
 			break
 		}
-		rowLines = append(rowLines, rl...)
+		lines = append(lines, rowLines...)
+		firstRow = false
 	}
-	// 一个卡片行也放不下时，不画悬空的连接线。
-	if len(children) == 0 || (omitted == len(children) && len(children) > 0) {
-		connLines = nil
-	}
-	lines := append(metaLines, connLines...)
-	lines = append(lines, rowLines...)
 
-	// 图例：仅在所有卡片都放下且还有余量时显示，并插入空行贴底对齐。
+	// 图例：全部放下且还有余量时显示并贴底对齐。
 	if omitted == 0 && len(lines)+1 <= maxBody {
 		for len(lines)+1 < maxBody {
 			lines = append(lines, "")
@@ -435,9 +446,154 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
 }
 
-// buildMetaCard 渲染顶部 MetaAgent 卡片：只写名称，不带角色/目标/时间等额外信息。
+// agentTreeBranch 是编排树的一个直接分支：depth=1 节点（领域 Agent/直接助手）+ 其下挂载的子节点。
+type agentTreeBranch struct {
+	node     agentTreeNode
+	children []agentTreeNode
+}
+
+// groupAgentTree 把扁平渲染节点按树结构分组为 meta + 直接分支（TODO #48 子项 2 数据源）。
+// 子孙归属：沿 ParentID 链找到首个 depth=1 祖先；孤儿（找不到祖先）挂到最后一个分支兜底。
+// 顺带应用拥挤过滤：depth>=2 且无目标且已终结/空闲的节点不参与渲染（与旧网格同口径）。
+// 待澄清占位节点作为独立分支追加（挂在 meta 下）。
+func groupAgentTree(nodes []agentTreeNode) (meta *agentTreeNode, branches []agentTreeBranch, loose []agentTreeNode) {
+	byID := make(map[string]int, len(nodes))
+	for i := range nodes {
+		byID[nodes[i].instID] = i
+	}
+	level1Idx := make(map[string]int, len(nodes))
+	for i := range nodes {
+		n := &nodes[i]
+		if n.isClarify {
+			continue
+		}
+		switch n.depth {
+		case 0:
+			if meta == nil {
+				meta = n
+			}
+		case 1:
+			level1Idx[n.instID] = len(branches)
+			branches = append(branches, agentTreeBranch{node: *n})
+		}
+	}
+	// 第二遍：depth>=2 节点沿父链挂到所属分支。
+	for i := range nodes {
+		n := &nodes[i]
+		if n.depth < 2 {
+			continue
+		}
+		if n.goal == "" && (n.status == enums.RoleStatusDone || n.status == enums.RoleStatusIdle) {
+			continue
+		}
+		attached := false
+		pid := n.parentID
+		for range nodes {
+			if pid == "" {
+				break
+			}
+			idx, ok := byID[pid]
+			if !ok {
+				break
+			}
+			anc := &nodes[idx]
+			if anc.depth == 1 {
+				if bi, ok2 := level1Idx[anc.instID]; ok2 {
+					branches[bi].children = append(branches[bi].children, *n)
+					attached = true
+				}
+				break
+			}
+			pid = anc.parentID
+		}
+		if !attached {
+			loose = append(loose, *n)
+		}
+	}
+	// 待澄清占位作为独立分支。
+	for i := range nodes {
+		if nodes[i].isClarify {
+			branches = append(branches, agentTreeBranch{node: nodes[i]})
+		}
+	}
+	// 孤儿挂最后一个分支兜底，保证不丢节点。
+	if len(loose) > 0 && len(branches) > 0 {
+		branches[len(branches)-1].children = append(branches[len(branches)-1].children, loose...)
+	}
+	return meta, branches, loose
+}
+
+// waitingChildNames 返回分支下仍处于活动/等待状态的子节点展示名摘要（TODO #48 子项 1）：
+// 1 个返回"⏳ 等待 X 完成"，2 个"⏳ 等待 X、Y 完成"，更多返回"⏳ 等待 N 个子 Agent 完成"。
+func waitingChildNames(children []agentTreeNode) string {
+	var names []string
+	for _, c := range children {
+		if c.status == enums.RoleStatusActive || c.status == enums.RoleStatusWaiting {
+			names = append(names, c.name)
+		}
+	}
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return "⏳ 等待 " + names[0] + " 完成"
+	case 2:
+		return "⏳ 等待 " + names[0] + "、" + names[1] + " 完成"
+	default:
+		return fmt.Sprintf("⏳ 等待 %d 个子 Agent 完成", len(names))
+	}
+}
+
+// waitingBranchNames 返回 meta 正在等待的分支名摘要：分支自身处于活动/等待态即视为未回传。
+func waitingBranchNames(branches []agentTreeBranch) string {
+	children := make([]agentTreeNode, 0, len(branches))
+	for _, b := range branches {
+		children = append(children, b.node)
+	}
+	return waitingChildNames(children)
+}
+
+// branchCenters 计算一行内各分支卡片列的中心横坐标（行整体居中）。
+func branchCenters(n, colW, gap, innerW int) []int {
+	rowW := n*colW + (n-1)*gap
+	start := (innerW - rowW) / 2
+	if start < 0 {
+		start = 0
+	}
+	centers := make([]int, n)
+	for i := range n {
+		centers[i] = start + i*(colW+gap) + colW/2
+	}
+	return centers
+}
+
+// renderAgentsGridFallback 回退旧网格布局：仅 MetaAgent（无分支派发）或散节点场景。
+func (m Model) renderAgentsGridFallback(w, h int, header string, meta *agentTreeNode, maxBody, innerW int) string {
+	var lines []string
+	if meta != nil {
+		metaCard := m.buildMetaCard(*meta, "")
+		padLeft := (innerW - lipgloss.Width(metaCard)) / 2
+		if padLeft < 0 {
+			padLeft = 0
+		}
+		pad := strings.Repeat(" ", padLeft)
+		for _, l := range strings.Split(metaCard, "\n") {
+			lines = append(lines, pad+l)
+		}
+	}
+	for len(lines)+1 < maxBody {
+		lines = append(lines, "")
+	}
+	if len(lines) < maxBody {
+		lines = append(lines, m.agentLegendLine())
+	}
+	body := strings.Join(lines, "\n")
+	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
+}
+
+// buildMetaCard 渲染顶部 MetaAgent 卡片：名称 +（可选）等待标注行。
 // 边框颜色仍随状态变化（运行绿/错误红），宽度自适应内容，由调用方居中。
-func (m Model) buildMetaCard(node agentTreeNode) string {
+func (m Model) buildMetaCard(node agentTreeNode, waiting string) string {
 	name := lipgloss.NewStyle().Foreground(lipgloss.Color(agentRoleColor(enums.RoleTypeMeta))).Bold(true).
 		Render("MetaAgent")
 	// 运行中/错误用状态色边框突出，其余用普通暗色边框。
@@ -448,6 +604,10 @@ func (m Model) buildMetaCard(node agentTreeNode) string {
 	case enums.RoleStatusError:
 		borderColor = cStatusErr
 	}
+	// 等待标注：MetaAgent 空等子 Agent 时直接读出"谁在等谁"（TODO #48 子项 1）。
+	if waiting != "" {
+		name += "\n" + m.styles.Dim.Render(waiting)
+	}
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(borderColor)).
@@ -455,11 +615,12 @@ func (m Model) buildMetaCard(node agentTreeNode) string {
 		Render(name)
 }
 
-// buildAgentCard 把子 Agent 节点渲染为紧凑的圆角边框卡片，固定 2 行内容：
-// 彩色加粗名称（如"游戏渲染领域"）+ 状态色点文本（如"● Running"）。
-// 任务/结果/时间等详情不再上卡片（简洁展示要求），仍可在 [A] 编排弹窗中查看。
-// 卡片总宽恒为 cardW：lipgloss Width 含左右内边距（各 1），边框另加 2 列，保证网格列对齐。
-func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
+// buildAgentCard 把子 Agent 节点渲染为紧凑的圆角边框卡片：
+// 彩色加粗名称（如"游戏渲染领域"）+ 状态色点文本（如"● Running"）；
+// 运行中且有待完成子节点时追加"⏳ 等待 XX 完成"标注行（TODO #48 子项 1），
+// 运行中无子节点时展示当前任务摘要（进度感，TODO #48 子项 3 验收 (d)）。
+// 卡片总宽恒为 cardW：lipgloss Width 含左右内边距（各 1），边框另加 2 列，保证列对齐。
+func (m Model) buildAgentCard(node agentTreeNode, cardW int, waiting string) string {
 	// 文本区宽度 = 总宽 - 边框 2 - 内边距 2。
 	inner := cardW - 4
 	if inner < 4 {
@@ -471,6 +632,13 @@ func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
 	// 状态行：彩色图标 + 英文状态文本。
 	stLine := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor(string(node.status)))).
 		Render(statusIcon(string(node.status)) + " " + roleStatusText(node.status))
+	// 附加行：等待标注优先，其次运行中展示当前任务（进度感）。
+	extra := ""
+	if waiting != "" {
+		extra = m.styles.Dim.Render(truncate(waiting, inner))
+	} else if node.status == enums.RoleStatusActive && node.goal != "" {
+		extra = m.styles.Dim.Render(truncate("📋 "+node.goal, inner))
+	}
 	// 运行中/错误的 Agent 用状态色边框突出，其余用普通暗色边框。
 	borderColor := cBlur
 	switch node.status {
@@ -479,46 +647,80 @@ func (m Model) buildAgentCard(node agentTreeNode, cardW int) string {
 	case enums.RoleStatusError:
 		borderColor = cStatusErr
 	}
+	content := name + "\n" + stLine
+	if extra != "" {
+		content += "\n" + extra
+	}
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(borderColor)).
 		Padding(0, 1).
 		Width(cardW - 2).
-		Render(name + "\n" + stLine)
+		Render(content)
 }
 
-// agentConnectorLines 生成 MetaAgent 卡片与子 Agent 网格之间的连接线。
-// 单列时为居中的竖线；多列时为带 ┌ ┐ ┬ ┴ 的分流横线，对齐各列中心。
-func (m Model) agentConnectorLines(cols, cardW, gap, innerW int) []string {
-	center := innerW / 2
-	vline := strings.Repeat(" ", center) + m.styles.Dim.Render("│")
-	if cols <= 1 {
-		return []string{vline, vline}
+// branchChildLines 渲染一个分支下的子节点行：树状连接符（├─ / └─）+ 名称 + 状态色点。
+func (m Model) branchChildLines(b agentTreeBranch, colW int) []string {
+	var lines []string
+	for i, c := range b.children {
+		glyph := "├─"
+		if i == len(b.children)-1 {
+			glyph = "└─"
+		}
+		name := lipgloss.NewStyle().Foreground(lipgloss.Color(agentRoleColor(c.roleType))).
+			Render(truncate(c.name, colW-6))
+		st := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor(string(c.status)))).
+			Render(statusIcon(string(c.status)) + " " + roleStatusText(c.status))
+		lines = append(lines, "  "+m.styles.Dim.Render(glyph)+" "+name+" "+st)
 	}
-	// 计算各列中心位置。
-	centers := make([]int, cols)
-	for i := 0; i < cols; i++ {
-		centers[i] = i*(cardW+gap) + cardW/2
+	return lines
+}
+
+// agentBranchConnectorLines 生成 MetaAgent 卡片到分支卡片行之间的连接线（TODO #48 子项 2）：
+// 竖干（meta 中心）→ 分流横线（按实际分支列中心生成：1 个分支一条竖线、2 个两叉、3 个三叉）→ 各分支竖线。
+func (m Model) agentBranchConnectorLines(centers []int, metaCenter int) []string {
+	// 单分支且与 meta 同轴：三条竖线（无横线分叉）。
+	if len(centers) == 1 && centers[0] == metaCenter {
+		v := strings.Repeat(" ", metaCenter) + m.styles.Dim.Render("│")
+		return []string{v, v, v}
 	}
-	bar := []rune(strings.Repeat(" ", centers[cols-1]+1))
-	for i := centers[0]; i <= centers[cols-1]; i++ {
+	lo, hi := centers[0], centers[len(centers)-1]
+	if metaCenter < lo {
+		lo = metaCenter
+	}
+	if metaCenter > hi {
+		hi = metaCenter
+	}
+	bar := []rune(strings.Repeat(" ", hi+1))
+	for i := lo; i <= hi; i++ {
 		bar[i] = '─'
 	}
-	mid := (centers[0] + centers[cols-1]) / 2
-	bar[mid] = '┴'
-	for i, c := range centers {
-		switch {
-		case c == mid:
+	bar[metaCenter] = '┴'
+	for _, c := range centers {
+		if c == metaCenter {
 			bar[c] = '┼'
-		case i == 0:
-			bar[c] = '┌'
-		case i == cols-1:
-			bar[c] = '┐'
-		default:
+		} else {
 			bar[c] = '┬'
 		}
 	}
-	return []string{vline, m.styles.Dim.Render(string(bar))}
+	// 横线端点美化：未与连接点重合的端点画 ┌ ┐。
+	if lo < hi {
+		if lo != metaCenter {
+			bar[lo] = '┌'
+		}
+		if hi != metaCenter {
+			bar[hi] = '┐'
+		}
+	}
+	stub := []rune(strings.Repeat(" ", hi+1))
+	for _, c := range centers {
+		stub[c] = '│'
+	}
+	return []string{
+		strings.Repeat(" ", metaCenter) + m.styles.Dim.Render("│"),
+		m.styles.Dim.Render(string(bar)),
+		m.styles.Dim.Render(string(stub)),
+	}
 }
 
 // agentLegendLine 渲染 Agent 编排面板底部的状态图例。

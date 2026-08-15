@@ -161,6 +161,7 @@ func (r *Registry) registerDefaults() {
 	// 依次注册文件、命令、HTTP、Git 等类别的内置工具。
 	r.Register(&readFileTool{exec: r.exec})
 	r.Register(&writeFileTool{exec: r.exec})
+	r.Register(&editFileTool{exec: r.exec})
 	r.Register(&listDirTool{exec: r.exec})
 	r.Register(&runCommandTool{exec: r.exec})
 	r.Register(&searchInFilesTool{exec: r.exec})
@@ -217,7 +218,7 @@ func (r *Registry) needsApproval(name string, args map[string]any) bool {
 	}
 	prod := inProductionWorkDir(r.WorkDir(), r.productionWorkDir)
 	switch name {
-	case "WriteFile":
+	case "WriteFile", "EditFile":
 		return prod
 	case "RunCommand":
 		cmd, _ := args["command"].(string)
@@ -367,10 +368,10 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		result.Output += readNote
 	}
 
-	// WriteFile 成功后失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
+	// WriteFile/EditFile 成功后失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
 	// 防止子 Agent 改文件后，父 Agent 下次派发仍把旧摘要注入新子 Agent task 导致幻觉。
 	// ReadFile 无需清已读记录：重读本就直返磁盘最新内容，不存在脏数据问题。
-	if name == "WriteFile" && result.Success && result.Path != "" {
+	if (name == "WriteFile" || name == "EditFile") && result.Success && result.Path != "" {
 		r.invalidateSharedMemoryForPath(ctx, result.Path)
 		// 文件新增/修改触发去抖刷新 PROJECT.md 领域影响范围（安静期一次 LLM 重分区）。
 		r.scheduleProjectRefresh()
@@ -598,6 +599,16 @@ func (r *Registry) Schema() []tools.Tool {
 	if t, err := tools.NewFunc("WriteFile", "写入文件（整文件覆盖，不是局部替换/追加）。content 必须是文件的**完整内容**--修改局部须先 ReadFile 读取完整文件再写完整内容，禁止只发修改片段（只发片段会把原文件整文件覆盖为片段，造成数据丢失）。若文件仅作为临时产物使用（例如运行脚本、中间分析、一次性计算），请设置 temporary=true，文件会写入会话级临时目录并在会话结束后自动清理；用户明确要求保留的文件请保持 temporary=false（默认）。极端缩小（新内容 < 原文件 10% 且原文件 >= 5KB）默认拒收，确为有意精简时加 confirm_shrink=true 绕过。", func(ctx context.Context, in writeFileInput) (string, error) {
 		// 转发到内部 WriteFile 工具，包含路径、内容和 temporary/confirm_shrink 标志。
 		res, _ := r.Dispatch(ctx, "WriteFile", map[string]any{"path": in.Path, "content": in.Content, "temporary": in.Temporary, "confirm_shrink": in.ConfirmShrink})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 EditFile 工具：精确局部替换（TODO #49）。
+	// 小改（<20% 文件）优先 EditFile，新建/大改才 WriteFile；匹配失败返回就近上下文提示而非静默。
+	if t, err := tools.NewFunc("EditFile", "精确局部替换（只改指定片段，不重写整个文件）。old_string 必须与文件现有内容逐字符一致（含缩进/空格；行尾 \\r\\n 与 \\n 视为等价），默认须唯一匹配，多处匹配会报错；确需全部替换时传 replace_all=true。匹配失败返回错误并附文件开头片段供自查，不会改动文件。**小改（<20% 文件）优先用 EditFile 而非 WriteFile**：EditFile 只输出替换片段，输出 token 与耗时远小于整文件重写（整文件重写单次可达 23-25KB 输出、拖慢 1-3 分钟）；新建文件或改动面接近整文件时仍用 WriteFile。EditFile 与 WriteFile 同等触发共享记忆/spec 失效与 .bma/snapshots 备份。", func(ctx context.Context, in editFileInput) (string, error) {
+		// 转发到内部 EditFile 工具，包含路径、old_string/new_string 与 replace_all 标志。
+		res, _ := r.Dispatch(ctx, "EditFile", map[string]any{"path": in.Path, "old_string": in.OldString, "new_string": in.NewString, "replace_all": in.ReplaceAll})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
 	}); err == nil {
@@ -900,6 +911,24 @@ func (t *writeFileTool) Destructive() bool { return true }
 // Execute 调用 Executor 的 writeFile 方法完成写入。
 func (t *writeFileTool) Execute(ctx context.Context, args map[string]any) *Result {
 	return t.exec.writeFile(ctx, args)
+}
+
+// editFileTool 是 EditFile 工具的封装。
+type editFileTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 EditFile。
+func (t *editFileTool) Name() string { return "EditFile" }
+
+// Aliases 返回 EditFile 的别名列表。
+func (t *editFileTool) Aliases() []string { return []string{"edit_file", "editFile"} }
+
+// Destructive 标记 EditFile 为破坏性操作（文件内容不可逆修改）：
+// 生产工作目录下触发用户确认，与 WriteFile 同边界（TODO #17 P1）。
+func (t *editFileTool) Destructive() bool { return true }
+
+// Execute 调用 Executor 的 editFile 方法完成局部替换。
+func (t *editFileTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.editFile(ctx, args)
 }
 
 // listDirTool 是 ListDir 工具的封装。
