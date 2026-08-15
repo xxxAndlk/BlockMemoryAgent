@@ -139,8 +139,10 @@ func (m *Model) subAgentFlowPanelHeight() int {
 }
 
 // flowPanelCols 返回面板每行可容纳的列数（至少 1）。
+// 需把列间隔纳入计算：rowW = cols*flowColW + (cols-1)*flowColGap ≤ w，
+// 否则列数取 w/flowColW 时拼接行会超宽物理折行（实测 w=150 时 5 列达 166 列）。
 func flowPanelCols(w int) int {
-	cols := w / flowColW
+	cols := (w + flowColGap) / (flowColW + flowColGap)
 	if cols < 1 {
 		cols = 1
 	}

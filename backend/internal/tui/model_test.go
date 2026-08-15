@@ -479,22 +479,21 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 // TestRightPanelShowsBothPanelsEvenWhenShort 验证：即使终端高度较紧张，
 // 右侧计划栏与 Agent 编排栏也应同时出现，而不是计划栏被完全丢弃。
 func TestRightPanelShowsBothPanelsEvenWhenShort(t *testing.T) {
-	m := &Model{
-		styles:           NewStyles(),
-		chatPanel:        ChatPanel{vp: viewport.New(80, 20)},
-		width:            80,
-		height:           12,
-		rightPanelForced: 1,
-		shared:           newSharedState(),
-	}
-	m.chatPanel.vp.SetContent("")
+	// 经 NewModel + WindowSizeMsg 走真实尺寸分发（直接构造 viewport 会与 height 不一致，
+	// 渲染出超终端高度的帧——真实程序不会这样）。
+	// 高度 20 是“紧张”的下限：顶栏+对话区+Token 栏+输入栏(5)+快捷键栏已占 13 行，
+	// 12 行终端连必需区都装不下（帧封顶后保留底部，面板标题必然不可见），故用 20 验证。
+	m := NewModel(nil, nil, "http://127.0.0.1:1", "test")
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	model := modelPtr(nm)
+	model.rightPanelForced = 1
 
-	view := m.View()
+	view := model.View()
 	if !strings.Contains(view, "Agent 编排") {
-		t.Fatalf("高度 12 时仍应显示 Agent 编排面板，got:\n%s", view)
+		t.Fatalf("高度 20 时仍应显示 Agent 编排面板，got:\n%s", view)
 	}
 	if !strings.Contains(view, "执行计划") {
-		t.Fatalf("高度 12 时仍应显示执行计划面板，got:\n%s", view)
+		t.Fatalf("高度 20 时仍应显示执行计划面板，got:\n%s", view)
 	}
 }
 

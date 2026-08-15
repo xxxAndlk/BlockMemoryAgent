@@ -343,3 +343,63 @@ func TestRenderAgentsPanel_TreeLayout(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildAgentCardWrapsName 验证窄列下卡片名称换行而非截断（Y 轴换 X 轴空间）：
+// 名称完整保留、无省略号，且折为多行。
+func TestBuildAgentCardWrapsName(t *testing.T) {
+	m := &Model{styles: NewStyles()}
+	node := agentTreeNode{
+		depth:    1,
+		name:     "游戏流程进度领域",
+		roleType: enums.RoleTypeDomain,
+		status:   enums.RoleStatusActive,
+		goal:     "实现关卡进度持久化",
+	}
+	// cardW=14 → 文本区 10 列，名称（16 列宽）必须折成两行。
+	card := stripANSI(m.buildAgentCard(node, 14, ""))
+	if strings.Contains(card, "…") {
+		t.Errorf("卡片名称不应截断为省略号:\n%s", card)
+	}
+	// 去掉换行、对齐空格与边框后，名称与任务摘要的所有字符应完整保留（折行点可在任意字符边界）。
+	flat := strings.NewReplacer("\n", "", " ", "", "│", "").Replace(card)
+	if !strings.Contains(flat, "游戏流程进度领域") {
+		t.Errorf("卡片名称换行后应完整保留:\n%s", card)
+	}
+	if !strings.Contains(flat, "实现关卡进度持久化") {
+		t.Errorf("卡片任务摘要应换行保留:\n%s", card)
+	}
+}
+
+// TestRenderAgentsPanel_NarrowPanelThreeBranchesOneRow 验证窄面板（旧逻辑 innerW<66 只排 2 列）
+// 下 3 个分支经卡片文字换行后仍排在同一行。
+func TestRenderAgentsPanel_NarrowPanelThreeBranchesOneRow(t *testing.T) {
+	mkNode := func(inst, name string) agentTreeNode {
+		return agentTreeNode{
+			depth:    1,
+			instID:   inst,
+			parentID: "s",
+			name:     name,
+			roleType: enums.RoleTypeDomain,
+			status:   enums.RoleStatusActive,
+		}
+	}
+	m := &Model{styles: NewStyles()}
+	m.agentTreePanel.nodes = []agentTreeNode{
+		{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive},
+		mkNode("s/d1", "主控领域"),
+		mkNode("s/d2", "怪物领域"),
+		mkNode("s/d3", "路径领域"),
+	}
+	// w=52 → innerW=48：3 列各 14 宽（≥ minBranchColW），一行放下。
+	panel := stripANSI(m.renderAgentsPanel(52, 30))
+	sameRow := false
+	for _, l := range strings.Split(panel, "\n") {
+		if strings.Contains(l, "主控领域") && strings.Contains(l, "怪物领域") && strings.Contains(l, "路径领域") {
+			sameRow = true
+			break
+		}
+	}
+	if !sameRow {
+		t.Errorf("窄面板下 3 个分支应排在同一行:\n%s", panel)
+	}
+}

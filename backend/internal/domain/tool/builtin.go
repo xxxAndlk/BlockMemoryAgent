@@ -749,6 +749,10 @@ func (e *Executor) searchInFiles(args map[string]any) *Result {
 
 // ---- RunCommand（执行命令） ----
 
+// psForceUTF8Prefix 是 Windows 下每条 PowerShell 命令的前导语句：
+// 把控制台输出编码与管道编码都切到 UTF-8，避免中文系统 GBK/936 输出被 Go 端按 UTF-8 读成乱码。
+const psForceUTF8Prefix = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new();$OutputEncoding=[System.Text.UTF8Encoding]::new();"
+
 // parseMkdirDir 解析形如 "mkdir -p /some/dir" 的命令字符串，尝试提取目标目录。
 func parseMkdirDir(cmd string) string {
 	// 去除首尾空白。
@@ -816,7 +820,10 @@ func (e *Executor) runCommand(ctx context.Context, args map[string]any) *Result 
 	// powershell 比 cmd /c 更可靠：Write-Host 输出到 stdout 可捕获；$ 变量不会被错误展开；
 	// 复合管道命令正确执行。
 	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "powershell", "-NoLogo", "-NoProfile", "-Command", cmdStr)
+		// 中文 Windows 控制台代码页为 GBK/936，PowerShell 格式化输出（Select-String 等）
+		// 默认按 GBK 编码，Go 端按 UTF-8 读会乱码；先强制会话输出编码为 UTF-8。
+		// （原生命令直写 stdout 的 GBK 字节由 DecodeCommandOutput 回退解码兜底。）
+		cmd = exec.CommandContext(ctx, "powershell", "-NoLogo", "-NoProfile", "-Command", psForceUTF8Prefix+cmdStr)
 	} else {
 		cmd = exec.CommandContext(ctx, "sh", "-c", cmdStr)
 	}
@@ -835,10 +842,10 @@ func (e *Executor) runCommand(ctx context.Context, args map[string]any) *Result 
 	// 执行命令，Windows 下使用树形进程kill以处理超时。
 	err := runCommandWithTreeKill(ctx, cmd)
 
-	// 清理并合并标准输出与标准错误。
-	output := SanitizeBytes(stdout.Bytes())
+	// 清理并合并标准输出与标准错误（GBK 控制台输出回退解码，见 DecodeCommandOutput）。
+	output := DecodeCommandOutput(stdout.Bytes())
 	if stderr.Len() > 0 {
-		output += "\n[stderr]\n" + SanitizeBytes(stderr.Bytes())
+		output += "\n[stderr]\n" + DecodeCommandOutput(stderr.Bytes())
 	}
 	// 检测输出是否暗示端口占用，并追加友好提示。
 	if hint := detectPortConflictHint(cmdStr, output); hint != "" {

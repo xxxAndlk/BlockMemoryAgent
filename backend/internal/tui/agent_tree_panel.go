@@ -355,16 +355,14 @@ func (m Model) renderAgentsPanel(w, h int) string {
 		return m.renderAgentsGridFallback(w, h, header, meta, maxBody, innerW)
 	}
 
-	// 分支列参数：宽度足够时每行最多 3 列（分三叉），否则 2 列/1 列（窄面板退化为竖向树）。
-	rowCols := 3
-	if innerW < 66 {
-		rowCols = 2
+	// 分支列参数：优先一行放下（最多 3 列分叉），列宽变窄时卡片文字换行
+	// （Y 轴换 X 轴空间，TODO #48 后续）；仅当列宽跌破最小可读宽度时才减列。
+	rowCols := len(branches)
+	if rowCols > 3 {
+		rowCols = 3
 	}
-	if innerW < 40 {
-		rowCols = 1
-	}
-	if rowCols > len(branches) {
-		rowCols = len(branches)
+	for rowCols > 1 && (innerW-2*(rowCols-1))/rowCols < minBranchColW {
+		rowCols--
 	}
 	gap := 2
 	colW := (innerW - gap*(rowCols-1)) / rowCols
@@ -434,8 +432,15 @@ func (m Model) renderAgentsPanel(w, h int) string {
 			lines = append(lines, "")
 		}
 		lines = append(lines, m.agentLegendLine())
-	} else if omitted > 0 && len(lines) < maxBody {
-		lines = append(lines, m.styles.Dim.Render(fmt.Sprintf("… 还有 %d 个 Agent", omitted)))
+	} else if omitted > 0 {
+		// 有分支/子节点被裁剪时必须给出提示；行已满则替换末行（PanelBox 自带外框，
+		// 被替换掉的可能是某张卡片的底边，仅外观瑕疵，不提示则用户无从知晓有节点未显示）。
+		note := m.styles.Dim.Render(fmt.Sprintf("… 还有 %d 个 Agent", omitted))
+		if len(lines) < maxBody {
+			lines = append(lines, note)
+		} else if len(lines) > 0 {
+			lines[len(lines)-1] = note
+		}
 	}
 	// 兜底硬裁剪，防止极端高度下内容溢出面板挤乱整体布局。
 	if len(lines) > maxBody {
@@ -451,6 +456,9 @@ type agentTreeBranch struct {
 	node     agentTreeNode
 	children []agentTreeNode
 }
+
+// minBranchColW 是分支卡片列的最小可读总宽（卡片文字换行，跌破该宽度才减少每行列数）。
+const minBranchColW = 14
 
 // groupAgentTree 把扁平渲染节点按树结构分组为 meta + 直接分支（TODO #48 子项 2 数据源）。
 // 子孙归属：沿 ParentID 链找到首个 depth=1 祖先；孤儿（找不到祖先）挂到最后一个分支兜底。
@@ -619,6 +627,7 @@ func (m Model) buildMetaCard(node agentTreeNode, waiting string) string {
 // 彩色加粗名称（如"游戏渲染领域"）+ 状态色点文本（如"● Running"）；
 // 运行中且有待完成子节点时追加"⏳ 等待 XX 完成"标注行（TODO #48 子项 1），
 // 运行中无子节点时展示当前任务摘要（进度感，TODO #48 子项 3 验收 (d)）。
+// 名称与附加行按列宽换行而非截断（Y 轴换 X 轴空间）：列宽收窄时一行仍可容纳更多分支。
 // 卡片总宽恒为 cardW：lipgloss Width 含左右内边距（各 1），边框另加 2 列，保证列对齐。
 func (m Model) buildAgentCard(node agentTreeNode, cardW int, waiting string) string {
 	// 文本区宽度 = 总宽 - 边框 2 - 内边距 2。
@@ -626,18 +635,27 @@ func (m Model) buildAgentCard(node agentTreeNode, cardW int, waiting string) str
 	if inner < 4 {
 		inner = 4
 	}
-	// 名称：按角色类型着色并加粗。
-	name := lipgloss.NewStyle().Foreground(lipgloss.Color(agentRoleColor(node.roleType))).Bold(true).
-		Render(truncate(node.name, inner))
+	// 名称：先按宽度换行再逐行着色加粗（先着色再折行会让 ANSI 序列跨行断裂）。
+	nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(agentRoleColor(node.roleType))).Bold(true)
+	nameLines := wrapToWidth(node.name, inner)
+	for i, l := range nameLines {
+		nameLines[i] = nameStyle.Render(l)
+	}
 	// 状态行：彩色图标 + 英文状态文本。
 	stLine := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor(string(node.status)))).
 		Render(statusIcon(string(node.status)) + " " + roleStatusText(node.status))
-	// 附加行：等待标注优先，其次运行中展示当前任务（进度感）。
+	// 附加行：等待标注优先，其次运行中展示当前任务（进度感）；按宽度换行。
+	var extraLines []string
 	extra := ""
 	if waiting != "" {
-		extra = m.styles.Dim.Render(truncate(waiting, inner))
+		extra = waiting
 	} else if node.status == enums.RoleStatusActive && node.goal != "" {
-		extra = m.styles.Dim.Render(truncate("📋 "+node.goal, inner))
+		extra = "📋 " + node.goal
+	}
+	if extra != "" {
+		for _, l := range wrapToWidth(extra, inner) {
+			extraLines = append(extraLines, m.styles.Dim.Render(l))
+		}
 	}
 	// 运行中/错误的 Agent 用状态色边框突出，其余用普通暗色边框。
 	borderColor := cBlur
@@ -647,9 +665,9 @@ func (m Model) buildAgentCard(node agentTreeNode, cardW int, waiting string) str
 	case enums.RoleStatusError:
 		borderColor = cStatusErr
 	}
-	content := name + "\n" + stLine
-	if extra != "" {
-		content += "\n" + extra
+	content := strings.Join(nameLines, "\n") + "\n" + stLine
+	if len(extraLines) > 0 {
+		content += "\n" + strings.Join(extraLines, "\n")
 	}
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).

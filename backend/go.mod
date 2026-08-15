@@ -16,6 +16,7 @@ require (
 	github.com/redis/go-redis/v9 v9.20.1
 	github.com/rs/zerolog v1.33.0
 	github.com/yalue/onnxruntime_go v1.32.1
+	golang.org/x/text v0.27.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -56,6 +57,5 @@ require (
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/text v0.27.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 )

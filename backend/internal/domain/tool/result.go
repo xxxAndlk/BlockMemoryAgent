@@ -2,12 +2,15 @@ package tool
 
 // 导入所需标准库：bytes 用于无 HTML 转义的 JSON 序列化；context 用于进度回调上下文；
 // encoding/json 用于 JSON 编码；strings 用于 UTF-8 修复；unicode/utf8 用于判断字节序列是否为合法 UTF-8。
+// simplifiedchinese 用于 Windows 中文系统 GBK 控制台输出的回退解码（DecodeCommandOutput）。
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
 	"unicode/utf8"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 // Result 表示一次工具调用的结果。
@@ -102,5 +105,19 @@ func SanitizeBytes(b []byte) string {
 		return string(b)
 	}
 	// 否则将字节切片转为字符串，并用 "�" 替换所有非法 UTF-8 序列。
+	return strings.ToValidUTF8(string(b), "�")
+}
+
+// DecodeCommandOutput 解码外部命令的原始输出字节（RunCommand 专用）：
+// 合法 UTF-8 直接返回；非法时（Windows 中文系统的控制台代码页为 GBK/936，
+// findstr 等原生命令与未设 UTF-8 前缀的 PowerShell 输出均为 GBK 字节）
+// 回退按 GB18030（GBK 超集）解码；解码失败再退化为替换字符净化。
+func DecodeCommandOutput(b []byte) string {
+	if utf8.Valid(b) {
+		return string(b)
+	}
+	if decoded, err := simplifiedchinese.GB18030.NewDecoder().Bytes(b); err == nil && utf8.Valid(decoded) {
+		return string(decoded)
+	}
 	return strings.ToValidUTF8(string(b), "�")
 }

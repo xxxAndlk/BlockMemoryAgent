@@ -64,7 +64,18 @@ func (m Model) singleColumnView() string {
 		overlay := m.renderOverlay(m.width, overlayH)
 		view = lipgloss.JoinVertical(lipgloss.Left, view, overlay)
 	}
-	return view
+
+	// 安全网：任何一行显示宽度超过终端都会物理折行，把后续内容整体顶下去
+	// （实证：顶栏/快捷键栏超宽折行使整帧比终端高，输入栏被挤出可视区）。
+	// 对最终帧逐行硬裁剪；总行数超高时保留底部（输入栏/快捷键栏优先可见）。
+	vlines := strings.Split(view, "\n")
+	for i, l := range vlines {
+		vlines[i] = hardClipLine(l, m.width)
+	}
+	if m.height > 0 && len(vlines) > m.height {
+		vlines = vlines[len(vlines)-m.height:]
+	}
+	return strings.Join(vlines, "\n")
 }
 
 // renderTopBar 渲染顶部状态栏，展示版本、模型、会话、状态等信息。
@@ -135,6 +146,9 @@ func (m Model) renderTopBar(w int) string {
 	if lipgloss.Width(line) > w {
 		line = left
 	}
+	// 左侧自身也可能超宽（如深路径 Workspace），硬裁剪保证顶栏恒为 1 物理行：
+	// 折行会让整帧比终端高，alt-screen 下底部输入栏被顶出屏幕。
+	line = hardClipLine(line, w)
 	return m.styles.TopBar.Width(w).Height(1).Render(line)
 }
 
@@ -180,7 +194,24 @@ func (m Model) renderRightPanels(w, h int) string {
 			}
 		}
 	}
-	return lipgloss.JoinVertical(lipgloss.Top, m.renderPlanPanel(w, topH), m.renderAgentsPanel(w, bottomH))
+	// 严格按预算裁剪：终端高度紧张（如 h=12）时 topH/bottomH 只有 2~3 行，
+	// 而面板最少渲染 4 行（标题+边框+1 行内容），不裁剪会把整帧撑高超终端、
+	// 输入栏被挤出可视区。保留每块前 N 行（标题优先可见，箱底边被裁仅外观瑕疵）。
+	plan := clipLinesTo(m.renderPlanPanel(w, topH), topH)
+	agents := clipLinesTo(m.renderAgentsPanel(w, bottomH), bottomH)
+	return lipgloss.JoinVertical(lipgloss.Top, plan, agents)
+}
+
+// clipLinesTo 保留 s 的前 n 行（不足 n 行原样返回）。
+func clipLinesTo(s string, n int) string {
+	if n < 0 {
+		n = 0
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[:n], "\n")
 }
 
 // renderPlanPanel 渲染右侧计划面板，展示目标、进度条与任务列表。
@@ -533,6 +564,8 @@ func (m Model) renderTokenBar(w int) string {
 	if lipgloss.Width(line) > w {
 		line = left
 	}
+	// 硬裁剪保证恒为 1 物理行（见 renderTopBar 注释）。
+	line = hardClipLine(line, w)
 	return lipgloss.NewStyle().Width(w).Height(1).Render(line)
 }
 
@@ -569,7 +602,9 @@ func (m Model) renderShortcutBar(w int) string {
 	for _, s := range shortcuts {
 		parts = append(parts, "["+m.styles.ShortcutKey.Render(s.key)+"] "+m.styles.ShortcutLabel.Render(s.label))
 	}
-	return m.styles.ShortcutBar.Width(w).Height(1).Render(strings.Join(parts, "  "))
+	// 快捷键较多时一行放不下，硬裁剪保证恒为 1 物理行（折行会把输入栏顶出屏幕）。
+	// 注意 ShortcutBar 样式带 Padding(0,1)，内容区只有 w-2 列。
+	return m.styles.ShortcutBar.Width(w).Height(1).Render(hardClipLine(strings.Join(parts, "  "), w-2))
 }
 
 // wrapStyledLine 将单行原始文本按宽度换行，并在首行保留时间戳前缀，续行保持对齐。
@@ -653,6 +688,45 @@ func displayDetailLines(title, detail string) []string {
 		lines = append(lines, "    ...")
 	}
 	return lines
+}
+
+// hardClipLine ANSI 感知的硬裁剪：按显示宽度截断到 w 列（不加省略号），
+// 保留行内 ANSI 序列；若行内含样式则末尾补 reset，防样式泄漏到后续行。
+// 用于顶栏/快捷键栏等"必须恰好 1 物理行"的场景：物理折行会让整帧比终端高。
+func hardClipLine(s string, w int) string {
+	if w < 1 || lipgloss.Width(s) <= w {
+		return s
+	}
+	var b strings.Builder
+	cur := 0
+	inAnsi := false
+	sawAnsi := false
+	for _, r := range s {
+		if r == '\x1b' {
+			inAnsi = true
+			sawAnsi = true
+			b.WriteRune(r)
+			continue
+		}
+		if inAnsi {
+			b.WriteRune(r)
+			// 字母表示 ANSI 序列结束。
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inAnsi = false
+			}
+			continue
+		}
+		rw := runewidth.RuneWidth(r)
+		if cur+rw > w {
+			break
+		}
+		b.WriteRune(r)
+		cur += rw
+	}
+	if sawAnsi {
+		b.WriteString("\x1b[0m")
+	}
+	return b.String()
 }
 
 // truncate 按显示宽度截断字符串并在末尾追加省略号（占 1 列）。

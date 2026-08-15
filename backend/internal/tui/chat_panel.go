@@ -349,6 +349,8 @@ func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Sessio
 	}
 
 	// 无 item 时展示欢迎页或空会话提示（目标栏保持置顶）。
+	// 欢迎框内容行数固定（约 11 行），终端高度紧张时会超过 bodyH 预算，
+	// 把整帧撑高超终端导致输入栏被挤出可视区——裁剪到 bodyH（箱底边被裁仅外观瑕疵）。
 	if !hasItems {
 		var body string
 		if session == nil {
@@ -356,6 +358,7 @@ func (cp *ChatPanel) renderChat(w, h int, styles *Styles, session *server.Sessio
 		} else {
 			body = renderEmptyChat(styles, contentW, bodyH)
 		}
+		body = clipLinesTo(body, bodyH)
 		if goalH > 0 {
 			return lipgloss.JoinVertical(lipgloss.Top, goalBar, body)
 		}
