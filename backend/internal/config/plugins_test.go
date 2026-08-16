@@ -74,6 +74,41 @@ func TestLoadPluginsConfigMissingFile(t *testing.T) {
 	}
 }
 
+// TestLoadPluginsConfig_RegistrySources registry_sources 顶层字段解析（TODO #51）。
+func TestLoadPluginsConfig_RegistrySources(t *testing.T) {
+	dir := t.TempDir()
+	content := `
+registry_sources:
+  - https://registry.modelcontextprotocol.io/v0/servers
+  - https://mirror.example/v0/servers
+plugins:
+  web_search:
+    kind: mcp
+`
+	path := filepath.Join(dir, "plugins.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadPluginsConfig(path)
+	if err != nil {
+		t.Fatalf("LoadPluginsConfig: %v", err)
+	}
+	if len(cfg.RegistrySources) != 2 || cfg.RegistrySources[0] != "https://registry.modelcontextprotocol.io/v0/servers" {
+		t.Fatalf("registry_sources 解析错误: %v", cfg.RegistrySources)
+	}
+	if _, ok := cfg.Plugins["web_search"]; !ok {
+		t.Fatal("plugins 段仍应解析")
+	}
+	// 缺省：未配置时为空切片（Manager 层回退官方端点）。
+	empty, err := LoadPluginsConfig(filepath.Join(t.TempDir(), "nope.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.RegistrySources) != 0 {
+		t.Fatalf("缺省应为空: %v", empty.RegistrySources)
+	}
+}
+
 func TestLoadPluginsMerge(t *testing.T) {
 	dir := t.TempDir()
 	// config.yaml 侧 plugins 段（基底）。

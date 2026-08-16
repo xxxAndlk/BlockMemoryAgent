@@ -125,6 +125,17 @@ type Registry struct {
 	// productionWorkDir 是配置的生产环境工作目录（绝对路径）；空 = 未启用生产边界确认，
 	// 仅危险命令模式（isDangerousCommand）触发确认。
 	productionWorkDir string
+	// pluginMgr 是 plugin_* 工具（TODO #51）依赖的插件管理面，由 bootstrap 注入
+	// plugins.ToolManagerAdapter；nil 时工具返回未配置错误。
+	pluginMgr PluginManager
+	// pluginVisibility 插件工具角色可见性回调（权限天花板，TODO #52）：由 bootstrap 注入
+	// plugins.Manager.ToolVisibility（与 agent/dispatcher 侧同源）；nil 时挂载不做天花板校验。
+	pluginVisibility PluginVisibilityFunc
+	// mountedMu 保护 mounted 挂载集（TODO #52 按需挂载）。
+	mountedMu sync.RWMutex
+	// mounted 按 scope（agentID）记录已挂载的插件工具名；agent 包 adapter.Schema() 读此
+	// 集收窄插件工具可见集 = 天花板 ∩ 已挂载集（默认收窄为角色基础工具）。
+	mounted map[string]map[string]bool
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -172,6 +183,17 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	r.Register(&rememberPreferenceTool{})
 	// 注册 search_knowledge 工具（TODO #27 外部知识库）；hook 在 SetKnowledgeSearchHook 注入后生效。
 	r.Register(&searchKnowledgeTool{})
+	// 注册 plugin_* 工具组（TODO #51 插件自安装闭环）；mgr 在 SetPluginManager 注入后生效。
+	r.Register(&pluginSearchTool{})
+	r.Register(&pluginInstallTool{})
+	r.Register(&pluginToggleTool{enable: true})
+	r.Register(&pluginToggleTool{enable: false})
+	// 注册工具目录/挂载工具组（TODO #52 插件分配给 Agent）：tool_catalog 发现天花板内
+	// 插件工具，tool_mount/tool_unmount 在天花板内按需挂载/卸载（角色白名单外不可见）。
+	r.Register(&toolCatalogTool{reg: r})
+	r.Register(&toolMountTool{reg: r})
+	r.Register(&toolUnmountTool{reg: r})
+	r.Register(&pluginListTool{})
 	// 返回构造完成的注册表。
 	return r
 }

@@ -1,4 +1,4 @@
-.PHONY: backend-test test-test test-compile web-build lint up down migrate run help
+.PHONY: backend-test test-test test-compile web-build lint up down migrate run plugins-up plugins-down plugins-build help
 
 ## Run all backend Go tests (unit + package tests).
 backend-test:
@@ -43,6 +43,20 @@ migrate:
 run: web-build
 	go run ./backend
 
+## Start the self-hosted Firecrawl stack (web_search plugin data plane, :3002).
+plugins-up:
+	docker compose -f docker/docker-compose.firecrawl.yml up -d
+
+## Stop the self-hosted Firecrawl stack.
+plugins-down:
+	docker compose -f docker/docker-compose.firecrawl.yml down
+
+## Build/pull plugin images: firecrawl-mcp + computer-use-mcp (local build) + open_design (ghcr pull).
+plugins-build:
+	docker build -t bma/firecrawl-mcp:local docker/firecrawl-mcp
+	docker build -t bma/computer-use-mcp:local docker/computer-use
+	docker pull ghcr.io/nexu-io/od:latest
+
 ## Show available targets.
 help:
 	@echo "Available targets:"
@@ -55,3 +69,6 @@ help:
 	@echo "  down          - stop docker compose services"
 	@echo "  migrate       - apply SQL migrations (requires POSTGRES_DSN)"
 	@echo "  run           - build web UI and run backend server"
+	@echo "  plugins-up    - start self-hosted Firecrawl stack (web_search data plane)"
+	@echo "  plugins-down  - stop self-hosted Firecrawl stack"
+	@echo "  plugins-build - build/pull plugin images (web_search / computer_use / open_design)"

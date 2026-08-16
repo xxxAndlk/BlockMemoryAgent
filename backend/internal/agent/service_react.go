@@ -1371,7 +1371,7 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 任务看板注入（TODO #35 Phase 0）：每轮上下文末尾追加【任务看板】段——编排状态
 	// 机器可读且压缩不可达，"重新执行"类短指令的消歧锚点。仅 meta 注入，子 Agent 不注入。
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
-	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, metaRole.Tools, "meta", s.pluginVisibility)).
+	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, "meta", s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
 		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
@@ -1464,7 +1464,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
 	// 任务看板注入（TODO #35 Phase 0）：同 runSession，每轮末尾追加【任务看板】段。
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
-	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, metaRole.Tools, "meta", s.pluginVisibility)).
+	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, "meta", s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
 		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).

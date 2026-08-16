@@ -86,6 +86,42 @@
     - 方向：plan_execute 的步骤完成报告模板改为三段式瘦身格式：①结论（通过/未通过，一行）②关键改动位置（函数名+行号清单，不复述代码）③验收证据（逐项 验收标准→PASS/FAIL→证据引用，一行一条）。禁止整段复述 diff 与代码原文（父 Agent 需要细节可自行 ReadFile）。模板落 plan_execute 执行器的步骤提示词；验收标准逐条判的要求保留（这是步骤 3-5 抓到 PowerShell 引号吞字、CSS 类 MISS 等真实问题的纪律来源，不能瘦身掉）。
     - 验收：重放同类多步骤任务，步骤报告 output token 下降 50%+，且验收纪律不退化（逐项 PASS/FAIL 仍在、仍能拦截不达标步骤）；父 Agent 整品验收所需信息不缺失。
 
+51. **插件系统 Agent 自安装闭环（对标 Claude Code marketplace 体验）**（✅ 已完成 2026-08-16，doc/变更.md 任务 58）  ← 来源：2026-08-16 用户提问"告诉系统 Agent 想装某插件，它自动搜索、安装并立即可用（Claude Code 可支持），当前系统是否也可以"（评估结论见 doc/变更.md 任务 57）
+    - 现状结论：MCP 热插拔已具备（mcp/service/bundle 三种形态 + enable/disable/reload API，启用后下一轮 ReAct 迭代即见工具）；缺 Agent 自驱动安装链路——插件管理仅暴露 HTTP API，Agent 无对应工具；无"安装"概念（API 只能启停 plugins.yaml/plugins.d 已声明条目，无动态新增 manifest 入口，无插件市场/注册表搜索源）。
+    - 补齐项：
+      1. **Manager.Install(ctx, manifest)**：校验 → 写入 `plugins.yaml` 或落 `plugins.d/` → 复用现有 Load/Enable 路径立即生效；含失败回滚、并发安全、配置文件原子写（防写坏丢配置）。
+      2. **Agent 工具组**：`plugin_search`（查目录源：MCP 官方 registry API + 内置精选目录）、`plugin_install`、`plugin_enable`、`plugin_disable`、`plugin_list`（包装现有 Manager 方法，接入既有审批/确认链）。
+      3. **安全门**：安装动作走敏感操作二次确认；registry 来源白名单，防 Agent 拉任意代码执行（镜像/包来源校验可后置）。
+    - 落地（任务 58）：
+      - **Manager.Install**（`plugins/install.go`）：校验（ID 字符集/可装形态 mcp|service/传输最小契约）→ 原子写 `plugins.installed.yaml`（临时文件+rename，不覆盖用户手写 plugins.yaml，loadDesired 合并时手工条目优先）→ createInstance + Enable 立即生效；失败回滚（摘实例+移除已写条目），`installMu` 串行化。enabled=false 只注册不启用，重启后保持。
+      - **目录检索**（`plugins/catalog.go`）：内置精选目录（sequential_thinking/filesystem/fetch/memory/time/git/github/gitlab/slack/firecrawl/everything 11 条，settings 完整可直接装）+ 远程 registry（MCP 官方 `registry.modelcontextprotocol.io/v0/servers`，契约 `{servers:[{server:{name,title,description,version,remotes,packages},_meta:{...isLatest}}]}`，isLatest 去重、streamable-http 优先、npm stdio 兑底 npx -y，8s 短超时 fail-soft）+ 已配置实例（带状态）；来源白名单 = `plugins.yaml` `registry_sources`（缺省官方端点），只查白名单内 URL。
+      - **工具组**（`tool/plugin_tools.go` + `plugins/tooladapter.go`）：`plugin_search` / `plugin_install`（目录条目按 id 解析或手工 manifest，env/roles/destructive 可覆盖）/ `plugin_enable` / `plugin_disable` / `plugin_list`，经 `tool.PluginManager` 接口注入（tool 包不反向依赖 plugins）。白名单：meta 全五件，domain 仅 plugin_list。
+      - **安全门**：`plugin_install` 自标 `Destructive()=true` → 自动接入既有审批守卫链（approval hook 未接线零变化）；registry 来源白名单如上。
+    - 验证：`plugins`/`tool`/`config` 三包新增 20 个单测（安装/回滚/冲突/校验/跨 Reload 持久化/检索聚合/registry 契约 httptest/工具格式化/审批门/Schema 暴露）；`go build && go test ./backend/...` 29 包全绿；真实 LLM 会话 E2E（session-...-06bf5b4f-1）："装 Sequential Thinking" → plugin_search 命中目录 → plugin_install 触发审批门（awaiting_clarify）→ 用户批准 → 安装成功 running + 工具 sequentialthinking 注册 + plugins.installed.yaml 落盘 + plugin_list 确认，当轮即可调用。既有热插拔闭环（web_search 26 工具 running 等）不退化。
+    - 验收：对话中说"装 XX 插件"→ Agent 搜索 registry → 安装 → 当轮即可调用新工具；全量 `go test ./backend/...` 绿；既有热插拔 E2E 闭环（任务 52/55/56 验证项）不退化。
+
+52. **插件分配给 Agent 的机制：静态权限天花板 + Agent 天花板内自选（分层混合）**（✅ 已完成 2026-08-16，doc/变更.md 任务 59）  ← 来源：2026-08-16 用户问"给 Agent 分配插件使用（如 UI 助手用画图插件），写死好还是 Agent 自己分配"——分析结论：写死管"能不能用"（权限），Agent 管"用不用/何时用"（选择），不开放 Agent 修改分配关系本身
+    - 分析结论：
+      - 纯写死（现状）：安全边界确定、可审计可复现、零运行时成本；但新组合要改配置+reload，长尾覆盖差。
+      - 纯 Agent 自分配：灵活但让 LLM 决定权限是安全红线（prompt injection 可诱导把 computer_use 等 destructive 工具分给不可信子 Agent），且不可审计、增 token 开销。否决。
+      - 分层混合（采纳，对齐 Claude Code 权限模型）：`plugins.yaml` 的 `roles` 白名单 = 权限天花板（Agent 不可改）；天花板内 Agent 通过工具目录自主选用/按需挂载，解决全量 schema 注入的上下文膨胀。
+    - 现状基础（已具备，不动）：`roles.yaml` 角色基础工具白名单（owned）∪ `plugins.yaml` 插件 `roles` 白名单（`plugins/manager.go` ToolVisibility），ReAct 每轮现取可见集。
+    - 执行项：
+      1. **天花板层（保留强化，无新代码或少量）**：插件 `roles` 白名单语义固化为权限红线——destructive 插件（computer_use）必须显式授权角色；#51 的 plugin_install 装好后必须落 roles 声明（默认 `["*"]` 需确认门，敏感插件强制显式列表）。文档明确"分配=权限声明，仅人改配置"。
+      2. **工具目录工具 `tool_catalog`**：新增只读 Agent 工具，返回该角色天花板内全部插件工具的名称+一句话描述（不含 schema），按插件分组——Agent 借此"知道自已能用什么"，替代全量 schema 注入。
+      3. **按需挂载/收窄**：可见集默认收窄为角色基础工具 + 任务相关插件工具；Agent 经 `tool_catalog` 发现后，下一轮 Schema 纳入目标工具（挂载请求仅在天花板内生效，越界直接拒绝并说明）。实现上扩展 ToolVisibility 回调为 (ceiling ∩ 已挂载集)。
+      4. **派发侧 `tools_hint`**：`call_sub_agent` 支持 MetaAgent 在 task 中声明建议工具集，dispatcher 校验 ∩ 子 Agent 角色天花板后收窄其可见集——实现"派 UI 任务时提示用画图插件"而不放权。
+    - 验收：(a) 越界挂载/委派被拒绝且日志可查；(b) 全量工具场景下注入 schema 数显著下降（对照当前全量基线）；(c) MetaAgent 派 UI 任务带 tools_hint，子 Agent 当轮可见对应插件工具；(d) 全量 `go test ./backend/...` 绿，任务 52/55/56 热插拔 E2E 不退化。
+    - 依赖：与 #51（Agent 自安装闭环）衔接——安装入口与挂载入口共用天花板校验。
+    - 落地（任务 59，2026-08-16）：
+      - **天花板层**：`validateInstall` 强制 destructive 插件（如 computer_use）显式声明可见角色（缺省/["*"] 直接拒绝安装）；`Manager.Install` 落 roles 声明（settings["roles"] 归一化：manifest.Roles → settings.Roles → 缺省显式 ["*"]，重启后可见性语义一致）；`config/plugins.yaml` computer_use 显式 `roles: ["meta"]` + 头注声明"分配=权限声明，仅人改配置"。
+      - **挂载机制**（`tool/mount.go` + `tool/mount_tools.go`）：Registry 按 scope（agentID）存挂载集（`MountForScope` 天花板校验：工具已注册 + 插件 owned + 角色 visible，越界拒绝并记日志；`MountedTools`/`UnmountTools`）；新工具组 `tool_catalog`（只读枚举天花板内插件工具，按插件分组 + 一句话描述 + 已挂载 ✓ 标注，不含 schema）/ `tool_mount`（越界直接拒绝并说明）/ `tool_unmount`。meta/domain 白名单加入三工具。
+      - **可见集收窄**：`agent/tool_adapter.go` `NewToolRegistryAdapterForRole` 加 scope 参数，`Schema()` = 静态白名单 ∪（插件可见集 ∩ 已挂载集）——默认收窄为角色基础工具，插件工具按需挂载，缓解全量 schema 注入上下文膨胀。meta scope=sessionID、子 Agent scope=subAgentID（resume 用 pausedNodeID，挂载集天然跨 resume 保留）。
+      - **plugin_install 自动挂载**：安装成功后把新工具天花板内部分自动挂载进调用者 scope（"装完当轮即可调用"闭环不破）；越界项（roles 限定他角色）回告不挂载。
+      - **派发侧 `tools_hint`**：call_sub_agent / call_sub_agents 新增可选 `tools_hint` 字段，dispatcher 校验 ∩ 子 Agent 角色天花板后预挂载进子 scope（派 UI 任务提示用画图插件而不放权）；越界/未注册项忽略并随派发结果回告父 Agent（日志可查）。
+      - **bootstrap**：`toolRegistry.SetPluginVisibility(plugins.Manager.ToolVisibility)`（与 agent/dispatcher 同源回调，tool 包不反向依赖 plugins）。
+      - 验收对照：(a) 越界挂载/委派拒绝且日志可查 ✓（MountForScope 拒绝 + dispatch 回告 + log）；(b) schema 数下降 ✓（默认收窄，挂载后才注入插件工具 schema）；(c) tools_hint 子 Agent 当轮可见 ✓（TestDispatch_ToolsHint 断言子 scope 预挂载）；(d) 全量 `go test ./backend/...` 29 包绿，任务 52/55/56 热插拔 E2E（plugins/server 包内）不退化 ✓。
+
 ## 已完成（已归档到 git 历史）
 
 - **评测体系落地 + 首次基线**（2026-08-14）：`test/eval/`（build tag `eval`）真实 LLM 任务完成率评测——场景 YAML + checkpoint 判分（command/file/regex/tree/llm_judge）+ token/子Agent 指标聚合 + TheAgentCompany 式全量/部分分报告（`test/eval/runs/`）；环境隔离修复：`docker/docker-compose.test.yml` 独立端口（PG 55432/Redis 56380）+ 无固定容器名，fixture 维度对齐 migrations（768）。首基线 12 场景 full pass 91.7%、加权 0.979，详见 `doc/eval/baseline_2026-08-14.md`。后续加固（同日）：fixture 改"共享容器常驻 + 每测试独立 PG database/Redis 逻辑库"（Redis 开 1024 逻辑库），并行包 `go test ./...` 不再互相拆台；`TestFactExtractionFallback` 序列对齐现行后端（verify_kind 校验分层 + 派发后不阻塞）。开放项：verifyloop 场景判分口径修正（自动验证闭环已下线，改测 verify_kind 证据）、EVAL_RUNS=3 可靠性、SWE-bench 20 题切片（Phase 2）。

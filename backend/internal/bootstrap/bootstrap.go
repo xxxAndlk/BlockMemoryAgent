@@ -474,6 +474,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 角色可见性：meta/domain/动态角色按 Manifest.Roles 判定插件工具是否可见（§4.3）。
 	agentSvc.SetPluginVisibility(pluginManager.ToolVisibility)
 	subAgentDispatcher.WithPluginVisibility(pluginManager.ToolVisibility)
+	// 挂载天花板（TODO #52）：tool.Registry 同一回调校验 tool_mount/派发 tools_hint
+	// 是否越界（工具包不反向依赖 plugins，经同一函数值注入）。
+	toolRegistry.SetPluginVisibility(pluginManager.ToolVisibility)
+	// 插件管理工具组（TODO #51 Agent 自安装闭环）：plugin_search/install/enable/disable/list
+	// 经适配器注入 tool.Registry（tool 包不反向依赖 plugins）。
+	toolRegistry.SetPluginManager(plugins.NewToolManagerAdapter(pluginManager))
 
 	// 第十七步：创建 HTTP SessionManager 并注入依赖。
 	sessionMgr := server.NewSessionManager(agentSvc)

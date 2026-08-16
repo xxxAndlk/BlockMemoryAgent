@@ -17,7 +17,7 @@
 meta_agent:
   model_config: &meta_model
     provider: anthropic
-    model: glm-5.2
+    model: glm-5.3
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.3
@@ -92,7 +92,7 @@ meta_agent:
 domain_agent:
   model_config: &domain_model
     provider: anthropic
-    model: glm-5.2
+    model: glm-5.3
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.5

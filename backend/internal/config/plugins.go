@@ -18,6 +18,12 @@ import (
 type PluginsConfig struct {
 	// Plugins 按插件 ID 索引的插件条目。
 	Plugins map[string]PluginConfig `yaml:"plugins"`
+	// RegistrySources 插件目录检索的远程 registry URL 白名单（TODO #51）：
+	// plugin_search/plugin_install 只会查询这些 URL（缺省 MCP 官方 registry）。
+	// 契约：GET 返回 {"servers":[{"server":{name,title,description,version,
+	// remotes:[{type,url}],packages:[{registryType,identifier,transport}]}}]}。
+	// 空 = 使用默认官方端点；置空切片无法表达，用显式配置覆盖默认。
+	RegistrySources []string `yaml:"registry_sources"`
 }
 
 // Enabled 返回插件条目是否启用（缺省 false：安全默认，显式开启）。

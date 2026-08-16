@@ -98,16 +98,23 @@ type Manager struct {
 	logger     *slog.Logger
 	workDir    string
 	mcpFactory MCPFactory
+
+	// installMu 串行化 Install/回滚（持久化 + 实例变更复合操作，TODO #51）。
+	installMu sync.Mutex
+	// searchCache 是 Search 的条目缓存（plugin_install 按 ID 解析安装用，TODO #51）。
+	searchCacheMu sync.Mutex
+	searchCache   map[string]CatalogEntry
 }
 
 // NewManager 创建插件管理器。
 func NewManager(registry *tool.Registry, opts ...Option) *Manager {
 	m := &Manager{
 		registry:     registry,
-		instances:    make(map[string]*instance),
-		builtins:     make(map[string]Plugin),
-		bundleSkills: make(map[string][]*types.Skill),
-		logger:       slog.Default(),
+		instances:     make(map[string]*instance),
+		builtins:      make(map[string]Plugin),
+		bundleSkills:  make(map[string][]*types.Skill),
+		searchCache:   make(map[string]CatalogEntry),
+		logger:        slog.Default(),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -166,6 +173,20 @@ func (m *Manager) loadDesired() (map[string]config.PluginConfig, error) {
 		}
 	}
 
+	// 1.5 plugins.installed.yaml（plugin_install 工具自动写入，TODO #51）：
+	// 仅补 plugins.yaml 未声明的 ID（手工条目优先，installed 是机器写入的补充层）。
+	if m.configDir != "" {
+		installed, err := loadInstalled(m.configDir)
+		if err != nil {
+			m.logger.Warn("plugins.installed.yaml 读取失败", "err", err)
+		} else {
+			for id, pc := range installed.Plugins {
+				if _, ok := desired[id]; !ok {
+					desired[id] = pc
+				}
+			}
+		}
+	}
 	// builtin 插件：程序化注册即装载（enabled 缺省 false，需 yaml 显式开启）。
 	m.mu.RLock()
 	for id := range m.builtins {

@@ -48,6 +48,10 @@ type callSubAgentInput struct {
 	// VerifyKind 校验分层（TODO #43）：auto（默认，按角色/模式自动选）/ executable（L0 证据）/
 	// rubric（L2 交叉模型 judge）/ none。空串按 auto 处理。
 	VerifyKind string `json:"verify_kind"`
+	// ToolsHint 建议工具集（TODO #52 执行项 4）：父 Agent 声明希望子 Agent 使用的工具名列表，
+	// dispatcher 校验 ∩ 子 Agent 角色权限天花板后收窄其插件工具可见集（相当于预挂载）。
+	// 天花板外（插件 roles 白名单不允许）的越界项被忽略并随派发结果回告父 Agent，不放大权限。
+	ToolsHint []string `json:"tools_hint"`
 }
 
 // ModelProviderFactory 是 model.ModelFactory 的子集，
@@ -980,6 +984,9 @@ func (t *callSubAgentTool) Description() string {
 		"琐碎单步任务省略；正确性敏感任务（算法/迁移/重构）用 reflection——执行后自动对照验收标准自检，不达标带反馈重试；" +
 		"多步骤长任务（多文件/多阶段）用 plan_execute——先出步骤计划（TUI 可见）再逐步执行。判断不准时省略，默认 react。\n\n" +
 		"【verify_kind 字段】（可选）校验分层：auto（默认，按角色与执行模式自动选——代码/测试助手自动要求可执行证据、自检模式自动 rubric 评审）/ executable（必须有测试/lint/--check 成功运行的客观证据，否则会反馈重试 1 轮）/ rubric（独立评审模型按验收标准逐条判）/ none（跳过校验）。判断不准时省略，默认 auto。注意：verify_kind 与 mode 是不同字段，勿把 mode 的值填到本字段。\n\n" +
+		"【tools_hint 字段】（可选）建议工具集：子 Agent 需要插件工具（如画图/搜索/浏览器）时，在此声明工具名列表（来自 tool_catalog），" +
+		"dispatcher 校验 ∩ 子 Agent 角色权限天花板后预挂载——子 Agent 当轮即可见对应插件工具，无需自己挂载。" +
+		"天花板外（插件 roles 白名单不允许）的越界项会被忽略并随本调用结果回告，不放大权限。\n\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
@@ -1058,6 +1065,8 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	mode, _ := args["mode"].(string)
 	// verify_kind 可选：校验分层（auto/executable/rubric/none），空串=auto（默认，TODO #43）。
 	verifyKind, _ := args["verify_kind"].(string)
+	// tools_hint 可选：建议工具集（TODO #52）——dispatcher 校验 ∩ 子 Agent 天花板后预挂载。
+	toolsHint := d.toolsHintArg(args)
 
 	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode, verifyKind)
 	if msg != "" {
@@ -1072,7 +1081,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
-	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind)
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint)
 	if errRes != nil {
 		errRes.Tool = "call_sub_agent"
 		return errRes
@@ -1089,10 +1098,11 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 // 成功返回 subAgentID；失败返回 *tool.Result（Error 非空，Tool 字段由调用方按工具名覆盖）。
 // mode 为派发执行模式（react/reflection/plan_execute，空串=react，TODO #29），
 // verifyKind 为校验分层（auto/executable/rubric/none，空串=auto，TODO #43），
+// toolsHint 为建议工具集（TODO #52，可空）：校验 ∩ 子 Agent 角色天花板后预挂载到子 scope，
 // 均穿透到子 Agent 构造时的引擎选择与完成后校验。
 // 前置：调用方已完成参数校验（validateDispatchArgs）与 spec 强制校验。
 // 供 call_sub_agent（单个）与 call_sub_agents（批量同波）两个工具复用。
-func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string) (string, *tool.Result) {
+func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint []string) (string, *tool.Result) {
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
 	if parentID == "" {
@@ -1141,6 +1151,16 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 
 	// 生成全局唯一的子 Agent ID，格式为 "父ID/角色ID-序号"。
 	subAgentID := fmt.Sprintf("%s/%s-%d", parentID, roleID, d.seq.Add(1))
+
+	// tools_hint 预挂载（TODO #52 执行项 4）：父 Agent 建议的工具集 ∩ 子 Agent 角色天花板后
+	// 挂载进子 scope，子 Agent 构造的 adapter 据此收窄插件工具可见集——
+	// 实现"派 UI 任务时提示用画图插件"而不放权。越界项拒绝并回告父 Agent（日志可查）。
+	var hintRejected []string
+	if len(toolsHint) > 0 && d.tools != nil {
+		if _, rejected := d.tools.MountForScope(subAgentID, roleDef.ID, toolsHint); len(rejected) > 0 {
+			hintRejected = rejected
+		}
+	}
 
 	// 在派发前递增父 Agent 的未决子 Agent 计数，供终结保护消费。
 	d.trackChildStart(parentID)
@@ -1207,7 +1227,32 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	}()
 
 	// 返回子 Agent ID 作为句柄，父 Agent 可用该 ID 查询或接收后续通知。
+	if len(hintRejected) > 0 {
+		// tools_hint 越界项回告父 Agent（TODO #52 验收 (a)：越界委派被拒绝且可查）。
+		return subAgentID + "。tools_hint 越界忽略（子 Agent 角色权限天花板外）: " + strings.Join(hintRejected, "; "), nil
+	}
 	return subAgentID, nil
+}
+
+// toolsHintArg 从 args 提取 tools_hint 参数（兼容 []string / []any）。
+func (d *Dispatcher) toolsHintArg(args map[string]any) []string {
+	raw, ok := args["tools_hint"]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // callSubAgentsTool 实现 call_sub_agents 工具：同一波多个子任务一次性原子并行派出。
@@ -1230,9 +1275,10 @@ func (t *callSubAgentsTool) Description() string {
 		"多文件创建/多领域拆分任务的**全部建设领域必须用它一次派出**，禁止按依赖关系分波串行——" +
 		"共享契约已钉死集成点，领域产物互为独立文件，后写的不需要等先写的落盘" +
 		"（v6 实证：4 个建设领域分 2 波，第二波晚启动 24 分钟，交付死线直接判负）。\n" +
-		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?, verify_kind?}，" +
+		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?, verify_kind?, tools_hint?}，" +
 		fmt.Sprintf("字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=%d 字；", t.dispatcher.taskRuneSoftLimit) +
-		"mode 可选 react/reflection/plan_execute，省略=react；verify_kind 可选 auto/executable/rubric/none，省略=auto）。\n" +
+		"mode 可选 react/reflection/plan_execute，省略=react；verify_kind 可选 auto/executable/rubric/none，省略=auto；" +
+		"tools_hint 可选：建议子 Agent 使用的插件工具名列表，校验 ∩ 子 Agent 权限天花板后预挂载，越界项忽略并回告）。\n" +
 		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
 		"否则返回 spec missing/stale 错误（stale 会列出已变更文件路径）。逐项返回派出结果：某项失败不影响其他项。"
 }
@@ -1252,7 +1298,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 	}
 
 	// 逐项校验参数；轻微超限（2000-2600 runes）软着陆放行并收集警告（TODO #38-3）。
-	type batchItem struct{ roleID, domain, task, responsibility, mode, verifyKind string }
+	type batchItem struct{ roleID, domain, task, responsibility, mode, verifyKind string; toolsHint []string }
 	items := make([]batchItem, 0, len(raw))
 	var batchWarnings []string
 	for i, r := range raw {
@@ -1267,6 +1313,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.responsibility, _ = m["responsibility"].(string)
 		it.mode, _ = m["mode"].(string)
 		it.verifyKind, _ = m["verify_kind"].(string)
+		it.toolsHint = d.toolsHintArg(m) // TODO #52：建议工具集（∩ 子 Agent 天花板后预挂载）
 		if msg, warning := t.dispatcher.validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode, it.verifyKind); msg != "" {
 			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
 		} else if warning != "" {
@@ -1285,7 +1332,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 
 	var okIDs, errs []string
 	for _, it := range items {
-		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind)
+		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint)
 		if errRes != nil {
 			errs = append(errs, fmt.Sprintf("%s(%s): %s", it.roleID, it.domain, errRes.Error))
 			continue
@@ -1538,7 +1585,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			mem = uptake
 		}
 	}
-	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
+	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, subAgentID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
@@ -1889,7 +1936,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		mem = newSiblingUptakePipeline(mem, bb, sid, pausedNode.ParentID, pausedNode.Domain, pausedNodeID)
 	}
 	// 不注入编排者人格（理由同 runSubAgentOnce：身份混淆实证）。
-	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
+	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, pausedNodeID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor("domain")).

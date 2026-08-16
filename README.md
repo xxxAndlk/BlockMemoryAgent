@@ -26,7 +26,7 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 - **共享记忆**：`WriteSharedMemory` 工具让主 Agent 把关键上下文（文件路径/行号/函数签名/验收标准）写入 `sharedKV`，子 Agent 自动读取，避免重读全文件；`task` 入参 2000 runes 上限强制规格走共享记忆
 - **验证闭环编排器**：`verifyloop` 原生驱动"产出 -> 自测 -> 修正 -> 上级统一测试"状态机，`Verifier`/`Fixer`/`Reporter` 三接口解耦，`PlanConfirmVerifier` 支持"测试方向不明确 -> 列方案 -> 产出方确认 -> 符合才自测"前置
 - **角色工具白名单**：`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集；MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet` 防越位，DomainAgent 开放完整权限承担上下文采集 + 任务拆分 + 派发执行
-- **热插拔插件系统**（[设计文档](doc/设计文档_插件范式.md)）：MCP 外部插件（stdio 子进程 / streamable HTTP）与 Claude/Codex 插件包（`.mcp.json` + `SKILL.md`）统一挂进 `tool.Registry`，运行中 enable/disable 下一轮迭代即生效；`web_search`（默认开，需 uvx）与 `computer_use`（默认关，全部工具接审批守卫链）两个初始插件；管理 API：`/api/plugins`（list/get/enable/disable/reload），配置 `config/plugins.yaml` + `config/plugins.d/`
+- **热插拔插件系统**（[设计文档](doc/设计文档_插件范式.md)）：MCP 外部插件（stdio 子进程 / streamable HTTP / docker 容器）、Claude/Codex 插件包（`.mcp.json` + `SKILL.md`）与 Docker 长驻服务统一挂进 `tool.Registry` 或生命周期管理，运行中 enable/disable 下一轮迭代即生效；三个初始插件全部容器化：`web_search`（firecrawl 自托管栈，默认开）、`computer_use`（Xvfb 虚拟桌面，默认关，全部工具接审批守卫链）、`open_design`（画图设计台 service 插件，默认关）；管理 API：`/api/plugins`（list/get/enable/disable/reload），配置 `config/plugins.yaml` + `config/plugins.d/`，部署见下文「插件（Docker 部署）」
 - **14 个内置工具**：文件/命令（ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles）、HTTP（HTTPGet/HTTPPost）、Git（GitDiff/GitStatus/GitLog/GitBlame）、共享内存（WriteSharedMemory）、Agent 通信（call_sub_agent/send_message），统一经沙箱守卫
 - **两段事件流记忆**：`Write` 追加事件（tool_call / call_sub_agent / sub_agent_summary / answer），`Assemble` 在 LLM 调用前注入最近 N 条作为上下文；无压缩、无 RAG
 - **会话持久化，默认全新启动**：会话历史（goal/summary/工具结果）与事件流写入 PostgreSQL；每次启动默认是全新会话列表，`agent.restore_sessions: true` 时才恢复最近 50 个会话到内存
@@ -105,6 +105,29 @@ go run ./backend/cmd/memory-console   # 记忆检查控制台（SSE 订阅）
 > **关于数据库迁移**：`bootstrap.Build` 启动时会幂等执行 `Ensure*Schema` 自动建表（session_history 含 meta_memory 列、session_events、session_logs、dag_jobs、001 记忆/知识表），全新数据库可直接启动；仍建议按顺序应用 `migrations/*.sql` 以保持索引等细节一致。`004_memory_write_failures.sql` 为历史遗留死信表，其 step_count 列与索引已在 001 中。
 
 flags：`-config config/config.yaml -roles config/roles.yaml -env .env -soul config/soul.md -skills config/skills.yaml`
+
+### 插件（Docker 部署）
+
+三个初始插件全部容器化运行，新机器首次部署：
+
+```bash
+make plugins-up      # 联网搜索数据面：firecrawl 自托管栈（api :3002，免 API Key）
+make plugins-build   # 构建/拉取三个插件镜像：
+                     #   bma/firecrawl-mcp:local（web_search，本地构建）
+                     #   bma/computer-use-mcp:local（computer_use，本地构建，含 Xvfb/noVNC 虚拟桌面）
+                     #   ghcr.io/nexu-io/od:latest（open_design 画图台，直接拉取）
+```
+
+启用方式（`config/plugins.yaml`）：
+
+- **web_search**：默认 `enabled: true`，后端启动即自动起容器可用（依赖 firecrawl 栈已起）。
+- **computer_use** / **open_design**：默认 `enabled: false`，改配置为 `true` 随启动自动起，或运行时热启用 `POST /api/plugins/computer_use/enable`、`POST /api/plugins/open_design/enable`。open_design 需先在 `.env` 填 `OD_API_TOKEN`。
+
+入口与验证：
+
+- `GET /api/plugins` 查看插件状态；open_design UI：`http://localhost:7456`（Basic 认证 `open-design` / `OD_API_TOKEN`）；computer_use 虚拟桌面观察口：`http://localhost:6081`（noVNC，操作发生在容器内 Xvfb 虚拟桌面，不控制宿主机）。
+- 同机多个 BMA 实例（如 tui.exe + headless 后端）不要同时 enable 带端口映射的同一插件（7456/6081 宿主端口冲突）。
+- `docker-compose.firecrawl.yml` 中 redis/rabbitmq 走 `docker.m.daocloud.io` 加速前缀（Docker Hub 不可达环境的 workaround）；网络正常时可去掉前缀。
 
 ---
 

@@ -5,6 +5,26 @@
 #   - enabled 缺省 false（安全默认，显式开启）；enabled: true 的插件随后端启动自动启用。
 #   - 密钥只走 ${VAR} / ${VAR:default} 环境变量插值，不落盘明文。
 #   - 外部插件包目录丢进同目录 plugins.d/，经 /api/plugins/reload 扫描装载（不引入 fsnotify）。
+#   - 动态安装（plugin_install 工具，TODO #51）写入同目录 plugins.installed.yaml，
+#     原子写且不覆盖本文件；本文件手工条目优先于 installed 条目。
+#
+# roles 语义（TODO #52 权限天花板，仅人改配置、Agent 不可改）：
+#   - 插件 settings.roles 白名单 = 该插件工具可见的 Agent 角色集合（权限声明）；
+#     缺省 ["*"] 全角色可见，如需限定改为 ["meta", "domain"] 等显式列表。
+#   - destructive 插件（工具全进审批链，如 computer_use）必须显式声明 roles，
+#     禁止缺省/["*"] 全角色授权——plugin_install 对破坏性插件强制此校验（拒绝安装）。
+#   - 分配关系只由配置文件声明：Agent 只能在天花板内 tool_mount/tools_hint 选用工具，
+#     不能修改分配本身（越界挂载/委派被拒绝）。
+#   - 运行时：Agent 经 tool_catalog 发现天花板内工具，tool_mount 挂载后下一轮可见
+#     （TODO #52 按需挂载，替代全量 schema 注入）。
+#
+# registry_sources：plugin_search/plugin_install 可查询的远程插件目录 URL 白名单
+#（TODO #51 安全门：只查白名单来源，防 Agent 拉任意来源）。契约：GET 返回
+# {"servers":[{"server":{name,title,description,version,remotes:[{type,url}],
+# packages:[{registryType,identifier,transport}]}}]}（MCP 官方 registry 格式）。
+# 空 = 缺省官方端点 https://registry.modelcontextprotocol.io/v0/servers。
+registry_sources:
+  - https://registry.modelcontextprotocol.io/v0/servers
 plugins:
   # 联网搜索：firecrawl 自托管栈（数据不出本机，免 API key）。
   # 链路：后端 --(docker stdio MCP)--> bma/firecrawl-mcp 容器
@@ -35,7 +55,7 @@ plugins:
       # env:
       #   FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY}
       # 可见角色：缺省 ["*"] 全角色；如需限定可改为 ["meta", "domain"]
-      # roles: ["*"]
+      roles: ["meta"]
 
   # Computer Use：高危插件，默认关闭，显式开启（设计文档 §6.2/§6.4）。
   # docker transport：enable 时后端拉起 bma/computer-use-mcp 沙箱容器
@@ -43,14 +63,17 @@ plugins:
   # 前置：docker build -t bma/computer-use-mcp:local docker/computer-use
   # noVNC 观察口：http://localhost:6081（经 ports 映射）。
   # destructive: true 使全部工具接入审批守卫链（敏感操作二次确认）。
+  # TODO #52：destructive 插件必须显式授权角色（权限天花板红线）——
+  # 此处 roles: ["meta"] 声明仅 MetaAgent 可见，禁用全角色默认值。
   computer_use:
     kind: mcp
-    enabled: false
+    enabled: true
     settings:
       transport: docker
       image: bma/computer-use-mcp:local
       ports: ["6081:6081"]
       destructive: true
+      roles: ["meta"]
       # 宿主机直起（备选，AI 直接操作真机，仅调试用）：
       # transport: stdio
       # command: npx
@@ -65,7 +88,7 @@ plugins:
   # 注意：与 computer_use 的 6081 同理，同机两个 BMA 实例不能同时 enable（7456 端口冲突）。
   open_design:
     kind: service
-    enabled: false
+    enabled: true
     settings:
       image: ghcr.io/nexu-io/od:latest
       ports: ["127.0.0.1:7456:7456"]

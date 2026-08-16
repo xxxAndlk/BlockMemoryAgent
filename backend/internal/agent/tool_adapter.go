@@ -31,6 +31,9 @@ type toolRegistryAdapter struct {
 	// roleID 是持有该适配器的 Agent 角色 ID（"meta"/"domain"/动态角色），
 	// 供 pluginVisibility 判定插件工具可见性。
 	roleID string
+	// scope 是持有该适配器的 Agent 作用域（agentID）：MetaAgent=sessionID、
+	// 子 Agent=subAgentID。供 Schema() 读取本 Agent 已挂载的插件工具集（TODO #52）。
+	scope string
 	// pluginVisibility 热插拔插件动态可见集回调（设计文档 §4.3）：
 	// fn(roleID, toolName) -> (owned, visible)；nil 时插件工具不做角色过滤。
 	pluginVisibility ToolVisibilityFunc
@@ -76,15 +79,18 @@ func NewToolRegistryAdapterWithFilter(r *tool.Registry, allowed []string) ToolRe
 
 // NewToolRegistryAdapterForRole 构造带角色上下文的适配器（热插拔插件可见性）。
 // allowed 为 nil 或空切片时等价于不过滤；roleID 是持有者的角色 ID；
+// scope 是持有者的作用域（agentID，供读取本 Agent 已挂载插件工具集）；
 // visibility 为 nil 时等价于 NewToolRegistryAdapterWithFilter（白名单语义不变）。
-// Schema() 过滤逻辑 = 「静态白名单 ∪ 插件动态可见集」（设计文档 §4.3）：
-//   - 白名单非空：白名单命中直接暴露；白名单外仅插件工具（owned=true）
-//     且角色可见（visible=true）才暴露；
-//   - 白名单为空：插件工具按可见性隐藏，其余工具全部暴露。
+// Schema() 过滤逻辑 = 「静态白名单 ∪（插件动态可见集 ∩ 本 Agent 已挂载集）」（TODO #52）：
+//   - 白名单非空：白名单命中直接暴露；白名单外仅插件工具（owned=true）、角色可见
+//     （visible=true）**且已挂载**（tool_mount / 派发 tools_hint / plugin_install 自动挂载）
+//     才暴露——默认收窄为角色基础工具，插件工具按需挂载，缓解全量 schema 注入的上下文膨胀；
+//   - 白名单为空：插件工具按（可见性 ∩ 已挂载）隐藏，其余工具全部暴露。
 //
 // 参数:
 //
 //	r          - 领域层的工具注册表。
+//	scope     - 持有该适配器的 Agent 作用域（agentID）。
 //	allowed    - 允许暴露给 LLM 的工具名白名单。
 //	roleID     - 持有该适配器的 Agent 角色 ID。
 //	visibility - 插件工具可见性回调 fn(roleID, toolName) -> (owned, visible)；nil 表示不过滤插件工具。
@@ -92,18 +98,18 @@ func NewToolRegistryAdapterWithFilter(r *tool.Registry, allowed []string) ToolRe
 // 返回值:
 //
 //	ToolRegistry - 带过滤的适配器对象。
-func NewToolRegistryAdapterForRole(r *tool.Registry, allowed []string, roleID string, visibility ToolVisibilityFunc) ToolRegistry {
+func NewToolRegistryAdapterForRole(r *tool.Registry, scope string, allowed []string, roleID string, visibility ToolVisibilityFunc) ToolRegistry {
 	m := make(map[string]bool, len(allowed))
 	for _, name := range allowed {
 		if name != "" {
 			m[name] = true
 		}
 	}
-	return &toolRegistryAdapter{inner: r, allowed: m, roleID: roleID, pluginVisibility: visibility}
+	return &toolRegistryAdapter{inner: r, scope: scope, allowed: m, roleID: roleID, pluginVisibility: visibility}
 }
 
 // Schema 返回当前注册表下所有工具的 JSON Schema 描述。
-// 过滤语义：静态白名单（allowed）∪ 插件动态可见集（pluginVisibility，按角色判定）。
+// 过滤语义：静态白名单（allowed）∪（插件动态可见集 ∩ 本 Agent 已挂载集）（TODO #52）。
 // 白名单为空且无可见性回调时原样返回全部工具（向后兼容）。
 // 返回值:
 //
@@ -114,7 +120,9 @@ func (a *toolRegistryAdapter) Schema() []tools.Tool {
 	if len(a.allowed) == 0 && a.pluginVisibility == nil {
 		return all
 	}
-	// 按白名单 + 插件可见性过滤；保持原注册顺序，便于工具列表稳定。
+	// 已挂载插件工具集（tool_mount / tools_hint / plugin_install 自动挂载，TODO #52）。
+	mounted := a.inner.MountedTools(a.scope)
+	// 按白名单 + 插件可见性∩挂载过滤；保持原注册顺序，便于工具列表稳定。
 	out := make([]tools.Tool, 0, len(all))
 	for _, t := range all {
 		owned, visible := false, true
@@ -126,12 +134,12 @@ func (a *toolRegistryAdapter) Schema() []tools.Tool {
 				out = append(out, t)
 				continue
 			}
-			// 白名单未命中：仅插件工具可经动态可见集加入（非插件工具不越权）。
-			if !owned || !visible {
+			// 白名单未命中：仅插件工具可经（可见性 ∩ 已挂载）加入（非插件工具不越权）。
+			if !owned || !visible || !mounted[t.Name()] {
 				continue
 			}
-		} else if owned && !visible {
-			// 无白名单：插件工具按角色可见性隐藏；非插件工具全部保留。
+		} else if owned && (!visible || !mounted[t.Name()]) {
+			// 无白名单：插件工具按（可见性 ∩ 已挂载）隐藏；非插件工具全部保留。
 			continue
 		}
 		out = append(out, t)
