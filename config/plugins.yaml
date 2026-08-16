@@ -1,0 +1,57 @@
+# 插件配置（设计文档《插件系统设计 v2》§5）
+#
+# 约定：
+#   - 与 config.yaml 同目录，启动时自动装载；改动后经 POST /api/plugins/reload 生效。
+#   - enabled 缺省 false（安全默认，显式开启）；enabled: true 的插件随后端启动自动启用。
+#   - 密钥只走 ${VAR} / ${VAR:default} 环境变量插值，不落盘明文。
+#   - 外部插件包目录丢进同目录 plugins.d/，经 /api/plugins/reload 扫描装载（不引入 fsnotify）。
+plugins:
+  # 联网搜索：firecrawl 自托管栈（数据不出本机，免 API key）。
+  # 链路：后端 --(docker stdio MCP)--> bma/firecrawl-mcp 容器
+  #       --(REST http://host.docker.internal:3002)--> 本地 firecrawl 栈。
+  # 前置：
+  #   1) docker compose -f docker/docker-compose.firecrawl.yml up -d   （自托管栈）
+  #   2) docker build -t bma/firecrawl-mcp:local docker/firecrawl-mcp  （MCP 封装镜像）
+  # docker transport 由后端直接拉起/回收容器（bma-plugin-web_search），
+  # 经 /api/plugins/enable|disable|reload 热插拔。
+  web_search:
+    kind: mcp
+    enabled: true
+    settings:
+      transport: docker
+      image: bma/firecrawl-mcp:local
+      env:
+        FIRECRAWL_API_URL: http://host.docker.internal:3002
+        # 自托管栈不校验 key（USE_DB_AUTHENTICATION=false），给个非空默认值即可；
+        # 若改回云端 API，则在 .env 配 FIRECRAWL_API_KEY=fc-xxx。
+        FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:self-hosted}
+      # 备选 1（云端免 key 兜底，限速，仅 search/scrape/parse）：
+      # transport: http
+      # url: https://mcp.firecrawl.dev/v2/mcp
+      # 备选 2（云端 API + key，全工具）：
+      # transport: stdio
+      # command: npx
+      # args: ["-y", "firecrawl-mcp"]
+      # env:
+      #   FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY}
+      # 可见角色：缺省 ["*"] 全角色；如需限定可改为 ["meta", "domain"]
+      # roles: ["*"]
+
+  # Computer Use：高危插件，默认关闭，显式开启（设计文档 §6.2/§6.4）。
+  # docker transport：enable 时后端拉起 bma/computer-use-mcp 沙箱容器
+  #（Xvfb 虚拟桌面，AI 不直接操作真机；stdio MCP 桥接），disable 即回收。
+  # 前置：docker build -t bma/computer-use-mcp:local docker/computer-use
+  # noVNC 观察口：http://localhost:6081（经 ports 映射）。
+  # destructive: true 使全部工具接入审批守卫链（敏感操作二次确认）。
+  computer_use:
+    kind: mcp
+    enabled: false
+    settings:
+      transport: docker
+      image: bma/computer-use-mcp:local
+      ports: ["6081:6081"]
+      destructive: true
+      # 宿主机直起（备选，AI 直接操作真机，仅调试用）：
+      # transport: stdio
+      # command: npx
+      # args: ["-y", "@zavora-ai/computer-use-mcp"]

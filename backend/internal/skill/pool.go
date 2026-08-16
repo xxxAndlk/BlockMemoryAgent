@@ -118,6 +118,15 @@ func (p *Pool) Get(id string) *types.Skill {
 	return p.skills[id]
 }
 
+// Remove 摘除一个 Skill；不存在时静默（幂等）。
+// 供 bundle 插件包 reload 时清理消失目录的 skill（设计文档 §3.3）。
+// 并发安全：加写锁。
+func (p *Pool) Remove(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.skills, id)
+}
+
 // All 返回当前所有 Skill（拷贝，避免外部并发修改）
 //
 // 返回：新建切片，包含池中全部 Skill 指针（指针共享，调用方不应修改 Skill 字段）。

@@ -1,0 +1,110 @@
+name: bma-firecrawl
+
+# firecrawl 自托管栈（设计文档 §6.1 部署形态）：
+# 数据抓取/渲染全在本机容器内完成，不依赖 firecrawl 云端、无需 API key
+#（USE_DB_AUTHENTICATION=false）。后端插件链路：
+#   后端 --(docker stdio MCP)--> bma/firecrawl-mcp 容器
+#        --(REST http://host.docker.internal:3002)--> 本栈 api 服务
+#
+# 启动：docker compose -f docker/docker-compose.firecrawl.yml up -d
+# 停止：docker compose -f docker/docker-compose.firecrawl.yml down
+#
+# 镜像全部使用官方预构建（ghcr.io/firecrawl/*），不做本地编译。
+# 与 docker-compose.yml（postgres/redis/computer）完全隔离：独立 project 与
+# 独立网络，只向宿主发布 3002 一个端口。
+
+x-common-env: &common-env
+  REDIS_URL: redis://redis:6379
+  REDIS_RATE_LIMIT_URL: redis://redis:6379
+  PLAYWRIGHT_MICROSERVICE_URL: http://playwright-service:3000/scrape
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_DB: postgres
+  POSTGRES_HOST: nuq-postgres
+  POSTGRES_PORT: "5432"
+  USE_DB_AUTHENTICATION: "false"
+  NUM_WORKERS_PER_QUEUE: "8"
+  NUQ_RABBITMQ_URL: amqp://rabbitmq:5672
+  ENV: local
+
+services:
+  api:
+    image: ghcr.io/firecrawl/firecrawl:latest
+    container_name: bma-firecrawl-api
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      HOST: "0.0.0.0"
+      PORT: "3002"
+    command: node dist/src/harness.js --start-docker
+    depends_on:
+      redis:
+        condition: service_started
+      playwright-service:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      nuq-postgres:
+        condition: service_started
+    ports:
+      - "3002:3002"
+    networks:
+      - firecrawl-backend
+    healthcheck:
+      # node 20 全局 fetch；根路径返回 2xx/4xx 都算进程存活
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3002/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  playwright-service:
+    image: ghcr.io/firecrawl/playwright-service:latest
+    container_name: bma-firecrawl-playwright
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      BLOCK_MEDIA: "true"
+      MAX_CONCURRENT_PAGES: "5"
+    networks:
+      - firecrawl-backend
+    cpus: 2.0
+    mem_limit: 4G
+
+  redis:
+    # daocloud 镜像加速前缀（海外环境可改回 redis:7-alpine）
+    image: docker.m.daocloud.io/library/redis:7-alpine
+    container_name: bma-firecrawl-redis
+    restart: unless-stopped
+    command: redis-server --bind 0.0.0.0
+    networks:
+      - firecrawl-backend
+
+  rabbitmq:
+    # daocloud 镜像加速前缀（海外环境可改回 rabbitmq:3-alpine）
+    image: docker.m.daocloud.io/library/rabbitmq:3-alpine
+    container_name: bma-firecrawl-rabbitmq
+    restart: unless-stopped
+    networks:
+      - firecrawl-backend
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  nuq-postgres:
+    image: ghcr.io/firecrawl/nuq-postgres:latest
+    container_name: bma-firecrawl-nuq-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    networks:
+      - firecrawl-backend
+
+networks:
+  firecrawl-backend:
+    driver: bridge

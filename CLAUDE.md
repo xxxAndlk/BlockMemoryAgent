@@ -22,6 +22,7 @@ See `Makefile` (`make help` lists all targets). Key targets: `make run` (build w
 ## Documentation Map
 
 - **`doc/项目说明.md`** - authoritative implementation guide (directory layout, code reading order, key design decisions, architecture). Defer to this on conflict.
+- **`doc/设计文档_插件范式.md`** - plugin system design (hot-pluggable MCP/bundle plugins), implemented per `backend/internal/plugins/`.
 - **`doc/TODO.md`** - progress tracking and open items.
 - **`doc/设计文档_v3.md`** - vision doc, top carries status note acknowledging divergence from code.
 - **`doc/扩展设计_Agent工作流平台.md`** - future-vision doc (workflow platform), not current code.
@@ -30,7 +31,7 @@ See `Makefile` (`make help` lists all targets). Key targets: `make run` (build w
 
 ## Package Layering (quick reference)
 
-Bottom up: `pkg/*` -> infrastructure (`store`/`memory`/`model`/`logger`/`embed`/`config`/...) -> runtime components (`dag`/`skill`/`soul`/`watchdog`/`board`/`mailbox`/`cmdqueue`) -> `runtime` aggregator -> `domain/*` (`tool`/`role`/`memory`/`subagent`/`verifyloop`/`assembly`) -> `agent` facade -> `bootstrap` -> adapters (`server`/`tui`/`testserver`/`cmd/*`/`main.go`/`test/*`).
+Bottom up: `pkg/*` -> infrastructure (`store`/`memory`/`model`/`logger`/`embed`/`config`/...) -> runtime components (`dag`/`skill`/`soul`/`watchdog`/`board`/`mailbox`/`cmdqueue`) -> `runtime` aggregator -> `domain/*` (`tool`/`role`/`memory`/`subagent`/`verifyloop`/`assembly`) -> `plugins/*` (hot-pluggable plugin system: `plugins` manager + `plugins/mcpbridge` + `plugins/bundle`) -> `agent` facade -> `bootstrap` -> adapters (`server`/`tui`/`testserver`/`cmd/*`/`main.go`/`test/*`).
 
 Key rules: `pkg/*` must not import `internal/*`; infrastructure must not import `domain/*`/`runtime`/`server`/`tui`/`agent`; `domain/*` must not import `server`/`tui`/`agent`; adapters consume via `agent.Agent` + `bootstrap`. Full rules in `docs/superpowers/plans/dependency-rules.md`.
 
@@ -43,3 +44,12 @@ Key rules: `pkg/*` must not import `internal/*`; infrastructure must not import 
 ## History
 
 Codebase migrated from CloudWeGo Eino to go-kratos Blades (pre-v3 Eino docs no longer in tree).
+
+## Plugin System
+
+Hot-pluggable plugins (design: `doc/设计文档_插件范式.md`): plugins register into the shared `domain/tool.Registry`; ReAct reads `Schema()` fresh every iteration, so enable/disable takes effect next iteration. Plugin manager lives in `backend/internal/plugins/` (manager + `mcpbridge/` + `bundle/`).
+
+- Config: `config/plugins.yaml` (alongside `config.yaml`); external plugin packages go in `config/plugins.d/`. Manage via API: `GET/POST /api/plugins[/{id}][/enable|/disable]`, `POST /api/plugins/reload`. All endpoints pass `AuthMiddleware`.
+- Initial plugins: `web_search` (mcp, stdio `uvx free-search-mcp`, enabled by default; requires `uv/uvx` — missing binary degrades gracefully with a logged reason) and `computer_use` (mcp, stdio `npx computer-use-mcp`, **disabled by default**; all tools marked `Destructive()` → approval guard chain). `computer` sandbox service (Xvfb + noVNC) available in `docker/docker-compose.yml` behind the `computer` profile.
+- Role visibility: plugin `settings.roles` (default `["*"]`) restricts which roles see plugin tools; adapters filter as static whitelist ∪ dynamic plugin visibility.
+- Tests: `backend/internal/plugins/*_test.go`, `mcpbridge/bridge_test.go` (spawns a mock MCP server child process), `server/plugins_test.go` (API loop). `go test -race` needs a C compiler (not available in this env).

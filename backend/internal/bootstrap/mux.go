@@ -78,6 +78,7 @@ func NewDefaultMux(app *App) *http.ServeMux {
 	apiHandler.SetStores(app.Postgres, app.Redis) // 持久化与缓存存储
 	apiHandler.SetRoleConfig(app.RoleConfig)      // 角色配置
 	apiHandler.SetModelFactory(app.ModelFactory)  // 模型工厂
+	apiHandler.SetPluginManager(app.Plugins)      // 插件管理器（热插拔插件管理 API）
 
 	// 注册全局/系统级端点。
 	mux.HandleFunc("/api/health", apiHandler.HealthHandler)                   // 健康检查：公开访问
@@ -108,6 +109,13 @@ func NewDefaultMux(app *App) *http.ServeMux {
 	mux.HandleFunc("/api/files/content", wrap(apiHandler.FileContentHandler))      // 文件内容读取
 	mux.HandleFunc("/api/profile", wrap(apiHandler.ProfileHandler))     // 用户画像查看（TODO #28）
 	mux.HandleFunc("PUT /api/profile", wrap(apiHandler.SaveProfileHandler)) // 用户画像编辑
+
+	// 插件管理 API（设计文档 §5）：全部经 AuthMiddleware。
+	mux.HandleFunc("/api/plugins", wrap(apiHandler.ListPluginsHandler))            // 插件列表
+	mux.HandleFunc("/api/plugins/{id}", wrap(apiHandler.GetPluginHandler))         // 插件详情
+	mux.HandleFunc("/api/plugins/{id}/enable", wrap(apiHandler.EnablePluginHandler))  // 热启用
+	mux.HandleFunc("/api/plugins/{id}/disable", wrap(apiHandler.DisablePluginHandler)) // 热停用
+	mux.HandleFunc("/api/plugins/reload", wrap(apiHandler.ReloadPluginsHandler))   // 重读配置 + 重扫 plugins.d/
 
 	// 返回装配完成的路由复用器。
 	return mux

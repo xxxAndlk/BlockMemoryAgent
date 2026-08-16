@@ -26,6 +26,7 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 - **共享记忆**：`WriteSharedMemory` 工具让主 Agent 把关键上下文（文件路径/行号/函数签名/验收标准）写入 `sharedKV`，子 Agent 自动读取，避免重读全文件；`task` 入参 2000 runes 上限强制规格走共享记忆
 - **验证闭环编排器**：`verifyloop` 原生驱动"产出 -> 自测 -> 修正 -> 上级统一测试"状态机，`Verifier`/`Fixer`/`Reporter` 三接口解耦，`PlanConfirmVerifier` 支持"测试方向不明确 -> 列方案 -> 产出方确认 -> 符合才自测"前置
 - **角色工具白名单**：`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集；MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet` 防越位，DomainAgent 开放完整权限承担上下文采集 + 任务拆分 + 派发执行
+- **热插拔插件系统**（[设计文档](doc/设计文档_插件范式.md)）：MCP 外部插件（stdio 子进程 / streamable HTTP）与 Claude/Codex 插件包（`.mcp.json` + `SKILL.md`）统一挂进 `tool.Registry`，运行中 enable/disable 下一轮迭代即生效；`web_search`（默认开，需 uvx）与 `computer_use`（默认关，全部工具接审批守卫链）两个初始插件；管理 API：`/api/plugins`（list/get/enable/disable/reload），配置 `config/plugins.yaml` + `config/plugins.d/`
 - **14 个内置工具**：文件/命令（ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles）、HTTP（HTTPGet/HTTPPost）、Git（GitDiff/GitStatus/GitLog/GitBlame）、共享内存（WriteSharedMemory）、Agent 通信（call_sub_agent/send_message），统一经沙箱守卫
 - **两段事件流记忆**：`Write` 追加事件（tool_call / call_sub_agent / sub_agent_summary / answer），`Assemble` 在 LLM 调用前注入最近 N 条作为上下文；无压缩、无 RAG
 - **会话持久化，默认全新启动**：会话历史（goal/summary/工具结果）与事件流写入 PostgreSQL；每次启动默认是全新会话列表，`agent.restore_sessions: true` 时才恢复最近 50 个会话到内存

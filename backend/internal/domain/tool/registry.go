@@ -3,6 +3,7 @@ package tool
 // 导入所需标准库与项目内部包。
 import (
 	"context"       // context 用于传递上下文与取消信号
+	"encoding/json" // json 用于动态工具兜底的入参反序列化
 	"fmt"           // fmt 用于格式化错误信息
 	"log"           // log 用于记录拦截/失败等不影响主流程的可观测事件
 	"path/filepath" // filepath 用于规范化文件路径
@@ -12,6 +13,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/config"  // config 包提供 Agent 阈值配置
 	"github.com/blockmemory/agent/backend/internal/project" // project 包提供 DomainClassifier 接口
 	"github.com/go-kratos/blades/tools"                     // blades tools 包提供对外暴露的工具定义
+	"github.com/google/jsonschema-go/jsonschema"           // jsonschema 提供动态工具入参 schema 类型
 )
 
 // maxConsecutiveValidationRejections 定义单个工具连续校验拒绝的最大次数（TODO #32）。
@@ -24,6 +26,18 @@ const maxConsecutiveValidationRejections = 5
 // 调用意味着模型未吸收内容、陷入死循环（实证：代码助手对 config.js 反复 ReadFile 10+ 次）：
 // 第 2 次直返内容并附一句提醒，第 3 次触发 ActionLoopExit 终止 ReAct 循环兜底。
 const maxConsecutiveSameRead = 3
+
+// SchemaSource 是动态注册工具（热插拔插件等）暴露给 LLM 的可选接口：
+// 实现后 Registry.Schema() 兜底按注册顺序将其包装为 blades 工具定义。
+// 未实现该接口的注册工具不会出现在 Schema 中（保持既有行为，如 ask_user 等
+// "注册但按需可见"的内置工具不被意外推到 LLM）。
+// 由 plugins 包的工具适配器实现（MCP 远端工具透传服务端描述与入参 schema）。
+type SchemaSource interface {
+	// Description 返回工具功能描述，注入 LLM function calling schema。
+	Description() string
+	// InputSchema 返回工具入参 JSON Schema；nil 时退化为空对象 schema。
+	InputSchema() *jsonschema.Schema
+}
 
 // Tool 是内置工具的通用接口，所有具体工具都需要实现该接口。
 type Tool interface {
@@ -77,10 +91,16 @@ type Registry struct {
 	progress ProgressCallback
 	// failures 管理每个工具的连续失败计数。
 	failures *failureCounter
+	// mu 保护 tools / aliases / schemaOrder 的并发读写（热插拔插件 enable/disable
+	// 与进行中的 Dispatch / Schema 并存，Register/Unregister 写锁、读取读锁）。
+	mu sync.RWMutex
 	// tools 按标准名称存储已注册的工具实例。
 	tools map[string]Tool
 	// aliases 存储别名到标准名称的映射。
 	aliases map[string]string
+	// schemaOrder 按注册顺序记录工具标准名（去重），供 Schema() 动态工具兜底按稳定顺序暴露；
+	// 热插拔插件工具走此列表，保证每轮 Schema 顺序确定（LLM 工具列表稳定性）。
+	schemaOrder []string
 	// readMu 保护下列 per-scope 读取状态 map，防止并发读写。
 	readMu sync.Mutex
 	// lastReadKey 按 agentID 记录该 scope 最近一次 ReadFile 的调用键
@@ -176,17 +196,67 @@ func (r *Registry) registerDefaults() {
 }
 
 // Register 将工具及其别名注册到注册表中；若传入 nil 则忽略。
+// 并发安全：写锁；同名重复注册覆盖（schemaOrder 不重复追加）。
 func (r *Registry) Register(t Tool) {
 	// 防御性判断，避免空指针导致 panic。
 	if t == nil {
 		return
 	}
+	name := t.Name()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// 首次注册的标准名追加进 schemaOrder，保持注册顺序稳定。
+	if _, ok := r.tools[name]; !ok {
+		r.schemaOrder = append(r.schemaOrder, name)
+	}
 	// 以工具标准名称为键存入 tools map。
-	r.tools[t.Name()] = t
+	r.tools[name] = t
 	// 遍历工具别名，将别名映射到标准名称。
 	for _, alias := range t.Aliases() {
-		r.aliases[alias] = t.Name()
+		r.aliases[alias] = name
 	}
+}
+
+// Unregister 摘除工具及其全部别名（热插拔插件 disable / 断线摘除路径）。
+// 进行中的 Dispatch 已持工具实例引用，摘除后自然完成，不中断；
+// 之后对新调用方返回 "unknown tool"，由 ReAct 循环自愈。
+// 返回是否确有摘除（未知工具名返回 false）。
+// 并发安全：写锁。
+func (r *Registry) Unregister(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.tools[name]; !ok {
+		return false
+	}
+	delete(r.tools, name)
+	// 摘除指向该标准名的全部别名。
+	for alias, canonical := range r.aliases {
+		if canonical == name {
+			delete(r.aliases, alias)
+		}
+	}
+	// 从注册顺序列表中移除，Schema() 不再暴露。
+	for i, n := range r.schemaOrder {
+		if n == name {
+			r.schemaOrder = append(r.schemaOrder[:i], r.schemaOrder[i+1:]...)
+			break
+		}
+	}
+	return true
+}
+
+// toolByName 读锁取出已注册工具实例；未注册返回 nil, false。
+func (r *Registry) toolByName(name string) (Tool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	t, ok := r.tools[name]
+	return t, ok
+}
+
+// Has 判断指定标准名是否已注册（热插拔插件 enable 时预检工具名冲突）。
+func (r *Registry) Has(name string) bool {
+	_, ok := r.toolByName(name)
+	return ok
 }
 
 // WorkDir 返回 Executor 的工作目录，供 ReActAgent 在系统提示词中注入环境信息。
@@ -226,6 +296,14 @@ func (r *Registry) needsApproval(name string, args map[string]any) bool {
 			return true
 		}
 		return prod && commandAffectsFiles(cmd)
+	}
+	// 插件等动态注册工具可自标 Destructive（如 Computer Use 敏感操作）：
+	// 无论目录恒要求用户确认，接入同一守卫链（设计文档 §6.2 安全包装）。
+	// 置于内置工具分支之后：WriteFile/EditFile 的静态 Destructive 仍只走生产边界语义。
+	if t, ok := r.toolByName(name); ok {
+		if d, ok := t.(interface{ Destructive() bool }); ok && d.Destructive() {
+			return true
+		}
 	}
 	return false
 }
@@ -279,6 +357,8 @@ func (r *Registry) SetDomainClassifier(cls project.DomainClassifier) {
 // 同时把 store 写入已注册的 writeSharedMemoryTool 与 writeSpecTool 实例，使其立即可用。
 func (r *Registry) SetSharedMemory(store SharedMemoryStore) {
 	r.sharedMemory = store
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if t, ok := r.tools["WriteSharedMemory"].(*writeSharedMemoryTool); ok {
 		t.store = store
 	}
@@ -290,12 +370,16 @@ func (r *Registry) SetSharedMemory(store SharedMemoryStore) {
 // Dispatch 根据名称调度并执行工具，返回 JSON 序列化后的 Result。
 // name 可以是标准名称或已注册别名；args 为工具参数映射。
 func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]any) (*Result, error) {
+	// 读锁内解析别名与查找工具；锁只保护 map 访问，拿到实例引用后即可释放
+	// （Unregister 摘除的实例仍被本调用持有，可安全执行完成）。
+	r.mu.RLock()
 	// 若 name 是别名，则解析为工具的标准名称。
 	if canonical, ok := r.aliases[name]; ok {
 		name = canonical
 	}
 	// 从注册表中查找工具；未找到则返回错误。
 	t, ok := r.tools[name]
+	r.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unknown tool: %s", name)
 	}
@@ -763,7 +847,7 @@ func (r *Registry) Schema() []tools.Tool {
 	// 暴露 call_sub_agent 工具（若已由 subagent.Dispatcher 安装到注册表）。
 	// 该工具不在 registerDefaults 中注册，而是启动期由调度器按需安装；
 	// 描述文本由工具实现通过 Description() 提供（含当前可调用角色的动态清单）。
-	if ct, ok := r.tools["call_sub_agent"]; ok {
+	if ct, ok := r.toolByName("call_sub_agent"); ok {
 		desc := "将子任务派发给指定角色的子 Agent 异步执行。"
 		if d, ok := ct.(interface{ Description() string }); ok {
 			desc = d.Description()
@@ -778,7 +862,7 @@ func (r *Registry) Schema() []tools.Tool {
 	}
 	// 暴露 send_message 工具（若已由 subagent.Dispatcher 安装到注册表）。
 	// 该工具支持任意 Agent 向另一个 Agent 实例邮箱投递消息，是多 Agent 协作验证闭环的原语。
-	if ct, ok := r.tools["send_message"]; ok {
+	if ct, ok := r.toolByName("send_message"); ok {
 		desc := "向另一个 Agent 实例邮箱投递消息。"
 		if d, ok := ct.(interface{ Description() string }); ok {
 			desc = d.Description()
@@ -803,7 +887,7 @@ func (r *Registry) Schema() []tools.Tool {
 	}
 	// 暴露 create_role 工具（若已由 role.Registry.RegisterTools 安装到注册表）。
 	// 仅 MetaAgent 白名单含此工具，运行时注册动态角色供 call_sub_agent 派发。
-	if ct, ok := r.tools["create_role"]; ok {
+	if ct, ok := r.toolByName("create_role"); ok {
 		desc := "运行时注册一个新的动态角色。"
 		if d, ok := ct.(interface{ Description() string }); ok {
 			desc = d.Description()
@@ -839,7 +923,7 @@ func (r *Registry) Schema() []tools.Tool {
 	}
 	// 暴露 list_roles 工具（若已由 role.Registry.RegisterTools 安装到注册表）。
 	// 仅 MetaAgent 白名单含此工具，列出当前所有角色供派发决策参考。
-	if ct, ok := r.tools["list_roles"]; ok {
+	if ct, ok := r.toolByName("list_roles"); ok {
 		desc := "列出当前所有可用角色。"
 		if d, ok := ct.(interface{ Description() string }); ok {
 			desc = d.Description()
@@ -851,6 +935,55 @@ func (r *Registry) Schema() []tools.Tool {
 		}); err == nil {
 			toolsList = append(toolsList, t)
 		}
+	}
+	// 动态注册工具兜底（热插拔插件等）：上述显式块已覆盖全部内置/安装工具，
+	// 其余按注册顺序暴露——保证插件工具在 Schema 中出现且顺序稳定（LLM 工具列表稳定性）。
+	// 仅实现 SchemaSource 的工具进入此路径（自带描述与入参 schema）；无 schema 的
+	// 注册工具保持现状不暴露，避免 ask_user 等"注册但按需可见"内置工具行为漂移。
+	covered := map[string]bool{
+		"ReadFile": true, "WriteFile": true, "EditFile": true, "ListDir": true,
+		"RunCommand": true, "SearchInFiles": true, "HTTPGet": true, "HTTPPost": true,
+		"GitDiff": true, "GitStatus": true, "GitLog": true, "GitBlame": true,
+		"RefreshProjectDoc": true, "WriteSharedMemory": true, "WriteSpec": true,
+		"call_sub_agent": true, "send_message": true, "create_role": true, "list_roles": true,
+	}
+	r.mu.RLock()
+	order := append([]string(nil), r.schemaOrder...)
+	r.mu.RUnlock()
+	for _, name := range order {
+		if covered[name] {
+			continue
+		}
+		t, ok := r.toolByName(name)
+		if !ok {
+			continue
+		}
+		src, ok := t.(SchemaSource)
+		if !ok {
+			continue
+		}
+		desc := src.Description()
+		if desc == "" {
+			desc = "动态注册工具。"
+		}
+		opts := []tools.Option{}
+		if s := src.InputSchema(); s != nil {
+			opts = append(opts, tools.WithInputSchema(s))
+		}
+		f := tools.NewTool(name, desc, tools.HandleFunc(func(ctx context.Context, raw string) (string, error) {
+			// LLM 下发的参数 JSON 反序列化为 map 后走统一 Dispatch 路径。
+			var args map[string]any
+			if err := json.Unmarshal([]byte(raw), &args); err != nil {
+				return "", err
+			}
+			res, err := r.Dispatch(ctx, name, args)
+			if err != nil {
+				return "", err
+			}
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}), opts...)
+		toolsList = append(toolsList, f)
 	}
 	// 返回收集到的所有 blades 工具定义。
 	return toolsList

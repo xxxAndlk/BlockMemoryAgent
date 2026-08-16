@@ -13,6 +13,7 @@ import (
 	"time"               // 超时与时间戳
 
 	"github.com/blockmemory/agent/backend/internal/model"            // ModelFactory
+	"github.com/blockmemory/agent/backend/internal/plugins"          // 插件管理器
 	"github.com/blockmemory/agent/backend/internal/runtime"          // Runtime
 	"github.com/blockmemory/agent/backend/internal/server/eventkind" // 事件类型常量
 	"github.com/blockmemory/agent/backend/internal/store"            // Postgres / Redis
@@ -51,6 +52,7 @@ type APIHandler struct {
 	roleCfg      *pkgconfig.RoleConfigFile // 角色配置
 	modelFactory *model.ModelFactory       // 模型工厂
 	statsService *StatsService             // 会话统计聚合服务
+	pluginMgr    *plugins.Manager          // 插件管理器（热插拔插件管理 API）
 }
 
 // NewAPIHandler 创建 API 处理器。

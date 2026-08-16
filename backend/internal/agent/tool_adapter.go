@@ -12,6 +12,12 @@ import (
 	"github.com/go-kratos/blades/tools"
 )
 
+// ToolVisibilityFunc 是插件工具可见性回调（设计文档 §4.3）：
+// 返回 (owned, visible)：owned=true 表示该工具由插件注册（非内置工具），
+// visible 表示插件 Manifest.Roles 是否允许当前角色可见。
+// 由 bootstrap 注入 plugins.Manager.ToolVisibility。
+type ToolVisibilityFunc func(roleID, toolName string) (owned, visible bool)
+
 // toolRegistryAdapter 是一个适配器，将领域层 domain/tool.Registry 适配为
 // agent 包内部的 ToolRegistry 接口，同时避免 agent 包与 domain/tool 包之间产生循环导入。
 type toolRegistryAdapter struct {
@@ -22,6 +28,12 @@ type toolRegistryAdapter struct {
 	// Dispatch 不受白名单限制，仍可执行任意已注册工具——verifyloop 的 ExecuteChild
 	// 直接走 inner.Dispatch，绕过 adapter，不受此白名单影响。
 	allowed map[string]bool
+	// roleID 是持有该适配器的 Agent 角色 ID（"meta"/"domain"/动态角色），
+	// 供 pluginVisibility 判定插件工具可见性。
+	roleID string
+	// pluginVisibility 热插拔插件动态可见集回调（设计文档 §4.3）：
+	// fn(roleID, toolName) -> (owned, visible)；nil 时插件工具不做角色过滤。
+	pluginVisibility ToolVisibilityFunc
 }
 
 // NewToolRegistryAdapter 接收一个领域层工具注册表 r，返回一个实现了 agent.ToolRegistry
@@ -62,23 +74,67 @@ func NewToolRegistryAdapterWithFilter(r *tool.Registry, allowed []string) ToolRe
 	return &toolRegistryAdapter{inner: r, allowed: m}
 }
 
+// NewToolRegistryAdapterForRole 构造带角色上下文的适配器（热插拔插件可见性）。
+// allowed 为 nil 或空切片时等价于不过滤；roleID 是持有者的角色 ID；
+// visibility 为 nil 时等价于 NewToolRegistryAdapterWithFilter（白名单语义不变）。
+// Schema() 过滤逻辑 = 「静态白名单 ∪ 插件动态可见集」（设计文档 §4.3）：
+//   - 白名单非空：白名单命中直接暴露；白名单外仅插件工具（owned=true）
+//     且角色可见（visible=true）才暴露；
+//   - 白名单为空：插件工具按可见性隐藏，其余工具全部暴露。
+//
+// 参数:
+//
+//	r          - 领域层的工具注册表。
+//	allowed    - 允许暴露给 LLM 的工具名白名单。
+//	roleID     - 持有该适配器的 Agent 角色 ID。
+//	visibility - 插件工具可见性回调 fn(roleID, toolName) -> (owned, visible)；nil 表示不过滤插件工具。
+//
+// 返回值:
+//
+//	ToolRegistry - 带过滤的适配器对象。
+func NewToolRegistryAdapterForRole(r *tool.Registry, allowed []string, roleID string, visibility ToolVisibilityFunc) ToolRegistry {
+	m := make(map[string]bool, len(allowed))
+	for _, name := range allowed {
+		if name != "" {
+			m[name] = true
+		}
+	}
+	return &toolRegistryAdapter{inner: r, allowed: m, roleID: roleID, pluginVisibility: visibility}
+}
+
 // Schema 返回当前注册表下所有工具的 JSON Schema 描述。
-// 若适配器配置了白名单（allowed 非空），只返回白名单内的工具；否则返回全部。
+// 过滤语义：静态白名单（allowed）∪ 插件动态可见集（pluginVisibility，按角色判定）。
+// 白名单为空且无可见性回调时原样返回全部工具（向后兼容）。
 // 返回值:
 //
 //	[]tools.Tool - 工具列表，每个元素包含工具名、描述与参数模式，供大模型决策使用。
 func (a *toolRegistryAdapter) Schema() []tools.Tool {
 	all := a.inner.Schema()
-	// 白名单为空 -> 不过滤，原样返回。
-	if len(a.allowed) == 0 {
+	// 无过滤配置：原样返回。
+	if len(a.allowed) == 0 && a.pluginVisibility == nil {
 		return all
 	}
-	// 按白名单过滤；保持原注册顺序，便于工具列表稳定。
+	// 按白名单 + 插件可见性过滤；保持原注册顺序，便于工具列表稳定。
 	out := make([]tools.Tool, 0, len(all))
 	for _, t := range all {
-		if a.allowed[t.Name()] {
-			out = append(out, t)
+		owned, visible := false, true
+		if a.pluginVisibility != nil {
+			owned, visible = a.pluginVisibility(a.roleID, t.Name())
 		}
+		if len(a.allowed) > 0 {
+			if a.allowed[t.Name()] {
+				out = append(out, t)
+				continue
+			}
+			// 白名单未命中：仅插件工具可经动态可见集加入（非插件工具不越权）。
+			if !owned || !visible {
+				continue
+			}
+		} else if owned && !visible {
+			// 无白名单：插件工具按角色可见性隐藏；非插件工具全部保留。
+			continue
+		}
+		out = append(out, t)
 	}
 	return out
 }

@@ -125,6 +125,11 @@ type Dispatcher struct {
 	seq      atomic.Uint64        // seq 原子递增序列号，保证生成的子 Agent ID 唯一。
 	running  sync.Map             // running 存储正在运行的子 Agent，键为 subAgentID，值为 *agent.ReActAgent。
 
+	// pluginVisibility 热插拔插件角色可见性回调（设计文档 §4.3）：
+	// fn(roleID, toolName) -> (owned, visible)；nil 时插件工具不额外过滤。
+	// 由 bootstrap 注入 plugins.Manager.ToolVisibility。
+	pluginVisibility agent.ToolVisibilityFunc
+
 	// pending 跟踪每个父 Agent 当前未完成的子 Agent 数量，键为 parentID，
 	// 值为 *pendingState。用于父会话终结保护：父 Agent 给出终答前若有未决子 Agent，
 	// 应等待其完成再终结，防止迟到 mailbox 消息丢失（参见 agent.ReActAgent 的终结保护分支）。
@@ -581,6 +586,12 @@ func (d *Dispatcher) WithTimeout(t time.Duration) *Dispatcher {
 	return d
 }
 
+// WithPluginVisibility 注入插件工具角色可见性回调（设计文档 §4.3）。
+// 由 bootstrap 注入 plugins.Manager.ToolVisibility；传 nil 关闭插件可见性过滤。
+func (d *Dispatcher) WithPluginVisibility(fn agent.ToolVisibilityFunc) *Dispatcher {
+	d.pluginVisibility = fn
+	return d
+}
 // WithTaskRuneLimits 配置派发 task 文本双档上限（TODO #35 放开预算）：
 // 超 soft 未达 hard 软着陆放行附警告，超 hard 硬拒。<=0 按默认 3000/4000。
 // bootstrap 按 cfg.Agent.TaskMaxRunes / TaskMaxRunesHard 注入。
@@ -1527,7 +1538,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			mem = uptake
 		}
 	}
-	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
+	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
@@ -1878,7 +1889,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		mem = newSiblingUptakePipeline(mem, bb, sid, pausedNode.ParentID, pausedNode.Domain, pausedNodeID)
 	}
 	// 不注入编排者人格（理由同 runSubAgentOnce：身份混淆实证）。
-	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterWithFilter(d.tools, roleDef.Tools)).
+	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor("domain")).

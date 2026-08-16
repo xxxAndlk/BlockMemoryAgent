@@ -101,6 +101,10 @@ type ReactService struct {
 	userProfile *userprofile.Store
 	// profileExtractor 会话完成时从对话提取偏好增量的轻量模型回调；nil 跳过提取。
 	profileExtractor func(ctx context.Context, text string) ([]string, error)
+	// pluginVisibility 热插拔插件角色可见性回调（设计文档 §4.3）：
+	// fn(roleID, toolName) -> (owned, visible)；nil 时插件工具不额外过滤
+	//（白名单语义不变）。由 bootstrap 注入 plugins.Manager.ToolVisibility。
+	pluginVisibility ToolVisibilityFunc
 }
 
 // SetUserProfileStore 注入用户画像存储（TODO #28）。
@@ -114,6 +118,12 @@ func (s *ReactService) SetUserProfileStore(st *userprofile.Store) {
 // 传 nil 关闭自动提取（默认关闭）；显式写入（remember_preference / SaveProfile）不受影响。
 func (s *ReactService) SetProfileExtractor(fn func(ctx context.Context, text string) ([]string, error)) {
 	s.profileExtractor = fn
+}
+
+// SetPluginVisibility 注入插件工具角色可见性回调（设计文档 §4.3）。
+// 由 bootstrap 注入 plugins.Manager.ToolVisibility；传 nil 关闭插件可见性过滤。
+func (s *ReactService) SetPluginVisibility(fn ToolVisibilityFunc) {
+	s.pluginVisibility = fn
 }
 
 // Profile 返回用户画像全文快照（TODO #28 查看/编辑入口）。未接线返回空画像。
@@ -1361,7 +1371,7 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 任务看板注入（TODO #35 Phase 0）：每轮上下文末尾追加【任务看板】段——编排状态
 	// 机器可读且压缩不可达，"重新执行"类短指令的消歧锚点。仅 meta 注入，子 Agent 不注入。
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
-	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
+	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, metaRole.Tools, "meta", s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
 		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
@@ -1454,7 +1464,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
 	// 任务看板注入（TODO #35 Phase 0）：同 runSession，每轮末尾追加【任务看板】段。
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
-	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterWithFilter(s.toolRegistry, metaRole.Tools)).
+	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, metaRole.Tools, "meta", s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
 		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).

@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,6 +31,8 @@ import (
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/model"
+	"github.com/blockmemory/agent/backend/internal/plugins"
+	"github.com/blockmemory/agent/backend/internal/plugins/mcpbridge"
 	"github.com/blockmemory/agent/backend/internal/retriever"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
@@ -76,6 +80,7 @@ type App struct {
 	RoleConfig   *pkgconfig.RoleConfigFile // 角色配置对象
 	DAGScheduler *dag.Scheduler            // DAG 调度器；DAG 关闭时为 nil
 	Logger       *logger.Logger            // 结构化会话日志器
+	Plugins      *plugins.Manager         // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
 
 	// cleanup 保存 App 关闭时需要按逆序释放的资源。
 	cleanup []func() error
@@ -448,6 +453,28 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		agentSvc.RestoreSessions(ctx, 50)
 	}
 
+	// 第十六步半：插件系统（设计文档《插件系统设计 v2》）。
+	// 热插拔插件：MCP 桥（web_search / computer_use 等）+ bundle 外部插件包。
+	// plugins.yaml 与 config.yaml 同目录；plugins.d/ 亦与配置同目录（外部插件包目录）。
+	// 装配：manager → 注入 mcp 工厂 → Load（自动 enable enabled:true）→ 注入角色可见性回调。
+	// Load/Reload 失败不阻断启动（插件系统为可选能力，配置损坏仅记录）。
+	pluginManager := plugins.NewManager(toolRegistry,
+		plugins.WithLogger(slog.Default()),
+		plugins.WithConfigDir(filepath.Dir(paths.ConfigPath)),
+		plugins.WithBundlesDir(filepath.Join(filepath.Dir(paths.ConfigPath), "plugins.d")),
+		plugins.WithSkillPool(skillPool),
+		plugins.WithWorkDir(workDir),
+		plugins.WithMCPFactory(func(id string, settings map[string]any, deps plugins.Deps) (plugins.Plugin, error) {
+			return mcpbridge.NewFromSettings(id, settings, deps)
+		}),
+	)
+	if err := pluginManager.Load(ctx); err != nil {
+		log.Printf("[bootstrap] plugins load failed (non-fatal): %v", err)
+	}
+	// 角色可见性：meta/domain/动态角色按 Manifest.Roles 判定插件工具是否可见（§4.3）。
+	agentSvc.SetPluginVisibility(pluginManager.ToolVisibility)
+	subAgentDispatcher.WithPluginVisibility(pluginManager.ToolVisibility)
+
 	// 第十七步：创建 HTTP SessionManager 并注入依赖。
 	sessionMgr := server.NewSessionManager(agentSvc)
 	sessionMgr.SetLogger(sessionLogger)
@@ -479,10 +506,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		RoleConfig:   roleCfg,
 		DAGScheduler: dagScheduler,
 		Logger:       sessionLogger,
+		Plugins:      pluginManager,
 	}
 
 	// 第二十一步：注册关闭时释放资源的回调，按依赖顺序排列（外层 Close 会逆序调用）。
 	app.cleanup = []func() error{
+		func() error {
+			// 先停全部插件（MCP 子进程/HTTP 连接），再关 DAG 调度器。
+			stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = pluginManager.StopAll(stopCtx)
+			return nil
+		},
 		func() error {
 			// 先停止 DAG 调度器，避免在数据库关闭后还在调度任务。
 			if dagScheduler != nil {

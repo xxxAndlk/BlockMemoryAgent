@@ -34,6 +34,11 @@ services:
       timeout: 3s
       retries: 5
 
+  # Computer Use 沙箱已迁移为 docker transport 插件（设计文档 §6.4）：
+  # 镜像 docker/computer-use/Dockerfile（bma/computer-use-mcp:local），
+  # 由后端经 /api/plugins/computer_use/enable 按需拉起 stdio 容器，
+  # noVNC 观察口经 settings.ports 映射到宿主 6081。不再使用 compose 常驻服务。
+
 volumes:
   postgres_data:
     driver: local
