@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
 // InputBar 维护底部输入栏的状态，包括输入模式、当前字符、光标位置以及按会话保存的历史记录。
@@ -149,8 +151,9 @@ func (ib *InputBar) historyDown(sessionID string) {
 	}
 }
 
-// render 渲染输入栏，参数 w 为可用宽度，focused 表示是否获得焦点，flash 是顶部闪屏提示文本。
-func (ib *InputBar) render(styles *Styles, w int, focused bool, flash string) string {
+// render 渲染输入栏，参数 w 为可用宽度，focused 表示是否获得焦点，flash 是顶部闪屏提示文本，
+// hint 是第二行的引导提示（如待澄清时的操作引导），为空时不占行。
+func (ib *InputBar) render(styles *Styles, w int, focused bool, flash, hint string) string {
 	// 根据当前模式选择提示符。
 	prompt := ">"
 	switch ib.mode {
@@ -189,7 +192,7 @@ func (ib *InputBar) render(styles *Styles, w int, focused bool, flash string) st
 		border = styles.FocusBorder
 	}
 	// 拼接提示符、文本和闪屏提示，并套入边框与固定高度。
-	content := lipgloss.JoinVertical(lipgloss.Left, left+" "+text+flash, "")
+	content := lipgloss.JoinVertical(lipgloss.Left, left+" "+text+flash, hint)
 	return border.Width(w - 2).Height(3).Render(content)
 }
 
@@ -228,5 +231,13 @@ func (m Model) renderInput(w int) string {
 	if curFlash != "" {
 		flash = "  " + m.styles.LogError.Render(curFlash)
 	}
-	return m.inputBar.render(m.styles, w, m.focus == panelInput, flash)
+	// TODO #53：会话等待澄清时在输入栏第二行追加引导提示（按键说明见上方问答面板）。
+	hint := ""
+	if s := m.selectedSession(); s != nil && s.Status == enums.SessionStatusAwaitingClarify && s.State != nil && s.State.PendingClarify != nil {
+		hint = m.styles.InputHint.Render("⏳ Agent 等待答复：上方面板选择选项，或直接输入文字回车提交")
+		if len(s.State.PendingClarify.Options) > 0 {
+			hint += "\n" + m.styles.InputHint.Render("（↑/↓ 选择 · 回车提交 · 数字键/y/n 快捷选择）")
+		}
+	}
+	return m.inputBar.render(m.styles, w, m.focus == panelInput, flash, hint)
 }

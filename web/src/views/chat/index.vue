@@ -2,7 +2,7 @@
 import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import type { Session, SessionEvent, AgentNode, TaskBoardData } from '@/types'
+import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyOption } from '@/types'
 import {
   createSession,
   sendMessage,
@@ -36,6 +36,9 @@ const events = ref<SessionEvent[]>([])
 const agents = ref<AgentNode[]>([])
 const metrics = ref<SessionMetrics | null>(null)
 const board = ref<TaskBoardData | null>(null)
+
+// 待澄清选项区：由 SSE awaiting_clarify 帧驱动（不 push 进 events），答复后复位
+const clarifyPending = ref<{ options: ClarifyOption[]; multiSelect: boolean; questionId: string } | null>(null)
 
 const { roleTree, defaultProps } = useRoleTree(agents)
 const { tasks, taskProgress } = useTaskBoard(board)
@@ -76,6 +79,7 @@ async function openSession(id: string) {
   panel.stopPanelTimer()
   panel.invalidate()
   events.value = []
+  clarifyPending.value = null // 切换会话时复位待澄清选项，避免串会话残留
   try {
     const s = await getSession(id)
     activeSession.value = s
@@ -107,8 +111,21 @@ function startStream(s: Session) {
     onSnapshot(snap) {
       activeSession.value = snap
       events.value = [...(snap.events || [])]
+      // 会话已不再等待澄清（答复已提交）→ 复位选项区
+      if (snap.status !== 'awaiting_clarify' && clarifyPending.value) {
+        clarifyPending.value = null
+      }
     },
     onEvent(ev) {
+      // 待澄清帧：只记录选项供渲染，不 push 进 events，避免 turns 把帧当思考步骤
+      if ((ev as any).type === 'awaiting_clarify') {
+        clarifyPending.value = {
+          options: (ev as any).options || [],
+          multiSelect: !!(ev as any).multi_select,
+          questionId: (ev as any).question_id || '',
+        }
+        return
+      }
       events.value.push(ev)
     },
     onDone(finalStatus?: string) {
@@ -169,6 +186,13 @@ async function handleSubmit(content: string) {
   }
 }
 
+// 选项按钮提交澄清答复成功：置 running 并重开会话重建事件流（复用 handleSubmit 的刷新方式）
+async function handleClarifySubmitted() {
+  if (!activeSession.value) return
+  activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
+  await openSession(activeSession.value.id)
+}
+
 async function handleCancel() {
   if (!activeSession.value) return
   try {
@@ -188,6 +212,7 @@ async function handleNewSession() {
   metrics.value = null
   board.value = null
   router.replace({ path: '/chat' })
+  clarifyPending.value = null // 新建会话时复位
 }
 
 const filteredSessions = computed(() => {
@@ -256,7 +281,8 @@ function fmtDateTime(iso: string) {
     <!-- 中间对话区 -->
     <main class="flex-1 flex flex-col bg-[#1a1d24] border border-[#2a2d35] rounded-lg overflow-hidden min-w-0">
       <ChatHeader :session="activeSession" :agents="agents" @cancel="handleCancel" />
-      <MessageList :events="events" :verbose="verbose" />
+      <MessageList :events="events" :verbose="verbose" :clarify="clarifyPending"
+                   :session-id="activeSession?.id || ''" @submit-clarify="handleClarifySubmitted" />
       <ChatInput :loading="sending"
                  :session-active="activeSession?.status === 'running'"
                  :input-tokens="tokenUsage.input"

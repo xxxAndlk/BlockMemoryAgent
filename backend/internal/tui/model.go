@@ -87,6 +87,16 @@ type Model struct {
 	// tokenWarnLevel 记录已提醒过的输入 Token 成本预警档位（每 50 万为一档）。
 	tokenWarnLevel int
 
+	// clarifySel 是澄清多选模式下已选选项 ID 集合（TODO #53），
+	// 数字键 1-9 / 空格切换选择，Enter 提交时 join "," 作为答复；
+	// 会话离开 awaiting_clarify 后由 syncInputMode 清空。
+	clarifySel []string
+	// clarifyCursor 是问答面板中当前高亮的选项下标（↑/↓ 移动，回车提交）。
+	clarifyCursor int
+	// clarifyID 记录当前已进入澄清模式的 PendingClarify.ID，
+	// 同一 session 多轮 ask_user 时据此重置 clarifyCursor/clarifySel。
+	clarifyID string
+
 	// streamEvents 接收当前选中会话的 agent.Stream 事件，用于触发即时刷新。
 	streamEvents chan agent.Event
 	// streamCancel 关闭当前会话的事件流 goroutine。
@@ -403,6 +413,31 @@ func (m *Model) refreshSessions() {
 	}
 }
 
+// syncInputMode 根据当前选中会话的待澄清状态同步输入栏模式（TODO #53）：
+// 会话处于 awaiting_clarify 且存在 PendingClarify 时置为 inputClarify（已处于则保持），
+// 否则若当前是 inputClarify 则回退 inputNormal，并顺带清空多选选择集 clarifySel
+// 与选项光标（答复已提交、会话恢复运行后不再需要残留状态）；
+// 同一 session 出现新的 PendingClarify（ID 变化）时也重置光标与选择集。
+func (m *Model) syncInputMode() {
+	if pc := m.pendingClarify(); pc != nil {
+		if m.inputBar.mode != inputClarify {
+			m.inputBar.mode = inputClarify
+		}
+		if m.clarifyID != pc.ID {
+			m.clarifyID = pc.ID
+			m.clarifyCursor = 0
+			m.clarifySel = nil
+		}
+		return
+	}
+	if m.inputBar.mode == inputClarify {
+		m.inputBar.mode = inputNormal
+	}
+	m.clarifyID = ""
+	m.clarifyCursor = 0
+	m.clarifySel = nil
+}
+
 // toServerSession 将 agent.Session DTO 转换为 TUI 内部仍在使用的 server.Session 类型。
 func toServerSession(a *agent.Session) *server.Session {
 	return server.ToServerSession(a)
@@ -448,6 +483,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 每 5 tick（0.5s）刷新会话列表；每 10 tick（1s）刷新 Agent 面板与 Token 统计。
 		if m.tickCount%5 == 0 {
 			m.refreshSessions()
+			// 会话列表刷新后同步输入栏模式（awaiting_clarify ↔ inputClarify），
+			// 并清理多选选择集；依赖会话状态，放在 refreshSessions 之后。
+			m.syncInputMode()
 		}
 		if m.tickCount%10 == 0 {
 			m.rebuildAgents()
@@ -799,7 +837,7 @@ func (m *Model) chatContentWidth() int {
 	return w
 }
 
-// mainContentHeight 返回中间主内容区高度（已扣除顶栏、领域进度面板、Token 栏、输入栏、底部快捷键栏、弹窗占位）。
+// mainContentHeight 返回中间主内容区高度（已扣除顶栏、问答面板、Token 栏、输入栏、底部快捷键栏、弹窗占位）。
 func (m *Model) mainContentHeight() int {
 	topH := 1
 	// Token 用量栏：输入栏上方 1 行实时展示当前会话累计 token。
@@ -816,8 +854,8 @@ func (m *Model) mainContentHeight() int {
 			overlayH = 6
 		}
 	}
-	flowH := m.subAgentFlowPanelHeight()
-	h := m.height - topH - tokenBarH - inputH - shortcutH - overlayH - flowH
+	clarifyH := m.clarifyPanelHeight()
+	h := m.height - topH - tokenBarH - inputH - shortcutH - overlayH - clarifyH
 	if h < 4 {
 		h = 4
 	}

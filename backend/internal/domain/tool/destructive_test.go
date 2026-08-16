@@ -160,6 +160,46 @@ func TestIsDangerousCommand(t *testing.T) {
 	}
 }
 
+// TestApprovalMessage 验证确认文案必须携带足够细节（工具名/关键参数），
+// 让用户能判断"要确认的是什么操作"：已知工具取关键参数，插件等未知工具附参数 JSON。
+func TestApprovalMessage(t *testing.T) {
+	cases := []struct {
+		name     string
+		tool     string
+		args     map[string]any
+		contains []string
+	}{
+		{"WriteFile 带路径", "WriteFile", map[string]any{"path": "/srv/app/a.txt"},
+			[]string{"将写入文件 /srv/app/a.txt"}},
+		{"RunCommand 带命令", "RunCommand", map[string]any{"command": "rm -rf /tmp/x"},
+			[]string{"将执行命令 rm -rf /tmp/x"}},
+		{"插件工具含工具名与参数", "open_application", map[string]any{"app": "chrome.exe"},
+			[]string{"open_application", "chrome.exe"}},
+		{"插件工具无参数仅工具名", "snapshot", nil,
+			[]string{"snapshot"}},
+	}
+	for _, c := range cases {
+		got := ApprovalMessage(c.tool, c.args)
+		if !strings.HasPrefix(got, "【需确认】") {
+			t.Errorf("%s: 缺【需确认】前缀: %q", c.name, got)
+		}
+		for _, sub := range c.contains {
+			if !strings.Contains(got, sub) {
+				t.Errorf("%s: 文案缺少 %q: %q", c.name, sub, got)
+			}
+		}
+	}
+	// 长参数截断：超长命令/参数不得让确认文案无限膨胀。
+	long := ApprovalMessage("RunCommand", map[string]any{"command": strings.Repeat("x", 500)})
+	if len([]rune(long)) > 260 {
+		t.Errorf("长命令未截断: %d runes", len([]rune(long)))
+	}
+	longArgs := ApprovalMessage("some_plugin", map[string]any{"data": strings.Repeat("y", 500)})
+	if len([]rune(longArgs)) > 320 {
+		t.Errorf("长参数 JSON 未截断: %d runes", len([]rune(longArgs)))
+	}
+}
+
 // TestInProductionWorkDir 验证生产目录判定：相等、子目录命中；无关路径与空配置不命中。
 func TestInProductionWorkDir(t *testing.T) {
 	cases := []struct {

@@ -257,7 +257,7 @@ func ToServerSession(a *agent.Session) *Session {
 	}
 	if a.PendingClarify != nil {
 		req := a.PendingClarify
-		state.PendingClarify = &types.ClarifyRequest{
+		pc := &types.ClarifyRequest{
 			ID:         req.ID,
 			Question:   req.Question,
 			Context:    req.Context,
@@ -265,7 +265,18 @@ func ToServerSession(a *agent.Session) *Session {
 			CreatedAt:  req.CreatedAt,
 			Answer:     req.Answer,
 			AnsweredAt: req.AnsweredAt,
+			Kind:       req.Kind,
+			MultiSelect: req.MultiSelect,
 		}
+		for _, o := range req.Options {
+			pc.Options = append(pc.Options, types.ClarifyOption{
+				ID:          o.ID,
+				Label:       o.Label,
+				Description: o.Description,
+			})
+		}
+		pc.AnswerOptionIDs = append([]string(nil), req.AnswerOptionIDs...)
+		state.PendingClarify = pc
 	}
 	// 如果没有任何三层状态内容，则把 state 置为 nil，避免返回空对象。
 	if a.State == "" && len(a.ActiveBlocks) == 0 && a.PendingClarify == nil {

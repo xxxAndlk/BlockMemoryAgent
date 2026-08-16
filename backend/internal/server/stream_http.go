@@ -7,6 +7,7 @@ import (
 	"time"          // 轮询 ticker 与时间戳
 
 	"github.com/blockmemory/agent/backend/pkg/enums" // 会话状态枚举
+	"github.com/blockmemory/agent/backend/pkg/types" // ClarifyOption（awaiting_clarify 帧结构化选项）
 )
 
 // HandleSessionStream 处理 GET /api/sessions/{id}/stream。
@@ -83,20 +84,30 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 				flusher.Flush()
 			}
 
-			// 若会话等待用户澄清，推送 awaiting_clarify 事件。
+			// 若会话等待用户澄清，推送 awaiting_clarify 事件（TODO #53：帧携带结构化选项）。
 			if snapshot.Status == enums.SessionStatusAwaitingClarify {
 				pending := ""
 				qid := ""
+				var opts []types.ClarifyOption
+				multi := false
 				if snapshot.State != nil && snapshot.State.PendingClarify != nil {
-					pending = snapshot.State.PendingClarify.Question
-					qid = snapshot.State.PendingClarify.ID
+					pc := snapshot.State.PendingClarify
+					pending = pc.Question
+					qid = pc.ID
+					opts = pc.Options
+					multi = pc.MultiSelect
 				}
-				data, _ := json.Marshal(map[string]string{
+				frame := map[string]any{
 					"type":        "awaiting_clarify",
 					"status":      string(snapshot.Status),
 					"question":    pending,
 					"question_id": qid,
-				})
+					"multi_select": multi,
+				}
+				if len(opts) > 0 {
+					frame["options"] = opts
+				}
+				data, _ := json.Marshal(frame)
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				flusher.Flush()
 			}

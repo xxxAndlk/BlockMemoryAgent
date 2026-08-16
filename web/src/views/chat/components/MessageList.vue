@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick, onMounted, computed } from 'vue'
-import type { SessionEvent } from '@/types'
+import type { SessionEvent, ClarifyOption } from '@/types'
 import { groupEventsToTurns } from '../utils/turns'
 import UserBubble from './UserBubble.vue'
 import AssistantTurn from './AssistantTurn.vue'
@@ -8,7 +8,12 @@ import AssistantTurn from './AssistantTurn.vue'
 const props = defineProps<{
   events: SessionEvent[]
   verbose?: boolean
+  clarify?: { options: ClarifyOption[]; multiSelect: boolean; questionId: string } | null
+  sessionId: string
 }>()
+
+// 澄清选项提交成功 → 透传给父级（index.vue 重开会话刷新事件流）
+const emit = defineEmits<{ (e: 'submit-clarify'): void }>()
 
 const containerRef = ref<HTMLElement | null>(null)
 const stickToBottom = ref(true)
@@ -55,7 +60,8 @@ defineExpose({ scrollToBottom })
     <template v-else>
       <div v-for="turn in turns" :key="turn.id">
         <UserBubble v-if="turn.userMessage" :event="turn.userMessage" />
-        <AssistantTurn :turn="turn" :verbose="verbose" />
+        <AssistantTurn :turn="turn" :verbose="verbose" :clarify="clarify" :session-id="sessionId"
+                       @submit-clarify="emit('submit-clarify')" />
       </div>
     </template>
   </div>

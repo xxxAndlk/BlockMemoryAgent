@@ -90,6 +90,14 @@ type ActiveBlock struct {
 	Goal   string // Goal 会话块当前目标
 }
 
+// ClarifyOption 是澄清请求的一个结构化选项（TODO #53）。
+// 用户可点选选项答复（单选/多选），也可忽略选项自由文本答复。
+type ClarifyOption struct {
+	ID          string // ID 选项唯一标识（确认场景固定 confirm/reject）
+	Label       string // Label 选项展示文本
+	Description string // Description 选项补充说明（可选）
+}
+
 // ClarifyRequest 是澄清请求的 DTO，字段与 types.ClarifyRequest 对应。
 // 使用普通 DTO 字段，避免 agent 包依赖内部 types 包。
 type ClarifyRequest struct {
@@ -100,6 +108,15 @@ type ClarifyRequest struct {
 	CreatedAt  time.Time  // CreatedAt 澄清请求创建时间
 	Answer     string     // Answer 用户给出的答案内容
 	AnsweredAt *time.Time // AnsweredAt 用户回答时间，未回答时为 nil
+	// Kind 澄清类型（TODO #53）：confirm=破坏性操作确认 / choice=选项选择 /
+	// text=纯自由文本。缺省空串视为 text（向后兼容）。
+	Kind string
+	// MultiSelect 是否允许多选（仅 choice 有意义；confirm 恒单选）。
+	MultiSelect bool
+	// Options 结构化选项列表；空表示无选项（自由文本答复）。
+	Options []ClarifyOption
+	// AnswerOptionIDs 答复时命中的选项 ID（多选按序）；自由文本答复为空。
+	AnswerOptionIDs []string
 }
 
 // Session 是会话对象的 DTO，按字段逐一对齐 server.Session。

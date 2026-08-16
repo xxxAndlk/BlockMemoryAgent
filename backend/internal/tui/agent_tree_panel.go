@@ -114,11 +114,18 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 		at.nodes = append(at.nodes, orchestratorNodesToTreeNodes(filterPrevRoundNodes(nodes, roundStart), s.ID)...)
 	}
 
-	// 若会话处于待澄清状态，追加一个占位节点提示用户（含问题文本，TODO #24）。
+	// 若会话处于待澄清状态，追加一个占位节点提示用户（含问题文本，TODO #53）：
+	// Kind==confirm 为破坏性操作确认，其余（choice/text）统一按待答复展示。
 	if s.State != nil && s.State.PendingClarify != nil {
+		pc := s.State.PendingClarify
 		label := "Clarify pending"
-		if q := strings.TrimSpace(s.State.PendingClarify.Question); q != "" {
-			label = "待答复: " + truncate(q, 40)
+		if q := strings.TrimSpace(pc.Question); q != "" {
+			q = truncate(q, 40)
+			if pc.Kind == "confirm" {
+				label = "⚠️ 待确认: " + q
+			} else {
+				label = "❓ 待答复: " + q
+			}
 		}
 		at.nodes = append(at.nodes, agentTreeNode{
 			depth:     1,

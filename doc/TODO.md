@@ -122,6 +122,49 @@
       - **bootstrap**：`toolRegistry.SetPluginVisibility(plugins.Manager.ToolVisibility)`（与 agent/dispatcher 同源回调，tool 包不反向依赖 plugins）。
       - 验收对照：(a) 越界挂载/委派拒绝且日志可查 ✓（MountForScope 拒绝 + dispatch 回告 + log）；(b) schema 数下降 ✓（默认收窄，挂载后才注入插件工具 schema）；(c) tools_hint 子 Agent 当轮可见 ✓（TestDispatch_ToolsHint 断言子 scope 预挂载）；(d) 全量 `go test ./backend/...` 29 包绿，任务 52/55/56 热插拔 E2E（plugins/server 包内）不退化 ✓。
 
+53. **Agent 问答系统补全：TUI 提问可见可答 + 结构化选项（单选/多选/是否确认）**（✅ 已完成 2026-08-16，doc/变更.md 任务 60；后续交互迭代见任务 61——领域进度面板撤除、原位置改为问答面板（问题全文+选项）、选项 ↑/↓ 高亮选择 + 空格多选 + 回车提交对齐 Kimi Code；来源：2026-08-16 用户反馈——Agent 发起提问/破坏性操作确认时，TUI 只在 Agent 树面板显示"待答复：【需确认】该工具为破坏性操作…"40 字截断占位，用户看不到问题全文、没有选项可点、不知道该如何回答，流程看似卡死）
+    - 背景（链路勘察结论，2026-08-16）：后端问答链路**完整无断点**——`ApprovalHook`/`AskUserHook`（`service_react.go:836-951`）置 `pendingClarify` → 状态 `awaiting_clarify` → 发 `clarify` 事件 → 阻塞等 `approval`/`askUser` channel；答复入口已有两条（`sendMessage` L1731 普通消息直答、`answerClarify` L1886）。Web 端**全链路可用**（SSE 推 `awaiting_clarify` 帧 → `AssistantTurn.vue:123-130` 渲染问题卡片 → 输入框 POST `/clarify`）。断点全在 TUI：
+      1. `eventChatItem`（`tui/helpers.go:836-978`）的 switch **没有 `clarify` 事件分支**，落到 L978 丢弃——问题全文永远进不了对话区，用户只能看到树面板 40 字截断（`agent_tree_panel.go:117-131`）。
+      2. TUI 无任何"正在等待你的答复，直接输入回复即可"的提示；`inputClarify` 输入模式（`keys.go:36`、`input_bar.go:157`）是**死代码**——全库没有地方把 mode 设成它；`/clarify <id> <ans>` 命令（`input.go:294-300`）要求的 question_id（`approve-xxx`/`ask-xxx`）在 TUI 任何界面都不显示，用户无从得知。
+      3. 实际"直接输入普通文本回车"就能答复（sendMessage → 写 channel），但 UI 零引导，用户看到 Waiting 就以为卡死。
+    - 现状的结构性缺口（问答能力本身）：`ClarifyRequest`（`agent/types.go:95-103`）**无 Options 字段**；`ask_user` 工具 schema（`domain/tool/ask_user.go:75-79`）只有 `question` + `timeout_sec`，纯自由文本；破坏性确认靠 `parseApproval`（`service_react.go:889-895`）关键词匹配（"确认/yes/ok…"放行，其余 fail-closed）——没有结构化选项，模型只能让用户自由打字，确认语义靠猜词。
+    - 目标：① TUI 上提问/确认**可见**（问题全文进对话区）且**可答**（明确引导 + 快捷操作）；② 问答支持**结构化选项**——单选、多选、是/否确认三类，覆盖两个典型场景：破坏性操作确认（选项=确认/拒绝）与方向不明确时的方向选择（选项=若干方向，单选或多选）；③ Web 端同步支持选项按钮。
+    - 设计（三块，块 1 是止血 P0，块 2/3 是能力扩展 P1）：
+      1. **块 1：TUI 问答可见可答（P0，不动协议，纯 TUI 渲染+交互）**：
+         a. `eventChatItem` 增加 `clarify` 分支：问题全文（`ev.Message`）渲染进对话区，样式区分发问（Agent=System，醒目卡片/高亮）与答复（Agent=User）。用户在主对话区直接看到完整问题。
+         b. `awaiting_clarify` 状态下输入栏提示引导：输入栏 placeholder/状态栏显示"⏳ Agent 等待答复，直接输入回复回车（或输入「确认」/「拒绝」）"。复用现有 sendMessage 路径，零协议改动。
+         c. 接线 `inputClarify` 死代码或删除：若接线——session 快照 `awaiting_clarify` 时输入栏自动切 `inputClarify` 模式（提示符 `/clarify>`），回车走 `/clarify` 路由（question_id 从 `PendingClarify.ID` 自动取，不要求用户手输）；若判断普通消息路径已够，则删除死代码避免误导。二选一，倾向接线（语义明确、事件记录走 answerClarify）。
+         d. 树面板占位节点 label 不再截断关键信息：保持 40 字截断但 prepend 类型图标（❓提问 / ⚠️确认），详情已在对话区可见。
+      2. **块 2：结构化选项协议（P1，DTO + 工具 schema + 答复解析）**：
+         a. DTO：`ClarifyRequest` 加 `Options []ClarifyOption` + `MultiSelect bool` + `Kind string`（`confirm`/`choice`/`text`，缺省 `text` 向后兼容）；`ClarifyOption{ ID, Label, Description }`。
+         b. `ask_user` 工具 schema 扩展：加 `options`（数组，每项 `{id, label, description}`）与 `multi_select`（bool，默认 false）。模型调用约定：纯确认场景可不传 options（Kind=confirm 由 hook 自动生成 确认/拒绝 两选项）；方向选择场景传 2-N 个 options。工具描述中写明"方向不明确、需要用户拍板时给选项，不要开放式提问让用户打字"。
+         c. 破坏性确认对齐选项化：`ApprovalHook` 构造 `pendingClarify` 时填 `Kind=confirm` + `Options=[{confirm,确认执行},{reject,拒绝取消}]`，文案不变；`parseApproval` 保留作自由文本兜底（Web/旧客户端仍可打字答复），选项 ID（`confirm`/`reject`）直接映射放行/拒绝，优先于关键词匹配。
+         d. 答复解析：`answerClarify`/`sendMessage` 收到答复后——若 `Options` 非空，先精确匹配选项 ID 或 Label（含数字序号 "1"/"2" 映射第 N 项，TUI/Web 快捷选择都走这里）；多选时逗号/空格分隔多个 ID；匹配失败回退自由文本原文（多选未选满不报错，Agent 自行判断）。答复结果写回 `ClarifyRequest.Answer` 时同时记录选中的 option IDs。
+         e. 事件与 SSE：clarify 事件 payload 或 session 快照携带 Options（Web SSE `awaiting_clarify` 帧加 `options`/`multi_select` 字段，`stream_http.go:86-102`）。
+      3. **块 3：选项交互 UI（P1，TUI + Web）**：
+         a. TUI 对话区渲染选项列表：clarify 卡片内编号列出选项（`1. 确认执行 — 将执行 xxx`），多选标注"可多选，逗号分隔"。
+         b. TUI 快捷键：awaiting_clarify 且 Options 非空时，数字键 `1-9` 直接选中对应选项并发送（单选即选即答；多选切换勾选、回车提交）；`y`/`n` 快捷映射 confirm/reject。Esc 不答复、退回普通输入（保持 Waiting）。
+         c. Web：`AssistantTurn.vue` 的待澄清卡片渲染选项按钮（单选=点击即提交；多选=checkbox + 提交按钮），点击 POST `/clarify` answer=选项 ID。
+    - 执行流程：
+      1. 块 1（TUI 止血）：`helpers.go` clarify 分支 + 输入栏引导 + inputClarify 接线/删除 + 树面板图标。手动验证：跑一个触发 ask_user 的会话，TUI 对话区看到问题全文，直接输入答复流程走通。
+      2. 块 2（协议）：`types.go` DTO → `ask_user.go` schema → `service_react.go` ApprovalHook/AskUserHook 填选项 + 答复解析 → SSE 帧扩展。单测覆盖解析分支。
+      3. 块 3（UI）：TUI 数字键交互 + Web 选项按钮。
+    - 测试：
+      1. 单测——选项答复解析：选项 ID/Label/数字序号三种命中、多选分隔解析、无匹配回退自由文本、confirm/reject 映射优先于关键词。
+      2. 单测——ApprovalHook 构造的 pendingClarify 含 Kind=confirm 与两选项；ask_user hook 透传 options/multi_select 到 pendingClarify。
+      3. 单测——ask_user 工具 schema 含 options/multi_select 参数且 Execute 正确透传。
+      4. 回归——无 options 的旧行为不变：自由文本答复、parseApproval 关键词、超时自行决策（`ask_user.go:93-98`）全部不退化（复用现有 `approval_test.go`/`ask_user_test.go` 并扩充）。
+      5. 集成/TUI 手动——破坏性操作确认场景：TUI 对话区显示全文 + 1.确认/2.拒绝，按 2 拒绝后工具返回"已被用户拒绝"；方向选择场景：ask_user 带 3 选项，按数字键答复，Agent 收到选中项。
+    - 验收：(a) 复现 2026-08-16 场景——Agent 发起破坏性确认，TUI 对话区可见问题全文与选项，用户按数字键或输入文字均可答复，不再"看着 Waiting 干瞪眼"；(b) 方向不明确时 Agent 用 ask_user 给 2-N 个方向选项，单选/多选均可正确回传；(c) Web 端选项按钮可用；(d) 旧自由文本答复路径全兼容；(e) 双模块 `go test ./...` 绿。
+    - 不做：不做多轮向导式问答（一次一问及答，多轮由 Agent 多次调用 ask_user 实现）；不做选项的动态生成 UI 表单（仅限预定义选项列表）；不做 question_id 多并发问答（同一 session 同时刻仅一个 pendingClarify，沿用现状）；不改 fail-closed 安全语义（无法识别的确认答复仍判拒绝）；不做 Web 端以外的第三方客户端适配。
+    - 落地（任务 60，2026-08-16）：
+      - **协议层**：`agent/types.go` + `pkg/types/graph.go` 的 `ClarifyRequest` 加 `Kind`（confirm/choice/text，缺省 text 向后兼容）/`MultiSelect`/`Options []ClarifyOption{ID,Label,Description}`/`AnswerOptionIDs`；`server/session.go` 快照映射同步；`domain/tool/ask_user.go` 实现 `SchemaSource`（schema 含 options/multi_select，LLM 可见结构化选项）+ `AskUserHookFunc` 签名加 `AskUserOptions`（旧两参调用点全量迁移）；`ApprovalHook` 构造 `Kind=confirm` + 确认/拒绝两选项；`parseClarifyAnswer`（选项 ID/Label/数字序号命中、多选逗号顿号空格分隔、全命中回传 Label 连接、任一未命中回退自由文本）+ `resolveApproval`（选项裁决优先于关键词，fail-closed）+ `recordClarifyAnswer`（Answer/AnswerOptionIDs/AnsweredAt 写回）；sendMessage/answerClarify 四分支统一走解析；`stream_http.go` awaiting_clarify 帧加 options/multi_select。
+      - **TUI（块 1 + 块 3a/3b）**：`eventChatItem` 加 clarify 分支（提问 ❓ 剥离"Agent 提问: "前缀 / 答复 ✅ 剥离"提问答复: "/"审批答复: "前缀，空消息不展示）；对话区只给**最后一条**澄清提问卡片注入当前选项列表（多轮 ask_user 旧卡片不串选项）；buildContent 加 ❓（LogWarn）/✅（LogSuccess）样式；`syncInputMode` 按会话状态自动切 `inputClarify` 模式（awaiting_clarify ↔ inputClarify，离开后清空多选集）；submitInput 澄清模式非命令输入自动带 question_id 走 `/clarify`（id 缺失回退 sendMessage）；输入栏第二行引导"⏳ Agent 等待答复：直接输入文字回车提交（或按数字键 1-9 选择，y=确认 / n=拒绝）"；数字键 1-9 单选即答/多选 toggle+Enter 提交、y/n 映射 confirm/reject；树面板占位节点 ⚠️ 待确认/❓ 待答复。
+      - **Web（块 3c）**：SSE awaiting_clarify 帧由 index.vue 拦截存入 clarifyPending（不 push 进 events，避免 turns 当思考步骤；onSnapshot/切换会话时复位）；MessageList/AssistantTurn 透传 props；待澄清卡片渲染单选按钮（点击即提交选项 ID）/多选 checkbox+提交（ID 逗号分隔），底部提示"也可直接输入文字答复"；提交成功 emit submit-clarify → 父级置 running + 重开会话重建事件流。自由文本答复路径（handleSubmit → /clarify）不动。
+      - 测试：agent 包新增 `clarify_options_test.go`（parseClarifyAnswer 8 命中用例 + 回退、resolveApproval 12 用例、recordClarifyAnswer、ApprovalHook 选项结构 + 序号 1/2 裁决、ask_user hook 选项透传 + 序号回传 Label 入下一轮）；tool 包新增选项透传/垃圾选项降级/schema 断言 3 用例 + 旧 hook 签名迁移；TUI 包新增 `clarify_test.go` 5 用例（eventChatItem 提问/答复/空、选项注入、syncInputMode）；既有测试回归（approval/ask_user 自由文本路径、schema 计数 23→24 因 ask_user 实现 SchemaSource）。
+      - 验证：`go build && go vet && go test ./backend/...` 29 包全绿；web `vue-tsc -b && vite build` 绿（顺带修复 package-lock.json 预存漂移：dompurify/@types 缺失，npm install 同步）。
+      - 开放动作：TUI/Web 真机人工验收（破坏性确认按 2 拒绝、方向选择按数字键、Web 点按钮）；真实 LLM 会话观察模型是否按描述主动传 options（schema 已暴露，行为依赖模型）；answerClarify 答复后旧卡片选项随 PendingClarify 清空自动消失（已按"最后一条"注入规避串卡片）。
+
 ## 已完成（已归档到 git 历史）
 
 - **评测体系落地 + 首次基线**（2026-08-14）：`test/eval/`（build tag `eval`）真实 LLM 任务完成率评测——场景 YAML + checkpoint 判分（command/file/regex/tree/llm_judge）+ token/子Agent 指标聚合 + TheAgentCompany 式全量/部分分报告（`test/eval/runs/`）；环境隔离修复：`docker/docker-compose.test.yml` 独立端口（PG 55432/Redis 56380）+ 无固定容器名，fixture 维度对齐 migrations（768）。首基线 12 场景 full pass 91.7%、加权 0.979，详见 `doc/eval/baseline_2026-08-14.md`。后续加固（同日）：fixture 改"共享容器常驻 + 每测试独立 PG database/Redis 逻辑库"（Redis 开 1024 逻辑库），并行包 `go test ./...` 不再互相拆台；`TestFactExtractionFallback` 序列对齐现行后端（verify_kind 校验分层 + 派发后不阻塞）。开放项：verifyloop 场景判分口径修正（自动验证闭环已下线，改测 verify_kind 证据）、EVAL_RUNS=3 可靠性、SWE-bench 20 题切片（Phase 2）。

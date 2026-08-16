@@ -35,8 +35,9 @@ func TestDynamicToolSchemaExposure(t *testing.T) {
 	for _, s := range r.Schema() {
 		names[s.Name()] = true
 	}
-	if names["ask_user"] {
-		t.Fatal("ask_user 未实现 SchemaSource，不应出现在 Schema（保持既有行为）")
+	// ask_user 自 TODO #53 起实现 SchemaSource（含 options/multi_select 入参），应出现在 Schema。
+	if !names["ask_user"] {
+		t.Fatal("ask_user 已实现 SchemaSource，应出现在 Schema（TODO #53 结构化选项）")
 	}
 
 	// 注册两个动态工具（顺序固定）。

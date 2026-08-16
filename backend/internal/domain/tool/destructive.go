@@ -14,6 +14,7 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 )
 
@@ -79,8 +80,10 @@ func inProductionWorkDir(workDir, production string) bool {
 }
 
 // ApprovalMessage 生成推给用户的确认文案（导出供会话层推送「需确认」事件）。
+// 文案必须包含工具名与关键参数，让用户能判断"要确认的是什么操作"：
+// 已知工具取关键参数（文件路径/命令），其余工具（如插件工具）附完整参数 JSON（截断）。
 func ApprovalMessage(toolName string, args map[string]any) string {
-	desc := "该工具为破坏性操作"
+	desc := "工具 " + toolName + " 为破坏性操作"
 	switch toolName {
 	case "WriteFile", "EditFile":
 		if p, _ := args["path"].(string); p != "" {
@@ -89,6 +92,10 @@ func ApprovalMessage(toolName string, args map[string]any) string {
 	case "RunCommand":
 		if c, _ := args["command"].(string); c != "" {
 			desc = "将执行命令 " + truncate(c, 120)
+		}
+	default:
+		if b, err := json.Marshal(args); err == nil && len(args) > 0 {
+			desc += "，参数: " + truncate(string(b), 160)
 		}
 	}
 	return "【需确认】" + desc + "，且当前处于生产环境/命中危险命令模式。回复「确认」执行，「拒绝」取消；其余答复按拒绝处理。"

@@ -854,6 +854,13 @@ func (s *ReactService) ApprovalHook() tool.ApprovalHookFunc {
 			Context:   "破坏性工具调用待用户确认（生产边界/危险命令）",
 			AgentID:   tool.AgentIDFromContext(ctx),
 			CreatedAt: time.Now(),
+			// TODO #53 结构化确认：Kind=confirm + 确认/拒绝两选项，
+			// 答复按选项 ID 精确裁决（confirm/reject），自由文本经 parseApproval 兑底。
+			Kind: "confirm",
+			Options: []ClarifyOption{
+				{ID: "confirm", Label: "确认执行", Description: "允许执行该操作"},
+				{ID: "reject", Label: "拒绝取消", Description: "拒绝执行，取消本次调用"},
+			},
 		}
 		sess.Status = enums.SessionStatusAwaitingClarify
 		s.store.mu.Unlock()
@@ -894,14 +901,101 @@ func parseApproval(answer string) bool {
 	return false
 }
 
-// AskUserHook 返回 ask_user 工具的会话层回调（TODO #24 人在回路）。
+// splitClarifyTokens 按逗号/顿号/分号/空白拆分答复 token，去重保序。
+func splitClarifyTokens(answer string) []string {
+	fields := strings.FieldsFunc(answer, func(r rune) bool {
+		return r == ',' || r == '，' || r == '、' || r == ';' || r == '；' ||
+			r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	seen := map[string]bool{}
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+		if f == "" || seen[f] {
+			continue
+		}
+		seen[f] = true
+		out = append(out, f)
+	}
+	return out
+}
+
+// parseClarifyAnswer 把用户对澄清请求的答复解析为 (回传文本, 命中选项 ID 列表)
+// （TODO #53 结构化选项）。仅当 pc 带选项时启用，否则原样返回（旧自由文本行为）：
+//   - 单选/多选按分隔符拆分（逗号/顿号/分号/空白，中英文均可）；
+//   - 每个 token 精确匹配选项 ID 或 Label，或数字序号 "N"（1 基）映射第 N 项
+//     （TUI/Web 快捷选择都走这里）；
+//   - 全部 token 命中 → 回传文本 = 命中选项 Label 以"、"连接，optionIDs 按序；
+//   - 任一 token 未命中 → 回退自由文本原文（(answer, nil)），不吞用户输入。
+func parseClarifyAnswer(answer string, pc *ClarifyRequest) (string, []string) {
+	if pc == nil || len(pc.Options) == 0 {
+		return answer, nil
+	}
+	ids := make([]string, 0, 2)
+	labels := make([]string, 0, 2)
+	for _, tok := range splitClarifyTokens(answer) {
+		idx := -1
+		for i, o := range pc.Options {
+			if tok == o.ID || tok == o.Label {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			// 数字序号：第 N 项（1 基）。
+			if n, err := strconv.Atoi(tok); err == nil && n >= 1 && n <= len(pc.Options) {
+				idx = n - 1
+			}
+		}
+		if idx < 0 {
+			return answer, nil // 任一 token 未命中：回退自由文本
+		}
+		ids = append(ids, pc.Options[idx].ID)
+		labels = append(labels, pc.Options[idx].Label)
+	}
+	return strings.Join(labels, "、"), ids
+}
+
+// recordClarifyAnswer 把用户答复记录到 pendingClarify（回传文本 + 命中选项 ID，TODO #53），
+// 返回 (回传文本, 命中选项 ID 列表)。回传文本 = 选项命中时 Label 连接 / 否则原文，
+// 供 ask_user 工具结果带回 ReAct 循环；选项 ID 随快照透出供前端展示。
+func recordClarifyAnswer(pc *ClarifyRequest, answer string) (string, []string) {
+	text, ids := parseClarifyAnswer(answer, pc)
+	if pc != nil {
+		pc.Answer = text
+		pc.AnswerOptionIDs = ids
+		now := time.Now()
+		pc.AnsweredAt = &now
+	}
+	return text, ids
+}
+
+// resolveApproval 把用户对破坏性操作确认的答复解析为裁决（TODO #53 选项化）：
+// pendingClarify 带 confirm 选项时，命中选项 ID（confirm/reject）或数字序号直接裁决，
+// 优先于关键词匹配；未命中回退 parseApproval 自由文本兑底。fail-closed。
+func resolveApproval(answer string, pc *ClarifyRequest) bool {
+	if pc != nil && len(pc.Options) > 0 {
+		if _, ids := parseClarifyAnswer(answer, pc); len(ids) > 0 {
+			switch ids[0] {
+			case "confirm":
+				return true
+			case "reject":
+				return false
+			}
+		}
+	}
+	return parseApproval(answer)
+}
+
+// AskUserHook 返回 ask_user 工具的会话层回调（TODO #24 人在回路，#53 结构化选项）。
 // 由 bootstrap 注入 tool.Registry.SetAskUserHook；meta/domain Agent 在任务执行中
 // 主动提问时触发。与 ApprovalHook 同通道范式：置 PendingClarify + 会话暂停
 // （awaiting_clarify）+ 推 clarify 事件 → 阻塞等用户答复（Agent goroutine 存活）→
 // sendMessage/answerClarify 把**原始答复文本**写入 askUser 通道 →
 // ask_user 工具结果带回 ReAct 循环。会话取消时返回 ctx 错误。
+// opts.Options 非空时（TODO #53）透传为结构化选项（Kind=choice），用户可点选。
 func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
-	return func(ctx context.Context, question string) (string, error) {
+	return func(ctx context.Context, question string, opts tool.AskUserOptions) (string, error) {
 		sid := tool.SessionIDFromContext(ctx)
 		if sid == "" {
 			return "", fmt.Errorf("ask_user: missing session context")
@@ -914,13 +1008,24 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		}
 		ch := make(chan string, 1)
 		sess.askUser = ch
-		sess.pendingClarify = &ClarifyRequest{
-			ID:        fmt.Sprintf("ask-%d", time.Now().UnixNano()),
-			Question:  question,
-			Context:   "Agent 向用户提问（人在回路）",
-			AgentID:   tool.AgentIDFromContext(ctx),
-			CreatedAt: time.Now(),
+		req := &ClarifyRequest{
+			ID:          fmt.Sprintf("ask-%d", time.Now().UnixNano()),
+			Question:    question,
+			Context:     "Agent 向用户提问（人在回路）",
+			AgentID:     tool.AgentIDFromContext(ctx),
+			CreatedAt:   time.Now(),
+			MultiSelect: opts.MultiSelect,
 		}
+		if len(opts.Options) > 0 {
+			// 结构化选项（TODO #53）：Kind=choice；纯自由文本提问保持旧行为（Kind=text）。
+			req.Kind = "choice"
+			for _, o := range opts.Options {
+				req.Options = append(req.Options, ClarifyOption{ID: o.ID, Label: o.Label, Description: o.Description})
+			}
+		} else {
+			req.Kind = "text"
+		}
+		sess.pendingClarify = req
 		sess.Status = enums.SessionStatusAwaitingClarify
 		s.store.mu.Unlock()
 
@@ -1742,10 +1847,11 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		return ErrSessionNotFound
 	}
 
-	// 待答复的 Agent 提问（TODO #24 ask_user）：原始答复文本写入 askUser 通道，
-	// 由 ask_user 工具结果带回 ReAct 循环（不做 parseApproval 裁决）。
+	// 待答复的 Agent 提问（TODO #24 ask_user；#53 选项解析）：答复写 askUser 通道。
+	// 带选项时按选项 ID/Label/数字序号解析回传（Label 连接文本），自由文本原样透传。
 	if session.askUser != nil {
-		session.askUser <- content
+		text, _ := recordClarifyAnswer(session.pendingClarify, content)
+		session.askUser <- text
 		session.Messages = append(session.Messages, Message{
 			Role:      string(enums.ChatRoleUser),
 			Content:   "[澄清答复] " + content,
@@ -1756,11 +1862,13 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		return nil
 	}
 
-	// 待审批的破坏性操作（TODO #17 P1）：任意用户消息作为确认答复路由进审批通道。
+	// 待审批的破坏性操作（TODO #17 P1；#53 选项化）：答复路由进审批通道。
 	// Agent goroutine 存活，不重建会话不 resume（避免双跑）；答复不进入 LLM 对话历史，
-	// 由工具结果带回 ReAct 循环。明确同意才放行，其余按拒绝（fail-closed）。
+	// 由工具结果带回 ReAct 循环。confirm 选项命中（confirm/reject/数字序号）直接裁决，
+	// 否则 parseApproval 关键词兑底（fail-closed：不明确即拒绝）。
 	if session.approval != nil {
-		session.approval <- parseApproval(content)
+		_, _ = recordClarifyAnswer(session.pendingClarify, content)
+		session.approval <- resolveApproval(content, session.pendingClarify)
 		session.Messages = append(session.Messages, Message{
 			Role:      string(enums.ChatRoleUser),
 			Content:   "[澄清答复] " + content,
@@ -1903,9 +2011,11 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 		}
 		return fmt.Errorf("%w: session is not awaiting clarification", ErrInvalidSessionState)
 	}
-	// 待答复的 Agent 提问（TODO #24 ask_user）：原始答复文本写入 askUser 通道。
+	// 待答复的 Agent 提问（TODO #24 ask_user；#53 选项解析）：答复写 askUser 通道。
+	// 带选项时按选项 ID/Label/数字序号解析回传，自由文本原样透传。
 	if session.askUser != nil {
-		session.askUser <- answer
+		text, _ := recordClarifyAnswer(session.pendingClarify, answer)
+		session.askUser <- text
 		session.Messages = append(session.Messages, Message{
 			Role:      string(enums.ChatRoleUser),
 			Content:   "[澄清答复] " + answer,
@@ -1915,9 +2025,10 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 		s.store.addEvent(session, eventkind.Clarify, "User", "提问答复: "+answer, "", "", "", "", "", true)
 		return nil
 	}
-	// 待审批的破坏性操作确认（TODO #17 P1）：答复路由进审批通道，不重建会话（Agent goroutine 存活）。
+	// 待审批的破坏性操作确认（TODO #17 P1；#53 选项化）：答复路由进审批通道，不重建会话（Agent goroutine 存活）。
 	if session.approval != nil {
-		session.approval <- parseApproval(answer)
+		_, _ = recordClarifyAnswer(session.pendingClarify, answer)
+		session.approval <- resolveApproval(answer, session.pendingClarify)
 		session.Messages = append(session.Messages, Message{
 			Role:      string(enums.ChatRoleUser),
 			Content:   "[澄清答复] " + answer,

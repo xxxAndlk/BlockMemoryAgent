@@ -1,5 +1,12 @@
 export type SessionStatus = 'running' | 'completed' | 'error' | 'awaiting_clarify'
 
+/** 待澄清问题的选项（来自 SSE awaiting_clarify 帧） */
+export interface ClarifyOption {
+  id: string
+  label: string
+  description?: string
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string

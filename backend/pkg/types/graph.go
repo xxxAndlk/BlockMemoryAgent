@@ -38,6 +38,14 @@ type ChatMessage struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// ClarifyOption 是澄清请求的一个结构化选项（TODO #53）。
+// 用户可点选选项答复（单选/多选），也可忽略选项自由文本答复。
+type ClarifyOption struct {
+	ID          string `json:"id"`                    // 选项唯一标识（确认场景固定 confirm/reject）
+	Label       string `json:"label"`                 // 选项展示文本
+	Description string `json:"description,omitempty"` // 选项补充说明（可选）
+}
+
 // ClarifyRequest 人机对话请求：Agent 在执行中遇到需要用户确认的问题时挂起，
 // 由 server 层通过 HTTP 暴露给前端，用户答复后恢复会话。
 type ClarifyRequest struct {
@@ -48,6 +56,15 @@ type ClarifyRequest struct {
 	CreatedAt  time.Time  `json:"created_at"`            // 创建时间
 	Answer     string     `json:"answer,omitempty"`      // 用户答复（回填）
 	AnsweredAt *time.Time `json:"answered_at,omitempty"` // 答复时间
+	// Kind 澄清类型（TODO #53）：confirm=破坏性操作确认 / choice=选项选择 /
+	// text=纯自由文本。缺省空串视为 text（向后兼容）。
+	Kind string `json:"kind,omitempty"`
+	// MultiSelect 是否允许多选（仅 choice 有意义；confirm 恒单选）。
+	MultiSelect bool `json:"multi_select,omitempty"`
+	// Options 结构化选项列表；空表示无选项（自由文本答复）。
+	Options []ClarifyOption `json:"options,omitempty"`
+	// AnswerOptionIDs 答复时命中的选项 ID（多选按序）；自由文本答复为空。
+	AnswerOptionIDs []string `json:"answer_option_ids,omitempty"`
 }
 
 // UIEvent TUI 推送事件：向 bubbletea TUI / Web SSE 订阅者广播的事件信封。

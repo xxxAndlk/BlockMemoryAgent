@@ -17,7 +17,7 @@ import (
 )
 
 // buildCrowdedModel 构造截图场景：3 个领域分支（1 个运行中带等待标注与长任务）、
-// 领域进度面板有事件、右栏可见。经 NewModel + WindowSizeMsg 走真实尺寸分发路径。
+// 会话事件若干、右栏可见。经 NewModel + WindowSizeMsg 走真实尺寸分发路径。
 func buildCrowdedModel(w, h int) *Model {
 	m := NewModel(nil, nil, "http://127.0.0.1:1", "test")
 	nm, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
@@ -44,7 +44,7 @@ func buildCrowdedModel(w, h int) *Model {
 	return mm
 }
 
-// TestViewNoPhysicalLineOverflow 拥挤场景（3 分支+进度面板+长等待标注）下，
+// TestViewNoPhysicalLineOverflow 拥挤场景（3 分支+长等待标注）下，
 // View 的每个物理行宽度不得超过终端宽度、总行数不得超过终端高度。
 func TestViewNoPhysicalLineOverflow(t *testing.T) {
 	// 与 cmd/tui 保持一致：东亚字符按窄字符计算宽度。

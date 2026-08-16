@@ -26,9 +26,12 @@ func TestAskUserTool_Unwired(t *testing.T) {
 // TestAskUserTool_AnswerPassThrough hook 返回的原始答复透传为工具结果。
 func TestAskUserTool_AnswerPassThrough(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	r.SetAskUserHook(func(ctx context.Context, question string) (string, error) {
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
 		if !strings.Contains(question, "配色") {
 			t.Fatalf("question should pass through, got: %s", question)
+		}
+		if len(opts.Options) != 0 {
+			t.Fatalf("no options passed, got: %+v", opts.Options)
 		}
 		return "用深色", nil
 	})
@@ -44,7 +47,7 @@ func TestAskUserTool_AnswerPassThrough(t *testing.T) {
 // TestAskUserTool_TimeoutSelfDecision hook 超时未答复 -> "用户未答复，自行决策"。
 func TestAskUserTool_TimeoutSelfDecision(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	r.SetAskUserHook(func(ctx context.Context, question string) (string, error) {
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	})
@@ -63,7 +66,7 @@ func TestAskUserTool_TimeoutSelfDecision(t *testing.T) {
 // TestAskUserTool_HookError 会话取消等 hook 错误 -> 工具失败（ReAct 随 ctx 退出）。
 func TestAskUserTool_HookError(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	r.SetAskUserHook(func(ctx context.Context, question string) (string, error) {
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
 		return "", errors.New("session gone")
 	})
 	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{"question": "q"})
@@ -78,7 +81,7 @@ func TestAskUserTool_HookError(t *testing.T) {
 // TestAskUserTool_DefaultTimeout 注册表默认超时生效（timeout_sec 缺省时）。
 func TestAskUserTool_DefaultTimeout(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	r.SetAskUserHook(func(ctx context.Context, question string) (string, error) {
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	})
@@ -90,6 +93,96 @@ func TestAskUserTool_DefaultTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 500*time.Millisecond || elapsed > 5*time.Second {
 		t.Fatalf("default timeout should bound the wait, elapsed=%v", elapsed)
+	}
+}
+
+// TestAskUserTool_OptionsPassThrough 结构化选项透传（TODO #53）：
+// options/multi_select 入参解析后交 hook，多选标记透传。
+func TestAskUserTool_OptionsPassThrough(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
+		if !opts.MultiSelect {
+			t.Fatal("multi_select=true 应透传")
+		}
+		if len(opts.Options) != 3 {
+			t.Fatalf("expected 3 options, got %d: %+v", len(opts.Options), opts.Options)
+		}
+		want := []AskUserOption{
+			{ID: "dark", Label: "深色", Description: "护眼"},
+			{ID: "light", Label: "浅色"},
+			{ID: "auto", Label: "跟随系统"},
+		}
+		for i, w := range want {
+			if opts.Options[i] != w {
+				t.Fatalf("option %d mismatch: got %+v want %+v", i, opts.Options[i], w)
+			}
+		}
+		return "深色", nil
+	})
+	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{
+		"question":     "配色？",
+		"multi_select": true,
+		"options": []map[string]any{
+			{"id": "dark", "label": "深色", "description": "护眼"},
+			{"id": "light", "label": "浅色"},
+			{"id": "auto", "label": "跟随系统"},
+		},
+	})
+	if !res.Success {
+		t.Fatalf("ask_user with options should succeed, got: %+v", res)
+	}
+	if !strings.Contains(res.Output, "用户答复: 深色") {
+		t.Fatalf("expected answer in output, got: %s", res.Output)
+	}
+}
+
+// TestAskUserTool_OptionsGarbageIgnored 入参 options 格式损坏时降级为空选项（自由文本），不报错。
+func TestAskUserTool_OptionsGarbageIgnored(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
+		if len(opts.Options) != 0 {
+			t.Fatalf("garbage options should be dropped, got: %+v", opts.Options)
+		}
+		return "ok", nil
+	})
+	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{
+		"question": "q",
+		"options":  []any{"not-a-map", map[string]any{"id": "", "label": "x"}},
+	})
+	if !res.Success {
+		t.Fatalf("garbage options should not fail the tool, got: %+v", res)
+	}
+}
+
+// TestAskUserTool_Schema 入参 schema 含 question/options/multi_select/timeout_sec（TODO #53）。
+func TestAskUserTool_Schema(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	found := false
+	for _, s := range r.Schema() {
+		if s.Name() != "ask_user" {
+			continue
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("ask_user 应出现在 Registry.Schema()（TODO #53 实现 SchemaSource 后）")
+	}
+	toolInst, ok := r.toolByName("ask_user")
+	if !ok {
+		t.Fatal("ask_user 应已注册")
+	}
+	src, ok := toolInst.(SchemaSource)
+	if !ok {
+		t.Fatal("ask_user 应实现 SchemaSource")
+	}
+	props := src.InputSchema().Properties
+	for _, want := range []string{"question", "options", "multi_select", "timeout_sec"} {
+		if _, ok := props[want]; !ok {
+			t.Fatalf("ask_user schema missing parameter %q (have %v)", want, keysOf(props))
+		}
+	}
+	if len(src.InputSchema().Required) != 1 || src.InputSchema().Required[0] != "question" {
+		t.Fatalf("question 应为唯一必填项, got %v", src.InputSchema().Required)
 	}
 }
 

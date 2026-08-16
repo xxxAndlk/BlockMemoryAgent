@@ -15,6 +15,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/dag"
 	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // pasteEnterThreshold 用于区分终端粘贴产生的连续 Enter 与手动回车。
@@ -70,6 +71,33 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.inputBar.cursor++
 			return m, nil
 		}
+		// TODO #53：澄清选项导航模式且输入为空时，Enter 提交当前选项
+		// （单选=高亮项 ID；多选=勾选集 join ","，后端按 ID 解析）。
+		// 输入栏已有文字时走普通提交（自由文本答复优先）。
+		if m.clarifyNavActive() && len(m.inputBar.runes) == 0 {
+			s := m.selectedSession()
+			pc := s.State.PendingClarify
+			answer, ok := m.clarifySubmitAnswer(pc)
+			if !ok {
+				m.flashMsg("请先空格勾选选项（或直接输入文字答复）")
+				return m, nil
+			}
+			label := clarifyOptionLabel(pc.Options, answer)
+			if pc.MultiSelect {
+				labels := make([]string, 0, len(m.clarifySel))
+				for _, id := range m.clarifySel {
+					labels = append(labels, clarifyOptionLabel(pc.Options, id))
+				}
+				label = strings.Join(labels, "、")
+			}
+			m.postJSON(fmt.Sprintf("/api/sessions/%s/clarify", s.ID), map[string]string{"question_id": pc.ID, "answer": answer})
+			m.clarifySel = nil
+			m.inputBar.mode = inputNormal
+			// 保持焦点在输入栏，方便用户继续操作。
+			m.focus = panelInput
+			m.flashMsg("已选择: " + label)
+			return m, nil
+		}
 		// 非粘贴 Enter：提交输入。
 		cmd := string(m.inputBar.runes)
 		if strings.TrimSpace(cmd) != "" {
@@ -107,6 +135,13 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyUp:
+		// 澄清选项导航（TODO #53）：↑ 上移高亮选项，优先于历史输入浏览。
+		if m.clarifyNavActive() {
+			if m.clarifyCursor > 0 {
+				m.clarifyCursor--
+			}
+			return m, nil
+		}
 		// 向上浏览历史输入。
 		h := m.sessionHistory()
 		if len(h) == 0 {
@@ -123,6 +158,13 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyDown:
+		// 澄清选项导航（TODO #53）：↓ 下移高亮选项，优先于历史输入浏览。
+		if m.clarifyNavActive() {
+			if pc := m.pendingClarify(); m.clarifyCursor < len(pc.Options)-1 {
+				m.clarifyCursor++
+			}
+			return m, nil
+		}
 		// 向下浏览历史输入。
 		h := m.sessionHistory()
 		if m.inputBar.histIdx == -1 {
@@ -184,6 +226,11 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.ctrlCQuit()
 
 	case tea.KeyRunes:
+		// TODO #53：澄清模式下数字键 1-9 / y / n 快捷选择选项，
+		// 命中即消费该键（不进入普通字符插入）；其余字符仍可自由输入文字答复。
+		if m.inputBar.mode == inputClarify && len(msg.Runes) == 1 && m.handleClarifyQuickKey(msg) {
+			return m, nil
+		}
 		// 在光标位置插入输入字符。
 		m.inputBar.runes = append(m.inputBar.runes[:m.inputBar.cursor], append(msg.Runes, m.inputBar.runes[m.inputBar.cursor:]...)...)
 		m.inputBar.cursor += len(msg.Runes)
@@ -191,6 +238,125 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// handleClarifyQuickKey 处理澄清模式下的快捷选择键（TODO #53）：
+// 条件为当前会话存在 PendingClarify 且带结构化选项。
+// 空格：输入为空时操作当前高亮选项（多选=切换勾选；单选=直接提交）；已有文字时不消费。
+// 数字键 1-9：单选立即提交所选选项 ID；多选切换 clarifySel 选择集（Enter 统一提交）。
+// y/n：仅确认场景（Kind==confirm 或选项含 confirm/reject ID）可用，立即提交 confirm/reject。
+// 返回 true 表示按键已被消费（不进入普通字符插入逻辑）。
+func (m *Model) handleClarifyQuickKey(msg tea.KeyMsg) bool {
+	s := m.selectedSession()
+	if s == nil || s.State == nil || s.State.PendingClarify == nil {
+		return false
+	}
+	pc := s.State.PendingClarify
+	if len(pc.Options) == 0 {
+		return false
+	}
+	r := msg.Runes[0]
+
+	// 空格：输入栏为空时作为选项操作键；已有输入内容时按普通字符插入（自由文本可含空格）。
+	if r == ' ' {
+		if len(m.inputBar.runes) > 0 {
+			return false
+		}
+		opt := pc.Options[m.clarifyCursorClamped(pc)]
+		if pc.MultiSelect {
+			m.toggleClarifyOption(pc, opt)
+			return true
+		}
+		m.submitClarifyAnswer(s.ID, pc, opt.ID, opt.Label)
+		return true
+	}
+
+	// y / n：仅确认场景可用（Kind==confirm，或选项里含 confirm/reject ID）。
+	if r == 'y' || r == 'n' {
+		isConfirm := pc.Kind == "confirm"
+		if !isConfirm {
+			for _, o := range pc.Options {
+				if o.ID == "confirm" || o.ID == "reject" {
+					isConfirm = true
+					break
+				}
+			}
+		}
+		if !isConfirm {
+			return false
+		}
+		ans := "confirm"
+		if r == 'n' {
+			ans = "reject"
+		}
+		m.submitClarifyAnswer(s.ID, pc, ans, clarifyOptionLabel(pc.Options, ans))
+		return true
+	}
+
+	// 数字键 1-9：序号须在选项范围内，超界不消费（交给普通输入）。
+	if r < '1' || r > '9' {
+		return false
+	}
+	idx := int(r - '1')
+	if idx >= len(pc.Options) {
+		return false
+	}
+	opt := pc.Options[idx]
+
+	if pc.MultiSelect {
+		// 多选：切换选择集，flash 展示当前已选（Enter 统一提交）。
+		m.toggleClarifyOption(pc, opt)
+		return true
+	}
+
+	// 单选：立即提交所选选项 ID，清空输入并退出澄清模式。
+	m.submitClarifyAnswer(s.ID, pc, opt.ID, opt.Label)
+	return true
+}
+
+// toggleClarifyOption 切换多选选择集中的某个选项，并 flash 展示当前已选标签（TODO #53）。
+func (m *Model) toggleClarifyOption(pc *types.ClarifyRequest, opt types.ClarifyOption) {
+	found := -1
+	for i, id := range m.clarifySel {
+		if id == opt.ID {
+			found = i
+			break
+		}
+	}
+	if found >= 0 {
+		m.clarifySel = append(m.clarifySel[:found], m.clarifySel[found+1:]...)
+	} else {
+		m.clarifySel = append(m.clarifySel, opt.ID)
+	}
+	labels := make([]string, 0, len(m.clarifySel))
+	for _, id := range m.clarifySel {
+		labels = append(labels, clarifyOptionLabel(pc.Options, id))
+	}
+	if len(labels) == 0 {
+		m.flashMsg("已取消全部选择（回车直接输入文字答复）")
+	} else {
+		m.flashMsg("已选: " + strings.Join(labels, "、") + "（回车提交）")
+	}
+}
+
+// submitClarifyAnswer 提交澄清答复（选项 ID），清空输入并退出澄清模式（TODO #53）。
+func (m *Model) submitClarifyAnswer(sessionID string, pc *types.ClarifyRequest, answer, label string) {
+	m.postJSON(fmt.Sprintf("/api/sessions/%s/clarify", sessionID), map[string]string{"question_id": pc.ID, "answer": answer})
+	m.inputBar.runes = nil
+	m.inputBar.cursor = 0
+	m.inputBar.mode = inputNormal
+	m.clarifySel = nil
+	m.flashMsg("已选择: " + label)
+}
+
+// clarifyOptionLabel 按选项 ID 查找展示 Label；未命中时回退返回 ID 本身。
+func clarifyOptionLabel(opts []types.ClarifyOption, id string) string {
+	for _, o := range opts {
+		if o.ID == id {
+			return o.Label
+		}
+	}
+	return id
 }
 
 // submitInput 解析用户输入命令并路由到对应 HTTP 端点。
@@ -208,6 +374,18 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) submitInput(cmd string) {
 	if strings.TrimSpace(cmd) == "" {
 		return
+	}
+
+	// TODO #53：澄清模式下非命令输入直接作为答复提交（自由文本或选项文本），
+	// 走 /api/sessions/{id}/clarify 通道；斜杠命令仍按命令解析。
+	if m.inputBar.mode == inputClarify && !strings.HasPrefix(strings.TrimSpace(cmd), "/") {
+		if s := m.selectedSession(); s != nil && s.State != nil && s.State.PendingClarify != nil {
+			if id := s.State.PendingClarify.ID; id != "" {
+				m.postJSON(fmt.Sprintf("/api/sessions/%s/clarify", s.ID), map[string]string{"question_id": id, "answer": cmd})
+				return
+			}
+		}
+		// question_id 取不到（PendingClarify 已变化）时回退普通 sendMessage 路径。
 	}
 
 	// 命令解析用去空白版本；消息发送保留原始内容，避免多行粘贴时首行缩进被吞。

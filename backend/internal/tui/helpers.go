@@ -472,6 +472,28 @@ func chatItemsResolved(s *server.Session, compact bool, resolver func(childID st
 		items = deduped
 	}
 
+	// TODO #53：对话区结构化选项——只给**最后一条**澄清提问条目（❓ 前缀）注入
+	// 当前 PendingClarify 的选项列表（同一 session 多轮 ask_user 时，旧问题的卡片
+	// 不显示新问题的选项）；每行 "  N. <label>"（detail 按现有渲染再缩进），
+	// 多选时末尾追加提示行；无选项时 detail 保持为空。
+	if s.State != nil && s.State.PendingClarify != nil {
+		if pc := s.State.PendingClarify; len(pc.Options) > 0 {
+			for i := len(items) - 1; i >= 0; i-- {
+				if strings.HasPrefix(items[i].title, "❓ ") {
+					var b strings.Builder
+					for j, opt := range pc.Options {
+						fmt.Fprintf(&b, "  %d. %s\n", j+1, opt.Label)
+					}
+					if pc.MultiSelect {
+						b.WriteString("（可多选，逗号分隔；或直接输入文字答复）")
+					}
+					items[i].detail = strings.TrimRight(b.String(), "\n")
+					break
+				}
+			}
+		}
+	}
+
 	// 运行中会话追加实时状态条目（不走事件流，避免 token 级事件淹没事件列表）：
 	// 有流式文本时展示"正在输出"的助手条目；否则按是否有未完成的工具调用
 	// 分别展示"工具执行中"与"思考中"等待状态，保证等待期界面始终有反馈。
@@ -943,6 +965,26 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		}
 		role := subAgentRoleFromID(id)
 		title = "✓ " + subAgentRoleLabel(role) + "执行完成: " + id
+		return title, "", title, true
+	// 澄清问答事件（TODO #53）：提问（Agent 非 User）与答复（Agent 为 User）。
+	// 后端原始 Message 带 "Agent 提问: " / "提问答复: " / "审批答复: " 前缀，
+	// 在此剥离后以 ❓/✅ 前缀展示；空消息不展示。
+	case ev.Type == "clarify":
+		msg := strings.TrimSpace(ev.Message)
+		if msg == "" {
+			return "", "", "", false
+		}
+		if ev.Agent != "User" {
+			msg = strings.TrimSpace(strings.TrimPrefix(msg, "Agent 提问: "))
+			title = "❓ " + msg
+		} else {
+			msg = strings.TrimSpace(strings.TrimPrefix(msg, "提问答复: "))
+			msg = strings.TrimSpace(strings.TrimPrefix(msg, "审批答复: "))
+			title = "✅ 答复: " + msg
+		}
+		if msg == "" {
+			return "", "", "", false
+		}
 		return title, "", title, true
 	// LLM/思考/等待等事件。
 	case ev.Kind == "llm_result" || ev.Kind == "llm" || ev.Kind == "intend" || ev.Kind == "wait":

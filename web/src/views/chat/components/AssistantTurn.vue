@@ -1,16 +1,23 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import type { SessionEvent } from '@/types'
+import { computed, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import type { SessionEvent, ClarifyOption } from '@/types'
 import type { Turn, ToolCallGroup } from '../utils/turns'
 import { fmtTime, agentTextColor } from '../utils/eventStyles'
 import { renderMd } from '@/utils/markdown'
+import { clarifySession } from '@/api/session'
 import ThinkChain from './ThinkChain.vue'
 import ToolCallCard from './ToolCallCard.vue'
 
 const props = defineProps<{
   turn: Turn
   verbose?: boolean
+  clarify?: { options: ClarifyOption[]; multiSelect: boolean; questionId: string } | null
+  sessionId: string
 }>()
+
+// 澄清选项提交成功 → 通知父级重开会话刷新事件流（turn 状态由 events 驱动）
+const emit = defineEmits<{ (e: 'submit-clarify'): void }>()
 
 const finalText = computed(() => {
   if (!props.turn.finalAnswer) return ''
@@ -72,6 +79,37 @@ const lastThinkIndex = computed(() => {
   }
   return -1
 })
+
+// ---- 待澄清选项交互 ----
+// 多选已勾选项；提交中禁用按钮防止重复提交。
+// 注意：awaiting_clarify 帧每秒推送、对象引用会变，因此按 questionId 复位而不是按对象引用。
+const selectedOptions = ref<string[]>([])
+const submitting = ref(false)
+
+watch(() => props.clarify?.questionId, () => {
+  selectedOptions.value = []
+})
+
+async function submitOption(optionId?: string) {
+  if (submitting.value) return
+  let answer = ''
+  if (optionId) {
+    answer = optionId // 单选：直接提交选项 ID
+  } else {
+    if (selectedOptions.value.length === 0) return // 多选：无选中项不提交
+    answer = selectedOptions.value.join(',') // 多选：选项 ID 逗号分隔
+  }
+  submitting.value = true
+  try {
+    await clarifySession(props.sessionId, answer)
+    emit('submit-clarify')
+  } catch (e) {
+    console.error('clarify submit failed:', e)
+    ElMessage.error('提交答复失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    submitting.value = false
+  }
+}
 </script>
 
 <template>
@@ -128,6 +166,37 @@ const lastThinkIndex = computed(() => {
           <span class="text-gray-500 ml-auto">{{ fmtTime(turn.clarifyQuestion.timestamp) }}</span>
         </div>
         <div class="whitespace-pre-wrap">{{ turn.clarifyQuestion.message }}</div>
+
+        <!-- 澄清选项（来自 SSE awaiting_clarify 帧）：单选按钮 / 多选复选框 + 提交 -->
+        <template v-if="clarify && clarify.options.length > 0">
+          <div class="mt-2 flex flex-col gap-1.5">
+            <template v-if="!clarify.multiSelect">
+              <button v-for="opt in clarify.options" :key="opt.id" type="button"
+                      :disabled="submitting"
+                      class="text-left text-xs rounded-md border border-yellow-700/40 bg-yellow-900/30 hover:bg-yellow-900/50 px-2.5 py-1.5 text-yellow-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      @click="submitOption(opt.id)">
+                {{ opt.label }}
+                <span v-if="opt.description" class="text-yellow-400/70 ml-1.5">{{ opt.description }}</span>
+              </button>
+            </template>
+            <template v-else>
+              <label v-for="opt in clarify.options" :key="opt.id"
+                     class="flex items-center gap-2 text-xs text-yellow-200 cursor-pointer">
+                <input type="checkbox" :value="opt.id" v-model="selectedOptions" :disabled="submitting"
+                       class="accent-yellow-500" />
+                <span>{{ opt.label }}</span>
+                <span v-if="opt.description" class="text-yellow-400/70">{{ opt.description }}</span>
+              </label>
+              <button type="button"
+                      :disabled="submitting || selectedOptions.length === 0"
+                      class="self-start text-xs rounded-md border border-yellow-700/40 bg-yellow-900/30 hover:bg-yellow-900/50 px-2.5 py-1 text-yellow-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      @click="submitOption()">
+                提交选择
+              </button>
+            </template>
+          </div>
+          <div class="mt-1.5 text-[11px] text-yellow-500/60">也可直接输入文字答复</div>
+        </template>
       </div>
 
       <!-- 运行中提示 -->

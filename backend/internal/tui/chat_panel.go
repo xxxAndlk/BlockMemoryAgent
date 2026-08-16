@@ -513,6 +513,12 @@ func (cp *ChatPanel) buildContent(items []chatItem, styles *Styles, width int) s
 		// 错误事件。
 		case strings.HasPrefix(item.title, "✗ Error"):
 			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, styles.LogError, width)...)
+		// 澄清提问事件（TODO #53）：使用警告色。
+		case strings.HasPrefix(item.title, "❓ "):
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, styles.LogWarn, width)...)
+		// 澄清答复事件（TODO #53）：使用成功色。
+		case strings.HasPrefix(item.title, "✅ "):
+			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, styles.LogSuccess, width)...)
 		// 其他事件：使用信息色。
 		case item.isEvent:
 			titleLines = append(titleLines, wrapStyledLine(tsStyled, item.title, styles.LogInfo, width)...)
