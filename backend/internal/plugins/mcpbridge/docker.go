@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -22,6 +23,11 @@ import (
 
 // dockerContainerName 由插件 id 派生容器名（docker 仅允许 [a-zA-Z0-9_.-]，
 // bundle 插件 id 形如 bundle/<dir>/<server> 含 /，需净化）。
+// 追加进程号后缀：tui.exe 与 headless 后端是同机两个独立 BMA 实例（各自经
+// bootstrap 装配自己的插件管理器），固定容器名会导致两边重启清场时互相
+// docker rm -f 对方的容器（实测表现为秒级重连 churn）。带后缀后各实例只
+// 管理自己的容器；代价是进程被强杀时会残留带旧 pid 的孤儿容器，需手动清理
+//（docker ps -a --filter name=bma-plugin-）。
 func dockerContainerName(pluginID string) string {
 	var sb strings.Builder
 	sb.WriteString("bma-plugin-")
@@ -34,6 +40,7 @@ func dockerContainerName(pluginID string) string {
 			sb.WriteByte('-')
 		}
 	}
+	fmt.Fprintf(&sb, "-%d", os.Getpid())
 	return sb.String()
 }
 

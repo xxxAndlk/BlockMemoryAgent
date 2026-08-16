@@ -76,6 +76,7 @@ type Info struct {
 	State       State  `json:"state"`
 	Enabled     bool   `json:"enabled"`
 	Tools       []string `json:"tools,omitempty"`
+	URL         string   `json:"url,omitempty"`
 	Roles       []string `json:"roles,omitempty"`
 	MissingEnv  []string `json:"missing_env,omitempty"`
 	LastError   string `json:"last_error,omitempty"`
@@ -289,8 +290,11 @@ func (m *Manager) createInstance(id string, pc config.PluginConfig) error {
 			return fmt.Errorf("插件 %q: 未知 builtin 插件（未程序化注册）", id)
 		}
 		plugin = p
+	case "service":
+		// Docker 长驻 HTTP 服务（无工具注入），plugins 包内直接构造，无需工厂。
+		plugin = newServicePlugin(id, pc.Settings, m.logger)
 	default:
-		return fmt.Errorf("插件 %q: 未知 kind %q（支持 builtin/mcp/bundle）", id, pc.Kind)
+		return fmt.Errorf("插件 %q: 未知 kind %q（支持 builtin/mcp/bundle/service）", id, pc.Kind)
 	}
 	inst := &instance{
 		id:       id,
@@ -472,6 +476,7 @@ func (m *Manager) Get(id string) (Info, bool) {
 		State:       inst.state,
 		Enabled:     inst.config.Enabled(),
 		Tools:       tools,
+		URL:         manifest.URL,
 		Roles:       manifest.Roles,
 		MissingEnv:  manifest.MissingEnv(),
 		LastError:   inst.lastErr,

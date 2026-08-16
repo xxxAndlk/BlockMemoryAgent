@@ -8,7 +8,9 @@
 //   - builtin：编译进二进制的进程内 Go 插件（实现 Plugin 接口，程序化注册）；
 //   - mcp：外部 MCP server（stdio 子进程或 streamable HTTP），经 mcpbridge 桥接；
 //   - bundle：Claude/Codex 插件目录包（.claude-plugin/plugin.json + .mcp.json +
-//     skills/*/SKILL.md），由 bundle 包展开为若干 mcp 插件与 skill 条目。
+//     skills/*/SKILL.md），由 bundle 包展开为若干 mcp 插件与 skill 条目；
+//   - service：Docker 化长驻 HTTP 服务（无 MCP 工具，如 Open Design UI 设计台），
+//     只挂生命周期（docker run -d / rm -f + 健康探针），与 mcp 插件一样热插拔。
 //
 // 状态机：registered → initialized → running → stopped / degraded。
 package plugins
@@ -32,6 +34,8 @@ const (
 	KindMCP Kind = "mcp"
 	// KindBundle Claude/Codex 插件目录包（加载时展开为 mcp 插件 + skill 条目）。
 	KindBundle Kind = "bundle"
+	// KindService Docker 化长驻 HTTP 服务（无工具注入，仅生命周期管理）。
+	KindService Kind = "service"
 )
 
 // State 插件实例生命周期状态。
@@ -67,6 +71,8 @@ type Manifest struct {
 	RequiresEnv []string
 	// ToolNames 声明提供的工具名（mcp 插件连接后按 ListTools 实报，此处为静态声明）。
 	ToolNames []string
+	// URL 服务访问地址（仅 service 插件使用，供前端/TUI 展示入口链接）。
+	URL string
 	// Roles 可见角色白名单，缺省 ["*"] 全角色可见。
 	Roles []string
 }

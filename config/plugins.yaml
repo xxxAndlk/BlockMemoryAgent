@@ -55,3 +55,23 @@ plugins:
       # transport: stdio
       # command: npx
       # args: ["-y", "@zavora-ai/computer-use-mcp"]
+
+  # Open Design：UI 设计台（开源 Claude Design 替代品，github.com/nexu-io/open-design）。
+  # kind=service：Docker 长驻 HTTP 服务（非 MCP，不注入工具），生命周期与 mcp 插件
+  # 一样经 /api/plugins/enable|disable|reload 热插拔（docker run -d / rm -f + 健康探针）。
+  # 官方发布镜像 ghcr.io/nexu-io/od（Alpine 单容器，daemon 同端口服务 API + Web UI）。
+  # 访问入口：http://localhost:7456（Basic 认证：用户名 open-design，密码 = OD_API_TOKEN）。
+  # 前置：docker pull ghcr.io/nexu-io/od:latest ；.env 配 OD_API_TOKEN（openssl rand -hex 32）。
+  # 注意：与 computer_use 的 6081 同理，同机两个 BMA 实例不能同时 enable（7456 端口冲突）。
+  open_design:
+    kind: service
+    enabled: false
+    settings:
+      image: ghcr.io/nexu-io/od:latest
+      ports: ["127.0.0.1:7456:7456"]
+      volumes: ["bma-open-design-data:/app/.od"]
+      env:
+        OD_API_TOKEN: ${OD_API_TOKEN:}
+      requires_env: ["OD_API_TOKEN"]
+      url: http://localhost:7456
+      health_url: http://localhost:7456/api/health

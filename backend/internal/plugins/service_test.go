@@ -1,0 +1,156 @@
+package plugins
+
+// service 插件（kind=service）单元测试：
+//   - settings 解析（缺省值 / 全字段）；
+//   - 容器名净化 + pid 后缀（与 mcpbridge 同一约定）；
+//   - docker run 参数构造（纯函数，不依赖 Docker）；
+//   - Init 校验（image 必填）；
+//   - Manager 集成：kind=service 实例创建、Info 携带 url、未知 kind 报错。
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/blockmemory/agent/backend/internal/config"
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
+)
+
+func TestServiceSettingsFromMapDefaults(t *testing.T) {
+	s := serviceSettingsFromMap(map[string]any{})
+	if s.Image != "" || s.HealthURL != "" || s.URL != "" {
+		t.Fatalf("缺省字段应为空: %+v", s)
+	}
+	if s.StartTimeout != serviceStartTimeoutDefault {
+		t.Fatalf("StartTimeout 缺省应为 %v, got %v", serviceStartTimeoutDefault, s.StartTimeout)
+	}
+}
+
+func TestServiceSettingsFromMapFull(t *testing.T) {
+	s := serviceSettingsFromMap(map[string]any{
+		"image":             "ghcr.io/nexu-io/od:latest",
+		"url":               "http://localhost:7456",
+		"health_url":        "http://localhost:7456/api/health",
+		"args":              []any{"--no-open"},
+		"env":               map[string]any{"OD_API_TOKEN": "tok"},
+		"ports":             []any{"127.0.0.1:7456:7456"},
+		"volumes":           []any{"bma-open-design-data:/app/.od"},
+		"requires_env":      []any{"OD_API_TOKEN"},
+		"start_timeout_sec": float64(30),
+	})
+	if s.Image != "ghcr.io/nexu-io/od:latest" {
+		t.Fatalf("image 解析错误: %q", s.Image)
+	}
+	if s.URL != "http://localhost:7456" || s.HealthURL != "http://localhost:7456/api/health" {
+		t.Fatalf("url/health_url 解析错误: %+v", s)
+	}
+	if len(s.Args) != 1 || s.Args[0] != "--no-open" {
+		t.Fatalf("args 解析错误: %v", s.Args)
+	}
+	if s.Env["OD_API_TOKEN"] != "tok" {
+		t.Fatalf("env 解析错误: %v", s.Env)
+	}
+	if len(s.Ports) != 1 || len(s.Volumes) != 1 {
+		t.Fatalf("ports/volumes 解析错误: %+v", s)
+	}
+	if len(s.RequiresEnv) != 1 || s.RequiresEnv[0] != "OD_API_TOKEN" {
+		t.Fatalf("requires_env 解析错误: %v", s.RequiresEnv)
+	}
+	if s.StartTimeout != 30*time.Second {
+		t.Fatalf("start_timeout_sec 解析错误: %v", s.StartTimeout)
+	}
+}
+
+func TestServiceContainerName(t *testing.T) {
+	name := serviceContainerName("open_design")
+	if !strings.HasPrefix(name, "bma-plugin-svc-open_design-") {
+		t.Fatalf("容器名前缀错误: %q", name)
+	}
+	// 非法字符净化（bundle 风格 id 含 /）。
+	if got := serviceContainerName("a/b"); strings.Contains(got, "/") {
+		t.Fatalf("容器名未净化: %q", got)
+	}
+}
+
+func TestServiceRunArgs(t *testing.T) {
+	s := serviceSettingsFromMap(map[string]any{
+		"image":   "img:tag",
+		"env":     map[string]any{"B": "2", "A": "1"},
+		"ports":   []any{"127.0.0.1:7456:7456"},
+		"volumes": []any{"data:/app/.od"},
+		"args":    []any{"--no-open"},
+	})
+	args := serviceRunArgs("bma-plugin-svc-x-1", s)
+	got := strings.Join(args, " ")
+	want := "run -d --name bma-plugin-svc-x-1 --add-host host.docker.internal:host-gateway " +
+		"-p 127.0.0.1:7456:7456 -v data:/app/.od -e A=1 -e B=2 img:tag --no-open"
+	if got != want {
+		t.Fatalf("docker run 参数不符:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestServicePluginInitRequiresImage(t *testing.T) {
+	p := newServicePlugin("x", map[string]any{}, nil)
+	if err := p.Init(context.Background(), Deps{}); err == nil {
+		t.Fatal("缺 image 应报错")
+	}
+	p = newServicePlugin("x", map[string]any{"image": "img"}, nil)
+	if err := p.Init(context.Background(), Deps{}); err != nil {
+		t.Fatalf("有 image 不应报错: %v", err)
+	}
+	// service 插件不注入工具。
+	if tools := p.Tools(); len(tools) != 0 {
+		t.Fatalf("service 插件 Tools 应为空, got %d", len(tools))
+	}
+}
+
+func TestServicePluginManifest(t *testing.T) {
+	p := newServicePlugin("open_design", map[string]any{
+		"image":        "img",
+		"url":          "http://localhost:7456",
+		"requires_env": []any{"OD_API_TOKEN"},
+	}, nil)
+	m := p.Manifest()
+	if m.Kind != KindService {
+		t.Fatalf("Kind 应为 service, got %q", m.Kind)
+	}
+	if m.URL != "http://localhost:7456" {
+		t.Fatalf("Manifest.URL 错误: %q", m.URL)
+	}
+	// RequiresEnv 缺失时 MissingEnv 应报出。
+	t.Setenv("OD_API_TOKEN", "")
+	if missing := m.MissingEnv(); len(missing) != 1 || missing[0] != "OD_API_TOKEN" {
+		t.Fatalf("MissingEnv 错误: %v", missing)
+	}
+}
+
+func TestManagerServiceKindLifecycle(t *testing.T) {
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mgr := NewManager(reg, WithConfig(&config.PluginsConfig{Plugins: map[string]config.PluginConfig{
+		"open_design": {
+			Kind: "service",
+			Settings: map[string]any{
+				"image": "img",
+				"url":   "http://localhost:7456",
+			},
+		},
+	}}))
+	if err := mgr.Load(context.Background()); err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	info, ok := mgr.Get("open_design")
+	if !ok {
+		t.Fatal("实例未创建")
+	}
+	if info.Kind != "service" || info.State != StateRegistered {
+		t.Fatalf("状态错误: %+v", info)
+	}
+	if info.URL != "http://localhost:7456" {
+		t.Fatalf("Info.URL 错误: %q", info.URL)
+	}
+	// enabled 缺省 false：未触碰 Docker，无工具注册。
+	if len(info.Tools) != 0 {
+		t.Fatalf("不应注册任何工具, got %v", info.Tools)
+	}
+}

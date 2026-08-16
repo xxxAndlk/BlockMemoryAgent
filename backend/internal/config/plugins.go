@@ -25,7 +25,7 @@ func (p PluginConfig) Enabled() bool { return p.EnabledFlag != nil && *p.Enabled
 
 // PluginConfig 单个插件条目。
 type PluginConfig struct {
-	// Kind 插件形态：builtin | mcp | bundle（bundle 用于按目录整包启停插件包）。
+	// Kind 插件形态：builtin | mcp | bundle | service（bundle 用于按目录整包启停插件包；service 为 Docker 长驻 HTTP 服务）。
 	Kind string `yaml:"kind"`
 	// EnabledFlag 是否随启动自动 enable（nil = false：安全默认，显式开启）。
 	EnabledFlag *bool `yaml:"enabled"`
