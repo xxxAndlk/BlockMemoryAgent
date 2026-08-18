@@ -566,10 +566,13 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// 将工具执行结果以 tool 角色消息追加到历史中，供下一次 LLM 调用使用。
 			// ToolCallID 携带本次调用的 ID：Anthropic/OpenAI 原生工具协议要求
 			// tool_result 必须引用对应的 tool_use id，否则下一轮请求会被 API 拒绝。
+			// Images 仅内存透传（ui_preview 截图等 image_passthrough 插件），
+			// 挂载边界由 ToBladesMessages 控制（仅最新一批）。
 			history = append(history, ReactMessage{
 				Role:       "tool",
 				Content:    ToolResultJSON(result),
 				ToolCallID: tc.ID,
+				Images:     result.Images,
 			})
 
 			// 把工具调用细节与结果写入记忆流水线（保留完整输出，展示层自行截断）。

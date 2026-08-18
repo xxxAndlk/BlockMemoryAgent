@@ -43,10 +43,17 @@ type Settings struct {
 	Image string
 	// Ports 仅 docker 使用：端口映射（如 "6081:6081"，noVNC 观察口等）。
 	Ports []string
+	// Volumes 仅 docker 使用：卷映射（如 "D:/data/od-artifacts:/out"，docker -v 需绝对路径或命名卷）。
+	Volumes []string
 	// URL 仅 http 使用：MCP streamable HTTP 端点。
 	URL string
 	// Destructive 为 true 时全部远端工具标记 Destructive()，接入审批守卫链。
 	Destructive bool
+	// ImagePassthrough 为 true 时，远端工具返回的 image content 不再只留文本占位符，
+	// 而是随 tool.Result.Images 内存透传给多模态模型（视觉回显闭环）。
+	// 缺省 false：文本模型（glm-5.3 等）收到 image block 会被端点 400 拒绝，
+	// 仅确认模型支持图片输入的插件（如 ui_preview）显式开启。
+	ImagePassthrough bool
 	// Roles 可见角色白名单（透传到 Manifest，缺省全角色）。
 	Roles []string
 	// ExecTimeout 单次工具调用超时（默认 120s）。
@@ -93,8 +100,18 @@ func FromSettings(settings map[string]any) Settings {
 			}
 		}
 	}
+	if v, ok := settings["volumes"].([]any); ok {
+		for _, vol := range v {
+			if str, ok := vol.(string); ok {
+				s.Volumes = append(s.Volumes, str)
+			}
+		}
+	}
 	if v, ok := settings["destructive"].(bool); ok {
 		s.Destructive = v
+	}
+	if v, ok := settings["image_passthrough"].(bool); ok {
+		s.ImagePassthrough = v
 	}
 	if v, ok := settings["roles"].([]any); ok {
 		for _, r := range v {
@@ -405,7 +422,38 @@ func (b *Bridge) callTool(ctx context.Context, name string, args map[string]any)
 	if res.IsError {
 		return &tool.Result{Tool: name, Success: false, Error: text, Category: tool.ResultCategoryExecutionFailed}
 	}
-	return &tool.Result{Tool: name, Success: true, Output: text}
+	out := &tool.Result{Tool: name, Success: true, Output: text}
+	if b.settings.ImagePassthrough {
+		out.Images = extractImages(res.Content)
+	}
+	return out
+}
+
+// 图片透传上限：单次结果最多 4 张、单张 base64 不超过 4MiB。
+// 防失控 MCP server 一次回传超大图集撑爆内存与上下文。
+const (
+	maxPassthroughImages     = 4
+	maxPassthroughImageBytes = 4 << 20
+)
+
+// extractImages 从 MCP 结果内容块中提取图片（仅 image_passthrough 开启时调用）。
+// 超上限的图片静默跳过（Output 文本占位符仍保留其存在痕迹）。
+func extractImages(content []mcp.Content) []tool.ResultImage {
+	var images []tool.ResultImage
+	for _, c := range content {
+		v, ok := c.(*mcp.ImageContent)
+		if !ok || v.MIMEType == "" || len(v.Data) == 0 {
+			continue
+		}
+		if len(v.Data) > maxPassthroughImageBytes {
+			continue
+		}
+		images = append(images, tool.ResultImage{MIMEType: v.MIMEType, Data: v.Data})
+		if len(images) >= maxPassthroughImages {
+			break
+		}
+	}
+	return images
 }
 
 // renderContent 把 MCP 结果内容块渲染为文本（text 直取；image/audio 标注不展开 base64）。

@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"       // 上下文传递
+	"encoding/base64" // tool_result 图片块 base64 编码
 	"encoding/json" // JSON 序列化
 	"fmt"           // 错误格式化
 	"log"           // 钳制日志
@@ -499,6 +500,17 @@ func (p *anthropicProvider) convertMessages(messages []*blades.Message) ([]anthr
 		if messages[i].Role == blades.RoleTool {
 			merged := anthropic.MessageParam{Role: anthropic.MessageParamRoleUser}
 			for i < len(messages) && messages[i] != nil && messages[i].Role == blades.RoleTool {
+				// 每条 RoleTool 消息 = 一个 ToolPart（文本结果）+ 可选 DataPart（图片，
+				// 仅 image_passthrough 插件的最新一批，见 agent.ToBladesMessages）。
+				// 图片挂在同一 tool_result 的 content 里（anthropic 视觉协议）。
+				var images []anthropic.ToolResultBlockParamContentUnion
+				for _, part := range messages[i].Parts {
+					if dp, ok := part.(blades.DataPart); ok {
+						if img := toolResultImageBlock(dp); img != nil {
+							images = append(images, *img)
+						}
+					}
+				}
 				for _, part := range messages[i].Parts {
 					tp, ok := part.(blades.ToolPart)
 					if !ok {
@@ -507,12 +519,15 @@ func (p *anthropicProvider) convertMessages(messages []*blades.Message) ([]anthr
 					if tp.Response == "" {
 						continue
 					}
+					content := make([]anthropic.ToolResultBlockParamContentUnion, 0, 1+len(images))
+					content = append(content, anthropic.ToolResultBlockParamContentUnion{
+						OfText: &anthropic.TextBlockParam{Text: tp.Response},
+					})
+					content = append(content, images...)
 					merged.Content = append(merged.Content, anthropic.ContentBlockParamUnion{
 						OfToolResult: &anthropic.ToolResultBlockParam{
 							ToolUseID: tp.ID,
-							Content: []anthropic.ToolResultBlockParamContentUnion{
-								{OfText: &anthropic.TextBlockParam{Text: tp.Response}},
-							},
+							Content:   content,
 						},
 					})
 				}
@@ -532,6 +547,38 @@ func (p *anthropicProvider) convertMessages(messages []*blades.Message) ([]anthr
 		out = append(out, param)
 	}
 	return out, nil
+}
+
+// toolResultImageBlock 把 blades.DataPart 转为 anthropic tool_result content 的图片块。
+// 不支持/无法转换时返回 nil（静默跳过，Response 文本占位符仍保留其存在痕迹）。
+// Anthropic 图片协议仅接受 jpeg/png/gif/webp 的 base64 来源。
+func toolResultImageBlock(dp blades.DataPart) *anthropic.ToolResultBlockParamContentUnion {
+	if len(dp.Bytes) == 0 {
+		return nil
+	}
+	var mediaType anthropic.Base64ImageSourceMediaType
+	switch anthropic.Base64ImageSourceMediaType(strings.ToLower(string(dp.MIMEType))) {
+	case anthropic.Base64ImageSourceMediaTypeImagePNG:
+		mediaType = anthropic.Base64ImageSourceMediaTypeImagePNG
+	case anthropic.Base64ImageSourceMediaTypeImageJPEG:
+		mediaType = anthropic.Base64ImageSourceMediaTypeImageJPEG
+	case anthropic.Base64ImageSourceMediaTypeImageGIF:
+		mediaType = anthropic.Base64ImageSourceMediaTypeImageGIF
+	case anthropic.Base64ImageSourceMediaTypeImageWebP:
+		mediaType = anthropic.Base64ImageSourceMediaTypeImageWebP
+	default:
+		return nil
+	}
+	return &anthropic.ToolResultBlockParamContentUnion{
+		OfImage: &anthropic.ImageBlockParam{
+			Source: anthropic.ImageBlockParamSourceUnion{
+				OfBase64: &anthropic.Base64ImageSourceParam{
+					Data:      base64.StdEncoding.EncodeToString(dp.Bytes),
+					MediaType: mediaType,
+				},
+			},
+		},
+	}
 }
 
 // convertMessage 将单条 blades.Message 转换为 Anthropic MessageParam。

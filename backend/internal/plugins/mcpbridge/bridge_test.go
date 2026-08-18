@@ -90,20 +90,59 @@ func mustTool(t *testing.T, tools []tool.Tool, name string) tool.Tool {
 // TestFromSettings 验证 settings 解析（transport/args/env/roles/destructive/超时）。
 func TestFromSettings(t *testing.T) {
 	s := FromSettings(map[string]any{
-		"transport":        "http",
-		"url":              "http://localhost:8080/mcp",
-		"destructive":      true,
-		"exec_timeout_sec": 30.0,
-		"roles":            []any{"meta", "domain"},
+		"transport":         "http",
+		"url":               "http://localhost:8080/mcp",
+		"destructive":       true,
+		"image_passthrough": true,
+		"exec_timeout_sec":  30.0,
+		"roles":             []any{"meta", "domain"},
 	})
 	if s.Transport != "http" || s.URL != "http://localhost:8080/mcp" || !s.Destructive {
 		t.Fatalf("解析错误: %+v", s)
+	}
+	if !s.ImagePassthrough {
+		t.Fatalf("image_passthrough 解析错误: %+v", s)
 	}
 	if s.ExecTimeout != 30*time.Second {
 		t.Fatalf("exec_timeout 解析错误: %v", s.ExecTimeout)
 	}
 	if len(s.Roles) != 2 || s.Roles[0] != "meta" {
 		t.Fatalf("roles 解析错误: %v", s.Roles)
+	}
+	// 缺省关闭：文本模型收到 image block 会被端点 400，必须显式开启。
+	if FromSettings(map[string]any{}).ImagePassthrough {
+		t.Fatalf("image_passthrough 缺省应为 false")
+	}
+}
+
+// TestExtractImages 验证 image content 提取的过滤与上限：
+// 空 MIME/空数据/超尺寸跳过，单次最多 maxPassthroughImages 张。
+func TestExtractImages(t *testing.T) {
+	mk := func(mime string, size int) *mcp.ImageContent {
+		return &mcp.ImageContent{MIMEType: mime, Data: make([]byte, size)}
+	}
+	content := []mcp.Content{
+		&mcp.TextContent{Text: "前置文本"},
+		mk("image/png", 16),
+		mk("", 16),                            // 无 MIME：跳过
+		mk("image/jpeg", 0),                   // 空数据：跳过
+		mk("image/png", maxPassthroughImageBytes+1), // 超尺寸：跳过
+		mk("image/webp", 32),
+	}
+	images := extractImages(content)
+	if len(images) != 2 {
+		t.Fatalf("应提取 2 张合法图片, got %d: %+v", len(images), images)
+	}
+	if images[0].MIMEType != "image/png" || images[1].MIMEType != "image/webp" {
+		t.Fatalf("提取结果错误: %+v", images)
+	}
+	// 数量上限：6 张合法图片只留前 maxPassthroughImages 张。
+	var many []mcp.Content
+	for i := 0; i < maxPassthroughImages+2; i++ {
+		many = append(many, mk("image/png", 8))
+	}
+	if got := extractImages(many); len(got) != maxPassthroughImages {
+		t.Fatalf("应截断到 %d 张, got %d", maxPassthroughImages, len(got))
 	}
 }
 

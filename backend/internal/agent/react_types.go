@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -32,6 +33,11 @@ type ReactMessage struct {
 	// 否则 400 "reasoning_content must be passed back"。
 	// R1 等"不回传"模型在序列化时由 provider 决定是否携带。
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+	// Images 仅 role="tool" 使用：工具结果携带的图片（ui_preview 截图等）。
+	// 仅内存透传（json:"-" 不持久化、不计入 token 估算）：ToBladesMessages 只为
+	// 历史末尾最新一轮工具结果挂载图片，旧轮次只留 Content 里的文本占位符，
+	// 防 base64 反复进上下文烧毁前缀缓存（与 tool.Result.Images 同语义）。
+	Images []tool.ResultImage `json:"-"`
 }
 
 // ToolCall 表示模型请求执行某个命名工具的调用。
@@ -115,6 +121,9 @@ type ToolResult struct {
 	Success bool   `json:"success"`         // Success 标记工具执行是否成功
 	Output  string `json:"output"`          // Output 是工具执行成功时的输出内容
 	Error   string `json:"error,omitempty"` // Error 是工具执行失败时的错误信息
+	// Images 是工具结果携带的图片（仅 image_passthrough 插件，如 ui_preview 截图）。
+	// 仅内存透传：不持久化、不进 token 估算；见 tool.Result.Images。
+	Images []tool.ResultImage `json:"-"`
 }
 
 // ReactResult 是 ReActAgent 一次运行结束时返回的结果。
@@ -267,8 +276,19 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 
 	// 预分配与 history 长度相同的容量，减少 append 过程中的内存分配。
 	out := make([]*blades.Message, 0, len(history))
+	// 图片透传边界：定位最新一批 tool 结果（从尾部越过 mailbox 注入的 user 尾巴，
+	// 取最后一个连续 tool 消息块）。仅为该批次挂载图片，更早轮次不挂——
+	// 其 Content 文本占位符仍在，base64 不反复进上下文烧毁前缀缓存。
+	imgBatchEnd := len(history)
+	for imgBatchEnd > 0 && history[imgBatchEnd-1].Role != "tool" {
+		imgBatchEnd--
+	}
+	imgBatchStart := imgBatchEnd
+	for imgBatchStart > 0 && history[imgBatchStart-1].Role == "tool" {
+		imgBatchStart--
+	}
 	// 遍历每一轮对话消息，根据角色转换为 blades 对应的消息类型。
-	for _, m := range history {
+	for i, m := range history {
 		// 根据消息角色进入不同分支处理。
 		switch m.Role {
 		case "user":
@@ -314,11 +334,22 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 				req, _ := json.Marshal(tc.Input)
 				part.Request = string(req)
 			}
+			parts := []blades.Part{part}
+			// 最新一批工具结果挂载图片：DataPart 承载原始字节（base64 解码失败跳过，
+			// Response 里的文本占位符仍保留痕迹）；是否序列化进请求由 provider 决定
+			//（anthropic 转 image block；openai 系忽略 DataPart，天然降级）。
+			if i >= imgBatchStart && i < imgBatchEnd {
+				for _, img := range m.Images {
+					raw, err := base64.StdEncoding.DecodeString(string(img.Data))
+					if err != nil || len(raw) == 0 || img.MIMEType == "" {
+						continue
+					}
+					parts = append(parts, blades.DataPart{MIMEType: blades.MIMEType(img.MIMEType), Bytes: raw})
+				}
+			}
 			out = append(out, &blades.Message{
-				Role: blades.RoleTool,
-				Parts: []blades.Part{
-					part,
-				},
+				Role:  blades.RoleTool,
+				Parts: parts,
 			})
 		case "system":
 			// system 角色转换为系统提示消息。

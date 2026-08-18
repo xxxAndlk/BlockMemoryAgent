@@ -53,6 +53,9 @@ func dockerRunArgs(pluginID string, s Settings) (name string, args []string) {
 	for _, p := range s.Ports {
 		args = append(args, "-p", p)
 	}
+	for _, v := range s.Volumes {
+		args = append(args, "-v", v)
+	}
 	keys := make([]string, 0, len(s.Env))
 	for k := range s.Env {
 		keys = append(keys, k)

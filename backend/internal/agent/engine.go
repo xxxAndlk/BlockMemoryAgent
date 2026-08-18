@@ -120,7 +120,16 @@ func (e *ReflectEngine) Run(ctx context.Context, input string) (ReactResult, err
 		evidence := RecentVerificationOutputs(result.History, 3)
 		v, err := e.reflect(ctx, input, result.Text, files, evidence)
 		if err != nil {
-			// fail-closed：judge 不可用（报错/坏 JSON）→ 未验证上抛，绝不静默 pass。
+			// fail-closed：judge 不可用（报错/坏 JSON）时未验证上抛，绝不静默 pass。
+			// TODO #54 降级：judge 重试后仍不可用，但 L0 可执行证据存在
+			//（node --check 等验证命令 Success）时降级 pass-with-warning，
+			// 不再 unverified-FAIL 触发重派（2026-08-17 塔防事故：23 分钟产出
+			// 仅因 judge 围栏 JSON 被误杀，重派再烧 13 分钟同文件重复劳动）。
+			// 无客观证据时维持 fail-closed（#43"绝不静默放行"边界 = 无证据场景）。
+			if HasExecutableVerification(result.History) {
+				result.VerifyNote = "L0 通过，L2 judge 不可用（降级放行）"
+				return result, nil
+			}
 			result.Unverified = true
 			result.VerifyNote = err.Error()
 			return result, nil
@@ -143,7 +152,8 @@ func (e *ReflectEngine) Run(ctx context.Context, input string) (ReactResult, err
 
 // reflect 对照任务验收标准，rubric 分项自检执行结果（TODO #43 改造）：
 // judge 被要求从任务提取验收条目逐条判定，并对照【修改文件】与【验证证据】客观段
-// 给出依据（堵幻觉 pass）。judge 报错/坏 JSON 返回 ErrJudgeUnavailable（fail-closed）。
+// 给出依据（堵幻觉 pass）。judge 报错/坏 JSON 时重试 1 次（更严"只输出 JSON"措辞），
+// 重试仍败才返回 ErrJudgeUnavailable（fail-closed；TODO #54 解析健壮化）。
 func (e *ReflectEngine) reflect(ctx context.Context, task, answer string, files, evidence []string) (verdict, error) {
 	prompt := "【质量自检】你是独立评审（与被评审者不同模型）。对照任务验收标准，逐条检查执行结果是否达标。\n\n【任务】\n" + task +
 		"\n\n【执行结果】\n" + answer +
@@ -151,16 +161,69 @@ func (e *ReflectEngine) reflect(ctx context.Context, task, answer string, files,
 		"\n\n【验证证据】\n" + renderListOrNone(evidence, 0) +
 		"\n\n【验收标准】从【任务】中提取验收条目（无显式条目则推导 2-5 条），逐条判定。" +
 		"\n\n严格输出 JSON（不要其他文字）：{\"pass\": true 或 false, \"feedback\": \"不达标时的具体问题清单（达标则为空串）\", \"checks\": [{\"item\": \"验收条目\", \"pass\": true 或 false, \"evidence\": \"依据【执行结果】或【验证证据】的具体内容\"}]}"
+	if v, err := e.judgeOnce(ctx, prompt); err == nil {
+		return v, nil
+	}
+	// TODO #54：解析失败/LLM 报错重试 1 次，换更严"只输出 JSON"措辞
+	//（judge 模型返回围栏/夹带文字时首答大概率可救，2026-08-17 塔防事故根因）。
+	return e.judgeOnce(ctx, prompt+
+		"\n\n【重试】上一次输出无法解析。只输出一个合法 JSON 对象：以 { 开头、以 } 结尾，禁止 markdown 代码围栏、禁止任何解释文字。")
+}
+
+// judgeOnce 执行一次 judge 调用并解析 verdict；报错/坏 JSON 返回 ErrJudgeUnavailable。
+func (e *ReflectEngine) judgeOnce(ctx context.Context, prompt string) (verdict, error) {
 	resp, err := e.llm(ctx, prompt)
 	if err != nil {
 		return verdict{}, fmt.Errorf("%w: %v", ErrJudgeUnavailable, err)
 	}
 	var v verdict
-	if json.Unmarshal([]byte(resp), &v) != nil {
+	if json.Unmarshal([]byte(extractJSON(resp)), &v) != nil {
 		return verdict{}, fmt.Errorf("%w: invalid JSON response", ErrJudgeUnavailable)
 	}
 	v.Feedback = truncateRunes(strings.TrimSpace(v.Feedback), 2000)
 	return v, nil
+}
+
+// extractJSON 从 judge 原始响应提取 JSON 对象：剥 markdown 代码围栏，
+// 再提取首个花括号平衡的 {...} 块（容忍前后夹带解释文字）。无平衡块返回空串。
+func extractJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			s = s[i+1:]
+		}
+		if j := strings.LastIndex(s, "```"); j >= 0 {
+			s = s[:j]
+		}
+		s = strings.TrimSpace(s)
+	}
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inStr, esc := false, false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if esc {
+			esc = false
+			continue
+		}
+		switch {
+		case inStr && c == '\\':
+			esc = true
+		case c == '"':
+			inStr = !inStr
+		case !inStr && c == '{':
+			depth++
+		case !inStr && c == '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
 }
 
 // renderListOrNone 把字符串列表渲染为编号行；空列表渲染为"无"。

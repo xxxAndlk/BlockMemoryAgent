@@ -171,10 +171,12 @@ func (a *toolRegistryAdapter) Dispatch(ctx context.Context, call ToolCall) (Tool
 	}
 	// 调用成功时，将领域层结果 res 的各字段原样映射到 agent 层 ToolResult 中返回。
 	// Success 表示工具是否执行成功，Output 存放工具输出，Error 存放工具自身报告的错误。
+	// Images 为 image_passthrough 插件工具返回的图片（截图回显），仅内存透传。
 	return ToolResult{
 		Tool:    res.Tool,
 		Success: res.Success,
 		Output:  res.Output,
 		Error:   res.Error,
+		Images:  res.Images,
 	}, nil
 }

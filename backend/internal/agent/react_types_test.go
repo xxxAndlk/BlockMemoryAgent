@@ -3,10 +3,12 @@ package agent
 // react_types_test.go 验证 react_types.go 的纯函数 helper。
 
 import (
+	"encoding/base64"
 	"path/filepath"
 	"reflect"
 	"testing"
 
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/go-kratos/blades"
 )
 
@@ -98,5 +100,52 @@ func TestFilesModifiedFromHistory_PathCleaning(t *testing.T) {
 	want := []string{filepath.Clean("src/a.go")}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("FilesModifiedFromHistory path cleaning = %v, want %v", got, want)
+	}
+}
+
+// TestToBladesMessages_ToolImagesLatestBatchOnly 验证图片透传边界：
+// 仅历史末尾最新一批 tool 结果挂载 DataPart（越过 mailbox 注入的 user 尾巴），
+// 更早批次不挂（其 Content 文本占位符仍在），防 base64 反复进上下文烧毁前缀缓存；
+// 非法 base64 / 空 MIME 静默跳过。
+func TestToBladesMessages_ToolImagesLatestBatchOnly(t *testing.T) {
+	pngB64 := base64.StdEncoding.EncodeToString([]byte{0x89, 0x50, 0x4E, 0x47})
+	screenshot := func(id string) []tool.ResultImage {
+		return []tool.ResultImage{{MIMEType: "image/png", Data: []byte(pngB64)}}
+	}
+	history := []ReactMessage{
+		{Role: "user", Content: "u"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "browser_take_screenshot", Input: map[string]any{}}}},
+		{Role: "tool", ToolCallID: "c1", Content: "[image image/png, 4 bytes base64]", Images: screenshot("c1")},
+		{Role: "assistant", Content: "看到了旧图"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c2", Name: "browser_take_screenshot", Input: map[string]any{}}}},
+		{Role: "tool", ToolCallID: "c2", Content: "[image image/png, 4 bytes base64]", Images: []tool.ResultImage{
+			{MIMEType: "image/png", Data: []byte(pngB64)},
+			{MIMEType: "image/png", Data: []byte("!!!not-base64!!!")}, // 非法：跳过
+			{MIMEType: "", Data: []byte(pngB64)},                      // 空 MIME：跳过
+		}},
+		{Role: "user", Content: "[mailbox] 子任务完成"}, // mailbox 尾巴：不影响最新批次定位
+	}
+	msgs := ToBladesMessages(history)
+	if len(msgs) != len(history) {
+		t.Fatalf("消息数不符: got %d want %d", len(msgs), len(history))
+	}
+	// 旧批次（索引 2）：只有 ToolPart，无 DataPart。
+	for _, p := range msgs[2].Parts {
+		if _, ok := p.(blades.DataPart); ok {
+			t.Fatalf("旧批次不应挂载图片: %+v", p)
+		}
+	}
+	// 最新批次（索引 5）：ToolPart + 恰好 1 个合法 DataPart。
+	var dataParts []blades.DataPart
+	for _, p := range msgs[5].Parts {
+		if dp, ok := p.(blades.DataPart); ok {
+			dataParts = append(dataParts, dp)
+		}
+	}
+	if len(dataParts) != 1 {
+		t.Fatalf("最新批次应挂载 1 张合法图片, got %d", len(dataParts))
+	}
+	if dataParts[0].MIMEType != blades.MIMEImagePNG || len(dataParts[0].Bytes) != 4 {
+		t.Fatalf("DataPart 内容错误: %+v", dataParts[0])
 	}
 }

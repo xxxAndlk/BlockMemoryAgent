@@ -173,11 +173,11 @@ func TestReflectEngine_NoLLMFallback(t *testing.T) {
 	}
 }
 
-// TestReflectEngine_LLMErrorFailClosed 自检 LLM 报错时 fail-closed（TODO #43）：
-// 标记 Unverified 附原因，绝不静默放行。
+// TestReflectEngine_LLMErrorFailClosed 自检 LLM 报错时重试 1 次仍败 fail-closed
+//（TODO #43/#54）：标记 Unverified 附原因，绝不静默放行。
 func TestReflectEngine_LLMErrorFailClosed(t *testing.T) {
 	agentProvider := &scriptedProvider{replies: []string{"answer"}}
-	reflectLLM := &scriptedLLM{errs: []error{errors.New("llm down")}}
+	reflectLLM := &scriptedLLM{errs: []error{errors.New("llm down"), errors.New("llm down")}}
 	eng := NewReflectEngine(newEngineTestAgent(t, agentProvider), EngineOptions{LLM: reflectLLM.Call})
 	result, err := eng.Run(context.Background(), "task")
 	if err != nil {
@@ -191,6 +191,9 @@ func TestReflectEngine_LLMErrorFailClosed(t *testing.T) {
 	}
 	if got := agentProvider.callsCount(); got != 1 {
 		t.Fatalf("expected single agent run, got %d", got)
+	}
+	if got := reflectLLM.callsCount(); got != 2 {
+		t.Fatalf("expected 2 judge calls (1 + 1 retry), got %d", got)
 	}
 }
 
@@ -244,6 +247,109 @@ func TestReflectEngine_JudgePromptSections(t *testing.T) {
 		if !strings.Contains(p, want) {
 			t.Fatalf("judge prompt missing %q, got: %s", want, p)
 		}
+	}
+}
+
+// TestExtractJSON 验证 judge 响应提取变体（TODO #54）：
+// 裸 JSON / ```json 围栏 / 前后夹带文字 / 截断坏 JSON。
+func TestExtractJSON(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"裸 JSON", `{"pass": true}`, `{"pass": true}`},
+		{"json 围栏", "```json\n{\"pass\": true, \"feedback\": \"\"}\n```", `{"pass": true, "feedback": ""}`},
+		{"无语言围栏", "```\n{\"pass\": false}\n```", `{"pass": false}`},
+		{"前置文字", "判定如下：\n{\"pass\": true}", `{"pass": true}`},
+		{"前后夹带", "好的，结果：{\"pass\": true, \"checks\": []} 以上。", `{"pass": true, "checks": []}`},
+		{"字符串内花括号与嵌套", `{"a": "{不是括号}", "b": {"c": 1}}`, `{"a": "{不是括号}", "b": {"c": 1}}`},
+		{"截断坏 JSON", `{"pass": true, "feedback": "未闭合`, ""},
+		{"非 JSON", "完全不是 JSON", ""},
+	}
+	for _, c := range cases {
+		if got := extractJSON(c.in); got != c.want {
+			t.Errorf("%s: extractJSON(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+	}
+}
+
+// TestReflectEngine_FencedJSONAccepted judge 返围栏 JSON 不再误判（TODO #54 根因场景）：
+// 首答即通过，无需重试。
+func TestReflectEngine_FencedJSONAccepted(t *testing.T) {
+	agentProvider := &scriptedProvider{replies: []string{"answer"}}
+	reflectLLM := &scriptedLLM{replies: []string{"```json\n" + reflectPass() + "\n```"}}
+	eng := NewReflectEngine(newEngineTestAgent(t, agentProvider), EngineOptions{LLM: reflectLLM.Call})
+	result, err := eng.Run(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Unverified {
+		t.Fatalf("fenced JSON should parse, got Unverified note=%q", result.VerifyNote)
+	}
+	if result.VerifyNote != "L2 rubric" {
+		t.Fatalf("expected 'L2 rubric', got %q", result.VerifyNote)
+	}
+	if got := reflectLLM.callsCount(); got != 1 {
+		t.Fatalf("expected 1 judge call, got %d", got)
+	}
+}
+
+// TestReflectEngine_JudgeRetryRecovers 首答坏 JSON，重试（更严措辞）后通过。
+func TestReflectEngine_JudgeRetryRecovers(t *testing.T) {
+	agentProvider := &scriptedProvider{replies: []string{"answer"}}
+	reflectLLM := &scriptedLLM{replies: []string{"前置解释文字导致解析失败", reflectPass()}}
+	eng := NewReflectEngine(newEngineTestAgent(t, agentProvider), EngineOptions{LLM: reflectLLM.Call})
+	result, err := eng.Run(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Unverified || result.VerifyNote != "L2 rubric" {
+		t.Fatalf("retry should recover, got Unverified=%v note=%q", result.Unverified, result.VerifyNote)
+	}
+	if got := reflectLLM.callsCount(); got != 2 {
+		t.Fatalf("expected 2 judge calls, got %d", got)
+	}
+	if p := reflectLLM.lastPrompt(); !strings.Contains(p, "【重试】") {
+		t.Fatalf("retry prompt should carry strict suffix, got: %s", p)
+	}
+}
+
+// verifyThenAnswerProvider 第一次调用返回验证类 RunCommand 工具调用（echo verify，
+// 命中 IsVerificationCommand 且退出 0 = L0 可执行证据），第二次返回最终答复。
+type verifyThenAnswerProvider struct {
+	scriptedProvider
+}
+
+func (p *verifyThenAnswerProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	p.mu.Lock()
+	p.calls++
+	calls := p.calls
+	p.mu.Unlock()
+	if calls == 1 {
+		return &blades.ModelResponse{Message: blades.AssistantMessage(
+			blades.NewToolPart("call-verify-1", "RunCommand", `{"command":"echo verify"}`),
+		)}, nil
+	}
+	return &blades.ModelResponse{Message: blades.AssistantMessage("answer")}, nil
+}
+
+// TestReflectEngine_L0EvidenceDegradesPassWithWarning judge 重试仍败 + L0 可执行证据存在
+//（TODO #54 降级）：pass-with-warning 标注放行，不 Unverified 不触发重派。
+func TestReflectEngine_L0EvidenceDegradesPassWithWarning(t *testing.T) {
+	agentProvider := &verifyThenAnswerProvider{}
+	reflectLLM := &scriptedLLM{replies: []string{"坏输出", "还是坏输出"}}
+	eng := NewReflectEngine(newEngineTestAgent(t, agentProvider), EngineOptions{LLM: reflectLLM.Call})
+	result, err := eng.Run(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Text != "answer" {
+		t.Fatalf("expected answer, got %q", result.Text)
+	}
+	if result.Unverified {
+		t.Fatalf("L0 evidence should degrade to pass-with-warning, got Unverified note=%q", result.VerifyNote)
+	}
+	if !strings.Contains(result.VerifyNote, "L0 通过") || !strings.Contains(result.VerifyNote, "judge 不可用") {
+		t.Fatalf("expected degrade note, got %q", result.VerifyNote)
 	}
 }
 

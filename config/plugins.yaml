@@ -95,6 +95,68 @@ plugins:
       volumes: ["bma-open-design-data:/app/.od"]
       env:
         OD_API_TOKEN: ${OD_API_TOKEN:}
+        # 火山方舟 key：透传给守护进程启用 volcengine 图像 provider（Seedream），
+        # Agent 侧画图工具见下方 ui_design 插件（kind: mcp）。
+        ARK_API_KEY: ${ARK_API_KEY:}
       requires_env: ["OD_API_TOKEN"]
       url: http://localhost:7456
       health_url: http://localhost:7456/api/health
+      # 注：service 插件不注入工具也不解析 roles（Tools 恒空），角色门控无意义。
+
+  # ui_design：Agent 画图工具（kind: mcp，2026-08-17 新增）。
+  # open_design 守护进程（上方 service 插件）无 MCP 端点，本插件是其 REST API 的
+  # stdio MCP 桥（docker/open-design-mcp）：od_image_generate 生成图片并落盘
+  # volumes 映射的宿主目录（返回 workspace 相对路径供 HTML/CSS 引用），od_image_list 列历史产物。
+  # roles（TODO #55 由 ["ui_assistant"] 放宽）：meta 纳入派发考量（MetaAgent 看得见才会把
+  # AI 贴图路线写进 spec）；domain 允许领域 Agent 直接出图；ui_assistant 原有专用角色保留。
+  # 落盘目录约定（钉死）：产物固定落 workspace/od-artifacts（下方 volumes 映射），
+  # 项目页面引用相对路径 ../od-artifacts/<file>（项目目录与 od-artifacts 同在 workspace 下；
+  # ui_preview 挂载整个 workspace，file:///workspace/od-artifacts 可达）。
+  # exec_timeout_sec 240：Seedream 出图 10-60s，留足桥内轮询窗口（默认 120s 会掐断长任务）。
+  ui_design:
+    kind: mcp
+    enabled: true
+    settings:
+      transport: docker
+      image: bma/open-design-mcp:local
+      # 产物落盘目录：docker -v 需绝对路径，按部署机调整（容器内固定 /out）。
+      volumes: ["D:/data/project/BlockMemoryAgent/workspace/od-artifacts:/out"]
+      env:
+        OD_API_URL: http://host.docker.internal:7456
+        OD_API_TOKEN: ${OD_API_TOKEN:}
+        OD_DEFAULT_MODEL: doubao-seedream-3-0-t2i-250415
+      roles: ["meta","domain","ui_assistant"]
+      exec_timeout_sec: 240
+
+  # ui_preview：UI 渲染回显（Agent 的"眼睛"，2026-08-17 新增）。
+  # Microsoft Playwright MCP（Apache-2.0，github.com/microsoft/playwright-mcp）：
+  # headless Chromium 打开 workspace 里的 HTML 页面（如 tower-defense 游戏），
+  # 截图 / a11y 快照 / 执行 JS / 读 console——Agent 写完 canvas/CSS 动态 UI 代码后
+  # 可自己渲染验证、看图迭代，替代"静态文生图"之外的动态 UI 增强能力。
+  # 前置：docker build -t bma/ui-preview-mcp:local docker/ui-preview-mcp
+  # （或一把梭：docker/bma-plugin.sh / make bma-plugin 备齐全部插件镜像；
+  #  也可直接用官方镜像 mcr.microsoft.com/playwright/mcp:latest，无需构建）。
+  # volumes 挂 workspace（rw）：容器内 file:///workspace/... 读页面
+  #（--allow-unrestricted-file-access 放开 file:// 导航，官方默认封锁；
+  #  容器内仅见 /workspace 挂载，文件系统边界即沙箱）；
+  # browser_take_screenshot 截图同时落盘 --output-dir（=宿主 workspace/ui-artifacts）。
+  # image_passthrough: true 开启截图回传模型（bridge 提取 image content 经
+  # tool.Result.Images 内存透传，仅最新一批进上下文；要求 ui_assistant 模型
+  # 支持图片输入，否则端点 400——见 doc/变更.md 2026-08-17 条目）。
+  # 冒烟实测（2026-08-17，镜像 @playwright/mcp 0.0.79）两个关键行为：
+  # ①--allow-unrestricted-file-access 必需，否则 file:// 导航被官方默认封锁；
+  # ②browser_take_screenshot 仅在不传 filename 参数时才回传 image content
+  # （传了 filename 只落盘+回文本链接）——Agent 要"看图"时不要指定 filename。
+  ui_preview:
+    kind: mcp
+    enabled: true
+    settings:
+      transport: docker
+      image: bma/ui-preview-mcp:local
+      # 产物落盘目录：截图保存到 workspace/ui-artifacts（容器内 /workspace/ui-artifacts）。
+      volumes: ["D:/data/project/BlockMemoryAgent/workspace:/workspace"]
+      # --image-responses 缺省即 allow（截图回 image content），显式写出防误改 omit。
+      args: ["--headless", "--output-dir", "/workspace/ui-artifacts", "--allow-unrestricted-file-access", "--image-responses", "allow"]
+      image_passthrough: true
+      roles: ["meta","domain","ui_assistant"]
+      exec_timeout_sec: 180

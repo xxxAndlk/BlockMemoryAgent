@@ -1,0 +1,10 @@
+{
+  "name": "open-design-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP stdio bridge to the Open Design daemon REST API (BMA ui_design plugin)",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.0"
+  }
+}

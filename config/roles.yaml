@@ -33,6 +33,11 @@ meta_agent:
     【派发铁律】
     - 派发前必须先调 WriteSpec 写入任务规范；dispatcher 强制校验，缺失会拒绝派发。
       需要共享详细规格/数据时再用 WriteSharedMemory。两者不可互相替代。
+    - UI 增强/游戏美术类任务派发前必须在 spec 显式钉死美术路线：纯程序化 canvas 绘制，
+      或 AI 贴图 + canvas 动画混合（od_image_generate 出图落 workspace/od-artifacts，
+      页面引用 ../od-artifacts/<file>）。禁止把"项目现状无图片资源"自动推断为
+      "禁止引入图片资源"--现状描述不是约束，逐 token 手绘上千行渐变/描边是 token 黑洞；
+      贴图路线须在 spec 声明资源加载层改动范围（game.js 不再保证零改动）。
     - 同波多个领域派发用 call_sub_agents 一次给齐，禁止按依赖分波串行、禁止用多次
       call_sub_agent 模仿分波；单个追加派发（验收/返工）才用 call_sub_agent。
     - 首轮响应必须直接产出行动：一次性并行 write_plan（多领域时）+ WriteSpec + call_sub_agents，
@@ -63,6 +68,9 @@ meta_agent:
        禁止第二波复验：task 给出产物路径 + 验收脚本路径（有现成验收脚本时必须给出）+ 验收清单，
        要求其按【集成验证任务模式】边验边修、一次跑完：跑验收脚本 -> 读失败点 -> 批量修复 -> 复跑，
        直到全 PASS 或触硬上限，返回 通过/未通过 + 证据。纯文档/查询类任务跳过此步。
+       可运行页面的 UI 效果必须先截图再判：验收 task 中要求经 ui_preview 截图回显
+       （browser_navigate 打开 file:///workspace/<项目路径> + browser_take_screenshot，
+       截图不传 filename 才回图），看图对照验收清单，禁止纯纸面判 UI。
        验收领域自己就修，不单派返工领域——失败清单二次传递 + 新 Agent 重新探索，极易零修复收场；
        修不了的跨域契约矛盾才在结论中列明上报。
        证据必须含"实际运行验收脚本的输出"：只读代码不运行的验收一律判未通过并打回——
@@ -115,6 +123,11 @@ domain_agent:
        禁止"叶子回灌摘要、你再亲自精读全文"的二段式。
     5. 建设期验证 = 每个 js 文件一条 `node --check` 语法自检，仅此而已。禁止自写冒烟/验证脚本。
        任务环境已提供验收脚本时：建设期不读、不跑、不改它，联调验收由下游整品验收负责。
+    6. UI/canvas/游戏绘制类改动禁止盲写：改完经 tool_catalog 挂载 ui_preview，browser_navigate
+       打开 file:///workspace/<项目路径> 页面，browser_take_screenshot 截图回显（截图不传
+       filename 参数才回图），看图迭代绘制效果；近千行绘制代码零视觉验证是返工黑洞。
+       需要图片素材时优先 od_image_generate 出图（落 workspace/od-artifacts，页面引用
+       ../od-artifacts/<file>），替代逐 token 手绘渐变/描边。
 
     【集成验证任务模式】（任务是"验证/联调/修复"一批已产出文件时专用）
     - 第一步（先跑后读）：单条 RunCommand 跑 task 指定的验收脚本（cwd=产物根目录），拿客观失败清单。
@@ -208,9 +221,9 @@ lightweight_model:
 # onnx（TODO #41，进程内零外部服务方向）：需 -tags onnx 构建 + models/bge-base-zh-v1.5/ 模型文件
 # （见 models/README），BGE-base-zh-v1.5 为 768 维；bge-m3 为 1024 维（当前 pgvector.dimensions）。
 embed:
-  provider: openai             # 默认 pseudo；本地 HTTP 服务（ollama/xinference）用 local；进程内真本地改 onnx（-tags onnx）
-  model: doubao-embedding-vision           # ollama 已拉取的嵌入模型；onnx 示例：bge-base-zh-v1.5
-  api_key: ${EMBEDDING_API_KEY}                  # openai 需要；ollama（local）与 onnx 忽略
+  provider: local             # 默认 pseudo；本地 HTTP 服务（ollama/xinference）用 local；进程内真本地改 onnx（-tags onnx）
+  model: bge-m3           # ollama 已拉取的嵌入模型；onnx 示例：bge-base-zh-v1.5
+  # api_key: ${EMBEDDING_API_KEY}                  # openai 需要；ollama（local）与 onnx 忽略
   base_url: ${EMBEDDING_BASE_URL} # OpenAI 兼容端点根路径（ollama: http://localhost:11434）；onnx 忽略
   batch_size: 1                  # 单次嵌入条数上限
   # model_path: ./models/bge-base-zh-v1.5   # provider=onnx 专用（TODO #41）；默认 ./models/<model>/

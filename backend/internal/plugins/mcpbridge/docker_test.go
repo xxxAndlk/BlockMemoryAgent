@@ -33,6 +33,7 @@ func TestDockerRunArgs(t *testing.T) {
 		Image:     "bma/firecrawl-mcp:local",
 		Args:      []string{"--verbose"},
 		Ports:     []string{"6081:6081"},
+		Volumes:   []string{"D:/data/workspace/od-artifacts:/out"},
 		Env: map[string]string{
 			"FIRECRAWL_API_URL": "http://host.docker.internal:3002",
 			"FIRECRAWL_API_KEY": "self-hosted",
@@ -46,6 +47,7 @@ func TestDockerRunArgs(t *testing.T) {
 		"run", "-i", "--rm", "--name", name,
 		"--add-host", "host.docker.internal:host-gateway",
 		"-p", "6081:6081",
+		"-v", "D:/data/workspace/od-artifacts:/out",
 		"-e", "FIRECRAWL_API_KEY=self-hosted",
 		"-e", "FIRECRAWL_API_URL=http://host.docker.internal:3002",
 		"bma/firecrawl-mcp:local", "--verbose",
@@ -60,9 +62,13 @@ func TestFromSettingsDocker(t *testing.T) {
 		"transport": "docker",
 		"image":     "img:tag",
 		"env":       map[string]any{"K": "V"},
+		"volumes":   []any{"D:/data/workspace/od-artifacts:/out", "bma-data:/data"},
 	})
 	if s.Transport != "docker" || s.Image != "img:tag" || s.Env["K"] != "V" {
 		t.Fatalf("FromSettings = %+v", s)
+	}
+	if len(s.Volumes) != 2 || s.Volumes[0] != "D:/data/workspace/od-artifacts:/out" {
+		t.Fatalf("volumes 解析错误: %v", s.Volumes)
 	}
 
 	b := New("p", s, nil)

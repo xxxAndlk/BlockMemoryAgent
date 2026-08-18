@@ -165,6 +165,41 @@
       - 验证：`go build && go vet && go test ./backend/...` 29 包全绿；web `vue-tsc -b && vite build` 绿（顺带修复 package-lock.json 预存漂移：dompurify/@types 缺失，npm install 同步）。
       - 开放动作：TUI/Web 真机人工验收（破坏性确认按 2 拒绝、方向选择按数字键、Web 点按钮）；真实 LLM 会话观察模型是否按描述主动传 options（schema 已暴露，行为依赖模型）；answerClarify 答复后旧卡片选项随 PendingClarify 清空自动消失（已按"最后一条"注入规避串卡片）。
 
+54. **judge LLM 解析健壮化 + judge 不可用降级策略（unverified 误判放大重派）**  ← 来源：2026-08-17 塔防 UI 增强任务 90 分钟未结耗时归因（`workspace/tower-defense/logs/tui/2026-08-17.log`，session-1786949168171235200-4861bcec-1）
+    - 现象：code_assistant-3 跑 23m42s 完成 Tower._paint 重写（node --check 通过、验收证据齐全），15:32:39 被判 `[failure kind=unverified retryable=false]`，唯一原因 = judge LLM 返 `invalid JSON response`（日志 10816 行）；炮塔领域 Agent 随后自证 + 重派 code_assistant-4 再跑 ~13 分钟，同一文件重复劳动放大 ~25 分钟。
+    - 根因（系统性非偶发）：`backend/internal/agent/engine.go:159` `reflect()` 对 judge 原始响应直接 `json.Unmarshal`——不剥 ```json markdown 围栏、不提取首个 JSON 对象、不重试。judge = prompt_reviewer（`config.yaml:60 judge_role`，deepseek-v4-flash）返回带围栏或夹带文字即必然失败；该模型组合下每次 reflection rubric 校验都会失败，#43 fail-closed 从"防放水"退化为"必然误判"。
+    - 设计张力：`roles.yaml:222` 明确记载 verifyloop 自动验证 2026-08-08 因 A/B 实证负资产下线；#43 fail-closed judge 实质把同类机制请回。修复须解析健壮化与降级策略一起给——只修解析仍留"judge 真不可用（端点挂）时必然误杀 + 重派"的放大通道。
+    - 方向（两步，1 必做 2 推荐）：
+      1. 解析健壮化：剥 markdown 围栏 + 提取首个平衡 `{...}` 块再 Unmarshal；解析失败/LLM 报错重试 1 次（换更严"只输出 JSON"措辞）后才判 `ErrJudgeUnavailable`。
+      2. 降级策略：judge 重试后仍不可用时，若 L0 可执行证据（node --check 等 Success，`RecentVerificationOutputs` 非空）存在 → 降级 pass-with-warning（`VerifyNote` 标注"L0 通过，L2 judge 不可用"，成功摘要前缀如实体现），不再 unverified-FAIL 触发重派；无客观证据时维持 fail-closed（#43"绝不静默放行"的边界 = 无证据场景，而非无条件）。
+    - 执行流程：`engine.go` 加 extractJSON 辅助（剥围栏/找平衡块）+ reflect 内 1 次重试；`ReflectEngine.Run` 的 err 分支查证据非空则置 VerifyNote 降级放行；dispatcher 不动（unverified 仅剩真正无证据场景）。
+    - 测试：extractJSON 变体单测（裸 JSON / ```json 围栏 / 前后夹带文字 / 截断坏 JSON）；reflect 重试后成功；重试仍败 + 有 L0 证据 → 降级 pass 带标注；无证据 → 仍 unverified。
+    - 验收：mock judge 返围栏 JSON 不再误判；judge 真不可用且有 node --check 证据时子 Agent 判通过带标注、不触发重派；双模块 `go test ./...` 绿。
+    - 不做：不恢复 verifyloop 派验证 Agent（负资产结论不变）；不动 #43 L0/L2 分层与 verify_kind 路由；不删无证据场景的 fail-closed。
+    - 落地（任务 65，2026-08-17，详见 `doc/变更.md`）：
+      - `engine.go` 新增 `extractJSON`（剥围栏 + 首个平衡 `{...}` 块提取，字符串内花括号感知）；`reflect()` 拆出 `judgeOnce`，失败重试 1 次（更严"只输出 JSON"措辞）后才判 `ErrJudgeUnavailable`。
+      - `Run` err 分支降级：`HasExecutableVerification` 有 L0 证据 -> `VerifyNote="L0 通过，L2 judge 不可用（降级放行）"` 放行，不触发重派；无证据维持 fail-closed。dispatcher 零改动。
+      - 测试：`TestExtractJSON` 8 变体、围栏 JSON 首答即过、重试恢复、L0 证据降级放行（新 verifyThenAnswerProvider 构造 RunCommand 证据历史）；`LLMErrorFailClosed` 适配两次报错语义。`agent`/`subagent` 全量绿。
+
+55. **UI 增强类任务工具路由：图像生成可见性 + ui_preview 视觉验证闭环 + MetaAgent 美术路线决策**  ← 来源：同上归因（日志 8.1MB / LLM 调用 136 次 / tool_mount 实际调用 0 次 / `od_image_*` 全日志 0 次）
+    - 现象（三重失配）：
+      1. 权限天花板挡路：`plugins.yaml:125` ui_design roles=["ui_assistant"]，MetaAgent 派 role=domain，domain 的 tool_catalog 只有 ui_preview（日志 2542 行），od_image_generate 连目录都进不去。
+      2. 可见插件零使用：ui_preview 对 meta/domain/ui_assistant 全可见（`plugins.yaml:158`），但 tool_mount 实际调用 0 次（296 次出现全是 catalog 文本；8 次 browser_* 同为目录文本）——近千行 canvas 绘制代码全程盲写、零视觉验证。
+      3. 现状描述被硬化为禁令：用户任务文本"这是一个纯 Canvas 绘制的塔防游戏…都是程序化绘制，不是贴图"（日志 608 行）被 MetaAgent 写成契约"纯 canvas 程序化绘制，禁止引入外部图片/字体/base64 资源"（1576 行）——即使插件全放开，按此契约仍只能手绘。
+    - 耗时机理：glm-5.3 实测 ~43 tok/s（8371 tokens / 194.8s），手绘路线每个渐变/描边/阴影逐 token 生成，单轮 5-20K 输出 = 2-13 分钟；任务 14:57 派发，至分析时（16:27）仍在跑（90 分钟未结）。Seedream 出图 10-60s/张，混合路线（AI 贴图 + canvas 动画/叠加）从根上避开 token 黑洞。
+    - 方向（三块）：
+      1. 可见性：plugins.yaml ui_design roles 加 meta（MetaAgent 看得见才会纳入派发考量）与 domain（领域 Agent 可直接出图）；同步钉死 od-artifacts 落盘目录与 HTML 引用路径约定。
+      2. 视觉验证闭环：roles.yaml domain_agent system_prompt【工作模式】加纪律——UI/canvas/游戏绘制类改动后挂载 ui_preview 截图回显验证（截图不传 filename 才回 image content，见 plugins.yaml 注释），看图迭代，禁止全程盲写；MetaAgent 整品验收对可运行页面同样先截图再判。
+      3. MetaAgent 路线决策：meta_agent system_prompt 加一条——UI 增强/游戏美术类任务派发前在 spec 显式钉死美术路线（纯程序化 canvas / AI 贴图 + canvas 混合）；禁止把"项目现状无图片资源"自动推断为"禁止引入图片资源"（现状 ≠ 约束）；贴图路线须声明资源加载层改动范围（接受 game.js 不再零改动）。
+    - 执行流程：plugins.yaml roles + 注释更新；roles.yaml meta/domain prompt 各加 1 条；重启后端或 POST /api/plugins/reload 生效。
+    - 测试：tool_catalog 对 meta/domain 角色可见 od_image_generate/od_image_list（单测或真机）；重跑塔防怪物/炮塔 UI 增强任务验证闭环。
+    - 验收：同一塔防 UI 增强任务重跑——spec 显式钉死美术路线；日志可见 browser_take_screenshot 实际调用（≥1 次截图回显）；混合路线总墙钟对比 90 分钟基线显著下降（预期 < 30 分钟，待实证）。
+    - 不做：不强制所有 UI 任务走贴图路线（纯程序化仍合法，由 spec 显式决策）；不改 tool_mount 按需挂载机制（#52 结论不变）；不对 ui_assistant 之外角色开放 computer_use（破坏性红线不变）。
+    - 落地（任务 66，2026-08-17，详见 `doc/变更.md`）：
+      - `plugins.yaml`：ui_design roles -> `["meta","domain","ui_assistant"]`；注释钉死落盘约定（`workspace/od-artifacts`，页面引用 `../od-artifacts/<file>`，ui_preview 挂 workspace 可达）。
+      - `roles.yaml`：meta_agent【派发铁律】加美术路线决策条（spec 显式钉死纯程序化/混合；现状 ≠ 约束；贴图路线声明资源加载层改动）+【整品验收】加先截图再判 UI；domain_agent【工作模式】加第 6 条绘制类改动禁止盲写（ui_preview 截图回显看图迭代 + 素材优先 od_image_generate）。
+      - 验证：`config`/`plugins`/`mcpbridge` 全量测试绿（纯配置变更零代码路径）。开放验收待真机：重启/`POST /api/plugins/reload` 后重跑塔防 UI 增强任务，看 spec 美术路线 + browser_take_screenshot 实调 + 墙钟对比 90 分钟基线。
+
 ## 已完成（已归档到 git 历史）
 
 - **评测体系落地 + 首次基线**（2026-08-14）：`test/eval/`（build tag `eval`）真实 LLM 任务完成率评测——场景 YAML + checkpoint 判分（command/file/regex/tree/llm_judge）+ token/子Agent 指标聚合 + TheAgentCompany 式全量/部分分报告（`test/eval/runs/`）；环境隔离修复：`docker/docker-compose.test.yml` 独立端口（PG 55432/Redis 56380）+ 无固定容器名，fixture 维度对齐 migrations（768）。首基线 12 场景 full pass 91.7%、加权 0.979，详见 `doc/eval/baseline_2026-08-14.md`。后续加固（同日）：fixture 改"共享容器常驻 + 每测试独立 PG database/Redis 逻辑库"（Redis 开 1024 逻辑库），并行包 `go test ./...` 不再互相拆台；`TestFactExtractionFallback` 序列对齐现行后端（verify_kind 校验分层 + 派发后不阻塞）。开放项：verifyloop 场景判分口径修正（自动验证闭环已下线，改测 verify_kind 证据）、EVAL_RUNS=3 可靠性、SWE-bench 20 题切片（Phase 2）。

@@ -38,6 +38,20 @@ type Result struct {
 	IsTemporary bool `json:"is_temporary,omitempty"`
 	// TempDir 记录本次调用使用的临时目录路径。
 	TempDir string `json:"temp_dir,omitempty"`
+	// Images 记录工具结果携带的图片（如 MCP image content 截图）。
+	// 仅内存透传（json:"-" 不持久化、不计入 token 估算）：随最新一轮工具结果
+	// 喂给多模态模型；历史消息中只保留 Output 里的文本占位符
+	//（[image mime, N bytes base64]），避免 base64 反复进上下文烧毁前缀缓存。
+	Images []ResultImage `json:"-"`
+}
+
+// ResultImage 是工具结果携带的单张图片。
+type ResultImage struct {
+	// MIMEType 图片类型（image/png、image/jpeg 等）。
+	MIMEType string
+	// Data 为 base64 编码内容（与 MCP ImageContent.Data 语义一致，链路零转码；
+	// anthropic provider 在边界按协议直接使用，其他 provider 忽略）。
+	Data []byte
 }
 
 // 失败分级常量（TODO #32）：Dispatch 按 Category 区分连杀计数与终止语义。

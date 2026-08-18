@@ -4,8 +4,12 @@ package model
 // （2026-08-13 代码助手配 65536 撞 ark /api/coding kimi 硬上限 32768 全挂的根因场景）。
 
 import (
+	"encoding/base64"
 	"errors"
 	"testing"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/go-kratos/blades"
 )
 
 // newClampTestProvider 构造一个 maxTokens=指定值的 anthropicProvider（无真实客户端）。
@@ -62,5 +66,56 @@ func TestClampMaxTokensOnError_IgnoresUnrelated(t *testing.T) {
 	}
 	if got := p.maxTokens.Load(); got != 65536 {
 		t.Fatalf("未触发钳制时 maxTokens 应保持 65536，got %d", got)
+	}
+}
+
+// TestConvertMessages_ToolResultImages 验证图片透传的 anthropic 边界：
+// RoleTool 消息携带的 DataPart（仅 agent.ToBladesMessages 最新一批）转为同一
+// tool_result content 里的 image 块；协议不支持的 MIME（svg 等）静默跳过。
+func TestConvertMessages_ToolResultImages(t *testing.T) {
+	p := &anthropicProvider{}
+	raw := []byte{0x89, 0x50, 0x4E, 0x47}
+	msgs := []*blades.Message{
+		{Role: blades.RoleUser, Parts: []blades.Part{blades.TextPart{Text: "hi"}}},
+		{Role: blades.RoleTool, Parts: []blades.Part{
+			blades.ToolPart{ID: "c1", Response: "[image image/png, 4 bytes base64]"},
+			blades.DataPart{MIMEType: blades.MIMEImagePNG, Bytes: raw},
+		}},
+		{Role: blades.RoleTool, Parts: []blades.Part{
+			blades.ToolPart{ID: "c2", Response: "[image image/svg+xml, 9 bytes base64]"},
+			blades.DataPart{MIMEType: "image/svg+xml", Bytes: raw}, // 协议不支持：跳过
+		}},
+	}
+	out, err := p.convertMessages(msgs)
+	if err != nil {
+		t.Fatalf("convertMessages: %v", err)
+	}
+	// out = [user, mergedUser(c1+c2 tool_result)]
+	if len(out) != 2 {
+		t.Fatalf("消息数不符: got %d want 2", len(out))
+	}
+	merged := out[1]
+	if len(merged.Content) != 2 {
+		t.Fatalf("合并后应有 2 个 tool_result, got %d", len(merged.Content))
+	}
+	// c1：text + image 两块，image 为 png base64。
+	tr1 := merged.Content[0].OfToolResult
+	if tr1 == nil || len(tr1.Content) != 2 {
+		t.Fatalf("c1 tool_result 应含 text+image 两块: %+v", tr1)
+	}
+	img := tr1.Content[1].OfImage
+	if img == nil || img.Source.OfBase64 == nil {
+		t.Fatalf("c1 第二块应为 base64 image: %+v", tr1.Content[1])
+	}
+	if img.Source.OfBase64.Data != base64.StdEncoding.EncodeToString(raw) {
+		t.Fatalf("image base64 不符: %q", img.Source.OfBase64.Data)
+	}
+	if img.Source.OfBase64.MediaType != anthropic.Base64ImageSourceMediaTypeImagePNG {
+		t.Fatalf("image media_type 不符: %q", img.Source.OfBase64.MediaType)
+	}
+	// c2：svg 被跳过，仅 text 一块。
+	tr2 := merged.Content[1].OfToolResult
+	if tr2 == nil || len(tr2.Content) != 1 || tr2.Content[0].OfText == nil {
+		t.Fatalf("c2 tool_result 应仅含 text 一块: %+v", tr2)
 	}
 }

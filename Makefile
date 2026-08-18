@@ -1,4 +1,4 @@
-.PHONY: backend-test test-test test-compile web-build lint up down migrate run plugins-up plugins-down plugins-build help
+.PHONY: backend-test test-test test-compile web-build lint up down migrate run bma-plugin plugins-up plugins-down plugins-build help
 
 ## Run all backend Go tests (unit + package tests).
 backend-test:
@@ -43,6 +43,10 @@ migrate:
 run: web-build
 	go run ./backend
 
+## One command to ready all plugin docker deps: build/pull images + Firecrawl stack up.
+bma-plugin:
+	bash docker/bma-plugin.sh
+
 ## Start the self-hosted Firecrawl stack (web_search plugin data plane, :3002).
 plugins-up:
 	docker compose -f docker/docker-compose.firecrawl.yml up -d
@@ -51,10 +55,12 @@ plugins-up:
 plugins-down:
 	docker compose -f docker/docker-compose.firecrawl.yml down
 
-## Build/pull plugin images: firecrawl-mcp + computer-use-mcp (local build) + open_design (ghcr pull).
+## Build/pull plugin images: 4x local MCP bridges (bma/*:local) + open_design (ghcr pull).
 plugins-build:
 	docker build -t bma/firecrawl-mcp:local docker/firecrawl-mcp
 	docker build -t bma/computer-use-mcp:local docker/computer-use
+	docker build -t bma/open-design-mcp:local docker/open-design-mcp
+	docker build -t bma/ui-preview-mcp:local docker/ui-preview-mcp
 	docker pull ghcr.io/nexu-io/od:latest
 
 ## Show available targets.
@@ -69,6 +75,7 @@ help:
 	@echo "  down          - stop docker compose services"
 	@echo "  migrate       - apply SQL migrations (requires POSTGRES_DSN)"
 	@echo "  run           - build web UI and run backend server"
+	@echo "  bma-plugin    - one command: build/pull all plugin images + Firecrawl stack up"
 	@echo "  plugins-up    - start self-hosted Firecrawl stack (web_search data plane)"
 	@echo "  plugins-down  - stop self-hosted Firecrawl stack"
-	@echo "  plugins-build - build/pull plugin images (web_search / computer_use / open_design)"
+	@echo "  plugins-build - build/pull plugin images (web_search / computer_use / open_design / ui_design / ui_preview)"
