@@ -63,7 +63,7 @@ func (fileHelperScriptGuard) Check(path, content string) error {
 		return nil
 	}
 	// 检测到反模式，返回带原因的错误提示。
-	return fmt.Errorf("禁止写脚本做文件读取/列目录/搜索: %s。直接用 ReadFile / ListDir / SearchInFiles 工具，无需写中间脚本。此反模式浪费 token 与执行时间（塔防事故中 Agent 写 10+ 个 .py 读 game.js）。", reason)
+	return fmt.Errorf("禁止写脚本做文件读取/列目录/搜索: %s。直接用 ReadFile / ListDir / SearchInFiles 工具，无需写中间脚本。", reason)
 }
 
 // mailboxGoProgramGuard 用于阻止写入调用 runtime.Mailbox 的 Go 程序。
@@ -82,7 +82,7 @@ func (mailboxGoProgramGuard) Check(path, content string) error {
 		return nil
 	}
 	// 命中规则，返回禁止写入的错误提示。
-	return fmt.Errorf("禁止写 Go 程序伪造邮箱投递: %s。跨域协作请通过 runtime.Mailbox 投递（DomainAgent 内部 API，Agent 不应直接调用），或在任务输出中声明『请把 X 发给 Y 领域』由 MetaAgent 转发。写 Go 源码绕过邮箱检测不会被编译，纯属浪费 token（塔防事故 Agent 写 send_interface.go）。", reason)
+	return fmt.Errorf("禁止写 Go 程序伪造邮箱投递: %s。跨域协作请在任务输出中声明『请把 X 发给 Y 领域』由 MetaAgent 转发。", reason)
 }
 
 // pathWhitespaceGuard 用于拒绝非末尾路径段包含空格的写入路径。

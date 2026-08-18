@@ -11,7 +11,7 @@
 // stdout 只承载 MCP JSON-RPC 帧，日志一律 stderr。
 import http from 'node:http';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -19,14 +19,31 @@ import { z } from 'zod';
 const OD_API_URL = (process.env.OD_API_URL || 'http://host.docker.internal:7456').replace(/\/$/, '');
 const OD_API_TOKEN = process.env.OD_API_TOKEN || '';
 const OD_HOST_HEADER = process.env.OD_HOST_HEADER || 'localhost:7456';
-const OD_DEFAULT_MODEL = process.env.OD_DEFAULT_MODEL || 'doubao-seedream-3-0-t2i-250415';
+// 默认模型 = od 守护进程模型目录 id（非上游模型名）。"custom-image" 走 daemon 的
+// OpenAI 兼容 custom-image provider，真实模型名由 daemon media-config.json 的
+// providers.custom-image.model 决定（BMA 默认 doubao-seedream-5.0-lite，
+// 火山方舟 Agent Plan 网关唯一可用图像模型）。
+const OD_DEFAULT_MODEL = process.env.OD_DEFAULT_MODEL || 'custom-image';
 const OD_PROJECT_ID = process.env.OD_PROJECT_ID || 'bma-agent-artifacts';
 const OD_TIMEOUT_MS = Number(process.env.OD_TIMEOUT_MS || 180000);
-const OUTPUT_DIR = process.env.OD_OUTPUT_DIR || '/out';
+// 容器内挂载的工作目录根（plugins.yaml volumes: ${WORKDIR}:/workspace）。
+// save_as 相对路径以此解析；默认产物落其子目录 .bma/od-artifacts。
+const WORKSPACE_DIR = (process.env.OD_WORKSPACE_DIR || '/workspace').replace(/\/$/, '');
+const OUTPUT_DIR = process.env.OD_OUTPUT_DIR || `${WORKSPACE_DIR}/.bma/od-artifacts`;
 // 返回给 Agent 的宿主侧相对路径前缀（相对 Agent 工作目录，与 plugins.yaml 的 volumes 映射对应）。
 const OUTPUT_REL_PREFIX = (process.env.OD_OUTPUT_REL_PREFIX || '.bma/od-artifacts').replace(/\/$/, '');
 const POLL_INTERVAL_MS = 2000;
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
+
+// resolveSaveAs 把 Agent 给的 save_as（宿主工作目录相对路径）解析为容器内绝对路径。
+// 防路径穿越：拒绝绝对路径、盘符、`..` 上跳；统一为正斜杠。
+function resolveSaveAs(saveAs) {
+  const rel = String(saveAs).replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!rel || rel.startsWith('..') || rel.includes('/../') || /^[a-zA-Z]:/.test(rel)) {
+    throw new Error(`save_as 非法（须为工作目录内的相对路径，不可含 .. 或盘符）: ${saveAs}`);
+  }
+  return { rel, abs: `${WORKSPACE_DIR}/${rel}` };
+}
 
 function log(...args) {
   console.error('[open-design-mcp]', ...args);
@@ -163,10 +180,12 @@ function slugify(prompt) {
   return slug || 'image';
 }
 
-async function generateImage({ prompt, aspect, model }) {
+async function generateImage({ prompt, aspect, model, save_as: saveAs }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
+  // 先校验 save_as（fail fast：路径非法不必浪费一次生成）。
+  const saveTarget = saveAs ? resolveSaveAs(saveAs) : null;
   const useModel = model || OD_DEFAULT_MODEL;
   const startedAtMs = Date.now();
   await ensureProject();
@@ -181,20 +200,32 @@ async function generateImage({ prompt, aspect, model }) {
   const fileName = (await extractTaskFile(task)) || (await newestImageFallback(startedAtMs));
   if (!fileName) throw new Error('任务完成但未找到产物文件名');
   const bytes = await downloadFile(fileName);
-  mkdirSync(OUTPUT_DIR, { recursive: true });
   const ext = (fileName.match(/\.[a-z0-9]+$/i)?.[0]) || '.png';
-  const outName = `${new Date().toISOString().replace(/[:.]/g, '').slice(0, 15)}-${slugify(prompt)}${ext}`;
-  writeFileSync(join(OUTPUT_DIR, outName), bytes);
+  let absPath;
+  let relPath;
+  if (saveTarget) {
+    // 正式素材：直落 Agent 指定的工作目录相对路径（如 assets/img/mon-zombie.png），
+    // 一图一份，无需事后复制重命名。无扩展名时补生成文件的实际扩展名。
+    relPath = /\.[a-z0-9]+$/i.test(saveTarget.rel) ? saveTarget.rel : saveTarget.rel + ext;
+    absPath = `${WORKSPACE_DIR}/${relPath}`;
+  } else {
+    // 缺省（草稿/临时）：时间戳 + prompt slug 落 .bma/od-artifacts。
+    const outName = `${new Date().toISOString().replace(/[:.]/g, '').slice(0, 15)}-${slugify(prompt)}${ext}`;
+    relPath = `${OUTPUT_REL_PREFIX}/${outName}`;
+    absPath = join(OUTPUT_DIR, outName);
+  }
+  mkdirSync(dirname(absPath), { recursive: true });
+  writeFileSync(absPath, bytes);
   const elapsedSec = Math.round((Date.now() - startedAtMs) / 1000);
-  log('产物已落盘:', outName, `${bytes.length}B`, `${elapsedSec}s`);
+  log('产物已落盘:', relPath, `${bytes.length}B`, `${elapsedSec}s`);
   return {
-    path: `${OUTPUT_REL_PREFIX}/${outName}`,
-    filename: outName,
+    path: relPath,
+    filename: relPath.split('/').pop(),
     bytes: bytes.length,
     model: useModel,
     aspect: aspect || null,
     elapsedSec,
-    hint: '在 HTML/CSS 中以该相对路径引用此图片',
+    hint: '在 HTML/CSS/JS 中以该相对路径（path 字段）引用此图片',
   };
 }
 
@@ -223,12 +254,17 @@ server.registerTool('od_image_generate', {
   title: 'Open Design 图像生成',
   description:
     '经本地 open_design 守护进程生成图片（默认火山方舟 Seedream）。' +
-    '产物保存到宿主工作目录（.bma/od-artifacts）并在结果中返回相对路径（path 字段），可直接在 HTML/CSS/文档中引用。' +
+    '正式素材务必用 save_as 指定工作目录相对路径（如 assets/img/mon-zombie.png），图片直落该路径、' +
+    '一图一份，结果 path 字段即可在 HTML/CSS/JS 中直接引用；禁止事后再复制/重命名出第二份。' +
+    '缺省 save_as 时落 .bma/od-artifacts（时间戳命名，仅适合草稿/临时用途）。' +
     '生成约需 10–60 秒，请勿重复提交相同 prompt。',
   inputSchema: {
     prompt: z.string().min(1).describe('图像描述（建议具体描述主体/风格/配色/构图）'),
     aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例，缺省由模型决定'),
     model: z.string().optional().describe(`覆盖默认模型（缺省 ${OD_DEFAULT_MODEL}）`),
+    save_as: z.string().optional().describe(
+      '产物落盘的工作目录相对路径（如 assets/img/mon-zombie.png）。目录自动创建；' +
+      '无扩展名时按生成文件实际格式补齐；不可含 .. 或盘符。命名须与代码加载约定一致'),
   },
 }, async (args) => {
   try {

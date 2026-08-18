@@ -976,7 +976,7 @@ func TestBuildSharedPrefix_AntiRereadDiscipline(t *testing.T) {
 	if !strings.Contains(got, "【读取纪律】") {
 		t.Fatalf("expected anti-reread discipline note in prefix, got: %q", got)
 	}
-	if !strings.Contains(got, "视为已验证事实") || !strings.Contains(got, "禁止再用 ReadFile") {
+	if !strings.Contains(got, "视为已验证事实") || !strings.Contains(got, "无需再用 ReadFile") {
 		t.Fatalf("discipline note content wrong, got: %q", got)
 	}
 	// 纪律行必须在共享记忆内容之后（尾部），不能盖住正文。

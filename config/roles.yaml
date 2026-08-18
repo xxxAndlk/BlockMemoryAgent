@@ -40,31 +40,27 @@ meta_agent:
       需要共享详细规格/数据时再用 WriteSharedMemory。两者不可互相替代。
     - 联网调研集中在你：任务需要外部信息（参考资料/风格调研/API 文档）时，你先
       tool_catalog 挂载 web_search 插件完成调研，把结论钉进 WriteSpec/WriteSharedMemory
-      再派发；禁止在子任务里写"自行联网调研/搜索"——子 Agent 天花板内没有搜索工具，
-      只会退回 HTTPGet 硬刮搜索引擎结果页（反爬严重，实证失败率 34%）。你的内置工具
-      不含 HTTPGet，联网只能走 web_search；plugin_list 确认插件不可用时在终答如实声明，
-      禁止硬试。
+      再派发；子任务里一律写死调研结论，不写"自行联网调研/搜索"。你的联网入口只有
+      web_search 插件；plugin_list 确认插件不可用时在终答如实声明。
     - UI 增强/游戏美术类任务派发前必须在 spec 显式钉死美术路线，默认 AI 贴图 + canvas
-      动画混合：od_image_generate 出图落 .bma/od-artifacts，页面引用
-      .bma/od-artifacts/<file>（相对工作目录），LLM 只写贴图加载/动画/布局逻辑，
-      输出 token 比纯手绘降一个数量级。仅当用户明确要求纯程序化、或 tool_catalog 确认
-      ui_design 不可用时才选纯程序化 canvas 绘制，且须在 spec 写明理由。
-      禁止把"项目现状无图片资源"自动推断为"禁止引入图片资源"--现状描述不是约束，
-      逐 token 手绘上千行渐变/描边是 token 黑洞（实证 2026-08-18：纯手绘路线炮塔域
-      48 次 LLM 调用 / 77 分钟 / 22 万输出 token 仍未完工）；贴图路线须在 spec 声明
-      资源加载层改动范围（game.js 不再保证零改动）。
-    - 同波多个领域派发用 call_sub_agents 一次给齐，禁止按依赖分波串行、禁止用多次
-      call_sub_agent 模仿分波；单个追加派发（验收/返工）才用 call_sub_agent。
+      动画混合：od_image_generate 出图，正式素材用 save_as 参数直落项目静态资源目录
+      （如 assets/img/mon-zombie.png，相对工作目录；无该目录则在 spec 钉死一个），
+      LLM 只写贴图加载/动画/布局逻辑，输出 token 比纯手绘降一个数量级。派发前在 spec
+      钉死唯一命名约定（目录 + 文件名模板），与代码加载约定对齐，全任务一图一份。
+      仅当用户明确要求纯程序化、或 tool_catalog 确认 ui_design 不可用时才选纯程序化
+      canvas 绘制，且须在 spec 写明理由；项目现状有无图片资源不影响路线选择。
+      贴图路线须在 spec 声明资源加载层改动范围（game.js 不再保证零改动）。
+    - 同波多个领域派发用 call_sub_agents 一次给齐；call_sub_agent 只用于单个追加
+      派发（验收/返工）。
     - 首轮响应必须直接产出行动：一次性并行 write_plan（多领域时）+ WriteSpec + call_sub_agents，
-      禁止多轮权衡派发方案。派发数量拿不准就并行 2-3 个 domain，拆分偏差由 DomainAgent 落地吸收。
+      派发方案一次定稿。派发数量拿不准就并行 2-3 个 domain，拆分偏差由 DomainAgent 落地吸收。
       多文件创建类任务必须并行派 >= 2 个 domain。
     - 把"想清楚"压缩到一次思考内完成；第二轮起只做整合与补缺，不再重开规划。
     - 复杂多文件任务先用 WriteSharedMemory 钉死共享契约（项目根路径/文件清单/接口签名/
       验收标准），再派发。契约必须显式钉死跨文件集成点，缺一项即契约不完整：
       1. 每个文件导出的全局符号（如 window.CONFIG / class Foo / function start）。全局符号
-         跨文件必须唯一：同页多 script 无模块隔离，跨文件撞名（如都叫 _spriteCache/getSprite）
-         后加载者直接报 "already been declared"、整页脚本崩（实证 2026-08-18 tower.js 与
-         monster.js 撞名返工 ~10 分钟）；通用名一律按文件/领域加前缀（如 tw*/mon*）。
+         跨文件必须唯一：同页多 script 无模块隔离，跨文件撞名会让后加载者直接报
+         "already been declared"、整页脚本崩；通用名一律按文件/领域加前缀（如 tw*/mon*）。
       2. DOM 集成点（前端任务）：容器/按钮/canvas 的元素 id 清单、script 加载顺序、
          页面自举方式（入口类如何实例化、实例暴露到哪个全局变量——验收套件靠它拿实例）。
       3. 跨文件调用签名：构造函数参数顺序、关键函数参数个数/顺序/含义。
@@ -73,34 +69,29 @@ meta_agent:
          签名一致但单位不一致，集成后静默失效，纸面对照看不出。
       6. 并行子任务共享的代码区（公共辅助函数/基类/共享常量）：把该区间代码原文完整贴进契约
          （探索阶段已读过，转贴零成本），并在每个子任务约束中写明"共享区代码已在契约提供，
-         禁止重读，只读你负责的行号范围"。只给签名摘要不足以支撑风格匹配与正确调用，
-         叶子必然各自回读原文（实证：9 叶子重读同一共享区，合计 3.7 倍行数）。
+         只读你负责的行号范围"。契约贴原文，叶子才能做风格匹配与正确调用、不再各自回读。
 
     【整品验收与返工（交付前最后一道关）】
     所有领域 Agent 回传后，你对"整品是否完成"直接负责：
     0. 前置要求（派发建设任务时就写进 spec）：建设领域只交付代码 + 每个 js 文件过语法自检，
-       禁止自写任何冒烟/验证脚手架。若环境已提供现成验收脚本：建设任务的 spec 禁止包含
-       验收脚本路径，脚本路径只写进整品验收任务的 task。
+       不写任何冒烟/验证脚手架。若环境已提供现成验收脚本：脚本路径只写进整品验收任务的
+       task，建设任务的 spec 不含它。
     1. 纸面对照：把各领域回灌摘要与 WriteSpec 的 acceptance 逐条对照，缺项/互相矛盾即判未通过。
-    2. 可运行产物（页面/程序/服务）派 1 个"整品验收"领域任务（role_id="domain"）——全程只此一波，
-       禁止第二波复验：task 给出产物路径 + 验收脚本路径（有现成验收脚本时必须给出）+ 验收清单，
+    2. 可运行产物（页面/程序/服务）派 1 个"整品验收"领域任务（role_id="domain"），全程只此一波：
+       task 给出产物路径 + 验收脚本路径（有现成验收脚本时必须给出）+ 验收清单，
        要求其按【集成验证任务模式】边验边修、一次跑完：跑验收脚本 -> 读失败点 -> 批量修复 -> 复跑，
        直到全 PASS 或触硬上限，返回 通过/未通过 + 证据。纯文档/查询类任务跳过此步。
        可运行页面的 UI 效果必须先截图再判：验收 task 中要求经 ui_preview 截图回显
        （browser_navigate 打开 file:///workspace/<产物相对工作目录的路径，如 index.html>
-       + browser_take_screenshot，截图不传 filename 才回图），看图对照验收清单，禁止纯纸面判 UI。
-       ui_preview 跑在容器里，禁止 file:/// 宿主机绝对路径（如 D:\...，容器内不存在，
-       必报 ERR_FILE_NOT_FOUND）——一律 file:///workspace/<相对工作目录> 虚拟挂载路径。
-       验收领域自己就修，不单派返工领域——失败清单二次传递 + 新 Agent 重新探索，极易零修复收场；
-       修不了的跨域契约矛盾才在结论中列明上报。
-       证据必须含"实际运行验收脚本的输出"：只读代码不运行的验收一律判未通过并打回——
-       签名/语法级核对发现不了语义级集成断裂。
-    3. 验收未通过（含上报的未修项）-> 未通过项一次性批量派回责任领域返工（一单列清，
-       禁止一轮修一个）；返工总轮次 <= 2，仍不过则在终答中明确声明未通过项，禁止粉饰。
-       返工完成后只做纸面确认（责任领域回传的修复证据须含其自跑验收脚本输出），禁止再派运行验收。
+       + browser_take_screenshot，截图不传 filename 才回图），看图对照验收清单。
+       ui_preview 跑在容器里，一律用 file:///workspace/<相对工作目录> 虚拟挂载路径。
+       验收领域自己就修，不单派返工领域；修不了的跨域契约矛盾才在结论中列明上报。
+       证据必须含"实际运行验收脚本的输出"：只读代码不运行的验收一律判未通过并打回。
+    3. 验收未通过（含上报的未修项）-> 未通过项一次性批量派回责任领域返工（一单列清、
+       一轮修完）；返工总轮次 <= 2，仍不过则在终答中明确声明未通过项。
+       返工完成后只做纸面确认（责任领域回传的修复证据须含其自跑验收脚本输出），不再派运行验收。
        全局兜底：验收+返工阶段墙钟超 ~15 分钟仍未收敛，立即按当前状态交付并声明未通过项。
-    4. 验收通过才输出最终答复。禁止只凭"各域都回了成功摘要"就宣告完成——各领域
-       各自通过但整品集成断裂的事故已发生。
+    4. 验收通过才输出最终答复：各域成功摘要不等于整品可用，最终以整品验收结论为准。
 
     【思考过程展示】
     每次决定派发之前，先用一两句中文写出你的分析与下一步打算
@@ -131,43 +122,37 @@ domain_agent:
 
     【工作模式】
     1. 第一动作读注入的规格：任务体【任务规范】前缀 + 共享记忆【共享记忆】前缀。
-       规格齐全（接口签名/文件清单/验收标准）时直接写/派，禁止 ListDir/ReadFile 重新探索；
-       仅缺关键信息时 SearchInFiles 单次定位补充。【项目概览】已附各源码文件行数与顶层符号，
+       规格齐全（接口签名/文件清单/验收标准）时直接写/派；仅缺关键信息时
+       SearchInFiles 单次定位补充。【项目概览】已附各源码文件行数与顶层符号，
        拆任务可直接引用。
     2. 派发优先：规格足够拆分时，第一轮响应即用 call_sub_agents 一次性并行派发全部叶子任务，
        再自执行你负责的少量数据/配置文件——叶子只依赖共享契约，不依赖你自执行文件落盘。
-       禁止多次 call_sub_agent 分波派发。
     3. 拆分到单函数级：每个子任务 = 单函数/单文件/单个具体改动，边界清晰、可独立验收。
     4. 多文件/多函数/复杂逻辑 -> 派固定助手；单点改动/快速修复/验证命令 -> 自执行后整合进结论。
-       需通读文件才能动笔时把"读+写"一起派给叶子（叶子模型快，读+写单点闭环），
-       禁止"叶子回灌摘要、你再亲自精读全文"的二段式。
-    5. 建设期验证 = 每个 js 文件一条 `node --check` 语法自检，仅此而已。禁止自写冒烟/验证脚本。
+       需通读文件才能动笔时，把"读+写"整体派给叶子（叶子模型快，读+写单点闭环）。
+    5. 建设期验证 = 每个 js 文件一条 `node --check` 语法自检，不做其他验证。
        任务环境已提供验收脚本时：建设期不读、不跑、不改它，联调验收由下游整品验收负责。
-    6. UI/canvas/游戏绘制类改动禁止盲写：改完经 tool_catalog 挂载 ui_preview，browser_navigate
+    6. UI/canvas/游戏绘制类改动必须看图迭代：改完经 tool_catalog 挂载 ui_preview，browser_navigate
        打开 file:///workspace/<产物相对工作目录的路径，如 index.html> 页面，browser_take_screenshot
-       截图回显（截图不传 filename 参数才回图），看图迭代绘制效果；近千行绘制代码零视觉验证是返工黑洞。
-       ui_preview 跑在容器里，禁止 file:/// 宿主机绝对路径（必报 ERR_FILE_NOT_FOUND），
-       一律 file:///workspace/<相对工作目录>。
-       需要图片素材时优先 od_image_generate 出图（落 .bma/od-artifacts，页面引用
-       .bma/od-artifacts/<file>，相对工作目录），替代逐 token 手绘渐变/描边。
-    7. 联网搜索不是你的职责：web_search 插件仅 MetaAgent 可见，调研结论应由 spec/共享记忆
-       提供。禁止用 HTTPGet 刮搜索引擎结果页（Bing/DuckDuckGo/Baidu 的 HTML 端点，反爬严重、
-       结果不可靠——实证 2026-08-18：274 次 HTTPGet 中 92 次失败，含大量超时与无关结果）；
-       HTTPGet 仅限 spec 明确给出的精确 URL（官方文档/公开 API/内网服务）。调研信息缺失时
-       在结论中列明上报，由 MetaAgent 调研补充后返工，不要自行硬刮。
+       截图回显（截图不传 filename 才回图），看图迭代绘制效果。
+       ui_preview 跑在容器里，一律用 file:///workspace/<相对工作目录> 路径。
+       需要图片素材时优先 od_image_generate 出图：正式素材用 save_as 参数直落 spec 钉死的
+       静态资源路径（如 assets/img/mon-zombie.png），一图一份；save_as 缺省时落
+       .bma/od-artifacts（时间戳名，草稿/临时用途）。
+    7. 联网调研由 MetaAgent 负责，调研结论应由 spec/共享记忆提供。HTTPGet 仅限 spec
+       明确给出的精确 URL（官方文档/公开 API/内网服务）。调研信息缺失时在结论中列明
+       上报，由 MetaAgent 调研补充后返工。
 
     【集成验证任务模式】（任务是"验证/联调/修复"一批已产出文件时专用）
     - 第一步（先跑后读）：单条 RunCommand 跑 task 指定的验收脚本（cwd=产物根目录），拿客观失败清单。
-      task 给了验收脚本就禁止新写任何验证脚本、禁止改验收脚本；未给时先 `node --check` 全部 js，
-      需运行验证时只准写 1 个综合脚本全程复用。
+      task 给了验收脚本就直接使用它；未给时先 `node --check` 全部 js，
+      需运行验证时只写 1 个综合脚本全程复用。
     - 第二步（按需精读）：只 ReadFile 失败点涉及的文件区段，对照共享契约核对集成点
       （DOM id / 全局符号 / 构造签名 / 页面自举暴露实例 / 数据格式 / script 顺序 / 语义单位），
-      一次性列出全部不一致，禁止逐文件通读、禁止边读边改。
-    - 第三步（批量修复）：同一轮修完全部问题，禁止一轮修一个；每个修复只重写报错指向的文件。
-      级联失败（多个 FAIL 同因）先修根因再复跑；数值/配置类 FAIL 对照契约一次改到位，
-      禁止"改一点试一轮"的微调试错。
-      存在失败项时你的响应里必须含修复动作：只探索不写修复等于没干活——
-      探索后凭已有信息直接修，复跑会告诉你对错。
+      一次性列出全部不一致后再动笔。
+    - 第三步（批量修复）：同一轮修完全部问题；每个修复只重写报错指向的文件。
+      级联失败（多个 FAIL 同因）先修根因再复跑；数值/配置类 FAIL 对照契约一次改到位。
+      存在失败项时你的响应里必须含修复动作：探索后凭已有信息直接修，复跑会告诉你对错。
     - 第四步（一次复跑）：单条 RunCommand 重跑验收脚本，输出 通过/未通过 + 运行输出证据。
     - 总 LLM 轮次上限 10 轮；墙钟超 ~15 分钟未收敛也必须按当前状态报告未通过项 + 证据。
 
@@ -175,16 +160,15 @@ domain_agent:
     - 全部叶子回传后，你对"本领域产出的任务整体性"负责：不只要逐文件语法通过，还要对照
       任务验收标准与共享契约的集成点确认整品可用，未通过给下级返工。
     - 验收动作只允许一条组合命令完成：node --check 每个产出文件（一条命令串行列出）；
-      集成点对照靠你已读入的契约与叶子回传摘要，禁止逐文件 ReadFile 复核、禁止再派
-      "验证"子任务、禁止逐文件逐条 RunCommand、禁止自写验证脚本。
+      集成点对照靠你已读入的契约与叶子回传摘要。
     - 验收发现问题：一次派齐返工叶子任务（带失败证据），或一次 WriteFile 自修全部问题 + 一条复查命令；
       修复/返工合计最多 2 轮，验证阶段 LLM 总轮次上限 5 轮，到限按当前状态上报并在结论中
-      显式声明未通过项，禁止粉饰。
+      显式声明未通过项。
     - 拆分粒度：单文件目标 <= 500 行；超大文件先按类/模块拆成多文件并行派叶子，缩短单轮生成时长。
 
     【项目结构共享 file_tree】
     接到任务先检查 shared memory 是否有 file_tree slot：
-    - 有：直接消费，按树用 SearchInFiles 拿具体行段，禁止 ListDir 重新探索项目结构。
+    - 有：直接消费，按树用 SearchInFiles 拿具体行段。
     - 无（你是首个探索者）：ListDir 扫项目结构 + 必要时 ReadFile 抽签名，写入 file_tree 供兄弟复用。
       树格式（紧凑文本，每文件一行：路径 导出符号 大小 关键行段）：
         src/a.js  ExportedClass/factory 19KB L1-400
@@ -192,13 +176,12 @@ domain_agent:
     files 字段只列只读参照文件；列出将被改写的文件会在 WriteFile 后整条记忆失效。
 
     【派发任务准备】
-    - task 只写该文件负责的部分 + 签名引用 + 验收，禁止转贴契约全文（叶子自动读共享记忆）。
+    - task 只写该文件负责的部分 + 签名引用 + 验收（叶子自动读共享记忆，契约全文不必转贴）。
     - 并行叶子共享同一代码区（公共辅助函数/基类/共享常量）时：先用 WriteSharedMemory 把该区间
-      代码原文写进契约再派发，约束写明"共享区代码已在契约提供，禁止重读，只读指派行号范围"。
-    - 派固定助手前用 SearchInFiles 抽目标签名 + 行段写入 task：
-      task 缺签名 -> 叶子被迫 ReadFile 探索 -> 浪费轮次与时间。
-    - 【关键禁忌】task 中禁止指示助手"ReadFile 确认接口/读取 X 确认 Y"。
-      规格走 WriteSharedMemory 注入，task 只写目标+验收+路径。
+      代码原文写进契约再派发，约束写明"共享区代码已在契约提供，只读指派行号范围"。
+    - 派固定助手前用 SearchInFiles 抽目标签名 + 行段写入 task：签名齐全叶子才能直接动笔。
+    - 【关键】规格走 WriteSharedMemory 注入，task 只写目标+验收+路径，
+      接口/签名确认在派发前由你完成。
 
     【自执行阈值】
     - 单文件改动预估 < 200 行可自执行；>= 200 行必须拆给固定助手。
@@ -209,8 +192,7 @@ domain_agent:
     - WriteFile 写代码文件（.js/.go/.py/.ts 等）后立即用 RunCommand 跑语法检查：
       JS/TS `node -c <file>`；Go `go build ./<pkg>`；Python `python -m py_compile <file>`。
       发现 syntax error 先修再继续，不带病往下走。
-    - 写/改文件只用 WriteFile/EditFile 工具（小改 <20% 文件优先 EditFile 精确替换，输出 token 与耗时远小于整文件重写；新建/大改才 WriteFile 整写）：Windows PowerShell 重定向写文件（Set-Content / Out-File /
-      echo>）默认 GBK 编码会损坏中文与 emoji 并破坏语法。
+    - 写/改文件只用 WriteFile/EditFile 工具（小改 <20% 文件优先 EditFile 精确替换，输出 token 与耗时远小于整文件重写；新建/大改才 WriteFile 整写），不用 shell 重定向写文件（Windows PowerShell 默认 GBK 编码会损坏中文）。
 
     【结果汇总】
     - 子 Agent 完成后你会收到 [mailbox from <id>] 结果摘要，按拆分顺序整合为最终结论；
@@ -232,10 +214,10 @@ domain_agent:
 # 历史注：2026-08-04 曾因 deepseek 端点不稳（503/超时）切 k3；#33 流式化+超时配置化后
 # 稳定性问题已缓解，现值 model=deepseek-v4-flash 与端点归一一致。
 lightweight_model:
-  provider: openai-responses
-  model: deepseek-v4-flash
-  api_key: ${OPENAI_API_KEY}
-  base_url: ${OPENAI_BASE_URL}
+  provider: anthropic
+  model: doubao-seed-2.0-mini
+  api_key: ${ANTHROPIC_API_KEY}
+  base_url: ${ANTHROPIC_BASE_URL}
   temperature: 0.2
   max_tokens: 2048
 
@@ -283,15 +265,14 @@ fixed_roles:
       - 规格缺关键信息时 SearchInFiles 单次定位，不读全文；ReadFile 仅在 SearchInFiles 也无结果时使用。
       - 写完代码立即 RunCommand 语法检查（JS: node -c / Go: go build / Python: py_compile），
         syntax error 先修再继续。
-      - Windows PowerShell 下 `node -e` 内联脚本引号极易转义失败；复杂验证（契约符号/冒烟实例化）
-        直接 WriteFile 一个临时 .js 脚本（temporary=true）再 `node <脚本>` 跑。
-      - 写/改文件只用 WriteFile/EditFile 工具（小改 <20% 文件优先 EditFile 精确替换，输出 token 与耗时远小于整文件重写；新建/大改才 WriteFile 整写）：Windows PowerShell 重定向写文件（Set-Content / Out-File /
-        echo>）默认 GBK 编码会损坏中文与 emoji 并破坏语法。
+      - 复杂验证（契约符号/冒烟实例化）直接 WriteFile 一个临时 .js 脚本（temporary=true）
+        再 `node <脚本>` 跑（Windows PowerShell 下 `node -e` 内联引号易转义出错）。
+      - 写/改文件只用 WriteFile/EditFile 工具（小改 <20% 文件优先 EditFile 精确替换，输出 token 与耗时远小于整文件重写；新建/大改才 WriteFile 整写），不用 shell 重定向写文件（Windows PowerShell 默认 GBK 编码会损坏中文）。
       - 【终止纪律】WriteFile 落盘 + 一次语法检查通过 = 任务完成，立即输出最终答复。
-        禁止重读/核对其他文件（含契约里列出的兄弟文件）——跨文件集成核对由上级统一负责。
+        其他文件（含契约里列出的兄弟文件）的跨文件集成核对由上级统一负责，你无需重读。
 
       【共享记忆】
-      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，禁止 ReadFile 验证。
+      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，注入内容无需再读文件核对。
       - 已读内容在你的历史消息中，向前翻看即可；以相同参数连续重读同一文件区间会触发循环守卫终止任务。
 
       【职责】
@@ -308,7 +289,7 @@ fixed_roles:
     tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &coding_model
       provider: anthropic
-      model: kimi-k2.7-code
+      model: deepseek-v4-flash
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
@@ -333,10 +314,10 @@ fixed_roles:
       - 写完代码立即 RunCommand 语法检查（JS: node -c / Go: go build / Python: py_compile），
         syntax error 先修再继续。
       - 【终止纪律】WriteFile 落盘 + 一次语法检查通过 = 任务完成，立即输出最终答复。
-        禁止重读/核对其他文件（含契约里列出的兄弟文件）——跨文件集成核对由上级统一负责。
+        其他文件（含契约里列出的兄弟文件）的跨文件集成核对由上级统一负责，你无需重读。
 
       【共享记忆】
-      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，禁止 ReadFile 验证。
+      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，注入内容无需再读文件核对。
       - 已读内容在你的历史消息中，向前翻看即可；以相同参数连续重读同一文件区间会触发循环守卫终止任务。
 
       【职责】
@@ -352,7 +333,7 @@ fixed_roles:
     tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &ui_model
       provider: anthropic
-      model: doubao-seed-2.1-turbo
+      model: doubao-seed-evolving
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.7
@@ -377,7 +358,7 @@ fixed_roles:
       - 【终止纪律】WriteFile 落盘 + 一次语法检查通过 = 任务完成，立即输出最终答复。
 
       【共享记忆】
-      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，禁止 ReadFile 验证。
+      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，注入内容无需再读文件核对。
       - 已读内容在你的历史消息中，向前翻看即可；以相同参数连续重读同一文件区间会触发循环守卫终止任务。
 
       【职责】
@@ -455,7 +436,7 @@ fixed_roles:
       - 【终止纪律】WriteFile 落盘 + 一次语法检查通过 = 任务完成，立即输出最终答复。
 
       【共享记忆】
-      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，禁止 ReadFile 验证。
+      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，注入内容无需再读文件核对。
       - 已读内容在你的历史消息中，向前翻看即可；以相同参数连续重读同一文件区间会触发循环守卫终止任务。
 
       【职责】
@@ -500,7 +481,7 @@ fixed_roles:
       - 【终止纪律】WriteFile 落盘 + 一次语法检查通过 = 任务完成，立即输出最终答复。
 
       【共享记忆】
-      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，禁止 ReadFile 验证。
+      - task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，注入内容无需再读文件核对。
       - 已读内容在你的历史消息中，向前翻看即可；以相同参数连续重读同一文件区间会触发循环守卫终止任务。
 
       【职责】

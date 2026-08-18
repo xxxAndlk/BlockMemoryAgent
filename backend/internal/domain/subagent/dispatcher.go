@@ -1275,9 +1275,8 @@ func (t *callSubAgentsTool) Aliases() []string { return nil }
 // Description 返回工具的 LLM 可见描述。
 func (t *callSubAgentsTool) Description() string {
 	return "把同一波多个子任务一次性原子并行派出（等价于连续多次 call_sub_agent，但保证同波同时启动）。\n" +
-		"多文件创建/多领域拆分任务的**全部建设领域必须用它一次派出**，禁止按依赖关系分波串行——" +
-		"共享契约已钉死集成点，领域产物互为独立文件，后写的不需要等先写的落盘" +
-		"（v6 实证：4 个建设领域分 2 波，第二波晚启动 24 分钟，交付死线直接判负）。\n" +
+		"多文件创建/多领域拆分任务的**全部建设领域必须用它一次派出**——" +
+		"共享契约已钉死集成点，领域产物互为独立文件，后写的不需要等先写的落盘。\n" +
 		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?, verify_kind?, tools_hint?}，" +
 		fmt.Sprintf("字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=%d 字；", t.dispatcher.taskRuneSoftLimit) +
 		"mode 可选 react/reflection/plan_execute，省略=react；verify_kind 可选 auto/executable/rubric/none，省略=auto；" +
@@ -2214,7 +2213,7 @@ const sharedPrefixMarker = "【共享记忆】\n"
 // "视为已验证、禁止重读"，否则"认真查询"类通用纪律会驱使子 Agent 回读原文。
 // 注意：措辞不得含字面量【任务规范】/【共享记忆】/【当前任务】，避免干扰按标记切分前缀的既有逻辑与测试。
 const sharedPrefixDisciplineNote = "【读取纪律】以上注入的任务规范与共享记忆内容视为已验证事实：" +
-	"其中已给出的代码、签名与行号禁止再用 ReadFile 核对或重读；" +
+	"其中已给出的代码、签名与行号无需再用 ReadFile 核对或重读；" +
 	"ReadFile 仅限当前任务指派给你的行号范围，不读兄弟任务的代码区段。"
 
 // specSlotName 是 WriteSpec 写入的固定 slot 名，与 tool.SpecSlot 保持一致。
