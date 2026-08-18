@@ -377,10 +377,10 @@ fixed_roles:
     skills: ["Prompt审查", "Prompt优化", "安全检测", "偏见检测"]
     tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &review_model
-      provider: openai-responses
+      provider: anthropic
       model: deepseek-v4-flash
-      api_key: ${OPENAI_API_KEY}
-      base_url: ${OPENAI_BASE_URL}
+      api_key: ${ANTHROPIC_API_KEY}
+      base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.2
       max_tokens: 16384  # 提示词审查：完整 prompt 改写可能较长
       # TODO #40 块 3：归一 DeepSeek 原生 /chat/completions（openai-chat 别名）——自动前缀缓存
@@ -456,10 +456,10 @@ fixed_roles:
     skills: ["单元测试", "集成测试", "边界测试", "性能测试"]
     tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &test_model
-      provider: openai-responses
+      provider: anthropic
       model: deepseek-v4-flash
-      api_key: ${OPENAI_API_KEY}
-      base_url: ${OPENAI_BASE_URL}
+      api_key: ${ANTHROPIC_API_KEY}
+      base_url: ${ANTHROPIC_BASE_URL}
       # deepseek 端点不稳会拖死 strict 启动校验（2026-08-04 实证），统一切 k3
     can_be_called: true
 
@@ -499,10 +499,10 @@ fixed_roles:
     skills: ["技术文档", "API文档", "代码注释", "示例编写"]
     tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &doc_model
-      provider: openai-responses
+      provider: anthropic
       model: deepseek-v4-flash
-      api_key: ${OPENAI_API_KEY}
-      base_url: ${OPENAI_BASE_URL}
+      api_key: ${ANTHROPIC_API_KEY}
+      base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.5
       max_tokens: 16384  # 文档助手：README/CHANGELOG 中等长度
     can_be_called: true
@@ -549,9 +549,9 @@ dynamic_templates:
     skills: []
     max_lifetime: 3600  # 1小时
     model_config: &assistant_model
-      provider: openai-responses
+      provider: anthropic
       model: deepseek-v4-flash
-      api_key: ${OPENAI_API_KEY}
-      base_url: ${OPENAI_BASE_URL}
+      api_key: ${ANTHROPIC_API_KEY}
+      base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
       max_tokens: 16384  # 临时助手：基线 16K
