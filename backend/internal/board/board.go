@@ -294,6 +294,23 @@ func (b *TaskBoard) FindByDomain(domain string) (string, bool) {
 	return "", false
 }
 
+// FindAllByDomain 返回指定 domain 的全部子任务 ID（按 Order 顺序）；未匹配返回 nil。
+// MetaAgent 细粒度拆解时一个领域常对应多个子任务（如"怪物美术"7 步），
+// 派发置进行中（boardAssign）与完成回写（boardUpdate）需联动整组而非仅首条。
+//
+// 并发安全：内部持读锁。
+func (b *TaskBoard) FindAllByDomain(domain string) []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	var ids []string
+	for _, id := range b.Order {
+		if t := b.Tasks[id]; t != nil && t.Domain == domain {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 // DependsDone 报告任务的所有依赖是否均已 done；无依赖或任务不存在返回 true。
 // 供派发依赖门校验：依赖未全部完成时拒绝派发（TODO #22 Phase 1）。
 //

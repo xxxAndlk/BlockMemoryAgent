@@ -23,8 +23,8 @@ const OD_DEFAULT_MODEL = process.env.OD_DEFAULT_MODEL || 'doubao-seedream-3-0-t2
 const OD_PROJECT_ID = process.env.OD_PROJECT_ID || 'bma-agent-artifacts';
 const OD_TIMEOUT_MS = Number(process.env.OD_TIMEOUT_MS || 180000);
 const OUTPUT_DIR = process.env.OD_OUTPUT_DIR || '/out';
-// 返回给 Agent 的宿主侧相对路径前缀（与 plugins.yaml 的 volumes 映射对应）。
-const OUTPUT_REL_PREFIX = (process.env.OD_OUTPUT_REL_PREFIX || 'workspace/od-artifacts').replace(/\/$/, '');
+// 返回给 Agent 的宿主侧相对路径前缀（相对 Agent 工作目录，与 plugins.yaml 的 volumes 映射对应）。
+const OUTPUT_REL_PREFIX = (process.env.OD_OUTPUT_REL_PREFIX || '.bma/od-artifacts').replace(/\/$/, '');
 const POLL_INTERVAL_MS = 2000;
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
 
@@ -223,7 +223,7 @@ server.registerTool('od_image_generate', {
   title: 'Open Design 图像生成',
   description:
     '经本地 open_design 守护进程生成图片（默认火山方舟 Seedream）。' +
-    '产物保存到宿主 workspace 并在结果中返回相对路径（path 字段），可直接在 HTML/CSS/文档中引用。' +
+    '产物保存到宿主工作目录（.bma/od-artifacts）并在结果中返回相对路径（path 字段），可直接在 HTML/CSS/文档中引用。' +
     '生成约需 10–60 秒，请勿重复提交相同 prompt。',
   inputSchema: {
     prompt: z.string().min(1).describe('图像描述（建议具体描述主体/风格/配色/构图）'),

@@ -403,3 +403,63 @@ func TestRenderAgentsPanel_NarrowPanelThreeBranchesOneRow(t *testing.T) {
 		t.Errorf("窄面板下 3 个分支应排在同一行:\n%s", panel)
 	}
 }
+
+// TestRenderAgentsPanel_ChildCards 验证三级助手子分支的卡片式排列（与领域同一风格）：
+// 子 Agent 以圆角边框卡片渲染在所属领域列内，列首有连接竖线，不再是 ├─ 纯文本行；
+// 高度不足时按整张卡片裁剪并在列尾提示"… 还有 N 个"。
+func TestRenderAgentsPanel_ChildCards(t *testing.T) {
+	mkChild := func(inst, parent, name string, status enums.RoleStatus) agentTreeNode {
+		return agentTreeNode{
+			depth:    2,
+			instID:   inst,
+			parentID: parent,
+			name:     name,
+			roleType: enums.RoleTypeFixed,
+			status:   status,
+		}
+	}
+
+	t.Run("两个助手各成卡片", func(t *testing.T) {
+		m := &Model{styles: NewStyles()}
+		m.agentTreePanel.nodes = []agentTreeNode{
+			{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive},
+			{depth: 1, instID: "s/d1", parentID: "s", name: "炮塔美术领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusActive},
+			mkChild("s/d1/c1", "s/d1", "代码助手", enums.RoleStatusActive),
+			mkChild("s/d1/c2", "s/d1", "UI助手", enums.RoleStatusWaiting),
+		}
+		panel := stripANSI(m.renderAgentsPanel(80, 40))
+		for _, want := range []string{"代码助手", "UI助手"} {
+			if !strings.Contains(panel, want) {
+				t.Errorf("panel missing %q:\n%s", want, panel)
+			}
+		}
+		// 圆角边框数 = 面板外框 1 + meta 1 + 领域 1 + 助手 2 = 5 个左上角。
+		if got := strings.Count(panel, "╭"); got != 5 {
+			t.Errorf("圆角卡片应有 5 张（含面板外框），实际 %d:\n%s", got, panel)
+		}
+		if strings.Contains(panel, "├─") {
+			t.Errorf("子节点不应再用 ├─ 纯文本行:\n%s", panel)
+		}
+	})
+
+	t.Run("高度不足按整卡裁剪并提示", func(t *testing.T) {
+		m := &Model{styles: NewStyles()}
+		nodes := []agentTreeNode{
+			{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive},
+			{depth: 1, instID: "s/d1", parentID: "s", name: "炮塔美术领域", roleType: enums.RoleTypeDomain, status: enums.RoleStatusActive},
+		}
+		for i := 0; i < 4; i++ {
+			nodes = append(nodes, mkChild("s/d1/c"+string(rune('1'+i)), "s/d1", "代码助手", enums.RoleStatusActive))
+		}
+		m.agentTreePanel.nodes = nodes
+		// 高度只够头部 + 1~2 张子卡片：4 个助手必然放不下，必须有省略提示。
+		panel := stripANSI(m.renderAgentsPanel(80, 18))
+		if !strings.Contains(panel, "… 还有") {
+			t.Errorf("高度不足时应提示省略数:\n%s", panel)
+		}
+		// 裁剪不得切断卡片边框：出现的 ╰ 数量必须与 ╭ 相等（每张卡完整闭合）。
+		if strings.Count(panel, "╭") != strings.Count(panel, "╰") {
+			t.Errorf("卡片边框被切断（╭=%d ╰=%d）:\n%s", strings.Count(panel, "╭"), strings.Count(panel, "╰"), panel)
+		}
+	})
+}

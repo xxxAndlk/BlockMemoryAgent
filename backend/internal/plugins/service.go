@@ -15,12 +15,15 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -30,6 +33,17 @@ import (
 
 // serviceStartTimeoutDefault 健康探针默认等待上限。
 const serviceStartTimeoutDefault = 60 * time.Second
+
+// syncFile 对应 settings.sync_files 单条目：容器健康就绪后把 JSON 深合并
+// 写入容器内指定路径（用于容器内服务不支持环境变量覆盖、只认配置文件的
+// 场景，如 open_design 的 media-config.json）。叶子值全空（如 ${VAR:}
+// 未设置展开为空串）时跳过，不写文件。
+type syncFile struct {
+	// Path 容器内绝对路径。
+	Path string
+	// JSON 要合并进去的对象（同名键递归合并，本侧覆盖容器侧）。
+	JSON map[string]any
+}
 
 // serviceSettings 是 plugins.yaml 中 service 插件 settings 段的解析结果。
 type serviceSettings struct {
@@ -51,6 +65,8 @@ type serviceSettings struct {
 	RequiresEnv []string
 	// StartTimeout 健康探针等待上限（默认 60s）。
 	StartTimeout time.Duration
+	// SyncFiles 健康就绪后写入容器内的 JSON 配置（见 syncFile）。
+	SyncFiles []syncFile
 }
 
 // serviceSettingsFromMap 从 settings map 解析配置；缺失字段取默认值。
@@ -103,6 +119,23 @@ func serviceSettingsFromMap(settings map[string]any) serviceSettings {
 	}
 	if v, ok := settings["start_timeout_sec"].(float64); ok && v > 0 {
 		s.StartTimeout = time.Duration(v * float64(time.Second))
+	}
+	if v, ok := settings["sync_files"].([]any); ok {
+		for _, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			path, _ := m["path"].(string)
+			if path == "" {
+				continue
+			}
+			f := syncFile{Path: path}
+			if j, ok := m["json"].(map[string]any); ok {
+				f.JSON = j
+			}
+			s.SyncFiles = append(s.SyncFiles, f)
+		}
 	}
 	return s
 }
@@ -184,8 +217,11 @@ func newServicePlugin(id string, settings map[string]any, logger *slog.Logger) P
 // Manifest 实现 Plugin。
 func (p *servicePlugin) Manifest() Manifest { return p.manifest }
 
-// Init 实现 Plugin：校验配置（image 必填）。
-func (p *servicePlugin) Init(_ context.Context, _ Deps) error {
+// Init 实现 Plugin：校验配置（image 必填），并展开 volumes 中的 ${WORKDIR} 占位符。
+func (p *servicePlugin) Init(_ context.Context, deps Deps) error {
+	for i, v := range p.settings.Volumes {
+		p.settings.Volumes[i] = ExpandWorkDir(v, deps.WorkDir)
+	}
 	if p.settings.Image == "" {
 		return fmt.Errorf("service 插件 %q: 需要 settings.image", p.id)
 	}
@@ -204,13 +240,15 @@ func (p *servicePlugin) Start(ctx context.Context) error {
 		return fmt.Errorf("service 插件 %q docker run 失败: %w (%s)", p.id, err, strings.TrimSpace(string(out)))
 	}
 	p.logger.Info("service 容器已启动", "plugin", p.id, "container", p.container)
-	if p.settings.HealthURL == "" {
-		return nil
+	if p.settings.HealthURL != "" {
+		if err := p.waitHealthy(ctx); err != nil {
+			p.removeContainer()
+			return err
+		}
 	}
-	if err := p.waitHealthy(ctx); err != nil {
-		p.removeContainer()
-		return err
-	}
+	// 配置同步 best-effort：失败只告警不回滚（容器本身是健康的，
+	// 且写的是 volume 内文件，下次 enable 会重试合并）。
+	p.syncFiles(ctx)
 	return nil
 }
 
@@ -258,3 +296,90 @@ func (p *servicePlugin) removeContainer() {
 
 // Tools 实现 Plugin：service 插件不注入工具。
 func (p *servicePlugin) Tools() []tool.Tool { return nil }
+
+// syncFiles 把 settings.sync_files 逐条深合并写入容器（值全空跳过）。
+func (p *servicePlugin) syncFiles(ctx context.Context) {
+	for _, f := range p.settings.SyncFiles {
+		if !hasNonEmptyValue(f.JSON) {
+			p.logger.Debug("sync_files 值全空，跳过", "plugin", p.id, "path", f.Path)
+			continue
+		}
+		if err := p.syncOneFile(ctx, f); err != nil {
+			p.logger.Warn("sync_files 写入失败", "plugin", p.id, "path", f.Path, "err", err)
+		} else {
+			p.logger.Info("sync_files 已同步", "plugin", p.id, "path", f.Path)
+		}
+	}
+}
+
+// syncOneFile 读容器内现有 JSON（缺失/损坏视为空对象），深合并本侧配置后写回。
+func (p *servicePlugin) syncOneFile(ctx context.Context, f syncFile) error {
+	merged := map[string]any{}
+	if existing, err := p.readContainerFile(ctx, f.Path); err == nil {
+		var cur map[string]any
+		if json.Unmarshal(existing, &cur) == nil && cur != nil {
+			merged = cur
+		}
+	} else {
+		p.logger.Debug("sync_files 读现有文件失败（按空文件处理）", "plugin", p.id, "path", f.Path, "err", err)
+	}
+	mergeJSONInto(merged, f.JSON)
+	data, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化失败: %w", err)
+	}
+	return p.writeContainerFile(ctx, f.Path, data)
+}
+
+func (p *servicePlugin) readContainerFile(ctx context.Context, path string) ([]byte, error) {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(cctx, "docker", "exec", p.container, "cat", path).Output()
+}
+
+func (p *servicePlugin) writeContainerFile(ctx context.Context, path string, data []byte) error {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// path 来自 plugins.yaml（仅人改的配置），不做 shell 转义防护。
+	cmd := exec.CommandContext(cctx, "docker", "exec", "-i", p.container,
+		"sh", "-c", "mkdir -p \"$(dirname \""+path+"\")\" && cat > \""+path+"\"")
+	cmd.Stdin = bytes.NewReader(data)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker exec 写入失败: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// mergeJSONInto 把 src 深合并进 dst（同键且均为对象时递归，否则 src 覆盖）。
+func mergeJSONInto(dst, src map[string]any) {
+	for k, sv := range src {
+		if dv, ok := dst[k]; ok {
+			dm, dOk := dv.(map[string]any)
+			sm, sOk := sv.(map[string]any)
+			if dOk && sOk {
+				mergeJSONInto(dm, sm)
+				continue
+			}
+		}
+		dst[k] = sv
+	}
+}
+
+// hasNonEmptyValue 判断 v 树内是否存在非空字符串叶子（用于 ${VAR:} 未设置时跳过同步）。
+func hasNonEmptyValue(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return t != ""
+	case map[string]any:
+		for _, val := range t {
+			if hasNonEmptyValue(val) {
+				return true
+			}
+		}
+		return false
+	case []any:
+		return slices.ContainsFunc(t, hasNonEmptyValue)
+	default:
+		return v != nil
+	}
+}

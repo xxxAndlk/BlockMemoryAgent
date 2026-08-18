@@ -1200,6 +1200,9 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 			}
 		}
 	}
+	// 计划状态回写（TODO #22 Phase 1 补全）：派发即把该领域的计划子任务置为 in_progress，
+	// 否则任务只有完成/失败才翻状态，TUI 执行计划面板全程 Waiting、进度 0%。
+	d.boardAssign(ctx, parentID, domain, subAgentID)
 	// 心跳检活元数据：subMeta 存 cancel/parentID/sessionID/doneOnce 供巡检卡死时兜底。
 	// activity：所有非 meta 子 Agent 注册（TODO #25-3 domain 防误杀版）——叶子活动沿
 	// parentID 链向上冒泡刷新祖先时间戳，domain 等子/等回信期间靠后代活动保持存活；

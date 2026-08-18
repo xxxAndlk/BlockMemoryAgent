@@ -392,7 +392,8 @@ func (m Model) renderAgentsPanel(w, h int) string {
 		}
 	}
 
-	// 逐行组装分支：连接线 + 分支卡片行 + 各分支子节点行，整行粒度裁剪（行放不下整行丢弃）。
+	// 逐行组装分支：连接线 + 分支卡片行 + 各分支子节点卡片列，头部（连接线+领域卡片）
+	// 放不下时整行丢弃；子节点卡片列按剩余高度以整张卡片粒度裁剪。
 	omitted := 0
 	firstRow := true
 	for row := 0; row < len(branches); row += rowCols {
@@ -405,31 +406,45 @@ func (m Model) renderAgentsPanel(w, h int) string {
 
 		// 连接线：首行从 Meta 引出（1/2/3 分叉形态按实际分支数生成），
 		// 后续行左缘竖线延续，表示仍是 Meta 的分支。
-		var rowLines []string
+		var headLines []string
 		if firstRow && meta != nil {
-			rowLines = append(rowLines, m.agentBranchConnectorLines(centers, innerW/2)...)
+			headLines = append(headLines, m.agentBranchConnectorLines(centers, innerW/2)...)
 		} else {
-			rowLines = append(rowLines, m.styles.Dim.Render("  │"))
+			headLines = append(headLines, m.styles.Dim.Render("  │"))
 		}
 		// 分支卡片行：每个分支一张卡片（含等待标注/当前任务行）。
 		cards := make([]string, 0, len(rowBranches))
 		for _, b := range rowBranches {
 			cards = append(cards, m.buildAgentCard(b.node, colW, waitingChildNames(b.children)))
 		}
-		rowLines = append(rowLines, strings.Split(joinHorizontalWithGap(cards, gap), "\n")...)
-		// 各分支子节点行：树状连接符（├─ / └─），助手挂在所属分支下。
+		headLines = append(headLines, strings.Split(joinHorizontalWithGap(cards, gap), "\n")...)
+
 		nodesInRow := len(rowBranches)
+		totalChildren := 0
 		for _, b := range rowBranches {
-			cl := m.branchChildLines(b, colW)
-			rowLines = append(rowLines, cl...)
 			nodesInRow += len(b.children)
+			totalChildren += len(b.children)
 		}
 
-		if len(lines)+len(rowLines) > maxBody {
+		// 头部放不下整行省略（与旧行粒度裁剪一致）。
+		if len(lines)+len(headLines) > maxBody {
 			omitted += nodesInRow
 			break
 		}
-		lines = append(lines, rowLines...)
+		lines = append(lines, headLines...)
+
+		// 三级助手子分支：与领域相同的卡片式排列（TODO #48 子项 2 延伸）——
+		// 每个分支一列，列内连接竖线 + 子 Agent 卡片竖向堆叠，各列横向对齐拼接；
+		// 剩余高度放不下时按整张卡片裁剪并在列尾提示省略数。
+		if totalChildren > 0 {
+			childCols := make([][]agentTreeNode, 0, len(rowBranches))
+			for _, b := range rowBranches {
+				childCols = append(childCols, b.children)
+			}
+			colLines, omittedChildren := m.joinChildCardColumns(childCols, colW, gap, maxBody-len(lines))
+			lines = append(lines, colLines...)
+			omitted += omittedChildren
+		}
 		firstRow = false
 	}
 
@@ -684,21 +699,79 @@ func (m Model) buildAgentCard(node agentTreeNode, cardW int, waiting string) str
 		Render(content)
 }
 
-// branchChildLines 渲染一个分支下的子节点行：树状连接符（├─ / └─）+ 名称 + 状态色点。
-func (m Model) branchChildLines(b agentTreeBranch, colW int) []string {
-	var lines []string
-	for i, c := range b.children {
-		glyph := "├─"
-		if i == len(b.children)-1 {
-			glyph = "└─"
+// joinChildCardColumns 把各分支的三级助手子节点渲染为卡片列并横向拼接：
+// 每列顶部为连接竖线，其下子 Agent 卡片竖向堆叠（与领域卡片同一排列风格）。
+// maxLines 限制拼接后的总行数：各列独立按整张卡片粒度裁剪，
+// 放不下的子 Agent 计入返回的 omitted，列尾补"… 还有 N 个"提示。
+func (m Model) joinChildCardColumns(childCols [][]agentTreeNode, colW, gap, maxLines int) ([]string, int) {
+	cols := make([][]string, len(childCols))
+	omitted := 0
+	height := 0
+	for i, children := range childCols {
+		lines, om := m.childCardColumnLines(children, colW, maxLines)
+		cols[i] = lines
+		omitted += om
+		if len(lines) > height {
+			height = len(lines)
 		}
-		name := lipgloss.NewStyle().Foreground(lipgloss.Color(agentRoleColor(c.roleType))).
-			Render(truncate(c.name, colW-6))
-		st := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor(string(c.status)))).
-			Render(statusIcon(string(c.status)) + " " + roleStatusText(c.status))
-		lines = append(lines, "  "+m.styles.Dim.Render(glyph)+" "+name+" "+st)
 	}
-	return lines
+	if height == 0 {
+		return nil, omitted
+	}
+	if height > maxLines {
+		height = maxLines
+	}
+	// 逐行横向拼接：各列行补齐到 colW 显示宽度，保证与上方领域卡片列对齐。
+	var out []string
+	for r := 0; r < height; r++ {
+		var sb strings.Builder
+		for c := range cols {
+			if c > 0 {
+				sb.WriteString(strings.Repeat(" ", gap))
+			}
+			if r < len(cols[c]) {
+				sb.WriteString(padToWidth(cols[c][r], colW))
+			} else {
+				sb.WriteString(strings.Repeat(" ", colW))
+			}
+		}
+		out = append(out, sb.String())
+	}
+	return out, omitted
+}
+
+// childCardColumnLines 渲染单个分支的三级助手卡片列：连接竖线 + 卡片竖向堆叠。
+// 限高 maxLines：按整张卡片粒度裁剪（不切断卡片边框），放不下的子 Agent 计入 omitted
+// 并在列尾追加"… 还有 N 个"提示行；maxLines 不足以放任何卡片时仅保留提示行。
+func (m Model) childCardColumnLines(children []agentTreeNode, colW, maxLines int) ([]string, int) {
+	if len(children) == 0 || maxLines <= 0 {
+		return nil, len(children)
+	}
+	connector := strings.Repeat(" ", colW/2) + m.styles.Dim.Render("│")
+	var lines []string
+	for i, c := range children {
+		cardLines := strings.Split(m.buildAgentCard(c, colW, ""), "\n")
+		need := len(cardLines) + 1 // +1 为卡片前的连接竖线
+		remaining := len(children) - i - 1
+		// 当前卡片放不下，或放下后没有空间给后续卡片的省略提示时，停止堆叠。
+		if len(lines)+need > maxLines || (remaining > 0 && len(lines)+need+1 > maxLines) {
+			omitted := remaining + 1
+			lines = append(lines, m.styles.Dim.Render(fmt.Sprintf("  … 还有 %d 个", omitted)))
+			return lines, omitted
+		}
+		lines = append(lines, connector)
+		lines = append(lines, cardLines...)
+	}
+	return lines, 0
+}
+
+// padToWidth 按显示宽度（ANSI 感知）在行尾补空格到 w 列，用于多列文本块横向对齐。
+func padToWidth(s string, w int) string {
+	d := w - lipgloss.Width(s)
+	if d <= 0 {
+		return s
+	}
+	return s + strings.Repeat(" ", d)
 }
 
 // agentBranchConnectorLines 生成 MetaAgent 卡片到分支卡片行之间的连接线（TODO #48 子项 2）：

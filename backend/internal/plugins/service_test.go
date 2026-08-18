@@ -62,6 +62,76 @@ func TestServiceSettingsFromMapFull(t *testing.T) {
 	}
 }
 
+func TestServiceSettingsSyncFiles(t *testing.T) {
+	s := serviceSettingsFromMap(map[string]any{
+		"image": "img",
+		"sync_files": []any{
+			map[string]any{
+				"path": "/app/.od/media-config.json",
+				"json": map[string]any{
+					"providers": map[string]any{
+						"volcengine": map[string]any{"baseUrl": "https://ark.example/api/v3"},
+					},
+				},
+			},
+			map[string]any{"json": map[string]any{"x": "y"}}, // 缺 path，忽略
+			"not-a-map", // 非法条目，忽略
+		},
+	})
+	if len(s.SyncFiles) != 1 {
+		t.Fatalf("sync_files 应解析出 1 条, got %d", len(s.SyncFiles))
+	}
+	f := s.SyncFiles[0]
+	if f.Path != "/app/.od/media-config.json" {
+		t.Fatalf("path 解析错误: %q", f.Path)
+	}
+	prov := f.JSON["providers"].(map[string]any)["volcengine"].(map[string]any)
+	if prov["baseUrl"] != "https://ark.example/api/v3" {
+		t.Fatalf("json 嵌套解析错误: %v", prov)
+	}
+}
+
+func TestMergeJSONInto(t *testing.T) {
+	dst := map[string]any{
+		"providers": map[string]any{
+			"volcengine": map[string]any{"apiKey": "stored-key", "baseUrl": "https://old"},
+			"openai":     map[string]any{"apiKey": "keep-me"},
+		},
+	}
+	mergeJSONInto(dst, map[string]any{
+		"providers": map[string]any{
+			"volcengine": map[string]any{"baseUrl": "https://new"},
+		},
+	})
+	volc := dst["providers"].(map[string]any)["volcengine"].(map[string]any)
+	if volc["baseUrl"] != "https://new" {
+		t.Fatalf("src 应覆盖 dst: %v", volc)
+	}
+	if volc["apiKey"] != "stored-key" {
+		t.Fatalf("未涉及的键应保留: %v", volc)
+	}
+	if dst["providers"].(map[string]any)["openai"] == nil {
+		t.Fatal("其他 provider 应保留")
+	}
+}
+
+func TestHasNonEmptyValue(t *testing.T) {
+	empty := map[string]any{
+		"providers": map[string]any{
+			"volcengine": map[string]any{"baseUrl": ""},
+		},
+	}
+	if hasNonEmptyValue(empty) {
+		t.Fatal("全空字符串树应为 false")
+	}
+	if !hasNonEmptyValue(map[string]any{"a": map[string]any{"b": "x"}}) {
+		t.Fatal("存在非空叶子应为 true")
+	}
+	if !hasNonEmptyValue(map[string]any{"n": float64(1), "b": false}) {
+		t.Fatal("非字符串叶子（数字/布尔）应为 true")
+	}
+}
+
 func TestServiceContainerName(t *testing.T) {
 	name := serviceContainerName("open_design")
 	if !strings.HasPrefix(name, "bma-plugin-svc-open_design-") {

@@ -130,34 +130,40 @@ func (d *Dispatcher) checkDepGate(ctx context.Context, parentID, domain string) 
 	if b == nil {
 		return ""
 	}
-	taskID, ok := b.FindByDomain(domain)
-	if !ok {
+	taskIDs := b.FindAllByDomain(domain)
+	if len(taskIDs) == 0 {
 		return "" // 计划未覆盖该领域：放行（零行为变化）
 	}
-	if b.DependsDone(taskID) {
-		return ""
-	}
-	// 列出未完成的依赖供 LLM 知道等谁。
+	// 一个领域可对应多个子任务：任一任务的依赖未完成即拒绝派发，汇总所有未完成依赖。
 	snap := b.Snapshot()
 	var pending []string
-	for _, tsk := range snap.Tasks {
-		if tsk.ID != taskID {
+	firstBlocked := ""
+	for _, taskID := range taskIDs {
+		if b.DependsDone(taskID) {
 			continue
 		}
-		for _, dep := range tsk.DependsOn {
-			for _, dt := range snap.Tasks {
-				if dt.ID == dep && dt.Status != board.TaskDone {
-					pending = append(pending, fmt.Sprintf("%s(%s)", dep, dt.Title))
+		if firstBlocked == "" {
+			firstBlocked = taskID
+		}
+		for _, tsk := range snap.Tasks {
+			if tsk.ID != taskID {
+				continue
+			}
+			for _, dep := range tsk.DependsOn {
+				for _, dt := range snap.Tasks {
+					if dt.ID == dep && dt.Status != board.TaskDone {
+						pending = append(pending, fmt.Sprintf("%s(%s)", dep, dt.Title))
+					}
 				}
 			}
+			break
 		}
-		break
 	}
 	if len(pending) == 0 {
-		return fmt.Sprintf("依赖未满足：子任务 %s 的依赖尚未全部完成，请等待前置任务 [mailbox] 回传后再派发", taskID)
+		return ""
 	}
 	return fmt.Sprintf("依赖未满足：子任务 %s(%s) 依赖 %s 未完成，请等待其 [mailbox] 回传后再派发该领域",
-		taskID, tskTitle(snap, taskID), strings.Join(pending, "、"))
+		firstBlocked, tskTitle(snap, firstBlocked), strings.Join(pending, "、"))
 }
 
 func tskTitle(snap board.Snapshot, id string) string {
@@ -170,6 +176,8 @@ func tskTitle(snap board.Snapshot, id string) string {
 }
 
 // boardUpdate 把子 Agent 完成/失败状态回写计划任务（按 domain 匹配，TODO #22 Phase 1）。
+// 一个领域对应多个子任务时整组联动（FindAllByDomain），否则细粒度计划里
+// 只有首条任务翻状态、其余永远停在 pending。
 // 无计划/未匹配静默跳过（零行为变化）。
 func (d *Dispatcher) boardUpdate(ctx context.Context, parentID, domain string, done bool, summary string) {
 	domain = strings.TrimSpace(domain)
@@ -186,13 +194,44 @@ func (d *Dispatcher) boardUpdate(ctx context.Context, parentID, domain string, d
 	if b == nil {
 		return
 	}
-	taskID, ok := b.FindByDomain(domain)
-	if !ok {
+	for _, taskID := range b.FindAllByDomain(domain) {
+		if done {
+			_ = b.MarkDone(taskID, summary)
+		} else {
+			_ = b.MarkFailed(taskID, summary)
+		}
+	}
+}
+
+// boardAssign 派发回写（TODO #22 Phase 1 补全）：子 Agent 起步即把匹配 domain 的
+// 未完成任务置为 in_progress 并记录执行者。此前任务只有完成/失败回写，
+// 执行计划面板全程显示 Waiting、总体进度 0%（实证：15 项计划跑了 80 分钟全 Waiting）。
+// 已 Done 任务不翻回（重派已完成领域不复活旧状态）；无计划/未匹配静默跳过。
+func (d *Dispatcher) boardAssign(ctx context.Context, parentID, domain, assignee string) {
+	domain = strings.TrimSpace(domain)
+	if domain == "" || d.boardFn == nil {
 		return
 	}
-	if done {
-		_ = b.MarkDone(taskID, summary)
-	} else {
-		_ = b.MarkFailed(taskID, summary)
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		if i := strings.Index(parentID, "/"); i > 0 {
+			sid = parentID[:i]
+		}
+	}
+	b := d.boardFn(sid)
+	if b == nil {
+		return
+	}
+	doneSet := make(map[string]bool)
+	for _, t := range b.Snapshot().Tasks {
+		if t.Status == board.TaskDone {
+			doneSet[t.ID] = true
+		}
+	}
+	for _, taskID := range b.FindAllByDomain(domain) {
+		if doneSet[taskID] {
+			continue
+		}
+		_ = b.Assign(taskID, assignee)
 	}
 }

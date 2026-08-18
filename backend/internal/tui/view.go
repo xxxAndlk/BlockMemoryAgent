@@ -152,23 +152,17 @@ func (m Model) renderTopBar(w int) string {
 	return m.styles.TopBar.Width(w).Height(1).Render(line)
 }
 
-// renderRightPanels 渲染右侧上下堆叠的计划面板与 Agent 编排面板。
-func (m Model) renderRightPanels(w, h int) string {
-	// 保证最小宽度。
-	if w < 20 {
-		w = 20
-	}
-
-	// 右侧面板始终同时展示计划与 Agent 编排两个面板。
-	// 参考“新TUI页.png”：Agent 编排为卡片式布局，需要更多纵向空间，
-	// 因此计划面板占 45%、Agent 编排占 55%。
-	// 即使终端高度紧张，也优先保证两个面板都有可见区域（标题+至少一行内容），
-	// 避免计划栏被完全丢弃导致"内容没有显示"。
-	topH := h * 45 / 100
+// rightPanelHeights 计算右侧上（计划）/下（Agent 编排）面板的高度分配。
+// 参考"新TUI页.png"：Agent 编排为卡片式布局，需要更多纵向空间，计划面板占 45%、Agent 编排占 55%。
+// 即使终端高度紧张，也优先保证两个面板都有可见区域（标题+至少一行内容），
+// 避免计划栏被完全丢弃导致"内容没有显示"。
+// 渲染（renderRightPanels）与鼠标滚轮命中测试（handleMouse）共用此函数，保证区域一致。
+func rightPanelHeights(h int) (topH, bottomH int) {
+	topH = h * 45 / 100
 	if topH < 3 {
 		topH = 3
 	}
-	bottomH := h - topH
+	bottomH = h - topH
 	if bottomH < 3 {
 		bottomH = 3
 	}
@@ -194,6 +188,18 @@ func (m Model) renderRightPanels(w, h int) string {
 			}
 		}
 	}
+	return topH, bottomH
+}
+
+// renderRightPanels 渲染右侧上下堆叠的计划面板与 Agent 编排面板。
+func (m Model) renderRightPanels(w, h int) string {
+	// 保证最小宽度。
+	if w < 20 {
+		w = 20
+	}
+
+	// 右侧面板始终同时展示计划与 Agent 编排两个面板。
+	topH, bottomH := rightPanelHeights(h)
 	// 严格按预算裁剪：终端高度紧张（如 h=12）时 topH/bottomH 只有 2~3 行，
 	// 而面板最少渲染 4 行（标题+边框+1 行内容），不裁剪会把整帧撑高超终端、
 	// 输入栏被挤出可视区。保留每块前 N 行（标题优先可见，箱底边被裁仅外观瑕疵）。
@@ -272,12 +278,13 @@ func (m Model) renderPlanPanel(w, h int) string {
 	}
 
 	// 渲染计划内容行。内容区高度受 PanelBox 限制（Height(h-3)），
-	// 超长任务列表在 formatPlanSnapshot 内裁剪，保证底部"总体进度/预计剩余"始终可见。
+	// 超长任务列表在 formatPlanSnapshot 内按 m.planScroll 滚动开窗（滚轮翻看，不再省略截断），
+	// 底部"总体进度/预计剩余"固定可见。
 	maxBody := h - 3
 	if maxBody < 1 {
 		maxBody = 1
 	}
-	lines := m.formatPlanSnapshot(innerW, snap, maxBody)
+	lines := m.formatPlanSnapshot(innerW, snap, maxBody, m.planScroll)
 	body := strings.Join(lines, "\n")
 	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
 }
@@ -286,8 +293,9 @@ func (m Model) renderPlanPanel(w, h int) string {
 // 布局参考"新TUI页.png"：
 //   - 上方为编号任务列表：序号 + 标题 + 彩色状态单元格 + 右对齐 hh:mm:ss 时长；
 //   - 底部固定为"总体进度"进度条与"预计剩余"时间，内容不足时贴底显示；
-//   - 任务数超出 maxLines 时截断列表并追加"… 还有 N 项"，保证底部统计始终可见。
-func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot, maxLines int) []string {
+//   - 任务数超出 maxLines 时按 scroll 偏移滚动开窗（滚轮悬停计划面板滚动，见 handleMouse），
+//     窗口首/末行在还有未显示任务时替换为"↑ 上方还有 N 项"/"↓ 下方还有 N 项"提示。
+func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot, maxLines, scroll int) []string {
 	// 统计已完成数与总时长（用于预计剩余时间）。
 	done, total := 0, len(snap.Tasks)
 	var doneElapsed time.Duration
@@ -307,22 +315,26 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot, maxLines int)
 	// 底部统计区：空行 + 总体进度 + 预计剩余。
 	footer := m.planFooterLines(innerW, done, total, doneElapsed)
 
-	// 高度预算：footer 固定保留，任务列表按剩余空间裁剪。
+	// 高度预算：footer 固定保留，任务列表按剩余空间滚动开窗。
 	budget := maxLines - len(footer)
 	if budget < 0 {
 		budget = 0
 	}
-	switch {
-	case len(taskLines) > budget:
+	if len(taskLines) > budget {
 		if budget == 0 {
 			taskLines = nil
 		} else {
-			keep := budget - 1
-			if keep < 0 {
-				keep = 0
+			// 滚动窗口：scroll 偏移钳制在合法范围内，超出列表长度时回退到末尾窗口。
+			maxOff := len(taskLines) - budget
+			scroll = clamp(scroll, 0, maxOff)
+			visible := append([]string{}, taskLines[scroll:scroll+budget]...)
+			if scroll > 0 {
+				visible[0] = m.styles.Dim.Render(fmt.Sprintf("↑ 上方还有 %d 项（滚轮翻看）", scroll))
 			}
-			omitted := len(taskLines) - keep
-			taskLines = append(taskLines[:keep], m.styles.Dim.Render(fmt.Sprintf("… 还有 %d 项", omitted)))
+			if below := len(taskLines) - scroll - budget; below > 0 {
+				visible[len(visible)-1] = m.styles.Dim.Render(fmt.Sprintf("↓ 下方还有 %d 项（滚轮翻看）", below))
+			}
+			taskLines = visible
 		}
 	}
 

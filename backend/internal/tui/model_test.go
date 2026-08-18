@@ -62,6 +62,8 @@ type mockAgentForPlan struct {
 	messages []agent.Message
 	// startedAt 模拟会话开始时间；零值表示未设置。
 	startedAt time.Time
+	// boardSnap 非空时 Board 直接返回该快照（真实计划路径）；为空返回 nil 回退树合成。
+	boardSnap *board.Snapshot
 }
 
 // CreateSession 是 mockAgentForPlan 的空实现。
@@ -117,9 +119,9 @@ func (m *mockAgentForPlan) Tree(ctx context.Context, sessionID string) ([]orches
 	return m.treeNodes, nil
 }
 
-// Board 返回看板快照，测试实现返回 nil（回退树合成）。
+// Board 返回看板快照；boardSnap 非空时返回它（真实计划路径），否则返回 nil（回退树合成）。
 func (m *mockAgentForPlan) Board(ctx context.Context, sessionID string) (*board.Snapshot, error) {
-	return nil, nil
+	return m.boardSnap, nil
 }
 
 // CancelAgent 取消子 Agent，测试实现返回 nil。

@@ -81,3 +81,21 @@ func TestFromSettingsDocker(t *testing.T) {
 		t.Fatal("docker transport 缺 image 应报错")
 	}
 }
+
+// Init 展开 volumes 中的 ${WORKDIR} 占位符（deps.WorkDir 即 bootstrap 启动目录）。
+func TestBridgeInitExpandsWorkDir(t *testing.T) {
+	b := New("p", FromSettings(map[string]any{
+		"transport": "docker",
+		"image":     "img:tag",
+		"volumes":   []any{"${WORKDIR}/.bma/od-artifacts:/out", "bma-data:/data"},
+	}), nil)
+	if err := b.Init(context.Background(), plugins.Deps{WorkDir: `D:\data\proj`}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if want := "D:/data/proj/.bma/od-artifacts:/out"; b.settings.Volumes[0] != want {
+		t.Fatalf("Volumes[0] = %q, want %q", b.settings.Volumes[0], want)
+	}
+	if b.settings.Volumes[1] != "bma-data:/data" {
+		t.Fatalf("命名卷被误改: %q", b.settings.Volumes[1])
+	}
+}

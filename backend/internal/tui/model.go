@@ -75,6 +75,10 @@ type Model struct {
 	// 0=自动（按宽度和内容），1=强制显示，-1=强制隐藏。
 	rightPanelForced int
 
+	// planScroll 是右侧计划面板任务列表的滚动偏移（行）：
+	// 滚轮悬停在计划面板区域时增减（handleMouse），渲染时按此偏移开窗（formatPlanSnapshot）。
+	planScroll int
+
 	// shared 是跨 bubbletea 值拷贝共享的可变状态（#47 修复），见 sharedState。
 	shared *sharedState
 
@@ -320,6 +324,8 @@ func (m *Model) selectSession(idx int) {
 	m.chatPanel.anchorUser = false
 	m.chatPanel.lastItems = 0
 	m.chatPanel.lastWidth = 0
+	// 重置计划面板滚动偏移：不同会话的任务列表长度不同，旧偏移可能越界。
+	m.planScroll = 0
 	m.rebuildAgents()
 	m.startStream()
 	m.rebuildChatContent()
@@ -612,6 +618,16 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// 滚轮悬停在右侧计划面板区域时滚动计划任务列表（执行计划改为滚动查看，不再省略截断）。
+	if (msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown) && m.rightPanelVisible() && m.overPlanPanel(msg.X, msg.Y) {
+		delta := 3
+		if msg.Button == tea.MouseButtonWheelUp {
+			delta = -3
+		}
+		m.planScroll = clamp(m.planScroll+delta, 0, m.planMaxScroll())
+		return m, nil
+	}
+
 	// 滚轮始终交给 viewport 处理。
 	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
 		var cmd tea.Cmd
@@ -876,6 +892,33 @@ func (m *Model) toggleRightPanel() {
 		m.rightPanelForced = 0
 		m.flashMsg("right panel: auto")
 	}
+}
+
+// overPlanPanel 命中测试：屏幕坐标是否落在右侧计划面板区域内。
+// 布局：顶栏占 1 行，其下为主内容区；计划面板为右栏上段（rightPanelHeights 的 topH），
+// x 起点为对话区宽度（renderRightPanels 紧跟 renderChat 水平拼接）。
+func (m *Model) overPlanPanel(x, y int) bool {
+	topH, _ := rightPanelHeights(m.mainContentHeight())
+	return x >= m.chatAreaWidth() && y >= 1 && y < 1+topH
+}
+
+// planMaxScroll 返回计划面板任务列表当前的最大滚动偏移：
+// 任务数超出可视行数（面板高度扣除标题/边框与底部"总体进度/预计剩余"3 行）的部分。
+func (m *Model) planMaxScroll() int {
+	s := m.selectedSession()
+	if s == nil {
+		return 0
+	}
+	snap := m.boardSnapshot(s)
+	topH, _ := rightPanelHeights(m.mainContentHeight())
+	budget := topH - 3 - 3 // PanelBox 边框/标题 3 行 + footer 3 行
+	if budget < 0 {
+		budget = 0
+	}
+	if maxOff := len(snap.Tasks) - budget; maxOff > 0 {
+		return maxOff
+	}
+	return 0
 }
 
 // toggleLogPopup 打开/关闭"完整记录"面板：把整段对话铺成可滚动行列表，

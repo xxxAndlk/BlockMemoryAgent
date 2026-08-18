@@ -43,7 +43,8 @@ type Settings struct {
 	Image string
 	// Ports 仅 docker 使用：端口映射（如 "6081:6081"，noVNC 观察口等）。
 	Ports []string
-	// Volumes 仅 docker 使用：卷映射（如 "D:/data/od-artifacts:/out"，docker -v 需绝对路径或命名卷）。
+	// Volumes 仅 docker 使用：卷映射（如 "D:/data/od-artifacts:/out"）。宿主侧支持
+	// ${WORKDIR} 占位符，Init 时展开为 Agent 工作目录绝对路径（随启动目录解析，多开不串）。
 	Volumes []string
 	// URL 仅 http 使用：MCP streamable HTTP 端点。
 	URL string
@@ -188,8 +189,12 @@ func New(id string, settings Settings, logger *slog.Logger) *Bridge {
 // Manifest 实现 plugins.Plugin。
 func (b *Bridge) Manifest() plugins.Manifest { return b.manifest }
 
-// Init 实现 plugins.Plugin：校验配置。
+// Init 实现 plugins.Plugin：校验配置，并展开 volumes 中的 ${WORKDIR} 占位符
+//（deps.WorkDir 即 bootstrap 的 os.Getwd()，挂载随启动目录解析，支持多目录多开）。
 func (b *Bridge) Init(ctx context.Context, deps plugins.Deps) error {
+	for i, v := range b.settings.Volumes {
+		b.settings.Volumes[i] = plugins.ExpandWorkDir(v, deps.WorkDir)
+	}
 	switch b.settings.Transport {
 	case "stdio", "":
 		if b.settings.Command == "" {
