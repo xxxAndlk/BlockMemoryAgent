@@ -157,6 +157,22 @@ type mockBlockMemorySearcher struct {
 	lastGoal string
 	// bumpCalls 记录 BumpReuse 被调用的次数（reuseBumper 可选接口）。
 	bumpCalls int
+	// crossRecs 是 SearchBlockMemoryCrossSession 返回的固定记录切片。
+	crossRecs []*types.KnowledgeRecord
+	// crossErr 是 SearchBlockMemoryCrossSession 返回的固定错误。
+	crossErr error
+	// lastCrossSession / lastCrossTopK 记录补位调用入参，供断言。
+	lastCrossSession string
+	lastCrossTopK    int
+	crossCalls       int
+}
+
+// SearchBlockMemoryCrossSession 实现 CrossSessionSearcher 可选接口，记录入参并返回预设结果。
+func (m *mockBlockMemorySearcher) SearchBlockMemoryCrossSession(ctx context.Context, excludeSessionID, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+	m.crossCalls++
+	m.lastCrossSession = excludeSessionID
+	m.lastCrossTopK = topK
+	return m.crossRecs, m.crossErr
 }
 
 // SearchBlockMemoryByGoal 实现 BlockMemorySearcher 接口，忽略查询并返回预设结果。
@@ -276,6 +292,51 @@ func TestInjectRecalledMemory_BumpsReuse(t *testing.T) {
 	d.injectRecalledMemory(context.Background(), "查询任务", "")
 	if mock.bumpCalls != 2 {
 		t.Fatalf("expected 2 bumps (ids 1,2), got %d", mock.bumpCalls)
+	}
+}
+
+// TestInjectRecalledMemory_CrossSessionSupplement 验证跨 session 补位：
+// session 内命中不足 topK 时召回历史沉淀补齐，excludeSessionID 透传当前 session、
+// 补位额度为剩余槽位，合并结果统一走渲染与 reuse 递增。
+func TestInjectRecalledMemory_CrossSessionSupplement(t *testing.T) {
+	mock := &mockBlockMemorySearcher{
+		recs:      []*types.KnowledgeRecord{{ID: 1, Content: "本session记忆"}},
+		crossRecs: []*types.KnowledgeRecord{{ID: 2, Content: "历史session记忆"}},
+	}
+	d := NewDispatcher(nil, nil, nil, nil, nil).WithBlockMemorySearcher(mock)
+	ctx := tool.WithSessionID(context.Background(), "session-99")
+	got, recs := d.injectRecalledMemory(ctx, "查询任务", "原始任务")
+	if len(recs) != 2 {
+		t.Fatalf("expected 2 records (1 session + 1 cross-session), got %d", len(recs))
+	}
+	if mock.crossCalls != 1 {
+		t.Fatalf("expected 1 cross-session call, got %d", mock.crossCalls)
+	}
+	if mock.lastCrossSession != "session-99" {
+		t.Fatalf("expected excludeSessionID=session-99, got %q", mock.lastCrossSession)
+	}
+	if mock.lastCrossTopK != blockMemoryRecallTopK-1 {
+		t.Fatalf("expected supplement topK=%d (remaining slots), got %d", blockMemoryRecallTopK-1, mock.lastCrossTopK)
+	}
+	if !strings.Contains(got, "历史session记忆") {
+		t.Fatalf("expected cross-session record rendered, got: %q", got)
+	}
+	// 合并后统一 bump reuse。
+	if mock.bumpCalls != 2 {
+		t.Fatalf("expected 2 bumps (session + cross-session), got %d", mock.bumpCalls)
+	}
+}
+
+// TestInjectRecalledMemory_CrossSessionSkippedWhenFull 验证 session 内命中已满 topK 时
+// 不触发跨 session 补位（补位只补空槽，不挤占 session 内命中）。
+func TestInjectRecalledMemory_CrossSessionSkippedWhenFull(t *testing.T) {
+	mock := &mockBlockMemorySearcher{
+		recs: []*types.KnowledgeRecord{{Content: "一"}, {Content: "二"}, {Content: "三"}},
+	}
+	d := NewDispatcher(nil, nil, nil, nil, nil).WithBlockMemorySearcher(mock)
+	d.injectRecalledMemory(context.Background(), "查询任务", "")
+	if mock.crossCalls != 0 {
+		t.Fatalf("expected no cross-session call when session hits fill topK, got %d", mock.crossCalls)
 	}
 }
 

@@ -18,6 +18,12 @@ import (
 // 跨任务擦边的相似度通常低于该值；同域复用（"怪物路径"vs"怪物路径宽度"）高于该值。
 const minBlockMemoryScore = 0.4
 
+// crossSessionBlockMemoryScore 是跨 session 块记忆补位召回的相似度阈值，
+// 高于 session 内阈值：历史记忆没有当前会话上下文佐证，仅语义足够强才注入。
+// 实测（bge-m3，塔防项目 goal vs 前日事实）：同项目相关事实 0.50-0.69，
+// 弱相关跨任务事实 ~0.47 及以下，0.5 恰好分隔。
+const crossSessionBlockMemoryScore = 0.5
+
 // KnowledgeStore 是全局知识库/块记忆相关的 PostgreSQL 存储子层。
 // 职责: global_knowledge 表的写入、按类型查询、向量相似搜索、归档与访问计数。
 type KnowledgeStore struct {
@@ -194,6 +200,43 @@ func (s *KnowledgeStore) SearchBlockMemoryByGoal(ctx context.Context, sessionID,
 	}
 	// 仅按 knowledge_type 过滤做向量检索，不做 domain/session 过滤
 	return s.SearchByType(ctx, enums.KnowledgeTypeBlockMemory, emb, topK)
+}
+
+// SearchBlockMemoryCrossSession 跨 session 语义补位检索块记忆。
+// 供 session 内召回不足 topK 时补位：块记忆是全局沉淀，任何会话只要相关度
+// 足够高即可召回（纯语义过滤，不做项目隔离）；仅排除当前 session 已召回记录
+// （session_id 不等），与 session 内召回结果天然不重叠。
+// 阈值 crossSessionBlockMemoryScore 高于 session 内阈值，仅强相关命中补位。
+// 参数:
+//   - ctx:              请求上下文。
+//   - excludeSessionID: 排除的当前 session ID。
+//   - goal:             目标文本，用于生成查询向量。
+//   - topK:             返回上限。
+func (s *KnowledgeStore) SearchBlockMemoryCrossSession(ctx context.Context, excludeSessionID, goal string, topK int) ([]*types.KnowledgeRecord, error) {
+	if topK <= 0 {
+		return nil, nil
+	}
+	emb, err := s.pg.Embed(ctx, goal)
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived,
+			       1 - (embedding <=> $3) AS score
+			FROM global_knowledge
+			WHERE archived = false AND knowledge_type = $1
+			  AND (coalesce(meta->>'session_id','') = '' OR meta->>'session_id' <> $2)
+			  AND embedding <=> $3 <= $4
+			ORDER BY embedding <=> $3
+			LIMIT $5`,
+		enums.KnowledgeTypeBlockMemory, excludeSessionID, pgVector(emb), 1-crossSessionBlockMemoryScore, topK)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return s.scanKnowledgeRowsWithScore(ctx, rows)
 }
 
 // Query 黑板模式（TODO #42）scope 确定性检索：按 session_id + parent_id + task_domain

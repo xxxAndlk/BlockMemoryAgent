@@ -81,6 +81,15 @@ type BlackboardSearcher interface {
 	Query(ctx context.Context, sessionID, parentID, taskDomain, query string, topK int, excludeSubAgentID string) ([]*types.KnowledgeRecord, error)
 }
 
+// CrossSessionSearcher 抽象跨 session 块记忆补位检索能力，由 store.PostgresStore 实现。
+// session 内召回不足 topK 时补位历史任务沉淀（"外脑"）：块记忆是全局沉淀，任何会话
+// 只要相关度足够高即可召回（纯语义过滤，不做项目隔离）；仅排除当前 session。
+// 实现方自持更严的相似度阈值（crossSessionBlockMemoryScore）。
+// 未实现时跳过补位（向后兼容 mock/测试）。
+type CrossSessionSearcher interface {
+	SearchBlockMemoryCrossSession(ctx context.Context, excludeSessionID, goal string, topK int) ([]*types.KnowledgeRecord, error)
+}
+
 // blockMemoryRecallTopK 是派发子 Agent 时召回块记忆的条数上限。
 const blockMemoryRecallTopK = 3
 
@@ -2668,9 +2677,26 @@ func (d *Dispatcher) injectScopedRecall(ctx context.Context, parentID, taskDomai
 	if len(recs) == 0 {
 		rs, err := d.searcher.SearchBlockMemoryByGoal(ctx, sid, query, blockMemoryRecallTopK)
 		if err != nil || len(rs) == 0 {
-			return task, nil
+			rs = nil
 		}
 		recs = rs
+	}
+	// 跨 session 补位：session 内命中不足 topK 时，按更严阈值召回历史任务沉淀
+	// （排除当前 session，与已召回记录天然不重叠；纯语义过滤，跨项目弱相关
+	// 事实相似度低于阈值自然被滤掉）。未实现 CrossSessionSearcher / 出错 /
+	// 0 命中时静默跳过，不影响 session 内召回。
+	if len(recs) < blockMemoryRecallTopK {
+		if cs, ok := d.searcher.(CrossSessionSearcher); ok {
+			extra, err := cs.SearchBlockMemoryCrossSession(ctx, sid, query, blockMemoryRecallTopK-len(recs))
+			if err != nil {
+				log.Printf("[subagent] cross-session block-memory supplement failed: session=%s err=%v", sid, err)
+			} else {
+				recs = append(recs, extra...)
+			}
+		}
+	}
+	if len(recs) == 0 {
+		return task, nil
 	}
 	rankBlockMemory(recs)
 	d.bumpReuses(ctx, recs)
