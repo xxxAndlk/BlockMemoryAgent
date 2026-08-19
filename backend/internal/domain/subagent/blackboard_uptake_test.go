@@ -173,7 +173,7 @@ func TestWithPriorSalvage_ReadsBlackboard(t *testing.T) {
 	}
 	d.WithBlockMemorySearcher(mock)
 
-	task := d.withPriorSalvage(dispatchCtx(), "s1", "配置", "实现 config.js")
+	task := d.withPriorSalvage(dispatchCtx(), "s1", "配置", "domain", "实现 config.js")
 	if !strings.Contains(task, "【前序探索摘要】") || !strings.Contains(task, "config.js") {
 		t.Fatalf("expected blackboard salvage injected, got: %s", task)
 	}

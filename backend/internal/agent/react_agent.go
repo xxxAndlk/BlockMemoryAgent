@@ -535,7 +535,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// 工具派发前上报活动：工具 hang 时无后续活动，心跳巡检可捕获。
 			a.touchActivity()
 			// 分发执行单个工具调用；出错时构造包含错误信息的 ToolResult。
-			result, err := a.tools.Dispatch(ctx, tc)
+			result, err := a.dispatchToolWithKeepalive(ctx, tc)
 			// 长工具（大文件写/长命令）执行完成后同样刷新活动，防巡检在工具执行期间误判。
 			a.touchActivity()
 			if err != nil {
@@ -596,6 +596,35 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// 不视为错误——返回 LimitReached 标记与完整历史，
 	// 由上层将会话置为暂停并提示用户发送消息续跑，而不是判定任务失败。
 	return ReactResult{History: history, LimitReached: true}, nil
+}
+
+// dispatchToolWithKeepalive 执行单个工具调用，期间定时上报心跳。
+// 盲区修复（2026-08-19）：旧实现只在工具派发前/后 touch，工具执行期间零上报--
+// 长命令/大文件操作（构建、依赖安装）超过心跳阈值即被巡检误判假死杀掉，
+// 全部工作从零重派（实证：战斗实体首任 10 分钟被杀，损失约 20 分钟）。
+// 定时器与流式保活同口径：真实挂死由 sub_agent_timeout 墙钟兜底，本保活不无限续命。
+func (a *ReActAgent) dispatchToolWithKeepalive(ctx context.Context, tc ToolCall) (ToolResult, error) {
+	interval := a.streamKeepalive
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.touchActivity()
+			}
+		}
+	}()
+	return a.tools.Dispatch(ctx, tc)
 }
 
 // generate 包装一次 LLM 调用：带单次超时与指数退避重试（TODO #19 LLM 链）。

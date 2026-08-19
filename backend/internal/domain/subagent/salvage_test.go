@@ -200,8 +200,9 @@ func TestSalvageFailure_ExtractorErrorFallsBack(t *testing.T) {
 	}
 }
 
-// TestSalvageFailure_NoDomainSkipsSlot 无 domain 不写槽位（无法按键），仍返回摘要文本。
-func TestSalvageFailure_NoDomainSkipsSlot(t *testing.T) {
+// TestSalvageFailure_LeafWritesRoleSlot 叶子派发（domain 空）以 role:<roleID> 为 scope 写槽位，
+// 供同角色重派带回前序摘要（2026-08-19：心跳误杀叶子重派不再从零重跑）。
+func TestSalvageFailure_LeafWritesRoleSlot(t *testing.T) {
 	_, _, _, _, dir := newSalvageTestEnv(t, &mockProvider{text: "ok"})
 	cfg := &config.RoleConfigFile{
 		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
@@ -219,8 +220,9 @@ func TestSalvageFailure_NoDomainSkipsSlot(t *testing.T) {
 	if !strings.Contains(salvage, "探索成果") {
 		t.Fatalf("salvage should return text even without domain, got: %q", salvage)
 	}
-	if len(shared.Keys(context.Background())) != 0 {
-		t.Fatalf("no salvage slot should be written without domain, keys=%v", shared.Keys(context.Background()))
+	val, err := shared.Get(context.Background(), "s1:salvage:role:domain")
+	if err != nil || !strings.Contains(val, "探索成果") {
+		t.Fatalf("leaf salvage should write role-scoped slot, err=%v val=%q", err, val)
 	}
 }
 
@@ -234,25 +236,25 @@ func TestWithPriorSalvage_AppendsToSameDomainReDispatch(t *testing.T) {
 	tr.Finish("s1/domain-1", "failed", errors.New("timeout"))
 	_ = d.sharedMem.Set(context.Background(), "s1:salvage:配置", "已读: config.js 结构\n卡点: 渲染接口签名未确认")
 
-	task := d.withPriorSalvage(dispatchCtx(), "s1", "配置", "实现 config.js 渲染")
+	task := d.withPriorSalvage(dispatchCtx(), "s1", "配置", "domain", "实现 config.js 渲染")
 	if !strings.Contains(task, "【前序探索摘要】") || !strings.Contains(task, "config.js") {
 		t.Fatalf("re-dispatch task should carry prior salvage, got: %s", task)
 	}
 
 	// 其他 domain（无失败兄弟）：任务零变化。
-	other := d.withPriorSalvage(dispatchCtx(), "s1", "渲染", "实现渲染引擎")
+	other := d.withPriorSalvage(dispatchCtx(), "s1", "渲染", "domain", "实现渲染引擎")
 	if other != "实现渲染引擎" {
 		t.Fatalf("task without failed sibling should be unchanged, got: %s", other)
 	}
-	// domain 为空：零变化。
-	empty := d.withPriorSalvage(dispatchCtx(), "s1", "", "任务")
+	// 叶子派发（domain 空）无同角色失败前任：零变化。
+	empty := d.withPriorSalvage(dispatchCtx(), "s1", "", "code_assistant", "任务")
 	if empty != "任务" {
-		t.Fatalf("empty domain should skip, got: %s", empty)
+		t.Fatalf("leaf without failed sibling should be unchanged, got: %s", empty)
 	}
 	// 摘要槽位为空：零变化。
 	tr.Register(orchestrator.Node{ID: "s1/domain-2", ParentID: "s1", Role: "domain", Domain: "测试", Status: orchestrator.StatusRunning})
 	tr.Finish("s1/domain-2", "failed", errors.New("timeout"))
-	nofail := d.withPriorSalvage(dispatchCtx(), "s1", "测试", "写测试")
+	nofail := d.withPriorSalvage(dispatchCtx(), "s1", "测试", "domain", "写测试")
 	if nofail != "写测试" {
 		t.Fatalf("task with failed sibling but empty salvage should be unchanged, got: %s", nofail)
 	}

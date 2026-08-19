@@ -52,6 +52,11 @@ type callSubAgentInput struct {
 	// dispatcher 校验 ∩ 子 Agent 角色权限天花板后收窄其插件工具可见集（相当于预挂载）。
 	// 天花板外（插件 roles 白名单不允许）的越界项被忽略并随派发结果回告父 Agent，不放大权限。
 	ToolsHint []string `json:"tools_hint"`
+	// WallClockMin 派发级墙钟预算（分钟，可选）。代码级 context.WithTimeout 强制收口，
+	// 替代提示词墙钟（roles.yaml 的"墙钟约 15 分钟"对 LLM 只是软约束，实证验收 Agent
+	// 拿 15 分钟预算实际跑了 39 分钟）。>0 时取 min(本值, sub_agent_timeout)；到期前
+	// 预警窗口内向子 Agent 邮箱投递收口警告。省略=用全局 sub_agent_timeout。
+	WallClockMin float64 `json:"wall_clock_min"`
 }
 
 // ModelProviderFactory 是 model.ModelFactory 的子集，
@@ -235,6 +240,12 @@ type Dispatcher struct {
 	// judgeRole 校验 judge 的角色 ID（TODO #43 交叉模型）：engineLLMForJudge 优先取该角色的
 	// provider（与被审角色不同模型），取不到回退同角色。空串=仅同角色回退。
 	judgeRole string
+	// engineLLMTimeout 引擎辅助 LLM（reflection 自检 judge / plan_execute 规划）单次调用超时。
+	// 该路径不走 ReAct 主循环的 CallLLM 超时包装，只吃 SDK 默认 600s/请求；无独立超时时
+	// provider 层 3 次重试 × judge 内部重试叠加可烧 ~70 分钟直到 sub_agent_timeout 强杀
+	//（2026-08-19 引擎 Agent 事故：文件 15:54 已全部落盘，收尾自检被流式超时循环拖到 17:03）。
+	// 超时包住整次调用（含 provider 内部重试）。<=0 仅受子 Agent 墙钟控制。
+	engineLLMTimeout time.Duration
 
 	// factExtractor 从子 Agent 输出中提取关键事实，替代原始 result.Text 直接落库。
 	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
@@ -271,6 +282,11 @@ type Dispatcher struct {
 	// activity 存叶子子 Agent 最后活动时间戳（unix nano），键 subAgentID -> *atomic.Int64。
 	// 仅叶子 Agent 注入（DomainAgent/MetaAgent 有 wait loop 不注入，避免误杀合法等待）。
 	activity sync.Map
+	// lastWrites 存子 Agent 近期写入的文件清单（subAgentID -> []fileWriteRecord），
+	// 从实时工具事件识别（WriteFile/EditFile）。心跳巡检 kill 时把清单回告父 Agent--
+	// 收尾卡死被杀的子 Agent 常已把产物全部落盘（2026-08-19 引擎 Agent：文件 15:54 落盘、
+	// 回执因 judge 挂死拖到 17:03），父级需要知道盘上有货可按现状验收，而非从零重派。
+	lastWrites sync.Map
 	// subMeta 存子 Agent 的 cancel/parentID/sessionID/doneOnce，供巡检卡死时主动 cancel + 兜底递减。
 	// doneOnce 保证 patrol 与 goroutine 任一方 trackChildDone 仅触发一次，防双递减。
 	subMeta sync.Map // subAgentID -> *subAgentMeta
@@ -320,11 +336,25 @@ func (d *Dispatcher) trackChildDone(parentID string) {
 // subAgentMeta 存子 Agent 巡检所需元数据：cancel 用于主动取消卡死子 Agent ctx；
 // parentID/sessionID 用于 notify 父与 treeFinish；doneOnce 保证 trackChildDone 仅触发一次
 //（patrol 与 goroutine 竞争时防双递减，PendingChildren 不会为负）。
+// wallClock 是本次派发的有效墙钟（wall_clock_min ∩ sub_agent_timeout），供失败文案
+// 报准确上限（否则 15 分钟预算被杀时文案误报"上限 2h0m0s"）。
 type subAgentMeta struct {
 	cancel    context.CancelFunc
 	parentID  string
 	sessionID string
+	wallClock time.Duration
 	doneOnce  sync.Once
+}
+
+// effectiveTimeout 返回子 Agent 的有效墙钟：优先派发级 wall_clock_min（已 min 全局值），
+// 未派发级预算时回退全局 d.timeout。
+func (d *Dispatcher) effectiveTimeout(subAgentID string) time.Duration {
+	if v, ok := d.subMeta.Load(subAgentID); ok {
+		if wc := v.(*subAgentMeta).wallClock; wc > 0 && (d.timeout <= 0 || wc < d.timeout) {
+			return wc
+		}
+	}
+	return d.timeout
 }
 
 // WithHeartbeatTimeout 配置子 Agent 心跳超时；<=0 关闭巡检（测试场景默认关闭）。
@@ -360,6 +390,61 @@ func (d *Dispatcher) bubbleActivity(agentID string, now int64) {
 		}
 		cur = meta.parentID
 	}
+}
+
+// fileWriteRecord 是单个子 Agent 的一次文件写入记录（路径 + 时间）。
+type fileWriteRecord struct {
+	path string
+	at   time.Time
+}
+
+// recordFileWrite 从工具调用实时事件识别文件写入（WriteFile/EditFile），记录路径与时间。
+// copy-on-write + CAS 保证与 killStuckSubAgent 的并发读安全；同路径去重保最新。
+func (d *Dispatcher) recordFileWrite(subAgentID string, ev agent.LiveEvent) {
+	if ev.Kind != agent.LiveEventToolCall || (ev.Tool != "WriteFile" && ev.Tool != "EditFile") {
+		return
+	}
+	var in struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal([]byte(ev.Input), &in) != nil || strings.TrimSpace(in.Path) == "" {
+		return
+	}
+	path := strings.TrimSpace(in.Path)
+	now := time.Now()
+	for {
+		old, _ := d.lastWrites.LoadOrStore(subAgentID, []fileWriteRecord{})
+		list := old.([]fileWriteRecord)
+		next := make([]fileWriteRecord, 0, len(list)+1)
+		for _, r := range list {
+			if r.path != path {
+				next = append(next, r)
+			}
+		}
+		next = append(next, fileWriteRecord{path: path, at: now})
+		if len(next) > 8 {
+			next = next[len(next)-8:]
+		}
+		if d.lastWrites.CompareAndSwap(subAgentID, list, next) {
+			return
+		}
+	}
+}
+
+// recentWrittenFiles 返回子 Agent 近 within 窗口内写入的文件清单（保序去重）。
+func (d *Dispatcher) recentWrittenFiles(subAgentID string, within time.Duration) []string {
+	v, ok := d.lastWrites.Load(subAgentID)
+	if !ok {
+		return nil
+	}
+	cutoff := time.Now().Add(-within)
+	var out []string
+	for _, r := range v.([]fileWriteRecord) {
+		if r.at.After(cutoff) {
+			out = append(out, r.path)
+		}
+	}
+	return out
 }
 
 // PingActivity 外部保活探针（等待用户答复场景）：审批/提问阻塞期间由会话层周期性调用，
@@ -462,6 +547,12 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
 	meta.doneOnce.Do(func() { d.trackChildDone(meta.parentID) })
 	killMsg := failureMarker(FailureKindKilled, false) + "\n" +
 		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, threshold)
+	// 盘上产物回告（2026-08-19）：收尾卡死被杀的子 Agent 常已把文件全部落盘，
+	// 只是回执被挂死的收尾自检拖住--父级据此可按盘上现状直接验收，不必从零重派。
+	if paths := d.recentWrittenFiles(subAgentID, 30*time.Minute); len(paths) > 0 {
+		killMsg += "\n该 Agent 近期已写入以下文件（盘上产物大概率可用，可按盘上现状直接验收，无需从零重派）：\n- " +
+			strings.Join(paths, "\n- ")
+	}
 	d.notify(meta.parentID, subAgentID, killMsg, nil)
 	if d.treeFn != nil && meta.sessionID != "" {
 		if t := d.treeFn(meta.sessionID); t != nil {
@@ -755,6 +846,13 @@ func (d *Dispatcher) WithEngineConfig(reflectionMaxRounds, planMaxSteps int) *Di
 	return d
 }
 
+// WithEngineLLMTimeout 配置引擎辅助 LLM（自检 judge/规划）单次调用超时；<=0 仅受子 Agent 墙钟控制。
+// bootstrap 按 cfg.Agent.EngineLLMTimeoutSec 注入（默认 300s）。
+func (d *Dispatcher) WithEngineLLMTimeout(t time.Duration) *Dispatcher {
+	d.engineLLMTimeout = t
+	return d
+}
+
 // WithJudgeRole 配置校验 judge 的角色 ID（TODO #43 交叉模型）。
 // engineLLMForJudge 优先取该角色 provider（与被审角色不同模型，防同模型自评放水）；
 // 取不到回退同角色。bootstrap 按 cfg.Agent.JudgeRole 注入。
@@ -1018,6 +1116,8 @@ func (t *callSubAgentTool) Description() string {
 		"【tools_hint 字段】（可选）建议工具集：子 Agent 需要插件工具（如画图/搜索/浏览器）时，在此声明工具名列表（来自 tool_catalog），" +
 		"dispatcher 校验 ∩ 子 Agent 角色权限天花板后预挂载——子 Agent 当轮即可见对应插件工具，无需自己挂载。" +
 		"天花板外（插件 roles 白名单不允许）的越界项会被忽略并随本调用结果回告，不放大权限。\n\n" +
+		"【wall_clock_min 字段】（可选）本次派发的墙钟预算（分钟，代码级强制执行，与全局 sub_agent_timeout 取小）：" +
+		"到期前子 Agent 会收到收口警告，超时直接终止。验收/巡检类任务建议显式给预算（如 15）防止无边界扩张；普通建设任务省略。\n\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
@@ -1098,6 +1198,8 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	verifyKind, _ := args["verify_kind"].(string)
 	// tools_hint 可选：建议工具集（TODO #52）——dispatcher 校验 ∩ 子 Agent 天花板后预挂载。
 	toolsHint := d.toolsHintArg(args)
+	// wall_clock_min 可选：派发级墙钟（分钟），代码级强制收口，替代提示词墙钟。
+	wallClock := d.wallClockArg(args)
 
 	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode, verifyKind)
 	if msg != "" {
@@ -1112,7 +1214,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
-	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint)
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, wallClock)
 	if errRes != nil {
 		errRes.Tool = "call_sub_agent"
 		return errRes
@@ -1130,10 +1232,11 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 // mode 为派发执行模式（react/reflection/plan_execute，空串=react，TODO #29），
 // verifyKind 为校验分层（auto/executable/rubric/none，空串=auto，TODO #43），
 // toolsHint 为建议工具集（TODO #52，可空）：校验 ∩ 子 Agent 角色天花板后预挂载到子 scope，
+// wallClock 为派发级墙钟（>0 时取 min(wallClock, sub_agent_timeout) 替代全局值，到期前预警）。
 // 均穿透到子 Agent 构造时的引擎选择与完成后校验。
 // 前置：调用方已完成参数校验（validateDispatchArgs）与 spec 强制校验。
 // 供 call_sub_agent（单个）与 call_sub_agents（批量同波）两个工具复用。
-func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint []string) (string, *tool.Result) {
+func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint []string, wallClock time.Duration) (string, *tool.Result) {
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
 	if parentID == "" {
@@ -1160,11 +1263,11 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		}
 	}
 
-	// 前序失败打捞（TODO #20 第三层）：同父同 domain 存在 Failed/Cancelled 兄弟时，
-	// 把其打捞摘要（<parentID>:salvage:<domain>）追加到新任务文本，机制上保证重派不重复探索。
-	if roleID == "domain" {
-		task = d.withPriorSalvage(ctx, parentID, domain, task)
-	}
+	// 前序失败打捞（TODO #20 第三层）：同父同 scope 存在 Failed/Cancelled 前任时，
+	// 把其打捞摘要追加到新任务文本，机制上保证重派不重复探索。
+	// 2026-08-19 扩展到叶子：domain 派发按领域；叶子派发按角色（心跳误杀的叶子重派
+	// 此前从零重跑，损失 20 分钟量级）。
+	task = d.withPriorSalvage(ctx, parentID, domain, roleID, task)
 
 	// 全局派发总数限额：同一 session 内所有角色的派发合计超过 maxTotalDispatches 时拒绝。
 	// 早期实现按 (callerRole->calleeRole) 对计数，实为"每角色最多 N 次"，多文件编排任务
@@ -1202,13 +1305,20 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	//   - timeout>0 时才叠加超时；defer cancel 确保 goroutine 退出时释放上下文资源。
 	//   - 继承父 ctx 的 sessionID：子 Agent 工具事件经 handleToolEvent 写入会话日志，
 	//     否则事件 SessionID 为空被静默丢弃（参见 service_react.handleToolEvent 的 isRunning 分支）。
+	// 派发级墙钟（2026-08-19）：wall_clock_min 是代码级预算，替代 roles.yaml 提示词墙钟
+	//（对 LLM 只是软约束，实证验收 Agent 拿 15 分钟预算实际跑 39 分钟）。
+	// 取 min(wallClock, d.timeout)：派发级预算不放大全局上限。
+	effectiveTimeout := d.timeout
+	if wallClock > 0 && (effectiveTimeout <= 0 || wallClock < effectiveTimeout) {
+		effectiveTimeout = wallClock
+	}
 	subAgentCtx := context.Background()
 	if sid := tool.SessionIDFromContext(ctx); sid != "" {
 		subAgentCtx = tool.WithSessionID(subAgentCtx, sid)
 	}
 	cancel := context.CancelFunc(func() {})
-	if d.timeout > 0 {
-		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, d.timeout)
+	if effectiveTimeout > 0 {
+		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)
 	}
 	taskBrief := truncateRunes(strings.ReplaceAll(strings.TrimSpace(task), "\n", " "), 100)
 	log.Printf("[subagent] dispatch: parent=%s sub=%s role=%s task=%q", parentID, subAgentID, roleID, taskBrief)
@@ -1239,7 +1349,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// parentID 链向上冒泡刷新祖先时间戳，domain 等子/等回信期间靠后代活动保持存活；
 	// 自身无 LLM/工具活动且无活跃后代超阈值才判假死。meta 不注册（会话级由用户/墙钟控制）。
 	isMeta := roleDef.ID == "meta"
-	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(ctx)}
+	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(ctx), wallClock: effectiveTimeout}
 	d.subMeta.Store(subAgentID, meta)
 	if !isMeta {
 		act := new(atomic.Int64)
@@ -1251,6 +1361,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		defer cancel()
 		defer d.subMeta.Delete(subAgentID)
 		defer d.activity.Delete(subAgentID)
+		defer d.lastWrites.Delete(subAgentID)
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
 		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
@@ -1259,6 +1370,33 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 			meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
 		}
 	}()
+
+	// 墙钟预警：到期前 grace 窗口向子 Agent 邮箱投递收口警告（子 Agent 主循环 drainMailbox
+	// 会读到），避免"预算 15 分钟跑到 39 分钟"无感知硬杀。agent 提前完成时 ctx 被 defer cancel，
+	// 定时器随之退出，零泄漏。grace 取 min(2min, 墙钟/4)，墙钟过短（<2min）时跳过预警只硬杀。
+	if effectiveTimeout > 0 && d.mailbox != nil {
+		grace := effectiveTimeout / 4
+		if grace > 2*time.Minute {
+			grace = 2 * time.Minute
+		}
+		if grace >= 30*time.Second {
+			go func() {
+				select {
+				case <-time.After(effectiveTimeout - grace):
+				case <-subAgentCtx.Done():
+					return
+				}
+				_, _ = d.mailbox.Send(&mailbox.Message{
+					From:    "dispatcher",
+					To:      subAgentID,
+					Type:    mailbox.MsgInfo,
+					Subject: "墙钟预警",
+					Body: fmt.Sprintf("【墙钟预警】距执行上限（%v）只剩约 %v，请立即收口：停止继续探索，基于已有产出输出终答。",
+						effectiveTimeout, grace),
+				})
+			}()
+		}
+	}
 
 	// 返回子 Agent ID 作为句柄，父 Agent 可用该 ID 查询或接收后续通知。
 	if len(hintRejected) > 0 {
@@ -1289,6 +1427,16 @@ func (d *Dispatcher) toolsHintArg(args map[string]any) []string {
 	return nil
 }
 
+// wallClockArg 从 args 提取 wall_clock_min 参数（分钟，JSON number）转为 Duration。
+// 缺失/非数值/<=0 返回 0（用全局 sub_agent_timeout）。
+func (d *Dispatcher) wallClockArg(args map[string]any) time.Duration {
+	v, ok := args["wall_clock_min"].(float64)
+	if !ok || v <= 0 {
+		return 0
+	}
+	return time.Duration(v * float64(time.Minute))
+}
+
 // callSubAgentsTool 实现 call_sub_agents 工具：同一波多个子任务一次性原子并行派出。
 // 与连续多次 call_sub_agent 等长，但工具形态本身引导"同波一次派出"——
 // 实证 v6 基准 MetaAgent 把 4 个建设领域分 2 波串行（第二波晚 24 分钟判负），
@@ -1311,7 +1459,8 @@ func (t *callSubAgentsTool) Description() string {
 		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?, verify_kind?, tools_hint?}，" +
 		fmt.Sprintf("字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=%d 字；", t.dispatcher.taskRuneSoftLimit) +
 		"mode 可选 react/reflection/plan_execute，省略=react；verify_kind 可选 auto/executable/rubric/none，省略=auto；" +
-		"tools_hint 可选：建议子 Agent 使用的插件工具名列表，校验 ∩ 子 Agent 权限天花板后预挂载，越界项忽略并回告）。\n" +
+		"tools_hint 可选：建议子 Agent 使用的插件工具名列表，校验 ∩ 子 Agent 权限天花板后预挂载，越界项忽略并回告）；" +
+		"wall_clock_min 可选：本次派发的墙钟预算（分钟，代码级强制执行，与全局上限取小，到期前收口警告，验收类任务建议显式给）。\n" +
 		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
 		"否则返回 spec missing/stale 错误（stale 会列出已变更文件路径）。逐项返回派出结果：某项失败不影响其他项。"
 }
@@ -1331,7 +1480,11 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 	}
 
 	// 逐项校验参数；轻微超限（2000-2600 runes）软着陆放行并收集警告（TODO #38-3）。
-	type batchItem struct{ roleID, domain, task, responsibility, mode, verifyKind string; toolsHint []string }
+	type batchItem struct {
+		roleID, domain, task, responsibility, mode, verifyKind string
+		toolsHint                                              []string
+		wallClock                                              time.Duration
+	}
 	items := make([]batchItem, 0, len(raw))
 	var batchWarnings []string
 	for i, r := range raw {
@@ -1347,6 +1500,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.mode, _ = m["mode"].(string)
 		it.verifyKind, _ = m["verify_kind"].(string)
 		it.toolsHint = d.toolsHintArg(m) // TODO #52：建议工具集（∩ 子 Agent 天花板后预挂载）
+		it.wallClock = d.wallClockArg(m)
 		if msg, warning := t.dispatcher.validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode, it.verifyKind); msg != "" {
 			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
 		} else if warning != "" {
@@ -1365,7 +1519,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 
 	var okIDs, errs []string
 	for _, it := range items {
-		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint)
+		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint, it.wallClock)
 		if errRes != nil {
 			errs = append(errs, fmt.Sprintf("%s(%s): %s", it.roleID, it.domain, errRes.Error))
 			continue
@@ -1470,7 +1624,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		// 结构化失败（TODO #23）：头部机读标记 [failure kind=X retryable=Y]，人读文案在后。
 		kind := failureKindOf(err)
 		retryable := kind == FailureKindError && roleDef.ID != "domain" && roleDef.ID != "meta" && ctx.Err() == nil
-		msg := failureMarker(kind, retryable) + "\n" + formatSubAgentFailure(err, result, d.timeout, partial)
+		msg := failureMarker(kind, retryable) + "\n" + formatSubAgentFailure(err, result, d.effectiveTimeout(subAgentID), partial)
 		// 校验分层（TODO #43）两类"未验证/缺证据"：附产出全文供父 Agent 自决
 		// （重派/降级/收口）——非"失败"语义，产出可能可用，不能只给 500 字截断。
 		if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
@@ -1650,9 +1804,13 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	}
 	// 注入实时事件转发器：子 Agent emitLive 时按 sessionID 路由回会话 service，
 	// 使子 Agent token 用量计入会话累计（TUI/Web 总和展示）。
+	// 转发前拦截 WriteFile/EditFile 调用事件记录盘上产物（kill 时回告父级）。
 	if d.liveFn != nil && sid != "" {
 		forwarder := d.liveFn
-		sub = sub.WithLiveEvents(func(ev agent.LiveEvent) { forwarder(sid, ev) })
+		sub = sub.WithLiveEvents(func(ev agent.LiveEvent) {
+			d.recordFileWrite(subAgentID, ev)
+			forwarder(sid, ev)
+		})
 	}
 
 	d.running.Store(subAgentID, sub)
@@ -1785,14 +1943,14 @@ func (d *Dispatcher) runEngine(ctx context.Context, sub *agent.ReActAgent, subAg
 	// verifyKind=rubric 覆盖 mode（react+rubric = 完成后 judge 评审）。
 	if mode == agent.ModeReflection || verifyKind == verifyKindRubric {
 		return agent.NewReflectEngine(sub, agent.EngineOptions{
-			LLM:                 d.engineLLMForJudge(ctx, roleID),
+			LLM:                 d.engineLLMForJudge(ctx, roleID, subAgentID),
 			MaxReflectionRounds: d.reflectionMaxRounds,
 		}).Run(ctx, task)
 	}
 	switch mode {
 	case agent.ModePlanExecute:
 		return agent.NewPlanExecuteEngine(sub, agent.EngineOptions{
-			LLM:          d.engineLLM(ctx, roleID),
+			LLM:          d.engineLLM(ctx, roleID, subAgentID),
 			PlanMaxSteps: d.planMaxSteps,
 			PlanSink:     d.planSink(ctx, subAgentID),
 			PlanProgress: d.planProgress(ctx, subAgentID),
@@ -1807,17 +1965,62 @@ func (d *Dispatcher) runEngine(ctx context.Context, sub *agent.ReActAgent, subAg
 // 偏放水/幻觉 pass）；judgeRole 取不到（mock 测试/角色未注册）回退同角色 provider，
 // 两者都失败返回恒 err 的 LLMComplete——ReflectEngine 收到错误走 fail-closed（Unverified），
 // 绝不静默放行。
-func (d *Dispatcher) engineLLMForJudge(ctx context.Context, roleID string) agent.LLMComplete {
+func (d *Dispatcher) engineLLMForJudge(ctx context.Context, roleID, subAgentID string) agent.LLMComplete {
 	if d.judgeRole != "" && d.judgeRole != roleID {
 		if p, err := d.models.GetBladesProvider(ctx, d.judgeRole); err == nil {
-			return agent.NewEngineLLM(p)
+			return d.wrapEngineLLM(subAgentID, agent.NewEngineLLM(p))
 		}
 	}
 	if p, err := d.models.GetBladesProvider(ctx, roleID); err == nil {
-		return agent.NewEngineLLM(p)
+		return d.wrapEngineLLM(subAgentID, agent.NewEngineLLM(p))
 	}
 	return func(ctx context.Context, prompt string) (string, error) {
 		return "", fmt.Errorf("judge provider unavailable for role=%s judge=%s", roleID, d.judgeRole)
+	}
+}
+
+// engineLLMKeepalive 是引擎辅助 LLM 调用期间的心跳保活间隔（thinking 模型 judge
+// 单次生成可达数分钟，期间子 Agent 无 LLM/工具活动，不保活会被巡检误判假死）。
+const engineLLMKeepalive = 30 * time.Second
+
+// wrapEngineLLM 为引擎辅助 LLM 调用（自检 judge / plan_execute 规划）加超时与心跳保活。
+// 两个盲区一起堵（2026-08-19 引擎 Agent 70 分钟事故）：
+//  1. 超时：该路径无 CallLLM 包装，SDK 默认 600s/请求 × provider 3 次重试 × judge 内部
+//     重试叠加可烧 ~70 分钟；外层 WithTimeout 包住整次调用（含 provider 重试），到期后
+//     后续重试因 ctx 已耗尽立即失败（快速失败，不再重试-再超时循环）。
+//  2. 心跳：engineLLMStream 流式消费不 touchActivity，judge 长生成期间子 Agent 零活动
+//     会被巡检按假死杀掉；保活定时器补上报（真实挂死由墙钟兜底，不无限续命）。
+func (d *Dispatcher) wrapEngineLLM(subAgentID string, inner agent.LLMComplete) agent.LLMComplete {
+	return func(ctx context.Context, prompt string) (string, error) {
+		if d.engineLLMTimeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, d.engineLLMTimeout)
+			defer cancel()
+		}
+		if subAgentID == "" {
+			return inner(ctx, prompt)
+		}
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			ticker := time.NewTicker(engineLLMKeepalive)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					now := time.Now().UnixNano()
+					if av, ok := d.activity.Load(subAgentID); ok {
+						av.(*atomic.Int64).Store(now)
+					}
+					d.bubbleActivity(subAgentID, now)
+				}
+			}
+		}()
+		return inner(ctx, prompt)
 	}
 }
 
@@ -1852,13 +2055,13 @@ const l0RetryMessage = "【验证要求】终答前必须运行验证命令（�
 
 // engineLLM 构造引擎辅助 LLM（自检/规划）：从模型工厂取同角色 provider 适配为文本补全。
 // 取 provider 失败时返回的 LLMComplete 每次调用报错，引擎 fail-open 降级为纯 ReAct。
-func (d *Dispatcher) engineLLM(ctx context.Context, roleID string) agent.LLMComplete {
+func (d *Dispatcher) engineLLM(ctx context.Context, roleID, subAgentID string) agent.LLMComplete {
 	return func(ctx context.Context, prompt string) (string, error) {
 		p, err := d.models.GetBladesProvider(ctx, roleID)
 		if err != nil {
 			return "", err
 		}
-		return agent.NewEngineLLM(p)(ctx, prompt)
+		return d.wrapEngineLLM(subAgentID, agent.NewEngineLLM(p))(ctx, prompt)
 	}
 }
 

@@ -52,6 +52,12 @@ type LLMRuntimeConfig struct {
 	// SalvageLLMTimeoutSec 失败打捞轻量调用超时（秒，默认 30；思考型模型场景建议 >=60）。
 	// 旧硬编码 5s 对思考型模型（glm/deepseek 推理系）来不及出首 token，打捞 facts=0 全降级（TODO #33）。
 	SalvageLLMTimeoutSec int `yaml:"salvage_llm_timeout_sec"`
+	// EngineLLMTimeoutSec 引擎辅助 LLM（reflection 自检 judge / plan_execute 规划）单次调用
+	// 超时（秒，默认 300）。该路径不吃 react_llm_timeout 的 CallLLM 包装，只吃 SDK 默认
+	// 600s/请求；无独立超时时 provider 3 次重试 × judge 内部重试叠加可烧 ~70 分钟直到
+	// sub_agent_timeout 强杀（2026-08-19 引擎 Agent 事故）。超时包住整次调用含 provider 重试。
+	// 负数表示仅受子 Agent 墙钟控制。
+	EngineLLMTimeoutSec int `yaml:"engine_llm_timeout_sec"`
 	// TokenBudgetPerGoal 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。
 	// 保留不破坏旧配置加载，但不再驱动任何闸门。见 TokenBudgetPerRole。
 	TokenBudgetPerGoal int `yaml:"token_budget_per_goal"`
@@ -439,6 +445,9 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.SalvageLLMTimeoutSec == 0 {
 		c.Agent.SalvageLLMTimeoutSec = 30
+	}
+	if c.Agent.EngineLLMTimeoutSec == 0 {
+		c.Agent.EngineLLMTimeoutSec = 300
 	}
 	if c.Agent.TaskMaxRunes == 0 {
 		c.Agent.TaskMaxRunes = 3000

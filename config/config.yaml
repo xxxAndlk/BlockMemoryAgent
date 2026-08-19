@@ -62,6 +62,7 @@ agent:
   task_max_runes_hard: 4000      # 派发 task 文本硬上限（TODO #35）：超硬限拒绝；仍拦截全量规格转贴（事故日志 3521/2315 runes 区间已上移）
   react_llm_timeout_sec: 1200    # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断；600s 仍不够——2026-08-13 实证 MetaAgent 汇总轮（4 领域摘要 ~20K input）10 分钟被掐断,整品验收没派出去,故 600->1200。配合 generate() 不在 deadline 上重试,卡死时 1200s 即报错。
   sub_agent_timeout_min: 120     # 子 Agent 独立执行超时（分钟），负数表示不限制。TODO #35 放开预算：60->120，慢推理（thinking）下长任务不再撞超时。
+  engine_llm_timeout_sec: 300    # 引擎辅助 LLM（reflection 自检 judge / plan_execute 规划）单次调用超时（秒）。该路径不走 CallLLM 包装,只吃 SDK 默认 600s/请求,provider 3 次重试 × judge 内部重试叠加曾烧 70 分钟直到墙钟强杀（2026-08-19 引擎 Agent 事故）；300s 包住整次调用含 provider 重试,到期快速失败。
   tool_output_history_max_runes: 20000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 行区间分页默认 200 行/页（read_file_max_chars 默认 16000 字符，ASCII 整页约 16000 runes），20000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取
   token_budget_per_goal: 300000   # 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。保留不破坏旧配置加载，不再驱动任何闸门。
   token_budget_per_role:          # 按角色上下文 token 阈值（替换原累计预算）：Assemble 压缩后估算 messages token >= 阈值即暂停（近 N 单独就超、压不下去），每轮独立估算（各 Agent 独立）。未列角色默认 150000。

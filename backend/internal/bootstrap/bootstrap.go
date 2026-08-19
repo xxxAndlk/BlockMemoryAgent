@@ -281,6 +281,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.WithDispatchRetryCount(cfg.Agent.DispatchRetryCount)
 	// 派发执行模式引擎参数（TODO #29 三引擎）：reflection 自检轮数 / plan_execute 最大步数。
 	subAgentDispatcher.WithEngineConfig(cfg.Agent.ReflectionMaxRounds, cfg.Agent.PlanExecuteMaxSteps)
+	// 引擎辅助 LLM（自检 judge/规划）单次调用超时：该路径无 CallLLM 包装，
+	// 无独立超时时 provider 重试 × judge 重试叠加可烧 ~70 分钟（2026-08-19 引擎 Agent 事故）。
+	if cfg.Agent.EngineLLMTimeoutSec > 0 {
+		subAgentDispatcher.WithEngineLLMTimeout(time.Duration(cfg.Agent.EngineLLMTimeoutSec) * time.Second)
+	}
 	// 校验 judge 角色（TODO #43 交叉模型）：reflection/rubric 校验取该角色 provider 作评审
 	// （与被审角色不同模型）；取不到 dispatcher 回退同角色（测试场景不破）。
 	subAgentDispatcher.WithJudgeRole(cfg.Agent.JudgeRole)
