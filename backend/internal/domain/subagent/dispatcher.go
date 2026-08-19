@@ -353,6 +353,20 @@ func (d *Dispatcher) bubbleActivity(agentID string, now int64) {
 	}
 }
 
+// PingActivity 外部保活探针（等待用户答复场景）：审批/提问阻塞期间由会话层周期性调用，
+// 刷新该 Agent 活动时间并沿父链冒泡，防止心跳巡检把"等用户操作"误判为假死 kill。
+// agentID 未注册（meta/已终结）时静默跳过。
+func (d *Dispatcher) PingActivity(agentID string) {
+	if agentID == "" {
+		return
+	}
+	now := time.Now().UnixNano()
+	if av, ok := d.activity.Load(agentID); ok {
+		av.(*atomic.Int64).Store(now)
+	}
+	d.bubbleActivity(agentID, now)
+}
+
 // ensurePatrol 幂等启动心跳巡检 goroutine：仅 heartbeatTimeout>0 时启动，Dispatcher 生命周期内一次。
 func (d *Dispatcher) ensurePatrol() {
 	if d.heartbeatTimeout <= 0 {
@@ -425,12 +439,20 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
 		return
 	}
 	meta := v.(*subAgentMeta)
+	// 展示用真实阈值：domain 按 domainHeartbeatTimeout（默认 2× 叶子），
+	// 与 scanStuck 判定口径一致——旧文案恒用叶子阈值，domain 被杀时报"超过 5m0s"与实际不符。
+	threshold := d.heartbeatTimeout
+	if roleIDFromAgentID(subAgentID) == "domain" && d.domainHeartbeatTimeout > 0 {
+		threshold = d.domainHeartbeatTimeout
+	} else if roleIDFromAgentID(subAgentID) == "domain" {
+		threshold = 2 * d.heartbeatTimeout
+	}
 	log.Printf("[subagent] HEARTBEAT KILL: sub=%s parent=%s idle>%s - cancel+notify",
-		subAgentID, meta.parentID, d.heartbeatTimeout)
+		subAgentID, meta.parentID, threshold)
 	meta.cancel()
 	meta.doneOnce.Do(func() { d.trackChildDone(meta.parentID) })
 	killMsg := failureMarker(FailureKindKilled, false) + "\n" +
-		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, d.heartbeatTimeout)
+		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, threshold)
 	d.notify(meta.parentID, subAgentID, killMsg, nil)
 	if d.treeFn != nil && meta.sessionID != "" {
 		if t := d.treeFn(meta.sessionID); t != nil {
@@ -1764,6 +1786,7 @@ func (d *Dispatcher) runEngine(ctx context.Context, sub *agent.ReActAgent, subAg
 			LLM:          d.engineLLM(ctx, roleID),
 			PlanMaxSteps: d.planMaxSteps,
 			PlanSink:     d.planSink(ctx, subAgentID),
+			PlanProgress: d.planProgress(ctx, subAgentID),
 		}).Run(ctx, task)
 	default:
 		return sub.Run(ctx, task)
@@ -1830,9 +1853,16 @@ func (d *Dispatcher) engineLLM(ctx context.Context, roleID string) agent.LLMComp
 	}
 }
 
+// planTaskID 推导 plan_execute 步骤的看板任务 ID（subAgentID 前缀防与 MetaAgent write_plan 冲突）。
+func planTaskID(subAgentID string, stepIdx int) string {
+	prefix := strings.ReplaceAll(subAgentID, "/", "_")
+	return fmt.Sprintf("%s_p%d", prefix, stepIdx)
+}
+
 // planSink 把 plan_execute 引擎的步骤计划写入会话看板（TUI 可见，TODO #29）。
 // 任务 ID 用 subAgentID 前缀防与 MetaAgent write_plan 冲突；board 不可用时静默跳过。
 // 步骤不设 domain：plan_execute 步骤由执行 Agent 内部逐步跑，不经派发依赖门。
+// SetPlan 传空 goal：不覆盖 MetaAgent write_plan 已写入的全局目标（仅新建看板时用本任务作 goal）。
 func (d *Dispatcher) planSink(ctx context.Context, subAgentID string) func(goal string, steps []agent.PlanStep) error {
 	return func(goal string, steps []agent.PlanStep) error {
 		sid := tool.SessionIDFromContext(ctx)
@@ -1843,15 +1873,45 @@ func (d *Dispatcher) planSink(ctx context.Context, subAgentID string) func(goal 
 		if b == nil {
 			return nil
 		}
-		prefix := strings.ReplaceAll(subAgentID, "/", "_")
 		tasks := make([]board.PlanTask, 0, len(steps))
 		for i, st := range steps {
 			tasks = append(tasks, board.PlanTask{
-				ID:    fmt.Sprintf("%s_p%d", prefix, i+1),
+				ID:    planTaskID(subAgentID, i+1),
 				Title: st.Title,
 			})
 		}
-		return b.SetPlan(goal, tasks)
+		return b.SetPlan("", tasks)
+	}
+}
+
+// planProgress 把 plan_execute 单步执行状态回写看板（TODO #22 面板实时化）：
+// 起步 Assign 置 in_progress，完成/失败 MarkDone/MarkFailed。此前步骤任务落板后永不迁移，
+// 执行计划面板全程 Waiting、总体进度 0%（实证：验收会话 20 项计划 3.9 小时全 Waiting）。
+// 无计划/任务不存在静默跳过（零行为变化）。
+func (d *Dispatcher) planProgress(ctx context.Context, subAgentID string) func(stepIdx int, status agent.PlanStepStatus, summary string) {
+	return func(stepIdx int, status agent.PlanStepStatus, summary string) {
+		if d.boardFn == nil {
+			return
+		}
+		sid := tool.SessionIDFromContext(ctx)
+		if sid == "" {
+			if i := strings.Index(subAgentID, "/"); i > 0 {
+				sid = subAgentID[:i]
+			}
+		}
+		b := d.boardFn(sid)
+		if b == nil {
+			return
+		}
+		taskID := planTaskID(subAgentID, stepIdx)
+		switch status {
+		case agent.PlanStepInProgress:
+			_ = b.Assign(taskID, subAgentID)
+		case agent.PlanStepDone:
+			_ = b.MarkDone(taskID, summary)
+		case agent.PlanStepFailed:
+			_ = b.MarkFailed(taskID, summary)
+		}
 	}
 }
 

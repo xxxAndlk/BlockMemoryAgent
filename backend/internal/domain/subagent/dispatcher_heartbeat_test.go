@@ -4,6 +4,8 @@ package subagent
 import (
 	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,5 +118,55 @@ func TestDispatcher_HeartbeatNoPatrolWhenDisabled(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if d.PendingChildren("meta") == 0 {
 		t.Fatal("expected PendingChildren>0 when heartbeat disabled (no patrol), got 0")
+	}
+}
+
+// TestDispatcher_PingActivityPreventsKill 验证等待用户答复期间的保活探针（PingActivity）：
+// 活动时间被持续刷新时巡检不判假死；停止 ping 后超阈值才 kill。
+// 回归场景：子 Agent 阻塞在审批/提问等用户答复，期间无 LLM/工具活动（2026-08-18
+// 三次误杀均卡在此状态），会话层周期性 PingActivity 保活。
+func TestDispatcher_PingActivityPreventsKill(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles:  []types.RoleDefinition{{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"}},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+
+	d := NewDispatcher(reg, &mockModelFactory{provider: &hangingProvider{release: make(chan struct{})}}, toolsReg, mb, agent.NopMemoryPipeline{}).
+		WithHeartbeatTimeout(150 * time.Millisecond)
+	d.ensurePatrol()
+	t.Cleanup(d.ClosePatrol)
+
+	id := "sess-1/code_assistant-1"
+	killed := make(chan struct{})
+	var cancelOnce sync.Once
+	d.activity.Store(id, new(atomic.Int64))
+	d.subMeta.Store(id, &subAgentMeta{
+		parentID:  "meta",
+		sessionID: "sess-1",
+		cancel:    func() { cancelOnce.Do(func() { close(killed) }) },
+	})
+
+	// 模拟保活：每 50ms ping 一次，持续 400ms（> 2× 阈值），期间不得被杀。
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case <-killed:
+			t.Fatal("保活期间不应被心跳 kill")
+		default:
+		}
+		d.PingActivity(id)
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// 停止保活：超阈值后巡检应 kill。
+	select {
+	case <-killed:
+		// 预期：停止 ping 后被巡检判定假死。
+	case <-time.After(3 * time.Second):
+		t.Fatal("停止保活后应被心跳 kill")
 	}
 }

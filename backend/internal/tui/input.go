@@ -82,6 +82,11 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.flashMsg("请先空格勾选选项（或直接输入文字答复）")
 				return m, nil
 			}
+			// 「其他」逃生选项：不提交，引导用户在输入框填写自由文本答案。
+			if answer == types.ClarifyOtherOptionID {
+				m.flashMsg("请在输入框输入你的答案，回车提交")
+				return m, nil
+			}
 			label := clarifyOptionLabel(pc.Options, answer)
 			if pc.MultiSelect {
 				labels := make([]string, 0, len(m.clarifySel))
@@ -267,6 +272,11 @@ func (m *Model) handleClarifyQuickKey(msg tea.KeyMsg) bool {
 			m.toggleClarifyOption(pc, opt)
 			return true
 		}
+		// 「其他」逃生选项：不提交，引导自由文本输入。
+		if opt.ID == types.ClarifyOtherOptionID {
+			m.flashMsg("请在输入框输入你的答案，回车提交")
+			return true
+		}
 		m.submitClarifyAnswer(s.ID, pc, opt.ID, opt.Label)
 		return true
 	}
@@ -309,6 +319,11 @@ func (m *Model) handleClarifyQuickKey(msg tea.KeyMsg) bool {
 		return true
 	}
 
+	// 「其他」逃生选项：不提交，引导自由文本输入。
+	if opt.ID == types.ClarifyOtherOptionID {
+		m.flashMsg("请在输入框输入你的答案，回车提交")
+		return true
+	}
 	// 单选：立即提交所选选项 ID，清空输入并退出澄清模式。
 	m.submitClarifyAnswer(s.ID, pc, opt.ID, opt.Label)
 	return true

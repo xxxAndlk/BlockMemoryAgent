@@ -363,6 +363,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入破坏性操作审批钩子（TODO #17 P1）：命中生产边界/危险命令模式时
 	// 工具调用暂停会话推「需确认」事件，用户答复经 sendMessage/answerClarify 路由回放行。
 	// approvalHook 非 nil 仅影响命中边界的调用，常规编码流零阻塞。
+	// 等待用户答复期间的心跳保活：审批/提问阻塞时周期性刷新子 Agent 活动时间，
+	// 防"等用户操作"被巡检误判假死（等多久都不杀，直到用户答复或会话取消）。
+	agentSvc.SetActivityPinger(subAgentDispatcher.PingActivity)
 	toolRegistry.SetApprovalHook(agentSvc.ApprovalHook())
 	// 外部知识库检索（TODO #27 热路径 a）：search_knowledge 工具 → retriever 混合检索。
 	// 混合检索后端 = KnowledgeStore（直接满足 HybridSearchBackend：SearchByType + SearchKeywords）。

@@ -105,6 +105,55 @@ type ReactService struct {
 	// fn(roleID, toolName) -> (owned, visible)；nil 时插件工具不额外过滤
 	//（白名单语义不变）。由 bootstrap 注入 plugins.Manager.ToolVisibility。
 	pluginVisibility ToolVisibilityFunc
+	// activityPinger 等待用户答复期间的心跳保活回调（bootstrap 注入
+	// subagent.Dispatcher.PingActivity）：审批/提问阻塞时周期性刷新子 Agent 活动时间，
+	// 防止心跳巡检把"等用户操作"误判假死 kill（实证 2026-08-18：三次误杀均卡在
+	// Remove-Item 确认框无人答复，每次白耗 ~12 分钟 + 重派）。nil 时不保活。
+	activityPinger func(agentID string)
+}
+
+// SetActivityPinger 注入等待用户答复期间的心跳保活回调；nil 关闭（测试场景）。
+func (s *ReactService) SetActivityPinger(fn func(agentID string)) {
+	s.activityPinger = fn
+}
+
+// userWaitKeepalive 是等待用户答复期间的保活器，Stop 幂等。
+type userWaitKeepalive struct{ done chan struct{} }
+
+// Stop 停止保活 goroutine（幂等）。
+func (k userWaitKeepalive) Stop() {
+	select {
+	case <-k.done:
+	default:
+		close(k.done)
+	}
+}
+
+// startUserWaitKeepalive 启动等待用户答复期间的保活 goroutine（30s 一拍）：
+// 每拍调用 activityPinger 刷新 ctx 中 Agent 的活动时间，直到 Stop 或 ctx 取消。
+// pinger 未注入或 agentID 为空时返回的保活器零工作（Stop 仍安全）。
+func (s *ReactService) startUserWaitKeepalive(ctx context.Context) userWaitKeepalive {
+	k := userWaitKeepalive{done: make(chan struct{})}
+	agentID := tool.AgentIDFromContext(ctx)
+	if s.activityPinger == nil || agentID == "" {
+		close(k.done)
+		return k
+	}
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-k.done:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.activityPinger(agentID)
+			}
+		}
+	}()
+	return k
 }
 
 // SetUserProfileStore 注入用户画像存储（TODO #28）。
@@ -867,6 +916,10 @@ func (s *ReactService) ApprovalHook() tool.ApprovalHookFunc {
 
 		s.store.addEvent(sess, eventkind.Clarify, "System", question, "", "", "", "", "", true)
 
+		// 等待用户期间保活：阻塞等答复时周期性刷新该 Agent 心跳（沿父链冒泡），
+		// 巡检不会把"等用户操作"误判假死——一直等到用户答复或会话取消为止。
+		keepalive := s.startUserWaitKeepalive(ctx)
+		defer keepalive.Stop()
 		select {
 		case <-ctx.Done():
 			s.store.mu.Lock()
@@ -1022,6 +1075,24 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 			for _, o := range opts.Options {
 				req.Options = append(req.Options, ClarifyOption{ID: o.ID, Label: o.Label, Description: o.Description})
 			}
+			// 单选 choice 自动追加「其他」逃生选项：选项不精确/方向不对时用户点选后
+			// 自由填写答案，而不是被迫二选一。多选可勾选组合，不追加。
+			if !req.MultiSelect {
+				hasOther := false
+				for _, o := range req.Options {
+					if o.ID == ClarifyOtherOptionID {
+						hasOther = true
+						break
+					}
+				}
+				if !hasOther {
+					req.Options = append(req.Options, ClarifyOption{
+						ID:          ClarifyOtherOptionID,
+						Label:       "其他（自行输入答案）",
+						Description: "以上选项不够精确或方向不对时选这项，然后在输入框填写你的答案",
+					})
+				}
+			}
 		} else {
 			req.Kind = "text"
 		}
@@ -1031,6 +1102,9 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 
 		s.store.addEvent(sess, eventkind.Clarify, "System", "Agent 提问: "+question, "", "", "", "", "", true)
 
+		// 等待用户期间保活：同 ApprovalHook，等答复不被心跳巡检误判假死。
+		keepalive := s.startUserWaitKeepalive(ctx)
+		defer keepalive.Stop()
 		select {
 		case <-ctx.Done():
 			s.store.mu.Lock()

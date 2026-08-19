@@ -289,3 +289,55 @@ func TestAskUserHook_OptionsPassthrough(t *testing.T) {
 		t.Fatalf("final answer should reflect chosen option, got: %s", sess.Result)
 	}
 }
+
+// TestAskUserHook_OtherOptionAppended 验证单选 choice 自动追加「其他」逃生选项：
+// 选项不精确/方向不对时用户可点选后自由填写答案（点选不提交，由前端引导输入）。
+// 模型已自带 other 时不重复追加。
+func TestAskUserHook_OtherOptionAppended(t *testing.T) {
+	llm := &askCaptureProvider{responses: []*blades.Message{
+		{
+			Role: blades.RoleAssistant,
+			Parts: []blades.Part{
+				blades.ToolPart{Name: "ask_user", Request: string(mustJSON(map[string]any{
+					"question": "实现方向？",
+					"options": []map[string]any{
+						{"id": "a", "label": "方案A"},
+						{"id": "b", "label": "方案B"},
+					},
+				}))},
+			},
+		},
+	}}
+	svc := newAskUserTestService(t, llm)
+	ctx := context.Background()
+
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "做个功能"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var sess *Session
+	for time.Now().Before(deadline) {
+		sess, _ = svc.Get(ctx, created.ID)
+		if sess != nil && sess.PendingClarify != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sess == nil || sess.PendingClarify == nil {
+		t.Fatal("expected ask_user pending within timeout")
+	}
+	pc := sess.PendingClarify
+	if pc.Kind != "choice" || pc.MultiSelect {
+		t.Fatalf("应为单选 choice, got kind=%q multi=%v", pc.Kind, pc.MultiSelect)
+	}
+	if len(pc.Options) != 3 {
+		t.Fatalf("单选应追加「其他」选项（共 3 项）, got %+v", pc.Options)
+	}
+	last := pc.Options[2]
+	if last.ID != ClarifyOtherOptionID || !strings.Contains(last.Label, "其他") {
+		t.Fatalf("末项应为「其他」逃生选项, got %+v", last)
+	}
+	// 中止会话，避免后台 goroutine 泄漏影响其他用例。
+	_ = svc.Control(ctx, created.ID, ControlCommand{Op: ControlOpCancel})
+}

@@ -248,3 +248,35 @@ func TestSyncInputModeClarifyReset(t *testing.T) {
 			m.clarifyID, m.clarifyCursor, m.clarifySel, m.inputBar.mode)
 	}
 }
+
+// TestClarifyOtherOption 验证「其他」逃生选项（TODO #53 补）：
+// 单选下选中 other（空格/回车）不提交、不退出澄清模式，flash 引导自由文本输入。
+func TestClarifyOtherOption(t *testing.T) {
+	pc := &types.ClarifyRequest{ID: "ask-other", Options: []types.ClarifyOption{
+		{ID: "a", Label: "方案A"}, {ID: types.ClarifyOtherOptionID, Label: "其他（自行输入答案）"},
+	}}
+	m := clarifyTestModel(pc)
+	m.syncInputMode()
+	m.clarifyCursor = 1 // 高亮「其他」
+
+	// 空格选中 other：消费按键但不提交、不退出澄清模式。
+	space := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}}
+	if !m.handleClarifyQuickKey(space) {
+		t.Fatal("空格选中 other 应消费按键")
+	}
+	if m.inputBar.mode != inputClarify {
+		t.Fatalf("选中 other 不应退出澄清模式, got mode=%d", m.inputBar.mode)
+	}
+	if flash := m.ensureShared().getFlash(); !strings.Contains(flash, "输入你的答案") {
+		t.Fatalf("应有自由文本引导提示, got %q", flash)
+	}
+
+	// 回车选中 other：同样不提交、不退出。
+	if _, cmd := m.handleInputKey(tea.KeyMsg{Type: tea.KeyEnter}); cmd != nil {
+		// Enter 不应触发任何后台命令（不提交）。
+		_ = cmd
+	}
+	if m.inputBar.mode != inputClarify {
+		t.Fatalf("回车选中 other 不应退出澄清模式, got mode=%d", m.inputBar.mode)
+	}
+}

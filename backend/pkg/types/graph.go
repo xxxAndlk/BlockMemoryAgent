@@ -38,6 +38,11 @@ type ChatMessage struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// ClarifyOtherOptionID 是「其他」选项的固定 ID（TODO #53 补）：非 yes/no 确认的
+// choice 类提问由会话层自动追加该选项；用户点选后前端引导自由文本输入答案
+// （选项不精确或方向错误时的逃生通道），不产生提交。
+const ClarifyOtherOptionID = "other"
+
 // ClarifyOption 是澄清请求的一个结构化选项（TODO #53）。
 // 用户可点选选项答复（单选/多选），也可忽略选项自由文本答复。
 type ClarifyOption struct {

@@ -92,6 +92,12 @@ type ActiveBlock struct {
 
 // ClarifyOption 是澄清请求的一个结构化选项（TODO #53）。
 // 用户可点选选项答复（单选/多选），也可忽略选项自由文本答复。
+// ClarifyOtherOptionID 是「其他」选项的固定 ID（TODO #53 补）：非 yes/no 确认的
+// choice 类提问由会话层自动追加该选项；用户点选后前端引导自由文本输入答案
+// （选项不精确或方向错误时的逃生通道），点选本身不产生提交。
+// 取值与 pkg/types.ClarifyOtherOptionID 保持一致（agent 包不依赖 types 包，故重复定义）。
+const ClarifyOtherOptionID = "other"
+
 type ClarifyOption struct {
 	ID          string // ID 选项唯一标识（确认场景固定 confirm/reject）
 	Label       string // Label 选项展示文本

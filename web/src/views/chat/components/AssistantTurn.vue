@@ -92,6 +92,12 @@ watch(() => props.clarify?.questionId, () => {
 
 async function submitOption(optionId?: string) {
   if (submitting.value) return
+  // 「其他」逃生选项：不提交，引导用户在下方输入框自由填写答案
+  // （awaiting_clarify 状态下输入框内容会作为澄清答复发送到 /clarify）。
+  if (optionId === 'other') {
+    ElMessage.info('请在下方输入框输入你的答案，回车/发送提交')
+    return
+  }
   let answer = ''
   if (optionId) {
     answer = optionId // 单选：直接提交选项 ID

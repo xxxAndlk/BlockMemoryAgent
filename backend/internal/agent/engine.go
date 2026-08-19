@@ -47,6 +47,18 @@ type PlanStep struct {
 	Instruction string `json:"instruction"` // 自包含执行指令
 }
 
+// PlanStepStatus 是 plan_execute 单步的执行状态（PlanProgress 回调用）。
+type PlanStepStatus string
+
+const (
+	// PlanStepInProgress 步骤开始执行。
+	PlanStepInProgress PlanStepStatus = "in_progress"
+	// PlanStepDone 步骤成功完成。
+	PlanStepDone PlanStepStatus = "done"
+	// PlanStepFailed 步骤执行出错或触限收口。
+	PlanStepFailed PlanStepStatus = "failed"
+)
+
 // EngineOptions 是包装引擎的运行时参数。
 type EngineOptions struct {
 	// LLM 辅助补全（reflection 自检 / plan_execute 规划）；nil 时降级纯 ReAct。
@@ -57,6 +69,9 @@ type EngineOptions struct {
 	PlanMaxSteps int
 	// PlanSink 把执行计划写入看板（TUI 可见）；nil 时跳过（零行为变化）。
 	PlanSink func(goal string, steps []PlanStep) error
+	// PlanProgress 回传单步执行状态（看板任务状态迁移，TUI 计划面板实时化）；
+	// stepIdx 为 1 起步步骤序号，与 PlanSink 落板顺序一致。nil 时跳过（零行为变化）。
+	PlanProgress func(stepIdx int, status PlanStepStatus, summary string)
 }
 
 // ---- ReflectEngine ----
@@ -263,6 +278,7 @@ type PlanExecuteEngine struct {
 	llm      LLMComplete
 	maxSteps int
 	planSink func(goal string, steps []PlanStep) error
+	progress func(stepIdx int, status PlanStepStatus, summary string)
 }
 
 // NewPlanExecuteEngine 构造 PlanExecuteEngine；maxSteps <=0 按默认 8。
@@ -271,7 +287,14 @@ func NewPlanExecuteEngine(a *ReActAgent, opts EngineOptions) *PlanExecuteEngine 
 	if maxSteps <= 0 {
 		maxSteps = 8
 	}
-	return &PlanExecuteEngine{agent: a, llm: opts.LLM, maxSteps: maxSteps, planSink: opts.PlanSink}
+	return &PlanExecuteEngine{agent: a, llm: opts.LLM, maxSteps: maxSteps, planSink: opts.PlanSink, progress: opts.PlanProgress}
+}
+
+// reportStep 回传单步状态（看板迁移）；progress 未注入时静默跳过。
+func (e *PlanExecuteEngine) reportStep(stepIdx int, status PlanStepStatus, summary string) {
+	if e.progress != nil {
+		e.progress(stepIdx, status, summary)
+	}
 }
 
 // Run 规划并逐步执行任务。
@@ -286,19 +309,34 @@ func (e *PlanExecuteEngine) Run(ctx context.Context, input string) (ReactResult,
 	var history []ReactMessage
 	for i, st := range steps {
 		if i >= e.maxSteps {
+			// 超步数上限截断：未执行步骤落 failed，避免计划面板残留 Waiting。
+			e.failRemaining(steps, i, "超最大执行步数未执行")
 			break
 		}
+		e.reportStep(i+1, PlanStepInProgress, "")
 		result, err := e.agent.RunWithHistory(ctx, planStepMessage(st, i+1, len(steps)), history)
 		if err != nil {
+			e.reportStep(i+1, PlanStepFailed, err.Error())
+			e.failRemaining(steps, i+1, "前序步骤失败未执行")
 			return result, err
 		}
 		if result.LimitReached {
+			e.reportStep(i+1, PlanStepFailed, "上下文 token 上限收口")
+			e.failRemaining(steps, i+1, "前序步骤触限收口未执行")
 			return result, nil
 		}
+		e.reportStep(i+1, PlanStepDone, st.Title)
 		history = result.History
 	}
 	// 收口终答：各步骤产出已在 history 中，要求模型汇总输出最终交付答复。
 	return e.agent.RunWithHistory(ctx, planExecuteFinalizeMessage, history)
+}
+
+// failRemaining 把从 from（0 起步索引）起的未执行步骤统一落 failed。
+func (e *PlanExecuteEngine) failRemaining(steps []PlanStep, from int, reason string) {
+	for j := from; j < len(steps); j++ {
+		e.reportStep(j+1, PlanStepFailed, reason)
+	}
 }
 
 // plan 用辅助 LLM 把任务拆解为步骤计划。返回 ok=false 表示应降级纯 ReAct。
