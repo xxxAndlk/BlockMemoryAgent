@@ -459,3 +459,87 @@ func TestTree_EndCurrentTopicEmpty(t *testing.T) {
 		t.Errorf("expected empty snapshot, got %d", len(snapshot))
 	}
 }
+
+// TestTreeIdleLifecycle 验证 Idle 状态机：Running→Idle（绑销毁句柄）→Wake 回 Running；
+// Idle 可 Cancel（销毁热驻）、可 Finish（TTL 到期）；非 Running 不可 Idle；非 Idle 不可 Wake。
+func TestTreeIdleLifecycle(t *testing.T) {
+	tr := NewTree("sess-1", nil)
+	destroyCalled := false
+	killFn := func() { destroyCalled = true }
+	tr.Register(Node{ID: "d1", Role: "domain"})
+
+	// Idle 仅 Running 可转。
+	if !tr.Idle("d1", "task done", killFn) {
+		t.Fatal("Idle returned false for running node")
+	}
+	node, _ := tr.Get("d1")
+	if node.Status != StatusIdle {
+		t.Fatalf("Status = %s, want idle", node.Status)
+	}
+	if node.Summary != "task done" {
+		t.Errorf("Summary = %q, want 'task done'", node.Summary)
+	}
+	// 重复 Idle no-op。
+	if tr.Idle("d1", "again", killFn) {
+		t.Error("Idle should be no-op for already idle node")
+	}
+
+	// Wake 回 Running，绑新 cancel（Wake 只绑不触发，Cancel 时验证可调）。
+	wakeCancel := false
+	if !tr.Wake("d1", func() { wakeCancel = true }) {
+		t.Fatal("Wake returned false for idle node")
+	}
+	tr.SetCancel("d1", func() { wakeCancel = true })
+	tr.Cancel("d1")
+	if !wakeCancel {
+		t.Error("wake cancel func not invocable")
+	}
+	// Cancel 已置 Cancelled，恢复 Running 供后续断言。
+	node, _ = tr.Get("d1")
+	if node.Status != StatusCancelled {
+		t.Fatalf("Status = %s, want cancelled", node.Status)
+	}
+	// 重新注册回 Running→Idle 验证后续分支。
+	tr.Register(Node{ID: "d1", Role: "domain"})
+	// 非 Idle 不可 Wake。
+	if tr.Wake("d1", nil) {
+		t.Error("Wake should be no-op for non-idle node")
+	}
+
+	// Idle 后 Cancel 触发销毁句柄。
+	tr.Idle("d1", "done again", killFn)
+	if !tr.Cancel("d1") {
+		t.Fatal("Cancel returned false for idle node")
+	}
+	if !destroyCalled {
+		t.Error("destroy (kill) func not invoked on Cancel of idle node")
+	}
+	node, _ = tr.Get("d1")
+	if node.Status != StatusCancelled {
+		t.Errorf("Status = %s, want cancelled", node.Status)
+	}
+}
+
+// TestTreeFinishFromIdle 验证 Idle 节点可 Finish（TTL 到期销毁路径 → Done）。
+func TestTreeFinishFromIdle(t *testing.T) {
+	tr := NewTree("sess-1", nil)
+	tr.Register(Node{ID: "d1", Role: "domain"})
+	tr.Idle("d1", "task done", nil)
+	tr.Finish("d1", "idle expired", nil)
+	node, _ := tr.Get("d1")
+	if node.Status != StatusDone {
+		t.Errorf("Status = %s, want done (idle→done via Finish)", node.Status)
+	}
+}
+
+// TestTreeEndCurrentTopicCoversIdle 验证话题切换终结 Idle 节点（热驻槽销毁）。
+func TestTreeEndCurrentTopicCoversIdle(t *testing.T) {
+	tr := NewTree("sess-1", nil)
+	killCalled := false
+	tr.Register(Node{ID: "d1", Role: "domain"})
+	tr.Idle("d1", "done", func() { killCalled = true })
+	tr.EndCurrentTopic()
+	if !killCalled {
+		t.Error("idle node kill func not invoked on EndCurrentTopic")
+	}
+}

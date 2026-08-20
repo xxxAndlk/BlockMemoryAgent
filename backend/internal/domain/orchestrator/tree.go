@@ -39,6 +39,11 @@ const (
 	// 仅 Running 节点可 Pause;resume 完成后 Finish 转 Done。
 	// 与 Failed/Cancelled 区分:Paused 保留可恢复语义,history 持久化在 agent_messages。
 	StatusPaused
+	// StatusIdle 标记 DomainAgent 任务完结转入热驻留(可复用)态。
+	// 仅 Running 节点可 Idle;复用派发时 Wake 置回 Running。
+	// 与 Paused 区分:Paused=任务中断待续(等"继续"),Idle=任务完结待复用。
+	// Idle 非终态:可 Cancel(硬取消/话题切换)、可 Finish(TTL 到期销毁)、可 Wake(复用)。
+	StatusIdle
 )
 
 // String 返回状态的可读名称，用于日志与 JSON 序列化。
@@ -54,6 +59,8 @@ func (s Status) String() string {
 		return "cancelled"
 	case StatusPaused:
 		return "paused"
+	case StatusIdle:
+		return "idle"
 	}
 	return "unknown"
 }
@@ -160,7 +167,8 @@ func (t *Tree) Finish(id, summary string, err error) {
 		t.mu.Unlock()
 		return
 	}
-	// Paused 节点允许 Finish(resume 完成路径),不视为 terminal。
+	// Paused 节点允许 Finish(resume 完成路径);Idle 节点允许 Finish(TTL 到期销毁路径)。
+	// 两者均不视为 terminal。
 	node.Finished = time.Now()
 	node.Summary = summary
 	if err != nil {
@@ -217,6 +225,52 @@ func (t *Tree) Resume(id string, cancel context.CancelFunc) bool {
 	return true
 }
 
+// Idle 标记 DomainAgent 任务完结转入热驻留态。仅 Running 节点可 Idle;
+// 已 terminal 或 Paused/Idle 的节点 no-op。
+// cancel 参数绑定销毁句柄(硬取消/话题切换/TTL 到期统一走 Tree.Cancel 或
+// 直接调用),保持 Idle 节点仍是树公民可被外部取消。
+// 持久化:best-effort SaveNode。summary 记任务结果摘要。
+func (t *Tree) Idle(id, summary string, cancel context.CancelFunc) bool {
+	t.mu.Lock()
+	node, ok := t.nodes[id]
+	if !ok || node.Status != StatusRunning {
+		t.mu.Unlock()
+		return false
+	}
+	node.Status = StatusIdle
+	node.Summary = summary
+	node.Finished = time.Now()
+	if cancel != nil {
+		t.cancels[id] = cancel
+	}
+	snapshot := *node
+	t.mu.Unlock()
+	t.persistNode(snapshot)
+	return true
+}
+
+// Wake 把 Idle 节点置回 Running 并绑定新 cancel func（复用派发后调用）。
+// 仅 Idle 节点可 Wake；非 Idle no-op，返回 false。清空 Finished/Summary 恢复运行态。
+// 持久化：best-effort SaveNode。
+func (t *Tree) Wake(id string, cancel context.CancelFunc) bool {
+	t.mu.Lock()
+	node, ok := t.nodes[id]
+	if !ok || node.Status != StatusIdle {
+		t.mu.Unlock()
+		return false
+	}
+	node.Status = StatusRunning
+	node.Finished = time.Time{}
+	node.Summary = ""
+	if cancel != nil {
+		t.cancels[id] = cancel
+	}
+	snapshot := *node
+	t.mu.Unlock()
+	t.persistNode(snapshot)
+	return true
+}
+
 // Cancel 调用已绑定的 cancel func 并将状态置为 StatusCancelled。
 // 返回是否找到对应节点且处于可取消状态（Running）。
 // context.CancelFunc 幂等（Go doc），与 goroutine defer cancel 重复调用安全。
@@ -229,9 +283,9 @@ func (t *Tree) Cancel(id string) bool {
 		t.mu.Unlock()
 		return false
 	}
-	// Running 与 Paused 均可 Cancel(Running 取消执行;Paused 丢弃暂停态)。
+	// Running/Paused/Idle 均可 Cancel(Running 取消执行;Paused 丢弃暂停态;Idle 销毁热驻实例)。
 	// 已 terminal(Done/Failed/Cancelled)no-op。
-	if node.Status != StatusRunning && node.Status != StatusPaused {
+	if node.Status != StatusRunning && node.Status != StatusPaused && node.Status != StatusIdle {
 		t.mu.Unlock()
 		return false
 	}
@@ -285,6 +339,16 @@ func (t *Tree) LoadFromStore(ctx context.Context) error {
 	defer t.mu.Unlock()
 	for i := range nodes {
 		n := nodes[i]
+		// 重启恢复时 Idle 节点不可恢复(热驻 goroutine 已随进程消亡),降级为 Done。
+		if n.Status == StatusIdle {
+			n.Status = StatusDone
+			if n.Summary != "" {
+				n.Summary += "; 进程重启,热驻 Agent 已释放"
+			} else {
+				n.Summary = "进程重启,热驻 Agent 已释放"
+			}
+			n.Finished = time.Now()
+		}
 		// 已存在的内存节点优先(Race 场景:本会话已 Register 过的不覆盖)。
 		if _, exists := t.nodes[n.ID]; !exists {
 			t.nodes[n.ID] = &n
@@ -304,7 +368,7 @@ func (t *Tree) LoadFromStore(ctx context.Context) error {
 func (t *Tree) EndCurrentTopic() []Node {
 	t.mu.Lock()
 	for id, node := range t.nodes {
-		if node.Status == StatusRunning || node.Status == StatusPaused {
+		if node.Status == StatusRunning || node.Status == StatusPaused || node.Status == StatusIdle {
 			node.Status = StatusCancelled
 			node.Finished = time.Now()
 			if cancel, ok := t.cancels[id]; ok && cancel != nil {

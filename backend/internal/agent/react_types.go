@@ -250,6 +250,48 @@ type SoftStopMarker interface {
 	ClearSoftStop(sessionID string)
 }
 
+// SuspendGate 抽象"会话级挂起检查点"能力，由 subagent.Dispatcher 侧实现。
+// ReActAgent 在主循环顶部与 waitForChildren 内调用 Park：会话挂起期间阻塞
+// （goroutine 真挂起，内存态保留），恢复返回 nil 继续；销毁/取消返回非 nil error。
+// nil gate = 完全零变化（热驻关闭时所有存量路径不注入）。
+type SuspendGate interface {
+	// Park 在 Agent 处于挂起态时阻塞；恢复返回 nil，销毁/取消返回非 nil error。
+	Park(ctx context.Context) error
+}
+
+// IdleDomainInfo 描述一个热驻 Idle DomainAgent 的可复用信息，
+// 供 MetaAgent 上下文注入（复用判定）。由 subagent.Dispatcher 的 IdleRoster 填充。
+type IdleDomainInfo struct {
+	AgentID     string        `json:"agent_id"`     // AgentID 热驻 domain 的树节点 ID（reuse_agent_id 参数值）
+	Domain      string        `json:"domain"`       // Domain 领域标签
+	LastTask    string        `json:"last_task"`    // LastTask 最近一次任务摘要（截断）
+	LastSummary string        `json:"last_summary"` // LastSummary 最近一次结果摘要（截断）
+	ReuseCount  int           `json:"reuse_count"`  // ReuseCount 已被复用次数（权重）
+	IdleLeft    time.Duration `json:"idle_left"`    // IdleLeft 加权倒计时剩余（未武装为 0）
+	Busy        bool          `json:"busy"`         // Busy 正在执行任务（派发将入队）
+}
+
+// IdleRosterProvider 抽象"查询某 session 的热驻 Idle DomainAgent 清单"，
+// 由 subagent.Dispatcher 实现。ReactService 组装 MetaAgent 记忆管线时轮询注入
+// 【空闲领域Agent】上下文段，MetaAgent 据此自主判定强相关复用 vs 弱相关新建。
+type IdleRosterProvider interface {
+	IdleRoster(sessionID string) []IdleDomainInfo
+}
+
+// IdleTTLArmer 由 subagent.Dispatcher 实现：用户下一条消息到达时武装全部
+// Idle domain 的加权销毁倒计时（完成后一直热存，TTL 只在新用户消息后才启动）。
+type IdleTTLArmer interface {
+	ArmIdleTTLs(sessionID string)
+}
+
+// SessionAgentWaker 由 subagent.Dispatcher 实现（Domain 热驻）：唤醒会话全部挂起
+// Agent（触限暂停波及全树后的恢复入口）。ReactService.sendMessage 在非 Running 态
+// 恢复时调用：wake 广播 + Paused 树节点置回 Running + 恢复冻结的 idle TTL。
+// 为 nil 时走旧路径（逐个 resumePausedDomain）。
+type SessionAgentWaker interface {
+	ResumeSessionAgents(sessionID string)
+}
+
 // ModelProvider 是 ReActAgent 所需的 blades.ModelProvider 的最小子集。
 // 保留一个窄接口，使测试只需模拟 Generate 方法即可。
 type ModelProvider interface {

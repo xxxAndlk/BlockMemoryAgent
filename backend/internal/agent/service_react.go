@@ -5,6 +5,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -54,6 +55,23 @@ type ReactService struct {
 	// PausedOnChild 态时调用其 ResumePaused 从 agent_messages 加载历史续跑。
 	// 为 nil 时 PausedOnChild 会话回退到普通 resumeSession（不恢复暂停的 domain）。
 	resumeDispatcher PausedDomainResumer
+
+	// idleRosterProvider 可选的热驻空闲领域清单提供者（Domain 热驻），
+	// 由 bootstrap 注入 subagent.Dispatcher 实现。runSession/resumeSession 构造
+	// MetaAgent 时把 IdleRoster 包装进记忆管线注入【空闲领域Agent】段。
+	// 为 nil 时零注入。
+	idleRosterProvider IdleRosterProvider
+	// idleTTLArmer 可选的 Idle TTL 武装器（Domain 热驻），sendMessage 在新用户
+	// 消息到达时调用 ArmIdleTTLs（完成后一直热存，TTL 只在用户消息后启动）。
+	// 为 nil 时零行为。
+	idleTTLArmer IdleTTLArmer
+	// sessionAgentWaker 可选的会话挂起唤醒器（Domain 热驻），sendMessage 在非
+	// Running 态恢复时调用 ResumeSessionAgents 唤醒全部挂起 Agent（含全树叶子）。
+	// 为 nil 时走旧路径（逐个 resumePausedDomain）。
+	sessionAgentWaker SessionAgentWaker
+	// hotResident Domain 热驻模式标记（bootstrap 按 config 注入）：Stop 语义变化
+	// （叶子杀+domain 转 Idle+取消 MetaAgent 调用+停用 session 级销毁倒计时）。
+	hotResident bool
 
 	// testProvider 是包内部测试使用的钩子，
 	// 允许单元测试注入 mock 的 ModelProvider，从而无需真实 API 密钥即可运行 ReAct 循环。
@@ -420,6 +438,32 @@ func (s *ReactService) SetPausedDomainResumer(r PausedDomainResumer) {
 	s.resumeDispatcher = r
 }
 
+// SetIdleRosterProvider 注入热驻空闲领域清单提供者（Domain 热驻），
+// MetaAgent 每轮注入【空闲领域Agent】段供复用判定。由 bootstrap 注入 subagent.Dispatcher。
+func (s *ReactService) SetIdleRosterProvider(p IdleRosterProvider) {
+	s.idleRosterProvider = p
+}
+
+// SetIdleTTLArmer 注入 Idle TTL 武装器（Domain 热驻），新用户消息到达时武装
+// 全部 idle domain 的加权销毁倒计时。由 bootstrap 注入 subagent.Dispatcher。
+func (s *ReactService) SetIdleTTLArmer(a IdleTTLArmer) {
+	s.idleTTLArmer = a
+}
+
+// SetSessionAgentWaker 注入会话挂起唤醒器（Domain 热驻），sendMessage 恢复路径
+// 唤醒全部挂起 Agent（触限暂停波及全树的恢复入口）。由 bootstrap 注入 subagent.Dispatcher。
+func (s *ReactService) SetSessionAgentWaker(w SessionAgentWaker) {
+	s.sessionAgentWaker = w
+}
+
+// rosterFn 构造清单查询闭包；provider 未注入返回 nil（零注入）。
+func (s *ReactService) rosterFn(sessionID string) func() []IdleDomainInfo {
+	if s.idleRosterProvider == nil {
+		return nil
+	}
+	return func() []IdleDomainInfo { return s.idleRosterProvider.IdleRoster(sessionID) }
+}
+
 // ForwardLiveEvent 是子 Agent 实时事件转发入口：Dispatcher 派发子 Agent 时注入的
 // WithLiveEvents 回调按 sessionID 路由到这里，使子 Agent token 用量/流式增量/工具事件
 // 也走会话级 handleLiveEvent，让 TUI/Web 看到所有 Agent 的累计 token。
@@ -636,16 +680,16 @@ func (s *ReactService) startWallClock(session *reactInternalSession, wall time.D
 	}()
 }
 
-// cascadeCancelTree 遍历会话权威树，取消所有 Running/Paused 节点（TODO #25-2/25-4）。
+// cascadeCancelTree 遍历会话权威树，取消所有 Running/Paused/Idle 节点（TODO #25-2/25-4）。
 // 供会话取消与全局墙钟到期时级联终止在跑子 Agent（detach ctx 的 pause/resume 好处保留，
-// 仅"会话终止"这一刻级联）。
+// 仅"会话终止"这一刻级联）。Idle（热驻）节点绑定的销毁句柄一并触发——硬取消杀热驻实例。
 func (s *ReactService) cascadeCancelTree(sessionID string) {
 	t := s.TreeFor(sessionID)
 	if t == nil {
 		return
 	}
 	for _, n := range t.Snapshot() {
-		if n.Status == orchestrator.StatusRunning || n.Status == orchestrator.StatusPaused {
+		if n.Status == orchestrator.StatusRunning || n.Status == orchestrator.StatusPaused || n.Status == orchestrator.StatusIdle {
 			t.Cancel(n.ID)
 		}
 	}
@@ -1198,8 +1242,12 @@ func (s *ReactService) CancelAgent(ctx context.Context, sessionID, instID string
 	return nil
 }
 
-// Shutdown 取消所有正在运行的会话。
+// Shutdown 取消所有正在运行的会话。Domain 热驻模式下同时销毁全部热驻槽
+// （agent_messages 保留，进程重启后 idle 树节点标 done）。
 func (s *ReactService) Shutdown(ctx context.Context) error {
+	if w, ok := s.sessionAgentWaker.(interface{ DestroyAllIdle() }); ok {
+		w.DestroyAllIdle()
+	}
 	s.store.shutdown()
 	return nil
 }
@@ -1549,7 +1597,9 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
 	// 任务看板注入（TODO #35 Phase 0）：每轮上下文末尾追加【任务看板】段——编排状态
 	// 机器可读且压缩不可达，"重新执行"类短指令的消歧锚点。仅 meta 注入，子 Agent 不注入。
+	// 热驻空闲领域清单注入（Domain 热驻）：供 MetaAgent 自主判定强相关复用 vs 弱相关新建。
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
+	metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, "meta", s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
@@ -1576,6 +1626,12 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 运行 ReAct 主循环，传入会话目标。
 	result, err := agent.Run(runCtx, goal)
 	if err != nil {
+		// 热驻模式软停止分流：用户 Stop 取消了 session ctx（打断流式 LLM），
+		// domain 已转 Idle 热驻——落可续跑暂停态而非 error，partial history 保留。
+		if s.isSoftStopCancel(session, err) {
+			s.pauseSession(session, result.History, PauseUserStop)
+			return
+		}
 		// 运行出错时标记会话错误并退出。
 		s.setSessionError(session, err.Error())
 		return
@@ -1642,7 +1698,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// MetaAgent 暴露 call_sub_agent + 只读/信息类工具（ReadFile/ListDir/SearchInFiles/HTTPGet），
 	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
 	// 任务看板注入（TODO #35 Phase 0）：同 runSession，每轮末尾追加【任务看板】段。
+	// 热驻空闲领域清单注入（Domain 热驻）：供复用判定。
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
+	metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, "meta", s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
@@ -1681,6 +1739,11 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 调用带历史的 ReAct 运行接口。
 	result, err := agent.RunWithHistory(runCtx, input, history)
 	if err != nil {
+		// 热驻模式软停止分流（同 runSession）。
+		if s.isSoftStopCancel(session, err) {
+			s.pauseSession(session, result.History, PauseUserStop)
+			return
+		}
 		s.setSessionError(session, err.Error())
 		return
 	}
@@ -1825,6 +1888,9 @@ const (
 	PauseTokenBudget
 	// PauseOnChild 子 DomainAgent 触达 token 上限暂停，MetaAgent 检测后主动暂停会话。
 	PauseOnChild
+	// PauseUserStop 用户软停止（Domain 热驻模式）：MetaAgent API 调用被取消，
+	// partial history 保留，领域 Agent 已转 Idle 热驻；发消息可续跑（复用 idle 域）。
+	PauseUserStop
 )
 
 // pauseMessage 按 PauseKind 返回面向用户的暂停提示文案。
@@ -1834,6 +1900,8 @@ func (s *ReactService) pauseMessage(kind PauseKind) string {
 		return "子领域 Agent 触达 token 上限已暂停（完整历史已持久化，可恢复）。发送任意消息（如\"继续\"）将优先恢复暂停的领域 Agent 继续执行。"
 	case PauseTokenBudget:
 		return "已达 token 预算上限，会话已暂停。发送任意消息（如\"继续\"）将从当前进度继续执行。"
+	case PauseUserStop:
+		return "任务已停止（领域 Agent 已热驻保留）。发送消息可继续任务或派发新任务（空闲领域 Agent 可复用）。"
 	default:
 		// PauseIterationLimit：maxIter<=0（不限制）时不显示具体轮数，避免 "0 轮" 误报。
 		maxIter := s.runtimeCfg.LoopConfig().MaxIterations
@@ -1842,6 +1910,26 @@ func (s *ReactService) pauseMessage(kind PauseKind) string {
 		}
 		return fmt.Sprintf("已达最大轮数上限（%d 轮），会话已暂停。发送任意消息（如\"继续\"）将从当前进度继续执行。", maxIter)
 	}
+}
+
+// isSoftStopCancel 判定 MetaAgent 的 ctx 取消错误是否来自用户软停止（Domain 热驻）。
+// 判据：热驻模式 + 软停止标记命中 + 错误链含 context.Canceled。硬取消（cancel 路径）
+// 先置 Error 终态再 cancel，会话已非 Running，此处为 false——setSessionError 的首错
+// 胜出保护兜底，不会覆盖"cancelled by user"。
+func (s *ReactService) isSoftStopCancel(session *reactInternalSession, err error) bool {
+	if !s.hotResident || s.stopMarker == nil {
+		return false
+	}
+	if !errors.Is(err, context.Canceled) {
+		return false
+	}
+	type softStopQuerier interface {
+		IsSoftStop(sessionID string) bool
+	}
+	if q, ok := s.stopMarker.(softStopQuerier); ok {
+		return q.IsSoftStop(session.ID)
+	}
+	return false
 }
 
 // pauseSession 按暂停原因将会话置为对应暂停态而非错误：
@@ -1854,6 +1942,9 @@ func (s *ReactService) pauseSession(session *reactInternalSession, history []Rea
 	case PauseOnChild:
 		session.Status = enums.SessionStatusPausedOnChild
 		session.Result = "子领域 Agent 触达 token 上限暂停，发\"继续\"恢复该领域"
+	case PauseUserStop:
+		session.Status = enums.SessionStatusAwaitingClarify
+		session.Result = "任务已停止，领域 Agent 热驻保留，发送消息续跑"
 	default:
 		session.Status = enums.SessionStatusAwaitingClarify
 		session.Result = "已达上限，会话暂停，等待用户消息续跑"
@@ -1979,6 +2070,12 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		r.ResetDispatchCounts(sessionID)
 	}
 
+	// 热驻 Idle TTL 武装（Domain 热驻）：完成后一直热存，用户下一条消息到达才启动
+	// 加权销毁倒计时（未武装的 idle 槽不受影响；已武装的保持——复用路径会重置满额）。
+	if s.idleTTLArmer != nil {
+		s.idleTTLArmer.ArmIdleTTLs(sessionID)
+	}
+
 	// 记录会话原先状态：Running 在跑；非 Running 需恢复（paused_on_child 优先恢复暂停的 domain）。
 	priorStatus := session.Status
 	wasRunning := priorStatus == enums.SessionStatusRunning
@@ -2002,10 +2099,18 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 	if !wasRunning {
 		// 续跑触发：清除软停止状态（停倒计时定时器 + 清标记），幂等（TODO #37）。
 		s.cancelSoftStopState(sessionID)
+		// 热驻模式（Domain 热驻）：唤醒全部挂起 Agent——wake 广播（叶子+domain 的
+		// SuspendGate 解除阻塞）+ Paused 域置回 Running（supervisor 收 opResume 续跑
+		// 当前任务）+ 恢复冻结的 idle TTL。旧路径（resumePausedDomain 逐个恢复）仅作
+		// 跨重启兜底（内存槽丢失时）。
+		if s.sessionAgentWaker != nil {
+			s.sessionAgentWaker.ResumeSessionAgents(sessionID)
+		}
 		// PausedOnChild: 优先恢复 earliest paused domain（任意消息，含"继续"与新任务，D1）。
 		// 各 Agent 独立上下文：domain 从 agent_messages 加载 history 续跑，fresh budget。
+		// 热驻模式下域已被唤醒（ResumeSessionAgents），此处仅在唤醒器未接线或槽丢失时兜底。
 		// 无 paused domain 或未注入恢复器时回退普通 resumeSession（MetaAgent 续跑）。
-		if priorStatus == enums.SessionStatusPausedOnChild && s.resumeDispatcher != nil {
+		if priorStatus == enums.SessionStatusPausedOnChild && s.resumeDispatcher != nil && s.sessionAgentWaker == nil {
 			if pausedID := s.findEarliestPausedDomain(session.ID); pausedID != "" {
 				go s.resumePausedDomain(session, pausedID)
 				return nil
@@ -2246,6 +2351,13 @@ func (s *ReactService) SetStopCountdown(d time.Duration) {
 	s.stopCountdown = d
 }
 
+// SetHotResident 标记 Domain 热驻模式开启（bootstrap 按 config 注入）。
+// 开启后 Stop 语义变化：杀叶子 + domain 转 Idle 热驻 + 取消 MetaAgent API 调用 +
+// 会话落可续跑暂停态；session 级 300s 销毁倒计时停用（idle 域由自身加权 TTL 治理）。
+func (s *ReactService) SetHotResident(enabled bool) {
+	s.hotResident = enabled
+}
+
 // Stop 软停止会话（TODO #37）：停止当前会话全部在跑子 Agent，可续跑。
 //
 // 与 cancel（硬销毁）的区别：不置 error、不标 Cancelled——先置软停止标记，
@@ -2253,6 +2365,10 @@ func (s *ReactService) SetStopCountdown(d time.Duration) {
 // 据此把 domain 落 Paused（存 history 可续跑）、叶子部分回灌；全部落定后
 // PendingChildren>0 触发父终结保护，会话自然落入 PausedOnChild，恢复路由零改动生效。
 // 之后启动销毁倒计时：到期未续跑则硬销毁（cascadeCancelTree + 会话 error）。
+//
+// 热驻模式（hotResident，Domain 热驻）：叶子软停部分回灌（domain 收到取消提示），
+// domain supervisor 的 taskStopped 分支收尾（SaveMessages + tree.Idle + trackChildDone
+// + enterIdle）；session 级倒计时停用（idle 域由加权 TTL 治理，用户下次消息才武装）。
 //
 // 边界：仅 Running 会话可停止；停止中发消息照常入 Messages，待会话落入
 // PausedOnChild 后按既有恢复路由处理（不注入正在收尾的 MetaAgent）。
@@ -2267,11 +2383,13 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 		s.store.mu.Unlock()
 		return fmt.Errorf("%w: session is not running", ErrInvalidSessionState)
 	}
-	// 1. 置软停止标记（dispatcher 收尾分流依据）。
+	// 1. 置软停止标记（dispatcher 收尾分流依据；domain supervisor 的软停分支与叶子部分回灌共用）。
 	if s.stopMarker != nil {
 		s.stopMarker.SetSoftStop(sessionID)
 	}
-	// 2. 触发全部 Running 节点 cancel 回调（不改节点状态，Pause 由 dispatcher 收尾做）。
+	// 2. 触发全部 Running 节点 cancel 回调（不改节点状态，Pause/Idle 由 dispatcher 收尾做）。
+	//    热驻模式与旧模式一致：叶子 ctx 取消走软停分支（部分回灌+取消提示邮件），
+	//    domain 任务 ctx 取消走 supervisor 软停分支（SaveMessages + tree.Idle + enterIdle）。
 	if t := s.TreeFor(sessionID); t != nil {
 		for _, n := range t.Snapshot() {
 			if n.Status == orchestrator.StatusRunning {
@@ -2279,8 +2397,12 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 			}
 		}
 	}
-	// 3. 销毁倒计时：到期未续跑则硬销毁（含 Paused 节点）。
-	if s.stopCountdown > 0 {
+	// 3. 取消 MetaAgent 当前 API 调用：session ctx 取消打断流式 LLM（provider 直透），
+	//    runSession 的 context.Canceled 分支落暂停态（软停止标记区分于硬取消）。
+	cancelFn := session.cancelFn
+	// 4. 销毁倒计时：旧模式启用（到期未续跑硬销毁含 Paused 节点）；
+	//    热驻模式停用——Idle 域由自身加权 TTL 治理（用户下次消息武装）。
+	if s.stopCountdown > 0 && !s.hotResident {
 		deadline := time.Now().Add(s.stopCountdown)
 		session.destroyAt = &deadline
 		session.stopTimer = time.AfterFunc(s.stopCountdown, func() {
@@ -2289,9 +2411,18 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 	}
 	s.store.mu.Unlock()
 
-	s.store.addEvent(session, eventkind.System, "System",
-		fmt.Sprintf("软停止: 已停止全部子任务（%s 后未续跑将销毁）", s.stopCountdown), "", "", "", "", "", true)
-	log.Printf("[service] SOFT-STOP: session=%s countdown=%s", sessionID, s.stopCountdown)
+	if cancelFn != nil && s.hotResident {
+		cancelFn()
+	}
+
+	if s.hotResident {
+		s.store.addEvent(session, eventkind.System, "System",
+			"软停止: 叶子任务已停止，领域 Agent 转入热驻（下次消息后进入存活倒计时），发送消息可续跑", "", "", "", "", "", true)
+	} else {
+		s.store.addEvent(session, eventkind.System, "System",
+			fmt.Sprintf("软停止: 已停止全部子任务（%s 后未续跑将销毁）", s.stopCountdown), "", "", "", "", "", true)
+	}
+	log.Printf("[service] SOFT-STOP: session=%s countdown=%s hotResident=%t", sessionID, s.stopCountdown, s.hotResident)
 	return nil
 }
 

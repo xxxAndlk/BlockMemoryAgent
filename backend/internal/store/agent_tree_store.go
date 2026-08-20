@@ -129,6 +129,8 @@ func parseStatus(s string) orchestrator.Status {
 		return orchestrator.StatusCancelled
 	case "paused":
 		return orchestrator.StatusPaused
+	case "idle":
+		return orchestrator.StatusIdle
 	}
 	return orchestrator.StatusRunning
 }

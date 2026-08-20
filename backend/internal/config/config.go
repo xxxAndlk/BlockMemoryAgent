@@ -163,6 +163,27 @@ type AgentConfig struct {
 	TaskMaxRunes int `yaml:"task_max_runes"`
 	// TaskMaxRunesHard 派发 task 文本硬上限。默认 4000（原 2600）：仍拦截全量规格转贴。
 	TaskMaxRunesHard int `yaml:"task_max_runes_hard"`
+	// DomainHotResidentEnabled DomainAgent 热驻留总开关（默认 false=旧行为：完成即销毁）。
+	// 开启后：domain 任务完成/用户停止转入 Idle 热驻（goroutine 挂起等复用）；复用经
+	// call_sub_agent(reuse_agent_id=X)；idle 加权倒计时在用户下一条消息后武装。
+	DomainHotResidentEnabled bool `yaml:"domain_hot_resident_enabled"`
+	// DomainIdleBaseTTLMin Idle 基础寿命（分钟，默认 30；<=0 按默认）。
+	// 用户下一条消息武装倒计时后的存活时长基数。
+	DomainIdleBaseTTLMin int `yaml:"domain_idle_base_ttl_min"`
+	// DomainIdleExtendOnReuseMin 每次成功复用延长量（分钟，默认 30；<=0 按默认）。
+	// 复用时 reuse_count+1 且 TTL 重置为 min(base+reuse*extend, max)。
+	DomainIdleExtendOnReuseMin int `yaml:"domain_idle_extend_on_reuse_min"`
+	// DomainIdleMaxTTLMin 加权倒计时上限（分钟，默认 240；<=0 按默认）。
+	DomainIdleMaxTTLMin int `yaml:"domain_idle_max_ttl_min"`
+	// DomainIdleMaxPerSession 单 session 热驻 domain 上限（默认 4；<=0 按默认）。
+	// 超限时新 domain 进 Idle 前 LRU 淘毁最旧 idle。
+	DomainIdleMaxPerSession int `yaml:"domain_idle_max_per_session"`
+	// DomainIdleTaskQueueLen 忙碌（运行中/挂起）domain 新任务缓冲上限（默认 4；<=0 按默认）。
+	// 超限拒绝派发并提示父 Agent 稍后重派。
+	DomainIdleTaskQueueLen int `yaml:"domain_idle_task_queue_len"`
+	// DomainReuseRosterInject 是否向 MetaAgent 上下文注入【空闲领域Agent】清单（默认 true）。
+	// 注入后 MetaAgent 自主判定强相关复用 vs 弱相关新建。
+	DomainReuseRosterInject *bool `yaml:"domain_reuse_roster_inject"`
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -497,6 +518,30 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	// 软停止销毁倒计时默认 300s（TODO #37）。
 	if c.Agent.StopDestroyCountdownSec == 0 {
 		c.Agent.StopDestroyCountdownSec = 300
+	}
+	// Domain 热驻留参数默认值（总开关默认 false=旧行为，故零值兜底仅在开启时有意义）。
+	if c.Agent.DomainIdleBaseTTLMin == 0 {
+		c.Agent.DomainIdleBaseTTLMin = 30
+	}
+	if c.Agent.DomainIdleBaseTTLMin < 0 {
+		c.Agent.DomainIdleBaseTTLMin = 30
+	}
+	if c.Agent.DomainIdleExtendOnReuseMin <= 0 {
+		c.Agent.DomainIdleExtendOnReuseMin = 30
+	}
+	if c.Agent.DomainIdleMaxTTLMin <= 0 {
+		c.Agent.DomainIdleMaxTTLMin = 240
+	}
+	if c.Agent.DomainIdleMaxPerSession <= 0 {
+		c.Agent.DomainIdleMaxPerSession = 4
+	}
+	if c.Agent.DomainIdleTaskQueueLen <= 0 {
+		c.Agent.DomainIdleTaskQueueLen = 4
+	}
+	// 复用清单注入默认开启：*bool 区分"未配置"（默认 true）与"显式 false"。
+	if c.Agent.DomainReuseRosterInject == nil {
+		t := true
+		c.Agent.DomainReuseRosterInject = &t
 	}
 }
 

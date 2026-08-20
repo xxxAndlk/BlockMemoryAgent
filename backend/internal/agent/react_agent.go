@@ -81,6 +81,10 @@ type ReActAgent struct {
 	// 静默（零 chunk 无上报，实证 42K 输入 5m58s 无首 chunk 被心跳误杀），
 	// 定时器补上报防误判；真实挂死由 sub_agent_timeout 墙钟兜底。<=0 默认 30s。
 	streamKeepalive time.Duration
+	// suspendGate 可选的会话级挂起检查点，由 WithSuspendGate 注入。
+	// 主循环顶部与 waitForChildren 内调用 Park：会话挂起期间阻塞（goroutine 真挂起），
+	// 恢复返回 nil 继续。为 nil 时零变化（热驻关闭时不注入）。
+	suspendGate SuspendGate
 }
 
 // PersonaInjector 把人格内容拼接到系统提示词之前；soul.Loader 实现该接口。
@@ -279,6 +283,14 @@ func (a *ReActAgent) WithStreamKeepalive(d time.Duration) *ReActAgent {
 	return a
 }
 
+// WithSuspendGate 注入会话级挂起检查点。主循环顶部与 waitForChildren 内调用
+// Park：挂起期间阻塞，恢复返回 nil 继续循环。传 nil 关闭（默认关闭，热驻模式
+// 下由 dispatcher 注入给 domain 与叶子 Agent）。
+func (a *ReActAgent) WithSuspendGate(g SuspendGate) *ReActAgent {
+	a.suspendGate = g
+	return a
+}
+
 // touchActivity 上报一次活动；未注入回调时为空操作。
 func (a *ReActAgent) touchActivity() {
 	if a.activityReporter != nil {
@@ -389,6 +401,13 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// emptyStreak 记录连续空响应次数，用于空响应保护（见循环内注释）。
 	emptyStreak := 0
 	for i := 0; a.maxIter <= 0 || i < a.maxIter; i++ {
+		// 会话级挂起检查点（热驻模式）：挂起期间阻塞在此，恢复返回 nil 继续本轮。
+		// 在飞 LLM/工具调用跑完（有界超时）才到达这里，非抢占式。
+		if a.suspendGate != nil {
+			if err := a.suspendGate.Park(ctx); err != nil {
+				return ReactResult{History: history}, err
+			}
+		}
 		// 在每次调用 LLM 之前，通过记忆流水线组装上下文消息。
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
 		assembled := a.memory.Assemble(a.role, a.name, history)
@@ -923,6 +942,13 @@ func bladesText(m *blades.Message) string {
 // 返回 paused=true，调用方应以 PausedOnChild 结束并让上层置会话暂停态。
 func (a *ReActAgent) waitForChildren(ctx context.Context, history []ReactMessage) ([]ReactMessage, bool) {
 	for a.pendingChecker.PendingChildren(a.name) > 0 {
+		// 会话级挂起检查点（热驻模式）：domain 等叶子期间的挂起点，
+		// 恢复返回 nil 继续等待子 Agent。
+		if a.suspendGate != nil {
+			if err := a.suspendGate.Park(ctx); err != nil {
+				return history, false
+			}
+		}
 		if a.pausedChecker != nil && a.pausedChecker.HasPausedChild(a.name) {
 			return history, true
 		}

@@ -450,6 +450,28 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入 Paused DomainAgent 恢复器：sendMessage 在 PausedOnChild 态优先恢复 earliest paused domain，
 	// 从 agent_messages 加载历史用 fresh budget 续跑（各 Agent 独立上下文）。
 	agentSvc.SetPausedDomainResumer(subAgentDispatcher)
+	// DomainAgent 热驻留（Domain 热驻 + 复用权重）：开启后 domain 任务完成/用户停止转
+	// Idle 热驻（goroutine park 等复用，call_sub_agent(reuse_agent_id=X) 唤醒），
+	// 加权 TTL 在用户下一条消息后武装。关闭（默认）时所有热驻路径零变化。
+	subAgentDispatcher.WithDomainHotResident(subagent.DomainHotConfig{
+		Enabled:        cfg.Agent.DomainHotResidentEnabled,
+		BaseTTL:        time.Duration(cfg.Agent.DomainIdleBaseTTLMin) * time.Minute,
+		ExtendPerReuse: time.Duration(cfg.Agent.DomainIdleExtendOnReuseMin) * time.Minute,
+		MaxTTL:         time.Duration(cfg.Agent.DomainIdleMaxTTLMin) * time.Minute,
+		MaxPerSession:  cfg.Agent.DomainIdleMaxPerSession,
+		TaskQueueLen:   cfg.Agent.DomainIdleTaskQueueLen,
+	})
+	if cfg.Agent.DomainHotResidentEnabled && (cfg.Agent.DomainReuseRosterInject == nil || *cfg.Agent.DomainReuseRosterInject) {
+		// 空闲领域清单注入：MetaAgent 每轮见【空闲领域Agent】段，自主判定强相关复用 vs 弱相关新建。
+		agentSvc.SetIdleRosterProvider(subAgentDispatcher)
+	}
+	agentSvc.SetIdleTTLArmer(subAgentDispatcher)
+	// 热驻模式下挂起恢复走全树唤醒（ResumeSessionAgents）；旧 resumePausedDomain
+	// 仅在热驻关闭或进程重启槽丢失时兜底。
+	if cfg.Agent.DomainHotResidentEnabled {
+		agentSvc.SetSessionAgentWaker(subAgentDispatcher)
+		agentSvc.SetHotResident(true)
+	}
 	// 软停止（TODO #37）：会话 Stop 先标记再触发子 Agent cancel，dispatcher 收尾分支
 	// 把 domain 落 Paused（存 history 可续跑）、叶子部分回灌；倒计时到期硬销毁。
 	agentSvc.SetSoftStopMarker(subAgentDispatcher)

@@ -293,6 +293,15 @@ type Dispatcher struct {
 	// patrolOnce 保证巡检 goroutine 只启动一次；patrolStop 关闭后巡检退出（测试用 ClosePatrol）。
 	patrolOnce sync.Once
 	patrolStop chan struct{}
+
+	// hotCfg DomainAgent 热驻留配置（idle_pool.go）；Enabled=false（默认零值）时
+	// 所有热驻路径零变化。bootstrap 按 config domain_hot_resident_enabled 注入。
+	hotCfg domainHotConfig
+	// pool 热驻 domain 槽池（hotCfg.Enabled 时由 WithDomainHotResident 初始化）。
+	pool *domainPool
+	// suspendStates 会话级挂起状态（sessionID -> *sessionSuspendState），
+	// 热驻模式下触限暂停波及全树：叶子与 domain 的 SuspendGate.Park 阻塞在 wake 上。
+	suspendStates sync.Map
 }
 
 // pendingState 跟踪单个父 Agent 的未决子 Agent 计数与完成信号。
@@ -715,6 +724,12 @@ func (d *Dispatcher) isSoftStop(sessionID string) bool {
 	return d.softStops[sessionID]
 }
 
+// IsSoftStop 公开查询会话软停止标记（ReactService.isSoftStopCancel 经接口断言调用，
+// 区分用户停止与硬取消的 context.Canceled 分流）。
+func (d *Dispatcher) IsSoftStop(sessionID string) bool {
+	return d.isSoftStop(sessionID)
+}
+
 // WithTimeout 配置子 Agent 独立执行的最大时长；<=0 表示不限制（仅防挂起的保底由调用方负责）。
 func (d *Dispatcher) WithTimeout(t time.Duration) *Dispatcher {
 	d.timeout = t
@@ -1127,6 +1142,9 @@ func (t *callSubAgentTool) Description() string {
 		"天花板外（插件 roles 白名单不允许）的越界项会被忽略并随本调用结果回告，不放大权限。\n\n" +
 		"【wall_clock_min 字段】（可选）本次派发的墙钟预算（分钟，代码级强制执行，与全局 sub_agent_timeout 取小）：" +
 		"到期前子 Agent 会收到收口警告，超时直接终止。验收/巡检类任务建议显式给预算（如 15）防止无边界扩张；普通建设任务省略。\n\n" +
+		"【reuse_agent_id 字段】（可选，热驻复用）复用已完成的热驻领域 Agent：填【空闲领域Agent】清单中的 agent_id。" +
+		"新任务与该领域强相关时优先复用（保留全部上下文与领域知识，省冷启动）；弱相关则省略本字段新建 domain。" +
+		"复用时 role_id/domain/responsibility 可省略（沿用槽内冻结值），task 必填。目标 Agent 忙碌时任务入队，当前任务完成后自动执行。\n\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
@@ -1209,10 +1227,16 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	toolsHint := d.toolsHintArg(args)
 	// wall_clock_min 可选：派发级墙钟（分钟），代码级强制收口，替代提示词墙钟。
 	wallClock := d.wallClockArg(args)
+	// reuse_agent_id 可选：热驻复用（idle domain 唤醒/忙碌入队），非空时忽略 role_id。
+	reuseAgentID, _ := args["reuse_agent_id"].(string)
 
 	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode, verifyKind)
-	if msg != "" {
+	if reuseAgentID == "" && msg != "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
+	}
+	// reuse 模式 role_id 可省（复用槽沿用原角色）；task 仍必填。
+	if reuseAgentID != "" && strings.TrimSpace(task) == "" {
+		return &tool.Result{Tool: "call_sub_agent", Error: "task is required", Category: tool.ResultCategoryValidationRejected}
 	}
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
@@ -1223,7 +1247,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
-	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, wallClock)
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, wallClock, reuseAgentID)
 	if errRes != nil {
 		errRes.Tool = "call_sub_agent"
 		return errRes
@@ -1242,14 +1266,24 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 // verifyKind 为校验分层（auto/executable/rubric/none，空串=auto，TODO #43），
 // toolsHint 为建议工具集（TODO #52，可空）：校验 ∩ 子 Agent 角色天花板后预挂载到子 scope，
 // wallClock 为派发级墙钟（>0 时取 min(wallClock, sub_agent_timeout) 替代全局值，到期前预警）。
-// 均穿透到子 Agent 构造时的引擎选择与完成后校验。
+// reuseAgentID 非空时走热驻复用（idle_pool.go dispatchToIdleSlot）：唤醒 idle domain
+// 或忙碌入队，忽略 roleID/task 以外的派发参数。均穿透到子 Agent 构造时的引擎选择与完成后校验。
 // 前置：调用方已完成参数校验（validateDispatchArgs）与 spec 强制校验。
 // 供 call_sub_agent（单个）与 call_sub_agents（批量同波）两个工具复用。
-func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint []string, wallClock time.Duration) (string, *tool.Result) {
+func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint []string, wallClock time.Duration, reuseAgentID string) (string, *tool.Result) {
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
 	if parentID == "" {
 		return "", &tool.Result{Error: "missing parent agent context"}
+	}
+
+	// 热驻复用分流（reuse_agent_id 参数）：槽 idle 唤醒 + 注入新任务；busy 入队；
+	// 不存在报错提示新建。热驻未开启时报错（防误参数静默新建）。
+	if reuseAgentID != "" {
+		if !d.hotEnabled() {
+			return "", &tool.Result{Error: "reuse_agent_id 仅在 domain_hot_resident_enabled 开启时可用", Category: tool.ResultCategoryValidationRejected}
+		}
+		return d.dispatchToIdleSlot(ctx, parentID, reuseAgentID, task, wallClock, mode, verifyKind)
 	}
 
 	// 从角色注册表获取目标角色定义，若角色不存在则拒绝调用。
@@ -1321,6 +1355,15 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	if wallClock > 0 && (effectiveTimeout <= 0 || wallClock < effectiveTimeout) {
 		effectiveTimeout = wallClock
 	}
+	taskBrief := truncateRunes(strings.ReplaceAll(strings.TrimSpace(task), "\n", " "), 100)
+	started := time.Now()
+
+	// 热驻模式 domain 派发：走 supervisor 常驻 goroutine（idle_pool.go）。
+	// ctx 不带 deadline（墙钟由 slot timer 管理，挂起可停表）。
+	if d.hotEnabled() && roleDef.ID == "domain" {
+		return d.dispatchHotDomain(ctx, parentID, subAgentID, *roleDef, domain, task, responsibility, effectiveTimeout, taskBrief, started)
+	}
+
 	subAgentCtx := context.Background()
 	if sid := tool.SessionIDFromContext(ctx); sid != "" {
 		subAgentCtx = tool.WithSessionID(subAgentCtx, sid)
@@ -1329,9 +1372,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	if effectiveTimeout > 0 {
 		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)
 	}
-	taskBrief := truncateRunes(strings.ReplaceAll(strings.TrimSpace(task), "\n", " "), 100)
 	log.Printf("[subagent] dispatch: parent=%s sub=%s role=%s task=%q", parentID, subAgentID, roleID, taskBrief)
-	started := time.Now()
 	// 权威树注册：在 goroutine 启动前同步 Register + SetCancel，保证 Cancel 端点不会因时序漏掉句柄。
 	// treeFn 为 nil 时（测试场景）跳过，不影响派发主流程。
 	if d.treeFn != nil {
@@ -1469,7 +1510,8 @@ func (t *callSubAgentsTool) Description() string {
 		fmt.Sprintf("字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=%d 字；", t.dispatcher.taskRuneSoftLimit) +
 		"mode 可选 react/reflection/plan_execute，省略=react；verify_kind 可选 auto/executable/rubric/none，省略=auto；" +
 		"tools_hint 可选：建议子 Agent 使用的插件工具名列表，校验 ∩ 子 Agent 权限天花板后预挂载，越界项忽略并回告）；" +
-		"wall_clock_min 可选：本次派发的墙钟预算（分钟，代码级强制执行，与全局上限取小，到期前收口警告，验收类任务建议显式给）。\n" +
+		"wall_clock_min 可选：本次派发的墙钟预算（分钟，代码级强制执行，与全局上限取小，到期前收口警告，验收类任务建议显式给）；" +
+		"reuse_agent_id 可选：复用【空闲领域Agent】清单中的热驻领域 Agent（强相关任务优先复用，弱相关新建 domain）。\n" +
 		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
 		"否则返回 spec missing/stale 错误（stale 会列出已变更文件路径）。逐项返回派出结果：某项失败不影响其他项。"
 }
@@ -1491,6 +1533,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 	// 逐项校验参数；轻微超限（2000-2600 runes）软着陆放行并收集警告（TODO #38-3）。
 	type batchItem struct {
 		roleID, domain, task, responsibility, mode, verifyKind string
+		reuseAgentID                                           string
 		toolsHint                                              []string
 		wallClock                                              time.Duration
 	}
@@ -1508,10 +1551,13 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.responsibility, _ = m["responsibility"].(string)
 		it.mode, _ = m["mode"].(string)
 		it.verifyKind, _ = m["verify_kind"].(string)
+		it.reuseAgentID, _ = m["reuse_agent_id"].(string)
 		it.toolsHint = d.toolsHintArg(m) // TODO #52：建议工具集（∩ 子 Agent 天花板后预挂载）
 		it.wallClock = d.wallClockArg(m)
 		if msg, warning := t.dispatcher.validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode, it.verifyKind); msg != "" {
-			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
+			if it.reuseAgentID == "" {
+				return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
+			}
 		} else if warning != "" {
 			batchWarnings = append(batchWarnings, fmt.Sprintf("tasks[%d]: %s", i, warning))
 		}
@@ -1528,7 +1574,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 
 	var okIDs, errs []string
 	for _, it := range items {
-		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint, it.wallClock)
+		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint, it.wallClock, it.reuseAgentID)
 		if errRes != nil {
 			errs = append(errs, fmt.Sprintf("%s(%s): %s", it.roleID, it.domain, errRes.Error))
 			continue
@@ -1617,6 +1663,19 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 				log.Printf("[subagent] SOFT-STOP LEAF PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
 				d.treeFinish(ctx, subAgentID, "软停止部分完成: "+partial, nil)
 				d.notify(parentID, subAgentID, "子 Agent 已被软停止（会话停止中），返回当前部分成果；续跑后可按需重派。\n"+partial, files)
+				// Domain 热驻：父是热驻 domain 时追加一条取消提示邮件（"记忆补一句：子 Agent 已取消"）——
+				// domain 转 Idle 前读邮箱即可感知下属被停止，复用续跑时不误以为叶子仍在执行。
+				if d.hotEnabled() && d.mailbox != nil {
+					if _, err := d.mailbox.Send(&mailbox.Message{
+						From:    "dispatcher",
+						To:      parentID,
+						Type:    mailbox.MsgInfo,
+						Subject: "子 Agent 已取消",
+						Body:    fmt.Sprintf("【系统通知】用户已停止当前任务，你的子 Agent %s 已被取消（部分成果已随上条消息回传）。当前任务中断，成果已保留。", subAgentID),
+					}); err != nil {
+						log.Printf("[subagent] soft-stop notify parent failed: to=%s from=dispatcher err=%v", parentID, err)
+					}
+				}
 				return false
 			}
 			log.Printf("[subagent] CANCELLED: sub=%s role=%s duration=%s", subAgentID, roleDef.ID, duration)
@@ -2725,6 +2784,22 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, pa
 	d.saveRawBlockMemory(ctx, subAgentID, roleID, parentID, taskDomain, goal, content, outcome, filesModified)
 }
 
+// domainReuseCountOf 返回热驻槽的当前复用次数（Domain 热驻两层权重：域级 reuse_count
+// 与条目级 reuse_count）；非热驻/槽不存在返回 0。saveRawBlockMemory/saveFacts 写
+// domain_reuse_count Meta 标签，供召回侧把"高频复用领域的沉淀"排序靠前。
+func (d *Dispatcher) domainReuseCountOf(sessionID, subAgentID string) int {
+	if !d.hotEnabled() || sessionID == "" {
+		return 0
+	}
+	s := d.pool.slot(sessionID, subAgentID)
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reuseCount
+}
+
 // saveBlockRecord 落库单条块记忆并维护失败观测计数。
 // 连续失败达到阈值时 slog.Warn 醒目告警（提示 embedding 端点/DB 链路损坏），
 // 成功时重置计数。best-effort：失败仅告警，不影响派发主流程。
@@ -2749,22 +2824,27 @@ func (d *Dispatcher) saveBlockRecord(ctx context.Context, rec *types.KnowledgeRe
 func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID, parentID, taskDomain, goal, content, outcome string, filesModified []string) {
 	trimmedGoal := truncateRunes(strings.TrimSpace(goal), blockMemoryGoalMaxRunes)
 	sid := tool.SessionIDFromContext(ctx)
+	meta := map[string]any{
+		"goal":           trimmedGoal,
+		"domain":         roleID,
+		"session_id":     sid,
+		"sub_agent_id":   subAgentID,
+		"parent_id":      parentID,
+		"task_domain":    strings.TrimSpace(taskDomain),
+		"files_modified": filesModified,
+		"source":         "sub_agent_result",
+		"outcome":        outcome,
+		"reuse_count":    0,
+	}
+	// Domain 热驻两层权重：域级复用次数写 domain_reuse_count 标签。
+	if rc := d.domainReuseCountOf(sid, subAgentID); rc > 0 {
+		meta["domain_reuse_count"] = rc
+	}
 	rec := &types.KnowledgeRecord{
 		KnowledgeType: enums.KnowledgeTypeBlockMemory,
 		Content:       fmt.Sprintf("目标:%s\n角色:%s\n结果:%s", trimmedGoal, roleID, truncateRunes(content, blockMemoryResultMaxRunes)),
-		Meta: map[string]any{
-			"goal":           trimmedGoal,
-			"domain":         roleID,
-			"session_id":     sid,
-			"sub_agent_id":   subAgentID,
-			"parent_id":      parentID,
-			"task_domain":    strings.TrimSpace(taskDomain),
-			"files_modified": filesModified,
-			"source":         "sub_agent_result",
-			"outcome":        outcome,
-			"reuse_count":    0,
-		},
-		CreatedAt: time.Now(),
+		Meta:          meta,
+		CreatedAt:     time.Now(),
 	}
 	d.saveBlockRecord(ctx, rec, "block memory")
 }
@@ -2779,23 +2859,27 @@ func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, parentID
 		if fact == "" {
 			continue
 		}
+		meta := map[string]any{
+			"goal":           trimmedGoal,
+			"domain":         roleID,
+			"session_id":     sid,
+			"sub_agent_id":   subAgentID,
+			"parent_id":      parentID,
+			"task_domain":    strings.TrimSpace(taskDomain),
+			"files_modified": filesModified,
+			"source":         "fact_extraction",
+			"fact_index":     i,
+			"outcome":        outcome,
+			"reuse_count":    0,
+		}
+		if rc := d.domainReuseCountOf(sid, subAgentID); rc > 0 {
+			meta["domain_reuse_count"] = rc
+		}
 		rec := &types.KnowledgeRecord{
 			KnowledgeType: enums.KnowledgeTypeBlockMemory,
 			Content:       fact,
-			Meta: map[string]any{
-				"goal":           trimmedGoal,
-				"domain":         roleID,
-				"session_id":     sid,
-				"sub_agent_id":   subAgentID,
-				"parent_id":      parentID,
-				"task_domain":    strings.TrimSpace(taskDomain),
-				"files_modified": filesModified,
-				"source":         "fact_extraction",
-				"fact_index":     i,
-				"outcome":        outcome,
-				"reuse_count":    0,
-			},
-			CreatedAt: time.Now(),
+			Meta:          meta,
+			CreatedAt:     time.Now(),
 		}
 		d.saveBlockRecord(ctx, rec, "fact")
 	}

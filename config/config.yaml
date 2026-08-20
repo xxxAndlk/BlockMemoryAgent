@@ -98,6 +98,15 @@ agent:
   prompt_enhance_max_input_runes: 30 # L0 输入形态闸门长度上限（rune，TODO #39）：续跑/控制/诊断本质是短指令（实证 ≤15 字），超过视为任务描述直接直通不分类
   stop_destroy_countdown_sec: 300    # 软停止销毁倒计时（秒，TODO #37）：双击 ESC 停止后到期未续跑则硬销毁全部任务节点；负数=关闭（永久暂停，靠续跑）
 
+  # -- DomainAgent 热驻留 + 复用权重 --
+  domain_hot_resident_enabled: false  # DomainAgent 热驻留总开关：true 时 domain 任务完成/用户停止后转 Idle 热驻（goroutine 挂起等复用，复用经 call_sub_agent(reuse_agent_id=X)），false=旧行为（完成即销毁）
+  domain_idle_base_ttl_min: 30        # Idle 基础寿命（分钟）：用户下一条消息武装倒计时后的存活基数
+  domain_idle_extend_on_reuse_min: 30 # 每次成功复用延长量：复用时 reuse_count+1 且 TTL 重置为 min(base+reuse*extend, max)
+  domain_idle_max_ttl_min: 240        # 加权倒计时上限（分钟）
+  domain_idle_max_per_session: 4      # 单 session 热驻 domain 上限；超限新 domain 进 Idle 前 LRU 淘毁最旧 idle
+  domain_idle_task_queue_len: 4       # 忙碌 domain 新任务缓冲上限；超限拒绝派发提示父 Agent 稍后重派
+  domain_reuse_roster_inject: true    # 向 MetaAgent 上下文注入【空闲领域Agent】清单（ID/方向/reuse_count/剩余寿命），由其自主判定强相关复用 vs 弱相关新建
+
   # -- 工具沙箱（安全）--
   tool_sandbox_disabled: false   # true 时关闭写路径逃逸检测（保留命令黑名单）
   tool_sandbox_allowed_paths: [] # 允许读写的额外绝对路径白名单
