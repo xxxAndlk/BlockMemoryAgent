@@ -42,14 +42,14 @@ func TestAppendLiveItems(t *testing.T) {
 	// 情形三：工具已完成（call 与 exec 配对）→ 回到思考中。
 	s.Events = append(s.Events, server.SessionEvent{Type: "tool_exec", Tool: "ReadFile", Success: true, Timestamp: now})
 	items = appendLiveItems(nil, s, nil)
-	if len(items) != 1 || !strings.Contains(items[0].title, "⏳") {
+	if len(items) != 1 || !strings.Contains(items[0].title, "思考中") {
 		t.Fatalf("应展示思考中, got %+v", items)
 	}
 
 	// 情形四：无事件 → 思考中。
 	s = &server.Session{Status: enums.SessionStatusRunning}
 	items = appendLiveItems(nil, s, nil)
-	if len(items) != 1 || !strings.Contains(items[0].title, "⏳") {
+	if len(items) != 1 || !strings.Contains(items[0].title, "思考中") {
 		t.Fatalf("应展示思考中, got %+v", items)
 	}
 
@@ -75,8 +75,25 @@ func TestAppendLiveItems(t *testing.T) {
 	// 情形七：子 Agent 已回传 → 回到思考中。
 	s.Events = append(s.Events, server.SessionEvent{Type: "message", Kind: "sub_agent_done", Timestamp: now})
 	items = appendLiveItems(nil, s, nil)
-	if len(items) != 1 || !strings.Contains(items[0].title, "⏳") {
+	if len(items) != 1 || !strings.Contains(items[0].title, "思考中") {
 		t.Fatalf("子 Agent 完成后应回到思考中, got %+v", items)
+	}
+}
+
+// TestThinkingWaitTitleAnimates 验证思考等待标题随墙钟相位前进（转圈帧+渐增省略号）：
+// 两个间隔 200ms 的相位应产出不同帧，标题始终含 MetaAgent 思考中。
+func TestThinkingWaitTitleAnimates(t *testing.T) {
+	base := time.Unix(1800000000, 0)
+	t1 := thinkingWaitTitle(base)
+	if !strings.Contains(t1, "MetaAgent 思考中") {
+		t.Fatalf("标题应含 MetaAgent 思考中, got %q", t1)
+	}
+	seen := map[string]bool{}
+	for i := int64(0); i < 12; i++ {
+		seen[thinkingWaitTitle(base.Add(time.Duration(i)*200*time.Millisecond))] = true
+	}
+	if len(seen) < 4 {
+		t.Fatalf("12 个相位应产出多帧动效, got %d 种: %v", len(seen), seen)
 	}
 }
 

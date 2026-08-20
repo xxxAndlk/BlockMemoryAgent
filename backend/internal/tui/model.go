@@ -497,6 +497,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rebuildAgents()
 			m.accumulateTokens()
 		}
+		// 运行中会话每 2 tick（200ms）强制刷新：思考中动效条目（转圈帧+省略号，
+		// 相位取墙钟）不产生流式事件，只有强制重绘才能让帧前进。
+		if m.tickCount%2 == 0 {
+			if s := m.selectedSession(); s != nil && s.Status == enums.SessionStatusRunning {
+				m.dirty = true
+			}
+		}
 		// 有待消费的会话选中/滚动锚定请求时立即刷新，不等流式事件驱动，
 		// 保证发送消息后视图在一个 tick 内响应。
 		if m.shared.hasPendingSelect() || m.chatPanel.pendingScrollToUser {

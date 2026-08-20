@@ -549,12 +549,26 @@ func appendLiveItems(items []chatItem, s *server.Session, resolver func(childID 
 			isEvent:   true,
 		})
 	}
-	// 否则处于 LLM 调用等待期，提示思考中。
+	// 否则处于 LLM 调用等待期，提示思考中。转圈帧 + 动态省略号（相位取墙钟），
+	// 由 Model tick 的 200ms 强制刷新驱动重绘；thinking 模型首块前可静默数分钟，
+	// 动效是等待期唯一的"还活着"反馈（2026-08-20：MetaAgent 流静默 15min+ 用户无从分辨）。
 	return append(items, chatItem{
-		title:     "⏳ MetaAgent 思考中…",
+		title:     thinkingWaitTitle(now),
 		timestamp: now,
 		isEvent:   true,
 	})
+}
+
+// spinnerFrames 是思考等待期的盲文转圈帧序列。
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// thinkingWaitTitle 依据墙钟相位生成"转圈 + 思考中 + 渐增省略号"标题：
+// 帧周期 200ms（与 Model 的强制刷新节奏一致），省略号步进 600ms。
+func thinkingWaitTitle(now time.Time) string {
+	p := now.UnixMilli() / 200
+	frame := spinnerFrames[p%int64(len(spinnerFrames))]
+	dots := strings.Repeat("·", int((p/3)%4))
+	return frame + " MetaAgent 思考中" + dots
 }
 
 // waitingSubAgent 返回当前仍处于"已派发未回传"状态的子 Agent ID；没有时返回空串。

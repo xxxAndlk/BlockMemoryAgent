@@ -1629,7 +1629,7 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		// 热驻模式软停止分流：用户 Stop 取消了 session ctx（打断流式 LLM），
 		// domain 已转 Idle 热驻——落可续跑暂停态而非 error，partial history 保留。
 		if s.isSoftStopCancel(session, err) {
-			s.pauseSession(session, result.History, PauseUserStop)
+			s.pauseSession(session, result.History, s.softStopPauseKind(session))
 			return
 		}
 		// 运行出错时标记会话错误并退出。
@@ -1739,9 +1739,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 调用带历史的 ReAct 运行接口。
 	result, err := agent.RunWithHistory(runCtx, input, history)
 	if err != nil {
-		// 热驻模式软停止分流（同 runSession）。
+		// 软停止分流（同 runSession）。
 		if s.isSoftStopCancel(session, err) {
-			s.pauseSession(session, result.History, PauseUserStop)
+			s.pauseSession(session, result.History, s.softStopPauseKind(session))
 			return
 		}
 		s.setSessionError(session, err.Error())
@@ -1901,7 +1901,10 @@ func (s *ReactService) pauseMessage(kind PauseKind) string {
 	case PauseTokenBudget:
 		return "已达 token 预算上限，会话已暂停。发送任意消息（如\"继续\"）将从当前进度继续执行。"
 	case PauseUserStop:
-		return "任务已停止（领域 Agent 已热驻保留）。发送消息可继续任务或派发新任务（空闲领域 Agent 可复用）。"
+		if s.hotResident {
+			return "任务已停止（领域 Agent 已热驻保留）。发送消息可继续任务或派发新任务（空闲领域 Agent 可复用）。"
+		}
+		return "任务已停止。发送消息可继续任务（销毁倒计时内未续跑将销毁）。"
 	default:
 		// PauseIterationLimit：maxIter<=0（不限制）时不显示具体轮数，避免 "0 轮" 误报。
 		maxIter := s.runtimeCfg.LoopConfig().MaxIterations
@@ -1912,12 +1915,12 @@ func (s *ReactService) pauseMessage(kind PauseKind) string {
 	}
 }
 
-// isSoftStopCancel 判定 MetaAgent 的 ctx 取消错误是否来自用户软停止（Domain 热驻）。
-// 判据：热驻模式 + 软停止标记命中 + 错误链含 context.Canceled。硬取消（cancel 路径）
+// isSoftStopCancel 判定 MetaAgent 的 ctx 取消错误是否来自用户软停止。
+// 判据：软停止标记命中 + 错误链含 context.Canceled。硬取消（cancel 路径）
 // 先置 Error 终态再 cancel，会话已非 Running，此处为 false——setSessionError 的首错
 // 胜出保护兜底，不会覆盖"cancelled by user"。
 func (s *ReactService) isSoftStopCancel(session *reactInternalSession, err error) bool {
-	if !s.hotResident || s.stopMarker == nil {
+	if s.stopMarker == nil {
 		return false
 	}
 	if !errors.Is(err, context.Canceled) {
@@ -1932,6 +1935,26 @@ func (s *ReactService) isSoftStopCancel(session *reactInternalSession, err error
 	return false
 }
 
+// softStopPauseKind 软停止取消后的暂停分类：旧模式（非热驻）下树中存在
+// Running/Paused domain 节点（MetaAgent 原本阻塞在等子 domain）时维持
+// PauseOnChild 原恢复路由（resumePausedDomain 续跑暂停域）；否则（如在跑
+// LLM 被打断、无域在跑）落 PauseUserStop（awaiting_clarify，发消息走
+// MetaAgent 续跑）。热驻模式恒为 PauseUserStop（域转 Idle 由
+// ResumeSessionAgents 唤醒，不依赖 PausedOnChild 路由）。
+func (s *ReactService) softStopPauseKind(session *reactInternalSession) PauseKind {
+	if s.hotResident {
+		return PauseUserStop
+	}
+	if t := s.TreeFor(session.ID); t != nil {
+		for _, n := range t.Snapshot() {
+			if n.Role == "domain" && (n.Status == orchestrator.StatusRunning || n.Status == orchestrator.StatusPaused) {
+				return PauseOnChild
+			}
+		}
+	}
+	return PauseUserStop
+}
+
 // pauseSession 按暂停原因将会话置为对应暂停态而非错误：
 // PauseOnChild -> paused_on_child（优先恢复暂停的 domain）；其他 -> awaiting_clarify（普通续跑）。
 // History 完整保留，sendMessage -> resumeSession/resumePausedDomain 从当前进度续跑。
@@ -1944,7 +1967,11 @@ func (s *ReactService) pauseSession(session *reactInternalSession, history []Rea
 		session.Result = "子领域 Agent 触达 token 上限暂停，发\"继续\"恢复该领域"
 	case PauseUserStop:
 		session.Status = enums.SessionStatusAwaitingClarify
-		session.Result = "任务已停止，领域 Agent 热驻保留，发送消息续跑"
+		if s.hotResident {
+			session.Result = "任务已停止，领域 Agent 热驻保留，发送消息续跑"
+		} else {
+			session.Result = "任务已停止，发送消息可续跑（销毁倒计时内未续跑将销毁）"
+		}
 	default:
 		session.Status = enums.SessionStatusAwaitingClarify
 		session.Result = "已达上限，会话暂停，等待用户消息续跑"
@@ -2092,14 +2119,17 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		s.store.addEvent(session, eventkind.Prompt, "System", "输入补全: "+enhanceNote, "", "", "", "", "", true)
 	}
 
+	// 软停止窗口内任何用户消息都视作续跑意图：清倒计时定时器 + 清标记（幂等）。
+	// 不能只挂在 !wasRunning 分支--Stop 后会话可能尚 Running（MetaAgent 的 LLM
+	// 调用正在中断收尾途中），消息只入队不清倒计时，销毁倒计时到期会整体销毁。
+	s.cancelSoftStopState(sessionID)
+
 	// 添加用户消息事件。
 	s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)
 
 	// 如果会话原先未运行，则在 goroutine 中恢复执行。
 	if !wasRunning {
-		// 续跑触发：清除软停止状态（停倒计时定时器 + 清标记），幂等（TODO #37）。
-		s.cancelSoftStopState(sessionID)
-		// 热驻模式（Domain 热驻）：唤醒全部挂起 Agent——wake 广播（叶子+domain 的
+		// 热驻模式（Domain 热驻）：唤醒全部挂起 Agent--wake 广播（叶子+domain 的
 		// SuspendGate 解除阻塞）+ Paused 域置回 Running（supervisor 收 opResume 续跑
 		// 当前任务）+ 恢复冻结的 idle TTL。旧路径（resumePausedDomain 逐个恢复）仅作
 		// 跨重启兜底（内存槽丢失时）。
@@ -2411,7 +2441,11 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 	}
 	s.store.mu.Unlock()
 
-	if cancelFn != nil && s.hotResident {
+	// 取消 MetaAgent 当前 API 调用：session ctx 取消打断流式 LLM（provider 直透），
+	// runSession/resumeSession 的 context.Canceled 分支落暂停态（软停止标记区分于
+	// 硬取消）。两种模式都执行--旧模式否则 MetaAgent 卡在跑中的 LLM 调用上，
+	// 会话长期 Running，倒计时到期即整体销毁。
+	if cancelFn != nil {
 		cancelFn()
 	}
 
@@ -2429,7 +2463,7 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 // destroyAfterSoftStop 软停止倒计时到期：硬销毁会话（cascadeCancelTree 含 Paused 节点），
 // 清停止标记与倒计时状态。幂等：会话已恢复/已终止时 no-op。
 // 触发条件：仍在软停止窗口内（destroyAt 非 nil）且会话处于 PausedOnChild（正常落定）
-// 或 Running（级联仍在进行）——两种状态都属于"停止后未续跑"，到期即销毁。
+// 或 Running（级联仍在进行）——两种状态再加上 AwaitingClarify（软停取消落 PauseUserStop）都属于"停止后未续跑"，到期即销毁。
 func (s *ReactService) destroyAfterSoftStop(sessionID string) {
 	s.store.mu.Lock()
 	session, ok := s.store.sessions[sessionID]
@@ -2438,7 +2472,7 @@ func (s *ReactService) destroyAfterSoftStop(sessionID string) {
 		return
 	}
 	switch session.Status {
-	case enums.SessionStatusPausedOnChild, enums.SessionStatusRunning:
+	case enums.SessionStatusPausedOnChild, enums.SessionStatusRunning, enums.SessionStatusAwaitingClarify:
 	default:
 		s.store.mu.Unlock()
 		return
@@ -2461,7 +2495,7 @@ func (s *ReactService) destroyAfterSoftStop(sessionID string) {
 	s.cascadeCancelTree(sessionID)
 
 	s.store.mu.Lock()
-	if session.Status == enums.SessionStatusPausedOnChild || session.Status == enums.SessionStatusRunning {
+	if session.Status == enums.SessionStatusPausedOnChild || session.Status == enums.SessionStatusRunning || session.Status == enums.SessionStatusAwaitingClarify {
 		session.Status = enums.SessionStatusError
 		session.Result = "软停止超时未续跑，任务已销毁"
 		now := time.Now()
