@@ -1001,6 +1001,59 @@ func (p *silentStreamProvider) NewStreaming(ctx context.Context, req *blades.Mod
 	}
 }
 
+// stallStreamProvider 流式 provider：第 1 次尝试产出首块后挂死（只等 ctx 取消），
+// 第 2 次尝试正常收尾。复现 2026-08-20 ark glm-5.3 流中途静默：首块后零 chunk 直到墙钟。
+type stallStreamProvider struct {
+	attempts int
+}
+
+func (p *stallStreamProvider) Name() string { return "stall-stream" }
+
+func (p *stallStreamProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	return &blades.ModelResponse{Message: blades.AssistantMessage("from generate")}, nil
+}
+
+func (p *stallStreamProvider) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
+	return func(yield func(*blades.ModelResponse, error) bool) {
+		p.attempts++
+		if !yield(&blades.ModelResponse{Message: blades.AssistantMessage("partial")}, nil) {
+			return
+		}
+		if p.attempts == 1 {
+			// 首块后流挂死：被取消前零 chunk，取消后优雅 return（不 yield 错误）。
+			<-ctx.Done()
+			return
+		}
+		yield(&blades.ModelResponse{Message: blades.AssistantMessage("final answer")}, nil)
+	}
+}
+
+// TestReActAgent_StreamIdleTimeoutRetries 验证流式块间空闲超时：首块后挂死的流被
+// 判死并取消，generate 经 RetryLLM 自动重试，第 2 次尝试成功拿到完整答复。
+// 首块前静默不受影响（沿用 silentStreamProvider 场景，由整次调用墙钟兜底）。
+func TestReActAgent_StreamIdleTimeoutRetries(t *testing.T) {
+	p := &stallStreamProvider{}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, p, NewToolRegistryAdapter(reg)).
+		WithStreamKeepalive(10 * time.Millisecond).
+		WithStreamIdleTimeout(50 * time.Millisecond).
+		WithLoopConfig(LoopConfig{RetryCount: 1, RetryBackoff: 10 * time.Millisecond})
+	result, err := a.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("空闲超时应触发重试并成功, got err: %v", err)
+	}
+	if p.attempts != 2 {
+		t.Fatalf("应重试一次（2 次尝试）, got %d", p.attempts)
+	}
+	if len(result.History) == 0 {
+		t.Fatal("应产生历史")
+	}
+	last := result.History[len(result.History)-1]
+	if last.Role != "assistant" || !strings.Contains(last.Content, "final answer") {
+		t.Fatalf("应拿到第 2 次尝试的完整答复, got %+v", last)
+	}
+}
+
 // TestReActAgent_StreamKeepaliveDuringSilence 验证零 chunk 静默流期间保活定时器持续上报：
 // chunk 级上报救不了"首 token 前长考"，需定时器补上报防心跳误杀；真实挂死由墙钟超时兜底。
 func TestReActAgent_StreamKeepaliveDuringSilence(t *testing.T) {

@@ -81,6 +81,10 @@ type ReActAgent struct {
 	// 静默（零 chunk 无上报，实证 42K 输入 5m58s 无首 chunk 被心跳误杀），
 	// 定时器补上报防误判；真实挂死由 sub_agent_timeout 墙钟兜底。<=0 默认 30s。
 	streamKeepalive time.Duration
+	// streamIdleTimeout 流式块间空闲超时：首块之后 chunk 间隔超过它即判流死，
+	// 取消流让 generate 重试（2026-08-20 ark glm-5.3 一天三次流中途静默）。
+	// <=0 用 defaultStreamIdleTimeout（300s）。
+	streamIdleTimeout time.Duration
 	// suspendGate 可选的会话级挂起检查点，由 WithSuspendGate 注入。
 	// 主循环顶部与 waitForChildren 内调用 Park：会话挂起期间阻塞（goroutine 真挂起），
 	// 恢复返回 nil 继续。为 nil 时零变化（热驻关闭时不注入）。
@@ -283,6 +287,13 @@ func (a *ReActAgent) WithStreamKeepalive(d time.Duration) *ReActAgent {
 	return a
 }
 
+// WithStreamIdleTimeout 设置流式块间空闲超时；<=0 用 defaultStreamIdleTimeout（300s）。
+// 测试注入短间隔。仅对首块之后的 chunk 间隔生效。
+func (a *ReActAgent) WithStreamIdleTimeout(d time.Duration) *ReActAgent {
+	a.streamIdleTimeout = d
+	return a
+}
+
 // WithSuspendGate 注入会话级挂起检查点。主循环顶部与 waitForChildren 内调用
 // Park：挂起期间阻塞，恢复返回 nil 继续循环。传 nil 关闭（默认关闭，热驻模式
 // 下由 dispatcher 注入给 domain 与叶子 Agent）。
@@ -331,6 +342,10 @@ const emptyResponseNudge = "（系统提示：你上一条回复为空，未包�
 // 与 ToolOutputMaxRunes（工具输出截断）对称：工具入参（WriteFile 全文、codegen 大段代码）
 // 不截断会在滑动窗口内累积成单轮 100K+ input tokens，使续跑预算一次耗尽、暂停/恢复零进展。
 const historyToolCallInputMaxRunes = 2000
+
+// defaultStreamIdleTimeout 是流式块间空闲超时默认值：首块之后 chunk 间隔超过它
+// 即判流死（2026-08-20 ark glm-5.3 一天三次流中途静默，等满整次墙钟才报错代价太高）。
+const defaultStreamIdleTimeout = 300 * time.Second
 
 // truncateToolCallInputsForHistory 返回 assistant 消息的入史副本：
 // ToolCalls 的 Input 中超长字符串值被截断（附原始长度标记），其余字段与原消息共享。
@@ -872,6 +887,20 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 	if keepalive <= 0 {
 		keepalive = 30 * time.Second
 	}
+	// 流式块间空闲超时（2026-08-20）：ark glm-5.3 流式一天三次中途静默
+	// （440s / 15min / 20min 零 chunk，均等满整次调用墙钟才报错）。首块之后的
+	// chunk 间隔超过阈值即判流死、取消流让 generate 重试；首块前静默保留整体
+	// 墙钟兜底（thinking 模型首 token 前静默数分钟是合法的，不能误杀）。
+	idleTimeout := a.streamIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultStreamIdleTimeout
+	}
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	var idleMu sync.Mutex
+	lastChunk := time.Now()
+	firstChunk := false
+	idleKilled := false
 	keepaliveDone := make(chan struct{})
 	defer close(keepaliveDone)
 	go func() {
@@ -885,13 +914,33 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 				return
 			case <-ticker.C:
 				a.touchActivity()
+				idleMu.Lock()
+				idle := firstChunk && time.Since(lastChunk) > idleTimeout
+				idleMu.Unlock()
+				if idle {
+					idleMu.Lock()
+					idleKilled = true
+					idleMu.Unlock()
+					cancelStream()
+					return
+				}
 			}
 		}
 	}()
-	for resp, err := range sp.NewStreaming(ctx, req) {
+	for resp, err := range sp.NewStreaming(streamCtx, req) {
 		if err != nil {
+			idleMu.Lock()
+			killed := idleKilled
+			idleMu.Unlock()
+			if killed && ctx.Err() == nil {
+				return nil, fmt.Errorf("stream idle timeout (no chunk for %s after first chunk): %w", idleTimeout, err)
+			}
 			return nil, err
 		}
+		idleMu.Lock()
+		lastChunk = time.Now()
+		firstChunk = true
+		idleMu.Unlock()
 		// 流式块即活动证据：thinking 模型单次长生成可达 5-7 分钟（大段代码+深度推理），
 		// 期间无工具派发/generateOnce 结束，心跳巡检若无此刷新会误判假死杀掉活跃叶子
 		// （实证 2026-08-13 全天 4 次 HEARTBEAT KILL，被杀 LLM 调用均已在跑 5m40s-7m24s）。
@@ -919,6 +968,14 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 	}
 	if final == nil {
 		return nil, errors.New("empty model stream")
+	}
+	// provider 被取消后可能不 yield 错误而是直接 return（generator 契约允许）：
+	// 此时流被截断但 final 已有首块内容，若当正常结束返回会把半截内容当终答。
+	idleMu.Lock()
+	killed := idleKilled
+	idleMu.Unlock()
+	if killed && ctx.Err() == nil {
+		return nil, fmt.Errorf("stream idle timeout (no chunk for %s after first chunk): stream terminated", idleTimeout)
 	}
 	return final, nil
 }
