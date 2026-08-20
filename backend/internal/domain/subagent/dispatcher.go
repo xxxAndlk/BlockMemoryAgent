@@ -282,7 +282,7 @@ type Dispatcher struct {
 	// activity 存叶子子 Agent 最后活动时间戳（unix nano），键 subAgentID -> *atomic.Int64。
 	// 仅叶子 Agent 注入（DomainAgent/MetaAgent 有 wait loop 不注入，避免误杀合法等待）。
 	activity sync.Map
-	// lastWrites 存子 Agent 近期写入的文件清单（subAgentID -> []fileWriteRecord），
+	// lastWrites 存子 Agent 近期写入的文件清单（subAgentID -> *fileWriteState），
 	// 从实时工具事件识别（WriteFile/EditFile）。心跳巡检 kill 时把清单回告父 Agent--
 	// 收尾卡死被杀的子 Agent 常已把产物全部落盘（2026-08-19 引擎 Agent：文件 15:54 落盘、
 	// 回执因 judge 挂死拖到 17:03），父级需要知道盘上有货可按现状验收，而非从零重派。
@@ -398,8 +398,17 @@ type fileWriteRecord struct {
 	at   time.Time
 }
 
+// fileWriteState 是单个子 Agent 的写入清单（互斥保护，写事件流与 kill 巡检读并发）。
+type fileWriteState struct {
+	mu   sync.Mutex
+	recs []fileWriteRecord
+}
+
+// fileWriteStateMaxRecords 是单 Agent 保留的最大写入记录数（去重后上限，防长任务膨胀）。
+const fileWriteStateMaxRecords = 8
+
 // recordFileWrite 从工具调用实时事件识别文件写入（WriteFile/EditFile），记录路径与时间。
-// copy-on-write + CAS 保证与 killStuckSubAgent 的并发读安全；同路径去重保最新。
+// 同路径去重保最新写入时间。
 func (d *Dispatcher) recordFileWrite(subAgentID string, ev agent.LiveEvent) {
 	if ev.Kind != agent.LiveEventToolCall || (ev.Tool != "WriteFile" && ev.Tool != "EditFile") {
 		return
@@ -411,24 +420,21 @@ func (d *Dispatcher) recordFileWrite(subAgentID string, ev agent.LiveEvent) {
 		return
 	}
 	path := strings.TrimSpace(in.Path)
-	now := time.Now()
-	for {
-		old, _ := d.lastWrites.LoadOrStore(subAgentID, []fileWriteRecord{})
-		list := old.([]fileWriteRecord)
-		next := make([]fileWriteRecord, 0, len(list)+1)
-		for _, r := range list {
-			if r.path != path {
-				next = append(next, r)
-			}
-		}
-		next = append(next, fileWriteRecord{path: path, at: now})
-		if len(next) > 8 {
-			next = next[len(next)-8:]
-		}
-		if d.lastWrites.CompareAndSwap(subAgentID, list, next) {
-			return
+	v, _ := d.lastWrites.LoadOrStore(subAgentID, &fileWriteState{})
+	st := v.(*fileWriteState)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	next := make([]fileWriteRecord, 0, len(st.recs)+1)
+	for _, r := range st.recs {
+		if r.path != path {
+			next = append(next, r)
 		}
 	}
+	next = append(next, fileWriteRecord{path: path, at: time.Now()})
+	if len(next) > fileWriteStateMaxRecords {
+		next = next[len(next)-fileWriteStateMaxRecords:]
+	}
+	st.recs = next
 }
 
 // recentWrittenFiles 返回子 Agent 近 within 窗口内写入的文件清单（保序去重）。
@@ -437,9 +443,12 @@ func (d *Dispatcher) recentWrittenFiles(subAgentID string, within time.Duration)
 	if !ok {
 		return nil
 	}
+	st := v.(*fileWriteState)
 	cutoff := time.Now().Add(-within)
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	var out []string
-	for _, r := range v.([]fileWriteRecord) {
+	for _, r := range st.recs {
 		if r.at.After(cutoff) {
 			out = append(out, r.path)
 		}

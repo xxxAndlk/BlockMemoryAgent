@@ -220,7 +220,7 @@ func TestSalvageFailure_LeafWritesRoleSlot(t *testing.T) {
 	if !strings.Contains(salvage, "探索成果") {
 		t.Fatalf("salvage should return text even without domain, got: %q", salvage)
 	}
-	val, err := shared.Get(context.Background(), "s1:salvage:role:domain")
+	val, err := shared.Get(context.Background(), "s1:salvage:role.domain")
 	if err != nil || !strings.Contains(val, "探索成果") {
 		t.Fatalf("leaf salvage should write role-scoped slot, err=%v val=%q", err, val)
 	}
