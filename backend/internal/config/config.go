@@ -47,7 +47,7 @@ type LLMRuntimeConfig struct {
 	HistoryMaxMessages          int `yaml:"history_max_messages"`            // 单次 LLM 请求携带的最大历史消息数（默认 40，滑动窗口防 token 爆炸；负数表示不裁剪）
 	ToolOutputHistoryMaxRunes   int `yaml:"tool_output_history_max_runes"`   // 写入历史的单条工具输出最大字符数（默认 2000；负数表示不截断）
 	SummarizeEvery              int `yaml:"summarize_every"`                 // 每 N 步触发一次历史压缩（默认 10；<=0 关闭压缩，仅用滑动窗口）
-	SummarizeKeepRecent         int `yaml:"summarize_keep_recent"`           // 压缩时保留最近 K 条原始消息（默认 10；<=0 视为 10）
+	SummarizeKeepRecent         int `yaml:"summarize_keep_recent"`           // 压缩时保留最近 K 条原始消息（默认 15；<=0 视为 15。2026-08-21 由 10 上调：场景装配 Agent 压缩后丢工具结果细节被迫重读文件，多留 5 条原始消息换少一轮重侦察）
 	SummarizeTimeoutSec         int `yaml:"summarize_timeout_sec"`           // 事件摘要轻量模型调用超时（秒，默认 120）。旧硬编码 5s 对思考型模型必然超时，摘要全挂降级 raw join，上下文全量回注致 token 预算提前耗尽（实证 verify 子 Agent 300K 预算 7 分钟烧穿）
 	// SalvageLLMTimeoutSec 失败打捞轻量调用超时（秒，默认 30；思考型模型场景建议 >=60）。
 	// 旧硬编码 5s 对思考型模型（glm/deepseek 推理系）来不及出首 token，打捞 facts=0 全降级（TODO #33）。
@@ -73,6 +73,11 @@ type LLMRuntimeConfig struct {
 	// 续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证：验收领域研磨
 	// 32 轮 30 分钟不收敛）。触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工。
 	PausedDomainMaxResumes int `yaml:"paused_domain_max_resumes"`
+	// DomainReconWallClockMin DomainAgent 派发无显式 wall_clock_min 时的默认侦察墙钟（分钟，
+	// 默认 30；0=关闭回退全局 sub_agent_timeout_min）。2026-08-21 慢任务根因修复：实证领域
+	// Agent 侦察失控（炮塔领域 1.5h 零交付——"契约反推"读消费点文件 15+ 轮慢思考从未派发/写入），
+	// 中点邮件预警"停止侦察开始产出"。显式 wall_clock_min 的派发不受影响。
+	DomainReconWallClockMin int `yaml:"domain_recon_wall_clock_min"`
 	// PromptEnhance 用户输入自动提示词补全开关（TODO #36 Phase 0 规则版，默认 true）。
 	// 指针三态：nil=默认开启（applyDefaults 兜底）；显式 true/false 尊重显式值。
 	// 开启时 sendMessage 对命中续跑/控制/诊断意图的输入附加【系统补全】段
@@ -456,7 +461,10 @@ func (c *Config) applyLLMRuntimeDefaults() {
 		c.Agent.SummarizeEvery = 10
 	}
 	if c.Agent.SummarizeKeepRecent == 0 {
-		c.Agent.SummarizeKeepRecent = 10
+		c.Agent.SummarizeKeepRecent = 15
+	}
+	if c.Agent.DomainReconWallClockMin == 0 {
+		c.Agent.DomainReconWallClockMin = 30
 	}
 	if c.Agent.SummarizeTimeoutSec == 0 {
 		c.Agent.SummarizeTimeoutSec = 120

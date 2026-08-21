@@ -819,7 +819,7 @@ func (r *Registry) Schema() []tools.Tool {
 	// 注册 WriteSharedMemory 工具：写入 KV 共享记忆，供子 Agent 经 dispatcher.injectKVMemory 自动读取。
 	// 仅暴露给 MetaAgent（meta 角色白名单），固定助手/DomainAgent 的白名单不含此工具。
 	// files 字段填涉及的文件路径列表，写入时记录 mtime；任一文件被 WriteFile 修改后该记忆自动失效。
-	if t, err := tools.NewFunc("WriteSharedMemory", "把派发前采集的关键上下文（文件路径、行号、函数签名、前置结论、验收标准）写入共享记忆。被派发的子 Agent 会自动读取，避免重读全文件。files 字段填涉及的文件路径列表，写入时记录 mtime，任一文件被 WriteFile 修改后该记忆自动失效。仅 MetaAgent 可用。", func(ctx context.Context, in writeSharedMemoryInput) (string, error) {
+	if t, err := tools.NewFunc("WriteSharedMemory", "把派发前采集的关键上下文（文件路径、行号、函数签名、前置结论、验收标准）写入共享记忆。被派发的子 Agent 会自动读取，避免重读全文件。files 字段填涉及的文件路径列表，写入时记录 mtime，任一文件被 WriteFile 修改后该记忆自动失效。仅 MetaAgent 可用。\n侦察结论必须随时沉淀：每读完一批关键文件（消费点 API、签名、常量、行号证据）就立即写入一条，不要攒到最后——侦察中途失败/超时后，下一次重跑靠这些记忆跳过重读，否则全部侦察白干（实证领域 Agent 91 分钟侦察零沉淀，重跑时全套文件重读一遍）。", func(ctx context.Context, in writeSharedMemoryInput) (string, error) {
 		args := map[string]any{"content": in.Content}
 		if len(in.Files) > 0 {
 			files := make([]any, 0, len(in.Files))
@@ -837,7 +837,7 @@ func (r *Registry) Schema() []tools.Tool {
 	// 暴露 WriteSpec 工具：派发子 Agent 前写入结构化任务规范（goal/acceptance/constraints/files）。
 	// SpecEnforcement 开启时 dispatcher 强制 call_sub_agent 前先调本工具，否则拒绝派发。
 	// 与 WriteSharedMemory 共享 KV 后端，固定 slot "spec"，files 字段记录 mtime 供失效校验。
-	if t, err := tools.NewFunc("WriteSpec", "派发子 Agent 前写入结构化任务规范（目标/验收/约束/涉及文件）。dispatcher 会强制 call_sub_agent 前先调本工具，并把规范作为【任务规范】前缀注入子 Agent。files 字段填涉及的文件路径列表，写入时记录 mtime；任一文件被 WriteFile 修改后该规范自动失效，下次派发子 Agent 不再注入旧规范。覆盖语义：同一 parent 的写入覆盖前一次内容（不追加）。每个 parent 只存一份 spec，兄弟子 Agent 共享。", func(ctx context.Context, in writeSpecInput) (string, error) {
+	if t, err := tools.NewFunc("WriteSpec", "派发子 Agent 前写入结构化任务规范（目标/验收/约束/涉及文件）。dispatcher 会强制 call_sub_agent 前先调本工具，并把规范作为【任务规范】前缀注入子 Agent。files 字段填涉及的文件路径列表，写入时记录 mtime；任一文件被 WriteFile 修改后该规范自动失效，下次派发子 Agent 不再注入旧规范。覆盖语义：同一 parent 的写入覆盖前一次内容（不追加）。每个 parent 只存一份 spec，兄弟子 Agent 共享。\n已验证的事实直接钉进 spec（关键常量值、API 签名、行号、结论），不要让子 Agent 现场\"自行验证\"——实证领域 Agent 为一个朝向常量现场写像素测量脚本、为消费点 API 通读全套文件，侦察烧掉整个预算。你已知的就写进去，子 Agent 未知的才让它查。", func(ctx context.Context, in writeSpecInput) (string, error) {
 		args := map[string]any{"goal": in.Goal}
 		if len(in.Acceptance) > 0 {
 			acc := make([]any, 0, len(in.Acceptance))

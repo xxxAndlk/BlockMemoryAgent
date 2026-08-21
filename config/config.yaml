@@ -44,7 +44,7 @@ memory:
 agent:
   # -- ReAct 主循环 --
   summarize_every: 10            # 每 10 步压缩；<=0 关闭。压缩视图触发后冻结（pipeline compressState），压缩轮是 DeepSeek 前缀缓存唯一失效点；步频拉大=缓存命中升高+原文在历史里保留更久（防"压缩丢原文→重读"循环），过大则单轮 input 变长
-  summarize_keep_recent: 10      # 保留最近 10 条
+  summarize_keep_recent: 15      # 保留最近 15 条（2026-08-21 由 10 上调：压缩丢工具结果细节致领域 Agent 重读文件白烧慢思考轮；多留 5 条原始消息）
   summarize_timeout_sec: 120     # 事件摘要轻量模型调用超时（秒）。思考型模型首 token 需数十秒，旧硬编码 5s 致摘要全挂、上下文全量回注、token 预算提前烧穿（实证 verify 子 Agent 300K 预算 7 分钟耗尽）
   salvage_llm_timeout_sec: 60     # 失败打捞轻量调用超时（秒，默认 30）。旧硬编码 5s 对思考型模型来不及出首 token，打捞 facts=0 全降级（TODO #33）；当前轻量模型为推理系，取 60s 下限
   history_max_messages: 48       # 滑动窗口硬上限（system 前缀 + 最近消息），防 API 上下文溢出；负数表示不裁剪。配合 summarize_every=10+keep_recent=10，压缩周期内消息峰值 ~34 条，48 保证周期内窗口不滑动、发送历史纯追加（DeepSeek 前缀缓存全命中）；仅在超长会话兜底滑动
@@ -62,6 +62,7 @@ agent:
   task_max_runes_hard: 4000      # 派发 task 文本硬上限（TODO #35）：超硬限拒绝；仍拦截全量规格转贴（事故日志 3521/2315 runes 区间已上移）
   react_llm_timeout_sec: 1800    # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断；600s 仍不够——2026-08-13 实证 MetaAgent 汇总轮（4 领域摘要 ~20K input）10 分钟被掐断,整品验收没派出去,故 600->1200；2026-08-20 ark glm-5.3 流式两次中途静默(440s/15min+),1200->1800 给慢思考留满余量。配合 generate() 不在 deadline 上重试,卡死时 1800s 即报错。
   sub_agent_timeout_min: 120     # 子 Agent 独立执行超时（分钟），负数表示不限制。TODO #35 放开预算：60->120，慢推理（thinking）下长任务不再撞超时。
+  domain_recon_wall_clock_min: 30 # Domain 侦察墙钟（分钟）：domain 派发无显式 wall_clock_min 时的默认预算，中点邮件预警"停止侦察开始产出"。2026-08-21 慢任务修复：实证炮塔领域 Agent 1.5h 全程"契约反推"侦察零交付；0=关闭回退全局值。
   engine_llm_timeout_sec: 300    # 引擎辅助 LLM（reflection 自检 judge / plan_execute 规划）单次调用超时（秒）。该路径不走 CallLLM 包装,只吃 SDK 默认 600s/请求,provider 3 次重试 × judge 内部重试叠加曾烧 70 分钟直到墙钟强杀（2026-08-19 引擎 Agent 事故）；300s 包住整次调用含 provider 重试,到期快速失败。
   tool_output_history_max_runes: 20000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 行区间分页默认 200 行/页（read_file_max_chars 默认 16000 字符，ASCII 整页约 16000 runes），20000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取
   token_budget_per_goal: 300000   # 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。保留不破坏旧配置加载，不再驱动任何闸门。

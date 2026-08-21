@@ -176,6 +176,11 @@ type Dispatcher struct {
 
 	// timeout 是子 Agent 独立执行的最大时长；<=0 表示不限制。默认 30 分钟。
 	timeout time.Duration
+	// domainReconClock 是 DomainAgent 派发无显式 wall_clock_min 时的默认墙钟（分钟）
+	//（2026-08-21 慢任务根因修复：domain 侦察阶段失控——炮塔领域 Agent 1.5h 零交付，
+	// 全程"契约反推"侦察 15+ 轮慢思考从未进入派发/写入）。取 min(recon, timeout)。
+	// 中点投递"停止侦察开始产出"预警邮件。<=0 关闭（用全局 timeout）。
+	domainReconClock time.Duration
 	// taskRuneSoftLimit / taskRuneHardLimit 是派发 task 文本长度双档上限（TODO #35 放开预算）。
 	// 超软上限但未达硬上限：放行并附压缩警告（软着陆）；超硬上限：拒绝（全量规格转贴区间）。
 	// 默认 3000/4000（原 2000/2600 实证过紧，强模型吃大上下文后转贴代价低），bootstrap 按配置覆盖。
@@ -736,6 +741,13 @@ func (d *Dispatcher) WithTimeout(t time.Duration) *Dispatcher {
 	return d
 }
 
+// WithDomainReconClock 配置 DomainAgent 派发无显式 wall_clock_min 时的默认墙钟。
+// <=0 关闭（回退全局 timeout）。bootstrap 从 config domain_recon_wall_clock_min 注入。
+func (d *Dispatcher) WithDomainReconClock(t time.Duration) *Dispatcher {
+	d.domainReconClock = t
+	return d
+}
+
 // WithPluginVisibility 注入插件工具角色可见性回调（设计文档 §4.3）。
 // 由 bootstrap 注入 plugins.Manager.ToolVisibility；传 nil 关闭插件可见性过滤。
 func (d *Dispatcher) WithPluginVisibility(fn agent.ToolVisibilityFunc) *Dispatcher {
@@ -1141,7 +1153,8 @@ func (t *callSubAgentTool) Description() string {
 		"dispatcher 校验 ∩ 子 Agent 角色权限天花板后预挂载——子 Agent 当轮即可见对应插件工具，无需自己挂载。" +
 		"天花板外（插件 roles 白名单不允许）的越界项会被忽略并随本调用结果回告，不放大权限。\n\n" +
 		"【wall_clock_min 字段】（可选）本次派发的墙钟预算（分钟，代码级强制执行，与全局 sub_agent_timeout 取小）：" +
-		"到期前子 Agent 会收到收口警告，超时直接终止。验收/巡检类任务建议显式给预算（如 15）防止无边界扩张；普通建设任务省略。\n\n" +
+		"到期前子 Agent 会收到收口警告，超时直接终止。验收/巡检类任务建议显式给预算（如 15）防止无边界扩张；普通建设任务省略" +
+		"（省略时 domain 默认侦察墙钟 30 分钟，过半会收到\"停止侦察开始产出\"预警）。\n\n" +
 		"【reuse_agent_id 字段】（可选，热驻复用）复用已完成的热驻领域 Agent：填【空闲领域Agent】清单中的 agent_id。" +
 		"新任务与该领域强相关时优先复用（保留全部上下文与领域知识，省冷启动）；弱相关则省略本字段新建 domain。" +
 		"复用时 role_id/domain/responsibility 可省略（沿用槽内冻结值），task 必填。目标 Agent 忙碌时任务入队，当前任务完成后自动执行。\n\n" +
@@ -1351,7 +1364,14 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// 派发级墙钟（2026-08-19）：wall_clock_min 是代码级预算，替代 roles.yaml 提示词墙钟
 	//（对 LLM 只是软约束，实证验收 Agent 拿 15 分钟预算实际跑 39 分钟）。
 	// 取 min(wallClock, d.timeout)：派发级预算不放大全局上限。
+	// Domain 侦察墙钟（2026-08-21）：domain 无显式 wall_clock_min 时注入默认预算——
+	// 实证领域 Agent 侦察失控（炮塔 1.5h 零交付：15+ 轮慢思考"契约反推"从未派发/写入），
+	// reconClock 兜住侦察阶段，中点邮件预警"停止侦察开始产出"。
 	effectiveTimeout := d.timeout
+	if wallClock <= 0 && roleDef.ID == "domain" && d.domainReconClock > 0 &&
+		(effectiveTimeout <= 0 || d.domainReconClock < effectiveTimeout) {
+		effectiveTimeout = d.domainReconClock
+	}
 	if wallClock > 0 && (effectiveTimeout <= 0 || wallClock < effectiveTimeout) {
 		effectiveTimeout = wallClock
 	}
@@ -1443,6 +1463,30 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 					Subject: "墙钟预警",
 					Body: fmt.Sprintf("【墙钟预警】距执行上限（%v）只剩约 %v，请立即收口：停止继续探索，基于已有产出输出终答。",
 						effectiveTimeout, grace),
+				})
+			}()
+		}
+	}
+
+	// 侦察中点预警（2026-08-21）：domain 用侦察墙钟（未显式给 wall_clock_min）时，
+	// 过半投递"停止侦察开始产出"。实证领域 Agent 把全部预算花在契约反推侦察
+	// （读消费点文件 15+ 轮慢思考），到墙钟仍零派发零写入；中点预警在仍余半预算时
+	// 把模型推入产出阶段，比终点收口警告多留一半执行时间。ctx 结束即退出，零泄漏。
+	if wallClock <= 0 && roleDef.ID == "domain" && d.domainReconClock > 0 && d.mailbox != nil {
+		half := effectiveTimeout / 2
+		if half >= time.Minute {
+			go func() {
+				select {
+				case <-time.After(half):
+				case <-subAgentCtx.Done():
+					return
+				}
+				_, _ = d.mailbox.Send(&mailbox.Message{
+					From:    "dispatcher",
+					To:      subAgentID,
+					Type:    mailbox.MsgInfo,
+					Subject: "侦察预算过半",
+					Body: fmt.Sprintf("【侦察预算预警】已用约 %v（侦察墙钟 %v 的过半），停止继续侦察：已读文件的结论已足够，立即转入派发叶子/写文件。剩余预算必须全部用于产出。", half, effectiveTimeout),
 				})
 			}()
 		}

@@ -105,6 +105,57 @@ func TestDispatchOne_WallClockEnforced(t *testing.T) {
 	}
 }
 
+// TestDispatchOne_DomainReconClockEnforced 验证 domain 侦察墙钟：无显式 wall_clock_min 的
+// domain 派发吃 domainReconClock（而非全局 timeout），超时被终止且失败文案报侦察上限。
+// 显式 wall_clock_min 仍优先生效（不被 reconClock 放大）。
+func TestDispatchOne_DomainReconClockEnforced(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles:  []types.RoleDefinition{},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	// 全局 10min、侦察墙钟 300ms：domain 无 wall_clock_min 应被 reconClock 收口。
+	d := NewDispatcher(reg, &mockModelFactory{provider: &ctxAwareHangingProvider{release: release}}, toolsReg, mb, agent.NopMemoryPipeline{}).
+		WithTimeout(10 * time.Minute).
+		WithDomainReconClock(300 * time.Millisecond)
+	d.RegisterCallTool(toolsReg)
+	t.Cleanup(d.ClosePatrol)
+
+	ctx := agent.WithAgentID(context.Background(), "meta")
+	if _, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"domain":         "测试",
+		"responsibility": "测试领域",
+		"task":           "hang",
+	}); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.PendingChildren("meta") == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if d.PendingChildren("meta") != 0 {
+		t.Fatalf("recon clock should terminate domain agent, pending=%d", d.PendingChildren("meta"))
+	}
+	msgs := mb.Drain("meta")
+	if len(msgs) == 0 {
+		t.Fatal("expected timeout failure notify in mailbox")
+	}
+	if !strings.Contains(msgs[0].Body, "300ms") {
+		t.Fatalf("failure message should report recon clock limit, got: %s", msgs[0].Body)
+	}
+}
+
 // TestWrapEngineLLM_TimeoutAndKeepalive 验证引擎辅助 LLM 包装：
 // 1) 整次调用（含内部挂起）被 engineLLMTimeout 快速掐断（不再烧到墙钟）；
 // 2) 调用期间保活定时器刷新 activity（防心跳巡检误杀 judge 长生成）。

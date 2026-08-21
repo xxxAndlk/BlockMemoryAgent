@@ -272,6 +272,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.WithTimeout(subAgentTimeout).WithHeartbeatTimeout(subAgentHeartbeat).WithLoopConfigByRole(reactCfg.LoopConfigByRole).WithBlockMemorySearcher(pgStore)
 	// DomainAgent 心跳（TODO #25-3 防误杀版）：默认 2× 叶子；等子/等回信靠后代活动冒泡保活。
 	subAgentDispatcher.WithDomainHeartbeatTimeout(time.Duration(cfg.Agent.DomainHeartbeatTimeoutMin) * time.Minute)
+	// Domain 侦察墙钟（2026-08-21）：domain 无显式 wall_clock_min 时的默认预算 + 中点预警邮件，
+	// 兜住侦察阶段失控（实证炮塔领域 1.5h 零交付）。0=关闭。
+	subAgentDispatcher.WithDomainReconClock(time.Duration(cfg.Agent.DomainReconWallClockMin) * time.Minute)
 	// Paused domain 续跑次数上限：续跑重置 fresh budget，无上限则研磨环路永不绑定；
 	// 触顶后强制收口部分返回父 Agent（默认 1，cfg.Agent.PausedDomainMaxResumes 可调）。
 	subAgentDispatcher.WithMaxPausedResumes(cfg.Agent.PausedDomainMaxResumes)
