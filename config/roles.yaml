@@ -17,7 +17,7 @@
 meta_agent:
   model_config: &meta_model
     provider: anthropic
-    model: glm-5.3
+    model: doubao-seed-evolving
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.3
@@ -25,6 +25,9 @@ meta_agent:
     # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
     # 已切换 k3(非推理, 与 domain 同端点)：2026-08-04 基线运行 glm-5.2 路由 3m18s + 汇总多次 thinking 共 322s，
     # k3 路由决策应控制在 1 分钟内，配合下方【派发铁律】提示词。
+    # 2026-08-21 成本重排（火山方舟抵扣：k3=10 / glm-5.3=4.5 / evolving=2.5 / flash=0.5）：
+    # meta 是最大 token 消耗点（长输入段 ×1~×2 放大），现值 doubao-seed-evolving（抵扣 2.5，
+    # Agent 编排/长程规划定位）；kimi-k3（抵扣 10）不留常驻角色，仅在硬骨头任务手动临时切换。
   # tools 非空时整体覆盖 registry.go 内置白名单。本配置相对内置默认去掉 HTTPGet：
   # 实证 2026-08-18，MetaAgent 联网永远默认走内置 HTTPGet 硬刮搜索引擎（零摩擦路径依赖），
   # web_search 插件（firecrawl，roles:["meta"]）需要 tool_catalog+tool_mount 两步而从不被选中。
@@ -115,7 +118,7 @@ meta_agent:
 domain_agent:
   model_config: &domain_model
     provider: anthropic
-    model: glm-5.3
+    model: doubao-seed-2.1-turbo
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.5
@@ -309,7 +312,8 @@ fixed_roles:
       temperature: 0.4
       max_tokens: 32768  # 软偏好：超端点硬上限时 provider 自动钳制并重试（2026-08-13 实证 ark /api/coding 对 kimi 系硬限 32768，配 65536 全 400）；截断风险由跨轮续写（maxContinueRounds）兜底
       # 历史注：glm-5.2(thinking) 编码单轮分钟级曾拖慢全链路；k3(非推理) 单轮 ~1min。
-      # 现值 deepseek-v4-flash 经 openai-chat 原生端点，前缀缓存命中省计费省延迟。
+      # 现值 deepseek-v4-flash：叶子是最高频角色，规格已被 spec 钉死、单文件闭环，
+      # flash（抵扣 0.5）性价比最优；k2.7-code（抵扣 4.5）留作质量不足时的升级档。
     can_be_called: true
 
   # UI助手
@@ -392,7 +396,7 @@ fixed_roles:
     tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &review_model
       provider: anthropic
-      model: deepseek-v4-flash
+      model: glm-5.3
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.2
@@ -514,7 +518,7 @@ fixed_roles:
     tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &doc_model
       provider: anthropic
-      model: deepseek-v4-flash
+      model: doubao-seed-2.0-lite
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.5
