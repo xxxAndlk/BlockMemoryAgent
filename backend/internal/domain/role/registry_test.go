@@ -263,3 +263,32 @@ func TestRegistry_RegisterTools(t *testing.T) {
 		t.Errorf("expected 2 tools, got %d", len(got.Tools))
 	}
 }
+
+// TestRegistry_DomainRetainsLeafDispatch 锁定两层编排不变量：
+// domain 默认自执行是提示词纪律，机制上仍保留 call_sub_agent 与 domain->fixed 调用权，
+// 叶子助手作为可选下拆层存在（2026-08-22 任务 83）。
+func TestRegistry_DomainRetainsLeafDispatch(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Name: "代码助手", Type: enums.RoleTypeFixed, CanBeCalled: true},
+		},
+	}
+	r := NewRegistry(cfg)
+
+	d := r.Get("domain")
+	if d == nil {
+		t.Fatal("domain 角色定义不应为 nil")
+	}
+	found := false
+	for _, name := range d.Tools {
+		if name == "call_sub_agent" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("domain 工具白名单应保留 call_sub_agent（下拆为例外保留能力，不删机制）")
+	}
+	if !r.CanCall("domain", "code_assistant") {
+		t.Fatal("CanCall(domain, code_assistant) 应为 true（叶子保留为可选下拆层）")
+	}
+}
