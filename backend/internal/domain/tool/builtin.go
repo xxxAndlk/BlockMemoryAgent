@@ -143,7 +143,7 @@ type (
 	// 与 subagent 包内部入参结构保持一致（按字段名 JSON 解码）。
 	callSubAgentInput struct {
 		// RoleID 为被调用子 Agent 的角色标识。
-		RoleID string `json:"role_id" description:"被调用子 Agent 的角色标识，从工具描述的角色清单中选。默认走 domain，仅单函数级、单文件、领域明确的任务直派固定助手。"`
+		RoleID string `json:"role_id" description:"被调用子 Agent 的角色标识，从工具描述的角色清单中选。默认走 domain（其收到后默认自执行），仅单函数级、单文件、领域明确的任务直派固定助手。"`
 		// Task 为交给子 Agent 执行的自包含任务描述。
 		Task string `json:"task" description:"自包含任务描述（<=500 字）：背景、目标、相关文件路径、前置结论与验收标准。子 Agent 看不到当前对话历史，规格原文走 WriteSharedMemory。"`
 		// Domain 为领域分类简称（如 金融/认证/UI/数据库），仅 role_id="domain" 时有效，

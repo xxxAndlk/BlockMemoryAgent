@@ -1125,7 +1125,7 @@ func (t *callSubAgentTool) Aliases() []string { return nil }
 // 使工具 schema 始终反映 roles.yaml 的最新角色配置。
 func (t *callSubAgentTool) Description() string {
 	// 角色清单：domain 作为默认派发入口列首，固定助手标为叶子执行者。
-	entries := []string{"domain（默认派发入口：复杂任务/不确定范围走这里，由 DomainAgent 读文件/联网/拆到单函数级再派助手或自执行）"}
+	entries := []string{"domain（默认派发入口：复杂任务/不确定范围走这里，DomainAgent 是该领域的直接执行者，收到后默认自执行，仅其自主判断需要时才下拆叶子助手）"}
 	for _, fr := range t.dispatcher.registry.CallableFixedRoles() {
 		entries = append(entries, fmt.Sprintf("%s（叶子执行者：%s；仅在任务已单函数级、单文件、领域明确时直派）", fr.ID, fr.Description))
 	}
@@ -1138,9 +1138,10 @@ func (t *callSubAgentTool) Description() string {
 		"WriteSpec 与 WriteSharedMemory 是不同工具：WriteSharedMemory 写自由 KV 供子 Agent 读，" +
 		"WriteSpec 写固定 slot \"spec\" 供 dispatcher 校验并注入子 Agent 任务体前缀。两者不可互相替代。\n\n" +
 		"【路由规则】\n" +
-		"1. 默认走 domain：多文件/多函数/多步骤/不确定范围 -> role_id=\"domain\"，由 DomainAgent 拆分后再派助手。\n" +
+		"1. 默认走 domain：多文件/多函数/多步骤/不确定范围 -> role_id=\"domain\"。DomainAgent 是该领域的直接执行者，收到后默认自执行，仅其自主判断需要时才下拆叶子。\n" +
 		"2. 直派固定助手：仅当任务已单函数级、单文件、领域明确（如\"修改 X 函数签名\"、\"补一个测试\"）时直派对应助手。\n" +
-		"3. 不确定走哪条？走 domain。domain 可自执行单点改动，不会无谓下拆。\n\n" +
+		"3. 不确定走哪条？走 domain。\n" +
+		"4. 若你本身就是 DomainAgent：你不能派 domain（会被拒绝）。默认自执行，仅按你提示词中的【拆分决策】必要时直派固定助手。\n\n" +
 		"【domain 字段】role_id=\"domain\" 时填领域分类简称（如 金融/认证/UI/数据库/配置），" +
 		"用于子 Agent 展示名（\"金融领域Agent\"）。固定助手忽略此字段，用其角色名。\n" +
 		"【responsibility 字段】role_id=\"domain\" 时必填：该领域 Agent 的职责边界（<= 200 字），" +
