@@ -17,7 +17,7 @@ import (
 	"unicode/utf8"  // unicode/utf8 用于 RuneCountInString 统计 task 字符数
 
 	"github.com/blockmemory/agent/backend/internal/agent"               // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
-	"github.com/blockmemory/agent/backend/internal/board" // board 提供任务看板（TODO #22 执行计划）
+	"github.com/blockmemory/agent/backend/internal/board"               // board 提供任务看板（TODO #22 执行计划）
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // orchestrator 提供 Agent 树元数据层
 	"github.com/blockmemory/agent/backend/internal/domain/role"         // role 包提供角色注册表
 	"github.com/blockmemory/agent/backend/internal/domain/tool"         // tool 包提供工具注册表与 Result 类型
@@ -273,8 +273,8 @@ type Dispatcher struct {
 	// softStops 记录处于"软停止中"的 sessionID（TODO #37）：ReactService.Stop 先标记再
 	// 触发子 Agent cancel；dispatcher 的 context.Canceled 收尾分支据此分流——
 	// domain 落 Paused（存 history 可续跑）、叶子部分回灌，而非静默跳过。
-	softStops   map[string]bool
-	softStopMu  sync.Mutex
+	softStops  map[string]bool
+	softStopMu sync.Mutex
 
 	// heartbeatTimeout 子 Agent 心跳超时：叶子 Agent 超过该时长无活动（generateOnce/工具派发）
 	// 判定假死（LLM 流式挂起/工具 hang），巡检 goroutine 主动 cancel + notify 父 + trackChildDone，
@@ -349,7 +349,7 @@ func (d *Dispatcher) trackChildDone(parentID string) {
 
 // subAgentMeta 存子 Agent 巡检所需元数据：cancel 用于主动取消卡死子 Agent ctx；
 // parentID/sessionID 用于 notify 父与 treeFinish；doneOnce 保证 trackChildDone 仅触发一次
-//（patrol 与 goroutine 竞争时防双递减，PendingChildren 不会为负）。
+// （patrol 与 goroutine 竞争时防双递减，PendingChildren 不会为负）。
 // wallClock 是本次派发的有效墙钟（wall_clock_min ∩ sub_agent_timeout），供失败文案
 // 报准确上限（否则 15 分钟预算被杀时文案误报"上限 2h0m0s"）。
 type subAgentMeta struct {
@@ -754,6 +754,7 @@ func (d *Dispatcher) WithPluginVisibility(fn agent.ToolVisibilityFunc) *Dispatch
 	d.pluginVisibility = fn
 	return d
 }
+
 // WithTaskRuneLimits 配置派发 task 文本双档上限（TODO #35 放开预算）：
 // 超 soft 未达 hard 软着陆放行附警告，超 hard 硬拒。<=0 按默认 3000/4000。
 // bootstrap 按 cfg.Agent.TaskMaxRunes / TaskMaxRunesHard 注入。
@@ -767,7 +768,7 @@ func (d *Dispatcher) WithTaskRuneLimits(soft, hard int) *Dispatcher {
 	return d
 }
 
-	// WithMaxPausedResumes 设置同一 Paused domain 的最大续跑次数（<=0 按默认 1）。
+// WithMaxPausedResumes 设置同一 Paused domain 的最大续跑次数（<=0 按默认 1）。
 // 触顶后 ResumePaused 不再给 fresh budget 续跑，强制收口：部分产出 notify 父 + 标 Done，
 // 由 MetaAgent 决定返工——与叶子助手 errPartialReturn 同哲学。
 // bootstrap 按 cfg.Agent.PausedDomainMaxResumes 注入。
@@ -1154,8 +1155,9 @@ func (t *callSubAgentTool) Description() string {
 		"dispatcher 校验 ∩ 子 Agent 角色权限天花板后预挂载——子 Agent 当轮即可见对应插件工具，无需自己挂载。" +
 		"天花板外（插件 roles 白名单不允许）的越界项会被忽略并随本调用结果回告，不放大权限。\n\n" +
 		"【wall_clock_min 字段】（可选）本次派发的墙钟预算（分钟，代码级强制执行，与全局 sub_agent_timeout 取小）：" +
-		"到期前子 Agent 会收到收口警告，超时直接终止。验收/巡检类任务建议显式给预算（如 15）防止无边界扩张；普通建设任务省略" +
-		"（省略时 domain 默认侦察墙钟 30 分钟，过半会收到\"停止侦察开始产出\"预警）。\n\n" +
+		"到期前子 Agent 会收到收口警告，超时直接终止。普通建设/修复任务必须省略——省略=用全局 sub_agent_timeout（当前 120 分钟/2 小时）；" +
+		"显式给出去的预算就是硬上限，慢思考模型单轮 LLM 可达 5-25 分钟，小预算装不下侦察+产出" +
+		"仅纯侦察/巡检类快任务可显式给小预算（如 10-15）防无边界扩张。\n\n" +
 		"【reuse_agent_id 字段】（可选，热驻复用）复用已完成的热驻领域 Agent：填【空闲领域Agent】清单中的 agent_id。" +
 		"新任务与该领域强相关时优先复用（保留全部上下文与领域知识，省冷启动）；弱相关则省略本字段新建 domain。" +
 		"复用时 role_id/domain/responsibility 可省略（沿用槽内冻结值），task 必填。目标 Agent 忙碌时任务入队，当前任务完成后自动执行。\n\n" +
@@ -1487,7 +1489,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 					To:      subAgentID,
 					Type:    mailbox.MsgInfo,
 					Subject: "侦察预算过半",
-					Body: fmt.Sprintf("【侦察预算预警】已用约 %v（侦察墙钟 %v 的过半），停止继续侦察：已读文件的结论已足够，立即转入派发叶子/写文件。剩余预算必须全部用于产出。", half, effectiveTimeout),
+					Body:    fmt.Sprintf("【侦察预算预警】已用约 %v（侦察墙钟 %v 的过半），停止继续侦察：已读文件的结论已足够，立即转入派发叶子/写文件。剩余预算必须全部用于产出。", half, effectiveTimeout),
 				})
 			}()
 		}
@@ -1772,7 +1774,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 }
 
 // runSubAgentWithAutoRetry 包装 runSubAgentOnce：叶子助手 kind=error 失败自动重派一次
-//（TODO #23 最小一档，同任务同前缀，fresh 计数）。domain/timeout/killed/loop_guard/
+// （TODO #23 最小一档，同任务同前缀，fresh 计数）。domain/timeout/killed/loop_guard/
 // 预算部分返回不自动重试——domain 交 MetaAgent 决策、墙钟类重试无意义，避免放大故障。
 // 与 LLM 调用层重试（react_agent retry_count）正交：那层重试模型调用本身，这层重跑整个 Agent。
 // mode 为派发执行模式，自动重派沿用同一模式。
