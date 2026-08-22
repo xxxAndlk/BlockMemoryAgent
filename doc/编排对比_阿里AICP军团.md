@@ -10,13 +10,13 @@
 
 核心是**单 ReAct 循环 + 递归 `call_sub_agent`**，不是固定分层状态机。
 
-### 1.1 三层角色（由 LLM 决定深度，非固定阶段）
+### 1.1 两层角色 + 可选叶子（2026-08-22 任务 83 拍平：domain 默认自执行）
 
 | 层 | 角色 | 职责 | Token 预算 |
 |---|---|---|---|
-| 顶层 | MetaAgent | session 级，接用户目标，派 DomainAgent，整合终答 | 0（不限） |
-| 中层 | DomainAgent | 领域隔离，读文件/联网采上下文，拆到单函数级再派叶子或自执行 | 50K（触限暂停可恢复） |
-| 叶子 | 固定助手（code/ui/test/doc/prompt_reviewer） | 终端执行者，单函数/单文件改动 | 20K（触限部分回灌） |
+| 顶层 | MetaAgent | session 级，接用户目标，派 DomainAgent，整合终答 | 150K |
+| 执行层 | DomainAgent | 领域直接执行者：读文件/写代码/跑验证默认自执行，仅自主判断需要时才下拆叶子 | 150K（触限暂停可恢复） |
+| 可选叶子 | 固定助手（code/ui/test/doc/prompt_reviewer） | 可选下拆执行者，单函数/单文件改动；不再是默认路径 | 150K（触限部分回灌） |
 
 - 派发入口 `backend/internal/domain/subagent/dispatcher.go:640`（`callSubAgentTool.Execute`）。
 - 角色注册 `backend/internal/domain/role/registry.go`：`meta`/`domain` 保留，支持运行时动态注册（`Register`/`Unregister`）。
@@ -30,7 +30,7 @@
 - **块记忆**（pgvector）：召回→执行→沉淀闭环，LLM 事实提取逐条落库（dispatcher.go:1373 `saveBlockMemory`）。
 - **`verify_and_fix` 工具**：verifyloop 状态机折叠进 ReAct 作工具调用（dispatcher.go:520），替代独立编排器自动触发。
 - **pause/resume**：DomainAgent 触限存完整 history，用户「继续」续跑（dispatcher.go:1021 `ResumePaused`）。
-- **工具白名单按角色过滤**：domain 只见 `call_sub_agent`，叶子只见执行类工具（dispatcher.go:895）。
+- **工具白名单按角色过滤**：meta 无执行类工具，domain 见全套执行+派发工具（`call_sub_agent` 保留为例外下拆通道），叶子只见执行类工具（dispatcher.go:895）。
 - **派发限额 + 同领域兄弟去重**（dispatcher.go:707、:719）。
 - **session_logs**：完整 LLM I/O 落库（react_agent.go:568 `logLLMCall`）。
 
@@ -132,7 +132,7 @@
 
 9 层（决策/入口/策略/执行/观测/认知/输出/闭环/知识）是混沌工程固定阶段（注入→观测→诊断→报告→工单）的镜像。本仓库面对开放式编码与多类任务，**固定分层会僵化**：不是每个任务都需要诊断层、工单层。
 
-本仓库的 `call_sub_agent` 递归（meta/domain/leaf）让 LLM 按任务复杂度自决深度，更灵活。DomainAgent 可自执行单点改动而不无谓下拆（dispatcher.go:628 路由规则），避免固定层的空转。**保留递归，不引入固定 9 层。**
+本仓库的 `call_sub_agent` 递归（meta/domain/leaf）让 LLM 按任务复杂度自决深度，更灵活。DomainAgent 默认自执行、仅自主判断需要时才下拆叶子（2026-08-22 任务 83 起两层编排，路由规则见 dispatcher.go Description），避免固定层的空转。**保留递归，不引入固定 9 层。**
 
 ### 4.2 纯状态机驱动刚性，不适合开放任务
 
