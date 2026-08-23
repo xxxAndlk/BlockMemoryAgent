@@ -67,15 +67,25 @@ func (m Model) singleColumnView() string {
 
 	// 安全网：任何一行显示宽度超过终端都会物理折行，把后续内容整体顶下去
 	// （实证：顶栏/快捷键栏超宽折行使整帧比终端高，输入栏被挤出可视区）。
-	// 对最终帧逐行硬裁剪；总行数超高时保留底部（输入栏/快捷键栏优先可见）。
+	// 对最终帧逐行硬裁剪；总行数超高时由 fitFrameLines 压缩到终端高度。
 	vlines := strings.Split(view, "\n")
 	for i, l := range vlines {
 		vlines[i] = hardClipLine(l, m.width)
 	}
-	if m.height > 0 && len(vlines) > m.height {
-		vlines = vlines[len(vlines)-m.height:]
+	return strings.Join(fitFrameLines(vlines, m.height), "\n")
+}
+
+// fitFrameLines 将整帧裁剪到终端高度：顶栏（第 0 行）常驻、底部输入栏/快捷键栏
+// 优先可见，溢出行从中间对话区丢弃。行数不超高时原样返回。
+// （原实现只保留底部 N 行，超高时顶栏与对话区首行被裁掉——顶栏此后常驻。）
+func fitFrameLines(vlines []string, height int) []string {
+	if height <= 0 || len(vlines) <= height {
+		return vlines
 	}
-	return strings.Join(vlines, "\n")
+	kept := make([]string, 0, height)
+	kept = append(kept, vlines[0])
+	kept = append(kept, vlines[len(vlines)-height+1:]...)
+	return kept
 }
 
 // renderTopBar 渲染顶部状态栏，展示版本、模型、会话、状态等信息。

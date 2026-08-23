@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
+	term "github.com/charmbracelet/x/term"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/logger"
@@ -234,9 +235,9 @@ func currentWorkDir() string {
 	return wd
 }
 
-// Init 启动后台 tick 与 agent 事件流监听器。
+// Init 启动后台 tick、终端尺寸轮询（Windows 补偿，见 sizePollCmd）与 agent 事件流监听器。
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(tickCmd(), streamCmd(m.streamEvents))
+	return tea.Batch(tickCmd(), sizePollCmd(), streamCmd(m.streamEvents))
 }
 
 // SetLogger 注入结构化日志器，使后端交互错误以 [ERRO] 级别输出。
@@ -271,6 +272,38 @@ func tickCmd() tea.Cmd {
 
 // tickMsg 是 tick 命令产生的消息类型。
 type tickMsg struct{}
+
+// sizePollCmd 每秒查询一次真实终端尺寸，产出 sizePollMsg。
+// Windows 平台没有 SIGWINCH，bubbletea v1 的 listenForResize 是空实现，
+// 启动后窗口最大化/还原/全屏切换都不会再上报 WindowSizeMsg，模型只能按
+// 启动时的尺寸渲染：帧比物理屏幕高时整帧上滚、顶栏被顶出屏幕。
+// 这里以轮询补偿：尺寸变化时合成 WindowSizeMsg 走正常 resize 路径
+// （该消息同时喂给渲染器，渲染器的裁剪宽度同步更新）。
+// 非 TTY（测试/CI）下 GetSize 报错，返回 nil 消息，不产生任何影响。
+func sizePollCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		w, h, err := term.GetSize(os.Stdout.Fd())
+		if err != nil || w <= 0 || h <= 0 {
+			return nil
+		}
+		return sizePollMsg{width: w, height: h}
+	})
+}
+
+// sizePollMsg 是 sizePollCmd 产生的尺寸轮询结果。
+type sizePollMsg struct {
+	width  int
+	height int
+}
+
+// reconcileSize 对比轮询尺寸与当前缓存尺寸：一致返回 nil；不一致时返回一个
+// 产出合成 WindowSizeMsg 的命令，使模型与渲染器经同一 resize 路径更新。
+func (m *Model) reconcileSize(w, h int) tea.Cmd {
+	if w == m.width && h == m.height {
+		return nil
+	}
+	return func() tea.Msg { return tea.WindowSizeMsg{Width: w, Height: h} }
+}
 
 // streamEventMsg 在选中会话的 agent.Stream 通道产生新事件时发出，
 // 触发与 tickMsg 相同的刷新路径，保证 TUI 与实时输出同步。
@@ -483,6 +516,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.chatPanel.followBottom {
 			m.chatPanel.vp.GotoBottom()
 		}
+
+	case sizePollMsg:
+		// 终端尺寸轮询（Windows 下 resize 事件的补偿）：尺寸变化时合成
+		// WindowSizeMsg 走正常 resize 路径；无论是否变化都重新武装轮询。
+		if cmd := m.reconcileSize(msg.width, msg.height); cmd != nil {
+			return m, tea.Batch(sizePollCmd(), cmd)
+		}
+		return m, sizePollCmd()
 
 	case tickMsg:
 		m.tickCount++

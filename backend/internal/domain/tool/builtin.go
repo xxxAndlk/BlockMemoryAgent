@@ -873,7 +873,8 @@ func (e *Executor) runCommand(ctx context.Context, args map[string]any) *Result 
 
 // runCommandWithTreeKill 运行命令并在超时或取消时尝试结束整个进程树。
 func runCommandWithTreeKill(ctx context.Context, cmd *exec.Cmd) error {
-	// 非 Windows 平台直接调用 cmd.Run，由 context 驱动取消。
+	// 非 Windows 平台直接调用 cmd.Run，由 context 驱动取消（保持原有行为：
+	// killProcessTree 的进程组 kill 在未设置 Setpgid 时会误杀自身进程组）。
 	if runtime.GOOS != "windows" {
 		return cmd.Run()
 	}
@@ -894,8 +895,15 @@ func runCommandWithTreeKill(ctx context.Context, cmd *exec.Cmd) error {
 		if cmd.Process != nil {
 			killProcessTree(cmd.Process.Pid)
 		}
-		// 等待 Wait 返回，避免 goroutine 泄漏与僵尸进程。
-		<-done
+		// 等待 Wait 返回，避免 goroutine 泄漏与僵尸进程；但孙进程继承 stdout/stderr
+		// 句柄时 Wait 会因管道不到 EOF 而永久阻塞（实证 td-game domain 挂死 74 分钟），
+		// 故设宽限期，到期放弃等待直接返回超时错误——进程树已杀，泄漏的 Wait goroutine
+		// 会在管道最终关闭后自行退出。
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			slog.Warn("cmd.Wait did not return after process tree kill, abandoning wait", slog.String("error", ctx.Err().Error()))
+		}
 		// 返回上下文错误。
 		return ctx.Err()
 	case err := <-done:

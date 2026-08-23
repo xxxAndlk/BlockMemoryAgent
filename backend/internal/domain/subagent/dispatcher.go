@@ -1276,6 +1276,40 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	return &tool.Result{Tool: "call_sub_agent", Success: true, Output: out}
 }
 
+// checkActiveSiblingDomain 检查同父 Agent 下是否已存在同名且仍活跃的 domain 节点，
+// 存在时返回拒绝文案（引导按职责细分命名或等其回传）；不存在/无法判断时返回空串放行。
+// 仅活跃态（Running/Paused/Idle）算冲突；终态（Failed/Cancelled/Done）放行——
+// 失败打捞重派、完结后新任务沿用领域名均为合法路径（withPriorSalvage 依赖前者）。
+func (d *Dispatcher) checkActiveSiblingDomain(ctx context.Context, parentID, domain string) string {
+	domainKey := strings.TrimSpace(domain)
+	if domainKey == "" || d.treeFn == nil {
+		return ""
+	}
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		if i := strings.Index(parentID, "/"); i > 0 {
+			sid = parentID[:i]
+		}
+	}
+	if sid == "" {
+		return ""
+	}
+	t := d.treeFn(sid)
+	if t == nil {
+		return ""
+	}
+	for _, n := range t.Snapshot() {
+		if n.ParentID != parentID || n.Role != "domain" || strings.TrimSpace(n.Domain) != domainKey {
+			continue
+		}
+		switch n.Status {
+		case orchestrator.StatusRunning, orchestrator.StatusPaused, orchestrator.StatusIdle:
+			return fmt.Sprintf("domain %q 已有同名活跃实例（%s，状态 %s）：同名 domain 并行会让回灌摘要无法区分责任域。请按职责细分命名（如 %s核心层/%s命令层），或等其回传后再派", domainKey, n.ID, n.Status, domainKey, domainKey)
+		}
+	}
+	return ""
+}
+
 // dispatchOne 执行一次子 Agent 异步派发：权限校验→同领域去重→全局限额→注册树→goroutine。
 // 成功返回 subAgentID；失败返回 *tool.Result（Error 非空，Tool 字段由调用方按工具名覆盖）。
 // mode 为派发执行模式（react/reflection/plan_execute，空串=react，TODO #29），
@@ -1319,6 +1353,13 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	if roleID == "domain" {
 		if gate := d.checkDepGate(ctx, parentID, domain); gate != "" {
 			return "", &tool.Result{Error: gate, Category: tool.ResultCategoryValidationRejected}
+		}
+		// 同父同名活跃 domain 查重（跨调用）：call_sub_agents 的批内查重拦不住同一轮
+		// 多次 call_sub_agent 单派同名 domain（实证 parallel-independent 任务 Meta 同轮
+		// 两次单派 "CLI工具"，9ms 之差并行启动，回灌摘要/树展示无法区分责任域）。
+		// 工具调用在同轮内串行执行（react_agent.go），首个派发注册节点后第二个必被拦。
+		if msg := d.checkActiveSiblingDomain(ctx, parentID, domain); msg != "" {
+			return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
 		}
 	}
 
@@ -1609,6 +1650,24 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 			batchWarnings = append(batchWarnings, fmt.Sprintf("tasks[%d]: %s", i, warning))
 		}
 		items = append(items, it)
+	}
+
+	// 同波 domain 名称查重：同名 domain 并行派出会让回灌摘要/树展示无法区分责任域
+	// （实证 longctx 任务同波派出两个"后端" domain，判为重复派发）。
+	// 发现重复即整批拒绝，引导 MetaAgent 按职责细分命名后重发。
+	seenDomains := make(map[string]int, len(items))
+	for i, it := range items {
+		if it.roleID != "domain" {
+			continue
+		}
+		name := strings.TrimSpace(it.domain)
+		if name == "" {
+			continue
+		}
+		if j, dup := seenDomains[name]; dup {
+			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d] 与 tasks[%d] 重复 domain %q：同波 domain 名称必须唯一，请按职责细分命名（如 %s核心层/%s命令层）后重发", i, j, name, name, name), Category: tool.ResultCategoryValidationRejected}
+		}
+		seenDomains[name] = i
 	}
 
 	parentID := agent.AgentIDFromContext(ctx)
