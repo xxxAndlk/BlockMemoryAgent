@@ -406,7 +406,7 @@ func TestRenderAgentsPanel_NarrowPanelThreeBranchesOneRow(t *testing.T) {
 
 // TestRenderAgentsPanel_ChildCards 验证三级助手子分支的卡片式排列（与领域同一风格）：
 // 子 Agent 以圆角边框卡片渲染在所属领域列内，列首有连接竖线，不再是 ├─ 纯文本行；
-// 高度不足时按整张卡片裁剪并在列尾提示"… 还有 N 个"。
+// 高度不足时按 agentScroll 滚动开窗（滚轮翻看），窗口首/末行提示未显示内容，不再省略截断。
 func TestRenderAgentsPanel_ChildCards(t *testing.T) {
 	mkChild := func(inst, parent, name string, status enums.RoleStatus) agentTreeNode {
 		return agentTreeNode{
@@ -442,7 +442,7 @@ func TestRenderAgentsPanel_ChildCards(t *testing.T) {
 		}
 	})
 
-	t.Run("高度不足按整卡裁剪并提示", func(t *testing.T) {
+	t.Run("高度不足滚动开窗并提示", func(t *testing.T) {
 		m := &Model{styles: NewStyles()}
 		nodes := []agentTreeNode{
 			{depth: 0, instID: "MetaAgent", name: "MetaAgent", roleType: enums.RoleTypeMeta, status: enums.RoleStatusActive},
@@ -452,14 +452,26 @@ func TestRenderAgentsPanel_ChildCards(t *testing.T) {
 			nodes = append(nodes, mkChild("s/d1/c"+string(rune('1'+i)), "s/d1", "代码助手", enums.RoleStatusActive))
 		}
 		m.agentTreePanel.nodes = nodes
-		// 高度只够头部 + 1~2 张子卡片：4 个助手必然放不下，必须有省略提示。
+		// 高度放不下头部 + 4 个助手：首窗末行提示下方还有内容（滚轮翻看，不再省略截断），
+		// 旧省略提示不再出现，底部状态图例固定可见。
 		panel := stripANSI(m.renderAgentsPanel(80, 18))
-		if !strings.Contains(panel, "… 还有") {
-			t.Errorf("高度不足时应提示省略数:\n%s", panel)
+		if !strings.Contains(panel, "↓ 下方还有") {
+			t.Errorf("高度不足时首窗应提示下方还有内容:\n%s", panel)
 		}
-		// 裁剪不得切断卡片边框：出现的 ╰ 数量必须与 ╭ 相等（每张卡完整闭合）。
-		if strings.Count(panel, "╭") != strings.Count(panel, "╰") {
-			t.Errorf("卡片边框被切断（╭=%d ╰=%d）:\n%s", strings.Count(panel, "╭"), strings.Count(panel, "╰"), panel)
+		if strings.Contains(panel, "… 还有") {
+			t.Errorf("旧省略提示不应再出现（已改为滚动开窗）:\n%s", panel)
+		}
+		if !strings.Contains(panel, "◐ Waiting") {
+			t.Errorf("底部状态图例应固定可见:\n%s", panel)
+		}
+		// 滚到底部（越界钳制到末尾窗口）：首行提示上方内容，下方提示消失。
+		m.agentScroll = 99
+		panel = stripANSI(m.renderAgentsPanel(80, 18))
+		if !strings.Contains(panel, "↑ 上方还有") {
+			t.Errorf("滚到底部时首行应提示上方还有内容:\n%s", panel)
+		}
+		if strings.Contains(panel, "↓ 下方还有") {
+			t.Errorf("已到底部不应再有下方提示:\n%s", panel)
 		}
 	})
 }

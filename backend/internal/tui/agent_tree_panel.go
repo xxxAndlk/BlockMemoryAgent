@@ -325,7 +325,9 @@ func (at *AgentTreePanel) buildLines() []string {
 
 // renderAgentsPanel 渲染右侧 Agent 编排面板（TODO #48 真树形）：
 // 顶部为居中的 MetaAgent 卡片，经连接线按实际分支数分叉引出领域卡片，
-// 每个领域卡片下挂其派发的助手子分支（树状连接符），底部为状态图例。
+// 每个领域卡片下挂其派发的助手子分支（树状连接符），底部为固定状态图例。
+// 树内容超出可视高度时按 m.agentScroll 滚动开窗（滚轮翻看，与计划面板一致，不再省略截断），
+// 窗口首/末行在还有未显示内容时替换为"↑ 上方还有 N 行"/"↓ 下方还有 N 行"提示。
 func (m Model) renderAgentsPanel(w, h int) string {
 	// 保证最小宽度，避免卡片过度压缩。
 	if w < 20 {
@@ -346,7 +348,7 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	if innerW < 10 {
 		innerW = 10
 	}
-	// 内容区最大行数（PanelBox Height(h-3)），超出部分按行裁剪。
+	// 内容区最大行数（PanelBox Height(h-3)），超出部分按 m.agentScroll 滚动开窗。
 	maxBody := h - 3
 	if maxBody < 1 {
 		maxBody = 1
@@ -364,6 +366,52 @@ func (m Model) renderAgentsPanel(w, h int) string {
 	if len(branches) == 0 {
 		return m.renderAgentsGridFallback(w, h, header, meta, maxBody, innerW)
 	}
+
+	// 完整构建树内容（不限高），再按滚动偏移开窗：底部图例固定可见（对齐计划面板的固定底部统计区）。
+	lines := m.buildAgentTreeContent(innerW)
+	legend := m.agentLegendLine()
+	budget := maxBody - 1
+	if budget < 1 {
+		budget = 1
+	}
+	if len(lines) <= budget {
+		// 内容不足一屏：插入空行让图例贴底（对齐设计稿）。
+		for len(lines)+1 < maxBody {
+			lines = append(lines, "")
+		}
+		lines = append(lines, legend)
+	} else {
+		// 滚动窗口：scroll 偏移钳制在合法范围内，越界时回退到末尾窗口。
+		maxOff := len(lines) - budget
+		scroll := clamp(m.agentScroll, 0, maxOff)
+		visible := append([]string{}, lines[scroll:scroll+budget]...)
+		if scroll > 0 {
+			visible[0] = m.styles.Dim.Render(fmt.Sprintf("↑ 上方还有 %d 行（滚轮翻看）", scroll))
+		}
+		if below := len(lines) - scroll - budget; below > 0 {
+			visible[len(visible)-1] = m.styles.Dim.Render(fmt.Sprintf("↓ 下方还有 %d 行（滚轮翻看）", below))
+		}
+		lines = append(visible, legend)
+	}
+	// 兜底硬裁剪，防止极端高度下内容溢出面板挤乱整体布局。
+	if len(lines) > maxBody {
+		lines = lines[:maxBody]
+	}
+
+	body := strings.Join(lines, "\n")
+	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
+}
+
+// buildAllLinesBudget 是完整构建树内容时使用的"不限高"行数预算：
+// 真实 Agent 树内容远低于该值，配合滚动开窗，旧的按高度省略裁剪逻辑实际不会触发。
+const buildAllLinesBudget = 1 << 20
+
+// buildAgentTreeContent 构建 Agent 编排面板的完整树内容行（不限高，不做省略截断）：
+// 居中的 MetaAgent 卡片 + 连接线分叉 + 领域卡片行 + 各分支下的助手子卡片列。
+// 可视窗口（滚动开窗/图例贴底）由 renderAgentsPanel 统一处理；
+// agentMaxScroll 也调用本函数计算内容总行数。
+func (m Model) buildAgentTreeContent(innerW int) []string {
+	meta, branches, _ := groupAgentTree(m.agentTreePanel.nodes)
 
 	// 分支列参数：优先一行放下（最多 3 列分叉），列宽变窄时卡片文字换行
 	// （Y 轴换 X 轴空间，TODO #48 后续）；仅当列宽跌破最小可读宽度时才减列。
@@ -395,9 +443,7 @@ func (m Model) renderAgentsPanel(w, h int) string {
 		}
 	}
 
-	// 逐行组装分支：连接线 + 分支卡片行 + 各分支子节点卡片列，头部（连接线+领域卡片）
-	// 放不下时整行丢弃；子节点卡片列按剩余高度以整张卡片粒度裁剪。
-	omitted := 0
+	// 逐行组装分支：连接线 + 分支卡片行 + 各分支子节点卡片列（完整构建，不限高）。
 	firstRow := true
 	for row := 0; row < len(branches); row += rowCols {
 		end := row + rowCols
@@ -421,59 +467,25 @@ func (m Model) renderAgentsPanel(w, h int) string {
 			cards = append(cards, m.buildAgentCard(b.node, colW, waitingChildNames(b.children)))
 		}
 		headLines = append(headLines, strings.Split(joinHorizontalWithGap(cards, gap), "\n")...)
-
-		nodesInRow := len(rowBranches)
-		totalChildren := 0
-		for _, b := range rowBranches {
-			nodesInRow += len(b.children)
-			totalChildren += len(b.children)
-		}
-
-		// 头部放不下整行省略（与旧行粒度裁剪一致）。
-		if len(lines)+len(headLines) > maxBody {
-			omitted += nodesInRow
-			break
-		}
 		lines = append(lines, headLines...)
 
 		// 三级助手子分支：与领域相同的卡片式排列（TODO #48 子项 2 延伸）——
-		// 每个分支一列，列内连接竖线 + 子 Agent 卡片竖向堆叠，各列横向对齐拼接；
-		// 剩余高度放不下时按整张卡片裁剪并在列尾提示省略数。
+		// 每个分支一列，列内连接竖线 + 子 Agent 卡片竖向堆叠，各列横向对齐拼接。
+		totalChildren := 0
+		for _, b := range rowBranches {
+			totalChildren += len(b.children)
+		}
 		if totalChildren > 0 {
 			childCols := make([][]agentTreeNode, 0, len(rowBranches))
 			for _, b := range rowBranches {
 				childCols = append(childCols, b.children)
 			}
-			colLines, omittedChildren := m.joinChildCardColumns(childCols, colW, gap, maxBody-len(lines))
+			colLines, _ := m.joinChildCardColumns(childCols, colW, gap, buildAllLinesBudget)
 			lines = append(lines, colLines...)
-			omitted += omittedChildren
 		}
 		firstRow = false
 	}
-
-	// 图例：全部放下且还有余量时显示并贴底对齐。
-	if omitted == 0 && len(lines)+1 <= maxBody {
-		for len(lines)+1 < maxBody {
-			lines = append(lines, "")
-		}
-		lines = append(lines, m.agentLegendLine())
-	} else if omitted > 0 {
-		// 有分支/子节点被裁剪时必须给出提示；行已满则替换末行（PanelBox 自带外框，
-		// 被替换掉的可能是某张卡片的底边，仅外观瑕疵，不提示则用户无从知晓有节点未显示）。
-		note := m.styles.Dim.Render(fmt.Sprintf("… 还有 %d 个 Agent", omitted))
-		if len(lines) < maxBody {
-			lines = append(lines, note)
-		} else if len(lines) > 0 {
-			lines[len(lines)-1] = note
-		}
-	}
-	// 兜底硬裁剪，防止极端高度下内容溢出面板挤乱整体布局。
-	if len(lines) > maxBody {
-		lines = lines[:maxBody]
-	}
-
-	body := strings.Join(lines, "\n")
-	return lipgloss.JoinVertical(lipgloss.Top, header, m.styles.PanelBox.Width(w-2).Height(h-3).Render(body))
+	return lines
 }
 
 // agentTreeBranch 是编排树的一个直接分支：depth=1 节点（领域 Agent/直接助手）+ 其下挂载的子节点。

@@ -79,6 +79,12 @@ type Model struct {
 	// planScroll 是右侧计划面板任务列表的滚动偏移（行）：
 	// 滚轮悬停在计划面板区域时增减（handleMouse），渲染时按此偏移开窗（formatPlanSnapshot）。
 	planScroll int
+	// agentScroll 是右侧 Agent 编排面板树内容的滚动偏移（行）：
+	// 滚轮悬停在编排面板区域时增减（handleMouse），渲染时按此偏移开窗（renderAgentsPanel）。
+	agentScroll int
+
+	// startedAt 是 TUI 启动时间，用于计划面板底部"总计时"展示（TUI 开启至今的累计时长）。
+	startedAt time.Time
 
 	// shared 是跨 bubbletea 值拷贝共享的可变状态（#47 修复），见 sharedState。
 	shared *sharedState
@@ -215,6 +221,7 @@ func NewModel(
 		shared:         newSharedState(), // 跨值拷贝共享的可变状态（#47 修复）
 		taskBriefCache: NewTaskBriefCache(),
 		streamEvents:   make(chan agent.Event, 16),
+		startedAt:      time.Now(), // TUI 启动时间：计划面板底部"总计时"的计时起点
 	}
 	m.refreshSessions()
 	// 启动时不自动选中任何历史会话：保持空白新会话状态（无选中会话），
@@ -359,6 +366,8 @@ func (m *Model) selectSession(idx int) {
 	m.chatPanel.lastWidth = 0
 	// 重置计划面板滚动偏移：不同会话的任务列表长度不同，旧偏移可能越界。
 	m.planScroll = 0
+	// 同理重置 Agent 编排面板滚动偏移。
+	m.agentScroll = 0
 	m.rebuildAgents()
 	m.startStream()
 	m.rebuildChatContent()
@@ -676,6 +685,16 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// 滚轮悬停在右侧 Agent 编排面板区域时滚动编排树（与计划面板一致：滚动查看，不再省略截断）。
+	if (msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown) && m.rightPanelVisible() && m.overAgentsPanel(msg.X, msg.Y) {
+		delta := 3
+		if msg.Button == tea.MouseButtonWheelUp {
+			delta = -3
+		}
+		m.agentScroll = clamp(m.agentScroll+delta, 0, m.agentMaxScroll())
+		return m, nil
+	}
+
 	// 滚轮始终交给 viewport 处理。
 	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
 		var cmd tea.Cmd
@@ -951,7 +970,7 @@ func (m *Model) overPlanPanel(x, y int) bool {
 }
 
 // planMaxScroll 返回计划面板任务列表当前的最大滚动偏移：
-// 任务数超出可视行数（面板高度扣除标题/边框与底部"总体进度/预计剩余"3 行）的部分。
+// 任务数超出可视行数（面板高度扣除标题/边框与底部"总体进度/计时"3 行）的部分。
 func (m *Model) planMaxScroll() int {
 	s := m.selectedSession()
 	if s == nil {
@@ -964,6 +983,40 @@ func (m *Model) planMaxScroll() int {
 		budget = 0
 	}
 	if maxOff := len(snap.Tasks) - budget; maxOff > 0 {
+		return maxOff
+	}
+	return 0
+}
+
+// overAgentsPanel 命中测试：屏幕坐标是否落在右侧 Agent 编排面板区域内。
+// 布局：顶栏占 1 行；编排面板为右栏下段（紧跟计划面板，rightPanelHeights 的 bottomH）。
+func (m *Model) overAgentsPanel(x, y int) bool {
+	topH, bottomH := rightPanelHeights(m.mainContentHeight())
+	return x >= m.chatAreaWidth() && y >= 1+topH && y < 1+topH+bottomH
+}
+
+// agentMaxScroll 返回 Agent 编排面板树内容当前的最大滚动偏移：
+// 完整内容行数超出可视行数（面板高度扣除标题/边框 3 行与底部固定图例 1 行）的部分。
+// 无分支时回退网格布局内容很短，不可滚动，返回 0。
+func (m *Model) agentMaxScroll() int {
+	_, branches, _ := groupAgentTree(m.agentTreePanel.nodes)
+	if len(branches) == 0 {
+		return 0
+	}
+	_, bottomH := rightPanelHeights(m.mainContentHeight())
+	budget := bottomH - 3 - 1 // PanelBox 边框/标题 3 行 + 底部图例 1 行
+	if budget < 1 {
+		return 0
+	}
+	w := m.rightPanelWidth()
+	if w < 20 {
+		w = 20
+	}
+	innerW := w - 4
+	if innerW < 10 {
+		innerW = 10
+	}
+	if maxOff := len(m.buildAgentTreeContent(innerW)) - budget; maxOff > 0 {
 		return maxOff
 	}
 	return 0

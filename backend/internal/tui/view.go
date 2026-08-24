@@ -289,7 +289,7 @@ func (m Model) renderPlanPanel(w, h int) string {
 
 	// 渲染计划内容行。内容区高度受 PanelBox 限制（Height(h-3)），
 	// 超长任务列表在 formatPlanSnapshot 内按 m.planScroll 滚动开窗（滚轮翻看，不再省略截断），
-	// 底部"总体进度/预计剩余"固定可见。
+	// 底部"总体进度/计时行"固定可见。
 	maxBody := h - 3
 	if maxBody < 1 {
 		maxBody = 1
@@ -302,17 +302,15 @@ func (m Model) renderPlanPanel(w, h int) string {
 // formatPlanSnapshot 把看板快照渲染成计划面板内的文本行。
 // 布局参考"新TUI页.png"：
 //   - 上方为编号任务列表：序号 + 标题 + 彩色状态单元格 + 右对齐 hh:mm:ss 时长；
-//   - 底部固定为"总体进度"进度条与"预计剩余"时间，内容不足时贴底显示；
+//   - 底部固定为"总体进度"进度条与计时行（当前任务已执行时间 + TUI 总计时），内容不足时贴底显示；
 //   - 任务数超出 maxLines 时按 scroll 偏移滚动开窗（滚轮悬停计划面板滚动，见 handleMouse），
 //     窗口首/末行在还有未显示任务时替换为"↑ 上方还有 N 项"/"↓ 下方还有 N 项"提示。
 func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot, maxLines, scroll int) []string {
-	// 统计已完成数与总时长（用于预计剩余时间）。
+	// 统计已完成数（用于总体进度条）。
 	done, total := 0, len(snap.Tasks)
-	var doneElapsed time.Duration
 	for _, t := range snap.Tasks {
 		if t.Status == board.TaskDone {
 			done++
-			doneElapsed += taskElapsed(t)
 		}
 	}
 
@@ -322,8 +320,8 @@ func (m Model) formatPlanSnapshot(innerW int, snap board.Snapshot, maxLines, scr
 		taskLines = append(taskLines, m.planTaskLine(i, t, total, innerW))
 	}
 
-	// 底部统计区：空行 + 总体进度 + 预计剩余。
-	footer := m.planFooterLines(innerW, done, total, doneElapsed)
+	// 底部统计区：空行 + 总体进度 + 计时行。
+	footer := m.planFooterLines(innerW, snap, done, total)
 
 	// 高度预算：footer 固定保留，任务列表按剩余空间滚动开窗。
 	budget := maxLines - len(footer)
@@ -398,8 +396,9 @@ func (m Model) planTaskLine(i int, t board.SubTask, total, innerW int) string {
 	return m.styles.Dim.Render(num) + " " + titleStyled + strings.Repeat(" ", pad) + " " + statusCell + " " + m.styles.Dim.Render(elapsed)
 }
 
-// planFooterLines 渲染计划面板底部的总体进度条与预计剩余时间。
-func (m Model) planFooterLines(innerW, done, total int, doneElapsed time.Duration) []string {
+// planFooterLines 渲染计划面板底部的总体进度条与计时行：
+// 计时行展示当前任务已执行时间（首个进行中/阻塞的任务）与 TUI 开启至今的总计时。
+func (m Model) planFooterLines(innerW int, snap board.Snapshot, done, total int) []string {
 	// 完成百分比。
 	pct := 0
 	if total > 0 {
@@ -418,19 +417,23 @@ func (m Model) planFooterLines(innerW, done, total int, doneElapsed time.Duratio
 		m.styles.Dim.Render(strings.Repeat("░", barW-filled))
 	progress := m.styles.Dim.Render("总体进度") + " " + bar + " " + m.styles.StatValue.Render(fmt.Sprintf("%d%%", pct))
 
-	// 预计剩余：按已完成任务的平均耗时 × 剩余任务数估算；无完成样本时显示占位符。
-	estimate := "--:--:--"
-	remaining := total - done
-	switch {
-	case total > 0 && remaining == 0:
-		estimate = "00:00:00"
-	case done > 0:
-		avg := doneElapsed / time.Duration(done)
-		estimate = formatDurationHMS(avg * time.Duration(remaining))
+	// 当前任务已执行时间：取首个进行中/阻塞的任务；无进行中的任务时显示占位符。
+	cur := "--:--:--"
+	for _, t := range snap.Tasks {
+		if t.Status == board.TaskInProgress || t.Status == board.TaskBlocked {
+			cur = taskElapsedHMS(t)
+			break
+		}
 	}
-	rest := m.styles.Dim.Render("预计剩余: ") + m.styles.StatValue.Render(estimate)
+	// 总计时：TUI 开启至今的累计时长；未记录启动时间（测试以字面量构造 Model）时显示占位符。
+	uptime := "--:--:--"
+	if !m.startedAt.IsZero() {
+		uptime = formatDurationHMS(time.Since(m.startedAt))
+	}
+	timing := m.styles.Dim.Render("当前任务: ") + m.styles.StatValue.Render(cur) +
+		m.styles.Dim.Render("  总计时: ") + m.styles.StatValue.Render(uptime)
 
-	return []string{"", progress, rest}
+	return []string{"", progress, timing}
 }
 
 // deriveDomainTaskStatuses 从 Agent 拓扑中汇总每个领域的实际状态，
