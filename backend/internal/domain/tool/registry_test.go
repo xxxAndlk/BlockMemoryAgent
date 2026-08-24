@@ -661,6 +661,90 @@ func TestWriteSpec_Structured(t *testing.T) {
 	}
 }
 
+// TestWriteSpec_ContractField 验证 contract 字段（TODO #57）结构化写入：
+// map 入参经 JSON 往返解析，frontmatter 含四类条目，body 渲染跨域契约段。
+func TestWriteSpec_ContractField(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "多域前端任务",
+		"acceptance": []any{"跨域集成点一致"},
+		"contract": map[string]any{
+			"symbols": []any{map[string]any{
+				"symbol": "GameEngine.init", "file": "engine.js", "refs": []any{"main.js"},
+			}},
+			"dom_ids": []any{map[string]any{"id": "game-canvas", "file": "index.html"}},
+			"scripts": []any{map[string]any{"file": "engine.js"}, map[string]any{"file": "main.js"}},
+			"signatures": []any{map[string]any{
+				"symbol": "start", "signature": "function start()", "file": "engine.js",
+			}},
+		},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch: err=%v res=%+v", err, res)
+	}
+
+	val, _ := store.Get(ctx, "meta-1:spec")
+	fm, body, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatalf("KV value not MD: %q", val)
+	}
+	if fm.Contract == nil || len(fm.Contract.Symbols) != 1 || len(fm.Contract.DOMIDs) != 1 ||
+		len(fm.Contract.Scripts) != 2 || len(fm.Contract.Signatures) != 1 {
+		t.Fatalf("contract not roundtripped: %+v", fm.Contract)
+	}
+	if fm.Contract.Symbols[0].Symbol != "GameEngine.init" || fm.Contract.Symbols[0].Refs[0] != "main.js" {
+		t.Fatalf("symbol entry mismatch: %+v", fm.Contract.Symbols[0])
+	}
+	if !strings.Contains(body, "## 跨域契约") || !strings.Contains(body, "GameEngine.init") {
+		t.Fatalf("body missing contract section: %q", body)
+	}
+
+	// 契约可空：不传 contract 时 frontmatter 无契约、body 无契约段。
+	res2, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g2", "acceptance": []any{"a"},
+	})
+	if err != nil || !res2.Success {
+		t.Fatalf("dispatch without contract: err=%v res=%+v", err, res2)
+	}
+	val2, _ := store.Get(ctx, "meta-1:spec")
+	fm2, body2, _ := DecodeSharedMD(val2)
+	if fm2.Contract != nil || strings.Contains(body2, "跨域契约") {
+		t.Fatalf("contract should be absent when not provided: %+v body=%q", fm2.Contract, body2)
+	}
+}
+
+// TestWriteSpec_FileListPreservesMissingFiles 待创建文件（stat 失败）不进 Files mtime 索引
+// 但保留在 FileList：dispatcher 冒烟检查（TODO #56）在文件创建后仍能定位目标。
+func TestWriteSpec_FileListPreservesMissingFiles(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "not-created-yet.js")
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g", "acceptance": []any{"a"}, "files": []any{missing},
+	}); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	val, _ := store.Get(ctx, "meta-1:spec")
+	fm, _, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatalf("KV value not MD: %q", val)
+	}
+	if len(fm.Files) != 0 {
+		t.Fatalf("missing file must not enter mtime index: %v", fm.Files)
+	}
+	if len(fm.FileList) != 1 || fm.FileList[0] != missing {
+		t.Fatalf("file_list should preserve missing file, got %v", fm.FileList)
+	}
+}
+
 // TestWriteSpec_GrowingFilesWarning files 含持续增长目录（logs/）文件时输出告警提示。
 func TestWriteSpec_GrowingFilesWarning(t *testing.T) {
 	dir := t.TempDir()

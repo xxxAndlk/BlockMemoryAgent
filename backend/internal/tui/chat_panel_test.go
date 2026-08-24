@@ -108,3 +108,36 @@ func TestGoalBarAbsentWithoutGoal(t *testing.T) {
 		t.Errorf("goalBarH = %d, want 0", m.chatPanel.goalBarH)
 	}
 }
+
+// TestGoalBarSingleLineWithMultilineGoal 回归"多行目标把整帧撑超高"：
+// 目标栏预算仅 1 行，而 truncate 原样保留 '\n'（换行符显示宽度为 0），
+// 粘贴的多行需求文档作为目标时曾渲染出多行，整帧超高后 fitFrameLines
+// 从主内容区顶部裁行，把右侧计划面板标题裁出屏幕。目标栏必须恒为 1 行。
+func TestGoalBarSingleLineWithMultilineGoal(t *testing.T) {
+	now := time.Now()
+	goal := "玩家通过滑动屏幕斩切水果\n水果从浮岛下方的裂隙中抛射而出\n背景有三层视差滚动"
+	s := &server.Session{
+		ID:        "session-1",
+		Goal:      goal,
+		Status:    enums.SessionStatusRunning,
+		StartedAt: now,
+		Messages: []types.ChatMessage{
+			{Role: enums.ChatRoleUser, Content: goal, Timestamp: now},
+		},
+	}
+	m := &Model{
+		styles:         NewStyles(),
+		sessions:       []*server.Session{s},
+		sessionsCursor: 0,
+	}
+	m.chatPanel.lastItems = 1 // 跳过欢迎页分支，直接渲染 viewport。
+
+	const h = 20
+	out := m.renderChat(80, h)
+	if got := strings.Count(out, "\n") + 1; got != h {
+		t.Fatalf("多行目标下对话区应为 %d 行，实际 %d 行:\n%s", h, got, out)
+	}
+	if !strings.Contains(out, "🎯") {
+		t.Fatalf("目标栏应仍展示（折叠为单行）:\n%s", out)
+	}
+}

@@ -144,6 +144,10 @@ type ReactResult struct {
 	// VerifyNote 是校验层状态标签：非空=校验通过（"L0 证据"/"L2 rubric"）；
 	// Unverified 时为 judge 失败原因。上层据此在完成摘要里标注校验状态。
 	VerifyNote string `json:"verify_note,omitempty"`
+	// MachineCheck 是 dispatcher 域完成机器校验的【机器校验】段（TODO #56 冒烟层）：
+	// dispatcher 对产出文件自动执行语法检查（node --check 等），非 agent 自述。
+	// 非空时上层追加进完成摘要供父 Agent 纸面对照（meta 验收只信这段 + spec 对照）。
+	MachineCheck string `json:"machine_check,omitempty"`
 }
 
 // 实时进度事件种类：用于向 UI 推送 ReAct 运行过程中的中间状态。

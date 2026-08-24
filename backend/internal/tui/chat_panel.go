@@ -656,5 +656,9 @@ func (m *Model) currentGoalText() string {
 	if goal == "" {
 		goal = s.Goal
 	}
-	return strings.TrimSpace(goal)
+	// 目标栏仅 1 行预算：多行目标（如整段粘贴的多行需求文档）中的 '\n' 会被
+	// truncate 原样保留（换行符显示宽度为 0、不计入截断宽度），目标栏因此渲染出
+	// 多行，整帧被撑得比终端高，超高裁剪（fitFrameLines）会把顶部计划面板/对话首行
+	// 裁出屏幕。此处把全部空白折叠为单空格，保证目标栏恒为 1 物理行。
+	return strings.Join(strings.Fields(goal), " ")
 }

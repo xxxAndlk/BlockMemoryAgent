@@ -14,6 +14,7 @@ package tool
 //   - 单一 decodeSharedMD 函数供 dispatcher/registry 复用，避免多份解析逻辑漂移。
 
 import (
+	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -23,15 +24,21 @@ import (
 // 所有 slot 共用：spec slot 额外填 Goal/Acceptance/Constraints，其余 slot 仅填 AgentID/Slot/Files。
 // Version 供 CAS 乐观锁（SetIfVersion）使用：每次写入自增，冲突检测用。
 type MDFrontmatter struct {
-	AgentID string `yaml:"agent,omitempty"`
-	Slot    string `yaml:"slot,omitempty"`
+	AgentID string           `yaml:"agent,omitempty"`
+	Slot    string           `yaml:"slot,omitempty"`
 	Files   map[string]int64 `yaml:"files,omitempty"`
-	Version int    `yaml:"version,omitempty"`
+	Version int              `yaml:"version,omitempty"`
+	// FileList 是 spec.files 的完整原始清单（含当时不存在的待创建文件）。
+	// Files map 只收录 stat 成功的文件（mtime 索引），创建类任务的待创建文件
+	// 不在其中；dispatcher 冒烟检查（TODO #56）需要全量清单，读 FileList 兜底。
+	FileList []string `yaml:"file_list,omitempty"`
 	// Spec 专属字段：仅 slot == SpecSlot 时填充。
 	// 其余 slot 这些字段为空，解码时忽略。
 	Goal        string   `yaml:"goal,omitempty"`
 	Acceptance  []string `yaml:"acceptance,omitempty"`
 	Constraints []string `yaml:"constraints,omitempty"`
+	// Contract 跨域契约（TODO #57），仅 spec slot 填充；nil 等价于未填。
+	Contract *Contract `yaml:"contract,omitempty"`
 }
 
 // EncodeSharedMD 把 shared memory 槽位编码为 MD（frontmatter + body=content）。
@@ -60,9 +67,11 @@ func EncodeSpecMD(agentID string, spec Spec, files map[string]int64) string {
 		AgentID:     agentID,
 		Slot:        SpecSlot,
 		Files:       files,
+		FileList:    spec.Files,
 		Goal:        spec.Goal,
 		Acceptance:  spec.Acceptance,
 		Constraints: spec.Constraints,
+		Contract:    spec.Contract,
 	}
 	return encodeMD(fm, renderSpecBody(spec))
 }
@@ -107,6 +116,26 @@ func renderSpecBody(s Spec) string {
 			b.WriteString("- `")
 			b.WriteString(strings.TrimSpace(f))
 			b.WriteString("`\n")
+		}
+		b.WriteByte('\n')
+	}
+	if s.Contract != nil && !s.Contract.Empty() {
+		b.WriteString("## 跨域契约\n")
+		for _, sy := range s.Contract.Symbols {
+			if len(sy.Refs) > 0 {
+				fmt.Fprintf(&b, "- 符号 `%s` 声明于 `%s`，引用方: `%s`\n", sy.Symbol, sy.File, strings.Join(sy.Refs, "`、`"))
+			} else {
+				fmt.Fprintf(&b, "- 符号 `%s` 声明于 `%s`\n", sy.Symbol, sy.File)
+			}
+		}
+		for _, id := range s.Contract.DOMIDs {
+			fmt.Fprintf(&b, "- DOM id `%s` 声明于 `%s`\n", id.ID, id.File)
+		}
+		for i, sc := range s.Contract.Scripts {
+			fmt.Fprintf(&b, "- script 顺序 %d: `%s`\n", i+1, sc.File)
+		}
+		for _, sg := range s.Contract.Signatures {
+			fmt.Fprintf(&b, "- 签名 `%s`（%s）声明于 `%s`\n", sg.Signature, sg.Symbol, sg.File)
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")

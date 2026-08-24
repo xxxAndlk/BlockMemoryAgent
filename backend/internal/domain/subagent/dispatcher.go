@@ -9,6 +9,7 @@ import (
 	"log"           // log 用于记录块记忆写入失败等不影响主流程的错误
 	"log/slog"      // slog 用于块记忆连续失败阈值告警（单条 log 在长任务中被淹没）
 	"os"            // os 用于 stat 文件 mtime 校验（Layer 3 缓存一致性）
+	"path/filepath" // filepath 用于 spec 文件路径规范化（冒烟检查/契约检查）
 	"sort"          // sort 用于召回结果按 outcome/reuse_count 价值排序
 	"strings"       // strings 用于从 Agent ID 中提取角色 ID
 	"sync"          // sync 提供 sync.Map 存储运行中的子 Agent
@@ -163,6 +164,20 @@ type Dispatcher struct {
 	// 写入由主线程 Agent 直接通过 WriteSharedMemory/WriteSpec 工具完成，不经 Dispatcher。
 	// 同一后端承载两类槽位：自由槽位（WriteSharedMemory）与固定 spec 槽位（WriteSpec）。
 	sharedMem tool.SharedMemoryStore
+
+	// parentSpecs 缓存每个父 Agent 最新一份 spec 的结构化切片（TODO #56/#57）：
+	// 键为 parentID，值为 *parentSpecRecord（spec.files 绝对路径 + 跨域契约）。
+	// 派发时从 spec 槽位捕获（此时 spec 尚新鲜，随后子 Agent 写入会触发 Layer 2
+	// 失效删除 spec，完成收尾时无法再读到），供冒烟检查目标匹配与兄弟域全完成后的
+	// 契约检查使用。逐键覆盖、按 parentID 增长（与 pending map 同增长剖面，
+	// 条目为小切片 + 契约指针），进程重启不保留。
+	parentSpecs sync.Map
+
+	// smokeRunner 冒烟命令执行器（TODO #56）；nil 时用 defaultSmokeRunner 真跑命令。
+	// 测试注入假实现，避免依赖机器上的 node/gofmt 工具链。
+	smokeRunner smokeRunner
+	// smokeLookPath 工具链探测函数（TODO #56）；nil 时用 exec.LookPath。测试注入假实现。
+	smokeLookPath lookPathFunc
 
 	// specEnforcementEnabled 派发方调用 call_sub_agent 前是否强制先写 WriteSpec。
 	// 为 true 时 Execute 入口校验 parentID:spec 存在且新鲜（Spec.Goal 非空 + 至少一条 Acceptance），
@@ -338,12 +353,50 @@ func (d *Dispatcher) trackChildStart(parentID string) {
 
 // trackChildDone 在子 Agent 结束（成功/失败/超时）时递减父 Agent 未决计数，
 // 并非阻塞地通知一声，唤醒可能在 WaitForAnyChild 中等待的父 Agent。
+// 计数归零（全部兄弟完成）时异步触发跨域契约检查（TODO #57）。
 func (d *Dispatcher) trackChildDone(parentID string) {
 	ps := d.getOrCreatePending(parentID)
 	ps.count.Add(-1)
 	select {
 	case ps.notify <- struct{}{}:
 	default:
+	}
+	if ps.count.Load() == 0 {
+		go d.maybeRunContractChecks(parentID)
+	}
+}
+
+// maybeRunContractChecks 在父节点下全部兄弟域完成时跑跨域契约静态检查（TODO #57）。
+// 触发条件：父 spec 缓存含非空契约 + 无 spec 缓存/空契约/新一波派发已开始（未决计数
+// 回升）则跳过。结果经 mailbox 通知父 Agent：通过=【机器校验】段（纸面对照证据），
+// 违例=failure marker + 按文件归属批量列出全部违例（打回责任域，一次消息列全）。
+func (d *Dispatcher) maybeRunContractChecks(parentID string) {
+	if d.mailbox == nil {
+		return
+	}
+	rec := d.parentSpecRecordOf(parentID)
+	if rec == nil || rec.contract == nil || rec.contract.Empty() {
+		return
+	}
+	// 新一波派发已开始（归零后又递增）时跳过本波检查，避免对着半成品误报。
+	if d.PendingChildren(parentID) != 0 {
+		return
+	}
+	rep := d.runContractChecks(rec.contract, rec.files)
+	body := contractReportText(rep)
+	if !rep.pass() {
+		body = failureMarker(FailureKindContractViolation, false) +
+			"\n跨域契约机器校验失败（dispatcher 执行），按文件归属打回责任域：\n" +
+			contractViolationText(rep) + "\n\n" + contractReportText(rep)
+	}
+	if _, err := d.mailbox.Send(&mailbox.Message{
+		From:    "dispatcher",
+		To:      parentID,
+		Type:    mailbox.MsgInfo,
+		Subject: "跨域契约机器校验: " + parentID,
+		Body:    body,
+	}); err != nil {
+		log.Printf("[subagent] contract check notify dead-letter: to=%s err=%v", parentID, err)
 	}
 }
 
@@ -1825,9 +1878,14 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	d.treeFinish(ctx, subAgentID, result.Text, nil)
 	// 校验分层（TODO #43）状态标注：VerifyNote 非空=校验通过（L0 证据/L2 rubric），
 	// 完成摘要前缀一行，父 Agent 可见校验依据；空=未启用校验（none），零变化。
+	// 域完成机器校验（TODO #56）：MachineCheck 非空时把【机器校验】段追加进摘要，
+	// dispatcher 执行的客观证据，meta 验收只信这段 + spec 纸面对照（#58）。
 	summary := result.Text
+	if result.MachineCheck != "" {
+		summary = strings.TrimRight(summary, "\n") + "\n\n" + result.MachineCheck
+	}
 	if result.VerifyNote != "" {
-		summary = fmt.Sprintf("【校验:通过(%s)】\n%s", result.VerifyNote, result.Text)
+		summary = fmt.Sprintf("【校验:通过(%s)】\n%s", result.VerifyNote, summary)
 	}
 	d.notify(parentID, subAgentID, summary, files)
 	return false
@@ -1998,6 +2056,9 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 
 	// 保留原始任务文本，供块记忆沉淀时作为 goal 标签使用（避免混入召回前缀）。
 	origTask := task
+	// 捕获父 spec 结构化切片（TODO #56/#57）：派发时 spec 尚新鲜，完成后 Layer 2
+	// 失效删除 spec 就再也读不到——冒烟检查目标与契约检查依赖此刻的捕获。
+	d.recordParentSpec(ctx, parentID)
 	// 上下文前缀注入：共享记忆（spec + 自由槽位）+ 块记忆召回。两段独立前缀统一拼装，避免嵌套
 	// 【当前任务】标记（实证：嵌套后 UI 助手把 KV 内容当作任务主体，空转 16 分钟）。
 	var prefixes []string
@@ -2092,6 +2153,32 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		d.saveBlockMemory(ctx, subAgentID, roleDef.ID, parentID, domain, origTask, partial, blockOutcomePartial, agent.FilesModifiedFromHistory(result.History))
 		log.Printf("[subagent] PARTIAL: sub=%s role=%s (token budget, partial returned)", subAgentID, roleDef.ID)
 		return sub, result, errPartialReturn
+	}
+
+	// 域完成机器校验冒烟层（TODO #56）：对 spec.files ∩ 本子 Agent 实际写入文件
+	// 自动派生并执行语法检查（node --check 等），结果以【机器校验】段入完成摘要。
+	// 失败走 verify_kind 反馈重试通道：反馈 1 轮自修，仍失败按 errSmokeFailed 打回父
+	// （复用 #43 校验分层路由，不新建通路）。
+	if targets := d.smokeTargetsFor(parentID, result.History); len(targets) > 0 {
+		results := runSmokeChecks(ctx, d.subAgentWorkDir(), targets, d.smokeRunner, d.smokeLookPath)
+		if failed := smokeFailed(results); len(failed) > 0 {
+			log.Printf("[subagent] smoke check failed: sub=%s role=%s failed=%d (retry 1 round)", subAgentID, roleDef.ID, len(failed))
+			result, err = sub.RunWithHistory(ctx, smokeFixMessage(failed), result.History)
+			if err != nil {
+				return sub, result, fmt.Errorf("run: %w", err)
+			}
+			if result.LimitReached {
+				return sub, result, errSmokeFailed
+			}
+			results = runSmokeChecks(ctx, d.subAgentWorkDir(), targets, d.smokeRunner, d.smokeLookPath)
+			if failed := smokeFailed(results); len(failed) > 0 {
+				log.Printf("[subagent] smoke check still failed: sub=%s role=%s failed=%d", subAgentID, roleDef.ID, len(failed))
+				return sub, result, fmt.Errorf("%w:\n%s", errSmokeFailed, smokeFixMessage(failed))
+			}
+		}
+		if smokeRunCount(results) > 0 {
+			result.MachineCheck = renderSmokeReport(results)
+		}
 	}
 
 	_ = mem.Write(subAgentID, agent.MemoryEvent{
@@ -2504,6 +2591,13 @@ const (
 	// FailureKindVerifyMissing L0 可执行校验缺验证证据（无成功运行的测试/lint/--check，
 	// 重试 1 轮后仍缺）。retryable=false，父 Agent 自决。
 	FailureKindVerifyMissing FailureKind = "verify_missing"
+	// FailureKindSmokeFailed 域完成机器校验冒烟失败（TODO #56）：dispatcher 对产出文件
+	// 自动执行的语法检查（node --check 等）未通过，反馈重试 1 轮后仍失败。
+	// retryable=false，父 Agent 打回责任域自修。
+	FailureKindSmokeFailed FailureKind = "smoke_failed"
+	// FailureKindContractViolation 跨域契约违例（TODO #57）：兄弟域全完成后的静态契约检查
+	// 发现违例条目。retryable=false，父 Agent 按文件归属打回责任域。
+	FailureKindContractViolation FailureKind = "contract_violation"
 )
 
 // failureKindOf 从失败错误分类失败类型；未知错误归 error。
@@ -2519,6 +2613,8 @@ func failureKindOf(err error) FailureKind {
 		return FailureKindUnverified
 	case errors.Is(err, errVerifyMissing):
 		return FailureKindVerifyMissing
+	case errors.Is(err, errSmokeFailed):
+		return FailureKindSmokeFailed
 	default:
 		return FailureKindError
 	}
@@ -2550,6 +2646,11 @@ var errUnverified = errors.New("sub-agent result unverified: judge LLM unavailab
 // 重试 1 轮后仍缺）。runSubAgent 见此信号按 FailureKindVerifyMissing notify 父。
 var errVerifyMissing = errors.New("sub-agent missing executable verification evidence")
 
+// errSmokeFailed 标记域完成机器校验冒烟失败（TODO #56）：dispatcher 自动执行的
+// 语法检查未通过（反馈重试 1 轮后仍失败），错误文本携带失败明细。
+// runSubAgent 见此信号按 FailureKindSmokeFailed notify 父（打回责任域）。
+var errSmokeFailed = errors.New("sub-agent smoke check failed")
+
 // formatSubAgentFailure 把 runSubAgentOnce 返回的错误格式化为父邮箱通知文案，
 // 保留原有"超时/循环守卫/通用失败"三段语义与部分进度回传；
 // 校验分层两类（TODO #43）单独文案，明确"未验证"而非"失败"语义。
@@ -2566,6 +2667,11 @@ func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Dur
 	}
 	if errors.Is(err, errVerifyMissing) {
 		return "子 Agent 未提供可执行验证证据（没有成功运行的测试/lint/--check 命令）。"
+	}
+	if errors.Is(err, errSmokeFailed) {
+		// 错误文本携带冒烟失败明细（命令 + 退出码 + 输出尾部），剥掉哨兵前缀直陈证据。
+		detail := strings.TrimSpace(strings.TrimPrefix(err.Error(), errSmokeFailed.Error()+":"))
+		return "子 Agent 产出未通过 dispatcher 机器校验（冒烟检查）：\n" + detail
 	}
 	return fmt.Sprintf("sub-agent failed: %v%s", err, partialSuffix(partial))
 }
@@ -2669,10 +2775,79 @@ const specSlotName = "spec"
 // specMirror 是 tool.Spec 的本地镜像，避免 subagent 反向 import tool 包。
 // 字段名与 JSON tag 必须与 tool.Spec 保持一致。
 type specMirror struct {
-	Goal        string   `json:"goal"`
-	Acceptance  []string `json:"acceptance,omitempty"`
-	Constraints []string `json:"constraints,omitempty"`
-	Files       []string `json:"files,omitempty"`
+	Goal        string         `json:"goal"`
+	Acceptance  []string       `json:"acceptance,omitempty"`
+	Constraints []string       `json:"constraints,omitempty"`
+	Files       []string       `json:"files,omitempty"`
+	Contract    *tool.Contract `json:"contract,omitempty"`
+}
+
+// parentSpecRecord 是父 Agent spec 的结构化缓存（TODO #56/#57）：
+// files 为 spec.files 的绝对路径，contract 为跨域契约（可 nil）。
+// 派发时捕获（spec 尚新鲜），完成收尾/兄弟域全完成时消费（spec 可能已被 Layer 2 失效删除）。
+type parentSpecRecord struct {
+	files    []string
+	contract *tool.Contract
+}
+
+// recordParentSpec 捕获 parentID 的 spec 结构化切片进 parentSpecs 缓存。
+// spec 缺失/损坏/缺 goal+acceptance 时跳过；捕获失败不阻塞派发主流程
+// （冒烟检查与契约检查均为增强证据，缺了就降级跳过）。
+func (d *Dispatcher) recordParentSpec(ctx context.Context, parentID string) {
+	if d.sharedMem == nil {
+		return
+	}
+	key := parentID + ":" + specSlotName
+	val, err := d.sharedMem.Get(ctx, key)
+	if err != nil || strings.TrimSpace(val) == "" {
+		return
+	}
+	fm, _, ok := tool.DecodeSharedMD(val)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(fm.Goal) == "" || len(fm.Acceptance) == 0 {
+		return
+	}
+	files := make([]string, 0, len(fm.Files))
+	if len(fm.FileList) > 0 {
+		// FileList 是 spec.files 全量清单（含当时不存在的待创建文件）；规范化为
+		// 绝对路径供冒烟目标匹配（与 smokeTargets 的 modified 归一化同基准：工作目录）。
+		workdir := d.subAgentWorkDir()
+		for _, p := range fm.FileList {
+			ap := filepath.Clean(p)
+			if !filepath.IsAbs(ap) && workdir != "" {
+				ap = filepath.Join(workdir, ap)
+			}
+			files = append(files, ap)
+		}
+	} else {
+		for fp := range fm.Files {
+			files = append(files, filepath.Clean(fp))
+		}
+	}
+	d.parentSpecs.Store(parentID, &parentSpecRecord{files: files, contract: fm.Contract})
+}
+
+// parentSpecRecordOf 读取 parentID 的 spec 缓存；无缓存返回 nil。
+func (d *Dispatcher) parentSpecRecordOf(parentID string) *parentSpecRecord {
+	v, ok := d.parentSpecs.Load(parentID)
+	if !ok {
+		return nil
+	}
+	return v.(*parentSpecRecord)
+}
+
+// smokeTargetsFor 计算冒烟检查目标（TODO #56）：spec.files ∩ 本子 Agent 实际写入文件。
+// 交集为空（无 spec 缓存 / 子 Agent 未写文件 / 写入文件不在 spec 范围）返回 nil，
+// 跳过冒烟检查。收敛到交集是为责任归属精确：并行兄弟域中途写入共享文件时，
+// 先完成的一方不会被兄弟的半成品误打回。
+func (d *Dispatcher) smokeTargetsFor(parentID string, history []agent.ReactMessage) []string {
+	rec := d.parentSpecRecordOf(parentID)
+	if rec == nil {
+		return nil
+	}
+	return smokeTargets(rec.files, agent.FilesModifiedFromHistory(history), d.subAgentWorkDir())
 }
 
 // buildSharedPrefix 读取 parentID 下所有共享记忆槽位，渲染为【任务规范】+【共享记忆】前缀。

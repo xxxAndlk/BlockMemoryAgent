@@ -16,6 +16,7 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -35,6 +36,9 @@ type Spec struct {
 	Acceptance  []string `json:"acceptance,omitempty"`
 	Constraints []string `json:"constraints,omitempty"`
 	Files       []string `json:"files,omitempty"`
+	// Contract 跨域引用协议（TODO #57）：机器可校验的集成点清单，可空。
+	// dispatcher 在兄弟域全完成后跑静态契约检查器逐条核对。
+	Contract *Contract `json:"contract,omitempty"`
 }
 
 // writeSpecTool 是 WriteSpec 工具的封装。
@@ -72,6 +76,7 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 	acceptance := parseStringListArg(args["acceptance"])
 	constraints := parseStringListArg(args["constraints"])
 	files := parseFilesArg(args["files"])
+	contract := parseContractArg(args["contract"])
 
 	if goal == "" {
 		return &Result{Tool: "WriteSpec", Error: "goal is required", Category: ResultCategoryValidationRejected}
@@ -90,6 +95,7 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 		Acceptance:  acceptance,
 		Constraints: constraints,
 		Files:       files,
+		Contract:    contract,
 	}
 
 	// 构建文件 mtime 索引：stat 各 path，规范化为绝对路径。
@@ -144,6 +150,10 @@ type writeSpecInput struct {
 	Constraints []string `json:"constraints" description:"约束/边界（不碰哪些、性能要求、兼容性、风格等）。可空。"`
 	// Files 涉及的文件路径列表，用于自动失效与版本校验。任一文件被 WriteFile 修改后该 spec 自动失效。
 	Files []string `json:"files" description:"涉及的文件路径列表（相对或绝对）。任一文件被 WriteFile 修改后该规范自动失效，避免子 Agent 读到旧规范。可空。"`
+	// Contract 跨域契约（TODO #57）：多域任务必须填写机器可校验的集成点清单。
+	// dispatcher 在全部兄弟域完成后自动跑静态契约检查，违例按文件归属打回责任域。
+	// 四类条目均可空；单域/无跨域引用任务整个 contract 可空。
+	Contract *Contract `json:"contract" description:"跨域契约（多域任务填写）：symbols=跨域符号映射（symbol 声明于 file，refs 列引用方文件）；dom_ids=DOM 元素 id 清单（id 声明于 file）；scripts=script 加载顺序（条目顺序即加载顺序）；signatures=跨域函数签名（signature 文本必须出现在 file 中）。dispatcher 机器校验用，零 LLM；单域任务可空。"`
 }
 
 // parseStringListArg 从 args[key] 提取字符串列表，兼容 []any / []string / 缺省。
@@ -168,6 +178,32 @@ func parseStringListArg(v any) []string {
 			}
 		}
 		return out
+	default:
+		return nil
+	}
+}
+
+// parseContractArg 从 args[key] 提取 Contract：兼容 *Contract / map[string]any（JSON 往返）/
+// 缺省。LLM 经 blades schema 传入 map，JSON 序列化往返是结构映射的最省路径。
+func parseContractArg(v any) *Contract {
+	switch vv := v.(type) {
+	case *Contract:
+		return vv
+	case Contract:
+		return &vv
+	case map[string]any:
+		data, err := json.Marshal(vv)
+		if err != nil {
+			return nil
+		}
+		var c Contract
+		if err := json.Unmarshal(data, &c); err != nil {
+			return nil
+		}
+		if c.Empty() {
+			return nil
+		}
+		return &c
 	default:
 		return nil
 	}
