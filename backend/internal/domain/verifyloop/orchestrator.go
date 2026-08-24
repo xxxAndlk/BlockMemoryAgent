@@ -3,7 +3,7 @@
 // 【现状：未接线保留】2026-08-08 A/B 实证（test/benchmark/runs/multi-on vs multi-off）：
 // 自动验证闭环开启后通过率 16/16 -> 5/16、token 翻倍（verifier 累计 input 计费烧穿预算、
 // 零件级通过≠整品可用、失败摘要干扰父 Agent 决策）。dispatcher/bootstrap 接线与
-// self_test 配置已整体移除，活跃机制改为分层自检（叶子自检 / 领域整体性验收 / meta 整品验收+返工，
+// self_test 配置已整体移除，活跃机制改为分层自检（叶子自检 / 领域收尾验收 / meta 纸面交付对照+返工，
 // 见 config/roles.yaml）。本包作为业务验收测试工作流的原型保留，复活方案见
 // doc/扩展设计_Agent工作流平台.md §12。
 //

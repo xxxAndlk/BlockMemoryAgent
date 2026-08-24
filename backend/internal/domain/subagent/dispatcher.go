@@ -1816,8 +1816,9 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		return false
 	}
 
-	// 成功：把结果摘要通知父 Agent。产出质量由分层自检保证（叶子自检 / 领域整体性验收 /
-	// meta 整品验收+返工，见 roles.yaml 提示词），完成路径不再自动派验证 Agent——
+	// 成功：把结果摘要通知父 Agent。产出质量由分层自检保证（叶子自检 / 领域收尾验收 /
+	// meta 纸面交付对照+返工，见 roles.yaml 提示词），完成路径不再自动派验证 Agent--
+	// 整品验收 Agent 2026-08-24 切出默认流程：isVerificationTask +【集成验证任务模式】保留为口子。
 	// A/B 实证自动验证闭环是负资产（开 5/16 vs 关 16/16），机制移至扩展设计文档 §12 作后期扩展。
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
 	d.boardUpdate(ctx, parentID, domain, true, result.Text)
