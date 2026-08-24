@@ -18,9 +18,9 @@
 meta_agent:
   model_config: &meta_model
     provider: anthropic
-    model: doubao-seed-evolving
-    api_key: ${ANTHROPIC_API_KEY}
-    base_url: ${ANTHROPIC_BASE_URL}
+    model: k3
+    api_key: ${ANTHROPIC_API_KEY_TWO}
+    base_url: ${ANTHROPIC_BASE_URL_TWO}
     temperature: 0.3
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
     # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
