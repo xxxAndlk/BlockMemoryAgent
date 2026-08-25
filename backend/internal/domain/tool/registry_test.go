@@ -174,6 +174,71 @@ func TestReadFile_ConsecutiveSameCallLoopGuard(t *testing.T) {
 	}
 }
 
+// TestReadFile_WriteResetsConsecutiveCount 确认性复读放行（TODO #72）：
+// WriteFile/EditFile 成功写某路径后清零该路径连读计数--
+// Read(A)->Write(A)->Read(A)->Read(A) 的编辑后确认工作流不再第 3 次被杀。
+func TestReadFile_WriteResetsConsecutiveCount(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(target, []byte("v1"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s2")
+	args := map[string]any{"path": "a.txt", "offset": float64(1), "limit": float64(5)}
+
+	// Read x2（连读计数 2），随后写入成功清零。
+	for i := 0; i < 2; i++ {
+		if res, err := r.Dispatch(ctx, "ReadFile", args); err != nil || !res.Success {
+			t.Fatalf("read %d: err=%v success=%v", i+1, err, res.Success)
+		}
+	}
+	if wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{"path": "a.txt", "content": "v2"}); err != nil || !wres.Success {
+		t.Fatalf("write: err=%v success=%v", err, wres.Success)
+	}
+	// 写后确认性复读 x2（若无写入清零，这里第 2 次已是第 4 连读、被杀）。
+	for i := 0; i < 2; i++ {
+		if res, err := r.Dispatch(ctx, "ReadFile", args); err != nil || !res.Success {
+			t.Fatalf("confirm read %d after write should pass: err=%v success=%v", i+1, err, res.Success)
+		}
+	}
+	// 第 3 次写后复读（计数 3）仍被杀--守卫语义保留。
+	res, _ := r.Dispatch(ctx, "ReadFile", args)
+	if res.Success {
+		t.Fatal("3rd consecutive read after write should still be blocked")
+	}
+}
+
+// TestReadFile_LongFileRelaxed 长文件连读上限放宽（TODO #72）：
+// ReadFile 返回总行数 > 500 的长文件时，同区间连读上限放宽到 6。
+func TestReadFile_LongFileRelaxed(t *testing.T) {
+	dir := t.TempDir()
+	var lines []string
+	for i := 0; i < longFileReadLines+50; i++ {
+		lines = append(lines, "line")
+	}
+	target := filepath.Join(dir, "long.txt")
+	if err := os.WriteFile(target, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s3")
+	args := map[string]any{"path": "long.txt", "offset": float64(1), "limit": float64(5)}
+
+	// 首读标记长文件；随后同参数 2..5 连读均放行（旧上限 3 会杀第 3 次）。
+	for i := 0; i < 5; i++ {
+		res, err := r.Dispatch(ctx, "ReadFile", args)
+		if err != nil || !res.Success {
+			t.Fatalf("long-file read %d should pass (relaxed limit): err=%v success=%v", i+1, err, res.Success)
+		}
+	}
+	// 第 6 次达放宽上限，被杀。
+	res, _ := r.Dispatch(ctx, "ReadFile", args)
+	if res.Success {
+		t.Fatal("6th consecutive long-file read should be blocked")
+	}
+}
+
 // TestReadFile_AfterWriteFile_ReturnsFreshContent 脏数据回归测试：
 // ReadFile 每次直返磁盘最新内容，WriteFile 改写后按相同参数重读必须看到新内容，
 // 不依赖任何"已读记录清理"机制（WriteFile/sed/外部进程改写均被天然覆盖）。
@@ -828,7 +893,9 @@ func TestWriteSpec_RequiresGoalAndAcceptance(t *testing.T) {
 	}
 }
 
-// TestWriteSpec_InvalidatesOnWriteFile 验证 Layer 2：WriteFile 成功后引用同 path 的 spec entry 被删除。
+// TestWriteSpec_InvalidatesOnWriteFile 验证 Layer 2：WriteFile 成功后引用同 path 的
+// spec entry 写墓碑（TODO #74：物理删除改为 "invalidated: ..." 留痕，
+// 派发侧区分"从未写"与"已失效"）。
 func TestWriteSpec_InvalidatesOnWriteFile(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "foo.js")
@@ -855,7 +922,7 @@ func TestWriteSpec_InvalidatesOnWriteFile(t *testing.T) {
 		t.Fatal("expected spec entry before WriteFile")
 	}
 
-	// WriteFile 修改 foo.js，触发失效。
+	// WriteFile 修改 foo.js，触发失效（墓碑而非物理删除）。
 	wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{
 		"path":    target,
 		"content": "var x = 2",
@@ -863,8 +930,12 @@ func TestWriteSpec_InvalidatesOnWriteFile(t *testing.T) {
 	if err != nil || !wres.Success {
 		t.Fatalf("WriteFile: err=%v res=%+v", err, wres)
 	}
-	if _, ok := store.items["meta-1:spec"]; ok {
-		t.Fatal("expected spec entry deleted after WriteFile invalidated it")
+	val, ok := store.items["meta-1:spec"]
+	if !ok {
+		t.Fatal("expected spec tombstone retained after WriteFile invalidated it")
+	}
+	if !strings.HasPrefix(val, SpecTombstonePrefix) {
+		t.Fatalf("expected tombstone value with prefix %q, got %q", SpecTombstonePrefix, val)
 	}
 }
 

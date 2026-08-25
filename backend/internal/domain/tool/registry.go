@@ -7,6 +7,7 @@ import (
 	"fmt"           // fmt 用于格式化错误信息
 	"log"           // log 用于记录拦截/失败等不影响主流程的可观测事件
 	"path/filepath" // filepath 用于规范化文件路径
+	"strconv"       // strconv 用于解析 ReadFile 分页头总行数（长文件判定）
 	"strings"       // strings 用于拼接已读文件列表
 	"sync"          // sync 提供互斥锁保护并发状态
 
@@ -112,6 +113,9 @@ type Registry struct {
 	// 达 maxConsecutiveSameRead 触发 LoopExit（真死循环兜底）；
 	// 参数有任何变化（翻页/换文件）即归零——重读本身合法，每次直返磁盘最新内容。
 	sameReadCount map[string]int
+	// longFileScopes 按 agentID 记录最近一次成功 ReadFile 是否为长文件（TODO #72）：
+	// 返回总行数 > longFileReadLines 时置 true，下一次同文件同区间连读上限放宽。
+	longFileScopes map[string]bool
 	// sharedMemory 是 WriteSharedMemory 工具的 KV 后端，由 bootstrap 注入。
 	// 为 nil 时 WriteSharedMemory 注册但不生效，调用返回 store 未配置错误。
 	sharedMemory SharedMemoryStore
@@ -156,6 +160,7 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		aliases:           make(map[string]string),
 		lastReadKey:       make(map[string]string),
 		sameReadCount:     make(map[string]int),
+		longFileScopes:    make(map[string]bool),
 		productionWorkDir: "",
 	}
 	if cfg != nil {
@@ -413,7 +418,10 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 
 	// ReadFile 连读检测：重读不再拦截（每次直返磁盘最新内容，天然无脏数据，
 	// 也兼容 WriteFile/sed/外部进程改写等一切修改途径）。仅检测"参数完全相同"的连续
-	// 调用：第 2 次直返内容并附提醒，第 maxConsecutiveSameRead 次判定死循环触发 LoopExit。
+	// 调用：第 2 次直返内容并附提醒，达上限判定死循环触发 LoopExit。
+	// TODO #72 确认性复读放行：长文件（返回总行数 > longFileReadLines）上限放宽到
+	// maxConsecutiveSameReadLongFile——编辑前后同区间复读是合理确认工作流；
+	// 短文件保持 3（真死循环）。
 	readNote := ""
 	if name == "ReadFile" {
 		// 注入 offset/limit 默认值，使执行器与连读检测使用同一取值。
@@ -430,9 +438,14 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 			int(args["offset"].(float64)), int(args["limit"].(float64)))
 		scope := scopeKeyFromCtx(ctx)
 		n := r.bumpSameRead(scope, key)
+		// 长文件判定：同 scope 上一成功 ReadFile 返回总行数 > longFileReadLines 时放宽上限。
+		limit := maxConsecutiveSameRead
+		if r.isLongFileScope(scope, normalizedPath) {
+			limit = maxConsecutiveSameReadLongFile
+		}
 		// 连续相同调用达上限：LLM 陷入死循环（内容已直返过仍原样再调），
 		// 触发 LoopExit 终止 ReAct 循环，让上层子 Agent 失败回灌摘要，避免烧 token 与时间。
-		if n >= maxConsecutiveSameRead {
+		if n >= limit {
 			msg := fmt.Sprintf("已连续 %d 次以完全相同的参数读取该文件区间，内容均已返回，疑似死循环。需要其他段落应调整 offset 翻页；本次任务终止。", n)
 			result := &Result{Tool: "ReadFile", Path: normalizedPath, Error: msg}
 			r.fillResult(ctx, result, args)
@@ -469,16 +482,23 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 调用工具实现获取执行结果。
 	result := t.Execute(ctx, args)
 
-	// ReadFile 成功读取后：连续第 2 次相同参数调用时附上翻页提醒（内容直返，不拦截）。
-	if name == "ReadFile" && result.Success && readNote != "" {
-		result.Output += readNote
+	// ReadFile 成功读取后：连续第 2 次相同参数调用时附上翻页提醒（内容直返，不拦截）；
+	// 按总行数标记长文件状态（下一次连读上限放宽，TODO #72）。
+	if name == "ReadFile" && result.Success && result.Output != "" {
+		if readNote != "" {
+			result.Output += readNote
+		}
+		r.markLongFileScope(scopeKeyFromCtx(ctx), result.Output)
 	}
 
 	// WriteFile/EditFile 成功后失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
 	// 防止子 Agent 改文件后，父 Agent 下次派发仍把旧摘要注入新子 Agent task 导致幻觉。
 	// ReadFile 无需清已读记录：重读本就直返磁盘最新内容，不存在脏数据问题。
+	// TODO #72 确认性复读放行：写入成功同时清零该路径连读计数——
+	// Read(A)→Write(A)→Read(A)→Read(A) 的编辑后确认不再被杀。
 	if (name == "WriteFile" || name == "EditFile") && result.Success && result.Path != "" {
 		r.invalidateSharedMemoryForPath(ctx, result.Path)
+		r.resetSameReadForPath(scopeKeyFromCtx(ctx), result.Path)
 		// 文件新增/修改触发去抖刷新 PROJECT.md 领域影响范围（安静期一次 LLM 重分区）。
 		r.scheduleProjectRefresh()
 	}
@@ -587,10 +607,21 @@ func (r *Registry) scheduleProjectRefresh() {
 	r.refresher.schedule(r.exec.WorkDir())
 }
 
+// specTombstonePrefix 是 spec 槽位失效墓碑值前缀（TODO #74）：
+// 物理删除改为写墓碑 "invalidated: 文件 X 已变更"，派发侧据前缀区分
+// "从未写"与"已失效"，报错直指真实原因（key 错配时列已有 key 清单）。
+const specTombstonePrefix = "invalidated: "
+
+// SpecTombstonePrefix 导出 spec 墓碑前缀（dispatcher 派发侧诊断用，TODO #74）。
+const SpecTombstonePrefix = specTombstonePrefix
+
 // invalidateSharedMemoryForPath 遍历共享记忆，删除引用指定 path 的 entry（Layer 2 缓存一致性）。
 // 在 WriteFile 成功后调用，防止子 Agent 改文件后父 Agent 下次派发仍注入旧摘要。
 // 失败静默（仅影响缓存，不影响 WriteFile 主路径）；path 规范化为绝对路径比较。
 // 旧格式 value（无 frontmatter）无法判断引用关系，保留不删，由 Layer 3 stat 校验兜底。
+// spec 槽位（<agentID>:spec[...]) 不物理删而写墓碑（TODO #74）：
+// "被失效"与"从未写"在派发报错中语义不同，物理删导致 meta 误诊 key 覆盖
+//（实证 2026-08-25：meta 误诊"每 parent 只存一份 spec 互相覆盖"改串行重派白烧一轮）。
 func (r *Registry) invalidateSharedMemoryForPath(ctx context.Context, path string) {
 	if r.sharedMemory == nil || path == "" {
 		return
@@ -602,6 +633,10 @@ func (r *Registry) invalidateSharedMemoryForPath(ctx context.Context, path strin
 		if err != nil || val == "" {
 			continue
 		}
+		// spec 墓碑幂等：已是本 path 的墓碑不再重写（跳过后续解析）。
+		if strings.HasPrefix(val, specTombstonePrefix) {
+			continue
+		}
 		fm, _, ok := DecodeSharedMD(val)
 		if !ok {
 			// 旧格式（无 frontmatter）：无法判断引用关系，保留。
@@ -609,6 +644,11 @@ func (r *Registry) invalidateSharedMemoryForPath(ctx context.Context, path strin
 		}
 		for fp := range fm.Files {
 			if filepath.Clean(fp) == cleanPath {
+				// spec 槽位写墓碑（key 形如 "<agentID>:spec" 或 "<agentID>:spec:<key>"）。
+				if slot := key[strings.Index(key, ":")+1:]; slot == SpecSlot || strings.HasPrefix(slot, SpecSlot+":") {
+					_ = r.sharedMemory.Set(ctx, key, specTombstonePrefix+filepath.Clean(fp)+" 已变更，请用 WriteSpec 重写")
+					break
+				}
 				_ = r.sharedMemory.Delete(ctx, key)
 				break
 			}
@@ -691,6 +731,68 @@ func (r *Registry) bumpSameRead(scopeKey, key string) int {
 		r.sameReadCount[scopeKey] = 1
 	}
 	return r.sameReadCount[scopeKey]
+}
+
+// maxConsecutiveSameReadLongFile 是长文件（ReadFile 返回总行数 > longFileReadLines）的
+// 连读上限放宽值（TODO #72）：编辑长文件前后同区间确认性复读是合理工作流，
+// 扁平常量 3 误杀（实证 2026-08-25 domain-2 被连读守卫杀时 plan_execute 仅 1/6）。
+const maxConsecutiveSameReadLongFile = 6
+
+// longFileReadLines 判定"长文件"的输出行数阈值（TODO #72）。
+const longFileReadLines = 500
+
+// resetSameReadForPath 清零指定 scope 中匹配 path 的连读计数（TODO #72 确认性复读放行）：
+// WriteFile/EditFile 成功写某路径后调用——编辑后的同区间复读是确认性工作流
+//（Read(A)→Write(A)→Read(A)→Read(A) 不再第 3 次被杀），纯探索性 3 连读仍杀。
+func (r *Registry) resetSameReadForPath(scopeKey, path string) {
+	if scopeKey == "" || path == "" {
+		return
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	key := r.lastReadKey[scopeKey]
+	if key == "" {
+		return
+	}
+	// 调用键格式 "path\x00offset\x00limit"：前缀匹配同路径任意区间。
+	if strings.HasPrefix(key, filepath.Clean(path)+"\x00") {
+		delete(r.lastReadKey, scopeKey)
+		delete(r.sameReadCount, scopeKey)
+	}
+}
+
+// isLongFileScope 返回该 scope 最近一次 ReadFile 是否为长文件（TODO #72）。
+func (r *Registry) isLongFileScope(scopeKey, path string) bool {
+	if scopeKey == "" {
+		return false
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	return r.longFileScopes[scopeKey]
+}
+
+// markLongFileScope 按 ReadFile 成功结果的总行数标记长文件状态（TODO #72）。
+// Output 分页头格式 `[共 %d 行 | ...`，解析失败按短文件处理（保守不放宽）。
+func (r *Registry) markLongFileScope(scopeKey, output string) {
+	long := false
+	if strings.HasPrefix(output, "[共 ") {
+		rest := strings.TrimPrefix(output, "[共 ")
+		if sp := strings.IndexByte(rest, ' '); sp > 0 {
+			if n, err := strconv.Atoi(rest[:sp]); err == nil && n > longFileReadLines {
+				long = true
+			}
+		}
+	}
+	if scopeKey == "" {
+		return
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	if long {
+		r.longFileScopes[scopeKey] = true
+	} else {
+		delete(r.longFileScopes, scopeKey)
+	}
 }
 
 // ResetReadHistory 清空指定 agent 的连读状态（参数完全相同的 ReadFile 连续次数）。

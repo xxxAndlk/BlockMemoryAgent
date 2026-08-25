@@ -115,6 +115,50 @@ func FilesModifiedFromHistory(history []ReactMessage) []string {
 	return out
 }
 
+// FilesWrittenFromHistory 从 ReAct 历史中收集"写入成功"的文件清单（TODO #72 遗产清单）：
+// 仅统计 assistant 发起 WriteFile/EditFile 调用且对应 tool 结果 Success=true 的路径，
+// 去重保序。与 FilesModifiedFromHistory（不校验成功）相对——遗产清单只认真实落盘的文件，
+// 作为续建 spec 骨架的素材必须可信。
+func FilesWrittenFromHistory(history []ReactMessage) []string {
+	okCalls := make(map[string]bool)
+	for _, m := range history {
+		if m.Role != "tool" || m.ToolCallID == "" {
+			continue
+		}
+		var r ToolResult
+		if json.Unmarshal([]byte(m.Content), &r) == nil && r.Success {
+			okCalls[m.ToolCallID] = true
+		}
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range history {
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if tc.Name != "WriteFile" && tc.Name != "EditFile" {
+				continue
+			}
+			if !okCalls[tc.ID] {
+				continue
+			}
+			p, _ := tc.Input["path"].(string)
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			cleaned := filepath.Clean(p)
+			if seen[cleaned] {
+				continue
+			}
+			seen[cleaned] = true
+			out = append(out, cleaned)
+		}
+	}
+	return out
+}
+
 // ToolResult 表示执行一次 ToolCall 后的结果。
 type ToolResult struct {
 	Tool    string `json:"tool"`            // Tool 是产生该结果的工具名称

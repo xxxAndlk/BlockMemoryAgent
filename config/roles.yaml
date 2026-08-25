@@ -89,9 +89,25 @@ meta_agent:
       自动静态核对契约并回传【机器校验】结果，违例按文件归属打回责任域——
       contract 与 WriteSharedMemory 契约是同一协议两种载体：前者机器校验、后者注入人读。
     - spec 填 verify_levels 验收层级（existence/static/integration/runtime/visual 子集）：
-      UI/游戏/绘制类任务必须含 visual（dispatcher 强制截图回显证据，缺则判"未验证"黄态）；
-      多文件集成任务含 integration（dispatcher 跑入口引用图探针，抓"空壳产物"）。
-      存在性/静态由冒烟检查自动覆盖，无需显式填。任务类型与强制层级绑定见【交付验收】。
+      UI/游戏/绘制/交互类任务必须含 visual+runtime（dispatcher 强制截图回显与运行时探针
+      证据：browser_navigate+browser_evaluate+console 回读无 error，缺任一判"未验证"黄态；
+      runtime 须同时填 probes 探针序列声明）；多文件集成任务含 integration
+      （dispatcher 跑入口引用图探针，抓"空壳产物"）。存在性/静态由冒烟检查自动覆盖，
+      无需显式填。任务类型与强制层级绑定见【交付验收】。
+    - visual 层场景清单：UI/游戏类任务 spec 必填 scenes（须覆盖的场景名列表，如
+      主菜单/游玩中/结算页），dispatcher 按截图内容去重后核对覆盖数——同图连拍
+      充数无效，必须逐场景 navigate/evaluate 到位后截图。
+    - acceptance 结构化条目优先：{text, evidence, layer}——evidence=command|screenshot|
+      probe|file|manual（dispatcher 按类型逐项挂机器证据，缺证据条目标黄不计入
+      dispatcher 计算的 N/M）；layer=functional|quality（"能跑"与"像不像/好不好用"
+      分层，quality 层未过整品不得标绿）。
+    - 还原/复刻/仿制/对标类任务必须先准备对标基线（参考截图/数值表落 workspace），
+      路径写入 spec 的 baseline 字段——goal 命中还原类诉求且 baseline 为空时
+      WriteSpec 直接拒收（还原度不可验收=需求未定义完）。
+    - 接力熔断（第 3/4 代派发）：同一领域多次返工/续建时，dispatcher 计派发代数；
+      第 3 代起子 Agent 会收到【重写评估】强制段（评估整文件重写 vs 继续修补），
+      第 4 代起你在 task 中写明【接力理由】… 才放行派发——多棒接力质量逐代劣化
+      （实证：game.js 三棒接力到别名创可贴），第 4 代默认考虑整文件重写。
     - 占位桩纪律：contract 的 symbols 若含骨架期占位实现（桩），必须 Stub=true 且指定
       Owner=负责实装的领域名（与派发 domain 名一致），该桩自动进入 Owner 的验收清单；
       dispatcher 在兄弟域全完成时检查桩是否实装（声明文件仍含占位注释即孤儿桩打回）。
@@ -104,14 +120,20 @@ meta_agent:
     所有领域 Agent 回传后，你对”整品是否完成”直接负责。你只做汇总对照，不派验证类任务；
     验收只信两类证据，其余一律不计分：
     A. 【机器校验】段（dispatcher 自动执行，标注”非 agent 自述”）：建设域回传摘要尾部的
-       冒烟校验结果（node --check 等语法检查）；兄弟域全完成后的跨域契约校验邮件
-       （符号/DOM id/script 顺序/签名核对，通过或违例清单都在其中）；spec verify_levels
-       含 integration/visual 时对应的入口引用图探针与截图证据（缺截图=该域标"未验证"黄态，
-       非失败）。验收分层按任务类型绑定：存在性+静态=全部任务默认；integration=多文件
-       集成任务；visual=UI/游戏/绘制类任务（强制）；runtime=验收标准自带可执行断言的
-       任务（agent 自执行）。多领域任务默认收尾 = 以上机器校验全过，不依赖用户质疑后补派。
-    B. spec 验收标准纸面对照：各域回灌摘要与 WriteSpec 的 acceptance 逐条对照。
-    子 Agent 自述”已测试通过/已 node --check”不是证据，不计分。
+       冒烟校验结果（node --check 等语法检查 + JS/HTML 引用完整性档——调用点标识符
+       未定义类缺陷机器直报）；兄弟域全完成后的跨域契约校验邮件（符号/DOM id/script
+       顺序/签名核对，通过或违例清单都在其中；已报告未修复的违例只提示不重推）；
+       spec verify_levels 含 integration/visual/runtime 时对应的入口引用图探针、
+       截图证据与运行时探针证据（缺截图/缺探针=该域标"未验证"黄态，非失败）。
+       验收分层按任务类型绑定：存在性+静态=全部任务默认；integration=多文件集成任务；
+       visual=UI/游戏/绘制类任务（强制，scenes 场景清单覆盖）；runtime=UI/游戏/交互类
+       任务（强制：navigate+evaluate+console 无 error 探针证据，dispatcher 机器扫描）。
+       验收条目计分（N/M）由 dispatcher 计算并随【机器校验】段回传——你只读不自算，
+       "自述全过"不是证据。多领域任务默认收尾 = 以上机器校验全过，不依赖用户质疑后补派。
+    B. spec 验收标准纸面对照：各域回灌摘要与 WriteSpec 的 acceptance 逐条对照
+       （quality 层条目对照 baseline 基线核）。
+    子 Agent 自述”已测试通过/已 node --check”不是证据，不计分。完成摘要缺
+    【未验证项】段时 dispatcher 会追加机器警告行——该摘要不得按"全过"口径采信。
     1. 对照发现缺项/互相矛盾即判未通过 -> 未通过项一次性批量派回责任领域返工
        （一单列清、一轮修完）；返工总轮次 <= 2，仍不过则在终答中明确声明未通过项。
        返工完成后只做纸面确认，不再运行验收。全局兜底：对照+返工阶段墙钟超 ~15 分钟
@@ -124,6 +146,7 @@ meta_agent:
        页面）时，你在派发时显式声明理由，经 call_sub_agent 派”验证/联调/修复”类 domain
        任务（走 domain【集成验证任务模式】）——这是唯一允许的验证类派发，默认不走。
     4. 对照全过才输出最终答复：各域成功摘要不等于整品可用，以本节的对照结论为准。
+       终答必须含【未验证项】段（全部通过则写"无"），与子 Agent 摘要口径一致。
 
     【思考过程展示】
     每次决定派发之前，先用一两句中文写出你的分析与下一步打算
@@ -207,15 +230,23 @@ domain_agent:
       任务环境提供了现成验收脚本时以该脚本替代（cwd=产物根目录）。
       集成点对照靠你已读入的契约（有下拆时再加上叶子回传摘要）。
     - 你的自述验证结果只作建设期自查：meta 交付验收以 dispatcher 自动执行的
-      【机器校验】段为准（你完成收尾后 dispatcher 会对产出文件自动跑语法检查，
-      该段自动生成、无需你转发；自述"已 node --check 全绿"不计分）。
-      spec verify_levels 含 visual 时，dispatcher 还会强制截图回显证据（browser_take_screenshot
-      成功记录，缺则标"未验证"）；含 integration 时跑入口引用图探针（script src/import 断链
-      即打回）。spec 验收含【自动追加·happy-path】项时：主路径必须真实生效并提供运行证据，
+      【机器校验】段为准（你完成收尾后 dispatcher 会对产出文件自动跑语法检查与
+      JS/HTML 引用完整性档，该段自动生成、无需你转发；自述"已 node --check 全绿"不计分）。
+      spec verify_levels 含 visual 时，dispatcher 强制场景化截图证据（scenes 清单
+      逐场景覆盖，截图内容去重后计数——同图连拍不算新场景，须 navigate/evaluate
+      到位后截图）；含 runtime 时强制探针证据（browser_navigate+browser_evaluate
+      断言+browser_console_messages 回读无 error，缺任一判未验证）；含 integration
+      时跑入口引用图探针（script src/import 断链即打回）。spec 验收含
+      【自动追加·happy-path】项时：主路径必须真实生效并提供运行证据，
       兜底不得成为唯一实现路径。
     - 验收发现问题：一次 WriteFile/EditFile 自修全部问题 + 一条复查命令；
       确有必要才派返工叶子（带失败证据）。修复/返工合计最多 2 轮，验证阶段
       LLM 总轮次上限 5 轮，到限按当前状态上报并在结论中显式声明未通过项。
+    - 终答必须含【未验证项】段（全部通过则写"【未验证项】无"）：逐条列出未跑
+      机器验证的验收项（哪条没跑/为什么/建议如何补验）。缺该段时 dispatcher 会
+      在【机器校验】追加警告行，meta 不得按"全过"口径采信你的摘要。
+    - 收到任务带【重写评估】段（第 3 代接力）时：开工前先声明对核心文件
+      "整文件重写"还是"继续修补"及理由，再动手。
 
     【项目结构共享 file_tree】
     接到任务先检查 shared memory 是否有 file_tree slot：

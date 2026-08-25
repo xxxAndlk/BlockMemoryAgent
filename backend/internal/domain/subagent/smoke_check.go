@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 
 	"strings"
 	"time"
@@ -173,6 +174,198 @@ func smokeRunCount(results []smokeResult) int {
 	}
 	return n
 }
+
+// runJSRefChecks 对 targets 中的 .js/.html 逐个跑引用完整性检查（TODO #71），
+// 聚合报告行。返回 (报告文本, 是否有硬判失败)。
+func runJSRefChecks(ctx context.Context, workdir string, files []string, runner smokeRunner, lookPath lookPathFunc) (string, bool) {
+	var notes []string
+	failed := false
+	for _, f := range files {
+		ext := strings.ToLower(filepath.Ext(f))
+		if ext != ".js" && ext != ".html" && ext != ".htm" {
+			continue
+		}
+		note, ffail := runJSReferenceCheck(ctx, workdir, f, runner, lookPath)
+		if note != "" {
+			notes = append(notes, strings.TrimRight(note, "\n"))
+		}
+		if ffail {
+			failed = true
+		}
+	}
+	return strings.Join(notes, "\n"), failed
+}
+
+// jsRefCheckMinLines 触发 JS 引用完整性检查的行数阈值（TODO #71）：
+// >300 行的单文件 .js 才追加 tsc --allowJs --checkJs 档——小文件 LLM 出错率低，
+// 全量跑 tsc 会显著拉长每次完成收尾。HTML 内联 script 同阈值。
+const jsRefCheckMinLines = 300
+
+// runJSReferenceCheck 对单个大文件 .js/.html 做引用完整性检查（TODO #71 冒烟层第三档）：
+//   - 首选 tsc --allowJs --checkJs --noEmit --skipLibCheck（能报 Cannot find name，
+//     .ts 档已依赖 tsc 环境）；结果硬判（exit != 0 = 失败）。
+//   - tsc 不可用时回退内置轻量扫描（调用点裸标识符 vs 顶层定义 + 常见全局白名单），
+//     结果只标"存疑"不硬拒（防动态属性/全局注入误报，与契约 tsc 仲裁同语义）。
+// 返回 (报告行, failed)：failed=true 仅 tsc 档成立；轻量档 failed=false、报告行标存疑。
+func runJSReferenceCheck(ctx context.Context, workdir, file string, runner smokeRunner, lookPath lookPathFunc) (string, bool) {
+	abs := file
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(workdir, file)
+	}
+	data, err := osReadFile(abs)
+	if err != nil {
+		return "", false
+	}
+	content := string(data)
+	// HTML：提取内联 script 后同检（src 引用归 integration 层，此处只查内联代码）。
+	if strings.EqualFold(filepath.Ext(file), ".html") || strings.EqualFold(filepath.Ext(file), ".htm") {
+		content = extractInlineScripts(content)
+		if strings.TrimSpace(content) == "" {
+			return "", false
+		}
+	}
+	if countLines(content) <= jsRefCheckMinLines {
+		return "", false
+	}
+	if lookPath == nil {
+		lookPath = exec.LookPath
+	}
+	if _, err := lookPath("tsc"); err == nil {
+		if runner == nil {
+			runner = defaultSmokeRunner
+		}
+		cmdCtx, cancel := context.WithTimeout(ctx, smokeTimeout)
+		defer cancel()
+		out, code, runErr := runner(cmdCtx, workdir, "tsc", "--allowJs", "--checkJs", "--noEmit", "--skipLibCheck", abs)
+		if runErr != nil {
+			return "", false
+		}
+		if code == 0 {
+			return "", false
+		}
+		tail := tailRunes(strings.TrimSpace(out), smokeOutputTailRunes)
+		return fmt.Sprintf("- %s: 引用完整性 tsc 档失败（exit %d）——调用点标识符未定义类缺陷：\n%s\n", file, code, indentLines(tail, "  ")), true
+	}
+	// 轻量回退：裸标识符 vs 定义扫描，只标存疑。
+	if suspects := scanUndefinedCalls(content); len(suspects) > 0 {
+		return fmt.Sprintf("- %s: 引用完整性轻量扫描存疑（tsc 不可用，不硬拒）：疑似未定义调用 %s——请人工核对\n", file, strings.Join(suspects, ", ")), false
+	}
+	return "", false
+}
+
+// extractInlineScripts 提取 HTML 中 <script>（无 src）的内联 JS 内容。
+func extractInlineScripts(html string) string {
+	var b strings.Builder
+	rest := html
+	for {
+		i := strings.Index(rest, "<script")
+		if i < 0 {
+			break
+		}
+		closeIdx := strings.Index(rest[i:], ">")
+		if closeIdx < 0 {
+			break
+		}
+		openTag := rest[i : i+closeIdx+1]
+		rest = rest[i+closeIdx+1:]
+		endIdx := strings.Index(rest, "</script>")
+		if endIdx < 0 {
+			break
+		}
+		// 带 src 的外链 script 跳过（引用存在性归 integration 层）。
+		if !strings.Contains(openTag, "src") {
+			b.WriteString(rest[:endIdx])
+			b.WriteString("\n")
+		}
+		rest = rest[endIdx+len("</script>"):]
+	}
+	return b.String()
+}
+
+// jsGlobalWhitelist 是轻量扫描放行的浏览器/Node 全局与关键字（防误报核心）。
+var jsGlobalWhitelist = map[string]bool{
+	"window": true, "document": true, "console": true, "Math": true, "JSON": true,
+	"Date": true, "Array": true, "Object": true, "String": true, "Number": true,
+	"Boolean": true, "Promise": true, "Set": true, "Map": true, "WeakMap": true,
+	"Symbol": true, "Error": true, "TypeError": true, "RangeError": true,
+	"parseInt": true, "parseFloat": true, "isNaN": true, "isFinite": true,
+	"encodeURIComponent": true, "decodeURIComponent": true, "encodeURI": true, "decodeURI": true,
+	"setTimeout": true, "setInterval": true, "clearTimeout": true, "clearInterval": true,
+	"requestAnimationFrame": true, "cancelAnimationFrame": true,
+	"localStorage": true, "sessionStorage": true, "navigator": true, "location": true,
+	"history": true, "performance": true, "alert": true, "confirm": true, "prompt": true,
+	"fetch": true, "XMLHttpRequest": true, "WebSocket": true, "Audio": true,
+	"Image": true, "URL": true, "URLSearchParams": true, "FormData": true,
+	"globalThis": true, "module": true, "exports": true, "require": true, "process": true,
+	"Buffer": true, "__dirname": true, "__filename": true,
+	"canvas": true, "ctx": true, "g": true,
+	// JS 关键字/字面量骨架（正则已排除关键字，此处兜底常用结构词）。
+	"new": true, "typeof": true, "instanceof": true, "delete": true, "void": true,
+	"in": true, "of": true, "this": true, "super": true, "arguments": true,
+	"true": true, "false": true, "null": true, "undefined": true, "NaN": true, "Infinity": true,
+}
+
+// jsKeywordSet 是定义收集与调用扫描都跳过的 JS 保留字。
+var jsKeywordSet = map[string]bool{
+	"if": true, "else": true, "for": true, "while": true, "do": true, "switch": true,
+	"case": true, "default": true, "break": true, "continue": true, "return": true,
+	"function": true, "var": true, "let": true, "const": true, "class": true, "extends": true,
+	"try": true, "catch": true, "finally": true, "throw": true, "async": true, "await": true,
+	"yield": true, "static": true, "get": true, "set": true, "new": true, "typeof": true,
+	"instanceof": true, "delete": true, "void": true, "in": true, "of": true, "this": true,
+	"super": true, "import": true, "export": true, "from": true, "as": true,
+}
+
+
+// scanUndefinedCalls 轻量引用扫描（TODO #71 回退档）：收集顶层定义
+//（function/class 声明、var/let/const 赋值、对象方法名粗收）后，
+// 扫调用点裸标识符 `name(`，不在定义集/白名单/关键字内的列为存疑。
+// 粗口径：局部变量与参数不在顶层收集范围，会漏报也会把"定义在函数内"误放行——
+// 只作存疑提示不硬拒，防误报伤害大于漏报。
+func scanUndefinedCalls(content string) []string {
+	defined := make(map[string]bool)
+	clean := stripLineComments(content)
+	collectInto := func(re *regexp.Regexp) {
+		for _, m := range re.FindAllStringSubmatch(clean, -1) {
+			if len(m) > 1 && m[1] != "" {
+				defined[m[1]] = true
+			}
+		}
+	}
+	// 对象成员/方法简写/赋值目标也认定义（宁可放行不误报，轻量档只标存疑）。
+	collectInto(regexp.MustCompile(`([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::\s*(?:function|\()|\(\s*[^)\n]*\)\s*\{)`))
+	collectInto(regexp.MustCompile(`([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:function|\(|async|\[|\{|[A-Za-z_$])`))
+	// 调用点：`ident(` 且前一字符非 `.`（属性调用）非 \w$（防截断标识符）。
+	callRe := regexp.MustCompile(`([^.\w$])([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
+	var suspects []string
+	suspectSeen := make(map[string]bool)
+	for _, m := range callRe.FindAllStringSubmatch(clean, -1) {
+		name := m[2]
+		if jsKeywordSet[name] || jsGlobalWhitelist[name] || defined[name] {
+			continue
+		}
+		if suspectSeen[name] {
+			continue
+		}
+		suspectSeen[name] = true
+		suspects = append(suspects, name)
+		if len(suspects) >= 5 {
+			break
+		}
+	}
+	return suspects
+}
+
+// countLines 统计行数（空串 0 行）。
+func countLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n") + 1
+}
+
+// osReadFile 是 os.ReadFile 的可替换包装，测试注入假实现。
+var osReadFile = func(path string) ([]byte, error) { return os.ReadFile(path) }
 
 // smokeFixMessage 渲染冒烟失败后的反馈重试消息（1 轮，复用 L0 反馈通道语义）。
 func smokeFixMessage(failed []smokeResult) string {

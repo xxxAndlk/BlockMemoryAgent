@@ -41,6 +41,12 @@ type MDFrontmatter struct {
 	VerifyLevels []string `yaml:"verify_levels,omitempty"`
 	// Contract 跨域契约（TODO #57），仅 spec slot 填充；nil 等价于未填。
 	Contract *Contract `yaml:"contract,omitempty"`
+	// Probes 运行时探针声明（TODO #67 runtime 层），仅 spec slot 填充。
+	Probes []string `yaml:"probes,omitempty"`
+	// Scenes 场景化截图清单（TODO #69 visual 层），仅 spec slot 填充。
+	Scenes []string `yaml:"scenes,omitempty"`
+	// Baseline 对标基线产物清单（TODO #75），仅 spec slot 填充。
+	Baseline []string `yaml:"baseline,omitempty"`
 }
 
 // EncodeSharedMD 把 shared memory 槽位编码为 MD（frontmatter + body=content）。
@@ -75,6 +81,9 @@ func EncodeSpecMD(agentID string, spec Spec, files map[string]int64) string {
 		Constraints:  spec.Constraints,
 		VerifyLevels: spec.VerifyLevels,
 		Contract:     spec.Contract,
+		Probes:       spec.Probes,
+		Scenes:       spec.Scenes,
+		Baseline:     spec.Baseline,
 	}
 	return encodeMD(fm, renderSpecBody(spec))
 }
@@ -126,6 +135,33 @@ func renderSpecBody(s Spec) string {
 		b.WriteString("## 验收层级\n")
 		b.WriteString(strings.Join(s.VerifyLevels, " / "))
 		b.WriteString("\n\n")
+	}
+	if len(s.Probes) > 0 {
+		b.WriteString("## 运行时探针\n")
+		for _, p := range s.Probes {
+			b.WriteString("- ")
+			b.WriteString(strings.TrimSpace(p))
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+	if len(s.Scenes) > 0 {
+		b.WriteString("## 场景截图清单\n")
+		for _, sc := range s.Scenes {
+			b.WriteString("- ")
+			b.WriteString(strings.TrimSpace(sc))
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+	if len(s.Baseline) > 0 {
+		b.WriteString("## 对标基线\n")
+		for _, bl := range s.Baseline {
+			b.WriteString("- `")
+			b.WriteString(strings.TrimSpace(bl))
+			b.WriteString("`\n")
+		}
+		b.WriteByte('\n')
 	}
 	if s.Contract != nil && !s.Contract.Empty() {
 		b.WriteString("## 跨域契约\n")

@@ -215,6 +215,9 @@ func (d *Dispatcher) runContractChecks(c *tool.Contract, specFiles []string) con
 
 // signatureMatched 签名匹配：字面包含优先，未命中时空白归一后包含
 // （`attack (target, dmg)` 与 `attack(target, dmg)` 等价，TODO #62 语义化）。
+// TODO #70 注解剥离：字面/空白归一匹配前先把文件内容中的行注释（// 与 #）与
+// 行尾注解段剥掉——含注解的真实代码因注释干扰漏匹配会产生假违例
+// （实证 2026-08-25：签名对多行字面量真实代码永不命中，同一假违例 3 次推送）。
 func signatureMatched(content, sig string) bool {
 	if strings.Contains(content, sig) {
 		return true
@@ -228,7 +231,37 @@ func signatureMatched(content, sig string) bool {
 			return r
 		}, s)
 	}
-	return strings.Contains(norm(content), norm(sig))
+	if strings.Contains(norm(content), norm(sig)) {
+		return true
+	}
+	// 注解剥离后重试：剥掉行注释（// 与 # 到行尾，粗口径——字符串字面量里的 //
+	// 极少见于签名场景，漏报优于复杂化），再走字面 + 空白归一匹配。
+	stripped := stripLineComments(content)
+	if stripped != content {
+		if strings.Contains(stripped, sig) {
+			return true
+		}
+		if strings.Contains(norm(stripped), norm(sig)) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripLineComments 剥掉每行的 // 与 # 注释段（TODO #70）。
+// 粗口径正则级处理，不做字符串字面量感知（漏报优于复杂化）。
+func stripLineComments(content string) string {
+	lines := strings.Split(content, "\n")
+	for i, l := range lines {
+		if j := strings.Index(l, "//"); j >= 0 {
+			l = l[:j]
+		}
+		if j := strings.Index(l, "#"); j >= 0 {
+			l = l[:j]
+		}
+		lines[i] = l
+	}
+	return strings.Join(lines, "\n")
 }
 
 // stubMarkers 是占位桩标记识别口径（TODO #61）：声明文件仍含任一标记即判未实装。

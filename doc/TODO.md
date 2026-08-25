@@ -250,6 +250,18 @@
 
 ## 已完成（已归档到 git 历史）
 
+- **2026-08-25 落地 #67-76（任务 97-106，详见 `doc/变更.md`）——2026-08-25 水果忍者复原任务失败复盘十项**：
+  - #67 runtime 实装：`Spec.Probes` + `agent.HasRuntimeProbeEvidence`（navigate+evaluate 成功 + console 回读无 error/severe）+ dispatcher runtime 分支（缺证据重试 1 轮 → delivered-unverified 黄态）；roles.yaml UI/游戏/交互类 runtime 从建议改必须。
+  - #68 acceptance 结构化：`AcceptanceItem{text, evidence, layer}` 行内标记串编码（`Acceptance []string` 类型不变零破坏兼容）+ dispatcher `scoreAcceptance` 逐项计分（command/screenshot/probe/file 分派证据扫描，N/M 由 dispatcher 计算写入【机器校验】段，meta 只读不自算）。
+  - #69 场景化截图：`Spec.Scenes` + `HasSceneEvidence`（shotFingerprint 内容去重，同图连拍计 1；navigate/evaluate→screenshot 时序邻接）+ `visualEvidenceCheck` 场景清单驱动判定。
+  - #70 契约健壮化：`ValidateContractShape` 写时拦截全角/CJK 散文签名 + `signatureMatched` 行注释剥离重试 + `violationFingerprint` 会话级去重（首报打回/复验升级文案/全已知零打回）。
+  - #71 JS 引用完整性：冒烟层第三档 `runJSRefChecks`——>300 行 .js/.html（含内联 script 提取）首选 `tsc --allowJs --checkJs` 硬判，无 tsc 回退正则轻量扫描只标存疑。
+  - #72 循环守卫：WriteFile/EditFile 成功清零该路径连读计数（确认性复读放行）+ 长文件（>500 行）阈值 3→6 + 失败路径【遗产清单】段（成功写入清单 cap 30 + 看板在办步骤 + "可直接作为续建 spec 骨架素材"）。
+  - #73 看板接力：`TakeoverFrom` 失败条目迁移留痕（"曾失败，由 X 接力完成"，Done 不迁）+ `call_sub_agent` takeover 参数 + Brief【接管提示】。
+  - #74 spec 诊断：spec 槽位失效改 tombstone（`invalidated: ` 前缀，区分"被失效"与"从未写"）+ missing 报错列已有 spec key 清单 + 唯一 keyed spec 候选回退。
+  - #75 baseline 强制：`Spec.Baseline` + `HasFidelityKeyword`（还原/复刻/仿制/对标等）→ 还原类需求无基线 WriteSpec 拒收 + 基线文件存在性校验 + acceptance layer: functional/quality 分层计分（quality 缺失不标绿）。
+  - #76 meta 硬约束：domain 完成摘要缺【未验证项】段追加警告入【机器校验】（可观测不硬拒）+ `bumpDispatchGeneration` 派发代数（takeover 链贯通）：第 3 代注入【重写评估】强制段、第 4 代无【接力理由】拒派。
+  - 观察点：runtime 探针证据覆盖率、同图连拍黄态出现频率、假违例推送复发（应趋零）、确认性复读误杀消失、接力熔断第 3 代出现率。
 - **2026-08-25 落地 #59-66（任务 89-96，详见 `doc/变更.md`）——2026-08-24 高防植物大战僵尸复盘八项**：
   - #59 验收分层模板：`Spec.VerifyLevels`（existence/static/integration/runtime/visual），WriteSpec schema + frontmatter；dispatcher 集成层探针（`subagent/integration_check.go`：HTML script src 解析 + 入口 import 引用图 + 空壳提示）与视觉层证据强制（`agent.HasScreenshotEvidence`，缺截图 → `errVisualEvidenceMissing` → delivered-unverified 黄态）；roles.yaml 派发铁律/交付验收绑定任务类型强制层级。
   - #60 状态三态化：`orchestrator.StatusUnverified`（delivered-unverified）+ `Tree.FinishUnverified`；`board.TaskUnverified`/`BoardStatusDelivered` + `MarkUnverified`；dispatcher 失败路径按 kind 分流（verify_missing/unverified → 黄态，真失败仍红）；TUI `RoleStatusUnverified` 标黄。
