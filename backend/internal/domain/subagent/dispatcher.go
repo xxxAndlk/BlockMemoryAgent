@@ -1292,7 +1292,8 @@ func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode, ve
 // checkSpecBeforeDispatch 做 WriteSpec 强制校验：SpecEnforcementEnabled 开启时，
 // 派发前必须先 WriteSpec（校验 parentID:spec 存在、新鲜、Spec.Goal 非空且至少一条 Acceptance）。
 // domain 非空时校验该领域专属 spec（TODO #65 多 key 化），缺失回退遗留单键。
-// 返回空串表示通过，否则为错误文案。批量派发（call_sub_agents）只校验一次。
+// 返回空串表示通过，否则为错误文案。批量派发（call_sub_agents）对有 domain 的项逐领域
+// 调用本函数校验（任一失败整批拒），无 domain 项回退遗留单键一次校验（TODO #65）。
 func (d *Dispatcher) checkSpecBeforeDispatch(ctx context.Context, parentID, domain string) string {
 	if !d.specEnforcementEnabled {
 		return ""
@@ -1698,7 +1699,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("batch too large: %d 项（max %d）。超过请合并领域或分批", len(raw), maxBatch), Category: tool.ResultCategoryValidationRejected}
 	}
 
-	// 逐项校验参数；轻微超限（2000-2600 runes）软着陆放行并收集警告（TODO #38-3）。
+	// 逐项校验参数；超软限（默认 3000 runes）未达硬限（默认 4000）软着陆放行并收集警告（TODO #38-3，口径见 validateDispatchArgs）。
 	type batchItem struct {
 		roleID, domain, task, responsibility, mode, verifyKind string
 		reuseAgentID                                           string

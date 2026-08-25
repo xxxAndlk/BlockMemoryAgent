@@ -50,6 +50,44 @@ func TestTaskBoard_LifeCycle(t *testing.T) {
 	}
 }
 
+// TestTaskBoard_MarkUnverified 验证 TODO #60 三态化：MarkUnverified 置 delivered-unverified
+// 并记录缺验证原因；全终态无失败但有未验证 → 看板 DELIVERED（非 DONE 非 FAILED）；
+// 真失败混入时 FAILED 优先级更高；未知任务报错。
+func TestTaskBoard_MarkUnverified(t *testing.T) {
+	b := NewTaskBoard("topic-1", "多域交付")
+	id1 := b.AddSubTask("引擎")
+	id2 := b.AddSubTask("UI")
+
+	if err := b.MarkDone(id1, "OK"); err != nil {
+		t.Fatalf("mark done: %v", err)
+	}
+	if err := b.MarkUnverified(id2, "缺验证证据"); err != nil {
+		t.Fatalf("mark unverified: %v", err)
+	}
+	if b.Tasks[id2].Status != TaskUnverified {
+		t.Fatalf("expected task delivered-unverified, got %s", b.Tasks[id2].Status)
+	}
+	if b.Tasks[id2].Result != "缺验证证据" {
+		t.Fatalf("expected reason recorded, got %q", b.Tasks[id2].Result)
+	}
+	if b.Status != BoardStatusDelivered {
+		t.Fatalf("expected board DELIVERED, got %s", b.Status)
+	}
+
+	// 真失败优先级高于未验证
+	if err := b.MarkFailed(id1, "smoke failed"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if b.Status != BoardStatusFailed {
+		t.Fatalf("expected board FAILED, got %s", b.Status)
+	}
+
+	// 未知任务报错
+	if err := b.MarkUnverified("nonexistent", "x"); err == nil {
+		t.Fatal("expected error for unknown task")
+	}
+}
+
 // TestManager 验证 Manager 的复用与删除行为。
 func TestManager(t *testing.T) {
 	m := NewManager()

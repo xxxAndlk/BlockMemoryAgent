@@ -52,13 +52,14 @@ func TestOrchestratorNodesToTreeNodes_Depth(t *testing.T) {
 	}
 }
 
-// TestOrchestratorStatusToRole 验证四种树状态映射到 RoleStatus。
+// TestOrchestratorStatusToRole 验证树状态映射到 RoleStatus（含 TODO #60 Unverified 标黄态）。
 func TestOrchestratorStatusToRole(t *testing.T) {
 	cases := map[orchestrator.Status]enums.RoleStatus{
-		orchestrator.StatusRunning:   enums.RoleStatusActive,
-		orchestrator.StatusDone:      enums.RoleStatusDone,
-		orchestrator.StatusFailed:    enums.RoleStatusError,
-		orchestrator.StatusCancelled: enums.RoleStatusDone, // 终态归 Done
+		orchestrator.StatusRunning:    enums.RoleStatusActive,
+		orchestrator.StatusDone:       enums.RoleStatusDone,
+		orchestrator.StatusFailed:     enums.RoleStatusError,
+		orchestrator.StatusCancelled:  enums.RoleStatusDone,       // 终态归 Done
+		orchestrator.StatusUnverified: enums.RoleStatusUnverified, // TODO #60 标黄不标红
 	}
 	for s, want := range cases {
 		if got := orchestratorStatusToRole(s); got != want {

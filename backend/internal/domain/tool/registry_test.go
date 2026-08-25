@@ -63,6 +63,33 @@ func TestIsVerificationCommand(t *testing.T) {
 	}
 }
 
+// TestVerificationEvidenceTemplate 验证 TODO #63 同源模板：模板文本含证据格式要求
+// （``` 代码块 + EXIT_CODE=0），且识别词表 verificationCommandPatterns 的每一项都
+// 原样出现在模板中（识别器认什么，prompt 就要求什么，防漂移）。
+func TestVerificationEvidenceTemplate(t *testing.T) {
+	tpl := VerificationEvidenceTemplate()
+	for _, want := range []string{"【验证证据格式】", "```", "EXIT_CODE=0"} {
+		if !strings.Contains(tpl, want) {
+			t.Fatalf("template missing %q: %q", want, tpl)
+		}
+	}
+	for _, p := range verificationCommandPatterns {
+		if !strings.Contains(tpl, p) {
+			t.Fatalf("template missing pattern %q: %q", p, tpl)
+		}
+	}
+	// 扩词覆盖实证缺口：npx tsc --noEmit / vite build / npm run build 必须命中识别口径。
+	for _, cmd := range []string{"npx tsc --noEmit", "vite build", "npm run build"} {
+		if !IsVerificationCommand(cmd) {
+			t.Fatalf("IsVerificationCommand(%q) 应为 true（TODO #63 扩词）", cmd)
+		}
+	}
+	// 防误匹配：vite 词表项带尾随空格，"invited"（vite 后接字母）不应命中。
+	if IsVerificationCommand("invited reviewers") {
+		t.Fatal("IsVerificationCommand(\"invited reviewers\") 应为 false")
+	}
+}
+
 // TestReadFile 验证 ReadFile 工具可以正确读取工作目录下的文件内容。
 func TestReadFile(t *testing.T) {
 	// 创建临时目录并在其中写入测试文件 hello.txt。
