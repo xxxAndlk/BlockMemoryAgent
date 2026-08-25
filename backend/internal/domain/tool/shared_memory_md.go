@@ -37,6 +37,8 @@ type MDFrontmatter struct {
 	Goal        string   `yaml:"goal,omitempty"`
 	Acceptance  []string `yaml:"acceptance,omitempty"`
 	Constraints []string `yaml:"constraints,omitempty"`
+	// VerifyLevels 验收层级（TODO #59）：existence/static/integration/runtime/visual 子集。
+	VerifyLevels []string `yaml:"verify_levels,omitempty"`
 	// Contract 跨域契约（TODO #57），仅 spec slot 填充；nil 等价于未填。
 	Contract *Contract `yaml:"contract,omitempty"`
 }
@@ -64,14 +66,15 @@ func encodeSharedMD(agentID, slot string, files map[string]int64, body string) s
 // 导出让 subagent 包测试可构造 spec MD fixture。
 func EncodeSpecMD(agentID string, spec Spec, files map[string]int64) string {
 	fm := MDFrontmatter{
-		AgentID:     agentID,
-		Slot:        SpecSlot,
-		Files:       files,
-		FileList:    spec.Files,
-		Goal:        spec.Goal,
-		Acceptance:  spec.Acceptance,
-		Constraints: spec.Constraints,
-		Contract:    spec.Contract,
+		AgentID:      agentID,
+		Slot:         SpecSlot,
+		Files:        files,
+		FileList:     spec.Files,
+		Goal:         spec.Goal,
+		Acceptance:   spec.Acceptance,
+		Constraints:  spec.Constraints,
+		VerifyLevels: spec.VerifyLevels,
+		Contract:     spec.Contract,
 	}
 	return encodeMD(fm, renderSpecBody(spec))
 }
@@ -119,13 +122,22 @@ func renderSpecBody(s Spec) string {
 		}
 		b.WriteByte('\n')
 	}
+	if len(s.VerifyLevels) > 0 {
+		b.WriteString("## 验收层级\n")
+		b.WriteString(strings.Join(s.VerifyLevels, " / "))
+		b.WriteString("\n\n")
+	}
 	if s.Contract != nil && !s.Contract.Empty() {
 		b.WriteString("## 跨域契约\n")
 		for _, sy := range s.Contract.Symbols {
+			stubNote := ""
+			if sy.Stub {
+				stubNote = fmt.Sprintf(" 【占位桩,责任方: %s,须实装】", strings.TrimSpace(sy.Owner))
+			}
 			if len(sy.Refs) > 0 {
-				fmt.Fprintf(&b, "- 符号 `%s` 声明于 `%s`，引用方: `%s`\n", sy.Symbol, sy.File, strings.Join(sy.Refs, "`、`"))
+				fmt.Fprintf(&b, "- 符号 `%s`%s 声明于 `%s`，引用方: `%s`\n", sy.Symbol, stubNote, sy.File, strings.Join(sy.Refs, "`、`"))
 			} else {
-				fmt.Fprintf(&b, "- 符号 `%s` 声明于 `%s`\n", sy.Symbol, sy.File)
+				fmt.Fprintf(&b, "- 符号 `%s`%s 声明于 `%s`\n", sy.Symbol, stubNote, sy.File)
 			}
 		}
 		for _, id := range s.Contract.DOMIDs {

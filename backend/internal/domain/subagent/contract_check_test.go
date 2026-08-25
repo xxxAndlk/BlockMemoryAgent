@@ -306,3 +306,56 @@ func TestDispatcher_ContractCheckOnAllChildrenDone(t *testing.T) {
 		}
 	})
 }
+
+// TestSymbolFound_CaseInsensitivePropertyPath 契约大写符号命中属性访问路径（TODO #62）：
+// `Assets` 应命中 `this.game.assets.getImage()`（实证 2026-08-24 塔防误报场景）。
+func TestSymbolFound_CaseInsensitivePropertyPath(t *testing.T) {
+	content := `const g = new Game();
+g.assets.getImage('plant-peashooter');`
+	if !symbolFound(content, "Assets") {
+		t.Fatal("Assets should match this.assets property access case-insensitively")
+	}
+	// 非末段大小写仍敏感：GameEngine 与 gameengine 是不同符号。
+	if symbolFound(content, "Assets.getImage") {
+		t.Fatal("composite with wrong mid-case should not match")
+	}
+	if !symbolFound(content, "g.assets.getImage") {
+		t.Fatal("composite with lowercase property should match")
+	}
+}
+
+// TestSignatureMatched_WhitespaceInsensitive 签名空白归一匹配（TODO #62）：
+// `attack (target, dmg)` 与 `attack(target, dmg)` 等价。
+func TestSignatureMatched_WhitespaceInsensitive(t *testing.T) {
+	if !signatureMatched("function attack(target, dmg) {}", "attack (target, dmg)") {
+		t.Fatal("whitespace-insensitive signature match should pass")
+	}
+	if signatureMatched("function attack() {}", "attack(target, dmg)") {
+		t.Fatal("different parameter lists should not match")
+	}
+}
+
+// TestStubOrphanDetected 占位桩责任挂名（TODO #61）：Stub 标记 + 声明文件仍含占位
+// 注释 → 孤儿桩违例；实装（占位注释移除）→ 通过。
+func TestStubOrphanDetected(t *testing.T) {
+	stubDecl := "// 占位：完整实现由其他领域负责\nclass Assets { static get() { return null; } }"
+	d, dir := newContractCheckEnv(t, fixtureHTML, fixtureEngine, stubDecl)
+	_ = dir
+	c := &tool.Contract{Symbols: []tool.ContractSymbol{
+		{Symbol: "Assets", File: "main.js", Stub: true, Owner: "美术资产领域"},
+	}}
+	rep := d.runContractChecks(c, nil)
+	if rep.pass() {
+		t.Fatalf("stub with placeholder markers should violate, got %+v", rep.entries)
+	}
+	if !strings.Contains(rep.violations[0].detail, "美术资产领域") {
+		t.Fatalf("stub violation should name owner, got %q", rep.violations[0].detail)
+	}
+
+	implemented := "class Assets { static getImage(n) { return imgCache[n]; } }"
+	d2, _ := newContractCheckEnv(t, fixtureHTML, fixtureEngine, implemented)
+	rep2 := d2.runContractChecks(c, nil)
+	if !rep2.pass() {
+		t.Fatalf("implemented stub (markers removed) should pass, got %+v", rep2.violations)
+	}
+}

@@ -38,6 +38,13 @@ type ContractSymbol struct {
 	File string `json:"file" yaml:"file"`
 	// Refs 引用该符号的文件路径列表。
 	Refs []string `json:"refs,omitempty" yaml:"refs,omitempty"`
+	// Stub 占位桩标记（TODO #61）：true 表示该符号当前是占位实现（骨架期建的桩），
+	// 必须由 Owner 领域实装。dispatcher 在兄弟域全完成时检查声明文件不再含占位标记，
+	// 仍含则判孤儿桩打回责任方。
+	Stub bool `json:"stub,omitempty" yaml:"stub,omitempty"`
+	// Owner 占位桩责任方（TODO #61）：负责实装该桩的领域名（与派发 domain 名对应）。
+	// Stub=true 时必填；进入 Owner 的验收清单（验收时须确认已实装）。
+	Owner string `json:"owner,omitempty" yaml:"owner,omitempty"`
 }
 
 // ContractDOMID DOM 集成点条目。

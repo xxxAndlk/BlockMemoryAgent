@@ -92,3 +92,43 @@ func TestRecentVerificationOutputs_OrderAndCap(t *testing.T) {
 		t.Fatalf("outputs should differ: %v", outs)
 	}
 }
+
+func TestHasScreenshotEvidence(t *testing.T) {
+	cases := []struct {
+		name    string
+		history []ReactMessage
+		want    bool
+	}{
+		{
+			name: "success screenshot counts",
+			history: []ReactMessage{
+				{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "browser_take_screenshot", Input: map[string]any{}}}},
+				{Role: "tool", ToolCallID: "c1", Content: `{"success":true,"output":"screenshot saved"}`},
+			},
+			want: true,
+		},
+		{
+			name: "failed screenshot does not count",
+			history: []ReactMessage{
+				{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "browser_take_screenshot", Input: map[string]any{}}}},
+				{Role: "tool", ToolCallID: "c1", Content: `{"success":false,"error":"browser not running"}`},
+			},
+			want: false,
+		},
+		{
+			name: "no screenshot call at all",
+			history: []ReactMessage{
+				{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "RunCommand", Input: map[string]any{"command": "node --check a.js"}}}},
+				{Role: "tool", ToolCallID: "c1", Content: `{"success":true}`},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HasScreenshotEvidence(tc.history); got != tc.want {
+				t.Fatalf("HasScreenshotEvidence = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

@@ -165,8 +165,9 @@ type Dispatcher struct {
 	// 同一后端承载两类槽位：自由槽位（WriteSharedMemory）与固定 spec 槽位（WriteSpec）。
 	sharedMem tool.SharedMemoryStore
 
-	// parentSpecs 缓存每个父 Agent 最新一份 spec 的结构化切片（TODO #56/#57）：
-	// 键为 parentID，值为 *parentSpecRecord（spec.files 绝对路径 + 跨域契约）。
+	// parentSpecs 缓存每个父 Agent 的 spec 结构化切片（TODO #56/#57/#65）：
+	// 键为 specRecKey{parentID, domain}，值为 *parentSpecRecord（files 绝对路径 +
+	// 跨域契约 + 验收层级）。domain 空=遗留单键 spec；非空=该领域专属 spec（多 key 化）。
 	// 派发时从 spec 槽位捕获（此时 spec 尚新鲜，随后子 Agent 写入会触发 Layer 2
 	// 失效删除 spec，完成收尾时无法再读到），供冒烟检查目标匹配与兄弟域全完成后的
 	// 契约检查使用。逐键覆盖、按 parentID 增长（与 pending map 同增长剖面，
@@ -374,15 +375,40 @@ func (d *Dispatcher) maybeRunContractChecks(parentID string) {
 	if d.mailbox == nil {
 		return
 	}
-	rec := d.parentSpecRecordOf(parentID)
-	if rec == nil || rec.contract == nil || rec.contract.Empty() {
+	recs := d.parentSpecRecordsOf(parentID)
+	hasContract := false
+	for _, rec := range recs {
+		if rec != nil && rec.contract != nil && !rec.contract.Empty() {
+			hasContract = true
+			break
+		}
+	}
+	if !hasContract {
 		return
 	}
 	// 新一波派发已开始（归零后又递增）时跳过本波检查，避免对着半成品误报。
 	if d.PendingChildren(parentID) != 0 {
 		return
 	}
-	rep := d.runContractChecks(rec.contract, rec.files)
+	var rep contractReport
+	checked := 0
+	for _, rec := range recs {
+		if rec == nil || rec.contract == nil || rec.contract.Empty() {
+			continue
+		}
+		// 变更屏障（TODO #62 时序串行化）：capture 后涉及文件已变（兄弟返工落地）时
+		// 跳过该份契约，避免对着旧状态误报——等下一波全完成再查。
+		if !recMtimesMatch(rec.filesMtime) {
+			continue
+		}
+		sub := d.runContractChecks(rec.contract, rec.files)
+		rep.entries = append(rep.entries, sub.entries...)
+		rep.violations = append(rep.violations, sub.violations...)
+		checked++
+	}
+	if checked == 0 {
+		return
+	}
 	body := contractReportText(rep)
 	if !rep.pass() {
 		body = failureMarker(FailureKindContractViolation, false) +
@@ -1265,12 +1291,13 @@ func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode, ve
 
 // checkSpecBeforeDispatch 做 WriteSpec 强制校验：SpecEnforcementEnabled 开启时，
 // 派发前必须先 WriteSpec（校验 parentID:spec 存在、新鲜、Spec.Goal 非空且至少一条 Acceptance）。
+// domain 非空时校验该领域专属 spec（TODO #65 多 key 化），缺失回退遗留单键。
 // 返回空串表示通过，否则为错误文案。批量派发（call_sub_agents）只校验一次。
-func (d *Dispatcher) checkSpecBeforeDispatch(ctx context.Context, parentID string) string {
+func (d *Dispatcher) checkSpecBeforeDispatch(ctx context.Context, parentID, domain string) string {
 	if !d.specEnforcementEnabled {
 		return ""
 	}
-	if ok, reason := d.hasFreshSpec(ctx, parentID); !ok {
+	if ok, reason := d.hasFreshSpec(ctx, parentID, domain); !ok {
 		return reason + " 先调 WriteSpec(goal, acceptance, constraints, files) 写任务规范，再派发"
 	}
 	return ""
@@ -1312,7 +1339,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	if parentID == "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: "missing parent agent context"}
 	}
-	if msg := d.checkSpecBeforeDispatch(ctx, parentID); msg != "" {
+	if msg := d.checkSpecBeforeDispatch(ctx, parentID, domain); msg != "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
@@ -1727,8 +1754,22 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 	if parentID == "" {
 		return &tool.Result{Tool: "call_sub_agents", Error: "missing parent agent context"}
 	}
-	if msg := d.checkSpecBeforeDispatch(ctx, parentID); msg != "" {
-		return &tool.Result{Tool: "call_sub_agents", Error: msg, Category: tool.ResultCategoryValidationRejected}
+	// 批量派发（call_sub_agents）：多 domain 各自有专属 spec 时逐项校验（每个 domain
+	// 的 spec 必须新鲜，TODO #65）；无 domain 项时校验遗留单键一次。
+	anyDomain := false
+	for _, it := range items {
+		if it.roleID != "domain" || strings.TrimSpace(it.domain) == "" {
+			continue
+		}
+		anyDomain = true
+		if msg := d.checkSpecBeforeDispatch(ctx, parentID, it.domain); msg != "" {
+			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("domain %q: %s", it.domain, msg), Category: tool.ResultCategoryValidationRejected}
+		}
+	}
+	if !anyDomain {
+		if msg := d.checkSpecBeforeDispatch(ctx, parentID, ""); msg != "" {
+			return &tool.Result{Tool: "call_sub_agents", Error: msg, Category: tool.ResultCategoryValidationRejected}
+		}
 	}
 
 	var okIDs, errs []string
@@ -1851,7 +1892,8 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		// 结构化失败（TODO #23）：头部机读标记 [failure kind=X retryable=Y]，人读文案在后。
 		kind := failureKindOf(err)
 		retryable := kind == FailureKindError && roleDef.ID != "domain" && roleDef.ID != "meta" && ctx.Err() == nil
-		msg := failureMarker(kind, retryable) + "\n" + formatSubAgentFailure(err, result, d.effectiveTimeout(subAgentID), partial)
+		failText := formatSubAgentFailure(err, result, d.effectiveTimeout(subAgentID), partial)
+		msg := failureMarker(kind, retryable) + "\n" + failText
 		// 校验分层（TODO #43）两类"未验证/缺证据"：附产出全文供父 Agent 自决
 		// （重派/降级/收口）——非"失败"语义，产出可能可用，不能只给 500 字截断。
 		if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
@@ -1863,8 +1905,17 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		} else if salvage != "" {
 			msg += "\n\n" + salvagePrefixMarker + salvage
 		}
-		d.boardUpdate(ctx, parentID, domain, false, truncateRunes(msg, 300))
-		d.treeFinish(ctx, subAgentID, partial, err)
+		// 状态语义三态化（TODO #60）：缺验证证据（verify_missing/unverified）不是失败——
+		// 树落 delivered-unverified、看板标黄不标红，让父 Agent 看到"产出已交付但没证据"
+		// 而非满屏错误；真失败（冒烟不过/超时/守卫）仍标红。
+		boardSt := board.TaskFailed
+		treeStatus := orchestrator.StatusFailed
+		if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
+			boardSt = board.TaskUnverified
+			treeStatus = orchestrator.StatusUnverified
+		}
+		d.boardUpdate(ctx, parentID, domain, boardSt, truncateRunes(msg, 300))
+		d.treeFinishStatus(ctx, subAgentID, partial, treeStatus, failText)
 		d.notify(parentID, subAgentID, msg, files)
 		return false
 	}
@@ -1874,7 +1925,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	// 整品验收 Agent 2026-08-24 切出默认流程：isVerificationTask +【集成验证任务模式】保留为口子。
 	// A/B 实证自动验证闭环是负资产（开 5/16 vs 关 16/16），机制移至扩展设计文档 §12 作后期扩展。
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
-	d.boardUpdate(ctx, parentID, domain, true, result.Text)
+	d.boardUpdate(ctx, parentID, domain, board.TaskDone, result.Text)
 	d.treeFinish(ctx, subAgentID, result.Text, nil)
 	// 校验分层（TODO #43）状态标注：VerifyNote 非空=校验通过（L0 证据/L2 rubric），
 	// 完成摘要前缀一行，父 Agent 可见校验依据；空=未启用校验（none），零变化。
@@ -1915,6 +1966,16 @@ func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, sub
 // treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
 // 幂等：orchestrator.Tree.Finish 对已 terminal 节点 no-op。
 func (d *Dispatcher) treeFinish(ctx context.Context, subAgentID, summary string, err error) {
+	if err != nil {
+		d.treeFinishStatus(ctx, subAgentID, summary, orchestrator.StatusFailed, err.Error())
+		return
+	}
+	d.treeFinishStatus(ctx, subAgentID, summary, orchestrator.StatusDone, "")
+}
+
+// treeFinishStatus 按指定终态写树（TODO #60 三态化）：StatusUnverified 走
+// Tree.FinishUnverified（非失败语义、看板标黄），其余与 treeFinish 同语义。
+func (d *Dispatcher) treeFinishStatus(ctx context.Context, subAgentID, summary string, status orchestrator.Status, errText string) {
 	if d.treeFn == nil {
 		return
 	}
@@ -1923,7 +1984,16 @@ func (d *Dispatcher) treeFinish(ctx context.Context, subAgentID, summary string,
 		return
 	}
 	if t := d.treeFn(sid); t != nil {
-		t.Finish(subAgentID, summary, err)
+		switch status {
+		case orchestrator.StatusUnverified:
+			t.FinishUnverified(subAgentID, summary, errText)
+		default:
+			if errText != "" {
+				t.Finish(subAgentID, summary, errors.New(errText))
+			} else {
+				t.Finish(subAgentID, summary, nil)
+			}
+		}
 	}
 }
 
@@ -2058,11 +2128,11 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	origTask := task
 	// 捕获父 spec 结构化切片（TODO #56/#57）：派发时 spec 尚新鲜，完成后 Layer 2
 	// 失效删除 spec 就再也读不到——冒烟检查目标与契约检查依赖此刻的捕获。
-	d.recordParentSpec(ctx, parentID)
+	d.recordParentSpec(ctx, parentID, domain)
 	// 上下文前缀注入：共享记忆（spec + 自由槽位）+ 块记忆召回。两段独立前缀统一拼装，避免嵌套
 	// 【当前任务】标记（实证：嵌套后 UI 助手把 KV 内容当作任务主体，空转 16 分钟）。
 	var prefixes []string
-	if sp := d.buildSharedPrefix(ctx, parentID); sp != "" {
+	if sp := d.buildSharedPrefix(ctx, parentID, domain); sp != "" {
 		prefixes = append(prefixes, sp)
 	}
 	if bm, recs := d.injectScopedRecall(ctx, parentID, domain, origTask, ""); bm != "" {
@@ -2097,6 +2167,12 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	}
 
 	vk := resolveVerifyKind(verifyKind, roleDef.ID, mode)
+	// 验证证据格式模板（TODO #63）：L0 可执行校验角色在任务尾部注入证据格式要求，
+	// 与识别器口径同源（verificationCommandPatterns）——从源头消灭"回传了验证输出
+	// 但格式不认"的 verify_missing（实证 2026-08-24 塔防 7 连发）。
+	if vk == verifyKindExecutable {
+		task += "\n\n" + tool.VerificationEvidenceTemplate()
+	}
 	result, err := d.runEngine(ctx, sub, subAgentID, roleDef.ID, mode, vk, task)
 	if err != nil {
 		return sub, result, fmt.Errorf("run: %w", err)
@@ -2113,7 +2189,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	if vk == verifyKindExecutable {
 		if !agent.HasExecutableVerification(result.History) {
 			log.Printf("[subagent] verify L0 missing evidence: sub=%s role=%s (retry 1 round)", subAgentID, roleDef.ID)
-			result, err = sub.RunWithHistory(ctx, l0RetryMessage, result.History)
+			result, err = sub.RunWithHistory(ctx, l0RetryMessage(), result.History)
 			if err != nil {
 				return sub, result, fmt.Errorf("run: %w", err)
 			}
@@ -2159,7 +2235,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// 自动派生并执行语法检查（node --check 等），结果以【机器校验】段入完成摘要。
 	// 失败走 verify_kind 反馈重试通道：反馈 1 轮自修，仍失败按 errSmokeFailed 打回父
 	// （复用 #43 校验分层路由，不新建通路）。
-	if targets := d.smokeTargetsFor(parentID, result.History); len(targets) > 0 {
+	if targets := d.smokeTargetsFor(parentID, domain, result.History); len(targets) > 0 {
 		results := runSmokeChecks(ctx, d.subAgentWorkDir(), targets, d.smokeRunner, d.smokeLookPath)
 		if failed := smokeFailed(results); len(failed) > 0 {
 			log.Printf("[subagent] smoke check failed: sub=%s role=%s failed=%d (retry 1 round)", subAgentID, roleDef.ID, len(failed))
@@ -2178,6 +2254,52 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		}
 		if smokeRunCount(results) > 0 {
 			result.MachineCheck = renderSmokeReport(results)
+		}
+	}
+
+	// 验收分层（TODO #59）：spec verify_levels 驱动集成层探针 + 视觉层证据强制。
+	// 存在性/静态层已由上方冒烟检查覆盖；此处补 integration（入口引用图）与 visual（截图）。
+	// 失败均走反馈重试 1 轮：integration 违例=真缺陷打回（复用 errSmokeFailed 路由），
+	// visual 缺证据=产出可能可用但未验证（errVisualEvidenceMissing → delivered-unverified 黄态）。
+	if rec := d.parentSpecRecordOf(parentID, domain); rec != nil && len(rec.verifyLevels) > 0 {
+		levels := make(map[string]bool, len(rec.verifyLevels))
+		for _, l := range rec.verifyLevels {
+			levels[l] = true
+		}
+		if levels["integration"] {
+			irep := runIntegrationChecks(d.subAgentWorkDir(), rec.files)
+			if failed := integrationFailed(irep); len(failed) > 0 {
+				log.Printf("[subagent] integration check failed: sub=%s role=%s failed=%d (retry 1 round)", subAgentID, roleDef.ID, len(failed))
+				result, err = sub.RunWithHistory(ctx, integrationFixMessage(failed), result.History)
+				if err != nil {
+					return sub, result, fmt.Errorf("run: %w", err)
+				}
+				if result.LimitReached {
+					return sub, result, errSmokeFailed
+				}
+				irep = runIntegrationChecks(d.subAgentWorkDir(), rec.files)
+				if failed := integrationFailed(irep); len(failed) > 0 {
+					log.Printf("[subagent] integration check still failed: sub=%s role=%s failed=%d", subAgentID, roleDef.ID, len(failed))
+					return sub, result, fmt.Errorf("%w:\n%s", errSmokeFailed, integrationFixMessage(failed))
+				}
+			}
+			if section := renderIntegrationReport(irep); section != "" {
+				result.MachineCheck = strings.TrimRight(result.MachineCheck, "\n") + "\n\n" + section
+			}
+		}
+		if levels["visual"] && !agent.HasScreenshotEvidence(result.History) {
+			log.Printf("[subagent] verify visual missing: sub=%s role=%s (retry 1 round)", subAgentID, roleDef.ID)
+			result, err = sub.RunWithHistory(ctx, visualRetryMessage, result.History)
+			if err != nil {
+				return sub, result, fmt.Errorf("run: %w", err)
+			}
+			if result.LimitReached {
+				return sub, result, errVisualEvidenceMissing
+			}
+			if !agent.HasScreenshotEvidence(result.History) {
+				log.Printf("[subagent] verify visual still missing: sub=%s role=%s", subAgentID, roleDef.ID)
+				return sub, result, errVisualEvidenceMissing
+			}
 		}
 	}
 
@@ -2313,7 +2435,12 @@ func resolveVerifyKind(verifyKind, roleID, mode string) string {
 }
 
 // l0RetryMessage 是 L0 校验缺验证证据时的 1 轮反馈重试指令。
-const l0RetryMessage = "【验证要求】终答前必须运行验证命令（测试/lint/build 检查，如 node test.js、go test ./...、npm run lint），并依据结果修正问题。请运行验证命令后重新产出最终答复。"
+// 证据格式要求与识别器口径同源（TODO #63）：tool.VerificationEvidenceTemplate
+// 由 verificationCommandPatterns 生成，识别器认什么 prompt 就要求什么。
+func l0RetryMessage() string {
+	return "【验证要求】终答前必须运行验证命令并依据结果修正问题（识别口径见下）：\n" +
+		tool.VerificationEvidenceTemplate() + "\n请运行验证命令后重新产出最终答复。"
+}
 
 // engineLLM 构造引擎辅助 LLM（自检/规划）：从模型工厂取同角色 provider 适配为文本补全。
 // 取 provider 失败时返回的 LLMComplete 每次调用报错，引擎 fail-open 降级为纯 ReAct。
@@ -2613,6 +2740,10 @@ func failureKindOf(err error) FailureKind {
 		return FailureKindUnverified
 	case errors.Is(err, errVerifyMissing):
 		return FailureKindVerifyMissing
+	case errors.Is(err, errVisualEvidenceMissing):
+		// 视觉层缺证据（TODO #59）：语义同 verify_missing——产出可用但缺截图回显，
+		// 非失败；统一走 FailureKindVerifyMissing 的三态化（delivered-unverified 黄态）。
+		return FailureKindVerifyMissing
 	case errors.Is(err, errSmokeFailed):
 		return FailureKindSmokeFailed
 	default:
@@ -2646,6 +2777,18 @@ var errUnverified = errors.New("sub-agent result unverified: judge LLM unavailab
 // 重试 1 轮后仍缺）。runSubAgent 见此信号按 FailureKindVerifyMissing notify 父。
 var errVerifyMissing = errors.New("sub-agent missing executable verification evidence")
 
+// errVisualEvidenceMissing 标记视觉层缺截图回显证据（TODO #59 验收分层 visual 层）：
+// spec verify_levels 含 visual 的任务（UI/游戏/绘制类），重试 1 轮后仍无成功的
+// browser_take_screenshot 证据。语义同 verify_missing（产出可用但未验证），
+// failureKindOf 归并到 FailureKindVerifyMissing → delivered-unverified 黄态。
+var errVisualEvidenceMissing = errors.New("sub-agent missing visual (screenshot) evidence")
+
+// visualRetryMessage 是视觉层缺截图证据时的 1 轮反馈重试指令（TODO #59）。
+const visualRetryMessage = "【视觉证据要求】本任务验收层级含 visual（UI/游戏/绘制类）：终答前必须" +
+	"经 tool_catalog 挂载 ui_preview，browser_navigate 打开页面后 browser_take_screenshot " +
+	"截图回显实际渲染效果（file:///workspace/<相对工作目录> 路径），截图成功即视觉证据。" +
+	"截图必须展示真实渲染结果（贴图/动画/布局可见），仅空页面不算。请补充截图证据后重新产出最终答复。"
+
 // errSmokeFailed 标记域完成机器校验冒烟失败（TODO #56）：dispatcher 自动执行的
 // 语法检查未通过（反馈重试 1 轮后仍失败），错误文本携带失败明细。
 // runSubAgent 见此信号按 FailureKindSmokeFailed notify 父（打回责任域）。
@@ -2667,6 +2810,9 @@ func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Dur
 	}
 	if errors.Is(err, errVerifyMissing) {
 		return "子 Agent 未提供可执行验证证据（没有成功运行的测试/lint/--check 命令）。"
+	}
+	if errors.Is(err, errVisualEvidenceMissing) {
+		return "子 Agent 未提供视觉验证证据（UI/游戏/绘制类任务要求 browser_take_screenshot 截图回显，没有成功截图记录）。"
 	}
 	if errors.Is(err, errSmokeFailed) {
 		// 错误文本携带冒烟失败明细（命令 + 退出码 + 输出尾部），剥掉哨兵前缀直陈证据。
@@ -2769,38 +2915,71 @@ const sharedPrefixDisciplineNote = "【读取纪律】以上注入的任务规�
 	"其中已给出的代码、签名与行号无需再用 ReadFile 核对或重读；" +
 	"ReadFile 仅限当前任务指派给你的行号范围，不读兄弟任务的代码区段。"
 
-// specSlotName 是 WriteSpec 写入的固定 slot 名，与 tool.SpecSlot 保持一致。
+// specSlotName 是 WriteSpec 写入的默认 slot 名，与 tool.SpecSlot 保持一致。
 const specSlotName = "spec"
+
+// specKeyFor 计算 spec 存储键（TODO #65 多 key 化）：domain 非空 →
+// "<parentID>:spec:<domain>"（兄弟各持各的，staleness 按各自 files 交集隔离）；
+// domain 空 → 遗留单键 "<parentID>:spec"（全兄弟共享一份）。
+func specKeyFor(parentID, domain string) string {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return parentID + ":" + specSlotName
+	}
+	return parentID + ":" + specSlotName + ":" + domain
+}
+
+// specRecKey 是 parentSpecs 缓存键：同一 parent 下按 domain 区分 spec。
+type specRecKey struct {
+	parentID string
+	domain   string
+}
 
 // specMirror 是 tool.Spec 的本地镜像，避免 subagent 反向 import tool 包。
 // 字段名与 JSON tag 必须与 tool.Spec 保持一致。
 type specMirror struct {
-	Goal        string         `json:"goal"`
-	Acceptance  []string       `json:"acceptance,omitempty"`
-	Constraints []string       `json:"constraints,omitempty"`
-	Files       []string       `json:"files,omitempty"`
-	Contract    *tool.Contract `json:"contract,omitempty"`
+	Goal         string         `json:"goal"`
+	Acceptance   []string       `json:"acceptance,omitempty"`
+	Constraints  []string       `json:"constraints,omitempty"`
+	Files        []string       `json:"files,omitempty"`
+	VerifyLevels []string       `json:"verify_levels,omitempty"`
+	Contract     *tool.Contract `json:"contract,omitempty"`
 }
 
-// parentSpecRecord 是父 Agent spec 的结构化缓存（TODO #56/#57）：
-// files 为 spec.files 的绝对路径，contract 为跨域契约（可 nil）。
+// parentSpecRecord 是父 Agent spec 的结构化缓存（TODO #56/#57/#59）：
+// files 为 spec.files 的绝对路径，contract 为跨域契约（可 nil），
+// verifyLevels 为验收层级（可空，驱动集成/视觉层机器校验）。
+// filesMtime 为捕获时刻的 frontmatter files mtime 快照：契约检查前比对，
+// 涉及文件已变更（兄弟返工落地）则跳过该份契约（TODO #62 时序串行化变更屏障）。
 // 派发时捕获（spec 尚新鲜），完成收尾/兄弟域全完成时消费（spec 可能已被 Layer 2 失效删除）。
 type parentSpecRecord struct {
-	files    []string
-	contract *tool.Contract
+	files        []string
+	contract     *tool.Contract
+	verifyLevels []string
+	filesMtime   map[string]int64
 }
 
 // recordParentSpec 捕获 parentID 的 spec 结构化切片进 parentSpecs 缓存。
+// domain 非空时读 "<parentID>:spec:<domain>"（多 key 化）；该键缺失时回退遗留
+// 单键 "<parentID>:spec"（老流程兼容，兄弟共享一份）。
 // spec 缺失/损坏/缺 goal+acceptance 时跳过；捕获失败不阻塞派发主流程
 // （冒烟检查与契约检查均为增强证据，缺了就降级跳过）。
-func (d *Dispatcher) recordParentSpec(ctx context.Context, parentID string) {
+func (d *Dispatcher) recordParentSpec(ctx context.Context, parentID, domain string) {
 	if d.sharedMem == nil {
 		return
 	}
-	key := parentID + ":" + specSlotName
+	key := specKeyFor(parentID, domain)
 	val, err := d.sharedMem.Get(ctx, key)
 	if err != nil || strings.TrimSpace(val) == "" {
-		return
+		if domain == "" {
+			return
+		}
+		// 领域专属 spec 缺失 → 回退遗留单键（老流程：单 spec 全兄弟共享）。
+		legacyKey := parentID + ":" + specSlotName
+		val, err = d.sharedMem.Get(ctx, legacyKey)
+		if err != nil || strings.TrimSpace(val) == "" {
+			return
+		}
 	}
 	fm, _, ok := tool.DecodeSharedMD(val)
 	if !ok {
@@ -2826,24 +3005,45 @@ func (d *Dispatcher) recordParentSpec(ctx context.Context, parentID string) {
 			files = append(files, filepath.Clean(fp))
 		}
 	}
-	d.parentSpecs.Store(parentID, &parentSpecRecord{files: files, contract: fm.Contract})
+	d.parentSpecs.Store(specRecKey{parentID: parentID, domain: strings.TrimSpace(domain)}, &parentSpecRecord{
+		files:        files,
+		contract:     fm.Contract,
+		verifyLevels: fm.VerifyLevels,
+		filesMtime:   fm.Files,
+	})
 }
 
-// parentSpecRecordOf 读取 parentID 的 spec 缓存；无缓存返回 nil。
-func (d *Dispatcher) parentSpecRecordOf(parentID string) *parentSpecRecord {
-	v, ok := d.parentSpecs.Load(parentID)
+// parentSpecRecordOf 读取 parentID 指定 domain 的 spec 缓存；无缓存返回 nil。
+// domain 空读遗留单键记录。
+func (d *Dispatcher) parentSpecRecordOf(parentID, domain string) *parentSpecRecord {
+	v, ok := d.parentSpecs.Load(specRecKey{parentID: parentID, domain: strings.TrimSpace(domain)})
 	if !ok {
 		return nil
 	}
 	return v.(*parentSpecRecord)
 }
 
+// parentSpecRecordsOf 返回 parentID 下全部 spec 记录（遗留单键 + 各领域专属键）。
+// 供兄弟域全完成后的契约检查遍历（多 key 化后契约可能分散在各领域 spec 中）。
+func (d *Dispatcher) parentSpecRecordsOf(parentID string) []*parentSpecRecord {
+	var out []*parentSpecRecord
+	d.parentSpecs.Range(func(k, v any) bool {
+		if rec, ok := v.(*parentSpecRecord); ok {
+			if key, ok := k.(specRecKey); ok && key.parentID == parentID {
+				out = append(out, rec)
+			}
+		}
+		return true
+	})
+	return out
+}
+
 // smokeTargetsFor 计算冒烟检查目标（TODO #56）：spec.files ∩ 本子 Agent 实际写入文件。
 // 交集为空（无 spec 缓存 / 子 Agent 未写文件 / 写入文件不在 spec 范围）返回 nil，
 // 跳过冒烟检查。收敛到交集是为责任归属精确：并行兄弟域中途写入共享文件时，
-// 先完成的一方不会被兄弟的半成品误打回。
-func (d *Dispatcher) smokeTargetsFor(parentID string, history []agent.ReactMessage) []string {
-	rec := d.parentSpecRecordOf(parentID)
+// 先完成的一方不会被兄弟的半成品误打回。domain 定位本子 Agent 专属 spec（#65）。
+func (d *Dispatcher) smokeTargetsFor(parentID, domain string, history []agent.ReactMessage) []string {
+	rec := d.parentSpecRecordOf(parentID, domain)
 	if rec == nil {
 		return nil
 	}
@@ -2854,13 +3054,15 @@ func (d *Dispatcher) smokeTargetsFor(parentID string, history []agent.ReactMessa
 // 缺失/stale/解析失败时返回空串（graceful degrade，不阻塞派发主流程）。
 //
 // 槽位两类：
-//   - spec 槽位（"<parentID>:spec"）：WriteSpec 写入，MD frontmatter 含 goal/acceptance/constraints/files。
-//     渲染为【任务规范】段，files mtime 校验失败视为 stale 跳过。
-//   - 自由槽位（"<parentID>:<key>"，key != spec）：WriteSharedMemory 写入，MD body 为 content。
-//     渲染为【共享记忆】段，files mtime 校验失败跳过。
+//   - spec 槽位："<parentID>:spec"（WriteSpec 默认键，全兄弟共享）与
+//     "<parentID>:spec:<domain>"（TODO #65 多 key 化，领域专属）。domain 非空时优先
+//     注入本领域专属 spec；遗留单键对所有子 Agent 注入。MD frontmatter 含
+//     goal/acceptance/constraints/files，渲染为【任务规范】段，files mtime 校验失败视为 stale 跳过。
+//   - 自由槽位（"<parentID>:<key>"，key 不以 "spec" 开头）：WriteSharedMemory 写入，
+//     MD body 为 content，渲染为【共享记忆】段，files mtime 校验失败跳过。
 //
 // 返回纯前缀（不含【当前任务】标记），供 runSubAgentOnce 统一拼装多段前缀避免嵌套。
-func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID string) string {
+func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain string) string {
 	if d.sharedMem == nil {
 		return ""
 	}
@@ -2884,6 +3086,12 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID string) str
 		if strings.HasPrefix(slotName, salvageSlotPrefix) {
 			continue
 		}
+		// 领域专属 spec（#65）：只注入本 domain 的，兄弟的 spec 不注入（各持各的）。
+		if strings.HasPrefix(slotName, specSlotName+":") {
+			if strings.TrimPrefix(slotName, specSlotName+":") != strings.TrimSpace(domain) {
+				continue
+			}
+		}
 		slotNames = append(slotNames, slotName)
 
 		fm, body, ok := tool.DecodeSharedMD(val)
@@ -2899,7 +3107,7 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID string) str
 		if !verifyFileMtimes(fm.Files) {
 			continue
 		}
-		if slotName == specSlotName {
+		if slotName == specSlotName || strings.HasPrefix(slotName, specSlotName+":") {
 			// spec 槽位需 goal + 至少一条 acceptance 才视为合法规范。
 			if strings.TrimSpace(fm.Goal) == "" || len(fm.Acceptance) == 0 {
 				continue
@@ -2909,10 +3117,11 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID string) str
 				files = append(files, fp)
 			}
 			specPart = []string{renderSpecPrefix(specMirror{
-				Goal:        fm.Goal,
-				Acceptance:  fm.Acceptance,
-				Constraints: fm.Constraints,
-				Files:       files,
+				Goal:         fm.Goal,
+				Acceptance:   fm.Acceptance,
+				Constraints:  fm.Constraints,
+				Files:        files,
+				VerifyLevels: fm.VerifyLevels,
 			})}
 			continue
 		}
@@ -2953,15 +3162,31 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID string) str
 	return strings.TrimRight(strings.Join(parts, "\n\n"), "\n")
 }
 
-// hasFreshSpec 校验 parentID:spec 是否存在且新鲜（Spec.Goal 非空 + 至少一条 Acceptance + files mtime 一致）。
-// 供 callSubAgentTool.Execute 在 SpecEnforcementEnabled 开启时调用，缺失则拒绝派发。
+// hasFreshSpec 校验 parentID 的 spec 是否存在且新鲜（Spec.Goal 非空 + 至少一条
+// Acceptance + files mtime 一致）。供 callSubAgentTool.Execute 在 SpecEnforcementEnabled
+// 开启时调用，缺失则拒绝派发。domain 非空时校验该领域专属 spec（TODO #65 多 key 化），
+// 缺失则回退遗留单键；domain 空只校验单键。
 // 返回 (通过, 失败原因文案)：失败时区分 missing（未写）/ invalid（内容不合法）/ stale（文件已变更），
 // stale 精确列出失配文件路径，让 LLM 定向修正（重写被改文件或剔除无关文件）而非盲猜重写整个 spec。
-func (d *Dispatcher) hasFreshSpec(ctx context.Context, parentID string) (bool, string) {
+func (d *Dispatcher) hasFreshSpec(ctx context.Context, parentID, domain string) (bool, string) {
 	if d.sharedMem == nil {
 		return false, "spec missing: 共享记忆未启用"
 	}
-	key := parentID + ":" + specSlotName
+	ok, reason := d.checkSpecKey(ctx, specKeyFor(parentID, domain))
+	if ok || strings.TrimSpace(domain) == "" {
+		return ok, reason
+	}
+	// 领域专属 spec 缺失 → 回退遗留单键（老流程兼容）；仅当单键存在且新鲜才放行。
+	if strings.Contains(reason, "missing") {
+		if legacyOK, _ := d.checkSpecKey(ctx, parentID+":"+specSlotName); legacyOK {
+			return true, ""
+		}
+	}
+	return ok, reason
+}
+
+// checkSpecKey 校验单个 spec 键的新鲜度与内容合法性（hasFreshSpec 内部）。
+func (d *Dispatcher) checkSpecKey(ctx context.Context, key string) (bool, string) {
 	val, err := d.sharedMem.Get(ctx, key)
 	if err != nil || strings.TrimSpace(val) == "" {
 		return false, "spec missing: 未找到 WriteSpec 写入的任务规范"
@@ -3009,6 +3234,11 @@ func renderSpecPrefix(s specMirror) string {
 			b.WriteString(strings.TrimSpace(f))
 			b.WriteByte('\n')
 		}
+	}
+	if len(s.VerifyLevels) > 0 {
+		b.WriteString("验收层级: ")
+		b.WriteString(strings.Join(s.VerifyLevels, "/"))
+		b.WriteByte('\n')
 	}
 	// 范围锚定：规范是父 Agent 的全局目标（常含多领域拆分与其他 Agent 职责），
 	// 你的执行范围以 task 正文为准。其他 Agent 的进度与你无关——不要等待、不要汇报、
@@ -3345,6 +3575,13 @@ func staleFilePaths(files map[string]int64) []string {
 // 任一 path stat 失败或 mtime 不匹配返回 false（视为 stale）。
 // 空 Files 视为通过（无 path 需校验，可能是旧 entry 或纯结论摘要）。
 func verifyFileMtimes(files map[string]int64) bool {
+	return len(staleFilePaths(files)) == 0
+}
+
+// recMtimesMatch 变更屏障（TODO #62 时序串行化）：契约检查前比对 capture 时刻的
+// files mtime 快照与当前磁盘状态，全部一致返回 true。任何文件被兄弟返工落地改写
+// 即 false（跳过该份契约检查，避免对着旧状态误报）。空快照视为一致。
+func recMtimesMatch(files map[string]int64) bool {
 	return len(staleFilePaths(files)) == 0
 }
 

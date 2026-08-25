@@ -88,13 +88,28 @@ meta_agent:
       signatures=跨域函数签名；无该类集成点则省略该类）。dispatcher 在全部兄弟域完成后
       自动静态核对契约并回传【机器校验】结果，违例按文件归属打回责任域——
       contract 与 WriteSharedMemory 契约是同一协议两种载体：前者机器校验、后者注入人读。
+    - spec 填 verify_levels 验收层级（existence/static/integration/runtime/visual 子集）：
+      UI/游戏/绘制类任务必须含 visual（dispatcher 强制截图回显证据，缺则判"未验证"黄态）；
+      多文件集成任务含 integration（dispatcher 跑入口引用图探针，抓"空壳产物"）。
+      存在性/静态由冒烟检查自动覆盖，无需显式填。任务类型与强制层级绑定见【交付验收】。
+    - 占位桩纪律：contract 的 symbols 若含骨架期占位实现（桩），必须 Stub=true 且指定
+      Owner=负责实装的领域名（与派发 domain 名一致），该桩自动进入 Owner 的验收清单；
+      dispatcher 在兄弟域全完成时检查桩是否实装（声明文件仍含占位注释即孤儿桩打回）。
+      禁止"桩留着等别人装"——每个桩必须挂名唯一责任方，否则终答时整品视为未完成。
+    - 验收标准出现"降级/兜底/fallback"字样时，dispatcher 自动追加 happy-path 主路径
+      可用性验收项：兜底只作异常保护，不得成为唯一实现路径（实证 23 张 AI 贴图全走
+      手绘兜底的验收盲区）。你在 spec 中细化具体主路径断言（如资源加载断言）。
 
     【交付验收（机器校验 + meta 纸面对照）】
     所有领域 Agent 回传后，你对”整品是否完成”直接负责。你只做汇总对照，不派验证类任务；
     验收只信两类证据，其余一律不计分：
     A. 【机器校验】段（dispatcher 自动执行，标注”非 agent 自述”）：建设域回传摘要尾部的
        冒烟校验结果（node --check 等语法检查）；兄弟域全完成后的跨域契约校验邮件
-       （符号/DOM id/script 顺序/签名核对，通过或违例清单都在其中）。
+       （符号/DOM id/script 顺序/签名核对，通过或违例清单都在其中）；spec verify_levels
+       含 integration/visual 时对应的入口引用图探针与截图证据（缺截图=该域标"未验证"黄态，
+       非失败）。验收分层按任务类型绑定：存在性+静态=全部任务默认；integration=多文件
+       集成任务；visual=UI/游戏/绘制类任务（强制）；runtime=验收标准自带可执行断言的
+       任务（agent 自执行）。多领域任务默认收尾 = 以上机器校验全过，不依赖用户质疑后补派。
     B. spec 验收标准纸面对照：各域回灌摘要与 WriteSpec 的 acceptance 逐条对照。
     子 Agent 自述”已测试通过/已 node --check”不是证据，不计分。
     1. 对照发现缺项/互相矛盾即判未通过 -> 未通过项一次性批量派回责任领域返工
@@ -103,6 +118,8 @@ meta_agent:
        仍未收敛，立即按当前状态交付并声明未通过项。
     2. 兜底口径：spec 有可执行验收标准、但回传摘要缺【机器校验】段 -> 判”未验证”，
        打回责任域补跑（dispatcher 在其完成收尾自动生成该段），不派验证域代劳。
+       域标"未验证/Unverified"（黄态）= 产出已交付但缺证据，不是失败——补证据或
+       由你纸面裁定收口均可，但终答须显式声明哪些域未验证及理由。
     3. 重度验证例外通道：仅当任务形态必须有运行时验证（UI 视觉类截图回显、联调类真跑
        页面）时，你在派发时显式声明理由，经 call_sub_agent 派”验证/联调/修复”类 domain
        任务（走 domain【集成验证任务模式】）——这是唯一允许的验证类派发，默认不走。
@@ -192,6 +209,10 @@ domain_agent:
     - 你的自述验证结果只作建设期自查：meta 交付验收以 dispatcher 自动执行的
       【机器校验】段为准（你完成收尾后 dispatcher 会对产出文件自动跑语法检查，
       该段自动生成、无需你转发；自述"已 node --check 全绿"不计分）。
+      spec verify_levels 含 visual 时，dispatcher 还会强制截图回显证据（browser_take_screenshot
+      成功记录，缺则标"未验证"）；含 integration 时跑入口引用图探针（script src/import 断链
+      即打回）。spec 验收含【自动追加·happy-path】项时：主路径必须真实生效并提供运行证据，
+      兜底不得成为唯一实现路径。
     - 验收发现问题：一次 WriteFile/EditFile 自修全部问题 + 一条复查命令；
       确有必要才派返工叶子（带失败证据）。修复/返工合计最多 2 轮，验证阶段
       LLM 总轮次上限 5 轮，到限按当前状态上报并在结论中显式声明未通过项。
@@ -274,11 +295,12 @@ embed:
 # 两层编排下的可选下拆层：叶子执行者拥有 ReadFile/WriteFile/RunCommand 等执行类工具，
 # 但不再拥有 call_sub_agent（不能派发子任务，避免越位）。
 # 是否启用叶子由 DomainAgent 按【拆分决策】自主判断，不再是默认路径。
-# 产出质量走分层自检：叶子自检（写完即语法检查）-> 领域 Agent 收尾验收 -> MetaAgent 纸面交付对照+返工，
-# 均为提示词纪律、无独立验证 Agent。verifyloop 自动验证已下线（2026-08-08 A/B 实证负资产）；
+# 产出质量走分层自检 + dispatcher 机器校验：叶子自检（写完即语法检查）-> 领域 Agent 收尾验收 ->
+# MetaAgent 纸面交付对照+返工（均为提示词纪律，无独立验证 Agent）；dispatcher 在完成收尾
+# 自动执行机器校验（冒烟语法层 #56 / 跨域契约静态层 #57 / 分层验收探针 #59：入口引用图+截图证据）。
 # 整品验收 Agent 已切出默认流程（2026-08-24 决策：游戏验收 2h 撞墙钟零收益），
-# 口子保留：dispatcher isVerificationTask 判定 + domain【集成验证任务模式】提示词段原样保留，
-# 后续功能需要联调验收时，经 call_sub_agent 派“验证/联调/修复”类 domain 任务即可接入。
+# isVerificationTask 代码钩子已删除（ce43288），保留口子 = domain【集成验证任务模式】提示词段：
+# 后续功能需要联调验收时，经 call_sub_agent 派"验证/联调/修复"类 domain 任务即可接入。
 # 业务级测试（computer-use 点击页面 / CLI 断言）见 doc/扩展设计_Agent工作流平台.md §12。
 fixed_roles:
   # 代码助手

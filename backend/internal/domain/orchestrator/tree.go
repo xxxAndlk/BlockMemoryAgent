@@ -44,6 +44,11 @@ const (
 	// 与 Paused 区分:Paused=任务中断待续(等"继续"),Idle=任务完结待复用。
 	// Idle 非终态:可 Cancel(硬取消/话题切换)、可 Finish(TTL 到期销毁)、可 Wake(复用)。
 	StatusIdle
+	// StatusUnverified 标记"已交付但未验证"（TODO #60 三态化）：
+	// 产出已回传（正文含结果），但缺少机器可执行的验证证据（L0 证据缺/校验不可用），
+	// 非失败语义——看板标黄不标红，由父 Agent 决定补验证或收口。
+	// 与 Failed 区分:Failed=真失败(冒烟不过/超时/守卫终止),Unverified=产出可用但没证据。
+	StatusUnverified
 )
 
 // String 返回状态的可读名称，用于日志与 JSON 序列化。
@@ -61,6 +66,8 @@ func (s Status) String() string {
 		return "paused"
 	case StatusIdle:
 		return "idle"
+	case StatusUnverified:
+		return "delivered-unverified"
 	}
 	return "unknown"
 }
@@ -157,25 +164,39 @@ func (t *Tree) SetCancel(id string, cancel context.CancelFunc) {
 // 幂等：已 terminal 的节点重复调用 no-op。
 // 持久化:store 非 nil 时 best-effort 更新节点状态。
 func (t *Tree) Finish(id, summary string, err error) {
+	if err != nil {
+		t.finishWithStatus(id, summary, StatusFailed, err.Error())
+		return
+	}
+	t.finishWithStatus(id, summary, StatusDone, "")
+}
+
+// FinishUnverified 标记节点"已交付但未验证"（TODO #60 三态化）：
+// errVerifyMissing/errUnverified 类缺证据产出走此通道——节点不标红（非失败语义），
+// summary 附产出，reason 记缺证据原因。其余语义与 Finish 相同。
+func (t *Tree) FinishUnverified(id, summary, reason string) {
+	t.finishWithStatus(id, summary, StatusUnverified, reason)
+}
+
+// finishWithStatus 是 Finish/FinishUnverified 的共享实现。
+// 幂等：已 terminal（Done/Failed/Cancelled/Unverified）的节点重复调用 no-op；
+// Paused/Idle 节点允许收尾（resume 完成路径 / TTL 到期销毁路径）。
+func (t *Tree) finishWithStatus(id, summary string, status Status, errText string) {
 	t.mu.Lock()
 	node, ok := t.nodes[id]
 	if !ok {
 		t.mu.Unlock()
 		return
 	}
-	if node.Status == StatusDone || node.Status == StatusFailed || node.Status == StatusCancelled {
+	if node.Status == StatusDone || node.Status == StatusFailed || node.Status == StatusCancelled || node.Status == StatusUnverified {
 		t.mu.Unlock()
 		return
 	}
-	// Paused 节点允许 Finish(resume 完成路径);Idle 节点允许 Finish(TTL 到期销毁路径)。
-	// 两者均不视为 terminal。
 	node.Finished = time.Now()
 	node.Summary = summary
-	if err != nil {
-		node.Status = StatusFailed
-		node.Err = err.Error()
-	} else {
-		node.Status = StatusDone
+	node.Status = status
+	if errText != "" {
+		node.Err = errText
 	}
 	delete(t.cancels, id)
 	snapshot := *node

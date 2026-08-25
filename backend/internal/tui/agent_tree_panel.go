@@ -210,7 +210,7 @@ func filterPrevRoundNodes(nodes []orchestrator.Node, roundStart time.Time) []orc
 	out := make([]orchestrator.Node, 0, len(nodes))
 	for _, n := range nodes {
 		switch n.Status {
-		case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled:
+		case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled, orchestrator.StatusUnverified:
 			if n.Started.Before(roundStart) {
 				continue
 			}
@@ -241,7 +241,8 @@ func orchestratorNodeDepth(n orchestrator.Node, nodes []orchestrator.Node, byID 
 
 // orchestratorStatusToRole 把 orchestrator.Status 映射为 TUI RoleStatus。
 // Cancelled 归入 Done(终态,非错误)；Paused(触达 token 上限待恢复)归入 Waiting；
-// Idle(热驻待复用,Domain 热驻)归入 Idle。
+// Idle(热驻待复用,Domain 热驻)归入 Idle；Unverified(已交付未验证, TODO #60)归入
+// 独立 Unverified 态（标黄不标红）。
 func orchestratorStatusToRole(s orchestrator.Status) enums.RoleStatus {
 	switch s {
 	case orchestrator.StatusRunning:
@@ -256,6 +257,8 @@ func orchestratorStatusToRole(s orchestrator.Status) enums.RoleStatus {
 		return enums.RoleStatusWaiting
 	case orchestrator.StatusIdle:
 		return enums.RoleStatusIdle
+	case orchestrator.StatusUnverified:
+		return enums.RoleStatusUnverified
 	}
 	return enums.RoleStatusIdle
 }
@@ -274,6 +277,8 @@ func (at *AgentTreePanel) deriveDomainTaskStatuses() map[string]board.TaskStatus
 		switch node.status {
 		case enums.RoleStatusError:
 			st = board.TaskFailed
+		case enums.RoleStatusUnverified:
+			st = board.TaskUnverified
 		case enums.RoleStatusActive:
 			st = board.TaskInProgress
 		case enums.RoleStatusDone:
@@ -872,6 +877,8 @@ func roleStatusText(s enums.RoleStatus) string {
 		return "Waiting"
 	case enums.RoleStatusError:
 		return "Error"
+	case enums.RoleStatusUnverified:
+		return "Unverified"
 	default:
 		return "Idle"
 	}

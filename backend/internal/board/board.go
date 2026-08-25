@@ -31,6 +31,10 @@ const (
 	TaskDone TaskStatus = "done"
 	// TaskFailed 表示失败：执行出错或被否决。
 	TaskFailed TaskStatus = "failed"
+	// TaskUnverified 表示已交付但未验证（TODO #60 三态化）：
+	// 产出已回传但缺机器可执行的验证证据（L0 证据缺/校验不可用），非失败语义。
+	// 看板展示标黄不标红，由父 Agent 决定补验证或收口。
+	TaskUnverified TaskStatus = "delivered-unverified"
 )
 
 // BoardStatus 看板整体状态枚举类型。
@@ -46,6 +50,10 @@ const (
 	BoardStatusDone BoardStatus = "DONE"
 	// BoardStatusFailed 表示失败：所有子任务都已结束但至少有一个失败。
 	BoardStatusFailed BoardStatus = "FAILED"
+	// BoardStatusDelivered 表示已交付但存在未验证任务（TODO #60）：
+	// 所有子任务都已结束、无失败，但至少有一个是 delivered-unverified。
+	// 与 DONE 区分：整品可用性未经全部验证；与 FAILED 区分：没有真失败。
+	BoardStatusDelivered BoardStatus = "DELIVERED"
 )
 
 // SubTask 看板上的一个子任务。
@@ -391,6 +399,16 @@ func (b *TaskBoard) MarkFailed(taskID, reason string) error {
 	return b.transition(taskID, TaskFailed, reason)
 }
 
+// MarkUnverified 标记任务"已交付但未验证"（TODO #60 三态化）。
+//
+// 职责：将子任务置为 delivered-unverified，并记录缺验证原因。
+// 不触发看板 FAILED（非失败语义），整体状态走 DELIVERED。
+//
+// 并发安全：内部持写锁（经 transition）。
+func (b *TaskBoard) MarkUnverified(taskID, reason string) error {
+	return b.transition(taskID, TaskUnverified, reason)
+}
+
 // MarkBlocked 标记任务被阻塞。
 //
 // 职责：将子任务置为 blocked，并记录阻塞原因。
@@ -444,7 +462,8 @@ func (b *TaskBoard) transition(taskID string, status TaskStatus, result string) 
 // 职责：遍历所有子任务，根据其终态推导看板 Status：
 //   - 无任务 → NEW
 //   - 全部终态且有失败 → FAILED
-//   - 全部终态且无失败 → DONE
+//   - 全部终态、无失败但有 delivered-unverified → DELIVERED（TODO #60 三态化）
+//   - 全部终态且无失败无未验证 → DONE
 //   - 否则 → IN_PROGRESS
 //
 // 前置条件：调用方必须已持有 b.mu 写锁（"Locked" 后缀即此含义）。
@@ -457,13 +476,15 @@ func (b *TaskBoard) recomputeStatusLocked() {
 		b.Status = BoardStatusNew // 空看板归零
 		return
 	}
-	allTerminal, anyFailed := true, false // 终态标记与失败标记
+	allTerminal, anyFailed, anyUnverified := true, false, false
 	for _, t := range b.Tasks {
 		switch t.Status {
 		case TaskFailed:
 			anyFailed = true // 出现失败
 		case TaskDone:
 			// ok：终态成功，无需额外处理
+		case TaskUnverified:
+			anyUnverified = true // 终态但未验证（非失败语义）
 		default:
 			allTerminal = false // 仍有未完成任务
 		}
@@ -471,6 +492,8 @@ func (b *TaskBoard) recomputeStatusLocked() {
 	switch {
 	case allTerminal && anyFailed:
 		b.Status = BoardStatusFailed // 全终态但含失败
+	case allTerminal && anyUnverified:
+		b.Status = BoardStatusDelivered // 全终态无失败但有未验证
 	case allTerminal:
 		b.Status = BoardStatusDone // 全部成功完成
 	default:

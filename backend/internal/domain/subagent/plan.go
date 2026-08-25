@@ -175,11 +175,12 @@ func tskTitle(snap board.Snapshot, id string) string {
 	return id
 }
 
-// boardUpdate 把子 Agent 完成/失败状态回写计划任务（按 domain 匹配，TODO #22 Phase 1）。
+// boardUpdate 把子 Agent 完成/失败/未验证状态回写计划任务（按 domain 匹配，TODO #22 Phase 1；
+// #60 三态化：status 可为 TaskDone/TaskFailed/TaskUnverified）。
 // 一个领域对应多个子任务时整组联动（FindAllByDomain），否则细粒度计划里
 // 只有首条任务翻状态、其余永远停在 pending。
 // 无计划/未匹配静默跳过（零行为变化）。
-func (d *Dispatcher) boardUpdate(ctx context.Context, parentID, domain string, done bool, summary string) {
+func (d *Dispatcher) boardUpdate(ctx context.Context, parentID, domain string, status board.TaskStatus, summary string) {
 	domain = strings.TrimSpace(domain)
 	if domain == "" || d.boardFn == nil {
 		return
@@ -195,9 +196,12 @@ func (d *Dispatcher) boardUpdate(ctx context.Context, parentID, domain string, d
 		return
 	}
 	for _, taskID := range b.FindAllByDomain(domain) {
-		if done {
+		switch status {
+		case board.TaskDone:
 			_ = b.MarkDone(taskID, summary)
-		} else {
+		case board.TaskUnverified:
+			_ = b.MarkUnverified(taskID, summary)
+		default:
 			_ = b.MarkFailed(taskID, summary)
 		}
 	}

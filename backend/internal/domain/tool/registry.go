@@ -542,19 +542,40 @@ func isMetaDispatch(ctx context.Context, name string) bool {
 	return RoleIDFromContext(ctx) == "meta"
 }
 
+// verificationCommandPatterns 是验证类命令识别口径（TODO #63 同源模板）：子 Agent
+// 证据模板（VerificationEvidenceTemplate）与 L0 重试消息按此生成——识别器认什么，
+// prompt 就要求什么，杜绝"回传了 tsc/build 证据但识别器不认"（实证 2026-08-24 塔防
+// verify_missing 7 连发）。匹配在命令小写化后的字符串上做子串包含。
+var verificationCommandPatterns = []string{
+	"--check", "lint", "verify", " test ", "test -",
+	"node -c", "go build", "go vet", "py_compile", "pytest",
+	// 实证缺口补录：npx tsc --noEmit / vite build / npm run build 等常见验收命令
+	// 此前不在口径内（tsc 大写 E 变 noemit；vite 后接空格防匹配 invite 等无关词）。
+	"noemit", "tsc ", "vite ", "npm run", "pnpm run", "yarn run", "jest", "vitest", "mocha", "go test",
+}
+
 // IsVerificationCommand 判断命令是否为验证/检查类（--check/lint/test/verify 等，
 // 退出码即有效反馈）。
 // 导出供 agent 包 L0 证据扫描（HasExecutableVerification，TODO #43）复用同一判定口径。
 func IsVerificationCommand(cmd string) bool {
 	c := strings.ToLower(strings.TrimSpace(cmd))
-	// node -c / go build / py_compile 是领域提示词规定的语法检查写法，与 --check 同义。
-	for _, m := range []string{"--check", "lint", "verify", " test ", "test -",
-		"node -c", "go build", "go vet", "py_compile", "pytest"} {
+	for _, m := range verificationCommandPatterns {
 		if strings.Contains(c, m) {
 			return true
 		}
 	}
 	return strings.HasPrefix(c, "test ") || strings.HasSuffix(c, " test")
+}
+
+// VerificationEvidenceTemplate 渲染子 Agent 验证证据格式要求（TODO #63）：
+// 与 IsVerificationCommand 识别口径同源生成（识别器认什么，prompt 就要求什么）。
+// 注入 L0 可执行校验角色的任务前缀与反馈重试消息，保证两处口径一致不漂移。
+func VerificationEvidenceTemplate() string {
+	patterns := strings.Join(verificationCommandPatterns, " / ")
+	return "【验证证据格式】终答前必须用 RunCommand 运行验证类命令（tsc --noEmit / node -c / go test / " +
+		"npm run build 等），并必须以 ``` 代码块原样粘贴命令全文与退出码（EXIT_CODE=0）。" +
+		"dispatcher 机器识别口径（命令含以下片段即计为验证证据）: " + patterns + "。" +
+		"只靠自述\"已测试通过\"不计为证据。"
 }
 
 // scheduleProjectRefresh 去抖调度一次 PROJECT.md 刷新（文件增删改后调用）。

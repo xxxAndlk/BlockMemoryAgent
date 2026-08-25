@@ -449,6 +449,8 @@ func (m Model) deriveDomainTaskStatuses() map[string]board.TaskStatus {
 		switch node.status {
 		case enums.RoleStatusError:
 			st = board.TaskFailed
+		case enums.RoleStatusUnverified:
+			st = board.TaskUnverified
 		case enums.RoleStatusActive:
 			st = board.TaskInProgress
 		case enums.RoleStatusDone:
@@ -463,9 +465,11 @@ func (m Model) deriveDomainTaskStatuses() map[string]board.TaskStatus {
 }
 
 // strongerTaskStatus 返回两个任务状态中优先级更高的一个。
+// 优先级：Failed > Unverified > InProgress/Blocked > Done > Pending。
 func strongerTaskStatus(a, b board.TaskStatus) board.TaskStatus {
 	order := map[board.TaskStatus]int{
-		board.TaskFailed:     3,
+		board.TaskFailed:     4,
+		board.TaskUnverified: 3,
 		board.TaskInProgress: 2,
 		board.TaskBlocked:    2,
 		board.TaskDone:       1,
@@ -500,6 +504,8 @@ func statusColor(status string) string {
 		return cStatusDone
 	case "error", string(board.TaskFailed):
 		return cStatusErr
+	case string(enums.RoleStatusUnverified), string(board.TaskUnverified):
+		return cStatusWait // 已交付未验证：黄（非红）
 	default:
 		return cStatusIdle
 	}

@@ -248,46 +248,18 @@
       - domain_agent 同步：收尾验收自述降级为"建设期自查"，交付证据以 dispatcher【机器校验】为准；【集成验证任务模式】标注为例外通道入口（meta 派发时显式声明理由才启用）。
       - 测试：`config`/`role` 加载测试绿（纯 prompt 变更零代码路径）。真机验收：重跑多域任务看零验证类派发 + 摘要含【机器校验】段（待观察）。
 
-59. **验收分层模板：任务类型 → 验收层级绑定，UI/游戏类强制视觉层**（P0）  ← 来源：2026-08-24 高防植物大战僵尸任务复盘（`D:\WebData\demo\ZVB\logs\tui\2026-08-24.log` + `2026-08-25.log`，11 domain / 3 轮返工 / 4 次契约校验邮件），TuiAgent 自总结痛点经代码+日志双侧核实属实。
-    - 实证：vite build 连续两轮"成功"但产物是 9 modules/10.54KB 空壳（`src/main.ts` 被骨架期 stub 覆盖成空渲染循环，全仓 30+ 文件未进 bundle，22:28:33 构建成功日志）；23 张 AI 贴图验收标准只写"文件生成到 public/assets/img/ 且命名一致"，运行时是否被 drawImage 消费从未验收，用户实测"23 张贴图一张没用全走 canvas 手绘"（23:57:18）。修复后 28 modules/58.11KB。
-    - 代码现状：验收栈止步于存在性/静态层——L0 证据扫描（`agent/verify_evidence.go:21-50`，只认 `IsVerificationCommand` 关键词）、冒烟层（`subagent/smoke_check.go:41-45`，node --check/gofmt/tsc --noEmit 纯语法）、契约静态校验（regex/文本）、rubric judge（LLM 纸面）。不存在集成层（bundle 规模/模块数启发式）、运行时探针层（实跑断言）、视觉层（截图回显作为验收）的任何代码；截图迭代仅是 domain prompt 职责（`roles.yaml:151-154`），不构成验收机制。
-    - 方向：分层验收模板——存在性（文件在不在）→ 静态（tsc/grep 消费点）→ 集成（bundle 模块数/chunk 体积下限写进 acceptance 启发式）→ 运行时（探针脚本实跑断言）→ 视觉（截图回显）；按任务类型绑定强制层级，UI/游戏类必须到视觉层。与 #55（ui_preview 视觉验证闭环）联动。
-
-60. **状态语义三态化：verified / delivered-unverified / failed 分开**（P0）  ← 来源：同上复盘——用户看到"编排栏全是错误"，信任直接受损。
-    - 实证：7 个 domain 功能全部交付（回传正文含 tsc/build 输出原文 EXIT_CODE=0、28 modules），却因 `verify_missing`（回传摘要格式未被证据识别器认出）统一标红 failed（8-24 L22316 起；MetaAgent 23:23:17 自述"其余 7 个 Agent 都标 failed，原因都是同一个"）。
-    - 代码现状：`errVerifyMissing`（`dispatcher.go:2647`）走 `err != nil` 分支 → `boardUpdate(..., false)` + `treeFinish(err)` → `Tree.Finish` 置 `StatusFailed`（`orchestrator/tree.go:155-159`）→ TUI `TaskFailed` 标红。状态枚举只有 Running/Done/Failed/Cancelled/Paused（`tree.go:33-41`），无 unverified 态；仅邮箱文案做了软化（`formatSubAgentFailure` `dispatcher.go:2668-2670` 写"未提供可执行验证证据、非失败语义"），看板/树/TUI 层面未区分。
-    - 方向：状态机加 `delivered-unverified` 态，看板只把真 failed 标红、unverified 标黄（或独立色）；与 #64（证据格式注入，从源头消灭 verify_missing）联动。
-
-61. **占位桩责任挂名制度：契约中每个桩必须指定 owner 领域 + 进入其验收清单**（P0）  ← 来源：同上复盘——Assets.ts 断链根因。
-    - 实证：骨架领域建的 `Assets.ts` 占位桩注释"完整实现由其他领域负责，此处仅提供最小类型定义以通过构建"，8 个 domain 跑完后桩仍是桩、全局检索 `Assets.get` 零调用方；直到用户质疑后补派 domain-11（00:05:03，goal="修复贴图链路断点"）才实装。
-    - 代码现状：契约结构（`tool/contract.go:13-23,34-41`）只有 symbols/dom_ids/scripts/signatures 四类条目，字段仅 symbol/file/refs，**无 owner/责任方字段**；派发铁律与 domain prompt 全文无"桩/stub"字样，无任何"每个桩必须挂名唯一责任方 + 出现在该方验收清单"的规则；dispatcher 收尾不检查孤儿桩。
-    - 方向：契约条目加 stub/placeholder 标记 + owner 字段；dispatcher 全兄弟完成收尾时检查"无孤儿桩"（桩未被任何 owner 实装即违例打回）；派发铁律补桩纪律文案。
-
-62. **契约校验语义化：签名兼容以 tsc 为判据 + 契约冲突先质疑契约**（P1）  ← 来源：同上复盘——4 次契约校验邮件 3 次误报。
-    - 实证：①时序误报（校验发生在返工派发之后、修改落地之前）；②`bootstrap` 签名字面匹配误报（23:14:01 自述"规范字面匹配的误报"）；③`loadAll` 契约写两参签名、实现用 `LoadProgress` 对象参数（与 main.ts 既存消费兼容且 tsc 通过）被字面判违例 + "3 场景+4 UI 未引用 `Assets` 符号"误报（实际走 `this.game.assets.getImage()` 属性消费）。
-    - 代码现状与**对原总结的修正**：(a) 签名字面匹配属实——`contract_check.go:155` `strings.Contains(content, sg.Signature)` 纯文本包含，无类型兼容性判断；(b) 原总结"引用检查只认 import"**不准确**——checker 根本没有 import 概念（`contract_check.go:48-66,106-118` 是符号文本/按 `.` 拆段词边界匹配），真正机制问题是纯文本匹配的大小写/字面敏感：`this.game.assets`（小写）未命中契约符号 `Assets`，属字面匹配误报的另一形态，且注释提及会被误判"已引用"（漏报方向也存在）；(c) 无"先质疑契约"逻辑属实——所有违例直接打回责任域（`contract_check.go:97-160`），无契约自省分支。
-    - 方向：签名兼容性以 tsc 能编译过为准（能编译=兼容）；引用检查支持声明属性访问路径（如 `game.assets`）并做大小写不敏感/语义化匹配；实现已过编译而契约判违例时先复核契约本身；契约检查与返工落地的时序竞争需串行化（兄弟全完成+无进行中派发后才跑，或带变更屏障）。
-
-63. **验证证据格式模板注入子 Agent prompt**（P1）  ← 来源：同上复盘——verify_missing 的源头是子 Agent 根本不知道要按什么格式回传。
-    - 实证：7 个 domain 回传正文实际包含 tsc/build 输出原文，但格式不被 `verify_evidence.go` 证据识别器认出 → 全判 verify_missing。
-    - 方向：子 Agent prompt 自动附带证据模板（"必须以 ``` 块粘贴命令 + 退出码原文"），格式要求与识别器口径同源生成（识别器认什么，prompt 就要求什么），从源头消灭 verify_missing；与 #60 三态化互补（一个治源头、一个治状态语义）。
-
-64. **fallback happy-path 探针规则**（P1）  ← 来源：同上复盘——"贴图优先、手绘兜底"的防御性设计 + 只验证文件存在 = 兜底变成唯一路径。
-    - 实证：23 张 AI 贴图运行时一张未用，全走 canvas 手绘兜底（用户 23:57:18 实测质疑，MetaAgent 核实确认）。
-    - 代码现状：acceptance 完全由派发方 LLM 手写（`spec.go:70-141` 只校验非空），无任何"出现降级/fallback 字样时自动生成 happy-path 验收项"的机制。
-    - 方向：spec/acceptance 中出现"降级/fallback/兜底"字样时，自动追加一条 happy-path 验收项（如运行时断言 `getImage('plant-peashooter') !== null`）；与 #59 运行时探针层联动。
-
-65. **WriteSpec 多 key 存储 + 精准 staleness + 预算口径修正**（P2）  ← 来源：同上复盘。
-    - 实证：同 parent 只存一份 spec 导致"写一个派一个"；domain-3 因兄弟 domain-1 写目录导致共享 spec stale 被拒（22:17:16 `spec stale: 涉及文件已变更…请用 WriteSpec 重写`），只能收窄 files 到具体路径重写重派（22:19:19 成功）；task 文本两次超软预算警告（3221/3318 runes，"超出 3000 字预算但未达硬上限 4000"）。
-    - 代码现状与**对原总结的修正**：(a) 一父一份写即覆盖属实（`spec.go:26,116-117`，键固定 `agentID+":spec"`，工具描述明写"兄弟子 Agent 共享"）；(b) staleness 跟踪粒度本身是 files 交集（`spec.go:103-110` + `dispatcher.go:3347-3349` 只校验 fm.Files），**兄弟写未列入 files 的文件不会误伤**——真正问题是共享 spec 的 files 通常列整任务全部文件，兄弟写其中任何一个都使共享 spec 对全组 stale，"交集粒度正确、共享粒度放大误伤"；(c) 原总结"3000 字硬预算"**不准确**——3000 是派发 task 文本软上限（放行附警告）、4000 才是硬拒绝（`dispatcher.go:201-203,754-755,1238-1260`），且约束的是 task 非 spec 本身（WriteSpec 无长度校验）。
-    - 方向：spec 支持按领域 key 存多份（兄弟各持各的，staleness 天然按各自 files 交集隔离）；staleness 只跟踪与本任务 files 交集的变更（现状已是，多 key 化后误伤面收敛）；顺手修陈旧文案 `spec.go:123`"派发 task 预算 2000 字"（实际 3000/4000 双档）。
-
-66. **Meta 侧最终集成验证默认化**（P2）  ← 来源：同上复盘——第 9 个 domain（最终只读集成验证）是用户 23:22:11 质疑"编排栏全是错误"后被动补派的，非初始编排计划内（初始仅 5 个建设域）。
-    - 代码现状：完成路径零集成验证（`dispatcher.go:1872-1875` 注释明写"完成路径不再自动派验证 Agent"）；prompt 层 meta"不派验证类任务"（`roles.yaml:93`），重度验证需显式声明理由且"默认不走"（`roles.yaml:106-108`）——与 #58 的例外通道决策存在张力，需权衡（#58 刚把整品验收切出默认流程，本项不是简单回退，而是把"多领域任务的收尾集成验证"以低成本机器校验形态默认化，LLM 重度验证仍走例外）。
-    - 方向：多领域任务的默认收尾步骤写进编排流程（优先复用 #56/#57 机器校验通道 + #59 分层验收的高层级项，零/低 LLM 成本），而非依赖用户质疑后补派。
-    - 顺手修：`roles.yaml:280` 声称保留的 `isVerificationTask` 代码钩子已不存在（ce43288 已删，全 backend 仅注释提及），文案与代码漂移。
-
 ## 已完成（已归档到 git 历史）
+
+- **2026-08-25 落地 #59-66（任务 89-96，详见 `doc/变更.md`）——2026-08-24 高防植物大战僵尸复盘八项**：
+  - #59 验收分层模板：`Spec.VerifyLevels`（existence/static/integration/runtime/visual），WriteSpec schema + frontmatter；dispatcher 集成层探针（`subagent/integration_check.go`：HTML script src 解析 + 入口 import 引用图 + 空壳提示）与视觉层证据强制（`agent.HasScreenshotEvidence`，缺截图 → `errVisualEvidenceMissing` → delivered-unverified 黄态）；roles.yaml 派发铁律/交付验收绑定任务类型强制层级。
+  - #60 状态三态化：`orchestrator.StatusUnverified`（delivered-unverified）+ `Tree.FinishUnverified`；`board.TaskUnverified`/`BoardStatusDelivered` + `MarkUnverified`；dispatcher 失败路径按 kind 分流（verify_missing/unverified → 黄态，真失败仍红）；TUI `RoleStatusUnverified` 标黄。
+  - #61 桩挂名：`ContractSymbol.Stub/Owner`；契约检查第 5 段孤儿桩检查（声明文件仍含占位标记即打回 owner）；派发铁律补桩纪律。
+  - #62 契约语义化：`symbolFound` 末段大小写不敏感（属性访问路径）+ 非末段敏感；签名空白归一 + .ts 文件 tsc 编译仲裁（编译过 → "存疑"降级先质疑契约）；变更屏障（`recMtimesMatch`，capture 后文件变则跳过）。
+  - #63 证据模板同源：`verificationCommandPatterns` 提取 + 扩词表（noemit/tsc /vite /npm run 等）；`VerificationEvidenceTemplate()` 同源注入任务尾部 + L0 重试消息。
+  - #64 happy-path：`HasFallbackKeyword` + `HappyPathAcceptance` 自动追加（WriteSpec 检测降级/兜底关键词）。
+  - #65 多 key spec：WriteSpec `key` 参数 → `<parentID>:spec:<domain>`；dispatcher `specKeyFor`/`parentSpecs` 按 (parent, domain) 键、`hasFreshSpec`/`buildSharedPrefix` 领域定向 + 遗留单键回退；顺手修 spec.go 预算文案 2000→3000/4000。
+  - #66 meta 收尾集成验证默认化：交付验收 A 段并入集成层/视觉层机器校验 + 分层绑定；顺手修 roles.yaml isVerificationTask 漂移文案。
+  - 观察点：verify_missing 复发率（应趋零）、契约误报率（tsc 仲裁后）、UI/游戏任务未验证黄态出现频率、多 key spec 隔离后兄弟互伤。
 
 - **评测体系落地 + 首次基线**（2026-08-14）：`test/eval/`（build tag `eval`）真实 LLM 任务完成率评测——场景 YAML + checkpoint 判分（command/file/regex/tree/llm_judge）+ token/子Agent 指标聚合 + TheAgentCompany 式全量/部分分报告（`test/eval/runs/`）；环境隔离修复：`docker/docker-compose.test.yml` 独立端口（PG 55432/Redis 56380）+ 无固定容器名，fixture 维度对齐 migrations（768）。首基线 12 场景 full pass 91.7%、加权 0.979，详见 `doc/eval/baseline_2026-08-14.md`。后续加固（同日）：fixture 改"共享容器常驻 + 每测试独立 PG database/Redis 逻辑库"（Redis 开 1024 逻辑库），并行包 `go test ./...` 不再互相拆台；`TestFactExtractionFallback` 序列对齐现行后端（verify_kind 校验分层 + 派发后不阻塞）。开放项：verifyloop 场景判分口径修正（自动验证闭环已下线，改测 verify_kind 证据）、EVAL_RUNS=3 可靠性、SWE-bench 20 题切片（Phase 2）。
 - ReAct 主循环骨架（`internal/agent/react_agent.go`）

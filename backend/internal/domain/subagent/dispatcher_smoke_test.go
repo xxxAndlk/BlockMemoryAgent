@@ -100,7 +100,7 @@ func TestDispatcher_SmokeCheckFail(t *testing.T) {
 		}
 	}
 	// 冒烟检查应实际执行过（含重试轮共 2 次）。
-	if got := d.parentSpecRecordOf("meta"); got == nil || len(got.files) != 1 {
+	if got := d.parentSpecRecordOf("meta", ""); got == nil || len(got.files) != 1 {
 		t.Fatalf("expected captured parent spec files, got %+v", got)
 	}
 }

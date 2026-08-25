@@ -871,3 +871,118 @@ func TestWriteFile_TemporaryOutputHasAbsPath(t *testing.T) {
 		t.Fatalf("temp file should exist at %s: %v", res.Path, err)
 	}
 }
+
+// TestWriteSpec_MultiKeyPerDomain 多 key 存储（TODO #65）：key=领域名时存到
+// "<agentID>:spec:<key>"，与默认单键互不覆盖。
+func TestWriteSpec_MultiKeyPerDomain(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "共享单份", "acceptance": []any{"a"},
+	}); err != nil {
+		t.Fatalf("legacy write: %v", err)
+	}
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "渲染域目标", "acceptance": []any{"b"}, "key": "渲染领域",
+	}); err != nil {
+		t.Fatalf("domain write: %v", err)
+	}
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "寻路域目标", "acceptance": []any{"c"}, "key": "寻路领域",
+	}); err != nil {
+		t.Fatalf("second domain write: %v", err)
+	}
+	if resBad, _ := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "x", "acceptance": []any{"d"}, "key": "bad:key",
+	}); resBad.Success || !strings.Contains(resBad.Error, "key must not contain") {
+		t.Fatalf("key with colon should be rejected, got %q", resBad.Error)
+	}
+	legacy, _ := store.Get(ctx, "meta-1:spec")
+	fm1, _, _ := DecodeSharedMD(legacy)
+	if fm1.Goal != "共享单份" {
+		t.Fatalf("legacy spec overwritten: %q", fm1.Goal)
+	}
+	d1, _ := store.Get(ctx, "meta-1:spec:渲染领域")
+	fm2, _, _ := DecodeSharedMD(d1)
+	if fm2.Goal != "渲染域目标" {
+		t.Fatalf("domain spec missing: %q", fm2.Goal)
+	}
+	d2, _ := store.Get(ctx, "meta-1:spec:寻路领域")
+	fm3, _, _ := DecodeSharedMD(d2)
+	if fm3.Goal != "寻路域目标" {
+		t.Fatalf("second domain spec missing: %q", fm3.Goal)
+	}
+}
+
+// TestWriteSpec_VerifyLevels 验收层级（TODO #59）：合法值存 frontmatter，非法值拒绝。
+func TestWriteSpec_VerifyLevels(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.SetSharedMemory(newFakeSharedMemoryStore())
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g", "acceptance": []any{"a"},
+		"verify_levels": []any{"visual", "integration", "visual"},
+	}); err != nil {
+		t.Fatalf("valid levels write: %v", err)
+	}
+	val, _ := r.sharedMemory.Get(ctx, "meta-1:spec")
+	fm, _, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatal("decode failed")
+	}
+	if len(fm.VerifyLevels) != 2 || fm.VerifyLevels[0] != "visual" || fm.VerifyLevels[1] != "integration" {
+		t.Fatalf("verify_levels normalized wrong: %v", fm.VerifyLevels)
+	}
+
+	res, _ := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g", "acceptance": []any{"a"},
+		"verify_levels": []any{"invalid-layer"},
+	})
+	if res.Success {
+		t.Fatal("invalid verify_levels should be rejected")
+	}
+	if !strings.Contains(res.Error, "verify_levels 含非法值") {
+		t.Fatalf("expected validation error, got %q", res.Error)
+	}
+}
+
+// TestWriteSpec_HappyPathAutoAppend 降级/兜底关键词自动追加 happy-path 验收项（TODO #64）。
+func TestWriteSpec_HappyPathAutoAppend(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.SetSharedMemory(newFakeSharedMemoryStore())
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "贴图优先，手绘兜底",
+		"acceptance": []any{"文件生成到 assets/img/"},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch: %v %v", err, res)
+	}
+	if !strings.Contains(res.Output, "happy-path") {
+		t.Fatalf("output should announce happy-path append, got %q", res.Output)
+	}
+	val, _ := r.sharedMemory.Get(ctx, "meta-1:spec")
+	fm, _, _ := DecodeSharedMD(val)
+	found := false
+	for _, a := range fm.Acceptance {
+		if strings.HasPrefix(a, "【自动追加·happy-path】") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("happy-path acceptance not appended: %v", fm.Acceptance)
+	}
+
+	// 无兜底关键词：不追加。
+	res2, _ := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "普通任务", "acceptance": []any{"a"},
+	})
+	if strings.Contains(res2.Output, "happy-path") {
+		t.Fatalf("no fallback keywords should not append, got %q", res2.Output)
+	}
+}

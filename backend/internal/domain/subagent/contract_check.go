@@ -9,8 +9,10 @@ package subagent
 // 漏报优于复杂化）；契约为空时跳过；契约只保证静态一致性。
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -38,10 +40,13 @@ func (r contractReport) pass() bool { return len(r.violations) == 0 }
 // identifierRegexp 单词边界匹配单标识符（防 CONFIG 匹配 MYCONFIGX）。
 var identifierRegexp = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
 
-// symbolFound 判断符号是否出现在文件内容中：
+// symbolFound 判断符号是否出现在文件内容中（TODO #62 语义化匹配）：
 //   - 字面包含（复合符号如 `GameEngine.init` 的引用形态 `GameEngine.init()`）直接命中；
-//   - 否则对复合符号按 "." 拆段，逐段词边界匹配——覆盖声明形态
-//     `var GameEngine = { init: function() {} }`（字面不含 `GameEngine.init`）。
+//   - 复合符号按 "." 拆段逐段词边界匹配——覆盖声明形态
+//     `var GameEngine = { init: function() {} }`（字面不含 `GameEngine.init`）；
+//   - 末段（属性名）大小写不敏感：契约 `Assets`、实际消费走 `this.game.assets` 属性
+//     访问路径（实证 2026-08-24 塔防误报：checker 只认字面大写符号）仍命中；
+//   - 非末段保持大小写敏感（`GameEngine` 与 `gameengine` 是不同符号，不误放行）。
 //
 // 静态文本解析不做 AST（doc/TODO.md #57 不做项）：段匹配会放宽误放行，
 // 漏报优于复杂化，契约只保证静态一致性兜底。
@@ -51,11 +56,24 @@ func symbolFound(content, symbol string) bool {
 	}
 	segs := strings.Split(symbol, ".")
 	if len(segs) < 2 {
-		return false
+		// 单段符号：先精确词边界，再大小写不敏感兜底（属性访问路径形态）。
+		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(strings.Trim(segs[0], "()[]")) + `\b`)
+		if seg := strings.Trim(segs[0], "()[]"); seg != "" && re.MatchString(content) {
+			return true
+		}
+		lower := regexp.MustCompile(`\b` + regexp.QuoteMeta(strings.ToLower(strings.Trim(segs[0], "()[]"))) + `\b`)
+		return lower.MatchString(strings.ToLower(content))
 	}
-	for _, seg := range segs {
+	for i, seg := range segs {
 		seg = strings.Trim(seg, "()[]")
 		if seg == "" || !identifierRegexp.MatchString(seg) {
+			continue
+		}
+		if i == len(segs)-1 {
+			// 末段（属性名）大小写不敏感。
+			if !regexp.MustCompile(`\b` + regexp.QuoteMeta(strings.ToLower(seg)) + `\b`).MatchString(strings.ToLower(content)) {
+				return false
+			}
 			continue
 		}
 		if !regexp.MustCompile(`\b` + regexp.QuoteMeta(seg) + `\b`).MatchString(content) {
@@ -144,7 +162,10 @@ func (d *Dispatcher) runContractChecks(c *tool.Contract, specFiles []string) con
 	// HTML 时跳过（漏报优于复杂化）。
 	checkScriptOrder(workdir, specFiles, c.Scripts, &rep)
 
-	// 4. 跨域函数签名：签名文本字面出现在声明文件中。
+	// 4. 跨域函数签名：签名文本字面/空白归一后匹配；未命中时对 .ts/.tsx 文件以
+	// tsc 单文件编译为判据（TODO #62 语义化：能编译=兼容）——tsc 编译通过则
+	// "先质疑契约"：签名兼容但契约字面过时，降级为存疑条目而非违例打回。
+	// tsc 缺失/超时/非 TS 文件维持原字面判定（漏报优于复杂化）。
 	for _, sg := range c.Signatures {
 		content, ok := readContractFile(workdir, sg.File)
 		if !ok {
@@ -152,15 +173,109 @@ func (d *Dispatcher) runContractChecks(c *tool.Contract, specFiles []string) con
 			rep.violations = append(rep.violations, contractViolation{file: sg.File, detail: fmt.Sprintf("契约签名 `%s` 的声明文件缺失", sg.Signature)})
 			continue
 		}
-		if !strings.Contains(content, sg.Signature) {
-			rep.entries = append(rep.entries, fmt.Sprintf("违例: 签名 `%s` 未在 `%s` 中找到", sg.Signature, sg.File))
-			rep.violations = append(rep.violations, contractViolation{file: sg.File, detail: fmt.Sprintf("契约签名 `%s` 未在声明文件中找到", sg.Signature)})
+		if signatureMatched(content, sg.Signature) {
+			rep.entries = append(rep.entries, fmt.Sprintf("通过: 签名 `%s` 声明于 `%s`", sg.Signature, sg.File))
 			continue
 		}
-		rep.entries = append(rep.entries, fmt.Sprintf("通过: 签名 `%s` 声明于 `%s`", sg.Signature, sg.File))
+		if isTSFile(sg.File) && tscCompiles(workdir, sg.File, d) {
+			rep.entries = append(rep.entries, fmt.Sprintf("存疑: 签名 `%s` 未在 `%s` 中字面命中，但 tsc 编译通过——契约可能过时，先质疑契约本身再决定是否打回", sg.Signature, sg.File))
+			continue
+		}
+		rep.entries = append(rep.entries, fmt.Sprintf("违例: 签名 `%s` 未在 `%s` 中找到", sg.Signature, sg.File))
+		rep.violations = append(rep.violations, contractViolation{file: sg.File, detail: fmt.Sprintf("契约签名 `%s` 未在声明文件中找到", sg.Signature)})
+	}
+
+	// 5. 占位桩责任挂名（TODO #61）：契约 Stub 标记的符号必须已实装——
+	// 声明文件不再含占位标记（placeholder/占位/待实现），否则判孤儿桩打回 owner 域。
+	// 实证 2026-08-24 塔防：骨架域建的 Assets.ts 占位桩 8 个 domain 跑完仍是桩，
+	// 全局零调用方，直到用户质疑后补派 domain-11 才实装。
+	for _, sy := range c.Symbols {
+		if !sy.Stub {
+			continue
+		}
+		decl, ok := readContractFile(workdir, sy.File)
+		if !ok {
+			continue // 声明文件缺失已在符号检查段报过，此处不重复。
+		}
+		if stubMarkerFound(decl) {
+			owner := strings.TrimSpace(sy.Owner)
+			ownerNote := ""
+			if owner != "" {
+				ownerNote = "（责任方: " + owner + "，须进入其验收清单）"
+			}
+			rep.entries = append(rep.entries, fmt.Sprintf("违例: 占位桩 `%s` 未被实装，声明文件 `%s` 仍含占位标记%s", sy.Symbol, sy.File, ownerNote))
+			rep.violations = append(rep.violations, contractViolation{file: sy.File, detail: fmt.Sprintf("占位桩 `%s` 未实装%s：声明文件仍含占位标记，请实装并移除占位注释", sy.Symbol, ownerNote)})
+			continue
+		}
+		rep.entries = append(rep.entries, fmt.Sprintf("通过: 占位桩 `%s` 已实装（占位标记已移除）", sy.Symbol))
 	}
 
 	return rep
+}
+
+// signatureMatched 签名匹配：字面包含优先，未命中时空白归一后包含
+// （`attack (target, dmg)` 与 `attack(target, dmg)` 等价，TODO #62 语义化）。
+func signatureMatched(content, sig string) bool {
+	if strings.Contains(content, sig) {
+		return true
+	}
+	norm := func(s string) string {
+		return strings.Map(func(r rune) rune {
+			switch r {
+			case ' ', '\t', '\n', '\r':
+				return -1
+			}
+			return r
+		}, s)
+	}
+	return strings.Contains(norm(content), norm(sig))
+}
+
+// stubMarkers 是占位桩标记识别口径（TODO #61）：声明文件仍含任一标记即判未实装。
+// 不含 "stub" 本身——测试桩（test stub）是合法代码形态，误伤面过大。
+var stubMarkers = []string{"占位", "placeholder", "待实现", "not implemented", "todo: implement", "tbd", "占位桩"}
+
+// stubMarkerFound 判断文件内容是否仍含占位标记（大小写不敏感）。
+func stubMarkerFound(content string) bool {
+	lc := strings.ToLower(content)
+	for _, m := range stubMarkers {
+		if strings.Contains(lc, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTSFile 判断契约文件是否为 TypeScript（tsc 编译仲裁适用范围）。
+func isTSFile(p string) bool {
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(p))) {
+	case ".ts", ".tsx":
+		return true
+	}
+	return false
+}
+
+// tscCompiles 以 tsc --noEmit --skipLibCheck 单文件编译为签名兼容仲裁（TODO #62）。
+// 编译退出码 0 = 能编译 = 签名兼容（契约疑似过时）。tsc 缺失/超时/无法启动返回
+// false（不误判"编译过"，仍按字面判定原路走）。runner/lookPath 复用冒烟注入
+// （测试可注入假实现），nil 时用默认实现。30s 超时兜底。
+func tscCompiles(workdir, file string, d *Dispatcher) bool {
+	runner := d.smokeRunner
+	if runner == nil {
+		runner = defaultSmokeRunner
+	}
+	lookPath := d.smokeLookPath
+	if lookPath == nil {
+		lookPath = exec.LookPath
+	}
+	if _, err := lookPath("tsc"); err != nil {
+		return false
+	}
+	abs := contractFileAbs(workdir, file)
+	cmdCtx, cancel := context.WithTimeout(context.Background(), smokeTimeout)
+	defer cancel()
+	_, code, err := runner(cmdCtx, workdir, "tsc", "--noEmit", "--skipLibCheck", abs)
+	return err == nil && code == 0
 }
 
 // scriptSrcRegexp 提取 HTML 中 <script src="..."> 的 src 值。
