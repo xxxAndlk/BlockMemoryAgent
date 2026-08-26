@@ -290,6 +290,15 @@ func (p *domainPool) slots(sessionID string) []*domainSlot {
 	return out
 }
 
+// rearmSlotActivity 重建槽的心跳监控条目：enterIdle/挂起收尾 Delete activity（巡检豁免）后，
+// 唤醒路径（reuse-wake / resume / 出队缓冲任务）统一在 runDomainTask 入口重建，
+// 保证执行期假死仍可被巡检发现。
+func (d *Dispatcher) rearmSlotActivity(id string) {
+	act := new(atomic.Int64)
+	act.Store(time.Now().UnixNano())
+	d.activity.Store(id, act)
+}
+
 // enterIdle 转入 Idle：记录 idleSince，不挂 TTL timer（完成后一直热存，
 // 用户下一条消息经 ArmIdleTTLs 才武装）。心跳豁免=activity.Delete。
 func (d *Dispatcher) enterIdle(s *domainSlot, summary string) {
@@ -550,6 +559,21 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 	s.cancelTask = cancelTask
 	s.mu.Unlock()
 
+	// 巡检兜底换绑（2026-08-26 panic 修复）：dispatchHotDomain 注册的 subMeta.cancel 为 nil
+	//（任务 ctx 彼时尚未创建），此处每任务换绑真实 cancel--假死 kill 时巡检才能真正取消
+	// 执行中的任务 ctx（ctx 取消 -> 下方 Canceled 分支 -> domainTaskDestroyed 销毁槽）。
+	// 换绑 = Store 新实例（subAgentMeta 字段无锁被巡检并发读，禁止原地改写）；上一任务的
+	// cancel 已由其 defer 触发，巡检拿到旧实例再调用是无害 no-op。
+	if v, ok := d.subMeta.Load(s.id); ok {
+		if m, ok2 := v.(*subAgentMeta); ok2 {
+			d.subMeta.Store(s.id, &subAgentMeta{cancel: cancelTask, parentID: m.parentID, sessionID: m.sessionID, wallClock: wallClock})
+		}
+	}
+	// 活动重建：enterIdle/挂起收尾会 Delete activity（巡检豁免），唤醒路径（reuse-wake/
+	// resume/出队缓冲任务）统一在任务入口重建，执行期假死仍可被巡检发现
+	//（此前唤醒分支只 Load 刷新，enterIdle Delete 后必落空--复用任务心跳永久失明）。
+	d.rearmSlotActivity(s.id)
+
 	wallClock = d.armWallClock(s, taskCtx, cancelTask, wallClock)
 
 	// 树节点保持 Running + 绑任务 cancel（Wake 已由派发方完成；首任务 Register 时已绑）。
@@ -593,6 +617,10 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 		}
 		s.suspended = true
 		s.mu.Unlock()
+		// 挂起期间心跳豁免：等用户"继续"可远超心跳阈值（2026-08-26 实证 panic 链：
+		// 挂起槽的 activity 残留被巡检判假死 -> killStuckSubAgent）。恢复执行时
+		// runDomainTask 入口重建。
+		d.activity.Delete(s.id)
 		// 挂起全树（叶子经 SuspendGate 在下个检查点 park；在飞的跑完或完成回灌）。
 		d.SuspendSession(s.sessionID)
 		return domainTaskSuspended
@@ -940,10 +968,8 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 			}
 		}
 		d.trackChildStart(parentID)
-		// 活动恢复（心跳豁免解除）。
-		if actVal, ok := d.activity.Load(s.id); ok {
-			actVal.(*atomic.Int64).Store(time.Now().UnixNano())
-		}
+		// 活动恢复（心跳豁免解除）：enterIdle 已 Delete 旧条目，Load 必落空，须重建。
+		d.rearmSlotActivity(s.id)
 		select {
 		case s.ops <- domainOp{kind: opNewTask, task: taskText, wallClock: wallClock}:
 		default:
