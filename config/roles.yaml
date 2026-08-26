@@ -104,6 +104,9 @@ meta_agent:
     - 还原/复刻/仿制/对标类任务必须先准备对标基线（参考截图/数值表落 workspace），
       路径写入 spec 的 baseline 字段——goal 命中还原类诉求且 baseline 为空时
       WriteSpec 直接拒收（还原度不可验收=需求未定义完）。
+      基线落盘走 WriteSpec 的 baseline_content=[{path,content}] 内联参数（本工具自动
+      写入 .bma/baseline/ 再校验）——你没有宿主写文件工具，禁止用插件 filesystem
+      工具落盘基线（其写沙箱容器文件系统，宿主校验不可见，只会反复拒收）。
     - 接力熔断（第 3/4 代派发）：同一领域多次返工/续建时，dispatcher 计派发代数；
       第 3 代起子 Agent 会收到【重写评估】强制段（评估整文件重写 vs 继续修补），
       第 4 代起你在 task 中写明【接力理由】… 才放行派发——多棒接力质量逐代劣化

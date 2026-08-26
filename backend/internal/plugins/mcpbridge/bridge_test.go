@@ -115,6 +115,37 @@ func TestFromSettings(t *testing.T) {
 	}
 }
 
+// TestFromSettingsToolDescriptionSuffix 验证 tool_description_suffix 解析
+// 与 wrapTool 描述拼接（沙箱边界警告注入点）。
+func TestFromSettingsToolDescriptionSuffix(t *testing.T) {
+	s := FromSettings(map[string]any{
+		"tool_description_suffix": "沙箱容器文件系统，宿主不可见",
+	})
+	if s.ToolDescriptionSuffix != "沙箱容器文件系统，宿主不可见" {
+		t.Fatalf("tool_description_suffix 解析错误: %+v", s)
+	}
+	if FromSettings(map[string]any{}).ToolDescriptionSuffix != "" {
+		t.Fatalf("tool_description_suffix 缺省应为空")
+	}
+
+	// wrapTool 拼接：服务端描述 + 后缀。
+	b := New("test-plugin", s, nil)
+	desc := b.wrapTool(&mcp.Tool{Name: "filesystem", Description: "File operations. Relative paths resolve from Desktop."}).(interface{ Description() string }).Description()
+	if !strings.Contains(desc, "沙箱容器文件系统，宿主不可见") {
+		t.Fatalf("wrapTool 应附加 suffix，got %q", desc)
+	}
+	if !strings.Contains(desc, "Relative paths resolve from Desktop") {
+		t.Fatalf("wrapTool 应保留服务端描述，got %q", desc)
+	}
+
+	// 空后缀零拼接：描述原样。
+	b2 := New("test-plugin", FromSettings(map[string]any{}), nil)
+	desc2 := b2.wrapTool(&mcp.Tool{Name: "x", Description: "plain"}).(interface{ Description() string }).Description()
+	if desc2 != "plain" {
+		t.Fatalf("无后缀时描述应原样，got %q", desc2)
+	}
+}
+
 // TestExtractImages 验证 image content 提取的过滤与上限：
 // 空 MIME/空数据/超尺寸跳过，单次最多 maxPassthroughImages 张。
 func TestExtractImages(t *testing.T) {

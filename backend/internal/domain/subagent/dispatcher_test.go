@@ -1238,13 +1238,13 @@ func TestHasFreshSpec(t *testing.T) {
 	d6.WithSharedMemory(kv6)
 	d6.WithSpecEnforcement(true)
 	// 先通过校验一次。
-	if msg := d6.checkSpecBeforeDispatch(context.Background(), "meta", ""); msg != "" {
+	if msg, _ := d6.checkSpecBeforeDispatch(context.Background(), "meta", ""); msg != "" {
 		t.Fatalf("expected pass before modification, got: %q", msg)
 	}
 	// 改普通文件 → stale（checkSpecBeforeDispatch 文案区分且列出路径）。
 	newTime6 := fi6.ModTime().Add(5 * time.Second)
 	_ = os.Chtimes(target6, newTime6, newTime6)
-	if msg := d6.checkSpecBeforeDispatch(context.Background(), "meta", ""); msg == "" {
+	if msg, _ := d6.checkSpecBeforeDispatch(context.Background(), "meta", ""); msg == "" {
 		t.Fatal("expected spec check failure after normal file modified")
 	} else if !strings.Contains(msg, "stale") || !strings.Contains(msg, target6) {
 		t.Fatalf("stale message should distinguish and list path, got: %q", msg)

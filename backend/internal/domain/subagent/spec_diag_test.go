@@ -57,13 +57,16 @@ func TestHasFreshSpec_UniqueCandidateFallback(t *testing.T) {
 	kv := newTestKVMemory(true)
 	d.sharedMem = kv
 
-	// 仅存在一个 keyed spec（key 与 domain 不一致）：唯一候选回退放行。
+	// 仅存在一个 keyed spec（key 与 domain 不一致）：唯一候选回退放行，附对齐警告。
 	kv.items["meta-1:spec:fruit-game-spec"] = tool.EncodeSpecMD("meta-1", tool.Spec{
 		Goal: "g", Acceptance: []string{"a"},
 	}, nil)
 	ok, reason := d.hasFreshSpec(context.Background(), "meta-1", "fruit-game")
 	if !ok {
 		t.Fatalf("unique keyed spec should fall back and pass, got reason=%q", reason)
+	}
+	if !strings.Contains(reason, "唯一候选") || !strings.Contains(reason, "fruit-game-spec") {
+		t.Fatalf("fallback pass should carry alignment warning, got reason=%q", reason)
 	}
 
 	// 两个 keyed spec：无法唯一定位，回退失效，仍报 missing 列出两 key。

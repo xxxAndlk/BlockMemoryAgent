@@ -200,3 +200,150 @@ func TestWriteSpec_ProbesScenesBaselineRoundTrip(t *testing.T) {
 		t.Fatalf("structured acceptance not persisted: %v", fm.Acceptance)
 	}
 }
+
+func TestWriteSpec_BaselineContentInline(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	store.workDir = dir
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	// 还原类 goal + baseline_content 内联 → 自动落盘 .bma/baseline/ 并通过。
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "高还原度复刻水果忍者游戏",
+		"acceptance": []any{"可玩"},
+		"baseline_content": []any{map[string]any{
+			"path":    "fruit-baseline.md",
+			"content": "# Fruit Ninja 基线\n- 切水果 1 分",
+		}},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("baseline_content should succeed: err=%v res=%+v", err, res)
+	}
+	dst := filepath.Join(dir, ".bma", "baseline", "fruit-baseline.md")
+	data, rerr := os.ReadFile(dst)
+	if rerr != nil {
+		t.Fatalf("baseline file not written: %v", rerr)
+	}
+	if !strings.Contains(string(data), "切水果 1 分") {
+		t.Fatalf("baseline content mismatch: %q", data)
+	}
+
+	// frontmatter Baseline 记录相对路径。
+	val, ok := store.items["meta-1:spec"]
+	if !ok {
+		t.Fatal("spec entry missing")
+	}
+	fm, _, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatal("decode spec failed")
+	}
+	if len(fm.Baseline) != 1 || fm.Baseline[0] != ".bma/baseline/fruit-baseline.md" {
+		t.Fatalf("baseline should record written path, got %v", fm.Baseline)
+	}
+}
+
+func TestWriteSpec_BaselineContentPathEscape(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	store.workDir = dir
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	// 路径穿越：只取文件名，落盘仍在 .bma/baseline/ 内。
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "高还原度复刻水果忍者游戏",
+		"acceptance": []any{"可玩"},
+		"baseline_content": []any{map[string]any{
+			"path":    "../escape.md",
+			"content": "escape attempt",
+		}},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("path escape should be neutralized: err=%v res=%+v", err, res)
+	}
+	if _, rerr := os.Stat(filepath.Join(dir, "escape.md")); rerr == nil {
+		t.Fatal("file escaped baseline dir")
+	}
+	if _, rerr := os.Stat(filepath.Join(dir, ".bma", "baseline", "escape.md")); rerr != nil {
+		t.Fatalf("escaped name should land in baseline dir: %v", rerr)
+	}
+
+	// path 为空 → 拒收。
+	res, _ = r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "高还原度复刻水果忍者游戏",
+		"acceptance": []any{"可玩"},
+		"baseline_content": []any{map[string]any{
+			"content": "no path",
+		}},
+	})
+	if res.Success {
+		t.Fatal("empty path should be rejected")
+	}
+
+	// content 为空 → 拒收。
+	res, _ = r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "高还原度复刻水果忍者游戏",
+		"acceptance": []any{"可玩"},
+		"baseline_content": []any{map[string]any{
+			"path": "empty.md",
+		}},
+	})
+	if res.Success {
+		t.Fatal("empty content should be rejected")
+	}
+}
+
+func TestWriteSpec_BaselineContentNeedsWorkDir(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	// 非文件后端（workDir 空）→ baseline_content 不可用，明确报错而非静默。
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "高还原度复刻水果忍者游戏",
+		"acceptance": []any{"可玩"},
+		"baseline_content": []any{map[string]any{
+			"path":    "b.md",
+			"content": "content",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if res.Success {
+		t.Fatal("baseline_content without workDir should fail")
+	}
+	if !strings.Contains(res.Error, "baseline_content") {
+		t.Fatalf("error should mention baseline_content, got %q", res.Error)
+	}
+}
+
+func TestWriteSpec_MissingBaselineErrorSelfDescribing(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	store.workDir = dir
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(WithSessionID(context.Background(), "s1"), "meta-1")
+
+	res, _ := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "高还原度复刻水果忍者游戏",
+		"acceptance": []any{"可玩"},
+		"baseline":   []any{".bma/baseline/gone.md"},
+	})
+	if res.Success {
+		t.Fatal("missing baseline should be rejected")
+	}
+	// 错误自描述：附解析后绝对路径 + 指引 baseline_content。
+	if !strings.Contains(res.Error, filepath.Join(dir, ".bma", "baseline", "gone.md")) {
+		t.Fatalf("error should contain resolved absolute path, got %q", res.Error)
+	}
+	if !strings.Contains(res.Error, "baseline_content") {
+		t.Fatalf("error should point to baseline_content, got %q", res.Error)
+	}
+}

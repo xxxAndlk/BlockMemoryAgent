@@ -519,12 +519,16 @@ func keysOf(m map[string]*jsonschema.Schema) []string {
 
 // fakeSharedMemoryStore 是测试用 SharedMemoryStore 实现，内存版，无持久化。
 type fakeSharedMemoryStore struct {
-	items map[string]string
+	items   map[string]string
+	workDir string
 }
 
 func newFakeSharedMemoryStore() *fakeSharedMemoryStore {
 	return &fakeSharedMemoryStore{items: make(map[string]string)}
 }
+
+// WorkDir 模拟 FileSharedMemoryStore.WorkDir（可选接口）：空串表示非文件后端。
+func (s *fakeSharedMemoryStore) WorkDir() string { return s.workDir }
 
 func (s *fakeSharedMemoryStore) Set(ctx context.Context, key, value string) error {
 	s.items[key] = value

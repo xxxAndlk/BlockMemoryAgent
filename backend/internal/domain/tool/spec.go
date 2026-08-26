@@ -18,6 +18,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 )
@@ -110,6 +112,9 @@ type Spec struct {
 // writeSpecTool 是 WriteSpec 工具的封装。
 type writeSpecTool struct {
 	store SharedMemoryStore
+	// workDir 为工作目录（来自 FileSharedMemoryStore.WorkDir），baseline_content
+	// 内联落盘写到 <workDir>/.bma/baseline/ 下；为空时 baseline_content 报错提示不可用。
+	workDir string
 }
 
 // Name 返回工具标准名称 WriteSpec。
@@ -130,7 +135,7 @@ func (t *writeSpecTool) Description() string {
 		"UI/游戏类任务填 visual+runtime（强制截图回显与运行时探针证据），多文件集成填 integration（入口引用图探针）。" +
 		"acceptance 支持结构化条目 {text, evidence, layer}：evidence=command|screenshot|probe|file|manual，" +
 		"dispatcher 按类型逐项挂机器证据（缺证据条目标黄不计入通过数）；layer=functional|quality（quality 未过不整体标绿）。" +
-		"还原/复刻/对标类任务必须填 baseline（参照物文件路径），否则拒收。" +
+		"还原/复刻/对标类任务必须填 baseline（参照物文件路径）或 baseline_content（内联基线全文自动落盘 .bma/baseline/），否则拒收。" +
 		"例外：logs/ 与 .bma/ 目录下的文件是系统持续写入的活体文件（日志等），豁免 mtime 校验、不会导致失效。" +
 		"\n覆盖语义：同一 parent 的同一 key 写入覆盖前一次内容（不追加）。" +
 		"key 可空（默认 spec，全兄弟共享一份）；多领域任务按领域名各写一份（key=领域名，须与 call_sub_agent 的 domain 一致），" +
@@ -161,6 +166,7 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 	probes := parseStringListArg(args["probes"])
 	scenes := parseStringListArg(args["scenes"])
 	baseline := parseFilesArg(args["baseline"])
+	baselineContent := parseBaselineContentArg(args["baseline_content"])
 
 	if goal == "" {
 		return &Result{Tool: "WriteSpec", Error: "goal is required", Category: ResultCategoryValidationRejected}
@@ -176,21 +182,53 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 			return &Result{Tool: "WriteSpec", Error: msg, Category: ResultCategoryValidationRejected}
 		}
 	}
+	// baseline_content 内联落盘（防死锁，实证 2026-08-25 水果忍者：MetaAgent 工具表
+	// 无宿主写文件工具，被迫挂 computer_use 插件的 filesystem（跑在沙箱容器内、相对路径
+	// 从容器 /root/Desktop 解析），基线写进容器后宿主 fileExists 永远不见，5 连拒被
+	// loop guard 强杀）。调研结论本就在 MetaAgent 上下文里，直接内联落盘一步直达。
+	// 落盘目录强制 <workDir>/.bma/baseline/（path 仅取文件名部分，防路径逃逸），
+	// 落盘后追加进 baseline 清单参与后续存在性校验。
+	if len(baselineContent) > 0 {
+		if t.workDir == "" {
+			return &Result{Tool: "WriteSpec", Error: "baseline_content 需要文件后端共享记忆存储（当前 store 未提供工作目录），请改用 baseline 字段引用已落盘文件", Category: ResultCategoryValidationRejected}
+		}
+		for _, bc := range baselineContent {
+			if strings.TrimSpace(bc.Content) == "" {
+				return &Result{Tool: "WriteSpec", Error: "baseline_content 项 " + bc.Path + " 的 content 为空", Category: ResultCategoryValidationRejected}
+			}
+		}
+		rel, err := writeBaselineFiles(t.workDir, baselineContent)
+		if err != nil {
+			return &Result{Tool: "WriteSpec", Error: err.Error(), Category: ResultCategoryValidationRejected}
+		}
+		baseline = append(baseline, rel...)
+	}
 	// 对标基线强制（TODO #75）：goal/acceptance 命中还原类关键词且 baseline 空 → 拒收。
 	// "还原度不可验收 = 需求未定义完"，先准备基线（用户供图/网络下载/先派分析任务）。
-	if len(baseline) == 0 && HasFidelityKeyword(goal, strings.Join(acceptance, " ")) {
-		return &Result{Tool: "WriteSpec", Error: "goal/acceptance 命中还原/复刻/对标类诉求但 baseline 为空：还原度不可验收 = 需求未定义完。请先准备对标基线（参考截图/数值表/帧分析文件路径，落 workspace 可核），写入 baseline 字段后重写 spec", Category: ResultCategoryValidationRejected}
+	// baseline_content 计入非空判定（其随后落盘并入 baseline 清单）。
+	if len(baseline) == 0 && len(baselineContent) == 0 && HasFidelityKeyword(goal, strings.Join(acceptance, " ")) {
+		return &Result{Tool: "WriteSpec", Error: "goal/acceptance 命中还原/复刻/对标类诉求但 baseline 为空：还原度不可验收 = 需求未定义完。请先准备对标基线（参考截图/数值表/帧分析文件路径，落 workspace 可核），写入 baseline 字段；或把基线全文内联进 baseline_content=[{path,content}]（本工具自动落盘 .bma/baseline/）", Category: ResultCategoryValidationRejected}
 	}
 	// baseline 引用文件存在性校验（TODO #75）：基线是验收依据，路径不存在=对照无从谈起。
+	// 错误自描述（防死亡螺旋，实证 2026-08-25：MetaAgent 用沙箱容器内的 filesystem
+	// 工具落盘基线，宿主不可见，盲试 4 种路径写法全拒）：附解析后的绝对路径与校验
+	// 基准目录，并指引 baseline_content 内联落盘——一次重试可解，不进 loop guard。
+	// 相对路径按 workDir 解析（与 baseline_content 落盘目录同源；workDir 空回退进程 cwd）。
 	if len(baseline) > 0 {
 		var missing []string
 		for _, p := range baseline {
-			if !fileExists(p) {
-				missing = append(missing, p)
+			rp := strings.TrimSpace(p)
+			if t.workDir != "" && !filepath.IsAbs(rp) {
+				rp = filepath.Join(t.workDir, rp)
+			}
+			if _, err := os.Stat(rp); err != nil {
+				missing = append(missing, p+"（解析为 "+rp+"）")
 			}
 		}
 		if len(missing) > 0 {
-			return &Result{Tool: "WriteSpec", Error: "baseline 引用文件不存在: " + strings.Join(missing, ", ") + "。基线是品质层验收的对照依据，请先落盘再写 spec", Category: ResultCategoryValidationRejected}
+			return &Result{Tool: "WriteSpec", Error: "baseline 引用文件不存在: " + strings.Join(missing, ", ") +
+				"。校验以宿主工作目录为基准（插件 filesystem/scrape 等工具写的是沙箱容器文件系统，宿主不可见，换路径写法无用）。" +
+				"调研结论在上下文里时直接用 baseline_content=[{path,content}] 内联落盘（本工具自动写入 .bma/baseline/），一步到位", Category: ResultCategoryValidationRejected}
 		}
 	}
 
@@ -316,6 +354,10 @@ type writeSpecInput struct {
 	Scenes []string `json:"scenes" description:"场景化截图清单（verify_levels 含 visual 时填写）：UI/游戏类任务须覆盖的场景名列表（如 主菜单/游玩中/切割瞬间/结算页）。dispatcher 按截图内容哈希去重后核对覆盖数，同图连拍充数无效。"`
 	// Baseline 对标基线产物清单（TODO #75）：还原/复刻/对标类任务必填。
 	Baseline []string `json:"baseline" description:"对标基线产物清单（还原/复刻/仿制/对标类任务必填）：参照物文件路径列表（参考截图/数值表/帧分析文件，须已落盘可核）。goal 命中还原类诉求且为空时拒收——还原度不可验收=需求未定义完。"`
+	// BaselineContent 内联基线内容（TODO 防死锁）：基线尚未落盘时直接内联全文，
+	// 本工具自动写入 <workDir>/.bma/baseline/<path> 再纳入 baseline 校验。
+	// 用于 MetaAgent 无宿主写文件工具的场景（插件 filesystem 写入沙箱容器宿主不可见）。
+	BaselineContent []BaselineContentItem `json:"baseline_content" description:"内联基线内容清单（基线尚未落盘时用）：[{path, content}]，path 仅取文件名部分（强制写入 .bma/baseline/ 目录），content 为基线全文。本工具先落盘再校验存在性——调研结论直接内联，不要用插件 filesystem 工具落盘（其写沙箱容器文件系统，宿主不可见）。与 baseline 字段可同时使用：baseline 引已落盘文件，baseline_content 内联新内容。"`
 }
 
 // parseStringListArg 从 args[key] 提取字符串列表，兼容 []any / []string / 缺省。
@@ -369,6 +411,61 @@ func parseContractArg(v any) *Contract {
 	default:
 		return nil
 	}
+}
+
+// BaselineContentItem 是 baseline_content 的内联基线条目：Path 为文件名（仅取
+// path.Base 部分，目录强制 .bma/baseline/，防路径逃逸），Content 为基线全文。
+type BaselineContentItem struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// parseBaselineContentArg 从 args["baseline_content"] 提取内联基线条目。
+// 兼容 []any(map) / 缺省；path 为空或非字符串项跳过（由后续校验报错）。
+func parseBaselineContentArg(v any) []BaselineContentItem {
+	items, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]BaselineContentItem, 0, len(items))
+	for _, it := range items {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		bc := BaselineContentItem{}
+		bc.Path, _ = m["path"].(string)
+		bc.Content, _ = m["content"].(string)
+		out = append(out, bc)
+	}
+	return out
+}
+
+// writeBaselineFiles 把内联基线内容写到 <workDir>/.bma/baseline/<name>，
+// 返回写入的相对路径清单（供追加进 baseline 字段）。path 只取文件名部分，
+// 同名覆盖（重写 spec 幂等）。
+func writeBaselineFiles(workDir string, items []BaselineContentItem) ([]string, error) {
+	root := filepath.Join(workDir, ".bma", "baseline")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, fmt.Errorf("创建基线目录失败: %w", err)
+	}
+	var rel []string
+	for _, bc := range items {
+		name := strings.TrimSpace(bc.Path)
+		if name == "" {
+			return nil, fmt.Errorf("baseline_content 项 path 为空")
+		}
+		name = filepath.Base(filepath.FromSlash(name))
+		if name == "." || name == ".." || name == string(filepath.Separator) {
+			return nil, fmt.Errorf("baseline_content 项 path %q 不是合法文件名", bc.Path)
+		}
+		dst := filepath.Join(root, name)
+		if err := os.WriteFile(dst, []byte(bc.Content), 0o644); err != nil {
+			return nil, fmt.Errorf("基线落盘失败 %s: %w", dst, err)
+		}
+		rel = append(rel, filepath.ToSlash(filepath.Join(".bma", "baseline", name)))
+	}
+	return rel, nil
 }
 
 // truncateRunesForLog 按 rune 数截断字符串并追加省略号，用于日志输出。
@@ -463,12 +560,6 @@ func ParseAcceptanceLine(line string) (text, evidence, layer string) {
 		evidence = tag
 	}
 	return text, strings.TrimSpace(evidence), strings.TrimSpace(layer)
-}
-
-// fileExists 判断文件存在（非目录）。相对路径按进程 cwd 解析（与 statFile 同语义）。
-func fileExists(p string) bool {
-	_, _, ok := statFile(p)
-	return ok
 }
 
 // fidelityKeywords 触发 baseline 强制（TODO #75）：还原/仿制/复刻/对标类诉求。

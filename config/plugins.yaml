@@ -75,6 +75,10 @@ plugins:
       ports: ["6081:6081"]
       destructive: true
       roles: ["meta"]
+      # 全工具描述尾部追加沙箱边界警告（实证 2026-08-25 水果忍者：MetaAgent 用
+      # filesystem 落盘基线，实际写入沙箱容器 /root/Desktop/... 宿主不可见，WriteSpec
+      # 基线校验 5 连拒被 loop guard 强杀）。文件系统边界必须明示，防模型再走此路。
+      tool_description_suffix: "注意：本工具运行在隔离沙箱容器内（Docker Xvfb），文件系统与宿主工作目录不通——相对路径从容器 Desktop 解析，写文件宿主不可见。不得用于落盘任务产物/基线/项目文件，基线落盘用 WriteSpec 的 baseline_content 参数。"
       # 宿主机直起（备选，AI 直接操作真机，仅调试用）：
       # transport: stdio
       # command: npx

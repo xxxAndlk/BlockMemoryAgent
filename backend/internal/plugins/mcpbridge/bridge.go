@@ -50,6 +50,9 @@ type Settings struct {
 	URL string
 	// Destructive 为 true 时全部远端工具标记 Destructive()，接入审批守卫链。
 	Destructive bool
+	// ToolDescriptionSuffix 附加到每个远端工具描述尾部（plugins.yaml tool_description_suffix）。
+	// 用于沙箱类插件提示模型文件系统边界（如 computer_use 容器内写文件宿主不可见）。
+	ToolDescriptionSuffix string
 	// ImagePassthrough 为 true 时，远端工具返回的 image content 不再只留文本占位符，
 	// 而是随 tool.Result.Images 内存透传给多模态模型（视觉回显闭环）。
 	// 缺省 false：文本模型（glm-5.3 等）收到 image block 会被端点 400 拒绝，
@@ -110,6 +113,9 @@ func FromSettings(settings map[string]any) Settings {
 	}
 	if v, ok := settings["destructive"].(bool); ok {
 		s.Destructive = v
+	}
+	if v, ok := settings["tool_description_suffix"].(string); ok {
+		s.ToolDescriptionSuffix = v
 	}
 	if v, ok := settings["image_passthrough"].(bool); ok {
 		s.ImagePassthrough = v

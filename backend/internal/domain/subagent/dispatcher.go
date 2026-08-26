@@ -1361,16 +1361,21 @@ func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode, ve
 // checkSpecBeforeDispatch 做 WriteSpec 强制校验：SpecEnforcementEnabled 开启时，
 // 派发前必须先 WriteSpec（校验 parentID:spec 存在、新鲜、Spec.Goal 非空且至少一条 Acceptance）。
 // domain 非空时校验该领域专属 spec（TODO #65 多 key 化），缺失回退遗留单键。
-// 返回空串表示通过，否则为错误文案。批量派发（call_sub_agents）对有 domain 的项逐领域
-// 调用本函数校验（任一失败整批拒），无 domain 项回退遗留单键一次校验（TODO #65）。
-func (d *Dispatcher) checkSpecBeforeDispatch(ctx context.Context, parentID, domain string) string {
+// 返回 (错误文案, 警告文案)：错误非空=拒绝派发；警告非空=放行附提示（唯一候选回退等）。
+// 批量派发（call_sub_agents）对有 domain 的项逐领域调用本函数校验（任一失败整批拒），
+// 无 domain 项回退遗留单键一次校验（TODO #65）。
+func (d *Dispatcher) checkSpecBeforeDispatch(ctx context.Context, parentID, domain string) (string, string) {
 	if !d.specEnforcementEnabled {
-		return ""
+		return "", ""
 	}
-	if ok, reason := d.hasFreshSpec(ctx, parentID, domain); !ok {
-		return reason + " 先调 WriteSpec(goal, acceptance, constraints, files) 写任务规范，再派发"
+	ok, reason := d.hasFreshSpec(ctx, parentID, domain)
+	if !ok {
+		return reason + " 先调 WriteSpec(goal, acceptance, constraints, files) 写任务规范，再派发", ""
 	}
-	return ""
+	if reason != "" {
+		return "", reason
+	}
+	return "", ""
 }
 
 // Execute 执行 call_sub_agent 工具调用。
@@ -1413,8 +1418,9 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	if parentID == "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: "missing parent agent context"}
 	}
-	if msg := d.checkSpecBeforeDispatch(ctx, parentID, domain); msg != "" {
-		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
+	specMsg, specWarn := d.checkSpecBeforeDispatch(ctx, parentID, domain)
+	if specMsg != "" {
+		return &tool.Result{Tool: "call_sub_agent", Error: specMsg, Category: tool.ResultCategoryValidationRejected}
 	}
 
 	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, wallClock, reuseAgentID, takeover)
@@ -1427,8 +1433,15 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		out += fmt.Sprintf("（已接管旧领域 %q 的未完成看板条目并留痕）", takeover)
 	}
 	// task 轻微超限软着陆警告（TODO #38-3）：放行但提示下次压缩。
+	var warns []string
 	if warning != "" {
-		out += "。警告: " + warning
+		warns = append(warns, warning)
+	}
+	if specWarn != "" {
+		warns = append(warns, specWarn)
+	}
+	if len(warns) > 0 {
+		out += "。警告: " + strings.Join(warns, "；")
 	}
 	return &tool.Result{Tool: "call_sub_agent", Success: true, Output: out}
 }
@@ -1865,13 +1878,17 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 			continue
 		}
 		anyDomain = true
-		if msg := d.checkSpecBeforeDispatch(ctx, parentID, it.domain); msg != "" {
+		if msg, warn := d.checkSpecBeforeDispatch(ctx, parentID, it.domain); msg != "" {
 			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("domain %q: %s", it.domain, msg), Category: tool.ResultCategoryValidationRejected}
+		} else if warn != "" {
+			batchWarnings = append(batchWarnings, fmt.Sprintf("domain %q: %s", it.domain, warn))
 		}
 	}
 	if !anyDomain {
-		if msg := d.checkSpecBeforeDispatch(ctx, parentID, ""); msg != "" {
+		if msg, warn := d.checkSpecBeforeDispatch(ctx, parentID, ""); msg != "" {
 			return &tool.Result{Tool: "call_sub_agents", Error: msg, Category: tool.ResultCategoryValidationRejected}
+		} else if warn != "" {
+			batchWarnings = append(batchWarnings, warn)
 		}
 	}
 
@@ -3359,8 +3376,9 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain str
 // Acceptance + files mtime 一致）。供 callSubAgentTool.Execute 在 SpecEnforcementEnabled
 // 开启时调用，缺失则拒绝派发。domain 非空时校验该领域专属 spec（TODO #65 多 key 化），
 // 缺失则回退遗留单键；domain 空只校验单键。
-// 返回 (通过, 失败原因文案)：失败时区分 missing（未写）/ invalid（内容不合法）/ stale（文件已变更），
+// 返回 (通过, 原因文案)：失败时区分 missing（未写）/ invalid（内容不合法）/ stale（文件已变更），
 // stale 精确列出失配文件路径，让 LLM 定向修正（重写被改文件或剔除无关文件）而非盲猜重写整个 spec。
+// 通过且原因非空 = 唯一候选回退附警告（key/domain 错配放行，模型应对齐）。
 // TODO #74 诊断精确化：missing 时列出该 parent 全部现存 spec key（key/domain 错配一眼可见）；
 // 该 parent 下仅存在一个 keyed spec 时做唯一候选回退（WriteSpec key 自由命名与派发 domain
 // 不匹配的真因兜底——实证 2026-08-25：key=fruit-game-spec vs domain=fruit-game 双双被拒）。
@@ -3381,7 +3399,7 @@ func (d *Dispatcher) hasFreshSpec(ctx context.Context, parentID, domain string) 
 		// 按该唯一候选校验并在通过时附警告——自由命名的 key 与 domain 错配不再双双报错。
 		if keys := d.specKeysOfParent(ctx, parentID); len(keys) == 1 {
 			if altOK, _ := d.checkSpecKey(ctx, keys[0]); altOK {
-				return true, ""
+				return true, fmt.Sprintf("spec key %q 与 domain %q 不一致，已按唯一候选放行——后续 WriteSpec 的 key 请与 call_sub_agent 的 domain 对齐", keys[0], strings.TrimSpace(domain))
 			}
 		}
 	}
