@@ -520,7 +520,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.chatPanel.vp.Width = m.chatContentWidth()
-		m.chatPanel.vp.Height = m.mainContentHeight()
+		m.syncChatBodyHeight()
 		m.rebuildChatContent()
 		if m.chatPanel.followBottom {
 			m.chatPanel.vp.GotoBottom()
@@ -587,6 +587,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // refreshView 是 tickMsg 驱动的视图刷新逻辑（streamEventMsg 只置 dirty 标记，由 tick 合并触发）：
 // 待处理会话选中、滚动到用户消息、重建对话内容、刷新弹窗。
 func (m *Model) refreshView() {
+	// 目标栏随首条消息/会话切换/看板目标出现或消失，先于下方一切滚动计算
+	// 同步持久化的对话体高度，否则滚动偏移上限按过期高度钳制。
+	m.syncChatBodyHeight()
 	// 消费后台 createSession 写入的 pendingSelectID：在主循环内 refresh+select
 	// 避免后台 goroutine 直接改 m.sessions/cursor 与 View 产生 race（T2 修复；
 	// #47 修复：经 sharedState 指针共享，写入不再落到废弃的 Model 副本上）

@@ -636,6 +636,25 @@ func (m Model) renderChat(w, h int) string {
 	return m.chatPanel.renderChat(w, h, m.styles, s, m.chatPanel.lastItems > 0, m.modelName, m.workDir, m.currentGoalText())
 }
 
+// syncChatBodyHeight 把 Update 路径持久化的 vp.Height/goalBarH 与 renderChat 的
+// 渲染口径对齐：目标栏常驻时对话体高度须少 1 行。renderChat 内对 cp.vp.Height/
+// cp.goalBarH 的修正在 View 值接收者链上落在每帧副本里被丢弃，若 Update 路径不按
+// 同一口径维护，持久 vp.Height 会比实际渲染高度多 1 行——GotoBottom/SetYOffset 的
+// 偏移上限因此差 1 行，对话内容最后一行永远渲染不到、也滚动不到
+// （实证：长答复末尾半句被截，PgDn/End 均无法到达）。
+func (m *Model) syncChatBodyHeight() {
+	goalH := 0
+	if m.selectedSession() != nil && strings.TrimSpace(m.currentGoalText()) != "" {
+		goalH = 1
+	}
+	m.chatPanel.goalBarH = goalH
+	bodyH := m.mainContentHeight() - goalH
+	if bodyH < 1 {
+		bodyH = 1
+	}
+	m.chatPanel.vp.Height = bodyH
+}
+
 // currentGoalText 返回当前会话的主任务目标（TODO #48 子项 3）：
 // 优先任务看板 Goal（write_plan 首行），回退最后一条用户消息，再回退会话 Goal。
 // 空会话返回空串（不渲染目标栏）。
