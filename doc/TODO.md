@@ -200,7 +200,78 @@
       - `roles.yaml`：meta_agent【派发铁律】加美术路线决策条（spec 显式钉死纯程序化/混合；现状 ≠ 约束；贴图路线声明资源加载层改动）+【整品验收】加先截图再判 UI；domain_agent【工作模式】加第 6 条绘制类改动禁止盲写（ui_preview 截图回显看图迭代 + 素材优先 od_image_generate）。
       - 验证：`config`/`plugins`/`mcpbridge` 全量测试绿（纯配置变更零代码路径）。开放验收待真机：重启/`POST /api/plugins/reload` 后重跑塔防 UI 增强任务，看 spec 美术路线 + browser_take_screenshot 实调 + 墙钟对比 90 分钟基线。
 
+56. **域完成机器校验（冒烟层）：dispatcher 自动跑语法/编译检查 + 【机器校验】证据段入完成摘要**（P0，校验三层方案第一层，先做）  ← 来源：2026-08-24 讨论——commit `95e024e` 已把整品验收切出默认流程（仅改 `config/roles.yaml` meta_agent 文案："不派验证类任务"），但当日 Fruit Fury 任务（`workspace/logs/tui/2026-08-24.log` ~17:13）meta 仍派发了只读集成验证 domain（goal="验证 Fruit Fury 三域代码的跨文件集成点一致性（只读检查，不修改）"）。根因：prompt 纪律是软约束——meta 自身被禁止读文件，要核对跨文件集成点只能派领域；dispatcher 侧无代码闸拦截（`isVerificationTask` 已在 ce43288 删除，仅 `dispatcher.go:1821` 残留注释）。困境：单独派验证领域白烧时间/token；领域自报"已 node --check 全绿"又无法证实是否真执行。
+    - 设计（机器代跑校验，零 LLM 调用，证据可归因）：
+      1. dispatcher 在子 Agent 完成收尾路径（`runSubAgent` 成功分支，`backend/internal/domain/subagent/dispatcher.go` ~1816-1821 附近）对 `spec.files` 中可校验文件自动派生并执行冒烟命令：`.js` → `node --check`；可扩展 `.go` → `gofmt -l`、`ts` → `tsc --noEmit`（按 workspace 可得工具链探测降级，无工具则跳过并标注）。毫秒级，零 meta 参与。
+      2. 结果以【机器校验】段（命令 + 退出码 + 输出尾部 + "dispatcher 执行，非 agent 自述"标注）追加进完成摘要/mailbox/boardUpdate——meta 与上级 domain 拿到的证据天然可信，解决"不知道是否执行了"。
+      3. 失败走既有 `verify_kind` 反馈重试通道打回责任 domain（复用 #43 校验分层路由，不新建通路）；重试耗尽按现有失败分级上抛。
+    - 执行流程：dispatcher 完成路径加 `runSmokeChecks(spec.files)`（命令派生表 + 超时 + 输出截断）→ 结果拼进完成摘要 → 失败接 verify_kind 反馈 → `config/roles.yaml` domain_agent 文案同步（自证要求降级为"补充说明"，机器校验为准）。
+    - 测试：单测——多文件派生命令正确、node 不存在时降级跳过、失败输出截断、失败触发 verify_kind 打回而非直接判死；集成测——mock 域写两 js（一语法错）→ 完成摘要含【机器校验】两段、错文件触发打回。
+    - 验收：重跑 Fruit Fury/塔防类多域任务，meta 交付验收全程不派验证类 domain；完成摘要每条带 dispatcher 执行的【机器校验】段；故意植入语法错误时域被打回自修。
+    - 不做：不做运行时/浏览器级验证（归 #58 例外通道）；不做语义正确性判断；不恢复 verifyloop 派验证 Agent（负资产结论不变）；不动 #43 L0/L2 分层与 #54 judge 降级。
+    - 落地（任务 86，2026-08-24，详见 `doc/变更.md`）：
+      - `subagent/smoke_check.go` 新增：扩展名→冒烟命令派生表（.js→`node --check`、.go→`gofmt -l`（输出非空=未格式化判失败）、.ts→`tsc --noEmit`），工具链 LookPath 探测降级（缺失跳过并标注），30s 超时 + 输出尾部 2000 rune 截断；命令执行器可注入（测试不依赖机器工具链）。
+      - 校验对象收敛为 spec.files ∩ 本子 Agent 实际写入文件（偏离原文"spec.files 全量"：并行兄弟域中途写入共享文件时先完成方不被误打回，责任归属精确）。spec.files 全量清单经 WriteSpec frontmatter 新字段 `file_list` 保留（stat 失败的待创建文件也在列，冒烟检查在文件创建后仍能定位）。
+      - `runSubAgentOnce` 成功路径挂冒烟：失败反馈重试 1 轮（复用 L0 反馈通道）→ 仍失败 `errSmokeFailed` → 新 FailureKind `smoke_failed` 打回父（不判死，复用 #43 路由）；通过时 `result.MachineCheck` 段追加进完成摘要（标注"dispatcher 自动执行（非 agent 自述）"）。
+      - 测试：`smoke_check_test.go` 6 单测（派生/降级/截断/gofmt 语义/目标收敛/消息格式）+ `dispatcher_smoke_test.go` 3 集成测（错文件打回 smoke_failed / 全绿摘要含【机器校验】段 / 范围外写入跳过）。`agent`/`subagent`/`tool` 全量绿。
+      - 观察点：真机多域任务完成摘要【机器校验】段生成率；部署环境 node/gofmt 工具链存在性（缺失时静默跳过，段内标注）。
+
+57. **跨域契约静态校验：WriteSpec 加 contract 字段 + 兄弟域全完成后 dispatcher 跑契约检查器**（P1，校验三层方案第二层）  ← 来源：同上 2026-08-24 讨论——解决"所有领域完成后怎么校验各领域之间是否正确引用、是否协调"，且不再靠派一个验证 domain 去读所有文件。
+    - 设计（契约前置显式化 + 静态检查，零 LLM）：
+      1. WriteSpec 加结构化 `contract` JSON 字段（meta 派发时显式钉死）：跨域符号映射（symbol → 所在 file，如 `GameEngine.init` → `js/engine.js`）、DOM id 清单、script 加载顺序、跨域函数签名。契约即派发时的"引用协议"，从隐含约定变显式数据。
+      2. dispatcher 在父节点下全部兄弟 domain 完成时跑静态契约检查器（regex/文本解析，不调 LLM）：契约符号在声明文件中存在、引用方文件含引用点、DOM id 在 HTML 中声明、script 顺序与契约一致。
+      3. 失败按契约条目归属批量打回责任 domain（一次消息列全部违例，避免逐条往返）；通过结果同样以【机器校验】段入摘要供 meta 纸面对照。
+    - 执行流程：WriteSpec 工具 schema 加 `contract` 字段 + 校验 → dispatcher 记录兄弟域完成集合 → 全完成触发 `runContractChecks(contracts, files)` → 违例按域分组走 verify_kind 打回。
+    - 测试：单测——符号缺失/DOM id 未声明/script 顺序颠倒三类违例检出、契约为空时跳过、违例正确归属责任域；集成测——三域 mock 任务（HTML/引擎/逻辑）契约全过与缺符号打回两分支。
+    - 验收：多域前端任务全完成后 dispatcher 输出跨域契约【机器校验】段；人为制造跨域引用错误（改一域函数名不改引用方）被检出并打回正确责任域。
+    - 不做：不做真运行时集成测试（契约只保证静态一致性，语义协调仍靠例外通道）；不强制所有 spec 填 contract（单域/无跨域引用任务可空）；不做 AST 级精确解析（regex 够用，漏报优于复杂化）。
+    - 落地（任务 87，2026-08-24，详见 `doc/变更.md`）：
+      - `tool/contract.go` 新增四类契约条目（Symbols/DOMIDs/Scripts/Signatures）；`WriteSpec` 加 contract 字段（schema + map 入参 JSON 往返解析 + frontmatter yaml + body 人读段），空契约合法。
+      - `subagent/contract_check.go` 静态检查器：符号匹配支持声明形态（`var GameEngine = { init: ... }` 逐段词边界匹配，非 AST）；DOM id 正则；script 顺序按 HTML 实际出现序核对；签名字面包含；文件缺失直接违例。违例按文件归属分组，一次消息列全部违例。
+      - 触发点 `trackChildDone`：父 pending 归零（全部兄弟完成）→ 异步跑契约检查（归零后新一波派发已开始时跳过）→ mailbox 通知父：违例=`contract_violation` marker + 分组清单，通过=【机器校验】段。
+      - spec 捕获：派发时 `recordParentSpec` 缓存 files+contract 进 `parentSpecs`（spec 会被 Layer 2 失效删除，完成时读不到——缓存是前提，会话级内存不持久化）。
+      - 测试：`contract_check_test.go` 8 单测（五类违例/空契约跳过/违例分组/全过）+ 集成测（pending 归零触发打回与通过两分支）；`tool` 侧 contract 往返 + file_list 保留 2 测。全量绿。
+
+58. **meta 验收口径改纸面信任【机器校验】+ 集成验证收敛为显式例外通道**（P1，校验三层方案第三层，prompt 侧）  ← 来源：同上——`95e024e` 只改文案未改信任结构，meta 手上无客观证据时"要验收只能派验证域"的结构性动机仍在（8-24 日志实证）。
+    - 设计：
+      1. `config/roles.yaml` meta_agent【交付验收】口径改：验收只信两类证据——【机器校验】段（dispatcher 执行）与 spec 验收标准纸面对照；子 Agent 自述"已测试通过/已 node --check"不计分。
+      2. 重度验证（浏览器截图/ui_preview/真跑页面）保留为显式例外：meta 须在派发时声明理由（如 UI 视觉类 #55 场景），走保留的【集成验证任务模式】（`config/roles.yaml:165`）派发；默认不走。例外通道是"接入口"语义的正身，与 `95e024e` 决策不冲突。
+      3. 兜底口径：spec 有可执行验收标准但摘要缺【机器校验】段 → 标"未验证"打回责任域补跑（走 #56 通道），而非派验证域代劳。
+    - 执行流程：roles.yaml meta_agent 交付验收段改写（信任清单 + 例外声明格式 + 兜底口径）；domain_agent 侧同步"自述不计分"预期。
+    - 测试：配置加载测试绿（纯 prompt 变更）；复盘点——重放 8-24 Fruit Fury 会话上下文，新 prompt 下 meta 不再生成验证类 call_sub_agent。
+    - 验收：多域任务全程零验证类派发（日志 grep 佐证）；UI 视觉类任务 meta 仍能显式走例外通道截图验收。
+    - 依赖：#56 落地后才有【机器校验】段可信，本项的信任清单才完整；#56 之前先落"自述不计分"半量口径亦可。
+    - 不做：不删【集成验证任务模式】保留段（例外通道）；不引入代码闸硬拦验证类派发（除非 prompt 层再失效，届时单列项）。
+    - 落地（任务 88，2026-08-24，详见 `doc/变更.md`）：
+      - `roles.yaml` meta_agent【交付验收】改写：验收只信两类证据（【机器校验】段 + spec acceptance 纸面对照），子 Agent 自述"已测试通过/已 node --check"不计分；兜底口径（spec 有验收标准但摘要缺【机器校验】段 → 判"未验证"打回责任域补跑，不派验证域代劳）；重度验证收敛为显式例外通道（派发时声明理由走 domain【集成验证任务模式】，默认不走）。
+      - meta【派发铁律】加 WriteSpec contract 字段纪律（与 WriteSharedMemory 契约同一协议两种载体：前者机器校验、后者注入人读）。
+      - domain_agent 同步：收尾验收自述降级为"建设期自查"，交付证据以 dispatcher【机器校验】为准；【集成验证任务模式】标注为例外通道入口（meta 派发时显式声明理由才启用）。
+      - 测试：`config`/`role` 加载测试绿（纯 prompt 变更零代码路径）。真机验收：重跑多域任务看零验证类派发 + 摘要含【机器校验】段（待观察）。
+
 ## 已完成（已归档到 git 历史）
+
+- **2026-08-25 落地 #67-76（任务 97-106，详见 `doc/变更.md`）——2026-08-25 水果忍者复原任务失败复盘十项**：
+  - #67 runtime 实装：`Spec.Probes` + `agent.HasRuntimeProbeEvidence`（navigate+evaluate 成功 + console 回读无 error/severe）+ dispatcher runtime 分支（缺证据重试 1 轮 → delivered-unverified 黄态）；roles.yaml UI/游戏/交互类 runtime 从建议改必须。
+  - #68 acceptance 结构化：`AcceptanceItem{text, evidence, layer}` 行内标记串编码（`Acceptance []string` 类型不变零破坏兼容）+ dispatcher `scoreAcceptance` 逐项计分（command/screenshot/probe/file 分派证据扫描，N/M 由 dispatcher 计算写入【机器校验】段，meta 只读不自算）。
+  - #69 场景化截图：`Spec.Scenes` + `HasSceneEvidence`（shotFingerprint 内容去重，同图连拍计 1；navigate/evaluate→screenshot 时序邻接）+ `visualEvidenceCheck` 场景清单驱动判定。
+  - #70 契约健壮化：`ValidateContractShape` 写时拦截全角/CJK 散文签名 + `signatureMatched` 行注释剥离重试 + `violationFingerprint` 会话级去重（首报打回/复验升级文案/全已知零打回）。
+  - #71 JS 引用完整性：冒烟层第三档 `runJSRefChecks`——>300 行 .js/.html（含内联 script 提取）首选 `tsc --allowJs --checkJs` 硬判，无 tsc 回退正则轻量扫描只标存疑。
+  - #72 循环守卫：WriteFile/EditFile 成功清零该路径连读计数（确认性复读放行）+ 长文件（>500 行）阈值 3→6 + 失败路径【遗产清单】段（成功写入清单 cap 30 + 看板在办步骤 + "可直接作为续建 spec 骨架素材"）。
+  - #73 看板接力：`TakeoverFrom` 失败条目迁移留痕（"曾失败，由 X 接力完成"，Done 不迁）+ `call_sub_agent` takeover 参数 + Brief【接管提示】。
+  - #74 spec 诊断：spec 槽位失效改 tombstone（`invalidated: ` 前缀，区分"被失效"与"从未写"）+ missing 报错列已有 spec key 清单 + 唯一 keyed spec 候选回退。
+  - #75 baseline 强制：`Spec.Baseline` + `HasFidelityKeyword`（还原/复刻/仿制/对标等）→ 还原类需求无基线 WriteSpec 拒收 + 基线文件存在性校验 + acceptance layer: functional/quality 分层计分（quality 缺失不标绿）。
+  - #76 meta 硬约束：domain 完成摘要缺【未验证项】段追加警告入【机器校验】（可观测不硬拒）+ `bumpDispatchGeneration` 派发代数（takeover 链贯通）：第 3 代注入【重写评估】强制段、第 4 代无【接力理由】拒派。
+  - 观察点：runtime 探针证据覆盖率、同图连拍黄态出现频率、假违例推送复发（应趋零）、确认性复读误杀消失、接力熔断第 3 代出现率。
+- **2026-08-25 落地 #59-66（任务 89-96，详见 `doc/变更.md`）——2026-08-24 高防植物大战僵尸复盘八项**：
+  - #59 验收分层模板：`Spec.VerifyLevels`（existence/static/integration/runtime/visual），WriteSpec schema + frontmatter；dispatcher 集成层探针（`subagent/integration_check.go`：HTML script src 解析 + 入口 import 引用图 + 空壳提示）与视觉层证据强制（`agent.HasScreenshotEvidence`，缺截图 → `errVisualEvidenceMissing` → delivered-unverified 黄态）；roles.yaml 派发铁律/交付验收绑定任务类型强制层级。
+  - #60 状态三态化：`orchestrator.StatusUnverified`（delivered-unverified）+ `Tree.FinishUnverified`；`board.TaskUnverified`/`BoardStatusDelivered` + `MarkUnverified`；dispatcher 失败路径按 kind 分流（verify_missing/unverified → 黄态，真失败仍红）；TUI `RoleStatusUnverified` 标黄。
+  - #61 桩挂名：`ContractSymbol.Stub/Owner`；契约检查第 5 段孤儿桩检查（声明文件仍含占位标记即打回 owner）；派发铁律补桩纪律。
+  - #62 契约语义化：`symbolFound` 末段大小写不敏感（属性访问路径）+ 非末段敏感；签名空白归一 + .ts 文件 tsc 编译仲裁（编译过 → "存疑"降级先质疑契约）；变更屏障（`recMtimesMatch`，capture 后文件变则跳过）。
+  - #63 证据模板同源：`verificationCommandPatterns` 提取 + 扩词表（noemit/tsc /vite /npm run 等）；`VerificationEvidenceTemplate()` 同源注入任务尾部 + L0 重试消息。
+  - #64 happy-path：`HasFallbackKeyword` + `HappyPathAcceptance` 自动追加（WriteSpec 检测降级/兜底关键词）。
+  - #65 多 key spec：WriteSpec `key` 参数 → `<parentID>:spec:<domain>`；dispatcher `specKeyFor`/`parentSpecs` 按 (parent, domain) 键、`hasFreshSpec`/`buildSharedPrefix` 领域定向 + 遗留单键回退；顺手修 spec.go 预算文案 2000→3000/4000。
+  - #66 meta 收尾集成验证默认化：交付验收 A 段并入集成层/视觉层机器校验 + 分层绑定；顺手修 roles.yaml isVerificationTask 漂移文案。
+  - 观察点：verify_missing 复发率（应趋零）、契约误报率（tsc 仲裁后）、UI/游戏任务未验证黄态出现频率、多 key spec 隔离后兄弟互伤。
 
 - **评测体系落地 + 首次基线**（2026-08-14）：`test/eval/`（build tag `eval`）真实 LLM 任务完成率评测——场景 YAML + checkpoint 判分（command/file/regex/tree/llm_judge）+ token/子Agent 指标聚合 + TheAgentCompany 式全量/部分分报告（`test/eval/runs/`）；环境隔离修复：`docker/docker-compose.test.yml` 独立端口（PG 55432/Redis 56380）+ 无固定容器名，fixture 维度对齐 migrations（768）。首基线 12 场景 full pass 91.7%、加权 0.979，详见 `doc/eval/baseline_2026-08-14.md`。后续加固（同日）：fixture 改"共享容器常驻 + 每测试独立 PG database/Redis 逻辑库"（Redis 开 1024 逻辑库），并行包 `go test ./...` 不再互相拆台；`TestFactExtractionFallback` 序列对齐现行后端（verify_kind 校验分层 + 派发后不阻塞）。开放项：verifyloop 场景判分口径修正（自动验证闭环已下线，改测 verify_kind 证据）、EVAL_RUNS=3 可靠性、SWE-bench 20 题切片（Phase 2）。
 - ReAct 主循环骨架（`internal/agent/react_agent.go`）

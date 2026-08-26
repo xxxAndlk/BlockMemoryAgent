@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
@@ -602,7 +603,7 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 			// 用户软停止：SaveMessages 安全网 + 转 Idle（可续跑可复用）。
 			d.saveSlotMessages(s, result.History)
 			partial := truncateRunes(agent.LastAssistantText(result.History), 500)
-			d.boardUpdate(taskCtx, s.parentID, s.domain, false, truncateRunes(partial, 300))
+			d.boardUpdate(taskCtx, s.parentID, s.domain, board.TaskFailed, truncateRunes(partial, 300))
 			d.notify(s.parentID, s.id, "子 Agent 已被用户停止，当前任务中断；成果已保留，热驻待复用。\n"+partial, files)
 			d.trackChildDone(s.parentID)
 			d.enterIdle(s, "user stop: "+partial)
@@ -625,8 +626,15 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 		if salvage != "" {
 			msg += "\n\n" + salvagePrefixMarker + salvage
 		}
-		d.boardUpdate(taskCtx, s.parentID, s.domain, false, truncateRunes(msg, 300))
-		d.treeFinish(taskCtx, s.id, partial, err)
+		// 状态语义三态化（TODO #60）：缺验证证据非失败——树落 delivered-unverified、看板标黄。
+		boardSt := board.TaskFailed
+		treeStatus := orchestrator.StatusFailed
+		if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
+			boardSt = board.TaskUnverified
+			treeStatus = orchestrator.StatusUnverified
+		}
+		d.boardUpdate(taskCtx, s.parentID, s.domain, boardSt, truncateRunes(msg, 300))
+		d.treeFinishStatus(taskCtx, s.id, partial, treeStatus, formatSubAgentFailure(err, result, d.effectiveTimeout(s.id), partial))
 		d.notify(s.parentID, s.id, msg, files)
 		d.trackChildDone(s.parentID)
 		return domainTaskFailed
@@ -634,7 +642,7 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 
 	// 成功：boardUpdate + tree.Idle + saveBlockMemory + notify + trackChildDone + 进 Idle。
 	log.Printf("[subagent] DONE: sub=%s domain=%s duration=%s result_len=%d", s.id, s.domain, duration, len(result.Text))
-	d.boardUpdate(taskCtx, s.parentID, s.domain, true, result.Text)
+	d.boardUpdate(taskCtx, s.parentID, s.domain, board.TaskDone, result.Text)
 	summary := result.Text
 	if result.VerifyNote != "" {
 		summary = fmt.Sprintf("【校验:通过(%s)】\n%s", result.VerifyNote, result.Text)
@@ -962,7 +970,7 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 // buildReuseTask 拼装复用任务文本：共享前缀 + 召回前缀 + 领域标签 + 任务正文。
 func (d *Dispatcher) buildReuseTask(ctx context.Context, s *domainSlot, task string) string {
 	var prefixes []string
-	if sp := d.buildSharedPrefix(ctx, s.parentID); sp != "" {
+	if sp := d.buildSharedPrefix(ctx, s.parentID, s.domain); sp != "" {
 		prefixes = append(prefixes, sp)
 	}
 	if bm, _ := d.injectScopedRecall(ctx, s.parentID, s.domain, task, ""); bm != "" {

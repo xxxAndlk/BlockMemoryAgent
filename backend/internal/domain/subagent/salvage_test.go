@@ -266,7 +266,7 @@ func TestBuildSharedPrefix_SkipsSalvageSlot(t *testing.T) {
 	_ = d.sharedMem.Set(context.Background(), "s1:salvage:配置", "已读: config.js")
 	_ = d.sharedMem.Set(context.Background(), "s1:file_tree", "tree: a.txt")
 
-	prefix := d.buildSharedPrefix(context.Background(), "s1")
+	prefix := d.buildSharedPrefix(context.Background(), "s1", "")
 	if !strings.Contains(prefix, "tree: a.txt") {
 		t.Fatalf("normal shared slot should inject, got: %s", prefix)
 	}

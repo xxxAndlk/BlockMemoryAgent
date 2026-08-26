@@ -352,7 +352,7 @@ func TestAssembleTaskWithDualPrefixes_NoNestedMarker(t *testing.T) {
 
 	// 模拟 runSubAgentOnce 中的拼装逻辑（直接调用两函数的纯前缀模式）。
 	var prefixes []string
-	if p := d.buildSharedPrefix(context.Background(), "meta"); p != "" {
+	if p := d.buildSharedPrefix(context.Background(), "meta", ""); p != "" {
 		prefixes = append(prefixes, p)
 	}
 	if p, _ := d.injectRecalledMemory(context.Background(), "查询任务", ""); p != "" {
@@ -988,7 +988,7 @@ func TestBuildSharedPrefix_Layer3StaleDetection(t *testing.T) {
 	_ = kv.Set(context.Background(), "meta:shared", md)
 	d.WithSharedMemory(kv)
 
-	got := d.buildSharedPrefix(context.Background(), "meta")
+	got := d.buildSharedPrefix(context.Background(), "meta", "")
 	if !strings.Contains(got, "stale.go is v1") {
 		t.Fatalf("expected shared content injected, got: %q", got)
 	}
@@ -1003,7 +1003,7 @@ func TestBuildSharedPrefix_Layer3StaleDetection(t *testing.T) {
 	newTime := time.Now().Add(5 * time.Second)
 	_ = os.Chtimes(target, newTime, newTime)
 
-	got2 := d.buildSharedPrefix(context.Background(), "meta")
+	got2 := d.buildSharedPrefix(context.Background(), "meta", "")
 	if strings.Contains(got2, "stale.go is v1") {
 		t.Fatalf("expected stale shared discarded, got: %q", got2)
 	}
@@ -1017,7 +1017,7 @@ func TestBuildSharedPrefix_Layer3StaleDetection(t *testing.T) {
 	dOld := &Dispatcher{}
 	dOld.WithSharedMemory(kvOld)
 
-	got3 := dOld.buildSharedPrefix(context.Background(), "meta")
+	got3 := dOld.buildSharedPrefix(context.Background(), "meta", "")
 	if !strings.Contains(got3, "legacy plain summary") {
 		t.Fatalf("expected legacy content used as-is, got: %q", got3)
 	}
@@ -1033,7 +1033,7 @@ func TestBuildSharedPrefix_AntiRereadDiscipline(t *testing.T) {
 	_ = kv.Set(context.Background(), "meta:shared", md)
 	d.WithSharedMemory(kv)
 
-	got := d.buildSharedPrefix(context.Background(), "meta")
+	got := d.buildSharedPrefix(context.Background(), "meta", "")
 	if !strings.Contains(got, "【读取纪律】") {
 		t.Fatalf("expected anti-reread discipline note in prefix, got: %q", got)
 	}
@@ -1048,7 +1048,7 @@ func TestBuildSharedPrefix_AntiRereadDiscipline(t *testing.T) {
 	// 无槽位时返回空前缀，纪律行不单独出现。
 	dEmpty := &Dispatcher{}
 	dEmpty.WithSharedMemory(newTestKVMemory(true))
-	if p := dEmpty.buildSharedPrefix(context.Background(), "meta"); p != "" {
+	if p := dEmpty.buildSharedPrefix(context.Background(), "meta", ""); p != "" {
 		t.Fatalf("expected empty prefix without slots, got: %q", p)
 	}
 }
@@ -1062,7 +1062,7 @@ func TestBuildSharedPrefix_NoFilesSkipsStatCheck(t *testing.T) {
 	_ = kv.Set(context.Background(), "meta:shared", md)
 	d.WithSharedMemory(kv)
 
-	got := d.buildSharedPrefix(context.Background(), "meta")
+	got := d.buildSharedPrefix(context.Background(), "meta", "")
 	if !strings.Contains(got, "pure conclusion no files") {
 		t.Fatalf("expected content injected when Files empty, got: %q", got)
 	}
@@ -1094,7 +1094,7 @@ func TestBuildSharedPrefix_RendersSpecAndShared(t *testing.T) {
 
 	d := &Dispatcher{}
 	d.WithSharedMemory(kv)
-	got := d.buildSharedPrefix(context.Background(), "meta")
+	got := d.buildSharedPrefix(context.Background(), "meta", "")
 	if !strings.Contains(got, "【任务规范】") {
 		t.Fatalf("expected spec prefix marker, got: %q", got)
 	}
@@ -1116,7 +1116,7 @@ func TestBuildSharedPrefix_RendersSpecAndShared(t *testing.T) {
 	kv2 := newTestKVMemory(true)
 	_ = kv2.Set(context.Background(), "meta:shared", "only shared")
 	d2.WithSharedMemory(kv2)
-	got2 := d2.buildSharedPrefix(context.Background(), "meta")
+	got2 := d2.buildSharedPrefix(context.Background(), "meta", "")
 	if strings.Contains(got2, "【任务规范】") {
 		t.Fatalf("expected no spec marker when missing, got: %q", got2)
 	}
@@ -1127,14 +1127,14 @@ func TestBuildSharedPrefix_RendersSpecAndShared(t *testing.T) {
 	// Case 3: 完全无槽位 -> 空串。
 	d3 := &Dispatcher{}
 	d3.WithSharedMemory(newTestKVMemory(true))
-	if got3 := d3.buildSharedPrefix(context.Background(), "meta"); got3 != "" {
+	if got3 := d3.buildSharedPrefix(context.Background(), "meta", ""); got3 != "" {
 		t.Fatalf("expected empty when no slots, got: %q", got3)
 	}
 
 	// Case 4: spec stale（文件被改 mtime 不匹配）-> 跳过 spec 段。
 	newTime := time.Now().Add(5 * time.Second)
 	_ = os.Chtimes(target, newTime, newTime)
-	got4 := d.buildSharedPrefix(context.Background(), "meta")
+	got4 := d.buildSharedPrefix(context.Background(), "meta", "")
 	if strings.Contains(got4, "【任务规范】") {
 		t.Fatalf("expected no spec marker when stale, got: %q", got4)
 	}
@@ -1161,7 +1161,7 @@ func TestHasFreshSpec(t *testing.T) {
 	_ = kv.Set(context.Background(), "meta:spec", md)
 	d := &Dispatcher{}
 	d.WithSharedMemory(kv)
-	ok, reason := d.hasFreshSpec(context.Background(), "meta")
+	ok, reason := d.hasFreshSpec(context.Background(), "meta", "")
 	if !ok {
 		t.Fatalf("expected hasFreshSpec=true for valid spec, got reason=%q", reason)
 	}
@@ -1169,7 +1169,7 @@ func TestHasFreshSpec(t *testing.T) {
 	// Case 2: spec 缺失 -> false + missing 文案。
 	d2 := &Dispatcher{}
 	d2.WithSharedMemory(newTestKVMemory(true))
-	ok2, reason2 := d2.hasFreshSpec(context.Background(), "meta")
+	ok2, reason2 := d2.hasFreshSpec(context.Background(), "meta", "")
 	if ok2 || !strings.Contains(reason2, "missing") {
 		t.Fatalf("expected missing reason, ok=%v reason=%q", ok2, reason2)
 	}
@@ -1181,7 +1181,7 @@ func TestHasFreshSpec(t *testing.T) {
 	_ = kv3.Set(context.Background(), "meta:spec", md3)
 	d3 := &Dispatcher{}
 	d3.WithSharedMemory(kv3)
-	ok3, reason3 := d3.hasFreshSpec(context.Background(), "meta")
+	ok3, reason3 := d3.hasFreshSpec(context.Background(), "meta", "")
 	if ok3 || !strings.Contains(reason3, "invalid") {
 		t.Fatalf("expected invalid reason, ok=%v reason=%q", ok3, reason3)
 	}
@@ -1192,12 +1192,12 @@ func TestHasFreshSpec(t *testing.T) {
 	d4 := &Dispatcher{}
 	d4.WithSharedMemory(kv4)
 	// 先通过一次再改文件。
-	if ok, _ := d4.hasFreshSpec(context.Background(), "meta"); !ok {
+	if ok, _ := d4.hasFreshSpec(context.Background(), "meta", ""); !ok {
 		t.Fatal("expected fresh before modification")
 	}
 	newT4 := fi.ModTime().Add(7 * time.Second)
 	_ = os.Chtimes(target, newT4, newT4)
-	if ok4, reason4 := d4.hasFreshSpec(context.Background(), "meta"); ok4 {
+	if ok4, reason4 := d4.hasFreshSpec(context.Background(), "meta", ""); ok4 {
 		t.Fatal("expected stale=false after file modified")
 	} else if !strings.Contains(reason4, "stale") || !strings.Contains(reason4, target) {
 		t.Fatalf("stale reason should list mismatched path, got: %q", reason4)
@@ -1221,7 +1221,7 @@ func TestHasFreshSpec(t *testing.T) {
 	// 系统继续写日志（mtime 前移 10s），spec 仍应视为新鲜。
 	newTime := lfi.ModTime().Add(10 * time.Second)
 	_ = os.Chtimes(logFile, newTime, newTime)
-	if ok5, reason5 := d5.hasFreshSpec(context.Background(), "meta"); !ok5 {
+	if ok5, reason5 := d5.hasFreshSpec(context.Background(), "meta", ""); !ok5 {
 		t.Fatalf("growing file (logs/) should be exempt from mtime check, reason=%q", reason5)
 	}
 
@@ -1238,13 +1238,13 @@ func TestHasFreshSpec(t *testing.T) {
 	d6.WithSharedMemory(kv6)
 	d6.WithSpecEnforcement(true)
 	// 先通过校验一次。
-	if msg := d6.checkSpecBeforeDispatch(context.Background(), "meta"); msg != "" {
+	if msg, _ := d6.checkSpecBeforeDispatch(context.Background(), "meta", ""); msg != "" {
 		t.Fatalf("expected pass before modification, got: %q", msg)
 	}
 	// 改普通文件 → stale（checkSpecBeforeDispatch 文案区分且列出路径）。
 	newTime6 := fi6.ModTime().Add(5 * time.Second)
 	_ = os.Chtimes(target6, newTime6, newTime6)
-	if msg := d6.checkSpecBeforeDispatch(context.Background(), "meta"); msg == "" {
+	if msg, _ := d6.checkSpecBeforeDispatch(context.Background(), "meta", ""); msg == "" {
 		t.Fatal("expected spec check failure after normal file modified")
 	} else if !strings.Contains(msg, "stale") || !strings.Contains(msg, target6) {
 		t.Fatalf("stale message should distinguish and list path, got: %q", msg)

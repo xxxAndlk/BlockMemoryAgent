@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -106,5 +108,83 @@ func TestGoalBarAbsentWithoutGoal(t *testing.T) {
 	}
 	if m.chatPanel.goalBarH != 0 {
 		t.Errorf("goalBarH = %d, want 0", m.chatPanel.goalBarH)
+	}
+}
+
+// TestGoalBarSingleLineWithMultilineGoal 回归"多行目标把整帧撑超高"：
+// 目标栏预算仅 1 行，而 truncate 原样保留 '\n'（换行符显示宽度为 0），
+// 粘贴的多行需求文档作为目标时曾渲染出多行，整帧超高后 fitFrameLines
+// 从主内容区顶部裁行，把右侧计划面板标题裁出屏幕。目标栏必须恒为 1 行。
+func TestGoalBarSingleLineWithMultilineGoal(t *testing.T) {
+	now := time.Now()
+	goal := "玩家通过滑动屏幕斩切水果\n水果从浮岛下方的裂隙中抛射而出\n背景有三层视差滚动"
+	s := &server.Session{
+		ID:        "session-1",
+		Goal:      goal,
+		Status:    enums.SessionStatusRunning,
+		StartedAt: now,
+		Messages: []types.ChatMessage{
+			{Role: enums.ChatRoleUser, Content: goal, Timestamp: now},
+		},
+	}
+	m := &Model{
+		styles:         NewStyles(),
+		sessions:       []*server.Session{s},
+		sessionsCursor: 0,
+	}
+	m.chatPanel.lastItems = 1 // 跳过欢迎页分支，直接渲染 viewport。
+
+	const h = 20
+	out := m.renderChat(80, h)
+	if got := strings.Count(out, "\n") + 1; got != h {
+		t.Fatalf("多行目标下对话区应为 %d 行，实际 %d 行:\n%s", h, got, out)
+	}
+	if !strings.Contains(out, "🎯") {
+		t.Fatalf("目标栏应仍展示（折叠为单行）:\n%s", out)
+	}
+}
+
+// TestViewportHeightSyncedWithGoalBar 回归"长答复最后一行渲染不到也滚动不到"：
+// 目标栏常驻时 renderChat 按 bodyH=contentH-1 渲染，但持久 vp.Height 此前只在
+// WindowSizeMsg 按 contentH 设置（renderChat 内的修正落在 View 值接收者的每帧副本上
+// 被丢弃），GotoBottom/SetYOffset 的偏移上限因此差 1 行。Update 路径维护的持久
+// vp.Height/goalBarH 必须与渲染口径一致。
+func TestViewportHeightSyncedWithGoalBar(t *testing.T) {
+	now := time.Now()
+	s := &server.Session{
+		ID:        "session-1",
+		Goal:      "做一个塔防游戏",
+		Status:    enums.SessionStatusRunning,
+		StartedAt: now,
+		Messages: []types.ChatMessage{
+			{Role: enums.ChatRoleUser, Content: "做一个塔防游戏", Timestamp: now},
+		},
+	}
+	m := &Model{
+		styles:         NewStyles(),
+		sessions:       []*server.Session{s},
+		sessionsCursor: 0,
+	}
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	um, ok := updated.(Model)
+	if !ok {
+		t.Fatalf("Update 返回类型应为 Model，实际 %T", updated)
+	}
+	if um.chatPanel.goalBarH != 1 {
+		t.Errorf("有目标时 goalBarH = %d, want 1", um.chatPanel.goalBarH)
+	}
+	if wantH := um.mainContentHeight() - 1; um.chatPanel.vp.Height != wantH {
+		t.Errorf("有目标栏时 vp.Height = %d, want %d（渲染口径 contentH-1）", um.chatPanel.vp.Height, wantH)
+	}
+
+	// 无会话（无目标栏）：vp.Height 不扣减。
+	m2 := &Model{styles: NewStyles()}
+	updated2, _ := m2.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	um2 := updated2.(Model)
+	if um2.chatPanel.goalBarH != 0 {
+		t.Errorf("无会话时 goalBarH = %d, want 0", um2.chatPanel.goalBarH)
+	}
+	if wantH := um2.mainContentHeight(); um2.chatPanel.vp.Height != wantH {
+		t.Errorf("无目标栏时 vp.Height = %d, want %d", um2.chatPanel.vp.Height, wantH)
 	}
 }

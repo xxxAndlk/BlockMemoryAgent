@@ -63,6 +63,36 @@ func TestFinishIdempotent(t *testing.T) {
 	}
 }
 
+// TestFinishUnverified TODO #60 三态化：FinishUnverified 置 delivered-unverified（非失败语义），
+// summary 保留产出、reason 记入 Err；terminal 幂等——后续 Finish/FinishUnverified 均 no-op。
+func TestFinishUnverified(t *testing.T) {
+	tr := NewTree("", nil)
+	tr.Register(Node{ID: "a"})
+	tr.FinishUnverified("a", "产出全文", "L0 证据缺失")
+
+	node, _ := tr.Get("a")
+	if node.Status != StatusUnverified {
+		t.Fatalf("Status = %s, want delivered-unverified", node.Status)
+	}
+	if node.Summary != "产出全文" {
+		t.Errorf("Summary = %q, want 产出保留", node.Summary)
+	}
+	if node.Err != "L0 证据缺失" {
+		t.Errorf("Err = %q, want 缺证据原因", node.Err)
+	}
+	if node.Finished.IsZero() {
+		t.Error("Finished not set")
+	}
+
+	// terminal 幂等：重复 FinishUnverified 与 Finish 均不覆盖已终态节点
+	tr.FinishUnverified("a", "x", "y")
+	tr.Finish("a", "x", errors.New("boom"))
+	node, _ = tr.Get("a")
+	if node.Status != StatusUnverified || node.Summary != "产出全文" {
+		t.Errorf("terminal node should be idempotent, got status=%s summary=%q", node.Status, node.Summary)
+	}
+}
+
 func TestCancelRunningNode(t *testing.T) {
 	tr := NewTree("", nil)
 	cancelled := false
@@ -172,6 +202,7 @@ func TestStatusMarshalJSON(t *testing.T) {
 		{StatusDone, `"done"`},
 		{StatusFailed, `"failed"`},
 		{StatusCancelled, `"cancelled"`},
+		{StatusUnverified, `"delivered-unverified"`}, // TODO #60 三态化
 	}
 	for _, c := range cases {
 		got, err := c.s.MarshalJSON()

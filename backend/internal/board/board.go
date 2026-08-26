@@ -31,6 +31,10 @@ const (
 	TaskDone TaskStatus = "done"
 	// TaskFailed 表示失败：执行出错或被否决。
 	TaskFailed TaskStatus = "failed"
+	// TaskUnverified 表示已交付但未验证（TODO #60 三态化）：
+	// 产出已回传但缺机器可执行的验证证据（L0 证据缺/校验不可用），非失败语义。
+	// 看板展示标黄不标红，由父 Agent 决定补验证或收口。
+	TaskUnverified TaskStatus = "delivered-unverified"
 )
 
 // BoardStatus 看板整体状态枚举类型。
@@ -46,6 +50,10 @@ const (
 	BoardStatusDone BoardStatus = "DONE"
 	// BoardStatusFailed 表示失败：所有子任务都已结束但至少有一个失败。
 	BoardStatusFailed BoardStatus = "FAILED"
+	// BoardStatusDelivered 表示已交付但存在未验证任务（TODO #60）：
+	// 所有子任务都已结束、无失败，但至少有一个是 delivered-unverified。
+	// 与 DONE 区分：整品可用性未经全部验证；与 FAILED 区分：没有真失败。
+	BoardStatusDelivered BoardStatus = "DELIVERED"
 )
 
 // SubTask 看板上的一个子任务。
@@ -311,6 +319,47 @@ func (b *TaskBoard) FindAllByDomain(domain string) []string {
 	return ids
 }
 
+// TakeoverFrom 看板接力认领（TODO #73）：把旧 domain 的非 Done 子任务迁移到新 domain
+// 名下并留痕"曾失败，由 <newDomain> 接力完成"。异名续建时旧 FAILED 条目不再永久红
+//（实证 2026-08-25：domain-2 FAILED 永久红，异名"续建"完成后仍红，meta 只能散文解释；
+// boardAssign/boardUpdate 按 domain 精确匹配，异名接管不命中旧条目）。
+// 返回迁移条数；旧 domain 无非 Done 条目返回 0（幂等，同名续建天然覆盖）。
+//
+// 迁移语义：条目 Domain 改为新名、Title 追加留痕注记、状态翻回 pending
+//（boardAssign 随派发置 in_progress、完成时整组 MarkDone 翻绿）；Done 条目不迁移
+//（已完成的留原 domain 归档）。执行者标记清空（assignee 由新派发覆写）。
+//
+// 并发安全：内部持写锁。
+func (b *TaskBoard) TakeoverFrom(oldDomain, newDomain string) int {
+	oldDomain = strings.TrimSpace(oldDomain)
+	newDomain = strings.TrimSpace(newDomain)
+	if oldDomain == "" || newDomain == "" || oldDomain == newDomain {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	migrated := 0
+	now := time.Now()
+	for _, id := range b.Order {
+		t := b.Tasks[id]
+		if t == nil || t.Domain != oldDomain || t.Status == TaskDone {
+			continue
+		}
+		t.Domain = newDomain
+		if !strings.Contains(t.Title, "曾失败") {
+			t.Title = t.Title + fmt.Sprintf("（曾失败，由 %s 接力完成）", newDomain)
+		}
+		t.Status = TaskPending
+		t.Assignee = ""
+		t.UpdatedAt = now
+		migrated++
+	}
+	if migrated > 0 {
+		b.UpdatedAt = now
+	}
+	return migrated
+}
+
 // DependsDone 报告任务的所有依赖是否均已 done；无依赖或任务不存在返回 true。
 // 供派发依赖门校验：依赖未全部完成时拒绝派发（TODO #22 Phase 1）。
 //
@@ -391,6 +440,16 @@ func (b *TaskBoard) MarkFailed(taskID, reason string) error {
 	return b.transition(taskID, TaskFailed, reason)
 }
 
+// MarkUnverified 标记任务"已交付但未验证"（TODO #60 三态化）。
+//
+// 职责：将子任务置为 delivered-unverified，并记录缺验证原因。
+// 不触发看板 FAILED（非失败语义），整体状态走 DELIVERED。
+//
+// 并发安全：内部持写锁（经 transition）。
+func (b *TaskBoard) MarkUnverified(taskID, reason string) error {
+	return b.transition(taskID, TaskUnverified, reason)
+}
+
 // MarkBlocked 标记任务被阻塞。
 //
 // 职责：将子任务置为 blocked，并记录阻塞原因。
@@ -444,7 +503,8 @@ func (b *TaskBoard) transition(taskID string, status TaskStatus, result string) 
 // 职责：遍历所有子任务，根据其终态推导看板 Status：
 //   - 无任务 → NEW
 //   - 全部终态且有失败 → FAILED
-//   - 全部终态且无失败 → DONE
+//   - 全部终态、无失败但有 delivered-unverified → DELIVERED（TODO #60 三态化）
+//   - 全部终态且无失败无未验证 → DONE
 //   - 否则 → IN_PROGRESS
 //
 // 前置条件：调用方必须已持有 b.mu 写锁（"Locked" 后缀即此含义）。
@@ -457,13 +517,15 @@ func (b *TaskBoard) recomputeStatusLocked() {
 		b.Status = BoardStatusNew // 空看板归零
 		return
 	}
-	allTerminal, anyFailed := true, false // 终态标记与失败标记
+	allTerminal, anyFailed, anyUnverified := true, false, false
 	for _, t := range b.Tasks {
 		switch t.Status {
 		case TaskFailed:
 			anyFailed = true // 出现失败
 		case TaskDone:
 			// ok：终态成功，无需额外处理
+		case TaskUnverified:
+			anyUnverified = true // 终态但未验证（非失败语义）
 		default:
 			allTerminal = false // 仍有未完成任务
 		}
@@ -471,6 +533,8 @@ func (b *TaskBoard) recomputeStatusLocked() {
 	switch {
 	case allTerminal && anyFailed:
 		b.Status = BoardStatusFailed // 全终态但含失败
+	case allTerminal && anyUnverified:
+		b.Status = BoardStatusDelivered // 全终态无失败但有未验证
 	case allTerminal:
 		b.Status = BoardStatusDone // 全部成功完成
 	default:
@@ -563,7 +627,11 @@ func (b *TaskBoard) Brief(maxTasks int) string {
 	}
 	out += "子任务:\n"
 	count := 0 // 已输出的任务计数
+	failedDomains := map[string]bool{}
 	for _, t := range snap.Tasks {
+		if t.Status == TaskFailed {
+			failedDomains[t.Domain] = true
+		}
 		if count >= maxTasks {
 			// 超出上限时给出剩余数量提示后中止
 			out += fmt.Sprintf("...(%d more)\n", len(snap.Tasks)-count)
@@ -576,6 +644,20 @@ func (b *TaskBoard) Brief(maxTasks int) string {
 		// 每行：[状态] 标题 -> 责任人 (ID)
 		out += fmt.Sprintf("  [%s] %s -> %s (%s)\n", t.Status, t.Title, assign, t.ID)
 		count++
+	}
+	// 接管提示（TODO #73）：存在失败条目时引导续建沿用同名（自动翻绿）或显式 takeover
+	//（异名接管），防旧 FAILED 条目永久红误导决策（实证 2026-08-25 水果忍者）。
+	if len(failedDomains) > 0 {
+		var ds []string
+		for d := range failedDomains {
+			if strings.TrimSpace(d) != "" {
+				ds = append(ds, d)
+			}
+		}
+		sort.Strings(ds)
+		if len(ds) > 0 {
+			out += fmt.Sprintf("【接管提示】存在失败条目（领域: %s）：续建同类工作时沿用原 domain 名（完成自动翻绿），或异名续建时在 call_sub_agent 填 takeover=旧域名 迁移留痕；忽略则旧条目永久红。\n", strings.Join(ds, "、"))
+		}
 	}
 	return out
 }

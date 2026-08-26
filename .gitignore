@@ -28,9 +28,9 @@ dist-ssr
 /设计文档_v2_Eino版.md
 .env
 blockmemory-agent
+*.exe
 /backend/blockmemory-agent
 /backend/tui
-*.exe
 go.work.sum
 /workspace
 /zzzdemo

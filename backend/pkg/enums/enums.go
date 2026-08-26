@@ -151,6 +151,10 @@ const (
 	// RoleStatusError 错误:执行失败,需升级或重试。
 	// 终态,触发升级/上抛给更高层 Agent 处理。
 	RoleStatusError RoleStatus = "error"
+
+	// RoleStatusUnverified 未验证:产出已交付但缺机器可执行验证证据（TODO #60 三态化）。
+	// 终态,非失败语义——展示标黄不标红,由父 Agent 决定补验证或收口。
+	RoleStatusUnverified RoleStatus = "unverified"
 )
 
 // ==================== 章节分隔 ====================

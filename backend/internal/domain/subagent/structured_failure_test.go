@@ -50,6 +50,10 @@ func TestFailureKindOf(t *testing.T) {
 		{"expired ctx err", expiredCtx.Err(), FailureKindTimeout},
 		{"loop guard", tool.ErrLoopExit, FailureKindLoopGuard},
 		{"budget partial", errPartialReturn, FailureKindBudget},
+		// TODO #60 三态化：缺证据类归并 verify_missing/unverified（delivered-unverified 黄态）
+		{"unverified", errUnverified, FailureKindUnverified},
+		{"verify missing", errVerifyMissing, FailureKindVerifyMissing},
+		{"visual evidence missing merged", errVisualEvidenceMissing, FailureKindVerifyMissing},
 		{"generic", errors.New("boom"), FailureKindError},
 	}
 	for _, c := range cases {

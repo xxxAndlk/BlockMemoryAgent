@@ -63,6 +63,33 @@ func TestIsVerificationCommand(t *testing.T) {
 	}
 }
 
+// TestVerificationEvidenceTemplate 验证 TODO #63 同源模板：模板文本含证据格式要求
+// （``` 代码块 + EXIT_CODE=0），且识别词表 verificationCommandPatterns 的每一项都
+// 原样出现在模板中（识别器认什么，prompt 就要求什么，防漂移）。
+func TestVerificationEvidenceTemplate(t *testing.T) {
+	tpl := VerificationEvidenceTemplate()
+	for _, want := range []string{"【验证证据格式】", "```", "EXIT_CODE=0"} {
+		if !strings.Contains(tpl, want) {
+			t.Fatalf("template missing %q: %q", want, tpl)
+		}
+	}
+	for _, p := range verificationCommandPatterns {
+		if !strings.Contains(tpl, p) {
+			t.Fatalf("template missing pattern %q: %q", p, tpl)
+		}
+	}
+	// 扩词覆盖实证缺口：npx tsc --noEmit / vite build / npm run build 必须命中识别口径。
+	for _, cmd := range []string{"npx tsc --noEmit", "vite build", "npm run build"} {
+		if !IsVerificationCommand(cmd) {
+			t.Fatalf("IsVerificationCommand(%q) 应为 true（TODO #63 扩词）", cmd)
+		}
+	}
+	// 防误匹配：vite 词表项带尾随空格，"invited"（vite 后接字母）不应命中。
+	if IsVerificationCommand("invited reviewers") {
+		t.Fatal("IsVerificationCommand(\"invited reviewers\") 应为 false")
+	}
+}
+
 // TestReadFile 验证 ReadFile 工具可以正确读取工作目录下的文件内容。
 func TestReadFile(t *testing.T) {
 	// 创建临时目录并在其中写入测试文件 hello.txt。
@@ -144,6 +171,71 @@ func TestReadFile_ConsecutiveSameCallLoopGuard(t *testing.T) {
 	res4, err := r.Dispatch(ctx, "ReadFile", paged)
 	if err != nil || !res4.Success {
 		t.Fatalf("read after reset should succeed: err=%v success=%v", err, res4.Success)
+	}
+}
+
+// TestReadFile_WriteResetsConsecutiveCount 确认性复读放行（TODO #72）：
+// WriteFile/EditFile 成功写某路径后清零该路径连读计数--
+// Read(A)->Write(A)->Read(A)->Read(A) 的编辑后确认工作流不再第 3 次被杀。
+func TestReadFile_WriteResetsConsecutiveCount(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(target, []byte("v1"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s2")
+	args := map[string]any{"path": "a.txt", "offset": float64(1), "limit": float64(5)}
+
+	// Read x2（连读计数 2），随后写入成功清零。
+	for i := 0; i < 2; i++ {
+		if res, err := r.Dispatch(ctx, "ReadFile", args); err != nil || !res.Success {
+			t.Fatalf("read %d: err=%v success=%v", i+1, err, res.Success)
+		}
+	}
+	if wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{"path": "a.txt", "content": "v2"}); err != nil || !wres.Success {
+		t.Fatalf("write: err=%v success=%v", err, wres.Success)
+	}
+	// 写后确认性复读 x2（若无写入清零，这里第 2 次已是第 4 连读、被杀）。
+	for i := 0; i < 2; i++ {
+		if res, err := r.Dispatch(ctx, "ReadFile", args); err != nil || !res.Success {
+			t.Fatalf("confirm read %d after write should pass: err=%v success=%v", i+1, err, res.Success)
+		}
+	}
+	// 第 3 次写后复读（计数 3）仍被杀--守卫语义保留。
+	res, _ := r.Dispatch(ctx, "ReadFile", args)
+	if res.Success {
+		t.Fatal("3rd consecutive read after write should still be blocked")
+	}
+}
+
+// TestReadFile_LongFileRelaxed 长文件连读上限放宽（TODO #72）：
+// ReadFile 返回总行数 > 500 的长文件时，同区间连读上限放宽到 6。
+func TestReadFile_LongFileRelaxed(t *testing.T) {
+	dir := t.TempDir()
+	var lines []string
+	for i := 0; i < longFileReadLines+50; i++ {
+		lines = append(lines, "line")
+	}
+	target := filepath.Join(dir, "long.txt")
+	if err := os.WriteFile(target, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	r := NewBuiltinRegistry(dir, nil, nil)
+	ctx := WithSessionID(context.Background(), "s3")
+	args := map[string]any{"path": "long.txt", "offset": float64(1), "limit": float64(5)}
+
+	// 首读标记长文件；随后同参数 2..5 连读均放行（旧上限 3 会杀第 3 次）。
+	for i := 0; i < 5; i++ {
+		res, err := r.Dispatch(ctx, "ReadFile", args)
+		if err != nil || !res.Success {
+			t.Fatalf("long-file read %d should pass (relaxed limit): err=%v success=%v", i+1, err, res.Success)
+		}
+	}
+	// 第 6 次达放宽上限，被杀。
+	res, _ := r.Dispatch(ctx, "ReadFile", args)
+	if res.Success {
+		t.Fatal("6th consecutive long-file read should be blocked")
 	}
 }
 
@@ -427,12 +519,16 @@ func keysOf(m map[string]*jsonschema.Schema) []string {
 
 // fakeSharedMemoryStore 是测试用 SharedMemoryStore 实现，内存版，无持久化。
 type fakeSharedMemoryStore struct {
-	items map[string]string
+	items   map[string]string
+	workDir string
 }
 
 func newFakeSharedMemoryStore() *fakeSharedMemoryStore {
 	return &fakeSharedMemoryStore{items: make(map[string]string)}
 }
+
+// WorkDir 模拟 FileSharedMemoryStore.WorkDir（可选接口）：空串表示非文件后端。
+func (s *fakeSharedMemoryStore) WorkDir() string { return s.workDir }
 
 func (s *fakeSharedMemoryStore) Set(ctx context.Context, key, value string) error {
 	s.items[key] = value
@@ -661,6 +757,90 @@ func TestWriteSpec_Structured(t *testing.T) {
 	}
 }
 
+// TestWriteSpec_ContractField 验证 contract 字段（TODO #57）结构化写入：
+// map 入参经 JSON 往返解析，frontmatter 含四类条目，body 渲染跨域契约段。
+func TestWriteSpec_ContractField(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "多域前端任务",
+		"acceptance": []any{"跨域集成点一致"},
+		"contract": map[string]any{
+			"symbols": []any{map[string]any{
+				"symbol": "GameEngine.init", "file": "engine.js", "refs": []any{"main.js"},
+			}},
+			"dom_ids": []any{map[string]any{"id": "game-canvas", "file": "index.html"}},
+			"scripts": []any{map[string]any{"file": "engine.js"}, map[string]any{"file": "main.js"}},
+			"signatures": []any{map[string]any{
+				"symbol": "start", "signature": "function start()", "file": "engine.js",
+			}},
+		},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch: err=%v res=%+v", err, res)
+	}
+
+	val, _ := store.Get(ctx, "meta-1:spec")
+	fm, body, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatalf("KV value not MD: %q", val)
+	}
+	if fm.Contract == nil || len(fm.Contract.Symbols) != 1 || len(fm.Contract.DOMIDs) != 1 ||
+		len(fm.Contract.Scripts) != 2 || len(fm.Contract.Signatures) != 1 {
+		t.Fatalf("contract not roundtripped: %+v", fm.Contract)
+	}
+	if fm.Contract.Symbols[0].Symbol != "GameEngine.init" || fm.Contract.Symbols[0].Refs[0] != "main.js" {
+		t.Fatalf("symbol entry mismatch: %+v", fm.Contract.Symbols[0])
+	}
+	if !strings.Contains(body, "## 跨域契约") || !strings.Contains(body, "GameEngine.init") {
+		t.Fatalf("body missing contract section: %q", body)
+	}
+
+	// 契约可空：不传 contract 时 frontmatter 无契约、body 无契约段。
+	res2, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g2", "acceptance": []any{"a"},
+	})
+	if err != nil || !res2.Success {
+		t.Fatalf("dispatch without contract: err=%v res=%+v", err, res2)
+	}
+	val2, _ := store.Get(ctx, "meta-1:spec")
+	fm2, body2, _ := DecodeSharedMD(val2)
+	if fm2.Contract != nil || strings.Contains(body2, "跨域契约") {
+		t.Fatalf("contract should be absent when not provided: %+v body=%q", fm2.Contract, body2)
+	}
+}
+
+// TestWriteSpec_FileListPreservesMissingFiles 待创建文件（stat 失败）不进 Files mtime 索引
+// 但保留在 FileList：dispatcher 冒烟检查（TODO #56）在文件创建后仍能定位目标。
+func TestWriteSpec_FileListPreservesMissingFiles(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "not-created-yet.js")
+	r := NewBuiltinRegistry(dir, nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g", "acceptance": []any{"a"}, "files": []any{missing},
+	}); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	val, _ := store.Get(ctx, "meta-1:spec")
+	fm, _, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatalf("KV value not MD: %q", val)
+	}
+	if len(fm.Files) != 0 {
+		t.Fatalf("missing file must not enter mtime index: %v", fm.Files)
+	}
+	if len(fm.FileList) != 1 || fm.FileList[0] != missing {
+		t.Fatalf("file_list should preserve missing file, got %v", fm.FileList)
+	}
+}
+
 // TestWriteSpec_GrowingFilesWarning files 含持续增长目录（logs/）文件时输出告警提示。
 func TestWriteSpec_GrowingFilesWarning(t *testing.T) {
 	dir := t.TempDir()
@@ -717,7 +897,9 @@ func TestWriteSpec_RequiresGoalAndAcceptance(t *testing.T) {
 	}
 }
 
-// TestWriteSpec_InvalidatesOnWriteFile 验证 Layer 2：WriteFile 成功后引用同 path 的 spec entry 被删除。
+// TestWriteSpec_InvalidatesOnWriteFile 验证 Layer 2：WriteFile 成功后引用同 path 的
+// spec entry 写墓碑（TODO #74：物理删除改为 "invalidated: ..." 留痕，
+// 派发侧区分"从未写"与"已失效"）。
 func TestWriteSpec_InvalidatesOnWriteFile(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "foo.js")
@@ -744,7 +926,7 @@ func TestWriteSpec_InvalidatesOnWriteFile(t *testing.T) {
 		t.Fatal("expected spec entry before WriteFile")
 	}
 
-	// WriteFile 修改 foo.js，触发失效。
+	// WriteFile 修改 foo.js，触发失效（墓碑而非物理删除）。
 	wres, err := r.Dispatch(ctx, "WriteFile", map[string]any{
 		"path":    target,
 		"content": "var x = 2",
@@ -752,8 +934,12 @@ func TestWriteSpec_InvalidatesOnWriteFile(t *testing.T) {
 	if err != nil || !wres.Success {
 		t.Fatalf("WriteFile: err=%v res=%+v", err, wres)
 	}
-	if _, ok := store.items["meta-1:spec"]; ok {
-		t.Fatal("expected spec entry deleted after WriteFile invalidated it")
+	val, ok := store.items["meta-1:spec"]
+	if !ok {
+		t.Fatal("expected spec tombstone retained after WriteFile invalidated it")
+	}
+	if !strings.HasPrefix(val, SpecTombstonePrefix) {
+		t.Fatalf("expected tombstone value with prefix %q, got %q", SpecTombstonePrefix, val)
 	}
 }
 
@@ -785,5 +971,120 @@ func TestWriteFile_TemporaryOutputHasAbsPath(t *testing.T) {
 	}
 	if _, err := os.Stat(res.Path); err != nil {
 		t.Fatalf("temp file should exist at %s: %v", res.Path, err)
+	}
+}
+
+// TestWriteSpec_MultiKeyPerDomain 多 key 存储（TODO #65）：key=领域名时存到
+// "<agentID>:spec:<key>"，与默认单键互不覆盖。
+func TestWriteSpec_MultiKeyPerDomain(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	store := newFakeSharedMemoryStore()
+	r.SetSharedMemory(store)
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "共享单份", "acceptance": []any{"a"},
+	}); err != nil {
+		t.Fatalf("legacy write: %v", err)
+	}
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "渲染域目标", "acceptance": []any{"b"}, "key": "渲染领域",
+	}); err != nil {
+		t.Fatalf("domain write: %v", err)
+	}
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "寻路域目标", "acceptance": []any{"c"}, "key": "寻路领域",
+	}); err != nil {
+		t.Fatalf("second domain write: %v", err)
+	}
+	if resBad, _ := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "x", "acceptance": []any{"d"}, "key": "bad:key",
+	}); resBad.Success || !strings.Contains(resBad.Error, "key must not contain") {
+		t.Fatalf("key with colon should be rejected, got %q", resBad.Error)
+	}
+	legacy, _ := store.Get(ctx, "meta-1:spec")
+	fm1, _, _ := DecodeSharedMD(legacy)
+	if fm1.Goal != "共享单份" {
+		t.Fatalf("legacy spec overwritten: %q", fm1.Goal)
+	}
+	d1, _ := store.Get(ctx, "meta-1:spec:渲染领域")
+	fm2, _, _ := DecodeSharedMD(d1)
+	if fm2.Goal != "渲染域目标" {
+		t.Fatalf("domain spec missing: %q", fm2.Goal)
+	}
+	d2, _ := store.Get(ctx, "meta-1:spec:寻路领域")
+	fm3, _, _ := DecodeSharedMD(d2)
+	if fm3.Goal != "寻路域目标" {
+		t.Fatalf("second domain spec missing: %q", fm3.Goal)
+	}
+}
+
+// TestWriteSpec_VerifyLevels 验收层级（TODO #59）：合法值存 frontmatter，非法值拒绝。
+func TestWriteSpec_VerifyLevels(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.SetSharedMemory(newFakeSharedMemoryStore())
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	if _, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g", "acceptance": []any{"a"},
+		"verify_levels": []any{"visual", "integration", "visual"},
+	}); err != nil {
+		t.Fatalf("valid levels write: %v", err)
+	}
+	val, _ := r.sharedMemory.Get(ctx, "meta-1:spec")
+	fm, _, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatal("decode failed")
+	}
+	if len(fm.VerifyLevels) != 2 || fm.VerifyLevels[0] != "visual" || fm.VerifyLevels[1] != "integration" {
+		t.Fatalf("verify_levels normalized wrong: %v", fm.VerifyLevels)
+	}
+
+	res, _ := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g", "acceptance": []any{"a"},
+		"verify_levels": []any{"invalid-layer"},
+	})
+	if res.Success {
+		t.Fatal("invalid verify_levels should be rejected")
+	}
+	if !strings.Contains(res.Error, "verify_levels 含非法值") {
+		t.Fatalf("expected validation error, got %q", res.Error)
+	}
+}
+
+// TestWriteSpec_HappyPathAutoAppend 降级/兜底关键词自动追加 happy-path 验收项（TODO #64）。
+func TestWriteSpec_HappyPathAutoAppend(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.SetSharedMemory(newFakeSharedMemoryStore())
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal":       "贴图优先，手绘兜底",
+		"acceptance": []any{"文件生成到 assets/img/"},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch: %v %v", err, res)
+	}
+	if !strings.Contains(res.Output, "happy-path") {
+		t.Fatalf("output should announce happy-path append, got %q", res.Output)
+	}
+	val, _ := r.sharedMemory.Get(ctx, "meta-1:spec")
+	fm, _, _ := DecodeSharedMD(val)
+	found := false
+	for _, a := range fm.Acceptance {
+		if strings.HasPrefix(a, "【自动追加·happy-path】") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("happy-path acceptance not appended: %v", fm.Acceptance)
+	}
+
+	// 无兜底关键词：不追加。
+	res2, _ := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "普通任务", "acceptance": []any{"a"},
+	})
+	if strings.Contains(res2.Output, "happy-path") {
+		t.Fatalf("no fallback keywords should not append, got %q", res2.Output)
 	}
 }

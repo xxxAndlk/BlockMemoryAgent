@@ -1,8 +1,9 @@
 package mcpbridge
 
 import (
-	"context" // 工具执行上下文
-	"encoding/json" // schema 转换
+	"context"        // 工具执行上下文
+	"encoding/json"  // schema 转换
+	"strings"        // 描述后缀拼接
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/google/jsonschema-go/jsonschema"
@@ -48,6 +49,9 @@ func (b *Bridge) wrapTool(mt *mcp.Tool) tool.Tool {
 	desc := mt.Description
 	if desc == "" {
 		desc = "MCP 远端工具 " + mt.Name
+	}
+	if b.settings.ToolDescriptionSuffix != "" {
+		desc = strings.TrimSpace(desc) + " " + b.settings.ToolDescriptionSuffix
 	}
 	var schema *jsonschema.Schema
 	if mt.InputSchema != nil {

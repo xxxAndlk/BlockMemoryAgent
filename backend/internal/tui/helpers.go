@@ -112,6 +112,9 @@ func (m *Model) boardSnapshot(s *server.Session) board.Snapshot {
 			st = board.TaskDone
 		case orchestrator.StatusFailed:
 			st = board.TaskFailed
+		case orchestrator.StatusUnverified:
+			// 已交付未验证（TODO #60）：看板标黄不标红。
+			st = board.TaskUnverified
 		case orchestrator.StatusPaused:
 			// 触达 token 上限暂停（待用户"继续"）：展示为 Blocked 而非 Running。
 			st = board.TaskBlocked
@@ -1164,6 +1167,8 @@ func planStatusText(status board.TaskStatus) string {
 		return " Blocked"
 	case board.TaskFailed:
 		return " Failed"
+	case board.TaskUnverified:
+		return " Unverified"
 	default:
 		return " Waiting"
 	}
@@ -1190,7 +1195,7 @@ func taskElapsedHMS(t board.SubTask) string {
 	if t.CreatedAt.IsZero() {
 		return "--:--:--"
 	}
-	if (t.Status == board.TaskDone || t.Status == board.TaskFailed) && t.UpdatedAt.IsZero() {
+	if (t.Status == board.TaskDone || t.Status == board.TaskFailed || t.Status == board.TaskUnverified) && t.UpdatedAt.IsZero() {
 		return "--:--:--"
 	}
 	return formatDurationHMS(taskElapsed(t))

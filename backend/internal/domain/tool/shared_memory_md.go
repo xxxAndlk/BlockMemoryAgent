@@ -14,6 +14,7 @@ package tool
 //   - 单一 decodeSharedMD 函数供 dispatcher/registry 复用，避免多份解析逻辑漂移。
 
 import (
+	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -23,15 +24,29 @@ import (
 // 所有 slot 共用：spec slot 额外填 Goal/Acceptance/Constraints，其余 slot 仅填 AgentID/Slot/Files。
 // Version 供 CAS 乐观锁（SetIfVersion）使用：每次写入自增，冲突检测用。
 type MDFrontmatter struct {
-	AgentID string `yaml:"agent,omitempty"`
-	Slot    string `yaml:"slot,omitempty"`
+	AgentID string           `yaml:"agent,omitempty"`
+	Slot    string           `yaml:"slot,omitempty"`
 	Files   map[string]int64 `yaml:"files,omitempty"`
-	Version int    `yaml:"version,omitempty"`
+	Version int              `yaml:"version,omitempty"`
+	// FileList 是 spec.files 的完整原始清单（含当时不存在的待创建文件）。
+	// Files map 只收录 stat 成功的文件（mtime 索引），创建类任务的待创建文件
+	// 不在其中；dispatcher 冒烟检查（TODO #56）需要全量清单，读 FileList 兜底。
+	FileList []string `yaml:"file_list,omitempty"`
 	// Spec 专属字段：仅 slot == SpecSlot 时填充。
 	// 其余 slot 这些字段为空，解码时忽略。
 	Goal        string   `yaml:"goal,omitempty"`
 	Acceptance  []string `yaml:"acceptance,omitempty"`
 	Constraints []string `yaml:"constraints,omitempty"`
+	// VerifyLevels 验收层级（TODO #59）：existence/static/integration/runtime/visual 子集。
+	VerifyLevels []string `yaml:"verify_levels,omitempty"`
+	// Contract 跨域契约（TODO #57），仅 spec slot 填充；nil 等价于未填。
+	Contract *Contract `yaml:"contract,omitempty"`
+	// Probes 运行时探针声明（TODO #67 runtime 层），仅 spec slot 填充。
+	Probes []string `yaml:"probes,omitempty"`
+	// Scenes 场景化截图清单（TODO #69 visual 层），仅 spec slot 填充。
+	Scenes []string `yaml:"scenes,omitempty"`
+	// Baseline 对标基线产物清单（TODO #75），仅 spec slot 填充。
+	Baseline []string `yaml:"baseline,omitempty"`
 }
 
 // EncodeSharedMD 把 shared memory 槽位编码为 MD（frontmatter + body=content）。
@@ -57,12 +72,18 @@ func encodeSharedMD(agentID, slot string, files map[string]int64, body string) s
 // 导出让 subagent 包测试可构造 spec MD fixture。
 func EncodeSpecMD(agentID string, spec Spec, files map[string]int64) string {
 	fm := MDFrontmatter{
-		AgentID:     agentID,
-		Slot:        SpecSlot,
-		Files:       files,
-		Goal:        spec.Goal,
-		Acceptance:  spec.Acceptance,
-		Constraints: spec.Constraints,
+		AgentID:      agentID,
+		Slot:         SpecSlot,
+		Files:        files,
+		FileList:     spec.Files,
+		Goal:         spec.Goal,
+		Acceptance:   spec.Acceptance,
+		Constraints:  spec.Constraints,
+		VerifyLevels: spec.VerifyLevels,
+		Contract:     spec.Contract,
+		Probes:       spec.Probes,
+		Scenes:       spec.Scenes,
+		Baseline:     spec.Baseline,
 	}
 	return encodeMD(fm, renderSpecBody(spec))
 }
@@ -107,6 +128,62 @@ func renderSpecBody(s Spec) string {
 			b.WriteString("- `")
 			b.WriteString(strings.TrimSpace(f))
 			b.WriteString("`\n")
+		}
+		b.WriteByte('\n')
+	}
+	if len(s.VerifyLevels) > 0 {
+		b.WriteString("## 验收层级\n")
+		b.WriteString(strings.Join(s.VerifyLevels, " / "))
+		b.WriteString("\n\n")
+	}
+	if len(s.Probes) > 0 {
+		b.WriteString("## 运行时探针\n")
+		for _, p := range s.Probes {
+			b.WriteString("- ")
+			b.WriteString(strings.TrimSpace(p))
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+	if len(s.Scenes) > 0 {
+		b.WriteString("## 场景截图清单\n")
+		for _, sc := range s.Scenes {
+			b.WriteString("- ")
+			b.WriteString(strings.TrimSpace(sc))
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+	if len(s.Baseline) > 0 {
+		b.WriteString("## 对标基线\n")
+		for _, bl := range s.Baseline {
+			b.WriteString("- `")
+			b.WriteString(strings.TrimSpace(bl))
+			b.WriteString("`\n")
+		}
+		b.WriteByte('\n')
+	}
+	if s.Contract != nil && !s.Contract.Empty() {
+		b.WriteString("## 跨域契约\n")
+		for _, sy := range s.Contract.Symbols {
+			stubNote := ""
+			if sy.Stub {
+				stubNote = fmt.Sprintf(" 【占位桩,责任方: %s,须实装】", strings.TrimSpace(sy.Owner))
+			}
+			if len(sy.Refs) > 0 {
+				fmt.Fprintf(&b, "- 符号 `%s`%s 声明于 `%s`，引用方: `%s`\n", sy.Symbol, stubNote, sy.File, strings.Join(sy.Refs, "`、`"))
+			} else {
+				fmt.Fprintf(&b, "- 符号 `%s`%s 声明于 `%s`\n", sy.Symbol, stubNote, sy.File)
+			}
+		}
+		for _, id := range s.Contract.DOMIDs {
+			fmt.Fprintf(&b, "- DOM id `%s` 声明于 `%s`\n", id.ID, id.File)
+		}
+		for i, sc := range s.Contract.Scripts {
+			fmt.Fprintf(&b, "- script 顺序 %d: `%s`\n", i+1, sc.File)
+		}
+		for _, sg := range s.Contract.Signatures {
+			fmt.Fprintf(&b, "- 签名 `%s`（%s）声明于 `%s`\n", sg.Signature, sg.Symbol, sg.File)
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")

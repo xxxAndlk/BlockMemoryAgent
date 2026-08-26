@@ -5,8 +5,10 @@ package tool
 
 import (
 	"context"
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -72,6 +74,108 @@ func TestFileSharedMemoryStore_KeysEnumerates(t *testing.T) {
 	}
 }
 
+// TestFileSharedMemoryStore_MultiColonKeyRoundtrip 验证多冒号 key（多 key spec：
+// "<agentID>:spec:<key>"，slot 段含 ":"）Set/Get/Keys 往返。
+// 回归（2026-08-25 水果忍者）：旧实现 slot 原样落文件名，Windows 上 ":" 被当
+// NTFS ADS 流分隔符——内容写进 ADS、主文件 0 字节无 .md 后缀，Keys() 枚举不到，
+// dispatcher 唯一候选回退失效，call_sub_agent 连续 spec missing。
+func TestFileSharedMemoryStore_MultiColonKeyRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFileSharedMemoryStore(dir)
+
+	ctx := context.Background()
+	key := "session-1-abc-1:spec:fruit-ninja"
+	if err := s.Set(ctx, key, "v"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got, err := s.Get(ctx, key)
+	if err != nil || got != "v" {
+		t.Fatalf("Get mismatch: got=%q err=%v", got, err)
+	}
+
+	keys := s.Keys(ctx)
+	if !slices.Contains(keys, key) {
+		t.Fatalf("expected key %q in Keys(), got %v", key, keys)
+	}
+
+	// 落盘文件名不得含 ":"（Windows ADS 陷阱），且必须有 .md 后缀（Keys 枚举前提）。
+	entries, err := os.ReadDir(filepath.Join(dir, ".bma", "shared"))
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(entries))
+	}
+	name := entries[0].Name()
+	if strings.Contains(name, ":") {
+		t.Fatalf("filename must not contain ':' (ADS hazard), got %q", name)
+	}
+	if !strings.HasSuffix(name, ".md") {
+		t.Fatalf("expected .md suffix, got %q", name)
+	}
+}
+
+// TestFileSharedMemoryStore_LegacyFilenameCompat 验证旧格式文件（"<hex>__<slot>.md"，
+// 升级前落盘）仍可被 Get/Keys 读取——desanitize 整 hex 解码失败时回退旧格式。
+func TestFileSharedMemoryStore_LegacyFilenameCompat(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFileSharedMemoryStore(dir)
+
+	root := filepath.Join(dir, ".bma", "shared")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// 手工落旧格式文件：hex(agentID)__spec.md
+	agentID := "session-1-abc-1"
+	oldName := hex.EncodeToString([]byte(agentID)) + "__spec.md"
+	if err := os.WriteFile(filepath.Join(root, oldName), []byte("legacy-value"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got, err := s.Get(context.Background(), agentID+":spec")
+	if err != nil || got != "legacy-value" {
+		t.Fatalf("legacy file should be readable, got=%q err=%v", got, err)
+	}
+	if !slices.Contains(s.Keys(context.Background()), agentID+":spec") {
+		t.Fatalf("expected legacy key %q in Keys(), got %v", agentID+":spec", s.Keys(context.Background()))
+	}
+}
+
+// TestFileSharedMemoryStore_UnsafeSlotCharsRoundtrip 验证 slot 含其他 Windows 非法
+// 字符（/、?、* 等）时整键 hex 编码仍往返一致。
+func TestFileSharedMemoryStore_UnsafeSlotCharsRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFileSharedMemoryStore(dir)
+
+	ctx := context.Background()
+	for _, key := range []string{
+		"session-1:spec:a/b",
+		"session-1:spec:美术资源",
+		"session-1:spec:a*b?c",
+	} {
+		if err := s.Set(ctx, key, "v-"+key); err != nil {
+			t.Fatalf("Set %s: %v", key, err)
+		}
+		got, err := s.Get(ctx, key)
+		if err != nil || got != "v-"+key {
+			t.Fatalf("Get %s mismatch: got=%q err=%v", key, got, err)
+		}
+	}
+	// 文件名全部无 ":" 且有 .md 后缀。
+	entries, err := os.ReadDir(filepath.Join(dir, ".bma", "shared"))
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 files, got %d", len(entries))
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ":") || !strings.HasSuffix(e.Name(), ".md") {
+			t.Fatalf("bad filename %q", e.Name())
+		}
+	}
+}
+
 // TestFileSharedMemoryStore_SubAgentKeyReversible 验证含 "/" 的子 Agent ID 键名可逆。
 // 子 Agent ID 形如 "session-1/domain-1"，roleID 含 "_"（如 code_assistant）。
 func TestFileSharedMemoryStore_SubAgentKeyReversible(t *testing.T) {
@@ -89,16 +193,8 @@ func TestFileSharedMemoryStore_SubAgentKeyReversible(t *testing.T) {
 		t.Fatalf("Get mismatch: got=%q want=v", got)
 	}
 
-	keys := s.Keys(ctx)
-	found := false
-	for _, k := range keys {
-		if k == key {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected key %q in Keys() got %v", key, keys)
+	if !slices.Contains(s.Keys(ctx), key) {
+		t.Fatalf("expected key %q in Keys() got %v", key, s.Keys(ctx))
 	}
 }
 

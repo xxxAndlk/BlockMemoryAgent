@@ -139,6 +139,15 @@ func (s *FileSharedMemoryStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// WorkDir 返回 store 对应的工作目录（root 上溯两级，root = <workDir>/.bma/shared）。
+// 供 WriteSpec 的 baseline_content 内联落盘定位 <workDir>/.bma/baseline/；非文件后端返回空串。
+func (s *FileSharedMemoryStore) WorkDir() string {
+	if s == nil {
+		return ""
+	}
+	return filepath.Dir(filepath.Dir(s.root))
+}
+
 // Keys 返回 root 下所有 MD 文件对应的 KV key（desanitize 还原）。
 // 供 injectKVMemory 枚举 parentID: 前缀的所有槽位，与 invalidateSharedMemoryForPath 遍历。
 func (s *FileSharedMemoryStore) Keys(ctx context.Context) []string {
@@ -199,33 +208,47 @@ func (s *FileSharedMemoryStore) filePath(key string) string {
 }
 
 // sanitizeKey 把 KV key "<agentID>:<slot>" 转为安全文件名。
-// agentID 段 hex 编码（可逆，兼容 "/" 与 "_"），slot 段原样保留。
+// agentID 段 hex 编码（可逆，兼容 "/" 与 "_"），slot 段原样保留（slot 为简单标识符如 spec/shared）。
+// slot 含 Windows 文件名非法字符（":\/<>|?*" 或控制字符）时整键 hex 编码——
+// 多 key spec 的 slot 为 "spec:<key>" 含 ":"，Windows 上 ":xx" 会被当 NTFS 备用数据流（ADS）：
+// 写入落在 ADS、主文件 0 字节且无 .md 后缀，Keys() 枚举不到（实证 2026-08-25 水果忍者
+// key=spec:fruit-ninja 派发连续 spec missing）。
 // 无 ":" 时整段 hex 编码（防御性，正常路径不触发）。
 func sanitizeKey(key string) string {
-	idx := strings.Index(key, ":")
-	if idx < 0 {
+	agentID, slot, found := strings.Cut(key, ":")
+	if !found {
 		return hex.EncodeToString([]byte(key))
 	}
-	agentID := key[:idx]
-	slot := key[idx+1:]
-	return hex.EncodeToString([]byte(agentID)) + "__" + slot
+	if safeFilenameSlot(slot) {
+		return hex.EncodeToString([]byte(agentID)) + "__" + slot
+	}
+	return hex.EncodeToString([]byte(key))
+}
+
+// safeFilenameSlot 判断 slot 是否可直接用作文件名段（Windows 合法且不歧义）。
+// 非法字符含 Windows 保留字符 "<>:\"/\\|?*" 与控制字符（<0x20）。
+// 中文等 Unicode 字符在 NTFS 合法，保持原样可读。
+func safeFilenameSlot(slot string) bool {
+	for _, r := range slot {
+		if r < 0x20 || strings.ContainsRune(`<>:"/\|?*`, r) {
+			return false
+		}
+	}
+	return true
 }
 
 // desanitizeKey 反向 sanitizeKey。
-// 还原 "<hex>__<slot>" -> "<agentID>:<slot>"。
-// 解析失败（hex 非法 / 无 "__" 分隔）返回 ok=false。
+// 先试整 stem hex 解码（slot 非法字符的整键编码，含原 ":" 结构）；
+// 失败回退旧格式 "<hex>__<slot>"（旧文件兼容：含 "__" 必非 hex，两分支无歧义）。
+// 旧格式解析失败（hex 非法 / 无 "__" 分隔）返回 ok=false。
 func desanitizeKey(stem string) (string, bool) {
-	idx := strings.Index(stem, "__")
-	if idx < 0 {
-		// 无分隔符：整体 hex 解码
-		agentBytes, err := hex.DecodeString(stem)
-		if err != nil {
-			return "", false
-		}
+	if agentBytes, err := hex.DecodeString(stem); err == nil {
 		return string(agentBytes), true
 	}
-	hexAgent := stem[:idx]
-	slot := stem[idx+2:]
+	hexAgent, slot, found := strings.Cut(stem, "__")
+	if !found {
+		return "", false
+	}
 	agentBytes, err := hex.DecodeString(hexAgent)
 	if err != nil {
 		return "", false
