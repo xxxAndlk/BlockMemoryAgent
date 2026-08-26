@@ -1294,8 +1294,10 @@ func (t *callSubAgentTool) Description() string {
 		"写明负责哪些文件/模块、不碰哪些。会注入子 Agent 系统提示词，长跑不丢。\n\n" +
 		"【mode 字段】（可选）派发执行模式：react（默认）/ reflection / plan_execute。" +
 		"琐碎单步任务省略；正确性敏感任务（算法/迁移/重构）用 reflection——执行后自动对照验收标准自检，不达标带反馈重试；" +
-		"多步骤长任务（多文件/多阶段）用 plan_execute——先出步骤计划（TUI 可见）再逐步执行。判断不准时省略，默认 react。\n\n" +
-		"【verify_kind 字段】（可选）校验分层：auto（默认，按角色与执行模式自动选——代码/测试助手自动要求可执行证据、自检模式自动 rubric 评审）/ executable（必须有测试/lint/--check 成功运行的客观证据，否则会反馈重试 1 轮）/ rubric（独立评审模型按验收标准逐条判）/ none（跳过校验）。判断不准时省略，默认 auto。注意：verify_kind 与 mode 是不同字段，勿把 mode 的值填到本字段。\n\n" +
+		"多步骤长任务（多文件/多阶段）用 plan_execute——先出步骤计划（TUI 可见）再逐步执行。判断不准时省略，默认 react。" +
+		"非编码任务（文案/分析/规划）默认省略--主观质量机器评审不了，靠派发方纸面收口；仅客观正确性敏感（数值结论/事实断言）用 reflection。\n\n" +
+		"【verify_kind 字段】（可选）校验分层：auto（默认，按角色与执行模式自动选——代码/测试助手自动要求可执行证据、自检模式自动 rubric 评审）/ executable（必须有测试/lint/--check 成功运行的客观证据，否则会反馈重试 1 轮）/ rubric（独立评审模型按验收标准逐条判）/ none（跳过校验）。\n\n" +
+		"判断不准时省略，默认 auto。非编码任务省略即可（domain 角色默认 none）。注意：verify_kind 与 mode 是不同字段，勿把 mode 的值填到本字段。\n\n" +
 		"【tools_hint 字段】（可选）建议工具集：子 Agent 需要插件工具（如画图/搜索/浏览器）时，在此声明工具名列表（来自 tool_catalog），" +
 		"dispatcher 校验 ∩ 子 Agent 角色权限天花板后预挂载——子 Agent 当轮即可见对应插件工具，无需自己挂载。" +
 		"天花板外（插件 roles 白名单不允许）的越界项会被忽略并随本调用结果回告，不放大权限。\n\n" +
