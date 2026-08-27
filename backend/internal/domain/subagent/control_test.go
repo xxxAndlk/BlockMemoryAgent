@@ -92,6 +92,8 @@ func TestCancelAgentTool_CancelsChild(t *testing.T) {
 	if got == nil {
 		t.Fatal("parent mailbox never got cancel notification")
 	}
+	// 注意区分：cancel_agent 显式取消（本用例）retryable=false（上级有意终止）；
+	// 心跳假死 kill（killStuckSubAgent）retryable=true（盘上产物可续建）。
 	if !strings.HasPrefix(got.Body, "[failure kind=killed retryable=false]") {
 		t.Fatalf("cancel notify should carry killed marker, got: %s", got.Body)
 	}

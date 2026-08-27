@@ -312,6 +312,9 @@ type Dispatcher struct {
 	// 收尾卡死被杀的子 Agent 常已把产物全部落盘（2026-08-19 引擎 Agent：文件 15:54 落盘、
 	// 回执因 judge 挂死拖到 17:03），父级需要知道盘上有货可按现状验收，而非从零重派。
 	lastWrites sync.Map
+	// recentActs 存子 Agent 杀前最近活动（llm_delta 尾文本 + 最近工具调用行），
+	// kill 回告时机械归纳"已完成事项"回传父 Agent。
+	recentActs sync.Map // subAgentID -> *recentActState
 	// subMeta 存子 Agent 的 cancel/parentID/sessionID/doneOnce，供巡检卡死时主动 cancel + 兜底递减。
 	// doneOnce 保证 patrol 与 goroutine 任一方 trackChildDone 仅触发一次，防双递减。
 	subMeta sync.Map // subAgentID -> *subAgentMeta
@@ -533,6 +536,19 @@ func (d *Dispatcher) WithDomainHeartbeatTimeout(t time.Duration) *Dispatcher {
 // bubbleActivity 把子 Agent 活动沿 parentID 链向上冒泡（TODO #25-3）：
 // domain 等子/等回信期间自身无 LLM/工具活动，靠后代活动刷新保持存活；
 // 后代全静默后 domain 超其阈值才判假死。subMeta 缺失或链顶（meta/会话）终止。
+// activityReporterFn 返回注入 ReActAgent 的活动上报闭包（WithActivityReporter）。
+// Load-per-call 而非捕获指针：热驻 domain 的 activity 条目会被 enterIdle/挂起收尾
+// Delete 后由 rearmSlotActivity 重建为新 atomic，闭包捕获旧指针会写进已废弃条目。
+func (d *Dispatcher) activityReporterFn(agentID string) func() {
+	return func() {
+		now := time.Now().UnixNano()
+		if v, ok := d.activity.Load(agentID); ok {
+			v.(*atomic.Int64).Store(now)
+		}
+		d.bubbleActivity(agentID, now)
+	}
+}
+
 func (d *Dispatcher) bubbleActivity(agentID string, now int64) {
 	cur := agentID
 	for depth := 0; depth < 32; depth++ { // 深度上限防御（三层 Agent 树足够）
@@ -613,6 +629,65 @@ func (d *Dispatcher) recentWrittenFiles(subAgentID string, within time.Duration)
 		}
 	}
 	return out
+}
+
+// recentActState 是单个子 Agent 的最近活动缓存（kill 时机械归纳"已完成事项"用：
+// ctx 已取消无法再起 LLM 总结，只能取杀前最后一手信息）。
+type recentActState struct {
+	mu       sync.Mutex
+	lastText string   // 最近一次 LLM 叙述片段（llm_delta 累积文本）
+	tools    []string // 最近工具调用行（新→旧）
+}
+
+// recentActMaxTools 是保留的最近工具调用条数上限。
+const recentActMaxTools = 6
+
+// recordRecentActivity 在 liveFn 拦截点记录最近叙述与工具调用（低频事件，量级同
+// 工具调用次数；llm_delta 每次仅覆盖 lastText 一个字符串）。
+func (d *Dispatcher) recordRecentActivity(subAgentID string, ev agent.LiveEvent) {
+	switch ev.Kind {
+	case agent.LiveEventLLMDelta:
+		text := strings.TrimSpace(ev.Text)
+		if text == "" {
+			return
+		}
+		v, _ := d.recentActs.LoadOrStore(subAgentID, &recentActState{})
+		st := v.(*recentActState)
+		st.mu.Lock()
+		st.lastText = textutil.TruncateRunes(text, 300, "…")
+		st.mu.Unlock()
+	case agent.LiveEventToolCall:
+		line := strings.Join(strings.Fields(ev.Input), " ")
+		v, _ := d.recentActs.LoadOrStore(subAgentID, &recentActState{})
+		st := v.(*recentActState)
+		st.mu.Lock()
+		next := []string{ev.Tool + "(" + textutil.TruncateRunes(line, 80, "…") + ")"}
+		next = append(next, st.tools...)
+		if len(next) > recentActMaxTools {
+			next = next[:recentActMaxTools]
+		}
+		st.tools = next
+		st.mu.Unlock()
+	}
+}
+
+// recentActivitySummary 渲染 kill 回告附言段；无记录返回空串。
+func (d *Dispatcher) recentActivitySummary(subAgentID string) string {
+	v, ok := d.recentActs.Load(subAgentID)
+	if !ok {
+		return ""
+	}
+	st := v.(*recentActState)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var b strings.Builder
+	if st.lastText != "" {
+		b.WriteString("- 最近自述：" + st.lastText + "\n")
+	}
+	if len(st.tools) > 0 {
+		b.WriteString("- 最近工具调用（由新到旧）：" + strings.Join(st.tools, "、"))
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // PingActivity 外部保活探针（等待用户答复场景）：审批/提问阻塞期间由会话层周期性调用，
@@ -719,13 +794,21 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
 		meta.cancel()
 	}
 	meta.doneOnce.Do(func() { d.trackChildDone(meta.parentID) })
-	killMsg := failureMarker(FailureKindKilled, false) + "\n" +
-		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, threshold)
+	// retryable=true（2026-08-27）：killed 实际多死于验证阶段长工具执行中，盘上产物
+	// 大概率可续建——retryable=false 曾误导父 LLM 从零重派（fruit 任务实证）。
+	// 自动重派策略不受影响：runSubAgentWithAutoRetry 只认 kind=error+叶子，标记仅供父决策。
+	killMsg := failureMarker(FailureKindKilled, true) + "\n" +
+		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。", subAgentID, threshold)
 	// 盘上产物回告（2026-08-19）：收尾卡死被杀的子 Agent 常已把文件全部落盘，
 	// 只是回执被挂死的收尾自检拖住--父级据此可按盘上现状直接验收，不必从零重派。
 	if paths := d.recentWrittenFiles(subAgentID, 30*time.Minute); len(paths) > 0 {
 		killMsg += "\n该 Agent 近期已写入以下文件（盘上产物大概率可用，可按盘上现状直接验收，无需从零重派）：\n- " +
 			strings.Join(paths, "\n- ")
+	}
+	// 杀前最后一手信息（叙述片段+工具轨迹）：机械归纳已完成事项回传父 Agent，
+	// 供其判断续建范围而非重派。
+	if s := d.recentActivitySummary(subAgentID); s != "" {
+		killMsg += "\n\n终止前活动摘要：\n" + s
 	}
 	d.notify(meta.parentID, subAgentID, killMsg, nil)
 	if d.treeFn != nil && meta.sessionID != "" {
@@ -747,10 +830,44 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
 			}
 		}
 	}
+	// 级联停止：被杀 Agent 名下所有后代子 Agent 一并取消（防孤儿叶子继续空跑，
+	// 其结果无人消费）。每代复用 killStuckSubAgent 完整收尾链。
+	d.killDescendants(subAgentID, meta.sessionID)
 	d.activity.Delete(subAgentID)
 	d.running.Delete(subAgentID)
 	if d.mailbox != nil {
 		d.mailbox.Purge(subAgentID)
+	}
+}
+
+// killDescendants BFS 遍历树快照，递归对后代调用 killStuckSubAgent（cancel + notify 父 +
+// tree.Finish + salvage + purge）。只处理 Running/Paused 节点；LoadAndDelete 幂等 +
+// visited 防环，重复杀无害。
+func (d *Dispatcher) killDescendants(rootID, sessionID string) {
+	if sessionID == "" || d.treeFn == nil {
+		return
+	}
+	t := d.treeFn(sessionID)
+	if t == nil {
+		return
+	}
+	visited := map[string]bool{rootID: true}
+	queue := []string{rootID}
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		for _, n := range t.Snapshot() {
+			if n.ParentID != pid || visited[n.ID] {
+				continue
+			}
+			if n.Status != orchestrator.StatusRunning && n.Status != orchestrator.StatusPaused {
+				continue
+			}
+			visited[n.ID] = true
+			queue = append(queue, n.ID)
+			log.Printf("[subagent] CASCADE KILL: parent=%s child=%s", pid, n.ID)
+			d.killStuckSubAgent(n.ID)
+		}
 	}
 }
 
@@ -2271,6 +2388,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		forwarder := d.liveFn
 		sub = sub.WithLiveEvents(func(ev agent.LiveEvent) {
 			d.recordFileWrite(subAgentID, ev)
+			d.recordRecentActivity(subAgentID, ev)
 			forwarder(sid, ev)
 		})
 	}

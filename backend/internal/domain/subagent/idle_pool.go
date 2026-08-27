@@ -787,15 +787,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 	// 假死 killed（2026-08-27 实证：3 个 domain 死于验证阶段长工具执行中）。
 	// Load-per-call 而非捕获指针：enterIdle/挂起收尾会 Delete activity、
 	// rearmSlotActivity 每任务重建新 atomic，闭包捕获旧指针会写进已废弃条目。
-	if d.liveFn != nil || true { // 无条件注入：巡检与 liveFn 解耦
-		sub = sub.WithActivityReporter(func() {
-			now := time.Now().UnixNano()
-			if v, ok := d.activity.Load(s.id); ok {
-				v.(*atomic.Int64).Store(now)
-			}
-			d.bubbleActivity(s.id, now)
-		})
-	}
+	sub = sub.WithActivityReporter(d.activityReporterFn(s.id))
 	if d.log != nil {
 		sub = sub.WithLogger(d.log.WithSession(s.sessionID).WithAgent(roleDef.Name))
 	}
@@ -804,6 +796,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 		sid := s.sessionID
 		sub = sub.WithLiveEvents(func(ev agent.LiveEvent) {
 			d.recordFileWrite(s.id, ev)
+			d.recordRecentActivity(s.id, ev)
 			forwarder(sid, ev)
 		})
 	}
