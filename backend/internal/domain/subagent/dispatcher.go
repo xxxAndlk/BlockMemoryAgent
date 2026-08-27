@@ -1530,6 +1530,20 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	takeover, _ := args["takeover"].(string)
 	takeover = strings.TrimSpace(takeover)
 
+	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
+	parentID := agent.AgentIDFromContext(ctx)
+	if parentID == "" {
+		return &tool.Result{Tool: "call_sub_agent", Error: "missing parent agent context"}
+	}
+
+	// 同名热驻 Idle 槽隐式复用（先于参数校验：空 responsibility 会被 validateDispatchArgs
+	// 先拒，永远到不了复用分流，见 resolveIdleSiblingReuse 注释）。
+	if reuseAgentID == "" && roleID == "domain" {
+		if id := d.resolveIdleSiblingReuse(ctx, parentID, domain); id != "" {
+			reuseAgentID = id
+		}
+	}
+
 	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode, verifyKind)
 	if reuseAgentID == "" && msg != "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
@@ -1537,11 +1551,6 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	// reuse 模式 role_id 可省（复用槽沿用原角色）；task 仍必填。
 	if reuseAgentID != "" && strings.TrimSpace(task) == "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: "task is required", Category: tool.ResultCategoryValidationRejected}
-	}
-	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
-	parentID := agent.AgentIDFromContext(ctx)
-	if parentID == "" {
-		return &tool.Result{Tool: "call_sub_agent", Error: "missing parent agent context"}
 	}
 	specMsg, specWarn := d.checkSpecBeforeDispatch(ctx, parentID, domain)
 	if specMsg != "" {
@@ -1600,6 +1609,41 @@ func (d *Dispatcher) checkActiveSiblingDomain(ctx context.Context, parentID, dom
 		switch n.Status {
 		case orchestrator.StatusRunning, orchestrator.StatusPaused, orchestrator.StatusIdle:
 			return fmt.Sprintf("domain %q 已有同名活跃实例（%s，状态 %s）：同名 domain 并行会让回灌摘要无法区分责任域。请按职责细分命名（如 %s核心层/%s命令层），或等其回传后再派", domainKey, n.ID, n.Status, domainKey, domainKey)
+		}
+	}
+	return ""
+}
+
+// resolveIdleSiblingReuse 同名热驻空闲槽隐式复用解析：domain 与同父下某热驻 Idle
+// 实例同名、且池内槽健在时返回该槽 agent_id，调用方将其视同显式 reuse_agent_id 走
+// dispatchToIdleSlot——等效自动复用。仅精确同名；Running/Paused 不命中（仍走
+// checkActiveSiblingDomain 并行拒绝）；终态节点无热驻槽，天然不命中。
+// 背景（2026-08-27 派发死循环实证）：MetaAgent 叙述复用意图却漏传 reuse_agent_id
+// （整场 0 次），同名+空 responsibility 双错循环 8 连败；与其硬拒自纠，不如直接路由。
+// 注意必须在 validateDispatchArgs 之前解析——空 responsibility 会被参数校验先拒，
+// 永远到不了复用分流。热驻关闭/树不可用返回空串零行为变化。
+func (d *Dispatcher) resolveIdleSiblingReuse(ctx context.Context, parentID, domain string) string {
+	domain = strings.TrimSpace(domain)
+	if !d.hotEnabled() || domain == "" || d.treeFn == nil {
+		return ""
+	}
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		sid = sessionIDFromAgentID(parentID)
+	}
+	if sid == "" {
+		return ""
+	}
+	t := d.treeFn(sid)
+	if t == nil {
+		return ""
+	}
+	for _, n := range t.Snapshot() {
+		if n.ParentID != parentID || n.Role != "domain" || strings.TrimSpace(n.Domain) != domain {
+			continue
+		}
+		if n.Status == orchestrator.StatusIdle && d.pool.slot(sid, n.ID) != nil {
+			return n.ID
 		}
 	}
 	return ""
@@ -1949,6 +1993,10 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 	if len(raw) > maxBatch {
 		return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("batch too large: %d 项（max %d）。超过请合并领域或分批", len(raw), maxBatch), Category: tool.ResultCategoryValidationRejected}
 	}
+	parentID := agent.AgentIDFromContext(ctx)
+	if parentID == "" {
+		return &tool.Result{Tool: "call_sub_agents", Error: "missing parent agent context"}
+	}
 
 	// 逐项校验参数；超软限（默认 3000 runes）未达硬限（默认 4000）软着陆放行并收集警告（TODO #38-3，口径见 validateDispatchArgs）。
 	type batchItem struct {
@@ -1976,6 +2024,12 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.takeover = strings.TrimSpace(it.takeover)
 		it.toolsHint = d.toolsHintArg(m) // TODO #52：建议工具集（∩ 子 Agent 天花板后预挂载）
 		it.wallClock = d.wallClockArg(m)
+		// 同名热驻 Idle 槽隐式复用（先于参数校验，口径同单派入口）。
+		if it.reuseAgentID == "" && it.roleID == "domain" {
+			if id := d.resolveIdleSiblingReuse(ctx, parentID, it.domain); id != "" {
+				it.reuseAgentID = id
+			}
+		}
 		if msg, warning := t.dispatcher.validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode, it.verifyKind); msg != "" {
 			if it.reuseAgentID == "" {
 				return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
@@ -2004,10 +2058,6 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		seenDomains[name] = i
 	}
 
-	parentID := agent.AgentIDFromContext(ctx)
-	if parentID == "" {
-		return &tool.Result{Tool: "call_sub_agents", Error: "missing parent agent context"}
-	}
 	// 批量派发（call_sub_agents）：多 domain 各自有专属 spec 时逐项校验（每个 domain
 	// 的 spec 必须新鲜，TODO #65）；无 domain 项时校验遗留单键一次。
 	anyDomain := false

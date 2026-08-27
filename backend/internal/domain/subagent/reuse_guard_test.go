@@ -178,3 +178,59 @@ func TestCheckIdleDomainReuse_DisabledHotResidentNoop(t *testing.T) {
 		t.Fatalf("hot resident disabled should pass, got %q", msg)
 	}
 }
+
+// --- 同名热驻 Idle 槽隐式复用（2026-08-27 派发死循环根治） ---
+
+// TestImplicitReuse_SameNameIdleRoutesToSlot：MetaAgent 漏传 reuse_agent_id 且空
+// responsibility 的同名重派，不再落进 "responsibility required"/"同名活跃实例"
+// 双错循环，而是自动路由到热驻槽（等价隐式 reuse_agent_id）。
+func TestImplicitReuse_SameNameIdleRoutesToSlot(t *testing.T) {
+	provider := &scriptProvider{lines: []string{"domain result", "domain result"}}
+	_, _, tr, toolsReg := newIdleTestEnv(t, provider, time.Hour)
+	subID := dispatchIdleDomain(t, toolsReg, "jiujie", "负责九劫服务器部署")
+	waitTreeIdle(t, tr, subID)
+
+	// 事故原案重放：domain 精确同名 + responsibility 缺省（复用沿用槽内冻结值）。
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id": "domain",
+		"task":    "补验收尾任务",
+		"domain":  "jiujie",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("same-name idle re-dispatch should implicitly reuse, err=%v res=%+v", err, res)
+	}
+	if !strings.Contains(res.Output, subID) {
+		t.Fatalf("implicit reuse should target original slot %s, got %q", subID, res.Output)
+	}
+	count := 0
+	for _, n := range tr.Snapshot() {
+		if n.Role == "domain" && n.Domain == "jiujie" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("implicit reuse created duplicate node: %d nodes for domain jiujie, want 1", count)
+	}
+}
+
+// TestImplicitReuse_BatchSameNameItemRoutesToSlot：批量派发单入口同样享受隐式复用，
+// 同名项路由热驻槽、无关新项正常新建。
+func TestImplicitReuse_BatchSameNameItemRoutesToSlot(t *testing.T) {
+	provider := &scriptProvider{lines: []string{"domain result", "domain result", "domain result"}}
+	_, _, tr, toolsReg := newIdleTestEnv(t, provider, time.Hour)
+	subID := dispatchIdleDomain(t, toolsReg, "deploy", "负责部署")
+	waitTreeIdle(t, tr, subID)
+
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agents", map[string]any{
+		"tasks": []any{
+			map[string]any{"role_id": "domain", "task": "部署后续调整", "domain": "deploy"},
+			map[string]any{"role_id": "domain", "task": "写财务周报脚本", "domain": "finance", "responsibility": "负责财务报表"},
+		},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("batch with same-name idle item should succeed, err=%v res=%+v", err, res)
+	}
+	if !strings.Contains(res.Output, subID) {
+		t.Fatalf("reuse item should map to original slot id %s, got %q", subID, res.Output)
+	}
+}
