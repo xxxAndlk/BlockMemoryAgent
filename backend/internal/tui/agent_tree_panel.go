@@ -111,7 +111,17 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 	// 挤出可视区(实证:第二轮运行时编排面板看似不刷新,全是上一轮 Done 卡片)。
 	nodes, err := agentFacade.Tree(context.Background(), s.ID)
 	if err == nil {
-		at.nodes = append(at.nodes, orchestratorNodesToTreeNodes(filterPrevRoundNodes(nodes, roundStart), s.ID)...)
+		roundNodes := filterPrevRoundNodes(nodes, roundStart)
+		// 热驻节点（任务完结转 Idle 待复用）不在编排面板展示：用户视角工作已由
+		// 计划面板 Done 行呈现，复用清单只供 MetaAgent 派发决策（空闲清单注入）。
+		live := make([]orchestrator.Node, 0, len(roundNodes))
+		for _, n := range roundNodes {
+			if n.Status == orchestrator.StatusIdle {
+				continue
+			}
+			live = append(live, n)
+		}
+		at.nodes = append(at.nodes, orchestratorNodesToTreeNodes(live, s.ID)...)
 	}
 
 	// 若会话处于待澄清状态，追加一个占位节点提示用户（含问题文本，TODO #53）：

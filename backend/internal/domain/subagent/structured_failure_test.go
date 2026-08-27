@@ -9,6 +9,7 @@ package subagent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -57,9 +58,23 @@ func TestFailureKindOf(t *testing.T) {
 		{"generic", errors.New("boom"), FailureKindError},
 	}
 	for _, c := range cases {
-		if got := failureKindOf(c.err); got != c.want {
+		if got := failureKindOf(context.Background(), c.err); got != c.want {
 			t.Fatalf("%s: failureKindOf=%s want=%s", c.name, got, c.want)
 		}
+	}
+}
+
+// TestFailureKindOf_LLMCallDeadline LLM 调用内部超时（err 带 llm generate 前缀且运行
+// ctx 存活）归 error 而非 timeout；同一错误在 ctx 已终结（墙钟）时仍归 timeout。
+func TestFailureKindOf_LLMCallDeadline(t *testing.T) {
+	llmErr := fmt.Errorf("run: llm generate: openai-chat scan: %w", context.DeadlineExceeded)
+	if got := failureKindOf(context.Background(), llmErr); got != FailureKindError {
+		t.Fatalf("llm call deadline with live ctx: kind=%s want=%s", got, FailureKindError)
+	}
+	expired, cancel := context.WithTimeout(context.Background(), -time.Second)
+	defer cancel()
+	if got := failureKindOf(expired, llmErr); got != FailureKindTimeout {
+		t.Fatalf("same err under expired ctx (wall clock): kind=%s want=%s", got, FailureKindTimeout)
 	}
 }
 

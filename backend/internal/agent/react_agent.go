@@ -894,19 +894,21 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 		keepalive = 30 * time.Second
 	}
 	// 流式块间空闲超时（2026-08-20）：ark glm-5.3 流式一天三次中途静默
-	// （440s / 15min / 20min 零 chunk，均等满整次调用墙钟才报错）。首块之后的
-	// chunk 间隔超过阈值即判流死、取消流让 generate 重试；首块前静默保留整体
-	// 墙钟兜底（thinking 模型首 token 前静默数分钟是合法的，不能误杀）。
+	// （440s / 15min / 20min 零 chunk，均等满整次调用墙钟才报错）。chunk 间隔超过
+	// 阈值即判流死、取消流让 generate 重试；2026-08-27 起首块前同样设卡
+	// （endpoint 假死零字节连接原先只有 provider 600s 硬超时且不重试）。
 	idleTimeout := a.streamIdleTimeout
 	if idleTimeout <= 0 {
 		idleTimeout = defaultStreamIdleTimeout
 	}
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
+	started := time.Now()
 	var idleMu sync.Mutex
 	lastChunk := time.Now()
 	firstChunk := false
 	idleKilled := false
+	killPhase := "" // "before first chunk" / "after first chunk"
 	keepaliveDone := make(chan struct{})
 	defer close(keepaliveDone)
 	go func() {
@@ -921,12 +923,22 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 			case <-ticker.C:
 				a.touchActivity()
 				idleMu.Lock()
-				idle := firstChunk && time.Since(lastChunk) > idleTimeout
-				idleMu.Unlock()
-				if idle {
-					idleMu.Lock()
+				// 首块前也设卡口：endpoint 假死（连接建立后零字节）只有 provider
+				// http.Client 600s 整体兜底，且该错误属 DeadlineExceeded 不重试，
+				// 整个 Agent 白死 10 分钟（实证 2026-08-27 domain-1/4 连续 10m0.0s
+				// FAIL partial=""）。首块前与首块后同用 idleTimeout 判静默。
+				stall := time.Since(lastChunk) > idleTimeout
+				phase := "after first chunk"
+				if !firstChunk {
+					stall = time.Since(started) > idleTimeout
+					phase = "before first chunk"
+				}
+				if stall {
 					idleKilled = true
-					idleMu.Unlock()
+					killPhase = phase
+				}
+				idleMu.Unlock()
+				if stall {
 					cancelStream()
 					return
 				}
@@ -936,10 +948,12 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 	for resp, err := range sp.NewStreaming(streamCtx, req) {
 		if err != nil {
 			idleMu.Lock()
-			killed := idleKilled
+			killed, phase := idleKilled, killPhase
 			idleMu.Unlock()
 			if killed && ctx.Err() == nil {
-				return nil, fmt.Errorf("stream idle timeout (no chunk for %s after first chunk): %w", idleTimeout, err)
+				// cancelStream 触发的底层错误是 context canceled（非 DeadlineExceeded），
+				// RetryLLM 判为瞬时故障走重试——正是本卡口的目的。
+				return nil, fmt.Errorf("stream stall timeout (no chunk for %s %s): %w", idleTimeout, phase, err)
 			}
 			return nil, err
 		}

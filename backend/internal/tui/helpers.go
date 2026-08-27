@@ -108,7 +108,8 @@ func (m *Model) boardSnapshot(s *server.Session) board.Snapshot {
 	for i, n := range nodes {
 		st := board.TaskInProgress
 		switch n.Status {
-		case orchestrator.StatusDone, orchestrator.StatusCancelled:
+		case orchestrator.StatusDone, orchestrator.StatusCancelled, orchestrator.StatusIdle:
+			// Idle=任务完结热驻留态（Tree.Idle），合成计划任务应翻绿；Wake 复用会翻回 Running。
 			st = board.TaskDone
 		case orchestrator.StatusFailed:
 			st = board.TaskFailed

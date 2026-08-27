@@ -671,8 +671,8 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 		}
 		log.Printf("[subagent] FAIL: sub=%s domain=%s duration=%s err=%v partial=%q", s.id, s.domain, duration, err, truncateRunes(partial, 200))
 		salvage := d.salvageFailure(taskCtx, s.parentID, s.id, s.slotRoleDef(), s.domain, result, partial)
-		kind := failureKindOf(err)
-		msg := failureMarker(kind, false) + "\n" + formatSubAgentFailure(err, result, d.effectiveTimeout(s.id), partial)
+		kind := failureKindOf(taskCtx, err)
+		msg := failureMarker(kind, false) + "\n" + formatSubAgentFailure(taskCtx, err, result, d.effectiveTimeout(s.id), partial)
 		if salvage != "" {
 			msg += "\n\n" + salvagePrefixMarker + salvage
 		}
@@ -684,7 +684,7 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 			treeStatus = orchestrator.StatusUnverified
 		}
 		d.boardUpdate(taskCtx, s.parentID, s.domain, boardSt, truncateRunes(msg, 300))
-		d.treeFinishStatus(taskCtx, s.id, partial, treeStatus, formatSubAgentFailure(err, result, d.effectiveTimeout(s.id), partial))
+		d.treeFinishStatus(taskCtx, s.id, partial, treeStatus, formatSubAgentFailure(taskCtx, err, result, d.effectiveTimeout(s.id), partial))
 		d.notify(s.parentID, s.id, msg, files)
 		d.trackChildDone(s.parentID)
 		return domainTaskFailed

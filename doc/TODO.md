@@ -11,6 +11,7 @@
     - Agent执行任务,先拆解任务,拆解为不会干涉的单元任务后,一个单元任务使用一个干净上下文的Agent编码助手执行,压缩Token成本。执行完成后暂时不销毁,一定时间不使用直接消耗,有使用则重置使用时间并加长使用时间。原因：我在使用claude时,经常会有不切换会话在同一个会话使用重复上下文一直执行任务。越到后面越会上下文污染严重导致模型幻觉,并且上下文上每一次输入的Token成本也会激增。可评估是否可以替换块记忆,块记忆过于抽象,可用性与传统感觉不明显,。或者把块记忆与每个单独感觉上下文的Agent进行集成融合等尝试。现在的领域子Agent排发就相当于这个方案的初始模式,每个领域干净上下文负责自己的事。
 
 42. **通信架构重构：黑板模式（共享底座 + 选择性摄取）**  ← 来源：2026-08-13 CrewAI / MS Agent Framework 对比讨论
+    - **当前状态**：Phase B 已落地（2026-08-13，变更.md 任务 40）——scope 标注 + 每轮兄弟产出摄取 + salvage 统一收口黑板。剩余开放：mailbox 降级为信号层、子 Agent 上下文按 scope 切片注入替代父全量 spec 注入。
     - 背景：当前 agent 间通信 = mailbox（显式点对点消息，隔离强）+ 父独占 history（子 Agent 间无共享态势）。MS Agent Framework GroupChat 全量重广播 transcript（共享强但上下文互染、token 爆）。两者都不理想。本项目 event 流 + block memory(pgvector) + agent tree + task board 已是 append-only 黑板底座，缺"选择性摄取"检索层。此重构是去硬化件（#44）与可信校验（#43 证据核对取兄弟产物）的前置依赖。
     - 设计（blackboard architecture：共享底座 + 选择性摄取）：
       1. 写侧统一：所有 agent 产出（工具结果/think/子 Agent 完成摘要/fact）落 append-only 黑板（复用 event 流 + block memory + shared slot），不点对点发完整内容。mailbox 降级为"有新产出"信号 + 产物指针，不再承载内容。
@@ -29,12 +30,8 @@
     - 不做：不做全量共享 transcript（MS GroupChat 模式，上下文互染 token 爆）；不做跨 session 黑板复用（会话级，#35 Phase 2 跨重启恢复另管）；不删 mailbox（降级为信号层保留）；不立即删去重件/空转门（#44 黑板稳定后再删）。
     - 开放风险：检索质量依赖 retriever（embedding 可能漏"不知道该查"项）--scope 显式声明 + 确定性匹配优先缓解。
 
-43. **校验分层重构：可执行 > 证据核对 > 交叉模型 rubric，fail-closed**（✅ 已完成 2026-08-13，doc/变更.md 任务 41；来源：CrewAI/MS Agent Framework 对比讨论"当前校验很有问题"）
-    - **前提修正（重要）**：原设计"复用 verifyloop 作 L0/L1 壳"失效——verifyloop 接线已于 2026-08-08 整体移除（A/B 实证自动派验证 Agent 闭环=负资产）。落地**不碰 verifyloop、不派任何验证 Agent、不加开关**：L0=确定性证据扫描（零 LLM 零 spawn），L1 证据段并入 L2 rubric judge prompt（【修改文件】+【验证证据】段），verify_kind 枚举简化为 auto/executable/rubric/none。
-    - **落地**：L0 executable=扫历史 RunCommand 验证类命令（IsVerificationCommand 同口径）Success 证据，缺证据 1 轮反馈重试→verify_missing 报父（附产出全文）；L2=ReflectEngine judge 交叉模型（config judge_role 默认 prompt_reviewer）+ fail-closed（judge 错/坏 JSON→Unverified→kind=unverified 报父，绝不静默 pass）+ rubric 分项 checks；路由 verify_kind 默认 auto（reflection→rubric、code/test/reviewer→executable、其余 none）；成功摘要前缀【校验:通过(L0 证据/L2 rubric)】。
-    - 遗留：塔防回归观察 auto-executable 误报率（无测试基建任务会 verify_missing，噪音大可收紧 auto 推断）。08-14 实证一处误报已修：IsVerificationCommand 认不出 `node -c`（领域提示词规定的 JS 语法检查写法，塔防验收唯一证据来源），补 node -c/go build/go vet/py_compile/pytest 标记（变更.md 任务 42）；另修 verify_kind 描述诱导（模型抄 mode 值）+ verify_missing 通知正文翻倍（打捞摘要与产出全文重复）。继续观察。
-
 44. **去调度硬化件：根因修复后退役补偿控制**  ← 来源：同上对比讨论（"调度硬化需经苦难去除"）
+    - **当前状态**：主体已落地（2026-08-14，变更.md 任务 46 退役批次）——探索预算、连杀指纹、同域去重 findPendingDomainSibling、等待叙事空转门四件全退役；轮/token/墙钟重定位为框架终止条件。剩余开放：心跳 watchdog 仍保留（08-27 任务 112 又修一次误杀根因），退役条件=连续 N 个塔防任务零 HEARTBEAT KILL；spec 强制门 + 终止条件按决策永久保留。
     - 背景：当前调度硬化件（心跳 watchdog kill、派发预算 MaxTotalDispatches、同域去重 findPendingDomainSibling、等待叙事空转门、spec 强制门）= 系统不成熟期防 Token 爆炸/误杀的补偿控制，每条掩一个根因 bug。根因修了就该删，不是"生产成熟度特性"。目标：控制项数随版本递减到零（除 spec 门 + 终止条件）。前置依赖 #42 黑板（替去重/空转门）+ #43 校验（替预算 backstop）+ 08-13 流式活动上报（已替心跳假死判）。
     - 退役映射（每条 = 根因修法 + 退役条件）：
       1. **心跳 watchdog idle>5min kill**：根因=LLM 调用看起来假死。08-13 已修流式 delta 持续上报活动；08-14 补零 chunk 盲区（首 token 前长考静默，流存活期间 30s 保活定时器上报，真实挂死由 sub_agent_timeout 墙钟兜底）。退役条件=N 个塔防任务无 HEARTBEAT KILL 误杀 -> 删 patrol/killStuckSubAgent，仅留 provider 网络调用超时（归 LLM 调用层，非"假死"概念）。
@@ -62,6 +59,34 @@
     - 现象：`injectScopedRecall`（dispatcher.go:1571）→ `knowledge_store.go:216` `pg.Embed` 走 60s HTTP 超时 × 重试（client.go:51），且 fallback `SearchBlockMemoryByGoal` 用派发 ctx（30 分钟超时）。embedding 端点间歇性挂起时阻塞派发 goroutine：实证 chain-dependency 出现 158s、longctx-multifile 出现 61s 的"派发→首次 LLM"沉默延迟（占两场景墙钟 ~12%）；pseudo embed 配置下同位置为 0s。
     - 复杂原因：要给召回链路独立短超时 + 熔断，需权衡召回质量降级策略（熔断期间静默跳过召回 vs 降级注入），涉及 `PostgresStore.Embed`/Recall 链路多处调用点。
     - 方向：embed/Recall 调用统一包独立 timeout（如 5-10s）+ 熔断器（连续失败 N 次直接跳过召回并记 WARN），降级策略显式化。
+
+77. **UI 测试工作流：多步桌面点击场景测试（先询问后演示）+ 上下文压缩 auto/manual 双模式**
+    - 背景（原始需求原话）：测试工作流添加自动桌面点击测试，分多个测试——第一个测试点击某个按钮查看反应，第二个测试滑动某个桌面再点击某个按钮的一套业务流程；每次测试流程启动前询问是否开始演示，点击后才操控电脑演示。另：上下文压缩支持自动与手动两种模式——当前为自动压缩（到达某个上下文值就自动压缩并保持在阈值附近），手动模式则和其他工具一样由用户自己手动管理上下文。
+    - 子项 1 设计（多步桌面点击场景测试，走既有 computer_use 插件与审批链，零新通道）：
+      1. 前置：computer_use 插件默认 disabled（`plugins.yaml`），此类任务会话显式启用（Agent 经 plugin_enable 或用户 HTTP API / 对话批准安装门）；容器沙箱场景起 `docker compose --profile computer`（Xvfb + noVNC），本机场景直接操控用户桌面。
+      2. 场景进 spec：MetaAgent 把 UI 交互验证需求写成有序场景清单 `[{场景名, 步骤: [{动作: click|swipe|type|wait|screenshot, 目标: 元素自然语言描述/坐标区域}, ...]}]`——落在 WriteSpec 的 acceptance/scene 维度（对齐 #59 verify_levels 与 #69 场景化截图的场景概念），人可在派发前审改。
+      3. 启动门（先询问后演示）：每个场景执行前经 ask_user 结构化确认（复用任务 60 选项协议，Kind=confirm，选项=开始演示/跳过该场景/终止全部测试）；批准后 agent 逐步骤调 computer_use 工具（screenshot 定位 -> 动作执行 -> 截图对比）；未批准场景标 skipped 不执行。
+      4. 证据与判定：每步截图落会话临时目录并把绝对路径写进产出（同 #38 根因 D 教训，输出必须带路径）；汇总为「场景 N：步骤 M 成功/失败 + 截图证据引用」的视觉验证证据——对接 #68 acceptance 计分的 screenshot/probe 证据扫描与 #56 冒烟层 verify_missing 反馈通道：场景有败则算未通过打回责任域，修好后只重跑失败场景。
+      5. 安全边界不变：computer_use 全部工具 `Destructive()=true` 审批守卫链保持兜底（启动门是流程性预告，单步拦截仍靠审批链）；角色白名单仅限显式启用者。
+    - 子项 1 测试：mock computer_use MCP server 下——三场景清单顺序执行、启动门选跳过该场景被标 skipped、步骤失败截断后续并回传失败场景号；真实环境人工冒烟（登录 -> 滑动 -> 点按钮两场景）。
+    - 子项 1 验收：发起带 UI 交互验收的任务时，日志可见逐场景 ask_user 确认 -> 截图证据落盘 -> 完成/打回结论；插件未启用/沙箱未起时给明确不可用原因而非挂起等待。
+    - 子项 2 设计（上下文压缩 auto/manual 双模式）：
+      1. 现状：仅 auto——每 Agent 150K 阈值即触发压缩（任务 45），保留近 10 条、其余压成摘要块，压完回落阈值附近；无手动入口。
+      2. 配置：`config.yaml` 加 `context_compression_mode: auto|manual`（默认 auto，不改现状语义）。
+      3. manual 语义：Pipeline 不再按 token 阈值自动压缩；新增 TUI 命令 `/compact [keep_n]` 触发即时压缩（keep_n 缺省取默认近 10 条）；TUI 状态栏常驻显示当前会话 token 用量 / 150K 百分比，>=80% 黄色提示建议 /compact。触达硬上限（LimitReached 暂停）时暂停文案追加「输入 /compact 压缩上下文后继续」引导。
+      4. HTTP 同步暴露 `POST /api/sessions/{id}/compact`，web 端按钮走同一通路。
+    - 子项 2 测试：manual 模式下长会话超阈值不自动压缩 + /compact 后窗口收缩摘要生成、首条 user 与看板注入段保留；auto 模式回归零变化；HTTP compact 对非活跃会话幂等。
+    - 子项 2 验收：双开关切换行为各自正确；manual 模式长跑塔防会话中用户 /compact 后 MetaAgent 继续编排不丢目标。
+    - 不做：不做场景自动录制回放（首版场景清单全由 MetaAgent 写、人审后执行）；不做鼠标轨迹拟人化；manual 模式不做 per-Agent 差异化阈值（沿用统一 150K）；不做跨会话压缩结果复用。
+
+## 已完成（已归档到 git 历史）
+### 本次归档（已收口项自待完成区移入，原文保留：#43 校验分层、#47-#58 TUI/插件/校验三层批次）
+
+43. **校验分层重构：可执行 > 证据核对 > 交叉模型 rubric，fail-closed**（✅ 已完成 2026-08-13，doc/变更.md 任务 41；来源：CrewAI/MS Agent Framework 对比讨论"当前校验很有问题"）
+    - **前提修正（重要）**：原设计"复用 verifyloop 作 L0/L1 壳"失效——verifyloop 接线已于 2026-08-08 整体移除（A/B 实证自动派验证 Agent 闭环=负资产）。落地**不碰 verifyloop、不派任何验证 Agent、不加开关**：L0=确定性证据扫描（零 LLM 零 spawn），L1 证据段并入 L2 rubric judge prompt（【修改文件】+【验证证据】段），verify_kind 枚举简化为 auto/executable/rubric/none。
+    - **落地**：L0 executable=扫历史 RunCommand 验证类命令（IsVerificationCommand 同口径）Success 证据，缺证据 1 轮反馈重试→verify_missing 报父（附产出全文）；L2=ReflectEngine judge 交叉模型（config judge_role 默认 prompt_reviewer）+ fail-closed（judge 错/坏 JSON→Unverified→kind=unverified 报父，绝不静默 pass）+ rubric 分项 checks；路由 verify_kind 默认 auto（reflection→rubric、code/test/reviewer→executable、其余 none）；成功摘要前缀【校验:通过(L0 证据/L2 rubric)】。
+    - 遗留：塔防回归观察 auto-executable 误报率（无测试基建任务会 verify_missing，噪音大可收紧 auto 推断）。08-14 实证一处误报已修：IsVerificationCommand 认不出 `node -c`（领域提示词规定的 JS 语法检查写法，塔防验收唯一证据来源），补 node -c/go build/go vet/py_compile/pytest 标记（变更.md 任务 42）；另修 verify_kind 描述诱导（模型抄 mode 值）+ verify_missing 通知正文翻倍（打捞摘要与产出全文重复）。继续观察。
+
 
 47. ~~**TUI 新会话自动选中竞态（pendingSelectID 写入已废弃的 Model 副本）**~~ ✅ 已修复（2026-08-15）
     - 现象：`input.go:395` `createSession` 后台 goroutine 写 `m.pendingSelectID`，但 bubbletea Update 是值语义——`agent.CreateSession` 阻塞期间（实证 ~15s：创建会话到图启动）tick 每 100ms 拷贝一次 Model，goroutine 完成时写入的是早已被丢弃的旧副本，`refreshView` 永远消费不到，新会话不自动选中（光标停在 -1，聊天区空白）。CreateSession 快时（<一次 tick 间隔）碰巧正常，慢时必现。
@@ -165,7 +190,7 @@
       - 验证：`go build && go vet && go test ./backend/...` 29 包全绿；web `vue-tsc -b && vite build` 绿（顺带修复 package-lock.json 预存漂移：dompurify/@types 缺失，npm install 同步）。
       - 开放动作：TUI/Web 真机人工验收（破坏性确认按 2 拒绝、方向选择按数字键、Web 点按钮）；真实 LLM 会话观察模型是否按描述主动传 options（schema 已暴露，行为依赖模型）；answerClarify 答复后旧卡片选项随 PendingClarify 清空自动消失（已按"最后一条"注入规避串卡片）。
 
-54. **judge LLM 解析健壮化 + judge 不可用降级策略（unverified 误判放大重派）**  ← 来源：2026-08-17 塔防 UI 增强任务 90 分钟未结耗时归因（`workspace/tower-defense/logs/tui/2026-08-17.log`，session-1786949168171235200-4861bcec-1）
+54. **judge LLM 解析健壮化 + judge 不可用降级策略（unverified 误判放大重派）**（✅ 已完成 2026-08-17，doc/变更.md 任务 65）  ← 来源：2026-08-17 塔防 UI 增强任务 90 分钟未结耗时归因（`workspace/tower-defense/logs/tui/2026-08-17.log`，session-1786949168171235200-4861bcec-1）
     - 现象：code_assistant-3 跑 23m42s 完成 Tower._paint 重写（node --check 通过、验收证据齐全），15:32:39 被判 `[failure kind=unverified retryable=false]`，唯一原因 = judge LLM 返 `invalid JSON response`（日志 10816 行）；炮塔领域 Agent 随后自证 + 重派 code_assistant-4 再跑 ~13 分钟，同一文件重复劳动放大 ~25 分钟。
     - 根因（系统性非偶发）：`backend/internal/agent/engine.go:159` `reflect()` 对 judge 原始响应直接 `json.Unmarshal`——不剥 ```json markdown 围栏、不提取首个 JSON 对象、不重试。judge = prompt_reviewer（`config.yaml:60 judge_role`，deepseek-v4-flash）返回带围栏或夹带文字即必然失败；该模型组合下每次 reflection rubric 校验都会失败，#43 fail-closed 从"防放水"退化为"必然误判"。
     - 设计张力：`roles.yaml:222` 明确记载 verifyloop 自动验证 2026-08-08 因 A/B 实证负资产下线；#43 fail-closed judge 实质把同类机制请回。修复须解析健壮化与降级策略一起给——只修解析仍留"judge 真不可用（端点挂）时必然误杀 + 重派"的放大通道。
@@ -181,7 +206,7 @@
       - `Run` err 分支降级：`HasExecutableVerification` 有 L0 证据 -> `VerifyNote="L0 通过，L2 judge 不可用（降级放行）"` 放行，不触发重派；无证据维持 fail-closed。dispatcher 零改动。
       - 测试：`TestExtractJSON` 8 变体、围栏 JSON 首答即过、重试恢复、L0 证据降级放行（新 verifyThenAnswerProvider 构造 RunCommand 证据历史）；`LLMErrorFailClosed` 适配两次报错语义。`agent`/`subagent` 全量绿。
 
-55. **UI 增强类任务工具路由：图像生成可见性 + ui_preview 视觉验证闭环 + MetaAgent 美术路线决策**  ← 来源：同上归因（日志 8.1MB / LLM 调用 136 次 / tool_mount 实际调用 0 次 / `od_image_*` 全日志 0 次）
+55. **UI 增强类任务工具路由：图像生成可见性 + ui_preview 视觉验证闭环 + MetaAgent 美术路线决策**（✅ 已完成 2026-08-17，doc/变更.md 任务 66；真机验收开放）  ← 来源：同上归因（日志 8.1MB / LLM 调用 136 次 / tool_mount 实际调用 0 次 / `od_image_*` 全日志 0 次）
     - 现象（三重失配）：
       1. 权限天花板挡路：`plugins.yaml:125` ui_design roles=["ui_assistant"]，MetaAgent 派 role=domain，domain 的 tool_catalog 只有 ui_preview（日志 2542 行），od_image_generate 连目录都进不去。
       2. 可见插件零使用：ui_preview 对 meta/domain/ui_assistant 全可见（`plugins.yaml:158`），但 tool_mount 实际调用 0 次（296 次出现全是 catalog 文本；8 次 browser_* 同为目录文本）——近千行 canvas 绘制代码全程盲写、零视觉验证。
@@ -247,9 +272,7 @@
       - meta【派发铁律】加 WriteSpec contract 字段纪律（与 WriteSharedMemory 契约同一协议两种载体：前者机器校验、后者注入人读）。
       - domain_agent 同步：收尾验收自述降级为"建设期自查"，交付证据以 dispatcher【机器校验】为准；【集成验证任务模式】标注为例外通道入口（meta 派发时显式声明理由才启用）。
       - 测试：`config`/`role` 加载测试绿（纯 prompt 变更零代码路径）。真机验收：重跑多域任务看零验证类派发 + 摘要含【机器校验】段（待观察）。
-77. 测试工作流添加自动桌面点击测试，分多个测试，如第一个测试点击某个按钮查看反应，第二个测试滑动某个桌面，再点击某个按钮的一套业务流程。每次测试流程启动前会询问是否开始演示点击后则操控电脑进行演示。添加上下文自动压缩模式与手动管理，当前为自动压缩即到达某个上下文值就自动压缩，保持在这个值附近，手动管理则和其他工具一样自己手动管理上下文
 
-## 已完成（已归档到 git 历史）
 
 - **2026-08-25 落地 #67-76（任务 97-106，详见 `doc/变更.md`）——2026-08-25 水果忍者复原任务失败复盘十项**：
   - #67 runtime 实装：`Spec.Probes` + `agent.HasRuntimeProbeEvidence`（navigate+evaluate 成功 + console 回读无 error/severe）+ dispatcher runtime 分支（缺证据重试 1 轮 → delivered-unverified 黄态）；roles.yaml UI/游戏/交互类 runtime 从建议改必须。

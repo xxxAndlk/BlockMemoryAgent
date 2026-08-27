@@ -2156,9 +2156,9 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		// 白烧一轮（实证 2026-08-25 domain-2 被杀时 plan_execute 仅 1/6）。
 		legacy := d.renderLegacyList(ctx, parentID, domain, result)
 		// 结构化失败（TODO #23）：头部机读标记 [failure kind=X retryable=Y]，人读文案在后。
-		kind := failureKindOf(err)
+		kind := failureKindOf(ctx, err)
 		retryable := kind == FailureKindError && roleDef.ID != "domain" && roleDef.ID != "meta" && ctx.Err() == nil
-		failText := formatSubAgentFailure(err, result, d.effectiveTimeout(subAgentID), partial)
+		failText := formatSubAgentFailure(ctx, err, result, d.effectiveTimeout(subAgentID), partial)
 		msg := failureMarker(kind, retryable) + "\n" + failText
 		// 校验分层（TODO #43）两类"未验证/缺证据"：附产出全文供父 Agent 自决
 		// （重派/降级/收口）——非"失败"语义，产出可能可用，不能只给 500 字截断。
@@ -2229,7 +2229,7 @@ func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, sub
 	if err == nil || d.dispatchRetryCount <= 0 {
 		return result, err, false
 	}
-	kind := failureKindOf(err)
+	kind := failureKindOf(ctx, err)
 	retryable := kind == FailureKindError && roleDef.ID != "domain" && roleDef.ID != "meta" && ctx.Err() == nil
 	if !retryable {
 		return result, err, false
@@ -2979,7 +2979,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 		log.Printf("[subagent] resume FAIL: sub=%s err=%v", pausedNodeID, err)
 		d.treeFinish(subCtx, pausedNodeID, partial, err)
-		d.notify(parentID, pausedNodeID, formatSubAgentFailure(err, result, d.timeout, partial), files)
+		d.notify(parentID, pausedNodeID, formatSubAgentFailure(subCtx, err, result, d.timeout, partial), files)
 		d.trackChildDone(parentID)
 		return result, err
 	}
@@ -3062,8 +3062,12 @@ const (
 )
 
 // failureKindOf 从失败错误分类失败类型；未知错误归 error。
-func failureKindOf(err error) FailureKind {
+func failureKindOf(ctx context.Context, err error) FailureKind {
 	switch {
+	case isLLMCallDeadline(ctx, err):
+		// LLM 调用内部超时（endpoint 假死/单次调用超时）≠ 子 Agent 墙钟超时：
+		// 归 error 让父 Agent 看到"模型层故障"而非"执行超时"。
+		return FailureKindError
 	case errors.Is(err, context.DeadlineExceeded):
 		return FailureKindTimeout
 	case errors.Is(err, tool.ErrLoopExit):
@@ -3128,10 +3132,30 @@ const visualRetryMessage = "【视觉证据要求】本任务验收层级含 vis
 // runSubAgent 见此信号按 FailureKindSmokeFailed notify 父（打回责任域）。
 var errSmokeFailed = errors.New("sub-agent smoke check failed")
 
+// isLLMCallDeadline 判定 DeadlineExceeded 是否源自单次 LLM 调用内部（provider
+// http.Client 整体超时 / react_llm_timeout），而非子 Agent 墙钟到期。两者同走
+// context.DeadlineExceeded（墙钟到期同样从 provider 读流处冒出同形错误），用
+// 运行 ctx 是否已终结判别：ctx 已到期=墙钟终止；ctx 存活而调用超时=LLM 层故障。
+// 邮箱文案不能把 LLM 10 分钟假死写成"墙钟上限超时"误导父 Agent 决策
+// （实证 2026-08-27 domain-1/4 双 10m0.0s FAIL 被报成 2h 超时）。
+func isLLMCallDeadline(ctx context.Context, err error) bool {
+	if ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "llm generate") || strings.Contains(msg, "Client.Timeout")
+}
+
 // formatSubAgentFailure 把 runSubAgentOnce 返回的错误格式化为父邮箱通知文案，
 // 保留原有"超时/循环守卫/通用失败"三段语义与部分进度回传；
 // 校验分层两类（TODO #43）单独文案，明确"未验证"而非"失败"语义。
-func formatSubAgentFailure(err error, result agent.ReactResult, timeout time.Duration, partial string) string {
+func formatSubAgentFailure(ctx context.Context, err error, result agent.ReactResult, timeout time.Duration, partial string) string {
+	if isLLMCallDeadline(ctx, err) {
+		return fmt.Sprintf("子 Agent 的 LLM 调用超时（模型端无响应或连接假死，非墙钟到期）：%v。%s", err, partialSuffix(partial))
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Sprintf("子 Agent 执行超时（上限 %v），已被终止。%s", timeout, partialSuffix(partial))
 	}
