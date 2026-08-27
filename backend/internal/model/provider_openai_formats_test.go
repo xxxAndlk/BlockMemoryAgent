@@ -5,7 +5,9 @@ package model
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -611,5 +613,63 @@ func TestCreateBladesProvider_Formats(t *testing.T) {
 	rp := p.(*retryProvider)
 	if _, ok := rp.inner.(*openAIResponsesProvider); !ok {
 		t.Errorf("openai-responses inner = %T, want *openAIResponsesProvider", rp.inner)
+	}
+}
+
+// TestChatProvider_UserImageContentArray 验证 user 消息携带图片 DataPart
+//（Alt+V 粘贴）时请求 content 用数组形态 [{type:text},{type:image_url,data URL}]；
+// 无图消息仍为 string content（兼容回归）。
+func TestChatProvider_UserImageContentArray(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)
+	}))
+	defer srv.Close()
+	p := newOpenAIChatProvider(types.AgentModelConfig{Model: "m", APIKey: "k", BaseURL: srv.URL})
+
+	raw := []byte{0x89, 0x50, 0x4E, 0x47}
+	msg := &blades.Message{Role: blades.RoleUser, Parts: []blades.Part{
+		blades.TextPart{Text: "按 [image:1] 实现"},
+		blades.DataPart{MIMEType: blades.MIMEImagePNG, Bytes: raw},
+	}}
+	if _, err := p.Generate(context.Background(), &blades.ModelRequest{Messages: []*blades.Message{msg}}); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	arr, ok := gotBody["messages"].([]any)
+	if !ok || len(arr) != 1 {
+		t.Fatalf("messages 应为 1 条数组, got %v", gotBody["messages"])
+	}
+	first, _ := arr[0].(map[string]any)
+	content, ok := first["content"].([]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("带图 user content 应为数组 2 项, got %v", first["content"])
+	}
+	txt, _ := content[0].(map[string]any)
+	if txt["type"] != "text" || txt["text"] != "按 [image:1] 实现" {
+		t.Fatalf("text 项不符: %v", txt)
+	}
+	iu, _ := content[1].(map[string]any)
+	if iu["type"] != "image_url" {
+		t.Fatalf("image_url 项 type 不符: %v", iu)
+	}
+	inner, _ := iu["image_url"].(map[string]any)
+	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
+	if inner["url"] != want {
+		t.Fatalf("data URL 不符: %v", inner["url"])
+	}
+
+	// 无图消息：content 仍为 string。
+	if _, err := p.Generate(context.Background(), &blades.ModelRequest{Messages: []*blades.Message{blades.UserMessage("纯文本")}}); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	arr2, _ := gotBody["messages"].([]any)
+	second, _ := arr2[0].(map[string]any)
+	if _, isArray := second["content"].([]any); isArray {
+		t.Fatalf("无图 user content 不应为数组: %v", second["content"])
+	}
+	if second["content"] != "纯文本" {
+		t.Fatalf("无图 content 不符: %v", second["content"])
 	}
 }

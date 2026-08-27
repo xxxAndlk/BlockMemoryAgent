@@ -119,3 +119,52 @@ func TestConvertMessages_ToolResultImages(t *testing.T) {
 		t.Fatalf("c2 tool_result 应仅含 text 一块: %+v", tr2)
 	}
 }
+
+// TestConvertMessage_UserImageBlocks 验证 user 消息携带的图片 DataPart
+//（Alt+V 粘贴）转为顶层 image 块；白名单外 MIME 跳过；tool 角色不受影响。
+func TestConvertMessage_UserImageBlocks(t *testing.T) {
+	p := &anthropicProvider{}
+	raw := []byte{0x89, 0x50, 0x4E, 0x47}
+
+	// user 消息：text + png DataPart + svg DataPart（跳过）。
+	m := &blades.Message{Role: blades.RoleUser, Parts: []blades.Part{
+		blades.TextPart{Text: "看这张图 [image:1]"},
+		blades.DataPart{MIMEType: blades.MIMEImagePNG, Bytes: raw},
+		blades.DataPart{MIMEType: "image/svg+xml", Bytes: raw},
+	}}
+	out, err := p.convertMessage(m)
+	if err != nil {
+		t.Fatalf("convertMessage: %v", err)
+	}
+	if out.Role != anthropic.MessageParamRoleUser {
+		t.Fatalf("role 不符: %v", out.Role)
+	}
+	if len(out.Content) != 2 {
+		t.Fatalf("user 应含 text+image 两块, got %d", len(out.Content))
+	}
+	if out.Content[0].OfText == nil || out.Content[0].OfText.Text != "看这张图 [image:1]" {
+		t.Fatalf("第一块应为 text: %+v", out.Content[0])
+	}
+	img := out.Content[1].OfImage
+	if img == nil || img.Source.OfBase64 == nil {
+		t.Fatalf("第二块应为 base64 image: %+v", out.Content[1])
+	}
+	if img.Source.OfBase64.MediaType != anthropic.Base64ImageSourceMediaTypeImagePNG {
+		t.Fatalf("media_type 不符: %q", img.Source.OfBase64.MediaType)
+	}
+	if img.Source.OfBase64.Data != base64.StdEncoding.EncodeToString(raw) {
+		t.Fatalf("image base64 不符: %q", img.Source.OfBase64.Data)
+	}
+
+	// assistant 角色携带 DataPart：不挂图（只支持 user 顶层块）。
+	am := &blades.Message{Role: blades.RoleAssistant, Parts: []blades.Part{
+		blades.TextPart{Text: "回复"},
+		blades.DataPart{MIMEType: blades.MIMEImagePNG, Bytes: raw},
+	}}
+	aout, _ := p.convertMessage(am)
+	for _, b := range aout.Content {
+		if b.OfImage != nil {
+			t.Fatalf("assistant 消息不应挂顶层图片块")
+		}
+	}
+}

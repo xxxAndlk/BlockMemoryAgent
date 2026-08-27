@@ -65,15 +65,17 @@ const (
 // domainOp 是发给 supervisor goroutine 的单条指令。
 type domainOp struct {
 	kind      domainOpKind
-	task      string        // opNewTask：任务正文（已拼前缀）
-	wallClock time.Duration // opNewTask：本次派发级墙钟
-	resumeMsg string        // opResume：续跑输入（默认"继续"）
+	task      string             // opNewTask：任务正文（已拼前缀）
+	wallClock time.Duration      // opNewTask：本次派发级墙钟
+	resumeMsg string             // opResume：续跑输入（默认"继续"）
+	images    []tool.ResultImage // opNewTask：本轮用户图片（Alt+V 粘贴，带外穿透；仅内存不持久化）
 }
 
 // queuedTask 是忙碌 domain 缓冲的新任务（PendingChildren 已挂账，销毁时须补偿递减）。
 type queuedTask struct {
 	task      string
 	wallClock time.Duration
+	images    []tool.ResultImage // 本轮用户图片（同 domainOp.images）
 }
 
 // slotState 是 domainSlot 的生命周期状态。
@@ -433,16 +435,16 @@ func (d *Dispatcher) IdleRoster(sessionID string) []agent.IdleDomainInfo {
 // 执行任务 → 按结果分类收尾 → park（select ops / 已武装的 TTL 由 ops 到期投递）。
 // 唯一退出路径：opDestroy（TTL 到期/硬取消/话题切换/失败收口/进程关闭）。
 // 任务完成后优先出队缓冲任务（忙碌时复用派发入队的），无任务才 park。
-func (d *Dispatcher) runDomainSupervisor(s *domainSlot, firstTask string, firstWallClock time.Duration) {
-	task, wc := firstTask, firstWallClock
+func (d *Dispatcher) runDomainSupervisor(s *domainSlot, firstTask string, firstWallClock time.Duration, firstImages []tool.ResultImage) {
+	task, wc, imgs := firstTask, firstWallClock, firstImages
 	for {
-		outcome := d.runDomainTask(s, task, wc)
+		outcome := d.runDomainTask(s, task, wc, imgs)
 		switch outcome {
 		case domainTaskDone, domainTaskStopped:
 			// 成功/软停止：收尾已在 runDomainTask 内完成（notify + tree.Idle + trackChildDone + enterIdle）。
 			// 优先出队缓冲任务（挂账已在入队时 trackChildStart；出队执行不再重复挂账）。
 			if q, ok := s.dequeueNext(); ok {
-				task, wc = q.task, q.wallClock
+				task, wc, imgs = q.task, q.wallClock, q.images
 				// 唤醒槽（Idle→Running）继续执行队头任务。
 				s.mu.Lock()
 				s.state = slotRunning
@@ -474,7 +476,8 @@ func (d *Dispatcher) runDomainSupervisor(s *domainSlot, firstTask string, firstW
 			return
 		case opResume:
 			// 挂起唤醒："继续"续跑当前任务（history 在内存，budget 由 Assemble 独立轮估）。
-			task, wc = op.resumeMsg, s.resumeWallClock()
+			// 恢复轮不重复带图（不持久化语义）：历史里首条 user 消息已带过本任务的图。
+			task, wc, imgs = op.resumeMsg, s.resumeWallClock(), nil
 			// 挂起前树已 Pause，恢复置回 Running。
 			s.mu.Lock()
 			s.state = slotRunning
@@ -486,7 +489,7 @@ func (d *Dispatcher) runDomainSupervisor(s *domainSlot, firstTask string, firstW
 				}
 			}
 		case opNewTask:
-			task, wc = op.task, op.wallClock
+			task, wc, imgs = op.task, op.wallClock, op.images
 			// 唤醒后槽回到 Running（enterIdle 的前置检查依赖）。
 			s.mu.Lock()
 			s.state = slotRunning
@@ -559,11 +562,16 @@ const (
 
 // runDomainTask 执行单个 domain 任务：构造/复用 ReActAgent、前缀注入、驱动引擎、
 // 按结果分类收尾（含 notify 父 + 树状态 + trackChildDone + 记忆沉淀）。
-func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Duration) domainTaskOutcome {
+// images 为本轮用户图片（Alt+V 粘贴，带外穿透）：注入 taskCtx 挂到本任务首条
+// user 消息，并随 domain 自身的工具执行 ctx 递归穿透给其派发的叶子 Agent。
+func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Duration, images []tool.ResultImage) domainTaskOutcome {
 	// 每任务 ctx：Background 派生 + sessionID；墙钟由 slot timer 驱动（可挂起停表）。
 	ctx := context.Background()
 	if s.sessionID != "" {
 		ctx = tool.WithSessionID(ctx, s.sessionID)
+	}
+	if len(images) > 0 {
+		ctx = agent.WithUserImages(ctx, images)
 	}
 	taskCtx, cancelTask := context.WithCancel(ctx)
 	defer cancelTask()
@@ -773,6 +781,21 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 		WithPendingChildrenChecker(d).
 		WithSuspendGate(&slotSuspendGate{d: d, sid: s.sessionID})
 
+	// 心跳检活：同 runSubAgentOnce（dispatcher.go）注入活动上报回调。此前热驻 domain
+	// 漏注入，touchActivity 全程 no-op（工具 30s 保活 tick / 流式 delta 均失效），
+	// activity 只在任务入口刷新一次——domain 直接执行任何 >10min 长工具即被巡检误判
+	// 假死 killed（2026-08-27 实证：3 个 domain 死于验证阶段长工具执行中）。
+	// Load-per-call 而非捕获指针：enterIdle/挂起收尾会 Delete activity、
+	// rearmSlotActivity 每任务重建新 atomic，闭包捕获旧指针会写进已废弃条目。
+	if d.liveFn != nil || true { // 无条件注入：巡检与 liveFn 解耦
+		sub = sub.WithActivityReporter(func() {
+			now := time.Now().UnixNano()
+			if v, ok := d.activity.Load(s.id); ok {
+				v.(*atomic.Int64).Store(now)
+			}
+			d.bubbleActivity(s.id, now)
+		})
+	}
 	if d.log != nil {
 		sub = sub.WithLogger(d.log.WithSession(s.sessionID).WithAgent(roleDef.Name))
 	}
@@ -959,6 +982,10 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 	qlen := len(s.taskQueue)
 	s.mu.Unlock()
 
+	// 本轮用户图片（Alt+V 粘贴）：从父 ctx 带外取出，随任务捎带给该 domain
+	//（本任务首条 user 消息挂图；忙碌入队则随 queuedTask 缓冲）。
+	imgs := agent.UserImagesFromContext(ctx)
+
 	switch state {
 	case slotDestroyed:
 		return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s already destroyed，请用 role_id=domain 新建", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
@@ -985,7 +1012,7 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 		// 活动恢复（心跳豁免解除）：enterIdle 已 Delete 旧条目，Load 必落空，须重建。
 		d.rearmSlotActivity(s.id)
 		select {
-		case s.ops <- domainOp{kind: opNewTask, task: taskText, wallClock: wallClock}:
+		case s.ops <- domainOp{kind: opNewTask, task: taskText, wallClock: wallClock, images: imgs}:
 		default:
 			// ops 满（异常）：回滚挂账。
 			d.trackChildDone(parentID)
@@ -1000,7 +1027,7 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 		taskText := d.buildReuseTask(ctx, s, task)
 		d.trackChildStart(parentID)
 		s.mu.Lock()
-		s.taskQueue = append(s.taskQueue, queuedTask{task: taskText, wallClock: wallClock})
+		s.taskQueue = append(s.taskQueue, queuedTask{task: taskText, wallClock: wallClock, images: imgs})
 		s.mu.Unlock()
 		log.Printf("[subagent] QUEUE: sub=%s domain=%s queued=%d (busy, will run after current task)", s.id, s.domain, qlen+1)
 		return s.id + "（忙碌中，任务已入队，当前任务完成后执行）", nil
@@ -1090,6 +1117,6 @@ func (d *Dispatcher) dispatchHotDomain(ctx context.Context, parentID, subAgentID
 
 	d.pool.store(s)
 	log.Printf("[subagent] dispatch: parent=%s sub=%s role=domain domain=%s task=%q (hot-resident)", parentID, subAgentID, domain, taskBrief)
-	go d.runDomainSupervisor(s, taskText, wallClock)
+	go d.runDomainSupervisor(s, taskText, wallClock, agent.UserImagesFromContext(ctx))
 	return subAgentID, nil
 }

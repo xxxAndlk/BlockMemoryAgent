@@ -3,16 +3,59 @@
 package agent
 
 import (
+	"fmt"
 	"time"
 
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
+
+// 用户消息图片限流（与 MCP 图片透传 mcpbridge 上限对齐：4 张 / 单张 4MiB）。
+// 双层执行：TUI 粘贴时拒绝 + HandleSessionMessage 400。
+const (
+	// MaxMessageImages 单条用户消息最多携带图片张数。
+	MaxMessageImages = 4
+	// MaxMessageImageBytes 单张图片 base64 解码后的最大字节数。
+	MaxMessageImageBytes = 4 << 20
+)
+
+// WireImage 是用户消息图片的 HTTP 线型 DTO（TUI/Web -> server）。
+// server 不直接依赖 tool 包，经 ToResultImage 转入内存类型。
+type WireImage struct {
+	// MIMEType 图片类型（image/png、image/jpeg/gif/webp）。
+	MIMEType string `json:"mime_type"`
+	// Data 为 base64 编码内容（encoding/json 对 []byte 原生 base64 编解码）。
+	Data []byte `json:"data"`
+}
+
+// ToResultImage 把线型 DTO 转为链路内统一图片类型。
+func (w WireImage) ToResultImage() tool.ResultImage {
+	return tool.ResultImage{MIMEType: w.MIMEType, Data: w.Data}
+}
+
+// ParseWireImages 校验并转换 HTTP 线型图片列表（超限报错），
+// 供 server 层使用（server 不直接依赖 tool 包）。
+func ParseWireImages(imgs []WireImage) ([]tool.ResultImage, error) {
+	if len(imgs) > MaxMessageImages {
+		return nil, fmt.Errorf("单条消息最多携带 %d 张图片", MaxMessageImages)
+	}
+	out := make([]tool.ResultImage, 0, len(imgs))
+	for _, img := range imgs {
+		if len(img.Data) > MaxMessageImageBytes {
+			return nil, fmt.Errorf("单张图片超过大小上限（4MiB）")
+		}
+		out = append(out, img.ToResultImage())
+	}
+	return out, nil
+}
 
 // CreateRequest 表示创建新会话的请求。
 // Goal 是会话的目标或任务描述，Meta 用于携带额外的元数据。
 type CreateRequest struct {
-	Goal string         // Goal 本次会话的目标/任务描述
-	Meta map[string]any // Meta 附加的键值对元数据，供业务扩展使用
+	Goal string // Goal 本次会话的目标/任务描述
+	Meta map[string]any
+	// Images 首条消息携带的图片（Alt+V 粘贴）：内存透传不持久化，仅首轮注入。
+	Images []tool.ResultImage
 }
 
 // ResumeRequest 表示恢复一个此前暂停或已结束的会话。
@@ -28,6 +71,9 @@ type Message struct {
 	Role      string    // Role 消息发送者角色，例如 user / assistant / system
 	Content   string    // Content 消息正文内容
 	Timestamp time.Time // Timestamp 消息产生的时间戳
+	// Images 用户随消息粘贴的图片（Alt+V）：内存透传不持久化，ToServerSession
+	// 显式映射不透出；重启后历史仅保留 Content 里的 [image:N] 占位文本。
+	Images []tool.ResultImage
 }
 
 // Query 表示对会话发起的只读查询。

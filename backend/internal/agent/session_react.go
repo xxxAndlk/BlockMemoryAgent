@@ -19,6 +19,7 @@ import (
 	"time"
 
 	// 内部包：模型工厂、事件类型、持久化存储、枚举、文本工具
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/project"
@@ -47,6 +48,10 @@ type reactInternalSession struct {
 	Events []internalEvent
 	// Messages 保存用于前端/LLM 对话上下文的聊天消息。
 	Messages []Message
+	// firstTurnImages 是首条消息（创建会话时）携带的用户图片（Alt+V 粘贴）：
+	// 纯内存，runSession 注入 runCtx 后一次性消费置 nil；重启丢失，
+	// 历史只剩 [image:N] 占位文本。
+	firstTurnImages []tool.ResultImage
 	// TempDir 是会话专用的临时工作目录路径。
 	TempDir string
 	// History 保存 React 对话历史，用于后续推理与恢复。

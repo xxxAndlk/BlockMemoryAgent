@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
@@ -24,6 +25,10 @@ type InputBar struct {
 	histIdx int
 	// lastKeyTime 记录上一次按键时间，用于区分终端粘贴的快速 Enter 与手动回车。
 	lastKeyTime time.Time
+	// pendingImages 是 Alt+V 粘贴暂存的图片（base64），随下条消息发送。
+	// 顺序与输入文字中 [image:N] 占位符编号对齐（N=下标+1）；提交/清空/历史
+	// 浏览替换时重置，下一轮从 1 重新编号。
+	pendingImages []tool.ResultImage
 }
 
 // NewInputBar 构造一个空的 InputBar，初始化历史记录 map 并将历史索引设为 -1。
@@ -40,6 +45,13 @@ func (ib *InputBar) reset() {
 	ib.cursor = 0
 	ib.mode = inputNormal
 	ib.histIdx = -1
+	ib.pendingImages = nil
+}
+
+// clearPendingImages 清空粘贴暂存图片（编号下一轮从 1 重新计）。
+// 全量替换 runes 的路径（多行整清/历史浏览填充）同步调用，防图片残留串轮。
+func (ib *InputBar) clearPendingImages() {
+	ib.pendingImages = nil
 }
 
 // isMultiline 判断当前输入是否包含换行符，用于决定输入栏渲染为占位符还是展开文本。
@@ -59,6 +71,7 @@ func (ib *InputBar) backspace() {
 		// 多行内容一次性清空，避免逐字符删除长文本。
 		ib.runes = nil
 		ib.cursor = 0
+		ib.clearPendingImages()
 	} else if ib.cursor > 0 {
 		// 单行模式下删除光标前一个 rune。
 		ib.runes = append(ib.runes[:ib.cursor-1], ib.runes[ib.cursor:]...)
@@ -72,6 +85,7 @@ func (ib *InputBar) delete() {
 		// 多行内容一次性清空。
 		ib.runes = nil
 		ib.cursor = 0
+		ib.clearPendingImages()
 	} else if ib.cursor < len(ib.runes) {
 		// 单行模式下删除光标后一个 rune。
 		ib.runes = append(ib.runes[:ib.cursor], ib.runes[ib.cursor+1:]...)
@@ -128,6 +142,7 @@ func (ib *InputBar) historyUp(sessionID string) {
 		ib.histIdx--
 		ib.runes = []rune(h[ib.histIdx])
 		ib.cursor = len(ib.runes)
+		ib.clearPendingImages()
 	}
 }
 
@@ -143,11 +158,13 @@ func (ib *InputBar) historyDown(sessionID string) {
 		ib.histIdx++
 		ib.runes = []rune(h[ib.histIdx])
 		ib.cursor = len(ib.runes)
+		ib.clearPendingImages()
 	} else {
 		// 到达最新命令之后，恢复空输入并退出历史浏览模式。
 		ib.histIdx = -1
 		ib.runes = nil
 		ib.cursor = 0
+		ib.clearPendingImages()
 	}
 }
 

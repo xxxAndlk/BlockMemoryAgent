@@ -28,6 +28,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -418,6 +419,16 @@ func bladesMessageToChat(m *blades.Message) map[string]any {
 	}
 	switch m.Role {
 	case blades.RoleUser:
+		// 携带图片 DataPart（Alt+V 粘贴 / 工具透传）时 content 用数组形式
+		//（text + image_url data URL）；无图保持 string content（兼容回归）。
+		if imgs := chatImageDataParts(m); len(imgs) > 0 {
+			content := make([]map[string]any, 0, len(m.Parts)+len(imgs))
+			if t := chatTextOf(m); t != "" {
+				content = append(content, map[string]any{"type": "text", "text": t})
+			}
+			content = append(content, imgs...)
+			return map[string]any{"role": "user", "content": content}
+		}
 		return map[string]any{"role": "user", "content": chatTextOf(m)}
 	case blades.RoleSystem:
 		return map[string]any{"role": "system", "content": chatTextOf(m)}
@@ -482,6 +493,28 @@ func chatTextOf(m *blades.Message) string {
 		}
 	}
 	return sb.String()
+}
+
+// chatImageDataParts 提取消息中的 DataPart 转为 OpenAI vision content 数组项
+// （{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}）。
+// 无图返回 nil，调用方保持纯文本 content。
+func chatImageDataParts(m *blades.Message) []map[string]any {
+	if m == nil {
+		return nil
+	}
+	var out []map[string]any
+	for _, part := range m.Parts {
+		dp, ok := part.(blades.DataPart)
+		if !ok || len(dp.Bytes) == 0 || dp.MIMEType == "" {
+			continue
+		}
+		url := "data:" + string(dp.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(dp.Bytes)
+		out = append(out, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": url},
+		})
+	}
+	return out
 }
 
 // chatSchemaAsMap 把 jsonschema.Schema 转为 map[string]any，便于 JSON 序列化。

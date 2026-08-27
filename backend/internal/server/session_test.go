@@ -1,11 +1,15 @@
 package server
 
 import (
-	"context" // 测试用上下文
-	"fmt"     // 构造会话 ID
-	"sync"    // 并发保护 mock 数据
-	"testing" // 测试框架
-	"time"    // 时间戳
+	"context"       // 测试用上下文
+	"encoding/json" // wire 载荷构造
+	"fmt"           // 构造会话 ID
+	"net/http"      // HTTP handler 测试
+	"net/http/httptest"
+	"strings"       // 请求体构造
+	"sync"          // 并发保护 mock 数据
+	"testing"       // 测试框架
+	"time"          // 时间戳
 
 	"github.com/blockmemory/agent/backend/internal/agent"                // agent 门面接口
 	"github.com/blockmemory/agent/backend/internal/board"
@@ -200,4 +204,79 @@ func TestSessionManagerLaunchSession(t *testing.T) {
 // Board 返回看板快照，测试实现返回 nil（回退树合成）。
 func (m *mockAgentForServer) Board(ctx context.Context, sessionID string) (*board.Snapshot, error) {
 	return nil, nil
+}
+
+// capturingAgent 包装 mockAgentForServer，捕获 Send 收到的消息供断言。
+type capturingAgent struct {
+	mockAgentForServer
+	mu        sync.Mutex
+	sent      []agent.Message
+	sendSess  []string
+}
+
+func (c *capturingAgent) Send(ctx context.Context, sessionID string, msg agent.Message) error {
+	c.mu.Lock()
+	c.sent = append(c.sent, msg)
+	c.sendSess = append(c.sendSess, sessionID)
+	c.mu.Unlock()
+	return nil
+}
+
+// TestHandleSessionMessageWithImages 验证 POST /api/sessions/{id}/message 的
+// images 字段：解码 agent.WireImage -> Message.Images 透传；超限张数 400。
+func TestHandleSessionMessageWithImages(t *testing.T) {
+	facade := newTestAgent(t)
+	cap := &capturingAgent{mockAgentForServer: *newMockAgentForServer()}
+	// 建一个会话供 Get 返回。
+	sess, err := facade.CreateSession(context.Background(), agent.CreateRequest{Goal: "img"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	_ = sess
+	// capturingAgent 持有独立 sessions map，直接把会话注册进去。
+	created, _ := cap.mockAgentForServer.CreateSession(context.Background(), agent.CreateRequest{Goal: "img"})
+
+	mgr := NewSessionManager(cap)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sessions/{id}/message", mgr.HandleSessionMessage)
+
+	// wire 载荷由 json.Marshal(tool.ResultImage) 生成：Data 为 base64 ASCII，
+	// encoding/json 对 []byte 再做一层 base64（双端对称，解出即还原）。
+	wantImg := agent.WireImage{MIMEType: "image/png", Data: []byte("aVBobw==")}
+	imgJSON, _ := json.Marshal(wantImg)
+	body := `{"content":"按这张图实现","images":[` + string(imgJSON) + `]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/"+created.ID+"/message", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	if len(cap.sent) != 1 {
+		t.Fatalf("Send 次数 = %d, want 1", len(cap.sent))
+	}
+	msg := cap.sent[0]
+	if msg.Content != "按这张图实现" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if len(msg.Images) != 1 || msg.Images[0].MIMEType != "image/png" || string(msg.Images[0].Data) != "aVBobw==" {
+		t.Fatalf("images = %+v", msg.Images)
+	}
+
+	// 超限 5 张：400。
+	over := `{"content":"x","images":[`
+	for i := 0; i < 5; i++ {
+		if i > 0 {
+			over += ","
+		}
+		over += `{"mime_type":"image/png","data":"aQ=="}`
+	}
+	over += `]}`
+	req2 := httptest.NewRequest(http.MethodPost, "/api/sessions/"+created.ID+"/message", strings.NewReader(over))
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("超限 status = %d, want 400", rec2.Code)
+	}
 }

@@ -1631,6 +1631,12 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	if sid := tool.SessionIDFromContext(ctx); sid != "" {
 		subAgentCtx = tool.WithSessionID(subAgentCtx, sid)
 	}
+	// 本轮用户图片（Alt+V 粘贴）带外穿透：子 Agent ctx 由 Background 重建，
+	// 父 ctx 的 value 不会自动流入，须显式重注入--子 Agent 首条 user 消息挂图，
+	// 其自身工具调用链（含再派发叶子）递归携带。
+	if imgs := agent.UserImagesFromContext(ctx); len(imgs) > 0 {
+		subAgentCtx = agent.WithUserImages(subAgentCtx, imgs)
+	}
 	cancel := context.CancelFunc(func() {})
 	if effectiveTimeout > 0 {
 		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)

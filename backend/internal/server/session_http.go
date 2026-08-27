@@ -251,7 +251,8 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 	}
 
 	req, err := DecodeBody[struct {
-		Content string `json:"content"`
+		Content string            `json:"content"`
+		Images  []agent.WireImage `json:"images,omitempty"`
 	}](r)
 	if err != nil {
 		http.Error(w, "请求体无效", http.StatusBadRequest)
@@ -261,8 +262,14 @@ func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Req
 		http.Error(w, "内容不能为空", http.StatusBadRequest)
 		return
 	}
+	// 用户图片限流（与 TUI 粘贴侧同规则）：超限直接 400，防御直连 API 的调用方。
+	images, err := agent.ParseWireImages(req.Images)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	if err := m.agent.Send(r.Context(), id, agent.Message{Content: req.Content, Timestamp: time.Now()}); err != nil {
+	if err := m.agent.Send(r.Context(), id, agent.Message{Content: req.Content, Images: images, Timestamp: time.Now()}); err != nil {
 		msg, status := agentErrorStatus(err)
 		http.Error(w, msg, status)
 		return

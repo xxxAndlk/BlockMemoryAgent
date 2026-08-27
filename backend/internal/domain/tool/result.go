@@ -48,10 +48,12 @@ type Result struct {
 // ResultImage 是工具结果携带的单张图片。
 type ResultImage struct {
 	// MIMEType 图片类型（image/png、image/jpeg 等）。
-	MIMEType string
+	MIMEType string `json:"mime_type"`
 	// Data 为 base64 编码内容（与 MCP ImageContent.Data 语义一致，链路零转码；
 	// anthropic provider 在边界按协议直接使用，其他 provider 忽略）。
-	Data []byte
+	// json 标签供用户消息图片走 HTTP 线型（agent.WireImage / TUI payload）复用编码；
+	// Result.Images 本身 json:"-" 不受影响。
+	Data []byte `json:"data"`
 }
 
 // 失败分级常量（TODO #32）：Dispatch 按 Category 区分连杀计数与终止语义。

@@ -14,6 +14,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/dag"
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -28,6 +29,12 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 记录按键时间，用于区分终端粘贴产生的快速连续 Enter 与手动回车。
 	defer func() { m.inputBar.lastKeyTime = now }()
 
+	// Alt+V：异步读取剪贴板图片（须在 KeyRunes case 之前拦截，否则 'v'
+	// 会被当普通字符插入输入栏）。
+	if msg.Alt && msg.String() == "alt+v" {
+		return m, m.pasteImageCmd()
+	}
+
 	switch msg.Type {
 	case tea.KeyEsc:
 		// 软停止（TODO #37）：当前会话 Running 时第一次 ESC 进入 2s 武装窗（不清空输入栏），
@@ -41,6 +48,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.inputBar.cursor = 0
 			m.inputBar.mode = inputNormal
 			m.inputBar.histIdx = -1
+			m.inputBar.clearPendingImages()
 			return m, nil
 		}
 		if s := m.selectedSession(); s != nil && s.Status == enums.SessionStatusRunning && m.stopArmedUntil.IsZero() {
@@ -55,6 +63,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputBar.cursor = 0
 		m.inputBar.mode = inputNormal
 		m.inputBar.histIdx = -1
+		m.inputBar.clearPendingImages()
 		return m, nil
 
 	case tea.KeyEnter:
@@ -113,6 +122,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputBar.runes = nil
 		m.inputBar.cursor = 0
 		m.inputBar.mode = inputNormal
+		m.inputBar.clearPendingImages()
 		// 发送后先停止跟随底部，等待 tick 把视口滚动到刚发送的用户问题，
 		// 避免长回答直接顶掉用户问题。
 		m.chatPanel.followBottom = false
@@ -391,6 +401,17 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
+	// Alt+V 粘贴暂存的图片：随本条消息发送。仅普通消息（含无会话首条与
+	// /new）承载；澄清答复/其他斜杠命令通道不支持，提示后丢弃。
+	imgs := m.inputBar.pendingImages
+	if len(imgs) > 0 {
+		head := strings.TrimSpace(cmd)
+		if m.inputBar.mode == inputClarify || (strings.HasPrefix(head, "/") && !strings.HasPrefix(head, "/new")) {
+			m.flashMsg("图片仅支持普通消息（含 /new），本次不带图发送")
+			imgs = nil
+		}
+	}
+
 	// TODO #53：澄清模式下非命令输入直接作为答复提交（自由文本或选项文本），
 	// 走 /api/sessions/{id}/clarify 通道；斜杠命令仍按命令解析。
 	if m.inputBar.mode == inputClarify && !strings.HasPrefix(strings.TrimSpace(cmd), "/") {
@@ -413,7 +434,7 @@ func (m *Model) submitInput(cmd string) {
 	// /new <goal...> 无需选中会话即可创建新会话。
 	if parts[0] == "/new" && len(parts) > 1 {
 		goal := strings.TrimSpace(strings.TrimPrefix(trimmed, "/new "))
-		m.createSession(goal)
+		m.createSession(goal, imgs...)
 		return
 	}
 
@@ -438,7 +459,7 @@ func (m *Model) submitInput(cmd string) {
 		// 避免欢迎页停留造成"第一个问题未记录"的错觉。
 		m.chatPanel.pendingFirstMessage = cmd
 		m.rebuildChatContent()
-		m.createSession(cmd)
+		m.createSession(cmd, imgs...)
 		return
 	}
 
@@ -531,7 +552,14 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
-	// default: message（保留原始多行内容，包括缩进与换行）
+	// default: message（保留原始多行内容，包括缩进与换行；图片非空时随消息携带）
+	if len(imgs) > 0 {
+		m.postJSON(fmt.Sprintf("/api/sessions/%s/message", s.ID), map[string]any{
+			"content": cmd,
+			"images":  imgs,
+		})
+		return
+	}
 	m.postJSON(fmt.Sprintf("/api/sessions/%s/message", s.ID), map[string]string{"content": cmd})
 }
 
@@ -586,13 +614,13 @@ func (m *Model) postJSON(path string, body any) {
 // 主循环内执行 refreshSessions + selectSession，避免后台 goroutine 直接改
 // m.sessions/cursor 与 View 产生 race。sharedState 为指针共享（#47 修复），
 // 写入对所有 Model 拷贝可见，不会因 bubbletea 值语义落到废弃副本上。
-func (m *Model) createSession(goal string) {
+func (m *Model) createSession(goal string, images ...tool.ResultImage) {
 	go func() {
 		if m.agent == nil {
 			m.flashMsg("agent facade not available")
 			return
 		}
-		created, err := m.agent.CreateSession(context.Background(), agent.CreateRequest{Goal: goal})
+		created, err := m.agent.CreateSession(context.Background(), agent.CreateRequest{Goal: goal, Images: images})
 		if err != nil {
 			m.flashMsg("create session: " + err.Error())
 			return

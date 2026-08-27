@@ -3,6 +3,7 @@ package subagent
 // 导入测试与项目依赖包。
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -1661,5 +1662,98 @@ func TestRenderSpecPrefix_ScopeNote(t *testing.T) {
 	}
 	if !strings.Contains(got, "【范围】") || !strings.Contains(got, "父 Agent 的全局背景") {
 		t.Fatalf("应带范围锚定说明，got: %s", got)
+	}
+}
+
+// imageCaptureProvider 捕获最近一次 Generate 请求（含消息列表）的 mock provider。
+type imageCaptureProvider struct {
+	mu      sync.Mutex
+	lastReq *blades.ModelRequest
+}
+
+func (p *imageCaptureProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	p.mu.Lock()
+	p.lastReq = req
+	p.mu.Unlock()
+	return &blades.ModelResponse{Message: blades.AssistantMessage("done")}, nil
+}
+
+func (p *imageCaptureProvider) Name() string { return "mock-img-capture" }
+
+// TestDispatchOne_PropagatesUserImages 验证用户图片（Alt+V 粘贴）经 ctx 带外
+// 穿透到子 Agent：call_sub_agent Execute 的父 ctx 携图时，子 Agent 首轮 LLM
+// 请求的首条 user 消息挂 DataPart；无图 ctx 零变化（纯文本）。
+func TestDispatchOne_PropagatesUserImages(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	prov := &imageCaptureProvider{}
+	d := NewDispatcher(reg, &mockModelFactory{provider: prov}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.RegisterCallTool(toolsReg)
+
+	pngB64 := base64.StdEncoding.EncodeToString([]byte{0x89, 0x50, 0x4E, 0x47})
+	imgs := []tool.ResultImage{{MIMEType: "image/png", Data: []byte(pngB64)}}
+	ctx := agent.WithUserImages(agent.WithAgentID(context.Background(), "meta"), imgs)
+
+	res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+		"role_id":     "code_assistant",
+		"task":        "按 [image:1] 实现界面",
+		"verify_kind": "none",
+	})
+	if err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("expected success, got error: %s", res.Error)
+	}
+
+	// 等子 Agent 完成（邮箱收到摘要）。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(mb.Drain("meta")) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	prov.mu.Lock()
+	req := prov.lastReq
+	prov.mu.Unlock()
+	if req == nil || len(req.Messages) == 0 {
+		t.Fatal("未捕获到子 Agent LLM 请求")
+	}
+	// 首条消息应为带图 user（系统提示词由 provider 层另行注入或不在 req.Messages，
+	// 此处只断言存在一条含 DataPart 的 user 消息且文本含任务占位符）。
+	found := false
+	for _, m := range req.Messages {
+		if m.Role != blades.RoleUser {
+			continue
+		}
+		hasImg, hasText := false, false
+		for _, part := range m.Parts {
+			switch v := part.(type) {
+			case blades.DataPart:
+				if v.MIMEType == blades.MIMEImagePNG && len(v.Bytes) == 4 {
+					hasImg = true
+				}
+			case blades.TextPart:
+				if strings.Contains(v.Text, "[image:1]") {
+					hasText = true
+				}
+			}
+		}
+		if hasImg && hasText {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("子 Agent 首轮请求应含带图 user 消息, messages=%+v", req.Messages)
 	}
 }

@@ -625,6 +625,8 @@ func NewReactService(
 func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*Session, error) {
 	// 在内存中创建会话对象。
 	sess := s.store.createSession(req.Goal)
+	// 首条消息携带的用户图片（Alt+V 粘贴）：runSession 注入 runCtx 后一次性消费。
+	sess.firstTurnImages = req.Images
 	s.maybeWatchWallClock(sess)
 	// 在独立 goroutine 中运行 ReAct 循环，避免阻塞调用方。
 	go s.runSession(sess)
@@ -755,7 +757,7 @@ func (s *ReactService) List(ctx context.Context, filter Filter) ([]*Session, err
 
 // Send 向指定会话投递一条用户消息。
 func (s *ReactService) Send(ctx context.Context, sessionID string, msg Message) error {
-	return s.sendMessage(ctx, sessionID, msg.Content)
+	return s.sendMessage(ctx, sessionID, msg.Content, msg.Images...)
 }
 
 // ResumeSession 继续一个之前已结束或暂停的会话。
@@ -1620,6 +1622,12 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 将会话 ID 注入工具上下文，便于工具内部识别当前会话。
 	runCtx := tool.WithSessionID(ctx, session.ID)
 
+	// 首条消息用户图片（Alt+V 粘贴）注入 runCtx 后一次性消费置 nil。
+	if len(session.firstTurnImages) > 0 {
+		runCtx = WithUserImages(runCtx, session.firstTurnImages)
+		session.firstTurnImages = nil
+	}
+
 	// 召回旧话题摘要拼到目标前(切换话题后续接上下文);同一话题只注入一次。
 	goal := s.injectTopicRecall(ctx, session, session.Goal)
 
@@ -1722,16 +1730,26 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	runCtx := tool.WithSessionID(ctx, session.ID)
 
 	// 使用最新用户消息作为本轮输入，并以之前的历史作为种子。
+	// 倒序取最后一条 user 消息（中途可能追加了澄清/审批答复等非 user 项），
+	// 同步取出该轮用户图片注入 runCtx：带外穿透给 RunWithHistory 的首条
+	// user 消息与 call_sub_agent 子 Agent（每轮新 runCtx，图片按轮作用域）。
 	var input string
+	var turnImages []tool.ResultImage
 	s.store.mu.RLock()
-	if len(session.Messages) > 0 {
-		// 取 Messages 中最后一条作为当前轮输入。
-		input = session.Messages[len(session.Messages)-1].Content
+	for i := len(session.Messages) - 1; i >= 0; i-- {
+		if session.Messages[i].Role == string(enums.ChatRoleUser) {
+			input = session.Messages[i].Content
+			turnImages = session.Messages[i].Images
+			break
+		}
 	}
 	// 拷贝历史记录，避免在加锁期间被外部修改。
 	history := make([]ReactMessage, len(session.History))
 	copy(history, session.History)
 	s.store.mu.RUnlock()
+	if len(turnImages) > 0 {
+		runCtx = WithUserImages(runCtx, turnImages)
+	}
 
 	// 召回旧话题摘要拼到本轮输入前(切换话题后续接上下文);同一话题只注入一次。
 	input = s.injectTopicRecall(ctx, session, input)
@@ -2025,7 +2043,9 @@ func restartSessionContext(session *reactInternalSession) {
 }
 
 // sendMessage 向会话发送一条消息，并在必要时恢复会话运行。
-func (s *ReactService) sendMessage(ctx context.Context, sessionID, content string) error {
+// images 为用户随消息粘贴的图片（Alt+V），内存透传：挂到该条 Message 上，
+// 由 resumeSession 取出注入 runCtx（带外穿透到 call_sub_agent 子 Agent）。
+func (s *ReactService) sendMessage(ctx context.Context, sessionID, content string, images ...tool.ResultImage) error {
 	// 空内容直接拒绝。
 	if content == "" {
 		return fmt.Errorf("content cannot be empty")
@@ -2083,6 +2103,7 @@ func (s *ReactService) sendMessage(ctx context.Context, sessionID, content strin
 		Role:      string(enums.ChatRoleUser),
 		Content:   content,
 		Timestamp: time.Now(),
+		Images:    images,
 	})
 
 	// 新用户消息 = 新任务起点：清空该 session 的 ReadFile 已读记录。

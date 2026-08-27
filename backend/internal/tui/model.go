@@ -574,6 +574,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dirty = true
 		return m, streamCmd(m.streamEvents)
 
+	case clipImageMsg:
+		// Alt+V 剪贴板图片读取完成：校验限流后暂存并在输入栏插入 [image:N] 占位符。
+		m.applyClipImage(msg)
+		m.dirty = true
+
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 

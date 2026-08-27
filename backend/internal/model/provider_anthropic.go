@@ -549,36 +549,51 @@ func (p *anthropicProvider) convertMessages(messages []*blades.Message) ([]anthr
 	return out, nil
 }
 
-// toolResultImageBlock 把 blades.DataPart 转为 anthropic tool_result content 的图片块。
-// 不支持/无法转换时返回 nil（静默跳过，Response 文本占位符仍保留其存在痕迹）。
+// imageMediaType 校验并归一图片 MIME 类型，白名单外返回空串。
 // Anthropic 图片协议仅接受 jpeg/png/gif/webp 的 base64 来源。
-func toolResultImageBlock(dp blades.DataPart) *anthropic.ToolResultBlockParamContentUnion {
+func imageMediaType(mime blades.MIMEType) anthropic.Base64ImageSourceMediaType {
+	switch anthropic.Base64ImageSourceMediaType(strings.ToLower(string(mime))) {
+	case anthropic.Base64ImageSourceMediaTypeImagePNG:
+		return anthropic.Base64ImageSourceMediaTypeImagePNG
+	case anthropic.Base64ImageSourceMediaTypeImageJPEG:
+		return anthropic.Base64ImageSourceMediaTypeImageJPEG
+	case anthropic.Base64ImageSourceMediaTypeImageGIF:
+		return anthropic.Base64ImageSourceMediaTypeImageGIF
+	case anthropic.Base64ImageSourceMediaTypeImageWebP:
+		return anthropic.Base64ImageSourceMediaTypeImageWebP
+	default:
+		return ""
+	}
+}
+
+// imageDataBlock 把 blades.DataPart 转为 anthropic 顶层图片块（user 消息多模态）。
+// 不支持/无法转换时返回 nil（静默跳过，文本占位符仍保留其存在痕迹）。
+func imageDataBlock(dp blades.DataPart) *anthropic.ImageBlockParam {
 	if len(dp.Bytes) == 0 {
 		return nil
 	}
-	var mediaType anthropic.Base64ImageSourceMediaType
-	switch anthropic.Base64ImageSourceMediaType(strings.ToLower(string(dp.MIMEType))) {
-	case anthropic.Base64ImageSourceMediaTypeImagePNG:
-		mediaType = anthropic.Base64ImageSourceMediaTypeImagePNG
-	case anthropic.Base64ImageSourceMediaTypeImageJPEG:
-		mediaType = anthropic.Base64ImageSourceMediaTypeImageJPEG
-	case anthropic.Base64ImageSourceMediaTypeImageGIF:
-		mediaType = anthropic.Base64ImageSourceMediaTypeImageGIF
-	case anthropic.Base64ImageSourceMediaTypeImageWebP:
-		mediaType = anthropic.Base64ImageSourceMediaTypeImageWebP
-	default:
+	mediaType := imageMediaType(dp.MIMEType)
+	if mediaType == "" {
 		return nil
 	}
-	return &anthropic.ToolResultBlockParamContentUnion{
-		OfImage: &anthropic.ImageBlockParam{
-			Source: anthropic.ImageBlockParamSourceUnion{
-				OfBase64: &anthropic.Base64ImageSourceParam{
-					Data:      base64.StdEncoding.EncodeToString(dp.Bytes),
-					MediaType: mediaType,
-				},
+	return &anthropic.ImageBlockParam{
+		Source: anthropic.ImageBlockParamSourceUnion{
+			OfBase64: &anthropic.Base64ImageSourceParam{
+				Data:      base64.StdEncoding.EncodeToString(dp.Bytes),
+				MediaType: mediaType,
 			},
 		},
 	}
+}
+
+// toolResultImageBlock 把 blades.DataPart 转为 anthropic tool_result content 的图片块。
+// 不支持/无法转换时返回 nil（静默跳过，Response 文本占位符仍保留其存在痕迹）。
+func toolResultImageBlock(dp blades.DataPart) *anthropic.ToolResultBlockParamContentUnion {
+	ib := imageDataBlock(dp)
+	if ib == nil {
+		return nil
+	}
+	return &anthropic.ToolResultBlockParamContentUnion{OfImage: ib}
 }
 
 // convertMessage 将单条 blades.Message 转换为 Anthropic MessageParam。
@@ -641,6 +656,18 @@ func (p *anthropicProvider) convertMessage(m *blades.Message) (anthropic.Message
 			}
 		default:
 			// 忽略不支持的 part 类型
+		}
+	}
+
+	// user 消息携带的图片 DataPart（Alt+V 粘贴 / 工具透传）转顶层图片块；
+	// tool 角色的图片由上方 ToolPart 分支经 toolResultImageBlock 处理。
+	if m.Role == blades.RoleUser {
+		for _, part := range m.Parts {
+			if dp, ok := part.(blades.DataPart); ok {
+				if ib := imageDataBlock(dp); ib != nil {
+					blocks = append(blocks, anthropic.ContentBlockParamUnion{OfImage: ib})
+				}
+			}
 		}
 	}
 

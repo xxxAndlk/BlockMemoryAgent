@@ -406,7 +406,13 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	}
 
 	// 将本轮用户输入作为一条 user 消息追加到历史中，开启新一轮 ReAct。
-	history = append(history, ReactMessage{Role: "user", Content: input})
+	// 当前轮用户图片（Alt+V 粘贴，ctx 带外注入）挂到该消息：meta 主会话与
+	// 子 Agent 派发首条 user 消息共用此收口（dispatcher 侧重注入子 Agent ctx）。
+	userMsg := ReactMessage{Role: "user", Content: input}
+	if imgs := UserImagesFromContext(ctx); len(imgs) > 0 {
+		userMsg.Images = imgs
+	}
+	history = append(history, userMsg)
 
 	// 根据当前角色构建系统提示词，作为模型行为约束。
 	system := a.systemPrompt()

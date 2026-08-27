@@ -379,12 +379,42 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 	for imgBatchStart > 0 && history[imgBatchStart-1].Role == "tool" {
 		imgBatchStart--
 	}
+	// 用户图片透传边界：定位最后一条 user 消息，仅该条挂图。更早轮次的
+	// user 消息回落纯文本（Content 里 [image:N] 占位符仍在），与上方 tool
+	// 图片窗口同构--base64 不反复进上下文烧毁前缀缓存。mailbox 注入或
+	// nudge 追加新 user 消息后，旧图自动从后续请求卸载。
+	lastUserIdx := -1
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
 	// 遍历每一轮对话消息，根据角色转换为 blades 对应的消息类型。
 	for i, m := range history {
 		// 根据消息角色进入不同分支处理。
 		switch m.Role {
 		case "user":
-			// user 角色直接转换为 blades 的用户消息。
+			// user 角色直接转换为 blades 的用户消息；仅最后一条 user 且带图时
+			// 构造多模态 parts（文本 + DataPart）。base64 解码失败/空 mime 跳过
+			//（与下方 tool 分支同语义），Content 占位符保留痕迹。
+			if i == lastUserIdx && len(m.Images) > 0 {
+				parts := []blades.Part{}
+				if m.Content != "" {
+					parts = append(parts, blades.TextPart{Text: m.Content})
+				}
+				for _, img := range m.Images {
+					raw, err := base64.StdEncoding.DecodeString(string(img.Data))
+					if err != nil || len(raw) == 0 || img.MIMEType == "" {
+						continue
+					}
+					parts = append(parts, blades.DataPart{MIMEType: blades.MIMEType(img.MIMEType), Bytes: raw})
+				}
+				if len(parts) > 0 {
+					out = append(out, &blades.Message{Role: blades.RoleUser, Parts: parts})
+					continue
+				}
+			}
 			out = append(out, blades.UserMessage(m.Content))
 		case "assistant":
 			// assistant 角色需要同时处理文本内容和可能的工具调用。
@@ -548,4 +578,27 @@ func AgentDisplayNameFromContext(ctx context.Context) string {
 		return v
 	}
 	return ""
+}
+
+// userImagesKey 用于在 context 中携带"当前轮用户图片"（Alt+V 粘贴），
+// 作为 task 文本之外的带外穿透通道：service 层注入 -> RunWithHistory 挂到
+// 首条 user 消息 -> 工具执行 ctx 同源 -> dispatcher dispatchOne 显式重注入子 Agent。
+// ctx 按调用链作用域，派发那一刻的父 ctx 决定子 Agent 拿到哪一轮的图，无跨轮串图。
+type userImagesKey struct{}
+
+// WithUserImages 把当前轮用户图片写入 ctx。空切片原样返回 ctx。
+// 注入后的切片沿途视为只读，不得原地修改。
+func WithUserImages(ctx context.Context, imgs []tool.ResultImage) context.Context {
+	if len(imgs) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, userImagesKey{}, imgs)
+}
+
+// UserImagesFromContext 取出当前轮用户图片；未注入返回 nil。
+func UserImagesFromContext(ctx context.Context) []tool.ResultImage {
+	if v, ok := ctx.Value(userImagesKey{}).([]tool.ResultImage); ok {
+		return v
+	}
+	return nil
 }
