@@ -1307,7 +1307,7 @@ func (t *callSubAgentTool) Description() string {
 		"仅纯侦察/巡检类快任务可显式给小预算（如 10-15）防无边界扩张。\n\n" +
 		"【reuse_agent_id 字段】（可选，热驻复用）复用已完成的热驻领域 Agent：填【空闲领域Agent】清单中的 agent_id。" +
 		"新任务与该领域强相关时优先复用（保留全部上下文与领域知识，省冷启动）；弱相关则省略本字段新建 domain。" +
-		"复用时 role_id/domain/responsibility 可省略（沿用槽内冻结值），task 必填。目标 Agent 忙碌时任务入队，当前任务完成后自动执行。\n\n" +
+		"复用时 role_id/domain/responsibility 可省略（沿用槽内冻结值），task 必填；spec 照常先写，domain 留空时按单键/唯一候选回退校验（key 不受 domain 名约束）。目标 Agent 忙碌时任务入队，当前任务完成后自动执行。\n\n" +
 		"【takeover 字段】（可选，看板接力认领）异名续建某旧领域的工作时填旧 domain 名：" +
 		"dispatcher 会把旧领域的未完成看板条目（含失败红条）迁移到本次 domain 名下并留痕，旧条目随本次完成自动翻绿——" +
 		"不填则旧失败条目永久红，误导看板与后续决策。同名续建（domain 与旧领域同名）天然覆盖，无需填。\n\n" +
@@ -1533,6 +1533,13 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		// 工具调用在同轮内串行执行（react_agent.go），首个派发注册节点后第二个必被拦。
 		if msg := d.checkActiveSiblingDomain(ctx, parentID, domain); msg != "" {
 			return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
+		}
+		// 复用守卫（热驻开启时）：新建 domain 疑似与某热驻槽同目标（命名包含/
+		// spec 文件重叠）时拒一次，引导 reuse_agent_id 复用；task 含【新领域声明】放行。
+		if d.hotEnabled() {
+			if msg := d.checkIdleDomainReuse(ctx, parentID, domain, task); msg != "" {
+				return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
+			}
 		}
 	}
 
@@ -3377,7 +3384,8 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain str
 // hasFreshSpec 校验 parentID 的 spec 是否存在且新鲜（Spec.Goal 非空 + 至少一条
 // Acceptance + files mtime 一致）。供 callSubAgentTool.Execute 在 SpecEnforcementEnabled
 // 开启时调用，缺失则拒绝派发。domain 非空时校验该领域专属 spec（TODO #65 多 key 化），
-// 缺失则回退遗留单键；domain 空只校验单键。
+// 缺失则回退遗留单键；domain 空只校验单键 + 唯一 keyed spec 候选回退
+//（reuse 派发省略 domain 的场景，2026-08-26：复用路径 spec key 不受 domain 名约束）。
 // 返回 (通过, 原因文案)：失败时区分 missing（未写）/ invalid（内容不合法）/ stale（文件已变更），
 // stale 精确列出失配文件路径，让 LLM 定向修正（重写被改文件或剔除无关文件）而非盲猜重写整个 spec。
 // 通过且原因非空 = 唯一候选回退附警告（key/domain 错配放行，模型应对齐）。
@@ -3389,7 +3397,19 @@ func (d *Dispatcher) hasFreshSpec(ctx context.Context, parentID, domain string) 
 		return false, "spec missing: 共享记忆未启用"
 	}
 	ok, reason := d.checkSpecKey(ctx, specKeyFor(parentID, domain))
-	if ok || strings.TrimSpace(domain) == "" {
+	if ok {
+		return ok, reason
+	}
+	if strings.TrimSpace(domain) == "" {
+		// reuse 派发省略 domain：主键（=遗留单键）已由上面查过，唯一 keyed spec
+		// 候选回退对称放行--复用派发刚写的 spec 用任意 key 都能命中，消除复用路径摩擦。
+		if strings.Contains(reason, "missing") {
+			if keys := d.specKeysOfParent(ctx, parentID); len(keys) == 1 {
+				if altOK, _ := d.checkSpecKey(ctx, keys[0]); altOK {
+					return true, fmt.Sprintf("spec 按唯一候选放行（key=%q）--reuse 派发可在 call_sub_agent 的 domain 参数填该 key 对应 domain 以消除歧义", keys[0])
+				}
+			}
+		}
 		return ok, reason
 	}
 	// 领域专属 spec 缺失 → 回退遗留单键（老流程兼容）；仅当单键存在且新鲜才放行。

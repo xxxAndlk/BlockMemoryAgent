@@ -58,6 +58,12 @@ func renderIdleRoster(infos []IdleDomainInfo) string {
 	sb.WriteString("复用保留该领域全部上下文与知识；**弱相关或无关**则省略 reuse_agent_id 新建 domain。繁忙 Agent 的任务会入队，当前任务完成后自动执行。）\n")
 	for _, info := range infos {
 		line := fmt.Sprintf("- id=%s 领域=%s reuse=%d 状态=%s", info.AgentID, info.Domain, info.ReuseCount, idleStateLabel(info))
+		if info.Resp != "" {
+			line += " 职责=" + info.Resp
+		}
+		if len(info.WrittenFiles) > 0 {
+			line += " 写过=" + strings.Join(info.WrittenFiles, ",")
+		}
 		if info.LastTask != "" {
 			line += " 最近任务=" + info.LastTask
 		}

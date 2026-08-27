@@ -358,7 +358,38 @@ func TestIdleRoster_Render(t *testing.T) {
 	if roster[0].AgentID != subID || roster[0].Domain != "金融" {
 		t.Errorf("roster entry = %+v", roster[0])
 	}
+	if roster[0].Resp != "负责金融模块" {
+		t.Errorf("roster responsibility = %q, want 负责金融模块", roster[0].Resp)
+	}
 	if roster[0].Busy {
 		t.Error("idle slot reported busy")
+	}
+}
+
+// TestIdleRoster_WrittenFiles 验证清单含近期写入文件（lastWrites 追踪 -> base 名）。
+func TestIdleRoster_WrittenFiles(t *testing.T) {
+	provider := &scriptProvider{lines: []string{"result"}}
+	d, _, tr, toolsReg := newIdleTestEnv(t, provider, time.Hour)
+	res, _ := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "做某事",
+		"domain":         "部署",
+		"responsibility": "负责部署",
+	})
+	subID := res.Output
+	waitForCond(t, "tree idle", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusIdle
+	})
+
+	d.lastWrites.Store(subID, &fileWriteState{recs: []fileWriteRecord{
+		{path: "/srv/app.conf", at: time.Now()},
+	}})
+	roster := d.IdleRoster("s1")
+	if len(roster) != 1 {
+		t.Fatalf("roster len = %d, want 1", len(roster))
+	}
+	if len(roster[0].WrittenFiles) != 1 || roster[0].WrittenFiles[0] != "app.conf" {
+		t.Errorf("roster written files = %v, want [app.conf]", roster[0].WrittenFiles)
 	}
 }

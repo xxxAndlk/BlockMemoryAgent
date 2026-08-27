@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,9 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
+
+// idleRosterFileWindow 是 roster/复用守卫取"近期写入文件"的时间窗口。
+const idleRosterFileWindow = 24 * time.Hour
 
 // domainHotConfig 热驻留参数，由 bootstrap 从 config 注入。
 type domainHotConfig struct {
@@ -383,6 +387,16 @@ func (d *Dispatcher) IdleRoster(sessionID string) []agent.IdleDomainInfo {
 			Domain:      s.domain,
 			ReuseCount:  s.reuseCount,
 			Busy:        s.state == slotRunning,
+			Resp:        truncateRunes(strings.TrimSpace(s.responsibility), 60),
+		}
+		if files := d.recentWrittenFiles(s.id, idleRosterFileWindow); len(files) > 0 {
+			n := len(files)
+			if n > 3 {
+				n = 3
+			}
+			for _, f := range files[:n] {
+				info.WrittenFiles = append(info.WrittenFiles, filepath.Base(f))
+			}
 		}
 		if s.state == slotIdle {
 			// LastTask/LastSummary 从最近 history 提取。

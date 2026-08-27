@@ -102,3 +102,45 @@ func TestCheckSpecKey_TombstoneVsMissing(t *testing.T) {
 		t.Fatalf("tombstone should be excluded from key listing, got %v", keys)
 	}
 }
+
+// TestHasFreshSpec_EmptyDomainUniqueCandidateFallback 验证 reuse 派发省略 domain 时
+// 的唯一候选回退：遗留单键缺失 + 仅一个 keyed spec -> 放行附警告；多 keyed 仍 missing。
+func TestHasFreshSpec_EmptyDomainUniqueCandidateFallback(t *testing.T) {
+	d := &Dispatcher{}
+	kv := newTestKVMemory(true)
+	d.sharedMem = kv
+
+	// 空 store：missing。
+	if ok, _ := d.hasFreshSpec(context.Background(), "meta-1", ""); ok {
+		t.Fatal("empty store should be missing")
+	}
+
+	// 仅一个 keyed spec（reuse 派发刚写的）：domain 省略按唯一候选放行。
+	kv.items["meta-1:spec:port80-fix"] = tool.EncodeSpecMD("meta-1", tool.Spec{
+		Goal: "g", Acceptance: []string{"a"},
+	}, nil)
+	ok, reason := d.hasFreshSpec(context.Background(), "meta-1", "")
+	if !ok {
+		t.Fatalf("reuse dispatch with single keyed spec should fall back, got reason=%q", reason)
+	}
+	if !strings.Contains(reason, "唯一候选") || !strings.Contains(reason, "port80-fix") {
+		t.Fatalf("fallback should carry key warning, got %q", reason)
+	}
+
+	// 遗留单键存在时优先命中（不进回退）。
+	kv.items["meta-1:spec"] = tool.EncodeSpecMD("meta-1", tool.Spec{
+		Goal: "g", Acceptance: []string{"a"},
+	}, nil)
+	if ok, reason := d.hasFreshSpec(context.Background(), "meta-1", ""); !ok || reason != "" {
+		t.Fatalf("legacy key should pass without warning, ok=%v reason=%q", ok, reason)
+	}
+
+	// 两个 keyed spec 且无单键：无法唯一定位，仍 missing。
+	delete(kv.items, "meta-1:spec")
+	kv.items["meta-1:spec:other-task"] = tool.EncodeSpecMD("meta-1", tool.Spec{
+		Goal: "g", Acceptance: []string{"a"},
+	}, nil)
+	if ok, _ := d.hasFreshSpec(context.Background(), "meta-1", ""); ok {
+		t.Fatal("two keyed specs without legacy should not fall back")
+	}
+}

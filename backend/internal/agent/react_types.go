@@ -310,13 +310,15 @@ type SuspendGate interface {
 // IdleDomainInfo 描述一个热驻 Idle DomainAgent 的可复用信息，
 // 供 MetaAgent 上下文注入（复用判定）。由 subagent.Dispatcher 的 IdleRoster 填充。
 type IdleDomainInfo struct {
-	AgentID     string        `json:"agent_id"`     // AgentID 热驻 domain 的树节点 ID（reuse_agent_id 参数值）
-	Domain      string        `json:"domain"`       // Domain 领域标签
-	LastTask    string        `json:"last_task"`    // LastTask 最近一次任务摘要（截断）
-	LastSummary string        `json:"last_summary"` // LastSummary 最近一次结果摘要（截断）
-	ReuseCount  int           `json:"reuse_count"`  // ReuseCount 已被复用次数（权重）
-	IdleLeft    time.Duration `json:"idle_left"`    // IdleLeft 加权倒计时剩余（未武装为 0）
-	Busy        bool          `json:"busy"`         // Busy 正在执行任务（派发将入队）
+	AgentID      string        `json:"agent_id"`                // AgentID 热驻 domain 的树节点 ID（reuse_agent_id 参数值）
+	Domain       string        `json:"domain"`                  // Domain 领域标签
+	Resp         string        `json:"responsibility,omitempty"` // Resp 槽内冻结职责描述（截断，复用相关性判定用）
+	WrittenFiles []string      `json:"written_files,omitempty"` // WrittenFiles 近期写入文件（base 名，最多 3 个，同文件集判定用）
+	LastTask     string        `json:"last_task"`               // LastTask 最近一次任务摘要（截断）
+	LastSummary  string        `json:"last_summary"`            // LastSummary 最近一次结果摘要（截断）
+	ReuseCount   int           `json:"reuse_count"`             // ReuseCount 已被复用次数（权重）
+	IdleLeft     time.Duration `json:"idle_left"`               // IdleLeft 加权倒计时剩余（未武装为 0）
+	Busy         bool          `json:"busy"`                    // Busy 正在执行任务（派发将入队）
 }
 
 // IdleRosterProvider 抽象"查询某 session 的热驻 Idle DomainAgent 清单"，
