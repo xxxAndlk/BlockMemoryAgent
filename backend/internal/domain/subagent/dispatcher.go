@@ -1433,7 +1433,7 @@ func (t *callSubAgentTool) Description() string {
 		"复用时 role_id/domain/responsibility 可省略（沿用槽内冻结值），task 必填；spec 照常先写，domain 留空时按单键/唯一候选回退校验（key 不受 domain 名约束）。目标 Agent 忙碌时任务入队，当前任务完成后自动执行。\n\n" +
 		"【takeover 字段】（可选，看板接力认领）异名续建某旧领域的工作时填旧 domain 名：" +
 		"dispatcher 会把旧领域的未完成看板条目（含失败红条）迁移到本次 domain 名下并留痕，旧条目随本次完成自动翻绿——" +
-		"不填则旧失败条目永久红，误导看板与后续决策。同名续建（domain 与旧领域同名）天然覆盖，无需填。\n\n" +
+		"不填则旧失败条目永久红，误导看板与后续决策。同名续建（domain 与旧领域同名）天然覆盖，无需填——dispatcher 自动路由该领域的热驻空闲 Agent 复用其上下文（Running 中则拒绝，等回传）。\n\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
