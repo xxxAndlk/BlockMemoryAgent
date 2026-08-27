@@ -3925,14 +3925,20 @@ func (d *Dispatcher) injectScopedRecall(ctx context.Context, parentID, taskDomai
 	var recs []*types.KnowledgeRecord
 	// scope 确定性路径：BlackboardSearcher + 非空 parent/domain。
 	if bb, ok := d.searcher.(BlackboardSearcher); ok && strings.TrimSpace(parentID) != "" && strings.TrimSpace(taskDomain) != "" {
-		if rs, err := bb.Query(ctx, sid, parentID, taskDomain, query, blockMemoryRecallTopK, ""); err == nil && len(rs) > 0 {
+		if rs, err := bb.Query(ctx, sid, parentID, taskDomain, query, blockMemoryRecallTopK, ""); err != nil {
+			// 降级显式化（TODO #46）：召回失败静默跳过，但留痕供排查熔断/超时。
+			log.Printf("[subagent] blackboard scope recall failed (skipped): parent=%s domain=%s err=%v", parentID, taskDomain, err)
+		} else if len(rs) > 0 {
 			recs = rs
 		}
 	}
 	// 回退：语义召回（旧数据无 parent_id/task_domain / mock 未实现 BlackboardSearcher / scope 0 命中）。
 	if len(recs) == 0 {
 		rs, err := d.searcher.SearchBlockMemoryByGoal(ctx, sid, query, blockMemoryRecallTopK)
-		if err != nil || len(rs) == 0 {
+		if err != nil {
+			log.Printf("[subagent] block-memory recall failed (skipped): session=%s err=%v", sid, err)
+			rs = nil
+		} else if len(rs) == 0 {
 			rs = nil
 		}
 		recs = rs

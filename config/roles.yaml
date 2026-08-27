@@ -17,10 +17,10 @@
 # 主Agent (MetaAgent)：会话入口，对最终目标负责。只做派发与汇总，不直接执行。
 meta_agent:
   model_config: &meta_model
-    provider: openai-chat
+    provider: anthropic
     model: glm-5.3-flash
     api_key: ${OPENAI_API_KEY_TWO}
-    base_url: ${OPENAI_BASE_URL_TWO}
+    base_url: ${ANTHROPIC_BASE_URL_FOUR}
     temperature: 0.3
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
     # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
@@ -230,10 +230,10 @@ meta_agent:
 # 领域Agent配置（domain 角色共用模型；提示词由此处 system_prompt 提供，registry.go 仅兜底）
 domain_agent:
   model_config: &domain_model
-    provider: openai-chat
+    provider: anthropic
     model: glm-5.3-flash
     api_key: ${OPENAI_API_KEY_TWO}
-    base_url: ${OPENAI_BASE_URL_TWO}
+    base_url: ${ANTHROPIC_BASE_URL_FOUR}
     temperature: 0.5
     max_tokens: 128000  # DomainAgent 自执行 WriteFile 时需容纳大文件 + 派发推理；Volces ark 硬上限 128000，顶格设
   system_prompt: |
@@ -492,9 +492,9 @@ fixed_roles:
     tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
     model_config: &ui_model
       provider: anthropic
-      model: doubao-seed-evolving
-      api_key: ${ANTHROPIC_API_KEY}
-      base_url: ${ANTHROPIC_BASE_URL}
+      model: glm-5.3-flash
+      api_key: ${OPENAI_API_KEY_TWO}
+      base_url: ${ANTHROPIC_BASE_URL_FOUR}
       temperature: 0.7
       max_tokens: 32768  # 实证 16K 时 HTML+CSS 输出被截断 → 重写/分段追加空转 8.5min 烧穿预算；32K 一次写完
     can_be_called: true
