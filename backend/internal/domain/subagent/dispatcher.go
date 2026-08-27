@@ -711,7 +711,13 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
 	}
 	log.Printf("[subagent] HEARTBEAT KILL: sub=%s parent=%s idle>%s - cancel+notify",
 		subAgentID, meta.parentID, threshold)
-	meta.cancel()
+	// cancel 可能为 nil：热驻 domain 槽的 subMeta 在任务 ctx 创建前注册（idle_pool
+	// dispatchHotDomain），首任务换绑前/挂起等用户续跑期间被巡检命中时（2026-08-26
+	// 实证进程级 panic）不得空指针崩溃。nil 时跳过主动 cancel，仍走 doneOnce 兜底
+	// 递减 + notify 收尾。
+	if meta.cancel != nil {
+		meta.cancel()
+	}
 	meta.doneOnce.Do(func() { d.trackChildDone(meta.parentID) })
 	killMsg := failureMarker(FailureKindKilled, false) + "\n" +
 		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。请检查任务或重派。", subAgentID, threshold)

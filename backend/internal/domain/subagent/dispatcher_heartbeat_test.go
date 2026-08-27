@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
@@ -168,5 +169,96 @@ func TestDispatcher_PingActivityPreventsKill(t *testing.T) {
 		// 预期：停止 ping 后被巡检判定假死。
 	case <-time.After(3 * time.Second):
 		t.Fatal("停止保活后应被心跳 kill")
+	}
+}
+
+// TestDispatcher_KillStuckNilCancelNoPanic 回归（2026-08-26 实证进程级 panic）：
+// 热驻 domain 槽首注册的 subMeta.cancel 为 nil（idle_pool dispatchHotDomain 在任务 ctx
+// 创建前注册），挂起等用户续跑/换绑前被巡检命中时 killStuckSubAgent 的 meta.cancel()
+// 空指针崩溃。修复后 kill 走 nil 守卫：不 panic + doneOnce 兜底递减 + 父邮箱收到假死通知。
+func TestDispatcher_KillStuckNilCancelNoPanic(t *testing.T) {
+	d, mb, _, _ := newIdleTestEnv(t, &scriptProvider{lines: []string{"x"}}, time.Hour)
+	d.WithHeartbeatTimeout(150 * time.Millisecond)
+	t.Cleanup(d.ClosePatrol)
+
+	id := "s1/domain-9"
+	d.activity.Store(id, new(atomic.Int64)) // 时间戳 0：立即判假死
+	d.subMeta.Store(id, &subAgentMeta{parentID: "s1", sessionID: "s1"}) // cancel=nil（热驻首注册形态）
+	d.ensurePatrol()
+
+	// 巡检应完成 kill（LoadAndDelete subMeta）；期间不得 panic（panic 会直接终止测试进程）。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := d.subMeta.Load(id); !ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, ok := d.subMeta.Load(id); ok {
+		t.Fatal("expected patrol to kill the nil-cancel stuck slot")
+	}
+	if got := d.PendingChildren("s1"); got != 0 {
+		t.Fatalf("PendingChildren = %d, want 0 after doneOnce fallback decrement", got)
+	}
+	msgs := mb.Drain("s1")
+	if len(msgs) == 0 {
+		t.Fatal("expected stuck notify in mailbox, got none")
+	}
+	if !strings.Contains(msgs[0].Body, "假死") && !strings.Contains(msgs[0].Body, "无活动") {
+		t.Fatalf("expected stuck notify body, got: %s", msgs[0].Body)
+	}
+}
+
+// ctxCancelProvider 模拟可被取消的挂起 LLM 调用：Generate 阻塞至 ctx 取消后返回 ctx.Err()
+//（区别于 hangingProvider 的无视 ctx，用于验证巡检 kill 的 cancel 真正传导到任务 ctx）。
+type ctxCancelProvider struct{}
+
+func (p *ctxCancelProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (p *ctxCancelProvider) Name() string { return "ctx-cancel-mock" }
+
+// TestHotDomain_HeartbeatKillCancelsRunningTask 验证热驻槽假死 kill 的换绑修复：
+// runDomainTask 把每任务 cancelTask 换绑进 subMeta，巡检 kill 应真正取消执行中的
+// 任务 ctx（ctx 取消 -> Canceled 分支 -> domainTaskDestroyed -> 槽销毁 + 树 Failed），
+// 而非旧实现的 subMeta.cancel 恒 nil（要么空指针 panic，要么 kill 后槽继续跑到墙钟）。
+func TestHotDomain_HeartbeatKillCancelsRunningTask(t *testing.T) {
+	d, mb, tr, toolsReg := newIdleTestEnv(t, &ctxCancelProvider{}, time.Hour)
+	d.WithHeartbeatTimeout(150 * time.Millisecond)
+
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "挂起任务",
+		"domain":         "金融",
+		"responsibility": "负责金融模块",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
+	}
+	subID := res.Output
+
+	// 巡检 kill：树节点应落 Failed（心跳超时疑似卡死）。
+	waitForCond(t, "tree node failed after heartbeat kill", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusFailed
+	})
+	// cancel 传导到任务 ctx：引擎经 Canceled 分支返回 domainTaskDestroyed，槽被销毁。
+	waitForCond(t, "slot destroyed after cancel propagation", func() bool {
+		return d.pool.slot("s1", subID) == nil
+	})
+	// 父计数归零（kill 的 doneOnce 兜底递减）。
+	if got := d.PendingChildren("s1"); got != 0 {
+		t.Fatalf("PendingChildren = %d, want 0 after heartbeat kill", got)
+	}
+	// 父邮箱收到假死通知。
+	found := false
+	for _, m := range mb.Drain("s1") {
+		if strings.Contains(m.Body, "假死") || strings.Contains(m.Body, "无活动") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected stuck notify in parent mailbox")
 	}
 }
