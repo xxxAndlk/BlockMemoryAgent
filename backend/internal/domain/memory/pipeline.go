@@ -34,6 +34,13 @@ const eventSummarizeThreshold = 8
 // 为 nil 时关闭摘要路径，injectEvents 直接拼装原始事件。
 type EventSummarizer func(ctx context.Context, events []string) (string, error)
 
+// HistorySummarizer 把一段对话历史文本压成一个结构化压缩包（层级压缩用）。
+// merge=false：输入是新滑出保留段的中段历史（formatSegmentText 渲染），输出单个压缩包；
+// merge=true：输入是若干旧压缩包的拼接（从旧到新），输出合并后的单个更粗粒度压缩包。
+// bootstrap 侧用 modelFactory.CallLightweightWithRetry 实现。为 nil 或调用失败时
+// 降级为截断式压缩（user 500 字符 / 其他 200 字符），主流程不受影响。
+type HistorySummarizer func(ctx context.Context, text string, merge bool) (string, error)
+
 // Pipeline 实现了 agent.MemoryPipeline 接口，作为一个基于内存的事件流。
 // 每个智能体（agent）的事件按插入顺序保存在内存中；如果配置了 Store，事件还可以被持久化。
 type Pipeline struct {
@@ -76,12 +83,27 @@ type Pipeline struct {
 	// tokenEstimator 估算消息切片的 token 数；为 nil 时不按 token 触发压缩（仅步频兜底）。
 	// 由 bootstrap 注入 agent.EstimateMessagesTokens，避免 domain/memory 反向依赖 model 包。
 	tokenEstimator func([]agent.ReactMessage) int
+	// historySummarizer 是可选的层级压缩摘要器：每次压缩触发把新滑出保留段的中段历史
+	// 压成一个结构化压缩包（LLM），并在压缩包超上限时合并最老的一半。
+	// 为 nil 或失败时降级截断式压缩（旧行为）。见 pyramid.go。
+	historySummarizer HistorySummarizer
+	// maxBundles 是每个 agent 压缩包数量上限；超限时把最老的一半合并为 1 个更粗的包。
+	// <=0 视为 DefaultMaxBundles。
+	maxBundles int
+	// compressLoaded 记录已尝试从 store 懒加载压缩状态的 agentID（重启恢复用），
+	// 无论成败都只试一次，避免每轮 Assemble 打一次 DB。受 mu 保护。
+	compressLoaded map[string]bool
+	// eventsLoaded 记录已尝试从 store 懒加载历史事件的 agentID（重启恢复用），语义同上。
+	eventsLoaded map[string]bool
 }
 
-// compressState 是某 agent 已冻结的压缩视图状态。
+// compressState 是某 agent 已冻结的压缩视图状态（层级压缩金字塔）。
+// 字段导出以便 JSON 序列化落库（agent_compress_states 表），进程重启后懒加载恢复。
 type compressState struct {
-	summary   string // 中段压缩摘要消息正文（含【历史压缩摘要】头尾）
-	tailStart int    // 摘要覆盖到的 history 下标（不含）；history[tailStart:] 原样保留
+	Bundles []string `json:"bundles"` // 压缩包列表（从旧到新）；超 maxBundles 时最老的一半已合并为更粗的包
+	// TailStart 是压缩包覆盖到的 history 下标（不含）；history[tailStart:] 原样保留。
+	// 仅当全量 history 同时被持久化/恢复（MetaAgent 走 agent_messages）时下标语义跨重启有效。
+	TailStart int `json:"tail_start"`
 }
 
 // Store 抽象了事件流的持久化能力，实现者负责把事件保存到磁盘或数据库。
@@ -90,6 +112,10 @@ type Store interface {
 	SaveEvent(ctx context.Context, agentID string, event agent.MemoryEvent) error
 	// LoadEvents 从持久化存储中加载指定 agent 的最多 limit 条事件。
 	LoadEvents(ctx context.Context, agentID string, limit int) ([]agent.MemoryEvent, error)
+	// SaveCompressState 持久化指定 agent 的层级压缩状态（压缩金字塔），供进程重启后恢复。
+	SaveCompressState(ctx context.Context, agentID string, state *compressState) error
+	// LoadCompressState 加载指定 agent 的压缩状态；无数据返回 (nil, nil)。
+	LoadCompressState(ctx context.Context, agentID string) (*compressState, error)
 }
 
 // NewPipeline 创建一个基于内存的事件管道。
@@ -100,8 +126,11 @@ func NewPipeline(store Store) *Pipeline {
 		store:             store,                                // 保存外部传入的持久化存储实现
 		limit:             DefaultEventLimit,                    // 默认使用 DefaultEventLimit 作为注入上限
 		maxEventsPerAgent: DefaultMaxEventsPerAgent,             // 默认每个 agent 最多保留 DefaultMaxEventsPerAgent 条事件
+		maxBundles:        DefaultMaxBundles,                    // 默认压缩包数量上限
 		compressCounters:  make(map[string]int),                 // 初始化空的 agentID -> 步频计数器映射
 		compressStates:    make(map[string]compressState),       // 初始化空的 agentID -> 冻结压缩视图映射
+		compressLoaded:    make(map[string]bool),                // 初始化压缩状态懒加载记录
+		eventsLoaded:      make(map[string]bool),                // 初始化事件懒加载记录
 	}
 }
 
@@ -179,6 +208,23 @@ func (p *Pipeline) WithTokenEstimator(f func([]agent.ReactMessage) int) *Pipelin
 	return p
 }
 
+// WithHistorySummarizer 注入层级压缩摘要器（轻量模型）。传 nil 关闭 LLM 压缩包路径，
+// 降级为截断式压缩（旧行为）。摘要失败时同样降级，不影响主流程。
+func (p *Pipeline) WithHistorySummarizer(f HistorySummarizer) *Pipeline {
+	p.historySummarizer = f
+	return p
+}
+
+// WithMaxBundles 配置每个 agent 的压缩包数量上限；超限时合并最老的一半为 1 个包。
+// n<=0 时回退 DefaultMaxBundles，避免错误配置导致金字塔无限增长或无法压缩。
+func (p *Pipeline) WithMaxBundles(n int) *Pipeline {
+	if n <= 0 {
+		n = DefaultMaxBundles
+	}
+	p.maxBundles = n
+	return p
+}
+
 // resolveContextBudget 返回 roleID 的上下文 token 阈值：
 // perRole 命中优先，否则 contextBudget；<=0 表示不限制（不按 token 触发）。
 func (p *Pipeline) resolveContextBudget(roleID string) int {
@@ -193,11 +239,15 @@ func (p *Pipeline) resolveContextBudget(roleID string) int {
 // Assemble 把 agent 的近期事件作为一条 system 角色上下文消息注入到历史记录中。
 // 返回的新切片不会修改传入的 history 参数，调用方可以安全复用原切片。
 //
-// 历史压缩（hot/cold 分层，冻结视图版）：
-//   - 每 compressEvery 步触发一次压缩：中段历史压成摘要并冻结为 compressState；
-//   - 两次压缩之间每轮都复用同一冻结视图（摘要与保留段起点不变），history 只在尾部追加，
-//     发给模型的消息前缀字节级稳定——DeepSeek 前缀缓存仅压缩那一轮全量失效，
+// 历史压缩（层级压缩金字塔，冻结视图版，见 pyramid.go）：
+//   - 每 compressEvery 步（或 token 达阈值）触发一次压缩：新滑出保留段的中段历史
+//     压成一个结构化压缩包（LLM 摘要，失败降级截断），追加到该 agent 的压缩包列表；
+//   - 压缩包数量超 maxBundles 时，最老的一半合并为 1 个更粗的包，循环往复——
+//     旧上下文以逐级变粗的形式保留，不再 200 字符截断后等同丢弃；
+//   - 两次压缩之间每轮都复用同一冻结视图（压缩包列表与保留段起点不变），history 只在尾部追加，
+//     发给模型的消息前缀字节级稳定——DeepSeek 前缀缓存仅压缩那一轮失效，
 //     其余轮次全部命中（旧实现每轮从全量 history 重算摘要，前缀每压缩轮即被打断）；
+//   - 压缩状态随压缩触发落库（agent_compress_states），进程重启后懒加载恢复；
 //   - 近期事件注入永远放在视图末尾（内容每轮变化，尾部变化不破坏前缀缓存）。
 func (p *Pipeline) Assemble(role types.RoleDefinition, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
 	return p.injectEvents(agentID, p.compressedView(role.ID, agentID, history))
@@ -214,6 +264,10 @@ func (p *Pipeline) Assemble(role types.RoleDefinition, agentID string, history [
 // 不会进入保留段、也不会在下个周期被压进中段摘要。
 func (p *Pipeline) compressedView(roleID, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
 	if p.compressEvery <= 0 && p.tokenEstimator == nil {
+		// 压缩触发全关：仍尝试恢复已持久化的压缩视图（重启场景），无状态则原样返回。
+		if st, ok := p.loadCompressStateOnce(agentID, len(history)); ok && st.TailStart <= len(history) {
+			return buildCompressedView(history, st)
+		}
 		return history
 	}
 
@@ -226,8 +280,14 @@ func (p *Pipeline) compressedView(roleID, agentID string, history []agent.ReactM
 	p.mu.RLock()
 	st, ok := p.compressStates[agentID]
 	p.mu.RUnlock()
+	if !ok {
+		// 重启后内存无状态：尝试从 store 懒加载压缩金字塔（每 agent 只试一次）。
+		// TailStart 下标语义依赖全量 history 同时被恢复（MetaAgent 走 agent_messages），
+		// 未恢复全量历史时加载结果会因 TailStart 越界被丢弃，退化为不压缩，安全。
+		st, ok = p.loadCompressStateOnce(agentID, len(history))
+	}
 	var candidate []agent.ReactMessage
-	if ok && st.tailStart <= len(history) {
+	if ok && st.TailStart <= len(history) {
 		candidate = buildCompressedView(history, st)
 	} else {
 		candidate = history
@@ -237,18 +297,15 @@ func (p *Pipeline) compressedView(roleID, agentID string, history []agent.ReactM
 	overBudget := threshold > 0 && p.tokenEstimator != nil && p.tokenEstimator(candidate) >= threshold
 	stepHit := p.compressEvery > 0 && step%p.compressEvery == 0
 	if overBudget || stepHit {
-		if summary, tailStart, ok := compressMiddle(history, p.compressKeepRecent); ok {
-			p.mu.Lock()
-			p.compressStates[agentID] = compressState{summary: summary, tailStart: tailStart}
-			p.mu.Unlock()
-		}
+		// 层级压缩：把新滑出保留段的中段历史压成一个压缩包并冻结新视图（见 pyramid.go）。
+		p.advanceCompression(agentID, history)
 	}
 
 	p.mu.RLock()
 	st, ok = p.compressStates[agentID]
 	p.mu.RUnlock()
 	// history 在单次运行内只增不减；tailStart 越界说明状态陈旧（如外部重建 history），原样返回。
-	if !ok || st.tailStart > len(history) {
+	if !ok || st.TailStart > len(history) || len(st.Bundles) == 0 {
 		return history
 	}
 	return buildCompressedView(history, st)
@@ -266,6 +323,11 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 	// 获取该 agent 在内存中的全部事件；这里只是读指针，不需要深拷贝
 	events := p.events[agentID]
 	p.mu.RUnlock()
+
+	if len(events) == 0 {
+		// 重启后内存无事件：尝试从 store 懒加载（每 agent 只试一次），恢复"近期事件"连续性。
+		events = p.loadEventsOnce(agentID)
+	}
 
 	if len(events) == 0 {
 		// 没有事件时无需生成上下文消息，避免插入空内容
@@ -290,11 +352,7 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 	if p.summarizer != nil && len(summary) > eventSummarizeThreshold {
 		// 若连续 2 次 Insufficient Balance，关闭摘要路径降级到 raw join 直到进程重启，
 		// 避免每次调用白等超时（实证 DeepSeek 余额耗尽持续 402）。
-		summarizerDisabled := false
-		p.mu.RLock()
-		summarizerDisabled = p.consecutiveBalanceErrors >= 2
-		p.mu.RUnlock()
-		if !summarizerDisabled {
+		if !p.summarizerDisabled() {
 			// 超时取装配层注入值（默认 5s 仅适合秒回模型；思考型模型需 60-180s）。
 			// 超时立即降级 raw join，避免主循环无限卡顿。
 			timeout := p.summarizeTimeout
@@ -305,26 +363,13 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 			summarized, err := p.summarizer(ctx, summary)
 			cancel()
 			if err != nil {
-				// 检测余额不足：DeepSeek 402 错误持续重试无意义，连续 2 次后关闭摘要路径。
-				if strings.Contains(err.Error(), "Insufficient Balance") || strings.Contains(err.Error(), "402") {
-					p.mu.Lock()
-					p.consecutiveBalanceErrors++
-					count := p.consecutiveBalanceErrors
-					p.mu.Unlock()
-					slog.Warn("pipeline: summarize got Insufficient Balance, will disable after 2 consecutive errors",
-						"agent_id", agentID, "consecutive_count", count)
-					if count >= 2 {
-						slog.Warn("pipeline: summarizer disabled (Insufficient Balance x2), falling back to raw join until restart")
-					}
-				}
+				p.noteSummarizeError(agentID, err)
 				// 摘要失败：记录警告，降级为原始 join，主流程不中断。
 				slog.Warn("pipeline: summarize events failed, fallback to raw join",
 					"agent_id", agentID, "event_count", len(summary), "err", err)
 			} else if trimmed := strings.TrimSpace(summarized); trimmed != "" {
 				// 摘要成功：重置连续错误计数。
-				p.mu.Lock()
-				p.consecutiveBalanceErrors = 0
-				p.mu.Unlock()
+				p.noteSummarizeSuccess()
 				// 摘要成功且非空：用摘要替换原始 body，显著降低 token 占用。
 				// 保留原始事件数标注，便于 LLM 识别这是压缩后的快照。
 				body = fmt.Sprintf("[已摘要 %d 条事件] %s", len(summary), trimmed)
@@ -448,27 +493,19 @@ func joinNonEmpty(sep string, parts []string) string {
 	return result
 }
 
-// compressMiddle 计算历史的中段压缩摘要与保留段起点。
-// 用于每 N 步触发一次的上下文压缩，避免长任务 token O(N²) 增长。
-//
-// 压缩规则：
-//   - system 前缀全保留（若存在；记忆流水线已将近期事件移至末尾，此处通常无 system 前缀）；
-//   - 首条 user 消息原样保留（任务目标，防"失忆"）；
-//   - 中段压缩（TODO #34/#35 结论）：assistant/tool 消息压成 "[role] 前 200 字符"，
-//     **user 消息保前 500 字符**——用户指令语义不可压（多轮会话第二条指令如"重新执行/
-//     自检"被压成 200 字符是"指令歧义→全量重跑"事故的直接推手）；
+// compressBoundary 计算历史压缩的边界：首条 user 下标与保留段起点。
+//   - 首条 user 消息原样保留（任务目标，防"失忆"）；无 user 消息时 ok=false（不压缩）；
 //   - 最近 K 条原样保留（含 tool_call/tool_result 对，边界避开 tool 起刀）。
+//     不锚 user 边界：纯工作段（assistant/tool 交替）无 user，锚 user 会走空保留段
+//     （实证：windowMessages 同款缺陷致塔防配置 Agent 上下文塌缩成 2 条失忆空转）。
 //
-// 返回 summary 摘要正文、tailStart 保留段起点（messages[tailStart:] 原样保留）。
-// keepRecent<=0 视为 10；消息总数不足或无 user 消息时 ok=false（不压缩）。
-//
-// 该函数从 react_agent.go 迁入，职责归位到记忆层。ReActAgent 不再直接做历史压缩。
-func compressMiddle(messages []agent.ReactMessage, keepRecent int) (summary string, tailStart int, ok bool) {
+// keepRecent<=0 视为 10；消息总数不足时 ok=false。
+func compressBoundary(messages []agent.ReactMessage, keepRecent int) (firstUserIdx, recentStart int, ok bool) {
 	if keepRecent <= 0 {
 		keepRecent = 10
 	}
 	if len(messages) <= keepRecent+2 {
-		return "", 0, false
+		return 0, 0, false
 	}
 
 	// 1) system 前缀
@@ -478,7 +515,7 @@ func compressMiddle(messages []agent.ReactMessage, keepRecent int) (summary stri
 	}
 
 	// 2) 首条 user（任务目标）。若无 user（仅 system），不压缩。
-	firstUserIdx := -1
+	firstUserIdx = -1
 	for i := keep; i < len(messages); i++ {
 		if messages[i].Role == "user" {
 			firstUserIdx = i
@@ -486,29 +523,28 @@ func compressMiddle(messages []agent.ReactMessage, keepRecent int) (summary stri
 		}
 	}
 	if firstUserIdx < 0 {
-		return "", 0, false
+		return 0, 0, false
 	}
 
 	// 3) 最近 K 条边界：避开孤立的 tool 结果起刀（tool 结果须跟随其 assistant tool_calls）。
-	// 不锚 user 边界：纯工作段（assistant/tool 交替）无 user，锚 user 会走空保留段
-	// （实证：windowMessages 同款缺陷致塔防配置 Agent 上下文塌缩成 2 条失忆空转）。
 	if keepRecent > len(messages)-firstUserIdx-1 {
 		keepRecent = len(messages) - firstUserIdx - 1
 	}
-	recentStart := len(messages) - keepRecent
+	recentStart = len(messages) - keepRecent
 	for recentStart < len(messages) && messages[recentStart].Role == "tool" {
 		recentStart++
 	}
+	return firstUserIdx, recentStart, true
+}
 
-	// 4) 中段暴力压缩：user 消息保前 500 字符（指令语义不可压），其余 200。
-	middle := messages[firstUserIdx+1 : recentStart]
+// renderTruncated 把一段消息按行渲染为截断文本：user 消息保前 500 字符
+// （指令语义不可压，TODO #34/#35 结论），其余 200 字符。供截断式压缩降级路径复用。
+func renderTruncated(sb *strings.Builder, messages []agent.ReactMessage) {
 	const (
 		midChunkMax     = 200
 		midUserChunkMax = 500
 	)
-	var sb strings.Builder
-	sb.WriteString("【历史压缩摘要】\n")
-	for _, m := range middle {
+	for _, m := range messages {
 		role := m.Role
 		if role == "" {
 			role = "?"
@@ -524,16 +560,45 @@ func compressMiddle(messages []agent.ReactMessage, keepRecent int) (summary stri
 		if r := []rune(content); len(r) > limit {
 			content = string(r[:limit]) + "…"
 		}
-		fmt.Fprintf(&sb, "- [%s] %s\n", role, content)
+		fmt.Fprintf(sb, "- [%s] %s\n", role, content)
 	}
+}
+
+// compressMiddle 计算历史的中段压缩摘要与保留段起点（截断式，单次全段）。
+// 用于每 N 步触发一次的上下文压缩，避免长任务 token O(N²) 增长。
+//
+// 压缩规则：
+//   - system 前缀全保留（若存在；记忆流水线已将近期事件移至末尾，此处通常无 system 前缀）；
+//   - 首条 user 消息原样保留（任务目标，防"失忆"）；
+//   - 中段压缩（TODO #34/#35 结论）：assistant/tool 消息压成 "[role] 前 200 字符"，
+//     **user 消息保前 500 字符**——用户指令语义不可压（多轮会话第二条指令如"重新执行/
+//     自检"被压成 200 字符是"指令歧义→全量重跑"事故的直接推手）；
+//   - 最近 K 条原样保留（边界规则见 compressBoundary）。
+//
+// 返回 summary 摘要正文、tailStart 保留段起点（messages[tailStart:] 原样保留）。
+// keepRecent<=0 视为 10；消息总数不足或无 user 消息时 ok=false（不压缩）。
+//
+// 该函数从 react_agent.go 迁入，职责归位到记忆层。ReActAgent 不再直接做历史压缩。
+// 现为层级压缩（pyramid.go）的截断降级底仓，供无 LLM 摘要器时整段压平使用与测试直调。
+func compressMiddle(messages []agent.ReactMessage, keepRecent int) (summary string, tailStart int, ok bool) {
+	firstUserIdx, recentStart, ok := compressBoundary(messages, keepRecent)
+	if !ok {
+		return "", 0, false
+	}
+
+	// 中段暴力压缩：user 消息保前 500 字符（指令语义不可压），其余 200。
+	middle := messages[firstUserIdx+1 : recentStart]
+	var sb strings.Builder
+	sb.WriteString("【历史压缩摘要】\n")
+	renderTruncated(&sb, middle)
 	sb.WriteString("\n（以上为早期对话压缩摘要，关键结论见下方近期事件与下方最近消息）")
 	return sb.String(), recentStart, true
 }
 
 // buildCompressedView 按冻结状态拼装压缩视图：
-// system 前缀 + 首条 user 任务目标 + 摘要消息 + messages[tailStart:]（原样保留段）。
+// system 前缀 + 首条 user 任务目标 + 压缩金字塔消息 + messages[tailStart:]（原样保留段）。
 // 同一 compressState 下输出前缀字节级稳定（DeepSeek 前缀缓存命中）；
-// 调用方保证 st.tailStart <= len(messages)。无首条 user 时原样返回（防御）。
+// 调用方保证 st.TailStart <= len(messages)。无首条 user 或无压缩包时原样返回（防御）。
 func buildCompressedView(messages []agent.ReactMessage, st compressState) []agent.ReactMessage {
 	keep := 0
 	for keep < len(messages) && messages[keep].Role == "system" {
@@ -546,14 +611,14 @@ func buildCompressedView(messages []agent.ReactMessage, st compressState) []agen
 			break
 		}
 	}
-	if firstUserIdx < 0 || st.tailStart < firstUserIdx+1 {
+	if firstUserIdx < 0 || st.TailStart < firstUserIdx+1 || len(st.Bundles) == 0 {
 		return messages
 	}
 
-	out := make([]agent.ReactMessage, 0, keep+2+(len(messages)-st.tailStart))
+	out := make([]agent.ReactMessage, 0, keep+2+(len(messages)-st.TailStart))
 	out = append(out, messages[:keep]...)
 	out = append(out, messages[firstUserIdx]) // 首条 user 任务目标
-	out = append(out, agent.ReactMessage{Role: "system", Content: st.summary})
-	out = append(out, messages[st.tailStart:]...)
+	out = append(out, agent.ReactMessage{Role: "system", Content: renderBundles(st.Bundles)})
+	out = append(out, messages[st.TailStart:]...)
 	return out
 }

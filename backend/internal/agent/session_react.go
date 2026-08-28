@@ -551,6 +551,35 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 	if err := st.pgStore.SaveSessionHistory(ctx, rec); err != nil {
 		st.logError(ctx, fmt.Sprintf("[%s] 持久化会话历史失败", session.ID), err)
 	}
+	// 同步持久化主对话完整消息历史（重启恢复上下文用，见 persistFullHistory）。
+	st.persistFullHistory(session)
+}
+
+// persistFullHistory 把主对话（MetaAgent，agentID==sessionID）的完整 ReAct 消息历史
+// 落 agent_messages 表：进程重启后 restoreSessions 经 LoadMessages 重建 session.History，
+// 修复"重启即失忆"（此前只存 goal + 最终结果各截 500 字符，Messages 只重建 2 条）。
+// 复用 Paused DomainAgent 的持久化通道（SaveMessages 为 delete-then-insert 全量覆盖语义，
+// 支持反复重写）；子 Agent 的持久化由 dispatcher 在 pause 时单独负责，这里只覆盖主对话。
+// 每轮结束调用一次（完成/暂停/出错路径均经 persistHistory 至此）。
+func (st *reactSessionStore) persistFullHistory(session *reactInternalSession) {
+	// 若未配置 pgStore，直接返回，避免空指针。
+	if st.pgStore == nil {
+		return
+	}
+	// 拷贝历史，避免持久化期间被并发修改。
+	st.mu.RLock()
+	history := make([]ReactMessage, len(session.History))
+	copy(history, session.History)
+	st.mu.RUnlock()
+	if len(history) == 0 {
+		return
+	}
+	// 历史较长时 delete-then-insert 略慢，给 10 秒超时；失败仅记录日志。
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := NewPostgresMessagesStore(st.pgStore.DB()).SaveMessages(ctx, session.ID, session.ID, history); err != nil {
+		st.logError(ctx, fmt.Sprintf("[%s] 持久化完整对话历史失败", session.ID), err)
+	}
 }
 
 // persistEvents 将当前会话的所有事件批量持久化到 PostgreSQL。
@@ -677,6 +706,13 @@ func (st *reactSessionStore) restoreSessions(ctx context.Context, limit int) int
 				{Role: string(enums.ChatRoleUser), Content: rec.Goal, Timestamp: rec.CreatedAt},
 				{Role: string(enums.ChatRoleAssistant), Content: rec.Summary, Timestamp: rec.CreatedAt},
 			},
+		}
+		// 重建完整对话历史（若重启前经 persistFullHistory 持久化过）：续跑时
+		// resumeSession 以 session.History 为种子，MetaAgent 上下文不再清零；
+		// 更早的上下文由 memory.Pipeline 懒加载压缩金字塔（agent_compress_states）接续。
+		// 失败/无数据时 History 保持 nil，退回旧行为（仅 goal + 总结两条可读消息）。
+		if msgs, err := NewPostgresMessagesStore(st.pgStore.DB()).LoadMessages(ctx, rec.SessionID); err == nil && len(msgs) > 0 {
+			st.sessions[rec.SessionID].History = msgs
 		}
 		// 计数增加。
 		restored++

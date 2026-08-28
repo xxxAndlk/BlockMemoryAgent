@@ -177,6 +177,25 @@ CREATE INDEX IF NOT EXISTS idx_agent_messages_session
 	return err
 }
 
+// EnsureCompressStateSchema 自动创建 agent_compress_states 表 (幂等)。
+// 存 memory.Pipeline 的层级压缩状态 (压缩金字塔: bundles + tail_start, JSONB),
+// 进程重启后 Pipeline 懒加载恢复, 旧上下文不再重启即失忆。
+// 每 agent 一行 (agent_id 主键, upsert 覆盖语义); TailStart 下标语义依赖
+// 全量消息历史同时被恢复 (MetaAgent 走 agent_messages 表)。
+func EnsureCompressStateSchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS agent_compress_states (
+    agent_id   VARCHAR(256) PRIMARY KEY,
+    session_id VARCHAR(64)  NOT NULL DEFAULT '',
+    state      JSONB        NOT NULL,
+    updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_compress_states_session
+    ON agent_compress_states (session_id);
+`)
+	return err
+}
+
 // EnsureInitialMemorySchema 自动创建 001_init.sql 中定义的记忆/知识/注册表相关表 (幂等)。
 // 负责在启动时补齐 global_knowledge / agent_private_memory / agent_snapshots / topics /
 // agent_registry / decision_logs / topic_archives 等表,避免块记忆、私有记忆、快照写入失败。

@@ -18,6 +18,9 @@ type InMemoryStore struct {
 	// 键为代理唯一标识，值为该代理按时间顺序追加的记忆事件列表。
 	events map[string][]agent.MemoryEvent
 
+	// compressStates 以 agentID 为键保存层级压缩状态（压缩金字塔），模拟落库恢复。
+	compressStates map[string]compressState
+
 	// maxEventsPerAgent 控制每个代理在内存中最多保留的事件条数，超出时丢弃最旧事件。
 	maxEventsPerAgent int
 }
@@ -26,7 +29,11 @@ type InMemoryStore struct {
 func NewInMemoryStore() *InMemoryStore {
 	// 初始化 InMemoryStore，并分配空的事件字典，避免后续空指针访问。
 	// maxEventsPerAgent 默认使用 DefaultMaxEventsPerAgent，防止事件流无限增长。
-	return &InMemoryStore{events: make(map[string][]agent.MemoryEvent), maxEventsPerAgent: DefaultMaxEventsPerAgent}
+	return &InMemoryStore{
+		events:           make(map[string][]agent.MemoryEvent),
+		compressStates:   make(map[string]compressState),
+		maxEventsPerAgent: DefaultMaxEventsPerAgent,
+	}
 }
 
 // WithMaxEventsPerAgent 配置每个代理在内存中最多保留的事件条数。
@@ -104,4 +111,33 @@ func (s *InMemoryStore) LoadEvents(_ context.Context, agentID string, limit int)
 
 	// 返回复制后的事件切片与 nil 错误。
 	return out, nil
+}
+
+// SaveCompressState 保存指定代理的层级压缩状态（深拷贝 Bundles，避免共享底层数组）。
+func (s *InMemoryStore) SaveCompressState(_ context.Context, agentID string, state *compressState) error {
+	if s == nil || state == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := compressState{TailStart: state.TailStart}
+	cp.Bundles = append([]string(nil), state.Bundles...)
+	s.compressStates[agentID] = cp
+	return nil
+}
+
+// LoadCompressState 加载指定代理的层级压缩状态；无数据返回 (nil, nil)。
+func (s *InMemoryStore) LoadCompressState(_ context.Context, agentID string) (*compressState, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st, ok := s.compressStates[agentID]
+	if !ok {
+		return nil, nil
+	}
+	cp := compressState{TailStart: st.TailStart}
+	cp.Bundles = append([]string(nil), st.Bundles...)
+	return &cp, nil
 }

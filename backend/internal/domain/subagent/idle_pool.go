@@ -106,6 +106,8 @@ type domainSlot struct {
 
 	wallRemain time.Duration       // 挂起时冻结的剩余墙钟
 	wallTimer  *time.Timer         // 墙钟 timer（到期 cancel 当前任务 ctx）
+	wallFired  bool                // 墙钟 timer 已到期（Canceled 分支区分墙钟取消与外部硬取消）
+	childReported bool             // 当前任务的父未决计数已递减（destroySlot 兜底防双递减）
 	cancelTask context.CancelFunc  // 当前任务 ctx cancel
 	taskCtx    context.Context     // 当前任务 ctx（挂起判定用）
 	ttlArmed   bool                // TTL 是否已武装（用户消息后）
@@ -526,8 +528,17 @@ func (d *Dispatcher) destroySlot(s *domainSlot, reason string) {
 		s.wallTimer.Stop()
 		s.wallTimer = nil
 	}
+	childPending := !s.childReported // 执行中任务尚未递减父未决计数（外部硬取消等静默路径）
+	s.childReported = true
 	s.mu.Unlock()
 
+	// 兜底：执行中任务未经正常收口（成功/失败/墙钟分支都会递减）即被销毁时，
+	// 此处补偿递减 + 回告父——否则父终结保护 wait loop 永久空等（同队列补偿语义）。
+	// 必须在 subMeta.Delete 之前做：递减经 subMeta.doneOnce 与巡检 kill 的兜底互斥。
+	if childPending {
+		d.trackChildDoneOnce(s)
+		d.notify(s.parentID, s.id, "子 Agent 被强制销毁（硬取消），任务未回传；父未决计数已兜底递减。", nil)
+	}
 	d.pool.remove(s.sessionID, s.id)
 	d.running.Delete(s.id)
 	d.activity.Delete(s.id)
@@ -579,6 +590,7 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 	s.mu.Lock()
 	s.taskCtx = taskCtx
 	s.cancelTask = cancelTask
+	s.childReported = false // 新任务重置：上一任务的递减标记不得污染 destroySlot 兜底判定
 	s.mu.Unlock()
 
 	// 巡检兜底换绑（2026-08-26 panic 修复）：dispatchHotDomain 注册的 subMeta.cancel 为 nil
@@ -614,6 +626,11 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 	result, err := d.runDomainEngine(s, taskCtx, task)
 	files := agent.FilesModifiedFromHistory(result.History)
 	duration := time.Since(started)
+
+	// 任务终结统一停表：残留 wallTimer 会在任务完结（含 DONE 转 Idle 热驻）后空放触发
+	//（2026-08-28 实证：01:20 DONE 的 domain-2 在 02:38 被残留 timer 打出 WALL CLOCK）。
+	// 挂起分支的冻结剩余逻辑本就不依赖 timer（任务 ctx 无 deadline，wallRemain 恒 0），不受影响。
+	stopWallClock(s)
 
 	if errors.Is(err, errPaused) {
 		log.Printf("[subagent] PAUSED: sub=%s domain=%s duration=%s (token budget, hot-resident awaiting resume)", s.id, s.domain, duration)
@@ -655,12 +672,24 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 			partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 			d.boardUpdate(taskCtx, s.parentID, s.domain, board.TaskFailed, truncateRunes(partial, 300))
 			d.notify(s.parentID, s.id, "子 Agent 已被用户停止，当前任务中断；成果已保留，热驻待复用。\n"+partial, files)
-			d.trackChildDone(s.parentID)
+			d.trackChildDoneOnce(s)
 			d.enterIdle(s, "user stop: "+partial)
 			log.Printf("[subagent] SOFT-STOP IDLE: sub=%s domain=%s duration=%s", s.id, s.domain, duration)
 			return domainTaskStopped
 		}
-		// 硬取消：树状态由取消方（Tree.Cancel）已置 Cancelled，此处仅销毁槽。
+		// 墙钟到期：armWallClock 的 timer cancel 到这里与外部硬取消同形（context.Canceled），
+		// 用 wallFired 区分。墙钟走失败收口（翻看板 + treeFinish + notify 父 + 递减未决计数）
+		// 而非硬取消的静默销毁——静默销毁不减 PendingChildren、邮箱无消息，父终结保护
+		// wait loop 永久空等（2026-08-28 实证 domain-3 超时销毁后 MetaAgent 卡死"等待回传"）。
+		s.mu.Lock()
+		wallFired := s.wallFired
+		s.mu.Unlock()
+		if wallFired {
+			d.wallClockWrapUp(s, taskCtx, result, files, duration)
+			return domainTaskDestroyed
+		}
+		// 硬取消：树状态由取消方（Tree.Cancel）已置 Cancelled，此处仅销毁槽
+		//（父未决计数由 destroySlot 兜底递减）。
 		log.Printf("[subagent] CANCELLED: sub=%s domain=%s duration=%s", s.id, s.domain, duration)
 		return domainTaskDestroyed
 	}
@@ -686,7 +715,7 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 		d.boardUpdate(taskCtx, s.parentID, s.domain, boardSt, truncateRunes(msg, 300))
 		d.treeFinishStatus(taskCtx, s.id, partial, treeStatus, formatSubAgentFailure(taskCtx, err, result, d.effectiveTimeout(s.id), partial))
 		d.notify(s.parentID, s.id, msg, files)
-		d.trackChildDone(s.parentID)
+		d.trackChildDoneOnce(s)
 		return domainTaskFailed
 	}
 
@@ -699,9 +728,52 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 	}
 	d.saveBlockMemory(taskCtx, s.id, "domain", s.parentID, s.domain, s.lastTaskGoal(), result.Text, blockOutcomeSuccess, files)
 	d.notify(s.parentID, s.id, summary, files)
-	d.trackChildDone(s.parentID)
+	d.trackChildDoneOnce(s)
 	d.enterIdle(s, summary)
 	return domainTaskDone
+}
+
+// trackChildDoneOnce 热驻 domain 任务的父未决计数递减入口：经 subMeta.doneOnce 与
+// 巡检 kill 的兜底递减互斥（防双递减），并标记槽 childReported 供 destroySlot 兜底判定。
+// subMeta 缺失（极端时序）回退直接递减。
+func (d *Dispatcher) trackChildDoneOnce(s *domainSlot) {
+	if v, ok := d.subMeta.Load(s.id); ok {
+		if m, ok2 := v.(*subAgentMeta); ok2 {
+			m.doneOnce.Do(func() { d.trackChildDone(s.parentID) })
+			s.mu.Lock()
+			s.childReported = true
+			s.mu.Unlock()
+			return
+		}
+	}
+	d.trackChildDone(s.parentID)
+	s.mu.Lock()
+	s.childReported = true
+	s.mu.Unlock()
+}
+
+// wallClockWrapUp 热驻 domain 墙钟到期的失败收口：翻看板 + 树终态 Failed + notify 父 +
+// 递减父未决计数，附部分产出与失败打捞。此前墙钟取消与外部硬取消共用静默销毁路径，
+// 父 Agent 永远等不到回执（2026-08-28 实证 domain-3 撞 2h 墙钟后对话栏卡死）。
+// 收口后槽仍走销毁（任务 ctx 已死不可续），父收到超时回执可自行决定重派/收口。
+func (d *Dispatcher) wallClockWrapUp(s *domainSlot, taskCtx context.Context, result agent.ReactResult, files []string, duration time.Duration) {
+	partial := ""
+	if result.History != nil {
+		partial = truncateRunes(agent.LastAssistantText(result.History), 500)
+	}
+	budget := d.effectiveTimeout(s.id)
+	msg := failureMarker(FailureKindTimeout, false) + "\n" +
+		fmt.Sprintf("子 Agent 墙钟预算耗尽（上限 %v，已执行 %v），已被强制收口；产出未完成，请重派或基于已有成果收口。%s",
+			budget, duration, partialSuffix(partial))
+	if salvage := d.salvageFailure(taskCtx, s.parentID, s.id, s.slotRoleDef(), s.domain, result, partial); salvage != "" {
+		msg += "\n\n" + salvagePrefixMarker + salvage
+	}
+	d.boardUpdate(taskCtx, s.parentID, s.domain, board.TaskFailed, truncateRunes(msg, 300))
+	d.treeFinishStatus(taskCtx, s.id, partial, orchestrator.StatusFailed, fmt.Sprintf("wall clock budget %v exhausted", budget))
+	d.notify(s.parentID, s.id, msg, files)
+	d.trackChildDoneOnce(s)
+	log.Printf("[subagent] WALL CLOCK WRAP-UP: sub=%s domain=%s duration=%s budget=%v (parent notified, pending decremented)",
+		s.id, s.domain, duration, budget)
 }
 
 // runDomainEngine 构造/复用 ReActAgent 并驱动引擎。
@@ -820,12 +892,30 @@ func (d *Dispatcher) armWallClock(s *domainSlot, taskCtx context.Context, cancel
 	if s.wallTimer != nil {
 		s.wallTimer.Stop()
 	}
+	s.wallFired = false // 新任务重置触发标志（上一任务的残留不得污染本任务判定）
 	s.mu.Unlock()
 	s.wallTimer = time.AfterFunc(wallClock, func() {
+		// 先置标志再 cancel：runDomainTask 的 Canceled 分支靠 wallFired 区分
+		// 墙钟到期（走失败收口回告父）与外部硬取消（静默销毁）。
+		s.mu.Lock()
+		s.wallFired = true
+		s.mu.Unlock()
 		log.Printf("[subagent] WALL CLOCK exceeded: sub=%s domain=%s budget=%v", s.id, s.domain, wallClock)
 		cancelTask()
 	})
 	return wallClock
+}
+
+// stopWallClock 停掉当前任务的墙钟 timer（任务终结时调用）。不停表则残留 timer 会在
+// 任务完结（含 DONE 转 Idle 热驻）后空放触发，误打 WALL CLOCK 日志并 cancel 已死 ctx
+//（2026-08-28 实证：01:20 DONE 的 domain-2 在 02:38 被残留 timer 触发）。
+func stopWallClock(s *domainSlot) {
+	s.mu.Lock()
+	if s.wallTimer != nil {
+		s.wallTimer.Stop()
+		s.wallTimer = nil
+	}
+	s.mu.Unlock()
 }
 
 // saveSlotMessages 落盘 history 安全网（脱离已取消 ctx + 10s 超时，同软停止分支）。

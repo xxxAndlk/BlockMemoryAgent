@@ -20,7 +20,7 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 
 - **单一 ReAct 主循环**：MetaAgent 跑 LLM → 工具 → 结果循环（默认上限 50 轮），直到输出纯文本回答
 - **层级即调用栈**：`call_sub_agent(role_id, task)` 起 goroutine 跑子 Agent，子 Agent 完成后把摘要推 Mailbox，父 Agent 每轮 LLM 前 Drain 邮箱注入上下文——任意深度递归，无图状态机
-- **历史压缩**：每 `summarize_every` 步（默认 5）`compressHistory` 把中段历史压成"系统前缀 + 用户目标 + 摘要 + 最近 K 条"；assistant 入史副本截断超长工具入参（单值 2000 runes），滑动窗口/压缩下刀只避开孤立 tool 结果（不锚 user 边界），防 token 爆炸、单轮 input 爆预算与上下文塌缩
+- **层级历史压缩**：token 阈值（默认 150K）或每 `summarize_every` 步触发，`memory.Pipeline` 把新滑出保留段的中段历史压成一个结构化压缩包（轻量模型，四节：决策/进展/待办/约束；失败降级截断），视图呈"系统前缀 + 用户目标 + N 个压缩包（从旧到新）+ 最近 K 条"；压缩包超 `summarize_max_bundles`（默认 20）时最老的一半合并为 1 个更粗的包，循环往复渐变式遗忘；压缩状态落 `agent_compress_states` 表、主对话全量历史落 `agent_messages` 表，重启后懒加载恢复不再失忆；assistant 入史副本截断超长工具入参（单值 2000 runes），滑动窗口/压缩下刀只避开孤立 tool 结果（不锚 user 边界），防 token 爆炸、单轮 input 爆预算与上下文塌缩
 - **权威 Agent 树**：`internal/domain/orchestrator/tree.go` 维护派发树快照，HTTP 暴露 `GET /api/sessions/{id}/tree` 读子 Agent 节点状态 + `POST /api/sessions/{id}/agents/{aid}/cancel` 取消子 Agent（补 ReAct 重构后丢失的 introspect/cancel 能力）；`call_sub_agent` 同父 Agent 下同领域重复派发查树快照自动去重；暂停态（paused_on_child/awaiting_clarify）会话可取消
 - **块记忆事实提取**：子 Agent 完成后调轻量模型提取 1-5 条关键事实，每条单独向量化落 KnowledgeRecord，替代原始 result.Text 整段落库；提取失败自动回退原始保存
 - **共享记忆**：`WriteSharedMemory` 工具让主 Agent 把关键上下文（文件路径/行号/函数签名/验收标准）写入 `sharedKV`，子 Agent 自动读取，避免重读全文件；`task` 入参 2000 runes 上限强制规格走共享记忆
@@ -28,8 +28,8 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 - **角色工具白名单**：`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集；MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet` 防越位，DomainAgent 开放完整权限承担上下文采集 + 任务拆分 + 派发执行
 - **热插拔插件系统**（[设计文档](doc/设计文档_插件范式.md)）：MCP 外部插件（stdio 子进程 / streamable HTTP / docker 容器）、Claude/Codex 插件包（`.mcp.json` + `SKILL.md`）与 Docker 长驻服务统一挂进 `tool.Registry` 或生命周期管理，运行中 enable/disable 下一轮迭代即生效；三个初始插件全部容器化：`web_search`（firecrawl 自托管栈，默认开）、`computer_use`（Xvfb 虚拟桌面，默认关，全部工具接审批守卫链）、`open_design`（画图设计台 service 插件，默认关）；管理 API：`/api/plugins`（list/get/enable/disable/reload），配置 `config/plugins.yaml` + `config/plugins.d/`，部署见下文「插件（Docker 部署）」
 - **14 个内置工具**：文件/命令（ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles）、HTTP（HTTPGet/HTTPPost）、Git（GitDiff/GitStatus/GitLog/GitBlame）、共享内存（WriteSharedMemory）、Agent 通信（call_sub_agent/send_message），统一经沙箱守卫
-- **两段事件流记忆**：`Write` 追加事件（tool_call / call_sub_agent / sub_agent_summary / answer），`Assemble` 在 LLM 调用前注入最近 N 条作为上下文；无压缩、无 RAG
-- **会话持久化，默认全新启动**：会话历史（goal/summary/工具结果）与事件流写入 PostgreSQL；每次启动默认是全新会话列表，`agent.restore_sessions: true` 时才恢复最近 50 个会话到内存
+- **两段事件流记忆**：`Write` 追加事件（tool_call / call_sub_agent / sub_agent_summary / answer）并落 `agent_events` 表，`Assemble` 在 LLM 调用前注入最近 N 条（超 8 条经轻量模型压成 ≤200 字摘要，失败降级 raw join）；重启后懒加载恢复；无 RAG 自动注入（块记忆经 `SearchBlockMemory` 工具按需调用）
+- **会话持久化，默认全新启动**：会话历史（goal/summary/工具结果）、主对话完整消息历史（`agent_messages`）与事件流写入 PostgreSQL；每次启动默认是全新会话列表，`agent.restore_sessions: true` 时才恢复最近 50 个会话到内存（含完整对话历史，续跑不再失忆）
 - **LLM 调用全链路日志**：`sessionLogger` 把每次 LLM I/O 写 `session_logs` 表，`QueryKindLogs` 按会话回看完整调用链；`LiveEventTokenUsage` 实时推送 token 用量；DeepSeek V4 缓存模式与 `reasoning_content` 字段适配
 - **结构化日志**：所有 Agent 关键事件写 `session_logs` 表并按 session/agent/level 可查；各组件注入 `*logger.Logger`，错误类日志真实输出 `[ERRO]`；文件日志按天分割（`logs/backend/`、`logs/tui/`）
 - **严格启动**：config/roles/env/soul/skills 任一配置文件缺失，或 PG/Redis/LLM 后端不可达，启动即失败并明确报错
@@ -181,7 +181,7 @@ ReAct 重构后子 Agent 由 Dispatcher 直接 goroutine 创建，不注册为 `
 
 ### 4. 记忆（`internal/domain/memory/`）
 
-两段事件流：`Write` 追加 `MemoryEvent`，`Assemble` 注入最近 N 条。默认 `InMemoryStore`（进程内存），Postgres 事件持久化是开放项（`doc/TODO.md` #3）。`InMemoryKV` 提供共享 KV 记忆（主 Agent 写、子 Agent 读）。`WithMaxEventsPerAgent` 防事件流无限增长。遗留 `internal/memory/write.go` 仅负责 Episode 持久化，不在 ReAct 热路径上。
+两段事件流 + 层级压缩：`Write` 追加 `MemoryEvent`（同步落 `agent_events` 表），`Assemble` 注入最近 N 条（超阈值走轻量模型摘要）；历史压缩在 `Pipeline`/`pyramid.go`——每次触发把新滑出保留段的中段压成一个结构化压缩包，包数超 `summarize_max_bundles` 合并最老一半，状态落 `agent_compress_states` 表。生产装配用 `PostgresEventStore`（事件 + 压缩状态持久化），`InMemoryStore` 供测试；重启后两者均懒加载恢复。`InMemoryKV` 提供共享 KV 记忆（主 Agent 写、子 Agent 读）。`WithMaxEventsPerAgent` 防事件流无限增长。遗留 `internal/memory/write.go` 仅负责 Episode 持久化，不在 ReAct 热路径上。
 
 ### 5. 验证闭环编排器（`internal/domain/verifyloop/`，默认关闭）
 

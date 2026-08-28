@@ -9,7 +9,9 @@ import (
 )
 
 // MemoryEvent 用于记录 ReAct 循环中一次可观察到的步骤。
-// 事件流是唯一的持久化记忆；在新架构中没有压缩、RAG 或向量检索。
+// 事件流是持久化记忆的一部分；对话历史的层级压缩（压缩金字塔）由
+// internal/domain/memory 的 Pipeline 实现（见 pyramid.go），无 RAG/向量自动注入
+// （块记忆仅经 SearchBlockMemory 工具按需调用）。
 type MemoryEvent struct {
 	Type     string    `json:"type"`                // 事件类型，例如 thought / action / observation
 	AgentID  string    `json:"agent_id"`            // 产生该事件的 Agent 唯一标识

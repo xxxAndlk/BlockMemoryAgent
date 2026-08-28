@@ -48,6 +48,7 @@ type LLMRuntimeConfig struct {
 	ToolOutputHistoryMaxRunes   int `yaml:"tool_output_history_max_runes"`   // 写入历史的单条工具输出最大字符数（默认 2000；负数表示不截断）
 	SummarizeEvery              int `yaml:"summarize_every"`                 // 每 N 步触发一次历史压缩（默认 10；<=0 关闭压缩，仅用滑动窗口）
 	SummarizeKeepRecent         int `yaml:"summarize_keep_recent"`           // 压缩时保留最近 K 条原始消息（默认 15；<=0 视为 15。2026-08-21 由 10 上调：场景装配 Agent 压缩后丢工具结果细节被迫重读文件，多留 5 条原始消息换少一轮重侦察）
+	SummarizeMaxBundles         int `yaml:"summarize_max_bundles"`           // 层级压缩包数量上限（默认 20）：每次压缩触发产生一个结构化压缩包，超限把最老的一半合并为 1 个更粗的包，循环往复保留远期上下文
 	SummarizeTimeoutSec         int `yaml:"summarize_timeout_sec"`           // 事件摘要轻量模型调用超时（秒，默认 120）。旧硬编码 5s 对思考型模型必然超时，摘要全挂降级 raw join，上下文全量回注致 token 预算提前耗尽（实证 verify 子 Agent 300K 预算 7 分钟烧穿）
 	// SalvageLLMTimeoutSec 失败打捞轻量调用超时（秒，默认 30；思考型模型场景建议 >=60）。
 	// 旧硬编码 5s 对思考型模型（glm/deepseek 推理系）来不及出首 token，打捞 facts=0 全降级（TODO #33）。
@@ -462,6 +463,9 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 	if c.Agent.SummarizeKeepRecent == 0 {
 		c.Agent.SummarizeKeepRecent = 15
+	}
+	if c.Agent.SummarizeMaxBundles == 0 {
+		c.Agent.SummarizeMaxBundles = 20
 	}
 	if c.Agent.DomainReconWallClockMin == 0 {
 		c.Agent.DomainReconWallClockMin = 30

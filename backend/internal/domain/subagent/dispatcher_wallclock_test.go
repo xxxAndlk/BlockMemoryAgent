@@ -11,6 +11,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -202,5 +203,144 @@ func TestRecordFileWrite(t *testing.T) {
 	}
 	if got := d.recentWrittenFiles(id, 0); len(got) != 0 {
 		t.Fatalf("zero window should return empty, got: %v", got)
+	}
+}
+
+// TestHotDomain_WallClockWrapUpNotifiesParent 验证热驻 domain 墙钟到期走失败收口而非静默销毁：
+// 父邮箱收到超时回执（报真实预算）+ PendingChildren 归 0 + 树 Failed + 槽销毁。
+// 回归 2026-08-28 实证：墙钟 cancel（AfterFunc+cancelTask）与外部硬取消同为 context.Canceled，
+// 共用静默销毁路径后不减 PendingChildren、邮箱无消息，MetaAgent 终结保护 wait loop
+// 永久空等（对话栏卡死"等待 domain-3 回传"）。既有墙钟测试只覆盖叶子路径
+//（context.WithTimeout → DeadlineExceeded → 通用失败分支），热驻路径零覆盖。
+func TestHotDomain_WallClockWrapUpNotifiesParent(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	d, mb, tr, toolsReg := newIdleTestEnv(t, &ctxAwareHangingProvider{release: release}, time.Hour)
+
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "hang",
+		"domain":         "金融",
+		"responsibility": "负责金融模块",
+		"wall_clock_min": 0.005, // 300ms
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
+	}
+	subID := res.Output
+
+	// 槽销毁（墙钟收口后任务 ctx 已死，不可续）。
+	waitForCond(t, "slot destroyed after wall clock", func() bool {
+		return d.pool.slot("s1", subID) == nil
+	})
+	// 父未决计数归 0（终结保护可退出）。
+	if got := d.PendingChildren("s1"); got != 0 {
+		t.Fatalf("pending after wall clock wrap-up = %d, want 0", got)
+	}
+	// 树终态 Failed（而非 destroySlot 的 TTL-Done 覆盖——Finish 幂等首个生效）。
+	n, ok := tr.Get(subID)
+	if !ok || n.Status != orchestrator.StatusFailed {
+		t.Fatalf("tree status = %v ok=%v, want failed", n.Status, ok)
+	}
+	// 父邮箱收到墙钟超时回执，且报派发级预算（300ms）而非全局值。
+	msgs := mb.Drain("s1")
+	if len(msgs) == 0 {
+		t.Fatal("expected wall clock failure notify in parent mailbox")
+	}
+	if !strings.Contains(msgs[0].Body, "墙钟预算耗尽") {
+		t.Fatalf("failure message should be wall-clock wrap-up, got: %s", msgs[0].Body)
+	}
+	if !strings.Contains(msgs[0].Body, "300ms") {
+		t.Fatalf("failure message should report dispatch-level budget, got: %s", msgs[0].Body)
+	}
+}
+
+// TestHotDomain_DoneStopsWallTimer 验证任务完结统一停表：DONE 转 Idle 后残留 wallTimer
+// 必须已停（回归 2026-08-28 实证：01:20 DONE 的 domain-2 在 02:38 被残留 timer 空放触发）。
+func TestHotDomain_DoneStopsWallTimer(t *testing.T) {
+	provider := &scriptProvider{lines: []string{"result"}}
+	d, _, tr, toolsReg := newIdleTestEnv(t, provider, time.Hour)
+
+	res, _ := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "快速完成",
+		"domain":         "金融",
+		"responsibility": "负责金融模块",
+		"wall_clock_min": 0.005, // 300ms，任务远早于预算完成
+	})
+	subID := res.Output
+	waitForCond(t, "tree idle", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusIdle
+	})
+
+	s := d.pool.slot("s1", subID)
+	if s == nil {
+		t.Fatal("slot destroyed after done; want hot-resident")
+	}
+	s.mu.Lock()
+	timerNil := s.wallTimer == nil
+	fired := s.wallFired
+	s.mu.Unlock()
+	if !timerNil {
+		t.Error("wallTimer not stopped after task done; stale timer will misfire later")
+	}
+	if fired {
+		t.Error("wallFired should be false after successful done")
+	}
+}
+
+// TestHotDomain_HardCancelBackstopDecrementsParent 验证 destroySlot 兜底：执行中任务被
+// 外部硬取消（wallFired=false 的 Canceled 路径）静默销毁时，兜底递减父未决计数 + 回告父，
+// 父终结保护不永久空等。
+func TestHotDomain_HardCancelBackstopDecrementsParent(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	d, mb, tr, toolsReg := newIdleTestEnv(t, &ctxAwareHangingProvider{release: release}, time.Hour)
+
+	res, _ := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "hang",
+		"domain":         "金融",
+		"responsibility": "负责金融模块",
+	})
+	subID := res.Output
+	waitForCond(t, "running", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusRunning
+	})
+
+	// 模拟外部硬取消（巡检 kill / Tree.Cancel 的 cancelTask 语义；非墙钟、非软停止）。
+	// 先等 runDomainTask 入口绑定 cancelTask（dispatch 返回早于 supervisor 绑定，直接读会拿 nil）。
+	waitForCond(t, "cancelTask bound", func() bool {
+		s := d.pool.slot("s1", subID)
+		if s == nil {
+			return false
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.cancelTask != nil
+	})
+	s := d.pool.slot("s1", subID)
+	if s == nil {
+		t.Fatal("slot missing")
+	}
+	s.mu.Lock()
+	cancelTask := s.cancelTask
+	s.mu.Unlock()
+	cancelTask()
+
+	waitForCond(t, "slot destroyed after hard cancel", func() bool {
+		return d.pool.slot("s1", subID) == nil
+	})
+	if got := d.PendingChildren("s1"); got != 0 {
+		t.Fatalf("pending after hard-cancel backstop = %d, want 0", got)
+	}
+	msgs := mb.Drain("s1")
+	if len(msgs) == 0 {
+		t.Fatal("expected backstop notify in parent mailbox")
+	}
+	if !strings.Contains(msgs[0].Body, "兜底递减") {
+		t.Fatalf("backstop notify should explain compensation, got: %s", msgs[0].Body)
 	}
 }
