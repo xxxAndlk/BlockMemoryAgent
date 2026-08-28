@@ -421,6 +421,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// 每次循环对应一次“思考-行动-观察”的迭代。
 	// emptyStreak 记录连续空响应次数，用于空响应保护（见循环内注释）。
 	emptyStreak := 0
+	// unproductiveStreak 记录连续"无产出"轮数（无产出性工具 ∧ 无 mailbox 新消息 ∧ 无终答），
+	// 供循环尾部的停滞守卫（stagnationGuard）使用。
+	unproductiveStreak := 0
 	for i := 0; a.maxIter <= 0 || i < a.maxIter; i++ {
 		// 会话级挂起检查点（热驻模式）：挂起期间阻塞在此，恢复返回 nil 继续本轮。
 		// 在飞 LLM/工具调用跑完（有界超时）才到达这里，非抢占式。
@@ -532,6 +535,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// （实证：塔防 run4 meta 以"请稍候。"提前终结会话，domain-2 摘要从未进入终答）。
 			// 只要 drain 到新消息就 continue 回主循环，让模型基于完整摘要重新生成本轮答复。
 			if drained > 0 {
+				unproductiveStreak = 0 // mailbox 新消息 = 新信息注入，重置停滞计数
 				continue
 			}
 			// 父会话终结保护：若仍有未决子 Agent（call_sub_agent 派发后尚未回传结果），
@@ -629,13 +633,77 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 工具结果全部入史后再注入 mailbox：user 角色的 mailbox 消息若插在 assistant
 		// tool_calls 与其 tool 结果之间，会触发 Anthropic 配对校验 400（整轮请求作废，
 		// 实证：domain 派发子 Agent 后收到子 Agent 完成通知，白跑 31m43s 后失败）。
-		history, _ = a.drainMailbox(history)
+		// 注意不可用 := 短声明：循环体内会遮蔽外层 history，mailbox 消息随循环体结束丢失。
+		var drainedMbx int
+		history, drainedMbx = a.drainMailbox(history)
+
+		// 停滞守卫：本轮无产出性工具且无 mailbox 新消息则累加计数（有则清零），
+		// 连续无产出 6 轮注入预警、12 轮最终通牒、24 轮 ErrLoopExit 硬杀（meta 豁免硬杀）。
+		var stagnationErr error
+		history, unproductiveStreak, stagnationErr = a.stagnationGuard(unproductiveStreak, assistant.ToolCalls, drainedMbx, history)
+		if stagnationErr != nil {
+			return ReactResult{History: history}, stagnationErr
+		}
 	}
 
 	// 达到最大迭代次数上限（仅 maxIter>0 时可能触发）：
 	// 不视为错误——返回 LimitReached 标记与完整历史，
 	// 由上层将会话置为暂停并提示用户发送消息续跑，而不是判定任务失败。
 	return ReactResult{History: history, LimitReached: true}, nil
+}
+
+// 停滞守卫阈值：连续 N 轮"无产出"（无产出性工具调用 ∧ 无 mailbox 新消息 ∧ 无终答）逐级响应。
+// 6 轮注入停滞预警、12 轮注入最终通牒、24 轮返回 ErrLoopExit 硬杀（meta 豁免，见 stagnationGuard）。
+// 24 轮 × 慢模型单轮 2-5 分钟 ≈ 50-120 分钟：必在 2h 墙钟前触发，失败打捞回灌父 Agent 可立即
+// 重派，而不是空转到墙钟零产出硬杀（2026-08-28 渲染领域 Agent 两小时撞墙事故）。
+const (
+	stagnationWarnRounds      = 6
+	stagnationFinalWarnRounds = 12
+	stagnationExitRounds      = 24
+)
+
+// productiveToolNames 产出性工具集合：调用即视为"有产出"，重置停滞计数。
+// 取"改外部状态类"（写文件/派发/消息/浏览器驱动）；只读探查（ReadFile/搜索/RunCommand
+// 验证类）不算产出——连续 24 轮纯探查零写入本身就是异常信号，且 6/12 轮两次预警给了
+// 正常长验证充足的自我收口窗口（预警只提示不杀）。
+var productiveToolNames = map[string]bool{
+	"WriteFile": true, "EditFile": true,
+	"call_sub_agent": true, "call_sub_agents": true,
+	"send_message": true, "ask_user": true,
+	"WriteSharedMemory": true, "WriteSpec": true,
+	"browser_click": true, "browser_run_code_unsafe": true,
+}
+
+// stagnationGuard 无产出停滞守卫。覆盖既有守卫够不着的两类语义死循环：
+// 重复探针死循环（点击开始按钮 state 仍 idle 反复重试 19 分钟——连读同参×3 要求参数
+// 相同拦不住）与完美主义不收口（"还剩最后一处缺口"无限取证——探索预算只拦读类拦不住）。
+// 返回更新后的 history 与计数；达硬杀阈值返回 ErrLoopExit（dispatcher 侧 kind=loop_guard、
+// 失败打捞回灌父 Agent 语义现成）。meta 豁免硬杀（ErrLoopExit 会终止整个会话），仅收预警。
+func (a *ReActAgent) stagnationGuard(streak int, calls []ToolCall, mailboxDrained int, history []ReactMessage) ([]ReactMessage, int, error) {
+	productive := mailboxDrained > 0
+	if !productive {
+		for _, tc := range calls {
+			if productiveToolNames[tc.Name] {
+				productive = true
+				break
+			}
+		}
+	}
+	if productive {
+		return history, 0, nil
+	}
+	streak++
+	switch {
+	case streak >= stagnationExitRounds && a.role.ID != "meta":
+		return history, streak, fmt.Errorf("%w: 连续 %d 轮无任何产出性动作（未写文件/未派发/未收发消息/未终答），判定停滞强制终止。已有部分产出已保留，可缩小任务范围后重派", tool.ErrLoopExit, streak)
+	case streak == stagnationFinalWarnRounds:
+		history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
+			"【停滞最终警告】已连续 %d 轮没有任何产出（未写文件/未派发/未收发消息/未终答）。下一轮必须给出产出：写文件、派发子 Agent 或直接输出终答，三选一；继续只读探查将被判定停滞并强制终止。", streak)})
+	case streak == stagnationWarnRounds:
+		history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
+			"【停滞预警】已连续 %d 轮没有任何产出性动作（仅只读探查/验证）。若证据已足够，立即基于已有信息收尾：写文件、派发或输出终答；不要继续重复探查同一问题。", streak)})
+	}
+	return history, streak, nil
 }
 
 // dispatchToolWithKeepalive 执行单个工具调用，期间定时上报心跳。

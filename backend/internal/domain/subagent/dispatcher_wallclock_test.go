@@ -344,3 +344,62 @@ func TestHotDomain_HardCancelBackstopDecrementsParent(t *testing.T) {
 		t.Fatalf("backstop notify should explain compensation, got: %s", msgs[0].Body)
 	}
 }
+
+// TestWallClockWarnLadder_DeliversEscalating 验证递进预警阶梯：50%/75%/90% 三档按序投递，
+// 文案逐级升压（一半 -> 立即停止 -> 最终预警）。阈值临时缩小到毫秒级以便快速验证。
+func TestWallClockWarnLadder_DeliversEscalating(t *testing.T) {
+	oldOffset, oldRemain := wallClockWarnMinOffset, wallClockWarnMinRemain
+	wallClockWarnMinOffset, wallClockWarnMinRemain = 5*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { wallClockWarnMinOffset, wallClockWarnMinRemain = oldOffset, oldRemain })
+
+	mb := mailbox.New()
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	wallClockWarnLadder(mb, "sub-1", 150*time.Millisecond, done)
+
+	// 三档触发点 75ms/112.5ms/135ms，留足余量后一次性 Drain（Drain 取出即删，不可轮询消费）。
+	time.Sleep(600 * time.Millisecond)
+	msgs := mb.Drain("sub-1")
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 escalating warnings, got %d", len(msgs))
+	}
+	if !strings.Contains(msgs[0].Body, "一半") {
+		t.Fatalf("first warning should be 50%% planning notice, got %q", msgs[0].Body)
+	}
+	if !strings.Contains(msgs[1].Body, "立即停止") {
+		t.Fatalf("second warning should be 75%% wrap-up notice, got %q", msgs[1].Body)
+	}
+	if !strings.Contains(msgs[2].Body, "最终预警") {
+		t.Fatalf("third warning should be 90%% final ultimatum, got %q", msgs[2].Body)
+	}
+}
+
+// TestWallClockWarnLadder_ShortClockSkipsAll 短墙钟（各档位距派发/到期 <30s）全部跳过，
+// 与旧行为一致退化为仅到期硬杀（零行为变化）。
+func TestWallClockWarnLadder_ShortClockSkipsAll(t *testing.T) {
+	mb := mailbox.New()
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	wallClockWarnLadder(mb, "sub-1", 300*time.Millisecond, done) // 默认 30s 阈值下三档全跳过
+	time.Sleep(500 * time.Millisecond)
+	if msgs := mb.Drain("sub-1"); len(msgs) != 0 {
+		t.Fatalf("short wall clock should skip all warning steps, got %d", len(msgs))
+	}
+}
+
+// TestWallClockWarnLadder_DoneStopsDelivery 任务结束（done 关闭）后档位不再投递，
+// goroutine 随之退出（零泄漏、不污染热驻槽的下一任务）。
+func TestWallClockWarnLadder_DoneStopsDelivery(t *testing.T) {
+	oldOffset, oldRemain := wallClockWarnMinOffset, wallClockWarnMinRemain
+	wallClockWarnMinOffset, wallClockWarnMinRemain = 5*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { wallClockWarnMinOffset, wallClockWarnMinRemain = oldOffset, oldRemain })
+
+	mb := mailbox.New()
+	done := make(chan struct{})
+	wallClockWarnLadder(mb, "sub-1", 10*time.Second, done)
+	close(done) // 任务立即完成
+	time.Sleep(300 * time.Millisecond)
+	if msgs := mb.Drain("sub-1"); len(msgs) != 0 {
+		t.Fatalf("no warnings should be delivered after done, got %d", len(msgs))
+	}
+}

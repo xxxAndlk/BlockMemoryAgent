@@ -169,6 +169,12 @@ type Dispatcher struct {
 	// 同一后端承载两类槽位：自由槽位（WriteSharedMemory）与固定 spec 槽位（WriteSpec）。
 	sharedMem tool.SharedMemoryStore
 
+	// ledger 任务台账（2026-08-28 旧需求重派事故根治）：本会话派发任务的权威
+	// 状态流水——派发记"进行中"，notify 终态收口（完成/失败+原因+修改文件），
+	// 经 TaskLedgerBrief 渲染注入 MetaAgent 每轮上下文。NewDispatcher 初始化，
+	// 进程内有效；重启后 Render 时从权威树（PG 恢复）播种。
+	ledger *TaskLedger
+
 	// parentSpecs 缓存每个父 Agent 的 spec 结构化切片（TODO #56/#57/#65）：
 	// 键为 specRecKey{parentID, domain}，值为 *parentSpecRecord（files 绝对路径 +
 	// 跨域契约 + 验收层级）。domain 空=遗留单键 spec；非空=该领域专属 spec（多 key 化）。
@@ -964,6 +970,7 @@ func NewDispatcher(
 		tools:             tools,
 		mailbox:           mailbox,
 		memory:            memory,
+		ledger:            newTaskLedger(),
 		timeout:           30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
 		salvageTimeout:    30 * time.Second, // 默认 30s，可用 WithSalvageTimeout 覆盖（TODO #33）
 		taskRuneSoftLimit: 3000,             // task 文本软上限（TODO #35），WithTaskRuneLimits 覆盖
@@ -1425,7 +1432,7 @@ func (t *callSubAgentTool) Description() string {
 		"dispatcher 校验 ∩ 子 Agent 角色权限天花板后预挂载——子 Agent 当轮即可见对应插件工具，无需自己挂载。" +
 		"天花板外（插件 roles 白名单不允许）的越界项会被忽略并随本调用结果回告，不放大权限。\n\n" +
 		"【wall_clock_min 字段】（可选）本次派发的墙钟预算（分钟，代码级强制执行，与全局 sub_agent_timeout 取小）：" +
-		"到期前子 Agent 会收到收口警告，超时直接终止。普通建设/修复任务必须省略——省略=用全局 sub_agent_timeout（当前 120 分钟/2 小时）；" +
+		"预算用到 50%/75%/90% 时子 Agent 会收到递进收口警告，超时直接终止。普通建设/修复任务必须省略——省略=用全局 sub_agent_timeout（当前 120 分钟/2 小时）；" +
 		"显式给出去的预算就是硬上限，慢思考模型单轮 LLM 可达 5-25 分钟，小预算装不下侦察+产出" +
 		"仅纯侦察/巡检类快任务可显式给小预算（如 10-15）防无边界扩张。\n\n" +
 		"【reuse_agent_id 字段】（可选，热驻复用）复用已完成的热驻领域 Agent：填【空闲领域Agent】清单中的 agent_id。" +
@@ -1821,6 +1828,11 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 			}
 		}
 	}
+	// 任务台账登记（2026-08-28 旧需求重派事故根治）：派发即记"进行中"，
+	// 终态由 notify 收口；仅 Meta 直派入账（RecordDispatch 内部过滤父角色）。
+	if sid := tool.SessionIDFromContext(ctx); sid != "" {
+		d.ledger.RecordDispatch(sid, parentID, subAgentID, domain, taskBrief, "")
+	}
 	// 计划状态回写（TODO #22 Phase 1 补全）：派发即把该领域的计划子任务置为 in_progress，
 	// 否则任务只有完成/失败才翻状态，TUI 执行计划面板全程 Waiting、进度 0%。
 	d.boardAssign(ctx, parentID, domain, subAgentID)
@@ -1861,31 +1873,12 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		}
 	}()
 
-	// 墙钟预警：到期前 grace 窗口向子 Agent 邮箱投递收口警告（子 Agent 主循环 drainMailbox
-	// 会读到），避免"预算 15 分钟跑到 39 分钟"无感知硬杀。agent 提前完成时 ctx 被 defer cancel，
-	// 定时器随之退出，零泄漏。grace 取 min(2min, 墙钟/4)，墙钟过短（<2min）时跳过预警只硬杀。
+	// 墙钟预警阶梯：50%/75%/90% 三段递进 mailbox 收口警告。原单次终点预警（到期前
+	// grace=min(2min,T/4) 才投）实证失效：2h 预算第 118 分钟才警告，慢模型单轮 2-5 分钟，
+	// 警告被 drain 时 Agent 已被杀，全程无感知硬杀（2026-08-28 渲染领域 Agent 两小时撞墙）。
+	// agent 提前完成时 ctx 被 defer cancel，goroutine 随之退出，零泄漏。
 	if effectiveTimeout > 0 && d.mailbox != nil {
-		grace := effectiveTimeout / 4
-		if grace > 2*time.Minute {
-			grace = 2 * time.Minute
-		}
-		if grace >= 30*time.Second {
-			go func() {
-				select {
-				case <-time.After(effectiveTimeout - grace):
-				case <-subAgentCtx.Done():
-					return
-				}
-				_, _ = d.mailbox.Send(&mailbox.Message{
-					From:    "dispatcher",
-					To:      subAgentID,
-					Type:    mailbox.MsgInfo,
-					Subject: "墙钟预警",
-					Body: fmt.Sprintf("【墙钟预警】距执行上限（%v）只剩约 %v，请立即收口：停止继续探索，基于已有产出输出终答。",
-						effectiveTimeout, grace),
-				})
-			}()
-		}
+		wallClockWarnLadder(d.mailbox, subAgentID, effectiveTimeout, subAgentCtx.Done())
 	}
 
 	// 侦察中点预警（2026-08-21）：domain 用侦察墙钟（未显式给 wall_clock_min）时，
@@ -1918,6 +1911,69 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		return subAgentID + "。tools_hint 越界忽略（子 Agent 角色权限天花板外）: " + strings.Join(hintRejected, "; "), nil
 	}
 	return subAgentID, nil
+}
+
+// wallClockWarnMinOffset / wallClockWarnMinRemain 是预警档位跳过阈值：触发点距派发
+// <minOffset 或距到期 <minRemain 的档位不投（短墙钟零行为变化，退化为仅到期硬杀）。
+// var 而非 const：测试可临时缩小阈值以在毫秒内验证投递。
+var (
+	wallClockWarnMinOffset = 30 * time.Second
+	wallClockWarnMinRemain = 30 * time.Second
+)
+
+// wallClockWarnLadder 墙钟预警阶梯：在预算的 50%/75%/90% 处向子 Agent 邮箱投递递进
+// 收口警告（子 Agent 主循环 drainMailbox 会读到）。一次性子 Agent（dispatchOne）与热驻
+// domain（armWallClock）共用。距派发 <30s 或距到期 <30s 的档位跳过（短墙钟零行为变化，
+// 退化为仅到期硬杀）。done 关闭（任务完成/取消/到期）时 goroutine 立即退出，零泄漏。
+func wallClockWarnLadder(mb *mailbox.Mailbox, subAgentID string, total time.Duration, done <-chan struct{}) {
+	if mb == nil || total <= 0 || done == nil {
+		return
+	}
+	steps := []struct {
+		frac float64
+		body func(total, remain time.Duration) string
+	}{
+		{0.50, func(total, remain time.Duration) string {
+			return fmt.Sprintf("【墙钟预警】执行预算（%v）已用约一半（剩约 %v）。规划收口节奏：不再开启新的探索方向，优先完成手头产出。",
+				total, remain)
+		}},
+		{0.75, func(total, remain time.Duration) string {
+			return fmt.Sprintf("【墙钟预警】执行预算（%v）只剩约 %v。立即停止新探索与新读取，基于已有产出收尾并准备终答。",
+				total, remain)
+		}},
+		{0.90, func(total, remain time.Duration) string {
+			return fmt.Sprintf("【墙钟最终预警】距执行上限（%v）只剩约 %v。下一轮必须输出终答：总结已有产出与未完成项，不再调用任何工具。",
+				total, remain)
+		}},
+	}
+	go func() {
+		start := time.Now()
+		for _, st := range steps {
+			offset := time.Duration(float64(total) * st.frac)
+			remain := total - offset
+			if offset < wallClockWarnMinOffset || remain < wallClockWarnMinRemain {
+				continue
+			}
+			wait := time.Until(start.Add(offset))
+			if wait <= 0 {
+				continue
+			}
+			t := time.NewTimer(wait)
+			select {
+			case <-t.C:
+				_, _ = mb.Send(&mailbox.Message{
+					From:    "dispatcher",
+					To:      subAgentID,
+					Type:    mailbox.MsgInfo,
+					Subject: "墙钟预警",
+					Body:    st.body(total, remain),
+				})
+			case <-done:
+				t.Stop()
+				return
+			}
+		}
+	}()
 }
 
 // toolsHintArg 从 args 提取 tools_hint 参数（兼容 []string / []any）。
@@ -1974,7 +2030,7 @@ func (t *callSubAgentsTool) Description() string {
 		fmt.Sprintf("字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=%d 字；", t.dispatcher.taskRuneSoftLimit) +
 		"mode 可选 react/reflection/plan_execute，省略=react；verify_kind 可选 auto/executable/rubric/none，省略=auto；" +
 		"tools_hint 可选：建议子 Agent 使用的插件工具名列表，校验 ∩ 子 Agent 权限天花板后预挂载，越界项忽略并回告）；" +
-		"wall_clock_min 可选：本次派发的墙钟预算（分钟，代码级强制执行，与全局上限取小，到期前收口警告，验收类任务建议显式给）；" +
+		"wall_clock_min 可选：本次派发的墙钟预算（分钟，代码级强制执行，与全局上限取小，50%/75%/90% 递进收口警告，验收类任务建议显式给）；" +
 		"reuse_agent_id 可选：复用【空闲领域Agent】清单中的热驻领域 Agent（强相关任务优先复用，弱相关新建 domain）。\n" +
 		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
 		"否则返回 spec missing/stale 错误（stale 会列出已变更文件路径）。逐项返回派出结果：某项失败不影响其他项。"
@@ -4110,6 +4166,9 @@ func truncateRunes(s string, n int) string {
 // filesModified 为子 Agent 本次修改的文件路径列表（Layer 5，从 result.History 扫 WriteFile 得来），
 // 父 drainMailbox 时展示给父 LLM；无修改文件时传 nil。
 func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified []string) {
+	// 任务台账终态登记（先于邮箱 nil 检查：无邮箱配置时台账仍须可用）。
+	// notify 是所有完成/失败/墙钟收口/被杀回传的唯一咽喉，此处一处全覆盖。
+	d.ledger.RecordTerminal(sessionIDFromAgentID(parentID), parentID, subAgentID, summary, filesModified)
 	// 若未配置邮箱，直接返回，避免 nil 指针 panic。
 	if d.mailbox == nil {
 		return
@@ -4126,6 +4185,22 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 	}); err != nil {
 		log.Printf("[subagent] notify dead-letter: to=%s from=%s err=%v", parentID, subAgentID, err)
 	}
+}
+
+// TaskLedgerBrief 渲染会话任务台账（供 MetaAgent 上下文注入，bootstrap 经
+// ReactService.SetTaskLedgerProvider 以 method value 接线本方法）。
+// 台账为空（新会话尚未派发任何任务）返回空串，注入层跳过不产生任何上下文变化。
+func (d *Dispatcher) TaskLedgerBrief(sessionID string) string {
+	if d.ledger == nil || sessionID == "" {
+		return ""
+	}
+	var tv ledgerTreeView
+	if d.treeFn != nil {
+		if t := d.treeFn(sessionID); t != nil {
+			tv = t
+		}
+	}
+	return d.ledger.Render(sessionID, tv)
 }
 
 // roleIDFromAgentID 从 Agent 句柄中还原出角色 ID。

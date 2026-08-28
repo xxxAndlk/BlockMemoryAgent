@@ -234,3 +234,51 @@ func TestPipeline_EventsLazyReload(t *testing.T) {
 		t.Fatalf("reloaded events should contain pre-restart content, got %q", last.Content)
 	}
 }
+
+// TestFormatSegmentText_TruncatesLongMessages 验证压缩输入的单条截断：user/assistant
+// 超 1000 runes、tool 超 800 runes 被截断并带省略号（防 lightweight 摘要模型 400，
+// 2026-08-28 doubao-seed-2.0-mini "Total tokens of image and text exceed max message tokens" 实证）。
+func TestFormatSegmentText_TruncatesLongMessages(t *testing.T) {
+	long := strings.Repeat("字", 3000)
+	segment := []agent.ReactMessage{
+		{Role: "user", Content: long},
+		{Role: "assistant", Content: long},
+		{Role: "tool", Content: long},
+	}
+	out := formatSegmentText(segment)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 lines, got %d", len(lines))
+	}
+	if n := len([]rune(lines[0])); n > len("[user] ")+segmentTextMsgRunes+1 {
+		t.Fatalf("user line should be truncated to %d runes, got %d", segmentTextMsgRunes, n)
+	}
+	if n := len([]rune(lines[2])); n > len("[tool] ")+segmentTextToolMsgRunes+1 {
+		t.Fatalf("tool line should be truncated to %d runes, got %d", segmentTextToolMsgRunes, n)
+	}
+	if !strings.Contains(lines[0], "…") {
+		t.Fatalf("truncated line should carry ellipsis, got %q", lines[0])
+	}
+}
+
+// TestFormatSegmentText_TotalCapDropsOldest 验证段总量上限：超限从最老消息开始丢弃，
+// 保留最新并加省略标记（20000 runes/条 × 30 条/段 ≈ 60 万字符必超 lightweight 模型上下文）。
+func TestFormatSegmentText_TotalCapDropsOldest(t *testing.T) {
+	segment := make([]agent.ReactMessage, 0, 30)
+	for i := 0; i < 30; i++ {
+		segment = append(segment, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("MSG%02d-", i) + strings.Repeat("x", 900)})
+	}
+	out := formatSegmentText(segment)
+	if n := len([]rune(out)); n > maxSegmentTextRunes+200 { // 省略标记占少量额度
+		t.Fatalf("total output should be capped near %d runes, got %d", maxSegmentTextRunes, n)
+	}
+	if !strings.Contains(out, "省略") {
+		t.Fatalf("expected elision marker for dropped oldest messages, got prefix %q", string([]rune(out)[:60]))
+	}
+	if !strings.Contains(out, "MSG29-") {
+		t.Fatalf("newest message must be kept")
+	}
+	if strings.Contains(out, "MSG00-") {
+		t.Fatalf("oldest message should have been dropped")
+	}
+}

@@ -880,7 +880,9 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 }
 
 // armWallClock 启动 slot 墙钟 timer：到期 cancelTask（软停止/硬收口由任务 ctx 分支处理）。
-// 返回有效墙钟（0=不限制）。预警邮件投递复用全局 grace 逻辑（简化：仅到期杀）。
+// 返回有效墙钟（0=不限制）。同时挂 50%/75%/90% 递进预警（wallClockWarnLadder）——此前热驻
+// domain 完全没有预警（仅到期杀），而 config 默认 domain_hot_resident_enabled=true 即主路径，
+// 渲染领域 Agent 两小时零预警撞墙即此路径（2026-08-28 实证）。taskCtx 结束预警 goroutine 即退出。
 func (d *Dispatcher) armWallClock(s *domainSlot, taskCtx context.Context, cancelTask context.CancelFunc, wallClock time.Duration) time.Duration {
 	if wallClock <= 0 {
 		wallClock = d.timeout
@@ -903,6 +905,7 @@ func (d *Dispatcher) armWallClock(s *domainSlot, taskCtx context.Context, cancel
 		log.Printf("[subagent] WALL CLOCK exceeded: sub=%s domain=%s budget=%v", s.id, s.domain, wallClock)
 		cancelTask()
 	})
+	wallClockWarnLadder(d.mailbox, s.id, wallClock, taskCtx.Done())
 	return wallClock
 }
 
@@ -1102,6 +1105,8 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 			return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s 指令通道满，请稍后重试", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
 		}
 		log.Printf("[subagent] REUSE: sub=%s domain=%s reuse=%d task_len=%d", s.id, s.domain, s.reuseCount, len(task))
+		// 任务台账登记：续建复用新开一条任务记录（台账按任务粒度，热驻槽跨任务不累加）。
+		d.ledger.RecordDispatch(s.sessionID, parentID, s.id, s.domain, task, fmt.Sprintf("续建#%d", s.reuseCount))
 		return s.id, nil
 	default: // slotRunning（含挂起）
 		if qlen >= d.hotCfg.TaskQueueLen {
@@ -1113,6 +1118,8 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 		s.taskQueue = append(s.taskQueue, queuedTask{task: taskText, wallClock: wallClock, images: imgs})
 		s.mu.Unlock()
 		log.Printf("[subagent] QUEUE: sub=%s domain=%s queued=%d (busy, will run after current task)", s.id, s.domain, qlen+1)
+		// 任务台账登记：忙碌入队同样记"进行中"（备注队列位置），任务执行后由 notify 收口。
+		d.ledger.RecordDispatch(s.sessionID, parentID, s.id, s.domain, task, fmt.Sprintf("入队第%d位", qlen+1))
 		return s.id + "（忙碌中，任务已入队，当前任务完成后执行）", nil
 	}
 }
@@ -1182,6 +1189,8 @@ func (d *Dispatcher) dispatchHotDomain(ctx context.Context, parentID, subAgentID
 			t.SetCancel(subAgentID, s.destroyFnLocked())
 		}
 	}
+	// 任务台账登记（热驻新建路径，与 dispatchOne 非热路径并列）。
+	d.ledger.RecordDispatch(sid, parentID, subAgentID, domain, taskBrief, "")
 	// 心跳元数据：subMeta 供巡检兜底；activity 由 buildDomainAgent 注册。
 	d.subMeta.Store(subAgentID, &subAgentMeta{parentID: parentID, sessionID: sid, wallClock: wallClock})
 	d.ensurePatrol()

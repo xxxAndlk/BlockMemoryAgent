@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	// errors 用于构造模拟的瞬时 LLM 错误。
 	"errors"
+	// fmt 用于构造每轮不同的读取路径（规避连读同参守卫的干扰）。
+	"fmt"
 	// os 与 path/filepath 用于校验工具落盘文件内容。
 	"os"
 	"path/filepath"
@@ -1073,3 +1075,90 @@ func TestReActAgent_StreamKeepaliveDuringSilence(t *testing.T) {
 }
 
 
+
+// readCallMsg 构造一轮 ReadFile 工具调用响应（路径每轮不同，规避连读同参×3 守卫）。
+func readCallMsg(i int) *blades.Message {
+	return &blades.Message{
+		Role: blades.RoleAssistant,
+		Parts: []blades.Part{
+			blades.ToolPart{Name: "ReadFile", Request: string(mustJSON(map[string]any{"path": fmt.Sprintf("f%02d.txt", i)}))},
+		},
+	}
+}
+
+// TestReActAgent_StagnationGuard_HardKill 连续 24 轮只读探查（无产出性工具/无 mailbox
+// 新消息/无终答）触发停滞守卫 ErrLoopExit 硬杀；第 6/12 轮已注入递进预警。
+// 覆盖既有守卫够不着的语义死循环（重复探针/完美主义不收口，2026-08-28 两小时撞墙实证）。
+func TestReActAgent_StagnationGuard_HardKill(t *testing.T) {
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	responses := make([]*blades.Message, 0, stagnationExitRounds)
+	for i := 0; i < stagnationExitRounds; i++ {
+		responses = append(responses, readCallMsg(i))
+	}
+	llm := &mockModelProvider{responses: responses}
+	a := NewReActAgent("test", types.RoleDefinition{ID: "domain", SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg))
+	res, err := a.Run(context.Background(), "probe")
+	if err == nil || !errors.Is(err, tool.ErrLoopExit) {
+		t.Fatalf("expected ErrLoopExit after %d unproductive rounds, got %v", stagnationExitRounds, err)
+	}
+	var warn, finalWarn bool
+	for _, m := range res.History {
+		if m.Role == "user" && strings.Contains(m.Content, "【停滞预警】") {
+			warn = true
+		}
+		if m.Role == "user" && strings.Contains(m.Content, "【停滞最终警告】") {
+			finalWarn = true
+		}
+	}
+	if !warn || !finalWarn {
+		t.Fatalf("expected escalating warnings before kill, warn=%v finalWarn=%v", warn, finalWarn)
+	}
+}
+
+// TestReActAgent_StagnationGuard_ProductiveResets 产出性工具调用（WriteFile）重置停滞计数：
+// 5 轮只读 + WriteFile + 5 轮只读 + 终答，不触发任何预警、正常完成。
+func TestReActAgent_StagnationGuard_ProductiveResets(t *testing.T) {
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	responses := []*blades.Message{readCallMsg(0), readCallMsg(1), readCallMsg(2), readCallMsg(3), readCallMsg(4)}
+	responses = append(responses, &blades.Message{
+		Role: blades.RoleAssistant,
+		Parts: []blades.Part{
+			blades.ToolPart{Name: "WriteFile", Request: string(mustJSON(map[string]any{"path": "out.txt", "content": "x"}))},
+		},
+	})
+	responses = append(responses, readCallMsg(5), readCallMsg(6), readCallMsg(7), readCallMsg(8), readCallMsg(9))
+	responses = append(responses, blades.AssistantMessage("done"))
+	llm := &mockModelProvider{responses: responses}
+	a := NewReActAgent("test", types.RoleDefinition{ID: "domain", SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg))
+	res, err := a.Run(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Text != "done" {
+		t.Fatalf("expected final answer, got %q", res.Text)
+	}
+	for _, m := range res.History {
+		if strings.Contains(m.Content, "【停滞") {
+			t.Fatalf("no stagnation warning expected with productive reset, got %q", m.Content)
+		}
+	}
+}
+
+// TestReActAgent_StagnationGuard_MetaExempt MetaAgent 豁免硬杀（ErrLoopExit 会终止整个
+// 会话）：连续 24 轮无产出仅收预警，耗尽后默认终答正常返回。
+func TestReActAgent_StagnationGuard_MetaExempt(t *testing.T) {
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	responses := make([]*blades.Message, 0, stagnationExitRounds)
+	for i := 0; i < stagnationExitRounds; i++ {
+		responses = append(responses, readCallMsg(i))
+	}
+	llm := &mockModelProvider{responses: responses} // 耗尽后默认返回 "done" 终答
+	a := NewReActAgent("meta", types.RoleDefinition{ID: "meta", SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg))
+	res, err := a.Run(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("meta must be exempt from stagnation kill, got %v", err)
+	}
+	if res.Text != "done" {
+		t.Fatalf("expected final answer after exemption, got %q", res.Text)
+	}
+}

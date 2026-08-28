@@ -94,6 +94,10 @@ type ReactService struct {
 	persona PersonaInjector
 	// boardFn 按 sessionID 返回会话任务看板（TODO #22 执行计划）；nil 表示未接线。
 	boardFn func(sessionID string) *board.TaskBoard
+
+	// ledgerFn 按 sessionID 渲染【任务台账】块文本（2026-08-28 旧需求重派事故根治）；
+	// 空串=无台账不注入，nil 表示未接线。由 bootstrap 注入 Dispatcher.TaskLedgerBrief。
+	ledgerFn func(sessionID string) string
 	// promptEnhance 用户输入自动提示词补全开关（TODO #36 Phase 0 规则版）。
 	// 开启时 sendMessage 对命中续跑/控制/诊断意图的输入附加【系统补全】段
 	// （意图标签 + 最近失败/未完成任务绑定），只增不改原文；关闭时零行为变化。
@@ -247,6 +251,13 @@ func (s *ReactService) extractProfilePreferences(session *reactInternalSession) 
 // 由 bootstrap 注入 board.Manager.Get；传 nil 关闭看板功能（TUI 计划面板回退树合成）。
 func (s *ReactService) SetBoard(fn func(sessionID string) *board.TaskBoard) {
 	s.boardFn = fn
+}
+
+// SetTaskLedgerProvider 注入任务台账渲染器（2026-08-28 旧需求重派事故根治）：
+// fn(sessionID) 返回【任务台账】块文本，空串=无台账不注入。传 nil 关闭台账注入。
+// 由 bootstrap 注入 Dispatcher.TaskLedgerBrief。
+func (s *ReactService) SetTaskLedgerProvider(fn func(sessionID string) string) {
+	s.ledgerFn = fn
 }
 
 // SetPromptEnhance 开启/关闭用户输入自动提示词补全（TODO #36，默认关闭；
@@ -1115,12 +1126,33 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		if sid == "" {
 			return "", fmt.Errorf("ask_user: missing session context")
 		}
+		// 等待用户期间保活：同 ApprovalHook，等答复不被心跳巡检误判假死。
+		// 提前到排队之前启动：排队等槽位期间本 Agent 同样阻塞无活动，需要保活覆盖。
+		keepalive := s.startUserWaitKeepalive(ctx)
+		defer keepalive.Stop()
+		// 提问槽位只有一个（与审批共用）。已有待答复项时排队等空位（2s 一拍），
+		// 不硬错——"路线分叉先问后派"下并行领域 Agent 同时提问是常态，硬错会迫使
+		// 后到的 Agent 放弃提问改自行猜测。等待受 ctx 约束（会话取消或 timeout_sec
+		// 超时自然退出，工具侧兑底"用户未答复，自行决策"）。
 		s.store.mu.Lock()
-		sess := s.store.sessions[sid]
-		if sess == nil || sess.approval != nil || sess.askUser != nil {
+		for {
+			sess := s.store.sessions[sid]
+			if sess == nil {
+				s.store.mu.Unlock()
+				return "", fmt.Errorf("ask_user: 会话不存在")
+			}
+			if sess.approval == nil && sess.askUser == nil {
+				break // 拿到空槽位；锁保持持有，下方直接占位
+			}
 			s.store.mu.Unlock()
-			return "", fmt.Errorf("ask_user: 会话不存在或已有待答复项（审批/提问），暂不能提问")
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+			s.store.mu.Lock()
 		}
+		sess := s.store.sessions[sid]
 		ch := make(chan string, 1)
 		sess.askUser = ch
 		req := &ClarifyRequest{
@@ -1164,9 +1196,6 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 
 		s.store.addEvent(sess, eventkind.Clarify, "System", "Agent 提问: "+question, "", "", "", "", "", true)
 
-		// 等待用户期间保活：同 ApprovalHook，等答复不被心跳巡检误判假死。
-		keepalive := s.startUserWaitKeepalive(ctx)
-		defer keepalive.Stop()
 		select {
 		case <-ctx.Done():
 			s.store.mu.Lock()
@@ -1618,6 +1647,7 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 热驻空闲领域清单注入（Domain 热驻）：供 MetaAgent 自主判定强相关复用 vs 弱相关新建。
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
 	metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
+	metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, "meta", s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
@@ -1725,6 +1755,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 热驻空闲领域清单注入（Domain 热驻）：供复用判定。
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
 	metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
+	metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, "meta", s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).

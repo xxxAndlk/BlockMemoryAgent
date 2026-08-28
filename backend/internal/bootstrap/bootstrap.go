@@ -470,6 +470,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		// 空闲领域清单注入：MetaAgent 每轮见【空闲领域Agent】段，自主判定强相关复用 vs 弱相关新建。
 		agentSvc.SetIdleRosterProvider(subAgentDispatcher)
 	}
+	// 任务台账注入（2026-08-28 旧需求重派事故根治）：MetaAgent 每轮见【任务台账】段——
+	// 派发任务的机器权威状态（完成/失败+原因/进行中），完成项禁止重新派发查询，防旧需求返工。
+	agentSvc.SetTaskLedgerProvider(subAgentDispatcher.TaskLedgerBrief)
 	agentSvc.SetIdleTTLArmer(subAgentDispatcher)
 	// 热驻模式下挂起恢复走全树唤醒（ResumeSessionAgents）；旧 resumePausedDomain
 	// 仅在热驻关闭或进程重启槽丢失时兜底。

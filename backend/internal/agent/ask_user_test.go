@@ -181,6 +181,102 @@ func TestAskUser_TimeoutSelfDecision(t *testing.T) {
 	t.Fatal("session did not complete after ask_user timeout")
 }
 
+// blockProvider 阻塞型 provider：首次 Generate 卡住直到 release 关闭，
+// 让会话保持 running，供 hook 级测试直接驱动 AskUserHook。
+type blockProvider struct{ release chan struct{} }
+
+func (p *blockProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &blades.ModelResponse{Message: blades.AssistantMessage("done")}, nil
+}
+func (p *blockProvider) Name() string { return "block" }
+
+// TestAskUser_ConcurrentQueues 并行提问排队：第二个 ask_user 在槽位被占时不再硬错，
+// 排队等空位；第一个答复后第二个挂出自己的问题（2026-08-28：路线分叉先问后派下
+// 并行领域 Agent 同时提问是常态，硬错会迫使后到的 Agent 放弃提问改自行猜测）。
+func TestAskUser_ConcurrentQueues(t *testing.T) {
+	llm := &blockProvider{release: make(chan struct{})}
+	defer close(llm.release)
+	svc := newAskUserTestService(t, llm)
+	ctx := context.Background()
+
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "游戏"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	hook := svc.AskUserHook()
+	mkCtx := func(agentID string) context.Context {
+		return tool.WithAgentID(tool.WithSessionID(ctx, created.ID), agentID)
+	}
+	waitPending := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			sess, _ := svc.Get(ctx, created.ID)
+			if sess != nil && sess.PendingClarify != nil && strings.Contains(sess.PendingClarify.Question, want) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("expected pending clarify %q within timeout", want)
+	}
+
+	type askOutcome struct {
+		answer string
+		err    error
+	}
+	out1 := make(chan askOutcome, 1)
+	go func() {
+		a, err := hook(mkCtx("domain-1"), "问题1：配色？", tool.AskUserOptions{})
+		out1 <- askOutcome{a, err}
+	}()
+	waitPending("问题1")
+
+	out2 := make(chan askOutcome, 1)
+	go func() {
+		a, err := hook(mkCtx("domain-2"), "问题2：难度？", tool.AskUserOptions{})
+		out2 <- askOutcome{a, err}
+	}()
+
+	// 1s 内第二个不得返回（应在排队，而不是硬错或提前放行）。
+	select {
+	case o := <-out2:
+		t.Fatalf("second ask should queue behind the pending one, got early return: %+v", o)
+	case <-time.After(1 * time.Second):
+	}
+
+	// 答复第一个 → 第一个返回，第二个拿到槽位挂出自己的问题。
+	if err := svc.sendMessage(ctx, created.ID, "深色"); err != nil {
+		t.Fatalf("answer 1: %v", err)
+	}
+	select {
+	case o := <-out1:
+		if o.err != nil || o.answer != "深色" {
+			t.Fatalf("ask1 outcome = %+v", o)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ask1 did not return after answer")
+	}
+	waitPending("问题2")
+
+	if err := svc.sendMessage(ctx, created.ID, "简单"); err != nil {
+		t.Fatalf("answer 2: %v", err)
+	}
+	select {
+	case o := <-out2:
+		if o.err != nil || o.answer != "简单" {
+			t.Fatalf("ask2 outcome = %+v", o)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ask2 did not return after slot freed and answer")
+	}
+}
+
 // ---- TODO #28 用户画像 ----
 
 // TestUserProfile_MetaPromptInjection 画像注入 MetaAgent 系统提示词（【用户画像】前缀）。

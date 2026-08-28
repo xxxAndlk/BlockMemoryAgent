@@ -60,6 +60,12 @@ func retryGenerate(ctx context.Context, llm LLMClient, prompt string, perAttempt
 		}
 		// 记录最后一次错误
 		lastErr = err
+		// 4xx 客户端错误（如 400 上下文超限）重试必然再败：立即返回，不徒劳烧满
+		// maxRetries 轮（2026-08-28 实证：压缩摘要 400 三连发，provider 层已判
+		// non-retryable 但本层不知情，每次压缩白等 3 轮退避）。
+		if isNonRetryableErr(err) {
+			return "", err, false
+		}
 		// 若本次 attempt 超时，则标记整个过程出现过超时
 		if deadlineExceeded {
 			timedOut = true
@@ -144,6 +150,10 @@ func retryStreamGenerate(ctx context.Context, llm LLMClient, prompt string, perA
 		}
 		if deadlineExceeded {
 			timedOut = true
+		}
+		// 4xx 客户端错误（如 400 上下文超限）重试必然再败：立即返回（同 retryGenerate）。
+		if isNonRetryableErr(lastErr) {
+			return "", nil, lastErr, false
 		}
 		if attempt < maxRetries {
 			select {

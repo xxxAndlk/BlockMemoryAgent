@@ -145,11 +145,24 @@ func (p *Pipeline) mergeOldestBundles(agentID string, bundles []string) []string
 	return out
 }
 
+// formatSegmentText 渲染上限：单条 user/system/assistant 1000 runes、tool 800 runes；
+// 段总量 maxSegmentTextRunes，超限从最老消息开始丢弃（保留最新）并加省略标记。
+// 此前不截断单条（注释称"tool 输出入史时已截断到 tool_output_history_max_runes，长度天然
+// 有界"），但 20000 runes/条 × ~30 条/压缩段 = 最多 60 万字符，远超 lightweight 摘要模型上下文
+// ——压缩 LLM 每次 400（"Total tokens of image and text exceed max message tokens"），重试 3 次
+// 后降级 truncateSegment，压缩摘要退化成无信息残桩，Agent 失忆反复重读同一文件烧墙钟
+// （2026-08-28 渲染领域 Agent 两小时事故实证）。
+const (
+	segmentTextMsgRunes     = 1000
+	segmentTextToolMsgRunes = 800
+	maxSegmentTextRunes     = 12000
+)
+
 // formatSegmentText 把一段中段历史渲染为 LLM 压缩的输入文本。
-// 与截断降级共用同一渲染（不截断单条内容——让 LLM 看到完整语义自己取舍；
-// 但 tool 输出入史时已截断到 tool_output_history_max_runes，长度天然有界）。
+// 单条按角色截断 + 段总量兜底截断：lightweight 摘要模型上下文有限，不截断必 400
+// （见上常量注释）。截断只影响压缩输入，不动 history 本体。
 func formatSegmentText(segment []agent.ReactMessage) string {
-	var sb strings.Builder
+	lines := make([]string, 0, len(segment))
 	for _, m := range segment {
 		role := m.Role
 		if role == "" {
@@ -159,7 +172,33 @@ func formatSegmentText(segment []agent.ReactMessage) string {
 		if content == "" && len(m.ToolCalls) > 0 {
 			content = fmt.Sprintf("[tool_calls: %d]", len(m.ToolCalls))
 		}
-		fmt.Fprintf(&sb, "[%s] %s\n", role, content)
+		limit := segmentTextMsgRunes
+		if role == "tool" {
+			limit = segmentTextToolMsgRunes
+		}
+		if r := []rune(content); len(r) > limit {
+			content = string(r[:limit]) + "…"
+		}
+		lines = append(lines, fmt.Sprintf("[%s] %s", role, content))
+	}
+	// 段总量 cap：从最老消息开始丢弃，保留最新（近期上下文细节价值最高）。
+	total := 0
+	for _, l := range lines {
+		total += len([]rune(l)) + 1
+	}
+	dropped := 0
+	for total > maxSegmentTextRunes && len(lines) > 1 {
+		total -= len([]rune(lines[0])) + 1
+		lines = lines[1:]
+		dropped++
+	}
+	var sb strings.Builder
+	if dropped > 0 {
+		fmt.Fprintf(&sb, "[… 最早 %d 条消息因压缩输入总量超限省略 …]\n", dropped)
+	}
+	for _, l := range lines {
+		sb.WriteString(l)
+		sb.WriteString("\n")
 	}
 	return sb.String()
 }
