@@ -1,4 +1,4 @@
-import type { Session, SessionEvent, AgentNode, TaskBoardData } from '@/types'
+import type { Session, SessionEvent, AgentNode, TaskBoardData, WireImage } from '@/types'
 import { fetchJson } from './client'
 import { APP_CONFIG } from '@/config/app'
 
@@ -6,10 +6,10 @@ export function listSessions(): Promise<Session[]> {
   return fetchJson('/sessions')
 }
 
-export function createSession(goal: string): Promise<Session> {
+export function createSession(goal: string, images?: WireImage[]): Promise<Session> {
   return fetchJson('/sessions', {
     method: 'POST',
-    body: JSON.stringify({ goal }),
+    body: JSON.stringify(images?.length ? { goal, images } : { goal }),
   })
 }
 
@@ -27,15 +27,36 @@ export function getSessionAgents(
   return fetchJson(`/sessions/${id}/agents`)
 }
 
-export function sendMessage(id: string, content: string): Promise<void> {
+export function sendMessage(id: string, content: string, images?: WireImage[]): Promise<void> {
   return fetchJson(`/sessions/${id}/message`, {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(images?.length ? { content, images } : { content }),
   })
 }
 
 export function cancelSession(id: string): Promise<{ session_id: string; status: string }> {
   return fetchJson(`/sessions/${id}/cancel`, { method: 'POST' })
+}
+
+/** 软停止（TODO #37）：停止当前子任务、销毁倒计时窗口内可续跑。 */
+export function stopSession(id: string): Promise<{ session_id: string; status: string }> {
+  return fetchJson(`/sessions/${id}/stop`, { method: 'POST' })
+}
+
+/** 抢占中断：停止当前 LLM 调用并把内容作为新指令注入。 */
+export function interruptSession(id: string, content: string): Promise<void> {
+  return fetchJson(`/sessions/${id}/interrupt`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  })
+}
+
+/** 运行中会话任务入队：不打断当前执行，当前轮结束后依次消费。 */
+export function enqueueSession(id: string, content: string): Promise<void> {
+  return fetchJson(`/sessions/${id}/enqueue`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  })
 }
 
 export function clarifySession(id: string, answer: string): Promise<void> {

@@ -1,14 +1,13 @@
 package server
 
 import (
-	"context"       // 用于传递请求上下文与超时控制
-	"encoding/json" // 用于 HTTP 响应的 JSON 编码
-	"errors"        // 用于错误判断（errors.Is）
-	"fmt"           // 格式化日志消息
-	"log"           // 未注入 logger 时的回退输出
-	"net/http"      // HTTP 处理器与状态码
-	"strconv"       // 字符串与数字转换
-	"time"          // 时间类型与持续时间
+	"context"  // 用于传递请求上下文与超时控制
+	"errors"   // 用于错误判断（errors.Is）
+	"fmt"      // 格式化日志消息
+	"log"      // 未注入 logger 时的回退输出
+	"net/http" // HTTP 状态码
+	"strconv"  // 字符串与数字转换
+	"time"     // 时间类型与持续时间
 
 	"github.com/blockmemory/agent/backend/internal/agent"  // Agent 门面接口
 	"github.com/blockmemory/agent/backend/internal/logger" // 结构化日志器
@@ -16,6 +15,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/store"  // PostgresStore（兼容注入）
 	"github.com/blockmemory/agent/backend/pkg/enums"       // 会话状态、聊天角色等枚举
 	"github.com/blockmemory/agent/backend/pkg/types"       // 共享类型（ThreeLayerState 等）
+	"github.com/gin-gonic/gin"                             // Gin Web 框架
 )
 
 // Session 表示单个会话的运行时状态，同时作为 HTTP API 的传输对象（DTO）。
@@ -45,22 +45,22 @@ type Session struct {
 
 // SessionEvent 是会话事件流中的单个事件，对应前端展示的一条日志/消息。
 type SessionEvent struct {
-	Type         string    `json:"type"`                    // 事件类型（如 think / tool_exec / token_usage 等）
-	Agent        string    `json:"agent"`                   // 产生事件的 Agent 名称
-	Message      string    `json:"message"`                 // 人类可读的事件描述
-	Kind         string    `json:"kind,omitempty"`          // 事件细分种类（可选）
-	Tool         string    `json:"tool,omitempty"`          // 工具名（可选）
-	ToolPath     string    `json:"tool_path,omitempty"`     // 工具输出路径（可选）
-	ToolOutput   string    `json:"tool_output,omitempty"`   // 工具标准输出（可选）
-	ToolError    string    `json:"tool_error,omitempty"`    // 工具错误信息（可选）
-	Success      bool      `json:"success,omitempty"`       // 工具/操作是否成功（可选）
-	Timestamp    time.Time `json:"timestamp"`               // 事件发生时间
-	Prompt       string    `json:"prompt,omitempty"`        // 关联的 LLM Prompt（可选）
-	InputTokens  int       `json:"input_tokens,omitempty"`  // 输入 token 数（可选）
-	OutputTokens int       `json:"output_tokens,omitempty"` // 输出 token 数（可选）
-	CacheHitTokens  int    `json:"cache_hit_tokens,omitempty"`  // 缓存命中 token 数（TODO #40 可观测）
-	CacheMissTokens int    `json:"cache_miss_tokens,omitempty"` // 缓存未命中 token 数（TODO #40 可观测）
-	DetailJSON   string    `json:"detail_json,omitempty"`   // 额外结构化详情（JSON 字符串，可选）
+	Type            string    `json:"type"`                        // 事件类型（如 think / tool_exec / token_usage 等）
+	Agent           string    `json:"agent"`                       // 产生事件的 Agent 名称
+	Message         string    `json:"message"`                     // 人类可读的事件描述
+	Kind            string    `json:"kind,omitempty"`              // 事件细分种类（可选）
+	Tool            string    `json:"tool,omitempty"`              // 工具名（可选）
+	ToolPath        string    `json:"tool_path,omitempty"`         // 工具输出路径（可选）
+	ToolOutput      string    `json:"tool_output,omitempty"`       // 工具标准输出（可选）
+	ToolError       string    `json:"tool_error,omitempty"`        // 工具错误信息（可选）
+	Success         bool      `json:"success,omitempty"`           // 工具/操作是否成功（可选）
+	Timestamp       time.Time `json:"timestamp"`                   // 事件发生时间
+	Prompt          string    `json:"prompt,omitempty"`            // 关联的 LLM Prompt（可选）
+	InputTokens     int       `json:"input_tokens,omitempty"`      // 输入 token 数（可选）
+	OutputTokens    int       `json:"output_tokens,omitempty"`     // 输出 token 数（可选）
+	CacheHitTokens  int       `json:"cache_hit_tokens,omitempty"`  // 缓存命中 token 数（TODO #40 可观测）
+	CacheMissTokens int       `json:"cache_miss_tokens,omitempty"` // 缓存未命中 token 数（TODO #40 可观测）
+	DetailJSON      string    `json:"detail_json,omitempty"`       // 额外结构化详情（JSON 字符串，可选）
 }
 
 // SessionManager 是 agent.Agent 之上的薄 HTTP 适配层。
@@ -258,14 +258,14 @@ func ToServerSession(a *agent.Session) *Session {
 	if a.PendingClarify != nil {
 		req := a.PendingClarify
 		pc := &types.ClarifyRequest{
-			ID:         req.ID,
-			Question:   req.Question,
-			Context:    req.Context,
-			AgentID:    req.AgentID,
-			CreatedAt:  req.CreatedAt,
-			Answer:     req.Answer,
-			AnsweredAt: req.AnsweredAt,
-			Kind:       req.Kind,
+			ID:          req.ID,
+			Question:    req.Question,
+			Context:     req.Context,
+			AgentID:     req.AgentID,
+			CreatedAt:   req.CreatedAt,
+			Answer:      req.Answer,
+			AnsweredAt:  req.AnsweredAt,
+			Kind:        req.Kind,
 			MultiSelect: req.MultiSelect,
 		}
 		for _, o := range req.Options {
@@ -294,22 +294,22 @@ func ToServerSession(a *agent.Session) *Session {
 	events := make([]SessionEvent, len(a.Events))
 	for i, e := range a.Events {
 		events[i] = SessionEvent{
-			Type:         e.Type,
-			Agent:        e.Agent,
-			Message:      e.Message,
-			Kind:         e.Kind,
-			Tool:         e.Tool,
-			ToolPath:     e.ToolPath,
-			ToolOutput:   e.ToolOutput,
-			ToolError:    e.ToolError,
-			Success:      e.Success,
-			Timestamp:    e.Timestamp,
-			Prompt:       e.Prompt,
-			InputTokens:  e.InputTokens,
-			OutputTokens: e.OutputTokens,
+			Type:            e.Type,
+			Agent:           e.Agent,
+			Message:         e.Message,
+			Kind:            e.Kind,
+			Tool:            e.Tool,
+			ToolPath:        e.ToolPath,
+			ToolOutput:      e.ToolOutput,
+			ToolError:       e.ToolError,
+			Success:         e.Success,
+			Timestamp:       e.Timestamp,
+			Prompt:          e.Prompt,
+			InputTokens:     e.InputTokens,
+			OutputTokens:    e.OutputTokens,
 			CacheHitTokens:  e.CacheHitTokens,
 			CacheMissTokens: e.CacheMissTokens,
-			DetailJSON:   e.DetailJSON,
+			DetailJSON:      e.DetailJSON,
 		}
 	}
 
@@ -343,50 +343,40 @@ func ToServerSession(a *agent.Session) *Session {
 
 // HandleSessionMetrics 处理 GET /api/sessions/{id}/metrics。
 // 返回指定会话的指标数据。
-func (m *SessionManager) HandleSessionMetrics(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+func (m *SessionManager) HandleSessionMetrics(c *gin.Context) {
+	id := c.Param("id")
+
+	if _, err := m.agent.Get(c.Request.Context(), id); err != nil {
+		c.String(http.StatusNotFound, "会话不存在")
 		return
 	}
 
-	if _, err := m.agent.Get(r.Context(), id); err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
-		return
-	}
-
-	res, err := m.agent.Query(r.Context(), id, agent.Query{Kind: agent.QueryKindMetrics})
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{Kind: agent.QueryKindMetrics})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res.Data)
+	c.JSON(http.StatusOK, res.Data)
 }
 
 // HandleSessionWatchdog 处理 GET /api/sessions/{id}/watchdog。
 // 返回看门狗对会话的决策记录。
-func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+func (m *SessionManager) HandleSessionWatchdog(c *gin.Context) {
+	id := c.Param("id")
+
+	if _, err := m.agent.Get(c.Request.Context(), id); err != nil {
+		c.String(http.StatusNotFound, "会话不存在")
 		return
 	}
 
-	if _, err := m.agent.Get(r.Context(), id); err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
-		return
-	}
-
-	res, err := m.agent.Query(r.Context(), id, agent.Query{Kind: agent.QueryKindWatchdog})
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{Kind: agent.QueryKindWatchdog})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"decisions":  res.Data,
 	})
@@ -394,26 +384,21 @@ func (m *SessionManager) HandleSessionWatchdog(w http.ResponseWriter, r *http.Re
 
 // HandleSessionMailbox 处理 GET /api/sessions/{id}/mailbox。
 // 返回会话邮箱中的消息列表。
-func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+func (m *SessionManager) HandleSessionMailbox(c *gin.Context) {
+	id := c.Param("id")
+
+	if _, err := m.agent.Get(c.Request.Context(), id); err != nil {
+		c.String(http.StatusNotFound, "会话不存在")
 		return
 	}
 
-	if _, err := m.agent.Get(r.Context(), id); err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
-		return
-	}
-
-	res, err := m.agent.Query(r.Context(), id, agent.Query{Kind: agent.QueryKindMailbox})
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{Kind: agent.QueryKindMailbox})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"messages":   res.Data,
 	})
@@ -421,64 +406,54 @@ func (m *SessionManager) HandleSessionMailbox(w http.ResponseWriter, r *http.Req
 
 // HandleSessionLogs 处理 GET /api/sessions/{id}/logs。
 // 支持 query 参数：agent、level、limit、offset。
-func (m *SessionManager) HandleSessionLogs(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
-		return
-	}
+func (m *SessionManager) HandleSessionLogs(c *gin.Context) {
+	id := c.Param("id")
 
-	if _, err := m.agent.Get(r.Context(), id); err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
+	if _, err := m.agent.Get(c.Request.Context(), id); err != nil {
+		c.String(http.StatusNotFound, "会话不存在")
 		return
 	}
 
 	// 解析分页参数，转换失败时默认为 0（Atoi 返回 0）。
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	offset, _ := strconv.Atoi(c.Query("offset"))
 
-	res, err := m.agent.Query(r.Context(), id, agent.Query{
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{
 		Kind: agent.QueryKindLogs,
 		Args: map[string]any{
-			"agent":  r.URL.Query().Get("agent"),
-			"level":  r.URL.Query().Get("level"),
+			"agent":  c.Query("agent"),
+			"level":  c.Query("level"),
 			"limit":  limit,
 			"offset": offset,
 		},
 	})
 	if err != nil {
-		m.logError(r.Context(), fmt.Sprintf("[SessionManager] 查询 session_logs 失败: session=%s", id), err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		m.logError(c.Request.Context(), fmt.Sprintf("[SessionManager] 查询 session_logs 失败: session=%s", id), err)
+		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res.Data)
+	c.JSON(http.StatusOK, res.Data)
 }
 
 // HandleSessionTokenMetrics 处理 GET /api/sessions/{id}/token-metrics。
 // 返回会话级别的 Token 消耗聚合。
-func (m *SessionManager) HandleSessionTokenMetrics(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+func (m *SessionManager) HandleSessionTokenMetrics(c *gin.Context) {
+	id := c.Param("id")
+
+	if _, err := m.agent.Get(c.Request.Context(), id); err != nil {
+		c.String(http.StatusNotFound, "会话不存在")
 		return
 	}
 
-	if _, err := m.agent.Get(r.Context(), id); err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
-		return
-	}
-
-	res, err := m.agent.Query(r.Context(), id, agent.Query{Kind: agent.QueryKindTokenMetrics})
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{Kind: agent.QueryKindTokenMetrics})
 	if err != nil {
-		m.logError(r.Context(), fmt.Sprintf("[SessionManager] 聚合 token 消耗失败: session=%s", id), err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		m.logError(c.Request.Context(), fmt.Sprintf("[SessionManager] 聚合 token 消耗失败: session=%s", id), err)
+		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res.Data)
+	c.JSON(http.StatusOK, res.Data)
 }
 
 // agentErrorStatus 将 agent 的哨兵错误映射为 HTTP 状态码与可读消息。

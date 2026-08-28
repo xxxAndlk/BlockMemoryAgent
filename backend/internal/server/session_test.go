@@ -6,16 +6,18 @@ import (
 	"fmt"           // 构造会话 ID
 	"net/http"      // HTTP handler 测试
 	"net/http/httptest"
-	"strings"       // 请求体构造
-	"sync"          // 并发保护 mock 数据
-	"testing"       // 测试框架
-	"time"          // 时间戳
+	"strings" // 请求体构造
+	"sync"    // 并发保护 mock 数据
+	"testing" // 测试框架
+	"time"    // 时间戳
 
-	"github.com/blockmemory/agent/backend/internal/agent"                // agent 门面接口
+	"github.com/gin-gonic/gin" // Gin Web 框架（测试路由）
+
+	"github.com/blockmemory/agent/backend/internal/agent" // agent 门面接口
 	"github.com/blockmemory/agent/backend/internal/board"
-	"github.com/blockmemory/agent/backend/internal/userprofile"                // 看板快照类型
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // Agent 树节点类型
-	"github.com/blockmemory/agent/backend/pkg/enums"                     // 会话状态与角色枚举
+	"github.com/blockmemory/agent/backend/internal/userprofile"         // 看板快照类型
+	"github.com/blockmemory/agent/backend/pkg/enums"                    // 会话状态与角色枚举
 )
 
 // mockAgentForServer 是一个最小化的 agent.Agent 实现，
@@ -123,7 +125,9 @@ func (m *mockAgentForServer) CancelAgent(ctx context.Context, sessionID, instID 
 }
 
 // Profile 返回用户画像，测试实现返回空。
-func (m *mockAgentForServer) Profile(ctx context.Context) (*userprofile.Profile, error) { return &userprofile.Profile{}, nil }
+func (m *mockAgentForServer) Profile(ctx context.Context) (*userprofile.Profile, error) {
+	return &userprofile.Profile{}, nil
+}
 
 // SaveProfile 覆盖画像，测试实现为空操作。
 func (m *mockAgentForServer) SaveProfile(ctx context.Context, content string) error { return nil }
@@ -209,9 +213,9 @@ func (m *mockAgentForServer) Board(ctx context.Context, sessionID string) (*boar
 // capturingAgent 包装 mockAgentForServer，捕获 Send 收到的消息供断言。
 type capturingAgent struct {
 	mockAgentForServer
-	mu        sync.Mutex
-	sent      []agent.Message
-	sendSess  []string
+	mu       sync.Mutex
+	sent     []agent.Message
+	sendSess []string
 }
 
 func (c *capturingAgent) Send(ctx context.Context, sessionID string, msg agent.Message) error {
@@ -237,8 +241,9 @@ func TestHandleSessionMessageWithImages(t *testing.T) {
 	created, _ := cap.mockAgentForServer.CreateSession(context.Background(), agent.CreateRequest{Goal: "img"})
 
 	mgr := NewSessionManager(cap)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/sessions/{id}/message", mgr.HandleSessionMessage)
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/api/sessions/:id/message", mgr.HandleSessionMessage)
 
 	// wire 载荷由 json.Marshal(tool.ResultImage) 生成：Data 为 base64 ASCII，
 	// encoding/json 对 []byte 再做一层 base64（双端对称，解出即还原）。
@@ -247,7 +252,7 @@ func TestHandleSessionMessageWithImages(t *testing.T) {
 	body := `{"content":"按这张图实现","images":[` + string(imgJSON) + `]}`
 	req := httptest.NewRequest(http.MethodPost, "/api/sessions/"+created.ID+"/message", strings.NewReader(body))
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
+	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
@@ -275,7 +280,7 @@ func TestHandleSessionMessageWithImages(t *testing.T) {
 	over += `]}`
 	req2 := httptest.NewRequest(http.MethodPost, "/api/sessions/"+created.ID+"/message", strings.NewReader(over))
 	rec2 := httptest.NewRecorder()
-	mux.ServeHTTP(rec2, req2)
+	r.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusBadRequest {
 		t.Fatalf("超限 status = %d, want 400", rec2.Code)
 	}

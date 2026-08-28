@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin" // Gin Web 框架（测试路由）
+
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/plugins"
@@ -23,9 +25,9 @@ import (
 // apiTestTool 模拟插件工具。
 type apiTestTool struct{ name string }
 
-func (a *apiTestTool) Name() string      { return a.name }
-func (a *apiTestTool) Aliases() []string { return nil }
-func (a *apiTestTool) Description() string { return "api 测试工具" }
+func (a *apiTestTool) Name() string                    { return a.name }
+func (a *apiTestTool) Aliases() []string               { return nil }
+func (a *apiTestTool) Description() string             { return "api 测试工具" }
 func (a *apiTestTool) InputSchema() *jsonschema.Schema { return nil }
 func (a *apiTestTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
 	return &tool.Result{Tool: a.name, Success: true, Output: "ok"}
@@ -47,25 +49,26 @@ func (f *apiFakePlugin) Tools() []tool.Tool {
 	return []tool.Tool{&apiTestTool{name: f.id + "_tool"}}
 }
 
-// newPluginTestMux 构造与生产同构的路由（插件端点 + AuthMiddleware 空 token 放行）。
-func newPluginTestMux(h *APIHandler) *http.ServeMux {
-	mux := http.NewServeMux()
-	wrap := func(fn http.HandlerFunc) http.HandlerFunc {
-		return AuthMiddleware("", nil, fn)
-	}
-	mux.HandleFunc("/api/plugins", wrap(h.ListPluginsHandler))
-	mux.HandleFunc("/api/plugins/{id}", wrap(h.GetPluginHandler))
-	mux.HandleFunc("/api/plugins/{id}/enable", wrap(h.EnablePluginHandler))
-	mux.HandleFunc("/api/plugins/{id}/disable", wrap(h.DisablePluginHandler))
-	mux.HandleFunc("/api/plugins/reload", wrap(h.ReloadPluginsHandler))
-	return mux
+// newPluginTestRouter 构造与生产同构的 Gin 路由（插件端点 + GinAuthMiddleware 空 token 放行）。
+func newPluginTestRouter(h *APIHandler) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.HandleMethodNotAllowed = true
+	// 空 token = 未启用鉴权，中间件直接放行（与生产同构）。
+	r.Use(GinAuthMiddleware("", nil))
+	r.GET("/api/plugins", h.ListPluginsHandler)
+	r.GET("/api/plugins/:id", h.GetPluginHandler)
+	r.POST("/api/plugins/:id/enable", h.EnablePluginHandler)
+	r.POST("/api/plugins/:id/disable", h.DisablePluginHandler)
+	r.POST("/api/plugins/reload", h.ReloadPluginsHandler)
+	return r
 }
 
-func doJSON(t *testing.T, mux *http.ServeMux, method, path string) *httptest.ResponseRecorder {
+func doJSON(t *testing.T, r *gin.Engine, method, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, nil)
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
+	r.ServeHTTP(rec, req)
 	return rec
 }
 
@@ -86,10 +89,10 @@ func TestPluginAPIEnableDisableLoop(t *testing.T) {
 	}
 	api := NewAPIHandler(nil)
 	api.SetPluginManager(mgr)
-	mux := newPluginTestMux(api)
+	r := newPluginTestRouter(api)
 
 	// 列表：1 个插件，registered 态。
-	rec := doJSON(t, mux, http.MethodGet, "/api/plugins")
+	rec := doJSON(t, r, http.MethodGet, "/api/plugins")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list: %d", rec.Code)
 	}
@@ -107,7 +110,7 @@ func TestPluginAPIEnableDisableLoop(t *testing.T) {
 	}
 
 	// enable → 工具出现在 Registry/Schema。
-	rec = doJSON(t, mux, http.MethodPost, "/api/plugins/p/enable")
+	rec = doJSON(t, r, http.MethodPost, "/api/plugins/p/enable")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("enable: %d %s", rec.Code, rec.Body.String())
 	}
@@ -132,13 +135,13 @@ func TestPluginAPIEnableDisableLoop(t *testing.T) {
 	}
 
 	// 详情。
-	rec = doJSON(t, mux, http.MethodGet, "/api/plugins/p")
+	rec = doJSON(t, r, http.MethodGet, "/api/plugins/p")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"state":"running"`) {
 		t.Fatalf("get: %d %s", rec.Code, rec.Body.String())
 	}
 
 	// disable → 工具消失。
-	rec = doJSON(t, mux, http.MethodPost, "/api/plugins/p/disable")
+	rec = doJSON(t, r, http.MethodPost, "/api/plugins/p/disable")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable: %d", rec.Code)
 	}
@@ -147,11 +150,11 @@ func TestPluginAPIEnableDisableLoop(t *testing.T) {
 	}
 
 	// 未知插件 404 / enable 不存在 400。
-	rec = doJSON(t, mux, http.MethodGet, "/api/plugins/nope")
+	rec = doJSON(t, r, http.MethodGet, "/api/plugins/nope")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("未知插件应 404，got %d", rec.Code)
 	}
-	rec = doJSON(t, mux, http.MethodPost, "/api/plugins/nope/enable")
+	rec = doJSON(t, r, http.MethodPost, "/api/plugins/nope/enable")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("未知插件 enable 应 400，got %d", rec.Code)
 	}
@@ -181,16 +184,16 @@ func TestPluginAPIReload(t *testing.T) {
 	}
 	api := NewAPIHandler(nil)
 	api.SetPluginManager(mgr)
-	mux := newPluginTestMux(api)
+	r := newPluginTestRouter(api)
 
 	// 重载前：仅有 a。
-	rec := doJSON(t, mux, http.MethodGet, "/api/plugins")
+	rec := doJSON(t, r, http.MethodGet, "/api/plugins")
 	if !strings.Contains(rec.Body.String(), `"id":"a"`) {
 		t.Fatalf("重载前应只有 a: %s", rec.Body.String())
 	}
 	// 磁盘配置改为 b，reload 后 a 消失、b 出现。
 	writeFile("plugins:\n  b:\n    kind: mcp\n")
-	rec = doJSON(t, mux, http.MethodPost, "/api/plugins/reload")
+	rec = doJSON(t, r, http.MethodPost, "/api/plugins/reload")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("reload: %d %s", rec.Code, rec.Body.String())
 	}

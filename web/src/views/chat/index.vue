@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyOption } from '@/types'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyOption, WireImage } from '@/types'
 import {
   createSession,
   sendMessage,
   clarifySession,
   cancelSession,
+  stopSession,
+  enqueueSession,
+  interruptSession,
   getSession,
   getSessionAgents,
   getSessionBoard,
@@ -149,12 +152,13 @@ function startStream(s: Session) {
   })
 }
 
-async function handleSubmit(content: string) {
-  if (!content.trim()) return
+async function handleSubmit(content: string, images: WireImage[] = []) {
+  if (!content.trim() && !images.length) return
   sending.value = true
   try {
     // 1) 待澄清会话 → 调 /clarify 提交答复，复用同一会话
     if (activeSession.value && activeSession.value.status === 'awaiting_clarify') {
+      if (images.length) ElMessage.warning('澄清答复不支持携带图片，已忽略')
       await clarifySession(activeSession.value.id, content)
       activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
       await openSession(activeSession.value.id)
@@ -164,7 +168,17 @@ async function handleSubmit(content: string) {
     //    后端 POST /api/sessions/{id}/message 支持向已完成会话追加并 resumeSession。
     if (activeSession.value) {
       const wasRunning = activeSession.value.status === 'running'
-      await sendMessage(activeSession.value.id, content)
+      if (wasRunning && !activeSession.value.destroy_at) {
+        // 运行中且未软停止：不打断当前执行，走入队通道（对齐 TUI /enqueue），
+        // 当前轮结束后依次消费。入队端点不携带图片，丢图显式提示。
+        if (images.length) ElMessage.warning('运行中入队不支持携带图片，已忽略')
+        await enqueueSession(activeSession.value.id, content)
+        sending.value = false
+        return
+      }
+      // 软停止倒计时窗口内（destroy_at 非空）：走 /message 续跑路径，
+      // 打断挂死的 LLM 调用并从当前进度恢复（任务 78 语义）。
+      await sendMessage(activeSession.value.id, content, images)
       if (!wasRunning) {
         // 会话此前已完成/出错：onDone 已关闭 SSE，需重新打开会话以重建事件流并置 running
         activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
@@ -173,8 +187,8 @@ async function handleSubmit(content: string) {
       // wasRunning 时 SSE 仍在监听，会自动推送 user_message 事件
       return
     }
-    // 3) 无选中会话 → 创建新会话
-    const s = await createSession(content)
+    // 3) 无选中会话 → 创建新会话（首条消息可携带图片）
+    const s = await createSession(content, images)
     sessions.value.unshift(s)
     router.replace({ path: '/chat', query: { id: s.id } })
     await openSession(s.id)
@@ -196,10 +210,53 @@ async function handleClarifySubmitted() {
 async function handleCancel() {
   if (!activeSession.value) return
   try {
+    await ElMessageBox.confirm(
+      '硬终止会立即取消全部子 Agent 与当前任务，且不可续跑。建议优先使用软停止。',
+      '确认硬终止？',
+      { confirmButtonText: '硬终止', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return // 用户取消
+  }
+  try {
     await cancelSession(activeSession.value.id)
   } catch (e) {
     console.error('cancel failed:', e)
     ElMessage.error('取消会话失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+// 抢占中断（对齐 TUI /interrupt）：打断当前 LLM 调用，把输入作为新指令注入续跑。
+async function handleInterrupt() {
+  if (!activeSession.value) return
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '将打断当前执行，并把输入内容作为新指令注入继续运行',
+      '抢占中断',
+      { confirmButtonText: '中断', cancelButtonText: '取消', inputPlaceholder: '新指令（必填）', type: 'warning' }
+    )
+    if (!value || !value.trim()) return
+    await interruptSession(activeSession.value.id, value.trim())
+    ElMessage.success('已中断并注入新指令')
+  } catch (e) {
+    if (e === 'cancel' || (e instanceof Error && e.message === 'cancel')) return
+    ElMessage.error('中断失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+// 软停止（TODO #37 / 任务 21 Web 侧同步）：停止当前执行、进入销毁倒计时窗口，
+// 窗口内再发消息即续跑（走 /message resume 路径）。
+async function handleStop() {
+  if (!activeSession.value) return
+  try {
+    await stopSession(activeSession.value.id)
+    ElMessage.success('已软停止，倒计时内发送新消息可续跑')
+    const id = activeSession.value.id
+    const s = await getSession(id)
+    activeSession.value = s
+  } catch (e) {
+    console.error('stop failed:', e)
+    ElMessage.error('软停止失败：' + (e instanceof Error ? e.message : String(e)))
   }
 }
 
@@ -280,7 +337,7 @@ function fmtDateTime(iso: string) {
 
     <!-- 中间对话区 -->
     <main class="flex-1 flex flex-col bg-[#1a1d24] border border-[#2a2d35] rounded-lg overflow-hidden min-w-0">
-      <ChatHeader :session="activeSession" :agents="agents" @cancel="handleCancel" />
+      <ChatHeader :session="activeSession" :agents="agents" @cancel="handleCancel" @stop="handleStop" @interrupt="handleInterrupt" />
       <MessageList :events="events" :verbose="verbose" :clarify="clarifyPending"
                    :session-id="activeSession?.id || ''" @submit-clarify="handleClarifySubmitted" />
       <ChatInput :loading="sending"
@@ -343,8 +400,8 @@ function fmtDateTime(iso: string) {
                 </span>
                 <el-tag v-if="data.status" :type="data.statusType" size="small" effect="plain"
                   class="!bg-transparent !border-[#2a2d35] scale-75 origin-right"
-                  :class="{'!text-green-500': data.status==='active', '!text-yellow-500': data.status==='running', '!text-gray-500': data.status==='pending'}">
-                  {{ data.status }}
+                  :class="{'!text-green-500': data.status==='active' || data.status==='done', '!text-yellow-500': data.status==='running' || data.status==='delivered-unverified', '!text-red-500': data.status==='failed', '!text-gray-500': data.status==='pending'}">
+                  {{ data.status === 'delivered-unverified' ? '已交付未验证' : data.status }}
                 </el-tag>
               </div>
             </template>
@@ -365,12 +422,18 @@ function fmtDateTime(iso: string) {
           <div v-for="(t, i) in tasks" :key="i"
                class="flex items-center gap-2 p-1.5 bg-[#0f1115] rounded border border-[#2a2d35]">
             <el-icon v-if="t.status === 'done'" class="text-green-500 text-sm"><CircleCheck /></el-icon>
-            <el-icon v-else-if="t.status === 'running'" class="text-yellow-500 text-sm"><Loading /></el-icon>
+            <el-icon v-else-if="t.status === 'running' || t.status === 'in_progress'" class="text-yellow-500 text-sm"><Loading /></el-icon>
+            <el-icon v-else-if="t.status === 'delivered-unverified'" class="text-yellow-500 text-sm"><WarningFilled /></el-icon>
+            <el-icon v-else-if="t.status === 'failed'" class="text-red-500 text-sm"><CircleClose /></el-icon>
+            <el-icon v-else-if="t.status === 'blocked'" class="text-gray-400 text-sm"><Lock /></el-icon>
             <el-icon v-else class="text-gray-500 text-sm"><CirclePlus /></el-icon>
             <span class="text-gray-200 truncate flex-1">{{ t.title || t.name }}</span>
             <span v-if="t.assignee" class="text-[10px] text-gray-500 shrink-0 font-mono">{{ t.assignee }}</span>
             <el-tag v-if="t.status === 'done'" size="small" type="success" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">完成</el-tag>
-            <el-tag v-else-if="t.status === 'running'" size="small" type="warning" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">进行中</el-tag>
+            <el-tag v-else-if="t.status === 'running' || t.status === 'in_progress'" size="small" type="warning" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">进行中</el-tag>
+            <el-tag v-else-if="t.status === 'delivered-unverified'" size="small" type="warning" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">已交付未验证</el-tag>
+            <el-tag v-else-if="t.status === 'failed'" size="small" type="danger" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">失败</el-tag>
+            <el-tag v-else-if="t.status === 'blocked'" size="small" type="info" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">阻塞</el-tag>
             <el-tag v-else size="small" type="info" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-75 origin-right">待办</el-tag>
           </div>
         </div>

@@ -22,6 +22,8 @@ import (
 	"syscall"       // SIGINT/SIGTERM 等信号常量
 	"time"          // HTTP 超时与持续时间计算
 
+	"github.com/gin-gonic/gin" // Gin Web 框架（静态资源包装）
+
 	"github.com/blockmemory/agent/backend/internal/bootstrap" // 统一后端依赖装配（wiring）
 	"github.com/blockmemory/agent/backend/internal/config"    // 基础设施配置加载与环境变量注入
 	"github.com/blockmemory/agent/backend/internal/logger"    // 结构化日志器
@@ -123,13 +125,13 @@ func main() {
 	// bootstrap.Build 统一构造 repository、service、handler、SSE broker 等组件，
 	// 返回的 app 对象提供 Close() 用于释放资源。
 	app, err := bootstrap.Build(ctx, bootstrap.ConfigPaths{
-		ConfigPath: *configPath, // 基础设施配置路径
-		RolePath:   *rolePath,   // 角色配置路径
-		EnvPath:    *envPath,    // 环境变量文件路径
-		SoulPath:   *soulPath,   // 人格定义文件路径
+		ConfigPath:  *configPath,  // 基础设施配置路径
+		RolePath:    *rolePath,    // 角色配置路径
+		EnvPath:     *envPath,     // 环境变量文件路径
+		SoulPath:    *soulPath,    // 人格定义文件路径
 		ProfilePath: *profilePath, // 用户画像文件路径
-		SkillPath:  *skillPath,  // Skill 池 YAML 路径
-		LogWriter:  logWriter,   // 文件日志 writer，组件内部可共用
+		SkillPath:   *skillPath,   // Skill 池 YAML 路径
+		LogWriter:   logWriter,    // 文件日志 writer，组件内部可共用
 	})
 	if err != nil {
 		// 依赖装配失败无法继续，退出前 log 已落盘或输出到 stderr
@@ -138,32 +140,34 @@ func main() {
 	}
 	defer app.Close() // main 返回时释放数据库连接、缓存连接等资源
 
-	// ---- 构造默认 HTTP 路由 ----
-	// NewDefaultMux 已注册 API 路由；此处继续注册静态文件与首页。
-	mux := bootstrap.NewDefaultMux(app)
+	// ---- 构造 Gin 路由 ----
+	// NewDefaultRouter 已注册全部 API 路由；此处继续注册静态文件与 SPA 首页回退。
+	router := bootstrap.NewDefaultRouter(app)
 
 	// 静态文件：Vue 构建产物目录支持相对可执行文件路径解析，
 	// 避免服务从其他工作目录启动时找不到 web/dist。
 	webDist := resolveWebDistPath(*webDistPath)
 	fs := http.FileServer(http.Dir(webDist))
-	mux.Handle("/assets/", fs)     // 静态资源目录（JS/CSS/图片）
-	mux.Handle("/favicon.svg", fs) // 站点图标
+	router.GET("/assets/*filepath", gin.WrapH(fs))    // 静态资源目录（JS/CSS/图片）
+	router.GET("/favicon.svg", func(c *gin.Context) { // 站点图标
+		c.File(filepath.Join(webDist, "favicon.svg"))
+	})
 
-	// 首页：Vue SPA 使用 history 路由，所有未匹配路径统一回退 index.html。
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// ServeFile 直接读取 webDist/index.html 作为响应体
-		http.ServeFile(w, r, filepath.Join(webDist, "index.html"))
+	// SPA 回退：Vue 使用 history 路由，所有未匹配路径统一回退 index.html
+	// （含未知 /api 路径，与原标准库路由的 "/" 兜底行为一致）。
+	router.NoRoute(func(c *gin.Context) {
+		c.File(filepath.Join(webDist, "index.html"))
 	})
 
 	// ---- 启动 HTTP 服务 ----
 	addr := cfg.HTTP.Addr
 	srvLogger.Info(ctx, fmt.Sprintf("BlockMemoryAgent 服务启动: http://localhost%s", addr))
 
-	// 构造 http.Server 实例，Handler 指向上面注册好的 mux。
+	// 构造 http.Server 实例，Handler 指向上面注册好的 Gin 引擎（实现 http.Handler）。
 	// P0-01 修复：显式配置读/写超时，避免慢客户端攻击；IdleTimeout 兜底 120s。
 	httpServer := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      router,
 		ReadTimeout:  time.Duration(cfg.HTTP.ReadTimeout) * time.Second,
 		WriteTimeout: time.Duration(cfg.HTTP.WriteTimeout) * time.Second,
 		IdleTimeout:  120 * time.Second,

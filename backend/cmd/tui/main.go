@@ -16,6 +16,7 @@ import (
 	"strings"  // 判断关闭网络连接时的预期错误
 
 	tea "github.com/charmbracelet/bubbletea" // TUI 框架
+	"github.com/gin-gonic/gin"               // Gin Web 框架（本地 API 服务）
 	"github.com/mattn/go-isatty"             // 检测 stdin 是否为终端
 	"github.com/mattn/go-runewidth"          // 等宽字符宽度计算
 
@@ -140,54 +141,30 @@ func main() {
 	}
 	defer app.Close() // main 返回时释放数据库、缓存等资源
 
-	// ---- 启动本地 HTTP 服务 ----
-	// 这里不直接复用 server.api.go 是因为 TUI 进程内已持有 SessionManager/Graph 实例，
+	// ---- 启动本地 HTTP 服务（Gin）----
+	// 这里不直接复用生产路由是因为 TUI 进程内已持有 SessionManager/Graph 实例，
 	// 直接走本地 HTTP 比进程内调用更解耦：输入栏只关心 HTTP，便于后续替换为远程后端。
-	mux := http.NewServeMux()
+	// 服务仅绑定 127.0.0.1，无需鉴权中间件。
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.HandleMethodNotAllowed = true
 
-	// /api/sessions 集合路由：支持 GET 列表与 POST 创建
-	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			// 列出所有会话
-			app.Server.HandleListSessions(w, r)
-		case http.MethodPost:
-			// 创建新会话
-			app.Server.HandleCreateSession(w, r)
-		default:
-			// 其他方法不支持
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
+	// /api 分组：与生产路由同构的会话端点全集（server.RegisterSessionRoutes 共用）。
+	api := router.Group("/api")
+	server.RegisterSessionRoutes(api, app.Server)
 
-	// Session 子资源路由：使用 Go 1.22 路径变量，handler 内部通过 r.PathValue("id") 读取 ID
-	mux.HandleFunc("/api/sessions/{id}/stream", app.Server.HandleSessionStream)
-	mux.HandleFunc("/api/sessions/{id}/message", app.Server.HandleSessionMessage)
-	mux.HandleFunc("/api/sessions/{id}/clarify", app.Server.HandleSessionClarify)
-	mux.HandleFunc("/api/sessions/{id}/interrupt", app.Server.HandleSessionInterrupt)
-	mux.HandleFunc("/api/sessions/{id}/enqueue", app.Server.HandleSessionEnqueue)
-	mux.HandleFunc("/api/sessions/{id}/stop", app.Server.HandleSessionStop)
-	mux.HandleFunc("/api/sessions/{id}/cancel", app.Server.HandleSessionCancel)
-	mux.HandleFunc("/api/sessions/{id}/board", app.Server.HandleSessionBoard)
-	mux.HandleFunc("/api/sessions/{id}/agents", app.Server.HandleSessionAgents)
-	mux.HandleFunc("/api/sessions/{id}/metrics", app.Server.HandleSessionMetrics)
-	mux.HandleFunc("/api/sessions/{id}/watchdog", app.Server.HandleSessionWatchdog)
-	mux.HandleFunc("/api/sessions/{id}/topic", app.Server.HandleSessionTopic)
-	mux.HandleFunc("/api/sessions/{id}", app.Server.HandleGetSession)
-
-	// DAG 路由：同时注册精确路径与前缀匹配，覆盖 /api/dag 与 /api/dag/*
-	mux.Handle("/api/dag", app.DAGHandler)
-	mux.Handle("/api/dag/", app.DAGHandler)
+	// DAG 路由：调度器未启用时 handler 自行返回 503。
+	app.DAGHandler.RegisterRoutes(api)
 
 	// 通用指标路由：通过 NewAPIHandler 构造，注入 SessionManager
 	apiHandler := server.NewAPIHandler(nil)
 	apiHandler.SetSessionManager(app.Server)
-	mux.HandleFunc("/api/metrics", apiHandler.MetricsHandler)
+	api.GET("/metrics", apiHandler.MetricsHandler)
 
 	// 健康检查端点：固定返回依赖状态，TUI 内部可用于快速自检
-	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"postgres":{"online":true},"redis":{"online":false,"detail":"not configured in TUI"},"llm":{"online":true}}`)
+	api.GET("/health", func(c *gin.Context) {
+		c.Data(http.StatusOK, "application/json",
+			[]byte(`{"postgres":{"online":true},"redis":{"online":false,"detail":"not configured in TUI"},"llm":{"online":true}}`))
 	})
 
 	// 监听 127.0.0.1:0 让内核分配空闲端口，避免与其他进程冲突；
@@ -200,7 +177,7 @@ func main() {
 	// 在独立 goroutine 中服务 HTTP 请求
 	go func() {
 		// 关闭 listener 时的 "use of closed network connection" 是正常退出信号，不当作错误
-		if err := http.Serve(ln, mux); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+		if err := http.Serve(ln, router); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
 			tuiLogger.Error(context.Background(), "http server", err)
 		}
 	}()

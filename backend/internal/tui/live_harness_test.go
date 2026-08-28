@@ -22,9 +22,11 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/gin-gonic/gin"
 	"github.com/mattn/go-runewidth"
 
 	"github.com/blockmemory/agent/backend/internal/bootstrap"
+	"github.com/blockmemory/agent/backend/internal/server"
 )
 
 // liveHarnessRoot 是项目根目录的绝对路径（配置/.env 相对它解析）。
@@ -57,39 +59,19 @@ func TestLiveHarness(t *testing.T) {
 	}
 	defer app.Close()
 
-	// 复刻 cmd/tui 的本地 HTTP 路由（输入栏经 HTTP 访问后端）。
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			app.Server.HandleListSessions(w, r)
-		case http.MethodPost:
-			app.Server.HandleCreateSession(w, r)
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-	mux.HandleFunc("/api/sessions/{id}/stream", app.Server.HandleSessionStream)
-	mux.HandleFunc("/api/sessions/{id}/message", app.Server.HandleSessionMessage)
-	mux.HandleFunc("/api/sessions/{id}/clarify", app.Server.HandleSessionClarify)
-	mux.HandleFunc("/api/sessions/{id}/interrupt", app.Server.HandleSessionInterrupt)
-	mux.HandleFunc("/api/sessions/{id}/enqueue", app.Server.HandleSessionEnqueue)
-	mux.HandleFunc("/api/sessions/{id}/cancel", app.Server.HandleSessionCancel)
-	mux.HandleFunc("/api/sessions/{id}/board", app.Server.HandleSessionBoard)
-	mux.HandleFunc("/api/sessions/{id}/agents", app.Server.HandleSessionAgents)
-	mux.HandleFunc("/api/sessions/{id}/metrics", app.Server.HandleSessionMetrics)
-	mux.HandleFunc("/api/sessions/{id}/watchdog", app.Server.HandleSessionWatchdog)
-	mux.HandleFunc("/api/sessions/{id}/topic", app.Server.HandleSessionTopic)
-	mux.HandleFunc("/api/sessions/{id}", app.Server.HandleGetSession)
-	mux.Handle("/api/dag", app.DAGHandler)
-	mux.Handle("/api/dag/", app.DAGHandler)
+	// 复刻 cmd/tui 的本地 HTTP 路由（输入栏经 HTTP 访问后端，Gin 引擎）。
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	api := router.Group("/api")
+	server.RegisterSessionRoutes(api, app.Server)
+	app.DAGHandler.RegisterRoutes(api)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen 失败: %v", err)
 	}
 	defer ln.Close()
-	go func() { _ = http.Serve(ln, mux) }()
+	go func() { _ = http.Serve(ln, router) }()
 	httpAddr := "http://" + ln.Addr().String()
 
 	modelName := app.RoleConfig.MetaAgent.ModelConfig.Model

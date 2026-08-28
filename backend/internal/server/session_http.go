@@ -2,70 +2,67 @@ package server
 
 import (
 	"context"       // 请求上下文
-	"encoding/json" // JSON 编解码
-	"net/http"      // HTTP 处理器与状态码
+	"net/http"      // HTTP 状态码
 	"time"          // 消息时间戳
+
+	"github.com/gin-gonic/gin" // Gin Web 框架
 
 	"github.com/blockmemory/agent/backend/internal/agent" // Agent 门面
 )
 
 // HandleCreateSession 处理 POST /api/sessions。
 // 职责：解析目标文本，调用 Agent 创建会话，返回会话快照。
-func (m *SessionManager) HandleCreateSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// 解析请求体，仅需要 goal 字段。
+func (m *SessionManager) HandleCreateSession(c *gin.Context) {
+	// 解析请求体：goal 必填；images 可选（首条消息粘贴/上传的图片，与 /message 同规则限流）。
 	req, err := DecodeBody[struct {
-		Goal string `json:"goal"`
-	}](r)
+		Goal   string            `json:"goal"`
+		Images []agent.WireImage `json:"images,omitempty"`
+	}](c.Request)
 	if err != nil {
-		http.Error(w, "请求体无效", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "请求体无效")
 		return
 	}
 	if req.Goal == "" {
-		http.Error(w, "目标 (goal) 不能为空", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "目标 (goal) 不能为空")
 		return
 	}
-
-	// 调用 Agent 创建会话。
-	session, err := m.agent.CreateSession(r.Context(), agent.CreateRequest{Goal: req.Goal})
+	// 用户图片限流（与 /message、TUI 粘贴侧同规则）：超限直接 400。
+	images, err := agent.ParseWireImages(req.Images)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		c.String(http.StatusBadRequest, "%s", err.Error())
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ToServerSession(session))
+	// 调用 Agent 创建会话（images 经 firstTurnImages 注入首轮 runCtx 后一次性消费）。
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images})
+	if err != nil {
+		c.String(http.StatusInternalServerError, "%s", err.Error())
+		return
+	}
+
+	c.JSON(http.StatusOK, ToServerSession(session))
 }
 
 // HandleGetSession 处理 GET /api/sessions/{id}。
 // 职责：按 ID 返回会话快照。
-func (m *SessionManager) HandleGetSession(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
-		return
-	}
+func (m *SessionManager) HandleGetSession(c *gin.Context) {
+	id := c.Param("id")
 
-	session, err := m.agent.Get(r.Context(), id)
+	session, err := m.agent.Get(c.Request.Context(), id)
 	if err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
+		c.String(http.StatusNotFound, "会话不存在")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ToServerSession(session))
+	c.JSON(http.StatusOK, ToServerSession(session))
 }
 
 // HandleListSessions 处理 GET /api/sessions。
 // 职责：列出所有会话。
-func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Request) {
-	sessions, err := m.agent.List(r.Context(), agent.Filter{})
+func (m *SessionManager) HandleListSessions(c *gin.Context) {
+	sessions, err := m.agent.List(c.Request.Context(), agent.Filter{})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
 
@@ -74,32 +71,26 @@ func (m *SessionManager) HandleListSessions(w http.ResponseWriter, r *http.Reque
 		all = append(all, ToServerSession(s))
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(all)
+	c.JSON(http.StatusOK, all)
 }
 
 // HandleSessionBoard 处理 GET /api/sessions/{id}/board。
 // 职责：返回会话的看板（board）数据。
-func (m *SessionManager) HandleSessionBoard(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
+func (m *SessionManager) HandleSessionBoard(c *gin.Context) {
+	id := c.Param("id")
+
+	if _, err := m.agent.Get(c.Request.Context(), id); err != nil {
+		c.String(http.StatusNotFound, "会话不存在")
 		return
 	}
 
-	if _, err := m.agent.Get(r.Context(), id); err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
-		return
-	}
-
-	res, err := m.agent.Query(r.Context(), id, agent.Query{Kind: agent.QueryKindBoard})
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{Kind: agent.QueryKindBoard})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"board":      res.Data,
 	})
@@ -120,16 +111,12 @@ type agentNode struct {
 
 // HandleSessionAgents 处理 GET /api/sessions/{id}/agents。
 // 职责：列出会话中所有 Agent 实例，并补充其所属 Block 的目标与 ID。
-func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
-		return
-	}
+func (m *SessionManager) HandleSessionAgents(c *gin.Context) {
+	id := c.Param("id")
 
-	session, err := m.agent.Get(r.Context(), id)
+	session, err := m.agent.Get(c.Request.Context(), id)
 	if err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
+		c.String(http.StatusNotFound, "会话不存在")
 		return
 	}
 
@@ -141,9 +128,9 @@ func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Requ
 		blockIDByDomain[b.Domain] = b.ID
 	}
 
-	instances, err := m.agent.ListAgents(r.Context(), id)
+	instances, err := m.agent.ListAgents(c.Request.Context(), id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
 
@@ -168,8 +155,7 @@ func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Requ
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"agents":     nodes,
 	})
@@ -177,28 +163,19 @@ func (m *SessionManager) HandleSessionAgents(w http.ResponseWriter, r *http.Requ
 
 // HandleSessionTopic 处理 POST /api/sessions/{id}/topic。
 // 职责：切换/创建话题；非运行中会话会创建新会话来延续话题。
-func (m *SessionManager) HandleSessionTopic(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
-		return
-	}
-
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
-		return
-	}
+func (m *SessionManager) HandleSessionTopic(c *gin.Context) {
+	id := c.Param("id")
 
 	req, err := DecodeBody[struct {
 		Name string `json:"name"`
 		Goal string `json:"goal,omitempty"`
-	}](r)
+	}](c.Request)
 	if err != nil {
-		http.Error(w, "请求体无效", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "请求体无效")
 		return
 	}
 	if req.Name == "" {
-		http.Error(w, "话题名称 (name) 不能为空", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "话题名称 (name) 不能为空")
 		return
 	}
 
@@ -210,10 +187,10 @@ func (m *SessionManager) HandleSessionTopic(w http.ResponseWriter, r *http.Reque
 	var switched *agent.Session
 	var topicErr error
 	if ts, ok := m.agent.(topicSwitcher); ok {
-		switched, topicErr = ts.SwitchTopic(r.Context(), id, req.Name, req.Goal)
+		switched, topicErr = ts.SwitchTopic(c.Request.Context(), id, req.Name, req.Goal)
 	} else {
 		// 回退到通用 Control 命令。
-		topicErr = m.agent.Control(r.Context(), id, agent.ControlCommand{
+		topicErr = m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
 			Op: agent.ControlOpTopic,
 			Args: map[string]any{
 				"name": req.Name,
@@ -223,89 +200,69 @@ func (m *SessionManager) HandleSessionTopic(w http.ResponseWriter, r *http.Reque
 	}
 	if topicErr != nil {
 		msg, status := agentErrorStatus(topicErr)
-		http.Error(w, msg, status)
+		c.String(status, "%s", msg)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	if switched != nil && switched.ID != id {
 		// 非运行中会话：已创建新会话来延续该话题。
-		json.NewEncoder(w).Encode(ToServerSession(switched))
+		c.JSON(http.StatusOK, ToServerSession(switched))
 	} else {
-		json.NewEncoder(w).Encode(map[string]any{"session_id": id, "status": "running", "topic": req.Name})
+		c.JSON(http.StatusOK, map[string]any{"session_id": id, "status": "running", "topic": req.Name})
 	}
 }
 
 // HandleSessionMessage 处理 POST /api/sessions/{id}/message。
 // 职责：向会话发送用户消息，并返回最新会话快照。
-func (m *SessionManager) HandleSessionMessage(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
-		return
-	}
-
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
-		return
-	}
+func (m *SessionManager) HandleSessionMessage(c *gin.Context) {
+	id := c.Param("id")
 
 	req, err := DecodeBody[struct {
 		Content string            `json:"content"`
 		Images  []agent.WireImage `json:"images,omitempty"`
-	}](r)
+	}](c.Request)
 	if err != nil {
-		http.Error(w, "请求体无效", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "请求体无效")
 		return
 	}
 	if req.Content == "" {
-		http.Error(w, "内容不能为空", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "内容不能为空")
 		return
 	}
 	// 用户图片限流（与 TUI 粘贴侧同规则）：超限直接 400，防御直连 API 的调用方。
 	images, err := agent.ParseWireImages(req.Images)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "%s", err.Error())
 		return
 	}
 
-	if err := m.agent.Send(r.Context(), id, agent.Message{Content: req.Content, Images: images, Timestamp: time.Now()}); err != nil {
+	if err := m.agent.Send(c.Request.Context(), id, agent.Message{Content: req.Content, Images: images, Timestamp: time.Now()}); err != nil {
 		msg, status := agentErrorStatus(err)
-		http.Error(w, msg, status)
+		c.String(status, "%s", msg)
 		return
 	}
 
-	session, err := m.agent.Get(r.Context(), id)
+	session, err := m.agent.Get(c.Request.Context(), id)
 	if err != nil {
 		msg, status := agentErrorStatus(err)
-		http.Error(w, msg, status)
+		c.String(status, "%s", msg)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ToServerSession(session))
+	c.JSON(http.StatusOK, ToServerSession(session))
 }
 
 // HandleSessionTree 处理 GET /api/sessions/{id}/tree。
 // 职责：返回会话的权威 Agent 树快照，按启动时间升序。
-func (m *SessionManager) HandleSessionTree(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
-		return
-	}
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
-		return
-	}
-	nodes, err := m.agent.Tree(r.Context(), id)
+func (m *SessionManager) HandleSessionTree(c *gin.Context) {
+	id := c.Param("id")
+	nodes, err := m.agent.Tree(c.Request.Context(), id)
 	if err != nil {
 		msg, status := agentErrorStatus(err)
-		http.Error(w, msg, status)
+		c.String(status, "%s", msg)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"tree":       nodes,
 	})
@@ -313,28 +270,19 @@ func (m *SessionManager) HandleSessionTree(w http.ResponseWriter, r *http.Reques
 
 // HandleSessionAgentCancel 处理 POST /api/sessions/{id}/agents/{aid}/cancel。
 // 职责：取消指定子 Agent 实例，调用其绑定的 cancel func。
-func (m *SessionManager) HandleSessionAgentCancel(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "方法不被允许", http.StatusMethodNotAllowed)
-		return
-	}
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
-		return
-	}
-	instID := r.PathValue("aid")
+func (m *SessionManager) HandleSessionAgentCancel(c *gin.Context) {
+	id := c.Param("id")
+	instID := c.Param("aid")
 	if instID == "" {
-		http.Error(w, "缺少 Agent 实例 ID", http.StatusBadRequest)
+		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
 		return
 	}
-	if err := m.agent.CancelAgent(r.Context(), id, instID); err != nil {
+	if err := m.agent.CancelAgent(c.Request.Context(), id, instID); err != nil {
 		msg, status := agentErrorStatus(err)
-		http.Error(w, msg, status)
+		c.String(status, "%s", msg)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"agent_id":   instID,
 		"status":     "cancelled",

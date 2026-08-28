@@ -3,8 +3,10 @@ package server
 import (
 	"encoding/json" // 会话快照与事件的 JSON 序列化
 	"fmt"           // SSE 帧格式化输出
-	"net/http"      // HTTP 处理器与状态码
+	"net/http"      // HTTP 状态码与 Flusher
 	"time"          // 轮询 ticker 与时间戳
+
+	"github.com/gin-gonic/gin" // Gin Web 框架
 
 	"github.com/blockmemory/agent/backend/pkg/enums" // 会话状态枚举
 	"github.com/blockmemory/agent/backend/pkg/types" // ClarifyOption（awaiting_clarify 帧结构化选项）
@@ -13,21 +15,18 @@ import (
 // HandleSessionStream 处理 GET /api/sessions/{id}/stream。
 // 职责：建立 Server-Sent Events 长连接，周期性推送会话最新快照与新增事件，
 // 直到会话结束或客户端断开。
-func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
-		return
-	}
+func (m *SessionManager) HandleSessionStream(c *gin.Context) {
+	id := c.Param("id")
 
 	// 先获取一次会话，确认存在；同时用于计算初始事件偏移。
-	session, err := m.agent.Get(r.Context(), id)
+	session, err := m.agent.Get(c.Request.Context(), id)
 	if err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
+		c.String(http.StatusNotFound, "会话不存在")
 		return
 	}
 
 	// 设置 SSE 响应头。
+	w := c.Writer
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -35,13 +34,14 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 
 	// SSE 是长连接：清除 server 级 WriteTimeout 对本连接设置的写截止时间，
 	// 避免长任务下连接在 WriteTimeout（默认 30s）后被强制断开。
-	// 客户端断开仍由 r.Context().Done() 感知，不受影响。
+	// gin 的 responseWriter 实现了 Unwrap()，NewResponseController 可穿透到底层
+	// ResponseWriter；客户端断开仍由 r.Context().Done() 感知，不受影响。
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 
 	// 断言 http.Flusher，不支持流式则返回 500。
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "不支持流式输出", http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "不支持流式输出")
 		return
 	}
 
@@ -61,7 +61,7 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 		select {
 		case <-ticker.C:
 			// 重新拉取会话。
-			session, err := m.agent.Get(r.Context(), id)
+			session, err := m.agent.Get(c.Request.Context(), id)
 			if err != nil {
 				return
 			}
@@ -98,10 +98,10 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 					multi = pc.MultiSelect
 				}
 				frame := map[string]any{
-					"type":        "awaiting_clarify",
-					"status":      string(snapshot.Status),
-					"question":    pending,
-					"question_id": qid,
+					"type":         "awaiting_clarify",
+					"status":       string(snapshot.Status),
+					"question":     pending,
+					"question_id":  qid,
 					"multi_select": multi,
 				}
 				if len(opts) > 0 {
@@ -120,7 +120,7 @@ func (m *SessionManager) HandleSessionStream(w http.ResponseWriter, r *http.Requ
 				return
 			}
 
-		case <-r.Context().Done():
+		case <-c.Request.Context().Done():
 			// 客户端断开或请求被取消。
 			return
 		}

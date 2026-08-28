@@ -1,4 +1,16 @@
-export type SessionStatus = 'running' | 'completed' | 'error' | 'awaiting_clarify'
+export type SessionStatus =
+  | 'running'
+  | 'completed'
+  | 'error'
+  | 'awaiting_clarify'
+  | 'paused_on_child'
+
+/** 用户消息图片的 HTTP 线型（与后端 agent.WireImage 对齐）。
+ *  data 为 base64 编码内容（不带 data: 前缀）；后端 Go []byte JSON 编解码即 base64。 */
+export interface WireImage {
+  mime_type: string
+  data: string
+}
 
 /** 待澄清问题的选项（来自 SSE awaiting_clarify 帧） */
 export interface ClarifyOption {
@@ -20,6 +32,8 @@ export interface Session {
   result?: string
   started_at: string
   ended_at?: string
+  /** 软停止销毁倒计时截止时间（TODO #37）：软停止后非空，续跑/到期后清空。 */
+  destroy_at?: string | null
   events: SessionEvent[]
   messages: ChatMessage[]
 }

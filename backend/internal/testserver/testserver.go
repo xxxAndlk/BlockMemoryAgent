@@ -1,5 +1,5 @@
 // Package testserver 封装了原本位于 main.go 的后端装配逻辑，
-// 使生产二进制与集成测试都能以进程内方式启动相同的 HTTP mux。
+// 使生产二进制与集成测试都能以进程内方式启动相同的 Gin 路由引擎。
 // 它把实际依赖构造委托给 internal/bootstrap，并通过 Deps 暴露真实依赖，
 // 方便测试在 HTTP 之外直接访问 store、session manager、runtime 等对象。
 package testserver
@@ -7,8 +7,9 @@ package testserver
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
+
+	"github.com/gin-gonic/gin" // Gin Web 框架
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/bootstrap"
@@ -50,7 +51,7 @@ type Deps struct {
 	DAGHandler     *server.DAGHandler        // DAG HTTP 处理器
 }
 
-// BuildHandler 通过委托 bootstrap.Build 装配后端，并返回根 mux、
+// BuildHandler 通过委托 bootstrap.Build 装配后端，并返回根 Gin 引擎、
 // 实时依赖对象以及清理函数。调用方负责 ctx 的取消；返回的 cleanup
 // 函数会关闭 stores，应由调用方通过 defer 调用。
 //
@@ -63,11 +64,11 @@ type Deps struct {
 //   - skillPath: 技能文件路径。
 //
 // 返回：
-//   - *http.ServeMux: 装配完成的 HTTP 路由复用器。
+//   - *gin.Engine: 装配完成的 Gin 路由引擎（实现 http.Handler）。
 //   - *Deps: 真实后端依赖集合。
 //   - func(): 清理函数，调用后释放资源。
 //   - error: 初始化错误，成功时为 nil。
-func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, skillPath string) (*http.ServeMux, *Deps, func(), error) {
+func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, skillPath string) (*gin.Engine, *Deps, func(), error) {
 	// 严格启动：任意配置文件不存在即失败，明确告知缺失项。
 	for path, name := range map[string]string{
 		cfgPath:   "config file",
@@ -88,12 +89,12 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 
 	// 委托 bootstrap.Build 完成完整的后端依赖装配。
 	app, err := bootstrap.Build(ctx, bootstrap.ConfigPaths{
-		ConfigPath: cfgPath,
-		RolePath:   rolePath,
-		EnvPath:    envPath,
-		SoulPath:   soulPath,
+		ConfigPath:  cfgPath,
+		RolePath:    rolePath,
+		EnvPath:     envPath,
+		SoulPath:    soulPath,
 		ProfilePath: "config/user_profile.md",
-		SkillPath:  skillPath,
+		SkillPath:   skillPath,
 	})
 	if err != nil {
 		// 装配失败时直接透传错误；此时资源已由 bootstrap.Build 自行清理。
@@ -120,7 +121,7 @@ func BuildHandler(ctx context.Context, cfgPath, rolePath, envPath, soulPath, ski
 		_ = app.Close()
 	}
 
-	// 使用 bootstrap.NewDefaultMux 挂载全部 API 路由。
-	mux := bootstrap.NewDefaultMux(app)
-	return mux, deps, cleanup, nil
+	// 使用 bootstrap.NewDefaultRouter 挂载全部 API 路由（Gin 引擎）。
+	router := bootstrap.NewDefaultRouter(app)
+	return router, deps, cleanup, nil
 }

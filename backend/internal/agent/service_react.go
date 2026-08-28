@@ -877,6 +877,22 @@ func (s *ReactService) Query(ctx context.Context, sessionID string, q Query) (Re
 		limit, _ := q.Args["limit"].(int)
 		offset, _ := q.Args["offset"].(int)
 		return Result{Data: s.store.queryLogs(ctx, sessionID, agent, level, limit, offset)}, nil
+	case QueryKindBoard:
+		// 会话任务看板：write_plan 权威快照优先，回退权威树合成（query_react.go）。
+		return s.boardQueryResult(ctx, sessionID), nil
+	case QueryKindMetrics:
+		// 会话级 LLM 指标聚合（调用/超时/耗时/token）。
+		return s.metricsQueryResult(ctx, sessionID), nil
+	case QueryKindMailbox:
+		// 会话权威树全部 Agent 实例的未取走邮箱消息。
+		return s.mailboxQueryResult(ctx, sessionID), nil
+	case QueryKindWatchdog:
+		// watchdog 组件已随 runtime 步骤 6 退役（无决策产生方），
+		// 返回空决策列表保持端点兼容。
+		return Result{Data: []any{}}, nil
+	case QueryKindTokenMetrics:
+		// 按 agent|model 聚合的 token 消耗（HTTP 线型）。
+		return s.tokenMetricsQueryResult(ctx, sessionID), nil
 	default:
 		// 未知查询类型返回空结果。
 		return Result{}, nil

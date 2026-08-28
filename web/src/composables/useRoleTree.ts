@@ -19,15 +19,34 @@ export function useRoleTree(agents: MaybeRef<AgentNode[]>) {
     const map = new Map<string, RoleTreeNode>()
 
     list.forEach((a) => {
+      // 热驻（Idle）节点不在编排树展示（任务 114 对齐 TUI）：任务完结转 Idle 待复用，
+      // 复用清单只供 MetaAgent 注入，对用户是噪音。
+      if (a.status === 'idle') return
       const node: RoleTreeNode = {
         label: a.name,
         status: a.status,
         statusType:
-          a.status === 'active' ? 'success' : a.status === 'running' ? 'warning' : 'info',
+          a.status === 'active'
+            ? 'success'
+            : a.status === 'running'
+              ? 'warning'
+              : a.status === 'delivered-unverified'
+                ? 'warning'
+                : a.status === 'failed'
+                  ? 'danger'
+                  : 'info',
         active: a.status === 'active' || a.status === 'running',
         isUser: a.type === 'domain' || a.type === 'subdomain',
         iconColor:
-          a.status === 'active' ? 'text-green-500' : a.status === 'running' ? 'text-yellow-500' : 'text-gray-500',
+          a.status === 'active'
+            ? 'text-green-500'
+            : a.status === 'running'
+              ? 'text-yellow-500'
+              : a.status === 'delivered-unverified'
+                ? 'text-yellow-500'
+                : a.status === 'failed'
+                  ? 'text-red-500'
+                  : 'text-gray-500',
         children: [],
       }
       map.set(a.inst_id, node)

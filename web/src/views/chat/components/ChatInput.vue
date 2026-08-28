@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { ElMessage } from 'element-plus'
+import type { WireImage } from '@/types'
 
 const props = defineProps<{
   loading?: boolean
@@ -11,13 +13,21 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'submit', content: string): void
+  (e: 'submit', content: string, images: WireImage[]): void
   (e: 'update:verbose', val: boolean): void
   (e: 'update:memoryEnabled', val: boolean): void
   (e: 'new-session'): void
 }>()
 
 const content = ref('')
+
+// 待发送图片（任务 111 Web 侧同步）：顺序与 [image:N] 占位符编号升序对齐
+// （顺序对齐非解析对齐，与 TUI 同策略）。base64 不带 data: 前缀。
+const pendingImages = ref<WireImage[]>([])
+// 与后端 agent.ParseWireImages 同规则：最多 4 张、单张解码后 ≤4MiB。
+const MAX_IMAGES = 4
+const MAX_IMAGE_BYTES = 4 << 20
+const MIME_WHITELIST = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
 
 const quickTags = [
   '展开方案细节',
@@ -28,7 +38,7 @@ const quickTags = [
   '总结要点',
 ]
 
-const canSend = computed(() => content.value.trim().length > 0 && !props.loading)
+const canSend = computed(() => (content.value.trim().length > 0 || pendingImages.value.length > 0) && !props.loading)
 
 // token 数值格式化：≥1000 显示为 1.2k，否则原样显示。
 function fmtTokens(n: number): string {
@@ -43,10 +53,91 @@ const tokenLabel = computed(() => {
   return `↑ ${fmtTokens(input)}  ↓ ${fmtTokens(output)}`
 })
 
+// 把图片加入待发送列表并在光标处插入 [image:N] 占位符。
+async function addImageFiles(files: File[]) {
+  for (const f of files) {
+    if (!MIME_WHITELIST.includes(f.type)) {
+      ElMessage.warning(`不支持的图片格式 ${f.type || '(未知)'}，仅支持 png/jpeg/gif/webp`)
+      continue
+    }
+    if (f.size > MAX_IMAGE_BYTES) {
+      ElMessage.warning('单张图片超过大小上限（4MiB）')
+      continue
+    }
+    if (pendingImages.value.length >= MAX_IMAGES) {
+      ElMessage.warning(`单条消息最多携带 ${MAX_IMAGES} 张图片`)
+      break
+    }
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(reader.result as string)
+      reader.onerror = () => reject(reader.error)
+      reader.readAsDataURL(f)
+    })
+    // dataURL 形如 data:image/png;base64,xxxx —— 剥前缀取纯 base64。
+    const base64 = dataUrl.split(',', 2)[1] || ''
+    if (!base64) continue
+    pendingImages.value.push({ mime_type: f.type, data: base64 })
+    insertPlaceholder(`[image:${pendingImages.value.length}]`)
+  }
+}
+
+// 在 textarea 光标处插入占位符文本。
+function insertPlaceholder(text: string) {
+  const el = textareaRef.value?.textarea as HTMLTextAreaElement | undefined
+  if (!el || el.selectionStart == null) {
+    content.value += text
+    return
+  }
+  const start = el.selectionStart
+  const end = el.selectionEnd
+  content.value = content.value.slice(0, start) + text + content.value.slice(end)
+}
+
+// 粘贴剪贴板图片（对齐 TUI Alt+V 的粘贴入口）。
+function onPaste(e: ClipboardEvent) {
+  const files: File[] = []
+  for (const item of e.clipboardData?.items || []) {
+    if (item.kind === 'file' && item.type.startsWith('image/')) {
+      const f = item.getAsFile()
+      if (f) files.push(f)
+    }
+  }
+  if (files.length) {
+    e.preventDefault() // 阻止把图片当文件名文本插入
+    addImageFiles(files)
+  }
+}
+
+// 预览图缩略 data URL（img src 直接可用）。
+function previewUrl(img: WireImage) {
+  return `data:${img.mime_type};base64,${img.data}`
+}
+
+function removeImage(idx: number) {
+  // 移除预览图；已插入的占位符文本不回收（与 TUI 手删占位符不移除图片本体
+  // 同一容忍策略：外观错位可接受，编号不重排以保持与已插占位符一致）。
+  pendingImages.value.splice(idx, 1)
+}
+
+function pickFiles() {
+  fileRef.value?.click()
+}
+
+function onFileChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  if (input.files?.length) addImageFiles(Array.from(input.files))
+  input.value = '' // 允许重复选择同一文件
+}
+
+const textareaRef = ref()
+const fileRef = ref<HTMLInputElement>()
+
 function handleSubmit() {
   if (!canSend.value) return
-  emit('submit', content.value.trim())
+  emit('submit', content.value.trim(), pendingImages.value.slice())
   content.value = ''
+  pendingImages.value = []
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -117,24 +208,46 @@ const memoryModel = computed({
       </el-tag>
     </div>
 
+    <!-- 待发送图片预览（可移除） -->
+    <div v-if="pendingImages.length" class="flex gap-2 mb-2 flex-wrap">
+      <div v-for="(img, i) in pendingImages" :key="i"
+           class="relative w-14 h-14 rounded border border-[#2a2d35] overflow-hidden group">
+        <img :src="previewUrl(img)" class="w-full h-full object-cover" alt="待发送图片" />
+        <button @click="removeImage(i)"
+                class="absolute inset-0 hidden group-hover:flex items-center justify-center bg-black/60 text-red-400 text-xs">
+          移除
+        </button>
+      </div>
+    </div>
+
     <!-- 输入区 -->
     <div class="flex gap-2 items-end">
       <div class="flex-1 chat-input">
-        <el-input v-model="content"
+        <el-input ref="textareaRef" v-model="content"
                   type="textarea"
                   :autosize="{ minRows: 2, maxRows: 6 }"
-                  placeholder="向 AI 下达命令…（Ctrl/Cmd + Enter 发送）"
+                  placeholder="向 AI 下达命令…（Ctrl/Cmd + Enter 发送，可直接粘贴图片）"
                   resize="none"
-                  @keydown="onKeydown" />
+                  @keydown="onKeydown"
+                  @paste="onPaste" />
       </div>
-      <el-button type="primary"
-                 :loading="loading"
-                 :disabled="!canSend"
-                 class="!bg-blue-600 !border-blue-600 hover:!bg-blue-500 h-[68px]! w-24"
-                 @click="handleSubmit">
-        <el-icon class="mr-1"><Promotion /></el-icon> 发送
-        <span class="sr-only">{{ tokenLabel }}</span>
-      </el-button>
+      <div class="flex flex-col gap-1">
+        <el-button :disabled="pendingImages.length >= 4" plain size="small"
+                   class="!bg-transparent !border-[#2a2d35] !text-gray-400 hover:!text-white"
+                   title="添加图片（或直接粘贴截图）"
+                   @click="pickFiles">
+          <el-icon><Picture /></el-icon>
+        </el-button>
+        <el-button type="primary"
+                   :loading="loading"
+                   :disabled="!canSend"
+                   class="!bg-blue-600 !border-blue-600 hover:!bg-blue-500"
+                   @click="handleSubmit">
+          <el-icon class="mr-1"><Promotion /></el-icon> 发送
+          <span class="sr-only">{{ tokenLabel }}</span>
+        </el-button>
+      </div>
+      <input ref="fileRef" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple class="hidden" @change="onFileChange" />
     </div>
   </div>
 </template>
@@ -150,5 +263,8 @@ const memoryModel = computed({
 }
 :deep(.chat-input .el-textarea__inner:focus) {
   border-color: #3b82f6;
+}
+.hidden {
+  display: none;
 }
 </style>

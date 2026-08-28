@@ -7,10 +7,8 @@ import {
   getSession,
   getSessionBoard,
   getSessionAgents,
-  getSessionWatchdog,
   getSessionMailbox,
   getSessionLogs,
-  type WatchdogDecision,
   type MailboxMessage,
   type SessionLog,
 } from '@/api/session'
@@ -27,12 +25,10 @@ import { useRoleTree } from '@/composables/useRoleTree'
 import { useTaskBoard } from '@/composables/useTaskBoard'
 import { useSessionList } from '@/composables/useSessionList'
 import ExecutionLog from './components/ExecutionLog.vue'
-import MemoryExplorer from './components/MemoryExplorer.vue'
 import SkillSet from './components/SkillSet.vue'
 import FilePreview from './components/FilePreview.vue'
 import MetricsCard from './components/MetricsCard.vue'
 import TokenMetricsCard from './components/TokenMetricsCard.vue'
-import WatchdogCard from './components/WatchdogCard.vue'
 import MailboxCard from './components/MailboxCard.vue'
 import HealthCard from './components/HealthCard.vue'
 import SessionLogsPanel from './components/SessionLogsPanel.vue'
@@ -52,7 +48,6 @@ const { roleTree, defaultProps } = useRoleTree(agents)
 const { tasks, constraints, taskProgress: progress } = useTaskBoard(board)
 
 const metrics = ref<SessionMetrics | null>(null)
-const watchdogDecisions = ref<WatchdogDecision[]>([])
 const mailboxMessages = ref<MailboxMessage[]>([])
 const health = ref<HealthResponse | null>(null)
 
@@ -104,11 +99,10 @@ async function selectSession(s: Session) {
 }
 
 async function loadSessionPanels(sessionID: string) {
-  const [boardRes, agentRes, metricsRes, wdRes, mbRes, healthRes] = await Promise.allSettled([
+  const [boardRes, agentRes, metricsRes, mbRes, healthRes] = await Promise.allSettled([
     panel.run(() => getSessionBoard(sessionID)),
     panel.run(() => getSessionAgents(sessionID)),
     panel.run(() => getSessionMetrics(sessionID)),
-    panel.run(() => getSessionWatchdog(sessionID)),
     panel.run(() => getSessionMailbox(sessionID)),
     panel.run(() => getHealth()),
   ])
@@ -116,7 +110,6 @@ async function loadSessionPanels(sessionID: string) {
   board.value = boardRes.status === 'fulfilled' && boardRes.value ? boardRes.value.board || null : null
   agents.value = agentRes.status === 'fulfilled' && agentRes.value ? agentRes.value.agents || [] : []
   metrics.value = metricsRes.status === 'fulfilled' && metricsRes.value ? metricsRes.value : null
-  watchdogDecisions.value = wdRes.status === 'fulfilled' && wdRes.value ? wdRes.value.decisions || [] : []
   mailboxMessages.value = mbRes.status === 'fulfilled' && mbRes.value ? mbRes.value.messages || [] : []
   health.value = healthRes.status === 'fulfilled' && healthRes.value ? healthRes.value : null
 
@@ -192,8 +185,8 @@ function startStream(s: Session) {
                 <span :class="{'text-gray-200': data.active, 'text-gray-500': !data.active}">{{ node.label }}</span>
               </span>
               <el-tag v-if="data.status" :type="data.statusType" size="small" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-90 origin-right"
-                       :class="{'!text-green-500': data.status==='active', '!text-yellow-500': data.status==='running', '!text-gray-500': data.status==='pending'}"
-              >{{ data.status }}</el-tag>
+                       :class="{'!text-green-500': data.status==='active' || data.status==='done', '!text-yellow-500': data.status==='running' || data.status==='delivered-unverified', '!text-red-500': data.status==='failed', '!text-gray-500': data.status==='pending'}"
+              >{{ data.status === 'delivered-unverified' ? '已交付未验证' : data.status }}</el-tag>
             </div>
           </template>
         </el-tree>
@@ -237,9 +230,11 @@ function startStream(s: Session) {
               <div class="w-20 text-right flex items-center justify-end gap-1">
                 <el-icon v-if="task.status === 'done' || task.status === 'completed'" class="text-green-500"><Check /></el-icon>
                 <el-icon v-else-if="task.status === 'in_progress' || task.status === 'running'" class="text-blue-500 is-loading"><Loading /></el-icon>
+                <el-icon v-else-if="task.status === 'delivered-unverified'" class="text-yellow-500"><Warning /></el-icon>
+                <el-icon v-else-if="task.status === 'failed'" class="text-red-500"><CircleCloseFilled /></el-icon>
                 <el-icon v-else-if="task.status === 'blocked'" class="text-yellow-500"><Warning /></el-icon>
                 <el-icon v-else class="text-gray-600"><Clock /></el-icon>
-                <span :class="{'text-green-500': task.status==='done'||task.status==='completed', 'text-blue-500': task.status==='in_progress'||task.status==='running', 'text-yellow-500': task.status==='blocked', 'text-gray-500': task.status==='pending'}">{{ task.status }}</span>
+                <span :class="{'text-green-500': task.status==='done'||task.status==='completed', 'text-blue-500': task.status==='in_progress'||task.status==='running', 'text-yellow-500': task.status==='delivered-unverified'||task.status==='blocked', 'text-red-500': task.status==='failed', 'text-gray-500': task.status==='pending'}">{{ task.status === 'delivered-unverified' ? '已交付未验证' : task.status }}</span>
               </div>
             </div>
           </div>
@@ -265,10 +260,6 @@ function startStream(s: Session) {
         >
           <el-icon class="mr-1"><Document /></el-icon> 执行日志
         </span>
-        <span @click="activeTab = 'memory'" :class="activeTab === 'memory' ? 'text-blue-400 font-bold border-b-2 border-blue-500 pb-[2px]' : 'text-gray-400 hover:text-gray-200'" class="flex items-center h-full cursor-pointer"
-        >
-          <el-icon class="mr-1"><List /></el-icon> 记忆浏览器
-        </span>
         <span @click="activeTab = 'skill'" :class="activeTab === 'skill' ? 'text-blue-400 font-bold border-b-2 border-blue-500 pb-[2px]' : 'text-gray-400 hover:text-gray-200'" class="flex items-center h-full cursor-pointer"
         >
           <el-icon class="mr-1"><Connection /></el-icon> Skill 装配
@@ -285,7 +276,6 @@ function startStream(s: Session) {
 
       <div class="flex-1 overflow-hidden relative flex flex-col">
         <ExecutionLog v-if="activeTab === 'log'" :events="activeSession?.events || []" />
-        <MemoryExplorer v-if="activeTab === 'memory'" :session-id="activeSession?.id || ''" :agents="agents" />
         <SkillSet v-if="activeTab === 'skill'" :agents="agents" />
         <FilePreview v-if="activeTab === 'file'" :session-id="activeSession?.id || ''" :agents="agents" />
         <SessionLogsPanel
@@ -302,7 +292,6 @@ function startStream(s: Session) {
     <!-- Right: Metrics & Health -->
     <div class="w-[320px] flex flex-col gap-4 overflow-y-auto shrink-0 pl-1">
       <MetricsCard :metrics="metrics" />
-      <WatchdogCard :decisions="watchdogDecisions" />
       <TokenMetricsCard :token-metrics="tokenMetrics" />
       <MailboxCard :messages="mailboxMessages" />
       <HealthCard :health="health" />

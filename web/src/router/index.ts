@@ -26,6 +26,12 @@ const routes: Array<RouteRecordRaw> = [
         meta: { title: '会话监控', icon: 'Monitor' }
       },
       {
+        path: 'plugins',
+        name: 'Plugins',
+        component: () => import('@/views/plugins/index.vue'),
+        meta: { title: '插件管理', icon: 'MagicStick' }
+      },
+      {
         path: 'knowledge',
         name: 'Knowledge',
         component: () => import('@/views/knowledge/index.vue'),
