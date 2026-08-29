@@ -44,9 +44,13 @@ type LLMRuntimeConfig struct {
 	ReactLLMTimeoutSec          int `yaml:"react_llm_timeout_sec"`           // ReAct 单次 LLM 调用超时（秒，默认 300；负数表示仅受会话取消控制）
 	SubAgentTimeoutMin          int `yaml:"sub_agent_timeout_min"`           // 子 Agent 独立执行超时（分钟，默认 30；负数表示不限制）
 	SubAgentHeartbeatTimeoutMin int `yaml:"sub_agent_heartbeat_timeout_min"` // 子 Agent 心跳超时（分钟，默认 5；<=0 关闭巡检，仅靠 sub_agent_timeout 兜底）
-	HistoryMaxMessages          int `yaml:"history_max_messages"`            // 单次 LLM 请求携带的最大历史消息数（默认 40，滑动窗口防 token 爆炸；负数表示不裁剪）
+	HistoryMaxMessages          int `yaml:"history_max_messages"`            // 单次 LLM 请求携带的最大历史消息数（默认 400，滑动窗口兜底防 API 上下文溢出；负数表示不裁剪）
 	ToolOutputHistoryMaxRunes   int `yaml:"tool_output_history_max_runes"`   // 写入历史的单条工具输出最大字符数（默认 2000；负数表示不截断）
-	SummarizeEvery              int `yaml:"summarize_every"`                 // 每 N 步触发一次历史压缩（默认 10；<=0 关闭压缩，仅用滑动窗口）
+	// SummarizeEvery 退役字段（原步频压缩扳机：每 N 步强制压缩一次）。实测步数扳机与上下文
+	// 实际大小脱钩，致 Agent 每 10 步强制失忆、反复重读文件；压缩已改为仅由 token 阈值
+	// （ContextTokenBudget/TokenBudgetPerRole，默认 150K）驱动。保留解析不破坏旧配置加载，
+	// 不再驱动任何逻辑（同 TokenBudgetPerGoal 退役先例）。
+	SummarizeEvery              int `yaml:"summarize_every"`
 	SummarizeKeepRecent         int `yaml:"summarize_keep_recent"`           // 压缩时保留最近 K 条原始消息（默认 15；<=0 视为 15。2026-08-21 由 10 上调：场景装配 Agent 压缩后丢工具结果细节被迫重读文件，多留 5 条原始消息换少一轮重侦察）
 	SummarizeMaxBundles         int `yaml:"summarize_max_bundles"`           // 层级压缩包数量上限（默认 20）：每次压缩触发产生一个结构化压缩包，超限把最老的一半合并为 1 个更粗的包，循环往复保留远期上下文
 	SummarizeTimeoutSec         int `yaml:"summarize_timeout_sec"`           // 事件摘要轻量模型调用超时（秒，默认 120）。旧硬编码 5s 对思考型模型必然超时，摘要全挂降级 raw join，上下文全量回注致 token 预算提前耗尽（实证 verify 子 Agent 300K 预算 7 分钟烧穿）
@@ -453,13 +457,13 @@ func (c *Config) applyLLMRuntimeDefaults() {
 		c.Agent.SubAgentHeartbeatTimeoutMin = 5
 	}
 	if c.Agent.HistoryMaxMessages == 0 {
-		c.Agent.HistoryMaxMessages = 40
+		// 默认 400：窗口只做兜底防爆（防 API 上下文溢出），真正的约束是 150K token 阈值
+		// （压缩先于窗口动手）；步频压缩退役后 40/48 这类小窗口会抢在阈值前裁剪，
+		// 成为新的隐性失忆点。
+		c.Agent.HistoryMaxMessages = 400
 	}
 	if c.Agent.ToolOutputHistoryMaxRunes == 0 {
 		c.Agent.ToolOutputHistoryMaxRunes = 2000
-	}
-	if c.Agent.SummarizeEvery == 0 {
-		c.Agent.SummarizeEvery = 10
 	}
 	if c.Agent.SummarizeKeepRecent == 0 {
 		c.Agent.SummarizeKeepRecent = 15

@@ -229,6 +229,47 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs }) {
   };
 }
 
+// generateImageBatch 批量生成：对 prompts 数组顺序串行逐张调用 generateImage
+//（daemon 一 prompt 一 task 单任务语义，桥内不并发，避免打爆上游配额）；
+// 单张失败不中断整批，结果逐项标注 path 或 error，由 Agent 决定重试/降级。
+async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAsList }) {
+  if (!OD_API_TOKEN) {
+    throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
+  }
+  if (!Array.isArray(prompts) || prompts.length === 0) {
+    throw new Error('prompts 为空数组：批量模式至少提供 1 个 prompt');
+  }
+  if (saveAsList !== undefined && saveAsList.length !== prompts.length) {
+    throw new Error(`save_as_list 长度（${saveAsList.length}）须与 prompts（${prompts.length}）等长`);
+  }
+  const startedAtMs = Date.now();
+  const results = [];
+  for (let i = 0; i < prompts.length; i++) {
+    const prompt = prompts[i];
+    // save_as_list 元素为空串 = 该项走默认 .bma/od-artifacts 命名。
+    const saveAs = saveAsList?.[i] || undefined;
+    try {
+      const r = await generateImage({ prompt, aspect, model, save_as: saveAs });
+      results.push({ index: i, prompt, path: r.path, filename: r.filename, bytes: r.bytes });
+      log(`批量进度 ${i + 1}/${prompts.length} 完成:`, r.path);
+    } catch (err) {
+      log(`批量进度 ${i + 1}/${prompts.length} 失败:`, err.message);
+      results.push({ index: i, prompt, error: err.message });
+    }
+  }
+  const succeeded = results.filter((r) => r.path).length;
+  return {
+    total: prompts.length,
+    succeeded,
+    failed: prompts.length - succeeded,
+    model: model || OD_DEFAULT_MODEL,
+    aspect: aspect || null,
+    elapsedSec: Math.round((Date.now() - startedAtMs) / 1000),
+    results,
+    hint: '在 HTML/CSS/JS 中以各项结果的相对路径（path 字段）引用图片；带 error 的项需换 prompt 重试或人工处理',
+  };
+}
+
 async function listImages({ limit }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
@@ -254,21 +295,44 @@ server.registerTool('od_image_generate', {
   title: 'Open Design 图像生成',
   description:
     '经本地 open_design 守护进程生成图片（默认火山方舟 Seedream）。' +
-    '正式素材务必用 save_as 指定工作目录相对路径（如 assets/img/mon-zombie.png），图片直落该路径、' +
-    '一图一份，结果 path 字段即可在 HTML/CSS/JS 中直接引用；禁止事后再复制/重命名出第二份。' +
-    '缺省 save_as 时落 .bma/od-artifacts（时间戳命名，仅适合草稿/临时用途）。' +
-    '生成约需 10–60 秒，请勿重复提交相同 prompt。',
+    '【批量优先】帧序列/多素材场景（如塔防游戏的 6 塔 × 4 帧动画、整套怪物贴图）' +
+    '务必用 prompts 数组一次提交整批：桥内顺序串行逐张生成（daemon 单任务语义，不并发），' +
+    '一次调用拿全部结果；逐张单独调用会在每两张之间多夹一轮 LLM 往返，墙钟数倍放大。' +
+    '单张失败不中断整批，结果 results 数组逐项标注 path 或 error。' +
+    '正式素材务必指定落盘路径：单张用 save_as，批量用 save_as_list（与 prompts 等长，' +
+    '元素空串表示该项走默认命名），给工作目录相对路径（如 assets/img/mon-zombie.png），' +
+    '图片直落该路径、一图一份，结果 path 字段即可在 HTML/CSS/JS 中直接引用；' +
+    '禁止事后再复制/重命名出第二份。缺省落盘 .bma/od-artifacts（时间戳命名，仅适合草稿/临时用途）。' +
+    '单张生成约需 10–60 秒，请勿重复提交相同 prompt。',
   inputSchema: {
-    prompt: z.string().min(1).describe('图像描述（建议具体描述主体/风格/配色/构图）'),
-    aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例，缺省由模型决定'),
+    prompt: z.string().min(1).optional().describe(
+      '单张模式的图像描述（建议具体描述主体/风格/配色/构图）。与 prompts 二选一；同时给 prompts 时以 prompts 为准'),
+    prompts: z.array(z.string().min(1)).min(1).optional().describe(
+      '批量模式：prompt 数组，每个元素各生成一张（桥内顺序串行）。帧序列/多素材场景优先用此参数一次提交，' +
+      '避免逐张调用各产生一轮 LLM 往返。与 prompt 二选一；空数组报错'),
+    aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例（批量时整批共用），缺省由模型决定'),
     model: z.string().optional().describe(`覆盖默认模型（缺省 ${OD_DEFAULT_MODEL}）`),
     save_as: z.string().optional().describe(
-      '产物落盘的工作目录相对路径（如 assets/img/mon-zombie.png）。目录自动创建；' +
+      '单张模式产物落盘的工作目录相对路径（如 assets/img/mon-zombie.png）。目录自动创建；' +
       '无扩展名时按生成文件实际格式补齐；不可含 .. 或盘符。命名须与代码加载约定一致'),
+    save_as_list: z.array(z.string()).optional().describe(
+      '批量模式落盘路径数组，须与 prompts 等长；元素为工作目录相对路径（同 save_as 规则），' +
+      '空串表示该项用默认 .bma/od-artifacts 命名。仅配合 prompts 使用'),
   },
 }, async (args) => {
   try {
-    const result = await generateImage(args);
+    let result;
+    if (args.prompts !== undefined) {
+      // 批量模式：prompts 优先于 prompt（两者同时给时按批量处理）。
+      result = await generateImageBatch(args);
+    } else if (args.prompt) {
+      if (args.save_as_list !== undefined) {
+        throw new Error('save_as_list 仅配合 prompts 批量使用；单张请用 save_as');
+      }
+      result = await generateImage(args);
+    } else {
+      throw new Error('prompt 与 prompts 至少提供其一（帧序列/多素材场景优先 prompts 一次提交整批）');
+    }
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     return { content: [{ type: 'text', text: `od_image_generate 失败: ${err.message}` }], isError: true };

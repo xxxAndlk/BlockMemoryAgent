@@ -22,6 +22,11 @@ func makeHistory(n int) []agent.ReactMessage {
 	return history
 }
 
+// alwaysOverEstimator 返回恒定超大 token 估算：配 WithContextBudget(1, nil) 时阈值必然命中，
+// 每次装配都触发压缩。步频扳机（每 N 步强制压缩）已退役，原"每步压缩"测试语义
+// 由必然超阈值的估算器复现（token 阈值是唯一闸门）。
+func alwaysOverEstimator([]agent.ReactMessage) int { return 1 << 30 }
+
 // findSummary 返回视图中的压缩摘要 system 消息正文；未找到返回 ("", false)。
 func findSummary(out []agent.ReactMessage) (string, bool) {
 	for _, m := range out {
@@ -47,7 +52,7 @@ func TestPipeline_PyramidIncrementalBundles(t *testing.T) {
 		inputs = append(inputs, text)
 		return fmt.Sprintf("PACK%d", call), nil
 	}
-	pipe := NewPipeline(nil).WithCompression(1, 3).WithHistorySummarizer(stub) // 每步压缩，保留最近 3 条
+	pipe := NewPipeline(nil).WithCompression(3).WithContextBudget(1, nil).WithTokenEstimator(alwaysOverEstimator).WithHistorySummarizer(stub) // 必超阈值每次装配都触发，保留最近 3 条
 
 	// 第 1 次触发：10 条历史，保留 3 条，压缩段 = m0..m5。
 	history := makeHistory(9)
@@ -107,7 +112,7 @@ func TestPipeline_PyramidMergeOldestHalf(t *testing.T) {
 		}
 		return fmt.Sprintf("PACK%d", call), nil
 	}
-	pipe := NewPipeline(nil).WithCompression(1, 3).WithMaxBundles(2).WithHistorySummarizer(stub)
+	pipe := NewPipeline(nil).WithCompression(3).WithContextBudget(1, nil).WithTokenEstimator(alwaysOverEstimator).WithMaxBundles(2).WithHistorySummarizer(stub)
 
 	// 逐轮追加 3 条并触发压缩，共 4 轮 → 产生 4 个包的压缩需求，上限 2。
 	history := makeHistory(6)
@@ -137,7 +142,7 @@ func TestPipeline_PyramidMergeOldestHalf(t *testing.T) {
 // TestPipeline_PyramidFallbackMultiBundles 验证无 LLM 摘要器时的截断降级：
 // 每次触发产生一个截断压缩段，多段同时出现在摘要消息中（不再互相覆盖）。
 func TestPipeline_PyramidFallbackMultiBundles(t *testing.T) {
-	pipe := NewPipeline(nil).WithCompression(1, 3) // 每步压缩，保留最近 3 条，无摘要器
+	pipe := NewPipeline(nil).WithCompression(3).WithContextBudget(1, nil).WithTokenEstimator(alwaysOverEstimator) // 必超阈值每次装配都触发，保留最近 3 条，无摘要器
 
 	history := makeHistory(9)
 	pipe.Assemble(types.RoleDefinition{}, "a", history)
@@ -162,7 +167,7 @@ func TestPipeline_PyramidFallbackMultiBundles(t *testing.T) {
 // TestPipeline_PyramidMergeFallbackConcat 验证合并的降级路径（无摘要器）：
 // 超上限时最老的一半直接拼接为一个包，包数收敛、内容不丢（截断形式保留）。
 func TestPipeline_PyramidMergeFallbackConcat(t *testing.T) {
-	pipe := NewPipeline(nil).WithCompression(1, 3).WithMaxBundles(2) // 无摘要器
+	pipe := NewPipeline(nil).WithCompression(3).WithContextBudget(1, nil).WithTokenEstimator(alwaysOverEstimator).WithMaxBundles(2) // 无摘要器
 
 	history := makeHistory(6)
 	for round := 0; round < 4; round++ {
@@ -191,7 +196,7 @@ func TestPipeline_PyramidMergeFallbackConcat(t *testing.T) {
 func TestPipeline_CompressStatePersistReload(t *testing.T) {
 	store := NewInMemoryStore()
 	stub := func(_ context.Context, _ string, _ bool) (string, error) { return "PACK-RESTART", nil }
-	pipe1 := NewPipeline(store).WithCompression(1, 3).WithHistorySummarizer(stub)
+	pipe1 := NewPipeline(store).WithCompression(3).WithContextBudget(1, nil).WithTokenEstimator(alwaysOverEstimator).WithHistorySummarizer(stub)
 
 	history := makeHistory(9)
 	out1 := pipe1.Assemble(types.RoleDefinition{}, "a", history)
@@ -200,7 +205,7 @@ func TestPipeline_CompressStatePersistReload(t *testing.T) {
 	}
 
 	// 模拟重启：全新 Pipeline，内存无状态，经 store 懒加载恢复。
-	pipe2 := NewPipeline(store).WithCompression(0, 3) // 步频关闭，仅靠懒加载出视图
+	pipe2 := NewPipeline(store).WithCompression(3) // 无估算器：压缩不触发，仅靠懒加载出视图
 	out2 := pipe2.Assemble(types.RoleDefinition{}, "a", history)
 	sum, ok := findSummary(out2)
 	if !ok {

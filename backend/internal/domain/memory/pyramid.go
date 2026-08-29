@@ -3,7 +3,7 @@ package memory
 // pyramid.go 层级压缩（summary pyramid）：替代旧的"中段整段暴力截断"。
 //
 // 机制（2026-08-28 设计结论）：
-//   - 每次压缩触发（token 阈值 / 步频兜底）把"新滑出保留段"的中段历史
+//   - 每次压缩触发（token 阈值，唯一闸门；步频扳机已退役）把"新滑出保留段"的中段历史
 //     （history[prev.TailStart:newTailStart]）压成一个结构化压缩包追加到列表，
 //     而不是像旧实现那样每次从全量 history 重算整段摘要并覆盖；
 //   - 压缩包数量超 maxBundles 时，把最老的一半合并为 1 个更粗的包（LLM merge），
@@ -17,7 +17,7 @@ package memory
 //     TailStart 下标语义依赖全量 history 同时被恢复（MetaAgent 走 agent_messages）。
 //
 // 前缀缓存：压缩包列表在两次触发之间冻结，视图前缀字节级稳定（同旧冻结视图设计）；
-// 触发那一轮前缀失效是不可避免的代价，但触发频率不变（token 阈值 / 步频）。
+// 触发那一轮前缀失效是不可避免的代价，但触发频率不变（token 阈值驱动）。
 
 import (
 	"context"

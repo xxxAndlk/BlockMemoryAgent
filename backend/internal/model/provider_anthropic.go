@@ -473,6 +473,13 @@ func (p *anthropicProvider) convertSystem(inst *blades.Message) []anthropic.Text
 		}
 		blocks = append(blocks, anthropic.TextBlockParam{Text: text.Text})
 	}
+	// 给最后一个 system block 打 cache_control ephemeral 断点：system prompt
+	// 已按实例冻结（react_agent.go sysPromptOnce），是请求中最大最稳定的前缀，
+	// 此前完全依赖中继隐式缓存，实测命中率仅 24%；显式断点让 Anthropic 协议
+	// 把 system 前缀纳入 prompt cache，后续轮次命中 cache_read。
+	if len(blocks) > 0 {
+		blocks[len(blocks)-1].CacheControl = anthropic.NewCacheControlEphemeralParam()
+	}
 	return blocks
 }
 
@@ -715,6 +722,11 @@ func (p *anthropicProvider) convertTools(tools []bladestools.Tool) []anthropic.T
 			},
 		})
 	}
+	// 给最后一个工具打 cache_control ephemeral 断点：tools 列表按实例稳定，
+	// 与 system 同为请求头部的大段稳定前缀；断点让 tools+system 整体可被缓存，
+	// 避免每轮 32K tokens 全量 cache_miss（此前依赖中继隐式缓存命中率仅 24%）。
+	// len(tools) == 0 时上方已返回 nil，此处必然非空。
+	out[len(out)-1].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
 	return out
 }
 

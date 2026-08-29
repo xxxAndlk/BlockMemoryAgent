@@ -62,12 +62,20 @@ VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)`)
 	}
 	defer stmt.Close()
 	for i, m := range msgs {
-		callsJSON, _ := json.Marshal(m.ToolCalls)
-		if _, err := stmt.ExecContext(ctx, sessionID, agentID, i, m.Role, m.Content, m.ToolCallID, string(callsJSON), m.ReasoningContent); err != nil {
+		content, reasoning, calls := sanitizeMessageFields(m)
+		if _, err := stmt.ExecContext(ctx, sessionID, agentID, i, m.Role, content, m.ToolCallID, calls, reasoning); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// sanitizeMessageFields 清洗入库的字符串字段（content/reasoning/tool_calls JSON）：
+// 剥离 NUL 并替换非法 UTF-8。用户输入可能夹带 0x00（Windows 控制台 Ctrl+Space、
+// 粘贴带 NUL 文本），原样 INSERT 会被 PG 拒绝（invalid byte sequence 22021）。
+func sanitizeMessageFields(m ReactMessage) (content, reasoning, calls string) {
+	callsJSON, _ := json.Marshal(m.ToolCalls)
+	return sanitizeUTF8(m.Content), sanitizeUTF8(m.ReasoningContent), sanitizeUTF8(string(callsJSON))
 }
 
 // LoadMessages 按 seq ASC 加载该 agent 的全部消息历史。

@@ -436,14 +436,21 @@ const (
 	maxOutlineSymbols = 12
 )
 
-// fileOutline 读取源码文件并返回紧凑轮廓后缀：" (355 行): class Tower L15, fire() L120"。
+// fileOutline 是 FileOutline 的项目根 + 相对路径包装，供领域文件列表括注使用。
+func fileOutline(absRoot, rel string) string {
+	return FileOutline(filepath.Join(absRoot, filepath.FromSlash(rel)))
+}
+
+// FileOutline 读取单个源码文件并返回紧凑轮廓后缀：" (355 行): class Tower L15, fire() L120"。
 // 非轮廓扩展名返回空串；读失败/无符号时至少给出行数（拿不到行数才返回空串）。
 // best-effort：行首正则抽取，供 Agent 按符号带 offset 精读，消灭"找结构"式逐页盲扫。
-func fileOutline(absRoot, rel string) string {
-	if !outlineExts[strings.ToLower(filepath.Ext(rel))] {
+// 单文件粒度导出：除 PROJECT.md 领域括注外，任务级文件小地图（tool 包触碰文件追踪器）
+// 也复用同一抽取逻辑。
+func FileOutline(absPath string) string {
+	if !outlineExts[strings.ToLower(filepath.Ext(absPath))] {
 		return ""
 	}
-	f, err := os.Open(filepath.Join(absRoot, filepath.FromSlash(rel)))
+	f, err := os.Open(absPath)
 	if err != nil {
 		return ""
 	}

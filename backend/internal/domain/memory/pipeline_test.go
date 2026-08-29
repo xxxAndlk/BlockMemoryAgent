@@ -210,9 +210,12 @@ func TestInMemoryStore_MaxEventsPerAgent(t *testing.T) {
 }
 
 // TestPipeline_Compression 验证 Pipeline 的历史压缩（hot/cold 分层）。
-// 消息数超过 keepRecent+2 且步频命中时，中段被压缩为摘要消息。
+// 消息数超过 keepRecent+2 且 token 达阈值时，中段被压缩为摘要消息。
 func TestPipeline_Compression(t *testing.T) {
-	pipe := NewPipeline(nil).WithCompression(1, 3) // 每步都压缩，保留最近 3 条
+	pipe := NewPipeline(nil).
+		WithCompression(3). // 保留最近 3 条
+		WithContextBudget(1, nil).
+		WithTokenEstimator(func(msgs []agent.ReactMessage) int { return 1 << 30 }) // 永远超阈值，必触发
 
 	// 构造 10 条历史：1 个 user（任务目标）+ 8 个 assistant/user 中段 + 1 个 user 末尾。
 	history := []agent.ReactMessage{{Role: "user", Content: "task goal"}}
@@ -250,9 +253,9 @@ func TestPipeline_Compression(t *testing.T) {
 	}
 }
 
-// TestPipeline_CompressionDisabled 验证 compressEvery<=0 时关闭压缩。
+// TestPipeline_CompressionDisabled 验证未注入 token 估算器时压缩不触发（阈值无从判定）。
 func TestPipeline_CompressionDisabled(t *testing.T) {
-	pipe := NewPipeline(nil) // 未配置 WithCompression
+	pipe := NewPipeline(nil) // 未配置 WithTokenEstimator/WithContextBudget
 
 	history := []agent.ReactMessage{{Role: "user", Content: "task"}}
 	for i := 0; i < 20; i++ {
@@ -264,39 +267,44 @@ func TestPipeline_CompressionDisabled(t *testing.T) {
 	}
 }
 
-// TestPipeline_CompressionStepFrequency 验证压缩仅在步频命中时触发。
-func TestPipeline_CompressionStepFrequency(t *testing.T) {
-	pipe := NewPipeline(nil).WithCompression(3, 2) // 每 3 步压缩一次
-
+// TestPipeline_CompressionNoStepTrigger 验证步数扳机已退役：无论装配多少轮，
+// 无估算器或未达 token 阈值时绝不压缩——步频触发（每 10 步强制压缩）曾致 Agent
+// 周期性失忆、反复重读文件，压缩只应由 token 阈值驱动。
+func TestPipeline_CompressionNoStepTrigger(t *testing.T) {
 	history := []agent.ReactMessage{{Role: "user", Content: "task"}}
 	for i := 0; i < 15; i++ {
 		history = append(history, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("m %d", i)})
 	}
 
-	// 第 1 步：不压缩。
-	out1 := pipe.Assemble(types.RoleDefinition{}, "a", history)
-	if len(out1) != len(history) {
-		t.Fatalf("step 1 should not compress, got %d vs %d", len(out1), len(history))
+	// 无估算器：装配 12 轮（超过旧步频 10）从不压缩。
+	pipe := NewPipeline(nil).WithCompression(2)
+	for step := 1; step <= 12; step++ {
+		out := pipe.Assemble(types.RoleDefinition{}, "a", history)
+		if len(out) != len(history) {
+			t.Fatalf("step %d should never compress without estimator, got %d vs %d", step, len(out), len(history))
+		}
 	}
-	// 第 2 步：不压缩。
-	out2 := pipe.Assemble(types.RoleDefinition{}, "a", history)
-	if len(out2) != len(history) {
-		t.Fatalf("step 2 should not compress, got %d vs %d", len(out2), len(history))
-	}
-	// 第 3 步：压缩。
-	out3 := pipe.Assemble(types.RoleDefinition{}, "a", history)
-	if len(out3) >= len(history) {
-		t.Fatalf("step 3 should compress, got %d vs %d", len(out3), len(history))
+
+	// 有估算器但未达阈值：同样从不压缩（token 阈值是唯一闸门）。
+	pipe2 := NewPipeline(nil).
+		WithCompression(2).
+		WithContextBudget(1<<30, nil).
+		WithTokenEstimator(func(msgs []agent.ReactMessage) int { return len(msgs) })
+	for step := 1; step <= 12; step++ {
+		out := pipe2.Assemble(types.RoleDefinition{}, "b", history)
+		if len(out) != len(history) {
+			t.Fatalf("below-threshold step %d should not compress, got %d vs %d", step, len(out), len(history))
+		}
 	}
 }
 
-// TestPipeline_CompressionTokenThreshold 验证压缩按上下文 token 阈值触发（主，替换步频语义）：
+// TestPipeline_CompressionTokenThreshold 验证压缩按上下文 token 阈值触发（唯一闸门）：
 // 估算视图 token >= 阈值即压缩（保留近 keepRecent，旧压成上下文内摘要块）；per-role 阈值覆盖默认；
-// 未达阈值不压缩。步频（WithCompression）为兜底，二者独立。
+// 未达阈值不压缩。
 func TestPipeline_CompressionTokenThreshold(t *testing.T) {
 	est := func(msgs []agent.ReactMessage) int { return len(msgs) * 1000 } // 1 条 = 1000 tokens
 	pipe := NewPipeline(nil).
-		WithCompression(0, 3). // 步频关闭，纯 token 触发
+		WithCompression(3). // 保留最近 3 条；触发纯 token 阈值
 		WithContextBudget(5000, map[string]int{"meta": 100000}). // 默认 5000；meta 例外 100000
 		WithTokenEstimator(est)
 
@@ -339,23 +347,36 @@ func TestPipeline_CompressionTokenThreshold(t *testing.T) {
 // TestPipeline_CompressionFrozenView 验证压缩视图在两次触发之间冻结：
 // 非压缩轮复用同一摘要与保留段起点，history 尾部追加的消息原样跟在保留段后，
 // 视图前缀字节级稳定（DeepSeek 前缀缓存仅压缩轮失效，其余轮次全命中）。
+// 步频扳机退役后触发只由 token 阈值驱动，测试用可控估算器模拟"达阈值/未达阈值"。
 func TestPipeline_CompressionFrozenView(t *testing.T) {
-	pipe := NewPipeline(nil).WithCompression(3, 2) // 每 3 步压缩一次，保留最近 2 条
+	over := false // 可控阈值开关：true 时估算超阈值触发压缩
+	est := func(msgs []agent.ReactMessage) int {
+		if over {
+			return 1 << 30
+		}
+		return 0
+	}
+	pipe := NewPipeline(nil).
+		WithCompression(2). // 保留最近 2 条
+		WithContextBudget(1000, nil).
+		WithTokenEstimator(est)
 
 	history := []agent.ReactMessage{{Role: "user", Content: "task"}}
 	for i := 0; i < 15; i++ {
 		history = append(history, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("m %d", i)})
 	}
 
-	// 第 1、2 步不触发压缩；第 3 步触发，拿到冻结视图。
+	// 前两轮未达阈值不触发；第三轮达阈值触发，拿到冻结视图。
 	pipe.Assemble(types.RoleDefinition{}, "a", history)
 	pipe.Assemble(types.RoleDefinition{}, "a", history)
+	over = true
 	frozen := pipe.Assemble(types.RoleDefinition{}, "a", history)
+	over = false
 	if len(frozen) >= len(history) {
-		t.Fatalf("step 3 should compress, got %d vs %d", len(frozen), len(history))
+		t.Fatalf("over-budget assemble should compress, got %d vs %d", len(frozen), len(history))
 	}
 
-	// history 尾部追加 2 条（模拟一轮 assistant + tool），第 4 步不触发压缩。
+	// history 尾部追加 2 条（模拟一轮 assistant + tool），未达阈值不触发压缩。
 	history = append(history,
 		agent.ReactMessage{Role: "assistant", Content: "new turn"},
 		agent.ReactMessage{Role: "tool", Content: "new result"},
@@ -377,9 +398,10 @@ func TestPipeline_CompressionFrozenView(t *testing.T) {
 		t.Fatalf("appended messages should be at tail, got %q / %q", out[len(out)-2].Content, out[len(out)-1].Content)
 	}
 
-	// 第 6 步再次触发压缩：摘要覆盖范围推进，冻结视图更新。
+	// 再次达阈值触发压缩：摘要覆盖范围推进，冻结视图更新。
 	history = append(history, agent.ReactMessage{Role: "assistant", Content: "m 15"})
-	pipe.Assemble(types.RoleDefinition{}, "a", history) // 第 5 步
+	pipe.Assemble(types.RoleDefinition{}, "a", history) // 未达阈值，不触发
+	over = true
 	refrozen := pipe.Assemble(types.RoleDefinition{}, "a", history)
 	var foundNew bool
 	for _, m := range refrozen {

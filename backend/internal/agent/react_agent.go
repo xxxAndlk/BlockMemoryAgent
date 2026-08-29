@@ -341,7 +341,10 @@ const emptyResponseNudge = "（系统提示：你上一条回复为空，未包�
 // historyToolCallInputMaxRunes 是写入历史的工具入参单字符串值最大 rune 数。
 // 与 ToolOutputMaxRunes（工具输出截断）对称：工具入参（WriteFile 全文、codegen 大段代码）
 // 不截断会在滑动窗口内累积成单轮 100K+ input tokens，使续跑预算一次耗尽、暂停/恢复零进展。
-const historyToolCallInputMaxRunes = 2000
+// 取值 12000（与 tool_output_history_max_runes 20000 同量级，保持硬编码、无对应配置项）：
+// 原 2000 截得太狠，WriteFile/EditFile 刚写入的内容几轮后就从历史消失，而 EditFile 又要求
+// old_string 逐字符一致，Agent 只能改前重读（实证：领域 Agent 反复 ReadFile 同一批文件）。
+const historyToolCallInputMaxRunes = 12000
 
 // defaultStreamIdleTimeout 是流式块间空闲超时默认值：首块之后 chunk 间隔超过它
 // 即判流死（2026-08-20 ark glm-5.3 一天三次流中途静默，等满整次墙钟才报错代价太高）。
@@ -440,9 +443,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 所有 Agent（meta/domain/叶子）统一注入，与看板段同位（不可缓存尾部）。
 		assembled = append(assembled, buildTimeMessage())
 
-		// 上下文裁剪策略：仅 windowMessages 滑动窗口（硬上限，防 API 上下文溢出）。
-		// 历史压缩（hot/cold 分层）已迁入 memory.Pipeline.Assemble，按步频触发；
-		// ReActAgent 不再直接做历史压缩，职责归位到记忆层。
+		// 上下文裁剪策略：仅 windowMessages 滑动窗口（硬上限，兜底防 API 上下文溢出）。
+		// 历史压缩（hot/cold 分层）已迁入 memory.Pipeline.Assemble，仅按 token 阈值触发
+		// （步频扳机已退役）；压缩先于窗口动手，窗口默认值已放大到 400 避免抢先裁剪。
 		// windowMessages 只影响本次请求，不修改 history（完整历史仍用于持久化与续跑）。
 		messages := windowMessages(assembled, a.historyMaxMessages)
 		// 兜底防线：任何裁剪/注入路径若留下不配对的 tool 调用（assistant tool_calls
@@ -876,7 +879,8 @@ func serializePromptForLog(req *blades.ModelRequest) string {
 // bladesText 只读 TextPart，纯 tool_call 的 assistant 消息与 tool 结果消息会被
 // 序列化成空 content（实证：日志里大量 "role":"tool"/"assistant","content":""
 // 被误以为上下文为空；实际请求中 tool 数据完整，只是日志没渲染）。
-// 单个 part 截断 2000 runes：与入史截断（historyToolCallInputMaxRunes）对齐，防日志爆炸。
+// 单个 part 截断 2000 runes：仅防本地日志爆炸，与入史截断（historyToolCallInputMaxRunes，
+// 已提至 12000）相互独立，不影响上下文回发内容。
 func messageLogText(m *blades.Message) string {
 	var sb strings.Builder
 	sb.WriteString(bladesText(m))
@@ -1109,7 +1113,8 @@ func (a *ReActAgent) waitForChildren(ctx context.Context, history []ReactMessage
 
 // summarizeWindow 已迁入 domain/memory/pipeline.go 的 compressHistory 函数。
 // 历史压缩（hot/cold 分层）属记忆层职责，ReActAgent 不再直接做历史压缩。
-// 触发由 memory.Pipeline.WithCompression(every, keepRecent) 配置，bootstrap 注入。
+// 触发仅由 token 阈值驱动（memory.Pipeline.WithContextBudget + WithTokenEstimator，
+// bootstrap 注入；步频扳机已退役），保留段长度由 WithCompression(keepRecent) 配置。
 
 // windowMessages 把发送给 LLM 的消息裁剪到最多 max 条（滑动窗口）：
 // 保留开头的 system 消息（记忆注入）与最近的对话，下刀处避开孤立的 tool 结果

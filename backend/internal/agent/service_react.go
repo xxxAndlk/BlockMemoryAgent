@@ -505,7 +505,7 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 		LLMTimeout:         300 * time.Second,
 		RetryCount:         3,
 		RetryBackoff:       100 * time.Millisecond,
-		HistoryMaxMessages: 40,
+		HistoryMaxMessages: 400, // 窗口只兜底防爆；真正约束是 token 阈值（压缩先于窗口），小窗口会抢先裁剪致隐性失忆
 		ToolOutputMaxRunes: 2000,
 	}
 	if c.MaxIterations != 0 {

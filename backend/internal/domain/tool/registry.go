@@ -6,10 +6,12 @@ import (
 	"encoding/json" // json 用于动态工具兜底的入参反序列化
 	"fmt"           // fmt 用于格式化错误信息
 	"log"           // log 用于记录拦截/失败等不影响主流程的可观测事件
+	"os"            // os 用于 stat 文件 mtime（读取状态追踪）
 	"path/filepath" // filepath 用于规范化文件路径
 	"strconv"       // strconv 用于解析 ReadFile 分页头总行数（长文件判定）
 	"strings"       // strings 用于拼接已读文件列表
 	"sync"          // sync 提供互斥锁保护并发状态
+	"time"          // time 用于共享记忆失效标记时间戳（InvalidatedAt）
 
 	"github.com/blockmemory/agent/backend/internal/config"  // config 包提供 Agent 阈值配置
 	"github.com/blockmemory/agent/backend/internal/project" // project 包提供 DomainClassifier 接口
@@ -116,12 +118,21 @@ type Registry struct {
 	// longFileScopes 按 agentID 记录最近一次成功 ReadFile 是否为长文件（TODO #72）：
 	// 返回总行数 > longFileReadLines 时置 true，下一次同文件同区间连读上限放宽。
 	longFileScopes map[string]bool
+	// fileReadMtime 按 agentID 记录该 scope 已读文件的 mtime（cleanPath → 上次成功
+	// ReadFile/WriteFile/EditFile 时的 mtime），即"读取状态追踪"（Claude Code 同款机制的
+	// 提示版）：重复读取且 mtime 未变时提示直接引用上文（消除防御性重读——实证领域 Agent
+	// 两小时 ReadFile 610 次大量为"忘了文件现状"的重读）；写入前发现 mtime 已变/从未读过
+	// 时附 stale 警告（old_string 可能基于过期内容）。advisory 提示，不做硬阻断。
+	fileReadMtime map[string]map[string]time.Time
 	// sharedMemory 是 WriteSharedMemory 工具的 KV 后端，由 bootstrap 注入。
 	// 为 nil 时 WriteSharedMemory 注册但不生效，调用返回 store 未配置错误。
 	sharedMemory SharedMemoryStore
 	// refresher 去抖异步刷新 .bma/PROJECT.md：WriteFile/删改类 RunCommand 成功后 schedule，
 	// 安静期触发 LLM 按职责重分区，使领域影响范围随文件增删改自动更新。
 	refresher *projectRefresher
+	// fileMap 任务级文件小地图追踪器：ReadFile/WriteFile/EditFile 成功后按 Agent 登记
+	// 触碰文件（mtime 缓存符号轮廓），FileMapText 渲染注入文本供记忆流水线尾部常驻注入。
+	fileMap *fileMapTracker
 	// approvalHook 是破坏性操作的用户确认回调（TODO #17 P1）。nil（默认）= 全放行，
 	// 零行为变化；非 nil 时仅对命中边界的调用触发（WriteFile 在生产目录 / 危险命令模式），
 	// 常规编码流不阻塞。由 bootstrap 注入 ReactService.ApprovalHook。
@@ -161,6 +172,8 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		lastReadKey:       make(map[string]string),
 		sameReadCount:     make(map[string]int),
 		longFileScopes:    make(map[string]bool),
+		fileReadMtime:     make(map[string]map[string]time.Time),
+		fileMap:           newFileMapTracker(),
 		productionWorkDir: "",
 	}
 	if cfg != nil {
@@ -486,6 +499,25 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 
 	// 确保上下文中携带 SessionID，供后续结果填充和日志关联。
 	ctx = WithSessionID(ctx, SessionIDFromContext(ctx))
+
+	// 读取状态追踪（写前 stale 检查，advisory）：EditFile/WriteFile 目标文件已存在，
+	// 且本 Agent 从未读过或 mtime 与上次读取不一致（期间被外部/别的 Agent 改过）时，
+	// 操作仍执行，结果尾部附"内容可能过期"警告。新建文件（不存在）与 temporary 临时文件
+	// 无旧内容可过期，不检查，避免每次新建都附噪音警告。
+	staleWriteNote := ""
+	if name == "EditFile" || name == "WriteFile" {
+		if temporary, _ := args["temporary"].(bool); name == "EditFile" || !temporary {
+			if path, _ := args["path"].(string); path != "" {
+				abs := r.exec.resolvePath(path)
+				if mt, ok := statMtime(abs); ok {
+					if prev, seen := r.lastFileMtime(scopeKeyFromCtx(ctx), abs); !seen || !prev.Equal(mt) {
+						staleWriteNote = "\n[注意] 该文件自你上次读取后已被修改（或你尚未读过），old_string 可能基于过期内容，建议核对。"
+					}
+				}
+			}
+		}
+	}
+
 	// 调用工具实现获取执行结果。
 	result := t.Execute(ctx, args)
 
@@ -496,18 +528,47 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 			result.Output += readNote
 		}
 		r.markLongFileScope(scopeKeyFromCtx(ctx), result.Output)
+		// 读取状态追踪登记：与上次读取记录比对 mtime 后再登记本次。
+		// 同参数连读场景已附连读守卫提醒（readNote），不再重复附加免啰嗦。
+		if mt, ok := statMtime(result.Path); ok {
+			scope := scopeKeyFromCtx(ctx)
+			if prev, seen := r.lastFileMtime(scope, result.Path); seen && readNote == "" {
+				if prev.Equal(mt) {
+					result.Output += "\n[提示] 该文件自你上次读取后未变更；若上文仍有该内容请直接引用，无需为重读而重读。"
+				} else {
+					result.Output += "\n[提示] 该文件自你上次读取后已被修改，上文内容可能已过期，以本次返回为准。"
+				}
+			}
+			r.recordFileMtime(scope, result.Path, mt)
+		}
 	}
 
-	// WriteFile/EditFile 成功后失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
-	// 防止子 Agent 改文件后，父 Agent 下次派发仍把旧摘要注入新子 Agent task 导致幻觉。
+	// WriteFile/EditFile 成功后标记失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
+	// 普通槽不物理删除、内容保留：标记 stale 后注入时照常注入并附行号漂移警告，
+	// 防止旧逻辑"删记忆"导致下次派发/复用时 Agent 拿裸任务从零重读同一批文件。
 	// ReadFile 无需清已读记录：重读本就直返磁盘最新内容，不存在脏数据问题。
 	// TODO #72 确认性复读放行：写入成功同时清零该路径连读计数——
 	// Read(A)→Write(A)→Read(A)→Read(A) 的编辑后确认不再被杀。
 	if (name == "WriteFile" || name == "EditFile") && result.Success && result.Path != "" {
 		r.invalidateSharedMemoryForPath(ctx, result.Path)
 		r.resetSameReadForPath(scopeKeyFromCtx(ctx), result.Path)
+		// 写前 stale 检查结果落地：操作已执行，尾部附"内容可能过期"警告（advisory）。
+		result.Output += staleWriteNote
+		// 登记写入后的新 mtime：本 Agent 刚写的内容视为已知，
+		// 避免后续自编辑被误判为"已被外部修改"；其他 Agent 的记录仍正确变 stale。
+		if mt, ok := statMtime(result.Path); ok {
+			r.recordFileMtime(scopeKeyFromCtx(ctx), result.Path, mt)
+		}
 		// 文件新增/修改触发去抖刷新 PROJECT.md 领域影响范围（安静期一次 LLM 重分区）。
 		r.scheduleProjectRefresh()
+	}
+
+	// 任务级文件小地图：ReadFile/WriteFile/EditFile 成功后登记触碰文件（按 Agent 隔离，
+	// mtime 缓存符号轮廓），记忆流水线每轮在 history 尾部常驻注入【本任务文件地图】，
+	// 压缩循环压不掉（与上面的失效标记/连读清零同属文件类工具的后置钩子）。
+	if result.Success && result.Path != "" &&
+		(name == "ReadFile" || name == "WriteFile" || name == "EditFile") {
+		r.touchFileMap(ctx, result.Path)
 	}
 
 	// RunCommand 命中删改类命令（rm/mv/mkdir/touch/cp/git rm/git mv）触发去抖刷新，
@@ -622,11 +683,15 @@ const specTombstonePrefix = "invalidated: "
 // SpecTombstonePrefix 导出 spec 墓碑前缀（dispatcher 派发侧诊断用，TODO #74）。
 const SpecTombstonePrefix = specTombstonePrefix
 
-// invalidateSharedMemoryForPath 遍历共享记忆，删除引用指定 path 的 entry（Layer 2 缓存一致性）。
-// 在 WriteFile 成功后调用，防止子 Agent 改文件后父 Agent 下次派发仍注入旧摘要。
+// invalidateSharedMemoryForPath 遍历共享记忆，失效引用指定 path 的 entry（Layer 2 缓存一致性）。
+// 在 WriteFile/EditFile 成功后调用。
 // 失败静默（仅影响缓存，不影响 WriteFile 主路径）；path 规范化为绝对路径比较。
-// 旧格式 value（无 frontmatter）无法判断引用关系，保留不删，由 Layer 3 stat 校验兜底。
-// spec 槽位（<agentID>:spec[...]) 不物理删而写墓碑（TODO #74）：
+// 旧格式 value（无 frontmatter）无法判断引用关系，保留不动，由 Layer 3 stat 校验兜底。
+// 普通共享记忆槽：不物理删除，frontmatter 打 invalidated_at 标记、body/Files 原样保留——
+// dispatcher 注入侧判 stale 后照常注入并附行号漂移警告（常量值/签名类结论仍可直接采信）。
+// 实证：物理删除后无任何重存引导，下次派发/复用拿裸任务从零重读同一批文件
+//（单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）。
+// spec 槽位（<agentID>:spec[...]) 不标 stale 而写墓碑（TODO #74，维持现状）：
 // "被失效"与"从未写"在派发报错中语义不同，物理删导致 meta 误诊 key 覆盖
 //（实证 2026-08-25：meta 误诊"每 parent 只存一份 spec 互相覆盖"改串行重派白烧一轮）。
 func (r *Registry) invalidateSharedMemoryForPath(ctx context.Context, path string) {
@@ -644,7 +709,7 @@ func (r *Registry) invalidateSharedMemoryForPath(ctx context.Context, path strin
 		if strings.HasPrefix(val, specTombstonePrefix) {
 			continue
 		}
-		fm, _, ok := DecodeSharedMD(val)
+		fm, body, ok := DecodeSharedMD(val)
 		if !ok {
 			// 旧格式（无 frontmatter）：无法判断引用关系，保留。
 			continue
@@ -656,7 +721,10 @@ func (r *Registry) invalidateSharedMemoryForPath(ctx context.Context, path strin
 					_ = r.sharedMemory.Set(ctx, key, specTombstonePrefix+filepath.Clean(fp)+" 已变更，请用 WriteSpec 重写")
 					break
 				}
-				_ = r.sharedMemory.Delete(ctx, key)
+				// 普通槽：打失效标记重编码落盘（Files 保留旧 mtime，Layer 3 校验与
+				// invalidated_at 双重判 stale）；幂等——已标记的同 path 重写一次即可。
+				fm.InvalidatedAt = time.Now().Format(time.RFC3339)
+				_ = r.sharedMemory.Set(ctx, key, encodeMD(fm, body))
 				break
 			}
 		}
@@ -740,6 +808,46 @@ func (r *Registry) bumpSameRead(scopeKey, key string) int {
 	return r.sameReadCount[scopeKey]
 }
 
+// statMtime 返回文件的修改时间；文件不存在或 stat 失败时返回 ok=false。
+func statMtime(path string) (time.Time, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return fi.ModTime(), true
+}
+
+// lastFileMtime 取 scope 已登记的 path 上次读取/写入时 mtime（读取状态追踪）。
+// 未登记过（从未读过）返回 ok=false。并发安全：与连读守卫共用 readMu。
+func (r *Registry) lastFileMtime(scopeKey, path string) (time.Time, bool) {
+	if scopeKey == "" || path == "" {
+		return time.Time{}, false
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	m := r.fileReadMtime[scopeKey]
+	if m == nil {
+		return time.Time{}, false
+	}
+	mt, ok := m[filepath.Clean(path)]
+	return mt, ok
+}
+
+// recordFileMtime 登记 scope 对 path 的最新已知 mtime（成功 ReadFile/WriteFile/EditFile 后调用）。
+func (r *Registry) recordFileMtime(scopeKey, path string, mtime time.Time) {
+	if scopeKey == "" || path == "" {
+		return
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	m := r.fileReadMtime[scopeKey]
+	if m == nil {
+		m = make(map[string]time.Time)
+		r.fileReadMtime[scopeKey] = m
+	}
+	m[filepath.Clean(path)] = mtime
+}
+
 // maxConsecutiveSameReadLongFile 是长文件（ReadFile 返回总行数 > longFileReadLines）的
 // 连读上限放宽值（TODO #72）：编辑长文件前后同区间确认性复读是合理工作流，
 // 扁平常量 3 误杀（实证 2026-08-25 domain-2 被连读守卫杀时 plan_execute 仅 1/6）。
@@ -802,7 +910,8 @@ func (r *Registry) markLongFileScope(scopeKey, output string) {
 	}
 }
 
-// ResetReadHistory 清空指定 agent 的连读状态（参数完全相同的 ReadFile 连续次数）。
+// ResetReadHistory 清空指定 agent 的连读状态（参数完全相同的 ReadFile 连续次数）
+// 与读取状态追踪记录（fileReadMtime）。
 // 在新用户消息进入时调用，使连读循环检测为单任务级而非整个会话级。
 // per-agent 作用域：sessionID 仍可用作 MetaAgent 的 agentID（派发时 MetaAgent 持 sessionID 作 agentID），
 // 子 Agent 各有独立 agentID，每次派发新 ID 自然隔离；调用方无需改动。
@@ -814,6 +923,7 @@ func (r *Registry) ResetReadHistory(sessionID string) {
 	defer r.readMu.Unlock()
 	delete(r.lastReadKey, sessionID)
 	delete(r.sameReadCount, sessionID)
+	delete(r.fileReadMtime, sessionID)
 }
 
 // 供外部框架（如 blades）动态发现和调用工具。

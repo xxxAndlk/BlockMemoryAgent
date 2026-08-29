@@ -4,12 +4,15 @@ package model
 // （2026-08-13 代码助手配 65536 撞 ark /api/coding kimi 硬上限 32768 全挂的根因场景）。
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"testing"
 
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/go-kratos/blades"
+	"github.com/anthropics/anthropic-sdk-go"        // Anthropic Go SDK
+	"github.com/go-kratos/blades"                   // blades 消息抽象
+	bladestools "github.com/go-kratos/blades/tools" // blades 工具定义
+	"github.com/google/jsonschema-go/jsonschema"    // JSON Schema
 )
 
 // newClampTestProvider 构造一个 maxTokens=指定值的 anthropicProvider（无真实客户端）。
@@ -69,7 +72,64 @@ func TestClampMaxTokensOnError_IgnoresUnrelated(t *testing.T) {
 	}
 }
 
-// TestConvertMessages_ToolResultImages 验证图片透传的 anthropic 边界：
+// TestConvertSystem_CacheControlBreakpoint 验证 prompt cache 断点：
+// 仅最后一个 system block 带 cache_control ephemeral，其余 block 不带；
+// system 为空/无文本 part 时返回 nil 不 panic。
+func TestConvertSystem_CacheControlBreakpoint(t *testing.T) {
+	p := &anthropicProvider{}
+
+	// 多文本 part：仅最后一个 block 打断点。
+	blocks := p.convertSystem(&blades.Message{Role: blades.RoleSystem, Parts: []blades.Part{
+		blades.TextPart{Text: "第一段"},
+		blades.TextPart{Text: "第二段"},
+	}})
+	if len(blocks) != 2 {
+		t.Fatalf("应有 2 个 system block, got %d", len(blocks))
+	}
+	if blocks[0].CacheControl.Type != "" {
+		t.Fatalf("非末尾 block 不应带 cache_control: %+v", blocks[0].CacheControl)
+	}
+	if blocks[1].CacheControl.Type != "ephemeral" {
+		t.Fatalf("末尾 block 应带 ephemeral 断点: %+v", blocks[1].CacheControl)
+	}
+
+	// 空 system / 无文本 part：nil 安全。
+	if got := p.convertSystem(nil); got != nil {
+		t.Fatalf("nil system 应返回 nil, got %+v", got)
+	}
+	if got := p.convertSystem(&blades.Message{Role: blades.RoleSystem}); len(got) != 0 {
+		t.Fatalf("无文本 part 应返回空, got %+v", got)
+	}
+}
+
+// TestConvertTools_CacheControlBreakpoint 验证 prompt cache 断点：
+// 仅最后一个工具带 cache_control ephemeral，其余不带；空工具列表返回 nil。
+func TestConvertTools_CacheControlBreakpoint(t *testing.T) {
+	p := &anthropicProvider{}
+
+	noop := bladestools.HandleFunc(func(context.Context, string) (string, error) { return "", nil })
+	schema := &jsonschema.Schema{Type: "object"}
+	tools := []bladestools.Tool{
+		bladestools.NewTool("t1", "工具1", noop, bladestools.WithInputSchema(schema)),
+		bladestools.NewTool("t2", "工具2", noop, bladestools.WithInputSchema(schema)),
+	}
+	out := p.convertTools(tools)
+	if len(out) != 2 {
+		t.Fatalf("应有 2 个工具, got %d", len(out))
+	}
+	if out[0].OfTool == nil || out[0].OfTool.CacheControl.Type != "" {
+		t.Fatalf("非末尾工具不应带 cache_control: %+v", out[0].OfTool)
+	}
+	if out[1].OfTool == nil || out[1].OfTool.CacheControl.Type != "ephemeral" {
+		t.Fatalf("末尾工具应带 ephemeral 断点: %+v", out[1].OfTool)
+	}
+
+	// 空工具列表：nil 安全。
+	if got := p.convertTools(nil); got != nil {
+		t.Fatalf("空工具列表应返回 nil, got %+v", got)
+	}
+}
+
 // RoleTool 消息携带的 DataPart（仅 agent.ToBladesMessages 最新一批）转为同一
 // tool_result content 里的 image 块；协议不支持的 MIME（svg 等）静默跳过。
 func TestConvertMessages_ToolResultImages(t *testing.T) {

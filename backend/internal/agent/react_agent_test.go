@@ -656,13 +656,13 @@ func TestReActAgent_EmptyResponseStreakFails(t *testing.T) {
 
 // TestReActAgent_TruncatesToolCallInputsInHistory 验证超长工具入参（如 WriteFile 全文）
 // 只在写入历史的副本中截断，派发执行仍用完整入参：
-//   - 磁盘文件内容为完整的 3000 字（派发未被截断影响）；
+//   - 磁盘文件内容为完整的 15000 字（派发未被截断影响）；
 //   - 历史中 assistant 消息的 ToolCalls input 被截断（防止滑动窗口内逐轮重发耗尽预算）。
 func TestReActAgent_TruncatesToolCallInputsInHistory(t *testing.T) {
 	dir := t.TempDir()
 	reg := tool.NewBuiltinRegistry(dir, nil, nil)
 
-	full := strings.Repeat("字", 3000)
+	full := strings.Repeat("字", 15000)
 	llm := &mockModelProvider{
 		responses: []*blades.Message{
 			{
@@ -687,7 +687,7 @@ func TestReActAgent_TruncatesToolCallInputsInHistory(t *testing.T) {
 		t.Fatalf("read written file: %v", err)
 	}
 	if string(b) != full {
-		t.Fatalf("dispatched content truncated: got %d runes, want %d", len([]rune(string(b))), 3000)
+		t.Fatalf("dispatched content truncated: got %d runes, want %d", len([]rune(string(b))), 15000)
 	}
 
 	// 历史中的工具入参被截断：assistant(tool) 消息的 content 值带截断标记。

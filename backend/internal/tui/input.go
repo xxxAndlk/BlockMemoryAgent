@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -246,9 +247,20 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.inputBar.mode == inputClarify && len(msg.Runes) == 1 && m.handleClarifyQuickKey(msg) {
 			return m, nil
 		}
-		// 在光标位置插入输入字符。
-		m.inputBar.runes = append(m.inputBar.runes[:m.inputBar.cursor], append(msg.Runes, m.inputBar.runes[m.inputBar.cursor:]...)...)
-		m.inputBar.cursor += len(msg.Runes)
+		// 过滤控制字符：Windows 控制台 Ctrl+Space/Ctrl+@ 会产生 0x00 的 KeyRunes，
+		// 粘贴文本也可能夹带 NUL；原样入库会被 PG 拒绝（invalid byte sequence 22021）。
+		// 保留 \n / \t（多行粘贴的换行与代码缩进经 KeyRunes 路径进入）。
+		runes := make([]rune, 0, len(msg.Runes))
+		for _, r := range msg.Runes {
+			if r == '\n' || r == '\t' || unicode.IsPrint(r) {
+				runes = append(runes, r)
+			}
+		}
+		if len(runes) == 0 {
+			return m, nil
+		}
+		// 在光标位置插入输入字符（光标按过滤后的实际插入长度推进）。
+		m.inputBar.insertRunes(runes)
 		return m, nil
 	}
 

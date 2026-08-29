@@ -43,12 +43,12 @@ memory:
 # Agent 运行时动态参数
 agent:
   # -- ReAct 主循环 --
-  summarize_every: 10            # 每 10 步压缩；<=0 关闭。压缩视图触发后冻结（pipeline compressState），压缩轮是 DeepSeek 前缀缓存唯一失效点；步频拉大=缓存命中升高+原文在历史里保留更久（防"压缩丢原文→重读"循环），过大则单轮 input 变长
+  summarize_every: 10            # 退役字段：原步频压缩扳机（每 N 步强制压缩），实测与上下文实际大小脱钩、致 Agent 每 10 步强制失忆反复重读文件。压缩已仅由 token 阈值（token_budget_per_role/context_token_budget，150K）驱动——唯一闸门。保留解析不报错，不再驱动任何逻辑（同 token_budget_per_goal 退役先例）
   summarize_keep_recent: 15      # 保留最近 15 条（2026-08-21 由 10 上调：压缩丢工具结果细节致领域 Agent 重读文件白烧慢思考轮；多留 5 条原始消息）
   summarize_max_bundles: 20      # 层级压缩包数量上限：每次压缩触发把新滑出保留段的中段压成一个结构化压缩包（轻量模型），超上限把最老的一半合并为 1 个更粗的包，循环往复——旧上下文渐变式遗忘而非 200 字符截断后丢弃；压缩状态落 agent_compress_states 表，重启后懒加载恢复
   summarize_timeout_sec: 120     # 事件摘要轻量模型调用超时（秒）。思考型模型首 token 需数十秒，旧硬编码 5s 致摘要全挂、上下文全量回注、token 预算提前烧穿（实证 verify 子 Agent 300K 预算 7 分钟耗尽）
   salvage_llm_timeout_sec: 60     # 失败打捞轻量调用超时（秒，默认 30）。旧硬编码 5s 对思考型模型来不及出首 token，打捞 facts=0 全降级（TODO #33）；当前轻量模型为推理系，取 60s 下限
-  history_max_messages: 48       # 滑动窗口硬上限（system 前缀 + 最近消息），防 API 上下文溢出；负数表示不裁剪。配合 summarize_every=10+keep_recent=10，压缩周期内消息峰值 ~34 条，48 保证周期内窗口不滑动、发送历史纯追加（DeepSeek 前缀缓存全命中）；仅在超长会话兜底滑动
+  history_max_messages: 400      # 滑动窗口硬上限（system 前缀 + 最近消息），纯兜底防爆：压缩已仅由 token 阈值（150K）驱动、先于窗口动手，窗口 48 会抢在阈值前裁剪成新的隐性失忆点，故放大到 400——按 tool_output_history_max_runes=20000 估算极端情形仍可能超 react_llm 端点实际上下文，保留硬上限防 API 溢出；负数表示不裁剪（不推荐，会失去兜底）
   tool_call_max_rounds: -1       # ReAct 最大 LLM 轮数（达到上限暂停等待用户续跑，不判失败），负数表示不限制
   retry_count: 1                 # Assistant 任务指数退避重试次数。provider 层已有 3 次重试（retry_provider），此处再重试会乘法放大尝试次数（最多 provider3 × agent(1+n)），瞬时故障已被下层覆盖，1 次足够
   retry_backoff_ms: 100          # 重试初始退避时长（毫秒）

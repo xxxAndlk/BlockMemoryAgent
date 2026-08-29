@@ -28,6 +28,13 @@ type MDFrontmatter struct {
 	Slot    string           `yaml:"slot,omitempty"`
 	Files   map[string]int64 `yaml:"files,omitempty"`
 	Version int              `yaml:"version,omitempty"`
+	// InvalidatedAt 失效标记（RFC3339 时间戳）：普通共享记忆槽在所涉文件被
+	// WriteFile/EditFile 修改后由 registry.invalidateSharedMemoryForPath 打上，
+	// 不物理删除、body/Files 原样保留；dispatcher 注入侧据此判 stale，
+	// 注入内容并附行号漂移警告（实证：物理删除导致下次派发从零重读同一批文件）。
+	// spec 槽不走此字段（写墓碑 specTombstonePrefix，语义不变）。WriteSharedMemory
+	// 重写时编码新 frontmatter，该标记自然清除。
+	InvalidatedAt string `yaml:"invalidated_at,omitempty"`
 	// FileList 是 spec.files 的完整原始清单（含当时不存在的待创建文件）。
 	// Files map 只收录 stat 成功的文件（mtime 索引），创建类任务的待创建文件
 	// 不在其中；dispatcher 冒烟检查（TODO #56）需要全量清单，读 FileList 兜底。

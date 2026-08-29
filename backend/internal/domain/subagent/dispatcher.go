@@ -3370,6 +3370,13 @@ const specPrefixMarker = "【任务规范】\n"
 // sharedPrefixMarker 是共享记忆注入任务前缀时的标记，便于子 Agent 区分"共享记忆"与"当前任务"。
 const sharedPrefixMarker = "【共享记忆】\n"
 
+// sharedStaleWarning 是普通共享记忆槽 stale（所涉文件已被修改或已标 invalidated_at）时
+// 仍注入、前置的警告行：行号类结论可能漂移，常量值/签名类结论仍可直接采信。
+// 旧逻辑 stale 即跳过注入（叠加 registry 物理删除），子 Agent 下次派发从零重读同一批文件
+//（实证：单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）。
+// 措辞不含字面量【任务规范】/【共享记忆】/【当前任务】，避免干扰按标记切分前缀的既有逻辑与测试。
+const sharedStaleWarning = "【失效警告】以下共享记忆所涉文件已被修改，行号可能漂移，常量值/签名类结论仍可直接采信：\n"
+
 // sharedPrefixDisciplineNote 是共享前缀尾部固定的反重读纪律行。
 // 实证（2026-08-14 塔防 9 叶子并行重绘）：契约已含共享方法签名清单，9 个叶子仍各自
 // ReadFile 重读共享代码区（合计 4722 行 ≈ 文件 3.7 倍）——注入内容必须显式声明
@@ -3534,7 +3541,9 @@ func (d *Dispatcher) smokeTargetsFor(parentID, domain string, history []agent.Re
 //     注入本领域专属 spec；遗留单键对所有子 Agent 注入。MD frontmatter 含
 //     goal/acceptance/constraints/files，渲染为【任务规范】段，files mtime 校验失败视为 stale 跳过。
 //   - 自由槽位（"<parentID>:<key>"，key 不以 "spec" 开头）：WriteSharedMemory 写入，
-//     MD body 为 content，渲染为【共享记忆】段，files mtime 校验失败跳过。
+//     MD body 为 content，渲染为【共享记忆】段。files mtime 校验失败或 frontmatter 带
+//     invalidated_at 标记（所涉文件被 EditFile/WriteFile 改过）时不再丢弃，照常注入
+//     并前置 sharedStaleWarning 行号漂移警告（常量值/签名类结论仍可直接采信）。
 //
 // 返回纯前缀（不含【当前任务】标记），供 runSubAgentOnce 统一拼装多段前缀避免嵌套。
 func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain string) string {
@@ -3582,11 +3591,13 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain str
 			sharedParts = append(sharedParts, val)
 			continue
 		}
-		// Layer 3 mtime 校验：任一 file stat 不匹配视为 stale，丢弃避免子 Agent 读旧摘要。
-		if !verifyFileMtimes(fm.Files) {
-			continue
-		}
+		// Layer 3 stale 判定：mtime 不匹配或 registry 打过 invalidated_at 标记。
+		stale := !verifyFileMtimes(fm.Files) || fm.InvalidatedAt != ""
 		if slotName == specSlotName || strings.HasPrefix(slotName, specSlotName+":") {
+			// spec 槽位维持现状：stale 丢弃，避免子 Agent 拿旧验收依据干活。
+			if stale {
+				continue
+			}
 			// spec 槽位需 goal + 至少一条 acceptance 才视为合法规范。
 			if strings.TrimSpace(fm.Goal) == "" || len(fm.Acceptance) == 0 {
 				continue
@@ -3603,6 +3614,11 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain str
 				VerifyLevels: fm.VerifyLevels,
 			})}
 			continue
+		}
+		// 普通共享记忆槽：stale 不再丢弃——照常注入 body 并前置行号漂移警告
+		//（常量值/签名类结论仍可直接采信，见 sharedStaleWarning）。
+		if stale {
+			body = sharedStaleWarning + body
 		}
 		sharedParts = append(sharedParts, body)
 	}

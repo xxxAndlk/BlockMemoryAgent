@@ -969,7 +969,9 @@ func (m *testKVMemory) Keys(ctx context.Context) []string {
 }
 
 // TestBuildSharedPrefix_Layer3StaleDetection 验证 Layer 3：MD frontmatter mtime 不匹配
-// （文件被改）时丢弃该槽位降级 fresh read。旧格式（纯字符串）直接用，向后兼容。
+// （文件被改）时普通共享记忆槽不再丢弃，照常注入并前置【失效警告】行号漂移警告
+//（常量值/签名类结论仍可直接采信，防止"跳过注入"导致子 Agent 从零重读）。
+// 旧格式（纯字符串）直接用，向后兼容。
 func TestBuildSharedPrefix_Layer3StaleDetection(t *testing.T) {
 	// 准备临时文件并记录初始 mtime。
 	dir := t.TempDir()
@@ -997,7 +999,7 @@ func TestBuildSharedPrefix_Layer3StaleDetection(t *testing.T) {
 		t.Fatalf("expected shared memory marker, got: %q", got)
 	}
 
-	// Case 2: 文件被改，mtime 不匹配 -> 丢弃该槽位。
+	// Case 2: 文件被改，mtime 不匹配 -> stale 槽位仍注入，前置【失效警告】行。
 	if err := os.WriteFile(target, []byte("v2"), 0644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
@@ -1005,11 +1007,14 @@ func TestBuildSharedPrefix_Layer3StaleDetection(t *testing.T) {
 	_ = os.Chtimes(target, newTime, newTime)
 
 	got2 := d.buildSharedPrefix(context.Background(), "meta", "")
-	if strings.Contains(got2, "stale.go is v1") {
-		t.Fatalf("expected stale shared discarded, got: %q", got2)
+	if !strings.Contains(got2, "stale.go is v1") {
+		t.Fatalf("expected stale shared still injected (with warning), got: %q", got2)
 	}
-	if strings.Contains(got2, "【共享记忆】") {
-		t.Fatalf("expected no shared memory prefix for stale entry, got: %q", got2)
+	if !strings.Contains(got2, "【失效警告】") || !strings.Contains(got2, "行号可能漂移") {
+		t.Fatalf("expected stale warning line before injected content, got: %q", got2)
+	}
+	if !strings.Contains(got2, "【共享记忆】") {
+		t.Fatalf("expected shared memory prefix retained for stale entry, got: %q", got2)
 	}
 
 	// Case 3: 旧格式（纯字符串）-> 直接用，不校验 mtime。

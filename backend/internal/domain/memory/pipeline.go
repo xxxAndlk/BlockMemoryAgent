@@ -61,27 +61,21 @@ type Pipeline struct {
 	// 达到 2 次后关闭摘要路径，直接用 raw join，避免每次调用白等摘要超时（实证 DeepSeek 余额耗尽）。
 	// 摘要成功时重置为 0。受 mu 保护。
 	consecutiveBalanceErrors int
-	// compressEvery 是历史压缩步频：每 N 轮 ReAct 迭代把中段历史暴力压缩为摘要。
-	// <=0 关闭压缩，仅用 ReActAgent 的 windowMessages 滑动窗口。
-	// 原 summarizeWindow 逻辑从 react_agent.go 迁入此处，职责归位到记忆层。
-	compressEvery int
 	// compressKeepRecent 是压缩时保留的最近原始消息条数；<=0 视为 10。
 	compressKeepRecent int
-	// compressCounters 按 agentID 记录 Assemble 调用次数，用于步频触发压缩。
-	// 受 mu 保护。进程生命周期内不清理，与 events map 同生命周期。
-	compressCounters map[string]int
 	// compressStates 按 agentID 保存已冻结的压缩视图（摘要 + 保留段起点）。
 	// 冻结视图在两次压缩之间字节级稳定：DeepSeek 前缀缓存只在压缩那一轮失效，
 	// 其余轮次 history 纯追加、前缀全命中。受 mu 保护，与 events map 同生命周期。
 	compressStates map[string]compressState
 	// contextBudget 是按上下文 token 阈值触发压缩的默认上限（每角色可由 contextBudgetPerRole 覆盖）。
 	// Assemble 后估算视图 token >= 阈值即触发压缩（保留近 compressKeepRecent，旧压成上下文内摘要块）。
-	// <=0 关闭 token 触发，仅靠 compressEvery 步频兜底。默认 150000（bootstrap 注入）。
+	// <=0 关闭压缩触发（token 阈值是唯一闸门）。默认 150000（bootstrap 注入）。
 	contextBudget int
 	// contextBudgetPerRole 按 roleID 覆盖 contextBudget。未列出角色用 contextBudget。
 	contextBudgetPerRole map[string]int
-	// tokenEstimator 估算消息切片的 token 数；为 nil 时不按 token 触发压缩（仅步频兜底）。
-	// 由 bootstrap 注入 agent.EstimateMessagesTokens，避免 domain/memory 反向依赖 model 包。
+	// tokenEstimator 估算消息切片的 token 数；为 nil 时不触发压缩（token 阈值是唯一闸门，
+	// 无估算器则无从判定阈值）。由 bootstrap 注入 agent.EstimateMessagesTokens，
+	// 避免 domain/memory 反向依赖 model 包。
 	tokenEstimator func([]agent.ReactMessage) int
 	// historySummarizer 是可选的层级压缩摘要器：每次压缩触发把新滑出保留段的中段历史
 	// 压成一个结构化压缩包（LLM），并在压缩包超上限时合并最老的一半。
@@ -95,6 +89,10 @@ type Pipeline struct {
 	compressLoaded map[string]bool
 	// eventsLoaded 记录已尝试从 store 懒加载历史事件的 agentID（重启恢复用），语义同上。
 	eventsLoaded map[string]bool
+	// fileMapProvider 返回该 agent 的【本任务文件地图】注入文本（tool 包触碰文件追踪器渲染：
+	// ReadFile/WriteFile/EditFile 触碰过的文件符号轮廓，mtime 缓存）。为 nil 或返回空时不注入。
+	// 由 bootstrap 注入，避免 domain/memory 反向依赖 tool 包。
+	fileMapProvider func(agentID string) string
 }
 
 // compressState 是某 agent 已冻结的压缩视图状态（层级压缩金字塔）。
@@ -127,7 +125,6 @@ func NewPipeline(store Store) *Pipeline {
 		limit:             DefaultEventLimit,                    // 默认使用 DefaultEventLimit 作为注入上限
 		maxEventsPerAgent: DefaultMaxEventsPerAgent,             // 默认每个 agent 最多保留 DefaultMaxEventsPerAgent 条事件
 		maxBundles:        DefaultMaxBundles,                    // 默认压缩包数量上限
-		compressCounters:  make(map[string]int),                 // 初始化空的 agentID -> 步频计数器映射
 		compressStates:    make(map[string]compressState),       // 初始化空的 agentID -> 冻结压缩视图映射
 		compressLoaded:    make(map[string]bool),                // 初始化压缩状态懒加载记录
 		eventsLoaded:      make(map[string]bool),                // 初始化事件懒加载记录
@@ -173,16 +170,13 @@ func (p *Pipeline) WithSummarizeTimeout(d time.Duration) *Pipeline {
 	return p
 }
 
-// WithCompression 配置历史压缩步频与保留条数。
-// every<=0 关闭压缩（仅用 ReActAgent 的 windowMessages 滑动窗口）。
-// WithCompression 配置历史压缩的步频与保留段长度（步频兜底安全网）。
-// keepRecent<=0 视为 10。原 summarizeWindow 逻辑从 react_agent.go 迁入此处。
-// 职责归位：历史压缩属记忆层，不属 ReAct 层。
+// WithCompression 配置历史压缩的保留段长度（keepRecent<=0 视为 10）。
+// 原 summarizeWindow 逻辑从 react_agent.go 迁入此处，职责归位到记忆层。
 //
-// token 阈值触发（WithContextBudget + WithTokenEstimator）为主，步频为兜底：
-// 估算偏差或 estimator 未注入时，步频保证周期性压缩不缺位。
-func (p *Pipeline) WithCompression(every, keepRecent int) *Pipeline {
-	p.compressEvery = every
+// 触发只由 token 阈值驱动（WithContextBudget + WithTokenEstimator）：步频扳机
+// （每 N 步强制压缩）已退役——实测导致 Agent 每 10 步强制失忆一次、反复重读文件，
+// 主流工具均为 token 阈值触发。summarize_every 配置保留解析但不再驱动任何逻辑。
+func (p *Pipeline) WithCompression(keepRecent int) *Pipeline {
 	if keepRecent <= 0 {
 		keepRecent = 10
 	}
@@ -193,7 +187,7 @@ func (p *Pipeline) WithCompression(every, keepRecent int) *Pipeline {
 // WithContextBudget 配置上下文 token 阈值：Assemble 后视图 token 达阈值即触发压缩
 // （保留近 compressKeepRecent，旧消息压成上下文内摘要块，不落盘）。
 // perRole 按 roleID 覆盖 defaultBudget（如 meta/domain/叶子各配不同阈值）。
-// defaultBudget<=0 关闭 token 触发，仅靠 WithCompression 步频兜底。
+// defaultBudget<=0 关闭压缩触发（token 阈值是唯一闸门，无步频兜底）。
 func (p *Pipeline) WithContextBudget(defaultBudget int, perRole map[string]int) *Pipeline {
 	p.contextBudget = defaultBudget
 	p.contextBudgetPerRole = perRole
@@ -202,9 +196,17 @@ func (p *Pipeline) WithContextBudget(defaultBudget int, perRole map[string]int) 
 
 // WithTokenEstimator 注入消息切片 token 估算器。
 // bootstrap 注入 agent.EstimateMessagesTokens，避免 domain/memory 反向依赖 model 包。
-// 为 nil 时关闭 token 触发压缩，仅步频兜底。
+// 为 nil 时压缩不触发（token 阈值是唯一闸门，无估算器则无从判定阈值），仅保留重启恢复路径。
 func (p *Pipeline) WithTokenEstimator(f func([]agent.ReactMessage) int) *Pipeline {
 	p.tokenEstimator = f
+	return p
+}
+
+// WithFileMapProvider 注入【本任务文件地图】文本提供者（bootstrap 接 tool 包的触碰文件
+// 追踪器）。传 nil 关闭该注入（默认关闭）。渲染失败/无触碰文件时 provider 返回空串，
+// Assemble 原样返回，不影响主流程。
+func (p *Pipeline) WithFileMapProvider(f func(agentID string) string) *Pipeline {
+	p.fileMapProvider = f
 	return p
 }
 
@@ -240,41 +242,37 @@ func (p *Pipeline) resolveContextBudget(roleID string) int {
 // 返回的新切片不会修改传入的 history 参数，调用方可以安全复用原切片。
 //
 // 历史压缩（层级压缩金字塔，冻结视图版，见 pyramid.go）：
-//   - 每 compressEvery 步（或 token 达阈值）触发一次压缩：新滑出保留段的中段历史
-//     压成一个结构化压缩包（LLM 摘要，失败降级截断），追加到该 agent 的压缩包列表；
+//   - token 达阈值触发一次压缩（唯一闸门，步频扳机已退役：实测每 10 步强制失忆、
+//     反复重读文件）：新滑出保留段的中段历史压成一个结构化压缩包（LLM 摘要，
+//     失败降级截断），追加到该 agent 的压缩包列表；
 //   - 压缩包数量超 maxBundles 时，最老的一半合并为 1 个更粗的包，循环往复——
 //     旧上下文以逐级变粗的形式保留，不再 200 字符截断后等同丢弃；
 //   - 两次压缩之间每轮都复用同一冻结视图（压缩包列表与保留段起点不变），history 只在尾部追加，
 //     发给模型的消息前缀字节级稳定——DeepSeek 前缀缓存仅压缩那一轮失效，
 //     其余轮次全部命中（旧实现每轮从全量 history 重算摘要，前缀每压缩轮即被打断）；
 //   - 压缩状态随压缩触发落库（agent_compress_states），进程重启后懒加载恢复；
-//   - 近期事件注入永远放在视图末尾（内容每轮变化，尾部变化不破坏前缀缓存）。
+//   - 近期事件与本任务文件地图注入永远放在视图末尾（内容每轮变化，尾部变化不破坏前缀缓存）。
 func (p *Pipeline) Assemble(role types.RoleDefinition, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
-	return p.injectEvents(agentID, p.compressedView(role.ID, agentID, history))
+	return p.injectFileMap(agentID, p.injectEvents(agentID, p.compressedView(role.ID, agentID, history)))
 }
 
 // compressedView 返回该 agent 的压缩视图：未触发过压缩时原样返回 history；
 // 触发过压缩后返回冻结视图（system 前缀 + 首条 user + 摘要消息 + history[tailStart:]）。
 //
-// 触发条件（二者或）：
-//   - token 阈值：估算候选视图 token >= roleID 的上下文阈值（主，与上下文实际大小挂钩）；
-//   - 步频兜底：step%every==0（防估算偏差或 estimator 未注入时缺位）。
+// 触发条件（唯一闸门）：token 阈值——估算候选视图 token >= roleID 的上下文阈值。
+// 步频扳机（step%every==0）已退役：与上下文实际大小脱钩，实测每 10 步强制压缩
+// 致 Agent 周期性失忆、反复重读文件；150K token 阈值足以兜底估算偏差。
 //
-// 压缩只作用于 history 本体；近期事件消息在 Assemble 里于压缩之后追加，
+// 压缩只作用于 history 本体；近期事件/文件地图消息在 Assemble 里于压缩之后追加，
 // 不会进入保留段、也不会在下个周期被压进中段摘要。
 func (p *Pipeline) compressedView(roleID, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
-	if p.compressEvery <= 0 && p.tokenEstimator == nil {
-		// 压缩触发全关：仍尝试恢复已持久化的压缩视图（重启场景），无状态则原样返回。
+	if p.tokenEstimator == nil {
+		// 无估算器无法按 token 触发：仍尝试恢复已持久化的压缩视图（重启场景），无状态则原样返回。
 		if st, ok := p.loadCompressStateOnce(agentID, len(history)); ok && st.TailStart <= len(history) {
 			return buildCompressedView(history, st)
 		}
 		return history
 	}
-
-	p.mu.Lock()
-	p.compressCounters[agentID]++
-	step := p.compressCounters[agentID]
-	p.mu.Unlock()
 
 	// 候选视图：现冻结状态应用后的视图（或原 history）。token 触发据此判定。
 	p.mu.RLock()
@@ -294,9 +292,8 @@ func (p *Pipeline) compressedView(roleID, agentID string, history []agent.ReactM
 	}
 
 	threshold := p.resolveContextBudget(roleID)
-	overBudget := threshold > 0 && p.tokenEstimator != nil && p.tokenEstimator(candidate) >= threshold
-	stepHit := p.compressEvery > 0 && step%p.compressEvery == 0
-	if overBudget || stepHit {
+	overBudget := threshold > 0 && p.tokenEstimator(candidate) >= threshold
+	if overBudget {
 		// 层级压缩：把新滑出保留段的中段历史压成一个压缩包并冻结新视图（见 pyramid.go）。
 		p.advanceCompression(agentID, history)
 	}
@@ -394,6 +391,26 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 	out = append(out, history...)
 	// 再把上下文消息放到末尾，避免每轮变化的内容破坏前缀缓存。
 	out = append(out, ctxMsg)
+	return out
+}
+
+// injectFileMap 在压缩视图与近期事件之后追加【本任务文件地图】system 消息：
+// Agent 本任务触碰过（ReadFile/WriteFile/EditFile）的文件符号轮廓，常驻尾部注入，
+// 压缩循环压不掉（解决"压缩后连哪个函数在哪个文件哪行都忘了"的失忆重读）。
+// 与 injectEvents 同款尾部注入位：内容随触碰集变化，放末尾不破坏前缀缓存，
+// 且发生在压缩视图之后，不进入压缩输入。provider 未注入/返回空/agentID 为空时原样返回。
+func (p *Pipeline) injectFileMap(agentID string, history []agent.ReactMessage) []agent.ReactMessage {
+	if p.fileMapProvider == nil || agentID == "" {
+		return history
+	}
+	body := p.fileMapProvider(agentID)
+	if body == "" {
+		// 无触碰文件或全部不可读：无需生成上下文消息，避免插入空内容
+		return history
+	}
+	out := make([]agent.ReactMessage, 0, len(history)+1)
+	out = append(out, history...)
+	out = append(out, agent.ReactMessage{Role: "system", Content: body})
 	return out
 }
 

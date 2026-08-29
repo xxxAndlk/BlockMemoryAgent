@@ -129,8 +129,9 @@ plugins:
 
   # ui_design：Agent 画图工具（kind: mcp，2026-08-17 新增）。
   # open_design 守护进程（上方 service 插件）无 MCP 端点，本插件是其 REST API 的
-  # stdio MCP 桥（docker/open-design-mcp）：od_image_generate 生成图片并落盘
-  # volumes 映射的宿主目录（返回 workspace 相对路径供 HTML/CSS 引用），od_image_list 列历史产物。
+  # stdio MCP 桥（docker/open-design-mcp）：od_image_generate 生成图片（单张 prompt /
+  # 批量 prompts 数组桥内顺序串行）并落盘 volumes 映射的宿主目录（返回 workspace
+  # 相对路径供 HTML/CSS 引用），od_image_list 列历史产物。
   # roles（TODO #55 由 ["ui_assistant"] 放宽）：meta 纳入派发考量（MetaAgent 看得见才会把
   # AI 贴图路线写进 spec）；domain 允许领域 Agent 直接出图；ui_assistant 原有专用角色保留。
   # 落盘目录约定（2026-08-18 修订）：产物默认落 <工作目录>/.bma/od-artifacts（草稿/临时用途）；
@@ -139,7 +140,9 @@ plugins:
   # Agent 被迫写脚本复制两份规范名，9 张图变 27 个文件）。下方 volumes 挂整个工作目录，
   # ${WORKDIR} 在插件 Init 时展开为启动目录绝对路径；ui_preview 挂载同一工作目录，
   # file:///workspace/... 可达全部产物。
-  # exec_timeout_sec 240：Seedream 出图 10-60s，留足桥内轮询窗口（默认 120s 会掐断长任务）。
+  # exec_timeout_sec 1200：od_image_generate 支持 prompts 批量（桥内顺序串行，daemon 单任务语义），
+  # 批量 20+ 张 × 单张最长 60s 可能逼近 20min；单张场景远低于此上限，放大上限无负面影响
+  #（默认 120s 会掐断长任务，单张时代的 240s 又兜不住批量）。
   ui_design:
     kind: mcp
     enabled: true
@@ -162,7 +165,8 @@ plugins:
         # 缺省产物（未传 save_as 的草稿）返回给 Agent 的宿主侧相对路径前缀（相对工作目录）。
         OD_OUTPUT_REL_PREFIX: .bma/od-artifacts
       roles: ["meta","domain","ui_assistant"]
-      exec_timeout_sec: 240
+      # 1200s：批量 20+ 张 × 单张最长 60s（桥内串行）可能逼近 20min，见上方注释。
+      exec_timeout_sec: 1200
 
   # ui_preview：UI 渲染回显（Agent 的"眼睛"，2026-08-17 新增）。
   # Microsoft Playwright MCP（Apache-2.0，github.com/microsoft/playwright-mcp）：

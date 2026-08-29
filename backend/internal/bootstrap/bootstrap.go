@@ -243,11 +243,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	memoryPipeline := memory.NewPipeline(memory.NewPostgresEventStore(pgStore.DB())).
 		WithSummarizer(newEventSummarizer(modelFactory)).
 		WithSummarizeTimeout(time.Duration(cfg.Agent.SummarizeTimeoutSec)*time.Second). // 思考型模型摘要需 60-180s，旧 5s 硬编码致摘要全挂
-		WithCompression(cfg.Agent.SummarizeEvery, cfg.Agent.SummarizeKeepRecent). // 记忆流水线
+		WithCompression(cfg.Agent.SummarizeKeepRecent). // 记忆流水线（保留段长度；触发仅由 token 阈值驱动，summarize_every 步频扳机已退役）
 		WithContextBudget(cfg.Agent.ContextTokenBudget, cfg.Agent.TokenBudgetPerRole). // 上下文 token 阈值触发压缩（默认 150K，保留近 10 旧压成摘要块）
 		WithTokenEstimator(agent.EstimateMessagesTokens). // 注入消息 token 估算器，避免 domain/memory 反向依赖 model
 		WithHistorySummarizer(newHistorySummarizer(modelFactory)). // 层级压缩：中段压成结构化压缩包，超限合并最老一半
-		WithMaxBundles(cfg.Agent.SummarizeMaxBundles)
+		WithMaxBundles(cfg.Agent.SummarizeMaxBundles).
+		WithFileMapProvider(toolRegistry.FileMapText) // 任务级文件小地图：触碰文件符号轮廓尾部常驻注入，压缩压不掉
 
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
@@ -741,7 +742,10 @@ func newEventSummarizer(f *model.ModelFactory) memory.EventSummarizer {
 
 // newHistorySummarizer 构造一个 memory.HistorySummarizer，供层级压缩（压缩金字塔）使用：
 // merge=false 把新滑出保留段的中段历史压成结构化压缩包；merge=true 把若干旧压缩包
-// 合并为一个更粗的包。结构化四节（决策/进展/待办/约束）比纯散文在多层合并时更抗漂移。
+// 合并为一个更粗的包。结构化五节（决策/进展/待办/约束/文件要点）比纯散文在多层合并时更抗漂移。
+// 【文件要点】节的动机（实证）：压缩丢已读文件内容导致领域 Agent 失忆、反复重读同一文件
+//（实测单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）——读到的文件关键事实
+//（路径 + 行号区间 + 函数签名/常量值/结论）必须随压缩包存活，总字数上限相应从 300 放宽到 500。
 // 失败时返回错误，由 Pipeline 降级为截断式压缩，主流程不受影响。
 func newHistorySummarizer(f *model.ModelFactory) memory.HistorySummarizer {
 	if f == nil {
@@ -751,13 +755,15 @@ func newHistorySummarizer(f *model.ModelFactory) memory.HistorySummarizer {
 		var prompt string
 		if merge {
 			prompt = "以下是一个 Agent 会话的若干历史压缩包（按时间从旧到新）。把它们合并为一个结构化压缩包，" +
-				"400 字以内，保持四节结构：【决策】已拍板的结论；【进展】已完成的工作与关键文件路径；" +
-				"【待办】未完成事项；【约束】用户明确要求。保留仍然有效的结论与文件路径，" +
+				"500 字以内，保持五节结构：【决策】已拍板的结论；【进展】已完成的工作与关键文件路径；" +
+				"【待办】未完成事项；【约束】用户明确要求；【文件要点】已读文件的关键事实：" +
+				"路径 + 行号区间 + 函数签名/常量值/结论。保留仍然有效的结论、文件路径与文件要点，" +
 				"丢弃已被推翻或完成清理的内容。直接输出压缩包，不要解释：\n" + text
 		} else {
-			prompt = "将以下 Agent 对话中段历史压成一个结构化压缩包，300 字以内，分四节：" +
+			prompt = "将以下 Agent 对话中段历史压成一个结构化压缩包，500 字以内，分五节：" +
 				"【决策】已拍板的结论；【进展】已完成的工作与关键文件路径；【待办】未完成事项；" +
-				"【约束】用户明确要求。直接输出压缩包，不要解释：\n" + text
+				"【约束】用户明确要求；【文件要点】已读文件的关键事实：路径 + 行号区间 + " +
+				"函数签名/常量值/结论（此节必须保留，防压缩后失忆重读）。直接输出压缩包，不要解释：\n" + text
 		}
 		return f.CallLightweightWithRetry(ctx, prompt)
 	}

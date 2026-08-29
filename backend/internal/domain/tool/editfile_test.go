@@ -243,7 +243,8 @@ func TestEditFile_EmptyOldStringRejected(t *testing.T) {
 }
 
 // TestEditFile_InvalidatesSharedMemory 验证 Layer 2：EditFile 成功后，
-// 引用同 path 的 KV entry 被删除（与 WriteFile 行为一致）。
+// 引用同 path 的 KV entry 被标记 stale（invalidated_at）但不物理删除、body 保留
+//（与 WriteFile 行为一致）。
 func TestEditFile_InvalidatesSharedMemory(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "bar.go")
@@ -281,9 +282,20 @@ func TestEditFile_InvalidatesSharedMemory(t *testing.T) {
 		t.Fatalf("EditFile failed: %s", eres.Error)
 	}
 
-	// KV entry 应被删除。
-	if _, ok := store.items["meta-1:shared"]; ok {
-		t.Fatal("expected KV entry deleted after EditFile invalidated it")
+	// KV entry 应保留并打上 stale 标记（invalidated_at），body 原样留存。
+	val, ok := store.items["meta-1:shared"]
+	if !ok {
+		t.Fatal("expected KV entry retained (marked stale, not deleted) after EditFile invalidated it")
+	}
+	fm, body, decOK := DecodeSharedMD(val)
+	if !decOK {
+		t.Fatalf("invalidated entry should remain decodable MD, got: %q", val)
+	}
+	if fm.InvalidatedAt == "" {
+		t.Fatalf("expected invalidated_at marked in frontmatter, got: %q", val)
+	}
+	if body != "bar.go defines package bar" {
+		t.Fatalf("expected body preserved after invalidation, got: %q", body)
 	}
 }
 

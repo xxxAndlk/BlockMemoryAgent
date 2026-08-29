@@ -621,7 +621,8 @@ func TestWriteSharedMemory_StructuredAndFileTracking(t *testing.T) {
 }
 
 // TestWriteFile_InvalidatesSharedMemory 验证 Layer 2：WriteFile 成功后，
-// 引用同 path 的 KV entry 被删除，防止子 Agent 读到旧摘要。
+// 引用同 path 的 KV entry 被标记 stale（invalidated_at）但不物理删除、body 保留——
+// 注入侧照常注入并附行号漂移警告，防止"删记忆"导致下次派发从零重读。
 func TestWriteFile_InvalidatesSharedMemory(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "bar.go")
@@ -659,9 +660,20 @@ func TestWriteFile_InvalidatesSharedMemory(t *testing.T) {
 		t.Fatalf("WriteFile failed: %s", wres.Error)
 	}
 
-	// KV entry 应被删除。
-	if _, ok := store.items["meta-1:shared"]; ok {
-		t.Fatal("expected KV entry deleted after WriteFile invalidated it")
+	// KV entry 应保留并打上 stale 标记（invalidated_at），body 原样留存。
+	val, ok := store.items["meta-1:shared"]
+	if !ok {
+		t.Fatal("expected KV entry retained (marked stale, not deleted) after WriteFile invalidated it")
+	}
+	fm, body, decOK := DecodeSharedMD(val)
+	if !decOK {
+		t.Fatalf("invalidated entry should remain decodable MD, got: %q", val)
+	}
+	if fm.InvalidatedAt == "" {
+		t.Fatalf("expected invalidated_at marked in frontmatter, got: %q", val)
+	}
+	if body != "bar.go defines package bar" {
+		t.Fatalf("expected body preserved after invalidation, got: %q", body)
 	}
 }
 
