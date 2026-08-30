@@ -124,6 +124,7 @@ agent:
 
   # -- 工具沙箱（安全）--
   tool_sandbox_disabled: false   # true 时关闭写路径逃逸检测（保留命令黑名单）
+  tool_approval_disabled: true   # 全信任模式：true 关闭全部破坏性操作审批（WriteFile/EditFile 生产写入、RunCommand 危险命令模式、插件 Destructive 工具一律直接执行，不再推「需确认」）。2026-08-30 事故动机：computer_use 插件全工具自标 destructive，视频诊断会话 list/read/wait 等无害只读调用也被拦 30+ 次，审批风暴吃掉整晚墙钟。仅关确认链，命令黑名单（hard block）与写路径沙箱不受影响；单人开发机可开，多人/生产环境保持 false
   tool_sandbox_allowed_paths: [] # 允许读写的额外绝对路径白名单
   tool_sandbox_blocked_cmds: []  # 追加到默认命令黑名单的额外命令
   production_workdir: ""         # 生产环境工作目录（绝对路径）；非空时其下的破坏性操作（WriteFile/写类命令）需用户确认；空=仅危险命令模式（git push/rm -rf 等）需确认

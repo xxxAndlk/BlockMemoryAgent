@@ -5,6 +5,7 @@ package tool
 //   - 非生产目录 WriteFile 不触发（保持自主）；
 //   - RunCommand 危险命令模式（git push 等）与目录无关恒触发；普通验证命令不触发；
 //   - approvalHook nil（默认）零行为变化；
+//   - 全信任模式（SetApprovalDisabled）下 hook 零调用、破坏性操作直接执行；
 //   - isDangerousCommand / inProductionWorkDir 纯函数。
 
 import (
@@ -134,6 +135,36 @@ func TestDispatch_ApprovalHook_DangerousCommand(t *testing.T) {
 	_ = res3
 	if hookCalls != 2 {
 		t.Fatalf("verification command must not trigger approval, got %d calls", hookCalls)
+	}
+}
+
+// TestDispatch_ApprovalDisabled_FullTrust 验证全信任模式（tool_approval_disabled）：
+// 开启后危险命令、生产目录 WriteFile 一律不再触发确认，直接执行——hook 零调用。
+func TestDispatch_ApprovalDisabled_FullTrust(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, &config.AgentConfig{SafetyConfig: config.SafetyConfig{ProductionWorkDir: dir}}, nil)
+	r.SetApprovalDisabled(true)
+	hookCalls := 0
+	r.SetApprovalHook(func(ctx context.Context, name string, args map[string]any) (bool, error) {
+		hookCalls++
+		return false, nil // 若被调即失败：全信任模式下 hook 不应触达
+	})
+	ctx := WithAgentID(context.Background(), "meta")
+
+	// 危险命令模式（非生产目录也恒触发的那类）：全信任下直接执行不问。
+	if _, err := r.Dispatch(ctx, "RunCommand", map[string]any{"command": "git push origin main"}); err != nil {
+		t.Fatalf("full trust should not error dispatch: %v", err)
+	}
+	// 生产目录 WriteFile（静态 destructive）：全信任下直接写。
+	res, err := r.Dispatch(ctx, "WriteFile", map[string]any{"path": "a.txt", "content": "42"})
+	if err != nil || res == nil || !res.Success {
+		t.Fatalf("full trust write should succeed, res=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "a.txt")); err != nil {
+		t.Fatalf("file should be written without approval: %v", err)
+	}
+	if hookCalls != 0 {
+		t.Fatalf("approval hook must never fire in full trust mode, got %d calls", hookCalls)
 	}
 }
 

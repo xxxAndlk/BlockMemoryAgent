@@ -140,6 +140,9 @@ type Registry struct {
 	// productionWorkDir 是配置的生产环境工作目录（绝对路径）；空 = 未启用生产边界确认，
 	// 仅危险命令模式（isDangerousCommand）触发确认。
 	productionWorkDir string
+	// approvalDisabled 全信任模式（config: tool_approval_disabled）：true 时 needsApproval
+	// 直接短路，所有破坏性操作不再推「需确认」、照常执行（动机与边界见 SafetyConfig 注释）。
+	approvalDisabled bool
 	// pluginMgr 是 plugin_* 工具（TODO #51）依赖的插件管理面，由 bootstrap 注入
 	// plugins.ToolManagerAdapter；nil 时工具返回未配置错误。
 	pluginMgr PluginManager
@@ -315,15 +318,23 @@ func (r *Registry) SetApprovalHook(fn ApprovalHookFunc) {
 	}
 }
 
+// SetApprovalDisabled 注入全信任模式开关（config: tool_approval_disabled）。
+// true 时所有破坏性操作不再推「需确认」，直接执行。
+func (r *Registry) SetApprovalDisabled(disabled bool) {
+	if r != nil {
+		r.approvalDisabled = disabled
+	}
+}
+
 // needsApproval 判定本次工具调用是否需要用户确认（破坏性工具分级）：
 //   - WriteFile（静态 destructive）：仅生产工作目录下触发；
 //   - RunCommand：命中危险命令模式（git push/rm -rf/drop table 等）恒触发（与目录无关）；
 //     生产目录下的写类命令（rm/mv/cp/touch/mkdir/git rm/git mv）亦触发；
 //   - 其余工具与普通命令：不触发，保持自主。
 //
-// approvalHook 为 nil 时不触发（零行为变化）。
+// approvalHook 为 nil 时不触发（零行为变化）；approvalDisabled（全信任模式）时一律不触发。
 func (r *Registry) needsApproval(name string, args map[string]any) bool {
-	if r == nil || r.approvalHook == nil {
+	if r == nil || r.approvalHook == nil || r.approvalDisabled {
 		return false
 	}
 	prod := inProductionWorkDir(r.WorkDir(), r.productionWorkDir)

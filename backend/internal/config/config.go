@@ -106,6 +106,14 @@ type LLMRuntimeConfig struct {
 // SafetyConfig 工具沙箱与安全策略配置。
 type SafetyConfig struct {
 	ToolSandboxDisabled     bool     `yaml:"tool_sandbox_disabled"`      // true 时关闭写路径逃逸检测（保留命令黑名单）
+	// ToolApprovalDisabled 全信任模式（默认 false）：true 时关闭全部破坏性操作审批，
+	// needsApproval 直接短路——WriteFile/EditFile 生产目录写入、RunCommand 危险命令
+	// 模式、插件 Destructive 工具（computer_use 全工具自标 destructive）一律不再推
+	// 「需确认」，直接执行。动机（2026-08-30 事故）：computer_use 插件全工具自标
+	// destructive，视频诊断会话 30+ 次【需确认】拦截 list/read/wait 等无害只读调用，
+	// 审批风暴吃掉整晚墙钟。仅关闭确认链，命令黑名单（hard block）与写路径沙箱不受影响；
+	// 信任模型等于把裁决权从"每次人工确认"移交给提示词纪律 + 沙箱，单人开发机可开。
+	ToolApprovalDisabled bool `yaml:"tool_approval_disabled"`
 	ToolSandboxAllowedPaths []string `yaml:"tool_sandbox_allowed_paths"` // 允许读写的额外绝对路径白名单
 	ToolSandboxBlockedCmds  []string `yaml:"tool_sandbox_blocked_cmds"`  // 额外命令黑名单（追加到默认黑名单）
 	// ProductionWorkDir 生产环境工作目录（绝对路径，默认空=未启用）。

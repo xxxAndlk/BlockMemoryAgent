@@ -227,6 +227,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
 	// Executor 永远跑 DefaultSandboxConfig（默认禁写工作目录外、保留命令黑名单）。
 	toolRegistry.SetSandboxConfig(&cfg.Agent.SafetyConfig)
+	// 全信任模式（tool_approval_disabled，默认 false）：true 时关闭全部破坏性操作审批
+	// ——WriteFile/EditFile 生产写入、RunCommand 危险命令模式、插件 Destructive 工具
+	// （computer_use 全工具自标 destructive）不再推「需确认」，直接执行。仅关闭确认链，
+	// 命令黑名单与写路径沙箱不受影响（见 SafetyConfig.ToolApprovalDisabled 注释）。
+	toolRegistry.SetApprovalDisabled(cfg.Agent.ToolApprovalDisabled)
 	// 注入角色级写路径解析器（Layer 4）：roleID -> 该角色 Sandbox.AllowedWritePaths。
 	// 角色未配 sandbox.allowed_write_paths 时返 nil，enforceRoleWritePath 跳过，现有写行为不变。
 	toolRegistry.SetRoleWritePathResolver(func(roleID string) []string {
