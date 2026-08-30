@@ -79,3 +79,4 @@ help:
 	@echo "  plugins-up    - start self-hosted Firecrawl stack (web_search data plane)"
 	@echo "  plugins-down  - stop self-hosted Firecrawl stack"
 	@echo "  plugins-build - build/pull plugin images (web_search / computer_use / open_design / ui_design / ui_preview)"
+	@echo "  note: TUI 视频附件默认 native 直传（mp4/avi/mov ≤ native_max_mb 无需 ffmpeg）；webm/mkv/超限回落抽帧需宿主机 ffmpeg（winget install Gyan.FFmpeg），缺失时降级为仅元数据"

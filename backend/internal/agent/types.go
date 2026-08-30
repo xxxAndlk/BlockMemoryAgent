@@ -4,6 +4,9 @@ package agent
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
@@ -49,6 +52,75 @@ func ParseWireImages(imgs []WireImage) ([]tool.ResultImage, error) {
 	return out, nil
 }
 
+// 用户消息视频限流：视频体积远超图片，传宿主路径不传内容
+//（TUI 与本地 Gin 服务同机同进程，路径语义成立；未来前后端分离需改 multipart 上传）。
+// 双层执行：TUI 粘贴时拒绝 + HandleSessionMessage 400。
+const (
+	// MaxMessageVideos 单条用户消息最多携带视频个数。
+	MaxMessageVideos = 2
+	// DefaultMaxVideoBytes 单个视频文件默认大小上限（200MB）。
+	DefaultMaxVideoBytes = 200 << 20
+)
+
+// videoExtMIME 视频扩展名白名单（key 均为小写，查找时 strings.ToLower）。
+var videoExtMIME = map[string]string{
+	".mp4":  "video/mp4",
+	".webm": "video/webm",
+	".mov":  "video/quicktime",
+	".mkv":  "video/x-matroska",
+	".avi":  "video/x-msvideo",
+}
+
+// VideoMIMEByExt 按文件扩展名（含点、大小写不敏感）返回视频 MIME 类型；
+// 非白名单扩展名返回 false。TUI 侧判定剪贴板文件是否视频复用此函数。
+func VideoMIMEByExt(ext string) (string, bool) {
+	mime, ok := videoExtMIME[strings.ToLower(ext)]
+	return mime, ok
+}
+
+// WireVideo 是用户消息视频附件的 HTTP 线型 DTO：只传宿主机文件路径，
+// 服务端（与 TUI 同机）读文件抽帧，避免 base64 大体积过 JSON。
+type WireVideo struct {
+	// Path 视频文件的宿主机绝对路径。
+	Path string `json:"path"`
+	// MIMEType 视频类型，可省略（服务端按扩展名推断回填）。
+	MIMEType string `json:"mime_type,omitempty"`
+}
+
+// ParseWireVideos 校验并规范化 HTTP 线型视频列表：数量上限、扩展名白名单、
+// 文件存在、大小 ≤ maxBytes（maxBytes<=0 取 DefaultMaxVideoBytes），
+// mime 缺省按扩展名回填。供 server 层使用（超限返回 400 语义的错误）。
+func ParseWireVideos(vs []WireVideo, maxBytes int64) ([]WireVideo, error) {
+	if len(vs) > MaxMessageVideos {
+		return nil, fmt.Errorf("单条消息最多携带 %d 个视频", MaxMessageVideos)
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxVideoBytes
+	}
+	out := make([]WireVideo, 0, len(vs))
+	for _, v := range vs {
+		if v.Path == "" {
+			return nil, fmt.Errorf("视频路径为空")
+		}
+		mime, ok := VideoMIMEByExt(filepath.Ext(v.Path))
+		if !ok {
+			return nil, fmt.Errorf("不支持的视频格式 %q（支持 mp4/webm/mov/mkv/avi）", filepath.Ext(v.Path))
+		}
+		info, err := os.Stat(v.Path)
+		if err != nil {
+			return nil, fmt.Errorf("视频文件不可读 %s: %w", v.Path, err)
+		}
+		if info.Size() > maxBytes {
+			return nil, fmt.Errorf("视频超过大小上限（%dMB）: %s", maxBytes>>20, v.Path)
+		}
+		if v.MIMEType == "" {
+			v.MIMEType = mime
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 // CreateRequest 表示创建新会话的请求。
 // Goal 是会话的目标或任务描述，Meta 用于携带额外的元数据。
 type CreateRequest struct {
@@ -56,6 +128,9 @@ type CreateRequest struct {
 	Meta map[string]any
 	// Images 首条消息携带的图片（Alt+V 粘贴）：内存透传不持久化，仅首轮注入。
 	Images []tool.ResultImage
+	// Videos 首条消息携带的视频（Alt+V 粘贴视频文件）：CreateSession 内抽帧
+	// 并入 Images、元数据文本并入 Goal，Videos 本身不持久化。
+	Videos []WireVideo
 }
 
 // ResumeRequest 表示恢复一个此前暂停或已结束的会话。
@@ -74,6 +149,10 @@ type Message struct {
 	// Images 用户随消息粘贴的图片（Alt+V）：内存透传不持久化，ToServerSession
 	// 显式映射不透出；重启后历史仅保留 Content 里的 [image:N] 占位文本。
 	Images []tool.ResultImage
+	// Videos 用户随消息粘贴的视频文件（Alt+V 粘贴视频）：sendMessage 内抽帧
+	// 并入 Images、元数据文本并入 Content 后即弃（不入 session.Messages），
+	// 与 Images 同为内存透传不持久化。
+	Videos []WireVideo
 }
 
 // Query 表示对会话发起的只读查询。

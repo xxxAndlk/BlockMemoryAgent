@@ -6,6 +6,8 @@ import (
 	"fmt"           // 构造会话 ID
 	"net/http"      // HTTP handler 测试
 	"net/http/httptest"
+	"os"       // 写临时假视频文件
+	"path/filepath" // 临时视频路径
 	"strings" // 请求体构造
 	"sync"    // 并发保护 mock 数据
 	"testing" // 测试框架
@@ -284,4 +286,65 @@ func TestHandleSessionMessageWithImages(t *testing.T) {
 	if rec2.Code != http.StatusBadRequest {
 		t.Fatalf("超限 status = %d, want 400", rec2.Code)
 	}
+}
+
+// TestHandleSessionMessageWithVideos 验证 POST /api/sessions/{id}/message 的
+// videos 字段：合法路径透传 Message.Videos；扩展名白名单/超数量/路径不存在 400。
+func TestHandleSessionMessageWithVideos(t *testing.T) {
+	facade := newTestAgent(t)
+	cap := &capturingAgent{mockAgentForServer: *newMockAgentForServer()}
+	created, _ := cap.mockAgentForServer.CreateSession(context.Background(), agent.CreateRequest{Goal: "vid"})
+	_ = facade
+
+	mgr := NewSessionManager(cap)
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/api/sessions/:id/message", mgr.HandleSessionMessage)
+
+	// 合法：假 .mp4（ParseWireVideos 只校验存在/大小，不解析内容）→ 透传。
+	valid := filepath.Join(t.TempDir(), "clip.mp4")
+	if err := os.WriteFile(valid, make([]byte, 10), 0o644); err != nil {
+		t.Fatalf("写假视频: %v", err)
+	}
+	body := `{"content":"分析这个视频","videos":[{"path":` + jsonString(t, valid) + `}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/"+created.ID+"/message", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	cap.mu.Lock()
+	if len(cap.sent) != 1 {
+		t.Fatalf("Send 次数 = %d, want 1", len(cap.sent))
+	}
+	if len(cap.sent[0].Videos) != 1 || cap.sent[0].Videos[0].Path != valid || cap.sent[0].Videos[0].MIMEType != "video/mp4" {
+		t.Fatalf("videos 透传不符: %+v", cap.sent[0].Videos)
+	}
+	cap.mu.Unlock()
+
+	// 非法：扩展名白名单 / 超 2 个 / 文件不存在 / 相对路径 → 400。
+	pj := jsonString(t, valid)
+	for name, b := range map[string]string{
+		"bad-ext":       `{"content":"x","videos":[{"path":"C:/nope.exe"}]}`,
+		"over-limit":    `{"content":"x","videos":[{"path":` + pj + `},{"path":` + pj + `},{"path":` + pj + `}]}`,
+		"missing-file":  `{"content":"x","videos":[{"path":"C:/definitely_missing_x9.mp4"}]}`,
+		"relative-path": `{"content":"x","videos":[{"path":"relative.mp4"}]}`,
+	} {
+		req2 := httptest.NewRequest(http.MethodPost, "/api/sessions/"+created.ID+"/message", strings.NewReader(b))
+		rec2 := httptest.NewRecorder()
+		r.ServeHTTP(rec2, req2)
+		if rec2.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", name, rec2.Code)
+		}
+	}
+}
+
+// jsonString 把字符串编码为 JSON 字符串字面量（处理 Windows 路径反斜杠转义）。
+func jsonString(t *testing.T, s string) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(b)
 }

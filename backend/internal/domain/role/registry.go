@@ -37,6 +37,12 @@ const defaultDomainAgentSystemPrompt = `你是领域负责人（DomainAgent）�
 4. 编码类任务：写完代码文件立即 RunCommand 语法检查（node -c / go build / py_compile），不带病往下走。
    非编码产出（分析/方案/文案）对照任务验收标准逐条纸面核对，不套用代码语法检查口径。
 
+【计划纪律】
+- 任何任务动手产出前先 submit_plan(task_summary, plan) 给上级确认（无大小豁免），批准后才执行；
+  未经批准禁止产出/改动。被驳回按意见修订重提，循环直到批准；认为上级意见有误时在修订版中
+  标注分歧点，不拒绝修改。收到【计划审批请求】邮箱消息（首行含 plan_id）时用 review_plan
+  及时审批：纠正到可执行为止，可行即放行。
+
 【结果汇总】
 - 自执行部分直接写入结论；有下拆时按 [mailbox from <id>] 摘要整合。
 - 你的最终答复就是回灌给父 Agent 的交付物：结论先行、自包含、附关键文件路径与验收证据；不要写过程流水账。`
@@ -179,7 +185,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 		// 永远优先于需挂载的 web_search 插件被选中；联网调研集中于 meta + web_search 插件。
 		// roles.yaml meta_agent.tools 非空时整体覆盖白名单（基准单 Agent 模式：
 		// 去掉 call_sub_agent、放开执行类工具）；为空保持上述内置默认。
-		tools := []string{"call_sub_agent", "call_sub_agents", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles", "RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "write_plan", "remember_preference", "search_knowledge", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount"}
+		tools := []string{"call_sub_agent", "call_sub_agents", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles", "RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "write_plan", "submit_plan", "review_plan", "remember_preference", "search_knowledge", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount"}
 		if len(r.cfg.MetaAgent.Tools) > 0 {
 			tools = r.cfg.MetaAgent.Tools
 		}
@@ -214,6 +220,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 				"WriteSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RunCommand",
 				"RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "search_knowledge",
 				"plugin_list", "tool_catalog", "tool_mount", "tool_unmount",
+				"submit_plan", "review_plan",
 			},
 			CanBeCalled: true,
 		}

@@ -196,6 +196,19 @@ type Dispatcher struct {
 	// 为 false 时跳过强制，injectSpec 仍生效（graceful degrade，spec 缺失则无前缀注入）。
 	specEnforcementEnabled bool
 
+	// planConfirmEnabled 计划确认机制开关（plan_confirm.go）：下级中大型任务动手前
+	// submit_plan 给上级（顶层给用户）确认，批准后才执行。默认 false（零值），
+	// bootstrap 按 cfg.Agent.PlanConfirmationEnabled 注入（默认 true）。关闭时
+	// submit_plan 直通不阻塞，零行为变化。
+	planConfirmEnabled bool
+	// planConfirmTimeout 单次计划审批等待超时；<=0 时用 defaultPlanConfirmTimeout（fail-open）。
+	planConfirmTimeout time.Duration
+	// planMaxRevisions 每 Agent 计划被驳回重提上限；<=0 表示不限制（循环直到批准，
+	// 默认）。>0 时达上限不放行，转 send_message(escalate) 升级仲裁（防无限循环）。
+	planMaxRevisions int
+	// planState 计划确认会话级状态（等待者注册表 + 驳回计数），NewDispatcher 初始化。
+	planState *planConfirmState
+
 	// maxTotalDispatches 全局派发总数上限：同一 session 内所有角色的派发合计超过该值时
 	// 拒绝进一步派发，防止编排失控。<=0 表示不限制。计数随用户新消息重置。
 	maxTotalDispatches int
@@ -976,6 +989,7 @@ func NewDispatcher(
 		taskRuneSoftLimit: 3000,             // task 文本软上限（TODO #35），WithTaskRuneLimits 覆盖
 		taskRuneHardLimit: 4000,
 		softStops:         make(map[string]bool),
+		planState:         newPlanConfirmState(),
 	}
 }
 
@@ -1207,6 +1221,28 @@ func (d *Dispatcher) WithBlockMemorySaver(s BlockMemorySaver, enabled bool) *Dis
 func (d *Dispatcher) WithSpecEnforcement(enabled bool) *Dispatcher {
 	d.specEnforcementEnabled = enabled
 	return d
+}
+
+// WithPlanConfirmation 配置计划确认机制（plan_confirm.go）：enabled 开启后 submit_plan
+// 阻塞等待上级/用户确认，关闭时直通不阻塞；timeout 单次审批等待上限（<=0 用默认 10m，
+// 超时 fail-open 按计划继续）；maxRevisions 每 Agent 被驳回重提上限（<=0 不限制，
+// 循环直到批准；>0 时达上限转 escalate 仲裁仍不放行）。bootstrap 按 cfg.Agent 注入。
+func (d *Dispatcher) WithPlanConfirmation(enabled bool, timeout time.Duration, maxRevisions int) *Dispatcher {
+	d.planConfirmEnabled = enabled
+	d.planConfirmTimeout = timeout
+	d.planMaxRevisions = maxRevisions
+	if d.planState == nil {
+		d.planState = newPlanConfirmState()
+	}
+	return d
+}
+
+// RegisterPlanTools 将 submit_plan / review_plan 工具安装到传入的工具注册表中
+// （plan_confirm.go 计划确认机制）。角色可见性由 role.Registry 的 meta/domain
+// 内置工具白名单 + roles.yaml 覆盖控制。
+func (d *Dispatcher) RegisterPlanTools(r *tool.Registry) {
+	r.Register(&submitPlanTool{dispatcher: d})
+	r.Register(&reviewPlanTool{dispatcher: d})
 }
 
 // RegisterCallTool 将 call_sub_agent / call_sub_agents 工具安装到传入的工具注册表中。

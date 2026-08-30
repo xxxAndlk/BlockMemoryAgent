@@ -98,6 +98,10 @@ type ReactService struct {
 	// ledgerFn 按 sessionID 渲染【任务台账】块文本（2026-08-28 旧需求重派事故根治）；
 	// 空串=无台账不注入，nil 表示未接线。由 bootstrap 注入 Dispatcher.TaskLedgerBrief。
 	ledgerFn func(sessionID string) string
+
+	// VideoOpts 用户消息视频附件（Alt+V 粘贴视频文件）抽帧参数：
+	// bootstrap 从 config.Video 注入，零值字段内部回落 DefaultVideoOptions。
+	VideoOpts VideoOptions
 	// promptEnhance 用户输入自动提示词补全开关（TODO #36 Phase 0 规则版）。
 	// 开启时 sendMessage 对命中续跑/控制/诊断意图的输入附加【系统补全】段
 	// （意图标签 + 最近失败/未完成任务绑定），只增不改原文；关闭时零行为变化。
@@ -634,15 +638,29 @@ func NewReactService(
 
 // CreateSession 为指定目标创建一个新的 ReAct 会话，并异步启动 ReAct 主循环。
 func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*Session, error) {
+	// 首条消息携带的用户视频（Alt+V 粘贴视频文件）：服务端抽帧（兼容全部
+	// provider——所有现有 provider 均无原生视频输入 API），帧并入首轮图片走
+	// 现有图片链路，元数据文本并入 goal（持久化）；Videos 本身不落库。
+	// 转换同步执行（须在 run 启动前完成才能注入 runCtx），内部带硬超时与降级。
+	frames, videoNotes := resolveVideosFn(ctx, req.Videos, s.videoOpts(), len(req.Images))
+	goal := req.Goal
+	if len(videoNotes) > 0 {
+		goal = goal + "\n" + strings.Join(videoNotes, "\n")
+	}
 	// 在内存中创建会话对象。
-	sess := s.store.createSession(req.Goal)
+	sess := s.store.createSession(goal)
 	// 首条消息携带的用户图片（Alt+V 粘贴）：runSession 注入 runCtx 后一次性消费。
-	sess.firstTurnImages = req.Images
+	sess.firstTurnImages = append(req.Images, frames...)
 	s.maybeWatchWallClock(sess)
 	// 在独立 goroutine 中运行 ReAct 循环，避免阻塞调用方。
 	go s.runSession(sess)
 	// 返回转换后的公共 Session DTO。
 	return toReactAgentSession(sess), nil
+}
+
+// videoOpts 返回带默认值兜底的抽帧参数（config 约定"0=未配置"）。
+func (s *ReactService) videoOpts() VideoOptions {
+	return s.VideoOpts.withDefaults()
 }
 
 // maybeWatchWallClock 启动会话全局墙钟看门狗（TODO #25-4 硬止损）：
@@ -768,7 +786,7 @@ func (s *ReactService) List(ctx context.Context, filter Filter) ([]*Session, err
 
 // Send 向指定会话投递一条用户消息。
 func (s *ReactService) Send(ctx context.Context, sessionID string, msg Message) error {
-	return s.sendMessage(ctx, sessionID, msg.Content, msg.Images...)
+	return s.sendMessageFull(ctx, sessionID, msg.Content, msg.Videos, msg.Images...)
 }
 
 // ResumeSession 继续一个之前已结束或暂停的会话。
@@ -2093,9 +2111,27 @@ func restartSessionContext(session *reactInternalSession) {
 // images 为用户随消息粘贴的图片（Alt+V），内存透传：挂到该条 Message 上，
 // 由 resumeSession 取出注入 runCtx（带外穿透到 call_sub_agent 子 Agent）。
 func (s *ReactService) sendMessage(ctx context.Context, sessionID, content string, images ...tool.ResultImage) error {
+	return s.sendMessageFull(ctx, sessionID, content, nil, images...)
+}
+
+// sendMessageFull 是 sendMessage 的完整版，额外接收视频附件 vids：
+// 服务端抽帧（兼容全部 provider）并入 images、元数据文本并入 content，
+// 转换后 vids 即弃（与 Images 同为内存透传不持久化）。
+func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content string, vids []WireVideo, images ...tool.ResultImage) error {
 	// 空内容直接拒绝。
 	if content == "" {
 		return fmt.Errorf("content cannot be empty")
+	}
+
+	// 用户视频附件（Alt+V 粘贴视频文件）：抽帧并入 images、元数据文本并入
+	// content。转换必须在取 store.mu 之前完成（ffmpeg 可达数秒，不能持锁），
+	// 内部带硬超时与降级，不返回 error。
+	frames, videoNotes := resolveVideosFn(ctx, vids, s.videoOpts(), len(images))
+	if len(frames) > 0 {
+		images = append(images, frames...)
+	}
+	if len(videoNotes) > 0 {
+		content = content + "\n" + strings.Join(videoNotes, "\n")
 	}
 
 	// 加锁查找会话。

@@ -13,10 +13,12 @@ import (
 // HandleCreateSession 处理 POST /api/sessions。
 // 职责：解析目标文本，调用 Agent 创建会话，返回会话快照。
 func (m *SessionManager) HandleCreateSession(c *gin.Context) {
-	// 解析请求体：goal 必填；images 可选（首条消息粘贴/上传的图片，与 /message 同规则限流）。
+	// 解析请求体：goal 必填；images 可选（首条消息粘贴/上传的图片，与 /message 同规则限流）；
+	// videos 可选（首条消息粘贴的视频文件路径，服务端抽帧后走图片链路）。
 	req, err := DecodeBody[struct {
 		Goal   string            `json:"goal"`
 		Images []agent.WireImage `json:"images,omitempty"`
+		Videos []agent.WireVideo `json:"videos,omitempty"`
 	}](c.Request)
 	if err != nil {
 		c.String(http.StatusBadRequest, "请求体无效")
@@ -32,9 +34,15 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		c.String(http.StatusBadRequest, "%s", err.Error())
 		return
 	}
+	// 用户视频限流：扩展名白名单/文件存在/大小上限，超限直接 400。
+	videos, err := agent.ParseWireVideos(req.Videos, 0)
+	if err != nil {
+		c.String(http.StatusBadRequest, "%s", err.Error())
+		return
+	}
 
-	// 调用 Agent 创建会话（images 经 firstTurnImages 注入首轮 runCtx 后一次性消费）。
-	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images})
+	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费）。
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
@@ -220,6 +228,7 @@ func (m *SessionManager) HandleSessionMessage(c *gin.Context) {
 	req, err := DecodeBody[struct {
 		Content string            `json:"content"`
 		Images  []agent.WireImage `json:"images,omitempty"`
+		Videos  []agent.WireVideo `json:"videos,omitempty"`
 	}](c.Request)
 	if err != nil {
 		c.String(http.StatusBadRequest, "请求体无效")
@@ -235,8 +244,14 @@ func (m *SessionManager) HandleSessionMessage(c *gin.Context) {
 		c.String(http.StatusBadRequest, "%s", err.Error())
 		return
 	}
+	// 用户视频限流（与 TUI 粘贴侧同规则）：扩展名白名单/文件存在/大小上限。
+	videos, err := agent.ParseWireVideos(req.Videos, 0)
+	if err != nil {
+		c.String(http.StatusBadRequest, "%s", err.Error())
+		return
+	}
 
-	if err := m.agent.Send(c.Request.Context(), id, agent.Message{Content: req.Content, Images: images, Timestamp: time.Now()}); err != nil {
+	if err := m.agent.Send(c.Request.Context(), id, agent.Message{Content: req.Content, Images: images, Videos: videos, Timestamp: time.Now()}); err != nil {
 		msg, status := agentErrorStatus(err)
 		c.String(status, "%s", msg)
 		return

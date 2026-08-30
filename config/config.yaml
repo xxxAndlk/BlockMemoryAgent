@@ -77,6 +77,15 @@ agent:
     test_assistant: 150000
     doc_assistant: 150000
   context_token_budget: 150000   # 上下文 token 阈值默认值（未在 token_budget_per_role 列出的角色用此值）。替换原累计预算：每 Agent 独立估算上下文 token，达阈值即压缩（保留近 10，旧压成上下文内摘要块）；压缩后仍超=近 10 单独就超，暂停等续跑。<=0 不限制。
+  video:                         # 用户消息视频附件（TUI Alt+V 粘贴视频文件）处理参数；0 值字段回落默认
+    mode: native                 # 视频消费模式：native=默认，≤ native_max_mb 的视频整个直传 video_url（Ark doubao-seed/GLM 等 OpenAI 兼容视频理解模型原生消费，已对照火山文档 82379/1895586 确认格式，模型获得完整时间维度信息；直传 MIME 仅 mp4/avi/mov，webm/mkv 自动回落抽帧，ffmpeg 缺失再降级元数据）| frames=显式退出，全部抽关键帧走图片链路（anthropic 等无视频 API 的 provider 组合必须显式配 frames，否则视频内容被其白名单静默丢弃）
+    native_max_mb: 32            # native 模式单视频直传上限 MB（base64 后约 ×1.37 进请求体；端点硬约束视频 ≤50MB 且请求体 ≤64MB → 理论上限约 46；默认 32 留余量，超限仍回落抽帧）
+    frame_count: 6               # 每个视频抽取的关键帧数（默认 6，约 6K token/视频）
+    frame_max_pixels: 1024       # 帧长边像素上限（默认 1024，不放大小图）
+    max_video_mb: 200            # 单视频大小上限 MB（默认 200）
+    extract_timeout_sec: 25      # 抽帧整体超时秒（默认 25，必须小于 http.write_timeout 30s）
+    # ffmpeg_bin: ffmpeg         # ffmpeg 可执行文件（默认 PATH 探测；缺失时降级为仅元数据文本，消息照常发送）
+    # ffprobe_bin: ffprobe       # ffprobe 可执行文件（默认 PATH 探测）
   paused_domain_max_resumes: 2   # 同一 Paused DomainAgent 允许的最大续跑次数。续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证 v10 基准验收领域研磨 32 轮 30 分钟不收敛）；触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工。TODO #35 放开：1->2 多给一次续跑机会
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
 
@@ -94,6 +103,10 @@ agent:
   # -- 强制门（spec 强制默认开启：塔防实证 WriteSpec 有用；Pipeline 重构后由 PlanStage 替代）--
   spec_enforcement_enabled: true     # call_sub_agent 前是否强制 WriteSpec
   max_total_dispatches: 30           # 单 session 派发总数上限
+  # -- 计划确认（下级中大型任务先出计划给上级确认，批准后才执行；对照 Claude Code 差距分析 2026-08-29）--
+  plan_confirmation_enabled: true   # 开关：子 Agent 任何任务动手前 submit_plan 阻塞等上级确认（无大小豁免）；false=直通不阻塞
+  plan_confirm_timeout_sec: 600     # 单次审批等待超时（秒）：超时 fail-open 按计划继续，防上级忙线时下级永久挂起
+  plan_max_revisions: 0             # 每 Agent 计划被驳回重提上限：0=不限制，循环修订直到上级批准；>0 达上限不放行、转 escalate 升级仲裁（防失控兜底）
   prompt_enhance: true               # 用户输入自动提示词补全（TODO #36 Phase 0 规则版）：命中续跑/控制/诊断意图时附加【系统补全】段（意图标签+最近失败/未完成任务绑定），只增不改用户原文；false=原样直通
   prompt_enhance_llm: true           # L2 轻量模型仲裁开关（TODO #39）：灰区输入（L1 未命中但句中有弱词信号）调轻量模型四分类（none/resume/control/diagnose）；超时/失败/低置信一律按普通任务直通（宁漏判不误判）；false=降级纯规则（Phase 0 行为）
   prompt_enhance_llm_timeout_sec: 10 # L2 仲裁单次超时秒（TODO #39）：轻量模型首 token 慢，宁短超时降级也不阻塞用户输入（最坏延迟=本值）

@@ -82,7 +82,7 @@ const fullHelpText = `
 	  /dag trigger <id> 触发 DAG
 	  /dag new <json>   创建 DAG
 	  Alt+Enter         输入换行（多行）
-	  Alt+V             粘贴剪贴板图片（插入 [image:N] 占位符，随消息发送给 Agent 并穿透到子 Agent，最多 4 张）
+	  Alt+V             粘贴剪贴板图片/视频（资源管理器复制的视频文件自动识别为视频附件，插入 [image:N]/[video:N] 占位符随消息发送，服务端对视频抽帧后走图片链路；图片最多 4 张、视频最多 2 个）
 	  ↑/↓               浏览历史输入
 
 	底部快捷键栏：K Command Palette  P Plan  A Agents  L Logs  M Memory  G Git Diff  S Settings  ? Help  Ctrl+C Exit

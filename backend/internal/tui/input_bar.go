@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
@@ -29,6 +30,10 @@ type InputBar struct {
 	// 顺序与输入文字中 [image:N] 占位符编号对齐（N=下标+1）；提交/清空/历史
 	// 浏览替换时重置，下一轮从 1 重新编号。
 	pendingImages []tool.ResultImage
+	// pendingVideos 是 Alt+V 粘贴暂存的视频文件（宿主机路径引用，视频体积大
+	// 不过 base64），随下条消息发送，服务端抽帧走图片链路。顺序与 [video:N]
+	// 占位符编号对齐；清理时机与 pendingImages 相同（clearPendingAttachments）。
+	pendingVideos []agent.WireVideo
 }
 
 // NewInputBar 构造一个空的 InputBar，初始化历史记录 map 并将历史索引设为 -1。
@@ -46,12 +51,15 @@ func (ib *InputBar) reset() {
 	ib.mode = inputNormal
 	ib.histIdx = -1
 	ib.pendingImages = nil
+	ib.pendingVideos = nil
 }
 
-// clearPendingImages 清空粘贴暂存图片（编号下一轮从 1 重新计）。
-// 全量替换 runes 的路径（多行整清/历史浏览填充）同步调用，防图片残留串轮。
-func (ib *InputBar) clearPendingImages() {
+// clearPendingAttachments 清空粘贴暂存图片与视频（编号下一轮从 1 重新计）。
+// 全量替换 runes 的路径（多行整清/历史浏览填充/模式切换）同步调用，
+// 防附件残留串轮。
+func (ib *InputBar) clearPendingAttachments() {
 	ib.pendingImages = nil
+	ib.pendingVideos = nil
 }
 
 // isMultiline 判断当前输入是否包含换行符，用于决定输入栏渲染为占位符还是展开文本。
@@ -71,7 +79,7 @@ func (ib *InputBar) backspace() {
 		// 多行内容一次性清空，避免逐字符删除长文本。
 		ib.runes = nil
 		ib.cursor = 0
-		ib.clearPendingImages()
+		ib.clearPendingAttachments()
 	} else if ib.cursor > 0 {
 		// 单行模式下删除光标前一个 rune。
 		ib.runes = append(ib.runes[:ib.cursor-1], ib.runes[ib.cursor:]...)
@@ -85,7 +93,7 @@ func (ib *InputBar) delete() {
 		// 多行内容一次性清空。
 		ib.runes = nil
 		ib.cursor = 0
-		ib.clearPendingImages()
+		ib.clearPendingAttachments()
 	} else if ib.cursor < len(ib.runes) {
 		// 单行模式下删除光标后一个 rune。
 		ib.runes = append(ib.runes[:ib.cursor], ib.runes[ib.cursor+1:]...)
@@ -142,7 +150,7 @@ func (ib *InputBar) historyUp(sessionID string) {
 		ib.histIdx--
 		ib.runes = []rune(h[ib.histIdx])
 		ib.cursor = len(ib.runes)
-		ib.clearPendingImages()
+		ib.clearPendingAttachments()
 	}
 }
 
@@ -158,13 +166,13 @@ func (ib *InputBar) historyDown(sessionID string) {
 		ib.histIdx++
 		ib.runes = []rune(h[ib.histIdx])
 		ib.cursor = len(ib.runes)
-		ib.clearPendingImages()
+		ib.clearPendingAttachments()
 	} else {
 		// 到达最新命令之后，恢复空输入并退出历史浏览模式。
 		ib.histIdx = -1
 		ib.runes = nil
 		ib.cursor = 0
-		ib.clearPendingImages()
+		ib.clearPendingAttachments()
 	}
 }
 

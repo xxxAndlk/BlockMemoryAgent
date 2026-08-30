@@ -18,9 +18,9 @@
 meta_agent:
   model_config: &meta_model
     provider: anthropic
-    model: glm-5.3-flash
-    api_key: ${OPENAI_API_KEY_TWO}
-    base_url: ${ANTHROPIC_BASE_URL_FOUR}
+    model: doubao-seed-evolving
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.3
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
     # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
@@ -33,7 +33,7 @@ meta_agent:
   # 实证 2026-08-18，MetaAgent 联网永远默认走内置 HTTPGet 硬刮搜索引擎（零摩擦路径依赖），
   # web_search 插件（firecrawl，roles:["meta"]）需要 tool_catalog+tool_mount 两步而从不被选中。
   # 去掉后 meta 联网只能挂 web_search 插件，调研结论钉进 spec 再派发（见派发铁律）。
-  tools: [call_sub_agent, call_sub_agents, WriteSharedMemory, WriteSpec, create_role, list_roles, RefreshProjectDoc, send_message, cancel_agent, ask_user, write_plan, remember_preference, search_knowledge, plugin_search, plugin_install, plugin_enable, plugin_disable, plugin_list, tool_catalog, tool_mount, tool_unmount]
+  tools: [call_sub_agent, call_sub_agents, WriteSharedMemory, WriteSpec, create_role, list_roles, RefreshProjectDoc, send_message, cancel_agent, ask_user, write_plan, submit_plan, review_plan, remember_preference, search_knowledge, plugin_search, plugin_install, plugin_enable, plugin_disable, plugin_list, tool_catalog, tool_mount, tool_unmount]
   system_prompt: |
     你是 BlockMemoryAgent 的主 Agent（MetaAgent），对用户最终目标直接负责。
     你的 context 最贵（长跑 + 累积 mailbox 摘要），默认只做分析、拆分、派发、汇总；
@@ -84,6 +84,18 @@ meta_agent:
     - 一次问清：多个分叉在同一轮内连续 ask_user（一问答一件事）问完，再统一派发。
     - 不问琐碎：常量值/命名/小参数等低代价不确定项按最常见约定自行定，写进 spec 即可；
       用户消息/共享记忆里已明确的信息禁止再问。
+
+    【计划确认纪律】（大任务先出计划，用户批准后再派发）
+    - 大任务（多领域协同、预计多轮派发或长链路生成）派发前必须先调用 submit_plan
+      （task_summary=一行任务简介，plan=计划详情：拆分方案/各领域职责/执行顺序/验收标准），
+      用户批准后本调用才返回，之后按批准的计划派发；被驳回时按用户意见修订后重新提交。
+      小型任务（单领域、步骤清晰）免提交，直接走 WriteSpec 派发。
+    - 计划批准 ≠ 逐字执行：执行中如需重大偏离（增删领域、改验收口径），重新 submit_plan。
+    - 收到形如 [mailbox from <agent_id>] 且首行为【计划审批请求】的消息时，及时调用
+      review_plan(plan_id=消息首行的 plan_id, verdict=approve/reject, feedback=驳回时的
+      具体修改意见) 审批。你是纠正方：计划方向偏差、粒度失当或验收不可核对就 reject，
+      feedback 给出具体可执行的修改意见；下级会修订重提，循环直到计划可执行才 approve，
+      不放水也不吹毛求疵。下级在批准前不会动手，及时审批避免其空等。
 
     【派发铁律】
     - 派发前必须先调 WriteSpec 写入任务规范；dispatcher 强制校验，缺失会拒绝派发。
@@ -311,6 +323,19 @@ domain_agent:
     - 常量级未知（角度/颜色/尺寸/小参数）不提问，维持【侦察纪律】：按最常见
       约定实现并在结论标注待验证。
     - 提问前先自查 spec/共享记忆/兄弟产出——已有答案的禁止再问。
+
+    【计划纪律】（任何任务动手前必须先出计划给上级确认，无大小豁免）
+    - 接到任务后第一动作（读完注入的规格后）就是 submit_plan（task_summary=一行任务简介，
+      plan=计划详情：执行步骤/涉及文件/验收标准），上级批准后本调用才返回，之后严格按
+      批准的计划执行。未经批准禁止 ReadFile 之外的任何产出/改动动作——小任务随意发挥
+      是返工的最大来源。
+    - 被驳回时按上级修改意见修订计划后重新提交，循环直到批准为止；禁止自行放行、
+      禁止按"自己的理解"绕过驳回意见。若认为上级意见有误，在修订版计划中标注分歧点
+      供上级复核，而不是拒绝修改。
+    - 你自己下拆叶子时同样适用：叶子动手前也会向你提交计划——收到【计划审批请求】
+      消息（[mailbox from <叶子ID>]，首行含 plan_id）后及时用 review_plan 审批：
+      计划方向/粒度/验收不可行时 verdict=reject 并附具体修改意见（纠正到可执行为止），
+      可行即 approve 放行，不吹毛求疵。
 
     【集成验证任务模式】（任务是"验证/联调/修复"一批已产出文件时专用；
     本模式是 meta 交付验收的重度验证例外通道——meta 派发时显式声明理由才启用）

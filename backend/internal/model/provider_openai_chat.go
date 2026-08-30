@@ -495,9 +495,14 @@ func chatTextOf(m *blades.Message) string {
 	return sb.String()
 }
 
-// chatImageDataParts 提取消息中的 DataPart 转为 OpenAI vision content 数组项
-// （{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}）。
-// 无图返回 nil，调用方保持纯文本 content。
+// chatImageDataParts 提取消息中的 DataPart 转为 OpenAI 兼容多模态 content 数组项，
+// 按 MIME 主类型分流（Ark/GLM 等 OpenAI 兼容端点的视频理解同此格式）：
+//   - image/* → {"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}
+//   - video/* → {"type":"video_url","video_url":{"url":"data:<mime>;base64,..."}}
+//     （火山方舟 doubao-seed/GLM 视频理解、智谱 GLM-4V/4.5V 的 OpenAI 兼容格式）
+//   - 其他（audio 等）：跳过（宁可降级为纯文本也不误标 image_url 触发 400）。
+//
+// 无媒体项返回 nil，调用方保持纯文本 content。
 func chatImageDataParts(m *blades.Message) []map[string]any {
 	if m == nil {
 		return nil
@@ -508,11 +513,26 @@ func chatImageDataParts(m *blades.Message) []map[string]any {
 		if !ok || len(dp.Bytes) == 0 || dp.MIMEType == "" {
 			continue
 		}
-		url := "data:" + string(dp.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(dp.Bytes)
-		out = append(out, map[string]any{
-			"type":      "image_url",
-			"image_url": map[string]any{"url": url},
-		})
+		dataURL := "data:" + string(dp.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(dp.Bytes)
+		major := string(dp.MIMEType)
+		if i := strings.IndexByte(major, '/'); i >= 0 {
+			major = major[:i]
+		}
+		switch major {
+		case "image":
+			out = append(out, map[string]any{
+				"type":      "image_url",
+				"image_url": map[string]any{"url": dataURL},
+			})
+		case "video":
+			out = append(out, map[string]any{
+				"type":      "video_url",
+				"video_url": map[string]any{"url": dataURL},
+			})
+		default:
+			// audio/* 等未支持模态：跳过（历史上会被无条件误标为 image_url）。
+			continue
+		}
 	}
 	return out
 }

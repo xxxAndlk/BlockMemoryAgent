@@ -673,3 +673,43 @@ func TestChatProvider_UserImageContentArray(t *testing.T) {
 		t.Fatalf("无图 content 不符: %v", second["content"])
 	}
 }
+
+// TestChatProvider_UserVideoContentArray 验证 user 消息携带 video/* DataPart
+//（native 模式视频直传）时请求 content 数组项映射为 video_url（Ark/GLM 视频
+// 理解的 OpenAI 兼容格式），而非误标 image_url；audio/* 等未支持模态被跳过。
+func TestChatProvider_UserVideoContentArray(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)
+	}))
+	defer srv.Close()
+	p := newOpenAIChatProvider(types.AgentModelConfig{Model: "m", APIKey: "k", BaseURL: srv.URL})
+
+	raw := []byte{0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70} // 假 mp4 头
+	audio := []byte{0x01, 0x02, 0x03}
+	msg := &blades.Message{Role: blades.RoleUser, Parts: []blades.Part{
+		blades.TextPart{Text: "描述 [video:1]"},
+		blades.DataPart{MIMEType: blades.MIMEType("video/mp4"), Bytes: raw},
+		blades.DataPart{MIMEType: blades.MIMEType("audio/wav"), Bytes: audio},
+	}}
+	if _, err := p.Generate(context.Background(), &blades.ModelRequest{Messages: []*blades.Message{msg}}); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	arr, _ := gotBody["messages"].([]any)
+	first, _ := arr[0].(map[string]any)
+	content, ok := first["content"].([]any)
+	if !ok || len(content) != 2 { // text + video_url（audio 被跳过）
+		t.Fatalf("content 应为 2 项（text+video_url，audio 跳过）, got %v", first["content"])
+	}
+	vu, _ := content[1].(map[string]any)
+	if vu["type"] != "video_url" {
+		t.Fatalf("video DataPart 应映射 video_url, got: %v", vu)
+	}
+	inner, _ := vu["video_url"].(map[string]any)
+	want := "data:video/mp4;base64," + base64.StdEncoding.EncodeToString(raw)
+	if inner["url"] != want {
+		t.Fatalf("video data URL 不符: %v", inner["url"])
+	}
+}

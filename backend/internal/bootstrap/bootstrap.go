@@ -312,6 +312,14 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// dispatcher 校验 parentID:spec 存在且新鲜，缺失则拒绝派发。config 层默认 true，
 	// config.yaml 可显式关闭；applyDefaults 保证非 nil，else 分支为防御。
 	subAgentDispatcher.WithSpecEnforcement(cfg.Agent.SpecEnforcementEnabled == nil || *cfg.Agent.SpecEnforcementEnabled)
+	// 计划确认（plan_confirm.go）：下级中大型任务动手前 submit_plan 给上级确认
+	// （顶层 Meta 给用户，复用 ask_user 澄清链路），批准后才执行；驳回按意见修订重提。
+	// config 层默认 true / 600s / 3 次，config.yaml 可显式调整或关闭（关闭时直通不阻塞）。
+	subAgentDispatcher.WithPlanConfirmation(
+		cfg.Agent.PlanConfirmationEnabled == nil || *cfg.Agent.PlanConfirmationEnabled,
+		time.Duration(cfg.Agent.PlanConfirmTimeoutSec)*time.Second,
+		cfg.Agent.PlanMaxRevisions,
+	)
 	// 共享记忆/spec：文件后端落盘到 <workDir>/.bma/shared/<hex(agentID)>__<slot>.md。
 	// 主线程 Agent（meta/domain）持可写实例写关键上下文与 spec，
 	// 子 Agent 派发时经 Dispatcher 的只读视图读取并注入任务前。
@@ -332,6 +340,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.RegisterMessagingTool(toolRegistry)
 	// 注册 cancel_agent 工具（TODO #25 控制面）：MetaAgent/DomainAgent 主动取消跑偏子 Agent。
 	subAgentDispatcher.RegisterControlTool(toolRegistry)
+	// 注册 submit_plan / review_plan 工具（计划确认机制）：下级中大型任务先出计划给上级
+	// 确认；角色可见性由 role.Registry meta/domain 内置白名单 + roles.yaml 覆盖控制。
+	subAgentDispatcher.RegisterPlanTools(toolRegistry)
 	// 注册 create_role / list_roles 工具：让 MetaAgent 运行时注册动态角色。
 	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools 字段），
 	// 其他角色看不到它们。Registry 持 closure 引用，Execute 直接读写 dynamic 层。
@@ -339,6 +350,26 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
+	// 注入用户视频附件处理参数（Alt+V 粘贴视频）：默认 native——≤ native_max_mb 的
+	// mp4/avi/mov 整个直传，openai-chat 兼容端点映射 video_url 供 Ark/GLM 视频理解
+	// 模型原生消费（已对照火山文档 82379/1895586）；webm/mkv/超限视频回落抽帧，
+	// ffmpeg 缺失再降级元数据。显式 mode: frames 关闭直传、全部抽帧（anthropic 等
+	// 无视频 API 的 provider 组合需显式关）。零值字段由 agent 层 DefaultVideoOptions 兜底。
+	agentSvc.VideoOpts = agent.VideoOptions{
+		FFmpegBin:         cfg.Agent.Video.FFmpegBin,
+		FFprobeBin:        cfg.Agent.Video.FFprobeBin,
+		MaxVideoBytes:     cfg.Agent.Video.MaxVideoMB << 20,
+		FrameCount:        cfg.Agent.Video.FrameCount,
+		FrameMaxPixels:    cfg.Agent.Video.FrameMaxPixels,
+		ExtractTimeoutSec: cfg.Agent.Video.ExtractTimeoutSec,
+	}
+	if cfg.Agent.Video.Mode != "frames" { // native 为默认（含未配置），frames 为显式退出
+		nativeMax := cfg.Agent.Video.NativeMaxMB << 20
+		if nativeMax <= 0 {
+			nativeMax = 32 << 20
+		}
+		agentSvc.VideoOpts.NativeMaxBytes = nativeMax
+	}
 	// 串联权威 workDir：bootstrap 持有的 os.Getwd() 结果注入 session store，
 	// 消除 newReactSessionStore 内不再自取 cwd 的双源漂移。
 	agentSvc.SetWorkDir(workDir)

@@ -1147,6 +1147,34 @@ func (r *Registry) Schema() []tools.Tool {
 			toolsList = append(toolsList, t)
 		}
 	}
+	// 暴露 submit_plan / review_plan 工具（若已由 subagent.Dispatcher.RegisterPlanTools 安装）。
+	// 计划确认机制：下级中大型任务动手前 submit_plan 给上级确认，上级用 review_plan 审批。
+	if ct, ok := r.toolByName("submit_plan"); ok {
+		desc := "提交执行计划给上级确认。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("submit_plan", desc, func(ctx context.Context, in submitPlanInput) (string, error) {
+			res, _ := r.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": in.TaskSummary, "plan": in.Plan})
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
+	if ct, ok := r.toolByName("review_plan"); ok {
+		desc := "审批下级提交的计划。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("review_plan", desc, func(ctx context.Context, in reviewPlanInput) (string, error) {
+			res, _ := r.Dispatch(ctx, "review_plan", map[string]any{"plan_id": in.PlanID, "verdict": in.Verdict, "feedback": in.Feedback})
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
 	// 暴露 create_role 工具（若已由 role.Registry.RegisterTools 安装到注册表）。
 	// 仅 MetaAgent 白名单含此工具，运行时注册动态角色供 call_sub_agent 派发。
 	if ct, ok := r.toolByName("create_role"); ok {
@@ -1208,6 +1236,7 @@ func (r *Registry) Schema() []tools.Tool {
 		"GitDiff": true, "GitStatus": true, "GitLog": true, "GitBlame": true,
 		"RefreshProjectDoc": true, "WriteSharedMemory": true, "WriteSpec": true,
 		"call_sub_agent": true, "send_message": true, "create_role": true, "list_roles": true,
+		"submit_plan": true, "review_plan": true,
 	}
 	r.mu.RLock()
 	order := append([]string(nil), r.schemaOrder...)
@@ -1249,6 +1278,19 @@ func (r *Registry) Schema() []tools.Tool {
 	}
 	// 返回收集到的所有 blades 工具定义。
 	return toolsList
+}
+
+// submitPlanInput 是 submit_plan 工具的入参结构（计划确认机制）。
+type submitPlanInput struct {
+	TaskSummary string `json:"task_summary" description:"一行任务简介"`
+	Plan        string `json:"plan" description:"计划详情：执行步骤、涉及文件、验收标准。批准后本调用才返回并放行执行"`
+}
+
+// reviewPlanInput 是 review_plan 工具的入参结构（计划确认机制）。
+type reviewPlanInput struct {
+	PlanID   string `json:"plan_id" description:"计划 ID（取自【计划审批请求】消息首行）"`
+	Verdict  string `json:"verdict" description:"approve=批准；reject=驳回"`
+	Feedback string `json:"feedback" description:"驳回时的具体修改意见（reject 必填，下级按意见修订重提）"`
 }
 
 // sendMessageInput 是 send_message 工具的入参结构。

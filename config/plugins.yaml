@@ -75,10 +75,20 @@ plugins:
       ports: ["6081:6081"]
       destructive: true
       roles: ["meta"]
+      # 录屏产物挂载：容器 /workspace 映射宿主工作目录，screen_record 录制的
+      # mp4 落 <宿主工作目录>/.bma/videos/，Agent/用户在宿主侧可直接消费。
+      volumes: ["${WORKDIR}:/workspace"]
+      # screen_record 返回的 4 张关键帧（MCP image content）透传给多模态模型
+      #（与 ui_preview 同机制；上限单次 4 张/单张 4MiB，工具侧帧参数已对齐）。
+      image_passthrough: true
+      # 默认 120s 掐不住 300s 录制 + 抽帧，放开到 600s。
+      exec_timeout_sec: 600
       # 全工具描述尾部追加沙箱边界警告（实证 2026-08-25 水果忍者：MetaAgent 用
       # filesystem 落盘基线，实际写入沙箱容器 /root/Desktop/... 宿主不可见，WriteSpec
       # 基线校验 5 连拒被 loop guard 强杀）。文件系统边界必须明示，防模型再走此路。
-      tool_description_suffix: "注意：本工具运行在隔离沙箱容器内（Docker Xvfb），文件系统与宿主工作目录不通——相对路径从容器 Desktop 解析，写文件宿主不可见。不得用于落盘任务产物/基线/项目文件，基线落盘用 WriteSpec 的 baseline_content 参数。"
+      # 2026-08-30 更新：接入 /workspace 挂载后边界改写——仅 /workspace 映射宿主
+      # 工作目录（screen_record 产物宿主可见），其余容器路径仍宿主不可见。
+      tool_description_suffix: "注意：本工具运行在隔离沙箱容器内（Docker Xvfb）。仅 /workspace 目录映射宿主工作目录（screen_record 录屏产物在宿主 <工作目录>/.bma/videos/ 可见）；其余路径（如容器内 Desktop）写文件宿主不可见，不得用于落盘任务产物/基线/项目文件，基线落盘用 WriteSpec 的 baseline_content 参数。"
       # 宿主机直起（备选，AI 直接操作真机，仅调试用）：
       # transport: stdio
       # command: npx

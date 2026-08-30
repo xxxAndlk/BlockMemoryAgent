@@ -579,6 +579,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyClipImage(msg)
 		m.dirty = true
 
+	case clipVideoMsg:
+		// Alt+V 剪贴板视频文件识别完成：限流后暂存路径引用并插入 [video:N] 占位符。
+		m.applyClipVideo(msg)
+		m.dirty = true
+
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 

@@ -126,6 +126,15 @@ type FeatureTogglesConfig struct {
 	// SpecEnforcementEnabled 派发方调用 call_sub_agent 前是否强制先写 WriteSpec。
 	// 默认 true（塔防实证 WriteSpec 有用，config.yaml 显式配置覆盖）；Pipeline 重构后由 PlanStage 替代。
 	SpecEnforcementEnabled *bool `yaml:"spec_enforcement_enabled"`
+	// PlanConfirmationEnabled 计划确认机制开关：下级中大型任务动手前 submit_plan 给上级
+	// （顶层给用户）确认，批准后才执行。默认 true；显式 false 关闭（submit_plan 直通不阻塞）。
+	PlanConfirmationEnabled *bool `yaml:"plan_confirmation_enabled"`
+	// PlanConfirmTimeoutSec 单次计划审批等待超时（秒）。默认 600；超时 fail-open
+	// （按计划继续），防上级忙线/失联时下级永久挂起。
+	PlanConfirmTimeoutSec int `yaml:"plan_confirm_timeout_sec"`
+	// PlanMaxRevisions 每 Agent 计划被驳回重提上限。默认 0=不限制（循环直到批准，
+	// 对齐"未经批准不执行"）；>0 时达上限不放行、转 send_message(escalate) 升级仲裁。
+	PlanMaxRevisions int `yaml:"plan_max_revisions"`
 }
 
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
@@ -194,6 +203,37 @@ type AgentConfig struct {
 	// DomainReuseRosterInject 是否向 MetaAgent 上下文注入【空闲领域Agent】清单（默认 true）。
 	// 注入后 MetaAgent 自主判定强相关复用 vs 弱相关新建。
 	DomainReuseRosterInject *bool `yaml:"domain_reuse_roster_inject"`
+
+	// Video 用户消息视频附件（Alt+V 粘贴视频）抽帧参数；0 值字段回落默认。
+	Video VideoConfig `yaml:"video"`
+}
+
+// VideoConfig 视频附件服务端处理参数（抽帧走图片链路兼容全部 provider；
+// native 模式下小视频直传 video_url 供 Ark doubao/GLM 等视频理解模型原生消费）。
+type VideoConfig struct {
+	// Mode 视频消费模式：native（默认，含未配置——≤ native_max_mb 的视频整个直传，
+	// openai-chat 兼容端点映射为 video_url——Ark doubao-seed/GLM 视频理解格式，
+	// 已对照火山文档 82379/1895586 确认；模型获得完整时间维度信息）|
+	// frames（显式退出：全部抽关键帧走图片链路，anthropic 等无视频 API 的
+	// provider 组合必须显式配置 frames，否则 video/* 内容会被其白名单静默丢弃）。
+	Mode string `yaml:"mode"`
+	// NativeMaxMB native 模式下单视频直传上限（MB，base64 后约 ×1.37 进请求体）。
+	// 默认 32；超过的仍回落抽帧。端点硬约束（火山文档）：base64 传入视频
+	// ≤ 50MB 且请求体 ≤ 64MB → 本值理论上限约 46，默认 32 留余量。
+	NativeMaxMB int64 `yaml:"native_max_mb"`
+	// FrameCount 每个视频抽取的关键帧数。默认 6。
+	FrameCount int `yaml:"frame_count"`
+	// FrameMaxPixels 帧长边像素上限（不放大小图）。默认 1024。
+	FrameMaxPixels int `yaml:"frame_max_pixels"`
+	// MaxVideoMB 单视频大小上限（MB）。默认 200。
+	MaxVideoMB int64 `yaml:"max_video_mb"`
+	// ExtractTimeoutSec 抽帧整体超时（秒）。默认 25，必须小于 HTTP
+	// write_timeout（30s），否则 handler 先被写超时掐断。
+	ExtractTimeoutSec int `yaml:"extract_timeout_sec"`
+	// FFmpegBin ffmpeg 可执行文件名/路径。默认 "ffmpeg"（PATH 探测，缺失降级仅元数据）。
+	FFmpegBin string `yaml:"ffmpeg_bin"`
+	// FFprobeBin ffprobe 可执行文件名/路径。默认 "ffprobe"。
+	FFprobeBin string `yaml:"ffprobe_bin"`
 }
 
 // PostgresConfig 描述 PostgreSQL 连接与连接池参数。
@@ -514,6 +554,17 @@ func (c *Config) applyFeatureTogglesDefaults() {
 		t := true
 		c.Agent.SpecEnforcementEnabled = &t
 	}
+	// 计划确认默认开启：对照 Claude Code 差距分析（2026-08-29 塔防日志 2 次返工约 130 分钟），
+	// 大任务先出计划确认可显著降低返工；*bool 区分"未配置"（默认 true）与"显式 false"。
+	if c.Agent.PlanConfirmationEnabled == nil {
+		t := true
+		c.Agent.PlanConfirmationEnabled = &t
+	}
+	if c.Agent.PlanConfirmTimeoutSec <= 0 {
+		c.Agent.PlanConfirmTimeoutSec = 600
+	}
+	// PlanMaxRevisions 默认 0=不限制：子 Agent 计划必须循环修订直到上级批准，
+	// 不做"达上限放行"；>0 仅作防失控兜底（达上限转升级仲裁，仍不放行）。
 	// 输入补全默认开启（TODO #36）：*bool 区分"未配置"（默认 true）与"显式 false"。
 	if c.Agent.PromptEnhance == nil {
 		t := true
@@ -600,6 +651,15 @@ func (c *Config) applyAgentStandaloneDefaults() {
 	// 校验 judge 角色（TODO #43 交叉模型）：默认 prompt_reviewer（与被审角色不同模型）。
 	if c.Agent.JudgeRole == "" {
 		c.Agent.JudgeRole = "prompt_reviewer"
+	}
+	// 视频附件抽帧参数（0 值回落 agent.DefaultVideoOptions 内部默认）：
+	// 二进制名留空由 agent 层 exec.LookPath 探测；帧数/像素/超时此处不重复设默认，
+	// 仅校验超时上限（须 < http.write_timeout，超限拒绝启动防止写超时掐断响应）。
+	if c.Agent.Video.ExtractTimeoutSec < 0 {
+		c.Agent.Video.ExtractTimeoutSec = 0
+	}
+	if c.Agent.Video.MaxVideoMB < 0 {
+		c.Agent.Video.MaxVideoMB = 0
 	}
 }
 

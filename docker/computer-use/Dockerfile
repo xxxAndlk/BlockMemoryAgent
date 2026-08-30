@@ -8,15 +8,17 @@
 FROM docker.m.daocloud.io/library/node:22-trixie
 
 # xdotool/wmctrl/xclip/scrot 是 computer-use-mcp Linux 后端的系统依赖（见项目 README Linux 节）。
+# ffmpeg 供 recorder-mcp.js 的 screen_record 工具录屏（x11grab 抓 :99 桌面）+ 抽关键帧。
 # deb.debian.org 本网络高丢包（502/EOF），切阿里云镜像 + 重试。
 RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
       /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=3 update \
     && apt-get -o Acquire::Retries=3 install -y --no-install-recommends --fix-missing \
-      xvfb x11vnc xdotool fluxbox xauth novnc websockify wmctrl xclip scrot \
+      xvfb x11vnc xdotool fluxbox xauth novnc websockify wmctrl xclip scrot ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @zavora-ai/computer-use-mcp && npm cache clean --force
 
+COPY recorder-mcp.js /recorder-mcp.js
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

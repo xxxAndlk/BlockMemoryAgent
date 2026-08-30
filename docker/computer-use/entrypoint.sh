@@ -11,4 +11,8 @@ fluxbox >/var/log/fluxbox.log 2>&1 &
 x11vnc -display :99 -forever -nopw -shared >/var/log/x11vnc.log 2>&1 &
 websockify --web /usr/share/novnc 6081 localhost:5900 >/var/log/websockify.log 2>&1 &
 
-exec node "$(npm root -g)/@zavora-ai/computer-use-mcp/dist/server.js"
+# recorder-mcp.js：复合 MCP stdio 代理——spawn 原 computer-use server 作为子进程，
+# 合并 screen_record 录屏工具（ffmpeg x11grab 抓本入口起的 :99 桌面）。
+# 录的就是 Agent 自己操作的同一个虚拟桌面。
+export COMPUTER_USE_SERVER="$(npm root -g)/@zavora-ai/computer-use-mcp/dist/server.js"
+exec node /recorder-mcp.js
