@@ -146,12 +146,13 @@ func (t *submitPlanTool) Execute(ctx context.Context, args map[string]any) *tool
 	return d.submitPlanToParent(ctx, w, planID, taskSummary, plan)
 }
 
-// submitPlanToUser 顶层路径：把计划渲染成 ask_user 问题（选项：批准开工 / 需要修改），
-// 复用 session 澄清槽位 → SSE → TUI 面板，零新增适配层。
+// submitPlanToUser 顶层路径：计划全文经 ask_user detail 落对话区事件流（完整可滚动查看），
+// 问答面板只显示短确认问题 + 批准/驳回选项；复用 session 澄清槽位 → SSE → TUI。
 func (d *Dispatcher) submitPlanToUser(ctx context.Context, planID, taskSummary, plan string) *tool.Result {
-	question := fmt.Sprintf("【计划确认】执行前请确认。\n任务简介: %s\n\n【计划详情】\n%s\n\n批准后立即开工；选\"需要修改\"可直接输入修改意见。", taskSummary, plan)
+	question := fmt.Sprintf("【计划确认】执行前请确认（计划详情见上方对话区）。\n任务简介: %s\n\n批准后立即开工；选\"需要修改\"可直接输入修改意见。", taskSummary)
 	res, err := d.tools.Dispatch(ctx, "ask_user", map[string]any{
 		"question": question,
+		"detail":   plan,
 		"options": []any{
 			map[string]any{"id": "approve", "label": "批准开工", "description": "按计划执行"},
 			map[string]any{"id": "revise", "label": "需要修改", "description": "驳回计划并给出修改意见"},

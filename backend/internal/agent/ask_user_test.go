@@ -128,7 +128,7 @@ func TestAskUserFlow(t *testing.T) {
 	if sess == nil || sess.Status != string(enums.SessionStatusCompleted) {
 		t.Fatalf("session did not complete after ask answer, status=%v", sess.Status)
 	}
-	if !llm.requestContains("用户答复: 用深色") {
+	if !llm.requestContains("答复: 用深色") {
 		t.Fatalf("ask_user tool result with user answer should reach the next LLM request")
 	}
 	if !strings.Contains(sess.Result, "深色") {

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -26,11 +27,23 @@ type AskUserOption struct {
 	Description string // Description 选项补充说明（可选）
 }
 
-// AskUserOptions 是 ask_user 工具的结构化选项入参（TODO #53）。
+// AskUserQuestion 是批量提问模式（questions 数组）中的单个问题，
+// 字段与顶层单题入参一致；顶层 question/options/multi_select 保留向后兼容。
+type AskUserQuestion struct {
+	Question    string
+	Options     []AskUserOption
+	MultiSelect bool
+}
+
+// AskUserOptions 是 ask_user 工具传给 hook 的单题入参（TODO #53）。
 // Options 为空 = 纯自由文本提问（旧行为）；MultiSelect=true 时用户可多选。
+// Detail 为附加长上下文（如 submit_plan 的计划全文）：落对话区事件流展示，
+// 不进问答面板（面板只显示 question + 选项）。批量模式在 Execute 侧拆成
+// 多次单题 hook 调用，hook 签名不变。
 type AskUserOptions struct {
 	Options     []AskUserOption
 	MultiSelect bool
+	Detail      string
 }
 
 // AskUserHookFunc 是 ask_user 工具的会话层回调：置 PendingClarify + 暂停会话 +
@@ -79,16 +92,21 @@ func (t *askUserTool) Aliases() []string { return nil }
 
 // Description 返回 LLM 可见的工具描述。
 func (t *askUserTool) Description() string {
-	return "向用户提出一个问题并等待答复（人在回路）。" +
-		"适用场景：需求不明确、关键决策需要用户拍板、信息缺失导致无法继续时主动询问，" +
-		"不要自行臆测关键需求。调用会暂停任务等待用户答复；" +
-		"参数 question 为要问的问题（简洁、可答、一问答一件事）；" +
-		"options 可选：方向不明确、需要用户从若干候选里拍板时给出 2-N 个选项" +
-		"（每项 {id,label,description}，label 简短可点选），不要开放式提问让用户打字；" +
-		"multi_select 可选（默认 false）：true 时用户可多选，答复以逗号/空格分隔的" +
-		"选项 ID 或序号返回；" +
-		"timeout_sec 可选（>0 时超时未答复返回\"用户未答复，自行决策\"，0=不限，默认 0）。" +
-		"答复作为本工具结果返回。"
+	return "向用户提问并等待答复（人在回路）。" +
+		"批量模式（推荐）：新任务开工前用 questions 参数一次批量问齐 2-5 个关键分叉" +
+		"（凡选错要返工、缺失则无法定案的关键决策，按任务本身推导该问什么，" +
+		"不套固定清单），全部答复后再写 spec、提交计划或派发——提问是最省时间的行动，" +
+		"禁止不问直接派发。执行中遇到新的方向分叉同样先问再动。" +
+		"不问琐碎：无关紧要的细节自行定；用户已明确的禁止再问；追加需求、续建、纯问答不问。" +
+		"说人话：问题与选项用用户的日常语言，禁止行话术语，每个选项说清对结果的影响，" +
+		"让任何用户不看细节也能拍板。" +
+		"questions 每项 {question,options,multi_select}；题目会逐个呈现给用户，" +
+		"答复按题号汇总返回。单题兼容：也可用顶层 question/options/multi_select 问一题。" +
+		"options 给 2-N 个候选方向（每项 {id,label,description}，label 简短可点选），" +
+		"不要开放式提问让用户打字；multi_select=true 时用户可多选。" +
+		"detail 可选：长上下文（如计划全文）完整展示在对话区供用户滚动查看，" +
+		"问答面板只显示 question 与选项。" +
+		"timeout_sec 可选（>0 时每题超时未答复返回\"自行决策\"，0=不限，默认 0）。"
 }
 
 // InputSchema 返回入参 JSON Schema（TODO #53 结构化选项）。
@@ -102,31 +120,89 @@ func (t *askUserTool) InputSchema() *jsonschema.Schema {
 		},
 		Required: []string{"id", "label"},
 	}
+	optionArraySchema := &jsonschema.Schema{
+		Type:        "array",
+		Items:       optionSchema,
+		Description: "结构化选项（2-N 个方向，方向不明确时必填；缺省=自由文本提问）",
+	}
 	return &jsonschema.Schema{
 		Type: "object",
 		Properties: map[string]*jsonschema.Schema{
 			"question":     {Type: "string", Description: "要问的问题（简洁、可答、一问答一件事）"},
-			"options":      {Type: "array", Items: optionSchema, Description: "结构化选项（2-N 个方向，方向不明确时必填；缺省=自由文本提问）"},
+			"options":      optionArraySchema,
 			"multi_select": {Type: "boolean", Description: "是否允许多选（默认 false=单选）"},
-			"timeout_sec":  {Type: "number", Description: "超时秒数（>0 时超时未答复自行决策，0=不限）"},
+			"timeout_sec":  {Type: "number", Description: "超时秒数（>0 时每题超时未答复自行决策，0=不限）"},
+			"questions": {
+				Type: "array",
+				Items: &jsonschema.Schema{
+					Type: "object",
+					Properties: map[string]*jsonschema.Schema{
+						"question":     {Type: "string", Description: "要问的问题"},
+						"options":      optionArraySchema,
+						"multi_select": {Type: "boolean", Description: "是否允许多选（默认 false）"},
+					},
+					Required: []string{"question"},
+				},
+				Description: "批量模式：2-5 个问题一次问齐（新任务开工前澄清必用），题目逐个呈现，答复按题号汇总返回",
+			},
+			"detail": {Type: "string", Description: "附加长上下文（如计划全文）：完整展示在对话区供用户滚动查看，问答面板只显示 question 与选项；question 写短引导语即可"},
 		},
 		Required: []string{"question"},
 	}
 }
 
-// parseAskUserOptions 把工具入参解析为结构化选项；参数缺失/格式错误时返回零值
-// （空选项 = 自由文本提问，与旧行为一致，不因此报错）。
-func parseAskUserOptions(args map[string]any) AskUserOptions {
-	var opts AskUserOptions
-	raw, ok := args["options"].([]any)
+// maxAskUserBatch 批量提问单次调用的问题数上限。
+const maxAskUserBatch = 5
+
+// parseAskUserQuestions 解析批量模式 questions 数组；为空时回退顶层单题字段
+// （question/options/multi_select 包装成单元素列表），两条路径归一。
+// question 与 questions 同时存在时 questions 优先。
+func parseAskUserQuestions(args map[string]any) []AskUserQuestion {
+	var qs []AskUserQuestion
+	if raw, ok := args["questions"].([]any); ok {
+		for _, item := range raw {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			q, _ := m["question"].(string)
+			if q == "" {
+				continue
+			}
+			qs = append(qs, AskUserQuestion{
+				Question:    q,
+				Options:     parseOptionList(m["options"]),
+				MultiSelect: boolOf(m["multi_select"]),
+			})
+		}
+	}
+	if len(qs) == 0 {
+		if q, _ := args["question"].(string); q != "" {
+			qs = []AskUserQuestion{{
+				Question:    q,
+				Options:     parseOptionList(args["options"]),
+				MultiSelect: boolOf(args["multi_select"]),
+			}}
+		}
+	}
+	if len(qs) > maxAskUserBatch {
+		qs = qs[:maxAskUserBatch]
+	}
+	return qs
+}
+
+// parseOptionList 解析 options 数组字段（[]any 或 []map[string]any 两种形态）。
+func parseOptionList(v any) []AskUserOption {
+	raw, ok := v.([]any)
 	if !ok {
-		if arr, ok2 := args["options"].([]map[string]any); ok2 {
+		if arr, ok2 := v.([]map[string]any); ok2 {
 			raw = make([]any, 0, len(arr))
 			for _, m := range arr {
 				raw = append(raw, m)
 			}
 		}
 	}
+	var opts []AskUserOption
 	for _, item := range raw {
 		m, ok := item.(map[string]any)
 		if !ok {
@@ -138,50 +214,57 @@ func parseAskUserOptions(args map[string]any) AskUserOptions {
 			continue
 		}
 		desc, _ := m["description"].(string)
-		opts.Options = append(opts.Options, AskUserOption{ID: id, Label: label, Description: desc})
-	}
-	if multi, ok := args["multi_select"].(bool); ok {
-		opts.MultiSelect = multi
+		opts = append(opts, AskUserOption{ID: id, Label: label, Description: desc})
 	}
 	return opts
 }
 
-// Execute 执行 ask_user 工具调用。
+// boolOf 宽松取布尔字段；缺失或类型不符返回 false。
+func boolOf(v any) bool {
+	b, _ := v.(bool)
+	return b
+}
+
+// Execute 执行 ask_user 工具调用：批量模式逐题调 hook，答案按题号汇总。
 func (t *askUserTool) Execute(ctx context.Context, args map[string]any) *Result {
 	if t.hook == nil {
 		return &Result{Tool: "ask_user", Error: "ask_user 未接线（会话服务未注入 AskUserHook）"}
 	}
-	q, _ := args["question"].(string)
-	if q == "" {
+	questions := parseAskUserQuestions(args)
+	if len(questions) == 0 {
 		return &Result{Tool: "ask_user", Error: "question is required"}
 	}
 	timeoutSec, _ := args["timeout_sec"].(float64)
 	if timeoutSec <= 0 && t.defaultTimeoutSec > 0 {
 		timeoutSec = float64(t.defaultTimeoutSec)
 	}
+	detail, _ := args["detail"].(string)
 
-	askCtx := ctx
-	cancel := func() {}
-	if timeoutSec > 0 {
-		askCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-	}
-	defer cancel()
-
-	answer, err := t.hook(askCtx, q, parseAskUserOptions(args))
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrAskUserTimeout) {
-			return &Result{
-				Tool:    "ask_user",
-				Success: true,
-				Output:  "用户未答复，自行决策。",
-			}
+	var sb strings.Builder
+	sb.WriteString("用户答复:")
+	for i, q := range questions {
+		askCtx := ctx
+		cancel := func() {}
+		if timeoutSec > 0 {
+			askCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 		}
-		// 会话取消等：中止调用（ReAct 循环随 ctx 退出）。
-		return &Result{Tool: "ask_user", Error: fmt.Sprintf("提问中断: %v", err)}
+		answer, err := t.hook(askCtx, q.Question, AskUserOptions{Options: q.Options, MultiSelect: q.MultiSelect, Detail: detail})
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrAskUserTimeout) {
+				// 单题超时不中断批量：记未答继续，由模型对该题自行决策。
+				// 不回显问题原文：问题里可能含"需要修改"等裁决词，回显会污染下游裁决。
+				fmt.Fprintf(&sb, "\n%d. 答复: 用户未答复，自行决策。", i+1)
+				continue
+			}
+			// 会话取消等：中止调用（ReAct 循环随 ctx 退出）。
+			return &Result{Tool: "ask_user", Error: fmt.Sprintf("提问中断: %v", err)}
+		}
+		fmt.Fprintf(&sb, "\n%d. 答复: %s", i+1, answer)
 	}
 	return &Result{
 		Tool:    "ask_user",
 		Success: true,
-		Output:  "用户答复: " + answer,
+		Output:  sb.String(),
 	}
 }

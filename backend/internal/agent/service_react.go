@@ -1212,7 +1212,12 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		sess.Status = enums.SessionStatusAwaitingClarify
 		s.store.mu.Unlock()
 
-		s.store.addEvent(sess, eventkind.Clarify, "System", "Agent 提问: "+question, "", "", "", "", "", true)
+		// detail（如 submit_plan 计划全文）完整落对话区事件流；面板只渲染 question（短）。
+		eventText := "Agent 提问: " + question
+		if d := strings.TrimSpace(opts.Detail); d != "" {
+			eventText = "Agent 提问: " + d + "\n" + question
+		}
+		s.store.addEvent(sess, eventkind.Clarify, "System", eventText, "", "", "", "", "", true)
 
 		select {
 		case <-ctx.Done():
@@ -1612,18 +1617,19 @@ func toolArgsLabel(argsJSON string) string {
 	return ""
 }
 
-// subAgentDispatchInfo 从 call_sub_agent 的入参 JSON 中提取角色 ID 与任务摘要（截断 100 字符），
-// 供子 Agent 派发事件记录使用；解析失败时返回空角色与原始输入的截断。
+// subAgentDispatchInfo 从 call_sub_agent 的入参 JSON 中提取角色 ID 与任务全文，
+// 供子 Agent 派发事件记录使用；显示端（TUI）自行截断标题，完整记录看全文。
+// 解析失败时返回空角色与原始输入的截断。
 func subAgentDispatchInfo(argsJSON string) (roleID, taskBrief string) {
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return "", textutil.TruncateRunes(argsJSON, 100, "…")
+		return "", textutil.TruncateRunes(argsJSON, 2000, "…")
 	}
 	if v, ok := args["role_id"].(string); ok {
 		roleID = v
 	}
 	if v, ok := args["task"].(string); ok {
-		taskBrief = textutil.TruncateRunes(strings.ReplaceAll(strings.TrimSpace(v), "\n", " "), 100, "…")
+		taskBrief = strings.ReplaceAll(strings.TrimSpace(v), "\n", " ")
 	}
 	return roleID, taskBrief
 }

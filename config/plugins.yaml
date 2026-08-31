@@ -150,8 +150,9 @@ plugins:
   # Agent 被迫写脚本复制两份规范名，9 张图变 27 个文件）。下方 volumes 挂整个工作目录，
   # ${WORKDIR} 在插件 Init 时展开为启动目录绝对路径；ui_preview 挂载同一工作目录，
   # file:///workspace/... 可达全部产物。
-  # exec_timeout_sec 1200：od_image_generate 支持 prompts 批量（桥内顺序串行，daemon 单任务语义），
-  # 批量 20+ 张 × 单张最长 60s 可能逼近 20min；单张场景远低于此上限，放大上限无负面影响
+  # exec_timeout_sec 1200：od_image_generate 支持 prompts 批量（桥内并发生成，上限
+  # OD_BATCH_CONCURRENCY 默认 3，daemon 每 task 独立异步无串行限制），
+  # 批量 20+ 张 × 单张最长 60s ÷ 并发 3 约 8min；单张场景远低于此上限，放大上限无负面影响
   #（默认 120s 会掐断长任务，单张时代的 240s 又兜不住批量）。
   ui_design:
     kind: mcp

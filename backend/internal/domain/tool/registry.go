@@ -953,7 +953,10 @@ func (r *Registry) Schema() []tools.Tool {
 		toolsList = append(toolsList, t)
 	}
 	// 注册 WriteFile 工具：写入文件。
-	if t, err := tools.NewFunc("WriteFile", "写入文件（整文件覆盖，不是局部替换/追加）。content 必须是文件的**完整内容**--修改局部须先 ReadFile 读取完整文件再写完整内容，禁止只发修改片段（只发片段会把原文件整文件覆盖为片段，造成数据丢失）。若文件仅作为临时产物使用（例如运行脚本、中间分析、一次性计算），请设置 temporary=true，文件会写入会话级临时目录并在会话结束后自动清理；用户明确要求保留的文件请保持 temporary=false（默认）。极端缩小（新内容 < 原文件 10% 且原文件 >= 5KB）默认拒收，确为有意精简时加 confirm_shrink=true 绕过。", func(ctx context.Context, in writeFileInput) (string, error) {
+	// 编辑纪律（2026-08-31 实证）：域 Agent 修改已有文件 90 次全走 WriteFile 整写
+	// （EditFile 仅 3 次），单轮流式输出 30-64K token 拖慢 5-22 分钟/轮。修改已有
+	// 文件一律 EditFile 局部替换；WriteFile 限新建文件与整文件重写。
+	if t, err := tools.NewFunc("WriteFile", "新建文件（整文件写入）。**修改已存在的文件禁止用本工具**：一律用 EditFile 局部替换（只输出改动片段，省 token 且快）；仅当改动面覆盖文件大半时才允许 WriteFile 整写。content 必须是文件的**完整内容**--绝不允许只发修改片段（只发片段会把原文件整文件覆盖为片段，造成数据丢失）。若文件仅作为临时产物使用（例如运行脚本、中间分析、一次性计算），请设置 temporary=true，文件会写入会话级临时目录并在会话结束后自动清理；用户明确要求保留的文件请保持 temporary=false（默认）。极端缩小（新内容 < 原文件 10% 且原文件 >= 5KB）默认拒收，确为有意精简时加 confirm_shrink=true 绕过。", func(ctx context.Context, in writeFileInput) (string, error) {
 		// 转发到内部 WriteFile 工具，包含路径、内容和 temporary/confirm_shrink 标志。
 		res, _ := r.Dispatch(ctx, "WriteFile", map[string]any{"path": in.Path, "content": in.Content, "temporary": in.Temporary, "confirm_shrink": in.ConfirmShrink})
 		b, _ := marshalNoHTMLEscape(res)
@@ -962,8 +965,8 @@ func (r *Registry) Schema() []tools.Tool {
 		toolsList = append(toolsList, t)
 	}
 	// 注册 EditFile 工具：精确局部替换（TODO #49）。
-	// 小改（<20% 文件）优先 EditFile，新建/大改才 WriteFile；匹配失败返回就近上下文提示而非静默。
-	if t, err := tools.NewFunc("EditFile", "精确局部替换（只改指定片段，不重写整个文件）。old_string 必须与文件现有内容逐字符一致（含缩进/空格；行尾 \\r\\n 与 \\n 视为等价），默认须唯一匹配，多处匹配会报错；确需全部替换时传 replace_all=true。匹配失败返回错误并附文件开头片段供自查，不会改动文件。**小改（<20% 文件）优先用 EditFile 而非 WriteFile**：EditFile 只输出替换片段，输出 token 与耗时远小于整文件重写（整文件重写单次可达 23-25KB 输出、拖慢 1-3 分钟）；新建文件或改动面接近整文件时仍用 WriteFile。EditFile 与 WriteFile 同等触发共享记忆/spec 失效与 .bma/snapshots 备份。", func(ctx context.Context, in editFileInput) (string, error) {
+	// 修改已有文件的首选方式（对齐 Claude Code Edit 惯例）；仅新建文件走 WriteFile。
+	if t, err := tools.NewFunc("EditFile", "修改已存在文件的首选方式：精确局部替换，只改指定片段，不重写整个文件（输出 token 与耗时仅为整文件重写的零头）。old_string 必须与文件现有内容逐字符一致（含缩进/空格；行尾 \\r\\n 与 \\n 视为等价），默认须唯一匹配，多处匹配会报错；确需全部替换时传 replace_all=true。定位片段前可先 ReadFile 该文件的目标行段（用 offset/limit 只读相关区间，不必整读大文件）。匹配失败返回错误并附文件开头片段供自查，不会改动文件；多处匹配时在 old_string 中多带几行上下文使其唯一。新建文件用 WriteFile；改动面确实覆盖文件大半时才整写。EditFile 与 WriteFile 同等触发共享记忆/spec 失效与 .bma/snapshots 备份。", func(ctx context.Context, in editFileInput) (string, error) {
 		// 转发到内部 EditFile 工具，包含路径、old_string/new_string 与 replace_all 标志。
 		res, _ := r.Dispatch(ctx, "EditFile", map[string]any{"path": in.Path, "old_string": in.OldString, "new_string": in.NewString, "replace_all": in.ReplaceAll})
 		b, _ := marshalNoHTMLEscape(res)

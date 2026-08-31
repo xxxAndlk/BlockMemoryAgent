@@ -14,6 +14,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { PNG } from 'pngjs';
 import { z } from 'zod';
 
 const OD_API_URL = (process.env.OD_API_URL || 'http://host.docker.internal:7456').replace(/\/$/, '');
@@ -25,6 +26,13 @@ const OD_HOST_HEADER = process.env.OD_HOST_HEADER || 'localhost:7456';
 // 火山方舟 Agent Plan 网关唯一可用图像模型）。
 const OD_DEFAULT_MODEL = process.env.OD_DEFAULT_MODEL || 'custom-image';
 const OD_PROJECT_ID = process.env.OD_PROJECT_ID || 'bma-agent-artifacts';
+// 批量生成并发上限：daemon 每 task 独立异步（无串行限制），上限只防上游配额打爆。
+const OD_BATCH_CONCURRENCY = Math.max(1, Number(process.env.OD_BATCH_CONCURRENCY || 3));
+// 白底抠除阈值：RGB 三通道均 >= 阈值的边缘连通区视为背景置透明。
+// 240 档容忍 seedream 的近白底（250+）；图内白色本体（眼睛/高光/白萝卜身）因与边缘
+// 不连通而保留。实证 2026-08-31：seedream 对"透明背景"提示词执行不稳定，
+// tower/monster 系列整图白底，纯 prompt 不可靠，必须落盘前后处理。
+const WHITE_BG_THRESHOLD = 240;
 const OD_TIMEOUT_MS = Number(process.env.OD_TIMEOUT_MS || 180000);
 // 容器内挂载的工作目录根（plugins.yaml volumes: ${WORKDIR}:/workspace）。
 // save_as 相对路径以此解析；默认产物落其子目录 .bma/od-artifacts。
@@ -180,7 +188,36 @@ function slugify(prompt) {
   return slug || 'image';
 }
 
-async function generateImage({ prompt, aspect, model, save_as: saveAs }) {
+// removeWhiteBackground 白底抠除：从图片四边出发 flood-fill，凡 RGB 三通道均
+// >= WHITE_BG_THRESHOLD 且与边缘连通的像素置全透明。边缘连通保证只抠"背景"，
+// 图内白色本体（白萝卜身/眼睛高光/白色图案）与边缘隔着描边不连通、得以保留。
+// 非透明 PNG / 解码失败抛错由调用方兜底保留原图。
+function removeWhiteBackground(buf) {
+  const png = PNG.sync.read(buf);
+  const { width: w, height: h, data } = png;
+  const nearWhite = (i) =>
+    data[i] >= WHITE_BG_THRESHOLD && data[i + 1] >= WHITE_BG_THRESHOLD &&
+    data[i + 2] >= WHITE_BG_THRESHOLD && data[i + 3] !== 0;
+  const visited = new Uint8Array(w * h);
+  const stack = [];
+  for (let x = 0; x < w; x++) stack.push(x, 0, x, h - 1);
+  for (let y = 0; y < h; y++) stack.push(0, y, w - 1, y);
+  while (stack.length) {
+    const y = stack.pop();
+    const x = stack.pop();
+    if (x < 0 || y < 0 || x >= w || y >= h) continue;
+    const p = y * w + x;
+    if (visited[p]) continue;
+    visited[p] = 1;
+    const i = p * 4;
+    if (!nearWhite(i)) continue;
+    data[i + 3] = 0;
+    stack.push(x + 1, y, x - 1, y, x, y + 1, x, y - 1);
+  }
+  return PNG.sync.write(png);
+}
+
+async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg: removeBg }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
@@ -200,6 +237,20 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs }) {
   const fileName = (await extractTaskFile(task)) || (await newestImageFallback(startedAtMs));
   if (!fileName) throw new Error('任务完成但未找到产物文件名');
   const bytes = await downloadFile(fileName);
+  // 白底抠除（默认开）：seedream 对"透明背景"提示词执行不稳定（实证 tower/monster
+  // 系列整图白底），纯 prompt 不可靠，落盘前 flood-fill 边缘连通白区置透明。
+  // remove_bg=false 跳过（满幅背景图如 9:16 场景底图必须保留背景，勿开）。
+  let outBytes = bytes;
+  let bgRemoved = false;
+  if (removeBg !== false) {
+    try {
+      outBytes = removeWhiteBackground(bytes);
+      bgRemoved = outBytes !== bytes;
+    } catch (err) {
+      log('背景去除失败（保留原图）:', err.message);
+      outBytes = bytes;
+    }
+  }
   const ext = (fileName.match(/\.[a-z0-9]+$/i)?.[0]) || '.png';
   let absPath;
   let relPath;
@@ -215,13 +266,14 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs }) {
     absPath = join(OUTPUT_DIR, outName);
   }
   mkdirSync(dirname(absPath), { recursive: true });
-  writeFileSync(absPath, bytes);
+  writeFileSync(absPath, outBytes);
   const elapsedSec = Math.round((Date.now() - startedAtMs) / 1000);
-  log('产物已落盘:', relPath, `${bytes.length}B`, `${elapsedSec}s`);
+  log('产物已落盘:', relPath, `${outBytes.length}B${bgRemoved ? '（白底已抠除）' : ''}`, `${elapsedSec}s`);
   return {
     path: relPath,
     filename: relPath.split('/').pop(),
-    bytes: bytes.length,
+    bytes: outBytes.length,
+    bg_removed: bgRemoved,
     model: useModel,
     aspect: aspect || null,
     elapsedSec,
@@ -229,10 +281,12 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs }) {
   };
 }
 
-// generateImageBatch 批量生成：对 prompts 数组顺序串行逐张调用 generateImage
-//（daemon 一 prompt 一 task 单任务语义，桥内不并发，避免打爆上游配额）；
+// generateImageBatch 批量生成：对 prompts 数组并发生成，上限 OD_BATCH_CONCURRENCY
+//（默认 3，防打爆上游配额）。实证 2026-08-31：daemon /media/generate 建 task 后
+// generateMedia 后台异步跑、HTTP 立即回 taskId（routes/media.js），无队列无锁——
+// 旧"daemon 单任务语义"注释不成立，纯串行白等（23 张 × 30s ≈ 11.5min，并发 3 压到 ~4min）。
 // 单张失败不中断整批，结果逐项标注 path 或 error，由 Agent 决定重试/降级。
-async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAsList }) {
+async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAsList, remove_bg: removeBg }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
@@ -243,20 +297,28 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
     throw new Error(`save_as_list 长度（${saveAsList.length}）须与 prompts（${prompts.length}）等长`);
   }
   const startedAtMs = Date.now();
-  const results = [];
-  for (let i = 0; i < prompts.length; i++) {
-    const prompt = prompts[i];
-    // save_as_list 元素为空串 = 该项走默认 .bma/od-artifacts 命名。
-    const saveAs = saveAsList?.[i] || undefined;
-    try {
-      const r = await generateImage({ prompt, aspect, model, save_as: saveAs });
-      results.push({ index: i, prompt, path: r.path, filename: r.filename, bytes: r.bytes });
-      log(`批量进度 ${i + 1}/${prompts.length} 完成:`, r.path);
-    } catch (err) {
-      log(`批量进度 ${i + 1}/${prompts.length} 失败:`, err.message);
-      results.push({ index: i, prompt, error: err.message });
+  const results = new Array(prompts.length);
+  let next = 0;
+  let settled = 0;
+  async function worker() {
+    while (next < prompts.length) {
+      const i = next++;
+      const prompt = prompts[i];
+      // save_as_list 元素为空串 = 该项走默认 .bma/od-artifacts 命名。
+      const saveAs = saveAsList?.[i] || undefined;
+      try {
+        const r = await generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg: removeBg });
+        results[i] = { index: i, prompt, path: r.path, filename: r.filename, bytes: r.bytes };
+        log(`批量进度 ${++settled}/${prompts.length} 完成:`, r.path);
+      } catch (err) {
+        log(`批量进度 ${++settled}/${prompts.length} 失败:`, err.message);
+        results[i] = { index: i, prompt, error: err.message };
+      }
     }
   }
+  await Promise.all(
+    Array.from({ length: Math.min(OD_BATCH_CONCURRENCY, prompts.length) }, () => worker())
+  );
   const succeeded = results.filter((r) => r.path).length;
   return {
     total: prompts.length,
@@ -296,19 +358,22 @@ server.registerTool('od_image_generate', {
   description:
     '经本地 open_design 守护进程生成图片（默认火山方舟 Seedream）。' +
     '【批量优先】帧序列/多素材场景（如塔防游戏的 6 塔 × 4 帧动画、整套怪物贴图）' +
-    '务必用 prompts 数组一次提交整批：桥内顺序串行逐张生成（daemon 单任务语义，不并发），' +
-    '一次调用拿全部结果；逐张单独调用会在每两张之间多夹一轮 LLM 往返，墙钟数倍放大。' +
+    '务必用 prompts 数组一次提交整批：桥内并发生成（上限 ' + OD_BATCH_CONCURRENCY + '，' +
+    'OD_BATCH_CONCURRENCY 可调），一次调用拿全部结果；' +
+    '逐张单独调用会在每两张之间多夹一轮 LLM 往返，墙钟数倍放大。' +
     '单张失败不中断整批，结果 results 数组逐项标注 path 或 error。' +
     '正式素材务必指定落盘路径：单张用 save_as，批量用 save_as_list（与 prompts 等长，' +
     '元素空串表示该项走默认命名），给工作目录相对路径（如 assets/img/mon-zombie.png），' +
     '图片直落该路径、一图一份，结果 path 字段即可在 HTML/CSS/JS 中直接引用；' +
     '禁止事后再复制/重命名出第二份。缺省落盘 .bma/od-artifacts（时间戳命名，仅适合草稿/临时用途）。' +
+    '产物默认白底抠除（remove_bg=true）：边缘连通白色背景自动置透明，贴图/图标/精灵开箱即用；' +
+    '满幅背景图（9:16 场景底图等）必须传 remove_bg=false 保留背景。' +
     '单张生成约需 10–60 秒，请勿重复提交相同 prompt。',
   inputSchema: {
     prompt: z.string().min(1).optional().describe(
       '单张模式的图像描述（建议具体描述主体/风格/配色/构图）。与 prompts 二选一；同时给 prompts 时以 prompts 为准'),
     prompts: z.array(z.string().min(1)).min(1).optional().describe(
-      '批量模式：prompt 数组，每个元素各生成一张（桥内顺序串行）。帧序列/多素材场景优先用此参数一次提交，' +
+      '批量模式：prompt 数组，每个元素各生成一张（桥内并发生成，上限 OD_BATCH_CONCURRENCY 默认 3）。帧序列/多素材场景优先用此参数一次提交，' +
       '避免逐张调用各产生一轮 LLM 往返。与 prompt 二选一；空数组报错'),
     aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例（批量时整批共用），缺省由模型决定'),
     model: z.string().optional().describe(`覆盖默认模型（缺省 ${OD_DEFAULT_MODEL}）`),
@@ -318,6 +383,10 @@ server.registerTool('od_image_generate', {
     save_as_list: z.array(z.string()).optional().describe(
       '批量模式落盘路径数组，须与 prompts 等长；元素为工作目录相对路径（同 save_as 规则），' +
       '空串表示该项用默认 .bma/od-artifacts 命名。仅配合 prompts 使用'),
+    remove_bg: z.boolean().optional().describe(
+      '白底抠除（默认 true）：落盘前把边缘连通的白色背景置为透明（贴图/图标/精灵类需要）。' +
+      '满幅背景图（如 9:16 场景底图、整页背景）必须传 false 保留背景，否则会被抠透。' +
+      '仅对 PNG 生效，非 PNG 产物自动跳过'),
   },
 }, async (args) => {
   try {

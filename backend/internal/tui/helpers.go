@@ -964,17 +964,19 @@ func eventChatItem(ev server.SessionEvent, compact bool) (title, detail, rawDeta
 		}
 		title = "💭 " + msg
 		return title, "", title, true
-	// 子 Agent 派发事件：Tool 携带角色 ID，Message 为任务摘要。
+	// 子 Agent 派发事件：Tool 携带角色 ID，Message 为任务全文（后端不再截断）。
+	// 标题按显示宽度截断防刷屏；完整任务文本放 rawDetail 供完整记录查看。
 	case ev.Kind == "sub_agent_dispatch":
 		role := ev.Tool
 		if role == "" {
 			role = "sub-agent"
 		}
 		title = "🚀 派发" + subAgentRoleLabel(role) + ": " + role
-		if msg := strings.TrimSpace(ev.Message); msg != "" {
-			title += " — " + msg
+		rawDetail = strings.TrimSpace(ev.Message)
+		if rawDetail != "" {
+			title += " — " + truncate(rawDetail, 200)
 		}
-		return title, "", title, true
+		return title, "", rawDetail, true
 	// 子 Agent 完成事件：Message 携带子 Agent ID（形如 session-1/code_assistant-1）。
 	case ev.Kind == "sub_agent_done":
 		id := strings.TrimSpace(ev.Message)

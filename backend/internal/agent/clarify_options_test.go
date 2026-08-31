@@ -282,7 +282,7 @@ func TestAskUserHook_OptionsPassthrough(t *testing.T) {
 	if sess == nil || sess.Status != string(enums.SessionStatusCompleted) {
 		t.Fatalf("session did not complete after option answer, status=%v", sess.Status)
 	}
-	if !llm.requestContains("用户答复: 浅色") {
+	if !llm.requestContains("答复: 浅色") {
 		t.Fatalf("option label 应作为工具结果进入下一轮 LLM 请求")
 	}
 	if !strings.Contains(sess.Result, "浅色") {

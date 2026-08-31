@@ -292,6 +292,12 @@ func TestSubmitPlanTopLevelUsesAskUser(t *testing.T) {
 		if !strings.Contains(question, "【计划确认】") || !strings.Contains(question, "任务简介") {
 			t.Errorf("unexpected ask_user question: %s", question)
 		}
+		if opts.Detail != "p" {
+			t.Errorf("plan 全文应经 detail 透传（落对话区）, got %q", opts.Detail)
+		}
+		if strings.Contains(question, "p\n") || strings.Contains(question, "【计划详情】") {
+			t.Errorf("question 不应再内嵌计划全文（面板只显示短问题+选项）: %s", question)
+		}
 		if len(opts.Options) != 2 {
 			t.Errorf("expected 2 options, got %d", len(opts.Options))
 		}

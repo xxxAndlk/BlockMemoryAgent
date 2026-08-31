@@ -53,8 +53,9 @@ type (
 		// Path 为待写入文件的目标路径。
 		Path string `json:"path"`
 		// Content 为要写入文件的文本内容。必须是文件的**完整内容**--WriteFile 是整文件覆盖，
-		// 不是局部替换/追加。修改局部须先 ReadFile 完整文件再写完整内容，禁止只发修改片段
-		// （只发片段会把原文件整文件覆盖为片段，造成数据丢失）。
+		// 不是局部替换/追加。修改已有文件一律走 EditFile 局部替换；WriteFile 限新建与整写。
+		// 禁止只发修改片段（只发片段会把原文件整文件覆盖为片段，造成数据丢失），
+		// 缩小守卫会拒收并引导改用 EditFile。
 		Content string `json:"content"`
 		// Temporary 为 true 时表示写入到当前会话的临时目录，受会话上下文约束。
 		Temporary bool `json:"temporary"`
@@ -355,7 +356,7 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 		prevSize = fi.Size()
 	}
 	// 极端缩小硬拒绝：原文件较大且新内容远小于原文件时，几乎肯定是模型把 WriteFile
-	// 当局部替换用了（只发修改片段）。拒收并引导模型 ReadFile 全文重写；若确为有意精简，
+	// 当局部替换用了（只发修改片段）。拒收并引导模型改用 EditFile 局部替换；若确为有意精简，
 	// 模型可显式传 confirm_shrink=true 绕过（合法大幅删减仍可放行）。
 	if prevSize >= minWriteFileShrinkRefuseBytes &&
 		int64(len(content)) < int64(float64(prevSize)*writeFileShrinkRefuseRatio) &&
@@ -363,7 +364,8 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 		return &Result{Tool: "WriteFile", Path: absPath, Error: fmt.Sprintf(
 			"refused: 新内容 %d 字节，仅为原文件 %d 字节的 %d%%。"+
 				"WriteFile 是整文件覆盖，不是局部替换--只发修改片段会把原文件整文件覆盖为片段，造成数据丢失。"+
-				"请改用 ReadFile 读取完整文件后把完整内容写入；若确为有意的极端精简，请加参数 confirm_shrink=true。",
+				"修改已有文件请改用 EditFile 局部替换（old_string=原文片段，new_string=新片段）；"+
+				"若确为有意的极端精简，请加参数 confirm_shrink=true。",
 			len(content), prevSize, int64(len(content))*100/prevSize)}
 	}
 	// 写入前快照原文件：os.WriteFile 是整文件覆盖，截断写入会把原文件写残（实证：

@@ -39,7 +39,7 @@ func TestAskUserTool_AnswerPassThrough(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("ask_user should succeed, got: %+v", res)
 	}
-	if !strings.Contains(res.Output, "用户答复: 用深色") {
+	if !strings.Contains(res.Output, "答复: 用深色") {
 		t.Fatalf("expected answer in output, got: %s", res.Output)
 	}
 }
@@ -131,7 +131,7 @@ func TestAskUserTool_OptionsPassThrough(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("ask_user with options should succeed, got: %+v", res)
 	}
-	if !strings.Contains(res.Output, "用户答复: 深色") {
+	if !strings.Contains(res.Output, "答复: 深色") {
 		t.Fatalf("expected answer in output, got: %s", res.Output)
 	}
 }
@@ -151,6 +151,128 @@ func TestAskUserTool_OptionsGarbageIgnored(t *testing.T) {
 	})
 	if !res.Success {
 		t.Fatalf("garbage options should not fail the tool, got: %+v", res)
+	}
+}
+
+// TestAskUserTool_BatchQuestions 批量模式：questions 数组逐题调 hook，答案按题号汇总。
+func TestAskUserTool_BatchQuestions(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	var asked []string
+	answers := map[string]string{"技术方案？": "单文件HTML", "几张地图？": "3张"}
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
+		asked = append(asked, question)
+		return answers[question], nil
+	})
+	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{
+		"questions": []any{
+			map[string]any{
+				"question": "技术方案？",
+				"options": []any{
+					map[string]any{"id": "single", "label": "单文件HTML"},
+					map[string]any{"id": "phaser", "label": "Phaser"},
+				},
+			},
+			map[string]any{"question": "几张地图？"},
+		},
+	})
+	if !res.Success {
+		t.Fatalf("batch ask_user should succeed, got: %+v", res)
+	}
+	if len(asked) != 2 || asked[0] != "技术方案？" || asked[1] != "几张地图？" {
+		t.Fatalf("questions should be asked in order, got: %v", asked)
+	}
+	if !strings.Contains(res.Output, "1. 答复: 单文件HTML") ||
+		!strings.Contains(res.Output, "2. 答复: 3张") {
+		t.Fatalf("expected numbered answers, got: %s", res.Output)
+	}
+}
+
+// TestAskUserTool_BatchTimeoutContinues 批量中单题超时不中断：记"自行决策"继续下一题。
+func TestAskUserTool_BatchTimeoutContinues(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	var asked []string
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
+		asked = append(asked, question)
+		if question == "卡住？" {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		return "答案", nil
+	})
+	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{
+		"timeout_sec": float64(1),
+		"questions": []any{
+			map[string]any{"question": "卡住？"},
+			map[string]any{"question": "正常？"},
+		},
+	})
+	if !res.Success {
+		t.Fatalf("batch with one timeout should still succeed, got: %+v", res)
+	}
+	if len(asked) != 2 {
+		t.Fatalf("second question should still be asked, asked: %v", asked)
+	}
+	if !strings.Contains(res.Output, "1. 答复: 用户未答复，自行决策。") ||
+		!strings.Contains(res.Output, "2. 答复: 答案") {
+		t.Fatalf("expected timeout note + continuing answer, got: %s", res.Output)
+	}
+}
+
+// TestAskUserTool_QuestionsPreferredOverTopLevel questions 与顶层 question 并存时 questions 优先。
+func TestAskUserTool_QuestionsPreferredOverTopLevel(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	var asked []string
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
+		asked = append(asked, question)
+		return "ok", nil
+	})
+	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{
+		"question":  "顶层问题？",
+		"questions": []any{map[string]any{"question": "批量问题1？"}, map[string]any{"question": "批量问题2？"}},
+	})
+	if !res.Success {
+		t.Fatalf("should succeed, got: %+v", res)
+	}
+	if len(asked) != 2 || asked[0] != "批量问题1？" {
+		t.Fatalf("questions should take precedence, asked: %v", asked)
+	}
+}
+
+// TestAskUserTool_BatchCap 超过 5 题截断到上限。
+func TestAskUserTool_BatchCap(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	n := 0
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
+		n++
+		return "ok", nil
+	})
+	qs := make([]any, 0, 8)
+	for range 8 {
+		qs = append(qs, map[string]any{"question": "q"})
+	}
+	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{"questions": qs})
+	if !res.Success || n != maxAskUserBatch {
+		t.Fatalf("expected %d questions asked, got %d, res: %+v", maxAskUserBatch, n, res)
+	}
+}
+
+// TestAskUserTool_DetailPassthrough detail 参数（计划全文等长上下文）透传 hook。
+func TestAskUserTool_DetailPassthrough(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	var gotDetail string
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
+		gotDetail = opts.Detail
+		return "ok", nil
+	})
+	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{
+		"question": "确认？",
+		"detail":   "计划全文……",
+	})
+	if !res.Success {
+		t.Fatalf("should succeed, got: %+v", res)
+	}
+	if gotDetail != "计划全文……" {
+		t.Fatalf("detail 应透传 hook, got %q", gotDetail)
 	}
 }
 
@@ -176,7 +298,7 @@ func TestAskUserTool_Schema(t *testing.T) {
 		t.Fatal("ask_user 应实现 SchemaSource")
 	}
 	props := src.InputSchema().Properties
-	for _, want := range []string{"question", "options", "multi_select", "timeout_sec"} {
+	for _, want := range []string{"question", "options", "multi_select", "timeout_sec", "questions"} {
 		if _, ok := props[want]; !ok {
 			t.Fatalf("ask_user schema missing parameter %q (have %v)", want, keysOf(props))
 		}

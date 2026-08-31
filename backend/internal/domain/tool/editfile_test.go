@@ -351,8 +351,8 @@ func TestEditFile_SchemaExposed(t *testing.T) {
 			if !strings.Contains(desc, "old_string") || !strings.Contains(desc, "replace_all") {
 				t.Errorf("EditFile description = %q, want old_string/replace_all guidance", desc)
 			}
-			if !strings.Contains(desc, "小改") {
-				t.Errorf("EditFile description = %q, want small-change guidance", desc)
+			if !strings.Contains(desc, "修改已存在文件的首选方式") {
+				t.Errorf("EditFile description = %q, want edit-first guidance", desc)
 			}
 		}
 	}
