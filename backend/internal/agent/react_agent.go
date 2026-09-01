@@ -67,6 +67,11 @@ type ReActAgent struct {
 	// persona 可选的人格注入器（soul.Loader 实现该接口）；为 nil 时不注入人格前缀。
 	// 在 systemPrompt() 头部把人格内容拼到环境块之前，使所有 Agent 共享用户级人格。
 	persona PersonaInjector
+	// skillBlock 技能元数据块（渐进披露第一层：仅名称+一句话描述），由 WithSkillBlock
+	// 在构造期注入（一次性 Agent 在派发时、Meta 在会话构建时）。追加在系统提示词
+	// 纪律块之后 = 只 fork 提示词尾部，envBlock+base 公共前缀跨 Agent 前缀缓存不受影响。
+	// 正文获取经 load_skill 工具按需进行，整块内容不随提示词重复展开。
+	skillBlock string
 	// pausedChecker 可选的"是否有 Paused 子 DomainAgent"检查器，由 WithPausedChildChecker 注入。
 	// 父终结保护 wait loop 中检查：若有 Paused 子节点（触达 token 上限），父 MetaAgent
 	// 无限 budget 不会自行暂停，需靠此检查跳出 wait loop 返回 PausedOnChild，由上层 pauseSession
@@ -199,6 +204,13 @@ func (a *ReActAgent) WithMemory(m MemoryPipeline) *ReActAgent {
 // 用于让 LLM 用相对路径定位文件、判断 OS 上下文。空字符串表示回退到进程 cwd。
 func (a *ReActAgent) WithWorkDir(wd string) *ReActAgent {
 	a.workDir = wd
+	return a
+}
+
+// WithSkillBlock 注入【可用技能】元数据块（构造期一次性，冻结进 systemPrompt 缓存）。
+// 空串为零行为（未启用技能/无持有技能时 dispatcher 传空即自动跳过）。
+func (a *ReActAgent) WithSkillBlock(block string) *ReActAgent {
+	a.skillBlock = block
 	return a
 }
 
@@ -1280,6 +1292,12 @@ func (a *ReActAgent) buildSystemPrompt() string {
 		"2. 产出或修改文件后必须验证：代码类产出用 RunCommand 跑构建/测试/语法检查；非代码产出对照任务验收标准逐条核对。没有验证证据不得声称完成。\n" +
 		"3. 任务完成立即停止调用工具，输出最终答复；答复必须自包含：做了什么、结果如何、关键产出与文件路径。\n" +
 		"4. 形如 [mailbox from <agent_id>] 的消息是异步子 Agent 回传的结果摘要，阅读后整合进当前结论；若摘要表明失败，决定重试、自己接手或在答复中说明。\n"
+	// 技能元数据块（渐进披露第一层）追加在纪律块之后：持有技能的名称+一句话描述 +
+	// load_skill 取全文/派发下放提示。放在尾部只 fork 提示词尾部，envBlock+base+纪律块
+	// 的公共前缀跨 Agent 保持逐字节一致（前缀缓存跨实例复用，口径同 responsibility 注入）。
+	if a.skillBlock != "" {
+		prompt += "\n\n" + a.skillBlock
+	}
 	// 人格注入器非 nil 时，把人格内容拼到完整 prompt 最前（envBlock 之前），
 	// 作为用户级人格前缀。人格为空时 Inject 原样返回，无副作用。
 	if a.persona != nil {

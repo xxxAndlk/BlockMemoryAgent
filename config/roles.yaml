@@ -34,7 +34,7 @@ meta_agent:
   # 实证 2026-08-18，MetaAgent 联网永远默认走内置 HTTPGet 硬刮搜索引擎（零摩擦路径依赖），
   # web_search 插件（firecrawl，roles:["meta"]）需要 tool_catalog+tool_mount 两步而从不被选中。
   # 去掉后 meta 联网只能挂 web_search 插件，调研结论钉进 spec 再派发（见派发铁律）。
-  tools: [call_sub_agent, call_sub_agents, WriteSharedMemory, WriteSpec, WriteFile, EditFile, create_role, list_roles, RefreshProjectDoc, send_message, cancel_agent, ask_user, write_plan, submit_plan, review_plan, remember_preference, search_knowledge, plugin_search, plugin_install, plugin_enable, plugin_disable, plugin_list, tool_catalog, tool_mount, tool_unmount]
+  tools: [call_sub_agent, call_sub_agents, WriteSharedMemory, WriteSpec, WriteFile, EditFile, create_role, list_roles, RefreshProjectDoc, send_message, cancel_agent, ask_user, write_plan, submit_plan, review_plan, remember_preference, search_knowledge, plugin_search, plugin_install, plugin_enable, plugin_disable, plugin_list, tool_catalog, tool_mount, tool_unmount, list_skills, load_skill]
   system_prompt: |
     你是 BlockMemoryAgent 的主 Agent（MetaAgent），对用户最终目标直接负责。
     你的 context 最贵（长跑 + 累积 mailbox 摘要），默认只做分析、拆分、派发、汇总；
@@ -306,7 +306,7 @@ domain_agent:
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.5
     max_tokens: 128000  # DomainAgent 自执行 WriteFile 时需容纳大文件 + 派发推理；Volces ark 硬上限 128000，顶格设
-    thinking: off       # 思考开关（true/false）：实证 glm-5.3-flash 默认思考每轮烧 2-20K reasoning，侦察任务 30 轮 165K 输出 ≈57min 纯生成；执行型角色关思考
+    thinking: high       # 思考开关（true/false）：实证 glm-5.3-flash 默认思考每轮烧 2-20K reasoning，侦察任务 30 轮 165K 输出 ≈57min 纯生成；执行型角色关思考
   system_prompt: |
     你是领域负责人（DomainAgent），把父 Agent 交办的目标在你负责的领域内落地。
     你是本领域的直接执行者：任务所需的读文件/写文件/跑命令/检索查证默认全部由你一人完成；
@@ -549,9 +549,9 @@ fixed_roles:
       【交付】
       最终答复自包含：修改摘要 + 验证结果（命令与结论）+ 涉及的文件路径。
     keywords: ["代码", "编程", "开发", "bug", "修复", "重构", "review", "code"]
-    skills: ["代码编写", "代码审查", "重构", "单元测试", "调试"]
+    skills: []
     # 只暴露执行类工具；call_sub_agent 由 dispatcher 注册但不在此白名单中。
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &coding_model
       provider: anthropic
       model: deepseek-v4-flash
@@ -559,7 +559,7 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
       max_tokens: 32768  # 软偏好：超端点硬上限时 provider 自动钳制并重试（2026-08-13 实证 ark /api/coding 对 kimi 系硬限 32768，配 65536 全 400）；截断风险由跨轮续写（maxContinueRounds）兜底
-      thinking: off       # 执行型角色关思考（历史注：glm-5.2(thinking) 编码单轮分钟级曾拖慢全链路；k3(非推理) 单轮 ~1min）
+      thinking: high       # 执行型角色关思考（历史注：glm-5.2(thinking) 编码单轮分钟级曾拖慢全链路；k3(非推理) 单轮 ~1min）
       # 现值 deepseek-v4-flash：叶子是最高频角色，规格已被 spec 钉死、单文件闭环，
       # flash（抵扣 0.5）性价比最优；k2.7-code（抵扣 4.5）留作质量不足时的升级档。
     can_be_called: true
@@ -595,8 +595,8 @@ fixed_roles:
       【交付】
       最终答复自包含：改动摘要 + 验证结果 + 涉及的文件路径。
     keywords: ["UI", "界面", "前端", "CSS", "HTML", "样式", "布局", "page"]
-    skills: ["UI修复", "组件开发", "响应式设计", "CSS优化", "交互实现"]
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    skills: []
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &ui_model
       provider: anthropic
       model: glm-5.3-flash
@@ -604,7 +604,7 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL_FOUR}
       temperature: 0.7
       max_tokens: 32768  # 实证 16K 时 HTML+CSS 输出被截断 → 重写/分段追加空转 8.5min 烧穿预算；32K 一次写完
-      thinking: off       # 出图/写 UI 执行型角色关思考（同 domain_agent 实证）
+      thinking: high       # 出图/写 UI 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
 
   # 提示词审查助手
@@ -641,8 +641,8 @@ fixed_roles:
       【交付】
       最终答复 = 按严重度排序的问题清单 + 改写后的提示词全文，自包含。
     keywords: ["提示词", "prompt", "审查", "优化", "template"]
-    skills: ["Prompt审查", "Prompt优化", "安全检测", "偏见检测"]
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    skills: []
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &review_model
       provider: anthropic
       model: glm-5.3
@@ -650,7 +650,7 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.2
       max_tokens: 16384  # 提示词审查：完整 prompt 改写可能较长
-      thinking: off       # 2026-08-21 实证 glm-5.3 思考 300s 出不了判定 JSON（judge 2 连超时 fail-closed 全 FAIL）
+      thinking: high       # 2026-08-21 实证 glm-5.3 思考 300s 出不了判定 JSON（judge 2 连超时 fail-closed 全 FAIL）
       # TODO #40 块 3：归一 DeepSeek 原生 /chat/completions（openai-chat 别名）——自动前缀缓存
       # + 原生 cache 字段。历史注：2026-08-04 曾因端点不稳切 k3，strict 启动校验拖死风险由
       # VerifyConnectivity 的宽松重试兜底（#33 后已流式化+超时配置化）。
@@ -681,8 +681,8 @@ fixed_roles:
       【交付】
       最终答复 = findings 列表 + 末尾单独一行的 [VERIFY:PASS] 或 [VERIFY:FAIL] + 原因。
     keywords: ["review", "审查", "code_review"]
-    skills: ["代码审查", "安全审查", "风格检查"]
-    tools: [ReadFile, ListDir, SearchInFiles, GitDiff, GitStatus, GitLog, GitBlame, HTTPGet]
+    skills: []
+    tools: [ReadFile, ListDir, SearchInFiles, GitDiff, GitStatus, GitLog, GitBlame, HTTPGet, load_skill]
     model_config: *review_model
     can_be_called: true
 
@@ -721,15 +721,15 @@ fixed_roles:
       【交付】
       最终答复自包含：新增/修改的测试文件 + 运行结果 + 覆盖说明。
     keywords: ["测试", "test", "验证", "QA", "assert", "coverage"]
-    skills: ["单元测试", "集成测试", "边界测试", "性能测试"]
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    skills: []
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &test_model
       provider: anthropic
       model: deepseek-v4-flash
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       # deepseek 端点不稳会拖死 strict 启动校验（2026-08-04 实证），统一切 k3
-      thinking: off       # 执行型角色关思考（同 domain_agent 实证）
+      thinking: high       # 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
 
   # 文档助手
@@ -765,8 +765,8 @@ fixed_roles:
       风格简洁明了、结构清晰、示例充分。
       最终答复自包含：文档摘要 + 涉及的文件路径。
     keywords: ["文档", "doc", "README", "注释", "example"]
-    skills: ["技术文档", "API文档", "代码注释", "示例编写"]
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame]
+    skills: []
+    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &doc_model
       provider: anthropic
       model: doubao-seed-2.0-lite
@@ -797,7 +797,7 @@ dynamic_templates:
       - 子任务可独立执行，但后序任务必须复用前序结论。
       - 派发任务时附带关键上下文：文件路径、函数/行号、前置结论。
       - 前置已读过的代码，后序直接基于结论修改或验证，不重复全量读取。
-    skills: ["任务分析", "上下文管理", "结果汇总"]
+    skills: []
     max_lifetime: 86400  # 24小时
     model_config: *domain_model
 

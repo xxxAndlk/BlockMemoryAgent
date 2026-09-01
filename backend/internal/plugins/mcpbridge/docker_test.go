@@ -2,7 +2,6 @@ package mcpbridge
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"reflect"
@@ -59,23 +58,27 @@ func TestDockerRunArgs(t *testing.T) {
 }
 
 func TestDockerSharedContainerName(t *testing.T) {
-	a := dockerSharedContainerName("web_search", `D:\data\proj`)
-	b := dockerSharedContainerName("web_search", `D:\data\proj`)
-	if a != b {
-		t.Fatalf("同 workdir 应同名: %q vs %q", a, b)
-	}
-	if c := dockerSharedContainerName("web_search", `D:\data\other`); c == a {
-		t.Fatalf("异 workdir 应异名: %q", c)
-	}
-	// 后缀 = workdir sha256 前 4 字节十六进制（8 字符），跟进程号无关。
-	sum := sha256.Sum256([]byte(`D:\data\proj`))
-	wantSuffix := fmt.Sprintf("%x", sum[:4])
-	if !strings.HasSuffix(a, "-"+wantSuffix) {
-		t.Fatalf("容器名后缀应为 workdir 哈希: %q, want 后缀 %q", a, wantSuffix)
+	// 全局确定性：同 id 恒同名（跨 workdir/跨实例共用一套容器），无任何后缀。
+	a := dockerSharedContainerName("web_search")
+	if a != "bma-plugin-web_search" {
+		t.Fatalf("容器名错误: %q", a)
 	}
 	// id 净化与 legacy 同规则。
-	if got := dockerSharedContainerName("bundle/dir/server", "w"); strings.Contains(got, "/") {
+	if got := dockerSharedContainerName("bundle/dir/server"); strings.Contains(got, "/") {
 		t.Fatalf("容器名未净化: %q", got)
+	}
+	_ = a
+}
+
+func TestParseDockerMountSources(t *testing.T) {
+	out := "D:\\data\\proj|/workspace\n/var/lib/docker/volumes/x/_data|/app/.od\n"
+	got := parseDockerMountSources(out)
+	want := []string{`D:\data\proj`, "/var/lib/docker/volumes/x/_data"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sources = %q, want %q", got, want)
+	}
+	if normalizeMountPath(`D:\Data\Proj`) != "d:/data/proj" {
+		t.Fatalf("normalizeMountPath 错误: %q", normalizeMountPath(`D:\Data\Proj`))
 	}
 }
 
@@ -173,13 +176,16 @@ func TestFromSettingsShared(t *testing.T) {
 		t.Fatal("shared + stdio 应报错")
 	}
 
-	// 合法 shared：Init 预计算容器名（随 workdir）。
+	// 合法 shared：Init 预计算容器名（全局确定，与 workdir 无关）。
 	b3 := New("p3", s, nil)
 	if err := b3.Init(context.Background(), plugins.Deps{WorkDir: "w"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if want := dockerSharedContainerName("p3", "w"); b3.containerName != want {
+	if want := dockerSharedContainerName("p3"); b3.containerName != want {
 		t.Fatalf("containerName = %q, want %q", b3.containerName, want)
+	}
+	if b3.workDir != "w" {
+		t.Fatalf("workDir 未记录: %q", b3.workDir)
 	}
 }
 

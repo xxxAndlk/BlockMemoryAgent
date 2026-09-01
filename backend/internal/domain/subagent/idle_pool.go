@@ -544,6 +544,7 @@ func (d *Dispatcher) destroySlot(s *domainSlot, reason string) {
 	d.activity.Delete(s.id)
 	d.subMeta.Delete(s.id)
 	d.lastWrites.Delete(s.id)
+	d.heldSkills.Delete(s.id)
 	if d.mailbox != nil {
 		d.mailbox.Purge(s.id)
 	}
@@ -850,6 +851,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor("domain")).
 		WithWorkDir(d.subAgentWorkDir()).
+		WithSkillBlock(d.skillBlockFor(s.id, roleDef)).
 		WithPendingChildrenChecker(d).
 		WithSuspendGate(&slotSuspendGate{d: d, sid: s.sessionID})
 

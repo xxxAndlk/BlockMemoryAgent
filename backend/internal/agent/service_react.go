@@ -22,6 +22,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/userprofile"
 	"github.com/blockmemory/agent/backend/internal/project"
+	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	"github.com/blockmemory/agent/backend/internal/store"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
@@ -136,6 +137,25 @@ type ReactService struct {
 	// 防止心跳巡检把"等用户操作"误判假死 kill（实证 2026-08-18：三次误杀均卡在
 	// Remove-Item 确认框无人答复，每次白耗 ~12 分钟 + 重派）。nil 时不保活。
 	activityPinger func(agentID string)
+	// skillPool 全局技能池（技能渐进披露）：nil 时不注入 MetaAgent 技能目录块。
+	// bootstrap 经 SetSkillCatalog 注入与 Dispatcher 同一个池。
+	skillPool *skill.Pool
+}
+
+// SetSkillCatalog 注入全局技能池：MetaAgent 会话系统提示追加全池【可用技能】目录块
+// （Meta 持全集、可派发任意技能给下级）；nil 关闭（测试/未配置场景）。
+func (s *ReactService) SetSkillCatalog(p *skill.Pool) {
+	s.skillPool = p
+}
+
+// metaSkillBlock 渲染 MetaAgent 的全池技能目录块：Meta 持全集（无需派发即可
+// load_skill 取全文，也可经 call_sub_agent 的 skills 参数下放任意技能）。
+// skillPool 未注入或池为空时返回空串（零注入）。
+func (s *ReactService) metaSkillBlock() string {
+	if s.skillPool == nil {
+		return ""
+	}
+	return skill.MetadataBlock(s.skillPool, s.skillPool.Names())
 }
 
 // SetActivityPinger 注入等待用户答复期间的心跳保活回调；nil 关闭（测试场景）。
@@ -1679,6 +1699,7 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(s.workDir()).
+		WithSkillBlock(s.metaSkillBlock()).
 		WithPersonaInjector(s.metaPersona())
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
@@ -1787,6 +1808,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(s.workDir()).
+		WithSkillBlock(s.metaSkillBlock()).
 		WithPersonaInjector(s.metaPersona())
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {

@@ -24,7 +24,9 @@ type RoleDefinition struct {
 	SystemPrompt string `json:"system_prompt" yaml:"system_prompt"`
 	// Keywords 关键字列表，用于领域匹配、角色筛选与检索召回。
 	Keywords []string `json:"keywords" yaml:"keywords"`
-	// Skills 技能列表（Skill ID 列表），运行时与 SkillPool 取交集后装配给角色。
+	// Skills 本角色固定持有的技能（按技能 Name 或 SkillID 匹配 SkillPool，
+	// 未知项跳过并记日志）。派发子 Agent 时额外传入的 skills 会并入持有集；
+	// MetaAgent 不经此字段即默认持有全部技能。
 	Skills []string `json:"skills" yaml:"skills"`
 	// Tools 可用工具 ID 列表，约束该角色可调用的工具集合。
 	Tools []string `json:"tools" yaml:"tools"`

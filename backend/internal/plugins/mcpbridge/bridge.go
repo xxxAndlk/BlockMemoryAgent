@@ -208,8 +208,10 @@ type Bridge struct {
 	cmd     *exec.Cmd // stdio 子进程（http 传输为 nil）
 	tools   []tool.Tool
 
-	// containerName 仅 shared docker 使用：Init 时按 workdir 哈希预计算的共享容器名。
+	// containerName 仅 shared docker 使用：Init 时预计算的全局共享容器名。
 	containerName string
+	// workDir 仅 shared docker 使用：Init 时记录的当前工作目录，复用容器时校验挂载一致性。
+	workDir string
 
 	// lifecycle
 	stopCtx    context.Context
@@ -268,7 +270,8 @@ func (b *Bridge) Init(ctx context.Context, deps plugins.Deps) error {
 			if len(b.settings.ExecCommand) == 0 {
 				return fmt.Errorf("mcp 插件 %q: shared 模式需要 settings.exec_command（容器内 MCP server 启动命令）", b.id)
 			}
-			b.containerName = dockerSharedContainerName(b.id, deps.WorkDir)
+			b.workDir = deps.WorkDir
+			b.containerName = dockerSharedContainerName(b.id)
 		}
 	default:
 		return fmt.Errorf("mcp 插件 %q: 未知 transport %q（支持 stdio/http/docker）", b.id, b.settings.Transport)

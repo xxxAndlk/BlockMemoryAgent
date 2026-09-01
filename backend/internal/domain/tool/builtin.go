@@ -160,6 +160,10 @@ type (
 		// / executable（L0：须有验证命令成功执行的客观证据，无则反馈重试 1 轮）/ rubric（L2：交叉模型
 		// judge 按验收标准逐条判）/ none（不校验）。
 		VerifyKind string `json:"verify_kind" description:"校验分层（可选）：auto（默认，按角色/模式自动选）/ executable（必须有测试/lint/--check 成功运行的客观证据）/ rubric（交叉模型按验收标准逐条评审）/ none（跳过校验）。"`
+		// Skills 为下放给子 Agent 的技能名列表（技能渐进披露）：校验 ⊆ 父 Agent 持有集
+		// 后并入子持有集，越界项忽略并随派发结果回告。子 Agent 系统提示注入其【可用技能】
+		// 元数据块，正文经 load_skill 按需获取。
+		Skills []string `json:"skills" description:"下放给子 Agent 的技能名列表（可选，来自你的【可用技能】块）：子 Agent 将获得对应技能的元数据与 load_skill 加载权限。省略=不下放技能（子 Agent 仍有其角色固定技能）。"`
 	}
 )
 

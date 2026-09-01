@@ -24,6 +24,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/domain/tool"         // tool 包提供工具注册表与 Result 类型
 	"github.com/blockmemory/agent/backend/internal/logger"              // logger 包提供会话级日志器，记录子 Agent LLM I/O
 	"github.com/blockmemory/agent/backend/internal/mailbox"             // mailbox 包用于子 Agent 向父 Agent 发送完成通知
+	"github.com/blockmemory/agent/backend/internal/skill"               // skill 包提供技能池与元数据块渲染（技能分发）
 	"github.com/blockmemory/agent/backend/pkg/enums"                    // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
 	"github.com/blockmemory/agent/backend/pkg/textutil"                 // textutil 提供截断展示名用工具
 	"github.com/blockmemory/agent/backend/pkg/types"                    // types 包提供 RoleDefinition 类型
@@ -363,6 +364,15 @@ type Dispatcher struct {
 	// 第 4 代起需 meta 在 task 显式声明继续理由否则拒派。键 "parentID\x00domain"。
 	// 计数含异名接管链（takeover 声明时代数累加到新 domain）。
 	dispatchGenerations sync.Map
+
+	// skillPool 全局技能池（技能分发渐进披露）：nil 时技能参数/工具全部零行为。
+	// bootstrap 经 WithSkillPool 注入（skills.yaml + 约定目录扫描合并后的同一池）。
+	skillPool *skill.Pool
+	// heldSkills 每个 Agent 实例当前持有的技能名（agentID -> []string）：
+	// 派发时写入（角色固定集 ∪ 父分配集），子 Agent 的【可用技能】提示块与
+	// load_skill/list_skills 范围都以此为权威。一次性 Agent 结束时删除；
+	// 热驻槽随槽存活（destroySlot 清理）；未命中回退角色固定集。
+	heldSkills sync.Map
 }
 
 // relayRewriteAssessGen 是注入【重写评估】强制段的起始代数（TODO #76）。
@@ -1044,6 +1054,126 @@ func (d *Dispatcher) WithPluginVisibility(fn agent.ToolVisibilityFunc) *Dispatch
 	return d
 }
 
+// WithSkillPool 注入全局技能池（技能渐进披露 + 树形分发）。传 nil 时技能参数、
+// 技能工具、【可用技能】提示块全部零行为（测试/未配置场景）。
+func (d *Dispatcher) WithSkillPool(p *skill.Pool) *Dispatcher {
+	d.skillPool = p
+	return d
+}
+
+// fixedSkillNames 把角色固定技能列表解析为池内规范名（Name 优先，缺 Name 回退
+// SkillID）；未知项跳过并记日志。roleDef 为 nil 时返回 nil。
+func fixedSkillNames(pool *skill.Pool, roleDef *types.RoleDefinition) []string {
+	if pool == nil || roleDef == nil || len(roleDef.Skills) == 0 {
+		return nil
+	}
+	var out []string
+	for _, key := range roleDef.Skills {
+		s := pool.FindByNameOrID(strings.TrimSpace(key))
+		if s == nil {
+			log.Printf("[subagent] skill: role %s 固定技能 %q 不在池中，跳过", roleDef.ID, key)
+			continue
+		}
+		name := s.Name
+		if name == "" {
+			name = s.SkillID
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// assignableSkills 返回父 Agent 可分配给下级的技能查找表：键为池内技能的 Name
+// 与 SkillID（两种写法都接受），值为规范展示名。meta 持全池；其他 Agent 只持
+// heldSkills 已登记集合（未登记/为空 = 仅角色固定集由 resolveChildSkills 单独并入）。
+func (d *Dispatcher) assignableSkills(agentID string) map[string]string {
+	out := map[string]string{}
+	if d.skillPool == nil {
+		return out
+	}
+	if roleIDFromAgentID(agentID) == "meta" {
+		for _, s := range d.skillPool.All() {
+			name := s.Name
+			if name == "" {
+				name = s.SkillID
+			}
+			out[s.SkillID] = name
+			if s.Name != "" {
+				out[s.Name] = name
+			}
+		}
+		return out
+	}
+	v, ok := d.heldSkills.Load(agentID)
+	if !ok {
+		return out
+	}
+	for _, n := range v.([]string) {
+		s := d.skillPool.FindByNameOrID(n)
+		if s == nil {
+			continue
+		}
+		out[s.SkillID] = n
+		if s.Name != "" {
+			out[s.Name] = n
+		}
+	}
+	return out
+}
+
+// resolveChildSkills 解析子 Agent 持有集 = 角色固定集（直接并入，不经父权限）
+// ∪ 父分配集（skillsHint 逐项校验 ⊆ 父持有集，越界项返回 rejected）。
+// skillPool 为 nil 时零行为（空集）。
+func (d *Dispatcher) resolveChildSkills(parentID string, roleDef *types.RoleDefinition, skillsHint []string) (held []string, rejected []string) {
+	if d.skillPool == nil {
+		return nil, nil
+	}
+	held = fixedSkillNames(d.skillPool, roleDef)
+	assignable := d.assignableSkills(parentID)
+	for _, key := range skillsHint {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		name, ok := assignable[key]
+		if !ok {
+			rejected = append(rejected, key)
+			continue
+		}
+		if !containsString(held, name) {
+			held = append(held, name)
+		}
+	}
+	return held, rejected
+}
+
+// containsString 判断切片中是否含指定字符串。
+func containsString(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// skillBlockFor 渲染指定 Agent 实例的【可用技能】系统提示块（渐进披露第一层：
+// 仅名称+一句话描述）。持有集以 heldSkills 为权威，未登记回退角色固定集；
+// skillPool 为 nil 或结果为空时返回空串（不注入）。
+func (d *Dispatcher) skillBlockFor(agentID string, roleDef *types.RoleDefinition) string {
+	if d.skillPool == nil {
+		return ""
+	}
+	names := []string(nil)
+	if v, ok := d.heldSkills.Load(agentID); ok {
+		names = v.([]string)
+	}
+	if len(names) == 0 {
+		names = fixedSkillNames(d.skillPool, roleDef)
+	}
+	return skill.MetadataBlock(d.skillPool, names)
+}
+
 // WithTaskRuneLimits 配置派发 task 文本双档上限（TODO #35 放开预算）：
 // 超 soft 未达 hard 软着陆放行附警告，超 hard 硬拒。<=0 按默认 3000/4000。
 // bootstrap 按 cfg.Agent.TaskMaxRunes / TaskMaxRunesHard 注入。
@@ -1564,6 +1694,8 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	verifyKind, _ := args["verify_kind"].(string)
 	// tools_hint 可选：建议工具集（TODO #52）——dispatcher 校验 ∩ 子 Agent 天花板后预挂载。
 	toolsHint := d.toolsHintArg(args)
+	// skills 可选：下放技能集（渐进披露）——校验 ⊆ 父持有集后并入子持有集。
+	skillsHint := d.skillsArg(args)
 	// wall_clock_min 可选：派发级墙钟（分钟），代码级强制收口，替代提示词墙钟。
 	wallClock := d.wallClockArg(args)
 	// reuse_agent_id 可选：热驻复用（idle domain 唤醒/忙碌入队），非空时忽略 role_id。
@@ -1600,7 +1732,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: specMsg, Category: tool.ResultCategoryValidationRejected}
 	}
 
-	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, wallClock, reuseAgentID, takeover)
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, wallClock, reuseAgentID, takeover)
 	if errRes != nil {
 		errRes.Tool = "call_sub_agent"
 		return errRes
@@ -1697,13 +1829,16 @@ func (d *Dispatcher) resolveIdleSiblingReuse(ctx context.Context, parentID, doma
 // mode 为派发执行模式（react/reflection/plan_execute，空串=react，TODO #29），
 // verifyKind 为校验分层（auto/executable/rubric/none，空串=auto，TODO #43），
 // toolsHint 为建议工具集（TODO #52，可空）：校验 ∩ 子 Agent 角色天花板后预挂载到子 scope，
+// skillsHint 为下放技能集（技能渐进披露，可空）：校验 ⊆ 父持有集后并入子持有集
+//（角色固定集自动并入，越界项忽略并随结果回告父 Agent），
 // wallClock 为派发级墙钟（>0 时取 min(wallClock, sub_agent_timeout) 替代全局值，到期前预警）。
 // reuseAgentID 非空时走热驻复用（idle_pool.go dispatchToIdleSlot）：唤醒 idle domain
-// 或忙碌入队，忽略 roleID/task 以外的派发参数。均穿透到子 Agent 构造时的引擎选择与完成后校验。
+// 或忙碌入队，忽略 roleID/task 以外的派发参数（复用 Agent 技能集沿用槽内冻结值，skillsHint 忽略）。
+// 均穿透到子 Agent 构造时的引擎选择与完成后校验。
 // takeover 非空时（TODO #73）迁移旧 domain 的非 Done 看板条目到本次派发 domain 并留痕。
 // 前置：调用方已完成参数校验（validateDispatchArgs）与 spec 强制校验。
 // 供 call_sub_agent（单个）与 call_sub_agents（批量同波）两个工具复用。
-func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint []string, wallClock time.Duration, reuseAgentID, takeover string) (string, *tool.Result) {
+func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint, skillsHint []string, wallClock time.Duration, reuseAgentID, takeover string) (string, *tool.Result) {
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
 	if parentID == "" {
@@ -1799,6 +1934,14 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		}
 	}
 
+	// 技能分发（渐进披露）：子持有集 = 角色固定集 ∪ 父分配集（⊆ 父持有集，越界忽略回告）。
+	// 持有集登记进 heldSkills，子 Agent 的【可用技能】提示块与 load_skill/list_skills
+	// 范围均以此为权威。热驻复用路径在上方已提前返回，技能集沿用槽内冻结值。
+	heldSkills, skillRejected := d.resolveChildSkills(parentID, roleDef, skillsHint)
+	if len(heldSkills) > 0 {
+		d.heldSkills.Store(subAgentID, heldSkills)
+	}
+
 	// 在派发前递增父 Agent 的未决子 Agent 计数，供终结保护消费。
 	d.trackChildStart(parentID)
 
@@ -1828,7 +1971,11 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// 热驻模式 domain 派发：走 supervisor 常驻 goroutine（idle_pool.go）。
 	// ctx 不带 deadline（墙钟由 slot timer 管理，挂起可停表）。
 	if d.hotEnabled() && roleDef.ID == "domain" {
-		return d.dispatchHotDomain(ctx, parentID, subAgentID, *roleDef, domain, task, responsibility, effectiveTimeout, taskBrief, started)
+		id, res := d.dispatchHotDomain(ctx, parentID, subAgentID, *roleDef, domain, task, responsibility, effectiveTimeout, taskBrief, started)
+		if res != nil {
+			return id, res
+		}
+		return appendRejectNotes(id, hintRejected, skillRejected), nil
 	}
 
 	subAgentCtx := context.Background()
@@ -1900,6 +2047,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		defer d.subMeta.Delete(subAgentID)
 		defer d.activity.Delete(subAgentID)
 		defer d.lastWrites.Delete(subAgentID)
+		defer d.heldSkills.Delete(subAgentID)
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
 		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
@@ -1942,11 +2090,23 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	}
 
 	// 返回子 Agent ID 作为句柄，父 Agent 可用该 ID 查询或接收后续通知。
-	if len(hintRejected) > 0 {
-		// tools_hint 越界项回告父 Agent（TODO #52 验收 (a)：越界委派被拒绝且可查）。
-		return subAgentID + "。tools_hint 越界忽略（子 Agent 角色权限天花板外）: " + strings.Join(hintRejected, "; "), nil
+	if len(hintRejected) > 0 || len(skillRejected) > 0 {
+		// tools_hint / skills 越界项回告父 Agent：越界委派被拒绝且可查。
+		return appendRejectNotes(subAgentID, hintRejected, skillRejected), nil
 	}
 	return subAgentID, nil
+}
+
+// appendRejectNotes 把 tools_hint / skills 越界忽略说明追加到派发结果尾部；
+// 均为空时原样返回。与既有 tools_hint 回告文案同构。
+func appendRejectNotes(id string, hintRejected, skillRejected []string) string {
+	if len(hintRejected) > 0 {
+		id += "。tools_hint 越界忽略（子 Agent 角色权限天花板外）: " + strings.Join(hintRejected, "; ")
+	}
+	if len(skillRejected) > 0 {
+		id += "。skills 越界忽略（父 Agent 未持有）: " + strings.Join(skillRejected, "; ")
+	}
+	return id
 }
 
 // wallClockWarnMinOffset / wallClockWarnMinRemain 是预警档位跳过阈值：触发点距派发
@@ -2033,6 +2193,27 @@ func (d *Dispatcher) toolsHintArg(args map[string]any) []string {
 	return nil
 }
 
+// skillsArg 从 args 提取 skills 参数（兼容 []string / []any），口径同 toolsHintArg。
+func (d *Dispatcher) skillsArg(args map[string]any) []string {
+	raw, ok := args["skills"]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 // wallClockArg 从 args 提取 wall_clock_min 参数（分钟，JSON number）转为 Duration。
 // 缺失/非数值/<=0 返回 0（用全局 sub_agent_timeout）。
 func (d *Dispatcher) wallClockArg(args map[string]any) time.Duration {
@@ -2095,6 +2276,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		roleID, domain, task, responsibility, mode, verifyKind, takeover string
 		reuseAgentID                                                     string
 		toolsHint                                                        []string
+		skillsHint                                                       []string
 		wallClock                                                        time.Duration
 	}
 	items := make([]batchItem, 0, len(raw))
@@ -2115,6 +2297,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.takeover, _ = m["takeover"].(string)
 		it.takeover = strings.TrimSpace(it.takeover)
 		it.toolsHint = d.toolsHintArg(m) // TODO #52：建议工具集（∩ 子 Agent 天花板后预挂载）
+		it.skillsHint = d.skillsArg(m)   // 下放技能集（⊆ 父持有集校验后并入子持有集）
 		it.wallClock = d.wallClockArg(m)
 		// 同名热驻 Idle 槽隐式复用（先于参数校验，口径同单派入口）。
 		if it.reuseAgentID == "" && it.roleID == "domain" {
@@ -2174,7 +2357,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 
 	var okIDs, errs []string
 	for _, it := range items {
-		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint, it.wallClock, it.reuseAgentID, it.takeover)
+		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint, it.skillsHint, it.wallClock, it.reuseAgentID, it.takeover)
 		if errRes != nil {
 			errs = append(errs, fmt.Sprintf("%s(%s): %s", it.roleID, it.domain, errRes.Error))
 			continue
@@ -2498,6 +2681,9 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
 		WithWorkDir(d.subAgentWorkDir())
+	// 技能渐进披露第一层：【可用技能】元数据块注入系统提示（正文经 load_skill 按需取）。
+	// 持有集以 heldSkills 为权威（未登记回退角色固定集），skillPool nil 时零行为。
+	sub = sub.WithSkillBlock(d.skillBlockFor(subAgentID, &roleDef))
 	// 注入未决子 Agent 检查器：子 Agent 也能递归派发（domain -> 叶子助手），
 	// 无此检查时子 Agent 会在派发后立刻给出中间汇报式终答（不等待 mailbox），
 	// 父链路上的 Agent 会把“中间状态”误当最终结果（实证：domain-1 拆两个子任务后
@@ -3080,6 +3266,9 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor("domain")).
 		WithWorkDir(d.subAgentWorkDir())
+	// resume 重建的 Agent 恢复技能块：持有集从 heldSkills 取（一次性路径派发时已登记；
+	// 进程重启丢失则回退角色固定集）。
+	sub = sub.WithSkillBlock(d.skillBlockFor(pausedNodeID, roleDef))
 	// 同 runSubAgentOnce：resume 重建的 domain Agent 也可能继续递归派发，
 	// 需要终结保护等待自己的子 Agent（Dispatcher 自身实现 PendingChildrenChecker）。
 	sub = sub.WithPendingChildrenChecker(d)
@@ -3106,6 +3295,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	d.activity.Store(pausedNodeID, act)
 	defer d.activity.Delete(pausedNodeID)
 	defer d.running.Delete(pausedNodeID)
+	defer d.heldSkills.Delete(pausedNodeID)
 	defer cancel()
 	defer func() {
 		if d.mailbox != nil {

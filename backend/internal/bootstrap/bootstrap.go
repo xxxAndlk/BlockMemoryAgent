@@ -190,17 +190,30 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		return nil, fmt.Errorf("verify LLM connectivity: %w", err)
 	}
 
-	// 第十一步：加载技能池；未指定路径时使用内置技能池。
+	// 第十一步：加载技能池 + 扫描主流 Agent 工具约定目录（技能渐进披露）。
+	// skills.yaml（工具别名技能）与 <cwd>/{.claude,.codex,.agents,.cursor,.gemini,.agent}/skills/
+	// 的 SKILL.md 合并进同一池；两路均为空时回退内置池，保证开箱可用。
+	workDir, err := os.Getwd()
+	if err != nil {
+		workDir = "."
+	}
 	var skillPool *skill.Pool
 	if paths.SkillPath == "" {
-		skillPool = skill.BuiltinPool()
+		skillPool = skill.NewPool()
 	} else {
-		var err error
 		skillPool, err = skill.LoadFromYAML(paths.SkillPath)
 		if err != nil {
 			closeStores(pgStore, redisStore)
 			return nil, fmt.Errorf("load skills %s: %w", paths.SkillPath, err)
 		}
+	}
+	if loaded, skipped := skillPool.LoadFromDir(workDir); loaded > 0 {
+		log.Printf("[bootstrap] skill dir scan: loaded=%d skipped=%v root=%s", loaded, skipped, workDir)
+	} else if len(skipped) > 0 {
+		log.Printf("[bootstrap] skill dir scan: 0 loaded, skipped=%v", skipped)
+	}
+	if len(skillPool.All()) == 0 {
+		skillPool = skill.BuiltinPool()
 	}
 
 	// 第十二步：创建共享邮箱，供 Runtime（遗留 API 兼容）与 ReAct 子 Agent 调度器共同使用。
@@ -215,11 +228,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	rt.SetAgentConfig(&cfg.Agent)
 
 	// 第十四步：装配 ReAct 引擎依赖。
-	// 获取当前工作目录，用于工具注册表定位工作区；失败时回退到 "."。
-	workDir, err := os.Getwd()
-	if err != nil {
-		workDir = "."
-	}
+	// workDir 已在第十一步取得（技能目录扫描同根）：工具注册表定位工作区。
 	// workDir 本身即沙箱：Agent 直接在用户项目目录内读写，不再创建 workspace/ 子区。
 	// guards 仅挡 VCS/IDE/构建产物目录；sandbox.go 拦截路径逃逸 workDir。
 	roleRegistry := role.NewRegistry(roleCfg)
@@ -348,6 +357,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注册 submit_plan / review_plan 工具（计划确认机制）：下级中大型任务先出计划给上级
 	// 确认；角色可见性由 role.Registry meta/domain 内置白名单 + roles.yaml 覆盖控制。
 	subAgentDispatcher.RegisterPlanTools(toolRegistry)
+	// 注册 list_skills / load_skill 工具（技能渐进披露）：meta/domain 及叶子角色白名单
+	// 含这两个工具；范围判定（meta=全池，其他=持有集）由 Dispatcher 的 heldSkills 权威管理。
+	subAgentDispatcher.RegisterSkillTools(toolRegistry)
+	// 技能池注入：call_sub_agent 的 skills 参数校验（⊆ 父持有集）、子 Agent
+	// 【可用技能】提示块渲染与 load_skill/list_skills 的池查询共用同一池。
+	subAgentDispatcher.WithSkillPool(skillPool)
 	// 注册 create_role / list_roles 工具：让 MetaAgent 运行时注册动态角色。
 	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools 字段），
 	// 其他角色看不到它们。Registry 持 closure 引用，Execute 直接读写 dynamic 层。
@@ -355,6 +370,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
+	// MetaAgent 全池技能目录块（【可用技能】进 meta 系统提示；Meta 持全集可 load_skill
+	// 取全文，也可派发时经 skills 参数下放任意技能）。
+	agentSvc.SetSkillCatalog(skillPool)
 	// 注入用户视频附件处理参数（Alt+V 粘贴视频）：默认 native——≤ native_max_mb 的
 	// mp4/avi/mov 整个直传，openai-chat 兼容端点映射 video_url 供 Ark/GLM 视频理解
 	// 模型原生消费（已对照火山文档 82379/1895586）；webm/mkv/超限视频回落抽帧，

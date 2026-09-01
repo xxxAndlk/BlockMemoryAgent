@@ -61,7 +61,6 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.GET("/memory/levels", apiHandler.MemoryLevelsHandler)    // 记忆层级
 	api.GET("/memory/eval", apiHandler.MemoryEvalHandler)        // 记忆评估
 	api.GET("/skills", apiHandler.SkillsHandler)                 // Skill 列表
-	api.GET("/agents/:id/skills", apiHandler.AgentSkillsHandler) // Agent Skill 管理
 	api.GET("/files", apiHandler.FilesHandler)                   // 文件列表
 	api.GET("/files/content", apiHandler.FileContentHandler)     // 文件内容读取
 	api.GET("/profile", apiHandler.ProfileHandler)               // 用户画像查看（TODO #28）

@@ -1,106 +1,42 @@
 package types
 
-import "time"
-
-// Skill 结构化技能对象（v3 §5.1）。
+// Skill 结构化技能对象。
 //
-// 每个 Skill 是一个独立的能力单元，可被任意 DomainAgent / SubDomainAgent
-// 在初始化时按领域筛选并装配，避免将全部 Skill 直接暴露给子 Agent
-// 造成"上下文噪音"。
+// 来源三类：skills.yaml 工具别名（ToolRef 绑定已有工具）、
+// 主流 Agent 工具约定目录的 SKILL.md（.claude/.codex/.agents/.cursor/.gemini/.agent）、
+// 插件 bundle 注入。Skill 内容按渐进披露下发：仅元数据（Name+Description）
+// 进系统提示，正文经 load_skill 工具按需获取。
 type Skill struct {
 	// SkillID 全局唯一标识（小写英文+下划线）。
 	SkillID string `json:"skill_id" yaml:"skill_id"`
 
-	// Name 显示名称。
+	// Name 显示名称（SKILL.md frontmatter name；派发/加载按此匹配）。
 	Name string `json:"name" yaml:"name"`
 
-	// Description 一句话描述（≤30 字），仅这一句话被注入子 Agent 上下文。
+	// Description 一句话描述，唯一被注入系统提示的内容。
 	Description string `json:"description" yaml:"description"`
 
-	// UsageExample 使用示例（仅在 LLM 选择失败时作为 Few-Shot）。
+	// UsageExample 使用示例（yaml 工具别名 skill 的 few-shot 兜底）。
 	UsageExample string `json:"usage_example,omitempty" yaml:"usage_example,omitempty"`
 
-	// Domain 所属领域，用于按领域筛选（多领域用","分隔）。
+	// Domain 所属领域（多领域用","分隔）。
 	Domain string `json:"domain" yaml:"domain"`
 
-	// ToolRef 绑定的工具实现引用（如 "ReadFile" / "mcp_firecrawl"）。
+	// ToolRef 绑定的工具实现引用（如 "ReadFile"）；SKILL.md 类技能为空。
 	ToolRef string `json:"tool_ref" yaml:"tool_ref"`
 
-	// Tags 标签，辅助 LLM 与关键字检索。
+	// Tags 标签。
 	Tags []string `json:"tags,omitempty" yaml:"tags,omitempty"`
 
-	// Cost 估算每次调用的 Token 消耗（用于预算分配，可选）。
+	// Cost 估算每次调用的 Token 消耗（可选）。
 	Cost int `json:"cost,omitempty" yaml:"cost,omitempty"`
-}
 
-// SkillSet 一次任务装配给某个 DomainAgent 的 Skill 子集。
-// 由 SkillPool.AssembleSet 生成，经 Registry.Bind 绑定到具体 Agent。
-type SkillSet struct {
-	// OwnerAgent 持有者 Agent 实例 ID。
-	OwnerAgent string `json:"owner_agent"`
-	// Domain 所属领域，用于校验与日志。
-	Domain string `json:"domain"`
-	// Skills 装配后的技能列表（≤8，受上下文预算约束）。
-	Skills []*Skill `json:"skills"`
-	// CreatedAt 装配时间，用于缓存命中判断。
-	CreatedAt time.Time `json:"created_at"`
-}
+	// Source 技能来源：yaml | dir | bundle | builtin。
+	Source string `json:"source,omitempty" yaml:"source,omitempty"`
 
-// PromptList 输出供 LLM 决策时使用的 "Skill 名:一句话" 列表。
-//
-// 严格遵循 v3 §5.3：LLM 看到的只是 ID + Description，不会被
-// 完整定义淹没。
-//
-// 注意：输出行用 ToolRef（如 WriteFile / RunCommand）作为工具名，
-// 与 ToolExecutor.Execute 接受的 case 名一致；同时附带参数 schema，
-// 避免 LLM 输出 {"tool":"write_file",...} 这种 snake_case 导致
-// "unknown tool" 错误。
-//
-// 返回：多行字符串；nil 接收者或空集时返回 "(无可用 Skill)"。
-func (s *SkillSet) PromptList() string {
-	// 防御 nil 接收者与空技能集，统一返回提示字符串。
-	if s == nil || len(s.Skills) == 0 {
-		return "(无可用 Skill)"
-	}
-	// 使用字符串拼接累积输出（数量少，无需 Builder）。
-	out := ""
-	// 遍历每个 Skill，生成一行 "- toolName: 描述. 参数: schema"。
-	for _, sk := range s.Skills {
-		// 优先使用 ToolRef 作为工具名；未配置时回退到 SkillID。
-		toolName := sk.ToolRef
-		if toolName == "" {
-			toolName = sk.SkillID
-		}
-		// 拼接一行工具描述与参数 schema。
-		out += "- " + toolName + ": " + sk.Description + ". 参数: " + schemaFor(toolName) + "\n"
-	}
-	// 返回完整的多行字符串。
-	return out
-}
+	// Path SKILL.md 文件绝对路径（dir/bundle 来源），用于 load_skill 附带资源清单。
+	Path string `json:"path,omitempty" yaml:"path,omitempty"`
 
-// schemaFor 返回各工具的参数 schema 提示，让 LLM 知道如何构造 args。
-//
-// 参数: toolRef 工具引用名。
-// 返回: JSON 参数模板字符串；未知工具返回通用 "{...}"。
-func schemaFor(toolRef string) string {
-	// 根据工具名返回对应参数模板。
-	switch toolRef {
-	case "ReadFile":
-		return `{"path": "文件路径"}`
-	case "WriteFile":
-		return `{"path": "文件路径", "content": "文件内容"}`
-	case "ListDir":
-		return `{"path": "目录路径"}`
-	case "RunCommand":
-		return `{"command": "命令", "timeout": 秒数}`
-	case "SearchInFiles":
-		return `{"pattern": "搜索模式", "dir": "目录"}`
-	case "HTTPGet":
-		return `{"url": "...", "headers": {...}}`
-	case "HTTPPost":
-		return `{"url": "...", "headers": {...}, "body": {...}}`
-	default:
-		// 未知工具不暴露具体字段，仅给出通用对象占位。
-		return `{...}`
-	}
+	// Content SKILL.md 正文全文（dir/bundle 来源），load_skill 按需返回。
+	Content string `json:"content,omitempty" yaml:"content,omitempty"`
 }

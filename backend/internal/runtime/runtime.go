@@ -27,10 +27,10 @@ import (
 // internal/cmdqueue 包整体移除。Board/Skill/Soul 保留：Board 被 TUI 作类型
 // 消费（Snapshot/TaskStatus），Skill/Soul 被 server API 作字典消费。
 type Runtime struct {
-	Boards   *board.Manager      // 多看板管理器：每会话一个 TaskBoard，记录目标/子任务/约束/进度
-	Mailbox  *mailbox.Mailbox    // Agent 间异步邮箱：事件投递与拉取，避免上下文交叉污染
-	Skills   *skill.Registry     // Skill 注册表：持有 Pool 并维护 Agent->SkillSet 装配映射
-	Soul     *soul.Loader        // 人格加载器：注入 soul.md 并提供热重载与温度策略
+	Boards   *board.Manager   // 多看板管理器：每会话一个 TaskBoard，记录目标/子任务/约束/进度
+	Mailbox  *mailbox.Mailbox // Agent 间异步邮箱：事件投递与拉取，避免上下文交叉污染
+	Skills   *skill.Pool      // 全局技能池：skills.yaml + 约定目录扫描 + 插件 bundle 注入的合并视图
+	Soul     *soul.Loader     // 人格加载器：注入 soul.md 并提供热重载与温度策略
 	AgentCfg *config.AgentConfig // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
 }
 
@@ -84,9 +84,9 @@ func New(soulPath string, skillPool *skill.Pool, opts ...RuntimeOption) (*Runtim
 
 	// 先用默认值装配 Runtime，再通过选项覆盖依赖；这样保证所有字段都有合理初始值。
 	rt := &Runtime{
-		Boards:  board.NewManager(),                     // 空看板管理器，会话启动时由 MetaAgent 按需 GetOrCreate
-		Mailbox: mailbox.New(),                           // 空邮箱，各 Agent 通过 Send/Drain 异步通信
-		Skills:  skill.NewRegistry(skillPool),            // 以技能池初始化注册表
+		Boards:  board.NewManager(),  // 空看板管理器，会话启动时由 MetaAgent 按需 GetOrCreate
+		Mailbox: mailbox.New(),       // 空邮箱，各 Agent 通过 Send/Drain 异步通信
+		Skills:  skillPool,           // 技能池（nil 时已回退 BuiltinPool）
 	}
 
 	// 应用所有选项注入/覆盖依赖。

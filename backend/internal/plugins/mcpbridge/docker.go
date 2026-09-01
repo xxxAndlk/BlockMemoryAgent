@@ -13,7 +13,6 @@ package mcpbridge
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"os"
@@ -74,10 +73,12 @@ func dockerRunArgs(pluginID string, s Settings) (name string, args []string) {
 	return name, args
 }
 
-// dockerSharedContainerName 共享容器名：插件 id + workdir sha256 前 8 位十六进制。
-// 同目录多开实例 → 同名容器 → 复用；不同目录实例 → 不同容器，${WORKDIR} 卷映射
-// 互不干扰（保留原 pid 后缀方案的防互杀语义：不同名容器各实例只管理自己的）。
-func dockerSharedContainerName(pluginID, workDir string) string {
+// dockerSharedContainerName 共享容器名：全局确定性（bma-plugin-<id>，无后缀）。
+// 用户约定：插件运行环境全局只构建一套，所有 BMA 实例（跨目录、跨项目）共用。
+// 代价：挂载（${WORKDIR} 卷）固定为首个创建实例的目录——异目录实例的工具产物
+// 会落首个实例的工作目录；ensure 检测到挂载源与当前 workdir 不一致只告警不重建
+//（重建会杀掉其他实例的会话）。换项目目录需手动 docker rm -f 重建容器。
+func dockerSharedContainerName(pluginID string) string {
 	var sb strings.Builder
 	sb.WriteString("bma-plugin-")
 	for _, r := range pluginID {
@@ -89,8 +90,6 @@ func dockerSharedContainerName(pluginID, workDir string) string {
 			sb.WriteByte('-')
 		}
 	}
-	sum := sha256.Sum256([]byte(workDir))
-	fmt.Fprintf(&sb, "-%x", sum[:4])
 	return sb.String()
 }
 
@@ -166,12 +165,65 @@ func parseDockerInspectRunning(out string) (bool, string) {
 	return fields[0] == "true", fields[1]
 }
 
+// warnMountMismatch 复用共享容器时校验挂载源与当前工作目录一致性：不一致只告警
+// 不重建（重建会杀掉其他实例的 exec 会话）——带 ${WORKDIR} 卷的工具（ui_design/
+// ui_preview/computer_use）产物将落首个创建实例的目录，换项目目录需手动重建容器。
+func (b *Bridge) warnMountMismatch() {
+	if b.workDir == "" || len(b.settings.Volumes) == 0 {
+		return
+	}
+	srcs, ok := dockerInspectMountSources(b.logger, b.containerName)
+	if !ok || len(srcs) == 0 {
+		return
+	}
+	want := normalizeMountPath(b.workDir)
+	for _, s := range srcs {
+		if normalizeMountPath(s) == want {
+			return
+		}
+	}
+	b.logger.Warn("共享容器挂载目录与当前工作目录不一致，工具产物将落首个创建实例的目录（换项目需 docker rm -f 重建容器）",
+		"plugin", b.id, "container", b.containerName, "mounted", srcs, "current_workdir", b.workDir)
+}
+
+// dockerInspectMountSources 返回容器全部挂载的宿主侧源路径（bind 与命名卷均含）。
+func dockerInspectMountSources(logger *slog.Logger, name string) ([]string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f",
+		`{{range .Mounts}}{{.Source}}|{{.Destination}}{{"\n"}}{{end}}`, name).Output()
+	if err != nil {
+		logger.Debug("docker inspect mounts", "container", name, "err", err)
+		return nil, false
+	}
+	return parseDockerMountSources(string(out)), true
+}
+
+// parseDockerMountSources 解析 dockerInspectMountSources 的 `src|dst` 行输出。
+func parseDockerMountSources(out string) []string {
+	var srcs []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if i := strings.IndexByte(line, '|'); i > 0 {
+			if s := strings.TrimSpace(line[:i]); s != "" {
+				srcs = append(srcs, s)
+			}
+		}
+	}
+	return srcs
+}
+
+// normalizeMountPath 归一 Windows/Linux 路径用于比较（反斜杠转斜杠 + 小写）。
+func normalizeMountPath(p string) string {
+	return strings.ToLower(strings.ReplaceAll(p, "\\", "/"))
+}
+
 // ensureSharedContainer 确保共享容器在运行且镜像匹配。
 // 容器不在/已停止 → rm 残留后 `docker run -d` 重建；镜像不匹配（配置改了）→ 重建。
 // 并发竞态：另一实例同时重建撞名失败时重新 inspect，running 且镜像一致即放行。
 func (b *Bridge) ensureSharedContainer(ctx context.Context) error {
 	running, image := dockerInspectRunning(b.logger, b.containerName)
 	if running && image == b.settings.Image {
+		b.warnMountMismatch()
 		return nil
 	}
 	if running {

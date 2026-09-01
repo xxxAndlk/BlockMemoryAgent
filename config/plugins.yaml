@@ -7,9 +7,11 @@
 #   - 外部插件包目录丢进同目录 plugins.d/，经 /api/plugins/reload 扫描装载（不引入 fsnotify）。
 #   - 跨实例共享（2026-09-01）：mcp 插件 settings.shared: true 时容器 docker run -d
 #     常驻（每会话 docker exec 起独立 MCP server 进程），多开 TUI 复用同一容器；
-#     Stop/退出不断开其他实例、不回收容器。回收方式：docker rm -f bma-plugin-<id>-*
-#     （环境变量/镜像变更后也需手动 rm 重建）。旧版 pid 后缀容器（bma-plugin-*-<pid>）
-#     为升级遗留，可一并清理：docker ps -aq --filter name=bma-plugin- | xargs docker rm -f。
+#     Stop/退出不断开其他实例、不回收容器。容器名全局确定（bma-plugin-<id>），
+#     所有实例共用一套；${WORKDIR} 挂载固定为首个创建实例的目录（实例目录不一致
+#     时仅告警）。回收/换项目目录重建：docker rm -f bma-plugin-<id>。
+#     旧版 pid 后缀容器（bma-plugin-*-<pid>）为升级遗留，可一并清理：
+#     docker ps -aq --filter name=bma-plugin- | xargs docker rm -f。
 #   - 动态安装（plugin_install 工具，TODO #51）写入同目录 plugins.installed.yaml，
 #     原子写且不覆盖本文件；本文件手工条目优先于 installed 条目。
 #
@@ -46,9 +48,8 @@ plugins:
       transport: docker
       image: bma/firecrawl-mcp:local
       # 跨实例共享容器（shared: true）：容器 docker run -d 常驻 keeper，每会话经
-      # docker exec -i 起独立 MCP server 进程；多开 TUI 复用同一容器，不重复拉起。
-      # 容器名 bma-plugin-<id>-<workdir哈希>：同目录复用，异目录各自容器互不干扰。
-      # Stop 只断本会话不回收容器；显式回收 docker rm -f bma-plugin-<id>-*。
+      # docker exec -i 起独立 MCP server 进程；多开 TUI 全局共用一套容器，不重复拉起。
+      # Stop 只断本会话不回收容器；显式回收 docker rm -f bma-plugin-web_search。
       shared: true
       exec_command: ["firecrawl-mcp"]
       env:
@@ -182,11 +183,11 @@ plugins:
     settings:
       transport: docker
       image: bma/open-design-mcp:local
-      # 跨实例共享容器（同 web_search 注释）：多开 TUI 复用同一容器与 workdir 挂载。
+      # 跨实例共享容器（同 web_search 注释）：多开 TUI 全局共用同一容器。
+      # ${WORKDIR} 挂载 = 首个创建实例的工作目录（全局一套的代价，目录不一致启动时告警）。
       shared: true
       exec_command: ["node", "server.js"]
-      # 挂整个工作目录（容器内 /workspace，与 ui_preview 一致）：save_as 可写项目任意子目录；
-      # ${WORKDIR} 占位符随启动目录解析（多目录多开互不串产物）。
+      # 挂整个工作目录（容器内 /workspace，与 ui_preview 一致）：save_as 可写项目任意子目录。
       volumes: ["${WORKDIR}:/workspace"]
       env:
         OD_API_URL: http://host.docker.internal:7456
@@ -230,11 +231,11 @@ plugins:
     settings:
       transport: docker
       image: bma/ui-preview-mcp:local
-      # 跨实例共享容器（同 web_search 注释）：exec_command = 官方镜像 ENTRYPOINT
-      #（node cli.js），settings.args 附加其后（对齐 docker run CMD 追加语义）。
-      # 每 exec 会话独立浏览器实例，会话状态互不串。
+      # 跨实例共享容器（同 web_search 注释）：exec_command 对齐官方镜像 ENTRYPOINT
+      #（node /app/cli.js --browser chromium --no-sandbox，exec 不继承 ENTRYPOINT
+      # 故需显式带上）；settings.args 附加其后。每 exec 会话独立浏览器实例。
       shared: true
-      exec_command: ["node", "cli.js"]
+      exec_command: ["node", "/app/cli.js", "--browser", "chromium", "--no-sandbox"]
       # 产物落盘目录：截图保存到 <工作目录>/.bma/ui-artifacts（容器内 /workspace/.bma/ui-artifacts）。
       volumes: ["${WORKDIR}:/workspace"]
       # --image-responses 缺省即 allow（截图回 image content），显式写出防误改 omit。

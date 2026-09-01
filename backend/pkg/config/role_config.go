@@ -63,7 +63,7 @@ type DynamicRoleTemplate struct {
 	Name           string                 `yaml:"name"`            // 模板名称(展示用)
 	Type           string                 `yaml:"type"`            // "domain" or "assistant"
 	PromptTemplate string                 `yaml:"prompt_template"` // 让大模型填充的模板
-	Skills         []string               `yaml:"skills"`          // 模板预置技能 ID 列表
+	Skills         []string               `yaml:"skills"`          // 模板固定持有技能（按 Name 或 SkillID 匹配池，未知项跳过）
 	MaxLifetime    int                    `yaml:"max_lifetime"`    // 最大存活时间（秒）
 	ModelConfig    types.AgentModelConfig `yaml:"model_config"`    // 可选：动态角色专用模型配置
 }

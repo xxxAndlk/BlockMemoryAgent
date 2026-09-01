@@ -414,32 +414,14 @@ func (h *APIHandler) MemoryEvalHandler(c *gin.Context) {
 	})
 }
 
-// SkillsHandler 处理 GET /api/skills — 返回 Skill 池全部技能。
-// 职责：从 Runtime.Skills.Pool 取所有技能，返回 JSON 列表。
+// SkillsHandler 处理 GET /api/skills — 返回 Skill 池全部技能（含来源标记 Source）。
+// 职责：从 Runtime.Skills 取所有技能，返回 JSON 列表。
 func (h *APIHandler) SkillsHandler(c *gin.Context) {
 	var skills []*types.Skill
-	if h.rt != nil && h.rt.Skills != nil && h.rt.Skills.Pool() != nil {
-		skills = h.rt.Skills.Pool().All() // 取所有技能
+	if h.rt != nil && h.rt.Skills != nil {
+		skills = h.rt.Skills.All() // 取所有技能
 	}
 	c.JSON(http.StatusOK, map[string]any{"skills": skills})
-}
-
-// AgentSkillsHandler 处理 GET /api/agents/{id}/skills — 返回 Agent 已装配 SkillSet。
-// 职责：从路径解析 agent id，查询其 SkillSet。
-func (h *APIHandler) AgentSkillsHandler(c *gin.Context) {
-	id := c.Param("id")
-	if id == "" {
-		c.String(http.StatusBadRequest, "agent id required")
-		return
-	}
-	var set *types.SkillSet
-	if h.rt != nil && h.rt.Skills != nil {
-		set = h.rt.Skills.GetForAgent(id) // 查询 Agent 已装配技能
-	}
-	c.JSON(http.StatusOK, map[string]any{
-		"agent_id": id,
-		"skillset": set,
-	})
 }
 
 // FilesHandler 处理 GET /api/files — 返回某会话 WriteFile 输出文件列表。

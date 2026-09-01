@@ -19,8 +19,9 @@ import (
 	"sort"    // 稳定输出
 	"strings" // 字符串处理
 
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
-	"gopkg.in/yaml.v3" // SKILL.md frontmatter 解析
+	"gopkg.in/yaml.v3" // plugin.json / SKILL.md 解析
 )
 
 // MCPServer 是 .mcp.json 中一个 MCP server 的描述。
@@ -206,14 +207,14 @@ func parseSkillMD(path, dirName string) (*types.Skill, error) {
 	if err != nil {
 		return nil, err
 	}
-	fm, body := parseFrontmatter(data)
+	fm, body := textutil.ParseFrontmatter(data)
 	name := strings.TrimSpace(fm["name"])
 	if name == "" {
 		name = strings.TrimSuffix(filepath.Base(path), ".md")
 	}
 	s := &types.Skill{
 		// SkillID 全局唯一：目录名 + 技能名（防不同插件包同名技能互相覆盖）。
-		SkillID:     sanitizeID(dirName + "_" + name),
+		SkillID:     textutil.SanitizeID(dirName + "_" + name),
 		Name:        name,
 		Description: strings.TrimSpace(fm["description"]),
 		Domain:      strings.TrimSpace(fm["domain"]),
@@ -235,42 +236,6 @@ func parseSkillMD(path, dirName string) (*types.Skill, error) {
 	return s, nil
 }
 
-// parseFrontmatter 解析 Markdown frontmatter（--- 围栏的 YAML 块）。
-// 无 frontmatter 时返回空 map 与全文。
-func parseFrontmatter(data []byte) (map[string]string, string) {
-	text := string(data)
-	if !strings.HasPrefix(text, "---\n") && !strings.HasPrefix(text, "---\r\n") {
-		return nil, text
-	}
-	rest := text[4:]
-	if idx := strings.Index(rest, "\n---"); idx >= 0 {
-		block := rest[:idx]
-		body := rest[idx+4:]
-		body = strings.TrimPrefix(body, "\n")
-		body = strings.TrimPrefix(body, "\r\n")
-		m := map[string]string{}
-		var raw map[string]any
-		if err := yaml.Unmarshal([]byte(block), &raw); err == nil {
-			for k, v := range raw {
-				switch tv := v.(type) {
-				case string:
-					m[k] = tv
-				case []any:
-					parts := make([]string, 0, len(tv))
-					for _, e := range tv {
-						if str, ok := e.(string); ok {
-							parts = append(parts, str)
-						}
-					}
-					m[k] = strings.Join(parts, ",")
-				}
-			}
-		}
-		return m, body
-	}
-	return nil, text
-}
-
 // expandRoot 替换 ${CLAUDE_PLUGIN_ROOT} 占位符为插件包绝对路径。
 func expandRoot(s, dir string) string {
 	if s == "" {
@@ -281,24 +246,6 @@ func expandRoot(s, dir string) string {
 		abs = dir
 	}
 	return strings.ReplaceAll(s, "${CLAUDE_PLUGIN_ROOT}", abs)
-}
-
-// sanitizeID 把任意目录/技能名规整为 SkillID 约定（小写字母数字下划线）。
-func sanitizeID(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			b.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			b.WriteRune(r + 32)
-		case r == '-' || r == '.' || r == ' ':
-			b.WriteByte('_')
-		default:
-			b.WriteByte('_')
-		}
-	}
-	return b.String()
 }
 
 // firstNonEmpty 返回第一个非空字符串；全空返回空串。
