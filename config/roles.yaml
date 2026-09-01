@@ -23,6 +23,7 @@ meta_agent:
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.3
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
+    thinking: high # 规划/整合任务保留思考；false 提速（见 domain_agent 同名字段说明）
     # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
     # 已切换 k3(非推理, 与 domain 同端点)：2026-08-04 基线运行 glm-5.2 路由 3m18s + 汇总多次 thinking 共 322s，
     # k3 路由决策应控制在 1 分钟内，配合下方【派发铁律】提示词。
@@ -288,6 +289,7 @@ domain_agent:
     base_url: ${ANTHROPIC_BASE_URL_FOUR}
     temperature: 0.5
     max_tokens: 128000  # DomainAgent 自执行 WriteFile 时需容纳大文件 + 派发推理；Volces ark 硬上限 128000，顶格设
+    thinking: off       # 思考开关（true/false）：实证 glm-5.3-flash 默认思考每轮烧 2-20K reasoning，侦察任务 30 轮 165K 输出 ≈57min 纯生成；执行型角色关思考
   system_prompt: |
     你是领域负责人（DomainAgent），把父 Agent 交办的目标在你负责的领域内落地。
     你是本领域的直接执行者：任务所需的读文件/写文件/跑命令/检索查证默认全部由你一人完成；
@@ -540,7 +542,7 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
       max_tokens: 32768  # 软偏好：超端点硬上限时 provider 自动钳制并重试（2026-08-13 实证 ark /api/coding 对 kimi 系硬限 32768，配 65536 全 400）；截断风险由跨轮续写（maxContinueRounds）兜底
-      # 历史注：glm-5.2(thinking) 编码单轮分钟级曾拖慢全链路；k3(非推理) 单轮 ~1min。
+      thinking: off       # 执行型角色关思考（历史注：glm-5.2(thinking) 编码单轮分钟级曾拖慢全链路；k3(非推理) 单轮 ~1min）
       # 现值 deepseek-v4-flash：叶子是最高频角色，规格已被 spec 钉死、单文件闭环，
       # flash（抵扣 0.5）性价比最优；k2.7-code（抵扣 4.5）留作质量不足时的升级档。
     can_be_called: true
@@ -585,6 +587,7 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL_FOUR}
       temperature: 0.7
       max_tokens: 32768  # 实证 16K 时 HTML+CSS 输出被截断 → 重写/分段追加空转 8.5min 烧穿预算；32K 一次写完
+      thinking: off       # 出图/写 UI 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
 
   # 提示词审查助手
@@ -630,6 +633,7 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.2
       max_tokens: 16384  # 提示词审查：完整 prompt 改写可能较长
+      thinking: off       # 2026-08-21 实证 glm-5.3 思考 300s 出不了判定 JSON（judge 2 连超时 fail-closed 全 FAIL）
       # TODO #40 块 3：归一 DeepSeek 原生 /chat/completions（openai-chat 别名）——自动前缀缓存
       # + 原生 cache 字段。历史注：2026-08-04 曾因端点不稳切 k3，strict 启动校验拖死风险由
       # VerifyConnectivity 的宽松重试兜底（#33 后已流式化+超时配置化）。
@@ -708,6 +712,7 @@ fixed_roles:
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       # deepseek 端点不稳会拖死 strict 启动校验（2026-08-04 实证），统一切 k3
+      thinking: off       # 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
 
   # 文档助手
@@ -752,6 +757,7 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.5
       max_tokens: 16384  # 文档助手：README/CHANGELOG 中等长度
+      thinking: off       # 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
 
 # 动态角色模板

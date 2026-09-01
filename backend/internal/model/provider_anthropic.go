@@ -26,6 +26,8 @@ type anthropicProvider struct {
 	maxTokens   atomic.Int64     // 最大输出 token 数（运行期可被端点上限钳制，需并发安全）
 	temperature float64          // 采样温度
 	baseURL     string           // .env 配置的完整端点（实际请求 URL）
+	thinkMode   string           // 思考模式："off" 禁用 / "on" 启用 / "" 端点默认
+	thinkBudget int64            // 思考预算（thinkMode=on 时生效，默认 8192）
 }
 
 // newAnthropicProvider 构造一个 Anthropic 原生 provider。
@@ -47,6 +49,29 @@ func newAnthropicProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 		maxTokens = 4096
 	}
 
+	// 解析思考档位（roles.yaml model_config.thinking: off/low/medium/high/缺省）。
+	// 协议约束：开思考时 Anthropic 要求 temperature=1，强制覆盖。
+	temperature := cfg.Temperature
+	thinkMode := ""
+	thinkBudget := int64(0)
+	switch lvl := cfg.ThinkingLevel(); lvl {
+	case "off":
+		thinkMode = "off"
+	case "low", "medium", "high":
+		thinkMode = "on"
+		switch lvl {
+		case "low":
+			thinkBudget = 4096
+		case "medium":
+			thinkBudget = 8192
+		case "high":
+			thinkBudget = 16384
+		}
+	}
+	if thinkMode == "on" {
+		temperature = 1
+	}
+
 	// 创建 Anthropic 客户端并封装为 provider
 	p := &anthropicProvider{
 		client: anthropic.NewClient(
@@ -54,8 +79,10 @@ func newAnthropicProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 			option.WithBaseURL(baseURL),
 		),
 		modelName:   cfg.Model,
-		temperature: cfg.Temperature,
+		temperature: temperature,
 		baseURL:     baseURL,
+		thinkMode:   thinkMode,
+		thinkBudget: thinkBudget,
 	}
 	p.maxTokens.Store(maxTokens)
 	return p
@@ -63,6 +90,18 @@ func newAnthropicProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 
 // Name 返回 provider 使用的模型名称。
 func (p *anthropicProvider) Name() string { return p.modelName }
+
+// applyThinking 按角色配置把 thinking 参数写入请求：
+// off → ThinkingConfigDisabledParam（禁用思考，执行型角色提速）；
+// on → ThinkingConfigEnabledParam（预算 p.thinkBudget）；"" → 端点默认（不设参数）。
+func (p *anthropicProvider) applyThinking(params *anthropic.MessageNewParams) {
+	switch p.thinkMode {
+	case "off":
+		params.Thinking.OfDisabled = &anthropic.ThinkingConfigDisabledParam{}
+	case "on":
+		params.Thinking = anthropic.ThinkingConfigParamOfEnabled(p.thinkBudget)
+	}
+}
 
 // maxTokensLimitRe 匹配端点 max_tokens 超限错误中声明的上限值：
 //   - ark/火山: "expected a value <= 32768, but got 65536 instead"
@@ -143,6 +182,7 @@ func (p *anthropicProvider) Generate(ctx context.Context, req *blades.ModelReque
 			Tools:       tools,
 			Temperature: anthropic.Float(p.temperature),
 		}
+		p.applyThinking(&params)
 		resp, err := p.client.Messages.New(ctx, params)
 		if err != nil {
 			return nil, fmt.Errorf("anthropic messages POST %s: %w", p.baseURL, err)
@@ -282,6 +322,7 @@ func (p *anthropicProvider) NewStreaming(ctx context.Context, req *blades.ModelR
 				Tools:       tools,
 				Temperature: anthropic.Float(p.temperature),
 			}
+			p.applyThinking(&params)
 
 			stream := p.client.Messages.NewStreaming(ctx, params)
 
@@ -552,6 +593,23 @@ func (p *anthropicProvider) convertMessages(messages []*blades.Message) ([]anthr
 			return nil, err
 		}
 		out = append(out, param)
+	}
+	// 移动断点：给最后一条消息的最后一个 content block 打 cache_control ephemeral。
+	// 历史是 append-only（mailbox 注入也只追加尾部），上一轮请求的本轮尾部在下一轮
+	// 请求中逐字节原样出现——断点随每轮后移，缓存条目覆盖全前缀且每次命中续期 TTL。
+	// 实证 2026-08-31：仅 system+tools 两处断点时对话段依赖端点隐式缓存，glm-5.3-flash
+	// 轮间隔 3-9min 超其 TTL，30 轮里 17 轮 cache_hit=0 全价重算 45-82K input。
+	// 断点总量 3（system/tools/尾部）≤ Anthropic 上限 4。
+	if n := len(out); n > 0 && len(out[n-1].Content) > 0 {
+		last := &out[n-1].Content[len(out[n-1].Content)-1]
+		switch {
+		case last.OfText != nil:
+			last.OfText.CacheControl = anthropic.NewCacheControlEphemeralParam()
+		case last.OfToolResult != nil:
+			last.OfToolResult.CacheControl = anthropic.NewCacheControlEphemeralParam()
+		case last.OfToolUse != nil:
+			last.OfToolUse.CacheControl = anthropic.NewCacheControlEphemeralParam()
+		}
 	}
 	return out, nil
 }

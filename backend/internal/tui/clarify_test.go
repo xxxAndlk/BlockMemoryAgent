@@ -92,8 +92,9 @@ func TestEventChatItemClarifyEmpty(t *testing.T) {
 	}
 }
 
-// TestChatItemsResolvedClarifyOptions 验证 clarify 提问条目在对话区追加结构化选项：
-// 带 Options 时 detail 含 "N. <label>" 编号行与多选提示；无 Options 时 detail 为空。
+// TestChatItemsResolvedClarifyOptions 验证 clarify 提问条目不向对话区注入结构化选项：
+// 选项只在底部问答面板（clarifyPanelLines）渲染，对话区 detail 始终为空，
+// 避免同一份选项在对话栏与选项栏重复出现。
 func TestChatItemsResolvedClarifyOptions(t *testing.T) {
 	now := time.Now()
 	s := &server.Session{
@@ -123,11 +124,8 @@ func TestChatItemsResolvedClarifyOptions(t *testing.T) {
 	if !strings.HasPrefix(it.title, "❓ ") {
 		t.Fatalf("条目标题应以 ❓ 开头，got %q", it.title)
 	}
-	if !strings.Contains(it.detail, "1. 深色") || !strings.Contains(it.detail, "2. 浅色") {
-		t.Fatalf("detail 应包含 1/2 编号选项行，got %q", it.detail)
-	}
-	if !strings.Contains(it.detail, "可多选") {
-		t.Fatalf("多选时 detail 应含多选提示，got %q", it.detail)
+	if strings.Contains(it.detail, "深色") || strings.Contains(it.detail, "浅色") {
+		t.Fatalf("对话区 detail 不应注入选项（选项只在问答面板展示），got %q", it.detail)
 	}
 
 	// 无 Options 的会话：detail 保持为空。

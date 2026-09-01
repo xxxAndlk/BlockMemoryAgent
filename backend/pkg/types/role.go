@@ -1,6 +1,8 @@
 package types
 
 import (
+	"strings"
+
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
@@ -60,6 +62,30 @@ type AgentModelConfig struct {
 	Temperature float64 `json:"temperature" yaml:"temperature"`
 	// MaxTokens 单次响应最大 Token 数，用于控制成本与响应长度。
 	MaxTokens int `json:"max_tokens" yaml:"max_tokens"`
+	// Thinking 思考模式开关（anthropic / openai-chat / openai-responses 三 provider 生效）：
+	// "off" 关闭思考；"low"/"medium"/"high" 开启并指定思考强度；空（缺省）= 端点默认。
+	// 各 provider 映射：anthropic → thinking.type=disabled / enabled+budget_tokens
+	//（low=4096/medium=8192/high=16384，temperature 强制 1）；openai-chat →
+	// reasoning_effort=none/low/medium/high；openai-responses → reasoning.effort 同档。
+	// 实证 2026-08-31：glm-5.3-flash 默认思考每轮烧 2-20K reasoning token，
+	// 侦察任务 30 轮 165K 输出 ≈ 57min 纯生成；执行型角色关思考显著提速。
+	Thinking string `json:"thinking" yaml:"thinking,omitempty"`
+}
+
+// ThinkingLevel 归一思考配置为统一档位："off"/"low"/"medium"/"high"，
+// 未配置/无法识别返回 ""（端点默认）。true/false/on/off 等历史写法兼容归档。
+func (c AgentModelConfig) ThinkingLevel() string {
+	switch strings.ToLower(strings.TrimSpace(c.Thinking)) {
+	case "off", "none", "false", "disabled":
+		return "off"
+	case "low":
+		return "low"
+	case "high":
+		return "high"
+	case "medium", "on", "true", "enabled":
+		return "medium"
+	}
+	return ""
 }
 
 // SessionBlock 是会话块（DomainAgent 管理）的遗留 API 桥接类型。

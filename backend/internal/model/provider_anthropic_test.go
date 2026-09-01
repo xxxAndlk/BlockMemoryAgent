@@ -130,6 +130,58 @@ func TestConvertTools_CacheControlBreakpoint(t *testing.T) {
 	}
 }
 
+// 移动断点：convertMessages 给最后一条消息的最后一个 content block 打
+// cache_control ephemeral（tool_result 尾巴与纯文本尾巴两种形态），前面的
+// block 与更早的消息一律不带。
+func TestConvertMessages_MovingCacheControlBreakpoint(t *testing.T) {
+	p := &anthropicProvider{}
+
+	// 形态1：尾部是 tool 结果（合并 user 消息）→ 最后 tool_result 打断点。
+	msgs := []*blades.Message{
+		{Role: blades.RoleUser, Parts: []blades.Part{blades.TextPart{Text: "hi"}}},
+		{Role: blades.RoleAssistant, Parts: []blades.Part{
+			blades.ToolPart{ID: "c1", Name: "ReadFile", Request: "{}"},
+		}},
+		{Role: blades.RoleTool, Parts: []blades.Part{
+			blades.ToolPart{ID: "c1", Response: "ok"},
+		}},
+	}
+	out, err := p.convertMessages(msgs)
+	if err != nil {
+		t.Fatalf("convertMessages: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("消息数不符: got %d want 3（user / assistant(tool_use) / merged tool_result）", len(out))
+	}
+	tail := out[len(out)-1]
+	if len(tail.Content) != 1 || tail.Content[0].OfToolResult == nil {
+		t.Fatalf("尾部应为单个 tool_result, got %+v", tail.Content)
+	}
+	if tail.Content[0].OfToolResult.CacheControl.Type != "ephemeral" {
+		t.Fatalf("tool_result 尾块应带 ephemeral 断点: %+v", tail.Content[0].OfToolResult.CacheControl)
+	}
+	head := out[0]
+	if head.Content[0].OfText.CacheControl.Type != "" {
+		t.Fatalf("更早消息不应带断点: %+v", head.Content[0].OfText.CacheControl)
+	}
+
+	// 形态2：尾部是纯文本 user 消息 → 最后文本块打断点。
+	msgs2 := []*blades.Message{
+		{Role: blades.RoleUser, Parts: []blades.Part{blades.TextPart{Text: "第一段"}}},
+		{Role: blades.RoleUser, Parts: []blades.Part{blades.TextPart{Text: "第二段"}}},
+	}
+	out2, err := p.convertMessages(msgs2)
+	if err != nil {
+		t.Fatalf("convertMessages(2): %v", err)
+	}
+	if out2[0].Content[0].OfText.CacheControl.Type != "" {
+		t.Fatalf("非末尾文本块不应带断点: %+v", out2[0].Content[0].OfText.CacheControl)
+	}
+	if out2[1].Content[0].OfText.CacheControl.Type != "ephemeral" {
+		t.Fatalf("末尾文本块应带 ephemeral 断点: %+v", out2[1].Content[0].OfText.CacheControl)
+	}
+}
+
 // RoleTool 消息携带的 DataPart（仅 agent.ToBladesMessages 最新一批）转为同一
 // tool_result content 里的 image 块；协议不支持的 MIME（svg 等）静默跳过。
 func TestConvertMessages_ToolResultImages(t *testing.T) {

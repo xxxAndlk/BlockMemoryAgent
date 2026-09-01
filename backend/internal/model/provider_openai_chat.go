@@ -48,6 +48,7 @@ type openAIChatProvider struct {
 	modelName   string
 	temperature float64
 	maxTokens   int
+	think       string // 思考档位（""=端点默认；off/low/medium/high，映射 reasoning_effort）
 	httpClient  *http.Client
 }
 
@@ -64,6 +65,7 @@ func newOpenAIChatProvider(cfg types.AgentModelConfig) blades.ModelProvider {
 		modelName:   cfg.Model,
 		temperature: cfg.Temperature,
 		maxTokens:   cfg.MaxTokens,
+		think:       cfg.ThinkingLevel(),
 		httpClient: &http.Client{
 			Timeout: 600 * time.Second,
 		},
@@ -371,6 +373,16 @@ func (p *openAIChatProvider) buildRequestJSON(req *blades.ModelRequest, stream b
 	}
 	if p.maxTokens > 0 {
 		body[chatMaxTokensField(p.modelName)] = p.maxTokens
+	}
+	// 思考档位（roles.yaml model_config.thinking）：Chat Completions 端点约定用
+	// reasoning_effort 档位控制（Ollama/三方平台广泛采用）：off→none（关闭），
+	// low/medium/high 原样透传。仅显式配置的角色发送，未配置端点零感知。
+	if p.think != "" {
+		effort := "none"
+		if p.think != "off" {
+			effort = p.think
+		}
+		body["reasoning_effort"] = effort
 	}
 	if stream {
 		body["stream"] = true

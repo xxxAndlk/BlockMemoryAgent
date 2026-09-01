@@ -61,6 +61,7 @@ type openAIResponsesProvider struct {
 	modelName   string
 	temperature float64
 	maxTokens   int
+	think       string // 思考档位（""=端点默认；off/low/medium/high，映射 reasoning.effort）
 	httpClient  *http.Client
 }
 
@@ -77,6 +78,7 @@ func newOpenAIResponsesProvider(cfg types.AgentModelConfig) blades.ModelProvider
 		modelName:   cfg.Model,
 		temperature: cfg.Temperature,
 		maxTokens:   cfg.MaxTokens,
+		think:       cfg.ThinkingLevel(),
 		httpClient: &http.Client{
 			Timeout: 600 * time.Second,
 		},
@@ -476,6 +478,16 @@ func (p *openAIResponsesProvider) buildRequestJSON(req *blades.ModelRequest, str
 			mt = responsesMinMaxOutputTokens
 		}
 		body["max_output_tokens"] = mt
+	}
+	// 思考档位（roles.yaml model_config.thinking）：Responses 端点用 reasoning
+	// 对象控制——off→effort=none（关闭），low/medium/high 原样透传。
+	// 仅显式配置的角色发送，未配置端点零感知。
+	if p.think != "" {
+		effort := "none"
+		if p.think != "off" {
+			effort = p.think
+		}
+		body["reasoning"] = map[string]any{"effort": effort}
 	}
 	if stream {
 		body["stream"] = true
