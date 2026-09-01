@@ -7,9 +7,10 @@
 // 这类自带 Web UI 的服务。
 //
 // 生命周期要点（与 mcpbridge/docker.go 同一套约定）：
-//   - 启动前 best-effort `docker rm -f` 同名容器，防上次崩溃残留导致 name 冲突；
-//   - 容器名带进程号后缀（bma-plugin-svc-<id>-<pid>），避免同机多个 BMA 实例
-//     （tui.exe 与 headless 后端）互相清场；
+//   - 容器名确定性（bma-plugin-svc-<id>，无 pid 后缀）：service 插件绑定固定宿主
+//     端口（如 open_design 7456），同机多个 BMA 实例本就必须共享同一容器，
+//     Start 先探测复用已在运行的容器，重复 run -d 必然撞端口绑定；
+//   - 启动前 best-effort `docker rm -f` 同名残留容器（仅在未运行时）；
 //   - 停止即显式 `docker rm -f`，幂等；
 //   - 只经 -e KEY=VALUE 显式传递 settings.env，不继承宿主全部环境。
 package plugins
@@ -21,7 +22,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"os/exec"
 	"slices"
 	"sort"
@@ -140,8 +140,9 @@ func serviceSettingsFromMap(settings map[string]any) serviceSettings {
 	return s
 }
 
-// serviceContainerName 由插件 id 派生容器名（净化规则与 mcpbridge 一致），
-// 追加进程号后缀防多实例互杀（见 mcpbridge/docker.go dockerContainerName 注释）。
+// serviceContainerName 由插件 id 派生确定性容器名（净化规则与 mcpbridge 一致）。
+// 无 pid 后缀：service 插件绑定固定宿主端口，同机多实例必须共享同一容器，
+// Start 复用已在运行的容器（原 pid 后缀方案下第二个实例必然端口绑定失败）。
 func serviceContainerName(pluginID string) string {
 	var sb strings.Builder
 	sb.WriteString("bma-plugin-svc-")
@@ -154,7 +155,6 @@ func serviceContainerName(pluginID string) string {
 			sb.WriteByte('-')
 		}
 	}
-	fmt.Fprintf(&sb, "-%d", os.Getpid())
 	return sb.String()
 }
 
@@ -229,11 +229,28 @@ func (p *servicePlugin) Init(_ context.Context, deps Deps) error {
 }
 
 // Start 实现 Plugin：拉起长驻容器并等待健康探针就绪。
+// 先探测复用：同机另一 BMA 实例已拉起同名容器且镜像一致 → 直接复用
+//（固定端口本就强制共享，重复 run -d 必然撞端口绑定）。
 // 失败时回收已起容器并返回错误（Enable 回滚）。
 func (p *servicePlugin) Start(ctx context.Context) error {
-	// 上次异常退出可能残留同名容器（进程被强杀时 pid 后缀会变，但同进程
-	// enable-after-disable / 重连路径仍可能撞上），先清场。
-	p.removeContainer()
+	running, image := dockerInspectRunning(p.logger, p.container)
+	switch {
+	case running && image == p.settings.Image:
+		p.logger.Info("service 复用已有容器", "plugin", p.id, "container", p.container)
+		if err := p.waitHealthy(ctx); err != nil {
+			return err
+		}
+		p.syncFiles(ctx)
+		return nil
+	case running:
+		// 镜像不匹配（配置改了），重建。
+		p.logger.Warn("service 容器镜像不匹配，重建", "plugin", p.id, "container", p.container,
+			"running_image", image, "want_image", p.settings.Image)
+		p.removeContainer()
+	default:
+		// 不存在/已停止：上次异常退出可能残留同名已停止容器，先清场。
+		p.removeContainer()
+	}
 	args := serviceRunArgs(p.container, p.settings)
 	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 	if err != nil {
@@ -250,6 +267,25 @@ func (p *servicePlugin) Start(ctx context.Context) error {
 	// 且写的是 volume 内文件，下次 enable 会重试合并）。
 	p.syncFiles(ctx)
 	return nil
+}
+
+// dockerInspectRunning 查询容器运行状态与镜像；容器不存在/查询失败返回 (false, "")。
+// 与 mcpbridge 的同名函数同款（包依赖方向 plugins←mcpbridge，不能反向导入故各自维护）。
+func dockerInspectRunning(logger *slog.Logger, name string) (running bool, image string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f",
+		"{{.State.Running}} {{.Config.Image}}", name).Output()
+	if err != nil {
+		// 容器不存在是常态（首次启动/已被 --rm 回收），不算错误。
+		logger.Debug("docker inspect", "container", name, "err", err)
+		return false, ""
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) != 2 {
+		return false, ""
+	}
+	return fields[0] == "true", fields[1]
 }
 
 // waitHealthy 轮询健康探针直到 2xx 或超时/ctx 取消。

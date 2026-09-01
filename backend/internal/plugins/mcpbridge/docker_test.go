@@ -2,6 +2,7 @@ package mcpbridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"reflect"
@@ -54,6 +55,131 @@ func TestDockerRunArgs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("args =\n%q\nwant\n%q", args, want)
+	}
+}
+
+func TestDockerSharedContainerName(t *testing.T) {
+	a := dockerSharedContainerName("web_search", `D:\data\proj`)
+	b := dockerSharedContainerName("web_search", `D:\data\proj`)
+	if a != b {
+		t.Fatalf("同 workdir 应同名: %q vs %q", a, b)
+	}
+	if c := dockerSharedContainerName("web_search", `D:\data\other`); c == a {
+		t.Fatalf("异 workdir 应异名: %q", c)
+	}
+	// 后缀 = workdir sha256 前 4 字节十六进制（8 字符），跟进程号无关。
+	sum := sha256.Sum256([]byte(`D:\data\proj`))
+	wantSuffix := fmt.Sprintf("%x", sum[:4])
+	if !strings.HasSuffix(a, "-"+wantSuffix) {
+		t.Fatalf("容器名后缀应为 workdir 哈希: %q, want 后缀 %q", a, wantSuffix)
+	}
+	// id 净化与 legacy 同规则。
+	if got := dockerSharedContainerName("bundle/dir/server", "w"); strings.Contains(got, "/") {
+		t.Fatalf("容器名未净化: %q", got)
+	}
+}
+
+func TestDockerRunArgsShared(t *testing.T) {
+	s := Settings{
+		Transport: "docker",
+		Image:     "bma/firecrawl-mcp:local",
+		Ports:     []string{"6081:6081"},
+		Volumes:   []string{"D:/data/workspace:/workspace"},
+		Env:       map[string]string{"FIRECRAWL_API_KEY": "self-hosted"},
+	}
+	args := dockerRunArgsShared("bma-plugin-web_search-ab12cd34", s)
+	want := []string{
+		"run", "-d", "--name", "bma-plugin-web_search-ab12cd34",
+		"--add-host", "host.docker.internal:host-gateway",
+		"-p", "6081:6081",
+		"-v", "D:/data/workspace:/workspace",
+		"-e", "FIRECRAWL_API_KEY=self-hosted",
+		"--entrypoint", "sleep", "bma/firecrawl-mcp:local", "infinity",
+	}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("args =\n%q\nwant\n%q", args, want)
+	}
+
+	// 自定义 entrypoint + container_env（与 Env 键冲突时 Env 优先）。
+	s2 := Settings{
+		Transport:           "docker",
+		Image:               "bma/computer-use-mcp:local",
+		Env:                 map[string]string{"K": "env"},
+		ContainerEnv:        map[string]string{"K": "container", "BMA_KEEPER": "1"},
+		ContainerEntrypoint: []string{"/entrypoint.sh"},
+	}
+	args2 := dockerRunArgsShared("c", s2)
+	got := strings.Join(args2, " ")
+	wantStr := "run -d --name c --add-host host.docker.internal:host-gateway " +
+		"-e BMA_KEEPER=1 -e K=env --entrypoint /entrypoint.sh bma/computer-use-mcp:local"
+	if got != wantStr {
+		t.Errorf("args = %q, want %q", got, wantStr)
+	}
+}
+
+func TestDockerExecArgs(t *testing.T) {
+	s := Settings{
+		ExecCommand: []string{"node", "cli.js"},
+		Args:        []string{"--headless", "--output-dir", "/workspace/.bma/ui-artifacts"},
+	}
+	got := dockerExecArgs("bma-plugin-ui_preview-ab12cd34", s)
+	want := []string{
+		"exec", "-i", "bma-plugin-ui_preview-ab12cd34",
+		"node", "cli.js", "--headless", "--output-dir", "/workspace/.bma/ui-artifacts",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("args =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestParseDockerInspectRunning(t *testing.T) {
+	if running, image := parseDockerInspectRunning("true img:tag\n"); !running || image != "img:tag" {
+		t.Fatalf("running 解析错误: %v %q", running, image)
+	}
+	if running, _ := parseDockerInspectRunning("false img:tag"); running {
+		t.Fatal("stopped 容器应解析为 false")
+	}
+	if running, image := parseDockerInspectRunning("garbage"); running || image != "" {
+		t.Fatalf("非法输出应返回 false/空: %v %q", running, image)
+	}
+}
+
+func TestFromSettingsShared(t *testing.T) {
+	s := FromSettings(map[string]any{
+		"transport":            "docker",
+		"image":                "img:tag",
+		"shared":               true,
+		"exec_command":         []any{"node", "server.js"},
+		"container_entrypoint": []any{"/entrypoint.sh"},
+		"container_env":        map[string]any{"BMA_KEEPER": "1"},
+	})
+	if !s.Shared || s.ExecCommand[0] != "node" || s.ExecCommand[1] != "server.js" {
+		t.Fatalf("shared 字段解析错误: %+v", s)
+	}
+	if s.ContainerEntrypoint[0] != "/entrypoint.sh" || s.ContainerEnv["BMA_KEEPER"] != "1" {
+		t.Fatalf("container 字段解析错误: %+v", s)
+	}
+
+	// shared 缺 exec_command → Init 报错。
+	b := New("p", s, nil)
+	b.settings.ExecCommand = nil
+	if err := b.Init(context.Background(), plugins.Deps{WorkDir: "w"}); err == nil {
+		t.Fatal("shared 缺 exec_command 应报错")
+	}
+
+	// shared 仅支持 docker transport。
+	b2 := New("p2", FromSettings(map[string]any{"transport": "stdio", "command": "x", "shared": true}), nil)
+	if err := b2.Init(context.Background(), plugins.Deps{}); err == nil {
+		t.Fatal("shared + stdio 应报错")
+	}
+
+	// 合法 shared：Init 预计算容器名（随 workdir）。
+	b3 := New("p3", s, nil)
+	if err := b3.Init(context.Background(), plugins.Deps{WorkDir: "w"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if want := dockerSharedContainerName("p3", "w"); b3.containerName != want {
+		t.Fatalf("containerName = %q, want %q", b3.containerName, want)
 	}
 }
 

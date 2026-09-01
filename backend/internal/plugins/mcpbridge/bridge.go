@@ -48,6 +48,25 @@ type Settings struct {
 	Volumes []string
 	// URL 仅 http 使用：MCP streamable HTTP 端点。
 	URL string
+	// Shared 为 true 时启用跨实例共享容器模式（plugins.yaml shared，仅 docker transport）：
+	// 容器以 `docker run -d` 常驻 keeper 运行（容器内无 MCP 业务进程），每个会话经
+	// `docker exec -i` 在容器内起独立 MCP server 进程（stdio 桥接）。多个 BMA 实例
+	// （多开 TUI）复用同一容器；容器名带 workdir 哈希（同目录复用，异目录隔离卷映射）。
+	// Stop 只断开本会话，不回收容器（常驻，显式回收用 docker rm -f）。
+	Shared bool
+	// ExecCommand 仅 shared docker 使用：每次会话在容器内 exec 的 MCP server 启动命令
+	//（argv 列表）。settings.Args 附加在其后（与 docker run 时 CMD 追加在 ENTRYPOINT
+	// 后的语义一致，如 ui_preview 的 --headless 等启动参数）。
+	ExecCommand []string
+	// ContainerEntrypoint 仅 shared docker 使用：`docker run -d` 的 --entrypoint 覆盖
+	//（首字段为 --entrypoint 值，其余作为镜像后参数）。缺省 ["sleep","infinity"] keeper：
+	// 容器内无常驻业务进程，MCP server 全部由 exec 按会话拉起。
+	// computer_use 等需要入口脚本先起后台服务（Xvfb 桌面）的镜像，配合
+	// container_env BMA_KEEPER=1 让脚本只起服务不 exec MCP。
+	ContainerEntrypoint []string
+	// ContainerEnv 仅 shared docker 使用：`docker run -d` 时额外注入的环境变量
+	//（仅守护进程可见；Env 会话与守护进程都可见）。
+	ContainerEnv map[string]string
 	// Destructive 为 true 时全部远端工具标记 Destructive()，接入审批守卫链。
 	Destructive bool
 	// ToolDescriptionSuffix 附加到每个远端工具描述尾部（plugins.yaml tool_description_suffix）。
@@ -93,6 +112,31 @@ func FromSettings(settings map[string]any) Settings {
 	}
 	if v, ok := settings["url"].(string); ok {
 		s.URL = v
+	}
+	if v, ok := settings["shared"].(bool); ok {
+		s.Shared = v
+	}
+	if v, ok := settings["exec_command"].([]any); ok {
+		for _, a := range v {
+			if str, ok := a.(string); ok {
+				s.ExecCommand = append(s.ExecCommand, str)
+			}
+		}
+	}
+	if v, ok := settings["container_entrypoint"].([]any); ok {
+		for _, a := range v {
+			if str, ok := a.(string); ok {
+				s.ContainerEntrypoint = append(s.ContainerEntrypoint, str)
+			}
+		}
+	}
+	if v, ok := settings["container_env"].(map[string]any); ok {
+		s.ContainerEnv = make(map[string]string, len(v))
+		for k, val := range v {
+			if str, ok := val.(string); ok {
+				s.ContainerEnv[k] = str
+			}
+		}
 	}
 	if v, ok := settings["image"].(string); ok {
 		s.Image = v
@@ -164,6 +208,9 @@ type Bridge struct {
 	cmd     *exec.Cmd // stdio 子进程（http 传输为 nil）
 	tools   []tool.Tool
 
+	// containerName 仅 shared docker 使用：Init 时按 workdir 哈希预计算的共享容器名。
+	containerName string
+
 	// lifecycle
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
@@ -201,6 +248,9 @@ func (b *Bridge) Init(ctx context.Context, deps plugins.Deps) error {
 	for i, v := range b.settings.Volumes {
 		b.settings.Volumes[i] = plugins.ExpandWorkDir(v, deps.WorkDir)
 	}
+	if b.settings.Shared && b.settings.Transport != "docker" {
+		return fmt.Errorf("mcp 插件 %q: shared 仅支持 docker transport（当前 %q）", b.id, b.settings.Transport)
+	}
 	switch b.settings.Transport {
 	case "stdio", "":
 		if b.settings.Command == "" {
@@ -213,6 +263,12 @@ func (b *Bridge) Init(ctx context.Context, deps plugins.Deps) error {
 	case "docker":
 		if b.settings.Image == "" {
 			return fmt.Errorf("mcp 插件 %q: docker transport 需要 settings.image", b.id)
+		}
+		if b.settings.Shared {
+			if len(b.settings.ExecCommand) == 0 {
+				return fmt.Errorf("mcp 插件 %q: shared 模式需要 settings.exec_command（容器内 MCP server 启动命令）", b.id)
+			}
+			b.containerName = dockerSharedContainerName(b.id, deps.WorkDir)
 		}
 	default:
 		return fmt.Errorf("mcp 插件 %q: 未知 transport %q（支持 stdio/http/docker）", b.id, b.settings.Transport)
@@ -501,7 +557,8 @@ func renderContent(content []mcp.Content) string {
 }
 
 // killCmd 终止并回收 stdio/docker 子进程（http 传输 cmd 为 nil）。幂等。
-// docker 传输下 CLI 被杀后容器可能残留（Windows 无信号转发），显式 docker rm -f。
+// docker 传输下 CLI 被杀后容器可能残留（Windows 无信号转发），显式 docker rm -f；
+// shared 模式容器是跨实例常驻资源，只杀本会话 exec CLI，不回收容器。
 func (b *Bridge) killCmd(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
@@ -514,7 +571,7 @@ func (b *Bridge) killCmd(cmd *exec.Cmd) {
 		_ = cmd.Process.Kill()
 		<-done
 	}
-	if b.settings.Transport == "docker" {
+	if b.settings.Transport == "docker" && !b.settings.Shared {
 		removeDockerContainer(b.logger, dockerContainerName(b.id))
 	}
 }

@@ -133,9 +133,9 @@ func TestHasNonEmptyValue(t *testing.T) {
 }
 
 func TestServiceContainerName(t *testing.T) {
-	name := serviceContainerName("open_design")
-	if !strings.HasPrefix(name, "bma-plugin-svc-open_design-") {
-		t.Fatalf("容器名前缀错误: %q", name)
+	// 确定性命名（无 pid 后缀）：同机多实例复用同一容器（固定端口本就强制共享）。
+	if got := serviceContainerName("open_design"); got != "bma-plugin-svc-open_design" {
+		t.Fatalf("容器名错误: %q", got)
 	}
 	// 非法字符净化（bundle 风格 id 含 /）。
 	if got := serviceContainerName("a/b"); strings.Contains(got, "/") {

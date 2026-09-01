@@ -15,4 +15,11 @@ websockify --web /usr/share/novnc 6081 localhost:5900 >/var/log/websockify.log 2
 # 合并 screen_record 录屏工具（ffmpeg x11grab 抓本入口起的 :99 桌面）。
 # 录的就是 Agent 自己操作的同一个虚拟桌面。
 export COMPUTER_USE_SERVER="$(npm root -g)/@zavora-ai/computer-use-mcp/dist/server.js"
+
+# BMA_KEEPER=1（plugins.yaml shared 模式，docker run -d 常驻 keeper）：只起桌面
+# 服务不 exec MCP server（PID1 挂住保活），MCP server 由各 BMA 实例会话经
+# `docker exec -i node /recorder-mcp.js` 按需拉起（多开实例复用同一容器/桌面）。
+if [ "${BMA_KEEPER:-0}" = "1" ]; then
+  sleep infinity
+fi
 exec node /recorder-mcp.js
