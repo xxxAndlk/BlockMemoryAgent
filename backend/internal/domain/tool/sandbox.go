@@ -117,12 +117,12 @@ func (e *Executor) isCommandBlocked(cmd string) (string, bool) {
 }
 
 // isPathAllowed 判断给定的绝对路径是否位于允许访问的区域内。
-// 允许区域包括 Executor 的工作目录以及 AllowedPaths 中列出的路径。
-func (e *Executor) isPathAllowed(absPath string) bool {
+// 允许区域包括会话工作目录（ctx 注入值优先，见 workDirOf）以及 AllowedPaths 中列出的路径。
+func (e *Executor) isPathAllowed(ctx context.Context, absPath string) bool {
 	// 先将路径规范化，消除 .、.. 等相对符号，统一分隔符。
 	absPath = filepath.Clean(absPath)
-	// 规范化 Executor 的工作目录，用于后续前缀比较。
-	workDirClean := filepath.Clean(e.workDir)
+	// 规范化当前会话的工作目录，用于后续前缀比较。
+	workDirClean := filepath.Clean(e.workDirOf(ctx))
 	// 如果目标路径在工作目录下（或就是工作目录本身），则允许访问。
 	if hasPathPrefix(absPath, workDirClean) {
 		return true
@@ -172,17 +172,17 @@ func hasPathPrefix(child, parent string) bool {
 
 // sanitizeWritePath 检查并返回一个安全的写入路径。
 // 如果路径超出沙箱范围，则返回错误。
-func (e *Executor) sanitizeWritePath(absPath string) error {
+func (e *Executor) sanitizeWritePath(ctx context.Context, absPath string) error {
 	// 如果配置允许写到工作目录之外，则直接放行，不再检查路径。
 	if e.sandbox.AllowWriteOutsideWorkDir {
 		return nil
 	}
 	// 如果路径在允许区域内，则允许写入。
-	if e.isPathAllowed(absPath) {
+	if e.isPathAllowed(ctx, absPath) {
 		return nil
 	}
 	// 路径超出沙箱，返回包含路径信息的格式化错误。
-	return fmt.Errorf("path escapes sandbox: %s (allowed base: %s)", absPath, filepath.Clean(e.workDir))
+	return fmt.Errorf("path escapes sandbox: %s (allowed base: %s)", absPath, filepath.Clean(e.workDirOf(ctx)))
 }
 
 // enforceRoleWritePath 角色级写沙箱：当 ctx 携带 roleID 且解析器为该角色返回非空
@@ -206,10 +206,10 @@ func (e *Executor) enforceRoleWritePath(ctx context.Context, absPath string) err
 		if p == "" {
 			continue
 		}
-		// 相对路径以 workDir 为基解析；绝对路径原样使用。
+		// 相对路径以会话工作目录为基解析；绝对路径原样使用。
 		resolved := p
 		if !filepath.IsAbs(p) {
-			resolved = filepath.Join(e.workDir, p)
+			resolved = filepath.Join(e.workDirOf(ctx), p)
 		}
 		if hasPathPrefix(absPath, filepath.Clean(resolved)) {
 			return nil
@@ -220,30 +220,30 @@ func (e *Executor) enforceRoleWritePath(ctx context.Context, absPath string) err
 
 // resolvePathWithSandbox 将相对路径解析为绝对路径，并执行读取访问检查。
 // 如果路径超出沙箱范围，则返回错误。
-func (e *Executor) resolvePathWithSandbox(path string) (string, error) {
+func (e *Executor) resolvePathWithSandbox(ctx context.Context, path string) (string, error) {
 	// 使用 Executor 的内部方法将路径解析为绝对路径。
-	absPath := e.resolvePath(path)
+	absPath := e.resolvePath(ctx, path)
 	// 如果配置允许写到工作目录之外，则跳过沙箱检查，直接返回绝对路径。
 	if e.sandbox.AllowWriteOutsideWorkDir {
 		return absPath, nil
 	}
 	// 如果解析后的路径在允许区域内，则返回该路径。
-	if e.isPathAllowed(absPath) {
+	if e.isPathAllowed(ctx, absPath) {
 		return absPath, nil
 	}
 	// 路径超出沙箱范围，返回空字符串和错误信息。
-	return "", fmt.Errorf("path escapes sandbox: %s (allowed base: %s)", absPath, filepath.Clean(e.workDir))
+	return "", fmt.Errorf("path escapes sandbox: %s (allowed base: %s)", absPath, filepath.Clean(e.workDirOf(ctx)))
 }
 
 // isPathWithinTempDir 判断 absPath 是否位于指定 sessionID 对应的临时目录内。
 // 该方法用于判断文件是否属于某个会话的临时工作空间。
-func (e *Executor) isPathWithinTempDir(absPath, sessionID string) bool {
+func (e *Executor) isPathWithinTempDir(ctx context.Context, absPath, sessionID string) bool {
 	// 如果 sessionID 为空，则不存在对应的临时目录，直接返回 false。
 	if sessionID == "" {
 		return false
 	}
 	// 获取该 sessionID 对应的临时目录路径。
-	tempDir := e.sessionTempDir(sessionID)
+	tempDir := e.sessionTempDir(ctx, sessionID)
 	// 规范化目标路径和临时目录后，使用 hasPathPrefix 判断归属关系。
 	return hasPathPrefix(filepath.Clean(absPath), filepath.Clean(tempDir))
 }
@@ -259,14 +259,14 @@ func (e *Executor) ensureSandboxDefaults() {
 }
 
 // sessionTempDir 返回某个 session 对应的临时目录路径。
-// 格式为：<workDir>/.bma/tmp/<sessionID>。
-func (e *Executor) sessionTempDir(sessionID string) string {
+// 格式为：<会话工作目录>/.bma/tmp/<sessionID>。
+func (e *Executor) sessionTempDir(ctx context.Context, sessionID string) string {
 	// 如果 sessionID 为空，则无法构造有效临时目录，返回空字符串。
 	if sessionID == "" {
 		return ""
 	}
 	// 使用 filepath.Join 拼接工作目录、.bma、tmp 和 sessionID。
-	return filepath.Join(e.workDir, ".bma", "tmp", sessionID)
+	return filepath.Join(e.workDirOf(ctx), ".bma", "tmp", sessionID)
 }
 
 // sessionIDKey 是用于在 context 中携带 session ID 的私有键类型。
@@ -309,15 +309,34 @@ func RoleIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// resolvePath 将路径解析为相对于 Executor 工作目录的绝对路径。
+// workDirKey 是会话级工作目录的 context 键（每会话独立工作目录，S2）。
+type workDirKey struct{}
+
+// WithWorkDir 把会话工作目录注入 ctx；空 dir 原样返回（回落 Executor 默认目录）。
+func WithWorkDir(ctx context.Context, dir string) context.Context {
+	if dir == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, workDirKey{}, dir)
+}
+
+// WorkDirFromContext 取出会话工作目录，未注入返回空串。
+func WorkDirFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(workDirKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// resolvePath 将路径解析为相对于会话工作目录（ctx 注入值优先，见 workDirOf）的绝对路径。
 // 如果传入的 path 已经是绝对路径，则原样返回。
-func (e *Executor) resolvePath(path string) string {
+func (e *Executor) resolvePath(ctx context.Context, path string) string {
 	// 如果 path 已经是绝对路径，则无需拼接，直接返回。
 	if filepath.IsAbs(path) {
 		return path
 	}
 	// 否则将相对路径与工作目录拼接，得到绝对路径。
-	return filepath.Join(e.workDir, path)
+	return filepath.Join(e.workDirOf(ctx), path)
 }
 
 // fallbackWorkDir 在 Executor 的 workDir 为空时返回进程当前工作目录。

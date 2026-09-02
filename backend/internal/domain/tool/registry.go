@@ -464,7 +464,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		}
 		// 从参数中读取目标文件路径并解析为绝对路径，拼装调用键（path+offset+limit）。
 		path, _ := args["path"].(string)
-		normalizedPath := r.exec.resolvePath(path)
+		normalizedPath := r.exec.resolvePath(ctx, path)
 		key := fmt.Sprintf("%s\x00%d\x00%d", filepath.Clean(normalizedPath),
 			int(args["offset"].(float64)), int(args["limit"].(float64)))
 		scope := scopeKeyFromCtx(ctx)
@@ -519,7 +519,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	if name == "EditFile" || name == "WriteFile" {
 		if temporary, _ := args["temporary"].(bool); name == "EditFile" || !temporary {
 			if path, _ := args["path"].(string); path != "" {
-				abs := r.exec.resolvePath(path)
+				abs := r.exec.resolvePath(ctx, path)
 				if mt, ok := statMtime(abs); ok {
 					if prev, seen := r.lastFileMtime(scopeKeyFromCtx(ctx), abs); !seen || !prev.Equal(mt) {
 						staleWriteNote = "\n[注意] 该文件自你上次读取后已被修改（或你尚未读过），old_string 可能基于过期内容，建议核对。"
@@ -1343,7 +1343,7 @@ func (t *readFileTool) Aliases() []string { return []string{"read_file", "readFi
 
 // Execute 调用 Executor 的 readFile 方法完成读取。
 func (t *readFileTool) Execute(ctx context.Context, args map[string]any) *Result {
-	return t.exec.readFile(args)
+	return t.exec.readFile(ctx, args)
 }
 
 // writeFileTool 是 WriteFile 工具的封装。
@@ -1393,7 +1393,7 @@ func (t *listDirTool) Aliases() []string { return []string{"list_dir", "listDir"
 
 // Execute 调用 Executor 的 listDir 方法完成目录列出。
 func (t *listDirTool) Execute(ctx context.Context, args map[string]any) *Result {
-	return t.exec.listDir(args)
+	return t.exec.listDir(ctx, args)
 }
 
 // runCommandTool 是 RunCommand 工具的封装。
@@ -1421,7 +1421,7 @@ func (t *searchInFilesTool) Aliases() []string { return []string{"search_in_file
 
 // Execute 调用 Executor 的 searchInFiles 方法完成搜索。
 func (t *searchInFilesTool) Execute(ctx context.Context, args map[string]any) *Result {
-	return t.exec.searchInFiles(args)
+	return t.exec.searchInFiles(ctx, args)
 }
 
 // httpGetTool 是 HTTPGet 工具的封装。
@@ -1463,7 +1463,7 @@ func (t *gitDiffTool) Aliases() []string { return []string{"git_diff", "gitDiff"
 
 // Execute 调用 Executor 的 gitDiff 方法查看差异。
 func (t *gitDiffTool) Execute(ctx context.Context, args map[string]any) *Result {
-	return t.exec.gitDiff(args)
+	return t.exec.gitDiff(ctx, args)
 }
 
 // gitStatusTool 是 GitStatus 工具的封装。
@@ -1477,7 +1477,7 @@ func (t *gitStatusTool) Aliases() []string { return []string{"git_status", "gitS
 
 // Execute 调用 Executor 的 gitStatus 方法查看状态。
 func (t *gitStatusTool) Execute(ctx context.Context, args map[string]any) *Result {
-	return t.exec.gitStatus(args)
+	return t.exec.gitStatus(ctx, args)
 }
 
 // gitLogTool 是 GitLog 工具的封装。
@@ -1491,7 +1491,7 @@ func (t *gitLogTool) Aliases() []string { return []string{"git_log", "gitLog"} }
 
 // Execute 调用 Executor 的 gitLog 方法查看提交历史。
 func (t *gitLogTool) Execute(ctx context.Context, args map[string]any) *Result {
-	return t.exec.gitLog(args)
+	return t.exec.gitLog(ctx, args)
 }
 
 // gitBlameTool 是 GitBlame 工具的封装。
@@ -1505,5 +1505,5 @@ func (t *gitBlameTool) Aliases() []string { return []string{"git_blame", "gitBla
 
 // Execute 调用 Executor 的 gitBlame 方法查看行级 blame 信息。
 func (t *gitBlameTool) Execute(ctx context.Context, args map[string]any) *Result {
-	return t.exec.gitBlame(args)
+	return t.exec.gitBlame(ctx, args)
 }

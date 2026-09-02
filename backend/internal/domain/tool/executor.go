@@ -2,6 +2,7 @@ package tool
 
 // 导入所需标准库与项目内部包。
 import (
+	"context"  // 上下文，用于按会话解析工作目录
 	"log/slog" // 结构化日志，用于输出调试信息
 	"os"       // 操作系统接口，用于获取当前工作目录等
 	"time"     // 时间类型与常量，用于设置执行超时
@@ -167,6 +168,15 @@ func (e *Executor) readWorkDir() string {
 	}
 	// 返回已配置的工作目录，即使获取 cwd 失败也能返回原值
 	return e.workDir
+}
+
+// workDirOf 按会话解析工作目录：ctx 注入值（WithWorkDir）> e.workDir > 进程 cwd。
+// 未注入时与 readWorkDir 完全同语义，保证既有行为不变。
+func (e *Executor) workDirOf(ctx context.Context) string {
+	if v := WorkDirFromContext(ctx); v != "" {
+		return v
+	}
+	return e.readWorkDir()
 }
 
 // WorkDir 公开 Executor 的工作目录，供 ReActAgent 在系统提示词中注入环境信息。

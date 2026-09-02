@@ -186,7 +186,7 @@ const maxReadFileLimit = 300
 // 放在顶部是因为写历史的 tool_output_history_max_runes 截断保头不保尾，
 // 页脚式分页信息会在历史里丢失，导致模型忘记如何翻页。
 // 超出 ReadFileMaxChars 时按行截停，分页头中给出实际返回区间，保证"继续读"指引始终准确。
-func (e *Executor) readFile(args map[string]any) *Result {
+func (e *Executor) readFile(ctx context.Context, args map[string]any) *Result {
 	// 从参数中取出 path，要求必须是非空字符串。
 	path, ok := args["path"].(string)
 	if !ok || path == "" {
@@ -194,7 +194,7 @@ func (e *Executor) readFile(args map[string]any) *Result {
 		return &Result{Tool: "ReadFile", Error: "path is required"}
 	}
 	// 解析路径并校验沙箱约束。
-	absPath, err := e.resolvePathWithSandbox(path)
+	absPath, err := e.resolvePathWithSandbox(ctx, path)
 	if err != nil {
 		// 路径越界或解析失败时返回错误。
 		return &Result{Tool: "ReadFile", Path: absPath, Error: err.Error()}
@@ -318,7 +318,7 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	}
 
 	// 解析目标路径。
-	absPath := e.resolvePath(path)
+	absPath := e.resolvePath(ctx, path)
 	// tempDir 用于保存当前会话的临时目录路径，仅在 temporary 模式下使用。
 	tempDir := ""
 	if temporary {
@@ -328,7 +328,7 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 			return &Result{Tool: "WriteFile", Error: "temporary file requires a session context"}
 		}
 		// 获取当前会话专属的临时目录。
-		tempDir = e.sessionTempDir(sessionID)
+		tempDir = e.sessionTempDir(ctx, sessionID)
 		// 清洗传入路径，防止 .. 等导致越界。
 		cleanPath := filepath.Clean(path)
 		if filepath.IsAbs(cleanPath) {
@@ -339,7 +339,7 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 		absPath = filepath.Join(tempDir, cleanPath)
 	} else {
 		// 非临时文件需要额外校验写入路径（禁止写到系统目录等）。
-		if err := e.sanitizeWritePath(absPath); err != nil {
+		if err := e.sanitizeWritePath(ctx, absPath); err != nil {
 			return &Result{Tool: "WriteFile", Path: absPath, Error: err.Error()}
 		}
 		// 角色级写沙箱（Layer 4）：角色配了 allowed_write_paths 时进一步限制写入范围。
@@ -433,21 +433,22 @@ const snapshotRetention = 24 * time.Hour
 // 扫描全量（跨 sessionID）保证废弃会话的快照也能被回收，成本可接受（每次 WriteFile 一次 Walk）。
 func (e *Executor) snapshotBeforeWrite(ctx context.Context, absPath string) string {
 	sessionID := SessionIDFromContext(ctx)
-	if sessionID == "" || e.workDir == "" {
+	workDir := e.workDirOf(ctx)
+	if sessionID == "" || workDir == "" {
 		return ""
 	}
 	data, err := os.ReadFile(absPath)
 	if err != nil {
 		return ""
 	}
-	rel, err := filepath.Rel(e.workDir, absPath)
+	rel, err := filepath.Rel(workDir, absPath)
 	if err != nil || rel == "" {
 		rel = filepath.Base(absPath)
 	}
 	// rel 用 OS 原生分隔符，快照路径在 Windows 下形如 css\style.css.20260812-150530.bak。
 	// 时间戳用秒级精度：同一文件秒内多次写入只保留最后一次快照（够用，避免噪声）。
 	stamp := time.Now().Format("20060102-150405")
-	snapPath := filepath.Join(e.workDir, ".bma", "snapshots", sessionID, rel+"."+stamp+".bak")
+	snapPath := filepath.Join(workDir, ".bma", "snapshots", sessionID, rel+"."+stamp+".bak")
 	if err := os.MkdirAll(filepath.Dir(snapPath), 0755); err != nil {
 		return ""
 	}
@@ -455,14 +456,14 @@ func (e *Executor) snapshotBeforeWrite(ctx context.Context, absPath string) stri
 		return ""
 	}
 	// 写完后异步清理过期快照：不阻塞当前写入，失败静默（best-effort）。
-	go e.cleanExpiredSnapshots()
+	go e.cleanExpiredSnapshots(workDir)
 	return snapPath
 }
 
-// cleanExpiredSnapshots 扫描 .bma/snapshots/ 全目录，删除 mtime 超过 snapshotRetention 的 .bak 文件。
+// cleanExpiredSnapshots 扫描 <workDir>/.bma/snapshots/ 全目录，删除 mtime 超过 snapshotRetention 的 .bak 文件。
 // best-effort：Walk/Stat/Remove 任一错误均跳过，不影响主流程。空目录保留（无伤害）。
-func (e *Executor) cleanExpiredSnapshots() {
-	root := filepath.Join(e.workDir, ".bma", "snapshots")
+func (e *Executor) cleanExpiredSnapshots(workDir string) {
+	root := filepath.Join(workDir, ".bma", "snapshots")
 	cutoff := time.Now().Add(-snapshotRetention)
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -522,8 +523,8 @@ func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
 	}
 
 	// 解析目标路径并做沙箱/角色级写路径校验（与 WriteFile 一致）。
-	absPath := e.resolvePath(path)
-	if err := e.sanitizeWritePath(absPath); err != nil {
+	absPath := e.resolvePath(ctx, path)
+	if err := e.sanitizeWritePath(ctx, absPath); err != nil {
 		return &Result{Tool: "EditFile", Path: absPath, Error: err.Error()}
 	}
 	if err := e.enforceRoleWritePath(ctx, absPath); err != nil {
@@ -617,14 +618,14 @@ func truncateRunes(s string, n int) string {
 // ---- ListDir（列出目录） ----
 
 // listDir 列出指定目录下的条目，并标注每个条目的类型与大小。
-func (e *Executor) listDir(args map[string]any) *Result {
+func (e *Executor) listDir(ctx context.Context, args map[string]any) *Result {
 	// 从参数中读取目录路径，空字符串时默认当前目录。
 	path, _ := args["path"].(string)
 	if path == "" {
 		path = "."
 	}
 	// 解析路径并校验沙箱约束。
-	absPath, err := e.resolvePathWithSandbox(path)
+	absPath, err := e.resolvePathWithSandbox(ctx, path)
 	if err != nil {
 		return &Result{Tool: "ListDir", Path: absPath, Error: err.Error()}
 	}
@@ -660,7 +661,7 @@ func (e *Executor) listDir(args map[string]any) *Result {
 // ---- SearchInFiles（文件内搜索） ----
 
 // searchInFiles 在指定目录下按扩展名白名单递归搜索包含指定模式的文本行。
-func (e *Executor) searchInFiles(args map[string]any) *Result {
+func (e *Executor) searchInFiles(ctx context.Context, args map[string]any) *Result {
 	// 从参数中读取搜索模式与目录，目录缺失时使用当前目录。
 	pattern, _ := args["pattern"].(string)
 	dir, _ := args["dir"].(string)
@@ -668,7 +669,7 @@ func (e *Executor) searchInFiles(args map[string]any) *Result {
 		dir = "."
 	}
 	// 解析并校验搜索目录的沙箱约束。
-	absDir, err := e.resolvePathWithSandbox(dir)
+	absDir, err := e.resolvePathWithSandbox(ctx, dir)
 	if err != nil {
 		return &Result{Tool: "SearchInFiles", Path: absDir, Error: err.Error()}
 	}
@@ -791,9 +792,9 @@ func (e *Executor) runCommand(ctx context.Context, args map[string]any) *Result 
 	// 如果命令是 mkdir，则直接本地处理而不调用外部 shell。
 	if dir := parseMkdirDir(cmdStr); dir != "" {
 		// 解析目标目录路径。
-		absDir := e.resolvePath(dir)
+		absDir := e.resolvePath(ctx, dir)
 		// 校验目录是否允许写入。
-		if err := e.sanitizeWritePath(absDir); err != nil {
+		if err := e.sanitizeWritePath(ctx, absDir); err != nil {
 			return &Result{Tool: "RunCommand", Error: err.Error()}
 		}
 		// 递归创建目录。
@@ -833,11 +834,11 @@ func (e *Executor) runCommand(ctx context.Context, args map[string]any) *Result 
 	} else {
 		cmd = exec.CommandContext(ctx, "sh", "-c", cmdStr)
 	}
-	// 设置命令的工作目录为当前 Agent 工作目录。
-	cmd.Dir = e.readWorkDir()
+	// 设置命令的工作目录为当前会话的工作目录。
+	cmd.Dir = e.workDirOf(ctx)
 	// 若存在会话上下文，将临时目录通过环境变量暴露给子进程。
 	if sessionID := SessionIDFromContext(ctx); sessionID != "" {
-		cmd.Env = append(os.Environ(), "BMA_SESSION_TEMP_DIR="+e.sessionTempDir(sessionID))
+		cmd.Env = append(os.Environ(), "BMA_SESSION_TEMP_DIR="+e.sessionTempDir(ctx, sessionID))
 	}
 
 	// stdout 与 stderr 用于缓存命令输出。
@@ -865,7 +866,7 @@ func (e *Executor) runCommand(ctx context.Context, args map[string]any) *Result 
 	// 构造结果对象，默认 Success 由命令是否出错决定。
 	result := &Result{
 		Tool:    "RunCommand",
-		Path:    e.readWorkDir(),
+		Path:    e.workDirOf(ctx),
 		Output:  output,
 		Success: err == nil,
 	}
@@ -1263,11 +1264,11 @@ func (e *Executor) httpPost(ctx context.Context, args map[string]any) *Result {
 const gitMaxOutput = 10000
 
 // runGit 执行 git 子命令并封装为 *Result 返回。
-func (e *Executor) runGit(args []string, path string) *Result {
+func (e *Executor) runGit(ctx context.Context, args []string, path string) *Result {
 	// 构造 git 命令，参数已包含子命令与选项。
 	cmd := exec.Command("git", args...)
-	// 设置命令的工作目录。
-	cmd.Dir = e.readWorkDir()
+	// 设置命令的工作目录为当前会话的工作目录。
+	cmd.Dir = e.workDirOf(ctx)
 	// 执行命令并捕获合并后的标准输出与错误。
 	out, err := cmd.CombinedOutput()
 	// 根据子命令名称构造工具名，如 GitDiff / GitStatus。
@@ -1310,7 +1311,7 @@ func truncateGitOutput(s string) string {
 }
 
 // gitDiff 执行 git diff，支持指定目标引用与路径范围。
-func (e *Executor) gitDiff(args map[string]any) *Result {
+func (e *Executor) gitDiff(ctx context.Context, args map[string]any) *Result {
 	// 读取可选参数 target 与 path。
 	target, _ := args["target"].(string)
 	path, _ := args["path"].(string)
@@ -1322,24 +1323,24 @@ func (e *Executor) gitDiff(args map[string]any) *Result {
 	}
 	// 若指定路径，则解析为绝对路径后加入参数。
 	if path != "" {
-		absPath, err := e.resolvePathWithSandbox(path)
+		absPath, err := e.resolvePathWithSandbox(ctx, path)
 		if err != nil {
 			return &Result{Tool: "GitDiff", Path: absPath, Error: err.Error()}
 		}
 		gitArgs = append(gitArgs, absPath)
 	}
 	// 调用统一的 git 执行入口。
-	return e.runGit(gitArgs, path)
+	return e.runGit(ctx, gitArgs, path)
 }
 
 // gitStatus 执行 git status -sb 返回仓库精简状态。
-func (e *Executor) gitStatus(args map[string]any) *Result {
+func (e *Executor) gitStatus(ctx context.Context, args map[string]any) *Result {
 	// 直接调用 git status 短格式命令。
-	return e.runGit([]string{"status", "-sb"}, "")
+	return e.runGit(ctx, []string{"status", "-sb"}, "")
 }
 
 // gitLog 执行 git log，支持限制条数与路径范围。
-func (e *Executor) gitLog(args map[string]any) *Result {
+func (e *Executor) gitLog(ctx context.Context, args map[string]any) *Result {
 	// 默认返回最近 20 条提交。
 	limit := 20
 	// 若参数中显式设置 limit 且为正数，则覆盖默认值。
@@ -1352,30 +1353,30 @@ func (e *Executor) gitLog(args map[string]any) *Result {
 	gitArgs := []string{"log", "--oneline", "-n", fmt.Sprintf("%d", limit)}
 	// 若指定路径，则解析为绝对路径后加入。
 	if path != "" {
-		absPath, err := e.resolvePathWithSandbox(path)
+		absPath, err := e.resolvePathWithSandbox(ctx, path)
 		if err != nil {
 			return &Result{Tool: "GitLog", Path: absPath, Error: err.Error()}
 		}
 		gitArgs = append(gitArgs, "--", absPath)
 	}
 	// 调用统一的 git 执行入口。
-	return e.runGit(gitArgs, path)
+	return e.runGit(ctx, gitArgs, path)
 }
 
 // gitBlame 执行 git blame --line-porcelain 并返回指定文件的逐行作者信息。
-func (e *Executor) gitBlame(args map[string]any) *Result {
+func (e *Executor) gitBlame(ctx context.Context, args map[string]any) *Result {
 	// 读取文件路径，空字符串直接返回错误。
 	path, _ := args["path"].(string)
 	if path == "" {
 		return &Result{Tool: "GitBlame", Error: "path is required"}
 	}
 	// 解析路径并校验沙箱约束。
-	absPath, err := e.resolvePathWithSandbox(path)
+	absPath, err := e.resolvePathWithSandbox(ctx, path)
 	if err != nil {
 		return &Result{Tool: "GitBlame", Path: absPath, Error: err.Error()}
 	}
 	// 构造 git blame 参数，使用 line-porcelain 格式。
 	gitArgs := []string{"blame", "--line-porcelain", absPath}
 	// 调用统一的 git 执行入口。
-	return e.runGit(gitArgs, absPath)
+	return e.runGit(ctx, gitArgs, absPath)
 }
