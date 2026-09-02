@@ -31,6 +31,8 @@ type Session struct {
 	Events    []SessionEvent         `json:"events"`             // 会话事件流
 	Messages  []types.ChatMessage    `json:"messages"`           // 用户与助手消息列表
 	TempDir   string                 `json:"temp_dir,omitempty"` // 临时工作目录（可选）
+	// WorkDir 每会话工作目录（绝对路径，空=进程默认）。
+	WorkDir string `json:"work_dir,omitempty"`
 	// StreamingText 是当前正在流式生成的助手文本（仅运行中有值），供前端实时渲染输出过程。
 	StreamingText string `json:"streaming_text,omitempty"`
 	// ThinkingText 是当前思考阶段的过程文本（瞬时，仅运行中有值），答复输出或结束时清空。
@@ -334,6 +336,7 @@ func ToServerSession(a *agent.Session) *Session {
 		Events:        events,
 		Messages:      messages,
 		TempDir:       a.TempDir,
+		WorkDir:       a.WorkDir,
 		StreamingText: a.StreamingText,
 		ThinkingText:  a.ThinkingText,
 		ActiveTopicID: a.ActiveTopicID,

@@ -3,6 +3,8 @@ package server
 import (
 	"context"       // 请求上下文
 	"net/http"      // HTTP 状态码
+	"os"            // work_dir 目录存在性校验
+	"path/filepath" // work_dir 转绝对路径
 	"time"          // 消息时间戳
 
 	"github.com/gin-gonic/gin" // Gin Web 框架
@@ -14,11 +16,13 @@ import (
 // 职责：解析目标文本，调用 Agent 创建会话，返回会话快照。
 func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	// 解析请求体：goal 必填；images 可选（首条消息粘贴/上传的图片，与 /message 同规则限流）；
-	// videos 可选（首条消息粘贴的视频文件路径，服务端抽帧后走图片链路）。
+	// videos 可选（首条消息粘贴的视频文件路径，服务端抽帧后走图片链路）；
+	// work_dir 可选（每会话工作目录，绝对/相对均转绝对）。
 	req, err := DecodeBody[struct {
-		Goal   string            `json:"goal"`
-		Images []agent.WireImage `json:"images,omitempty"`
-		Videos []agent.WireVideo `json:"videos,omitempty"`
+		Goal    string            `json:"goal"`
+		Images  []agent.WireImage `json:"images,omitempty"`
+		Videos  []agent.WireVideo `json:"videos,omitempty"`
+		WorkDir string            `json:"work_dir,omitempty"`
 	}](c.Request)
 	if err != nil {
 		c.String(http.StatusBadRequest, "请求体无效")
@@ -27,6 +31,20 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	if req.Goal == "" {
 		c.String(http.StatusBadRequest, "目标 (goal) 不能为空")
 		return
+	}
+	// work_dir 校验：转绝对路径，不存在或非目录直接 400（在到达 agent 前拦截）。
+	if req.WorkDir != "" {
+		abs, err := filepath.Abs(req.WorkDir)
+		if err != nil {
+			c.String(http.StatusBadRequest, "work_dir 无效")
+			return
+		}
+		info, err := os.Stat(abs)
+		if err != nil || !info.IsDir() {
+			c.String(http.StatusBadRequest, "work_dir 不存在或不是目录")
+			return
+		}
+		req.WorkDir = abs
 	}
 	// 用户图片限流（与 /message、TUI 粘贴侧同规则）：超限直接 400。
 	images, err := agent.ParseWireImages(req.Images)
@@ -42,7 +60,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	}
 
 	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费）。
-	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos})
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos, WorkDir: req.WorkDir})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return

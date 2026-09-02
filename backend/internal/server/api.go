@@ -7,7 +7,9 @@ import (
 	"os"                 // 文件读取 / Stat
 	"path/filepath"      // filepath.Base
 	stdruntime "runtime" // 进程运行时指标
+	"sort"               // 目录列表排序
 	"strconv"            // Atoi 等
+	"strings"            // 目录名大小写不敏感比较
 	"sync"               // paused 互斥锁
 	"time"               // 超时与时间戳
 
@@ -462,6 +464,44 @@ func (h *APIHandler) FilesHandler(c *gin.Context) {
 		"session_id": sessionID,
 		"files":      files,
 	})
+}
+
+// BrowseFSHandler 处理 GET /api/fs/browse?path=，只列目录（前端工作目录选择器）。
+// path 为空：Windows 返回盘符列表，其他系统返回 /。
+func (h *APIHandler) BrowseFSHandler(c *gin.Context) {
+	type dirEntry struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+	p := c.Query("path")
+	if p == "" {
+		dirs := []dirEntry{}
+		if stdruntime.GOOS == "windows" {
+			for _, l := range "ABCDEFGHIJKLMNOPQRSTUVWXYZ" {
+				d := string(l) + `:\`
+				if _, err := os.Stat(d); err == nil {
+					dirs = append(dirs, dirEntry{Name: d, Path: d})
+				}
+			}
+		} else {
+			dirs = append(dirs, dirEntry{Name: "/", Path: "/"})
+		}
+		c.JSON(http.StatusOK, gin.H{"path": "", "parent": "", "dirs": dirs})
+		return
+	}
+	entries, err := os.ReadDir(p)
+	if err != nil {
+		c.String(http.StatusBadRequest, "路径不可读: %s", err.Error())
+		return
+	}
+	dirs := []dirEntry{}
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, dirEntry{Name: e.Name(), Path: filepath.Join(p, e.Name())})
+		}
+	}
+	sort.Slice(dirs, func(i, j int) bool { return strings.ToLower(dirs[i].Name) < strings.ToLower(dirs[j].Name) })
+	c.JSON(http.StatusOK, gin.H{"path": p, "parent": filepath.Dir(p), "dirs": dirs})
 }
 
 // FileContentHandler 处理 GET /api/files/content — 读取文件内容。
