@@ -78,9 +78,10 @@ plugins:
   # destructive: true 使全部工具接入审批守卫链（敏感操作二次确认）。
   # TODO #52：destructive 插件必须显式授权角色（权限天花板红线）——
   # 此处 roles: ["meta"] 声明仅 MetaAgent 可见，禁用全角色默认值。
+  # 2026-09-02:沙箱版默认关闭,真机直控改用下方 host_computer_use(stdio 宿主机直起);需要隔离环境时改回 true。
   computer_use:
     kind: mcp
-    enabled: true
+    enabled: false
     settings:
       transport: docker
       image: bma/computer-use-mcp:local
@@ -115,6 +116,27 @@ plugins:
       # transport: stdio
       # command: npx
       # args: ["-y", "@zavora-ai/computer-use-mcp"]
+
+  # Host Computer Use:真机 GUI 直控(2026-09-02,替代沙箱 computer_use 的默认形态)。
+  # stdio 在宿主机直起 @zavora-ai/computer-use-mcp(与沙箱镜像内同一包,工具面一致):
+  # 截图/鼠标/键盘/剪贴板/窗口管理/UIA 直接作用于真机桌面(Windows,SendInput/UIA)。
+  # 前置:宿主机 Node 20+(npx 首次运行自动拉包)。
+  # destructive: true 全工具进审批守卫链(当前全信任模式 tool_approval_disabled: true 不拦截)。
+  # 与沙箱 computer_use 不要同时启用:工具面重叠,模型易混淆。
+  # 已知缺口:沙箱版自加的 screen_record 录屏依赖 X11,宿主机版暂不提供。
+  host_computer_use:
+    kind: mcp
+    enabled: true
+    settings:
+      transport: stdio
+      command: npx
+      args: ["-y", "@zavora-ai/computer-use-mcp"]
+      destructive: true
+      roles: ["meta"]
+      # 截图经 image content 回传多模态模型(与 ui_preview 同机制)。
+      image_passthrough: true
+      # 真机操作一律在会话工作目录语义之外(作用于桌面),工具描述尾部明示风险。
+      tool_description_suffix: "注意:本工具直接操作宿主机真实桌面(非沙箱):截图为真机屏幕,鼠标键盘事件作用于真机前台窗口。文件落盘仍用内置 WriteFile/EditFile(会话工作目录),不要用本工具的 filesystem 能力落盘任务产物。"
 
   # Open Design：UI 设计台（开源 Claude Design 替代品，github.com/nexu-io/open-design）。
   # kind=service：Docker 长驻 HTTP 服务（非 MCP，不注入工具），生命周期与 mcp 插件
