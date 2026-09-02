@@ -130,6 +130,40 @@ func TestConvertTools_CacheControlBreakpoint(t *testing.T) {
 	}
 }
 
+// TestConvertTools_NilInputSchema 验证 InputSchema() 返回 nil 的工具（如 MCP
+// 远端工具 mcpbridge.remoteTool，服务端未声明入参 schema 时）不再触发 nil 解引用
+// panic（2026-09-01 线上 convertTools 崩溃根因），退化为空 properties/无必填项。
+func TestConvertTools_NilInputSchema(t *testing.T) {
+	p := &anthropicProvider{}
+	noop := bladestools.HandleFunc(func(context.Context, string) (string, error) { return "", nil })
+	// NewTool 不带 WithInputSchema 时 InputSchema() 返回 nil。
+	nilSchemaTool := bladestools.NewTool("mcp_tool", "无入参 schema 的远端工具", noop)
+	if nilSchemaTool.InputSchema() != nil {
+		t.Fatal("前置条件：该工具 InputSchema 应为 nil")
+	}
+	withSchema := bladestools.NewTool("local_tool", "本地工具", noop,
+		bladestools.WithInputSchema(&jsonschema.Schema{
+			Type:     "object",
+			Required: []string{"path"},
+			Properties: map[string]*jsonschema.Schema{
+				"path": {Type: "string"},
+			},
+		}))
+	out := p.convertTools([]bladestools.Tool{nilSchemaTool, withSchema})
+	if len(out) != 2 {
+		t.Fatalf("应有 2 个工具, got %d", len(out))
+	}
+	if out[0].OfTool == nil {
+		t.Fatal("nil schema 工具仍应转换成功")
+	}
+	if out[0].OfTool.InputSchema.Required != nil {
+		t.Fatalf("nil schema 工具应无必填项, got %v", out[0].OfTool.InputSchema.Required)
+	}
+	if out[1].OfTool == nil || len(out[1].OfTool.InputSchema.Required) != 1 || out[1].OfTool.InputSchema.Required[0] != "path" {
+		t.Fatalf("带 schema 工具的必填项应保留: %+v", out[1].OfTool)
+	}
+}
+
 // 移动断点：convertMessages 给最后一条消息的最后一个 content block 打
 // cache_control ephemeral（tool_result 尾巴与纯文本尾巴两种形态），前面的
 // block 与更早的消息一律不带。

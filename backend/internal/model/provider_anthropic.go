@@ -754,8 +754,11 @@ func (p *anthropicProvider) convertTools(tools []bladestools.Tool) []anthropic.T
 	out := make([]anthropic.ToolUnionParam, 0, len(tools))
 	// 逐个工具转换
 	for _, t := range tools {
+		// 部分工具（如 MCP 远端工具 mcpbridge.remoteTool）InputSchema 可能为 nil，
+		// 统一取局部变量并判空，避免下面直接解引用触发 nil panic。
+		schema := t.InputSchema()
 		// 将 JSON Schema 转为 map
-		schemaMap, _ := schemaToMap(t.InputSchema())
+		schemaMap, _ := schemaToMap(schema)
 		// ToolInputSchemaParam.Properties 只接受内部 properties 映射，
 		// 传入整个 schema 会导致 input_schema 结构错乱（嵌套一层 type/properties/required），
 		// 触发 Ark 端点 400 InvalidParameter。
@@ -769,13 +772,18 @@ func (p *anthropicProvider) convertTools(tools []bladestools.Tool) []anthropic.T
 		} else {
 			properties = map[string]any{}
 		}
+		// nil schema 无必填项
+		var required []string
+		if schema != nil {
+			required = schema.Required
+		}
 		out = append(out, anthropic.ToolUnionParam{
 			OfTool: &anthropic.ToolParam{
 				Name:        t.Name(),
 				Description: anthropic.String(t.Description()),
 				InputSchema: anthropic.ToolInputSchemaParam{
 					Properties: properties,
-					Required:   t.InputSchema().Required,
+					Required:   required,
 				},
 			},
 		})
