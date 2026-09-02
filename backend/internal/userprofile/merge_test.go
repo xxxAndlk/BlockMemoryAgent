@@ -4,9 +4,14 @@ package userprofile
 // 人工行保护 / 冲突归档 / 去重 / 时间戳保留 / 归档裁剪 / 缺失小节补建 / 项目偏好双实例。
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 )
 
 func newLoadedStore(t *testing.T, content string) *Store {
@@ -121,18 +126,19 @@ func TestMerge_UnknownSectionIgnored(t *testing.T) {
 }
 
 func TestMerge_ProjectStoreUsesProjectTemplateAndArchive(t *testing.T) {
-	s := NewProjectStore(t.TempDir() + "/project_preferences.md")
-	if err := s.Load(); err != nil {
+	ctx := context.Background()
+	s := NewProjectStore(t.TempDir())
+	if err := s.Load(ctx); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if err := s.Append("项目经验", "渲染帧先统一去白底"); err != nil {
+	if err := s.Append(ctx, "项目经验", "渲染帧先统一去白底"); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	got := s.Current().Content
+	got := s.Current(ctx).Content
 	if !strings.Contains(got, "# 项目偏好") || !strings.Contains(got, "## 项目经验") {
 		t.Fatalf("project template missing: %s", got)
 	}
-	view := s.MergeView([]string{"项目约定", "项目经验"})
+	view := s.MergeView(ctx, []string{"项目约定", "项目经验"})
 	if len(view["项目经验"]) != 1 || view["项目经验"][0] != "渲染帧先统一去白底" {
 		t.Fatalf("MergeView wrong: %v", view)
 	}
@@ -140,12 +146,36 @@ func TestMerge_ProjectStoreUsesProjectTemplateAndArchive(t *testing.T) {
 		Merged:   map[string][]string{"项目经验": {"渲染帧先去白底再合成"}},
 		Archived: []string{"渲染帧先统一去白底"},
 	}
-	if err := s.ApplyMerge(plan, []string{"项目约定", "项目经验"}); err != nil {
+	if err := s.ApplyMerge(ctx, plan, []string{"项目约定", "项目经验"}); err != nil {
 		t.Fatalf("ApplyMerge: %v", err)
 	}
-	got = s.Current().Content
+	got = s.Current(ctx).Content
 	if !strings.Contains(got, "## 经验归档") || !strings.Contains(got, "渲染帧先统一去白底") {
 		t.Fatalf("project archive missing: %s", got)
+	}
+}
+
+// TestProjectStore_PerSession 项目偏好按 ctx 会话工作目录解析（S2）：
+// ctx 注入会话目录时读写落在该目录的 .bma/project_preferences.md，未注入回落构造目录。
+func TestProjectStore_PerSession(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	s := NewProjectStore(dirA)
+	ctxB := tool.WithWorkDir(context.Background(), dirB)
+
+	if err := s.Append(ctxB, "项目约定", "本项目用 pnpm"); err != nil {
+		t.Fatalf("Append ctxB: %v", err)
+	}
+	if got := s.Current(ctxB).Content; !strings.Contains(got, "本项目用 pnpm") {
+		t.Fatalf("Current ctxB missing content: %s", got)
+	}
+	// 默认目录侧读不到 dirB 的写入。
+	if got := s.Current(context.Background()).Content; strings.Contains(got, "pnpm") {
+		t.Fatalf("default dir should not see session B prefs: %s", got)
+	}
+	// 文件确实落在 dirB/.bma 下。
+	if _, err := os.Stat(filepath.Join(dirB, ".bma", "project_preferences.md")); err != nil {
+		t.Fatalf("prefs file should exist under dirB/.bma: %v", err)
 	}
 }
 

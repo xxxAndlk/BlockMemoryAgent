@@ -515,16 +515,17 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 项目偏好（2026-09-02 设计 §5）：per workDir .bma/project_preferences.md。
 	// 首次写入才创建文件（Load 容忍缺失，零注入直到有内容）；
 	// MetaAgent 经 persona 链【项目偏好】段注入，子 Agent 经 Dispatcher 前缀注入（执行层工艺）。
-	projectPrefsStore := userprofile.NewProjectStore(filepath.Join(workDir, ".bma", "project_preferences.md"))
-	if err := projectPrefsStore.Load(); err != nil {
+	// S2：构造只传 workDir 根，读写经 ctx 会话目录解析（未注入回落构造目录）。
+	projectPrefsStore := userprofile.NewProjectStore(workDir)
+	if err := projectPrefsStore.Load(context.Background()); err != nil {
 		log.Printf("[bootstrap] load project preferences failed (non-fatal): %v", err)
 	} else {
 		agentSvc.SetProjectPreferencesStore(projectPrefsStore)
-		subAgentDispatcher.WithProjectPreferences(func() string {
-			return projectPrefsStore.Current().Content
+		subAgentDispatcher.WithProjectPreferences(func(ctx context.Context) string {
+			return projectPrefsStore.Current(ctx).Content
 		})
 		toolRegistry.SetProjectPreferenceHook(func(ctx context.Context, text string) error {
-			return projectPrefsStore.Append("项目约定", text)
+			return projectPrefsStore.Append(ctx, "项目约定", text)
 		})
 	}
 	// 经验技能召回（设计 §6.5）：MetaAgent 新任务 goal 与子 Agent 派发 task 均做向量

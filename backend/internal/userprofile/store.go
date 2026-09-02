@@ -9,8 +9,9 @@
 // 注入：仅 MetaAgent system prompt（带 token 上限截断），不下发子 Agent。
 //
 // 泛化（2026-09-02 偏好与自进化期 1）：Store 不再绑定用户画像一种文件——
-// 模板头/归档小节经构造函数注入，用户画像与项目偏好（.bma/project_preferences.md）
-// 各持一个实例，同一套 Append/Save/Merge 语义，不复制代码。
+// 模板头/归档小节经构造函数注入，用户画像持单实例；项目偏好由 ProjectStore
+// 按 ctx 会话目录解析 .bma/project_preferences.md、每路径缓存一个 Store 实例
+//（project_store.go），同一套 Append/Save/Merge 语义，不复制代码。
 package userprofile
 
 import (
@@ -62,12 +63,6 @@ type Store struct {
 // NewStore 创建用户画像存储。仅记录路径，不触发 IO；调用方需显式 Load（缺失文件容忍）。
 func NewStore(path string) *Store {
 	return newStore(path, DefaultTemplate, DefaultArchiveSection, defaultArchiveCap)
-}
-
-// NewProjectStore 创建项目偏好存储（per workDir .bma/project_preferences.md）。
-// 语义与用户画像 Store 完全一致，仅模板头与归档小节名不同。
-func NewProjectStore(path string) *Store {
-	return newStore(path, ProjectTemplate, ProjectArchiveSection, defaultArchiveCap)
 }
 
 func newStore(path, template, archiveSec string, archiveCap int) *Store {

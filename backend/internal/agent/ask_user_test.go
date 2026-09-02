@@ -295,7 +295,7 @@ func TestUserProfile_MetaPromptInjection(t *testing.T) {
 	svc2.SetUserProfileStore(store)
 	svc2.SetPersonaInjector(nil)
 	// metaPersona 组合注入器应含画像前缀。
-	inj := svc2.metaPersona()
+	inj := svc2.metaPersona("")
 	out := inj.Inject("system")
 	if !strings.Contains(out, "【用户画像】") || !strings.Contains(out, "直接改别问") {
 		t.Fatalf("meta prompt should carry profile, got: %s", out)

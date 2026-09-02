@@ -20,17 +20,37 @@ import (
 )
 
 // FileSharedMemoryStore 是基于文件的 SharedMemoryStore 实现。
-// root 为 .bma/shared 绝对路径；构造时 MkdirAll。
+// root 为 .bma/shared 绝对路径；构造时 MkdirAll 默认目录。
+// S2 起按 ctx 会话工作目录解析根目录（root(ctx)），ctx 未注入时回落构造目录。
 type FileSharedMemoryStore struct {
-	root string
+	workDir string
 }
 
 // NewFileSharedMemoryStore 创建文件后端共享记忆存储。
 // workDir 为工作目录（通常 os.Getwd）；实际 root 为 <workDir>/.bma/shared。
 func NewFileSharedMemoryStore(workDir string) *FileSharedMemoryStore {
-	root := filepath.Join(workDir, ".bma", "shared")
-	_ = os.MkdirAll(root, 0o755)
-	return &FileSharedMemoryStore{root: root}
+	s := &FileSharedMemoryStore{workDir: workDir}
+	_ = os.MkdirAll(s.root(context.Background()), 0o755)
+	return s
+}
+
+// root 按会话解析共享记忆根目录：ctx 携带的会话目录优先，空回退构造目录。
+func (s *FileSharedMemoryStore) root(ctx context.Context) string {
+	if wd := WorkDirFromContext(ctx); wd != "" {
+		return filepath.Join(wd, ".bma", "shared")
+	}
+	return filepath.Join(s.workDir, ".bma", "shared")
+}
+
+// WorkDirOf 返回 ctx 生效的工作目录（供 WriteSpec baseline 落盘）。
+func (s *FileSharedMemoryStore) WorkDirOf(ctx context.Context) string {
+	if s == nil {
+		return ""
+	}
+	if wd := WorkDirFromContext(ctx); wd != "" {
+		return wd
+	}
+	return s.workDir
 }
 
 // Set 把 value 写入 <root>/<sanitized_key>.md。
@@ -43,7 +63,7 @@ func (s *FileSharedMemoryStore) Set(ctx context.Context, key, value string) erro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	path := s.filePath(key)
+	path := s.filePath(ctx, key)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
@@ -64,7 +84,7 @@ func (s *FileSharedMemoryStore) SetIfVersion(ctx context.Context, key, value str
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	path := s.filePath(key)
+	path := s.filePath(ctx, key)
 	cur, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return 0, fmt.Errorf("read %s: %w", path, err)
@@ -110,7 +130,7 @@ func (s *FileSharedMemoryStore) Get(ctx context.Context, key string) (string, er
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	path := s.filePath(key)
+	path := s.filePath(ctx, key)
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return "", nil
@@ -129,7 +149,7 @@ func (s *FileSharedMemoryStore) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	err := os.Remove(s.filePath(key))
+	err := os.Remove(s.filePath(ctx, key))
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -139,22 +159,23 @@ func (s *FileSharedMemoryStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// WorkDir 返回 store 对应的工作目录（root 上溯两级，root = <workDir>/.bma/shared）。
-// 供 WriteSpec 的 baseline_content 内联落盘定位 <workDir>/.bma/baseline/；非文件后端返回空串。
+// WorkDir 返回 store 的构造工作目录（不含 ctx 会话覆盖；按会话解析见 WorkDirOf）。
+// 供 WriteSpec 的 baseline_content 内联落盘定位默认 <workDir>/.bma/baseline/；非文件后端返回空串。
 func (s *FileSharedMemoryStore) WorkDir() string {
 	if s == nil {
 		return ""
 	}
-	return filepath.Dir(filepath.Dir(s.root))
+	return s.workDir
 }
 
-// Keys 返回 root 下所有 MD 文件对应的 KV key（desanitize 还原）。
+// Keys 按 ctx 会话目录解析 root，返回其下所有 MD 文件对应的 KV key（desanitize 还原）。
 // 供 injectKVMemory 枚举 parentID: 前缀的所有槽位，与 invalidateSharedMemoryForPath 遍历。
 func (s *FileSharedMemoryStore) Keys(ctx context.Context) []string {
 	if s == nil {
 		return nil
 	}
-	entries, err := os.ReadDir(s.root)
+	root := s.root(ctx)
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil
 	}
@@ -175,8 +196,8 @@ func (s *FileSharedMemoryStore) Keys(ctx context.Context) []string {
 	return keys
 }
 
-// Clear 删除 root 下所有 MD 文件，幂等。供新 session 启动清理旧 session 残留
-//（spec/file_tree 不跨 session 复用，丢历史无损失）。非 file-store 后端不实现此方法。
+// Clear 按 ctx 会话目录解析 root，删除其下所有 MD 文件，幂等。供新 session 启动清理旧
+// session 残留（spec/file_tree 不跨 session 复用，丢历史无损失）。非 file-store 后端不实现此方法。
 func (s *FileSharedMemoryStore) Clear(ctx context.Context) error {
 	if s == nil {
 		return fmt.Errorf("file shared memory store not initialized")
@@ -184,7 +205,8 @@ func (s *FileSharedMemoryStore) Clear(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(s.root)
+	root := s.root(ctx)
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -195,16 +217,16 @@ func (s *FileSharedMemoryStore) Clear(ctx context.Context) error {
 		if e.IsDir() {
 			continue
 		}
-		if err := os.Remove(filepath.Join(s.root, e.Name())); err != nil && !os.IsNotExist(err) {
+		if err := os.Remove(filepath.Join(root, e.Name())); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", e.Name(), err)
 		}
 	}
 	return nil
 }
 
-// filePath 返回 key 对应的绝对文件路径。
-func (s *FileSharedMemoryStore) filePath(key string) string {
-	return filepath.Join(s.root, sanitizeKey(key)+".md")
+// filePath 按 ctx 会话目录解析 root，返回 key 对应的绝对文件路径。
+func (s *FileSharedMemoryStore) filePath(ctx context.Context, key string) string {
+	return filepath.Join(s.root(ctx), sanitizeKey(key)+".md")
 }
 
 // sanitizeKey 把 KV key "<agentID>:<slot>" 转为安全文件名。

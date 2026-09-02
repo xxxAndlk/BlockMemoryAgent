@@ -112,8 +112,9 @@ type Spec struct {
 // writeSpecTool 是 WriteSpec 工具的封装。
 type writeSpecTool struct {
 	store SharedMemoryStore
-	// workDir 为工作目录（来自 FileSharedMemoryStore.WorkDir），baseline_content
+	// workDir 为默认工作目录（来自 FileSharedMemoryStore.WorkDir），baseline_content
 	// 内联落盘写到 <workDir>/.bma/baseline/ 下；为空时 baseline_content 报错提示不可用。
+	// Execute 时若 store 提供 WorkDirOf(ctx) 则按 ctx 会话目录覆盖本默认值（S2）。
 	workDir string
 }
 
@@ -188,8 +189,14 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 	// loop guard 强杀）。调研结论本就在 MetaAgent 上下文里，直接内联落盘一步直达。
 	// 落盘目录强制 <workDir>/.bma/baseline/（path 仅取文件名部分，防路径逃逸），
 	// 落盘后追加进 baseline 清单参与后续存在性校验。
+	// workDir 按 ctx 会话目录解析（S2）：store 为文件后端时经 WorkDirOf(ctx)
+	// 取 ctx 生效目录（未注入回落 store 构造目录），非文件后端回落 t.workDir（空串）。
+	workDir := t.workDir
+	if w, ok := t.store.(interface{ WorkDirOf(context.Context) string }); ok {
+		workDir = w.WorkDirOf(ctx)
+	}
 	if len(baselineContent) > 0 {
-		if t.workDir == "" {
+		if workDir == "" {
 			return &Result{Tool: "WriteSpec", Error: "baseline_content 需要文件后端共享记忆存储（当前 store 未提供工作目录），请改用 baseline 字段引用已落盘文件", Category: ResultCategoryValidationRejected}
 		}
 		for _, bc := range baselineContent {
@@ -197,7 +204,7 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 				return &Result{Tool: "WriteSpec", Error: "baseline_content 项 " + bc.Path + " 的 content 为空", Category: ResultCategoryValidationRejected}
 			}
 		}
-		rel, err := writeBaselineFiles(t.workDir, baselineContent)
+		rel, err := writeBaselineFiles(workDir, baselineContent)
 		if err != nil {
 			return &Result{Tool: "WriteSpec", Error: err.Error(), Category: ResultCategoryValidationRejected}
 		}
@@ -218,8 +225,8 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 		var missing []string
 		for _, p := range baseline {
 			rp := strings.TrimSpace(p)
-			if t.workDir != "" && !filepath.IsAbs(rp) {
-				rp = filepath.Join(t.workDir, rp)
+			if workDir != "" && !filepath.IsAbs(rp) {
+				rp = filepath.Join(workDir, rp)
 			}
 			if _, err := os.Stat(rp); err != nil {
 				missing = append(missing, p+"（解析为 "+rp+"）")

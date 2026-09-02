@@ -415,8 +415,9 @@ func (r *Registry) SetSharedMemory(store SharedMemoryStore) {
 	}
 	if t, ok := r.tools["WriteSpec"].(*writeSpecTool); ok {
 		t.store = store
-		// 文件后端时同步注入 workDir（<workDir>/.bma/shared 上溯），供
-		// baseline_content 内联落盘定位 <workDir>/.bma/baseline/；非文件后端保持空串。
+		// 文件后端时同步注入默认 workDir，供 baseline_content 内联落盘定位
+		// <workDir>/.bma/baseline/；Execute 时经 store.WorkDirOf(ctx) 按 ctx
+		// 会话目录覆盖（S2）。非文件后端保持空串。
 		if wd, ok := store.(interface{ WorkDir() string }); ok {
 			t.workDir = wd.WorkDir()
 		} else {

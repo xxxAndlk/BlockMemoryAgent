@@ -154,10 +154,10 @@ type Dispatcher struct {
 	// 由 bootstrap 注入 plugins.Manager.ToolVisibility。
 	pluginVisibility agent.ToolVisibilityFunc
 
-	// projectPrefs 项目偏好读取回调（2026-09-02 设计 §5）：返回 workDir 下
-	// .bma/project_preferences.md 全文；派发前缀拼【项目偏好】段下发子 Agent。
+	// projectPrefs 项目偏好读取回调（2026-09-02 设计 §5）：按 ctx 会话目录解析
+	// .bma/project_preferences.md 全文（S2）；派发前缀拼【项目偏好】段下发子 Agent。
 	// nil 或空串时零注入。
-	projectPrefs func() string
+	projectPrefs func(ctx context.Context) string
 
 	// skillRecall 经验技能向量预答回调（2026-09-02 设计 §6.5）：task 文本 -> 提示行列表
 	//（「有相关经验技能 <name>——<title>，可 load_skill 查看」）。nil 时零注入。
@@ -1066,10 +1066,10 @@ func (d *Dispatcher) WithPluginVisibility(fn agent.ToolVisibilityFunc) *Dispatch
 }
 
 // WithProjectPreferences 注入项目偏好读取回调（2026-09-02 设计 §5）：
-// bootstrap 接 userprofile.Store(项目偏好).Current().Content；
+// bootstrap 接 userprofile.ProjectStore.Current(ctx).Content（按 ctx 会话目录解析，S2）；
 // 派发前缀拼【项目偏好】段下发所有子 Agent（项目经验是执行层要遵守的工艺）。
 // 传 nil（或回调返回空串）时不注入。
-func (d *Dispatcher) WithProjectPreferences(fn func() string) *Dispatcher {
+func (d *Dispatcher) WithProjectPreferences(fn func(ctx context.Context) string) *Dispatcher {
 	d.projectPrefs = fn
 	return d
 }
@@ -1119,11 +1119,11 @@ func (d *Dispatcher) skillRecallPrefix(ctx context.Context, task string) string 
 const projectPrefsRunes = 2000
 
 // projectPrefsPrefix 渲染【项目偏好】派发前缀段；空偏好返回空串（零注入）。
-func (d *Dispatcher) projectPrefsPrefix() string {
+func (d *Dispatcher) projectPrefsPrefix(ctx context.Context) string {
 	if d.projectPrefs == nil {
 		return ""
 	}
-	content := strings.TrimSpace(d.projectPrefs())
+	content := strings.TrimSpace(d.projectPrefs(ctx))
 	if content == "" {
 		return ""
 	}
@@ -2823,7 +2823,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		prefixes = append(prefixes, sp)
 	}
 	// 项目偏好（2026-09-02 设计 §5）：本项目约定与经验下发给全部子 Agent（执行层工艺）。
-	if pp := d.projectPrefsPrefix(); pp != "" {
+	if pp := d.projectPrefsPrefix(ctx); pp != "" {
 		prefixes = append(prefixes, pp)
 	}
 	// 经验技能召回（2026-09-02 设计 §6.5）：task 向量预筛 top-3，只注一行提示不注全文。

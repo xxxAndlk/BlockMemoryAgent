@@ -97,11 +97,11 @@ func TestEvolveSessionDegradeOnLLMError(t *testing.T) {
 func TestEvolveSessionThreeOutputs(t *testing.T) {
 	s := newEvolverTestService(t)
 	profile := userprofile.NewStore(t.TempDir() + "/user_profile.md")
-	project := userprofile.NewProjectStore(t.TempDir() + "/project_preferences.md")
+	project := userprofile.NewProjectStore(t.TempDir())
 	if err := profile.Load(); err != nil {
 		t.Fatalf("load profile: %v", err)
 	}
-	if err := project.Load(); err != nil {
+	if err := project.Load(context.Background()); err != nil {
 		t.Fatalf("load project prefs: %v", err)
 	}
 	s.userProfile = profile
@@ -141,7 +141,7 @@ func TestEvolveSessionThreeOutputs(t *testing.T) {
 	if got := profile.Current().Content; !strings.Contains(got, "偏好简洁输出") || !strings.Contains(got, "## 反馈记录") {
 		t.Fatalf("user prefs should land in archive section, got: %q", got)
 	}
-	if got := project.Current().Content; !strings.Contains(got, "渲染动画帧前先统一去白底") || !strings.Contains(got, "## 经验归档") {
+	if got := project.Current(context.Background()).Content; !strings.Contains(got, "渲染动画帧前先统一去白底") || !strings.Contains(got, "## 经验归档") {
 		t.Fatalf("project lessons should land in archive section, got: %q", got)
 	}
 	if len(sunkSkills) != 1 || sunkSkills[0].Name != "frame-render-dedup" {

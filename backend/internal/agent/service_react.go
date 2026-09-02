@@ -129,8 +129,9 @@ type ReactService struct {
 	// profileExtractor 会话完成时从对话提取偏好增量的轻量模型回调；nil 跳过提取。
 	profileExtractor func(ctx context.Context, text string) ([]string, error)
 	// projectPrefs 项目偏好存储（2026-09-02 偏好与自进化期 1）：per workDir
-	// .bma/project_preferences.md；nil 表示未接线（Meta/DomainAgent 均不注入）。
-	projectPrefs *userprofile.Store
+	// .bma/project_preferences.md，读写按 ctx 会话目录解析（S2）；
+	// nil 表示未接线（Meta/DomainAgent 均不注入）。
+	projectPrefs *userprofile.ProjectStore
 	// prefMerger 偏好合并回调（轻量模型对目标小节做去重/冲突归档重写）；
 	// nil 时增量降级直写归档小节（v1 行为）。
 	prefMerger PrefMerger
@@ -265,24 +266,24 @@ func (s *ReactService) SetSkillRecall(fn func(ctx context.Context, task string) 
 // SetProjectPreferencesStore 注入项目偏好存储（设计 §5）：
 // 注入后 MetaAgent system prompt 带【项目偏好】前缀（persona 链），
 // Dispatcher 派发前缀带【项目偏好】段（子 Agent 执行层遵守项目工艺）。
-func (s *ReactService) SetProjectPreferencesStore(st *userprofile.Store) {
+func (s *ReactService) SetProjectPreferencesStore(st *userprofile.ProjectStore) {
 	s.projectPrefs = st
 }
 
-// ProjectPreferences 返回项目偏好全文快照。未接线返回空画像。
+// ProjectPreferences 返回项目偏好全文快照（按 ctx 会话目录解析）。未接线返回空画像。
 func (s *ReactService) ProjectPreferences(ctx context.Context) (*userprofile.Profile, error) {
 	if s.projectPrefs == nil {
 		return &userprofile.Profile{}, nil
 	}
-	return s.projectPrefs.Current(), nil
+	return s.projectPrefs.Current(ctx), nil
 }
 
-// SaveProjectPreferences 全量覆盖项目偏好（HTTP PUT 用户手动编辑）。
+// SaveProjectPreferences 全量覆盖项目偏好（HTTP PUT 用户手动编辑，按 ctx 会话目录解析）。
 func (s *ReactService) SaveProjectPreferences(ctx context.Context, content string) error {
 	if s.projectPrefs == nil {
 		return fmt.Errorf("project preferences store not wired")
 	}
-	return s.projectPrefs.Save(content)
+	return s.projectPrefs.Save(ctx, content)
 }
 
 // SetPluginVisibility 注入插件工具角色可见性回调（设计文档 §4.3）。
@@ -494,7 +495,8 @@ func (s *ReactService) SetPersonaInjector(p PersonaInjector) {
 // metaPersona 返回 MetaAgent 的注入器组合：人格（soul）+ 用户画像（TODO #28）+ 项目偏好
 //（2026-09-02 设计 §5：项目偏好 Meta+Domain 双注入）。
 // 用户画像仅注入 MetaAgent；项目偏好经 Dispatcher 前缀同步下发子 Agent（执行层工艺）。
-func (s *ReactService) metaPersona() PersonaInjector {
+// workDir 为会话工作目录（S2）：项目偏好按会话目录解析，空串回落 store 构造目录。
+func (s *ReactService) metaPersona(workDir string) PersonaInjector {
 	var userCurrent func() string
 	if s.userProfile != nil {
 		store := s.userProfile
@@ -503,7 +505,9 @@ func (s *ReactService) metaPersona() PersonaInjector {
 	var projCurrent func() string
 	if s.projectPrefs != nil {
 		store := s.projectPrefs
-		projCurrent = func() string { return store.Current().Content }
+		projCurrent = func() string {
+			return store.Current(tool.WithWorkDir(context.Background(), workDir)).Content
+		}
 	}
 	return CombinePersonaInjectors(
 		s.persona,
@@ -1787,7 +1791,7 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(s.workDir()).
 		WithSkillBlock(s.metaSkillBlock()).
-		WithPersonaInjector(s.metaPersona())
+		WithPersonaInjector(s.metaPersona(session.workDir))
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -1901,7 +1905,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(s.workDir()).
 		WithSkillBlock(s.metaSkillBlock()).
-		WithPersonaInjector(s.metaPersona())
+		WithPersonaInjector(s.metaPersona(session.workDir))
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
