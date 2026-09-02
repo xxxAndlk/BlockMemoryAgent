@@ -13,6 +13,7 @@ import (
 	"net"      // 监听本地 TCP 端口
 	"net/http" // 本地 HTTP 服务
 	"os"       // 文件状态、标准错误、环境变量、TTY 检测
+	"path/filepath" // 配置路径拼接
 	"strings"  // 判断关闭网络连接时的预期错误
 
 	tea "github.com/charmbracelet/bubbletea" // TUI 框架
@@ -52,6 +53,29 @@ func main() {
 	skillPath := flag.String("skills", "config/skills.yaml", "Skill 池 YAML 路径（可选）")
 	noAltScreen := flag.Bool("no-alt-screen", false, "禁用 alt-screen（CI 或非 TTY 自动禁用）")
 	flag.Parse() // 解析命令行输入
+
+	// ---- 安装目录解析:未显式指定的配置路径落到 BMA_HOME 下 ----
+	home, homeErr := config.HomeDir()
+	explicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if homeErr == nil {
+		if !explicit["config"] {
+			*configPath = filepath.Join(home, "config", "config.yaml")
+		}
+		if !explicit["roles"] {
+			*rolePath = filepath.Join(home, "config", "roles.yaml")
+		}
+		if !explicit["env"] {
+			*envPath = filepath.Join(home, ".env")
+		}
+		if !explicit["soul"] {
+			*soulPath = filepath.Join(home, "config", "soul.md")
+		}
+		if !explicit["skills"] {
+			*skillPath = filepath.Join(home, "config", "skills.yaml")
+		}
+	}
+	// home 解析失败不致命:保留 cwd 相对默认值,由下方文件校验报错提示。
 
 	// ---- 启动早期日志器 ----
 	// 配置文件校验失败等早期错误需要落到终端，避免用户只看到 exit status 1。
@@ -96,6 +120,9 @@ func main() {
 	if !cfg.Logging.Enabled || logDir == "" {
 		// 配置未启用或目录为空时，使用默认 logs 目录
 		logDir = "logs"
+	}
+	if homeErr == nil {
+		logDir = config.ResolveUnderHome(home, logDir)
 	}
 	// logging.Init 第三个参数 silent=true，表示同时关闭 stderr 输出
 	logWriter, err := logging.Init(logging.EntryTUI, logDir, true)
