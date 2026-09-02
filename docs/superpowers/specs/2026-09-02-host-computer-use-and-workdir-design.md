@@ -49,7 +49,7 @@ D:\data\bma\
 TUI 与 server 共用新增 helper(如 `config.HomeDir()`):
 
 1. `BMA_HOME` 环境变量(指向的目录须含 `config/config.yaml`,否则视为未设置并告警);
-2. exe 所在目录的上级(exe 位于 `bin\` 下、且该上级目录含 `config/config.yaml` 时;开发态 `backend/tui.exe` 的上级即仓库根,同样满足);
+2. exe 所在目录及其上级(候选须含 `config/config.yaml`;`bin\` 布局时上级优先,开发态 `backend/tui.exe` 命中上级即仓库根);
 3. 兼容现状的 cwd(含 `config/config.yaml` 才接受,否则启动报错)。
 
 5 个现有 flag(`-config/-roles/-env/-soul/-skills`)仍可单独覆盖对应文件。`logging.dir`、`plugins.yaml`/`plugins.installed.yaml`/`plugins.d/`、skills 路径均相对 home 解析。
@@ -68,7 +68,7 @@ TUI 与 server 共用新增 helper(如 `config.HomeDir()`):
 1. **API**:`POST /api/sessions` 请求体增加可选 `work_dir`(绝对路径)。服务端校验:必须存在且为目录,否则 400;为空回落 server 启动目录(向后兼容,TUI 与旧客户端不受影响)。
 2. **目录浏览 API**:新增 `GET /api/fs/browse?path=` 返回指定路径的子目录列表(只列目录不列文件);Windows 根层(空 path)返回盘符列表。供前端目录选择器使用。
 3. **会话模型**:`server.Session` DTO 与运行时 `reactInternalSession` 增加 `WorkDir` 字段;新增迁移 `migrations/008_session_work_dir.sql`(session_history 加列),`restore_sessions` 恢复时带回。
-4. **工具执行器按会话解析 workDir**:`tool.Executor` 的 workDir 单例改为按会话解析(ctx 已有会话标识,新增 `WorkDirResolver`);相对路径 `resolvePath`、沙箱 `isPathAllowed`(界 = 该会话 workDir + 全局 `tool_sandbox_allowed_paths`)、会话临时目录 `.bma/tmp/<sid>` 全部改用该会话的 workDir。
+4. **工具执行器按会话解析 workDir**:`tool.Executor` 的 workDir 单例改为按会话解析(ctx 已有会话标识,经 `tool.WithWorkDir(ctx)` 注入、`WorkDirFromContext(ctx)` 取出);相对路径 `resolvePath`、沙箱 `isPathAllowed`(界 = 该会话 workDir + 全局 `tool_sandbox_allowed_paths`)、会话临时目录 `.bma/tmp/<sid>` 全部改用该会话的 workDir。
 5. **`.bma/` 状态目录跟随会话项目目录**:tmp / snapshots / shared / project_preferences 每个项目目录一份(per-project 语义,与 codex 一致);DB 全局记忆不受影响。
 6. `production_workdir` 审批语义不变(全信任模式下本不触发)。
 
