@@ -18,7 +18,7 @@ import (
 	"net/http"      // HTTP 服务与路由注册
 	"os"            // 文件状态、信号、标准错误等
 	"os/signal"     // 注册操作系统信号监听器
-	"path/filepath" // 可执行文件相对路径解析
+	"path/filepath" // home 目录与静态资源路径拼接
 	"syscall"       // SIGINT/SIGTERM 等信号常量
 	"time"          // HTTP 超时与持续时间计算
 
@@ -49,8 +49,37 @@ func main() {
 	soulPath := flag.String("soul", "config/soul.md", "人格定义文件路径")
 	profilePath := flag.String("profile", "config/user_profile.md", "用户画像文件路径（TODO #28）")
 	skillPath := flag.String("skills", "config/skills.yaml", "Skill 池 YAML 路径（可选）")
-	webDistPath := flag.String("web-dist", "web/dist", "前端构建产物目录路径（相对路径将基于可执行文件目录解析）")
+	webDistPath := flag.String("web-dist", "web/dist", "前端构建产物目录路径（未显式指定时落到 BMA_HOME/web/dist）")
 	flag.Parse() // 解析命令行输入；未解析前 *configPath 等指针仍为默认值
+
+	// ---- 安装目录解析:未显式指定的路径落到 BMA_HOME 下 ----
+	home, homeErr := config.HomeDir()
+	explicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if homeErr == nil {
+		if !explicit["config"] {
+			*configPath = filepath.Join(home, "config", "config.yaml")
+		}
+		if !explicit["roles"] {
+			*rolePath = filepath.Join(home, "config", "roles.yaml")
+		}
+		if !explicit["env"] {
+			*envPath = filepath.Join(home, ".env")
+		}
+		if !explicit["soul"] {
+			*soulPath = filepath.Join(home, "config", "soul.md")
+		}
+		if !explicit["skills"] {
+			*skillPath = filepath.Join(home, "config", "skills.yaml")
+		}
+		if !explicit["profile"] {
+			*profilePath = filepath.Join(home, "config", "user_profile.md")
+		}
+		if !explicit["web-dist"] {
+			*webDistPath = filepath.Join(home, "web", "dist")
+		}
+	}
+	// home 解析失败不致命:保留 flag 默认值与既有行为。
 
 	// ---- 启动早期日志器 ----
 	// 在配置文件加载之前，任何致命错误都需要落到 stderr；此处使用一个最小配置的
@@ -92,7 +121,12 @@ func main() {
 	var srvLogger *logger.Logger
 	if cfg.Logging.Enabled {
 		// logging.Init 返回一个按天滚动的 io.WriteCloser；EntryBackend 区分入口
-		w, err := logging.Init(logging.EntryBackend, cfg.Logging.Dir, false)
+		// 日志目录经 BMA_HOME 解析：相对路径落到安装目录下，绝对路径原样使用
+		logDir := cfg.Logging.Dir
+		if homeErr == nil {
+			logDir = config.ResolveUnderHome(home, logDir)
+		}
+		w, err := logging.Init(logging.EntryBackend, logDir, false)
 		if err != nil {
 			// 初始化失败仅记录警告，保持 stderr 可用
 			earlyLogger.Error(context.Background(), "初始化文件日志失败，降级到 stderr", err)
@@ -144,9 +178,8 @@ func main() {
 	// NewDefaultRouter 已注册全部 API 路由；此处继续注册静态文件与 SPA 首页回退。
 	router := bootstrap.NewDefaultRouter(app)
 
-	// 静态文件：Vue 构建产物目录支持相对可执行文件路径解析，
-	// 避免服务从其他工作目录启动时找不到 web/dist。
-	webDist := resolveWebDistPath(*webDistPath)
+	// 静态文件：Vue 构建产物目录；未显式指定 -web-dist 时已在上文落到 BMA_HOME/web/dist。
+	webDist := *webDistPath
 	fs := http.FileServer(http.Dir(webDist))
 	router.GET("/assets/*filepath", gin.WrapH(fs))    // 静态资源目录（JS/CSS/图片）
 	router.GET("/favicon.svg", func(c *gin.Context) { // 站点图标
@@ -192,28 +225,4 @@ func main() {
 	srvLogger.Info(ctx, "正在关闭服务...")
 	cancel()
 	httpServer.Close()
-}
-
-// resolveWebDistPath 解析前端构建产物目录路径。
-// 参数 path 既可以是绝对路径，也可以是相对路径：
-//   - 绝对路径：直接原样返回，不做修改；
-//   - 相对路径：基于当前可执行文件所在目录拼接，避免服务从其他工作目录启动时找不到 web/dist。
-//
-// 返回值是最终用于 http.Dir 的绝对路径字符串。
-func resolveWebDistPath(path string) string {
-	if filepath.IsAbs(path) {
-		// 绝对路径无需解析，直接返回以减少不确定性
-		return path
-	}
-	// 获取当前可执行文件路径；失败时回退到原始相对路径（保持旧行为）
-	exe, err := os.Executable()
-	if err != nil {
-		return path
-	}
-	// 处理符号链接：取最终实际路径，避免软链接导致相对位置错误
-	if real, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = real
-	}
-	baseDir := filepath.Dir(exe)        // 可执行文件所在目录
-	return filepath.Join(baseDir, path) // 拼接为绝对路径
 }
