@@ -6,11 +6,11 @@ export function listSessions(): Promise<Session[]> {
   return fetchJson('/sessions')
 }
 
-export function createSession(goal: string, images?: WireImage[]): Promise<Session> {
-  return fetchJson('/sessions', {
-    method: 'POST',
-    body: JSON.stringify(images?.length ? { goal, images } : { goal }),
-  })
+export function createSession(goal: string, images?: WireImage[], workDir?: string): Promise<Session> {
+  const body: Record<string, unknown> = { goal }
+  if (images?.length) body.images = images
+  if (workDir) body.work_dir = workDir
+  return fetchJson('/sessions', { method: 'POST', body: JSON.stringify(body) })
 }
 
 export function getSession(id: string): Promise<Session> {

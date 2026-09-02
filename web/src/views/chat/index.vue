@@ -22,6 +22,7 @@ import { useRoleTree } from '@/composables/useRoleTree'
 import { useTaskBoard } from '@/composables/useTaskBoard'
 import { useSessionList } from '@/composables/useSessionList'
 import { useSessionStatus } from '@/composables/useSessionStatus'
+import { useWorkDir } from '@/composables/useWorkDir'
 import MessageList from './components/MessageList.vue'
 import ChatInput from './components/ChatInput.vue'
 import ChatHeader from './components/ChatHeader.vue'
@@ -33,6 +34,7 @@ const { sessions, loadSessions } = useSessionList()
 const stream = useSessionStream()
 const panel = usePanelRefresh()
 const { statusDotClass, statusText } = useSessionStatus()
+const { workDir } = useWorkDir()
 
 const activeSession = ref<Session | null>(null)
 const events = ref<SessionEvent[]>([])
@@ -188,7 +190,7 @@ async function handleSubmit(content: string, images: WireImage[] = []) {
       return
     }
     // 3) 无选中会话 → 创建新会话（首条消息可携带图片）
-    const s = await createSession(content, images)
+    const s = await createSession(content, images, workDir.value || undefined)
     sessions.value.unshift(s)
     router.replace({ path: '/chat', query: { id: s.id } })
     await openSession(s.id)

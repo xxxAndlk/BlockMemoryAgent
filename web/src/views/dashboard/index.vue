@@ -8,9 +8,12 @@ import { getTimeline, getActivity, type TimelinePoint, type ActivityItem } from 
 import { statusTagType, statusText } from '@/utils/sessionStatus'
 import { fmtDate } from '@/utils/date'
 import { kindIcon, kindTagType } from '@/views/chat/utils/eventStyles'
+import { useWorkDir } from '@/composables/useWorkDir'
+import WorkDirPicker from '@/components/WorkDirPicker.vue'
 
 const router = useRouter()
 const goal = ref('')
+const { workDir, setWorkDir } = useWorkDir()
 const searchSession = ref('')
 const sessions = ref<Session[]>([])
 const loading = ref(false)
@@ -56,7 +59,8 @@ async function runSession() {
   if (!goal.value.trim()) return
   loading.value = true
   try {
-    const s = await createSession(goal.value.trim())
+    const s = await createSession(goal.value.trim(), undefined, workDir.value || undefined)
+    setWorkDir(workDir.value)
     goal.value = ''
     await load()
     if (s?.id) viewSession(s.id)
@@ -187,6 +191,7 @@ function activityStyle(kind: string) {
               class="w-full bg-[#0f1115] border-none"
               @keydown.enter.prevent="runSession"
             />
+            <WorkDirPicker v-model="workDir" />
             <div class="flex flex-wrap items-center gap-4">
               <span class="text-sm text-gray-400">快捷模板:</span>
               <div class="flex flex-wrap gap-2">
@@ -273,6 +278,7 @@ function activityStyle(kind: string) {
                 </el-tag>
               </div>
               <div class="text-xs text-gray-500">创建时间: {{ fmtDate(s.started_at) }}</div>
+              <div class="text-xs text-gray-500 truncate">目录: {{ s.work_dir || '默认目录' }}</div>
             </div>
             <div class="w-48 px-4 flex flex-col items-end">
               <div v-if="s.status === 'running'" class="w-full flex items-center gap-2">

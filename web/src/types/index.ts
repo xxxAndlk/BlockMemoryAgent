@@ -34,6 +34,8 @@ export interface Session {
   ended_at?: string
   /** 软停止销毁倒计时截止时间（TODO #37）：软停止后非空，续跑/到期后清空。 */
   destroy_at?: string | null
+  /** 每会话工作目录：空/缺省 = 后端默认目录。 */
+  work_dir?: string
   events: SessionEvent[]
   messages: ChatMessage[]
 }
