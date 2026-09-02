@@ -30,8 +30,8 @@ func pgVector(v []float32) string {
 }
 
 // EnsureSessionHistorySchema 自动创建 session_history 表 (幂等)。
-// 同时确保 006_session_history_meta_memory.sql 中声明的 meta_memory 列已存在，
-// 避免 SaveSessionHistory 因列缺失而失败。
+// 同时确保 006_session_history_meta_memory.sql 的 meta_memory 列与
+// 008_session_work_dir.sql 的 work_dir 列已存在，避免 SaveSessionHistory 因列缺失而失败。
 // 参数:
 //   - ctx: 超时与取消控制。
 //   - db:  *sql.DB 连接池。
@@ -53,6 +53,8 @@ CREATE INDEX IF NOT EXISTS idx_session_history_created_at
     ON session_history (created_at DESC);
 -- 老库缺 meta_memory 列时补齐（CREATE TABLE IF NOT EXISTS 对存量表是空操作）。
 ALTER TABLE session_history ADD COLUMN IF NOT EXISTS meta_memory JSONB DEFAULT '[]';
+-- 同理补齐 work_dir 列（008_session_work_dir.sql）：每会话工作目录，空串回落进程默认。
+ALTER TABLE session_history ADD COLUMN IF NOT EXISTS work_dir TEXT NOT NULL DEFAULT '';
 `)
 	return err
 }

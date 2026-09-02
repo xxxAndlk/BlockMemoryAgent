@@ -554,6 +554,7 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 		ToolResults: toolResults,
 		MetaMemory:  []map[string]any{},
 		CreatedAt:   time.Now(),
+		WorkDir:     session.workDir,
 	}
 	// 使用 3 秒超时上下文，避免数据库挂起导致无限等待。
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -713,6 +714,8 @@ func (st *reactSessionStore) restoreSessions(ctx context.Context, limit int) int
 			StartedAt: rec.CreatedAt,
 			EndedAt:   &endedAt,
 			Events:    restoredEvents,
+			// S2: 恢复每会话工作目录，重启后续跑仍在原目录；空串回落进程默认。
+			workDir: rec.WorkDir,
 			// Messages 重建为用户目标与助手总结，保持对话上下文可读。
 			Messages: []Message{
 				{Role: string(enums.ChatRoleUser), Content: rec.Goal, Timestamp: rec.CreatedAt},

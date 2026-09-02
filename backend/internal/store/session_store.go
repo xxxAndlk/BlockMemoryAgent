@@ -17,6 +17,7 @@ type SessionHistoryRecord struct {
 	ToolResults []map[string]any `json:"tool_results"` // 工具调用结果数组
 	MetaMemory  []map[string]any `json:"meta_memory"`  // P0-1: MetaAgent 调度记忆
 	CreatedAt   time.Time        `json:"created_at"`   // 创建时间
+	WorkDir     string           `json:"work_dir"`     // S2: 每会话工作目录(空串=进程默认)
 }
 
 // SessionEventRecord 会话事件归档记录。
@@ -45,7 +46,7 @@ type SessionStore struct {
 	log Logger  // 结构化日志器，由 PostgresStore.SetLogger 传播注入；nil 时回退标准库 log
 }
 
-// SaveHistory 持久化一次会话的 goal/summary/工具调用结果/调度记忆。
+// SaveHistory 持久化一次会话的 goal/summary/工具调用结果/调度记忆/工作目录。
 // 参数:
 //   - ctx: 请求上下文。
 //   - rec: 会话历史记录;ToolResults/MetaMemory 为 nil 时补为空数组,保证 JSONB 非 null
@@ -72,10 +73,10 @@ func (s *SessionStore) SaveHistory(ctx context.Context, rec *SessionHistoryRecor
 	}
 	// COALESCE 保证 created_at 为零值时回退到 NOW()
 	_, err = s.db.ExecContext(ctx, `
-			INSERT INTO session_history (session_id, goal, summary, tool_results, meta_memory, created_at)
-			VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()))
+			INSERT INTO session_history (session_id, goal, summary, tool_results, meta_memory, created_at, work_dir)
+			VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), $7)
 			ON CONFLICT DO NOTHING
-		`, rec.SessionID, sanitizeUTF8(rec.Goal), sanitizeUTF8(rec.Summary), toolData, memData, rec.CreatedAt)
+		`, rec.SessionID, sanitizeUTF8(rec.Goal), sanitizeUTF8(rec.Summary), toolData, memData, rec.CreatedAt, sanitizeUTF8(rec.WorkDir))
 	return err
 }
 
@@ -160,7 +161,7 @@ func (s *SessionStore) RecentHistories(ctx context.Context, limit int) ([]*Sessi
 	}
 	// 查询最近 limit 条历史，按创建时间倒序
 	rows, err := s.db.QueryContext(ctx, `
-			SELECT session_id, goal, summary, tool_results, meta_memory, created_at
+			SELECT session_id, goal, summary, tool_results, meta_memory, created_at, work_dir
 			FROM session_history
 			ORDER BY created_at DESC
 			LIMIT $1
@@ -174,7 +175,7 @@ func (s *SessionStore) RecentHistories(ctx context.Context, limit int) ([]*Sessi
 	for rows.Next() {
 		var r SessionHistoryRecord
 		var toolRaw, memRaw []byte
-		if err := rows.Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt, &r.WorkDir); err != nil {
 			// 单行扫描失败跳过
 			continue
 		}
@@ -205,10 +206,10 @@ func (s *SessionStore) GetHistoryByID(ctx context.Context, id string) (*SessionH
 	var r SessionHistoryRecord
 	var toolRaw, memRaw []byte
 	err := s.db.QueryRowContext(ctx, `
-			SELECT session_id, goal, summary, tool_results, meta_memory, created_at
+			SELECT session_id, goal, summary, tool_results, meta_memory, created_at, work_dir
 			FROM session_history
 			WHERE session_id = $1
-		`, id).Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt)
+		`, id).Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt, &r.WorkDir)
 	if err == sql.ErrNoRows {
 		// 未找到是正常情况
 		return nil, nil
