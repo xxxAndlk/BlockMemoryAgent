@@ -2,20 +2,18 @@
 import { ref, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { WireImage } from '@/types'
+import { useWorkDir } from '@/composables/useWorkDir'
+import WorkDirPicker from '@/components/WorkDirPicker.vue'
 
 const props = defineProps<{
   loading?: boolean
   sessionActive?: boolean
-  verbose?: boolean
-  memoryEnabled?: boolean
   inputTokens?: number
   outputTokens?: number
 }>()
 
 const emit = defineEmits<{
   (e: 'submit', content: string, images: WireImage[]): void
-  (e: 'update:verbose', val: boolean): void
-  (e: 'update:memoryEnabled', val: boolean): void
   (e: 'new-session'): void
 }>()
 
@@ -133,6 +131,10 @@ function onFileChange(e: Event) {
 const textareaRef = ref()
 const fileRef = ref<HTMLInputElement>()
 
+// 工作目录：模块级共享 ref（useWorkDir），新建会话时随 createSession 提交；
+// 与首页 WorkDirPicker 同源，改动实时同步。
+const { workDir } = useWorkDir()
+
 function handleSubmit() {
   if (!canSend.value) return
   emit('submit', content.value.trim(), pendingImages.value.slice())
@@ -155,30 +157,17 @@ function applyQuickTag(tag: string) {
     content.value = tag
   }
 }
-
-const verboseModel = computed({
-  get: () => !!props.verbose,
-  set: (v: boolean) => emit('update:verbose', v),
-})
-const memoryModel = computed({
-  get: () => !!props.memoryEnabled,
-  set: (v: boolean) => emit('update:memoryEnabled', v),
-})
 </script>
 
 <template>
   <div class="border-t border-[#2a2d35] bg-[#14161a] px-6 py-3">
     <!-- 模式开关 + 快捷标签 + Token 计数 -->
     <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
-      <div class="flex items-center gap-4 text-xs text-gray-400">
-        <label class="flex items-center gap-2 cursor-pointer">
-          <el-switch v-model="verboseModel" size="small" />
-          <span>详细模式</span>
-        </label>
-        <label class="flex items-center gap-2 cursor-pointer">
-          <el-switch v-model="memoryModel" size="small" />
-          <span>启用记忆</span>
-        </label>
+      <div class="flex items-center gap-4 text-xs text-gray-400 flex-1 min-w-0">
+        <div class="flex items-center gap-2 w-80 max-w-full shrink-0 workdir-cell">
+          <span class="text-gray-400 whitespace-nowrap">工作目录</span>
+          <WorkDirPicker v-model="workDir" />
+        </div>
         <span v-if="sessionActive" class="text-green-400 flex items-center gap-1">
           <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
           会话已连接
@@ -263,6 +252,15 @@ const memoryModel = computed({
 }
 :deep(.chat-input .el-textarea__inner:focus) {
   border-color: #3b82f6;
+}
+:deep(.workdir-cell .el-input__wrapper) {
+  background-color: #0f1115;
+  box-shadow: 0 0 0 1px #2a2d35 inset;
+  padding: 0 8px;
+  min-height: 28px;
+}
+:deep(.workdir-cell .el-input__inner) {
+  font-size: 12px;
 }
 .hidden {
   display: none;

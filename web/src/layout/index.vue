@@ -24,12 +24,6 @@
       </div>
       
       <div class="flex items-center space-x-4 shrink-0">
-        <el-button size="small" class="!bg-[#2a2d35] !border-none !text-yellow-500 hover:!bg-[#3a3d45]">
-          <el-icon class="mr-1"><VideoPause /></el-icon> 暂停 Graph
-        </el-button>
-        <el-button size="small" class="!bg-[#1e3a2e] !border-none !text-green-500 hover:!bg-[#2e4a3e]">
-          <el-icon class="mr-1"><VideoPlay /></el-icon> 恢复 Graph
-        </el-button>
         <el-icon class="text-xl cursor-pointer text-gray-400 hover:text-white"><Setting /></el-icon>
       </div>
     </header>

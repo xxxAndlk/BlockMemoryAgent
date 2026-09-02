@@ -63,11 +63,12 @@ plugins-build:
 	docker build -t bma/ui-preview-mcp:local docker/ui-preview-mcp
 	docker pull ghcr.io/nexu-io/od:latest
 
-## Build dist/ install layout: dist/{bin,config,web/dist,plugins.d}. Then run install.ps1 to install.
+## Build dist/ install layout: dist/{bin,config,web/dist,plugins.d}. Then run install.ps1 to install. PowerShell 无 make 时用 .\dist.ps1。
 dist: web-build
 	cd backend && GOTOOLCHAIN=local go build -o ../dist/bin/bma-server.exe . && GOTOOLCHAIN=local go build -o ../dist/bin/tui.exe ./cmd/tui
 	mkdir -p dist/config
 	cp config/*.yaml config/soul.md config/user_profile.md dist/config/
+	rm -rf dist/config/skills_learned && cp -r config/skills_learned dist/config/
 	rm -rf dist/web && mkdir -p dist/web
 	cp -r web/dist dist/web/dist
 	mkdir -p dist/plugins.d

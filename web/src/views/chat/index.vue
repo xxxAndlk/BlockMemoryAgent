@@ -34,7 +34,7 @@ const { sessions, loadSessions } = useSessionList()
 const stream = useSessionStream()
 const panel = usePanelRefresh()
 const { statusDotClass, statusText } = useSessionStatus()
-const { workDir } = useWorkDir()
+const { workDir, setWorkDir } = useWorkDir()
 
 const activeSession = ref<Session | null>(null)
 const events = ref<SessionEvent[]>([])
@@ -52,8 +52,6 @@ const loading = ref(false)
 const sending = ref(false)
 
 // 用户偏好
-const verbose = ref(false)
-const memoryEnabled = ref(true)
 const sessionFilter = ref('')
 
 onMounted(async () => {
@@ -191,6 +189,7 @@ async function handleSubmit(content: string, images: WireImage[] = []) {
     }
     // 3) 无选中会话 → 创建新会话（首条消息可携带图片）
     const s = await createSession(content, images, workDir.value || undefined)
+    setWorkDir(workDir.value) // 与首页同策略：提交时固化工作目录到 localStorage，刷新/换页后保留
     sessions.value.unshift(s)
     router.replace({ path: '/chat', query: { id: s.id } })
     await openSession(s.id)
@@ -340,14 +339,12 @@ function fmtDateTime(iso: string) {
     <!-- 中间对话区 -->
     <main class="flex-1 flex flex-col bg-[#1a1d24] border border-[#2a2d35] rounded-lg overflow-hidden min-w-0">
       <ChatHeader :session="activeSession" :agents="agents" @cancel="handleCancel" @stop="handleStop" @interrupt="handleInterrupt" />
-      <MessageList :events="events" :verbose="verbose" :clarify="clarifyPending"
+      <MessageList :events="events" :verbose="false" :clarify="clarifyPending"
                    :session-id="activeSession?.id || ''" @submit-clarify="handleClarifySubmitted" />
       <ChatInput :loading="sending"
                  :session-active="activeSession?.status === 'running'"
                  :input-tokens="tokenUsage.input"
                  :output-tokens="tokenUsage.output"
-                 v-model:verbose="verbose"
-                 v-model:memory-enabled="memoryEnabled"
                  @submit="handleSubmit"
                  @new-session="handleNewSession" />
     </main>

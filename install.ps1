@@ -1,6 +1,6 @@
 ﻿# BMA 安装脚本:复制 dist/ 到安装目录并写入 BMA_HOME 用户环境变量。幂等,可重复运行(升级)。
 $ErrorActionPreference = "Stop"
-$default = "D:\data\bma"
+$default = "D:\WebApp\bma"
 $target = Read-Host "安装目录 [$default]"
 if ([string]::IsNullOrWhiteSpace($target)) { $target = $default }
 $src = Join-Path $PSScriptRoot "dist"

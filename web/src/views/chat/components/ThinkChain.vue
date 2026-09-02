@@ -47,7 +47,7 @@ function asText(s: string | undefined): string {
         <el-icon class="text-blue-400"><ChatLineRound /></el-icon>
         <span class="font-medium">思考链路</span>
         <span class="text-gray-500">{{ visible.length }} 步</span>
-        <span v-if="!verbose && hiddenCount > 0" class="text-gray-500">（详细模式可见 +{{ hiddenCount }}）</span>
+        <span v-if="!verbose && hiddenCount > 0" class="text-gray-500">（已折叠 +{{ hiddenCount }}）</span>
       </span>
       <el-icon class="text-gray-500 transition-transform" :class="{'rotate-180': !collapsed}"><ArrowDown /></el-icon>
     </button>
