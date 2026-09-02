@@ -54,6 +54,10 @@ func (mockAgentForRouter) Profile(context.Context) (*userprofile.Profile, error)
 	return nil, nil
 }
 func (mockAgentForRouter) SaveProfile(context.Context, string) error { return nil }
+func (mockAgentForRouter) ProjectPreferences(context.Context) (*userprofile.Profile, error) {
+	return &userprofile.Profile{}, nil
+}
+func (mockAgentForRouter) SaveProjectPreferences(context.Context, string) error { return nil }
 func (mockAgentForRouter) Shutdown(context.Context) error            { return nil }
 func (mockAgentForRouter) SummarizeTaskTitle(context.Context, string) string {
 	return ""

@@ -154,6 +154,17 @@ type Dispatcher struct {
 	// 由 bootstrap 注入 plugins.Manager.ToolVisibility。
 	pluginVisibility agent.ToolVisibilityFunc
 
+	// projectPrefs 项目偏好读取回调（2026-09-02 设计 §5）：返回 workDir 下
+	// .bma/project_preferences.md 全文；派发前缀拼【项目偏好】段下发子 Agent。
+	// nil 或空串时零注入。
+	projectPrefs func() string
+
+	// skillRecall 经验技能向量预答回调（2026-09-02 设计 §6.5）：task 文本 -> 提示行列表
+	//（「有相关经验技能 <name>——<title>，可 load_skill 查看」）。nil 时零注入。
+	skillRecall func(ctx context.Context, task string) []SkillHint
+	// skillUseCounter learned 技能 use_count++ 回调（设计 §6.5）；nil 时零计数。
+	skillUseCounter func(name string) error
+
 	// pending 跟踪每个父 Agent 当前未完成的子 Agent 数量，键为 parentID，
 	// 值为 *pendingState。用于父会话终结保护：父 Agent 给出终答前若有未决子 Agent，
 	// 应等待其完成再终结，防止迟到 mailbox 消息丢失（参见 agent.ReActAgent 的终结保护分支）。
@@ -1052,6 +1063,74 @@ func (d *Dispatcher) WithDomainReconClock(t time.Duration) *Dispatcher {
 func (d *Dispatcher) WithPluginVisibility(fn agent.ToolVisibilityFunc) *Dispatcher {
 	d.pluginVisibility = fn
 	return d
+}
+
+// WithProjectPreferences 注入项目偏好读取回调（2026-09-02 设计 §5）：
+// bootstrap 接 userprofile.Store(项目偏好).Current().Content；
+// 派发前缀拼【项目偏好】段下发所有子 Agent（项目经验是执行层要遵守的工艺）。
+// 传 nil（或回调返回空串）时不注入。
+func (d *Dispatcher) WithProjectPreferences(fn func() string) *Dispatcher {
+	d.projectPrefs = fn
+	return d
+}
+
+// SkillHint 经验技能召回提示（设计 §6.5：只注一行提示，不注全文）。
+type SkillHint struct {
+	Name  string
+	Title string
+}
+
+// WithSkillRecall 注入经验技能向量预答回调（设计 §6.5）：
+// bootstrap 接 learned_skills 向量检索（goal/task embedding top-3，相似度阈值过滤）。
+// 派发前缀拼【相关经验】段（每技能一行提示）；nil 时零注入。
+func (d *Dispatcher) WithSkillRecall(fn func(ctx context.Context, task string) []SkillHint) *Dispatcher {
+	d.skillRecall = fn
+	return d
+}
+
+// WithSkillUseCounter 注入 learned 技能 load 计数回调（设计 §6.5）。
+func (d *Dispatcher) WithSkillUseCounter(fn func(name string) error) *Dispatcher {
+	d.skillUseCounter = fn
+	return d
+}
+
+// skillRecallPrefix 渲染【相关经验】派发前缀段；无回调/无命中返回空串（零注入）。
+func (d *Dispatcher) skillRecallPrefix(ctx context.Context, task string) string {
+	if d.skillRecall == nil || strings.TrimSpace(task) == "" {
+		return ""
+	}
+	hints := d.skillRecall(ctx, task)
+	if len(hints) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("【相关经验】\n以下经验技能与当前任务相关，可用 load_skill(名称) 获取完整工艺指引：\n")
+	for _, h := range hints {
+		b.WriteString("- ")
+		b.WriteString(h.Name)
+		b.WriteString(" —— ")
+		b.WriteString(h.Title)
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// projectPrefsRunes 项目偏好段注入的 rune 上限（与 MetaAgent 侧 persona 段一致）。
+const projectPrefsRunes = 2000
+
+// projectPrefsPrefix 渲染【项目偏好】派发前缀段；空偏好返回空串（零注入）。
+func (d *Dispatcher) projectPrefsPrefix() string {
+	if d.projectPrefs == nil {
+		return ""
+	}
+	content := strings.TrimSpace(d.projectPrefs())
+	if content == "" {
+		return ""
+	}
+	if len([]rune(content)) > projectPrefsRunes {
+		content = string([]rune(content)[:projectPrefsRunes]) + "\n...（项目偏好截断）"
+	}
+	return "【项目偏好】\n" + content + "\n（以上是本项目的约定与经验，执行任务时遵守）"
 }
 
 // WithSkillPool 注入全局技能池（技能渐进披露 + 树形分发）。传 nil 时技能参数、
@@ -2739,6 +2818,14 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	var prefixes []string
 	if sp := d.buildSharedPrefix(ctx, parentID, domain); sp != "" {
 		prefixes = append(prefixes, sp)
+	}
+	// 项目偏好（2026-09-02 设计 §5）：本项目约定与经验下发给全部子 Agent（执行层工艺）。
+	if pp := d.projectPrefsPrefix(); pp != "" {
+		prefixes = append(prefixes, pp)
+	}
+	// 经验技能召回（2026-09-02 设计 §6.5）：task 向量预筛 top-3，只注一行提示不注全文。
+	if sr := d.skillRecallPrefix(ctx, origTask); sr != "" {
+		prefixes = append(prefixes, sr)
 	}
 	if bm, recs := d.injectScopedRecall(ctx, parentID, domain, origTask, ""); bm != "" {
 		prefixes = append(prefixes, bm)

@@ -77,6 +77,11 @@ type Agent interface {
 	Profile(ctx context.Context) (*userprofile.Profile, error)
 	SaveProfile(ctx context.Context, content string) error
 
+	// ProjectPreferences 返回项目偏好全文快照（2026-09-02 设计 §5，per workDir）。
+	// SaveProjectPreferences 全量覆盖（HTTP PUT 用户手动编辑）。
+	ProjectPreferences(ctx context.Context) (*userprofile.Profile, error)
+	SaveProjectPreferences(ctx context.Context, content string) error
+
 	// Shutdown 优雅关闭整个 Agent 编排模块，释放资源并停止后台任务。
 	// ctx 用于控制关闭操作的超时与取消。
 	// 若关闭过程中出现错误，返回 error。

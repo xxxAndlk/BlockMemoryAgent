@@ -135,29 +135,37 @@ func (c *compositeInjector) Inject(systemPrompt string) string {
 // 仅注入 MetaAgent（runSession/resumeSession）；子 Agent 不注入（画像不下发）。
 // current 为 nil 或返回空串时原样返回（零副作用）。
 func NewUserProfileInjector(current func() string, maxRunes int) PersonaInjector {
-	if current == nil {
+	return NewSectionInjector("【用户画像】", current, maxRunes)
+}
+
+// NewSectionInjector 构造通用文本段注入器（2026-09-02 偏好与自进化）：
+// 以 header 为前缀把 current() 全文拼入系统提示词（rune 截断防膨胀）。
+// 用户画像与项目偏好共用；current 为 nil 或返回空串时原样返回。
+func NewSectionInjector(header string, current func() string, maxRunes int) PersonaInjector {
+	if current == nil || strings.TrimSpace(header) == "" {
 		return nil
 	}
 	if maxRunes <= 0 {
 		maxRunes = 2000
 	}
-	return &userProfileInjector{current: current, maxRunes: maxRunes}
+	return &sectionInjector{header: header, current: current, maxRunes: maxRunes}
 }
 
-type userProfileInjector struct {
+type sectionInjector struct {
+	header   string
 	current  func() string
 	maxRunes int
 }
 
-func (p *userProfileInjector) Inject(systemPrompt string) string {
+func (p *sectionInjector) Inject(systemPrompt string) string {
 	content := strings.TrimSpace(p.current())
 	if content == "" {
 		return systemPrompt
 	}
 	if len([]rune(content)) > p.maxRunes {
-		content = string([]rune(content)[:p.maxRunes]) + "\n...（画像截断）"
+		content = string([]rune(content)[:p.maxRunes]) + "\n...（截断）"
 	}
-	return "【用户画像】\n" + content + "\n\n" + systemPrompt
+	return p.header + "\n" + content + "\n\n" + systemPrompt
 }
 
 // LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。

@@ -215,6 +215,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if len(skillPool.All()) == 0 {
 		skillPool = skill.BuiltinPool()
 	}
+	// 自进化技能库（2026-09-02 设计 §6.5/§9）：config/skills_learned/ 的 SKILL.md 与
+	// learned_skills PG 互相修复（孤儿补注册/文件缺失标禁用），enabled 注册进共享技能池。
+	// 纯净目录零行为（无文件无 PG 记录）。
+	reconcileLearnedSkills(ctx, pgStore.LearnedSkills, filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"), skillPool)
 
 	// 第十二步：创建共享邮箱，供 Runtime（遗留 API 兼容）与 ReAct 子 Agent 调度器共同使用。
 	sharedMailbox := mailbox.New()
@@ -476,8 +480,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 子 Agent 身份由 roles.yaml 角色提示词定义，不再下发人格。
 	agentSvc.SetPersonaInjector(rt.Soul)
 	// 用户画像（TODO #28 第四层记忆）：单文件 user_profile.md，人可编辑 + 程序结构化追加。
-	// 注入仅 MetaAgent（metaPersona 组合人格+画像），子 Agent 不下发（防上下文膨胀/偏好泄露）。
+	// 注入仅 MetaAgent（metaPersona 组合人格+画像+项目偏好），子 Agent 不下发用户画像
+	//（防上下文膨胀/偏好泄露；项目偏好例外，见下）。
 	// 双路写入：remember_preference 工具（用户显式陈述，立即生效）+ 会话完成轻量模型提取。
+	// Merge 整理（2026-09-02 期 1）：提取增量经轻量模型去重/冲突归档进偏好/技术栈/沟通风格小节。
 	if paths.ProfilePath != "" {
 		profileStore := userprofile.NewStore(paths.ProfilePath)
 		if err := profileStore.Load(); err != nil {
@@ -488,10 +494,70 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		agentSvc.SetProfileExtractor(func(ctx context.Context, text string) ([]string, error) {
 			return extractProfilePreferences(ctx, modelFactory, text)
 		})
+		agentSvc.SetPrefMerger(func(ctx context.Context, view userprofile.MergeView, increments []string) (userprofile.MergePlan, error) {
+			return mergePreferences(ctx, modelFactory, view, increments)
+		})
 		toolRegistry.SetUserProfileHook(func(ctx context.Context, text string) error {
 			return profileStore.Append("偏好", text)
 		})
+		// SessionEvolver（2026-09-02 设计 §6.1）：会话结束一次轻量模型调用产出三类沉淀。
+		// 未接线 ProfilePath 时不进化（画像是一切偏好的宿主）。
+		agentSvc.SetEvolver(func(ctx context.Context, in agent.EvolveInput) (*agent.EvolveOutput, error) {
+			return evolveSessionLLM(ctx, modelFactory, in)
+		})
+		skillSink := newLearnedSkillSink(pgStore.LearnedSkills,
+			filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"), skillPool)
+		agentSvc.SetSkillSink(skillSink.persist)
+		agentSvc.SetEvolutionLogger(func(ctx context.Context, sessionID, kind, target, summary string) error {
+			return pgStore.LearnedSkills.AppendEvolutionLog(ctx, kind, target, summary, sessionID)
+		})
 	}
+	// 项目偏好（2026-09-02 设计 §5）：per workDir .bma/project_preferences.md。
+	// 首次写入才创建文件（Load 容忍缺失，零注入直到有内容）；
+	// MetaAgent 经 persona 链【项目偏好】段注入，子 Agent 经 Dispatcher 前缀注入（执行层工艺）。
+	projectPrefsStore := userprofile.NewProjectStore(filepath.Join(workDir, ".bma", "project_preferences.md"))
+	if err := projectPrefsStore.Load(); err != nil {
+		log.Printf("[bootstrap] load project preferences failed (non-fatal): %v", err)
+	} else {
+		agentSvc.SetProjectPreferencesStore(projectPrefsStore)
+		subAgentDispatcher.WithProjectPreferences(func() string {
+			return projectPrefsStore.Current().Content
+		})
+		toolRegistry.SetProjectPreferenceHook(func(ctx context.Context, text string) error {
+			return projectPrefsStore.Append("项目约定", text)
+		})
+	}
+	// 经验技能召回（设计 §6.5）：MetaAgent 新任务 goal 与子 Agent 派发 task 均做向量
+	// 预筛 top-3（相似度阈值过滤），命中只注一行提示；load_skill 计数 use_count。
+	skillRecallFn := func(ctx context.Context, text string) []agent.SkillRecallHint {
+		emb, err := pgStore.LearnedSkills.Embed(ctx, text)
+		if err != nil {
+			return nil
+		}
+		hits, err := pgStore.LearnedSkills.SearchSkills(ctx, emb, 3, skillRecallDistance)
+		if err != nil {
+			return nil
+		}
+		var out []agent.SkillRecallHint
+		for _, h := range hits {
+			out = append(out, agent.SkillRecallHint{Name: h.Name, Title: h.Title})
+		}
+		return out
+	}
+	agentSvc.SetSkillRecall(skillRecallFn)
+	subAgentDispatcher.WithSkillRecall(func(ctx context.Context, task string) []subagent.SkillHint {
+		hints := skillRecallFn(ctx, task)
+		out := make([]subagent.SkillHint, 0, len(hints))
+		for _, h := range hints {
+			out = append(out, subagent.SkillHint{Name: h.Name, Title: h.Title})
+		}
+		return out
+	})
+	subAgentDispatcher.WithSkillUseCounter(func(name string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return pgStore.LearnedSkills.IncrementUseCount(ctx, name)
+	})
 	// 注入权威 Agent 树访问器：Dispatcher 派发时 Register/Finish/SetCancel，
 	// HTTP API 的 /tree 与 /agents/{aid}/cancel 端点通过 ReactService.TreeFor 读取。
 	subAgentDispatcher.WithTree(agentSvc.TreeFor)
@@ -685,6 +751,7 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 		"dag":             store.EnsureDAGSchema,
 		"memory":          store.EnsureInitialMemorySchema,
 		"agent_tree":      store.EnsureAgentTreeSchema,
+		"learned_skills":  store.EnsureLearnedSkillsSchema,
 	} {
 		if err := fn(ctx, pgStore.DB()); err != nil {
 			return fmt.Errorf("ensure %s schema: %w", name, err)

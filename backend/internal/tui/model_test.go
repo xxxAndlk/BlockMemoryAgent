@@ -140,6 +140,14 @@ func (m *mockAgentForPlan) Profile(ctx context.Context) (*userprofile.Profile, e
 // SaveProfile 覆盖画像，测试实现为空操作。
 func (m *mockAgentForPlan) SaveProfile(ctx context.Context, content string) error { return nil }
 
+// ProjectPreferences 返回项目偏好，测试实现返回空。
+func (m *mockAgentForPlan) ProjectPreferences(ctx context.Context) (*userprofile.Profile, error) {
+	return &userprofile.Profile{}, nil
+}
+
+// SaveProjectPreferences 覆盖项目偏好，测试实现为空操作。
+func (m *mockAgentForPlan) SaveProjectPreferences(ctx context.Context, content string) error { return nil }
+
 // SummarizeTaskTitle 是 mockAgentForPlan 的标题摘要实现，直接返回原标题。
 func (m *mockAgentForPlan) SummarizeTaskTitle(ctx context.Context, title string) string { return title }
 

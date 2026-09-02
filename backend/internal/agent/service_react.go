@@ -128,6 +128,23 @@ type ReactService struct {
 	userProfile *userprofile.Store
 	// profileExtractor 会话完成时从对话提取偏好增量的轻量模型回调；nil 跳过提取。
 	profileExtractor func(ctx context.Context, text string) ([]string, error)
+	// projectPrefs 项目偏好存储（2026-09-02 偏好与自进化期 1）：per workDir
+	// .bma/project_preferences.md；nil 表示未接线（Meta/DomainAgent 均不注入）。
+	projectPrefs *userprofile.Store
+	// prefMerger 偏好合并回调（轻量模型对目标小节做去重/冲突归档重写）；
+	// nil 时增量降级直写归档小节（v1 行为）。
+	prefMerger PrefMerger
+	// evolver SessionEvolver 回调（设计 §6.1）：一次轻量模型调用产出三类沉淀；
+	// nil 时会话结束回退纯画像提取（extractProfilePreferences 语义）。
+	evolver func(ctx context.Context, in EvolveInput) (*EvolveOutput, error)
+	// skillSink 技能包落库回调（设计 §6.3/§6.4）：文件 + learned_skills PG +
+	// skill_create/skill_update evolution_log；nil 时技能沉淀跳过。
+	skillSink func(ctx context.Context, sessionID string, skills []EvolvedSkill, outcome string) error
+	// evolutionLog 进化审计写回调（evolution_log 表）；nil 时跳过审计。
+	evolutionLog func(ctx context.Context, sessionID, kind, target, summary string) error
+	// skillRecall MetaAgent 侧经验技能向量预答回调（设计 §6.5）：goal -> top-3 提示行；
+	// nil 时零注入。与 Dispatcher 侧召回同源（bootstrap 注入同一检索函数）。
+	skillRecall func(ctx context.Context, task string) []SkillRecallHint
 	// pluginVisibility 热插拔插件角色可见性回调（设计文档 §4.3）：
 	// fn(roleID, toolName) -> (owned, visible)；nil 时插件工具不额外过滤
 	//（白名单语义不变）。由 bootstrap 注入 plugins.Manager.ToolVisibility。
@@ -215,6 +232,59 @@ func (s *ReactService) SetProfileExtractor(fn func(ctx context.Context, text str
 	s.profileExtractor = fn
 }
 
+// SetPrefMerger 注入偏好合并回调（轻量模型去重/冲突归档重写，设计 §4）。
+// nil（默认）时会话结束提取的增量降级直写归档小节（v1 行为）。
+func (s *ReactService) SetPrefMerger(fn PrefMerger) {
+	s.prefMerger = fn
+}
+
+// SetEvolver 注入 SessionEvolver（设计 §6.1）。
+// nil（默认）时会话结束回退纯画像提取（旧语义，测试/未接线场景）。
+func (s *ReactService) SetEvolver(fn func(ctx context.Context, in EvolveInput) (*EvolveOutput, error)) {
+	s.evolver = fn
+}
+
+// SetSkillSink 注入技能包落库回调（设计 §6.3 存储分界 + §6.4 同名合并）。
+// nil（默认）时会话进化产出的技能包被跳过（偏好增量照常）。
+func (s *ReactService) SetSkillSink(fn func(ctx context.Context, sessionID string, skills []EvolvedSkill, outcome string) error) {
+	s.skillSink = fn
+}
+
+// SetEvolutionLogger 注入进化审计写回调（evolution_log 表）。
+// nil（默认）时三类沉淀不写审计流水（沉淀本身照常生效）。
+func (s *ReactService) SetEvolutionLogger(fn func(ctx context.Context, sessionID, kind, target, summary string) error) {
+	s.evolutionLog = fn
+}
+
+// SetSkillRecall 注入 MetaAgent 侧经验技能向量预答回调（设计 §6.5）。
+// nil（默认）时新任务零提示（技能仍可 list_skills/load_skill 主动取用）。
+func (s *ReactService) SetSkillRecall(fn func(ctx context.Context, task string) []SkillRecallHint) {
+	s.skillRecall = fn
+}
+
+// SetProjectPreferencesStore 注入项目偏好存储（设计 §5）：
+// 注入后 MetaAgent system prompt 带【项目偏好】前缀（persona 链），
+// Dispatcher 派发前缀带【项目偏好】段（子 Agent 执行层遵守项目工艺）。
+func (s *ReactService) SetProjectPreferencesStore(st *userprofile.Store) {
+	s.projectPrefs = st
+}
+
+// ProjectPreferences 返回项目偏好全文快照。未接线返回空画像。
+func (s *ReactService) ProjectPreferences(ctx context.Context) (*userprofile.Profile, error) {
+	if s.projectPrefs == nil {
+		return &userprofile.Profile{}, nil
+	}
+	return s.projectPrefs.Current(), nil
+}
+
+// SaveProjectPreferences 全量覆盖项目偏好（HTTP PUT 用户手动编辑）。
+func (s *ReactService) SaveProjectPreferences(ctx context.Context, content string) error {
+	if s.projectPrefs == nil {
+		return fmt.Errorf("project preferences store not wired")
+	}
+	return s.projectPrefs.Save(content)
+}
+
 // SetPluginVisibility 注入插件工具角色可见性回调（设计文档 §4.3）。
 // 由 bootstrap 注入 plugins.Manager.ToolVisibility；传 nil 关闭插件可见性过滤。
 func (s *ReactService) SetPluginVisibility(fn ToolVisibilityFunc) {
@@ -237,8 +307,10 @@ func (s *ReactService) SaveProfile(ctx context.Context, content string) error {
 	return s.userProfile.Save(content)
 }
 
-// extractProfilePreferences 会话完成时扫对话提取偏好增量并写入画像（TODO #28 双路写入之 b）。
+// extractProfilePreferences 会话完成时扫对话提取偏好增量并 Merge 整理入画像
+//（TODO #28 双路写入之 b + 2026-09-02 期 1 Merge 升级）。
 // 仅提取用户消息（user 角色）；提取失败/空结果零副作用（不阻塞会话收尾）。
+// Merge：轻量模型对偏好/技术栈/沟通风格小节去重+冲突归档；合并不可用降级直写反馈记录。
 func (s *ReactService) extractProfilePreferences(session *reactInternalSession) {
 	if s.userProfile == nil || s.profileExtractor == nil {
 		return
@@ -264,11 +336,13 @@ func (s *ReactService) extractProfilePreferences(session *reactInternalSession) 
 		log.Printf("[profile] extract preferences failed, skip: err=%v prefs=%d", err, len(prefs))
 		return
 	}
+	cleaned := make([]string, 0, len(prefs))
 	for _, p := range prefs {
 		if p = strings.TrimSpace(p); p != "" {
-			_ = s.userProfile.Append("反馈记录", p)
+			cleaned = append(cleaned, p)
 		}
 	}
+	s.mergeIntoStore(session.ID, "UserProfileExtractor", s.userProfile, userProfileTargets, cleaned)
 }
 
 // SetBoard 注入会话任务看板访问器（TODO #22）。
@@ -413,16 +487,25 @@ func (s *ReactService) SetPersonaInjector(p PersonaInjector) {
 	s.persona = p
 }
 
-// metaPersona 返回 MetaAgent 的注入器组合：人格（soul）+ 用户画像（TODO #28 第四层记忆）。
-// 画像仅注入 MetaAgent；子 Agent 由 dispatcher 注入人格单一注入器（画像不下发，
-// 防上下文膨胀与偏好泄露）。
+// metaPersona 返回 MetaAgent 的注入器组合：人格（soul）+ 用户画像（TODO #28）+ 项目偏好
+//（2026-09-02 设计 §5：项目偏好 Meta+Domain 双注入）。
+// 用户画像仅注入 MetaAgent；项目偏好经 Dispatcher 前缀同步下发子 Agent（执行层工艺）。
 func (s *ReactService) metaPersona() PersonaInjector {
-	var current func() string
+	var userCurrent func() string
 	if s.userProfile != nil {
 		store := s.userProfile
-		current = func() string { return store.Current().Content }
+		userCurrent = func() string { return store.Current().Content }
 	}
-	return CombinePersonaInjectors(s.persona, NewUserProfileInjector(current, 2000))
+	var projCurrent func() string
+	if s.projectPrefs != nil {
+		store := s.projectPrefs
+		projCurrent = func() string { return store.Current().Content }
+	}
+	return CombinePersonaInjectors(
+		s.persona,
+		NewUserProfileInjector(userCurrent, 2000),
+		NewSectionInjector("【项目偏好】", projCurrent, 2000),
+	)
 }
 
 // ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
@@ -1721,6 +1804,8 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 
 	// 召回旧话题摘要拼到目标前(切换话题后续接上下文);同一话题只注入一次。
 	goal := s.injectTopicRecall(ctx, session, session.Goal)
+	// 经验技能预筛（设计 §6.5）：goal 向量 top-3 命中只注一行提示，不注全文。
+	goal = s.injectSkillRecall(ctx, goal)
 
 	// 运行 ReAct 主循环，传入会话目标。
 	result, err := agent.Run(runCtx, goal)
@@ -1758,8 +1843,9 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 添加 Agent 完成事件。
 	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
 
-	// 用户画像自动提取（TODO #28）：会话完成扫对话提偏好增量写入画像，失败零副作用。
-	s.extractProfilePreferences(session)
+	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
+	//（用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
+	s.evolveSession(session, "success")
 
 	// 持久化历史与事件到 Postgres。
 	s.store.persistHistory(session)
@@ -1846,6 +1932,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 	// 召回旧话题摘要拼到本轮输入前(切换话题后续接上下文);同一话题只注入一次。
 	input = s.injectTopicRecall(ctx, session, input)
+	// 经验技能预筛（设计 §6.5）：续跑新输入同样做向量预筛提示。
+	input = s.injectSkillRecall(ctx, input)
 
 	// 调用带历史的 ReAct 运行接口。
 	result, err := agent.RunWithHistory(runCtx, input, history)
@@ -1881,8 +1969,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 添加完成事件并持久化。
 	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
 
-	// 用户画像自动提取（TODO #28）：会话完成扫对话提偏好增量写入画像，失败零副作用。
-	s.extractProfilePreferences(session)
+	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
+	//（用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
+	s.evolveSession(session, "success")
 
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
@@ -2113,6 +2202,12 @@ func (s *ReactService) setSessionError(session *reactInternalSession, msg string
 
 	// 添加错误事件。
 	s.store.addEvent(session, eventkind.Error, "System", msg, "", "", "", "", "", false)
+
+	// 会话进化（设计 §6.1 失败会话参与进化，踩坑经验价值更高）：
+	// 用户主动取消（context canceled）不进化。
+	if !strings.Contains(msg, "context canceled") {
+		s.evolveSession(session, "failed")
+	}
 
 	// 持久化历史与事件。
 	s.store.persistHistory(session)

@@ -65,6 +65,16 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.GET("/files/content", apiHandler.FileContentHandler)     // 文件内容读取
 	api.GET("/profile", apiHandler.ProfileHandler)               // 用户画像查看（TODO #28）
 	api.PUT("/profile", apiHandler.SaveProfileHandler)           // 用户画像编辑
+	api.GET("/project/preferences", apiHandler.ProjectPreferencesHandler)         // 项目偏好查看（2026-09-02 设计 §5）
+	api.PUT("/project/preferences", apiHandler.SaveProjectPreferencesHandler)     // 项目偏好编辑
+
+	// 自进化技能库 + 进化日志（2026-09-02 设计 §8）。
+	api.GET("/skills/learned", apiHandler.ListLearnedSkillsHandler)                // 技能库列表（含禁用）
+	api.GET("/skills/learned/:name", apiHandler.GetLearnedSkillHandler)            // 技能详情 + 文件全文
+	api.PUT("/skills/learned/:name", apiHandler.SaveLearnedSkillHandler)           // 手动编辑（重写文件+向量）
+	api.POST("/skills/learned/:name/enable", apiHandler.EnableLearnedSkillHandler)   // 启用
+	api.POST("/skills/learned/:name/disable", apiHandler.DisableLearnedSkillHandler) // 禁用
+	api.GET("/evolution/log", apiHandler.EvolutionLogHandler)                      // 进化审计流水
 
 	// 插件管理 API（设计文档 §5）。
 	api.GET("/plugins", apiHandler.ListPluginsHandler)                // 插件列表
@@ -87,5 +97,8 @@ func apiHandlerOf(app *App) *server.APIHandler {
 	h.SetStores(app.Postgres, app.Redis) // 持久化与缓存存储
 	h.SetRoleConfig(app.RoleConfig)      // 角色配置
 	h.SetModelFactory(app.ModelFactory)  // 模型工厂
+	if app.Postgres != nil {
+		h.SetLearnedSkills(app.Postgres.LearnedSkills) // 自进化技能库存储
+	}
 	return h
 }

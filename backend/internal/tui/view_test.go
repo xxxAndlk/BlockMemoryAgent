@@ -159,6 +159,14 @@ func (stubAgent) Profile(ctx context.Context) (*userprofile.Profile, error) {
 // SaveProfile 覆盖画像，测试实现为空操作。
 func (stubAgent) SaveProfile(ctx context.Context, content string) error { return nil }
 
+// ProjectPreferences 返回项目偏好，测试实现返回空。
+func (stubAgent) ProjectPreferences(ctx context.Context) (*userprofile.Profile, error) {
+	return &userprofile.Profile{}, nil
+}
+
+// SaveProjectPreferences 覆盖项目偏好，测试实现为空操作。
+func (stubAgent) SaveProjectPreferences(ctx context.Context, content string) error { return nil }
+
 // CreateSession 是 stubAgent 的空实现。
 func (stubAgent) CreateSession(ctx context.Context, req agent.CreateRequest) (*agent.Session, error) {
 	return nil, nil

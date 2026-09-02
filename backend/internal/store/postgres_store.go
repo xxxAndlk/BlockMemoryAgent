@@ -30,6 +30,7 @@ type PostgresStore struct {
 	Topic                      *TopicStore         // 话题元数据与归档存储
 	AgentRegistry              *AgentRegistryStore // Agent 注册表与决策日志存储
 	Session                    *SessionStore       // 会话历史/事件存储
+	LearnedSkills              *LearnedSkillStore  // 自进化技能库 + 进化日志（migration 007）
 }
 
 // NewPostgresStore 创建 PostgreSQL 存储实例。
@@ -71,6 +72,7 @@ func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 	s.Topic = &TopicStore{db: db}
 	s.AgentRegistry = &AgentRegistryStore{db: db}
 	s.Session = &SessionStore{db: db}
+	s.LearnedSkills = &LearnedSkillStore{db: db, pg: s}
 	return s, nil
 }
 

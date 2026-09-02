@@ -44,6 +44,18 @@ const routes: Array<RouteRecordRaw> = [
         meta: { title: '会话历史', icon: 'Clock' }
       },
       {
+        path: 'profile',
+        name: 'Profile',
+        component: () => import('@/views/profile/index.vue'),
+        meta: { title: '用户画像', icon: 'UserFilled' }
+      },
+      {
+        path: 'project-prefs',
+        name: 'ProjectPrefs',
+        component: () => import('@/views/project-prefs/index.vue'),
+        meta: { title: '项目偏好', icon: 'Document' }
+      },
+      {
         path: 'skills',
         name: 'Skills',
         component: () => import('@/views/skills/index.vue'),

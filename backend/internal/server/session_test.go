@@ -134,6 +134,16 @@ func (m *mockAgentForServer) Profile(ctx context.Context) (*userprofile.Profile,
 // SaveProfile 覆盖画像，测试实现为空操作。
 func (m *mockAgentForServer) SaveProfile(ctx context.Context, content string) error { return nil }
 
+// ProjectPreferences 返回项目偏好，测试实现返回空。
+func (m *mockAgentForServer) ProjectPreferences(ctx context.Context) (*userprofile.Profile, error) {
+	return &userprofile.Profile{}, nil
+}
+
+// SaveProjectPreferences 覆盖项目偏好，测试实现为空操作。
+func (m *mockAgentForServer) SaveProjectPreferences(ctx context.Context, content string) error {
+	return nil
+}
+
 // Shutdown 关闭 Agent，测试实现为空操作。
 func (m *mockAgentForServer) Shutdown(ctx context.Context) error { return nil }
 

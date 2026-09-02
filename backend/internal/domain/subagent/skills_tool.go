@@ -129,7 +129,9 @@ func (t *loadSkillTool) Execute(ctx context.Context, args map[string]any) *tool.
 		return &tool.Result{Tool: "load_skill", Error: fmt.Sprintf("技能 %q 不存在", name), Category: tool.ResultCategoryValidationRejected}
 	}
 	// 越权取用校验：非 meta 只能加载自己持有的技能（meta 持全池）。
-	if roleIDFromAgentID(agentID) != "meta" {
+	// 例外（2026-09-02 设计 §6.5）：learned 技能（自进化经验库）全局可加载——
+	// 派发前缀只注入一行提示，取全文必须走 load_skill，持有集不登记经验技能。
+	if roleIDFromAgentID(agentID) != "meta" && s.Source != "learned" {
 		held := map[string]bool{}
 		if v, ok := d.heldSkills.Load(agentID); ok {
 			for _, n := range v.([]string) {
@@ -173,6 +175,13 @@ func (t *loadSkillTool) Execute(ctx context.Context, args map[string]any) *tool.
 			}
 		} else {
 			log.Printf("[subagent] load_skill resource listing failed: path=%s err=%v", s.Path, err)
+		}
+	}
+	// learned 技能 use_count++（设计 §6.5：被 load 后计数，用于排序与审计）。
+	// 回调未注入或计数失败零影响（只记日志）。
+	if s.Source == "learned" && d.skillUseCounter != nil {
+		if err := d.skillUseCounter(s.SkillID); err != nil {
+			log.Printf("[subagent] load_skill use_count++ failed: skill=%s err=%v", s.SkillID, err)
 		}
 	}
 	return &tool.Result{Tool: "load_skill", Success: true, Output: out}

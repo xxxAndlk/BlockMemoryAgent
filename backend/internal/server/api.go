@@ -54,6 +54,7 @@ type APIHandler struct {
 	modelFactory *model.ModelFactory       // 模型工厂
 	statsService *StatsService             // 会话统计聚合服务
 	pluginMgr    *plugins.Manager          // 插件管理器（热插拔插件管理 API）
+	learnedSkills *store.LearnedSkillStore // 自进化技能库存储（2026-09-02 设计 §8）
 }
 
 // NewAPIHandler 创建 API 处理器。
@@ -524,6 +525,45 @@ func (h *APIHandler) SaveProfileHandler(c *gin.Context) {
 		return
 	}
 	if err := h.sessionMgr.agent.SaveProfile(c.Request.Context(), req.Content); err != nil {
+		c.String(http.StatusInternalServerError, "%s", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"ok": true})
+}
+
+// ProjectPreferencesHandler 处理 GET /api/project/preferences — 返回当前 workDir 项目偏好全文
+//（2026-09-02 设计 §5：.bma/project_preferences.md）。
+func (h *APIHandler) ProjectPreferencesHandler(c *gin.Context) {
+	if h.sessionMgr == nil {
+		c.JSON(http.StatusOK, map[string]any{"content": ""})
+		return
+	}
+	p, err := h.sessionMgr.agent.ProjectPreferences(c.Request.Context())
+	if err != nil {
+		c.String(http.StatusInternalServerError, "%s", err.Error())
+		return
+	}
+	content := ""
+	if p != nil {
+		content = p.Content
+	}
+	c.JSON(http.StatusOK, map[string]any{"path": p.Path, "content": content})
+}
+
+// SaveProjectPreferencesHandler 处理 PUT /api/project/preferences — 全量覆盖项目偏好。
+func (h *APIHandler) SaveProjectPreferencesHandler(c *gin.Context) {
+	if h.sessionMgr == nil {
+		c.String(http.StatusInternalServerError, "session manager not wired")
+		return
+	}
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.String(http.StatusBadRequest, "%s", err.Error())
+		return
+	}
+	if err := h.sessionMgr.agent.SaveProjectPreferences(c.Request.Context(), req.Content); err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
