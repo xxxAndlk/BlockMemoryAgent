@@ -463,12 +463,16 @@ func (s *ReactService) SetTreeStore(ts orchestrator.TreeStore) {
 // SetSharedMemoryStore 注入共享记忆 KV,用于话题切换时写入旧话题摘要。
 // bootstrap 在创建 sharedKV 后调用。传 nil 关闭摘要写入(测试场景)。
 // 若 store 实现 Clear(ctx) error（FileSharedMemoryStore），同时桥接清理闭包到 session store，
-// 使新 session 启动时清 .bma/shared 旧 session 残留（spec/file_tree 不跨 session 复用）。
+// 使新 session 启动时清其有效工作目录 <dir>/.bma/shared 旧 session 残留（spec/file_tree 不跨 session 复用）。
 func (s *ReactService) SetSharedMemoryStore(store tool.SharedMemoryStore) {
 	s.sharedMemoryStore = store
-	if clearer, ok := store.(interface{ Clear(context.Context) error }); ok {
-		s.store.setSharedMemoryReset(func() {
-			if err := clearer.Clear(context.Background()); err != nil {
+	if _, ok := store.(interface{ Clear(context.Context) error }); ok {
+		s.store.setSharedMemoryReset(func(dir string) {
+			if dir == "" {
+				return
+			}
+			// 按会话有效工作目录拼 <dir>/.bma/shared 清理（默认实现内部拼路径）。
+			if err := tool.NewFileSharedMemoryStore(dir).Clear(context.Background()); err != nil {
 				s.store.logError(context.Background(), "clear shared memory on session start", err)
 			}
 		})
@@ -750,8 +754,8 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 	if len(videoNotes) > 0 {
 		goal = goal + "\n" + strings.Join(videoNotes, "\n")
 	}
-	// 在内存中创建会话对象。
-	sess := s.store.createSession(goal)
+	// 在内存中创建会话对象（携带每会话工作目录，空=进程默认）。
+	sess := s.store.createSession(goal, req.WorkDir)
 	// 首条消息携带的用户图片（Alt+V 粘贴）：runSession 注入 runCtx 后一次性消费。
 	sess.firstTurnImages = append(req.Images, frames...)
 	s.maybeWatchWallClock(sess)
@@ -1453,8 +1457,8 @@ func (s *ReactService) SummarizeTaskTitle(ctx context.Context, title string) str
 
 // LaunchSession 实现 dag.SessionLauncher 接口。
 func (s *ReactService) LaunchSession(goal string) string {
-	// 创建会话并异步启动 ReAct 循环。
-	sess := s.store.createSession(goal)
+	// 创建会话并异步启动 ReAct 循环（dag 启动器无每会话工作目录，回落进程默认）。
+	sess := s.store.createSession(goal, "")
 	s.maybeWatchWallClock(sess)
 	go s.runSession(sess)
 	return sess.ID
@@ -1795,6 +1799,8 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 
 	// 将会话 ID 注入工具上下文，便于工具内部识别当前会话。
 	runCtx := tool.WithSessionID(ctx, session.ID)
+	// 注入每会话工作目录（空则原样返回，回落 Executor 默认目录）。
+	runCtx = tool.WithWorkDir(runCtx, session.workDir)
 
 	// 首条消息用户图片（Alt+V 粘贴）注入 runCtx 后一次性消费置 nil。
 	if len(session.firstTurnImages) > 0 {
@@ -1907,6 +1913,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 	// 注入会话 ID 到工具上下文。
 	runCtx := tool.WithSessionID(ctx, session.ID)
+	// 注入每会话工作目录（空则原样返回，回落 Executor 默认目录）。
+	runCtx = tool.WithWorkDir(runCtx, session.workDir)
 
 	// 使用最新用户消息作为本轮输入，并以之前的历史作为种子。
 	// 倒序取最后一条 user 消息（中途可能追加了澄清/审批答复等非 user 项），
@@ -2387,7 +2395,7 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 //   - 出错：回退 pauseSession(PauseOnChild)，不丢已持久化上下文（防跑飞）。
 func (s *ReactService) resumePausedDomain(session *reactInternalSession, pausedNodeID string) {
 	ctx := sessionContext(session)
-	res, err := s.resumeDispatcher.ResumePaused(tool.WithSessionID(ctx, session.ID), pausedNodeID)
+	res, err := s.resumeDispatcher.ResumePaused(tool.WithWorkDir(tool.WithSessionID(ctx, session.ID), session.workDir), pausedNodeID)
 	if err != nil {
 		s.store.addEvent(session, eventkind.Error, "System", fmt.Sprintf("恢复暂停领域 Agent 失败，已回退暂停态: %v", err), "", "", "", "", "", false)
 		s.pauseSession(session, session.History, PauseOnChild)
@@ -2783,6 +2791,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		Events:         events,
 		Messages:       messages,
 		TempDir:        s.TempDir,
+		WorkDir:        s.workDir,
 		StreamingText:  s.StreamingText,
 		ThinkingText:   s.ThinkingText,
 		ActiveBlocks:   []ActiveBlock{},

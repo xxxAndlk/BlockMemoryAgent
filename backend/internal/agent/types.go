@@ -125,7 +125,9 @@ func ParseWireVideos(vs []WireVideo, maxBytes int64) ([]WireVideo, error) {
 // Goal 是会话的目标或任务描述，Meta 用于携带额外的元数据。
 type CreateRequest struct {
 	Goal string // Goal 本次会话的目标/任务描述
-	Meta map[string]any
+	// WorkDir 每会话工作目录(绝对路径),空=进程默认
+	WorkDir string
+	Meta    map[string]any
 	// Images 首条消息携带的图片（Alt+V 粘贴）：内存透传不持久化，仅首轮注入。
 	Images []tool.ResultImage
 	// Videos 首条消息携带的视频（Alt+V 粘贴视频文件）：CreateSession 内抽帧
@@ -263,6 +265,9 @@ type Session struct {
 	Events         []Event         // Events 会话生命周期中产生的事件列表
 	Messages       []Message       // Messages 会话中的聊天消息列表
 	TempDir        string          // TempDir 会话使用的临时目录路径
+	// WorkDir 每会话工作目录（绝对路径，空=进程默认）。json 名 `work_dir` 由
+	// Task 10 的 server DTO 接线决定，此处先行声明。
+	WorkDir        string          `json:"work_dir,omitempty"`
 	StreamingText  string          // StreamingText 当前正在流式生成的助手文本（仅运行中有值）
 	ThinkingText   string          // ThinkingText 当前思考阶段的过程文本（瞬时，仅运行中有值）
 	ActiveBlocks   []ActiveBlock   // ActiveBlocks 当前正在运行的会话块视图

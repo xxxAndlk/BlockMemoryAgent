@@ -17,7 +17,7 @@ import (
 // Paused 阻塞 / Failed 红（任务 113/89 语义服务端同步）。
 func TestQueryBoard_TreeSynthesis_StatusMapping(t *testing.T) {
 	svc := newReactServiceForTest(nil, "")
-	sess := svc.store.createSession("goal-x")
+	sess := svc.store.createSession("goal-x", "")
 	tree := svc.TreeFor(sess.ID)
 
 	now := time.Now()
@@ -55,7 +55,7 @@ func TestQueryBoard_TreeSynthesis_StatusMapping(t *testing.T) {
 // TestQueryBoard_AuthoritativePlanWins 验证 write_plan 权威看板优先于树合成。
 func TestQueryBoard_AuthoritativePlanWins(t *testing.T) {
 	svc := newReactServiceForTest(nil, "")
-	sess := svc.store.createSession("goal-y")
+	sess := svc.store.createSession("goal-y", "")
 	svc.SetBoard(func(sessionID string) *board.TaskBoard {
 		b := board.NewTaskBoard("topic-1", "计划目标")
 		_ = b.SetPlan("计划目标", []board.PlanTask{{ID: "t1", Title: "权威任务", Domain: "d1"}})
@@ -83,7 +83,7 @@ func TestQueryBoard_AuthoritativePlanWins(t *testing.T) {
 // 本轮节点保留（多轮会话不稀释看板）。
 func TestQueryBoard_FiltersPrevRoundTerminalNodes(t *testing.T) {
 	svc := newReactServiceForTest(nil, "")
-	sess := svc.store.createSession("goal-z")
+	sess := svc.store.createSession("goal-z", "")
 	// 注入一条用户消息作为本轮起点。
 	svc.store.getSession(sess.ID).Messages = []Message{{Role: string(enums.ChatRoleUser), Content: "第二轮", Timestamp: time.Now()}}
 	tree := svc.TreeFor(sess.ID)
@@ -119,7 +119,7 @@ func TestQueryBoard_FiltersPrevRoundTerminalNodes(t *testing.T) {
 // pgStore 缺席时调用数/token 归零、超时数从 error 事件关键词计数。
 func TestQueryMetrics_TimeoutEventCounting(t *testing.T) {
 	svc := newReactServiceForTest(nil, "")
-	sess := svc.store.createSession("goal-m")
+	sess := svc.store.createSession("goal-m", "")
 	svc.store.addEvent(sess, eventkind.Error, "meta", "run: llm generate: context DeadlineExceeded", eventkind.Error, "", "", "", "context deadline exceeded", false)
 
 	res, err := svc.Query(context.Background(), sess.ID, Query{Kind: QueryKindMetrics})
@@ -142,7 +142,7 @@ func TestQueryMetrics_TimeoutEventCounting(t *testing.T) {
 // mailbox 在无消息/无邮箱依赖时返回空列表而非 nil Data。
 func TestQueryWatchdogAndMailbox_EmptyCompat(t *testing.T) {
 	svc := newReactServiceForTest(nil, "")
-	sess := svc.store.createSession("goal-w")
+	sess := svc.store.createSession("goal-w", "")
 	ctx := context.Background()
 
 	res, err := svc.Query(ctx, sess.ID, Query{Kind: QueryKindWatchdog})

@@ -27,7 +27,7 @@ func agentIDFromDetail(detailJSON string) string {
 func newLiveEventTestSession(t *testing.T) (*ReactService, *reactInternalSession) {
 	t.Helper()
 	svc := newReactServiceForTest(nil, t.TempDir())
-	sess := svc.store.createSession("test")
+	sess := svc.store.createSession("test", "")
 	return svc, sess
 }
 

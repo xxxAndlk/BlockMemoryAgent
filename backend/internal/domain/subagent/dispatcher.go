@@ -2061,6 +2061,9 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	if sid := tool.SessionIDFromContext(ctx); sid != "" {
 		subAgentCtx = tool.WithSessionID(subAgentCtx, sid)
 	}
+	// 每会话工作目录（S2）：子 Agent ctx 由 Background 重建，父 ctx 的 value 不会自动
+	// 流入，须显式重注入（父未注入时 WorkDirFromContext 返回空，WithWorkDir 空值 no-op）。
+	subAgentCtx = tool.WithWorkDir(subAgentCtx, tool.WorkDirFromContext(ctx))
 	// 本轮用户图片（Alt+V 粘贴）带外穿透：子 Agent ctx 由 Background 重建，
 	// 父 ctx 的 value 不会自动流入，须显式重注入--子 Agent 首条 user 消息挂图，
 	// 其自身工具调用链（含再派发叶子）递归携带。
@@ -3369,6 +3372,9 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 
 	subCtx := context.Background()
 	subCtx = tool.WithSessionID(subCtx, sid)
+	// 每会话工作目录（S2）：subCtx 由 Background 重建，从入站 ctx（resumePausedDomain
+	// 已注入）显式重注入，保证 resume 的 domain Agent 工具执行落在会话工作目录。
+	subCtx = tool.WithWorkDir(subCtx, tool.WorkDirFromContext(ctx))
 	cancel := context.CancelFunc(func() {})
 	if d.timeout > 0 {
 		subCtx, cancel = context.WithTimeout(subCtx, d.timeout)

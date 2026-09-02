@@ -54,6 +54,9 @@ type reactInternalSession struct {
 	firstTurnImages []tool.ResultImage
 	// TempDir 是会话专用的临时工作目录路径。
 	TempDir string
+	// workDir 是每会话工作目录（绝对路径，空=进程默认 st.workDir）：S2 每会话工作目录，
+	// runSession/resumeSession 经 tool.WithWorkDir 注入 runCtx，工具执行按会话解析。
+	workDir string
 	// History 保存 React 对话历史，用于后续推理与恢复。
 	History []ReactMessage
 	// StreamingText 保存当前正在流式生成的助手文本（累积值，运行中才有意义），
@@ -130,9 +133,10 @@ type reactSessionStore struct {
 	// domainClassifier 是 LLM 领域分区器，供 EnsureProjectDoc 首生成 PROJECT.md 时按职责分区。
 	// nil（测试）走启发式依赖图兜底。由 bootstrap 经 ReactService.SetDomainClassifier 注入。
 	domainClassifier project.DomainClassifier
-	// sharedMemoryReset 在新 session 启动时调用，清理 .bma/shared 下旧 session 残留文件
-	//（spec/file_tree 不跨 session 复用）。由 bootstrap 经 ReactService.SetSharedMemoryStore 桥接注入。
-	sharedMemoryReset func()
+	// sharedMemoryReset 在新 session 启动时调用，清理有效工作目录 <dir>/.bma/shared 下
+	// 旧 session 残留文件（spec/file_tree 不跨 session 复用），入参为会话有效工作目录。
+	// 由 bootstrap 经 ReactService.SetSharedMemoryStore 桥接注入。
+	sharedMemoryReset func(dir string)
 }
 
 // newReactSessionStore 创建一个新的 reactSessionStore 实例。
@@ -184,8 +188,8 @@ func (st *reactSessionStore) setDomainClassifier(cls project.DomainClassifier) {
 	st.domainClassifier = cls
 }
 
-// setSharedMemoryReset 注入 session 启动时的 shared 清理闭包（清 .bma/shared 旧 session 残留）。
-func (st *reactSessionStore) setSharedMemoryReset(fn func()) {
+// setSharedMemoryReset 注入 session 启动时的 shared 清理闭包（清 <dir>/.bma/shared 旧 session 残留）。
+func (st *reactSessionStore) setSharedMemoryReset(fn func(dir string)) {
 	st.sharedMemoryReset = fn
 }
 
@@ -215,22 +219,30 @@ func (st *reactSessionStore) logError(ctx context.Context, msg string, err error
 
 // createSession 创建一个运行中的 React 会话。
 // goal: 用户输入的任务目标字符串。
+// workDir: 每会话工作目录（绝对路径），空串回落 st.workDir（进程默认）。
 // 返回: 已注册到内存中的新会话指针。
-func (st *reactSessionStore) createSession(goal string) *reactInternalSession {
+func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalSession {
 	// sessionID = "session-<bootEpoch>-<bootRand>-<seq>"：bootEpoch+bootRand 跨重启唯一；
 	// seq 进程内单调递增。旧实现 "session-N" 重启后回 1，block-memory 按 session_id
 	// 召回旧 session 数据污染新 session。
 	sessionID := fmt.Sprintf("session-%d-%s-%d", st.bootEpoch, st.bootRand, st.seq.Add(1))
 
+	// eff 是会话有效工作目录：每会话 workDir 优先，空则回落进程默认 st.workDir。
+	eff := workDir
+	if eff == "" {
+		eff = st.workDir
+	}
+
 	// session 初始化基础字段：设置 ID、目标、运行状态、开始时间、
-	// 空事件列表以及基于 workDir 构建的临时目录。
+	// 空事件列表以及基于有效工作目录构建的临时目录。
 	session := &reactInternalSession{
 		ID:        sessionID,
 		Goal:      goal,
 		Status:    enums.SessionStatusRunning,
 		StartedAt: time.Now(),
 		Events:    make([]internalEvent, 0),
-		TempDir:   filepath.Join(st.workDir, ".bma", "tmp", sessionID),
+		TempDir:   filepath.Join(eff, ".bma", "tmp", sessionID),
+		workDir:   workDir,
 		// Messages 初始化系统提示与用户目标，为后续 LLM 对话提供上下文。
 		Messages: []Message{
 			{Role: string(enums.ChatRoleSystem), Content: "Goal: " + goal, Timestamp: time.Now()},
@@ -248,15 +260,15 @@ func (st *reactSessionStore) createSession(goal string) *reactInternalSession {
 	st.sessions[sessionID] = session
 	st.mu.Unlock()
 
-	// 新 session 启动时清理 .bma/shared 下旧 session 残留文件（spec/file_tree 不跨 session 复用）。
+	// 新 session 启动时清理有效工作目录 .bma/shared 下旧 session 残留文件（spec/file_tree 不跨 session 复用）。
 	// 失败静默：仅影响共享记忆初态，旧文件留存由 Layer 3 mtime 校验兜底，不阻断会话。
 	if st.sharedMemoryReset != nil {
-		st.sharedMemoryReset()
+		st.sharedMemoryReset(eff)
 	}
 
-	// 首个 session 启动时确保 workDir 下存在 .bma/PROJECT.md（缺失则按职责分区生成）。
+	// 首个 session 启动时确保有效工作目录下存在 .bma/PROJECT.md（缺失则按职责分区生成）。
 	// 失败仅记录日志，不阻断会话：PROJECT.md 是辅助上下文，缺失时系统提示词略去项目概览段。
-	if err := project.EnsureProjectDoc(context.Background(), st.workDir, st.domainClassifier); err != nil {
+	if err := project.EnsureProjectDoc(context.Background(), eff, st.domainClassifier); err != nil {
 		st.logError(context.Background(), "ensure project doc", err)
 	}
 

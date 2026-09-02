@@ -93,6 +93,9 @@ type domainSlot struct {
 	mu             sync.Mutex
 	id             string
 	sessionID      string
+	// workDir 会话级工作目录（S2）：槽创建时从派发 ctx 捕获，会话内固定；
+	// 每任务 ctx 经 tool.WithWorkDir 重注入，空=进程默认。
+	workDir        string
 	parentID       string
 	domain         string
 	responsibility string
@@ -582,6 +585,8 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 	if s.sessionID != "" {
 		ctx = tool.WithSessionID(ctx, s.sessionID)
 	}
+	// 每会话工作目录（S2）：ctx 由 Background 重建，从槽位捕获值显式重注入（空 no-op）。
+	ctx = tool.WithWorkDir(ctx, s.workDir)
 	if len(images) > 0 {
 		ctx = agent.WithUserImages(ctx, images)
 	}
@@ -1170,6 +1175,7 @@ func (d *Dispatcher) dispatchHotDomain(ctx context.Context, parentID, subAgentID
 	s := &domainSlot{
 		id:             subAgentID,
 		sessionID:      sid,
+		workDir:        tool.WorkDirFromContext(ctx),
 		parentID:       parentID,
 		domain:         strings.TrimSpace(domain),
 		responsibility: responsibility,
