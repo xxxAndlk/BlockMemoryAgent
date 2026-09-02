@@ -1,4 +1,4 @@
-.PHONY: backend-test test-test test-compile web-build lint up down migrate run bma-plugin plugins-up plugins-down plugins-build help
+.PHONY: backend-test test-test test-compile web-build lint up down migrate run bma-plugin plugins-up plugins-down plugins-build dist help
 
 ## Run all backend Go tests (unit + package tests).
 backend-test:
@@ -63,6 +63,16 @@ plugins-build:
 	docker build -t bma/ui-preview-mcp:local docker/ui-preview-mcp
 	docker pull ghcr.io/nexu-io/od:latest
 
+## Build dist/ install layout: dist/{bin,config,web/dist,plugins.d}. Then run install.ps1 to install.
+dist: web-build
+	cd backend && GOTOOLCHAIN=local go build -o ../dist/bin/bma-server.exe . && GOTOOLCHAIN=local go build -o ../dist/bin/tui.exe ./cmd/tui
+	mkdir -p dist/config
+	cp config/*.yaml config/soul.md config/user_profile.md dist/config/
+	rm -rf dist/web && mkdir -p dist/web
+	cp -r web/dist dist/web/dist
+	mkdir -p dist/plugins.d
+	@echo "dist/ 布局完成,运行 install.ps1 安装"
+
 ## Show available targets.
 help:
 	@echo "Available targets:"
@@ -79,4 +89,5 @@ help:
 	@echo "  plugins-up    - start self-hosted Firecrawl stack (web_search data plane)"
 	@echo "  plugins-down  - stop self-hosted Firecrawl stack"
 	@echo "  plugins-build - build/pull plugin images (web_search / computer_use / open_design / ui_design / ui_preview)"
+	@echo "  dist          - build dist/ install layout (bin/config/web/dist/plugins.d)"
 	@echo "  note: TUI 视频附件默认 native 直传（mp4/avi/mov ≤ native_max_mb 无需 ffmpeg）；webm/mkv/超限回落抽帧需宿主机 ffmpeg（winget install Gyan.FFmpeg），缺失时降级为仅元数据"
