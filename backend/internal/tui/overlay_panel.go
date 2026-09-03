@@ -1,9 +1,15 @@
 package tui
 
 import (
+	"context"
+	"fmt"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // OverlayPanel 维护弹窗/浮层的状态，包括当前模式、标题、内容行、光标位置与类型。
@@ -211,6 +217,137 @@ func (m *Model) handleOverlayEnter() {
 	case overlayAgents:
 		m.showAgentDetailByIndex(m.overlayPanel.cursor)
 	}
+}
+
+// modelSwitchDoneMsg 模型切换异步完成消息（SwitchModel 含 60s 级连通性探测，
+// 必须 tea.Cmd 异步执行，禁止阻塞 Update）。
+type modelSwitchDoneMsg struct {
+	role   string
+	preset string
+	cfg    types.AgentModelConfig
+	err    error
+}
+
+// toggleModelPopup 切换模型弹窗（两段式）：stage 0 选角色 → stage 1 选预设。
+// 依赖后端 agent.ModelManager 能力（ReactService 实现）；不可用时提示。
+func (m *Model) toggleModelPopup() {
+	// 已打开则关闭。
+	if m.overlayPanel.mode == overlayModel {
+		m.overlayPanel.close()
+		return
+	}
+	mgr, ok := m.agent.(agent.ModelManager)
+	if !ok {
+		m.flashMsg("model switching not available")
+		return
+	}
+	catalog, err := mgr.ListModels(context.Background())
+	if err != nil || catalog == nil || len(catalog.Roles) == 0 {
+		m.flashMsg("model catalog unavailable")
+		return
+	}
+	m.modelRoles = catalog.Roles
+	m.modelPresets = catalog.Presets
+	m.modelStage = 0
+	m.overlayPanel.mode = overlayModel
+	m.overlayPanel.kind = overlayModel
+	m.overlayPanel.title = "Switch Model · Select Role"
+	m.overlayPanel.lines = m.buildModelRoleLines()
+	m.overlayPanel.cursor = clamp(m.overlayPanel.cursor, 0, len(m.overlayPanel.lines)-1)
+}
+
+// buildModelRoleLines 弹窗 stage 0 内容：可切换角色 + 当前模型（含覆写标记）。
+func (m *Model) buildModelRoleLines() []string {
+	lines := make([]string, 0, len(m.modelRoles))
+	for _, r := range m.modelRoles {
+		line := fmt.Sprintf("%-16s %s/%s", r.RoleID, r.Provider, r.Model)
+		if r.Overridden {
+			line += fmt.Sprintf("  [override: %s]", r.PresetID)
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// buildModelPresetLines 弹窗 stage 1 内容：可选预设清单。
+func (m *Model) buildModelPresetLines() []string {
+	lines := make([]string, 0, len(m.modelPresets)+1)
+	lines = append(lines, fmt.Sprintf("target role: %s  (enter=pick preset, esc=back)", m.modelSelRole))
+	for _, p := range m.modelPresets {
+		name := p.Name
+		if name == "" {
+			name = p.ID
+		}
+		extra := ""
+		if p.BaseURL != "" {
+			extra = "  " + p.BaseURL
+		}
+		lines = append(lines, fmt.Sprintf("%-16s %-24s %s/%s%s", p.ID, name, p.Provider, p.Model, extra))
+	}
+	return lines
+}
+
+// handleModelEnter 模型弹窗 Enter：stage 0 记录所选角色进 preset 列表；
+// stage 1 发起异步切换（探测最长 60s，期间 Enter 忽略）。
+func (m *Model) handleModelEnter() tea.Cmd {
+	switch m.modelStage {
+	case 0:
+		if m.overlayPanel.cursor < 0 || m.overlayPanel.cursor >= len(m.modelRoles) {
+			return nil
+		}
+		m.modelSelRole = m.modelRoles[m.overlayPanel.cursor].RoleID
+		m.modelStage = 1
+		m.overlayPanel.title = "Switch Model · Select Preset"
+		m.overlayPanel.lines = m.buildModelPresetLines()
+		m.overlayPanel.cursor = 0
+		return nil
+	case 1:
+		if m.modelSwitching {
+			m.flashMsg("switching in progress…")
+			return nil
+		}
+		// 减去首行提示行得到预设下标。
+		idx := m.overlayPanel.cursor - 1
+		if idx < 0 || idx >= len(m.modelPresets) {
+			return nil
+		}
+		preset := m.modelPresets[idx]
+		m.modelSwitching = true
+		m.flashMsg(fmt.Sprintf("probing %s… (up to 60s)", preset.ID))
+		mgr, ok := m.agent.(agent.ModelManager)
+		if !ok {
+			m.modelSwitching = false
+			return nil
+		}
+		role, presetID := m.modelSelRole, preset.ID
+		return func() tea.Msg {
+			cfg, err := mgr.SwitchModel(context.Background(), role, presetID)
+			return modelSwitchDoneMsg{role: role, preset: presetID, cfg: cfg, err: err}
+		}
+	}
+	return nil
+}
+
+// applyModelSwitchDone 处理切换结果：成功更新顶栏模型名并刷新角色列表；
+// 失败 flash 错误（fail-closed，后端状态未变）。弹窗保持打开便于连续切换。
+func (m *Model) applyModelSwitchDone(msg modelSwitchDoneMsg) {
+	m.modelSwitching = false
+	if msg.err != nil {
+		m.flashMsg("switch failed: " + msg.err.Error())
+		return
+	}
+	if msg.role == "meta" {
+		m.modelName = msg.cfg.Model // 顶栏展示的是 meta 模型
+	}
+	if mgr, ok := m.agent.(agent.ModelManager); ok {
+		if catalog, err := mgr.ListModels(context.Background()); err == nil && catalog != nil {
+			m.modelRoles = catalog.Roles
+		}
+	}
+	if m.modelStage == 0 {
+		m.overlayPanel.lines = m.buildModelRoleLines()
+	}
+	m.flashMsg(fmt.Sprintf("switched %s → %s (%s)", msg.role, msg.cfg.Model, msg.preset))
 }
 
 // refreshOverlay 根据最新状态刷新当前弹窗的内容行，实现实时更新。

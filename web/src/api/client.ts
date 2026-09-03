@@ -11,9 +11,12 @@ export class APIError extends Error {
   }
 }
 
-export async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
+export async function fetchJson<T>(
+  url: string,
+  options?: RequestInit & { timeoutMs?: number },
+): Promise<T> {
   const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), APP_CONFIG.apiTimeout)
+  const timeoutId = setTimeout(() => controller.abort(), options?.timeoutMs ?? APP_CONFIG.apiTimeout)
 
   try {
     const res = await fetch(`${APP_CONFIG.apiBase}${url}`, {

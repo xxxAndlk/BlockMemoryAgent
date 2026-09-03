@@ -462,6 +462,10 @@ func (m *Model) submitInput(cmd string) {
 	case "/help":
 		m.openHelpPopup()
 		return
+	case "/model", "/models":
+		// 打开模型切换弹窗（两段式：选角色 → 选预设，含连通性探测）。
+		m.toggleModelPopup()
+		return
 	case "/agents":
 		// 选中会话时打开 agent 拓扑面板；无会话则提示
 		if m.selectedSession() == nil {

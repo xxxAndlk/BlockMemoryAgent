@@ -17,6 +17,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // Model 是 BlockMemoryAgent TUI 的顶层 bubbletea 模型，持有全部状态与依赖。
@@ -122,6 +123,15 @@ type Model struct {
 
 	// log 是结构化日志器，由 SetLogger 注入；nil 时回退标准库 log。
 	log *logger.Logger
+
+	// 模型切换弹窗状态（overlayModel 两段式）：
+	// modelStage 0=选角色 1=选预设；modelSelRole 是 stage1 的目标角色；
+	// modelSwitching 标记异步切换进行中（探测最长 60s，期间忽略 Enter）。
+	modelStage     int
+	modelSelRole   string
+	modelSwitching bool
+	modelRoles     []agent.RoleModelStatus
+	modelPresets   []types.ModelPreset
 }
 
 // sharedState 是跨 bubbletea 值拷贝共享的可变状态（#47 修复）。
@@ -587,6 +597,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 
+	case modelSwitchDoneMsg:
+		m.applyModelSwitchDone(msg)
+		m.dirty = true
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -778,6 +792,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m.ctrlCQuit()
 		case "esc", "q":
+			// 模型弹窗两段式：stage 1 的 Esc 退回角色列表，stage 0 才关闭。
+			if m.overlayPanel.mode == overlayModel && m.modelStage == 1 {
+				m.modelStage = 0
+				m.overlayPanel.title = "Switch Model · Select Role"
+				m.overlayPanel.lines = m.buildModelRoleLines()
+				m.clampOverlayCursor()
+				return m, nil
+			}
 			m.overlayPanel.mode = overlayNone
 			return m, nil
 		case "j", "down":
@@ -791,6 +813,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "G":
 			m.overlayPanel.cursor = len(m.overlayPanel.lines) - 1
 		case "enter":
+			// 模型弹窗 Enter 可能发起异步切换（返回 tea.Cmd）。
+			if m.overlayPanel.mode == overlayModel {
+				return m, m.handleModelEnter()
+			}
 			m.handleOverlayEnter()
 		case "2":
 			m.togglePlanPopup()
@@ -829,7 +855,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "g":
 		m.flashMsg("Git Diff: not implemented in TUI")
 	case "s":
-		m.flashMsg("Settings: not implemented in TUI")
+		m.toggleModelPopup()
 	case "K":
 		m.focus = panelInput
 		m.inputBar.mode = inputNormal

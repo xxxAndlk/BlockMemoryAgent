@@ -30,6 +30,9 @@ type RoleConfigFile struct {
 	FixedRoles []types.RoleDefinition `yaml:"fixed_roles"`
 	// DynamicTemplates 动态角色生成模板，由 LLM 在运行时按需实例化为临时助手。
 	DynamicTemplates []DynamicRoleTemplate `yaml:"dynamic_templates"`
+	// ModelPresets 可切换模型预设清单，供运行时动态切换角色模型（TUI /model、
+	// Web settings 页）选择；切换结果持久化到 model_overrides.yaml（role → preset_id）。
+	ModelPresets []types.ModelPreset `yaml:"model_presets"`
 }
 
 // MetaAgentConfig MetaAgent 专属配置。
@@ -50,7 +53,7 @@ type MetaAgentConfig struct {
 // 设计意图: 所有 Domain/SubDomain 共享同一份模型配置，简化部署与调参。
 type DomainAgentConfig struct {
 	ModelConfig  types.AgentModelConfig `yaml:"model_config"`  // 共享模型配置
-	SystemPrompt string                `yaml:"system_prompt"` // DomainAgent 系统提示词（含 skim/WriteSharedMemory/拆分纪律）
+	SystemPrompt string                 `yaml:"system_prompt"` // DomainAgent 系统提示词（含 skim/WriteSharedMemory/拆分纪律）
 }
 
 // DynamicRoleTemplate 动态角色模板。
@@ -146,6 +149,26 @@ func (c *RoleConfigFile) resolveEnvVars() {
 		c.DynamicTemplates[i].ModelConfig.APIKey = resolveEnv(c.DynamicTemplates[i].ModelConfig.APIKey)
 		c.DynamicTemplates[i].ModelConfig.BaseURL = resolveEnv(c.DynamicTemplates[i].ModelConfig.BaseURL)
 	}
+	// 模型预设: 密钥与 BaseURL（运行时动态切换角色模型的候选清单）。
+	for i := range c.ModelPresets {
+		c.ModelPresets[i].APIKey = resolveEnv(c.ModelPresets[i].APIKey)
+		c.ModelPresets[i].BaseURL = resolveEnv(c.ModelPresets[i].BaseURL)
+	}
+}
+
+// GetModelPreset 按 ID 查找模型预设。
+//
+// 参数:
+//   - presetID: 预设 ID。
+//
+// 返回: 命中返回预设值（值拷贝），未命中返回 false。
+func (c *RoleConfigFile) GetModelPreset(presetID string) (types.ModelPreset, bool) {
+	for i := range c.ModelPresets {
+		if c.ModelPresets[i].ID == presetID {
+			return c.ModelPresets[i], true
+		}
+	}
+	return types.ModelPreset{}, false
 }
 
 // GetFixedRole 按 ID 查找固定角色定义。

@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"github.com/gin-gonic/gin" // Gin Web 框架
 
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/server"
 )
 
@@ -56,26 +57,26 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	app.DAGHandler.RegisterRoutes(api)
 
 	// 其他业务端点。
-	api.POST("/snapshot", apiHandler.SnapshotHandler)            // 快照管理
-	api.POST("/memory/search", apiHandler.MemorySearchHandler)   // 记忆检索
-	api.GET("/memory/levels", apiHandler.MemoryLevelsHandler)    // 记忆层级
-	api.GET("/memory/eval", apiHandler.MemoryEvalHandler)        // 记忆评估
-	api.GET("/skills", apiHandler.SkillsHandler)                 // Skill 列表
-	api.GET("/files", apiHandler.FilesHandler)                   // 文件列表
-	api.GET("/files/content", apiHandler.FileContentHandler)     // 文件内容读取
-	api.GET("/fs/browse", apiHandler.BrowseFSHandler)            // 目录浏览（前端工作目录选择器）
-	api.GET("/profile", apiHandler.ProfileHandler)               // 用户画像查看（TODO #28）
-	api.PUT("/profile", apiHandler.SaveProfileHandler)           // 用户画像编辑
-	api.GET("/project/preferences", apiHandler.ProjectPreferencesHandler)         // 项目偏好查看（2026-09-02 设计 §5）
-	api.PUT("/project/preferences", apiHandler.SaveProjectPreferencesHandler)     // 项目偏好编辑
+	api.POST("/snapshot", apiHandler.SnapshotHandler)                         // 快照管理
+	api.POST("/memory/search", apiHandler.MemorySearchHandler)                // 记忆检索
+	api.GET("/memory/levels", apiHandler.MemoryLevelsHandler)                 // 记忆层级
+	api.GET("/memory/eval", apiHandler.MemoryEvalHandler)                     // 记忆评估
+	api.GET("/skills", apiHandler.SkillsHandler)                              // Skill 列表
+	api.GET("/files", apiHandler.FilesHandler)                                // 文件列表
+	api.GET("/files/content", apiHandler.FileContentHandler)                  // 文件内容读取
+	api.GET("/fs/browse", apiHandler.BrowseFSHandler)                         // 目录浏览（前端工作目录选择器）
+	api.GET("/profile", apiHandler.ProfileHandler)                            // 用户画像查看（TODO #28）
+	api.PUT("/profile", apiHandler.SaveProfileHandler)                        // 用户画像编辑
+	api.GET("/project/preferences", apiHandler.ProjectPreferencesHandler)     // 项目偏好查看（2026-09-02 设计 §5）
+	api.PUT("/project/preferences", apiHandler.SaveProjectPreferencesHandler) // 项目偏好编辑
 
 	// 自进化技能库 + 进化日志（2026-09-02 设计 §8）。
-	api.GET("/skills/learned", apiHandler.ListLearnedSkillsHandler)                // 技能库列表（含禁用）
-	api.GET("/skills/learned/:name", apiHandler.GetLearnedSkillHandler)            // 技能详情 + 文件全文
-	api.PUT("/skills/learned/:name", apiHandler.SaveLearnedSkillHandler)           // 手动编辑（重写文件+向量）
+	api.GET("/skills/learned", apiHandler.ListLearnedSkillsHandler)                  // 技能库列表（含禁用）
+	api.GET("/skills/learned/:name", apiHandler.GetLearnedSkillHandler)              // 技能详情 + 文件全文
+	api.PUT("/skills/learned/:name", apiHandler.SaveLearnedSkillHandler)             // 手动编辑（重写文件+向量）
 	api.POST("/skills/learned/:name/enable", apiHandler.EnableLearnedSkillHandler)   // 启用
 	api.POST("/skills/learned/:name/disable", apiHandler.DisableLearnedSkillHandler) // 禁用
-	api.GET("/evolution/log", apiHandler.EvolutionLogHandler)                      // 进化审计流水
+	api.GET("/evolution/log", apiHandler.EvolutionLogHandler)                        // 进化审计流水
 
 	// 插件管理 API（设计文档 §5）。
 	api.GET("/plugins", apiHandler.ListPluginsHandler)                // 插件列表
@@ -83,6 +84,10 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/plugins/:id/enable", apiHandler.EnablePluginHandler)   // 热启用
 	api.POST("/plugins/:id/disable", apiHandler.DisablePluginHandler) // 热停用
 	api.POST("/plugins/reload", apiHandler.ReloadPluginsHandler)      // 重读配置 + 重扫 plugins.d/
+
+	// 模型动态切换 API（TUI 走进程内直调，不经此端点）。
+	api.GET("/models", apiHandler.ListModelsHandler)          // 模型目录：预设 + 各角色当前模型
+	api.POST("/models/switch", apiHandler.SwitchModelHandler) // 切换：{role, preset}（含连通性探测）
 
 	return router
 }
@@ -98,6 +103,9 @@ func apiHandlerOf(app *App) *server.APIHandler {
 	h.SetStores(app.Postgres, app.Redis) // 持久化与缓存存储
 	h.SetRoleConfig(app.RoleConfig)      // 角色配置
 	h.SetModelFactory(app.ModelFactory)  // 模型工厂
+	if mgr, ok := app.Agent.(agent.ModelManager); ok {
+		h.SetModelManager(mgr) // 模型动态切换（ReactService 实现；测试桩缺该能力时跳过）
+	}
 	if app.Postgres != nil {
 		h.SetLearnedSkills(app.Postgres.LearnedSkills) // 自进化技能库存储
 	}

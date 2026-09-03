@@ -5,16 +5,17 @@ package model
 // 同时暴露底层 blades.ModelProvider 供工具循环路径使用。
 
 import (
-	"context" // 上下文传递
-	"fmt"     // 错误格式化
-	"strings" // 失败角色列表拼接
-	"sync"    // 读写锁，保护 models 缓存
-	"time"    // 探测超时
+	"context"     // 上下文传递
+	"fmt"         // 错误格式化
+	"strings"     // 失败角色列表拼接
+	"sync"        // 读写锁，保护 models 缓存
+	"sync/atomic" // 原子指针，保护 overrides 写时复制
+	"time"        // 探测超时
 
 	"github.com/blockmemory/agent/backend/internal/logger" // logger 提供 ctx 携带的会话级日志器（轻量调用写 session_logs）
 	"github.com/blockmemory/agent/backend/pkg/config"      // RoleConfigFile 角色配置
 	"github.com/blockmemory/agent/backend/pkg/types"       // AgentModelConfig 类型
-	"github.com/go-kratos/blades"                     // blades.ModelProvider 类型引用
+	"github.com/go-kratos/blades"                          // blades.ModelProvider 类型引用
 )
 
 // LLMClient 大模型客户端接口（与 graph 包兼容）。
@@ -64,13 +65,32 @@ func GenerateWithTemperature(ctx context.Context, c LLMClient, prompt string, te
 	return c.Generate(ctx, prompt)
 }
 
+// overrideEntry 单个角色的模型覆写：解析后的配置 + 来源预设 ID（展示用）。
+type overrideEntry struct {
+	cfg      types.AgentModelConfig
+	presetID string
+}
+
 // ModelFactory 模型工厂，按角色缓存模型实例。
 // 设计意图：避免重复构造 provider（连接池/鉴权开销），按角色复用。
 type ModelFactory struct {
 	mu             sync.RWMutex                      // 读写锁保护 models 并发访问
 	models         map[string]LLMClient              // key: roleDefID or "meta" or "domain"
-	cfg            *config.RoleConfigFile            // 角色配置，用于解析每个角色的 ModelConfig
+	cfg            *config.RoleConfigFile            // 角色配置，用于解析每个角色的 ModelConfig（只读，运行期不修改）
 	dynamicConfigs map[string]types.AgentModelConfig // 运行时动态角色的模型配置（P3-4）
+
+	// overrides 运行时模型覆写（roleID → entry），写时复制 + 原子指针：
+	// resolveConfig 在 GetModel 写锁内被调用，不能用 f.mu 保护（RWMutex 不可重入），
+	// 原子读天然免锁且零竞态；切换时整表拷贝后 Store。
+	overrides atomic.Pointer[map[string]overrideEntry]
+	// presets 可切换预设清单与 overrides 落盘路径（bootstrap 启动期一次性注入，此后只读）。
+	presets       []types.ModelPreset
+	overridesPath string
+	// switchMu 串行化 SwitchModel（TUI 与 server 双入口共享同进程工厂）。
+	switchMu sync.Mutex
+	// probeHook 切换前的连通性探测钩子；nil 用默认实现（MaxTokens=1 临时客户端
+	// + probeLLM，60s 超时）。测试注入 fake 以免真实网络调用。
+	probeHook func(ctx context.Context, cfg types.AgentModelConfig) error
 }
 
 // NewModelFactory 创建模型工厂。
@@ -238,8 +258,12 @@ func (f *ModelFactory) GetLightweightModel(ctx context.Context) (LLMClient, erro
 //   - types.AgentModelConfig: 该角色的模型配置
 //
 // 副作用：无。
-// 并发安全：只读 cfg，无锁。
+// 并发安全：只读 cfg 与 overrides（原子指针），无锁。
 func (f *ModelFactory) resolveConfig(roleDefID string) types.AgentModelConfig {
+	// 0. 运行时覆写优先（动态切换角色模型）：原子读，写时复制。
+	if e := f.overrideFor(roleDefID); e != nil {
+		return e.cfg
+	}
 	// 根据角色 ID 进入不同分支
 	switch roleDefID {
 	case "meta":
@@ -473,9 +497,192 @@ func (f *ModelFactory) logLightweightCall(ctx context.Context, prompt, resp stri
 // 2026-08-10 事故：roles.yaml 配 lightweight_model.model=deepseek-v4-flash，
 // 但运行时重试日志 provider=glm-5.2（=domain 模型）——生效配置与磁盘现值不一致
 // （配置晚于会话加载 / CWD 路径漂移），启动时打印解析结果可当场暴露此类漂移。
+// 覆写（override）存在时来源记为 "override"，自动跟随动态切换。
 func (f *ModelFactory) LightweightResolution() (cfg types.AgentModelConfig, source string) {
+	if e := f.overrideFor("lightweight"); e != nil {
+		return e.cfg, "override"
+	}
 	if f.cfg.LightweightModel.Model != "" {
 		return f.cfg.LightweightModel, "direct"
 	}
 	return f.cfg.DomainAgent.ModelConfig, "fallback-domain"
+}
+
+// overrideFor 原子读取指定角色的覆写条目；无覆写返回 nil。
+func (f *ModelFactory) overrideFor(roleDefID string) *overrideEntry {
+	if m := f.overrides.Load(); m != nil {
+		if e, ok := (*m)[roleDefID]; ok {
+			return &e
+		}
+	}
+	return nil
+}
+
+// SetModelPresets 注入可切换预设清单与 overrides 落盘路径。
+// 由 bootstrap 启动期调用一次，此后 presets/overridesPath 只读。
+func (f *ModelFactory) SetModelPresets(presets []types.ModelPreset, overridesPath string) {
+	f.presets = presets
+	f.overridesPath = overridesPath
+}
+
+// ApplyStartupOverrides 在启动期应用 model_overrides.yaml（role → preset_id）。
+// 预设已由 LoadRoleConfig 展开环境变量；引用了不存在/已删除预设的条目跳过，
+// 返回跳过的 roleID 列表由调用方记警告（fail-open 到已过连通性校验的原配置）。
+// 必须在 WarmUp/VerifyConnectivity 之前调用，使启动预热/探测针对覆写后的模型。
+func (f *ModelFactory) ApplyStartupOverrides(file *config.ModelOverridesFile) []string {
+	if file == nil || len(file.Overrides) == 0 {
+		return nil
+	}
+	m := make(map[string]overrideEntry, len(file.Overrides))
+	var skipped []string
+	for roleID, ov := range file.Overrides {
+		preset, ok := f.presetByID(ov.PresetID)
+		if !ok {
+			skipped = append(skipped, fmt.Sprintf("%s (preset %q 不存在)", roleID, ov.PresetID))
+			continue
+		}
+		m[roleID] = overrideEntry{cfg: preset.ToAgentModelConfig(), presetID: ov.PresetID}
+	}
+	if len(m) > 0 {
+		f.overrides.Store(&m)
+	}
+	return skipped
+}
+
+// SwitchableRoles 返回可动态切换模型的角色 ID 列表：
+// meta / domain / lightweight + 全部 fixed_roles[].id。动态角色不在范围内。
+func (f *ModelFactory) SwitchableRoles() []string {
+	roles := []string{"meta", "domain", "lightweight"}
+	for _, fr := range f.cfg.FixedRoles {
+		if fr.ID != "" {
+			roles = append(roles, fr.ID)
+		}
+	}
+	return roles
+}
+
+// CurrentModelInfo 返回角色当前生效的模型信息（含覆写来源预设）。
+// 供 StatusHandler 与模型目录展示；unknown roleID 按默认解析链返回（overridden=false）。
+func (f *ModelFactory) CurrentModelInfo(roleID string) (provider, model, presetID string, overridden bool) {
+	cfg := f.resolveConfig(roleID)
+	provider, model = cfg.Provider, cfg.Model
+	if e := f.overrideFor(roleID); e != nil {
+		return provider, model, e.presetID, true
+	}
+	return provider, model, "", false
+}
+
+// SwitchModel 把角色切换到指定预设的模型（运行时动态切换核心入口）。
+//
+// 流程：串行锁 → 校验 → 同预设短路 → 连通性探测（fail-closed，失败三处全不动）
+// → 先持久化 model_overrides.yaml 再原子应用 override + 失效客户端缓存。
+//
+// 生效语义：下一个 LLM 客户端获取点生效——domain/叶子下一次派发、lightweight/judge
+// 下一次调用、meta 下一会话（provider 每会话注入一次）；进行中任务不中断。
+//
+// 返回生效的模型配置；错误时状态不变。
+func (f *ModelFactory) SwitchModel(ctx context.Context, roleID, presetID string) (types.AgentModelConfig, error) {
+	f.switchMu.Lock()
+	defer f.switchMu.Unlock()
+
+	// 校验角色可切换
+	switchable := false
+	for _, r := range f.SwitchableRoles() {
+		if r == roleID {
+			switchable = true
+			break
+		}
+	}
+	if !switchable {
+		return types.AgentModelConfig{}, fmt.Errorf("role %q 不支持动态切换模型", roleID)
+	}
+	// 校验预设存在
+	preset, ok := f.presetByID(presetID)
+	if !ok {
+		return types.AgentModelConfig{}, fmt.Errorf("模型预设 %q 不存在", presetID)
+	}
+	// 同预设短路（已覆写为同一预设则无操作）
+	if e := f.overrideFor(roleID); e != nil && e.presetID == presetID {
+		return e.cfg, nil
+	}
+
+	newCfg := preset.ToAgentModelConfig()
+	if newCfg.APIKey == "" {
+		return types.AgentModelConfig{}, fmt.Errorf("预设 %q 未配置 api_key", presetID)
+	}
+	// 连通性探测（锁外网络 IO；MaxTokens=1 最小化开销，参照启动期 VerifyConnectivity）
+	probeCfg := newCfg
+	probeCfg.MaxTokens = 1
+	probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	if err := f.probe(probeCtx, probeCfg); err != nil {
+		return types.AgentModelConfig{}, fmt.Errorf("预设 %q 连通性探测失败，保持原模型: %w", presetID, err)
+	}
+
+	// 先持久化（失败则内存不动，无半状态）
+	now := time.Now().UTC()
+	file := &config.ModelOverridesFile{Overrides: map[string]config.ModelOverride{roleID: {PresetID: presetID, AppliedAt: &now}}}
+	if m := f.overrides.Load(); m != nil {
+		for r, e := range *m {
+			if r == roleID {
+				continue
+			}
+			file.Overrides[r] = config.ModelOverride{PresetID: e.presetID}
+		}
+	}
+	if err := file.Save(f.overridesPath); err != nil {
+		return types.AgentModelConfig{}, fmt.Errorf("持久化模型覆写失败，保持原模型: %w", err)
+	}
+
+	// 原子应用 override + 失效缓存条目（下一获取点重建）
+	m := make(map[string]overrideEntry, len(file.Overrides))
+	for r := range file.Overrides {
+		if r == roleID {
+			m[r] = overrideEntry{cfg: newCfg, presetID: presetID}
+			continue
+		}
+		if e := f.overrideFor(r); e != nil {
+			m[r] = *e
+		}
+	}
+	f.overrides.Store(&m)
+
+	f.mu.Lock()
+	delete(f.models, roleID)
+	// domain 被覆写且 lightweight 无独立配置（靠 domain 回退）时，
+	// 已缓存的 lightweight 客户端还指向旧 domain 模型，需一并失效重建。
+	if roleID == "domain" && f.cfg.LightweightModel.Model == "" && f.overrideFor("lightweight") == nil {
+		delete(f.models, "lightweight")
+	}
+	f.mu.Unlock()
+	return newCfg, nil
+}
+
+// presetByID 按 ID 查预设（presets 启动期注入后只读，无锁）。
+func (f *ModelFactory) presetByID(presetID string) (types.ModelPreset, bool) {
+	for _, p := range f.presets {
+		if p.ID == presetID {
+			return p, true
+		}
+	}
+	return types.ModelPreset{}, false
+}
+
+// Presets 返回注入的预设清单副本（只读视图，供模型目录展示）。
+func (f *ModelFactory) Presets() []types.ModelPreset {
+	out := make([]types.ModelPreset, len(f.presets))
+	copy(out, f.presets)
+	return out
+}
+
+// probe 执行切换前连通性探测；probeHook 非空用注入实现，否则默认临时客户端。
+func (f *ModelFactory) probe(ctx context.Context, probeCfg types.AgentModelConfig) error {
+	if f.probeHook != nil {
+		return f.probeHook(ctx, probeCfg)
+	}
+	client, err := NewBladesClient(ctx, probeCfg)
+	if err != nil {
+		return err
+	}
+	return probeLLM(ctx, client)
 }

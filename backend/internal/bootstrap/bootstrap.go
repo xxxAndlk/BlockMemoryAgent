@@ -80,7 +80,7 @@ type App struct {
 	RoleConfig   *pkgconfig.RoleConfigFile // 角色配置对象
 	DAGScheduler *dag.Scheduler            // DAG 调度器；DAG 关闭时为 nil
 	Logger       *logger.Logger            // 结构化会话日志器
-	Plugins      *plugins.Manager         // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
+	Plugins      *plugins.Manager          // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
 
 	// cleanup 保存 App 关闭时需要按逆序释放的资源。
 	cleanup []func() error
@@ -171,15 +171,28 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第十步：创建模型工厂并预热、校验连通性。
 	modelFactory := model.NewModelFactory(roleCfg)
-	// 启动即打印轻量模型解析结果（来源 direct / fallback-domain），排查配置加载漂移：
+	// 注入可切换模型预设（roles.yaml model_presets[]）与覆写文件路径，
+	// 并应用上次运行期动态切换的持久化结果（model_overrides.yaml，role → preset_id）。
+	// 必须先于 WarmUp/VerifyConnectivity：启动预热与连通性探测针对覆写后的模型。
+	modelOverridesPath := filepath.Join(filepath.Dir(paths.RolePath), "model_overrides.yaml")
+	modelFactory.SetModelPresets(roleCfg.ModelPresets, modelOverridesPath)
+	overridesFile, err := pkgconfig.LoadModelOverrides(modelOverridesPath)
+	if err != nil {
+		// 覆写属可抛弃状态：文件损坏只警告不阻断启动，删文件即恢复 roles.yaml 原配置。
+		log.Printf("[bootstrap] [WARN] model overrides 文件损坏，忽略全部覆写: %v", err)
+	} else {
+		for _, skip := range modelFactory.ApplyStartupOverrides(overridesFile) {
+			log.Printf("[bootstrap] [WARN] 模型覆写跳过: %s", skip)
+		}
+	}
+	// 启动即打印轻量模型解析结果（来源 direct / fallback-domain / override），排查配置加载漂移：
 	// 2026-08-10 事故 roles.yaml 配 deepseek-v4-flash 但运行时 provider=glm-5.2（domain 回退），
 	// 会话期生效配置与磁盘现值不一致（配置晚于会话加载 / CWD 路径漂移），启动日志当场暴露。
 	if lmCfg, lmSource := modelFactory.LightweightResolution(); lmSource == "direct" {
 		log.Printf("[bootstrap] lightweight model resolution: model=%q provider=%q base_url=%q source=direct (roles.yaml lightweight_model 段)",
 			lmCfg.Model, lmCfg.Provider, lmCfg.BaseURL)
 	} else {
-		log.Printf("[bootstrap] lightweight model resolution: source=fallback-domain model=%q provider=%q（roles.yaml 未配 lightweight_model，轻量调用回退 domain 模型——若预期为独立轻量模型请配置）",
-			lmCfg.Model, lmCfg.Provider)
+		log.Printf("[bootstrap] lightweight model resolution: source=%s model=%q provider=%q", lmSource, lmCfg.Model, lmCfg.Provider)
 	}
 	if err := modelFactory.WarmUp(ctx); err != nil {
 		closeStores(pgStore, redisStore)
@@ -261,10 +274,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	memoryPipeline := memory.NewPipeline(memory.NewPostgresEventStore(pgStore.DB())).
 		WithSummarizer(newEventSummarizer(modelFactory)).
 		WithSummarizeTimeout(time.Duration(cfg.Agent.SummarizeTimeoutSec)*time.Second). // 思考型模型摘要需 60-180s，旧 5s 硬编码致摘要全挂
-		WithCompression(cfg.Agent.SummarizeKeepRecent). // 记忆流水线（保留段长度；触发仅由 token 阈值驱动，summarize_every 步频扳机已退役）
-		WithContextBudget(cfg.Agent.ContextTokenBudget, cfg.Agent.TokenBudgetPerRole). // 上下文 token 阈值触发压缩（默认 150K，保留近 10 旧压成摘要块）
-		WithTokenEstimator(agent.EstimateMessagesTokens). // 注入消息 token 估算器，避免 domain/memory 反向依赖 model
-		WithHistorySummarizer(newHistorySummarizer(modelFactory)). // 层级压缩：中段压成结构化压缩包，超限合并最老一半
+		WithCompression(cfg.Agent.SummarizeKeepRecent).                                 // 记忆流水线（保留段长度；触发仅由 token 阈值驱动，summarize_every 步频扳机已退役）
+		WithContextBudget(cfg.Agent.ContextTokenBudget, cfg.Agent.TokenBudgetPerRole).  // 上下文 token 阈值触发压缩（默认 150K，保留近 10 旧压成摘要块）
+		WithTokenEstimator(agent.EstimateMessagesTokens).                               // 注入消息 token 估算器，避免 domain/memory 反向依赖 model
+		WithHistorySummarizer(newHistorySummarizer(modelFactory)).                      // 层级压缩：中段压成结构化压缩包，超限合并最老一半
 		WithMaxBundles(cfg.Agent.SummarizeMaxBundles).
 		WithFileMapProvider(toolRegistry.FileMapText) // 任务级文件小地图：触碰文件符号轮廓尾部常驻注入，压缩压不掉
 
@@ -743,16 +756,16 @@ func validatePaths(paths ConfigPaths) error {
 func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDim int) error {
 	// 依次确保各业务表/扩展已创建。
 	for name, fn := range map[string]func(context.Context, *sql.DB) error{
-		"session_history": store.EnsureSessionHistorySchema,
-		"session_events":  store.EnsureSessionEventsSchema,
-		"agent_events":    store.EnsureAgentEventsSchema,
-		"agent_messages":  store.EnsureAgentMessagesSchema,
+		"session_history":       store.EnsureSessionHistorySchema,
+		"session_events":        store.EnsureSessionEventsSchema,
+		"agent_events":          store.EnsureAgentEventsSchema,
+		"agent_messages":        store.EnsureAgentMessagesSchema,
 		"agent_compress_states": store.EnsureCompressStateSchema,
-		"session_logs":    store.EnsureSessionLogsSchema,
-		"dag":             store.EnsureDAGSchema,
-		"memory":          store.EnsureInitialMemorySchema,
-		"agent_tree":      store.EnsureAgentTreeSchema,
-		"learned_skills":  store.EnsureLearnedSkillsSchema,
+		"session_logs":          store.EnsureSessionLogsSchema,
+		"dag":                   store.EnsureDAGSchema,
+		"memory":                store.EnsureInitialMemorySchema,
+		"agent_tree":            store.EnsureAgentTreeSchema,
+		"learned_skills":        store.EnsureLearnedSkillsSchema,
 	} {
 		if err := fn(ctx, pgStore.DB()); err != nil {
 			return fmt.Errorf("ensure %s schema: %w", name, err)

@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin" // Gin Web 框架
 
+	"github.com/blockmemory/agent/backend/internal/agent"            // ModelManager（模型动态切换）
 	"github.com/blockmemory/agent/backend/internal/model"            // ModelFactory
 	"github.com/blockmemory/agent/backend/internal/plugins"          // 插件管理器
 	"github.com/blockmemory/agent/backend/internal/runtime"          // Runtime
@@ -55,6 +56,7 @@ type APIHandler struct {
 	redisStore   *store.RedisStore         // Redis 存储
 	roleCfg      *pkgconfig.RoleConfigFile // 角色配置
 	modelFactory *model.ModelFactory       // 模型工厂
+	modelMgr     agent.ModelManager        // 模型动态切换能力（ReactService 实现）
 	statsService *StatsService             // 会话统计聚合服务
 	pluginMgr    *plugins.Manager          // 插件管理器（热插拔插件管理 API）
 	learnedSkills *store.LearnedSkillStore // 自进化技能库存储（2026-09-02 设计 §8）
@@ -334,7 +336,10 @@ func (h *APIHandler) StatusHandler(c *gin.Context) {
 
 	llmProvider := "mock"
 	llmModel := "mock"
-	if h.roleCfg != nil {
+	if h.modelFactory != nil {
+		// 从工厂读当前生效模型（跟随运行时动态切换的 override），而非静态 roleCfg。
+		llmProvider, llmModel, _, _ = h.modelFactory.CurrentModelInfo("meta")
+	} else if h.roleCfg != nil {
 		llmProvider = h.roleCfg.MetaAgent.ModelConfig.Provider // 供应商
 		llmModel = h.roleCfg.MetaAgent.ModelConfig.Model       // 模型名
 	}

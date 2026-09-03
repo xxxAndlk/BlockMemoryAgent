@@ -26,6 +26,8 @@ const (
 	overlayDAG
 	// overlayRuntime 表示打开运行时信息弹窗（预留）。
 	overlayRuntime
+	// overlayModel 表示打开模型切换弹窗（两段式：先选角色，再选预设）。
+	overlayModel
 )
 
 // 输入栏模式常量：用于切换输入栏的提示符与命令解析逻辑。
@@ -52,7 +54,7 @@ const fullHelpText = `
 	  Ctrl+B           切换右侧计划/Agent 分栏显示（自动/强制显示/强制隐藏）
 	  m                Memory 面板占位提示
 	  g                Git Diff 占位提示
-	  s                Settings 占位提示
+	  s / /model       打开 / 关闭 模型切换弹窗（先选角色，再选预设；切换含连通性探测需等待）
 	  ?                帮助
 	  Esc              关闭弹窗 / 离开输入栏 / 回到对话区
 	  ctrl+c           退出 TUI（任意状态下生效）

@@ -825,3 +825,49 @@ dynamic_templates:
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
       max_tokens: 16384  # 临时助手：基线 16K
+
+# ─── 可切换模型预设（model_presets）───────────────────────────────────────────
+# 供运行时动态切换角色模型使用：TUI 按 s 键或输入 /model、Web 设置页选择预设后一键切换。
+# - 切换前会对目标模型做一次最小化连通性探测（1 token，最长 60s），失败则保持原模型不动。
+# - 切换结果持久化到 roles.yaml 同目录的 model_overrides.yaml（role → preset_id），
+#   重启后自动应用；删除该文件即恢复本文件原配置。本文件本身不会被程序改写。
+# - 生效范围：domain/叶子下一次派发、lightweight/judge 下一次调用、meta 下一会话；
+#   进行中任务不中断。
+# api_key / base_url 支持 ${ENV} 与 ${ENV:默认值} 引用。
+model_presets:
+  - id: doubao-seed-evolving
+    name: 豆包 Seed Evolving（当前 meta）
+    provider: anthropic
+    model: doubao-seed-evolving
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ${ANTHROPIC_BASE_URL}
+    temperature: 0.1
+    max_tokens: 128000
+    thinking: max
+  - id: glm-53-flash
+    name: GLM 5.3 Flash（当前 domain，执行型关思考提速）
+    provider: anthropic
+    model: glm-5.3-flash
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ${ANTHROPIC_BASE_URL}
+    temperature: 0.5
+    max_tokens: 128000
+    thinking: high
+  - id: kimi-k3
+    name: Kimi K3（硬骨头任务临时切换）
+    provider: anthropic
+    model: kimi-k3
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ${ANTHROPIC_BASE_URL}
+    temperature: 0.2
+    max_tokens: 128000
+    thinking: "off"
+  - id: deepseek-v4-flash
+    name: DeepSeek V4 Flash（轻量/临时助手）
+    provider: anthropic
+    model: deepseek-v4-flash
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ${ANTHROPIC_BASE_URL}
+    temperature: 0.4
+    max_tokens: 16384
+    thinking: "off"
