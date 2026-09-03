@@ -85,6 +85,10 @@ func main() {
 	// 在配置文件加载之前，任何致命错误都需要落到 stderr；此处使用一个最小配置的
 	// zerolog logger，保证启动早期日志格式与运行期一致。
 	earlyLogger := logger.NewWithConfig(config.LoggingConfig{Level: "info", Format: "console", Timezone: "Local"}, nil, os.Stderr)
+	// home 解析失败时打一行 warning(resolveHome 提示文案),后续仍按 flag 默认值回落 cwd。
+	if homeErr != nil {
+		earlyLogger.Warn(context.Background(), "安装目录解析失败,回落默认相对路径: "+homeErr.Error())
+	}
 
 	// ---- 加载 .env 文件 ----
 	// os.Stat 判断文件是否存在；若存在则把其中 KEY=VALUE 注入进程环境变量。
@@ -119,13 +123,13 @@ func main() {
 	// 失败不 fatal：文件日志缺失时仍用 stderr，保证服务可启动。
 	var logWriter io.WriteCloser
 	var srvLogger *logger.Logger
+	// 日志目录经 BMA_HOME 解析：相对路径落到安装目录下，绝对路径原样使用
+	logDir := cfg.Logging.Dir
 	if cfg.Logging.Enabled {
-		// logging.Init 返回一个按天滚动的 io.WriteCloser；EntryBackend 区分入口
-		// 日志目录经 BMA_HOME 解析：相对路径落到安装目录下，绝对路径原样使用
-		logDir := cfg.Logging.Dir
 		if homeErr == nil {
 			logDir = config.ResolveUnderHome(home, logDir)
 		}
+		// logging.Init 返回一个按天滚动的 io.WriteCloser；EntryBackend 区分入口
 		w, err := logging.Init(logging.EntryBackend, logDir, false)
 		if err != nil {
 			// 初始化失败仅记录警告，保持 stderr 可用
@@ -140,7 +144,7 @@ func main() {
 		// 文件日志关闭时统一输出到 stderr
 		srvLogger = logger.NewWithConfig(cfg.Logging, nil, os.Stderr)
 	}
-	srvLogger.Info(context.Background(), fmt.Sprintf("BlockMemoryAgent 后台服务启动中, 日志目录=%s", cfg.Logging.Dir))
+	srvLogger.Info(context.Background(), fmt.Sprintf("BlockMemoryAgent 后台服务启动中, 日志目录=%s", logDir))
 
 	// ---- 兜底转发标准库 log 输出 ----
 	// 业务代码已统一注入 *logger.Logger；少数未注入路径（如测试直接构造的结构体）

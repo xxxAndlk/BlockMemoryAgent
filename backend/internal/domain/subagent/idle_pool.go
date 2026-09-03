@@ -851,11 +851,17 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 	if mem == nil {
 		mem = agent.NopMemoryPipeline{}
 	}
+	// 系统提示词工作目录按会话解析(终审修复,同 dispatcher 派发路径):槽创建时已从派发 ctx
+	// 捕获会话 workDir,优先使用;空串回落工具注册表默认目录。
+	wd := s.workDir
+	if wd == "" {
+		wd = d.subAgentWorkDir()
+	}
 	sub := agent.NewReActAgent(s.id, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, s.id, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor("domain")).
-		WithWorkDir(d.subAgentWorkDir()).
+		WithWorkDir(wd).
 		WithSkillBlock(d.skillBlockFor(s.id, roleDef)).
 		WithPendingChildrenChecker(d).
 		WithSuspendGate(&slotSuspendGate{d: d, sid: s.sessionID})

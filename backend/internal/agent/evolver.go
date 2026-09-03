@@ -101,11 +101,12 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 	}
 	// ② 项目经验增量：Merge 整理进项目偏好 + evolution_log。
 	// S2：项目偏好按会话工作目录解析（session.workDir 空串回落 store 构造目录）。
+	// ForContext 返回 nil（目录不可解析）时既未写入也不应记 project_lesson 审计流水。
 	if lessons := cleanIncrements(out.ProjectLessons); len(lessons) > 0 && s.projectPrefs != nil {
 		if st := s.projectPrefs.ForContext(tool.WithWorkDir(ctx, session.workDir)); st != nil {
 			s.mergeIntoStore(session.ID, agentName, st, projectPrefsTargets, lessons)
+			s.logEvolution(session.ID, "project_lesson", "项目经验", strings.Join(lessons, "；"))
 		}
-		s.logEvolution(session.ID, "project_lesson", "项目经验", strings.Join(lessons, "；"))
 	}
 	// ③ 技能包：skillSink 落文件+PG+evolution_log（含校验/同名更新）。
 	if len(out.Skills) > 0 && s.skillSink != nil {

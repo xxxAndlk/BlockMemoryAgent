@@ -1516,6 +1516,7 @@ func (s *ReactService) SwitchTopic(ctx context.Context, sessionID, name, goal st
 		return nil, ErrSessionNotFound
 	}
 	oldTopicID := session.activeTopicID
+	workDir := session.workDir // 话题摘要 KV 按会话目录解析(S2):锁内快照,供下方注入
 	wasRunning := session.Status == enums.SessionStatusRunning
 	s.store.mu.Unlock()
 
@@ -1527,7 +1528,8 @@ func (s *ReactService) SwitchTopic(ctx context.Context, sessionID, name, goal st
 	// (与块记忆 recall 同原则)。召回侧 recallTopicSummaries 按 session 前缀读取。
 	if oldTopicID != "" && s.sharedMemoryStore != nil && len(snapshot) > 0 {
 		summary := summarizeTopicSnapshot(oldTopicID, snapshot)
-		kvCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		// 注入会话工作目录:HTTP 请求 ctx 不含会话 workDir,KV 须按会话目录解析 .bma 根。
+		kvCtx, cancel := context.WithTimeout(tool.WithWorkDir(ctx, workDir), 3*time.Second)
 		if err := s.sharedMemoryStore.Set(kvCtx, "topic:"+sessionID+":"+oldTopicID+":summary", summary); err != nil {
 			s.store.logError(ctx, "switch topic: write old topic summary to KV failed", err)
 		}
@@ -1780,6 +1782,12 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 任务看板注入（TODO #35 Phase 0）：每轮上下文末尾追加【任务看板】段——编排状态
 	// 机器可读且压缩不可达，"重新执行"类短指令的消歧锚点。仅 meta 注入，子 Agent 不注入。
 	// 热驻空闲领域清单注入（Domain 热驻）：供 MetaAgent 自主判定强相关复用 vs 弱相关新建。
+	// 系统提示词工作目录按会话解析(终审修复):会话 workDir 优先,空串回落进程默认目录,
+	// 使 buildEnvBlock/LoadProjectDoc 与 createSession 的 EnsureProjectDoc 落在同一目录。
+	wd := session.workDir
+	if wd == "" {
+		wd = s.workDir()
+	}
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
 	metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
 	metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
@@ -1789,7 +1797,7 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
-		WithWorkDir(s.workDir()).
+		WithWorkDir(wd).
 		WithSkillBlock(s.metaSkillBlock()).
 		WithPersonaInjector(s.metaPersona(session.workDir))
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
@@ -1813,7 +1821,8 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	}
 
 	// 召回旧话题摘要拼到目标前(切换话题后续接上下文);同一话题只注入一次。
-	goal := s.injectTopicRecall(ctx, session, session.Goal)
+	// 用注入会话 workDir 后的 runCtx:话题摘要 KV 按会话目录解析 .bma 根。
+	goal := s.injectTopicRecall(runCtx, session, session.Goal)
 	// 经验技能预筛（设计 §6.5）：goal 向量 top-3 命中只注一行提示，不注全文。
 	goal = s.injectSkillRecall(ctx, goal)
 
@@ -1894,6 +1903,11 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
 	// 任务看板注入（TODO #35 Phase 0）：同 runSession，每轮末尾追加【任务看板】段。
 	// 热驻空闲领域清单注入（Domain 热驻）：供复用判定。
+	// 系统提示词工作目录按会话解析(终审修复,同 runSession):会话 workDir 优先,空串回落进程默认目录。
+	wd := session.workDir
+	if wd == "" {
+		wd = s.workDir()
+	}
 	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
 	metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
 	metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
@@ -1903,7 +1917,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
-		WithWorkDir(s.workDir()).
+		WithWorkDir(wd).
 		WithSkillBlock(s.metaSkillBlock()).
 		WithPersonaInjector(s.metaPersona(session.workDir))
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
@@ -1943,7 +1957,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	}
 
 	// 召回旧话题摘要拼到本轮输入前(切换话题后续接上下文);同一话题只注入一次。
-	input = s.injectTopicRecall(ctx, session, input)
+	// 用注入会话 workDir 后的 runCtx(同 runSession):话题摘要 KV 按会话目录解析。
+	input = s.injectTopicRecall(runCtx, session, input)
 	// 经验技能预筛（设计 §6.5）：续跑新输入同样做向量预筛提示。
 	input = s.injectSkillRecall(ctx, input)
 

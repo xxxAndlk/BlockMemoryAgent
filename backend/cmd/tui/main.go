@@ -80,6 +80,11 @@ func main() {
 	// ---- 启动早期日志器 ----
 	// 配置文件校验失败等早期错误需要落到终端，避免用户只看到 exit status 1。
 	earlyLogger := logger.NewWithConfig(config.LoggingConfig{Level: "info", Format: "console", Timezone: "Local"}, nil, os.Stderr)
+	// home 解析失败时打一行 warning(resolveHome 提示文案),后续仍按 cwd 相对默认值回落,
+	// 由下方文件校验给出缺失报错。
+	if homeErr != nil {
+		earlyLogger.Warn(context.Background(), "安装目录解析失败,回落 cwd 相对默认值: "+homeErr.Error())
+	}
 
 	// ---- 校验必需配置文件 ----
 	// 严格启动：任一必需配置文件缺失即失败，避免运行期因缺配置产生隐式错误。

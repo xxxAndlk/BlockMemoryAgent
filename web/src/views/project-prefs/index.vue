@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getProjectPreferences, saveProjectPreferences } from '@/api/preferences'
+import { useWorkDir } from '@/composables/useWorkDir'
 
 const content = ref('')
 const path = ref('')
@@ -9,10 +10,13 @@ const loading = ref(false)
 const saving = ref(false)
 const dirty = ref(false)
 
+// 与 chat 页同源的"记住的 workDir"（localStorage bma:last-workdir）：有则按该目录解析项目偏好。
+const { workDir } = useWorkDir()
+
 async function load() {
   loading.value = true
   try {
-    const res = await getProjectPreferences()
+    const res = await getProjectPreferences(workDir.value || undefined)
     content.value = res.content || ''
     path.value = res.path || ''
     dirty.value = false
@@ -26,7 +30,7 @@ async function load() {
 async function save() {
   saving.value = true
   try {
-    await saveProjectPreferences(content.value)
+    await saveProjectPreferences(content.value, workDir.value || undefined)
     dirty.value = false
     ElMessage.success('项目偏好已保存')
   } catch (e) {

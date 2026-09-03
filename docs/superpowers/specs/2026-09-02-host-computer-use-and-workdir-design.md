@@ -79,7 +79,8 @@ TUI 与 server 共用新增 helper(如 `config.HomeDir()`):
 
 ### 已知限制(本期不解决,写入文档)
 
-- Docker 插件(ui_design / ui_preview / 沙箱 computer_use)的 `${WORKDIR}` 挂载在容器首次创建时钉死,无法跟随每会话目录——仍挂载 server 启动目录;每会话目录只对内置工具与宿主机插件生效。
+- Docker 插件(ui_design / ui_preview / 沙箱 computer_use)的 `${WORKDIR}` 挂载在容器首次创建时钉死,无法跟随每会话目录——仍挂载 server 启动目录。
+- stdio MCP 插件进程(如 host_computer_use)是 enable 期拉起、跨会话共享的,cwd 钉在 server 启动目录:每会话 workDir 对 stdio 插件进程本身不生效(host_computer_use 的桌面操作不依赖进程 cwd,不受影响);每会话目录只对内置工具与注入 ctx 的进程内逻辑(共享记忆/项目偏好/PROJECT.md 等)生效。
 
 ## S3 · 真机 GUI 控制插件
 

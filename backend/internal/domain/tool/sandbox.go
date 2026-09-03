@@ -235,19 +235,6 @@ func (e *Executor) resolvePathWithSandbox(ctx context.Context, path string) (str
 	return "", fmt.Errorf("path escapes sandbox: %s (allowed base: %s)", absPath, filepath.Clean(e.workDirOf(ctx)))
 }
 
-// isPathWithinTempDir 判断 absPath 是否位于指定 sessionID 对应的临时目录内。
-// 该方法用于判断文件是否属于某个会话的临时工作空间。
-func (e *Executor) isPathWithinTempDir(ctx context.Context, absPath, sessionID string) bool {
-	// 如果 sessionID 为空，则不存在对应的临时目录，直接返回 false。
-	if sessionID == "" {
-		return false
-	}
-	// 获取该 sessionID 对应的临时目录路径。
-	tempDir := e.sessionTempDir(ctx, sessionID)
-	// 规范化目标路径和临时目录后，使用 hasPathPrefix 判断归属关系。
-	return hasPathPrefix(filepath.Clean(absPath), filepath.Clean(tempDir))
-}
-
 // ensureSandboxDefaults 确保 Executor 的沙箱字段已被初始化。
 // 如果当前沙箱为空配置，则替换为默认配置。
 func (e *Executor) ensureSandboxDefaults() {

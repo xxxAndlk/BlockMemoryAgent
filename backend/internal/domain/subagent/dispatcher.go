@@ -2762,7 +2762,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
-		WithWorkDir(d.subAgentWorkDir())
+		WithWorkDir(d.subAgentWorkDirFor(ctx))
 	// 技能渐进披露第一层：【可用技能】元数据块注入系统提示（正文经 load_skill 按需取）。
 	// 持有集以 heldSkills 为权威（未登记回退角色固定集），skillPool nil 时零行为。
 	sub = sub.WithSkillBlock(d.skillBlockFor(subAgentID, &roleDef))
@@ -3355,7 +3355,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor("domain")).
-		WithWorkDir(d.subAgentWorkDir())
+		WithWorkDir(d.subAgentWorkDirFor(ctx))
 	// resume 重建的 Agent 恢复技能块：持有集从 heldSkills 取（一次性路径派发时已登记；
 	// 进程重启丢失则回退角色固定集）。
 	sub = sub.WithSkillBlock(d.skillBlockFor(pausedNodeID, roleDef))
@@ -4143,6 +4143,16 @@ func (d *Dispatcher) subAgentWorkDir() string {
 		return ""
 	}
 	return d.tools.WorkDir()
+}
+
+// subAgentWorkDirFor 返回子 Agent 系统提示词用的工作目录（终审修复）：
+// 优先取 ctx 注入的每会话工作目录（派发来路 runCtx 已注入会话 workDir），
+// 取不到再回落 subAgentWorkDir（工具注册表默认目录）。
+func (d *Dispatcher) subAgentWorkDirFor(ctx context.Context) string {
+	if wd := tool.WorkDirFromContext(ctx); wd != "" {
+		return wd
+	}
+	return d.subAgentWorkDir()
 }
 
 // WithSharedMemory 注入共享记忆后端（tool.SharedMemoryStore），使子 Agent 派发时能读取

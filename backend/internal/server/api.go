@@ -20,6 +20,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/runtime"          // Runtime
 	"github.com/blockmemory/agent/backend/internal/server/eventkind" // 事件类型常量
 	"github.com/blockmemory/agent/backend/internal/store"            // Postgres / Redis
+	"github.com/blockmemory/agent/backend/internal/domain/tool"      // WithWorkDir(work_dir 注入)
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"      // RoleConfigFile
 	"github.com/blockmemory/agent/backend/pkg/types"                 // 共享类型
 )
@@ -501,7 +502,12 @@ func (h *APIHandler) BrowseFSHandler(c *gin.Context) {
 		}
 	}
 	sort.Slice(dirs, func(i, j int) bool { return strings.ToLower(dirs[i].Name) < strings.ToLower(dirs[j].Name) })
-	c.JSON(http.StatusOK, gin.H{"path": p, "parent": filepath.Dir(p), "dirs": dirs})
+	parent := filepath.Dir(p)
+	// 盘符根/根目录（如 C:\）Dir 返回自身：无上级可回，parent 置空让前端禁用"上级"按钮。
+	if parent == p {
+		parent = ""
+	}
+	c.JSON(http.StatusOK, gin.H{"path": p, "parent": parent, "dirs": dirs})
 }
 
 // FileContentHandler 处理 GET /api/files/content — 读取文件内容。
@@ -571,14 +577,37 @@ func (h *APIHandler) SaveProfileHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
+// prefsWorkDirCtx 校验可选 work_dir 参数并注入 ctx（与 /api/sessions 的 work_dir 同规则：
+// 非空时转绝对路径，不存在或非目录返回 400）；为空时原样返回请求 ctx（进程目录语义）。
+func prefsWorkDirCtx(c *gin.Context, dir string) (context.Context, bool) {
+	if dir == "" {
+		return c.Request.Context(), true
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		c.String(http.StatusBadRequest, "work_dir 无效")
+		return nil, false
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		c.String(http.StatusBadRequest, "work_dir 不存在或不是目录")
+		return nil, false
+	}
+	return tool.WithWorkDir(c.Request.Context(), abs), true
+}
+
 // ProjectPreferencesHandler 处理 GET /api/project/preferences — 返回当前 workDir 项目偏好全文
-//（2026-09-02 设计 §5：.bma/project_preferences.md）。
+//（2026-09-02 设计 §5：.bma/project_preferences.md）。可选 query work_dir 按会话目录解析。
 func (h *APIHandler) ProjectPreferencesHandler(c *gin.Context) {
 	if h.sessionMgr == nil {
 		c.JSON(http.StatusOK, map[string]any{"content": ""})
 		return
 	}
-	p, err := h.sessionMgr.agent.ProjectPreferences(c.Request.Context())
+	ctx, ok := prefsWorkDirCtx(c, c.Query("work_dir"))
+	if !ok {
+		return
+	}
+	p, err := h.sessionMgr.agent.ProjectPreferences(ctx)
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
@@ -591,6 +620,7 @@ func (h *APIHandler) ProjectPreferencesHandler(c *gin.Context) {
 }
 
 // SaveProjectPreferencesHandler 处理 PUT /api/project/preferences — 全量覆盖项目偏好。
+// 可选 body 字段 work_dir 按会话目录解析（校验规则同 /api/sessions）。
 func (h *APIHandler) SaveProjectPreferencesHandler(c *gin.Context) {
 	if h.sessionMgr == nil {
 		c.String(http.StatusInternalServerError, "session manager not wired")
@@ -598,12 +628,17 @@ func (h *APIHandler) SaveProjectPreferencesHandler(c *gin.Context) {
 	}
 	var req struct {
 		Content string `json:"content"`
+		WorkDir string `json:"work_dir,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.String(http.StatusBadRequest, "%s", err.Error())
 		return
 	}
-	if err := h.sessionMgr.agent.SaveProjectPreferences(c.Request.Context(), req.Content); err != nil {
+	ctx, ok := prefsWorkDirCtx(c, req.WorkDir)
+	if !ok {
+		return
+	}
+	if err := h.sessionMgr.agent.SaveProjectPreferences(ctx, req.Content); err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
