@@ -18,9 +18,9 @@
 meta_agent:
   model_config: &meta_model
     provider: anthropic
-    model: k3 # doubao-seed-evolving
-    api_key: ${ANTHROPIC_API_KEY_TWO}
-    base_url: ${ANTHROPIC_BASE_URL_TWO}
+    model: doubao-seed-evolving
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.1
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
     thinking: max # 规划/整合任务保留思考；false 提速（见 domain_agent 同名字段说明）
