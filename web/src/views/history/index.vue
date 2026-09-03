@@ -1,17 +1,122 @@
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import type { Session } from '@/types'
+import { listSessions } from '@/api/session'
+import { statusTagType, statusText } from '@/utils/sessionStatus'
+
+const route = useRoute()
+const router = useRouter()
+
+const sessions = ref<Session[]>([])
+const loading = ref(false)
+const search = ref('')
+const statusFilter = ref('')
+// 工作目录页「查看会话」跳入：?work_dir= 预过滤
+const workDirFilter = ref((route.query.work_dir as string) || '')
+
+const statusOptions = [
+  { value: '', label: '全部状态' },
+  { value: 'running', label: '运行中' },
+  { value: 'completed', label: '已完成' },
+  { value: 'error', label: '失败' },
+  { value: 'awaiting_clarify', label: '待澄清' },
+  { value: 'paused_on_child', label: '子Agent暂停' },
+]
+
+const workDirOptions = computed(() => {
+  const dirs = Array.from(new Set(sessions.value.map((s) => s.work_dir || ''))).sort()
+  return [{ value: '', label: '全部目录' }, ...dirs.map((d) => ({ value: d, label: d || '默认目录' }))]
+})
+
+const rows = computed(() =>
+  sessions.value.filter((s) => {
+    if (statusFilter.value && s.status !== statusFilter.value) return false
+    if (workDirFilter.value && (s.work_dir || '') !== workDirFilter.value) return false
+    const q = search.value.trim().toLowerCase()
+    if (q && !s.id.toLowerCase().includes(q) && !(s.goal || '').toLowerCase().includes(q)) return false
+    return true
+  })
+)
+
+onMounted(async () => {
+  loading.value = true
+  try {
+    sessions.value = await listSessions()
+  } catch (e) {
+    ElMessage.error('会话历史加载失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    loading.value = false
+  }
+})
+
+function open(s: Session) {
+  router.push({ path: '/session', query: { id: s.id, view: 'monitor' } })
+}
+
+function fmt(t?: string) {
+  return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : '—'
+}
+
+function duration(s: Session) {
+  if (!s.started_at || !s.ended_at) return '—'
+  const ms = new Date(s.ended_at).getTime() - new Date(s.started_at).getTime()
+  if (ms < 0) return '—'
+  const mm = Math.floor(ms / 60000)
+  const ss = Math.floor((ms % 60000) / 1000)
+  return mm ? `${mm}m ${ss}s` : `${ss}s`
+}
+</script>
+
 <template>
-  <div class="h-full flex flex-col gap-4 overflow-hidden text-gray-300">
-    <div class="shrink-0 mb-2">
-      <h1 class="text-xl font-bold text-gray-200 mb-1">Session History / 会话历史</h1>
-      <p class="text-sm text-gray-500">查看历史会话记录，回顾执行过程和结果</p>
+  <div class="h-full flex flex-col gap-4 overflow-hidden text-ink">
+    <div class="bg-card border border-line rounded-card p-4 shrink-0 flex items-center gap-3 flex-wrap">
+      <div class="font-bold text-sm mr-auto">会话历史</div>
+      <el-input v-model="search" size="small" placeholder="搜索目标 / ID…" class="w-56">
+        <template #prefix><el-icon class="text-ink-3"><Search /></el-icon></template>
+      </el-input>
+      <el-select v-model="statusFilter" size="small" class="w-32">
+        <el-option v-for="o in statusOptions" :key="o.value" :value="o.value" :label="o.label" />
+      </el-select>
+      <el-select v-model="workDirFilter" size="small" class="w-56">
+        <el-option v-for="o in workDirOptions" :key="o.value" :value="o.value" :label="o.label" />
+      </el-select>
     </div>
-    <FeaturePlaceholder
-      icon="Clock"
-      title="会话历史功能开发中"
-      description="历史会话归档、回放与导出能力将在后端 API 就绪后提供，当前不再展示示例数据。"
-    />
+
+    <div class="flex-1 min-h-0 bg-card border border-line rounded-card overflow-hidden">
+      <el-table v-loading="loading" :data="rows" class="w-full" height="100%">
+        <el-table-column label="目标" min-width="280">
+          <template #default="{ row }">
+            <div class="font-bold text-sm truncate">{{ row.goal || '(无目标)' }}</div>
+            <div class="text-[11px] text-ink-3 font-mono">{{ row.id }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="110">
+          <template #default="{ row }">
+            <el-tag size="small" :type="statusTagType(row.status)" effect="plain">{{ statusText(row.status) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="工作目录" min-width="220">
+          <template #default="{ row }">
+            <span class="font-mono text-xs text-ink-2">{{ row.work_dir || '默认目录' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="开始时间" width="160">
+          <template #default="{ row }"><span class="text-xs text-ink-2">{{ fmt(row.started_at) }}</span></template>
+        </el-table-column>
+        <el-table-column label="耗时" width="100">
+          <template #default="{ row }"><span class="text-xs text-ink-2">{{ duration(row) }}</span></template>
+        </el-table-column>
+        <el-table-column width="80" align="right">
+          <template #default="{ row }">
+            <el-button size="small" link type="primary" @click="open(row)">打开</el-button>
+          </template>
+        </el-table-column>
+        <template #empty>
+          <div class="text-sm text-ink-3 py-10">暂无会话历史</div>
+        </template>
+      </el-table>
+    </div>
   </div>
 </template>
-
-<script setup lang="ts">
-import FeaturePlaceholder from '@/components/FeaturePlaceholder.vue'
-</script>

@@ -2,7 +2,7 @@
 </script>
 
 <template>
-  <el-card class="!border-dark-border !bg-dark-panel">
+  <el-card class="!border-line !bg-card">
     <slot />
   </el-card>
 </template>

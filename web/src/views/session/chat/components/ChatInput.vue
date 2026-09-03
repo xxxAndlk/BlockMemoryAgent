@@ -160,27 +160,27 @@ function applyQuickTag(tag: string) {
 </script>
 
 <template>
-  <div class="border-t border-[#2a2d35] bg-[#14161a] px-6 py-3">
+  <div class="border-t border-line bg-card px-6 py-3">
     <!-- 模式开关 + 快捷标签 + Token 计数 -->
     <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
-      <div class="flex items-center gap-4 text-xs text-gray-400 flex-1 min-w-0">
+      <div class="flex items-center gap-4 text-xs text-ink-2 flex-1 min-w-0">
         <div class="flex items-center gap-2 w-80 max-w-full shrink-0 workdir-cell">
-          <span class="text-gray-400 whitespace-nowrap">工作目录</span>
+          <span class="text-ink-2 whitespace-nowrap">工作目录</span>
           <WorkDirPicker v-model="workDir" />
         </div>
         <span v-if="sessionActive" class="text-green-400 flex items-center gap-1">
           <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
           会话已连接
         </span>
-        <span v-else class="text-gray-500">将创建新会话</span>
+        <span v-else class="text-ink-2">将创建新会话</span>
       </div>
       <div class="flex items-center gap-3 text-xs">
-        <span class="text-gray-500 font-mono" :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
-          <span class="text-gray-600">Token</span>
+        <span class="text-ink-2 font-mono" :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
+          <span class="text-ink-3">Token</span>
           <span class="ml-2 text-blue-400">↑{{ fmtTokens(props.inputTokens || 0) }}</span>
           <span class="ml-1 text-green-400">↓{{ fmtTokens(props.outputTokens || 0) }}</span>
         </span>
-        <el-button size="small" plain class="!bg-transparent !border-[#2a2d35] !text-gray-400 hover:!text-white"
+        <el-button size="small" plain class="!bg-transparent !border-line !text-ink-2 hover:!text-white"
                    @click="emit('new-session')">
           <el-icon class="mr-1"><Plus /></el-icon> 新建会话
         </el-button>
@@ -191,7 +191,7 @@ function applyQuickTag(tag: string) {
       <el-tag v-for="t in quickTags" :key="t"
               effect="plain"
               size="small"
-              class="!bg-[#0f1115] !border-[#2a2d35] !text-gray-400 hover:!text-white cursor-pointer transition-colors"
+              class="!bg-page !border-line !text-ink-2 hover:!text-white cursor-pointer transition-colors"
               @click="applyQuickTag(t)">
         {{ t }}
       </el-tag>
@@ -200,7 +200,7 @@ function applyQuickTag(tag: string) {
     <!-- 待发送图片预览（可移除） -->
     <div v-if="pendingImages.length" class="flex gap-2 mb-2 flex-wrap">
       <div v-for="(img, i) in pendingImages" :key="i"
-           class="relative w-14 h-14 rounded border border-[#2a2d35] overflow-hidden group">
+           class="relative w-14 h-14 rounded border border-line overflow-hidden group">
         <img :src="previewUrl(img)" class="w-full h-full object-cover" alt="待发送图片" />
         <button @click="removeImage(i)"
                 class="absolute inset-0 hidden group-hover:flex items-center justify-center bg-black/60 text-red-400 text-xs">
@@ -222,7 +222,7 @@ function applyQuickTag(tag: string) {
       </div>
       <div class="flex flex-col gap-1">
         <el-button :disabled="pendingImages.length >= 4" plain size="small"
-                   class="!bg-transparent !border-[#2a2d35] !text-gray-400 hover:!text-white"
+                   class="!bg-transparent !border-line !text-ink-2 hover:!text-white"
                    title="添加图片（或直接粘贴截图）"
                    @click="pickFiles">
           <el-icon><Picture /></el-icon>
@@ -230,7 +230,7 @@ function applyQuickTag(tag: string) {
         <el-button type="primary"
                    :loading="loading"
                    :disabled="!canSend"
-                   class="!bg-blue-600 !border-blue-600 hover:!bg-blue-500"
+                   class="!bg-primary !border-primary hover:!bg-[var(--bma-primary-hover)] hover:!border-[var(--bma-primary-hover)]"
                    @click="handleSubmit">
           <el-icon class="mr-1"><Promotion /></el-icon> 发送
           <span class="sr-only">{{ tokenLabel }}</span>
@@ -243,19 +243,19 @@ function applyQuickTag(tag: string) {
 
 <style scoped>
 :deep(.chat-input .el-textarea__inner) {
-  background-color: #0f1115 !important;
-  border: 1px solid #2a2d35;
-  color: #e5e7eb;
+  background-color: var(--bma-page) !important;
+  border: 1px solid var(--bma-border);
+  color: var(--bma-text);
   box-shadow: none !important;
   font-size: 13px;
   padding: 10px 12px;
 }
 :deep(.chat-input .el-textarea__inner:focus) {
-  border-color: #3b82f6;
+  border-color: var(--bma-primary);
 }
 :deep(.workdir-cell .el-input__wrapper) {
-  background-color: #0f1115;
-  box-shadow: 0 0 0 1px #2a2d35 inset;
+  background-color: var(--bma-page);
+  box-shadow: 0 0 0 1px var(--bma-border) inset;
   padding: 0 8px;
   min-height: 28px;
 }

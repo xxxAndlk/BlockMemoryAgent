@@ -122,10 +122,10 @@ async function submitOption(optionId?: string) {
   <div class="flex justify-start mb-6">
     <div class="max-w-[88%] w-full">
       <!-- 元信息行 -->
-      <div class="text-xs text-gray-500 flex items-center gap-2 mb-1.5">
+      <div class="text-xs text-ink-2 flex items-center gap-2 mb-1.5">
         <el-icon class="text-blue-400 text-sm"><UserFilled /></el-icon>
         <span :class="agentTextColor(primaryAgent)" class="font-medium">{{ primaryAgent }}</span>
-        <span v-if="turn.agents.length > 1" class="text-gray-500">+{{ turn.agents.length - 1 }}</span>
+        <span v-if="turn.agents.length > 1" class="text-ink-2">+{{ turn.agents.length - 1 }}</span>
         <span>·</span>
         <span>{{ fmtTime(turn.startedAt) }}</span>
         <span>·</span>
@@ -136,7 +136,7 @@ async function submitOption(optionId?: string) {
           <el-icon v-else><CircleClose /></el-icon>
           {{ statusLabel }}
         </span>
-        <span v-if="turn.tokens.in || turn.tokens.out" class="text-gray-500">
+        <span v-if="turn.tokens.in || turn.tokens.out" class="text-ink-2">
           · tokens {{ turn.tokens.in }} ↑ / {{ turn.tokens.out }} ↓
         </span>
       </div>
@@ -150,26 +150,26 @@ async function submitOption(optionId?: string) {
 
       <!-- 错误事件 -->
       <div v-for="(err, i) in turn.errors" :key="'err-' + i"
-           class="bg-red-900/20 border border-red-700/40 rounded-lg px-3 py-2 my-2 text-xs text-red-300">
+           class="bg-red-50 border border-red-200 rounded-lg px-3 py-2 my-2 text-xs text-red-700 dark:bg-red-900/20 dark:border-red-700/40 dark:text-red-300">
         <div class="flex items-center gap-2 font-medium mb-1">
           <el-icon><WarningFilled /></el-icon>
           <span>{{ err.agent }} 报告错误</span>
-          <span class="text-gray-500 ml-auto">{{ fmtTime(err.timestamp) }}</span>
+          <span class="text-ink-2 ml-auto">{{ fmtTime(err.timestamp) }}</span>
         </div>
         <div class="whitespace-pre-wrap">{{ err.message }}</div>
       </div>
 
       <!-- 最终回答 -->
-      <div v-if="finalText" class="bg-[#1a1d24] border border-[#2a2d35] rounded-lg px-4 py-3 mt-2 text-sm text-gray-200 leading-relaxed markdown-body"
+      <div v-if="finalText" class="bg-card border border-line rounded-lg px-4 py-3 mt-2 text-sm text-ink leading-relaxed markdown-body"
            v-html="renderMd(finalText)"></div>
 
       <!-- 待澄清提示：Agent 请求用户回答，会话挂起 -->
       <div v-else-if="turn.status === 'awaiting_clarify' && turn.clarifyQuestion"
-           class="bg-yellow-900/20 border border-yellow-700/40 rounded-lg px-3 py-2 my-2 text-xs text-yellow-300">
+           class="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 my-2 text-xs text-amber-700 dark:bg-yellow-900/20 dark:border-yellow-700/40 dark:text-yellow-300">
         <div class="flex items-center gap-2 font-medium mb-1">
           <el-icon><QuestionFilled /></el-icon>
           <span>需要你的澄清</span>
-          <span class="text-gray-500 ml-auto">{{ fmtTime(turn.clarifyQuestion.timestamp) }}</span>
+          <span class="text-ink-2 ml-auto">{{ fmtTime(turn.clarifyQuestion.timestamp) }}</span>
         </div>
         <div class="whitespace-pre-wrap">{{ turn.clarifyQuestion.message }}</div>
 
@@ -179,34 +179,34 @@ async function submitOption(optionId?: string) {
             <template v-if="!clarify.multiSelect">
               <button v-for="opt in clarify.options" :key="opt.id" type="button"
                       :disabled="submitting"
-                      class="text-left text-xs rounded-md border border-yellow-700/40 bg-yellow-900/30 hover:bg-yellow-900/50 px-2.5 py-1.5 text-yellow-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      class="text-left text-xs rounded-md border border-amber-300 bg-amber-50 hover:bg-amber-100 px-2.5 py-1.5 text-amber-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed dark:border-yellow-700/40 dark:bg-yellow-900/30 dark:hover:bg-yellow-900/50 dark:text-yellow-200"
                       @click="submitOption(opt.id)">
                 {{ opt.label }}
-                <span v-if="opt.description" class="text-yellow-400/70 ml-1.5">{{ opt.description }}</span>
+                <span v-if="opt.description" class="text-amber-600/80 dark:text-yellow-400/70 ml-1.5">{{ opt.description }}</span>
               </button>
             </template>
             <template v-else>
               <label v-for="opt in clarify.options" :key="opt.id"
-                     class="flex items-center gap-2 text-xs text-yellow-200 cursor-pointer">
+                     class="flex items-center gap-2 text-xs text-amber-700 cursor-pointer dark:text-yellow-200">
                 <input type="checkbox" :value="opt.id" v-model="selectedOptions" :disabled="submitting"
                        class="accent-yellow-500" />
                 <span>{{ opt.label }}</span>
-                <span v-if="opt.description" class="text-yellow-400/70">{{ opt.description }}</span>
+                <span v-if="opt.description" class="text-amber-600/80 dark:text-yellow-400/70">{{ opt.description }}</span>
               </label>
               <button type="button"
                       :disabled="submitting || selectedOptions.length === 0"
-                      class="self-start text-xs rounded-md border border-yellow-700/40 bg-yellow-900/30 hover:bg-yellow-900/50 px-2.5 py-1 text-yellow-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      class="self-start text-xs rounded-md border border-amber-300 bg-amber-50 hover:bg-amber-100 px-2.5 py-1 text-amber-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed dark:border-yellow-700/40 dark:bg-yellow-900/30 dark:hover:bg-yellow-900/50 dark:text-yellow-200"
                       @click="submitOption()">
                 提交选择
               </button>
             </template>
           </div>
-          <div class="mt-1.5 text-[11px] text-yellow-500/60">也可直接输入文字答复</div>
+          <div class="mt-1.5 text-[11px] text-amber-600/70 dark:text-yellow-500/60">也可直接输入文字答复</div>
         </template>
       </div>
 
       <!-- 运行中提示 -->
-      <div v-else-if="turn.status === 'running'" class="text-xs text-gray-500 mt-2 flex items-center gap-2">
+      <div v-else-if="turn.status === 'running'" class="text-xs text-ink-2 mt-2 flex items-center gap-2">
         <el-icon class="is-loading"><Loading /></el-icon>
         <span>正在生成回答…</span>
       </div>
@@ -218,19 +218,19 @@ async function submitOption(optionId?: string) {
 .markdown-body :deep(p) { margin: 0 0 0.5em 0; }
 .markdown-body :deep(p:last-child) { margin-bottom: 0; }
 .markdown-body :deep(pre) {
-  background: #0f1115;
+  background: var(--bma-page);
   padding: 10px;
   border-radius: 6px;
   margin: 6px 0;
   overflow-x: auto;
-  color: #e5e7eb;
+  color: var(--bma-text);
   font-size: 12px;
 }
 .markdown-body :deep(code) { font-family: monospace; }
-.markdown-body :deep(a) { color: #93c5fd; }
+.markdown-body :deep(a) { color: var(--bma-primary); }
 .markdown-body :deep(ul), .markdown-body :deep(ol) { margin: 0.4em 0 0.4em 1.2em; }
 .markdown-body :deep(h1), .markdown-body :deep(h2), .markdown-body :deep(h3) {
-  color: #e5e7eb;
+  color: var(--bma-text);
   margin: 0.6em 0 0.3em;
   font-weight: 600;
 }

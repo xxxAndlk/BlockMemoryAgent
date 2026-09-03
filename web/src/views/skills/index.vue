@@ -11,12 +11,29 @@ import {
   type LearnedSkill,
   type EvolutionLogEntry,
 } from '@/api/learned'
+import { listSkills } from '@/api/skills'
+import type { Skill } from '@/types'
 
 const activeTab = ref('skills')
 const skills = ref<LearnedSkill[]>([])
 const entries = ref<EvolutionLogEntry[]>([])
 const loading = ref(false)
 const mutating = ref<string | null>(null)
+
+const builtinSkills = ref<Skill[]>([])
+const builtinLoading = ref(false)
+
+async function loadBuiltin() {
+  builtinLoading.value = true
+  try {
+    const res = await listSkills()
+    builtinSkills.value = res.skills || []
+  } catch (e) {
+    ElMessage.error('内置技能加载失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    builtinLoading.value = false
+  }
+}
 
 const editVisible = ref(false)
 const editSaving = ref(false)
@@ -131,14 +148,15 @@ function fmtTime(t: string) {
 onMounted(() => {
   loadSkills()
   loadLog()
+  loadBuiltin()
 })
 </script>
 
 <template>
-  <div class="p-6 h-full overflow-y-auto text-gray-300">
+  <div class="p-6 h-full overflow-y-auto text-ink">
     <div class="mb-4">
-      <h2 class="text-lg font-bold text-gray-200">技能库</h2>
-      <p class="text-xs text-gray-500 mt-1">
+      <h2 class="text-lg font-bold text-ink">技能库</h2>
+      <p class="text-xs text-ink-2 mt-1">
         会话结束自动沉淀的跨项目工艺技能包；任务派发时按语义召回提示（只注一行），load_skill 取全文。
       </p>
     </div>
@@ -146,12 +164,12 @@ onMounted(() => {
     <el-tabs v-model="activeTab">
       <el-tab-pane label="经验技能" name="skills">
         <div v-loading="loading" class="grid gap-3 md:grid-cols-2">
-          <el-card v-for="s in skills" :key="s.name" class="!border-[#2a2d35] !bg-[#1a1d24]" shadow="never">
+          <el-card v-for="s in skills" :key="s.name" class="!border-line !bg-card" shadow="never">
             <div class="flex items-start justify-between gap-3">
               <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-2 flex-wrap">
-                  <span class="font-bold text-gray-200">{{ s.title }}</span>
-                  <el-tag size="small" effect="plain" class="!bg-transparent !border-[#2a2d35] font-mono">{{ s.name }}</el-tag>
+                  <span class="font-bold text-ink">{{ s.title }}</span>
+                  <el-tag size="small" effect="plain" class="!bg-transparent !border-line font-mono">{{ s.name }}</el-tag>
                   <el-tag size="small" :type="s.enabled ? 'success' : 'info'" effect="plain">
                     {{ s.enabled ? '启用' : '禁用' }}
                   </el-tag>
@@ -159,8 +177,8 @@ onMounted(() => {
                     源自{{ s.outcome === 'success' ? '成功' : '失败' }}会话
                   </el-tag>
                 </div>
-                <p class="text-xs text-gray-400 mt-2 line-clamp-2">{{ s.when_to_use }}</p>
-                <div class="mt-2 text-[11px] text-gray-600 flex gap-3">
+                <p class="text-xs text-ink-2 mt-2 line-clamp-2">{{ s.when_to_use }}</p>
+                <div class="mt-2 text-[11px] text-ink-3 flex gap-3">
                   <span>使用 {{ s.use_count }} 次</span>
                   <span>更新于 {{ fmtTime(s.updated_at) }}</span>
                 </div>
@@ -168,31 +186,51 @@ onMounted(() => {
               <div class="flex flex-col items-end gap-2 shrink-0">
                 <el-switch :model-value="s.enabled" :loading="mutating === s.name"
                            :disabled="mutating === s.name" @change="() => toggle(s)" />
-                <el-button size="small" plain class="!bg-transparent !border-[#2a2d35] !text-gray-300" @click="openEdit(s)">
+                <el-button size="small" plain class="!bg-transparent !border-line !text-ink" @click="openEdit(s)">
                   <el-icon class="mr-1"><EditPen /></el-icon> 编辑
                 </el-button>
               </div>
             </div>
           </el-card>
         </div>
-        <div v-if="!loading && !skills.length" class="text-center text-sm text-gray-500 py-16">
+        <div v-if="!loading && !skills.length" class="text-center text-sm text-ink-2 py-16">
           暂无经验技能。有价值的会话（成功或失败）结束后会自动沉淀技能包。
         </div>
       </el-tab-pane>
 
+      <el-tab-pane label="内置技能" name="builtin">
+        <div v-loading="builtinLoading" class="grid gap-3 md:grid-cols-2">
+          <el-card v-for="s in builtinSkills" :key="s.skill_id" shadow="never">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="font-bold text-ink">{{ s.name }}</span>
+              <el-tag size="small" effect="plain">{{ s.domain || '通用' }}</el-tag>
+              <el-tag v-if="s.cost" size="small" type="warning" effect="plain">cost {{ s.cost }}</el-tag>
+            </div>
+            <p class="text-xs text-ink-2 mt-2 line-clamp-2">{{ s.description }}</p>
+            <div v-if="s.tool_ref" class="mt-2 text-[11px] text-ink-3 font-mono break-all">工具：{{ s.tool_ref }}</div>
+            <div v-if="s.tags?.length" class="mt-2 flex flex-wrap gap-1">
+              <el-tag v-for="t in s.tags" :key="t" size="small" effect="plain" class="!text-ink-2">{{ t }}</el-tag>
+            </div>
+          </el-card>
+        </div>
+        <div v-if="!builtinLoading && !builtinSkills.length" class="text-center text-sm text-ink-3 py-16">
+          暂无内置技能（config/skills.yaml 与插件包注入）。
+        </div>
+      </el-tab-pane>
+
       <el-tab-pane label="进化日志" name="log">
-        <el-card class="!border-[#2a2d35] !bg-[#1a1d24]" shadow="never">
+        <el-card class="!border-line !bg-card" shadow="never">
           <el-timeline v-if="entries.length">
             <el-timeline-item v-for="e in entries" :key="e.id" :timestamp="fmtTime(e.created_at)" placement="top">
               <div class="flex items-center gap-2 flex-wrap">
                 <el-tag size="small" :type="kindType(e.kind)" effect="plain">{{ kindLabel(e.kind) }}</el-tag>
-                <span class="text-sm text-gray-300 font-bold">{{ e.target }}</span>
-                <span v-if="e.source_session" class="text-[10px] text-gray-600 font-mono">{{ e.source_session }}</span>
+                <span class="text-sm text-ink font-bold">{{ e.target }}</span>
+                <span v-if="e.source_session" class="text-[10px] text-ink-3 font-mono">{{ e.source_session }}</span>
               </div>
-              <p class="text-xs text-gray-400 mt-1">{{ e.summary }}</p>
+              <p class="text-xs text-ink-2 mt-1">{{ e.summary }}</p>
             </el-timeline-item>
           </el-timeline>
-          <div v-else class="text-center text-sm text-gray-500 py-16">
+          <div v-else class="text-center text-sm text-ink-2 py-16">
             暂无进化记录。
           </div>
         </el-card>
@@ -202,15 +240,15 @@ onMounted(() => {
     <el-dialog v-model="editVisible" :title="`编辑技能：${editName}`" width="640px" top="6vh">
       <div class="space-y-3">
         <div>
-          <div class="text-xs text-gray-500 mb-1">标题</div>
+          <div class="text-xs text-ink-2 mb-1">标题</div>
           <el-input v-model="editTitle" spellcheck="false" />
         </div>
         <div>
-          <div class="text-xs text-gray-500 mb-1">适用场景（when_to_use，参与语义召回）</div>
+          <div class="text-xs text-ink-2 mb-1">适用场景（when_to_use，参与语义召回）</div>
           <el-input v-model="editWhenToUse" type="textarea" :rows="2" spellcheck="false" />
         </div>
         <div>
-          <div class="text-xs text-gray-500 mb-1">正文（步骤 / 坑点 / 验证）</div>
+          <div class="text-xs text-ink-2 mb-1">正文（步骤 / 坑点 / 验证）</div>
           <el-input v-model="editContent" type="textarea" :rows="14" spellcheck="false" class="skill-editor" />
         </div>
       </div>
@@ -233,7 +271,7 @@ onMounted(() => {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
   line-height: 1.7;
-  background: #0f1115;
-  color: #d1d5db;
+  background: var(--bma-page);
+  color: var(--bma-text);
 }
 </style>

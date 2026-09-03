@@ -78,6 +78,13 @@ type (
 		// 默认 false 只替换第一处且要求唯一匹配。
 		ReplaceAll bool `json:"replace_all"`
 	}
+	// restoreFileInput 表示 RestoreFile 工具的输入参数。
+	restoreFileInput struct {
+		// Path 为待恢复文件的目标路径。
+		Path string `json:"path"`
+		// Timestamp 为可选的快照时间戳（格式 20060102-150530），缺省时恢复到最新一份快照。
+		Timestamp string `json:"timestamp,omitempty"`
+	}
 	// listDirInput 表示 ListDir 工具的输入参数。
 	listDirInput struct {
 		// Path 为待列出目录的路径，空字符串时默认使用当前工作目录。
@@ -481,6 +488,122 @@ func (e *Executor) cleanExpiredSnapshots(workDir string) {
 		}
 		return nil
 	})
+}
+
+// ---- RestoreFile（从快照恢复文件） ----
+
+// restoreFile 把文件恢复到 .bma/snapshots 中最近（或指定时间戳）的快照版本。
+// 与 WriteFile/EditFile 同一套写沙箱校验；恢复本身是覆盖操作，
+// 覆盖前会给当前内容再留一份快照（恢复可回退）。
+func (e *Executor) restoreFile(ctx context.Context, args map[string]any) *Result {
+	// 从参数中取出各字段，缺失时使用零值。
+	path, _ := args["path"].(string)
+	stamp, _ := args["timestamp"].(string)
+	if path == "" {
+		return &Result{Tool: "RestoreFile", Error: "path is required"}
+	}
+	// 解析目标路径并做与 WriteFile 相同的写路径校验（沙箱边界 + 角色级写沙箱）。
+	absPath := e.resolvePath(ctx, path)
+	if err := e.sanitizeWritePath(ctx, absPath); err != nil {
+		return &Result{Tool: "RestoreFile", Path: absPath, Error: err.Error()}
+	}
+	if err := e.enforceRoleWritePath(ctx, absPath); err != nil {
+		return &Result{Tool: "RestoreFile", Path: absPath, Error: err.Error()}
+	}
+	workDir := e.workDirOf(ctx)
+	if workDir == "" {
+		return &Result{Tool: "RestoreFile", Path: absPath, Error: "no work directory in context"}
+	}
+	// 查找快照：优先本会话目录，找不到时回退扫描全部会话目录（快照跨会话保留 24h，
+	// 会话重启后新 sessionID 下也能找回旧快照）。
+	snapPath, available := findSnapshot(workDir, SessionIDFromContext(ctx), absPath, stamp)
+	if snapPath == "" {
+		msg := fmt.Sprintf("未找到 %s 的快照。快照仅在 WriteFile/EditFile/RestoreFile 覆盖已存在文件前自动生成，保留 %v。",
+			path, snapshotRetention)
+		if len(available) > 0 {
+			msg += fmt.Sprintf("该文件可用快照时间戳：%s", strings.Join(available, ", "))
+		}
+		return &Result{Tool: "RestoreFile", Path: absPath, Error: msg}
+	}
+	data, err := os.ReadFile(snapPath)
+	if err != nil {
+		return &Result{Tool: "RestoreFile", Path: absPath, Error: "read snapshot: " + err.Error()}
+	}
+	// 确保目标文件所在目录存在（误删场景可能连目录一并被删）。
+	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+		return &Result{Tool: "RestoreFile", Path: absPath, Error: "mkdir: " + err.Error()}
+	}
+	// 覆盖前给当前内容留快照：恢复操作本身可回退（与 WriteFile/EditFile 同一机制）。
+	backupPath := ""
+	if fi, serr := os.Stat(absPath); serr == nil && fi.Mode().IsRegular() {
+		backupPath = e.snapshotBeforeWrite(ctx, absPath)
+	}
+	if err := os.WriteFile(absPath, data, 0644); err != nil {
+		return &Result{Tool: "RestoreFile", Path: absPath, Error: err.Error()}
+	}
+	out := fmt.Sprintf("restored %d bytes from snapshot %s", len(data), snapPath)
+	if backupPath != "" {
+		out += fmt.Sprintf("；覆盖前内容已备份到 %s", backupPath)
+	}
+	return &Result{Tool: "RestoreFile", Success: true, Output: out, Path: absPath}
+}
+
+// findSnapshot 在 <workDir>/.bma/snapshots/ 下查找 absPath 对应的快照文件。
+// 快照命名与 snapshotBeforeWrite 一致：<sessionID>/<relPath>.<stamp>.bak（stamp 格式 20060102-150405，
+// 字典序即时间序）。stamp 非空时精确匹配该时间戳，否则返回最新一份。
+// 返回快照绝对路径与可用时间戳列表（去重升序，供错误提示）；未找到时快照路径为空串。
+func findSnapshot(workDir, sessionID, absPath, stamp string) (snapPath string, available []string) {
+	rel, err := filepath.Rel(workDir, absPath)
+	if err != nil || rel == "" || strings.HasPrefix(rel, "..") {
+		rel = filepath.Base(absPath)
+	}
+	root := filepath.Join(workDir, ".bma", "snapshots")
+	// 候选会话目录：本会话优先，其余会话目录随后（跨会话回退）。
+	var dirs []string
+	if sessionID != "" {
+		dirs = append(dirs, filepath.Join(root, sessionID))
+	}
+	if entries, rerr := os.ReadDir(root); rerr == nil {
+		for _, ent := range entries {
+			if ent.IsDir() && ent.Name() != sessionID {
+				dirs = append(dirs, filepath.Join(root, ent.Name()))
+			}
+		}
+	}
+	base := filepath.Base(rel)
+	relDir := filepath.Dir(rel)
+	stampSet := map[string]bool{}
+	best, bestStamp := "", ""
+	for _, d := range dirs {
+		dir := filepath.Join(d, relDir)
+		entries, rerr := os.ReadDir(dir)
+		if rerr != nil {
+			continue
+		}
+		for _, ent := range entries {
+			name := ent.Name()
+			if ent.IsDir() || !strings.HasPrefix(name, base+".") || !strings.HasSuffix(name, ".bak") {
+				continue
+			}
+			s := strings.TrimSuffix(strings.TrimPrefix(name, base+"."), ".bak")
+			if !stampSet[s] {
+				stampSet[s] = true
+				available = append(available, s)
+			}
+			if stamp != "" {
+				// 指定时间戳：精确匹配即返回。
+				if s == stamp {
+					return filepath.Join(dir, name), available
+				}
+				continue
+			}
+			if s > bestStamp {
+				bestStamp, best = s, filepath.Join(dir, name)
+			}
+		}
+	}
+	slices.Sort(available)
+	return best, available
 }
 
 // ---- EditFile（精确局部替换） ----

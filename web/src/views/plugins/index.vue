@@ -55,41 +55,55 @@ function stateType(p: PluginInfo) {
   return 'warning'
 }
 
+// 形态徽标约定：PluginInfo 无 transport 字段，按 id/kind 判定（spec §06）。
+function transportBadge(p: PluginInfo): { label: string; type: 'warning' | 'info' | '' } | null {
+  if (p.id === 'host_computer_use') return { label: '宿主直控', type: 'warning' }
+  if (p.id === 'computer_use') return { label: 'Docker 沙箱', type: 'info' }
+  if (p.kind === 'service') return { label: 'HTTP 服务', type: '' }
+  return null
+}
+
 onMounted(load)
 </script>
 
 <template>
-  <div class="p-6 h-full overflow-y-auto text-gray-300">
+  <div class="p-6 h-full overflow-y-auto text-ink">
     <div class="flex items-center justify-between mb-4">
       <div>
-        <h2 class="text-lg font-bold text-gray-200">插件管理</h2>
-        <p class="text-xs text-gray-500 mt-1">热插拔 MCP / bundle 插件；启用/停用下一轮对话生效，无需重启服务。</p>
+        <h2 class="text-lg font-bold text-ink">插件管理</h2>
+        <p class="text-xs text-ink-2 mt-1">热插拔 MCP / bundle 插件；启用/停用下一轮对话生效，无需重启服务。</p>
       </div>
-      <el-button plain class="!bg-transparent !border-[#2a2d35] !text-gray-300" :loading="loading" @click="handleReload">
+      <el-button plain class="!bg-transparent !border-line !text-ink" :loading="loading" @click="handleReload">
         <el-icon class="mr-1"><Refresh /></el-icon> 重载配置
       </el-button>
     </div>
 
     <div class="grid gap-3 md:grid-cols-2">
-      <el-card v-for="p in plugins" :key="p.id" class="!border-[#2a2d35] !bg-[#1a1d24]">
+      <el-card v-for="p in plugins" :key="p.id" class="!border-line !bg-card">
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-2 flex-wrap">
-              <span class="font-bold text-gray-200">{{ p.name || p.id }}</span>
-              <el-tag size="small" effect="plain" class="!bg-transparent !border-[#2a2d35]">{{ p.kind }}</el-tag>
+              <span class="font-bold text-ink">{{ p.name || p.id }}</span>
+              <el-tag size="small" effect="plain" class="!bg-transparent !border-line">{{ p.kind }}</el-tag>
+              <el-tag v-if="transportBadge(p)" size="small" :type="transportBadge(p)!.type" effect="plain">
+                {{ transportBadge(p)!.label }}
+              </el-tag>
               <el-tag size="small" :type="stateType(p)" effect="plain">{{ p.enabled ? (p.state || 'enabled') : 'disabled' }}</el-tag>
-              <span v-if="p.version" class="text-[10px] text-gray-600">v{{ p.version }}</span>
+              <span v-if="p.version" class="text-[10px] text-ink-3">v{{ p.version }}</span>
             </div>
-            <p v-if="p.description" class="text-xs text-gray-400 mt-2 line-clamp-2">{{ p.description }}</p>
+            <p v-if="p.description" class="text-xs text-ink-2 mt-2 line-clamp-2">{{ p.description }}</p>
+            <div v-if="p.id === 'host_computer_use'" class="text-[11px] text-amber-600 dark:text-amber-400">
+              该插件直接操作宿主机 GUI（鼠标/键盘/截屏），与沙箱版 computer_use 不要同时启用。
+            </div>
             <div v-if="p.tools?.length" class="mt-2 flex flex-wrap gap-1">
               <el-tag v-for="t in p.tools" :key="t" size="small" effect="plain"
-                      class="!bg-[#0f1115] !border-[#2a2d35] !text-gray-400 font-mono">{{ t }}</el-tag>
+                      class="!bg-page !border-line !text-ink-2 font-mono">{{ t }}</el-tag>
             </div>
             <div class="mt-2 space-y-1 text-[11px]">
-              <div v-if="p.roles?.length" class="text-gray-500">
-                可见角色：<span class="text-gray-400">{{ p.roles.join('、') }}</span>
+              <div v-if="p.roles?.length" class="text-ink-2">
+                可见角色：<span class="text-ink-2">{{ p.roles.join('、') }}</span>
               </div>
-              <div v-if="p.url" class="text-gray-500 truncate">
+              <div v-if="p.url" class="text-ink-2 truncate">
                 入口：<a :href="p.url" target="_blank" rel="noreferrer" class="text-blue-400 hover:underline">{{ p.url }}</a>
               </div>
               <div v-if="p.missing_env?.length" class="text-orange-400">
@@ -105,7 +119,7 @@ onMounted(load)
       </el-card>
     </div>
 
-    <div v-if="!loading && !plugins.length" class="text-center text-sm text-gray-500 py-16">
+    <div v-if="!loading && !plugins.length" class="text-center text-sm text-ink-2 py-16">
       暂无已注册插件。外部插件包放入 config/plugins.d/ 后点击「重载配置」。
     </div>
   </div>

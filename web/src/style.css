@@ -2,26 +2,88 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ===== BMA 设计 Token：浅色默认，html.dark 深色（localStorage bma:theme 持久化）===== */
 :root {
-  --el-bg-color: #1a1d24;
-  --el-bg-color-overlay: #1a1d24;
-  --el-text-color-primary: #e5e7eb;
-  --el-text-color-regular: #9ca3af;
-  --el-border-color: #2a2d35;
-  --el-border-color-light: #2a2d35;
-  --el-fill-color-blank: #1a1d24;
-  --el-menu-bg-color: #1a1d24;
-  --el-menu-hover-bg-color: #2a2d35;
+  --bma-primary: #4F5DFF;
+  --bma-primary-hover: #3D4BE0;
+  --bma-primary-soft: #EEF0FF;
+  --bma-page: #F6F7F9;
+  --bma-card: #FFFFFF;
+  --bma-border: #E5E7EB;
+  --bma-text: #1F2329;
+  --bma-text-2: #6B7280;
+  --bma-text-3: #9CA3AF;
+  --bma-success: #16A34A;
+  --bma-danger: #DC2626;
+  --bma-warning: #D97706;
+  --bma-card-shadow: 0 1px 2px rgba(16, 24, 40, .05);
+
+  /* Element Plus 浅色覆写 */
+  --el-color-primary: var(--bma-primary);
+  --el-color-primary-light-3: #7C86FF;
+  --el-color-primary-light-5: #A4ABFF;
+  --el-color-primary-light-7: #CCD0FF;
+  --el-color-primary-light-8: #E0E3FF;
+  --el-color-primary-light-9: var(--bma-primary-soft);
+  --el-color-primary-dark-2: var(--bma-primary-hover);
+  --el-bg-color: #FFFFFF;
+  --el-bg-color-overlay: #FFFFFF;
+  --el-bg-color-page: var(--bma-page);
+  --el-text-color-primary: var(--bma-text);
+  --el-text-color-regular: var(--bma-text-2);
+  --el-text-color-secondary: var(--bma-text-3);
+  --el-border-color: var(--bma-border);
+  --el-border-color-light: var(--bma-border);
+  --el-border-color-lighter: #EEF0F3;
+  --el-fill-color-blank: #FFFFFF;
+  --el-fill-color-light: #F3F4F6;
+  --el-menu-bg-color: transparent;
+  --el-menu-hover-bg-color: var(--bma-primary-soft);
+  --el-menu-text-color: var(--bma-text-2);
+  --el-menu-active-color: var(--bma-primary);
 }
 
 html.dark {
-  /* Let element plus know it's dark mode */
+  --bma-primary: #6B77FF;
+  --bma-primary-hover: #8A94FF;
+  --bma-primary-soft: #232947;
+  --bma-page: #0F1115;
+  --bma-card: #1A1D24;
+  --bma-border: #2A2D35;
+  --bma-text: #E5E7EB;
+  --bma-text-2: #9CA3AF;
+  --bma-text-3: #6B7280;
+  --bma-card-shadow: 0 1px 2px rgba(0, 0, 0, .4);
+
+  /* Element Plus 深色覆写（theme-chalk/dark/css-vars.css 已提供基底，这里对齐品牌色） */
+  --el-color-primary: var(--bma-primary);
+  --el-bg-color: #1A1D24;
+  --el-bg-color-overlay: #1A1D24;
+  --el-bg-color-page: var(--bma-page);
+  --el-text-color-primary: #E5E7EB;
+  --el-text-color-regular: #9CA3AF;
+  --el-border-color: #2A2D35;
+  --el-border-color-light: #2A2D35;
+  --el-border-color-lighter: #33373F;
+  --el-fill-color-blank: #1A1D24;
+  --el-fill-color-light: #23262E;
+  --el-menu-bg-color: transparent;
+  --el-menu-hover-bg-color: #2A2D35;
+  --el-menu-text-color: #9CA3AF;
+  --el-menu-active-color: #FFFFFF;
 }
 
 body {
   margin: 0;
-  background-color: #0f1219;
-  color: #e5e7eb;
+  background-color: var(--bma-page);
+  color: var(--bma-text);
+}
+
+/* 等宽工具类：路径 / 日志 / 代码 */
+.font-mono,
+code,
+pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .el-menu {
@@ -29,21 +91,24 @@ body {
 }
 
 .el-card {
-  background-color: var(--el-bg-color);
-  border-color: var(--el-border-color);
-  color: var(--el-text-color-primary);
+  background-color: var(--bma-card);
+  border-color: var(--bma-border);
+  border-radius: 10px;
+  box-shadow: var(--bma-card-shadow);
+  color: var(--bma-text);
 }
 
 .el-table {
-  background-color: var(--el-bg-color);
-  --el-table-border-color: var(--el-border-color);
-  --el-table-header-bg-color: var(--el-bg-color);
-  --el-table-row-hover-bg-color: #2a2d35;
+  background-color: var(--bma-card);
+  --el-table-border-color: var(--bma-border);
+  --el-table-header-bg-color: var(--bma-card);
+  --el-table-row-hover-bg-color: var(--bma-primary-soft);
 }
 
 .el-table th.el-table__cell {
-  background-color: var(--el-bg-color);
+  background-color: var(--bma-card);
 }
+
 .el-table tr {
-  background-color: var(--el-bg-color);
+  background-color: var(--bma-card);
 }

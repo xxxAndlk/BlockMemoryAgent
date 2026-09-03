@@ -16,13 +16,13 @@ const html = computed(() => renderMd(props.content))
 <style scoped>
 .markdown-body :deep(p) { margin: 0; }
 .markdown-body :deep(pre) {
-  background: #0f1115;
+  background: var(--bma-page);
   padding: 8px;
   border-radius: 4px;
   margin-top: 4px;
   overflow-x: auto;
-  color: #e5e7eb;
+  color: var(--bma-text);
 }
 .markdown-body :deep(code) { font-family: monospace; }
-.markdown-body :deep(a) { color: #93c5fd; }
+.markdown-body :deep(a) { color: var(--bma-primary); }
 </style>

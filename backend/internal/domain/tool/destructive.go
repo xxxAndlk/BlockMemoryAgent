@@ -89,6 +89,10 @@ func ApprovalMessage(toolName string, args map[string]any) string {
 		if p, _ := args["path"].(string); p != "" {
 			desc = "将写入文件 " + p
 		}
+	case "RestoreFile":
+		if p, _ := args["path"].(string); p != "" {
+			desc = "将从快照恢复文件 " + p + "（覆盖当前内容）"
+		}
 	case "RunCommand":
 		if c, _ := args["command"].(string); c != "" {
 			desc = "将执行命令 " + truncate(c, 120)

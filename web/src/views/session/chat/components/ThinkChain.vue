@@ -40,54 +40,54 @@ function asText(s: string | undefined): string {
 </script>
 
 <template>
-  <div v-if="events.length" class="rounded-lg border border-[#2a2d35] bg-[#0f1115]/60 my-2">
-    <button class="w-full text-left px-3 py-2 flex items-center justify-between hover:bg-[#14161a]/80 transition-colors"
+  <div v-if="events.length" class="rounded-lg border border-line bg-page my-2">
+    <button class="w-full text-left px-3 py-2 flex items-center justify-between hover:bg-card transition-colors"
             @click="collapsed = !collapsed">
-      <span class="flex items-center gap-2 text-xs text-gray-300">
+      <span class="flex items-center gap-2 text-xs text-ink">
         <el-icon class="text-blue-400"><ChatLineRound /></el-icon>
         <span class="font-medium">思考链路</span>
-        <span class="text-gray-500">{{ visible.length }} 步</span>
-        <span v-if="!verbose && hiddenCount > 0" class="text-gray-500">（已折叠 +{{ hiddenCount }}）</span>
+        <span class="text-ink-2">{{ visible.length }} 步</span>
+        <span v-if="!verbose && hiddenCount > 0" class="text-ink-2">（已折叠 +{{ hiddenCount }}）</span>
       </span>
-      <el-icon class="text-gray-500 transition-transform" :class="{'rotate-180': !collapsed}"><ArrowDown /></el-icon>
+      <el-icon class="text-ink-2 transition-transform" :class="{'rotate-180': !collapsed}"><ArrowDown /></el-icon>
     </button>
 
     <div v-show="!collapsed" class="px-3 pb-3 space-y-2">
       <div v-for="(ev, i) in visible" :key="i" class="text-xs">
         <div class="flex items-start gap-2">
-          <div class="w-12 shrink-0 text-gray-500 pt-0.5">{{ fmtTime(ev.timestamp) }}</div>
+          <div class="w-12 shrink-0 text-ink-2 pt-0.5">{{ fmtTime(ev.timestamp) }}</div>
           <el-tag size="small" :type="kindTagType(ev.kind, ev.type)" effect="plain"
-                  class="!bg-transparent !border-[#2a2d35] shrink-0 scale-90 origin-left">
+                  class="!bg-transparent !border-line shrink-0 scale-90 origin-left">
             <el-icon class="mr-0.5 text-[10px]"><component :is="kindIcon(ev.kind, ev.type)" /></el-icon>
             {{ kindLabel(ev.kind, ev.type) }}
           </el-tag>
           <span class="text-[11px] shrink-0" :class="agentTextColor(ev.agent)">{{ ev.agent }}</span>
           <div class="flex-1 min-w-0">
-            <div class="text-gray-300 break-words leading-relaxed whitespace-pre-wrap">{{ asText(ev.message) }}</div>
+            <div class="text-ink break-words leading-relaxed whitespace-pre-wrap">{{ asText(ev.message) }}</div>
             <button v-if="hasDetail(ev)"
-                    class="text-[10px] text-gray-500 hover:text-gray-300 mt-1 flex items-center gap-1"
+                    class="text-[10px] text-ink-2 hover:text-ink mt-1 flex items-center gap-1"
                     @click="toggle(i)">
               <el-icon class="text-[10px]"><component :is="expanded.has(i) ? 'ArrowUp' : 'ArrowDown'" /></el-icon>
               {{ expanded.has(i) ? '收起详情' : '展开详情' }}
             </button>
-            <div v-if="expanded.has(i)" class="mt-2 space-y-1.5 pl-2 border-l-2 border-[#2a2d35]">
+            <div v-if="expanded.has(i)" class="mt-2 space-y-1.5 pl-2 border-l-2 border-line">
               <div v-if="ev.prompt">
-                <div class="text-[10px] text-gray-500 mb-0.5">Prompt 摘要</div>
-                <pre class="bg-[#0f1115] p-2 rounded text-[11px] text-gray-400 whitespace-pre-wrap font-mono">{{ ev.prompt }}</pre>
+                <div class="text-[10px] text-ink-2 mb-0.5">Prompt 摘要</div>
+                <pre class="bg-page p-2 rounded text-[11px] text-ink-2 whitespace-pre-wrap font-mono">{{ ev.prompt }}</pre>
               </div>
               <div v-if="ev.detail_json">
-                <div class="text-[10px] text-gray-500 mb-0.5">结构化详情</div>
-                <pre class="bg-[#0f1115] p-2 rounded text-[11px] text-gray-400 whitespace-pre-wrap font-mono">{{ ev.detail_json }}</pre>
+                <div class="text-[10px] text-ink-2 mb-0.5">结构化详情</div>
+                <pre class="bg-page p-2 rounded text-[11px] text-ink-2 whitespace-pre-wrap font-mono">{{ ev.detail_json }}</pre>
               </div>
               <div v-if="ev.tool_output">
-                <div class="text-[10px] text-gray-500 mb-0.5">工具输出</div>
-                <pre class="bg-[#0f1115] p-2 rounded text-[11px] text-gray-400 whitespace-pre-wrap font-mono">{{ ev.tool_output }}</pre>
+                <div class="text-[10px] text-ink-2 mb-0.5">工具输出</div>
+                <pre class="bg-page p-2 rounded text-[11px] text-ink-2 whitespace-pre-wrap font-mono">{{ ev.tool_output }}</pre>
               </div>
               <div v-if="ev.tool_error">
-                <div class="text-[10px] text-gray-500 mb-0.5">错误</div>
-                <pre class="bg-[#0f1115] p-2 rounded text-[11px] text-red-400 whitespace-pre-wrap font-mono">{{ ev.tool_error }}</pre>
+                <div class="text-[10px] text-ink-2 mb-0.5">错误</div>
+                <pre class="bg-page p-2 rounded text-[11px] text-red-400 whitespace-pre-wrap font-mono">{{ ev.tool_error }}</pre>
               </div>
-              <div v-if="ev.input_tokens || ev.output_tokens" class="text-[10px] text-gray-500">
+              <div v-if="ev.input_tokens || ev.output_tokens" class="text-[10px] text-ink-2">
                 Token: in={{ ev.input_tokens || 0 }} · out={{ ev.output_tokens || 0 }}
               </div>
             </div>

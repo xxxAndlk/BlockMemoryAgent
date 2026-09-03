@@ -30,25 +30,25 @@ const expandedLogId = defineModel<number | null>('expandedLogId')
       <el-button size="small" type="primary" @click="emit('query')">查询</el-button>
     </div>
     <div class="flex-1 overflow-y-auto space-y-2 pr-1">
-      <div v-if="!props.logs.length" class="text-gray-500 text-sm text-center py-10">暂无结构化日志</div>
-      <div v-for="log in props.logs" :key="log.id" class="text-xs border border-[#2a2d35] rounded p-2 bg-[#14161a]">
+      <div v-if="!props.logs.length" class="text-ink-2 text-sm text-center py-10">暂无结构化日志</div>
+      <div v-for="log in props.logs" :key="log.id" class="text-xs border border-line rounded p-2 bg-page">
         <div class="flex items-center justify-between mb-1">
           <div class="flex items-center gap-2">
-            <el-tag size="small" :type="log.level === 'error' ? 'danger' : log.level === 'warn' ? 'warning' : 'info'" effect="plain" class="!bg-transparent !border-[#2a2d35] scale-90 origin-left">{{ log.level }}</el-tag>
-            <span class="text-gray-400">{{ log.phase }}</span>
-            <span class="text-gray-500">{{ log.agent }}</span>
+            <el-tag size="small" :type="log.level === 'error' ? 'danger' : log.level === 'warn' ? 'warning' : 'info'" effect="plain" class="!bg-transparent !border-line scale-90 origin-left">{{ log.level }}</el-tag>
+            <span class="text-ink-2">{{ log.phase }}</span>
+            <span class="text-ink-2">{{ log.agent }}</span>
           </div>
-          <span class="text-gray-500">{{ fmtDateTime(log.created_at) }}</span>
+          <span class="text-ink-2">{{ fmtDateTime(log.created_at) }}</span>
         </div>
-        <div class="text-gray-200 mb-1">{{ log.message }}</div>
-        <div v-if="log.input_tokens || log.output_tokens" class="text-gray-500 mb-1">tokens: {{ log.input_tokens }} / {{ log.output_tokens }} · latency: {{ log.latency_ms }}ms · model: {{ log.model || '-' }}</div>
+        <div class="text-ink mb-1">{{ log.message }}</div>
+        <div v-if="log.input_tokens || log.output_tokens" class="text-ink-2 mb-1">tokens: {{ log.input_tokens }} / {{ log.output_tokens }} · latency: {{ log.latency_ms }}ms · model: {{ log.model || '-' }}</div>
         <div v-if="log.prompt || log.response" class="mt-2">
           <el-button link size="small" type="primary" @click="expandedLogId = expandedLogId === log.id ? null : log.id">
             {{ expandedLogId === log.id ? '收起' : '展开 Prompt/Response' }}
           </el-button>
           <div v-if="expandedLogId === log.id" class="mt-2 space-y-2">
-            <div v-if="log.prompt" class="bg-[#0f1115] p-2 rounded text-gray-400 whitespace-pre-wrap">{{ log.prompt }}</div>
-            <div v-if="log.response" class="bg-[#0f1115] p-2 rounded text-gray-400 whitespace-pre-wrap">{{ log.response }}</div>
+            <div v-if="log.prompt" class="bg-card p-2 rounded text-ink-2 whitespace-pre-wrap">{{ log.prompt }}</div>
+            <div v-if="log.response" class="bg-card p-2 rounded text-ink-2 whitespace-pre-wrap">{{ log.response }}</div>
           </div>
         </div>
       </div>

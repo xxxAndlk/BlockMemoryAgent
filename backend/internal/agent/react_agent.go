@@ -690,7 +690,7 @@ const (
 // 验证类）不算产出——连续 24 轮纯探查零写入本身就是异常信号，且 6/12 轮两次预警给了
 // 正常长验证充足的自我收口窗口（预警只提示不杀）。
 var productiveToolNames = map[string]bool{
-	"WriteFile": true, "EditFile": true,
+	"WriteFile": true, "EditFile": true, "RestoreFile": true,
 	"call_sub_agent": true, "call_sub_agents": true,
 	"send_message": true, "ask_user": true,
 	"WriteSharedMemory": true, "WriteSpec": true,
