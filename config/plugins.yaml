@@ -163,6 +163,12 @@ plugins:
         # 这条——daemon 模型目录只认注册 id，见下方 ui_design 的 OD_DEFAULT_MODEL）。
         ARK_API_KEY: ${ARK_API_KEY:}
         OD_CUSTOM_IMAGE_API_KEY: ${ARK_API_KEY:}
+        # 生视频（2026-09-04）：OD_AIHUBMIX_API_KEY = OpenAI /videos 协议网关的 key
+        #（daemon aihubmix provider 槽位）；方舟 tasks 协议网关继续用 ARK_API_KEY。
+        # OD_MEDIA_MODEL_ALIASES 可选：方舟侧自定义接入点 id 时填 JSON 映射，如
+        # {"doubao-seedance-2-0-fast-260128":"ep-xxx"}（daemon 渲染前改写 wire 模型名）。
+        OD_AIHUBMIX_API_KEY: ${VIDEO_OPENAI_API_KEY:}
+        OD_MEDIA_MODEL_ALIASES: ${OD_MEDIA_MODEL_ALIASES:}
       requires_env: ["OD_API_TOKEN"]
       url: http://localhost:7456
       health_url: http://localhost:7456/api/health
@@ -178,8 +184,16 @@ plugins:
           json:
             providers:
               custom-image:
-                baseUrl: ${ARK_BASE_URL}
-                model: doubao-seedream-5.0-lite
+                baseUrl: ${GEMINI_IMAGE_URL}
+                model: imagen # doubao-seedream-5.0-lite
+              # 生视频双协议槽位（2026-09-04）：aihubmix = OpenAI /videos 协议网关
+              #（任意模型名，目录旁路）；volcengine = 方舟 tasks 协议网关，baseUrl
+              # 缺省官方地址，仅自定义网关时需覆盖。空串键跳过（同 custom-image）。
+              aihubmix:
+                baseUrl: ${VIDEO_OPENAI_URL:}
+                model: ${VIDEO_OPENAI_MODEL:}
+              volcengine:
+                baseUrl: ${VIDEO_VOLC_URL:}
       # 注：service 插件不注入工具也不解析 roles（Tools 恒空），角色门控无意义。
 
   # ui_design：Agent 画图工具（kind: mcp，2026-08-17 新增）。
@@ -187,6 +201,8 @@ plugins:
   # stdio MCP 桥（docker/open-design-mcp）：od_image_generate 生成图片（单张 prompt /
   # 批量 prompts 数组桥内顺序串行）并落盘 volumes 映射的宿主目录（返回 workspace
   # 相对路径供 HTML/CSS 引用），od_image_list 列历史产物。
+  # 2026-09-04 新增 od_video_generate（文生视频，双协议：方舟 tasks / OpenAI /videos）
+  # 与 od_video_list；视频产物 mp4 同机制落盘，HTML <video> 引用。
   # roles（TODO #55 由 ["ui_assistant"] 放宽）：meta 纳入派发考量（MetaAgent 看得见才会把
   # AI 贴图路线写进 spec）；domain 允许领域 Agent 直接出图；ui_assistant 原有专用角色保留。
   # 落盘目录约定（2026-08-18 修订）：产物默认落 <工作目录>/.bma/od-artifacts（草稿/临时用途）；
@@ -223,6 +239,13 @@ plugins:
         OD_DEFAULT_MODEL: custom-image
         # 缺省产物（未传 save_as 的草稿）返回给 Agent 的宿主侧相对路径前缀（相对工作目录）。
         OD_OUTPUT_REL_PREFIX: .bma/od-artifacts
+        # 生视频（od_video_generate）：provider 缺省 volcengine（方舟 tasks 协议）；
+        # openai = OpenAI /videos 协议网关（模型名裸填，桥自动补 aihubmix- 前缀）。
+        # 视频单条 30s–5min，桥侧超时独立（默认 720s，图片仍 180s）。
+        OD_VIDEO_PROVIDER: ${VIDEO_PROVIDER:}
+        OD_VOLCENGINE_VIDEO_MODEL: ${VIDEO_VOLC_MODEL:}
+        OD_OPENAI_VIDEO_MODEL: ${VIDEO_OPENAI_MODEL:}
+        OD_VIDEO_TIMEOUT_MS: ${OD_VIDEO_TIMEOUT_MS:}
       roles: ["meta","domain","ui_assistant"]
       # 1200s：批量 20+ 张 × 单张最长 60s（桥内串行）可能逼近 20min，见上方注释。
       exec_timeout_sec: 1200
