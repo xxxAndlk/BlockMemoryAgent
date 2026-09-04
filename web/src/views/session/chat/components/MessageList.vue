@@ -52,8 +52,8 @@ defineExpose({ scrollToBottom })
        class="flex-1 overflow-y-auto px-6 py-4 min-h-0 scroll-smooth"
        @scroll="onScroll">
     <template v-if="events.length === 0">
-      <div class="h-full flex flex-col items-center justify-center text-gray-500 text-sm gap-3">
-        <el-icon class="text-5xl text-gray-700"><ChatLineRound /></el-icon>
+      <div class="h-full flex flex-col items-center justify-center text-ink-2 text-sm gap-3">
+        <el-icon class="text-5xl text-ink-3"><ChatLineRound /></el-icon>
         <div>选择一个会话开始查看，或在下方输入框直接下达新命令。</div>
       </div>
     </template>

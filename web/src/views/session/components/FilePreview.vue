@@ -2,7 +2,7 @@
   <div class="h-full flex gap-4 overflow-hidden">
     <!-- Left Column: File Tree -->
     <div class="w-72 flex flex-col gap-4 overflow-y-auto">
-      <el-card class="!border-dark-border !bg-dark-panel h-full flex flex-col">
+      <el-card class="!border-line !bg-card h-full flex flex-col">
         <template #header>
           <div class="font-bold text-sm">文件列表 (WriteFile 结果)</div>
         </template>
@@ -22,7 +22,7 @@
               <el-icon v-if="data.children" class="text-yellow-500"><Folder /></el-icon>
               <el-icon v-else class="text-blue-400"><Document /></el-icon>
               <span :class="{ 'text-primary': node.isCurrent }">{{ node.label }}</span>
-              <span v-if="data.size !== undefined" class="text-xs text-gray-500">({{ formatSize(data.size) }})</span>
+              <span v-if="data.size !== undefined" class="text-xs text-ink-2">({{ formatSize(data.size) }})</span>
             </span>
           </template>
         </el-tree>
@@ -31,7 +31,7 @@
 
     <!-- Right Column: File Content -->
     <div class="flex-1 flex flex-col gap-4 overflow-hidden">
-      <el-card class="!border-dark-border !bg-dark-panel h-full flex flex-col body-flex-1">
+      <el-card class="!border-line !bg-card h-full flex flex-col body-flex-1">
         <template #header>
           <div class="flex justify-between items-center">
             <div class="font-bold text-sm flex items-center gap-2">
@@ -39,19 +39,19 @@
               {{ currentFileName }}
             </div>
             <div class="flex gap-2">
-              <el-button size="small" class="!bg-dark-bg !border-dark-border !text-gray-300">在 VS Code 中打开</el-button>
+              <el-button size="small" class="!bg-page !border-line !text-ink">在 VS Code 中打开</el-button>
               <el-button type="primary" size="small" plain>下载文件</el-button>
             </div>
           </div>
         </template>
 
-        <div v-if="loading" class="flex items-center justify-center h-full text-sm text-gray-500">
+        <div v-if="loading" class="flex items-center justify-center h-full text-sm text-ink-2">
           <el-icon class="is-loading mr-2"><Loading /></el-icon> 加载中…
         </div>
-        <div v-else-if="content" class="bg-[#1e1e1e] p-4 rounded h-full overflow-y-auto font-mono text-sm text-gray-300 whitespace-pre-wrap">{{ content }}</div>
-        <div v-else class="flex items-center justify-center h-full text-sm text-gray-500">请在左侧选择文件查看内容</div>
+        <div v-else-if="content" class="bg-page p-4 rounded h-full overflow-y-auto font-mono text-sm text-ink whitespace-pre-wrap">{{ content }}</div>
+        <div v-else class="flex items-center justify-center h-full text-sm text-ink-2">请在左侧选择文件查看内容</div>
 
-        <div class="mt-4 pt-2 border-t border-dark-border text-xs text-gray-500 flex justify-between">
+        <div class="mt-4 pt-2 border-t border-line text-xs text-ink-2 flex justify-between">
           <span>文件路径：{{ currentFilePath || '-' }} | 大小：{{ currentFileSize || '-' }}</span>
           <span>{{ currentFileDate || '' }}</span>
         </div>
@@ -160,7 +160,7 @@ function formatSize(bytes: number) {
   height: 32px;
 }
 :deep(.custom-tree .el-tree-node__content:hover) {
-  background-color: #2a2d35 !important;
+  background-color: var(--bma-primary-soft) !important;
 }
 :deep(.custom-tree .el-tree-node:focus > .el-tree-node__content) {
   background-color: transparent !important;
@@ -175,10 +175,10 @@ pre::-webkit-scrollbar-track {
   background: transparent;
 }
 pre::-webkit-scrollbar-thumb {
-  background: #4b5563;
+  background: var(--bma-text-3);
   border-radius: 4px;
 }
 pre::-webkit-scrollbar-thumb:hover {
-  background: #6b7280;
+  background: var(--bma-text-2);
 }
 </style>

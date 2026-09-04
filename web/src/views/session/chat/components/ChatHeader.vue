@@ -10,13 +10,13 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: 'cancel'): void; (e: 'stop'): void; (e: 'interrupt'): void }>()
 
 const statusColor = computed(() => {
-  if (!props.session) return 'text-gray-500'
+  if (!props.session) return 'text-ink-2'
   switch (props.session.status) {
     case 'running': return props.session.destroy_at ? 'text-orange-400' : 'text-blue-400'
     case 'completed': return 'text-green-400'
     case 'error': return 'text-red-400'
     case 'paused_on_child': return 'text-yellow-400'
-    default: return 'text-gray-500'
+    default: return 'text-ink-2'
   }
 })
 
@@ -65,29 +65,29 @@ function nodeColor(type: string) {
   if (type === 'domain') return 'text-purple-400'
   if (type === 'subdomain') return 'text-fuchsia-400'
   if (type === 'assistant') return 'text-emerald-400'
-  return 'text-gray-400'
+  return 'text-ink-2'
 }
 </script>
 
 <template>
-  <div class="h-14 border-b border-[#2a2d35] bg-[#14161a] flex items-center px-6 gap-4 shrink-0">
+  <div class="h-14 border-b border-line bg-card flex items-center px-6 gap-4 shrink-0">
     <div class="flex items-center gap-2 min-w-0 flex-1">
       <el-icon class="text-blue-400"><ChatLineRound /></el-icon>
-      <span class="font-semibold text-gray-200 truncate">
+      <span class="font-semibold text-ink truncate">
         {{ session?.goal || '尚未选择会话' }}
       </span>
       <el-tag size="small" effect="plain"
-              class="!bg-transparent !border-[#2a2d35] scale-90 shrink-0"
+              class="!bg-transparent !border-line scale-90 shrink-0"
               :class="statusColor">{{ statusLabel }}</el-tag>
       <!-- 抢占中断：打断当前执行并注入新指令（对齐 TUI /interrupt） -->
       <el-button v-if="session?.status === 'running' && !session?.destroy_at" size="small"
-                 class="!bg-transparent !border-[#2a2d35] !text-gray-400 hover:!text-white shrink-0"
+                 class="!bg-transparent !border-line !text-ink-2 hover:!text-primary shrink-0"
                  @click="emit('interrupt')">
         <el-icon class="mr-1"><Pointer /></el-icon>中断
       </el-button>
       <!-- 软停止：可续跑（TODO #37）；硬终止走原 cancel（带确认） -->
       <el-button v-if="session?.status === 'running' && !session?.destroy_at" size="small"
-                 class="!bg-orange-900/30 !border-orange-700/40 !text-orange-400 hover:!bg-orange-800/50 shrink-0"
+                 class="!bg-amber-50 !border-amber-300 !text-amber-700 dark:!bg-orange-900/30 dark:!border-orange-700/40 dark:!text-orange-400 shrink-0"
                  @click="emit('stop')">
         <el-icon class="mr-1"><SwitchButton /></el-icon>软停止
       </el-button>
@@ -95,18 +95,18 @@ function nodeColor(type: string) {
         {{ destroyCountdown }}
       </span>
       <el-button v-if="session?.status === 'running' && !session?.destroy_at" size="small"
-                 class="!bg-red-900/30 !border-red-700/40 !text-red-400 hover:!bg-red-800/50 shrink-0"
+                 class="!bg-red-50 !border-red-300 !text-red-700 dark:!bg-red-900/30 dark:!border-red-700/40 dark:!text-red-400 shrink-0"
                  @click="emit('cancel')">
         <el-icon class="mr-1"><CircleClose /></el-icon>终止
       </el-button>
-      <span class="text-xs text-gray-500 truncate shrink-0">{{ session?.id || '' }}</span>
+      <span class="text-xs text-ink-2 truncate shrink-0">{{ session?.id || '' }}</span>
     </div>
 
     <!-- Agent 链路 -->
-    <div v-if="chain.length" class="flex items-center gap-1.5 text-xs text-gray-500 overflow-x-auto max-w-[60%]">
+    <div v-if="chain.length" class="flex items-center gap-1.5 text-xs text-ink-2 overflow-x-auto max-w-[60%]">
       <template v-for="(a, i) in chain" :key="a.inst_id">
         <span :class="nodeColor(a.type)" class="whitespace-nowrap">{{ a.name }}</span>
-        <el-icon v-if="i < chain.length - 1" class="text-gray-600 text-[10px]"><ArrowRight /></el-icon>
+        <el-icon v-if="i < chain.length - 1" class="text-ink-3 text-[10px]"><ArrowRight /></el-icon>
       </template>
     </div>
   </div>

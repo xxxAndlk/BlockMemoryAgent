@@ -1,62 +1,78 @@
 <template>
-  <div class="flex flex-col h-screen w-full overflow-hidden bg-dark-bg text-gray-200">
+  <div class="flex flex-col h-screen w-full overflow-hidden bg-page text-ink">
     <!-- Header -->
-    <header class="h-14 bg-[#14161a] border-b border-dark-border flex items-center px-4 shrink-0">
+    <header class="h-14 bg-card border-b border-line flex items-center px-4 shrink-0">
       <div class="flex items-center w-52 shrink-0">
         <el-icon class="text-primary text-2xl mr-2"><Grid /></el-icon>
         <span class="font-bold text-lg">BlockMemoryAgent</span>
       </div>
-      
-      <div class="flex items-center space-x-4 ml-4 shrink-0">
-        <div class="flex items-center text-sm">
-          <span class="text-gray-400 mr-2 whitespace-nowrap">人格:</span>
-          <el-select v-model="currentSoul" size="small" class="w-32 !bg-transparent">
-            <el-option label="严谨工程师" value="engineer" />
-            <el-option label="创意设计师" value="designer" />
-          </el-select>
-        </div>
+
+      <div class="flex items-center space-x-6 text-sm ml-auto mr-4 shrink-0">
+        <span class="flex items-center text-ink-2" title="Postgres">
+          <span class="w-2 h-2 rounded-full mr-2 inline-block" :class="healthDot(health?.postgres)"></span>Postgres
+        </span>
+        <span class="flex items-center text-ink-2" title="Redis">
+          <span class="w-2 h-2 rounded-full mr-2 inline-block" :class="healthDot(health?.redis)"></span>Redis
+        </span>
+        <span class="flex items-center text-ink-2" title="LLM API">
+          <span class="w-2 h-2 rounded-full mr-2 inline-block" :class="healthDot(health?.llm)"></span>LLM API
+        </span>
       </div>
-      
-      <div class="flex items-center space-x-6 text-sm ml-auto mr-8 shrink-0">
-        <span class="flex items-center text-gray-300" title="Postgres"><div class="w-2 h-2 rounded-full mr-2" :class="healthDot(health?.postgres)"></div>Postgres</span>
-        <span class="flex items-center text-gray-300" title="Redis"><div class="w-2 h-2 rounded-full mr-2" :class="healthDot(health?.redis)"></div>Redis</span>
-        <span class="flex items-center text-gray-300" title="LLM API"><div class="w-2 h-2 rounded-full mr-2" :class="healthDot(health?.llm)"></div>LLM API</span>
-      </div>
-      
-      <div class="flex items-center space-x-4 shrink-0">
-        <el-icon class="text-xl cursor-pointer text-gray-400 hover:text-white"><Setting /></el-icon>
+
+      <div class="flex items-center space-x-3 shrink-0">
+        <el-icon class="text-xl cursor-pointer text-ink-2 hover:text-primary" @click="toggleTheme">
+          <Moon v-if="theme === 'light'" /><Sunny v-else />
+        </el-icon>
+        <router-link to="/settings">
+          <el-icon class="text-xl cursor-pointer text-ink-2 hover:text-primary"><Setting /></el-icon>
+        </router-link>
       </div>
     </header>
 
     <!-- Main Body -->
     <div class="flex flex-1 min-h-0">
       <!-- Sidebar -->
-      <div class="w-56 bg-[#14161a] flex flex-col shrink-0">
+      <div class="w-56 bg-card border-r border-line flex flex-col shrink-0">
         <el-menu
           :default-active="route.path"
-          class="flex-1 overflow-y-auto !border-r-0 py-4"
+          class="flex-1 overflow-y-auto !border-r-0 py-3"
           background-color="transparent"
-          text-color="#9ca3af"
-          active-text-color="#ffffff"
           router
         >
-          <el-menu-item v-for="item in menuItems" :key="item.path" :index="item.path" :class="{'is-active-custom': route.path === item.path}">
-            <el-icon><component :is="item.meta?.icon" /></el-icon>
-            <span>{{ item.meta?.title }}</span>
-          </el-menu-item>
+          <el-menu-item-group v-for="g in menuGroups" :key="g.title">
+            <template #title>
+              <span class="text-xs text-ink-3">{{ g.title }}</span>
+            </template>
+            <el-menu-item v-for="item in g.items" :key="item.path" :index="item.path"
+                          :class="{ 'is-active-custom': route.path === item.path }">
+              <el-icon><component :is="item.icon" /></el-icon>
+              <span>{{ item.title }}</span>
+            </el-menu-item>
+          </el-menu-item-group>
         </el-menu>
-        
-        <div class="p-4 text-xs text-gray-500 border-t border-dark-border flex justify-between items-center">
+
+        <!-- Beta 预留：工作流编排 -->
+        <div class="px-3 pb-3">
+          <router-link to="/workflow"
+                       class="flex items-center justify-between px-3 py-2.5 rounded-card border border-dashed border-line text-ink-3 hover:text-primary hover:border-primary transition-colors">
+            <span class="flex items-center gap-2 text-sm">
+              <el-icon><SetUp /></el-icon>工作流编排
+            </span>
+            <el-tag size="small" effect="plain" type="warning">Beta</el-tag>
+          </router-link>
+        </div>
+
+        <div class="p-4 text-xs text-ink-3 border-t border-line flex justify-between items-center">
           <div>
-            <div>最后更新</div>
-            <div>2025-06-17 15:42:30</div>
+            <div>当前人格</div>
+            <div class="text-ink-2">{{ soulName }}</div>
           </div>
-          <el-icon class="cursor-pointer hover:text-gray-300"><Refresh /></el-icon>
+          <el-icon class="cursor-pointer hover:text-primary" @click="loadHealth"><Refresh /></el-icon>
         </div>
       </div>
 
       <!-- Content -->
-      <main class="flex-1 overflow-y-auto p-6 bg-[#0f1115]">
+      <main class="flex-1 overflow-y-auto p-6 bg-page">
         <router-view v-slot="{ Component }">
           <transition name="fade" mode="out-in">
             <component :is="Component" />
@@ -68,23 +84,23 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { getHealth, getStatus, type HealthResponse, type StatusResponse } from '@/api/health'
+import { ref, onMounted, onUnmounted } from 'vue'
+import { useRoute } from 'vue-router'
+import { getHealth, getStatus, type HealthResponse } from '@/api/health'
+import { useTheme } from '@/composables/useTheme'
 
 const route = useRoute()
-const router = useRouter()
+const { theme, toggleTheme } = useTheme()
 
-const currentSoul = ref('engineer')
 const health = ref<HealthResponse | null>(null)
-const status = ref<StatusResponse | null>(null)
+const soulName = ref('default')
 
 let healthTimer: ReturnType<typeof setInterval> | null = null
 
 async function loadStatus() {
   try {
-    status.value = await getStatus()
-    if (status.value?.soul) currentSoul.value = status.value.soul
+    const s = await getStatus()
+    if (s?.soul) soulName.value = s.soul
   } catch {
     // ignore
   }
@@ -112,13 +128,41 @@ function healthDot(service?: { online?: boolean }) {
   return service?.online ? 'bg-green-500' : 'bg-red-500'
 }
 
-const menuItems = computed(() => {
-  const routes = router.options.routes.find(r => r.path === '/')?.children || []
-  return routes.map(r => ({
-    path: '/' + r.path,
-    meta: r.meta
-  }))
-})
+// 静态分组菜单（IA 定稿：4 组 + 底部 Beta 预留项，见 spec §信息架构）
+const menuGroups = [
+  {
+    title: '工作台',
+    items: [
+      { path: '/dashboard', title: '首页', icon: 'House' },
+      { path: '/session', title: '会话', icon: 'ChatDotRound' },
+    ],
+  },
+  {
+    title: '项目',
+    items: [{ path: '/projects', title: '工作目录', icon: 'FolderOpened' }],
+  },
+  {
+    title: '资源库',
+    items: [
+      { path: '/skills', title: '技能库', icon: 'Connection' },
+      { path: '/plugins', title: '插件', icon: 'MagicStick' },
+      { path: '/knowledge', title: '知识库', icon: 'Document' },
+    ],
+  },
+  {
+    title: '记忆',
+    items: [
+      { path: '/memory', title: '记忆中心', icon: 'Coin' },
+      { path: '/profile', title: '用户画像', icon: 'UserFilled' },
+      { path: '/soul', title: '人格配置', icon: 'User' },
+      { path: '/history', title: '会话历史', icon: 'Clock' },
+    ],
+  },
+  {
+    title: '系统',
+    items: [{ path: '/settings', title: '系统设置', icon: 'Setting' }],
+  },
+]
 </script>
 
 <style scoped>
@@ -132,15 +176,20 @@ const menuItems = computed(() => {
   opacity: 0;
 }
 
-:deep(.el-input__wrapper) {
-  background-color: var(--el-fill-color-blank);
-  box-shadow: 0 0 0 1px var(--el-border-color) inset;
+:deep(.el-menu-item) {
+  border-radius: 8px;
+  margin: 0 8px;
+  height: 40px;
+  line-height: 40px;
+}
+
+:deep(.el-menu-item-group__title) {
+  padding: 8px 16px 4px;
 }
 
 .is-active-custom {
-  background-color: #1e3a8a !important;
-  color: white !important;
-  border-radius: 4px;
-  margin: 0 8px;
+  background-color: var(--bma-primary-soft) !important;
+  color: var(--bma-primary) !important;
+  font-weight: 600;
 }
 </style>

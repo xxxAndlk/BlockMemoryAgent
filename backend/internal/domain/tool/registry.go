@@ -225,6 +225,7 @@ func (r *Registry) registerDefaults() {
 	r.Register(&readFileTool{exec: r.exec})
 	r.Register(&writeFileTool{exec: r.exec})
 	r.Register(&editFileTool{exec: r.exec})
+	r.Register(&restoreFileTool{exec: r.exec})
 	r.Register(&listDirTool{exec: r.exec})
 	r.Register(&runCommandTool{exec: r.exec})
 	r.Register(&searchInFilesTool{exec: r.exec})
@@ -555,13 +556,13 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		}
 	}
 
-	// WriteFile/EditFile 成功后标记失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
+	// WriteFile/EditFile/RestoreFile 成功后标记失效引用该 path 的共享记忆 entry（Layer 2 缓存一致性）。
 	// 普通槽不物理删除、内容保留：标记 stale 后注入时照常注入并附行号漂移警告，
 	// 防止旧逻辑"删记忆"导致下次派发/复用时 Agent 拿裸任务从零重读同一批文件。
 	// ReadFile 无需清已读记录：重读本就直返磁盘最新内容，不存在脏数据问题。
 	// TODO #72 确认性复读放行：写入成功同时清零该路径连读计数——
 	// Read(A)→Write(A)→Read(A)→Read(A) 的编辑后确认不再被杀。
-	if (name == "WriteFile" || name == "EditFile") && result.Success && result.Path != "" {
+	if (name == "WriteFile" || name == "EditFile" || name == "RestoreFile") && result.Success && result.Path != "" {
 		r.invalidateSharedMemoryForPath(ctx, result.Path)
 		r.resetSameReadForPath(scopeKeyFromCtx(ctx), result.Path)
 		// 写前 stale 检查结果落地：操作已执行，尾部附"内容可能过期"警告（advisory）。
@@ -575,11 +576,11 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		r.scheduleProjectRefresh()
 	}
 
-	// 任务级文件小地图：ReadFile/WriteFile/EditFile 成功后登记触碰文件（按 Agent 隔离，
+	// 任务级文件小地图：ReadFile/WriteFile/EditFile/RestoreFile 成功后登记触碰文件（按 Agent 隔离，
 	// mtime 缓存符号轮廓），记忆流水线每轮在 history 尾部常驻注入【本任务文件地图】，
 	// 压缩循环压不掉（与上面的失效标记/连读清零同属文件类工具的后置钩子）。
 	if result.Success && result.Path != "" &&
-		(name == "ReadFile" || name == "WriteFile" || name == "EditFile") {
+		(name == "ReadFile" || name == "WriteFile" || name == "EditFile" || name == "RestoreFile") {
 		r.touchFileMap(ctx, result.Path)
 	}
 
@@ -970,6 +971,17 @@ func (r *Registry) Schema() []tools.Tool {
 	if t, err := tools.NewFunc("EditFile", "修改已存在文件的首选方式：精确局部替换，只改指定片段，不重写整个文件（输出 token 与耗时仅为整文件重写的零头）。old_string 必须与文件现有内容逐字符一致（含缩进/空格；行尾 \\r\\n 与 \\n 视为等价），默认须唯一匹配，多处匹配会报错；确需全部替换时传 replace_all=true。定位片段前可先 ReadFile 该文件的目标行段（用 offset/limit 只读相关区间，不必整读大文件）。匹配失败返回错误并附文件开头片段供自查，不会改动文件；多处匹配时在 old_string 中多带几行上下文使其唯一。新建文件用 WriteFile；改动面确实覆盖文件大半时才整写。EditFile 与 WriteFile 同等触发共享记忆/spec 失效与 .bma/snapshots 备份。", func(ctx context.Context, in editFileInput) (string, error) {
 		// 转发到内部 EditFile 工具，包含路径、old_string/new_string 与 replace_all 标志。
 		res, _ := r.Dispatch(ctx, "EditFile", map[string]any{"path": in.Path, "old_string": in.OldString, "new_string": in.NewString, "replace_all": in.ReplaceAll})
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
+	// 注册 RestoreFile 工具：从 .bma/snapshots 快照恢复文件。
+	// 描述显式引导模型：回退误改/误删时用本工具，不要 ReadFile .bak 再 WriteFile 重写
+	// （后者把全文件内容过一遍模型，费 token 且易写错）。
+	if t, err := tools.NewFunc("RestoreFile", "把文件回退到 .bma/snapshots 中的备份版本（WriteFile/EditFile 覆盖已存在文件前自动生成快照，保留 24h）。误改/误删文件时优先用本工具恢复：harness 直接从快照拷回，不要 ReadFile .bak 文件再用 WriteFile 重写（费 token 且易出错）。path 为目标文件路径；timestamp 可选，指定要恢复的快照时间戳（格式 20060102-150530），缺省恢复最新一份；目标文件已被删除也可恢复。恢复会覆盖当前文件内容，覆盖前当前内容同样自动备份（恢复本身可回退）。无快照时报错并附可用时间戳。", func(ctx context.Context, in restoreFileInput) (string, error) {
+		// 转发到内部 RestoreFile 工具，包含路径与可选时间戳。
+		res, _ := r.Dispatch(ctx, "RestoreFile", map[string]any{"path": in.Path, "timestamp": in.Timestamp})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
 	}); err == nil {
@@ -1381,6 +1393,24 @@ func (t *editFileTool) Destructive() bool { return true }
 // Execute 调用 Executor 的 editFile 方法完成局部替换。
 func (t *editFileTool) Execute(ctx context.Context, args map[string]any) *Result {
 	return t.exec.editFile(ctx, args)
+}
+
+// restoreFileTool 是 RestoreFile 工具的封装。
+type restoreFileTool struct{ exec *Executor }
+
+// Name 返回工具标准名称 RestoreFile。
+func (t *restoreFileTool) Name() string { return "RestoreFile" }
+
+// Aliases 返回 RestoreFile 的别名列表。
+func (t *restoreFileTool) Aliases() []string { return []string{"restore_file", "restoreFile"} }
+
+// Destructive 标记 RestoreFile 为破坏性操作（覆盖目标文件当前内容）：
+// 生产工作目录下触发用户确认，与 WriteFile/EditFile 同边界（TODO #17 P1）。
+func (t *restoreFileTool) Destructive() bool { return true }
+
+// Execute 调用 Executor 的 restoreFile 方法完成快照恢复。
+func (t *restoreFileTool) Execute(ctx context.Context, args map[string]any) *Result {
+	return t.exec.restoreFile(ctx, args)
 }
 
 // listDirTool 是 ListDir 工具的封装。

@@ -70,14 +70,14 @@ export function kindLabel(kind?: string, type?: string): string {
 
 /** Agent 名字到文本颜色（左侧标签） */
 export function agentTextColor(agent: string): string {
-  if (!agent) return 'text-gray-300'
+  if (!agent) return 'text-ink'
   if (agent === 'MetaAgent') return 'text-blue-400'
-  if (agent.startsWith('System') || agent === 'System') return 'text-gray-500'
+  if (agent.startsWith('System') || agent === 'System') return 'text-ink-2'
   if (agent.includes('Domain')) return 'text-purple-400'
   if (agent.includes('SubDomain')) return 'text-fuchsia-400'
   if (agent.includes('Assistant')) return 'text-emerald-400'
   if (agent === 'User') return 'text-sky-300'
-  return 'text-gray-300'
+  return 'text-ink'
 }
 
 /** 时间戳 → HH:MM:SS */

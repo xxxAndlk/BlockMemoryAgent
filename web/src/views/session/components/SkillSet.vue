@@ -2,35 +2,35 @@
   <div class="h-full flex gap-4 overflow-hidden">
     <!-- Left Column: Current Agent & Equipped Skills -->
     <div class="w-80 flex flex-col gap-4 overflow-y-auto">
-      <el-card class="!border-dark-border !bg-dark-panel">
+      <el-card class="!border-line !bg-card">
         <div class="text-sm">
-          <div class="text-gray-400 mb-1">当前 Agent</div>
+          <div class="text-ink-2 mb-1">当前 Agent</div>
           <el-select v-model="selectedAgent" size="small" class="w-full">
             <el-option v-for="opt in agentOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
           </el-select>
         </div>
       </el-card>
 
-      <el-card class="!border-dark-border !bg-dark-panel flex-1">
+      <el-card class="!border-line !bg-card flex-1">
         <template #header>
           <div class="font-bold text-sm">当前装配的 Skills</div>
         </template>
 
-        <div v-if="loading" class="text-xs text-gray-500 text-center py-4">加载中...</div>
+        <div v-if="loading" class="text-xs text-ink-2 text-center py-4">加载中...</div>
         <div v-else class="space-y-3">
-          <div v-for="skill in equippedSkills" :key="skill.skill_id" class="p-3 bg-dark-bg rounded border border-dark-border relative group">
+          <div v-for="skill in equippedSkills" :key="skill.skill_id" class="p-3 bg-page rounded border border-line relative group">
             <div class="flex justify-between items-start">
               <div>
-                <div class="font-bold text-sm text-gray-200">{{ skill.name }}</div>
-                <div class="text-xs text-gray-500 mt-1">Tool: <span class="text-blue-400">{{ skill.tool_ref }}</span></div>
-                <div class="text-xs text-gray-500 mt-1">Cost: {{ skill.cost }}</div>
+                <div class="font-bold text-sm text-ink">{{ skill.name }}</div>
+                <div class="text-xs text-ink-2 mt-1">Tool: <span class="text-blue-400">{{ skill.tool_ref }}</span></div>
+                <div class="text-xs text-ink-2 mt-1">Cost: {{ skill.cost }}</div>
               </div>
             </div>
-            <div class="text-xs text-gray-400 mt-2 pt-2 border-t border-dark-border">
+            <div class="text-xs text-ink-2 mt-2 pt-2 border-t border-line">
               描述: {{ skill.description }}
             </div>
           </div>
-          <div v-if="!equippedSkills.length" class="text-xs text-gray-500">未装配技能</div>
+          <div v-if="!equippedSkills.length" class="text-xs text-ink-2">未装配技能</div>
         </div>
       </el-card>
     </div>
@@ -38,7 +38,7 @@
     <!-- Right Column: Available Skills & History -->
     <div class="flex-1 flex flex-col gap-4 overflow-hidden">
       <!-- Available Skills -->
-      <el-card class="!border-dark-border !bg-dark-panel flex-1 overflow-y-auto">
+      <el-card class="!border-line !bg-card flex-1 overflow-y-auto">
         <template #header>
           <div class="flex justify-between items-center">
             <div class="font-bold text-sm">技能候选池</div>
@@ -50,20 +50,20 @@
           </div>
         </template>
 
-        <div v-if="loading" class="text-xs text-gray-500 text-center py-4">加载中...</div>
+        <div v-if="loading" class="text-xs text-ink-2 text-center py-4">加载中...</div>
         <div v-else class="grid grid-cols-3 gap-4">
-          <div v-for="skill in availableSkills" :key="skill.skill_id" class="p-4 bg-dark-bg rounded border border-dark-border hover:border-primary transition-colors flex flex-col">
-            <div class="font-bold text-sm text-gray-200 mb-1">{{ skill.name }}</div>
-            <div class="text-xs text-gray-500 mb-1">Tool: <span class="text-blue-400">{{ skill.tool_ref }}</span></div>
-            <div class="text-xs text-gray-500 mb-4">Cost: {{ skill.cost }}</div>
+          <div v-for="skill in availableSkills" :key="skill.skill_id" class="p-4 bg-page rounded border border-line hover:border-primary transition-colors flex flex-col">
+            <div class="font-bold text-sm text-ink mb-1">{{ skill.name }}</div>
+            <div class="text-xs text-ink-2 mb-1">Tool: <span class="text-blue-400">{{ skill.tool_ref }}</span></div>
+            <div class="text-xs text-ink-2 mb-4">Cost: {{ skill.cost }}</div>
 
             <div class="mt-auto">
-              <el-button type="primary" size="small" class="w-full !bg-primary/20 !text-primary !border-primary hover:!bg-primary hover:!text-white transition-colors">
+              <el-button type="primary" size="small" class="w-full !bg-primary-soft !text-primary !border-primary hover:!bg-primary hover:!text-white transition-colors">
                 <el-icon class="mr-1"><Plus /></el-icon> 装配
               </el-button>
             </div>
           </div>
-          <div v-if="!availableSkills.length" class="col-span-3 text-xs text-gray-500 text-center py-4">无可用技能</div>
+          <div v-if="!availableSkills.length" class="col-span-3 text-xs text-ink-2 text-center py-4">无可用技能</div>
         </div>
       </el-card>
     </div>
@@ -152,7 +152,7 @@ load()
 
 :deep(.search-input .el-input__wrapper) {
   box-shadow: none !important;
-  border: 1px solid #2a2d35;
+  border: 1px solid var(--bma-border);
 }
 :deep(.search-input .el-input__wrapper.is-focus) {
   border-color: var(--el-color-primary);

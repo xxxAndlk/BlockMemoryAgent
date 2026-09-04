@@ -7,7 +7,7 @@ import { listSessions, createSession } from '@/api/session'
 import { getTimeline, getActivity, type TimelinePoint, type ActivityItem } from '@/api/metrics'
 import { statusTagType, statusText } from '@/utils/sessionStatus'
 import { fmtDate } from '@/utils/date'
-import { kindIcon, kindTagType } from '@/views/chat/utils/eventStyles'
+import { kindIcon, kindTagType } from '@/views/session/chat/utils/eventStyles'
 import { useWorkDir } from '@/composables/useWorkDir'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 
@@ -144,7 +144,7 @@ const tagBgMap: Record<string, string> = {
   warning: 'bg-yellow-900/30',
   danger: 'bg-red-900/30',
   primary: 'bg-blue-900/30',
-  info: 'bg-gray-800/50',
+  info: 'bg-page',
 }
 
 const tagIconColorMap: Record<string, string> = {
@@ -152,7 +152,7 @@ const tagIconColorMap: Record<string, string> = {
   warning: 'text-yellow-400',
   danger: 'text-red-400',
   primary: 'text-blue-400',
-  info: 'text-gray-400',
+  info: 'text-ink-2',
 }
 
 function activityStyle(kind: string) {
@@ -170,36 +170,36 @@ function activityStyle(kind: string) {
     <!-- Left Column -->
     <div class="flex-1 flex flex-col gap-6 min-w-0 overflow-y-auto pr-2">
       <!-- Mock data warning -->
-      <div v-if="usingMock" class="bg-yellow-900/30 border border-yellow-700/50 rounded-lg px-4 py-3 text-sm text-yellow-300 flex items-center gap-2">
+      <div v-if="usingMock" class="bg-amber-50 border border-amber-300 rounded-lg px-4 py-3 text-sm text-amber-700 dark:bg-yellow-900/30 dark:border-yellow-700/50 dark:text-yellow-300 flex items-center gap-2">
         <el-icon><WarningFilled /></el-icon>
         <span>后端不可用，当前显示为示例数据</span>
       </div>
 
       <!-- Create Session -->
-      <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
+      <el-card class="!border-line !bg-card">
         <template #header>
-          <div class="font-bold text-sm text-gray-200">创建新会话</div>
+          <div class="font-bold text-sm text-ink">创建新会话</div>
         </template>
         <div class="flex">
           <div class="flex-1 pr-6 space-y-4">
-            <div class="text-xs text-gray-400">输入你的目标，我们将为你规划并执行任务</div>
+            <div class="text-xs text-ink-2">输入你的目标，我们将为你规划并执行任务</div>
             <el-input
               v-model="goal"
               type="textarea"
               :rows="3"
               placeholder="例如：分析 gin 项目的架构并生成设计文档"
-              class="w-full bg-[#0f1115] border-none"
+              class="w-full bg-page border-none"
               @keydown.enter.prevent="runSession"
             />
             <WorkDirPicker v-model="workDir" />
             <div class="flex flex-wrap items-center gap-4">
-              <span class="text-sm text-gray-400">快捷模板:</span>
+              <span class="text-sm text-ink-2">快捷模板:</span>
               <div class="flex flex-wrap gap-2">
                 <el-tag
                   v-for="q in quickTags"
                   :key="q"
                   effect="plain"
-                  class="!bg-transparent !border-[#2a2d35] !text-gray-300 cursor-pointer hover:!border-primary"
+                  class="!bg-transparent !border-line !text-ink cursor-pointer hover:!border-primary"
                   @click="quickStart(q)"
                 >{{ q }}</el-tag>
               </div>
@@ -238,11 +238,11 @@ function activityStyle(kind: string) {
       </el-card>
 
       <!-- Session List -->
-      <el-card class="flex-1 !border-[#2a2d35] !bg-[#1a1d24] flex flex-col body-flex-1 min-h-[400px]">
+      <el-card class="flex-1 !border-line !bg-card flex flex-col body-flex-1 min-h-[400px]">
         <template #header>
           <div class="flex justify-between items-center">
-            <div class="font-bold text-sm text-gray-200">会话列表</div>
-            <el-input v-model="searchSession" size="small" placeholder="搜索会话..." class="w-48 !bg-[#0f1115]">
+            <div class="font-bold text-sm text-ink">会话列表</div>
+            <el-input v-model="searchSession" size="small" placeholder="搜索会话..." class="w-48 !bg-page">
               <template #suffix><el-icon><Search /></el-icon></template>
             </el-input>
           </div>
@@ -255,7 +255,7 @@ function activityStyle(kind: string) {
             :key="f"
             size="small"
             :type="filter===f ? 'primary' : ''"
-            :class="filter===f ? '!bg-[#1e3a8a] !border-none !text-white' : '!bg-transparent !border-none !text-gray-400 hover:!text-gray-200'"
+            :class="filter===f ? '!bg-primary !border-none !text-white' : '!bg-transparent !border-none !text-ink-2 hover:!text-ink'"
             @click="filter=f"
           >
             {{ {all:'全部', running:'运行中', completed:'已完成', failed:'已失败', paused:'已暂停'}[f] }} {{ counts[f as keyof typeof counts] }}
@@ -266,39 +266,39 @@ function activityStyle(kind: string) {
           <div
             v-for="s in filteredSessions"
             :key="s.id"
-            class="p-3 bg-[#0f1115] rounded border border-[#2a2d35] flex items-center justify-between group hover:border-primary transition-colors cursor-pointer"
+            class="p-3 bg-page rounded border border-line flex items-center justify-between group hover:border-primary transition-colors cursor-pointer"
             @click="viewSession(s.id)"
           >
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-3 mb-1">
-                <span class="font-bold text-sm text-gray-200 truncate">{{ s.goal }}</span>
+                <span class="font-bold text-sm text-ink truncate">{{ s.goal }}</span>
                 <el-tag :type="statusTagType(s.status)" size="small" effect="plain" class="!bg-transparent !border-none px-0"
                 >
                   {{ statusText(s.status) }} <span class="ml-1" :class="s.status==='running'?'text-blue-500':s.status==='completed'?'text-green-500':'text-red-500'">●</span>
                 </el-tag>
               </div>
-              <div class="text-xs text-gray-500">创建时间: {{ fmtDate(s.started_at) }}</div>
-              <div class="text-xs text-gray-500 truncate">目录: {{ s.work_dir || '默认目录' }}</div>
+              <div class="text-xs text-ink-2">创建时间: {{ fmtDate(s.started_at) }}</div>
+              <div class="text-xs text-ink-2 truncate">目录: {{ s.work_dir || '默认目录' }}</div>
             </div>
             <div class="w-48 px-4 flex flex-col items-end">
               <div v-if="s.status === 'running'" class="w-full flex items-center gap-2">
-                <span class="text-xs text-gray-400 whitespace-nowrap">进度 {{ progressOf(s) }}%</span>
+                <span class="text-xs text-ink-2 whitespace-nowrap">进度 {{ progressOf(s) }}%</span>
                 <el-progress :percentage="progressOf(s)" :show-text="false" class="flex-1" />
               </div>
               <div v-else-if="s.status === 'completed'" class="w-full flex items-center gap-2">
-                <span class="text-xs text-gray-400 whitespace-nowrap">100%</span>
+                <span class="text-xs text-ink-2 whitespace-nowrap">100%</span>
                 <el-progress :percentage="100" :show-text="false" status="success" class="flex-1" />
               </div>
-              <div v-else class="text-xs text-gray-400">-</div>
+              <div v-else class="text-xs text-ink-2">-</div>
             </div>
 
-            <div class="w-20 text-right text-xs text-gray-500 flex items-center justify-end gap-2">
-              <el-icon class="text-gray-600 group-hover:text-primary"><ArrowRight /></el-icon>
+            <div class="w-20 text-right text-xs text-ink-2 flex items-center justify-end gap-2">
+              <el-icon class="text-ink-3 group-hover:text-primary"><ArrowRight /></el-icon>
             </div>
           </div>
         </div>
 
-        <div class="mt-4 flex justify-between items-center text-xs text-gray-500">
+        <div class="mt-4 flex justify-between items-center text-xs text-ink-2">
           <span>共 {{ filteredSessions.length }} 条会话</span>
           <el-pagination small background layout="prev, pager, next" :total="filteredSessions.length" class="!p-0" />
         </div>
@@ -308,60 +308,60 @@ function activityStyle(kind: string) {
     <!-- Right Column -->
     <div class="w-[400px] flex flex-col gap-6 shrink-0 overflow-y-auto">
       <!-- Stats -->
-      <el-card class="!border-[#2a2d35] !bg-[#1a1d24]">
+      <el-card class="!border-line !bg-card">
         <template #header>
           <div class="flex justify-between items-center">
-            <div class="font-bold text-sm text-gray-200">统计概览 (今日)</div>
+            <div class="font-bold text-sm text-ink">统计概览 (今日)</div>
             <el-button link type="primary" size="small">查看更多 <el-icon><ArrowRight /></el-icon></el-button>
           </div>
         </template>
 
         <div class="grid grid-cols-2 gap-4 mb-6">
-          <div class="p-3 bg-[#0f1115] rounded border border-[#2a2d35] relative overflow-hidden">
-            <div class="text-xs text-gray-400 mb-1">会话总数</div>
-            <div class="text-2xl font-bold text-gray-200">{{ stats.total }}</div>
-            <div class="text-xs text-gray-500 mt-1">当前内存中的会话</div>
+          <div class="p-3 bg-page rounded border border-line relative overflow-hidden">
+            <div class="text-xs text-ink-2 mb-1">会话总数</div>
+            <div class="text-2xl font-bold text-ink">{{ stats.total }}</div>
+            <div class="text-xs text-ink-2 mt-1">当前内存中的会话</div>
           </div>
 
-          <div class="p-3 bg-[#0f1115] rounded border border-[#2a2d35] relative overflow-hidden">
-            <div class="text-xs text-gray-400 mb-1">完成率</div>
-            <div class="text-2xl font-bold text-gray-200">{{ stats.rate }}%</div>
-            <div class="text-xs text-gray-500 mt-1">已完成 / 总数</div>
+          <div class="p-3 bg-page rounded border border-line relative overflow-hidden">
+            <div class="text-xs text-ink-2 mb-1">完成率</div>
+            <div class="text-2xl font-bold text-ink">{{ stats.rate }}%</div>
+            <div class="text-xs text-ink-2 mt-1">已完成 / 总数</div>
           </div>
 
-          <div class="p-3 bg-[#0f1115] rounded border border-[#2a2d35] relative overflow-hidden">
-            <div class="text-xs text-gray-400 mb-1">LLM 调用总数</div>
-            <div class="text-2xl font-bold text-gray-200">{{ stats.calls.toLocaleString() }}</div>
-            <div class="text-xs text-gray-500 mt-1">累计 Token: {{ stats.tokens.toLocaleString() }}</div>
+          <div class="p-3 bg-page rounded border border-line relative overflow-hidden">
+            <div class="text-xs text-ink-2 mb-1">LLM 调用总数</div>
+            <div class="text-2xl font-bold text-ink">{{ stats.calls.toLocaleString() }}</div>
+            <div class="text-xs text-ink-2 mt-1">累计 Token: {{ stats.tokens.toLocaleString() }}</div>
           </div>
 
-          <div class="p-3 bg-[#0f1115] rounded border border-[#2a2d35] relative overflow-hidden">
-            <div class="text-xs text-gray-400 mb-1">超时率</div>
-            <div class="text-2xl font-bold text-gray-200">{{ stats.timeout }}%</div>
-            <div class="text-xs text-gray-500 mt-1">按 token_usage 事件估算</div>
+          <div class="p-3 bg-page rounded border border-line relative overflow-hidden">
+            <div class="text-xs text-ink-2 mb-1">超时率</div>
+            <div class="text-2xl font-bold text-ink">{{ stats.timeout }}%</div>
+            <div class="text-xs text-ink-2 mt-1">按 token_usage 事件估算</div>
           </div>
         </div>
 
         <div>
-          <div class="flex justify-between text-xs text-gray-400 mb-2">
+          <div class="flex justify-between text-xs text-ink-2 mb-2">
             <span>Token 消耗趋势 (最近 12 小时)</span>
             <span>单位: tokens</span>
           </div>
-          <div class="h-40 bg-[#0f1115] rounded border border-[#2a2d35] p-3">
-            <svg v-if="trendValues.length > 1" class="w-full h-full text-blue-500" viewBox="0 0 100 40" preserveAspectRatio="none" fill="none" stroke="currentColor" stroke-width="1.5">
+          <div class="h-40 bg-page rounded-card border border-line p-3">
+            <svg v-if="trendValues.length > 1" class="w-full h-full text-primary" viewBox="0 0 100 40" preserveAspectRatio="none" fill="none" stroke="currentColor" stroke-width="1.5">
               <path :d="`M0 ${40 - trendValues[0]/40} ${trendValues.slice(1).map((v,i)=>`L${(i+1)*100/(trendValues.length-1)} ${40 - v/40}`).join(' ')}`" />
               <circle v-for="(v,i) in trendValues" :key="i" :cx="i*100/(trendValues.length-1)" :cy="40 - v/40" r="1.2" fill="currentColor" />
             </svg>
-            <div v-else class="h-full flex items-center justify-center text-xs text-gray-500">暂无趋势数据</div>
+            <div v-else class="h-full flex items-center justify-center text-xs text-ink-2">暂无趋势数据</div>
           </div>
         </div>
       </el-card>
 
       <!-- Recent Activity -->
-      <el-card class="!border-[#2a2d35] !bg-[#1a1d24] flex-1">
+      <el-card class="!border-line !bg-card flex-1">
         <template #header>
           <div class="flex justify-between items-center">
-            <div class="font-bold text-sm text-gray-200">最近活动</div>
+            <div class="font-bold text-sm text-ink">最近活动</div>
             <el-button link type="primary" size="small">查看更多 <el-icon><ArrowRight /></el-icon></el-button>
           </div>
         </template>
@@ -372,15 +372,15 @@ function activityStyle(kind: string) {
               <el-icon :class="activityStyle(activity.kind).iconClass"><component :is="activityStyle(activity.kind).icon" /></el-icon>
             </div>
             <div class="flex-1 min-w-0">
-              <div class="text-gray-300 break-words line-clamp-2">
-                <span class="text-gray-400 mr-1" v-if="activity.agent">{{ activity.agent }}</span>
-                <span class="text-gray-500 mr-1">[{{ activity.kind }}]</span>
+              <div class="text-ink break-words line-clamp-2">
+                <span class="text-ink-2 mr-1" v-if="activity.agent">{{ activity.agent }}</span>
+                <span class="text-ink-2 mr-1">[{{ activity.kind }}]</span>
                 {{ activity.content }}
               </div>
             </div>
-            <div class="text-xs text-gray-500 shrink-0 whitespace-nowrap">{{ activity.time }}</div>
+            <div class="text-xs text-ink-2 shrink-0 whitespace-nowrap">{{ activity.time }}</div>
           </div>
-          <div v-if="!activities.length" class="text-xs text-gray-500 text-center py-4">暂无活动</div>
+          <div v-if="!activities.length" class="text-xs text-ink-2 text-center py-4">暂无活动</div>
         </div>
       </el-card>
     </div>
@@ -397,16 +397,16 @@ function activityStyle(kind: string) {
 :deep(.el-textarea__inner) {
   background-color: transparent;
   box-shadow: none !important;
-  color: #e5e7eb;
+  color: var(--bma-text);
 }
 :deep(.el-textarea__inner:focus) {
   box-shadow: none !important;
 }
 :deep(.el-input__wrapper) {
-  background-color: #0f1115;
-  box-shadow: 0 0 0 1px #2a2d35 inset;
+  background-color: var(--bma-page);
+  box-shadow: 0 0 0 1px var(--bma-border) inset;
 }
 :deep(.el-pagination.is-background .el-pager li:not(.is-disabled).is-active) {
-  background-color: var(--el-color-primary);
+  background-color: var(--bma-primary);
 }
 </style>

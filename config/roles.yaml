@@ -34,7 +34,7 @@ meta_agent:
   # 实证 2026-08-18，MetaAgent 联网永远默认走内置 HTTPGet 硬刮搜索引擎（零摩擦路径依赖），
   # web_search 插件（firecrawl，roles:["meta"]）需要 tool_catalog+tool_mount 两步而从不被选中。
   # 去掉后 meta 联网只能挂 web_search 插件，调研结论钉进 spec 再派发（见派发铁律）。
-  tools: [call_sub_agent, call_sub_agents, WriteSharedMemory, WriteSpec, WriteFile, EditFile, create_role, list_roles, RefreshProjectDoc, send_message, cancel_agent, ask_user, write_plan, submit_plan, review_plan, remember_preference, search_knowledge, plugin_search, plugin_install, plugin_enable, plugin_disable, plugin_list, tool_catalog, tool_mount, tool_unmount, list_skills, load_skill]
+  tools: [call_sub_agent, call_sub_agents, WriteSharedMemory, WriteSpec, WriteFile, EditFile, RestoreFile, create_role, list_roles, RefreshProjectDoc, send_message, cancel_agent, ask_user, write_plan, submit_plan, review_plan, remember_preference, search_knowledge, plugin_search, plugin_install, plugin_enable, plugin_disable, plugin_list, tool_catalog, tool_mount, tool_unmount, list_skills, load_skill]
   system_prompt: |
     你是 BlockMemoryAgent 的主 Agent（MetaAgent），对用户最终目标直接负责。
     你的 context 最贵（长跑 + 累积 mailbox 摘要），默认只做分析、拆分、派发、汇总；
@@ -551,7 +551,7 @@ fixed_roles:
     keywords: ["代码", "编程", "开发", "bug", "修复", "重构", "review", "code"]
     skills: []
     # 只暴露执行类工具；call_sub_agent 由 dispatcher 注册但不在此白名单中。
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    tools: [ReadFile, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &coding_model
       provider: anthropic
       model: deepseek-v4-flash
@@ -596,7 +596,7 @@ fixed_roles:
       最终答复自包含：改动摘要 + 验证结果 + 涉及的文件路径。
     keywords: ["UI", "界面", "前端", "CSS", "HTML", "样式", "布局", "page"]
     skills: []
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    tools: [ReadFile, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &ui_model
       provider: openai-chat
       model: gemini-flash
@@ -642,7 +642,7 @@ fixed_roles:
       最终答复 = 按严重度排序的问题清单 + 改写后的提示词全文，自包含。
     keywords: ["提示词", "prompt", "审查", "优化", "template"]
     skills: []
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    tools: [ReadFile, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &review_model
       provider: anthropic
       model: glm-5.3
@@ -722,7 +722,7 @@ fixed_roles:
       最终答复自包含：新增/修改的测试文件 + 运行结果 + 覆盖说明。
     keywords: ["测试", "test", "验证", "QA", "assert", "coverage"]
     skills: []
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    tools: [ReadFile, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &test_model
       provider: anthropic
       model: deepseek-v4-flash
@@ -766,7 +766,7 @@ fixed_roles:
       最终答复自包含：文档摘要 + 涉及的文件路径。
     keywords: ["文档", "doc", "README", "注释", "example"]
     skills: []
-    tools: [ReadFile, WriteFile, EditFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    tools: [ReadFile, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &doc_model
       provider: anthropic
       model: doubao-seed-2.0-lite
