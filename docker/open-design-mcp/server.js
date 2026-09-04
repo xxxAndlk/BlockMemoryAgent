@@ -42,6 +42,7 @@ const OUTPUT_DIR = process.env.OD_OUTPUT_DIR || `${WORKSPACE_DIR}/.bma/od-artifa
 const OUTPUT_REL_PREFIX = (process.env.OD_OUTPUT_REL_PREFIX || '.bma/od-artifacts').replace(/\/$/, '');
 const POLL_INTERVAL_MS = 2000;
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
+const VIDEO_EXTS = ['.mp4', '.webm', '.mov'];
 
 // resolveSaveAs 把 Agent 给的 save_as（宿主工作目录相对路径）解析为容器内绝对路径。
 // 防路径穿越：拒绝绝对路径、盘符、`..` 上跳；统一为正斜杠。
@@ -129,20 +130,22 @@ function extractTaskFile(task) {
   return meta.fileName || meta.filename || meta.name || meta.path || null;
 }
 
-// newestImageFallback task.file 缺文件名时，取项目里 task 启动后最新修改的图片。
-async function newestImageFallback(sinceMs) {
+// newestImageFallback task.file 缺文件名时，取项目里 task 启动后最新修改的对应类型文件。
+async function newestImageFallback(sinceMs, exts = IMAGE_EXTS) {
   const data = await odJson(`/api/projects/${OD_PROJECT_ID}/files`);
   const files = Array.isArray(data?.files) ? data.files : [];
   const images = files
-    .filter((f) => IMAGE_EXTS.some((ext) => String(f?.name || f?.fileName || '').toLowerCase().endsWith(ext)))
+    .filter((f) => exts.some((ext) => String(f?.name || f?.fileName || '').toLowerCase().endsWith(ext)))
     .filter((f) => !sinceMs || Number(f?.mtime || f?.updatedAt || f?.modifiedAt || 0) >= sinceMs - 5000)
     .sort((a, b) => Number(b?.mtime || b?.updatedAt || b?.modifiedAt || 0) - Number(a?.mtime || a?.updatedAt || a?.modifiedAt || 0));
   const first = images[0];
   return first ? String(first.name || first.fileName) : null;
 }
 
-async function waitTask(taskId, startedAtMs) {
-  const deadline = Date.now() + OD_TIMEOUT_MS;
+// waitTask 轮询任务直至 done/failed。label 用于错误文案（"图像"/"视频"），
+// listTool 为超时后引导查询的列表工具名。视频生成 30s–5min，超时由调用方传入。
+async function waitTask(taskId, { timeoutMs = OD_TIMEOUT_MS, label = '图像', listTool = 'od_image_list' } = {}) {
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     const data = await odJson(`/api/projects/${OD_PROJECT_ID}/media/tasks?includeDone=1`);
     const tasks = Array.isArray(data?.tasks) ? data.tasks : [];
@@ -150,10 +153,10 @@ async function waitTask(taskId, startedAtMs) {
     if (task?.status === 'done') return task;
     if (task?.status === 'failed' || task?.status === 'interrupted') {
       const msg = task?.error?.message || JSON.stringify(task?.error || '未知错误');
-      throw new Error(`图像生成失败（${task.status}）：${msg}`);
+      throw new Error(`${label}生成失败（${task.status}）：${msg}`);
     }
     if (Date.now() > deadline) {
-      throw new Error(`等待生成超时（${OD_TIMEOUT_MS}ms），taskId=${taskId}；可稍后调 od_image_list 查看结果`);
+      throw new Error(`等待生成超时（${timeoutMs}ms），taskId=${taskId}；可稍后调 ${listTool} 查看结果`);
     }
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
@@ -233,7 +236,7 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg
   const taskId = gen?.taskId;
   if (!taskId) throw new Error(`OD 未返回 taskId：${JSON.stringify(gen).slice(0, 300)}`);
   log('生成任务已受理:', taskId, 'model=', useModel);
-  const task = await waitTask(taskId, startedAtMs);
+  const task = await waitTask(taskId);
   const fileName = (await extractTaskFile(task)) || (await newestImageFallback(startedAtMs));
   if (!fileName) throw new Error('任务完成但未找到产物文件名');
   const bytes = await downloadFile(fileName);
@@ -332,15 +335,16 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
   };
 }
 
-async function listImages({ limit }) {
+// listMediaFiles 列项目文件按扩展名过滤（图片/视频共用）。
+async function listMediaFiles({ limit, exts, key }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
   await ensureProject();
   const data = await odJson(`/api/projects/${OD_PROJECT_ID}/files`);
   const files = Array.isArray(data?.files) ? data.files : [];
-  const images = files
-    .filter((f) => IMAGE_EXTS.some((ext) => String(f?.name || f?.fileName || '').toLowerCase().endsWith(ext)))
+  const items = files
+    .filter((f) => exts.some((ext) => String(f?.name || f?.fileName || '').toLowerCase().endsWith(ext)))
     .map((f) => ({
       name: String(f.name || f.fileName),
       size: Number(f.size || f.bytes || 0),
@@ -348,7 +352,15 @@ async function listImages({ limit }) {
     }))
     .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))
     .slice(0, limit || 20);
-  return { project: OD_PROJECT_ID, count: images.length, images };
+  return { project: OD_PROJECT_ID, count: items.length, [key]: items };
+}
+
+async function listImages({ limit }) {
+  return listMediaFiles({ limit, exts: IMAGE_EXTS, key: 'images' });
+}
+
+async function listVideos({ limit }) {
+  return listMediaFiles({ limit, exts: VIDEO_EXTS, key: 'videos' });
 }
 
 const server = new McpServer({ name: 'open-design-mcp', version: '0.1.0' });
