@@ -44,6 +44,21 @@ const POLL_INTERVAL_MS = 2000;
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
 const VIDEO_EXTS = ['.mp4', '.webm', '.mov'];
 
+// ---- 视频生成（od_video_generate，2026-09-04）----
+// 双协议兼容（设计 docs/superpowers/specs/2026-09-04-video-generation-design.md）：
+//   - volcengine：daemon 内置 renderVolcengineVideo（方舟 tasks 协议），模型须为目录 id
+//     （doubao-seedance-*）；wire 模型名可被 daemon 的 OD_MEDIA_MODEL_ALIASES 别名改写
+//     （自定义接入点场景，env 在 open_design service 插件侧注入）。
+//   - openai：daemon 内置 renderAIHubMixVideo 讲 OpenAI /videos 协议；模型 id 带
+//     aihubmix- 前缀触发 daemon 目录旁路（任意模型名），用户给裸名时桥自动补前缀；
+//     网关 baseUrl/key 由 daemon media-config providers.aihubmix 提供（桥侧不可见，
+//     缺失时 daemon 任务 failed、错误原文透传）。
+const OD_VIDEO_PROVIDER = (process.env.OD_VIDEO_PROVIDER || 'volcengine').toLowerCase();
+const OD_VOLCENGINE_VIDEO_MODEL = process.env.OD_VOLCENGINE_VIDEO_MODEL || 'doubao-seedance-2-0-fast-260128';
+const OD_OPENAI_VIDEO_MODEL = process.env.OD_OPENAI_VIDEO_MODEL || '';
+// 视频 30s–5min（ark 队列峰值更久），远超图片的 180s 上限，独立超时。
+const OD_VIDEO_TIMEOUT_MS = Number(process.env.OD_VIDEO_TIMEOUT_MS || 720000);
+
 // resolveSaveAs 把 Agent 给的 save_as（宿主工作目录相对路径）解析为容器内绝对路径。
 // 防路径穿越：拒绝绝对路径、盘符、`..` 上跳；统一为正斜杠。
 function resolveSaveAs(saveAs) {
@@ -335,6 +350,81 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
   };
 }
 
+function resolveVideoProvider(provider) {
+  const p = String(provider || OD_VIDEO_PROVIDER).toLowerCase();
+  if (p !== 'volcengine' && p !== 'openai') {
+    throw new Error(`未知视频 provider：${p}（可选 volcengine / openai；对应网关协议分别为方舟 tasks 与 OpenAI /videos）`);
+  }
+  return p;
+}
+
+function resolveVideoModel(provider, model) {
+  if (provider === 'openai') {
+    const m = model || OD_OPENAI_VIDEO_MODEL;
+    if (!m) {
+      throw new Error('provider=openai 但未配置视频模型：.env 填 VIDEO_OPENAI_MODEL（你的 /videos 网关模型名，如 veo-3.1-fast）后 POST /api/plugins/reload');
+    }
+    return m.startsWith('aihubmix-') ? m : `aihubmix-${m}`;
+  }
+  return model || OD_VOLCENGINE_VIDEO_MODEL;
+}
+
+// generateVideo 文生视频（t2v）：daemon media/generate surface='video'，length 传时长秒数。
+// 无白底抠除（图片专属）；产物 mp4 经 downloadFile 落盘，路径语义与 generateImage 一致。
+async function generateVideo({ prompt, aspect, duration_sec: durationSec, provider, model, save_as: saveAs }) {
+  if (!OD_API_TOKEN) {
+    throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
+  }
+  // 先校验 save_as（fail fast：路径非法不必浪费一次生成）。
+  const saveTarget = saveAs ? resolveSaveAs(saveAs) : null;
+  const useProvider = resolveVideoProvider(provider);
+  const useModel = resolveVideoModel(useProvider, model);
+  const startedAtMs = Date.now();
+  await ensureProject();
+  const gen = await odJson(`/api/projects/${OD_PROJECT_ID}/media/generate`, {
+    method: 'POST',
+    body: {
+      surface: 'video',
+      model: useModel,
+      prompt,
+      ...(aspect ? { aspect } : {}),
+      ...(durationSec ? { length: durationSec } : {}),
+    },
+  });
+  const taskId = gen?.taskId;
+  if (!taskId) throw new Error(`OD 未返回 taskId：${JSON.stringify(gen).slice(0, 300)}`);
+  log('视频任务已受理:', taskId, 'provider=', useProvider, 'model=', useModel);
+  const task = await waitTask(taskId, { timeoutMs: OD_VIDEO_TIMEOUT_MS, label: '视频', listTool: 'od_video_list' });
+  const fileName = (await extractTaskFile(task)) || (await newestImageFallback(startedAtMs, VIDEO_EXTS));
+  if (!fileName) throw new Error('任务完成但未找到产物文件名');
+  const bytes = await downloadFile(fileName);
+  const ext = (fileName.match(/\.[a-z0-9]+$/i)?.[0]) || '.mp4';
+  let absPath;
+  let relPath;
+  if (saveTarget) {
+    relPath = /\.[a-z0-9]+$/i.test(saveTarget.rel) ? saveTarget.rel : saveTarget.rel + ext;
+    absPath = `${WORKSPACE_DIR}/${relPath}`;
+  } else {
+    const outName = `${new Date().toISOString().replace(/[:.]/g, '').slice(0, 15)}-${slugify(prompt)}${ext}`;
+    relPath = `${OUTPUT_REL_PREFIX}/${outName}`;
+    absPath = join(OUTPUT_DIR, outName);
+  }
+  mkdirSync(dirname(absPath), { recursive: true });
+  writeFileSync(absPath, bytes);
+  const elapsedSec = Math.round((Date.now() - startedAtMs) / 1000);
+  log('视频已落盘:', relPath, `${bytes.length}B`, `${elapsedSec}s`);
+  return {
+    path: relPath,
+    filename: relPath.split('/').pop(),
+    bytes: bytes.length,
+    provider: useProvider,
+    model: useModel,
+    duration_sec: durationSec || 5,
+    elapsedSec,
+    hint: '在 HTML 中以该相对路径（path 字段）用 <video src> 引用此视频',
+  };
+}
+
 // listMediaFiles 列项目文件按扩展名过滤（图片/视频共用）。
 async function listMediaFiles({ limit, exts, key }) {
   if (!OD_API_TOKEN) {
@@ -432,6 +522,46 @@ server.registerTool('od_image_list', {
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     return { content: [{ type: 'text', text: `od_image_list 失败: ${err.message}` }], isError: true };
+  }
+});
+
+server.registerTool('od_video_generate', {
+  title: 'Open Design 视频生成',
+  description:
+    '经本地 open_design 守护进程生成短视频（文生视频 t2v）。' +
+    'provider 二选一：volcengine=方舟 tasks 协议网关（模型为 daemon 目录 id，自定义接入点由 daemon 的 OD_MEDIA_MODEL_ALIASES 别名改写）；' +
+    'openai=OpenAI /videos 协议网关（模型名任意，需 .env 配 VIDEO_OPENAI_URL/VIDEO_OPENAI_MODEL/VIDEO_OPENAI_API_KEY）。' +
+    '正式素材务必用 save_as 直落工作目录相对路径（如 assets/video/intro.mp4），一视频一份；缺省落 .bma/od-artifacts（时间戳命名，仅草稿）。' +
+    '单条约 30 秒–5 分钟，请勿重复提交相同 prompt；超时（默认 720s）后可调 od_video_list 查看结果。',
+  inputSchema: {
+    prompt: z.string().min(1).describe('视频描述（建议具体描述主体/动作/镜头运动/风格）'),
+    aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例，缺省由模型决定'),
+    duration_sec: z.number().int().min(2).max(15).optional().describe('时长秒数，缺省 5；daemon 自动 snap 到模型允许桶（Veo 4/6/8、Sora 4/8/12、Seedance 常用 5/10）'),
+    provider: z.enum(['volcengine', 'openai']).optional().describe(`网关协议，缺省 ${OD_VIDEO_PROVIDER}（env OD_VIDEO_PROVIDER 可改）`),
+    model: z.string().optional().describe('覆盖默认模型 id（openai 侧给裸模型名即可，桥自动补 aihubmix- 前缀；volcengine 侧须为 daemon 目录 id）'),
+    save_as: z.string().optional().describe('产物落盘的工作目录相对路径（如 assets/video/intro.mp4）。目录自动创建；无扩展名时补实际格式；不可含 .. 或盘符'),
+  },
+}, async (args) => {
+  try {
+    const result = await generateVideo(args);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `od_video_generate 失败: ${err.message}` }], isError: true };
+  }
+});
+
+server.registerTool('od_video_list', {
+  title: 'Open Design 已生成视频列表',
+  description: '列出 BMA 专用 OD 项目中已生成的视频文件（名称/大小/更新时间），用于复用历史产物。',
+  inputSchema: {
+    limit: z.number().int().min(1).max(100).optional().describe('返回条数上限，缺省 20'),
+  },
+}, async (args) => {
+  try {
+    const result = await listVideos(args);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `od_video_list 失败: ${err.message}` }], isError: true };
   }
 });
 
