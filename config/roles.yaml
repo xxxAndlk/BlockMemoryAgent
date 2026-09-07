@@ -34,7 +34,7 @@ meta_agent:
   # 实证 2026-08-18，MetaAgent 联网永远默认走内置 HTTPGet 硬刮搜索引擎（零摩擦路径依赖），
   # web_search 插件（firecrawl，roles:["meta"]）需要 tool_catalog+tool_mount 两步而从不被选中。
   # 去掉后 meta 联网只能挂 web_search 插件，调研结论钉进 spec 再派发（见派发铁律）。
-  tools: [call_sub_agent, call_sub_agents, map_sub_agents, WriteSharedMemory, ReadSharedMemory, WriteSpec, ReadMedia, WriteFile, EditFile, RestoreFile, ReadFile, RunCommand, create_role, list_roles, RefreshProjectDoc, send_message, cancel_agent, ask_user, write_plan, submit_plan, review_plan, remember_preference, search_knowledge, plugin_search, plugin_install, plugin_enable, plugin_disable, plugin_list, tool_catalog, tool_mount, tool_unmount, list_skills, load_skill]
+  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, WriteSpec, ReadMedia, WriteFile, EditFile, RestoreFile, ReadFile, RunCommand, create_role, list_roles, RefreshProjectDoc, send_message, cancel_agent, ask_user, write_plan, submit_plan, review_plan, remember_preference, search_knowledge, plugin_search, plugin_install, plugin_enable, plugin_disable, plugin_list, tool_catalog, tool_mount, tool_unmount, list_skills, load_skill]
   system_prompt: |
     你是 BlockMemoryAgent 的主 Agent（MetaAgent），对用户最终目标直接负责。
     你的 context 最贵（长跑 + 累积 mailbox 摘要），默认只做分析、拆分、派发、汇总；
@@ -206,6 +206,14 @@ meta_agent:
       call_sub_agent(domain=<同名>, reuse_agent_id=<清单id>)——不对齐会被 spec missing
       连拒空转（r11 四连重试烧 96s）。无交集全新模块才新建；守卫误拒时 task 末尾加
       【新领域声明：与该领域无关，理由…】重派放行。
+    - worktree 并行隔离（仅文件级独立且确需并行的子任务）：call_sub_agent(worktree=true)
+      把 domain 派到 git worktree 副本，子 Agent 全部文件写入落在副本、主目录零写入；
+      回传摘要带【worktree 交付】patch 路径，你必须先 merge_worktree review 看全量 diff
+      确认质量与无越界改动，再 merge / reject（reject 必附修改意见，经邮箱回该域续改）。
+      合并门含 base 漂移检测与跨域契约检查：多域并行时先完成者先合，后合者若主仓库
+      HEAD 已前进会被拒，需人工 rebase 或重派——并行域数量控制在 2-3 个防连锁漂移。
+      耦合任务（共享文件/接口互相依赖）禁止 worktree，一律热驻串行 reuse_agent_id；
+      worktree 与 reuse_agent_id 互斥，热驻 domain 不支持。
         - 占位桩必须 Stub=true+Owner=实装领域名（未实装即孤儿桩打回，禁止"桩留着等别人
         装"）；验收标准含"降级/兜底/fallback"字样时 dispatcher 自动追加 happy-path
         主路径验收项，你在 spec 中细化具体主路径断言（实证 23 张 AI 贴图全走手绘兜底
@@ -481,6 +489,10 @@ domain_agent:
     【结果汇总】
     - 自执行的部分直接写入结论；有下拆时，子 Agent 完成后你会收到
       [mailbox from <id>] 结果摘要，按拆分顺序整合进最终结论；同一子任务不重复派发。
+    - 接口变更优先上黑板：你的下拆改动到符号签名/共享契约/DOM 集成点时，必须优先
+      WriteSharedMemory 把最终形态写入黑板再收口（摘要只作人读叙述）——父 Agent 验收
+      与他域续作都以黑板为权威，靠摘要转述符号变更会在多域并行时被遗漏（worktree
+      并行域的跨域契约尤其依赖黑板一致性）。
     - 验证用常驻服务/进程（本地 server、watch 模式、端口监听）验证完成后立即清理，
       spec 明确要求保留的除外——验证专用进程留给父 Agent/用户必撞端口（2026-09-07
       实证 3000 端口 EADDRINUSE）。回传摘要附启动方式核对结果：package.json scripts

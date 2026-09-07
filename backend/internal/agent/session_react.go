@@ -74,6 +74,19 @@ type reactInternalSession struct {
 	ctx context.Context
 	// cancelFn 用于取消 ctx，通常在会话结束或关闭时调用。
 	cancelFn context.CancelFunc
+	// stopCtx 是会话级中断传播基底（TODO 第10④）：独立于 ctx 从 Background 建，
+	// 仅 Stop（软停）/cancel（硬取消）/destroyAfterSoftStop/shutdown 取消；
+	// pauseSession（token/轮数触顶）与父正常结束不触碰——暂停可恢复、热驻 Idle 保留复用。
+	// 经 tool.WithStopContext 注入 runCtx，dispatchOne/ResumePaused/runDomainTask 派生
+	// 子 Agent ctx 以它为基底（缺省回退 Background），stop 窗口期新派发与深层孙代即刻随会话终止。
+	stopCtx context.Context
+	// stopCancel 取消 stopCtx；与 stopCtx 同建同重建（restartSessionContext）。
+	stopCancel context.CancelFunc
+	// trustMode 是会话当前信任模式（TODO 第10⑥，suggest|auto-edit|full-auto）：
+	// createSession 取 config 默认（st.defaultTrustMode），会话内可经 HTTP/TUI 随时切换。
+	// atomic.Value 保证跨 goroutine 读取（ReAct 循环工具派发侧实时读取——切换下一工具调用生效）；
+	// 未设置返回空串 → Registry 回退现网生产边界 + 危险命令语义（测试/旧路径兼容）。
+	trustMode atomic.Value
 	// activeTopicID 当前活跃话题 ID。切换话题时旧 Agent 树终结 + 新树起,
 	// 旧话题摘要写入 sharedKV `topic:{sessionID}:{topicID}:summary`。空表示单话题(未切换过)。
 	// 话题 ID 也在切换时用于emetries 标签(若需)。
@@ -159,6 +172,10 @@ type reactSessionStore struct {
 	// 旧 session 残留文件（spec/file_tree 不跨 session 复用），入参为会话有效工作目录。
 	// 由 bootstrap 经 ReactService.SetSharedMemoryStore 桥接注入。
 	sharedMemoryReset func(dir string)
+	// defaultTrustMode 是新建会话的初始信任模式（TODO 第10⑥）：config agent.trust_mode
+	// 经 ReactService.SetDefaultTrustMode 注入；空 = 未配置，会话 trustMode 不设置，
+	// Registry 回退现网语义。
+	defaultTrustMode string
 }
 
 // newReactSessionStore 创建一个新的 reactSessionStore 实例。
@@ -298,6 +315,16 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 	runCtx, cancelFn := context.WithCancel(context.Background())
 	session.ctx = runCtx
 	session.cancelFn = cancelFn
+	// stopCtx 独立于 runCtx 建（TODO 第10④）：runCtx 取消≠中断传播（pause 触顶不传播），
+	// 仅显式 stop/cancel/destroy 路径取消 stopCtx。
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+	session.stopCtx = stopCtx
+	session.stopCancel = stopCancel
+	// 初始信任模式（TODO 第10⑥）：取 store 默认（config agent.trust_mode）；未配置不设置，
+	// Registry 回退现网语义。
+	if st.defaultTrustMode != "" {
+		session.trustMode.Store(st.defaultTrustMode)
+	}
 
 	// 加写锁后将新会话放入内存映射。
 	st.mu.Lock()
@@ -318,6 +345,23 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 
 	// 返回刚创建的会话指针，调用方可立即使用。
 	return session
+}
+
+// currentTrustMode 返回会话当前信任模式；未设置（测试/未配置）返回空串，
+// Registry 据此回退现网生产边界 + 危险命令语义。
+// 供 runCtx 注入的读取器闭包在每次工具派发时实时调用——中途切换下一工具调用生效。
+func (s *reactInternalSession) currentTrustMode() string {
+	if v := s.trustMode.Load(); v != nil {
+		if m, ok := v.(string); ok {
+			return m
+		}
+	}
+	return ""
+}
+
+// setTrustMode 切换会话信任模式（atomic 存储无需额外加锁）。
+func (s *reactInternalSession) setTrustMode(mode string) {
+	s.trustMode.Store(mode)
 }
 
 // getSession 根据会话 ID 获取会话指针。
@@ -414,6 +458,17 @@ func (st *reactSessionStore) sessionCount() int {
 	return len(st.sessions)
 }
 
+// sessionIDs 返回当前内存中全部会话 ID（shutdown 遍历清理等场景用）。
+func (st *reactSessionStore) sessionIDs() []string {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	ids := make([]string, 0, len(st.sessions))
+	for id := range st.sessions {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // shutdown 优雅停机：先把 Running 会话标记为"因服务重启中断"（error + 统一提示），
 // 再取消全部会话上下文，最后在锁外对被中断的会话落库（历史/事件 + 中断事件）。
 // 标记先行：setSessionError 的"首次错误胜出"守卫（Status==Error 且 Result!="" 即跳过）
@@ -429,6 +484,11 @@ func (st *reactSessionStore) shutdown() {
 		if s.cancelFn != nil {
 			s.cancelFn()
 			s.cancelFn = nil
+		}
+		// 中断传播（TODO 第10④）：stopCtx 同步取消（同硬取消语义，进程退出全树终止）。
+		if s.stopCancel != nil {
+			s.stopCancel()
+			s.stopCancel = nil
 		}
 		// Running 会话标记为中断：重启后列表显示"因服务重启中断"而非静止的 running。
 		if s.Status == enums.SessionStatusRunning {

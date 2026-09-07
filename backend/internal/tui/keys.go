@@ -76,6 +76,10 @@ const fullHelpText = `
 	  /enqueue text     队列注入
 	  /topic <name> [goal]  切换/创建话题
 	  /topics           打开完整记录翻阅话题切换点
+	  /approval <mode>  切换信任模式：suggest（变更逐条审批）/ auto-edit（命令与破坏
+	                    性工具审批，文件编辑直通）/ full-auto（全自主）；下一工具调用生效
+	  /worktree         worktree 合并门：list 副本清单弹窗 / diff <aid> 全量 diff /
+	                    merge <aid> 合入主仓库 / reject <aid> <意见> 驳回并回信该域
 	  /memory <query>   手动检索 Agent 记忆
 	  /agents           打开 Agent 编排面板
 	  /status           显示当前会话状态

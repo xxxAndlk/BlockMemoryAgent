@@ -68,6 +68,11 @@ type Agent interface {
 	// 节点不存在或已 terminal 返回 ErrAgentNotFound。
 	CancelAgent(ctx context.Context, sessionID, instID string) error
 
+	// PauseAgent 手动暂停指定 domain 支路（TODO 第10项③ 审计面止血）。
+	// 仅 Role=domain 且 Running 的节点可暂停；走 dispatcher Pause 收尾
+	// （SaveMessages + tree.Pause），热驻槽 parked 可 ResumePaused 续跑。
+	PauseAgent(ctx context.Context, sessionID, instID string) error
+
 	// Board 返回会话任务看板快照（TODO #22 执行计划面板真相源）。
 	// 未接线或会话无看板时返回 (nil, nil)，调用方回退旧树合成。
 	Board(ctx context.Context, sessionID string) (*board.Snapshot, error)

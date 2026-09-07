@@ -303,7 +303,16 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		TokenBudgetPerRole:        cfg.Agent.TokenBudgetPerRole,
 		ContextTokenBudget:        cfg.Agent.ContextTokenBudget,
 		SessionMaxWallClockMin:    cfg.Agent.SessionMaxWallClockMin,
+		ToolResultDumpRunes:       cfg.Agent.ToolResultDumpRunes,
+		ToolResultDigestRunes:     cfg.Agent.ToolResultDigestRunes,
+		StaleToolEvictRounds:      cfg.Agent.StaleToolEvictRounds,
+		AgentsMDMaxRunes:          cfg.Agent.AgentsMDMaxRunes,
+		ToolParallelEnabled:       cfg.Agent.ToolParallelEnabled,
+		ToolParallelMaxConcurrency: cfg.Agent.ToolParallelMaxConcurrency,
 	}
+	// 工具图片长边降采样（TODO 第9项④）：agent 包级旋钮，全部工具图片唯一汇流点
+	//（toolRegistryAdapter.Dispatch）读取；<=0 关闭。进程生命周期内不变。
+	agent.SetImageMaxEdge(cfg.Agent.ImageMaxEdge)
 	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute
 	if subAgentTimeout < 0 {
 		subAgentTimeout = 0 // 负数表示不限制
@@ -323,6 +332,14 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.WithMaxPausedResumes(cfg.Agent.PausedDomainMaxResumes)
 	// 派发 task 文本双档上限（TODO #35 放开预算）：soft 软着陆警告 / hard 硬拒。
 	subAgentDispatcher.WithTaskRuneLimits(cfg.Agent.TaskMaxRunes, cfg.Agent.TaskMaxRunesHard)
+	// AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦）：派发前缀首位注入【项目自述】段；
+	// 缺失零开销，<=0 关闭。
+	subAgentDispatcher.WithAgentsMDMaxRunes(cfg.Agent.AgentsMDMaxRunes)
+	// worktree 隔离派发开关（TODO 第9项⑤/#10项⑤）：允许 call_sub_agent worktree=true
+	// 派发到 git worktree 副本（主目录零写入，patch 交付经 merge_worktree 合并门）。
+	if cfg.Agent.WorktreeEnabled != nil {
+		subAgentDispatcher.WithWorktreeEnabled(*cfg.Agent.WorktreeEnabled)
+	}
 	// 叶子助手 kind=error 失败自动重派（TODO #23）：默认 1 次，同任务同前缀重跑。
 	subAgentDispatcher.WithDispatchRetryCount(cfg.Agent.DispatchRetryCount)
 	// 派发执行模式引擎参数（TODO #29 三引擎）：reflection 自检轮数 / plan_execute 最大步数。
@@ -468,6 +485,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 防"等用户操作"被巡检误判假死（等多久都不杀，直到用户答复或会话取消）。
 	agentSvc.SetActivityPinger(subAgentDispatcher.PingActivity)
 	toolRegistry.SetApprovalHook(agentSvc.ApprovalHook())
+	// 默认信任模式（TODO 第10⑥）：config agent.trust_mode 注入，新建会话取为初始档；
+	// 会话内可经 HTTP/TUI 随时切换（下一工具调用生效）。非法值 fail-fast 拒绝启动。
+	if err := agentSvc.SetDefaultTrustMode(cfg.Agent.TrustMode); err != nil {
+		return nil, fmt.Errorf("invalid agent.trust_mode: %w", err)
+	}
 	// 外部知识库检索（TODO #27 热路径 a）：search_knowledge 工具 → retriever 混合检索。
 	// 混合检索后端 = KnowledgeStore（直接满足 HybridSearchBackend：SearchByType + SearchKeywords）。
 	// 嵌入用全局 embedder（roles.yaml embed 段；当前 pseudo，真实 embed 激活后自动升级）。
@@ -628,6 +650,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 派发任务的机器权威状态（完成/失败+原因/进行中），完成项禁止重新派发查询，防旧需求返工。
 	agentSvc.SetTaskLedgerProvider(subAgentDispatcher.TaskLedgerBrief)
 	agentSvc.SetIdleTTLArmer(subAgentDispatcher)
+	// 活动证据展示面（TODO 第10项②）：ListAgents 填充各节点 ActivityKind/LastActivityAgo，
+	// TUI/Web 渲染 "in <tool> · active Xs ago" 让假死可见。
+	agentSvc.SetActivityEvidenceProvider(subAgentDispatcher)
 	// 热驻模式下挂起恢复走全树唤醒（ResumeSessionAgents）；旧 resumePausedDomain
 	// 仅在热驻关闭或进程重启槽丢失时兜底。
 	if cfg.Agent.DomainHotResidentEnabled {

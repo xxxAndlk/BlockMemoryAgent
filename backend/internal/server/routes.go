@@ -21,7 +21,13 @@ func RegisterSessionRoutes(rg gin.IRouter, m *SessionManager) {
 	rg.GET("/sessions/:id/agents", m.HandleSessionAgents)                   // 会话内 Agent 列表
 	rg.GET("/sessions/:id/tree", m.HandleSessionTree)                       // 权威 Agent 树快照
 	rg.POST("/sessions/:id/agents/:aid/cancel", m.HandleSessionAgentCancel) // 取消子 Agent 实例
+	rg.POST("/sessions/:id/agents/:aid/pause", m.HandleSessionAgentPause)   // 手动暂停 domain 支路（TODO 第10③）
+	rg.GET("/sessions/:id/agents/:aid/events", m.HandleSessionAgentEvents)  // 审计下钻：逐轮事件（TODO 第10③）
+	rg.GET("/sessions/:id/worktrees", m.HandleSessionWorktrees)             // worktree 副本清单（TODO 第9⑤）
+	rg.GET("/sessions/:id/worktrees/:aid/diff", m.HandleSessionWorktreeDiff)    // worktree 全量 diff（TODO 第10⑤ review）
+	rg.POST("/sessions/:id/worktrees/:aid/:action", m.HandleSessionWorktreeAction) // 合并门操作 merge|reject（TODO 第10⑤）
 	rg.GET("/sessions/:id/metrics", m.HandleSessionMetrics)                 // 会话级指标
+	rg.GET("/sessions/:id/efficiency", m.HandleSessionEfficiency)           // 效率一等指标（TODO 第9⑥/第10③）
 	rg.GET("/sessions/:id/logs", m.HandleSessionLogs)                       // 会话日志查询
 	rg.GET("/sessions/:id/token-metrics", m.HandleSessionTokenMetrics)      // Token 消耗指标
 	rg.GET("/sessions/:id/watchdog", m.HandleSessionWatchdog)               // Watchdog 状态
@@ -32,5 +38,6 @@ func RegisterSessionRoutes(rg gin.IRouter, m *SessionManager) {
 	rg.POST("/sessions/:id/cancel", m.HandleSessionCancel)                  // 取消会话
 	rg.POST("/sessions/:id/stop", m.HandleSessionStop)                      // 软停止（可续跑，TODO #37）
 	rg.POST("/sessions/:id/topic", m.HandleSessionTopic)                    // 话题管理
+	rg.POST("/sessions/:id/trust-mode", m.HandleSessionTrustMode)           // 信任模式切换（TODO 第10⑥）
 	rg.GET("/sessions/:id", m.HandleGetSession)                             // 会话详情
 }

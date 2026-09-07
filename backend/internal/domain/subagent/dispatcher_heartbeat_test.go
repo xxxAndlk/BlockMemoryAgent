@@ -1,11 +1,10 @@
 package subagent
 
-// dispatcher_heartbeat_test.go 验证心跳巡检主动 kill 假死叶子子 Agent。
+// dispatcher_heartbeat_test.go 验证 stall 巡检主动 kill 假死叶子子 Agent（步间静默形态）。
 import (
 	"context"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,8 +19,9 @@ import (
 	"github.com/go-kratos/blades"
 )
 
-// hangingProvider 模拟 LLM 流式挂起：Generate 阻塞至 release 关闭，忽略 ctx 取消（假死场景）。
-// 触发心跳巡检主动 cancel + 兜底 trackChildDone，验证父 Agent 不必空等 sub_agent_timeout。
+// hangingProvider 模拟 LLM 调用挂起（慢思考/流式首块前停滞）：Generate 阻塞至 release
+// 关闭，忽略 ctx 取消。证据化语义（TODO 第10项②）下该形态被 llmInFlight 豁免巡检，
+// 兜底收敛归 react_llm_timeout（CallLLM 单呼超时）+ 流空闲卡口 + 会话墙钟。
 type hangingProvider struct {
 	release chan struct{}
 }
@@ -33,8 +33,13 @@ func (h *hangingProvider) Generate(ctx context.Context, req *blades.ModelRequest
 func (h *hangingProvider) Name() string { return "hanging" }
 
 // TestDispatcher_HeartbeatKillsStuckLeaf 验证叶子 Agent 假死（Generate 无返回）时，
-// 心跳巡检主动 cancel + notify 父 + 兜底 trackChildDone：父 PendingChildren 归 0 且邮箱收到卡死通知。
-func TestDispatcher_HeartbeatKillsStuckLeaf(t *testing.T) {
+// TestDispatcher_StuckLeaf_InFlightLLMExempt 验证证据化豁免（TODO 第10项②）：
+// 端到端派发的叶子 Agent 在 LLM 调用挂起（llmInFlight=true）期间即使远超巡检阈值
+// 也不被 patrol kill——task-115 类慢思考误杀根因修复。挂死 LLM 的兜底收敛归
+// react_llm_timeout（CallLLM 单呼超时，默认 300s）+ 流空闲卡口 + 会话墙钟。
+// 巡检 kill 路径（cancel+notify+兜底递减）的端到端覆盖见 TestDispatcher_KillStuckNilCancelNoPanic；
+// 判定三态分流见 stall_evidence_test.go。
+func TestDispatcher_StuckLeaf_InFlightLLMExempt(t *testing.T) {
 	cfg := &config.RoleConfigFile{
 		MetaAgent: config.MetaAgentConfig{
 			SystemPrompt: "meta",
@@ -69,26 +74,28 @@ func TestDispatcher_HeartbeatKillsStuckLeaf(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("expected dispatch success, got: %s", res.Error)
 	}
+	subID := res.Output
 
-	// 等待巡检 kill：父 PendingChildren 应归 0（doneOnce 兜底递减）。
-	deadline := time.Now().Add(3 * time.Second)
+	// 前提守卫：reporter 已注入且 llm_start 置 llmInFlight=true（Generate 挂起中）。
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if d.PendingChildren("meta") == 0 {
+		if e := d.activityEvidenceFor(subID); e != nil && e.llmInFlight.Load() {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if d.PendingChildren("meta") != 0 {
-		t.Fatalf("expected PendingChildren==0 after heartbeat kill, got %d", d.PendingChildren("meta"))
+	e := d.activityEvidenceFor(subID)
+	if e == nil || !e.llmInFlight.Load() {
+		t.Fatal("premise: leaf evidence should have llmInFlight=true while Generate hangs")
 	}
 
-	// 校验邮箱收到卡死通知。
-	msgs := mb.Drain("meta")
-	if len(msgs) == 0 {
-		t.Fatal("expected stuck notify in mailbox, got none")
+	// 等待 3× 阈值：在飞 LLM 期间巡检不得 kill。
+	time.Sleep(600 * time.Millisecond)
+	if d.PendingChildren("meta") != 1 {
+		t.Fatalf("in-flight LLM leaf must NOT be patrol-killed, pending=%d", d.PendingChildren("meta"))
 	}
-	if !strings.Contains(msgs[0].Body, "假死") && !strings.Contains(msgs[0].Body, "无活动") {
-		t.Fatalf("expected stuck notify body, got: %s", msgs[0].Body)
+	if msgs := mb.Drain("meta"); len(msgs) > 0 {
+		t.Fatalf("no kill notify expected while LLM in flight, got: %s", msgs[0].Body)
 	}
 }
 
@@ -144,7 +151,7 @@ func TestDispatcher_PingActivityPreventsKill(t *testing.T) {
 	id := "sess-1/code_assistant-1"
 	killed := make(chan struct{})
 	var cancelOnce sync.Once
-	d.activity.Store(id, new(atomic.Int64))
+	d.activity.Store(id, &activityEvidence{}) // lastTS=0：首次 ping 前即静默（PingActivity 刷新后豁免）
 	d.subMeta.Store(id, &subAgentMeta{
 		parentID:  "meta",
 		sessionID: "sess-1",
@@ -182,7 +189,7 @@ func TestDispatcher_KillStuckNilCancelNoPanic(t *testing.T) {
 	t.Cleanup(d.ClosePatrol)
 
 	id := "s1/domain-9"
-	d.activity.Store(id, new(atomic.Int64)) // 时间戳 0：立即判假死
+	d.activity.Store(id, &activityEvidence{}) // lastTS=0：立即判静默
 	d.subMeta.Store(id, &subAgentMeta{parentID: "s1", sessionID: "s1"}) // cancel=nil（热驻首注册形态）
 	d.ensurePatrol()
 
@@ -238,7 +245,21 @@ func TestHotDomain_HeartbeatKillCancelsRunningTask(t *testing.T) {
 	}
 	subID := res.Output
 
-	// 巡检 kill：树节点应落 Failed（心跳超时疑似卡死）。
+	// 前提：等引擎 LLM 进入在飞（wrapEngineLLM beginAuxLLM 置 llmInFlight=true）。
+	// 换绑先于引擎执行，此时任务 cancelTask 已换绑进 subMeta。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if e := d.activityEvidenceFor(subID); e != nil && e.llmInFlight.Load() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// 证据化语义（TODO 第10项②）：在飞 LLM 是巡检豁免形态，不再直接构成 kill 触发。
+	// 注入"步间静默"证据条目（lastTS=0、无在飞 LLM/工具）触发巡检 kill，
+	// 被测对象仍是换绑后 cancel 的传导链：cancel → ctx 取消 → Canceled 分支 → 槽销毁。
+	d.activity.Store(subID, &activityEvidence{})
+
+	// 巡检 kill：树节点应落 Failed（步间静默疑似卡死）。
 	waitForCond(t, "tree node failed after heartbeat kill", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && n.Status == orchestrator.StatusFailed

@@ -1,9 +1,12 @@
 package subagent
 
-// heartbeat_kill_test.go 验证心跳 kill 增强（2026-08-27 fruit 任务实证链）：
-//   - 热驻 domain 活动上报闭包 Load-per-call（Delete→rearm 换 atomic 后仍刷新当前条目）；
+// heartbeat_kill_test.go 验证 stall kill 增强（2026-08-27 fruit 任务实证链 + TODO 第10项②）：
+//   - 热驻 domain 活动上报闭包 Load-per-call（Delete→rearm 换新证据条目后仍刷新当前条目）；
 //   - kill 时级联停止树内全部 Running/Paused 后代；
 //   - kill 回告含「终止前活动摘要」（最近自述 + 最近工具调用，cap 6 新版在前）。
+//
+// 本文件覆盖的 kill 均为「步间静默超阈值」形态（lastTS 过期、无在飞 LLM/工具）；
+// 在飞 LLM 豁免与挂死工具到点杀两形态见 stall_evidence_test.go。
 
 import (
 	"strings"
@@ -16,7 +19,7 @@ import (
 )
 
 // TestActivityReporterFn_LoadPerCall 验证闭包在 activity 条目被 Delete 后 rearm
-// 重建（热驻 domain 每任务换新 atomic）场景下仍刷新当前条目——捕获指针的旧实现会
+// 重建（热驻 domain 每任务换新证据条目）场景下仍刷新当前条目——捕获指针的旧实现会
 // 写进已废弃条目导致巡检误判假死。
 func TestActivityReporterFn_LoadPerCall(t *testing.T) {
 	d, _, _, _, _ := newSalvageTestEnv(t, &mockProvider{text: "ok"})
@@ -26,23 +29,23 @@ func TestActivityReporterFn_LoadPerCall(t *testing.T) {
 	fn := d.activityReporterFn(id)
 
 	// 第一轮任务：rearm 建条目 A，触碰刷新。
-	first := newAtomic(time.Now().UnixNano())
+	first := newEvidenceAt(time.Now().UnixNano())
 	d.activity.Store(id, first)
-	fn()
-	if first.Load() == 0 {
+	fn("llm_end")
+	if first.lastTS.Load() == 0 {
 		t.Fatal("reporter should refresh entry of current task")
 	}
-	first.Store(1) // 打脏，验证后续写入不再落在此实例
+	first.lastTS.Store(1) // 打脏，验证后续写入不再落在此实例
 
 	// enterIdle Delete + 下任务 rearm 重建条目 B。
 	d.activity.Delete(id)
-	second := newAtomic(0)
+	second := newEvidenceAt(0)
 	d.activity.Store(id, second)
-	fn()
-	if second.Load() == 0 {
+	fn("llm_end")
+	if second.lastTS.Load() == 0 {
 		t.Fatal("reporter must refresh the rebuilt (current) entry, not the stale one")
 	}
-	if first.Load() != 1 {
+	if first.lastTS.Load() != 1 {
 		t.Fatal("stale entry must not be touched by Load-per-call reporter")
 	}
 }
@@ -65,13 +68,13 @@ func TestKillStuckSubAgent_CascadeKillsDescendants(t *testing.T) {
 
 	stale := time.Now().Add(-time.Hour).UnixNano()
 	now := time.Now().UnixNano()
-	d.activity.Store(domainID, newAtomic(stale))
-	d.activity.Store(leafID, newAtomic(now))
+	d.activity.Store(domainID, newEvidenceAt(stale))
+	d.activity.Store(leafID, newEvidenceAt(now))
 	d.subMeta.Store(domainID, &subAgentMeta{parentID: "s1", sessionID: "s1"})
 	d.subMeta.Store(leafID, &subAgentMeta{parentID: domainID, sessionID: "s1", cancel: leafCancel.set})
 	d.subMeta.Store(pausedID, &subAgentMeta{parentID: domainID, sessionID: "s1", cancel: pausedCancel.set})
 
-	d.killStuckSubAgent(domainID)
+	d.killStuckSubAgent(domainID, "last_kind=test quiet=1h0m0s")
 
 	if !leafCancel.called() {
 		t.Fatal("running descendant should be cancelled by cascade")
@@ -97,10 +100,10 @@ func TestKillStuckSubAgent_NoDescendants(t *testing.T) {
 	leafID := "s1/code_assistant-9"
 	tr.Register(orchestrator.Node{ID: leafID, ParentID: "s1", Role: "code_assistant", Status: orchestrator.StatusRunning})
 	stale := time.Now().Add(-time.Hour).UnixNano()
-	d.activity.Store(leafID, newAtomic(stale))
+	d.activity.Store(leafID, newEvidenceAt(stale))
 	d.subMeta.Store(leafID, &subAgentMeta{parentID: "s1", sessionID: "s1"})
 
-	d.killStuckSubAgent(leafID)
+	d.killStuckSubAgent(leafID, "last_kind=test quiet=1h0m0s")
 
 	var got bool
 	dl := time.Now().Add(2 * time.Second)
@@ -124,7 +127,7 @@ func TestRecentActivitySummary_KillMsg(t *testing.T) {
 	domainID := "s1/domain-1"
 	tr.Register(orchestrator.Node{ID: domainID, ParentID: "s1", Role: "domain", Status: orchestrator.StatusRunning})
 	stale := time.Now().Add(-time.Hour).UnixNano()
-	d.activity.Store(domainID, newAtomic(stale))
+	d.activity.Store(domainID, newEvidenceAt(stale))
 	d.subMeta.Store(domainID, &subAgentMeta{parentID: "s1", sessionID: "s1"})
 
 	d.recordRecentActivity(domainID, agent.LiveEvent{Kind: agent.LiveEventLLMDelta, Text: "正在跑 6 场景截图验证"})
@@ -136,7 +139,7 @@ func TestRecentActivitySummary_KillMsg(t *testing.T) {
 		})
 	}
 
-	d.killStuckSubAgent(domainID)
+	d.killStuckSubAgent(domainID, "last_kind=test quiet=1h0m0s")
 
 	var body string
 	dl := time.Now().Add(2 * time.Second)
@@ -165,9 +168,9 @@ func TestRecentActivitySummary_KillMsg(t *testing.T) {
 	// 无记录 Agent：不追加归纳段。
 	leafID := "s1/code_assistant-7"
 	tr.Register(orchestrator.Node{ID: leafID, ParentID: "s1", Role: "code_assistant", Status: orchestrator.StatusRunning})
-	d.activity.Store(leafID, newAtomic(stale))
+	d.activity.Store(leafID, newEvidenceAt(stale))
 	d.subMeta.Store(leafID, &subAgentMeta{parentID: "s1", sessionID: "s1"})
-	d.killStuckSubAgent(leafID)
+	d.killStuckSubAgent(leafID, "last_kind=test quiet=1h0m0s")
 	dl = time.Now().Add(2 * time.Second)
 	var leafBody string
 	for time.Now().Before(dl) && leafBody == "" {

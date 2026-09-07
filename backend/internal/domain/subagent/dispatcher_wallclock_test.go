@@ -4,7 +4,6 @@ package subagent
 import (
 	"context"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -159,16 +158,18 @@ func TestDispatchOne_DomainReconClockEnforced(t *testing.T) {
 
 // TestWrapEngineLLM_TimeoutAndKeepalive 验证引擎辅助 LLM 包装：
 // 1) 整次调用（含内部挂起）被 engineLLMTimeout 快速掐断（不再烧到墙钟）；
-// 2) 调用期间保活定时器刷新 activity（防心跳巡检误杀 judge 长生成）。
+// 2) 证据化（TODO 第10项②）：调用期间 llmInFlight=true（巡检豁免，替代旧 keepalive
+//    ticker 盲报），结束后复位 + lastTS 收口为 llm_end。
 func TestWrapEngineLLM_TimeoutAndKeepalive(t *testing.T) {
 	d := &Dispatcher{engineLLMTimeout: 60 * time.Millisecond}
-	act := new(atomic.Int64)
-	act.Store(0)
-	d.activity.Store("s1/code_assistant-1", act)
+	e := &activityEvidence{}
+	d.activity.Store("s1/code_assistant-1", e)
 
+	var inFlightDuring bool
 	start := time.Now()
 	_, err := d.wrapEngineLLM("s1/code_assistant-1", func(ctx context.Context, prompt string) (string, error) {
-		<-ctx.Done() // 模拟 SDK 挂起直至超时
+		inFlightDuring = e.llmInFlight.Load() // 调用中采样：应处于在飞态
+		<-ctx.Done()                          // 模拟 SDK 挂起直至超时
 		return "", ctx.Err()
 	})(context.Background(), "judge prompt")
 	if err == nil {
@@ -177,12 +178,11 @@ func TestWrapEngineLLM_TimeoutAndKeepalive(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("engine llm timeout should fail fast, elapsed=%v", elapsed)
 	}
-	// 保活：超时前 30s ticker 不一定触发（60ms 超时 < 30s 间隔），此处仅验证不 panic；
-	// activity 未被清零即路径可用。真正触发验证见 keepalive 语义（间隔 30s 硬编码，
-	// 测试不等待 30s，超时快速失败已覆盖主事故场景）。
-	if act.Load() == 0 {
-		// 60ms 超时 < 30s 保活间隔，未触发是预期；不判失败。
-		t.Log("keepalive ticker interval (30s) > timeout (60ms), touch not expected")
+	if !inFlightDuring {
+		t.Fatal("llmInFlight should be set while engine LLM is in flight")
+	}
+	if e.llmInFlight.Load() {
+		t.Fatal("llmInFlight should be cleared after engine LLM returns")
 	}
 }
 

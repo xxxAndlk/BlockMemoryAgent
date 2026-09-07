@@ -66,6 +66,15 @@ agent:
   domain_recon_wall_clock_min: -1 # Domain 侦察墙钟（分钟）：domain 派发无显式 wall_clock_min 时的默认预算，中点邮件预警"停止侦察开始产出"。2026-08-21 慢任务修复：实证炮塔领域 Agent 1.5h 全程"契约反推"侦察零交付；0=关闭回退全局值。同日下午实证 domain 换 glm-5.3 后单轮 LLM 5-25min，30min 墙钟装不下侦察+建设三连杀（domain-1/3/4 全 FAIL 30m0.00s），-1=禁用回退全局 sub_agent_timeout_min。
   engine_llm_timeout_sec: -1     # 引擎辅助 LLM（reflection 自检 judge / plan_execute 规划）单次调用超时（秒）。该路径不走 CallLLM 包装,只吃 SDK 默认 600s/请求,provider 3 次重试 × judge 内部重试叠加曾烧 70 分钟直到墙钟强杀（2026-08-19 引擎 Agent 事故）；300s 包住整次调用含 provider 重试,到期快速失败。2026-08-21 下午实证 judge 角色被成本重排换成 glm-5.3（thinking）后 300s 内出不了判定 JSON，judge 2 连超时→fail-closed unverified，把当天所有成功任务（文件已落盘）标成 FAIL（domain-2/3/4/5 四连杀）；-1=禁用独立超时，judge 只受子 Agent 墙钟约束。
   tool_output_history_max_runes: 20000 # 写入历史的单条工具输出最大字符数，负数表示不截断。ReadFile 行区间分页默认 200 行/页（read_file_max_chars 默认 16000 字符，ASCII 整页约 16000 runes），20000 保证整页内容完整进入历史，模型无需为"看不见刚读的下半页"重复读取
+  tool_result_dump_runes: 8000   # 工具结果统一收口（TODO 第9项②）：单条工具输出超此 rune 数全文落盘 <workDir>/.bma/tool_outputs/，历史只留头 tool_result_digest_runes 摘录 +【全文已落盘】路径（模型按需 ReadFile 取全文）；落盘失败降级原样截断；负数=关闭
+  tool_result_digest_runes: 2000 # 收口后保留的头部摘录 rune 数（TODO 第9项②）
+  stale_tool_evict_rounds: 20    # 陈旧工具结果驱逐（TODO 第9项③）：N 轮前（按 assistant 轮序）ReadFile/SearchInFiles 结果在请求视图替换为"已驱逐需重读"占位符（需重读时按原参数重新 ReadFile）；只影响请求不改持久化历史；验证证据类工具（RunCommand 等）不驱逐；负数=关闭
+  image_max_edge: 1024           # 工具图片长边降采样上限（TODO 第9项④，像素）：png/jpeg 超限等比缩小（不放大小图），原图落盘 <workDir>/.bma/images/ 并在输出附「原图已落盘」路径；gif/webp 与缩放失败原图直通；确定性缩放保持截图指纹去重语义；负数=关闭
+  agents_md_max_runes: 4000      # AGENTS.md/CLAUDE.md 项目自述自动注入上限（TODO 第10项⑦，rune）：workDir 根部 AGENTS.md 优先、其次 CLAUDE.md，以【项目自述】段注入 envBlock 与派发前缀首位（mtime 缓存，缺失零开销）；负数=关闭
+  tool_parallel_enabled: true    # 轮内并行工具执行（TODO 第9项①）：同轮多个 tool_calls 无依赖调用并发派发（墙钟≈最慢一个），结果按原序串行回填；写类工具同路径互斥防竞写；false=退回逐个串行
+  tool_parallel_max_concurrency: 4 # 轮内并行工具并发上限（TODO 第9项①）：信号量限流，防同轮大量 tool_calls 打满下游（子 Agent 派发/命令子进程）；<=0 按默认 4
+  trust_mode: full-auto          # 默认信任模式（TODO 第10项⑥，会话级三档，对标 Codex）：suggest=全部变更类动作（写文件/命令/插件破坏性工具）逐条推「需确认」，读类直通 | auto-edit=文件编辑直通，命令与插件破坏性工具审批 | full-auto=全自主（现状默认）。新建会话取此值为初始档，会话内可经 POST /api/sessions/{id}/trust-mode 或 TUI /approval 随时切换（下一工具调用生效）；非法值回落 full-auto
+  worktree_enabled: true         # worktree 隔离派发开关（TODO 第9项⑤/#10项⑤）：允许 call_sub_agent 携带 worktree=true 派发到 git worktree 副本（子 Agent 全部文件写入落在 <repoRoot>/.bma/worktrees/ 副本，主目录零写入；成功收尾产出全量 patch，meta 经 merge_worktree 工具 review/merge/reject 走合并门：base 漂移检测→跨域契约检查→git apply）；与 reuse_agent_id 互斥，热驻 domain 不支持；false=拒绝 worktree 参数；主目录非 git 仓库时派发侧同样拒绝（不静默降级）
   token_budget_per_goal: 300000   # 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。保留不破坏旧配置加载，不再驱动任何闸门。
   token_budget_per_role:          # 按角色上下文 token 阈值（替换原累计预算）：Assemble 压缩后估算 messages token >= 阈值即暂停（近 N 单独就超、压不下去），每轮独立估算（各 Agent 独立）。未列角色默认 150000。
     domain: 150000

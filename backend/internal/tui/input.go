@@ -551,10 +551,37 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 
+	// /approval [suggest|auto-edit|full-auto]：切换会话信任模式（TODO 第10⑥）。
+	// 经 POST /api/sessions/{id}/trust-mode 下发，下一工具调用生效；
+	// 无参数时展示当前三档语义帮助。
+	if parts[0] == "/approval" {
+		if len(parts) < 2 {
+			m.flashMsg("usage: /approval suggest|auto-edit|full-auto（suggest=变更逐条审批, auto-edit=命令/破坏性审批, full-auto=全自主）")
+			return
+		}
+		mode := parts[1]
+		switch mode {
+		case "suggest", "auto-edit", "full-auto":
+		default:
+			m.flashMsg("invalid mode: " + mode + " (want suggest|auto-edit|full-auto)")
+			return
+		}
+		m.postJSON(fmt.Sprintf("/api/sessions/%s/trust-mode", s.ID), map[string]string{"mode": mode})
+		m.flashMsg("trust mode -> " + mode + "（下一工具调用生效）")
+		return
+	}
+
 	// /enqueue <text...>：将文本注入当前会话队列。
 	if parts[0] == "/enqueue" && len(parts) > 1 {
 		content := strings.TrimSpace(strings.TrimPrefix(trimmed, "/enqueue "))
 		m.postJSON(fmt.Sprintf("/api/sessions/%s/enqueue", s.ID), map[string]string{"content": content})
+		return
+	}
+
+	// /worktree [list|diff <aid>|merge <aid>|reject <aid> <comments...>]：
+	// worktree 隔离派发的合并门视图与操作（TODO 第9⑤/#10⑤）。
+	if parts[0] == "/worktree" {
+		m.handleWorktreeCommand(s.ID, parts, trimmed)
 		return
 	}
 
@@ -586,6 +613,86 @@ func (m *Model) submitInput(cmd string) {
 		return
 	}
 	m.postJSON(fmt.Sprintf("/api/sessions/%s/message", s.ID), map[string]string{"content": cmd})
+}
+
+// handleWorktreeCommand 处理 /worktree 子命令（TODO 第9⑤/#10⑤ 合并门 TUI 入口）：
+//   - /worktree（或 list）：打开副本清单弹窗（agent/领域/状态/分支/base/patch 摘要）；
+//   - diff <aid>：打开该副本全量 diff 弹窗（未收尾为实时 diff）；
+//   - merge <aid>：POST 合并门（base 漂移/契约检查失败会以 flash 返回状态码）；
+//   - reject <aid> <comments...>：POST 驳回，comments 经邮箱回该域。
+//
+// 拉取类子命令异步执行并经 sharedState.pendingOverlay 在主循环打开弹窗（race 约束）。
+func (m *Model) handleWorktreeCommand(sessionID string, parts []string, trimmed string) {
+	sub := ""
+	if len(parts) > 1 {
+		sub = parts[1]
+	}
+	switch sub {
+	case "", "list":
+		go func() {
+			var wts []agent.WorktreeView
+			if err := m.getJSON(fmt.Sprintf("/api/sessions/%s/worktrees", sessionID), &wts); err != nil {
+				m.flashMsg("worktree list: " + err.Error())
+				return
+			}
+			if len(wts) == 0 {
+				m.flashMsg("no worktrees in this session")
+				return
+			}
+			lines := make([]string, 0, len(wts)*4)
+			for _, w := range wts {
+				state := "pending"
+				switch {
+				case w.Merged:
+					state = "merged"
+				case w.Removed:
+					state = "removed"
+				}
+				base := w.BaseCommit
+				if len(base) > 8 {
+					base = base[:8]
+				}
+				lines = append(lines,
+					fmt.Sprintf("%s  [%s]  %s", w.AgentID, state, w.Domain),
+					"    branch: "+w.Branch+"  base: "+base,
+					"    path: "+w.Path,
+					"    patch: "+w.PatchPath+"  "+strings.SplitN(w.PatchStat, "\n", 2)[0])
+			}
+			m.ensureShared().setPendingOverlay("Worktrees", lines)
+		}()
+	case "diff":
+		if len(parts) < 3 {
+			m.flashMsg("usage: /worktree diff <agent_id>")
+			return
+		}
+		aid := parts[2]
+		go func() {
+			var out struct {
+				AgentID string `json:"agent_id"`
+				Diff    string `json:"diff"`
+			}
+			path := fmt.Sprintf("/api/sessions/%s/worktrees/%s/diff", sessionID, aid)
+			if err := m.getJSON(path, &out); err != nil {
+				m.flashMsg("worktree diff: " + err.Error())
+				return
+			}
+			m.ensureShared().setPendingOverlay("Worktree Diff "+aid, strings.Split(out.Diff, "\n"))
+		}()
+	case "merge", "reject":
+		if len(parts) < 3 {
+			m.flashMsg(fmt.Sprintf("usage: /worktree %s <agent_id>%s", sub, map[bool]string{true: " <comments...>"}[sub == "reject"]))
+			return
+		}
+		aid := parts[2]
+		body := map[string]any{}
+		if sub == "reject" {
+			body["comments"] = strings.TrimSpace(strings.TrimPrefix(trimmed, "/worktree reject "+aid))
+		}
+		m.postJSON(fmt.Sprintf("/api/sessions/%s/worktrees/%s/%s", sessionID, aid, sub), body)
+		m.flashMsg("worktree " + sub + " -> " + aid)
+	default:
+		m.flashMsg("usage: /worktree [list|diff <aid>|merge <aid>|reject <aid> <comments>]")
+	}
 }
 
 // postJSON 向本地 TUI 后端发 POST 请求。

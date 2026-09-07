@@ -181,6 +181,17 @@ const (
 	QueryKindLogs         = "logs"          // QueryKindLogs 日志查询
 	QueryKindSessionCount = "session-count" // QueryKindSessionCount 会话数量查询
 	QueryKindLLMStats     = "llm-stats"     // QueryKindLLMStats LLM 调用统计查询
+	// QueryKindEfficiency 会话效率一等指标（TODO 第9项⑥/第10项③）：五项指标 + 支路成本表。
+	QueryKindEfficiency = "efficiency"
+	// QueryKindAgentEvents 子 Agent 审计下钻：Args{"agent": 实例ID, "limit", "offset"}，
+	// 返回该实例 agent_events 逐轮事件（回放数据源）。
+	QueryKindAgentEvents = "agent-events"
+	// QueryKindWorktrees 会话 worktree 副本清单（TODO 第9⑤/#10⑤）：
+	// 返回 ListWorktrees 快照（路径/分支/base/patch 路径与 stat/合并状态）。
+	QueryKindWorktrees = "worktrees"
+	// QueryKindWorktreeDiff 指定 worktree 的全量 diff（review 数据源）：
+	// Args{"agent": 实例ID}，返回 patch 全文（未收尾时为副本实时 diff）。
+	QueryKindWorktreeDiff = "worktree-diff"
 )
 
 // ControlCommand 表示向会话发送的操作型控制命令。
@@ -200,6 +211,12 @@ const (
 	ControlOpCancel    = "cancel"    // ControlOpCancel 取消会话或当前任务
 	ControlOpStop      = "stop"      // ControlOpStop 软停止（TODO #37）：停止当前会话全部子任务，可续跑
 	ControlOpTopic     = "topic"     // ControlOpTopic 切换/指定会话主题
+	// ControlOpTrustMode 切换会话信任模式（TODO 第10⑥）：Args{"mode": "suggest|auto-edit|full-auto"}，
+	// atomic 即时生效（正在阻塞的 ReAct 循环下一次工具派发按新模式裁决）。
+	ControlOpTrustMode = "trust-mode"
+	// ControlOpWorktree worktree 合并门操作（TODO 第9⑤/#10⑤）：
+	// Args{"action": "merge|reject", "agent": 实例ID, "comments": 驳回意见（reject 可选）}。
+	ControlOpWorktree = "worktree"
 )
 
 // Filter 表示列出会话时使用的筛选条件。
@@ -279,6 +296,9 @@ type Session struct {
 	// 旧话题摘要写入 sharedKV `topic:{id}:summary` 供新话题 MetaAgent 召回。
 	// 空表示尚未切换过话题(单话题会话)。
 	ActiveTopicID string
+	// TrustMode 会话当前信任模式（TODO 第10⑥）：suggest|auto-edit|full-auto；
+	// 空串 = 未设置（Registry 回退现网生产边界 + 危险命令语义）。
+	TrustMode string
 }
 
 // Event 是会话事件的 DTO，按字段逐一对齐 server.SessionEvent。
@@ -316,4 +336,9 @@ type AgentInstance struct {
 	Children  []string       // Children 子 Agent 实例标识列表
 	CreatedAt time.Time      // CreatedAt Agent 实例创建时间
 	RoleDefID string         // RoleDefID 角色定义唯一标识
+	// ActivityKind 最近活动种类（TODO 第10项②展示面：llm_start/llm_end/tool:<名>/
+	// tool_end/stream/user_wait/descendant）；空串表示无活动监控条目。
+	ActivityKind string
+	// LastActivityAgo 最近活动距今时长（"5m12s" 格式，展示用）；空串同上。
+	LastActivityAgo string
 }

@@ -43,6 +43,9 @@ type Session struct {
 	// DestroyAt 软停止销毁倒计时截止时间（TODO #37）：软停止后非 nil，续跑/到期后清空。
 	// 前端可显示"MM:SS 后销毁"倒计时。
 	DestroyAt *time.Time `json:"destroy_at,omitempty"`
+	// TrustMode 会话当前信任模式（TODO 第10⑥）：suggest|auto-edit|full-auto；
+	// 空串 = 未设置（后端回退现网生产边界 + 危险命令语义）。前端三态下拉据此回显。
+	TrustMode string `json:"trust_mode,omitempty"`
 }
 
 // SessionEvent 是会话事件流中的单个事件，对应前端展示的一条日志/消息。
@@ -341,6 +344,7 @@ func ToServerSession(a *agent.Session) *Session {
 		ThinkingText:  a.ThinkingText,
 		ActiveTopicID: a.ActiveTopicID,
 		DestroyAt:     a.DestroyAt,
+		TrustMode:     a.TrustMode,
 	}
 }
 

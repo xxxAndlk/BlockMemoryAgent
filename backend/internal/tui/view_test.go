@@ -216,6 +216,9 @@ func (stubAgent) Tree(ctx context.Context, sessionID string) ([]orchestrator.Nod
 // CancelAgent 是 stubAgent 的空实现。
 func (stubAgent) CancelAgent(ctx context.Context, sessionID, instID string) error { return nil }
 
+// PauseAgent 是 stubAgent 的空实现。
+func (stubAgent) PauseAgent(ctx context.Context, sessionID, instID string) error { return nil }
+
 // Shutdown 是 stubAgent 的空实现。
 func (stubAgent) Shutdown(ctx context.Context) error { return nil }
 

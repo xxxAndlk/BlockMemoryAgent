@@ -4,10 +4,14 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -49,6 +53,36 @@ type ReActAgent struct {
 	historyMaxMessages int
 	// toolOutputMaxRunes 是写入历史的单条工具输出最大字符数；<=0 不截断。
 	toolOutputMaxRunes int
+	// toolResultDumpRunes 工具结果统一收口阈值（TODO 第9项②，rune 计数）：单条工具输出
+	// 超该阈值时全文落盘 <workDir>/.bma/tool_outputs/，历史只留头部摘录 + 【全文已落盘】
+	// 路径，模型按需 ReadFile 取全文。落盘失败降级原样（回落 toolOutputMaxRunes 截断）。
+	// <=0 关闭收口。bootstrap 从 config tool_result_dump_runes 注入。
+	toolResultDumpRunes int
+	// toolResultDigestRunes 收口后保留的头部摘录 rune 数；<=0 按默认 2000。
+	toolResultDigestRunes int
+	// staleToolEvictRounds 陈旧工具结果驱逐轮数（TODO 第9项③）：请求构建期把 N 轮前
+	//（按 assistant 轮序）的 ReadFile/SearchInFiles 结果替换为"已驱逐需重读"占位符，
+	// 只影响本次请求视图，canonical history 与持久化不动。<=0 关闭。
+	staleToolEvictRounds int
+	// agentsMDMaxRunes AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦，rune 计数）。
+	// workDir 根部 AGENTS.md 优先、其次 CLAUDE.md，注入 envBlock【项目自述】段。
+	// <=0 关闭注入。bootstrap 从 config agents_md_max_runes 注入。
+	agentsMDMaxRunes int
+	// parallelTools 轮内并行工具执行开关（TODO 第9项①）：同轮多个 tool_calls 并发派发
+	//（信号量限 toolParallelMax），结果按原序串行回填。零值=关闭（测试稳定），
+	// 生产配置 tool_parallel_enabled: true 打开。
+	parallelTools bool
+	// toolParallelMax 并行工具并发上限；<=0 用默认 defaultToolParallelConcurrency。
+	toolParallelMax int
+	// pathMu/pathMutexes 轮内并行的同路径写互斥锁表：写类工具按目标路径分键
+	//（相对路径按 agent workDir 解析，worktree 副本天然不同键），同路径串行、
+	// 异路径并行。仅并行派发路径使用；串行路径零开销。
+	pathMu      sync.Mutex
+	pathMutexes map[string]*sync.Mutex
+	// stableHashLast 上次记录的 stable 层（系统指令）内容哈希（TODO 第10项①缓存纪律）。
+	// stable 段按实例 sync.Once 冻结，跨轮哈希应恒定；变化即 WARN（防回归断言）。
+	// 仅 Run 循环 goroutine 读写，无需加锁。
+	stableHashLast string
 	// tokenBudget 上下文 token 阈值（替换原累计跨轮 token 预算）：Assemble 压缩后
 	// 估算 messages token >= 阈值即 LimitReached（近 N 单独就超、压不下去），暂停等续跑。
 	// <=0 不限制。默认 150000（service_react roleTokenBudget 按角色配）。
@@ -78,10 +112,11 @@ type ReActAgent struct {
 	// 置会话暂停态。为 nil 时不检查（默认关闭，仅 MetaAgent 注入）。
 	pausedChecker PausedChildChecker
 	// activityReporter 可选的活动上报回调，由 Dispatcher 心跳巡检注入。
-	// 每次 generateOnce 与工具派发时触发，更新 Dispatcher 侧最后活动时间戳；
-	// 巡检发现超阈值无活动则判定子 Agent 假死（LLM 流式挂起等），主动 cancel。
-	// 为 nil 时跳过（测试场景或 DomainAgent/MetaAgent 不注入），不影响主流程。
-	activityReporter func()
+	// 语义化 kind 上报（TODO 第10项②证据化）：llm_start/llm_end（LLM 调用首尾）、
+	// tool:<名>/tool_end（工具派发首尾）、stream（流式 chunk）、keepalive（保活 tick，
+	// 证明进程活着但不刷新 lastTS）。Dispatcher 侧据此区分"真静默"与"在飞 LLM/长工具"。
+	// 为 nil 时跳过（测试场景或未注入巡检的 Agent），不影响主流程。
+	activityReporter func(kind string)
 	// streamKeepalive 流式生成期间的保活上报间隔：thinking 模型首 token 前可能长时间
 	// 静默（零 chunk 无上报，实证 42K 输入 5m58s 无首 chunk 被心跳误杀），
 	// 定时器补上报防误判；真实挂死由 sub_agent_timeout 墙钟兜底。<=0 默认 30s。
@@ -180,7 +215,25 @@ type LoopConfig struct {
 	// TokenBudget 上下文 token 阈值（替换原累计跨轮 token 预算）：Assemble 压缩后
 	// 估算 messages token >= 阈值即 LimitReached（近 N 单独就超、压不下去）。<=0 不限制。
 	TokenBudget int
+	// ToolResultDumpRunes 工具结果统一收口阈值（TODO 第9项②，rune）：单条工具输出超该值
+	// 全文落盘 .bma/tool_outputs/，历史只留头部摘录 + 【全文已落盘】路径。<=0 关闭。
+	ToolResultDumpRunes int
+	// ToolResultDigestRunes 收口后保留的头部摘录 rune 数；<=0 按默认 2000。
+	ToolResultDigestRunes int
+	// StaleToolEvictRounds 陈旧只读工具结果（ReadFile/SearchInFiles）驱逐轮数（TODO 第9项③）；
+	// 请求构建期替换为"已驱逐需重读"占位符，不改 canonical history。<=0 关闭。
+	StaleToolEvictRounds int
+	// AgentsMDMaxRunes AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦，rune）。<=0 关闭。
+	AgentsMDMaxRunes int
+	// ToolParallelEnabled 轮内并行工具执行开关（TODO 第9项①）：同轮多个 tool_calls
+	// 并发派发、结果按原序串行回填。nil=关闭（零值稳定，生产配置默认 true）。
+	ToolParallelEnabled *bool
+	// ToolParallelMaxConcurrency 并行工具并发上限；<=0 用默认 4。
+	ToolParallelMaxConcurrency int
 }
+
+// defaultToolParallelConcurrency 轮内并行工具执行的默认并发上限（TODO 第9项①）。
+const defaultToolParallelConcurrency = 4
 
 // NewReActAgent 根据具体角色构造一个 ReActAgent 实例。
 // 参数 name 为代理标识；role 为角色定义；llm 为模型提供者；tools 为工具注册表。
@@ -253,6 +306,17 @@ func (a *ReActAgent) WithLoopConfig(c LoopConfig) *ReActAgent {
 	a.historyMaxMessages = c.HistoryMaxMessages
 	a.toolOutputMaxRunes = c.ToolOutputMaxRunes
 	a.tokenBudget = c.TokenBudget
+	a.toolResultDumpRunes = c.ToolResultDumpRunes
+	a.toolResultDigestRunes = c.ToolResultDigestRunes
+	a.staleToolEvictRounds = c.StaleToolEvictRounds
+	a.agentsMDMaxRunes = c.AgentsMDMaxRunes
+	if c.ToolParallelEnabled != nil {
+		a.parallelTools = *c.ToolParallelEnabled
+	}
+	a.toolParallelMax = c.ToolParallelMaxConcurrency
+	if a.toolParallelMax <= 0 {
+		a.toolParallelMax = defaultToolParallelConcurrency
+	}
 	return a
 }
 
@@ -294,9 +358,10 @@ func (a *ReActAgent) WithPausedChildChecker(p PausedChildChecker) *ReActAgent {
 }
 
 // WithActivityReporter 注入活动上报回调，供 Dispatcher 心跳巡检判断子 Agent 是否假死。
-// 每次 generateOnce 与工具派发触发；传 nil 关闭（默认关闭）。
+// 语义化 kind 上报（TODO 第10项②证据化）：llm_start/llm_end/tool:<名>/tool_end/stream/
+// keepalive；传 nil 关闭（默认关闭）。
 // 仅叶子 Agent 注入：DomainAgent/MetaAgent 有自身 wait loop，注入会误杀合法等待。
-func (a *ReActAgent) WithActivityReporter(fn func()) *ReActAgent {
+func (a *ReActAgent) WithActivityReporter(fn func(kind string)) *ReActAgent {
 	a.activityReporter = fn
 	return a
 }
@@ -322,10 +387,11 @@ func (a *ReActAgent) WithSuspendGate(g SuspendGate) *ReActAgent {
 	return a
 }
 
-// touchActivity 上报一次活动；未注入回调时为空操作。
-func (a *ReActAgent) touchActivity() {
+// touchActivity 按语义化 kind 上报一次活动（TODO 第10项②证据化）；
+// 未注入回调时为空操作。kind 约定：llm_start/llm_end/tool:<名>/tool_end/stream/keepalive。
+func (a *ReActAgent) touchActivity(kind string) {
 	if a.activityReporter != nil {
-		a.activityReporter()
+		a.activityReporter(kind)
 	}
 }
 
@@ -468,6 +534,10 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 在每次调用 LLM 之前，通过记忆流水线组装上下文消息。
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
 		assembled := a.memory.Assemble(a.role, a.name, history)
+		// 陈旧工具结果驱逐（TODO 第9项③）：请求构建期视图变换，把 N 轮前的只读探查
+		// 结果（ReadFile/SearchInFiles）替换为"已驱逐需重读"占位符。canonical history
+		// 与持久化不受影响；驱逐保留 tool 消息本体，sanitizeToolPairing 配对不受影响。
+		assembled = evictStaleToolResults(assembled, a.staleToolEvictRounds)
 
 		// 当前时间尾部注入（TODO #40 块 1）：时间每轮变化，放尾部不破坏前缀缓存。
 		// 所有 Agent（meta/domain/叶子）统一注入，与看板段同位（不可缓存尾部）。
@@ -504,6 +574,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		}
 
 		// 调用 LLM 生成回复（带重试与单次超时）；重试耗尽后返回错误。
+		a.reportStableHash(system, i)
 		resp, err := a.generate(ctx, req)
 		if err != nil {
 			// 出错时返回已累计的历史，便于上层回传部分进度或排查。
@@ -625,18 +696,48 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			return ReactResult{Text: assistant.Content, History: history}, nil
 		}
 
-		// 否则，按顺序执行助手请求的所有工具调用，并将结果反馈回会话。
-		// 工具调用顺序执行，以保持追踪顺序与模型调用顺序一致。
-		for _, tc := range assistant.ToolCalls {
-			// 实时推送工具调用开始事件，UI 可据此展示"执行中"状态。
+		// 否则执行助手请求的全部工具调用（TODO 第9项①：轮内并行 + 串行回填两段）。
+		// 并行段只做"派发+收集"，全部既有不变量（ToolCallID 配对、收口/截断、记忆写入、
+		// mailbox 注入时机、停滞守卫）留在下方串行回填段单处执行，行为与旧串行版一致。
+		calls := assistant.ToolCalls
+		results := make([]ToolResult, len(calls))
+		execErrs := make([]error, len(calls))
+		for _, tc := range calls {
+			// 实时推送工具调用开始事件，UI 可据此展示"执行中"状态；
+			// 并行时先批量发出，让全部工具同时显示执行中。
 			a.emitLive(LiveEvent{Kind: LiveEventToolCall, Tool: tc.Name, Input: mustMarshal(tc.Input)})
-
-			// 工具派发前上报活动：工具 hang 时无后续活动，心跳巡检可捕获。
-			a.touchActivity()
-			// 分发执行单个工具调用；出错时构造包含错误信息的 ToolResult。
-			result, err := a.dispatchToolWithKeepalive(ctx, tc)
-			// 长工具（大文件写/长命令）执行完成后同样刷新活动，防巡检在工具执行期间误判。
-			a.touchActivity()
+		}
+		if a.parallelTools && len(calls) > 1 {
+			// 并行执行段：每 call 一个 goroutine（信号量限并发），各自 keepalive/活动上报；
+			// 写类工具经同路径互斥（pathLockFor）防并发竞写。
+			sem := make(chan struct{}, a.toolParallelMax)
+			var wg sync.WaitGroup
+			for i := range calls {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					a.touchActivity("tool:" + calls[i].Name)
+					results[i], execErrs[i] = a.dispatchToolSerialized(ctx, calls[i])
+					a.touchActivity("tool_end")
+				}(i)
+			}
+			wg.Wait()
+		} else {
+			for i := range calls {
+				// 工具派发前上报活动（tool:<名> 证据）：挂死工具可被巡检按阈值识别。
+				a.touchActivity("tool:" + calls[i].Name)
+				results[i], execErrs[i] = a.dispatchToolWithKeepalive(ctx, calls[i])
+				// 长工具（大文件写/长命令）执行完成后同样刷新活动，防巡检在工具执行期间误判。
+				a.touchActivity("tool_end")
+			}
+		}
+		// 串行回填段：按模型给定顺序逐个处理结果；首个 ErrLoopExit 命中即终止并带原因
+		// 返回（并行段已发生的副作用属已知微小语义偏移：模型本只对无依赖调用并行发）。
+		for i := range calls {
+			tc := calls[i]
+			result, err := results[i], execErrs[i]
 			if err != nil {
 				// 循环守卫命中（连读死循环/探索预算耗尽/连续失败）：终止循环并带原因返回，
 				// 不吞成普通工具结果继续烧轮次。子 Agent 经 runSubAgent 走 Failed 语义
@@ -655,6 +756,10 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				Error:   result.Error,
 				Success: err == nil && result.Error == "",
 			})
+
+			// 工具结果统一收口（TODO 第9项②）：超阈值全文落盘 <workDir>/.bma/tool_outputs/，
+			// 历史只留头部摘录 + 【全文已落盘】路径；落盘失败降级原样（走下方截断路径）。
+			a.condenseToolResult(ctx, tc.Name, &result)
 
 			// 截断工具输出后再写入历史，避免单次大输出（如整文件/长日志）
 			// 在历史中无限累积，导致后续每轮请求 token 爆炸。
@@ -761,7 +866,147 @@ func (a *ReActAgent) stagnationGuard(streak int, calls []ToolCall, mailboxDraine
 	return history, streak, nil
 }
 
-// dispatchToolWithKeepalive 执行单个工具调用，期间定时上报心跳。
+// condenseToolResult 工具结果统一收口（TODO 第9项②）：单条工具输出超过 toolResultDumpRunes
+// 时全文落盘 <workDir>/.bma/tool_outputs/<agent>-<unix>-<tool>.md，Output 替换为头部摘录 +
+// 【全文已落盘】路径，模型按需 ReadFile 取全文。落盘失败降级原样（不丢内容，回落截断路径）。
+// 收口后输出远小于 toolOutputMaxRunes，既有截断自然不再触发。
+func (a *ReActAgent) condenseToolResult(ctx context.Context, toolName string, result *ToolResult) {
+	if a.toolResultDumpRunes <= 0 {
+		return
+	}
+	total := len([]rune(result.Output))
+	if total <= a.toolResultDumpRunes {
+		return
+	}
+	path, err := dumpToolOutputToDisk(ctx, a.workDir, a.name, toolName, result.Output)
+	if err != nil {
+		log.Printf("[react] tool output dump failed (degrade to truncate): agent=%s tool=%s err=%v", a.name, toolName, err)
+		return
+	}
+	digest := a.toolResultDigestRunes
+	if digest <= 0 {
+		digest = 2000
+	}
+	result.Output = truncateRunes(result.Output, digest) + "\n\n【全文已落盘】" + path + "（如需全文请 ReadFile 该路径）"
+	log.Printf("[react] tool output dumped: agent=%s tool=%s path=%s total=%d runes", a.name, toolName, path, total)
+}
+
+// dumpToolOutputToDisk 把超限工具输出全文写入 <workDir>/.bma/tool_outputs/，返回绝对路径。
+// workDir 优先取 ctx 注入的会话目录，回退 agent 自身 workDir，再回退系统临时目录
+//（与 mailbox 收口 dumpReturnToDisk 同容错口径：.bma 是项目级目录，各回退目录下语义一致）。
+func dumpToolOutputToDisk(ctx context.Context, agentWorkDir, agentID, toolName, output string) (string, error) {
+	wd := tool.WorkDirFromContext(ctx)
+	if wd == "" {
+		wd = agentWorkDir
+	}
+	base := wd
+	if base == "" {
+		base = filepath.Join(os.TempDir(), "bma-tool-outputs")
+	}
+	dir := filepath.Join(base, ".bma", "tool_outputs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%s-%d-%s.md", filepath.Base(agentID), time.Now().Unix(), sanitizeToolFilePart(toolName)))
+	if err := os.WriteFile(path, []byte(output), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// sanitizeToolFilePart 把工具名收敛为安全文件名片段（MCP 工具名形如 mcp__server__tool，
+// 子代理派发名形如 call_sub_agent；异常字符统一替换为下划线）。
+func sanitizeToolFilePart(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "tool"
+	}
+	return b.String()
+}
+
+// evictableToolNames 可驱逐的工具集合（TODO 第9项③）：只读探查类，结果内容仍在文件系统/
+// 可重取，驱逐后按原参数重跑即可恢复。验证证据类（RunCommand/http/git/WriteSpec 等）
+// 一律不驱逐——它们是"已完成验证"的凭证，驱逐会诱发无意义的重复验证。
+var evictableToolNames = map[string]bool{
+	"ReadFile":      true,
+	"SearchInFiles": true,
+}
+
+// evictPlaceholderMark 占位符指纹：已驱逐的消息本轮不再重写，保持占位文本跨轮稳定
+//（前缀缓存友好；重写只会把"原文 N runes"换成占位符自身长度，毫无收益）。
+const evictPlaceholderMark = "[内容已驱逐]"
+
+// evictStaleToolResults 陈旧工具结果驱逐（TODO 第9项③）：对请求视图做变换，把超过
+// keepRounds 轮前的 ReadFile/SearchInFiles 结果替换为合法 ToolResultJSON 占位符
+//（"已驱逐需重读"，防止模型幻觉记得旧内容）。只影响本次请求：
+// canonical history / 持久化 / 续跑数据无损；驱逐保留 tool 消息本体与 ToolCallID，
+// sanitizeToolPairing 配对校验不受影响；token 估算天然看到驱逐后的大小。
+//
+// 轮次界定 = assistant 消息序数（0 起）：tool 结果归属其前方最近的 assistant，
+// 与最新 assistant 序数之差 > keepRounds 即候选。
+func evictStaleToolResults(messages []ReactMessage, keepRounds int) []ReactMessage {
+	if keepRounds <= 0 || len(messages) == 0 {
+		return messages
+	}
+	// tool_call id -> 工具名（同 ToBladesMessages 的索引手法），供判定结果可否驱逐。
+	names := make(map[string]string)
+	for _, m := range messages {
+		if m.Role == "assistant" {
+			for _, tc := range m.ToolCalls {
+				names[tc.ID] = tc.Name
+			}
+		}
+	}
+	// 每条消息归属的 assistant 轮序；非 assistant 之前的（如首条 user）记 -1。
+	ords := make([]int, len(messages))
+	last := -1
+	for i, m := range messages {
+		if m.Role == "assistant" {
+			last++
+		}
+		ords[i] = last
+	}
+	cur := ords[len(messages)-1]
+	if cur < 0 {
+		return messages
+	}
+	out := make([]ReactMessage, len(messages))
+	copy(out, messages)
+	for i := range out {
+		m := &out[i]
+		if m.Role != "tool" || m.ToolCallID == "" {
+			continue
+		}
+		if cur-ords[i] <= keepRounds {
+			continue
+		}
+		if strings.Contains(m.Content, evictPlaceholderMark) {
+			continue // 已是占位符：保持文本稳定，不重写
+		}
+		name := names[m.ToolCallID]
+		if !evictableToolNames[name] {
+			continue
+		}
+		origRunes := len([]rune(m.Content))
+		m.Content = ToolResultJSON(ToolResult{
+			Tool:    name,
+			Success: true,
+			Output: fmt.Sprintf("%s 该结果是 %d 轮前的 %s 输出（原文 %d runes）。文件内容仍在磁盘上未被删除；"+
+				"如需再次查看，请按上方对应调用的参数重新执行 %s。", evictPlaceholderMark, cur-ords[i], name, origRunes, name),
+		})
+		m.Images = nil
+	}
+	return out
+}
+
+
 // 盲区修复（2026-08-19）：旧实现只在工具派发前/后 touch，工具执行期间零上报--
 // 长命令/大文件操作（构建、依赖安装）超过心跳阈值即被巡检误判假死杀掉，
 // 全部工作从零重派（实证：战斗实体首任 10 分钟被杀，损失约 20 分钟）。
@@ -783,11 +1028,87 @@ func (a *ReActAgent) dispatchToolWithKeepalive(ctx context.Context, tc ToolCall)
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				a.touchActivity()
+				// 保活 tick 只证明进程活着（kind=keepalive 不刷新 lastTS——盲报根除，
+				// TODO 第10项②）：挂死工具由巡检按 toolStartTS 阈值识别并击杀。
+				a.touchActivity("keepalive")
 			}
 		}
 	}()
 	return a.tools.Dispatch(ctx, tc)
+}
+
+// writeLockedTools 轮内并行时需要按目标路径互斥的写类工具（TODO 第9项①）：
+// 同路径并发写会产生交错损坏（半截内容/双写冲突），同路径串行、异路径并行。
+var writeLockedTools = map[string]bool{"WriteFile": true, "EditFile": true, "RestoreFile": true}
+
+// dispatchToolSerialized 带同路径互斥的工具派发：写类工具按目标路径加锁
+//（相对路径按 agent workDir 解析，worktree 副本天然不同键），其余零开销直通。
+func (a *ReActAgent) dispatchToolSerialized(ctx context.Context, tc ToolCall) (ToolResult, error) {
+	if mu := a.pathLockFor(tc); mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+	return a.dispatchToolWithKeepalive(ctx, tc)
+}
+
+// pathLockFor 返回该调用目标路径的互斥锁（按 agent 实例懒建）；非写类工具/无路径参数
+// 返回 nil。绝对路径规范化后作键，避免同文件不同写法绕过互斥。
+func (a *ReActAgent) pathLockFor(tc ToolCall) *sync.Mutex {
+	if !writeLockedTools[tc.Name] {
+		return nil
+	}
+	p, _ := tc.Input["path"].(string)
+	if strings.TrimSpace(p) == "" {
+		return nil
+	}
+	if !filepath.IsAbs(p) {
+		base := a.workDir
+		if base == "" {
+			base = "."
+		}
+		p = filepath.Join(base, p)
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	a.pathMu.Lock()
+	defer a.pathMu.Unlock()
+	if a.pathMutexes == nil {
+		a.pathMutexes = map[string]*sync.Mutex{}
+	}
+	mu, ok := a.pathMutexes[p]
+	if !ok {
+		mu = &sync.Mutex{}
+		a.pathMutexes[p] = mu
+	}
+	return mu
+}
+
+// 提示词三层分级（TODO 第10项①缓存纪律，对标 Hermes）：前缀缓存命中依赖"稳定段在前、
+// 易变段置尾"，三层易变度递增、位置与冻结纪律如下——
+//   - stable（system instruction）：systemPrompt() 按实例 sync.Once 冻结（人格/技能块/
+//     envBlock 均在冻结前拼入），跨轮字节级不变；reportStableHash 逐呼打哈希，变化即 WARN。
+//   - context（压缩视图）：memory.Pipeline 冻结视图，仅压缩触发轮变化（该轮前缀缓存失效，
+//     变更点在 pipeline.go compressedView 内记录）。
+//   - volatile（时间戳/近期事件/文件地图/mailbox/sibling 摘要）：每轮可变，全部置尾注入，
+//     不破坏前缀。
+//
+// reportStableHash 每呼记录 stable 层（发往模型的 Instruction=system 消息）内容哈希：
+// 正常恒定（冻结保证），变化即 WARN——冻结被破坏（回归）时第一现场暴露。
+func (a *ReActAgent) reportStableHash(instruction string, round int) {
+	sum := sha256.Sum256([]byte(instruction))
+	hash := hex.EncodeToString(sum[:])[:12]
+	if a.stableHashLast == "" {
+		a.stableHashLast = hash
+		log.Printf("[cache] stable_hash=%s agent=%s round=%d (init)", hash, a.name, round)
+		return
+	}
+	if hash != a.stableHashLast {
+		log.Printf("[cache] WARN stable_hash changed: agent=%s round=%d %s -> %s (stable layer must be frozen per instance)", a.name, round, a.stableHashLast, hash)
+		a.stableHashLast = hash
+		return
+	}
+	log.Printf("[cache] stable_hash=%s agent=%s round=%d", hash, a.name, round)
 }
 
 // generate 包装一次 LLM 调用：带单次超时与指数退避重试（TODO #19 LLM 链）。
@@ -819,7 +1140,7 @@ type streamingModelProvider interface {
 // generateOnce 执行单次 LLM 调用：provider 支持流式时走流式并推送 llm_delta 实时事件，
 // 否则回退到一次性 Generate。
 func (a *ReActAgent) generateOnce(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
-	a.touchActivity()
+	a.touchActivity("llm_start")
 	start := time.Now()
 	role := a.role.Name
 	log.Printf("[react] llm start: role=%s model=%s msgs=%d", role, a.llmModelName(), len(req.Messages))
@@ -838,6 +1159,8 @@ func (a *ReActAgent) generateOnce(ctx context.Context, req *blades.ModelRequest)
 	}
 	// 无论成功失败都记录完整 LLM I/O 到 session_logs，便于排查 token 暴涨/失忆问题。
 	a.logLLMCall(ctx, req, resp, err, dur)
+	// LLM 调用收尾证据：解除在飞 LLM 豁免，巡检恢复按 lastTS 判步间静默（TODO 第10项②）。
+	a.touchActivity("llm_end")
 	return resp, err
 }
 
@@ -1045,7 +1368,9 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				a.touchActivity()
+				// 流保活 tick 证明进程活着，但不刷新 lastTS（盲报根除，TODO 第10项②）；
+				// 在飞 LLM 期间巡检本就豁免（llm_start 已置位），无需续命。
+				a.touchActivity("keepalive")
 				idleMu.Lock()
 				// 首块前也设卡口：endpoint 假死（连接建立后零字节）只有 provider
 				// http.Client 600s 整体兜底，且该错误属 DeadlineExceeded 不重试，
@@ -1085,10 +1410,10 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 		lastChunk = time.Now()
 		firstChunk = true
 		idleMu.Unlock()
-		// 流式块即活动证据：thinking 模型单次长生成可达 5-7 分钟（大段代码+深度推理），
-		// 期间无工具派发/generateOnce 结束，心跳巡检若无此刷新会误判假死杀掉活跃叶子
-		// （实证 2026-08-13 全天 4 次 HEARTBEAT KILL，被杀 LLM 调用均已在跑 5m40s-7m24s）。
-		a.touchActivity()
+		// 流式块即活动证据（kind=stream）：thinking 模型单次长生成可达 5-7 分钟
+		//（大段代码+深度推理），chunk 持续刷新 lastTS；即使在飞 LLM 豁免兜不住的场景
+		//（跨入下一轮工具前）也有真实步进证据（TODO 第10项②）。
+		a.touchActivity("stream")
 		if resp == nil || resp.Message == nil {
 			continue
 		}
@@ -1322,7 +1647,7 @@ func (a *ReActAgent) buildSystemPrompt() string {
 	// （Windows 用 PowerShell，Linux/macOS 用 bash/sh）与正确的相对路径。
 	// 注意：当前时间不在此处（TODO #40 缓存修复）——动态时间会打碎 system Instruction
 	// 前缀导致 DeepSeek 前缀缓存每轮失效，改为独立尾部 system 消息注入（buildTimeMessage）。
-	envBlock := buildEnvBlock(a.workDir)
+	envBlock := buildEnvBlock(a.workDir, a.agentsMDMaxRunes)
 
 	// 在基础提示后追加执行纪律块，与角色提示同语言（中文），覆盖：
 	// 工具使用节制、产出后验证（代码走机器校验、非代码走纸面对照）、完成即停、mailbox 消息语义。
@@ -1349,8 +1674,10 @@ func (a *ReActAgent) buildSystemPrompt() string {
 // buildEnvBlock 构造环境信息块，注入到系统提示词头部。
 // 包含 OS（含 Windows 主版本判断）、时区、工作目录——全部跨轮字节稳定
 // （TODO #40：动态时间已移出，见 buildTimeMessage；本函数输出可被 DeepSeek 前缀缓存命中）。
+// agentsMDMaxRunes > 0 时追加 workDir 根部 AGENTS.md/CLAUDE.md 的【项目自述】段
+//（TODO 第10项⑦冷启动注入；mtime 缓存命中时零读取，缺失零开销）。
 // workDir 为空时回退到进程 cwd。
-func buildEnvBlock(workDir string) string {
+func buildEnvBlock(workDir string, agentsMDMaxRunes int) string {
 	osName := runtime.GOOS
 	// Windows 主版本细判：仅给 LLM "windows" 足够，但显式标注能让 LLM 选择正确的 shell 语法。
 	osLabel := osName
@@ -1385,6 +1712,12 @@ func buildEnvBlock(workDir string) string {
 	// TODO #40 块 4：会话级冻结（projectRefresher 刷新不污染当前会话前缀）另行处理。
 	if projDoc := project.LoadProjectDoc(workDir); projDoc != "" {
 		env += "\n\n【项目概览】\n" + projDoc
+	}
+	// 项目自述（TODO 第10项⑦）：workDir 根部 AGENTS.md（优先）或 CLAUDE.md 的项目级说明，
+	// 截断至 agentsMDMaxRunes 防膨胀。与 PROJECT.md 同属跨轮字节稳定段（mtime 缓存命中
+	// 零读取）；缺失/关闭时零注入。
+	if brief := project.LoadProjectBrief(workDir, agentsMDMaxRunes); brief != "" {
+		env += "\n\n【项目自述】\n" + brief
 	}
 	return env
 }

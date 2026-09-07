@@ -5,6 +5,7 @@ import type { SessionLog } from '@/api/session'
 import ExecutionLog from '../components/ExecutionLog.vue'
 import SkillSet from '../components/SkillSet.vue'
 import SessionLogsPanel from '../components/SessionLogsPanel.vue'
+import EfficiencyPanel from './EfficiencyPanel.vue'
 
 defineProps<{
   session: Session | null
@@ -19,7 +20,7 @@ const expandedLogId = defineModel<number | null>('expandedLogId', { default: nul
 
 const emit = defineEmits<{ 'query-logs': [] }>()
 
-const activeTab = ref<'log' | 'skill' | 'logs'>('log')
+const activeTab = ref<'log' | 'skill' | 'logs' | 'efficiency'>('log')
 </script>
 
 <template>
@@ -40,6 +41,11 @@ const activeTab = ref<'log' | 'skill' | 'logs'>('log')
             class="flex items-center h-full cursor-pointer">
         <el-icon class="mr-1"><Tickets /></el-icon> 日志分析
       </span>
+      <span @click="activeTab = 'efficiency'"
+            :class="activeTab === 'efficiency' ? 'text-primary font-bold border-b-2 border-primary' : 'text-ink-2 hover:text-ink'"
+            class="flex items-center h-full cursor-pointer">
+        <el-icon class="mr-1"><DataAnalysis /></el-icon> 效率审计
+      </span>
     </div>
 
     <div class="flex-1 overflow-hidden relative flex flex-col">
@@ -56,6 +62,7 @@ const activeTab = ref<'log' | 'skill' | 'logs'>('log')
         :logs="sessionLogs"
         @query="emit('query-logs')"
       />
+      <EfficiencyPanel v-if="activeTab === 'efficiency'" :session="session" />
     </div>
   </div>
 </template>

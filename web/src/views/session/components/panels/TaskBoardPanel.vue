@@ -28,6 +28,7 @@ const { tasks, constraints, taskProgress } = useTaskBoard(toRef(props, 'board'))
                 <UserFilled v-if="data.isUser" /><User v-else />
               </el-icon>
               <span :class="data.active ? 'text-ink' : 'text-ink-3'" class="text-xs">{{ node.label }}</span>
+              <span v-if="data.activity" class="text-[10px] text-ink-3">{{ data.activity }}</span>
             </span>
             <el-tag v-if="data.status" :type="data.statusType" size="small" effect="plain"
                     class="scale-75 origin-right">

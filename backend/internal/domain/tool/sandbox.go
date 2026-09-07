@@ -279,6 +279,77 @@ func SessionIDFromContext(ctx context.Context) string {
 	return ""
 }
 
+// stopCtxKey 用于在 runCtx 中携带会话级 stopCtx（TODO 第10项④ 中断传播基底）：
+// 会话 Stop 时 cancel 的 context，dispatchOne/ResumePaused/runDomainTask 派生子 Agent
+// ctx 以它为基底（缺省回退 Background，测试/旧路径兼容），stop 窗口期新派发与深层
+// 孙代即刻随会话终止。值为 context.Context。
+type stopCtxKey struct{}
+
+// WithStopContext 把会话级 stopCtx 注入 runCtx，供子派发侧取基底。
+func WithStopContext(ctx context.Context, stopCtx context.Context) context.Context {
+	if stopCtx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, stopCtxKey{}, stopCtx)
+}
+
+// StopContextFrom 取出会话级 stopCtx；未注入返回 nil（派发侧回退 context.Background()）。
+func StopContextFrom(ctx context.Context) context.Context {
+	if v, ok := ctx.Value(stopCtxKey{}).(context.Context); ok {
+		return v
+	}
+	return nil
+}
+
+// 信任模式常量（TODO 第10⑥ 三级信任，对标 Codex）：
+//   - suggest：全部变更类动作（写文件/命令/动态破坏性工具）逐条审批，读类直通；
+//   - auto-edit：文件编辑直通，命令与动态破坏性工具审批；
+//   - full-auto：全自主，不再推「需确认」（现状默认）。
+const (
+	TrustModeSuggest  = "suggest"
+	TrustModeAutoEdit = "auto-edit"
+	TrustModeFullAuto = "full-auto"
+)
+
+// ValidTrustMode 校验信任模式枚举值。
+func ValidTrustMode(mode string) bool {
+	switch mode {
+	case TrustModeSuggest, TrustModeAutoEdit, TrustModeFullAuto:
+		return true
+	}
+	return false
+}
+
+// trustModeFnKey 携带信任模式读取器（返回当前会话模式），供 needsApproval 每次
+// 工具调用实时读取——会话中途切换模式下一工具调用即生效（TODO 第10⑥）。
+type trustModeFnKey struct{}
+
+// WithTrustModeFunc 注入信任模式读取器。fn 返回空串表示未设置（回退全局配置语义）。
+func WithTrustModeFunc(ctx context.Context, fn func() string) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, trustModeFnKey{}, fn)
+}
+
+// TrustModeFuncFrom 取出信任模式读取器；未注入返回 nil。
+func TrustModeFuncFrom(ctx context.Context) func() string {
+	if fn, ok := ctx.Value(trustModeFnKey{}).(func() string); ok {
+		return fn
+	}
+	return nil
+}
+
+// TrustModeOf 便捷读取当前信任模式：先取读取器，无读取器或返回空串时回退默认 full-auto。
+func TrustModeOf(ctx context.Context) string {
+	if fn := TrustModeFuncFrom(ctx); fn != nil {
+		if m := fn(); m != "" {
+			return m
+		}
+	}
+	return TrustModeFullAuto
+}
+
 // roleIDKey 用于在 context 中携带当前 Agent 的角色 ID，供角色级写沙箱校验读取。
 type roleIDKey struct{}
 

@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import type { Session, AgentNode } from '@/types'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import type { Session, AgentNode, TrustMode } from '@/types'
+import { setTrustMode } from '@/api/session'
 
 const props = defineProps<{
   session: Session | null
@@ -8,6 +10,26 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{ (e: 'cancel'): void; (e: 'stop'): void; (e: 'interrupt'): void }>()
+
+// 信任模式（TODO 第10⑥ 三级信任，对标 Codex）：三态下拉，切换即时 POST 后端，
+// 下一工具调用生效。本地值以会话快照回显（trust_mode 空 = 后端回退现网语义，显示 full-auto）。
+const trustMode = ref<TrustMode>('full-auto')
+watch(
+  () => props.session?.trust_mode,
+  (m) => { trustMode.value = m === 'suggest' || m === 'auto-edit' ? m : 'full-auto' },
+  { immediate: true }
+)
+
+async function onTrustModeChange(mode: TrustMode) {
+  if (!props.session) return
+  try {
+    await setTrustMode(props.session.id, mode)
+    trustMode.value = mode
+    ElMessage.success(`信任模式已切换为 ${mode}（下一工具调用生效）`)
+  } catch (e) {
+    ElMessage.error('切换信任模式失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
 
 const statusColor = computed(() => {
   if (!props.session) return 'text-ink-2'
@@ -100,6 +122,15 @@ function nodeColor(type: string) {
         <el-icon class="mr-1"><CircleClose /></el-icon>终止
       </el-button>
       <span class="text-xs text-ink-2 truncate shrink-0">{{ session?.id || '' }}</span>
+
+      <!-- 信任模式三态下拉（TODO 第10⑥）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主 -->
+      <el-select v-if="session" :model-value="trustMode" size="small" class="!w-32 shrink-0"
+                 title="信任模式：变更类操作的审批档位，切换下一工具调用生效"
+                 @update:model-value="onTrustModeChange($event as TrustMode)">
+        <el-option value="suggest" label="suggest 逐条审批" />
+        <el-option value="auto-edit" label="auto-edit 审命令" />
+        <el-option value="full-auto" label="full-auto 全自主" />
+      </el-select>
     </div>
 
     <!-- Agent 链路 -->

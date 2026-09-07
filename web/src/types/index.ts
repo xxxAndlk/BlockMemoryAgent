@@ -25,6 +25,9 @@ export interface ChatMessage {
   timestamp: string
 }
 
+/** 信任模式（TODO 第10⑥ 三级信任，对标 Codex）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主。 */
+export type TrustMode = 'suggest' | 'auto-edit' | 'full-auto'
+
 export interface Session {
   id: string
   goal: string
@@ -36,6 +39,8 @@ export interface Session {
   destroy_at?: string | null
   /** 每会话工作目录：空/缺省 = 后端默认目录。 */
   work_dir?: string
+  /** 信任模式（TODO 第10⑥）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主；空 = 后端回退现网语义。 */
+  trust_mode?: TrustMode | ''
   events: SessionEvent[]
   messages: ChatMessage[]
 }
@@ -138,6 +143,10 @@ export interface AgentNode {
   parent_id: string
   goal?: string
   block_id?: string
+  /** 活动证据：最近活动种类（llm_start/tool:<名>/stream 等），空=无监控条目 */
+  activity_kind?: string
+  /** 活动证据：最近活动距今时长（"5s" 格式） */
+  last_activity_ago?: string
 }
 
 export interface SubTask {

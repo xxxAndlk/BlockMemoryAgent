@@ -9,7 +9,21 @@ export interface RoleTreeNode {
   active: boolean
   isUser: boolean
   iconColor: string
+  /** 活动证据小字（TODO 第10项②展示面）："in ReadFile · active 12s ago"，仅运行节点携带 */
+  activity: string
   children: RoleTreeNode[]
+}
+
+// formatActivityEvidence 把活动证据渲染为节点小字（TODO 第10项②展示面）：
+// tool:<名> → "in <名> · active Xs ago"；llm_start/stream → thinking。
+function formatActivityEvidence(kind?: string, ago?: string): string {
+  const k = (kind ?? '').trim()
+  const t = (ago ?? '').trim()
+  if (!k || !t) return ''
+  if (k.startsWith('tool:')) return `in ${k.slice(5)} · active ${t} ago`
+  if (k === 'llm_start' || k === 'stream') return `thinking · active ${t} ago`
+  if (k === 'user_wait') return `awaiting user · ${t} ago`
+  return `${k} · active ${t} ago`
 }
 
 export function useRoleTree(agents: MaybeRef<AgentNode[]>) {
@@ -47,6 +61,7 @@ export function useRoleTree(agents: MaybeRef<AgentNode[]>) {
                 : a.status === 'failed'
                   ? 'text-red-500'
                   : 'text-gray-500',
+        activity: formatActivityEvidence(a.activity_kind, a.last_activity_ago),
         children: [],
       }
       map.set(a.inst_id, node)

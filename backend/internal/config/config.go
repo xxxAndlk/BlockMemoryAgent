@@ -101,6 +101,26 @@ type LLMRuntimeConfig struct {
 	// StopDestroyCountdownSec 软停止销毁倒计时（秒，TODO #37，默认 300；负数=关闭=永久暂停）。
 	// Stop 后到期未续跑则硬销毁全部节点（cascadeCancelTree + 会话 error）；续跑触发即取消。
 	StopDestroyCountdownSec int `yaml:"stop_destroy_countdown_sec"`
+	// ToolResultDumpRunes 工具结果统一收口阈值（TODO 第9项②，rune，默认 8000）：单条工具输出
+	// 超该值全文落盘 <workDir>/.bma/tool_outputs/，历史只留头部摘录（ToolResultDigestRunes）+
+	// 【全文已落盘】路径。落盘失败降级原样截断。负数=关闭。
+	ToolResultDumpRunes int `yaml:"tool_result_dump_runes"`
+	// ToolResultDigestRunes 收口后保留的头部摘录 rune 数（默认 2000）。负数=按默认。
+	ToolResultDigestRunes int `yaml:"tool_result_digest_runes"`
+	// StaleToolEvictRounds 陈旧只读工具结果驱逐轮数（TODO 第9项③，默认 20）：请求构建期把
+	// N 轮前（assistant 轮序）的 ReadFile/SearchInFiles 结果替换为"已驱逐需重读"占位符；
+	// 只影响请求视图，canonical history 与持久化不动；验证证据类工具不驱逐。负数=关闭。
+	StaleToolEvictRounds int `yaml:"stale_tool_evict_rounds"`
+	// AgentsMDMaxRunes AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦，rune，默认 4000）：
+	// workDir 根部 AGENTS.md 优先、其次 CLAUDE.md，注入【项目自述】段；缺失零开销。负数=关闭。
+	AgentsMDMaxRunes int `yaml:"agents_md_max_runes"`
+	// ToolParallelEnabled 轮内并行工具执行开关（TODO 第9项①，默认 true）：同轮多个
+	// tool_calls 并发派发（无依赖调用并行，墙钟≈最慢一个），结果按原序串行回填。
+	// false=关闭（退回逐个串行执行）。
+	ToolParallelEnabled *bool `yaml:"tool_parallel_enabled"`
+	// ToolParallelMaxConcurrency 并行工具并发上限（TODO 第9项①，默认 4）：信号量限流，
+	// 防同轮大量 tool_calls 打满下游（LLM 派发/命令子进程）。<=0 按默认。
+	ToolParallelMaxConcurrency int `yaml:"tool_parallel_max_concurrency"`
 }
 
 // SafetyConfig 工具沙箱与安全策略配置。
@@ -211,6 +231,28 @@ type AgentConfig struct {
 	// DomainReuseRosterInject 是否向 MetaAgent 上下文注入【空闲领域Agent】清单（默认 true）。
 	// 注入后 MetaAgent 自主判定强相关复用 vs 弱相关新建。
 	DomainReuseRosterInject *bool `yaml:"domain_reuse_roster_inject"`
+
+	// ImageMaxEdge 工具图片长边降采样上限（TODO 第9项④，像素，默认 1024）：png/jpeg 超限
+	// 等比缩小（不放大小图），原图落盘 <workDir>/.bma/images/；gif/webp 与缩放失败直通。
+	// 截图类 MCP 工具（computer_use 等）的视觉 token 随边长平方膨胀，1024 足够读 UI 布局。
+	// 负数=关闭。
+	ImageMaxEdge int `yaml:"image_max_edge"`
+
+	// TrustMode 默认信任模式（TODO 第10项⑥，对标 Codex 三级信任）：会话创建时取此值为初始档，
+	// 会话内可经 API/TUI 随时切换（下一工具调用生效）。取值：
+	//   - suggest：全部变更类动作（写文件/命令/插件破坏性工具）逐条推「需确认」，读类直通；
+	//   - auto-edit：文件编辑直通，命令与插件破坏性工具审批；
+	//   - full-auto：全自主，不再推「需确认」（现状默认；等价 tool_approval_disabled 语义，
+	//     但后者是全局硬开关，本项是会话级可切档）。
+	// 非法值回落 full-auto。ctx 未携带模式时 Registry 仍按生产边界 + 危险命令规则兜底。
+	TrustMode string `yaml:"trust_mode"`
+
+	// WorktreeEnabled worktree 隔离派发开关（TODO 第9项⑤/#10项⑤，默认 true）：允许
+	// call_sub_agent 携带 worktree=true 派发到 git worktree 副本——子 Agent 全部文件
+	// 写入落在副本（主目录零写入），成功收尾产出全量 patch，meta 经 merge_worktree
+	// 合并门 review/merge/reject。false 时 worktree 参数按 validation_rejected 拒绝。
+	// 主目录非 git 仓库时派发侧也会拒绝（不静默降级——隔离名存实亡不如明确报错）。
+	WorktreeEnabled *bool `yaml:"worktree_enabled"`
 
 	// Video 用户消息视频附件（Alt+V 粘贴视频）抽帧参数；0 值字段回落默认。
 	Video VideoConfig `yaml:"video"`
@@ -540,6 +582,27 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	if c.Agent.TaskMaxRunesHard == 0 {
 		c.Agent.TaskMaxRunesHard = 4000
 	}
+	// 上下文收口三件套（TODO 第9项②③）+ 项目自述注入（第10项⑦）：0=未配置走默认，负数=显式关闭。
+	if c.Agent.ToolResultDumpRunes == 0 {
+		c.Agent.ToolResultDumpRunes = 8000
+	}
+	if c.Agent.ToolResultDigestRunes == 0 {
+		c.Agent.ToolResultDigestRunes = 2000
+	}
+	if c.Agent.StaleToolEvictRounds == 0 {
+		c.Agent.StaleToolEvictRounds = 20
+	}
+	if c.Agent.AgentsMDMaxRunes == 0 {
+		c.Agent.AgentsMDMaxRunes = 4000
+	}
+	// 轮内并行工具执行（TODO 第9项①）：未配置默认开启；并发上限 <=0 走默认（react 侧再兜底）。
+	if c.Agent.ToolParallelEnabled == nil {
+		t := true
+		c.Agent.ToolParallelEnabled = &t
+	}
+	if c.Agent.ToolParallelMaxConcurrency == 0 {
+		c.Agent.ToolParallelMaxConcurrency = 4
+	}
 }
 
 func (c *Config) applySafetyDefaults() {
@@ -659,6 +722,21 @@ func (c *Config) applyAgentStandaloneDefaults() {
 	// 校验 judge 角色（TODO #43 交叉模型）：默认 prompt_reviewer（与被审角色不同模型）。
 	if c.Agent.JudgeRole == "" {
 		c.Agent.JudgeRole = "prompt_reviewer"
+	}
+	// 工具图片长边降采样上限（TODO 第9项④）：默认 1024，负数=显式关闭。
+	if c.Agent.ImageMaxEdge == 0 {
+		c.Agent.ImageMaxEdge = 1024
+	}
+	// 默认信任模式（TODO 第10项⑥）：空/非法值回落 full-auto（现状语义）。
+	switch c.Agent.TrustMode {
+	case "suggest", "auto-edit", "full-auto":
+	default:
+		c.Agent.TrustMode = "full-auto"
+	}
+	// worktree 隔离派发开关（TODO 第9项⑤）：nil（未配置）默认开启，显式 false 关闭。
+	if c.Agent.WorktreeEnabled == nil {
+		t := true
+		c.Agent.WorktreeEnabled = &t
 	}
 	// 视频附件抽帧参数（0 值回落 agent.DefaultVideoOptions 内部默认）：
 	// 二进制名留空由 agent 层 exec.LookPath 探测；帧数/像素/超时此处不重复设默认，

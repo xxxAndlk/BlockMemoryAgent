@@ -249,3 +249,53 @@ func TestDispatcher_HasPausedChildNilTree(t *testing.T) {
 	}
 }
 
+// TestRunSubAgent_ManualPauseRoutesToPausedTree 验证手动单支暂停（TODO 第9⑥/10③ 审计面）：
+// MarkPauseNode + StopRunning 触发 domain ctx 取消，isPauseRequested 命中走 Pause 收尾——
+// 树节点 Paused（非 Failed/Cancelled）、父 pending 不减、父 mailbox 不 notify、
+// 节点暂停标记收尾即清（防残留误分流后续取消）。
+func TestRunSubAgent_ManualPauseRoutesToPausedTree(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) }) // 释放悬挂 goroutine，防泄漏
+	d, _, mb, _, tr, toolsReg := newPauseTestEnv(t, &ctxAwareHangingProvider{release: release})
+	// 覆盖 env 默认的小 budget（10 token 会在悬挂前先触发 LimitReached pause，
+	// 抢占手动暂停路径）——本测试只验证手动暂停分流。
+	d.WithLoopConfigByRole(func(string) agent.LoopConfig { return agent.LoopConfig{TokenBudget: 1 << 30, MaxIterations: 50} })
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "悬挂的 domain 任务",
+		"domain":         "测试",
+		"responsibility": "负责测试",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch domain failed: err=%v res=%+v", err, res)
+	}
+	subID := res.Output
+	// 前提：节点已 Running 且悬挂在 Generate 中。
+	waitForCond(t, "domain running", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusRunning
+	})
+
+	// 手动暂停：登记标记后触发该支路 cancel（PauseAgent 服务层语义的两步）。
+	d.MarkPauseNode(subID)
+	if !tr.StopRunning(subID) {
+		t.Fatal("StopRunning should succeed on a Running domain node")
+	}
+	waitForCond(t, "domain paused by manual pause", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusPaused
+	})
+	// 收尾清标记。
+	if d.isPauseRequested(subID) {
+		t.Error("pause marker should be cleared after pause finalize")
+	}
+	// 父 pending 不减（paused 不 trackChildDone）。
+	if got := d.PendingChildren("s1"); got != 1 {
+		t.Errorf("pending after manual pause = %d, want 1", got)
+	}
+	// 父 mailbox 不 notify。
+	if drains := mb.Drain("s1"); len(drains) != 0 {
+		t.Errorf("parent mailbox should be empty on manual pause, got %d msgs", len(drains))
+	}
+}
+

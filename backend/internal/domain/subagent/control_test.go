@@ -3,12 +3,12 @@ package subagent
 // control_test.go 验证 TODO #25 MetaAgent 控制面：
 //   - cancel_agent 工具：树节点 Cancelled + 父计数兜底 + 父 mailbox 收"已被上级取消"；
 //     子 goroutine 经 context.Canceled 路径不重复通知（单通知）；
-//   - domain 心跳防误杀版：后代活动沿 parentID 链冒泡保活；domain 超其阈值（2× 叶子）才判假死。
+//   - stall 防误杀版（TODO 第10项② 证据化判定）：后代活动沿 parentID 链冒泡保活；
+//     domain 超其阈值（2× 叶子）步间静默才判假死。
 
 import (
 	"context"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,11 +17,12 @@ import (
 	"github.com/go-kratos/blades"
 )
 
-// newAtomic 构造带初始值的 *atomic.Int64。
-func newAtomic(v int64) *atomic.Int64 {
-	a := new(atomic.Int64)
-	a.Store(v)
-	return a
+// newEvidenceAt 构造 lastTS=v 的活动证据（测试用；活动种类记为 test）。
+func newEvidenceAt(v int64) *activityEvidence {
+	e := &activityEvidence{}
+	e.lastTS.Store(v)
+	e.lastKind.Store("test")
+	return e
 }
 
 // blockingProvider Generate 阻塞直到 ctx 取消，模拟挂起/长跑的子 Agent。
@@ -121,14 +122,14 @@ func TestBubbleActivity_RefreshesAncestors(t *testing.T) {
 	old := time.Now().Add(-time.Hour).UnixNano()
 	now := time.Now().UnixNano()
 
-	d.activity.Store("s1/domain-1", newAtomic(old))
-	d.activity.Store("s1/domain-1/code_assistant-1", newAtomic(old))
+	d.activity.Store("s1/domain-1", newEvidenceAt(old))
+	d.activity.Store("s1/domain-1/code_assistant-1", newEvidenceAt(old))
 	d.subMeta.Store("s1/domain-1", &subAgentMeta{parentID: "s1", sessionID: "s1"})
 	d.subMeta.Store("s1/domain-1/code_assistant-1", &subAgentMeta{parentID: "s1/domain-1", sessionID: "s1"})
 
 	d.bubbleActivity("s1/domain-1/code_assistant-1", now)
 
-	if v, ok := d.activity.Load("s1/domain-1"); !ok || v.(*atomic.Int64).Load() != now {
+	if v, ok := d.activity.Load("s1/domain-1"); !ok || v.(*activityEvidence).lastTS.Load() != now {
 		t.Fatalf("domain ancestor should be refreshed by descendant activity")
 	}
 }
@@ -144,13 +145,13 @@ func TestScanStuck_DomainThreshold(t *testing.T) {
 	noopCancel := func() {}
 	// 叶子静默 100ms（>50ms 阈值）→ 被杀。
 	leafID := "s1/code_assistant-1"
-	d.activity.Store(leafID, newAtomic(now-100*time.Millisecond.Nanoseconds()))
+	d.activity.Store(leafID, newEvidenceAt(now-100*time.Millisecond.Nanoseconds()))
 	d.subMeta.Store(leafID, &subAgentMeta{parentID: "s1", sessionID: "s1", cancel: noopCancel})
 	// domain 静默 100ms（<200ms 阈值）→ 存活；静默 300ms（>阈值）→ 被杀。
 	aliveDomain := "s1/domain-1"
 	deadDomain := "s1/domain-2"
-	d.activity.Store(aliveDomain, newAtomic(now-100*time.Millisecond.Nanoseconds()))
-	d.activity.Store(deadDomain, newAtomic(now-300*time.Millisecond.Nanoseconds()))
+	d.activity.Store(aliveDomain, newEvidenceAt(now-100*time.Millisecond.Nanoseconds()))
+	d.activity.Store(deadDomain, newEvidenceAt(now-300*time.Millisecond.Nanoseconds()))
 	d.subMeta.Store(aliveDomain, &subAgentMeta{parentID: "s1", sessionID: "s1", cancel: noopCancel})
 	d.subMeta.Store(deadDomain, &subAgentMeta{parentID: "s1", sessionID: "s1", cancel: noopCancel})
 

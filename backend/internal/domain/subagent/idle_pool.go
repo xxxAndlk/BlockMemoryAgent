@@ -25,7 +25,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
@@ -96,6 +95,10 @@ type domainSlot struct {
 	// workDir 会话级工作目录（S2）：槽创建时从派发 ctx 捕获，会话内固定；
 	// 每任务 ctx 经 tool.WithWorkDir 重注入，空=进程默认。
 	workDir        string
+	// stopCtx 会话级中断传播基底（TODO 第10④）：任务 ctx 以它为 WithCancel 基底，
+	// 会话 Stop/cancel 即刻取消执行中任务；复用派发时随新 runCtx 刷新（restartSessionContext
+	// 会重建，旧值已取消不能沿用）。
+	stopCtx        context.Context
 	parentID       string
 	domain         string
 	responsibility string
@@ -305,9 +308,7 @@ func (p *domainPool) slots(sessionID string) []*domainSlot {
 // 唤醒路径（reuse-wake / resume / 出队缓冲任务）统一在 runDomainTask 入口重建，
 // 保证执行期假死仍可被巡检发现。
 func (d *Dispatcher) rearmSlotActivity(id string) {
-	act := new(atomic.Int64)
-	act.Store(time.Now().UnixNano())
-	d.activity.Store(id, act)
+	d.activity.Store(id, newEvidence())
 }
 
 // enterIdle 转入 Idle：记录 idleSince，不挂 TTL timer（完成后一直热存，
@@ -580,8 +581,12 @@ const (
 // images 为本轮用户图片（Alt+V 粘贴，带外穿透）：注入 taskCtx 挂到本任务首条
 // user 消息，并随 domain 自身的工具执行 ctx 递归穿透给其派发的叶子 Agent。
 func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Duration, images []tool.ResultImage) domainTaskOutcome {
-	// 每任务 ctx：Background 派生 + sessionID；墙钟由 slot timer 驱动（可挂起停表）。
+	// 每任务 ctx：stopCtx 基底（TODO 第10④，会话 Stop 即刻取消执行中任务；
+	// 缺省回退 Background）+ sessionID；墙钟由 slot timer 驱动（可挂起停表）。
 	ctx := context.Background()
+	if s.stopCtx != nil {
+		ctx = s.stopCtx
+	}
 	if s.sessionID != "" {
 		ctx = tool.WithSessionID(ctx, s.sessionID)
 	}
@@ -693,6 +698,25 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 		if wallFired {
 			d.wallClockWrapUp(s, taskCtx, result, files, duration)
 			return domainTaskDestroyed
+		}
+		// 手动单节点暂停（TODO 第9⑥/10③ 审计面）：PauseAgent 标记后 StopRunning 到这里。
+		// 同触限挂起收尾（SaveMessages + tree.Pause + 心跳豁免），槽保留 park 等唤醒
+		//（既有 resume/继续通路可续）；不 SuspendSession——手动暂停仅针对该 domain，
+		// 会话其余任务照跑。
+		if d.isPauseRequested(s.id) {
+			d.ClearPauseNode(s.id)
+			d.saveSlotMessages(s, result.History)
+			if d.treeFn != nil && s.sessionID != "" {
+				if t := d.treeFn(s.sessionID); t != nil {
+					t.Pause(s.id, "manual pause")
+				}
+			}
+			s.mu.Lock()
+			s.suspended = true
+			s.mu.Unlock()
+			d.activity.Delete(s.id)
+			log.Printf("[subagent] MANUAL-PAUSED: sub=%s domain=%s duration=%s (hot-resident awaiting resume)", s.id, s.domain, duration)
+			return domainTaskSuspended
 		}
 		// 硬取消：树状态由取消方（Tree.Cancel）已置 Cancelled，此处仅销毁槽
 		//（父未决计数由 destroySlot 兜底递减）。
@@ -871,7 +895,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 	// activity 只在任务入口刷新一次——domain 直接执行任何 >10min 长工具即被巡检误判
 	// 假死 killed（2026-08-27 实证：3 个 domain 死于验证阶段长工具执行中）。
 	// Load-per-call 而非捕获指针：enterIdle/挂起收尾会 Delete activity、
-	// rearmSlotActivity 每任务重建新 atomic，闭包捕获旧指针会写进已废弃条目。
+	// rearmSlotActivity 每任务重建新证据条目，闭包捕获旧指针会写进已废弃条目。
 	sub = sub.WithActivityReporter(d.activityReporterFn(s.id))
 	if d.log != nil {
 		sub = sub.WithLogger(d.log.WithSession(s.sessionID).WithAgent(roleDef.Name))
@@ -885,10 +909,8 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 			forwarder(sid, ev)
 		})
 	}
-	// 心跳：domain 注册 activity（等子期间靠后代冒泡保活，同 runSubAgentOnce 语义）。
-	act := new(atomic.Int64)
-	act.Store(time.Now().UnixNano())
-	d.activity.Store(s.id, act)
+	// 心跳：domain 注册活动证据（等子期间靠后代冒泡保活，同 runSubAgentOnce 语义）。
+	d.activity.Store(s.id, newEvidence())
 	return sub, nil
 }
 
@@ -1076,6 +1098,15 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 		return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s belongs to another session", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
 	}
 
+	// stopCtx 刷新（TODO 第10④）：会话恢复后 stopCtx 已重建（旧值随上次 Stop 取消），
+	// 复用/入队前换绑本次 runCtx 携带的新基底，防新任务继承已取消 context 秒死。
+	// 忙碌槽当前任务不受影响（其 taskCtx 已派生），仅作用于后续任务。
+	if sc := tool.StopContextFrom(ctx); sc != nil {
+		s.mu.Lock()
+		s.stopCtx = sc
+		s.mu.Unlock()
+	}
+
 	s.mu.Lock()
 	state := s.state
 	qlen := len(s.taskQueue)
@@ -1137,9 +1168,13 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 	}
 }
 
-// buildReuseTask 拼装复用任务文本：共享前缀 + 召回前缀 + 领域标签 + 任务正文。
+// buildReuseTask 拼装复用任务文本：项目自述 + 共享前缀 + 召回前缀 + 领域标签 + 任务正文。
 func (d *Dispatcher) buildReuseTask(ctx context.Context, s *domainSlot, task string) string {
 	var prefixes []string
+	// 项目自述（TODO 第10项⑦）：与 runSubAgentOnce 首派同口径，置前缀首位。
+	if brief := d.projectBriefPrefix(ctx); brief != "" {
+		prefixes = append(prefixes, brief)
+	}
 	if sp := d.buildSharedPrefix(ctx, s.parentID, s.domain); sp != "" {
 		prefixes = append(prefixes, sp)
 	}
@@ -1182,6 +1217,7 @@ func (d *Dispatcher) dispatchHotDomain(ctx context.Context, parentID, subAgentID
 		id:             subAgentID,
 		sessionID:      sid,
 		workDir:        tool.WorkDirFromContext(ctx),
+		stopCtx:        tool.StopContextFrom(ctx),
 		parentID:       parentID,
 		domain:         strings.TrimSpace(domain),
 		responsibility: responsibility,

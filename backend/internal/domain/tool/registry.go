@@ -331,15 +331,43 @@ func (r *Registry) SetApprovalDisabled(disabled bool) {
 	}
 }
 
-// needsApproval 判定本次工具调用是否需要用户确认（破坏性工具分级）：
-//   - WriteFile（静态 destructive）：仅生产工作目录下触发；
-//   - RunCommand：命中危险命令模式（git push/rm -rf/drop table 等）恒触发（与目录无关）；
-//     生产目录下的写类命令（rm/mv/cp/touch/mkdir/git rm/git mv）亦触发；
-//   - 其余工具与普通命令：不触发，保持自主。
+// needsApproval 判定本次工具调用是否需要用户确认（TODO #17 P1 破坏性分级 + 第10⑥ 三级信任模式）。
+// 信任模式经 ctx 携带的读取器实时读取（会话层注入闭包，会话中途切换模式下一工具调用即生效）：
+//   - suggest：全部变更类动作（WriteFile/EditFile/RestoreFile/RunCommand/动态 Destructive 工具）
+//     逐条审批，读类工具直通（比 TODO 字面「全部动作」收窄为变更类，防 ReadFile 审批风暴）；
+//   - auto-edit：文件编辑（WriteFile/EditFile/RestoreFile）直通，RunCommand 与动态 Destructive 审批；
+//   - full-auto：全自主放行（现状默认）。
+//   - ctx 未携带值（未注入/返回空串，测试与旧路径）：回退现网语义——approvalDisabled
+//     （tool_approval_disabled 全信任开关）优先，否则生产边界 + 危险命令规则。
 //
-// approvalHook 为 nil 时不触发（零行为变化）；approvalDisabled（全信任模式）时一律不触发。
-func (r *Registry) needsApproval(name string, args map[string]any) bool {
-	if r == nil || r.approvalHook == nil || r.approvalDisabled {
+// approvalHook 为 nil 时不触发（零行为变化）。
+func (r *Registry) needsApproval(ctx context.Context, name string, args map[string]any) bool {
+	if r == nil || r.approvalHook == nil {
+		return false
+	}
+	mode := ""
+	if fn := TrustModeFuncFrom(ctx); fn != nil {
+		mode = fn()
+	}
+	switch mode {
+	case TrustModeSuggest:
+		if name == "WriteFile" || name == "EditFile" || name == "RestoreFile" || name == "RunCommand" {
+			return true
+		}
+		return r.dynamicDestructive(name)
+	case TrustModeAutoEdit:
+		if name == "RunCommand" {
+			return true
+		}
+		if name == "WriteFile" || name == "EditFile" || name == "RestoreFile" {
+			return false
+		}
+		return r.dynamicDestructive(name)
+	case TrustModeFullAuto:
+		return false
+	}
+	// ctx 未携带信任模式：回退现网语义（兼容未注入路径）。
+	if r.approvalDisabled {
 		return false
 	}
 	prod := inProductionWorkDir(r.WorkDir(), r.productionWorkDir)
@@ -356,10 +384,18 @@ func (r *Registry) needsApproval(name string, args map[string]any) bool {
 	// 插件等动态注册工具可自标 Destructive（如 Computer Use 敏感操作）：
 	// 无论目录恒要求用户确认，接入同一守卫链（设计文档 §6.2 安全包装）。
 	// 置于内置工具分支之后：WriteFile/EditFile 的静态 Destructive 仍只走生产边界语义。
-	if t, ok := r.toolByName(name); ok {
-		if d, ok := t.(interface{ Destructive() bool }); ok && d.Destructive() {
-			return true
-		}
+	return r.dynamicDestructive(name)
+}
+
+// dynamicDestructive 判定工具是否（动态）自标 Destructive。内置写类工具的静态标记
+// 由调用方按名称分支先行处理，不会经此误判进 auto-edit 直通语义。
+func (r *Registry) dynamicDestructive(name string) bool {
+	t, ok := r.toolByName(name)
+	if !ok {
+		return false
+	}
+	if d, ok := t.(DestructiveTool); ok {
+		return d.Destructive()
 	}
 	return false
 }
@@ -516,7 +552,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 破坏性工具分级（TODO #17 P1）：命中生产边界/危险命令模式时先经 approvalHook 等用户确认。
 	// 拒绝则返回工具级错误（不执行），Agent 可见并自行决策；hook 错误上抛中止本次调用。
 	// 非生产环境与普通工具不经过此路径，保持自主。
-	if r.needsApproval(name, args) {
+	if r.needsApproval(ctx, name, args) {
 		allowed, err := r.approvalHook(ctx, name, args)
 		if err != nil {
 			return nil, fmt.Errorf("%s approval failed: %w", name, err)

@@ -1,4 +1,4 @@
-import type { Session, SessionEvent, AgentNode, TaskBoardData, WireImage } from '@/types'
+import type { Session, SessionEvent, AgentNode, TaskBoardData, WireImage, TrustMode } from '@/types'
 import { fetchJson } from './client'
 import { APP_CONFIG } from '@/config/app'
 
@@ -48,6 +48,14 @@ export function interruptSession(id: string, content: string): Promise<void> {
   return fetchJson(`/sessions/${id}/interrupt`, {
     method: 'POST',
     body: JSON.stringify({ content }),
+  })
+}
+
+/** 切换会话信任模式（TODO 第10⑥ 三级信任，对标 Codex）：POST /sessions/{id}/trust-mode，下一工具调用生效。 */
+export function setTrustMode(id: string, mode: TrustMode): Promise<{ session_id: string; trust_mode: string }> {
+  return fetchJson(`/sessions/${id}/trust-mode`, {
+    method: 'POST',
+    body: JSON.stringify({ mode }),
   })
 }
 

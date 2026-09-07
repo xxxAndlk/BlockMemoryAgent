@@ -44,6 +44,9 @@ type agentTreeNode struct {
 	isClarify bool
 	// createdAt 是 Agent 创建时间，用于显示时间戳。
 	createdAt time.Time
+	// activity 是活动证据小字（TODO 第10项②展示面："in ReadFile · active 12s ago"），
+	// 来自 AgentInstance.ActivityKind/LastActivityAgo；空串表示无监控条目/非运行态。
+	activity string
 }
 
 // AgentTreePanel 维护从 agent.Agent 数据构建的扁平 Agent 树渲染状态。
@@ -122,6 +125,19 @@ func (at *AgentTreePanel) rebuild(agentFacade agent.Agent, s *server.Session) {
 			live = append(live, n)
 		}
 		at.nodes = append(at.nodes, orchestratorNodesToTreeNodes(live, s.ID)...)
+		// 活动证据（TODO 第10项②展示面）：ListAgents 携带各节点最近活动种类与距今时长，
+		// 运行中节点行渲染 "in <tool> · active Xs ago" 小字，让假死可见可判。
+		if instances, err := agentFacade.ListAgents(context.Background(), s.ID); err == nil {
+			byID := make(map[string]agent.AgentInstance, len(instances))
+			for _, inst := range instances {
+				byID[inst.ModuleID] = inst
+			}
+			for i := range at.nodes {
+				if inst, ok := byID[at.nodes[i].instID]; ok {
+					at.nodes[i].activity = formatActivityEvidence(inst.ActivityKind, inst.LastActivityAgo)
+				}
+			}
+		}
 	}
 
 	// 若会话处于待澄清状态，追加一个占位节点提示用户（含问题文本，TODO #53）：
@@ -333,9 +349,34 @@ func (at *AgentTreePanel) buildLines() []string {
 		if node.isClarify {
 			name = "Clarify pending"
 		}
-		lines = append(lines, fmt.Sprintf("%s %s %s %s  %s", " ", prefix, icon, name, statusIcon(string(node.status))))
+		line := fmt.Sprintf("%s %s %s %s  %s", " ", prefix, icon, name, statusIcon(string(node.status)))
+		// 活动证据小字（TODO 第10项②）：仅运行中节点携带（rebuild 时已过滤非运行证据）。
+		if node.activity != "" {
+			line += "  " + lipgloss.NewStyle().Faint(true).Render(node.activity)
+		}
+		lines = append(lines, line)
 	}
 	return lines
+}
+
+// formatActivityEvidence 把活动证据渲染为节点行小字（TODO 第10项②展示面）：
+// tool:<名> → "in <名> · active Xs ago"；llm_start/stream → thinking；user_wait → awaiting user。
+func formatActivityEvidence(kind, ago string) string {
+	kind = strings.TrimSpace(kind)
+	ago = strings.TrimSpace(ago)
+	if kind == "" || ago == "" {
+		return ""
+	}
+	switch {
+	case strings.HasPrefix(kind, "tool:"):
+		return "in " + strings.TrimPrefix(kind, "tool:") + " · active " + ago + " ago"
+	case kind == "llm_start" || kind == "stream":
+		return "thinking · active " + ago + " ago"
+	case kind == "user_wait":
+		return "awaiting user · " + ago + " ago"
+	default:
+		return kind + " · active " + ago + " ago"
+	}
 }
 
 // renderAgentsPanel 渲染右侧 Agent 编排面板（TODO #48 真树形）：

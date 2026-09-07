@@ -24,6 +24,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/domain/tool"         // tool 包提供工具注册表与 Result 类型
 	"github.com/blockmemory/agent/backend/internal/logger"              // logger 包提供会话级日志器，记录子 Agent LLM I/O
 	"github.com/blockmemory/agent/backend/internal/mailbox"             // mailbox 包用于子 Agent 向父 Agent 发送完成通知
+	"github.com/blockmemory/agent/backend/internal/project"             // project 包提供 AGENTS.md/CLAUDE.md 项目自述读取（TODO 第10项⑦）
 	"github.com/blockmemory/agent/backend/internal/skill"               // skill 包提供技能池与元数据块渲染（技能分发）
 	"github.com/blockmemory/agent/backend/pkg/enums"                    // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
 	"github.com/blockmemory/agent/backend/pkg/textutil"                 // textutil 提供截断展示名用工具
@@ -210,6 +211,11 @@ type Dispatcher struct {
 	// 默认 3000/4000（原 2000/2600 实证过紧，强模型吃大上下文后转贴代价低），bootstrap 按配置覆盖。
 	taskRuneSoftLimit int
 	taskRuneHardLimit int
+	// agentsMDMaxRunes AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦，rune 计数）。
+	// workDir 根部 AGENTS.md 优先、其次 CLAUDE.md，以【项目自述】段注入派发前缀首位
+	//（会话内最稳的段，前缀缓存友好）；缺失零开销。<=0 关闭（bootstrap 从
+	// config agents_md_max_runes 注入，配置默认 4000）。
+	agentsMDMaxRunes int
 	// loopCfgByRole 按角色返回 ReAct 主循环配置:不同角色 token 预算分级
 	// (config.yaml token_budget_per_role，resume 重置，超限暂停可恢复)。
 	// 为 nil 时用 agent.NopLoopConfig 兜底(测试场景)。
@@ -299,6 +305,23 @@ type Dispatcher struct {
 	// domain 落 Paused（存 history 可续跑）、叶子部分回灌，而非静默跳过。
 	softStops  map[string]bool
 	softStopMu sync.Mutex
+	// pauseRequests 记录被手动暂停的节点（TODO 第9⑥/10③ 审计面止血入口）：
+	// ReactService.PauseAgent 对单个运行中 domain 标记后再 StopRunning，
+	// context.Canceled 收尾分支据此把**该节点**（不影响会话其余节点）走
+	// domain→Pause 软停收尾（SaveMessages + tree.Pause），ResumePaused 可续。
+	// PauseAgent 收尾后/竞态时清除，不留会话级残留。
+	pauseRequests  map[string]bool
+	pauseRequestMu sync.Mutex
+
+	// worktreeEnabled 允许 call_sub_agent 携带 worktree=true 派发到 git worktree 副本
+	// （TODO 第9项⑤/#10⑤）。false 时 worktree 参数按 validation_rejected 拒绝
+	//（bootstrap 从 config worktree_enabled 注入，config.yaml 默认 true）。
+	worktreeEnabled bool
+	// worktrees 登记每个 worktree 隔离派发的句柄（TODO 第9⑤），键 subAgentID ->
+	// *worktreeHandle（path/branch/baseCommit/patch 等）。供完成收尾产出 patch、
+	// merge_worktree 合并门与 CleanupSessionWorktrees 清理消费。
+	// NewDispatcher 初始化；条目随 merge/remove 语义流转，进程内有效。
+	worktrees sync.Map
 
 	// heartbeatTimeout 子 Agent 心跳超时：叶子 Agent 超过该时长无活动（generateOnce/工具派发）
 	// 判定假死（LLM 流式挂起/工具 hang），巡检 goroutine 主动 cancel + notify 父 + trackChildDone，
@@ -308,8 +331,9 @@ type Dispatcher struct {
 	// 默认 2× 叶子——domain 等子/等回信期间自身无 LLM/工具活动，靠后代活动冒泡保活；
 	// 后代全静默后超该阈值才判假死。<=0 时按 2× heartbeatTimeout 兜底。
 	domainHeartbeatTimeout time.Duration
-	// activity 存叶子子 Agent 最后活动时间戳（unix nano），键 subAgentID -> *atomic.Int64。
-	// 仅叶子 Agent 注入（DomainAgent/MetaAgent 有 wait loop 不注入，避免误杀合法等待）。
+	// activity 存子 Agent 活动证据（TODO 第10项②），键 subAgentID -> *activityEvidence：
+	// lastTS/lastKind + llmInFlight/toolStartTS（在飞豁免与挂死工具判定）。
+	// 仅叶子 Agent 与热驻 domain 槽注入（MetaAgent wait loop 不注入，避免误杀合法等待）。
 	activity sync.Map
 	// lastWrites 存子 Agent 近期写入的文件清单（subAgentID -> *fileWriteState），
 	// 从实时工具事件识别（WriteFile/EditFile）。心跳巡检 kill 时把清单回告父 Agent--
@@ -539,6 +563,26 @@ func (d *Dispatcher) WithHeartbeatTimeout(t time.Duration) *Dispatcher {
 	return d
 }
 
+// WithAgentsMDMaxRunes 配置 AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦，rune）；
+// <=0 关闭注入。bootstrap 从 config.AgentsMDMaxRunes 注入（默认 4000）。
+func (d *Dispatcher) WithAgentsMDMaxRunes(n int) *Dispatcher {
+	d.agentsMDMaxRunes = n
+	return d
+}
+
+// projectBriefPrefix 读取 workDir 根部项目自述并渲染为【项目自述】前缀段（TODO 第10项⑦）。
+// 关闭/缺失时返回空串（零注入）。mtime 缓存命中时零读取（project 包进程级缓存）。
+func (d *Dispatcher) projectBriefPrefix(ctx context.Context) string {
+	if d.agentsMDMaxRunes <= 0 {
+		return ""
+	}
+	brief := project.LoadProjectBrief(d.subAgentWorkDirFor(ctx), d.agentsMDMaxRunes)
+	if brief == "" {
+		return ""
+	}
+	return "【项目自述】\n" + brief
+}
+
 // WithDomainHeartbeatTimeout 配置 DomainAgent 心跳超时（TODO #25-3 防误杀版）。
 // <=0 时按 2× heartbeatTimeout 兜底；bootstrap 从 config.DomainHeartbeatTimeoutMin 注入。
 func (d *Dispatcher) WithDomainHeartbeatTimeout(t time.Duration) *Dispatcher {
@@ -551,12 +595,12 @@ func (d *Dispatcher) WithDomainHeartbeatTimeout(t time.Duration) *Dispatcher {
 // 后代全静默后 domain 超其阈值才判假死。subMeta 缺失或链顶（meta/会话）终止。
 // activityReporterFn 返回注入 ReActAgent 的活动上报闭包（WithActivityReporter）。
 // Load-per-call 而非捕获指针：热驻 domain 的 activity 条目会被 enterIdle/挂起收尾
-// Delete 后由 rearmSlotActivity 重建为新 atomic，闭包捕获旧指针会写进已废弃条目。
-func (d *Dispatcher) activityReporterFn(agentID string) func() {
-	return func() {
+// Delete 后由 rearmSlotActivity 重建为新证据，闭包捕获旧指针会写进已废弃条目。
+func (d *Dispatcher) activityReporterFn(agentID string) func(kind string) {
+	return func(kind string) {
 		now := time.Now().UnixNano()
-		if v, ok := d.activity.Load(agentID); ok {
-			v.(*atomic.Int64).Store(now)
+		if e := d.activityEvidenceFor(agentID); e != nil {
+			e.report(kind, now)
 		}
 		d.bubbleActivity(agentID, now)
 	}
@@ -573,8 +617,8 @@ func (d *Dispatcher) bubbleActivity(agentID string, now int64) {
 		if meta.parentID == "" {
 			return
 		}
-		if av, ok := d.activity.Load(meta.parentID); ok {
-			av.(*atomic.Int64).Store(now)
+		if e := d.activityEvidenceFor(meta.parentID); e != nil {
+			e.stamp("descendant", now)
 		}
 		cur = meta.parentID
 	}
@@ -704,15 +748,15 @@ func (d *Dispatcher) recentActivitySummary(subAgentID string) string {
 }
 
 // PingActivity 外部保活探针（等待用户答复场景）：审批/提问阻塞期间由会话层周期性调用，
-// 刷新该 Agent 活动时间并沿父链冒泡，防止心跳巡检把"等用户操作"误判为假死 kill。
-// agentID 未注册（meta/已终结）时静默跳过。
+// 以 user_wait 证据刷新该 Agent 活动时间并沿父链冒泡，防止巡检把"等用户操作"
+// 误判为假死 kill。agentID 未注册（meta/已终结）时静默跳过。
 func (d *Dispatcher) PingActivity(agentID string) {
 	if agentID == "" {
 		return
 	}
 	now := time.Now().UnixNano()
-	if av, ok := d.activity.Load(agentID); ok {
-		av.(*atomic.Int64).Store(now)
+	if e := d.activityEvidenceFor(agentID); e != nil {
+		e.report("user_wait", now)
 	}
 	d.bubbleActivity(agentID, now)
 }
@@ -754,9 +798,14 @@ func (d *Dispatcher) patrol() {
 	}
 }
 
-// scanStuck 扫描 activity map，对超阈值无活动的子 Agent 执行 killStuckSubAgent。
+// scanStuck 扫描 activity map，对超阈值无有效活动的子 Agent 执行 killStuckSubAgent。
 // 叶子按 heartbeatTimeout；domain 按 domainHeartbeatTimeout（默认 2× 叶子，
 // 等子/等回信期间靠后代活动冒泡保活，防误杀合法等待，TODO #25-3）。
+// 证据化判定（TODO 第10项②）：
+//  1. 在飞 LLM（llmInFlight，含引擎 judge）→ 豁免——慢思考单呼可远超阈值，流式 chunk、
+//     流空闲卡口、调用超时与会话墙钟另有兜底；
+//  2. 工具在飞超阈值（toolStartTS）→ 杀——真挂死工具（keepalive 盲报不再续命）；
+//  3. 步间静默超阈值（lastTS）→ 杀——步间死锁。
 func (d *Dispatcher) scanStuck() {
 	if d.heartbeatTimeout <= 0 {
 		return
@@ -767,15 +816,25 @@ func (d *Dispatcher) scanStuck() {
 		domainThreshold = 2 * d.heartbeatTimeout
 	}
 	d.activity.Range(func(k, v any) bool {
-		act := v.(*atomic.Int64)
+		e := v.(*activityEvidence)
 		threshold := d.heartbeatTimeout
 		if roleIDFromAgentID(k.(string)) == "domain" {
 			threshold = domainThreshold
 		}
-		if act.Load() > now-int64(threshold) {
-			return true // 仍活跃
+		// 1. 在飞 LLM：豁免（只展示不杀）。
+		if e.llmInFlight.Load() {
+			return true
 		}
-		d.killStuckSubAgent(k.(string))
+		// 2. 工具在飞超阈值：真挂死工具。
+		if ts := e.toolStartTS.Load(); ts > 0 && now-ts > int64(threshold) {
+			d.killStuckSubAgent(k.(string), fmt.Sprintf("tool=%s in-flight=%s", e.toolNameString(), time.Duration(now-ts)))
+			return true
+		}
+		// 3. 步间静默超阈值。
+		if last := e.lastTS.Load(); now-last > int64(threshold) {
+			d.killStuckSubAgent(k.(string), fmt.Sprintf("last_kind=%s quiet=%s", e.kindString(), time.Duration(now-last)))
+			return true
+		}
 		return true
 	})
 }
@@ -783,7 +842,8 @@ func (d *Dispatcher) scanStuck() {
 // killStuckSubAgent 主动取消假死子 Agent：cancel ctx + 兜底 trackChildDone + notify 父 +
 // 树节点置 Failed + 清理 activity/subMeta/running。runSubAgent goroutine 若因 cancel 返回，
 // 其 doneOnce.Do 为 no-op；若不尊重 ctx（流式挂起），此处 doneOnce 兜底递减防父永久空等。
-func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
+// evidence 为 scanStuck 判定的活动证据摘要（kind/工具名/静默时长），进日志与父通知文案。
+func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	v, ok := d.subMeta.LoadAndDelete(subAgentID)
 	if !ok {
 		return
@@ -797,8 +857,8 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
 	} else if roleIDFromAgentID(subAgentID) == "domain" {
 		threshold = 2 * d.heartbeatTimeout
 	}
-	log.Printf("[subagent] HEARTBEAT KILL: sub=%s parent=%s idle>%s - cancel+notify",
-		subAgentID, meta.parentID, threshold)
+	log.Printf("[subagent] STALL KILL: sub=%s parent=%s threshold>%s evidence=[%s] - cancel+notify",
+		subAgentID, meta.parentID, threshold, evidence)
 	// cancel 可能为 nil：热驻 domain 槽的 subMeta 在任务 ctx 创建前注册（idle_pool
 	// dispatchHotDomain），首任务换绑前/挂起等用户续跑期间被巡检命中时（2026-08-26
 	// 实证进程级 panic）不得空指针崩溃。nil 时跳过主动 cancel，仍走 doneOnce 兜底
@@ -811,7 +871,7 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID string) {
 	// 大概率可续建——retryable=false 曾误导父 LLM 从零重派（fruit 任务实证）。
 	// 自动重派策略不受影响：runSubAgentWithAutoRetry 只认 kind=error+叶子，标记仅供父决策。
 	killMsg := failureMarker(FailureKindKilled, true) + "\n" +
-		fmt.Sprintf("子 Agent %s 超过 %s 无活动，判定假死已主动取消。", subAgentID, threshold)
+		fmt.Sprintf("子 Agent %s 超过 %s 无有效活动（证据：%s），判定假死已主动取消。", subAgentID, threshold, evidence)
 	// 盘上产物回告（2026-08-19）：收尾卡死被杀的子 Agent 常已把文件全部落盘，
 	// 只是回执被挂死的收尾自检拖住--父级据此可按盘上现状直接验收，不必从零重派。
 	if paths := d.recentWrittenFiles(subAgentID, 30*time.Minute); len(paths) > 0 {
@@ -879,7 +939,7 @@ func (d *Dispatcher) killDescendants(rootID, sessionID string) {
 			visited[n.ID] = true
 			queue = append(queue, n.ID)
 			log.Printf("[subagent] CASCADE KILL: parent=%s child=%s", pid, n.ID)
-			d.killStuckSubAgent(n.ID)
+			d.killStuckSubAgent(n.ID, "cascade")
 		}
 	}
 }
@@ -983,6 +1043,7 @@ func NewDispatcher(
 		taskRuneSoftLimit: 3000,             // task 文本软上限（TODO #35），WithTaskRuneLimits 覆盖
 		taskRuneHardLimit: 4000,
 		softStops:         make(map[string]bool),
+		pauseRequests:     make(map[string]bool),
 		planState:         newPlanConfirmState(),
 	}
 }
@@ -1016,6 +1077,41 @@ func (d *Dispatcher) isSoftStop(sessionID string) bool {
 // 区分用户停止与硬取消的 context.Canceled 分流）。
 func (d *Dispatcher) IsSoftStop(sessionID string) bool {
 	return d.isSoftStop(sessionID)
+}
+
+// MarkPauseNode 标记单个节点为"手动暂停中"（TODO 第9⑥/10③ 审计面）：
+// ReactService.PauseAgent 先标记再 StopRunning，context.Canceled 收尾分支据此把
+// 该节点按软停语义落 Paused（SaveMessages + tree.Pause），不影响会话其余节点。
+func (d *Dispatcher) MarkPauseNode(nodeID string) {
+	if d == nil || nodeID == "" {
+		return
+	}
+	d.pauseRequestMu.Lock()
+	defer d.pauseRequestMu.Unlock()
+	if d.pauseRequests == nil {
+		d.pauseRequests = make(map[string]bool)
+	}
+	d.pauseRequests[nodeID] = true
+}
+
+// ClearPauseNode 清除节点手动暂停标记（收尾落 Pause 后/竞态时调用）。幂等。
+func (d *Dispatcher) ClearPauseNode(nodeID string) {
+	if d == nil || nodeID == "" {
+		return
+	}
+	d.pauseRequestMu.Lock()
+	defer d.pauseRequestMu.Unlock()
+	delete(d.pauseRequests, nodeID)
+}
+
+// isPauseRequested 查询节点是否被手动暂停标记。
+func (d *Dispatcher) isPauseRequested(nodeID string) bool {
+	if d == nil || nodeID == "" {
+		return false
+	}
+	d.pauseRequestMu.Lock()
+	defer d.pauseRequestMu.Unlock()
+	return d.pauseRequests[nodeID]
 }
 
 // WithTimeout 配置子 Agent 独立执行的最大时长；<=0 表示不限制（仅防挂起的保底由调用方负责）。
@@ -1435,6 +1531,8 @@ func (d *Dispatcher) RegisterCallTool(r *tool.Registry) {
 	r.Register(&callSubAgentTool{dispatcher: d})
 	r.Register(&callSubAgentsTool{dispatcher: d})
 	r.Register(&mapSubAgentsTool{dispatcher: d})
+	// merge_worktree（TODO 第9⑤/#10⑤）：worktree 隔离派发的合并门工具，白名单仅 meta。
+	r.Register(&mergeWorktreeTool{dispatcher: d})
 }
 
 // RegisterMessagingTool 将 send_message 工具安装到传入的工具注册表中。
@@ -1633,7 +1731,8 @@ func (t *callSubAgentTool) Description() string {
 		"mode=react(默认)/reflection/plan_execute（判断不准省略）；verify_kind=auto(默认)/executable/rubric/none；" +
 		"tools_hint=预挂载插件工具名列表（受角色白名单天花板约束）；wall_clock_min=墙钟分钟（普通任务省略，仅侦察/巡检给小预算）；" +
 		"reuse_agent_id=热驻复用（填【空闲领域Agent】的 agent_id，保留全部上下文，spec 照写、key 与领域名对齐）；" +
-		"takeover=异名续建时填旧 domain 名，看板未完成条目迁移留痕（同名续建自动覆盖无需填）。\n" +
+		"takeover=异名续建时填旧 domain 名，看板未完成条目迁移留痕（同名续建自动覆盖无需填）；" +
+		"worktree=true 隔离派发到 git worktree 副本（子 Agent 全部文件写入落在副本，主目录零写入；成功收尾产出全量 patch，用 merge_worktree review 看完整 diff 后 merge/reject——仅文件级独立且需并行的任务使用；与 reuse_agent_id 互斥，热驻 domain 不支持）。\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
@@ -1731,6 +1830,9 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	// dispatcher 迁移其非 Done 看板条目（含 Failed）到本次 domain 并留痕。
 	takeover, _ := args["takeover"].(string)
 	takeover = strings.TrimSpace(takeover)
+	// worktree 可选（TODO 第9⑤/#10⑤）：git worktree 隔离派发——子 Agent 在主仓库
+	// 副本内工作，成功收尾产出全量 patch，meta 经 merge_worktree 合并门合入。
+	wantWorktree := boolArg(args, "worktree")
 
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
@@ -1760,12 +1862,23 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	if rd := d.registry.Get(roleID); rd == nil || !rd.SpecExempt {
 		specMsg, warn := d.checkSpecBeforeDispatch(ctx, parentID, domain)
 		if specMsg != "" {
-			return &tool.Result{Tool: "call_sub_agent", Error: specMsg, Category: tool.ResultCategoryValidationRejected}
+			// worktree 派发豁免 spec 新鲜度（mtime stale）拒绝（TODO 第9⑤）：
+			// spec mtime 相对主目录，他域合入/工作目录漂移会让合法的 worktree 派发误报
+			// stale——降级为警告放行（missing/invalid 仍硬拒）。
+			if wantWorktree && strings.Contains(specMsg, "stale") {
+				specWarn = strings.TrimSpace(specWarn + "；worktree 派发豁免 spec 新鲜度检查: " + specMsg)
+			} else {
+				return &tool.Result{Tool: "call_sub_agent", Error: specMsg, Category: tool.ResultCategoryValidationRejected}
+			}
 		}
-		specWarn = warn
+		specWarn += warn
+	}
+	// worktree 与热驻复用互斥：复用槽沿主目录上下文冻结，切副本无意义。
+	if wantWorktree && reuseAgentID != "" {
+		return &tool.Result{Tool: "call_sub_agent", Error: "worktree 与 reuse_agent_id 互斥：复用槽沿主目录上下文续作，请二选一", Category: tool.ResultCategoryValidationRejected}
 	}
 
-	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, wallClock, reuseAgentID, takeover)
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, wallClock, reuseAgentID, takeover, &dispatchOpts{worktree: wantWorktree})
 	if errRes != nil {
 		errRes.Tool = "call_sub_agent"
 		return errRes
@@ -1880,6 +1993,9 @@ type dispatchOpts struct {
 	aggItem string
 	// aggIdx 是聚合模式下本项在 items 中的下标（聚合消息按派发顺序排列用）。
 	aggIdx int
+	// worktree 为 true 时（TODO 第9⑤/#10⑤）：本项派发到 git worktree 副本，
+	// 成功收尾产出 patch，meta 经 merge_worktree 合并门合入主仓库。
+	worktree bool
 }
 
 func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint, skillsHint []string, wallClock time.Duration, reuseAgentID, takeover string, opts ...*dispatchOpts) (string, *tool.Result) {
@@ -1906,6 +2022,17 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	roleDef := d.registry.Get(roleID)
 	if roleDef == nil {
 		return "", &tool.Result{Error: fmt.Sprintf("unknown role: %s", roleID), Category: tool.ResultCategoryValidationRejected}
+	}
+
+	// worktree 派发约束（TODO 第9⑤）：开关关闭拒绝；热驻 domain 拒绝（槽沿主目录
+	// 上下文冻结，切副本破坏 reuse 语义）。callSubAgentTool 已拒 reuse 组合。
+	if opt != nil && opt.worktree {
+		if !d.worktreeEnabled {
+			return "", &tool.Result{Error: "worktree 派发未启用（agent.worktree_enabled=false）", Category: tool.ResultCategoryValidationRejected}
+		}
+		if d.hotEnabled() && roleDef.ID == "domain" {
+			return "", &tool.Result{Error: "worktree 不支持热驻 domain 派发（热驻槽沿主目录上下文续作）；请关闭热驻或取消 worktree 参数", Category: tool.ResultCategoryValidationRejected}
+		}
 	}
 
 	// scout 类 spec_exempt 角色缺省墙钟 5 分钟（TODO 第七项②）：侦察任务必须有预算上限，
@@ -1978,6 +2105,18 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// 生成全局唯一的子 Agent ID，格式为 "父ID/角色ID-序号"。
 	subAgentID := fmt.Sprintf("%s/%s-%d", parentID, roleID, d.seq.Add(1))
 
+	// worktree 隔离派发（TODO 第9⑤）：trackChildStart 之前创建副本——失败按
+	// validation_rejected 拒绝，不泄漏父 pending 计数；成功后句柄登记进 d.worktrees，
+	// 供完成收尾 producePatch、merge_worktree 合并门与终态清理消费。
+	var wt *worktreeHandle
+	if opt != nil && opt.worktree {
+		h, rej := d.createWorktreeForDispatch(ctx, parentID, subAgentID, sessionIDFromAgentID(parentID), domain, roleID)
+		if h == nil {
+			return "", rej
+		}
+		wt = h
+	}
+
 	// tools_hint 预挂载（TODO #52 执行项 4）：父 Agent 建议的工具集 ∩ 子 Agent 角色天花板后
 	// 挂载进子 scope，子 Agent 构造的 adapter 据此收窄插件工具可见集——
 	// 实现"派 UI 任务时提示用画图插件"而不放权。越界项拒绝并回告父 Agent（日志可查）。
@@ -2032,13 +2171,25 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		return appendRejectNotes(id, hintRejected, skillRejected), nil
 	}
 
-	subAgentCtx := context.Background()
+	// 中断传播基底（TODO 第10④）：父 ctx 携带会话级 stopCtx（tool.WithStopContext 注入）
+	// 时以其为基底——会话 Stop/cancel 取消 stopCtx，stop 窗口期新派发即刻终止、深层孙代
+	// 随链级联；未携带（测试/旧路径）回退 Background 保持既有独立语义。
+	subAgentCtx := tool.StopContextFrom(ctx)
+	if subAgentCtx == nil {
+		subAgentCtx = context.Background()
+	}
 	if sid := tool.SessionIDFromContext(ctx); sid != "" {
 		subAgentCtx = tool.WithSessionID(subAgentCtx, sid)
 	}
 	// 每会话工作目录（S2）：子 Agent ctx 由 Background 重建，父 ctx 的 value 不会自动
 	// 流入，须显式重注入（父未注入时 WorkDirFromContext 返回空，WithWorkDir 空值 no-op）。
-	subAgentCtx = tool.WithWorkDir(subAgentCtx, tool.WorkDirFromContext(ctx))
+	workDirForChild := tool.WorkDirFromContext(ctx)
+	if wt != nil {
+		// worktree 派发（TODO 第9⑤）：工作目录切换到副本路径——subAgentWorkDirFor
+		// 读 ctx 值优先，引擎提示词/工具/沙箱基线随之自然隔离（主目录零写入）。
+		workDirForChild = wt.Path
+	}
+	subAgentCtx = tool.WithWorkDir(subAgentCtx, workDirForChild)
 	// 本轮用户图片（Alt+V 粘贴）带外穿透：子 Agent ctx 由 Background 重建，
 	// 父 ctx 的 value 不会自动流入，须显式重注入--子 Agent 首条 user 消息挂图，
 	// 其自身工具调用链（含再派发叶子）递归携带。
@@ -2094,9 +2245,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(ctx), wallClock: effectiveTimeout}
 	d.subMeta.Store(subAgentID, meta)
 	if !isMeta {
-		act := new(atomic.Int64)
-		act.Store(time.Now().UnixNano())
-		d.activity.Store(subAgentID, act)
+		d.activity.Store(subAgentID, newEvidence())
 	}
 	d.ensurePatrol()
 	// 聚合模式登记（TODO 第七项⑤）：先于 goroutine 注册，消除 notify 时序竞态。
@@ -2500,7 +2649,9 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 			//     恢复路由零改动生效）；
 			//   叶子助手：无 Pause 语义，部分回灌父（treeFinish Done + notify + trackChildDone），
 			//     domain 续跑后按需重派。
-			if sid := tool.SessionIDFromContext(ctx); d.isSoftStop(sid) {
+			// 手动单节点暂停（TODO 第9⑥/10③ 审计面）：PauseAgent 对单个 domain 标记后
+			// StopRunning，isPauseRequested 命中走同一条 domain→Pause 收尾，不影响其余节点。
+			if sid := tool.SessionIDFromContext(ctx); d.isSoftStop(sid) || d.isPauseRequested(subAgentID) {
 				if roleDef.ID == "domain" {
 					if d.msgStore != nil && result.History != nil {
 						// 本分支的 ctx 已被 StopRunning 取消：SaveMessages 必须用脱离取消的 ctx，
@@ -2518,6 +2669,8 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 							t.Pause(subAgentID, "user stop")
 						}
 					}
+					// 手动暂停收尾完成，清节点标记（防残留误分流后续取消）。
+					d.ClearPauseNode(subAgentID)
 					// 唤醒父 MetaAgent 的 wait loop（不改变 PendingChildren 计数）：
 					// 否则父要等满 30s wait 周期才检测到 Paused 子节点，PausedOnChild 转换被拖慢。
 					d.pokeParent(parentID)
@@ -2544,6 +2697,8 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 				return false
 			}
 			log.Printf("[subagent] CANCELLED: sub=%s role=%s duration=%s", subAgentID, roleDef.ID, duration)
+			// 硬取消路径清残留手动暂停标记（竞态：StopRunning 前节点已被取消）。
+			d.ClearPauseNode(subAgentID)
 			return false
 		}
 		partial := ""
@@ -2616,6 +2771,12 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	}
 	if result.VerifyNote != "" {
 		summary = fmt.Sprintf("【校验:通过(%s)】\n%s", result.VerifyNote, summary)
+	}
+	// worktree 隔离派发（TODO 第9⑤/#10⑤）成功收尾：产出全量 patch 落盘并把
+	// 【worktree 交付】附言拼进摘要——meta 据此经 merge_worktree review/merge/reject
+	// 走合并门；句柄不存在（非 worktree 派发）返回空串零打扰。
+	if note := d.worktreePatchNote(ctx, subAgentID); note != "" {
+		summary += note
 	}
 	d.notify(parentID, subAgentID, summary, files)
 	return false
@@ -2769,16 +2930,12 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// Dispatcher 自身实现 PendingChildrenChecker（PendingChildren/WaitForAnyChild）。
 	sub = sub.WithPendingChildrenChecker(d)
 
-	// 心跳检活：注入活动上报回调（generateOnce/工具派发时 Store 当前时间，巡检据此判假死）。
-	// 回调同时把活动沿 parentID 链向上冒泡（TODO #25-3）：domain 等子期间自身无活动，
-	// 靠后代活动刷新保持存活，巡检不误杀合法等待。
-	if actVal, ok := d.activity.Load(subAgentID); ok {
-		act := actVal.(*atomic.Int64)
-		sub = sub.WithActivityReporter(func() {
-			now := time.Now().UnixNano()
-			act.Store(now)
-			d.bubbleActivity(subAgentID, now)
-		})
+	// 心跳检活：注入语义化活动上报回调（TODO 第10项②证据化——llm_start/llm_end/tool:<名>/
+	// tool_end/stream/keepalive 各 kind 由 activityEvidence.report 分类记录，巡检据此
+	// 区分"真静默"与"在飞 LLM/长工具"）。回调同时把活动沿 parentID 链向上冒泡
+	//（TODO #25-3）：domain 等子期间自身无活动，靠后代活动刷新保持存活，巡检不误杀合法等待。
+	if e := d.activityEvidenceFor(subAgentID); e != nil {
+		sub = sub.WithActivityReporter(d.activityReporterFn(subAgentID))
 	}
 
 	// 注入会话级日志器：派生 session-scoped logger，使子 Agent LLM I/O 写入同一会话的 session_logs。
@@ -2817,6 +2974,12 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// TODO 第七项③：各路注入 runes 逐路记账（ctx_inject 日志），供注入收口定默认值。
 	var prefixes []string
 	injectRunes := map[string]int{}
+	// 项目自述（TODO 第10项⑦）：workDir 根部 AGENTS.md/CLAUDE.md。置于所有前缀首位——
+	// 它是会话内最稳的段（文件不变则逐字节一致），越靠前越利于跨派发前缀缓存复用。
+	if brief := d.projectBriefPrefix(ctx); brief != "" {
+		prefixes = append(prefixes, brief)
+		injectRunes["agents_md"] = len([]rune(brief))
+	}
 	if sp := d.buildSharedPrefix(ctx, parentID, domain); sp != "" {
 		prefixes = append(prefixes, sp)
 		injectRunes["shared_prefix"] = len([]rune(sp))
@@ -2862,10 +3025,10 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	if len(prefixes) > 0 {
 		task = strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + task
 	}
-	// TODO 第七项③：四路注入 runes 记账（数据供 ⑥ 参数化 knobs 与 P0-4 收口 <20K 定默认值）。
+	// TODO 第七项③：五路注入 runes 记账（数据供 ⑥ 参数化 knobs 与 P0-4 收口 <20K 定默认值）。
 	if roleDef.ID != "meta" {
-		log.Printf("[subagent] ctx_inject: sub=%s role=%s shared_prefix=%d project_prefs=%d skill_recall=%d block_recall=%d task=%d runes",
-			subAgentID, roleDef.ID, injectRunes["shared_prefix"], injectRunes["project_prefs"], injectRunes["skill_recall"], injectRunes["block_recall"], len([]rune(origTask)))
+		log.Printf("[subagent] ctx_inject: sub=%s role=%s agents_md=%d shared_prefix=%d project_prefs=%d skill_recall=%d block_recall=%d task=%d runes",
+			subAgentID, roleDef.ID, injectRunes["agents_md"], injectRunes["shared_prefix"], injectRunes["project_prefs"], injectRunes["skill_recall"], injectRunes["block_recall"], len([]rune(origTask)))
 	}
 
 	vk := resolveVerifyKind(verifyKind, roleDef.ID, mode)
@@ -3122,17 +3285,17 @@ func (d *Dispatcher) engineLLMForJudge(ctx context.Context, roleID, subAgentID s
 	}
 }
 
-// engineLLMKeepalive 是引擎辅助 LLM 调用期间的心跳保活间隔（thinking 模型 judge
-// 单次生成可达数分钟，期间子 Agent 无 LLM/工具活动，不保活会被巡检误判假死）。
-const engineLLMKeepalive = 30 * time.Second
+// engineLLMKeepalive 退役（TODO 第10项②证据化）：引擎辅助 LLM 在飞改由
+// activityEvidence.beginAuxLLM/endAuxLLM 豁免巡检，保活 ticker 盲报随之移除。
 
-// wrapEngineLLM 为引擎辅助 LLM 调用（自检 judge / plan_execute 规划）加超时与心跳保活。
+// wrapEngineLLM 为引擎辅助 LLM 调用（自检 judge / plan_execute 规划）加超时与活动豁免。
 // 两个盲区一起堵（2026-08-19 引擎 Agent 70 分钟事故）：
 //  1. 超时：该路径无 CallLLM 包装，SDK 默认 600s/请求 × provider 3 次重试 × judge 内部
 //     重试叠加可烧 ~70 分钟；外层 WithTimeout 包住整次调用（含 provider 重试），到期后
 //     后续重试因 ctx 已耗尽立即失败（快速失败，不再重试-再超时循环）。
-//  2. 心跳：engineLLMStream 流式消费不 touchActivity，judge 长生成期间子 Agent 零活动
-//     会被巡检按假死杀掉；保活定时器补上报（真实挂死由墙钟兜底，不无限续命）。
+//  2. 巡检：judge 长生成期间 ReAct 主循环零活动，证据化判定（TODO 第10项②）把在飞 LLM
+//     一律豁免——beginAuxLLM/endAuxLLM 标记在飞态即可，旧保活 ticker（盲报刷新 lastTS
+//     续命）随之退役；真实挂死由 engineLLMTimeout 与子 Agent 墙钟兜底。
 func (d *Dispatcher) wrapEngineLLM(subAgentID string, inner agent.LLMComplete) agent.LLMComplete {
 	return func(ctx context.Context, prompt string) (string, error) {
 		if d.engineLLMTimeout > 0 {
@@ -3143,26 +3306,10 @@ func (d *Dispatcher) wrapEngineLLM(subAgentID string, inner agent.LLMComplete) a
 		if subAgentID == "" {
 			return inner(ctx, prompt)
 		}
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			ticker := time.NewTicker(engineLLMKeepalive)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-done:
-					return
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					now := time.Now().UnixNano()
-					if av, ok := d.activity.Load(subAgentID); ok {
-						av.(*atomic.Int64).Store(now)
-					}
-					d.bubbleActivity(subAgentID, now)
-				}
-			}
-		}()
+		if e := d.activityEvidenceFor(subAgentID); e != nil {
+			e.beginAuxLLM(time.Now().UnixNano())
+			defer e.endAuxLLM(time.Now().UnixNano())
+		}
 		return inner(ctx, prompt)
 	}
 }
@@ -3377,9 +3524,14 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		sub = sub.WithLiveEvents(func(ev agent.LiveEvent) { forwarder(sid, ev) })
 	}
 
-	subCtx := context.Background()
+	// 中断传播基底（TODO 第10④）：入站 ctx 携带会话 stopCtx 时以其为基底（恢复路径
+	// 同样受会话 stop 管辖），未携带回退 Background。
+	subCtx := tool.StopContextFrom(ctx)
+	if subCtx == nil {
+		subCtx = context.Background()
+	}
 	subCtx = tool.WithSessionID(subCtx, sid)
-	// 每会话工作目录（S2）：subCtx 由 Background 重建，从入站 ctx（resumePausedDomain
+	// 每会话工作目录（S2）：subCtx 由基底重建，从入站 ctx（resumePausedDomain
 	// 已注入）显式重注入，保证 resume 的 domain Agent 工具执行落在会话工作目录。
 	subCtx = tool.WithWorkDir(subCtx, tool.WorkDirFromContext(ctx))
 	cancel := context.CancelFunc(func() {})
@@ -3388,11 +3540,9 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	}
 	t.Resume(pausedNodeID, cancel)
 	d.running.Store(pausedNodeID, sub)
-	// 心跳（TODO #25-3）：resume 的 domain 注册 activity，其子 Agent 活动冒泡保活；
+	// 心跳（TODO #25-3）：resume 的 domain 注册 activity 证据，其子 Agent 活动冒泡保活；
 	// 巡检超 domain 阈值判假死。defer 清理与子 Agent 派发路径一致。
-	act := new(atomic.Int64)
-	act.Store(time.Now().UnixNano())
-	d.activity.Store(pausedNodeID, act)
+	d.activity.Store(pausedNodeID, newEvidence())
 	defer d.activity.Delete(pausedNodeID)
 	defer d.running.Delete(pausedNodeID)
 	defer d.heldSkills.Delete(pausedNodeID)
@@ -3658,12 +3808,10 @@ func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task st
 			t.SetCancel(subAgentID, cancel)
 		}
 	}
-	// 心跳检活：叶子注册 activity + subMeta（巡检超时 cancel -> childCtx err -> 本方法返回错误）。
+	// 心跳检活：叶子注册 activity 证据 + subMeta（巡检超时 cancel -> childCtx err -> 本方法返回错误）。
 	isLeaf := roleDef.ID != "domain" && roleDef.ID != "meta"
 	if isLeaf && d.heartbeatTimeout > 0 {
-		act := new(atomic.Int64)
-		act.Store(time.Now().UnixNano())
-		d.activity.Store(subAgentID, act)
+		d.activity.Store(subAgentID, newEvidence())
 		d.subMeta.Store(subAgentID, &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: sid})
 		d.ensurePatrol()
 		defer func() {

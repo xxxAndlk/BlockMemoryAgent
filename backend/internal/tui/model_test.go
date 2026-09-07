@@ -129,6 +129,11 @@ func (m *mockAgentForPlan) CancelAgent(ctx context.Context, sessionID, instID st
 	return nil
 }
 
+// PauseAgent 暂停 domain 支路，测试实现返回 nil。
+func (m *mockAgentForPlan) PauseAgent(ctx context.Context, sessionID, instID string) error {
+	return nil
+}
+
 // Shutdown 是 mockAgentForPlan 的空实现。
 func (m *mockAgentForPlan) Shutdown(ctx context.Context) error { return nil }
 

@@ -102,9 +102,15 @@ func readContractFile(workdir, p string) (string, bool) {
 	return string(data), true
 }
 
-// runContractChecks 逐条核对契约。workdir 为工作目录（文件相对路径解析基准）。
+// runContractChecks 逐条核对契约，检查基准为主仓库工作目录（既有兄弟域全完成
+// 检查路径）。worktree 合并门需要以副本为基准，走 runContractChecksIn。
 func (d *Dispatcher) runContractChecks(c *tool.Contract, specFiles []string) contractReport {
-	workdir := d.subAgentWorkDir()
+	return d.runContractChecksIn(d.subAgentWorkDir(), c, specFiles)
+}
+
+// runContractChecksIn 逐条核对契约；workdir 为文件相对路径解析基准
+//（主仓库工作目录或 worktree 副本，TODO 第10⑤ 合并门对副本跑检查）。
+func (d *Dispatcher) runContractChecksIn(workdir string, c *tool.Contract, specFiles []string) contractReport {
 	var rep contractReport
 
 	// 1. 跨域符号：声明文件存在 + 引用方含引用点。

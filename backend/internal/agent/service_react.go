@@ -63,6 +63,10 @@ type ReactService struct {
 	// MetaAgent 时把 IdleRoster 包装进记忆管线注入【空闲领域Agent】段。
 	// 为 nil 时零注入。
 	idleRosterProvider IdleRosterProvider
+	// activityEvidenceProvider 可选的活动证据查询器（TODO 第10项②展示面），
+	// 由 bootstrap 注入 subagent.Dispatcher 实现；ListAgents 据此填充各节点的
+	// ActivityKind/LastActivityAgo。为 nil 时字段留空。
+	activityEvidenceProvider ActivityEvidenceProvider
 	// idleTTLArmer 可选的 Idle TTL 武装器（Domain 热驻），sendMessage 在新用户
 	// 消息到达时调用 ArmIdleTTLs（完成后一直热存，TTL 只在用户消息后启动）。
 	// 为 nil 时零行为。
@@ -551,6 +555,20 @@ type ReactRuntimeConfig struct {
 	// SessionMaxWallClockMin 会话全局墙钟上限（分钟，TODO #25-4 硬止损）。
 	// 从会话创建起超时未终止则级联取消全部节点 + 会话置 error；<=0 关闭（默认）。
 	SessionMaxWallClockMin int
+	// ToolResultDumpRunes 工具结果统一收口阈值（TODO 第9项②，rune）；<=0 关闭
+	//（未注入 ReactRuntimeConfig 的测试场景默认关闭；生产由 config applyDefaults 兜底 8000）。
+	ToolResultDumpRunes int
+	// ToolResultDigestRunes 收口后头部摘录 rune 数；<=0 按默认 2000。
+	ToolResultDigestRunes int
+	// StaleToolEvictRounds 陈旧只读工具结果驱逐轮数（TODO 第9项③）；<=0 关闭（生产默认 20）。
+	StaleToolEvictRounds int
+	// AgentsMDMaxRunes AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦，rune）；<=0 关闭（生产默认 4000）。
+	AgentsMDMaxRunes int
+	// ToolParallelEnabled 轮内并行工具执行开关（TODO 第9项①）；nil=关闭
+	//（未注入 ReactRuntimeConfig 的测试场景零值稳定；生产 config 默认 true）。
+	ToolParallelEnabled *bool
+	// ToolParallelMaxConcurrency 并行工具并发上限；<=0 按默认 4。
+	ToolParallelMaxConcurrency int
 }
 
 // SetRuntimeConfig 注入 ReAct 主循环运行时参数（见 ReactRuntimeConfig）。
@@ -586,6 +604,20 @@ func (s *ReactService) SetIdleRosterProvider(p IdleRosterProvider) {
 // 全部 idle domain 的加权销毁倒计时。由 bootstrap 注入 subagent.Dispatcher。
 func (s *ReactService) SetIdleTTLArmer(a IdleTTLArmer) {
 	s.idleTTLArmer = a
+}
+
+// ActivityEvidenceProvider 查询子 Agent 活动证据（TODO 第10项②展示面）；
+// 由 subagent.Dispatcher 实现（ActivityEvidenceOf）。
+type ActivityEvidenceProvider interface {
+	// ActivityEvidenceOf 返回该 Agent 的最近活动种类与距今时长；ok=false 表示
+	// 无活动监控条目（meta/已终结/热驻 Idle）。
+	ActivityEvidenceOf(agentID string) (kind string, lastAgo time.Duration, ok bool)
+}
+
+// SetActivityEvidenceProvider 注入活动证据查询器，ListAgents 据此填充各节点的
+// ActivityKind/LastActivityAgo。由 bootstrap 注入 subagent.Dispatcher。
+func (s *ReactService) SetActivityEvidenceProvider(p ActivityEvidenceProvider) {
+	s.activityEvidenceProvider = p
 }
 
 // SetSessionAgentWaker 注入会话挂起唤醒器（Domain 热驻），sendMessage 恢复路径
@@ -652,6 +684,28 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 	}
 	if c.ToolOutputHistoryMaxRunes != 0 {
 		lc.ToolOutputMaxRunes = max(c.ToolOutputHistoryMaxRunes, 0)
+	}
+	// 上下文收口三件套 + 项目自述注入（TODO 第9项②③④ + 第10项⑦）：
+	// 未注入（零值）保持关闭，测试场景零行为变化；生产由 bootstrap 注入 config 值
+	//（applyDefaults 兜底 8000/2000/20/4000）。负数（显式关闭）归一为 0。
+	if c.ToolResultDumpRunes != 0 {
+		lc.ToolResultDumpRunes = max(c.ToolResultDumpRunes, 0)
+	}
+	if c.ToolResultDigestRunes != 0 {
+		lc.ToolResultDigestRunes = max(c.ToolResultDigestRunes, 0)
+	}
+	if c.StaleToolEvictRounds != 0 {
+		lc.StaleToolEvictRounds = max(c.StaleToolEvictRounds, 0)
+	}
+	if c.AgentsMDMaxRunes != 0 {
+		lc.AgentsMDMaxRunes = max(c.AgentsMDMaxRunes, 0)
+	}
+	// 轮内并行工具执行（TODO 第9项①）：未注入（nil）保持关闭；生产 config 默认 true。
+	if c.ToolParallelEnabled != nil {
+		lc.ToolParallelEnabled = c.ToolParallelEnabled
+	}
+	if c.ToolParallelMaxConcurrency != 0 {
+		lc.ToolParallelMaxConcurrency = max(c.ToolParallelMaxConcurrency, 1)
 	}
 	// TokenBudget 由 LoopConfigByRole 按角色注入（默认 150000，上下文阈值），
 	// 不再从累计 TokenBudgetPerGoal 取值（累计预算已退役，见 roleTokenBudget）。
@@ -1115,6 +1169,33 @@ func (s *ReactService) Query(ctx context.Context, sessionID string, q Query) (Re
 	case QueryKindTokenMetrics:
 		// 按 agent|model 聚合的 token 消耗（HTTP 线型）。
 		return s.tokenMetricsQueryResult(ctx, sessionID), nil
+	case QueryKindEfficiency:
+		// 会话效率一等指标（TODO 第9项⑥/第10项③）：五项指标 + 支路成本表。
+		return s.efficiencyQueryResult(ctx, sessionID), nil
+	case QueryKindAgentEvents:
+		// 子 Agent 审计下钻（TODO 第10项③）：按实例 ID 取 agent_events 逐轮事件。
+		agentID, _ := q.Args["agent"].(string)
+		limit, _ := q.Args["limit"].(int)
+		offset, _ := q.Args["offset"].(int)
+		return s.agentEventsQueryResult(ctx, sessionID, agentID, limit, offset), nil
+	case QueryKindWorktrees:
+		// 会话 worktree 副本清单（TODO 第9⑤/#10⑤）：经结构化接口断言访问 Dispatcher。
+		// 未接线（nil/未实现）返回空列表，端点可安全轮询。
+		if wr, ok := s.stopMarker.(WorktreeReader); ok {
+			return Result{Data: wr.ListWorktrees(sessionID)}, nil
+		}
+		return Result{Data: []WorktreeView{}}, nil
+	case QueryKindWorktreeDiff:
+		// 指定 worktree 的全量 diff（TODO 第10⑤ review 数据源）。
+		agentID, _ := q.Args["agent"].(string)
+		if wr, ok := s.stopMarker.(WorktreeReader); ok {
+			diff, err := wr.WorktreeDiff(sessionID, agentID)
+			if err != nil {
+				return Result{}, err
+			}
+			return Result{Data: map[string]any{"agent_id": agentID, "diff": diff}}, nil
+		}
+		return Result{}, fmt.Errorf("worktree 能力未接线（dispatcher 未注入）")
 	default:
 		// 未知查询类型返回空结果。
 		return Result{}, nil
@@ -1153,6 +1234,29 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		goal, _ := cmd.Args["goal"].(string)
 		_, err := s.SwitchTopic(ctx, sessionID, name, goal)
 		return err
+	case ControlOpTrustMode:
+		// 信任模式切换（TODO 第10⑥）：提取 mode 校验枚举后落会话，下一工具调用生效。
+		mode, _ := cmd.Args["mode"].(string)
+		return s.SetSessionTrustMode(sessionID, mode)
+	case ControlOpWorktree:
+		// worktree 合并门操作（TODO 第9⑤/#10⑤）：merge 走合并门，reject 驳回回信。
+		action, _ := cmd.Args["action"].(string)
+		agentID, _ := cmd.Args["agent"].(string)
+		comments, _ := cmd.Args["comments"].(string)
+		wo, ok := s.stopMarker.(WorktreeOperator)
+		if !ok {
+			return fmt.Errorf("worktree 能力未接线（dispatcher 未注入）")
+		}
+		switch action {
+		case "merge":
+			_, err := wo.MergeWorktree(ctx, sessionID, agentID)
+			return err
+		case "reject":
+			_, err := wo.RejectWorktree(ctx, sessionID, agentID, comments)
+			return err
+		default:
+			return fmt.Errorf("unknown worktree action: %s（可选 merge|reject，review 走 Query worktree-diff）", action)
+		}
 	default:
 		// 未知操作返回错误。
 		return fmt.Errorf("unknown control op: %s", cmd.Op)
@@ -1226,6 +1330,52 @@ func (s *ReactService) ApprovalHook() tool.ApprovalHookFunc {
 			return allow, nil
 		}
 	}
+}
+
+// SetDefaultTrustMode 设置新建会话的初始信任模式（TODO 第10⑥）：config agent.trust_mode
+// 经 bootstrap 注入。非法值返回错误（启动期 fail-fast），空串清空（回退现网语义）。
+func (s *ReactService) SetDefaultTrustMode(mode string) error {
+	if mode == "" {
+		s.store.mu.Lock()
+		s.store.defaultTrustMode = ""
+		s.store.mu.Unlock()
+		return nil
+	}
+	if !tool.ValidTrustMode(mode) {
+		return fmt.Errorf("invalid trust mode %q (want suggest|auto-edit|full-auto)", mode)
+	}
+	s.store.mu.Lock()
+	s.store.defaultTrustMode = mode
+	s.store.mu.Unlock()
+	return nil
+}
+
+// SetSessionTrustMode 切换既有会话的信任模式（TODO 第10⑥，HTTP/TUI 切换通道）：
+// atomic 存储即时生效——正在阻塞的 ReAct 循环下一次工具派发即按新模式裁决。
+// 非法值返回错误（HTTP 400 / TUI 报错）；会话不存在返回错误。
+func (s *ReactService) SetSessionTrustMode(sessionID, mode string) error {
+	if !tool.ValidTrustMode(mode) {
+		return fmt.Errorf("invalid trust mode %q (want suggest|auto-edit|full-auto)", mode)
+	}
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	sess.setTrustMode(mode)
+	return nil
+}
+
+// SessionTrustMode 读取会话当前信任模式（HTTP GET 展示用）；未设置返回空串。
+func (s *ReactService) SessionTrustMode(sessionID string) string {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return ""
+	}
+	return sess.currentTrustMode()
 }
 
 // parseApproval 把用户对破坏性操作确认的答复解析为裁决：明确同意 → true；
@@ -1469,7 +1619,7 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 		if name == "" {
 			name = n.Role
 		}
-		instances = append(instances, AgentInstance{
+		inst := AgentInstance{
 			Name:      name,
 			Role:      n.Role,
 			ModuleID:  n.ID,
@@ -1478,7 +1628,16 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 			Domain:    n.Domain,
 			Goal:      n.Task,
 			RoleDefID: n.Role,
-		})
+		}
+		// 活动证据展示面（TODO 第10项②）：运行中节点附"最近活动种类 + 距今时长"，
+		// TUI/Web 渲染为 "in <tool> · active Xs ago"，让假死可见可判。
+		if s.activityEvidenceProvider != nil {
+			if kind, ago, ok := s.activityEvidenceProvider.ActivityEvidenceOf(n.ID); ok {
+				inst.ActivityKind = kind
+				inst.LastActivityAgo = ago.Truncate(time.Second).String()
+			}
+		}
+		instances = append(instances, inst)
 	}
 	return instances, nil
 }
@@ -1528,11 +1687,62 @@ func (s *ReactService) CancelAgent(ctx context.Context, sessionID, instID string
 	return nil
 }
 
+// PauseAgent 手动暂停指定 domain 支路（TODO 第10项③ 审计面止血动作）。
+// 仅 Role=domain 且 Running 的节点可暂停：先 MarkPauseNode 让 dispatcher 收尾分流到
+// Pause 分支（SaveMessages + tree.Pause，热驻槽 parked 可 ResumePaused 续），再
+// StopRunning 触发该支路 cancel；StopRunning 落空（节点已终态等）则回滚标记返回错误。
+// 非热驻叶子请用 CancelAgent；全树软停请用 Stop——两者语义不同勿混。
+func (s *ReactService) PauseAgent(ctx context.Context, sessionID, instID string) error {
+	s.store.mu.Lock()
+	session, ok := s.store.sessions[sessionID]
+	s.store.mu.Unlock()
+	if !ok {
+		return ErrSessionNotFound
+	}
+	t := s.TreeFor(sessionID)
+	node, ok := t.Get(instID)
+	if !ok {
+		return ErrAgentNotFound
+	}
+	if node.Role != "domain" {
+		return fmt.Errorf("%w: 仅 domain 支路支持手动暂停（叶子用 cancel，全树用 stop）", ErrInvalidSessionState)
+	}
+	if node.Status != orchestrator.StatusRunning {
+		return fmt.Errorf("%w: 支路 %s 状态 %s 不可暂停", ErrInvalidSessionState, instID, node.Status)
+	}
+	// 先登记暂停意图，再触发 cancel：runSubAgent/runDomainTask 的 Canceled 分支
+	// 据此路由到 Pause 收尾而非软停/硬销毁。
+	if pm, ok := s.stopMarker.(interface{ MarkPauseNode(string) }); ok {
+		pm.MarkPauseNode(instID)
+	} else {
+		return fmt.Errorf("%w: dispatcher 未接线，无法暂停", ErrInvalidSessionState)
+	}
+	if !t.StopRunning(instID) {
+		// cancel 未触发（节点已终态竞态）：回滚标记防幽灵暂停意图。
+		if pm, ok := s.stopMarker.(interface{ ClearPauseNode(string) }); ok {
+			pm.ClearPauseNode(instID)
+		}
+		return fmt.Errorf("%w: 支路 %s 已不在运行", ErrInvalidSessionState, instID)
+	}
+	s.store.addEvent(session, eventkind.System, "System",
+		fmt.Sprintf("手动暂停 domain 支路 %s（%s），恢复请用 resume", instID, node.Domain),
+		"", "", "", "", "", true)
+	log.Printf("[service] PAUSE-AGENT: session=%s agent=%s domain=%s", sessionID, instID, node.Domain)
+	return nil
+}
+
 // Shutdown 取消所有正在运行的会话。Domain 热驻模式下同时销毁全部热驻槽
 // （agent_messages 保留，进程重启后 idle 树节点标 done）。
 func (s *ReactService) Shutdown(ctx context.Context) error {
 	if w, ok := s.sessionAgentWaker.(interface{ DestroyAllIdle() }); ok {
 		w.DestroyAllIdle()
+	}
+	// worktree 残留副本清理（TODO 第9⑤）：进程退出前 best-effort 移除全部会话
+	// 未合并副本（patch 文件保留），防 git worktree 元数据悬挂。
+	if wo, ok := s.stopMarker.(WorktreeOperator); ok {
+		for _, sid := range s.store.sessionIDs() {
+			wo.CleanupSessionWorktrees(sid)
+		}
 	}
 	s.store.shutdown()
 	return nil
@@ -1924,6 +2134,11 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	runCtx := tool.WithSessionID(ctx, session.ID)
 	// 注入每会话工作目录（空则原样返回，回落 Executor 默认目录）。
 	runCtx = tool.WithWorkDir(runCtx, session.workDir)
+	// 注入会话级 stopCtx（TODO 第10④）：子派发以此取消基底，stop 窗口期新派发即刻终止。
+	runCtx = tool.WithStopContext(runCtx, session.stopCtx)
+	// 注入信任模式读取器（TODO 第10⑥）：闭包实时读会话 atomic 值，HTTP/TUI 中途切换
+	// 下一工具调用即生效；未设置返回空串 → Registry 回退现网语义。
+	runCtx = tool.WithTrustModeFunc(runCtx, session.currentTrustMode)
 
 	// 首条消息用户图片（Alt+V 粘贴）注入 runCtx 后一次性消费置 nil。
 	if len(session.firstTurnImages) > 0 {
@@ -2044,6 +2259,10 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	runCtx := tool.WithSessionID(ctx, session.ID)
 	// 注入每会话工作目录（空则原样返回，回落 Executor 默认目录）。
 	runCtx = tool.WithWorkDir(runCtx, session.workDir)
+	// 注入会话级 stopCtx（TODO 第10④）：续跑路径同 runSession，子派发以此取消基底。
+	runCtx = tool.WithStopContext(runCtx, session.stopCtx)
+	// 注入信任模式读取器（TODO 第10⑥）：同 runSession，中途切换下一工具调用生效。
+	runCtx = tool.WithTrustModeFunc(runCtx, session.currentTrustMode)
 
 	// 使用最新用户消息作为本轮输入，并以之前的历史作为种子。
 	// 倒序取最后一条 user 消息（中途可能追加了澄清/审批答复等非 user 项），
@@ -2362,11 +2581,16 @@ func sessionContext(session *reactInternalSession) context.Context {
 }
 
 // restartSessionContext 为被恢复的会话创建一个全新的可取消上下文，
-// 确保之前被取消的会话能够再次运行。
+// 确保之前被取消的会话能够再次运行。stopCtx（TODO 第10④）同步重建：
+// 上次 Stop/destroy 已把旧 stopCtx 取消，续跑派发的子 Agent 必须换绑新基底，
+// 否则恢复后新派发全部继承已取消 context 秒死。
 func restartSessionContext(session *reactInternalSession) {
 	ctx, cancel := context.WithCancel(context.Background())
 	session.ctx = ctx
 	session.cancelFn = cancel
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+	session.stopCtx = stopCtx
+	session.stopCancel = stopCancel
 }
 
 // sendMessage 向会话发送一条消息，并在必要时恢复会话运行。
@@ -2540,7 +2764,9 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 //   - 出错：回退 pauseSession(PauseOnChild)，不丢已持久化上下文（防跑飞）。
 func (s *ReactService) resumePausedDomain(session *reactInternalSession, pausedNodeID string) {
 	ctx := sessionContext(session)
-	res, err := s.resumeDispatcher.ResumePaused(tool.WithWorkDir(tool.WithSessionID(ctx, session.ID), session.workDir), pausedNodeID)
+	// stopCtx 注入（TODO 第10④）：恢复路径派生的子 ctx 同样以会话 stopCtx 为取消基底。
+	res, err := s.resumeDispatcher.ResumePaused(
+		tool.WithStopContext(tool.WithWorkDir(tool.WithSessionID(ctx, session.ID), session.workDir), session.stopCtx), pausedNodeID)
 	if err != nil {
 		s.store.addEvent(session, eventkind.Error, "System", fmt.Sprintf("恢复暂停领域 Agent 失败，已回退暂停态: %v", err), "", "", "", "", "", false)
 		s.pauseSession(session, session.History, PauseOnChild)
@@ -2729,6 +2955,9 @@ func (s *ReactService) cancel(ctx context.Context, sessionID string) error {
 	// 取出取消函数并在解锁后调用，避免在持有锁时执行取消回调。
 	cancelFn := session.cancelFn
 	session.cancelFn = nil
+	// 中断传播（TODO 第10④）：硬取消同步取消 stopCtx。
+	stopCancel := session.stopCancel
+	session.stopCancel = nil
 	// 将会话标记为错误状态并记录结束时间。
 	session.Status = enums.SessionStatusError
 	session.Result = "cancelled by user"
@@ -2743,9 +2972,18 @@ func (s *ReactService) cancel(ctx context.Context, sessionID string) error {
 	if cancelFn != nil {
 		cancelFn()
 	}
+	// 中断传播（TODO 第10④）：stopCtx 取消在飞子 Agent 基底（窗口期新派发/孙代即刻终止）。
+	if stopCancel != nil {
+		stopCancel()
+	}
 	// 级联取消在跑/暂停子 Agent（TODO #25-2）：会话终止这一刻，树中节点逐个 Cancel，
 	// 子 goroutine 经 context.Canceled 路径退出（runSubAgent 对该路径不重复通知）。
 	s.cascadeCancelTree(sessionID)
+	// worktree 残留副本清理（TODO 第9⑤）：硬取消即会话终态，未合并副本 best-effort
+	// 强制移除（patch 文件保留供事后审计）。
+	if wo, ok := s.stopMarker.(WorktreeOperator); ok {
+		wo.CleanupSessionWorktrees(sessionID)
+	}
 	return nil
 }
 
@@ -2810,6 +3048,9 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 	// 3. 取消 MetaAgent 当前 API 调用：session ctx 取消打断流式 LLM（provider 直透），
 	//    runSession 的 context.Canceled 分支落暂停态（软停止标记区分于硬取消）。
 	cancelFn := session.cancelFn
+	// 中断传播（TODO 第10④）：stopCtx 同步取消——stop 窗口期新派发的子 Agent 与深层
+	// 孙代即刻随会话终止，不再依赖树快照逐节点 StopRunning。
+	stopCancel := session.stopCancel
 	// 4. 销毁倒计时：旧模式启用（到期未续跑硬销毁含 Paused 节点）；
 	//    热驻模式停用——Idle 域由自身加权 TTL 治理（用户下次消息武装）。
 	if s.stopCountdown > 0 && !s.hotResident {
@@ -2827,6 +3068,11 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 	// 会话长期 Running，倒计时到期即整体销毁。
 	if cancelFn != nil {
 		cancelFn()
+	}
+	// 中断传播（TODO 第10④）：全树在飞子 Agent（含 stop 窗口期新派发/孙代）≤瞬时取消；
+	// domain 走既有软停收尾转 Idle 热驻，续跑前 restartSessionContext 重建 stopCtx。
+	if stopCancel != nil {
+		stopCancel()
 	}
 
 	if s.hotResident {
@@ -2864,6 +3110,8 @@ func (s *ReactService) destroyAfterSoftStop(sessionID string) {
 	session.destroyAt = nil
 	cancelFn := session.cancelFn
 	session.cancelFn = nil
+	stopCancel := session.stopCancel
+	session.stopCancel = nil
 	s.store.mu.Unlock()
 
 	if s.stopMarker != nil {
@@ -2872,7 +3120,15 @@ func (s *ReactService) destroyAfterSoftStop(sessionID string) {
 	if cancelFn != nil {
 		cancelFn()
 	}
+	// 中断传播（TODO 第10④）：硬销毁同步取消 stopCtx（与 cancel 同语义）。
+	if stopCancel != nil {
+		stopCancel()
+	}
 	s.cascadeCancelTree(sessionID)
+	// worktree 残留副本清理（TODO 第9⑤）：软停超时硬销毁等同会话终态。
+	if wo, ok := s.stopMarker.(WorktreeOperator); ok {
+		wo.CleanupSessionWorktrees(sessionID)
+	}
 
 	s.store.mu.Lock()
 	if session.Status == enums.SessionStatusPausedOnChild || session.Status == enums.SessionStatusRunning || session.Status == enums.SessionStatusAwaitingClarify {
@@ -2943,6 +3199,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		PendingClarify: s.pendingClarify,
 		DestroyAt:      s.destroyAt,
 		ActiveTopicID:  s.activeTopicID,
+		TrustMode:      s.currentTrustMode(),
 	}
 }
 

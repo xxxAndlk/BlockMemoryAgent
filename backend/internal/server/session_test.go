@@ -126,6 +126,11 @@ func (m *mockAgentForServer) CancelAgent(ctx context.Context, sessionID, instID 
 	return nil
 }
 
+// PauseAgent 暂停 domain 支路，测试实现返回 nil。
+func (m *mockAgentForServer) PauseAgent(ctx context.Context, sessionID, instID string) error {
+	return nil
+}
+
 // Profile 返回用户画像，测试实现返回空。
 func (m *mockAgentForServer) Profile(ctx context.Context) (*userprofile.Profile, error) {
 	return &userprofile.Profile{}, nil

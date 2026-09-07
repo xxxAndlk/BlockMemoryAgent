@@ -5,11 +5,14 @@ import (
 	"net/http"      // HTTP 状态码
 	"os"            // work_dir 目录存在性校验
 	"path/filepath" // work_dir 转绝对路径
+	"strconv"       // 审计事件分页参数解析
+	"strings"       // 合并门 action 归一化
 	"time"          // 消息时间戳
 
 	"github.com/gin-gonic/gin" // Gin Web 框架
 
 	"github.com/blockmemory/agent/backend/internal/agent" // Agent 门面
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 )
 
 // HandleCreateSession 处理 POST /api/sessions。
@@ -133,6 +136,10 @@ type agentNode struct {
 	ParentID  string `json:"parent_id"`          // 父节点 ID（空表示顶层）
 	Goal      string `json:"goal,omitempty"`     // 目标（可选）
 	BlockID   string `json:"block_id,omitempty"` // 所属 Block ID（可选）
+	// 活动证据（TODO 第10项②展示面）：最近活动种类与距今时长，前端渲染
+	// "in <tool> · active Xs ago" 小字；空串表示无监控条目/非运行态。
+	ActivityKind    string `json:"activity_kind,omitempty"`
+	LastActivityAgo string `json:"last_activity_ago,omitempty"`
 }
 
 // HandleSessionAgents 处理 GET /api/sessions/{id}/agents。
@@ -171,15 +178,17 @@ func (m *SessionManager) HandleSessionAgents(c *gin.Context) {
 			blockID = blockIDByDomain[inst.Domain]
 		}
 		nodes = append(nodes, agentNode{
-			InstID:    inst.ModuleID,
-			RoleDefID: inst.RoleDefID,
-			Name:      inst.Name,
-			Type:      inst.Role,
-			Domain:    inst.Domain,
-			Status:    inst.Status,
-			ParentID:  inst.ParentID,
-			Goal:      goal,
-			BlockID:   blockID,
+			InstID:          inst.ModuleID,
+			RoleDefID:       inst.RoleDefID,
+			Name:            inst.Name,
+			Type:            inst.Role,
+			Domain:          inst.Domain,
+			Status:          inst.Status,
+			ParentID:        inst.ParentID,
+			Goal:            goal,
+			BlockID:         blockID,
+			ActivityKind:    inst.ActivityKind,
+			LastActivityAgo: inst.LastActivityAgo,
 		})
 	}
 
@@ -321,5 +330,173 @@ func (m *SessionManager) HandleSessionAgentCancel(c *gin.Context) {
 		"session_id": id,
 		"agent_id":   instID,
 		"status":     "cancelled",
+	})
+}
+
+// HandleSessionTrustMode 处理 POST /api/sessions/{id}/trust-mode（TODO 第10⑥）。
+// 职责：切换会话信任模式（suggest|auto-edit|full-auto），经 Control 通道下发；
+// atomic 即时生效——正在阻塞的 ReAct 循环下一次工具派发按新模式裁决。
+// 非法枚举 400；会话不存在 404。
+func (m *SessionManager) HandleSessionTrustMode(c *gin.Context) {
+	id := c.Param("id")
+	req, err := DecodeBody[struct {
+		Mode string `json:"mode"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	if !tool.ValidTrustMode(req.Mode) {
+		c.String(http.StatusBadRequest, "mode 非法（want suggest|auto-edit|full-auto）")
+		return
+	}
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
+		Op:   agent.ControlOpTrustMode,
+		Args: map[string]any{"mode": req.Mode},
+	}); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"session_id": id,
+		"trust_mode": req.Mode,
+	})
+}
+
+// HandleSessionAgentPause 处理 POST /api/sessions/{id}/agents/{aid}/pause
+// （TODO 第10项③ 审计面手动止血）。
+// 职责：暂停指定 domain 支路（dispatcher Pause 收尾，热驻槽 parked 可 resume 续跑）。
+// 仅 domain + Running 可暂停；叶子用 cancel 端点，全树用 stop 端点。
+func (m *SessionManager) HandleSessionAgentPause(c *gin.Context) {
+	id := c.Param("id")
+	instID := c.Param("aid")
+	if instID == "" {
+		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
+		return
+	}
+	if err := m.agent.PauseAgent(c.Request.Context(), id, instID); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"session_id": id,
+		"agent_id":   instID,
+		"status":     "paused",
+	})
+}
+
+// HandleSessionEfficiency 处理 GET /api/sessions/{id}/efficiency
+// （TODO 第9项⑥ 效率一等指标 + 第10项③ 支路成本表）。
+// 返回五项效率指标 + 支路成本表 + 角色级 token 统计（纯聚合，无新采集管道）。
+func (m *SessionManager) HandleSessionEfficiency(c *gin.Context) {
+	id := c.Param("id")
+	if _, err := m.agent.Get(c.Request.Context(), id); err != nil {
+		c.String(http.StatusNotFound, "会话不存在")
+		return
+	}
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{Kind: agent.QueryKindEfficiency})
+	if err != nil {
+		c.String(http.StatusInternalServerError, "%s", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, res.Data)
+}
+
+// HandleSessionAgentEvents 处理 GET /api/sessions/{id}/agents/{aid}/events
+// （TODO 第10项③ 子 Agent 审计下钻）。
+// 返回该实例逐轮事件（tool_call/answer 回放数据源）；limit/offset 分页（query 参数）。
+func (m *SessionManager) HandleSessionAgentEvents(c *gin.Context) {
+	id := c.Param("id")
+	instID := c.Param("aid")
+	if instID == "" {
+		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{
+		Kind: agent.QueryKindAgentEvents,
+		Args: map[string]any{"agent": instID, "limit": limit, "offset": offset},
+	})
+	if err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, res.Data)
+}
+
+// HandleSessionWorktrees 处理 GET /api/sessions/{id}/worktrees
+// （TODO 第9项⑤/#10项⑤ 合并门视图）。
+// 返回会话全部 worktree 副本快照（路径/分支/base/patch 路径与 stat/合并状态）。
+func (m *SessionManager) HandleSessionWorktrees(c *gin.Context) {
+	id := c.Param("id")
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{Kind: agent.QueryKindWorktrees})
+	if err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, res.Data)
+}
+
+// HandleSessionWorktreeDiff 处理 GET /api/sessions/{id}/worktrees/{aid}/diff
+// （TODO 第10项⑤ 合并门 review 数据源）：返回指定副本全量 diff（未收尾为实时 diff）。
+func (m *SessionManager) HandleSessionWorktreeDiff(c *gin.Context) {
+	id := c.Param("id")
+	instID := c.Param("aid")
+	if instID == "" {
+		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
+		return
+	}
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{
+		Kind: agent.QueryKindWorktreeDiff,
+		Args: map[string]any{"agent": instID},
+	})
+	if err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, res.Data)
+}
+
+// HandleSessionWorktreeAction 处理 POST /api/sessions/{id}/worktrees/{aid}/{action}
+// （TODO 第9项⑤/#10项⑤ 合并门操作）：action ∈ merge|reject；reject body 可带 comments。
+func (m *SessionManager) HandleSessionWorktreeAction(c *gin.Context) {
+	id := c.Param("id")
+	instID := c.Param("aid")
+	action := strings.ToLower(strings.TrimSpace(c.Param("action")))
+	if instID == "" {
+		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
+		return
+	}
+	switch action {
+	case "merge", "reject":
+	default:
+		c.String(http.StatusBadRequest, "action 必须为 merge 或 reject")
+		return
+	}
+	args := map[string]any{"action": action, "agent": instID}
+	if action == "reject" {
+		var req struct {
+			Comments string `json:"comments"`
+		}
+		if err := c.ShouldBindJSON(&req); err == nil {
+			args["comments"] = req.Comments
+		}
+	}
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{Op: agent.ControlOpWorktree, Args: args}); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"session_id": id,
+		"agent_id":   instID,
+		"action":     action,
+		"status":     "ok",
 	})
 }

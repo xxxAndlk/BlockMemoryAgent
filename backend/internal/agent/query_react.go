@@ -257,3 +257,179 @@ func (s *ReactService) mailboxQueryResult(ctx context.Context, sessionID string)
 	}
 	return Result{Data: msgs}
 }
+
+// efficiencyBranchWire 支路成本表行（HTTP 线型）。
+type efficiencyBranchWire struct {
+	NodeID       string   `json:"node_id"`
+	Role         string   `json:"role"`
+	Domain       string   `json:"domain"`
+	Task         string   `json:"task"`
+	Status       string   `json:"status"`
+	WallClockSec float64  `json:"wall_clock_sec"`
+	ToolCalls    int      `json:"tool_calls"`
+	Rounds       int      `json:"rounds"`
+	FilesWritten []string `json:"files_written"`
+}
+
+// efficiencyRoleWire 角色级 token/延迟统计行（HTTP 线型）。
+type efficiencyRoleWire struct {
+	Role           string `json:"role"`
+	Calls          int    `json:"calls"`
+	InputTokens    int64  `json:"input_tokens"`
+	OutputTokens   int64  `json:"output_tokens"`
+	AvgLatencyMs   int64  `json:"avg_latency_ms"`
+	P50InputTokens float64 `json:"p50_input_tokens"`
+	P95InputTokens float64 `json:"p95_input_tokens"`
+}
+
+// efficiencyQueryResult 组装会话效率一等指标（TODO 第9项⑥/第10项③）。
+// 五项指标：每交付文件 token 成本 / 每派发平均轮次 / 校验开销占比 / meta:domain token 比 /
+// 单呼输入 P50/P95；附支路成本表（按树节点）与角色级 token 统计。
+// 数据源纯聚合：agent_tree_nodes（墙钟/角色）+ agent_events（工具调用/交付文件）+
+// session_logs（token/延迟分位数），无新采集管道。
+func (s *ReactService) efficiencyQueryResult(ctx context.Context, sessionID string) Result {
+	// 角色级 token/延迟统计（session_logs.agent = 角色 ID）。
+	roleRows := []*store.RoleEfficiencyStats{}
+	var totalIn, totalOut int64
+	var verifyTok, domainTok, metaTok int64
+	if pg := s.store.pgStore; pg != nil {
+		if rs, err := pg.QuerySessionRoleEfficiency(ctx, sessionID); err == nil {
+			roleRows = rs
+			for _, r := range rs {
+				totalIn += r.InputTokens
+				totalOut += r.OutputTokens
+				tok := r.InputTokens + r.OutputTokens
+				switch {
+				case isVerifyRole(r.Agent):
+					verifyTok += tok
+				case r.Agent == "domain":
+					domainTok += tok
+				case r.Agent == "meta":
+					metaTok += tok
+				}
+			}
+		}
+	}
+	// 会话级单呼输入 P50/P95。
+	var p50, p95 float64
+	if pg := s.store.pgStore; pg != nil {
+		if a, b, err := pg.QuerySessionInputPercentiles(ctx, sessionID); err == nil {
+			p50, p95 = a, b
+		}
+	}
+	// 实例级事件统计（agent_events.agent_id = 实例 ID）。
+	eventStats := map[string]*store.AgentEventStats{}
+	var filesDelivered int
+	if pg := s.store.pgStore; pg != nil {
+		if es, err := pg.QueryAgentEventStats(ctx, sessionID); err == nil {
+			for _, e := range es {
+				eventStats[e.AgentID] = e
+				filesDelivered += len(e.WrittenFiles)
+			}
+		}
+	}
+
+	// 支路成本表：树节点逐支路（墙钟/轮次/工具调用/交付文件）。
+	branches := []efficiencyBranchWire{}
+	totalRounds, dispatches := 0, 0
+	if nodes, err := s.Tree(ctx, sessionID); err == nil {
+		for _, n := range nodes {
+			isMeta := n.Role == "meta"
+			toolCalls, files := 0, []string{}
+			if es := eventStats[n.ID]; es != nil {
+				toolCalls = es.ToolCalls
+				files = es.WrittenFiles
+			}
+			// 轮次口径：工具轮 + 1 个终答轮（ReAct 每轮要么派工具要么出终答）。
+			rounds := toolCalls + 1
+			if !isMeta {
+				dispatches++
+				totalRounds += rounds
+			}
+			wall := 0.0
+			if !n.Finished.IsZero() && n.Finished.After(n.Started) {
+				wall = n.Finished.Sub(n.Started).Seconds()
+			}
+			task := n.Task
+			if len([]rune(task)) > 80 {
+				task = string([]rune(task)[:80]) + "…"
+			}
+			branches = append(branches, efficiencyBranchWire{
+				NodeID: n.ID, Role: n.Role, Domain: n.Domain, Task: task,
+				Status: n.Status.String(), WallClockSec: wall,
+				ToolCalls: toolCalls, Rounds: rounds, FilesWritten: files,
+			})
+		}
+	}
+
+	totalTok := totalIn + totalOut
+	// 每派发平均轮次 = 非-meta 支路轮次和 / 派发数；无派发时 0。
+	avgRounds := 0.0
+	if dispatches > 0 {
+		avgRounds = float64(totalRounds) / float64(dispatches)
+	}
+	// 校验开销占比：校验/评审类角色 token / 会话总 token。
+	verifyShare := 0.0
+	if totalTok > 0 {
+		verifyShare = float64(verifyTok) / float64(totalTok)
+	}
+	// meta:domain token 比：domain 总 token 为分母（0 时报 0）。
+	metaDomainRatio := 0.0
+	if domainTok > 0 {
+		metaDomainRatio = float64(metaTok) / float64(domainTok)
+	}
+	// 每交付文件 token 成本：总 token / 去重交付文件数。
+	costPerFile := 0.0
+	if filesDelivered > 0 {
+		costPerFile = float64(totalTok) / float64(filesDelivered)
+	}
+
+	roleStats := make([]efficiencyRoleWire, 0, len(roleRows))
+	for _, r := range roleRows {
+		roleStats = append(roleStats, efficiencyRoleWire{
+			Role: r.Agent, Calls: r.Calls,
+			InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
+			AvgLatencyMs: r.AvgLatency.Milliseconds(),
+			P50InputTokens: r.P50InputTokens, P95InputTokens: r.P95InputTokens,
+		})
+	}
+
+	return Result{Data: map[string]any{
+		"session_id":           sessionID,
+		"tokens_per_file":      costPerFile,
+		"files_delivered":      filesDelivered,
+		"avg_rounds_per_dispatch": avgRounds,
+		"verify_token_share":   verifyShare,
+		"meta_domain_ratio":    metaDomainRatio,
+		"input_p50":            p50,
+		"input_p95":            p95,
+		"total_input_tokens":   totalIn,
+		"total_output_tokens":  totalOut,
+		"branches":             branches,
+		"role_stats":           roleStats,
+	}}
+}
+
+// isVerifyRole 判定角色是否校验/评审类（校验开销占比口径）：
+// 角色名含 review/verif/judge/audit 子串即计入（verif 覆盖 verify/verifier/verification）。
+func isVerifyRole(role string) bool {
+	r := strings.ToLower(role)
+	return strings.Contains(r, "review") || strings.Contains(r, "verif") ||
+		strings.Contains(r, "judge") || strings.Contains(r, "audit")
+}
+
+// agentEventsQueryResult 子 Agent 审计下钻（TODO 第10项③）：按实例 ID 取逐轮事件。
+// pgStore 不可用或查询失败返回空列表（审计面降级不报错）。
+func (s *ReactService) agentEventsQueryResult(ctx context.Context, sessionID, agentID string, limit, offset int) Result {
+	events := []map[string]any{}
+	if agentID != "" && s.store.pgStore != nil {
+		if evs, err := s.store.pgStore.QueryAgentEvents(ctx, sessionID, agentID, limit, offset); err == nil {
+			events = evs
+		}
+	}
+	return Result{Data: map[string]any{
+		"session_id": sessionID,
+		"agent_id":   agentID,
+		"events":     events,
+	}}
+}

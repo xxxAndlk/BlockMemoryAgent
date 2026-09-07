@@ -37,8 +37,8 @@ func (m *recordingProvider) Name() string { return "recording" }
 // TestBuildEnvBlock_StableNoTime 环境块跨调用字节一致且不含动态时间（TODO #40 块 1）。
 func TestBuildEnvBlock_StableNoTime(t *testing.T) {
 	dir := t.TempDir()
-	first := buildEnvBlock(dir)
-	second := buildEnvBlock(dir)
+	first := buildEnvBlock(dir, 0)
+	second := buildEnvBlock(dir, 0)
 	if first != second {
 		t.Fatalf("envBlock must be byte-stable across calls:\n%q\nvs\n%q", first, second)
 	}

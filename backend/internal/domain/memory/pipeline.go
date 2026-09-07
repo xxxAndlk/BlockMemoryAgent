@@ -296,6 +296,15 @@ func (p *Pipeline) compressedView(roleID, agentID string, history []agent.ReactM
 	if overBudget {
 		// 层级压缩：把新滑出保留段的中段历史压成一个压缩包并冻结新视图（见 pyramid.go）。
 		p.advanceCompression(agentID, history)
+		// 上下文层（context）变更日志（TODO 第10项①缓存纪律）：压缩即冻结新视图，
+		// 前缀缓存只在压缩这一轮失效——记录指纹供与 stable 层逐呼日志对账。
+		p.mu.RLock()
+		stNew, okNew := p.compressStates[agentID]
+		p.mu.RUnlock()
+		if okNew {
+			slog.Warn("[cache] context layer advanced (prefix cache invalidated this round)",
+				"agent", agentID, "role", roleID, "tail_start", stNew.TailStart, "bundles", len(stNew.Bundles))
+		}
 	}
 
 	p.mu.RLock()

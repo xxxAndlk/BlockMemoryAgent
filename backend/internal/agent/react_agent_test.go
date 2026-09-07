@@ -112,8 +112,9 @@ func TestReActAgent_Run_WithToolCall(t *testing.T) {
 	}
 }
 
-// TestReActAgent_ActivityReporter 验证 generateOnce 与工具派发均触发 activityReporter 回调，
-// 供 Dispatcher 心跳巡检判活。Run 单协程同步执行，plain int 计数器无需加锁。
+// TestReActAgent_ActivityReporter 验证 generateOnce 与工具派发均以语义化 kind 触发
+// activityReporter 回调（llm_start/llm_end/tool:<名>/tool_end，TODO 第10项②证据化），
+// 供 Dispatcher 巡检三态判定。Run 单协程同步执行，plain slice 无需加锁。
 func TestReActAgent_ActivityReporter(t *testing.T) {
 	dir := t.TempDir()
 	reg := tool.NewBuiltinRegistry(dir, nil, nil)
@@ -128,15 +129,25 @@ func TestReActAgent_ActivityReporter(t *testing.T) {
 			blades.AssistantMessage("done"),
 		},
 	}
-	var touches int
+	var kinds []string
 	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "You are a tester."}, llm, NewToolRegistryAdapter(reg)).
-		WithActivityReporter(func() { touches++ })
+		WithActivityReporter(func(kind string) { kinds = append(kinds, kind) })
 	if _, err := a.Run(context.Background(), "write a.txt"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// 至少 3 次：第一轮 generateOnce + 工具派发，第二轮 generateOnce。
-	if touches < 3 {
-		t.Fatalf("expected >=3 activity touches (generateOnce+tool+generateOnce), got %d", touches)
+	hasKind := func(k string) bool {
+		for _, got := range kinds {
+			if got == k {
+				return true
+			}
+		}
+		return false
+	}
+	// 两轮 generateOnce 各报 llm_start/llm_end；工具派发报 tool:WriteFile 与 tool_end。
+	for _, k := range []string{"llm_start", "llm_end", "tool:WriteFile", "tool_end"} {
+		if !hasKind(k) {
+			t.Fatalf("expected activity kind %q, got %v", k, kinds)
+		}
 	}
 }
 
@@ -964,7 +975,7 @@ func TestSerializePromptForLog_ToolParts(t *testing.T) {
 func TestBuildEnvBlock_InjectsProjectDoc(t *testing.T) {
 	// 无 PROJECT.md 的工作目录：不应出现项目概览段。
 	emptyDir := t.TempDir()
-	env := buildEnvBlock(emptyDir)
+	env := buildEnvBlock(emptyDir, 0)
 	if strings.Contains(env, "【项目概览】") {
 		t.Fatalf("空 workDir 不应注入项目概览，got: %s", env)
 	}
@@ -979,7 +990,7 @@ func TestBuildEnvBlock_InjectsProjectDoc(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".bma", "PROJECT.md"), []byte(content), 0o644); err != nil {
 		t.Fatalf("write PROJECT.md: %v", err)
 	}
-	env = buildEnvBlock(dir)
+	env = buildEnvBlock(dir, 0)
 	if !strings.Contains(env, "【项目概览】") {
 		t.Fatalf("应注入项目概览段，got: %s", env)
 	}
@@ -1032,23 +1043,28 @@ func (p *multiChunkStreamProvider) NewStreaming(ctx context.Context, req *blades
 	}
 }
 
-// TestReActAgent_StreamingActivityReporter 验证流式长生成期间每个块都上报活动：
-// 心跳巡检据此不误杀正在长时间生成代码的活跃叶子（实证 5-7 分钟调用被杀）。
+// TestReActAgent_StreamingActivityReporter 验证流式长生成期间每个块都以 kind=stream
+// 上报活动（真实步进证据）：巡检据 lastTS 不误杀正在长时间生成代码的活跃叶子（实证
+// 5-7 分钟调用被杀）。keepalive tick 则不再刷新 lastTS（盲报根除）。
 func TestReActAgent_StreamingActivityReporter(t *testing.T) {
 	p := &multiChunkStreamProvider{}
-	var touches int
+	var streams int
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, p, NewToolRegistryAdapter(reg)).
-		WithActivityReporter(func() { touches++ })
+		WithActivityReporter(func(kind string) {
+			if kind == "stream" {
+				streams++
+			}
+		})
 	if _, err := a.Run(context.Background(), "hi"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if p.genCalls != 0 {
 		t.Fatalf("应走流式路径，不应调用 Generate，got %d", p.genCalls)
 	}
-	// generateOnce 起始 1 次 + 3 个流式块各 1 次，至少 4 次。
-	if touches < 4 {
-		t.Fatalf("流式块应触发活动上报，got %d touches", touches)
+	// 3 个流式块各报 1 次 stream。
+	if streams < 3 {
+		t.Fatalf("流式块应触发 stream 活动上报，got %d", streams)
 	}
 }
 
@@ -1128,21 +1144,26 @@ func TestReActAgent_StreamIdleTimeoutRetries(t *testing.T) {
 	}
 }
 
-// TestReActAgent_StreamKeepaliveDuringSilence 验证零 chunk 静默流期间保活定时器持续上报：
-// chunk 级上报救不了"首 token 前长考"，需定时器补上报防心跳误杀；真实挂死由墙钟超时兜底。
+// TestReActAgent_StreamKeepaliveDuringSilence 验证零 chunk 静默流期间保活定时器持续上报
+// kind=keepalive：证明进程活着，但不再刷新 lastTS（盲报续命根除，TODO 第10项②）——
+// 真实挂死由流空闲卡口（streamIdleTimeout）/整次调用超时/会话墙钟兜底。
 func TestReActAgent_StreamKeepaliveDuringSilence(t *testing.T) {
 	p := &silentStreamProvider{silence: 150 * time.Millisecond}
-	var touches atomic.Int64
+	var keepalives atomic.Int64
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, p, NewToolRegistryAdapter(reg)).
-		WithActivityReporter(func() { touches.Add(1) }).
+		WithActivityReporter(func(kind string) {
+			if kind == "keepalive" {
+				keepalives.Add(1)
+			}
+		}).
 		WithStreamKeepalive(20 * time.Millisecond)
 	if _, err := a.Run(context.Background(), "hi"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// 静默 150ms 零 chunk；保活每 20ms 一次，至少 5 次上报。
-	if n := touches.Load(); n < 5 {
-		t.Fatalf("零 chunk 静默流期间保活应持续上报，got %d touches", n)
+	// 静默 150ms 零 chunk；保活每 20ms 一次，至少 5 次 keepalive 上报。
+	if n := keepalives.Load(); n < 5 {
+		t.Fatalf("零 chunk 静默流期间保活应持续上报 keepalive，got %d", n)
 	}
 }
 

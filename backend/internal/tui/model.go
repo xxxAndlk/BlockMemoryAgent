@@ -148,6 +148,10 @@ type sharedState struct {
 	// 成功创建会话后选中它需操作 m.sessions/cursor，不能在后台 goroutine 直接改
 	// （与主循环 View 读产生 race），改为 tick 在主循环内执行 refresh+select。
 	pendingSelectID string
+	// pendingOverlay 由后台 goroutine（/worktree list|diff 拉取）写入，refreshView
+	// 在主循环内消费 openOverlay——弹窗字段不能被后台 goroutine 直接改（同上 race 约束）。
+	pendingOverlayTitle string
+	pendingOverlayLines []string
 }
 
 func newSharedState() *sharedState { return &sharedState{} }
@@ -199,6 +203,28 @@ func (s *sharedState) hasPendingSelect() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pendingSelectID != ""
+}
+
+// setPendingOverlay 写入待打开的通用弹窗（标题 + 行内容），主循环 refreshView 消费。
+func (s *sharedState) setPendingOverlay(title string, lines []string) {
+	s.mu.Lock()
+	s.pendingOverlayTitle = title
+	s.pendingOverlayLines = lines
+	s.mu.Unlock()
+}
+
+// takePendingOverlay 取出并清空待打开弹窗；无待处理项返回 ("", nil)。nil 接收者安全。
+func (s *sharedState) takePendingOverlay() (string, []string) {
+	if s == nil {
+		return "", nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	title := s.pendingOverlayTitle
+	lines := s.pendingOverlayLines
+	s.pendingOverlayTitle = ""
+	s.pendingOverlayLines = nil
+	return title, lines
 }
 
 // ensureShared 惰性补齐 shared（测试中以 Model 字面量构造时可能未初始化）。
@@ -625,6 +651,10 @@ func (m *Model) refreshView() {
 				break
 			}
 		}
+	}
+	// 消费后台 /worktree list|diff 写入的待打开弹窗（同上 race 约束，主循环内打开）。
+	if title, lines := m.shared.takePendingOverlay(); title != "" {
+		m.openOverlay(title, lines)
 	}
 	// 对话条目只全量收集一次，供下方滚动锚定与内容重建两个分支复用
 	// （原先各算一次 collectChatItems，长会话下是双倍开销）。
