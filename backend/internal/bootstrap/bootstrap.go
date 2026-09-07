@@ -151,6 +151,15 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	}
 	pgStore.SetEmbedder(embedder)
 
+	// embed 端点起动探活（仅告警不阻断）：local/openai provider 依赖外部服务
+	// （ollama 等），服务未起时全程块记忆/技能库/黑板召回静默降级——2026-09-07
+	// 实证 ollama 未运行，整个会话外脑失效仅剩周期性 WARN。起动时大声报一次。
+	probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer probeCancel()
+	if _, err := embedder.Embed(probeCtx, "bootstrap health probe"); err != nil {
+		log.Printf("[bootstrap] WARN embed 端点探活失败（记忆召回/技能库/黑板语义匹配将持续降级）: %v", err)
+	}
+
 	// 第七步：确保所需数据库 schema 已就绪。
 	if err := ensureSchemas(ctx, pgStore, cfg.PgVector.Dimensions); err != nil {
 		pgStore.Close()
@@ -410,6 +419,16 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		}
 		agentSvc.VideoOpts.NativeMaxBytes = nativeMax
 	}
+	// 任务128：ReadMedia 视频解析器——复用上传链路的 ResolveVideos 抽帧，但强制
+	// NativeMaxBytes=0：native 整传产生的 video/* DataPart 在 anthropic-compat
+	// 端点（domain 当前走 glm anthropic 兼容层）会被静默丢弃，抽出的 jpeg 帧
+	// 全 provider 可见。native 直传语义保留给上传链路不变。
+	toolRegistry.SetMediaResolver(func(ctx context.Context, path string) ([]tool.ResultImage, []string) {
+		opts := agentSvc.VideoOpts
+		opts.NativeMaxBytes = 0
+		mime, _ := agent.VideoMIMEByExt(strings.ToLower(filepath.Ext(path)))
+		return agent.ResolveVideos(ctx, []agent.WireVideo{{Path: path, MIMEType: mime}}, opts, 0)
+	})
 	// 串联权威 workDir：bootstrap 持有的 os.Getwd() 结果注入 session store，
 	// 消除 newReactSessionStore 内不再自取 cwd 的双源漂移。
 	agentSvc.SetWorkDir(workDir)

@@ -1,9 +1,10 @@
 package tool
 
-// shared_memory.go 提供 WriteSharedMemory 工具：主线程 Agent（MetaAgent/DomainAgent）
+// shared_memory.go 提供 WriteSharedMemory / ReadSharedMemory 工具：主线程 Agent（MetaAgent/DomainAgent）
 // 把派发前采集到的关键上下文（文件路径、行号、签名、前置结论）写入共享记忆，
 // 协程 Agent（被 call_sub_agent 派发的子 Agent）经 dispatcher.injectKVMemory 自动读取，
 // 实现"主 Agent 浅读一次、子 Agent 不重读全文件"的 token 节约语义。
+// ReadSharedMemory 供主 Agent 派发/返工前读回已写入槽位（Meta 无 ReadFile 的信息源）。
 //
 // 存储后端：FileSharedMemoryStore 落盘到 <workDir>/.bma/shared/<hex(agentID)>__<slot>.md，
 // MD 格式：YAML frontmatter（agent/slot/files mtime）+ body（content 原文）。
@@ -22,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -199,6 +201,135 @@ func (t *writeSharedMemoryTool) writeWithCAS(ctx context.Context, key, md string
 		}
 	}
 	return 0, fmt.Errorf("%w", ErrVersionConflict)
+}
+
+// readSharedMemoryTool 是 ReadSharedMemory 工具的封装：主 Agent 派发/返工前读回
+// 已写入的共享记忆（spec/契约/前置结论），作为自身无 ReadFile 时的信息源。
+type readSharedMemoryTool struct {
+	store SharedMemoryStore
+}
+
+// readSharedMemoryTruncateLimit 是单槽位读回正文的截断上限：
+// 共享记忆按设计存"摘要/契约"而非原文全文，超限视为写入方违反写入纪律，读回截断保护上下文。
+const readSharedMemoryTruncateLimit = 20000
+
+// Name 返回工具标准名称 ReadSharedMemory。
+func (t *readSharedMemoryTool) Name() string { return "ReadSharedMemory" }
+
+// Aliases 返回 ReadSharedMemory 的别名列表。
+func (t *readSharedMemoryTool) Aliases() []string {
+	return []string{"read_shared_memory", "readSharedMemory"}
+}
+
+// Description 返回工具的人类可读描述，供 schema 与 UI 展示。
+func (t *readSharedMemoryTool) Description() string {
+	return readSharedMemoryToolDescription()
+}
+
+// readSharedMemoryToolDescription 是 ReadSharedMemory 的描述文本（blades 桥接层复用）。
+func readSharedMemoryToolDescription() string {
+	return "读回共享记忆。key 省略时列出当前全部槽位（key 与字数）；指定 key 读回该槽位全文。" +
+		"key 可传全键 \"<agentID>:<slot>\" 或仅 slot（自动用你的 agentID 前缀解析，未命中时全库唯一同名槽位回退）。" +
+		"用途：返工/修复前重读上次写入的 spec/契约/前置结论；派发前核对已写入内容。" +
+		"被派发的子 Agent 会自动注入共享记忆，无需为它们调用本工具。"
+}
+
+// readSharedMemoryInput 是 ReadSharedMemory 工具的入参结构。
+type readSharedMemoryInput struct {
+	// Key 是要读回的槽位；省略时列出全部槽位名与字数。
+	Key string `json:"key" description:"要读回的槽位：全键 \"<agentID>:<slot>\" 或仅 slot（自动用你的 agentID 前缀解析）。省略时只列出全部槽位名与字数。可空。"`
+}
+
+// Execute 读回共享记忆：无 key 枚举槽位清单，有 key 返回槽位正文。
+func (t *readSharedMemoryTool) Execute(ctx context.Context, args map[string]any) *Result {
+	if t.store == nil {
+		return &Result{Tool: "ReadSharedMemory", Error: "shared memory store not configured"}
+	}
+	key, _ := args["key"].(string)
+	key = strings.TrimSpace(key)
+
+	keys := t.store.Keys(ctx)
+	sort.Strings(keys)
+
+	if key == "" {
+		return t.listResult(ctx, keys)
+	}
+
+	val, hitKey := t.resolve(ctx, key, keys)
+	if !hitKey {
+		return &Result{Tool: "ReadSharedMemory", Error: fmt.Sprintf(
+			"shared memory %q 不存在。可用槽位：\n%s", key, listKeysSummary(ctx, t.store, keys))}
+	}
+	return &Result{Tool: "ReadSharedMemory", Success: true, Output: decodeSharedBody(val)}
+}
+
+// resolve 按"本 Agent 前缀 -> 全键"顺序解析 key，返回命中内容。
+func (t *readSharedMemoryTool) resolve(ctx context.Context, key string, keys []string) (string, bool) {
+	if !strings.Contains(key, ":") {
+		if agentID := AgentIDFromContext(ctx); agentID != "" {
+			if val, err := t.store.Get(ctx, agentID+":"+key); err == nil && strings.TrimSpace(val) != "" {
+				return val, true
+			}
+		}
+	}
+	val, err := t.store.Get(ctx, key)
+	if err != nil || strings.TrimSpace(val) == "" {
+		// 仅 slot 且带本 Agent 前缀未命中时，回退全库唯一候选（跨 Agent 读，如 Meta 读子 Agent 沉淀）。
+		if !strings.Contains(key, ":") {
+			var cands []string
+			for _, k := range keys {
+				if _, slot, ok := strings.Cut(k, ":"); ok && slot == key {
+					cands = append(cands, k)
+				}
+			}
+			if len(cands) == 1 {
+				if val, err := t.store.Get(ctx, cands[0]); err == nil && strings.TrimSpace(val) != "" {
+					return val, true
+				}
+			}
+		}
+		return "", false
+	}
+	return val, true
+}
+
+// listResult 输出全部槽位的 key 与字数摘要。
+func (t *readSharedMemoryTool) listResult(ctx context.Context, keys []string) *Result {
+	if len(keys) == 0 {
+		return &Result{Tool: "ReadSharedMemory", Success: true, Output: "共享记忆为空。"}
+	}
+	return &Result{Tool: "ReadSharedMemory", Success: true,
+		Output: "共享记忆槽位（用 ReadSharedMemory(key=...) 读全文）：\n" + listKeysSummary(ctx, t.store, keys)}
+}
+
+// listKeysSummary 生成 "key — N 字符" 逐行摘要。
+func listKeysSummary(ctx context.Context, store SharedMemoryStore, keys []string) string {
+	lines := make([]string, 0, len(keys))
+	for _, k := range keys {
+		n := 0
+		if val, err := store.Get(ctx, k); err == nil {
+			_, body, ok := DecodeSharedMD(val)
+			if ok {
+				val = body
+			}
+			n = len([]rune(val))
+		}
+		lines = append(lines, fmt.Sprintf("- %s — %d 字符", k, n))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// decodeSharedBody 解出槽位正文；非 MD 格式原样返回，超限截断。
+func decodeSharedBody(val string) string {
+	if _, body, ok := DecodeSharedMD(val); ok {
+		val = body
+	}
+	runes := []rune(val)
+	if len(runes) > readSharedMemoryTruncateLimit {
+		return string(runes[:readSharedMemoryTruncateLimit]) +
+			fmt.Sprintf("\n\n[截断：全文 %d 字符，仅显示前 %d。写入方应存摘要而非原文全文]", len(runes), readSharedMemoryTruncateLimit)
+	}
+	return val
 }
 
 // writeSharedMemoryInput 是 WriteSharedMemory 工具的入参结构。

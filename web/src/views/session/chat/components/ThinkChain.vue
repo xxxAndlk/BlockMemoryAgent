@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import type { SessionEvent } from '@/types'
 import { fmtTime, kindTagType, kindIcon, kindLabel, agentTextColor, hasDetail } from '../utils/eventStyles'
+import { renderMd } from '@/utils/markdown'
 
 const props = defineProps<{
   events: SessionEvent[]
@@ -32,8 +33,12 @@ const visible = computed(() => {
 
 const hiddenCount = computed(() => props.events.length - visible.value.length)
 
-// 消息体只展示纯文本：多行混合中英/路径/JSON 的 prompt 摘要若走 markdown
-// 会出现错位、乱码式排版。仅最终回答（AssistantTurn）走 markdown。
+// LLM 产出的思考/回复文本走 markdown 渲染（列表/代码块/加粗等格式保留）；
+// 非文本类事件（prompt 摘要等调试内容）保持纯文本避免 markdown 错位排版。
+const MD_KINDS = new Set(['think', 'intend', 'llm', 'llm_result', 'llm_response', 'wait', 'agent_done', 'clarify'])
+function useMd(ev: SessionEvent): boolean {
+  return MD_KINDS.has(ev.kind || ev.type || '')
+}
 function asText(s: string | undefined): string {
   return s || ''
 }
@@ -63,7 +68,9 @@ function asText(s: string | undefined): string {
           </el-tag>
           <span class="text-[11px] shrink-0" :class="agentTextColor(ev.agent)">{{ ev.agent }}</span>
           <div class="flex-1 min-w-0">
-            <div class="text-ink break-words leading-relaxed whitespace-pre-wrap">{{ asText(ev.message) }}</div>
+            <div v-if="useMd(ev)" class="markdown-body text-ink break-words leading-relaxed"
+                 v-html="renderMd(ev.message)"></div>
+            <div v-else class="text-ink break-words leading-relaxed whitespace-pre-wrap">{{ asText(ev.message) }}</div>
             <button v-if="hasDetail(ev)"
                     class="text-[10px] text-ink-2 hover:text-ink mt-1 flex items-center gap-1"
                     @click="toggle(i)">
@@ -99,4 +106,19 @@ function asText(s: string | undefined): string {
 </template>
 
 <style scoped>
+.markdown-body :deep(p) { margin: 0 0 0.4em 0; }
+.markdown-body :deep(p:last-child) { margin-bottom: 0; }
+.markdown-body :deep(ul), .markdown-body :deep(ol) { margin: 0.3em 0 0.3em 1.2em; }
+.markdown-body :deep(pre) {
+  background: var(--bma-page);
+  padding: 8px;
+  border-radius: 4px;
+  margin: 4px 0;
+  overflow-x: auto;
+}
+.markdown-body :deep(code) { font-family: monospace; }
+.markdown-body :deep(h1), .markdown-body :deep(h2), .markdown-body :deep(h3), .markdown-body :deep(h4) {
+  margin: 0.5em 0 0.25em;
+  font-weight: 600;
+}
 </style>

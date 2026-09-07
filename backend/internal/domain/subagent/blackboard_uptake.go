@@ -101,6 +101,8 @@ func (p *siblingUptakePipeline) Assemble(role types.RoleDefinition, agentID stri
 	if msg == "" {
 		return out
 	}
+	// 注入测量（TODO 第七项③）：纯加法 slog，量化每轮黑板摄取对上下文的增量贡献。
+	log.Printf("[subagent] ctx_inject: sub=%s stage=sibling_uptake fresh=%d uptake=%d runes", agentID, len(fresh), len([]rune(msg)))
 	return append(out, agent.ReactMessage{Role: "system", Content: msg})
 }
 

@@ -128,19 +128,14 @@ func (t *writeSpecTool) Aliases() []string {
 
 // Description 返回工具的人类可读描述，供 schema 与 UI 展示。
 func (t *writeSpecTool) Description() string {
-	return "派发子 Agent 前写入结构化任务规范（目标/验收/约束/涉及文件），" +
-		"dispatcher 会强制 call_sub_agent 前先调本工具，并把规范作为【任务规范】前缀注入子 Agent。" +
-		"files 字段填涉及的文件路径列表，写入时记录 mtime；任一文件被 WriteFile 修改后该规范自动失效，" +
-		"下次派发子 Agent 不再注入旧规范。" +
-		"verify_levels 字段填验收层级（existence/static/integration/runtime/visual 子集）：" +
-		"UI/游戏类任务填 visual+runtime（强制截图回显与运行时探针证据），多文件集成填 integration（入口引用图探针）。" +
-		"acceptance 支持结构化条目 {text, evidence, layer}：evidence=command|screenshot|probe|file|manual，" +
-		"dispatcher 按类型逐项挂机器证据（缺证据条目标黄不计入通过数）；layer=functional|quality（quality 未过不整体标绿）。" +
-		"还原/复刻/对标类任务必须填 baseline（参照物文件路径）或 baseline_content（内联基线全文自动落盘 .bma/baseline/），否则拒收。" +
-		"例外：logs/ 与 .bma/ 目录下的文件是系统持续写入的活体文件（日志等），豁免 mtime 校验、不会导致失效。" +
-		"\n覆盖语义：同一 parent 的同一 key 写入覆盖前一次内容（不追加）。" +
-		"key 可空（默认 spec，全兄弟共享一份）；多领域任务按领域名各写一份（key=领域名，须与 call_sub_agent 的 domain 一致），" +
-		"兄弟各持各的、staleness 按各自 files 交集隔离，互不误伤。"
+	return "派发子 Agent 前写入结构化任务规范（goal/acceptance/constraints/files），" +
+		"dispatcher 强制 call_sub_agent 前先调本工具，规范注入子 Agent 任务体前缀。" +
+		"files 记录 mtime，任一文件被改后规范自动失效（stale 拒派）；logs/ 与 .bma/ 活体文件豁免。" +
+		"verify_levels 填验收层级子集（UI/游戏类 visual+runtime，多文件集成 integration）；" +
+		"acceptance 支持 {text,evidence,layer} 结构化条目（缺证据标黄不计分，quality 未过不标绿）。" +
+		"还原/复刻类必须填 baseline 或 baseline_content（内联基线自动落盘 .bma/baseline/），否则拒收。" +
+		"覆盖语义：同 key 写入覆盖不追加；key 可空（默认单键共享），多领域任务 key=领域名" +
+		"（须与 call_sub_agent 的 domain 一致）。"
 }
 
 // Execute 写入任务规范。

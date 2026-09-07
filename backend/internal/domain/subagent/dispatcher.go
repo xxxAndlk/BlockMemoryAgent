@@ -34,37 +34,6 @@ import (
 //   - 父会话若被用户手动取消，子 Agent 仍可在独立上下文中继续运行，避免长任务结果丢失。
 //   - 超时仅用于防止无限制挂起，由 WithTimeout 配置；<=0 表示不限制。
 
-// callSubAgentInput 定义 call_sub_agent 工具的 JSON 入参结构。
-// 大模型在调用 call_sub_agent 时应提供 role_id（被调用角色）与 task（任务描述），
-// 可选 domain（领域分类简称，仅 role_id="domain" 时有效，用于子 Agent 展示名）。
-type callSubAgentInput struct {
-	RoleID string `json:"role_id"` // RoleID 被调用子 Agent 的角色标识。
-	Task   string `json:"task"`    // Task 交给子 Agent 执行的具体任务描述。
-	Domain string `json:"domain"`  // Domain 领域分类简称（金融/认证/UI 等），仅 role_id="domain" 时有效。
-	// Responsibility 职责边界描述（仅 role_id="domain" 时有效），注入子 Agent 系统提示词，
-	// 防止长 ReAct 循环中 task 被历史压缩后领域身份丢失。
-	Responsibility string `json:"responsibility"`
-	// Mode 派发执行模式（TODO #29）：react（默认）/ reflection / plan_execute。
-	// 空串按 react 处理（零行为变化）。
-	Mode string `json:"mode"`
-	// VerifyKind 校验分层（TODO #43）：auto（默认，按角色/模式自动选）/ executable（L0 证据）/
-	// rubric（L2 交叉模型 judge）/ none。空串按 auto 处理。
-	VerifyKind string `json:"verify_kind"`
-	// ToolsHint 建议工具集（TODO #52 执行项 4）：父 Agent 声明希望子 Agent 使用的工具名列表，
-	// dispatcher 校验 ∩ 子 Agent 角色权限天花板后收窄其插件工具可见集（相当于预挂载）。
-	// 天花板外（插件 roles 白名单不允许）的越界项被忽略并随派发结果回告父 Agent，不放大权限。
-	ToolsHint []string `json:"tools_hint"`
-	// WallClockMin 派发级墙钟预算（分钟，可选）。代码级 context.WithTimeout 强制收口，
-	// 替代提示词墙钟（roles.yaml 的"墙钟约 15 分钟"对 LLM 只是软约束，实证验收 Agent
-	// 拿 15 分钟预算实际跑了 39 分钟）。>0 时取 min(本值, sub_agent_timeout)；到期前
-	// 预警窗口内向子 Agent 邮箱投递收口警告。省略=用全局 sub_agent_timeout。
-	WallClockMin float64 `json:"wall_clock_min"`
-	// Takeover 接管声明（TODO #73）：声明被接管的旧 domain 名。dispatcher 迁移旧 domain
-	// 的非 Done 看板条目（含 Failed）到本次 domain 并留痕。异名续建旧领域工作时必填，
-	// 否则旧 FAILED 条目永久红误导看板。
-	Takeover string `json:"takeover"`
-}
-
 // ModelProviderFactory 是 model.ModelFactory 的子集，
 // Dispatcher 只需要从中获取指定角色对应的模型提供者即可创建子 Agent。
 type ModelProviderFactory interface {
@@ -224,6 +193,10 @@ type Dispatcher struct {
 	// maxTotalDispatches 全局派发总数上限：同一 session 内所有角色的派发合计超过该值时
 	// 拒绝进一步派发，防止编排失控。<=0 表示不限制。计数随用户新消息重置。
 	maxTotalDispatches int
+
+	// aggByAgent 聚合模式登记（TODO 第七项⑤ map_sub_agents）：subAgentID → *mapAggEntry。
+	// 命中时 notify 不直发父邮箱，改记入聚合器；收口后删除登记。
+	aggByAgent sync.Map
 
 	// timeout 是子 Agent 独立执行的最大时长；<=0 表示不限制。默认 30 分钟。
 	timeout time.Duration
@@ -1458,9 +1431,10 @@ func (d *Dispatcher) RegisterPlanTools(r *tool.Registry) {
 // 工具被注册到父 Agent 与子 Agent 共同使用的 registry 上，
 // 递归深度固定三层：MetaAgent -> DomainAgent -> 叶子助手（CanCall 拒绝 domain->domain 平级派发）。
 func (d *Dispatcher) RegisterCallTool(r *tool.Registry) {
-	// 注册 callSubAgentTool / callSubAgentsTool 实例，工具内部持有当前 Dispatcher 以便执行时调用。
+	// 注册 callSubAgentTool / callSubAgentsTool / mapSubAgentsTool 实例，工具内部持有当前 Dispatcher 以便执行时调用。
 	r.Register(&callSubAgentTool{dispatcher: d})
 	r.Register(&callSubAgentsTool{dispatcher: d})
+	r.Register(&mapSubAgentsTool{dispatcher: d})
 }
 
 // RegisterMessagingTool 将 send_message 工具安装到传入的工具注册表中。
@@ -1651,41 +1625,15 @@ func (t *callSubAgentTool) Description() string {
 		entries = append(entries, fmt.Sprintf("%s（叶子执行者：%s；仅在任务已单函数级、单文件、领域明确时直派）", fr.ID, fr.Description))
 	}
 	return "将子任务派发给指定角色的子 Agent 异步执行。调用立即返回 sub_agent_id；" +
-		"子 Agent 完成后，其结果摘要会以 [mailbox from <sub_agent_id>] 消息送达，请在后续轮次中阅读并整合。\n" +
-		fmt.Sprintf("task 必须自包含 <= %d 字（按 rune 计数，含中文字符）：背景、目标、相关文件路径、前置结论与验收标准--子 Agent 看不到当前对话历史。", t.dispatcher.taskRuneSoftLimit) +
-		"规格原文走 WriteSharedMemory，不塞进 task。超长 task 将被拒绝，错误提示\"task too long\"（" +
-		fmt.Sprintf("%d-%d 字轻微超限会放行但附压缩警告，>%d 字硬拒）。\n\n", t.dispatcher.taskRuneSoftLimit, t.dispatcher.taskRuneHardLimit, t.dispatcher.taskRuneHardLimit) +
-		"【前置依赖】派发前必须先调 WriteSpec(goal, acceptance, constraints, files) 写入任务规范，否则返回错误（spec missing=未写 / spec stale=涉及文件已变更且列出失配路径 / spec invalid=缺 goal 或验收）。" +
-		"WriteSpec 与 WriteSharedMemory 是不同工具：WriteSharedMemory 写自由 KV 供子 Agent 读，" +
-		"WriteSpec 写固定 slot \"spec\" 供 dispatcher 校验并注入子 Agent 任务体前缀。两者不可互相替代。\n\n" +
-		"【路由规则】\n" +
-		"1. 默认走 domain：多文件/多函数/多步骤/不确定范围 -> role_id=\"domain\"。DomainAgent 是该领域的直接执行者，收到后默认自执行，仅其自主判断需要时才下拆叶子。\n" +
-		"2. 直派固定助手：仅当任务已单函数级、单文件、领域明确（如\"修改 X 函数签名\"、\"补一个测试\"）时直派对应助手。\n" +
-		"3. 不确定走哪条？走 domain。\n" +
-		"4. 若你本身就是 DomainAgent：你不能派 domain（会被拒绝）。默认自执行，仅按你提示词中的【拆分决策】必要时直派固定助手。\n\n" +
-		"【domain 字段】role_id=\"domain\" 时填领域分类简称（如 金融/认证/UI/数据库/配置），" +
-		"用于子 Agent 展示名（\"金融领域Agent\"）。固定助手忽略此字段，用其角色名。\n" +
-		"【responsibility 字段】role_id=\"domain\" 时必填：该领域 Agent 的职责边界（<= 200 字），" +
-		"写明负责哪些文件/模块、不碰哪些。会注入子 Agent 系统提示词，长跑不丢。\n\n" +
-		"【mode 字段】（可选）派发执行模式：react（默认）/ reflection / plan_execute。" +
-		"琐碎单步任务省略；正确性敏感任务（算法/迁移/重构）用 reflection——执行后自动对照验收标准自检，不达标带反馈重试；" +
-		"多步骤长任务（多文件/多阶段）用 plan_execute——先出步骤计划（TUI 可见）再逐步执行。判断不准时省略，默认 react。" +
-		"非编码任务（文案/分析/规划）默认省略--主观质量机器评审不了，靠派发方纸面收口；仅客观正确性敏感（数值结论/事实断言）用 reflection。\n\n" +
-		"【verify_kind 字段】（可选）校验分层：auto（默认，按角色与执行模式自动选——代码/测试助手自动要求可执行证据、自检模式自动 rubric 评审）/ executable（必须有测试/lint/--check 成功运行的客观证据，否则会反馈重试 1 轮）/ rubric（独立评审模型按验收标准逐条判）/ none（跳过校验）。\n\n" +
-		"判断不准时省略，默认 auto。非编码任务省略即可（domain 角色默认 none）。注意：verify_kind 与 mode 是不同字段，勿把 mode 的值填到本字段。\n\n" +
-		"【tools_hint 字段】（可选）建议工具集：子 Agent 需要插件工具（如画图/搜索/浏览器）时，在此声明工具名列表（来自 tool_catalog），" +
-		"dispatcher 校验 ∩ 子 Agent 角色权限天花板后预挂载——子 Agent 当轮即可见对应插件工具，无需自己挂载。" +
-		"天花板外（插件 roles 白名单不允许）的越界项会被忽略并随本调用结果回告，不放大权限。\n\n" +
-		"【wall_clock_min 字段】（可选）本次派发的墙钟预算（分钟，代码级强制执行，与全局 sub_agent_timeout 取小）：" +
-		"预算用到 50%/75%/90% 时子 Agent 会收到递进收口警告，超时直接终止。普通建设/修复任务必须省略——省略=用全局 sub_agent_timeout（当前 120 分钟/2 小时）；" +
-		"显式给出去的预算就是硬上限，慢思考模型单轮 LLM 可达 5-25 分钟，小预算装不下侦察+产出" +
-		"仅纯侦察/巡检类快任务可显式给小预算（如 10-15）防无边界扩张。\n\n" +
-		"【reuse_agent_id 字段】（可选，热驻复用）复用已完成的热驻领域 Agent：填【空闲领域Agent】清单中的 agent_id。" +
-		"新任务与该领域强相关时优先复用（保留全部上下文与领域知识，省冷启动）；弱相关则省略本字段新建 domain。" +
-		"复用时 role_id/domain/responsibility 可省略（沿用槽内冻结值），task 必填；spec 照常先写，domain 留空时按单键/唯一候选回退校验（key 不受 domain 名约束）。目标 Agent 忙碌时任务入队，当前任务完成后自动执行。\n\n" +
-		"【takeover 字段】（可选，看板接力认领）异名续建某旧领域的工作时填旧 domain 名：" +
-		"dispatcher 会把旧领域的未完成看板条目（含失败红条）迁移到本次 domain 名下并留痕，旧条目随本次完成自动翻绿——" +
-		"不填则旧失败条目永久红，误导看板与后续决策。同名续建（domain 与旧领域同名）天然覆盖，无需填——dispatcher 自动路由该领域的热驻空闲 Agent 复用其上下文（Running 中则拒绝，等回传）。\n\n" +
+		"完成后结果摘要以 [mailbox from <sub_agent_id>] 送达，后续轮次阅读整合。" +
+		fmt.Sprintf("task 必须自包含 <=%d 字：背景/目标/文件路径/验收——子 Agent 看不到对话历史；规格原文走 WriteSharedMemory（超限 %d 字硬拒）。\n", t.dispatcher.taskRuneSoftLimit, t.dispatcher.taskRuneHardLimit) +
+		"前置依赖：必须先 WriteSpec（否则 spec missing/stale/invalid 拒派）；WriteSpec=固定 spec 槽供校验注入，WriteSharedMemory=自由 KV，不可互替。\n" +
+		"路由：不确定一律 role_id=\"domain\"（默认自执行）；单函数级单文件领域明确的任务才直派固定助手；DomainAgent 不能派 domain。\n" +
+		"字段：domain=领域简称（仅 domain 角色用）；responsibility=职责边界 <=200 字（domain 必填，注入子提示词防越界）；" +
+		"mode=react(默认)/reflection/plan_execute（判断不准省略）；verify_kind=auto(默认)/executable/rubric/none；" +
+		"tools_hint=预挂载插件工具名列表（受角色白名单天花板约束）；wall_clock_min=墙钟分钟（普通任务省略，仅侦察/巡检给小预算）；" +
+		"reuse_agent_id=热驻复用（填【空闲领域Agent】的 agent_id，保留全部上下文，spec 照写、key 与领域名对齐）；" +
+		"takeover=异名续建时填旧 domain 名，看板未完成条目迁移留痕（同名续建自动覆盖无需填）。\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
@@ -1806,9 +1754,15 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	if reuseAgentID != "" && strings.TrimSpace(task) == "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: "task is required", Category: tool.ResultCategoryValidationRejected}
 	}
-	specMsg, specWarn := d.checkSpecBeforeDispatch(ctx, parentID, domain)
-	if specMsg != "" {
-		return &tool.Result{Tool: "call_sub_agent", Error: specMsg, Category: tool.ResultCategoryValidationRejected}
+	// spec 豁免（TODO 第七项②）：spec_exempt 角色跳过 WriteSpec 强制门——
+	// scout 类侦察角色本身就是"先定位"的工具，spec 先于侦察存在则门永远挡住合法路径。
+	var specWarn string
+	if rd := d.registry.Get(roleID); rd == nil || !rd.SpecExempt {
+		specMsg, warn := d.checkSpecBeforeDispatch(ctx, parentID, domain)
+		if specMsg != "" {
+			return &tool.Result{Tool: "call_sub_agent", Error: specMsg, Category: tool.ResultCategoryValidationRejected}
+		}
+		specWarn = warn
 	}
 
 	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, wallClock, reuseAgentID, takeover)
@@ -1917,7 +1871,22 @@ func (d *Dispatcher) resolveIdleSiblingReuse(ctx context.Context, parentID, doma
 // takeover 非空时（TODO #73）迁移旧 domain 的非 Done 看板条目到本次派发 domain 并留痕。
 // 前置：调用方已完成参数校验（validateDispatchArgs）与 spec 强制校验。
 // 供 call_sub_agent（单个）与 call_sub_agents（批量同波）两个工具复用。
-func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint, skillsHint []string, wallClock time.Duration, reuseAgentID, takeover string) (string, *tool.Result) {
+// dispatchOpts 是 dispatchOne 的可选项（TODO 第七项⑤ map_sub_agents 聚合模式）。
+type dispatchOpts struct {
+	// aggregate 非空时：本子 Agent 的完成通知不直发父邮箱，改记入聚合器；
+	// 全部项收口后由聚合器统一发一条汇总消息。
+	aggregate *mapAggregation
+	// aggItem 是聚合模式下本项的原始 item 文本（聚合消息回显用）。
+	aggItem string
+	// aggIdx 是聚合模式下本项在 items 中的下标（聚合消息按派发顺序排列用）。
+	aggIdx int
+}
+
+func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint, skillsHint []string, wallClock time.Duration, reuseAgentID, takeover string, opts ...*dispatchOpts) (string, *tool.Result) {
+	var opt *dispatchOpts
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	// 从当前上下文获取父 Agent ID，子 Agent 需要知道是谁调用了它。
 	parentID := agent.AgentIDFromContext(ctx)
 	if parentID == "" {
@@ -1937,6 +1906,12 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	roleDef := d.registry.Get(roleID)
 	if roleDef == nil {
 		return "", &tool.Result{Error: fmt.Sprintf("unknown role: %s", roleID), Category: tool.ResultCategoryValidationRejected}
+	}
+
+	// scout 类 spec_exempt 角色缺省墙钟 5 分钟（TODO 第七项②）：侦察任务必须有预算上限，
+	// LLM 未显式给 wall_clock_min 时兜底，防侦察失控无收口。
+	if wallClock <= 0 && roleDef.SpecExempt {
+		wallClock = 5 * time.Minute
 	}
 
 	// 校验调用权限：只有被允许的角色关系才能发起子 Agent 调用。
@@ -2124,6 +2099,10 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		d.activity.Store(subAgentID, act)
 	}
 	d.ensurePatrol()
+	// 聚合模式登记（TODO 第七项⑤）：先于 goroutine 注册，消除 notify 时序竞态。
+	if opt != nil && opt.aggregate != nil {
+		d.aggByAgent.Store(subAgentID, &mapAggEntry{agg: opt.aggregate, idx: opt.aggIdx, item: opt.aggItem})
+	}
 	go func() {
 		defer cancel()
 		defer d.subMeta.Delete(subAgentID)
@@ -2134,6 +2113,17 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
 		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
 		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, mode, verifyKind, started)
+		// 聚合模式：notify 未触达（暂停/无邮箱等路径）时兜底收口本项，防聚合器永久悬挂。
+		// 正常完成路径 notify 已先消费登记，此处 Load 不到即 no-op。
+		if opt != nil && opt.aggregate != nil {
+			if e, ok := d.aggByAgent.Load(subAgentID); ok {
+				d.aggByAgent.Delete(subAgentID)
+				entry := e.(*mapAggEntry)
+				entry.once.Do(func() {
+					opt.aggregate.record(entry.idx, entry.item, "（未回传：暂停或异常终止，恢复/排查后另行通知）", false)
+				})
+			}
+		}
 		if !paused {
 			meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
 		}
@@ -2322,17 +2312,13 @@ func (t *callSubAgentsTool) Aliases() []string { return nil }
 
 // Description 返回工具的 LLM 可见描述。
 func (t *callSubAgentsTool) Description() string {
-	return "把同一波多个子任务一次性原子并行派出（等价于连续多次 call_sub_agent，但保证同波同时启动）。\n" +
-		"多文件创建/多领域拆分任务的**全部建设领域必须用它一次派出**——" +
-		"共享契约已钉死集成点，领域产物互为独立文件，后写的不需要等先写的落盘。\n" +
-		"参数：tasks 为数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?, verify_kind?, tools_hint?}，" +
-		fmt.Sprintf("字段规则与 call_sub_agent 一致（domain 角色的 responsibility 必填，task 自包含 <=%d 字；", t.dispatcher.taskRuneSoftLimit) +
-		"mode 可选 react/reflection/plan_execute，省略=react；verify_kind 可选 auto/executable/rubric/none，省略=auto；" +
-		"tools_hint 可选：建议子 Agent 使用的插件工具名列表，校验 ∩ 子 Agent 权限天花板后预挂载，越界项忽略并回告）；" +
-		"wall_clock_min 可选：本次派发的墙钟预算（分钟，代码级强制执行，与全局上限取小，50%/75%/90% 递进收口警告，验收类任务建议显式给）；" +
-		"reuse_agent_id 可选：复用【空闲领域Agent】清单中的热驻领域 Agent（强相关任务优先复用，弱相关新建 domain）。\n" +
-		"【前置依赖】与 call_sub_agent 相同：派发前必须先调 WriteSpec 写任务规范（整波共用一份），" +
-		"否则返回 spec missing/stale 错误（stale 会列出已变更文件路径）。逐项返回派出结果：某项失败不影响其他项。"
+	return "同波多领域批量原子派发：多文件/多领域拆分任务的全部建设领域用它一次派出" +
+		"（等价多次 call_sub_agent，但保证同波同时启动；同波 domain 名必须唯一）。\n" +
+		"参数：tasks 数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?, " +
+		"verify_kind?, tools_hint?, wall_clock_min?, reuse_agent_id?}，字段规则与 call_sub_agent 一致" +
+		fmt.Sprintf("（domain 角色 responsibility 必填，task 自包含 <=%d 字）。", t.dispatcher.taskRuneSoftLimit) +
+		"前置依赖与 call_sub_agent 相同：派发前先 WriteSpec（整波共用一份，spec missing/stale 拒绝）。" +
+		"逐项返回派出结果，某项失败不影响其他项。"
 }
 
 // Execute 执行 call_sub_agents 工具调用：逐项校验→spec 校验一次→逐项 dispatchOne。
@@ -2430,10 +2416,20 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		}
 	}
 	if !anyDomain {
-		if msg, warn := d.checkSpecBeforeDispatch(ctx, parentID, ""); msg != "" {
-			return &tool.Result{Tool: "call_sub_agents", Error: msg, Category: tool.ResultCategoryValidationRejected}
-		} else if warn != "" {
-			batchWarnings = append(batchWarnings, warn)
+		// spec 豁免（TODO 第七项②）：整批均为 spec_exempt 角色（如 scout 批量侦察）时跳过门。
+		allExempt := true
+		for _, it := range items {
+			if rd := d.registry.Get(it.roleID); rd == nil || !rd.SpecExempt {
+				allExempt = false
+				break
+			}
+		}
+		if !allExempt {
+			if msg, warn := d.checkSpecBeforeDispatch(ctx, parentID, ""); msg != "" {
+				return &tool.Result{Tool: "call_sub_agents", Error: msg, Category: tool.ResultCategoryValidationRejected}
+			} else if warn != "" {
+				batchWarnings = append(batchWarnings, warn)
+			}
 		}
 	}
 
@@ -2818,20 +2814,26 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	d.recordParentSpec(ctx, parentID, domain)
 	// 上下文前缀注入：共享记忆（spec + 自由槽位）+ 块记忆召回。两段独立前缀统一拼装，避免嵌套
 	// 【当前任务】标记（实证：嵌套后 UI 助手把 KV 内容当作任务主体，空转 16 分钟）。
+	// TODO 第七项③：各路注入 runes 逐路记账（ctx_inject 日志），供注入收口定默认值。
 	var prefixes []string
+	injectRunes := map[string]int{}
 	if sp := d.buildSharedPrefix(ctx, parentID, domain); sp != "" {
 		prefixes = append(prefixes, sp)
+		injectRunes["shared_prefix"] = len([]rune(sp))
 	}
 	// 项目偏好（2026-09-02 设计 §5）：本项目约定与经验下发给全部子 Agent（执行层工艺）。
 	if pp := d.projectPrefsPrefix(ctx); pp != "" {
 		prefixes = append(prefixes, pp)
+		injectRunes["project_prefs"] = len([]rune(pp))
 	}
 	// 经验技能召回（2026-09-02 设计 §6.5）：task 向量预筛 top-3，只注一行提示不注全文。
 	if sr := d.skillRecallPrefix(ctx, origTask); sr != "" {
 		prefixes = append(prefixes, sr)
+		injectRunes["skill_recall"] = len([]rune(sr))
 	}
 	if bm, recs := d.injectScopedRecall(ctx, parentID, domain, origTask, ""); bm != "" {
 		prefixes = append(prefixes, bm)
+		injectRunes["block_recall"] = len([]rune(bm))
 		log.Printf("[subagent] inject block-memory: sub=%s role=%s hits=%d task_len=%d",
 			subAgentID, roleDef.ID, len(recs), len(origTask))
 		for i, rec := range recs {
@@ -2859,6 +2861,11 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// 统一拼装前缀与原任务：单一【当前任务】标记，避免嵌套混淆模型。
 	if len(prefixes) > 0 {
 		task = strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + task
+	}
+	// TODO 第七项③：四路注入 runes 记账（数据供 ⑥ 参数化 knobs 与 P0-4 收口 <20K 定默认值）。
+	if roleDef.ID != "meta" {
+		log.Printf("[subagent] ctx_inject: sub=%s role=%s shared_prefix=%d project_prefs=%d skill_recall=%d block_recall=%d task=%d runes",
+			subAgentID, roleDef.ID, injectRunes["shared_prefix"], injectRunes["project_prefs"], injectRunes["skill_recall"], injectRunes["block_recall"], len([]rune(origTask)))
 	}
 
 	vk := resolveVerifyKind(verifyKind, roleDef.ID, mode)
@@ -4514,9 +4521,32 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 	// 任务台账终态登记（先于邮箱 nil 检查：无邮箱配置时台账仍须可用）。
 	// notify 是所有完成/失败/墙钟收口/被杀回传的唯一咽喉，此处一处全覆盖。
 	d.ledger.RecordTerminal(sessionIDFromAgentID(parentID), parentID, subAgentID, summary, filesModified)
+	// 聚合模式拦截（TODO 第七项⑤）：map_sub_agents 的项完成时记入聚合器，
+	// 不逐项直发父邮箱（N 个子 Agent 完成汇成一条消息，防邮箱淹没）。
+	if e, ok := d.aggByAgent.Load(subAgentID); ok {
+		d.aggByAgent.Delete(subAgentID)
+		entry := e.(*mapAggEntry)
+		entry.once.Do(func() {
+			entry.agg.record(entry.idx, entry.item, summary, true)
+		})
+		return
+	}
 	// 若未配置邮箱，直接返回，避免 nil 指针 panic。
 	if d.mailbox == nil {
 		return
+	}
+	// mailbox 收口（TODO 第七项④）：超阈值回传全文落盘，邮箱只留摘要头 + 全文路径。
+	// 防 4K+ 大回传整段灌进父上下文（父 MetaAgent context 最贵）；
+	// 落盘失败降级原样发送（notify 是 best-effort，不因收口失败丢消息）。
+	body := summary
+	if runeLen(summary) > mailboxReturnDumpRunes {
+		path, dumpErr := d.dumpReturnToDisk(subAgentID, summary)
+		if dumpErr != nil {
+			log.Printf("[subagent] return dump failed (degrade to full body): sub=%s err=%v", subAgentID, dumpErr)
+		} else {
+			body = truncateRunes(summary, mailboxReturnDigestRunes) + "\n\n【全文已落盘】" + path
+			log.Printf("[subagent] return dumped: sub=%s path=%s total=%d runes", subAgentID, path, runeLen(summary))
+		}
 	}
 	// 构造并发送消息：发件人为子 Agent，收件人为父 Agent，主题为子 Agent 完成提示，正文为摘要。
 	// 死信错误（父已销毁）仅记日志：notify 是 best-effort 通知，不阻塞失败主流程。
@@ -4525,11 +4555,35 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 		To:            parentID,
 		Type:          mailbox.MsgInfo,
 		Subject:       "子 Agent 完成: " + subAgentID,
-		Body:          summary,
+		Body:          body,
 		FilesModified: filesModified,
 	}); err != nil {
 		log.Printf("[subagent] notify dead-letter: to=%s from=%s err=%v", parentID, subAgentID, err)
 	}
+}
+
+// mailboxReturnDumpRunes 超过该 rune 数的回传全文落盘、邮箱只留摘要。
+const mailboxReturnDumpRunes = 4000
+
+// mailboxReturnDigestRunes 落盘时邮箱保留的摘要头 rune 数。
+const mailboxReturnDigestRunes = 1500
+
+// runeLen 返回字符串 rune 数。
+func runeLen(s string) int { return len([]rune(s)) }
+
+// dumpReturnToDisk 把超限回传全文写入 <workDir>/.bma/returns/<agentID>-<unix>.md，
+// 返回绝对路径。workDir 取工具注册表默认目录（notify 无 ctx，会话级目录不可得；
+// .bma 是项目级目录，默认 workDir 下语义一致）。
+func (d *Dispatcher) dumpReturnToDisk(subAgentID, summary string) (string, error) {
+	dir := filepath.Join(d.subAgentWorkDir(), ".bma", "returns")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%s-%d.md", filepath.Base(subAgentID), time.Now().Unix()))
+	if err := os.WriteFile(path, []byte(summary), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // TaskLedgerBrief 渲染会话任务台账（供 MetaAgent 上下文注入，bootstrap 经

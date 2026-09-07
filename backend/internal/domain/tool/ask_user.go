@@ -92,21 +92,13 @@ func (t *askUserTool) Aliases() []string { return nil }
 
 // Description 返回 LLM 可见的工具描述。
 func (t *askUserTool) Description() string {
-	return "向用户提问并等待答复（人在回路）。" +
-		"批量模式（推荐）：新任务开工前用 questions 参数一次批量问齐 2-5 个关键分叉" +
-		"（凡选错要返工、缺失则无法定案的关键决策，按任务本身推导该问什么，" +
-		"不套固定清单），全部答复后再写 spec、提交计划或派发——提问是最省时间的行动，" +
-		"禁止不问直接派发。执行中遇到新的方向分叉同样先问再动。" +
-		"不问琐碎：无关紧要的细节自行定；用户已明确的禁止再问；追加需求、续建、纯问答不问。" +
-		"说人话：问题与选项用用户的日常语言，禁止行话术语，每个选项说清对结果的影响，" +
-		"让任何用户不看细节也能拍板。" +
-		"questions 每项 {question,options,multi_select}；题目会逐个呈现给用户，" +
-		"答复按题号汇总返回。单题兼容：也可用顶层 question/options/multi_select 问一题。" +
-		"options 给 2-N 个候选方向（每项 {id,label,description}，label 简短可点选），" +
-		"不要开放式提问让用户打字；multi_select=true 时用户可多选。" +
-		"detail 可选：长上下文（如计划全文）完整展示在对话区供用户滚动查看，" +
-		"问答面板只显示 question 与选项。" +
-		"timeout_sec 可选（>0 时每题超时未答复返回\"自行决策\"，0=不限，默认 0）。"
+	return "向用户提问并等待答复（人在回路）。推荐批量模式：questions 一次问齐 2-5 个" +
+		"关键分叉（选错要返工、缺失无法定案的决策；不问琐碎，用户已明确的禁止再问），" +
+		"答复按题号汇总返回——提问是最省时间的行动。说人话，每个选项讲清对结果的影响。" +
+		"参数：questions 每项 {question,options,multi_select}；options 每项 {id,label,description}" +
+		"（label 简短可点选，给候选不开放式让用户打字；multi_select=true 可多选）。" +
+		"detail 可选：长上下文完整展示在对话区；timeout_sec 可选（>0 时超时未答复返回" +
+		"\"自行决策\"，默认 0 不限）。"
 }
 
 // InputSchema 返回入参 JSON Schema（TODO #53 结构化选项）。

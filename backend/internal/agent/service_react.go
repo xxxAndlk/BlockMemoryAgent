@@ -83,6 +83,9 @@ type ReactService struct {
 	// Snapshot/Cancel 经由 Tree()/CancelAgent() 暴露给 HTTP API。
 	// treeStore 非 nil 时 TreeFor lazy init 会调 LoadFromStore 恢复历史节点(重启不丢)。
 	trees sync.Map
+	// createMu 串行化 CreateSession 的"查重-建会话"临界区：web 端重载/双开重发会
+	// 并发触发两次 CreateSession，无锁时查重窗口内双双通过、起两个并行同任务会话。
+	createMu sync.Mutex
 	// treeStore 可选的 Agent 树持久化层。为 nil 时纯内存。
 	// 由 bootstrap 注入 store.PostgresTreeStore;测试场景保持 nil。
 	treeStore orchestrator.TreeStore
@@ -516,6 +519,14 @@ func (s *ReactService) metaPersona(workDir string) PersonaInjector {
 	)
 }
 
+// metaPersonaLite 返回续轮（resumeSession）的轻量注入器：仅人格（soul）。
+// 画像/偏好属于首轮一次性注入（TODO 第八项 P0-2）：runSession 首轮带全量
+// metaPersona，此后每轮重发 ~4K runes 属纯重复（画像/偏好极少变化，且已在前缀
+// 缓存的历史里）——续轮只保留 soul 前缀，省 ~4K runes/呼。
+func (s *ReactService) metaPersonaLite() PersonaInjector {
+	return s.persona
+}
+
 // ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
 // 由 bootstrap 从 cfg.Agent 派生注入，避免 agent 包反向依赖 config 包；
 // 未注入时全部取零值，由 loopConfig 回退到合理默认值。
@@ -749,6 +760,15 @@ func NewReactService(
 
 // CreateSession 为指定目标创建一个新的 ReAct 会话，并异步启动 ReAct 主循环。
 func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*Session, error) {
+	// 防重复提交幂等闸：短间隔内（重载页面/新标签页/双击发送）对同一 goal 的重复
+	// 建会话请求直接返回既有运行中会话。2026-09-07 实证：web 端双开导致两个 session
+	// 并行执行同一任务 1 小时（其一被用户手动取消），白烧一半算力且互相写盘干扰。
+	// 只拦 running 态完全同 goal：awaiting_clarify/paused 会话无法代收新文本，放行新建。
+	s.createMu.Lock()
+	defer s.createMu.Unlock()
+	if dup := s.store.findRunningDuplicateSession(req.Goal); dup != nil {
+		return toReactAgentSession(dup), nil
+	}
 	// 首条消息携带的用户视频（Alt+V 粘贴视频文件）：服务端抽帧（兼容全部
 	// provider——所有现有 provider 均无原生视频输入 API），帧并入首轮图片走
 	// 现有图片链路，元数据文本并入 goal（持久化）；Videos 本身不落库。
@@ -1942,7 +1962,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
 		WithSkillBlock(s.metaSkillBlock()).
-		WithPersonaInjector(s.metaPersona(session.workDir))
+		WithPersonaInjector(s.metaPersonaLite())
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)

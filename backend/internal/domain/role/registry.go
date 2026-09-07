@@ -177,15 +177,15 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 	case "meta":
 		// 合成 MetaAgent：从配置的 MetaAgent 字段提取系统提示词与模型配置。
 		// CanBeCalled 为 false，因为元代理作为顶层协调者，不应被其他角色直接调用。
-		// Tools 暴露 call_sub_agent + WriteSharedMemory + HTTPGet：MetaAgent context 最贵
-		// （长跑 + 累积 mailbox 摘要），架构层禁 ReadFile/ListDir/SearchInFiles 防止越位读
-		// 文件 + 把原文粘进 task（log 实证 MetaAgent 违反 prompt 自律）。读文件交给 DomainAgent。
+		// Tools 暴露 call_sub_agent + 执行类工具（WriteFile/EditFile/ReadFile/RunCommand）：
+		// 2026-09-07 单循环默认化（TODO 第八项 P1-1）发还 ReadFile/RunCommand——中小任务
+		// Meta 直接读写与命令自检，不再强制派发；ListDir/SearchInFiles 仍不暴露（防越位
+		// 把原文粘进 task，定位活交给 scout/map_sub_agents/DomainAgent）。
 		// 保留 HTTPGet（内置默认）：MetaAgent 偶尔需联网查文档/API 参考，不涉及大块上下文。
 		// 注意：生产 config/roles.yaml 已通过 meta_agent.tools 覆盖去掉 HTTPGet——实证其
 		// 永远优先于需挂载的 web_search 插件被选中；联网调研集中于 meta + web_search 插件。
-		// roles.yaml meta_agent.tools 非空时整体覆盖白名单（基准单 Agent 模式：
-		// 去掉 call_sub_agent、放开执行类工具）；为空保持上述内置默认。
-		tools := []string{"call_sub_agent", "call_sub_agents", "WriteSharedMemory", "WriteSpec", "HTTPGet", "create_role", "list_roles", "RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "write_plan", "submit_plan", "review_plan", "remember_preference", "search_knowledge", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount", "list_skills", "load_skill"}
+		// roles.yaml meta_agent.tools 非空时整体覆盖白名单；为空保持上述内置默认。
+		tools := []string{"call_sub_agent", "call_sub_agents", "map_sub_agents", "WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "ReadMedia", "WriteFile", "EditFile", "RestoreFile", "ReadFile", "RunCommand", "HTTPGet", "create_role", "list_roles", "RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "write_plan", "submit_plan", "review_plan", "remember_preference", "search_knowledge", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount", "list_skills", "load_skill"}
 		if len(r.cfg.MetaAgent.Tools) > 0 {
 			tools = r.cfg.MetaAgent.Tools
 		}
@@ -214,10 +214,11 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 			Type:         enums.RoleTypeDomain,
 			SystemPrompt: domainPrompt,
 			ModelConfig:  r.cfg.DomainAgent.ModelConfig,
+			Skills:       r.cfg.DomainAgent.Skills,
 			Tools: []string{
-				"call_sub_agent", "call_sub_agents",
-				"ReadFile", "ListDir", "SearchInFiles", "HTTPGet",
-				"WriteSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RestoreFile", "RunCommand",
+				"call_sub_agent", "call_sub_agents", "map_sub_agents",
+				"ReadFile", "ListDir", "SearchInFiles", "HTTPGet", "ReadMedia",
+				"WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RestoreFile", "RunCommand",
 				"RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "search_knowledge",
 				"plugin_list", "tool_catalog", "tool_mount", "tool_unmount",
 				"submit_plan", "review_plan",

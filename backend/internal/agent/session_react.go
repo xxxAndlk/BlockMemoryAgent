@@ -217,6 +217,28 @@ func (st *reactSessionStore) logError(ctx context.Context, msg string, err error
 	log.Printf("%s: %v", msg, err)
 }
 
+// findRunningDuplicateSession 返回 goal 完全一致（trim 后）且仍在 running 的既有
+// 会话（取最新）。仅匹配 running：awaiting_clarify/paused 会话无法代收新文本，
+// 放行新建。供 CreateSession 防重复提交幂等闸使用。
+func (st *reactSessionStore) findRunningDuplicateSession(goal string) *reactInternalSession {
+	target := strings.TrimSpace(goal)
+	if target == "" {
+		return nil
+	}
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	var newest *reactInternalSession
+	for _, sess := range st.sessions {
+		if sess.Status != enums.SessionStatusRunning || strings.TrimSpace(sess.Goal) != target {
+			continue
+		}
+		if newest == nil || sess.StartedAt.After(newest.StartedAt) {
+			newest = sess
+		}
+	}
+	return newest
+}
+
 // createSession 创建一个运行中的 React 会话。
 // goal: 用户输入的任务目标字符串。
 // workDir: 每会话工作目录（绝对路径），空串回落 st.workDir（进程默认）。
