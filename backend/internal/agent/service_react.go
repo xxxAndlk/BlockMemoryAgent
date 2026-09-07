@@ -1355,8 +1355,8 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 }
 
 // ListAgents 返回与会话关联的运行时 Agent 实例列表。
-// 在 ReAct 重构期间，这里返回单个 MetaAgent 节点，以保持 TUI 树形面板继续渲染；
-// 后续阶段将根据子 Agent 事件流构建完整树。
+// MetaAgent 为固定根节点，子 Agent 实例来自权威 Agent 树（TreeFor），
+// 顶层派发节点挂到 MetaAgent 下形成完整层级（Idle 热驻节点由展示层过滤）。
 func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]AgentInstance, error) {
 	// 获取会话快照，确认会话存在。
 	sess := s.store.snapshotSessionByID(sessionID)
@@ -1368,14 +1368,37 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 	if sess.Status == enums.SessionStatusCompleted || sess.Status == enums.SessionStatusError {
 		status = string(enums.RoleStatusDone)
 	}
-	return []AgentInstance{
+	instances := []AgentInstance{
 		{
 			Name:     "MetaAgent",
 			Role:     "meta",
 			RoleType: enums.RoleTypeMeta,
 			Status:   status,
+			ModuleID: "meta",
 		},
-	}, nil
+	}
+	// 权威树快照 → 实例视图：ModuleID=节点 ID，ParentID=父节点 ID（顶层挂 meta）。
+	for _, n := range s.TreeFor(sessionID).Snapshot() {
+		parent := n.ParentID
+		if parent == "" {
+			parent = "meta"
+		}
+		name := n.Domain
+		if name == "" {
+			name = n.Role
+		}
+		instances = append(instances, AgentInstance{
+			Name:      name,
+			Role:      n.Role,
+			ModuleID:  n.ID,
+			ParentID:  parent,
+			Status:    n.Status.String(),
+			Domain:    n.Domain,
+			Goal:      n.Task,
+			RoleDefID: n.Role,
+		})
+	}
+	return instances, nil
 }
 
 // TreeFor 按 sessionID 取得权威 Agent 树（不存在则 lazy 创建并从持久化层恢复）。
@@ -2032,7 +2055,8 @@ func (s *ReactService) finalizeThinking(session *reactInternalSession, ev LiveEv
 	if ev.Agent != "" {
 		text = strings.TrimPrefix(text, "【"+ev.Agent+"】\n")
 	}
-	text = textutil.TruncateRunes(strings.TrimSpace(text), 500, "…")
+	// 思考文本不在事件层截断：Web 需全量回看，TUI 展示侧自行折叠。
+	text = strings.TrimSpace(text)
 	if text == "" {
 		s.store.setThinkingText(session, "")
 		return

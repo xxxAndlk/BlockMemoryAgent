@@ -421,8 +421,8 @@ func (st *reactSessionStore) setThinkingText(session *reactInternalSession, text
 // prompt: 原始提示词；inputTokens/outputTokens: token 用量；cacheHit/cacheMiss: 缓存命中/未命中
 // token（TODO #40 可观测）；detailJSON: 额外调试 JSON。
 func (st *reactSessionStore) addEventDebug(session *reactInternalSession, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError string, success bool, prompt string, inputTokens, outputTokens, cacheHit, cacheMiss int, detailJSON string) {
-	// 对工具输出做截断，避免单条事件过大占用内存与数据库空间。
-	toolOutput = textutil.TruncateRunes(toolOutput, 4096, "...(truncated)")
+	// 工具输出不在事件层截断（上限由工具执行层 ReadFileMaxChars/RunCommandMaxOutput 兜底），
+	// Web 详情需展示全量，TUI 在展示侧自行压缩（helpers.truncateToolOutput）。
 	// 组装内部事件结构体，填充所有字段。
 	ev := internalEvent{
 		Type:         eventType,
@@ -614,7 +614,7 @@ func (st *reactSessionStore) persistEvents(session *reactInternalSession) {
 			Kind:         ev.Kind,
 			Tool:         ev.Tool,
 			ToolPath:     sanitizeUTF8(ev.ToolPath),
-			ToolOutput:   sanitizeUTF8(textutil.TruncateRunes(ev.ToolOutput, 2048, "...(truncated)")),
+			ToolOutput:   sanitizeUTF8(ev.ToolOutput),
 			ToolError:    sanitizeUTF8(ev.ToolError),
 			Success:      ev.Success,
 			Timestamp:    ev.Timestamp,

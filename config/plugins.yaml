@@ -158,42 +158,45 @@ plugins:
       volumes: ["bma-open-design-data:/app/.od"]
       env:
         OD_API_TOKEN: ${OD_API_TOKEN:}
-        # 火山方舟 key：透传给守护进程。ARK_API_KEY 启用 volcengine provider；
-        # OD_CUSTOM_IMAGE_API_KEY 启用 custom-image provider（Agent 生图实际走
-        # 这条——daemon 模型目录只认注册 id，见下方 ui_design 的 OD_DEFAULT_MODEL）。
-        ARK_API_KEY: ${ARK_API_KEY:}
-        OD_CUSTOM_IMAGE_API_KEY: ${ARK_API_KEY:}
-        # 生视频（2026-09-04）：OD_AIHUBMIX_API_KEY = OpenAI /videos 协议网关的 key
-        #（daemon aihubmix provider 槽位）；方舟 tasks 协议网关继续用 ARK_API_KEY。
-        # OD_MEDIA_MODEL_ALIASES 可选：方舟侧自定义接入点 id 时填 JSON 映射，如
-        # {"doubao-seedance-2-0-fast-260128":"ep-xxx"}（daemon 渲染前改写 wire 模型名）。
-        OD_AIHUBMIX_API_KEY: ${VIDEO_OPENAI_API_KEY:}
-        OD_MEDIA_MODEL_ALIASES: ${OD_MEDIA_MODEL_ALIASES:}
+        # ---- 媒体生成统一入口（6 个值全在 .env「媒体生成」块，见 .env.example）----
+        # 生图 KEY：同时点亮 volcengine 与 custom-image 两个 provider 槽位
+        #（Agent 生图实际走 custom-image = OpenAI 兼容 /images/generations，
+        #  baseUrl/model 由下方 sync_files 落盘 media-config.json——daemon 对
+        #  这两项无 env 覆盖）。
+        ARK_API_KEY: ${IMAGE_KEY:}
+        OD_CUSTOM_IMAGE_API_KEY: ${IMAGE_KEY:}
+        # 生视频 KEY：OpenAI /videos 协议网关（aihubmix provider 槽位，配
+        # VIDEO_PROVIDER=openai）。若切 VIDEO_PROVIDER=volcengine（方舟 tasks
+        # 协议），视频 key 复用 ARK_API_KEY（daemon 上游限制：volcengine 槽位
+        # 无独立 key），届时 VIDEO_KEY 不生效。
+        OD_AIHUBMIX_API_KEY: ${VIDEO_KEY:}
+        # 方舟自定义接入点映射（仅 provider=volcengine 且用接入点 id 时需要，
+        # daemon 渲染前改写 wire 模型名）：
+        # OD_MEDIA_MODEL_ALIASES: {"doubao-seedance-2-0-fast-260128":"ep-xxx"}
       requires_env: ["OD_API_TOKEN"]
       url: http://localhost:7456
       health_url: http://localhost:7456/api/health
-      # 生图 baseUrl + wire 模型（火山方舟 Agent Plan 网关）：daemon 对这两项无
-      # 环境变量覆盖（env 只覆盖 apiKey），故经 sync_files 在容器健康就绪后自动
-      # 深合并写入容器内 /app/.od/media-config.json（volume 持久）。
-      # custom-image provider = OpenAI 兼容 /images/generations 直调：
-      # baseUrl 取 .env 的 ARK_BASE_URL（未设置则展开为空串、该键跳过），
-      # model 是发给网关的真实模型名——Agent Plan 仅支持 doubao-seedream-5.0-lite
-      #（实测 2026-08-18：seedream-3-0/4-0/4-5 均被 UnsupportedModel 拒）。
+      # 生图/生视频 baseUrl + 模型：daemon 对这些项无环境变量覆盖（env 只覆盖
+      # apiKey），故经 sync_files 在容器健康就绪后深合并写入容器内
+      # /app/.od/media-config.json（volume 持久）。变量未填时展开为空串、该键
+      # 跳过（provider 保持 daemon 缺省/容器内旧值）。6 个值统一在 .env 维护。
       sync_files:
         - path: /app/.od/media-config.json
           json:
             providers:
+              # 生图（custom-image provider = OpenAI 兼容 /images/generations
+              # 直调；model = 发给网关的真实模型名）
               custom-image:
-                baseUrl: ${GEMINI_IMAGE_URL}
-                model: imagen # doubao-seedream-5.0-lite
-              # 生视频双协议槽位（2026-09-04）：aihubmix = OpenAI /videos 协议网关
-              #（任意模型名，目录旁路）；volcengine = 方舟 tasks 协议网关，baseUrl
-              # 缺省官方地址，仅自定义网关时需覆盖。空串键跳过（同 custom-image）。
+                baseUrl: ${IMAGE_URL:}
+                model: ${IMAGE_MODEL:}
+              # 生视频（OpenAI /videos 协议，VIDEO_PROVIDER=openai 时用；模型名任意）
               aihubmix:
-                baseUrl: ${VIDEO_OPENAI_URL:}
-                model: ${VIDEO_OPENAI_MODEL:}
+                baseUrl: ${VIDEO_URL:}
+                model: ${VIDEO_MODEL:}
+              # 生视频（方舟 tasks 协议，VIDEO_PROVIDER=volcengine 时用；baseUrl
+              # 缺省官方地址，仅自定义网关时填 VIDEO_URL 覆盖）
               volcengine:
-                baseUrl: ${VIDEO_VOLC_URL:}
+                baseUrl: ${VIDEO_URL:}
       # 注：service 插件不注入工具也不解析 roles（Tools 恒空），角色门控无意义。
 
   # ui_design：Agent 画图工具（kind: mcp，2026-08-17 新增）。
@@ -239,13 +242,15 @@ plugins:
         OD_DEFAULT_MODEL: custom-image
         # 缺省产物（未传 save_as 的草稿）返回给 Agent 的宿主侧相对路径前缀（相对工作目录）。
         OD_OUTPUT_REL_PREFIX: .bma/od-artifacts
-        # 生视频（od_video_generate）：provider 缺省 volcengine（方舟 tasks 协议）；
-        # openai = OpenAI /videos 协议网关（模型名裸填，桥自动补 aihubmix- 前缀）。
-        # 视频单条 30s–5min，桥侧超时独立（默认 720s，图片仍 180s）。
-        OD_VIDEO_PROVIDER: ${VIDEO_PROVIDER:}
-        OD_VOLCENGINE_VIDEO_MODEL: ${VIDEO_VOLC_MODEL:}
-        OD_OPENAI_VIDEO_MODEL: ${VIDEO_OPENAI_MODEL:}
-        OD_VIDEO_TIMEOUT_MS: ${OD_VIDEO_TIMEOUT_MS:}
+        # 生视频（od_video_generate）：provider 取 .env VIDEO_PROVIDER（缺省
+        # volcengine=方舟 tasks 协议；openai=OpenAI /videos 协议，模型名裸填，
+        # 桥自动补 aihubmix- 前缀）。两个模型槽位统一喂 VIDEO_MODEL（同一视频
+        # 网关下只需填一个模型名）。视频单条 30s–5min，桥侧超时独立
+        #（默认 720s，图片仍 180s）。
+        OD_VIDEO_PROVIDER: openai-chat
+        OD_VOLCENGINE_VIDEO_MODEL: ${VIDEO_MODEL:}
+        OD_OPENAI_VIDEO_MODEL: ${VIDEO_MODEL:}
+        OD_VIDEO_TIMEOUT_MS: 180
       roles: ["meta","domain","ui_assistant"]
       # 1200s：批量 20+ 张 × 单张最长 60s（桥内串行）可能逼近 20min，见上方注释。
       exec_timeout_sec: 1200

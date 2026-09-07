@@ -23,7 +23,7 @@ meta_agent:
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.1
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
-    thinking: off # 2026-09-06 对擂实测：doubao-seed-evolving 端点接受 thinking.type=disabled（curl 200/1.1s），max→low→off 逐轮提速（meta 均延 40.1→22.1s→预期 ~10s）
+    thinking: high # 2026-09-06 对擂实测：doubao-seed-evolving 端点接受 thinking.type=disabled（curl 200/1.1s），max→low→off 逐轮提速（meta 均延 40.1→22.1s→预期 ~10s）
     # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
     # 已切换 k3(非推理, 与 domain 同端点)：2026-08-04 基线运行 glm-5.2 路由 3m18s + 汇总多次 thinking 共 322s，
     # k3 路由决策应控制在 1 分钟内，配合下方【派发铁律】提示词。
@@ -338,10 +338,10 @@ meta_agent:
 domain_agent:
   model_config: &domain_model
     provider: anthropic
-    model: doubao-seed-evolving  # 2026-09-06 对擂实测：glm-5.3-flash domain 单呼均延 57.6s（80 呼 4608s，占总耗时 71%）；evolving 同端点同协议 meta 侧均延 27.6s，切域执行层提速
+    model: glm-5.3-flash  # 2026-09-06 对擂实测：glm-5.3-flash domain 单呼均延 57.6s（80 呼 4608s，占总耗时 71%）；evolving 同端点同协议 meta 侧均延 27.6s，切域执行层提速
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ${ANTHROPIC_BASE_URL}
-    temperature: 0.5
+    temperature: 0
     max_tokens: 128000  # DomainAgent 自执行 WriteFile 时需容纳大文件 + 派发推理；Volces ark 硬上限 128000，顶格设
     thinking: low        # 2026-09-06 对擂实测：off 档步数翻倍且完成度下滑（round-5 C=0.849 双输 round-4 的 0.948/4491s），编码执行层须留推理预算；off 仅 meta 这类路由/汇总角色适用。glm 系 ark 端点不支持 disabled（400），仅 doubao 角色可关
   system_prompt: |
@@ -684,7 +684,7 @@ fixed_roles:
     tools: [ReadFile, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &ui_model
       provider: openai-chat
-      model: gemini-flash
+      model: ${GEMINI_CHAT_MODEL}
       api_key: xxx
       base_url: ${GEMINI_CHAT_URL}
       temperature: 0.2

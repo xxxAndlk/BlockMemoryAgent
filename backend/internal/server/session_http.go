@@ -130,7 +130,7 @@ type agentNode struct {
 	Type      string `json:"type"`               // 角色类型
 	Domain    string `json:"domain"`             // 所属领域
 	Status    string `json:"status"`             // 当前状态
-	ParentID  string `json:"parent_id"`          // 父节点 ID（当前固定为空）
+	ParentID  string `json:"parent_id"`          // 父节点 ID（空表示顶层）
 	Goal      string `json:"goal,omitempty"`     // 目标（可选）
 	BlockID   string `json:"block_id,omitempty"` // 所属 Block ID（可选）
 }
@@ -162,10 +162,12 @@ func (m *SessionManager) HandleSessionAgents(c *gin.Context) {
 
 	nodes := make([]agentNode, 0, len(instances))
 	for _, inst := range instances {
-		goal := ""
+		goal := inst.Goal
 		blockID := ""
 		if inst.Domain != "" {
-			goal = blockGoalByDomain[inst.Domain]
+			if g, ok := blockGoalByDomain[inst.Domain]; ok && g != "" {
+				goal = g
+			}
 			blockID = blockIDByDomain[inst.Domain]
 		}
 		nodes = append(nodes, agentNode{
@@ -175,7 +177,7 @@ func (m *SessionManager) HandleSessionAgents(c *gin.Context) {
 			Type:      inst.Role,
 			Domain:    inst.Domain,
 			Status:    inst.Status,
-			ParentID:  "",
+			ParentID:  inst.ParentID,
 			Goal:      goal,
 			BlockID:   blockID,
 		})
