@@ -40,6 +40,10 @@ type RoleDefinition struct {
 	// 非空 AllowedWritePaths 时，该角色 WriteFile 只能写到这些路径（相对 workDir 解析）下，
 	// 用于多 Agent 并发写隔离。dormant opt-in：未配置则零开销跳过。
 	Sandbox *RoleSandbox `json:"sandbox,omitempty" yaml:"sandbox,omitempty"`
+	// SpecExempt 豁免派发前 WriteSpec 强制校验（TODO 第七项② scout 专用）：
+	// 侦察类角色是探索本身，spec 先于探索存在会让"先定位再侦察"倒置；
+	// 同时缺省派发墙钟取 5 分钟（dispatchOne），防侦察类任务无预算上限。
+	SpecExempt bool `json:"spec_exempt,omitempty" yaml:"spec_exempt,omitempty"`
 }
 
 // RoleSandbox 角色级写沙箱。AllowedWritePaths 为相对 workDir 的路径前缀列表

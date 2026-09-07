@@ -239,6 +239,28 @@ func (st *reactSessionStore) logError(ctx context.Context, msg string, err error
 	log.Printf("%s: %v", msg, err)
 }
 
+// findRunningDuplicateSession 返回 goal 完全一致（trim 后）且仍在 running 的既有
+// 会话（取最新）。仅匹配 running：awaiting_clarify/paused 会话无法代收新文本，
+// 放行新建。供 CreateSession 防重复提交幂等闸使用。
+func (st *reactSessionStore) findRunningDuplicateSession(goal string) *reactInternalSession {
+	target := strings.TrimSpace(goal)
+	if target == "" {
+		return nil
+	}
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	var newest *reactInternalSession
+	for _, sess := range st.sessions {
+		if sess.Status != enums.SessionStatusRunning || strings.TrimSpace(sess.Goal) != target {
+			continue
+		}
+		if newest == nil || sess.StartedAt.After(newest.StartedAt) {
+			newest = sess
+		}
+	}
+	return newest
+}
+
 // createSession 创建一个运行中的 React 会话。
 // goal: 用户输入的任务目标字符串。
 // workDir: 每会话工作目录（绝对路径），空串回落 st.workDir（进程默认）。
@@ -458,8 +480,8 @@ func (st *reactSessionStore) setThinkingText(session *reactInternalSession, text
 // prompt: 原始提示词；inputTokens/outputTokens: token 用量；cacheHit/cacheMiss: 缓存命中/未命中
 // token（TODO #40 可观测）；detailJSON: 额外调试 JSON。
 func (st *reactSessionStore) addEventDebug(session *reactInternalSession, eventType, agentName, message, kind, tool, toolPath, toolOutput, toolError string, success bool, prompt string, inputTokens, outputTokens, cacheHit, cacheMiss int, detailJSON string) {
-	// 对工具输出做截断，避免单条事件过大占用内存与数据库空间。
-	toolOutput = textutil.TruncateRunes(toolOutput, 4096, "...(truncated)")
+	// 工具输出不在事件层截断（上限由工具执行层 ReadFileMaxChars/RunCommandMaxOutput 兜底），
+	// Web 详情需展示全量，TUI 在展示侧自行压缩（helpers.truncateToolOutput）。
 	// 组装内部事件结构体，填充所有字段。
 	ev := internalEvent{
 		Type:         eventType,
@@ -669,7 +691,7 @@ func (st *reactSessionStore) persistEvents(session *reactInternalSession) {
 			Kind:         ev.Kind,
 			Tool:         ev.Tool,
 			ToolPath:     sanitizeUTF8(ev.ToolPath),
-			ToolOutput:   sanitizeUTF8(textutil.TruncateRunes(ev.ToolOutput, 2048, "...(truncated)")),
+			ToolOutput:   sanitizeUTF8(ev.ToolOutput),
 			ToolError:    sanitizeUTF8(ev.ToolError),
 			Success:      ev.Success,
 			Timestamp:    ev.Timestamp,

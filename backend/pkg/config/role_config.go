@@ -54,6 +54,7 @@ type MetaAgentConfig struct {
 type DomainAgentConfig struct {
 	ModelConfig  types.AgentModelConfig `yaml:"model_config"`  // 共享模型配置
 	SystemPrompt string                 `yaml:"system_prompt"` // DomainAgent 系统提示词（含 skim/WriteSharedMemory/拆分纪律）
+	Skills       []string               `yaml:"skills"`        // 固定持有技能（按 Name 或 SkillID 匹配池；空=不持有）
 }
 
 // DynamicRoleTemplate 动态角色模板。

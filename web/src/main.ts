@@ -8,6 +8,7 @@ import 'element-plus/theme-chalk/dark/css-vars.css'
 import {
   Aim,
   ArrowDown,
+  ArrowLeft,
   ArrowRight,
   ArrowUp,
   Calendar,
@@ -74,6 +75,7 @@ const app = createApp(App)
 const icons = [
   Aim,
   ArrowDown,
+  ArrowLeft,
   ArrowRight,
   ArrowUp,
   Calendar,

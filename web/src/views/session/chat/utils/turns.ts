@@ -279,6 +279,35 @@ function extractToolName(msg?: string): string | undefined {
   return undefined
 }
 
+/** 从调用参数 JSON 中提取一行关键入参摘要（读了哪个文件 / 跑了什么命令 / 请求哪个 URL） */
+export function toolHeadline(group: ToolCallGroup): string {
+  const raw = group.call?.detail_json || group.call?.tool_args || ''
+  let args: Record<string, unknown> = {}
+  if (raw) {
+    try {
+      args = JSON.parse(raw)
+    } catch {
+      args = {}
+    }
+  }
+  switch (group.tool) {
+    case 'ReadFile':
+    case 'WriteFile':
+    case 'EditFile':
+    case 'ListDir':
+      return String(args.path || group.result?.tool_path || '')
+    case 'RunCommand':
+      return String(args.command || '')
+    case 'HTTPGet':
+    case 'HTTPPost':
+      return String(args.url || '')
+    case 'SearchInFiles':
+      return String(args.pattern || '')
+    default:
+      return group.result?.tool_path || ''
+  }
+}
+
 /** 简洁模式过滤：剔除偏调试用的事件 */
 export function filterTurnForConcise(turn: Turn): Turn {
   return {

@@ -84,6 +84,9 @@ type ReactService struct {
 	// Snapshot/Cancel 经由 Tree()/CancelAgent() 暴露给 HTTP API。
 	// treeStore 非 nil 时 TreeFor lazy init 会调 LoadFromStore 恢复历史节点(重启不丢)。
 	trees sync.Map
+	// createMu 串行化 CreateSession 的"查重-建会话"临界区：web 端重载/双开重发会
+	// 并发触发两次 CreateSession，无锁时查重窗口内双双通过、起两个并行同任务会话。
+	createMu sync.Mutex
 	// treeStore 可选的 Agent 树持久化层。为 nil 时纯内存。
 	// 由 bootstrap 注入 store.PostgresTreeStore;测试场景保持 nil。
 	treeStore orchestrator.TreeStore
@@ -517,6 +520,14 @@ func (s *ReactService) metaPersona(workDir string) PersonaInjector {
 	)
 }
 
+// metaPersonaLite 返回续轮（resumeSession）的轻量注入器：仅人格（soul）。
+// 画像/偏好属于首轮一次性注入（TODO 第八项 P0-2）：runSession 首轮带全量
+// metaPersona，此后每轮重发 ~4K runes 属纯重复（画像/偏好极少变化，且已在前缀
+// 缓存的历史里）——续轮只保留 soul 前缀，省 ~4K runes/呼。
+func (s *ReactService) metaPersonaLite() PersonaInjector {
+	return s.persona
+}
+
 // ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
 // 由 bootstrap 从 cfg.Agent 派生注入，避免 agent 包反向依赖 config 包；
 // 未注入时全部取零值，由 loopConfig 回退到合理默认值。
@@ -750,6 +761,15 @@ func NewReactService(
 
 // CreateSession 为指定目标创建一个新的 ReAct 会话，并异步启动 ReAct 主循环。
 func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*Session, error) {
+	// 防重复提交幂等闸：短间隔内（重载页面/新标签页/双击发送）对同一 goal 的重复
+	// 建会话请求直接返回既有运行中会话。2026-09-07 实证：web 端双开导致两个 session
+	// 并行执行同一任务 1 小时（其一被用户手动取消），白烧一半算力且互相写盘干扰。
+	// 只拦 running 态完全同 goal：awaiting_clarify/paused 会话无法代收新文本，放行新建。
+	s.createMu.Lock()
+	defer s.createMu.Unlock()
+	if dup := s.store.findRunningDuplicateSession(req.Goal); dup != nil {
+		return toReactAgentSession(dup), nil
+	}
 	// 首条消息携带的用户视频（Alt+V 粘贴视频文件）：服务端抽帧（兼容全部
 	// provider——所有现有 provider 均无原生视频输入 API），帧并入首轮图片走
 	// 现有图片链路，元数据文本并入 goal（持久化）；Videos 本身不落库。
@@ -1417,8 +1437,8 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 }
 
 // ListAgents 返回与会话关联的运行时 Agent 实例列表。
-// 在 ReAct 重构期间，这里返回单个 MetaAgent 节点，以保持 TUI 树形面板继续渲染；
-// 后续阶段将根据子 Agent 事件流构建完整树。
+// MetaAgent 为固定根节点，子 Agent 实例来自权威 Agent 树（TreeFor），
+// 顶层派发节点挂到 MetaAgent 下形成完整层级（Idle 热驻节点由展示层过滤）。
 func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]AgentInstance, error) {
 	// 获取会话快照，确认会话存在。
 	sess := s.store.snapshotSessionByID(sessionID)
@@ -1430,14 +1450,37 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 	if sess.Status == enums.SessionStatusCompleted || sess.Status == enums.SessionStatusError {
 		status = string(enums.RoleStatusDone)
 	}
-	return []AgentInstance{
+	instances := []AgentInstance{
 		{
 			Name:     "MetaAgent",
 			Role:     "meta",
 			RoleType: enums.RoleTypeMeta,
 			Status:   status,
+			ModuleID: "meta",
 		},
-	}, nil
+	}
+	// 权威树快照 → 实例视图：ModuleID=节点 ID，ParentID=父节点 ID（顶层挂 meta）。
+	for _, n := range s.TreeFor(sessionID).Snapshot() {
+		parent := n.ParentID
+		if parent == "" {
+			parent = "meta"
+		}
+		name := n.Domain
+		if name == "" {
+			name = n.Role
+		}
+		instances = append(instances, AgentInstance{
+			Name:      name,
+			Role:      n.Role,
+			ModuleID:  n.ID,
+			ParentID:  parent,
+			Status:    n.Status.String(),
+			Domain:    n.Domain,
+			Goal:      n.Task,
+			RoleDefID: n.Role,
+		})
+	}
+	return instances, nil
 }
 
 // TreeFor 按 sessionID 取得权威 Agent 树（不存在则 lazy 创建并从持久化层恢复）。
@@ -1987,7 +2030,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
 		WithSkillBlock(s.metaSkillBlock()).
-		WithPersonaInjector(s.metaPersona(session.workDir))
+		WithPersonaInjector(s.metaPersonaLite())
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -2100,7 +2143,8 @@ func (s *ReactService) finalizeThinking(session *reactInternalSession, ev LiveEv
 	if ev.Agent != "" {
 		text = strings.TrimPrefix(text, "【"+ev.Agent+"】\n")
 	}
-	text = textutil.TruncateRunes(strings.TrimSpace(text), 500, "…")
+	// 思考文本不在事件层截断：Web 需全量回看，TUI 展示侧自行折叠。
+	text = strings.TrimSpace(text)
 	if text == "" {
 		s.store.setThinkingText(session, "")
 		return

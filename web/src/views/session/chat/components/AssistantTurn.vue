@@ -2,12 +2,12 @@
 import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { SessionEvent, ClarifyOption } from '@/types'
-import type { Turn, ToolCallGroup } from '../utils/turns'
+import type { Turn } from '../utils/turns'
 import { fmtTime, agentTextColor } from '../utils/eventStyles'
 import { renderMd } from '@/utils/markdown'
 import { clarifySession } from '@/api/session'
 import ThinkChain from './ThinkChain.vue'
-import ToolCallCard from './ToolCallCard.vue'
+import ToolActivity from './ToolActivity.vue'
 
 const props = defineProps<{
   turn: Turn
@@ -43,41 +43,20 @@ const statusColor = computed(() => {
 
 const primaryAgent = computed(() => props.turn.agents[0] || 'MetaAgent')
 
-// 把按时间交错的 steps 切成渲染块：连续的 think 合并成一段 ThinkChain，
-// 每个 tool 单独一张 ToolCallCard。这样保留 ReAct 时序
-// （思考 → 工具调用 → 结果 → 下一轮思考），而非原先工具与思考分离两块。
-interface ThinkBlock { type: 'think'; events: SessionEvent[] }
-interface ToolBlock { type: 'tool'; group: ToolCallGroup }
-type RenderBlock = ThinkBlock | ToolBlock
-
-const blocks = computed<RenderBlock[]>(() => {
-  const out: RenderBlock[] = []
+// 思考链只展示最后一段连续 think（运行时替换而非累计）；
+// 工具调用不再逐条渲染，交给 ToolActivity 单行就地替换 + 结束后折叠汇总。
+const lastThinkEvents = computed<SessionEvent[]>(() => {
   let buf: SessionEvent[] = []
-  const flush = () => {
-    if (buf.length) {
-      out.push({ type: 'think', events: buf })
-      buf = []
-    }
-  }
+  let last: SessionEvent[] = []
   for (const step of props.turn.steps) {
     if (step.kind === 'think' && step.event) {
       buf.push(step.event)
-    } else if (step.kind === 'tool' && step.group) {
-      flush()
-      out.push({ type: 'tool', group: step.group })
+      last = buf
+    } else if (step.kind === 'tool') {
+      buf = []
     }
   }
-  flush()
-  return out
-})
-
-// 最后一条 think block 的索引：运行时只展示最新思考，替换而非累计
-const lastThinkIndex = computed(() => {
-  const bs = blocks.value
-  for (let i = bs.length - 1; i >= 0; i--) {
-    if (bs[i].type === 'think') return i
-  }
-  return -1
+  return last
 })
 
 // ---- 待澄清选项交互 ----
@@ -141,12 +120,9 @@ async function submitOption(optionId?: string) {
         </span>
       </div>
 
-      <!-- ReAct 步骤：按时间交错渲染思考链与工具调用，保留时序。
-           思考步骤仅展示最新一条（运行时替换），工具调用全部保留。 -->
-      <template v-for="(b, i) in blocks" :key="i">
-        <ThinkChain v-if="b.type === 'think' && i === lastThinkIndex" :events="b.events" :verbose="verbose" />
-        <ToolCallCard v-else-if="b.type === 'tool'" :group="b.group" />
-      </template>
+      <!-- 思考链（仅最后一段，运行时替换）+ 工具活动（单行就地替换 / 结束后折叠汇总） -->
+      <ThinkChain v-if="lastThinkEvents.length" :events="lastThinkEvents" :verbose="verbose" />
+      <ToolActivity :groups="turn.toolCalls" :running="turn.status === 'running'" />
 
       <!-- 错误事件 -->
       <div v-for="(err, i) in turn.errors" :key="'err-' + i"

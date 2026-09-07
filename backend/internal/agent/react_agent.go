@@ -753,10 +753,10 @@ func (a *ReActAgent) stagnationGuard(streak int, calls []ToolCall, mailboxDraine
 		return history, streak, fmt.Errorf("%w: 连续 %d 轮无任何产出性动作（未写文件/未派发/未收发消息/未终答），判定停滞强制终止。已有部分产出已保留，可缩小任务范围后重派", tool.ErrLoopExit, streak)
 	case streak == stagnationFinalWarnRounds:
 		history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
-			"【停滞最终警告】已连续 %d 轮没有任何产出（未写文件/未派发/未收发消息/未终答）。下一轮必须给出产出：写文件、派发子 Agent 或直接输出终答，三选一；继续只读探查将被判定停滞并强制终止。", streak)})
+			"【停滞最终警告】已连续 %d 轮没有任何产出（未写文件/未派发/未收发消息/未终答）。换个策略推进：若当前路径走不通，改变方法或上报阻塞（ask_user/send_message 说明卡点）；确认确实无进展再收敛输出终答。", streak)})
 	case streak == stagnationWarnRounds:
 		history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
-			"【停滞预警】已连续 %d 轮没有任何产出性动作（仅只读探查/验证）。若证据已足够，立即基于已有信息收尾：写文件、派发或输出终答；不要继续重复探查同一问题。", streak)})
+			"【停滞预警】已连续 %d 轮没有任何产出性动作（仅只读探查/验证）。若证据已足够，直接基于已有信息推进下一步（写文件/派发/终答）；若仍缺信息，换一个检索角度或换策略，不要重复同一探查。", streak)})
 	}
 	return history, streak, nil
 }
@@ -1442,6 +1442,14 @@ func (a *ReActAgent) drainMailbox(history []ReactMessage) ([]ReactMessage, int) 
 		return history, 0
 	}
 	msgs := a.mailbox.Drain(a.name)
+	// 注入测量（TODO 第七项③）：本回合邮箱入站总 runes，量化回传对上下文的贡献。
+	if len(msgs) > 0 {
+		inbound := 0
+		for _, m := range msgs {
+			inbound += len([]rune(m.Body))
+		}
+		log.Printf("[agent] ctx_inject: agent=%s stage=mailbox_inbound msgs=%d inbound=%d runes", a.name, len(msgs), inbound)
+	}
 	for _, m := range msgs {
 		// 将 mailbox 消息转为模型可见的 user 角色消息并加入历史。
 		history = append(history, mailboxMessageToReact(m))

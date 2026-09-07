@@ -80,8 +80,17 @@ watch(view, (v) => {
   router.replace({ query: { ...route.query, view: v === 'chat' ? undefined : v } })
 })
 
-// 右栏统一 5 Tab
+// 右栏统一 5 Tab；侧栏默认收起为图标条，点击展开
 const rightTab = ref<'board' | 'tools' | 'files' | 'memory' | 'metrics'>('board')
+const sidebarOpen = ref(false)
+const sideTabs = [
+  { name: 'board', label: '任务看板', icon: 'DataLine' },
+  { name: 'tools', label: '工具', icon: 'Tools' },
+  { name: 'files', label: '文件', icon: 'FolderOpened' },
+  { name: 'memory', label: '记忆', icon: 'Coin' },
+  { name: 'metrics', label: '指标', icon: 'DataAnalysis' },
+] as const
+const activeSideTab = computed(() => sideTabs.find((t) => t.name === rightTab.value))
 
 onMounted(async () => {
   // 工作目录页「发起新会话」跳入：?work_dir= 预填并固化（与提交时 setWorkDir 同策略）
@@ -417,30 +426,60 @@ function fmtDateTime(iso: string) {
       />
     </main>
 
-    <!-- 右栏：统一 5 Tab -->
-    <aside class="w-[320px] shrink-0 bg-card border border-line rounded-card overflow-hidden flex flex-col">
-      <el-tabs v-model="rightTab" class="session-right-tabs flex-1 flex flex-col min-h-0">
-        <el-tab-pane label="任务看板" name="board" class="flex-1 overflow-y-auto p-3">
-          <TaskBoardPanel :agents="agents" :board="board" />
-        </el-tab-pane>
-        <el-tab-pane label="工具" name="tools" class="flex-1 overflow-y-auto p-3">
-          <ToolPanel :events="events" />
-        </el-tab-pane>
-        <el-tab-pane label="文件" name="files" class="flex-1 overflow-hidden p-0">
-          <FilePreview :session-id="activeSession?.id || ''" :agents="agents" />
-        </el-tab-pane>
-        <el-tab-pane label="记忆" name="memory" class="flex-1 overflow-y-auto p-3">
-          <SessionMemoryPanel :session-id="activeSession?.id || ''" />
-        </el-tab-pane>
-        <el-tab-pane label="指标" name="metrics" class="flex-1 overflow-y-auto p-3">
-          <div class="space-y-3">
-            <MetricsCard :metrics="metrics" />
-            <TokenMetricsCard :token-metrics="tokenMetrics" />
-            <MailboxCard :messages="mailboxMessages" />
-            <HealthCard :health="health" />
-          </div>
-        </el-tab-pane>
-      </el-tabs>
+    <!-- 右栏：可收起侧栏（默认收起为图标条，点击展开；展开宽度 640px） -->
+    <aside class="shrink-0 bg-card border border-line rounded-card overflow-hidden flex flex-col transition-all duration-200"
+           :class="sidebarOpen ? 'w-[640px]' : 'w-[48px]'">
+      <template v-if="!sidebarOpen">
+        <div class="flex flex-col items-center gap-1 py-3 flex-1">
+          <el-tooltip content="展开侧栏" placement="left">
+            <button class="p-2 rounded-lg text-ink-2 hover:text-ink hover:bg-page transition-colors"
+                    @click="sidebarOpen = true">
+              <el-icon :size="16"><ArrowLeft /></el-icon>
+            </button>
+          </el-tooltip>
+          <div class="w-6 border-t border-line my-1"></div>
+          <el-tooltip v-for="t in sideTabs" :key="t.name" :content="t.label" placement="left">
+            <button class="p-2 rounded-lg transition-colors"
+                    :class="rightTab === t.name ? 'text-primary bg-primary-soft' : 'text-ink-2 hover:text-ink hover:bg-page'"
+                    @click="rightTab = t.name; sidebarOpen = true">
+              <el-icon :size="16"><component :is="t.icon" /></el-icon>
+            </button>
+          </el-tooltip>
+        </div>
+      </template>
+      <template v-else>
+        <div class="h-10 shrink-0 flex items-center justify-between px-4 border-b border-line">
+          <span class="text-sm font-bold text-ink">{{ activeSideTab?.label }}</span>
+          <el-tooltip content="收起侧栏" placement="left">
+            <button class="p-1.5 rounded-lg text-ink-2 hover:text-ink hover:bg-page transition-colors"
+                    @click="sidebarOpen = false">
+              <el-icon :size="16"><ArrowRight /></el-icon>
+            </button>
+          </el-tooltip>
+        </div>
+        <el-tabs v-model="rightTab" class="session-right-tabs flex-1 flex flex-col min-h-0">
+          <el-tab-pane label="任务看板" name="board" class="flex-1 overflow-y-auto p-3">
+            <TaskBoardPanel :agents="agents" :board="board" />
+          </el-tab-pane>
+          <el-tab-pane label="工具" name="tools" class="flex-1 overflow-y-auto p-3">
+            <ToolPanel :events="events" />
+          </el-tab-pane>
+          <el-tab-pane label="文件" name="files" class="flex-1 overflow-hidden p-0">
+            <FilePreview :session-id="activeSession?.id || ''" :agents="agents" />
+          </el-tab-pane>
+          <el-tab-pane label="记忆" name="memory" class="flex-1 overflow-y-auto p-3">
+            <SessionMemoryPanel :session-id="activeSession?.id || ''" />
+          </el-tab-pane>
+          <el-tab-pane label="指标" name="metrics" class="flex-1 overflow-y-auto p-3">
+            <div class="space-y-3">
+              <MetricsCard :metrics="metrics" />
+              <TokenMetricsCard :token-metrics="tokenMetrics" />
+              <MailboxCard :messages="mailboxMessages" />
+              <HealthCard :health="health" />
+            </div>
+          </el-tab-pane>
+        </el-tabs>
+      </template>
     </aside>
   </div>
 </template>

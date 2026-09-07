@@ -85,3 +85,60 @@ skills:
     domain: code,*
     tool_ref: GitBlame
     tags: [git,vcs]
+
+  # ---- 派发与规格（工具描述精简后全语义承接，load_skill 按需取） ----
+  - skill_id: dispatch_and_spec
+    name: 派发与规格
+    description: call_sub_agent/WriteSpec 字段全语义（mode/verify_kind/verify_levels/tools_hint/wall_clock_min/reuse_agent_id/takeover/acceptance/contract/baseline）；字段拿不准时加载
+    domain: meta,domain,*
+    tags: [dispatch, spec]
+    content: |
+      # 派发与规格：字段全语义
+
+      ## call_sub_agent 字段
+      - task：自包含（背景/目标/确切文件路径/验收）。子 Agent 看不到对话历史；
+        "你去找 X 在哪"式任务禁止——路径先自己定位再写进 task。规格原文走
+        WriteSharedMemory（字数限额见工具描述，软着陆+硬拒双档）。
+      - responsibility：职责边界（domain 派发必填），注入子 Agent 提示词头部，
+        防长循环中身份漂移与越界改他域文件。
+      - mode（默认 react，判断不准就省略）：
+        - react：标准 ReAct 循环，绝大多数任务。
+        - reflection：产出后触发自检-重试引擎（辅助 LLM 对产出评分，不达标自动返工；
+          自检不可用时 fail-open 直接放行）。适合质量要求高但验收难写成命令的任务。
+        - plan_execute：先产计划落看板逐步执行，适合步骤多且顺序敏感的任务。
+      - verify_kind（默认 auto）：
+        - auto：按任务类型自动选校验，省略即可。
+        - executable：要求可执行证据收尾（测试/命令输出贴终答），编码任务适用。
+        - rubric：按文字评分标准评（无命令可跑的场景）。
+        - none：纯产出不校验（草稿/纯文本文档）。
+      - tools_hint：预挂载插件工具名列表（如 [web_search]）。仅是建议，实际可见集 =
+        角色工具白名单天花板 ∩ 插件 roles 可见性。
+      - wall_clock_min：墙钟预算（分钟），超时被 watchdog 终止。普通任务省略（默认宽）；
+        侦察/巡检类给小值（如 5）防发散。
+      - reuse_agent_id：热驻复用。填【空闲领域Agent】面板中的 agent_id，子 Agent 保留
+        全部上下文连续执行；spec 照写（key 与领域名对齐），task 写增量目标。
+        不确定其已有上下文时先 ReadSharedMemory 看台账再派。
+      - takeover：异名续建时填旧 domain 名，看板未完成条目自动迁移留痕；
+        同名续建自动覆盖无需填。
+
+      ## WriteSpec 字段
+      - goal：一句话目标 + 关键验收口径。
+      - acceptance：验收条目列表；支持 {text,evidence,layer} 结构化条目——
+        text=验收陈述，evidence=证据类型（命令输出/截图/探针结果），layer=校验层级。
+        缺证据条目标黄（delivered-unverified），不计满分；quality 未过不标绿。
+      - constraints：约束列表（不得改动 X / 必须复用 Y / 技术栈限制）。
+      - files：涉及文件清单，记录 mtime；派发后任一文件被改动 → spec 自动 stale 拒派
+        （需重写 spec）；logs/ 与 .bma/ 下活体文件豁免。
+      - verify_levels：验收层级子集，合法值 existence/static/integration/runtime/visual。
+        UI/游戏类填 visual+runtime；多文件集成任务填 integration。
+      - contract：跨域契约（字段名/类型/端口/路径），供 contract 静态检查与契约仲裁。
+      - baseline / baseline_content：还原/复刻类必填其一，缺失拒收。baseline=参考文件
+        路径；baseline_content=内联基线原文（自动落盘 .bma/baseline/）。
+      - key：覆盖语义——同 key 写入覆盖不追加。默认单键共享；多领域任务 key=领域名，
+        必须与 call_sub_agent 的 domain 字段一致。
+
+      ## 时机与规则
+      - call_sub_agent 前必须 WriteSpec（spec missing/stale/invalid 拒派）。
+        WriteSpec=固定 spec 槽（供校验注入），WriteSharedMemory=自由 KV（台账/结论），不可互替。
+      - 批量：同波多领域用 call_sub_agents（整波共用一份 spec）；同构批量用
+        map_sub_agents（task_template 占位 {{item}}，scout 类 ≤32 项、重型 ≤6 项）。

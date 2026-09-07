@@ -308,8 +308,10 @@ type AgentInstance struct {
 	Name      string         // Name Agent 实例名称
 	Role      string         // Role Agent 担任的角色名称
 	ModuleID  string         // ModuleID Agent 所属模块标识
+	ParentID  string         // ParentID 父实例标识（空表示顶层）
 	Status    string         // Status Agent 当前运行状态
 	Domain    string         // Domain Agent 所属领域
+	Goal      string         // Goal Agent 当前任务目标（可选）
 	RoleType  enums.RoleType // RoleType 角色类型，使用 pkg/enums 中的枚举
 	Children  []string       // Children 子 Agent 实例标识列表
 	CreatedAt time.Time      // CreatedAt Agent 实例创建时间

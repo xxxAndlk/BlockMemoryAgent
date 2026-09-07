@@ -336,12 +336,12 @@ func TestReadFile_Pagination(t *testing.T) {
 
 // TestReadFile_LimitHardClamp 验证单次 ReadFile 行数硬上限：
 // limit > maxReadFileLimit 时钳到上限返回，分页头标注截断原因与下一页起点。
-// 对应日志事故：2026-08-14 塔防 9 叶子并行重绘，单次 ReadFile 401/410/450 行违反 300 行纪律。
+// 2026-09-07 P1-2 上限 300→1000（分页截断是干扰源，字符上限仍是体积闸门）。
 func TestReadFile_LimitHardClamp(t *testing.T) {
 	dir := t.TempDir()
-	// 构造 400 行文件。
+	// 构造 1100 行文件。
 	var lines []string
-	for i := 1; i <= 400; i++ {
+	for i := 1; i <= 1100; i++ {
 		lines = append(lines, fmt.Sprintf("line-%d", i))
 	}
 	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(strings.Join(lines, "\n")), 0644); err != nil {
@@ -350,22 +350,22 @@ func TestReadFile_LimitHardClamp(t *testing.T) {
 	r := NewBuiltinRegistry(dir, nil, nil)
 	ctx := WithSessionID(context.Background(), "s1")
 
-	// limit=400 超上限：应只返回 1-300 行，分页头标注截断并指引 offset=301。
-	res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "big.txt", "offset": float64(1), "limit": float64(400)})
+	// limit=1100 超上限：应只返回 1-1000 行，分页头标注截断并指引 offset=1001。
+	res, err := r.Dispatch(ctx, "ReadFile", map[string]any{"path": "big.txt", "offset": float64(1), "limit": float64(1100)})
 	if err != nil || !res.Success {
 		t.Fatalf("clamped read should succeed: err=%v success=%v", err, res.Success)
 	}
-	if !strings.Contains(res.Output, "本页 1-300 行") {
-		t.Fatalf("expected clamped page range 1-300, got: %s", res.Output)
+	if !strings.Contains(res.Output, "本页 1-1000 行") {
+		t.Fatalf("expected clamped page range 1-1000, got: %s", res.Output)
 	}
 	if !strings.Contains(res.Output, "已截断") {
 		t.Fatalf("expected clamp note in header, got: %s", res.Output)
 	}
-	if !strings.Contains(res.Output, "offset=301") {
-		t.Fatalf("expected next-page hint offset=301, got: %s", res.Output)
+	if !strings.Contains(res.Output, "offset=1001") {
+		t.Fatalf("expected next-page hint offset=1001, got: %s", res.Output)
 	}
-	if !strings.Contains(res.Output, "line-300") || strings.Contains(res.Output, "line-301") {
-		t.Fatalf("expected content up to line-300 only, got: %s", res.Output)
+	if !strings.Contains(res.Output, "line-1000") || strings.Contains(res.Output, "line-1001") {
+		t.Fatalf("expected content up to line-1000 only, got: %s", res.Output)
 	}
 }
 
@@ -463,16 +463,16 @@ func (s *stubCallSubAgent) Execute(ctx context.Context, args map[string]any) *Re
 // scope 扩展起实现 SchemaSource）+ 5 个 plugin_* 插件管理工具
 // + 3 个 tool_catalog/mount/unmount 挂载工具，TODO #51/52）。
 func TestSchemaIncludesCallSubAgent(t *testing.T) {
-	// 未安装 call_sub_agent 时，schema 恰为 26 个工具（含 RefreshProjectDoc/WriteSpec/ask_user/remember_preference/plugin_*/tool_*）。
+	// 未安装 call_sub_agent 时，schema 恰为 28 个工具（含 RefreshProjectDoc/WriteSharedMemory/ReadSharedMemory/WriteSpec/ReadMedia/ask_user/remember_preference/plugin_*/tool_*）。
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	if n := len(r.Schema()); n != 26 {
-		t.Fatalf("expected 26 builtin tools without call_sub_agent, got %d", n)
+	if n := len(r.Schema()); n != 28 {
+		t.Fatalf("expected 28 builtin tools without call_sub_agent, got %d", n)
 	}
 	// 安装后应出现在 schema 中，且描述来自 Description()。
 	r.Register(&stubCallSubAgent{})
 	schema := r.Schema()
-	if len(schema) != 27 {
-		t.Fatalf("expected 27 tools with call_sub_agent, got %d", len(schema))
+	if len(schema) != 29 {
+		t.Fatalf("expected 29 tools with call_sub_agent, got %d", len(schema))
 	}
 	// 遍历查找 call_sub_agent 并校验描述文本。
 	found := false

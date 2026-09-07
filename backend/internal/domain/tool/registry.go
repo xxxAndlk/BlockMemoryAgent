@@ -194,6 +194,8 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	// 注册 WriteSharedMemory 工具；store 在 SetSharedMemory 注入后生效。
 	// 注册始终发生，使 Schema 中可见；调用时若 store 未注入返回错误。
 	r.Register(&writeSharedMemoryTool{})
+	// 注册 ReadSharedMemory 工具；store 同样在 SetSharedMemory 注入后生效。
+	r.Register(&readSharedMemoryTool{})
 	// 注册 WriteSpec 工具；store 同样在 SetSharedMemory 注入后生效。
 	// 与 WriteSharedMemory 共用同一 SharedMemoryStore 后端，固定 slot "spec"。
 	r.Register(&writeSpecTool{})
@@ -237,6 +239,8 @@ func (r *Registry) registerDefaults() {
 	r.Register(&gitBlameTool{exec: r.exec})
 	// RefreshProjectDoc：重写 .bma/PROJECT.md managed 区。仅 MetaAgent/DomainAgent 白名单含。
 	r.Register(&refreshProjectDocTool{exec: r.exec})
+	// ReadMedia：按路径读图/视频（任务128），视频解析器经 SetMediaResolver 注入。
+	r.Register(&readMediaTool{exec: r.exec})
 }
 
 // Register 将工具及其别名注册到注册表中；若传入 nil 则忽略。
@@ -414,6 +418,9 @@ func (r *Registry) SetSharedMemory(store SharedMemoryStore) {
 	if t, ok := r.tools["WriteSharedMemory"].(*writeSharedMemoryTool); ok {
 		t.store = store
 	}
+	if t, ok := r.tools["ReadSharedMemory"].(*readSharedMemoryTool); ok {
+		t.store = store
+	}
 	if t, ok := r.tools["WriteSpec"].(*writeSpecTool); ok {
 		t.store = store
 		// 文件后端时同步注入默认 workDir，供 baseline_content 内联落盘定位
@@ -424,6 +431,18 @@ func (r *Registry) SetSharedMemory(store SharedMemoryStore) {
 		} else {
 			t.workDir = ""
 		}
+	}
+}
+
+// SetMediaResolver 注入 ReadMedia 工具的视频解析器（任务128）。
+// bootstrap 在构建 videoOpts 后调用，以 agent.ResolveVideos 闭包实现
+// （强制抽帧模式，NativeMaxBytes 清零保证全 provider 可见）。
+// 未注入时视频分支降级为文本说明，图片分支不受影响。
+func (r *Registry) SetMediaResolver(fn MediaResolveFunc) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if t, ok := r.tools["ReadMedia"].(*readMediaTool); ok {
+		t.resolver = fn
 	}
 }
 
@@ -1101,10 +1120,23 @@ func (r *Registry) Schema() []tools.Tool {
 	}); err == nil {
 		toolsList = append(toolsList, t)
 	}
+	// 注册 ReadSharedMemory 工具：读回共享记忆槽位（返工/修复前重读 spec/契约/结论）。
+	if t, err := tools.NewFunc("ReadSharedMemory", readSharedMemoryToolDescription(), func(ctx context.Context, in readSharedMemoryInput) (string, error) {
+		args := map[string]any{}
+		if strings.TrimSpace(in.Key) != "" {
+			args["key"] = in.Key
+		}
+		res, _ := r.Dispatch(ctx, "ReadSharedMemory", args)
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
 	// 暴露 WriteSpec 工具：派发子 Agent 前写入结构化任务规范（goal/acceptance/constraints/files）。
 	// SpecEnforcement 开启时 dispatcher 强制 call_sub_agent 前先调本工具，否则拒绝派发。
 	// 与 WriteSharedMemory 共享 KV 后端，固定 slot "spec"，files 字段记录 mtime 供失效校验。
-	if t, err := tools.NewFunc("WriteSpec", "派发子 Agent 前写入结构化任务规范（目标/验收/约束/涉及文件）。dispatcher 会强制 call_sub_agent 前先调本工具，并把规范作为【任务规范】前缀注入子 Agent。files 字段填涉及的文件路径列表，写入时记录 mtime；任一文件被 WriteFile 修改后该规范自动失效，下次派发子 Agent 不再注入旧规范。覆盖语义：同一 parent 的写入覆盖前一次内容（不追加）。每个 parent 只存一份 spec，兄弟子 Agent 共享。\n已验证的事实直接钉进 spec（关键常量值、API 签名、行号、结论），不要让子 Agent 现场\"自行验证\"——实证领域 Agent 为一个朝向常量现场写像素测量脚本、为消费点 API 通读全套文件，侦察烧掉整个预算。你已知的就写进去，子 Agent 未知的才让它查。\ncontract 的 signature/symbol 字段只收纯代码文本：含中文（CJK）注解会被校验拒绝，中文说明一律放 constraints——第一次就按此写，不要等报错再改。\n还原/复刻类任务填 baseline（已落盘文件路径）或 baseline_content（内联基线全文，本工具自动落盘 .bma/baseline/ 再校验）；不要用插件 filesystem 工具落盘基线——其写入沙箱容器文件系统，宿主校验不可见。", func(ctx context.Context, in writeSpecInput) (string, error) {
+	// 描述精简（TODO 第八项 P0-3）：字段全语义见 builtin 技能「派发与规格」（load_skill）。
+	if t, err := tools.NewFunc("WriteSpec", "派发子 Agent 前写入结构化任务规范（goal/acceptance/constraints/files），dispatcher 强制派发前先调本工具，规范注入子 Agent 任务体。已验证事实（常量/签名/行号/结论）直接钉进 spec；contract 的 signature/symbol 字段只收纯代码文本（中文放 constraints）；还原/复刻类填 baseline 或 baseline_content（自动落盘 .bma/baseline/，禁用插件 filesystem 落盘）。覆盖语义：写入覆盖不追加，兄弟子 Agent 共享。", func(ctx context.Context, in writeSpecInput) (string, error) {
 		args := map[string]any{"goal": in.Goal}
 		if len(in.Acceptance) > 0 {
 			acc := make([]any, 0, len(in.Acceptance))

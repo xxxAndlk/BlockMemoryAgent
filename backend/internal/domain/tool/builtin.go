@@ -186,7 +186,9 @@ const defaultReadFileLimit = 200
 // 原"单次 ReadFile 不超过 300 行"仅靠提示词纪律约束，实证被违反
 // （2026-08-14 塔防 9 叶子并行重绘：单次 401/410/450 行各出现）；改为工具层硬截断，
 // 并在分页头标注，让模型知道被钳制、可分页续读。
-const maxReadFileLimit = 300
+// 2026-09-07 TODO 第八项 P1-2：300→1000——分页截断本身是冲突干扰源（一次读不完
+// 中等文件需 3-5 页拼接），字符上限 ReadFileMaxChars 仍是体积闸门，行数放宽不失控。
+const maxReadFileLimit = 1000
 
 // readFile 按行区间读取指定路径的文本内容（1-based offset + limit 分页）。
 // 输出带行号（cat -n 风格），顶部首行放置分页头（总行数/本页区间/下一页 offset），
