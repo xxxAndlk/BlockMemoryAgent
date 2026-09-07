@@ -1104,7 +1104,7 @@ func (r *Registry) Schema() []tools.Tool {
 	// 暴露 WriteSpec 工具：派发子 Agent 前写入结构化任务规范（goal/acceptance/constraints/files）。
 	// SpecEnforcement 开启时 dispatcher 强制 call_sub_agent 前先调本工具，否则拒绝派发。
 	// 与 WriteSharedMemory 共享 KV 后端，固定 slot "spec"，files 字段记录 mtime 供失效校验。
-	if t, err := tools.NewFunc("WriteSpec", "派发子 Agent 前写入结构化任务规范（目标/验收/约束/涉及文件）。dispatcher 会强制 call_sub_agent 前先调本工具，并把规范作为【任务规范】前缀注入子 Agent。files 字段填涉及的文件路径列表，写入时记录 mtime；任一文件被 WriteFile 修改后该规范自动失效，下次派发子 Agent 不再注入旧规范。覆盖语义：同一 parent 的写入覆盖前一次内容（不追加）。每个 parent 只存一份 spec，兄弟子 Agent 共享。\n已验证的事实直接钉进 spec（关键常量值、API 签名、行号、结论），不要让子 Agent 现场\"自行验证\"——实证领域 Agent 为一个朝向常量现场写像素测量脚本、为消费点 API 通读全套文件，侦察烧掉整个预算。你已知的就写进去，子 Agent 未知的才让它查。\n还原/复刻类任务填 baseline（已落盘文件路径）或 baseline_content（内联基线全文，本工具自动落盘 .bma/baseline/ 再校验）；不要用插件 filesystem 工具落盘基线——其写入沙箱容器文件系统，宿主校验不可见。", func(ctx context.Context, in writeSpecInput) (string, error) {
+	if t, err := tools.NewFunc("WriteSpec", "派发子 Agent 前写入结构化任务规范（目标/验收/约束/涉及文件）。dispatcher 会强制 call_sub_agent 前先调本工具，并把规范作为【任务规范】前缀注入子 Agent。files 字段填涉及的文件路径列表，写入时记录 mtime；任一文件被 WriteFile 修改后该规范自动失效，下次派发子 Agent 不再注入旧规范。覆盖语义：同一 parent 的写入覆盖前一次内容（不追加）。每个 parent 只存一份 spec，兄弟子 Agent 共享。\n已验证的事实直接钉进 spec（关键常量值、API 签名、行号、结论），不要让子 Agent 现场\"自行验证\"——实证领域 Agent 为一个朝向常量现场写像素测量脚本、为消费点 API 通读全套文件，侦察烧掉整个预算。你已知的就写进去，子 Agent 未知的才让它查。\ncontract 的 signature/symbol 字段只收纯代码文本：含中文（CJK）注解会被校验拒绝，中文说明一律放 constraints——第一次就按此写，不要等报错再改。\n还原/复刻类任务填 baseline（已落盘文件路径）或 baseline_content（内联基线全文，本工具自动落盘 .bma/baseline/ 再校验）；不要用插件 filesystem 工具落盘基线——其写入沙箱容器文件系统，宿主校验不可见。", func(ctx context.Context, in writeSpecInput) (string, error) {
 		args := map[string]any{"goal": in.Goal}
 		if len(in.Acceptance) > 0 {
 			acc := make([]any, 0, len(in.Acceptance))

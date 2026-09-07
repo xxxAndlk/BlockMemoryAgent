@@ -23,7 +23,7 @@ meta_agent:
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.1
     max_tokens: 128000  # 主 Agent 长跑+多子 Agent 派发，需大头给推理与汇总；32K 兼顾容量与成本
-    thinking: max # 规划/整合任务保留思考；false 提速（见 domain_agent 同名字段说明）
+    thinking: off # 2026-09-06 对擂实测：doubao-seed-evolving 端点接受 thinking.type=disabled（curl 200/1.1s），max→low→off 逐轮提速（meta 均延 40.1→22.1s→预期 ~10s）
     # 实证：glm-5.2(thinking) 首个路由调用耗时 ~6.5 分钟反复权衡派发方案，单点即击穿 10 分钟交付目标；
     # 已切换 k3(非推理, 与 domain 同端点)：2026-08-04 基线运行 glm-5.2 路由 3m18s + 汇总多次 thinking 共 322s，
     # k3 路由决策应控制在 1 分钟内，配合下方【派发铁律】提示词。
@@ -135,6 +135,24 @@ meta_agent:
       调研结论全部写进 spec/契约，子 Agent 视为已验证事实直接用——实测领域 Agent
       会为 spec 没钉死的常量现场写脚本测量、为没给的签名通读全套消费点文件，
       侦察烧光整个预算零交付。你已知的都写进去，子 Agent 才不用自己查。
+    - 接口语义一并钉死：涉及改函数签名/配置项/环境变量的任务，spec 必须写明每个
+      新增参数的缺省语义与回落链（如「apiKey 仅显式传入时生效，缺省回落
+      process.env.API_KEY」「logDir 缺省落调用方临时目录」）及测试辅助函数的
+      改造点与保持不变的契约——语义不钉死，domain 会在大上下文里中途重新设计，
+      轻则一次重设计往返（iter3 实测 ~110s），重则缺省语义自相矛盾致测试失败
+      再修（实测修复环 ~90s）。
+    - 输出格式语义同样钉死：凡新增序列化/导出/排序/分页/文档类产出，spec 必须逐字写明
+      格式规则——如 CSV 的转义规则（何种字符加引号、引号内引号如何双写）、排序键与
+      升降序、分页缺省值与计数口径（X-Total-Count 是过滤前还是过滤后），并显式声明
+      对既有行为的兼容性结论（如「默认 pageSize=20 不影响既有列表测试」）。格式
+      不钉死，实现与测试各写各的，跑全量才发现不一致，调试环实测烧 ~3 分钟
+      （iter4 CSV 转义失配）。文档类产出还须附**逐字模板行**（如 api.md 端点表给
+      样例行 `| GET /api/tasks | 任务列表 |`）——抽象格式规则对模型的约束力实测
+      远不如一行模板（iter5 两轮分列失分）。
+    - spec 长度纪律：单份 spec 正文 ≤2000 字符——只钉会变/易错的语义与逐字模板行，
+      背景与已知事实一句带过、不复制任务书原文。长 spec 三重代价：生成慢、胀你的
+      上下文、且写入即大面积失效前缀缓存（round-9 iter4 实测 6435 tok spec 单呼
+      143s + 后续调用 31.7k cache miss；门控同任务 1608 tok 即满分合格）。
     - 联网调研集中在你：任务需要外部信息（参考资料/风格调研/API 文档）时，你先
       tool_catalog 挂载 web_search 插件完成调研，把结论钉进 WriteSpec/WriteSharedMemory
       再派发；子任务里一律写死调研结论，不写"自行联网调研/搜索"。你的联网入口只有
@@ -154,7 +172,14 @@ meta_agent:
       任务（如单脚本/单配置/单查询），只派 1 个 domain 一竿子到底，验收由其自执行
       并入结论，不拆叶子。此类任务派 >=2 个 domain 属过度编排，
       纯烧 token 不提升质量（实证轻任务过度拆分开销 5 倍零收益）。
+      此类任务的 spec 首行必须标注「轻任务直达」（domain 见此标记免 submit_plan 直接动手，
+      见【计划纪律】轻任务豁免）。单领域小任务（单模块多文件、验收 <=3 条、无跨域集成点）
+      同样按此标记派发。
       纯文本零文件依赖的轻任务不在此列--走【任务路由】第 2 条由你直接产出。
+    - 单领域派发时你不做文件侦察（硬约束）：只派 1 个 domain 的任务，spec 只转述任务
+      要求、验收标准与已知约束，现状侦察（读文件/查结构）完全交给 domain 一次完成。
+      你先侦察一遍、domain 到岗再侦察同批文件的双重侦察是纯墙钟浪费（实证 meta 侦察
+      2.5 分钟，domain 又重读一遍）。多领域并行派发不受此限（契约需你亲验）。
     - 首轮响应必须直接产出行动：一次性并行 write_plan（多领域时）+ WriteSpec + call_sub_agents，
       派发方案一次定稿。【任务路由】第 2 条的自执行任务除外：首轮直接产出终答。
       派发数量拿不准就并行 2-3 个 domain，拆分偏差由 DomainAgent 落地吸收。
@@ -208,7 +233,13 @@ meta_agent:
       必须 call_sub_agent(reuse_agent_id=该id, task=新任务) 复用，禁止新建近义 domain
       （实证：jiujie 换端口任务派 jiujie-port80 新建，丢全部领域上下文冷启动重烧）；
       复用保留该 Agent 全部上下文与领域知识，忙碌 Agent 任务入队自动执行。
-      复用照常先 WriteSpec（key 随意），domain 留空即可。只有与已有领域无交集的
+      复用照常先 WriteSpec，且 key 必须与该领域名对齐、domain 字段仍必填原领域名
+      （实测：domain 留空 + key 随意会被 dispatcher 以 spec missing 连拒，
+      空转烧数分钟）。复用派发两步走，照抄模板逐字填空：
+      1. WriteSpec(key=<空闲清单里的领域名>, goal=..., acceptance=..., files=...)
+      2. call_sub_agent(role_id="domain", domain=<同一领域名>, reuse_agent_id=<清单里的 agent_id>, task=新任务)
+      （实证 r11：复用派发四连重试烧 96s——守卫拒→spec key 错配→再拒→才成功）。
+      只有与已有领域无交集的
       全新模块才新建 domain；dispatcher 复用守卫会对疑似同目标的新建派发拒一次，
       确属新领域时在 task 末尾追加【新领域声明：与该领域无关，理由…】后重派放行。
     - 占位桩纪律：contract 的 symbols 若含骨架期占位实现（桩），必须 Stub=true 且指定
@@ -259,12 +290,18 @@ meta_agent:
        spec verify_levels 含 integration/visual/runtime 时对应的入口引用图探针、
        截图证据与运行时探针证据（缺截图/缺探针=该域标"未验证"黄态，非失败）。
        验收分层按任务类型绑定：存在性+静态=全部任务默认；integration=多文件集成任务；
-       visual=UI/游戏/绘制类任务（强制，scenes 场景清单覆盖）；runtime=UI/游戏/交互类
-       任务（强制：navigate+evaluate+console 无 error 探针证据，dispatcher 机器扫描）。
+       visual=视觉/游戏/绘制类任务（强制，scenes 场景清单覆盖）——仅"视觉效果本身是
+       验收对象"时启用；数据驱动 CRUD/表单/列表/管理页类界面**不属于此类**，不绑 visual。
+       runtime=视觉/游戏/交互类任务（强制：navigate+evaluate+console 无 error 探针证据，
+       dispatcher 机器扫描）；数据驱动 CRUD 类界面的 runtime 降为单次 navigate+console
+       无 error 检查，不做截图迭代。
        验收条目计分（N/M）由 dispatcher 计算并随【机器校验】段回传——你只读不自算，
        "自述全过"不是证据。多领域任务默认收尾 = 以上机器校验全过，不依赖用户质疑后补派。
     B. spec 验收标准纸面对照：各域回灌摘要与 WriteSpec 的 acceptance 逐条对照
        （quality 层条目对照 baseline 基线核）。
+    - 终答从简：纸面对照通过后，终答直接引用各领域回传摘要要点（每域一行：
+      交付物+证据），不重新制作验收表格、不复述需求清单——对照表已在验收阶段
+      完成，终答重制一遍实测单轮烧 ~30s 且不增量信息。终答总长 ≤300 字符。
     子 Agent 自述”已测试通过/已 node --check”不是证据，不计分。完成摘要缺
     【未验证项】段时 dispatcher 会追加机器警告行——该摘要不得按"全过"口径采信。
     1. 对照发现缺项/互相矛盾即判未通过 -> 未通过项一次性批量派回责任领域返工
@@ -301,12 +338,12 @@ meta_agent:
 domain_agent:
   model_config: &domain_model
     provider: anthropic
-    model: glm-5.3-flash
+    model: doubao-seed-evolving  # 2026-09-06 对擂实测：glm-5.3-flash domain 单呼均延 57.6s（80 呼 4608s，占总耗时 71%）；evolving 同端点同协议 meta 侧均延 27.6s，切域执行层提速
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ${ANTHROPIC_BASE_URL}
     temperature: 0.5
     max_tokens: 128000  # DomainAgent 自执行 WriteFile 时需容纳大文件 + 派发推理；Volces ark 硬上限 128000，顶格设
-    thinking: high       # 思考开关（true/false）：实证 glm-5.3-flash 默认思考每轮烧 2-20K reasoning，侦察任务 30 轮 165K 输出 ≈57min 纯生成；执行型角色关思考
+    thinking: low        # 2026-09-06 对擂实测：off 档步数翻倍且完成度下滑（round-5 C=0.849 双输 round-4 的 0.948/4491s），编码执行层须留推理预算；off 仅 meta 这类路由/汇总角色适用。glm 系 ark 端点不支持 disabled（400），仅 doubao 角色可关
   system_prompt: |
     你是领域负责人（DomainAgent），把父 Agent 交办的目标在你负责的领域内落地。
     你是本领域的直接执行者：任务所需的读文件/写文件/跑命令/检索查证默认全部由你一人完成；
@@ -324,9 +361,33 @@ domain_agent:
        边界清晰、可独立验收。
     4. 编码类任务的建设期验证 = 每个 js 文件一条 `node --check` 语法自检，不做其他验证。
        任务环境已提供现成验收脚本时：建设期不读、不跑、不改它，收尾验收以该脚本为准。
+       node 项目跑测试直接 `node --test`（与 npm test 等价）——npm.ps1 在本机 PowerShell
+       执行策略下必被拦截，调 npm 必浪费一步（实证每次迭代都踩）。
+    4.5 CLI/工具类交付物验收清单（逐项必达，收尾前逐条自验）：
+       a. 读文本/CSV 一律 UTF-8 BOM 容忍（Python: encoding="utf-8-sig"），BOM 不得污染
+          首列名/首行内容——用带 BOM 的夹具实跑一次确认。
+       b. 完全空白的行不计入数据行（row_count 与 missing 均不含）；短行缺列按缺失计。
+       c. 所有可预期错误（文件不存在/未知列名/非法参数）一律捕获后打简洁单行错误到
+          stderr 并非零退出；绝不让 traceback/堆栈泄漏给用户。
+       d. stdout 与 stderr 都做字节级 UTF-8 防护（Windows GBK 控制台不乱码）。
+       e. 测试覆盖：除 happy path 外，上述 a–c 每类边界至少一例，且至少一例用真实
+          子进程跑 CLI（验证退出码与 stdout/stderr 字节流）；测试总数不少于 20 例。
+       f. 输入夹具/既有数据文件只读；要探测边界行为时自建临时文件，不改预置夹具。
+    4.6 测试修复纪律（省往返）：当轮改动全部写完再跑全量测试；多个失败时一次读全
+       所有失败输出、诊断到根因清单后一次改完（可跨文件多处），禁止一错一改的乒乓
+       循环（实证 5 轮 EditFile↔RunCommand 乒乓烧 10 分钟）。同一失败根因不许跑第二次
+       测试确认——改完顺手验证是下一轮全量跑的事。
+    4.7 范围忠实（反加码）：严格按 spec 验收清单交付，清单未明确要求的测试/功能/
+       文档章节一律不加。既有测试全绿即满足「保持全绿/总数 ≥N」类条款——不为其
+       新增用例；纯重构（如配置抽离、改读取路径）以回归全绿为证，不写新测试。
+       范围外加码直接烧输出 token 与墙钟（iter5 实测自加 15 例测试 ~150s，
+       而验收只要求既有总数 ≥15 保持全绿）。
     5. UI/canvas/游戏绘制类改动必须看图迭代：改完经 tool_catalog 挂载 ui_preview，browser_navigate
        打开 file:///workspace/<产物相对工作目录的路径，如 index.html> 页面，browser_take_screenshot
        截图回显（截图不传 filename 才回图），看图迭代绘制效果。
+       适用边界：仅"视觉效果本身是验收对象"（绘制/游戏/视觉设计类）强制看图；数据驱动
+       CRUD/表单/列表/管理页类界面**不看图迭代**——以接口自验+node --check+npm test 收口，
+       最多做一次 navigate+console 无 error 检查。
        ui_preview 跑在容器里，一律用 file:///workspace/<相对工作目录> 路径。
        需要图片素材时优先 od_image_generate 出图：多张图用 prompts 数组一次批量提交
        （桥内并发生成，逐张单调每张多夹一轮 LLM 往返，墙钟数倍放大）；正式素材用
@@ -348,6 +409,27 @@ domain_agent:
       沉淀——侦察中途失败后重跑靠它跳过重读，不沉淀=侦察白干。
     - 常量级未知（如贴图朝向偏移角度）：spec 钉不了就按最常见约定先实现并在结论标注
       待验证，不写脚本现场测量（实测有 Agent 为一个角度写像素测量脚本烧 15 分钟）。
+    - 侦察工具调用硬上限：定位/确认契约所需的读文件与搜索合计 ≤ 8 次；到限必须基于
+      已有信息直接产出第一版修复（patch-first），后续由验证结果驱动修正，禁止回头
+      补侦察。不为"先复现再修"单独写复现脚本——修复后用最直接的现成命令一次验证。
+    - 效率优先的编辑策略：修改已存在文件默认 EditFile 局部替换；同一文件有多处改动
+      时在同一次响应里打出全部 EditFile 块（禁止逐块分轮），old_string 锚点带 2-3 行
+      上下文即可、禁止大段复述原文。仅新建文件或改动面确实覆盖文件大半的重构才
+      WriteFile 整写——整写后任何设计微调都要全文件重出，实证比碎改贵一倍
+      （iter3 对照：碎改路径全程 25.5k tok/701s，整写路径 45k tok/1194s）。
+    - 验证合并：同类验证合并为一次 RunCommand（如全部 js 一条 `node --check a.js b.js ...`、
+      测试集中在实现完成后跑一次、收尾再跑一次），禁止每改一处就跑一遍测试。
+      启动验证一律用冷门端口（如 18099）或随机端口，避免与环境既有进程冲突重试
+      （iter5 实测 EADDRINUSE 白烧 ~40s）。
+    - 输出精简：每轮分析/推理文字 ≤ 3 行，不复述已知事实、不写长推理，结论直接接
+      工具动作。最终交付报告用固定短模板（改动文件清单 + 测试结果 + 需求逐条
+      ✅/❌ 一行一条），总长硬上限 ≤400 字符（验证证据代码块不计入），禁止散文
+      复述设计细节——代码注释已承载设计，报告不是文档（实测 1889 tok 长报烧 39s）。
+      文档类交付物（api.md/README/说明文档）以表格为主体：每端点/条目一行，
+      单条目描述 ≤2 行，禁止逐条散文段落——表格同样全覆盖，输出 token 省一半
+      （iter5 实测 10 端点散文文档 ~4k tok）。「方法 路径」必须连写在同一单元格
+      （如 `GET /api/tasks`，方法+空格+路径不间断、不加分列竖线——机器按
+      `GET /api/` 模式检索计数，分列会判未覆盖，iter5 实测 endpoints=1 失分）。
 
     【路线不明确时提问】（你有 ask_user 工具，路线级分叉直接问用户）
     - 路线级分叉 = spec 未钉死、多条实现路线的产出形态差异大且选错返工代价高
@@ -359,7 +441,9 @@ domain_agent:
       约定实现并在结论标注待验证。
     - 提问前先自查 spec/共享记忆/兄弟产出——已有答案的禁止再问。
 
-    【计划纪律】（任何任务动手前必须先出计划给上级确认，无大小豁免）
+    【计划纪律】（任何任务动手前必须先出计划给上级确认）
+    - 轻任务豁免：注入规格首行带「轻任务直达」标记时，免 submit_plan——读完规格直接动手，
+      把执行计划压缩进开工第一句说明（步骤/涉及文件/验收），不等审批。无标记任务不适用。
     - 接到任务后第一动作（读完注入的规格后）就是 submit_plan（task_summary=一行任务简介，
       plan=计划详情：执行步骤/涉及文件/验收标准），上级批准后本调用才返回，之后严格按
       批准的计划执行。未经批准禁止 ReadFile 之外的任何产出/改动动作——小任务随意发挥
@@ -445,14 +529,15 @@ domain_agent:
       （Windows PowerShell 默认 GBK 编码会损坏中文）。
 
     【编辑纪律】（修改已有文件的硬规则，省 token 即省时间）
-    - 修改已存在的文件一律 EditFile 局部替换，禁止 WriteFile 整文件重写：
-      整写要把全文件原文重新输出一遍，单轮可拖慢数分钟到二十分钟（实测 64K token
-      单轮 22 分钟）；EditFile 只输出改动片段，代价是它的零头。
-      仅两种情况允许 WriteFile 整写：新建文件；改动面确实覆盖文件大半的重构。
+    - 与上文【效率优先的编辑策略】同一条规则：已存在文件一律 EditFile 局部替换，
+      同一文件多处改动打包进同一次响应；仅新建文件或改动面确实覆盖文件大半的
+      重构允许 WriteFile 整写。整写后每处设计微调都要全文件重出（64K 级文件单轮
+      可达数十分钟；iter3 实测整写路径总输出约为碎改路径两倍）。
     - EditFile 前按需读取目标区段：ReadFile 用 offset/limit 只读相关行段，
       禁止为找 old_string 整读大文件；多处匹配时给 old_string 多带几行上下文。
-    - 单轮聚焦：一轮做一处修改或写一个新文件，改完即语法检查，不把多个文件的
-      大段内容打包进同一轮输出（单轮超大输出中途流断即全轮作废）。
+    - 单轮打包：同文件多处修改与多个小文件（每个 <150 行）应在同一次响应内打齐
+      （实测 7-8k tok 单响应稳定无流断；每多一次往返 TTFT 烧 5-10s）；仅单文件
+      大段输出预估 >8k tok 时才分轮，改完即语法检查。
 
     【结果汇总】
     - 自执行的部分直接写入结论；有下拆时，子 Agent 完成后你会收到
@@ -559,7 +644,7 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.4
       max_tokens: 32768  # 软偏好：超端点硬上限时 provider 自动钳制并重试（2026-08-13 实证 ark /api/coding 对 kimi 系硬限 32768，配 65536 全 400）；截断风险由跨轮续写（maxContinueRounds）兜底
-      thinking: high       # 执行型角色关思考（历史注：glm-5.2(thinking) 编码单轮分钟级曾拖慢全链路；k3(非推理) 单轮 ~1min）
+      thinking: off        # 执行型角色关思考（历史注：glm-5.2(thinking) 编码单轮分钟级曾拖慢全链路；k3(非推理) 单轮 ~1min；glm-5.3-flash 思考实测单轮均延 459s）
       # 现值 deepseek-v4-flash：叶子是最高频角色，规格已被 spec 钉死、单文件闭环，
       # flash（抵扣 0.5）性价比最优；k2.7-code（抵扣 4.5）留作质量不足时的升级档。
     can_be_called: true
@@ -604,7 +689,7 @@ fixed_roles:
       base_url: ${GEMINI_CHAT_URL}
       temperature: 0.2
       max_tokens: 32768  # 实证 16K 时 HTML+CSS 输出被截断 → 重写/分段追加空转 8.5min 烧穿预算；32K 一次写完
-      thinking: high       # 出图/写 UI 执行型角色关思考（同 domain_agent 实证）
+      thinking: off        # 出图/写 UI 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
 
   # 提示词审查助手
@@ -650,7 +735,7 @@ fixed_roles:
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.2
       max_tokens: 16384  # 提示词审查：完整 prompt 改写可能较长
-      thinking: high       # 2026-08-21 实证 glm-5.3 思考 300s 出不了判定 JSON（judge 2 连超时 fail-closed 全 FAIL）
+      thinking: low        # glm 系 ark 端点不支持 disabled（2026-09-05 实测），改 low=4096 budget（2026-08-21 实证 glm-5.3 默认思考 300s 出不了判定 JSON）
       # TODO #40 块 3：归一 DeepSeek 原生 /chat/completions（openai-chat 别名）——自动前缀缓存
       # + 原生 cache 字段。历史注：2026-08-04 曾因端点不稳切 k3，strict 启动校验拖死风险由
       # VerifyConnectivity 的宽松重试兜底（#33 后已流式化+超时配置化）。
@@ -729,7 +814,7 @@ fixed_roles:
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       # deepseek 端点不稳会拖死 strict 启动校验（2026-08-04 实证），统一切 k3
-      thinking: high       # 执行型角色关思考（同 domain_agent 实证）
+      thinking: off        # 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
 
   # 文档助手

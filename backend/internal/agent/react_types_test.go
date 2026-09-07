@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
@@ -23,9 +24,12 @@ func TestAssistantMessageFromBlades_DropsBrokenToolCall(t *testing.T) {
 		blades.NewToolPart("c1", "WriteFile", `{"path":"a.js","content":"`),     // 半截 JSON
 		blades.NewToolPart("c2", "WriteFile", `{"path":"b.js","content":"ok"}`), // 完整 JSON
 	}
-	msg := AssistantMessageFromBlades(m)
+	msg, dropped := AssistantMessageFromBlades(m)
 	if len(msg.ToolCalls) != 1 {
 		t.Fatalf("ToolCalls = %d, want 1 (broken JSON dropped)", len(msg.ToolCalls))
+	}
+	if len(dropped) != 1 || !strings.Contains(dropped[0], "WriteFile") || !strings.Contains(dropped[0], "c1") {
+		t.Fatalf("dropped = %v, want 1 entry naming WriteFile(c1)", dropped)
 	}
 	if msg.ToolCalls[0].ID != "c2" {
 		t.Errorf("kept tool call = %+v, want c2", msg.ToolCalls[0])
@@ -44,9 +48,12 @@ func TestAssistantMessageFromBlades_EmptyRequestKept(t *testing.T) {
 	m.Parts = []blades.Part{
 		blades.NewToolPart("c1", "noop", `{}`),
 	}
-	msg := AssistantMessageFromBlades(m)
+	msg, dropped := AssistantMessageFromBlades(m)
 	if len(msg.ToolCalls) != 1 || msg.ToolCalls[0].Input == nil || len(msg.ToolCalls[0].Input) != 0 {
 		t.Fatalf("ToolCalls = %+v, want 1 with empty map", msg.ToolCalls)
+	}
+	if len(dropped) != 0 {
+		t.Fatalf("dropped = %v, want empty", dropped)
 	}
 }
 

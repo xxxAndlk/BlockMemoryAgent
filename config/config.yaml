@@ -69,7 +69,7 @@ agent:
   token_budget_per_goal: 300000   # 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。保留不破坏旧配置加载，不再驱动任何闸门。
   token_budget_per_role:          # 按角色上下文 token 阈值（替换原累计预算）：Assemble 压缩后估算 messages token >= 阈值即暂停（近 N 单独就超、压不下去），每轮独立估算（各 Agent 独立）。未列角色默认 150000。
     domain: 150000
-    meta: 150000
+    meta: 150000  # 2026-09-06 round-11 实测：40K 全程未触发压缩（上下文自由长到 46.8K，估算口径低于 API 实测），对成绩无影响；回滚默认消除未测风险。真正的 meta 减重靠 user_profile.md 去重（111→27 行）
     code_assistant: 150000
     ui_assistant: 150000
     prompt_reviewer: 150000

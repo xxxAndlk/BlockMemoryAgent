@@ -487,13 +487,17 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 
 // AssistantMessageFromBlades 将 blades 返回的 assistant 消息转换为我们的 ReactMessage。
 // 该函数会把纯文本与工具调用分离到不同字段中。
-func AssistantMessageFromBlades(m *blades.Message) ReactMessage {
+// 第二返回值是被丢弃的工具调用描述（name(id): 错误），供调用方观测与兜底：
+// 参数 JSON 损坏的调用被丢弃后若无人知晓，上层会把本轮误判为终答静默收官。
+func AssistantMessageFromBlades(m *blades.Message) (ReactMessage, []string) {
 	// 如果输入为空，直接返回一个默认的 assistant 角色消息。
 	if m == nil {
-		return ReactMessage{Role: "assistant"}
+		return ReactMessage{Role: "assistant"}, nil
 	}
 	// 初始化结果消息，角色固定为 assistant。
 	msg := ReactMessage{Role: "assistant"}
+	// dropped 记录因参数非法被丢弃的工具调用（name(id): 解析错误）。
+	var dropped []string
 	// 遍历消息的所有 Part，根据类型分别提取文本或工具调用。
 	for _, part := range m.Parts {
 		// 通过类型断言区分文本部分和工具调用部分。
@@ -510,6 +514,7 @@ func AssistantMessageFromBlades(m *blades.Message) ReactMessage {
 			// 时丢弃该调用：以 nil 入参执行工具会静默写坏文件（如 WriteFile 空写）。
 			var input map[string]any
 			if err := json.Unmarshal([]byte(v.Request), &input); err != nil {
+				dropped = append(dropped, fmt.Sprintf("%s(%s): %v", v.Name, v.ID, err))
 				continue
 			}
 			// 把解析后的工具调用追加到结果中。
@@ -528,7 +533,7 @@ func AssistantMessageFromBlades(m *blades.Message) ReactMessage {
 			msg.ReasoningContent = v
 		}
 	}
-	return msg
+	return msg, dropped
 }
 
 // ToolResultJSON 将 ToolResult 序列化为 JSON 字符串，用于填充 tool 消息的内容。

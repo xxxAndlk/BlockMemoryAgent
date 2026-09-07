@@ -358,6 +358,14 @@ const maxEmptyResponses = 3
 // emptyResponseNudge 是收到空响应时注入的用户提示，要求模型继续推进任务。
 const emptyResponseNudge = "（系统提示：你上一条回复为空，未包含任何文本或工具调用。请继续推进当前任务；若任务确已全部完成，请直接输出完整的最终答复。）"
 
+// maxBadToolCallResponses 是允许的连续"工具调用参数非法被丢弃"次数上限：超过即判定
+// 模型异常，显式报错，而不是把伴随的中间陈述文本当作终答静默收官。
+const maxBadToolCallResponses = 3
+
+// badToolCallNudge 是工具调用参数 JSON 解析失败被丢弃后注入的用户提示（%s=被丢弃
+// 调用的描述列表），要求模型修正参数后重新发起调用。
+const badToolCallNudge = "（系统提示：你刚才发起的工具调用因参数不是合法 JSON 已被系统丢弃、未执行：%s。请修正参数后重新发起该工具调用（注意嵌套的 JSON 字符串必须正确转义），继续推进当前任务。）"
+
 // historyToolCallInputMaxRunes 是写入历史的工具入参单字符串值最大 rune 数。
 // 与 ToolOutputMaxRunes（工具输出截断）对称：工具入参（WriteFile 全文、codegen 大段代码）
 // 不截断会在滑动窗口内累积成单轮 100K+ input tokens，使续跑预算一次耗尽、暂停/恢复零进展。
@@ -444,6 +452,8 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// 每次循环对应一次“思考-行动-观察”的迭代。
 	// emptyStreak 记录连续空响应次数，用于空响应保护（见循环内注释）。
 	emptyStreak := 0
+	// badToolCallStreak 记录连续"工具调用参数非法被丢弃"轮数（见循环内注释）。
+	badToolCallStreak := 0
 	// unproductiveStreak 记录连续"无产出"轮数（无产出性工具 ∧ 无 mailbox 新消息 ∧ 无终答），
 	// 供循环尾部的停滞守卫（stagnationGuard）使用。
 	unproductiveStreak := 0
@@ -520,7 +530,29 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		}
 
 		// 将 blades 返回的消息转换为内部 Assistant 消息。
-		assistant := AssistantMessageFromBlades(resp.Message)
+		assistant, droppedToolCalls := AssistantMessageFromBlades(resp.Message)
+
+		// 坏工具调用保护：模型发起了工具调用但参数不是合法 JSON（如嵌套 JSON
+		// 未转义、max_tokens 截断），AssistantMessageFromBlades 会丢弃这些调用。
+		// 若照常落入"无工具调用=终答"分支，任务会带着一句中间陈述无声收官且被
+		// 标记为 success（实证：SWE 修复会话中 WriteSpec 参数双重编码被丢弃，
+		// 派发从未发生，会话却正常完成）。改为注入提示让模型修正后重发该调用；
+		// 连续超限则显式报错，把失败暴露出来。
+		if len(droppedToolCalls) > 0 {
+			badToolCallStreak++
+			log.Printf("[react] role=%s dropped %d tool call(s) with invalid JSON args: %s", a.name, len(droppedToolCalls), strings.Join(droppedToolCalls, "; "))
+			if badToolCallStreak >= maxBadToolCallResponses {
+				return ReactResult{History: history}, fmt.Errorf("model returned %d consecutive tool calls with invalid JSON args (%s)", badToolCallStreak, strings.Join(droppedToolCalls, "; "))
+			}
+			// 附带文本时保留 assistant 消息（模型据此知道自己尝试过什么），
+			// 无文本则与空响应保护同理不写入历史（空 content 块可能被 API 拒绝）。
+			if strings.TrimSpace(assistant.Content) != "" {
+				history = append(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
+			}
+			history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(badToolCallNudge, strings.Join(droppedToolCalls, "；"))})
+			continue
+		}
+		badToolCallStreak = 0
 
 		// 空响应保护：模型既未输出文本也未调用工具（常见于思考阶段耗尽
 		// max_tokens、端点异常或流被中途截断）。若当作最终答复返回，任务会

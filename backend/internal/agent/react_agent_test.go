@@ -654,6 +654,78 @@ func TestReActAgent_EmptyResponseStreakFails(t *testing.T) {
 	}
 }
 
+// TestReActAgent_BadToolCallNudgesRetry 验证模型发起的工具调用参数为非法 JSON 时，
+// 循环不把伴随文本当终答静默收官，而是注入提示让模型修正后重试（实证：SWE 修复
+// 会话 WriteSpec 参数双重编码被丢弃，派发从未发生，会话却 success 结束）。
+func TestReActAgent_BadToolCallNudgesRetry(t *testing.T) {
+	broken := blades.NewAssistantMessage(blades.StatusCompleted)
+	broken.Parts = []blades.Part{
+		blades.TextPart{Text: "我先派发任务"},
+		blades.NewToolPart("c1", "WriteSpec", `{"acceptance":["{"`), // 双重编码的坏 JSON
+	}
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			broken,
+			blades.AssistantMessage("修正后完成"),
+		},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	agent := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg))
+
+	res, err := agent.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("坏参数后经提示重试应成功，got err=%v", err)
+	}
+	if res.Text != "修正后完成" {
+		t.Fatalf("res.Text = %q", res.Text)
+	}
+	if llm.calls != 2 {
+		t.Fatalf("应重试后第 2 次调用成功，got %d calls", llm.calls)
+	}
+	// 历史中应注入坏参数提示，且被丢弃的工具调用未执行（无 tool 角色消息）。
+	foundNudge := false
+	for _, m := range res.History {
+		if m.Role == "user" && strings.Contains(m.Content, "合法 JSON") {
+			foundNudge = true
+		}
+		if m.Role == "tool" {
+			t.Fatal("参数非法的工具调用不应被执行")
+		}
+	}
+	if !foundNudge {
+		t.Fatal("坏工具调用后应向历史注入修正提示")
+	}
+}
+
+// TestReActAgent_BadToolCallStreakFails 验证连续坏工具参数达到上限后返回显式错误，
+// 而不是把中间陈述文本当作最终答复静默完成。
+func TestReActAgent_BadToolCallStreakFails(t *testing.T) {
+	broken := blades.NewAssistantMessage(blades.StatusCompleted)
+	broken.Parts = []blades.Part{
+		blades.TextPart{Text: "我先派发任务"},
+		blades.NewToolPart("c1", "WriteSpec", `{"acceptance":["{"`),
+	}
+	llm := &mockModelProvider{
+		responses: []*blades.Message{broken, broken, broken, broken},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	agent := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg))
+
+	res, err := agent.Run(context.Background(), "hi")
+	if err == nil {
+		t.Fatal("连续坏工具参数达到上限后应返回错误")
+	}
+	if !strings.Contains(err.Error(), "invalid JSON args") {
+		t.Fatalf("错误信息应说明是连续非法工具参数，got: %v", err)
+	}
+	if res.Text != "" {
+		t.Fatal("出错时不应产生最终答复文本")
+	}
+	if llm.calls != maxBadToolCallResponses {
+		t.Fatalf("应在第 %d 次坏参数后报错，got %d calls", maxBadToolCallResponses, llm.calls)
+	}
+}
+
 // TestReActAgent_TruncatesToolCallInputsInHistory 验证超长工具入参（如 WriteFile 全文）
 // 只在写入历史的副本中截断，派发执行仍用完整入参：
 //   - 磁盘文件内容为完整的 15000 字（派发未被截断影响）；
