@@ -103,6 +103,28 @@ type reactInternalSession struct {
 // 防止内存无限增长；超出时将淘汰最早完成的会话。
 const maxReactInMemorySessions = 20
 
+// interruptedByRestartMsg 运行中会话因进程退出而中断时的统一提示。
+// 优雅停机落库与崩溃后恢复两条路径共用同一文案，Web/TUI 发送消息即可续跑。
+const interruptedByRestartMsg = "因服务重启中断，可发送消息继续"
+
+// restoredSessionStatus 将 session_history.status 列映射为内存会话状态、结果文本与是否中断。
+//   - "running"：进程死亡遗留的运行态 → error + 中断提示（优雅停机会先把 running 标为
+//     error 再落库，库里还能读到 running 说明是硬崩溃/断电）；
+//   - ""（009 迁移前的旧数据）或无法识别的值：无从判断终态，按 completed + summary 兜底；
+//   - awaiting_clarify/paused_on_child/completed/error：状态原样保留，结果取 summary。
+//     恢复后 approval/askUser 通道为 nil，sendMessage 对 nil 通道自然回落普通续跑路径。
+func restoredSessionStatus(stored, summary string) (status enums.SessionStatus, result string, interrupted bool) {
+	switch enums.SessionStatus(stored) {
+	case enums.SessionStatusRunning:
+		return enums.SessionStatusError, interruptedByRestartMsg, true
+	case enums.SessionStatusAwaitingClarify, enums.SessionStatusPausedOnChild,
+		enums.SessionStatusCompleted, enums.SessionStatusError:
+		return enums.SessionStatus(stored), summary, false
+	default:
+		return enums.SessionStatusCompleted, summary, false
+	}
+}
+
 // reactSessionStore 是 ReactService 的内存会话仓库，
 // 持有会话映射、并发锁、自增序号以及持久化与指标依赖。
 type reactSessionStore struct {
@@ -370,22 +392,37 @@ func (st *reactSessionStore) sessionCount() int {
 	return len(st.sessions)
 }
 
-// shutdown 关闭仓库：取消所有会话的上下文。
-// 通常在服务停止时调用，用于通知各会话尽快退出。
+// shutdown 优雅停机：先把 Running 会话标记为"因服务重启中断"（error + 统一提示），
+// 再取消全部会话上下文，最后在锁外对被中断的会话落库（历史/事件 + 中断事件）。
+// 标记先行：setSessionError 的"首次错误胜出"守卫（Status==Error 且 Result!="" 即跳过）
+// 使随后 ctx 取消触发的 "context canceled" 错误不会覆盖中断提示。
+// addEvent/persistHistory/persistEvents 自身要加锁，不得持写锁调用（RWMutex 不可重入）。
 func (st *reactSessionStore) shutdown() {
-	// 加写锁，避免与创建/删除会话并发。
+	// 加写锁：取消上下文并就地标记中断状态。
 	st.mu.Lock()
-	// 返回前释放写锁。
-	defer st.mu.Unlock()
-	// 遍历所有会话并取消它们的运行上下文。
+	now := time.Now()
+	var interrupted []*reactInternalSession
 	for _, s := range st.sessions {
-		// 防止重复调用或 nil 指针导致 panic。
+		// 先取消运行上下文，通知依赖 ctx 的 goroutine 尽快退出；置空避免二次取消。
 		if s.cancelFn != nil {
-			// 触发上下文取消，通知依赖 ctx 的 goroutine 结束。
 			s.cancelFn()
-			// 置空，避免二次取消。
 			s.cancelFn = nil
 		}
+		// Running 会话标记为中断：重启后列表显示"因服务重启中断"而非静止的 running。
+		if s.Status == enums.SessionStatusRunning {
+			s.Status = enums.SessionStatusError
+			s.Result = interruptedByRestartMsg
+			s.EndedAt = &now
+			interrupted = append(interrupted, s)
+		}
+	}
+	st.mu.Unlock()
+	// 锁外落库：History 为上一轮完成时的快照，进行中轮次尽力而为（真实终态若在
+	// 停机瞬间完成并落库，会覆盖中断标记，属更准确的结果）。
+	for _, s := range interrupted {
+		st.addEvent(s, eventkind.System, "System", interruptedByRestartMsg, "", "", "", "", "", false)
+		st.persistHistory(s)
+		st.persistEvents(s)
 	}
 }
 
@@ -520,6 +557,17 @@ func (st *reactSessionStore) evictCompletedSessions() {
 	}
 }
 
+// snapshotSessionEvents 在读锁内拷贝会话事件切片。
+// persistHistory/persistEvents 与并发的 addEvent（子 Agent 事件来自其他 goroutine）
+// 及优雅停机落库（turn goroutine 收尾中）并存，必须经锁同步读取，避免数据竞争。
+func (st *reactSessionStore) snapshotSessionEvents(session *reactInternalSession) []internalEvent {
+	st.mu.RLock()
+	events := make([]internalEvent, len(session.Events))
+	copy(events, session.Events)
+	st.mu.RUnlock()
+	return events
+}
+
 // persistHistory 将对话历史持久化到 PostgreSQL。
 // session: 待保存的会话。
 func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
@@ -527,10 +575,12 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 	if st.pgStore == nil {
 		return
 	}
+	// 锁内快照事件，避免与并发 addEvent / 停机落库竞争。
+	events := st.snapshotSessionEvents(session)
 	// toolResults 汇总所有工具执行事件的结果，用于历史记录。
-	toolResults := make([]map[string]any, 0, len(session.Events))
+	toolResults := make([]map[string]any, 0, len(events))
 	// 遍历事件，仅保留工具执行类型的事件。
-	for _, ev := range session.Events {
+	for _, ev := range events {
 		// 跳过非工具执行事件。
 		if ev.Type != eventkind.ToolExec {
 			continue
@@ -555,6 +605,9 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 		MetaMemory:  []map[string]any{},
 		CreatedAt:   time.Now(),
 		WorkDir:     session.workDir,
+		// 009: 记录落库时的会话状态。轮开始时为 running（崩溃后被恢复逻辑标记中断），
+		// 轮结束时为 completed/error/paused 等终态。
+		Status: string(session.Status),
 	}
 	// 使用 3 秒超时上下文，避免数据库挂起导致无限等待。
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -602,10 +655,12 @@ func (st *reactSessionStore) persistEvents(session *reactInternalSession) {
 	if st.pgStore == nil {
 		return
 	}
+	// 锁内快照事件，避免与并发 addEvent / 停机落库竞争。
+	events := st.snapshotSessionEvents(session)
 	// records 预分配容量，避免多次扩容。
-	records := make([]store.SessionEventRecord, 0, len(session.Events))
+	records := make([]store.SessionEventRecord, 0, len(events))
 	// 遍历事件并转换为数据库记录格式，同时对文本字段做 UTF-8 清理与截断。
-	for _, ev := range session.Events {
+	for _, ev := range events {
 		records = append(records, store.SessionEventRecord{
 			SessionID:    session.ID,
 			Type:         ev.Type,
@@ -669,7 +724,102 @@ func (st *reactSessionStore) loadSessionEvents(ctx context.Context, sessionID st
 	return events
 }
 
-// restoreSessions 从 PostgreSQL 恢复近期会话到内存。
+// buildRestoredSession 从一条 session_history 记录重建内存会话（不触碰 store 锁与映射）。
+// events 自 session_events 全量加载；History 自 agent_messages 重建（persistFullHistory
+// 每轮落库），续跑时 resumeSession 以其为种子，MetaAgent 上下文不再清零；更早的上下文
+// 由 memory.Pipeline 懒加载压缩金字塔（agent_compress_states）接续。失败/无数据时
+// History 保持 nil，退回旧行为（仅 goal + 总结两条可读消息）。
+// 不设置 ctx/cancelFn：会话非 Running，sendMessageFull/resume 路径会 restartSessionContext。
+// ctx: 加载事件的请求上下文；rec: 历史记录。
+func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *store.SessionHistoryRecord) *reactInternalSession {
+	// 加载该会话关联的详细事件。
+	restoredEvents := st.loadSessionEvents(ctx, rec.SessionID)
+	// 状态映射：running（进程死亡遗留）→ error + 中断提示，并补一条合成系统事件说明原因，
+	// 使时间线在 Web/TUI 上可见中断原因。
+	status, result, interrupted := restoredSessionStatus(rec.Status, rec.Summary)
+	if interrupted {
+		restoredEvents = append(restoredEvents, internalEvent{
+			Type:      eventkind.System,
+			Agent:     "System",
+			Message:   interruptedByRestartMsg,
+			Success:   false,
+			Timestamp: rec.CreatedAt,
+		})
+	}
+	// endedAt 使用历史记录的创建时间作为会话结束时间。
+	endedAt := rec.CreatedAt
+	// eff 是会话有效工作目录：每会话 workDir 优先，空则回落进程默认 st.workDir（同 createSession）。
+	eff := rec.WorkDir
+	if eff == "" {
+		eff = st.workDir
+	}
+	sess := &reactInternalSession{
+		ID:        rec.SessionID,
+		Goal:      rec.Goal,
+		Status:    status,
+		Result:    result,
+		StartedAt: rec.CreatedAt,
+		EndedAt:   &endedAt,
+		Events:    restoredEvents,
+		// S2: 恢复每会话工作目录，重启后续跑仍在原目录；空串回落进程默认。
+		workDir: rec.WorkDir,
+		// TempDir 与 createSession 同款规则计算（createSession 也从不预建目录，
+		// cleanupSessionTempDir 对不存在路径幂等）。
+		TempDir: filepath.Join(eff, ".bma", "tmp", rec.SessionID),
+		// Messages 重建为用户目标与助手总结，保持对话上下文可读。
+		Messages: []Message{
+			{Role: string(enums.ChatRoleUser), Content: rec.Goal, Timestamp: rec.CreatedAt},
+			{Role: string(enums.ChatRoleAssistant), Content: rec.Summary, Timestamp: rec.CreatedAt},
+		},
+	}
+	// 重建完整对话历史（若重启前经 persistFullHistory 持久化过）。
+	if msgs, err := NewPostgresMessagesStore(st.pgStore.DB()).LoadMessages(ctx, rec.SessionID); err == nil && len(msgs) > 0 {
+		sess.History = msgs
+	}
+	return sess
+}
+
+// restoreOneSession 按需从 PG 恢复单个会话到内存（懒恢复）。
+// 用于重启后未随 restoreSessions 批量恢复（超出 limit / restore_sessions 关闭）的旧会话：
+// Get/Stream/Send 命中未知 ID 时物化该会话，实现"任意旧会话可查看可续聊"。
+// 已在内存直接返回；PG 无此会话或未配置 pgStore 返回 nil（调用方回落 ErrSessionNotFound）。
+// 插入幂等（并发双恢复先到者胜，后到者丢弃已构建副本）；插入后调用
+// evictCompletedSessions 防止浏览大量旧会话撑爆内存上限。
+// ctx: 加载事件的请求上下文；id: 会话 ID。
+func (st *reactSessionStore) restoreOneSession(ctx context.Context, id string) *reactInternalSession {
+	// 快路径：读锁查内存，命中直接返回。
+	st.mu.RLock()
+	sess, ok := st.sessions[id]
+	st.mu.RUnlock()
+	if ok {
+		return sess
+	}
+	// 未配置 pgStore 无法恢复。
+	if st.pgStore == nil {
+		return nil
+	}
+	// DB 查询与构建在锁外完成，3 秒超时防止存储故障拖住调用方。
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	rec, err := st.pgStore.GetSessionHistoryByID(ctx, id)
+	if err != nil || rec == nil {
+		return nil
+	}
+	built := st.buildRestoredSession(ctx, rec)
+	// 写锁内二次判重后插入，避免与批量恢复/并发懒恢复互相覆盖。
+	st.mu.Lock()
+	if existing, ok := st.sessions[id]; ok {
+		st.mu.Unlock()
+		return existing
+	}
+	st.sessions[id] = built
+	st.mu.Unlock()
+	// 物化的会话均带 EndedAt（可淘汰），立即触发一次淘汰防止内存膨胀。
+	st.evictCompletedSessions()
+	return built
+}
+
+// restoreSessions 从 PostgreSQL 恢复近期会话到内存（启动时批量预热）。
 // ctx: 请求上下文；limit: 最大恢复数量，<=0 时默认 50。
 // 返回: 实际恢复的会话数量。
 func (st *reactSessionStore) restoreSessions(ctx context.Context, limit int) int {
@@ -689,49 +839,42 @@ func (st *reactSessionStore) restoreSessions(ctx context.Context, limit int) int
 		return 0
 	}
 
-	// restored 统计成功恢复的会话数。
-	restored := 0
-	// 加写锁，向内存映射写入恢复的会话。
-	st.mu.Lock()
-	// 返回前释放写锁。
-	defer st.mu.Unlock()
-	// 遍历每条历史记录，重建内存会话。
+	// 批内去重 + 过滤已存在会话。迁移前旧库 session_history 无唯一约束，
+	// RecentHistories（created_at DESC）可能返回同 ID 重复行，首行即最新写入，保留首行。
+	seen := make(map[string]struct{}, len(recs))
+	pending := make([]*store.SessionHistoryRecord, 0, len(recs))
+	st.mu.RLock()
 	for _, rec := range recs {
-		// 若该会话已存在于内存中，跳过，避免覆盖当前运行状态。
+		if _, dup := seen[rec.SessionID]; dup {
+			continue
+		}
+		seen[rec.SessionID] = struct{}{}
+		// 已在内存的会话跳过，避免覆盖当前运行状态。
 		if _, exists := st.sessions[rec.SessionID]; exists {
 			continue
 		}
-		// endedAt 使用历史记录的创建时间作为会话结束时间。
-		endedAt := rec.CreatedAt
-		// 加载该会话关联的详细事件。
-		restoredEvents := st.loadSessionEvents(ctx, rec.SessionID)
-		// 重建内存会话对象，状态标记为已完成。
-		st.sessions[rec.SessionID] = &reactInternalSession{
-			ID:        rec.SessionID,
-			Goal:      rec.Goal,
-			Status:    enums.SessionStatusCompleted,
-			Result:    rec.Summary,
-			StartedAt: rec.CreatedAt,
-			EndedAt:   &endedAt,
-			Events:    restoredEvents,
-			// S2: 恢复每会话工作目录，重启后续跑仍在原目录；空串回落进程默认。
-			workDir: rec.WorkDir,
-			// Messages 重建为用户目标与助手总结，保持对话上下文可读。
-			Messages: []Message{
-				{Role: string(enums.ChatRoleUser), Content: rec.Goal, Timestamp: rec.CreatedAt},
-				{Role: string(enums.ChatRoleAssistant), Content: rec.Summary, Timestamp: rec.CreatedAt},
-			},
+		pending = append(pending, rec)
+	}
+	st.mu.RUnlock()
+
+	// 逐条重建（DB I/O 在锁外执行：加载事件 + 重建 History 可达数十毫秒/条）。
+	built := make([]*reactInternalSession, 0, len(pending))
+	for _, rec := range pending {
+		built = append(built, st.buildRestoredSession(ctx, rec))
+	}
+
+	// 加写锁，向内存映射写入恢复的会话。
+	restored := 0
+	st.mu.Lock()
+	for _, sess := range built {
+		// 双保险：构建期间同 ID 被占则丢弃副本（理论不可达，ID 含 bootRand）。
+		if _, exists := st.sessions[sess.ID]; exists {
+			continue
 		}
-		// 重建完整对话历史（若重启前经 persistFullHistory 持久化过）：续跑时
-		// resumeSession 以 session.History 为种子，MetaAgent 上下文不再清零；
-		// 更早的上下文由 memory.Pipeline 懒加载压缩金字塔（agent_compress_states）接续。
-		// 失败/无数据时 History 保持 nil，退回旧行为（仅 goal + 总结两条可读消息）。
-		if msgs, err := NewPostgresMessagesStore(st.pgStore.DB()).LoadMessages(ctx, rec.SessionID); err == nil && len(msgs) > 0 {
-			st.sessions[rec.SessionID].History = msgs
-		}
-		// 计数增加。
+		st.sessions[sess.ID] = sess
 		restored++
 	}
+	st.mu.Unlock()
 
 	// maxSeq 用于恢复后同步自增序号，避免新会话 ID 与历史 ID 冲突。
 	// 新格式 sessionID = "session-<bootEpoch>-<bootRand>-<seq>"，解析取最后段 seq；
@@ -761,6 +904,8 @@ func (st *reactSessionStore) restoreSessions(ctx context.Context, limit int) int
 	if restored > 0 {
 		st.logInfo(fmt.Sprintf("从历史恢复了 %d 个会话", restored))
 	}
+	// 恢复数量可能超过内存上限（默认 50 > 20），按结束时间淘汰最早的完成会话。
+	st.evictCompletedSessions()
 	// 返回实际恢复数量。
 	return restored
 }

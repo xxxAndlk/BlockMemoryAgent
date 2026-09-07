@@ -18,6 +18,7 @@ type SessionHistoryRecord struct {
 	MetaMemory  []map[string]any `json:"meta_memory"`  // P0-1: MetaAgent 调度记忆
 	CreatedAt   time.Time        `json:"created_at"`   // 创建时间
 	WorkDir     string           `json:"work_dir"`     // S2: 每会话工作目录(空串=进程默认)
+	Status      string           `json:"status"`       // 009: 会话最后一次落库时的状态(running/completed/error/awaiting_clarify/paused_on_child)
 }
 
 // SessionEventRecord 会话事件归档记录。
@@ -46,13 +47,14 @@ type SessionStore struct {
 	log Logger  // 结构化日志器，由 PostgresStore.SetLogger 传播注入；nil 时回退标准库 log
 }
 
-// SaveHistory 持久化一次会话的 goal/summary/工具调用结果/调度记忆/工作目录。
+// SaveHistory 持久化一次会话的 goal/summary/工具调用结果/调度记忆/工作目录/状态。
 // 参数:
 //   - ctx: 请求上下文。
 //   - rec: 会话历史记录;ToolResults/MetaMemory 为 nil 时补为空数组,保证 JSONB 非 null
 //
 // 返回: SQL 执行错误。
-// 副作用: ON CONFLICT DO NOTHING 保证同 session_id 重复写入幂等。
+// 副作用: ON CONFLICT (session_id) DO UPDATE 保证同 session_id 幂等且始终保留最新一轮
+// 的 goal/summary/status(009 唯一索引 uniq_session_history_session_id 支撑冲突目标)。
 func (s *SessionStore) SaveHistory(ctx context.Context, rec *SessionHistoryRecord) error {
 	if rec.ToolResults == nil {
 		// 避免写入 null,统一为空数组便于下游读取
@@ -73,14 +75,23 @@ func (s *SessionStore) SaveHistory(ctx context.Context, rec *SessionHistoryRecor
 	}
 	// COALESCE 保证 created_at 为零值时回退到 NOW()
 	_, err = s.db.ExecContext(ctx, `
-			INSERT INTO session_history (session_id, goal, summary, tool_results, meta_memory, created_at, work_dir)
-			VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), $7)
-			ON CONFLICT DO NOTHING
-		`, rec.SessionID, sanitizeUTF8(rec.Goal), sanitizeUTF8(rec.Summary), toolData, memData, rec.CreatedAt, sanitizeUTF8(rec.WorkDir))
+			INSERT INTO session_history (session_id, goal, summary, tool_results, meta_memory, created_at, work_dir, status)
+			VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), $7, $8)
+			ON CONFLICT (session_id) DO UPDATE SET
+				goal = EXCLUDED.goal,
+				summary = EXCLUDED.summary,
+				tool_results = EXCLUDED.tool_results,
+				meta_memory = EXCLUDED.meta_memory,
+				created_at = EXCLUDED.created_at,
+				work_dir = EXCLUDED.work_dir,
+				status = EXCLUDED.status
+		`, rec.SessionID, sanitizeUTF8(rec.Goal), sanitizeUTF8(rec.Summary), toolData, memData, rec.CreatedAt, sanitizeUTF8(rec.WorkDir), sanitizeUTF8(rec.Status))
 	return err
 }
 
-// SaveEvents 批量持久化会话事件。
+// SaveEvents 批量持久化会话事件(全量覆盖语义)。
+// 每轮结束调用方都会重写该会话的全部事件,先 DELETE 再 INSERT 保证幂等,
+// 恢复-续跑场景不会与已落库的旧行叠加重复(与 PostgresMessagesStore.SaveMessages 同语义)。
 // 参数:
 //   - ctx:       请求上下文。
 //   - sessionID: 会话 ID。
@@ -95,6 +106,11 @@ func (s *SessionStore) SaveEvents(ctx context.Context, sessionID string, events 
 	}
 	// 任何返回路径都回滚；成功提交会覆盖回滚操作
 	defer tx.Rollback()
+
+	// 先清空该会话的旧事件,再全量写入本轮快照(delete-then-insert)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM session_events WHERE session_id = $1`, sessionID); err != nil {
+		return fmt.Errorf("delete old events: %w", err)
+	}
 
 	// 预编译 INSERT 语句，提升批量写入性能
 	stmt, err := tx.PrepareContext(ctx, `
@@ -161,7 +177,7 @@ func (s *SessionStore) RecentHistories(ctx context.Context, limit int) ([]*Sessi
 	}
 	// 查询最近 limit 条历史，按创建时间倒序
 	rows, err := s.db.QueryContext(ctx, `
-			SELECT session_id, goal, summary, tool_results, meta_memory, created_at, work_dir
+			SELECT session_id, goal, summary, tool_results, meta_memory, created_at, work_dir, status
 			FROM session_history
 			ORDER BY created_at DESC
 			LIMIT $1
@@ -175,7 +191,7 @@ func (s *SessionStore) RecentHistories(ctx context.Context, limit int) ([]*Sessi
 	for rows.Next() {
 		var r SessionHistoryRecord
 		var toolRaw, memRaw []byte
-		if err := rows.Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt, &r.WorkDir); err != nil {
+		if err := rows.Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt, &r.WorkDir, &r.Status); err != nil {
 			// 单行扫描失败跳过
 			continue
 		}
@@ -206,10 +222,10 @@ func (s *SessionStore) GetHistoryByID(ctx context.Context, id string) (*SessionH
 	var r SessionHistoryRecord
 	var toolRaw, memRaw []byte
 	err := s.db.QueryRowContext(ctx, `
-			SELECT session_id, goal, summary, tool_results, meta_memory, created_at, work_dir
+			SELECT session_id, goal, summary, tool_results, meta_memory, created_at, work_dir, status
 			FROM session_history
 			WHERE session_id = $1
-		`, id).Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt, &r.WorkDir)
+		`, id).Scan(&r.SessionID, &r.Goal, &r.Summary, &toolRaw, &memRaw, &r.CreatedAt, &r.WorkDir, &r.Status)
 	if err == sql.ErrNoRows {
 		// 未找到是正常情况
 		return nil, nil

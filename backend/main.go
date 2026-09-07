@@ -225,8 +225,16 @@ func main() {
 	<-sigCh // 阻塞当前 goroutine，直到收到信号
 
 	// ---- 优雅关闭 ----
-	// 触发上下文取消，通知后台任务退出；随后关闭 HTTP server。
+	// 触发上下文取消，通知后台任务退出；随后优雅关闭 HTTP server。
 	srvLogger.Info(ctx, "正在关闭服务...")
 	cancel()
-	httpServer.Close()
+	// 优雅关闭：停止接收新连接并等待在途请求完成（避免在途 POST /message 被硬断丢消息）。
+	// SSE 长连接不会自行结束，以 3 秒超时封顶后强制关闭兜底；会话中断持久化由
+	// defer app.Close() 的 cleanup（Agent.Shutdown 标记中断 + 落库）完成。
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer shutdownCancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		srvLogger.Warn(ctx, "HTTP 连接未在超时内退出，强制关闭: "+err.Error())
+		httpServer.Close()
+	}
 }

@@ -706,6 +706,15 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		},
 		func() error { redisStore.Close(); return nil }, // 关闭 Redis 连接
 		func() error { pgStore.Close(); return nil },    // 最后关闭 PostgreSQL 连接
+		// 会话优雅停机：把 Running 会话标记"因服务重启中断"并落库（历史/事件 + 中断事件），
+		// 再取消全部会话上下文。App.Close 逆序执行 cleanup（见上方 Close 实现），本条
+		// 位于列表末位故最先执行——必须先于 pgStore.Close 落库。硬崩溃/断电场景由
+		// 启动恢复逻辑依据库中遗留的 running 状态兜底标记。
+		func() error {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return app.Agent.Shutdown(shutdownCtx)
+		},
 	}
 
 	return app, nil

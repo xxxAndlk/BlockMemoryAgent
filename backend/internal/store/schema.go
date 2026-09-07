@@ -30,8 +30,10 @@ func pgVector(v []float32) string {
 }
 
 // EnsureSessionHistorySchema 自动创建 session_history 表 (幂等)。
-// 同时确保 006_session_history_meta_memory.sql 的 meta_memory 列与
-// 008_session_work_dir.sql 的 work_dir 列已存在，避免 SaveSessionHistory 因列缺失而失败。
+// 同时确保 006_session_history_meta_memory.sql 的 meta_memory 列、
+// 008_session_work_dir.sql 的 work_dir 列与 009_session_history_status.sql 的
+// status 列 + session_id 唯一索引已存在，避免 SaveSessionHistory 因列缺失或
+// upsert 冲突目标缺失而失败。
 // 参数:
 //   - ctx: 超时与取消控制。
 //   - db:  *sql.DB 连接池。
@@ -55,6 +57,16 @@ CREATE INDEX IF NOT EXISTS idx_session_history_created_at
 ALTER TABLE session_history ADD COLUMN IF NOT EXISTS meta_memory JSONB DEFAULT '[]';
 -- 同理补齐 work_dir 列（008_session_work_dir.sql）：每会话工作目录，空串回落进程默认。
 ALTER TABLE session_history ADD COLUMN IF NOT EXISTS work_dir TEXT NOT NULL DEFAULT '';
+-- 补齐 status 列（009_session_history_status.sql）：会话最后一次落库时的状态，
+-- 进程死亡遗留 running 的行在恢复时被标记为"因服务重启中断"。
+ALTER TABLE session_history ADD COLUMN IF NOT EXISTS status VARCHAR(32) NOT NULL DEFAULT 'completed';
+-- 存量库 session_id 无唯一约束（此前 ON CONFLICT DO NOTHING 无冲突目标，每轮落一行），
+-- 先按 id 保留最新一行去重，再建唯一索引；SaveHistory 的 upsert 依赖此索引。
+-- 顺序不可颠倒：先去重后建索引，否则存量重复行会导致建索引失败（启动 fail-fast）。
+DELETE FROM session_history a USING session_history b
+    WHERE a.session_id = b.session_id AND a.id < b.id;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_session_history_session_id
+    ON session_history (session_id);
 `)
 	return err
 }

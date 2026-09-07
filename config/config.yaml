@@ -91,7 +91,7 @@ agent:
 
   # -- DAG / 会话恢复 --
   dag_enabled: false             # DAG 定时任务调度（默认关闭）
-  restore_sessions: false        # 启动时从 session_history 恢复最近 50 个会话到内存（默认 true；TUI 不需要历史记录，显式 false 关闭，启动即为全新会话）
+  restore_sessions: true         # 启动时从 session_history 恢复最近 50 个会话到内存（Web 重启续聊依赖此预热；列表合并与懒恢复不受此开关影响，关闭仅跳过预热）
 
   # -- 验证机制：分层自检（2026-08-08 起，替代已下线的 verifyloop 测试助手自动验证）--
   # 叶子 Agent 自检（写完即语法检查）；领域 Agent 对叶子产出做整体性验收，不过则返工叶子；

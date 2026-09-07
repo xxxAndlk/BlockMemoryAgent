@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -838,61 +839,120 @@ func (s *ReactService) cascadeCancelTree(sessionID string) {
 }
 
 // Get 根据会话 ID 获取会话。
-// 如果会话已从内存中淘汰，则回退到 PostgreSQL 历史记录中查找。
+// 如果会话不在内存（重启后未随 restoreSessions 批量恢复的老会话），
+// 则从 PostgreSQL 单会话懒恢复后返回完整快照（事件 + 完整 History）。
 func (s *ReactService) Get(ctx context.Context, sessionID string) (*Session, error) {
 	// 优先从内存快照中查找会话。
-	sess := s.store.snapshotSessionByID(sessionID)
-	if sess != nil {
+	if sess := s.store.snapshotSessionByID(sessionID); sess != nil {
 		return toReactAgentSession(sess), nil
 	}
-	// 内存未命中且存在 Postgres 存储时，查询历史记录。
-	if s.store.pgStore != nil {
-		// 设置 3 秒超时，避免外部存储故障导致长时间阻塞。
-		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		rec, err := s.store.pgStore.GetSessionHistoryByID(ctx, sessionID)
-		// 查询成功且记录存在时，将历史记录转换为 Session DTO。
-		if err == nil && rec != nil {
-			return &Session{
-				ID:     rec.SessionID,
-				Goal:   rec.Goal,
-				Status: string(enums.SessionStatusCompleted),
-				Result: rec.Summary,
-				// 历史会话没有准确的结束时间，使用创建时间占位。
-				StartedAt: rec.CreatedAt,
-				EndedAt:   rec.CreatedAt,
-				Events:    make([]Event, 0),
-				Messages: []Message{
-					{Role: string(enums.ChatRoleUser), Content: rec.Goal, Timestamp: rec.CreatedAt},
-					{Role: string(enums.ChatRoleAssistant), Content: rec.Summary, Timestamp: rec.CreatedAt},
-				},
-			}, nil
-		}
+	// 内存未命中：单会话懒恢复（事件 + 完整 History），恢复成功返回完整快照。
+	// 覆盖旧的两条消息降级快照，重启后旧会话的面板/续聊体验与内存会话一致；
+	// /board /tree /metrics /logs 等子资源 handler 均先经 Get，旧会话面板自动可用。
+	if restored := s.store.restoreOneSession(ctx, sessionID); restored != nil {
+		return toReactAgentSession(restored), nil
 	}
 	// 既不在内存也不在历史记录中，返回未找到错误。
 	return nil, ErrSessionNotFound
 }
 
-// List 返回内存中符合过滤条件的会话列表。
+// defaultSessionListLimit List 合并内存与库记录的默认上限，防止旧库膨胀拖垮侧栏。
+const defaultSessionListLimit = 200
+
+// sessionFromHistoryRecord 将 session_history 记录转为轻量 Session DTO（不逐条查事件）。
+// 状态经 restoredSessionStatus 映射（running → error + 中断提示）；历史会话没有准确的
+// 结束时间，使用创建时间占位；Messages 重建为用户目标与结果摘要两条。
+func sessionFromHistoryRecord(rec *store.SessionHistoryRecord) *Session {
+	status, result, _ := restoredSessionStatus(rec.Status, rec.Summary)
+	return &Session{
+		ID:        rec.SessionID,
+		Goal:      rec.Goal,
+		Status:    string(status),
+		Result:    result,
+		StartedAt: rec.CreatedAt,
+		EndedAt:   rec.CreatedAt,
+		Events:    make([]Event, 0),
+		Messages: []Message{
+			{Role: string(enums.ChatRoleUser), Content: rec.Goal, Timestamp: rec.CreatedAt},
+			{Role: string(enums.ChatRoleAssistant), Content: result, Timestamp: rec.CreatedAt},
+		},
+		WorkDir: rec.WorkDir,
+	}
+}
+
+// mergeSessionLists 合并内存会话与库记录转出的会话列表：内存优先（权威，同 ID 丢弃库行），
+// 按 StartedAt 降序排序后截断到 limit（<=0 时取 defaultSessionListLimit）。
+// 纯函数，便于无 PG 单测覆盖去重/排序/截断。
+func mergeSessionLists(memory, fromDB []*Session, limit int) []*Session {
+	if limit <= 0 {
+		limit = defaultSessionListLimit
+	}
+	seen := make(map[string]struct{}, len(memory))
+	out := make([]*Session, 0, len(memory)+len(fromDB))
+	for _, sess := range memory {
+		seen[sess.ID] = struct{}{}
+		out = append(out, sess)
+	}
+	for _, sess := range fromDB {
+		if _, dup := seen[sess.ID]; dup {
+			continue
+		}
+		seen[sess.ID] = struct{}{}
+		out = append(out, sess)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].StartedAt.After(out[j].StartedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// List 返回符合过滤条件的会话列表：内存会话优先，PostgreSQL 历史记录补充
+// 重启后不在内存的旧会话（查询失败仅记日志，降级为纯内存列表）。
 func (s *ReactService) List(ctx context.Context, filter Filter) ([]*Session, error) {
-	// 获取所有内存会话。
+	// 获取所有内存会话（已按开始时间降序）。
 	all := s.store.listSessions()
 	// 预分配输出切片，容量与总数一致。
-	out := make([]*Session, 0, len(all))
-	// 遍历会话并应用过滤条件。
+	memory := make([]*Session, 0, len(all))
+	// 遍历会话并应用状态过滤。
 	for _, sess := range all {
 		// 如果指定了状态过滤且状态不匹配，则跳过。
 		if filter.Status != "" && string(sess.Status) != filter.Status {
 			continue
 		}
 		// 将内部会话转换为公共 DTO 并追加到结果。
-		out = append(out, toReactAgentSession(sess))
-		// 如果达到数量上限，提前结束遍历。
-		if filter.Limit > 0 && len(out) >= filter.Limit {
-			break
+		memory = append(memory, toReactAgentSession(sess))
+	}
+	// 库记录补充：仅当存在 pgStore 时查询；拉取条数取过滤上限与默认上限的较大值。
+	var fromDB []*Session
+	if s.store.pgStore != nil {
+		// 设置 3 秒超时，避免外部存储故障导致长时间阻塞。
+		fetchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		fetchN := filter.Limit
+		if fetchN < defaultSessionListLimit {
+			fetchN = defaultSessionListLimit
+		}
+		if recs, err := s.store.pgStore.RecentSessionHistories(fetchCtx, fetchN); err != nil {
+			// 查询失败不阻塞列表：记录日志并降级为纯内存列表（启动本就要求 PG 可达，
+			// 此处兜底存储瞬时故障）。
+			s.store.logError(fetchCtx, "查询会话历史列表失败，降级为内存列表", err)
+		} else {
+			fromDB = make([]*Session, 0, len(recs))
+			for _, rec := range recs {
+				// 库行状态映射后同样应用状态过滤。
+				status, _, _ := restoredSessionStatus(rec.Status, rec.Summary)
+				if filter.Status != "" && string(status) != filter.Status {
+					continue
+				}
+				fromDB = append(fromDB, sessionFromHistoryRecord(rec))
+			}
 		}
 	}
-	return out, nil
+	// 合并去重、排序并截断。
+	return mergeSessionLists(memory, fromDB, filter.Limit), nil
 }
 
 // Send 向指定会话投递一条用户消息。
@@ -924,9 +984,11 @@ func (s *ReactService) ResumeSession(ctx context.Context, sessionID string, req 
 
 // Stream 返回指定会话的实时事件流通道。
 func (s *ReactService) Stream(ctx context.Context, sessionID string) (<-chan Event, error) {
-	// 如果会话不存在，直接返回错误。
+	// 如果会话不存在，先尝试懒恢复（重启后未预热的老会话），仍不存在才返回错误。
 	if s.store.snapshotSessionByID(sessionID) == nil {
-		return nil, ErrSessionNotFound
+		if s.store.restoreOneSession(ctx, sessionID) == nil {
+			return nil, ErrSessionNotFound
+		}
 	}
 
 	// 创建带缓冲的输出通道，降低发送阻塞。
@@ -1756,6 +1818,12 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	// 记录会话启动事件。
 	s.store.addEvent(session, eventkind.System, "System", "会话启动", "", "", "", "", "", true)
 
+	// 轮开始落库 running 状态行（009 status 列；History 为空时 persistFullHistory 自动跳过）：
+	// 进程在本轮中途崩溃/断电时，重启恢复逻辑依据库中 running 状态把会话标记为"因服务重启中断"，
+	// 优雅停机路径标记不到硬崩溃场景。
+	s.store.persistHistory(session)
+	s.store.persistEvents(session)
+
 	// 获取 meta 角色配置；若缺失则标记会话错误并退出。
 	metaRole := s.roleRegistry.Get("meta")
 	if metaRole == nil {
@@ -2289,7 +2357,16 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	session, ok := s.store.sessions[sessionID]
 	if !ok {
 		s.store.mu.Unlock()
-		return ErrSessionNotFound
+		// 懒恢复：老会话不在内存（重启后未在 restoreSessions 批量恢复范围内）时，
+		// 从 PG 恢复该会话后继续本次发送，实现"任意旧会话可续聊"。
+		// 恢复会话 approval/askUser 通道为 nil，下方澄清分支自然跳过；非 Running
+		// 状态走置 Running + resumeSession 路径（History 已自 agent_messages 重建）。
+		restored := s.store.restoreOneSession(ctx, sessionID)
+		if restored == nil {
+			return ErrSessionNotFound
+		}
+		s.store.mu.Lock()
+		session = restored
 	}
 
 	// 待答复的 Agent 提问（TODO #24 ask_user；#53 选项解析）：答复写 askUser 通道。
@@ -2383,6 +2460,11 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 
 	// 如果会话原先未运行，则在 goroutine 中恢复执行。
 	if !wasRunning {
+		// 轮开始落库 running 状态（历史/事件为上一轮快照，store.mu 已解锁——
+		// persistFullHistory 需 RLock，持写锁调用会死锁）：进程若在本轮中途崩溃，
+		// 重启恢复逻辑依据库中 running 状态把会话标记为"因服务重启中断"。
+		s.store.persistHistory(session)
+		s.store.persistEvents(session)
 		// 热驻模式（Domain 热驻）：唤醒全部挂起 Agent--wake 广播（叶子+domain 的
 		// SuspendGate 解除阻塞）+ Paused 域置回 Running（supervisor 收 opResume 续跑
 		// 当前任务）+ 恢复冻结的 idle TTL。旧路径（resumePausedDomain 逐个恢复）仅作
