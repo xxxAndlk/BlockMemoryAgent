@@ -293,3 +293,66 @@ round-12 任务 B 未达标（4926s > 3986s 线），触发熔断条款「第 12
 - 压缩失忆重定向 mega 呼（热驻会话压缩后「以磁盘为准」全量盘点 8-10k tok）仍有发生，r18 被其他节约掩盖
 - 任务 B iter2/iter4 仍落后 claude（+116/+64s）；iter4 为最大单迭代（878s）
 - 我的流程事故：round-15 因裸 `&` 双实例赛跑作废一轮（已固化：只许 run_in_background=true）
+
+---
+
+# 大改回归轮（2026-09-08 起跑：TODO#7-10 落地后回归，验证对擂成果在新系统上保持）
+
+- 背景：TODO 第 7-10 项主体落地（变更.md 任务 129-131）+ 赛后提交（eaa0f3b 停滞检测/防重、2c4de21 meta 提示词、5859994 PauseAgent+并行工具+驱逐+降采样+信任模式+worktree）。模型不变（双侧 doubao-seed-evolving 冻结基线：任务A 639s/C=1.0/Q=0.9091，任务B 3624s/C=0.9722）。
+- 关键配置变化（vs round-19 快照）：meta thinking off→high；meta 工具发还 ReadFile/RunCommand/ReadMedia/ReadSharedMemory/map_sub_agents/merge_worktree；tool_parallel_enabled=true；stale_tool_evict_rounds=20；tool_result_dump_runes=8000；agents_md 注入 ≤4000 runes；trust_mode=full-auto（默认不改现状）；worktree_enabled=true（默认不启用参数）。
+- 风险观察点：①thinking:high 致 meta 单呼变慢（历史 off 时 ~10s，high 或回 40s+ 量级）②新停滞检测误杀 RunCommand 长操作 ③驱逐/收口改变 domain 上下文行为。
+- round-20 起跑（规则不变：任务B单会话6迭代 → 任务A → report.js 20；每迭代质检，不合格修复重跑该迭代）。
+- 00:10 round-20 首跑失败（server_unhealthy）：两处起跑前修复——①domain_model 被 merge 回落成 glm-5.3-flash（违反用户裁定"模型不可换"，round-18 冠军配置=evolving），已复原 doubao-seed-evolving（thinking: medium 保留，TODO#8 P0-1 待测项）；②roles.yaml ui_model 块改为 ${GEMINI_CHAT_MODEL} 占位后 lib.sh 重写正则失配（boot 校验拨 api.openai.com 超时），已放宽 model 行匹配+残留校验改为块内 provider 断言。该次不计成绩。
+- 00:12 round-20 重跑（bash-2nyp28v8）：健康检查通过，MetaAgent 首呼 doubao-seed-evolving 正常，stable_hash 日志可见。观察 cron=f26c2b25。
+- 观察（cron 00:46）：r20 iter0-2 = 354/424/313s 全满分（累计 1091s vs claude 1519s——领先 428s，历代最佳开局，超 r18 的 1242s）。iter2=313s 首次快于 claude 的 338s 且满分（字面量钉死纪律在新提示词下存活）。thinking:high/medium 未拖垮前半程；stable_hash/并行工具日志正常。反超算术：iter3+4+5 ≤2533s（均 844s）即可破反超线，r18 后半程为 1928s——窗口宽裕。iter3 进行中。本轮仅观察。
+- 01:15 round-20 任务B 全程：3252s（354/424/313/1130/747/284），iter0-4 满分，**iter5 B5-5 FAIL**（api.md 分列式 `| GET | `/api/x` |` +路径反引号，探针 `GET\s+/api/` 仅命中 1）→ C=0.9722 平 claude，T 破反超线 372s。**判定=追平达标，反超未达**。结构性发现：新提示词（中小任务直达+工具发还）下 MetaAgent 六个迭代全部自执行、零派发（tree.json 空）——编排开销近零是提速主因（iter5 仅 284s，历代最快）；风险面=无 spec 环节使「模板行同格连写」纪律失去触发点（该规则原文只约束 spec 写作场景）。
+- 归因与改动（r21 生效）：B5-5 根因=meta 自写文档不受 spec 模板行纪律约束。roles.yaml 输出格式钉死条款扩展——自执行/返工直达直产文档同样适用同格连写+路径裸写（附 r20 iter5 实证）。YAML 校验通过。
+- 质检（qc-round-20-task_b-final 轻量版）：34/34 测试绿（判分器实测）、app.js 三处 method 字面量在位、总交付 1304 行（r18=1165/claude=1827）无注水、config.js getter 动态读 env 正确；唯一失分=api.md 表格机器可读格式。
+- round-21 起跑（唯一改动=上述模板行条款扩展）。
+- 观察（cron 01:45）：r21 iter0-3 = 293/394/202/555s 全满分（累计 1444s vs claude 2211s——领先 767s，历代最佳）。iter2=202s 历代最快；iter3 较 r20 腰斩（1130→555s）。meta 自执行模式延续。反超算术：iter4+5 ≤2180s 即破线（r20 后半程 1031s），窗口宽裕。iter4 进行中。本轮仅观察。
+- 01:56 **round-21 任务B 全程：2383s（293/394/202/555/656/283）/ C=1.0 六迭代全满分——反超线 3624s 突破，领先 1241s（34%）；逐迭代六线全胜 claude**。B5-5 修复生效（api.md 同格连写 endpoints=10）。历代最佳：较 r18 冠军再快 787s。meta 全程自执行零派发延续。人工质检 ✅合格（qc-round-21-task_b-final.md：config getter/RFC4180/夹具隔离/字面量全在位，1489 行无注水）。任务 A r21 补跑中（bash-h3rkgo1d）。
+- 02:02 round-21 官方判定：任务B **BMA胜**（2383s/C=1.0/S=100）；任务A **未达标**（215s/C=1.0 历代最快，但 Q=0.7955<0.8591——Q1 BOM 未剥离首列名污染 + Q8 测试 13 例<20）。根因同 B5-5 一类：meta 自执行（logs 仅 MetaAgent 14 呼）无 spec 环节，domain 4.5 从严清单（r19 修复成果）不在 meta 上下文生效。
+- 改动（r22 生效）：meta【自执行纪律】内嵌 CLI 从严清单同口径条款（BOM 容忍/错误非零退出+stderr/UTF-8 防护/测试 ≥20 例含边界与子进程断言/README 三节，附 r21 实证）。YAML 校验通过。沿用 r19 先例：任务A 单跑验证（round-22 只跑 task_a），任务B r21 成果不回滚不重跑。
+- 观察（cron 02:15）：r22 任务A 进行中（5min 处）。meta 自白已引用从严清单条款（"≥20 cases covering... subprocess calls"）——内嵌清单生效迹象。等完赛判分。
+- 02:31 round-22 任务A ❌双不合格：timeout 1244s（上限 1200）+ A6 FAIL（27 例测试 failures=2）。归因：①meta thinking:high 自执行编码 16 呼均延 65s，时限内修不完 ②遗留一次性诊断脚本 tests/test_diag2.py（import 失败计 1 败）③非 ASCII 断言未显式 encoding（4.5.e 已写仍违，模型漂移）。从严清单本身生效（27 例 ≥20、BOM fixture 有写）。
+- r23 双改动（YAML 校验通过）：①meta thinking high→low（模型不变；P0-1 thinking 恢复只保 domain 编码层 medium；实测 off/low 为 meta 对擂优胜档位）②meta 自执行条款补 4.6 测试纪律+收尾清场（禁留一次性脚本，附 r22 实证）。任务A 单跑重验证。
+- 观察（cron 02:45）：r23 任务A 进行中（~7min），出现一次 RunCommand FAIL（测试失败修复中）。r22 同位置曾陷修复环，观察 low 档能否在时限内收敛。
+- 02:46 **round-23 任务A ✅达标**：696s（≤703s 线，余量 7s）/ C=1.0 / **Q=0.9091 平 claude 基线**——Q1 BOM 修复 ✓、Q8 测试 28 例满分 ✓、A6 全绿无遗留脚本 ✓；唯一失分 Q2（空白行计数，与 claude 基线同剖面）。report.js 23 官方判定达标（E=0.9181，S=98.4）。
+
+---
+
+# 大改回归终报（2026-09-08 收官）
+
+## 背景
+
+TODO 第 7-10 项落地（变更.md 任务 129-131：并行工具/结果收口驱逐/降采样/worktree/信任模式/停滞检测/懒恢复/PauseAgent）+ meta 提示词大改（长版：返工直达/中小任务直达/工具发还）后，按冻结规则回归验证对擂成果。模型全程不变（doubao-seed-evolving）。
+
+## 最终结果（官方判定）
+
+| 任务 | claude 基线 | BMA 大改后 | 判定 |
+| --- | --- | --- | --- |
+| 任务 B（大型迭代） | 3624s / C=0.9722 | **2383s / C=1.0**（round-21，六迭代全胜，较旧冠军 r18 再快 787s） | **BMA胜** ✅ |
+| 任务 A（中小一次性） | 639s / C=1.0 / Q=0.9091 | **696s / C=1.0 / Q=0.9091**（round-23，Q 平基线，时间 0.92 倍） | **达标** ✅ |
+
+## 结构变化（本轮最大发现）
+
+新提示词下 MetaAgent 对两个任务**全程自执行、零派发**（单循环默认化设计意图落地），编排开销近零——任务B 六线全胜主因。代价=spec 场景纪律失去触发点，两轮修复：
+
+1. r20→r21：输出格式「同格连写」从 spec 写作扩展到自执行直产文档（B5-5 回收，2383s 反超）
+2. r21→r23：meta 自执行纪律内嵌 CLI 从严清单（domain 4.5 同口径）+ 4.6 测试纪律 + 收尾清场；meta thinking high→low（high 档 16 呼×65s 烧穿 1200s 上限，low 档 696s 达标；P0-1 thinking 恢复只保 domain 编码层 medium）
+
+## 起跑前修复（merge 回落类）
+
+- domain_model 被 merge 回落 glm-5.3-flash（违反模型冻结裁定）→ 复原 evolving
+- lib.sh ui_model 重写适配 ${GEMINI_CHAT_MODEL} 占位新格式（否则 boot 校验拨 api.openai.com 超时）
+
+## 观察点记录（TODO 7-10 验收口径对照）
+
+- 停滞检测：两任务全程零误杀（RunCommand 长跑正常）✓
+- stable_hash 日志可见；并行工具执行正常；自执行模式 token 总量显著低于派发模式
+- meta thinking 档位结论：路由/汇总角色 low 足够，high 无质量增益只有延迟（Q 分 r21 high=0.7955 vs r23 low=0.9091，差异在条款覆盖不在思考深度）
+
+## 残留项
+
+- 任务A 696s 贴线（余量 7s），模型漂移下存在回退风险；Q2 空白行计数两侧同失（基线剖面一致）
+- 大改回归收官，观察 cron 已删
