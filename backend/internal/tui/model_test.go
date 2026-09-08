@@ -306,10 +306,10 @@ func TestScrollbarDragScrollsChat(t *testing.T) {
 		height:    12,
 		shared:    newSharedState(),
 	}
-	// 顶栏 1 行 + Token 栏 1 行 + 主内容区 4 行 + 输入栏 5 行（含边框） + 快捷键栏 1 行 = 12 行
-	// mainContentHeight = 12 - 1（顶栏） - 1（Token 栏） - 5（输入栏） - 1（快捷键栏） = 4
-	if h := m.mainContentHeight(); h != 4 {
-		t.Fatalf("mainContentHeight 应为 4，got %d", h)
+	// 顶栏 1 行 + Token 栏 1 行 + 主内容区 5 行 + 输入栏 5 行（含边框） = 12 行
+	// mainContentHeight = 12 - 1（顶栏） - 1（Token 栏） - 5（输入栏） = 5
+	if h := m.mainContentHeight(); h != 5 {
+		t.Fatalf("mainContentHeight 应为 5，got %d", h)
 	}
 
 	// 构造 20 行内容，使 viewport 可滚动。
@@ -327,7 +327,7 @@ func TestScrollbarDragScrollsChat(t *testing.T) {
 	}
 
 	sx, sy, sw, sh := m.chatPanel.scrollbarArea(m.chatAreaWidth(), m.mainContentHeight())
-	if sx < 0 || sy != 1 || sw != 1 || sh != 4 {
+	if sx < 0 || sy != 1 || sw != 1 || sh != 5 {
 		t.Fatalf("scrollbarArea 异常: x=%d y=%d w=%d h=%d", sx, sy, sw, sh)
 	}
 
@@ -496,8 +496,8 @@ func TestRightPanelLayoutDoesNotOverflow(t *testing.T) {
 func TestRightPanelShowsBothPanelsEvenWhenShort(t *testing.T) {
 	// 经 NewModel + WindowSizeMsg 走真实尺寸分发（直接构造 viewport 会与 height 不一致，
 	// 渲染出超终端高度的帧——真实程序不会这样）。
-	// 高度 20 是“紧张”的下限：顶栏+对话区+Token 栏+输入栏(5)+快捷键栏已占 13 行，
-	// 12 行终端连必需区都装不下（帧封顶后保留底部，面板标题必然不可见），故用 20 验证。
+	// 高度 20 是“紧张”的下限：顶栏+对话区+Token 栏+输入栏(5)已占 12 行，
+	// 更小终端连必需区都装不下（帧封顶后保留底部，面板标题必然不可见），故用 20 验证。
 	m := NewModel(nil, nil, "http://127.0.0.1:1", "test")
 	nm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
 	model := modelPtr(nm)

@@ -125,6 +125,12 @@ type ReActAgent struct {
 	// 取消流让 generate 重试（2026-08-20 ark glm-5.3 一天三次流中途静默）。
 	// <=0 用 defaultStreamIdleTimeout（300s）。
 	streamIdleTimeout time.Duration
+	// streamFirstChunkTimeout 首块前独立卡口（任务137）：健康端点首 chunk（含思考
+	// 增量）秒级到达，5min 才来首块 = 端点假连接（实证 2026-09-08 domain-4/5/6
+	// 三连 5min 零首块，重试再烧 5min，10min 墙钟全烧光零交付）。首块前与首块后
+	// 分开设卡：首块前用短卡口快速判死重试，首块后仍用 300s 容忍长生成停顿。
+	// <=0 用 defaultStreamFirstChunkTimeout（120s）。
+	streamFirstChunkTimeout time.Duration
 	// suspendGate 可选的会话级挂起检查点，由 WithSuspendGate 注入。
 	// 主循环顶部与 waitForChildren 内调用 Park：会话挂起期间阻塞（goroutine 真挂起），
 	// 恢复返回 nil 继续。为 nil 时零变化（热驻关闭时不注入）。
@@ -443,6 +449,10 @@ const historyToolCallInputMaxRunes = 12000
 // defaultStreamIdleTimeout 是流式块间空闲超时默认值：首块之后 chunk 间隔超过它
 // 即判流死（2026-08-20 ark glm-5.3 一天三次流中途静默，等满整次墙钟才报错代价太高）。
 const defaultStreamIdleTimeout = 300 * time.Second
+
+// defaultStreamFirstChunkTimeout 是首块前独立卡口默认值：健康端点首 chunk（含思考
+// 增量）秒级到达，超过它 = 端点假连接，快速判死让 RetryLLM 重试而不是白烧墙钟。
+const defaultStreamFirstChunkTimeout = 120 * time.Second
 
 // truncateToolCallInputsForHistory 返回 assistant 消息的入史副本：
 // ToolCalls 的 Input 中超长字符串值被截断（附原始长度标记），其余字段与原消息共享。
@@ -1348,6 +1358,10 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 	if idleTimeout <= 0 {
 		idleTimeout = defaultStreamIdleTimeout
 	}
+	firstChunkTimeout := a.streamFirstChunkTimeout
+	if firstChunkTimeout <= 0 {
+		firstChunkTimeout = defaultStreamFirstChunkTimeout
+	}
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
 	started := time.Now()
@@ -1379,7 +1393,9 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 				stall := time.Since(lastChunk) > idleTimeout
 				phase := "after first chunk"
 				if !firstChunk {
-					stall = time.Since(started) > idleTimeout
+					// 首块前用独立短卡口：健康端点首 chunk 秒级到达，等满 300s 才判死
+					// 会在假连接上白烧墙钟（实证 domain-4/5/6 三连 5min 零首块）。
+					stall = time.Since(started) > firstChunkTimeout
 					phase = "before first chunk"
 				}
 				if stall {

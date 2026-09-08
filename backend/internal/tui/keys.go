@@ -91,5 +91,5 @@ const fullHelpText = `
 	  Alt+V             粘贴剪贴板图片/视频（资源管理器复制的视频文件自动识别为视频附件，插入 [image:N]/[video:N] 占位符随消息发送，服务端对视频抽帧后走图片链路；图片最多 4 张、视频最多 2 个）
 	  ↑/↓               浏览历史输入
 
-	底部快捷键栏：K Command Palette  P Plan  A Agents  L Logs  M Memory  G Git Diff  S Settings  ? Help  Ctrl+C Exit
+	快捷键（对话区）：P Plan  A Agents  L Logs  S 切换模型  K 聚焦输入栏  ? Help  Ctrl+C Exit
 	`

@@ -1029,7 +1029,7 @@ func formatMarkdown(text string) string {
 	mdHeader := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(cHeader))
 	mdBold := lipgloss.NewStyle().Bold(true)
 	mdItalic := lipgloss.NewStyle().Italic(true)
-	mdCode := lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cValue))
+	mdCode := lipgloss.NewStyle().Foreground(lipgloss.Color(cWarn))
 	mdCodeBlock := lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cValue)).Padding(0, 1)
 	mdDim := lipgloss.NewStyle().Foreground(lipgloss.Color(cDone))
 

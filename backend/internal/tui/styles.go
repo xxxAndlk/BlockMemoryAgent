@@ -38,7 +38,7 @@ const (
 	cOverlayBg = "#24283B"
 	// cPanelBg 是右侧面板背景色。
 	cPanelBg = "#16161E"
-	// cTopBarBg 是顶部状态栏与底部快捷键栏背景色。
+	// cTopBarBg 是顶部状态栏背景色。
 	cTopBarBg = "#1A1B26"
 	// cStatusRun 是运行中状态指示色。
 	cStatusRun = "#9ECE6A"
@@ -146,12 +146,6 @@ type Styles struct {
 	PanelHeader lipgloss.Style
 	// PanelBox 是右侧面板内容区样式。
 	PanelBox lipgloss.Style
-	// ShortcutKey 是底部快捷键栏按键样式。
-	ShortcutKey lipgloss.Style
-	// ShortcutLabel 是底部快捷键栏标签样式。
-	ShortcutLabel lipgloss.Style
-	// ShortcutBar 是底部快捷键栏整体样式。
-	ShortcutBar lipgloss.Style
 	// InputHint 是输入栏空态提示文本样式。
 	InputHint lipgloss.Style
 }
@@ -208,9 +202,6 @@ func NewStyles() *Styles {
 		WelcomeExample: lipgloss.NewStyle().Foreground(lipgloss.Color(cSub)),
 		PanelHeader:    lipgloss.NewStyle().Background(lipgloss.Color(cBlur)).Foreground(lipgloss.Color(cValue)).Bold(true).Padding(0, 1),
 		PanelBox:       lipgloss.NewStyle().Background(lipgloss.Color(cPanelBg)).BorderStyle(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(cBlur)).Padding(0, 1),
-		ShortcutKey:    lipgloss.NewStyle().Foreground(lipgloss.Color(cTitle)).Bold(true),
-		ShortcutLabel:  lipgloss.NewStyle().Foreground(lipgloss.Color(cInfo)),
-		ShortcutBar:    lipgloss.NewStyle().Background(lipgloss.Color(cTopBarBg)).Foreground(lipgloss.Color(cInfo)).Padding(0, 1),
 		InputHint:      lipgloss.NewStyle().Foreground(lipgloss.Color(cDone)),
 	}
 }

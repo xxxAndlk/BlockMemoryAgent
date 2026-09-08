@@ -123,7 +123,7 @@ func (op *OverlayPanel) render(styles *Styles, w, h int, planLines, agentsLines,
 
 	// 拼接标题、操作提示与内容，居中放置。
 	header := styles.Header.Render(op.title)
-	hint := styles.Dim.Render("  [Esc close · j/k scroll · enter detail]")
+	hint := styles.Dim.Render("  [Esc close · ↑/↓ select · enter detail]")
 	body := lipgloss.JoinVertical(lipgloss.Left, header+hint, content)
 	box := styles.Overlay.Width(boxW).Height(boxH).Render(body)
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)

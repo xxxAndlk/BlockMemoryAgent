@@ -617,6 +617,68 @@ func findSnapshot(workDir, sessionID, absPath, stamp string) (snapPath string, a
 // 应退回 WriteFile 整写（含截断防护/缩小警告全套保护）。
 const maxEditStringRunes = 50000
 
+// fuzzyEditRange 是一次空白宽容匹配命中的区域：start 为 0-based 起始行号，lines 为行数。
+type fuzzyEditRange struct {
+	start int
+	lines int
+}
+
+// fuzzyEditRegions 在 content 中做空白宽容匹配：content 与 old 按行拆分后逐行
+// TrimSpace 做连续子序列比对（old 首尾空行忽略），返回全部命中区域。
+// 覆盖场景：old_string 基于过期读取，文件缩进/行尾空白已被并发修改，逐字符
+// 匹配落空但空白归一后仍能对上。内容本身有差异的行不命中。
+func fuzzyEditRegions(content, old string) []fuzzyEditRange {
+	trimLines := func(s string) []string {
+		lines := strings.Split(s, "\n")
+		out := make([]string, len(lines))
+		for i, l := range lines {
+			out[i] = strings.TrimSpace(l)
+		}
+		return out
+	}
+	trimmedContent := trimLines(content)
+	trimmedOld := trimLines(old)
+	for len(trimmedOld) > 0 && trimmedOld[0] == "" {
+		trimmedOld = trimmedOld[1:]
+	}
+	for len(trimmedOld) > 0 && trimmedOld[len(trimmedOld)-1] == "" {
+		trimmedOld = trimmedOld[:len(trimmedOld)-1]
+	}
+	if len(trimmedOld) == 0 {
+		return nil
+	}
+	var out []fuzzyEditRange
+	for i := 0; i+len(trimmedOld) <= len(trimmedContent); i++ {
+		match := true
+		for j := range trimmedOld {
+			if trimmedContent[i+j] != trimmedOld[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			out = append(out, fuzzyEditRange{start: i, lines: len(trimmedOld)})
+			i += len(trimmedOld) - 1
+		}
+	}
+	return out
+}
+
+// replaceFuzzyRegions 把命中区域整段替换为 newStr（按行插入），从后往前替换防行号漂移。
+func replaceFuzzyRegions(content string, regions []fuzzyEditRange, newStr string) string {
+	lines := strings.Split(content, "\n")
+	newLines := strings.Split(newStr, "\n")
+	for i := len(regions) - 1; i >= 0; i-- {
+		r := regions[i]
+		updated := make([]string, 0, len(lines)-r.lines+len(newLines))
+		updated = append(updated, lines[:r.start]...)
+		updated = append(updated, newLines...)
+		updated = append(updated, lines[r.start+r.lines:]...)
+		lines = updated
+	}
+	return strings.Join(lines, "\n")
+}
+
 // editFile 在已存在文件中做精确局部替换：old_string 唯一匹配（或 replace_all）替换为
 // new_string。与 WriteFile 对齐的机制：写守卫/沙箱/角色写路径校验、.bma/snapshots 快照、
 // 成功后共享记忆失效与 PROJECT.md 去抖刷新（后者由 Registry.Dispatch 统一触发）。
@@ -673,32 +735,50 @@ func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
 	normOld := normalizeCRLF(oldStr)
 	normNew := normalizeCRLF(newStr)
 	count := strings.Count(normContent, normOld)
-	if count == 0 {
-		// 无匹配：返回就近上下文提示（文件开头片段）帮助模型自查，而非静默。
-		hint := truncateRunes(normContent, 200)
-		if hint == "" {
-			hint = "（文件为空）"
+	var newContent string
+	var fuzzyWarn string
+	line := 1
+	switch {
+	case count == 0:
+		// 任务137 空白宽容回退：old_string 基于过期读取（文件被并发修改/缩进漂移）时
+		// 逐字符匹配落空。逐行 TrimSpace 序列比对作为"自动重读"替代——命中即按实际
+		// 原文区域替换并附警告，省一轮"报错→重读→重试"往返（实证 wuhaotui 两处
+		// EditFile FAIL 后用户杀任务）。
+		regions := fuzzyEditRegions(normContent, normOld)
+		if len(regions) == 0 {
+			// 无匹配：返回就近上下文提示（文件开头片段）帮助模型自查，而非静默。
+			hint := truncateRunes(normContent, 200)
+			if hint == "" {
+				hint = "（文件为空）"
+			}
+			return &Result{Tool: "EditFile", Path: absPath, Error: fmt.Sprintf(
+				"old_string 未在文件中找到（含空白宽容匹配）。old_string 必须与文件内容逐字符一致（含缩进/空格；"+
+					"行尾 \\r\\n 与 \\n 视为等价）。请先用 SearchInFiles/ReadFile 定位当前实际文本再重试。\n文件开头片段：\n%s", hint)}
 		}
-		return &Result{Tool: "EditFile", Path: absPath, Error: fmt.Sprintf(
-			"old_string 未在文件中找到。old_string 必须与文件内容逐字符一致（含缩进/空格；"+
-				"行尾 \\r\\n 与 \\n 视为等价）。请先用 SearchInFiles 定位实际文本再重试。\n文件开头片段：\n%s", hint)}
-	}
-	if count > 1 && !replaceAll {
+		if len(regions) > 1 && !replaceAll {
+			return &Result{Tool: "EditFile", Path: absPath, Error: fmt.Sprintf(
+				"old_string 空白宽容匹配在文件中出现 %d 处，不唯一。请扩大 old_string 的上下文（包含周围独特行）"+
+					"使其唯一，或显式传 replace_all=true 替换全部 %d 处。", len(regions), len(regions))}
+		}
+		line = regions[0].start + 1
+		newContent = replaceFuzzyRegions(normContent, regions, normNew)
+		count = len(regions)
+		fuzzyWarn = "；old_string 与当前文件存在空白差异（文件可能已被修改），已按空白宽容匹配替换，建议核对周边内容"
+	case count > 1 && !replaceAll:
 		return &Result{Tool: "EditFile", Path: absPath, Error: fmt.Sprintf(
 			"old_string 在文件中出现 %d 次，不唯一。请扩大 old_string 的上下文（包含周围独特行）"+
 				"使其唯一，或显式传 replace_all=true 替换全部 %d 处。", count, count)}
+	default:
+		// 应用替换：replace_all 全替换，否则仅第一处。
+		if replaceAll {
+			newContent = strings.ReplaceAll(normContent, normOld, normNew)
+		} else {
+			newContent = strings.Replace(normContent, normOld, normNew, 1)
+		}
+		// 首个匹配位置的行号（1-based），供结果报告。
+		firstIdx := strings.Index(normContent, normOld)
+		line = 1 + strings.Count(normContent[:firstIdx], "\n")
 	}
-
-	// 应用替换：replace_all 全替换，否则仅第一处。
-	var newContent string
-	if replaceAll {
-		newContent = strings.ReplaceAll(normContent, normOld, normNew)
-	} else {
-		newContent = strings.Replace(normContent, normOld, normNew, 1)
-	}
-	// 首个匹配位置的行号（1-based），供结果报告。
-	firstIdx := strings.Index(normContent, normOld)
-	line := 1 + strings.Count(normContent[:firstIdx], "\n")
 
 	// 按文件主行尾风格写回：原文 CRLF 为主时整体转回 CRLF，保持全文件风格一致。
 	crlf := bytes.Count(data, []byte("\r\n"))
@@ -716,7 +796,7 @@ func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
 	result := &Result{
 		Tool:    "EditFile",
 		Success: true,
-		Output:  fmt.Sprintf("replaced %d occurrence(s) at line %d (%d -> %d bytes)", count, line, len(data), len(newContent)),
+		Output:  fmt.Sprintf("replaced %d occurrence(s) at line %d (%d -> %d bytes)%s", count, line, len(data), len(newContent), fuzzyWarn),
 		Path:    absPath,
 	}
 	if snapPath != "" {

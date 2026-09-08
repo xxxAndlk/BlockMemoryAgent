@@ -23,7 +23,7 @@ func (m Model) View() string {
 	return m.singleColumnView()
 }
 
-// singleColumnView v2.5 主布局：顶部状态栏 + 主内容区 + 输入栏 + 底部快捷键栏。
+// singleColumnView v2.5 主布局：顶部状态栏 + 主内容区 + 输入栏。
 // 有活动会话且终端宽度充足时，主内容区左侧为对话区，右侧为计划/Agent 面板。
 func (m Model) singleColumnView() string {
 	contentH := m.mainContentHeight()
@@ -40,7 +40,7 @@ func (m Model) singleColumnView() string {
 		mainRow = m.renderChat(m.width, contentH)
 	}
 
-	// 垂直拼接：顶栏、主内容区、问答面板（有待答复澄清时）、Token 统计栏、输入栏、快捷键栏。
+	// 垂直拼接：顶栏、主内容区、问答面板（有待答复澄清时）、Token 统计栏、输入栏。
 	parts := []string{
 		m.renderTopBar(m.width),
 		mainRow,
@@ -51,7 +51,6 @@ func (m Model) singleColumnView() string {
 	parts = append(parts,
 		m.renderTokenBar(m.width),
 		m.renderInput(m.width),
-		m.renderShortcutBar(m.width),
 	)
 	view := lipgloss.JoinVertical(lipgloss.Top, parts...)
 
@@ -66,7 +65,7 @@ func (m Model) singleColumnView() string {
 	}
 
 	// 安全网：任何一行显示宽度超过终端都会物理折行，把后续内容整体顶下去
-	// （实证：顶栏/快捷键栏超宽折行使整帧比终端高，输入栏被挤出可视区）。
+	// （实证：顶栏超宽折行使整帧比终端高，输入栏被挤出可视区）。
 	// 对最终帧逐行硬裁剪；总行数超高时由 fitFrameLines 压缩到终端高度。
 	vlines := strings.Split(view, "\n")
 	for i, l := range vlines {
@@ -75,7 +74,7 @@ func (m Model) singleColumnView() string {
 	return strings.Join(fitFrameLines(vlines, m.height), "\n")
 }
 
-// fitFrameLines 将整帧裁剪到终端高度：顶栏（第 0 行）常驻、底部输入栏/快捷键栏
+// fitFrameLines 将整帧裁剪到终端高度：顶栏（第 0 行）常驻、底部输入栏
 // 优先可见，溢出行从中间对话区丢弃。行数不超高时原样返回。
 // （原实现只保留底部 N 行，超高时顶栏与对话区首行被裁掉——顶栏此后常驻。）
 func fitFrameLines(vlines []string, height int) []string {
@@ -613,31 +612,6 @@ func fmtTokensK(n int) string {
 	return s
 }
 
-// renderShortcutBar 渲染底部快捷键栏，展示常用按键提示。
-func (m Model) renderShortcutBar(w int) string {
-	shortcuts := []struct {
-		key   string
-		label string
-	}{
-		{"K", "Command Palette"},
-		{"P", "Plan"},
-		{"A", "Agents"},
-		{"L", "Logs"},
-		{"B", "Side Panel"},
-		{"Tab", "对话区"},
-		{"Pg↑/Pg↓", "滚动"},
-		{"?", "Help"},
-		{"Ctrl+C", "Exit"},
-	}
-	var parts []string
-	for _, s := range shortcuts {
-		parts = append(parts, "["+m.styles.ShortcutKey.Render(s.key)+"] "+m.styles.ShortcutLabel.Render(s.label))
-	}
-	// 快捷键较多时一行放不下，硬裁剪保证恒为 1 物理行（折行会把输入栏顶出屏幕）。
-	// 注意 ShortcutBar 样式带 Padding(0,1)，内容区只有 w-2 列。
-	return m.styles.ShortcutBar.Width(w).Height(1).Render(hardClipLine(strings.Join(parts, "  "), w-2))
-}
-
 // wrapStyledLine 将单行原始文本按宽度换行，并在首行保留时间戳前缀，续行保持对齐。
 // style 为整行文本应用的颜色样式；width 为对话区总宽度。
 func wrapStyledLine(tsStyled, text string, style lipgloss.Style, width int) []string {
@@ -723,7 +697,7 @@ func displayDetailLines(title, detail string) []string {
 
 // hardClipLine ANSI 感知的硬裁剪：按显示宽度截断到 w 列（不加省略号），
 // 保留行内 ANSI 序列；若行内含样式则末尾补 reset，防样式泄漏到后续行。
-// 用于顶栏/快捷键栏等"必须恰好 1 物理行"的场景：物理折行会让整帧比终端高。
+// 用于顶栏等"必须恰好 1 物理行"的场景：物理折行会让整帧比终端高。
 func hardClipLine(s string, w int) string {
 	if w < 1 || lipgloss.Width(s) <= w {
 		return s

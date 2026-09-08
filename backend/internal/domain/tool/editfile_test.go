@@ -340,6 +340,93 @@ func TestEditFile_DoesNotInvalidateUnrelatedEntry(t *testing.T) {
 	}
 }
 
+// TestEditFile_FuzzyWhitespaceFallback 验证空白宽容回退（任务137）：old_string 基于
+// 过期读取、文件缩进/行尾空白已被并发修改时，逐字符匹配落空但逐行 TrimSpace 比对
+// 唯一命中 → 按实际原文区域替换成功，Output 附空白差异警告。
+func TestEditFile_FuzzyWhitespaceFallback(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "a.js")
+	// 文件实际缩进是 4 空格 + 行尾空格，old_string 按 2 空格抄写（过期读取形态）。
+	original := "function foo() {\n    return x;   \n}\n"
+	if err := os.WriteFile(target, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+	e := NewExecutor(dir)
+	res := e.editFile(context.Background(), map[string]any{
+		"path":       "a.js",
+		"old_string": "  return x;\n}",
+		"new_string": "  return x + 1;\n}",
+	})
+	if !res.Success {
+		t.Fatalf("fuzzy fallback should succeed: %s", res.Error)
+	}
+	if !strings.Contains(res.Output, "空白宽容匹配") {
+		t.Errorf("output = %q, want fuzzy warning", res.Output)
+	}
+	if !strings.Contains(res.Output, "line 2") {
+		t.Errorf("output = %q, want line 2 of match", res.Output)
+	}
+	got, _ := os.ReadFile(target)
+	// new_string 原样插入（2 空格形态），命中区域整体被替换。
+	want := "function foo() {\n  return x + 1;\n}\n"
+	if string(got) != want {
+		t.Errorf("content = %q, want %q", got, want)
+	}
+}
+
+// TestEditFile_FuzzyMultipleHitsRejected 验证空白宽容匹配多处命中且未传 replace_all
+// 时被拒绝，文件保持原样。old_string 带首尾空行（精确匹配必然落空），逐行 trim 后
+// 两处行内容都命中 → 走 fuzzy 分支的不唯一拒绝。
+func TestEditFile_FuzzyMultipleHitsRejected(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "a.txt")
+	original := "  return x;  \nother\n  return x;  \n"
+	if err := os.WriteFile(target, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+	e := NewExecutor(dir)
+	res := e.editFile(context.Background(), map[string]any{
+		"path":       "a.txt",
+		"old_string": "\nreturn x;\n",
+		"new_string": "return y;",
+	})
+	if res.Success {
+		t.Fatal("expected rejection for multiple fuzzy hits")
+	}
+	if !strings.Contains(res.Error, "空白宽容匹配") || !strings.Contains(res.Error, "不唯一") {
+		t.Errorf("error = %q, want fuzzy multi-hit message", res.Error)
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != original {
+		t.Errorf("file must stay unchanged on rejection, got %q", got)
+	}
+}
+
+// TestEditFile_FuzzyCRLFPreserved 验证空白宽容路径写回仍保持文件原 CRLF 行尾风格。
+// old_string 为两行（第二行带缩进空白差异），精确匹配落空走 fuzzy 分支。
+func TestEditFile_FuzzyCRLFPreserved(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "win.txt")
+	original := "line one\r\n  line two  \r\nline three\r\n"
+	if err := os.WriteFile(target, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+	e := NewExecutor(dir)
+	res := e.editFile(context.Background(), map[string]any{
+		"path":       "win.txt",
+		"old_string": "line two\nline three",
+		"new_string": "line TWO\nline three",
+	})
+	if !res.Success {
+		t.Fatalf("fuzzy fallback should succeed: %s", res.Error)
+	}
+	got, _ := os.ReadFile(target)
+	want := "line one\r\nline TWO\r\nline three\r\n"
+	if string(got) != want {
+		t.Errorf("content = %q, want CRLF preserved %q", got, want)
+	}
+}
+
 // TestEditFile_SchemaExposed 验证 EditFile 出现在 Schema 中且描述引导小改优先 EditFile。
 func TestEditFile_SchemaExposed(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)

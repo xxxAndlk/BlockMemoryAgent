@@ -2039,6 +2039,10 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// LLM 未显式给 wall_clock_min 时兜底，防侦察失控无收口。
 	if wallClock <= 0 && roleDef.SpecExempt {
 		wallClock = 5 * time.Minute
+		// light 速修手查修一体（定位+修改+自检），比纯侦察多留一倍预算。
+		if roleDef.ID == "light" {
+			wallClock = 10 * time.Minute
+		}
 	}
 
 	// 校验调用权限：只有被允许的角色关系才能发起子 Agent 调用。

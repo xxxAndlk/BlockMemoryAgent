@@ -832,9 +832,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.overlayPanel.mode = overlayNone
 			return m, nil
-		case "j", "down":
+		case "down":
 			m.overlayPanel.cursor++
-		case "k", "up":
+		case "up":
 			if m.overlayPanel.cursor > 0 {
 				m.overlayPanel.cursor--
 			}
@@ -989,7 +989,7 @@ func (m *Model) chatContentWidth() int {
 	return w
 }
 
-// mainContentHeight 返回中间主内容区高度（已扣除顶栏、问答面板、Token 栏、输入栏、底部快捷键栏、弹窗占位）。
+// mainContentHeight 返回中间主内容区高度（已扣除顶栏、问答面板、Token 栏、输入栏、弹窗占位）。
 func (m *Model) mainContentHeight() int {
 	topH := 1
 	// Token 用量栏：输入栏上方 1 行实时展示当前会话累计 token。
@@ -998,7 +998,6 @@ func (m *Model) mainContentHeight() int {
 	// 预算必须按真实高度计算，否则整页比终端高出 2 行，
 	// alt-screen 只保留底部 N 行，顶栏与对话区首行（首个问题）会被顶出屏幕。
 	inputH := 5
-	shortcutH := 1
 	overlayH := 0
 	if m.overlayPanel.mode != overlayNone {
 		overlayH = m.height / 3
@@ -1007,7 +1006,7 @@ func (m *Model) mainContentHeight() int {
 		}
 	}
 	clarifyH := m.clarifyPanelHeight()
-	h := m.height - topH - tokenBarH - inputH - shortcutH - overlayH - clarifyH
+	h := m.height - topH - tokenBarH - inputH - overlayH - clarifyH
 	if h < 4 {
 		h = 4
 	}
