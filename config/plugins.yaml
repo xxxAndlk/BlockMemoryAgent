@@ -245,12 +245,12 @@ plugins:
         # 生视频（od_video_generate）：provider 取 .env VIDEO_PROVIDER（缺省
         # volcengine=方舟 tasks 协议；openai=OpenAI /videos 协议，模型名裸填，
         # 桥自动补 aihubmix- 前缀）。两个模型槽位统一喂 VIDEO_MODEL（同一视频
-        # 网关下只需填一个模型名）。视频单条 30s–5min，桥侧超时独立
-        #（默认 720s，图片仍 180s）。
-        OD_VIDEO_PROVIDER: openai-chat
+        # 网关下只需填一个模型名）。视频单条 30s–5min，桥侧超时独立，单位毫秒
+        #（缺省 720000=720s，须小于下方 exec_timeout_sec 1200s；图片仍 180s）。
+        OD_VIDEO_PROVIDER: ${VIDEO_PROVIDER:openai}
         OD_VOLCENGINE_VIDEO_MODEL: ${VIDEO_MODEL:}
         OD_OPENAI_VIDEO_MODEL: ${VIDEO_MODEL:}
-        OD_VIDEO_TIMEOUT_MS: 180
+        OD_VIDEO_TIMEOUT_MS: ${OD_VIDEO_TIMEOUT_MS:120000}
       roles: ["meta","domain","ui_assistant"]
       # 1200s：批量 20+ 张 × 单张最长 60s（桥内串行）可能逼近 20min，见上方注释。
       exec_timeout_sec: 1200
