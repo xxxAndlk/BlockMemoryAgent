@@ -38,6 +38,7 @@ const statusColor = computed(() => {
     case 'completed': return 'text-green-400'
     case 'error': return 'text-red-400'
     case 'paused_on_child': return 'text-yellow-400'
+    case 'awaiting_clarify': return 'text-yellow-400'
     default: return 'text-ink-2'
   }
 })
@@ -50,6 +51,7 @@ const statusLabel = computed(() => {
     case 'completed': return '已完成'
     case 'error': return '失败'
     case 'paused_on_child': return '子 Agent 暂停'
+    case 'awaiting_clarify': return '待澄清'
     default: return props.session.status
   }
 })

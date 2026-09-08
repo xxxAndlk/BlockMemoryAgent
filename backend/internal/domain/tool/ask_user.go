@@ -183,7 +183,12 @@ func parseAskUserQuestions(args map[string]any) []AskUserQuestion {
 	return qs
 }
 
-// parseOptionList 解析 options 数组字段（[]any 或 []map[string]any 两种形态）。
+// parseOptionList 解析 options 数组字段（[]any / []map[string]any / []string 三种形态）。
+// 宽容解析：实测模型（doubao 等）常漏 label 只给 id+description（2026-09-08 web 端
+// ask_user 无选项事故根因——旧逻辑 id/label 任一为空即静默丢弃，全部丢弃后
+// pendingClarify 退化成 Kind=text，用户面对问题卡没有任何可点选项）。缺 label 用 id
+// 兜底、缺 id 用 label 兜底、仅有 description 时合成 id 并以 description 作展示文本；
+// 数字/布尔/空串/纯空白等真垃圾才跳过（降级为空选项 = 自由文本提问，不报错）。
 func parseOptionList(v any) []AskUserOption {
 	raw, ok := v.([]any)
 	if !ok {
@@ -195,18 +200,32 @@ func parseOptionList(v any) []AskUserOption {
 		}
 	}
 	var opts []AskUserOption
-	for _, item := range raw {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
+	for i, item := range raw {
+		switch m := item.(type) {
+		case map[string]any:
+			id, _ := m["id"].(string)
+			label, _ := m["label"].(string)
+			desc, _ := m["description"].(string)
+			id, label, desc = strings.TrimSpace(id), strings.TrimSpace(label), strings.TrimSpace(desc)
+			if id == "" && label == "" && desc == "" {
+				continue
+			}
+			if id == "" && label == "" {
+				// 仅有 description：合成 id，description 作展示文本。
+				id = fmt.Sprintf("opt-%d", i+1)
+				label = desc
+			} else if id == "" {
+				id = label
+			} else if label == "" {
+				label = id
+			}
+			opts = append(opts, AskUserOption{ID: id, Label: label, Description: desc})
+		case string:
+			// 宽容字符串形态：["ts-web", "py-pygame"]——id/label 同值。
+			if s := strings.TrimSpace(m); s != "" {
+				opts = append(opts, AskUserOption{ID: s, Label: s})
+			}
 		}
-		id, _ := m["id"].(string)
-		label, _ := m["label"].(string)
-		if id == "" || label == "" {
-			continue
-		}
-		desc, _ := m["description"].(string)
-		opts = append(opts, AskUserOption{ID: id, Label: label, Description: desc})
 	}
 	return opts
 }

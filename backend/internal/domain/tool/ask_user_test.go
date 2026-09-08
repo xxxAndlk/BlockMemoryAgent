@@ -63,6 +63,45 @@ func TestAskUserTool_TimeoutSelfDecision(t *testing.T) {
 	}
 }
 
+// TestAskUserTool_MissingLabelOptions 模型漏 label 只给 id+description（doubao 实测每次
+// 都漏，2026-09-08 web 端 ask_user 无选项事故根因）：选项不得被静默丢弃——缺 label 用
+// id 兜底、纯 description 合成 id、字符串形态 id=label 同值。
+func TestAskUserTool_MissingLabelOptions(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	var got []AskUserOption
+	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
+		got = opts.Options
+		return "ts-web", nil
+	})
+	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{
+		"questions": []any{
+			map[string]any{
+				"question": "技术栈？",
+				"options": []any{
+					map[string]any{"id": "ts-web", "description": "浏览器运行"},
+					map[string]any{"description": "纯描述项"},
+					"py-pygame",
+				},
+			},
+		},
+	})
+	if !res.Success {
+		t.Fatalf("should succeed, got: %+v", res)
+	}
+	if len(got) != 3 {
+		t.Fatalf("degraded options must not be dropped, got %d: %+v", len(got), got)
+	}
+	if got[0].ID != "ts-web" || got[0].Label != "ts-web" || got[0].Description != "浏览器运行" {
+		t.Fatalf("missing-label option should fall back label=id, got %+v", got[0])
+	}
+	if got[1].ID != "opt-2" || got[1].Label != "纯描述项" {
+		t.Fatalf("description-only option should synthesize id (raw index) and use desc as label, got %+v", got[1])
+	}
+	if got[2].ID != "py-pygame" || got[2].Label != "py-pygame" {
+		t.Fatalf("string option should map id=label, got %+v", got[2])
+	}
+}
+
 // TestAskUserTool_HookError 会话取消等 hook 错误 -> 工具失败（ReAct 随 ctx 退出）。
 func TestAskUserTool_HookError(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
@@ -136,7 +175,9 @@ func TestAskUserTool_OptionsPassThrough(t *testing.T) {
 	}
 }
 
-// TestAskUserTool_OptionsGarbageIgnored 入参 options 格式损坏时降级为空选项（自由文本），不报错。
+// TestAskUserTool_OptionsGarbageIgnored 入参 options 彻底无法解析（数字/布尔/空/纯空白）
+// 时降级为空选项（自由文本），不报错。有内容的降级项（缺 label / 字符串形态）按宽容
+// 解析保留（见 TestAskUserTool_MissingLabelOptions），真垃圾才丢弃。
 func TestAskUserTool_OptionsGarbageIgnored(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
 	r.SetAskUserHook(func(ctx context.Context, question string, opts AskUserOptions) (string, error) {
@@ -147,7 +188,11 @@ func TestAskUserTool_OptionsGarbageIgnored(t *testing.T) {
 	})
 	res, _ := r.Dispatch(context.Background(), "ask_user", map[string]any{
 		"question": "q",
-		"options":  []any{"not-a-map", map[string]any{"id": "", "label": "x"}},
+		"options": []any{
+			123, true, nil, "", "   ",
+			map[string]any{},
+			map[string]any{"id": "  ", "label": "", "description": ""},
+		},
 	})
 	if !res.Success {
 		t.Fatalf("garbage options should not fail the tool, got: %+v", res)
