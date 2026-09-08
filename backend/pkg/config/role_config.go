@@ -3,11 +3,52 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"gopkg.in/yaml.v3"
 )
+
+// leafCommonToken 叶子助手公共纪律段的占位符，须在提示词中独立成行。
+const leafCommonToken = "{{LEAF_COMMON_DISCIPLINE}}"
+
+// leafCommonBlock 五个固定叶子角色（code/ui/prompt_reviewer/test/doc_assistant）
+// 共用的【执行纪律】+【终止纪律】+【共享记忆】段单一来源。YAML 块标量无法引用
+// 锚点拼接片段，故在 LoadRoleConfig 里按占位符行展开（缩进随占位符行对齐），
+// 防止五处复制后各自漂移。修改本段即对五个叶子同时生效。
+const leafCommonBlock = `- task 应已含目标文件路径 + 依赖签名 + 关键行段：直接 WriteFile 实现，不 ListDir 探索项目结构。
+- 规格缺关键信息时 SearchInFiles 单次定位，不读全文；ReadFile 仅在 SearchInFiles 也无结果时使用。
+- 产出落盘后立即 RunCommand 自检：代码文件语法检查（JS: node -c / Go: go build / Python: py_compile）；非代码产出按任务验收口径核对。报错先修再继续。
+- 【终止纪律】产出落盘 + 一次自检通过 = 任务完成，立即输出最终答复。其他文件（含契约里列出的兄弟文件）的跨文件集成核对由上级统一负责，你无需重读。
+
+【共享记忆】
+- task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，注入内容无需再读文件核对。
+- 已读内容在你的历史消息中，向前翻看即可；以相同参数连续重读同一文件区间会触发循环守卫终止任务。`
+
+// expandLeafCommonDiscipline 展开提示词中的叶子公共纪律段占位符。
+// 占位符行保持其原有缩进逐行对齐展开；无占位符时原样返回。
+func expandLeafCommonDiscipline(prompt string) string {
+	if !strings.Contains(prompt, leafCommonToken) {
+		return prompt
+	}
+	var out []string
+	for _, line := range strings.Split(prompt, "\n") {
+		if strings.TrimSpace(line) != leafCommonToken {
+			out = append(out, line)
+			continue
+		}
+		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+		for _, blockLine := range strings.Split(leafCommonBlock, "\n") {
+			if blockLine == "" {
+				out = append(out, "")
+			} else {
+				out = append(out, indent+blockLine)
+			}
+		}
+	}
+	return strings.Join(out, "\n")
+}
 
 // RoleConfigFile 角色配置文件根结构。
 //
@@ -41,7 +82,7 @@ type RoleConfigFile struct {
 //   - ModelConfig:     模型提供商/密钥/温度等。
 //   - SystemPrompt:    系统提示词。
 //   - Tools:           工具白名单覆盖；为空时用内置默认（call_sub_agent 等编排工具）。
-//                      基准单 Agent 模式用它去掉 call_sub_agent、放开执行类工具。
+//     基准单 Agent 模式用它去掉 call_sub_agent、放开执行类工具。
 type MetaAgentConfig struct {
 	ModelConfig  types.AgentModelConfig `yaml:"model_config"`  // 模型配置(提供商/密钥/温度等)
 	SystemPrompt string                 `yaml:"system_prompt"` // MetaAgent 系统提示词
@@ -104,6 +145,11 @@ func LoadRoleConfig(path string) (*RoleConfigFile, error) {
 
 	// 解析配置中的环境变量引用(如 ${OPENAI_API_KEY})。
 	cfg.resolveEnvVars()
+
+	// 叶子公共纪律段展开：固定角色提示词里的占位符行替换为共享段（防五叶子漂移）。
+	for i := range cfg.FixedRoles {
+		cfg.FixedRoles[i].SystemPrompt = expandLeafCommonDiscipline(cfg.FixedRoles[i].SystemPrompt)
+	}
 
 	// Embed 默认值: provider 为空时回退 pseudo，避免嵌入模块因空 provider 崩溃。
 	if cfg.Embed.Provider == "" {
