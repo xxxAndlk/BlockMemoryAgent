@@ -70,6 +70,10 @@ const expandedLogId = ref<number | null>(null)
 // 待澄清选项区：由 SSE awaiting_clarify 帧驱动（不 push 进 events），答复后复位
 const clarifyPending = ref<{ options: ClarifyOption[]; multiSelect: boolean; questionId: string } | null>(null)
 
+// 模型实时汇报/思考文本：由 SSE live 帧驱动（不 push 进 events），对齐 TUI 流式展示
+const liveStreaming = ref('')
+const liveThinking = ref('')
+
 const loading = ref(false)
 const sending = ref(false)
 const sessionFilter = ref('')
@@ -84,11 +88,11 @@ watch(view, (v) => {
 const rightTab = ref<'board' | 'tools' | 'files' | 'memory' | 'metrics'>('board')
 const sidebarOpen = ref(false)
 const sideTabs = [
-  { name: 'board', label: '任务看板', icon: 'DataLine' },
-  { name: 'tools', label: '工具', icon: 'Tools' },
-  { name: 'files', label: '文件', icon: 'FolderOpened' },
-  { name: 'memory', label: '记忆', icon: 'Coin' },
-  { name: 'metrics', label: '指标', icon: 'DataAnalysis' },
+  { name: 'board', label: '任务看板', icon: 'DataLine', width: 760 },
+  { name: 'tools', label: '工具', icon: 'Tools', width: 640 },
+  { name: 'files', label: '文件', icon: 'FolderOpened', width: 760 },
+  { name: 'memory', label: '记忆', icon: 'Coin', width: 560 },
+  { name: 'metrics', label: '指标', icon: 'DataAnalysis', width: 600 },
 ] as const
 const activeSideTab = computed(() => sideTabs.find((t) => t.name === rightTab.value))
 
@@ -180,9 +184,16 @@ function startStream(s: Session) {
     onSnapshot(snap) {
       activeSession.value = snap
       events.value = [...(snap.events || [])]
+      // live 文本随快照回填：运行中即得当前值，结束后为空自然清零
+      liveStreaming.value = snap.streaming_text || ''
+      liveThinking.value = snap.thinking_text || ''
       if (snap.status !== 'awaiting_clarify' && clarifyPending.value) {
         clarifyPending.value = null
       }
+    },
+    onLive(d) {
+      liveStreaming.value = d.streaming_text || ''
+      liveThinking.value = d.thinking_text || ''
     },
     onEvent(ev) {
       if ((ev as any).type === 'awaiting_clarify') {
@@ -196,6 +207,8 @@ function startStream(s: Session) {
       events.value.push(ev)
     },
     onDone(finalStatus?: string) {
+      liveStreaming.value = ''
+      liveThinking.value = ''
       panel.stopPanelTimer()
       refreshPanels(s.id)
       loadSessions()
@@ -406,6 +419,8 @@ function fmtDateTime(iso: string) {
         :sending="sending"
         :input-tokens="tokenUsage.input"
         :output-tokens="tokenUsage.output"
+        :live-streaming="liveStreaming"
+        :live-thinking="liveThinking"
         @submit="handleSubmit"
         @cancel="handleCancel"
         @stop="handleStop"
@@ -426,9 +441,9 @@ function fmtDateTime(iso: string) {
       />
     </main>
 
-    <!-- 右栏：可收起侧栏（默认收起为图标条，点击展开；展开宽度 640px） -->
+    <!-- 右栏：可收起侧栏（默认收起为图标条，点击展开；各面板独立宽度，无 tab 切换） -->
     <aside class="shrink-0 bg-card border border-line rounded-card overflow-hidden flex flex-col transition-all duration-200"
-           :class="sidebarOpen ? 'w-[640px]' : 'w-[48px]'">
+           :style="{ width: (sidebarOpen ? (activeSideTab?.width ?? 640) : 48) + 'px' }">
       <template v-if="!sidebarOpen">
         <div class="flex flex-col items-center gap-1 py-3 flex-1">
           <el-tooltip content="展开侧栏" placement="left">
@@ -457,28 +472,20 @@ function fmtDateTime(iso: string) {
             </button>
           </el-tooltip>
         </div>
-        <el-tabs v-model="rightTab" class="session-right-tabs flex-1 flex flex-col min-h-0">
-          <el-tab-pane label="任务看板" name="board" class="flex-1 overflow-y-auto p-3">
-            <TaskBoardPanel :agents="agents" :board="board" />
-          </el-tab-pane>
-          <el-tab-pane label="工具" name="tools" class="flex-1 overflow-y-auto p-3">
-            <ToolPanel :events="events" />
-          </el-tab-pane>
-          <el-tab-pane label="文件" name="files" class="flex-1 overflow-hidden p-0">
-            <FilePreview :session-id="activeSession?.id || ''" :agents="agents" />
-          </el-tab-pane>
-          <el-tab-pane label="记忆" name="memory" class="flex-1 overflow-y-auto p-3">
-            <SessionMemoryPanel :session-id="activeSession?.id || ''" />
-          </el-tab-pane>
-          <el-tab-pane label="指标" name="metrics" class="flex-1 overflow-y-auto p-3">
-            <div class="space-y-3">
-              <MetricsCard :metrics="metrics" />
-              <TokenMetricsCard :token-metrics="tokenMetrics" />
-              <MailboxCard :messages="mailboxMessages" />
-              <HealthCard :health="health" />
-            </div>
-          </el-tab-pane>
-        </el-tabs>
+        <!-- 单面板渲染：打开哪个只看哪个（无 tab 切换条），面板切换走图标条 -->
+        <div class="flex-1 min-h-0" :class="rightTab === 'files' ? 'overflow-hidden' : 'overflow-y-auto p-3'">
+          <TaskBoardPanel v-if="rightTab === 'board'" :agents="agents" :board="board"
+                          :goal="activeSession?.goal || ''" />
+          <ToolPanel v-else-if="rightTab === 'tools'" :events="events" />
+          <FilePreview v-else-if="rightTab === 'files'" :session-id="activeSession?.id || ''" :agents="agents" />
+          <SessionMemoryPanel v-else-if="rightTab === 'memory'" :session-id="activeSession?.id || ''" />
+          <div v-else class="space-y-3">
+            <MetricsCard :metrics="metrics" />
+            <TokenMetricsCard :token-metrics="tokenMetrics" />
+            <MailboxCard :messages="mailboxMessages" />
+            <HealthCard :health="health" />
+          </div>
+        </div>
       </template>
     </aside>
   </div>
@@ -498,21 +505,5 @@ function fmtDateTime(iso: string) {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
-}
-
-/* 右栏 Tab：标签栏固定在卡片顶部，内容区自适应滚动 */
-.session-right-tabs :deep(.el-tabs__header) {
-  margin: 0;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--bma-border);
-}
-.session-right-tabs :deep(.el-tabs__content) {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-.session-right-tabs :deep(.el-tab-pane) {
-  height: 100%;
 }
 </style>

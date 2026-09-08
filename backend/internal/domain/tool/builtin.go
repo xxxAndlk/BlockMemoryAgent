@@ -31,6 +31,8 @@ import (
 	"strconv"
 	// strings 用于字符串切分、大小写转换、前缀判断与拼接。
 	"strings"
+	// sync 用于进程内缓存命令解释器探测结果。
+	"sync"
 	// time 用于超时时间计算与 context.WithTimeout。
 	"time"
 	// unicode 用于 Git 子命令首字母大写转换。
@@ -285,8 +287,8 @@ const maxWriteFileContentRunes = 100000
 // writeFileSizeWarnRatio 重写已有文件时，新内容小于原大小该比例（且原文件
 // 超过 minWriteFileSizeWarnBytes）则输出附警告，辅助模型发现截断写入。
 const (
-	writeFileSizeWarnRatio      = 0.3
-	minWriteFileSizeWarnBytes   = 1000
+	writeFileSizeWarnRatio    = 0.3
+	minWriteFileSizeWarnBytes = 1000
 )
 
 // 极端缩小硬拒绝阈值：原文件 >= minWriteFileShrinkRefuseBytes 且新内容 < 原文件
@@ -881,9 +883,77 @@ func (e *Executor) searchInFiles(ctx context.Context, args map[string]any) *Resu
 
 // ---- RunCommand（执行命令） ----
 
-// psForceUTF8Prefix 是 Windows 下每条 PowerShell 命令的前导语句：
+// psForceUTF8Prefix 是 Windows 下 PowerShell 命令的前导语句：
 // 把控制台输出编码与管道编码都切到 UTF-8，避免中文系统 GBK/936 输出被 Go 端按 UTF-8 读成乱码。
 const psForceUTF8Prefix = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new();$OutputEncoding=[System.Text.UTF8Encoding]::new();"
+
+// shellCommand 描述一次 RunCommand 的解释器调用方式。
+type shellCommand struct {
+	Exe       string   // 解释器可执行文件
+	Args      []string // 前置参数（-c / -Command），命令串追加其后
+	ForceUTF8 bool     // PowerShell：命令串前置 UTF-8 编码语句
+	ExtraEnv  []string // 解释器专属附加环境变量
+}
+
+func unixShell() shellCommand {
+	return shellCommand{Exe: "sh", Args: []string{"-c"}}
+}
+
+func bashShell(exe string) shellCommand {
+	// MSYS_NO_PATHCONV=1 关闭 Git Bash 对以 / 开头参数的自动路径改写（防命令串被误转换）。
+	return shellCommand{Exe: exe, Args: []string{"-c"}, ExtraEnv: []string{"MSYS_NO_PATHCONV=1"}}
+}
+
+// windowsShell 探测可用解释器：优先 Git Bash（bash -c）。模型生成 bash 命令的
+// 准确率显著高于 PowerShell，且 PowerShell 的三类实证坑（npm.ps1 执行策略拦截、
+// GBK 重定向损坏中文、node -e 引号转义）在 bash 下全部不存在；Git for Windows
+// 是 worktree 派发的硬依赖，bash.exe 基本必在。探测顺序：PATH 中的 bash →
+// git.exe 同级推断 → 常见安装路径；排除 WSL 的 System32\bash.exe stub（Linux
+// 文件系统/工具链语义与宿主会话不通用）；全落空回落 powershell -Command。
+// lookPath/fileExists 参数便于单测注入。
+func windowsShell(lookPath func(string) (string, error), fileExists func(string) bool) shellCommand {
+	if p, err := lookPath("bash"); err == nil && !isWSLBashStub(p) {
+		return bashShell(p)
+	}
+	if p, err := lookPath("git"); err == nil {
+		dir := filepath.Dir(p)
+		for _, cand := range []string{
+			filepath.Join(dir, "..", "bin", "bash.exe"),
+			filepath.Join(dir, "..", "usr", "bin", "bash.exe"),
+			filepath.Join(dir, "bash.exe"),
+		} {
+			if fileExists(cand) {
+				return bashShell(cand)
+			}
+		}
+	}
+	for _, cand := range []string{
+		`C:\Program Files\Git\bin\bash.exe`,
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Git", "bin", "bash.exe"),
+	} {
+		if fileExists(cand) {
+			return bashShell(cand)
+		}
+	}
+	return shellCommand{Exe: "powershell", Args: []string{"-NoLogo", "-NoProfile", "-Command"}, ForceUTF8: true}
+}
+
+// isWSLBashStub 排除 Windows 自带的 WSL bash 启动器（System32 下），
+// 其 cwd/路径语义与宿主会话不通用，误用会错乱工作目录。
+func isWSLBashStub(p string) bool {
+	return strings.Contains(strings.ToLower(filepath.Clean(p)), `\system32\`)
+}
+
+// cachedShell 进程内缓存解释器探测结果（探测含磁盘访问，进程生命周期内不变）。
+var cachedShell = sync.OnceValue(func() shellCommand {
+	if runtime.GOOS != "windows" {
+		return unixShell()
+	}
+	return windowsShell(exec.LookPath, func(p string) bool {
+		_, err := os.Stat(p)
+		return err == nil
+	})
+})
 
 // parseMkdirDir 解析形如 "mkdir -p /some/dir" 的命令字符串，尝试提取目标目录。
 func parseMkdirDir(cmd string) string {
@@ -946,24 +1016,23 @@ func (e *Executor) runCommand(ctx context.Context, args map[string]any) *Result 
 	// 函数返回时取消上下文，释放相关资源。
 	defer cancel()
 
-	// cmd 为待执行的外部命令对象。
-	var cmd *exec.Cmd
-	// 根据操作系统选择命令解释器：Windows 使用 powershell -Command，类 Unix 使用 sh -c。
-	// powershell 比 cmd /c 更可靠：Write-Host 输出到 stdout 可捕获；$ 变量不会被错误展开；
-	// 复合管道命令正确执行。
-	if runtime.GOOS == "windows" {
-		// 中文 Windows 控制台代码页为 GBK/936，PowerShell 格式化输出（Select-String 等）
-		// 默认按 GBK 编码，Go 端按 UTF-8 读会乱码；先强制会话输出编码为 UTF-8。
-		// （原生命令直写 stdout 的 GBK 字节由 DecodeCommandOutput 回退解码兜底。）
-		cmd = exec.CommandContext(ctx, "powershell", "-NoLogo", "-NoProfile", "-Command", psForceUTF8Prefix+cmdStr)
+	// 选择命令解释器（Windows 优先 Git Bash，回落 PowerShell；类 Unix 用 sh -c）。
+	sc := cachedShell()
+	// 组装 argv：PowerShell 命令串前置 UTF-8 编码语句（原生命令直写 stdout 的
+	// GBK 字节由 DecodeCommandOutput 回退解码兜底）。
+	argv := append([]string{}, sc.Args...)
+	if sc.ForceUTF8 {
+		argv = append(argv, psForceUTF8Prefix+cmdStr)
 	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", cmdStr)
+		argv = append(argv, cmdStr)
 	}
+	cmd := exec.CommandContext(ctx, sc.Exe, argv...)
 	// 设置命令的工作目录为当前会话的工作目录。
 	cmd.Dir = e.workDirOf(ctx)
-	// 若存在会话上下文，将临时目录通过环境变量暴露给子进程。
+	// 解释器专属环境变量 + 会话临时目录通过环境变量暴露给子进程。
+	cmd.Env = append(os.Environ(), sc.ExtraEnv...)
 	if sessionID := SessionIDFromContext(ctx); sessionID != "" {
-		cmd.Env = append(os.Environ(), "BMA_SESSION_TEMP_DIR="+e.sessionTempDir(ctx, sessionID))
+		cmd.Env = append(cmd.Env, "BMA_SESSION_TEMP_DIR="+e.sessionTempDir(ctx, sessionID))
 	}
 
 	// stdout 与 stderr 用于缓存命令输出。

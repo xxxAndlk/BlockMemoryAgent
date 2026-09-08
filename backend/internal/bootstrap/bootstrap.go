@@ -154,7 +154,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// embed 端点起动探活（仅告警不阻断）：local/openai provider 依赖外部服务
 	// （ollama 等），服务未起时全程块记忆/技能库/黑板召回静默降级——2026-09-07
 	// 实证 ollama 未运行，整个会话外脑失效仅剩周期性 WARN。起动时大声报一次。
-	probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+	// 窗口 30s（2026-09-08 实测 bge-m3 冷态首呼 ~4s，机器忙时超 5s 误报降级）；
+	// 仅起动一次性探测，运行期仍走短超时+熔断（任务 117）不受影响。
+	probeCtx, probeCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer probeCancel()
 	if _, err := embedder.Embed(probeCtx, "bootstrap health probe"); err != nil {
 		log.Printf("[bootstrap] WARN embed 端点探活失败（记忆召回/技能库/黑板语义匹配将持续降级）: %v", err)

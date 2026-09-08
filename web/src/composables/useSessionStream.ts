@@ -1,6 +1,6 @@
 import { ref, onUnmounted } from 'vue'
 import type { Session, SessionEvent } from '@/types'
-import { streamSession } from '@/api/session'
+import { streamSession, type LiveTextFrame } from '@/api/session'
 
 function isSnapshot(ev: SessionEvent): boolean {
   return (
@@ -15,6 +15,7 @@ function isSnapshot(ev: SessionEvent): boolean {
 export interface StreamHandlers {
   onSnapshot?: (snap: Session) => void
   onEvent?: (ev: SessionEvent) => void
+  onLive?: (d: LiveTextFrame) => void
   onDone?: (finalStatus?: string) => void
   onError?: (err: Error) => void
 }
@@ -34,7 +35,8 @@ export function useSessionStream() {
         }
       },
       handlers.onDone,
-      handlers.onError
+      handlers.onError,
+      handlers.onLive
     )
   }
 

@@ -387,9 +387,10 @@ func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 			// 继续探测下一个角色
 			continue
 		}
-		// 探测：整体 60s（容纳 2 次重试 + 退避 + 冷启动），单次 30s
-		// deepseek-v4-flash 等推理类模型首包冷启动可能 >12s，拉长单次超时避免误杀
-		probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		// 探测：整体 150s（容纳 3 次重试 ×30s 单次 + 退避 + 慢网关冷启动），单次 30s
+		// deepseek-v4-flash 等推理类模型首包冷启动可能 >12s；gemini-flash 经
+		// gemini-webapi 网关单呼实测 ~10s（2026-09-08），原 60s 总窗会截断重试链
+		probeCtx, cancel := context.WithTimeout(ctx, 150*time.Second)
 		// 发起最小化调用验证连通性
 		if err := probeLLM(probeCtx, probeClient); err != nil {
 			// 探测失败，记录失败原因

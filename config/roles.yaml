@@ -299,8 +299,7 @@ domain_agent:
        边界清晰、可独立验收。
     4. 编码类任务的建设期验证 = 每个 js 文件一条 `node --check` 语法自检，不做其他验证。
        任务环境已提供现成验收脚本时：建设期不读、不跑、不改它，收尾验收以该脚本为准。
-       node 项目跑测试直接 `node --test`（与 npm test 等价）——npm.ps1 在本机 PowerShell
-       执行策略下必被拦截，调 npm 必浪费一步（实证每次迭代都踩）。
+       node 项目跑测试直接 `node --test`（与 npm test 等价），少一层 npm 包装启动。
     4.5 CLI/工具类交付物验收清单（逐项必达，收尾前逐条自验；**spec 的宽松表述不豁免
        本清单**——spec 写「均可/不依赖该行为/测试 ≥N 例（N<20）」等放宽时仍以本清单
        从严交付（实测：spec 放行未知列跳过+写 ≥6 例，按 spec 交付致 Q6/Q8 双失）；
@@ -484,7 +483,7 @@ domain_agent:
       JS/TS `node -c <file>`；Go `go build ./<pkg>`；Python `python -m py_compile <file>`。
       发现 syntax error 先修再继续，不带病往下走。
     - 写/改文件只用 WriteFile/EditFile 工具，不用 shell 重定向写文件
-      （Windows PowerShell 默认 GBK 编码会损坏中文）。
+      （重定向的编码与落盘不受工具管控，出问题无审计可查）。
 
     【编辑纪律】（修改已有文件的硬规则，省 token 即省时间）
     - 与上文【效率优先的编辑策略】同一条规则：已存在文件一律 EditFile 局部替换，
@@ -609,8 +608,8 @@ fixed_roles:
 
       【执行纪律】
       - 复杂验证（契约符号/冒烟实例化）直接 WriteFile 一个临时 .js 脚本（temporary=true）
-        再 `node <脚本>` 跑（Windows PowerShell 下 `node -e` 内联引号易转义出错）。
-      - 写/改文件只用 WriteFile/EditFile 工具（小改 <20% 文件优先 EditFile 精确替换，输出 token 与耗时远小于整文件重写；新建/大改才 WriteFile 整写），不用 shell 重定向写文件（Windows PowerShell 默认 GBK 编码会损坏中文）。
+        再 `node <脚本>` 跑（`node -e` 内联引号跨 shell 转义易错，落脚本文件跑更稳）。
+      - 写/改文件只用 WriteFile/EditFile 工具（小改 <20% 文件优先 EditFile 精确替换，输出 token 与耗时远小于整文件重写；新建/大改才 WriteFile 整写），不用 shell 重定向写文件（重定向的编码与落盘不受工具管控）。
       {{LEAF_COMMON_DISCIPLINE}}
 
       【职责】

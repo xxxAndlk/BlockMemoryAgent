@@ -12,6 +12,8 @@ defineProps<{
   sending: boolean
   inputTokens: number
   outputTokens: number
+  liveStreaming: string
+  liveThinking: string
 }>()
 
 const emit = defineEmits<{
@@ -29,7 +31,9 @@ const emit = defineEmits<{
     <ChatHeader :session="session" :agents="agents"
                 @cancel="emit('cancel')" @stop="emit('stop')" @interrupt="emit('interrupt')" />
     <MessageList :events="events" :verbose="false" :clarify="clarify"
-                 :session-id="session?.id || ''" @submit-clarify="emit('clarify-submitted')" />
+                 :session-id="session?.id || ''"
+                 :live-streaming="liveStreaming" :live-thinking="liveThinking"
+                 @submit-clarify="emit('clarify-submitted')" />
     <ChatInput :loading="sending"
                :session-active="session?.status === 'running'"
                :input-tokens="inputTokens"

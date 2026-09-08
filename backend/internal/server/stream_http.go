@@ -51,6 +51,10 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
 
+	// 模型实时文本（流式汇报/思考，同 TUI 轮询快照的 StreamingText/ThinkingText 源）上次推送值：变化才推 live 帧。
+	lastStreamedText := snapshot.StreamingText
+	lastThinkingText := snapshot.ThinkingText
+
 	// 500ms 轮询一次会话状态。
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -81,6 +85,20 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 					fmt.Fprintf(w, "data: %s\n\n", data)
 				}
 				lastEventCount = len(currentEvents)
+				flusher.Flush()
+			}
+
+			// 模型实时汇报/思考文本变化 → 推 live 帧（500ms tick 变化才推，零增量流量）。
+			if snapshot.StreamingText != lastStreamedText || snapshot.ThinkingText != lastThinkingText {
+				frame := map[string]string{
+					"type":           "live",
+					"streaming_text": snapshot.StreamingText,
+					"thinking_text":  snapshot.ThinkingText,
+				}
+				data, _ := json.Marshal(frame)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				lastStreamedText = snapshot.StreamingText
+				lastThinkingText = snapshot.ThinkingText
 				flusher.Flush()
 			}
 

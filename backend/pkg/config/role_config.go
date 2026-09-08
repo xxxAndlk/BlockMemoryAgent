@@ -171,33 +171,41 @@ func LoadRoleConfig(path string) (*RoleConfigFile, error) {
 
 // resolveEnvVars 原地解析配置中所有模型字段的 ${VAR} 环境变量引用。
 //
-// 覆盖范围: MetaAgent / DomainAgent / 每个 FixedRoles 的 APIKey 与 BaseURL。
+// 覆盖范围: MetaAgent / DomainAgent / 每个 FixedRoles 的 Model/APIKey/BaseURL。
+// Model 同样可引用环境变量（如 ui_assistant 走 ${GEMINI_CHAT_MODEL} 按模型名路由），
+// 未解析时字面量会原样发给端点。
 // 副作用: 直接修改接收者内部字段。
 func (c *RoleConfigFile) resolveEnvVars() {
-	// MetaAgent 模型配置: 密钥与 BaseURL。
+	// MetaAgent 模型配置: 模型名/密钥与 BaseURL。
+	c.MetaAgent.ModelConfig.Model = resolveEnv(c.MetaAgent.ModelConfig.Model)
 	c.MetaAgent.ModelConfig.APIKey = resolveEnv(c.MetaAgent.ModelConfig.APIKey)
 	c.MetaAgent.ModelConfig.BaseURL = resolveEnv(c.MetaAgent.ModelConfig.BaseURL)
-	// DomainAgent 模型配置: 密钥与 BaseURL。
+	// DomainAgent 模型配置: 模型名/密钥与 BaseURL。
+	c.DomainAgent.ModelConfig.Model = resolveEnv(c.DomainAgent.ModelConfig.Model)
 	c.DomainAgent.ModelConfig.APIKey = resolveEnv(c.DomainAgent.ModelConfig.APIKey)
 	c.DomainAgent.ModelConfig.BaseURL = resolveEnv(c.DomainAgent.ModelConfig.BaseURL)
-	// 轻量模型配置: 密钥与 BaseURL。
+	// 轻量模型配置: 模型名/密钥与 BaseURL。
+	c.LightweightModel.Model = resolveEnv(c.LightweightModel.Model)
 	c.LightweightModel.APIKey = resolveEnv(c.LightweightModel.APIKey)
 	c.LightweightModel.BaseURL = resolveEnv(c.LightweightModel.BaseURL)
 	// 文本嵌入模型配置: 密钥与 BaseURL。
 	c.Embed.APIKey = resolveEnv(c.Embed.APIKey)
 	c.Embed.BaseURL = resolveEnv(c.Embed.BaseURL)
-	// 逐个固定角色: 密钥与 BaseURL。
+	// 逐个固定角色: 模型名/密钥与 BaseURL。
 	for i := range c.FixedRoles {
+		c.FixedRoles[i].ModelConfig.Model = resolveEnv(c.FixedRoles[i].ModelConfig.Model)
 		c.FixedRoles[i].ModelConfig.APIKey = resolveEnv(c.FixedRoles[i].ModelConfig.APIKey)
 		c.FixedRoles[i].ModelConfig.BaseURL = resolveEnv(c.FixedRoles[i].ModelConfig.BaseURL)
 	}
-	// 动态角色模板: 密钥与 BaseURL（P3-4）。
+	// 动态角色模板: 模型名/密钥与 BaseURL（P3-4）。
 	for i := range c.DynamicTemplates {
+		c.DynamicTemplates[i].ModelConfig.Model = resolveEnv(c.DynamicTemplates[i].ModelConfig.Model)
 		c.DynamicTemplates[i].ModelConfig.APIKey = resolveEnv(c.DynamicTemplates[i].ModelConfig.APIKey)
 		c.DynamicTemplates[i].ModelConfig.BaseURL = resolveEnv(c.DynamicTemplates[i].ModelConfig.BaseURL)
 	}
-	// 模型预设: 密钥与 BaseURL（运行时动态切换角色模型的候选清单）。
+	// 模型预设: 模型名/密钥与 BaseURL（运行时动态切换角色模型的候选清单）。
 	for i := range c.ModelPresets {
+		c.ModelPresets[i].Model = resolveEnv(c.ModelPresets[i].Model)
 		c.ModelPresets[i].APIKey = resolveEnv(c.ModelPresets[i].APIKey)
 		c.ModelPresets[i].BaseURL = resolveEnv(c.ModelPresets[i].BaseURL)
 	}

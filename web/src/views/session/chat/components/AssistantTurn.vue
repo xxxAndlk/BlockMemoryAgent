@@ -14,6 +14,8 @@ const props = defineProps<{
   verbose?: boolean
   clarify?: { options: ClarifyOption[]; multiSelect: boolean; questionId: string } | null
   sessionId: string
+  liveStreaming: string
+  liveThinking: string
 }>()
 
 // 澄清选项提交成功 → 通知父级重开会话刷新事件流（turn 状态由 events 驱动）
@@ -42,6 +44,19 @@ const statusColor = computed(() => {
 })
 
 const primaryAgent = computed(() => props.turn.agents[0] || 'MetaAgent')
+
+// 实时思考行只显示尾部 ~300 字符（对齐 TUI 滚动显示当前行的行为），避免长思考占满聊天区
+const liveThinkingTail = computed(() => {
+  const s = props.liveThinking.trim()
+  if (!s) return ''
+  return s.length > 300 ? '…' + s.slice(-300) : s
+})
+
+// 流式汇报文本 markdown 化并追加流式光标（对齐 TUI 正文 + ▍）
+const liveStreamingHtml = computed(() => {
+  if (!props.liveStreaming) return ''
+  return renderMd(props.liveStreaming) + '<span class="live-cursor">▍</span>'
+})
 
 // 思考链只展示最后一段连续 think（运行时替换而非累计）；
 // 工具调用不再逐条渲染，交给 ToolActivity 单行就地替换 + 结束后折叠汇总。
@@ -181,10 +196,20 @@ async function submitOption(optionId?: string) {
         </template>
       </div>
 
-      <!-- 运行中提示 -->
-      <div v-else-if="turn.status === 'running'" class="text-xs text-ink-2 mt-2 flex items-center gap-2">
-        <el-icon class="is-loading"><Loading /></el-icon>
-        <span>正在生成回答…</span>
+      <!-- 运行中：模型实时思考行 + 流式汇报文本（SSE live 帧，对齐 TUI 展示），两者皆空时兜底静态占位 -->
+      <div v-else-if="turn.status === 'running'" class="mt-2">
+        <div v-if="liveThinking" class="text-xs text-ink-2 flex items-start gap-1.5">
+          <span>💭</span>
+          <span class="italic break-all">{{ liveThinkingTail }}</span>
+          <span class="live-cursor">▍</span>
+        </div>
+        <div v-if="liveStreaming"
+             class="bg-card border border-line rounded-lg px-4 py-3 mt-2 text-sm text-ink leading-relaxed markdown-body"
+             v-html="liveStreamingHtml"></div>
+        <div v-if="!liveThinking && !liveStreaming" class="text-xs text-ink-2 flex items-center gap-2">
+          <el-icon class="is-loading"><Loading /></el-icon>
+          <span>正在生成回答…</span>
+        </div>
       </div>
     </div>
   </div>
@@ -204,6 +229,13 @@ async function submitOption(optionId?: string) {
 }
 .markdown-body :deep(code) { font-family: monospace; }
 .markdown-body :deep(a) { color: var(--bma-primary); }
+.live-cursor,
+.markdown-body :deep(.live-cursor) {
+  color: var(--bma-primary);
+  margin-left: 2px;
+  animation: live-blink 1s steps(2, start) infinite;
+}
+@keyframes live-blink { to { visibility: hidden; } }
 .markdown-body :deep(ul), .markdown-body :deep(ol) { margin: 0.4em 0 0.4em 1.2em; }
 .markdown-body :deep(h1), .markdown-body :deep(h2), .markdown-body :deep(h3) {
   color: var(--bma-text);

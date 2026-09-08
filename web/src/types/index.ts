@@ -41,6 +41,10 @@ export interface Session {
   work_dir?: string
   /** 信任模式（TODO 第10⑥）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主；空 = 后端回退现网语义。 */
   trust_mode?: TrustMode | ''
+  /** 当前正在流式生成的助手文本（仅运行中有值，SSE 快照/live 帧携带），对齐 TUI 实时汇报展示。 */
+  streaming_text?: string
+  /** 当前思考阶段过程文本（瞬时，仅运行中有值）。 */
+  thinking_text?: string
   events: SessionEvent[]
   messages: ChatMessage[]
 }

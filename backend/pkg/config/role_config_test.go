@@ -75,3 +75,35 @@ func TestLoadRoleConfig_ExpandsLeafCommonToken(t *testing.T) {
 		t.Fatalf("展开内容与单一来源常量不一致:\n%s", sp)
 	}
 }
+
+// TestLoadRoleConfig_ResolvesModelEnvRef 模型名字段同样支持 ${VAR} 引用
+// （ui_assistant model: ${GEMINI_CHAT_MODEL} 场景）；未设置时为空而非字面量残留。
+func TestLoadRoleConfig_ResolvesModelEnvRef(t *testing.T) {
+	t.Setenv("BMA_TEST_CHAT_MODEL", "gemini-flash")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "roles.yaml")
+	yaml := `fixed_roles:
+  - id: ui_assistant
+    name: UI助手
+    type: fixed
+    model_config:
+      provider: openai-chat
+      model: ${BMA_TEST_CHAT_MODEL}
+      api_key: xxx
+      base_url: ${BMA_TEST_CHAT_URL}
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadRoleConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	role := cfg.GetFixedRole("ui_assistant")
+	if role == nil {
+		t.Fatal("ui_assistant 未加载")
+	}
+	if got := role.ModelConfig.Model; got != "gemini-flash" {
+		t.Fatalf("model 环境变量未解析: %q", got)
+	}
+}

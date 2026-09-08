@@ -74,11 +74,19 @@ export function clarifySession(id: string, answer: string): Promise<void> {
   })
 }
 
+/** SSE live 帧：模型实时汇报/思考文本（仅运行中，变化才推）。 */
+export interface LiveTextFrame {
+  type: 'live'
+  streaming_text?: string
+  thinking_text?: string
+}
+
 export function streamSession(
   id: string,
   onEvent: (ev: SessionEvent) => void,
   onDone?: (finalStatus?: string) => void,
-  onError?: (err: Error) => void
+  onError?: (err: Error) => void,
+  onLive?: (d: LiveTextFrame) => void
 ): () => void {
   let closed = false
   let attempt = 0
@@ -97,6 +105,10 @@ export function streamSession(
         if (d.type === 'done') {
           es?.close()
           onDone?.(d.status)
+          return
+        }
+        if (d.type === 'live') {
+          onLive?.(d as LiveTextFrame)
           return
         }
         onEvent(d as SessionEvent)

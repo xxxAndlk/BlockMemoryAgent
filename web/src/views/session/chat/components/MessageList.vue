@@ -10,6 +10,8 @@ const props = defineProps<{
   verbose?: boolean
   clarify?: { options: ClarifyOption[]; multiSelect: boolean; questionId: string } | null
   sessionId: string
+  liveStreaming: string
+  liveThinking: string
 }>()
 
 // 澄清选项提交成功 → 透传给父级（index.vue 重开会话刷新事件流）
@@ -61,6 +63,7 @@ defineExpose({ scrollToBottom })
       <div v-for="turn in turns" :key="turn.id">
         <UserBubble v-if="turn.userMessage" :event="turn.userMessage" />
         <AssistantTurn :turn="turn" :verbose="verbose" :clarify="clarify" :session-id="sessionId"
+                       :live-streaming="liveStreaming" :live-thinking="liveThinking"
                        @submit-clarify="emit('submit-clarify')" />
       </div>
     </template>
