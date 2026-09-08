@@ -136,6 +136,69 @@ func TestAskUserFlow(t *testing.T) {
 	}
 }
 
+// TestAskUser_EnqueueRoutesToClarify web 端状态滞后把待澄清答复误投 enqueue 通道
+//（2026-09-08 事故）：enqueue 应检测挂起中的 ask_user/approval 并按澄清答复路由，
+// 而不是置 Running + resumeSession 双开 ReAct 循环（旧循环阻塞泄漏 + 答复内容丢失）。
+func TestAskUser_EnqueueRoutesToClarify(t *testing.T) {
+	llm := &askCaptureProvider{responses: []*blades.Message{
+		askUserToolCall("游戏配色用深色还是浅色？"),
+		blades.AssistantMessage("完成，已按用户答复用深色实现"),
+	}}
+	svc := newAskUserTestService(t, llm)
+	ctx := context.Background()
+
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "实现塔防游戏"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// 等会话进入待答复（ask_user 阻塞，会话转 awaiting_clarify）。
+	deadline := time.Now().Add(5 * time.Second)
+	var sess *Session
+	for time.Now().Before(deadline) {
+		sess, _ = svc.Get(ctx, created.ID)
+		if sess != nil && sess.PendingClarify != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sess == nil || sess.PendingClarify == nil {
+		t.Fatal("expected ask_user pending within timeout")
+	}
+
+	// 模拟 web 端误投：答复走 enqueue（ControlOpEnqueue 路径）而非 /clarify。
+	if err := svc.enqueue(ctx, created.ID, "用深色"); err != nil {
+		t.Fatalf("enqueue while ask pending should route as clarify answer: %v", err)
+	}
+
+	// 会话应完成，且答复进入原 ReAct 循环的下一轮请求（双开循环时不会发生）。
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		sess, _ = svc.Get(ctx, created.ID)
+		if sess != nil && sess.Status == string(enums.SessionStatusCompleted) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sess == nil || sess.Status != string(enums.SessionStatusCompleted) {
+		t.Fatalf("session did not complete after enqueue-routed answer, status=%v", sess.Status)
+	}
+	if !llm.requestContains("答复: 用深色") {
+		t.Fatalf("enqueue-routed answer should reach the next LLM request as clarify tool result")
+	}
+	// 答复内容必须进对话历史（旧 enqueue 路径内容彻底丢失）。
+	found := false
+	for _, m := range sess.Messages {
+		if strings.Contains(m.Content, "[澄清答复] 用深色") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("enqueue-routed answer should be recorded as clarify message, messages=%d", len(sess.Messages))
+	}
+}
+
 // TestAskUser_TimeoutSelfDecision 超时未答复：工具返回"用户未答复，自行决策"，Agent 继续完成。
 func TestAskUser_TimeoutSelfDecision(t *testing.T) {
 	llm := &askCaptureProvider{responses: []*blades.Message{

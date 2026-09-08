@@ -196,11 +196,26 @@ function startStream(s: Session) {
       liveThinking.value = d.thinking_text || ''
     },
     onEvent(ev) {
+      // 会话状态变化帧（后端 500ms 轮询，状态翻转即推）：同步头部状态徽标与输入答复
+      // 路由依据。此前快照仅在连接建立时推一次，awaiting_clarify 帧只喂选项区不更新
+      // status，导致待澄清时输入框答复误走 enqueue 通道（内容丢失 + 会话卡死不恢复）。
+      if ((ev as any).type === 'session_status') {
+        const st = (ev as any).status as Session['status']
+        if (activeSession.value) {
+          activeSession.value = { ...activeSession.value, status: st }
+        }
+        if (st !== 'awaiting_clarify') clarifyPending.value = null
+        return
+      }
       if ((ev as any).type === 'awaiting_clarify') {
         clarifyPending.value = {
           options: (ev as any).options || [],
           multiSelect: !!(ev as any).multi_select,
           questionId: (ev as any).question_id || '',
+        }
+        // 输入答复路由依据（handleSubmit 按 status === 'awaiting_clarify' 走 /clarify）。
+        if (activeSession.value) {
+          activeSession.value = { ...activeSession.value, status: 'awaiting_clarify' }
         }
         return
       }

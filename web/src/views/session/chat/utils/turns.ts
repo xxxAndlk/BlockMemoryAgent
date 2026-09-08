@@ -73,6 +73,11 @@ const THINK_KINDS = new Set([
 /** 将事件归类到单一语义类别，作为后续路由的依据 */
 export function classifyEvent(ev: SessionEvent): EventCategory {
   if (isUserMessageEvent(ev)) return 'user_message'
+  // 用户对澄清/审批的答复事件（"提问答复: …"/"审批答复: …"，type=clarify + agent=User）
+  // 本质是用户发言：归入 user_message 开新回合。否则会命中下方 clarify 分支——把已答复
+  // 的问题卡覆盖成答复文本、把回合重新标回 awaiting_clarify，且问答流卡在"待澄清"态直到
+  // 完成事件到来（2026-09-08 web 端 ask_user 答复显示修复）。
+  if ((ev.type === 'clarify' || ev.kind === 'clarify') && ev.agent === 'User') return 'user_message'
   if (ev.type === 'system' && ev.agent === 'MetaAgent' && ev.message?.startsWith('会话启动')) {
     return 'system_start'
   }

@@ -55,6 +55,11 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 	lastStreamedText := snapshot.StreamingText
 	lastThinkingText := snapshot.ThinkingText
 
+	// 上次推送的会话状态：快照仅在连接建立时推一次，运行中状态翻转（running↔awaiting_clarify）
+	// 前端无从感知——web 输入框答复路由依赖 status，状态滞后会把 ask_user 澄清答复误入
+	// enqueue 通道（内容丢失 + 会话卡死）。状态变化即推 session_status 帧（2026-09-08）。
+	lastPushedStatus := snapshot.Status
+
 	// 500ms 轮询一次会话状态。
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -99,6 +104,18 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				lastStreamedText = snapshot.StreamingText
 				lastThinkingText = snapshot.ThinkingText
+				flusher.Flush()
+			}
+
+			// 会话状态变化 → 推 session_status 帧（前端同步头部状态徽标与输入答复路由）。
+			if snapshot.Status != lastPushedStatus {
+				frame := map[string]string{
+					"type":   "session_status",
+					"status": string(snapshot.Status),
+				}
+				data, _ := json.Marshal(frame)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				lastPushedStatus = snapshot.Status
 				flusher.Flush()
 			}
 

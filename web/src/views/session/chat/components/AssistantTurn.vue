@@ -194,6 +194,11 @@ async function submitOption(optionId?: string) {
           </div>
           <div class="mt-1.5 text-[11px] text-amber-600/70 dark:text-yellow-500/60">也可直接输入文字答复</div>
         </template>
+        <!-- 无候选项的提问（ask_user 纯文本，选项区为空）：给出输入框答复引导，
+             避免用户面对问题卡没有任何操作入口（2026-09-08 web 端 ask_user 修复）。 -->
+        <template v-else-if="clarify">
+          <div class="mt-1.5 text-[11px] text-amber-600/70 dark:text-yellow-500/60">该提问无候选项：直接在下方输入框输入答复并发送即可</div>
+        </template>
       </div>
 
       <!-- 运行中：模型实时思考行 + 流式汇报文本（SSE live 帧，对齐 TUI 展示），两者皆空时兜底静态占位 -->

@@ -35,7 +35,7 @@ const emit = defineEmits<{
                  :live-streaming="liveStreaming" :live-thinking="liveThinking"
                  @submit-clarify="emit('clarify-submitted')" />
     <ChatInput :loading="sending"
-               :session-active="session?.status === 'running'"
+               :session-active="session?.status === 'running' || session?.status === 'awaiting_clarify'"
                :input-tokens="inputTokens"
                :output-tokens="outputTokens"
                @submit="(c: string, i: WireImage[]) => emit('submit', c, i)"

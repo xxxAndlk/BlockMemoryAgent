@@ -2915,6 +2915,15 @@ func (s *ReactService) enqueue(ctx context.Context, sessionID, content string) e
 		s.store.mu.Unlock()
 		return ErrSessionNotFound
 	}
+	// 待答复的提问/审批挂起时（ask_user / 破坏性确认）：入队内容按澄清答复路由到
+	// askUser/approval 通道。Agent goroutine 仍存活且阻塞在 hook 上，若走下方
+	// "置 Running + resumeSession" 会双开 ReAct 循环、换绑 session.ctx（阻塞中 hook
+	// 持有的旧 ctx 取消句柄丢失，旧 goroutine 永久滞留）且本内容不进 Messages 彻底丢失
+	//（2026-09-08 web 端 ask_user 答复误入 enqueue 通道事故修复）。
+	if session.askUser != nil || session.approval != nil {
+		s.store.mu.Unlock()
+		return s.answerClarify(ctx, sessionID, content)
+	}
 	// 若会话未运行，则重新激活。
 	wasRunning := session.Status == enums.SessionStatusRunning
 	if !wasRunning {
