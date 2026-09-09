@@ -79,6 +79,124 @@ body {
   color: var(--bma-text);
 }
 
+/* ===== DeepSeek 风格 Markdown 文章排版：最终回答 / 流式汇报用 =====
+   大字号 + 宽行距 + 分级标题 + 代码块头栏（复制/下载按钮由容器事件委托实现） */
+.md-article {
+  font-size: 15px;
+  line-height: 1.8;
+  color: var(--bma-text);
+  word-break: break-word;
+}
+.md-article p { margin: 0.75em 0; }
+.md-article p:first-child { margin-top: 0; }
+.md-article p:last-child { margin-bottom: 0; }
+.md-article h1,
+.md-article h2,
+.md-article h3,
+.md-article h4 {
+  font-weight: 700;
+  color: var(--bma-text);
+  line-height: 1.4;
+}
+.md-article h1 { font-size: 1.45em; margin: 1.6em 0 0.7em; }
+.md-article h2 {
+  font-size: 1.25em;
+  margin: 1.6em 0 0.7em;
+  padding-bottom: 0.35em;
+  border-bottom: 1px solid var(--bma-border);
+}
+.md-article h3 { font-size: 1.1em; margin: 1.3em 0 0.5em; }
+.md-article h4 { font-size: 1em; margin: 1.1em 0 0.4em; }
+.md-article h1:first-child,
+.md-article h2:first-child,
+.md-article h3:first-child { margin-top: 0; }
+.md-article hr {
+  border: none;
+  border-top: 1px solid var(--bma-border);
+  margin: 1.8em 0;
+}
+.md-article ul,
+.md-article ol {
+  margin: 0.6em 0;
+  padding-left: 1.6em;
+}
+.md-article li { margin: 0.35em 0; }
+.md-article blockquote {
+  margin: 1em 0;
+  padding: 0.5em 1em;
+  border-left: 4px solid var(--bma-primary);
+  background: var(--bma-primary-soft);
+  border-radius: 0 8px 8px 0;
+  color: var(--bma-text-2);
+}
+.md-article blockquote p { margin: 0.25em 0; }
+.md-article code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86em;
+  background: var(--bma-page);
+  border: 1px solid var(--bma-border);
+  border-radius: 5px;
+  padding: 0.12em 0.4em;
+}
+/* 代码块整体（含头栏）：行内 code 样式还原 */
+.md-article .md-code {
+  margin: 1em 0;
+  border: 1px solid var(--bma-border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.md-article .md-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 14px;
+  background: var(--bma-page);
+  border-bottom: 1px solid var(--bma-border);
+  font-size: 12px;
+  color: var(--bma-text-2);
+}
+.md-article .md-code-actions { display: flex; gap: 14px; }
+.md-article .md-code-actions button {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  color: var(--bma-text-2);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.md-article .md-code-actions button:hover { color: var(--bma-primary); }
+.md-article .md-code pre {
+  margin: 0;
+  padding: 14px 16px;
+  background: var(--bma-card);
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.65;
+}
+.md-article .md-code pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: inherit;
+}
+.md-article table {
+  border-collapse: collapse;
+  margin: 1em 0;
+  width: 100%;
+  font-size: 14px;
+}
+.md-article th,
+.md-article td {
+  border: 1px solid var(--bma-border);
+  padding: 7px 12px;
+  text-align: left;
+}
+.md-article th { background: var(--bma-page); font-weight: 600; }
+.md-article img { max-width: 100%; border-radius: 8px; }
+
 /* 等宽工具类：路径 / 日志 / 代码 */
 .font-mono,
 code,

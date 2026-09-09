@@ -715,7 +715,7 @@ fixed_roles:
     tools: [ReadFile, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &ui_model
       provider: anthropic
-      model: ${ARK_IMAGE_MODEL}
+      model: glm-5.3-flash
       api_key: ${ANTHROPIC_API_KEY}
       base_url: ${ANTHROPIC_BASE_URL}
       temperature: 0.2

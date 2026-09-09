@@ -27,15 +27,6 @@ const MAX_IMAGES = 4
 const MAX_IMAGE_BYTES = 4 << 20
 const MIME_WHITELIST = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
 
-const quickTags = [
-  '展开方案细节',
-  '给出可运行代码',
-  '解释一下原理',
-  '列出关键步骤',
-  '改成 Go 实现',
-  '总结要点',
-]
-
 const canSend = computed(() => (content.value.trim().length > 0 || pendingImages.value.length > 0) && !props.loading)
 
 // token 数值格式化：≥1000 显示为 1.2k，否则原样显示。
@@ -143,18 +134,11 @@ function handleSubmit() {
 }
 
 function onKeydown(e: KeyboardEvent) {
-  // Ctrl/Cmd + Enter 提交
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+  // 中文输入法组词回车不发送（isComposing）；Shift+Enter 换行走默认行为，Enter 直接发送
+  if (e.isComposing || e.keyCode === 229) return
+  if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     handleSubmit()
-  }
-}
-
-function applyQuickTag(tag: string) {
-  if (content.value.trim()) {
-    content.value = content.value.trim() + '；' + tag
-  } else {
-    content.value = tag
   }
 }
 </script>
@@ -187,16 +171,6 @@ function applyQuickTag(tag: string) {
       </div>
     </div>
 
-    <div class="flex gap-2 mb-2 flex-wrap">
-      <el-tag v-for="t in quickTags" :key="t"
-              effect="plain"
-              size="small"
-              class="!bg-page !border-line !text-ink-2 hover:!text-white cursor-pointer transition-colors"
-              @click="applyQuickTag(t)">
-        {{ t }}
-      </el-tag>
-    </div>
-
     <!-- 待发送图片预览（可移除） -->
     <div v-if="pendingImages.length" class="flex gap-2 mb-2 flex-wrap">
       <div v-for="(img, i) in pendingImages" :key="i"
@@ -215,7 +189,7 @@ function applyQuickTag(tag: string) {
         <el-input ref="textareaRef" v-model="content"
                   type="textarea"
                   :autosize="{ minRows: 2, maxRows: 6 }"
-                  placeholder="向 AI 下达命令…（Ctrl/Cmd + Enter 发送，可直接粘贴图片）"
+                  placeholder="向 AI 下达命令…（Enter 发送，Shift+Enter 换行，可直接粘贴图片）"
                   resize="none"
                   @keydown="onKeydown"
                   @paste="onPaste" />

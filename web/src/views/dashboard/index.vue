@@ -20,9 +20,6 @@ const loading = ref(false)
 const filter = ref('all')
 const usingMock = ref(false)
 
-
-const quickTags = ['系统架构设计', '代码审查', '接口测试', '混沌演练', '根因分析', '生成周报']
-
 const timeline = ref<TimelinePoint[]>([])
 const activities = ref<ActivityItem[]>([])
 
@@ -71,9 +68,13 @@ async function runSession() {
   }
 }
 
-function quickStart(g: string) {
-  goal.value = g
-  runSession()
+// Enter 直接发送；Shift+Enter 换行（默认行为）；中文输入法组词回车不发送
+function onGoalKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault()
+    runSession()
+  }
 }
 
 function viewSession(id: string) {
@@ -187,23 +188,11 @@ function activityStyle(kind: string) {
               v-model="goal"
               type="textarea"
               :rows="3"
-              placeholder="例如：分析 gin 项目的架构并生成设计文档"
+              placeholder="例如：分析 gin 项目的架构并生成设计文档（Enter 发送，Shift+Enter 换行）"
               class="w-full bg-page border-none"
-              @keydown.enter.prevent="runSession"
+              @keydown="onGoalKeydown"
             />
             <WorkDirPicker v-model="workDir" />
-            <div class="flex flex-wrap items-center gap-4">
-              <span class="text-sm text-ink-2">快捷模板:</span>
-              <div class="flex flex-wrap gap-2">
-                <el-tag
-                  v-for="q in quickTags"
-                  :key="q"
-                  effect="plain"
-                  class="!bg-transparent !border-line !text-ink cursor-pointer hover:!border-primary"
-                  @click="quickStart(q)"
-                >{{ q }}</el-tag>
-              </div>
-            </div>
           </div>
           <div class="w-48 h-32 flex flex-col items-center justify-center shrink-0 gap-3">
             <svg class="w-28 h-28" viewBox="0 0 140 140" fill="none">

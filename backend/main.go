@@ -183,16 +183,23 @@ func main() {
 	router := bootstrap.NewDefaultRouter(app)
 
 	// 静态文件：Vue 构建产物目录；未显式指定 -web-dist 时已在上文落到 BMA_HOME/web/dist。
+	// assets 文件名带内容 hash：长缓存 immutable；index.html 必须 no-cache，
+	// 否则发版后浏览器沿用旧 index.html 引用旧 chunk，表现为"前端改了没生效"。
 	webDist := *webDistPath
 	fs := http.FileServer(http.Dir(webDist))
-	router.GET("/assets/*filepath", gin.WrapH(fs))    // 静态资源目录（JS/CSS/图片）
+	router.GET("/assets/*filepath", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		gin.WrapH(fs)(c)
+	})
 	router.GET("/favicon.svg", func(c *gin.Context) { // 站点图标
+		c.Header("Cache-Control", "no-cache")
 		c.File(filepath.Join(webDist, "favicon.svg"))
 	})
 
 	// SPA 回退：Vue 使用 history 路由，所有未匹配路径统一回退 index.html
 	// （含未知 /api 路径，与原标准库路由的 "/" 兜底行为一致）。
 	router.NoRoute(func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
 		c.File(filepath.Join(webDist, "index.html"))
 	})
 

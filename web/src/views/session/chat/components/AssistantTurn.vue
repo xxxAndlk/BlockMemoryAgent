@@ -58,6 +58,29 @@ const liveStreamingHtml = computed(() => {
   return renderMd(props.liveStreaming) + '<span class="live-cursor">▍</span>'
 })
 
+// 代码块头栏复制/下载（事件委托：md-article 内 v-html 按钮无 Vue 绑定）
+function onMdAction(e: MouseEvent) {
+  const el = e.target as HTMLElement
+  if (!el.closest('.md-code-actions')) return
+  const code = (el.closest('.md-code')?.querySelector('pre')?.textContent || '').replace(/\n$/, '')
+  if (!code) return
+  if (el.closest('.md-copy')) {
+    navigator.clipboard.writeText(code).then(
+      () => ElMessage.success('代码已复制'),
+      () => ElMessage.error('复制失败')
+    )
+    return
+  }
+  if (el.closest('.md-download')) {
+    const blob = new Blob([code], { type: 'text/plain;charset=utf-8' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = 'snippet.txt'
+    a.click()
+    URL.revokeObjectURL(a.href)
+  }
+}
+
 // 思考链只展示最后一段连续 think（运行时替换而非累计）；
 // 工具调用不再逐条渲染，交给 ToolActivity 单行就地替换 + 结束后折叠汇总。
 const lastThinkEvents = computed<SessionEvent[]>(() => {
@@ -150,8 +173,9 @@ async function submitOption(optionId?: string) {
         <div class="whitespace-pre-wrap">{{ err.message }}</div>
       </div>
 
-      <!-- 最终回答 -->
-      <div v-if="finalText" class="bg-card border border-line rounded-lg px-4 py-3 mt-2 text-sm text-ink leading-relaxed markdown-body"
+      <!-- 最终回答（DeepSeek 文章排版：大字号宽行距，代码块带复制/下载头栏） -->
+      <div v-if="finalText" class="md-article mt-2"
+           @click="onMdAction"
            v-html="renderMd(finalText)"></div>
 
       <!-- 待澄清提示：Agent 请求用户回答，会话挂起 -->
@@ -209,7 +233,8 @@ async function submitOption(optionId?: string) {
           <span class="live-cursor">▍</span>
         </div>
         <div v-if="liveStreaming"
-             class="bg-card border border-line rounded-lg px-4 py-3 mt-2 text-sm text-ink leading-relaxed markdown-body"
+             class="md-article mt-2"
+             @click="onMdAction"
              v-html="liveStreamingHtml"></div>
         <div v-if="!liveThinking && !liveStreaming" class="text-xs text-ink-2 flex items-center gap-2">
           <el-icon class="is-loading"><Loading /></el-icon>
@@ -221,30 +246,10 @@ async function submitOption(optionId?: string) {
 </template>
 
 <style scoped>
-.markdown-body :deep(p) { margin: 0 0 0.5em 0; }
-.markdown-body :deep(p:last-child) { margin-bottom: 0; }
-.markdown-body :deep(pre) {
-  background: var(--bma-page);
-  padding: 10px;
-  border-radius: 6px;
-  margin: 6px 0;
-  overflow-x: auto;
-  color: var(--bma-text);
-  font-size: 12px;
-}
-.markdown-body :deep(code) { font-family: monospace; }
-.markdown-body :deep(a) { color: var(--bma-primary); }
-.live-cursor,
-.markdown-body :deep(.live-cursor) {
+.live-cursor {
   color: var(--bma-primary);
   margin-left: 2px;
   animation: live-blink 1s steps(2, start) infinite;
 }
 @keyframes live-blink { to { visibility: hidden; } }
-.markdown-body :deep(ul), .markdown-body :deep(ol) { margin: 0.4em 0 0.4em 1.2em; }
-.markdown-body :deep(h1), .markdown-body :deep(h2), .markdown-body :deep(h3) {
-  color: var(--bma-text);
-  margin: 0.6em 0 0.3em;
-  font-weight: 600;
-}
 </style>

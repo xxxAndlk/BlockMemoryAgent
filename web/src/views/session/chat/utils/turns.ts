@@ -78,9 +78,8 @@ export function classifyEvent(ev: SessionEvent): EventCategory {
   // 的问题卡覆盖成答复文本、把回合重新标回 awaiting_clarify，且问答流卡在"待澄清"态直到
   // 完成事件到来（2026-09-08 web 端 ask_user 答复显示修复）。
   if ((ev.type === 'clarify' || ev.kind === 'clarify') && ev.agent === 'User') return 'user_message'
-  if (ev.type === 'system' && ev.agent === 'MetaAgent' && ev.message?.startsWith('会话启动')) {
-    return 'system_start'
-  }
+  // 会话启动事件（后端 addEvent agent=System）：仅作时间线锚点，不开回合不进思考链
+  if (ev.type === 'system' && ev.message?.startsWith('会话启动')) return 'system_start'
   if (ev.type === 'system' && ev.message?.startsWith('继续会话')) return 'system_resume'
   if (isCompletion(ev)) return 'completion'
   if (ev.type === 'clarify' || ev.kind === 'clarify') return 'clarify'
@@ -97,11 +96,25 @@ function isLLMThinkEvent(ev: SessionEvent): boolean {
 }
 
 export function isCompletion(ev: SessionEvent): boolean {
+  // 当前合同：后端会话完成只发 type=agent_done + agent=MetaAgent（消息即最终答复正文，无前缀）。
+  // 旧合同（system + "会话完成:"前缀）已无发送方，保留兼容历史库重放事件。
+  if (ev.type === 'agent_done' && ev.agent === 'MetaAgent') return true
+  // 暂停事件（agent=System，"已暂停/会话暂停/任务已停止"）：终结回合，
+  // 否则暂停后回合永远显示"处理中"假转圈。暂停文案见后端 pauseMessage。
+  if (ev.type === 'system' && ev.agent === 'System') {
+    const msg = ev.message || ''
+    if (msg.includes('已暂停') || msg.includes('会话暂停') || msg.startsWith('任务已停止')) return true
+  }
   return (
     ev.type === 'system' &&
     ev.agent === 'MetaAgent' &&
     (ev.message?.startsWith('会话完成') || ev.message?.startsWith('执行失败'))
   )
+}
+
+export function isFailedCompletion(ev: SessionEvent): boolean {
+  // 仅旧合同带 "执行失败" 前缀；agent_done 恒为成功路径（失败走 error 事件）。
+  return ev.type === 'system' && ev.agent === 'MetaAgent' && ev.message?.startsWith('执行失败') === true
 }
 
 export function isError(ev: SessionEvent): boolean {
@@ -121,7 +134,7 @@ export function createToolGroup(callEv: SessionEvent): ToolCallGroup {
 
 export function finalizeTurn(turn: Turn, finalEvent?: SessionEvent): Turn {
   if (!finalEvent) return turn
-  const status: Turn['status'] = finalEvent.message?.startsWith('执行失败') ? 'error' : 'completed'
+  const status: Turn['status'] = isFailedCompletion(finalEvent) ? 'error' : 'completed'
   return {
     ...turn,
     finalAnswer: finalEvent,
@@ -153,7 +166,7 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
   const turns: Turn[] = []
   let current: Turn | null = null
 
-  const openTurn = (ev?: SessionEvent) => {
+  const openTurn = (ev?: SessionEvent, startedAt?: string) => {
     current = {
       id: ev?.timestamp || `turn-${turns.length}`,
       userMessage: ev,
@@ -162,7 +175,7 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
       toolCalls: [],
       errors: [],
       status: 'running',
-      startedAt: ev?.timestamp || new Date().toISOString(),
+      startedAt: startedAt || ev?.timestamp || new Date().toISOString(),
       tokens: { in: 0, out: 0 },
       agents: [],
     }
@@ -178,8 +191,7 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
       continue
     }
     if (category === 'system_start') {
-      // 用启动事件作为首个回合的"目标"占位（如果用户已经显式发过 user_message 就别覆盖）
-      if (!current) openTurn(ev)
+      // 锚点事件：跳过，不作为回合内容（回合由首个 user_message / 首个事件兜底开启）
       continue
     }
     if (category === 'system_resume') {
@@ -187,7 +199,7 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
       continue
     }
 
-    if (!current) openTurn()
+    if (!current) openTurn(undefined, ev.timestamp)
 
     // 收集参与的 agent
     if (ev.agent && current!.agents.indexOf(ev.agent) === -1 && ev.agent !== 'System') {
