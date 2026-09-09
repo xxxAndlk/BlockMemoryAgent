@@ -714,10 +714,10 @@ fixed_roles:
     skills: []
     tools: [ReadFile, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config: &ui_model
-      provider: openai-chat
-      model: ${GEMINI_CHAT_MODEL}
+      provider: anthropic
+      model: ${ARK_IMAGE_MODEL}
       api_key: xxx
-      base_url: ${GEMINI_CHAT_URL}
+      base_url: ${ARK_BASE_URL}
       temperature: 0.2
       max_tokens: 32768  # 实证 16K 时 HTML+CSS 输出被截断 → 重写/分段追加空转 8.5min 烧穿预算；32K 一次写完
       thinking: off        # 出图/写 UI 执行型角色关思考（同 domain_agent 实证）
