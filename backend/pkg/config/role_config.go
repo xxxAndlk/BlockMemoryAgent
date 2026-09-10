@@ -13,7 +13,7 @@ import (
 // RoleConfigFile 角色配置文件根结构。
 //
 // 职责:
-//   - 作为 config/roles.yaml 在内存中的表示，承载 MetaAgent / DomainAgent / 固定角色 / 动态模板四类配置。
+//   - 作为 config/roles.yaml 在内存中的表示，承载 MetaAgent / DomainAgent / 固定角色三类配置。
 //   - 提供按 ID/类型查询角色、以及调用权限矩阵(CanCall)等方法。
 //
 // 副作用: 无; 仅作为数据载体。
@@ -29,8 +29,6 @@ type RoleConfigFile struct {
 	Embed types.EmbedConfig `yaml:"embed"`
 	// FixedRoles 固定角色定义列表，对应 fixed_roles 配置项。
 	FixedRoles []types.RoleDefinition `yaml:"fixed_roles"`
-	// DynamicTemplates 动态角色生成模板，由 LLM 在运行时按需实例化为临时助手。
-	DynamicTemplates []DynamicRoleTemplate `yaml:"dynamic_templates"`
 }
 
 // MetaAgentConfig MetaAgent 专属配置。
@@ -53,21 +51,6 @@ type DomainAgentConfig struct {
 	ModelConfig  types.AgentModelConfig `yaml:"model_config"`  // 共享模型配置
 	SystemPrompt string                 `yaml:"system_prompt"` // DomainAgent 系统提示词（内置填充，YAML 值被覆盖）
 	Skills       []string               `yaml:"skills"`        // 固定持有技能（按 Name 或 SkillID 匹配池；空=不持有）
-}
-
-// DynamicRoleTemplate 动态角色模板。
-//
-// 由 LLM 在运行时根据当前任务填充 PromptTemplate 实例化出临时角色
-// (类型为 domain 或 assistant)，并通过 MaxLifetime 控制其存活时长。
-// 可独立配置 ModelConfig；未配置时动态创建的角色回退到 DomainAgent 模型。
-type DynamicRoleTemplate struct {
-	ID             string                 `yaml:"id"`              // 模板唯一标识
-	Name           string                 `yaml:"name"`            // 模板名称(展示用)
-	Type           string                 `yaml:"type"`            // "domain" or "assistant"
-	PromptTemplate string                 `yaml:"prompt_template"` // 让大模型填充的模板（内置填充，YAML 值被覆盖）
-	Skills         []string               `yaml:"skills"`          // 模板固定持有技能（按 Name 或 SkillID 匹配池，未知项跳过）
-	MaxLifetime    int                    `yaml:"max_lifetime"`    // 最大存活时间（秒）
-	ModelConfig    types.AgentModelConfig `yaml:"model_config"`    // 可选：动态角色专用模型配置
 }
 
 // LoadRoleConfig 从指定路径加载角色配置文件。
@@ -121,13 +104,6 @@ func LoadRoleConfig(path string) (*RoleConfigFile, error) {
 		}
 		cfg.FixedRoles[i].SystemPrompt = p
 	}
-	for i := range cfg.DynamicTemplates {
-		p, err := prompts.Get(cfg.DynamicTemplates[i].ID)
-		if err != nil {
-			return nil, fmt.Errorf("template %q: %w", cfg.DynamicTemplates[i].ID, err)
-		}
-		cfg.DynamicTemplates[i].PromptTemplate = p
-	}
 
 	// Embed 默认值: provider 为空时回退 pseudo，避免嵌入模块因空 provider 崩溃。
 	if cfg.Embed.Provider == "" {
@@ -175,12 +151,6 @@ func (c *RoleConfigFile) resolveEnvVars() {
 		c.FixedRoles[i].ModelConfig.APIKey = resolveEnv(c.FixedRoles[i].ModelConfig.APIKey)
 		c.FixedRoles[i].ModelConfig.BaseURL = resolveEnv(c.FixedRoles[i].ModelConfig.BaseURL)
 	}
-	// 动态角色模板: 模型名/密钥与 BaseURL（P3-4）。
-	for i := range c.DynamicTemplates {
-		c.DynamicTemplates[i].ModelConfig.Model = resolveEnv(c.DynamicTemplates[i].ModelConfig.Model)
-		c.DynamicTemplates[i].ModelConfig.APIKey = resolveEnv(c.DynamicTemplates[i].ModelConfig.APIKey)
-		c.DynamicTemplates[i].ModelConfig.BaseURL = resolveEnv(c.DynamicTemplates[i].ModelConfig.BaseURL)
-	}
 }
 
 // GetFixedRole 按 ID 查找固定角色定义。
@@ -222,24 +192,6 @@ func (c *RoleConfigFile) GetFixedRolesByType(roleType enums.RoleType) []types.Ro
 	}
 	// 返回新切片，原配置不受影响。
 	return result
-}
-
-// GetDynamicTemplate 按 ID 查找动态角色模板。
-//
-// 参数:
-//   - templateID: 目标模板 ID。
-//
-// 返回: 命中返回模板指针，未命中返回 nil。
-func (c *RoleConfigFile) GetDynamicTemplate(templateID string) *DynamicRoleTemplate {
-	// 线性扫描 DynamicTemplates 切片。
-	for i := range c.DynamicTemplates {
-		// ID 匹配立即返回指针。
-		if c.DynamicTemplates[i].ID == templateID {
-			return &c.DynamicTemplates[i]
-		}
-	}
-	// 未命中返回 nil。
-	return nil
 }
 
 // CanCall 调用权限矩阵: 判断 caller 角色能否调用 callee 角色。

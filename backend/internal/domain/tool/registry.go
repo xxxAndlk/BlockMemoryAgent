@@ -1321,6 +1321,84 @@ func (r *Registry) Schema() []tools.Tool {
 			toolsList = append(toolsList, t)
 		}
 	}
+	// 暴露 list_models / set_role_model 工具（若已由 role.RegisterModelTools 安装到注册表）。
+	// 仅 MetaAgent 白名单含这两个工具：按模型条目描述为下层角色（domain + 固定角色）换档。
+	if ct, ok := r.toolByName("list_models"); ok {
+		desc := "列出模型注册表与各角色当前绑定。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("list_models", desc, func(ctx context.Context, in listModelsInput) (string, error) {
+			res, _ := r.Dispatch(ctx, "list_models", map[string]any{})
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
+	// 暴露 set_role_model 工具：为 domain/固定角色切换模型绑定（meta/lightweight 拒绝）。
+	if ct, ok := r.toolByName("set_role_model"); ok {
+		desc := "为下层角色切换模型。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("set_role_model", desc, func(ctx context.Context, in setRoleModelInput) (string, error) {
+			res, _ := r.Dispatch(ctx, "set_role_model", map[string]any{
+				"role_id": in.RoleID, "model_id": in.ModelID, "reason": in.Reason,
+			})
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
+	// 暴露 pause_agent / resume_agent 工具：暂停运行中的 domain 子 Agent（保留上下文），
+	// 换模型后恢复续跑。语义同 TUI 手动暂停（MarkPauseNode + StopRunning → Pause 收尾）。
+	if ct, ok := r.toolByName("pause_agent"); ok {
+		desc := "暂停运行中的 DomainAgent。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("pause_agent", desc, func(ctx context.Context, in pauseAgentInput) (string, error) {
+			res, _ := r.Dispatch(ctx, "pause_agent", map[string]any{
+				"agent_id": in.AgentID, "reason": in.Reason,
+			})
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
+	if ct, ok := r.toolByName("resume_agent"); ok {
+		desc := "恢复被暂停的热驻 DomainAgent。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("resume_agent", desc, func(ctx context.Context, in resumeAgentInput) (string, error) {
+			res, _ := r.Dispatch(ctx, "resume_agent", map[string]any{"agent_id": in.AgentID})
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
+	// 暴露 set_agent_model 工具：为单个 Agent 实例覆盖模型（仅本实例、不落盘、实例终结回收）。
+	// 与 set_role_model（角色级全局绑定）互补：只调一个实例用本工具。
+	if ct, ok := r.toolByName("set_agent_model"); ok {
+		desc := "为单个 Agent 实例覆盖模型。"
+		if d, ok := ct.(interface{ Description() string }); ok {
+			desc = d.Description()
+		}
+		if t, err := tools.NewFunc("set_agent_model", desc, func(ctx context.Context, in setAgentModelInput) (string, error) {
+			res, _ := r.Dispatch(ctx, "set_agent_model", map[string]any{
+				"agent_id": in.AgentID, "model_id": in.ModelID, "reason": in.Reason,
+			})
+			b, _ := marshalNoHTMLEscape(res)
+			return string(b), nil
+		}); err == nil {
+			toolsList = append(toolsList, t)
+		}
+	}
 	// 动态注册工具兜底（热插拔插件等）：上述显式块已覆盖全部内置/安装工具，
 	// 其余按注册顺序暴露——保证插件工具在 Schema 中出现且顺序稳定（LLM 工具列表稳定性）。
 	// 仅实现 SchemaSource 的工具进入此路径（自带描述与入参 schema）；无 schema 的
@@ -1331,6 +1409,8 @@ func (r *Registry) Schema() []tools.Tool {
 		"GitDiff": true, "GitStatus": true, "GitLog": true, "GitBlame": true,
 		"RefreshProjectDoc": true, "WriteSharedMemory": true, "WriteSpec": true,
 		"call_sub_agent": true, "send_message": true, "create_role": true, "list_roles": true,
+		"list_models": true, "set_role_model": true,
+		"pause_agent": true, "resume_agent": true, "set_agent_model": true,
 		"submit_plan": true, "review_plan": true,
 	}
 	r.mu.RLock()
@@ -1410,6 +1490,34 @@ type createRoleInput struct {
 
 // listRolesInput 是 list_roles 工具的入参结构，无字段。
 type listRolesInput struct{}
+
+// listModelsInput 是 list_models 工具的入参结构，无字段。
+type listModelsInput struct{}
+
+// setRoleModelInput 是 set_role_model 工具的入参结构。
+type setRoleModelInput struct {
+	RoleID  string `json:"role_id" description:"目标角色 ID（domain 或固定角色；meta/lightweight 不可切换）。先用 list_models 查看可切换角色。"`
+	ModelID string `json:"model_id" description:"模型注册表条目 ID（见 list_models 的 models 列表）。"`
+	Reason  string `json:"reason" description:"换档原因（必填）：说明任务形态与该模型能力/成本的匹配点，写入操作记录供用户审计。"`
+}
+
+// pauseAgentInput 是 pause_agent 工具的入参结构。
+type pauseAgentInput struct {
+	AgentID string `json:"agent_id" description:"要暂停的子 Agent ID（call_sub_agent 返回的 sub_agent_id，须为运行中的 domain 角色）。"`
+	Reason  string `json:"reason" description:"暂停原因（可选）：写入回执供用户审计。"`
+}
+
+// resumeAgentInput 是 resume_agent 工具的入参结构。
+type resumeAgentInput struct {
+	AgentID string `json:"agent_id" description:"要恢复的子 Agent ID（此前被 pause_agent 暂停的热驻 DomainAgent）。"`
+}
+
+// setAgentModelInput 是 set_agent_model 工具的入参结构。
+type setAgentModelInput struct {
+	AgentID string `json:"agent_id" description:"目标 Agent 实例 ID（须为你直派的子 Agent：domain，或你直接派的固定角色）。"`
+	ModelID string `json:"model_id" description:"模型注册表条目 ID（见 list_models 的 models 列表）。"`
+	Reason  string `json:"reason" description:"换档原因（可选）：写入回执供用户审计。"`
+}
 
 // ---- 工具实现 ----
 

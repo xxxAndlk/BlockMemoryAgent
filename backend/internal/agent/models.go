@@ -36,6 +36,10 @@ type ModelEntryView struct {
 	Provider string `json:"provider"`
 	Model    string `json:"model"`
 	BaseURL  string `json:"base_url,omitempty"`
+	// MaxOutputTokens 条目声明的最大输出 token（0=未声明）。
+	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
+	// Description 能力/成本描述（MetaAgent 选模型与界面展示用）。
+	Description string `json:"description,omitempty"`
 }
 
 // RoleModelStatus 单个可切换角色的当前模型状态。
@@ -57,11 +61,13 @@ func (s *ReactService) ListModels(ctx context.Context) (*ModelCatalog, error) {
 	catalog := &ModelCatalog{Models: make([]ModelEntryView, 0, len(entries))}
 	for _, e := range entries {
 		catalog.Models = append(catalog.Models, ModelEntryView{
-			ID:       e.ID,
-			Name:     e.Name,
-			Provider: e.Provider,
-			Model:    e.Model,
-			BaseURL:  e.BaseURL,
+			ID:              e.ID,
+			Name:            e.Name,
+			Provider:        e.Provider,
+			Model:           e.Model,
+			BaseURL:         e.BaseURL,
+			MaxOutputTokens: e.MaxOutputTokens,
+			Description:     e.Description,
 		})
 	}
 	roles := s.modelFactory.SwitchableRoles()

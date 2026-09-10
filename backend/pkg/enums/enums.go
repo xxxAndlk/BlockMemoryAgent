@@ -106,23 +106,6 @@ const (
 	RoleTypeDynamic RoleType = "dynamic"
 )
 
-// RoleLifecycle 角色生命周期:刻画角色实例的存活时长与回收策略。
-type RoleLifecycle string
-
-const (
-	// RoleLifecyclePermanent 永久型:固定角色,跨会话长期存在。
-	// 仅适用于 RoleTypeFixed,实例在进程生命周期内常驻。
-	RoleLifecyclePermanent RoleLifecycle = "permanent"
-
-	// RoleLifecycleSession 会话级:随会话结束自动消亡。
-	// 适用于 MetaAgent / DomainAgent,会话关闭时统一回收。
-	RoleLifecycleSession RoleLifecycle = "session"
-
-	// RoleLifecycleTask 任务级:单次任务完成后即回收。
-	// 适用于 SubDomainAgent / Dynamic Assistant,粒度最细,资源利用率最高。
-	RoleLifecycleTask RoleLifecycle = "task"
-)
-
 // RoleStatus 角色状态:实例在运行时状态机中的当前阶段。
 // 流转:Idle → Active → (Waiting | Calling) → Done | Error。
 type RoleStatus string

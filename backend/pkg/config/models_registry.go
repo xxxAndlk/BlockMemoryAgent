@@ -85,6 +85,9 @@ func (f *ModelsRegistryFile) Validate() error {
 		if e.Model == "" {
 			return fmt.Errorf("model %q: model 为空", e.ID)
 		}
+		if e.MaxOutputTokens < 0 {
+			return fmt.Errorf("model %q: max_output_tokens 为负 (%d)", e.ID, e.MaxOutputTokens)
+		}
 	}
 	for roleID, b := range f.RoleBindings {
 		if roleID == "" {

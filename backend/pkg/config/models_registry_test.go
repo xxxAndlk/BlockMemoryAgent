@@ -73,6 +73,7 @@ func TestRegistryValidateErrors(t *testing.T) {
 			{ID: "x", Provider: "p", Model: "m"}, {ID: "x", Provider: "p", Model: "m2"}}}},
 		{"provider 空", ModelsRegistryFile{Models: []types.ModelEntry{{ID: "x", Model: "m"}}}},
 		{"model 空", ModelsRegistryFile{Models: []types.ModelEntry{{ID: "x", Provider: "p"}}}},
+		{"max_output_tokens 负", ModelsRegistryFile{Models: []types.ModelEntry{{ID: "x", Provider: "p", Model: "m", MaxOutputTokens: -1}}}},
 		{"绑定角色空", ModelsRegistryFile{RoleBindings: map[string]RoleBinding{"": {ModelID: "x"}}}},
 		{"绑定 model_id 空", ModelsRegistryFile{RoleBindings: map[string]RoleBinding{"meta": {}}}},
 	}

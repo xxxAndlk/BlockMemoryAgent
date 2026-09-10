@@ -1255,3 +1255,85 @@ func TestReActAgent_StagnationGuard_MetaExempt(t *testing.T) {
 		t.Fatalf("expected final answer after exemption, got %q", res.Text)
 	}
 }
+
+// namedMockProvider 在 mockModelProvider 之上附加 ModelName 标识，
+// 用于断言 providerFn 切换后 llmModelName 随新 provider 变化。
+type namedMockProvider struct {
+	mockModelProvider
+	modelName string
+}
+
+// ModelName 实现 provider 可选的模型名标识接口（llmModelName 经类型断言读取）。
+func (m *namedMockProvider) ModelName() string { return m.modelName }
+
+// TestReActAgent_ProviderFuncResolvesPerCall 验证 WithProviderFunc：同一次 Run 内
+// 每次 LLM 调用前重解析 provider——首个 provider 返回工具调用，第二次调用即切到
+// 新 provider（模拟运行中 set_role_model 换档），且 llmModelName 随新 provider 变化。
+func TestReActAgent_ProviderFuncResolvesPerCall(t *testing.T) {
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	first := &namedMockProvider{
+		mockModelProvider: mockModelProvider{responses: []*blades.Message{
+			{
+				Role: blades.RoleAssistant,
+				Parts: []blades.Part{
+					blades.ToolPart{Name: "WriteFile", Request: string(mustJSON(map[string]any{"path": "a.txt", "content": "1"}))},
+				},
+			},
+		}},
+		modelName: "model-a",
+	}
+	second := &namedMockProvider{
+		mockModelProvider: mockModelProvider{responses: []*blades.Message{blades.AssistantMessage("switched answer")}},
+		modelName:         "model-b",
+	}
+	resolutions := 0
+	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "x"}, first, NewToolRegistryAdapter(reg)).
+		WithProviderFunc(func(context.Context) (ModelProvider, error) {
+			resolutions++
+			if resolutions == 1 {
+				return first, nil
+			}
+			return second, nil
+		})
+
+	res, err := a.Run(context.Background(), "do work")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Text != "switched answer" {
+		t.Fatalf("second LLM call should use the newly resolved provider, got %q", res.Text)
+	}
+	if first.calls != 1 || second.calls != 1 {
+		t.Errorf("each provider should serve exactly 1 call, got first=%d second=%d", first.calls, second.calls)
+	}
+	if resolutions != 2 {
+		t.Errorf("providerFn should resolve once per LLM call, got %d", resolutions)
+	}
+	if got := a.llmModelName(); got != "model-b" {
+		t.Errorf("llmModelName after switch = %q, want model-b", got)
+	}
+}
+
+// TestReActAgent_ProviderFuncErrorKeepsCurrent 验证 providerFn 解析失败时保留旧 provider，
+// 任务不中断（换档失败回退语义）。
+func TestReActAgent_ProviderFuncErrorKeepsCurrent(t *testing.T) {
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	llm := &namedMockProvider{
+		mockModelProvider: mockModelProvider{responses: []*blades.Message{blades.AssistantMessage("still works")}},
+		modelName:         "model-a",
+	}
+	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg)).
+		WithProviderFunc(func(context.Context) (ModelProvider, error) {
+			return nil, errors.New("registry unavailable")
+		})
+	res, err := a.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("run should continue with previous provider, got %v", err)
+	}
+	if res.Text != "still works" {
+		t.Fatalf("got %q, want previous provider answer", res.Text)
+	}
+	if got := a.llmModelName(); got != "model-a" {
+		t.Errorf("llmModelName should stay model-a, got %q", got)
+	}
+}

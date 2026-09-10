@@ -1684,6 +1684,10 @@ func (s *ReactService) CancelAgent(ctx context.Context, sessionID, instID string
 	if !t.Cancel(instID) {
 		return ErrAgentNotFound
 	}
+	// 取消即终结：回收实例级模型覆盖（工厂未接线时静默跳过）。
+	if s.modelFactory != nil {
+		s.modelFactory.ClearAgentModel(instID)
+	}
 	return nil
 }
 
@@ -2062,6 +2066,19 @@ func subAgentDispatchInfo(argsJSON string) (roleID, taskBrief string) {
 	return roleID, taskBrief
 }
 
+// metaProviderForCall 解析 meta 每次 LLM 调用应使用的 provider（WithProviderFunc 注入）：
+// 测试注入优先（此场景 modelFactory 可能为 nil），否则按当前角色绑定经模型工厂解析——
+// 运行期 set_role_model/TUI 切换在下一次调用即生效。
+func (s *ReactService) metaProviderForCall(ctx context.Context) (ModelProvider, error) {
+	if s.testProvider != nil {
+		return s.testProvider, nil
+	}
+	if s.modelFactory == nil {
+		return nil, errors.New("model factory not available")
+	}
+	return s.modelFactory.GetBladesProvider(ctx, "meta")
+}
+
 // runSession 为新创建的会话执行 ReAct 主循环。
 func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会话上下文；若不存在则使用 Background。
 	ctx := sessionContext(session)
@@ -2120,7 +2137,9 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
 		WithSkillBlock(s.metaSkillBlock()).
-		WithPersonaInjector(s.metaPersona(session.workDir))
+		WithPersonaInjector(s.metaPersona(session.workDir)).
+		// meta 长会话运行期间模型被切换时，下一次 LLM 调用即用新模型。
+		WithProviderFunc(s.metaProviderForCall)
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
@@ -2245,7 +2264,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
 		WithSkillBlock(s.metaSkillBlock()).
-		WithPersonaInjector(s.metaPersonaLite())
+		WithPersonaInjector(s.metaPersonaLite()).
+		// 同 runSession：运行期模型切换在下一次 LLM 调用生效。
+		WithProviderFunc(s.metaProviderForCall)
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
 	if s.pendingChecker != nil {
 		agent = agent.WithPendingChildrenChecker(s.pendingChecker)

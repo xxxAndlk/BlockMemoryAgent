@@ -412,6 +412,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools 字段），
 	// 其他角色看不到它们。Registry 持 closure 引用，Execute 直接读写 dynamic 层。
 	roleRegistry.RegisterTools(toolRegistry)
+	// 注册 list_models / set_role_model 工具：MetaAgent 按模型条目描述为下层角色
+	// （domain + 固定角色）换档；写路径委托 ModelFactory.SwitchModel（校验/探活/持久化）。
+	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools + roles.yaml）。
+	role.RegisterModelTools(toolRegistry, modelFactory)
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)

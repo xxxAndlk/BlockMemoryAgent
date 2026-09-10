@@ -7,6 +7,8 @@ export interface ModelEntryView {
   provider: string
   model: string
   base_url?: string
+  max_output_tokens?: number
+  description?: string
 }
 
 /** 单个可切换角色的当前模型状态（与后端 agent.RoleModelStatus 对齐）。 */
@@ -32,6 +34,8 @@ export interface AddModelRequest {
   model: string
   api_key?: string
   base_url?: string
+  max_output_tokens?: number
+  description?: string
 }
 
 export function listModels(): Promise<ModelCatalog> {

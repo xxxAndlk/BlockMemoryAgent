@@ -77,20 +77,22 @@ func (h *APIHandler) SwitchModelHandler(c *gin.Context) {
 }
 
 // AddModelHandler 处理 POST /api/models — 新增模型条目（落 config/models.json）。
-// body {name?, provider, model, api_key, base_url}；id 缺省由 model 名 slug 化生成，
-// 冲突时追加 -2/-3 后缀。
+// body {name?, provider, model, api_key, base_url, max_output_tokens?, description?}；
+// id 缺省由 model 名 slug 化生成，冲突时追加 -2/-3 后缀。
 func (h *APIHandler) AddModelHandler(c *gin.Context) {
 	if h.modelMgr == nil {
 		c.String(http.StatusServiceUnavailable, "model manager not initialized")
 		return
 	}
 	var req struct {
-		ID       string `json:"id"`
-		Name     string `json:"name"`
-		Provider string `json:"provider"`
-		Model    string `json:"model"`
-		APIKey   string `json:"api_key"`
-		BaseURL  string `json:"base_url"`
+		ID              string `json:"id"`
+		Name            string `json:"name"`
+		Provider        string `json:"provider"`
+		Model           string `json:"model"`
+		APIKey          string `json:"api_key"`
+		BaseURL         string `json:"base_url"`
+		MaxOutputTokens int    `json:"max_output_tokens"`
+		Description     string `json:"description"`
 	}
 	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
 		c.String(http.StatusBadRequest, "invalid body: %s", err.Error())
@@ -105,12 +107,14 @@ func (h *APIHandler) AddModelHandler(c *gin.Context) {
 		id = h.slugModelID(h.modelMgr, req.Model)
 	}
 	entry := types.ModelEntry{
-		ID:       id,
-		Name:     req.Name,
-		Provider: req.Provider,
-		Model:    req.Model,
-		APIKey:   req.APIKey,
-		BaseURL:  req.BaseURL,
+		ID:              id,
+		Name:            req.Name,
+		Provider:        req.Provider,
+		Model:           req.Model,
+		APIKey:          req.APIKey,
+		BaseURL:         req.BaseURL,
+		MaxOutputTokens: req.MaxOutputTokens,
+		Description:     req.Description,
 	}
 	if err := h.modelMgr.AddModelEntry(entry); err != nil {
 		c.String(http.StatusBadRequest, "%s", err.Error())

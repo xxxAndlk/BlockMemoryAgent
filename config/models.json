@@ -6,15 +6,29 @@
       "provider": "anthropic",
       "model": "doubao-seed-evolving",
       "api_key": "${ANTHROPIC_API_KEY}",
-      "base_url": "${ANTHROPIC_BASE_URL}"
+      "base_url": "${ANTHROPIC_BASE_URL}",
+      "max_output_tokens": 128000,
+      "description": "Agent 编排/长程规划主力（抵扣 2.5），适合 MetaAgent 路由、汇总与复杂规划"
+    },
+    {
+      "id": "ark-glm-5.3-flash",
+      "name": "ARK GLM 5.3 Flash",
+      "provider": "anthropic",
+      "model": "glm-5.3-flash",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "${ANTHROPIC_BASE_URL}",
+      "max_output_tokens": 128000,
+      "description": "域执行/叶子主力（抵扣 0.5），单呼快，适合编码执行、侦察、速修等高频任务"
     },
     {
       "id": "glm-5.3-flash",
       "name": "GLM 5.3 Flash",
       "provider": "anthropic",
       "model": "glm-5.3-flash",
-      "api_key": "${ANTHROPIC_API_KEY}",
-      "base_url": "${ANTHROPIC_BASE_URL}"
+      "api_key": "${ANTHROPIC_BASE_URL_FOUR}",
+      "base_url": "${OPENAI_API_KEY_TWO}",
+      "max_output_tokens": 32768,
+      "description": "GLM 5.3 Flash 备用端点（抵扣 0.5），同 ark-glm-5.3-flash 能力"
     },
     {
       "id": "doubao-seed-2.0-mini",
@@ -22,39 +36,59 @@
       "provider": "anthropic",
       "model": "doubao-seed-2.0-mini",
       "api_key": "${ANTHROPIC_API_KEY}",
-      "base_url": "${ANTHROPIC_BASE_URL}"
+      "base_url": "${ANTHROPIC_BASE_URL}",
+      "max_output_tokens": 32768,
+      "description": "轻量档，适合历史总结、检索 query 改写等低开销任务"
     },
     {
-      "id": "deepseek-v4-flash",
-      "name": "DeepSeek V4 Flash",
+      "id": "ark-deepseek-v4-flash",
+      "name": "ARK DeepSeek V4 Flash",
       "provider": "anthropic",
       "model": "deepseek-v4-flash",
       "api_key": "${ANTHROPIC_API_KEY}",
-      "base_url": "${ANTHROPIC_BASE_URL}"
+      "base_url": "${ANTHROPIC_BASE_URL}",
+      "max_output_tokens": 32768,
+      "description": "叶子高频角色性价比档（抵扣 0.5），适合代码编写、测试等单文件闭环任务"
     },
     {
-      "id": "glm-5.3",
-      "name": "GLM 5.3",
+      "id": "deepseek-flash",
+      "name": "DeepSeek V4.1 Flash",
+      "provider": "openai-responses",
+      "model": "deepseek-flash",
+      "api_key": "${OPENAI_API_KEY}",
+      "base_url": "${OPENAI_BASE_URL}",
+      "max_output_tokens": 32768,
+      "description": "DeepSeek responses 协议代理（抵扣约 0.5），带自动前缀缓存"
+    },
+    {
+      "id": "ark-glm-5.3",
+      "name": "ARK GLM 5.3",
       "provider": "anthropic",
       "model": "glm-5.3",
       "api_key": "${ANTHROPIC_API_KEY}",
-      "base_url": "${ANTHROPIC_BASE_URL}"
+      "base_url": "${ANTHROPIC_BASE_URL}",
+      "max_output_tokens": 16384,
+      "description": "中档质量（抵扣 4.5），适合提示词/代码审查类需要细致判断的任务"
     },
     {
       "id": "doubao-seed-2.0-lite",
-      "name": "豆包 Seed 2.0 Lite（原 doc）",
+      "name": "豆包 Seed 2.0 Lite",
       "provider": "anthropic",
       "model": "doubao-seed-2.0-lite",
       "api_key": "${ANTHROPIC_API_KEY}",
-      "base_url": "${ANTHROPIC_BASE_URL}"
+      "base_url": "${ANTHROPIC_BASE_URL}",
+      "max_output_tokens": 16384,
+      "description": "文档编写档，适合 README/CHANGELOG 等中等长度文本产出"
     },
     {
       "id": "kimi-k3",
       "name": "Kimi K3",
       "provider": "anthropic",
       "model": "kimi-k3",
-      "api_key": "${ANTHROPIC_API_KEY}",
-      "base_url": "${ANTHROPIC_BASE_URL}"
+      "api_key": "${ANTHROPIC_API_KEY_TWO}",
+      "base_url": "${ANTHROPIC_BASE_URL_TWO}",
+      "max_output_tokens": 32768,
+      "description": "高成本强推理档（抵扣 10），仅硬骨头任务临时切换使用（ark coding 端点硬限 32768）"
     },
     {
       "id": "gemini-3.8-flash",
@@ -62,7 +96,9 @@
       "provider": "openai-chat",
       "model": "${GEMINI_CHAT_MODEL}",
       "api_key": "xxx",
-      "base_url": "${GEMINI_CHAT_URL}"
+      "base_url": "${GEMINI_CHAT_URL}",
+      "max_output_tokens": 32768,
+      "description": "UI 出图/前端实现档，HTML+CSS 长输出防截断（gemini-webapi 网关）"
     }
   ],
   "role_bindings": {}

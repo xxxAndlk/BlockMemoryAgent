@@ -16,8 +16,6 @@ type RoleDefinition struct {
 	Name string `json:"name" yaml:"name"`
 	// Type 角色类型，决定实例化路径与生命周期管理策略。
 	Type enums.RoleType `json:"type" yaml:"type"`
-	// Lifecycle 生命周期策略，控制角色实例的存活时长与回收时机。
-	Lifecycle enums.RoleLifecycle `json:"lifecycle" yaml:"lifecycle"`
 	// Description 角色职责描述，供 LLM 动态创建角色时参考。
 	Description string `json:"description" yaml:"description"`
 	// SystemPrompt 系统提示词，执行时注入 Agent 上下文以约束行为。

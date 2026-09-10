@@ -5,13 +5,12 @@ import (
 	"testing"
 )
 
-// TestGet_AllRegisteredIDs 全部 12 个 roleID 可取且非空。
+// TestGet_AllRegisteredIDs 全部 10 个 roleID 可取且非空。
 func TestGet_AllRegisteredIDs(t *testing.T) {
 	ids := []string{
 		"meta", "domain",
 		"scout", "light", "code_assistant", "ui_assistant",
 		"prompt_reviewer", "code_reviewer", "test_assistant", "doc_assistant",
-		"domain_template", "assistant_template",
 	}
 	for _, id := range ids {
 		p, err := Get(id)

@@ -250,6 +250,54 @@ func TestResolveConfigMergeOrder(t *testing.T) {
 	}
 }
 
+// TestMaxOutputTokensResolution 输出上限解析链：角色侧 max_tokens（>0）优先，
+// 其次条目 max_output_tokens，两者皆无保持 0（provider 省略/回退端点默认）。
+func TestMaxOutputTokensResolution(t *testing.T) {
+	f, store, _ := newSwitchTestFactory(t)
+	if err := store.Add(types.ModelEntry{ID: "outmodel", Provider: "openai", Model: "m-out", APIKey: "k-out", MaxOutputTokens: 32000}); err != nil {
+		t.Fatalf("add entry: %v", err)
+	}
+	if err := store.Add(types.ModelEntry{ID: "noout", Provider: "openai", Model: "m-noout", APIKey: "k-noout"}); err != nil {
+		t.Fatalf("add entry: %v", err)
+	}
+
+	// meta 无角色侧 max_tokens：绑定到条目后取条目值。
+	if err := store.SetBinding("meta", "outmodel", ""); err != nil {
+		t.Fatalf("SetBinding: %v", err)
+	}
+	cfg, err := f.resolveConfig("meta")
+	if err != nil {
+		t.Fatalf("resolve meta: %v", err)
+	}
+	if cfg.MaxTokens != 32000 {
+		t.Fatalf("条目 max_output_tokens 未生效: %+v", cfg)
+	}
+
+	// ref_role 角色侧显式 4096：覆盖条目值。
+	if err := store.SetBinding("ref_role", "outmodel", ""); err != nil {
+		t.Fatalf("SetBinding: %v", err)
+	}
+	cfg, err = f.resolveConfig("ref_role")
+	if err != nil {
+		t.Fatalf("resolve ref_role: %v", err)
+	}
+	if cfg.MaxTokens != 4096 {
+		t.Fatalf("角色侧 max_tokens 应优先: %+v", cfg)
+	}
+
+	// 条目未声明上限：保持 0。
+	if err := store.SetBinding("meta", "noout", ""); err != nil {
+		t.Fatalf("SetBinding: %v", err)
+	}
+	cfg, err = f.resolveConfig("meta")
+	if err != nil {
+		t.Fatalf("resolve meta: %v", err)
+	}
+	if cfg.MaxTokens != 0 {
+		t.Fatalf("无声明应保持 0: %+v", cfg)
+	}
+}
+
 func TestModelRefMissingFailsStrict(t *testing.T) {
 	cfg := &config.RoleConfigFile{
 		MetaAgent:   config.MetaAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "meta-old", APIKey: "k-meta"}},

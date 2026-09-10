@@ -7,6 +7,7 @@ package model
 import (
 	"context" // 上下文传递
 	"fmt"     // 错误格式化
+	"sort"    // 实例覆盖清单排序（展示稳定）
 	"strings" // 失败角色列表拼接
 	"sync"    // 读写锁，保护 models 缓存
 	"time"    // 探测超时
@@ -71,6 +72,23 @@ type cachedClient struct {
 	cfg    types.AgentModelConfig
 }
 
+// agentOverride 实例级模型覆盖条目：只活在本进程内存，实例终结即回收，永不落盘。
+type agentOverride struct {
+	roleID  string                 // 设置时的角色 ID（展示/审计用）
+	modelID string                 // 注册表条目 ID
+	cfg     types.AgentModelConfig // 构造客户端时使用的生效配置
+	client  LLMClient              // 覆盖专用客户端（不参与角色缓存）
+}
+
+// AgentOverrideInfo 实例级覆盖摘要（展示用，不含 api_key）。
+type AgentOverrideInfo struct {
+	AgentID  string // 被覆盖的 Agent 实例 ID
+	RoleID   string // 设置时的角色 ID
+	ModelID  string // 注册表条目 ID
+	Model    string // 生效模型名
+	Thinking string // 生效思考档位
+}
+
 // ModelFactory 模型工厂，按角色缓存模型实例。
 // 设计意图：避免重复构造 provider（连接池/鉴权开销），按角色复用。
 type ModelFactory struct {
@@ -88,6 +106,12 @@ type ModelFactory struct {
 	// probeHook 切换前的连通性探测钩子；nil 用默认实现（MaxTokens=1 临时客户端
 	// + probeLLM，60s 超时）。测试注入 fake 以免真实网络调用。
 	probeHook func(ctx context.Context, cfg types.AgentModelConfig) error
+
+	// agentOvMu / agentOverrides：实例级模型覆盖（key: agentID）。独立于角色缓存 models——
+	// role_bindings 变更 / invalidateChangedClients / checkRegistryReload 均不触碰覆盖
+	// （角色换绑定不影响已覆盖实例）；反向亦隔离（覆盖不改同角色其他实例）。
+	agentOvMu       sync.RWMutex
+	agentOverrides  map[string]agentOverride
 }
 
 // NewModelFactory 创建模型工厂。
@@ -106,6 +130,7 @@ func NewModelFactory(cfg *config.RoleConfigFile) *ModelFactory {
 		models:         make(map[string]cachedClient), // 初始化空缓存
 		cfg:            cfg,
 		dynamicConfigs: make(map[string]types.AgentModelConfig), // 动态角色模型配置
+		agentOverrides: make(map[string]agentOverride),          // 实例级覆盖（默认空）
 	}
 }
 
@@ -203,6 +228,154 @@ func (f *ModelFactory) GetBladesProvider(ctx context.Context, roleDefID string) 
 	}
 	// 返回底层 provider
 	return bc.Provider(), nil
+}
+
+// GetBladesProviderForAgent 实例级模型解析：agentID 有覆盖时用覆盖客户端，否则回落
+// 角色级 GetBladesProvider。agentID 为空（无实例语义的调用点）直接回落。
+//
+// 覆盖客户端在 SetAgentModel 时一并构造（探测已通过）；此处只读，无构造开销。
+func (f *ModelFactory) GetBladesProviderForAgent(ctx context.Context, roleID, agentID string) (blades.ModelProvider, error) {
+	if agentID != "" {
+		f.agentOvMu.RLock()
+		ov, ok := f.agentOverrides[agentID]
+		f.agentOvMu.RUnlock()
+		if ok {
+			if bc, isBC := ov.client.(*BladesClient); isBC {
+				return bc.Provider(), nil
+			}
+			return nil, fmt.Errorf("blades provider unavailable for agent %s", agentID)
+		}
+	}
+	return f.GetBladesProvider(ctx, roleID)
+}
+
+// SetAgentModel 为单个 Agent 实例覆盖模型（set_agent_model 工具核心）。
+//
+// 与 SwitchModel 的区别：只改本实例、不写 role_bindings、不落盘、不影响同角色其他实例
+// 与其他角色；覆盖随实例存续，实例终结由调用方 ClearAgentModel 回收（进程重启天然清空）。
+//
+// 校验口径同 SwitchModel：角色可切换（meta/lightweight 由工具层拦截，此处仅查清单）、
+// 条目存在、api_key 非空、连通性探测 fail-closed（失败不落覆盖保持原模型）。
+// thinking 空 = 沿用该角色当前生效思考档；max_tokens 从角色侧重算（不继承旧模型条目的
+// 输出上限，避免换到小上限模型时带过去超限值触发 400）。
+func (f *ModelFactory) SetAgentModel(ctx context.Context, agentID, roleID, modelID, thinking string) (types.AgentModelConfig, error) {
+	if strings.TrimSpace(agentID) == "" {
+		return types.AgentModelConfig{}, fmt.Errorf("agent_id 不能为空")
+	}
+	if !f.isSwitchableRole(roleID) {
+		return types.AgentModelConfig{}, fmt.Errorf("role %q 不支持动态切换模型", roleID)
+	}
+	// 热更新检查（与 SwitchModel 同：防设置到刚被删掉的条目）
+	f.checkRegistryReload()
+	entry, ok := f.entryByID(modelID)
+	if !ok {
+		return types.AgentModelConfig{}, fmt.Errorf("模型 %q 不在模型注册表中", modelID)
+	}
+	// 同覆盖短路（同条目同思考档则无操作，避免重复探测）
+	if cur, exists := f.agentOverrideOf(agentID); exists && cur.modelID == modelID && cur.cfg.Thinking == resolveThinking(f, roleID, thinking) {
+		return cur.cfg, nil
+	}
+
+	// 生效配置 = 角色侧行为参数 + 目标条目连接参数；thinking 沿用当前生效档（未显式指定）
+	newCfg := applyModelEntry(f.resolveBaseConfig(roleID), entry)
+	if t := resolveThinking(f, roleID, thinking); t != "" {
+		newCfg.Thinking = t
+	}
+	if newCfg.APIKey == "" {
+		return types.AgentModelConfig{}, fmt.Errorf("模型 %q 未配置 api_key", modelID)
+	}
+	// 连通性探测（锁外网络 IO；MaxTokens=1 最小化开销，同 SwitchModel）
+	probeCfg := newCfg
+	probeCfg.MaxTokens = 1
+	probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	if err := f.probe(probeCtx, probeCfg); err != nil {
+		return types.AgentModelConfig{}, fmt.Errorf("模型 %q 连通性探测失败，未设置实例覆盖: %w", modelID, err)
+	}
+	client, err := NewBladesClient(ctx, newCfg)
+	if err != nil {
+		return types.AgentModelConfig{}, fmt.Errorf("create blades client for agent %s: %w", agentID, err)
+	}
+
+	f.agentOvMu.Lock()
+	if f.agentOverrides == nil {
+		f.agentOverrides = make(map[string]agentOverride)
+	}
+	f.agentOverrides[agentID] = agentOverride{roleID: roleID, modelID: modelID, cfg: newCfg, client: client}
+	f.agentOvMu.Unlock()
+	return newCfg, nil
+}
+
+// resolveThinking 计算实例覆盖的思考档：显式 thinking 优先，空则沿用角色当前生效档
+// （含 role_bindings 覆盖），避免静默回退到 roles.yaml 配置。
+func resolveThinking(f *ModelFactory, roleID, thinking string) string {
+	if strings.TrimSpace(thinking) != "" {
+		return thinking
+	}
+	if cur, err := f.resolveConfig(roleID); err == nil {
+		return cur.Thinking
+	}
+	return ""
+}
+
+// ClearAgentModel 回收实例级模型覆盖（节点死亡/取消/槽销毁时调用；无覆盖为 no-op）。
+func (f *ModelFactory) ClearAgentModel(agentID string) {
+	if agentID == "" {
+		return
+	}
+	f.agentOvMu.Lock()
+	delete(f.agentOverrides, agentID)
+	f.agentOvMu.Unlock()
+}
+
+// ClearAgentModelsByPrefix 按前缀回收实例级覆盖（会话清理兜底：话题切换/会话删除）。
+func (f *ModelFactory) ClearAgentModelsByPrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+	f.agentOvMu.Lock()
+	for id := range f.agentOverrides {
+		if strings.HasPrefix(id, prefix) {
+			delete(f.agentOverrides, id)
+		}
+	}
+	f.agentOvMu.Unlock()
+}
+
+// agentOverrideOf 读取单个实例覆盖（无则 exists=false）。
+func (f *ModelFactory) agentOverrideOf(agentID string) (agentOverride, bool) {
+	if agentID == "" {
+		return agentOverride{}, false
+	}
+	f.agentOvMu.RLock()
+	ov, ok := f.agentOverrides[agentID]
+	f.agentOvMu.RUnlock()
+	return ov, ok
+}
+
+// AgentOverrides 返回当前实例级覆盖清单（展示用；按 AgentID 排序保证输出稳定）。
+func (f *ModelFactory) AgentOverrides() []AgentOverrideInfo {
+	f.agentOvMu.RLock()
+	out := make([]AgentOverrideInfo, 0, len(f.agentOverrides))
+	for id, ov := range f.agentOverrides {
+		out = append(out, AgentOverrideInfo{
+			AgentID: id, RoleID: ov.roleID, ModelID: ov.modelID,
+			Model: ov.cfg.Model, Thinking: ov.cfg.Thinking,
+		})
+	}
+	f.agentOvMu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].AgentID < out[j].AgentID })
+	return out
+}
+
+// isSwitchableRole 判断角色是否在可动态切换清单内（meta/domain/lightweight + 固定角色）。
+func (f *ModelFactory) isSwitchableRole(roleID string) bool {
+	for _, r := range f.SwitchableRoles() {
+		if r == roleID {
+			return true
+		}
+	}
+	return false
 }
 
 // RegisterDynamicModelConfig 注册运行时动态角色的模型配置（P3-4）。
@@ -326,11 +499,17 @@ func (f *ModelFactory) resolveBaseConfig(roleDefID string) types.AgentModelConfi
 }
 
 // applyModelEntry 用注册表条目的连接参数覆盖 base 的连接字段（行为参数保留角色侧）。
+// 输出上限：角色侧 max_tokens 显式配置（>0）优先；未配置时取条目 max_output_tokens，
+// 两者皆无则保持 0（provider 省略/回退端点默认）。调用方（探活）在合并后覆写
+// MaxTokens=1，勿把本函数移到探活赋值之后。
 func applyModelEntry(base types.AgentModelConfig, e types.ModelEntry) types.AgentModelConfig {
 	base.Provider = e.Provider
 	base.Model = e.Model
 	base.APIKey = e.APIKey
 	base.BaseURL = e.BaseURL
+	if base.MaxTokens <= 0 && e.MaxOutputTokens > 0 {
+		base.MaxTokens = e.MaxOutputTokens
+	}
 	return base
 }
 
@@ -647,14 +826,7 @@ func (f *ModelFactory) SwitchModel(ctx context.Context, roleID, modelID, thinkin
 	defer f.switchMu.Unlock()
 
 	// 校验角色可切换
-	switchable := false
-	for _, r := range f.SwitchableRoles() {
-		if r == roleID {
-			switchable = true
-			break
-		}
-	}
-	if !switchable {
+	if !f.isSwitchableRole(roleID) {
 		return types.AgentModelConfig{}, fmt.Errorf("role %q 不支持动态切换模型", roleID)
 	}
 	// 热更新检查（switchMu 下，防切换到刚被删掉的条目）
