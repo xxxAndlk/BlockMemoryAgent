@@ -12,6 +12,8 @@ const props = defineProps<{
   sessionId: string
   liveStreaming: string
   liveThinking: string
+  /** 接替回合的流式文本快照（key=接替用 user_message 事件时间戳），见 groupEventsToTurns。 */
+  priorReplies?: Record<string, string>
 }>()
 
 // 澄清选项提交成功 → 透传给父级（index.vue 重开会话刷新事件流）
@@ -22,7 +24,7 @@ const stickToBottom = ref(true)
 
 // F9 修复：原 groupEventsToTurns(events) 在模板内直接调用，
 // 每次 patch 都重新 O(n) 分组。改 computed 仅在 events 变化时重算。
-const turns = computed(() => groupEventsToTurns(props.events))
+const turns = computed(() => groupEventsToTurns(props.events, props.priorReplies))
 
 function onScroll() {
   if (!containerRef.value) return
@@ -60,10 +62,11 @@ defineExpose({ scrollToBottom })
       </div>
     </template>
     <template v-else>
-      <div v-for="turn in turns" :key="turn.id">
+      <div v-for="(turn, ti) in turns" :key="turn.id">
         <UserBubble v-if="turn.userMessage" :event="turn.userMessage" />
         <AssistantTurn :turn="turn" :verbose="verbose" :clarify="clarify" :session-id="sessionId"
-                       :live-streaming="liveStreaming" :live-thinking="liveThinking"
+                       :live-streaming="ti === turns.length - 1 ? liveStreaming : ''"
+                       :live-thinking="ti === turns.length - 1 ? liveThinking : ''"
                        @submit-clarify="emit('submit-clarify')" />
       </div>
     </template>

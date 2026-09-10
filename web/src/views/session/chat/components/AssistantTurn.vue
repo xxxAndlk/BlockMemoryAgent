@@ -22,11 +22,14 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: 'submit-clarify'): void }>()
 
 const finalText = computed(() => {
-  if (!props.turn.finalAnswer) return ''
-  const msg = props.turn.finalAnswer.message || ''
-  // "会话完成: <内容>" / "执行失败: <内容>"
-  const m = msg.match(/^(?:会话完成|执行失败)[:：]?\s*([\s\S]*)$/)
-  return m ? m[1].trim() : msg
+  if (props.turn.finalAnswer) {
+    const msg = props.turn.finalAnswer.message || ''
+    // "会话完成: <内容>" / "执行失败: <内容>"
+    const m = msg.match(/^(?:会话完成|执行失败)[:：]?\s*([\s\S]*)$/)
+    return m ? m[1].trim() : msg
+  }
+  // 被新用户消息接替的回合：答复 = 接替时刻收编的流式汇报文本
+  return props.turn.finalText || ''
 })
 
 const statusLabel = computed(() => {
