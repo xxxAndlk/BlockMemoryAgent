@@ -99,7 +99,7 @@
       "api_key": "xxx",
       "base_url": "${GEMINI_CHAT_URL}",
       "max_output_tokens": 32768,
-      "description": "UI 出图/前端实现档，HTML+CSS 长输出防截断（gemini-webapi 网关）"
+      "description": "UI 出图/前端实现档，HTML+CSS 长输出防截断（gemini-webapi 网关，不稳定超时可切），每次调用需要间隔5秒"
     }
   ],
   "role_bindings": {}

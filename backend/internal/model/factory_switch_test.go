@@ -166,12 +166,12 @@ func TestSwitchableRolesWhitelist(t *testing.T) {
 	if _, err := f.SetAgentModel(context.Background(), "s1", "meta", "meta-only", ""); err != nil {
 		t.Fatalf("meta 实例覆盖 meta-only: %v", err)
 	}
-	if probes != 3 {
-		t.Fatalf("probe called %d times, want 3 (meta 切换 + meta 实例覆盖 + domain 普通条目)", probes)
-	}
 	// 无白名单条目不受影响。
 	if _, err := f.SwitchModel(context.Background(), "domain", "glm-flash", ""); err != nil {
 		t.Fatalf("domain 切换普通条目: %v", err)
+	}
+	if probes != 3 {
+		t.Fatalf("probe called %d times, want 3 (meta 切换 + meta 实例覆盖 + domain 普通条目)", probes)
 	}
 }
 
