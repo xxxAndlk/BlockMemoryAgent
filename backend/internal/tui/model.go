@@ -11,13 +11,13 @@ import (
 	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbles/textinput"
 	term "github.com/charmbracelet/x/term"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/pkg/enums"
-	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // Model 是 BlockMemoryAgent TUI 的顶层 bubbletea 模型，持有全部状态与依赖。
@@ -128,14 +128,20 @@ type Model struct {
 	// log 是结构化日志器，由 SetLogger 注入；nil 时回退标准库 log。
 	log *logger.Logger
 
-	// 模型切换弹窗状态（overlayModel 两段式）：
-	// modelStage 0=选角色 1=选预设；modelSelRole 是 stage1 的目标角色；
+	// 模型切换弹窗状态（overlayModel 多段式）：
+	// modelStage 0=选角色（←/→ 或 ↑/↓ 移动）1=选模型（末项=新增模型）
+	// 2=选思考档 3=新增模型表单；modelSelRole/modelSelModel 是后续段的目标；
 	// modelSwitching 标记异步切换进行中（探测最长 60s，期间忽略 Enter）。
-	modelStage     int
-	modelSelRole   string
-	modelSwitching bool
-	modelRoles     []agent.RoleModelStatus
-	modelPresets   []types.ModelPreset
+	modelStage       int
+	modelSelRole     string
+	modelSelModel    agent.ModelEntryView
+	modelSelThinking string
+	modelSwitching   bool
+	modelRoles       []agent.RoleModelStatus
+	modelModels      []agent.ModelEntryView
+	modelForm        [4]textinput.Model // 新增模型表单：provider/model/api_key/base_url
+	modelFormFocus   int
+	modelFormBusy    bool
 }
 
 // sharedState 是跨 bubbletea 值拷贝共享的可变状态（#47 修复）。
@@ -645,6 +651,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyModelSwitchDone(msg)
 		m.dirty = true
 
+	case modelAddedMsg:
+		m.applyModelAdded(msg)
+		m.dirty = true
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -834,18 +844,19 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 弹窗模式：导航或关闭。
 	if m.overlayPanel.mode != overlayNone {
+		// 模型弹窗 stage3（新增模型表单）：按键全部路由给表单输入框。
+		if m.overlayPanel.mode == overlayModel && m.modelStage == 3 {
+			return m.handleModelFormKey(msg)
+		}
 		// 保持弹窗内容与光标和实时状态同步。
 		m.refreshOverlay()
 		switch msg.String() {
 		case "ctrl+c":
 			return m.ctrlCQuit()
 		case "esc", "q":
-			// 模型弹窗两段式：stage 1 的 Esc 退回角色列表，stage 0 才关闭。
-			if m.overlayPanel.mode == overlayModel && m.modelStage == 1 {
-				m.modelStage = 0
-				m.overlayPanel.title = "Switch Model · Select Role"
-				m.overlayPanel.lines = m.buildModelRoleLines()
-				m.clampOverlayCursor()
+			// 模型弹窗逐段回退：3/2→1（模型列表）、1→0（角色列表）、0 关闭。
+			if m.overlayPanel.mode == overlayModel && m.modelStage > 0 {
+				m.modelModelBack()
 				return m, nil
 			}
 			m.overlayPanel.mode = overlayNone
@@ -855,6 +866,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "up":
 			if m.overlayPanel.cursor > 0 {
 				m.overlayPanel.cursor--
+			}
+		case "left", "right":
+			// 模型弹窗左右键：stage0 循环移角色、stage2 循环移思考档。
+			if m.overlayPanel.mode == overlayModel {
+				m.cycleModelCursor(msg.String() == "right")
 			}
 		case "g":
 			m.overlayPanel.cursor = 0

@@ -185,7 +185,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 		// 注意：生产 config/roles.yaml 已通过 meta_agent.tools 覆盖去掉 HTTPGet——实证其
 		// 永远优先于需挂载的 web_search 插件被选中；联网调研集中于 meta + web_search 插件。
 		// roles.yaml meta_agent.tools 非空时整体覆盖白名单；为空保持上述内置默认。
-		tools := []string{"call_sub_agent", "call_sub_agents", "map_sub_agents", "merge_worktree", "WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "ReadMedia", "WriteFile", "EditFile", "RestoreFile", "ReadFile", "RunCommand", "HTTPGet", "create_role", "list_roles", "RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "write_plan", "submit_plan", "review_plan", "remember_preference", "search_knowledge", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount", "list_skills", "load_skill"}
+		tools := []string{"call_sub_agent", "call_sub_agents", "map_sub_agents", "merge_worktree", "WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "ReadMedia", "WriteFile", "EditFile", "RestoreFile", "ReadFile", "RunCommand", "HTTPGet", "create_role", "list_roles", "list_models", "set_role_model", "set_agent_model", "RefreshProjectDoc", "send_message", "cancel_agent", "pause_agent", "resume_agent", "ask_user", "write_plan", "submit_plan", "review_plan", "remember_preference", "search_knowledge", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount", "list_skills", "load_skill"}
 		if len(r.cfg.MetaAgent.Tools) > 0 {
 			tools = r.cfg.MetaAgent.Tools
 		}
@@ -220,6 +220,9 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 				"ReadFile", "ListDir", "SearchInFiles", "HTTPGet", "ReadMedia",
 				"WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RestoreFile", "RunCommand",
 				"RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "search_knowledge",
+				// 叶子治理（2026-09-10）：domain 管理自己直派的叶子——暂停/换档/续跑，
+				// 与 meta 管理 domain 同构（授权 caller == node.ParentID）。
+				"pause_agent", "resume_agent", "set_agent_model", "list_models",
 				"plugin_list", "tool_catalog", "tool_mount", "tool_unmount",
 				"submit_plan", "review_plan",
 				"list_skills", "load_skill",

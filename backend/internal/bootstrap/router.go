@@ -86,8 +86,9 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/plugins/reload", apiHandler.ReloadPluginsHandler)      // 重读配置 + 重扫 plugins.d/
 
 	// 模型动态切换 API（TUI 走进程内直调，不经此端点）。
-	api.GET("/models", apiHandler.ListModelsHandler)          // 模型目录：预设 + 各角色当前模型
-	api.POST("/models/switch", apiHandler.SwitchModelHandler) // 切换：{role, preset}（含连通性探测）
+	api.GET("/models", apiHandler.ListModelsHandler)          // 模型目录：注册表清单 + 各角色当前模型
+	api.POST("/models/switch", apiHandler.SwitchModelHandler) // 切换：{role, model_id, thinking}（含连通性探测）
+	api.POST("/models", apiHandler.AddModelHandler)           // 新增模型条目：{name?, provider, model, api_key, base_url}
 
 	return router
 }

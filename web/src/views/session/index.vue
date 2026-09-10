@@ -28,6 +28,7 @@ import {
   type SessionTokenMetricsResponse,
 } from '@/api/metrics'
 import { useSessionStream } from '@/composables/useSessionStream'
+import { classifyEvent } from '@/views/session/chat/utils/turns'
 import { usePanelRefresh } from '@/composables/usePanelRefresh'
 import { useSessionList } from '@/composables/useSessionList'
 import { useSessionStatus } from '@/composables/useSessionStatus'
@@ -82,6 +83,11 @@ const clarifyDrafts = ref<Record<string, string[]>>({})
 // 模型实时汇报/思考文本：由 SSE live 帧驱动（不 push 进 events），对齐 TUI 流式展示
 const liveStreaming = ref('')
 const liveThinking = ref('')
+
+// 接替回合的流式文本快照（key=接替用 user_message 事件时间戳）：运行中会话里 MetaAgent
+// 单循环常驻、逐轮流式汇报只存于 live 帧；新用户消息接替当前回合时把此刻的流式文本
+// 收编为上一回合的最终答复（否则上一回合永远"处理中"且与当前回合重复渲染同一份 live 帧）。
+const replyStash = ref<Record<string, string>>({})
 
 const loading = ref(false)
 const sending = ref(false)
@@ -140,6 +146,7 @@ async function openSession(id: string) {
   clarifyPending.value = null // 切换会话时复位待澄清选项，避免串会话残留
   clarifyAck.value = false
   clarifyDrafts.value = {}
+  replyStash.value = {}
   try {
     const s = await getSession(id)
     activeSession.value = s
@@ -157,12 +164,15 @@ async function openSession(id: string) {
 }
 
 async function refreshPanels(id: string) {
+  // 共享同一刷新周期 epoch：Promise.allSettled 里多个 run 若各自 ++epoch，
+  // 只有最后一个能存活（前四个结果到达时 epoch 已变被丢弃）→ 面板永远空白。
+  const ep = panel.cycle()
   const [agentsRes, boardRes, metricsRes, mbRes, healthRes] = await Promise.allSettled([
-    panel.run(() => getSessionAgents(id)),
-    panel.run(() => getSessionBoard(id)),
-    panel.run(() => getSessionMetrics(id)),
-    panel.run(() => getSessionMailbox(id)),
-    panel.run(() => getHealth()),
+    panel.run(() => getSessionAgents(id), ep),
+    panel.run(() => getSessionBoard(id), ep),
+    panel.run(() => getSessionMetrics(id), ep),
+    panel.run(() => getSessionMailbox(id), ep),
+    panel.run(() => getHealth(), ep),
   ])
   agents.value = agentsRes.status === 'fulfilled' && agentsRes.value ? agentsRes.value.agents || [] : []
   board.value = boardRes.status === 'fulfilled' && boardRes.value ? boardRes.value.board || null : null
@@ -243,6 +253,13 @@ function startStream(s: Session) {
           activeSession.value = { ...activeSession.value, status: 'awaiting_clarify' }
         }
         return
+      }
+      // 新用户消息接替当前回合：快照此刻流式汇报为上一回合答复 + 复位 live 文本（新回合从零开始）。
+      // classifyEvent 与 turns.ts 的回合划分同源（含 type=clarify agent=User 的答复回显），保证
+      // replyStash 键与 groupEventsToTurns 查找键一致。答复回显时回合为 awaiting_clarify 非接管态，
+      // 快照为空串无害。
+      if (classifyEvent(ev) === 'user_message') {
+        replyStash.value = { ...replyStash.value, [ev.timestamp]: liveStreaming.value }
       }
       // 工具调用/新指令落地 = 上一段流式输出已终结：清 live 缓冲，防旧正文在新回合
       // 重复渲染（任务 140 问题⑤ web 侧双保险，后端已在 hook 恢复时清 StreamingText）。
@@ -396,6 +413,7 @@ async function handleNewSession() {
   stream.close()
   panel.stopPanelTimer()
   events.value = []
+  replyStash.value = {}
   activeSession.value = null
   agents.value = []
   metrics.value = null
@@ -510,6 +528,7 @@ function fmtDateTime(iso: string) {
         :output-tokens="tokenUsage.output"
         :live-streaming="liveStreaming"
         :live-thinking="liveThinking"
+        :prior-replies="replyStash"
         @submit="handleSubmit"
         @cancel="handleCancel"
         @stop="handleStop"

@@ -116,6 +116,15 @@ type domainSlot struct {
 	childReported bool             // 当前任务的父未决计数已递减（destroySlot 兜底防双递减）
 	cancelTask context.CancelFunc  // 当前任务 ctx cancel
 	taskCtx    context.Context     // 当前任务 ctx（挂起判定用）
+	// cancelPending: 取消/暂停指令到达时任务 ctx 尚未绑定（派发 Register 与 runDomainTask
+	// 建 ctx 之间的窗口），任务入口见标记即刻收口（暂停→park / 硬取消→销毁）。
+	cancelPending bool
+
+	// pendingTask: 任务尚未执行即 park 时暂存的任务文本/墙钟/图片，resume 时原样续跑
+	// （该路径无 history，"继续"会丢失原任务）。
+	pendingTask      string
+	pendingWallClock time.Duration
+	pendingImages    []tool.ResultImage
 	ttlArmed   bool                // TTL 是否已武装（用户消息后）
 	ttlTimer   *time.Timer         // 加权倒计时（武装后非 nil）
 	ttlDeadline time.Time          // 武装时的到期时刻（IdleLeft 计算用）
@@ -231,6 +240,21 @@ func (d *Dispatcher) hotEnabled() bool {
 	return d.hotCfg.Enabled && d.pool != nil
 }
 
+// slotPaused 报告热驻槽是否已进入暂停落地态（任务收尾完成、park 等唤醒）：
+// pause_agent 工具据此确认暂停已生效（随后 resume_agent 才能稳定命中）。
+func (d *Dispatcher) slotPaused(sessionID, id string) bool {
+	if !d.hotEnabled() {
+		return false
+	}
+	s := d.pool.slot(sessionID, id)
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state == slotRunning && s.suspended
+}
+
 // slot 按会话+ID 取热驻槽。
 func (p *domainPool) slot(sessionID, id string) *domainSlot {
 	p.mu.Lock()
@@ -339,9 +363,29 @@ func (d *Dispatcher) enterIdle(s *domainSlot, summary string) {
 	log.Printf("[subagent] IDLE: sub=%s domain=%s reuse=%d (hot-resident)", s.id, s.domain, s.reuseCount)
 }
 
-// destroyFnLocked 返回发送 opDestroy 的销毁闭包（须持 s.mu 调用）。
+// destroyFnLocked 返回槽的取消闭包（须持 s.mu 调用），供树 SetCancel 绑定（Register 首绑、
+// Idle 换绑）。语义随槽状态分流：
+//   - Idle：投递 opDestroy 销毁（TTL/硬取消空闲槽）；
+//   - Running 且任务 ctx 已绑定：直接 cancel 任务 ctx——supervisor 正在跑任务，opDestroy
+//     只能排队等任务自然结束，既停不住执行又会在暂停落地后把槽销毁（2026-09-10 实证：
+//     pause_agent 早于任务 ctx 绑定到达时，cancel 打空后 opDestroy 残留，park 即被销毁）；
+//   - Running 且任务 ctx 未绑定（派发 Register 与 runDomainTask 建 ctx 之间的窗口）：
+//     登记 cancelPending，任务入口即刻收口。
 func (s *domainSlot) destroyFnLocked() context.CancelFunc {
 	return func() {
+		s.mu.Lock()
+		if s.state == slotRunning {
+			if s.cancelTask != nil {
+				cancel := s.cancelTask
+				s.mu.Unlock()
+				cancel()
+				return
+			}
+			s.cancelPending = true
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
 		select {
 		case s.ops <- domainOp{kind: opDestroy}:
 		default:
@@ -484,6 +528,14 @@ func (d *Dispatcher) runDomainSupervisor(s *domainSlot, firstTask string, firstW
 			// 挂起唤醒："继续"续跑当前任务（history 在内存，budget 由 Assemble 独立轮估）。
 			// 恢复轮不重复带图（不持久化语义）：历史里首条 user 消息已带过本任务的图。
 			task, wc, imgs = op.resumeMsg, s.resumeWallClock(), nil
+			// 任务未执行即 park（暂停早于任务启动）：原任务文本从未进入 history，
+			// 用暂存的任务原文续跑而非"继续"。
+			s.mu.Lock()
+			if s.pendingTask != "" {
+				task, wc, imgs = s.pendingTask, s.pendingWallClock, s.pendingImages
+				s.pendingTask, s.pendingWallClock, s.pendingImages = "", 0, nil
+			}
+			s.mu.Unlock()
 			// 挂起前树已 Pause，恢复置回 Running。
 			s.mu.Lock()
 			s.state = slotRunning
@@ -562,6 +614,8 @@ func (d *Dispatcher) destroySlot(s *domainSlot, reason string) {
 			t.Finish(s.id, "idle expired (TTL)", nil)
 		}
 	}
+	// 槽终结即回收实例级模型覆盖（暂停 park 不销毁槽，覆盖跨 resume 存活）。
+	d.clearAgentModel(s.id)
 	log.Printf("[subagent] SLOT DESTROYED: sub=%s domain=%s reason=%s reuse=%d", s.id, s.domain, reason, s.reuseCount)
 }
 
@@ -626,6 +680,35 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 		if t := d.treeFn(s.sessionID); t != nil {
 			t.SetCancel(s.id, cancelTask)
 		}
+	}
+
+	// 早到指令收口：Register 与建 ctx 之间到达的取消/暂停（destroyFn 无 ctx 可 cancel，
+	// 登记 cancelPending）——任务不进入执行，按暂停标记/硬取消分流。
+	s.mu.Lock()
+	pending := s.cancelPending
+	s.cancelPending = false
+	s.mu.Unlock()
+	if pending {
+		if d.isPauseRequested(s.id) {
+			d.ClearPauseNode(s.id)
+			// 任务尚未执行：暂存任务文本，resume 时原样续跑（无 history，"继续"会丢任务）。
+			s.mu.Lock()
+			s.suspended = true
+			s.pendingTask = task
+			s.pendingWallClock = wallClock
+			s.pendingImages = images
+			s.mu.Unlock()
+			if d.treeFn != nil && s.sessionID != "" {
+				if t := d.treeFn(s.sessionID); t != nil {
+					t.Pause(s.id, "manual pause")
+				}
+			}
+			d.activity.Delete(s.id)
+			log.Printf("[subagent] MANUAL-PAUSED: sub=%s domain=%s (pre-execution, awaiting resume)", s.id, s.domain)
+			return domainTaskSuspended
+		}
+		log.Printf("[subagent] CANCELLED: sub=%s domain=%s (pre-execution)", s.id, s.domain)
+		return domainTaskDestroyed
 	}
 
 	// 会话级 logger 挂 ctx（同 runSubAgent）。
@@ -867,9 +950,15 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 		roleDef.SystemPrompt = roleDef.SystemPrompt + "\n\n" + header
 	}
 
-	provider, err := d.models.GetBladesProvider(context.Background(), "domain")
+	// 首次解析仅作建槽期 fail-fast 与初值；WithProviderFunc 使槽存活期内每次 LLM
+	// 调用按当前绑定重解析——否则 set_role_model/TUI 切换对热驻槽永久不可见。
+	// 解析走实例级（agent 覆盖 > 角色绑定）：set_agent_model 对该槽换档后下次调用即生效。
+	provider, err := d.providerForAgent(context.Background(), "domain", s.id)
 	if err != nil {
 		return nil, fmt.Errorf("get model: %w", err)
+	}
+	providerFn := func(ctx context.Context) (agent.ModelProvider, error) {
+		return d.providerForAgent(ctx, "domain", s.id)
 	}
 	mem := d.memory
 	if mem == nil {
@@ -882,6 +971,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 		wd = d.subAgentWorkDir()
 	}
 	sub := agent.NewReActAgent(s.id, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, s.id, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
+		WithProviderFunc(providerFn).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor("domain")).

@@ -16,8 +16,6 @@ type RoleDefinition struct {
 	Name string `json:"name" yaml:"name"`
 	// Type 角色类型，决定实例化路径与生命周期管理策略。
 	Type enums.RoleType `json:"type" yaml:"type"`
-	// Lifecycle 生命周期策略，控制角色实例的存活时长与回收时机。
-	Lifecycle enums.RoleLifecycle `json:"lifecycle" yaml:"lifecycle"`
 	// Description 角色职责描述，供 LLM 动态创建角色时参考。
 	Description string `json:"description" yaml:"description"`
 	// SystemPrompt 系统提示词，执行时注入 Agent 上下文以约束行为。
@@ -56,6 +54,11 @@ type RoleSandbox struct {
 // AgentModelConfig Agent 模型配置：单个角色所需的 LLM 接入参数。
 // 用于构造 OpenAI 兼容 SDK 客户端，provider + model 共同决定调用目标。
 type AgentModelConfig struct {
+	// ModelRef 模型注册表引用（config/models.json models[].id）。非空时
+	// 连接参数（provider/model/api_key/base_url）由 ModelFactory 在解析期从
+	// 注册表合并进来（热更新跟随），本结构其余字段（temperature/max_tokens/thinking）
+	// 仍为角色本有行为参数。空 = 使用下方内联连接参数。
+	ModelRef string `json:"model_ref,omitempty" yaml:"model_ref,omitempty"`
 	// Provider 模型供应方（如 openai / anthropic / local）。
 	Provider string `json:"provider" yaml:"provider"`
 	// Model 具体模型名（如 gpt-4o-mini / claude-3-sonnet）。

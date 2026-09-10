@@ -38,6 +38,9 @@ export interface Turn {
   /** 提问附带的长上下文（任务 140，kind=clarify_detail 事件）：展示在问题之前 */
   clarifyDetails: SessionEvent[]
   finalAnswer?: SessionEvent
+  /** 合成最终答复：运行中会话的新用户消息接替当前回合时，收编接替时刻的流式汇报文本
+   *  （流式文本只存于 SSE live 帧，不落事件；不收编则上一回合的答复内容丢失）。 */
+  finalText?: string
   status: 'running' | 'completed' | 'error' | 'awaiting_clarify'
   startedAt: string
   endedAt?: string
@@ -167,8 +170,12 @@ function tokenOut(ev: SessionEvent): number {
  *   tool_call → 新建工具组 + tool 步骤；tool_exec → 匹配同名 pending 组填 result（不新增步骤）；
  *   error → errors；system "会话完成"/"执行失败" → finalAnswer + 改变 status。
  * - 工具类事件判断优先于 error，避免失败的工具调用被误归 errors 而永久 pending。
+ * - 运行中会话（MetaAgent 单循环常驻）的新用户消息接替当前回合：上一回合标 completed，
+ *   并从 priorReplies 收编接替时刻的流式文本作 finalText——否则上一回合永远"处理中"
+ *   且继续渲染全局 live 帧（与当前回合重复展示同一份流式汇报，2026-09-10 实证）。
+ *   priorReplies 由 SSE 层在 user_message 事件到达时快照 liveStreaming 构建（key=事件时间戳）。
  */
-export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
+export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record<string, string>): Turn[] {
   const turns: Turn[] = []
   let current: Turn | null = null
 
@@ -194,6 +201,12 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
 
     // 启动 / 用户消息 → 新回合
     if (category === 'user_message') {
+      // 接替仍在运行的上一回合（awaiting_clarify 例外：澄清卡依赖该状态展示，保持原样）。
+      if (current && current.status === 'running') {
+        current.status = 'completed'
+        current.endedAt = ev.timestamp
+        current.finalText = priorReplies?.[ev.timestamp] || ''
+      }
       openTurn(ev)
       continue
     }

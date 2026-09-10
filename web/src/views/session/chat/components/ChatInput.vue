@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, reactive, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { WireImage } from '@/types'
 import { useWorkDir } from '@/composables/useWorkDir'
+import { useModelSelection } from '@/composables/useModelSelection'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 
 const props = defineProps<{
@@ -126,6 +127,85 @@ const fileRef = ref<HTMLInputElement>()
 // 与首页 WorkDirPicker 同源，改动实时同步。
 const { workDir } = useWorkDir()
 
+// ── 模型选择（对话栏右下弹层）：角色 → 模型 → 思考强度；切换/新增落 config/models.json ──
+const {
+  catalog, loading: modelsLoading,
+  selectedRole, selectedThinking,
+  ensureLoaded, doSwitch, doAdd,
+} = useModelSelection()
+
+const modelPopoverVisible = ref(false)
+const switching = ref(false)
+// 选中的目标模型条目 ID（切换动作的提交值；打开弹层/切角色时预选当前生效值）。
+const selectedModelId = ref('')
+
+const currentRoleStatus = computed(
+  () => catalog.value?.roles.find((r) => r.role_id === selectedRole.value) ?? null,
+)
+
+// 切换候选：selectable_roles 白名单按目标角色过滤（缺省=全员可用）。
+const switchableModels = computed(() =>
+  (catalog.value?.models ?? []).filter(
+    (m) => !m.selectable_roles || m.selectable_roles.includes(selectedRole.value),
+  ),
+)
+
+watch(modelPopoverVisible, (v) => {
+  if (v) ensureLoaded()
+})
+
+// 切角色时把模型/思考档预置为该角色当前生效值（思考档空=跟随角色默认）。
+watch(selectedRole, () => {
+  const role = currentRoleStatus.value
+  selectedModelId.value = role?.model_id ?? ''
+  selectedThinking.value = role?.bound ? role.thinking || '' : ''
+})
+
+async function onSwitchModel() {
+  if (!selectedModelId.value) return
+  switching.value = true
+  try {
+    const resp = await doSwitch(selectedModelId.value)
+    ElMessage.success(`已切换为 ${resp.model}（domain/叶子下次派发、meta 下一会话生效）`)
+    modelPopoverVisible.value = false
+  } catch (e) {
+    ElMessage.error(`切换失败: ${e instanceof Error ? e.message : String(e)}`)
+  } finally {
+    switching.value = false
+  }
+}
+
+// 新增模型对话框（4 字段落盘 models.json，免重启）。
+const addDialogVisible = ref(false)
+const adding = ref(false)
+const addForm = reactive({ provider: 'anthropic', model: '', api_key: '', base_url: '' })
+
+async function onAddModel() {
+  if (!addForm.provider.trim() || !addForm.model.trim()) {
+    ElMessage.warning('provider 与 model 必填')
+    return
+  }
+  adding.value = true
+  try {
+    const resp = await doAdd({
+      provider: addForm.provider.trim(),
+      model: addForm.model.trim(),
+      api_key: addForm.api_key.trim(),
+      base_url: addForm.base_url.trim(),
+    })
+    ElMessage.success(`已新增 ${resp.id} 到 models.json`)
+    addDialogVisible.value = false
+    selectedModelId.value = resp.id
+    addForm.model = ''
+    addForm.api_key = ''
+    addForm.base_url = ''
+  } catch (e) {
+    ElMessage.error(`新增失败: ${e instanceof Error ? e.message : String(e)}`)
+  } finally {
+    adding.value = false
+  }
+}
+
 function handleSubmit() {
   if (!canSend.value) return
   emit('submit', content.value.trim(), pendingImages.value.slice())
@@ -195,6 +275,49 @@ function onKeydown(e: KeyboardEvent) {
                   @paste="onPaste" />
       </div>
       <div class="flex flex-col gap-1">
+        <!-- 模型选择弹层（对话栏右下）：角色 → 模型 → 思考强度 -->
+        <el-popover v-model:visible="modelPopoverVisible" placement="top-end" :width="380" trigger="click">
+          <template #reference>
+            <el-button plain size="small"
+                       class="!bg-transparent !border-line !text-ink-2 hover:!text-white max-w-44"
+                       title="选择模型（角色 / 模型 / 思考强度，可新增模型）">
+              <el-icon><Coin /></el-icon>
+              <span class="ml-1 truncate text-xs">{{ currentRoleStatus?.model || '模型' }}</span>
+            </el-button>
+          </template>
+          <div class="space-y-2 text-xs">
+            <div>
+              <div class="mb-1 text-ink-2">角色</div>
+              <el-select v-model="selectedRole" size="small" class="w-full"
+                         placeholder="选择角色" :loading="modelsLoading">
+                <el-option v-for="r in catalog?.roles || []" :key="r.role_id" :value="r.role_id"
+                           :label="`${r.role_id}（${r.provider}/${r.model}）`" />
+              </el-select>
+            </div>
+            <div>
+              <div class="mb-1 text-ink-2">模型</div>
+              <el-select v-model="selectedModelId" size="small" class="w-full" filterable
+                         placeholder="选择模型" :loading="modelsLoading">
+                <el-option v-for="m in switchableModels" :key="m.id" :value="m.id"
+                           :label="`${m.id} · ${m.provider}/${m.model}`" />
+              </el-select>
+            </div>
+            <div>
+              <div class="mb-1 text-ink-2">思考强度</div>
+              <el-select v-model="selectedThinking" size="small" class="w-full">
+                <el-option value="" label="跟随角色默认" />
+                <el-option v-for="t in ['off', 'low', 'medium', 'high']" :key="t" :value="t" :label="t" />
+              </el-select>
+            </div>
+            <div class="flex items-center justify-between pt-1">
+              <el-button link type="primary" size="small" @click="addDialogVisible = true">＋ 新增模型</el-button>
+              <el-button type="primary" size="small" :loading="switching"
+                         :disabled="!selectedModelId" @click="onSwitchModel">
+                切换
+              </el-button>
+            </div>
+          </div>
+        </el-popover>
         <el-button :disabled="pendingImages.length >= 4" plain size="small"
                    class="!bg-transparent !border-line !text-ink-2 hover:!text-white"
                    title="添加图片（或直接粘贴截图）"
@@ -212,6 +335,35 @@ function onKeydown(e: KeyboardEvent) {
       </div>
       <input ref="fileRef" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple class="hidden" @change="onFileChange" />
     </div>
+
+    <!-- 新增模型对话框：4 字段落盘 config/models.json，免重启生效 -->
+    <el-dialog v-model="addDialogVisible" title="新增模型（写入 config/models.json，免重启）" width="460" append-to-body>
+      <div class="space-y-3 text-xs">
+        <div>
+          <div class="mb-1 text-ink-2">provider *</div>
+          <el-select v-model="addForm.provider" class="w-full" filterable allow-create default-first-option
+                     placeholder="anthropic / openai-chat / openai-responses / ollama">
+            <el-option v-for="p in ['anthropic', 'openai-chat', 'openai-responses', 'ollama']" :key="p" :value="p" :label="p" />
+          </el-select>
+        </div>
+        <div>
+          <div class="mb-1 text-ink-2">model *</div>
+          <el-input v-model="addForm.model" placeholder="如 glm-5.3-flash" />
+        </div>
+        <div>
+          <div class="mb-1 text-ink-2">api_key</div>
+          <el-input v-model="addForm.api_key" show-password placeholder="密钥或 ${ENV} 引用（可空）" />
+        </div>
+        <div>
+          <div class="mb-1 text-ink-2">base_url</div>
+          <el-input v-model="addForm.base_url" placeholder="自定义端点（可空，支持 ${ENV}）" />
+        </div>
+      </div>
+      <template #footer>
+        <el-button size="small" @click="addDialogVisible = false">取消</el-button>
+        <el-button type="primary" size="small" :loading="adding" @click="onAddModel">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 

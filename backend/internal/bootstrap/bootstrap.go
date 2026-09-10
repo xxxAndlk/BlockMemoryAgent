@@ -182,21 +182,21 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第十步：创建模型工厂并预热、校验连通性。
 	modelFactory := model.NewModelFactory(roleCfg)
-	// 注入可切换模型预设（roles.yaml model_presets[]）与覆写文件路径，
-	// 并应用上次运行期动态切换的持久化结果（model_overrides.yaml，role → preset_id）。
-	// 必须先于 WarmUp/VerifyConnectivity：启动预热与连通性探测针对覆写后的模型。
-	modelOverridesPath := filepath.Join(filepath.Dir(paths.RolePath), "model_overrides.yaml")
-	modelFactory.SetModelPresets(roleCfg.ModelPresets, modelOverridesPath)
-	overridesFile, err := pkgconfig.LoadModelOverrides(modelOverridesPath)
+	// 注入模型注册表（config/models.json，与 roles.yaml 同目录）：连接参数来源 +
+	// 角色绑定（上次运行期切换的持久化结果）+ mtime 热更新。
+	// 必须先于 WarmUp/VerifyConnectivity：启动预热与连通性探测针对绑定后的模型。
+	modelsJSONPath := filepath.Join(filepath.Dir(paths.RolePath), "models.json")
+	registry, err := pkgconfig.NewRegistryStore(modelsJSONPath)
 	if err != nil {
-		// 覆写属可抛弃状态：文件损坏只警告不阻断启动，删文件即恢复 roles.yaml 原配置。
-		log.Printf("[bootstrap] [WARN] model overrides 文件损坏，忽略全部覆写: %v", err)
-	} else {
-		for _, skip := range modelFactory.ApplyStartupOverrides(overridesFile) {
-			log.Printf("[bootstrap] [WARN] 模型覆写跳过: %s", skip)
-		}
+		// 注册表损坏会令 model_ref 角色不可解析，属严格启动范畴：fail-fast。
+		closeStores(pgStore, redisStore)
+		return nil, fmt.Errorf("load models registry %s: %w", modelsJSONPath, err)
 	}
-	// 启动即打印轻量模型解析结果（来源 direct / fallback-domain / override），排查配置加载漂移：
+	modelFactory.SetRegistry(registry)
+	for _, warn := range registryStartupWarnings(registry) {
+		log.Printf("[bootstrap] [WARN] 模型绑定跳过: %s", warn)
+	}
+	// 启动即打印轻量模型解析结果（来源 direct / fallback-domain / binding），排查配置加载漂移：
 	// 2026-08-10 事故 roles.yaml 配 deepseek-v4-flash 但运行时 provider=glm-5.2（domain 回退），
 	// 会话期生效配置与磁盘现值不一致（配置晚于会话加载 / CWD 路径漂移），启动日志当场暴露。
 	if lmCfg, lmSource := modelFactory.LightweightResolution(); lmSource == "direct" {
@@ -412,6 +412,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools 字段），
 	// 其他角色看不到它们。Registry 持 closure 引用，Execute 直接读写 dynamic 层。
 	roleRegistry.RegisterTools(toolRegistry)
+	// 注册 list_models / set_role_model 工具：MetaAgent 按模型条目描述为下层角色
+	// （domain + 固定角色）换档；写路径委托 ModelFactory.SwitchModel（校验/探活/持久化）。
+	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools + roles.yaml）。
+	role.RegisterModelTools(toolRegistry, modelFactory)
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
@@ -959,6 +963,18 @@ func newHistorySummarizer(f *model.ModelFactory) memory.HistorySummarizer {
 		}
 		return f.CallLightweightWithRetry(ctx, prompt)
 	}
+}
+
+// registryStartupWarnings 检查注册表绑定引用的模型条目是否存在，
+// 缺失的返回警告列表（运行期 resolveConfig 对这些绑定 fail-open 回落角色配置）。
+func registryStartupWarnings(reg *pkgconfig.RegistryStore) []string {
+	var warns []string
+	for roleID, b := range reg.Bindings() {
+		if _, ok := reg.ModelByID(b.ModelID); !ok {
+			warns = append(warns, fmt.Sprintf("%s (model %q 不存在)", roleID, b.ModelID))
+		}
+	}
+	return warns
 }
 
 // blockMemorySaver 将 store.PostgresStore 适配为子 Agent 调度器期望的

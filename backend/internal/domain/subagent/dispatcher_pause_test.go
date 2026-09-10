@@ -156,7 +156,7 @@ func TestRunSubAgent_AssistantLimitReachedPartialReturn(t *testing.T) {
 }
 
 // TestResumePaused_ConcludesAfterResumeCap 验证 Paused domain 的续跑次数上限（maxPausedResumes=1）：
-// 首次 ResumePaused 正常续跑（mock 仍触限 -> re-pause，父 pending 不减、mailbox 不 notify）；
+// 首次 ResumePaused 正常续跑（mock 仍触限 -> re-pause，父 pending 不减、notify 一条"重新暂停"）；
 // 第二次 ResumePaused 触顶 -> 强制收口：tree.Finish Done + 父 mailbox notify（含"续跑上限"）+ 父 pending 减。
 // 绑定点在续跑层：续跑重置 fresh budget，无上限则"触限-暂停-续跑"环路永不收敛（v10 实证研磨 30 分钟）。
 func TestResumePaused_ConcludesAfterResumeCap(t *testing.T) {
@@ -194,8 +194,10 @@ func TestResumePaused_ConcludesAfterResumeCap(t *testing.T) {
 	if got := d.PendingChildren("s1"); got != 1 {
 		t.Fatalf("pending after re-pause = %d, want 1", got)
 	}
-	if drains := mb.Drain("s1"); len(drains) != 0 {
-		t.Fatalf("mailbox should stay empty on re-pause, got %d msgs", len(drains))
+	// 再触限必须通知父（否则父在等续跑期间该节点静默占着未决计数）。
+	reDrains := mb.Drain("s1")
+	if len(reDrains) != 1 || !strings.Contains(reDrains[0].Body, "重新暂停") {
+		t.Fatalf("re-pause should notify parent once, got %+v", reDrains)
 	}
 
 	// 第二次续跑：触顶 -> 强制收口部分返回。
@@ -215,7 +217,7 @@ func TestResumePaused_ConcludesAfterResumeCap(t *testing.T) {
 	}
 	drains := mb.Drain("s1")
 	if len(drains) != 1 {
-		t.Fatalf("parent mailbox should have exactly 1 conclude notify, got %d", len(drains))
+		t.Fatalf("parent mailbox should have exactly 1 conclude notify (re-pause one already drained), got %d", len(drains))
 	}
 	if !strings.Contains(drains[0].Body, "续跑上限") {
 		t.Fatalf("conclude notify should mention resume cap, got %q", drains[0].Body)
@@ -239,6 +241,13 @@ func TestDispatcher_HasPausedChild(t *testing.T) {
 	if d.HasPausedChild(parentID) {
 		t.Error("HasPausedChild should be false after child finishes")
 	}
+	// 暂停的叶子不算：叶子暂停是父（domain）的自主中转态，不得触发会话 PausedOnChild
+	// （否则 meta 直派叶子被暂停时误要求用户"继续"）。
+	tr.Register(orchestrator.Node{ID: "s1/code_assistant-1", ParentID: parentID, Role: "code_assistant", Status: orchestrator.StatusRunning, Started: time.Now()})
+	tr.Pause("s1/code_assistant-1", "manual pause")
+	if d.HasPausedChild(parentID) {
+		t.Error("HasPausedChild should ignore paused leaf (non-domain) children")
+	}
 }
 
 // TestDispatcher_HasPausedChildNilTree 验证 treeFn 为 nil 时不 panic 且返回 false。
@@ -251,7 +260,7 @@ func TestDispatcher_HasPausedChildNilTree(t *testing.T) {
 
 // TestRunSubAgent_ManualPauseRoutesToPausedTree 验证手动单支暂停（TODO 第9⑥/10③ 审计面）：
 // MarkPauseNode + StopRunning 触发 domain ctx 取消，isPauseRequested 命中走 Pause 收尾——
-// 树节点 Paused（非 Failed/Cancelled）、父 pending 不减、父 mailbox 不 notify、
+// 树节点 Paused（非 Failed/Cancelled）、父 pending 不减、父收一条"已暂停"处置通知、
 // 节点暂停标记收尾即清（防残留误分流后续取消）。
 func TestRunSubAgent_ManualPauseRoutesToPausedTree(t *testing.T) {
 	release := make(chan struct{})
@@ -293,9 +302,10 @@ func TestRunSubAgent_ManualPauseRoutesToPausedTree(t *testing.T) {
 	if got := d.PendingChildren("s1"); got != 1 {
 		t.Errorf("pending after manual pause = %d, want 1", got)
 	}
-	// 父 mailbox 不 notify。
-	if drains := mb.Drain("s1"); len(drains) != 0 {
-		t.Errorf("parent mailbox should be empty on manual pause, got %d msgs", len(drains))
+	// 手动暂停通知父处置（domain 与叶子同路径：父须当轮 resume_agent 或 cancel_agent）。
+	drains := mb.Drain("s1")
+	if len(drains) != 1 || !strings.Contains(drains[0].Subject, "已暂停") {
+		t.Errorf("manual pause should notify parent once with pause subject, got %+v", drains)
 	}
 }
 

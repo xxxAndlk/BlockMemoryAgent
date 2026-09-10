@@ -3,57 +3,17 @@ package config
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/prompts"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"gopkg.in/yaml.v3"
 )
 
-// leafCommonToken 叶子助手公共纪律段的占位符，须在提示词中独立成行。
-const leafCommonToken = "{{LEAF_COMMON_DISCIPLINE}}"
-
-// leafCommonBlock 五个固定叶子角色（code/ui/prompt_reviewer/test/doc_assistant）
-// 共用的【执行纪律】+【终止纪律】+【共享记忆】段单一来源。YAML 块标量无法引用
-// 锚点拼接片段，故在 LoadRoleConfig 里按占位符行展开（缩进随占位符行对齐），
-// 防止五处复制后各自漂移。修改本段即对五个叶子同时生效。
-const leafCommonBlock = `- task 应已含目标文件路径 + 依赖签名 + 关键行段：直接 WriteFile 实现，不 ListDir 探索项目结构。
-- 规格缺关键信息时 SearchInFiles 单次定位，不读全文；ReadFile 仅在 SearchInFiles 也无结果时使用。
-- 产出落盘后立即 RunCommand 自检：代码文件语法检查（JS: node -c / Go: go build / Python: py_compile）；非代码产出按任务验收口径核对。报错先修再继续。
-- 【终止纪律】产出落盘 + 一次自检通过 = 任务完成，立即输出最终答复。其他文件（含契约里列出的兄弟文件）的跨文件集成核对由上级统一负责，你无需重读。
-
-【共享记忆】
-- task 顶部出现【共享记忆】前缀时，规格/接口签名/文件清单已注入：直接实现，注入内容无需再读文件核对。
-- 已读内容在你的历史消息中，向前翻看即可；以相同参数连续重读同一文件区间会触发循环守卫终止任务。`
-
-// expandLeafCommonDiscipline 展开提示词中的叶子公共纪律段占位符。
-// 占位符行保持其原有缩进逐行对齐展开；无占位符时原样返回。
-func expandLeafCommonDiscipline(prompt string) string {
-	if !strings.Contains(prompt, leafCommonToken) {
-		return prompt
-	}
-	var out []string
-	for _, line := range strings.Split(prompt, "\n") {
-		if strings.TrimSpace(line) != leafCommonToken {
-			out = append(out, line)
-			continue
-		}
-		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-		for _, blockLine := range strings.Split(leafCommonBlock, "\n") {
-			if blockLine == "" {
-				out = append(out, "")
-			} else {
-				out = append(out, indent+blockLine)
-			}
-		}
-	}
-	return strings.Join(out, "\n")
-}
-
 // RoleConfigFile 角色配置文件根结构。
 //
 // 职责:
-//   - 作为 config/roles.yaml 在内存中的表示，承载 MetaAgent / DomainAgent / 固定角色 / 动态模板四类配置。
+//   - 作为 config/roles.yaml 在内存中的表示，承载 MetaAgent / DomainAgent / 固定角色三类配置。
 //   - 提供按 ID/类型查询角色、以及调用权限矩阵(CanCall)等方法。
 //
 // 副作用: 无; 仅作为数据载体。
@@ -69,23 +29,18 @@ type RoleConfigFile struct {
 	Embed types.EmbedConfig `yaml:"embed"`
 	// FixedRoles 固定角色定义列表，对应 fixed_roles 配置项。
 	FixedRoles []types.RoleDefinition `yaml:"fixed_roles"`
-	// DynamicTemplates 动态角色生成模板，由 LLM 在运行时按需实例化为临时助手。
-	DynamicTemplates []DynamicRoleTemplate `yaml:"dynamic_templates"`
-	// ModelPresets 可切换模型预设清单，供运行时动态切换角色模型（TUI /model、
-	// Web settings 页）选择；切换结果持久化到 model_overrides.yaml（role → preset_id）。
-	ModelPresets []types.ModelPreset `yaml:"model_presets"`
 }
 
 // MetaAgentConfig MetaAgent 专属配置。
 //
 // 字段:
 //   - ModelConfig:     模型提供商/密钥/温度等。
-//   - SystemPrompt:    系统提示词。
+//   - SystemPrompt:    系统提示词（LoadRoleConfig 从 pkg/prompts 内置常量填充，YAML 不承载）。
 //   - Tools:           工具白名单覆盖；为空时用内置默认（call_sub_agent 等编排工具）。
 //     基准单 Agent 模式用它去掉 call_sub_agent、放开执行类工具。
 type MetaAgentConfig struct {
 	ModelConfig  types.AgentModelConfig `yaml:"model_config"`  // 模型配置(提供商/密钥/温度等)
-	SystemPrompt string                 `yaml:"system_prompt"` // MetaAgent 系统提示词
+	SystemPrompt string                 `yaml:"system_prompt"` // MetaAgent 系统提示词（内置填充，YAML 值被覆盖）
 	Tools        []string               `yaml:"tools"`         // 工具白名单覆盖（空=内置默认编排工具集）
 }
 
@@ -94,23 +49,8 @@ type MetaAgentConfig struct {
 // 设计意图: 所有 Domain/SubDomain 共享同一份模型配置，简化部署与调参。
 type DomainAgentConfig struct {
 	ModelConfig  types.AgentModelConfig `yaml:"model_config"`  // 共享模型配置
-	SystemPrompt string                 `yaml:"system_prompt"` // DomainAgent 系统提示词（含 skim/WriteSharedMemory/拆分纪律）
+	SystemPrompt string                 `yaml:"system_prompt"` // DomainAgent 系统提示词（内置填充，YAML 值被覆盖）
 	Skills       []string               `yaml:"skills"`        // 固定持有技能（按 Name 或 SkillID 匹配池；空=不持有）
-}
-
-// DynamicRoleTemplate 动态角色模板。
-//
-// 由 LLM 在运行时根据当前任务填充 PromptTemplate 实例化出临时角色
-// (类型为 domain 或 assistant)，并通过 MaxLifetime 控制其存活时长。
-// 可独立配置 ModelConfig；未配置时动态创建的角色回退到 DomainAgent 模型。
-type DynamicRoleTemplate struct {
-	ID             string                 `yaml:"id"`              // 模板唯一标识
-	Name           string                 `yaml:"name"`            // 模板名称(展示用)
-	Type           string                 `yaml:"type"`            // "domain" or "assistant"
-	PromptTemplate string                 `yaml:"prompt_template"` // 让大模型填充的模板
-	Skills         []string               `yaml:"skills"`          // 模板固定持有技能（按 Name 或 SkillID 匹配池，未知项跳过）
-	MaxLifetime    int                    `yaml:"max_lifetime"`    // 最大存活时间（秒）
-	ModelConfig    types.AgentModelConfig `yaml:"model_config"`    // 可选：动态角色专用模型配置
 }
 
 // LoadRoleConfig 从指定路径加载角色配置文件。
@@ -146,9 +86,23 @@ func LoadRoleConfig(path string) (*RoleConfigFile, error) {
 	// 解析配置中的环境变量引用(如 ${OPENAI_API_KEY})。
 	cfg.resolveEnvVars()
 
-	// 叶子公共纪律段展开：固定角色提示词里的占位符行替换为共享段（防五叶子漂移）。
+	// 提示词不来自 YAML：全部角色 SystemPrompt/PromptTemplate 由内置提示词包
+	// （pkg/prompts，编译进二进制，配置目录不可见）填充；YAML 中残留的
+	// system_prompt/prompt_template 键会被覆盖忽略。未知角色 ID 报 strict 错误。
+	cfg.MetaAgent.SystemPrompt, err = prompts.Get("meta")
+	if err != nil {
+		return nil, fmt.Errorf("fill meta prompt: %w", err)
+	}
+	cfg.DomainAgent.SystemPrompt, err = prompts.Get("domain")
+	if err != nil {
+		return nil, fmt.Errorf("fill domain prompt: %w", err)
+	}
 	for i := range cfg.FixedRoles {
-		cfg.FixedRoles[i].SystemPrompt = expandLeafCommonDiscipline(cfg.FixedRoles[i].SystemPrompt)
+		p, err := prompts.Get(cfg.FixedRoles[i].ID)
+		if err != nil {
+			return nil, fmt.Errorf("role %q: %w", cfg.FixedRoles[i].ID, err)
+		}
+		cfg.FixedRoles[i].SystemPrompt = p
 	}
 
 	// Embed 默认值: provider 为空时回退 pseudo，避免嵌入模块因空 provider 崩溃。
@@ -197,33 +151,6 @@ func (c *RoleConfigFile) resolveEnvVars() {
 		c.FixedRoles[i].ModelConfig.APIKey = resolveEnv(c.FixedRoles[i].ModelConfig.APIKey)
 		c.FixedRoles[i].ModelConfig.BaseURL = resolveEnv(c.FixedRoles[i].ModelConfig.BaseURL)
 	}
-	// 动态角色模板: 模型名/密钥与 BaseURL（P3-4）。
-	for i := range c.DynamicTemplates {
-		c.DynamicTemplates[i].ModelConfig.Model = resolveEnv(c.DynamicTemplates[i].ModelConfig.Model)
-		c.DynamicTemplates[i].ModelConfig.APIKey = resolveEnv(c.DynamicTemplates[i].ModelConfig.APIKey)
-		c.DynamicTemplates[i].ModelConfig.BaseURL = resolveEnv(c.DynamicTemplates[i].ModelConfig.BaseURL)
-	}
-	// 模型预设: 模型名/密钥与 BaseURL（运行时动态切换角色模型的候选清单）。
-	for i := range c.ModelPresets {
-		c.ModelPresets[i].Model = resolveEnv(c.ModelPresets[i].Model)
-		c.ModelPresets[i].APIKey = resolveEnv(c.ModelPresets[i].APIKey)
-		c.ModelPresets[i].BaseURL = resolveEnv(c.ModelPresets[i].BaseURL)
-	}
-}
-
-// GetModelPreset 按 ID 查找模型预设。
-//
-// 参数:
-//   - presetID: 预设 ID。
-//
-// 返回: 命中返回预设值（值拷贝），未命中返回 false。
-func (c *RoleConfigFile) GetModelPreset(presetID string) (types.ModelPreset, bool) {
-	for i := range c.ModelPresets {
-		if c.ModelPresets[i].ID == presetID {
-			return c.ModelPresets[i], true
-		}
-	}
-	return types.ModelPreset{}, false
 }
 
 // GetFixedRole 按 ID 查找固定角色定义。
@@ -265,24 +192,6 @@ func (c *RoleConfigFile) GetFixedRolesByType(roleType enums.RoleType) []types.Ro
 	}
 	// 返回新切片，原配置不受影响。
 	return result
-}
-
-// GetDynamicTemplate 按 ID 查找动态角色模板。
-//
-// 参数:
-//   - templateID: 目标模板 ID。
-//
-// 返回: 命中返回模板指针，未命中返回 nil。
-func (c *RoleConfigFile) GetDynamicTemplate(templateID string) *DynamicRoleTemplate {
-	// 线性扫描 DynamicTemplates 切片。
-	for i := range c.DynamicTemplates {
-		// ID 匹配立即返回指针。
-		if c.DynamicTemplates[i].ID == templateID {
-			return &c.DynamicTemplates[i]
-		}
-	}
-	// 未命中返回 nil。
-	return nil
 }
 
 // CanCall 调用权限矩阵: 判断 caller 角色能否调用 callee 角色。

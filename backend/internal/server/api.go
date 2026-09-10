@@ -337,8 +337,10 @@ func (h *APIHandler) StatusHandler(c *gin.Context) {
 	llmProvider := "mock"
 	llmModel := "mock"
 	if h.modelFactory != nil {
-		// 从工厂读当前生效模型（跟随运行时动态切换的 override），而非静态 roleCfg。
-		llmProvider, llmModel, _, _ = h.modelFactory.CurrentModelInfo("meta")
+		// 从工厂读当前生效模型（跟随运行时动态切换的绑定），而非静态 roleCfg。
+		if st, err := h.modelFactory.CurrentModelInfo("meta"); err == nil {
+			llmProvider, llmModel = st.Provider, st.Model
+		}
 	} else if h.roleCfg != nil {
 		llmProvider = h.roleCfg.MetaAgent.ModelConfig.Provider // 供应商
 		llmModel = h.roleCfg.MetaAgent.ModelConfig.Model       // 模型名

@@ -42,6 +42,37 @@ type ModelProviderFactory interface {
 	GetBladesProvider(ctx context.Context, roleID string) (agent.ModelProvider, error)
 }
 
+// AgentModelOverrider 实例级模型覆盖能力（*model.ModelFactory 实现，可选）。
+// 经接口断言使用：测试桩未实现时回落角色级解析，不破坏既有桩。
+type AgentModelOverrider interface {
+	// GetBladesProviderForAgent 解析 agentID 的模型提供者（有实例覆盖用覆盖，否则角色级）。
+	GetBladesProviderForAgent(ctx context.Context, roleID, agentID string) (agent.ModelProvider, error)
+	// ClearAgentModel 回收实例级覆盖（节点终结/取消/槽销毁时调用）。
+	ClearAgentModel(agentID string)
+}
+
+// AgentModelSwitcher 实例级模型覆盖写入能力（*model.ModelFactory 实现，可选）。
+type AgentModelSwitcher interface {
+	// SetAgentModel 为单个 Agent 实例覆盖模型（仅进程内存、不落盘、不影响同角色其他实例）。
+	SetAgentModel(ctx context.Context, agentID, roleID, modelID, thinking string) (types.AgentModelConfig, error)
+}
+
+// providerForAgent 实例级 provider 解析（工厂未实现覆盖能力时回落角色级）。
+func (d *Dispatcher) providerForAgent(ctx context.Context, roleID, agentID string) (agent.ModelProvider, error) {
+	if ov, ok := d.models.(AgentModelOverrider); ok && agentID != "" {
+		return ov.GetBladesProviderForAgent(ctx, roleID, agentID)
+	}
+	return d.models.GetBladesProvider(ctx, roleID)
+}
+
+// clearAgentModel 回收实例级模型覆盖（节点死亡钩子）；工厂未实现覆盖能力时 no-op。
+// 暂停路径不得调用（覆盖要跨 resume 存活）。
+func (d *Dispatcher) clearAgentModel(agentID string) {
+	if ov, ok := d.models.(AgentModelOverrider); ok && agentID != "" {
+		ov.ClearAgentModel(agentID)
+	}
+}
+
 // BlockMemorySearcher 抽象块记忆（block_memory）的语义检索能力，
 // 由 store.PostgresStore 实现；为 nil 时跳过召回，不影响子 Agent 派发。
 type BlockMemorySearcher interface {
@@ -889,6 +920,8 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 			t.Finish(subAgentID, "心跳超时疑似卡死", errors.New("heartbeat timeout"))
 		}
 	}
+	// 被杀节点不再续跑（热驻槽随后走 destroySlot），回收实例级模型覆盖。
+	d.clearAgentModel(subAgentID)
 	// 失败打捞（kill 场景）：从树节点取 domain，以 kill 消息文本作回退摘要写槽位，
 	// 供同域重派带前序摘要；goroutine 若尊重 cancel 会经 runSubAgent 失败路径覆盖为真实摘要。
 	if d.treeFn != nil && meta.sessionID != "" {
@@ -999,6 +1032,11 @@ func (d *Dispatcher) pokeParent(parentID string) {
 // 子 domain 触达 token 上限进入 Paused 后，父 MetaAgent 无限 budget 不会自行暂停，
 // 在 wait loop 中调此方法检测，命中则跳出返回 PausedOnChild，由上层 pauseSession
 // 置会话暂停态，等用户"继续"恢复该 domain（各 Agent 独立上下文）。
+//
+// 仅认 domain（2026-09-10 收窄）：暂停的叶子是父 domain 的自主中转态（解药是 domain
+// 经 pause/resume/换档自行处置），若计入会让 meta 误转会话 PausedOnChild 要求用户
+// "继续"；domain 无 pausedChecker，靠暂停通知邮件驱动处置。
+//
 // parentID 对 MetaAgent 即 sessionID（其 a.name）；含 "/" 时取前段（防御性，子 Agent 派发场景不达）。
 // treeFn 为 nil 时返回 false（测试场景）。
 func (d *Dispatcher) HasPausedChild(parentID string) bool {
@@ -1014,7 +1052,7 @@ func (d *Dispatcher) HasPausedChild(parentID string) bool {
 		return false
 	}
 	for _, n := range t.Snapshot() {
-		if n.ParentID == parentID && n.Status == orchestrator.StatusPaused {
+		if n.ParentID == parentID && n.Status == orchestrator.StatusPaused && n.Role == "domain" {
 			return true
 		}
 	}
@@ -1625,6 +1663,9 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 // 供 MetaAgent/DomainAgent 主动取消失控/不再需要的子 Agent（TODO #25 控制面）。
 func (d *Dispatcher) RegisterControlTool(r *tool.Registry) {
 	r.Register(&cancelAgentTool{dispatcher: d})
+	r.Register(&pauseAgentTool{dispatcher: d})
+	r.Register(&resumeAgentTool{dispatcher: d})
+	r.Register(&setAgentModelTool{dispatcher: d})
 }
 
 // cancelAgentTool 实现 cancel_agent 工具：取消指定子 Agent（树节点 + cancel func + 父计数兜底）。
@@ -1680,6 +1721,8 @@ func (t *cancelAgentTool) Execute(ctx context.Context, args map[string]any) *too
 	if !tr.Cancel(agentID) {
 		return &tool.Result{Tool: "cancel_agent", Error: fmt.Sprintf("agent %s 不存在或已终止，无需取消", agentID)}
 	}
+	// 取消即终结：回收实例级模型覆盖（热驻槽由 destroySlot 兜底，此处覆盖非热驻路径）。
+	d.clearAgentModel(agentID)
 	// 计数兜底（参照 killStuckSubAgent）：子 Agent 若挂起不尊重 ctx，父 PendingChildren
 	// 由此处 doneOnce 递减，父终结保护不会永久阻塞。
 	if metaV, ok := d.subMeta.LoadAndDelete(agentID); ok {
@@ -1700,6 +1743,283 @@ func (t *cancelAgentTool) Execute(ctx context.Context, args map[string]any) *too
 		Success: true,
 		Output:  "已取消 " + agentID,
 	}
+}
+
+// pauseLandingTimeout pause_agent 等待槽进入暂停落地态的上限；超时不报错（收尾可能
+// 仍在保存消息），只提示 metas 稍后重试 resume。
+const pauseLandingTimeout = 15 * time.Second
+
+// pauseAgentTool 实现 pause_agent 工具：暂停运行中的 DomainAgent，上下文完整保留，
+// 可换模型后经 resume_agent 从原任务续跑。语义同 ReactService.PauseAgent——先登记
+// 暂停意图再触发 cancel，cancel 收尾分支（idle_pool runDomainTask / dispatcher
+// runSubAgent）据标记走 Pause 落库而非销毁。
+type pauseAgentTool struct {
+	dispatcher *Dispatcher
+}
+
+// Name 返回工具名称。
+func (t *pauseAgentTool) Name() string { return "pause_agent" }
+
+// Aliases 返回工具别名列表，当前无别名。
+func (t *pauseAgentTool) Aliases() []string { return nil }
+
+// Description 返回 LLM 可见的工具描述。
+func (t *pauseAgentTool) Description() string {
+	return "暂停一个运行中的子 Agent（你直派的 domain，或你直接派的固定角色）：保存当前进度并让出执行" +
+		"（停止烧 token），上下文与已写文件保留，之后可用 set_agent_model/set_role_model 换模型、" +
+		"resume_agent 从原任务继续，或 cancel_agent 放弃。只能暂停自己直派的 Agent（越级会被拒绝）。"
+}
+
+// Execute 执行 pause_agent 工具调用。args 含 agent_id（必填）与 reason（可选，仅回执）。
+func (t *pauseAgentTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
+	d := t.dispatcher
+	agentID, _ := args["agent_id"].(string)
+	reason, _ := args["reason"].(string)
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return &tool.Result{Tool: "pause_agent", Error: "agent_id is required"}
+	}
+	if d.treeFn == nil {
+		return &tool.Result{Tool: "pause_agent", Error: "agent tree not available"}
+	}
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		if i := strings.Index(agentID, "/"); i > 0 {
+			sid = agentID[:i]
+		}
+	}
+	tr := d.treeFn(sid)
+	if tr == nil {
+		return &tool.Result{Tool: "pause_agent", Error: "agent tree not available for session"}
+	}
+	node, ok := tr.Get(agentID)
+	if !ok {
+		return &tool.Result{Tool: "pause_agent", Error: fmt.Sprintf("agent %s 不存在", agentID)}
+	}
+	// 授权：只能暂停自己直派的子 Agent（domain 名下的叶子归 domain 管，越级拒绝）。
+	callerID := agent.AgentIDFromContext(ctx)
+	if callerID != "" && callerID != node.ParentID {
+		return &tool.Result{Tool: "pause_agent", Error: fmt.Sprintf(
+			"agent %s 由 %s 派发，不能由 %s 越级暂停（只能管理自己直派的子 Agent）", agentID, node.ParentID, callerID),
+			Category: tool.ResultCategoryValidationRejected}
+	}
+	if node.Status != orchestrator.StatusRunning {
+		return &tool.Result{Tool: "pause_agent", Error: fmt.Sprintf(
+			"agent %s 状态为 %s，仅运行中可暂停", agentID, node.Status)}
+	}
+	// 先登记暂停意图，再触发 cancel（顺序与 ReactService.PauseAgent 一致）；触发失败回滚标记。
+	d.MarkPauseNode(agentID)
+	if !tr.StopRunning(agentID) {
+		d.ClearPauseNode(agentID)
+		return &tool.Result{Tool: "pause_agent", Error: fmt.Sprintf("agent %s 已不在运行", agentID)}
+	}
+	// 等收尾落地才返回：紧随其后的 resume_agent 才能稳定命中（history 未存完就续跑
+	// 会撞 "no persisted messages"）。热驻槽等 slotPaused，非热驻等树节点转 Paused。
+	hot := d.hotEnabled() && d.pool != nil && d.pool.slot(sid, agentID) != nil
+	parked := false
+	deadline := time.Now().Add(pauseLandingTimeout)
+	for time.Now().Before(deadline) {
+		if hot {
+			if d.slotPaused(sid, agentID) {
+				parked = true
+				break
+			}
+		} else if n, ok := tr.Get(agentID); ok && n.Status == orchestrator.StatusPaused {
+			parked = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	out := fmt.Sprintf("已暂停 %s：当前任务的上下文与已写文件保留；可 set_agent_model(该 id) 换模型后 resume_agent(该 id) 续跑，或 cancel_agent 放弃。", agentID)
+	if reason != "" {
+		out += "（原因: " + reason + "）"
+	}
+	if !parked {
+		out += "\n注意：收尾尚未落地（仍在保存进度），resume_agent 可能需稍后重试。"
+	}
+	return &tool.Result{Tool: "pause_agent", Success: true, Output: out}
+}
+
+// resumeAgentTool 实现 resume_agent 工具：唤醒被 pause_agent 暂停的热驻槽，
+// 从暂停时的任务继续（模型按当前绑定解析，期间换过模型即用新模型）。
+type resumeAgentTool struct {
+	dispatcher *Dispatcher
+}
+
+// Name 返回工具名称。
+func (t *resumeAgentTool) Name() string { return "resume_agent" }
+
+// Aliases 返回工具别名列表，当前无别名。
+func (t *resumeAgentTool) Aliases() []string { return nil }
+
+// Description 返回 LLM 可见的工具描述。
+func (t *resumeAgentTool) Description() string {
+	return "恢复被 pause_agent 暂停的子 Agent：从暂停时的任务继续执行，上下文与已写文件保留，" +
+		"模型按当前解析（期间 set_agent_model/set_role_model 过即用新模型）。" +
+		"非热驻节点异步续跑，完成后结果照常经 mailbox 回传。只能恢复自己直派且处于暂停态的 Agent。"
+}
+
+// Execute 执行 resume_agent 工具调用。args 含 agent_id（必填）。
+func (t *resumeAgentTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
+	d := t.dispatcher
+	agentID, _ := args["agent_id"].(string)
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return &tool.Result{Tool: "resume_agent", Error: "agent_id is required"}
+	}
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		if i := strings.Index(agentID, "/"); i > 0 {
+			sid = agentID[:i]
+		}
+	}
+	// 热驻槽路径：优先（槽存活时按 opResume 唤醒，上下文在槽内）。
+	if d.hotEnabled() && d.pool != nil {
+		if s := d.pool.slot(sid, agentID); s != nil {
+			s.mu.Lock()
+			suspended := s.suspended
+			if suspended {
+				s.suspended = false
+			}
+			s.mu.Unlock()
+			if !suspended {
+				return &tool.Result{Tool: "resume_agent", Error: fmt.Sprintf("agent %s 未处于暂停态，无需恢复", agentID)}
+			}
+			select {
+			case s.ops <- domainOp{kind: opResume, resumeMsg: "继续"}:
+			default:
+				// 指令通道拥塞：回滚标记，保持暂停态可重试。
+				s.mu.Lock()
+				s.suspended = true
+				s.mu.Unlock()
+				return &tool.Result{Tool: "resume_agent", Error: fmt.Sprintf("agent %s 指令通道繁忙，请稍后重试", agentID)}
+			}
+			return &tool.Result{Tool: "resume_agent", Success: true, Output: fmt.Sprintf(
+				"已恢复 %s：从暂停时的任务继续执行。", agentID)}
+		}
+	}
+	// 非热驻路径：树节点须为 Paused（history 已落 msgStore），异步续跑。
+	if d.treeFn == nil {
+		return &tool.Result{Tool: "resume_agent", Error: "agent tree not available"}
+	}
+	tr := d.treeFn(sid)
+	if tr == nil {
+		return &tool.Result{Tool: "resume_agent", Error: "agent tree not available for session"}
+	}
+	node, ok := tr.Get(agentID)
+	if !ok {
+		return &tool.Result{Tool: "resume_agent", Error: fmt.Sprintf("agent %s 不存在", agentID)}
+	}
+	callerID := agent.AgentIDFromContext(ctx)
+	if callerID != "" && callerID != node.ParentID {
+		return &tool.Result{Tool: "resume_agent", Error: fmt.Sprintf(
+			"agent %s 由 %s 派发，不能由 %s 越级恢复（只能管理自己直派的子 Agent）", agentID, node.ParentID, callerID),
+			Category: tool.ResultCategoryValidationRejected}
+	}
+	if node.Role == "meta" {
+		return &tool.Result{Tool: "resume_agent", Error: "meta 主 Agent 不支持恢复",
+			Category: tool.ResultCategoryValidationRejected}
+	}
+	if node.Status != orchestrator.StatusPaused {
+		return &tool.Result{Tool: "resume_agent", Error: fmt.Sprintf(
+			"agent %s 状态为 %s，仅已暂停的 Agent 可恢复", agentID, node.Status)}
+	}
+	if d.msgStore == nil {
+		return &tool.Result{Tool: "resume_agent", Error: "消息存储未接线，无法续跑（请重新派发任务）"}
+	}
+	d.resumePausedNode(ctx, agentID)
+	return &tool.Result{Tool: "resume_agent", Success: true, Output: fmt.Sprintf(
+		"已发起 %s 的续跑（异步执行，从暂停时的任务继续；完成后结果经 mailbox 回传）。", agentID)}
+}
+
+// agentModelSetTimeout set_agent_model 的整体墙钟上限（含连通性探测；探活内部 60s）。
+const agentModelSetTimeout = 60 * time.Second
+
+// setAgentModelTool 实现 set_agent_model 工具：为单个 Agent 实例覆盖模型（仅本实例、
+// 仅进程内存、不落盘）。与 set_role_model 的区别：后者改角色绑定（全局、持久）。
+// 授权：只能管理自己直派的子 Agent（caller == node.ParentID）——叶子归其 domain 管。
+type setAgentModelTool struct {
+	dispatcher *Dispatcher
+}
+
+// Name 返回工具名称。
+func (t *setAgentModelTool) Name() string { return "set_agent_model" }
+
+// Aliases 返回工具别名列表，当前无别名。
+func (t *setAgentModelTool) Aliases() []string { return nil }
+
+// Description 返回 LLM 可见的工具描述。
+func (t *setAgentModelTool) Description() string {
+	return "为单个 Agent 实例（你直派的 domain，或你直派的固定角色）覆盖模型，只影响这一个实例：" +
+		"同角色其他实例与后续派发不变，不写入 models.json，实例终结（完成/取消/槽销毁）即回收。" +
+		"参数：agent_id（必填）、model_id（注册表条目 ID，先用 list_models 查看）、reason（可选，写入回执）。" +
+		"典型用法：pause_agent(该实例) → set_agent_model(该实例) → resume_agent(该实例)，全程保留上下文。" +
+		"整类角色都不合适时用 set_role_model。只能管理自己直派的 Agent，越级会被拒绝。"
+}
+
+// Execute 执行 set_agent_model 工具调用。
+func (t *setAgentModelTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
+	d := t.dispatcher
+	agentID, _ := args["agent_id"].(string)
+	modelID, _ := args["model_id"].(string)
+	reason, _ := args["reason"].(string)
+	agentID = strings.TrimSpace(agentID)
+	modelID = strings.TrimSpace(modelID)
+	if agentID == "" || modelID == "" {
+		return &tool.Result{Tool: "set_agent_model", Error: "agent_id 与 model_id 必填（先 list_models 查看候选模型）",
+			Category: tool.ResultCategoryValidationRejected}
+	}
+	switchr, ok := d.models.(AgentModelSwitcher)
+	if !ok {
+		return &tool.Result{Tool: "set_agent_model", Error: "实例级模型覆盖不可用（模型工厂未接线）"}
+	}
+	if d.treeFn == nil {
+		return &tool.Result{Tool: "set_agent_model", Error: "agent tree not available"}
+	}
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		if i := strings.Index(agentID, "/"); i > 0 {
+			sid = agentID[:i]
+		}
+	}
+	tr := d.treeFn(sid)
+	if tr == nil {
+		return &tool.Result{Tool: "set_agent_model", Error: "agent tree not available for session"}
+	}
+	node, found := tr.Get(agentID)
+	if !found {
+		return &tool.Result{Tool: "set_agent_model", Error: fmt.Sprintf("agent %s 不存在", agentID)}
+	}
+	// 授权：只能管理自己直派的子 Agent（domain 名下的叶子归 domain 管）。
+	callerID := agent.AgentIDFromContext(ctx)
+	if callerID != "" && callerID != node.ParentID {
+		return &tool.Result{Tool: "set_agent_model", Error: fmt.Sprintf(
+			"agent %s 由 %s 派发，不能由 %s 越级换档（只能管理自己直派的子 Agent）", agentID, node.ParentID, callerID),
+			Category: tool.ResultCategoryValidationRejected}
+	}
+	if node.Role == "meta" {
+		return &tool.Result{Tool: "set_agent_model", Error: "meta 主 Agent 不支持实例级换档",
+			Category: tool.ResultCategoryValidationRejected}
+	}
+	switch node.Status {
+	case orchestrator.StatusRunning, orchestrator.StatusPaused, orchestrator.StatusIdle:
+	default:
+		return &tool.Result{Tool: "set_agent_model", Error: fmt.Sprintf(
+			"agent %s 状态为 %s，仅运行中/已暂停/空闲可换档", agentID, node.Status)}
+	}
+
+	setCtx, cancel := context.WithTimeout(ctx, agentModelSetTimeout)
+	defer cancel()
+	cfg, err := switchr.SetAgentModel(setCtx, agentID, node.Role, modelID, "")
+	if err != nil {
+		return &tool.Result{Tool: "set_agent_model", Error: err.Error(), Category: tool.ResultCategoryExecutionFailed}
+	}
+	out := fmt.Sprintf("已为 %s 覆盖模型 %s（provider=%s, model=%s, thinking=%s）。仅本实例生效，不写 models.json，实例终结即回收；下次 LLM 调用即生效，进行中调用不中断。",
+		agentID, modelID, cfg.Provider, cfg.Model, cfg.Thinking)
+	if reason != "" {
+		out += "（原因: " + reason + "）"
+	}
+	return &tool.Result{Tool: "set_agent_model", Success: true, Output: out}
 }
 
 // callSubAgentTool 实现内部 tool.Tool 接口，代表 call_sub_agent 这一可调用工具。
@@ -2647,34 +2967,51 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		// 取消路径（会话取消/cancel_agent/心跳杀）：通知与树收尾由取消方负责，
 		// 此处跳过避免双通知与覆盖 Cancelled 状态（TODO #25 控制面）。
 		if errors.Is(err, context.Canceled) {
+			sid := tool.SessionIDFromContext(ctx)
+			// 手动暂停分流（pause_agent / TUI PauseAgent）：domain 与叶子同路径——存完整
+			// history + tree.Pause（可 resume_agent 续跑），不 notify 结果、不递减
+			// PendingChildren（父等续跑后的回灌，中途放弃由 cancel_agent 收尾递减）。
+			// 叶子暂停是父（domain）的自主中转态，不进会话 PausedOnChild（HasPausedChild
+			// 仅认 domain），靠下方邮箱通知驱动父当轮处置。
+			if d.isPauseRequested(subAgentID) {
+				d.savePausedHistory(ctx, subAgentID, sid, result.History)
+				if d.treeFn != nil && sid != "" {
+					if t := d.treeFn(sid); t != nil {
+						t.Pause(subAgentID, "manual pause")
+					}
+				}
+				d.ClearPauseNode(subAgentID)
+				d.pokeParent(parentID)
+				if d.mailbox != nil {
+					if _, err := d.mailbox.Send(&mailbox.Message{
+						From:    "dispatcher",
+						To:      parentID,
+						Type:    mailbox.MsgInfo,
+						Subject: "子 Agent 已暂停: " + subAgentID,
+						Body: fmt.Sprintf("【系统通知】子 Agent %s 已按指令暂停（上下文与已写文件保留）。"+
+							"请当轮处置：先 list_models 看候选，必要时 set_agent_model(该 id) 换档后 resume_agent(该 id) 续跑原任务；"+
+							"无价值则 cancel_agent(该 id) 放弃。长时间不处置该节点占用未决计数。", subAgentID),
+					}); err != nil {
+						log.Printf("[subagent] pause notify parent failed: to=%s err=%v", parentID, err)
+					}
+				}
+				log.Printf("[subagent] MANUAL-PAUSED: sub=%s role=%s duration=%s (awaiting resume)", subAgentID, roleDef.ID, duration)
+				return true
+			}
 			// 软停止分流（TODO #37）：会话软停止标记命中时——
 			//   domain：SaveMessages 存完整 history + tree.Pause（可续跑），不 notify 不
 			//     trackChildDone（PendingChildren 保持 >0 → 父终结保护 → MetaAgent PausedOnChild，
 			//     恢复路由零改动生效）；
 			//   叶子助手：无 Pause 语义，部分回灌父（treeFinish Done + notify + trackChildDone），
 			//     domain 续跑后按需重派。
-			// 手动单节点暂停（TODO 第9⑥/10③ 审计面）：PauseAgent 对单个 domain 标记后
-			// StopRunning，isPauseRequested 命中走同一条 domain→Pause 收尾，不影响其余节点。
-			if sid := tool.SessionIDFromContext(ctx); d.isSoftStop(sid) || d.isPauseRequested(subAgentID) {
+			if d.isSoftStop(sid) {
 				if roleDef.ID == "domain" {
-					if d.msgStore != nil && result.History != nil {
-						// 本分支的 ctx 已被 StopRunning 取消：SaveMessages 必须用脱离取消的 ctx，
-						// 否则 history 存不进去、resume 无消息可加载（e2e 实证 "no persisted messages"）。
-						// 附加 10s 超时防慢 PG 阻塞子 Agent 收尾 goroutine。
-						saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-						err := d.msgStore.SaveMessages(saveCtx, subAgentID, sid, result.History)
-						cancelSave()
-						if err != nil {
-							log.Printf("[subagent] soft-stop save messages failed: sub=%s err=%v", subAgentID, err)
-						}
-					}
+					d.savePausedHistory(ctx, subAgentID, sid, result.History)
 					if d.treeFn != nil && sid != "" {
 						if t := d.treeFn(sid); t != nil {
 							t.Pause(subAgentID, "user stop")
 						}
 					}
-					// 手动暂停收尾完成，清节点标记（防残留误分流后续取消）。
-					d.ClearPauseNode(subAgentID)
 					// 唤醒父 MetaAgent 的 wait loop（不改变 PendingChildren 计数）：
 					// 否则父要等满 30s wait 周期才检测到 Paused 子节点，PausedOnChild 转换被拖慢。
 					d.pokeParent(parentID)
@@ -2807,6 +3144,20 @@ func (d *Dispatcher) runSubAgentWithAutoRetry(ctx context.Context, parentID, sub
 	return result2, err2, true
 }
 
+// savePausedHistory 暂停收尾把子 Agent 完整 history 落 msgStore，供 ResumePaused 续跑。
+// 收尾 ctx 已被 StopRunning 取消：必须用脱离取消的 ctx（否则存不进去、续跑报
+// "no persisted messages"，e2e 实证），附 10s 超时防慢 PG 阻塞收尾 goroutine。
+func (d *Dispatcher) savePausedHistory(ctx context.Context, subAgentID, sid string, history []agent.ReactMessage) {
+	if d.msgStore == nil || history == nil {
+		return
+	}
+	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancelSave()
+	if err := d.msgStore.SaveMessages(saveCtx, subAgentID, sid, history); err != nil {
+		log.Printf("[subagent] pause save messages failed: sub=%s err=%v", subAgentID, err)
+	}
+}
+
 // treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
 // 幂等：orchestrator.Tree.Finish 对已 terminal 节点 no-op。
 func (d *Dispatcher) treeFinish(ctx context.Context, subAgentID, summary string, err error) {
@@ -2820,6 +3171,8 @@ func (d *Dispatcher) treeFinish(ctx context.Context, subAgentID, summary string,
 // treeFinishStatus 按指定终态写树（TODO #60 三态化）：StatusUnverified 走
 // Tree.FinishUnverified（非失败语义、看板标黄），其余与 treeFinish 同语义。
 func (d *Dispatcher) treeFinishStatus(ctx context.Context, subAgentID, summary string, status orchestrator.Status, errText string) {
+	// 终态漏斗：节点死亡即回收实例级模型覆盖（暂停路径不走本函数，覆盖跨 resume 存活）。
+	d.clearAgentModel(subAgentID)
 	if d.treeFn == nil {
 		return
 	}
@@ -2856,7 +3209,7 @@ func (d *Dispatcher) treeFinishStatus(ctx context.Context, subAgentID, summary s
 //   - errUnverified：judge LLM 不可用（fail-closed，result.Unverified=true）；
 //   - 成功时 err == nil，result.Text 为最终答复。
 func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode, verifyKind string) (*agent.ReActAgent, agent.ReactResult, error) {
-	provider, err := d.models.GetBladesProvider(ctx, roleDef.ID)
+	provider, err := d.providerForAgent(ctx, roleDef.ID, subAgentID)
 	if err != nil {
 		return nil, agent.ReactResult{}, fmt.Errorf("get model: %w", err)
 	}
@@ -2920,6 +3273,9 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		}
 	}
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, subAgentID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
+		WithProviderFunc(func(callCtx context.Context) (agent.ModelProvider, error) {
+			return d.providerForAgent(callCtx, roleDef.ID, subAgentID)
+		}).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
@@ -3426,14 +3782,17 @@ func (d *Dispatcher) planProgress(ctx context.Context, subAgentID string) func(s
 	}
 }
 
-// ResumePaused 恢复一个因触达上下文 token 上限而 Paused 的 DomainAgent。
-// 从 msgStore 加载其完整消息历史，用 fresh budget（上下文 token 每轮独立估算）重建
-// domain ReActAgent 续跑。不强制压缩——靠 Assemble 压缩自动触发（Pipeline 状态延续：
+// ResumePaused 恢复一个 Paused 的子 Agent（触限挂起、会话软停或 pause_agent 手动暂停）：
+// 从 msgStore 加载其完整消息历史，用 fresh budget（上下文 token 每轮独立估算）按节点角色
+// 重建 ReActAgent 续跑。不强制压缩——靠 Assemble 压缩自动触发（Pipeline 状态延续：
 // 同 subAgentID -> compressCounters/events 跨 resume 保留）。
 //
+// 角色泛化：domain 与固定角色叶子同路径；domain 专属行为（领域名覆写、兄弟产出摄取）
+// 按 roleDef.ID == "domain" 分支。
+//
 // 生命周期：
-//   - 再触限：SaveMessages 覆盖 + tree.Pause + 返回 result.LimitReached=true（ReactService 置会话 PausedOnChild）。
-//   - 完成：tree.Finish Done + notify 父 mailbox + trackChildDone（父 MetaAgent 解除阻塞）。
+//   - 再触限：SaveMessages 覆盖 + tree.Pause + 通知父 + 返回 result.LimitReached=true。
+//   - 完成：tree.Finish Done + notify 父 mailbox + trackChildDone（父 Agent 解除阻塞）。
 //   - 出错：treeFinish Failed + notify 失败 + trackChildDone + 返回 err。
 //
 // pausedNodeID 为 Paused 节点 ID；parentID 从节点 ParentID 取。
@@ -3458,9 +3817,6 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	}
 	if !found {
 		return agent.ReactResult{}, fmt.Errorf("paused node not found: %s", pausedNodeID)
-	}
-	if pausedNode.Role != "domain" {
-		return agent.ReactResult{}, fmt.Errorf("paused node %s is not a domain agent (role=%s)", pausedNodeID, pausedNode.Role)
 	}
 	parentID := pausedNode.ParentID
 
@@ -3487,15 +3843,18 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		return agent.ReactResult{}, fmt.Errorf("no persisted messages for %s", pausedNodeID)
 	}
 
-	roleDef := d.registry.Get("domain")
+	roleDef := d.registry.Get(pausedNode.Role)
 	if roleDef == nil {
-		return agent.ReactResult{}, fmt.Errorf("domain role not found")
+		return agent.ReactResult{}, fmt.Errorf("role %q not found", pausedNode.Role)
 	}
-	if hint := strings.TrimSpace(pausedNode.Domain); hint != "" {
-		roleDef.Name = textutil.TruncateRunes(hint, 16, "…") + "领域Agent"
+	// 领域名覆写仅 domain（叶子用角色名，与派发路径一致）。
+	if roleDef.ID == "domain" {
+		if hint := strings.TrimSpace(pausedNode.Domain); hint != "" {
+			roleDef.Name = textutil.TruncateRunes(hint, 16, "…") + "领域Agent"
+		}
 	}
 
-	provider, err := d.models.GetBladesProvider(ctx, "domain")
+	provider, err := d.providerForAgent(ctx, roleDef.ID, pausedNodeID)
 	if err != nil {
 		return agent.ReactResult{}, fmt.Errorf("get model: %w", err)
 	}
@@ -3504,15 +3863,20 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		mem = agent.NopMemoryPipeline{}
 	}
 	// 黑板模式（TODO #42）：resume 的 domain Agent 同样每轮摄取兄弟产出--它正是因等兄弟而暂停的，
-	// 恢复后兄弟可能已完成，uptake 让它立即见到兄弟结论而非空等/重做。
-	if bb, ok := d.searcher.(BlackboardSearcher); ok && strings.TrimSpace(pausedNode.Domain) != "" {
-		mem = newSiblingUptakePipeline(mem, bb, sid, pausedNode.ParentID, pausedNode.Domain, pausedNodeID)
+	// 恢复后兄弟可能已完成，uptake 让它立即见到兄弟结论而非空等/重做。叶子无兄弟语义。
+	if roleDef.ID == "domain" {
+		if bb, ok := d.searcher.(BlackboardSearcher); ok && strings.TrimSpace(pausedNode.Domain) != "" {
+			mem = newSiblingUptakePipeline(mem, bb, sid, pausedNode.ParentID, pausedNode.Domain, pausedNodeID)
+		}
 	}
 	// 不注入编排者人格（理由同 runSubAgentOnce：身份混淆实证）。
 	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, pausedNodeID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
+		WithProviderFunc(func(callCtx context.Context) (agent.ModelProvider, error) {
+			return d.providerForAgent(callCtx, roleDef.ID, pausedNodeID)
+		}).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
-		WithLoopConfig(d.loopConfigFor("domain")).
+		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
 		WithWorkDir(d.subAgentWorkDirFor(ctx))
 	// resume 重建的 Agent 恢复技能块：持有集从 heldSkills 取（一次性路径派发时已登记；
 	// 进程重启丢失则回退角色固定集）。
@@ -3574,6 +3938,8 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 			log.Printf("[subagent] resume re-pause save messages failed: sub=%s err=%v", pausedNodeID, saveErr)
 		}
 		t.Pause(pausedNodeID, "token budget exhausted (resume)")
+		// 再触限：父必须知情（否则父等 resume 时该节点静默占着未决计数）。
+		d.notify(parentID, pausedNodeID, "子 Agent 再次触达 token 上限已重新暂停（上下文保留）；可稍后 resume_agent 继续，或 cancel_agent 放弃并按部分产出收口。", agent.FilesModifiedFromHistory(result.History))
 		log.Printf("[subagent] resume RE-PAUSED: sub=%s (token budget)", pausedNodeID)
 		return result, nil
 	}
@@ -3583,6 +3949,39 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	d.notify(parentID, pausedNodeID, result.Text, files)
 	d.trackChildDone(parentID)
 	return result, nil
+}
+
+// resumePausedNode 非热驻暂停节点的续跑入口：自建携带 SessionID/WorkDir/StopContext 的
+// ctx（工具调用 ctx 在工具返回后即失效），goroutine 内调 ResumePaused——续跑是完整任务执行，
+// 不能阻塞调用方（父 Agent）的工具轮。
+//
+// 失败兜底：ResumePaused 的前置/加载失败分支不回传父，此处若节点仍为 Paused 则补一条
+// 失败通知（否则父等不到回灌也收不到失败，永久挂账）；成功路径的完成/失败回传由
+// ResumePaused 内部负责（不重复通知）。
+func (d *Dispatcher) resumePausedNode(ctx context.Context, nodeID string) {
+	sid := tool.SessionIDFromContext(ctx)
+	base := tool.StopContextFrom(ctx)
+	if base == nil {
+		base = context.Background()
+	}
+	subCtx := tool.WithSessionID(base, sid)
+	if wd := tool.WorkDirFromContext(ctx); wd != "" {
+		subCtx = tool.WithWorkDir(subCtx, wd)
+	}
+	go func() {
+		if _, err := d.ResumePaused(subCtx, nodeID); err != nil {
+			log.Printf("[subagent] resume failed: sub=%s err=%v", nodeID, err)
+			if d.treeFn != nil {
+				if t := d.treeFn(sid); t != nil {
+					if n, ok := t.Get(nodeID); ok && n.Status == orchestrator.StatusPaused {
+						d.notify(n.ParentID, nodeID,
+							failureMarker(FailureKindError, false)+"\n续跑失败: "+err.Error()+
+								"（该节点仍为暂停态：可重试 resume_agent，或 cancel_agent 放弃并按已有产出收口）", nil)
+					}
+				}
+			}
+		}
+	}()
 }
 
 // concludePaused 在 Paused domain 触达续跑上限时强制收口：

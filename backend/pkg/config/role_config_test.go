@@ -5,52 +5,20 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/blockmemory/agent/backend/pkg/prompts"
 )
 
-// TestExpandLeafCommonDiscipline 锚定叶子公共段展开结果：
-// 占位符行按原缩进逐行展开，展开后无占位符残留，内容与 leafCommonBlock 一致。
-func TestExpandLeafCommonDiscipline(t *testing.T) {
-	in := "你是叶子执行者。\n\n      【执行纪律】\n      " + leafCommonToken + "\n\n      【职责】\n      1. 干活\n"
-	got := expandLeafCommonDiscipline(in)
-
-	if strings.Contains(got, leafCommonToken) {
-		t.Fatalf("占位符未展开:\n%s", got)
-	}
-	for _, want := range strings.Split(leafCommonBlock, "\n") {
-		if want == "" {
-			continue
-		}
-		if !strings.Contains(got, "      "+want) {
-			t.Fatalf("展开结果缺少公共段行（6 空格缩进）:\n%q", want)
-		}
-	}
-	if !strings.Contains(got, "\n\n      【职责】") {
-		t.Fatalf("占位符行后的原有内容丢失:\n%s", got)
-	}
-
-	// 无占位符的提示词必须原样返回。
-	plain := "没有占位符的提示词"
-	if got := expandLeafCommonDiscipline(plain); got != plain {
-		t.Fatalf("无占位符时不应改动原文: %q", got)
-	}
-}
-
-// TestLoadRoleConfig_ExpandsLeafCommonToken 走完整加载链路验证占位符替换生效。
-func TestLoadRoleConfig_ExpandsLeafCommonToken(t *testing.T) {
+// TestLoadRoleConfig_FillsPromptsFromCode 提示词由 pkg/prompts 内置填充：
+// YAML 不写 system_prompt/prompt_template，加载后字段从代码注册表填充，
+// 叶子公共段占位符已展开、无残留。
+func TestLoadRoleConfig_FillsPromptsFromCode(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "roles.yaml")
 	yaml := `fixed_roles:
   - id: code_assistant
     name: 代码助手
     type: fixed
-    system_prompt: |
-      你是叶子执行者。
-
-      【执行纪律】
-      {{LEAF_COMMON_DISCIPLINE}}
-
-      【职责】
-      1. 写代码
 `
 	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
@@ -59,20 +27,50 @@ func TestLoadRoleConfig_ExpandsLeafCommonToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	if cfg.MetaAgent.SystemPrompt == "" {
+		t.Fatal("meta 提示词未从代码填充")
+	}
+	if cfg.DomainAgent.SystemPrompt == "" {
+		t.Fatal("domain 提示词未从代码填充")
+	}
+
 	role := cfg.GetFixedRole("code_assistant")
 	if role == nil {
 		t.Fatal("code_assistant 未加载")
 	}
 	sp := role.SystemPrompt
-	if strings.Contains(sp, leafCommonToken) {
+	if strings.Contains(sp, prompts.LeafCommonToken) {
 		t.Fatalf("加载后仍含占位符:\n%s", sp)
 	}
 	if !strings.Contains(sp, "【终止纪律】") || !strings.Contains(sp, "【共享记忆】") {
 		t.Fatalf("公共段未注入完整:\n%s", sp)
 	}
-	// 块标量解析后缩进已剥离，展开内容应与常量逐行一致（0 列对齐）。
-	if !strings.Contains(sp, "\n"+leafCommonBlock+"\n") {
+	// 展开内容应与单一来源常量逐行一致（0 列对齐）。
+	if !strings.Contains(sp, "\n"+prompts.LeafCommonBlock+"\n") {
 		t.Fatalf("展开内容与单一来源常量不一致:\n%s", sp)
+	}
+}
+
+// TestLoadRoleConfig_UnknownFixedRoleID 未在 pkg/prompts 登记的固定角色 ID
+// 报 strict 错误（自定义固定角色需改代码，YAML 纯配置添加不再支持）。
+func TestLoadRoleConfig_UnknownFixedRoleID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "roles.yaml")
+	yaml := `fixed_roles:
+  - id: no_such_role
+    name: 幽灵角色
+    type: fixed
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadRoleConfig(path)
+	if err == nil {
+		t.Fatal("未知固定角色 ID 应报错")
+	}
+	if !strings.Contains(err.Error(), "no_such_role") {
+		t.Fatalf("错误未指明角色 ID: %v", err)
 	}
 }
 

@@ -30,8 +30,12 @@ import (
 // 它在多次运行之间刻意保持无状态；所有可变状态都保存在传入并返回的
 // History 切片中，便于上层按需持久化或续跑。
 type ReActAgent struct {
-	llm     ModelProvider        // llm 是当前使用的语言模型提供者，负责生成回复。
-	tools   ToolRegistry         // tools 是已注册的工具集合，提供 JSON Schema 与分发执行能力。
+	llm ModelProvider // llm 是当前使用的语言模型提供者，负责生成回复。
+	// providerFn 可选的 provider 每次调用重解析函数（WithProviderFunc 注入）：generateOnce
+	// 开头按当前角色模型绑定重取 provider 并替换 a.llm，使运行中的 Agent 在下一次 LLM
+	// 调用即用上新模型（否则热驻槽/长任务把 provider 钉在构造时刻）。解析失败保留旧值。
+	providerFn func(context.Context) (ModelProvider, error)
+	tools      ToolRegistry         // tools 是已注册的工具集合，提供 JSON Schema 与分发执行能力。
 	memory  MemoryPipeline       // memory 是记忆流水线，用于在每次 LLM 调用前组装上下文、写入事件。
 	mailbox *mailbox.Mailbox     // mailbox 是共享邮箱，用于接收异步子代理摘要；为空时不轮询。
 	role    types.RoleDefinition // role 是当前代理的角色定义，包含系统提示等配置。
@@ -253,6 +257,14 @@ func NewReActAgent(name string, role types.RoleDefinition, llm ModelProvider, to
 		memory:  NopMemoryPipeline{}, // 默认使用空实现，避免 nil 调用 panic。
 		maxIter: 50,                  // 默认最多 50 轮 LLM 调用。
 	}
+}
+
+// WithProviderFunc 注入 provider 每次调用重解析函数：每次 LLM 调用前按最新模型绑定
+// 重新解析 provider，使运行中的 Agent（含热驻槽复用、暂停续跑）在下一次调用即用上新模型。
+// 传 nil 关闭（默认关闭，provider 固定在构造时刻）。
+func (a *ReActAgent) WithProviderFunc(fn func(context.Context) (ModelProvider, error)) *ReActAgent {
+	a.providerFn = fn
+	return a
 }
 
 // WithMemory 注入记忆流水线。
@@ -1150,6 +1162,15 @@ type streamingModelProvider interface {
 // generateOnce 执行单次 LLM 调用：provider 支持流式时走流式并推送 llm_delta 实时事件，
 // 否则回退到一次性 Generate。
 func (a *ReActAgent) generateOnce(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	// 模型绑定可能在 Agent 存活期内被切换（set_role_model / TUI / Web 选择器）：
+	// 每次调用重解析 provider，失败保留旧 provider（不打断当前任务）。
+	if a.providerFn != nil {
+		if p, err := a.providerFn(ctx); err == nil && p != nil {
+			a.llm = p
+		} else if err != nil {
+			log.Printf("[react] provider refresh failed, keep current: role=%s err=%v", a.role.Name, err)
+		}
+	}
 	a.touchActivity("llm_start")
 	start := time.Now()
 	role := a.role.Name

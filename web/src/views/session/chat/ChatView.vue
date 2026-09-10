@@ -18,6 +18,8 @@ defineProps<{
   outputTokens: number
   liveStreaming: string
   liveThinking: string
+  /** 接替回合的流式文本快照（key=接替用 user_message 事件时间戳），透传 MessageList → groupEventsToTurns */
+  priorReplies?: Record<string, string>
 }>()
 
 const emit = defineEmits<{
@@ -39,6 +41,7 @@ const emit = defineEmits<{
                  :clarify-ack="clarifyAck" :clarify-drafts="clarifyDrafts"
                  :session-id="session?.id || ''"
                  :live-streaming="liveStreaming" :live-thinking="liveThinking"
+                 :prior-replies="priorReplies"
                  @submit-clarify="emit('clarify-submitted')"
                  @update-clarify-drafts="(d: string[]) => emit('update-clarify-drafts', d)" />
     <ChatInput :loading="sending"
