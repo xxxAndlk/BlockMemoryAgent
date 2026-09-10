@@ -108,5 +108,10 @@ Both must produce no output. If a command ever prints a path, move the shared
 - When an upper layer needs a lower-layer behavior, define a small interface in
   the upper layer and inject the implementation at wiring time (e.g.
   `dag.Store`, `dag.SessionLauncher`).
-- Keep business rules (prompts, thresholds, routing keywords) in configuration
-  files (`config/`) rather than embedding them in reusable packages.
+- Keep business rules (thresholds, routing keywords) in configuration files
+  (`config/`) rather than embedding them in reusable packages.
+- Exception — prompts: all role system prompts / dynamic templates live as Go
+  constants in `pkg/prompts` (compiled into the binary, not user-editable in
+  the config dir). `config.LoadRoleConfig` fills the `SystemPrompt` /
+  `PromptTemplate` fields from that package at startup; unknown role IDs fail
+  fast. Thresholds and routing keywords remain in `config/`.

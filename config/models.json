@@ -1,0 +1,69 @@
+{
+  "models": [
+    {
+      "id": "doubao-seed-evolving",
+      "name": "豆包 Seed Evolving",
+      "provider": "anthropic",
+      "model": "doubao-seed-evolving",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "${ANTHROPIC_BASE_URL}"
+    },
+    {
+      "id": "glm-5.3-flash",
+      "name": "GLM 5.3 Flash",
+      "provider": "anthropic",
+      "model": "glm-5.3-flash",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "${ANTHROPIC_BASE_URL}"
+    },
+    {
+      "id": "doubao-seed-2.0-mini",
+      "name": "豆包 Seed 2.0 Mini",
+      "provider": "anthropic",
+      "model": "doubao-seed-2.0-mini",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "${ANTHROPIC_BASE_URL}"
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "name": "DeepSeek V4 Flash",
+      "provider": "anthropic",
+      "model": "deepseek-v4-flash",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "${ANTHROPIC_BASE_URL}"
+    },
+    {
+      "id": "glm-5.3",
+      "name": "GLM 5.3",
+      "provider": "anthropic",
+      "model": "glm-5.3",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "${ANTHROPIC_BASE_URL}"
+    },
+    {
+      "id": "doubao-seed-2.0-lite",
+      "name": "豆包 Seed 2.0 Lite（原 doc）",
+      "provider": "anthropic",
+      "model": "doubao-seed-2.0-lite",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "${ANTHROPIC_BASE_URL}"
+    },
+    {
+      "id": "kimi-k3",
+      "name": "Kimi K3",
+      "provider": "anthropic",
+      "model": "kimi-k3",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "${ANTHROPIC_BASE_URL}"
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "name": "Gemini 3.8 flash",
+      "provider": "openai-chat",
+      "model": "${GEMINI_CHAT_MODEL}",
+      "api_key": "xxx",
+      "base_url": "${GEMINI_CHAT_URL}"
+    }
+  ],
+  "role_bindings": {}
+}
