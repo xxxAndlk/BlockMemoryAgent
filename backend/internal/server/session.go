@@ -281,6 +281,29 @@ func ToServerSession(a *agent.Session) *Session {
 			})
 		}
 		pc.AnswerOptionIDs = append([]string(nil), req.AnswerOptionIDs...)
+		// 批量模式（任务 140）：detail 长上下文 + 逐题深拷贝。
+		pc.Detail = req.Detail
+		for _, q := range req.Questions {
+			item := types.ClarifyQuestionItem{
+				Question:        q.Question,
+				Kind:            q.Kind,
+				MultiSelect:     q.MultiSelect,
+				Answer:          q.Answer,
+				AnswerOptionIDs: append([]string(nil), q.AnswerOptionIDs...),
+			}
+			if q.AnsweredAt != nil {
+				t := *q.AnsweredAt
+				item.AnsweredAt = &t
+			}
+			for _, o := range q.Options {
+				item.Options = append(item.Options, types.ClarifyOption{
+					ID:          o.ID,
+					Label:       o.Label,
+					Description: o.Description,
+				})
+			}
+			pc.Questions = append(pc.Questions, item)
+		}
 		state.PendingClarify = pc
 	}
 	// 如果没有任何三层状态内容，则把 state 置为 nil，避免返回空对象。

@@ -14,18 +14,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/blockmemory/agent/backend/internal/board"          // board 提供任务看板快照（TODO #22）
+	"github.com/blockmemory/agent/backend/internal/board" // board 提供任务看板快照（TODO #22）
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/model"
-	"github.com/blockmemory/agent/backend/internal/userprofile"
 	"github.com/blockmemory/agent/backend/internal/project"
-	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
+	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/internal/store"
+	"github.com/blockmemory/agent/backend/internal/userprofile"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/textutil"
@@ -536,11 +536,11 @@ func (s *ReactService) metaPersonaLite() PersonaInjector {
 // 由 bootstrap 从 cfg.Agent 派生注入，避免 agent 包反向依赖 config 包；
 // 未注入时全部取零值，由 loopConfig 回退到合理默认值。
 type ReactRuntimeConfig struct {
-	MaxIterations           int // ReAct 最大 LLM 轮数；<0 表示不限制
-	LLMTimeoutSec           int // 单次 LLM 调用超时（秒）；<0 表示仅受会话取消控制
-	RetryCount              int // LLM 失败重试次数（不含首次）
-	RetryBackoffMs          int // 重试初始退避（毫秒）
-	HistoryMaxMessages      int // 单次请求最大历史消息数；<0 表示不裁剪
+	MaxIterations             int // ReAct 最大 LLM 轮数；<0 表示不限制
+	LLMTimeoutSec             int // 单次 LLM 调用超时（秒）；<0 表示仅受会话取消控制
+	RetryCount                int // LLM 失败重试次数（不含首次）
+	RetryBackoffMs            int // 重试初始退避（毫秒）
+	HistoryMaxMessages        int // 单次请求最大历史消息数；<0 表示不裁剪
 	ToolOutputHistoryMaxRunes int // 写入历史的工具输出最大字符数；<0 表示不截断
 	// TokenBudgetPerGoal 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。
 	// 保留字段不破坏旧配置加载，但不再驱动任何闸门。见 roleTokenBudget。
@@ -1211,9 +1211,17 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		content, _ := cmd.Args["content"].(string)
 		return s.sendMessage(ctx, sessionID, content)
 	case ControlOpClarify:
-		// 澄清答复：提取 answer 并答复。
+		// 澄清答复：提取 answer（单题）与 answers（批量逐题，任务 140）并答复。
 		answer, _ := cmd.Args["answer"].(string)
-		return s.answerClarify(ctx, sessionID, answer)
+		var answers []string
+		if raw, ok := cmd.Args["answers"].([]any); ok {
+			for _, a := range raw {
+				if s, ok := a.(string); ok {
+					answers = append(answers, s)
+				}
+			}
+		}
+		return s.answerClarify(ctx, sessionID, answer, answers)
 	case ControlOpInterrupt:
 		// 中断：提取 content 并触发中断处理。
 		content, _ := cmd.Args["content"].(string)
@@ -1326,6 +1334,9 @@ func (s *ReactService) ApprovalHook() tool.ApprovalHookFunc {
 			if sess.Status == enums.SessionStatusAwaitingClarify {
 				sess.Status = enums.SessionStatusRunning
 			}
+			// 同 AskUserHook：恢复即清上一轮流式缓冲，防 live 帧把旧答复文本
+			// 当新轮实时流重复渲染。直写字段（store.mu 不可重入）。
+			sess.StreamingText = ""
 			s.store.mu.Unlock()
 			return allow, nil
 		}
@@ -1457,6 +1468,47 @@ func recordClarifyAnswer(pc *ClarifyRequest, answer string) (string, []string) {
 	return text, ids
 }
 
+// recordClarifyBatchAnswer 把批量答复逐题记录到 pendingClarify.Questions（任务 140）：
+// 每题按各自选项解析（命中选项回传 Label 连接文本，否则原文），回填 item 的
+// Answer/AnswerOptionIDs/AnsweredAt；顶层 Answer/AnswerOptionIDs/AnsweredAt 镜像
+// 第一题。返回逐题回传文本（下标与题目对齐）。
+func recordClarifyBatchAnswer(pc *ClarifyRequest, answers []string) []string {
+	if pc == nil {
+		return answers
+	}
+	texts := make([]string, len(answers))
+	for i, a := range answers {
+		texts[i] = a
+		if i >= len(pc.Questions) {
+			continue
+		}
+		item := &pc.Questions[i]
+		text, ids := parseClarifyAnswer(a, &ClarifyRequest{Options: item.Options})
+		item.Answer = text
+		item.AnswerOptionIDs = ids
+		now := time.Now()
+		item.AnsweredAt = &now
+		texts[i] = text
+	}
+	if len(pc.Questions) > 0 {
+		pc.Answer = pc.Questions[0].Answer
+		pc.AnswerOptionIDs = pc.Questions[0].AnswerOptionIDs
+		pc.AnsweredAt = pc.Questions[0].AnsweredAt
+	}
+	return texts
+}
+
+// numberedAnswers 把逐题答复编成 "1. X\n2. Y" 汇总文本（任务 140 批量答复
+// 合并为一条聊天消息/事件——web 每条 user_message 事件开新 turn，逐题拆开
+// 会把答复区打成 N 段）。
+func numberedAnswers(answers []string) string {
+	parts := make([]string, len(answers))
+	for i, a := range answers {
+		parts[i] = fmt.Sprintf("%d. %s", i+1, a)
+	}
+	return strings.Join(parts, "\n")
+}
+
 // resolveApproval 把用户对破坏性操作确认的答复解析为裁决（TODO #53 选项化）：
 // pendingClarify 带 confirm 选项时，命中选项 ID（confirm/reject）或数字序号直接裁决，
 // 优先于关键词匹配；未命中回退 parseApproval 自由文本兑底。fail-closed。
@@ -1517,37 +1569,19 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		ch := make(chan string, 1)
 		sess.askUser = ch
 		req := &ClarifyRequest{
-			ID:          fmt.Sprintf("ask-%d", time.Now().UnixNano()),
-			Question:    question,
-			Context:     "Agent 向用户提问（人在回路）",
-			AgentID:     tool.AgentIDFromContext(ctx),
-			CreatedAt:   time.Now(),
-			MultiSelect: opts.MultiSelect,
+			ID:        fmt.Sprintf("ask-%d", time.Now().UnixNano()),
+			Question:  question,
+			Context:   "Agent 向用户提问（人在回路）",
+			AgentID:   tool.AgentIDFromContext(ctx),
+			CreatedAt: time.Now(),
+			Detail:    strings.TrimSpace(opts.Detail),
 		}
-		if len(opts.Options) > 0 {
-			// 结构化选项（TODO #53）：Kind=choice；纯自由文本提问保持旧行为（Kind=text）。
+		// 结构化选项（TODO #53）：Kind=choice；纯自由文本提问保持旧行为（Kind=text）。
+		// 单选自动追加「其他」逃生选项（buildClarifyOptions）。
+		req.Options = buildClarifyOptions(opts.Options, opts.MultiSelect)
+		req.MultiSelect = opts.MultiSelect
+		if len(req.Options) > 0 {
 			req.Kind = "choice"
-			for _, o := range opts.Options {
-				req.Options = append(req.Options, ClarifyOption{ID: o.ID, Label: o.Label, Description: o.Description})
-			}
-			// 单选 choice 自动追加「其他」逃生选项：选项不精确/方向不对时用户点选后
-			// 自由填写答案，而不是被迫二选一。多选可勾选组合，不追加。
-			if !req.MultiSelect {
-				hasOther := false
-				for _, o := range req.Options {
-					if o.ID == ClarifyOtherOptionID {
-						hasOther = true
-						break
-					}
-				}
-				if !hasOther {
-					req.Options = append(req.Options, ClarifyOption{
-						ID:          ClarifyOtherOptionID,
-						Label:       "其他（自行输入答案）",
-						Description: "以上选项不够精确或方向不对时选这项，然后在输入框填写你的答案",
-					})
-				}
-			}
 		} else {
 			req.Kind = "text"
 		}
@@ -1555,12 +1589,13 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		sess.Status = enums.SessionStatusAwaitingClarify
 		s.store.mu.Unlock()
 
-		// detail（如 submit_plan 计划全文）完整落对话区事件流；面板只渲染 question（短）。
-		eventText := "Agent 提问: " + question
-		if d := strings.TrimSpace(opts.Detail); d != "" {
-			eventText = "Agent 提问: " + d + "\n" + question
+		// detail（如 submit_plan 计划全文）先于问题独立成事件（kind=clarify_detail，
+		// 任务 140）——长上下文在前、短问题在后；独立 kind 避开前端 clarify 事件
+		// last-wins 覆盖，面板/卡片按结构化字段渲染。
+		if req.Detail != "" {
+			s.store.addEvent(sess, eventkind.Clarify, "System", req.Detail, eventkind.ClarifyDetail, "", "", "", "", true)
 		}
-		s.store.addEvent(sess, eventkind.Clarify, "System", eventText, "", "", "", "", "", true)
+		s.store.addEvent(sess, eventkind.Clarify, "System", "Agent 提问: "+question, "", "", "", "", "", true)
 
 		select {
 		case <-ctx.Done():
@@ -1580,8 +1615,147 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 			if sess.Status == enums.SessionStatusAwaitingClarify {
 				sess.Status = enums.SessionStatusRunning
 			}
+			// 恢复即清上一轮流式缓冲：ask_user 阻塞期间 StreamingText 保留的是提问前
+			// 那轮的答复文本，不清零会随 live 帧继续推送，新一轮思考阶段前端把旧文本
+			// 当实时流重复渲染（2026-09-09 事故）。store.mu 不可重入，setStreamingText
+			// 内部再加锁会死锁，持锁区必须直写字段。
+			sess.StreamingText = ""
 			s.store.mu.Unlock()
 			return answer, nil
+		}
+	}
+}
+
+// buildClarifyOptions 把 ask_user 工具的结构化选项转为 ClarifyOption 列表；
+// 单选 choice 自动追加「其他」逃生选项：选项不精确/方向不对时用户点选后自由填写
+// 答案，而不是被迫二选一。多选可勾选组合，不追加。单题/批量两个 hook 共用防漂移。
+func buildClarifyOptions(opts []tool.AskUserOption, multiSelect bool) []ClarifyOption {
+	if len(opts) == 0 {
+		return nil
+	}
+	out := make([]ClarifyOption, 0, len(opts)+1)
+	for _, o := range opts {
+		out = append(out, ClarifyOption{ID: o.ID, Label: o.Label, Description: o.Description})
+	}
+	if !multiSelect {
+		hasOther := false
+		for _, o := range out {
+			if o.ID == ClarifyOtherOptionID {
+				hasOther = true
+				break
+			}
+		}
+		if !hasOther {
+			out = append(out, ClarifyOption{
+				ID:          ClarifyOtherOptionID,
+				Label:       "其他（自行输入答案）",
+				Description: "以上选项不够精确或方向不对时选这项，然后在输入框填写你的答案",
+			})
+		}
+	}
+	return out
+}
+
+// AskUserBatchHook 返回 ask_user 批量模式回调（任务 140）：全部题目一次挂出
+//（同屏分页、可回退改选、必须逐题作答后统一提交）。与单题 AskUserHook 同通道
+// 范式：置 pendingClarify（Questions 全量 + 顶层镜像第一题）+ awaiting_clarify +
+// 事件流（detail 非空先落 clarify_detail，再逐题 question-only clarify）→ 阻塞等
+// answerClarify 批量分支把逐题答复写入 askUserBatch 通道 → 按题序返回。
+// 会话取消时返回 ctx 错误；槽位与 approval/askUser 互斥（2s 一拍排队等空位）。
+func (s *ReactService) AskUserBatchHook() tool.AskUserBatchHookFunc {
+	return func(ctx context.Context, questions []tool.AskUserQuestion, detail string) ([]string, error) {
+		sid := tool.SessionIDFromContext(ctx)
+		if sid == "" {
+			return nil, fmt.Errorf("ask_user: missing session context")
+		}
+		// 等待用户期间保活：同 AskUserHook，排队与阻塞阶段都覆盖。
+		keepalive := s.startUserWaitKeepalive(ctx)
+		defer keepalive.Stop()
+		s.store.mu.Lock()
+		for {
+			sess := s.store.sessions[sid]
+			if sess == nil {
+				s.store.mu.Unlock()
+				return nil, fmt.Errorf("ask_user: 会话不存在")
+			}
+			if sess.approval == nil && sess.askUser == nil && sess.askUserBatch == nil {
+				break // 拿到空槽位；锁保持持有，下方直接占位
+			}
+			s.store.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+			s.store.mu.Lock()
+		}
+		sess := s.store.sessions[sid]
+		ch := make(chan []string, 1)
+		sess.askUserBatch = ch
+		req := &ClarifyRequest{
+			ID:        fmt.Sprintf("ask-%d", time.Now().UnixNano()),
+			Context:   "Agent 向用户提问（人在回路）",
+			AgentID:   tool.AgentIDFromContext(ctx),
+			CreatedAt: time.Now(),
+			Detail:    strings.TrimSpace(detail),
+		}
+		for _, q := range questions {
+			opts := buildClarifyOptions(q.Options, q.MultiSelect)
+			kind := "text"
+			if len(opts) > 0 {
+				kind = "choice"
+			}
+			req.Questions = append(req.Questions, ClarifyQuestionItem{
+				Question:    q.Question,
+				Kind:        kind,
+				MultiSelect: q.MultiSelect,
+				Options:     opts,
+			})
+		}
+		// 顶层镜像第一题：旧客户端只读顶层字段仍能渲染 Q1（答复会被批量分支的
+		// 数量校验拒绝并提示走面板统一提交，不会静默错位）。
+		if len(req.Questions) > 0 {
+			first := req.Questions[0]
+			req.Question = first.Question
+			req.Kind = first.Kind
+			req.MultiSelect = first.MultiSelect
+			req.Options = first.Options
+		}
+		sess.pendingClarify = req
+		sess.Status = enums.SessionStatusAwaitingClarify
+		s.store.mu.Unlock()
+
+		// 事件流：detail 先于问题（kind=clarify_detail），逐题 question-only
+		//（与单题 AskUserHook 同形态；每题独立事件便于历史按问答对回看）。
+		if req.Detail != "" {
+			s.store.addEvent(sess, eventkind.Clarify, "System", req.Detail, eventkind.ClarifyDetail, "", "", "", "", true)
+		}
+		for _, q := range req.Questions {
+			s.store.addEvent(sess, eventkind.Clarify, "System", "Agent 提问: "+q.Question, "", "", "", "", "", true)
+		}
+
+		select {
+		case <-ctx.Done():
+			s.store.mu.Lock()
+			if sess.askUserBatch == ch {
+				sess.askUserBatch = nil
+				sess.pendingClarify = nil
+			}
+			s.store.mu.Unlock()
+			return nil, ctx.Err()
+		case answers := <-ch:
+			s.store.mu.Lock()
+			if sess.askUserBatch == ch {
+				sess.askUserBatch = nil
+				sess.pendingClarify = nil
+			}
+			if sess.Status == enums.SessionStatusAwaitingClarify {
+				sess.Status = enums.SessionStatusRunning
+			}
+			// 恢复即清上一轮流式缓冲（同 AskUserHook；直写字段防死锁）。
+			sess.StreamingText = ""
+			s.store.mu.Unlock()
+			return answers, nil
 		}
 	}
 }
@@ -2063,7 +2237,7 @@ func subAgentDispatchInfo(argsJSON string) (roleID, taskBrief string) {
 }
 
 // runSession 为新创建的会话执行 ReAct 主循环。
-func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会话上下文；若不存在则使用 Background。
+func (s *ReactService) runSession(session *reactInternalSession) { // 获取会话上下文；若不存在则使用 Background。
 	ctx := sessionContext(session)
 	// 会话结束后清理临时目录并淘汰已完成会话。
 	defer s.finalizeSession(session)
@@ -2176,7 +2350,12 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 		return
 	}
 
-	// 运行成功：更新会话状态为已完成，并记录结果与历史。
+	// 运行成功：先落完成事件再翻状态——SSE 流见终态即推 done 帧关流（stream_http.go），
+	// 事件必须先入列才能被最后一个 tick 带出；先翻状态的话 tick 落在窗口内就只推
+	// session_status+done，最终答复永远到不了前端（2026-09-09 事故缺口 B）。
+	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
+
+	// 更新会话状态为已完成，并记录结果与历史。
 	now := time.Now()
 	s.store.mu.Lock()
 	session.Status = enums.SessionStatusCompleted
@@ -2184,9 +2363,6 @@ func (s *ReactService) runSession(session *reactInternalSession) {	// 获取会�
 	session.EndedAt = &now
 	session.History = result.History
 	s.store.mu.Unlock()
-
-	// 添加 Agent 完成事件。
-	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
 
 	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
 	//（用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
@@ -2314,6 +2490,10 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		return
 	}
 
+	// 先落完成事件再翻状态（同 runSession：done 帧关流前事件必须已在列，
+	// 2026-09-09 事故缺口 B）。
+	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
+
 	// 更新会话状态为已完成。
 	now := time.Now()
 	s.store.mu.Lock()
@@ -2322,9 +2502,6 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	session.EndedAt = &now
 	session.History = result.History
 	s.store.mu.Unlock()
-
-	// 添加完成事件并持久化。
-	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
 
 	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
 	//（用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
@@ -2652,6 +2829,13 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 		return nil
 	}
 
+	// 批量 ask_user 待答复（任务 140）：单条文本无法对齐逐题答复，明确拒绝引导
+	// 走问答面板统一提交（走下方续跑路径会双开 ReAct 循环）。
+	if session.askUserBatch != nil {
+		s.store.mu.Unlock()
+		return fmt.Errorf("%w: 批量提问待答复，请在问答面板逐题作答后一次性提交", ErrInvalidSessionState)
+	}
+
 	// 待审批的破坏性操作（TODO #17 P1；#53 选项化）：答复路由进审批通道。
 	// Agent goroutine 存活，不重建会话不 resume（避免双跑）；答复不进入 LLM 对话历史，
 	// 由工具结果带回 ReAct 循环。confirm 选项命中（confirm/reject/数字序号）直接裁决，
@@ -2806,9 +2990,10 @@ func (s *ReactService) findEarliestPausedDomain(sessionID string) string {
 }
 
 // answerClarify 处理用户对澄清问题的答复。
-func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer string) error {
-	// 空答复拒绝处理。
-	if answer == "" {
+// answers 为批量模式（任务 140）的逐题答复（下标与题目对齐）；单题路径只用 answer。
+func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer string, answers []string) error {
+	// 空答复拒绝处理（批量路径由 answers 承载）。
+	if answer == "" && len(answers) == 0 {
 		return fmt.Errorf("answer cannot be empty")
 	}
 	// 加锁查找会话。
@@ -2825,6 +3010,38 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 			return fmt.Errorf("%w: session is paused on child, send a message to resume the paused domain", ErrInvalidSessionState)
 		}
 		return fmt.Errorf("%w: session is not awaiting clarification", ErrInvalidSessionState)
+	}
+	// 批量 ask_user 待答复（任务 140）：answers 必须逐题对齐且全部非空（同屏分页
+	// 必须全部作答才允许提交），回填后写入 askUserBatch 通道；答复合并为一条
+	// [澄清答复] 消息 + 一条「提问答复」事件（web 每条 user_message 事件开新 turn，
+	// 逐题拆事件会把答复区打成 N 段）。
+	if session.askUserBatch != nil {
+		pc := session.pendingClarify
+		if pc == nil || len(answers) != len(pc.Questions) {
+			n := 0
+			if pc != nil {
+				n = len(pc.Questions)
+			}
+			s.store.mu.Unlock()
+			return fmt.Errorf("%w: 答复数量与问题数不一致（%d 题），请在问答面板逐题作答后一次性提交", ErrInvalidSessionState, n)
+		}
+		for i, a := range answers {
+			if strings.TrimSpace(a) == "" {
+				s.store.mu.Unlock()
+				return fmt.Errorf("%w: 第 %d 题答复为空，请逐题作答后再提交", ErrInvalidSessionState, i+1)
+			}
+		}
+		texts := recordClarifyBatchAnswer(pc, answers)
+		session.askUserBatch <- texts
+		numbered := numberedAnswers(texts)
+		session.Messages = append(session.Messages, Message{
+			Role:      string(enums.ChatRoleUser),
+			Content:   "[澄清答复] " + numbered,
+			Timestamp: time.Now(),
+		})
+		s.store.mu.Unlock()
+		s.store.addEvent(session, eventkind.Clarify, "User", "提问答复: "+numbered, "", "", "", "", "", true)
+		return nil
 	}
 	// 待答复的 Agent 提问（TODO #24 ask_user；#53 选项解析）：答复写 askUser 通道。
 	// 带选项时按选项 ID/Label/数字序号解析回传，自由文本原样透传。
@@ -2922,7 +3139,14 @@ func (s *ReactService) enqueue(ctx context.Context, sessionID, content string) e
 	//（2026-09-08 web 端 ask_user 答复误入 enqueue 通道事故修复）。
 	if session.askUser != nil || session.approval != nil {
 		s.store.mu.Unlock()
-		return s.answerClarify(ctx, sessionID, content)
+		return s.answerClarify(ctx, sessionID, content, nil)
+	}
+	// 批量 ask_user 待答复（任务 140）：单条文本无法对齐逐题答复，明确拒绝引导
+	// 走问答面板统一提交（不能路由——会经 answerClarify 的数量校验失败，也不能
+	// 走续跑路径——双开 ReAct 循环）。
+	if session.askUserBatch != nil {
+		s.store.mu.Unlock()
+		return fmt.Errorf("%w: 批量提问待答复，请在问答面板逐题作答后一次性提交", ErrInvalidSessionState)
 	}
 	// 若会话未运行，则重新激活。
 	wasRunning := session.Status == enums.SessionStatusRunning

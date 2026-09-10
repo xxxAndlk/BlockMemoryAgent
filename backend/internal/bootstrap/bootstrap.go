@@ -295,21 +295,21 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
 	reactCfg := agent.ReactRuntimeConfig{
-		MaxIterations:             cfg.Agent.ToolCallMaxRounds,
-		LLMTimeoutSec:             cfg.Agent.ReactLLMTimeoutSec,
-		RetryCount:                cfg.Agent.RetryCount,
-		RetryBackoffMs:            cfg.Agent.RetryBackoffMs,
-		HistoryMaxMessages:        cfg.Agent.HistoryMaxMessages,
-		ToolOutputHistoryMaxRunes: cfg.Agent.ToolOutputHistoryMaxRunes,
-		TokenBudgetPerGoal:        cfg.Agent.TokenBudgetPerGoal,
-		TokenBudgetPerRole:        cfg.Agent.TokenBudgetPerRole,
-		ContextTokenBudget:        cfg.Agent.ContextTokenBudget,
-		SessionMaxWallClockMin:    cfg.Agent.SessionMaxWallClockMin,
-		ToolResultDumpRunes:       cfg.Agent.ToolResultDumpRunes,
-		ToolResultDigestRunes:     cfg.Agent.ToolResultDigestRunes,
-		StaleToolEvictRounds:      cfg.Agent.StaleToolEvictRounds,
-		AgentsMDMaxRunes:          cfg.Agent.AgentsMDMaxRunes,
-		ToolParallelEnabled:       cfg.Agent.ToolParallelEnabled,
+		MaxIterations:              cfg.Agent.ToolCallMaxRounds,
+		LLMTimeoutSec:              cfg.Agent.ReactLLMTimeoutSec,
+		RetryCount:                 cfg.Agent.RetryCount,
+		RetryBackoffMs:             cfg.Agent.RetryBackoffMs,
+		HistoryMaxMessages:         cfg.Agent.HistoryMaxMessages,
+		ToolOutputHistoryMaxRunes:  cfg.Agent.ToolOutputHistoryMaxRunes,
+		TokenBudgetPerGoal:         cfg.Agent.TokenBudgetPerGoal,
+		TokenBudgetPerRole:         cfg.Agent.TokenBudgetPerRole,
+		ContextTokenBudget:         cfg.Agent.ContextTokenBudget,
+		SessionMaxWallClockMin:     cfg.Agent.SessionMaxWallClockMin,
+		ToolResultDumpRunes:        cfg.Agent.ToolResultDumpRunes,
+		ToolResultDigestRunes:      cfg.Agent.ToolResultDigestRunes,
+		StaleToolEvictRounds:       cfg.Agent.StaleToolEvictRounds,
+		AgentsMDMaxRunes:           cfg.Agent.AgentsMDMaxRunes,
+		ToolParallelEnabled:        cfg.Agent.ToolParallelEnabled,
 		ToolParallelMaxConcurrency: cfg.Agent.ToolParallelMaxConcurrency,
 	}
 	// 工具图片长边降采样（TODO 第9项④）：agent 包级旋钮，全部工具图片唯一汇流点
@@ -526,6 +526,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 置 PendingClarify + 暂停会话 + 阻塞等答复，答复作为工具结果带回 ReAct 循环。
 	// 默认超时从 config.AskUserTimeoutSec 注入（0=不限），单次调用 timeout_sec 可覆盖。
 	toolRegistry.SetAskUserHook(agentSvc.AskUserHook())
+	// 批量模式钩子（任务 140）：questions>1 时整组一次挂出（同屏分页、统一提交）。
+	toolRegistry.SetAskUserBatchHook(agentSvc.AskUserBatchHook())
 	toolRegistry.SetAskUserTimeoutDefault(cfg.Agent.AskUserTimeoutSec)
 	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
 	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。

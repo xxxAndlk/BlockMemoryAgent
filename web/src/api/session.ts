@@ -74,6 +74,14 @@ export function clarifySession(id: string, answer: string): Promise<void> {
   })
 }
 
+/** 批量澄清统一提交（任务 140）：answers 与待澄清 questions 按下标对齐，全部作答后一次性提交。 */
+export function clarifySessionBatch(id: string, answers: string[]): Promise<void> {
+  return fetchJson(`/sessions/${id}/clarify`, {
+    method: 'POST',
+    body: JSON.stringify({ answers }),
+  })
+}
+
 /** SSE live 帧：模型实时汇报/思考文本（仅运行中，变化才推）。 */
 export interface LiveTextFrame {
   type: 'live'

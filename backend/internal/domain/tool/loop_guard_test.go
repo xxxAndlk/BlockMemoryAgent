@@ -157,3 +157,105 @@ func TestLoopGuard_MetaExemptOnlyForDispatch(t *testing.T) {
 		}
 	}
 }
+
+// scriptedTool 按预设步骤依次返回结果（越界重复最后一步），模拟"拒绝→纠正→成功"节奏。
+type scriptedTool struct {
+	name  string
+	steps []Result
+	calls int
+}
+
+func (t *scriptedTool) Name() string        { return t.name }
+func (t *scriptedTool) Aliases() []string   { return nil }
+func (t *scriptedTool) Description() string { return "test tool" }
+func (t *scriptedTool) Execute(context.Context, map[string]any) *Result {
+	i := t.calls
+	if i >= len(t.steps) {
+		i = len(t.steps) - 1
+	}
+	t.calls++
+	res := t.steps[i]
+	return &res
+}
+
+// TestLoopGuard_ValidationCountResetsOnSuccess 成功即清零（2026-09-09 事故回归）：
+// 4 次拒绝 → 成功 1 次（模型已补齐前置条件）→ 后续拒绝计数从 1 重计；
+// 旧实现 reset 无调用点，成功后的第 1 次拒绝即累计 5 次误杀。
+func TestLoopGuard_ValidationCountResetsOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	st := &scriptedTool{name: "WriteSpec", steps: []Result{
+		{Tool: "WriteSpec", Error: "goal/acceptance 命中还原类诉求但 baseline 为空", Category: ResultCategoryValidationRejected},
+		{Tool: "WriteSpec", Error: "goal/acceptance 命中还原类诉求但 baseline 为空", Category: ResultCategoryValidationRejected},
+		{Tool: "WriteSpec", Error: "goal/acceptance 命中还原类诉求但 baseline 为空", Category: ResultCategoryValidationRejected},
+		{Tool: "WriteSpec", Error: "goal/acceptance 命中还原类诉求但 baseline 为空", Category: ResultCategoryValidationRejected},
+		{Tool: "WriteSpec", Success: true, Output: "spec written (key=spec:wave1)"},
+		{Tool: "WriteSpec", Error: "goal is required", Category: ResultCategoryValidationRejected},
+	}}
+	r.Register(st)
+	ctx := WithSessionID(context.Background(), "s1")
+
+	// 前 4 次拒绝：普通校验拒绝，不终止。
+	for i := 1; i <= 4; i++ {
+		res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{"acceptance": []any{"a"}})
+		if res.Success || err != nil {
+			t.Fatalf("reject %d should be ordinary: success=%v err=%v", i, res.Success, err)
+		}
+	}
+	// 第 5 步成功：计数必须清零。
+	if res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{"acceptance": []any{"a"}}); !res.Success || err != nil {
+		t.Fatalf("5th call should succeed: success=%v err=%v", res.Success, err)
+	}
+	// 成功后的第 1 次拒绝：连续语义下计数=1，不得终止（旧实现此处累计 5 次直接 ErrLoopExit）。
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{"acceptance": []any{"a"}})
+	if res.Success || err != nil {
+		t.Fatalf("post-success reject must be ordinary after reset, got err=%v", err)
+	}
+	if !strings.Contains(res.Error, "goal is required") {
+		t.Fatalf("original validation error must surface, got: %s", res.Error)
+	}
+}
+
+// TestLoopGuard_ValidationCountScopeIsolated 计数按 scope 隔离（2026-09-09 事故回归）：
+// 会话 A 的历史校验拒绝不得继承到会话 B——B 的首次拒绝从 1 起计。
+func TestLoopGuard_ValidationCountScopeIsolated(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	r.Register(&rejectTool{name: "probe", cat: ResultCategoryValidationRejected, msg: "bad params"})
+	ctxA := WithSessionID(context.Background(), "sA")
+	ctxB := WithSessionID(context.Background(), "sB")
+
+	for i := 1; i <= 4; i++ {
+		if res, err := r.Dispatch(ctxA, "probe", nil); res.Success || err != nil {
+			t.Fatalf("session A reject %d should be ordinary: err=%v", i, err)
+		}
+	}
+	// 会话 B 首次拒绝：不得继承 A 的 4 次历史（旧实现按工具名全局计数，此处即误杀）。
+	if res, err := r.Dispatch(ctxB, "probe", nil); res.Success || err != nil {
+		t.Fatalf("session B first rejection must not inherit session A count, got err=%v", err)
+	}
+	// 会话 A 第 5 次拒绝：本会话连续达阈值，正常终止。
+	if _, err := r.Dispatch(ctxA, "probe", nil); !errors.Is(err, ErrLoopExit) {
+		t.Fatalf("session A 5th consecutive rejection should kill, err=%v", err)
+	}
+}
+
+// TestLoopGuard_ValidationLoopExitKeepsOriginalError LoopExit 文案保留原始校验错误
+//（2026-09-09 事故：守卫消息整条覆盖 result.Error，真实拒绝原因在日志/事件流丢失）。
+func TestLoopGuard_ValidationLoopExitKeepsOriginalError(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+	r.Register(&rejectTool{name: "probe", cat: ResultCategoryValidationRejected, msg: "baseline 引用文件不存在: ref/img.png"})
+	ctx := WithSessionID(context.Background(), "s1")
+	var res *Result
+	var err error
+	for i := 1; i <= 5; i++ {
+		res, err = r.Dispatch(ctx, "probe", nil)
+	}
+	if !errors.Is(err, ErrLoopExit) {
+		t.Fatalf("expected ErrLoopExit at 5th, got: %v", err)
+	}
+	if !strings.Contains(res.Error, "校验拒绝") || !strings.Contains(res.Error, "baseline 引用文件不存在") {
+		t.Fatalf("LoopExit result must keep guard message AND original error, got: %s", res.Error)
+	}
+}

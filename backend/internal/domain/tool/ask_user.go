@@ -37,9 +37,10 @@ type AskUserQuestion struct {
 
 // AskUserOptions 是 ask_user 工具传给 hook 的单题入参（TODO #53）。
 // Options 为空 = 纯自由文本提问（旧行为）；MultiSelect=true 时用户可多选。
-// Detail 为附加长上下文（如 submit_plan 的计划全文）：落对话区事件流展示，
-// 不进问答面板（面板只显示 question + 选项）。批量模式在 Execute 侧拆成
-// 多次单题 hook 调用，hook 签名不变。
+// Detail 为附加长上下文（如 submit_plan 的计划全文）：先于问题展示（事件流
+// clarify_detail 事件 + 面板 detail 块，任务 140），question 只承载短问题句。
+// 批量模式（questions>1 且接线了批量 hook）整组一次调用 AskUserBatchHookFunc；
+// 未接线批量 hook 时回退逐题调用本单题 hook（向后兼容）。
 type AskUserOptions struct {
 	Options     []AskUserOption
 	MultiSelect bool
@@ -51,6 +52,12 @@ type AskUserOptions struct {
 // 会话取消时返回 ctx 错误；超时未答复返回 ErrAskUserTimeout（工具转"自行决策"）。
 type AskUserHookFunc func(ctx context.Context, question string, opts AskUserOptions) (string, error)
 
+// AskUserBatchHookFunc 是 ask_user 批量模式的会话层回调（任务 140）：
+// 一次挂出全部题目（同屏分页、可回退改选），阻塞等用户统一提交后按题序
+// 返回逐题答复文本。questions 与返回值按下标对齐（长度必须一致）。
+// 会话取消时返回 ctx 错误；整组超时返回 ErrAskUserTimeout（工具逐题转"自行决策"）。
+type AskUserBatchHookFunc func(ctx context.Context, questions []AskUserQuestion, detail string) ([]string, error)
+
 // ErrAskUserTimeout 用户超时未答复 ask_user 提问。
 var ErrAskUserTimeout = errors.New("ask user: timeout waiting for answer")
 
@@ -58,7 +65,11 @@ var ErrAskUserTimeout = errors.New("ask user: timeout waiting for answer")
 // 未注入 hook（服务未接线）时返回未配置错误。
 type askUserTool struct {
 	hook AskUserHookFunc
+	// batchHook 批量模式回调（任务 140）：questions>1 时优先调用，整组一次
+	// 挂出/统一提交；nil 时回退逐题调 hook 的旧行为。
+	batchHook AskUserBatchHookFunc
 	// defaultTimeout 提问默认超时（秒）；<=0 不限。单次调用 timeout_sec 参数覆盖。
+	// 批量模式作用于整组（一个窗口），非逐题。
 	defaultTimeoutSec int
 }
 
@@ -70,6 +81,18 @@ func (r *Registry) SetAskUserHook(h AskUserHookFunc) {
 	}
 	if t, ok := r.tools["ask_user"].(*askUserTool); ok {
 		t.hook = h
+	}
+}
+
+// SetAskUserBatchHook 注入 ask_user 批量模式回调（任务 140）。
+// bootstrap 在 ReactService 装配后调用（agentSvc.AskUserBatchHook()）；
+// nil 时批量 questions 回退逐题调用单题 hook 的旧行为。
+func (r *Registry) SetAskUserBatchHook(h AskUserBatchHookFunc) {
+	if r == nil {
+		return
+	}
+	if t, ok := r.tools["ask_user"].(*askUserTool); ok {
+		t.batchHook = h
 	}
 }
 
@@ -94,17 +117,19 @@ func (t *askUserTool) Aliases() []string { return nil }
 func (t *askUserTool) Description() string {
 	return "向用户提问并等待答复（人在回路）。推荐批量模式：questions 一次问齐 2-5 个" +
 		"关键分叉（选错要返工、缺失无法定案的决策；不问琐碎，用户已明确的禁止再问），" +
-		"答复按题号汇总返回——提问是最省时间的行动。说人话，每个选项讲清对结果的影响。" +
+		"全部题目同屏分页呈现、用户可回退改选后一次性提交，答复按题号汇总返回——" +
+		"提问是最省时间的行动。说人话，每个选项讲清对结果的影响。" +
 		"参数：questions 每项 {question,options,multi_select}；options 每项 {id,label,description}" +
 		"（label 简短可点选，给候选不开放式让用户打字；multi_select=true 可多选）。" +
-		"detail 可选：长上下文完整展示在对话区；timeout_sec 可选（>0 时超时未答复返回" +
-		"\"自行决策\"，默认 0 不限）。"
+		"question 只写一句短问题（进度盘点/计划全文等长上下文一律放 detail，展示时" +
+		"detail 先于问题）；detail 可选：长上下文完整展示在问题之前；timeout_sec 可选" +
+		"（>0 时超时未答复返回\"自行决策\"，批量模式作用于整组，默认 0 不限）。"
 }
 
 // InputSchema 返回入参 JSON Schema（TODO #53 结构化选项）。
 func (t *askUserTool) InputSchema() *jsonschema.Schema {
 	optionSchema := &jsonschema.Schema{
-		Type:       "object",
+		Type: "object",
 		Properties: map[string]*jsonschema.Schema{
 			"id":          {Type: "string", Description: "选项唯一标识（如 dark/light）"},
 			"label":       {Type: "string", Description: "选项展示文本（简短可点选）"},
@@ -120,24 +145,24 @@ func (t *askUserTool) InputSchema() *jsonschema.Schema {
 	return &jsonschema.Schema{
 		Type: "object",
 		Properties: map[string]*jsonschema.Schema{
-			"question":     {Type: "string", Description: "要问的问题（简洁、可答、一问答一件事）"},
+			"question":     {Type: "string", Description: "要问的问题（一句短问题，简洁、可答、一问答一件事；进度盘点等长上下文放 detail）"},
 			"options":      optionArraySchema,
 			"multi_select": {Type: "boolean", Description: "是否允许多选（默认 false=单选）"},
-			"timeout_sec":  {Type: "number", Description: "超时秒数（>0 时每题超时未答复自行决策，0=不限）"},
+			"timeout_sec":  {Type: "number", Description: "超时秒数（>0 时超时未答复自行决策，0=不限；批量模式作用于整组一个窗口）"},
 			"questions": {
 				Type: "array",
 				Items: &jsonschema.Schema{
 					Type: "object",
 					Properties: map[string]*jsonschema.Schema{
-						"question":     {Type: "string", Description: "要问的问题"},
+						"question":     {Type: "string", Description: "要问的问题（一句短问题，长上下文放顶层 detail）"},
 						"options":      optionArraySchema,
 						"multi_select": {Type: "boolean", Description: "是否允许多选（默认 false）"},
 					},
 					Required: []string{"question"},
 				},
-				Description: "批量模式：2-5 个问题一次问齐（新任务开工前澄清必用），题目逐个呈现，答复按题号汇总返回",
+				Description: "批量模式：2-5 个问题一次问齐（新任务开工前澄清必用），全部题目同屏分页呈现、用户统一提交，答复按题号汇总返回",
 			},
-			"detail": {Type: "string", Description: "附加长上下文（如计划全文）：完整展示在对话区供用户滚动查看，问答面板只显示 question 与选项；question 写短引导语即可"},
+			"detail": {Type: "string", Description: "附加长上下文（如计划全文、进度盘点）：完整展示在问题之前供用户滚动查看，问答面板只显示 question 与选项；question 写一句短引导语即可"},
 		},
 		Required: []string{"question"},
 	}
@@ -236,7 +261,9 @@ func boolOf(v any) bool {
 	return b
 }
 
-// Execute 执行 ask_user 工具调用：批量模式逐题调 hook，答案按题号汇总。
+// Execute 执行 ask_user 工具调用：单题走 hook；批量（questions>1）优先走
+// batchHook 整组一次挂出/统一提交（任务 140），未接线批量 hook 时回退逐题调
+// hook 的旧行为，答案均按题号汇总。
 func (t *askUserTool) Execute(ctx context.Context, args map[string]any) *Result {
 	if t.hook == nil {
 		return &Result{Tool: "ask_user", Error: "ask_user 未接线（会话服务未注入 AskUserHook）"}
@@ -250,6 +277,11 @@ func (t *askUserTool) Execute(ctx context.Context, args map[string]any) *Result 
 		timeoutSec = float64(t.defaultTimeoutSec)
 	}
 	detail, _ := args["detail"].(string)
+
+	// 批量快速路径（任务 140）：整组一次调 batchHook，一个超时窗口覆盖全部题目。
+	if len(questions) > 1 && t.batchHook != nil {
+		return t.executeBatch(ctx, questions, detail, timeoutSec)
+	}
 
 	var sb strings.Builder
 	sb.WriteString("用户答复:")
@@ -278,4 +310,39 @@ func (t *askUserTool) Execute(ctx context.Context, args map[string]any) *Result 
 		Success: true,
 		Output:  sb.String(),
 	}
+}
+
+// executeBatch 批量模式快速路径（任务 140）：整组一次调 batchHook，一个超时
+// 窗口覆盖全部题目（同屏挂出无逐题超时语义）；整组超时逐题记"自行决策"，
+// 其余错误中止调用。answers 长度必须与 questions 一致（hook 契约）。
+func (t *askUserTool) executeBatch(ctx context.Context, questions []AskUserQuestion, detail string, timeoutSec float64) *Result {
+	askCtx := ctx
+	cancel := func() {}
+	if timeoutSec > 0 {
+		askCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	}
+	defer cancel()
+	answers, err := t.batchHook(askCtx, questions, detail)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrAskUserTimeout) {
+			// 整组超时：逐题记未答继续（不回显问题原文，同单题路径），由模型自行决策。
+			var sb strings.Builder
+			sb.WriteString("用户答复:")
+			for i := range questions {
+				fmt.Fprintf(&sb, "\n%d. 答复: 用户未答复，自行决策。", i+1)
+			}
+			return &Result{Tool: "ask_user", Success: true, Output: sb.String()}
+		}
+		// 会话取消等：中止调用（ReAct 循环随 ctx 退出）。
+		return &Result{Tool: "ask_user", Error: fmt.Sprintf("提问中断: %v", err)}
+	}
+	if len(answers) != len(questions) {
+		return &Result{Tool: "ask_user", Error: fmt.Sprintf("ask_user 批量 hook 契约违规: %d 题得到 %d 个答复", len(questions), len(answers))}
+	}
+	var sb strings.Builder
+	sb.WriteString("用户答复:")
+	for i, a := range answers {
+		fmt.Fprintf(&sb, "\n%d. 答复: %s", i+1, a)
+	}
+	return &Result{Tool: "ask_user", Success: true, Output: sb.String()}
 }

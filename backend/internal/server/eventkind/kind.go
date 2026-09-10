@@ -19,12 +19,13 @@ const (
 	Wait         = "wait"          // 等待事件
 	AgentCreated = "agent_created" // Agent 创建事件
 
-	Progress    = "progress"     // 进度事件
-	Clarify     = "clarify"      // 需要澄清事件
-	Stats       = "stats"        // 统计事件
-	LLM         = "llm"          // LLM 通用事件
-	UserMessage = "user_message" // 用户消息事件
-	Message     = "message"      // 普通消息事件
-	Interrupt   = "interrupt"    // 中断事件
-	Enqueue     = "enqueue"      // 入队事件
+	Progress      = "progress"       // 进度事件
+	Clarify       = "clarify"        // 需要澄清事件
+	ClarifyDetail = "clarify_detail" // 澄清附加长上下文事件（任务 140：先于问题展示的 detail 块）
+	Stats         = "stats"          // 统计事件
+	LLM           = "llm"            // LLM 通用事件
+	UserMessage   = "user_message"   // 用户消息事件
+	Message       = "message"        // 普通消息事件
+	Interrupt     = "interrupt"      // 中断事件
+	Enqueue       = "enqueue"        // 入队事件
 )

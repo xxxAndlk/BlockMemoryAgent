@@ -78,8 +78,15 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 			snapshot = ToServerSession(session)
 			currentEvents := snapshot.Events
 
-			// 防止事件切片被重置导致下标越界。
+			// 事件切片被头部裁剪（addEvent 超 500 条时 trimDebugEvents 就地丢头部，
+			// len 缩小）会让按索引的增量 diff 丢基线：直接把 lastEventCount 钳到 len
+			// 会跳过裁剪同一窗口内追加的尾部事件（如最终 agent_done），前端永远
+			// 收不到完成答复（2026-09-09 事故缺口 A）。此时推整帧快照，前端走既有
+			// onSnapshot 原子替换路径，基线随之对齐，无事件丢失。
 			if lastEventCount > len(currentEvents) {
+				data, _ := json.Marshal(snapshot)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
 				lastEventCount = len(currentEvents)
 			}
 
@@ -119,18 +126,24 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 				flusher.Flush()
 			}
 
-			// 若会话等待用户澄清，推送 awaiting_clarify 事件（TODO #53：帧携带结构化选项）。
+			// 若会话等待用户澄清，推送 awaiting_clarify 事件（TODO #53：帧携带结构化选项；
+			// 任务 140：批量模式增 questions 全量题目 + detail 长上下文，顶层 question/options
+			// 继续镜像第一题保证旧客户端可渲染）。
 			if snapshot.Status == enums.SessionStatusAwaitingClarify {
 				pending := ""
 				qid := ""
+				detail := ""
 				var opts []types.ClarifyOption
 				multi := false
+				var items []types.ClarifyQuestionItem
 				if snapshot.State != nil && snapshot.State.PendingClarify != nil {
 					pc := snapshot.State.PendingClarify
 					pending = pc.Question
 					qid = pc.ID
 					opts = pc.Options
 					multi = pc.MultiSelect
+					detail = pc.Detail
+					items = pc.Questions
 				}
 				frame := map[string]any{
 					"type":         "awaiting_clarify",
@@ -141,6 +154,23 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 				}
 				if len(opts) > 0 {
 					frame["options"] = opts
+				}
+				if detail != "" {
+					frame["detail"] = detail
+				}
+				if len(items) > 1 {
+					qs := make([]map[string]any, 0, len(items))
+					for _, q := range items {
+						qf := map[string]any{
+							"question":     q.Question,
+							"multi_select": q.MultiSelect,
+						}
+						if len(q.Options) > 0 {
+							qf["options"] = q.Options
+						}
+						qs = append(qs, qf)
+					}
+					frame["questions"] = qs
 				}
 				data, _ := json.Marshal(frame)
 				fmt.Fprintf(w, "data: %s\n\n", data)

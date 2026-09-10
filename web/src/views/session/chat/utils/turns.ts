@@ -35,6 +35,8 @@ export interface Turn {
   toolCalls: ToolCallGroup[] // 兼容字段：所有工具调用组
   errors: SessionEvent[]
   clarifyQuestion?: SessionEvent
+  /** 提问附带的长上下文（任务 140，kind=clarify_detail 事件）：展示在问题之前 */
+  clarifyDetails: SessionEvent[]
   finalAnswer?: SessionEvent
   status: 'running' | 'completed' | 'error' | 'awaiting_clarify'
   startedAt: string
@@ -52,6 +54,7 @@ type EventCategory =
   | 'tool_result_legacy'
   | 'completion'
   | 'clarify'
+  | 'clarify_detail'
   | 'error'
   | 'think'
   | 'other'
@@ -82,6 +85,9 @@ export function classifyEvent(ev: SessionEvent): EventCategory {
   if (ev.type === 'system' && ev.message?.startsWith('会话启动')) return 'system_start'
   if (ev.type === 'system' && ev.message?.startsWith('继续会话')) return 'system_resume'
   if (isCompletion(ev)) return 'completion'
+  // 提问附带的长上下文（任务 140 问题①）：kind=clarify_detail，先于问题展示；
+  // 必须在通用 clarify 判断之前分类（其 type 也是 clarify）。
+  if (ev.kind === 'clarify_detail') return 'clarify_detail'
   if (ev.type === 'clarify' || ev.kind === 'clarify') return 'clarify'
   if (isToolCallEvent(ev)) return 'tool_call'
   if (isToolExecEvent(ev)) return 'tool_exec'
@@ -174,6 +180,7 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
       thinkChain: [],
       toolCalls: [],
       errors: [],
+      clarifyDetails: [],
       status: 'running',
       startedAt: startedAt || ev?.timestamp || new Date().toISOString(),
       tokens: { in: 0, out: 0 },
@@ -223,6 +230,13 @@ export function groupEventsToTurns(events: SessionEvent[]): Turn[] {
       current!.clarifyQuestion = ev
       current!.status = 'awaiting_clarify'
       current!.endedAt = ev.timestamp
+      continue
+    }
+
+    // 提问附带的长上下文（任务 140 问题①）：只收集不改回合状态，
+    // 由问答卡渲染在问题之前
+    if (category === 'clarify_detail') {
+      current!.clarifyDetails.push(ev)
       continue
     }
 

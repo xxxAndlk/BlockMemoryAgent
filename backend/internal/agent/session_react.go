@@ -103,6 +103,10 @@ type reactInternalSession struct {
 	// 正在等用户答复；sendMessage/answerClarify 把**原始答复文本**写入通道（不 parseApproval），
 	// ask_user 工具结果带回 ReAct 循环。与 approval 互斥（同时只能有一个待答复项）。
 	askUser chan string
+	// askUserBatch 是 ask_user 批量模式（任务 140）的答复通道：全部题目同屏挂出、
+	// 用户统一提交后写入逐题答复文本（下标与题目对齐）。与 approval/askUser 互斥
+	//（槽不变式：三者至多一个非 nil）。
+	askUserBatch chan []string
 	// pendingClarify 是当前待用户答复的确认/澄清请求（含审批问题），随会话快照透出给前端。
 	pendingClarify *ClarifyRequest
 	// stopTimer 是软停止销毁倒计时定时器（TODO #37）：Stop 后启动，到期硬销毁；
@@ -186,9 +190,9 @@ func newReactSessionStore() *reactSessionStore {
 	bootRand := genBootRand()
 	return &reactSessionStore{
 		sessions:  make(map[string]*reactInternalSession),
-		metrics:    newMetricsCollector(),
-		bootEpoch:  time.Now().UnixNano(),
-		bootRand:   bootRand,
+		metrics:   newMetricsCollector(),
+		bootEpoch: time.Now().UnixNano(),
+		bootRand:  bootRand,
 	}
 }
 
@@ -544,22 +548,22 @@ func (st *reactSessionStore) addEventDebug(session *reactInternalSession, eventT
 	// Web 详情需展示全量，TUI 在展示侧自行压缩（helpers.truncateToolOutput）。
 	// 组装内部事件结构体，填充所有字段。
 	ev := internalEvent{
-		Type:         eventType,
-		Agent:        agentName,
-		Message:      message,
-		Kind:         kind,
-		Tool:         tool,
-		ToolPath:     toolPath,
-		ToolOutput:   toolOutput,
-		ToolError:    toolError,
-		Success:      success,
-		Timestamp:    time.Now(),
-		Prompt:       prompt,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
+		Type:            eventType,
+		Agent:           agentName,
+		Message:         message,
+		Kind:            kind,
+		Tool:            tool,
+		ToolPath:        toolPath,
+		ToolOutput:      toolOutput,
+		ToolError:       toolError,
+		Success:         success,
+		Timestamp:       time.Now(),
+		Prompt:          prompt,
+		InputTokens:     inputTokens,
+		OutputTokens:    outputTokens,
 		CacheHitTokens:  cacheHit,
 		CacheMissTokens: cacheMiss,
-		DetailJSON:   detailJSON,
+		DetailJSON:      detailJSON,
 	}
 	// 加写锁后追加事件，保证并发安全。
 	st.mu.Lock()

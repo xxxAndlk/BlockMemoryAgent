@@ -51,15 +51,26 @@ type ClarifyOption struct {
 	Description string `json:"description,omitempty"` // 选项补充说明（可选）
 }
 
+// ClarifyQuestionItem 是批量澄清模式（任务 140）中的单个问题及其答复回填。
+type ClarifyQuestionItem struct {
+	Question        string          `json:"question"`                    // 本题问题文本
+	Kind            string          `json:"kind,omitempty"`              // choice / text
+	MultiSelect     bool            `json:"multi_select,omitempty"`      // 是否允许多选
+	Options         []ClarifyOption `json:"options,omitempty"`           // 本题结构化选项
+	Answer          string          `json:"answer,omitempty"`            // 用户答复（回填）
+	AnswerOptionIDs []string        `json:"answer_option_ids,omitempty"` // 答复命中选项 ID
+	AnsweredAt      *time.Time      `json:"answered_at,omitempty"`       // 答复时间
+}
+
 // ClarifyRequest 人机对话请求：Agent 在执行中遇到需要用户确认的问题时挂起，
 // 由 server 层通过 HTTP 暴露给前端，用户答复后恢复会话。
 type ClarifyRequest struct {
 	ID         string     `json:"id"`                    // 请求唯一 ID（用于答复对齐）
-	Question   string     `json:"question"`              // Agent 提给用户的问题
+	Question   string     `json:"question"`              // Agent 提给用户的问题（批量模式镜像第一题）
 	Context    string     `json:"context"`               // 触发澄清的上下文摘要（便于用户理解）
 	AgentID    string     `json:"agent_id"`              // 发起澄清的 Agent 实例 ID
 	CreatedAt  time.Time  `json:"created_at"`            // 创建时间
-	Answer     string     `json:"answer,omitempty"`      // 用户答复（回填）
+	Answer     string     `json:"answer,omitempty"`      // 用户答复（回填，批量模式镜像第一题）
 	AnsweredAt *time.Time `json:"answered_at,omitempty"` // 答复时间
 	// Kind 澄清类型（TODO #53）：confirm=破坏性操作确认 / choice=选项选择 /
 	// text=纯自由文本。缺省空串视为 text（向后兼容）。
@@ -70,6 +81,10 @@ type ClarifyRequest struct {
 	Options []ClarifyOption `json:"options,omitempty"`
 	// AnswerOptionIDs 答复时命中的选项 ID（多选按序）；自由文本答复为空。
 	AnswerOptionIDs []string `json:"answer_option_ids,omitempty"`
+	// Detail 附加长上下文（任务 140）：先于问题展示；question 只承载短问题句。
+	Detail string `json:"detail,omitempty"`
+	// Questions 批量模式（任务 140）的全部题目；len>1 表示批量（同屏分页、统一提交）。
+	Questions []ClarifyQuestionItem `json:"questions,omitempty"`
 }
 
 // UIEvent TUI 推送事件：向 bubbletea TUI / Web SSE 订阅者广播的事件信封。
