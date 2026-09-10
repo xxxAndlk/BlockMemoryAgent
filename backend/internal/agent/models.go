@@ -40,6 +40,8 @@ type ModelEntryView struct {
 	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
 	// Description 能力/成本描述（MetaAgent 选模型与界面展示用）。
 	Description string `json:"description,omitempty"`
+	// SelectableRoles 切换允许的角色白名单（空=全员可用；界面按目标角色过滤候选）。
+	SelectableRoles []string `json:"selectable_roles,omitempty"`
 }
 
 // RoleModelStatus 单个可切换角色的当前模型状态。
@@ -68,6 +70,7 @@ func (s *ReactService) ListModels(ctx context.Context) (*ModelCatalog, error) {
 			BaseURL:         e.BaseURL,
 			MaxOutputTokens: e.MaxOutputTokens,
 			Description:     e.Description,
+			SelectableRoles: e.SelectableRoles,
 		})
 	}
 	roles := s.modelFactory.SwitchableRoles()

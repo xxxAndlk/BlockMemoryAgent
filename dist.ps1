@@ -19,7 +19,7 @@ Pop-Location
 
 # dist 布局:config(含 skills_learned)/ web 产物 / plugins.d
 New-Item -ItemType Directory -Force -Path "$repo\dist\config", "$repo\dist\web", "$repo\dist\plugins.d" | Out-Null
-Copy-Item -Force "$repo\config\*.yaml", "$repo\config\soul.md", "$repo\config\user_profile.md" "$repo\dist\config\"
+Copy-Item -Force "$repo\config\*.yaml", "$repo\config\models.json", "$repo\config\soul.md", "$repo\config\user_profile.md" "$repo\dist\config\"
 if (Test-Path "$repo\dist\config\skills_learned") { Remove-Item -Recurse -Force "$repo\dist\config\skills_learned" }
 Copy-Item -Recurse "$repo\config\skills_learned" "$repo\dist\config\skills_learned"
 if (Test-Path "$repo\dist\web\dist") { Remove-Item -Recurse -Force "$repo\dist\web\dist" }

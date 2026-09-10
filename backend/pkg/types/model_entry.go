@@ -25,6 +25,11 @@ type ModelEntry struct {
 	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
 	// Description 能力/成本描述（人类可读），供 MetaAgent 选模型与 TUI/Web 展示。
 	Description string `json:"description,omitempty"`
+	// SelectableRoles 切换选用允许的角色白名单（set_role_model / set_agent_model /
+	// TUI / Web 选择器按目标角色过滤）。空/缺省 = 全员可用；非空 = 仅列内角色可切换
+	// 选用（如 k3 仅 ["meta"]），其余角色不可经切换通道使用；绑定（role_bindings /
+	// model_ref）不受限，仍可指向本条目。
+	SelectableRoles []string `json:"selectable_roles,omitempty"`
 }
 
 // DisplayName 展示名：Name 为空回退 ID。
@@ -33,4 +38,17 @@ func (e ModelEntry) DisplayName() string {
 		return e.Name
 	}
 	return e.ID
+}
+
+// SwitchableFor 报告条目对目标角色可否被切换选用（SelectableRoles 空 = 全员可用）。
+func (e ModelEntry) SwitchableFor(roleID string) bool {
+	if len(e.SelectableRoles) == 0 {
+		return true
+	}
+	for _, r := range e.SelectableRoles {
+		if r == roleID {
+			return true
+		}
+	}
+	return false
 }

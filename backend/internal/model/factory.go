@@ -275,6 +275,10 @@ func (f *ModelFactory) SetAgentModel(ctx context.Context, agentID, roleID, model
 	if cur, exists := f.agentOverrideOf(agentID); exists && cur.modelID == modelID && cur.cfg.Thinking == resolveThinking(f, roleID, thinking) {
 		return cur.cfg, nil
 	}
+	// 角色不在条目允许表内则拒绝（selectable_roles 白名单）。
+	if !entry.SwitchableFor(roleID) {
+		return types.AgentModelConfig{}, fmt.Errorf("模型 %q 仅限角色 %v 切换使用，角色 %q 不可选用", modelID, entry.SelectableRoles, roleID)
+	}
 
 	// 生效配置 = 角色侧行为参数 + 目标条目连接参数；thinking 沿用当前生效档（未显式指定）
 	newCfg := applyModelEntry(f.resolveBaseConfig(roleID), entry)
@@ -839,6 +843,10 @@ func (f *ModelFactory) SwitchModel(ctx context.Context, roleID, modelID, thinkin
 	// 同绑定短路（目标模型与思考档均已生效则无操作）
 	if b, ok := f.bindingFor(roleID); ok && b.ModelID == modelID && b.Thinking == thinking {
 		return f.resolveConfig(roleID)
+	}
+	// 角色不在条目允许表内则拒绝（selectable_roles 白名单；绑定/model_ref 不受限）。
+	if !entry.SwitchableFor(roleID) {
+		return types.AgentModelConfig{}, fmt.Errorf("模型 %q 仅限角色 %v 切换使用，角色 %q 不可选用", modelID, entry.SelectableRoles, roleID)
 	}
 
 	// 计算切换后的生效配置：角色行为参数 + 目标条目连接参数 + 思考覆盖

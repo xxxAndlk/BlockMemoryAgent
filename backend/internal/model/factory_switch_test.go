@@ -139,6 +139,42 @@ func TestSwitchModelValidation(t *testing.T) {
 	}
 }
 
+// TestSwitchableRolesWhitelist 验证 selectable_roles 白名单：白名单外角色切换/实例覆盖
+// 均拒绝且不探测；白名单内角色照常；同绑定短路先于白名单（已绑定的白名单外条目可重申）。
+func TestSwitchableRolesWhitelist(t *testing.T) {
+	f, store, _ := newSwitchTestFactory(t)
+	probes := 0
+	f.probeHook = func(ctx context.Context, cfg types.AgentModelConfig) error { probes++; return nil }
+	if err := store.Add(types.ModelEntry{ID: "meta-only", Provider: "openai", Model: "k3", APIKey: "k-k3", SelectableRoles: []string{"meta"}}); err != nil {
+		t.Fatalf("add meta-only entry: %v", err)
+	}
+	// 白名单外角色：SwitchModel 与 SetAgentModel 均拒绝，不探测。
+	if _, err := f.SwitchModel(context.Background(), "domain", "meta-only", ""); err == nil {
+		t.Fatal("domain 切换到 meta-only 条目应拒绝")
+	}
+	if _, err := f.SetAgentModel(context.Background(), "s1/domain-1", "domain", "meta-only", ""); err == nil {
+		t.Fatal("domain 实例覆盖 meta-only 条目应拒绝")
+	}
+	// 同绑定短路先于白名单：meta 已绑 meta-only 后重申成功（不探测）。
+	if _, err := f.SwitchModel(context.Background(), "meta", "meta-only", ""); err != nil {
+		t.Fatalf("meta 切换到 meta-only: %v", err)
+	}
+	if _, err := f.SwitchModel(context.Background(), "meta", "meta-only", ""); err != nil {
+		t.Fatalf("同绑定重申应短路放行: %v", err)
+	}
+	// 白名单内角色（meta）实例覆盖可用。
+	if _, err := f.SetAgentModel(context.Background(), "s1", "meta", "meta-only", ""); err != nil {
+		t.Fatalf("meta 实例覆盖 meta-only: %v", err)
+	}
+	if probes != 3 {
+		t.Fatalf("probe called %d times, want 3 (meta 切换 + meta 实例覆盖 + domain 普通条目)", probes)
+	}
+	// 无白名单条目不受影响。
+	if _, err := f.SwitchModel(context.Background(), "domain", "glm-flash", ""); err != nil {
+		t.Fatalf("domain 切换普通条目: %v", err)
+	}
+}
+
 func TestSwitchModelSameBindingShortCircuit(t *testing.T) {
 	f, _, _ := newSwitchTestFactory(t)
 	calls := 0

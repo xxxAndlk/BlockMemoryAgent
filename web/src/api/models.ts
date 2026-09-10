@@ -9,6 +9,8 @@ export interface ModelEntryView {
   base_url?: string
   max_output_tokens?: number
   description?: string
+  /** 切换允许的角色白名单（缺省=全员可用；按目标角色过滤切换候选）。 */
+  selectable_roles?: string[]
 }
 
 /** 单个可切换角色的当前模型状态（与后端 agent.RoleModelStatus 对齐）。 */

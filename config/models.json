@@ -28,7 +28,7 @@
       "api_key": "${ANTHROPIC_BASE_URL_FOUR}",
       "base_url": "${OPENAI_API_KEY_TWO}",
       "max_output_tokens": 32768,
-      "description": "GLM 5.3 Flash 备用端点（抵扣 0.5），同 ark-glm-5.3-flash 能力"
+      "description": "GLM 5.3 Flash 备用端点，每日23点到次日9点免费，需及时切换，同 ark-glm-5.3-flash 能力"
     },
     {
       "id": "doubao-seed-2.0-mini",
@@ -58,7 +58,7 @@
       "api_key": "${OPENAI_API_KEY}",
       "base_url": "${OPENAI_BASE_URL}",
       "max_output_tokens": 32768,
-      "description": "DeepSeek responses 协议代理（抵扣约 0.5），带自动前缀缓存"
+      "description": "成本稍高，速度快质量高"
     },
     {
       "id": "ark-glm-5.3",
@@ -84,11 +84,12 @@
       "id": "kimi-k3",
       "name": "Kimi K3",
       "provider": "anthropic",
-      "model": "kimi-k3",
+      "model": "k3",
       "api_key": "${ANTHROPIC_API_KEY_TWO}",
       "base_url": "${ANTHROPIC_BASE_URL_TWO}",
       "max_output_tokens": 32768,
-      "description": "高成本强推理档（抵扣 10），仅硬骨头任务临时切换使用（ark coding 端点硬限 32768）"
+      "description": "高成本强推理档，仅硬骨头任务临时切换使用（ark coding 端点硬限 32768）",
+      "selectable_roles": ["meta"]
     },
     {
       "id": "gemini-3.8-flash",

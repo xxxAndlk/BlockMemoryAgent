@@ -318,9 +318,12 @@ func (m *Model) buildModelRoleLines() []string {
 	return lines
 }
 
-// buildModelModelLines 弹窗 stage 1 内容：可选模型清单（末项=新增模型表单入口）。
+// buildModelModelLines 弹窗 stage 1 内容：当前目标角色的可选模型清单（selectable_roles
+// 白名单过滤；末项=新增模型表单入口）。选中下标映射须与 handleModelEnter 的
+// selectableModelsFor 口径一致。
 func (m *Model) buildModelModelLines() []string {
-	lines := make([]string, 0, len(m.modelModels)+2)
+	models := selectableModelsFor(m.modelModels, m.modelSelRole)
+	lines := make([]string, 0, len(models)+2)
 	thinking := ""
 	for _, r := range m.modelRoles {
 		if r.RoleID == m.modelSelRole {
@@ -330,7 +333,7 @@ func (m *Model) buildModelModelLines() []string {
 	}
 	lines = append(lines, fmt.Sprintf("target role: %s  thinking=%s  (enter=pick, esc=back)",
 		m.modelSelRole, thinkingDisplay(thinking)))
-	for _, e := range m.modelModels {
+	for _, e := range models {
 		extra := ""
 		if e.BaseURL != "" {
 			extra = "  " + e.BaseURL
@@ -353,6 +356,31 @@ func (m *Model) modelRoleStatus(roleID string) (agent.RoleModelStatus, bool) {
 		}
 	}
 	return agent.RoleModelStatus{}, false
+}
+
+// selectableModelsFor 按目标角色过滤切换候选：条目 selectable_roles 非空且不含
+// 目标角色时剔除（如 k3 仅限 meta，domain/叶子弹窗不可见；工厂层另有 fail-closed）。
+func selectableModelsFor(in []agent.ModelEntryView, roleID string) []agent.ModelEntryView {
+	out := make([]agent.ModelEntryView, 0, len(in))
+	for _, e := range in {
+		if entryVisibleFor(e, roleID) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// entryVisibleFor 单条目对目标角色是否为合法切换候选（白名单空 = 全员）。
+func entryVisibleFor(e agent.ModelEntryView, roleID string) bool {
+	if len(e.SelectableRoles) == 0 {
+		return true
+	}
+	for _, r := range e.SelectableRoles {
+		if r == roleID {
+			return true
+		}
+	}
+	return false
 }
 
 // thinkingDisplay 思考档位展示名（空值 → 端点默认）。
@@ -498,9 +526,11 @@ func (m *Model) handleModelEnter() tea.Cmd {
 		m.overlayPanel.cursor = 0
 		return nil
 	case 1:
-		// 减去首行提示行得到模型下标；末项是"新增模型"入口。
+		// 减去首行提示行得到模型下标（selectable_roles 过滤后的候选清单，与渲染同源）；
+		// 末项是"新增模型"入口。
+		models := selectableModelsFor(m.modelModels, m.modelSelRole)
 		idx := m.overlayPanel.cursor - 1
-		if idx == len(m.modelModels) {
+		if idx == len(models) {
 			m.modelStage = 3
 			m.overlayPanel.title = "Add Model (Tab 切换字段, Enter 下一项, Esc 返回)"
 			m.initModelForm()
@@ -513,10 +543,10 @@ func (m *Model) handleModelEnter() tea.Cmd {
 			}
 			return textinput.Blink
 		}
-		if idx < 0 || idx >= len(m.modelModels) {
+		if idx < 0 || idx >= len(models) {
 			return nil
 		}
-		m.modelSelModel = m.modelModels[idx]
+		m.modelSelModel = models[idx]
 		m.modelStage = 2
 		m.overlayPanel.title = "Switch Model · Thinking 强度"
 		m.overlayPanel.lines = m.buildModelThinkingLines()

@@ -100,6 +100,30 @@ func TestListModelsTool_ListsEntriesAndTargets(t *testing.T) {
 	}
 }
 
+// TestListModelsTool_FiltersWhitelistOnlyForMeta 验证 selectable_roles 白名单：
+// 仅限 meta 的条目对工具目标角色（domain/fixed）全部不可选，不进 list_models 输出
+//（set_role_model/set_agent_model 均以 domain/叶子为目标，防误选白烧轮次）。
+func TestListModelsTool_FiltersWhitelistOnlyForMeta(t *testing.T) {
+	fs := newFakeSwitcher()
+	fs.entries = append(fs.entries, types.ModelEntry{
+		ID: "meta-only", Provider: "p", Model: "k3", Description: "仅限 meta",
+		SelectableRoles: []string{"meta"},
+	})
+	res := (&listModelsTool{switcher: fs}).Execute(context.Background(), nil)
+	if !res.Success {
+		t.Fatalf("list_models failed: %s", res.Error)
+	}
+	if strings.Contains(res.Output, "meta-only") {
+		t.Errorf("仅限 meta 的条目不应出现在 list_models: %s", res.Output)
+	}
+	// 白名单含工具目标角色（domain）时照常输出。
+	fs.entries[2].SelectableRoles = []string{"meta", "domain"}
+	res = (&listModelsTool{switcher: fs}).Execute(context.Background(), nil)
+	if !strings.Contains(res.Output, "meta-only") {
+		t.Errorf("白名单含 domain 的条目应出现: %s", res.Output)
+	}
+}
+
 func TestSetRoleModelTool_HappyPath(t *testing.T) {
 	fs := newFakeSwitcher()
 	res := (&setRoleModelTool{switcher: fs}).Execute(context.Background(), map[string]any{

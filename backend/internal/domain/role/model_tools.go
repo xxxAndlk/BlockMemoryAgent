@@ -83,8 +83,21 @@ func (t *listModelsTool) Execute(ctx context.Context, args map[string]any) *tool
 		return &tool.Result{Tool: "list_models", Error: "model switcher not configured"}
 	}
 	entries := t.switcher.RegistryModels()
+	targets := modelToolTargets(t.switcher)
 	modelsOut := make([]map[string]any, 0, len(entries))
 	for _, e := range entries {
+		// selectable_roles 白名单：对全部工具目标角色都不可选用的条目（如仅限 meta）
+		// 不进 LLM 视野防误选（set_role_model/set_agent_model 切换时工厂层也会 fail-closed）。
+		visible := false
+		for _, r := range targets {
+			if e.SwitchableFor(r) {
+				visible = true
+				break
+			}
+		}
+		if !visible {
+			continue
+		}
 		item := map[string]any{
 			"id":       e.ID,
 			"provider": e.Provider,

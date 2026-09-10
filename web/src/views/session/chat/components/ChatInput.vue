@@ -143,6 +143,13 @@ const currentRoleStatus = computed(
   () => catalog.value?.roles.find((r) => r.role_id === selectedRole.value) ?? null,
 )
 
+// 切换候选：selectable_roles 白名单按目标角色过滤（缺省=全员可用）。
+const switchableModels = computed(() =>
+  (catalog.value?.models ?? []).filter(
+    (m) => !m.selectable_roles || m.selectable_roles.includes(selectedRole.value),
+  ),
+)
+
 watch(modelPopoverVisible, (v) => {
   if (v) ensureLoaded()
 })
@@ -291,7 +298,7 @@ function onKeydown(e: KeyboardEvent) {
               <div class="mb-1 text-ink-2">模型</div>
               <el-select v-model="selectedModelId" size="small" class="w-full" filterable
                          placeholder="选择模型" :loading="modelsLoading">
-                <el-option v-for="m in catalog?.models || []" :key="m.id" :value="m.id"
+                <el-option v-for="m in switchableModels" :key="m.id" :value="m.id"
                            :label="`${m.id} · ${m.provider}/${m.model}`" />
               </el-select>
             </div>

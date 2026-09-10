@@ -6,6 +6,9 @@
 # models.json 条目上维护；角色侧 max_tokens 仅在需要更低上限时显式覆盖（>0 优先）。
 # models.json 改动免重启热更新（mtime 检查）；
 # 运行时切换（TUI /model、Web 对话栏右下选择器）持久化到 models.json role_bindings。
+# 条目可选 selectable_roles 角色白名单：非空时仅列内角色可经切换通道选用
+#（如 kimi-k3 仅 ["meta"]，domain/叶子 TUI/Web/set_role_model/set_agent_model 均不可选），
+# 绑定（role_bindings/model_ref）不受限。
 #
 # 提示词不承载于本文件：全部角色系统提示词内置于 pkg/prompts（Go 常量编译进二进制，
 # 配置目录不可见/不可改）；本文件残留的 system_prompt/prompt_template 键会被启动加载
