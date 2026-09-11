@@ -216,6 +216,17 @@ function pickBatchOption(i: number, optId: string) {
   advanceToUnanswered()
 }
 
+// 内置自由文本逃生口：部分提问的选项集没有 id=other 逃生项（如「我会在补充说明里
+// 写具体意见」），选完选项后用户没有输入补充内容的地方。进入时若当前草稿是已选项
+// 的 id 则清空（预填 "o2" 这类选项 id 对自由文本毫无意义），从零输入。
+function enterOtherMode(i: number) {
+  otherModeIndex.value = i
+  const cur = draftOf(i)
+  if (currentQuestion.value?.options?.some((o) => o.id === cur)) {
+    setDraft(i, '')
+  }
+}
+
 // 多选「确定」：勾选 id 逗号分隔落草稿
 function confirmBatchMulti(i: number) {
   if (!selectedOptions.value.length) return
@@ -336,6 +347,12 @@ async function submitBatch() {
                         @click="pickBatchOption(pagerIndex, opt.id)">
                   {{ opt.label }}
                   <span v-if="opt.description" class="text-amber-600/80 dark:text-yellow-400/70 ml-1.5">{{ opt.description }}</span>
+                </button>
+                <!-- 内置自由文本逃生口：选项集没有 other 项时也能补充说明 -->
+                <button v-if="otherModeIndex !== pagerIndex" type="button" :disabled="submittingBatch"
+                        class="self-start text-xs rounded-md border border-dashed border-amber-300 bg-amber-50/60 hover:bg-amber-100 px-2.5 py-1.5 text-amber-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed dark:border-yellow-700/40 dark:bg-yellow-900/20 dark:hover:bg-yellow-900/40 dark:text-yellow-200"
+                        @click="enterOtherMode(pagerIndex)">
+                  其他：自行输入答复
                 </button>
                 <!-- 「其他」逃生：自由文本输入 -->
                 <div v-if="otherModeIndex === pagerIndex">

@@ -181,6 +181,47 @@ func TestAskUserBatchFlow(t *testing.T) {
 	}
 }
 
+// TestAskUserBatch_ControlPathStringSlice 经 Control 边界提交批量答复（HTTP 路径回归）：
+// gin 解码的 Args["answers"] 是 []string，旧实现只断言 []any 会把批量答复静默丢成
+// 空切片 → answerClarify 误报 "answer cannot be empty"（HTTP 500）。
+func TestAskUserBatch_ControlPathStringSlice(t *testing.T) {
+	llm := &askCaptureProvider{responses: []*blades.Message{
+		batchAskToolCall(),
+		blades.AssistantMessage("完成"),
+	}}
+	svc := newBatchTestService(t, llm)
+	ctx := context.Background()
+
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "搭建服务"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	waitBatchPending(t, svc, created.ID)
+
+	err = svc.Control(ctx, created.ID, ControlCommand{
+		Op: ControlOpClarify,
+		Args: map[string]any{
+			"answer":  "", // HTTP 层批量提交时单题字段为空
+			"answers": []string{"pg", "yaml"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Control 批量答复（[]string）应成功, err=%v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		sess, _ := svc.Get(ctx, created.ID)
+		if sess != nil && sess.Status == string(enums.SessionStatusCompleted) {
+			if !llm.requestContains("答复: PostgreSQL") || !llm.requestContains("答复: yaml") {
+				t.Fatalf("batch tool result should carry per-question answers into next request")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("session did not complete after batch answer via Control")
+}
+
 // TestAskUserBatch_CountMismatchRejected 数量不一致 / 逐题空白 → 显式拒绝且会话仍挂起。
 func TestAskUserBatch_CountMismatchRejected(t *testing.T) {
 	llm := &askCaptureProvider{responses: []*blades.Message{

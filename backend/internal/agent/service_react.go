@@ -1212,9 +1212,15 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		return s.sendMessage(ctx, sessionID, content)
 	case ControlOpClarify:
 		// 澄清答复：提取 answer（单题）与 answers（批量逐题，任务 140）并答复。
+		// answers 兼容两种形态：HTTP 层 gin 解码后直接传入 []string；经 JSON
+		// 序列化的通道（cmdqueue 等）还原为 []any。只断言 []any 会把 HTTP 批量
+		// 答复静默丢成空切片，answerClarify 误报 "answer cannot be empty"（500）。
 		answer, _ := cmd.Args["answer"].(string)
 		var answers []string
-		if raw, ok := cmd.Args["answers"].([]any); ok {
+		switch raw := cmd.Args["answers"].(type) {
+		case []string:
+			answers = raw
+		case []any:
 			for _, a := range raw {
 				if s, ok := a.(string); ok {
 					answers = append(answers, s)
