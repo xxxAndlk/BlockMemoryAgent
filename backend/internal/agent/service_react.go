@@ -1800,9 +1800,12 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 		},
 	}
 	// 权威树快照 → 实例视图：ModuleID=节点 ID，ParentID=父节点 ID（顶层挂 meta）。
+	// 树节点的 ParentID 是派发时的父 agentID（顶层子 Agent 记的是 meta 的 agentID==sessionID），
+	// 而上方 meta 实例的 ModuleID 固定为 "meta"；不归一化会让前端按 parent_id 组树时
+	// 找不到父节点、整棵子树被丢弃（2026-09-11 实证：编排面板只剩 MetaAgent）。
 	for _, n := range s.TreeFor(sessionID).Snapshot() {
 		parent := n.ParentID
-		if parent == "" {
+		if parent == "" || parent == sessionID {
 			parent = "meta"
 		}
 		name := n.Domain

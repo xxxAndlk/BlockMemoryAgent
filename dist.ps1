@@ -17,11 +17,12 @@ go build -o ../dist/bin/bma-server.exe .; if ($LASTEXITCODE -ne 0) { throw "go b
 go build -o ../dist/bin/tui.exe ./cmd/tui; if ($LASTEXITCODE -ne 0) { throw "go build tui 失败" }
 Pop-Location
 
-# dist 布局:config(含 skills_learned)/ web 产物 / plugins.d
+# dist 布局:config / web 产物 / plugins.d
+# skills_learned 是运行时产物(自进化技能),不入 dist、install 也不覆盖安装目录现场数据。
 New-Item -ItemType Directory -Force -Path "$repo\dist\config", "$repo\dist\web", "$repo\dist\plugins.d" | Out-Null
 Copy-Item -Force "$repo\config\*.yaml", "$repo\config\models.json", "$repo\config\soul.md", "$repo\config\user_profile.md" "$repo\dist\config\"
+# 清掉旧版打包残留(若曾拷入),防 install 全量覆盖时误伤安装目录的 skills_learned
 if (Test-Path "$repo\dist\config\skills_learned") { Remove-Item -Recurse -Force "$repo\dist\config\skills_learned" }
-Copy-Item -Recurse "$repo\config\skills_learned" "$repo\dist\config\skills_learned"
 if (Test-Path "$repo\dist\web\dist") { Remove-Item -Recurse -Force "$repo\dist\web\dist" }
 Copy-Item -Recurse "$repo\web\dist" "$repo\dist\web\dist"
 

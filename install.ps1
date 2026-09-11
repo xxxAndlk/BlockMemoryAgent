@@ -12,7 +12,9 @@ Copy-Item -Force "$src\bin\*" "$target\bin\"
 if (Test-Path "$src\web\dist") { New-Item -ItemType Directory -Force -Path "$target\web" | Out-Null; Copy-Item -Force -Recurse "$src\web\dist" "$target\web\" }
 # 配置:config/ 下全部文件每次直接覆盖(roles.yaml/models.json/plugins.yaml/skills.yaml 等
 # 与二进制配套,旧版会缺新工具/新字段)。.env 不在此目录,仍只补缺不覆盖,保留现场密钥。
+# skills_learned 例外:运行时产物(自进化技能),保留安装目录现场数据,不覆盖。
 foreach ($f in Get-ChildItem "$src\config") {
+    if ($f.Name -eq "skills_learned") { continue }
     $dst = Join-Path "$target\config" $f.Name
     Copy-Item -Force $f.FullName $dst
 }

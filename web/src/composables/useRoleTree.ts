@@ -69,8 +69,13 @@ export function useRoleTree(agents: MaybeRef<AgentNode[]>) {
     })
 
     list.forEach((a) => {
-      if (a.parent_id && map.has(a.parent_id)) {
+      if (!a.parent_id) return // 根节点已在第一轮挂上
+      if (map.has(a.parent_id)) {
         map.get(a.parent_id)!.children.push(map.get(a.inst_id)!)
+      } else {
+        // 父节点缺失（后端 parent_id 与实例 ID 口径漂移的兜底）：挂顶层而非静默丢弃，
+        // 否则整棵子树从编排面板消失（2026-09-11 实证：只剩 MetaAgent）。
+        root.push(map.get(a.inst_id)!)
       }
     })
 

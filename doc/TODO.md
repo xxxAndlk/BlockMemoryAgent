@@ -96,3 +96,34 @@
 
 11. **任务完成后提示词三小项 + 提示词正文日期清扫**（①-④ 全部落地迁出：变更.md 任务 132——① assistant_template 补【交付】段、② domain 终答正文 ≤500 字符超出落盘留路径、③ 五叶子公共段收敛为 `pkg/config/leafCommonBlock` 单一来源加载期拼接（含 doc_assistant 自检口径泛化修正）、④ 提示词正文 27 处日期/迭代编号清扫（`#` 注释行保留）。以下只留观察点）
    - **观察点**（真机会话验证）：① 临时助手回传摘要含路径+证据（真机抽查 mailbox）；② domain 摘要超 4000 runes 截断落盘发生率下降（ctx_inject/mailbox 日志）；③ 塔防冒烟确认五叶子公共段泛化（自检口径/兄弟文件句统一）无行为回潮；④ 后续公共段修改只动 leafCommonBlock 一处即五叶子同步。
+
+12. **Agent 编排页：层级树图 + 单 Agent 对话页 + 用户直连**（2026-09-11 立项；设计已批准，spec 与 14 任务实现计划已落稿；未开工）
+    - 依据文档：
+      - 设计定稿：`docs/superpowers/specs/2026-09-11-agent-orch-board-design.md`
+      - 实现计划（含全部代码）：`docs/superpowers/plans/2026-09-11-agent-orch-board.md`
+    - 前置待决（已定）：
+      - [x] git 策略：全程不 commit（2026-09-11 用户拍板）——执行者跳过计划各任务末尾的 Commit 步骤，评审用工作区 diff
+      - [x] 执行分工：规划者只出计划，代码实施由其他执行者按本计划逐任务执行
+    - 全局约束（所有任务遵守，详见计划 Global Constraints）：
+      - 零新依赖；不动 `orchestrator.Status` 枚举、SSE 通道、压缩金字塔、mailbox 投递语义
+      - 观测写（Redis 热写 / trace 留痕 / 终态落库）一律 best-effort，失败仅记日志不阻塞 ReAct 主循环
+      - Redis 不可用全链路降级：写侧跳过、读侧回退 PG，端点不报错
+      - 后端测试不依赖真实 PG/Redis（nil-DB no-op + fake 模式）；前端验收 = `cd web && pnpm build`（vue-tsc）+ 手动清单
+      - 新代码注释中文，说明"为什么"
+    - 任务清单（依赖序执行，格式 Files/Interfaces/checkbox steps，详见计划）：
+      - [ ] **Task 1** `child_wait` 展示态：`waitForChildren` 上报等子信号（只换 kind，不刷 lastTS、不冒泡）
+      - [ ] **Task 2** mailbox trace 钩子：`WithTrace` + Send 重构，邮件双写 `agent_events`（type=mailbox）留痕
+      - [ ] **Task 3** Redis 热层：`redis_agentmsg.go` AgentMsgEntry/AgentMsgRedisStore（TTL 24h、cap 500、nil 安全）
+      - [ ] **Task 4** MessageLogger 接线：ReActAgent 每条入史消息热写 Redis + dispatcher 五处终态 saveTerminalHistory 全量落 PG
+      - [ ] **Task 5** 查询端点：`GET /sessions/:id/agents/:aid/messages`（热层优先 PG 回退，合并分页 + 留痕）
+      - [ ] **Task 6** 复活与注入内核：`Tree.Reopen`（仅终态可复活）+ `InjectUserMessage`（投邮件 + pokeParent 唤醒）+ `ReviveWithMessage`（同 ID 重跑，种子=原任务+上轮结果+用户消息，通知父"复活返工"）
+      - [ ] **Task 7** 直连端点：`POST /sessions/:id/agents/:aid/message` 状态机路由（waiting 注入/终态复活/running 409 ErrAgentBusy/paused·idle·meta 拒绝）
+      - [ ] **Task 8** 提示词规程：DomainAgent 加【用户直连消息】处置段（先盘点自身+下游→重派/新派/纳入/答进度），MetaAgent 加复活返工感知段
+      - [ ] **Task 9** 前端 API 层：AgentMessageItem/AgentMailItem/AgentConversation 类型 + getAgentMessages/sendAgentMessage
+      - [ ] **Task 10** 树图基础：useTreeLayout（tidy 两遍法，零图库）+ AgentTreeNode（状态点/徽章/活动小字/hover 中断终止）+ AgentTreeCanvas（SVG 贝塞尔边 + 缩放拖拽适应）
+      - [ ] **Task 11** 对话面板 AgentChatPanel：消息流（用户直连高亮/mailbox 灰卡/任务输入/assistant+思考+工具 chips/tool 折叠）+ 留痕 tab + 三态发送框（waiting 可发/running 禁用转圈/终态可发复活）
+      - [ ] **Task 12** 编排主视图 OrchView + index.vue 接线（`?view=orch`、选中态 `?agent=` 同步、第三个切换按钮 🌳 编排）
+      - [ ] **Task 13** 看板时间线化：useGoalTimeline（user/派发/完成/失败里程碑 + board.tasks 兜底）+ 任务目标折叠展开 + 旧 el-tree 编排区块换"打开编排页 →"入口 + 删 useRoleTree.ts
+      - [ ] **Task 14** 总验证：后端全量测试 + 前端构建 + 手动清单 6 项（树图/三态发送/复活/中断终止/Redis 降级/中断恢复连续性）+ CLAUDE.md·TODO.md 最小补记
+    - 验收口径：编排页树图层级与连线正确、点击任意 Agent 看全量对话与交互留痕；waiting 注入即时唤醒、终态复活重跑父知悉、running 发送禁用并可中断终止；Redis 停掉对话页仍可读（PG 回退）；看板目标时间线随事件增长且 events 空时有兜底
+    - 不做：不引入图布局库（tidy 自绘）；mailbox 留痕不建新表（复用 agent_events）；复活不回溯父状态（父经邮件感知）；不扩 SSE（对话页 3s 轮询增量）；paused/idle 不可直连（paused 走监控页恢复，idle 经 MetaAgent 派发）；meta 不开放直连（走主对话通道）

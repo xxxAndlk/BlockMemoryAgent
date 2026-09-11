@@ -94,8 +94,9 @@ function nodeColor(type: string) {
 </script>
 
 <template>
-  <div class="h-14 border-b border-line bg-card flex items-center px-6 gap-4 shrink-0">
-    <div class="flex items-center gap-2 min-w-0 flex-1">
+  <!-- 两行布局：操作区与 Agent 链路分行，中栏被侧栏挤窄时不再互相叠压 -->
+  <div class="border-b border-line bg-card px-6 py-2 shrink-0">
+    <div class="flex items-center gap-2 min-w-0 flex-wrap">
       <el-icon class="text-blue-400"><ChatLineRound /></el-icon>
       <span class="font-semibold text-ink truncate">
         {{ session?.goal || '尚未选择会话' }}
@@ -133,8 +134,8 @@ function nodeColor(type: string) {
       </el-select>
     </div>
 
-    <!-- Agent 链路 -->
-    <div v-if="chain.length" class="flex items-center gap-1.5 text-xs text-ink-2 overflow-x-auto max-w-[60%]">
+    <!-- Agent 链路（独立一行，横向滚动） -->
+    <div v-if="chain.length" class="flex items-center gap-1.5 text-xs text-ink-2 overflow-x-auto mt-1.5">
       <template v-for="(a, i) in chain" :key="a.inst_id">
         <span :class="nodeColor(a.type)" class="whitespace-nowrap">{{ a.name }}</span>
         <el-icon v-if="i < chain.length - 1" class="text-ink-3 text-[10px]"><ArrowRight /></el-icon>

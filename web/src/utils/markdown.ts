@@ -1,4 +1,4 @@
-import { marked } from 'marked'
+import { marked, Renderer } from 'marked'
 import DOMPurify from 'dompurify'
 
 marked.setOptions({
@@ -7,11 +7,23 @@ marked.setOptions({
 })
 
 const renderer = new marked.Renderer()
-renderer.link = ({ href, title, tokens }) => {
+// 注意：必须用 function + this.parser，不能读模块级 renderer.parser——marked.use()
+// 会把自定义渲染器包进新实例，parser 只挂在被 marked 管理的实例上；读模块变量拿到
+// undefined，任何裸链接（GFM autolink，如 **http://x**）触发即抛 "parseInline of
+// undefined"，Vue 组件渲染整体失败空白（2026-09-11 实证：回复含粗体裸链接时
+// 对话框该回合/日志该行全部空白）。
+renderer.link = function (this: Renderer, { href, title, tokens }) {
   const safe = /^https?:\/\//i.test(href || '') ? href : '#'
   const t = title ? ` title="${String(title).replace(/"/g, '&quot;')}"` : ''
-  const text = (renderer.parser.parseInline(tokens) as string)
+  const text = this.parser ? this.parser.parseInline(tokens) : escapePlain(tokens)
   return `<a href="${safe}" target="_blank" rel="noopener noreferrer"${t}>${text}</a>`
+}
+
+// escapePlain 是 parser 缺失时的兜底：把 link 子 token 原文转义为纯文本。
+function escapePlain(tokens: { raw?: string }[] | undefined): string {
+  return (tokens || [])
+    .map((tk) => (tk?.raw || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'))
+    .join('')
 }
 renderer.html = () => ''
 // DeepSeek 风格代码块：语言标签 + 复制/下载头栏。按钮交互由容器事件委托处理
@@ -52,8 +64,21 @@ const purifyConfig = {
 
 export function renderMd(src: string | undefined | null): string {
   if (!src) return ''
-  const html = marked.parse(src, { async: false }) as string
+  let html: string
+  try {
+    html = marked.parse(src, { async: false }) as string
+  } catch (e) {
+    // 渲染器异常兜底：宁可降级纯文本，也不能让一个 markdown 报错把整个组件渲染带崩
+    //（Vue 渲染函数抛错会整块空白——2026-09-11 link renderer 事故）。
+    console.error('[markdown] parse failed, fallback to plain text:', e)
+    html = `<pre class="md-fallback">${escapePlainText(src)}</pre>`
+  }
   return DOMPurify.sanitize(html, purifyConfig) as unknown as string
+}
+
+// escapePlainText 把任意文本转义为可安全入 HTML 的纯文本。
+function escapePlainText(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
 export function esc(s: string | undefined | null): string {
