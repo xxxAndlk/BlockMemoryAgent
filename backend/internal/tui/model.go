@@ -108,6 +108,10 @@ type Model struct {
 	// clarifyID 记录当前已进入澄清模式的 PendingClarify.ID，
 	// 同一 session 多轮 ask_user 时据此重置 clarifyCursor/clarifySel。
 	clarifyID string
+	// clarifyPage 是批量问答（任务 140）的当前页下标；clarifyDrafts 逐题草稿
+	//（下标对齐 PendingClarify.Questions）。页切换/新问题 ID/离开待澄清时重置。
+	clarifyPage   int
+	clarifyDrafts map[int]clarifyBatchDraft
 
 	// streamEvents 接收当前选中会话的 agent.Stream 事件，用于触发即时刷新。
 	streamEvents chan agent.Event
@@ -167,6 +171,15 @@ func (s *sharedState) setFlash(msg string) {
 	s.mu.Lock()
 	s.flash = msg
 	s.flashUntil = time.Now().Add(2 * time.Second)
+	s.mu.Unlock()
+}
+
+// setFlashLong 设置一条 5 秒后过期的闪屏提示（任务 140 问题②：批量提交的
+// 「已收到，正在思考中…」确认需要更长可见时长，轮询翻 running 后由 spinner 接力）。
+func (s *sharedState) setFlashLong(msg string) {
+	s.mu.Lock()
+	s.flash = msg
+	s.flashUntil = time.Now().Add(5 * time.Second)
 	s.mu.Unlock()
 }
 
@@ -517,6 +530,9 @@ func (m *Model) syncInputMode() {
 			m.clarifyID = pc.ID
 			m.clarifyCursor = 0
 			m.clarifySel = nil
+			// 批量问答（任务 140）：新问题重置页码与逐题草稿
+			m.clarifyPage = 0
+			m.clarifyDrafts = nil
 		}
 		return
 	}
@@ -526,6 +542,8 @@ func (m *Model) syncInputMode() {
 	m.clarifyID = ""
 	m.clarifyCursor = 0
 	m.clarifySel = nil
+	m.clarifyPage = 0
+	m.clarifyDrafts = nil
 }
 
 // toServerSession 将 agent.Session DTO 转换为 TUI 内部仍在使用的 server.Session 类型。

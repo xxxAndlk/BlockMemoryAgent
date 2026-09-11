@@ -19,6 +19,24 @@ export interface ClarifyOption {
   description?: string
 }
 
+/** 批量待澄清的单题（任务 140，SSE awaiting_clarify 帧 questions 数组项；与后端 ClarifyQuestionItem 对齐） */
+export interface ClarifyQuestionItem {
+  question: string
+  multi_select?: boolean
+  options?: ClarifyOption[]
+}
+
+/** SSE awaiting_clarify 帧驱动的待澄清状态（不 push 进 events，答复后复位） */
+export interface ClarifyPending {
+  options: ClarifyOption[]
+  multiSelect: boolean
+  questionId: string
+  /** 长上下文（进度盘点/计划全文）：展示在问题之前（任务 140 问题①） */
+  detail?: string
+  /** 批量模式题目列表；长度>1 为批量（同屏分页改选、统一提交），缺失/≤1 为单题 */
+  questions?: ClarifyQuestionItem[]
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string

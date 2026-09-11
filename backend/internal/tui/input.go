@@ -82,6 +82,12 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.inputBar.cursor++
 			return m, nil
 		}
+		// 批量问答（任务 140 问题③）：Enter 记当前题草稿并跳下一未答题；
+		// 全部作答后任意页回车整组统一提交。斜杠命令仍走普通命令解析。
+		if m.batchClarifyActive() && !isPasteEnter &&
+			!strings.HasPrefix(strings.TrimSpace(string(m.inputBar.runes)), "/") {
+			return m.clarifyBatchEnter()
+		}
 		// TODO #53：澄清选项导航模式且输入为空时，Enter 提交当前选项
 		// （单选=高亮项 ID；多选=勾选集 join ","，后端按 ID 解析）。
 		// 输入栏已有文字时走普通提交（自由文本答复优先）。
@@ -111,7 +117,8 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.inputBar.mode = inputNormal
 			// 保持焦点在输入栏，方便用户继续操作。
 			m.focus = panelInput
-			m.flashMsg("已选择: " + label)
+			// 问题②（任务 140）：提交确认放宽到 5s，轮询翻 running 后由 spinner 接力。
+			m.ensureShared().setFlashLong("已选择: " + label + " · 已收到，正在思考中…")
 			return m, nil
 		}
 		// 非粘贴 Enter：提交输入。
@@ -178,8 +185,9 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyDown:
 		// 澄清选项导航（TODO #53）：↓ 下移高亮选项，优先于历史输入浏览。
+		// 批量问答（任务 140）：在当前页题目选项范围内移动。
 		if m.clarifyNavActive() {
-			if pc := m.pendingClarify(); m.clarifyCursor < len(pc.Options)-1 {
+			if opts := m.currentClarifyOptions(m.pendingClarify()); m.clarifyCursor < len(opts)-1 {
 				m.clarifyCursor++
 			}
 			return m, nil
@@ -223,12 +231,21 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyLeft:
+		// 批量问答（任务 140 问题③）：输入框为空时 ←/→ 翻页回改；否则维持文本光标语义。
+		if m.batchClarifyActive() && len(m.inputBar.runes) == 0 {
+			m.clarifyPageGo(m.clarifyPage - 1)
+			return m, nil
+		}
 		if m.inputBar.cursor > 0 {
 			m.inputBar.cursor--
 		}
 		return m, nil
 
 	case tea.KeyRight:
+		if m.batchClarifyActive() && len(m.inputBar.runes) == 0 {
+			m.clarifyPageGo(m.clarifyPage + 1)
+			return m, nil
+		}
 		if m.inputBar.cursor < len(m.inputBar.runes) {
 			m.inputBar.cursor++
 		}
@@ -277,6 +294,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // 空格：输入为空时操作当前高亮选项（多选=切换勾选；单选=直接提交）；已有文字时不消费。
 // 数字键 1-9：单选立即提交所选选项 ID；多选切换 clarifySel 选择集（Enter 统一提交）。
 // y/n：仅确认场景（Kind==confirm 或选项含 confirm/reject ID）可用，立即提交 confirm/reject。
+// 批量问答（任务 140）走 handleClarifyBatchQuickKey：快捷键写当前页草稿不直接提交。
 // 返回 true 表示按键已被消费（不进入普通字符插入逻辑）。
 func (m *Model) handleClarifyQuickKey(msg tea.KeyMsg) bool {
 	s := m.selectedSession()
@@ -284,6 +302,10 @@ func (m *Model) handleClarifyQuickKey(msg tea.KeyMsg) bool {
 		return false
 	}
 	pc := s.State.PendingClarify
+	// 批量模式：操作对象是当前页题目的选项，写草稿不直接提交。
+	if item := m.currentClarifyItem(pc); item != nil {
+		return m.handleClarifyBatchQuickKey(item, msg)
+	}
 	if len(pc.Options) == 0 {
 		return false
 	}
@@ -382,13 +404,209 @@ func (m *Model) toggleClarifyOption(pc *types.ClarifyRequest, opt types.ClarifyO
 }
 
 // submitClarifyAnswer 提交澄清答复（选项 ID），清空输入并退出澄清模式（TODO #53）。
+// 问题②（任务 140）：提交确认「已收到，正在思考中…」放宽到 5s 闪屏，
+// 轮询翻 running 后由既有 spinner 接力。
 func (m *Model) submitClarifyAnswer(sessionID string, pc *types.ClarifyRequest, answer, label string) {
 	m.postJSON(fmt.Sprintf("/api/sessions/%s/clarify", sessionID), map[string]string{"question_id": pc.ID, "answer": answer})
 	m.inputBar.runes = nil
 	m.inputBar.cursor = 0
 	m.inputBar.mode = inputNormal
 	m.clarifySel = nil
-	m.flashMsg("已选择: " + label)
+	m.ensureShared().setFlashLong("已选择: " + label + " · 已收到，正在思考中…")
+}
+
+// ---- 批量问答（任务 140 问题③）：同屏分页、逐题草稿、全部作答后统一提交 ----
+
+// clarifyPageGo 切换批量问答页（钳制范围），重置页内选项光标并 flash 页码。
+func (m *Model) clarifyPageGo(page int) {
+	pc := m.pendingClarify()
+	if pc == nil || len(pc.Questions) == 0 {
+		return
+	}
+	if page < 0 {
+		page = 0
+	}
+	if page >= len(pc.Questions) {
+		page = len(pc.Questions) - 1
+	}
+	if page == m.clarifyPage {
+		return
+	}
+	m.clarifyPage = page
+	m.clarifyCursor = 0
+	m.flashMsg(fmt.Sprintf("题 %d/%d", page+1, len(pc.Questions)))
+}
+
+// setClarifyBatchDraft 写入批量逐题草稿（懒初始化 map；Model 值拷贝下 map 引用共享）。
+func (m *Model) setClarifyBatchDraft(page int, d clarifyBatchDraft) {
+	if m.clarifyDrafts == nil {
+		m.clarifyDrafts = make(map[int]clarifyBatchDraft)
+	}
+	m.clarifyDrafts[page] = d
+}
+
+// setClarifyBatchSel 记录单选题草稿为单个选项（覆盖文本草稿：最近操作优先）。
+func (m *Model) setClarifyBatchSel(page int, optID string) {
+	m.setClarifyBatchDraft(page, clarifyBatchDraft{sel: []string{optID}})
+}
+
+// toggleClarifyBatchOption 切换批量草稿中当前页多选选择集，并 flash 展示已选标签。
+func (m *Model) toggleClarifyBatchOption(item *types.ClarifyQuestionItem, opt types.ClarifyOption) {
+	d := m.clarifyDrafts[m.clarifyPage]
+	found := -1
+	for i, id := range d.sel {
+		if id == opt.ID {
+			found = i
+			break
+		}
+	}
+	if found >= 0 {
+		d.sel = append(d.sel[:found], d.sel[found+1:]...)
+	} else {
+		d.sel = append(d.sel, opt.ID)
+	}
+	d.text = ""
+	m.setClarifyBatchDraft(m.clarifyPage, d)
+	labels := make([]string, 0, len(d.sel))
+	for _, id := range d.sel {
+		labels = append(labels, clarifyOptionLabel(item.Options, id))
+	}
+	if len(labels) == 0 {
+		m.flashMsg("已取消本题全部选择")
+	} else {
+		m.flashMsg("本题已选: " + strings.Join(labels, "、"))
+	}
+}
+
+// handleClarifyBatchQuickKey 批量问答快捷键（任务 140）：数字/空格/y/n 写当前页
+// 草稿（不直接提交，全部作答后整组统一提交）；文本题返回 false 让字符进输入框。
+// 空格/数字：多选=切换本题勾选；单选=记草稿（「其他」逃生引导输入文字）。
+// y/n：当前页选项含 confirm/reject 时记草稿。
+func (m *Model) handleClarifyBatchQuickKey(item *types.ClarifyQuestionItem, msg tea.KeyMsg) bool {
+	r := msg.Runes[0]
+	if len(item.Options) == 0 {
+		return false
+	}
+
+	// 空格：输入栏为空时作为选项操作键；已有输入内容时按普通字符插入（自由文本可含空格）。
+	if r == ' ' {
+		if len(m.inputBar.runes) > 0 {
+			return false
+		}
+		opt := item.Options[m.clarifyCursorClampedFor(item.Options)]
+		if item.MultiSelect {
+			m.toggleClarifyBatchOption(item, opt)
+			return true
+		}
+		if opt.ID == types.ClarifyOtherOptionID {
+			m.flashMsg("输入文字后回车，记入本题草稿")
+			return true
+		}
+		m.setClarifyBatchSel(m.clarifyPage, opt.ID)
+		m.flashMsg("本题已选: " + opt.Label + "（回车下一题）")
+		return true
+	}
+
+	// y / n：当前页选项含 confirm/reject ID 时记草稿。
+	if r == 'y' || r == 'n' {
+		isConfirm := false
+		for _, o := range item.Options {
+			if o.ID == "confirm" || o.ID == "reject" {
+				isConfirm = true
+				break
+			}
+		}
+		if !isConfirm {
+			return false
+		}
+		ans := "confirm"
+		if r == 'n' {
+			ans = "reject"
+		}
+		m.setClarifyBatchSel(m.clarifyPage, ans)
+		m.flashMsg("本题已选: " + clarifyOptionLabel(item.Options, ans) + "（回车下一题）")
+		return true
+	}
+
+	// 数字键 1-9：序号须在当前题选项范围内，超界不消费（交给普通输入）。
+	if r < '1' || r > '9' {
+		return false
+	}
+	idx := int(r - '1')
+	if idx >= len(item.Options) {
+		return false
+	}
+	opt := item.Options[idx]
+
+	if item.MultiSelect {
+		m.toggleClarifyBatchOption(item, opt)
+		return true
+	}
+	if opt.ID == types.ClarifyOtherOptionID {
+		m.flashMsg("输入文字后回车，记入本题草稿")
+		return true
+	}
+	m.setClarifyBatchSel(m.clarifyPage, opt.ID)
+	m.flashMsg("本题已选: " + opt.Label + "（回车下一题）")
+	return true
+}
+
+// clarifyBatchEnter 批量问答 Enter：输入文字先落当前题文本草稿（覆盖选项选择）；
+// 全部作答 → 整组统一提交（POST answers 数组）并 5s 确认；否则本题已答时跳下一
+// 未答题，未答时提示作答方式。
+func (m *Model) clarifyBatchEnter() (tea.Model, tea.Cmd) {
+	s := m.selectedSession()
+	if s == nil || s.State == nil || s.State.PendingClarify == nil {
+		return m, nil
+	}
+	pc := s.State.PendingClarify
+	if m.currentClarifyItem(pc) == nil {
+		return m, nil
+	}
+
+	// 1) 输入文字 → 落当前题文本草稿（文本题 / 其他逃生 / 覆盖选项选择）
+	if txt := strings.TrimSpace(string(m.inputBar.runes)); txt != "" {
+		m.setClarifyBatchDraft(m.clarifyPage, clarifyBatchDraft{text: txt})
+		m.inputBar.runes = nil
+		m.inputBar.cursor = 0
+	}
+
+	// 2) 全部已答 → 整组提交（问题③：必须全部作答才能提交）
+	if answers, ok := buildClarifyBatchAnswers(pc.Questions, m.clarifyDrafts); ok {
+		m.postJSON(fmt.Sprintf("/api/sessions/%s/clarify", s.ID), map[string]any{"question_id": pc.ID, "answers": answers})
+		m.clarifyDrafts = nil
+		m.clarifyPage = 0
+		m.clarifySel = nil
+		m.inputBar.mode = inputNormal
+		m.focus = panelInput
+		m.ensureShared().setFlashLong(fmt.Sprintf("已收到 %d 题答复，正在思考中…", len(answers)))
+		return m, nil
+	}
+
+	// 3) 本题已答 → 跳下一未答题；未答 → 提示作答方式
+	if strings.TrimSpace(m.clarifyDrafts[m.clarifyPage].answer()) != "" {
+		m.clarifyBatchAdvance(pc)
+		return m, nil
+	}
+	if len(m.currentClarifyItem(pc).Options) > 0 {
+		m.flashMsg("本题未作答：空格/数字选择选项，或输入文字后回车")
+	} else {
+		m.flashMsg("本题未作答：输入文字后回车")
+	}
+	return m, nil
+}
+
+// clarifyBatchAdvance 跳到下一个未作答的题（环形扫描）；全部已答返回 false。
+func (m *Model) clarifyBatchAdvance(pc *types.ClarifyRequest) bool {
+	n := len(pc.Questions)
+	for k := 1; k <= n; k++ {
+		idx := (m.clarifyPage + k) % n
+		if strings.TrimSpace(m.clarifyDrafts[idx].answer()) == "" {
+			m.clarifyPageGo(idx)
+			return true
+		}
+	}
+	return false
 }
 
 // clarifyOptionLabel 按选项 ID 查找展示 Label；未命中时回退返回 ID 本身。
@@ -433,7 +651,13 @@ func (m *Model) submitInput(cmd string) {
 
 	// TODO #53：澄清模式下非命令输入直接作为答复提交（自由文本或选项文本），
 	// 走 /api/sessions/{id}/clarify 通道；斜杠命令仍按命令解析。
+	// 批量问答（任务 140）：自由文本不在此单题提交（Enter 已在 handleInputKey 记
+	// 当前题草稿），此处兜底拦截防误发单题答复导致后端数量校验报错。
 	if m.inputBar.mode == inputClarify && !strings.HasPrefix(strings.TrimSpace(cmd), "/") {
+		if m.batchClarifyActive() {
+			m.flashMsg("批量提问：请逐题记入草稿（←/→ 切题），全部作答后回车统一提交")
+			return
+		}
 		if s := m.selectedSession(); s != nil && s.State != nil && s.State.PendingClarify != nil {
 			if id := s.State.PendingClarify.ID; id != "" {
 				m.postJSON(fmt.Sprintf("/api/sessions/%s/clarify", s.ID), map[string]string{"question_id": id, "answer": cmd})

@@ -2,7 +2,8 @@
 import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyOption, WireImage } from '@/types'
+import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage } from '@/types'
+import { isToolCallEvent, isUserMessageEvent } from '@/types'
 import {
   createSession,
   sendMessage,
@@ -68,8 +69,16 @@ const logFilterLevel = ref('')
 const logLimit = ref(100)
 const expandedLogId = ref<number | null>(null)
 
-// 待澄清选项区：由 SSE awaiting_clarify 帧驱动（不 push 进 events），答复后复位
-const clarifyPending = ref<{ options: ClarifyOption[]; multiSelect: boolean; questionId: string } | null>(null)
+// 待澄清选项区：由 SSE awaiting_clarify 帧驱动（不 push 进 events），答复后复位。
+// 任务 140 扩展：detail（长上下文）+ questions（批量模式全量题目，长度>1 为批量）。
+const clarifyPending = ref<ClarifyPending | null>(null)
+// 问题②确认反馈：任一澄清提交路径成功后置位，MessageList 底部渲染「已收到，正在思考中…」；
+// 首个真实时间线事件（think/llm/tool 等）到达即清（user_message 回显不清，由其开的
+// 新回合占位符接力展示进行中状态）。
+const clarifyAck = ref(false)
+// 批量问答草稿（任务 140 问题③）：键=question_id，值=逐题草稿（下标对齐 questions）。
+// 上浮到本层抗 500ms 帧重推/断线重连；状态离开 awaiting_clarify 或切换会话时清除。
+const clarifyDrafts = ref<Record<string, string[]>>({})
 
 // 模型实时汇报/思考文本：由 SSE live 帧驱动（不 push 进 events），对齐 TUI 流式展示
 const liveStreaming = ref('')
@@ -135,6 +144,8 @@ async function openSession(id: string) {
   panel.invalidate()
   events.value = []
   clarifyPending.value = null // 切换会话时复位待澄清选项，避免串会话残留
+  clarifyAck.value = false
+  clarifyDrafts.value = {}
   replyStash.value = {}
   try {
     const s = await getSession(id)
@@ -197,6 +208,7 @@ function startStream(s: Session) {
       // live 文本随快照回填：运行中即得当前值，结束后为空自然清零
       liveStreaming.value = snap.streaming_text || ''
       liveThinking.value = snap.thinking_text || ''
+      clarifyAck.value = false
       if (snap.status !== 'awaiting_clarify' && clarifyPending.value) {
         clarifyPending.value = null
       }
@@ -214,15 +226,28 @@ function startStream(s: Session) {
         if (activeSession.value) {
           activeSession.value = { ...activeSession.value, status: st }
         }
-        if (st !== 'awaiting_clarify') clarifyPending.value = null
+        if (st !== 'awaiting_clarify') {
+          // 状态离开待澄清：复位问答卡与该题草稿（答复已被后端接收，SSE 增量接管）
+          if (clarifyPending.value) delete clarifyDrafts.value[clarifyPending.value.questionId]
+          clarifyPending.value = null
+        }
         return
       }
       if ((ev as any).type === 'awaiting_clarify') {
+        const qid = (ev as any).question_id || ''
+        const qs = ((ev as any).questions || []) as ClarifyQuestionItem[]
         clarifyPending.value = {
           options: (ev as any).options || [],
           multiSelect: !!(ev as any).multi_select,
-          questionId: (ev as any).question_id || '',
+          questionId: qid,
+          detail: (ev as any).detail || '',
+          questions: qs.length > 1 ? qs : undefined,
         }
+        // 批量题：懒初始化逐题草稿（键=question_id，抗帧重推/重连）
+        if (qs.length > 1 && !clarifyDrafts.value[qid]) {
+          clarifyDrafts.value[qid] = qs.map(() => '')
+        }
+        clarifyAck.value = false
         // 输入答复路由依据（handleSubmit 按 status === 'awaiting_clarify' 走 /clarify）。
         if (activeSession.value) {
           activeSession.value = { ...activeSession.value, status: 'awaiting_clarify' }
@@ -230,16 +255,29 @@ function startStream(s: Session) {
         return
       }
       // 新用户消息接替当前回合：快照此刻流式汇报为上一回合答复 + 复位 live 文本（新回合从零开始）。
+      // classifyEvent 与 turns.ts 的回合划分同源（含 type=clarify agent=User 的答复回显），保证
+      // replyStash 键与 groupEventsToTurns 查找键一致。答复回显时回合为 awaiting_clarify 非接管态，
+      // 快照为空串无害。
       if (classifyEvent(ev) === 'user_message') {
         replyStash.value = { ...replyStash.value, [ev.timestamp]: liveStreaming.value }
+      }
+      // 工具调用/新指令落地 = 上一段流式输出已终结：清 live 缓冲，防旧正文在新回合
+      // 重复渲染（任务 140 问题⑤ web 侧双保险，后端已在 hook 恢复时清 StreamingText）。
+      if (isToolCallEvent(ev) || isUserMessageEvent(ev)) {
         liveStreaming.value = ''
         liveThinking.value = ''
+      }
+      // 确认条（问题②）：首个真实时间线事件到达即收起（user_message 回显不清，
+      // 由其开启的新回合「正在生成回答…」占位符接力）。
+      if (clarifyAck.value && !isUserMessageEvent(ev)) {
+        clarifyAck.value = false
       }
       events.value.push(ev)
     },
     onDone(finalStatus?: string) {
       liveStreaming.value = ''
       liveThinking.value = ''
+      clarifyAck.value = false
       panel.stopPanelTimer()
       refreshPanels(s.id)
       loadSessions()
@@ -247,6 +285,14 @@ function startStream(s: Session) {
         const status = (finalStatus as Session['status']) || 'completed'
         activeSession.value = { ...activeSession.value, status }
       }
+      // 对账重取（任务 140 问题⑥）：SSE 增量按切片索引 diff，头部裁剪/重连等竞态
+      // 丢掉的尾部事件（含最终答复 agent_done）在此原子替换补齐，对话栏不再卡
+      // 「正在生成答复…」。
+      getSession(s.id).then((fresh) => {
+        if (activeSession.value?.id !== s.id) return
+        activeSession.value = fresh
+        events.value = [...(fresh.events || [])]
+      }).catch((e) => console.error('done reconcile failed:', e))
       sending.value = false
     },
     onError(err) {
@@ -264,10 +310,19 @@ async function handleSubmit(content: string, images: WireImage[] = []) {
   try {
     // 1) 待澄清会话 → 调 /clarify 提交答复
     if (activeSession.value && activeSession.value.status === 'awaiting_clarify') {
+      // 批量提问（任务 140 问题③）：输入框通道拒绝，引导走问答卡逐题作答统一提交
+      if ((clarifyPending.value?.questions?.length || 0) > 1) {
+        sending.value = false
+        ElMessage.info('当前为批量提问：请在上方问答卡逐题作答后统一提交')
+        return
+      }
       if (images.length) ElMessage.warning('澄清答复不支持携带图片，已忽略')
       await clarifySession(activeSession.value.id, content)
       activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
-      await openSession(activeSession.value.id)
+      clarifyAck.value = true
+      sending.value = false
+      // 不再 openSession 全量重载（任务 140 问题④）：重载清空 events 导致滚动跳变，
+      // 后续事件由 SSE session_status/增量帧驱动。
       return
     }
     // 2) 已有会话 → 追加消息 / 入队 / 续跑
@@ -302,7 +357,9 @@ async function handleSubmit(content: string, images: WireImage[] = []) {
 async function handleClarifySubmitted() {
   if (!activeSession.value) return
   activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
-  await openSession(activeSession.value.id)
+  // 问题②：提交成功确认条；后续事件由 SSE 接管。
+  clarifyAck.value = true
+  // 不再 openSession 全量重载（任务 140 问题④）：重载清空 events 导致滚动跳变。
 }
 
 async function handleCancel() {
@@ -363,6 +420,8 @@ async function handleNewSession() {
   tokenMetrics.value = null
   board.value = null
   clarifyPending.value = null
+  clarifyAck.value = false
+  clarifyDrafts.value = {}
   router.replace({ path: '/session' })
 }
 
@@ -384,6 +443,20 @@ const tokenUsage = computed(() => {
   }
   return { input, output }
 })
+
+// 批量问答草稿视图（下传问答卡）：批量态返回逐题草稿数组（下标对齐 questions），单题态为空
+const clarifyDraftsArr = computed<string[]>(() => {
+  const p = clarifyPending.value
+  if (!p || !p.questions || p.questions.length <= 1) return []
+  return clarifyDrafts.value[p.questionId] || p.questions.map(() => '')
+})
+
+// 问答卡草稿变更回写（键=question_id，抗 awaiting_clarify 帧 500ms 重推/断线重连）
+function handleUpdateClarifyDrafts(drafts: string[]) {
+  const p = clarifyPending.value
+  if (!p) return
+  clarifyDrafts.value = { ...clarifyDrafts.value, [p.questionId]: [...drafts] }
+}
 
 function fmtDateTime(iso: string) {
   if (!iso) return ''
@@ -446,17 +519,21 @@ function fmtDateTime(iso: string) {
         :events="events"
         :agents="agents"
         :clarify="clarifyPending"
+        :clarify-ack="clarifyAck"
+        :clarify-drafts="clarifyDraftsArr"
         :sending="sending"
         :input-tokens="tokenUsage.input"
         :output-tokens="tokenUsage.output"
         :live-streaming="liveStreaming"
         :live-thinking="liveThinking"
+        :prior-replies="replyStash"
         @submit="handleSubmit"
         @cancel="handleCancel"
         @stop="handleStop"
         @interrupt="handleInterrupt"
         @new-session="handleNewSession"
         @clarify-submitted="handleClarifySubmitted"
+        @update-clarify-drafts="handleUpdateClarifyDrafts"
       />
       <MonitorView
         v-else

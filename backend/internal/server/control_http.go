@@ -14,14 +14,15 @@ func (m *SessionManager) HandleSessionClarify(c *gin.Context) {
 	id := c.Param("id")
 
 	req, err := DecodeBody[struct {
-		Answer     string `json:"answer"`
-		QuestionID string `json:"question_id"`
+		Answer     string   `json:"answer"`
+		Answers    []string `json:"answers"` // 批量逐题答复（任务 140，下标与题目对齐）
+		QuestionID string   `json:"question_id"`
 	}](c.Request)
 	if err != nil {
 		c.String(http.StatusBadRequest, "请求体无效")
 		return
 	}
-	if req.Answer == "" {
+	if req.Answer == "" && len(req.Answers) == 0 {
 		c.String(http.StatusBadRequest, "答复内容不能为空")
 		return
 	}
@@ -30,6 +31,7 @@ func (m *SessionManager) HandleSessionClarify(c *gin.Context) {
 		Op: agent.ControlOpClarify,
 		Args: map[string]any{
 			"answer":      req.Answer,
+			"answers":     req.Answers,
 			"question_id": req.QuestionID,
 		},
 	}); err != nil {

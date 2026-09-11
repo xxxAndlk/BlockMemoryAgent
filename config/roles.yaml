@@ -177,7 +177,7 @@ fixed_roles:
     skills: []
     tools: [ReadFile, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config:
-      model_ref: glm-5.3 # 连接参数见 config/models.json
+      model_ref: ark-deepseek-v4-flash # 连接参数见 config/models.json
       temperature: 0.2
       thinking: low        # glm 系 ark 端点不支持 disabled（2026-09-05 实测），改 low=4096 budget（2026-08-21 实证 glm-5.3 默认思考 300s 出不了判定 JSON）
       # TODO #40 块 3：归一 DeepSeek 原生 /chat/completions（openai-chat 别名）——自动前缀缓存
@@ -194,7 +194,7 @@ fixed_roles:
     skills: []
     tools: [ReadFile, ListDir, SearchInFiles, GitDiff, GitStatus, GitLog, GitBlame, HTTPGet, load_skill]
     model_config:
-      model_ref: glm-5.3 # 同 prompt_reviewer（原 *review_model）：0.2/16384/low。连接参数见 config/models.json
+      model_ref: ark-deepseek-v4-flash # 同 prompt_reviewer（原 *review_model）：0.2/16384/low。连接参数见 config/models.json
       temperature: 0.2
       thinking: low
     can_be_called: true

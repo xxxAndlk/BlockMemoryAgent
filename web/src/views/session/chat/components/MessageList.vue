@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick, onMounted, computed } from 'vue'
-import type { SessionEvent, ClarifyOption } from '@/types'
+import type { SessionEvent, ClarifyPending } from '@/types'
 import { groupEventsToTurns } from '../utils/turns'
 import UserBubble from './UserBubble.vue'
 import AssistantTurn from './AssistantTurn.vue'
@@ -8,7 +8,11 @@ import AssistantTurn from './AssistantTurn.vue'
 const props = defineProps<{
   events: SessionEvent[]
   verbose?: boolean
-  clarify?: { options: ClarifyOption[]; multiSelect: boolean; questionId: string } | null
+  clarify?: ClarifyPending | null
+  /** 问题②确认条（任务 140）：澄清答复已提交，底部展示「已收到，正在思考中…」 */
+  clarifyAck?: boolean
+  /** 批量问答逐题草稿（任务 140，下标对齐 clarify.questions；单题态为空数组） */
+  clarifyDrafts?: string[]
   sessionId: string
   liveStreaming: string
   liveThinking: string
@@ -16,8 +20,11 @@ const props = defineProps<{
   priorReplies?: Record<string, string>
 }>()
 
-// 澄清选项提交成功 → 透传给父级（index.vue 重开会话刷新事件流）
-const emit = defineEmits<{ (e: 'submit-clarify'): void }>()
+// 澄清选项提交成功 → 透传给父级（index.vue 置 running + ack，不再全量重载）
+const emit = defineEmits<{
+  (e: 'submit-clarify'): void
+  (e: 'update-clarify-drafts', drafts: string[]): void
+}>()
 
 const containerRef = ref<HTMLElement | null>(null)
 const stickToBottom = ref(true)
@@ -38,6 +45,13 @@ function scrollToBottom() {
 }
 
 watch(() => props.events.length, () => {
+  if (stickToBottom.value) {
+    nextTick(scrollToBottom)
+  }
+})
+
+// 确认条出现/消失也维持吸底（条在内容流末尾，不跟会错过）
+watch(() => props.clarifyAck, () => {
   if (stickToBottom.value) {
     nextTick(scrollToBottom)
   }
@@ -64,10 +78,19 @@ defineExpose({ scrollToBottom })
     <template v-else>
       <div v-for="(turn, ti) in turns" :key="turn.id">
         <UserBubble v-if="turn.userMessage" :event="turn.userMessage" />
-        <AssistantTurn :turn="turn" :verbose="verbose" :clarify="clarify" :session-id="sessionId"
+        <AssistantTurn :turn="turn" :verbose="verbose" :clarify="clarify"
+                       :clarify-drafts="clarifyDrafts" :session-id="sessionId"
                        :live-streaming="ti === turns.length - 1 ? liveStreaming : ''"
                        :live-thinking="ti === turns.length - 1 ? liveThinking : ''"
-                       @submit-clarify="emit('submit-clarify')" />
+                       @submit-clarify="emit('submit-clarify')"
+                       @update-clarify-drafts="(d: string[]) => emit('update-clarify-drafts', d)" />
+      </div>
+      <!-- 问题②确认条：澄清答复已提交，Agent 正在恢复执行（首个真实事件到达后由父级清除） -->
+      <div v-if="clarifyAck" class="flex justify-center py-1.5">
+        <span class="text-[11px] text-ink-2 flex items-center gap-1.5">
+          <el-icon class="is-loading"><Loading /></el-icon>
+          已收到答复，正在思考中…
+        </span>
       </div>
     </template>
   </div>

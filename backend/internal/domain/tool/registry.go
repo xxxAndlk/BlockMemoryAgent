@@ -53,12 +53,15 @@ type Tool interface {
 }
 
 // failureCounter 用于统计连续校验拒绝次数，支持并发安全地增加计数和重置计数。
-// 校验拒绝（validation_rejected，阈值 5 终止）按工具名计数——"修正参数即可"
+// 校验拒绝（validation_rejected，阈值 5 终止）按 scope+工具名计数——"修正参数即可"
 // 的前置条件问题，修正参数后重试即恢复，无需指纹区分（TODO #32）。
+// scope 隔离（2026-09-09 事故）：Registry 进程级单例，键若只有工具名，计数会在
+// 会话/Agent 间泄漏（A 会话数小时前的历史拒绝踩线杀死 B 会话）；
+// 键为 scope（agentID 回退 sessionID）+ 工具名。
 type failureCounter struct {
 	// mu 保护 validationCounts 的读写锁，避免并发竞争。
 	mu sync.Mutex
-	// validationCounts 记录每个工具名称对应的连续校验拒绝次数。
+	// validationCounts 记录每个 scope+工具名 对应的连续校验拒绝次数。
 	validationCounts map[string]int
 }
 
@@ -69,21 +72,28 @@ func newFailureCounter() *failureCounter {
 	}
 }
 
-// failValidation 将指定工具的连续校验拒绝次数加 1，并返回当前次数。
-func (f *failureCounter) failValidation(name string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.validationCounts[name]++
-	return f.validationCounts[name]
+// validationKey 拼装计数键：scope（agentID 回退 sessionID）+ "\x00" + 工具名。
+func validationKey(scope, name string) string {
+	return scope + "\x00" + name
 }
 
-// reset 将指定工具的全部连续校验拒绝计数清零。
-func (f *failureCounter) reset(name string) {
-	// 加锁保护 validationCounts 的并发修改。
+// failValidation 将指定 scope+工具 的连续校验拒绝次数加 1，并返回当前次数。
+func (f *failureCounter) failValidation(scope, name string) int {
 	f.mu.Lock()
-	// 函数退出时释放锁，避免遗忘。
 	defer f.mu.Unlock()
-	delete(f.validationCounts, name)
+	k := validationKey(scope, name)
+	f.validationCounts[k]++
+	return f.validationCounts[k]
+}
+
+// resetValidation 将指定 scope+工具 的连续校验拒绝计数清零。
+// 成功调用后必须归零，否则"连续"退化为进程级累计（2026-09-09 事故：
+// reset 无调用点，PvZ 会话 23:16 留下的 2 次历史拒绝在 01:28 踩线，
+// 自我纠正后的正常编排被守卫误杀，波次2 编排中途强退）。
+func (f *failureCounter) resetValidation(scope, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.validationCounts, validationKey(scope, name))
 }
 
 // Registry 是工具注册表，保存所有内置工具、执行器、进度回调以及任务级状态。
@@ -650,11 +660,15 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 填充结果的通用字段，如 SessionID、ArgsJSON 以及执行器回调。
 	r.fillResult(ctx, result, args)
 
-	// 校验拒绝计数（TODO #32）：校验拒绝按工具名计数，连续达
+	// 校验拒绝计数（TODO #32）：校验拒绝按 scope+工具名计数，连续达
 	// maxConsecutiveValidationRejections 触发 ErrLoopExit 终止（防"复读同一错误参数"无效循环）。
 	// 执行失败不计数（连杀指纹已退役，TODO #44）：模型"改→试→复验"的正常调试节奏
 	// 不应被硬阈值误杀，真死循环由连读 guard 与 sub_agent_timeout 墙钟兜底。
-	if !result.Success {
+	if result.Success {
+		// 成功即清零该 scope+工具的计数，恢复"连续"语义（2026-09-09 事故：reset 无
+		// 调用点使计数变进程级累计——数小时前的历史拒绝踩线，误杀自我纠正后的编排）。
+		r.failures.resetValidation(scopeKeyFromCtx(ctx), name)
+	} else {
 		// 无显式 Category 的失败按执行失败计（默认语义，保持既有行为）。
 		cat := result.Category
 		if cat == "" {
@@ -670,12 +684,13 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 				r.emitResult(ctx, result)
 				return result, nil
 			}
-			n := r.failures.failValidation(name)
+			n := r.failures.failValidation(scopeKeyFromCtx(ctx), name)
 			if n >= maxConsecutiveValidationRejections {
 				msg := fmt.Sprintf("工具 %s 已连续 %d 次被校验拒绝（参数/前置条件问题，如 task 超长、必填参数缺失、spec 缺失或过期）——"+
 					"这是校验拒绝不是执行失败，修正参数或补齐前置条件（如 WriteSpec）后重试即可；本次任务终止以防无限纠偏循环。", name, n)
-				log.Printf("[tool] validation rejections LoopExit: scope=%s tool=%s rejections=%d", scopeKeyFromCtx(ctx), name, n)
-				result.Error = msg
+				log.Printf("[tool] validation rejections LoopExit: scope=%s tool=%s rejections=%d err=%q", scopeKeyFromCtx(ctx), name, n, result.Error)
+				// 保留原始校验错误（2026-09-09 事故：整条覆盖致真实拒绝原因在日志/事件流中丢失）。
+				result.Error = msg + "\n原始校验错误: " + result.Error
 				r.emitResult(ctx, result)
 				return result, fmt.Errorf("%w: %s", ErrLoopExit, msg)
 			}

@@ -248,15 +248,29 @@ type ClarifyOption struct {
 	Description string // Description 选项补充说明（可选）
 }
 
+// ClarifyQuestionItem 是批量澄清模式（任务 140）中的单个问题及其答复回填。
+// 批量提问一次挂出全部题目，用户前后翻页改选后统一提交；每题独立记录
+// 命中选项与答复时间，顶层 ClarifyRequest 的 Answer/AnswerOptionIDs 镜像第一题
+// （旧客户端只读顶层字段仍能拿到 Q1 的答复）。
+type ClarifyQuestionItem struct {
+	Question        string          // Question 本题问题文本（短句，长上下文放 ClarifyRequest.Detail）
+	Kind            string          // Kind choice=选项选择 / text=纯自由文本
+	MultiSelect     bool            // MultiSelect 是否允许多选（仅 choice 有意义）
+	Options         []ClarifyOption // Options 本题结构化选项；空表示自由文本答复
+	Answer          string          // Answer 用户对本题的答复（回填，解析后文本）
+	AnswerOptionIDs []string        // AnswerOptionIDs 答复命中的选项 ID（多选按序）
+	AnsweredAt      *time.Time      // AnsweredAt 本题答复时间
+}
+
 // ClarifyRequest 是澄清请求的 DTO，字段与 types.ClarifyRequest 对应。
 // 使用普通 DTO 字段，避免 agent 包依赖内部 types 包。
 type ClarifyRequest struct {
 	ID         string     // ID 澄清请求唯一标识
-	Question   string     // Question 需要向用户澄清的问题文本
+	Question   string     // Question 需要向用户澄清的问题文本（批量模式镜像第一题）
 	Context    string     // Context 触发澄清的上下文信息
 	AgentID    string     // AgentID 发起澄清的 Agent 标识
 	CreatedAt  time.Time  // CreatedAt 澄清请求创建时间
-	Answer     string     // Answer 用户给出的答案内容
+	Answer     string     // Answer 用户给出的答案内容（批量模式镜像第一题）
 	AnsweredAt *time.Time // AnsweredAt 用户回答时间，未回答时为 nil
 	// Kind 澄清类型（TODO #53）：confirm=破坏性操作确认 / choice=选项选择 /
 	// text=纯自由文本。缺省空串视为 text（向后兼容）。
@@ -267,21 +281,28 @@ type ClarifyRequest struct {
 	Options []ClarifyOption
 	// AnswerOptionIDs 答复时命中的选项 ID（多选按序）；自由文本答复为空。
 	AnswerOptionIDs []string
+	// Detail 附加长上下文（如 submit_plan 计划全文、进度盘点，任务 140）：
+	// 先于问题完整展示（事件流 clarify_detail 事件 + 面板 detail 块），
+	// question 只承载短问题句。
+	Detail string
+	// Questions 批量模式（任务 140）的全部题目；len>1 表示批量（同屏分页、
+	// 统一提交）。单题路径为 nil，Question/Options 等顶层字段即唯一题目。
+	Questions []ClarifyQuestionItem
 }
 
 // Session 是会话对象的 DTO，按字段逐一对齐 server.Session。
 // 使用纯 DTO 类型，使 agent 包与 internal/server 和 backend/pkg/types 解耦。
 type Session struct {
-	ID             string          // ID 会话唯一标识
-	Goal           string          // Goal 会话目标/任务描述
-	Status         string          // Status 会话当前状态，例如 running / paused / finished
-	Result         string          // Result 会话最终结果或输出摘要
-	State          string          // State 会话内部状态机状态
-	StartedAt      time.Time       // StartedAt 会话开始时间
-	EndedAt        time.Time       // EndedAt 会话结束时间，未结束为零值
-	Events         []Event         // Events 会话生命周期中产生的事件列表
-	Messages       []Message       // Messages 会话中的聊天消息列表
-	TempDir        string          // TempDir 会话使用的临时目录路径
+	ID        string    // ID 会话唯一标识
+	Goal      string    // Goal 会话目标/任务描述
+	Status    string    // Status 会话当前状态，例如 running / paused / finished
+	Result    string    // Result 会话最终结果或输出摘要
+	State     string    // State 会话内部状态机状态
+	StartedAt time.Time // StartedAt 会话开始时间
+	EndedAt   time.Time // EndedAt 会话结束时间，未结束为零值
+	Events    []Event   // Events 会话生命周期中产生的事件列表
+	Messages  []Message // Messages 会话中的聊天消息列表
+	TempDir   string    // TempDir 会话使用的临时目录路径
 	// WorkDir 每会话工作目录（绝对路径，空=进程默认）。json 名 `work_dir` 由
 	// Task 10 的 server DTO 接线决定，此处先行声明。
 	WorkDir        string          `json:"work_dir,omitempty"`
@@ -304,22 +325,22 @@ type Session struct {
 // Event 是会话事件的 DTO，按字段逐一对齐 server.SessionEvent。
 // 记录一次发生在会话中的事件，包括 Agent 动作、工具调用、LLM 交互等信息。
 type Event struct {
-	Type         string    // Type 事件类型，例如 tool / llm / agent 等
-	Agent        string    // Agent 产生该事件的 Agent 名称/标识
-	Message      string    // Message 事件描述或输出消息
-	Kind         string    // Kind 事件子类型/分类
-	Tool         string    // Tool 调用的工具名称
-	ToolPath     string    // ToolPath 工具调用路径或标识
-	ToolOutput   string    // ToolOutput 工具返回的输出内容
-	ToolError    string    // ToolError 工具调用产生的错误信息
-	Success      bool      // Success 该事件代表的操作是否成功
-	Timestamp    time.Time // Timestamp 事件发生时间
-	Prompt       string    // Prompt 发送给 LLM 的提示词内容
-	InputTokens  int       // InputTokens LLM 输入 Token 数
-	OutputTokens int       // OutputTokens LLM 输出 Token 数
-	CacheHitTokens  int    // CacheHitTokens 缓存命中 token 数（TODO #40 可观测）
-	CacheMissTokens int    // CacheMissTokens 缓存未命中 token 数（TODO #40 可观测）
-	DetailJSON   string    // DetailJSON 事件的原始 JSON 详情，便于审计与调试
+	Type            string    // Type 事件类型，例如 tool / llm / agent 等
+	Agent           string    // Agent 产生该事件的 Agent 名称/标识
+	Message         string    // Message 事件描述或输出消息
+	Kind            string    // Kind 事件子类型/分类
+	Tool            string    // Tool 调用的工具名称
+	ToolPath        string    // ToolPath 工具调用路径或标识
+	ToolOutput      string    // ToolOutput 工具返回的输出内容
+	ToolError       string    // ToolError 工具调用产生的错误信息
+	Success         bool      // Success 该事件代表的操作是否成功
+	Timestamp       time.Time // Timestamp 事件发生时间
+	Prompt          string    // Prompt 发送给 LLM 的提示词内容
+	InputTokens     int       // InputTokens LLM 输入 Token 数
+	OutputTokens    int       // OutputTokens LLM 输出 Token 数
+	CacheHitTokens  int       // CacheHitTokens 缓存命中 token 数（TODO #40 可观测）
+	CacheMissTokens int       // CacheMissTokens 缓存未命中 token 数（TODO #40 可观测）
+	DetailJSON      string    // DetailJSON 事件的原始 JSON 详情，便于审计与调试
 }
 
 // AgentInstance 表示一个已实例化 Agent 的运行时轻量视图。
