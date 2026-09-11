@@ -137,13 +137,12 @@ export function createToolGroup(callEv: SessionEvent): ToolCallGroup {
 
 export function finalizeTurn(turn: Turn, finalEvent?: SessionEvent): Turn {
   if (!finalEvent) return turn
-  const status: Turn['status'] = isFailedCompletion(finalEvent) ? 'error' : 'completed'
-  return {
-    ...turn,
-    finalAnswer: finalEvent,
-    status,
-    endedAt: finalEvent.timestamp,
-  }
+  // 必须原地修改：调用方把 turn 引用存进了 turns[]，返回扩散副本会丢掉完成状态
+  //（实证 2026-09-11：agent_done 落事件流但对话栏回合永久"处理中"、最终交付不渲染）。
+  turn.finalAnswer = finalEvent
+  turn.status = isFailedCompletion(finalEvent) ? 'error' : 'completed'
+  turn.endedAt = finalEvent.timestamp
+  return turn
 }
 
 function tokenIn(ev: SessionEvent): number {

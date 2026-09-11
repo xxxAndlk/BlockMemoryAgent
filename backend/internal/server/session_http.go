@@ -103,6 +103,59 @@ func (m *SessionManager) HandleListSessions(c *gin.Context) {
 	c.JSON(http.StatusOK, all)
 }
 
+// HandleDeleteSession 处理 DELETE /api/sessions/{id}。
+// 职责：硬删除单个会话（不可恢复）：运行中先终止执行，再物理删除持久化数据。
+func (m *SessionManager) HandleDeleteSession(c *gin.Context) {
+	id := c.Param("id")
+	if err := m.agent.DeleteSession(c.Request.Context(), id); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"session_id": id, "status": "deleted"})
+}
+
+// maxBatchDeleteSessions 是批量删除单次请求的会话数上限（防误贴超大列表打爆存储）。
+const maxBatchDeleteSessions = 200
+
+// HandleDeleteSessions 处理 POST /api/sessions/delete。
+// 职责：批量硬删除（body {"ids":[...]}）。逐条独立处理——单条失败不影响其余，
+// 返回 {"deleted":[...], "errors":[{"id","error"}]}，前端据此提示部分成功。
+func (m *SessionManager) HandleDeleteSessions(c *gin.Context) {
+	req, err := DecodeBody[struct {
+		IDs []string `json:"ids"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	if len(req.IDs) == 0 {
+		c.String(http.StatusBadRequest, "ids 不能为空")
+		return
+	}
+	if len(req.IDs) > maxBatchDeleteSessions {
+		c.String(http.StatusBadRequest, "单次最多删除 %d 个会话", maxBatchDeleteSessions)
+		return
+	}
+	deleted := make([]string, 0, len(req.IDs))
+	type deleteFailure struct {
+		ID    string `json:"id"`
+		Error string `json:"error"`
+	}
+	failures := make([]deleteFailure, 0)
+	for _, id := range req.IDs {
+		if id == "" {
+			continue
+		}
+		if err := m.agent.DeleteSession(c.Request.Context(), id); err != nil {
+			failures = append(failures, deleteFailure{ID: id, Error: err.Error()})
+			continue
+		}
+		deleted = append(deleted, id)
+	}
+	c.JSON(http.StatusOK, map[string]any{"deleted": deleted, "errors": failures})
+}
+
 // HandleSessionBoard 处理 GET /api/sessions/{id}/board。
 // 职责：返回会话的看板（board）数据。
 func (m *SessionManager) HandleSessionBoard(c *gin.Context) {

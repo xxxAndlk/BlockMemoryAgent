@@ -85,6 +85,19 @@ func newTaskLedger() *TaskLedger {
 // failureMarkerRe 解析 notify 失败消息头部的机读标记 [failure kind=X retryable=Y]。
 var failureMarkerRe = regexp.MustCompile(`^\[failure kind=(\S+) retryable=(?:true|false)\]\s*`)
 
+// Purge 删除会话的全部台账状态（会话硬删除路径：条目/序号/播种标记一并清）。
+// 幂等；l 为 nil 或 sessionID 空时 no-op。
+func (l *TaskLedger) Purge(sessionID string) {
+	if l == nil || sessionID == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.bySess, sessionID)
+	delete(l.seq, sessionID)
+	delete(l.seeded, sessionID)
+}
+
 // RecordDispatch 登记一次派发（进行中）。仅记录 Meta 直派的任务——domain 派叶子
 // 助手属领域内部实现细节，不进入 Meta 面向的台账（防噪声）。sessionID 空或
 // 父非 meta 时 no-op。

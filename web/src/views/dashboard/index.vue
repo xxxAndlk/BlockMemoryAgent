@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Session } from '@/types'
-import { listSessions, createSession } from '@/api/session'
+import { listSessions, createSession, deleteSession, deleteSessions } from '@/api/session'
 import { getTimeline, getActivity, type TimelinePoint, type ActivityItem } from '@/api/metrics'
 import { statusTagType, statusText } from '@/utils/sessionStatus'
 import { fmtDate } from '@/utils/date'
@@ -79,6 +79,77 @@ function onGoalKeydown(e: KeyboardEvent) {
 
 function viewSession(id: string) {
   router.push({ path: '/session', query: { id } })
+}
+
+// ---- 删除会话（硬删，不可恢复）----
+const selectedIds = ref<string[]>([])
+const deleting = ref(false)
+
+function toggleSelect(id: string) {
+  const i = selectedIds.value.indexOf(id)
+  if (i >= 0) selectedIds.value.splice(i, 1)
+  else selectedIds.value.push(id)
+}
+
+// 「全选」作用于当前过滤后的列表（搜索/状态页签下语义直观）。
+const allSelected = computed(
+  () => filteredSessions.value.length > 0 && filteredSessions.value.every((s) => selectedIds.value.includes(s.id)),
+)
+const someSelected = computed(
+  () => !allSelected.value && filteredSessions.value.some((s) => selectedIds.value.includes(s.id)),
+)
+
+function toggleSelectAll() {
+  if (allSelected.value) {
+    const ids = new Set(filteredSessions.value.map((s) => s.id))
+    selectedIds.value = selectedIds.value.filter((id) => !ids.has(id))
+  } else {
+    const merged = new Set(selectedIds.value)
+    filteredSessions.value.forEach((s) => merged.add(s.id))
+    selectedIds.value = [...merged]
+  }
+}
+
+async function confirmDelete(ids: string[]) {
+  if (ids.length === 0 || deleting.value) return
+  try {
+    await ElMessageBox.confirm(
+      `将永久删除 ${ids.length} 个会话（含历史、事件、日志，不可恢复）。运行中的会话会先被终止。`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  if (usingMock.value) {
+    // 后端不可用（示例数据）：仅本地移除，不发请求。
+    sessions.value = sessions.value.filter((s) => !ids.includes(s.id))
+    selectedIds.value = []
+    ElMessage.success(`已移除 ${ids.length} 个示例会话`)
+    return
+  }
+  deleting.value = true
+  try {
+    let failed = 0
+    if (ids.length === 1) {
+      try {
+        await deleteSession(ids[0])
+      } catch {
+        failed = 1
+      }
+    } else {
+      const res = await deleteSessions(ids)
+      failed = res.errors.length
+    }
+    selectedIds.value = []
+    await load()
+    if (failed > 0) ElMessage.error(`删除完成：${ids.length - failed} 成功，${failed} 失败`)
+    else ElMessage.success(`已删除 ${ids.length} 个会话`)
+  } catch (e) {
+    ElMessage.error('删除失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    deleting.value = false
+  }
 }
 
 function progressOf(s: Session) {
@@ -237,8 +308,8 @@ function activityStyle(kind: string) {
           </div>
         </template>
 
-        <!-- Tabs -->
-        <div class="flex gap-2 mb-4">
+        <!-- Tabs + 批量操作 -->
+        <div class="flex gap-2 mb-4 items-center">
           <el-button
             v-for="f in ['all','running','completed','failed','paused']"
             :key="f"
@@ -249,6 +320,25 @@ function activityStyle(kind: string) {
           >
             {{ {all:'全部', running:'运行中', completed:'已完成', failed:'已失败', paused:'已暂停'}[f] }} {{ counts[f as keyof typeof counts] }}
           </el-button>
+          <div class="ml-auto flex items-center gap-2">
+            <el-checkbox
+              :model-value="allSelected"
+              :indeterminate="someSelected"
+              :disabled="filteredSessions.length === 0"
+              @change="toggleSelectAll"
+            >
+              <span class="text-xs text-ink-2">全选</span>
+            </el-checkbox>
+            <el-button
+              v-if="selectedIds.length > 0"
+              size="small"
+              type="danger"
+              :loading="deleting"
+              @click="confirmDelete([...selectedIds])"
+            >
+              <el-icon class="mr-1"><Delete /></el-icon>删除选中 ({{ selectedIds.length }})
+            </el-button>
+          </div>
         </div>
 
         <div class="space-y-3 flex-1 overflow-y-auto">
@@ -258,6 +348,12 @@ function activityStyle(kind: string) {
             class="p-3 bg-page rounded border border-line flex items-center justify-between group hover:border-primary transition-colors cursor-pointer"
             @click="viewSession(s.id)"
           >
+            <span class="mr-3 shrink-0" @click.stop>
+              <el-checkbox
+                :model-value="selectedIds.includes(s.id)"
+                @change="toggleSelect(s.id)"
+              />
+            </span>
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-3 mb-1">
                 <span class="font-bold text-sm text-ink truncate">{{ s.goal }}</span>
@@ -281,7 +377,18 @@ function activityStyle(kind: string) {
               <div v-else class="text-xs text-ink-2">-</div>
             </div>
 
-            <div class="w-20 text-right text-xs text-ink-2 flex items-center justify-end gap-2">
+            <div class="w-28 text-right text-xs text-ink-2 flex items-center justify-end gap-2">
+              <el-button
+                link
+                type="danger"
+                size="small"
+                class="!p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                :disabled="deleting"
+                title="删除会话"
+                @click.stop="confirmDelete([s.id])"
+              >
+                <el-icon><Delete /></el-icon>
+              </el-button>
               <el-icon class="text-ink-3 group-hover:text-primary"><ArrowRight /></el-icon>
             </div>
           </div>

@@ -111,6 +111,18 @@ func (m *mockAgentForServer) Get(ctx context.Context, sessionID string) (*agent.
 	return s, nil
 }
 
+// DeleteSession 硬删除测试会话（从 mock 存储摘除）。
+// 返回值：不存在时返回 ErrSessionNotFound。
+func (m *mockAgentForServer) DeleteSession(ctx context.Context, sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.sessions[sessionID]; !ok {
+		return agent.ErrSessionNotFound
+	}
+	delete(m.sessions, sessionID)
+	return nil
+}
+
 // ListAgents 列出会话中的 Agent 实例，测试实现返回 nil。
 func (m *mockAgentForServer) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return nil, nil

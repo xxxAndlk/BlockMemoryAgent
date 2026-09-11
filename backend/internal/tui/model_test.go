@@ -109,6 +109,9 @@ func (m *mockAgentForPlan) Get(ctx context.Context, sessionID string) (*agent.Se
 	return nil, fmt.Errorf("not found")
 }
 
+// DeleteSession 是 mockAgentForPlan 的空实现。
+func (m *mockAgentForPlan) DeleteSession(ctx context.Context, sessionID string) error { return nil }
+
 // ListAgents 返回预设的 Agent 实例列表。
 func (m *mockAgentForPlan) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return m.agentInsts, nil

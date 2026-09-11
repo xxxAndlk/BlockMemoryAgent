@@ -650,11 +650,29 @@ func (st *reactSessionStore) snapshotSessionEvents(session *reactInternalSession
 	return events
 }
 
+// stillLive 报告会话是否仍在内存映射中且为同一指针实例。
+// 落库守卫：DeleteSession 先从 map 摘除会话再清 PG 数据；若运行中的收尾 goroutine
+//（finalizeSession → persistHistory/persistEvents）在删除之后才跑到落库，会把刚清掉的
+// session_history/session_events 行重新 upsert 回去，会话"复活"。落库前校验 map 成员
+// 身份即可拦截（正常路径落库时会话必然仍在 map——淘汰/删除都发生在终态落库之后）。
+func (st *reactSessionStore) stillLive(session *reactInternalSession) bool {
+	if session == nil {
+		return false
+	}
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return st.sessions[session.ID] == session
+}
+
 // persistHistory 将对话历史持久化到 PostgreSQL。
 // session: 待保存的会话。
 func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 	// 若未配置 pgStore，直接返回，避免空指针。
 	if st.pgStore == nil {
+		return
+	}
+	// 会话已被硬删除：跳过，防止删除后落库复活。
+	if !st.stillLive(session) {
 		return
 	}
 	// 锁内快照事件，避免与并发 addEvent / 停机落库竞争。
@@ -735,6 +753,10 @@ func (st *reactSessionStore) persistFullHistory(session *reactInternalSession) {
 func (st *reactSessionStore) persistEvents(session *reactInternalSession) {
 	// 若未配置 pgStore，直接返回。
 	if st.pgStore == nil {
+		return
+	}
+	// 会话已被硬删除：跳过，防止删除后落库复活（守卫语义见 stillLive）。
+	if !st.stillLive(session) {
 		return
 	}
 	// 锁内快照事件，避免与并发 addEvent / 停机落库竞争。

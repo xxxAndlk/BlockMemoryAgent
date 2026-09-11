@@ -40,6 +40,7 @@ func (mockAgentForRouter) List(context.Context, agent.Filter) ([]*agent.Session,
 func (mockAgentForRouter) Get(context.Context, string) (*agent.Session, error) {
 	return nil, nil
 }
+func (mockAgentForRouter) DeleteSession(context.Context, string) error { return nil }
 func (mockAgentForRouter) ListAgents(context.Context, string) ([]agent.AgentInstance, error) {
 	return nil, nil
 }

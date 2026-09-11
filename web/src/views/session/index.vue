@@ -414,7 +414,6 @@ function fmtDateTime(iso: string) {
                 :class="{ 'bg-primary-soft': activeSession?.id === s.id }">
           <div class="flex items-center gap-2 mb-1">
             <span class="w-1.5 h-1.5 rounded-full shrink-0" :class="statusDotClass(s.status)"></span>
-            <span class="text-xs text-ink-3 font-mono shrink-0">{{ s.id }}</span>
             <span class="text-[10px] text-ink-3 ml-auto shrink-0">{{ statusText(s.status) }}</span>
           </div>
           <div class="text-sm text-ink line-clamp-2 break-words">{{ s.goal || '(无目标)' }}</div>
@@ -431,7 +430,6 @@ function fmtDateTime(iso: string) {
     <main class="flex-1 flex flex-col min-w-0 gap-3">
       <div class="h-12 bg-card border border-line rounded-card flex items-center px-4 gap-3 shrink-0">
         <span class="font-bold text-sm text-ink truncate">{{ activeSession?.goal || '新会话' }}</span>
-        <span v-if="activeSession" class="text-xs text-ink-3 font-mono shrink-0">{{ activeSession.id }}</span>
         <div class="ml-auto flex bg-page border border-line rounded-lg p-0.5 shrink-0">
           <button class="px-3 py-1 text-xs rounded-md transition-colors"
                   :class="view === 'chat' ? 'bg-card text-primary font-bold shadow-sm' : 'text-ink-2 hover:text-ink'"

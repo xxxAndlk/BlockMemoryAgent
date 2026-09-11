@@ -37,11 +37,6 @@ function fmtTokens(n: number): string {
   return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
 }
 
-const tokenLabel = computed(() => {
-  const input = props.inputTokens || 0
-  const output = props.outputTokens || 0
-  return `↑ ${fmtTokens(input)}  ↓ ${fmtTokens(output)}`
-})
 
 // 把图片加入待发送列表并在光标处插入 [image:N] 占位符。
 async function addImageFiles(files: File[]) {
@@ -239,11 +234,6 @@ function onKeydown(e: KeyboardEvent) {
         <span v-else class="text-ink-2">将创建新会话</span>
       </div>
       <div class="flex items-center gap-3 text-xs">
-        <span class="text-ink-2 font-mono" :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
-          <span class="text-ink-3">Token</span>
-          <span class="ml-2 text-blue-400">↑{{ fmtTokens(props.inputTokens || 0) }}</span>
-          <span class="ml-1 text-green-400">↓{{ fmtTokens(props.outputTokens || 0) }}</span>
-        </span>
         <el-button size="small" plain class="!bg-transparent !border-line !text-ink-2 hover:!text-white"
                    @click="emit('new-session')">
           <el-icon class="mr-1"><Plus /></el-icon> 新建会话
@@ -263,23 +253,21 @@ function onKeydown(e: KeyboardEvent) {
       </div>
     </div>
 
-    <!-- 输入区 -->
-    <div class="flex gap-2 items-end">
-      <div class="flex-1 chat-input">
-        <el-input ref="textareaRef" v-model="content"
-                  type="textarea"
-                  :autosize="{ minRows: 2, maxRows: 6 }"
-                  placeholder="向 AI 下达命令…（Enter 发送，Shift+Enter 换行，可直接粘贴图片）"
-                  resize="none"
-                  @keydown="onKeydown"
-                  @paste="onPaste" />
-      </div>
-      <div class="flex flex-col gap-1">
-        <!-- 模型选择弹层（对话栏右下）：角色 → 模型 → 思考强度 -->
-        <el-popover v-model:visible="modelPopoverVisible" placement="top-end" :width="380" trigger="click">
+    <!-- 输入区：圆角容器内 上=文本域 下=工具行（左：模型/图片；右：发送），对齐主流对话产品 -->
+    <div class="chat-box flex flex-col rounded-xl border border-line bg-page focus-within:border-primary transition-colors">
+      <el-input ref="textareaRef" v-model="content"
+                type="textarea"
+                :autosize="{ minRows: 2, maxRows: 8 }"
+                placeholder="向 AI 下达命令…（Enter 发送，Shift+Enter 换行，可直接粘贴图片）"
+                resize="none"
+                class="chat-input"
+                @keydown="onKeydown"
+                @paste="onPaste" />
+      <div class="flex items-center gap-1 px-2 pb-2">
+        <!-- 模型选择弹层（工具行左）：角色 → 模型 → 思考强度 -->
+        <el-popover v-model:visible="modelPopoverVisible" placement="top-start" :width="380" trigger="click">
           <template #reference>
-            <el-button plain size="small"
-                       class="!bg-transparent !border-line !text-ink-2 hover:!text-white max-w-44"
+            <el-button text size="small" class="!text-ink-2 hover:!text-primary max-w-52 !px-2"
                        title="选择模型（角色 / 模型 / 思考强度，可新增模型）">
               <el-icon><Coin /></el-icon>
               <span class="ml-1 truncate text-xs">{{ currentRoleStatus?.model || '模型' }}</span>
@@ -318,23 +306,26 @@ function onKeydown(e: KeyboardEvent) {
             </div>
           </div>
         </el-popover>
-        <el-button :disabled="pendingImages.length >= 4" plain size="small"
-                   class="!bg-transparent !border-line !text-ink-2 hover:!text-white"
+        <el-button text size="small" class="!text-ink-2 hover:!text-primary !px-2"
+                   :disabled="pendingImages.length >= 4"
                    title="添加图片（或直接粘贴截图）"
                    @click="pickFiles">
           <el-icon><Picture /></el-icon>
         </el-button>
-        <el-button type="primary"
+        <span class="ml-auto mr-1 text-[11px] text-ink-3 font-mono hidden sm:inline"
+              :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
+          ↑{{ fmtTokens(props.inputTokens || 0) }} ↓{{ fmtTokens(props.outputTokens || 0) }}
+        </span>
+        <el-button type="primary" size="small" round
                    :loading="loading"
                    :disabled="!canSend"
                    class="!bg-primary !border-primary hover:!bg-[var(--bma-primary-hover)] hover:!border-[var(--bma-primary-hover)]"
                    @click="handleSubmit">
           <el-icon class="mr-1"><Promotion /></el-icon> 发送
-          <span class="sr-only">{{ tokenLabel }}</span>
         </el-button>
       </div>
-      <input ref="fileRef" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple class="hidden" @change="onFileChange" />
     </div>
+    <input ref="fileRef" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple class="hidden" @change="onFileChange" />
 
     <!-- 新增模型对话框：4 字段落盘 config/models.json，免重启生效 -->
     <el-dialog v-model="addDialogVisible" title="新增模型（写入 config/models.json，免重启）" width="460" append-to-body>
@@ -368,16 +359,14 @@ function onKeydown(e: KeyboardEvent) {
 </template>
 
 <style scoped>
-:deep(.chat-input .el-textarea__inner) {
-  background-color: var(--bma-page) !important;
-  border: 1px solid var(--bma-border);
+/* 容器（.chat-box）负责边框/聚焦态，文本域自身去边框 */
+:deep(.chat-box .el-textarea__inner) {
+  background-color: transparent !important;
+  border: none;
   color: var(--bma-text);
   box-shadow: none !important;
   font-size: 13px;
-  padding: 10px 12px;
-}
-:deep(.chat-input .el-textarea__inner:focus) {
-  border-color: var(--bma-primary);
+  padding: 10px 12px 4px;
 }
 :deep(.workdir-cell .el-input__wrapper) {
   background-color: var(--bma-page);

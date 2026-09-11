@@ -203,6 +203,9 @@ func (stubAgent) List(ctx context.Context, filter agent.Filter) ([]*agent.Sessio
 // Get 是 stubAgent 的空实现。
 func (stubAgent) Get(ctx context.Context, sessionID string) (*agent.Session, error) { return nil, nil }
 
+// DeleteSession 是 stubAgent 的空实现。
+func (stubAgent) DeleteSession(ctx context.Context, sessionID string) error { return nil }
+
 // ListAgents 是 stubAgent 的空实现。
 func (stubAgent) ListAgents(ctx context.Context, sessionID string) ([]agent.AgentInstance, error) {
 	return nil, nil

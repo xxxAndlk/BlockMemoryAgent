@@ -7,19 +7,7 @@
         <span class="font-bold text-lg">BlockMemoryAgent</span>
       </div>
 
-      <div class="flex items-center space-x-6 text-sm ml-auto mr-4 shrink-0">
-        <span class="flex items-center text-ink-2" title="Postgres">
-          <span class="w-2 h-2 rounded-full mr-2 inline-block" :class="healthDot(health?.postgres)"></span>Postgres
-        </span>
-        <span class="flex items-center text-ink-2" title="Redis">
-          <span class="w-2 h-2 rounded-full mr-2 inline-block" :class="healthDot(health?.redis)"></span>Redis
-        </span>
-        <span class="flex items-center text-ink-2" title="LLM API">
-          <span class="w-2 h-2 rounded-full mr-2 inline-block" :class="healthDot(health?.llm)"></span>LLM API
-        </span>
-      </div>
-
-      <div class="flex items-center space-x-3 shrink-0">
+      <div class="flex items-center space-x-3 shrink-0 ml-auto">
         <el-icon class="text-xl cursor-pointer text-ink-2 hover:text-primary" @click="toggleTheme">
           <Moon v-if="theme === 'light'" /><Sunny v-else />
         </el-icon>
@@ -67,7 +55,7 @@
             <div>当前人格</div>
             <div class="text-ink-2">{{ soulName }}</div>
           </div>
-          <el-icon class="cursor-pointer hover:text-primary" @click="loadHealth"><Refresh /></el-icon>
+          <el-icon class="cursor-pointer hover:text-primary" @click="loadStatus"><Refresh /></el-icon>
         </div>
       </div>
 
@@ -84,18 +72,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { getHealth, getStatus, type HealthResponse } from '@/api/health'
+import { getStatus } from '@/api/health'
 import { useTheme } from '@/composables/useTheme'
 
 const route = useRoute()
 const { theme, toggleTheme } = useTheme()
 
-const health = ref<HealthResponse | null>(null)
 const soulName = ref('default')
-
-let healthTimer: ReturnType<typeof setInterval> | null = null
 
 async function loadStatus() {
   try {
@@ -106,27 +91,7 @@ async function loadStatus() {
   }
 }
 
-async function loadHealth() {
-  try {
-    health.value = await getHealth()
-  } catch {
-    health.value = null
-  }
-}
-
-onMounted(() => {
-  loadStatus()
-  loadHealth()
-  healthTimer = setInterval(loadHealth, 10000)
-})
-
-onUnmounted(() => {
-  if (healthTimer) clearInterval(healthTimer)
-})
-
-function healthDot(service?: { online?: boolean }) {
-  return service?.online ? 'bg-green-500' : 'bg-red-500'
-}
+onMounted(loadStatus)
 
 // 静态分组菜单（IA 定稿：4 组 + 底部 Beta 预留项，见 spec §信息架构）
 const menuGroups = [

@@ -10,9 +10,10 @@ import "github.com/gin-gonic/gin" // Gin Web 框架
 // 路径使用相对形式（/sessions...），调用方决定是否拼接 /api 前缀与鉴权中间件。
 // 参数 rg：Gin 路由器（*gin.Engine 或 *gin.RouterGroup）；m：会话管理器（handler 绑定接收者）。
 func RegisterSessionRoutes(rg gin.IRouter, m *SessionManager) {
-	// 集合端点：GET 列出会话 / POST 创建会话。
+	// 集合端点：GET 列出会话 / POST 创建会话 / POST 批量硬删除。
 	rg.GET("/sessions", m.HandleListSessions)
 	rg.POST("/sessions", m.HandleCreateSession)
+	rg.POST("/sessions/delete", m.HandleDeleteSessions) // 批量硬删除（body {"ids":[...]}）
 
 	// 会话子资源：handler 内部通过 c.Param("id") 读取会话 ID。
 	rg.GET("/sessions/:id/stream", m.HandleSessionStream)                   // SSE 流式消息推送
@@ -39,5 +40,6 @@ func RegisterSessionRoutes(rg gin.IRouter, m *SessionManager) {
 	rg.POST("/sessions/:id/stop", m.HandleSessionStop)                      // 软停止（可续跑，TODO #37）
 	rg.POST("/sessions/:id/topic", m.HandleSessionTopic)                    // 话题管理
 	rg.POST("/sessions/:id/trust-mode", m.HandleSessionTrustMode)           // 信任模式切换（TODO 第10⑥）
+	rg.DELETE("/sessions/:id", m.HandleDeleteSession)                       // 硬删除会话（不可恢复）
 	rg.GET("/sessions/:id", m.HandleGetSession)                             // 会话详情
 }

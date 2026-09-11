@@ -54,6 +54,14 @@ type Agent interface {
 	// 返回会话指针，若会话不存在或查询失败则返回 error。
 	Get(ctx context.Context, sessionID string) (*Session, error)
 
+	// DeleteSession 硬删除会话：终止运行中的执行并物理删除全部持久化数据
+	// （session_history/session_events/session_logs/agent_events/agent_messages/
+	// agent_compress_states/agent_tree_nodes），不可恢复。
+	// 块记忆（global_knowledge）是跨会话外脑沉淀，不随会话删除。
+	// ctx 用于控制请求的超时与取消；sessionID 为目标会话 ID。
+	// 会话不存在时返回 ErrSessionNotFound。
+	DeleteSession(ctx context.Context, sessionID string) error
+
 	// ListAgents 列出指定会话当前运行中的所有 Agent 实例。
 	// ctx 用于控制请求的超时与取消；sessionID 为目标会话 ID。
 	// 返回 AgentInstance 切片，若会话不存在或查询失败则返回 error。

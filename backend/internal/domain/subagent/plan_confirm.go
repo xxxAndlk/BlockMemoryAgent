@@ -93,6 +93,31 @@ func (s *planConfirmState) bumpRevisions(agentID string) int {
 	return s.revisions[agentID]
 }
 
+// purgeSession 清理指定会话的全部计划确认状态（会话硬删除路径）：
+// 等待者与驳回计数按其 Agent ID 前缀归属判定（agentID == sessionID 或 "sessionID/..."）。
+// 被清理的等待者 chan 不主动投递结论——提交方 ReAct 循环已随会话 ctx 取消退出，
+// 阻塞在 ch 上的 select 走 ctx.Done 分支。幂等。
+func (s *planConfirmState) purgeSession(sessionID string) {
+	if s == nil || sessionID == "" {
+		return
+	}
+	inSession := func(id string) bool {
+		return id == sessionID || strings.HasPrefix(id, sessionID+"/")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for planID, w := range s.waits {
+		if inSession(w.agentID) {
+			delete(s.waits, planID)
+		}
+	}
+	for agentID := range s.revisions {
+		if inSession(agentID) {
+			delete(s.revisions, agentID)
+		}
+	}
+}
+
 // submitPlanTool 实现 submit_plan 工具：提交计划并阻塞等待上级（或用户）确认。
 type submitPlanTool struct {
 	dispatcher *Dispatcher

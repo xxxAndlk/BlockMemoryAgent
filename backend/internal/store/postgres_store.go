@@ -317,3 +317,8 @@ func (s *PostgresStore) RecentSessionHistories(ctx context.Context, limit int) (
 func (s *PostgresStore) GetSessionHistoryByID(ctx context.Context, id string) (*SessionHistoryRecord, error) {
 	return s.Session.GetHistoryByID(ctx, id)
 }
+
+// DeleteSessionData 硬删除会话全部持久化数据；委托给 SessionStore.DeleteSessionData。
+func (s *PostgresStore) DeleteSessionData(ctx context.Context, sessionID string) error {
+	return s.Session.DeleteSessionData(ctx, sessionID)
+}

@@ -123,8 +123,6 @@ function nodeColor(type: string) {
                  @click="emit('cancel')">
         <el-icon class="mr-1"><CircleClose /></el-icon>终止
       </el-button>
-      <span class="text-xs text-ink-2 truncate shrink-0">{{ session?.id || '' }}</span>
-
       <!-- 信任模式三态下拉（TODO 第10⑥）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主 -->
       <el-select v-if="session" :model-value="trustMode" size="small" class="!w-32 shrink-0"
                  title="信任模式：变更类操作的审批档位，切换下一工具调用生效"

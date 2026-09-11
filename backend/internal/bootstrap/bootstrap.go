@@ -466,6 +466,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入任务看板（TODO #22 执行计划）：write_plan 写板、派发依赖门、TUI 面板真相源。
 	// 看板按 sessionID 惰性创建（write_plan 首次调用 GetOrCreate）。
 	agentSvc.SetBoard(rt.Boards.Get)
+	// 看板移除器（会话硬删除路径）：DeleteSession 清掉该会话看板，防残留串台到同名新会话。
+	agentSvc.SetBoardRemover(rt.Boards.Remove)
 	// 用户输入自动提示词补全（TODO #36 Phase 0 规则版 + #39 四层管线）：命中续跑/控制/
 	// 诊断意图时 sendMessage 附加【系统补全】段（意图标签 + 看板/树失败任务绑定），
 	// 只增不改原文。L2 仲裁（#39）仅灰区触发：句首弱词/句中弱信号的短输入调轻量模型四分类，

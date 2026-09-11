@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -103,6 +104,9 @@ type ReactService struct {
 	persona PersonaInjector
 	// boardFn 按 sessionID 返回会话任务看板（TODO #22 执行计划）；nil 表示未接线。
 	boardFn func(sessionID string) *board.TaskBoard
+	// boardRemoveFn 移除会话任务看板（DeleteSession 硬删除路径）；nil 表示未接线。
+	// 由 bootstrap 注入 board.Manager.Remove。
+	boardRemoveFn func(sessionID string)
 
 	// ledgerFn 按 sessionID 渲染【任务台账】块文本（2026-08-28 旧需求重派事故根治）；
 	// 空串=无台账不注入，nil 表示未接线。由 bootstrap 注入 Dispatcher.TaskLedgerBrief。
@@ -365,6 +369,12 @@ func (s *ReactService) SetBoard(fn func(sessionID string) *board.TaskBoard) {
 // 由 bootstrap 注入 Dispatcher.TaskLedgerBrief。
 func (s *ReactService) SetTaskLedgerProvider(fn func(sessionID string) string) {
 	s.ledgerFn = fn
+}
+
+// SetBoardRemover 注入会话任务看板移除器（DeleteSession 硬删除路径）。
+// 由 bootstrap 注入 board.Manager.Remove；传 nil 时删除会话不清看板（测试场景）。
+func (s *ReactService) SetBoardRemover(fn func(sessionID string)) {
+	s.boardRemoveFn = fn
 }
 
 // SetPromptEnhance 开启/关闭用户输入自动提示词补全（TODO #36，默认关闭；
@@ -3013,6 +3023,127 @@ func (s *ReactService) cancel(ctx context.Context, sessionID string) error {
 	// 强制移除（patch 文件保留供事后审计）。
 	if wo, ok := s.stopMarker.(WorktreeOperator); ok {
 		wo.CleanupSessionWorktrees(sessionID)
+	}
+	return nil
+}
+
+// SessionResourcePurge 是会话硬删除的运行时资源清扫能力（subagent.Dispatcher 实现）：
+// 清软停标记/手动暂停标记/热驻槽（级联销毁+模型覆盖回收）/任务台账/分发计数，
+// 并对 nodeIDs（会话内全部节点）做邮箱与活动证据兜底清理。
+type SessionResourcePurge interface {
+	PurgeSession(sessionID string, nodeIDs []string)
+}
+
+// DeleteSession 硬删除会话：终止运行、清扫运行时资源、物理删除全部持久化数据。
+//
+// 不软删——session_history / session_events / session_logs / agent_events /
+// agent_messages / agent_compress_states / agent_tree_nodes 逐表物理删除；
+// 块记忆（global_knowledge）是跨会话外脑沉淀，不随会话删除。
+// 运行中的会话先取消（cancelFn + stopCtx + 级联取消树节点）再摘除；删除后迟到的
+// 收尾落库由 reactSessionStore.stillLive 守卫拦截，不会"复活"。
+// 仅存于 PG 的历史会话（重启后未物化）无需运行时清理，直接删库。
+// 会话在内存与库中都不存在时返回 ErrSessionNotFound。
+func (s *ReactService) DeleteSession(ctx context.Context, sessionID string) error {
+	// 1. 内存摘除 + 取消运行（锁内摘除后锁外取消，避免持锁执行回调）。
+	s.store.mu.Lock()
+	session := s.store.sessions[sessionID]
+	var cancelFn, stopCancel context.CancelFunc
+	var tempDir, workDir string
+	if session != nil {
+		cancelFn = session.cancelFn
+		session.cancelFn = nil
+		stopCancel = session.stopCancel
+		session.stopCancel = nil
+		if session.stopTimer != nil {
+			session.stopTimer.Stop()
+			session.stopTimer = nil
+		}
+		// 先摘除再取消：取消会异步触发收尾 goroutine，摘除先行保证 stillLive 守卫生效。
+		delete(s.store.sessions, sessionID)
+		tempDir = session.TempDir
+		workDir = session.workDir
+	}
+	s.store.mu.Unlock()
+	if cancelFn != nil {
+		cancelFn()
+	}
+	if stopCancel != nil {
+		stopCancel()
+	}
+
+	// 2. 树快照 + 终结：取消全部 Running/Paused/Idle 节点、清内存、删 PG 节点。
+	// 树实例保留在 s.trees（不删条目）：迟到的子 Agent 收尾经 TreeFor 拿到空树而非
+	// 触发 lazy init 重建，避免竞态下重复加载。
+	var nodeIDs []string
+	if v, ok := s.trees.Load(sessionID); ok {
+		if t, okTree := v.(*orchestrator.Tree); okTree {
+			for _, n := range t.Snapshot() {
+				nodeIDs = append(nodeIDs, n.ID)
+			}
+			t.EndCurrentTopic()
+		}
+	}
+
+	// 3. 运行时清扫：热驻槽销毁（含模型覆盖回收）/软停与暂停标记/台账/分发计数/邮箱。
+	if p, ok := s.stopMarker.(SessionResourcePurge); ok {
+		p.PurgeSession(sessionID, nodeIDs)
+	}
+	// 4. 邮箱兜底：meta 自身（agentID==sessionID）与全部节点（幂等）。
+	if s.mailbox != nil {
+		s.mailbox.Purge(sessionID)
+		for _, id := range nodeIDs {
+			s.mailbox.Purge(id)
+		}
+	}
+	// 5. 看板移除（写计划会话的执行计划面板真相源）。
+	if s.boardRemoveFn != nil {
+		s.boardRemoveFn(sessionID)
+	}
+	// 6. worktree 残留副本清理（未合并副本 best-effort 移除，patch 文件保留审计）。
+	if wo, ok := s.stopMarker.(WorktreeOperator); ok {
+		wo.CleanupSessionWorktrees(sessionID)
+	}
+
+	// 7. 仅存于 PG 的历史会话：取库记录供工作目录解析与存在性判定（内存命中则跳过）。
+	// 内存与库（或未配置库）都没有 → 会话不存在。
+	var rec *store.SessionHistoryRecord
+	if session == nil {
+		if s.store.pgStore == nil {
+			return ErrSessionNotFound
+		}
+		rec, _ = s.store.pgStore.GetSessionHistoryByID(ctx, sessionID)
+		if rec == nil {
+			return ErrSessionNotFound
+		}
+		workDir = rec.WorkDir
+		eff := workDir
+		if eff == "" {
+			eff = s.workDir()
+		}
+		tempDir = filepath.Join(eff, ".bma", "tmp", sessionID)
+	}
+
+	// 8. 临时目录清理。
+	if tempDir != "" {
+		s.store.cleanupSessionTempDir(sessionID, tempDir)
+	}
+	// 9. 话题摘要 KV 清理（key 格式 `topic:{sessionID}:{topicID}:summary`，按会话前缀清扫）。
+	if s.sharedMemoryStore != nil {
+		kvCtx, cancelKV := context.WithTimeout(tool.WithWorkDir(ctx, workDir), 3*time.Second)
+		for _, k := range s.sharedMemoryStore.Keys(kvCtx) {
+			if strings.HasPrefix(k, "topic:"+sessionID+":") {
+				if err := s.sharedMemoryStore.Delete(kvCtx, k); err != nil {
+					s.store.logError(ctx, "delete session: remove topic summary failed", err)
+				}
+			}
+		}
+		cancelKV()
+	}
+	// 10. PG 硬删（单事务，全部会话从属表）。
+	if s.store.pgStore != nil {
+		if err := s.store.pgStore.DeleteSessionData(ctx, sessionID); err != nil {
+			return fmt.Errorf("删除会话数据失败: %w", err)
+		}
 	}
 	return nil
 }

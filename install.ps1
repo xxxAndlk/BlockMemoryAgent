@@ -10,11 +10,11 @@ New-Item -ItemType Directory -Force -Path $target, "$target\bin", "$target\confi
 # 二进制与前端资源:覆盖(升级)
 Copy-Item -Force "$src\bin\*" "$target\bin\"
 if (Test-Path "$src\web\dist") { New-Item -ItemType Directory -Force -Path "$target\web" | Out-Null; Copy-Item -Force -Recurse "$src\web\dist" "$target\web\" }
-# 配置与 .env:roles.yaml 与二进制配套(工具白名单/角色表,旧版会整体覆盖内置清单导致新工具缺失),升级强制覆盖;
-# 其余(models.json 含 api_key、skills_learned 等)已存在则不覆盖,保留现场密钥与产物。
+# 配置:config/ 下全部文件每次直接覆盖(roles.yaml/models.json/plugins.yaml/skills.yaml 等
+# 与二进制配套,旧版会缺新工具/新字段)。.env 不在此目录,仍只补缺不覆盖,保留现场密钥。
 foreach ($f in Get-ChildItem "$src\config") {
     $dst = Join-Path "$target\config" $f.Name
-    if ($f.Name -eq "roles.yaml" -or -not (Test-Path $dst)) { Copy-Item $f.FullName $dst }
+    Copy-Item -Force $f.FullName $dst
 }
 if (-not (Test-Path "$target\.env") -and (Test-Path "$PSScriptRoot\.env.example")) { Copy-Item "$PSScriptRoot\.env.example" "$target\.env" }
 

@@ -163,6 +163,42 @@ func (s *SessionStore) GetEvents(ctx context.Context, sessionID string) ([]Sessi
 	return events, rows.Err()
 }
 
+// sessionScopedTables 列出全部带 session_id 列的会话从属表，会话硬删除逐表清扫。
+// agent_events/agent_messages/agent_compress_states 的 session_id 由 agentID 派生
+//（MetaAgent agentID==sessionID；子 Agent "session-N/role-K" 取首段），DELETE 按
+// session_id 等价即可覆盖该会话的全部子 Agent 行。
+var sessionScopedTables = []string{
+	"session_history",
+	"session_events",
+	"session_logs",
+	"agent_events",
+	"agent_messages",
+	"agent_compress_states",
+	"agent_tree_nodes",
+}
+
+// DeleteSessionData 硬删除会话的全部持久化数据（sessionScopedTables 逐表 DELETE）。
+// 单事务保证一致性；幂等——目标 session 无数据时各 DELETE 影响 0 行，返回 nil。
+// 参数:
+//   - ctx:       请求上下文。
+//   - sessionID: 会话 ID。
+//
+// 返回: 事务错误（任一表删除失败整体回滚）。
+func (s *SessionStore) DeleteSessionData(ctx context.Context, sessionID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	for _, table := range sessionScopedTables {
+		// 表名为编译期常量清单，非用户输入，直接内插安全。
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE session_id = $1`, sessionID); err != nil {
+			return fmt.Errorf("delete %s: %w", table, err)
+		}
+	}
+	return tx.Commit()
+}
+
 // RecentHistories 返回最近 limit 条会话历史 (按时间倒序)。
 // 参数:
 //   - ctx:   请求上下文。

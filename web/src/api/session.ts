@@ -17,6 +17,21 @@ export function getSession(id: string): Promise<Session> {
   return fetchJson(`/sessions/${id}`)
 }
 
+/** 硬删除单个会话（不可恢复）：运行中先终止，随后物理删除历史/事件/日志等全部数据。 */
+export function deleteSession(id: string): Promise<{ session_id: string; status: string }> {
+  return fetchJson(`/sessions/${id}`, { method: 'DELETE' })
+}
+
+export interface BatchDeleteResult {
+  deleted: string[]
+  errors: { id: string; error: string }[]
+}
+
+/** 批量硬删除会话（单次上限 200）；逐条独立处理，返回成功与失败清单。 */
+export function deleteSessions(ids: string[]): Promise<BatchDeleteResult> {
+  return fetchJson('/sessions/delete', { method: 'POST', body: JSON.stringify({ ids }) })
+}
+
 export function getSessionBoard(id: string): Promise<{ session_id: string; board: TaskBoardData }> {
   return fetchJson(`/sessions/${id}/board`)
 }
