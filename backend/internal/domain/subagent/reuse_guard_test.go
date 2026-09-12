@@ -66,7 +66,7 @@ func dispatchIdleDomain(t *testing.T, toolsReg *tool.Registry, domain, responsib
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch %s failed: err=%v res=%+v", domain, err, res)
 	}
-	return res.Output
+	return subAgentIDOf(res)
 }
 
 // waitTreeIdle 等指定子 Agent 树节点转 Idle。

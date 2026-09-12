@@ -155,7 +155,7 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 	constraints := parseStringListArg(args["constraints"])
 	files := parseFilesArg(args["files"])
 	contract := parseContractArg(args["contract"])
-	verifyLevels, err := NormalizeVerifyLevels(parseStringListArg(args["verify_levels"]))
+	verifyLevels, levelNotes, err := NormalizeVerifyLevels(parseStringListArg(args["verify_levels"]))
 	if err != nil {
 		return &Result{Tool: "WriteSpec", Error: err.Error(), Category: ResultCategoryValidationRejected}
 	}
@@ -305,6 +305,11 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 	if appendedHappyPath {
 		out += "。检测到降级/兜底关键词，已自动追加 happy-path 主路径可用性验收项（见 acceptance 末条）——主路径必须真实生效，兜底不得成为唯一实现路径"
 	}
+	// verify_levels 混淆值自动纠正回显（2026-09-12 事故）：让模型知道 probes/scenes
+	// 是独立字段不是层级，避免下次再填错。
+	for _, note := range levelNotes {
+		out += "。verify_levels 已自动纠正：" + note
+	}
 	// 派发预算提醒（TODO #38-3）：把合规时机前移一轮——写规范时即提示 task 预算，
 	// 避免下轮 call_sub_agent 因 task 超长被拒（3000 软限放行附警告，4000 硬拒）。
 	out += "。派发 task 预算 3000 字（按 rune 计，超 4000 硬拒）：规格细节走本工具，task 只写目标+验收标准"
@@ -342,7 +347,7 @@ type writeSpecInput struct {
 	Files []string `json:"files" description:"涉及的文件路径列表（相对或绝对）。任一文件被 WriteFile 修改后该规范自动失效，避免子 Agent 读到旧规范。可空。"`
 	// VerifyLevels 验收层级（TODO #59）：existence/static/integration/runtime/visual 子集。
 	// UI/游戏类任务填 visual；多文件集成填 integration；默认存在性+静态由 dispatcher 自动覆盖。
-	VerifyLevels []string `json:"verify_levels" description:"验收层级（existence/static/integration/runtime/visual 子集，可空）。UI/游戏/绘制类任务必须含 visual（dispatcher 强制截图回显证据，缺则判未验证）与 runtime（dispatcher 机器强制 browser_navigate+browser_evaluate+console 无 error 探针证据，缺则判未验证）；多文件集成类任务含 integration（dispatcher 跑入口引用图探针）。"`
+	VerifyLevels []string `json:"verify_levels" description:"验收层级（只接受 existence/static/integration/runtime/visual 五个值，可空）。注意：probes 和 scenes 是本工具的独立参数，不是验收层级，严禁填入 verify_levels。UI/游戏/绘制类任务必须含 visual（dispatcher 强制截图回显证据，缺则判未验证）与 runtime（dispatcher 机器强制 browser_navigate+browser_evaluate+console 无 error 探针证据，缺则判未验证）；多文件集成类任务含 integration（dispatcher 跑入口引用图探针）。"`
 	// Key 命名槽位（TODO #65 多 key 化）：可空（默认 spec，全兄弟共享一份）。
 	// 多领域任务建议按领域名各写一份（key=领域名），兄弟各持各的、staleness 互不误伤。
 	Key string `json:"key" description:"命名槽位（默认 spec）。多领域任务按领域名各写一份（key=领域名）可隔离 staleness；同 key 写入覆盖前值。key 必须与 call_sub_agent 的 domain 参数一致（dispatcher 按 domain 查键）。可空。"`
@@ -628,25 +633,53 @@ func ValidateContractShape(c *Contract) string {
 //   - visual 视觉：截图回显证据（dispatcher 强制 browser_take_screenshot 成功证据，缺则未验证）。
 var VerifyLevelsAllowed = []string{"existence", "static", "integration", "runtime", "visual"}
 
+// verifyLevelAlias 是模型高频混淆值的自动纠正表（2026-09-12 事故：提示词把
+// "visual+runtime+probes+scenes" 并列书写，模型误把 probes 当层级填进 verify_levels，
+// 连续 14 次校验拒绝触发 LoopExit 终止整个任务）。probes/scenes 是 spec 的独立
+// 参数字段而非验收层级，填进 verify_levels 时语义明确——probes 只为 runtime 层服务、
+// scenes 只为 visual 层服务——直接归并到对应层级并在结果中回显纠正说明。
+var verifyLevelAlias = map[string]string{
+	"probes":      "runtime",
+	"probe":       "runtime",
+	"scenes":      "visual",
+	"scene":       "visual",
+	"screenshot":  "visual",
+	"screenshots": "visual",
+}
+
+// verifyLevelDrop 是 spec 其他字段名误入 verify_levels 时的静默丢弃清单
+// （无对应层级语义，层级校验与该字段无关）。
+var verifyLevelDrop = map[string]bool{
+	"goal": true, "acceptance": true, "constraints": true, "files": true,
+	"contract": true, "baseline": true, "baseline_content": true, "key": true,
+}
+
 // NormalizeVerifyLevels 规范化验收层级列表：trim + 小写 + 去重 + 校验合法值。
-// 非法值返回错误并列出合法集合，让 LLM 一次改正（严格优于静默丢弃）。
-func NormalizeVerifyLevels(levels []string) ([]string, error) {
+// 已知混淆值（probes/scenes 等字段名误入）自动纠正/丢弃并返回 notes 供工具结果回显；
+// 真未知值返回错误并列出合法集合，让 LLM 一次改正。
+func NormalizeVerifyLevels(levels []string) ([]string, []string, error) {
 	if len(levels) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	allowed := make(map[string]bool, len(VerifyLevelsAllowed))
 	for _, v := range VerifyLevelsAllowed {
 		allowed[v] = true
 	}
 	seen := make(map[string]bool, len(levels))
-	var out []string
+	var out, notes []string
 	for _, l := range levels {
 		l = strings.ToLower(strings.TrimSpace(l))
 		if l == "" {
 			continue
 		}
-		if !allowed[l] {
-			return nil, fmt.Errorf("verify_levels 含非法值 %q，合法集合: %s", l, strings.Join(VerifyLevelsAllowed, "/"))
+		if alias, ok := verifyLevelAlias[l]; ok {
+			notes = append(notes, fmt.Sprintf("%q 不是验收层级（它是 spec 的独立字段），已按语义归入 %q 层", l, alias))
+			l = alias
+		} else if verifyLevelDrop[l] {
+			notes = append(notes, fmt.Sprintf("%q 不是验收层级（它是 spec 的独立字段），已从 verify_levels 移除", l))
+			continue
+		} else if !allowed[l] {
+			return nil, nil, fmt.Errorf("verify_levels 含非法值 %q，合法集合: %s", l, strings.Join(VerifyLevelsAllowed, "/"))
 		}
 		if seen[l] {
 			continue
@@ -654,7 +687,7 @@ func NormalizeVerifyLevels(levels []string) ([]string, error) {
 		seen[l] = true
 		out = append(out, l)
 	}
-	return out, nil
+	return out, notes, nil
 }
 
 // hasPrefixAcceptance 判断 acceptance 列表是否已有同前缀条目（防重复追加）。

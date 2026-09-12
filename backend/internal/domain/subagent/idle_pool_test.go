@@ -93,7 +93,7 @@ func TestHotDomain_TaskDoneEntersIdle(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 
 	waitForCond(t, "tree idle", func() bool {
 		n, ok := tr.Get(subID)
@@ -136,7 +136,7 @@ func TestHotDomain_ArmAndExpiry(t *testing.T) {
 		"domain":         "金融",
 		"responsibility": "负责金融模块",
 	})
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	waitForCond(t, "tree idle", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && n.Status == orchestrator.StatusIdle
@@ -176,7 +176,7 @@ func TestHotDomain_ReuseWake(t *testing.T) {
 		"domain":         "金融",
 		"responsibility": "负责金融模块",
 	})
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	waitForCond(t, "tree idle", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && n.Status == orchestrator.StatusIdle
@@ -222,7 +222,7 @@ func TestHotDomain_QueueWhenBusy(t *testing.T) {
 		"domain":         "金融",
 		"responsibility": "负责金融模块",
 	})
-	subID := res.Output
+	subID := subAgentIDOf(res)
 
 	// 第一任务仍在跑（同 goroutine 未完成），立即再派发应入队。
 	// 由于 scriptProvider 立即返回，忙碌窗口极窄；轮询 tree Running 态时再派。
@@ -280,7 +280,7 @@ func TestHotDomain_FailDestroysSlot(t *testing.T) {
 		"domain":         "金融",
 		"responsibility": "负责金融模块",
 	})
-	subID := res.Output
+	subID := subAgentIDOf(res)
 
 	waitForCond(t, "tree failed", func() bool {
 		n, ok := tr.Get(subID)
@@ -345,7 +345,7 @@ func TestIdleRoster_Render(t *testing.T) {
 		"domain":         "金融",
 		"responsibility": "负责金融模块",
 	})
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	waitForCond(t, "tree idle", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && n.Status == orchestrator.StatusIdle
@@ -376,7 +376,7 @@ func TestIdleRoster_WrittenFiles(t *testing.T) {
 		"domain":         "部署",
 		"responsibility": "负责部署",
 	})
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	waitForCond(t, "tree idle", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && n.Status == orchestrator.StatusIdle

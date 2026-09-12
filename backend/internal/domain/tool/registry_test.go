@@ -463,16 +463,16 @@ func (s *stubCallSubAgent) Execute(ctx context.Context, args map[string]any) *Re
 // scope 扩展起实现 SchemaSource）+ 5 个 plugin_* 插件管理工具
 // + 3 个 tool_catalog/mount/unmount 挂载工具，TODO #51/52）。
 func TestSchemaIncludesCallSubAgent(t *testing.T) {
-	// 未安装 call_sub_agent 时，schema 恰为 28 个工具（含 RefreshProjectDoc/WriteSharedMemory/ReadSharedMemory/WriteSpec/ReadMedia/ask_user/remember_preference/plugin_*/tool_*）。
+	// 未安装 call_sub_agent 时，schema 恰为 29 个工具（含 RefreshProjectDoc/WriteSharedMemory/ReadSharedMemory/WriteSpec/ReadMedia/ShowArtifact/ask_user/remember_preference/plugin_*/tool_*）。
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	if n := len(r.Schema()); n != 28 {
-		t.Fatalf("expected 28 builtin tools without call_sub_agent, got %d", n)
+	if n := len(r.Schema()); n != 29 {
+		t.Fatalf("expected 29 builtin tools without call_sub_agent, got %d", n)
 	}
 	// 安装后应出现在 schema 中，且描述来自 Description()。
 	r.Register(&stubCallSubAgent{})
 	schema := r.Schema()
-	if len(schema) != 29 {
-		t.Fatalf("expected 29 tools with call_sub_agent, got %d", len(schema))
+	if len(schema) != 30 {
+		t.Fatalf("expected 30 tools with call_sub_agent, got %d", len(schema))
 	}
 	// 遍历查找 call_sub_agent 并校验描述文本。
 	found := false
@@ -1062,6 +1062,35 @@ func TestWriteSpec_VerifyLevels(t *testing.T) {
 	}
 	if !strings.Contains(res.Error, "verify_levels 含非法值") {
 		t.Fatalf("expected validation error, got %q", res.Error)
+	}
+}
+
+// TestWriteSpec_VerifyLevelsAlias 字段名误入 verify_levels（probes/scenes 等，2026-09-12
+// 事故：模型把提示词并列书写的 probes 当层级填入，连续校验拒绝触发 LoopExit）：
+// 自动纠正为对应层级并放行，结果回显纠正说明；真未知值仍拒绝。
+func TestWriteSpec_VerifyLevelsAlias(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.SetSharedMemory(newFakeSharedMemoryStore())
+	ctx := WithAgentID(context.Background(), "meta-1")
+
+	res, err := r.Dispatch(ctx, "WriteSpec", map[string]any{
+		"goal": "g", "acceptance": []any{"a"},
+		"verify_levels": []any{"visual", "probes", "scenes", "runtime"},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("alias levels should be auto-corrected, got err=%v res=%+v", err, res)
+	}
+	val, _ := r.sharedMemory.Get(ctx, "meta-1:spec")
+	fm, _, ok := DecodeSharedMD(val)
+	if !ok {
+		t.Fatal("decode failed")
+	}
+	// probes→runtime、scenes→visual，去重后应为 [visual, runtime]。
+	if len(fm.VerifyLevels) != 2 || fm.VerifyLevels[0] != "visual" || fm.VerifyLevels[1] != "runtime" {
+		t.Fatalf("verify_levels alias correction wrong: %v", fm.VerifyLevels)
+	}
+	if !strings.Contains(res.Output, "verify_levels 已自动纠正") {
+		t.Fatalf("expected correction note in result, got %q", res.Output)
 	}
 }
 

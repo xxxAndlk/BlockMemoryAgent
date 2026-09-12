@@ -1,4 +1,4 @@
-﻿# BMA 安装脚本:复制 dist/ 到安装目录并写入 BMA_HOME 用户环境变量。幂等,可重复运行(升级)。
+# BMA 安装脚本:复制 dist/ 到安装目录并写入 BMA_HOME 用户环境变量。幂等,可重复运行(升级)。
 $ErrorActionPreference = "Stop"
 $default = "D:\WebApp\bma"
 $target = Read-Host "安装目录 [$default]"
@@ -9,7 +9,7 @@ if (-not (Test-Path (Join-Path $src "bin\tui.exe"))) { throw "未找到 dist\bin
 New-Item -ItemType Directory -Force -Path $target, "$target\bin", "$target\config", "$target\plugins.d", "$target\logs" | Out-Null
 # 二进制与前端资源:覆盖(升级)
 Copy-Item -Force "$src\bin\*" "$target\bin\"
-if (Test-Path "$src\web\dist") { New-Item -ItemType Directory -Force -Path "$target\web" | Out-Null; Copy-Item -Force -Recurse "$src\web\dist" "$target\web\" }
+if (Test-Path "$src\web\dist") { New-Item -ItemType Directory -Force -Path "$target\web" | Out-Null; if (Test-Path "$target\web\dist") { Remove-Item -Recurse -Force "$target\web\dist" }; Copy-Item -Force -Recurse "$src\web\dist" "$target\web\" }
 # 配置:config/ 下全部文件每次直接覆盖(roles.yaml/models.json/plugins.yaml/skills.yaml 等
 # 与二进制配套,旧版会缺新工具/新字段)。.env 不在此目录,仍只补缺不覆盖,保留现场密钥。
 # skills_learned 例外:运行时产物(自进化技能),保留安装目录现场数据,不覆盖。

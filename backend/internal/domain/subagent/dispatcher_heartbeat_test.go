@@ -74,7 +74,7 @@ func TestDispatcher_StuckLeaf_InFlightLLMExempt(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("expected dispatch success, got: %s", res.Error)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 
 	// 前提守卫：reporter 已注入且 llm_start 置 llmInFlight=true（Generate 挂起中）。
 	deadline := time.Now().Add(2 * time.Second)
@@ -243,7 +243,7 @@ func TestHotDomain_HeartbeatKillCancelsRunningTask(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 
 	// 前提：等引擎 LLM 进入在飞（wrapEngineLLM beginAuxLLM 置 llmInFlight=true）。
 	// 换绑先于引擎执行，此时任务 cancelTask 已换绑进 subMeta。

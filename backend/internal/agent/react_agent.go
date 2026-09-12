@@ -1846,7 +1846,11 @@ func (a *ReActAgent) drainMailbox(history []ReactMessage) ([]ReactMessage, int) 
 		history = a.appendLogged(history, mailboxMessageToReact(m))
 
 		// 实时推送子 Agent 完成事件，UI 可据此更新"等待子 Agent"状态。
-		a.emitLive(LiveEvent{Kind: LiveEventSubAgentDone, Tool: m.From, Text: truncateRunes(m.Body, 200)})
+		// 用户注入（From=user，如运行中重新下达指令）不是子 Agent 完成，不推该事件——
+		// 否则 UI 会多出一条 "子Agent 完成: user" 的假完成记录。
+		if m.From != "user" {
+			a.emitLive(LiveEvent{Kind: LiveEventSubAgentDone, Tool: m.From, Text: truncateRunes(m.Body, 200)})
+		}
 
 		// 同时把子代理摘要作为记忆事件写入，供后续上下文组装使用。
 		a.memory.Write(a.name, MemoryEvent{

@@ -660,6 +660,24 @@ func (s *ReactService) SetAgentMessenger(m AgentMessenger) {
 	s.messenger = m
 }
 
+// injectUserMessageToRunningSession 把用户新指令投给**运行中**会话的 MetaAgent 邮箱。
+//
+// 为什么需要（2026-09-12 用户实证）：任务全部派发出去、正在等子 Agent 时用户重新输入，
+// 此前只写进 session.Messages——而运行中的 ReAct 主循环根本不读该字段（它只在
+// resumeSession 建新轮时用它作输入），消息等于静默丢失，用户看着"发送成功"但 Agent
+// 毫无反应。改投邮箱后，主循环在本轮内的下一个检查点读到它：waitForChildren 每周期
+// drain（等子返回时立即生效）、主循环顶部 drain（其他阶段在下一步生效），经
+// mailboxMessageToReact 转成 user 消息进入历史，MetaAgent 即按新指令重新规划。
+// 邮箱未接线（测试/精简装配）时返回错误，调用方降级为"仅记录"，不影响主流程。
+func (s *ReactService) injectUserMessageToRunningSession(session *reactInternalSession, content string) error {
+	if s.messenger == nil {
+		return fmt.Errorf("用户注入通道未接线")
+	}
+	// MetaAgent 的邮箱名 = 会话 ID（runSession 里 NewReActAgent(session.ID, ...)），
+	// InjectUserMessage 内部 Send + poke：不 poke 要等满一次等待周期（30s）才可见。
+	return s.messenger.InjectUserMessage(session.ID, content)
+}
+
 // MessageAgent 用户直连子 Agent（编排页对话面板发送框）。状态机路由：
 // 等子返回（running + activity_kind=child_wait）→ 邮箱注入+唤醒；
 // 执行中（running 其他）→ ErrAgentBusy（前端禁用发送，引导先中断/终止）；
@@ -1424,9 +1442,10 @@ func (s *ReactService) ApprovalHook() tool.ApprovalHookFunc {
 			},
 		}
 		sess.Status = enums.SessionStatusAwaitingClarify
+		report := clarifyReportJSON(strings.TrimSpace(sess.StreamingText))
 		s.store.mu.Unlock()
 
-		s.store.addEvent(sess, eventkind.Clarify, "System", question, "", "", "", "", "", true)
+		s.store.addEventDetail(sess, eventkind.Clarify, "System", question, "", "", "", "", "", true, report)
 
 		// 等待用户期间保活：阻塞等答复时周期性刷新该 Agent 心跳（沿父链冒泡），
 		// 巡检不会把"等用户操作"误判假死——一直等到用户答复或会话取消为止。
@@ -1541,6 +1560,22 @@ func (s *ReactService) SetSessionWorkDir(ctx context.Context, sessionID, dir str
 	}
 	s.store.addEvent(sess, eventkind.System, "System", note, "", "", "", "", "", true)
 	return nil
+}
+
+// SessionWorkDir 返回会话**有效**工作目录（每会话目录为空时回落进程默认目录）。
+// 与 runSession/resumeSession 注入 runCtx 的口径一致（会话目录优先、空串回落默认），
+// 供工作区文件服务这类只读路径解析使用；会话不存在返回空串。
+func (s *ReactService) SessionWorkDir(sessionID string) string {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return ""
+	}
+	if wd := sess.currentWorkDir(); wd != "" {
+		return wd
+	}
+	return s.workDir()
 }
 
 // SessionTrustMode 读取会话当前信任模式（HTTP GET 展示用）；未设置返回空串。
@@ -1753,6 +1788,7 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		}
 		sess.pendingClarify = req
 		sess.Status = enums.SessionStatusAwaitingClarify
+		report := clarifyReportJSON(strings.TrimSpace(sess.StreamingText))
 		s.store.mu.Unlock()
 
 		// detail（如 submit_plan 计划全文）先于问题独立成事件（kind=clarify_detail，
@@ -1761,7 +1797,7 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		if req.Detail != "" {
 			s.store.addEvent(sess, eventkind.Clarify, "System", req.Detail, eventkind.ClarifyDetail, "", "", "", "", true)
 		}
-		s.store.addEvent(sess, eventkind.Clarify, "System", "Agent 提问: "+question, "", "", "", "", "", true)
+		s.store.addEventDetail(sess, eventkind.Clarify, "System", "Agent 提问: "+question, "", "", "", "", "", true, report)
 
 		select {
 		case <-ctx.Done():
@@ -1889,6 +1925,7 @@ func (s *ReactService) AskUserBatchHook() tool.AskUserBatchHookFunc {
 		}
 		sess.pendingClarify = req
 		sess.Status = enums.SessionStatusAwaitingClarify
+		report := clarifyReportJSON(strings.TrimSpace(sess.StreamingText))
 		s.store.mu.Unlock()
 
 		// 事件流：detail 先于问题（kind=clarify_detail），逐题 question-only
@@ -1896,8 +1933,13 @@ func (s *ReactService) AskUserBatchHook() tool.AskUserBatchHookFunc {
 		if req.Detail != "" {
 			s.store.addEvent(sess, eventkind.Clarify, "System", req.Detail, eventkind.ClarifyDetail, "", "", "", "", true)
 		}
-		for _, q := range req.Questions {
-			s.store.addEvent(sess, eventkind.Clarify, "System", "Agent 提问: "+q.Question, "", "", "", "", "", true)
+		for i, q := range req.Questions {
+			// 正文只挂第一条：前端按"任一 clarify 事件带正文即渲染"取值，无需题题复制。
+			detail := ""
+			if i == 0 {
+				detail = report
+			}
+			s.store.addEventDetail(sess, eventkind.Clarify, "System", "Agent 提问: "+q.Question, "", "", "", "", "", true, detail)
 		}
 
 		select {
@@ -2355,6 +2397,12 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 				if v, ok := detail["path"].(string); ok {
 					toolPath = v
 				}
+				// 可视成果（ShowArtifact 的 Result.Artifacts）：并入 detail_json 落库，
+				// 对话栏据此渲染媒体卡片（只带工作区相对路径，零二进制）。
+				// detail_json 是既有持久列，无需迁移；历史回放靠它。
+				if v, ok := detail["artifacts"]; ok {
+					detailJSON = mergeArtifactsJSON(detailJSON, v)
+				}
 			}
 		}
 		// 失败时把 path+error 拼进 message，让 logInfo 输出可见失败原因；
@@ -2372,6 +2420,24 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 	}
 	// 其他类型事件作为进度事件记录。
 	s.store.addEventDetail(session, eventkind.Progress, agentName, ev.Message, ev.Kind, ev.Tool, "", "", "", success, detailJSON)
+}
+
+// mergeArtifactsJSON 把工具产出的可视成果并入事件 detail_json（现为 {"agent_id":…}）。
+// 失败时原样返回原值——留痕/展示数据不值得为此中断事件记录。
+func mergeArtifactsJSON(detailJSON string, artifacts any) string {
+	if artifacts == nil {
+		return detailJSON
+	}
+	m := map[string]any{}
+	if detailJSON != "" {
+		_ = json.Unmarshal([]byte(detailJSON), &m)
+	}
+	m["artifacts"] = artifacts
+	b, err := json.Marshal(m)
+	if err != nil {
+		return detailJSON
+	}
+	return string(b)
 }
 
 // toolArgsLabel 从工具调用参数 JSON 中提取一个简短的展示标签（路径/命令/URL 等），
@@ -2392,21 +2458,60 @@ func toolArgsLabel(argsJSON string) string {
 	return ""
 }
 
-// subAgentDispatchInfo 从 call_sub_agent 的入参 JSON 中提取角色 ID 与任务全文，
-// 供子 Agent 派发事件记录使用；显示端（TUI）自行截断标题，完整记录看全文。
-// 解析失败时返回空角色与原始输入的截断。
-func subAgentDispatchInfo(argsJSON string) (roleID, taskBrief string) {
+// subAgentDispatch 是一条派发事件要落的信息：对话栏子 Agent 列表、编排页节点、
+// TUI 阶段标记都从这里取（领域名对用户可见，必须是中文展示名）。
+type subAgentDispatch struct {
+	RoleID string // 角色 ID（domain 或固定助手）
+	Domain string // 中文领域展示名（仅 role_id=domain 时非空）
+	Task   string // 任务摘要（单行，超长截断）
+}
+
+// parseSubAgentDispatch 从 call_sub_agent / call_sub_agents 的入参 JSON 解析派发清单：
+// 单派发返回 1 项；批量工具按 tasks 数组**逐项**返回——对话栏要为每个子 Agent 列一行，
+// 只报一条会把整批最多 6 个领域压成一行原始 JSON（用户看到的是乱码般的参数串）。
+// 解析失败回退"原文摘要一项"，宁可不精确也不丢展示。
+func parseSubAgentDispatch(argsJSON string) []subAgentDispatch {
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return "", textutil.TruncateRunes(argsJSON, 2000, "…")
+		return []subAgentDispatch{{Task: textutil.TruncateRunes(argsJSON, 2000, "…")}}
 	}
-	if v, ok := args["role_id"].(string); ok {
-		roleID = v
+	one := func(m map[string]any) subAgentDispatch {
+		d := subAgentDispatch{}
+		d.RoleID, _ = m["role_id"].(string)
+		d.Domain, _ = m["domain"].(string)
+		d.Domain = strings.TrimSpace(d.Domain)
+		if v, ok := m["task"].(string); ok {
+			d.Task = strings.ReplaceAll(strings.TrimSpace(v), "\n", " ")
+		}
+		return d
 	}
-	if v, ok := args["task"].(string); ok {
-		taskBrief = strings.ReplaceAll(strings.TrimSpace(v), "\n", " ")
+	// 批量形态：tasks=[{role_id,task,domain,...}, ...]
+	if raw, ok := args["tasks"].([]any); ok {
+		out := make([]subAgentDispatch, 0, len(raw))
+		for _, r := range raw {
+			if m, ok := r.(map[string]any); ok {
+				out = append(out, one(m))
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
 	}
-	return roleID, taskBrief
+	return []subAgentDispatch{one(args)}
+}
+
+// dispatchDomainJSON 把派发事件的中文领域名编码为 DetailJSON（{"domain":"..."}），
+// 供对话栏子 Agent 列表取展示名（事件 Tool 字段只放得下角色 ID，domain 角色恒为 "domain"，
+// 九个领域会同名无法区分）。空领域名返回空串。
+func dispatchDomainJSON(domain string) string {
+	if domain == "" {
+		return ""
+	}
+	b, err := json.Marshal(map[string]string{"domain": domain})
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // metaProviderForCall 解析 meta 每次 LLM 调用应使用的 provider（WithProviderFunc 注入）：
@@ -2748,6 +2853,24 @@ func (s *ReactService) finalizeThinking(session *reactInternalSession, ev LiveEv
 	s.store.setThinkingText(session, "")
 }
 
+// clarifyReportJSON 把"提问前的答复正文"编码为事件的 DetailJSON（{"report_text":"..."}）。
+//
+// 为什么需要：模型常见「先输出正文、再调 ask_user」——正文只存在于瞬时字段
+// StreamingText（流式增量按设计不落事件），提问卡片一出现，前端就切到待澄清态，
+// 上一段正文被整段吞掉，用户只剩思考链，还得靠脑补才能回答问题。
+// 在提问事件上挂一份快照（ask_user 阻塞期间 StreamingText 仍保留该正文，恢复才清），
+// 刷新/回放/重启后仍在，前端在问答卡上方原样渲染。空正文返回空串。
+func clarifyReportJSON(report string) string {
+	if report == "" {
+		return ""
+	}
+	b, err := json.Marshal(map[string]string{"report_text": report})
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // agentIDJSON 把 Agent 实例 ID 编码为事件的 DetailJSON（{"agent_id":"..."}），
 // 供 TUI 领域进度面板按实例匹配事件；空 ID 返回空串。
 func agentIDJSON(agentID string) string {
@@ -2777,9 +2900,13 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		s.finalizeThinking(session, ev)
 		// call_sub_agent 是子 Agent 派发：记录专用派发事件（角色 ID 与任务摘要），
 		// 供 TUI 对话区展示阶段标记、编排面板派生子 Agent 节点。
-		if ev.Tool == "call_sub_agent" {
-			roleID, taskBrief := subAgentDispatchInfo(ev.Input)
-			s.store.addEvent(session, eventkind.Message, ev.Agent, taskBrief, "sub_agent_dispatch", roleID, "", "", "", true)
+		if ev.Tool == "call_sub_agent" || ev.Tool == "call_sub_agents" {
+			// 批量工具逐项落事件（对话栏子 Agent 列表一人一行）；中文领域名随 detail_json
+			// 带给前端——事件 Tool 字段只放得下角色 ID，domain 角色恒为 "domain"，
+			// 九个领域会同名无法区分谁是谁。
+			for _, dis := range parseSubAgentDispatch(ev.Input) {
+				s.store.addEventDetail(session, eventkind.Message, ev.Agent, dis.Task, "sub_agent_dispatch", dis.RoleID, "", "", "", true, dispatchDomainJSON(dis.Domain))
+			}
 		}
 		// 其他工具的调用事件已由工具注册表的进度回调记录（handleToolEvent），此处不重复。
 	case LiveEventToolExec:
@@ -3102,6 +3229,17 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	// 添加用户消息事件。
 	s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)
 
+	// 运行中的会话：把新指令**投进 MetaAgent 邮箱**，本轮内的下一个检查点即读到它
+	//（等子 Agent 时 waitForChildren 每周期 drain，立即生效；其他阶段主循环顶部 drain，
+	// 下一步生效）。不投递的话这条消息只躺在 session.Messages 里，而运行中的循环从不读
+	// 该字段——用户看着"已发送"，Agent 毫无反应（2026-09-12 实证）。
+	if wasRunning {
+		if err := s.injectUserMessageToRunningSession(session, content); err != nil {
+			// 邮箱未接线（测试/精简装配）：降级为"随下一轮生效"，但要留痕，不静默。
+			s.store.logError(ctx, "[agent] 运行中指令注入失败，本条将在下一轮生效", err)
+		}
+	}
+
 	// 如果会话原先未运行，则在 goroutine 中恢复执行。
 	if !wasRunning {
 		// 轮开始落库 running 状态（历史/事件为上一轮快照，store.mu 已解锁——
@@ -3351,11 +3489,25 @@ func (s *ReactService) enqueue(ctx context.Context, sessionID, content string) e
 
 	// 记录队列注入事件。
 	s.store.addEvent(session, eventkind.Enqueue, "User", "队列注入: "+content, "", "", "", "", "", true)
-
-	// 若原先未运行，则异步恢复执行。
-	if !wasRunning {
-		go s.resumeSession(session)
+	// 运行中：投进 MetaAgent 邮箱即时生效（同 sendMessage）。此前该分支只发事件不投递，
+	// 内容根本没进对话历史/循环——"队列注入"名不副实（2026-09-12 实证）。
+	if wasRunning {
+		if err := s.injectUserMessageToRunningSession(session, content); err != nil {
+			s.store.logError(ctx, "[agent] enqueue 注入失败，本条将在下一轮生效", err)
+		}
+		return nil
 	}
+
+	// 未运行：把内容补进对话消息（resumeSession 取最后一条 user 消息作本轮输入，
+	// 不补就同样丢失），再异步恢复执行。
+	s.store.mu.Lock()
+	session.Messages = append(session.Messages, Message{
+		Role:      string(enums.ChatRoleUser),
+		Content:   content,
+		Timestamp: time.Now(),
+	})
+	s.store.mu.Unlock()
+	go s.resumeSession(session)
 	return nil
 }
 

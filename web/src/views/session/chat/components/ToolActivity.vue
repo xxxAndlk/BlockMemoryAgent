@@ -9,6 +9,8 @@ import ToolCallCard from './ToolCallCard.vue'
 const props = defineProps<{
   groups: ToolCallGroup[]
   running: boolean
+  /** 会话 ID：透传给工具卡里的媒体卡片（生成工作区文件 URL 用） */
+  sessionId: string
 }>()
 
 const expanded = ref(false)
@@ -52,7 +54,7 @@ const liveGroup = computed(() => pending.value || (props.running ? last.value : 
         <el-icon class="ml-auto text-ink-2 transition-transform" :class="{ 'rotate-180': expanded }"><ArrowDown /></el-icon>
       </button>
       <div v-show="expanded" class="px-2 pb-2">
-        <ToolCallCard v-for="g in groups" :key="g.id" :group="g" />
+        <ToolCallCard v-for="g in groups" :key="g.id" :group="g" :session-id="sessionId" />
       </div>
     </div>
   </div>

@@ -227,7 +227,7 @@ func TestHotDomain_WallClockWrapUpNotifiesParent(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 
 	// 槽销毁（墙钟收口后任务 ctx 已死，不可续）。
 	waitForCond(t, "slot destroyed after wall clock", func() bool {
@@ -268,7 +268,7 @@ func TestHotDomain_DoneStopsWallTimer(t *testing.T) {
 		"responsibility": "负责金融模块",
 		"wall_clock_min": 0.005, // 300ms，任务远早于预算完成
 	})
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	waitForCond(t, "tree idle", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && n.Status == orchestrator.StatusIdle
@@ -304,7 +304,7 @@ func TestHotDomain_HardCancelBackstopDecrementsParent(t *testing.T) {
 		"domain":         "金融",
 		"responsibility": "负责金融模块",
 	})
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	waitForCond(t, "running", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && n.Status == orchestrator.StatusRunning

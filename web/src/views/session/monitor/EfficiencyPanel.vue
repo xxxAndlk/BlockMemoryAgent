@@ -2,7 +2,7 @@
 // 效率审计面板（TODO 第9⑥ 效率一等指标 + 第10③ 子 Agent 审计面）。
 // 顶部五指标卡 + 支路成本表（点击行下钻逐轮事件回放，可手动暂停 domain 支路）
 // + 角色级 token 统计表。数据纯聚合自后端 /efficiency 与 /agents/{aid}/events。
-import { ref, watch } from 'vue'
+import { ref, watch, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getSessionEfficiency,
@@ -16,7 +16,7 @@ import type { Session } from '@/types'
 
 const props = defineProps<{
   session: Session | null
-  /** 选中 Agent 的 inst_id（node_id 口径一致）：有值时自动展开对应支路行的逐轮下钻 */
+  /** 选中 Agent 的 inst_id（node_id 口径一致）：有值时面板只看该支路（隐藏会话级指标与角色统计），并自动展开逐轮下钻 */
   selectedNodeId?: string
 }>()
 
@@ -25,6 +25,13 @@ const loading = ref(false)
 const expandedBranch = ref<EfficiencyBranch | null>(null)
 const branchEvents = ref<AgentEventRow[]>([])
 const eventsLoading = ref(false)
+
+// 选中子 Agent 时支路表只留该支路（"只看当前 Agent 自己的记录"；Meta/未选中为全会话）。
+const visibleBranches = computed(() => {
+  const all = eff.value?.branches || []
+  if (!props.selectedNodeId) return all
+  return all.filter((b) => b.node_id === props.selectedNodeId)
+})
 
 async function load() {
   if (!props.session) return
@@ -133,12 +140,14 @@ function eventTitle(ev: AgentEventRow): string {
 <template>
   <div class="p-3 space-y-3 overflow-y-auto h-full">
     <div class="flex items-center justify-between">
-      <div class="text-sm font-bold text-ink">效率审计（五项一等指标）</div>
+      <div class="text-sm font-bold text-ink">
+        {{ selectedNodeId ? '效率审计（当前 Agent）' : '效率审计（五项一等指标）' }}
+      </div>
       <el-button size="small" :loading="loading" @click="load">刷新</el-button>
     </div>
 
-    <!-- 五项指标卡 -->
-    <div class="grid grid-cols-5 gap-2">
+    <!-- 五项指标卡（会话级，仅全会话视图展示） -->
+    <div v-if="!selectedNodeId" class="grid grid-cols-5 gap-2">
       <div class="p-3 bg-page rounded border border-line text-center">
         <div class="text-xs text-ink-2">每交付文件 token 成本</div>
         <div class="text-lg font-bold text-ink">{{ fmtNum(eff?.tokens_per_file ?? 0) }}</div>
@@ -170,7 +179,7 @@ function eventTitle(ev: AgentEventRow): string {
     <div>
       <div class="text-xs text-ink-2 mb-1">支路成本表（点击行下钻逐轮事件；Running 的 domain 支路可手动暂停）</div>
       <el-table
-        :data="eff?.branches || []"
+        :data="visibleBranches"
         size="small"
         class="!border-line"
         highlight-current-row
@@ -242,8 +251,8 @@ function eventTitle(ev: AgentEventRow): string {
       </div>
     </div>
 
-    <!-- 角色级 token 统计 -->
-    <div>
+    <!-- 角色级 token 统计（会话级，仅全会话视图展示） -->
+    <div v-if="!selectedNodeId">
       <div class="text-xs text-ink-2 mb-1">角色级 token / 延迟统计（含单呼输入分位数）</div>
       <el-table :data="eff?.role_stats || []" size="small" class="!border-line">
         <el-table-column prop="role" label="角色" min-width="140" show-overflow-tooltip />

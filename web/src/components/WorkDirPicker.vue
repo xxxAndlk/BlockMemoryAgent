@@ -5,7 +5,7 @@
 // 此前行内是实时输入框，逐字符 emit，调用方若是"改即保存"会把半截路径写进会话。
 import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { browseFS, type BrowseResult } from '@/api/fs'
+import { browseFS, pickSystemDir, type BrowseResult } from '@/api/fs'
 
 const props = defineProps<{
   modelValue: string
@@ -72,6 +72,33 @@ async function load(p: string) {
   }
 }
 
+const picking = ref(false)
+
+/**
+ * 「更改」：优先调**系统原生目录选择框**（在服务主机上弹出，即用户眼前的资源管理器式选择器），
+ * 拿不到（平台不支持/超时/已有窗口打开）时才退回网页版选择器——原生是主路径，网页版是兜底。
+ */
+async function chooseDir() {
+  if (picking.value) return
+  picking.value = true
+  try {
+    const r = await pickSystemDir()
+    if (r.path) {
+      emit('update:modelValue', r.path)
+      return
+    }
+    // path 为空 = 用户在原生的框里点了取消：不改变现值，也不再弹第二个框。
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    // 501/504/409：原生不可用 → 退回网页版选择器（并说明原因，用户知道发生了什么）。
+    error.value = ''
+    open.value = true
+    ElMessage.warning('系统选择器不可用，已切换为网页版选择（' + msg + '）')
+  } finally {
+    picking.value = false
+  }
+}
+
 function openDialog() {
   error.value = ''
   open.value = true
@@ -114,9 +141,15 @@ function pickRecent(d: string) {
     <span class="font-mono text-xs truncate min-w-0 flex-1 text-ink-2"
           :class="hasValue ? '' : 'text-ink-3'"
           :title="modelValue || display">{{ display }}</span>
-    <el-button size="small" plain class="shrink-0" @click="openDialog">更改</el-button>
+    <el-button size="small" type="primary" plain class="shrink-0" :loading="picking" @click="chooseDir">
+      {{ picking ? '选择中…' : '浏览…' }}
+    </el-button>
+    <!-- 手动入口：系统选择器不可用时才会自动弹，这里给个显式入口（手输/最近目录/面包屑） -->
+    <el-button size="small" text class="shrink-0 !text-ink-3" title="手动输入 / 从最近目录选" @click="openDialog">
+      <el-icon><EditPen /></el-icon>
+    </el-button>
 
-    <el-dialog v-model="open" title="选择工作目录" width="560px" append-to-body>
+    <el-dialog v-model="open" title="选择工作目录（网页版）" width="560px" append-to-body>
       <!-- 面包屑：任意祖先层可点击直达 -->
       <div class="crumbs" :title="current">
         <template v-for="(c, i) in crumbs" :key="c.path">

@@ -18,6 +18,22 @@ export function getSession(id: string): Promise<Session> {
 }
 
 /**
+ * 工作区文件 URL（对话栏媒体卡片 / HTML 预览 iframe 的 src）。
+ *
+ * 走 path 型路由而不是查询参数：HTML 产物里的**相对引用**（pages/index.html 里的
+ * assets/x.png）会以该 URL 为基准解析，天然可用。逐段 encodeURIComponent 保留斜杠分隔。
+ */
+export function workspaceUrl(sessionId: string, path: string): string {
+  const encoded = path
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter((s) => s.length > 0)
+    .map((s) => encodeURIComponent(s))
+    .join('/')
+  return `${APP_CONFIG.apiBase}/sessions/${encodeURIComponent(sessionId)}/workspace/${encoded}`
+}
+
+/**
  * 修改某个会话的工作目录（每会话目录，落库即时保存）。
  * `workDir` 传空串 = 清除本会话目录、回落进程默认目录。
  * 目录在每回合开始时读取，因此下一回合生效（进行中的工具调用仍按旧目录解析）。
@@ -205,10 +221,15 @@ export function enqueueSession(id: string, content: string): Promise<void> {
   })
 }
 
+/** 澄清答复提交超时：用户主动动作不能按默认 10s 静默失败（后端重启/卡顿时需要更宽的
+ *  窗口，配合 chat/utils/clarifySubmit 的重试一起用）。 */
+const CLARIFY_TIMEOUT_MS = 30000
+
 export function clarifySession(id: string, answer: string): Promise<void> {
   return fetchJson(`/sessions/${id}/clarify`, {
     method: 'POST',
     body: JSON.stringify({ answer }),
+    timeoutMs: CLARIFY_TIMEOUT_MS,
   })
 }
 
@@ -217,6 +238,7 @@ export function clarifySessionBatch(id: string, answers: string[]): Promise<void
   return fetchJson(`/sessions/${id}/clarify`, {
     method: 'POST',
     body: JSON.stringify({ answers }),
+    timeoutMs: CLARIFY_TIMEOUT_MS,
   })
 }
 
@@ -317,7 +339,35 @@ export function getSessionLogs(
   if (params?.limit !== undefined) qs.set('limit', String(params.limit))
   if (params?.offset !== undefined) qs.set('offset', String(params.offset))
   const q = qs.toString() ? `?${qs.toString()}` : ''
-  return fetchJson(`/sessions/${id}/logs${q}`)
+  // 后端当前直接返回 []*SessionLogRecord 且无 json tag（大写键的裸数组，无信封）；
+  // 这里做兼容归一化：同时容忍裸数组/信封、大写/小写键。
+  return fetchJson<unknown>(`/sessions/${id}/logs${q}`).then((raw) => {
+    const list: unknown[] = Array.isArray(raw)
+      ? raw
+      : ((raw as SessionLogsResponse | null)?.logs ?? [])
+    const logs = list.map((r): SessionLog => {
+      const o = (r || {}) as Record<string, unknown>
+      const pick = <T>(snake: string, pascal: string, dflt: T): T =>
+        (o[snake] as T | undefined) ?? (o[pascal] as T | undefined) ?? dflt
+      return {
+        id: pick('id', 'ID', 0),
+        session_id: pick('session_id', 'SessionID', ''),
+        agent: pick('agent', 'Agent', ''),
+        level: pick('level', 'Level', ''),
+        phase: pick('phase', 'Phase', ''),
+        message: pick('message', 'Message', ''),
+        prompt: pick('prompt', 'Prompt', undefined),
+        response: pick('response', 'Response', undefined),
+        input_tokens: pick('input_tokens', 'InputTokens', 0),
+        output_tokens: pick('output_tokens', 'OutputTokens', 0),
+        model: pick('model', 'Model', ''),
+        latency_ms: pick('latency_ms', 'LatencyMs', 0),
+        created_at: pick('created_at', 'CreatedAt', ''),
+        meta: pick('meta', 'Meta', undefined),
+      }
+    })
+    return { session_id: id, logs, count: logs.length }
+  })
 }
 
 export interface WatchdogDecision {

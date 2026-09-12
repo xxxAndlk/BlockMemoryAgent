@@ -52,15 +52,20 @@ watch(
   }
 )
 
+// 进入面板直接落到底部（双帧兜底：首帧布局后图片/Markdown 异步撑高再校正一次），
+// 不做平滑动画——容器禁用 scroll-behavior，否则 3s 轮询追加会反复播放滚动动画。
 onMounted(() => {
-  nextTick(scrollToBottom)
+  nextTick(() => {
+    scrollToBottom()
+    requestAnimationFrame(scrollToBottom)
+  })
 })
 
 defineExpose({ scrollToBottom })
 </script>
 
 <template>
-  <div ref="containerRef" class="flex-1 overflow-y-auto px-4 py-3 min-h-0 scroll-smooth" @scroll="onScroll">
+  <div ref="containerRef" class="flex-1 overflow-y-auto px-4 py-3 min-h-0" @scroll="onScroll">
     <div v-if="hasMore" class="text-center mb-2">
       <button class="text-xs text-primary hover:underline" :disabled="loading" @click="emit('load-earlier')">
         加载更早消息

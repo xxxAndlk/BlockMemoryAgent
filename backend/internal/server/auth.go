@@ -49,6 +49,14 @@ func GinAuthMiddleware(token string, publicPaths []string) gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		// 媒体/预览类资源由浏览器直接发起（<img>/<video>/<audio>/<iframe> 无法带请求头），
+		// 故额外接受 ?token= 查询参数，与 Bearer 同源校验、不放宽语义。
+		// 注意：URL 里的 token 可能进访问日志/Referer，媒体响应统一带
+		// Referrer-Policy: no-referrer（见 workspace_http.go）缓解外泄。
+		if qt := c.Query("token"); qt != "" && qt == token {
+			c.Next()
+			return
+		}
 
 		c.Header("WWW-Authenticate", `Bearer realm="BlockMemoryAgent"`)
 		c.String(http.StatusUnauthorized, "Unauthorized")

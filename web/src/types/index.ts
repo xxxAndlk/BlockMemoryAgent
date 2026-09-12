@@ -171,6 +171,104 @@ export interface AgentNode {
   last_activity_ago?: string
 }
 
+/**
+ * Agent 可视成果引用（ShowArtifact 工具产出 / 工具输出里的 .bma 产物路径）。
+ * 只带工作区相对路径，媒体本体走 GET /api/sessions/:id/workspace/*path 流式读取。
+ */
+export interface ArtifactRef {
+  kind: 'image' | 'video' | 'audio' | 'html' | string
+  /** 工作区相对路径（正斜杠） */
+  path: string
+  title?: string
+  caption?: string
+  mime?: string
+  /** 自动兜底识别出来的（非工具显式登记）：用于文案区分 */
+  inferred?: boolean
+}
+
+/** 从 tool_exec 事件的 detail_json 里取出 ShowArtifact 登记的成果。 */
+export function artifactsFromDetail(detailJson?: string): ArtifactRef[] {
+  if (!detailJson) return []
+  try {
+    const d = JSON.parse(detailJson) as { artifacts?: ArtifactRef[] }
+    if (!Array.isArray(d.artifacts)) return []
+    return d.artifacts.filter((a) => a && typeof a.path === 'string' && a.path.length > 0)
+  } catch {
+    return [] // detail_json 是自由字段，解析失败按无成果处理
+  }
+}
+
+/**
+ * 从提问事件的 detail_json 里取出「提问前的答复正文」快照。
+ *
+ * 模型常见「先输出正文、再调 ask_user」：正文只活在流式瞬时字段里，不落事件，
+ * 待澄清态一切换就把上一段输出整段吞掉（用户只看到思考链）。后端在提问事件上挂了
+ * `{"report_text": ...}`，前端把它渲染在问答卡上方——刷新/回放/重启后仍在。
+ */
+export function clarifyReportFromDetail(detailJson?: string): string {
+  if (!detailJson) return ''
+  try {
+    const d = JSON.parse(detailJson) as { report_text?: string }
+    return typeof d.report_text === 'string' ? d.report_text : ''
+  } catch {
+    return '' // detail_json 是自由字段，解析失败按无正文处理
+  }
+}
+
+/**
+ * 从派发事件（kind=sub_agent_dispatch）的 detail_json 里取出中文领域名。
+ *
+ * 事件 Tool 字段只放得下角色 ID（domain 角色恒为 "domain"），一波 9 个领域会同名，
+ * 展示名因此随 detail_json 带出。域名为空时返回空串（调用方回退角色 ID）。
+ */
+export function domainFromDetail(detailJson?: string): string {
+  if (!detailJson) return ''
+  try {
+    const d = JSON.parse(detailJson) as { domain?: string }
+    return typeof d.domain === 'string' ? d.domain : ''
+  } catch {
+    return '' // detail_json 是自由字段，解析失败按无领域名处理
+  }
+}
+
+/** 媒体扩展名 → 展示类型（自动兜底识别用）。 */
+const MEDIA_EXT_KIND: Record<string, string> = {
+  png: 'image', jpg: 'image', jpeg: 'image', gif: 'image', webp: 'image', svg: 'image',
+  mp4: 'video', webm: 'video', mov: 'video', mkv: 'video',
+  mp3: 'audio', wav: 'audio', m4a: 'audio', ogg: 'audio', flac: 'audio',
+  html: 'html', htm: 'html',
+}
+
+/**
+ * 从工具输出文本里兜底识别可视成果路径（Agent 没调 ShowArtifact 也能出卡）。
+ *
+ * 只认 `.bma/` 下的产物目录：该前缀是 Agent 产出媒体/截图的统一落点
+ * （images / od-artifacts / ui-artifacts / videos / artifacts），按 `/.bma/` 锚点截取
+ * 就能同时兼容"绝对路径"与"工作区相对路径"两种写法，也避免把普通源码里的
+ * 路径字符串误判成媒体。
+ */
+export function inferArtifactsFromOutput(output?: string): ArtifactRef[] {
+  if (!output) return []
+  const out: ArtifactRef[] = []
+  const seen = new Set<string>()
+  // 按空白与常见标点切词后逐词检查（比"路径前缀正则"稳：不用猜路径前面是什么，
+  // 中英文标点/尖括号包裹的路径都能切出来）。
+  for (const token of output.split(/[\s"'`()=<>,;:!?|\[\]{}、。：，；！？（）、【】「」《》…—～·]+/)) {
+    const norm = token.replace(/\\/g, '/')
+    const i = norm.indexOf('.bma/')
+    if (i < 0) continue
+    const path = norm.slice(i)
+    // 只认产物目录下的媒体文件（.bma/shared、.bma/tool_outputs 等非展示内容不在此列）。
+    if (!/^(images|od-artifacts|ui-artifacts|videos|artifacts)\//.test(path.slice(5))) continue
+    const ext = path.split('.').pop()?.toLowerCase() || ''
+    const kind = MEDIA_EXT_KIND[ext]
+    if (!kind || seen.has(path)) continue
+    seen.add(path)
+    out.push({ kind, path, inferred: true })
+  }
+  return out
+}
+
 export interface SubTask {
   id: string
   title: string

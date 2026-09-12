@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import type { Session, SessionEvent, AgentNode } from '@/types'
 import type { SessionLog } from '@/api/session'
 import ExecutionLog from '../components/ExecutionLog.vue'
-import SkillSet from '../components/SkillSet.vue'
 import SessionLogsPanel from '../components/SessionLogsPanel.vue'
 import EfficiencyPanel from './EfficiencyPanel.vue'
+import { matchAgentLog } from './agentMatch'
 
-defineProps<{
+const props = defineProps<{
   session: Session | null
   events: SessionEvent[]
   agents: AgentNode[]
@@ -23,7 +23,14 @@ const expandedLogId = defineModel<number | null>('expandedLogId', { default: nul
 
 const emit = defineEmits<{ 'query-logs': [] }>()
 
-const activeTab = ref<'log' | 'skill' | 'logs' | 'efficiency'>('log')
+// Skill 装配 tab 已移除：技能装配/技能库在「技能库」页统一看（此处与那页重复）。
+const activeTab = ref<'log' | 'logs' | 'efficiency'>('log')
+
+// 日志分析：选中子 Agent 时只展示该 Agent 的结构化日志（客户端归一化匹配，
+// 服务端 agent 过滤是精确等值，匹配不上带"领域Agent"后缀/截断的展示名）。
+const visibleLogs = computed(() =>
+  props.agent ? props.sessionLogs.filter((l) => matchAgentLog(l, props.agent!)) : props.sessionLogs
+)
 </script>
 
 <template>
@@ -33,11 +40,6 @@ const activeTab = ref<'log' | 'skill' | 'logs' | 'efficiency'>('log')
             :class="activeTab === 'log' ? 'text-primary font-bold border-b-2 border-primary' : 'text-ink-2 hover:text-ink'"
             class="flex items-center h-full cursor-pointer">
         <el-icon class="mr-1"><Document /></el-icon> 执行日志
-      </span>
-      <span @click="activeTab = 'skill'"
-            :class="activeTab === 'skill' ? 'text-primary font-bold border-b-2 border-primary' : 'text-ink-2 hover:text-ink'"
-            class="flex items-center h-full cursor-pointer">
-        <el-icon class="mr-1"><Connection /></el-icon> Skill 装配
       </span>
       <span @click="activeTab = 'logs'"
             :class="activeTab === 'logs' ? 'text-primary font-bold border-b-2 border-primary' : 'text-ink-2 hover:text-ink'"
@@ -52,17 +54,17 @@ const activeTab = ref<'log' | 'skill' | 'logs' | 'efficiency'>('log')
     </div>
 
     <div class="flex-1 overflow-hidden relative flex flex-col">
-      <ExecutionLog v-if="activeTab === 'log'" :events="events" :force-agent="agent?.name" />
-      <SkillSet v-if="activeTab === 'skill'" :agents="agents" />
+      <ExecutionLog v-if="activeTab === 'log'" :events="events" :force-agent="agent" />
       <SessionLogsPanel
         v-if="activeTab === 'logs'"
+        :force-agent-name="agent?.name"
         :agent="logAgent"
         @update:agent="(v: string) => (logAgent = v)"
         :level="logLevel"
         @update:level="(v: string) => (logLevel = v)"
         :expanded-log-id="expandedLogId"
         @update:expanded-log-id="(v: number | null | undefined) => (expandedLogId = v ?? null)"
-        :logs="sessionLogs"
+        :logs="visibleLogs"
         @query="emit('query-logs')"
       />
       <EfficiencyPanel v-if="activeTab === 'efficiency'" :session="session" :selected-node-id="agent?.inst_id" />

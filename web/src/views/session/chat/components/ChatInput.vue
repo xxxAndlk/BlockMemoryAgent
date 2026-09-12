@@ -266,6 +266,11 @@ function onKeydown(e: KeyboardEvent) {
           <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
           会话已连接
         </span>
+        <!-- 运行中的输入语义：不再是"排到队尾"，而是即时注入当前执行 -->
+        <span v-if="sessionActive" class="text-[10px] text-ink-3 whitespace-nowrap shrink-0"
+              title="运行中发送的指令会投进当前 Agent 的邮箱：等待子 Agent 时立即读到并重新规划，其他阶段在当前步骤结束后生效">
+          运行中发送＝即时注入当前执行
+        </span>
         <span v-else class="text-ink-2">将创建新会话</span>
       </div>
       <div class="flex items-center gap-3 text-xs">

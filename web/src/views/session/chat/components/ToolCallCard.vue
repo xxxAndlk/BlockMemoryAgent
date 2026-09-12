@@ -3,8 +3,9 @@ import { ref, computed } from 'vue'
 import type { ToolCallGroup } from '../utils/turns'
 import { toolHeadline } from '../utils/turns'
 import { fmtTime } from '../utils/eventStyles'
+import ArtifactCard from './ArtifactCard.vue'
 
-const props = defineProps<{ group: ToolCallGroup }>()
+const props = defineProps<{ group: ToolCallGroup; sessionId: string }>()
 
 const expanded = ref(false)
 
@@ -42,6 +43,8 @@ const startedAt = computed(() => props.group.call?.timestamp || props.group.resu
         </el-tag>
         <span class="text-ink-2 text-[10px]">{{ group.agent }}</span>
         <span v-if="headline" class="text-ink-2 text-[10px] truncate max-w-[280px]" :title="headline">→ {{ headline }}</span>
+        <span v-if="group.artifacts?.length" class="text-[10px] px-1 rounded bg-primary-soft text-primary shrink-0"
+              :title="`本次产出 ${group.artifacts.length} 个可视成果`">🖼 {{ group.artifacts.length }}</span>
       </span>
       <span class="flex items-center gap-2">
         <span class="text-[10px] text-ink-2">{{ fmtTime(startedAt) }}</span>
@@ -50,6 +53,12 @@ const startedAt = computed(() => props.group.call?.timestamp || props.group.resu
     </button>
 
     <div v-show="expanded" class="px-3 pb-3 space-y-2 border-t border-line pt-2">
+      <!-- 本次工具产出的可视成果（效果图/视频/HTML）：就地渲染，免去滚到回合末尾 -->
+      <div v-if="group.artifacts?.length" class="space-y-2">
+        <div class="text-[10px] text-ink-2">产出（{{ group.artifacts.length }}）</div>
+        <ArtifactCard v-for="(a, i) in group.artifacts" :key="'tart-' + i + '-' + a.path"
+                      :artifact="a" :session-id="sessionId" />
+      </div>
       <div v-if="callArgs">
         <div class="text-[10px] text-ink-2 mb-1">调用参数</div>
         <pre class="bg-page p-2 rounded text-[11px] text-ink whitespace-pre-wrap font-mono max-h-64 overflow-auto">{{ callArgs }}</pre>

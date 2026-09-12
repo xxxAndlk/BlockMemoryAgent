@@ -107,7 +107,7 @@ func TestRunSubAgent_DomainLimitReachedPauses(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch domain failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	// 等 tree 节点进入 Paused。
 	waitForCond(t, "domain paused", func() bool {
 		n, ok := tr.Get(subID)
@@ -139,7 +139,7 @@ func TestRunSubAgent_AssistantLimitReachedPartialReturn(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch assistant failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	// 等 tree 节点 Done（部分回灌标 Done）。
 	waitForCond(t, "assistant done", func() bool {
 		n, ok := tr.Get(subID)
@@ -171,7 +171,7 @@ func TestResumePaused_ConcludesAfterResumeCap(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch domain failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	waitForCond(t, "domain paused", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && n.Status == orchestrator.StatusPaused
@@ -278,7 +278,7 @@ func TestRunSubAgent_ManualPauseRoutesToPausedTree(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch domain failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	// 前提：节点已 Running 且悬挂在 Generate 中。
 	waitForCond(t, "domain running", func() bool {
 		n, ok := tr.Get(subID)

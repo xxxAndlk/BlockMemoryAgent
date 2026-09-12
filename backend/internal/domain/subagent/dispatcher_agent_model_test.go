@@ -151,7 +151,7 @@ func TestLeafPauseSetModelResume_EndToEnd(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch leaf failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	waitForCond(t, "leaf running", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && n.Status == orchestrator.StatusRunning

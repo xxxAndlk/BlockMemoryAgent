@@ -43,6 +43,30 @@ type Result struct {
 	// 喂给多模态模型；历史消息中只保留 Output 里的文本占位符
 	//（[image mime, N bytes base64]），避免 base64 反复进上下文烧毁前缀缓存。
 	Images []ResultImage `json:"-"`
+	// Artifacts 工具产出的可视成果（ShowArtifact）：只带工作区相对路径，随事件落
+	// detail_json 供对话栏渲染媒体卡片（见 Artifact 注释）。
+	Artifacts []Artifact `json:"artifacts,omitempty"`
+}
+
+// Artifact 是工具产出的**可视成果引用**（效果图/视频/音频/HTML 原型），
+// 供对话栏渲染成媒体卡片（ShowArtifact 工具产出）。
+//
+// 只带**工作区相对路径**，不带二进制：媒体本体走
+// GET /api/sessions/:id/workspace/*path 流式读取（带 Range/Content-Type），
+// 塞进事件会让历史库与上下文线性膨胀（同 Result.Images 的 json:"-" 理由）。
+// 字段随 Result 一起被 registry.emitResult marshal 进事件 Detail，最终落
+// session_events.detail_json（已是持久列，无需迁移），前端直接读。
+type Artifact struct {
+	// Kind 展示类型：image|video|audio|html。
+	Kind string `json:"kind"`
+	// Path 工作区相对路径（正斜杠分隔），前端拼 /workspace/ 前缀取文件。
+	Path string `json:"path"`
+	// Title 卡片标题（可选，缺省用文件名）。
+	Title string `json:"title,omitempty"`
+	// Caption 一句话说明（可选，如"主界面效果图 v2"）。
+	Caption string `json:"caption,omitempty"`
+	// MIME 内容类型（可选，前端据此兜底渲染方式）。
+	MIME string `json:"mime,omitempty"`
 }
 
 // ResultImage 是工具结果携带的单张图片。

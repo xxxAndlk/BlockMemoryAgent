@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import type { SessionEvent } from '@/types'
+import type { AgentNode, SessionEvent } from '@/types'
 import MarkdownRenderer from '@/components/MarkdownRenderer.vue'
-import { kindTagType, agentTextColor, fmtTime, hasDetail } from '@/views/session/chat/utils/eventStyles'
+import { kindTagType, kindLabel, agentTextColor, fmtTime, hasDetail } from '@/views/session/chat/utils/eventStyles'
+import { matchAgentEvent } from '@/views/session/monitor/agentMatch'
 
 const props = defineProps<{
   events: SessionEvent[]
-  /** 锁定过滤为该 Agent 名（选中 Agent 的监控态）：有值时下拉替换为徽标不可改 */
-  forceAgent?: string
+  /** 锁定过滤为该 Agent 节点（选中 Agent 的监控态）：有值时下拉替换为徽标不可改。
+   *  匹配走 detail_json.agent_id + 名字归一化（后端展示名带"领域Agent"后缀且长名被截断，不能精确等值）。 */
+  forceAgent?: AgentNode | null
 }>()
 
 const filterAgent = ref('all')
@@ -23,7 +25,7 @@ const filtered = computed(() => {
   return props.events.filter(ev => {
     // forceAgent 锁定优先于本地下拉（选中 Agent 的监控只看该 Agent）
     if (props.forceAgent) {
-      if (ev.agent !== props.forceAgent) return false
+      if (!matchAgentEvent(ev, props.forceAgent)) return false
     } else if (filterAgent.value !== 'all' && ev.agent !== filterAgent.value) return false
     if (filterKind.value !== 'all' && (ev.kind || ev.type) !== filterKind.value) return false
     const q = searchLog.value.trim().toLowerCase()
@@ -65,36 +67,54 @@ const progressStatus = computed(() => {
 
 <template>
   <div class="flex-1 flex flex-col h-full bg-card">
-    <div class="p-3 border-b border-line flex items-center gap-4 text-xs shrink-0">
-      <div class="flex items-center gap-2">
+    <!-- 过滤行：控件一律"定宽包装 + shrink-0"，窄面板（会话页右侧栏实测 600~800px）下
+         不许压缩控件本身——Element Plus 给 .el-input/.el-select 的 width:100% 会让它们的
+         flex 基准尺寸等于整行宽，挤压时把 Kind 下拉压成一根光杆箭头、并让溢出的徽标盖住
+         "Kind:" 标签（2026-09-12 用户实证）。挤压预算全部交给搜索框（min-w 兜底），实在放不下
+         才换行（flex-wrap）。 -->
+    <div class="p-3 border-b border-line flex items-center gap-4 text-xs shrink-0 flex-wrap">
+      <div class="flex items-center gap-2 shrink-0">
         <span class="text-ink-2">Agent:</span>
-        <span v-if="forceAgent" class="px-2 py-1 rounded bg-primary-soft text-primary font-bold shrink-0">
-          当前 Agent：{{ forceAgent }}
+        <!-- 锁定态徽标：长展示名 max-w+truncate 收口，全名放 title，不挤后面的控件 -->
+        <span v-if="forceAgent" class="px-2 py-1 rounded bg-primary-soft text-primary font-bold max-w-[220px] truncate"
+              :title="forceAgent.name">
+          当前 Agent：{{ forceAgent.name }}
         </span>
-        <el-select v-else v-model="filterAgent" size="small" class="w-32 !bg-transparent filter-select">
-          <el-option v-for="a in agents" :key="a" :label="a === 'all' ? 'All' : a" :value="a" />
-        </el-select>
+        <div v-else class="w-40">
+          <el-select v-model="filterAgent" size="small" class="!w-full !bg-transparent filter-select">
+            <el-option v-for="a in agents" :key="a" :label="a === 'all' ? '全部' : a" :value="a" />
+          </el-select>
+        </div>
       </div>
-      <div class="flex items-center gap-2">
-        <span class="text-ink-2">Kind:</span>
-        <el-select v-model="filterKind" size="small" class="w-32 !bg-transparent filter-select">
-          <el-option v-for="k in kinds" :key="k" :label="k === 'all' ? 'All' : k" :value="k" />
-        </el-select>
+      <div class="flex items-center gap-2 shrink-0">
+        <span class="text-ink-2">类型:</span>
+        <div class="w-32">
+          <el-select v-model="filterKind" size="small" class="!w-full !bg-transparent filter-select">
+            <el-option v-for="k in kinds" :key="k" :label="k === 'all' ? '全部' : kindLabel(k)" :value="k" />
+          </el-select>
+        </div>
       </div>
-      <el-input v-model="searchLog" size="small" placeholder="搜索日志..." class="w-64 ml-auto !bg-page search-input">
-        <template #suffix>
-          <el-icon class="text-ink-2 hover:text-ink cursor-pointer mr-2"><Search /></el-icon>
-          <el-icon class="text-ink-2 hover:text-ink cursor-pointer"><Filter /></el-icon>
-        </template>
-      </el-input>
+      <div class="flex-1 min-w-[160px] max-w-[256px] ml-auto">
+        <el-input v-model="searchLog" size="small" placeholder="搜索日志..." class="!w-full !bg-page search-input">
+          <template #suffix>
+            <el-icon class="text-ink-2 hover:text-ink cursor-pointer mr-2"><Search /></el-icon>
+            <el-icon class="text-ink-2 hover:text-ink cursor-pointer"><Filter /></el-icon>
+          </template>
+        </el-input>
+      </div>
     </div>
 
     <div class="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
+      <div v-if="!filtered.length" class="text-ink-2 text-sm text-center py-10">
+        {{ forceAgent ? `暂无「${forceAgent.name}」的行为日志` : '暂无事件' }}
+      </div>
       <div v-for="(ev, index) in filtered" :key="index" class="flex text-xs items-start gap-4">
         <div class="text-ink-2 w-16 shrink-0 pt-0.5">{{ fmtTime(ev.timestamp) }}</div>
-        <div class="w-32 shrink-0 pt-0.5" :class="agentTextColor(ev.agent)">{{ ev.agent }}</div>
-        <div class="w-20 shrink-0 pt-0.5 flex justify-center">
-          <el-tag size="small" :type="kindTagType(ev.kind, ev.type)" effect="plain" class="!bg-transparent !border-line scale-90">{{ ev.kind || ev.type }}</el-tag>
+        <!-- 展示名带"领域 Agent"后缀且很长：单行截断 + title 全名，否则每行折成两行参差不齐 -->
+        <div class="w-32 shrink-0 pt-0.5 truncate" :class="agentTextColor(ev.agent)" :title="ev.agent">{{ ev.agent }}</div>
+        <div class="w-24 shrink-0 pt-0.5 flex justify-center">
+          <el-tag size="small" :type="kindTagType(ev.kind, ev.type)" effect="plain" class="!bg-transparent !border-line scale-90"
+                  :title="ev.kind || ev.type">{{ kindLabel(ev.kind, ev.type) }}</el-tag>
         </div>
         <div class="flex-1 min-w-0">
           <MarkdownRenderer :content="ev.message" class="text-ink break-words leading-relaxed pt-0.5" />

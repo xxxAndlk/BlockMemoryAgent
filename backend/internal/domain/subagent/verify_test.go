@@ -148,11 +148,11 @@ func TestResolveVerifyKind(t *testing.T) {
 func TestValidateDispatchArgs_VerifyKindEnum(t *testing.T) {
 	d := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{})
 	for _, ok := range []string{"", "auto", "executable", "rubric", "none"} {
-		if msg, _ := d.validateDispatchArgs("code_assistant", "t", "", "", ok); msg != "" {
+		if msg, _ := d.validateDispatchArgs("code_assistant", "t", "", "", ok, ""); msg != "" {
 			t.Fatalf("verify_kind %q should pass, got: %s", ok, msg)
 		}
 	}
-	if msg, _ := d.validateDispatchArgs("code_assistant", "t", "", "", "hyper"); msg == "" || !strings.Contains(msg, "verify_kind") {
+	if msg, _ := d.validateDispatchArgs("code_assistant", "t", "", "", "hyper", ""); msg == "" || !strings.Contains(msg, "verify_kind") {
 		t.Fatalf("unknown verify_kind should be rejected, got: %q", msg)
 	}
 }

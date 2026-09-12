@@ -47,7 +47,7 @@ func TestCancelAgentTool_CancelsChild(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 
 	// 等节点注册进树后取消。
 	deadline := time.Now().Add(3 * time.Second)

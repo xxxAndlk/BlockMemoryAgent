@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-kratos/blades"
 
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
@@ -294,5 +295,38 @@ func TestControlWorkDirFailClosed(t *testing.T) {
 	}
 	if got := s.store.sessions[sess.ID].currentWorkDir(); got != "" {
 		t.Fatalf("显式空串应清除目录, got %q", got)
+	}
+}
+
+// TestHandleToolEvent_ArtifactsIntoDetailJSON 验证可视成果随工具事件落 detail_json：
+// ShowArtifact 的 Result.Artifacts 经 registry.emitResult 进 ProgressEvent.Detail，
+// 这里必须并入事件的 detail_json（前端对话栏读它渲染媒体卡片）——漏了的话
+// "生成图/HTML 后展示"整条链路在浏览器侧就是空的。
+func TestHandleToolEvent_ArtifactsIntoDetailJSON(t *testing.T) {
+	s := newReactServiceForTest(nil, "")
+	defer s.Shutdown(context.Background())
+	sess := s.store.createSession("g", "")
+
+	ctx := WithAgentID(context.Background(), sess.ID)
+	detail := `{"output":"已把 主界面效果图 展示给用户","path":"/w/assets/img/hero.png",` +
+		`"artifacts":[{"kind":"image","path":"assets/img/hero.png","title":"主界面效果图","mime":"image/png"}]}`
+	s.handleToolEvent(ctx, tool.ProgressEvent{
+		SessionID: sess.ID, Kind: "tool_result", Tool: "ShowArtifact",
+		Message: "工具结果 ShowArtifact", Detail: detail,
+	})
+
+	events := s.store.sessions[sess.ID].Events
+	if len(events) == 0 {
+		t.Fatal("应记录一条工具结果事件")
+	}
+	ev := events[len(events)-1]
+	if !strings.Contains(ev.DetailJSON, `"artifacts"`) || !strings.Contains(ev.DetailJSON, "assets/img/hero.png") {
+		t.Fatalf("detail_json 应含 artifacts: %s", ev.DetailJSON)
+	}
+	if !strings.Contains(ev.DetailJSON, "agent_id") {
+		t.Fatalf("原有 agent_id 归属字段不应丢失: %s", ev.DetailJSON)
+	}
+	if ev.ToolOutput != "已把 主界面效果图 展示给用户" {
+		t.Fatalf("tool_output 应照旧落库: %q", ev.ToolOutput)
 	}
 }

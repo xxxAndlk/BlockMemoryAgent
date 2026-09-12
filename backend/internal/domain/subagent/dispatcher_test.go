@@ -494,7 +494,22 @@ func dispatchCodeAssistant(t *testing.T, toolsReg *tool.Registry) string {
 	if !res.Success {
 		t.Fatalf("expected success, got error: %s", res.Error)
 	}
-	return res.Output
+	return subAgentIDOf(res)
+}
+
+// subAgentIDOf 从派发结果里取子 Agent ID。Output 形如 "<subID>"，软警告
+//（task 超长 / domain 非中文领域名）会以"。警告: …"追加、接管会以"（已接管…）"追加——
+// 直接拿整个 Output 当 ID 用，会在警告一触发时静默失配（2026-09-12 实证：
+// 热驻复用守卫相关用例集体"timed out waiting for tree idle"）。
+func subAgentIDOf(res *tool.Result) string {
+	if res == nil {
+		return ""
+	}
+	id := res.Output
+	if i := strings.IndexAny(id, "。（"); i > 0 {
+		id = id[:i]
+	}
+	return strings.TrimSpace(id)
 }
 
 // waitForCond 轮询等待条件满足，超时则测试失败。
@@ -1542,16 +1557,16 @@ func TestDispatch_ModeValidation(t *testing.T) {
 func TestValidateDispatchArgs_TaskSoftLanding(t *testing.T) {
 	d := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{})
 	ok := strings.Repeat("字", 3000)
-	if msg, warning := d.validateDispatchArgs("code_assistant", ok, "", "", ""); msg != "" || warning != "" {
+	if msg, warning := d.validateDispatchArgs("code_assistant", ok, "", "", "", ""); msg != "" || warning != "" {
 		t.Fatalf("<=3000 should pass clean: msg=%q warning=%q", msg, warning)
 	}
 	soft := strings.Repeat("字", 3100)
-	msg, warning := d.validateDispatchArgs("code_assistant", soft, "", "", "")
+	msg, warning := d.validateDispatchArgs("code_assistant", soft, "", "", "", "")
 	if msg != "" || warning == "" || !strings.Contains(warning, "放行") {
 		t.Fatalf("3000-4000 should soft-land with warning: msg=%q warning=%q", msg, warning)
 	}
 	hard := strings.Repeat("字", 4100)
-	msg, warning = d.validateDispatchArgs("code_assistant", hard, "", "", "")
+	msg, warning = d.validateDispatchArgs("code_assistant", hard, "", "", "", "")
 	if msg == "" || !strings.Contains(msg, "task too long") || warning != "" {
 		t.Fatalf(">4000 should hard reject: msg=%q warning=%q", msg, warning)
 	}
@@ -1560,18 +1575,18 @@ func TestValidateDispatchArgs_TaskSoftLanding(t *testing.T) {
 // TestValidateDispatchArgs_TaskRuneLimitsOverride WithTaskRuneLimits 覆盖默认档位（TODO #35）。
 func TestValidateDispatchArgs_TaskRuneLimitsOverride(t *testing.T) {
 	d := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{}).WithTaskRuneLimits(1000, 1500)
-	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1000), "", "", ""); msg != "" {
+	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1000), "", "", "", ""); msg != "" {
 		t.Fatalf("<=soft should pass: %q", msg)
 	}
-	if _, warning := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1200), "", "", ""); warning == "" {
+	if _, warning := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1200), "", "", "", ""); warning == "" {
 		t.Fatal("soft-hard range should soft-land with warning")
 	}
-	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1600), "", "", ""); msg == "" {
+	if msg, _ := d.validateDispatchArgs("code_assistant", strings.Repeat("字", 1600), "", "", "", ""); msg == "" {
 		t.Fatal(">hard should reject")
 	}
 	// 0 值参数回落默认，不改档。
 	d2 := NewDispatcher(nil, nil, nil, nil, agent.NopMemoryPipeline{}).WithTaskRuneLimits(0, 0)
-	if msg, _ := d2.validateDispatchArgs("code_assistant", strings.Repeat("字", 3000), "", "", ""); msg != "" {
+	if msg, _ := d2.validateDispatchArgs("code_assistant", strings.Repeat("字", 3000), "", "", "", ""); msg != "" {
 		t.Fatalf("zero values should keep defaults: %q", msg)
 	}
 }

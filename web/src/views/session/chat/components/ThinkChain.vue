@@ -45,7 +45,10 @@ function asText(s: string | undefined): string {
 </script>
 
 <template>
-  <div v-if="events.length" class="rounded-lg border border-line bg-page my-2">
+  <!-- 简洁模式下 prompt/token_usage 这类调试事件会被折叠掉；若一段思考里**只剩**这类
+       事件，面板会渲染成"思考链路 0 步（已折叠 +1）"的空壳（2026-09-12 用户实证），
+       既没内容又让人以为出了 bug——没有可视步骤就不出这块。 -->
+  <div v-if="visible.length" class="rounded-lg border border-line bg-page my-2">
     <button class="w-full text-left px-3 py-2 flex items-center justify-between hover:bg-card transition-colors"
             @click="collapsed = !collapsed">
       <span class="flex items-center gap-2 text-xs text-ink">

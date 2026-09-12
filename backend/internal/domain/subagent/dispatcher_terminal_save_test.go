@@ -21,7 +21,7 @@ func TestRunSubAgent_TerminalSavesHistory(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 	waitForCond(t, "leaf terminal", func() bool {
 		n, ok := tr.Get(subID)
 		return ok && (n.Status == orchestrator.StatusDone)

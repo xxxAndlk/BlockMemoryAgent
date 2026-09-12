@@ -56,7 +56,7 @@ const emit = defineEmits<{
                     :session-id="session?.id || ''" :agent="agent" :agents="agents"
                     @refresh="emit('refresh')" />
     <template v-else>
-      <MessageList :events="events" :verbose="false" :clarify="clarify"
+      <MessageList :events="events" :verbose="false" :clarify="clarify" :agents="agents"
                    :clarify-ack="clarifyAck" :clarify-drafts="clarifyDrafts"
                    :session-id="session?.id || ''"
                    :session-status="session?.status"

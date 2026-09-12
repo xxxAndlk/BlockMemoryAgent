@@ -90,3 +90,35 @@ func TestDirectMessageGuidance(t *testing.T) {
 		t.Fatal("MetaAgent 缺子 Agent 复活返工感知规程")
 	}
 }
+
+// TestChineseDomainNameGuidance 钉死"子 Agent 展示名用中文领域名"的提示词契约
+//（2026-09-12 用户实证：整棵树显示 doc-rev-a…doc-rev-i，用户读不懂谁在干什么）。
+func TestChineseDomainNameGuidance(t *testing.T) {
+	if !strings.Contains(MetaAgent, "中文领域名") {
+		t.Fatal("MetaAgent 缺 domain 中文领域名硬约束")
+	}
+	// 答复里引用子 Agent 也要用中文领域名，不能甩 inst_id。
+	if !strings.Contains(MetaAgent, "inst_id") {
+		t.Fatal("MetaAgent 缺「引用子 Agent 用中文领域名而非 inst_id」约束")
+	}
+}
+
+// TestVisualArtifactGuidance 钉死"可视成果要展示给用户"的提示词契约：
+// 叶子公共段与 domain 提示词都必须写明 ShowArtifact——少一处，那条链路的角色就
+// 只会贴路径、用户在对话栏什么也看不到。
+func TestVisualArtifactGuidance(t *testing.T) {
+	if !strings.Contains(LeafCommonBlock, "ShowArtifact") {
+		t.Fatal("叶子公共段缺 ShowArtifact 展示指引")
+	}
+	if !strings.Contains(DomainAgent, "ShowArtifact") {
+		t.Fatal("DomainAgent 缺 ShowArtifact 展示指引")
+	}
+	// 叶子展开后仍带该指引（占位符替换不能把它吃掉）。
+	sp, err := Get("ui_assistant")
+	if err != nil {
+		t.Fatalf("Get(ui_assistant): %v", err)
+	}
+	if !strings.Contains(sp, "ShowArtifact") {
+		t.Fatal("ui_assistant 展开后的提示词缺 ShowArtifact 指引")
+	}
+}

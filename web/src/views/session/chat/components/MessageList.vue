@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick, onMounted, computed } from 'vue'
-import type { SessionEvent, ClarifyPending } from '@/types'
+import type { AgentNode, SessionEvent, ClarifyPending } from '@/types'
 import { groupEventsToTurns, settleTurnsBySessionStatus } from '../utils/turns'
 import UserBubble from './UserBubble.vue'
 import AssistantTurn from './AssistantTurn.vue'
@@ -20,6 +20,8 @@ const props = defineProps<{
   liveThinking: string
   /** 接替回合的流式文本快照（key=接替用 user_message 事件时间戳），见 groupEventsToTurns。 */
   priorReplies?: Record<string, string>
+  /** 会话内全部 Agent 实例：透传给回合，用于子 Agent 列表的实时状态 */
+  agents?: AgentNode[]
 }>()
 
 // 澄清选项提交成功 → 透传给父级（index.vue 置 running + ack，不再全量重载）
@@ -65,7 +67,12 @@ watch(() => props.clarifyAck, () => {
 })
 
 onMounted(() => {
-  nextTick(scrollToBottom)
+  // 进入会话直接落到底部（双帧兜底：首帧布局后图片/Markdown 异步撑高再校正一次）。
+  // 容器禁用 scroll-behavior 平滑动画，否则流式/轮询追加会反复播放滚动动画。
+  nextTick(() => {
+    scrollToBottom()
+    requestAnimationFrame(scrollToBottom)
+  })
 })
 
 // 暴露给父组件，让用户从外部触发"跳到底部"
@@ -74,7 +81,7 @@ defineExpose({ scrollToBottom })
 
 <template>
   <div ref="containerRef"
-       class="flex-1 overflow-y-auto px-6 py-4 min-h-0 scroll-smooth"
+       class="flex-1 overflow-y-auto px-6 py-4 min-h-0"
        @scroll="onScroll">
     <template v-if="events.length === 0">
       <div class="h-full flex flex-col items-center justify-center text-ink-2 text-sm gap-3">
@@ -86,7 +93,7 @@ defineExpose({ scrollToBottom })
       <div v-for="(turn, ti) in turns" :key="turn.id">
         <UserBubble v-if="turn.userMessage" :event="turn.userMessage" />
         <AssistantTurn :turn="turn" :verbose="verbose" :clarify="clarify"
-                       :clarify-drafts="clarifyDrafts" :session-id="sessionId"
+                       :clarify-drafts="clarifyDrafts" :session-id="sessionId" :agents="agents"
                        :live-streaming="ti === turns.length - 1 ? liveStreaming : ''"
                        :live-thinking="ti === turns.length - 1 ? liveThinking : ''"
                        @submit-clarify="emit('submit-clarify')"

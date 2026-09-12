@@ -63,7 +63,15 @@ export function kindLabel(kind?: string, type?: string): string {
     system: '系统',
     progress: '进度',
     clarify: '需要澄清',
+    clarify_detail: '澄清详情',
     stats: '统计',
+    message: '消息',
+    memory_recall: '记忆召回',
+    topic_switch: '话题切换',
+    sub_agent_dispatch: '派发子Agent',
+    sub_agent_done: '子Agent完成',
+    interrupt: '中断',
+    enqueue: '入队',
   }
   return map[k] || k
 }

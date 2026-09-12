@@ -72,6 +72,7 @@ export function groupAgentMessagesToTurns(messages: AgentMessageItem[], agent: A
       thinkChain: [],
       toolCalls: [],
       errors: [],
+      subAgents: [], // 单 Agent 对话面板不展示子 Agent 列表（该 Agent 自身即对话主体）
       clarifyDetails: [],
       status: 'running',
       startedAt: ev.timestamp,

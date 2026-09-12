@@ -7,10 +7,8 @@ import { isToolCallEvent, isUserMessageEvent } from '@/types'
 import {
   createSession,
   sendMessage,
-  clarifySession,
   cancelSession,
   stopSession,
-  enqueueSession,
   interruptSession,
   getSession,
   getSessionAgents,
@@ -30,6 +28,7 @@ import {
 } from '@/api/metrics'
 import { useSessionStream } from '@/composables/useSessionStream'
 import { classifyEvent } from '@/views/session/chat/utils/turns'
+import { submitClarify } from '@/views/session/chat/utils/clarifySubmit'
 import { usePanelRefresh } from '@/composables/usePanelRefresh'
 import { useSessionList } from '@/composables/useSessionList'
 import { useSessionStatus } from '@/composables/useSessionStatus'
@@ -228,9 +227,12 @@ async function refreshPanels(id: string) {
 }
 
 async function loadSessionLogs(sessionID: string) {
+  // 选中子 Agent 时日志分析走客户端归一化过滤（MonitorView），不下发 agent 参数：
+  // 服务端是精确等值匹配，匹配不上带"领域Agent"后缀/截断的展示名，会查空。
+  const agentLocked = !!selectedAgent.value && !isMetaSelected.value
   const logsRes = await panel.run(() =>
     getSessionLogs(sessionID, {
-      agent: logFilterAgent.value || undefined,
+      agent: agentLocked ? undefined : logFilterAgent.value || undefined,
       level: logFilterLevel.value || undefined,
       limit: logLimit.value,
     })
@@ -362,7 +364,12 @@ async function handleSubmit(content: string, images: WireImage[] = []) {
         return
       }
       if (images.length) ElMessage.warning('澄清答复不支持携带图片，已忽略')
-      await clarifySession(activeSession.value.id, content)
+      // 答复提交带网络级重试（后端重启窗口内不再一句话丢答复），确认条只在真正落地后显示。
+      await submitClarify(
+        activeSession.value.id,
+        { answer: content },
+        { onRetry: (n, total) => ElMessage.warning(`后端连接中断，正在重试提交答复（${n}/${total}）…`) },
+      )
       activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
       clarifyAck.value = true
       sending.value = false
@@ -374,8 +381,16 @@ async function handleSubmit(content: string, images: WireImage[] = []) {
     if (activeSession.value) {
       const wasRunning = activeSession.value.status === 'running'
       if (wasRunning && !activeSession.value.destroy_at) {
-        if (images.length) ElMessage.warning('运行中入队不支持携带图片，已忽略')
-        await enqueueSession(activeSession.value.id, content)
+        // 运行中：走 sendMessage —— 后端把内容**即时投进 MetaAgent 邮箱**，本轮内的下一个
+        // 检查点就读到它（等子 Agent 时立即生效，其他阶段下一步生效）。此前的 enqueue
+        // 只写事件不投递，消息静默丢失：用户看着"已发送"，Agent 毫无反应（2026-09-12 实证）。
+        if (images.length) ElMessage.warning('运行中注入的指令不支持携带图片，已忽略')
+        if (!content.trim()) {
+          sending.value = false // 只带了图片：没内容可注入，别把发送按钮卡在 loading
+          return
+        }
+        await sendMessage(activeSession.value.id, content, [])
+        ElMessage.success('指令已注入当前执行（等待子 Agent 时立即生效）')
         sending.value = false
         return
       }

@@ -1,10 +1,14 @@
-import type { SessionEvent } from '@/types'
+import type { ArtifactRef, SessionEvent } from '@/types'
 import {
   isUserMessageEvent,
   isToolCallEvent,
   isToolExecEvent,
   isTokenUsageEvent,
   isErrorEvent,
+  artifactsFromDetail,
+  inferArtifactsFromOutput,
+  clarifyReportFromDetail,
+  domainFromDetail,
 } from '@/types'
 
 /** 一次工具调用：把 tool_call (intent) + tool_exec (结果) 配对 */
@@ -16,6 +20,22 @@ export interface ToolCallGroup {
   result?: SessionEvent // type === 'tool_exec'
   success: boolean
   pending: boolean
+  /** 该次工具产出/引用的可视成果（ShowArtifact 登记 + 工具输出兜底识别） */
+  artifacts?: ArtifactRef[]
+}
+
+/**
+ * 一次子 Agent 派发（对话栏子 Agent 列表一行）：领域名 + 任务简要。
+ * 状态不在这里定——由展示层用 agents 接口的实时实例状态叠加（派发瞬间实例还没进树）。
+ */
+export interface SubAgentRef {
+  /** 事件时间戳（回合内唯一，作为列表 key） */
+  key: string
+  /** 中文领域名（后端随派发事件 detail_json 带出；缺失回退角色 ID） */
+  name: string
+  /** 任务简要（派发事件 message，后端已单行化） */
+  task: string
+  ts: string
 }
 
 /** 回合内一个按时间顺序的步骤：要么是一段思考，要么是一次工具调用 */
@@ -34,9 +54,14 @@ export interface Turn {
   thinkChain: SessionEvent[] // 兼容字段：所有思考事件扁平集合
   toolCalls: ToolCallGroup[] // 兼容字段：所有工具调用组
   errors: SessionEvent[]
+  /** 本回合派发出去的子 Agent（按派发顺序，一人一行） */
+  subAgents: SubAgentRef[]
   clarifyQuestion?: SessionEvent
   /** 提问附带的长上下文（任务 140，kind=clarify_detail 事件）：展示在问题之前 */
   clarifyDetails: SessionEvent[]
+  /** 提问前模型输出的正文快照（后端挂在提问事件 detail_json.report_text 上）：
+   *  不落事件的话，待澄清态一切换就把上一段输出整段吞掉，只剩思考链（2026-09-12 实证）。 */
+  clarifyReport?: string
   finalAnswer?: SessionEvent
   /** 合成最终答复：运行中会话的新用户消息接替当前回合时，收编接替时刻的流式汇报文本
    *  （流式文本只存于 SSE live 帧，不落事件；不收编则上一回合的答复内容丢失）。 */
@@ -56,6 +81,7 @@ type EventCategory =
   | 'tool_exec'
   | 'tool_result_legacy'
   | 'completion'
+  | 'sub_agent_dispatch'
   | 'clarify'
   | 'clarify_detail'
   | 'error'
@@ -92,6 +118,9 @@ export function classifyEvent(ev: SessionEvent): EventCategory {
   // 必须在通用 clarify 判断之前分类（其 type 也是 clarify）。
   if (ev.kind === 'clarify_detail') return 'clarify_detail'
   if (ev.type === 'clarify' || ev.kind === 'clarify') return 'clarify'
+  // 子 Agent 派发（后端 kind=sub_agent_dispatch）：对话栏子 Agent 列表用，
+  // 必须在通用 think 兜底之前分类——否则会落进思考链，用户看到一串参数 JSON。
+  if (ev.kind === 'sub_agent_dispatch') return 'sub_agent_dispatch'
   if (isToolCallEvent(ev)) return 'tool_call'
   if (isToolExecEvent(ev)) return 'tool_exec'
   if (ev.kind === 'tool_result') return 'tool_result_legacy'
@@ -232,6 +261,7 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
       thinkChain: [],
       toolCalls: [],
       errors: [],
+      subAgents: [],
       clarifyDetails: [],
       status: 'running',
       startedAt: startedAt || ev?.timestamp || new Date().toISOString(),
@@ -288,6 +318,12 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
       current!.clarifyQuestion = ev
       current!.status = 'awaiting_clarify'
       current!.endedAt = ev.timestamp
+      // 提问前的正文快照（批量题只挂在第一条提问事件上）：任一事件带即取，
+      // 首段非空优先——它必须活到问答卡上方，否则用户只能靠思考链回忆上下文。
+      if (!current!.clarifyReport) {
+        const r = clarifyReportFromDetail(ev.detail_json)
+        if (r) current!.clarifyReport = r
+      }
       continue
     }
 
@@ -295,6 +331,19 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
     // 由问答卡渲染在问题之前
     if (category === 'clarify_detail') {
       current!.clarifyDetails.push(ev)
+      continue
+    }
+
+    // 子 Agent 派发：收集成列表（一次批量派发落多条事件，一人一行）
+    if (category === 'sub_agent_dispatch') {
+      current!.subAgents.push({
+        key: ev.timestamp,
+        // 领域名优先；旧事件（后端未带 domain，Tool 恒为 "domain"）回退通用标签，
+        // 不把角色 ID "domain" 当名字展示给用户。
+        name: domainFromDetail(ev.detail_json) || (ev.tool && ev.tool !== 'domain' ? ev.tool : '') || '子 Agent',
+        task: (ev.message || '').trim(),
+        ts: ev.timestamp,
+      })
       continue
     }
 
@@ -309,11 +358,15 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
     // 工具执行结果（type=tool_exec）：配对到同名 pending 组填 result，不新增步骤
     if (category === 'tool_exec') {
       const toolName = ev.tool || extractToolName(ev.message) || 'unknown'
+      // 可视成果：ShowArtifact 显式登记（detail_json.artifacts）优先；
+      // 没登记时从工具输出里兜底识别 .bma/ 产物路径（Agent 忘了调工具也看得到）。
+      const arts = collectArtifacts(ev)
       const matched = [...current!.toolCalls].reverse().find((g) => g.tool === toolName && g.pending)
       if (matched) {
         matched.result = ev
         matched.success = ev.success !== false
         matched.pending = false
+        if (arts.length) matched.artifacts = arts
       } else {
         // 没有配对的 call（历史回放/孤儿），作为自包含组新建一个 tool 步骤
         const group: ToolCallGroup = {
@@ -323,6 +376,7 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
           result: ev,
           success: ev.success !== false,
           pending: false,
+          artifacts: arts.length ? arts : undefined,
         }
         current!.toolCalls.push(group)
         current!.steps.push({ kind: 'tool', group })
@@ -406,4 +460,28 @@ export function filterTurnForConcise(turn: Turn): Turn {
       return k === 'think' || k === 'intend' || k === 'llm' || k === 'wait'
     }),
   }
+}
+
+
+/** 收集一次工具结果携带的可视成果：显式登记优先，工具输出兜底识别（去重）。 */
+export function collectArtifacts(ev: SessionEvent): ArtifactRef[] {
+  const explicit = artifactsFromDetail(ev.detail_json)
+  const inferred = inferArtifactsFromOutput(ev.tool_output).filter(
+    (a) => !explicit.some((e) => e.path === a.path),
+  )
+  return [...explicit, ...inferred]
+}
+
+/** 回合内全部可视成果（按出现顺序去重）——对话栏"本轮产出"媒体 rail 用。 */
+export function turnArtifacts(turn: Turn): ArtifactRef[] {
+  const out: ArtifactRef[] = []
+  const seen = new Set<string>()
+  for (const g of turn.toolCalls) {
+    for (const a of g.artifacts || []) {
+      if (seen.has(a.path)) continue
+      seen.add(a.path)
+      out.push(a)
+    }
+  }
+  return out
 }

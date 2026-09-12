@@ -1,13 +1,16 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref, watch, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import type { SessionEvent, ClarifyPending, ClarifyQuestionItem } from '@/types'
+import type { AgentNode, SessionEvent, ClarifyPending, ClarifyQuestionItem } from '@/types'
 import type { Turn } from '../utils/turns'
+import { turnArtifacts } from '../utils/turns'
 import { fmtTime, agentTextColor } from '../utils/eventStyles'
 import { renderMd } from '@/utils/markdown'
-import { clarifySession, clarifySessionBatch } from '@/api/session'
+import { submitClarify } from '../utils/clarifySubmit'
 import ThinkChain from './ThinkChain.vue'
 import ToolActivity from './ToolActivity.vue'
+import ArtifactCard from './ArtifactCard.vue'
+import SubAgentList from './SubAgentList.vue'
 
 const props = defineProps<{
   turn: Turn
@@ -18,6 +21,8 @@ const props = defineProps<{
   sessionId: string
   liveStreaming: string
   liveThinking: string
+  /** 会话内全部 Agent 实例：子 Agent 列表取实时状态（每 3s 轮询刷新） */
+  agents?: AgentNode[]
 }>()
 
 // 澄清提交成功 → 通知父级置 running + 确认条（不再全量重载，任务 140 问题④）
@@ -25,6 +30,9 @@ const emit = defineEmits<{
   (e: 'submit-clarify'): void
   (e: 'update-clarify-drafts', drafts: string[]): void
 }>()
+
+/** 本轮产出的可视成果（效果图/视频/HTML 原型）：对话栏直接渲染成媒体卡片。 */
+const artifacts = computed(() => turnArtifacts(props.turn))
 
 const finalText = computed(() => {
   if (props.turn.finalAnswer) {
@@ -54,6 +62,18 @@ const statusColor = computed(() => {
 })
 
 const primaryAgent = computed(() => props.turn.agents[0] || 'MetaAgent')
+
+/** 待澄清问答卡要渲染的提问事件：已给出最终答复、或回合没有提问时为 null。
+ *  返回对象而非布尔值——模板内 `v-if="clarifyCard"` 才能把事件类型收窄。 */
+const clarifyCard = computed(() => {
+  if (finalText.value) return null
+  if (props.turn.status !== 'awaiting_clarify') return null
+  return props.turn.clarifyQuestion || null
+})
+/** 运行中占位是否渲染（与问答卡/最终答复互斥）。 */
+const showRunning = computed(
+  () => !finalText.value && !clarifyCard.value && props.turn.status === 'running',
+)
 
 // 实时思考行只显示尾部 ~300 字符（对齐 TUI 滚动显示当前行的行为），避免长思考占满聊天区
 const liveThinkingTail = computed(() => {
@@ -125,6 +145,40 @@ watch(() => props.clarify?.questionId, () => {
   selectedOptions.value = []
 })
 
+// ---- 提交韧性：后端重启/连接中断时答复不能一发就丢（2026-09-12 实证） ----
+// 此前网络层失败只弹一句 "Failed to fetch"，用户不知道答案有没有送出去；现在网络层
+// 失败自动重试（见 utils/clarifySubmit），重试进度与最终失败原因就地显示在问答卡里，
+// 草稿原样保留——后端恢复后直接再点一次提交即可，不用重答三题。
+const submitNotice = ref('') // 重试进度（"正在重连…"）
+const submitError = ref('') // 最终失败原因（常驻，不随 toast 消失）
+const disposed = ref(false)
+onUnmounted(() => {
+  disposed.value = true
+})
+
+/** 统一提交入口：成功 → 通知父级置 running + 确认条；失败 → 卡片内保留错误与草稿。 */
+async function runClarifySubmit(payload: { answer?: string; answers?: string[] }) {
+  submitError.value = ''
+  submitNotice.value = ''
+  try {
+    const r = await submitClarify(props.sessionId, payload, {
+      onRetry: (n, total) => {
+        submitNotice.value = `后端连接中断，正在重试（${n}/${total}）…你的答复已保留`
+      },
+      aborted: () => disposed.value,
+    })
+    submitNotice.value = ''
+    if (r === 'confirmed') {
+      ElMessage.success('答复已提交（响应中断，已按服务端状态确认）')
+    }
+    emit('submit-clarify')
+  } catch (e) {
+    submitNotice.value = ''
+    submitError.value = e instanceof Error ? e.message : String(e)
+    console.error('clarify submit failed:', e)
+  }
+}
+
 async function submitOption(optionId?: string) {
   if (submitting.value) return
   // 「其他」逃生选项：不提交，引导用户在下方输入框自由填写答案
@@ -142,11 +196,7 @@ async function submitOption(optionId?: string) {
   }
   submitting.value = true
   try {
-    await clarifySession(props.sessionId, answer)
-    emit('submit-clarify')
-  } catch (e) {
-    console.error('clarify submit failed:', e)
-    ElMessage.error('提交答复失败：' + (e instanceof Error ? e.message : String(e)))
+    await runClarifySubmit({ answer })
   } finally {
     submitting.value = false
   }
@@ -246,11 +296,7 @@ async function submitBatch() {
   if (!allAnswered.value || submittingBatch.value || !props.clarify) return
   submittingBatch.value = true
   try {
-    await clarifySessionBatch(props.sessionId, batchQuestions.value.map((_, i) => draftOf(i).trim()))
-    emit('submit-clarify')
-  } catch (e) {
-    console.error('batch clarify submit failed:', e)
-    ElMessage.error('提交答复失败：' + (e instanceof Error ? e.message : String(e)))
+    await runClarifySubmit({ answers: batchQuestions.value.map((_, i) => draftOf(i).trim()) })
   } finally {
     submittingBatch.value = false
   }
@@ -280,9 +326,12 @@ async function submitBatch() {
         </span>
       </div>
 
+      <!-- 子 Agent 列表：派了谁、各自干什么、进展如何（一人一行，状态实时） -->
+      <SubAgentList :items="turn.subAgents" :agents="agents || []" :running="turn.status === 'running'" />
+
       <!-- 思考链（仅最后一段，运行时替换）+ 工具活动（单行就地替换 / 结束后折叠汇总） -->
       <ThinkChain v-if="lastThinkEvents.length" :events="lastThinkEvents" :verbose="verbose" />
-      <ToolActivity :groups="turn.toolCalls" :running="turn.status === 'running'" />
+      <ToolActivity :groups="turn.toolCalls" :running="turn.status === 'running'" :session-id="sessionId" />
 
       <!-- 错误事件 -->
       <div v-for="(err, i) in turn.errors" :key="'err-' + i"
@@ -295,18 +344,49 @@ async function submitBatch() {
         <div class="whitespace-pre-wrap">{{ err.message }}</div>
       </div>
 
+      <!-- 本轮产出：可视成果直接渲染（效果图/视频/音频/HTML 预览） -->
+      <div v-if="artifacts.length" class="mt-2 space-y-2">
+        <div class="text-[11px] text-ink-3">本轮产出（{{ artifacts.length }}）</div>
+        <ArtifactCard v-for="(a, i) in artifacts" :key="'art-' + i + '-' + a.path"
+                      :artifact="a" :session-id="sessionId" />
+      </div>
+
+      <!-- 提问前的正文：模型「先输出正文、再调 ask_user」时，正文只活在流式缓冲里
+           （不落事件），待澄清态一切换就被整段吞掉，只剩思考链。后端已把它快照进
+           提问事件（detail_json.report_text），这里按正文原样渲染在问答卡上方。 -->
+      <div v-if="!finalText && turn.clarifyReport" class="md-article mt-2"
+           @click="onMdAction"
+           v-html="renderMd(turn.clarifyReport)"></div>
+
       <!-- 最终回答（DeepSeek 文章排版：大字号宽行距，代码块带复制/下载头栏） -->
       <div v-if="finalText" class="md-article mt-2"
            @click="onMdAction"
            v-html="renderMd(finalText)"></div>
 
       <!-- 待澄清提示：Agent 请求用户回答，会话挂起 -->
-      <div v-else-if="turn.status === 'awaiting_clarify' && turn.clarifyQuestion"
+      <div v-if="clarifyCard"
            class="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 my-2 text-xs text-amber-700 dark:bg-yellow-900/20 dark:border-yellow-700/40 dark:text-yellow-300">
         <div class="flex items-center gap-2 font-medium mb-1">
           <el-icon><QuestionFilled /></el-icon>
           <span>{{ isBatch ? '需要你的澄清（批量提问）' : '需要你的澄清' }}</span>
-          <span class="text-ink-2 ml-auto">{{ fmtTime(turn.clarifyQuestion.timestamp) }}</span>
+          <span class="text-ink-2 ml-auto">{{ fmtTime(clarifyCard.timestamp) }}</span>
+        </div>
+
+        <!-- 提交韧性（2026-09-12）：重试进度 / 最终失败原因就地常驻显示——
+             toast 一闪而过的 "Failed to fetch" 看不出答复到底有没有送出去。 -->
+        <div v-if="submitNotice"
+             class="mb-2 rounded-md border border-sky-200 bg-sky-50/80 px-2.5 py-1.5 text-[11px] text-sky-700 flex items-center gap-1.5 dark:border-sky-700/40 dark:bg-sky-900/20 dark:text-sky-300">
+          <el-icon class="is-loading"><Loading /></el-icon>{{ submitNotice }}
+        </div>
+        <div v-if="submitError"
+             class="mb-2 rounded-md border border-red-200 bg-red-50/80 px-2.5 py-1.5 text-[11px] text-red-700 dark:border-red-700/40 dark:bg-red-900/20 dark:text-red-300">
+          <div class="flex items-center gap-1.5 font-medium">
+            <el-icon><WarningFilled /></el-icon>提交答复失败
+          </div>
+          <div class="mt-0.5 break-all">{{ submitError }}</div>
+          <div class="mt-0.5 text-red-500/80 dark:text-red-400/70">
+            你的答复仍保留在卡片里：后端恢复后直接再点一次提交即可。
+          </div>
         </div>
 
         <!-- 长上下文（任务 140 问题①）：clarify_detail 事件承载，先于问题展示；限高滚动防长盘点刷屏 -->
@@ -446,7 +526,7 @@ async function submitBatch() {
       </div>
 
       <!-- 运行中：模型实时思考行 + 流式汇报文本（SSE live 帧，对齐 TUI 展示），两者皆空时兜底静态占位 -->
-      <div v-else-if="turn.status === 'running'" class="mt-2">
+      <div v-if="showRunning" class="mt-2">
         <div v-if="liveThinking" class="text-xs text-ink-2 flex items-start gap-1.5">
           <span>💭</span>
           <span class="italic break-all">{{ liveThinkingTail }}</span>

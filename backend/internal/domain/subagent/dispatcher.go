@@ -15,6 +15,7 @@ import (
 	"sync"          // sync 提供 sync.Map 存储运行中的子 Agent
 	"sync/atomic"   // sync/atomic 提供原子递增序列号
 	"time"          // time 用于设置子 Agent 独立超时
+	"unicode"       // unicode 用于汉字判定（domain 中文领域名校验）
 	"unicode/utf8"  // unicode/utf8 用于 RuneCountInString 统计 task 字符数
 
 	"github.com/blockmemory/agent/backend/internal/agent"               // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
@@ -2192,7 +2193,7 @@ func (t *callSubAgentTool) Description() string {
 		fmt.Sprintf("task 必须自包含 <=%d 字：背景/目标/文件路径/验收——子 Agent 看不到对话历史；规格原文走 WriteSharedMemory（超限 %d 字硬拒）。\n", t.dispatcher.taskRuneSoftLimit, t.dispatcher.taskRuneHardLimit) +
 		"前置依赖：必须先 WriteSpec（否则 spec missing/stale/invalid 拒派）；WriteSpec=固定 spec 槽供校验注入，WriteSharedMemory=自由 KV，不可互替。\n" +
 		"路由：不确定一律 role_id=\"domain\"（默认自执行）；单函数级单文件领域明确的任务才直派固定助手；DomainAgent 不能派 domain。\n" +
-		"字段：domain=领域简称（仅 domain 角色用）；responsibility=职责边界 <=200 字（domain 必填，注入子提示词防越界）；" +
+		"字段：domain=**中文领域名**（仅 domain 角色用；它是子 Agent 对用户可见的展示名，如「文档修订-第3章」「UI 渲染领域」，禁止英文缩写/编号 doc-rev-a 这类）；responsibility=职责边界 <=200 字（domain 必填，注入子提示词防越界）；" +
 		"mode=react(默认)/reflection/plan_execute（判断不准省略）；verify_kind=auto(默认)/executable/rubric/none；" +
 		"tools_hint=预挂载插件工具名列表（受角色白名单天花板约束）；wall_clock_min=墙钟分钟（普通任务省略，仅侦察/巡检给小预算）；" +
 		"reuse_agent_id=热驻复用（填【空闲领域Agent】的 agent_id，保留全部上下文，spec 照写、key 与领域名对齐）；" +
@@ -2201,11 +2202,33 @@ func (t *callSubAgentTool) Description() string {
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
 
+// hasHanRunes 判断字符串是否含汉字（中文领域名校验用）：纯 ASCII/拼音不算。
+func hasHanRunes(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// joinWarnings 以"；"拼接两条非空警告（空串自动跳过），保持工具结果可读。
+func joinWarnings(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "；" + b
+	}
+}
+
 // validateDispatchArgs 校验单次派发的必要参数；返回 (msg, warning)：
 // msg 非空=硬拒绝（校验拒绝，Category=validation_rejected）；否则通过，
-// warning 非空=放行但附提示（task 轻微超限软着陆，TODO #38-3）。
+// warning 非空=放行但附提示（task 轻微超限软着陆 TODO #38-3、domain 不是中文领域名）。
 // 供 call_sub_agent 与 call_sub_agents 复用（批量工具逐项校验）。
-func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode, verifyKind string) (msg, warning string) {
+func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode, verifyKind, domain string) (msg, warning string) {
 	// 校验必要参数：role_id 与 task 均不能为空。
 	if roleID == "" || task == "" {
 		return "role_id and task are required", ""
@@ -2215,6 +2238,14 @@ func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode, ve
 	// LLM 经常省略该字段，导致 DomainAgent 拿到的是通用 prompt 无职责边界——此处硬拒绝强制回填。
 	if roleID == "domain" && strings.TrimSpace(responsibility) == "" {
 		return "responsibility is required when role_id=domain: 填该领域 Agent 的职责边界（<=200 字，负责哪些文件/模块、不碰哪些），会注入子 Agent 系统提示词", ""
+	}
+	// domain 中文展示名（2026-09-12 用户实证）：domain 就是子 Agent 对用户可见的展示名，
+	// 出现在对话栏子 Agent 列表、编排页树、面包屑与事件流上。模型爱填 doc-rev-a 这类英文
+	// 编号，用户完全读不懂。这里**软着陆**（放行 + 警告进工具结果，模型下一次派发即改口）
+	// 而非硬拒：与"一波 9 个领域批量派发"叠加时硬拒会把整轮打成拒绝循环，而同日实证
+	// WriteSpec 连续 6 次拒绝已触发 loop guard 强退（改参数的成本远高于读一条警告）。
+	if roleID == "domain" && strings.TrimSpace(domain) != "" && !hasHanRunes(domain) {
+		warning = fmt.Sprintf("domain=%q 建议改用中文领域名（如「文档修订-第3章」「UI 渲染领域」）：它是子 Agent 对用户可见的展示名，英文编号用户读不懂", domain)
 	}
 	// task 长度双档上限（TODO #35 放开）：强制 MetaAgent 把规格写入 WriteSharedMemory，task 只写目标+验收。
 	// 原 500 runes 实证过紧：塔防类任务的自然派发文本 ~1200-1500 runes，每轮必触发
@@ -2229,8 +2260,8 @@ func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode, ve
 				"task too long: %d runes (hard max %d). 把规格/原文写入 WriteSharedMemory，task 只写目标+验收标准（%d 字内）",
 				n, hardLimit, softLimit), ""
 		}
-		return "", fmt.Sprintf("task 已 %d runes，超出 %d 字预算但未达硬上限 %d，本次放行；下次派发请压缩至 %d 字内",
-			n, softLimit, hardLimit, softLimit)
+		return "", joinWarnings(warning, fmt.Sprintf("task 已 %d runes，超出 %d 字预算但未达硬上限 %d，本次放行；下次派发请压缩至 %d 字内",
+			n, softLimit, hardLimit, softLimit))
 	}
 	// mode 枚举校验（TODO #29）：空串=react（默认），非法值拒绝，防引擎拼错静默跑错模式。
 	switch mode {
@@ -2244,7 +2275,9 @@ func (d *Dispatcher) validateDispatchArgs(roleID, task, responsibility, mode, ve
 	default:
 		return fmt.Sprintf("unknown verify_kind %q: 可选 auto / executable / rubric / none（省略=auto）", verifyKind), ""
 	}
-	return "", ""
+	// 注意带上 warning：domain 中文名提示只在该变量里，写死 return "", "" 会把它丢掉
+	//（2026-09-12 实证：软提示静默失效，测试才发现）。
+	return "", warning
 }
 
 // checkSpecBeforeDispatch 做 WriteSpec 强制校验：SpecEnforcementEnabled 开启时，
@@ -2313,7 +2346,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		}
 	}
 
-	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode, verifyKind)
+	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode, verifyKind, domain)
 	if reuseAgentID == "" && msg != "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
@@ -2995,7 +3028,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 				it.reuseAgentID = id
 			}
 		}
-		if msg, warning := t.dispatcher.validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode, it.verifyKind); msg != "" {
+		if msg, warning := t.dispatcher.validateDispatchArgs(it.roleID, it.task, it.responsibility, it.mode, it.verifyKind, it.domain); msg != "" {
 			if it.reuseAgentID == "" {
 				return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: %s", i, msg), Category: tool.ResultCategoryValidationRejected}
 			}

@@ -14,11 +14,13 @@ const props = defineProps<{
   events?: SessionEvent[]
 }>()
 
-const { tasks, constraints, taskProgress } = useTaskBoard(toRef(props, 'board'))
-// 时间线（设计 §8）：user/派发/完成/失败里程碑 + board.tasks 兜底，纯前端聚合。
+const { tasks, constraints, taskProgress } = useTaskBoard(toRef(props, 'board'), toRef(props, 'agents'))
+// 时间线（设计 §8）：user/派发/完成/失败里程碑 + board.tasks 兜底，纯前端聚合；
+// agents 传入用于把 sub_agent_done 的实例 ID 映射成显示名。
 const { milestones } = useGoalTimeline(
   computed(() => props.events || []),
   toRef(props, 'board'),
+  toRef(props, 'agents'),
 )
 
 // 任务目标：board 快照的 goal 优先（随执行演进），回退会话初始 goal

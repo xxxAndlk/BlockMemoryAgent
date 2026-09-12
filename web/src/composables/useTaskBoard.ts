@@ -1,6 +1,6 @@
 import { computed, unref } from 'vue'
 import type { MaybeRef } from 'vue'
-import type { SubTask, TaskBoardData } from '@/types'
+import type { AgentNode, SubTask, TaskBoardData } from '@/types'
 
 export interface TaskItem {
   title?: string
@@ -9,7 +9,32 @@ export interface TaskItem {
   status: string
 }
 
-export function useTaskBoard(board: MaybeRef<TaskBoardData | null>) {
+/** 任务标题截断（goal 取首行，避免长目标撑爆任务行）。 */
+const TITLE_CLIP = 60
+function clipTitle(text: string): string {
+  const first = (text || '').split('\n')[0].trim()
+  return first.length > TITLE_CLIP ? first.slice(0, TITLE_CLIP) + '…' : first
+}
+
+/** Agent 状态 → 任务行状态口径（对齐 TaskBoardPanel 的状态图标分支）。 */
+function toTaskStatus(agentStatus: string): string {
+  switch (agentStatus) {
+    case 'done':
+      return 'done'
+    case 'running':
+    case 'active':
+      return 'running'
+    case 'failed':
+      return 'failed'
+    case 'delivered-unverified':
+      return 'delivered-unverified'
+    // paused/cancelled/idle 等一律归入 blocked（等待/阻塞图例行）。
+    default:
+      return 'blocked'
+  }
+}
+
+export function useTaskBoard(board: MaybeRef<TaskBoardData | null>, agents?: MaybeRef<AgentNode[]>) {
   const tasks = computed<TaskItem[]>(() => {
     const b = unref(board)
     if (b?.tasks?.length) {
@@ -19,7 +44,16 @@ export function useTaskBoard(board: MaybeRef<TaskBoardData | null>) {
         status: t.status,
       }))
     }
-    return []
+    // 看板无任务快照时从 Agent 列表合成：每个非 meta Agent 即一条实际任务
+    // （派发即任务，避免面板长期停在"暂无子任务"）。
+    const list = unref(agents) || []
+    return list
+      .filter((a) => a.type !== 'meta' && a.inst_id !== 'meta')
+      .map((a) => ({
+        title: clipTitle(a.goal || '') || a.name,
+        assignee: a.name,
+        status: toTaskStatus(a.status),
+      }))
   })
 
   const constraints = computed<[string, string][]>(() => {

@@ -1,6 +1,6 @@
 import { computed, unref } from 'vue'
 import type { ComputedRef, MaybeRef } from 'vue'
-import type { SessionEvent, TaskBoardData } from '@/types'
+import type { AgentNode, SessionEvent, TaskBoardData } from '@/types'
 import { isErrorEvent, isToolCallEvent, isUserMessageEvent } from '@/types'
 
 /** Milestone 是任务目标时间线上的一个里程碑点（设计 §8：纯前端聚合，零后端改动）。 */
@@ -42,12 +42,15 @@ function dispatchLabel(ev: SessionEvent): string {
  * useGoalTimeline 把会话事件流 + 看板快照聚合成任务目标时间线（看板面板用）。
  * 提取规则与兜底见实现内注释；events 为空或提不出任何里程碑时从 board.tasks 合成，
  * 保证面板永不空白（设计 §8）。
+ * agents 用于把 sub_agent_done 事件 message 里的子 Agent 实例 ID 映射成显示名。
  */
 export function useGoalTimeline(
   events: MaybeRef<SessionEvent[]>,
   board: MaybeRef<TaskBoardData | null>,
+  agents?: MaybeRef<AgentNode[]>,
 ): { milestones: ComputedRef<Milestone[]> } {
   const milestones = computed<Milestone[]>(() => {
+    const agentList = unref(agents) || []
     const out: Milestone[] = []
     for (const ev of unref(events) || []) {
       if (isUserMessageEvent(ev)) {
@@ -59,9 +62,14 @@ export function useGoalTimeline(
         continue
       }
       // 完成里程碑：后端会话完成发 agent_done；子 Agent 完成经 mailbox 事件落为 sub_agent_done。
+      // sub_agent_done 的 message 携带子 Agent 实例 ID（形如 session-1/domain-1），
+      // 经 agents 映射为显示名；ev.agent 常为笼统的 "SubAgent"，不直接展示。
       if (ev.kind === 'agent_done' || ev.kind === 'sub_agent_done') {
-        const who = ev.agent && ev.agent !== 'MetaAgent' ? ev.agent + ' ' : ''
-        out.push({ at: ev.timestamp, kind: 'done', text: who + '完成' })
+        const instId = (ev.message || '').trim()
+        const name = agentList.find((a) => a.inst_id === instId)?.name || ''
+        const fallback = ev.agent && ev.agent !== 'MetaAgent' && ev.agent !== 'SubAgent' ? ev.agent : ''
+        const who = name || fallback
+        out.push({ at: ev.timestamp, kind: 'done', text: who ? `${who} 完成` : '完成' })
         continue
       }
       if (isErrorEvent(ev)) {

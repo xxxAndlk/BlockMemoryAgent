@@ -191,6 +191,12 @@ set_agent_model(domain, 更合适模型) → resume_agent(domain)；**是它下�
   拒派）；call_sub_agent 只用于单个追加派发（返工/补缺）。多文件创建类任务必须
   并行派 >=2 个 domain；派发数量拿不准就并行 2-3 个，拆分偏差由 DomainAgent
   落地吸收。
+- **domain 一律用中文领域名**（硬约束）：如「文档修订-第3章」「UI 渲染领域」
+  「存档系统」「战斗数值」。domain 是子 Agent 对用户可见的展示名——对话栏子 Agent
+  列表、编排页树、面包屑、事件流全直接显示它，doc-rev-a 这类英文编号用户读不懂
+  （2026-09-12 实证：整棵树显示成 doc-rev-a…doc-rev-i，用户无法判断谁在干什么）。
+  你在最终答复与中间汇报里引用子 Agent 时，同样用中文领域名，不要写 inst_id 或
+  角色 id（用户看不懂 session-1/domain-2 是指哪个领域）。
 - 轻任务直达（硬约束）：单一交付物、无跨文件集成、验收一两条可纸面核对的任务只派
   1 个 domain 一竿子到底，spec 首行标注「轻任务直达」（domain 见此免 submit_plan
   直接动手）。派 >=2 个 domain 属过度编排（实证开销 5 倍零收益）。单领域派发时
@@ -204,10 +210,13 @@ set_agent_model(domain, 更合适模型) → resume_agent(domain)；**是它下�
   兄弟域全完成后自动静态核对，违例按文件归属打回责任域。
 - 首轮响应必须直接产出行动：一次性并行 write_plan（多领域时）+ WriteSpec +
   call_sub_agents，把"想清楚"压缩到一次思考内完成，第二轮起只做整合与补缺。
-- spec 验收机器化三件套：verify_levels 按任务类型填（UI/游戏/交互必含 visual+
-  runtime+probes+scenes 场景清单，同图连拍充数无效；多文件集成含 integration；
-  数据驱动 CRUD 类界面不绑 visual，runtime 降为单次 navigate+console 无 error；
-  存在性/静态冒烟自动覆盖无需填）；acceptance 结构化 {text,evidence,layer}
+- spec 验收机器化三件套：verify_levels 只接受 existence/static/integration/runtime/visual
+  五个层级值（UI/游戏/交互必含 visual+runtime；多文件集成含 integration；数据驱动
+  CRUD 类界面不绑 visual，runtime 降为单次 navigate+console 无 error；存在性/静态
+  冒烟自动覆盖无需填）。probes（探针序列）与 scenes（场景清单）是 WriteSpec 的
+  独立参数，与 verify_levels 平级填写，严禁把 probes/scenes 填进 verify_levels
+  （verify_levels 含 visual 时 scenes 逐场景覆盖，同图连拍充数无效）；acceptance
+  结构化 {text,evidence,layer}
   （evidence=command|screenshot|probe|file|manual，缺证据条目标黄不计分；
   layer=functional|quality，quality 层未过整品不得标绿）。
 - 还原/复刻/仿制/对标类任务先备对标基线：WriteSpec 的 baseline_content 内联落盘

@@ -251,6 +251,9 @@ func (r *Registry) registerDefaults() {
 	r.Register(&refreshProjectDocTool{exec: r.exec})
 	// ReadMedia：按路径读图/视频（任务128），视频解析器经 SetMediaResolver 注入。
 	r.Register(&readMediaTool{exec: r.exec})
+	// ShowArtifact：把可视成果（图/视频/音频/HTML）展示到对话栏（媒体卡片）。
+	// 与 ReadMedia 互补：ReadMedia 喂模型，ShowArtifact 给用户看。
+	r.Register(&showArtifactTool{exec: r.exec})
 }
 
 // Register 将工具及其别名注册到注册表中；若传入 nil 则忽略。

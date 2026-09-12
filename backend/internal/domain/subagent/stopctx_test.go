@@ -79,7 +79,7 @@ func TestDispatchHotDomain_StopCtxDestroysSlot(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
-	subID := res.Output
+	subID := subAgentIDOf(res)
 
 	// 等任务进入挂起的引擎 LLM 调用后模拟会话 Stop。
 	deadline := time.Now().Add(2 * time.Second)
