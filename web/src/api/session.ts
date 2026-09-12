@@ -17,6 +17,21 @@ export function getSession(id: string): Promise<Session> {
   return fetchJson(`/sessions/${id}`)
 }
 
+/**
+ * 修改某个会话的工作目录（每会话目录，落库即时保存）。
+ * `workDir` 传空串 = 清除本会话目录、回落进程默认目录。
+ * 目录在每回合开始时读取，因此下一回合生效（进行中的工具调用仍按旧目录解析）。
+ */
+export function setSessionWorkDir(
+  id: string,
+  workDir: string,
+): Promise<{ session_id: string; work_dir: string }> {
+  return fetchJson(`/sessions/${id}/workdir`, {
+    method: 'POST',
+    body: JSON.stringify({ work_dir: workDir }),
+  })
+}
+
 /** 硬删除单个会话（不可恢复）：运行中先终止，随后物理删除历史/事件/日志等全部数据。 */
 export function deleteSession(id: string): Promise<{ session_id: string; status: string }> {
   return fetchJson(`/sessions/${id}`, { method: 'DELETE' })
@@ -46,6 +61,114 @@ export function sendMessage(id: string, content: string, images?: WireImage[]): 
   return fetchJson(`/sessions/${id}/message`, {
     method: 'POST',
     body: JSON.stringify(images?.length ? { content, images } : { content }),
+  })
+}
+
+// ---- 编排页：单 Agent 对话与用户直连（TODO 第12项）----
+
+/** 单条 Agent 消息（与后端 reactMessageWire/entriesToWire 线型对齐）。 */
+export interface AgentMessageItem {
+  seq: number
+  /** 热层条目带 RFC3339 时间戳；PG 回退路径无 at（省略）。 */
+  at?: string
+  role: 'user' | 'assistant' | 'tool' | string
+  content: string
+  reasoning?: string
+  tool_calls?: { id: string; name: string; input: unknown }[]
+  tool_call_id?: string
+}
+
+/** 一条 mailbox 留痕（后端 type=mailbox 事件，双方各一行）。 */
+export interface AgentMailItem {
+  /** 留痕时间（RFC3339）。 */
+  at: string
+  /** 发送方（user/dispatcher/子 Agent 实例 ID）。 */
+  from: string
+  /** 接收方。 */
+  to: string
+  /** 邮件类型（milestone/request/info/escalate/reply）。 */
+  msg_type: string
+  /** 主题（后端 content 的首行）。 */
+  subject: string
+  /** 正文（后端 content 去掉首行主题后的剩余部分）。 */
+  body: string
+}
+
+export interface AgentConversation {
+  agent_id: string
+  total: number
+  messages: AgentMessageItem[]
+  mails: AgentMailItem[]
+  /** 头部还有更早消息（before_seq 翻页用；本次取满 limit 即视为可能还有）。 */
+  has_more: boolean
+}
+
+/** 后端 mailbox 留痕线型（字段口径见 store.QueryAgentMailboxTrace）。 */
+interface WireMailItem {
+  role?: string
+  content?: string
+  tool_name?: string
+  input?: string
+  occurred?: string
+}
+
+/** 把后端 mailbox 留痕转成前端线型：content = subject\nbody，此处拆回首行/余下。 */
+function toMailItem(m: WireMailItem): AgentMailItem {
+  const raw = m.content ?? ''
+  const nl = raw.indexOf('\n')
+  return {
+    at: m.occurred ?? '',
+    from: m.role ?? '',
+    to: m.input ?? '',
+    msg_type: m.tool_name ?? '',
+    subject: nl >= 0 ? raw.slice(0, nl) : raw,
+    body: nl >= 0 ? raw.slice(nl + 1) : '',
+  }
+}
+
+/**
+ * 取单个 Agent 的完整对话（编排页对话面板数据源）。
+ * 滚动窗口三态：`afterSeq` 增量轮询 / `beforeSeq` 上翻 / 都不传取尾部。
+ * `aid='meta'` 后端映射为会话主 Agent（前端正常不传 meta）。
+ */
+export async function getAgentMessages(
+  id: string,
+  aid: string,
+  opts?: { beforeSeq?: number; afterSeq?: number; limit?: number },
+): Promise<AgentConversation> {
+  const qs = new URLSearchParams()
+  // 仅在 >0 时传窗口参数：seq=0 是合法最小值，但后端把 before_seq<=0 当"取尾部"，
+  // 传 0 会退化成尾部窗口（上翻时把同一批消息重复前插）。
+  if (opts?.beforeSeq && opts.beforeSeq > 0) qs.set('before_seq', String(opts.beforeSeq))
+  if (opts?.afterSeq && opts.afterSeq >= 0) qs.set('after_seq', String(opts.afterSeq))
+  const limit = opts?.limit ?? 100
+  qs.set('limit', String(limit))
+  const res = await fetchJson<{
+    session_id: string
+    agent_id: string
+    messages?: AgentMessageItem[]
+    mails?: WireMailItem[]
+  }>(`/sessions/${id}/agents/${encodeURIComponent(aid)}/messages?${qs.toString()}`)
+  const messages = res.messages ?? []
+  const mails = (res.mails ?? []).map(toMailItem)
+  // 后端不返 total/has_more：取满 limit 视为"头部可能还有更早消息"（上翻按钮据此显示）。
+  return {
+    agent_id: res.agent_id ?? aid,
+    total: messages.length,
+    messages,
+    mails,
+    has_more: !opts?.afterSeq && messages.length >= limit,
+  }
+}
+
+/**
+ * 用户直连发送（编排页对话面板发送框）。
+ * 后端状态机：等子返回→注入唤醒；终态→复活重跑；执行中/不可直连→409（抛 APIError）。
+ */
+export function sendAgentMessage(id: string, aid: string, content: string): Promise<void> {
+  return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(aid)}/message`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
   })
 }
 

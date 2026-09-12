@@ -1,27 +1,55 @@
 <script setup lang="ts">
-import { computed, toRef } from 'vue'
+import { computed, ref, toRef } from 'vue'
 import { CircleCheck, Loading, Lock } from '@element-plus/icons-vue'
-import type { AgentNode, TaskBoardData } from '@/types'
-import { useRoleTree } from '@/composables/useRoleTree'
+import type { AgentNode, SessionEvent, TaskBoardData } from '@/types'
 import { useTaskBoard } from '@/composables/useTaskBoard'
+import { useGoalTimeline } from '@/composables/useGoalTimeline'
+import OrchMiniCanvas from './OrchMiniCanvas.vue'
 
 const props = defineProps<{
   agents: AgentNode[]
   board: TaskBoardData | null
   goal?: string
+  /** 会话事件流：任务目标时间线数据源（设计 §8）。 */
+  events?: SessionEvent[]
 }>()
 
-const { roleTree, defaultProps } = useRoleTree(toRef(props, 'agents'))
 const { tasks, constraints, taskProgress } = useTaskBoard(toRef(props, 'board'))
+// 时间线（设计 §8）：user/派发/完成/失败里程碑 + board.tasks 兜底，纯前端聚合。
+const { milestones } = useGoalTimeline(
+  computed(() => props.events || []),
+  toRef(props, 'board'),
+)
 
 // 任务目标：board 快照的 goal 优先（随执行演进），回退会话初始 goal
 const goalText = computed(() => (props.board?.goal || props.goal || '').trim())
+const goalExpanded = ref(false)
+/** 时间线折叠：条数超过阈值时默认收起，避免长会话把面板撑爆。 */
+const timelineExpanded = ref(false)
+const TIMELINE_PREVIEW = 6
+const shownMilestones = computed(() =>
+  timelineExpanded.value ? milestones.value : milestones.value.slice(0, TIMELINE_PREVIEW),
+)
 
 const statusLegend = [
   { icon: CircleCheck, cls: 'text-green-500', label: '完成' },
   { icon: Loading, cls: 'text-yellow-500', label: '运行中' },
   { icon: Lock, cls: 'text-ink-2', label: '等待/阻塞' },
 ]
+
+/** 里程碑圆点配色：user=主色 / dispatch=蓝 / done=绿 / failed=红。 */
+function milestoneDot(kind: string): string {
+  if (kind === 'user') return 'bg-primary'
+  if (kind === 'dispatch') return 'bg-blue-500'
+  if (kind === 'done') return 'bg-green-500'
+  return 'bg-red-500'
+}
+
+function fmtTime(iso?: string): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  return isNaN(d.getTime()) ? '' : d.toLocaleTimeString('zh-CN', { hour12: false })
+}
 </script>
 
 <template>
@@ -32,7 +60,27 @@ const statusLegend = [
         <span class="font-bold text-sm text-ink">任务目标</span>
         <el-progress v-if="tasks.length" :percentage="taskProgress" :show-text="false" class="w-20 custom-progress" />
       </div>
-      <div v-if="goalText" class="p-2 mb-2 bg-page rounded border border-line text-ink leading-relaxed">{{ goalText }}</div>
+      <!-- 目标文本默认单行折叠，点击展开（长目标不再整段撑开面板） -->
+      <div v-if="goalText" class="p-2 mb-2 bg-page rounded border border-line text-ink leading-relaxed">
+        <div :class="goalExpanded ? '' : 'truncate'">{{ goalText }}</div>
+        <button v-if="goalText.length > 40" class="text-[11px] text-primary hover:underline mt-0.5"
+                @click="goalExpanded = !goalExpanded">{{ goalExpanded ? '收起' : '展开' }}</button>
+      </div>
+
+      <!-- 任务目标时间线：user/派发/完成/失败里程碑 -->
+      <div v-if="milestones.length" class="mb-2">
+        <div class="space-y-1">
+          <div v-for="(m, i) in shownMilestones" :key="i" class="flex items-start gap-2">
+            <span class="w-1.5 h-1.5 rounded-full mt-1 shrink-0" :class="milestoneDot(m.kind)"></span>
+            <span class="text-[10px] text-ink-3 font-mono w-14 shrink-0">{{ fmtTime(m.at) }}</span>
+            <span class="text-ink-2 flex-1 min-w-0 break-words">{{ m.text }}</span>
+          </div>
+        </div>
+        <button v-if="milestones.length > TIMELINE_PREVIEW" class="text-[11px] text-primary hover:underline mt-1"
+                @click="timelineExpanded = !timelineExpanded">
+          {{ timelineExpanded ? '收起' : `显示全部 ${milestones.length} 条` }}
+        </button>
+      </div>
       <div v-if="!tasks.length" class="text-ink-3 py-3 text-center">暂无子任务，等待 DomainAgent 拆解</div>
       <div v-else class="space-y-1.5">
         <div v-for="(t, i) in tasks" :key="i"
@@ -50,35 +98,18 @@ const statusLegend = [
       </div>
     </div>
 
-    <!-- Agent 编排（对齐 TUI 编排面板：角色树 + 状态图例） -->
-    <div>
-      <div class="flex justify-between items-center mb-2">
-        <span class="font-bold text-sm text-ink">Agent 编排</span>
+    <!-- Agent 编排：横向滑动迷你画布，点击节点直达该 Agent 对话 -->
+    <div class="p-2 bg-page rounded border border-line">
+      <div class="flex justify-between items-center mb-1">
+        <span class="font-bold text-sm text-ink">🌳 Agent 编排</span>
         <div class="flex items-center gap-2 text-[10px] text-ink-3">
           <span v-for="l in statusLegend" :key="l.label" class="flex items-center gap-0.5">
             <el-icon :class="l.cls" class="text-[11px]"><component :is="l.icon" /></el-icon>{{ l.label }}
           </span>
         </div>
       </div>
-      <div v-if="!roleTree.length" class="text-ink-3 py-3 text-center">暂无角色实例，会话启动后自动创建</div>
-      <el-tree v-else :data="roleTree" :props="defaultProps" default-expand-all
-               class="!bg-transparent custom-tree" :expand-on-click-node="false">
-        <template #default="{ node, data }">
-          <div class="flex items-center justify-between w-full pr-1 py-0.5">
-            <span class="flex items-center gap-1.5">
-              <el-icon :class="data.iconColor" class="text-sm">
-                <UserFilled v-if="data.isUser" /><User v-else />
-              </el-icon>
-              <span :class="data.active ? 'text-ink' : 'text-ink-3'" class="text-xs">{{ node.label }}</span>
-              <span v-if="data.activity" class="text-[10px] text-ink-3">{{ data.activity }}</span>
-            </span>
-            <el-tag v-if="data.status" :type="data.statusType" size="small" effect="plain"
-                    class="scale-75 origin-right">
-              {{ data.status === 'delivered-unverified' ? '已交付未验证' : data.status }}
-            </el-tag>
-          </div>
-        </template>
-      </el-tree>
+      <div class="text-[11px] text-ink-3 mb-2">层级树图查看 Agent 关系，点击节点直达该 Agent 对话。</div>
+      <OrchMiniCanvas :agents="agents" />
     </div>
 
     <!-- 约束条件 -->

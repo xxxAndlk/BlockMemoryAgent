@@ -12,6 +12,9 @@ defineProps<{
   events: SessionEvent[]
   agents: AgentNode[]
   sessionLogs: SessionLog[]
+  /** 选中的非 meta Agent（?agent=）：执行日志锁定过滤为该 Agent，效率审计自动下钻其支路；
+   *  未选中/选中 MetaAgent 时为 null，维持全会话监控 */
+  agent?: AgentNode | null
 }>()
 
 const logAgent = defineModel<string>('logAgent', { default: '' })
@@ -49,7 +52,7 @@ const activeTab = ref<'log' | 'skill' | 'logs' | 'efficiency'>('log')
     </div>
 
     <div class="flex-1 overflow-hidden relative flex flex-col">
-      <ExecutionLog v-if="activeTab === 'log'" :events="events" />
+      <ExecutionLog v-if="activeTab === 'log'" :events="events" :force-agent="agent?.name" />
       <SkillSet v-if="activeTab === 'skill'" :agents="agents" />
       <SessionLogsPanel
         v-if="activeTab === 'logs'"
@@ -62,7 +65,7 @@ const activeTab = ref<'log' | 'skill' | 'logs' | 'efficiency'>('log')
         :logs="sessionLogs"
         @query="emit('query-logs')"
       />
-      <EfficiencyPanel v-if="activeTab === 'efficiency'" :session="session" />
+      <EfficiencyPanel v-if="activeTab === 'efficiency'" :session="session" :selected-node-id="agent?.inst_id" />
     </div>
   </div>
 </template>

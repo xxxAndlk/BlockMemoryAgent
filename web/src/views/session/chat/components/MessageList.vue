@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, nextTick, onMounted, computed } from 'vue'
 import type { SessionEvent, ClarifyPending } from '@/types'
-import { groupEventsToTurns } from '../utils/turns'
+import { groupEventsToTurns, settleTurnsBySessionStatus } from '../utils/turns'
 import UserBubble from './UserBubble.vue'
 import AssistantTurn from './AssistantTurn.vue'
 
@@ -14,6 +14,8 @@ const props = defineProps<{
   /** 批量问答逐题草稿（任务 140，下标对齐 clarify.questions；单题态为空数组） */
   clarifyDrafts?: string[]
   sessionId: string
+  /** 会话状态：终态兜底收口最后一个回合（事件流缺终结文案时不至于永久转圈） */
+  sessionStatus?: string
   liveStreaming: string
   liveThinking: string
   /** 接替回合的流式文本快照（key=接替用 user_message 事件时间戳），见 groupEventsToTurns。 */
@@ -31,7 +33,12 @@ const stickToBottom = ref(true)
 
 // F9 修复：原 groupEventsToTurns(events) 在模板内直接调用，
 // 每次 patch 都重新 O(n) 分组。改 computed 仅在 events 变化时重算。
-const turns = computed(() => groupEventsToTurns(props.events, props.priorReplies))
+const turns = computed(() =>
+  settleTurnsBySessionStatus(
+    groupEventsToTurns(props.events, props.priorReplies),
+    props.sessionStatus,
+  ),
+)
 
 function onScroll() {
   if (!containerRef.value) return

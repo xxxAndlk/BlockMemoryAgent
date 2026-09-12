@@ -112,6 +112,9 @@ type Mailbox struct {
 	bcast  []*Message            // To == "*" 等待主 Agent 决议
 	closed map[string]struct{}   // 已销毁收件人（Purge 过），Send 死信
 	seq    atomic.Int64          // 全局递增序号，用于生成消息 ID
+	// trace 可选的发送留痕回调（编排页 Agent 间交互留痕数据源）：Send 投递成功
+	//（含广播桶）后持锁外调用；nil 时零行为。实现方必须 best-effort 非阻塞。
+	trace func(*Message)
 }
 
 // New 创建并返回一个新的邮箱管理器实例。
@@ -126,6 +129,13 @@ func New() *Mailbox {
 		inbox:  make(map[string][]*Message),
 		closed: make(map[string]struct{}),
 	}
+}
+
+// WithTrace 注入发送留痕回调（编排页"Agent 间交互留痕"数据源）。重复注入后者覆盖前者。
+func (m *Mailbox) WithTrace(fn func(*Message)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.trace = fn
 }
 
 // Send 投递一条邮件到目标 Agent 的收件箱或广播桶。
@@ -155,17 +165,24 @@ func (m *Mailbox) Send(msg *Message) (string, error) {
 
 	// 加写锁保护 inbox/bcast 的写入。
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if msg.To == "" || msg.To == "*" {
 		// 无明确收件人或广播：进入广播桶，交主 Agent 决议。
 		m.bcast = append(m.bcast, msg)
 	} else {
 		// 定向投递：目标已销毁则返回死信错误，不入箱。
 		if _, ok := m.closed[msg.To]; ok {
+			m.mu.Unlock()
 			return "", fmt.Errorf("%w: %s", ErrRecipientClosed, msg.To)
 		}
 		// 定向投递：追加到目标 Agent 的收件箱末尾。
 		m.inbox[msg.To] = append(m.inbox[msg.To], msg)
+	}
+	trace := m.trace
+	m.mu.Unlock()
+	// 投递成功后留痕（持锁外 + 值拷贝：防回调慢/再入 mailbox 死锁，防调用方后续改 msg）。
+	if trace != nil {
+		cp := *msg
+		trace(&cp)
 	}
 	return id, nil
 }
@@ -340,6 +357,20 @@ func (m *Mailbox) Purge(agentID string) {
 	delete(m.inbox, agentID)
 	// 标记收件人已销毁：此后 Send 至该 ID 返回死信错误（TODO #23 死信可见）。
 	m.closed[agentID] = struct{}{}
+}
+
+// Reopen 重新打开一个已被 Purge 的收件人（编排页"复活重跑"）：撤销 closed 标记。
+//
+// Purge 的语义是"该实例已终结、后续投递为死信"；复活沿用**同一个实例 ID** 重跑，
+// 若不撤销，新起子 Agent 的回传（notify→Send）与用户直连注入会全部命中死信而被丢弃
+// （子任务结果静默消失、wait loop 空手退出）。只清标记，历史消息不恢复。
+func (m *Mailbox) Reopen(agentID string) {
+	if agentID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.closed, agentID)
 }
 
 // sortByPriority 按优先级降序、创建时间升序稳定排序消息。

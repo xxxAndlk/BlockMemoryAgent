@@ -499,12 +499,18 @@ func agentErrorStatus(err error) (string, int) {
 		return "会话不存在", http.StatusNotFound
 	case errors.Is(err, agent.ErrQueueFull):
 		return "命令队列已满", http.StatusServiceUnavailable
+	case errors.Is(err, agent.ErrAgentNotDirectable):
+		// 编排页直连的不可用态（Paused/Idle/meta/通道未接线）：409 冲突而非 400 参数错。
+		// 该哨兵包装 ErrInvalidSessionState（errors.Is 仍可匹配父错误），此前分支必须在其前。
+		return err.Error(), http.StatusConflict
 	case errors.Is(err, agent.ErrSessionFinished), errors.Is(err, agent.ErrInvalidSessionState):
 		return err.Error(), http.StatusBadRequest
 	case errors.Is(err, agent.ErrPostgresUnavailable):
 		return "存储后端不可用", http.StatusServiceUnavailable
 	case errors.Is(err, agent.ErrAgentNotFound):
 		return "Agent 不存在或已结束", http.StatusNotFound
+	case errors.Is(err, agent.ErrAgentBusy):
+		return "agent 正在执行任务，发送已禁用（可先中断或终止）", http.StatusConflict
 	default:
 		return err.Error(), http.StatusInternalServerError
 	}

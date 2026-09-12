@@ -186,6 +186,9 @@ const (
 	// QueryKindAgentEvents 子 Agent 审计下钻：Args{"agent": 实例ID, "limit", "offset"}，
 	// 返回该实例 agent_events 逐轮事件（回放数据源）。
 	QueryKindAgentEvents = "agent-events"
+	// QueryKindAgentMessages 编排页 Agent 对话视图：Args{"agent","before_seq","after_seq","limit"}，
+	// 返回完整消息历史（Redis 热层 + PG 合并分页）+ mailbox 留痕。
+	QueryKindAgentMessages = "agent-messages"
 	// QueryKindWorktrees 会话 worktree 副本清单（TODO 第9⑤/#10⑤）：
 	// 返回 ListWorktrees 快照（路径/分支/base/patch 路径与 stat/合并状态）。
 	QueryKindWorktrees = "worktrees"
@@ -217,6 +220,10 @@ const (
 	// ControlOpWorktree worktree 合并门操作（TODO 第9⑤/#10⑤）：
 	// Args{"action": "merge|reject", "agent": 实例ID, "comments": 驳回意见（reject 可选）}。
 	ControlOpWorktree = "worktree"
+	// ControlOpWorkDir 修改会话工作目录（每会话目录，编排页/会话页"本会话目录"入口）：
+	// Args{"work_dir": 绝对路径，空串=回落进程默认}。落库即时保存，下一回合生效
+	//（正在执行的工具调用已按旧目录解析）。
+	ControlOpWorkDir = "work-dir"
 )
 
 // Filter 表示列出会话时使用的筛选条件。

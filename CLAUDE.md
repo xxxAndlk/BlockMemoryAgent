@@ -41,6 +41,14 @@ Key rules: `pkg/*` must not import `internal/*`; infrastructure must not import 
 - Integration tests under `test/` (separate module): `test/api/*`, `test/coding/*` (e2e via mock LLM), `test/tui/*`, `test/fixtures/*`. Fixtures use `docker/docker-compose.test.yml` (isolated ports PG 55432 / Redis 56380) — never point tests at the dev instance (5432/6380, VECTOR(1024)). Test containers are shared and left running; each test gets its own PG database + Redis logical DB (do not add compose `down` to fixture setup/cleanup — parallel packages share the containers).
 - Eval suite under `test/eval/` (build tag `eval`, real LLM, costs API credits): scenario YAMLs + deterministic checkpoint judges + metrics, reports to `test/eval/runs/<ts>/report.{json,md}`. Dry-run: `cd test && EVAL_DRY_RUN=1 GOTOOLCHAIN=local go test -tags=eval ./eval/ -run TestEval -v`. Knobs: `EVAL_FILTER`, `EVAL_RUNS`, `JUDGE_*` for llm_judge checks.
 
+## Agent 编排页
+
+会话页第三个主视图 `?view=orch`（选中态 `?agent=<inst_id>`，可分享/刷新恢复）：左树图（自绘 SVG tidy 布局，零图库）+ 右单 Agent 对话面板。设计/计划：`docs/superpowers/specs/2026-09-11-agent-orch-board-design.md` + `docs/superpowers/plans/2026-09-11-agent-orch-board.md`。
+
+- 新端点：`GET /api/sessions/{id}/agents/{aid}/messages?before_seq&after_seq&limit`（完整消息历史 + mailbox 留痕）、`POST /api/sessions/{id}/agents/{aid}/message`（用户直连）。
+- 用户直连状态机（`ReactService.MessageAgent` → `subagent.Dispatcher`）：`running + activity_kind=child_wait` 经 `InjectUserMessage` 投邮件并 poke 唤醒；终态（done/failed/cancelled/delivered-unverified）经 `Tree.Reopen` + `ReviveWithMessage` 同 ID 重跑（种子=原任务+上轮结果+用户消息，父收「复活返工」通知）；`running` 其他 → 409 `ErrAgentBusy`；paused/idle/meta/未接线 → 409 `ErrAgentNotDirectable`。
+- 观测写入一律 best-effort：消息逐条热写 Redis（`sess:{sid}:agent:{aid}:msgs`，TTL 24h、cap 500）+ 子 Agent 终态全量落 PG `agent_messages`；mailbox 发送留痕双写 `agent_events`（type=mailbox）；`child_wait` 是纯展示态活动 kind（只换 lastKind，不刷 lastTS、不冒泡）。Redis 不可用时写侧跳过、读侧回退 PG，端点不报错。
+
 ## History
 
 Codebase migrated from CloudWeGo Eino to go-kratos Blades (pre-v3 Eino docs no longer in tree).

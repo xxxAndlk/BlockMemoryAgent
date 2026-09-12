@@ -587,18 +587,12 @@ func (h *APIHandler) SaveProfileHandler(c *gin.Context) {
 // prefsWorkDirCtx 校验可选 work_dir 参数并注入 ctx（与 /api/sessions 的 work_dir 同规则：
 // 非空时转绝对路径，不存在或非目录返回 400）；为空时原样返回请求 ctx（进程目录语义）。
 func prefsWorkDirCtx(c *gin.Context, dir string) (context.Context, bool) {
-	if dir == "" {
+	abs, ok := workDirAbs(c, dir)
+	if !ok {
+		return nil, false
+	}
+	if abs == "" {
 		return c.Request.Context(), true
-	}
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		c.String(http.StatusBadRequest, "work_dir 无效")
-		return nil, false
-	}
-	info, err := os.Stat(abs)
-	if err != nil || !info.IsDir() {
-		c.String(http.StatusBadRequest, "work_dir 不存在或不是目录")
-		return nil, false
 	}
 	return tool.WithWorkDir(c.Request.Context(), abs), true
 }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { Session, AgentNode, TrustMode } from '@/types'
 import { setTrustMode } from '@/api/session'
@@ -31,8 +32,15 @@ async function onTrustModeChange(mode: TrustMode) {
   }
 }
 
+/** 用户主动"终止"的会话：后端落 error 态 + Result="cancelled by user"（见 service_react.cancel），
+ *  但这是预期内的中止，不该和真失败共用红色"失败"——单列"已终止"。 */
+const userCancelled = computed(
+  () => props.session?.status === 'error' && (props.session?.result || '').includes('cancelled by user'),
+)
+
 const statusColor = computed(() => {
   if (!props.session) return 'text-ink-2'
+  if (userCancelled.value) return 'text-ink-3'
   switch (props.session.status) {
     case 'running': return props.session.destroy_at ? 'text-orange-400' : 'text-blue-400'
     case 'completed': return 'text-green-400'
@@ -45,6 +53,7 @@ const statusColor = computed(() => {
 
 const statusLabel = computed(() => {
   if (!props.session) return '未连接'
+  if (userCancelled.value) return '已终止'
   if (props.session.destroy_at) return '停止中'
   switch (props.session.status) {
     case 'running': return '运行中'
@@ -83,6 +92,19 @@ const chain = computed(() => {
   return [...props.agents].sort((a, b) =>
     (order.indexOf(a.type) - order.indexOf(b.type)) || a.name.localeCompare(b.name))
 })
+
+// 链条 chip 可点击选中 Agent（?agent=<inst_id>，留在当前 tab）：对话/监控随选中切换；
+// 点 meta 节点清除选择回主会话。当前选中 chip 高亮。
+const route = useRoute()
+const router = useRouter()
+const selectedId = computed(() => (route.query.agent as string) || '')
+
+function handleChainClick(a: AgentNode) {
+  const q = { ...route.query }
+  if (a.type === 'meta' || a.inst_id === 'meta') delete q.agent
+  else q.agent = a.inst_id
+  void router.replace({ query: q })
+}
 
 function nodeColor(type: string) {
   if (type === 'meta') return 'text-blue-400'
@@ -134,10 +156,13 @@ function nodeColor(type: string) {
       </el-select>
     </div>
 
-    <!-- Agent 链路（独立一行，横向滚动） -->
+    <!-- Agent 链路（独立一行，横向滚动；chip 可点击选中，选中高亮，点 meta 清除选择） -->
     <div v-if="chain.length" class="flex items-center gap-1.5 text-xs text-ink-2 overflow-x-auto mt-1.5">
       <template v-for="(a, i) in chain" :key="a.inst_id">
-        <span :class="nodeColor(a.type)" class="whitespace-nowrap">{{ a.name }}</span>
+        <button class="whitespace-nowrap rounded px-1 transition-colors hover:bg-page"
+                :class="[nodeColor(a.type), a.inst_id === selectedId ? 'font-bold ring-1 ring-primary' : '']"
+                title="查看该 Agent 的对话与监控"
+                @click="handleChainClick(a)">{{ a.name }}</button>
         <el-icon v-if="i < chain.length - 1" class="text-ink-3 text-[10px]"><ArrowRight /></el-icon>
       </template>
     </div>

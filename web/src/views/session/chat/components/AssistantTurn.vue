@@ -40,6 +40,7 @@ const finalText = computed(() => {
 const statusLabel = computed(() => {
   if (props.turn.status === 'running') return '处理中'
   if (props.turn.status === 'error') return '失败'
+  if (props.turn.status === 'cancelled') return '已终止'
   if (props.turn.status === 'awaiting_clarify') return '待澄清'
   return '完成'
 })
@@ -47,6 +48,7 @@ const statusLabel = computed(() => {
 const statusColor = computed(() => {
   if (props.turn.status === 'running') return 'text-blue-400'
   if (props.turn.status === 'error') return 'text-red-400'
+  if (props.turn.status === 'cancelled') return 'text-ink-3'
   if (props.turn.status === 'awaiting_clarify') return 'text-yellow-400'
   return 'text-green-400'
 })

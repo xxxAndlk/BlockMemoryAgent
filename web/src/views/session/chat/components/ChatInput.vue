@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, reactive, watch } from 'vue'
+import { ref, computed, reactive, watch, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { WireImage } from '@/types'
-import { useWorkDir } from '@/composables/useWorkDir'
 import { useModelSelection } from '@/composables/useModelSelection'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 
@@ -11,11 +10,21 @@ const props = defineProps<{
   sessionActive?: boolean
   inputTokens?: number
   outputTokens?: number
+  /** 是否绑定了会话（有 activeSession）。区别于 sessionActive=运行中：
+   * 已完成的会话同样"有本会话目录"，不能因为没在跑就显示成"新会话目录"。 */
+  sessionBound?: boolean
+  /** 工作目录：有会话=本会话目录；无会话=新会话默认目录（空串=进程默认目录） */
+  workDir?: string
+  /** 目录保存中（请求在途，按钮转圈） */
+  workDirSaving?: boolean
+  /** 最近使用过的目录（选择器快捷区） */
+  recentDirs?: string[]
 }>()
 
 const emit = defineEmits<{
   (e: 'submit', content: string, images: WireImage[]): void
   (e: 'new-session'): void
+  (e: 'update-workdir', dir: string): void
 }>()
 
 const content = ref('')
@@ -118,9 +127,30 @@ function onFileChange(e: Event) {
 const textareaRef = ref()
 const fileRef = ref<HTMLInputElement>()
 
-// 工作目录：模块级共享 ref（useWorkDir），新建会话时随 createSession 提交；
-// 与首页 WorkDirPicker 同源，改动实时同步。
-const { workDir } = useWorkDir()
+// 工作目录：有会话时是"本会话目录"（改动经父级落库保存，下一回合生效），
+// 无会话时是新会话默认目录（父级写全局默认）。不再是模块级共享 ref——
+// 那会让所有会话共显一个值、在会话页改动只影响"下一条新会话"却看起来像改了当前会话。
+const workDirLabel = computed(() => (props.sessionBound ? '本会话目录' : '新会话目录'))
+/**
+ * 刚改完目录的短提示（8s 后自动消失）：目录在每回合开始时读取，正在执行的工具调用
+ * 仍按旧目录解析——只在"确实改过"时提示，常驻会变成噪音。
+ */
+const workDirJustChanged = ref(false)
+let workDirHintTimer: number | undefined
+watch(
+  () => props.workDir,
+  (v, prev) => {
+    if (prev === undefined || v === prev) return // 首次渲染/未变化
+    if (!props.sessionActive) return // 新会话尚未创建，无"当前回合"概念
+    workDirJustChanged.value = true
+    window.clearTimeout(workDirHintTimer)
+    workDirHintTimer = window.setTimeout(() => {
+      workDirJustChanged.value = false
+    }, 8000)
+  },
+)
+onUnmounted(() => window.clearTimeout(workDirHintTimer))
+const workDirHint = computed(() => workDirJustChanged.value)
 
 // ── 模型选择（对话栏右下弹层）：角色 → 模型 → 思考强度；切换/新增落 config/models.json ──
 const {
@@ -223,9 +253,14 @@ function onKeydown(e: KeyboardEvent) {
     <!-- 模式开关 + 快捷标签 + Token 计数 -->
     <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
       <div class="flex items-center gap-4 text-xs text-ink-2 flex-1 min-w-0">
-        <div class="flex items-center gap-2 w-80 max-w-full shrink-0 workdir-cell">
-          <span class="text-ink-2 whitespace-nowrap">工作目录</span>
-          <WorkDirPicker v-model="workDir" />
+        <div class="flex items-center gap-2 min-w-0 max-w-[26rem] workdir-cell">
+          <span class="text-ink-2 whitespace-nowrap">{{ workDirLabel }}</span>
+          <WorkDirPicker :model-value="workDir || ''" :recent="recentDirs"
+                         placeholder="进程默认目录"
+                         @update:model-value="(d: string) => emit('update-workdir', d)" />
+          <el-icon v-if="workDirSaving" class="animate-spin text-ink-3 shrink-0"><Loading /></el-icon>
+          <span v-if="workDirHint" class="text-[10px] text-ink-3 whitespace-nowrap shrink-0"
+                title="目录在每回合开始时读取，正在执行的工具调用仍按旧目录">下回合生效</span>
         </div>
         <span v-if="sessionActive" class="text-green-400 flex items-center gap-1">
           <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>

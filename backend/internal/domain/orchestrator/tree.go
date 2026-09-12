@@ -292,6 +292,31 @@ func (t *Tree) Wake(id string, cancel context.CancelFunc) bool {
 	return true
 }
 
+// Reopen 复活终态节点（编排页用户直连"复活重跑"）：仅 Done/Failed/Cancelled/
+// Unverified 可复活回 Running；其他状态 no-op 返回 false。清 Finished 恢复运行态，
+// 保留 Summary/Err 作为上一轮留痕（复活种子上下文由调用方读取后注入新一轮，
+// 下一轮 Finish 时自然覆盖）。
+func (t *Tree) Reopen(id string) bool {
+	t.mu.Lock()
+	node, ok := t.nodes[id]
+	if !ok {
+		t.mu.Unlock()
+		return false
+	}
+	switch node.Status {
+	case StatusDone, StatusFailed, StatusCancelled, StatusUnverified:
+	default:
+		t.mu.Unlock()
+		return false
+	}
+	node.Status = StatusRunning
+	node.Finished = time.Time{}
+	snapshot := *node
+	t.mu.Unlock()
+	t.persistNode(snapshot)
+	return true
+}
+
 // Cancel 调用已绑定的 cancel func 并将状态置为 StatusCancelled。
 // 返回是否找到对应节点且处于可取消状态（Running）。
 // context.CancelFunc 幂等（Go doc），与 goroutine defer cancel 重复调用安全。

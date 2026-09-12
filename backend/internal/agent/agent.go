@@ -81,6 +81,11 @@ type Agent interface {
 	// （SaveMessages + tree.Pause），热驻槽 parked 可 ResumePaused 续跑。
 	PauseAgent(ctx context.Context, sessionID, instID string) error
 
+	// MessageAgent 用户直连子 Agent（编排页对话面板发送框）。
+	// 状态机：等子返回→注入唤醒；终态→复活重跑；执行中→ErrAgentBusy；
+	// Paused/Idle/meta→ErrInvalidSessionState。
+	MessageAgent(ctx context.Context, sessionID, instID, content string) error
+
 	// Board 返回会话任务看板快照（TODO #22 执行计划面板真相源）。
 	// 未接线或会话无看板时返回 (nil, nil)，调用方回退旧树合成。
 	Board(ctx context.Context, sessionID string) (*board.Snapshot, error)

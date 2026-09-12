@@ -284,6 +284,9 @@ type Dispatcher struct {
 	// 为 nil 时跳过持久化(测试场景:domain 到限仍返 errPaused 但 history 不存,无法 resume)。
 	msgStore agent.MessagesStore
 
+	// msgLogger 消息热层记录器（编排页对话视图）：构造子 Agent 时装配到 ReActAgent。
+	msgLogger agent.MessageLogger
+
 	// pausedResumes 跟踪每个 Paused domain 节点已续跑的次数（nodeID -> *atomic.Int64）。
 	// ResumePaused 入口按 maxPausedResumes 校验，触顶后强制收口部分返回——
 	// 续跑重置 fresh budget 使 token 上限永不绑定（v10 实证：验收领域暂停-续跑研磨
@@ -630,6 +633,18 @@ func (d *Dispatcher) WithDomainHeartbeatTimeout(t time.Duration) *Dispatcher {
 func (d *Dispatcher) activityReporterFn(agentID string) func(kind string) {
 	return func(kind string) {
 		now := time.Now().UnixNano()
+		if kind == "child_wait" {
+			// 展示态专用（编排页等待下级标识，waitForChildren 上报）：
+			// 标记 waitingChildren 供 ActivityEvidenceOf 读取；不刷新 lastTS（不续命）、
+			// 不向上冒泡——等子期间存活判定仍由后代活动冒泡与既有心跳阈值决定，
+			// 避免"全部后代已死、父在干等"被展示态刷新误判为合法存活。
+			// 该标记在后代冒泡期间保持（见 activityEvidence.stamp），否则展示态与
+			// 直连发送闸门会被 descendant 冒泡秒刷掉。
+			if e := d.activityEvidenceFor(agentID); e != nil {
+				e.markChildWait()
+			}
+			return
+		}
 		if e := d.activityEvidenceFor(agentID); e != nil {
 			e.report(kind, now)
 		}
@@ -1025,6 +1040,130 @@ func (d *Dispatcher) pokeParent(parentID string) {
 	case ps.notify <- struct{}{}:
 	default:
 	}
+}
+
+// InjectUserMessage 用户直连注入（编排页对话面板）：向目标 Agent 邮箱投一封
+// From="user" 的 MsgRequest，并 pokeParent 唤醒其 wait loop——mailbox.Send 本身
+// 不唤醒 WaitForAnyChild 阻塞方，不显式 poke 要等满 wait 周期才看到消息。
+func (d *Dispatcher) InjectUserMessage(agentID, content string) error {
+	if d.mailbox == nil {
+		return fmt.Errorf("mailbox 未初始化")
+	}
+	if _, err := d.mailbox.Send(&mailbox.Message{
+		From:    "user",
+		To:      agentID,
+		Type:    mailbox.MsgRequest,
+		Subject: "用户直连消息",
+		Body:    content,
+	}); err != nil {
+		return err
+	}
+	d.pokeParent(agentID)
+	return nil
+}
+
+// ReviveWithMessage 复活终态子 Agent 并以用户消息为增量输入同 ID 重跑。
+// 种子 = 原任务 + 上轮 Summary/Err + 用户新消息；运行骨架完全镜像 dispatchOne
+//（ctx 重建 → Reopen+SetCancel → subMeta/activity/ensurePatrol → goroutine
+// runSubAgent → 父 poke+邮件通知 → ledger 重记）。
+func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.Node, userMsg string) error {
+	roleDef := d.registry.Get(node.Role)
+	if roleDef == nil {
+		return fmt.Errorf("角色 %s 未注册，无法复活", node.Role)
+	}
+	parentID := node.ParentID
+	subAgentID := node.ID
+
+	subAgentCtx := tool.StopContextFrom(ctx)
+	if subAgentCtx == nil {
+		subAgentCtx = context.Background()
+	}
+	if sid := tool.SessionIDFromContext(ctx); sid != "" {
+		subAgentCtx = tool.WithSessionID(subAgentCtx, sid)
+	}
+	subAgentCtx = tool.WithWorkDir(subAgentCtx, d.subAgentWorkDirFor(ctx))
+	// 墙钟与派发路径同口径：domain 未显式给出预算时用侦察墙钟兜底（d.timeout 是全局上限），
+	// 否则复活一个侦察失控的 domain 会拿满全局墙钟（默认 30min）继续空转。
+	effectiveTimeout := d.timeout
+	if roleDef.ID == "domain" && d.domainReconClock > 0 &&
+		(effectiveTimeout <= 0 || d.domainReconClock < effectiveTimeout) {
+		effectiveTimeout = d.domainReconClock
+	}
+	var cancel context.CancelFunc = func() {}
+	if effectiveTimeout > 0 {
+		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)
+	}
+
+	if d.treeFn == nil {
+		cancel()
+		return fmt.Errorf("权威树未接线，无法复活 %s", subAgentID)
+	}
+	t := d.treeFn(tool.SessionIDFromContext(subAgentCtx))
+	if t == nil || !t.Reopen(subAgentID) {
+		cancel()
+		return fmt.Errorf("节点 %s 非终态，不可复活", subAgentID)
+	}
+	t.SetCancel(subAgentID, cancel)
+
+	// 复活种子：原任务 + 上轮结果留痕 + 用户新指令，让模型明确"这是返工/追加"。
+	seed := node.Task + "\n\n【上一轮结果】\n" + node.Summary
+	if node.Err != "" {
+		seed += "\n【上轮错误】\n" + node.Err
+	}
+	seed += "\n\n【用户直连消息】\n" + userMsg
+
+	if parentID != "" {
+		d.trackChildStart(parentID)
+	}
+	// 复活必须重开邮箱：原 run 退出路径已 Purge 该 ID（closed 标记永久），不撤销则
+	// 新起的下游子 Agent 回传与用户直连注入全部死信（结果静默丢失、wait loop 空手退出）。
+	if d.mailbox != nil {
+		d.mailbox.Reopen(subAgentID)
+	}
+	// 复活前清消息热层：新 run 的 history 从 0 重新编号，与旧 run 的 seq 重叠会让
+	// 对话页增量游标（after_seq=旧最大值）再也取不到新消息、面板出现重复 seq 条目。
+	if d.msgLogger != nil {
+		d.msgLogger.Clear(subAgentID)
+	}
+	// 看板回写：该领域对应计划条目从"完成/失败"翻回进行中，否则面板显示已完成、
+	// 实际又在重跑（与派发路径同口径）。
+	d.boardAssign(ctx, parentID, node.Domain, subAgentID)
+	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(subAgentCtx), wallClock: effectiveTimeout}
+	d.subMeta.Store(subAgentID, meta)
+	ev := newEvidence()
+	if roleDef.ID != "meta" {
+		d.activity.Store(subAgentID, ev)
+	}
+	d.ensurePatrol()
+	started := time.Now()
+	go func() {
+		defer cancel()
+		// CompareAndDelete：只清自己登记的那份（见 dispatchOne 同名注释）。
+		defer d.subMeta.CompareAndDelete(subAgentID, meta)
+		defer d.activity.CompareAndDelete(subAgentID, ev)
+		defer d.lastWrites.Delete(subAgentID)
+		defer d.heldSkills.Delete(subAgentID)
+		// 复活按默认 ReAct 模式重跑（mode=react、verify_kind 留空走角色默认校验分层）——
+		// 原派发的 mode/responsibility 未随节点持久化，无法复原；职责边界由种子里的
+		// 原任务文本与领域标签承载，必要时模型可自行重新派发下游。
+		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, seed, node.Domain, "", agent.ModeReact, "", started)
+		if !paused && parentID != "" {
+			meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
+		}
+	}()
+	// 父感知（提示词 Task 8 配套）：复活返工属调度事实，邮件通知父"等重新回传，勿重复派发"。
+	if parentID != "" && d.mailbox != nil {
+		_, _ = d.mailbox.Send(&mailbox.Message{
+			From: "dispatcher", To: parentID, Type: mailbox.MsgInfo,
+			Subject: "子 Agent 复活返工",
+			Body:    fmt.Sprintf("子 Agent %s 已被用户直连复活重跑，等待其重新回传，勿重复派发同领域任务。", subAgentID),
+		})
+		d.pokeParent(parentID)
+	}
+	if sid := tool.SessionIDFromContext(subAgentCtx); sid != "" {
+		d.ledger.RecordDispatch(sid, parentID, subAgentID, node.Domain, truncateRunes(node.Task, 80), "")
+	}
+	return nil
 }
 
 // HasPausedChild 返回父 Agent 是否有 StatusPaused 的子 DomainAgent 节点。
@@ -1460,6 +1599,12 @@ func (d *Dispatcher) WithBoard(get func(sessionID string) *board.TaskBoard, crea
 // 为 nil 时跳过持久化(测试场景)。
 func (d *Dispatcher) WithMessagesStore(s agent.MessagesStore) *Dispatcher {
 	d.msgStore = s
+	return d
+}
+
+// WithMessageLogger 注入消息热层记录器（编排页对话视图）。nil 时跳过（测试场景）。
+func (d *Dispatcher) WithMessageLogger(l agent.MessageLogger) *Dispatcher {
+	d.msgLogger = l
 	return d
 }
 
@@ -2568,8 +2713,9 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	isMeta := roleDef.ID == "meta"
 	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(ctx), wallClock: effectiveTimeout}
 	d.subMeta.Store(subAgentID, meta)
+	ev := newEvidence()
 	if !isMeta {
-		d.activity.Store(subAgentID, newEvidence())
+		d.activity.Store(subAgentID, ev)
 	}
 	d.ensurePatrol()
 	// 聚合模式登记（TODO 第七项⑤）：先于 goroutine 注册，消除 notify 时序竞态。
@@ -2578,8 +2724,11 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	}
 	go func() {
 		defer cancel()
-		defer d.subMeta.Delete(subAgentID)
-		defer d.activity.Delete(subAgentID)
+		// CompareAndDelete（而非 Delete）：复活/复用会在同一 ID 上重新 Store 新条目，
+		// 旧 run 的无条件 Delete 会把新 run 的条目误删——被复活的 Agent 随即失去活动监控
+		// 与取消句柄（scanStuck/ActivityEvidenceOf/cancel_agent 全部落空）。
+		defer d.subMeta.CompareAndDelete(subAgentID, meta)
+		defer d.activity.CompareAndDelete(subAgentID, ev)
 		defer d.lastWrites.Delete(subAgentID)
 		defer d.heldSkills.Delete(subAgentID)
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
@@ -2959,6 +3108,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		// 叶子助手部分回灌:treeFinish Done + notify 父部分产出。trackChildDone 照常减。
 		partial := result.Text
 		log.Printf("[subagent] PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
+		d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
 		d.treeFinish(ctx, subAgentID, "部分完成: "+partial, nil)
 		d.notify(parentID, subAgentID, "子 Agent 已达 token 上限,返回部分完成。\n"+partial, files)
 		return false
@@ -3020,6 +3170,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 				}
 				partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 				log.Printf("[subagent] SOFT-STOP LEAF PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
+				d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
 				d.treeFinish(ctx, subAgentID, "软停止部分完成: "+partial, nil)
 				d.notify(parentID, subAgentID, "子 Agent 已被软停止（会话停止中），返回当前部分成果；续跑后可按需重派。\n"+partial, files)
 				// Domain 热驻：父是热驻 domain 时追加一条取消提示邮件（"记忆补一句：子 Agent 已取消"）——
@@ -3040,6 +3191,8 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 			log.Printf("[subagent] CANCELLED: sub=%s role=%s duration=%s", subAgentID, roleDef.ID, duration)
 			// 硬取消路径清残留手动暂停标记（竞态：StopRunning 前节点已被取消）。
 			d.ClearPauseNode(subAgentID)
+			// 终态落库（编排页对话视图）：取消路径 ctx 已取消，saveTerminalHistory 内部脱取消。
+			d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
 			return false
 		}
 		partial := ""
@@ -3084,6 +3237,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 			treeStatus = orchestrator.StatusUnverified
 		}
 		d.boardUpdate(ctx, parentID, domain, boardSt, truncateRunes(msg, 300))
+		d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
 		d.treeFinishStatus(ctx, subAgentID, partial, treeStatus, failText)
 		d.notify(parentID, subAgentID, msg, files)
 		return false
@@ -3095,6 +3249,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	// A/B 实证自动验证闭环是负资产（开 5/16 vs 关 16/16），机制移至扩展设计文档 §12 作后期扩展。
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
 	d.boardUpdate(ctx, parentID, domain, board.TaskDone, result.Text)
+	d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
 	d.treeFinish(ctx, subAgentID, result.Text, nil)
 	// 校验分层（TODO #43）状态标注：VerifyNote 非空=校验通过（L0 证据/L2 rubric），
 	// 完成摘要前缀一行，父 Agent 可见校验依据；空=未启用校验（none），零变化。
@@ -3156,6 +3311,12 @@ func (d *Dispatcher) savePausedHistory(ctx context.Context, subAgentID, sid stri
 	if err := d.msgStore.SaveMessages(saveCtx, subAgentID, sid, history); err != nil {
 		log.Printf("[subagent] pause save messages failed: sub=%s err=%v", subAgentID, err)
 	}
+}
+
+// saveTerminalHistory 子 Agent 终态落库完整 history（编排页对话视图 PG 全量源）。
+// 复用 savePausedHistory 的"脱离取消 ctx + 10s 超时"语义——取消/软停路径 ctx 已取消也能存。
+func (d *Dispatcher) saveTerminalHistory(ctx context.Context, subAgentID, sid string, history []agent.ReactMessage) {
+	d.savePausedHistory(ctx, subAgentID, sid, history)
 }
 
 // treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
@@ -3296,6 +3457,11 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	//（TODO #25-3）：domain 等子期间自身无活动，靠后代活动刷新保持存活，巡检不误杀合法等待。
 	if e := d.activityEvidenceFor(subAgentID); e != nil {
 		sub = sub.WithActivityReporter(d.activityReporterFn(subAgentID))
+	}
+
+	// 消息热层（编排页对话视图）：逐条热写 Redis，终态全量落 PG（runSubAgent 收尾）。
+	if d.msgLogger != nil {
+		sub = sub.WithMessageLogger(d.msgLogger)
 	}
 
 	// 注入会话级日志器：派生 session-scoped logger，使子 Agent LLM I/O 写入同一会话的 session_logs。
@@ -3884,6 +4050,11 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	// 同 runSubAgentOnce：resume 重建的 domain Agent 也可能继续递归派发，
 	// 需要终结保护等待自己的子 Agent（Dispatcher 自身实现 PendingChildrenChecker）。
 	sub = sub.WithPendingChildrenChecker(d)
+	// 消息热层（编排页对话视图）：resume 重建的 Agent 同样逐条热写；缺了会让对话页
+	// 停在暂停前的旧热层快照（热层非空即不再回退 PG），续跑内容永久不可见。
+	if d.msgLogger != nil {
+		sub = sub.WithMessageLogger(d.msgLogger)
+	}
 	if d.log != nil {
 		sub = sub.WithLogger(d.log.WithSession(sid).WithAgent(roleDef.Name))
 	}
@@ -3945,6 +4116,8 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	}
 
 	log.Printf("[subagent] resume DONE: sub=%s result_len=%d", pausedNodeID, len(result.Text))
+	// 终态全量落 PG（编排页对话视图权威源）：与 pause/失败分支同口径。
+	d.saveTerminalHistory(subCtx, pausedNodeID, sid, result.History)
 	d.treeFinish(subCtx, pausedNodeID, result.Text, nil)
 	d.notify(parentID, pausedNodeID, result.Text, files)
 	d.trackChildDone(parentID)

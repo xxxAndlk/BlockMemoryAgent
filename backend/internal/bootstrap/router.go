@@ -22,6 +22,12 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.HandleMethodNotAllowed = true // 未匹配方法返回 405（对齐原 mux 行为）
+	// 子 Agent 实例 ID 形如 "session-1/domain-2"（含 "/"），前端经 encodeURIComponent 转义为
+	// %2F 放进单段路径参数。gin 默认按解码后的 URL.Path 匹配，%2F 会被当成路径分隔符 →
+	// /agents/:aid/* 全 404（编排页对子 Agent 不可用）。开启 RawPath 匹配 + 参数解码，
+	// 使 :aid 收得回完整实例 ID（回归护栏：server/routes_agentparam_test.go）。
+	router.UseRawPath = true
+	router.UnescapePathValues = true
 
 	// authToken 在认证关闭时为空字符串，开启时取自配置；由 GinAuthMiddleware 负责判断是否放行。
 	authToken := ""

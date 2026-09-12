@@ -574,3 +574,27 @@ func TestTreeEndCurrentTopicCoversIdle(t *testing.T) {
 		t.Error("idle node kill func not invoked on EndCurrentTopic")
 	}
 }
+
+// TestTreeReopen 验证复活门控：仅终态（Done/Failed/Cancelled/Unverified）可 Reopen
+// 回 Running；Running/Paused/Idle 拒绝；Summary/Err 保留、Finished 清零。
+func TestTreeReopen(t *testing.T) {
+	tr := NewTree("", nil)
+	tr.Register(Node{ID: "a", Role: "domain", Status: StatusRunning})
+	if tr.Reopen("a") {
+		t.Fatal("Running 不应可复活")
+	}
+	tr.Finish("a", "干完了", nil)
+	if !tr.Reopen("a") {
+		t.Fatal("Done 应可复活")
+	}
+	n, _ := tr.Get("a")
+	if n.Status != StatusRunning || !n.Finished.IsZero() {
+		t.Fatalf("复活后应 Running 且 Finished 清零, got %+v", n)
+	}
+	if n.Summary != "干完了" {
+		t.Fatalf("复活应保留上轮 Summary 作留痕, got %q", n.Summary)
+	}
+	if tr.Reopen("missing") {
+		t.Fatal("不存在的节点应返回 false")
+	}
+}

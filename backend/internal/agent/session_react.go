@@ -56,7 +56,10 @@ type reactInternalSession struct {
 	TempDir string
 	// workDir 是每会话工作目录（绝对路径，空=进程默认 st.workDir）：S2 每会话工作目录，
 	// runSession/resumeSession 经 tool.WithWorkDir 注入 runCtx，工具执行按会话解析。
-	workDir string
+	// atomic.Value 保证跨 goroutine 读写安全：ReAct 循环/引擎在每回合开始时读取，
+	// 用户可随时经 HTTP 改（下一回合生效），普通 string 字段会构成数据竞争
+	//（同 trustMode 的处理方式）。空串表示回落进程默认目录。
+	workDir atomic.Value
 	// History 保存 React 对话历史，用于后续推理与恢复。
 	History []ReactMessage
 	// StreamingText 保存当前正在流式生成的助手文本（累积值，运行中才有意义），
@@ -307,7 +310,6 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 		StartedAt: time.Now(),
 		Events:    make([]internalEvent, 0),
 		TempDir:   filepath.Join(eff, ".bma", "tmp", sessionID),
-		workDir:   workDir,
 		// Messages 初始化系统提示与用户目标，为后续 LLM 对话提供上下文。
 		Messages: []Message{
 			{Role: string(enums.ChatRoleSystem), Content: "Goal: " + goal, Timestamp: time.Now()},
@@ -329,6 +331,8 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 	if st.defaultTrustMode != "" {
 		session.trustMode.Store(st.defaultTrustMode)
 	}
+	// 每会话工作目录（atomic 存储，见字段注释）：空串=回落进程默认。
+	session.setWorkDir(workDir)
 
 	// 加写锁后将新会话放入内存映射。
 	st.mu.Lock()
@@ -366,6 +370,22 @@ func (s *reactInternalSession) currentTrustMode() string {
 // setTrustMode 切换会话信任模式（atomic 存储无需额外加锁）。
 func (s *reactInternalSession) setTrustMode(mode string) {
 	s.trustMode.Store(mode)
+}
+
+// currentWorkDir 返回会话的每会话工作目录；未设置返回空串（= 回落进程默认目录）。
+// 供每回合开始的 runCtx 注入与持久化读取——中途改目录在下一回合生效。
+func (s *reactInternalSession) currentWorkDir() string {
+	if v := s.workDir.Load(); v != nil {
+		if d, ok := v.(string); ok {
+			return d
+		}
+	}
+	return ""
+}
+
+// setWorkDir 设置会话工作目录（atomic 存储无需额外加锁；空串=回落进程默认目录）。
+func (s *reactInternalSession) setWorkDir(dir string) {
+	s.workDir.Store(dir)
 }
 
 // getSession 根据会话 ID 获取会话指针。
@@ -708,7 +728,7 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 		ToolResults: toolResults,
 		MetaMemory:  []map[string]any{},
 		CreatedAt:   time.Now(),
-		WorkDir:     session.workDir,
+		WorkDir:     session.currentWorkDir(),
 		// 009: 记录落库时的会话状态。轮开始时为 running（崩溃后被恢复逻辑标记中断），
 		// 轮结束时为 completed/error/paused 等终态。
 		Status: string(session.Status),
@@ -869,8 +889,6 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 		StartedAt: rec.CreatedAt,
 		EndedAt:   &endedAt,
 		Events:    restoredEvents,
-		// S2: 恢复每会话工作目录，重启后续跑仍在原目录；空串回落进程默认。
-		workDir: rec.WorkDir,
 		// TempDir 与 createSession 同款规则计算（createSession 也从不预建目录，
 		// cleanupSessionTempDir 对不存在路径幂等）。
 		TempDir: filepath.Join(eff, ".bma", "tmp", rec.SessionID),
@@ -884,6 +902,8 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 	if msgs, err := NewPostgresMessagesStore(st.pgStore.DB()).LoadMessages(ctx, rec.SessionID); err == nil && len(msgs) > 0 {
 		sess.History = msgs
 	}
+	// S2: 恢复每会话工作目录，重启后续跑仍在原目录；空串回落进程默认（atomic，见字段注释）。
+	sess.setWorkDir(rec.WorkDir)
 	return sess
 }
 

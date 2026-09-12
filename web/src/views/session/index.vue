@@ -17,6 +17,7 @@ import {
   getSessionBoard,
   getSessionMailbox,
   getSessionLogs,
+  setSessionWorkDir,
   type MailboxMessage,
   type SessionLog,
 } from '@/api/session'
@@ -33,6 +34,7 @@ import { usePanelRefresh } from '@/composables/usePanelRefresh'
 import { useSessionList } from '@/composables/useSessionList'
 import { useSessionStatus } from '@/composables/useSessionStatus'
 import { useWorkDir } from '@/composables/useWorkDir'
+import { normDir } from '@/utils/dir'
 import ChatView from './chat/ChatView.vue'
 import MonitorView from './monitor/MonitorView.vue'
 import TaskBoardPanel from './components/panels/TaskBoardPanel.vue'
@@ -93,11 +95,27 @@ const loading = ref(false)
 const sending = ref(false)
 const sessionFilter = ref('')
 
-// 视图切换：?view=chat|monitor，缺省 chat；chat 为缺省视图不污染 URL
-const view = ref<'chat' | 'monitor'>((route.query.view as string) === 'monitor' ? 'monitor' : 'chat')
+// 视图切换：?view=chat|monitor，缺省 chat；chat 为缺省视图不污染 URL。
+// 旧链接的 view=orch（已删除的编排页）兼容映射为 chat。
+const initialView = route.query.view
+const view = ref<'chat' | 'monitor'>(initialView === 'monitor' ? 'monitor' : 'chat')
 watch(view, (v) => {
-  router.replace({ query: { ...route.query, view: v === 'chat' ? undefined : v } })
+  // 本地 ref 是权威：切换后同步 URL（chat 为缺省不落 query）。
+  const cur = route.query.view
+  const next = v === 'chat' ? undefined : v
+  if (cur === next || (cur === undefined && next === undefined)) return
+  router.replace({ query: { ...route.query, view: next } })
 })
+// URL → ref 反向同步：外部入口只改 query（router.replace），没有这条 watcher 时 ref 仍是
+// 'chat'，按钮看起来"点了没反应"（且随后任何切换都会用陈旧 ref 覆盖掉 query）。
+// 两个 watcher 收敛到同一值，不会互相触发循环。view=orch 兼容落 chat。
+watch(
+  () => route.query.view,
+  (v) => {
+    const next = v === 'monitor' ? 'monitor' : 'chat'
+    if (view.value !== next) view.value = next
+  }
+)
 
 // 右栏统一 5 Tab；侧栏默认收起为图标条，点击展开
 const rightTab = ref<'board' | 'tools' | 'files' | 'memory' | 'metrics'>('board')
@@ -111,10 +129,37 @@ const sideTabs = [
 ] as const
 const activeSideTab = computed(() => sideTabs.find((t) => t.name === rightTab.value))
 
+// 选中 Agent（经任务看板迷你画布/头部链条点击，?agent=<inst_id> 双向同步，刷新可恢复）：
+// 对话/监控两视图随选中 Agent 切换；未选中或选中 MetaAgent 时保持主会话视图。
+const selectedAgent = computed<AgentNode | null>(
+  () => agents.value.find((a) => a.inst_id === (route.query.agent as string)) || null
+)
+const isMetaSelected = computed(
+  () => selectedAgent.value?.type === 'meta' || selectedAgent.value?.inst_id === 'meta'
+)
+// 节点已从树中消失（会话切换/清理）时清掉悬挂的 ?agent=，避免空面板（逻辑搬自已删除的 OrchView）。
+watch(
+  () => route.query.agent,
+  (id) => {
+    if (id && !agents.value.some((a) => a.inst_id === id)) {
+      const q = { ...route.query }
+      delete q.agent
+      void router.replace({ query: q })
+    }
+  }
+)
+// 选中 Agent 变化时同步日志分析过滤（服务端按 agent 名过滤）：选中 meta/无选中即清空回全会话。
+watch(selectedAgent, (a) => {
+  logFilterAgent.value = a && !isMetaSelected.value ? a.name : ''
+  applyLogFilters()
+})
+
 onMounted(async () => {
-  // 工作目录页「发起新会话」跳入：?work_dir= 预填并固化（与提交时 setWorkDir 同策略）
+  // 工作目录页「发起新会话」跳入：?work_dir= 预填为新会话默认目录。
+  // 带 id 时是"打开既有会话"，不写全局——否则只是浏览一次旧会话，就会把新会话默认目录
+  // 悄悄改成该会话的目录（会话目录本身以服务端 work_dir 为准，与此无关）。
   const qwd = route.query.work_dir as string
-  if (qwd) setWorkDir(qwd)
+  if (qwd && !route.query.id) setWorkDir(qwd)
 
   await loadSessions()
   const id = route.query.id as string
@@ -354,6 +399,49 @@ async function handleSubmit(content: string, images: WireImage[] = []) {
   }
 }
 
+// ── 每会话工作目录（本会话目录，落库即时保存）──
+// 有活跃会话 → 展示/修改"该会话自己的"目录；无会话 → 展示全局默认（新会话用）。
+const workDirSaving = ref(false)
+const activeWorkDir = computed(() =>
+  activeSession.value ? activeSession.value.work_dir || '' : workDir.value,
+)
+/** 最近使用过的目录（跨会话去重，规范化大小写与尾分隔符）：多会话共用同目录的快捷入口。 */
+const recentWorkDirs = computed(() => {
+  const seen = new Map<string, string>()
+  for (const s of sessions.value) {
+    const d = s.work_dir
+    if (!d) continue
+    const key = normDir(d)
+    if (!seen.has(key)) seen.set(key, d)
+  }
+  return [...seen.values()].slice(0, 8)
+})
+
+/**
+ * 目录变更：有活跃会话 → 保存到该会话（服务端权威值就地回填，SSE 快照随后亦是该值，
+ * 不会回跳）；无会话 → 只写全局默认（供新建会话使用）。
+ */
+async function handleWorkDirChange(dir: string) {
+  const sess = activeSession.value
+  if (!sess) {
+    setWorkDir(dir)
+    ElMessage.success('新会话目录已设置')
+    return
+  }
+  workDirSaving.value = true
+  try {
+    const r = await setSessionWorkDir(sess.id, dir)
+    activeSession.value = { ...sess, work_dir: r.work_dir }
+    const idx = sessions.value.findIndex((s) => s.id === sess.id)
+    if (idx >= 0) sessions.value[idx] = { ...sessions.value[idx], work_dir: r.work_dir }
+    ElMessage.success('工作目录已更新（下一回合生效）')
+  } catch (e) {
+    ElMessage.error('修改工作目录失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    workDirSaving.value = false
+  }
+}
+
 async function handleClarifySubmitted() {
   if (!activeSession.value) return
   activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
@@ -375,8 +463,33 @@ async function handleCancel() {
   }
   try {
     await cancelSession(activeSession.value.id)
+    ElMessage.success('已终止')
+    // 立即回取快照收口回合：终止事件（"会话已被用户取消"，turns.ts isUserCancel 认它）
+    // 在 cancel 返回前就已入库，快照里必然带着它——不等 SSE 轮询，用户点完立刻看到
+    // "已终止"而不是继续假转圈（实证：只发请求不回取时，回合停在"处理中"直到下次
+    // 有点击/刷新，用户以为终止没生效）。
+    finishCancelledTurn()
   } catch (e) {
     ElMessage.error('取消会话失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+/** 终止后即时收口：拉最新快照替换事件流 + 清运行中残留（流式文本/待澄清）。 */
+async function finishCancelledTurn() {
+  const id = activeSession.value?.id
+  if (!id) return
+  liveStreaming.value = ''
+  liveThinking.value = ''
+  clarifyPending.value = null
+  clarifyAck.value = false
+  try {
+    const s = await getSession(id)
+    activeSession.value = s
+    events.value = [...(s.events || [])]
+    const idx = sessions.value.findIndex((x) => x.id === id)
+    if (idx >= 0) sessions.value[idx] = { ...sessions.value[idx], status: s.status }
+  } catch {
+    // 快照取失败不阻塞：SSE 的 session_status/事件帧随后仍会把状态带回来。
   }
 }
 
@@ -423,6 +536,13 @@ async function handleNewSession() {
   clarifyAck.value = false
   clarifyDrafts.value = {}
   router.replace({ path: '/session' })
+}
+
+/** 会话列表状态文案：用户主动"终止"的单列"已终止"（后端落 error + Result=cancelled by user），
+ *  否则与真失败同标"失败"，用户会以为是自己点终止点坏了。 */
+function sessionStatusLabel(s: Session): string {
+  if (s.status === 'error' && (s.result || '').includes('cancelled by user')) return '已终止'
+  return statusText(s.status)
 }
 
 const filteredSessions = computed(() => {
@@ -487,7 +607,7 @@ function fmtDateTime(iso: string) {
                 :class="{ 'bg-primary-soft': activeSession?.id === s.id }">
           <div class="flex items-center gap-2 mb-1">
             <span class="w-1.5 h-1.5 rounded-full shrink-0" :class="statusDotClass(s.status)"></span>
-            <span class="text-[10px] text-ink-3 ml-auto shrink-0">{{ statusText(s.status) }}</span>
+            <span class="text-[10px] text-ink-3 ml-auto shrink-0">{{ sessionStatusLabel(s) }}</span>
           </div>
           <div class="text-sm text-ink line-clamp-2 break-words">{{ s.goal || '(无目标)' }}</div>
           <div class="text-[10px] text-ink-3 mt-1">{{ fmtDateTime(s.started_at) }}</div>
@@ -518,6 +638,7 @@ function fmtDateTime(iso: string) {
         :session="activeSession"
         :events="events"
         :agents="agents"
+        :agent="isMetaSelected ? null : selectedAgent"
         :clarify="clarifyPending"
         :clarify-ack="clarifyAck"
         :clarify-drafts="clarifyDraftsArr"
@@ -527,6 +648,10 @@ function fmtDateTime(iso: string) {
         :live-streaming="liveStreaming"
         :live-thinking="liveThinking"
         :prior-replies="replyStash"
+        :session-bound="!!activeSession"
+        :work-dir="activeWorkDir"
+        :work-dir-saving="workDirSaving"
+        :recent-dirs="recentWorkDirs"
         @submit="handleSubmit"
         @cancel="handleCancel"
         @stop="handleStop"
@@ -534,12 +659,15 @@ function fmtDateTime(iso: string) {
         @new-session="handleNewSession"
         @clarify-submitted="handleClarifySubmitted"
         @update-clarify-drafts="handleUpdateClarifyDrafts"
+        @update-workdir="handleWorkDirChange"
+        @refresh="activeSession && refreshPanels(activeSession.id)"
       />
       <MonitorView
-        v-else
+        v-else-if="view === 'monitor'"
         :session="activeSession"
         :events="events"
         :agents="agents"
+        :agent="isMetaSelected ? null : selectedAgent"
         :session-logs="sessionLogs"
         v-model:log-agent="logFilterAgent"
         v-model:log-level="logFilterLevel"
@@ -582,7 +710,7 @@ function fmtDateTime(iso: string) {
         <!-- 单面板渲染：打开哪个只看哪个（无 tab 切换条），面板切换走图标条 -->
         <div class="flex-1 min-h-0" :class="rightTab === 'files' ? 'overflow-hidden' : 'overflow-y-auto p-3'">
           <TaskBoardPanel v-if="rightTab === 'board'" :agents="agents" :board="board"
-                          :goal="activeSession?.goal || ''" />
+                          :goal="activeSession?.goal || ''" :events="events" />
           <ToolPanel v-else-if="rightTab === 'tools'" :events="events" />
           <FilePreview v-else-if="rightTab === 'files'" :session-id="activeSession?.id || ''" :agents="agents" />
           <SessionMemoryPanel v-else-if="rightTab === 'memory'" :session-id="activeSession?.id || ''" />

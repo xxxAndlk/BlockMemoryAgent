@@ -292,6 +292,39 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		WithMaxBundles(cfg.Agent.SummarizeMaxBundles).
 		WithFileMapProvider(toolRegistry.FileMapText) // 任务级文件小地图：触碰文件符号轮廓尾部常驻注入，压缩压不掉
 
+	// mailbox 留痕（编排页 Agent 间交互留痕）：每封邮件收发双方各写一条 agent_events
+	//（type=mailbox），随会话删除一并清理；写失败仅记日志，不影响投递。
+	sharedMailbox.WithTrace(func(msg *mailbox.Message) {
+		// 异步落库：钩子在 Send 的调用方 goroutine 上同步执行，而 Pipeline.Write 是同步
+		// PG INSERT（各自 5s 超时）——同步写会让每封邮件（notify/墙钟预警/用户直连注入）
+		// 阻塞发送方最多 2×5s，含 HTTP 请求 goroutine。留痕是观测数据，丢一条不影响主流程。
+		writeRow := func(agentID string) {
+			if agentID == "" || agentID == "*" {
+				return
+			}
+			if err := memoryPipeline.Write(agentID, agent.MemoryEvent{
+				Type:     "mailbox",
+				AgentID:  agentID,
+				Role:     msg.From,
+				Content:  msg.Subject + "\n" + msg.Body,
+				ToolName: string(msg.Type),
+				Input:    msg.To,
+				Occurred: msg.CreatedAt,
+			}); err != nil {
+				log.Printf("[mailbox] trace write failed: agent=%s err=%v", agentID, err)
+			}
+		}
+		// 交给独立 goroutine：Send 的调用方立即返回，不被 PG 写阻塞
+		//（mailbox 侧已传值拷贝，msg 归本闭包独占，跨 goroutine 使用安全）。
+		go func() {
+			writeRow(msg.To)
+			// user/dispatcher 是系统侧发送者（非 Agent），不作为发送方行落库。
+			if msg.From != "user" && msg.From != "dispatcher" {
+				writeRow(msg.From)
+			}
+		}()
+	})
+
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
 	reactCfg := agent.ReactRuntimeConfig{
@@ -631,6 +664,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// LoadMessages 重建 domain Agent 续跑。缺失会导致暂停后无法恢复
 	// （ResumePaused 前置校验 msgStore == nil 直接失败）。
 	subAgentDispatcher.WithMessagesStore(agent.NewPostgresMessagesStore(pgStore.DB()))
+	// 编排页（Agent 树图 + 单 Agent 对话页）接线：消息热层 + 用户直连通道。
+	agentSvc.SetAgentMsgCache(redisStore.AgentMsg)
+	subAgentDispatcher.WithMessageLogger(agent.NewMessageLogger(redisStore.AgentMsg))
 	// 注入未决子 Agent 检查器，开启父会话终结保护：
 	// 父 Agent 给出终答前若有未决子 Agent，阻塞等待其完成，防止迟到 mailbox 消息丢失。
 	agentSvc.SetPendingChildrenChecker(subAgentDispatcher)
@@ -641,6 +677,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入 Paused DomainAgent 恢复器：sendMessage 在 PausedOnChild 态优先恢复 earliest paused domain，
 	// 从 agent_messages 加载历史用 fresh budget 续跑（各 Agent 独立上下文）。
 	agentSvc.SetPausedDomainResumer(subAgentDispatcher)
+	// 注入用户直连写通道（编排页对话面板）：waiting 注入唤醒 / 终态复活重跑。
+	agentSvc.SetAgentMessenger(subAgentDispatcher)
 	// DomainAgent 热驻留（Domain 热驻 + 复用权重）：开启后 domain 任务完成/用户停止转
 	// Idle 热驻（goroutine park 等复用，call_sub_agent(reuse_agent_id=X) 唤醒），
 	// 加权 TTL 在用户下一条消息后武装。关闭（默认）时所有热驻路径零变化。

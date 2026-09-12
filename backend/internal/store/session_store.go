@@ -89,6 +89,33 @@ func (s *SessionStore) SaveHistory(ctx context.Context, rec *SessionHistoryRecor
 	return err
 }
 
+// UpdateWorkDir 只更新会话的工作目录列。
+//
+// 与 SaveHistory 的区别：不触碰 goal/summary/status 等列，专供"用户中途改目录"
+// 这类单字段更新；返回是否命中行——**会话尚未落过库时（新建后首回合前）会命中 0 行**，
+// 调用方应回退 SaveHistory 做全量 upsert 补插入（session_history.goal/summary 均为
+// NOT NULL 无默认值，裸 INSERT 会失败，因此不能在这里做 upsert）。
+// 参数: ctx 请求上下文; sessionID 会话 ID; workDir 绝对路径（空串=回落进程默认）。
+// 返回: 是否命中行; SQL 错误。
+func (s *SessionStore) UpdateWorkDir(ctx context.Context, sessionID, workDir string) (bool, error) {
+	// 未接线（测试/无 PG）按"未命中"返回：调用方据此走全量 upsert 分支，
+	// 与 append 路径的 nil-DB 约定一致，也避免 nil 解引用 panic。
+	if s == nil || s.db == nil {
+		return false, nil
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE session_history SET work_dir = $2 WHERE session_id = $1`,
+		sessionID, sanitizeUTF8(workDir))
+	if err != nil {
+		return false, fmt.Errorf("update session work_dir: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("update session work_dir rows: %w", err)
+	}
+	return n > 0, nil
+}
+
 // SaveEvents 批量持久化会话事件(全量覆盖语义)。
 // 每轮结束调用方都会重写该会话的全部事件,先 DELETE 再 INSERT 保证幂等,
 // 恢复-续跑场景不会与已落库的旧行叠加重复(与 PostgresMessagesStore.SaveMessages 同语义)。

@@ -75,3 +75,18 @@ func TestExpandLeaf_IndentPreserved(t *testing.T) {
 		t.Fatalf("无占位符时不应改动原文: %q", got)
 	}
 }
+
+// TestDirectMessageGuidance 钉死两段新规程的存在性（编排页用户直连的提示词契约）。
+func TestDirectMessageGuidance(t *testing.T) {
+	if !strings.Contains(DomainAgent, "【用户直连消息】") {
+		t.Fatal("DomainAgent 缺用户直连消息处置规程")
+	}
+	for _, kw := range []string{"cancel_agent", "call_sub_agent", "进度"} {
+		if !strings.Contains(DomainAgent, kw) {
+			t.Fatalf("DomainAgent 用户直连规程缺关键词 %q", kw)
+		}
+	}
+	if !strings.Contains(MetaAgent, "复活返工") {
+		t.Fatal("MetaAgent 缺子 Agent 复活返工感知规程")
+	}
+}

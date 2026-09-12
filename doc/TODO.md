@@ -97,10 +97,12 @@
 11. **任务完成后提示词三小项 + 提示词正文日期清扫**（①-④ 全部落地迁出：变更.md 任务 132——① assistant_template 补【交付】段、② domain 终答正文 ≤500 字符超出落盘留路径、③ 五叶子公共段收敛为 `pkg/config/leafCommonBlock` 单一来源加载期拼接（含 doc_assistant 自检口径泛化修正）、④ 提示词正文 27 处日期/迭代编号清扫（`#` 注释行保留）。以下只留观察点）
    - **观察点**（真机会话验证）：① 临时助手回传摘要含路径+证据（真机抽查 mailbox）；② domain 摘要超 4000 runes 截断落盘发生率下降（ctx_inject/mailbox 日志）；③ 塔防冒烟确认五叶子公共段泛化（自检口径/兄弟文件句统一）无行为回潮；④ 后续公共段修改只动 leafCommonBlock 一处即五叶子同步。
 
-12. **Agent 编排页：层级树图 + 单 Agent 对话页 + 用户直连**（2026-09-11 立项；设计已批准，spec 与 14 任务实现计划已落稿；未开工）
+12. **Agent 编排页：层级树图 + 单 Agent 对话页 + 用户直连**（2026-09-11 立项；设计已批准，spec 与 14 任务实现计划已落稿；**代码实施完成（2026-09-11），后端全量测试 + 前端 vue-tsc/vite 构建零报错；仅剩带真实会话的手动验收清单待人工执行**）
     - 依据文档：
       - 设计定稿：`docs/superpowers/specs/2026-09-11-agent-orch-board-design.md`
       - 实现计划（含全部代码）：`docs/superpowers/plans/2026-09-11-agent-orch-board.md`
+    - 实施记录（2026-09-11）：Task 1-14 全部落地——`child_wait` 展示态（不续命不冒泡）、mailbox 双写 `agent_events` 留痕、Redis 消息热层（TTL 24h/cap 500/nil 降级）、消息热写 + 子 Agent 终态全量落 PG、`GET/POST /agents/:aid/messages|message`、`Tree.Reopen` + `InjectUserMessage`/`ReviveWithMessage`、两段提示词规程、前端树图/对话面板/编排主视图/看板时间线（删 `useRoleTree.ts`）。两处偏离计划：① `ErrInvalidSessionState` 全局映射仍是 400，直连不可用态改由新哨兵 `ErrAgentNotDirectable`（包装前者）映射 409；② 新增测试 `TestAgentMsgRedisStore_NilNoOp` 促使 `BeforeMsg`/`AfterMsg` 补 nil 守卫。
+    - 评审修复（2026-09-11，代码评审 15 项发现逐条核实后修）：**路由可达性**——`%2F` 转义的实例 ID 在默认 gin 下全部 404（`/agents/:aid/*` 对任何子 Agent 不可用，含既有 pause/cancel/events），修法为新 DefaultRouter 开 `UseRawPath`+`UnescapePathValues`，护栏 `server/routes_agentparam_test.go`；**复活直连 ctx 缺 sessionID**（treeFn("") 取空树 → 恒失败）→ `MessageAgent` 注入 `tool.WithSessionID`；**复活后邮箱已 Purge 永久关闭**（子 Agent 回传/再注入全死信）→ 新增 `Mailbox.Reopen`；**child_wait 被后代冒泡秒刷**（等子态与发送闸门形同失效）→ `activityEvidence.waitingChildren` 粘滞（冒泡只续命不换 kind）；**复活 seq 从 0 重编号撞旧游标** → 复活前 `MessageLogger.Clear` 清热层；**热驻 domain 主路径（默认开启）与 resume 路径漏接消息日志/终态落库** → 补注入 + 终态存；**读侧热层非空即不回退 PG** → 改为热层不足时按 seq 合并 PG（增量窗口仍只读热层）；**mailbox 留痕同步 PG 写阻塞发送方** → 改 goroutine 异步；**留痕取最早 100 条** → 改取最近 100；**复活脚手架漂移** → 补 lastWrites/heldSkills 清理，`subMeta`/`activity` 收尾改 `CompareAndDelete`（防旧 run 收尾误删复活条目）；前端：`before_seq=0` 上翻重复前插、看板「打开编排页」只改 URL 不切视图（补 URL→ref watcher）、`active` 状态渲染为灰点/英文原值、`fetchJson` 丢弃后端纯文本错误体（409 提示只剩 "409 Conflict"）。
     - 前置待决（已定）：
       - [x] git 策略：全程不 commit（2026-09-11 用户拍板）——执行者跳过计划各任务末尾的 Commit 步骤，评审用工作区 diff
       - [x] 执行分工：规划者只出计划，代码实施由其他执行者按本计划逐任务执行

@@ -1,8 +1,12 @@
 package server
 
 import (
+	"context"
+	"sync"
+
 	"encoding/json" // 响应体解析
-	"net/http"      // HTTP 方法与状态码
+	"github.com/blockmemory/agent/backend/internal/agent"
+	"net/http" // HTTP 方法与状态码
 	"net/http/httptest"
 	"net/url"       // query 参数转义
 	"os"            // 临时目录/文件构造
@@ -130,5 +134,93 @@ func TestBrowseFS_RootHasEmptyParent(t *testing.T) {
 	}
 	if resp.Parent != "" {
 		t.Fatalf("parent got %q, want empty for drive root", resp.Parent)
+	}
+}
+
+// captureControlAgent 记录 Control 调用（mockAgentForServer.Control 是空实现，
+// 校验入参需要捕获）。
+type captureControlAgent struct {
+	mockAgentForServer
+	mu    sync.Mutex
+	ops   []agent.ControlCommand
+	errAt int // 第 N 次调用返回 controlErr（1-based；0=不返回）
+	err   error
+}
+
+func (c *captureControlAgent) Control(ctx context.Context, sessionID string, cmd agent.ControlCommand) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ops = append(c.ops, cmd)
+	if c.errAt != 0 && len(c.ops) == c.errAt {
+		return c.err
+	}
+	return nil
+}
+
+// TestHandleSessionWorkDir 验证 POST /api/sessions/:id/workdir：
+// 成功 200 回显规范化后的绝对路径；非法/缺失字段 400；会话不存在 404（ErrSessionNotFound 映射）。
+func TestHandleSessionWorkDir(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	cap := &captureControlAgent{mockAgentForServer: *newMockAgentForServer()}
+	mgr := NewSessionManager(cap)
+	r := gin.New()
+	r.POST("/api/sessions/:id/workdir", mgr.HandleSessionWorkDir)
+
+	do := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/sessions/s1/workdir", strings.NewReader(body))
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+	// Windows 路径含反斜杠，手工拼 JSON 易错——统一走 json.Marshal 构造请求体。
+	mkBody := func(dir string) string {
+		b, _ := json.Marshal(map[string]string{"work_dir": dir})
+		return string(b)
+	}
+
+	// 1) 成功：相对路径也转绝对，回显服务端权威值。
+	rec := do(mkBody(dir))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("成功用例 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		SessionID string `json:"session_id"`
+		WorkDir   string `json:"work_dir"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应解析: %v", err)
+	}
+	if resp.SessionID != "s1" || resp.WorkDir != dir {
+		t.Fatalf("回显不符: %+v (want dir=%q)", resp, dir)
+	}
+	cap.mu.Lock()
+	if len(cap.ops) != 1 || cap.ops[0].Op != agent.ControlOpWorkDir || cap.ops[0].Args["work_dir"] != dir {
+		t.Fatalf("Control 入参不符: %+v", cap.ops)
+	}
+	cap.mu.Unlock()
+
+	// 2) 显式空串 = 清除为进程默认（允许）。
+	if rec := do(mkBody("")); rec.Code != http.StatusOK {
+		t.Fatalf("清空用例 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 3) 未传字段 = 参数错（不能与"清空"混为一谈）。
+	if rec := do(`{}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("缺字段应 400, got %d", rec.Code)
+	}
+
+	// 4) 路径不存在 = 400（与创建会话同一份校验）。
+	if rec := do(mkBody(filepath.Join(dir, "nope"))); rec.Code != http.StatusBadRequest {
+		t.Fatalf("不存在路径应 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 5) 会话不存在 = 404（agent 层返回 ErrSessionNotFound）。
+	cap.mu.Lock()
+	cap.errAt = len(cap.ops) + 1
+	cap.err = agent.ErrSessionNotFound
+	cap.mu.Unlock()
+	if rec := do(mkBody(dir)); rec.Code != http.StatusNotFound {
+		t.Fatalf("会话不存在应 404, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }

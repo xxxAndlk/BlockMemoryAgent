@@ -170,12 +170,27 @@ type ReactService struct {
 	// skillPool 全局技能池（技能渐进披露）：nil 时不注入 MetaAgent 技能目录块。
 	// bootstrap 经 SetSkillCatalog 注入与 Dispatcher 同一个池。
 	skillPool *skill.Pool
+
+	// agentMsgCache/msgLogger 编排页对话视图：Redis 热层读缓存 + meta 消息热写器；
+	// 均由 SetAgentMsgCache 一并装配，nil 时读侧回退 PG、写侧跳过。
+	agentMsgCache *store.AgentMsgRedisStore
+	msgLogger     MessageLogger
+	// messenger 用户直连写通道（编排页对话面板），由 subagent.Dispatcher 实现。
+	// nil（未接线/测试）时 MessageAgent 一律拒绝。
+	messenger AgentMessenger
 }
 
 // SetSkillCatalog 注入全局技能池：MetaAgent 会话系统提示追加全池【可用技能】目录块
 // （Meta 持全集、可派发任意技能给下级）；nil 关闭（测试/未配置场景）。
 func (s *ReactService) SetSkillCatalog(p *skill.Pool) {
 	s.skillPool = p
+}
+
+// SetAgentMsgCache 注入 Agent 消息 Redis 热层（编排页对话视图）：读侧缓存 + meta 热写器。
+// nil 安全：读回退 PG、写关闭。
+func (s *ReactService) SetAgentMsgCache(c *store.AgentMsgRedisStore) {
+	s.agentMsgCache = c
+	s.msgLogger = NewMessageLogger(c)
 }
 
 // metaSkillBlock 渲染 MetaAgent 的全池技能目录块：Meta 持全集（无需派发即可
@@ -628,6 +643,75 @@ type ActivityEvidenceProvider interface {
 // ActivityKind/LastActivityAgo。由 bootstrap 注入 subagent.Dispatcher。
 func (s *ReactService) SetActivityEvidenceProvider(p ActivityEvidenceProvider) {
 	s.activityEvidenceProvider = p
+}
+
+// AgentMessenger 是用户直连子 Agent 的写通道（编排页对话面板发送框），
+// 由 subagent.Dispatcher 实现（见 Task 6 内核）：
+//   - InjectUserMessage：向等子返回中的 Agent 邮箱投 From=user 消息并唤醒其 wait loop；
+//   - ReviveWithMessage：终态节点 Reopen 后同 ID 重跑（种子=原任务+上轮结果+用户消息）。
+type AgentMessenger interface {
+	InjectUserMessage(agentID, content string) error
+	ReviveWithMessage(ctx context.Context, node orchestrator.Node, userMsg string) error
+}
+
+// SetAgentMessenger 注入用户直连写通道（编排页）。nil 时 MessageAgent 一律拒绝
+//（未接线场景：端点存在但不可用，不静默丢消息）。
+func (s *ReactService) SetAgentMessenger(m AgentMessenger) {
+	s.messenger = m
+}
+
+// MessageAgent 用户直连子 Agent（编排页对话面板发送框）。状态机路由：
+// 等子返回（running + activity_kind=child_wait）→ 邮箱注入+唤醒；
+// 执行中（running 其他）→ ErrAgentBusy（前端禁用发送，引导先中断/终止）；
+// 终态（done/failed/cancelled/delivered-unverified）→ 复活重跑；
+// Paused/Idle/meta → 拒绝（Paused 走监控页恢复；Idle 经 MetaAgent 正常派发）。
+// 成功写一条 System 会话事件留痕，主对话流可见"用户直连了某 Agent"。
+func (s *ReactService) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return fmt.Errorf("%w: 消息内容不能为空", ErrInvalidSessionState)
+	}
+	// 主 Agent 走主对话通道，不经此端点（设计 §4 明确 meta 不开放直连）。
+	if instID == "" || instID == "meta" {
+		return fmt.Errorf("%w: 主 Agent 请用主对话页", ErrAgentNotDirectable)
+	}
+	if s.messenger == nil {
+		return fmt.Errorf("%w: 用户直连通道未接线", ErrAgentNotDirectable)
+	}
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return ErrSessionNotFound
+	}
+	node, ok := s.TreeFor(sessionID).Get(instID)
+	if !ok {
+		return ErrAgentNotFound
+	}
+	kind := ""
+	if s.activityEvidenceProvider != nil {
+		kind, _, _ = s.activityEvidenceProvider.ActivityEvidenceOf(instID)
+	}
+	switch node.Status {
+	case orchestrator.StatusRunning:
+		if kind != "child_wait" {
+			return ErrAgentBusy
+		}
+		if err := s.messenger.InjectUserMessage(instID, content); err != nil {
+			return err
+		}
+	case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled, orchestrator.StatusUnverified:
+		// 直连 ctx 需补会话标识：HTTP 请求 ctx 不携带 sessionID，而复活路径靠它
+		// treeFn(sessionID) 取权威树、runSubAgent 靠它落终态/台账——缺了会取到空树，
+		// 每次复活都以"节点非终态，不可复活"失败（并把空树缓存进 s.trees）。
+		if err := s.messenger.ReviveWithMessage(tool.WithSessionID(ctx, sessionID), node, content); err != nil {
+			return err
+		}
+	default: // Paused / Idle / 未知
+		return fmt.Errorf("%w（Paused 请到监控页恢复；Idle 经主 Agent 派发）", ErrAgentNotDirectable)
+	}
+	s.store.addEvent(sess, eventkind.System, "System", "用户直连 "+instID+"："+truncateRunes(content, 200), "", "", "", "", "", true)
+	return nil
 }
 
 // SetSessionAgentWaker 注入会话挂起唤醒器（Domain 热驻），sendMessage 恢复路径
@@ -1188,6 +1272,13 @@ func (s *ReactService) Query(ctx context.Context, sessionID string, q Query) (Re
 		limit, _ := q.Args["limit"].(int)
 		offset, _ := q.Args["offset"].(int)
 		return s.agentEventsQueryResult(ctx, sessionID, agentID, limit, offset), nil
+	case QueryKindAgentMessages:
+		// 编排页 Agent 对话视图：完整消息历史 + mailbox 留痕。
+		agentID, _ := q.Args["agent"].(string)
+		beforeSeq, _ := q.Args["before_seq"].(int)
+		afterSeq, _ := q.Args["after_seq"].(int)
+		limit, _ := q.Args["limit"].(int)
+		return s.agentMessagesQueryResult(ctx, sessionID, agentID, beforeSeq, afterSeq, limit), nil
 	case QueryKindWorktrees:
 		// 会话 worktree 副本清单（TODO 第9⑤/#10⑤）：经结构化接口断言访问 Dispatcher。
 		// 未接线（nil/未实现）返回空列表，端点可安全轮询。
@@ -1262,6 +1353,15 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		// 信任模式切换（TODO 第10⑥）：提取 mode 校验枚举后落会话，下一工具调用生效。
 		mode, _ := cmd.Args["mode"].(string)
 		return s.SetSessionTrustMode(sessionID, mode)
+	case ControlOpWorkDir:
+		// 每会话工作目录修改：落库即时保存，下一回合生效（目录在每回合开始时读取）。
+		// 参数断言必须 fail-closed：空串是**合法**的"清除为默认目录"载荷，若把
+		// 缺参数/类型不符也降级成空串，一次序列化误差就会静默清掉用户的目录。
+		dir, ok := cmd.Args["work_dir"].(string)
+		if !ok {
+			return fmt.Errorf("%w: work_dir 参数缺失或类型不符", ErrInvalidSessionState)
+		}
+		return s.SetSessionWorkDir(ctx, sessionID, dir)
 	case ControlOpWorktree:
 		// worktree 合并门操作（TODO 第9⑤/#10⑤）：merge 走合并门，reject 驳回回信。
 		action, _ := cmd.Args["action"].(string)
@@ -1394,7 +1494,57 @@ func (s *ReactService) SetSessionTrustMode(sessionID, mode string) error {
 	return nil
 }
 
+// SetSessionWorkDir 修改会话的每会话工作目录（会话页"本会话目录"入口，HTTP/TUI 共用）。
+//
+// 语义：
+//   - **落库即时保存**：驻留会话写内存（atomic）+ 更新 session_history.work_dir；非驻留会话
+//     （懒恢复、只在 PG 里）直接更新库——下次恢复经 rec.WorkDir 读到新值；
+//   - **空串 = 回落进程默认目录**（与创建路径同语义，即"清除本会话目录"）；
+//   - **下一回合生效**：workDir 在每回合开始时读取（runSession/resumeSession），正在执行的
+//     工具调用已按旧目录解析，已产出的文件不迁移；
+//   - 会话不存在 → ErrSessionNotFound（HTTP 404）。
+func (s *ReactService) SetSessionWorkDir(ctx context.Context, sessionID, dir string) error {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		// 非驻留会话：内存无副本可改，直接落库（恢复路径会读回新值）。
+		if s.store.pgStore == nil {
+			return ErrSessionNotFound
+		}
+		ok, err := s.store.pgStore.UpdateSessionWorkDir(ctx, sessionID, dir)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrSessionNotFound
+		}
+		return nil
+	}
+	sess.setWorkDir(dir)
+	if s.store.pgStore != nil {
+		ok, err := s.store.pgStore.UpdateSessionWorkDir(ctx, sessionID, dir)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			// 该会话尚未落过库（新建后首回合前）：走全量 upsert 补插入行，
+			// 否则本次改动会在重启后丢失（恢复只认 session_history）。
+			s.store.persistHistory(sess)
+		}
+	}
+	// 审计留痕：主对话流留一条系统事件，事后可回溯"这个会话何时换了目录"
+	//（产物路径变了却查不到原因是常见困惑）。
+	note := "工作目录已改为 " + dir
+	if dir == "" {
+		note = "工作目录已重置为进程默认目录"
+	}
+	s.store.addEvent(sess, eventkind.System, "System", note, "", "", "", "", "", true)
+	return nil
+}
+
 // SessionTrustMode 读取会话当前信任模式（HTTP GET 展示用）；未设置返回空串。
+
 func (s *ReactService) SessionTrustMode(sessionID string) string {
 	s.store.mu.RLock()
 	sess := s.store.sessions[sessionID]
@@ -2028,7 +2178,7 @@ func (s *ReactService) SwitchTopic(ctx context.Context, sessionID, name, goal st
 		return nil, ErrSessionNotFound
 	}
 	oldTopicID := session.activeTopicID
-	workDir := session.workDir // 话题摘要 KV 按会话目录解析(S2):锁内快照,供下方注入
+	workDir := session.currentWorkDir() // 话题摘要 KV 按会话目录解析(S2):锁内快照,供下方注入
 	wasRunning := session.Status == enums.SessionStatusRunning
 	s.store.mu.Unlock()
 
@@ -2315,7 +2465,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 热驻空闲领域清单注入（Domain 热驻）：供 MetaAgent 自主判定强相关复用 vs 弱相关新建。
 	// 系统提示词工作目录按会话解析(终审修复):会话 workDir 优先,空串回落进程默认目录,
 	// 使 buildEnvBlock/LoadProjectDoc 与 createSession 的 EnsureProjectDoc 落在同一目录。
-	wd := session.workDir
+	wd := session.currentWorkDir()
 	if wd == "" {
 		wd = s.workDir()
 	}
@@ -2330,7 +2480,8 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
 		WithSkillBlock(s.metaSkillBlock()).
-		WithPersonaInjector(s.metaPersona(session.workDir)).
+		WithPersonaInjector(s.metaPersona(session.currentWorkDir())).
+		WithMessageLogger(s.msgLogger).
 		// meta 长会话运行期间模型被切换时，下一次 LLM 调用即用新模型。
 		WithProviderFunc(s.metaProviderForCall)
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
@@ -2345,7 +2496,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 将会话 ID 注入工具上下文，便于工具内部识别当前会话。
 	runCtx := tool.WithSessionID(ctx, session.ID)
 	// 注入每会话工作目录（空则原样返回，回落 Executor 默认目录）。
-	runCtx = tool.WithWorkDir(runCtx, session.workDir)
+	runCtx = tool.WithWorkDir(runCtx, session.currentWorkDir())
 	// 注入会话级 stopCtx（TODO 第10④）：子派发以此取消基底，stop 窗口期新派发即刻终止。
 	runCtx = tool.WithStopContext(runCtx, session.stopCtx)
 	// 注入信任模式读取器（TODO 第10⑥）：闭包实时读会话 atomic 值，HTTP/TUI 中途切换
@@ -2444,7 +2595,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 任务看板注入（TODO #35 Phase 0）：同 runSession，每轮末尾追加【任务看板】段。
 	// 热驻空闲领域清单注入（Domain 热驻）：供复用判定。
 	// 系统提示词工作目录按会话解析(终审修复,同 runSession):会话 workDir 优先,空串回落进程默认目录。
-	wd := session.workDir
+	wd := session.currentWorkDir()
 	if wd == "" {
 		wd = s.workDir()
 	}
@@ -2460,6 +2611,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithWorkDir(wd).
 		WithSkillBlock(s.metaSkillBlock()).
 		WithPersonaInjector(s.metaPersonaLite()).
+		WithMessageLogger(s.msgLogger).
 		// 同 runSession：运行期模型切换在下一次 LLM 调用生效。
 		WithProviderFunc(s.metaProviderForCall)
 	// 注入未决子 Agent 检查器，开启父会话终结保护。
@@ -2474,7 +2626,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 注入会话 ID 到工具上下文。
 	runCtx := tool.WithSessionID(ctx, session.ID)
 	// 注入每会话工作目录（空则原样返回，回落 Executor 默认目录）。
-	runCtx = tool.WithWorkDir(runCtx, session.workDir)
+	runCtx = tool.WithWorkDir(runCtx, session.currentWorkDir())
 	// 注入会话级 stopCtx（TODO 第10④）：续跑路径同 runSession，子派发以此取消基底。
 	runCtx = tool.WithStopContext(runCtx, session.stopCtx)
 	// 注入信任模式读取器（TODO 第10⑥）：同 runSession，中途切换下一工具调用生效。
@@ -2990,7 +3142,7 @@ func (s *ReactService) resumePausedDomain(session *reactInternalSession, pausedN
 	ctx := sessionContext(session)
 	// stopCtx 注入（TODO 第10④）：恢复路径派生的子 ctx 同样以会话 stopCtx 为取消基底。
 	res, err := s.resumeDispatcher.ResumePaused(
-		tool.WithStopContext(tool.WithWorkDir(tool.WithSessionID(ctx, session.ID), session.workDir), session.stopCtx), pausedNodeID)
+		tool.WithStopContext(tool.WithWorkDir(tool.WithSessionID(ctx, session.ID), session.currentWorkDir()), session.stopCtx), pausedNodeID)
 	if err != nil {
 		s.store.addEvent(session, eventkind.Error, "System", fmt.Sprintf("恢复暂停领域 Agent 失败，已回退暂停态: %v", err), "", "", "", "", "", false)
 		s.pauseSession(session, session.History, PauseOnChild)
@@ -3294,7 +3446,7 @@ func (s *ReactService) DeleteSession(ctx context.Context, sessionID string) erro
 		// 先摘除再取消：取消会异步触发收尾 goroutine，摘除先行保证 stillLive 守卫生效。
 		delete(s.store.sessions, sessionID)
 		tempDir = session.TempDir
-		workDir = session.workDir
+		workDir = session.currentWorkDir()
 	}
 	s.store.mu.Unlock()
 	if cancelFn != nil {
@@ -3586,7 +3738,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		Events:         events,
 		Messages:       messages,
 		TempDir:        s.TempDir,
-		WorkDir:        s.workDir,
+		WorkDir:        s.currentWorkDir(),
 		StreamingText:  s.StreamingText,
 		ThinkingText:   s.ThinkingText,
 		ActiveBlocks:   []ActiveBlock{},

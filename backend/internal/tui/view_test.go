@@ -222,6 +222,11 @@ func (stubAgent) CancelAgent(ctx context.Context, sessionID, instID string) erro
 // PauseAgent 是 stubAgent 的空实现。
 func (stubAgent) PauseAgent(ctx context.Context, sessionID, instID string) error { return nil }
 
+// MessageAgent 是 stubAgent 的用户直连空实现（编排页不在 TUI 测试范围）。
+func (stubAgent) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
+	return nil
+}
+
 // Shutdown 是 stubAgent 的空实现。
 func (stubAgent) Shutdown(ctx context.Context) error { return nil }
 

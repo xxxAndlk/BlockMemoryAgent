@@ -834,6 +834,9 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 
 	// 成功：boardUpdate + tree.Idle + saveBlockMemory + notify + trackChildDone + 进 Idle。
 	log.Printf("[subagent] DONE: sub=%s domain=%s duration=%s result_len=%d", s.id, s.domain, duration, len(result.Text))
+	// 终态全量落 PG（编排页对话视图权威源）：热驻槽同样适用——否则任务完成后
+	// 对话页只剩热层（24h 后过期即空白），与暂停/软停分支的 saveSlotMessages 口径不一致。
+	d.saveSlotMessages(s, result.History)
 	d.boardUpdate(taskCtx, s.parentID, s.domain, board.TaskDone, result.Text)
 	summary := result.Text
 	if result.VerifyNote != "" {
@@ -987,6 +990,11 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 	// Load-per-call 而非捕获指针：enterIdle/挂起收尾会 Delete activity、
 	// rearmSlotActivity 每任务重建新证据条目，闭包捕获旧指针会写进已废弃条目。
 	sub = sub.WithActivityReporter(d.activityReporterFn(s.id))
+	// 消息热层（编排页对话视图）：热驻 domain 是 config 默认主路径（domain_hot_resident_enabled
+	// 默认 true），漏注入会让用户在编排页面对最常看的 DomainAgent 看到空白对话。
+	if d.msgLogger != nil {
+		sub = sub.WithMessageLogger(d.msgLogger)
+	}
 	if d.log != nil {
 		sub = sub.WithLogger(d.log.WithSession(s.sessionID).WithAgent(roleDef.Name))
 	}

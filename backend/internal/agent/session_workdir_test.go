@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -133,4 +134,165 @@ func TestRunSession_SystemPromptPerSessionWorkDir(t *testing.T) {
 	}
 	s.Shutdown(context.Background())
 	s2.Shutdown(context.Background())
+}
+
+// TestSetSessionWorkDir 验证"每会话目录可后续修改"（会话页本会话目录入口）：
+// 驻留会话改内存 + 落库、空串回落进程默认、未知会话返回 ErrSessionNotFound（HTTP 404），
+// 以及每次改动留一条系统事件（事后可回溯产物为何换位置）。
+func TestSetSessionWorkDir(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	// 会话不跑循环：直接往 store 塞会话即可（改动只动内存与事件流）。
+	s := newReactServiceForTest(nil, dirA)
+	sess := s.store.createSession("g", "")
+	defer s.Shutdown(context.Background())
+
+	if got := s.store.sessions[sess.ID].currentWorkDir(); got != "" {
+		t.Fatalf("初始 workDir 应为空, got %q", got)
+	}
+
+	// 1) 修改：内存即时生效（同会话后续 Get 返回新值）。
+	if err := s.SetSessionWorkDir(context.Background(), sess.ID, dirB); err != nil {
+		t.Fatalf("SetSessionWorkDir: %v", err)
+	}
+	if got := s.store.sessions[sess.ID].currentWorkDir(); got != dirB {
+		t.Fatalf("改后 workDir got %q want %q", got, dirB)
+	}
+	pub, err := s.Get(context.Background(), sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pub.WorkDir != dirB {
+		t.Fatalf("对外 DTO WorkDir got %q want %q", pub.WorkDir, dirB)
+	}
+
+	// 2) 审计留痕：改动写一条系统事件。
+	events := s.store.sessions[sess.ID].Events
+	found := false
+	for _, ev := range events {
+		if strings.Contains(ev.Message, "工作目录已改为") && strings.Contains(ev.Message, dirB) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("改动应留系统事件, events=%+v", events)
+	}
+
+	// 3) 空串 = 清除为进程默认目录。
+	if err := s.SetSessionWorkDir(context.Background(), sess.ID, ""); err != nil {
+		t.Fatalf("清除 workDir: %v", err)
+	}
+	if got := s.store.sessions[sess.ID].currentWorkDir(); got != "" {
+		t.Fatalf("清除后 workDir 应为空, got %q", got)
+	}
+
+	// 4) 未知会话 → ErrSessionNotFound（HTTP 404，而不是 trust-mode 那样的 500）。
+	if err := s.SetSessionWorkDir(context.Background(), "session-does-not-exist", dirB); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("未知会话应 ErrSessionNotFound, got %v", err)
+	}
+}
+
+// multiInstructionProvider 记录每一次 LLM 请求的系统提示词（与 recordingModelProvider
+// 只留首条不同）：用于验证"改目录后下一回合生效"。
+type multiInstructionProvider struct {
+	mu   sync.Mutex
+	sys  []string
+	text string
+}
+
+func (m *multiInstructionProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	m.mu.Lock()
+	if req != nil && req.Instruction != nil {
+		m.sys = append(m.sys, systemText(req))
+	}
+	text := m.text
+	m.mu.Unlock()
+	if text == "" {
+		text = "done"
+	}
+	return &blades.ModelResponse{Message: blades.AssistantMessage(text)}, nil
+}
+func (m *multiInstructionProvider) Name() string { return "multi-instruction" }
+func (m *multiInstructionProvider) last() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.sys) == 0 {
+		return ""
+	}
+	return m.sys[len(m.sys)-1]
+}
+
+// TestSetSessionWorkDir_TakesEffectNextTurn 验证"下一回合生效"这条承诺：
+// 会话在 dirA 完成首轮后改到 dirB，下一条消息的回合系统提示词必须已用 dirB
+// （目录在每回合开始时读取——这是 UI 提示"下回合生效"的依据）。
+func TestSetSessionWorkDir_TakesEffectNextTurn(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	prov := &multiInstructionProvider{}
+	s := newReactServiceForTest(prov, dirA)
+	defer s.Shutdown(context.Background())
+
+	sess, err := s.CreateSession(context.Background(), CreateRequest{Goal: "g1", WorkDir: dirA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCompleted(t, s, sess.ID)
+	if first := prov.last(); !strings.Contains(first, "- 工作目录: "+dirA) {
+		t.Fatalf("首轮应使用会话创建时的目录 %q:\n%s", dirA, first)
+	}
+
+	if err := s.SetSessionWorkDir(context.Background(), sess.ID, dirB); err != nil {
+		t.Fatalf("SetSessionWorkDir: %v", err)
+	}
+	if err := s.Send(context.Background(), sess.ID, Message{Content: "继续"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitCompleted(t, s, sess.ID)
+	if last := prov.last(); !strings.Contains(last, "- 工作目录: "+dirB) {
+		t.Fatalf("改目录后下一回合应使用 %q:\n%s", dirB, last)
+	}
+}
+
+// waitCompleted 轮询等待会话进入 completed（跑完一个回合）。
+func waitCompleted(t *testing.T, s *ReactService, id string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got, err := s.Get(context.Background(), id); err == nil && got.Status == string(enums.SessionStatusCompleted) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("会话 %s 未在期限内完成回合", id)
+}
+
+// TestControlWorkDirFailClosed 验证 Control 的 work_dir 参数 fail-closed：
+// 参数缺失/类型不符必须报错，**绝不能**降级成空串——空串是合法的"清除为默认目录"
+// 载荷，一旦静默降级，一次序列化误差就会悄悄清掉用户设的目录。
+func TestControlWorkDirFailClosed(t *testing.T) {
+	dirB := t.TempDir()
+	s := newReactServiceForTest(nil, "")
+	defer s.Shutdown(context.Background())
+	sess := s.store.createSession("g", dirB)
+	ctx := context.Background()
+
+	for name, args := range map[string]map[string]any{
+		"缺参数":  {},
+		"类型不符": {"work_dir": 123},
+	} {
+		if err := s.Control(ctx, sess.ID, ControlCommand{Op: ControlOpWorkDir, Args: args}); err == nil {
+			t.Fatalf("%s：应报错而非静默清除", name)
+		}
+		if got := s.store.sessions[sess.ID].currentWorkDir(); got != dirB {
+			t.Fatalf("%s：目录被误改 got=%q want=%q", name, got, dirB)
+		}
+	}
+
+	// 合法空串仍走"清除"语义（不是被误伤的那类）。
+	if err := s.Control(ctx, sess.ID, ControlCommand{Op: ControlOpWorkDir, Args: map[string]any{"work_dir": ""}}); err != nil {
+		t.Fatalf("显式空串应放行: %v", err)
+	}
+	if got := s.store.sessions[sess.ID].currentWorkDir(); got != "" {
+		t.Fatalf("显式空串应清除目录, got %q", got)
+	}
 }

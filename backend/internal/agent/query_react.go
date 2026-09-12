@@ -17,6 +17,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -432,4 +434,173 @@ func (s *ReactService) agentEventsQueryResult(ctx context.Context, sessionID, ag
 		"agent_id":   agentID,
 		"events":     events,
 	}}
+}
+
+// agentMessagesQueryResult 编排页 Agent 对话视图数据源：Redis 热层优先（运行中最新），
+// miss/不足回退 PG agent_messages 全量切片；附 mailbox 留痕（type=mailbox 事件，双方各一行）。
+// agentID 传 "meta" 或空时映射为 sessionID（MetaAgent agentID==sessionID）。
+func (s *ReactService) agentMessagesQueryResult(ctx context.Context, sessionID, agentID string, beforeSeq, afterSeq, limit int) Result {
+	if agentID == "" || agentID == "meta" {
+		agentID = sessionID
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	mails := []map[string]any{}
+	if s.store.pgStore != nil {
+		if rows, err := s.store.pgStore.QueryAgentMailboxTrace(ctx, sessionID, agentID, 100); err == nil {
+			mails = rows
+		}
+	}
+	return Result{Data: map[string]any{
+		"session_id": sessionID,
+		"agent_id":   agentID,
+		"messages":   s.readAgentMessages(ctx, agentID, beforeSeq, afterSeq, limit),
+		"mails":      mails,
+	}}
+}
+
+// readAgentMessages 读消息窗口：热层优先，热层不足时与 PG 全量切片按 seq 合并
+//（热层同 seq 覆盖 PG——热层是运行中最新版本，PG 是终态快照）。
+//
+// 只读热层不合并的场景：after_seq 增量窗口——PG 是上一轮终态快照，掺进来会把旧内容
+// 当新消息回放；该窗口仅在热层整段丢失（Redis 重启/过期）时回退 PG。
+func (s *ReactService) readAgentMessages(ctx context.Context, agentID string, beforeSeq, afterSeq, limit int) []map[string]any {
+	var hot []store.AgentMsgEntry
+	if s.agentMsgCache != nil {
+		var err error
+		switch {
+		case afterSeq > 0:
+			hot, err = s.agentMsgCache.AfterMsg(ctx, agentID, afterSeq, limit)
+		case beforeSeq > 0:
+			hot, err = s.agentMsgCache.BeforeMsg(ctx, agentID, beforeSeq, limit)
+		default:
+			hot, err = s.agentMsgCache.TailMsg(ctx, agentID, limit)
+		}
+		if err != nil {
+			log.Printf("[query] agent msg hot-read failed, fallback PG: agent=%s err=%v", agentID, err)
+			hot = nil
+		}
+	}
+	if afterSeq > 0 && len(hot) > 0 {
+		return entriesToWire(hot)
+	}
+	if len(hot) >= limit {
+		return entriesToWire(hot)
+	}
+
+	// 热层不足（未接线/被 LTRIM/TTL 过期/Redis 重启后只补了少数条目）：并入 PG 切片，
+	// 否则更早的历史在面板上不可达（"加载更早消息"永远取不到东西）。
+	pgWire := []map[string]any{}
+	if s.store.pgStore != nil {
+		if all, err := NewPostgresMessagesStore(s.store.pgStore.DB()).LoadMessages(ctx, agentID); err == nil {
+			pgWire = sliceMessagesWire(all, beforeSeq, afterSeq, limit)
+		}
+	}
+	if len(hot) == 0 {
+		return pgWire
+	}
+	merged := make(map[int]map[string]any, len(pgWire)+len(hot))
+	for _, w := range pgWire {
+		if seq, ok := w["seq"].(int); ok {
+			merged[seq] = w
+		}
+	}
+	for _, w := range entriesToWire(hot) {
+		if seq, ok := w["seq"].(int); ok {
+			merged[seq] = w // 热层优先
+		}
+	}
+	out := make([]map[string]any, 0, len(merged))
+	for seq, w := range merged {
+		if beforeSeq > 0 && seq >= beforeSeq {
+			continue // before 窗口只保留更早的
+		}
+		out = append(out, w)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i]["seq"].(int) < out[j]["seq"].(int) })
+	if len(out) > limit {
+		out = out[len(out)-limit:] // 两窗口都取"最近 limit 条"
+	}
+	return out
+}
+
+// sliceMessagesWire PG 全量切片（seq=下标）：after_seq 优先，再次 before_seq，缺省取尾部。
+func sliceMessagesWire(msgs []ReactMessage, beforeSeq, afterSeq, limit int) []map[string]any {
+	start, end := 0, len(msgs)
+	switch {
+	case afterSeq > 0:
+		start = afterSeq + 1
+		if start > len(msgs) {
+			start = len(msgs)
+		}
+		if start+limit < end {
+			end = start + limit
+		}
+	case beforeSeq > 0:
+		end = beforeSeq
+		if end > len(msgs) {
+			end = len(msgs)
+		}
+		start = end - limit
+		if start < 0 {
+			start = 0
+		}
+	default:
+		start = len(msgs) - limit
+		if start < 0 {
+			start = 0
+		}
+	}
+	out := make([]map[string]any, 0, end-start)
+	for i := start; i < end; i++ {
+		out = append(out, reactMessageWire(i, msgs[i]))
+	}
+	return out
+}
+
+// reactMessageWire 单条 ReactMessage 转线型（PG 路径无 at 时间戳，省略该键）。
+func reactMessageWire(seq int, m ReactMessage) map[string]any {
+	w := map[string]any{
+		"seq":     seq,
+		"role":    m.Role,
+		"content": m.Content,
+	}
+	if m.ToolCallID != "" {
+		w["tool_call_id"] = m.ToolCallID
+	}
+	if len(m.ToolCalls) > 0 {
+		w["tool_calls"] = m.ToolCalls
+	}
+	if m.ReasoningContent != "" {
+		w["reasoning"] = m.ReasoningContent
+	}
+	return w
+}
+
+// entriesToWire 热层条目转线型：tool_calls JSON 反序列化为数组（非法 JSON 降级省略）。
+func entriesToWire(entries []store.AgentMsgEntry) []map[string]any {
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		w := map[string]any{
+			"seq":     e.Seq,
+			"at":      e.At,
+			"role":    e.Role,
+			"content": e.Content,
+		}
+		if e.ToolCallID != "" {
+			w["tool_call_id"] = e.ToolCallID
+		}
+		if e.ToolCalls != "" {
+			var calls []any
+			if json.Unmarshal([]byte(e.ToolCalls), &calls) == nil {
+				w["tool_calls"] = calls
+			}
+		}
+		if e.Reasoning != "" {
+			w["reasoning"] = e.Reasoning
+		}
+		out = append(out, w)
+	}
+	return out
 }

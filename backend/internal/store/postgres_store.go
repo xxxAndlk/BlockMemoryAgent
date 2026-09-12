@@ -298,6 +298,12 @@ func (s *PostgresStore) SaveSessionHistory(ctx context.Context, rec *SessionHist
 	return s.Session.SaveHistory(ctx, rec)
 }
 
+// UpdateSessionWorkDir 只更新会话工作目录；委托给 SessionStore.UpdateWorkDir。
+// 返回是否命中行（false=该会话尚未落过库，调用方回退 SaveSessionHistory 补插入）。
+func (s *PostgresStore) UpdateSessionWorkDir(ctx context.Context, sessionID, workDir string) (bool, error) {
+	return s.Session.UpdateWorkDir(ctx, sessionID, workDir)
+}
+
 // SaveSessionEvents 批量持久化会话事件；委托给 SessionStore.SaveEvents。
 func (s *PostgresStore) SaveSessionEvents(ctx context.Context, sessionID string, events []SessionEventRecord) error {
 	return s.Session.SaveEvents(ctx, sessionID, events)

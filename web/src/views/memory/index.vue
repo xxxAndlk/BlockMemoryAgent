@@ -10,6 +10,7 @@ import {
   type LearnedSkill,
   type EvolutionLogEntry,
 } from '@/api/learned'
+import { normDir } from '@/utils/dir'
 
 const sessions = ref<Session[]>([])
 const skills = ref<LearnedSkill[]>([])
@@ -39,7 +40,14 @@ const sessionDir = computed(() => {
 })
 
 const projectOptions = computed(() => {
-  const dirs = Array.from(new Set(sessions.value.map((s) => s.work_dir || ''))).sort()
+  // 归一化去重：同一目录的不同写法（尾斜杠/盘符大小写）合成一个选项。
+  const seen = new Map<string, string>()
+  for (const s of sessions.value) {
+    const d = s.work_dir || ''
+    const k = normDir(d)
+    if (!seen.has(k)) seen.set(k, d)
+  }
+  const dirs = [...seen.values()].sort()
   return [{ value: '', label: '全部项目' }, ...dirs.map((d) => ({ value: d, label: d || '默认目录' }))]
 })
 
@@ -47,7 +55,8 @@ const projectOptions = computed(() => {
 function inProject(sourceSession?: string) {
   if (!project.value) return true
   if (!sourceSession) return false
-  return sessionDir.value.get(sourceSession) === project.value
+  // 按规范化路径归属：会话目录可改，写法差异不该让历史条目"消失"。
+  return normDir(sessionDir.value.get(sourceSession)) === normDir(project.value)
 }
 
 const filteredEntries = computed(() =>

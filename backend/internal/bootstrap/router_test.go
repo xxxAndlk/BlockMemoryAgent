@@ -49,6 +49,9 @@ func (mockAgentForRouter) Tree(context.Context, string) ([]orchestrator.Node, er
 }
 func (mockAgentForRouter) CancelAgent(context.Context, string, string) error { return nil }
 func (mockAgentForRouter) PauseAgent(context.Context, string, string) error  { return nil }
+func (mockAgentForRouter) MessageAgent(context.Context, string, string, string) error {
+	return nil
+}
 func (mockAgentForRouter) Board(context.Context, string) (*board.Snapshot, error) {
 	return nil, nil
 }

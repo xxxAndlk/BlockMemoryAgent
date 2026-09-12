@@ -41,7 +41,7 @@ export interface Turn {
   /** 合成最终答复：运行中会话的新用户消息接替当前回合时，收编接替时刻的流式汇报文本
    *  （流式文本只存于 SSE live 帧，不落事件；不收编则上一回合的答复内容丢失）。 */
   finalText?: string
-  status: 'running' | 'completed' | 'error' | 'awaiting_clarify'
+  status: 'running' | 'completed' | 'error' | 'awaiting_clarify' | 'cancelled'
   startedAt: string
   endedAt?: string
   tokens: { in: number; out: number }
@@ -104,21 +104,62 @@ function isLLMThinkEvent(ev: SessionEvent): boolean {
   return THINK_KINDS.has(ev.kind || '') || ev.type === 'progress'
 }
 
+/**
+ * 终结回合的 system 文案（agent=System）——漏一条就会让回合永远"处理中"假转圈
+ * （2026-09-11 实证：点"终止"后后端发了「会话已被用户取消」，前端不认，转圈不停）。
+ * 文案来源：`service_react.go` 的 pauseMessage / cancel / 墙钟强杀 / 软停止销毁。
+ */
+const TERMINAL_SYSTEM_MESSAGES = [
+  '已暂停', // pauseMessage（token/轮数触顶）
+  '会话暂停',
+  '任务已停止', // 软停止（可续跑）
+  '会话已被用户取消', // 硬取消：用户点"终止"
+  '已强制终止', // 会话超全局时限
+  '任务已销毁', // 软停止倒计时到期
+]
+
+/** 用户主动终止（"终止"按钮）：回合终态是"已终止"而非"失败"。 */
+export function isUserCancel(ev: SessionEvent): boolean {
+  return ev.type === 'system' && ev.agent === 'System' && (ev.message || '').includes('用户取消')
+}
+
 export function isCompletion(ev: SessionEvent): boolean {
   // 当前合同：后端会话完成只发 type=agent_done + agent=MetaAgent（消息即最终答复正文，无前缀）。
   // 旧合同（system + "会话完成:"前缀）已无发送方，保留兼容历史库重放事件。
   if (ev.type === 'agent_done' && ev.agent === 'MetaAgent') return true
-  // 暂停事件（agent=System，"已暂停/会话暂停/任务已停止"）：终结回合，
-  // 否则暂停后回合永远显示"处理中"假转圈。暂停文案见后端 pauseMessage。
   if (ev.type === 'system' && ev.agent === 'System') {
     const msg = ev.message || ''
-    if (msg.includes('已暂停') || msg.includes('会话暂停') || msg.startsWith('任务已停止')) return true
+    return TERMINAL_SYSTEM_MESSAGES.some((m) => msg.includes(m))
   }
   return (
     ev.type === 'system' &&
     ev.agent === 'MetaAgent' &&
     (ev.message?.startsWith('会话完成') || ev.message?.startsWith('执行失败'))
   )
+}
+
+/**
+ * 按会话终态兜底收口最后一个回合。
+ *
+ * 分组只认事件流里的终结事件；但会话可能因**事件流里没有对应文案**的路径停下
+ * （服务重启中断、异常退出等）——此时 session 已是终态而回合仍停在 'running'，
+ * 表现为永久"处理中 + 正在生成回答…"假转圈。会话状态是权威的兜底信号：
+ * 只要会话不在运行/待澄清，就不该有任何回合处于 'running'。
+ */
+export function settleTurnsBySessionStatus(
+  turns: Turn[],
+  sessionStatus: string | undefined,
+): Turn[] {
+  if (!sessionStatus) return turns
+  if (sessionStatus === 'running' || sessionStatus === 'awaiting_clarify') return turns
+  for (let i = turns.length - 1; i >= 0; i--) {
+    // 'awaiting_clarify' 一并收口：会话已终态就不该还挂着待澄清卡（终止发生在提问期间
+    // 时，卡片会带着可点选项留着，点了只会报错——会话已经不接受了）。
+    if (turns[i].status === 'running' || turns[i].status === 'awaiting_clarify') {
+      turns[i].status = sessionStatus === 'error' ? 'cancelled' : 'completed'
+    }
+  }
+  return turns
 }
 
 export function isFailedCompletion(ev: SessionEvent): boolean {
@@ -146,7 +187,12 @@ export function finalizeTurn(turn: Turn, finalEvent?: SessionEvent): Turn {
   // 必须原地修改：调用方把 turn 引用存进了 turns[]，返回扩散副本会丢掉完成状态
   //（实证 2026-09-11：agent_done 落事件流但对话栏回合永久"处理中"、最终交付不渲染）。
   turn.finalAnswer = finalEvent
-  turn.status = isFailedCompletion(finalEvent) ? 'error' : 'completed'
+  // 用户主动终止单列一档：这是预期内的中止，不该和"失败"共用红标与文案。
+  turn.status = isUserCancel(finalEvent)
+    ? 'cancelled'
+    : isFailedCompletion(finalEvent)
+      ? 'error'
+      : 'completed'
   turn.endedAt = finalEvent.timestamp
   return turn
 }

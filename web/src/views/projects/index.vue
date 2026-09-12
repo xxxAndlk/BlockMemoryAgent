@@ -7,6 +7,7 @@ import { listSessions } from '@/api/session'
 import { getProjectPreferences, saveProjectPreferences } from '@/api/preferences'
 import { useWorkDir } from '@/composables/useWorkDir'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
+import { normDir } from '@/utils/dir'
 
 const DEFAULT_DIR = '' // 空 work_dir = 后端默认目录
 const DIRS_KEY = 'bma:workdirs'
@@ -41,14 +42,17 @@ const groups = computed<DirGroup[]>(() => {
   const map = new Map<string, DirGroup>()
   for (const s of sessions.value) {
     const dir = s.work_dir || DEFAULT_DIR
-    const g = map.get(dir) || { dir, total: 0, running: 0, lastActive: '' }
+    // 归一化键：会话目录现在可改、且多会话可共用，`C:\a` 与 `c:\a\` 必须落同一张卡。
+    const key = normDir(dir)
+    const g = map.get(key) || { dir, total: 0, running: 0, lastActive: '' }
     g.total++
     if (s.status === 'running') g.running++
     if (s.started_at && s.started_at > g.lastActive) g.lastActive = s.started_at
-    map.set(dir, g)
+    map.set(key, g)
   }
   for (const d of customDirs.value) {
-    if (!map.has(d)) map.set(d, { dir: d, total: 0, running: 0, lastActive: '' })
+    const key = normDir(d)
+    if (!map.has(key)) map.set(key, { dir: d, total: 0, running: 0, lastActive: '' })
   }
   return [...map.values()].sort((a, b) => b.lastActive.localeCompare(a.lastActive))
 })
@@ -71,7 +75,8 @@ async function load() {
 function addDir() {
   const d = newDir.value.trim()
   if (!d) return
-  if (!customDirs.value.includes(d)) {
+  // 归一化去重：与已有手工目录/会话目录同址时不重复入表（否则分组会出现两张同址卡）。
+  if (!customDirs.value.some((x) => normDir(x) === normDir(d))) {
     customDirs.value = [...customDirs.value, d]
     localStorage.setItem(DIRS_KEY, JSON.stringify(customDirs.value))
   }
@@ -80,7 +85,7 @@ function addDir() {
 }
 
 function removeCustomDir(dir: string) {
-  customDirs.value = customDirs.value.filter((d) => d !== dir)
+  customDirs.value = customDirs.value.filter((d) => normDir(d) !== normDir(dir))
   localStorage.setItem(DIRS_KEY, JSON.stringify(customDirs.value))
   if (selected.value === dir) selected.value = DEFAULT_DIR
 }
@@ -146,7 +151,7 @@ function fmtTime(iso: string) {
         <div class="font-bold text-sm mb-1">工作目录</div>
         <p class="text-xs text-ink-2">按目录组织会话与项目偏好；新会话将以此目录作为 Agent 的工作根目录。</p>
         <div class="flex gap-2 mt-3">
-          <div class="flex-1"><WorkDirPicker v-model="newDir" /></div>
+          <div class="flex-1"><WorkDirPicker v-model="newDir" placeholder="选择要添加的目录" /></div>
           <el-button type="primary" :disabled="!newDir.trim()" @click="addDir">
             <el-icon class="mr-1"><FolderAdd /></el-icon>添加目录
           </el-button>
@@ -178,7 +183,7 @@ function fmtTime(iso: string) {
             </el-button>
             <el-button size="small" plain @click.stop="viewSessions(g.dir)">查看会话</el-button>
             <el-button
-              v-if="customDirs.includes(g.dir) && !g.total"
+              v-if="customDirs.some((x) => normDir(x) === normDir(g.dir)) && !g.total"
               size="small" plain type="danger"
               @click.stop="removeCustomDir(g.dir)"
             >移除</el-button>

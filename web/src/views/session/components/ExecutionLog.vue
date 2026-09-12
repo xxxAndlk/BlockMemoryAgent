@@ -6,6 +6,8 @@ import { kindTagType, agentTextColor, fmtTime, hasDetail } from '@/views/session
 
 const props = defineProps<{
   events: SessionEvent[]
+  /** 锁定过滤为该 Agent 名（选中 Agent 的监控态）：有值时下拉替换为徽标不可改 */
+  forceAgent?: string
 }>()
 
 const filterAgent = ref('all')
@@ -19,7 +21,10 @@ const kinds = computed(() => ['all', ...Array.from(new Set(props.events.map(e =>
 
 const filtered = computed(() => {
   return props.events.filter(ev => {
-    if (filterAgent.value !== 'all' && ev.agent !== filterAgent.value) return false
+    // forceAgent 锁定优先于本地下拉（选中 Agent 的监控只看该 Agent）
+    if (props.forceAgent) {
+      if (ev.agent !== props.forceAgent) return false
+    } else if (filterAgent.value !== 'all' && ev.agent !== filterAgent.value) return false
     if (filterKind.value !== 'all' && (ev.kind || ev.type) !== filterKind.value) return false
     const q = searchLog.value.trim().toLowerCase()
     if (q && !ev.message.toLowerCase().includes(q)) return false
@@ -63,7 +68,10 @@ const progressStatus = computed(() => {
     <div class="p-3 border-b border-line flex items-center gap-4 text-xs shrink-0">
       <div class="flex items-center gap-2">
         <span class="text-ink-2">Agent:</span>
-        <el-select v-model="filterAgent" size="small" class="w-32 !bg-transparent filter-select">
+        <span v-if="forceAgent" class="px-2 py-1 rounded bg-primary-soft text-primary font-bold shrink-0">
+          当前 Agent：{{ forceAgent }}
+        </span>
+        <el-select v-else v-model="filterAgent" size="small" class="w-32 !bg-transparent filter-select">
           <el-option v-for="a in agents" :key="a" :label="a === 'all' ? 'All' : a" :value="a" />
         </el-select>
       </div>

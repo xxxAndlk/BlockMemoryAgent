@@ -127,3 +127,8 @@ export function getAgentEvents(id: string, agentId: string, limit = 200, offset 
 export function pauseSessionAgent(id: string, agentId: string): Promise<{ session_id: string; agent_id: string; status: string }> {
   return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(agentId)}/pause`, { method: 'POST' })
 }
+
+/** 终止指定子 Agent 实例（硬取消，不可恢复；编排页节点卡/面板的 ⏹ 动作）。 */
+export function cancelSessionAgent(id: string, agentId: string): Promise<{ session_id: string; agent_id: string; status: string }> {
+  return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(agentId)}/cancel`, { method: 'POST' })
+}

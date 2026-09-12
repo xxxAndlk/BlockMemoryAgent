@@ -17,6 +17,26 @@ import (
 
 // HandleCreateSession 处理 POST /api/sessions。
 // 职责：解析目标文本，调用 Agent 创建会话，返回会话快照。
+// workDirAbs 校验并规范化 work_dir 参数（创建会话 / 修改会话目录 / 项目偏好三个入口
+// 共用同一规则，避免三份副本各自漂移）：空串返回 ("", true)，语义为"回落进程默认目录"；
+// 非空转绝对路径，不存在或非目录时写 400 响应并返回 ok=false。
+func workDirAbs(c *gin.Context, dir string) (string, bool) {
+	if dir == "" {
+		return "", true
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		c.String(http.StatusBadRequest, "work_dir 无效")
+		return "", false
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		c.String(http.StatusBadRequest, "work_dir 不存在或不是目录")
+		return "", false
+	}
+	return abs, true
+}
+
 func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	// 解析请求体：goal 必填；images 可选（首条消息粘贴/上传的图片，与 /message 同规则限流）；
 	// videos 可选（首条消息粘贴的视频文件路径，服务端抽帧后走图片链路）；
@@ -36,19 +56,11 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		return
 	}
 	// work_dir 校验：转绝对路径，不存在或非目录直接 400（在到达 agent 前拦截）。
-	if req.WorkDir != "" {
-		abs, err := filepath.Abs(req.WorkDir)
-		if err != nil {
-			c.String(http.StatusBadRequest, "work_dir 无效")
-			return
-		}
-		info, err := os.Stat(abs)
-		if err != nil || !info.IsDir() {
-			c.String(http.StatusBadRequest, "work_dir 不存在或不是目录")
-			return
-		}
-		req.WorkDir = abs
+	abs, ok := workDirAbs(c, req.WorkDir)
+	if !ok {
+		return
 	}
+	req.WorkDir = abs
 	// 用户图片限流（与 /message、TUI 粘贴侧同规则）：超限直接 400。
 	images, err := agent.ParseWireImages(req.Images)
 	if err != nil {
@@ -479,6 +491,87 @@ func (m *SessionManager) HandleSessionAgentEvents(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, res.Data)
+}
+
+// HandleSessionAgentMessages 处理 GET /api/sessions/{id}/agents/{aid}/messages（编排页对话视图）。
+// 返回该实例完整消息历史（热层+PG 合并分页）与 mailbox 留痕；aid=meta 映射为会话主 Agent。
+func (m *SessionManager) HandleSessionAgentMessages(c *gin.Context) {
+	id := c.Param("id")
+	instID := c.Param("aid")
+	if instID == "" {
+		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
+		return
+	}
+	beforeSeq, _ := strconv.Atoi(c.Query("before_seq"))
+	afterSeq, _ := strconv.Atoi(c.Query("after_seq"))
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{
+		Kind: agent.QueryKindAgentMessages,
+		Args: map[string]any{"agent": instID, "before_seq": beforeSeq, "after_seq": afterSeq, "limit": limit},
+	})
+	if err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, res.Data)
+}
+
+// HandleSessionAgentMessage 处理 POST /api/sessions/{id}/agents/{aid}/message（编排页用户直连）。
+// 状态机路由在 ReactService.MessageAgent：等子返回→注入唤醒；终态→复活重跑；
+// 执行中→409（前端禁用发送）；Paused/Idle/meta→409。
+func (m *SessionManager) HandleSessionAgentMessage(c *gin.Context) {
+	id := c.Param("id")
+	instID := c.Param("aid")
+	if instID == "" {
+		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
+		return
+	}
+	body, err := DecodeBody[struct {
+		Content string `json:"content"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体解析失败")
+		return
+	}
+	if err := m.agent.MessageAgent(c.Request.Context(), id, instID, body.Content); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// HandleSessionWorkDir 处理 POST /api/sessions/{id}/workdir（每会话工作目录修改）。
+// body {"work_dir": "D:\\proj"}：显式传空串 = 清除本会话目录、回落进程默认目录；
+// 未传字段（nil）= 参数错（避免"忘记传"被当成清空）。落库即时保存，下一回合生效
+// （正在执行的工具调用已按旧目录解析，产物不迁移）。
+func (m *SessionManager) HandleSessionWorkDir(c *gin.Context) {
+	id := c.Param("id")
+	req, err := DecodeBody[struct {
+		WorkDir *string `json:"work_dir"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	if req.WorkDir == nil {
+		c.String(http.StatusBadRequest, "缺少 work_dir 字段")
+		return
+	}
+	abs, ok := workDirAbs(c, *req.WorkDir)
+	if !ok {
+		return
+	}
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
+		Op:   agent.ControlOpWorkDir,
+		Args: map[string]any{"work_dir": abs},
+	}); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"session_id": id, "work_dir": abs})
 }
 
 // HandleSessionWorktrees 处理 GET /api/sessions/{id}/worktrees

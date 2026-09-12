@@ -14,7 +14,11 @@ import {
 } from '@/api/metrics'
 import type { Session } from '@/types'
 
-const props = defineProps<{ session: Session | null }>()
+const props = defineProps<{
+  session: Session | null
+  /** 选中 Agent 的 inst_id（node_id 口径一致）：有值时自动展开对应支路行的逐轮下钻 */
+  selectedNodeId?: string
+}>()
 
 const eff = ref<SessionEfficiency | null>(null)
 const loading = ref(false)
@@ -27,6 +31,7 @@ async function load() {
   loading.value = true
   try {
     eff.value = await getSessionEfficiency(props.session.id)
+    autoExpandSelected()
   } catch (e) {
     ElMessage.error(`加载效率指标失败: ${e instanceof Error ? e.message : e}`)
   } finally {
@@ -40,6 +45,17 @@ watch(() => props.session?.id, () => {
   branchEvents.value = []
   load()
 }, { immediate: true })
+
+/** 选中 Agent 变化/指标加载后：自动展开对应支路的下钻（已展开同一支路则不动）。 */
+function autoExpandSelected() {
+  const id = props.selectedNodeId
+  if (!id || !eff.value) return
+  if (expandedBranch.value?.node_id === id) return
+  const row = eff.value.branches?.find((b) => b.node_id === id)
+  if (row) void openBranch(row)
+}
+
+watch(() => props.selectedNodeId, autoExpandSelected)
 
 // 下钻：展开某支路的逐轮事件回放（tool_call/answer 按时间正序）。
 async function openBranch(row: EfficiencyBranch) {

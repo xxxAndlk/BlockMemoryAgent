@@ -35,6 +35,11 @@ type activityEvidence struct {
 	toolStartTS atomic.Int64
 	// toolName 在飞工具名（并行派发时为最近一次 tool:<名> 证据，仅展示用）。
 	toolName atomic.Value // string
+	// waitingChildren 是否正处于 waitForChildren 阻塞等待（编排页"等待下级返回"标识，
+	// 兼作用户直连的发送闸门）。等子期间后代活动冒泡只续命（lastTS）不覆盖 lastKind，
+	// 否则 child_wait 展示态会被 descendant 冒泡秒刷掉（实证：子 Agent 流式期间
+	// child_wait 占空比≈0，前端恒显"执行中"、直连恒 409）；Agent 自身恢复活动即清除。
+	waitingChildren atomic.Bool
 }
 
 // newEvidence 创建并初始化一条活动证据（lastTS=now，kind=created）。
@@ -74,9 +79,23 @@ func (e *activityEvidence) report(kind string, now int64) {
 }
 
 // stamp 刷新 lastTS 与 lastKind。
+// 例外：等子展示态（waitingChildren）期间的后代冒泡只续命不换 kind——等子存活性仍由
+// lastTS 保证（不误杀），展示面与发送闸门则稳定停在 child_wait，直到 Agent 自身恢复活动
+// （llm_start/tool 等非 descendant kind 到达）清除该态。
 func (e *activityEvidence) stamp(kind string, now int64) {
 	e.lastTS.Store(now)
+	if kind == "descendant" && e.waitingChildren.Load() {
+		return
+	}
+	e.waitingChildren.Store(false)
 	e.lastKind.Store(kind)
+}
+
+// markChildWait 标记进入 waitForChildren 等待（编排页展示态，不刷新 lastTS：
+// 等子期间的存活判定仍由后代活动冒泡决定，展示态不续命、不掩盖"后代全灭"）。
+func (e *activityEvidence) markChildWait() {
+	e.lastKind.Store("child_wait")
+	e.waitingChildren.Store(true)
 }
 
 // beginAuxLLM 标记引擎辅助 LLM（judge/plan_execute）开始：在飞 LLM 豁免巡检

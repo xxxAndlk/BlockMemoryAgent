@@ -139,6 +139,9 @@ type ReActAgent struct {
 	// 主循环顶部与 waitForChildren 内调用 Park：会话挂起期间阻塞（goroutine 真挂起），
 	// 恢复返回 nil 继续。为 nil 时零变化（热驻关闭时不注入）。
 	suspendGate SuspendGate
+	// msgLogger 可选的消息热层记录器（编排页对话视图）：每条入史消息同步热写。
+	// nil 时零行为。
+	msgLogger MessageLogger
 }
 
 // PersonaInjector 把人格内容拼接到系统提示词之前；soul.Loader 实现该接口。
@@ -405,6 +408,21 @@ func (a *ReActAgent) WithSuspendGate(g SuspendGate) *ReActAgent {
 	return a
 }
 
+// WithMessageLogger 注入消息热层记录器（编排页对话视图数据源）。传 nil 关闭。
+func (a *ReActAgent) WithMessageLogger(l MessageLogger) *ReActAgent {
+	a.msgLogger = l
+	return a
+}
+
+// appendLogged 追加一条消息到 history 并同步热写消息日志（编排页对话视图）。
+// seq = 追加前 history 长度，与 agent_messages 全量落库的下标口径一致。
+func (a *ReActAgent) appendLogged(history []ReactMessage, msg ReactMessage) []ReactMessage {
+	if a.msgLogger != nil {
+		a.msgLogger.Log(a.name, len(history), msg)
+	}
+	return append(history, msg)
+}
+
 // touchActivity 按语义化 kind 上报一次活动（TODO 第10项②证据化）；
 // 未注入回调时为空操作。kind 约定：llm_start/llm_end/tool:<名>/tool_end/stream/keepalive。
 func (a *ReActAgent) touchActivity(kind string) {
@@ -531,7 +549,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	if imgs := UserImagesFromContext(ctx); len(imgs) > 0 {
 		userMsg.Images = imgs
 	}
-	history = append(history, userMsg)
+	history = a.appendLogged(history, userMsg)
 
 	// 根据当前角色构建系统提示词，作为模型行为约束。
 	system := a.systemPrompt()
@@ -640,9 +658,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// 附带文本时保留 assistant 消息（模型据此知道自己尝试过什么），
 			// 无文本则与空响应保护同理不写入历史（空 content 块可能被 API 拒绝）。
 			if strings.TrimSpace(assistant.Content) != "" {
-				history = append(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
+				history = a.appendLogged(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
 			}
-			history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(badToolCallNudge, strings.Join(droppedToolCalls, "；"))})
+			history = a.appendLogged(history, ReactMessage{Role: "user", Content: fmt.Sprintf(badToolCallNudge, strings.Join(droppedToolCalls, "；"))})
 			continue
 		}
 		badToolCallStreak = 0
@@ -658,7 +676,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			}
 			// 空 assistant 消息不写入历史（空 content 块可能被 API 拒绝），
 			// 仅以一条提示消息要求模型继续。
-			history = append(history, ReactMessage{Role: "user", Content: emptyResponseNudge})
+			history = a.appendLogged(history, ReactMessage{Role: "user", Content: emptyResponseNudge})
 			continue
 		}
 		emptyStreak = 0
@@ -667,7 +685,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 完整入参仅用于本次派发执行；历史/持久化/续跑只保留截断副本。
 		// 否则大文件内容在滑动窗口内逐轮重发，单轮 input 即可耗尽整份 token 预算
 		// （实证：塔防 domain 续跑首轮即再触限，pause/resume 零进展死锁）。
-		history = append(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
+		history = a.appendLogged(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
 
 		// 如果助手消息中没有任何工具调用，说明本轮已产生最终答案。
 		if len(assistant.ToolCalls) == 0 {
@@ -794,7 +812,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// tool_result 必须引用对应的 tool_use id，否则下一轮请求会被 API 拒绝。
 			// Images 仅内存透传（ui_preview 截图等 image_passthrough 插件），
 			// 挂载边界由 ToBladesMessages 控制（仅最新一批）。
-			history = append(history, ReactMessage{
+			history = a.appendLogged(history, ReactMessage{
 				Role:       "tool",
 				Content:    ToolResultJSON(result),
 				ToolCallID: tc.ID,
@@ -879,10 +897,10 @@ func (a *ReActAgent) stagnationGuard(streak int, calls []ToolCall, mailboxDraine
 	case streak >= stagnationExitRounds && a.role.ID != "meta":
 		return history, streak, fmt.Errorf("%w: 连续 %d 轮无任何产出性动作（未写文件/未派发/未收发消息/未终答），判定停滞强制终止。已有部分产出已保留，可缩小任务范围后重派", tool.ErrLoopExit, streak)
 	case streak == stagnationFinalWarnRounds:
-		history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
+		history = a.appendLogged(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
 			"【停滞最终警告】已连续 %d 轮没有任何产出（未写文件/未派发/未收发消息/未终答）。换个策略推进：若当前路径走不通，改变方法或上报阻塞（ask_user/send_message 说明卡点）；确认确实无进展再收敛输出终答。", streak)})
 	case streak == stagnationWarnRounds:
-		history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
+		history = a.appendLogged(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
 			"【停滞预警】已连续 %d 轮没有任何产出性动作（仅只读探查/验证）。若证据已足够，直接基于已有信息推进下一步（写文件/派发/终答）；若仍缺信息，换一个检索角度或换策略，不要重复同一探查。", streak)})
 	}
 	return history, streak, nil
@@ -1505,6 +1523,9 @@ func bladesText(m *blades.Message) string {
 // 返回 paused=true，调用方应以 PausedOnChild 结束并让上层置会话暂停态。
 func (a *ReActAgent) waitForChildren(ctx context.Context, history []ReactMessage) ([]ReactMessage, bool) {
 	for a.pendingChecker.PendingChildren(a.name) > 0 {
+		// 展示态上报（编排页"等待下级返回"标识）：dispatcher 侧特判只换 lastKind，
+		// 不刷 lastTS、不冒泡，等子存活性仍由后代活动冒泡决定。
+		a.touchActivity("child_wait")
 		// 会话级挂起检查点（热驻模式）：domain 等叶子期间的挂起点，
 		// 恢复返回 nil 继续等待子 Agent。
 		if a.suspendGate != nil {
@@ -1822,7 +1843,7 @@ func (a *ReActAgent) drainMailbox(history []ReactMessage) ([]ReactMessage, int) 
 	}
 	for _, m := range msgs {
 		// 将 mailbox 消息转为模型可见的 user 角色消息并加入历史。
-		history = append(history, mailboxMessageToReact(m))
+		history = a.appendLogged(history, mailboxMessageToReact(m))
 
 		// 实时推送子 Agent 完成事件，UI 可据此更新"等待子 Agent"状态。
 		a.emitLive(LiveEvent{Kind: LiveEventSubAgentDone, Tool: m.From, Text: truncateRunes(m.Body, 200)})

@@ -1,0 +1,1637 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index bd9d330..8fa0685 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -41,6 +41,14 @@ Key rules: `pkg/*` must not import `internal/*`; infrastructure must not import
+ - Integration tests under `test/` (separate module): `test/api/*`, `test/coding/*` (e2e via mock LLM), `test/tui/*`, `test/fixtures/*`. Fixtures use `docker/docker-compose.test.yml` (isolated ports PG 55432 / Redis 56380) — never point tests at the dev instance (5432/6380, VECTOR(1024)). Test containers are shared and left running; each test gets its own PG database + Redis logical DB (do not add compose `down` to fixture setup/cleanup — parallel packages share the containers).
+ - Eval suite under `test/eval/` (build tag `eval`, real LLM, costs API credits): scenario YAMLs + deterministic checkpoint judges + metrics, reports to `test/eval/runs/<ts>/report.{json,md}`. Dry-run: `cd test && EVAL_DRY_RUN=1 GOTOOLCHAIN=local go test -tags=eval ./eval/ -run TestEval -v`. Knobs: `EVAL_FILTER`, `EVAL_RUNS`, `JUDGE_*` for llm_judge checks.
+ 
++## Agent 编排页
++
++会话页第三个主视图 `?view=orch`（选中态 `?agent=<inst_id>`，可分享/刷新恢复）：左树图（自绘 SVG tidy 布局，零图库）+ 右单 Agent 对话面板。设计/计划：`docs/superpowers/specs/2026-09-11-agent-orch-board-design.md` + `docs/superpowers/plans/2026-09-11-agent-orch-board.md`。
++
++- 新端点：`GET /api/sessions/{id}/agents/{aid}/messages?before_seq&after_seq&limit`（完整消息历史 + mailbox 留痕）、`POST /api/sessions/{id}/agents/{aid}/message`（用户直连）。
++- 用户直连状态机（`ReactService.MessageAgent` → `subagent.Dispatcher`）：`running + activity_kind=child_wait` 经 `InjectUserMessage` 投邮件并 poke 唤醒；终态（done/failed/cancelled/delivered-unverified）经 `Tree.Reopen` + `ReviveWithMessage` 同 ID 重跑（种子=原任务+上轮结果+用户消息，父收「复活返工」通知）；`running` 其他 → 409 `ErrAgentBusy`；paused/idle/meta/未接线 → 409 `ErrAgentNotDirectable`。
++- 观测写入一律 best-effort：消息逐条热写 Redis（`sess:{sid}:agent:{aid}:msgs`，TTL 24h、cap 500）+ 子 Agent 终态全量落 PG `agent_messages`；mailbox 发送留痕双写 `agent_events`（type=mailbox）；`child_wait` 是纯展示态活动 kind（只换 lastKind，不刷 lastTS、不冒泡）。Redis 不可用时写侧跳过、读侧回退 PG，端点不报错。
++
+ ## History
+ 
+ Codebase migrated from CloudWeGo Eino to go-kratos Blades (pre-v3 Eino docs no longer in tree).
+diff --git a/backend/internal/agent/agent.go b/backend/internal/agent/agent.go
+index d258e25..4a663b9 100644
+--- a/backend/internal/agent/agent.go
++++ b/backend/internal/agent/agent.go
+@@ -81,6 +81,11 @@ type Agent interface {
+ 	// （SaveMessages + tree.Pause），热驻槽 parked 可 ResumePaused 续跑。
+ 	PauseAgent(ctx context.Context, sessionID, instID string) error
+ 
++	// MessageAgent 用户直连子 Agent（编排页对话面板发送框）。
++	// 状态机：等子返回→注入唤醒；终态→复活重跑；执行中→ErrAgentBusy；
++	// Paused/Idle/meta→ErrInvalidSessionState。
++	MessageAgent(ctx context.Context, sessionID, instID, content string) error
++
+ 	// Board 返回会话任务看板快照（TODO #22 执行计划面板真相源）。
+ 	// 未接线或会话无看板时返回 (nil, nil)，调用方回退旧树合成。
+ 	Board(ctx context.Context, sessionID string) (*board.Snapshot, error)
+diff --git a/backend/internal/agent/errors.go b/backend/internal/agent/errors.go
+index 3cbbb6b..db0c84e 100644
+--- a/backend/internal/agent/errors.go
++++ b/backend/internal/agent/errors.go
+@@ -3,7 +3,10 @@
+ package agent
+ 
+ // import 标准库的 errors 包，用于创建预定义的哨兵错误。
+-import "errors"
++import (
++	"errors"
++	"fmt"
++)
+ 
+ // 该 var 块集中声明 agent 模块对外暴露的预定义错误。
+ // 这些错误可在调用方通过 errors.Is 进行精确匹配，便于统一错误处理。
+@@ -25,4 +28,15 @@ var (
+ 
+ 	// ErrAgentNotFound 表示按实例 ID 查找的 Agent 节点不存在或已终结，无法取消。
+ 	ErrAgentNotFound = errors.New("agent: agent not found")
++
++	// ErrAgentBusy 表示目标 Agent 正在执行任务（非等子返回态），不接受用户直连消息。
++	// 前端据此禁用发送框并引导先中断/终止（编排页对话面板三态发送）。
++	ErrAgentBusy = errors.New("agent 正在执行任务")
++
++	// ErrAgentNotDirectable 表示编排页用户直连的目标不在可直连状态：
++	// Paused（走监控页恢复）/ Idle（热驻待复用，经主 Agent 派发）/ meta（走主对话页）
++	// / 直连通道未接线。是 ErrInvalidSessionState 的细化（errors.Is 仍可匹配父错误），
++	// HTTP 层映射 409 冲突而非 400 参数错——前端据此提示"该状态不可直连"。
++	ErrAgentNotDirectable = fmt.Errorf("%w: 该状态不可直连", ErrInvalidSessionState)
++
+ )
+diff --git a/backend/internal/agent/query_react.go b/backend/internal/agent/query_react.go
+index 62ac9db..23a2a57 100644
+--- a/backend/internal/agent/query_react.go
++++ b/backend/internal/agent/query_react.go
+@@ -17,6 +17,8 @@ package agent
+ 
+ import (
+ 	"context"
++	"encoding/json"
++	"log"
+ 	"sort"
+ 	"strings"
+ 	"time"
+@@ -433,3 +435,136 @@ func (s *ReactService) agentEventsQueryResult(ctx context.Context, sessionID, ag
+ 		"events":     events,
+ 	}}
+ }
++
++// agentMessagesQueryResult 编排页 Agent 对话视图数据源：Redis 热层优先（运行中最新），
++// miss/不足回退 PG agent_messages 全量切片；附 mailbox 留痕（type=mailbox 事件，双方各一行）。
++// agentID 传 "meta" 或空时映射为 sessionID（MetaAgent agentID==sessionID）。
++func (s *ReactService) agentMessagesQueryResult(ctx context.Context, sessionID, agentID string, beforeSeq, afterSeq, limit int) Result {
++	if agentID == "" || agentID == "meta" {
++		agentID = sessionID
++	}
++	if limit <= 0 || limit > 200 {
++		limit = 100
++	}
++	mails := []map[string]any{}
++	if s.store.pgStore != nil {
++		if rows, err := s.store.pgStore.QueryAgentMailboxTrace(ctx, sessionID, agentID, 100); err == nil {
++			mails = rows
++		}
++	}
++	return Result{Data: map[string]any{
++		"session_id": sessionID,
++		"agent_id":   agentID,
++		"messages":   s.readAgentMessages(ctx, agentID, beforeSeq, afterSeq, limit),
++		"mails":      mails,
++	}}
++}
++
++// readAgentMessages 热层优先读消息窗口；热层空（miss/过期/未接线）回退 PG 全量切片。
++func (s *ReactService) readAgentMessages(ctx context.Context, agentID string, beforeSeq, afterSeq, limit int) []map[string]any {
++	if s.agentMsgCache != nil {
++		var entries []store.AgentMsgEntry
++		var err error
++		switch {
++		case afterSeq > 0:
++			entries, err = s.agentMsgCache.AfterMsg(ctx, agentID, afterSeq, limit)
++		case beforeSeq > 0:
++			entries, err = s.agentMsgCache.BeforeMsg(ctx, agentID, beforeSeq, limit)
++		default:
++			entries, err = s.agentMsgCache.TailMsg(ctx, agentID, limit)
++		}
++		if err != nil {
++			log.Printf("[query] agent msg hot-read failed, fallback PG: agent=%s err=%v", agentID, err)
++		} else if len(entries) > 0 {
++			return entriesToWire(entries)
++		}
++	}
++	if s.store.pgStore == nil {
++		return []map[string]any{}
++	}
++	all, err := NewPostgresMessagesStore(s.store.pgStore.DB()).LoadMessages(ctx, agentID)
++	if err != nil {
++		return []map[string]any{}
++	}
++	return sliceMessagesWire(all, beforeSeq, afterSeq, limit)
++}
++
++// sliceMessagesWire PG 全量切片（seq=下标）：after_seq 优先，再次 before_seq，缺省取尾部。
++func sliceMessagesWire(msgs []ReactMessage, beforeSeq, afterSeq, limit int) []map[string]any {
++	start, end := 0, len(msgs)
++	switch {
++	case afterSeq > 0:
++		start = afterSeq + 1
++		if start > len(msgs) {
++			start = len(msgs)
++		}
++		if start+limit < end {
++			end = start + limit
++		}
++	case beforeSeq > 0:
++		end = beforeSeq
++		if end > len(msgs) {
++			end = len(msgs)
++		}
++		start = end - limit
++		if start < 0 {
++			start = 0
++		}
++	default:
++		start = len(msgs) - limit
++		if start < 0 {
++			start = 0
++		}
++	}
++	out := make([]map[string]any, 0, end-start)
++	for i := start; i < end; i++ {
++		out = append(out, reactMessageWire(i, msgs[i]))
++	}
++	return out
++}
++
++// reactMessageWire 单条 ReactMessage 转线型（PG 路径无 at 时间戳，省略该键）。
++func reactMessageWire(seq int, m ReactMessage) map[string]any {
++	w := map[string]any{
++		"seq":     seq,
++		"role":    m.Role,
++		"content": m.Content,
++	}
++	if m.ToolCallID != "" {
++		w["tool_call_id"] = m.ToolCallID
++	}
++	if len(m.ToolCalls) > 0 {
++		w["tool_calls"] = m.ToolCalls
++	}
++	if m.ReasoningContent != "" {
++		w["reasoning"] = m.ReasoningContent
++	}
++	return w
++}
++
++// entriesToWire 热层条目转线型：tool_calls JSON 反序列化为数组（非法 JSON 降级省略）。
++func entriesToWire(entries []store.AgentMsgEntry) []map[string]any {
++	out := make([]map[string]any, 0, len(entries))
++	for _, e := range entries {
++		w := map[string]any{
++			"seq":     e.Seq,
++			"at":      e.At,
++			"role":    e.Role,
++			"content": e.Content,
++		}
++		if e.ToolCallID != "" {
++			w["tool_call_id"] = e.ToolCallID
++		}
++		if e.ToolCalls != "" {
++			var calls []any
++			if json.Unmarshal([]byte(e.ToolCalls), &calls) == nil {
++				w["tool_calls"] = calls
++			}
++		}
++		if e.Reasoning != "" {
++			w["reasoning"] = e.Reasoning
++		}
++		out = append(out, w)
++	}
++	return out
++}
+diff --git a/backend/internal/agent/react_agent.go b/backend/internal/agent/react_agent.go
+index cefdda3..a81a6a8 100644
+--- a/backend/internal/agent/react_agent.go
++++ b/backend/internal/agent/react_agent.go
+@@ -139,6 +139,9 @@ type ReActAgent struct {
+ 	// 主循环顶部与 waitForChildren 内调用 Park：会话挂起期间阻塞（goroutine 真挂起），
+ 	// 恢复返回 nil 继续。为 nil 时零变化（热驻关闭时不注入）。
+ 	suspendGate SuspendGate
++	// msgLogger 可选的消息热层记录器（编排页对话视图）：每条入史消息同步热写。
++	// nil 时零行为。
++	msgLogger MessageLogger
+ }
+ 
+ // PersonaInjector 把人格内容拼接到系统提示词之前；soul.Loader 实现该接口。
+@@ -405,6 +408,21 @@ func (a *ReActAgent) WithSuspendGate(g SuspendGate) *ReActAgent {
+ 	return a
+ }
+ 
++// WithMessageLogger 注入消息热层记录器（编排页对话视图数据源）。传 nil 关闭。
++func (a *ReActAgent) WithMessageLogger(l MessageLogger) *ReActAgent {
++	a.msgLogger = l
++	return a
++}
++
++// appendLogged 追加一条消息到 history 并同步热写消息日志（编排页对话视图）。
++// seq = 追加前 history 长度，与 agent_messages 全量落库的下标口径一致。
++func (a *ReActAgent) appendLogged(history []ReactMessage, msg ReactMessage) []ReactMessage {
++	if a.msgLogger != nil {
++		a.msgLogger.Log(a.name, len(history), msg)
++	}
++	return append(history, msg)
++}
++
+ // touchActivity 按语义化 kind 上报一次活动（TODO 第10项②证据化）；
+ // 未注入回调时为空操作。kind 约定：llm_start/llm_end/tool:<名>/tool_end/stream/keepalive。
+ func (a *ReActAgent) touchActivity(kind string) {
+@@ -531,7 +549,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
+ 	if imgs := UserImagesFromContext(ctx); len(imgs) > 0 {
+ 		userMsg.Images = imgs
+ 	}
+-	history = append(history, userMsg)
++	history = a.appendLogged(history, userMsg)
+ 
+ 	// 根据当前角色构建系统提示词，作为模型行为约束。
+ 	system := a.systemPrompt()
+@@ -640,9 +658,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
+ 			// 附带文本时保留 assistant 消息（模型据此知道自己尝试过什么），
+ 			// 无文本则与空响应保护同理不写入历史（空 content 块可能被 API 拒绝）。
+ 			if strings.TrimSpace(assistant.Content) != "" {
+-				history = append(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
++				history = a.appendLogged(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
+ 			}
+-			history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(badToolCallNudge, strings.Join(droppedToolCalls, "；"))})
++			history = a.appendLogged(history, ReactMessage{Role: "user", Content: fmt.Sprintf(badToolCallNudge, strings.Join(droppedToolCalls, "；"))})
+ 			continue
+ 		}
+ 		badToolCallStreak = 0
+@@ -658,7 +676,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
+ 			}
+ 			// 空 assistant 消息不写入历史（空 content 块可能被 API 拒绝），
+ 			// 仅以一条提示消息要求模型继续。
+-			history = append(history, ReactMessage{Role: "user", Content: emptyResponseNudge})
++			history = a.appendLogged(history, ReactMessage{Role: "user", Content: emptyResponseNudge})
+ 			continue
+ 		}
+ 		emptyStreak = 0
+@@ -667,7 +685,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
+ 		// 完整入参仅用于本次派发执行；历史/持久化/续跑只保留截断副本。
+ 		// 否则大文件内容在滑动窗口内逐轮重发，单轮 input 即可耗尽整份 token 预算
+ 		// （实证：塔防 domain 续跑首轮即再触限，pause/resume 零进展死锁）。
+-		history = append(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
++		history = a.appendLogged(history, truncateToolCallInputsForHistory(assistant, historyToolCallInputMaxRunes))
+ 
+ 		// 如果助手消息中没有任何工具调用，说明本轮已产生最终答案。
+ 		if len(assistant.ToolCalls) == 0 {
+@@ -794,7 +812,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
+ 			// tool_result 必须引用对应的 tool_use id，否则下一轮请求会被 API 拒绝。
+ 			// Images 仅内存透传（ui_preview 截图等 image_passthrough 插件），
+ 			// 挂载边界由 ToBladesMessages 控制（仅最新一批）。
+-			history = append(history, ReactMessage{
++			history = a.appendLogged(history, ReactMessage{
+ 				Role:       "tool",
+ 				Content:    ToolResultJSON(result),
+ 				ToolCallID: tc.ID,
+@@ -879,10 +897,10 @@ func (a *ReActAgent) stagnationGuard(streak int, calls []ToolCall, mailboxDraine
+ 	case streak >= stagnationExitRounds && a.role.ID != "meta":
+ 		return history, streak, fmt.Errorf("%w: 连续 %d 轮无任何产出性动作（未写文件/未派发/未收发消息/未终答），判定停滞强制终止。已有部分产出已保留，可缩小任务范围后重派", tool.ErrLoopExit, streak)
+ 	case streak == stagnationFinalWarnRounds:
+-		history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
++		history = a.appendLogged(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
+ 			"【停滞最终警告】已连续 %d 轮没有任何产出（未写文件/未派发/未收发消息/未终答）。换个策略推进：若当前路径走不通，改变方法或上报阻塞（ask_user/send_message 说明卡点）；确认确实无进展再收敛输出终答。", streak)})
+ 	case streak == stagnationWarnRounds:
+-		history = append(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
++		history = a.appendLogged(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
+ 			"【停滞预警】已连续 %d 轮没有任何产出性动作（仅只读探查/验证）。若证据已足够，直接基于已有信息推进下一步（写文件/派发/终答）；若仍缺信息，换一个检索角度或换策略，不要重复同一探查。", streak)})
+ 	}
+ 	return history, streak, nil
+@@ -1505,6 +1523,9 @@ func bladesText(m *blades.Message) string {
+ // 返回 paused=true，调用方应以 PausedOnChild 结束并让上层置会话暂停态。
+ func (a *ReActAgent) waitForChildren(ctx context.Context, history []ReactMessage) ([]ReactMessage, bool) {
+ 	for a.pendingChecker.PendingChildren(a.name) > 0 {
++		// 展示态上报（编排页"等待下级返回"标识）：dispatcher 侧特判只换 lastKind，
++		// 不刷 lastTS、不冒泡，等子存活性仍由后代活动冒泡决定。
++		a.touchActivity("child_wait")
+ 		// 会话级挂起检查点（热驻模式）：domain 等叶子期间的挂起点，
+ 		// 恢复返回 nil 继续等待子 Agent。
+ 		if a.suspendGate != nil {
+@@ -1822,7 +1843,7 @@ func (a *ReActAgent) drainMailbox(history []ReactMessage) ([]ReactMessage, int)
+ 	}
+ 	for _, m := range msgs {
+ 		// 将 mailbox 消息转为模型可见的 user 角色消息并加入历史。
+-		history = append(history, mailboxMessageToReact(m))
++		history = a.appendLogged(history, mailboxMessageToReact(m))
+ 
+ 		// 实时推送子 Agent 完成事件，UI 可据此更新"等待子 Agent"状态。
+ 		a.emitLive(LiveEvent{Kind: LiveEventSubAgentDone, Tool: m.From, Text: truncateRunes(m.Body, 200)})
+diff --git a/backend/internal/agent/service_react.go b/backend/internal/agent/service_react.go
+index 89e9cfe..c545fb0 100644
+--- a/backend/internal/agent/service_react.go
++++ b/backend/internal/agent/service_react.go
+@@ -170,6 +170,14 @@ type ReactService struct {
+ 	// skillPool 全局技能池（技能渐进披露）：nil 时不注入 MetaAgent 技能目录块。
+ 	// bootstrap 经 SetSkillCatalog 注入与 Dispatcher 同一个池。
+ 	skillPool *skill.Pool
++
++	// agentMsgCache/msgLogger 编排页对话视图：Redis 热层读缓存 + meta 消息热写器；
++	// 均由 SetAgentMsgCache 一并装配，nil 时读侧回退 PG、写侧跳过。
++	agentMsgCache *store.AgentMsgRedisStore
++	msgLogger     MessageLogger
++	// messenger 用户直连写通道（编排页对话面板），由 subagent.Dispatcher 实现。
++	// nil（未接线/测试）时 MessageAgent 一律拒绝。
++	messenger AgentMessenger
+ }
+ 
+ // SetSkillCatalog 注入全局技能池：MetaAgent 会话系统提示追加全池【可用技能】目录块
+@@ -178,6 +186,13 @@ func (s *ReactService) SetSkillCatalog(p *skill.Pool) {
+ 	s.skillPool = p
+ }
+ 
++// SetAgentMsgCache 注入 Agent 消息 Redis 热层（编排页对话视图）：读侧缓存 + meta 热写器。
++// nil 安全：读回退 PG、写关闭。
++func (s *ReactService) SetAgentMsgCache(c *store.AgentMsgRedisStore) {
++	s.agentMsgCache = c
++	s.msgLogger = NewMessageLogger(c)
++}
++
+ // metaSkillBlock 渲染 MetaAgent 的全池技能目录块：Meta 持全集（无需派发即可
+ // load_skill 取全文，也可经 call_sub_agent 的 skills 参数下放任意技能）。
+ // skillPool 未注入或池为空时返回空串（零注入）。
+@@ -630,6 +645,72 @@ func (s *ReactService) SetActivityEvidenceProvider(p ActivityEvidenceProvider) {
+ 	s.activityEvidenceProvider = p
+ }
+ 
++// AgentMessenger 是用户直连子 Agent 的写通道（编排页对话面板发送框），
++// 由 subagent.Dispatcher 实现（见 Task 6 内核）：
++//   - InjectUserMessage：向等子返回中的 Agent 邮箱投 From=user 消息并唤醒其 wait loop；
++//   - ReviveWithMessage：终态节点 Reopen 后同 ID 重跑（种子=原任务+上轮结果+用户消息）。
++type AgentMessenger interface {
++	InjectUserMessage(agentID, content string) error
++	ReviveWithMessage(ctx context.Context, node orchestrator.Node, userMsg string) error
++}
++
++// SetAgentMessenger 注入用户直连写通道（编排页）。nil 时 MessageAgent 一律拒绝
++//（未接线场景：端点存在但不可用，不静默丢消息）。
++func (s *ReactService) SetAgentMessenger(m AgentMessenger) {
++	s.messenger = m
++}
++
++// MessageAgent 用户直连子 Agent（编排页对话面板发送框）。状态机路由：
++// 等子返回（running + activity_kind=child_wait）→ 邮箱注入+唤醒；
++// 执行中（running 其他）→ ErrAgentBusy（前端禁用发送，引导先中断/终止）；
++// 终态（done/failed/cancelled/delivered-unverified）→ 复活重跑；
++// Paused/Idle/meta → 拒绝（Paused 走监控页恢复；Idle 经 MetaAgent 正常派发）。
++// 成功写一条 System 会话事件留痕，主对话流可见"用户直连了某 Agent"。
++func (s *ReactService) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
++	content = strings.TrimSpace(content)
++	if content == "" {
++		return fmt.Errorf("%w: 消息内容不能为空", ErrInvalidSessionState)
++	}
++	// 主 Agent 走主对话通道，不经此端点（设计 §4 明确 meta 不开放直连）。
++	if instID == "" || instID == "meta" {
++		return fmt.Errorf("%w: 主 Agent 请用主对话页", ErrAgentNotDirectable)
++	}
++	if s.messenger == nil {
++		return fmt.Errorf("%w: 用户直连通道未接线", ErrAgentNotDirectable)
++	}
++	s.store.mu.RLock()
++	sess := s.store.sessions[sessionID]
++	s.store.mu.RUnlock()
++	if sess == nil {
++		return ErrSessionNotFound
++	}
++	node, ok := s.TreeFor(sessionID).Get(instID)
++	if !ok {
++		return ErrAgentNotFound
++	}
++	kind := ""
++	if s.activityEvidenceProvider != nil {
++		kind, _, _ = s.activityEvidenceProvider.ActivityEvidenceOf(instID)
++	}
++	switch node.Status {
++	case orchestrator.StatusRunning:
++		if kind != "child_wait" {
++			return ErrAgentBusy
++		}
++		if err := s.messenger.InjectUserMessage(instID, content); err != nil {
++			return err
++		}
++	case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled, orchestrator.StatusUnverified:
++		if err := s.messenger.ReviveWithMessage(ctx, node, content); err != nil {
++			return err
++		}
++	default: // Paused / Idle / 未知
++		return fmt.Errorf("%w（Paused 请到监控页恢复；Idle 经主 Agent 派发）", ErrAgentNotDirectable)
++	}
++	s.store.addEvent(sess, eventkind.System, "System", "用户直连 "+instID+"："+truncateRunes(content, 200), "", "", "", "", "", true)
++	return nil
++}
++
+ // SetSessionAgentWaker 注入会话挂起唤醒器（Domain 热驻），sendMessage 恢复路径
+ // 唤醒全部挂起 Agent（触限暂停波及全树的恢复入口）。由 bootstrap 注入 subagent.Dispatcher。
+ func (s *ReactService) SetSessionAgentWaker(w SessionAgentWaker) {
+@@ -1188,6 +1269,13 @@ func (s *ReactService) Query(ctx context.Context, sessionID string, q Query) (Re
+ 		limit, _ := q.Args["limit"].(int)
+ 		offset, _ := q.Args["offset"].(int)
+ 		return s.agentEventsQueryResult(ctx, sessionID, agentID, limit, offset), nil
++	case QueryKindAgentMessages:
++		// 编排页 Agent 对话视图：完整消息历史 + mailbox 留痕。
++		agentID, _ := q.Args["agent"].(string)
++		beforeSeq, _ := q.Args["before_seq"].(int)
++		afterSeq, _ := q.Args["after_seq"].(int)
++		limit, _ := q.Args["limit"].(int)
++		return s.agentMessagesQueryResult(ctx, sessionID, agentID, beforeSeq, afterSeq, limit), nil
+ 	case QueryKindWorktrees:
+ 		// 会话 worktree 副本清单（TODO 第9⑤/#10⑤）：经结构化接口断言访问 Dispatcher。
+ 		// 未接线（nil/未实现）返回空列表，端点可安全轮询。
+@@ -2331,6 +2419,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会
+ 		WithWorkDir(wd).
+ 		WithSkillBlock(s.metaSkillBlock()).
+ 		WithPersonaInjector(s.metaPersona(session.workDir)).
++		WithMessageLogger(s.msgLogger).
+ 		// meta 长会话运行期间模型被切换时，下一次 LLM 调用即用新模型。
+ 		WithProviderFunc(s.metaProviderForCall)
+ 	// 注入未决子 Agent 检查器，开启父会话终结保护。
+@@ -2460,6 +2549,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
+ 		WithWorkDir(wd).
+ 		WithSkillBlock(s.metaSkillBlock()).
+ 		WithPersonaInjector(s.metaPersonaLite()).
++		WithMessageLogger(s.msgLogger).
+ 		// 同 runSession：运行期模型切换在下一次 LLM 调用生效。
+ 		WithProviderFunc(s.metaProviderForCall)
+ 	// 注入未决子 Agent 检查器，开启父会话终结保护。
+diff --git a/backend/internal/agent/types.go b/backend/internal/agent/types.go
+index 347a9b4..5ab6fc5 100644
+--- a/backend/internal/agent/types.go
++++ b/backend/internal/agent/types.go
+@@ -186,6 +186,9 @@ const (
+ 	// QueryKindAgentEvents 子 Agent 审计下钻：Args{"agent": 实例ID, "limit", "offset"}，
+ 	// 返回该实例 agent_events 逐轮事件（回放数据源）。
+ 	QueryKindAgentEvents = "agent-events"
++	// QueryKindAgentMessages 编排页 Agent 对话视图：Args{"agent","before_seq","after_seq","limit"}，
++	// 返回完整消息历史（Redis 热层 + PG 合并分页）+ mailbox 留痕。
++	QueryKindAgentMessages = "agent-messages"
+ 	// QueryKindWorktrees 会话 worktree 副本清单（TODO 第9⑤/#10⑤）：
+ 	// 返回 ListWorktrees 快照（路径/分支/base/patch 路径与 stat/合并状态）。
+ 	QueryKindWorktrees = "worktrees"
+diff --git a/backend/internal/bootstrap/bootstrap.go b/backend/internal/bootstrap/bootstrap.go
+index 0039836..20643f8 100644
+--- a/backend/internal/bootstrap/bootstrap.go
++++ b/backend/internal/bootstrap/bootstrap.go
+@@ -292,6 +292,32 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
+ 		WithMaxBundles(cfg.Agent.SummarizeMaxBundles).
+ 		WithFileMapProvider(toolRegistry.FileMapText) // 任务级文件小地图：触碰文件符号轮廓尾部常驻注入，压缩压不掉
+ 
++	// mailbox 留痕（编排页 Agent 间交互留痕）：每封邮件收发双方各写一条 agent_events
++	//（type=mailbox），随会话删除一并清理；写失败仅记日志，不影响投递。
++	sharedMailbox.WithTrace(func(msg *mailbox.Message) {
++		writeRow := func(agentID string) {
++			if agentID == "" || agentID == "*" {
++				return
++			}
++			if err := memoryPipeline.Write(agentID, agent.MemoryEvent{
++				Type:     "mailbox",
++				AgentID:  agentID,
++				Role:     msg.From,
++				Content:  msg.Subject + "\n" + msg.Body,
++				ToolName: string(msg.Type),
++				Input:    msg.To,
++				Occurred: msg.CreatedAt,
++			}); err != nil {
++				log.Printf("[mailbox] trace write failed: agent=%s err=%v", agentID, err)
++			}
++		}
++		writeRow(msg.To)
++		// user/dispatcher 是系统侧发送者（非 Agent），不作为发送方行落库。
++		if msg.From != "user" && msg.From != "dispatcher" {
++			writeRow(msg.From)
++		}
++	})
++
+ 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
+ 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
+ 	reactCfg := agent.ReactRuntimeConfig{
+@@ -631,6 +657,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
+ 	// LoadMessages 重建 domain Agent 续跑。缺失会导致暂停后无法恢复
+ 	// （ResumePaused 前置校验 msgStore == nil 直接失败）。
+ 	subAgentDispatcher.WithMessagesStore(agent.NewPostgresMessagesStore(pgStore.DB()))
++	// 编排页（Agent 树图 + 单 Agent 对话页）接线：消息热层 + 用户直连通道。
++	agentSvc.SetAgentMsgCache(redisStore.AgentMsg)
++	subAgentDispatcher.WithMessageLogger(agent.NewMessageLogger(redisStore.AgentMsg))
+ 	// 注入未决子 Agent 检查器，开启父会话终结保护：
+ 	// 父 Agent 给出终答前若有未决子 Agent，阻塞等待其完成，防止迟到 mailbox 消息丢失。
+ 	agentSvc.SetPendingChildrenChecker(subAgentDispatcher)
+@@ -641,6 +670,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
+ 	// 注入 Paused DomainAgent 恢复器：sendMessage 在 PausedOnChild 态优先恢复 earliest paused domain，
+ 	// 从 agent_messages 加载历史用 fresh budget 续跑（各 Agent 独立上下文）。
+ 	agentSvc.SetPausedDomainResumer(subAgentDispatcher)
++	// 注入用户直连写通道（编排页对话面板）：waiting 注入唤醒 / 终态复活重跑。
++	agentSvc.SetAgentMessenger(subAgentDispatcher)
+ 	// DomainAgent 热驻留（Domain 热驻 + 复用权重）：开启后 domain 任务完成/用户停止转
+ 	// Idle 热驻（goroutine park 等复用，call_sub_agent(reuse_agent_id=X) 唤醒），
+ 	// 加权 TTL 在用户下一条消息后武装。关闭（默认）时所有热驻路径零变化。
+diff --git a/backend/internal/bootstrap/router_test.go b/backend/internal/bootstrap/router_test.go
+index 1152cc2..a86c19d 100644
+--- a/backend/internal/bootstrap/router_test.go
++++ b/backend/internal/bootstrap/router_test.go
+@@ -49,6 +49,9 @@ func (mockAgentForRouter) Tree(context.Context, string) ([]orchestrator.Node, er
+ }
+ func (mockAgentForRouter) CancelAgent(context.Context, string, string) error { return nil }
+ func (mockAgentForRouter) PauseAgent(context.Context, string, string) error  { return nil }
++func (mockAgentForRouter) MessageAgent(context.Context, string, string, string) error {
++	return nil
++}
+ func (mockAgentForRouter) Board(context.Context, string) (*board.Snapshot, error) {
+ 	return nil, nil
+ }
+diff --git a/backend/internal/domain/orchestrator/tree.go b/backend/internal/domain/orchestrator/tree.go
+index bcd69f9..2d58895 100644
+--- a/backend/internal/domain/orchestrator/tree.go
++++ b/backend/internal/domain/orchestrator/tree.go
+@@ -292,6 +292,31 @@ func (t *Tree) Wake(id string, cancel context.CancelFunc) bool {
+ 	return true
+ }
+ 
++// Reopen 复活终态节点（编排页用户直连"复活重跑"）：仅 Done/Failed/Cancelled/
++// Unverified 可复活回 Running；其他状态 no-op 返回 false。清 Finished 恢复运行态，
++// 保留 Summary/Err 作为上一轮留痕（复活种子上下文由调用方读取后注入新一轮，
++// 下一轮 Finish 时自然覆盖）。
++func (t *Tree) Reopen(id string) bool {
++	t.mu.Lock()
++	node, ok := t.nodes[id]
++	if !ok {
++		t.mu.Unlock()
++		return false
++	}
++	switch node.Status {
++	case StatusDone, StatusFailed, StatusCancelled, StatusUnverified:
++	default:
++		t.mu.Unlock()
++		return false
++	}
++	node.Status = StatusRunning
++	node.Finished = time.Time{}
++	snapshot := *node
++	t.mu.Unlock()
++	t.persistNode(snapshot)
++	return true
++}
++
+ // Cancel 调用已绑定的 cancel func 并将状态置为 StatusCancelled。
+ // 返回是否找到对应节点且处于可取消状态（Running）。
+ // context.CancelFunc 幂等（Go doc），与 goroutine defer cancel 重复调用安全。
+diff --git a/backend/internal/domain/orchestrator/tree_test.go b/backend/internal/domain/orchestrator/tree_test.go
+index 9547d2f..0f6749f 100644
+--- a/backend/internal/domain/orchestrator/tree_test.go
++++ b/backend/internal/domain/orchestrator/tree_test.go
+@@ -574,3 +574,27 @@ func TestTreeEndCurrentTopicCoversIdle(t *testing.T) {
+ 		t.Error("idle node kill func not invoked on EndCurrentTopic")
+ 	}
+ }
++
++// TestTreeReopen 验证复活门控：仅终态（Done/Failed/Cancelled/Unverified）可 Reopen
++// 回 Running；Running/Paused/Idle 拒绝；Summary/Err 保留、Finished 清零。
++func TestTreeReopen(t *testing.T) {
++	tr := NewTree("", nil)
++	tr.Register(Node{ID: "a", Role: "domain", Status: StatusRunning})
++	if tr.Reopen("a") {
++		t.Fatal("Running 不应可复活")
++	}
++	tr.Finish("a", "干完了", nil)
++	if !tr.Reopen("a") {
++		t.Fatal("Done 应可复活")
++	}
++	n, _ := tr.Get("a")
++	if n.Status != StatusRunning || !n.Finished.IsZero() {
++		t.Fatalf("复活后应 Running 且 Finished 清零, got %+v", n)
++	}
++	if n.Summary != "干完了" {
++		t.Fatalf("复活应保留上轮 Summary 作留痕, got %q", n.Summary)
++	}
++	if tr.Reopen("missing") {
++		t.Fatal("不存在的节点应返回 false")
++	}
++}
+diff --git a/backend/internal/domain/subagent/dispatcher.go b/backend/internal/domain/subagent/dispatcher.go
+index d5702c1..8a99545 100644
+--- a/backend/internal/domain/subagent/dispatcher.go
++++ b/backend/internal/domain/subagent/dispatcher.go
+@@ -284,6 +284,9 @@ type Dispatcher struct {
+ 	// 为 nil 时跳过持久化(测试场景:domain 到限仍返 errPaused 但 history 不存,无法 resume)。
+ 	msgStore agent.MessagesStore
+ 
++	// msgLogger 消息热层记录器（编排页对话视图）：构造子 Agent 时装配到 ReActAgent。
++	msgLogger agent.MessageLogger
++
+ 	// pausedResumes 跟踪每个 Paused domain 节点已续跑的次数（nodeID -> *atomic.Int64）。
+ 	// ResumePaused 入口按 maxPausedResumes 校验，触顶后强制收口部分返回——
+ 	// 续跑重置 fresh budget 使 token 上限永不绑定（v10 实证：验收领域暂停-续跑研磨
+@@ -630,6 +633,16 @@ func (d *Dispatcher) WithDomainHeartbeatTimeout(t time.Duration) *Dispatcher {
+ func (d *Dispatcher) activityReporterFn(agentID string) func(kind string) {
+ 	return func(kind string) {
+ 		now := time.Now().UnixNano()
++		if kind == "child_wait" {
++			// 展示态专用（编排页等待下级标识，waitForChildren 上报）：
++			// 仅更新 lastKind 供 ActivityEvidenceOf 读取；不刷新 lastTS（不续命）、
++			// 不向上冒泡——等子期间存活判定仍由后代活动冒泡与既有心跳阈值决定，
++			// 避免"全部后代已死、父在干等"被展示态刷新误判为合法存活。
++			if e := d.activityEvidenceFor(agentID); e != nil {
++				e.lastKind.Store(kind)
++			}
++			return
++		}
+ 		if e := d.activityEvidenceFor(agentID); e != nil {
+ 			e.report(kind, now)
+ 		}
+@@ -1027,6 +1040,107 @@ func (d *Dispatcher) pokeParent(parentID string) {
+ 	}
+ }
+ 
++// InjectUserMessage 用户直连注入（编排页对话面板）：向目标 Agent 邮箱投一封
++// From="user" 的 MsgRequest，并 pokeParent 唤醒其 wait loop——mailbox.Send 本身
++// 不唤醒 WaitForAnyChild 阻塞方，不显式 poke 要等满 wait 周期才看到消息。
++func (d *Dispatcher) InjectUserMessage(agentID, content string) error {
++	if d.mailbox == nil {
++		return fmt.Errorf("mailbox 未初始化")
++	}
++	if _, err := d.mailbox.Send(&mailbox.Message{
++		From:    "user",
++		To:      agentID,
++		Type:    mailbox.MsgRequest,
++		Subject: "用户直连消息",
++		Body:    content,
++	}); err != nil {
++		return err
++	}
++	d.pokeParent(agentID)
++	return nil
++}
++
++// ReviveWithMessage 复活终态子 Agent 并以用户消息为增量输入同 ID 重跑。
++// 种子 = 原任务 + 上轮 Summary/Err + 用户新消息；运行骨架完全镜像 dispatchOne
++//（ctx 重建 → Reopen+SetCancel → subMeta/activity/ensurePatrol → goroutine
++// runSubAgent → 父 poke+邮件通知 → ledger 重记）。
++func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.Node, userMsg string) error {
++	roleDef := d.registry.Get(node.Role)
++	if roleDef == nil {
++		return fmt.Errorf("角色 %s 未注册，无法复活", node.Role)
++	}
++	parentID := node.ParentID
++	subAgentID := node.ID
++
++	subAgentCtx := tool.StopContextFrom(ctx)
++	if subAgentCtx == nil {
++		subAgentCtx = context.Background()
++	}
++	if sid := tool.SessionIDFromContext(ctx); sid != "" {
++		subAgentCtx = tool.WithSessionID(subAgentCtx, sid)
++	}
++	subAgentCtx = tool.WithWorkDir(subAgentCtx, d.subAgentWorkDirFor(ctx))
++	effectiveTimeout := d.timeout
++	var cancel context.CancelFunc = func() {}
++	if effectiveTimeout > 0 {
++		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)
++	}
++
++	if d.treeFn == nil {
++		cancel()
++		return fmt.Errorf("权威树未接线，无法复活 %s", subAgentID)
++	}
++	t := d.treeFn(tool.SessionIDFromContext(subAgentCtx))
++	if t == nil || !t.Reopen(subAgentID) {
++		cancel()
++		return fmt.Errorf("节点 %s 非终态，不可复活", subAgentID)
++	}
++	t.SetCancel(subAgentID, cancel)
++
++	// 复活种子：原任务 + 上轮结果留痕 + 用户新指令，让模型明确"这是返工/追加"。
++	seed := node.Task + "\n\n【上一轮结果】\n" + node.Summary
++	if node.Err != "" {
++		seed += "\n【上轮错误】\n" + node.Err
++	}
++	seed += "\n\n【用户直连消息】\n" + userMsg
++
++	if parentID != "" {
++		d.trackChildStart(parentID)
++	}
++	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(subAgentCtx), wallClock: effectiveTimeout}
++	d.subMeta.Store(subAgentID, meta)
++	if roleDef.ID != "meta" {
++		d.activity.Store(subAgentID, newEvidence())
++	}
++	d.ensurePatrol()
++	started := time.Now()
++	go func() {
++		defer cancel()
++		defer d.subMeta.Delete(subAgentID)
++		defer d.activity.Delete(subAgentID)
++		// 复活按默认 ReAct 模式重跑（mode=react、verify_kind 留空走角色默认校验分层）——
++		// 原派发的 mode/responsibility 未随节点持久化，无法复原；职责边界由种子里的
++		// 原任务文本与领域标签承载，必要时模型可自行重新派发下游。
++		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, seed, node.Domain, "", agent.ModeReact, "", started)
++		if !paused && parentID != "" {
++			meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
++		}
++	}()
++	// 父感知（提示词 Task 8 配套）：复活返工属调度事实，邮件通知父"等重新回传，勿重复派发"。
++	if parentID != "" && d.mailbox != nil {
++		_, _ = d.mailbox.Send(&mailbox.Message{
++			From: "dispatcher", To: parentID, Type: mailbox.MsgInfo,
++			Subject: "子 Agent 复活返工",
++			Body:    fmt.Sprintf("子 Agent %s 已被用户直连复活重跑，等待其重新回传，勿重复派发同领域任务。", subAgentID),
++		})
++		d.pokeParent(parentID)
++	}
++	if sid := tool.SessionIDFromContext(subAgentCtx); sid != "" {
++		d.ledger.RecordDispatch(sid, parentID, subAgentID, node.Domain, truncateRunes(node.Task, 80), "")
++	}
++	return nil
++}
++
+ // HasPausedChild 返回父 Agent 是否有 StatusPaused 的子 DomainAgent 节点。
+ // 实现 agent.PausedChildChecker 接口，供 MetaAgent 父终结保护 wait loop 检测：
+ // 子 domain 触达 token 上限进入 Paused 后，父 MetaAgent 无限 budget 不会自行暂停，
+@@ -1463,6 +1577,12 @@ func (d *Dispatcher) WithMessagesStore(s agent.MessagesStore) *Dispatcher {
+ 	return d
+ }
+ 
++// WithMessageLogger 注入消息热层记录器（编排页对话视图）。nil 时跳过（测试场景）。
++func (d *Dispatcher) WithMessageLogger(l agent.MessageLogger) *Dispatcher {
++	d.msgLogger = l
++	return d
++}
++
+ // WithFactExtractor 注入事实提取器，使 saveBlockMemory 先尝试 LLM 提取关键事实
+ // 再落库（每条事实单独 KnowledgeRecord，向量化后召回精度更高）。
+ // 传 nil 关闭提取（默认关闭），saveBlockMemory 回退原始文本保存。
+@@ -2959,6 +3079,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
+ 		// 叶子助手部分回灌:treeFinish Done + notify 父部分产出。trackChildDone 照常减。
+ 		partial := result.Text
+ 		log.Printf("[subagent] PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
++		d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
+ 		d.treeFinish(ctx, subAgentID, "部分完成: "+partial, nil)
+ 		d.notify(parentID, subAgentID, "子 Agent 已达 token 上限,返回部分完成。\n"+partial, files)
+ 		return false
+@@ -3020,6 +3141,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
+ 				}
+ 				partial := truncateRunes(agent.LastAssistantText(result.History), 500)
+ 				log.Printf("[subagent] SOFT-STOP LEAF PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
++				d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
+ 				d.treeFinish(ctx, subAgentID, "软停止部分完成: "+partial, nil)
+ 				d.notify(parentID, subAgentID, "子 Agent 已被软停止（会话停止中），返回当前部分成果；续跑后可按需重派。\n"+partial, files)
+ 				// Domain 热驻：父是热驻 domain 时追加一条取消提示邮件（"记忆补一句：子 Agent 已取消"）——
+@@ -3040,6 +3162,8 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
+ 			log.Printf("[subagent] CANCELLED: sub=%s role=%s duration=%s", subAgentID, roleDef.ID, duration)
+ 			// 硬取消路径清残留手动暂停标记（竞态：StopRunning 前节点已被取消）。
+ 			d.ClearPauseNode(subAgentID)
++			// 终态落库（编排页对话视图）：取消路径 ctx 已取消，saveTerminalHistory 内部脱取消。
++			d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
+ 			return false
+ 		}
+ 		partial := ""
+@@ -3084,6 +3208,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
+ 			treeStatus = orchestrator.StatusUnverified
+ 		}
+ 		d.boardUpdate(ctx, parentID, domain, boardSt, truncateRunes(msg, 300))
++		d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
+ 		d.treeFinishStatus(ctx, subAgentID, partial, treeStatus, failText)
+ 		d.notify(parentID, subAgentID, msg, files)
+ 		return false
+@@ -3095,6 +3220,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
+ 	// A/B 实证自动验证闭环是负资产（开 5/16 vs 关 16/16），机制移至扩展设计文档 §12 作后期扩展。
+ 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
+ 	d.boardUpdate(ctx, parentID, domain, board.TaskDone, result.Text)
++	d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
+ 	d.treeFinish(ctx, subAgentID, result.Text, nil)
+ 	// 校验分层（TODO #43）状态标注：VerifyNote 非空=校验通过（L0 证据/L2 rubric），
+ 	// 完成摘要前缀一行，父 Agent 可见校验依据；空=未启用校验（none），零变化。
+@@ -3158,6 +3284,12 @@ func (d *Dispatcher) savePausedHistory(ctx context.Context, subAgentID, sid stri
+ 	}
+ }
+ 
++// saveTerminalHistory 子 Agent 终态落库完整 history（编排页对话视图 PG 全量源）。
++// 复用 savePausedHistory 的"脱离取消 ctx + 10s 超时"语义——取消/软停路径 ctx 已取消也能存。
++func (d *Dispatcher) saveTerminalHistory(ctx context.Context, subAgentID, sid string, history []agent.ReactMessage) {
++	d.savePausedHistory(ctx, subAgentID, sid, history)
++}
++
+ // treeFinish 把子 Agent 终态写入权威树。treeFn 为 nil 或 sessionID 缺失时静默跳过。
+ // 幂等：orchestrator.Tree.Finish 对已 terminal 节点 no-op。
+ func (d *Dispatcher) treeFinish(ctx context.Context, subAgentID, summary string, err error) {
+@@ -3298,6 +3430,11 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
+ 		sub = sub.WithActivityReporter(d.activityReporterFn(subAgentID))
+ 	}
+ 
++	// 消息热层（编排页对话视图）：逐条热写 Redis，终态全量落 PG（runSubAgent 收尾）。
++	if d.msgLogger != nil {
++		sub = sub.WithMessageLogger(d.msgLogger)
++	}
++
+ 	// 注入会话级日志器：派生 session-scoped logger，使子 Agent LLM I/O 写入同一会话的 session_logs。
+ 	// sessionID 从 ctx 取（call_sub_agent 异步路径已 WithSessionID），agentName 用 roleDef.Name（DomainAgent 已按任务首行覆写）。
+ 	sid := tool.SessionIDFromContext(ctx)
+diff --git a/backend/internal/mailbox/mailbox.go b/backend/internal/mailbox/mailbox.go
+index 1c48874..522e555 100644
+--- a/backend/internal/mailbox/mailbox.go
++++ b/backend/internal/mailbox/mailbox.go
+@@ -112,6 +112,9 @@ type Mailbox struct {
+ 	bcast  []*Message            // To == "*" 等待主 Agent 决议
+ 	closed map[string]struct{}   // 已销毁收件人（Purge 过），Send 死信
+ 	seq    atomic.Int64          // 全局递增序号，用于生成消息 ID
++	// trace 可选的发送留痕回调（编排页 Agent 间交互留痕数据源）：Send 投递成功
++	//（含广播桶）后持锁外调用；nil 时零行为。实现方必须 best-effort 非阻塞。
++	trace func(*Message)
+ }
+ 
+ // New 创建并返回一个新的邮箱管理器实例。
+@@ -128,6 +131,13 @@ func New() *Mailbox {
+ 	}
+ }
+ 
++// WithTrace 注入发送留痕回调（编排页"Agent 间交互留痕"数据源）。重复注入后者覆盖前者。
++func (m *Mailbox) WithTrace(fn func(*Message)) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	m.trace = fn
++}
++
+ // Send 投递一条邮件到目标 Agent 的收件箱或广播桶。
+ //
+ // 职责：填充 ID/CreatedAt/Status，并按 To 字段路由消息。
+@@ -155,18 +165,25 @@ func (m *Mailbox) Send(msg *Message) (string, error) {
+ 
+ 	// 加写锁保护 inbox/bcast 的写入。
+ 	m.mu.Lock()
+-	defer m.mu.Unlock()
+ 	if msg.To == "" || msg.To == "*" {
+ 		// 无明确收件人或广播：进入广播桶，交主 Agent 决议。
+ 		m.bcast = append(m.bcast, msg)
+ 	} else {
+ 		// 定向投递：目标已销毁则返回死信错误，不入箱。
+ 		if _, ok := m.closed[msg.To]; ok {
++			m.mu.Unlock()
+ 			return "", fmt.Errorf("%w: %s", ErrRecipientClosed, msg.To)
+ 		}
+ 		// 定向投递：追加到目标 Agent 的收件箱末尾。
+ 		m.inbox[msg.To] = append(m.inbox[msg.To], msg)
+ 	}
++	trace := m.trace
++	m.mu.Unlock()
++	// 投递成功后留痕（持锁外 + 值拷贝：防回调慢/再入 mailbox 死锁，防调用方后续改 msg）。
++	if trace != nil {
++		cp := *msg
++		trace(&cp)
++	}
+ 	return id, nil
+ }
+ 
+diff --git a/backend/internal/server/routes.go b/backend/internal/server/routes.go
+index ef10103..3f964b8 100644
+--- a/backend/internal/server/routes.go
++++ b/backend/internal/server/routes.go
+@@ -16,30 +16,32 @@ func RegisterSessionRoutes(rg gin.IRouter, m *SessionManager) {
+ 	rg.POST("/sessions/delete", m.HandleDeleteSessions) // 批量硬删除（body {"ids":[...]}）
+ 
+ 	// 会话子资源：handler 内部通过 c.Param("id") 读取会话 ID。
+-	rg.GET("/sessions/:id/stream", m.HandleSessionStream)                   // SSE 流式消息推送
+-	rg.POST("/sessions/:id/message", m.HandleSessionMessage)                // 向会话发送消息
+-	rg.GET("/sessions/:id/board", m.HandleSessionBoard)                     // 任务看板
+-	rg.GET("/sessions/:id/agents", m.HandleSessionAgents)                   // 会话内 Agent 列表
+-	rg.GET("/sessions/:id/tree", m.HandleSessionTree)                       // 权威 Agent 树快照
+-	rg.POST("/sessions/:id/agents/:aid/cancel", m.HandleSessionAgentCancel) // 取消子 Agent 实例
+-	rg.POST("/sessions/:id/agents/:aid/pause", m.HandleSessionAgentPause)   // 手动暂停 domain 支路（TODO 第10③）
+-	rg.GET("/sessions/:id/agents/:aid/events", m.HandleSessionAgentEvents)  // 审计下钻：逐轮事件（TODO 第10③）
+-	rg.GET("/sessions/:id/worktrees", m.HandleSessionWorktrees)             // worktree 副本清单（TODO 第9⑤）
+-	rg.GET("/sessions/:id/worktrees/:aid/diff", m.HandleSessionWorktreeDiff)    // worktree 全量 diff（TODO 第10⑤ review）
++	rg.GET("/sessions/:id/stream", m.HandleSessionStream)                          // SSE 流式消息推送
++	rg.POST("/sessions/:id/message", m.HandleSessionMessage)                       // 向会话发送消息
++	rg.GET("/sessions/:id/board", m.HandleSessionBoard)                            // 任务看板
++	rg.GET("/sessions/:id/agents", m.HandleSessionAgents)                          // 会话内 Agent 列表
++	rg.GET("/sessions/:id/tree", m.HandleSessionTree)                              // 权威 Agent 树快照
++	rg.POST("/sessions/:id/agents/:aid/cancel", m.HandleSessionAgentCancel)        // 取消子 Agent 实例
++	rg.POST("/sessions/:id/agents/:aid/pause", m.HandleSessionAgentPause)          // 手动暂停 domain 支路（TODO 第10③）
++	rg.GET("/sessions/:id/agents/:aid/events", m.HandleSessionAgentEvents)         // 审计下钻：逐轮事件（TODO 第10③）
++	rg.GET("/sessions/:id/agents/:aid/messages", m.HandleSessionAgentMessages)     // 编排页：Agent 对话历史+留痕
++	rg.POST("/sessions/:id/agents/:aid/message", m.HandleSessionAgentMessage)      // 编排页：用户直连子 Agent
++	rg.GET("/sessions/:id/worktrees", m.HandleSessionWorktrees)                    // worktree 副本清单（TODO 第9⑤）
++	rg.GET("/sessions/:id/worktrees/:aid/diff", m.HandleSessionWorktreeDiff)       // worktree 全量 diff（TODO 第10⑤ review）
+ 	rg.POST("/sessions/:id/worktrees/:aid/:action", m.HandleSessionWorktreeAction) // 合并门操作 merge|reject（TODO 第10⑤）
+-	rg.GET("/sessions/:id/metrics", m.HandleSessionMetrics)                 // 会话级指标
+-	rg.GET("/sessions/:id/efficiency", m.HandleSessionEfficiency)           // 效率一等指标（TODO 第9⑥/第10③）
+-	rg.GET("/sessions/:id/logs", m.HandleSessionLogs)                       // 会话日志查询
+-	rg.GET("/sessions/:id/token-metrics", m.HandleSessionTokenMetrics)      // Token 消耗指标
+-	rg.GET("/sessions/:id/watchdog", m.HandleSessionWatchdog)               // Watchdog 状态
+-	rg.GET("/sessions/:id/mailbox", m.HandleSessionMailbox)                 // 邮箱消息
+-	rg.POST("/sessions/:id/clarify", m.HandleSessionClarify)                // 澄清答复
+-	rg.POST("/sessions/:id/interrupt", m.HandleSessionInterrupt)            // 抢占中断
+-	rg.POST("/sessions/:id/enqueue", m.HandleSessionEnqueue)                // 任务入队
+-	rg.POST("/sessions/:id/cancel", m.HandleSessionCancel)                  // 取消会话
+-	rg.POST("/sessions/:id/stop", m.HandleSessionStop)                      // 软停止（可续跑，TODO #37）
+-	rg.POST("/sessions/:id/topic", m.HandleSessionTopic)                    // 话题管理
+-	rg.POST("/sessions/:id/trust-mode", m.HandleSessionTrustMode)           // 信任模式切换（TODO 第10⑥）
+-	rg.DELETE("/sessions/:id", m.HandleDeleteSession)                       // 硬删除会话（不可恢复）
+-	rg.GET("/sessions/:id", m.HandleGetSession)                             // 会话详情
++	rg.GET("/sessions/:id/metrics", m.HandleSessionMetrics)                        // 会话级指标
++	rg.GET("/sessions/:id/efficiency", m.HandleSessionEfficiency)                  // 效率一等指标（TODO 第9⑥/第10③）
++	rg.GET("/sessions/:id/logs", m.HandleSessionLogs)                              // 会话日志查询
++	rg.GET("/sessions/:id/token-metrics", m.HandleSessionTokenMetrics)             // Token 消耗指标
++	rg.GET("/sessions/:id/watchdog", m.HandleSessionWatchdog)                      // Watchdog 状态
++	rg.GET("/sessions/:id/mailbox", m.HandleSessionMailbox)                        // 邮箱消息
++	rg.POST("/sessions/:id/clarify", m.HandleSessionClarify)                       // 澄清答复
++	rg.POST("/sessions/:id/interrupt", m.HandleSessionInterrupt)                   // 抢占中断
++	rg.POST("/sessions/:id/enqueue", m.HandleSessionEnqueue)                       // 任务入队
++	rg.POST("/sessions/:id/cancel", m.HandleSessionCancel)                         // 取消会话
++	rg.POST("/sessions/:id/stop", m.HandleSessionStop)                             // 软停止（可续跑，TODO #37）
++	rg.POST("/sessions/:id/topic", m.HandleSessionTopic)                           // 话题管理
++	rg.POST("/sessions/:id/trust-mode", m.HandleSessionTrustMode)                  // 信任模式切换（TODO 第10⑥）
++	rg.DELETE("/sessions/:id", m.HandleDeleteSession)                              // 硬删除会话（不可恢复）
++	rg.GET("/sessions/:id", m.HandleGetSession)                                    // 会话详情
+ }
+diff --git a/backend/internal/server/session.go b/backend/internal/server/session.go
+index 3f00d92..ec73b68 100644
+--- a/backend/internal/server/session.go
++++ b/backend/internal/server/session.go
+@@ -499,12 +499,18 @@ func agentErrorStatus(err error) (string, int) {
+ 		return "会话不存在", http.StatusNotFound
+ 	case errors.Is(err, agent.ErrQueueFull):
+ 		return "命令队列已满", http.StatusServiceUnavailable
++	case errors.Is(err, agent.ErrAgentNotDirectable):
++		// 编排页直连的不可用态（Paused/Idle/meta/通道未接线）：409 冲突而非 400 参数错。
++		// 该哨兵包装 ErrInvalidSessionState（errors.Is 仍可匹配父错误），此前分支必须在其前。
++		return err.Error(), http.StatusConflict
+ 	case errors.Is(err, agent.ErrSessionFinished), errors.Is(err, agent.ErrInvalidSessionState):
+ 		return err.Error(), http.StatusBadRequest
+ 	case errors.Is(err, agent.ErrPostgresUnavailable):
+ 		return "存储后端不可用", http.StatusServiceUnavailable
+ 	case errors.Is(err, agent.ErrAgentNotFound):
+ 		return "Agent 不存在或已结束", http.StatusNotFound
++	case errors.Is(err, agent.ErrAgentBusy):
++		return "agent 正在执行任务，发送已禁用（可先中断或终止）", http.StatusConflict
+ 	default:
+ 		return err.Error(), http.StatusInternalServerError
+ 	}
+diff --git a/backend/internal/server/session_http.go b/backend/internal/server/session_http.go
+index 63e769b..d31b321 100644
+--- a/backend/internal/server/session_http.go
++++ b/backend/internal/server/session_http.go
+@@ -481,6 +481,55 @@ func (m *SessionManager) HandleSessionAgentEvents(c *gin.Context) {
+ 	c.JSON(http.StatusOK, res.Data)
+ }
+ 
++// HandleSessionAgentMessages 处理 GET /api/sessions/{id}/agents/{aid}/messages（编排页对话视图）。
++// 返回该实例完整消息历史（热层+PG 合并分页）与 mailbox 留痕；aid=meta 映射为会话主 Agent。
++func (m *SessionManager) HandleSessionAgentMessages(c *gin.Context) {
++	id := c.Param("id")
++	instID := c.Param("aid")
++	if instID == "" {
++		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
++		return
++	}
++	beforeSeq, _ := strconv.Atoi(c.Query("before_seq"))
++	afterSeq, _ := strconv.Atoi(c.Query("after_seq"))
++	limit, _ := strconv.Atoi(c.Query("limit"))
++	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{
++		Kind: agent.QueryKindAgentMessages,
++		Args: map[string]any{"agent": instID, "before_seq": beforeSeq, "after_seq": afterSeq, "limit": limit},
++	})
++	if err != nil {
++		msg, status := agentErrorStatus(err)
++		c.String(status, "%s", msg)
++		return
++	}
++	c.JSON(http.StatusOK, res.Data)
++}
++
++// HandleSessionAgentMessage 处理 POST /api/sessions/{id}/agents/{aid}/message（编排页用户直连）。
++// 状态机路由在 ReactService.MessageAgent：等子返回→注入唤醒；终态→复活重跑；
++// 执行中→409（前端禁用发送）；Paused/Idle/meta→409。
++func (m *SessionManager) HandleSessionAgentMessage(c *gin.Context) {
++	id := c.Param("id")
++	instID := c.Param("aid")
++	if instID == "" {
++		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
++		return
++	}
++	body, err := DecodeBody[struct {
++		Content string `json:"content"`
++	}](c.Request)
++	if err != nil {
++		c.String(http.StatusBadRequest, "请求体解析失败")
++		return
++	}
++	if err := m.agent.MessageAgent(c.Request.Context(), id, instID, body.Content); err != nil {
++		msg, status := agentErrorStatus(err)
++		c.String(status, "%s", msg)
++		return
++	}
++	c.JSON(http.StatusOK, gin.H{"ok": true})
++}
++
+ // HandleSessionWorktrees 处理 GET /api/sessions/{id}/worktrees
+ // （TODO 第9项⑤/#10项⑤ 合并门视图）。
+ // 返回会话全部 worktree 副本快照（路径/分支/base/patch 路径与 stat/合并状态）。
+diff --git a/backend/internal/server/session_test.go b/backend/internal/server/session_test.go
+index c920d8b..d12821f 100644
+--- a/backend/internal/server/session_test.go
++++ b/backend/internal/server/session_test.go
+@@ -143,6 +143,11 @@ func (m *mockAgentForServer) PauseAgent(ctx context.Context, sessionID, instID s
+ 	return nil
+ }
+ 
++// MessageAgent 用户直连，测试实现返回 nil（成功）。
++func (m *mockAgentForServer) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
++	return nil
++}
++
+ // Profile 返回用户画像，测试实现返回空。
+ func (m *mockAgentForServer) Profile(ctx context.Context) (*userprofile.Profile, error) {
+ 	return &userprofile.Profile{}, nil
+diff --git a/backend/internal/store/redis.go b/backend/internal/store/redis.go
+index 5363831..46eae15 100644
+--- a/backend/internal/store/redis.go
++++ b/backend/internal/store/redis.go
+@@ -22,6 +22,7 @@ type RedisStore struct {
+ 	Event    *EventRedisStore    // 事件流 Stream 与决策日志 List
+ 	Snapshot *SnapshotRedisStore // Agent 快照热缓存
+ 	TTL      *TTLRedisStore      // 话题 TTL 与整话题删除
++	AgentMsg *AgentMsgRedisStore // Agent 消息热层（编排页对话视图）
+ 
+ 	// eventCursors 维护每个 topic events stream 的已读游标（last message ID）。
+ 	// C4 修复：原 PollEvents 用 XRead "0" 起始，每次返回全量消息，
+@@ -62,6 +63,7 @@ func NewRedisStore(ctx context.Context, addr, password string, db int) (*RedisSt
+ 		Event:        &EventRedisStore{client: client},
+ 		Snapshot:     &SnapshotRedisStore{client: client},
+ 		TTL:          &TTLRedisStore{client: client},
++		AgentMsg:     &AgentMsgRedisStore{client: client},
+ 	}, nil
+ }
+ 
+diff --git a/backend/internal/tui/model_test.go b/backend/internal/tui/model_test.go
+index e110426..d34693b 100644
+--- a/backend/internal/tui/model_test.go
++++ b/backend/internal/tui/model_test.go
+@@ -137,6 +137,11 @@ func (m *mockAgentForPlan) PauseAgent(ctx context.Context, sessionID, instID str
+ 	return nil
+ }
+ 
++// MessageAgent 是 mockAgentForPlan 的用户直连空实现（编排页不在 TUI 测试范围）。
++func (m *mockAgentForPlan) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
++	return nil
++}
++
+ // Shutdown 是 mockAgentForPlan 的空实现。
+ func (m *mockAgentForPlan) Shutdown(ctx context.Context) error { return nil }
+ 
+diff --git a/backend/internal/tui/view_test.go b/backend/internal/tui/view_test.go
+index 56dadfd..bca5e5d 100644
+--- a/backend/internal/tui/view_test.go
++++ b/backend/internal/tui/view_test.go
+@@ -222,6 +222,11 @@ func (stubAgent) CancelAgent(ctx context.Context, sessionID, instID string) erro
+ // PauseAgent 是 stubAgent 的空实现。
+ func (stubAgent) PauseAgent(ctx context.Context, sessionID, instID string) error { return nil }
+ 
++// MessageAgent 是 stubAgent 的用户直连空实现（编排页不在 TUI 测试范围）。
++func (stubAgent) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
++	return nil
++}
++
+ // Shutdown 是 stubAgent 的空实现。
+ func (stubAgent) Shutdown(ctx context.Context) error { return nil }
+ 
+diff --git a/backend/pkg/prompts/domain_agent.go b/backend/pkg/prompts/domain_agent.go
+index ae1c9e7..eb1a039 100644
+--- a/backend/pkg/prompts/domain_agent.go
++++ b/backend/pkg/prompts/domain_agent.go
+@@ -264,4 +264,16 @@ files 字段只列只读参照文件；列出将被改写的文件会在 WriteFi
+   用 set_role_model。
+ - 收到「子 Agent 已暂停」邮件**必须当轮处置**（resume 续跑或 cancel 放弃），禁止空等
+   ——暂停节点仍占你的未决计数。
++
++【用户直连消息】
++运行中可能收到 From=user、Subject=「用户直连消息」的邮件：用户绕过主 Agent 直接对你说话。处置规程：
++1. 先盘点：检查自身任务进度与下游各子任务进度（必要时翻邮箱留痕与看板），再回答或行动。
++2. 分类处置：
++   - 下游跑偏/产物不符 → 用 cancel_agent 终止跑偏子 Agent，按用户要求重新派发；
++   - 新需求/范围外追加 → 评估后自行完成或用 call_sub_agent 派发新子任务；
++   - 纯信息/口径澄清 → 纳入当前任务理解，继续执行；
++   - 询问进度 → 盘点后直接在终答/回传摘要中说明。
++3. 处置决策写入你的终答与回传父 Agent 的摘要（说明用户指令改变了什么）；用户没有邮箱，
++   不要 send_message 给 user——回复内容随你的回传与任务看板留痕呈现。
++4. 用户指令优先级高于原任务描述；与原任务冲突时以用户指令为准并在摘要中显式说明变更。
+ `
+diff --git a/backend/pkg/prompts/meta_agent.go b/backend/pkg/prompts/meta_agent.go
+index 80d5365..5c8d006 100644
+--- a/backend/pkg/prompts/meta_agent.go
++++ b/backend/pkg/prompts/meta_agent.go
+@@ -283,4 +283,9 @@ set_agent_model(domain, 更合适模型) → resume_agent(domain)；**是它下
+     显示真实进度）；自执行任务跳过计划/spec 直接产出。派发后继续推进可并行项，收到
+     mailbox 摘要及时整合；全部子任务完成后按【交付验收】对照收口；最终答复=回灌摘要
+     整理版，保留结论与文件路径。
++
++【子 Agent 复活返工】
++可能收到 From=dispatcher、Subject=「子 Agent 复活返工」的通知：用户直连某个已终态的
++子 Agent 并将其复活重跑。处置：知悉即可——该领域任务回到进行中，等其重新回传结果，
++期间勿对同领域重复派发；若你正等待该子 Agent，正常等回传即可。
+ `
+diff --git a/backend/pkg/prompts/prompts_test.go b/backend/pkg/prompts/prompts_test.go
+index b52d852..6be74a2 100644
+--- a/backend/pkg/prompts/prompts_test.go
++++ b/backend/pkg/prompts/prompts_test.go
+@@ -75,3 +75,18 @@ func TestExpandLeaf_IndentPreserved(t *testing.T) {
+ 		t.Fatalf("无占位符时不应改动原文: %q", got)
+ 	}
+ }
++
++// TestDirectMessageGuidance 钉死两段新规程的存在性（编排页用户直连的提示词契约）。
++func TestDirectMessageGuidance(t *testing.T) {
++	if !strings.Contains(DomainAgent, "【用户直连消息】") {
++		t.Fatal("DomainAgent 缺用户直连消息处置规程")
++	}
++	for _, kw := range []string{"cancel_agent", "call_sub_agent", "进度"} {
++		if !strings.Contains(DomainAgent, kw) {
++			t.Fatalf("DomainAgent 用户直连规程缺关键词 %q", kw)
++		}
++	}
++	if !strings.Contains(MetaAgent, "复活返工") {
++		t.Fatal("MetaAgent 缺子 Agent 复活返工感知规程")
++	}
++}
+diff --git a/doc/TODO.md b/doc/TODO.md
+index 9002306..dc1ce08 100644
+--- a/doc/TODO.md
++++ b/doc/TODO.md
+@@ -97,10 +97,11 @@
+ 11. **任务完成后提示词三小项 + 提示词正文日期清扫**（①-④ 全部落地迁出：变更.md 任务 132——① assistant_template 补【交付】段、② domain 终答正文 ≤500 字符超出落盘留路径、③ 五叶子公共段收敛为 `pkg/config/leafCommonBlock` 单一来源加载期拼接（含 doc_assistant 自检口径泛化修正）、④ 提示词正文 27 处日期/迭代编号清扫（`#` 注释行保留）。以下只留观察点）
+    - **观察点**（真机会话验证）：① 临时助手回传摘要含路径+证据（真机抽查 mailbox）；② domain 摘要超 4000 runes 截断落盘发生率下降（ctx_inject/mailbox 日志）；③ 塔防冒烟确认五叶子公共段泛化（自检口径/兄弟文件句统一）无行为回潮；④ 后续公共段修改只动 leafCommonBlock 一处即五叶子同步。
+ 
+-12. **Agent 编排页：层级树图 + 单 Agent 对话页 + 用户直连**（2026-09-11 立项；设计已批准，spec 与 14 任务实现计划已落稿；未开工）
++12. **Agent 编排页：层级树图 + 单 Agent 对话页 + 用户直连**（2026-09-11 立项；设计已批准，spec 与 14 任务实现计划已落稿；**代码实施完成（2026-09-11），后端全量测试 + 前端 vue-tsc/vite 构建零报错；仅剩带真实会话的手动验收清单待人工执行**）
+     - 依据文档：
+       - 设计定稿：`docs/superpowers/specs/2026-09-11-agent-orch-board-design.md`
+       - 实现计划（含全部代码）：`docs/superpowers/plans/2026-09-11-agent-orch-board.md`
++    - 实施记录（2026-09-11）：Task 1-14 全部落地——`child_wait` 展示态（不续命不冒泡）、mailbox 双写 `agent_events` 留痕、Redis 消息热层（TTL 24h/cap 500/nil 降级）、消息热写 + 子 Agent 终态全量落 PG、`GET/POST /agents/:aid/messages|message`、`Tree.Reopen` + `InjectUserMessage`/`ReviveWithMessage`、两段提示词规程、前端树图/对话面板/编排主视图/看板时间线（删 `useRoleTree.ts`）。两处偏离计划：① `ErrInvalidSessionState` 全局映射仍是 400，直连不可用态改由新哨兵 `ErrAgentNotDirectable`（包装前者）映射 409；② 新增测试 `TestAgentMsgRedisStore_NilNoOp` 促使 `BeforeMsg`/`AfterMsg` 补 nil 守卫。
+     - 前置待决（已定）：
+       - [x] git 策略：全程不 commit（2026-09-11 用户拍板）——执行者跳过计划各任务末尾的 Commit 步骤，评审用工作区 diff
+       - [x] 执行分工：规划者只出计划，代码实施由其他执行者按本计划逐任务执行
+diff --git a/docs/superpowers/plans/2026-09-11-agent-orch-board.md b/docs/superpowers/plans/2026-09-11-agent-orch-board.md
+index 81bb55d..d2dd9a4 100644
+--- a/docs/superpowers/plans/2026-09-11-agent-orch-board.md
++++ b/docs/superpowers/plans/2026-09-11-agent-orch-board.md
+@@ -2,6 +2,8 @@
+ 
+ > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+ 
++> **执行状态（2026-09-11）：Task 1–14 已全部实施完成。** 后端 `go build ./...` + `go test ./internal/... ./pkg/...` 全绿（32 包）；前端 `vue-tsc -b` + `vite build` 零报错。各任务末尾的 Commit 步骤按用户拍板跳过（工作区 diff 评审，见 TODO #12 前置待决）。**未完成**：Task 14 Step 3 的手动验收清单（树图三态发送/复活/中断终止/Redis 降级/中断恢复连续性）需带真实会话人工执行。实现中的两处偏离见 `doc/TODO.md` 第 12 项实施记录。
++
+ **Goal:** 把任务看板的 Agent 编排升级为全宽"编排"页：层级树图（自绘 SVG）+ 点击节点查看任意 Agent 的完整对话与交互留痕 + 用户直发消息（waiting 注入唤醒 / done/failed 复活重跑 / running 禁用并复用中断终止）。
+ 
+ **Architecture:** 后端复用现有编排内核，只做增量：① `waitForChildren` 上报 `child_wait` 展示态（不刷 lastTS、不冒泡）；② `Mailbox.Send` 加 trace 钩子把邮件双写 `agent_events` 留痕；③ ReActAgent 每条入史消息热写 Redis（TTL 24h、cap 500），PG `agent_messages` 在子 Agent 终态/暂停全量落库；④ 新端点 `GET .../agents/:aid/messages`（Redis 热层 + PG 合并分页）与 `POST .../agents/:aid/message`（状态机路由：waiting 注入+poke 唤醒 / 终态 `Tree.Reopen`+同 ID 重跑 / running 409）；⑤ 提示词补"用户直连消息"处置规程。前端新增 `?view=orch` 主区视图：左树图（tidy-tree 布局 + SVG 连线 + HTML 节点卡）右对话面板（消息流 + 邮件留痕 + 三态发送框）；看板"任务目标"改为时间线。
+diff --git a/web/src/api/metrics.ts b/web/src/api/metrics.ts
+index 9908e1e..53fba71 100644
+--- a/web/src/api/metrics.ts
++++ b/web/src/api/metrics.ts
+@@ -127,3 +127,8 @@ export function getAgentEvents(id: string, agentId: string, limit = 200, offset
+ export function pauseSessionAgent(id: string, agentId: string): Promise<{ session_id: string; agent_id: string; status: string }> {
+   return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(agentId)}/pause`, { method: 'POST' })
+ }
++
++/** 终止指定子 Agent 实例（硬取消，不可恢复；编排页节点卡/面板的 ⏹ 动作）。 */
++export function cancelSessionAgent(id: string, agentId: string): Promise<{ session_id: string; agent_id: string; status: string }> {
++  return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(agentId)}/cancel`, { method: 'POST' })
++}
+diff --git a/web/src/api/session.ts b/web/src/api/session.ts
+index d546eea..dc881a9 100644
+--- a/web/src/api/session.ts
++++ b/web/src/api/session.ts
+@@ -49,6 +49,112 @@ export function sendMessage(id: string, content: string, images?: WireImage[]):
+   })
+ }
+ 
++// ---- 编排页：单 Agent 对话与用户直连（TODO 第12项）----
++
++/** 单条 Agent 消息（与后端 reactMessageWire/entriesToWire 线型对齐）。 */
++export interface AgentMessageItem {
++  seq: number
++  /** 热层条目带 RFC3339 时间戳；PG 回退路径无 at（省略）。 */
++  at?: string
++  role: 'user' | 'assistant' | 'tool' | string
++  content: string
++  reasoning?: string
++  tool_calls?: { id: string; name: string; input: unknown }[]
++  tool_call_id?: string
++}
++
++/** 一条 mailbox 留痕（后端 type=mailbox 事件，双方各一行）。 */
++export interface AgentMailItem {
++  /** 留痕时间（RFC3339）。 */
++  at: string
++  /** 发送方（user/dispatcher/子 Agent 实例 ID）。 */
++  from: string
++  /** 接收方。 */
++  to: string
++  /** 邮件类型（milestone/request/info/escalate/reply）。 */
++  msg_type: string
++  /** 主题（后端 content 的首行）。 */
++  subject: string
++  /** 正文（后端 content 去掉首行主题后的剩余部分）。 */
++  body: string
++}
++
++export interface AgentConversation {
++  agent_id: string
++  total: number
++  messages: AgentMessageItem[]
++  mails: AgentMailItem[]
++  /** 头部还有更早消息（before_seq 翻页用；本次取满 limit 即视为可能还有）。 */
++  has_more: boolean
++}
++
++/** 后端 mailbox 留痕线型（字段口径见 store.QueryAgentMailboxTrace）。 */
++interface WireMailItem {
++  role?: string
++  content?: string
++  tool_name?: string
++  input?: string
++  occurred?: string
++}
++
++/** 把后端 mailbox 留痕转成前端线型：content = subject\nbody，此处拆回首行/余下。 */
++function toMailItem(m: WireMailItem): AgentMailItem {
++  const raw = m.content ?? ''
++  const nl = raw.indexOf('\n')
++  return {
++    at: m.occurred ?? '',
++    from: m.role ?? '',
++    to: m.input ?? '',
++    msg_type: m.tool_name ?? '',
++    subject: nl >= 0 ? raw.slice(0, nl) : raw,
++    body: nl >= 0 ? raw.slice(nl + 1) : '',
++  }
++}
++
++/**
++ * 取单个 Agent 的完整对话（编排页对话面板数据源）。
++ * 滚动窗口三态：`afterSeq` 增量轮询 / `beforeSeq` 上翻 / 都不传取尾部。
++ * `aid='meta'` 后端映射为会话主 Agent（前端正常不传 meta）。
++ */
++export async function getAgentMessages(
++  id: string,
++  aid: string,
++  opts?: { beforeSeq?: number; afterSeq?: number; limit?: number },
++): Promise<AgentConversation> {
++  const qs = new URLSearchParams()
++  if (opts?.beforeSeq) qs.set('before_seq', String(opts.beforeSeq))
++  if (opts?.afterSeq) qs.set('after_seq', String(opts.afterSeq))
++  const limit = opts?.limit ?? 100
++  qs.set('limit', String(limit))
++  const res = await fetchJson<{
++    session_id: string
++    agent_id: string
++    messages?: AgentMessageItem[]
++    mails?: WireMailItem[]
++  }>(`/sessions/${id}/agents/${encodeURIComponent(aid)}/messages?${qs.toString()}`)
++  const messages = res.messages ?? []
++  const mails = (res.mails ?? []).map(toMailItem)
++  // 后端不返 total/has_more：取满 limit 视为"头部可能还有更早消息"（上翻按钮据此显示）。
++  return {
++    agent_id: res.agent_id ?? aid,
++    total: messages.length,
++    messages,
++    mails,
++    has_more: !opts?.afterSeq && messages.length >= limit,
++  }
++}
++
++/**
++ * 用户直连发送（编排页对话面板发送框）。
++ * 后端状态机：等子返回→注入唤醒；终态→复活重跑；执行中/不可直连→409（抛 APIError）。
++ */
++export function sendAgentMessage(id: string, aid: string, content: string): Promise<void> {
++  return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(aid)}/message`, {
++    method: 'POST',
++    body: JSON.stringify({ content }),
++  })
++}
++
+ export function cancelSession(id: string): Promise<{ session_id: string; status: string }> {
+   return fetchJson(`/sessions/${id}/cancel`, { method: 'POST' })
+ }
+diff --git a/web/src/composables/useRoleTree.ts b/web/src/composables/useRoleTree.ts
+deleted file mode 100644
+index adeef53..0000000
+--- a/web/src/composables/useRoleTree.ts
++++ /dev/null
+@@ -1,88 +0,0 @@
+-import { computed, unref } from 'vue'
+-import type { MaybeRef } from 'vue'
+-import type { AgentNode } from '@/types'
+-
+-export interface RoleTreeNode {
+-  label: string
+-  status: string
+-  statusType: string
+-  active: boolean
+-  isUser: boolean
+-  iconColor: string
+-  /** 活动证据小字（TODO 第10项②展示面）："in ReadFile · active 12s ago"，仅运行节点携带 */
+-  activity: string
+-  children: RoleTreeNode[]
+-}
+-
+-// formatActivityEvidence 把活动证据渲染为节点小字（TODO 第10项②展示面）：
+-// tool:<名> → "in <名> · active Xs ago"；llm_start/stream → thinking。
+-function formatActivityEvidence(kind?: string, ago?: string): string {
+-  const k = (kind ?? '').trim()
+-  const t = (ago ?? '').trim()
+-  if (!k || !t) return ''
+-  if (k.startsWith('tool:')) return `in ${k.slice(5)} · active ${t} ago`
+-  if (k === 'llm_start' || k === 'stream') return `thinking · active ${t} ago`
+-  if (k === 'user_wait') return `awaiting user · ${t} ago`
+-  return `${k} · active ${t} ago`
+-}
+-
+-export function useRoleTree(agents: MaybeRef<AgentNode[]>) {
+-  const roleTree = computed<RoleTreeNode[]>(() => {
+-    const list = unref(agents)
+-    const root: RoleTreeNode[] = []
+-    const map = new Map<string, RoleTreeNode>()
+-
+-    list.forEach((a) => {
+-      // 热驻（Idle）节点不在编排树展示（任务 114 对齐 TUI）：任务完结转 Idle 待复用，
+-      // 复用清单只供 MetaAgent 注入，对用户是噪音。
+-      if (a.status === 'idle') return
+-      const node: RoleTreeNode = {
+-        label: a.name,
+-        status: a.status,
+-        statusType:
+-          a.status === 'active'
+-            ? 'success'
+-            : a.status === 'running'
+-              ? 'warning'
+-              : a.status === 'delivered-unverified'
+-                ? 'warning'
+-                : a.status === 'failed'
+-                  ? 'danger'
+-                  : 'info',
+-        active: a.status === 'active' || a.status === 'running',
+-        isUser: a.type === 'domain' || a.type === 'subdomain',
+-        iconColor:
+-          a.status === 'active'
+-            ? 'text-green-500'
+-            : a.status === 'running'
+-              ? 'text-yellow-500'
+-              : a.status === 'delivered-unverified'
+-                ? 'text-yellow-500'
+-                : a.status === 'failed'
+-                  ? 'text-red-500'
+-                  : 'text-gray-500',
+-        activity: formatActivityEvidence(a.activity_kind, a.last_activity_ago),
+-        children: [],
+-      }
+-      map.set(a.inst_id, node)
+-      if (!a.parent_id) root.push(node)
+-    })
+-
+-    list.forEach((a) => {
+-      if (!a.parent_id) return // 根节点已在第一轮挂上
+-      if (map.has(a.parent_id)) {
+-        map.get(a.parent_id)!.children.push(map.get(a.inst_id)!)
+-      } else {
+-        // 父节点缺失（后端 parent_id 与实例 ID 口径漂移的兜底）：挂顶层而非静默丢弃，
+-        // 否则整棵子树从编排面板消失（2026-09-11 实证：只剩 MetaAgent）。
+-        root.push(map.get(a.inst_id)!)
+-      }
+-    })
+-
+-    return root
+-  })
+-
+-  const defaultProps = { children: 'children', label: 'label' }
+-
+-  return { roleTree, defaultProps }
+-}
+diff --git a/web/src/views/session/components/panels/TaskBoardPanel.vue b/web/src/views/session/components/panels/TaskBoardPanel.vue
+index 927c4a7..a9253b5 100644
+--- a/web/src/views/session/components/panels/TaskBoardPanel.vue
++++ b/web/src/views/session/components/panels/TaskBoardPanel.vue
+@@ -1,27 +1,61 @@
+ <script setup lang="ts">
+-import { computed, toRef } from 'vue'
++import { computed, ref, toRef } from 'vue'
++import { useRouter } from 'vue-router'
+ import { CircleCheck, Loading, Lock } from '@element-plus/icons-vue'
+-import type { AgentNode, TaskBoardData } from '@/types'
+-import { useRoleTree } from '@/composables/useRoleTree'
++import type { AgentNode, SessionEvent, TaskBoardData } from '@/types'
+ import { useTaskBoard } from '@/composables/useTaskBoard'
++import { useGoalTimeline } from '@/composables/useGoalTimeline'
+ 
+ const props = defineProps<{
+   agents: AgentNode[]
+   board: TaskBoardData | null
+   goal?: string
++  /** 会话事件流：任务目标时间线数据源（设计 §8）。 */
++  events?: SessionEvent[]
+ }>()
+ 
+-const { roleTree, defaultProps } = useRoleTree(toRef(props, 'agents'))
++const router = useRouter()
+ const { tasks, constraints, taskProgress } = useTaskBoard(toRef(props, 'board'))
++// 时间线（设计 §8）：user/派发/完成/失败里程碑 + board.tasks 兜底，纯前端聚合。
++const { milestones } = useGoalTimeline(
++  computed(() => props.events || []),
++  toRef(props, 'board'),
++)
+ 
+ // 任务目标：board 快照的 goal 优先（随执行演进），回退会话初始 goal
+ const goalText = computed(() => (props.board?.goal || props.goal || '').trim())
++const goalExpanded = ref(false)
++/** 时间线折叠：条数超过阈值时默认收起，避免长会话把面板撑爆。 */
++const timelineExpanded = ref(false)
++const TIMELINE_PREVIEW = 6
++const shownMilestones = computed(() =>
++  timelineExpanded.value ? milestones.value : milestones.value.slice(0, TIMELINE_PREVIEW),
++)
+ 
+ const statusLegend = [
+   { icon: CircleCheck, cls: 'text-green-500', label: '完成' },
+   { icon: Loading, cls: 'text-yellow-500', label: '运行中' },
+   { icon: Lock, cls: 'text-ink-2', label: '等待/阻塞' },
+ ]
++
++/** 里程碑圆点配色：user=主色 / dispatch=蓝 / done=绿 / failed=红。 */
++function milestoneDot(kind: string): string {
++  if (kind === 'user') return 'bg-primary'
++  if (kind === 'dispatch') return 'bg-blue-500'
++  if (kind === 'done') return 'bg-green-500'
++  return 'bg-red-500'
++}
++
++function fmtTime(iso?: string): string {
++  if (!iso) return ''
++  const d = new Date(iso)
++  return isNaN(d.getTime()) ? '' : d.toLocaleTimeString('zh-CN', { hour12: false })
++}
++
++/** 打开编排页：保留当前 query（会话上下文）只加 view=orch。 */
++function openOrch() {
++  router.replace({ query: { ...router.currentRoute.value.query, view: 'orch' } })
++}
+ </script>
+ 
+ <template>
+@@ -32,7 +66,27 @@ const statusLegend = [
+         <span class="font-bold text-sm text-ink">任务目标</span>
+         <el-progress v-if="tasks.length" :percentage="taskProgress" :show-text="false" class="w-20 custom-progress" />
+       </div>
+-      <div v-if="goalText" class="p-2 mb-2 bg-page rounded border border-line text-ink leading-relaxed">{{ goalText }}</div>
++      <!-- 目标文本默认单行折叠，点击展开（长目标不再整段撑开面板） -->
++      <div v-if="goalText" class="p-2 mb-2 bg-page rounded border border-line text-ink leading-relaxed">
++        <div :class="goalExpanded ? '' : 'truncate'">{{ goalText }}</div>
++        <button v-if="goalText.length > 40" class="text-[11px] text-primary hover:underline mt-0.5"
++                @click="goalExpanded = !goalExpanded">{{ goalExpanded ? '收起' : '展开' }}</button>
++      </div>
++
++      <!-- 任务目标时间线：user/派发/完成/失败里程碑 -->
++      <div v-if="milestones.length" class="mb-2">
++        <div class="space-y-1">
++          <div v-for="(m, i) in shownMilestones" :key="i" class="flex items-start gap-2">
++            <span class="w-1.5 h-1.5 rounded-full mt-1 shrink-0" :class="milestoneDot(m.kind)"></span>
++            <span class="text-[10px] text-ink-3 font-mono w-14 shrink-0">{{ fmtTime(m.at) }}</span>
++            <span class="text-ink-2 flex-1 min-w-0 break-words">{{ m.text }}</span>
++          </div>
++        </div>
++        <button v-if="milestones.length > TIMELINE_PREVIEW" class="text-[11px] text-primary hover:underline mt-1"
++                @click="timelineExpanded = !timelineExpanded">
++          {{ timelineExpanded ? '收起' : `显示全部 ${milestones.length} 条` }}
++        </button>
++      </div>
+       <div v-if="!tasks.length" class="text-ink-3 py-3 text-center">暂无子任务，等待 DomainAgent 拆解</div>
+       <div v-else class="space-y-1.5">
+         <div v-for="(t, i) in tasks" :key="i"
+@@ -50,35 +104,19 @@ const statusLegend = [
+       </div>
+     </div>
+ 
+-    <!-- Agent 编排（对齐 TUI 编排面板：角色树 + 状态图例） -->
+-    <div>
+-      <div class="flex justify-between items-center mb-2">
+-        <span class="font-bold text-sm text-ink">Agent 编排</span>
++    <!-- Agent 编排：树图迁至全宽编排页（?view=orch），此处只留入口卡 -->
++    <div class="p-2 bg-page rounded border border-line">
++      <div class="flex justify-between items-center mb-1">
++        <span class="font-bold text-sm text-ink">🌳 Agent 编排</span>
+         <div class="flex items-center gap-2 text-[10px] text-ink-3">
+           <span v-for="l in statusLegend" :key="l.label" class="flex items-center gap-0.5">
+             <el-icon :class="l.cls" class="text-[11px]"><component :is="l.icon" /></el-icon>{{ l.label }}
+           </span>
+         </div>
+       </div>
+-      <div v-if="!roleTree.length" class="text-ink-3 py-3 text-center">暂无角色实例，会话启动后自动创建</div>
+-      <el-tree v-else :data="roleTree" :props="defaultProps" default-expand-all
+-               class="!bg-transparent custom-tree" :expand-on-click-node="false">
+-        <template #default="{ node, data }">
+-          <div class="flex items-center justify-between w-full pr-1 py-0.5">
+-            <span class="flex items-center gap-1.5">
+-              <el-icon :class="data.iconColor" class="text-sm">
+-                <UserFilled v-if="data.isUser" /><User v-else />
+-              </el-icon>
+-              <span :class="data.active ? 'text-ink' : 'text-ink-3'" class="text-xs">{{ node.label }}</span>
+-              <span v-if="data.activity" class="text-[10px] text-ink-3">{{ data.activity }}</span>
+-            </span>
+-            <el-tag v-if="data.status" :type="data.statusType" size="small" effect="plain"
+-                    class="scale-75 origin-right">
+-              {{ data.status === 'delivered-unverified' ? '已交付未验证' : data.status }}
+-            </el-tag>
+-          </div>
+-        </template>
+-      </el-tree>
++      <div class="text-[11px] text-ink-3 mb-2">层级树图查看 Agent 关系，点击节点直达对话。</div>
++      <button class="w-full text-xs py-1.5 rounded border border-primary text-primary hover:bg-primary-soft transition-colors"
++              @click="openOrch">打开编排页 →</button>
+     </div>
+ 
+     <!-- 约束条件 -->
+diff --git a/web/src/views/session/index.vue b/web/src/views/session/index.vue
+index f1931d0..9fa6a22 100644
+--- a/web/src/views/session/index.vue
++++ b/web/src/views/session/index.vue
+@@ -35,6 +35,7 @@ import { useSessionStatus } from '@/composables/useSessionStatus'
+ import { useWorkDir } from '@/composables/useWorkDir'
+ import ChatView from './chat/ChatView.vue'
+ import MonitorView from './monitor/MonitorView.vue'
++import OrchView from './orch/OrchView.vue'
+ import TaskBoardPanel from './components/panels/TaskBoardPanel.vue'
+ import ToolPanel from './components/panels/ToolPanel.vue'
+ import SessionMemoryPanel from './components/panels/SessionMemoryPanel.vue'
+@@ -93,8 +94,11 @@ const loading = ref(false)
+ const sending = ref(false)
+ const sessionFilter = ref('')
+ 
+-// 视图切换：?view=chat|monitor，缺省 chat；chat 为缺省视图不污染 URL
+-const view = ref<'chat' | 'monitor'>((route.query.view as string) === 'monitor' ? 'monitor' : 'chat')
++// 视图切换：?view=chat|monitor|orch，缺省 chat；chat 为缺省视图不污染 URL
++const initialView = route.query.view
++const view = ref<'chat' | 'monitor' | 'orch'>(
++  initialView === 'monitor' || initialView === 'orch' ? initialView : 'chat'
++)
+ watch(view, (v) => {
+   router.replace({ query: { ...route.query, view: v === 'chat' ? undefined : v } })
+ })
+@@ -510,6 +514,9 @@ function fmtDateTime(iso: string) {
+           <button class="px-3 py-1 text-xs rounded-md transition-colors"
+                   :class="view === 'monitor' ? 'bg-card text-primary font-bold shadow-sm' : 'text-ink-2 hover:text-ink'"
+                   @click="view = 'monitor'">📊 监控</button>
++          <button class="px-3 py-1 text-xs rounded-md transition-colors"
++                  :class="view === 'orch' ? 'bg-card text-primary font-bold shadow-sm' : 'text-ink-2 hover:text-ink'"
++                  @click="view = 'orch'">🌳 编排</button>
+         </div>
+       </div>
+ 
+@@ -536,7 +543,7 @@ function fmtDateTime(iso: string) {
+         @update-clarify-drafts="handleUpdateClarifyDrafts"
+       />
+       <MonitorView
+-        v-else
++        v-else-if="view === 'monitor'"
+         :session="activeSession"
+         :events="events"
+         :agents="agents"
+@@ -546,6 +553,12 @@ function fmtDateTime(iso: string) {
+         v-model:expanded-log-id="expandedLogId"
+         @query-logs="applyLogFilters"
+       />
++      <OrchView
++        v-else-if="view === 'orch'"
++        :session="activeSession"
++        :agents="agents"
++        @refresh="activeSession && refreshPanels(activeSession.id)"
++      />
+     </main>
+ 
+     <!-- 右栏：可收起侧栏（默认收起为图标条，点击展开；各面板独立宽度，无 tab 切换） -->
+@@ -582,7 +595,7 @@ function fmtDateTime(iso: string) {
+         <!-- 单面板渲染：打开哪个只看哪个（无 tab 切换条），面板切换走图标条 -->
+         <div class="flex-1 min-h-0" :class="rightTab === 'files' ? 'overflow-hidden' : 'overflow-y-auto p-3'">
+           <TaskBoardPanel v-if="rightTab === 'board'" :agents="agents" :board="board"
+-                          :goal="activeSession?.goal || ''" />
++                          :goal="activeSession?.goal || ''" :events="events" />
+           <ToolPanel v-else-if="rightTab === 'tools'" :events="events" />
+           <FilePreview v-else-if="rightTab === 'files'" :session-id="activeSession?.id || ''" :agents="agents" />
+           <SessionMemoryPanel v-else-if="rightTab === 'memory'" :session-id="activeSession?.id || ''" />
+diff --git a/web/tsconfig.tsbuildinfo b/web/tsconfig.tsbuildinfo
+index a65d917..ffab02b 100644
+--- a/web/tsconfig.tsbuildinfo
++++ b/web/tsconfig.tsbuildinfo
+@@ -1 +1 @@
+-{"root":["./src/main.ts","./src/vite-env.d.ts","./src/api/client.ts","./src/api/files.ts","./src/api/fs.ts","./src/api/health.ts","./src/api/learned.ts","./src/api/metrics.ts","./src/api/models.ts","./src/api/plugins.ts","./src/api/preferences.ts","./src/api/session.ts","./src/api/skills.ts","./src/composables/usemodelselection.ts","./src/composables/usepanelrefresh.ts","./src/composables/useroletree.ts","./src/composables/usesessionlist.ts","./src/composables/usesessionstatus.ts","./src/composables/usesessionstream.ts","./src/composables/usetaskboard.ts","./src/composables/usetheme.ts","./src/composables/useworkdir.ts","./src/config/app.ts","./src/router/index.ts","./src/types/index.ts","./src/utils/date.ts","./src/utils/markdown.ts","./src/utils/sessionstatus.ts","./src/views/session/chat/utils/eventstyles.ts","./src/views/session/chat/utils/turns.ts","./src/app.vue","./src/components/appcard.vue","./src/components/featureplaceholder.vue","./src/components/markdownrenderer.vue","./src/components/workdirpicker.vue","./src/layout/index.vue","./src/views/dashboard/index.vue","./src/views/history/index.vue","./src/views/knowledge/index.vue","./src/views/memory/index.vue","./src/views/plugins/index.vue","./src/views/profile/index.vue","./src/views/projects/index.vue","./src/views/session/index.vue","./src/views/session/chat/chatview.vue","./src/views/session/chat/components/assistantturn.vue","./src/views/session/chat/components/chatheader.vue","./src/views/session/chat/components/chatinput.vue","./src/views/session/chat/components/messagelist.vue","./src/views/session/chat/components/thinkchain.vue","./src/views/session/chat/components/toolactivity.vue","./src/views/session/chat/components/toolcallcard.vue","./src/views/session/chat/components/userbubble.vue","./src/views/session/components/executionlog.vue","./src/views/session/components/filepreview.vue","./src/views/session/components/healthcard.vue","./src/views/session/components/mailboxcard.vue","./src/views/session/components/metricscard.vue","./src/views/session/components/sessionlogspanel.vue","./src/views/session/components/skillset.vue","./src/views/session/components/tokenmetricscard.vue","./src/views/session/components/panels/sessionmemorypanel.vue","./src/views/session/components/panels/taskboardpanel.vue","./src/views/session/components/panels/toolpanel.vue","./src/views/session/monitor/efficiencypanel.vue","./src/views/session/monitor/monitorview.vue","./src/views/settings/index.vue","./src/views/skills/index.vue","./src/views/soul/index.vue","./src/views/workflow/index.vue"],"version":"5.9.3"}
+\ No newline at end of file
++{"root":["./src/main.ts","./src/vite-env.d.ts","./src/api/client.ts","./src/api/files.ts","./src/api/fs.ts","./src/api/health.ts","./src/api/learned.ts","./src/api/metrics.ts","./src/api/models.ts","./src/api/plugins.ts","./src/api/preferences.ts","./src/api/session.ts","./src/api/skills.ts","./src/composables/usegoaltimeline.ts","./src/composables/usemodelselection.ts","./src/composables/usepanelrefresh.ts","./src/composables/usesessionlist.ts","./src/composables/usesessionstatus.ts","./src/composables/usesessionstream.ts","./src/composables/usetaskboard.ts","./src/composables/usetheme.ts","./src/composables/usetreelayout.ts","./src/composables/useworkdir.ts","./src/config/app.ts","./src/router/index.ts","./src/types/index.ts","./src/utils/date.ts","./src/utils/markdown.ts","./src/utils/sessionstatus.ts","./src/views/session/chat/utils/eventstyles.ts","./src/views/session/chat/utils/turns.ts","./src/app.vue","./src/components/appcard.vue","./src/components/featureplaceholder.vue","./src/components/markdownrenderer.vue","./src/components/workdirpicker.vue","./src/layout/index.vue","./src/views/dashboard/index.vue","./src/views/history/index.vue","./src/views/knowledge/index.vue","./src/views/memory/index.vue","./src/views/plugins/index.vue","./src/views/profile/index.vue","./src/views/projects/index.vue","./src/views/session/index.vue","./src/views/session/chat/chatview.vue","./src/views/session/chat/components/assistantturn.vue","./src/views/session/chat/components/chatheader.vue","./src/views/session/chat/components/chatinput.vue","./src/views/session/chat/components/messagelist.vue","./src/views/session/chat/components/thinkchain.vue","./src/views/session/chat/components/toolactivity.vue","./src/views/session/chat/components/toolcallcard.vue","./src/views/session/chat/components/userbubble.vue","./src/views/session/components/executionlog.vue","./src/views/session/components/filepreview.vue","./src/views/session/components/healthcard.vue","./src/views/session/components/mailboxcard.vue","./src/views/session/components/metricscard.vue","./src/views/session/components/sessionlogspanel.vue","./src/views/session/components/skillset.vue","./src/views/session/components/tokenmetricscard.vue","./src/views/session/components/panels/sessionmemorypanel.vue","./src/views/session/components/panels/taskboardpanel.vue","./src/views/session/components/panels/toolpanel.vue","./src/views/session/monitor/efficiencypanel.vue","./src/views/session/monitor/monitorview.vue","./src/views/session/orch/agentchatpanel.vue","./src/views/session/orch/agenttreecanvas.vue","./src/views/session/orch/agenttreenode.vue","./src/views/session/orch/orchview.vue","./src/views/settings/index.vue","./src/views/skills/index.vue","./src/views/soul/index.vue","./src/views/workflow/index.vue"],"version":"5.9.3"}
+\ No newline at end of file

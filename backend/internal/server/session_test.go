@@ -143,6 +143,11 @@ func (m *mockAgentForServer) PauseAgent(ctx context.Context, sessionID, instID s
 	return nil
 }
 
+// MessageAgent 用户直连，测试实现返回 nil（成功）。
+func (m *mockAgentForServer) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
+	return nil
+}
+
 // Profile 返回用户画像，测试实现返回空。
 func (m *mockAgentForServer) Profile(ctx context.Context) (*userprofile.Profile, error) {
 	return &userprofile.Profile{}, nil

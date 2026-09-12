@@ -22,6 +22,7 @@ type RedisStore struct {
 	Event    *EventRedisStore    // 事件流 Stream 与决策日志 List
 	Snapshot *SnapshotRedisStore // Agent 快照热缓存
 	TTL      *TTLRedisStore      // 话题 TTL 与整话题删除
+	AgentMsg *AgentMsgRedisStore // Agent 消息热层（编排页对话视图）
 
 	// eventCursors 维护每个 topic events stream 的已读游标（last message ID）。
 	// C4 修复：原 PollEvents 用 XRead "0" 起始，每次返回全量消息，
@@ -62,6 +63,7 @@ func NewRedisStore(ctx context.Context, addr, password string, db int) (*RedisSt
 		Event:        &EventRedisStore{client: client},
 		Snapshot:     &SnapshotRedisStore{client: client},
 		TTL:          &TTLRedisStore{client: client},
+		AgentMsg:     &AgentMsgRedisStore{client: client},
 	}, nil
 }
 

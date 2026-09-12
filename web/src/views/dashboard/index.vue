@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Session } from '@/types'
@@ -91,21 +91,23 @@ function toggleSelect(id: string) {
   else selectedIds.value.push(id)
 }
 
-// 「全选」作用于当前过滤后的列表（搜索/状态页签下语义直观）。
+// 「全选」作用于**当前页**：列表分页后"全选"只对看得见的这 10 条生效，
+// 否则一次全选会静默勾中全部 58 条（搜索/状态页签过滤后也一样），配合"删除选中"极易误删。
+// 已选集合跨页保留——"删除选中(N)"仍显示真实总数。
 const allSelected = computed(
-  () => filteredSessions.value.length > 0 && filteredSessions.value.every((s) => selectedIds.value.includes(s.id)),
+  () => pagedSessions.value.length > 0 && pagedSessions.value.every((s) => selectedIds.value.includes(s.id)),
 )
 const someSelected = computed(
-  () => !allSelected.value && filteredSessions.value.some((s) => selectedIds.value.includes(s.id)),
+  () => !allSelected.value && pagedSessions.value.some((s) => selectedIds.value.includes(s.id)),
 )
 
 function toggleSelectAll() {
   if (allSelected.value) {
-    const ids = new Set(filteredSessions.value.map((s) => s.id))
+    const ids = new Set(pagedSessions.value.map((s) => s.id))
     selectedIds.value = selectedIds.value.filter((id) => !ids.has(id))
   } else {
     const merged = new Set(selectedIds.value)
-    filteredSessions.value.forEach((s) => merged.add(s.id))
+    pagedSessions.value.forEach((s) => merged.add(s.id))
     selectedIds.value = [...merged]
   }
 }
@@ -158,6 +160,16 @@ function progressOf(s: Session) {
   return 35
 }
 
+// 会话列表分页：列表按页切片渲染（此前 el-pagination 只绑了 :total、列表渲染全量，
+// 点页码只改分页器自身状态，看起来"点了没用"）。
+const PAGE_SIZE = 10
+const currentPage = ref(1)
+const pagedSessions = computed(() => {
+  const start = (currentPage.value - 1) * PAGE_SIZE
+  return filteredSessions.value.slice(start, start + PAGE_SIZE)
+})
+const pageCount = computed(() => Math.max(1, Math.ceil(filteredSessions.value.length / PAGE_SIZE)))
+
 const filteredSessions = computed(() => {
   let list = sessions.value
   const q = searchSession.value.trim().toLowerCase()
@@ -167,6 +179,13 @@ const filteredSessions = computed(() => {
   const want = map[filter.value]
   if (!want) return list
   return list.filter(s => s.status === want)
+})
+
+// 过滤条件/搜索变化 → 回到第 1 页；数据减少（删除后）→ 把越界的页码收回来，
+// 否则会停在一个空页上（"共 N 条会话"却一条都不显示）。
+watch([() => filter.value, searchSession], () => { currentPage.value = 1 })
+watch(filteredSessions, () => {
+  if (currentPage.value > pageCount.value) currentPage.value = pageCount.value
 })
 
 const counts = computed(() => {
@@ -263,7 +282,7 @@ function activityStyle(kind: string) {
               class="w-full bg-page border-none"
               @keydown="onGoalKeydown"
             />
-            <WorkDirPicker v-model="workDir" />
+            <WorkDirPicker v-model="workDir" placeholder="进程默认目录（可更改）" />
           </div>
           <div class="w-48 h-32 flex flex-col items-center justify-center shrink-0 gap-3">
             <svg class="w-28 h-28" viewBox="0 0 140 140" fill="none">
@@ -298,7 +317,9 @@ function activityStyle(kind: string) {
       </el-card>
 
       <!-- Session List -->
-      <el-card class="flex-1 !border-line !bg-card flex flex-col body-flex-1 min-h-[400px]">
+      <!-- 卡片按内容高度排布（去掉 flex-1）：列表不再内滚，改由外层页面滚动，
+           保留 min-h 避免空结果时卡片塌成一条。 -->
+      <el-card class="!border-line !bg-card flex flex-col min-h-[400px]">
         <template #header>
           <div class="flex justify-between items-center">
             <div class="font-bold text-sm text-ink">会话列表</div>
@@ -321,14 +342,20 @@ function activityStyle(kind: string) {
             {{ {all:'全部', running:'运行中', completed:'已完成', failed:'已失败', paused:'已暂停'}[f] }} {{ counts[f as keyof typeof counts] }}
           </el-button>
           <div class="ml-auto flex items-center gap-2">
-            <el-checkbox
-              :model-value="allSelected"
-              :indeterminate="someSelected"
-              :disabled="filteredSessions.length === 0"
-              @change="toggleSelectAll"
+            <!-- 本页全选：分页后只勾当前页这 10 条（范围写在按钮上，不再用含义模糊的"全选"）。
+                 已选集合跨页保留，"删除选中(N)"显示真实总数。 -->
+            <el-button
+              size="small"
+              :type="allSelected ? 'primary' : ''"
+              :plain="!allSelected"
+              :disabled="pagedSessions.length === 0"
+              :title="allSelected ? '取消本页选择的 ' + pagedSessions.length + ' 条' : '选中本页 ' + pagedSessions.length + ' 条'"
+              @click="toggleSelectAll"
             >
-              <span class="text-xs text-ink-2">全选</span>
-            </el-checkbox>
+              <el-icon class="mr-1"><Check /></el-icon>
+              {{ allSelected ? '取消本页' : '本页全选' }}
+              <span v-if="someSelected" class="ml-1 text-[10px] opacity-70">({{ pagedSessions.filter((s) => selectedIds.includes(s.id)).length }}/{{ pagedSessions.length }})</span>
+            </el-button>
             <el-button
               v-if="selectedIds.length > 0"
               size="small"
@@ -341,9 +368,12 @@ function activityStyle(kind: string) {
           </div>
         </div>
 
-        <div class="space-y-3 flex-1 overflow-y-auto">
+        <!-- 列表不再自带滚动条：分页后每页固定 10 条，滚轮只滚页面本身——
+             此前内层 overflow-y-auto 与外层页面各有一个滚动条，滚轮滚的是内层，
+             和翻页语义打架（用户："滚轮和翻页冲突了，只保留翻页"）。 -->
+        <div class="space-y-3">
           <div
-            v-for="s in filteredSessions"
+            v-for="s in pagedSessions"
             :key="s.id"
             class="p-3 bg-page rounded border border-line flex items-center justify-between group hover:border-primary transition-colors cursor-pointer"
             @click="viewSession(s.id)"
@@ -396,7 +426,8 @@ function activityStyle(kind: string) {
 
         <div class="mt-4 flex justify-between items-center text-xs text-ink-2">
           <span>共 {{ filteredSessions.length }} 条会话</span>
-          <el-pagination small background layout="prev, pager, next" :total="filteredSessions.length" class="!p-0" />
+          <el-pagination v-model:current-page="currentPage" small background layout="prev, pager, next"
+                         :total="filteredSessions.length" :page-size="PAGE_SIZE" class="!p-0" />
         </div>
       </el-card>
     </div>
@@ -484,12 +515,8 @@ function activityStyle(kind: string) {
 </template>
 
 <style scoped>
-:deep(.body-flex-1 .el-card__body) {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
+/* 说明：原 .body-flex-1（让卡片 body 撑满并内滚）已随"列表改由页面滚动"移除，
+   否则卡片仍会被压成固定高度、10 条列表在内部被裁掉。 */
 :deep(.el-textarea__inner) {
   background-color: transparent;
   box-shadow: none !important;

@@ -6,6 +6,7 @@ import type { Session } from '@/types'
 import { listSessions } from '@/api/session'
 import { statusTagType, statusText } from '@/utils/sessionStatus'
 
+import { normDir } from '@/utils/dir'
 const route = useRoute()
 const router = useRouter()
 
@@ -26,14 +27,22 @@ const statusOptions = [
 ]
 
 const workDirOptions = computed(() => {
-  const dirs = Array.from(new Set(sessions.value.map((s) => s.work_dir || ''))).sort()
+  // 归一化去重：同一目录的不同写法（尾斜杠/盘符大小写）合成一个选项。
+  const seen = new Map<string, string>()
+  for (const s of sessions.value) {
+    const d = s.work_dir || ''
+    const k = normDir(d)
+    if (!seen.has(k)) seen.set(k, d)
+  }
+  const dirs = [...seen.values()].sort()
   return [{ value: '', label: '全部目录' }, ...dirs.map((d) => ({ value: d, label: d || '默认目录' }))]
 })
 
 const rows = computed(() =>
   sessions.value.filter((s) => {
     if (statusFilter.value && s.status !== statusFilter.value) return false
-    if (workDirFilter.value && (s.work_dir || '') !== workDirFilter.value) return false
+    // 目录过滤按规范化比较：从工作目录页带 ?work_dir= 跳入时，写法差异不该查成空列表。
+    if (workDirFilter.value && normDir(s.work_dir) !== normDir(workDirFilter.value)) return false
     const q = search.value.trim().toLowerCase()
     if (q && !s.id.toLowerCase().includes(q) && !(s.goal || '').toLowerCase().includes(q)) return false
     return true

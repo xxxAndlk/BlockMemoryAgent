@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **执行状态（2026-09-11）：Task 1–14 已全部实施完成。** 后端 `go build ./...` + `go test ./internal/... ./pkg/...` 全绿（32 包）；前端 `vue-tsc -b` + `vite build` 零报错。各任务末尾的 Commit 步骤按用户拍板跳过（工作区 diff 评审，见 TODO #12 前置待决）。**未完成**：Task 14 Step 3 的手动验收清单（树图三态发送/复活/中断终止/Redis 降级/中断恢复连续性）需带真实会话人工执行。实现中的两处偏离见 `doc/TODO.md` 第 12 项实施记录。
+
 **Goal:** 把任务看板的 Agent 编排升级为全宽"编排"页：层级树图（自绘 SVG）+ 点击节点查看任意 Agent 的完整对话与交互留痕 + 用户直发消息（waiting 注入唤醒 / done/failed 复活重跑 / running 禁用并复用中断终止）。
 
 **Architecture:** 后端复用现有编排内核，只做增量：① `waitForChildren` 上报 `child_wait` 展示态（不刷 lastTS、不冒泡）；② `Mailbox.Send` 加 trace 钩子把邮件双写 `agent_events` 留痕；③ ReActAgent 每条入史消息热写 Redis（TTL 24h、cap 500），PG `agent_messages` 在子 Agent 终态/暂停全量落库；④ 新端点 `GET .../agents/:aid/messages`（Redis 热层 + PG 合并分页）与 `POST .../agents/:aid/message`（状态机路由：waiting 注入+poke 唤醒 / 终态 `Tree.Reopen`+同 ID 重跑 / running 409）；⑤ 提示词补"用户直连消息"处置规程。前端新增 `?view=orch` 主区视图：左树图（tidy-tree 布局 + SVG 连线 + HTML 节点卡）右对话面板（消息流 + 邮件留痕 + 三态发送框）；看板"任务目标"改为时间线。
