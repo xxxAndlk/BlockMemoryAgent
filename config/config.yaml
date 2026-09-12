@@ -42,6 +42,8 @@ memory:
 
 # Agent 运行时动态参数
 agent:
+  # 测试助手交付验收开关（2026-09-12）为工作目录级配置，不在本文件：
+  # 见 <工作目录>/.bma/tester.yaml（mode: off|auto|on，默认 off；GET/PUT /api/project/tester-config 读写）。
   # -- ReAct 主循环 --
   summarize_every: 10            # 退役字段：原步频压缩扳机（每 N 步强制压缩），实测与上下文实际大小脱钩、致 Agent 每 10 步强制失忆反复重读文件。压缩已仅由 token 阈值（token_budget_per_role/context_token_budget，150K）驱动——唯一闸门。保留解析不报错，不再驱动任何逻辑（同 token_budget_per_goal 退役先例）
   summarize_keep_recent: 15      # 保留最近 15 条（2026-08-21 由 10 上调：压缩丢工具结果细节致领域 Agent 重读文件白烧慢思考轮；多留 5 条原始消息）

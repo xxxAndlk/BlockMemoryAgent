@@ -32,6 +32,15 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/textutil"
 )
 
+// AcceptanceRunner 交付验收闭环接口（测试助手大改，2026-09-12）：
+// 由 subagent.AcceptanceManager 实现，bootstrap 装配注入。
+// RunWrap 在终答提交前执行验收循环（内含三态开关判定），返回最终交付文本
+// （原文 / 原文+验收通过附报告路径 / 原文+【未验证项】段+报告路径 / 原文+未验收警告）。
+// agent 包不能 import subagent（subagent 已 import agent），故接口定义在本侧。
+type AcceptanceRunner interface {
+	RunWrap(ctx context.Context, sessionID, workDir, goal, finalAnswer string) string
+}
+
 // ReactService 是基于 ReAct（Reasoning + Acting）引擎的 Agent 接口实现。
 // 它持有内存中的会话存储，并将实际执行委托给 ReActAgent。
 type ReactService struct {
@@ -178,6 +187,11 @@ type ReactService struct {
 	// messenger 用户直连写通道（编排页对话面板），由 subagent.Dispatcher 实现。
 	// nil（未接线/测试）时 MessageAgent 一律拒绝。
 	messenger AgentMessenger
+
+	// acceptance 交付验收闭环（测试助手大改）：runSession/resumeSession 终答提交前
+	// 经 RunWrap 触发 test_assistant 验收循环，返回最终交付文本。
+	// 由 bootstrap 注入 subagent.AcceptanceManager；nil 时原样交付（零行为变化）。
+	acceptance AcceptanceRunner
 }
 
 // SetSkillCatalog 注入全局技能池：MetaAgent 会话系统提示追加全池【可用技能】目录块
@@ -658,6 +672,23 @@ type AgentMessenger interface {
 //（未接线场景：端点存在但不可用，不静默丢消息）。
 func (s *ReactService) SetAgentMessenger(m AgentMessenger) {
 	s.messenger = m
+}
+
+// SetAcceptanceRunner 注入交付验收闭环（测试助手大改，subagent.AcceptanceManager 实现）。
+// nil（默认）时终答原样交付，零行为变化。
+func (s *ReactService) SetAcceptanceRunner(r AcceptanceRunner) {
+	s.acceptance = r
+}
+
+// NotifyUserSystemMessage 按会话 ID 向用户对话页发一条系统消息
+//（验收闭环进度通告：bootstrap 经 Dispatcher.WithUserNotify 接线到这里）。
+// 会话不在内存（已淘汰/未恢复）时静默跳过。
+func (s *ReactService) NotifyUserSystemMessage(sessionID, msg string) {
+	sess := s.store.getSession(sessionID)
+	if sess == nil {
+		return
+	}
+	s.store.addEvent(sess, eventkind.System, "System", msg, "", "", "", "", "", true)
 }
 
 // injectUserMessageToRunningSession 把用户新指令投给**运行中**会话的 MetaAgent 邮箱。
@@ -2644,16 +2675,27 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		return
 	}
 
+	// 交付验收闭环（测试助手大改）：终答先经验收循环处理再交付——
+	// 未接线或 .bma/tester.yaml 为 off 时 RunWrap 原样返回，零行为变化。
+	finalText := result.Text
+	if s.acceptance != nil {
+		awd := session.currentWorkDir()
+		if awd == "" {
+			awd = s.workDir()
+		}
+		finalText = s.acceptance.RunWrap(runCtx, session.ID, awd, session.Goal, result.Text)
+	}
+
 	// 运行成功：先落完成事件再翻状态——SSE 流见终态即推 done 帧关流（stream_http.go），
 	// 事件必须先入列才能被最后一个 tick 带出；先翻状态的话 tick 落在窗口内就只推
 	// session_status+done，最终答复永远到不了前端（2026-09-09 事故缺口 B）。
-	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
+	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", finalText, "", "", "", "", "", true)
 
 	// 更新会话状态为已完成，并记录结果与历史。
 	now := time.Now()
 	s.store.mu.Lock()
 	session.Status = enums.SessionStatusCompleted
-	session.Result = result.Text
+	session.Result = finalText
 	session.EndedAt = &now
 	session.History = result.History
 	s.store.mu.Unlock()
@@ -2761,6 +2803,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 	// 召回旧话题摘要拼到本轮输入前(切换话题后续接上下文);同一话题只注入一次。
 	// 用注入会话 workDir 后的 runCtx(同 runSession):话题摘要 KV 按会话目录解析。
+	// acceptGoal 保留注入前的原始用户输入，供终答验收闭环作任务目标（不掺召回/技能前缀）。
+	acceptGoal := input
 	input = s.injectTopicRecall(runCtx, session, input)
 	// 经验技能预筛（设计 §6.5）：续跑新输入同样做向量预筛提示。
 	input = s.injectSkillRecall(ctx, input)
@@ -2787,15 +2831,28 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		return
 	}
 
+	// 交付验收闭环（同 runSession）：终答先经验收循环处理再交付。
+	finalText := result.Text
+	if s.acceptance != nil {
+		awd := session.currentWorkDir()
+		if awd == "" {
+			awd = s.workDir()
+		}
+		if strings.TrimSpace(acceptGoal) == "" {
+			acceptGoal = session.Goal
+		}
+		finalText = s.acceptance.RunWrap(runCtx, session.ID, awd, acceptGoal, result.Text)
+	}
+
 	// 先落完成事件再翻状态（同 runSession：done 帧关流前事件必须已在列，
 	// 2026-09-09 事故缺口 B）。
-	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", result.Text, "", "", "", "", "", true)
+	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", finalText, "", "", "", "", "", true)
 
 	// 更新会话状态为已完成。
 	now := time.Now()
 	s.store.mu.Lock()
 	session.Status = enums.SessionStatusCompleted
-	session.Result = result.Text
+	session.Result = finalText
 	session.EndedAt = &now
 	session.History = result.History
 	s.store.mu.Unlock()

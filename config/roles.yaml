@@ -199,14 +199,16 @@ fixed_roles:
       thinking: low
     can_be_called: true
 
-  # 测试助手
+  # 测试助手（验收测试员：与 Meta/Domain 同级的交付验收角色，只验收不实现）
   - id: test_assistant
     name: 测试助手
     type: fixed
-    description: 自动化测试与质量保障助手
-    keywords: ["测试", "test", "验证", "QA", "assert", "coverage"]
+    description: 验收测试员：模拟人类操作验收交付物，输出测试报告
+    keywords: ["测试", "test", "验证", "QA", "assert", "coverage", "验收"]
     skills: []
-    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    spec_exempt: true  # 验收派发由 dispatcher 验收闭环内部发起（Meta 终答后），不走 WriteSpec 门禁
+    # tool_catalog/tool_mount 用于按需挂载 web_search / host_computer_use 插件工具（plugins.yaml roles 已授权）。
+    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill, tool_catalog, tool_mount]
     model_config:
       model_ref: ark-deepseek-v4-flash # 连接参数见 config/models.json。deepseek 端点不稳会拖死 strict 启动校验（2026-08-04 实证），统一切 k3
       thinking: medium     # 2026-09-07 恢复 medium（TODO 第八项 P0-1）：正确率>延迟，测试编写同样需要推理预算

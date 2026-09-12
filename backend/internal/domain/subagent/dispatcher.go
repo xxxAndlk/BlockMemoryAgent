@@ -268,6 +268,11 @@ type Dispatcher struct {
 	// 为 nil 时子 Agent 不推送实时事件（不影响主流程）。
 	liveFn func(sessionID string, ev agent.LiveEvent)
 
+	// userNotifyFn 用户对话页系统消息回调（验收闭环进度通告）：
+	// AcceptanceManager 在验收开始/发现问题派回修复/通过/熔断时经它发用户可见系统消息。
+	// 由 bootstrap 接线到 ReactService 的 addEvent 包装；nil 时静默跳过（不影响主流程）。
+	userNotifyFn func(sessionID, msg string)
+
 	// treeFn 按 sessionID 取得权威 Agent 树（lazy init）。
 	// 派发前 Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
 	// 为 nil 时关闭树跟踪（测试场景），不影响派发主流程。
@@ -1574,6 +1579,13 @@ func (d *Dispatcher) WithLogger(l *logger.Logger) *Dispatcher {
 // 传 nil 关闭子 Agent 实时事件推送（默认关闭）。
 func (d *Dispatcher) WithLiveEvents(fn func(sessionID string, ev agent.LiveEvent)) *Dispatcher {
 	d.liveFn = fn
+	return d
+}
+
+// WithUserNotify 注入用户对话页系统消息回调（验收闭环进度通告用）。
+// fn(sessionID, msg) 由 bootstrap 接线到 ReactService 的 addEvent 包装；nil 时静默跳过。
+func (d *Dispatcher) WithUserNotify(fn func(sessionID, msg string)) *Dispatcher {
+	d.userNotifyFn = fn
 	return d
 }
 

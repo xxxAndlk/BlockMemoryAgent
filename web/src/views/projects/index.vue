@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import type { Session } from '@/types'
 import { listSessions } from '@/api/session'
 import { getProjectPreferences, saveProjectPreferences } from '@/api/preferences'
+import { getTesterConfig, saveTesterConfig } from '@/api/tester'
 import { useWorkDir } from '@/composables/useWorkDir'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 import { normDir } from '@/utils/dir'
@@ -30,6 +31,13 @@ const prefPath = ref('')
 const prefLoading = ref(false)
 const prefSaving = ref(false)
 const prefDirty = ref(false)
+
+// 测试助手（验收）配置状态
+const testerMode = ref<'off' | 'auto' | 'on'>('off')
+const testerPrompt = ref('')
+const testerRounds = ref(2)
+const testerLoading = ref(false)
+const testerSaving = ref(false)
 
 interface DirGroup {
   dir: string
@@ -127,13 +135,46 @@ async function savePrefs() {
   }
 }
 
-watch(selected, loadPrefs)
+async function loadTester() {
+  testerLoading.value = true
+  try {
+    const res = await getTesterConfig(selected.value || undefined)
+    testerMode.value = res.mode || 'off'
+    testerPrompt.value = res.auto_prompt || ''
+    testerRounds.value = res.max_rounds || 2
+  } catch (e) {
+    ElMessage.error('测试助手配置加载失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    testerLoading.value = false
+  }
+}
+
+async function saveTester() {
+  testerSaving.value = true
+  try {
+    await saveTesterConfig(
+      { mode: testerMode.value, auto_prompt: testerPrompt.value, max_rounds: testerRounds.value },
+      selected.value || undefined,
+    )
+    ElMessage.success('测试助手配置已保存')
+  } catch (e) {
+    ElMessage.error('保存失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    testerSaving.value = false
+  }
+}
+
+watch(selected, () => {
+  loadPrefs()
+  loadTester()
+})
 onMounted(async () => {
   await load()
   if (groups.value.length && !groups.value.some((g) => g.dir === selected.value)) {
     selected.value = groups.value[0].dir
   }
   await loadPrefs()
+  await loadTester()
 })
 
 function fmtTime(iso: string) {
@@ -195,9 +236,10 @@ function fmtTime(iso: string) {
       </div>
     </div>
 
-    <!-- 右：选中目录的项目偏好（原 project-prefs 页逻辑） -->
-    <div class="w-[420px] shrink-0 bg-card border border-line rounded-card flex flex-col overflow-hidden">
-      <div class="px-4 py-3 border-b border-line flex items-center justify-between gap-2">
+    <!-- 右：选中目录的项目偏好（原 project-prefs 页逻辑） + 测试助手配置 -->
+    <div class="w-[420px] shrink-0 flex flex-col gap-4 overflow-y-auto min-h-0">
+      <div class="bg-card border border-line rounded-card flex flex-col overflow-hidden flex-1 min-h-[320px]">
+        <div class="px-4 py-3 border-b border-line flex items-center justify-between gap-2">
         <div class="min-w-0">
           <div class="font-bold text-sm">项目偏好</div>
           <div class="text-[11px] text-ink-3 font-mono truncate">{{ prefPath || dirLabel(selected) }}</div>
@@ -224,6 +266,36 @@ function fmtTime(iso: string) {
       </div>
       <div class="px-4 py-2 border-t border-line text-[11px] text-ink-3">
         改完即时生效（下次派发即注入）；自动沉淀的行带时间戳，人工行程序永不改写。
+      </div>
+      </div>
+
+      <!-- 测试助手（验收）：工作目录级三态开关 -->
+      <div v-loading="testerLoading" class="bg-card border border-line rounded-card p-4 shrink-0">
+        <div class="font-bold text-sm mb-1">测试助手</div>
+        <p class="text-xs text-ink-2">
+          任务完成后的验收策略，按当前工作目录生效：关=不执行；智能=按描述由模型判断命中才执行；总是=每次完成后都验收。
+        </p>
+        <el-radio-group v-model="testerMode" class="mt-3">
+          <el-radio value="off">关</el-radio>
+          <el-radio value="auto">智能</el-radio>
+          <el-radio value="on">总是</el-radio>
+        </el-radio-group>
+        <el-input
+          v-if="testerMode === 'auto'"
+          v-model="testerPrompt"
+          type="textarea"
+          :rows="3"
+          spellcheck="false"
+          class="mt-2"
+          placeholder="描述什么样的任务需要验收，例如「涉及前端页面交付、需要真机点击验证的任务」"
+        />
+        <div class="mt-3 flex items-center gap-2">
+          <span class="text-xs text-ink-2 shrink-0">最大复验轮次</span>
+          <el-input-number v-model="testerRounds" :min="1" :max="5" size="small" />
+          <el-button size="small" type="primary" :loading="testerSaving" class="ml-auto" @click="saveTester">
+            保存
+          </el-button>
+        </div>
       </div>
     </div>
   </div>

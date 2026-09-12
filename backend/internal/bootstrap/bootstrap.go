@@ -81,6 +81,7 @@ type App struct {
 	DAGScheduler *dag.Scheduler            // DAG 调度器；DAG 关闭时为 nil
 	Logger       *logger.Logger            // 结构化会话日志器
 	Plugins      *plugins.Manager          // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
+	WorkDir      string                    // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
 
 	// cleanup 保存 App 关闭时需要按逆序释放的资源。
 	cleanup []func() error
@@ -679,6 +680,14 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	agentSvc.SetPausedDomainResumer(subAgentDispatcher)
 	// 注入用户直连写通道（编排页对话面板）：waiting 注入唤醒 / 终态复活重跑。
 	agentSvc.SetAgentMessenger(subAgentDispatcher)
+	// 交付验收闭环（测试助手大改 2026-09-12）：
+	// 1) 用户对话页系统消息回调（验收进度通告）接线到 ReactService 的 addEvent 包装；
+	// 2) 验收管理器挂 Dispatcher（派发 test_assistant / 复活责任节点 / 抄送邮箱），
+	//    auto 模式命中判定用轻量模型（CallLightweightWithRetry）；
+	// 3) 注入 ReactService，runSession/resumeSession 终答提交前经 RunWrap 触发
+	//    （.bma/tester.yaml 默认 off，未开启时原样交付零行为变化）。
+	subAgentDispatcher.WithUserNotify(agentSvc.NotifyUserSystemMessage)
+	agentSvc.SetAcceptanceRunner(subagent.NewAcceptanceManager(subAgentDispatcher, modelFactory.CallLightweightWithRetry))
 	// DomainAgent 热驻留（Domain 热驻 + 复用权重）：开启后 domain 任务完成/用户停止转
 	// Idle 热驻（goroutine park 等复用，call_sub_agent(reuse_agent_id=X) 唤醒），
 	// 加权 TTL 在用户下一条消息后武装。关闭（默认）时所有热驻路径零变化。
@@ -778,6 +787,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		DAGScheduler: dagScheduler,
 		Logger:       sessionLogger,
 		Plugins:      pluginManager,
+		WorkDir:      workDir,
 	}
 
 	// 第二十一步：注册关闭时释放资源的回调，按依赖顺序排列（外层 Close 会逆序调用）。

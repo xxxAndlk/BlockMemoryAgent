@@ -76,6 +76,8 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.PUT("/profile", apiHandler.SaveProfileHandler)                        // 用户画像编辑
 	api.GET("/project/preferences", apiHandler.ProjectPreferencesHandler)     // 项目偏好查看（2026-09-02 设计 §5）
 	api.PUT("/project/preferences", apiHandler.SaveProjectPreferencesHandler) // 项目偏好编辑
+	api.GET("/project/tester-config", apiHandler.TesterConfigHandler)         // 测试助手验收开关查看（工作目录级）
+	api.PUT("/project/tester-config", apiHandler.SaveTesterConfigHandler)     // 测试助手验收开关编辑
 
 	// 自进化技能库 + 进化日志（2026-09-02 设计 §8）。
 	api.GET("/skills/learned", apiHandler.ListLearnedSkillsHandler)                  // 技能库列表（含禁用）
@@ -111,6 +113,7 @@ func apiHandlerOf(app *App) *server.APIHandler {
 	h.SetStores(app.Postgres, app.Redis) // 持久化与缓存存储
 	h.SetRoleConfig(app.RoleConfig)      // 角色配置
 	h.SetModelFactory(app.ModelFactory)  // 模型工厂
+	h.SetDefaultWorkDir(app.WorkDir)     // 进程默认工作目录（work_dir 为空时的回落目录）
 	if mgr, ok := app.Agent.(agent.ModelManager); ok {
 		h.SetModelManager(mgr) // 模型动态切换（ReactService 实现；测试桩缺该能力时跳过）
 	}

@@ -60,6 +60,9 @@ type APIHandler struct {
 	statsService *StatsService             // 会话统计聚合服务
 	pluginMgr    *plugins.Manager          // 插件管理器（热插拔插件管理 API）
 	learnedSkills *store.LearnedSkillStore // 自进化技能库存储（2026-09-02 设计 §8）
+	// defaultWorkDir 进程默认工作目录（bootstrap 注入）：work_dir 参数为空时
+	// tester-config 等工作目录级配置的回落目录（与 ReactService.workDir 同源）。
+	defaultWorkDir string
 }
 
 // NewAPIHandler 创建 API 处理器。
@@ -118,6 +121,11 @@ func (h *APIHandler) SetRoleConfig(cfg *pkgconfig.RoleConfigFile) {
 // 参数 mf：模型工厂。
 func (h *APIHandler) SetModelFactory(mf *model.ModelFactory) {
 	h.modelFactory = mf
+}
+
+// SetDefaultWorkDir 注入进程默认工作目录（work_dir 参数为空时的回落目录）。
+func (h *APIHandler) SetDefaultWorkDir(dir string) {
+	h.defaultWorkDir = dir
 }
 
 // RetrieveHandler 手动检索记忆。
