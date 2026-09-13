@@ -2,7 +2,7 @@ package agent
 
 // service_react_message_test.go 覆盖编排页用户直连的状态机路由（TODO 第12项 Task 7）：
 // running+child_wait → 注入唤醒；running → ErrAgentBusy；终态 → 复活重跑；
-// Paused/Idle/meta → 拒绝；成功分支留 System 会话事件。
+// Idle → 热驻唤醒续聊；Paused/meta → 拒绝；成功分支留 System 会话事件。
 
 import (
 	"context"
@@ -21,6 +21,7 @@ import (
 type fakeMessenger struct {
 	injected  []string
 	revived   []orchestrator.Node
+	woken     []string
 	contents  []string
 	injectErr error
 	reviveErr error
@@ -30,6 +31,13 @@ type fakeMessenger struct {
 
 func (f *fakeMessenger) InjectUserMessage(agentID, content string) error {
 	f.injected = append(f.injected, agentID)
+	f.contents = append(f.contents, content)
+	return f.injectErr
+}
+
+// WakeIdleWithMessage 唤醒热驻 idle 槽并投递消息（编排页用户直连 idle 分支）。
+func (f *fakeMessenger) WakeIdleWithMessage(agentID, content string) error {
+	f.woken = append(f.woken, agentID)
 	f.contents = append(f.contents, content)
 	return f.injectErr
 }
@@ -146,26 +154,30 @@ func TestMessageAgentStateRouting(t *testing.T) {
 		})
 	}
 
-	// 分支 4：Paused / Idle → ErrInvalidSessionState（走监控页恢复 / 经 MetaAgent 派发）。
-	for _, tc := range []struct {
-		name   string
-		status orchestrator.Status
-	}{
-		{"paused_reject", orchestrator.StatusPaused},
-		{"idle_reject", orchestrator.StatusIdle},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			svc, fm, tr, sid := newMessageAgentEnv(t)
-			registerNode(t, tr, sid, "child-4", tc.status)
-			err := svc.MessageAgent(ctx, sid, "child-4", "喂")
-			if !errors.Is(err, ErrInvalidSessionState) {
-				t.Fatalf("%s 应 ErrInvalidSessionState, got %v", tc.name, err)
-			}
-			if len(fm.injected) != 0 || len(fm.revived) != 0 {
-				t.Fatal("拒绝分支不应触达 messenger")
-			}
-		})
-	}
+	// 分支 4a：Idle（热驻待复用）→ 唤醒续聊，content 透传（任务即用户消息）。
+	t.Run("idle_wake", func(t *testing.T) {
+		svc, fm, tr, sid := newMessageAgentEnv(t)
+		registerNode(t, tr, sid, "child-4", orchestrator.StatusIdle)
+		if err := svc.MessageAgent(ctx, sid, "child-4", "喂"); err != nil {
+			t.Fatalf("idle 唤醒应成功: %v", err)
+		}
+		if len(fm.woken) != 1 || fm.woken[0] != "child-4" || fm.contents[0] != "喂" {
+			t.Fatalf("idle 分支应走 WakeIdleWithMessage: %+v", fm)
+		}
+	})
+
+	// 分支 4b：Paused → 拒绝（走监控页恢复 / 经 MetaAgent 派发）。
+	t.Run("paused_reject", func(t *testing.T) {
+		svc, fm, tr, sid := newMessageAgentEnv(t)
+		registerNode(t, tr, sid, "child-4", orchestrator.StatusPaused)
+		err := svc.MessageAgent(ctx, sid, "child-4", "喂")
+		if !errors.Is(err, ErrInvalidSessionState) {
+			t.Fatalf("paused 应 ErrInvalidSessionState, got %v", err)
+		}
+		if len(fm.injected) != 0 || len(fm.revived) != 0 || len(fm.woken) != 0 {
+			t.Fatal("拒绝分支不应触达 messenger")
+		}
+	})
 
 	// 分支 5：meta 实例与空 content → 拒绝。
 	t.Run("meta_and_empty_reject", func(t *testing.T) {

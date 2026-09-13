@@ -1,0 +1,137 @@
+// Package agent 包含「工具调用之间的中间正文（assistant_text）落事件」的单元测试。
+//
+// 背景（2026-09-13 用户实证）：模型"口播一句→调工具"时，那段正文只活在瞬时 StreamingText，
+// 下一个轮次的 delta 直接覆盖、前端 live 行也在工具调用时清掉，用户看到话刚出现就消失。
+package agent
+
+import (
+	"testing"
+
+	"github.com/blockmemory/agent/backend/internal/server/eventkind"
+)
+
+// countEventsByKind 统计会话事件中指定 Kind 的条数。
+func countEventsByKind(events []internalEvent, kind string) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// TestPersistInterimText_OnToolCall 验证工具调用边界把流式正文落成 assistant_text 事件：
+// 内容/归属正确，且 StreamingText 保留（ask_user/审批 hook 还要用它做提问正文快照）。
+func TestPersistInterimText_OnToolCall(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	svc.store.setStreamingText(sess, "游戏启动脚本已热修，容器正在重启。等 wine 冷启动后我立即验证。")
+	svc.store.setThinkingText(sess, "先确认脚本改对了")
+
+	svc.handleLiveEvent(sess, LiveEvent{
+		Kind:    LiveEventToolCall,
+		Agent:   "MetaAgent",
+		AgentID: "session-1",
+		Tool:    "RunCommand",
+	})
+
+	ev := findEventByKind(sess.Events, eventkind.AssistantText)
+	if ev == nil {
+		t.Fatalf("工具调用时应落 assistant_text 事件，events=%v", sess.Events)
+	}
+	if ev.Message != "游戏启动脚本已热修，容器正在重启。等 wine 冷启动后我立即验证。" {
+		t.Fatalf("assistant_text 内容不符，got %q", ev.Message)
+	}
+	if ev.Agent != "MetaAgent" || agentIDFromDetail(ev.DetailJSON) != "session-1" {
+		t.Fatalf("assistant_text 归属不符，got agent=%q detail=%q", ev.Agent, ev.DetailJSON)
+	}
+	if ev.Type != eventkind.Message {
+		t.Fatalf("assistant_text 的 Type 应为 message，got %q", ev.Type)
+	}
+	if sess.StreamingText == "" {
+		t.Fatal("落事件后 StreamingText 必须保留（ask_user/审批 hook 还要用它做提问正文快照）")
+	}
+	// 同一边界仍应落 think 事件（思考与正文本就是两条独立留存通道）。
+	if findEventByKind(sess.Events, eventkind.Think) == nil {
+		t.Fatal("工具调用时应同时落 think 事件")
+	}
+}
+
+// TestPersistInterimText_ParallelToolCallsOnce 验证并行工具调用连发多条 ToolCall 事件时
+// 只落一条 assistant_text（流式文本未变，重复落会刷屏）。
+func TestPersistInterimText_ParallelToolCallsOnce(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	svc.store.setStreamingText(sess, "同时读两个文件")
+
+	for _, name := range []string{"ReadFile", "ListDir", "ReadFile"} {
+		svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: "session-1", Tool: name})
+	}
+	if n := countEventsByKind(sess.Events, eventkind.AssistantText); n != 1 {
+		t.Fatalf("同一段正文只应落一条 assistant_text，got %d", n)
+	}
+
+	// 下一轮正文（内容不同）照常各落一条。
+	svc.store.setStreamingText(sess, "两个文件都读完了，开始改代码")
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: "session-1", Tool: "EditFile"})
+	if n := countEventsByKind(sess.Events, eventkind.AssistantText); n != 2 {
+		t.Fatalf("新一轮正文应再落一条，got %d", n)
+	}
+}
+
+// TestPersistInterimText_Skips 验证空正文与 ask_user 不落事件。
+func TestPersistInterimText_Skips(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+
+	// 空正文：不落。
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", Tool: "ReadFile"})
+	if n := countEventsByKind(sess.Events, eventkind.AssistantText); n != 0 {
+		t.Fatalf("空正文不应落 assistant_text，got %d", n)
+	}
+
+	// ask_user：正文由提问事件的 report_text 承载，这里跳过（否则对话栏重复展示同一段话）。
+	svc.store.setStreamingText(sess, "我先问清楚需求再动手")
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: "session-1", Tool: "ask_user"})
+	if n := countEventsByKind(sess.Events, eventkind.AssistantText); n != 0 {
+		t.Fatalf("ask_user 不应落 assistant_text，got %d", n)
+	}
+}
+
+// TestPersistInterimText_SubAgentPrefixStripped 验证子 Agent 正文的【展示名】前缀被剥离。
+func TestPersistInterimText_SubAgentPrefixStripped(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	svc.store.setStreamingText(sess, "【代码助手】\n正在重构渲染循环")
+
+	svc.handleLiveEvent(sess, LiveEvent{
+		Kind:    LiveEventToolCall,
+		Agent:   "代码助手",
+		AgentID: "session-1/code_assistant-5",
+		Tool:    "EditFile",
+	})
+
+	ev := findEventByKind(sess.Events, eventkind.AssistantText)
+	if ev == nil {
+		t.Fatal("子 Agent 正文也应落 assistant_text 事件")
+	}
+	if ev.Message != "正在重构渲染循环" {
+		t.Fatalf("应剥离【Agent】前缀，got %q", ev.Message)
+	}
+	if agentIDFromDetail(ev.DetailJSON) != "session-1/code_assistant-5" {
+		t.Fatalf("DetailJSON 应含子 Agent 实例 ID，got %q", ev.DetailJSON)
+	}
+}
+
+// TestTrimDebugEvents_KeepsAssistantText 验证头部裁剪只丢调试类事件，
+// assistant_text（用户要看的正文）不在裁剪范围内。
+func TestTrimDebugEvents_KeepsAssistantText(t *testing.T) {
+	events := []internalEvent{
+		{Kind: eventkind.AssistantText, Message: "第一轮正文"},
+		{Kind: eventkind.Think, Message: "第一轮思考"},
+		{Kind: eventkind.Prompt, Message: "prompt"},
+		{Kind: eventkind.TokenUsage, Message: "token"},
+		{Kind: eventkind.GraphStep, Message: "step"},
+	}
+	out := trimDebugEvents(events, 10)
+	if len(out) != 1 || out[0].Kind != eventkind.AssistantText {
+		t.Fatalf("裁剪后应只留 assistant_text，got %v", out)
+	}
+}

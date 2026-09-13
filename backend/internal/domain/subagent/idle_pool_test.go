@@ -1,8 +1,8 @@
 package subagent
 
 // idle_pool_test.go 验证 DomainAgent 热驻留核心路径（仅 hotCfg.Enabled 开启时）：
-//   - domain 任务完成 → tree.Idle + 父 notify + pending 归零 + 槽 idle 热存（无 TTL）。
-//   - ArmIdleTTLs 武装 TTL；到期投 opDestroy 销毁槽 + tree Finish Done。
+//   - domain 任务完成 → tree.Idle + 父 notify + pending 归零 + 槽 idle 热存（enterIdle 即武装 TTL）。
+//   - TTL 到期投 opDestroy 销毁槽 + tree Finish Done；复用/直连唤醒停表，完成按新权重重新武装。
 //   - 复用派发（reuse_agent_id）：idle 槽唤醒 + reuseCount++ + 新任务执行。
 //   - 忙碌槽入队：当前任务完成后自动出队执行。
 //   - 失败销毁：err 路径 slot destroyed + treeFinish Failed。
@@ -11,6 +11,7 @@ package subagent
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -79,7 +80,7 @@ func newIdleTestEnv(t *testing.T, provider agent.ModelProvider, ttl time.Duratio
 }
 
 // TestHotDomain_TaskDoneEntersIdle 验证热驻 domain 任务完成：
-// tree.Idle + 父 notify + pending 归零 + 槽状态 idle（无 TTL timer——完成后一直热存）。
+// tree.Idle + 父 notify + pending 归零 + 槽状态 idle（enterIdle 即武装 TTL——完成即开始销毁倒计时）。
 func TestHotDomain_TaskDoneEntersIdle(t *testing.T) {
 	provider := &scriptProvider{lines: []string{"domain result"}}
 	d, mb, tr, toolsReg := newIdleTestEnv(t, provider, time.Hour)
@@ -120,15 +121,16 @@ func TestHotDomain_TaskDoneEntersIdle(t *testing.T) {
 	if state != slotIdle {
 		t.Errorf("slot state = %d, want slotIdle", state)
 	}
-	if ttlArmed {
-		t.Error("TTL should NOT be armed on enterIdle (armed only after next user message)")
+	if !ttlArmed {
+		t.Error("TTL should be armed on enterIdle (countdown starts at task completion)")
 	}
 }
 
-// TestHotDomain_ArmAndExpiry 验证 TTL 生命周期：ArmIdleTTLs 武装；到期销毁槽 + tree Done。
+// TestHotDomain_ArmAndExpiry 验证 TTL 生命周期：enterIdle 完成即武装（ArmIdleTTLs 幂等兼容）；
+// 到期销毁槽 + tree Done。
 func TestHotDomain_ArmAndExpiry(t *testing.T) {
 	provider := &scriptProvider{lines: []string{"result"}}
-	d, _, tr, toolsReg := newIdleTestEnv(t, provider, 80*time.Millisecond)
+	d, _, tr, toolsReg := newIdleTestEnv(t, provider, 500*time.Millisecond)
 
 	res, _ := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
 		"role_id":        "domain",
@@ -142,7 +144,7 @@ func TestHotDomain_ArmAndExpiry(t *testing.T) {
 		return ok && n.Status == orchestrator.StatusIdle
 	})
 
-	// 武装 TTL。
+	// enterIdle 已武装（完成即开始倒计时）；ArmIdleTTLs 为幂等兼容调用。
 	d.ArmIdleTTLs("s1")
 	s := d.pool.slot("s1", subID)
 	if s == nil {
@@ -152,7 +154,7 @@ func TestHotDomain_ArmAndExpiry(t *testing.T) {
 	armed := s.ttlArmed
 	s.mu.Unlock()
 	if !armed {
-		t.Fatal("TTL not armed after ArmIdleTTLs")
+		t.Fatal("TTL not armed after enterIdle")
 	}
 
 	// 到期：槽销毁 + tree Done。
@@ -392,4 +394,207 @@ func TestIdleRoster_WrittenFiles(t *testing.T) {
 	if len(roster[0].WrittenFiles) != 1 || roster[0].WrittenFiles[0] != "app.conf" {
 		t.Errorf("roster written files = %v, want [app.conf]", roster[0].WrittenFiles)
 	}
+}
+
+// gateProvider 第 blockOn 次（1 起计）LLM 调用阻塞至 release 关闭，
+// 便于断言任务执行中的槽中态（running/reuseCount）；其余调用立即返回。
+type gateProvider struct {
+	mu      sync.Mutex
+	calls   int
+	blockOn int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (m *gateProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	m.mu.Lock()
+	m.calls++
+	n := m.calls
+	m.mu.Unlock()
+	if n == m.blockOn {
+		close(m.entered)
+		<-m.release
+	}
+	return &blades.ModelResponse{Message: blades.AssistantMessage("result")}, nil
+}
+func (m *gateProvider) Name() string { return "gate-mock" }
+
+// TestHotDomain_UserWakeIdle 验证用户直连唤醒热驻 idle 槽（WakeIdleWithMessage）：
+// 槽回 running + reuseCount+1 + 任务文本=用户消息原文（无派发前缀）；
+// 完成回 idle 后 pending 对称、父邮箱有"用户直连唤醒"MsgInfo。
+func TestHotDomain_UserWakeIdle(t *testing.T) {
+	provider := &gateProvider{blockOn: 2, entered: make(chan struct{}), release: make(chan struct{})}
+	d, mb, tr, toolsReg := newIdleTestEnv(t, provider, time.Hour)
+
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "第一任务",
+		"domain":         "金融",
+		"responsibility": "负责金融模块",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
+	}
+	subID := subAgentIDOf(res)
+	waitForCond(t, "tree idle", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusIdle
+	})
+	mb.Drain("s1") // 清掉首任务完成通知，后续只数用户直连相关邮件。
+
+	// 用户直连唤醒 idle 槽。
+	if err := d.WakeIdleWithMessage(subID, "帮我再看看"); err != nil {
+		t.Fatalf("WakeIdleWithMessage failed: %v", err)
+	}
+
+	// 等唤醒任务进入执行（第二次 LLM 调用被 gate 卡住）。
+	select {
+	case <-provider.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("唤醒任务未开始执行")
+	}
+
+	// 执行中态：槽 running + reuseCount+1 + 树 Running（TTL 已停表，完成回 idle 重新武装）。
+	s := d.pool.slot("s1", subID)
+	if s == nil {
+		t.Fatal("slot missing after wake")
+	}
+	s.mu.Lock()
+	state, rc := s.state, s.reuseCount
+	s.mu.Unlock()
+	if state != slotRunning {
+		t.Errorf("slot state = %d, want slotRunning", state)
+	}
+	if rc != 1 {
+		t.Errorf("reuseCount = %d, want 1", rc)
+	}
+	if n, _ := tr.Get(subID); n.Status != orchestrator.StatusRunning {
+		t.Errorf("tree status = %v, want Running", n.Status)
+	}
+
+	// 放行，唤醒任务完成回 idle。
+	close(provider.release)
+	waitForCond(t, "tree idle again", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusIdle
+	})
+
+	// 任务文本口径：history 含"【用户直连消息】"+用户原文，无 buildReuseTask 派发前缀。
+	s.mu.Lock()
+	found := false
+	for _, m := range s.history {
+		if m.Role == "user" && strings.Contains(m.Content, "【用户直连消息】") && strings.Contains(m.Content, "帮我再看看") {
+			found = true
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		t.Error("history should contain user-direct message task text")
+	}
+
+	// pending 对称：唤醒挂账与完成递减配对归零。
+	if got := d.PendingChildren("s1"); got != 0 {
+		t.Errorf("pending after wake task = %d, want 0", got)
+	}
+	// 父邮箱收到"用户直连唤醒"MsgInfo（From=dispatcher）。
+	drains := mb.Drain("s1")
+	wakeNotice := false
+	for _, m := range drains {
+		if m.Type == mailbox.MsgInfo && m.From == "dispatcher" && strings.Contains(m.Body, "用户直连唤醒") {
+			wakeNotice = true
+		}
+	}
+	if !wakeNotice {
+		t.Error("parent should receive user-direct wake notice (MsgInfo from dispatcher)")
+	}
+}
+
+// TestHotDomain_UserWakeRearmsTTL 验证对话刷新寿命：完成即武装 TTL（无需用户消息触发）；
+// 用户直连唤醒停表执行，任务完成回 idle 后按新权重重新武装满额，到期销毁槽 + tree Done。
+func TestHotDomain_UserWakeRearmsTTL(t *testing.T) {
+	provider := &scriptProvider{lines: []string{"first result", "second result"}}
+	d, _, tr, toolsReg := newIdleTestEnv(t, provider, 500*time.Millisecond)
+
+	res, _ := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "第一任务",
+		"domain":         "金融",
+		"responsibility": "负责金融模块",
+	})
+	subID := subAgentIDOf(res)
+	waitForCond(t, "tree idle", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusIdle
+	})
+
+	// 普通完成即武装 TTL（倒计时自任务完成开始）。
+	s := d.pool.slot("s1", subID)
+	s.mu.Lock()
+	armed := s.ttlArmed
+	s.mu.Unlock()
+	if !armed {
+		t.Fatal("TTL should be armed on enterIdle (countdown starts at task completion)")
+	}
+
+	// 用户直连唤醒（TTL 停表）→ 任务完成回 idle 后按新权重重新武装满额。
+	if err := d.WakeIdleWithMessage(subID, "继续聊聊"); err != nil {
+		t.Fatalf("WakeIdleWithMessage failed: %v", err)
+	}
+	waitForCond(t, "ttl re-armed after wake task done", func() bool {
+		s := d.pool.slot("s1", subID)
+		if s == nil {
+			return false
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.state == slotIdle && s.ttlArmed && s.reuseCount == 1
+	})
+
+	// 到期：槽销毁 + tree Done。
+	waitForCond(t, "slot destroyed after re-armed TTL", func() bool {
+		return d.pool.slot("s1", subID) == nil
+	})
+	waitForCond(t, "tree done after TTL", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusDone
+	})
+}
+
+// TestHotDomain_UserWakeRejected 验证错误路径：不存在槽 → ErrAgentNotDirectable；
+// running 槽 → ErrAgentBusy。
+func TestHotDomain_UserWakeRejected(t *testing.T) {
+	provider := &gateProvider{blockOn: 1, entered: make(chan struct{}), release: make(chan struct{})}
+	d, _, tr, toolsReg := newIdleTestEnv(t, provider, time.Hour)
+
+	// 不存在的槽。
+	if err := d.WakeIdleWithMessage("s1/domain-99", "喂"); !errors.Is(err, agent.ErrAgentNotDirectable) {
+		t.Fatalf("unknown slot: want ErrAgentNotDirectable, got %v", err)
+	}
+
+	// 首任务 LLM 调用被 gate 卡住 → 槽稳定 running。
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "第一任务",
+		"domain":         "金融",
+		"responsibility": "负责金融模块",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
+	}
+	subID := subAgentIDOf(res)
+	select {
+	case <-provider.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("首任务未开始执行")
+	}
+	if err := d.WakeIdleWithMessage(subID, "喂"); !errors.Is(err, agent.ErrAgentBusy) {
+		t.Fatalf("running slot: want ErrAgentBusy, got %v", err)
+	}
+
+	// 放行收尾（避免泄漏 goroutine 干扰其他用例）。
+	close(provider.release)
+	waitForCond(t, "tree idle", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusIdle
+	})
 }

@@ -30,10 +30,10 @@ import (
 // running → error + 中断提示；空串/未知值 → completed 兜底；其余状态原样保留。
 func TestRestoredSessionStatus(t *testing.T) {
 	cases := []struct {
-		stored       string
-		summary      string
-		wantStatus   enums.SessionStatus
-		wantResult   string
+		stored          string
+		summary         string
+		wantStatus      enums.SessionStatus
+		wantResult      string
 		wantInterrupted bool
 	}{
 		// 进程死亡遗留的运行态: 标记为中断。
@@ -45,6 +45,7 @@ func TestRestoredSessionStatus(t *testing.T) {
 		{stored: "error", summary: "boom", wantStatus: enums.SessionStatusError, wantResult: "boom"},
 		{stored: "awaiting_clarify", summary: "s2", wantStatus: enums.SessionStatusAwaitingClarify, wantResult: "s2"},
 		{stored: "paused_on_child", summary: "s3", wantStatus: enums.SessionStatusPausedOnChild, wantResult: "s3"},
+		{stored: "awaiting_child", summary: "s5", wantStatus: enums.SessionStatusAwaitingChild, wantResult: "s5"},
 		// 无法识别的值: completed 兜底。
 		{stored: "weird", summary: "s4", wantStatus: enums.SessionStatusCompleted, wantResult: "s4"},
 	}

@@ -24,6 +24,7 @@ const statusOptions = [
   { value: 'error', label: '失败' },
   { value: 'awaiting_clarify', label: '待澄清' },
   { value: 'paused_on_child', label: '子Agent暂停' },
+  { value: 'awaiting_child', label: '挂起等子' },
 ]
 
 const workDirOptions = computed(() => {

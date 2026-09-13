@@ -4,6 +4,8 @@ package subagent
 // 派发 test_assistant（验收测试员）模拟真人复核交付物；FAIL 时把可归属错误经
 // ReviveWithMessage 派回责任 Agent 修复、mailbox 抄送 Meta（只读知悉）、userNotifyFn
 // 通知用户，修复完成后复验，直至 PASS 或 max_rounds 硬顶按【未验证项】交付。
+// PASS 后进入录播演示阶段（demo.go，2026-09-13）：用户确认 → 录制演示视频 → 评审查验，
+// 打回意见归因后复用同款返工链路（与验收共享 max_rounds 硬顶）。
 //
 // 三态开关为工作目录级：<workDir>/.bma/tester.yaml，默认 off（零行为变化）。
 // 历史背景：旧 verifyloop 自动闭环 A/B 实证负收益，本次按用户明确要求实现，以
@@ -259,11 +261,45 @@ func (m *AcceptanceManager) run(ctx context.Context, cfg TesterConfig, sessionID
 		}
 		if passed {
 			m.notifyUser(sessionID, fmt.Sprintf("测试助手验收通过（第 %d/%d 轮）。", round, cfg.MaxRounds))
-			out := finalAnswer + "\n\n—— 测试助手验收通过"
-			if lastReport != "" {
-				out += "（验收报告：" + lastReport + "）"
+			// 演示阶段（demo.go）：用户确认后录播演示并评审。跳过/降级/评审通过
+			// approved=true 直接交付；打回返回 false + 意见原文，走下方归因返工。
+			approved, feedback, demoArtifact := m.demoStage(ctx, sessionID, t, round, lastReport)
+			if approved {
+				out := finalAnswer + "\n\n—— 测试助手验收通过"
+				var extras []string
+				if lastReport != "" {
+					extras = append(extras, "验收报告："+lastReport)
+				}
+				if demoArtifact != "" {
+					extras = append(extras, "演示视频："+demoArtifact)
+				}
+				if len(extras) > 0 {
+					out += "（" + strings.Join(extras, "；") + "）"
+				}
+				return out
 			}
-			return out
+			// 演示打回：与验收 FAIL 共享 max_rounds 硬顶（消耗本轮 round），
+			// 意见归因后走与 FAIL 相同的 reworkFailures 返工路径，下一轮重新验收+确认演示。
+			m.notifyUser(sessionID, fmt.Sprintf("演示被用户打回（第 %d/%d 轮），正在归因派回修复……", round, cfg.MaxRounds))
+			items = m.attributeDemoRejection(ctx, sessionID, t, feedback, lastReport)
+			if len(items) == 0 {
+				// 归因不出条目且名单为空：意见记未验证项，按现状交付（不阻塞）。
+				m.notifyUser(sessionID, "演示打回意见无法归因到任何执行 Agent，按现状交付（未验证项见终答）。")
+				lastItems = []acceptanceError{{AgentID: "demo", Desc: "演示打回意见（无法归因）：" + feedback}}
+				break
+			}
+			lastItems = items
+			if round == cfg.MaxRounds {
+				// 轮次硬顶仍打回：打回意见一并记入【未验证项】交付。
+				lastItems = append(lastItems, acceptanceError{AgentID: "demo", Desc: "演示打回意见：" + feedback})
+				break
+			}
+			revived, unrevived := m.reworkFailures(ctx, sessionID, t, items, round)
+			lastItems = append(lastItems, unrevived...)
+			if len(revived) > 0 {
+				m.waitNodesTerminal(ctx, t, revived) // 等修复子 Agent 全完成后进入下一轮复验
+			}
+			continue
 		}
 		lastItems = items
 		if round == cfg.MaxRounds {
@@ -426,7 +462,7 @@ type acceptanceRosterEntry struct {
 }
 
 // collectAcceptanceRoster 从权威树收集执行 Agent 名单 + 机器校验摘要。
-// 名单排除历史验收节点（test_assistant/acceptance 不承担实现责任）；
+// 名单排除全部 test_assistant 节点（验收/演示/归因均不承担实现责任）；
 // 机器校验摘要汇总非 Done 节点（Failed/Cancelled/Unverified）及其原因。
 func collectAcceptanceRoster(t *orchestrator.Tree) (roster []acceptanceRosterEntry, machineSummary string) {
 	nodes := t.Snapshot()
@@ -438,7 +474,7 @@ func collectAcceptanceRoster(t *orchestrator.Tree) (roster []acceptanceRosterEnt
 	})
 	var problems []string
 	for _, n := range nodes {
-		if n.Role == "test_assistant" && n.Domain == acceptanceDomain {
+		if n.Role == "test_assistant" {
 			continue
 		}
 		roster = append(roster, acceptanceRosterEntry{

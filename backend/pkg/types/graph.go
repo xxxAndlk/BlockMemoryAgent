@@ -62,6 +62,15 @@ type ClarifyQuestionItem struct {
 	AnsweredAt      *time.Time      `json:"answered_at,omitempty"`       // 答复时间
 }
 
+// ClarifyArtifact 是澄清请求随附的产物（评审卡内嵌演示视频/HTML 回放页等）。
+type ClarifyArtifact struct {
+	Kind    string `json:"kind,omitempty"`    // 产物类型（video / html 等）
+	Path    string `json:"path,omitempty"`    // 产物路径（相对工作目录）
+	Title   string `json:"title,omitempty"`   // 产物标题
+	Caption string `json:"caption,omitempty"` // 产物说明
+	MIME    string `json:"mime,omitempty"`    // 产物媒体类型
+}
+
 // ClarifyRequest 人机对话请求：Agent 在执行中遇到需要用户确认的问题时挂起，
 // 由 server 层通过 HTTP 暴露给前端，用户答复后恢复会话。
 type ClarifyRequest struct {
@@ -85,6 +94,8 @@ type ClarifyRequest struct {
 	Detail string `json:"detail,omitempty"`
 	// Questions 批量模式（任务 140）的全部题目；len>1 表示批量（同屏分页、统一提交）。
 	Questions []ClarifyQuestionItem `json:"questions,omitempty"`
+	// Artifacts 随问题附带的产物（如演示评审卡内嵌演示视频），空表示无产物。
+	Artifacts []ClarifyArtifact `json:"artifacts,omitempty"`
 }
 
 // UIEvent TUI 推送事件：向 bubbletea TUI / Web SSE 订阅者广播的事件信封。

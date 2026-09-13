@@ -65,6 +65,19 @@ Agent 产出的图/视频/音频/HTML 原型可直接在对话栏渲染（效果
 - **运行中用户输入 = 邮箱注入**：运行中的 ReAct 主循环**不读 `session.Messages`**，唯一触达通道是邮箱（`waitForChildren` 每周期 drain / 主循环顶部 drain）。`sendMessage` 对 running 会话经 `injectUserMessageToRunningSession`（AgentMessenger→`InjectUserMessage`）投递；等子 Agent 时立即生效，其他阶段下一步生效。`drainMailbox` 对 From=user 不冒泡 `sub_agent_done`。
 - ThinkChain 无可视步骤（只剩被折叠的 prompt/token_usage）时不渲染，避免"思考链路 0 步"空壳。
 
+## 对话栏过程留存（思考与中间正文）
+
+- **三档分类（2026-09-13 用户三轮实证定型，市面对齐：只有推理算思考）**：`turns.ts` 把事件分三档，档位决定展示位置——
+  - **推理**（`think`/`intend`）→「思考链路」盒：12px 灰、`.chain-body` 定高 280px 内部滚动、可折叠，**盒里只放推理**（此前是 llm_result/agent_done 混装的杂物盒）。
+  - **Agent 发言**（`assistant_text` 中间正文、`llm_result` 子 Agent 结果摘要、`message` Meta 中继文本、`llm`/`llm_response`/`notify`、**未知 kind**、非终态系统提示）→ 按**正文**展示（`.md-article` 15px，与最终答复同档；多 Agent 时上方标出说话者）。它们是"需要展示的东西"，不是思考。
+  - **调试/活动**（`prompt`/`token_usage`/`graph_step`/`wait`/`sub_agent_done`/`memory_recall`… 、`type=progress`）→ 折叠进思考盒计「已折叠 +N」，完整事件流看监控页（`?view=monitor`）。
+  - 判别一律用 **`kind||type`**（`prompt`/`system` 只有 type，只认 kind 会把「输入补全: gate_skip」当发言展示）。
+  - **教训**：这些发言块既不该压成灰字、也不该装箱（156/157 两轮都错在把模型说给用户的话当成了思考）；改分类时用 `groupEventsToTurns` 离线跑一遍真实会话事件（esbuild 打包 + 事件 JSON）核对每档数量，比肉眼看页面可靠。
+- **思考链累计**：`AssistantTurn.thinkEvents` 渲染**全部**推理段落（曾只留"最后一段连续 think"，一到工具调用前一段推理就整段消失）；段内去重——思考文本是累积快照（LLMDelta 与 ToolCall 各落一次），后一条是前一条超集时前一条不渲染。
+- **中间正文（`kind=assistant_text`）**：模型「口播一句→调工具」的那段正文，后端在 `LiveEventToolCall` 边界经 `persistInterimText` 落事件（一次 LLM 轮次一条；`session.lastInterimText` 去重并行工具调用；子 Agent 剥【展示名】前缀）。**ask_user 跳过**——正文由提问事件 `detail_json.report_text` 承载（任务 152），再落会重复展示。前端 `classifyEvent` 显式认这个 kind（属上方"Agent 发言"档），收进 `Turn.narrations` 渲染；`isAssistantTextEvent` 到达即清 live 行，防与正文块同屏重复。
+- **刻意不清 `StreamingText`**：ask_user / 审批 hook 还要用它做提问正文快照，提前清会让问答卡上方的正文丢失。`trimDebugEvents` 不裁 `assistant_text`（只裁 think/prompt/token_usage/graph_step）。
+- TUI 侧暂无 `assistant_text` 渲染分支（不显示、也无从消失），仍只有 `StreamingText` live 行。
+
 ## 问答卡（ask_user）正文留存与提交韧性
 
 - **正文留存**：模型「先输出正文、再调 ask_user」时正文只在瞬时 `StreamingText`（流式增量按设计不落事件）。三个 hook（单题/批量/审批）在**持锁区**取快照，经 `clarifyReportJSON` 挂到提问事件 `detail_json.report_text`（零迁移；批量只挂第一条）。前端 `clarifyReportFromDetail` → `Turn.clarifyReport` → `AssistantTurn` 在问答卡上方按正文渲染，刷新/回放后仍在。空正文不写字段。

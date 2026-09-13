@@ -18,6 +18,7 @@ export function kindTagType(kind?: string, type?: string): TagType {
   if (k === 'graph_step') return 'info'
   if (k === 'agent_done') return 'success'
   if (k === 'clarify') return 'warning'
+  if (k === 'assistant_text') return 'primary'
   return 'info'
 }
 
@@ -37,6 +38,7 @@ export function kindIcon(kind?: string, type?: string): string {
   if (k === 'graph_step') return 'Connection'
   if (k === 'agent_done') return 'CircleCheck'
   if (k === 'clarify') return 'QuestionFilled'
+  if (k === 'assistant_text') return 'ChatDotRound'
   return 'InfoFilled'
 }
 
@@ -70,6 +72,7 @@ export function kindLabel(kind?: string, type?: string): string {
     topic_switch: '话题切换',
     sub_agent_dispatch: '派发子Agent',
     sub_agent_done: '子Agent完成',
+    assistant_text: '中间正文',
     interrupt: '中断',
     enqueue: '入队',
   }

@@ -170,6 +170,11 @@ const (
 	// MetaAgent 检测到后主动暂停会话。用户发任意消息(如"继续")将优先恢复该 Paused DomainAgent。
 	// 与 AwaitingClarify 区分:后者等澄清答复,前者等恢复暂停的子 Agent。
 	SessionStatusPausedOnChild SessionStatus = "paused_on_child"
+
+	// SessionStatusAwaitingChild 挂起等子:任务已全部派发,Meta 挂起等待子 Agent 回传。
+	// 子 Agent 完成(trackChildDone 回调)自动唤醒续跑;用户也可直接发新消息唤醒。
+	// 与 PausedOnChild 区分:后者是子 domain 触限暂停需用户续跑,前者是正常等回传。
+	SessionStatusAwaitingChild SessionStatus = "awaiting_child"
 )
 
 // ChatRole 对话角色:ChatMessage 的角色分类,与 OpenAI Chat Completion 协议对齐。

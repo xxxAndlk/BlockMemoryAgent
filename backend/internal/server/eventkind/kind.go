@@ -20,6 +20,7 @@ const (
 	AgentCreated = "agent_created" // Agent 创建事件
 
 	Progress      = "progress"       // 进度事件
+	AssistantText = "assistant_text" // 工具调用之间的助手正文（口播）事件
 	Clarify       = "clarify"        // 需要澄清事件
 	ClarifyDetail = "clarify_detail" // 澄清附加长上下文事件（任务 140：先于问题展示的 detail 块）
 	Stats         = "stats"          // 统计事件

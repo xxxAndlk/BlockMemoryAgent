@@ -73,6 +73,9 @@ type reactInternalSession struct {
 	// 数十次完全相同的事件（实证：一条"等待回传"叙事在日志重复 40+ 行），
 	// 相同文本只落一次。
 	lastThinkEventText string
+	// lastInterimText 是已落事件流的最后一条 assistant_text 文本：persistInterimText 去重依据。
+	// 同轮并行多个工具调用会连发多条 ToolCall 事件而流式文本不变，同一段正文只落一次。
+	lastInterimText string
 	// ctx 是会话的运行上下文，用于控制生命周期与取消。
 	ctx context.Context
 	// cancelFn 用于取消 ctx，通常在会话结束或关闭时调用。
@@ -112,6 +115,10 @@ type reactInternalSession struct {
 	askUserBatch chan []string
 	// pendingClarify 是当前待用户答复的确认/澄清请求（含审批问题），随会话快照透出给前端。
 	pendingClarify *ClarifyRequest
+	// wakeInput 是「挂起等子」（awaiting_child）会话被子 Agent 完成回调唤醒时的本轮输入：
+	// WakeOnChildDone 翻 Running 时写入，resumeSession 优先取作输入并即取即清（一次性）。
+	// 访问走 store.mu；空串=非唤醒轮（按最后一条 user 消息续跑）。
+	wakeInput string
 	// stopTimer 是软停止销毁倒计时定时器（TODO #37）：Stop 后启动，到期硬销毁；
 	// 续跑触发时取消。nil=无进行中的倒计时。
 	stopTimer *time.Timer
@@ -131,13 +138,14 @@ const interruptedByRestartMsg = "因服务重启中断，可发送消息继续"
 //   - "running"：进程死亡遗留的运行态 → error + 中断提示（优雅停机会先把 running 标为
 //     error 再落库，库里还能读到 running 说明是硬崩溃/断电）；
 //   - ""（009 迁移前的旧数据）或无法识别的值：无从判断终态，按 completed + summary 兜底；
-//   - awaiting_clarify/paused_on_child/completed/error：状态原样保留，结果取 summary。
+//   - awaiting_clarify/paused_on_child/awaiting_child/completed/error：状态原样保留，结果取 summary。
 //     恢复后 approval/askUser 通道为 nil，sendMessage 对 nil 通道自然回落普通续跑路径。
 func restoredSessionStatus(stored, summary string) (status enums.SessionStatus, result string, interrupted bool) {
 	switch enums.SessionStatus(stored) {
 	case enums.SessionStatusRunning:
 		return enums.SessionStatusError, interruptedByRestartMsg, true
 	case enums.SessionStatusAwaitingClarify, enums.SessionStatusPausedOnChild,
+		enums.SessionStatusAwaitingChild,
 		enums.SessionStatusCompleted, enums.SessionStatusError:
 		return enums.SessionStatus(stored), summary, false
 	default:
@@ -676,7 +684,7 @@ func (st *reactSessionStore) snapshotSessionEvents(session *reactInternalSession
 
 // stillLive 报告会话是否仍在内存映射中且为同一指针实例。
 // 落库守卫：DeleteSession 先从 map 摘除会话再清 PG 数据；若运行中的收尾 goroutine
-//（finalizeSession → persistHistory/persistEvents）在删除之后才跑到落库，会把刚清掉的
+// （finalizeSession → persistHistory/persistEvents）在删除之后才跑到落库，会把刚清掉的
 // session_history/session_events 行重新 upsert 回去，会话"复活"。落库前校验 map 成员
 // 身份即可拦截（正常路径落库时会话必然仍在 map——淘汰/删除都发生在终态落库之后）。
 func (st *reactSessionStore) stillLive(session *reactInternalSession) bool {

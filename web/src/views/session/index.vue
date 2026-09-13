@@ -3,7 +3,7 @@ import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage } from '@/types'
-import { isToolCallEvent, isUserMessageEvent } from '@/types'
+import { isAssistantTextEvent, isToolCallEvent, isUserMessageEvent, clarifyArtifactsFromFrame } from '@/types'
 import {
   createSession,
   sendMessage,
@@ -283,12 +283,15 @@ function startStream(s: Session) {
       if ((ev as any).type === 'awaiting_clarify') {
         const qid = (ev as any).question_id || ''
         const qs = ((ev as any).questions || []) as ClarifyQuestionItem[]
+        // 帧附带的产物（演示视频等）：脏数据在 clarifyArtifactsFromFrame 内清洗/按扩展名兜底推断
+        const arts = clarifyArtifactsFromFrame((ev as any).artifacts)
         clarifyPending.value = {
           options: (ev as any).options || [],
           multiSelect: !!(ev as any).multi_select,
           questionId: qid,
           detail: (ev as any).detail || '',
           questions: qs.length > 1 ? qs : undefined,
+          artifacts: arts.length ? arts : undefined,
         }
         // 批量题：懒初始化逐题草稿（键=question_id，抗帧重推/重连）
         if (qs.length > 1 && !clarifyDrafts.value[qid]) {
@@ -308,9 +311,10 @@ function startStream(s: Session) {
       if (classifyEvent(ev) === 'user_message') {
         replyStash.value = { ...replyStash.value, [ev.timestamp]: liveStreaming.value }
       }
-      // 工具调用/新指令落地 = 上一段流式输出已终结：清 live 缓冲，防旧正文在新回合
+      // 工具调用/新指令/中间正文落地 = 上一段流式输出已终结：清 live 缓冲，防旧正文在新回合
       // 重复渲染（任务 140 问题⑤ web 侧双保险，后端已在 hook 恢复时清 StreamingText）。
-      if (isToolCallEvent(ev) || isUserMessageEvent(ev)) {
+      // assistant_text（2026-09-13）：正文已落事件由对话栏持久渲染，live 行不清会与之同屏重复。
+      if (isToolCallEvent(ev) || isUserMessageEvent(ev) || isAssistantTextEvent(ev)) {
         liveStreaming.value = ''
         liveThinking.value = ''
       }

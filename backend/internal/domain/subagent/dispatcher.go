@@ -273,6 +273,11 @@ type Dispatcher struct {
 	// 由 bootstrap 接线到 ReactService 的 addEvent 包装；nil 时静默跳过（不影响主流程）。
 	userNotifyFn func(sessionID, msg string)
 
+	// childDoneFn 子 Agent 完成回调（「挂起等子」awaiting_child 的唤醒入口）：
+	// trackChildDone 每次递减后异步触发（含失败/被杀/收口路径），接收方按会话态过滤
+	// 幂等空转。由 bootstrap 接线到 ReactService.WakeOnChildDone；nil 时跳过。
+	childDoneFn func(parentID string)
+
 	// treeFn 按 sessionID 取得权威 Agent 树（lazy init）。
 	// 派发前 Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
 	// 为 nil 时关闭树跟踪（测试场景），不影响派发主流程。
@@ -463,12 +468,19 @@ func (d *Dispatcher) trackChildStart(parentID string) {
 // trackChildDone 在子 Agent 结束（成功/失败/超时）时递减父 Agent 未决计数，
 // 并非阻塞地通知一声，唤醒可能在 WaitForAnyChild 中等待的父 Agent。
 // 计数归零（全部兄弟完成）时异步触发跨域契约检查（TODO #57）。
+// childDoneFn（「挂起等子」唤醒回调）每次递减后异步触发：各路径 mailbox 完成摘要
+// 落箱与 trackChildDone 的先后序不一，异步回调 + 接收方按 awaiting_child 态过滤，
+// 保证唤醒 resume 时摘要已落箱且重复唤醒幂等。
 func (d *Dispatcher) trackChildDone(parentID string) {
 	ps := d.getOrCreatePending(parentID)
 	ps.count.Add(-1)
 	select {
 	case ps.notify <- struct{}{}:
 	default:
+	}
+	if d.childDoneFn != nil && parentID != "" {
+		fn := d.childDoneFn
+		go fn(parentID)
 	}
 	if ps.count.Load() == 0 {
 		go d.maybeRunContractChecks(parentID)
@@ -1070,7 +1082,7 @@ func (d *Dispatcher) InjectUserMessage(agentID, content string) error {
 
 // ReviveWithMessage 复活终态子 Agent 并以用户消息为增量输入同 ID 重跑。
 // 种子 = 原任务 + 上轮 Summary/Err + 用户新消息；运行骨架完全镜像 dispatchOne
-//（ctx 重建 → Reopen+SetCancel → subMeta/activity/ensurePatrol → goroutine
+// （ctx 重建 → Reopen+SetCancel → subMeta/activity/ensurePatrol → goroutine
 // runSubAgent → 父 poke+邮件通知 → ledger 重记）。
 func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.Node, userMsg string) error {
 	roleDef := d.registry.Get(node.Role)
@@ -1586,6 +1598,13 @@ func (d *Dispatcher) WithLiveEvents(fn func(sessionID string, ev agent.LiveEvent
 // fn(sessionID, msg) 由 bootstrap 接线到 ReactService 的 addEvent 包装；nil 时静默跳过。
 func (d *Dispatcher) WithUserNotify(fn func(sessionID, msg string)) *Dispatcher {
 	d.userNotifyFn = fn
+	return d
+}
+
+// WithChildDoneNotify 注入子 Agent 完成回调（「挂起等子」awaiting_child 唤醒用）。
+// fn(parentID) 由 bootstrap 接线到 ReactService.WakeOnChildDone；nil 时跳过。
+func (d *Dispatcher) WithChildDoneNotify(fn func(parentID string)) *Dispatcher {
+	d.childDoneFn = fn
 	return d
 }
 
@@ -2486,7 +2505,7 @@ func (d *Dispatcher) resolveIdleSiblingReuse(ctx context.Context, parentID, doma
 // verifyKind 为校验分层（auto/executable/rubric/none，空串=auto，TODO #43），
 // toolsHint 为建议工具集（TODO #52，可空）：校验 ∩ 子 Agent 角色天花板后预挂载到子 scope，
 // skillsHint 为下放技能集（技能渐进披露，可空）：校验 ⊆ 父持有集后并入子持有集
-//（角色固定集自动并入，越界项忽略并随结果回告父 Agent），
+// （角色固定集自动并入，越界项忽略并随结果回告父 Agent），
 // wallClock 为派发级墙钟（>0 时取 min(wallClock, sub_agent_timeout) 替代全局值，到期前预警）。
 // reuseAgentID 非空时走热驻复用（idle_pool.go dispatchToIdleSlot）：唤醒 idle domain
 // 或忙碌入队，忽略 roleID/task 以外的派发参数（复用 Agent 技能集沿用槽内冻结值，skillsHint 忽略）。
@@ -4468,7 +4487,7 @@ const sharedPrefixMarker = "【共享记忆】\n"
 // sharedStaleWarning 是普通共享记忆槽 stale（所涉文件已被修改或已标 invalidated_at）时
 // 仍注入、前置的警告行：行号类结论可能漂移，常量值/签名类结论仍可直接采信。
 // 旧逻辑 stale 即跳过注入（叠加 registry 物理删除），子 Agent 下次派发从零重读同一批文件
-//（实证：单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）。
+// （实证：单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）。
 // 措辞不含字面量【任务规范】/【共享记忆】/【当前任务】，避免干扰按标记切分前缀的既有逻辑与测试。
 const sharedStaleWarning = "【失效警告】以下共享记忆所涉文件已被修改，行号可能漂移，常量值/签名类结论仍可直接采信：\n"
 
@@ -4756,7 +4775,7 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain str
 // Acceptance + files mtime 一致）。供 callSubAgentTool.Execute 在 SpecEnforcementEnabled
 // 开启时调用，缺失则拒绝派发。domain 非空时校验该领域专属 spec（TODO #65 多 key 化），
 // 缺失则回退遗留单键；domain 空只校验单键 + 唯一 keyed spec 候选回退
-//（reuse 派发省略 domain 的场景，2026-08-26：复用路径 spec key 不受 domain 名约束）。
+// （reuse 派发省略 domain 的场景，2026-08-26：复用路径 spec key 不受 domain 名约束）。
 // 返回 (通过, 原因文案)：失败时区分 missing（未写）/ invalid（内容不合法）/ stale（文件已变更），
 // stale 精确列出失配文件路径，让 LLM 定向修正（重写被改文件或剔除无关文件）而非盲猜重写整个 spec。
 // 通过且原因非空 = 唯一候选回退附警告（key/domain 错配放行，模型应对齐）。

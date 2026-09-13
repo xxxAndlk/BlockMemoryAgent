@@ -78,7 +78,7 @@ type ReactService struct {
 	// ActivityKind/LastActivityAgo。为 nil 时字段留空。
 	activityEvidenceProvider ActivityEvidenceProvider
 	// idleTTLArmer 可选的 Idle TTL 武装器（Domain 热驻），sendMessage 在新用户
-	// 消息到达时调用 ArmIdleTTLs（完成后一直热存，TTL 只在用户消息后启动）。
+	// 消息到达时调用 ArmIdleTTLs（倒计时自任务完成 enterIdle 即已武装，此调用幂等兼容）。
 	// 为 nil 时零行为。
 	idleTTLArmer IdleTTLArmer
 	// sessionAgentWaker 可选的会话挂起唤醒器（Domain 热驻），sendMessage 在非
@@ -350,7 +350,7 @@ func (s *ReactService) SaveProfile(ctx context.Context, content string) error {
 }
 
 // extractProfilePreferences 会话完成时扫对话提取偏好增量并 Merge 整理入画像
-//（TODO #28 双路写入之 b + 2026-09-02 期 1 Merge 升级）。
+// （TODO #28 双路写入之 b + 2026-09-02 期 1 Merge 升级）。
 // 仅提取用户消息（user 角色）；提取失败/空结果零副作用（不阻塞会话收尾）。
 // Merge：轻量模型对偏好/技术栈/沟通风格小节去重+冲突归档；合并不可用降级直写反馈记录。
 func (s *ReactService) extractProfilePreferences(session *reactInternalSession) {
@@ -540,7 +540,7 @@ func (s *ReactService) SetPersonaInjector(p PersonaInjector) {
 }
 
 // metaPersona 返回 MetaAgent 的注入器组合：人格（soul）+ 用户画像（TODO #28）+ 项目偏好
-//（2026-09-02 设计 §5：项目偏好 Meta+Domain 双注入）。
+// （2026-09-02 设计 §5：项目偏好 Meta+Domain 双注入）。
 // 用户画像仅注入 MetaAgent；项目偏好经 Dispatcher 前缀同步下发子 Agent（执行层工艺）。
 // workDir 为会话工作目录（S2）：项目偏好按会话目录解析，空串回落 store 构造目录。
 func (s *ReactService) metaPersona(workDir string) PersonaInjector {
@@ -662,14 +662,17 @@ func (s *ReactService) SetActivityEvidenceProvider(p ActivityEvidenceProvider) {
 // AgentMessenger 是用户直连子 Agent 的写通道（编排页对话面板发送框），
 // 由 subagent.Dispatcher 实现（见 Task 6 内核）：
 //   - InjectUserMessage：向等子返回中的 Agent 邮箱投 From=user 消息并唤醒其 wait loop；
-//   - ReviveWithMessage：终态节点 Reopen 后同 ID 重跑（种子=原任务+上轮结果+用户消息）。
+//   - ReviveWithMessage：终态节点 Reopen 后同 ID 重跑（种子=原任务+上轮结果+用户消息）；
+//   - WakeIdleWithMessage：热驻 idle 节点唤醒续聊（任务=用户消息，完成回 idle 后
+//     按新权重重新武装 TTL——对话刷新墙钟）。
 type AgentMessenger interface {
 	InjectUserMessage(agentID, content string) error
 	ReviveWithMessage(ctx context.Context, node orchestrator.Node, userMsg string) error
+	WakeIdleWithMessage(agentID, content string) error
 }
 
 // SetAgentMessenger 注入用户直连写通道（编排页）。nil 时 MessageAgent 一律拒绝
-//（未接线场景：端点存在但不可用，不静默丢消息）。
+// （未接线场景：端点存在但不可用，不静默丢消息）。
 func (s *ReactService) SetAgentMessenger(m AgentMessenger) {
 	s.messenger = m
 }
@@ -681,7 +684,7 @@ func (s *ReactService) SetAcceptanceRunner(r AcceptanceRunner) {
 }
 
 // NotifyUserSystemMessage 按会话 ID 向用户对话页发一条系统消息
-//（验收闭环进度通告：bootstrap 经 Dispatcher.WithUserNotify 接线到这里）。
+// （验收闭环进度通告：bootstrap 经 Dispatcher.WithUserNotify 接线到这里）。
 // 会话不在内存（已淘汰/未恢复）时静默跳过。
 func (s *ReactService) NotifyUserSystemMessage(sessionID, msg string) {
 	sess := s.store.getSession(sessionID)
@@ -713,7 +716,8 @@ func (s *ReactService) injectUserMessageToRunningSession(session *reactInternalS
 // 等子返回（running + activity_kind=child_wait）→ 邮箱注入+唤醒；
 // 执行中（running 其他）→ ErrAgentBusy（前端禁用发送，引导先中断/终止）；
 // 终态（done/failed/cancelled/delivered-unverified）→ 复活重跑；
-// Paused/Idle/meta → 拒绝（Paused 走监控页恢复；Idle 经 MetaAgent 正常派发）。
+// Idle（热驻待复用）→ 唤醒续聊，完成回 idle 后 TTL 重新起计；
+// Paused/meta → 拒绝（Paused 走监控页恢复；meta 走主对话页）。
 // 成功写一条 System 会话事件留痕，主对话流可见"用户直连了某 Agent"。
 func (s *ReactService) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
 	content = strings.TrimSpace(content)
@@ -756,8 +760,13 @@ func (s *ReactService) MessageAgent(ctx context.Context, sessionID, instID, cont
 		if err := s.messenger.ReviveWithMessage(tool.WithSessionID(ctx, sessionID), node, content); err != nil {
 			return err
 		}
-	default: // Paused / Idle / 未知
-		return fmt.Errorf("%w（Paused 请到监控页恢复；Idle 经主 Agent 派发）", ErrAgentNotDirectable)
+	case orchestrator.StatusIdle:
+		// 热驻待复用：唤醒续聊（任务=用户消息），完成回 idle 后 TTL 按新权重重新起计。
+		if err := s.messenger.WakeIdleWithMessage(instID, content); err != nil {
+			return err
+		}
+	default: // Paused / 未知
+		return fmt.Errorf("%w（Paused 请到监控页恢复）", ErrAgentNotDirectable)
 	}
 	s.store.addEvent(sess, eventkind.System, "System", "用户直连 "+instID+"："+truncateRunes(content, 200), "", "", "", "", "", true)
 	return nil
@@ -867,7 +876,7 @@ func (c ReactRuntimeConfig) LoopConfigByRole(roleID string) LoopConfig {
 }
 
 // roleTokenBudget 返回角色上下文 token 阈值:显式配置优先，否则默认 ContextTokenBudget
-//（未配时 150000）。meta 不给 0（无限）:config tool_call_max_rounds=-1 已使 maxIter 无界，
+// （未配时 150000）。meta 不给 0（无限）:config tool_call_max_rounds=-1 已使 maxIter 无界，
 // 若阈值也无界，模型不收敛时会无限循环（实证:TUI 重复思考不前进）。150K 安全网让不收敛时压缩到限暂停等续跑。
 func (c ReactRuntimeConfig) roleTokenBudget(roleID string) int {
 	if v, ok := c.TokenBudgetPerRole[roleID]; ok {
@@ -1018,7 +1027,7 @@ func (s *ReactService) startWallClock(session *reactInternalSession, wall time.D
 			return // 已淘汰
 		}
 		switch cur.Status {
-		case enums.SessionStatusRunning, enums.SessionStatusAwaitingClarify, enums.SessionStatusPausedOnChild:
+		case enums.SessionStatusRunning, enums.SessionStatusAwaitingClarify, enums.SessionStatusPausedOnChild, enums.SessionStatusAwaitingChild:
 		default:
 			s.store.mu.Unlock()
 			return // 已终止
@@ -1812,6 +1821,12 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		// 单选自动追加「其他」逃生选项（buildClarifyOptions）。
 		req.Options = buildClarifyOptions(opts.Options, opts.MultiSelect)
 		req.MultiSelect = opts.MultiSelect
+		// 随附产物（演示评审卡内嵌演示视频/回放页）：透传 agent 层 DTO。
+		for _, a := range opts.Artifacts {
+			req.Artifacts = append(req.Artifacts, ClarifyArtifact{
+				Kind: a.Kind, Path: a.Path, Title: a.Title, Caption: a.Caption, MIME: a.MIME,
+			})
+		}
 		if len(req.Options) > 0 {
 			req.Kind = "choice"
 		} else {
@@ -1890,7 +1905,7 @@ func buildClarifyOptions(opts []tool.AskUserOption, multiSelect bool) []ClarifyO
 }
 
 // AskUserBatchHook 返回 ask_user 批量模式回调（任务 140）：全部题目一次挂出
-//（同屏分页、可回退改选、必须逐题作答后统一提交）。与单题 AskUserHook 同通道
+// （同屏分页、可回退改选、必须逐题作答后统一提交）。与单题 AskUserHook 同通道
 // 范式：置 pendingClarify（Questions 全量 + 顶层镜像第一题）+ awaiting_clarify +
 // 事件流（detail 非空先落 clarify_detail，再逐题 question-only clarify）→ 阻塞等
 // answerClarify 批量分支把逐题答复写入 askUserBatch 通道 → 按题序返回。
@@ -2665,6 +2680,14 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		return
 	}
 
+	// 挂起等子（awaiting_child）：任务已全部派发、终答轮仍有未决子 Agent——
+	// 中继文本落库 + 置挂起态，等子完成回调（WakeOnChildDone）或用户消息唤醒。
+	// 先于 LimitReached 判断（两者互斥），不进验收闭环（非真终答，验收只在 pending==0 触发）。
+	if result.SuspendOnChildWait {
+		s.suspendOnChildWait(session, result)
+		return
+	}
+
 	// 达到轮数上限：不视为失败——暂停会话、保留全部进度，等待用户消息续跑。
 	if result.LimitReached {
 		kind := PauseIterationLimit
@@ -2780,23 +2803,30 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	runCtx = tool.WithTrustModeFunc(runCtx, session.currentTrustMode)
 
 	// 使用最新用户消息作为本轮输入，并以之前的历史作为种子。
-	// 倒序取最后一条 user 消息（中途可能追加了澄清/审批答复等非 user 项），
-	// 同步取出该轮用户图片注入 runCtx：带外穿透给 RunWithHistory 的首条
-	// user 消息与 call_sub_agent 子 Agent（每轮新 runCtx，图片按轮作用域）。
+	// 挂起等子唤醒轮（WakeOnChildDone 写入 wakeInput）优先取 wakeInput 作输入，
+	// 即取即清（一次性）；否则倒序取最后一条 user 消息（中途可能追加了澄清/审批
+	// 答复等非 user 项），同步取出该轮用户图片注入 runCtx：带外穿透给
+	// RunWithHistory 的首条 user 消息与 call_sub_agent 子 Agent（每轮新 runCtx，图片按轮作用域）。
 	var input string
 	var turnImages []tool.ResultImage
-	s.store.mu.RLock()
-	for i := len(session.Messages) - 1; i >= 0; i-- {
-		if session.Messages[i].Role == string(enums.ChatRoleUser) {
-			input = session.Messages[i].Content
-			turnImages = session.Messages[i].Images
-			break
+	s.store.mu.Lock()
+	wakeTurn := session.wakeInput != ""
+	if wakeTurn {
+		input = session.wakeInput
+		session.wakeInput = ""
+	} else {
+		for i := len(session.Messages) - 1; i >= 0; i-- {
+			if session.Messages[i].Role == string(enums.ChatRoleUser) {
+				input = session.Messages[i].Content
+				turnImages = session.Messages[i].Images
+				break
+			}
 		}
 	}
 	// 拷贝历史记录，避免在加锁期间被外部修改。
 	history := make([]ReactMessage, len(session.History))
 	copy(history, session.History)
-	s.store.mu.RUnlock()
+	s.store.mu.Unlock()
 	if len(turnImages) > 0 {
 		runCtx = WithUserImages(runCtx, turnImages)
 	}
@@ -2804,7 +2834,11 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 召回旧话题摘要拼到本轮输入前(切换话题后续接上下文);同一话题只注入一次。
 	// 用注入会话 workDir 后的 runCtx(同 runSession):话题摘要 KV 按会话目录解析。
 	// acceptGoal 保留注入前的原始用户输入，供终答验收闭环作任务目标（不掺召回/技能前缀）。
+	// 挂起等子唤醒轮的输入是系统唤醒提示而非用户目标，acceptGoal 回落会话 Goal。
 	acceptGoal := input
+	if wakeTurn {
+		acceptGoal = session.Goal
+	}
 	input = s.injectTopicRecall(runCtx, session, input)
 	// 经验技能预筛（设计 §6.5）：续跑新输入同样做向量预筛提示。
 	input = s.injectSkillRecall(ctx, input)
@@ -2818,6 +2852,12 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 			return
 		}
 		s.setSessionError(session, err.Error())
+		return
+	}
+
+	// 挂起等子（同 runSession）：中继文本落库 + 置 awaiting_child，不进验收闭环。
+	if result.SuspendOnChildWait {
+		s.suspendOnChildWait(session, result)
 		return
 	}
 
@@ -2870,8 +2910,8 @@ func (s *ReactService) finalizeSession(session *reactInternalSession) {
 	// 会话结束（完成/出错/暂停）时清空流式输出与思考过程状态，UI 停止渲染瞬时内容。
 	s.store.setStreamingText(session, "")
 	s.store.setThinkingText(session, "")
-	// 暂停待续（awaiting_clarify / paused_on_child）的会话保留临时目录，用户续跑时仍需其中的中间产物。
-	if session.Status != enums.SessionStatusAwaitingClarify && session.Status != enums.SessionStatusPausedOnChild {
+	// 暂停待续（awaiting_clarify / paused_on_child / awaiting_child）的会话保留临时目录，用户续跑时仍需其中的中间产物。
+	if session.Status != enums.SessionStatusAwaitingClarify && session.Status != enums.SessionStatusPausedOnChild && session.Status != enums.SessionStatusAwaitingChild {
 		// 清理会话临时目录。
 		s.store.cleanupSessionTempDir(session.ID, session.TempDir)
 	}
@@ -2908,6 +2948,35 @@ func (s *ReactService) finalizeThinking(session *reactInternalSession, ev LiveEv
 	session.lastThinkEventText = text
 	s.store.addEventDetail(session, eventkind.Think, ev.Agent, text, eventkind.Think, "", "", "", "", true, agentIDJSON(ev.AgentID))
 	s.store.setThinkingText(session, "")
+}
+
+// persistInterimText 把"调用工具前模型输出的正文"落为会话 assistant_text 事件。
+//
+// 为什么需要：模型常见「先说一句（刚做了什么/接下来干什么）、再调工具」。这段正文只存在于
+// 瞬时字段 StreamingText（流式增量按设计不落事件）——下一个 LLM 轮次的 delta 直接覆盖它，
+// 前端 live 行也在工具调用事件到达时清掉，于是用户看到「话刚出现、一调工具就整段消失」，
+// 刷新/回放后更是从来没有过（2026-09-13 用户实证）。在工具调用边界落一条事件即持久化：
+// 一次 LLM 轮次至多一条，量有界（不落 token 级事件）。
+//
+// 刻意不清 StreamingText：ask_user / 审批 hook 还要用它做提问正文快照（clarifyReportJSON），
+// 提前清空会让问答卡上方的正文丢失。ask_user 自身跳过——它的正文由提问事件的
+// detail_json.report_text 承载，这里再落一条会在对话栏重复展示同一段话。
+func (s *ReactService) persistInterimText(session *reactInternalSession, ev LiveEvent) {
+	if session == nil || ev.Tool == "ask_user" {
+		return
+	}
+	text := strings.TrimSpace(session.StreamingText)
+	// 子 Agent 的正文经 ForwardLiveEvent 加过【展示名】前缀，落事件时剥掉，
+	// 事件本身已带 Agent 归属，避免前缀污染展示（同 finalizeThinking）。
+	if ev.Agent != "" {
+		text = strings.TrimSpace(strings.TrimPrefix(text, "【"+ev.Agent+"】\n"))
+	}
+	// 同轮并行多个工具调用会连发多条 ToolCall 事件而流式文本未变——同一段正文只落一条。
+	if text == "" || text == session.lastInterimText {
+		return
+	}
+	session.lastInterimText = text
+	s.store.addEventDetail(session, eventkind.Message, ev.Agent, text, eventkind.AssistantText, "", "", "", "", true, agentIDJSON(ev.AgentID))
 }
 
 // clarifyReportJSON 把"提问前的答复正文"编码为事件的 DetailJSON（{"report_text":"..."}）。
@@ -2955,6 +3024,10 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 	case LiveEventToolCall:
 		// 工具调用开始同样意味着思考阶段结束（思考型模型常见 think→tool 而非 think→text）。
 		s.finalizeThinking(session, ev)
+		// 同一边界也是"这一轮正文说完了"：模型常见「口播一句（做了什么/接下来干什么）→调工具」，
+		// 那段正文只活在瞬时 StreamingText 里，下一个轮次的 delta 直接覆盖、前端 live 行也在
+		// 工具调用事件到达时清掉——用户看到的是"话刚出现就凭空消失"（2026-09-13 用户实证）。
+		s.persistInterimText(session, ev)
 		// call_sub_agent 是子 Agent 派发：记录专用派发事件（角色 ID 与任务摘要），
 		// 供 TUI 对话区展示阶段标记、编排面板派生子 Agent 节点。
 		if ev.Tool == "call_sub_agent" || ev.Tool == "call_sub_agents" {
@@ -3002,11 +3075,16 @@ const (
 	// PauseUserStop 用户软停止（Domain 热驻模式）：MetaAgent API 调用被取消，
 	// partial history 保留，领域 Agent 已转 Idle 热驻；发消息可续跑（复用 idle 域）。
 	PauseUserStop
+	// PauseChildWait 挂起等子（awaiting_child）：Meta 任务已全部派发、终答轮仍有未决
+	// 子 Agent，挂起等子完成回调（WakeOnChildDone）或用户新消息唤醒续跑。
+	PauseChildWait
 )
 
 // pauseMessage 按 PauseKind 返回面向用户的暂停提示文案。
 func (s *ReactService) pauseMessage(kind PauseKind) string {
 	switch kind {
+	case PauseChildWait:
+		return "任务已全部派发，挂起等待子 Agent 回传。子 Agent 完成会自动继续；你也可以直接发新消息，我会结合当前任务状态处理。"
 	case PauseOnChild:
 		return "子领域 Agent 触达 token 上限已暂停（完整历史已持久化，可恢复）。发送任意消息（如\"继续\"）将优先恢复暂停的领域 Agent 继续执行。"
 	case PauseTokenBudget:
@@ -3067,12 +3145,18 @@ func (s *ReactService) softStopPauseKind(session *reactInternalSession) PauseKin
 }
 
 // pauseSession 按暂停原因将会话置为对应暂停态而非错误：
-// PauseOnChild -> paused_on_child（优先恢复暂停的 domain）；其他 -> awaiting_clarify（普通续跑）。
+// PauseOnChild -> paused_on_child（优先恢复暂停的 domain）；
+// PauseChildWait -> awaiting_child（挂起等子回传，子完成回调或用户消息唤醒）；
+// 其他 -> awaiting_clarify（普通续跑）。
 // History 完整保留，sendMessage -> resumeSession/resumePausedDomain 从当前进度续跑。
+// 不动 EndedAt：暂停态会话非终态，evictCompletedSessions 不会将其淘汰。
 func (s *ReactService) pauseSession(session *reactInternalSession, history []ReactMessage, kind PauseKind) {
 	s.store.mu.Lock()
 	session.History = history
 	switch kind {
+	case PauseChildWait:
+		session.Status = enums.SessionStatusAwaitingChild
+		session.Result = "任务已派发，挂起等待子 Agent，发消息或子 Agent 完成自动继续"
 	case PauseOnChild:
 		session.Status = enums.SessionStatusPausedOnChild
 		session.Result = "子领域 Agent 触达 token 上限暂停，发\"继续\"恢复该领域"
@@ -3093,6 +3177,49 @@ func (s *ReactService) pauseSession(session *reactInternalSession, history []Rea
 
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
+}
+
+// suspendOnChildWait 落定「挂起等子」：Meta 中继文本落普通消息事件（前端按正常发言展示），
+// 会话置 awaiting_child（保留 History 与临时目录）。
+// 竞态收口：Run 判定 pending>0 到挂起落定之间有时间窗——若窗口内最后一个子 Agent 已完成
+// （trackChildDone 的唤醒回调彼时见 Running 态空转），此处补检 pending==0 立即自唤醒，
+// 否则再无完成事件触发唤醒，会话死等。
+func (s *ReactService) suspendOnChildWait(session *reactInternalSession, result ReactResult) {
+	if text := strings.TrimSpace(result.Text); text != "" {
+		s.store.addEvent(session, eventkind.Message, "MetaAgent", text, "", "", "", "", "", true)
+	}
+	s.pauseSession(session, result.History, PauseChildWait)
+	if s.pendingChecker != nil && s.pendingChecker.PendingChildren(session.ID) == 0 {
+		s.WakeOnChildDone(session.ID)
+	}
+}
+
+// WakeOnChildDone 子 Agent 完成回传时唤醒「挂起等子」会话（awaiting_child → running）。
+// 由 bootstrap 经 Dispatcher.WithChildDoneNotify 接线到 trackChildDone 回调；
+// trackChildDone 对每次子完成都触发（含父非 meta 的场景），此处按会话态过滤幂等：
+// 仅 awaiting_child 翻转并起 resumeSession（wakeInput 作本轮输入，替代用户新指令）；
+// 其余状态（Running/Completed/会话不在内存/父是 domain 等）一律空转。
+func (s *ReactService) WakeOnChildDone(parentID string) {
+	session := s.store.getSession(parentID)
+	if session == nil {
+		return
+	}
+	s.store.mu.Lock()
+	if session.Status != enums.SessionStatusAwaitingChild {
+		s.store.mu.Unlock()
+		return
+	}
+	session.Status = enums.SessionStatusRunning
+	session.EndedAt = nil
+	session.wakeInput = "【系统】有子 Agent 完成回传，请查收邮箱摘要、整合进度后继续（用户暂无新指令）。"
+	restartSessionContext(session)
+	s.store.mu.Unlock()
+
+	// 轮开始落库 running（同 sendMessage 恢复路径）：进程在本轮中途崩溃时，
+	// 重启恢复逻辑依据库中 running 状态把会话标记为"因服务重启中断"。
+	s.store.persistHistory(session)
+	s.store.persistEvents(session)
+	go s.resumeSession(session)
 }
 
 // setSessionError 将会话标记为错误状态，并记录相关事件与持久化。
@@ -3577,11 +3704,11 @@ func (s *ReactService) cancel(ctx context.Context, sessionID string) error {
 		s.store.mu.Unlock()
 		return ErrSessionNotFound
 	}
-	// 运行中或暂停待续（awaiting_clarify / paused_on_child）的会话都可取消：
-	// 暂停态没有运行中的 goroutine，但必须允许用户退出暂停死锁/死等场景
+	// 运行中或暂停待续（awaiting_clarify / paused_on_child / awaiting_child）的会话都可取消：
+	// 暂停/挂起态没有运行中的 goroutine，但必须允许用户退出暂停死锁/死等场景
 	// （实证：paused_on_child 态拒绝取消，会话无任何逃生通道，永久卡死）。
 	switch session.Status {
-	case enums.SessionStatusRunning, enums.SessionStatusAwaitingClarify, enums.SessionStatusPausedOnChild:
+	case enums.SessionStatusRunning, enums.SessionStatusAwaitingClarify, enums.SessionStatusPausedOnChild, enums.SessionStatusAwaitingChild:
 	default:
 		s.store.mu.Unlock()
 		return fmt.Errorf("%w: session is not running", ErrInvalidSessionState)

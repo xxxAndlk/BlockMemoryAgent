@@ -157,3 +157,81 @@ func TestHandleSessionStream_AwaitingClarifyFrame(t *testing.T) {
 		t.Fatal("帧应携带 question_id（旧客户端提交路由依赖）")
 	}
 }
+
+// TestHandleSessionStream_AwaitingClarifyArtifacts 演示评审卡场景：PendingClarify 带
+// Artifacts（内嵌演示视频）时，ToServerSession 逐字段映射且 SSE awaiting_clarify 帧
+// 携带 artifacts；无产物时帧不含该字段。
+func TestHandleSessionStream_AwaitingClarifyArtifacts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	facade := newMockAgentForServer()
+	sess := batchClarifySession("session-art")
+	sess.PendingClarify.Artifacts = []agent.ClarifyArtifact{
+		{Kind: "video", Path: ".bma/demo/demo.webm", Title: "演示视频", Caption: "逐页操作", MIME: "video/webm"},
+	}
+	facade.sessions["session-art"] = sess
+	// 无产物对照组：帧不应携带 artifacts 字段。
+	plain := batchClarifySession("session-plain")
+	facade.sessions["session-plain"] = plain
+
+	// 线型映射：Artifacts 逐字段透传。
+	pc := ToServerSession(sess).State.PendingClarify
+	if len(pc.Artifacts) != 1 || pc.Artifacts[0].Kind != "video" ||
+		pc.Artifacts[0].Path != ".bma/demo/demo.webm" || pc.Artifacts[0].MIME != "video/webm" {
+		t.Fatalf("ToServerSession 应映射 Artifacts, got %+v", pc.Artifacts)
+	}
+
+	mgr := NewSessionManager(facade)
+	r := gin.New()
+	r.GET("/api/sessions/:id/stream", mgr.HandleSessionStream)
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	// 取首个 awaiting_clarify 帧（会话恒挂起，拿到后主动断开）。
+	readFrame := func(id string) map[string]any {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/sessions/"+id+"/stream", nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("stream request: %v", err)
+		}
+		defer resp.Body.Close()
+		scanner := bufio.NewScanner(resp.Body)
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if !scanner.Scan() {
+				break
+			}
+			line := scanner.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var frame map[string]any
+			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &frame) != nil {
+				continue
+			}
+			if frame["type"] == "awaiting_clarify" {
+				return frame
+			}
+		}
+		t.Fatalf("3s 内未收到 %s 的 awaiting_clarify 帧", id)
+		return nil
+	}
+
+	frame := readFrame("session-art")
+	arts, ok := frame["artifacts"].([]any)
+	if !ok || len(arts) != 1 {
+		t.Fatalf("帧应携带 1 条 artifacts, got %v", frame["artifacts"])
+	}
+	a0, _ := arts[0].(map[string]any)
+	if a0["kind"] != "video" || a0["path"] != ".bma/demo/demo.webm" || a0["title"] != "演示视频" {
+		t.Fatalf("artifacts 字段错误, got %v", a0)
+	}
+
+	if frame := readFrame("session-plain"); frame["artifacts"] != nil {
+		t.Fatalf("无产物时帧不应携带 artifacts, got %v", frame["artifacts"])
+	}
+}

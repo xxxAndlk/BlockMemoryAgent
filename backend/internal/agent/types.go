@@ -269,6 +269,16 @@ type ClarifyQuestionItem struct {
 	AnsweredAt      *time.Time      // AnsweredAt 本题答复时间
 }
 
+// ClarifyArtifact 是澄清请求随附的产物（演示评审卡内嵌演示视频/HTML 回放页等）。
+// 字段与 types.ClarifyArtifact 对应（agent 包不依赖 types 包，镜像定义）。
+type ClarifyArtifact struct {
+	Kind    string // Kind 产物类型（video / html 等）
+	Path    string // Path 产物路径（相对工作目录）
+	Title   string // Title 产物标题
+	Caption string // Caption 产物说明
+	MIME    string // MIME 产物媒体类型
+}
+
 // ClarifyRequest 是澄清请求的 DTO，字段与 types.ClarifyRequest 对应。
 // 使用普通 DTO 字段，避免 agent 包依赖内部 types 包。
 type ClarifyRequest struct {
@@ -295,6 +305,8 @@ type ClarifyRequest struct {
 	// Questions 批量模式（任务 140）的全部题目；len>1 表示批量（同屏分页、
 	// 统一提交）。单题路径为 nil，Question/Options 等顶层字段即唯一题目。
 	Questions []ClarifyQuestionItem
+	// Artifacts 随问题附带的产物（如演示评审卡内嵌演示视频），空表示无产物。
+	Artifacts []ClarifyArtifact
 }
 
 // Session 是会话对象的 DTO，按字段逐一对齐 server.Session。

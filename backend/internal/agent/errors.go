@@ -34,8 +34,8 @@ var (
 	ErrAgentBusy = errors.New("agent 正在执行任务")
 
 	// ErrAgentNotDirectable 表示编排页用户直连的目标不在可直连状态：
-	// Paused（走监控页恢复）/ Idle（热驻待复用，经主 Agent 派发）/ meta（走主对话页）
-	// / 直连通道未接线。是 ErrInvalidSessionState 的细化（errors.Is 仍可匹配父错误），
+	// Paused（走监控页恢复）/ meta（走主对话页）/ 直连通道未接线。
+	// 是 ErrInvalidSessionState 的细化（errors.Is 仍可匹配父错误），
 	// HTTP 层映射 409 冲突而非 400 参数错——前端据此提示"该状态不可直连"。
 	ErrAgentNotDirectable = fmt.Errorf("%w: 该状态不可直连", ErrInvalidSessionState)
 

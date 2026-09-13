@@ -38,10 +38,10 @@ export interface SubAgentRef {
   ts: string
 }
 
-/** 回合内一个按时间顺序的步骤：要么是一段思考，要么是一次工具调用 */
+/** 回合内一个按时间顺序的步骤：一段思考 / 一段中间正文 / 一次工具调用 */
 export interface TurnStep {
-  kind: 'think' | 'tool'
-  event?: SessionEvent // think 步骤对应的事件
+  kind: 'think' | 'narrate' | 'tool'
+  event?: SessionEvent // think / narrate 步骤对应的事件
   group?: ToolCallGroup // tool 步骤对应的工具调用组
 }
 
@@ -59,6 +59,10 @@ export interface Turn {
   clarifyQuestion?: SessionEvent
   /** 提问附带的长上下文（任务 140，kind=clarify_detail 事件）：展示在问题之前 */
   clarifyDetails: SessionEvent[]
+  /** Agent 发言块（按时间顺序）：中间正文（kind=assistant_text，"口播一句→调工具"的那段话）、
+   *  子 Agent 结果摘要（llm_result）、Meta 中继文本（message）等。它们按**正文**展示（与最终
+   *  答复同档），只有模型私有推理（think/intend）才进思考链盒（2026-09-13 用户实证）。 */
+  narrations: SessionEvent[]
   /** 提问前模型输出的正文快照（后端挂在提问事件 detail_json.report_text 上）：
    *  不落事件的话，待澄清态一切换就把上一段输出整段吞掉，只剩思考链（2026-09-12 实证）。 */
   clarifyReport?: string
@@ -66,7 +70,7 @@ export interface Turn {
   /** 合成最终答复：运行中会话的新用户消息接替当前回合时，收编接替时刻的流式汇报文本
    *  （流式文本只存于 SSE live 帧，不落事件；不收编则上一回合的答复内容丢失）。 */
   finalText?: string
-  status: 'running' | 'completed' | 'error' | 'awaiting_clarify' | 'cancelled'
+  status: 'running' | 'completed' | 'error' | 'awaiting_clarify' | 'awaiting_child' | 'cancelled'
   startedAt: string
   endedAt?: string
   tokens: { in: number; out: number }
@@ -82,24 +86,48 @@ type EventCategory =
   | 'tool_result_legacy'
   | 'completion'
   | 'sub_agent_dispatch'
+  | 'assistant_text'
   | 'clarify'
   | 'clarify_detail'
   | 'error'
   | 'think'
-  | 'other'
+  | 'agent_message'
+  | 'debug'
 
-const THINK_KINDS = new Set([
-  'think',
-  'intend',
-  'llm',
-  'llm_result',
-  'llm_response',
-  'wait',
+/**
+ * 推理类 kind：**模型自己的思考链**（只进「思考链路」盒）。
+ * 市场对齐（DeepSeek「深度思考」/ ChatGPT agent / Claude Code）：盒里只放模型的私有推理；
+ * 说给用户的话、子 Agent 的产出都不是思考（2026-09-13 用户实证：链盒里混着
+ * 「【交付结论】…」这类交付内容）。
+ */
+const REASONING_KINDS = new Set(['think', 'intend'])
+
+/**
+ * Agent 发言类 kind：模型/子 Agent **说给用户的话**，按正文展示（与最终答复同档）。
+ * - `llm_result`：子 Agent 完成时的结果摘要（`LiveEventSubAgentDone` 落事件，Tool=子 Agent ID）
+ * - `message`：Meta 中继文本等普通消息（`suspendOnChildWait` 注释即"前端按正常发言展示"）
+ * - `llm` / `llm_response` / `notify`：LLM 通用输出事件
+ */
+const SPEECH_KINDS = new Set(['llm', 'llm_result', 'llm_response', 'message', 'notify'])
+
+/**
+ * 调试/活动类 kind：既不是推理也不是发言，折叠在思考盒里（简洁模式只计「已折叠 +N」）。
+ * 完整事件流看监控页（?view=monitor 的执行日志），对话栏不铺这些管线细节。
+ * 判别按 kind||type（`prompt`/`system` 这类事件只有 type，没有 kind——只认 kind 会把
+ * 「输入补全: gate_skip」当发言展示出来）。
+ */
+const DEBUG_KINDS = new Set([
   'prompt',
-  'agent_created',
   'token_usage',
   'graph_step',
-  'notify',
+  'agent_created',
+  'wait',
+  'stats',
+  'sub_agent_done',
+  'memory_recall',
+  'topic_switch',
+  'interrupt',
+  'enqueue',
 ])
 
 /** 将事件归类到单一语义类别，作为后续路由的依据 */
@@ -121,16 +149,39 @@ export function classifyEvent(ev: SessionEvent): EventCategory {
   // 子 Agent 派发（后端 kind=sub_agent_dispatch）：对话栏子 Agent 列表用，
   // 必须在通用 think 兜底之前分类——否则会落进思考链，用户看到一串参数 JSON。
   if (ev.kind === 'sub_agent_dispatch') return 'sub_agent_dispatch'
+  // 工具调用之间的中间正文（后端 kind=assistant_text）：按时间顺序渲染成正文块，
+  // 同样必须在 think 兜底之前分类——否则这段"人话"会掉进思考链里。
+  if (ev.kind === 'assistant_text') return 'assistant_text'
   if (isToolCallEvent(ev)) return 'tool_call'
   if (isToolExecEvent(ev)) return 'tool_exec'
   if (ev.kind === 'tool_result') return 'tool_result_legacy'
   if (isErrorEvent(ev)) return 'error'
-  if (isLLMThinkEvent(ev)) return 'think'
-  return 'other'
+  if (isReasoningEvent(ev)) return 'think'
+  if (isSpeechEvent(ev)) return 'agent_message'
+  if (isDebugEvent(ev)) return 'debug'
+  // 未知 kind + 系统提示（"因服务重启中断，可发送消息继续"之类）：一律按正文展示。
+  // 旧的兜底是把未知 kind 塞进思考链——结果是「交付结论」这类输出被当成思考
+  // （2026-09-13 用户实证）；宁可在对话栏多显示，也不把内容藏进推理盒。
+  return 'agent_message'
 }
 
-function isLLMThinkEvent(ev: SessionEvent): boolean {
-  return THINK_KINDS.has(ev.kind || '') || ev.type === 'progress'
+/** 事件的判别标识：后端多数事件 kind 与 type 同名（prompt/system 只有 type），统一取 kind||type。 */
+function eventKind(ev: SessionEvent): string {
+  return ev.kind || ev.type || ''
+}
+
+function isReasoningEvent(ev: SessionEvent): boolean {
+  return REASONING_KINDS.has(eventKind(ev))
+}
+
+function isSpeechEvent(ev: SessionEvent): boolean {
+  return SPEECH_KINDS.has(eventKind(ev))
+}
+
+function isDebugEvent(ev: SessionEvent): boolean {
+  if (DEBUG_KINDS.has(eventKind(ev))) return true
+  // progress 型管线事件（llm_result 是发言，已在 classifyEvent 里先被拦走）
+  return ev.type === 'progress'
 }
 
 /**
@@ -181,10 +232,18 @@ export function settleTurnsBySessionStatus(
 ): Turn[] {
   if (!sessionStatus) return turns
   if (sessionStatus === 'running' || sessionStatus === 'awaiting_clarify') return turns
+  // 挂起等子（Meta 已派完子任务，挂起等子 Agent 回传唤醒）：非终态，回合不能收口；
+  // 把仍 running 的回合标成 awaiting_child，展示「挂起等子」而非永久"处理中"转圈。
+  if (sessionStatus === 'awaiting_child') {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].status === 'running') turns[i].status = 'awaiting_child'
+    }
+    return turns
+  }
   for (let i = turns.length - 1; i >= 0; i--) {
-    // 'awaiting_clarify' 一并收口：会话已终态就不该还挂着待澄清卡（终止发生在提问期间
-    // 时，卡片会带着可点选项留着，点了只会报错——会话已经不接受了）。
-    if (turns[i].status === 'running' || turns[i].status === 'awaiting_clarify') {
+    // 'awaiting_clarify'/'awaiting_child' 一并收口：会话已终态就不该还挂着待澄清卡/挂起态
+    // （终止发生在提问/等子期间时，卡片会带着可点选项留着，点了只会报错——会话已经不接受了）。
+    if (turns[i].status === 'running' || turns[i].status === 'awaiting_clarify' || turns[i].status === 'awaiting_child') {
       turns[i].status = sessionStatus === 'error' ? 'cancelled' : 'completed'
     }
   }
@@ -263,6 +322,7 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
       errors: [],
       subAgents: [],
       clarifyDetails: [],
+      narrations: [],
       status: 'running',
       startedAt: startedAt || ev?.timestamp || new Date().toISOString(),
       tokens: { in: 0, out: 0 },
@@ -347,6 +407,21 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
       continue
     }
 
+    // 中间正文（工具调用之间的口播）：按时间顺序收集，渲染成持久正文块
+    if (category === 'assistant_text') {
+      current!.narrations.push(ev)
+      current!.steps.push({ kind: 'narrate', event: ev })
+      continue
+    }
+
+    // Agent 发言（子 Agent 结果摘要 / Meta 中继文本 / 未知 kind）：与中间正文同一档展示——
+    // 它们是"需要展示的东西"，不是模型的私有推理。
+    if (category === 'agent_message') {
+      current!.narrations.push(ev)
+      current!.steps.push({ kind: 'narrate', event: ev })
+      continue
+    }
+
     // 工具调用意图（pending）：新建组并占一个 tool 步骤
     if (category === 'tool_call') {
       const group = createToolGroup(ev)
@@ -396,8 +471,9 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
       continue
     }
 
-    // 思考链相关 Kind → think 步骤（同时累积到 thinkChain 兼容字段）
-    if (category === 'think' || category === 'other') {
+    // 推理 + 调试（prompt/token_usage/子Agent完成…）→ think 步骤（兼容字段 thinkChain）；
+    // ThinkChain 只显示推理，调试类折叠成「已折叠 +N」，展开/verbose 才看得到。
+    if (category === 'think' || category === 'debug') {
       current!.thinkChain.push(ev)
       current!.steps.push({ kind: 'think', event: ev })
       continue

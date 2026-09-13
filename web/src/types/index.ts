@@ -4,6 +4,7 @@ export type SessionStatus =
   | 'error'
   | 'awaiting_clarify'
   | 'paused_on_child'
+  | 'awaiting_child'
 
 /** 用户消息图片的 HTTP 线型（与后端 agent.WireImage 对齐）。
  *  data 为 base64 编码内容（不带 data: 前缀）；后端 Go []byte JSON 编解码即 base64。 */
@@ -35,6 +36,8 @@ export interface ClarifyPending {
   detail?: string
   /** 批量模式题目列表；长度>1 为批量（同屏分页改选、统一提交），缺失/≤1 为单题 */
   questions?: ClarifyQuestionItem[]
+  /** 澄清附带的产物（演示视频等，SSE awaiting_clarify 帧 artifacts 字段）：问答卡内嵌展示 */
+  artifacts?: ArtifactRef[]
 }
 
 export interface ChatMessage {
@@ -130,6 +133,12 @@ export function isToolCallEvent(ev: SessionEvent): ev is ToolCallEvent {
 
 export function isToolExecEvent(ev: SessionEvent): ev is ToolExecEvent {
   return ev.type === 'tool_exec'
+}
+
+/** 工具调用之间的中间正文（后端 kind=assistant_text）：该事件到达即表示上一轮流式正文已落盘，
+ *  live 行可以清掉——不清会与正文块同屏重复。 */
+export function isAssistantTextEvent(ev: SessionEvent): boolean {
+  return ev.kind === 'assistant_text'
 }
 
 export function isLLMEvent(ev: SessionEvent): ev is LLMEvent {
@@ -265,6 +274,31 @@ export function inferArtifactsFromOutput(output?: string): ArtifactRef[] {
     if (!kind || seen.has(path)) continue
     seen.add(path)
     out.push({ kind, path, inferred: true })
+  }
+  return out
+}
+
+const ARTIFACT_KINDS = new Set(['image', 'video', 'audio', 'html'])
+
+/**
+ * 清洗 SSE awaiting_clarify 帧的 artifacts 字段（后端契约外的脏数据不放进问答卡）：
+ * 非数组按无产物处理；元素缺 kind/path 丢弃；kind 不在四值枚举内时按 path 扩展名
+ * 推断（复用 MEDIA_EXT_KIND），推断不出同样丢弃。
+ */
+export function clarifyArtifactsFromFrame(raw: unknown): ArtifactRef[] {
+  if (!Array.isArray(raw)) return []
+  const out: ArtifactRef[] = []
+  for (const a of raw) {
+    if (!a || typeof a !== 'object') continue
+    const item = a as ArtifactRef
+    if (typeof item.path !== 'string' || !item.path) continue
+    let kind = typeof item.kind === 'string' ? item.kind : ''
+    if (!ARTIFACT_KINDS.has(kind)) {
+      const ext = item.path.split('.').pop()?.toLowerCase() || ''
+      kind = MEDIA_EXT_KIND[ext] || ''
+    }
+    if (!kind) continue
+    out.push({ ...item, kind })
   }
   return out
 }

@@ -74,6 +74,7 @@ export function groupAgentMessagesToTurns(messages: AgentMessageItem[], agent: A
       errors: [],
       subAgents: [], // 单 Agent 对话面板不展示子 Agent 列表（该 Agent 自身即对话主体）
       clarifyDetails: [],
+      narrations: [], // 单 Agent 面板的流式正文走 live 渲染（消息流里没有 assistant_text 事件）
       status: 'running',
       startedAt: ev.timestamp,
       tokens: { in: 0, out: 0 },

@@ -8,8 +8,8 @@ package subagent
 //   - 复用入口 call_sub_agent(reuse_agent_id=X)：槽 idle 则唤醒+注入新任务；
 //     busy 则入 taskQueue（执行完当前任务后自动出队）。
 //   - Idle 加权 TTL：effectiveTTL = min(BaseTTL + reuseCount*Extend, MaxTTL)。
-//     enterIdle 不启动倒计时（完成后一直热存）；用户下一条消息经 ArmIdleTTLs 武装；
-//     复用时重置满额并 reuseCount+1。
+//     enterIdle 即武装倒计时（任务完成≈父收到回传时就开始计时，避免完成后无限期热存
+//     占内存）；复用/用户直连唤醒时停表且 reuseCount+1，本轮完成回 idle 按新权重重新武装满额。
 //   - 会话级挂起（触限暂停全树）：sessionSuspendState 广播 wake channel，叶子与
 //     domain 的 SuspendGate.Park 阻塞其上；ResumeSessionAgents close 广播唤醒。
 //   - 心跳/墙钟豁免：Idle/挂起时 activity.Delete（scanStuck Range 不到）；
@@ -32,6 +32,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
+	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
@@ -125,7 +126,7 @@ type domainSlot struct {
 	pendingTask      string
 	pendingWallClock time.Duration
 	pendingImages    []tool.ResultImage
-	ttlArmed   bool                // TTL 是否已武装（用户消息后）
+	ttlArmed   bool                // TTL 是否已武装（enterIdle 完成即武装）
 	ttlTimer   *time.Timer         // 加权倒计时（武装后非 nil）
 	ttlDeadline time.Time          // 武装时的到期时刻（IdleLeft 计算用）
 	idleSince  time.Time
@@ -335,8 +336,9 @@ func (d *Dispatcher) rearmSlotActivity(id string) {
 	d.activity.Store(id, newEvidence())
 }
 
-// enterIdle 转入 Idle：记录 idleSince，不挂 TTL timer（完成后一直热存，
-// 用户下一条消息经 ArmIdleTTLs 才武装）。心跳豁免=activity.Delete。
+// enterIdle 转入 Idle：记录 idleSince 并立即武装加权 TTL——任务完成（父已收到回传）
+// 即开始销毁倒计时，不再无限期热存等用户下一条消息；复用/直连唤醒路径在唤醒时停表，
+// 本轮完成回到这里按新权重重新武装满额（对话/复用刷新寿命）。心跳豁免=activity.Delete。
 func (d *Dispatcher) enterIdle(s *domainSlot, summary string) {
 	s.mu.Lock()
 	if s.state != slotRunning {
@@ -360,6 +362,7 @@ func (d *Dispatcher) enterIdle(s *domainSlot, summary string) {
 			t.Idle(s.id, summary, killFn)
 		}
 	}
+	d.armTTL(s)
 	log.Printf("[subagent] IDLE: sub=%s domain=%s reuse=%d (hot-resident)", s.id, s.domain, s.reuseCount)
 }
 
@@ -421,7 +424,7 @@ func (d *Dispatcher) slotTTLLocked(s *domainSlot) time.Duration {
 }
 
 // ArmIdleTTLs 武装 session 全部 idle domain 的加权倒计时。
-// 用户下一条消息触发（ReactService 经 agent.IdleTTLArmer 接口调用）。
+// enterIdle 已改为完成即武装，本接口保留兼容（armTTL 幂等，已武装不重复）。
 func (d *Dispatcher) ArmIdleTTLs(sessionID string) {
 	if !d.hotEnabled() || sessionID == "" {
 		return
@@ -1264,6 +1267,73 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 		d.ledger.RecordDispatch(s.sessionID, parentID, s.id, s.domain, task, fmt.Sprintf("入队第%d位", qlen+1))
 		return s.id + "（忙碌中，任务已入队，当前任务完成后执行）", nil
 	}
+}
+
+// WakeIdleWithMessage 用户直连唤醒热驻 idle 槽（编排页对话面板，service MessageAgent
+// 的 StatusIdle 分支调用；实现 agent.AgentMessenger 接口）。
+// 唤醒序列照搬 dispatchToIdleSlot 的 idle 分支（reuseCount++ / 停 TTL / Wake /
+// trackChildStart / rearmSlotActivity / opNewTask / 台账），差异点：
+//   - 任务文本 = "【用户直连消息】"+用户原文（对齐 ReviveWithMessage 种子口径）——
+//     这是用户对该 Agent 的对话而非主 Agent 派发的新任务，不拼 buildReuseTask 前缀；
+//   - 邮箱通知父 Agent（MsgInfo，对齐 ReviveWithMessage 的父感知口径）并 pokeParent。
+// 槽不存在/已销毁 → ErrAgentNotDirectable；槽 running → ErrAgentBusy。
+func (d *Dispatcher) WakeIdleWithMessage(agentID, content string) error {
+	if !d.hotEnabled() {
+		return fmt.Errorf("%w: 热驻未开启", agent.ErrAgentNotDirectable)
+	}
+	s := d.pool.slot(sessionIDFromAgentID(agentID), agentID)
+	if s == nil {
+		return fmt.Errorf("%w: 热驻槽 %s 不存在或已销毁", agent.ErrAgentNotDirectable, agentID)
+	}
+	s.mu.Lock()
+	if s.state != slotIdle {
+		st := s.state
+		s.mu.Unlock()
+		if st == slotRunning {
+			return fmt.Errorf("%w: 目标 Agent 正在执行任务", agent.ErrAgentBusy)
+		}
+		return fmt.Errorf("%w: 热驻槽 %s 已销毁", agent.ErrAgentNotDirectable, agentID)
+	}
+	// idle 分支（同 dispatchToIdleSlot）：reuseCount+1 + TTL 重置 + 树 Idle→Running + opNewTask。
+	s.reuseCount++
+	if s.ttlTimer != nil {
+		s.ttlTimer.Stop()
+		s.ttlTimer = nil
+	}
+	s.ttlArmed = false
+	taskText := "【用户直连消息】\n" + content
+	cancelRef := s.cancelTask
+	s.mu.Unlock()
+
+	if d.treeFn != nil {
+		if t := d.treeFn(s.sessionID); t != nil {
+			t.Wake(s.id, cancelRef)
+		}
+	}
+	// 父未决计数挂账（对齐 ReviveWithMessage）：完成时 trackChildDoneOnce 配对递减。
+	d.trackChildStart(s.parentID)
+	// 活动恢复（心跳豁免解除）：enterIdle 已 Delete 旧条目，须重建。
+	d.rearmSlotActivity(s.id)
+	select {
+	case s.ops <- domainOp{kind: opNewTask, task: taskText}:
+	default:
+		// ops 满（异常）：回滚挂账。
+		d.trackChildDone(s.parentID)
+		return fmt.Errorf("%w: 热驻槽 %s 指令通道满，请稍后重试", agent.ErrAgentNotDirectable, agentID)
+	}
+	log.Printf("[subagent] USER-WAKE: sub=%s domain=%s reuse=%d msg_len=%d", s.id, s.domain, s.reuseCount, len(content))
+	// 任务台账登记：用户直连单独备注，区别于主 Agent 续建派发。
+	d.ledger.RecordDispatch(s.sessionID, s.parentID, s.id, s.domain, truncateRunes(content, 80), fmt.Sprintf("用户直连#%d", s.reuseCount))
+	// 父感知（对齐 ReviveWithMessage）：邮件通知父"等其回传，勿重复派发同领域任务"。
+	if s.parentID != "" && d.mailbox != nil {
+		_, _ = d.mailbox.Send(&mailbox.Message{
+			From: "dispatcher", To: s.parentID, Type: mailbox.MsgInfo,
+			Subject: "热驻 Agent 用户直连唤醒",
+			Body:    fmt.Sprintf("用户直连唤醒热驻 Agent %s，等待其回传，勿重复派发同领域任务。", s.id),
+		})
+		d.pokeParent(s.parentID)
+	}
+	return nil
 }
 
 // buildReuseTask 拼装复用任务文本：项目自述 + 共享前缀 + 召回前缀 + 领域标签 + 任务正文。

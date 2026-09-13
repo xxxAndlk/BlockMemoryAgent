@@ -1022,7 +1022,6 @@ func TestMailboxMessageToReact_EscalatePrefix(t *testing.T) {
 	}
 }
 
-
 // multiChunkStreamProvider 产出两个流式块的 provider，用于验证流式期间活动上报。
 type multiChunkStreamProvider struct {
 	genCalls int
@@ -1166,8 +1165,6 @@ func TestReActAgent_StreamKeepaliveDuringSilence(t *testing.T) {
 		t.Fatalf("零 chunk 静默流期间保活应持续上报 keepalive，got %d", n)
 	}
 }
-
-
 
 // readCallMsg 构造一轮 ReadFile 工具调用响应（路径每轮不同，规避连读同参×3 守卫）。
 func readCallMsg(i int) *blades.Message {
@@ -1335,5 +1332,51 @@ func TestReActAgent_ProviderFuncErrorKeepsCurrent(t *testing.T) {
 	}
 	if got := a.llmModelName(); got != "model-a" {
 		t.Errorf("llmModelName should stay model-a, got %q", got)
+	}
+}
+
+// fakeSuspendPendingChecker 模拟父 Agent 有未决子 Agent 且不完成的场景，
+// WaitForAnyChild 计次，用于断言 meta 门控下不再进入阻塞等待。
+type fakeSuspendPendingChecker struct{ waitCalls atomic.Int32 }
+
+func (f *fakeSuspendPendingChecker) PendingChildren(string) int { return 1 }
+func (f *fakeSuspendPendingChecker) WaitForAnyChild(string, time.Duration) bool {
+	f.waitCalls.Add(1)
+	return false
+}
+
+// TestReActAgent_SuspendOnChildWait 验证：meta 角色终答轮仍有未决子 Agent 时，
+// 不再走 waitForChildren 阻塞，而是立即带本轮中继文本返回 SuspendOnChildWait=true，
+// 由上层落 awaiting_child 会话态。非 meta（domain/leaf）不受此分支影响。
+func TestReActAgent_SuspendOnChildWait(t *testing.T) {
+	llm := &mockModelProvider{
+		responses: []*blades.Message{
+			blades.AssistantMessage("已派发 2 个子 Agent，等待回传"),
+		},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	checker := &fakeSuspendPendingChecker{}
+	ag := NewReActAgent("test", types.RoleDefinition{ID: "meta", SystemPrompt: ""}, llm, NewToolRegistryAdapter(reg)).
+		WithPendingChildrenChecker(checker)
+
+	start := time.Now()
+	res, err := ag.Run(context.Background(), "并行调研两个主题")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("应快速返回而非阻塞等待子 Agent, elapsed=%v", elapsed)
+	}
+	if !res.SuspendOnChildWait {
+		t.Error("expected SuspendOnChildWait=true")
+	}
+	if res.LimitReached || res.PausedOnChild {
+		t.Errorf("SuspendOnChildWait 与 LimitReached/PausedOnChild 互斥, got LimitReached=%v PausedOnChild=%v", res.LimitReached, res.PausedOnChild)
+	}
+	if !strings.Contains(res.Text, "等待回传") {
+		t.Errorf("中继文本应保留在 ReactResult.Text, got %q", res.Text)
+	}
+	if got := checker.waitCalls.Load(); got != 0 {
+		t.Errorf("meta 挂起等子不应进入 waitForChildren 阻塞, WaitForAnyChild 调用 %d 次", got)
 	}
 }

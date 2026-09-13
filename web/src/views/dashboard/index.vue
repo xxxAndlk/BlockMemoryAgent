@@ -389,7 +389,7 @@ function activityStyle(kind: string) {
                 <span class="font-bold text-sm text-ink truncate">{{ s.goal }}</span>
                 <el-tag :type="statusTagType(s.status)" size="small" effect="plain" class="!bg-transparent !border-none px-0"
                 >
-                  {{ statusText(s.status) }} <span class="ml-1" :class="s.status==='running'?'text-blue-500':s.status==='completed'?'text-green-500':'text-red-500'">●</span>
+                  {{ statusText(s.status) }} <span class="ml-1" :class="s.status==='running'?'text-blue-500':s.status==='completed'?'text-green-500':s.status==='awaiting_child'?'text-sky-500':'text-red-500'">●</span>
                 </el-tag>
               </div>
               <div class="text-xs text-ink-2">创建时间: {{ fmtDate(s.started_at) }}</div>

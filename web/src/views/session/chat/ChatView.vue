@@ -65,7 +65,8 @@ const emit = defineEmits<{
                    @submit-clarify="emit('clarify-submitted')"
                    @update-clarify-drafts="(d: string[]) => emit('update-clarify-drafts', d)" />
       <ChatInput :loading="sending"
-                 :session-active="session?.status === 'running' || session?.status === 'awaiting_clarify'"
+                 :session-active="session?.status === 'running' || session?.status === 'awaiting_clarify' || session?.status === 'awaiting_child'"
+                 :inject-hint="session?.status === 'running'"
                  :input-tokens="inputTokens"
                  :output-tokens="outputTokens"
                  :session-bound="sessionBound"

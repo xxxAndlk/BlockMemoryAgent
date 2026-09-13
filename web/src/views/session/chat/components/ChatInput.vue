@@ -8,6 +8,9 @@ import WorkDirPicker from '@/components/WorkDirPicker.vue'
 const props = defineProps<{
   loading?: boolean
   sessionActive?: boolean
+  /** 注入提示开关：仅真 running 为 true。sessionActive 还含 awaiting_clarify/awaiting_child
+   * （会话活着、可发送），但那时发送是澄清答复/唤醒新消息，不是即时注入当前执行。 */
+  injectHint?: boolean
   inputTokens?: number
   outputTokens?: number
   /** 是否绑定了会话（有 activeSession）。区别于 sessionActive=运行中：
@@ -266,8 +269,9 @@ function onKeydown(e: KeyboardEvent) {
           <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
           会话已连接
         </span>
-        <!-- 运行中的输入语义：不再是"排到队尾"，而是即时注入当前执行 -->
-        <span v-if="sessionActive" class="text-[10px] text-ink-3 whitespace-nowrap shrink-0"
+        <!-- 运行中的输入语义：不再是"排到队尾"，而是即时注入当前执行（仅真 running；
+             待澄清是答复、挂起等子是唤醒新消息，都不是注入，故用 injectHint 而非 sessionActive） -->
+        <span v-if="injectHint" class="text-[10px] text-ink-3 whitespace-nowrap shrink-0"
               title="运行中发送的指令会投进当前 Agent 的邮箱：等待子 Agent 时立即读到并重新规划，其他阶段在当前步骤结束后生效">
           运行中发送＝即时注入当前执行
         </span>

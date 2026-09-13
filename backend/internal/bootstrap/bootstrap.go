@@ -687,6 +687,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 3) 注入 ReactService，runSession/resumeSession 终答提交前经 RunWrap 触发
 	//    （.bma/tester.yaml 默认 off，未开启时原样交付零行为变化）。
 	subAgentDispatcher.WithUserNotify(agentSvc.NotifyUserSystemMessage)
+	// 「挂起等子」唤醒接线：子 Agent 完成（trackChildDone）回调唤醒 awaiting_child 会话续跑整合。
+	subAgentDispatcher.WithChildDoneNotify(agentSvc.WakeOnChildDone)
 	agentSvc.SetAcceptanceRunner(subagent.NewAcceptanceManager(subAgentDispatcher, modelFactory.CallLightweightWithRetry))
 	// DomainAgent 热驻留（Domain 热驻 + 复用权重）：开启后 domain 任务完成/用户停止转
 	// Idle 热驻（goroutine park 等复用，call_sub_agent(reuse_agent_id=X) 唤醒），

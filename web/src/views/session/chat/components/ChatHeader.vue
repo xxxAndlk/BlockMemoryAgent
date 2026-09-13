@@ -47,6 +47,7 @@ const statusColor = computed(() => {
     case 'error': return 'text-red-400'
     case 'paused_on_child': return 'text-yellow-400'
     case 'awaiting_clarify': return 'text-yellow-400'
+    case 'awaiting_child': return 'text-sky-400'
     default: return 'text-ink-2'
   }
 })
@@ -61,6 +62,7 @@ const statusLabel = computed(() => {
     case 'error': return '失败'
     case 'paused_on_child': return '子 Agent 暂停'
     case 'awaiting_clarify': return '待澄清'
+    case 'awaiting_child': return '挂起等待子 Agent'
     default: return props.session.status
   }
 })
@@ -127,13 +129,13 @@ function nodeColor(type: string) {
               class="!bg-transparent !border-line scale-90 shrink-0"
               :class="statusColor">{{ statusLabel }}</el-tag>
       <!-- 抢占中断：打断当前执行并注入新指令（对齐 TUI /interrupt） -->
-      <el-button v-if="session?.status === 'running' && !session?.destroy_at" size="small"
+      <el-button v-if="(session?.status === 'running' || session?.status === 'awaiting_child') && !session?.destroy_at" size="small"
                  class="!bg-transparent !border-line !text-ink-2 hover:!text-primary shrink-0"
                  @click="emit('interrupt')">
         <el-icon class="mr-1"><Pointer /></el-icon>中断
       </el-button>
       <!-- 软停止：可续跑（TODO #37）；硬终止走原 cancel（带确认） -->
-      <el-button v-if="session?.status === 'running' && !session?.destroy_at" size="small"
+      <el-button v-if="(session?.status === 'running' || session?.status === 'awaiting_child') && !session?.destroy_at" size="small"
                  class="!bg-amber-50 !border-amber-300 !text-amber-700 dark:!bg-orange-900/30 dark:!border-orange-700/40 dark:!text-orange-400 shrink-0"
                  @click="emit('stop')">
         <el-icon class="mr-1"><SwitchButton /></el-icon>软停止
@@ -141,7 +143,7 @@ function nodeColor(type: string) {
       <span v-if="destroyCountdown" class="text-xs text-orange-400 font-mono shrink-0 animate-pulse">
         {{ destroyCountdown }}
       </span>
-      <el-button v-if="session?.status === 'running' && !session?.destroy_at" size="small"
+      <el-button v-if="(session?.status === 'running' || session?.status === 'awaiting_child') && !session?.destroy_at" size="small"
                  class="!bg-red-50 !border-red-300 !text-red-700 dark:!bg-red-900/30 dark:!border-red-700/40 dark:!text-red-400 shrink-0"
                  @click="emit('cancel')">
         <el-icon class="mr-1"><CircleClose /></el-icon>终止

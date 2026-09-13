@@ -141,7 +141,8 @@ const sendState = computed<'meta' | 'waiting' | 'running' | 'done' | 'paused' | 
   return 'idle'
 })
 
-const canSend = computed(() => sendState.value === 'waiting' || sendState.value === 'done')
+// idle（热驻待复用）可发：发送即唤醒热驻 Agent 续聊并刷新墙钟（后端 WakeIdleWithMessage）。
+const canSend = computed(() => sendState.value === 'waiting' || sendState.value === 'done' || sendState.value === 'idle')
 const placeholder = computed(() => {
   switch (sendState.value) {
     case 'waiting':
@@ -153,7 +154,7 @@ const placeholder = computed(() => {
     case 'paused':
       return '已暂停——请到监控页恢复'
     case 'idle':
-      return '热驻待复用——新任务请经主 Agent 派发'
+      return '热驻待复用——发送即唤醒该 Agent 续聊并刷新墙钟'
     default:
       return '主 Agent 请用主对话页'
   }

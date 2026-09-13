@@ -304,6 +304,12 @@ func ToServerSession(a *agent.Session) *Session {
 			}
 			pc.Questions = append(pc.Questions, item)
 		}
+		// 随附产物（演示评审卡内嵌演示视频/回放页）逐条复制。
+		for _, a := range req.Artifacts {
+			pc.Artifacts = append(pc.Artifacts, types.ClarifyArtifact{
+				Kind: a.Kind, Path: a.Path, Title: a.Title, Caption: a.Caption, MIME: a.MIME,
+			})
+		}
 		state.PendingClarify = pc
 	}
 	// 如果没有任何三层状态内容，则把 state 置为 nil，避免返回空对象。

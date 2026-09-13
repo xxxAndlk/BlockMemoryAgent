@@ -136,6 +136,7 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 				var opts []types.ClarifyOption
 				multi := false
 				var items []types.ClarifyQuestionItem
+				var arts []types.ClarifyArtifact
 				if snapshot.State != nil && snapshot.State.PendingClarify != nil {
 					pc := snapshot.State.PendingClarify
 					pending = pc.Question
@@ -144,6 +145,7 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 					multi = pc.MultiSelect
 					detail = pc.Detail
 					items = pc.Questions
+					arts = pc.Artifacts
 				}
 				frame := map[string]any{
 					"type":         "awaiting_clarify",
@@ -157,6 +159,9 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 				}
 				if detail != "" {
 					frame["detail"] = detail
+				}
+				if len(arts) > 0 {
+					frame["artifacts"] = arts
 				}
 				if len(items) > 1 {
 					qs := make([]map[string]any, 0, len(items))

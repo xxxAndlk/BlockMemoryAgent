@@ -126,7 +126,7 @@ agent:
 
   # -- DomainAgent 热驻留 + 复用权重 --
   domain_hot_resident_enabled: true  # DomainAgent 热驻留总开关：true 时 domain 任务完成/用户停止后转 Idle 热驻（goroutine 挂起等复用，复用经 call_sub_agent(reuse_agent_id=X)），false=旧行为（完成即销毁）
-  domain_idle_base_ttl_min: 30        # Idle 基础寿命（分钟）：用户下一条消息武装倒计时后的存活基数
+  domain_idle_base_ttl_min: 30        # Idle 基础寿命（分钟）：任务完成（父收到回传）即开始销毁倒计时的存活基数
   domain_idle_extend_on_reuse_min: 30 # 每次成功复用延长量：复用时 reuse_count+1 且 TTL 重置为 min(base+reuse*extend, max)
   domain_idle_max_ttl_min: 240        # 加权倒计时上限（分钟）
   domain_idle_max_per_session: 4      # 单 session 热驻 domain 上限；超限新 domain 进 Idle 前 LRU 淘毁最旧 idle

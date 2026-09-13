@@ -181,6 +181,10 @@ type ReactResult struct {
 	// 与 LimitReached 互斥语义:LimitReached=自身到限,PausedOnChild=子到限。
 	// 上层据此将会话置 PausedOnChild 态,等用户"继续"恢复该 domain。
 	PausedOnChild bool `json:"paused_on_child,omitempty"`
+	// SuspendOnChildWait 为 true 表示 Meta 任务已全部派发、终答轮仍有未决子 Agent：
+	// 不再原地阻塞等子，立即带本轮中继文本返回，由上层将会话置 AwaitingChild 挂起态
+	// （子完成回调或用户消息唤醒续跑）。仅 meta 角色产生；与 LimitReached/PausedOnChild 互斥。
+	SuspendOnChildWait bool `json:"suspend_on_child_wait,omitempty"`
 	// Unverified 为 true 表示校验层判定"结论未验证"（TODO #43 fail-closed）：
 	// judge LLM 不可用/坏 JSON 时置位，上层不得当成功交付，须显式上抛父 Agent 自决
 	// （替代旧 fail-open 静默放行——2026-08-13 实证全天 reflection 形同虚设）。
@@ -310,15 +314,15 @@ type SuspendGate interface {
 // IdleDomainInfo 描述一个热驻 Idle DomainAgent 的可复用信息，
 // 供 MetaAgent 上下文注入（复用判定）。由 subagent.Dispatcher 的 IdleRoster 填充。
 type IdleDomainInfo struct {
-	AgentID      string        `json:"agent_id"`                // AgentID 热驻 domain 的树节点 ID（reuse_agent_id 参数值）
-	Domain       string        `json:"domain"`                  // Domain 领域标签
+	AgentID      string        `json:"agent_id"`                 // AgentID 热驻 domain 的树节点 ID（reuse_agent_id 参数值）
+	Domain       string        `json:"domain"`                   // Domain 领域标签
 	Resp         string        `json:"responsibility,omitempty"` // Resp 槽内冻结职责描述（截断，复用相关性判定用）
-	WrittenFiles []string      `json:"written_files,omitempty"` // WrittenFiles 近期写入文件（base 名，最多 3 个，同文件集判定用）
-	LastTask     string        `json:"last_task"`               // LastTask 最近一次任务摘要（截断）
-	LastSummary  string        `json:"last_summary"`            // LastSummary 最近一次结果摘要（截断）
-	ReuseCount   int           `json:"reuse_count"`             // ReuseCount 已被复用次数（权重）
-	IdleLeft     time.Duration `json:"idle_left"`               // IdleLeft 加权倒计时剩余（未武装为 0）
-	Busy         bool          `json:"busy"`                    // Busy 正在执行任务（派发将入队）
+	WrittenFiles []string      `json:"written_files,omitempty"`  // WrittenFiles 近期写入文件（base 名，最多 3 个，同文件集判定用）
+	LastTask     string        `json:"last_task"`                // LastTask 最近一次任务摘要（截断）
+	LastSummary  string        `json:"last_summary"`             // LastSummary 最近一次结果摘要（截断）
+	ReuseCount   int           `json:"reuse_count"`              // ReuseCount 已被复用次数（权重）
+	IdleLeft     time.Duration `json:"idle_left"`                // IdleLeft 加权倒计时剩余（未武装为 0）
+	Busy         bool          `json:"busy"`                     // Busy 正在执行任务（派发将入队）
 }
 
 // IdleRosterProvider 抽象"查询某 session 的热驻 Idle DomainAgent 清单"，
@@ -328,8 +332,8 @@ type IdleRosterProvider interface {
 	IdleRoster(sessionID string) []IdleDomainInfo
 }
 
-// IdleTTLArmer 由 subagent.Dispatcher 实现：用户下一条消息到达时武装全部
-// Idle domain 的加权销毁倒计时（完成后一直热存，TTL 只在新用户消息后才启动）。
+// IdleTTLArmer 由 subagent.Dispatcher 实现：武装全部 Idle domain 的加权销毁倒计时。
+// 倒计时自 enterIdle（任务完成）即已武装，本接口为兼容保留（幂等），由用户消息到达时调用。
 type IdleTTLArmer interface {
 	ArmIdleTTLs(sessionID string)
 }

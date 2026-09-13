@@ -36,11 +36,11 @@ type ReActAgent struct {
 	// 调用即用上新模型（否则热驻槽/长任务把 provider 钉在构造时刻）。解析失败保留旧值。
 	providerFn func(context.Context) (ModelProvider, error)
 	tools      ToolRegistry         // tools 是已注册的工具集合，提供 JSON Schema 与分发执行能力。
-	memory  MemoryPipeline       // memory 是记忆流水线，用于在每次 LLM 调用前组装上下文、写入事件。
-	mailbox *mailbox.Mailbox     // mailbox 是共享邮箱，用于接收异步子代理摘要；为空时不轮询。
-	role    types.RoleDefinition // role 是当前代理的角色定义，包含系统提示等配置。
-	name    string               // name 是代理唯一标识，也用于上下文中的 agent ID。
-	maxIter int                  // maxIter 是单次 Run 中允许的最大 LLM 调用次数，防止死循环。
+	memory     MemoryPipeline       // memory 是记忆流水线，用于在每次 LLM 调用前组装上下文、写入事件。
+	mailbox    *mailbox.Mailbox     // mailbox 是共享邮箱，用于接收异步子代理摘要；为空时不轮询。
+	role       types.RoleDefinition // role 是当前代理的角色定义，包含系统提示等配置。
+	name       string               // name 是代理唯一标识，也用于上下文中的 agent ID。
+	maxIter    int                  // maxIter 是单次 Run 中允许的最大 LLM 调用次数，防止死循环。
 	// sysPromptOnce/sysPromptCache 冻结 systemPrompt 结果（TODO #40 块 4）：
 	// 环境块（含 PROJECT.md）与画像/人格在 Agent 存活期内字节稳定，跨轮前缀命中
 	// DeepSeek 缓存；resume 重建新实例时读到最新文件。sync.Once 保证并发安全。
@@ -708,6 +708,22 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			// 阻塞等待其完成而非立即终结，防止迟到 mailbox 消息随会话销毁丢失。
 			// 多 Agent 协作验证闭环（code<->test 互问互答）的关键正确性保障。
 			if a.pendingChecker != nil && a.pendingChecker.PendingChildren(a.name) > 0 {
+				// Paused 子 DomainAgent 检查（先于挂起）：MetaAgent 无限 budget 不会因自身
+				// token 暂停，但子 domain 触达上限进入 Paused 后不会再有完成事件——
+				// 若挂起等子将永无唤醒源。检测到 Paused 子节点走旧 PausedOnChild 路径，
+				// 由上层 pauseSession 置会话暂停态，等用户"继续"恢复该 domain。
+				if a.pausedChecker != nil && a.pausedChecker.HasPausedChild(a.name) {
+					return ReactResult{History: history, LimitReached: true, PausedOnChild: true}, nil
+				}
+				// Meta 挂起等子（awaiting_child 会话态）：任务已全部派发、终答轮仍有
+				// 未决子 Agent 时不再原地阻塞 waitForChildren，立即带本轮中继文本返回，
+				// 由上层置 awaiting_child——子完成（dispatcher childDoneFn 回调）或用户
+				// 新消息唤醒 resumeSession 续跑整合，token 开销与原阻塞等待平价。
+				// 仅 meta 适用：domain/leaf 等子仍走 waitForChildren 阻塞——其运行由
+				// dispatcher runSubAgent 同步承载，无会话态可落，提前返回会被当终答回传。
+				if a.role.ID == "meta" {
+					return ReactResult{Text: assistant.Content, History: history, SuspendOnChildWait: true}, nil
+				}
 				// 等待期间不烧 LLM 轮次：纯阻塞等子 Agent 完成信号，仅当 mailbox
 				// 取到新摘要时才 break 回主循环调 LLM 整合；超时无新消息则继续等。
 				// 旧实现每 30s 超时白跑一次 LLM，50 轮上限烧完后会话停摆等用户
@@ -715,10 +731,6 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				var paused bool
 				history, paused = a.waitForChildren(ctx, history)
 				if paused {
-					// Paused 子 DomainAgent 检查：MetaAgent 无限 budget 不会因自身 token 暂停，
-					// 但子 domain 触达上限进入 Paused 后,父在此 wait loop 会永久阻塞。
-					// 检测到 Paused 子节点时跳出，返回 PausedOnChild 让上层 pauseSession
-					// 置会话暂停态，等用户"继续"恢复该 domain（各 Agent 独立上下文）。
 					return ReactResult{History: history, LimitReached: true, PausedOnChild: true}, nil
 				}
 				continue
@@ -1046,7 +1058,6 @@ func evictStaleToolResults(messages []ReactMessage, keepRounds int) []ReactMessa
 	return out
 }
 
-
 // 盲区修复（2026-08-19）：旧实现只在工具派发前/后 touch，工具执行期间零上报--
 // 长命令/大文件操作（构建、依赖安装）超过心跳阈值即被巡检误判假死杀掉，
 // 全部工作从零重派（实证：战斗实体首任 10 分钟被杀，损失约 20 分钟）。
@@ -1243,15 +1254,15 @@ func (a *ReActAgent) logLLMCall(ctx context.Context, req *blades.ModelRequest, r
 		response = "[ERROR] " + errStr + "\n" + response
 	}
 	a.log.LLMCall(ctx, logger.LLMCallRecord{
-		Agent:          a.role.Name,
-		Model:          a.llmModelName(),
-		Prompt:         prompt,
-		Response:       response,
-		InputTokens:    int(inTok),
-		OutputTokens:   int(outTok),
-		CacheHitTokens: int(cacheHit),
+		Agent:           a.role.Name,
+		Model:           a.llmModelName(),
+		Prompt:          prompt,
+		Response:        response,
+		InputTokens:     int(inTok),
+		OutputTokens:    int(outTok),
+		CacheHitTokens:  int(cacheHit),
 		CacheMissTokens: int(cacheMiss),
-		LatencyMs:      int(dur.Milliseconds()),
+		LatencyMs:       int(dur.Milliseconds()),
 	})
 }
 

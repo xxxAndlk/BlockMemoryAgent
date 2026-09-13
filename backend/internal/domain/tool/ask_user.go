@@ -35,16 +35,27 @@ type AskUserQuestion struct {
 	MultiSelect bool
 }
 
+// AskUserArtifact 是 ask_user 提问随附的产物（评审卡内嵌演示视频/HTML 回放页等）。
+type AskUserArtifact struct {
+	Kind    string // Kind 产物类型（video / html 等）
+	Path    string // Path 产物路径（相对工作目录）
+	Title   string // Title 产物标题（可选）
+	Caption string // Caption 产物说明（可选）
+	MIME    string // MIME 产物媒体类型（可选）
+}
+
 // AskUserOptions 是 ask_user 工具传给 hook 的单题入参（TODO #53）。
 // Options 为空 = 纯自由文本提问（旧行为）；MultiSelect=true 时用户可多选。
 // Detail 为附加长上下文（如 submit_plan 的计划全文）：先于问题展示（事件流
 // clarify_detail 事件 + 面板 detail 块，任务 140），question 只承载短问题句。
+// Artifacts 为随附产物（如演示评审卡内嵌演示视频），仅单题模式支持。
 // 批量模式（questions>1 且接线了批量 hook）整组一次调用 AskUserBatchHookFunc；
 // 未接线批量 hook 时回退逐题调用本单题 hook（向后兼容）。
 type AskUserOptions struct {
 	Options     []AskUserOption
 	MultiSelect bool
 	Detail      string
+	Artifacts   []AskUserArtifact
 }
 
 // AskUserHookFunc 是 ask_user 工具的会话层回调：置 PendingClarify + 暂停会话 +
@@ -163,6 +174,21 @@ func (t *askUserTool) InputSchema() *jsonschema.Schema {
 				Description: "批量模式：2-5 个问题一次问齐（新任务开工前澄清必用），全部题目同屏分页呈现、用户统一提交，答复按题号汇总返回",
 			},
 			"detail": {Type: "string", Description: "附加长上下文（如计划全文、进度盘点）：完整展示在问题之前供用户滚动查看，问答面板只显示 question 与选项；question 写一句短引导语即可"},
+			"artifacts": {
+				Type: "array",
+				Items: &jsonschema.Schema{
+					Type: "object",
+					Properties: map[string]*jsonschema.Schema{
+						"kind":    {Type: "string", Description: "产物类型（video / html 等）"},
+						"path":    {Type: "string", Description: "产物路径（相对工作目录）"},
+						"title":   {Type: "string", Description: "产物标题（可选）"},
+						"caption": {Type: "string", Description: "产物说明（可选）"},
+						"mime":    {Type: "string", Description: "产物媒体类型（可选）"},
+					},
+					Required: []string{"kind", "path"},
+				},
+				Description: "随问题附带的产物（如评审卡内嵌演示视频/回放页），仅单题模式支持",
+			},
 		},
 		Required: []string{"question"},
 	}
@@ -255,6 +281,39 @@ func parseOptionList(v any) []AskUserOption {
 	return opts
 }
 
+// parseArtifactList 解析 artifacts 数组字段（元素 {kind,path,title,caption,mime}，
+// []any / []map[string]any 两种形态）。宽容解析：缺 kind/path 的条目跳过
+// （降级为不带产物提问，不报错）。批量模式不支持产物，仅单题路径透传。
+func parseArtifactList(v any) []AskUserArtifact {
+	raw, ok := v.([]any)
+	if !ok {
+		if arr, ok2 := v.([]map[string]any); ok2 {
+			raw = make([]any, 0, len(arr))
+			for _, m := range arr {
+				raw = append(raw, m)
+			}
+		}
+	}
+	var out []AskUserArtifact
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind, _ := m["kind"].(string)
+		path, _ := m["path"].(string)
+		kind, path = strings.TrimSpace(kind), strings.TrimSpace(path)
+		if kind == "" || path == "" {
+			continue
+		}
+		title, _ := m["title"].(string)
+		caption, _ := m["caption"].(string)
+		mime, _ := m["mime"].(string)
+		out = append(out, AskUserArtifact{Kind: kind, Path: path, Title: title, Caption: caption, MIME: mime})
+	}
+	return out
+}
+
 // boolOf 宽松取布尔字段；缺失或类型不符返回 false。
 func boolOf(v any) bool {
 	b, _ := v.(bool)
@@ -277,6 +336,11 @@ func (t *askUserTool) Execute(ctx context.Context, args map[string]any) *Result 
 		timeoutSec = float64(t.defaultTimeoutSec)
 	}
 	detail, _ := args["detail"].(string)
+	// artifacts 仅单题模式透传（评审卡内嵌演示产物）；批量快速路径不支持。
+	var artifacts []AskUserArtifact
+	if len(questions) == 1 {
+		artifacts = parseArtifactList(args["artifacts"])
+	}
 
 	// 批量快速路径（任务 140）：整组一次调 batchHook，一个超时窗口覆盖全部题目。
 	if len(questions) > 1 && t.batchHook != nil {
@@ -291,7 +355,7 @@ func (t *askUserTool) Execute(ctx context.Context, args map[string]any) *Result 
 		if timeoutSec > 0 {
 			askCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 		}
-		answer, err := t.hook(askCtx, q.Question, AskUserOptions{Options: q.Options, MultiSelect: q.MultiSelect, Detail: detail})
+		answer, err := t.hook(askCtx, q.Question, AskUserOptions{Options: q.Options, MultiSelect: q.MultiSelect, Detail: detail, Artifacts: artifacts})
 		cancel()
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrAskUserTimeout) {

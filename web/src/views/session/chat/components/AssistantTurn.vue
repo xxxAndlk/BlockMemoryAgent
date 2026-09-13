@@ -34,6 +34,9 @@ const emit = defineEmits<{
 /** 本轮产出的可视成果（效果图/视频/HTML 原型）：对话栏直接渲染成媒体卡片。 */
 const artifacts = computed(() => turnArtifacts(props.turn))
 
+/** 澄清问答卡附带的产物（演示视频等，SSE awaiting_clarify 帧 artifacts 字段）。 */
+const clarifyArtifacts = computed(() => props.clarify?.artifacts ?? [])
+
 const finalText = computed(() => {
   if (props.turn.finalAnswer) {
     const msg = props.turn.finalAnswer.message || ''
@@ -50,6 +53,7 @@ const statusLabel = computed(() => {
   if (props.turn.status === 'error') return '失败'
   if (props.turn.status === 'cancelled') return '已终止'
   if (props.turn.status === 'awaiting_clarify') return '待澄清'
+  if (props.turn.status === 'awaiting_child') return '挂起等子'
   return '完成'
 })
 
@@ -58,6 +62,7 @@ const statusColor = computed(() => {
   if (props.turn.status === 'error') return 'text-red-400'
   if (props.turn.status === 'cancelled') return 'text-ink-3'
   if (props.turn.status === 'awaiting_clarify') return 'text-yellow-400'
+  if (props.turn.status === 'awaiting_child') return 'text-sky-400'
   return 'text-green-400'
 })
 
@@ -111,20 +116,36 @@ function onMdAction(e: MouseEvent) {
   }
 }
 
-// 思考链只展示最后一段连续 think（运行时替换而非累计）；
-// 工具调用不再逐条渲染，交给 ToolActivity 单行就地替换 + 结束后折叠汇总。
-const lastThinkEvents = computed<SessionEvent[]>(() => {
-  let buf: SessionEvent[] = []
-  let last: SessionEvent[] = []
-  for (const step of props.turn.steps) {
-    if (step.kind === 'think' && step.event) {
-      buf.push(step.event)
-      last = buf
-    } else if (step.kind === 'tool') {
-      buf = []
+// 思考链累计展示（2026-09-13 用户诉求）：此前只保留"最后一段连续 think"，一到工具调用
+// 前一段推理就整段消失。现在全部推理段落都留着；只在一段内部去重——思考文本是累积快照
+// （LLMDelta 与 ToolCall 各落一次），后一条是前一条的超集时前一条不再渲染，避免同段重复。
+// 工具调用本身仍不逐条渲染，交给 ToolActivity 单行就地替换 + 结束后折叠汇总。
+const thinkEvents = computed<SessionEvent[]>(() => {
+  const out: SessionEvent[] = []
+  let run: SessionEvent[] = []
+  const flush = () => {
+    for (let i = 0; i < run.length; i++) {
+      const next = run[i + 1]?.message || ''
+      if (next && next.startsWith(run[i].message || '')) continue // 被后一条累积快照取代
+      out.push(run[i])
     }
+    run = []
   }
-  return last
+  for (const step of props.turn.steps) {
+    if (step.kind === 'think' && step.event) run.push(step.event)
+    else if (step.kind === 'tool' || step.kind === 'narrate') flush()
+  }
+  flush()
+  return out
+})
+
+// 中间正文块：模型"口播一句 → 调工具"的那段话（后端在工具调用边界落 assistant_text 事件）。
+// 提问前的那段已由问答卡上方的 clarifyReport 呈现（后端两处存的是同一段文本），这里去重，
+// 免同一段话在对话栏出现两次（审批走 approval hook 快照，后端跳不掉的那部分靠这条兜住）。
+const narrations = computed<SessionEvent[]>(() => {
+  const report = (props.turn.clarifyReport || '').trim()
+  if (!report) return props.turn.narrations
+  return props.turn.narrations.filter((n) => (n.message || '').trim() !== report)
 })
 
 // ---- 待澄清：问题文本与长上下文 ----
@@ -318,6 +339,7 @@ async function submitBatch() {
           <el-icon v-if="turn.status === 'running'" class="is-loading"><Loading /></el-icon>
           <el-icon v-else-if="turn.status === 'completed'"><CircleCheck /></el-icon>
           <el-icon v-else-if="turn.status === 'awaiting_clarify'"><QuestionFilled /></el-icon>
+          <el-icon v-else-if="turn.status === 'awaiting_child'"><VideoPause /></el-icon>
           <el-icon v-else><CircleClose /></el-icon>
           {{ statusLabel }}
         </span>
@@ -329,8 +351,19 @@ async function submitBatch() {
       <!-- 子 Agent 列表：派了谁、各自干什么、进展如何（一人一行，状态实时） -->
       <SubAgentList :items="turn.subAgents" :agents="agents || []" :running="turn.status === 'running'" />
 
-      <!-- 思考链（仅最后一段，运行时替换）+ 工具活动（单行就地替换 / 结束后折叠汇总） -->
-      <ThinkChain v-if="lastThinkEvents.length" :events="lastThinkEvents" :verbose="verbose" />
+      <!-- 思考链（全部推理段落，可折叠）+ 工具活动（单行就地替换 / 结束后折叠汇总） -->
+      <ThinkChain v-if="thinkEvents.length" :events="thinkEvents" :verbose="verbose" />
+
+      <!-- Agent 发言块（工具调用之间的中间正文 / 子 Agent 结果摘要 / Meta 中继文本）：
+           这是模型**说给用户的话**，按正文展示，与最终答复同档——市面做法（DeepSeek 把
+           推理折进「深度思考」、Claude Code 的中间消息照常显示）都是"只有推理算思考"。
+           此前把这段当成了思考：先压成灰色小字、再整组装进「过程文本」定高窗，等于把模型
+           的发言当噪声藏起来（2026-09-13 用户实证）。 -->
+      <div v-for="(n, i) in narrations" :key="'narr-' + i" class="mt-2">
+        <div v-if="n.agent && n.agent !== primaryAgent" class="text-[11px] text-ink-3 mb-0.5">{{ n.agent }}</div>
+        <div class="md-article" @click="onMdAction" v-html="renderMd(n.message)"></div>
+      </div>
+
       <ToolActivity :groups="turn.toolCalls" :running="turn.status === 'running'" :session-id="sessionId" />
 
       <!-- 错误事件 -->
@@ -353,7 +386,8 @@ async function submitBatch() {
 
       <!-- 提问前的正文：模型「先输出正文、再调 ask_user」时，正文只活在流式缓冲里
            （不落事件），待澄清态一切换就被整段吞掉，只剩思考链。后端已把它快照进
-           提问事件（detail_json.report_text），这里按正文原样渲染在问答卡上方。 -->
+           提问事件（detail_json.report_text），这里按正文原样渲染在问答卡上方。
+           同为模型发言（与某段中间正文是同一段文本，本组件还按内容去重），按正文展示。 -->
       <div v-if="!finalText && turn.clarifyReport" class="md-article mt-2"
            @click="onMdAction"
            v-html="renderMd(turn.clarifyReport)"></div>
@@ -487,6 +521,13 @@ async function submitBatch() {
         <template v-else>
           <div class="whitespace-pre-wrap">{{ questionText }}</div>
 
+          <!-- 澄清附带的产物（演示视频等）：内嵌在选项区上方，便于看完演示再作答；
+               批量模式不展示（artifacts 只挂在顶层 clarify，镜像第一题）。 -->
+          <div v-if="clarifyArtifacts.length" class="mt-2 mb-2 space-y-2">
+            <ArtifactCard v-for="(a, i) in clarifyArtifacts" :key="'clarify-art-' + i + '-' + a.path"
+                          :artifact="a" :session-id="sessionId" />
+          </div>
+
           <!-- 澄清选项（来自 SSE awaiting_clarify 帧）：单选按钮 / 多选复选框 + 提交 -->
           <template v-if="clarify && clarify.options.length > 0">
             <div class="mt-2 flex flex-col gap-1.5">
@@ -532,6 +573,8 @@ async function submitBatch() {
           <span class="italic break-all">{{ liveThinkingTail }}</span>
           <span class="live-cursor">▍</span>
         </div>
+        <!-- 流式口播：模型正在说的那句话，按正文展示（与落盘后的发言块同字号，
+             中途不会跳字号） -->
         <div v-if="liveStreaming"
              class="md-article mt-2"
              @click="onMdAction"
