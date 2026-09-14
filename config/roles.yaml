@@ -50,7 +50,7 @@ meta_agent:
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:
   model_config:
-    model_ref: ark-glm-5.3-flash # 2026-09-06 对擂实测：ark-glm-5.3-flash domain 单呼均延 57.6s（80 呼 4608s，占总耗时 71%）；evolving 同端点同协议 meta 侧均延 27.6s，切域执行层提速
+    model_ref: ark-deepseek-v4-flash # 2026-09-06 对擂实测：ark-glm-5.3-flash domain 单呼均延 57.6s（80 呼 4608s，占总耗时 71%）；evolving 同端点同协议 meta 侧均延 27.6s，切域执行层提速
     temperature: 0
     thinking: medium     # 2026-09-07 恢复 medium（TODO 第八项 P0-1）：off 档正确率损失大于延迟收益（2026-09-06 对擂实测 off 步数翻倍且完成度下滑 round-5 C=0.849），编码执行层须留推理预算；off 仅 meta 这类路由/汇总角色适用。glm 系 ark 端点不支持 disabled（400），仅 doubao 角色可关
   skills: [派发与规格]   # 工具描述精简（P0-3）后字段全语义承接进技能文档，下拆写 spec 拿不准时 load_skill
@@ -106,7 +106,7 @@ fixed_roles:
     skills: []
     tools: [ReadFile, ListDir, SearchInFiles]
     model_config:
-      model_ref: ark-glm-5.3-flash # 抵扣 0.5 最便宜档；侦察任务短平快，thinking=low 保底推理。连接参数见 config/models.json
+      model_ref: ark-deepseek-v4-flash # 抵扣 0.5 最便宜档；侦察任务短平快，thinking=low 保底推理。连接参数见 config/models.json
       temperature: 0
       thinking: low
     can_be_called: true
@@ -126,7 +126,7 @@ fixed_roles:
     skills: []
     tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, GitDiff, GitStatus, load_skill]
     model_config:
-      model_ref: ark-glm-5.3-flash # 同 domain/scout 便宜档；小修短平快 thinking=low 保底推理。连接参数见 config/models.json
+      model_ref: ark-deepseek-v4-flash # 同 domain/scout 便宜档；小修短平快 thinking=low 保底推理。连接参数见 config/models.json
       temperature: 0
       thinking: low
     can_be_called: true
@@ -163,8 +163,8 @@ fixed_roles:
     skills: []
     tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config:
-      model_ref: gemini-3.8-flash # gemini-webapi 网关（连接参数见 config/models.json）
-      temperature: 0.2
+      model_ref: ark-glm-5.3-flash # gemini-webapi 网关（连接参数见 config/models.json）
+      temperature: 0.7
       thinking: off        # 出图/写 UI 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
 
@@ -223,7 +223,7 @@ fixed_roles:
     skills: []
     tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config:
-      model_ref: doubao-seed-2.0-lite # 连接参数见 config/models.json
+      model_ref: ark-deepseek-v4-flash # 连接参数见 config/models.json
       temperature: 0.5
       thinking: off       # 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
