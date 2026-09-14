@@ -138,6 +138,7 @@ agent:
   tool_approval_disabled: true   # 全信任模式：true 关闭全部破坏性操作审批（WriteFile/EditFile 生产写入、RunCommand 危险命令模式、插件 Destructive 工具一律直接执行，不再推「需确认」）。2026-08-30 事故动机：computer_use 插件全工具自标 destructive，视频诊断会话 list/read/wait 等无害只读调用也被拦 30+ 次，审批风暴吃掉整晚墙钟。仅关确认链，命令黑名单（hard block）与写路径沙箱不受影响；单人开发机可开，多人/生产环境保持 false
   tool_sandbox_allowed_paths: [] # 允许读写的额外绝对路径白名单
   tool_sandbox_blocked_cmds: []  # 追加到默认命令黑名单的额外命令
+  role_tool_gate_enabled: false  # 角色工具白名单硬门：false=白名单仅作 Schema 可见性软过滤（现状）；true=Dispatch 执行前按角色白名单硬校验，白名单外工具调用直接拒绝（堵住 LLM 幻觉/提示注入调用白名单外工具的缺口；verifyloop 程序化派发同被拦，开启前确认各角色白名单覆盖完整）
   production_workdir: ""         # 生产环境工作目录（绝对路径）；非空时其下的破坏性操作（WriteFile/写类命令）需用户确认；空=仅危险命令模式（git push/rm -rf 等）需确认
 
 # 日志文件输出（按天分割，按入口分文件）

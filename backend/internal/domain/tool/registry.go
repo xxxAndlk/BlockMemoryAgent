@@ -8,6 +8,7 @@ import (
 	"log"           // log 用于记录拦截/失败等不影响主流程的可观测事件
 	"os"            // os 用于 stat 文件 mtime（读取状态追踪）
 	"path/filepath" // filepath 用于规范化文件路径
+	"slices"        // slices 用于角色工具硬门白名单成员判定
 	"strconv"       // strconv 用于解析 ReadFile 分页头总行数（长文件判定）
 	"strings"       // strings 用于拼接已读文件列表
 	"sync"          // sync 提供互斥锁保护并发状态
@@ -153,6 +154,12 @@ type Registry struct {
 	// approvalDisabled 全信任模式（config: tool_approval_disabled）：true 时 needsApproval
 	// 直接短路，所有破坏性操作不再推「需确认」、照常执行（动机与边界见 SafetyConfig 注释）。
 	approvalDisabled bool
+	// roleToolGate 角色工具白名单硬门解析器（dormant opt-in，config: role_tool_gate_enabled）：
+	// 由 bootstrap 注入（闭包查 roleRegistry.Get(roleID).Tools）。非 nil 且 ctx 携带 roleID、
+	// 该角色白名单非空时，Dispatch 拒绝执行白名单外工具——堵住 Schema 软过滤缺口（LLM
+	// 幻觉/提示注入出白名单外工具名此前仍会执行）。nil 解析器 / 空 roleID / 空白名单 =
+	// 现状行为不变（verifyloop ExecuteChild 等程序化派发依赖现状，默认关闭）。
+	roleToolGate func(roleID string) []string
 	// pluginMgr 是 plugin_* 工具（TODO #51）依赖的插件管理面，由 bootstrap 注入
 	// plugins.ToolManagerAdapter；nil 时工具返回未配置错误。
 	pluginMgr PluginManager
@@ -344,6 +351,17 @@ func (r *Registry) SetApprovalDisabled(disabled bool) {
 	}
 }
 
+// SetRoleToolGateResolver 注入角色工具白名单硬门解析器（dormant opt-in，
+// config: role_tool_gate_enabled，默认关闭）。fn 返回该角色的工具白名单；
+// 返 nil/空切片表示该角色不限制。nil 解析器 = 全局关闭（现状行为）。
+// 注意：开启后 verifyloop ExecuteChild 等绕过 adapter Schema 过滤的程序化路径
+// 同样被拦截——这正是本门的目的，但启用前需确认各角色白名单完整覆盖其实际所需。
+func (r *Registry) SetRoleToolGateResolver(fn func(roleID string) []string) {
+	if r != nil {
+		r.roleToolGate = fn
+	}
+}
+
 // needsApproval 判定本次工具调用是否需要用户确认（TODO #17 P1 破坏性分级 + 第10⑥ 三级信任模式）。
 // 信任模式经 ctx 携带的读取器实时读取（会话层注入闭包，会话中途切换模式下一工具调用即生效）：
 //   - suggest：全部变更类动作（WriteFile/EditFile/RestoreFile/RunCommand/动态 Destructive 工具）
@@ -516,6 +534,22 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	argsStr, _ := marshalNoHTMLEscape(args)
 	// 发送工具调用进度事件，便于外部观测当前调用。
 	r.emitTool(ctx, "tool_call", name, "调用工具 "+name, string(argsStr))
+
+	// 角色工具白名单硬门（dormant opt-in，默认关闭）：resolver 非 nil 且 ctx 携带 roleID、
+	// 该角色白名单非空时，白名单外工具直接拒绝执行——Schema 白名单只是 LLM 可见性软过滤，
+	// 幻觉/提示注入出白名单外工具名此前仍会执行，此门把它变成执行层硬约束。
+	// 拒绝返回工具级错误（Agent 可见并自行改用白名单内工具），不中止循环。
+	if r.roleToolGate != nil {
+		if roleID := RoleIDFromContext(ctx); roleID != "" {
+			if allowed := r.roleToolGate(roleID); len(allowed) > 0 && !slices.Contains(allowed, name) {
+				log.Printf("[tool] role-tool-gate deny: role=%s tool=%s", roleID, name)
+				result := &Result{Tool: name, Error: fmt.Sprintf("角色 %s 的白名单不含工具 %s，执行被硬门拒绝。请改用白名单内工具推进任务。", roleID, name)}
+				r.fillResult(ctx, result, args)
+				r.emitResult(ctx, result)
+				return result, nil
+			}
+		}
+	}
 
 	// ReadFile 连读检测：重读不再拦截（每次直返磁盘最新内容，天然无脏数据，
 	// 也兼容 WriteFile/sed/外部进程改写等一切修改途径）。仅检测"参数完全相同"的连续

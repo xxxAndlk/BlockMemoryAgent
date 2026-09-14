@@ -136,6 +136,13 @@ type SafetyConfig struct {
 	ToolApprovalDisabled bool `yaml:"tool_approval_disabled"`
 	ToolSandboxAllowedPaths []string `yaml:"tool_sandbox_allowed_paths"` // 允许读写的额外绝对路径白名单
 	ToolSandboxBlockedCmds  []string `yaml:"tool_sandbox_blocked_cmds"`  // 额外命令黑名单（追加到默认黑名单）
+	// RoleToolGateEnabled 角色工具白名单硬门（默认 false=关闭，现状行为）。
+	// 角色 tools 白名单原本只是 Schema 可见性软过滤（LLM 看不到白名单外工具，但
+	// Registry.Dispatch 不校验，幻觉/提示注入出白名单外工具名仍会执行）；开启后
+	// Dispatch 执行前按 ctx 角色硬校验，白名单外调用直接拒绝（Agent 可见错误，不中止循环）。
+	// 注意：verifyloop ExecuteChild 等程序化派发路径同样被拦——启用前先确认各角色
+	// 白名单完整覆盖其实际所需（含 roles.yaml 对 meta/domain 的覆盖列表）。
+	RoleToolGateEnabled bool `yaml:"role_tool_gate_enabled"`
 	// ProductionWorkDir 生产环境工作目录（绝对路径，默认空=未启用）。
 	// 非空且当前工具工作目录等于/位于其下时，破坏性工具（WriteFile、写类/危险 RunCommand）
 	// 经 approvalHook 推「需确认」事件，上层暂停会话等用户确认；空时仅在命中危险命令模式

@@ -279,6 +279,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		}
 		return rd.Sandbox.AllowedWritePaths
 	})
+	// 角色工具白名单硬门（默认关闭，config: role_tool_gate_enabled）：开启后 Dispatch
+	// 执行前按角色白名单硬校验，堵住 Schema 软过滤缺口。闭包直接复用 roleRegistry.Get
+	// （meta/domain 合成角色与 roles.yaml 覆盖列表同源，无需额外映射）。
+	if cfg.Agent.RoleToolGateEnabled {
+		toolRegistry.SetRoleToolGateResolver(func(roleID string) []string {
+			rd := roleRegistry.Get(roleID)
+			if rd == nil {
+				return nil
+			}
+			return rd.Tools
+		})
+	}
 	// 注入 LLM 领域分区器：RefreshProjectDoc 工具（MetaAgent 侧）与 EnsureProjectDoc（首 session）
 	// 均调轻量模型读文件样本按职责/实体分区（如"游戏运行时""炮塔实体"）；失败/超限回退启发式依赖图兜底，永不留空标注。
 	cls := &llmDomainClassifier{factory: modelFactory}
