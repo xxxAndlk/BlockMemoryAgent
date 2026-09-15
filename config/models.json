@@ -8,7 +8,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 128000,
-      "description": "Agent 编排/长程规划主力（抵扣 2.5），适合 MetaAgent 路由、汇总与复杂规划"
+      "description": "Meta 编排主力（2.5）：规划/路由/汇总，128K 输出；不做编码执行"
     },
     {
       "id": "ark-glm-5.3-flash",
@@ -18,7 +18,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 128000,
-      "description": "域执行/叶子主力（抵扣 0.5），单呼快，适合编码执行、侦察、速修等高频任务"
+      "description": "质量型执行档（128K）：UI/长 HTML 输出；思考档单轮可达 459s，忌高频"
     },
     {
       "id": "glm-5.3-flash",
@@ -28,7 +28,7 @@
       "api_key": "${ANTHROPIC_BASE_URL_FOUR}",
       "base_url": "${OPENAI_API_KEY_TWO}",
       "max_output_tokens": 32768,
-      "description": "GLM 5.3 Flash 备用端点，每日23点到次日9点免费，需及时切换，同 ark-glm-5.3-flash 能力"
+      "description": "同 GLM 5.3 Flash 备用端点：仅 23:00-9:00 免费时段用，输出 32K"
     },
     {
       "id": "doubao-seed-2.0-mini",
@@ -38,7 +38,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 32768,
-      "description": "轻量档，适合历史总结、检索 query 改写等低开销任务"
+      "description": "轻量档：总结/query 改写等低开销调用；不能执行任务"
     },
     {
       "id": "ark-deepseek-v4-flash",
@@ -48,7 +48,17 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 32768,
-      "description": "叶子高频角色性价比档（抵扣 0.5），适合代码编写、测试等单文件闭环任务"
+      "description": "最便宜高频档（0.5）：规格明确的执行/速修，固定角色现役"
+    },
+    {
+      "id": "ark-deepseek-v4.1-flash",
+      "name": "ARK DeepSeek V4.1 Flash",
+      "provider": "anthropic",
+      "model": "deepseek-v4-flash",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "${ANTHROPIC_BASE_URL}",
+      "max_output_tokens": 128000,
+      "description": "domain 主力（2.5 ，128K）：多轮编码/测试/集成修复，性价比最优"
     },
     {
       "id": "deepseek-flash",
@@ -57,8 +67,8 @@
       "model": "deepseek-flash",
       "api_key": "${OPENAI_API_KEY}",
       "base_url": "${OPENAI_BASE_URL}",
-      "max_output_tokens": 32768,
-      "description": "成本稍高，速度快质量高"
+      "max_output_tokens": 64000,
+      "description": "官方直连备线（64K）：带前缀缓存命中统计；成本略高于 ark 档"
     },
     {
       "id": "ark-glm-5.3",
@@ -68,7 +78,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 16384,
-      "description": "中档质量（抵扣 4.5），适合提示词/代码审查类需要细致判断的任务"
+      "description": "审查判断档（4.5）：提示词/代码审查；输出仅 16K，思考档慢（judge 易超时）"
     },
     {
       "id": "doubao-seed-2.0-lite",
@@ -78,7 +88,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 16384,
-      "description": "文档编写档，适合 README/CHANGELOG 等中等长度文本产出"
+      "description": "文档档（16K）：README/CHANGELOG 等中等文本产出"
     },
     {
       "id": "kimi-k3",
@@ -88,8 +98,7 @@
       "api_key": "${ANTHROPIC_API_KEY_TWO}",
       "base_url": "${ANTHROPIC_BASE_URL_TWO}",
       "max_output_tokens": 32768,
-      "description": "高成本强推理档，仅硬骨头任务临时切换使用（ark coding 端点硬限 32768）",
-      "selectable_roles": ["meta"]
+      "description": "峰值推理（10，全表最贵）：仅 meta 可选，硬骨头任务临时换档"
     },
     {
       "id": "gemini-3.8-flash",
@@ -99,7 +108,7 @@
       "api_key": "xxx",
       "base_url": "${GEMINI_CHAT_URL}",
       "max_output_tokens": 32768,
-      "description": "UI 出图/前端实现档，HTML+CSS 长输出防截断（gemini-webapi 网关，不稳定超时可切），每次调用需要间隔5秒"
+      "description": "UI 出图/前端档（32K）：长 HTML 输出防截断；间隔 ≥5s，网关不稳"
     }
   ],
   "role_bindings": {}
