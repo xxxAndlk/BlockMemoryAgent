@@ -1,11 +1,13 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import type { Session, SessionEvent, AgentNode, ClarifyPending, WireImage } from '@/types'
 import ChatHeader from './components/ChatHeader.vue'
 import MessageList from './components/MessageList.vue'
 import ChatInput from './components/ChatInput.vue'
 import AgentChatPanel from '../orch/AgentChatPanel.vue'
+import { latestEventPhrase } from './utils/eventStyles'
 
-defineProps<{
+const props = defineProps<{
   session: Session | null
   events: SessionEvent[]
   agents: AgentNode[]
@@ -45,6 +47,17 @@ const emit = defineEmits<{
   'update-workdir': [dir: string]
   refresh: []
 }>()
+
+// 常驻最新状态行（TODO #15 翻译层① T10）：运行中在消息区下方展示最近事件的
+// 人话短语（"正在执行工具操作"），比"运行中"标签更可感知。流式思考优先展示。
+const latestStatus = computed(() => {
+  if (props.liveThinking) return '正在思考…'
+  return latestEventPhrase(props.events)
+})
+
+const showStatusLine = computed(() =>
+  (props.session?.status === 'running' || props.session?.status === 'awaiting_child') && !!latestStatus.value,
+)
 </script>
 
 <template>
@@ -64,6 +77,11 @@ const emit = defineEmits<{
                    :prior-replies="priorReplies"
                    @submit-clarify="emit('clarify-submitted')"
                    @update-clarify-drafts="(d: string[]) => emit('update-clarify-drafts', d)" />
+      <!-- 常驻最新状态行（T10）：运行中展示最近事件的人话短语 -->
+      <div v-if="showStatusLine"
+           class="px-6 py-1 text-xs text-ink-3 border-t border-line bg-page/60 truncate shrink-0">
+        {{ latestStatus }}
+      </div>
       <ChatInput :loading="sending"
                  :session-active="session?.status === 'running' || session?.status === 'awaiting_clarify' || session?.status === 'awaiting_child'"
                  :inject-hint="session?.status === 'running'"

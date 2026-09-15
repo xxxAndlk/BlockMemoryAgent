@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
@@ -24,6 +25,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
+	"github.com/go-kratos/blades/tools"
 )
 
 // ReActAgent 实现单个 ReAct 循环：LLM 生成 -> 工具调用 -> 工具结果 -> 重复。
@@ -142,6 +144,10 @@ type ReActAgent struct {
 	// msgLogger 可选的消息热层记录器（编排页对话视图）：每条入史消息同步热写。
 	// nil 时零行为。
 	msgLogger MessageLogger
+	// promptStatsSegs 提示词构成分段计量（TODO #15①，rune 数）：buildSystemPrompt
+	// 在 sysPromptOnce 内写入（单 goroutine，无竞争）——persona/env/role_base/discipline/skill
+	// 各分段规模。首轮 LLM 调用经 logPromptStats 以明细行输出，供提示词瘦身边际对照。
+	promptStatsSegs map[string]int
 }
 
 // PersonaInjector 把人格内容拼接到系统提示词之前；soul.Loader 实现该接口。
@@ -571,6 +577,16 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				return ReactResult{History: history}, err
 			}
 		}
+		// P0-2 steering（TODO #14 T8）：generate 前补一次 drainMailbox，压缩用户注入
+		// 消息的插入延迟上界——上一轮工具执行期间经邮箱注入的用户消息，不必等到本轮
+		// 无 tool_calls 分支才可见，本轮请求即可带上。此处 history 以 tool 结果
+		// （或首轮 user 消息）收尾，追加 user 角色消息不会破坏 tool_calls 配对。
+		var preGen int
+		history, preGen = a.drainMailbox(history)
+		if preGen > 0 {
+			unproductiveStreak = 0 // 新信息注入，重置停滞计数（同循环尾 drain 语义）
+		}
+
 		// 在每次调用 LLM 之前，通过记忆流水线组装上下文消息。
 		// 这可能会压缩历史、注入相关记忆或做其他上下文管理。
 		assembled := a.memory.Assemble(a.role, a.name, history)
@@ -612,6 +628,10 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			Messages:    bladesMsgs,
 			Tools:       a.tools.Schema(),
 		}
+
+		// 提示词构成计量（TODO #15①）：每轮一行紧凑统计，首轮附 sys 分段明细，
+		// 供提示词瘦身边际对照（#15② meta 收窄前后降幅即以此为准）。
+		a.logPromptStats(i, system, messages, history, req.Tools)
 
 		// 调用 LLM 生成回复（带重试与单次超时）；重试耗尽后返回错误。
 		a.reportStableHash(system, i)
@@ -1160,6 +1180,39 @@ func (a *ReActAgent) reportStableHash(instruction string, round int) {
 		return
 	}
 	log.Printf("[cache] stable_hash=%s agent=%s round=%d", hash, a.name, round)
+}
+
+// logPromptStats 输出提示词构成计量行（TODO #15①）：每轮 LLM 调用一行紧凑统计——
+//   - sys：系统指令 rune 数（buildSystemPrompt 冻结值）
+//   - tools：工具数/名称+描述 rune 数（角色工具白名单规模，#15② 收窄的直接观测项）
+//   - hist：请求视图历史 rune 数（窗口裁剪后、发往模型的全部非 system 消息）
+//   - dyn：请求视图相对 canonical history 的净增 rune（Assemble 注入的压缩摘要/事件/
+//     看板段减去压缩缩减；负值=本轮压缩净缩），时间消息等尾部注入一并计入
+//
+// 首轮（round==0）追加一行 sys 分段明细（persona/env/role_base/discipline/skill），
+// 供瘦身边际对照。纯 log 输出，不入史不落事件。
+func (a *ReActAgent) logPromptStats(round int, system string, messages, history []ReactMessage, toolSchemas []tools.Tool) {
+	sysRunes := utf8.RuneCountInString(system)
+	toolDescRunes := 0
+	for _, t := range toolSchemas {
+		toolDescRunes += utf8.RuneCountInString(t.Name()) + utf8.RuneCountInString(t.Description())
+	}
+	histRunes := 0
+	for _, m := range messages {
+		histRunes += utf8.RuneCountInString(m.Content)
+	}
+	dynRunes := 0
+	for _, m := range history {
+		dynRunes -= utf8.RuneCountInString(m.Content)
+	}
+	dynRunes += histRunes
+	log.Printf("[prompt-stats] agent=%s round=%d sys=%d tools=%d/%dr hist=%d dyn=%d",
+		a.name, round, sysRunes, len(toolSchemas), toolDescRunes, histRunes, dynRunes)
+	if round == 0 && len(a.promptStatsSegs) > 0 {
+		log.Printf("[prompt-stats] sys segments agent=%s persona=%d env=%d role_base=%d discipline=%d skill=%d",
+			a.name, a.promptStatsSegs["persona"], a.promptStatsSegs["env"],
+			a.promptStatsSegs["role_base"], a.promptStatsSegs["discipline"], a.promptStatsSegs["skill"])
+	}
 }
 
 // generate 包装一次 LLM 调用：带单次超时与指数退避重试（TODO #19 LLM 链）。
@@ -1720,22 +1773,43 @@ func (a *ReActAgent) buildSystemPrompt() string {
 
 	// 在基础提示后追加执行纪律块，与角色提示同语言（中文），覆盖：
 	// 工具使用节制、产出后验证（代码走机器校验、非代码走纸面对照）、完成即停、mailbox 消息语义。
-	prompt := envBlock + "\n\n" + base + "\n\n" +
+	discipline :=
 		"【执行纪律】\n" +
-		"1. 只在必要时调用工具；先用 SearchInFiles/ListDir 定位，再按需 ReadFile；不重复读取已读过的文件。\n" +
-		"2. 产出或修改文件后必须验证：代码类产出用 RunCommand 跑构建/测试/语法检查；非代码产出对照任务验收标准逐条核对。没有验证证据不得声称完成。\n" +
-		"3. 任务完成立即停止调用工具，输出最终答复；答复必须自包含：做了什么、结果如何、关键产出与文件路径。\n" +
-		"4. 形如 [mailbox from <agent_id>] 的消息是异步子 Agent 回传的结果摘要，阅读后整合进当前结论；若摘要表明失败，决定重试、自己接手或在答复中说明。\n"
+			"1. 只在必要时调用工具；先用 SearchInFiles/ListDir 定位，再按需 ReadFile；不重复读取已读过的文件。\n" +
+			"2. 产出或修改文件后必须验证：代码类产出用 RunCommand 跑构建/测试/语法检查；非代码产出对照任务验收标准逐条核对。没有验证证据不得声称完成。\n" +
+			"3. 任务完成立即停止调用工具，输出最终答复；答复必须自包含：做了什么、结果如何、关键产出与文件路径。\n" +
+			"4. 形如 [mailbox from <agent_id>] 的消息是异步子 Agent 回传的结果摘要，阅读后整合进当前结论；若摘要表明失败，决定重试、自己接手或在答复中说明。\n"
+	prompt := envBlock + "\n\n" + base + "\n\n" + discipline
 	// 技能元数据块（渐进披露第一层）追加在纪律块之后：持有技能的名称+一句话描述 +
 	// load_skill 取全文/派发下放提示。放在尾部只 fork 提示词尾部，envBlock+base+纪律块
 	// 的公共前缀跨 Agent 保持逐字节一致（前缀缓存跨实例复用，口径同 responsibility 注入）。
 	if a.skillBlock != "" {
 		prompt += "\n\n" + a.skillBlock
 	}
+	// 提示词构成分段计量（TODO #15①）：各分段 rune 快照，首轮 LLM 调用输出明细行，
+	// 供瘦身边际对照（T13 meta 收窄前后对比 sys 分段降幅）。sync.Once 内写入，无竞争。
+	seps := 4 // env+base、base+discipline 两处 "\n\n"
+	if a.skillBlock != "" {
+		seps += 2
+	}
+	a.promptStatsSegs = map[string]int{
+		"env":        utf8.RuneCountInString(envBlock),
+		"role_base":  utf8.RuneCountInString(base),
+		"discipline": utf8.RuneCountInString(discipline),
+		"skill":      utf8.RuneCountInString(a.skillBlock),
+	}
 	// 人格注入器非 nil 时，把人格内容拼到完整 prompt 最前（envBlock 之前），
 	// 作为用户级人格前缀。人格为空时 Inject 原样返回，无副作用。
 	if a.persona != nil {
 		prompt = a.persona.Inject(prompt)
+		// 人格规模按差值计（Injector 可能拼多段前缀）：总量 − 其余分段与分隔符。
+		if total := utf8.RuneCountInString(prompt); total > 0 {
+			other := a.promptStatsSegs["env"] + a.promptStatsSegs["role_base"] +
+				a.promptStatsSegs["discipline"] + a.promptStatsSegs["skill"] + seps
+			if total > other {
+				a.promptStatsSegs["persona"] = total - other
+			}
+		}
 	}
 	return prompt
 }

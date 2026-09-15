@@ -138,8 +138,8 @@ func (m *mockAgentForPlan) PauseAgent(ctx context.Context, sessionID, instID str
 }
 
 // MessageAgent 是 mockAgentForPlan 的用户直连空实现（编排页不在 TUI 测试范围）。
-func (m *mockAgentForPlan) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
-	return nil
+func (m *mockAgentForPlan) MessageAgent(ctx context.Context, sessionID, instID, content string) (bool, error) {
+	return false, nil
 }
 
 // Shutdown 是 mockAgentForPlan 的空实现。

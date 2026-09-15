@@ -250,6 +250,11 @@ const (
 	// search_knowledge 工具 / 混合检索按此类型召回。
 	KnowledgeTypeExternalKB KnowledgeType = "external_kb"
 
+	// KnowledgeTypeDomainProfile 领域档案（TODO #17 领域注册表）：按 meta->>'domain'
+	// 唯一 upsert 的跨场景领域注册条目，记录展示名/别名/常改文件清单/子项目归属，
+	// 供派发侧做「任务路径 ∩ 档案文件」匹配与冷复活种子注入。零新表，复用 global_knowledge。
+	KnowledgeTypeDomainProfile KnowledgeType = "domain_profile"
+
 	// KnowledgeTypeDomainArchive 领域归档:历史遗留知识类型，召回机制已在 P1-1 删除
 	// （原 internal/store/domain_archive.go 已移除）。常量保留以兼容历史数据，
 	// 新代码不应再写入此类型，统一使用 KnowledgeTypeBlockMemory。

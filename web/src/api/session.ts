@@ -1,4 +1,4 @@
-import type { Session, SessionEvent, AgentNode, TaskBoardData, WireImage, TrustMode } from '@/types'
+import type { Session, SessionEvent, AgentNode, TaskBoardData, WireImage, TrustMode, SessionGear } from '@/types'
 import { fetchJson } from './client'
 import { APP_CONFIG } from '@/config/app'
 
@@ -179,9 +179,10 @@ export async function getAgentMessages(
 
 /**
  * 用户直连发送（编排页对话面板发送框）。
- * 后端状态机：等子返回→注入唤醒；终态→复活重跑；执行中/不可直连→409（抛 APIError）。
+ * 后端状态机：等子返回→注入唤醒；执行中→邮箱排队（queued=true，P0-2 steering）；
+ * 终态→复活重跑；不可直连（paused/idle/meta）→409（抛 APIError）。
  */
-export function sendAgentMessage(id: string, aid: string, content: string): Promise<void> {
+export function sendAgentMessage(id: string, aid: string, content: string): Promise<{ ok: boolean; queued: boolean }> {
   return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(aid)}/message`, {
     method: 'POST',
     body: JSON.stringify({ content }),
@@ -210,6 +211,15 @@ export function setTrustMode(id: string, mode: TrustMode): Promise<{ session_id:
   return fetchJson(`/sessions/${id}/trust-mode`, {
     method: 'POST',
     body: JSON.stringify({ mode }),
+  })
+}
+
+/** 切换会话执行档位（TODO #14 三档控制）：POST /sessions/{id}/gear，原子即时生效；
+ *  手动切档允许任意向（auto 只升不降仅约束自动升档）；在飞子 Agent 不强杀，下轮按新档裁决。 */
+export function setSessionGear(id: string, gear: SessionGear): Promise<{ session_id: string; gear: string }> {
+  return fetchJson(`/sessions/${id}/gear`, {
+    method: 'POST',
+    body: JSON.stringify({ gear }),
   })
 }
 
@@ -260,11 +270,15 @@ export function streamSession(
   let attempt = 0
   let es: EventSource | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let online = false // 上次 onopen 是否成功（区分首次连接与断线重连）
 
   const connect = () => {
     if (closed) return
+    es?.close() // 防重复流：重连触发点可能撞上仍存活的旧连接（先关再开）
     es = new EventSource(`${APP_CONFIG.apiBase}/sessions/${id}/stream`)
     es.onopen = () => {
+      if (online) return
+      online = true
       attempt = 0
     }
     es.onmessage = (e) => {
@@ -288,19 +302,52 @@ export function streamSession(
       es?.close()
       es = null
       if (closed) return
-      if (attempt >= APP_CONFIG.sseRetry) {
-        onError?.(new Error('SSE 重连失败，已超过最大重试次数'))
-        return
-      }
-      const delay = Math.min(1000 * Math.pow(2, attempt), APP_CONFIG.sseRetryMaxDelayMs)
-      attempt++
-      reconnectTimer = setTimeout(connect, delay)
+      scheduleReconnect()
     }
   }
+
+  // 断线重连调度（TODO #16-5 T20 补播兜底）：页面可见期间持续重试（指数退避，
+  // 封顶 sseRetryMaxDelayMs）；页面不可见时暂停——浏览器本就会掐后台页的 SSE，
+  // 恢复可见/网络恢复时立即续连。重连成功后服务端先推全量快照，断档事件自动补齐，
+  // 因此无需额外补播端点。
+  const scheduleReconnect = () => {
+    online = false
+    if (document.visibilityState !== 'visible') {
+      document.addEventListener('visibilitychange', onVisible, { once: true })
+      return
+    }
+    const delay = Math.min(1000 * Math.pow(2, attempt), APP_CONFIG.sseRetryMaxDelayMs)
+    attempt++
+    reconnectTimer = setTimeout(connect, delay)
+  }
+
+  const onVisible = () => {
+    document.removeEventListener('visibilitychange', onVisible)
+    if (closed) return
+    if (document.visibilityState === 'visible') {
+      if (online && es) return // 连接还活着（后台页未必掐 SSE），无需重连
+      attempt = 0
+      connect()
+    } else {
+      scheduleReconnect()
+    }
+  }
+
+  const onOnline = () => {
+    if (closed) return
+    if (online && es) return // 连接活着就不折腾
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    attempt = 0
+    connect()
+  }
+  window.addEventListener('online', onOnline)
+
   connect()
 
   return () => {
     closed = true
+    document.removeEventListener('visibilitychange', onVisible)
+    window.removeEventListener('online', onOnline)
     if (reconnectTimer) clearTimeout(reconnectTimer)
     es?.close()
   }

@@ -49,6 +49,9 @@ export interface ChatMessage {
 /** 信任模式（TODO 第10⑥ 三级信任，对标 Codex）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主。 */
 export type TrustMode = 'suggest' | 'auto-edit' | 'full-auto'
 
+/** 会话执行档位（TODO #14 三档控制）：auto=规则自动选 / fast=轻聊快答 / cluster=完整重装；explore 预留未实现。 */
+export type SessionGear = 'auto' | 'fast' | 'cluster'
+
 export interface Session {
   id: string
   goal: string
@@ -62,6 +65,8 @@ export interface Session {
   work_dir?: string
   /** 信任模式（TODO 第10⑥）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主；空 = 后端回退现网语义。 */
   trust_mode?: TrustMode | ''
+  /** 执行档位（TODO #14）：auto|fast|cluster；空 = 未设置（按集群档现行为兜底）。 */
+  gear?: SessionGear | ''
   /** 当前正在流式生成的助手文本（仅运行中有值，SSE 快照/live 帧携带），对齐 TUI 实时汇报展示。 */
   streaming_text?: string
   /** 当前思考阶段过程文本（瞬时，仅运行中有值）。 */

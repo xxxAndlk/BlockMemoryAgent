@@ -82,9 +82,10 @@ type Agent interface {
 	PauseAgent(ctx context.Context, sessionID, instID string) error
 
 	// MessageAgent 用户直连子 Agent（编排页对话面板发送框）。
-	// 状态机：等子返回→注入唤醒；终态→复活重跑；执行中→ErrAgentBusy；
-	// Paused/Idle/meta→ErrInvalidSessionState。
-	MessageAgent(ctx context.Context, sessionID, instID, content string) error
+	// 状态机：等子返回→注入唤醒；执行中→邮箱排队（queued=true，P0-2 steering）；
+	// 终态→复活重跑；Paused/Idle/meta→ErrInvalidSessionState。
+	// queued=true 表示消息入邮箱排队（running 态）；false = 即时投递/复活/唤醒。
+	MessageAgent(ctx context.Context, sessionID, instID, content string) (queued bool, err error)
 
 	// Board 返回会话任务看板快照（TODO #22 执行计划面板真相源）。
 	// 未接线或会话无看板时返回 (nil, nil)，调用方回退旧树合成。

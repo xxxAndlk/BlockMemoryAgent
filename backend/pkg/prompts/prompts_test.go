@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-// TestGet_AllRegisteredIDs 全部 10 个 roleID 可取且非空。
+// TestGet_AllRegisteredIDs 全部 11 个 roleID 可取且非空。
 func TestGet_AllRegisteredIDs(t *testing.T) {
 	ids := []string{
-		"meta", "domain",
+		"meta", "domain", "chat",
 		"scout", "light", "code_assistant", "ui_assistant",
 		"prompt_reviewer", "code_reviewer", "test_assistant", "doc_assistant",
 	}
@@ -20,6 +20,37 @@ func TestGet_AllRegisteredIDs(t *testing.T) {
 		}
 		if strings.TrimSpace(p) == "" {
 			t.Errorf("Get(%q) 返回空提示词", id)
+		}
+	}
+}
+
+// TestChat_SlimPrompt 快速档提示词瘦身契约（TODO #14 P0-1 / #15①）：
+// Chat ≤ 3K rune 且含升级纪律——提示词养肥即失败，秒回角色的存在意义是轻。
+func TestChat_SlimPrompt(t *testing.T) {
+	r := 0
+	for range Chat {
+		r++
+	}
+	if r > maxChatPromptRunes {
+		t.Fatalf("Chat 提示词 %d runes 超上限 %d（快速档瘦身契约）", r, maxChatPromptRunes)
+	}
+	if !strings.Contains(Chat, "escalate_gear") {
+		t.Fatal("Chat 缺升级纪律（escalate_gear）")
+	}
+}
+
+// TestVersionPinned 版本钉契约（TODO #15 T15）：非空且符合 yyyymmdd-N 形态——
+// bootstrap 启动日志拿它对照线上提示词版本，形态散了归因就没锚点。
+func TestVersionPinned(t *testing.T) {
+	if strings.TrimSpace(Version) == "" {
+		t.Fatal("prompts.Version 不得为空")
+	}
+	if len(Version) != 10 || Version[8] != '-' || Version[9] < '1' || Version[9] > '9' {
+		t.Fatalf("prompts.Version 应为 yyyymmdd-N 形态, got %q", Version)
+	}
+	for i, c := range Version[:8] {
+		if c < '0' || c > '9' {
+			t.Fatalf("Version 前缀应为 8 位日期数字, got %q at %d", Version, i)
 		}
 	}
 }

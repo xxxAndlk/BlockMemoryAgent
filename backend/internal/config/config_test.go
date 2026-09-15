@@ -80,6 +80,26 @@ func TestApplyDefaults_TaskRuneLimits(t *testing.T) {
 	}
 }
 
+// TestApplyDefaults_HTTPAddrLoopback 验证 HTTP 地址缺省只绑本机回环（TODO #18 T27）：
+// 未配置时兜底 127.0.0.1:10010（防局域网裸奔）；显式配置（0.0.0.0:10010 等）保留不被改写。
+func TestApplyDefaults_HTTPAddrLoopback(t *testing.T) {
+	c := &Config{}
+	if err := c.applyDefaults(); err != nil {
+		t.Fatalf("applyDefaults failed: %v", err)
+	}
+	if c.HTTP.Addr != "127.0.0.1:10010" {
+		t.Fatalf("HTTP.Addr 默认应为 127.0.0.1:10010，got %q", c.HTTP.Addr)
+	}
+	c2 := &Config{}
+	c2.HTTP.Addr = "0.0.0.0:10010"
+	if err := c2.applyDefaults(); err != nil {
+		t.Fatalf("applyDefaults failed: %v", err)
+	}
+	if c2.HTTP.Addr != "0.0.0.0:10010" {
+		t.Fatalf("显式配置应保留，got %q", c2.HTTP.Addr)
+	}
+}
+
 // TestApplyDefaults_ContextTokenBudget 验证未配置时上下文 token 阈值兜底 150000。
 func TestApplyDefaults_ContextTokenBudget(t *testing.T) {
 	c := &Config{}

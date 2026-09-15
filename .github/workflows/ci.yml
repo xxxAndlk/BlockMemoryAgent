@@ -1,0 +1,50 @@
+# 最小 CI（TODO #18-3 T30）：backend vet+test + web 构建。
+#
+# 范围说明（与 doc/TODO.md #18-3 对齐）：
+#   - backend 测试零真实 PG/Redis 依赖（nil-DB 测试模式），普通 runner 直接跑。
+#   - nightly 集成任务（PG 55432/Redis 56380 服务容器跑 test/ 模块）暂缺位：
+#     test/ 集成模块的 Go 用例已随 b35f87e 移除，且生产严格启动（LLM 连通性 fail-fast）
+#     使无 Key 冒烟启动不可行——待集成测试重建后再补 nightly job。
+#   - -race 不开：需要 C 编译器（Windows 开发机/CI 均不满足本仓约束）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    name: backend vet + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      # 本仓硬约定：机器默认 Go 偏旧时必须钉本地工具链（CLAUDE.md）。
+      - name: vet
+        run: GOTOOLCHAIN=local go vet ./...
+      - name: test
+        run: GOTOOLCHAIN=local go test ./...
+
+  web:
+    name: web build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install
+        run: npm ci
+      - name: build
+        run: npm run build

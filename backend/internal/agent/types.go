@@ -224,6 +224,11 @@ const (
 	// Args{"work_dir": 绝对路径，空串=回落进程默认}。落库即时保存，下一回合生效
 	//（正在执行的工具调用已按旧目录解析）。
 	ControlOpWorkDir = "work-dir"
+	// ControlOpGear 切换会话执行档位（TODO #14 会话三档控制）：
+	// Args{"gear": "auto|fast|cluster"}，atomic 即时生效——正在运行的 ReAct 循环
+	// 下一轮按新档裁决（在飞子 Agent 不强杀，同 trustMode 语义）。
+	// 手动切换允许任意向；自动升档（escalate）只升不降由发起侧约束。
+	ControlOpGear = "gear"
 )
 
 // Filter 表示列出会话时使用的筛选条件。
@@ -339,6 +344,9 @@ type Session struct {
 	// TrustMode 会话当前信任模式（TODO 第10⑥）：suggest|auto-edit|full-auto；
 	// 空串 = 未设置（Registry 回退现网生产边界 + 危险命令语义）。
 	TrustMode string
+	// Gear 会话执行档位（TODO #14 会话三档控制）：auto|fast|cluster；
+	// 空串 = 未设置（按集群档现行为兜底）。
+	Gear string
 }
 
 // Event 是会话事件的 DTO，按字段逐一对齐 server.SessionEvent。

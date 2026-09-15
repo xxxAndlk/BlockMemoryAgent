@@ -1,0 +1,92 @@
+package agent
+
+// gear_test.go 验证会话执行档位（TODO #14 会话三档控制）服务层接线：
+//   - SetDefaultGear 注入 config 默认档，createSession 取为初始值；
+//   - SetSessionGear 切换既有会话（枚举校验），原子生效；
+//   - MetaMemory 持久化往返：sessionMetaMemory 携带 gear，gearFromMetaMemory 读回
+//   （落库/恢复全链路在集成测试覆盖，此处验证纯函数与字段接线）。
+
+import (
+	"testing"
+
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
+)
+
+// TestReactService_GearLifecycle 全生命周期：默认档 → 会话初值 → 中途切换 → 读取。
+func TestReactService_GearLifecycle(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+
+	// 默认档注入：非法值 fail-fast。
+	if err := svc.SetDefaultGear("bogus"); err == nil {
+		t.Fatal("SetDefaultGear must reject invalid gear")
+	}
+	if err := svc.SetDefaultGear(tool.GearFast); err != nil {
+		t.Fatalf("SetDefaultGear: %v", err)
+	}
+
+	sess := svc.store.createSession("档位测试", "")
+	if got := sess.currentGear(); got != tool.GearFast {
+		t.Fatalf("createSession should inherit default gear, got %q", got)
+	}
+
+	// 未配置默认档：新会话 gear 为空（runSession 按 auto 选档、集群兜底）。
+	svc2 := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	sess2 := svc2.store.createSession("无默认档", "")
+	if got := sess2.currentGear(); got != "" {
+		t.Fatalf("unset default should leave session gear empty, got %q", got)
+	}
+
+	// 中途切换：枚举校验 + 会话原子生效 + 读取器同步可见。
+	if err := svc.SetSessionGear(sess.ID, "bogus"); err == nil {
+		t.Fatal("SetSessionGear must reject invalid gear")
+	}
+	if err := svc.SetSessionGear(sess.ID, tool.GearCluster); err != nil {
+		t.Fatalf("SetSessionGear: %v", err)
+	}
+	if got := svc.SessionGear(sess.ID); got != tool.GearCluster {
+		t.Fatalf("SessionGear should reflect switch, got %q", got)
+	}
+	// 读取器返回切换后的值（runSession 起跑读取的就是这个方法值）。
+	svc.store.mu.RLock()
+	s := svc.store.sessions[sess.ID]
+	svc.store.mu.RUnlock()
+	if got := s.currentGear(); got != tool.GearCluster {
+		t.Fatalf("getter must return switched gear, got %q", got)
+	}
+
+	// 不存在的会话报错。
+	if err := svc.SetSessionGear("session-none", tool.GearFast); err == nil {
+		t.Fatal("SetSessionGear must fail for unknown session")
+	}
+}
+
+// TestGearMetaMemoryRoundTrip 验证 MetaMemory 持久化往返（TODO #14）：
+// 有档位携带 {"gear":...}；无档位保持空切片（旧写入形态）；非法值/缺键回落 fallback。
+func TestGearMetaMemoryRoundTrip(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	sess := svc.store.createSession("持久化测试", "")
+	svc.SetSessionGear(sess.ID, tool.GearFast)
+
+	meta := sessionMetaMemory(sess)
+	if len(meta) != 1 || meta[0]["gear"] != tool.GearFast {
+		t.Fatalf("sessionMetaMemory should carry gear, got %+v", meta)
+	}
+	if got := gearFromMetaMemory(meta, tool.GearAuto); got != tool.GearFast {
+		t.Fatalf("gearFromMetaMemory should read back fast, got %q", got)
+	}
+
+	// 无档位：空切片（旧行为不变），读回落 fallback。
+	empty := sessionMetaMemory(svc.store.createSession("无档", ""))
+	if len(empty) != 0 {
+		t.Fatalf("sessionMetaMemory without gear should be empty slice, got %+v", empty)
+	}
+	if got := gearFromMetaMemory(empty, tool.GearCluster); got != tool.GearCluster {
+		t.Fatalf("gearFromMetaMemory fallback, got %q", got)
+	}
+
+	// 旧记录缺键/非法值：回落 fallback。
+	bogus := []map[string]any{{"gear": "warp"}, {"other": 1}}
+	if got := gearFromMetaMemory(bogus, "auto"); got != "auto" {
+		t.Fatalf("invalid stored gear must fall back, got %q", got)
+	}
+}

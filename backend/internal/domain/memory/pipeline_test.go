@@ -2,6 +2,7 @@ package memory
 
 // 导入 testing 包，用于编写单元测试。
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -479,5 +480,48 @@ func TestPipeline_Compression_UserMessageLongerBudget(t *testing.T) {
 	}
 	if n := len([]rune(assistantLine)); n > 201 {
 		t.Fatalf("assistant message should stay capped at 200, got %d", n)
+	}
+}
+
+// TestPipeline_SummarizeMemo 验证事件摘要 hash 备忘（TODO 第15项 P2-6）：
+// 同一摘要输入（事件未新增）连续多轮 Assemble 只调一次轻量模型；事件新增（输入变化）
+// 后再次调用；备忘命中与直调路径注入格式一致。
+func TestPipeline_SummarizeMemo(t *testing.T) {
+	pipe := NewPipeline(nil)
+	calls := 0
+	pipe.WithSummarizer(func(ctx context.Context, events []string) (string, error) {
+		calls++
+		return "摘要结果", nil
+	})
+	// 写入超过 eventSummarizeThreshold(8) 的事件，触发摘要路径。
+	for i := 0; i < 10; i++ {
+		if err := pipe.Write("agent-1", agent.MemoryEvent{Type: "tool_call", AgentID: "agent-1", ToolName: "ReadFile", Output: fmt.Sprintf("out-%d", i)}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	history := []agent.ReactMessage{{Role: "user", Content: "hi"}}
+	pipe.Assemble(types.RoleDefinition{}, "agent-1", history)
+	if calls != 1 {
+		t.Fatalf("first assemble should call summarizer once, got %d", calls)
+	}
+
+	// 事件未新增：后续两轮输入相同 → 命中备忘，不再调用。
+	pipe.Assemble(types.RoleDefinition{}, "agent-1", history)
+	pipe.Assemble(types.RoleDefinition{}, "agent-1", history)
+	if calls != 1 {
+		t.Fatalf("unchanged events must reuse memo, got %d calls", calls)
+	}
+	out := pipe.Assemble(types.RoleDefinition{}, "agent-1", history)
+	if !strings.Contains(out[len(out)-1].Content, "摘要结果") {
+		t.Fatalf("memo hit must reuse summarized body, got %q", out[len(out)-1].Content)
+	}
+
+	// 新增事件：输入变化 → 再调一次。
+	if err := pipe.Write("agent-1", agent.MemoryEvent{Type: "tool_call", AgentID: "agent-1", ToolName: "ReadFile", Output: "new"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	pipe.Assemble(types.RoleDefinition{}, "agent-1", history)
+	if calls != 2 {
+		t.Fatalf("new events must re-call summarizer, got %d calls", calls)
 	}
 }

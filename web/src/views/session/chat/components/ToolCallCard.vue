@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { ElMessage } from 'element-plus'
 import type { ToolCallGroup } from '../utils/turns'
 import { toolHeadline } from '../utils/turns'
 import { fmtTime } from '../utils/eventStyles'
+import { errorHint } from '../utils/errorHints'
+import { setSessionGear } from '@/api/session'
 import ArtifactCard from './ArtifactCard.vue'
 
 const props = defineProps<{ group: ToolCallGroup; sessionId: string }>()
@@ -22,6 +25,19 @@ const statusColor = computed(() => {
 const callArgs = computed(() => props.group.call?.detail_json || props.group.call?.tool_args || '')
 const resultText = computed(() => props.group.result?.tool_output || props.group.result?.message || '')
 const errorText = computed(() => props.group.result?.tool_error || '')
+// 失败说人话（TODO #15 T11）：识别超时/限流/网络等模式给可行动提示；带 escalate
+// 标记时给"升集群档"快捷按钮（联动 POST /sessions/:id/gear）。
+const hint = computed(() => (errorText.value ? errorHint(errorText.value) : null))
+
+async function escalateGear() {
+  try {
+    await setSessionGear(props.sessionId, 'cluster')
+    ElMessage.success('已切换到集群档（即时生效），把任务再交代一遍即可按新档执行')
+  } catch (e) {
+    ElMessage.error('切换档位失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
 // 折叠态标题行：关键入参摘要（读了哪个文件 / 跑了什么命令）
 const headline = computed(() => toolHeadline(props.group))
 const startedAt = computed(() => props.group.call?.timestamp || props.group.result?.timestamp || '')
@@ -69,6 +85,12 @@ const startedAt = computed(() => props.group.call?.timestamp || props.group.resu
       </div>
       <div v-if="errorText">
         <div class="text-[10px] text-ink-2 mb-1">错误信息</div>
+        <!-- 可行动提示（T11）：说人话 + 可选升集群档 -->
+        <div v-if="hint"
+             class="mb-1 rounded border border-amber-200 bg-amber-50 dark:border-orange-800/40 dark:bg-orange-900/20 px-2 py-1.5 text-[11px] text-amber-700 dark:text-orange-300 flex items-start gap-2">
+          <span class="flex-1">{{ hint.text }}</span>
+          <el-button v-if="hint.escalate" size="small" class="!py-0.5 shrink-0" @click="escalateGear">升集群档</el-button>
+        </div>
         <pre class="bg-page p-2 rounded text-[11px] text-red-400 whitespace-pre-wrap font-mono max-h-64 overflow-auto">{{ errorText }}</pre>
       </div>
       <div v-if="!callArgs && !resultText && !errorText" class="text-[11px] text-ink-2">

@@ -429,6 +429,38 @@ func (m *SessionManager) HandleSessionTrustMode(c *gin.Context) {
 	})
 }
 
+// HandleSessionGear 处理 POST /api/sessions/{id}/gear（TODO #14 会话三档控制）。
+// 职责：切换会话执行档位（auto|fast|cluster），经 Control 通道下发；
+// atomic 即时生效——正在运行的 ReAct 循环下一轮按新档裁决（在飞子 Agent 不强杀）。
+// 手动切换允许任意向（自动升档只升不降的约束只在 escalate 发起侧）。
+// 非法枚举 400；会话不存在 404。
+func (m *SessionManager) HandleSessionGear(c *gin.Context) {
+	id := c.Param("id")
+	req, err := DecodeBody[struct {
+		Gear string `json:"gear"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	if !tool.ValidGear(req.Gear) {
+		c.String(http.StatusBadRequest, "gear 非法（want auto|fast|cluster）")
+		return
+	}
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
+		Op:   agent.ControlOpGear,
+		Args: map[string]any{"gear": req.Gear},
+	}); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"session_id": id,
+		"gear":       req.Gear,
+	})
+}
+
 // HandleSessionAgentPause 处理 POST /api/sessions/{id}/agents/{aid}/pause
 // （TODO 第10项③ 审计面手动止血）。
 // 职责：暂停指定 domain 支路（dispatcher Pause 收尾，热驻槽 parked 可 resume 续跑）。
@@ -519,7 +551,7 @@ func (m *SessionManager) HandleSessionAgentMessages(c *gin.Context) {
 
 // HandleSessionAgentMessage 处理 POST /api/sessions/{id}/agents/{aid}/message（编排页用户直连）。
 // 状态机路由在 ReactService.MessageAgent：等子返回→注入唤醒；终态→复活重跑；
-// 执行中→409（前端禁用发送）；Paused/Idle/meta→409。
+// 执行中→邮箱排队 200{queued:true}（P0-2 steering，不再 409）；Paused/Idle/meta→409。
 func (m *SessionManager) HandleSessionAgentMessage(c *gin.Context) {
 	id := c.Param("id")
 	instID := c.Param("aid")
@@ -534,12 +566,13 @@ func (m *SessionManager) HandleSessionAgentMessage(c *gin.Context) {
 		c.String(http.StatusBadRequest, "请求体解析失败")
 		return
 	}
-	if err := m.agent.MessageAgent(c.Request.Context(), id, instID, body.Content); err != nil {
+	queued, err := m.agent.MessageAgent(c.Request.Context(), id, instID, body.Content)
+	if err != nil {
 		msg, status := agentErrorStatus(err)
 		c.String(status, "%s", msg)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "queued": queued})
 }
 
 // HandleSessionWorkDir 处理 POST /api/sessions/{id}/workdir（每会话工作目录修改）。

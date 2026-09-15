@@ -52,12 +52,17 @@ func NewDefaultRouter(app *App) *gin.Engine {
 
 	// 会话端点全集：生产、TUI 本地服务与测试共用同一注册函数。
 	server.RegisterSessionRoutes(api, sessionMgr)
+	// 会话导出（TODO #18-2 T29）：handler 在 APIHandler（需要 pgStore/工作目录解析），
+	// 不进 RegisterSessionRoutes——TUI 本地服务无存储依赖，导出属 Web/备份诉求。
+	api.GET("/sessions/:id/export", apiHandler.SessionExportHandler)
 
 	// 注册全局/系统级端点。
 	api.GET("/metrics", apiHandler.MetricsHandler)           // 指标聚合（Prometheus 格式）
 	api.GET("/status", apiHandler.StatusHandler)             // 服务状态
 	api.GET("/metrics/timeline", apiHandler.TimelineHandler) // 指标时间线
 	api.GET("/activity", apiHandler.ActivityHandler)         // 活动日志
+	api.GET("/capabilities", apiHandler.CapabilitiesHandler) // 装机能力自检（TODO #18-1 T28，settings 能力面板数据源）
+	api.GET("/export/memory", apiHandler.MemoryExportHandler) // 记忆库导出 zip（TODO #18-2 T29：知识/画像/技能包）
 
 	// DAG 相关端点：调度器未启用时各 handler 自行返回 503。
 	app.DAGHandler.RegisterRoutes(api)

@@ -46,6 +46,9 @@ type Session struct {
 	// TrustMode 会话当前信任模式（TODO 第10⑥）：suggest|auto-edit|full-auto；
 	// 空串 = 未设置（后端回退现网生产边界 + 危险命令语义）。前端三态下拉据此回显。
 	TrustMode string `json:"trust_mode,omitempty"`
+	// Gear 会话执行档位（TODO #14 会话三档控制）：auto|fast|cluster；
+	// 空串 = 未设置（后端按集群档现行为兜底）。前端三态选择器据此回显。
+	Gear string `json:"gear,omitempty"`
 }
 
 // SessionEvent 是会话事件流中的单个事件，对应前端展示的一条日志/消息。
@@ -374,6 +377,7 @@ func ToServerSession(a *agent.Session) *Session {
 		ActiveTopicID: a.ActiveTopicID,
 		DestroyAt:     a.DestroyAt,
 		TrustMode:     a.TrustMode,
+		Gear:          a.Gear,
 	}
 }
 

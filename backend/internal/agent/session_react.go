@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -88,11 +89,19 @@ type reactInternalSession struct {
 	stopCtx context.Context
 	// stopCancel 取消 stopCtx；与 stopCtx 同建同重建（restartSessionContext）。
 	stopCancel context.CancelFunc
+	// runStartedAt 是本次 run 的开始时刻（restartSessionContext 每次重建刷新）：
+	// 供选档误判信号②（T18）判定"集群档刚开始就被停"。零值=旧路径未记录。
+	runStartedAt time.Time
 	// trustMode 是会话当前信任模式（TODO 第10⑥，suggest|auto-edit|full-auto）：
 	// createSession 取 config 默认（st.defaultTrustMode），会话内可经 HTTP/TUI 随时切换。
 	// atomic.Value 保证跨 goroutine 读取（ReAct 循环工具派发侧实时读取——切换下一工具调用生效）；
 	// 未设置返回空串 → Registry 回退现网生产边界 + 危险命令语义（测试/旧路径兼容）。
 	trustMode atomic.Value
+	// gear 是会话当前执行档位（TODO #14 会话三档控制，auto|fast|cluster）：
+	// createSession 取 config 默认（st.defaultGear），会话内可经 HTTP 随时切换。
+	// atomic.Value 保证跨 goroutine 读取（runSession 起跑时固化、控制通道切换下一轮生效）；
+	// 未设置返回空串 → 按集群档现行为兜底（与历史会话语义一致）。
+	gear atomic.Value
 	// activeTopicID 当前活跃话题 ID。切换话题时旧 Agent 树终结 + 新树起,
 	// 旧话题摘要写入 sharedKV `topic:{sessionID}:{topicID}:summary`。空表示单话题(未切换过)。
 	// 话题 ID 也在切换时用于emetries 标签(若需)。
@@ -124,6 +133,11 @@ type reactInternalSession struct {
 	stopTimer *time.Timer
 	// destroyAt 是软停止销毁截止时间（倒计时期间非 nil，供 TUI 显示剩余时间）。
 	destroyAt *time.Time
+	// projectDocReady 是 createSession 启动的 EnsureProjectDoc 完成信号（TODO 第14项 T9）：
+	// 首生成要跑 LLM 领域分区（秒级），异步化后 createSession 立即返回，
+	// runSession 起跑时有界等待 ≤2s 让【项目概览】段赶上进入首轮系统提示词前缀缓存；
+	// chat 档不等。nil（恢复会话/测试直建）= 不等待。
+	projectDocReady chan struct{}
 }
 
 // maxReactInMemorySessions 限制 ReactService 同时保留在内存中的最大会话数，
@@ -191,6 +205,9 @@ type reactSessionStore struct {
 	// 经 ReactService.SetDefaultTrustMode 注入；空 = 未配置，会话 trustMode 不设置，
 	// Registry 回退现网语义。
 	defaultTrustMode string
+	// defaultGear 是新建会话的初始执行档位（TODO #14）：config agent.default_gear
+	// 经 ReactService.SetDefaultGear 注入；空 = 未配置，会话 gear 不设置（按集群档兜底）。
+	defaultGear string
 }
 
 // newReactSessionStore 创建一个新的 reactSessionStore 实例。
@@ -339,6 +356,11 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 	if st.defaultTrustMode != "" {
 		session.trustMode.Store(st.defaultTrustMode)
 	}
+	// 初始执行档位（TODO #14 会话三档控制）：取 store 默认（config agent.default_gear）；
+	// 未配置不设置（runSession 按 auto 选档、空串按集群档兜底）。
+	if st.defaultGear != "" {
+		session.gear.Store(st.defaultGear)
+	}
 	// 每会话工作目录（atomic 存储，见字段注释）：空串=回落进程默认。
 	session.setWorkDir(workDir)
 
@@ -354,13 +376,49 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 	}
 
 	// 首个 session 启动时确保有效工作目录下存在 .bma/PROJECT.md（缺失则按职责分区生成）。
-	// 失败仅记录日志，不阻断会话：PROJECT.md 是辅助上下文，缺失时系统提示词略去项目概览段。
-	if err := project.EnsureProjectDoc(context.Background(), eff, st.domainClassifier); err != nil {
-		st.logError(context.Background(), "ensure project doc", err)
+	// TODO 第14项 T9 异步化（仅 LLM 分区路径）：cls 非 nil 时首生成要调 LLM 领域分区
+	//（秒级），同步等会把"创建会话→首字"延迟整段加在用户头上——转 goroutine + done
+	// channel，createSession 立即返回；runSession 起跑时有界等待 ≤2s（chat 档不等），
+	// 失败仅日志不阻断会话。cls 为 nil（测试/启发式路径）保持同步：纯文件扫描毫秒级，
+	// 异步只会引入"测试临时目录清理撞上在写 goroutine"的竞态（Windows unlinkat 报错）。
+	if st.domainClassifier == nil {
+		session.projectDocReady = nil
+		if err := project.EnsureProjectDoc(context.Background(), eff, nil); err != nil {
+			st.logError(context.Background(), "ensure project doc", err)
+		}
+	} else {
+		done := make(chan struct{})
+		session.projectDocReady = done
+		go func() {
+			defer close(done)
+			// 传会话 ctx：软停/硬删/取消时生成中止——往已终结会话的工作目录
+			// 写 PROJECT.md 无意义。
+			if err := project.EnsureProjectDoc(session.ctx, eff, st.domainClassifier); err != nil {
+				if session.ctx.Err() != nil {
+					return
+				}
+				st.logError(context.Background(), "ensure project doc", err)
+			}
+		}()
 	}
 
 	// 返回刚创建的会话指针，调用方可立即使用。
 	return session
+}
+
+// waitProjectDoc 有界等待 PROJECT.md 就绪（TODO 第14项 T9）：cluster/auto 等 ≤2s——
+// 项目概览段进入首轮系统提示词即冻结进前缀缓存，首轮就值得等；超时不再等（晚到的
+// 生成结果由 projectRefresher/后续轮刷新，本会话前缀不受影响）。chat 档不等
+//（buildSystemPrompt 对 PROJECT.md 缺失本就略段，秒回优先）。
+// 信号为 nil（恢复会话/测试直建）直接返回。
+func waitProjectDoc(session *reactInternalSession, timeout time.Duration) {
+	if session.projectDocReady == nil {
+		return
+	}
+	select {
+	case <-session.projectDocReady:
+	case <-time.After(timeout):
+	}
 }
 
 // currentTrustMode 返回会话当前信任模式；未设置（测试/未配置）返回空串，
@@ -378,6 +436,24 @@ func (s *reactInternalSession) currentTrustMode() string {
 // setTrustMode 切换会话信任模式（atomic 存储无需额外加锁）。
 func (s *reactInternalSession) setTrustMode(mode string) {
 	s.trustMode.Store(mode)
+}
+
+// currentGear 返回会话当前执行档位（TODO #14）；未设置（测试/旧会话）返回空串，
+// runSession 按集群档现行为兜底。
+// runSession 起跑时读取固化；HTTP 切档经 setGear 原子生效，下一轮起跑按新档裁决。
+func (s *reactInternalSession) currentGear() string {
+	if v := s.gear.Load(); v != nil {
+		if g, ok := v.(string); ok {
+			return g
+		}
+	}
+	return ""
+}
+
+// setGear 切换会话执行档位（atomic 存储无需额外加锁）。
+// 在飞子 Agent 不强杀：正在运行的轮次按起跑时档位走完，下一轮按新档裁决（同 trustMode 语义）。
+func (s *reactInternalSession) setGear(gear string) {
+	s.gear.Store(gear)
 }
 
 // currentWorkDir 返回会话的每会话工作目录；未设置返回空串（= 回落进程默认目录）。
@@ -734,9 +810,11 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 		Goal:        sanitizeUTF8(session.Goal),
 		Summary:     sanitizeUTF8(session.Result),
 		ToolResults: toolResults,
-		MetaMemory:  []map[string]any{},
-		CreatedAt:   time.Now(),
-		WorkDir:     session.currentWorkDir(),
+		// MetaMemory 承载会话级元信息（TODO #14）：当前仅档位 gear，重启恢复按此回填。
+		// 该列此前恒写空 map（占位未用），零迁移落位；无档位时保持空切片（旧行为不变）。
+		MetaMemory: sessionMetaMemory(session),
+		CreatedAt:  time.Now(),
+		WorkDir:    session.currentWorkDir(),
 		// 009: 记录落库时的会话状态。轮开始时为 running（崩溃后被恢复逻辑标记中断），
 		// 轮结束时为 completed/error/paused 等终态。
 		Status: string(session.Status),
@@ -751,6 +829,31 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 	}
 	// 同步持久化主对话完整消息历史（重启恢复上下文用，见 persistFullHistory）。
 	st.persistFullHistory(session)
+}
+
+// sessionMetaMemory 组装会话持久化 meta（TODO #14 会话三档控制）：当前仅档位 gear，
+// 重启恢复经 gearFromMetaMemory 回填；字段以 map 键增量扩展，旧记录缺键自然回落默认。
+// 无档位时返回空切片（与 MetaMemory 列历史写入形态一致）。
+func sessionMetaMemory(session *reactInternalSession) []map[string]any {
+	g := session.currentGear()
+	if g == "" {
+		return []map[string]any{}
+	}
+	return []map[string]any{{"gear": g}}
+}
+
+// gearFromMetaMemory 从持久化 meta 读取档位（TODO #14）：取首个合法枚举值；
+// 缺键/非法值/无 meta 回落 fallback（store 默认档，最终缺省 auto=集群现行为）。
+func gearFromMetaMemory(meta []map[string]any, fallback string) string {
+	for _, m := range meta {
+		if m == nil {
+			continue
+		}
+		if g, ok := m["gear"].(string); ok && tool.ValidGear(g) {
+			return g
+		}
+	}
+	return fallback
 }
 
 // persistFullHistory 把主对话（MetaAgent，agentID==sessionID）的完整 ReAct 消息历史
@@ -860,6 +963,53 @@ func (st *reactSessionStore) loadSessionEvents(ctx context.Context, sessionID st
 	return events
 }
 
+// restartObituary 从恢复的事件流拼"上次任务断在 X"讣告细节（TODO 第16项 T19，
+// 盲区"重启后不知道断在哪"）：纯内存扫描已加载的 session_events，无额外 DB 查询，
+// nil-DB/空事件流返回空串静默。优先级：最后一条子任务派发 > 最后一次工具调用 >
+// 最后一条用户消息。
+func restartObituary(events []internalEvent) string {
+	lastTool := ""
+	lastUser := ""
+	for i := len(events) - 1; i >= 0; i-- {
+		ev := events[i]
+		switch {
+		case ev.Kind == "sub_agent_dispatch":
+			desc := ev.Message // 派发事件 message=任务摘要
+			if domain := detailStringField(ev.DetailJSON, "domain"); domain != "" {
+				desc = "「" + domain + "」" + desc
+			}
+			return "派发子任务: " + truncateRunes(desc, 80)
+		case ev.Type == eventkind.ToolCall && lastTool == "":
+			lastTool = ev.Tool
+			if ev.ToolPath != "" {
+				lastTool += " → " + ev.ToolPath
+			}
+		case ev.Type == eventkind.UserMessage && lastUser == "":
+			lastUser = ev.Message
+		}
+	}
+	if lastTool != "" {
+		return "最后动作: " + lastTool
+	}
+	if lastUser != "" {
+		return "最后输入: " + truncateRunes(lastUser, 80)
+	}
+	return ""
+}
+
+// detailStringField 从事件 detail_json 取字符串字段（解析失败返回空串）。
+func detailStringField(detailJSON, key string) string {
+	if detailJSON == "" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(detailJSON), &m); err != nil {
+		return ""
+	}
+	s, _ := m[key].(string)
+	return s
+}
+
 // buildRestoredSession 从一条 session_history 记录重建内存会话（不触碰 store 锁与映射）。
 // events 自 session_events 全量加载；History 自 agent_messages 重建（persistFullHistory
 // 每轮落库），续跑时 resumeSession 以其为种子，MetaAgent 上下文不再清零；更早的上下文
@@ -874,10 +1024,16 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 	// 使时间线在 Web/TUI 上可见中断原因。
 	status, result, interrupted := restoredSessionStatus(rec.Status, rec.Summary)
 	if interrupted {
+		// T19 重启讣告（TODO 第16项）：best-effort 从已加载事件流拼"上次任务断在 X"，
+		// 让用户不用翻监控页就知道断点。空事件流（nil-DB/刚建即中断）只出基础提示。
+		msg := interruptedByRestartMsg
+		if obit := restartObituary(restoredEvents); obit != "" {
+			msg += "；上次任务断在" + obit
+		}
 		restoredEvents = append(restoredEvents, internalEvent{
 			Type:      eventkind.System,
 			Agent:     "System",
-			Message:   interruptedByRestartMsg,
+			Message:   msg,
 			Success:   false,
 			Timestamp: rec.CreatedAt,
 		})
@@ -912,6 +1068,9 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 	}
 	// S2: 恢复每会话工作目录，重启后续跑仍在原目录；空串回落进程默认（atomic，见字段注释）。
 	sess.setWorkDir(rec.WorkDir)
+	// 恢复执行档位（TODO #14）：MetaMemory 携带 gear 时回填；旧记录缺键回落 store
+	// 默认档（config agent.default_gear，未配置则保持空串=按集群档兜底）。
+	sess.setGear(gearFromMetaMemory(rec.MetaMemory, st.defaultGear))
 	return sess
 }
 

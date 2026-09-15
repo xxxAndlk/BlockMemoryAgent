@@ -194,7 +194,7 @@ func TestBridgeStdioConnectCall(t *testing.T) {
 	// 调用往返。
 	echo := mustTool(t, tools, "echo")
 	res := echo.Execute(ctx, map[string]any{"text": "hello"})
-	if !res.Success || res.Output != "echo:hello" {
+	if !res.Success || res.Output != tool.WrapUntrusted("mcp:echo", "echo:hello") { // T31: MCP 输出带 untrusted 围栏
 		t.Fatalf("echo 调用失败: %+v", res)
 	}
 	// 服务端 IsError → 失败结果回灌。
@@ -275,7 +275,7 @@ func TestBridgeReconnect(t *testing.T) {
 		}
 		echo := mustTool(t, newTools, "echo")
 		res := echo.Execute(ctx, map[string]any{"text": "again"})
-		if !res.Success || res.Output != "echo:again" {
+		if !res.Success || res.Output != tool.WrapUntrusted("mcp:echo", "echo:again") {
 			t.Fatalf("重连后调用失败: %+v", res)
 		}
 	case <-time.After(20 * time.Second):
@@ -336,7 +336,7 @@ func TestBridgeRestartAfterStop(t *testing.T) {
 		t.Fatal("重启后应恢复工具列表")
 	}
 	res := b.callTool(ctx, "echo", map[string]any{"text": "hi"})
-	if !res.Success || res.Output != "echo:hi" {
+	if !res.Success || res.Output != tool.WrapUntrusted("mcp:echo", "echo:hi") {
 		t.Fatalf("重启后调用失败: %+v", res)
 	}
 }

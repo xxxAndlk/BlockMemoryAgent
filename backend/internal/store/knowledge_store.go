@@ -367,6 +367,52 @@ func (s *KnowledgeStore) Archive(ctx context.Context, id int64) error {
 	return err
 }
 
+// ArchiveStale 陈旧知识批量归档（TODO #18-2 T29 数据生命周期）：
+// block_memory / external_kb 中 last_accessed 早于 olderThanDays 天的记录 archived=true。
+// 语义是"冷备不删"——查询层全局排除 archived，归档后不再参与召回，数据仍在库里。
+// 只动这两类：domain_profile / skill 等结构化知识有独立生命周期，不随访问冷热归档。
+//
+// 参数:
+//   - ctx: 请求上下文。
+//   - olderThanDays: 阈值天数；<=0 时直接返回 0（清理开关，config 缺省 0=关）。
+//
+// 返回: 归档行数与 SQL 错误；nil 库 / nil 接收者 no-op（测试与未接线场景）。
+func (s *KnowledgeStore) ArchiveStale(ctx context.Context, olderThanDays int) (int64, error) {
+	if s == nil || s.db == nil || olderThanDays <= 0 {
+		return 0, nil
+	}
+	res, err := s.db.ExecContext(ctx, `
+			UPDATE global_knowledge SET archived = true
+			WHERE archived = false
+			  AND knowledge_type IN ('block_memory', 'external_kb')
+			  AND last_accessed < NOW() - make_interval(days => $1)
+		`, olderThanDays)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ListAll 导出用全量清单（TODO #18-2 T29 GET /api/export/memory）：
+// 未归档记录按 id 升序，上限 10000 条防一次性拉爆内存。
+func (s *KnowledgeStore) ListAll(ctx context.Context) ([]*types.KnowledgeRecord, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE archived = false
+			ORDER BY id ASC
+			LIMIT 10000
+		`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return s.scanKnowledgeRows(ctx, rows)
+}
+
 // IncrementAccessCount 自增访问计数并刷新最近访问时间。
 // 参数:
 //   - ctx: 请求上下文。

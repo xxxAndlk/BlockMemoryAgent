@@ -895,9 +895,11 @@ func TestSanitizeToolPairing(t *testing.T) {
 }
 
 // TestReActAgent_MailboxAfterToolResult 验证 mailbox 注入时序：
-// 有 tool_calls 的轮次，mailbox user 消息必须排在 tool 结果之后，
-// 不得插在 assistant tool_calls 与其 tool 结果之间（Anthropic 400 回归，
-// 实证 domain-2 白跑 31m43s 后整轮被拒）。
+// mailbox user 消息不得插在 assistant tool_calls 与其 tool 结果之间
+// （Anthropic 400 回归，实证 domain-2 白跑 31m43s 后整轮被拒）。
+// P0-2 steering（TODO #14 T8）后时序收紧：generate 前补 drainMailbox，
+// 先到的 mailbox 消息在首次 generate 前即入历史（本例排在 user 目标之后、
+// tool 调用之前），模型当轮可见，不再等无 tool_calls 分支。
 func TestReActAgent_MailboxAfterToolResult(t *testing.T) {
 	mb := mailbox.New()
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
@@ -921,18 +923,18 @@ func TestReActAgent_MailboxAfterToolResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// 期望历史：user, assistant(tool_calls), tool, user(mailbox), assistant(final)。
+	// 期望历史：user, user(mailbox), assistant(tool_calls), tool, assistant(final)。
 	if len(res.History) != 5 {
 		t.Fatalf("expected 5 history messages, got %d: %+v", len(res.History), res.History)
 	}
-	if res.History[1].Role != "assistant" || len(res.History[1].ToolCalls) == 0 {
-		t.Fatalf("第 2 条应为带 tool_calls 的 assistant，got: %+v", res.History[1])
+	if res.History[1].Role != "user" || !strings.Contains(res.History[1].Content, "mailbox from") {
+		t.Fatalf("先到的 mailbox 消息应在首次 generate 前入历史（紧跟目标），got: %+v", res.History[1])
 	}
-	if res.History[2].Role != "tool" {
-		t.Fatalf("assistant tool_calls 后必须紧随 tool 结果，got role=%s", res.History[2].Role)
+	if res.History[2].Role != "assistant" || len(res.History[2].ToolCalls) == 0 {
+		t.Fatalf("第 3 条应为带 tool_calls 的 assistant，got: %+v", res.History[2])
 	}
-	if res.History[3].Role != "user" || !strings.Contains(res.History[3].Content, "mailbox from") {
-		t.Fatalf("mailbox 消息应排在 tool 结果之后，got: %+v", res.History[3])
+	if res.History[3].Role != "tool" {
+		t.Fatalf("assistant tool_calls 后必须紧随 tool 结果，got role=%s", res.History[3].Role)
 	}
 }
 

@@ -64,6 +64,10 @@ type (
 		// ConfirmShrink 为 true 时显式确认"新内容远小于原文件"是有意精简，绕过极端缩小硬拒绝。
 		// 仅在确实要大幅删减文件时设置；常规修改不要设。
 		ConfirmShrink bool `json:"confirm_shrink"`
+		// ExpectedMtime 为可选乐观锁：把 ReadFile 分页头里的 mtime=... 原样传回，
+		// 写入前比对（2s 容差），不符拒收并提示重读——拦截"读取后被其他 Agent/进程
+		// 修改"的并发覆盖。不传则不校验（现状 advisory 行为不变）。
+		ExpectedMtime string `json:"expected_mtime,omitempty"`
 	}
 	// editFileInput 表示 EditFile 工具的输入参数。
 	// EditFile 是精确局部替换：old_string/new_string 语义对齐主流 Agent 工具的编辑能力，
@@ -79,6 +83,11 @@ type (
 		// ReplaceAll 为 true 时替换所有匹配处（old_string 在文件中出现多次时使用）；
 		// 默认 false 只替换第一处且要求唯一匹配。
 		ReplaceAll bool `json:"replace_all"`
+		// ExpectedMtime 为可选乐观锁：把 ReadFile 分页头里的 mtime=... 原样传回，
+		// 写入前比对（2s 容差），不符拒收并提示重读——拦截"读取后被其他 Agent/进程
+		// 修改"的并发覆盖（old_string 基于过期内容时 fuzzy 匹配也可能误换到别处）。
+		// 不传则不校验（现状 advisory 行为不变）。
+		ExpectedMtime string `json:"expected_mtime,omitempty"`
 	}
 	// restoreFileInput 表示 RestoreFile 工具的输入参数。
 	restoreFileInput struct {
@@ -263,7 +272,14 @@ func (e *Executor) readFile(ctx context.Context, args map[string]any) *Result {
 	}
 
 	// 分页头放在输出顶部：历史截断保留头部，模型始终知道文件规模与下一页起点。
+	// mtime 段（TODO #16 T16）：作为 expected_mtime 乐观锁的取值来源——模型编辑前
+	// 把它原样传回 EditFile/WriteFile，写入前比对拦截并发覆盖。stat 失败省略该段。
+	var mtimeSeg string
+	if fi, err := os.Stat(absPath); err == nil {
+		mtimeSeg = fmt.Sprintf(" | mtime=%s", fi.ModTime().Format(time.RFC3339))
+	}
 	header := fmt.Sprintf("[共 %d 行 | 本页 %d-%d 行", total, offset, actualEnd)
+	header += mtimeSeg
 	if clamped {
 		header += fmt.Sprintf(" | limit 超单次上限 %d 行，已截断", maxReadFileLimit)
 	}
@@ -302,6 +318,53 @@ const (
 	minWriteFileShrinkRefuseBytes = 5000
 )
 
+// expectedMtimeTolerance 是 expected_mtime 乐观锁的比对容差（TODO #16 T16）：
+// mtime 精度跨文件系统（FAT 2s）与 RFC3339 秒级序列化（小数截断）都会漂移，2s 内视为
+// 一致。护栏目标是"读取→其他 Agent 修改→写入"这类秒-分钟级竞态，2s 内不构成现实冲突。
+const expectedMtimeTolerance = 2 * time.Second
+
+// checkExpectedMtime 校验可选乐观锁参数 expected_mtime（TODO #16 T16 并发写护栏）。
+// 模型把 ReadFile 分页头里的 mtime=... 原样传回；写入前 stat 比对，不符拒收本次写入
+//（工具结果级错误，不中止 ReAct 循环），列出当前 mtime 引导重读。expected 为空时
+// 不校验（现状 advisory 行为不变）。要求校验但文件已不存在同样拒收（可能被并发删除）。
+func checkExpectedMtime(absPath, expected string) error {
+	if expected == "" {
+		return nil
+	}
+	fi, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("expected_mtime 校验失败: 文件当前不存在（可能已被并发删除）--请 ListDir 确认现状后再操作")
+	}
+	got, ok := parseFlexibleTime(expected)
+	if !ok {
+		return fmt.Errorf("expected_mtime 无法解析: %q（应为 ReadFile 分页头里 mtime=... 的原值，RFC3339 格式）", expected)
+	}
+	cur := fi.ModTime()
+	if d := cur.Sub(got); d > expectedMtimeTolerance || d < -expectedMtimeTolerance {
+		return fmt.Errorf("mtime 冲突: 你基于 mtime=%s 的内容写入，但文件当前 mtime=%s（已被其他 Agent/进程修改）。"+
+			"为避免覆盖他人改动已拒收本次写入；请重新 ReadFile 获取最新内容与新 mtime 后重试",
+			got.Format(time.RFC3339), cur.Format(time.RFC3339))
+	}
+	return nil
+}
+
+// parseFlexibleTime 解析模型可能传回的 mtime 字符串：RFC3339/Nano（ReadFile 分页头格式）、
+// Go time.String() 默认布局、无时区的日期时间（按本地时区解释）。全部失败 ok=false。
+func parseFlexibleTime(s string) (time.Time, bool) {
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999 -0700 MST",
+		"2006-01-02 15:04:05",
+	}
+	for _, l := range layouts {
+		if t, err := time.ParseInLocation(l, s, time.Local); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
 // writeFile 将内容写入指定路径，支持普通文件与会话临时文件两种模式。
 func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	// 从参数中取出各字段，缺失时使用零值。
@@ -310,6 +373,7 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 	temporary, _ := args["temporary"].(bool)
 	allowSpaces, _ := args["allow_spaces"].(bool)
 	confirmShrink, _ := args["confirm_shrink"].(bool)
+	expectedMtime, _ := args["expected_mtime"].(string)
 
 	// path 为空时不允许写入，直接返回错误。
 	if path == "" {
@@ -358,6 +422,11 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 		if err := e.enforceRoleWritePath(ctx, absPath); err != nil {
 			return &Result{Tool: "WriteFile", Path: absPath, Error: err.Error()}
 		}
+	}
+
+	// 乐观锁（TODO #16 T16）：expected_mtime 传入时写入前比对，拦截并发覆盖。
+	if err := checkExpectedMtime(absPath, expectedMtime); err != nil {
+		return &Result{Tool: "WriteFile", Path: absPath, Error: err.Error()}
 	}
 
 	// 确保目标文件所在目录存在，不存在时递归创建。
@@ -690,6 +759,7 @@ func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
 	newStr, _ := args["new_string"].(string)
 	replaceAll, _ := args["replace_all"].(bool)
 	allowSpaces, _ := args["allow_spaces"].(bool)
+	expectedMtime, _ := args["expected_mtime"].(string)
 
 	if path == "" {
 		return &Result{Tool: "EditFile", Error: "path is required"}
@@ -717,6 +787,12 @@ func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
 		return &Result{Tool: "EditFile", Path: absPath, Error: err.Error()}
 	}
 	if err := e.enforceRoleWritePath(ctx, absPath); err != nil {
+		return &Result{Tool: "EditFile", Path: absPath, Error: err.Error()}
+	}
+
+	// 乐观锁（TODO #16 T16）：expected_mtime 传入时写入前比对，拦截并发覆盖
+	//（old_string 基于过期内容时，空白宽容匹配还可能误换到别的区域）。
+	if err := checkExpectedMtime(absPath, expectedMtime); err != nil {
 		return &Result{Tool: "EditFile", Path: absPath, Error: err.Error()}
 	}
 
@@ -1441,8 +1517,9 @@ func (e *Executor) httpGet(ctx context.Context, args map[string]any) *Result {
 	defer resp.Body.Close()
 	// 读取响应体，限制最大 1MB。
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	// 拼接状态码与响应体作为输出。
-	output := fmt.Sprintf("HTTP %d\n%s", resp.StatusCode, string(body))
+	// 响应体是不可信外部源（TODO #18-4 T31）：包 untrusted 围栏（转义防逃逸），
+	// 状态码行是我们自己的可信输出，留在围栏外。
+	output := fmt.Sprintf("HTTP %d\n%s", resp.StatusCode, WrapUntrusted(url, string(body)))
 	// 若输出超过 10000 字符则截断。
 	if len(output) > 10000 {
 		output = output[:10000] + "\n... (truncated)"
@@ -1517,8 +1594,9 @@ func (e *Executor) httpPost(ctx context.Context, args map[string]any) *Result {
 	defer resp.Body.Close()
 	// 读取响应体，限制最大 1MB。
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	// 拼接状态码与响应体作为输出。
-	output := fmt.Sprintf("HTTP %d\n%s", resp.StatusCode, string(body))
+	// 响应体是不可信外部源（TODO #18-4 T31）：包 untrusted 围栏（转义防逃逸），
+	// 状态码行是我们自己的可信输出，留在围栏外。
+	output := fmt.Sprintf("HTTP %d\n%s", resp.StatusCode, WrapUntrusted(url, string(body)))
 	// 若输出超过 10000 字符则截断。
 	if len(output) > 10000 {
 		output = output[:10000] + "\n... (truncated)"

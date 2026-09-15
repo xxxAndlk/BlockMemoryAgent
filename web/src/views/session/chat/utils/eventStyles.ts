@@ -79,6 +79,52 @@ export function kindLabel(kind?: string, type?: string): string {
   return map[k] || k
 }
 
+/** 高频 kind 的"说人话"状态短语（TODO #15 翻译层①，T10）：面向普通用户的进度描述，
+ *  不暴露内部术语；长尾 kind 回落 kindLabel。新增 kind 记得同时补这两处映射。 */
+const kindPhrases: Record<string, string> = {
+  think: '正在思考…',
+  intend: '确定了下一步动作',
+  tool_call: '正在执行工具操作',
+  tool_result: '工具执行完成',
+  tool_exec: '正在执行工具操作',
+  wait: '等待子 Agent 回传',
+  sub_agent_dispatch: '派发子 Agent 执行分工任务',
+  sub_agent_done: '子 Agent 完成并回传结果',
+  memory_recall: '召回相关记忆作参考',
+  graph_step: '推进任务流程',
+  clarify: '等待补充说明',
+  assistant_text: '汇报进展',
+  llm_result: '汇总结果',
+  llm_response: '汇总结果',
+  message: '发送消息',
+  error: '遇到问题，正在处理',
+  agent_done: '本轮任务完成',
+  agent_created: '组建执行团队',
+  topic_switch: '切换话题上下文',
+  interrupt: '已注入新指令',
+  enqueue: '任务已排队',
+}
+
+/** kind/type 对应的用户可读状态短语；无映射时回落 kindLabel。 */
+export function kindPhrase(kind?: string, type?: string): string {
+  const k = kind || type || ''
+  if (kindPhrases[k]) return kindPhrases[k]
+  return kindLabel(kind, type)
+}
+
+/** 从事件流尾部找最近一条"有进度含义"的事件，返回其人话短语（T10 常驻状态行）。
+ *  调试类（prompt/token_usage）跳过；找不到返回空串（调用方自行隐藏/回落）。 */
+export function latestEventPhrase(events: SessionEvent[]): string {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]
+    const k = ev.kind || ev.type || ''
+    if (k === 'user_message' || k === 'prompt' || k === 'token_usage' || k === 'system') continue
+    const p = kindPhrase(ev.kind, ev.type)
+    if (p) return p
+  }
+  return ''
+}
+
 /** Agent 名字到文本颜色（左侧标签） */
 export function agentTextColor(agent: string): string {
   if (!agent) return 'text-ink'

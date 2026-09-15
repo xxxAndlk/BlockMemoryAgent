@@ -492,7 +492,9 @@ func (b *Bridge) callTool(ctx context.Context, name string, args map[string]any)
 	if res.IsError {
 		return &tool.Result{Tool: name, Success: false, Error: text, Category: tool.ResultCategoryExecutionFailed}
 	}
-	out := &tool.Result{Tool: name, Success: true, Output: text}
+	// MCP 工具输出是不可信外部源（TODO #18-4 T31）：包进 untrusted 围栏再进上下文，
+	// 配合提示词【数据围栏纪律】防提示注入；围栏转义防内容自带闭合标记逃逸。
+	out := &tool.Result{Tool: name, Success: true, Output: tool.WrapUntrusted("mcp:"+name, text)}
 	if b.settings.ImagePassthrough {
 		out.Images = extractImages(res.Content)
 	}

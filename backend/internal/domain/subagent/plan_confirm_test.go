@@ -123,7 +123,10 @@ func TestSubmitPlanRejectedLoopUntilApproved(t *testing.T) {
 		ctx := agent.WithAgentID(context.Background(), "session-1/domain-3")
 		res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
 		if err != nil {
-			t.Fatalf("submit dispatch failed: %v", err)
+			// goroutine 内不可 FailNow（vet testinggoroutine）：报错后送空串，让主断言带出原因
+			t.Errorf("submit dispatch failed: %v", err)
+			out <- ""
+			return
 		}
 		out <- res.Output
 	}
@@ -198,7 +201,10 @@ func TestSubmitPlanRejectedCapEscalates(t *testing.T) {
 		ctx := agent.WithAgentID(context.Background(), "session-1/domain-3")
 		res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
 		if err != nil {
-			t.Fatalf("submit dispatch failed: %v", err)
+			// goroutine 内不可 FailNow（vet testinggoroutine）：报错后送空串，让主断言带出原因
+			t.Errorf("submit dispatch failed: %v", err)
+			out <- ""
+			return
 		}
 		out <- res.Output
 	}

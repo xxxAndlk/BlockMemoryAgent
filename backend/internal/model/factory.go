@@ -249,6 +249,62 @@ func (f *ModelFactory) GetBladesProviderForAgent(ctx context.Context, roleID, ag
 	return f.GetBladesProvider(ctx, roleID)
 }
 
+// GetBladesProviderWithFallback 带备胎链的 provider 解析（TODO 第15项 T17）。
+// 主模型 = GetBladesProvider 现有解析（role_bindings 覆写 > model_ref）；备胎链 =
+// models.json role_bindings[roleID].fallback 依序列出的条目 ID。主模型调用出错
+// （非 ctx 取消）时降级语义见 fallbackProvider。observe 可空（agent 层注入会话
+// 作用域观察者）；绑定未配置 fallback 时原样返回主 provider（零行为变化）。
+func (f *ModelFactory) GetBladesProviderWithFallback(ctx context.Context, roleID string, observe FallbackObserver) (blades.ModelProvider, error) {
+	primary, err := f.GetBladesProvider(ctx, roleID)
+	if err != nil {
+		return nil, err
+	}
+	ids := f.fallbackChainFor(roleID)
+	if len(ids) == 0 {
+		return primary, nil
+	}
+	return newFallbackProvider(roleID, primary, ids, f.buildFallbackProvider, observe), nil
+}
+
+// fallbackChainFor 读 models.json role_bindings[roleID].fallback（热更新感知），
+// 过滤空项。注册表未注入或绑定不存在时返回 nil。
+func (f *ModelFactory) fallbackChainFor(roleID string) []string {
+	f.checkRegistryReload()
+	if f.registry == nil {
+		return nil
+	}
+	b, ok := f.registry.Binding(roleID)
+	if !ok || len(b.Fallback) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(b.Fallback))
+	for _, id := range b.Fallback {
+		if id != "" {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// buildFallbackProvider 构造单个备胎条目的 provider（惰性调用，构造失败由备胎层
+// 永久标记本档不可用）。生效配置 = 角色基础配置 + 条目连接参数（同 SetAgentModel
+// 的构造口径，但不做连通性探测——备胎启用时机在故障现场，预探测会拖慢每次解析）。
+func (f *ModelFactory) buildFallbackProvider(roleID, entryID string) (blades.ModelProvider, error) {
+	entry, ok := f.entryByID(entryID)
+	if !ok {
+		return nil, fmt.Errorf("条目 %q 不在模型注册表", entryID)
+	}
+	cfg := applyModelEntry(f.resolveBaseConfig(roleID), entry)
+	if cfg.APIKey == "" {
+		return nil, fmt.Errorf("条目 %q 未配置 api_key", entryID)
+	}
+	client, err := NewBladesClient(context.Background(), cfg)
+	if err != nil {
+		return nil, err
+	}
+	return client.Provider(), nil
+}
+
 // SetAgentModel 为单个 Agent 实例覆盖模型（set_agent_model 工具核心）。
 //
 // 与 SwitchModel 的区别：只改本实例、不写 role_bindings、不落盘、不影响同角色其他实例

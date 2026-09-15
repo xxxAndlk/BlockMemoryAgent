@@ -30,6 +30,7 @@ import (
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/textutil"
+	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
 // AcceptanceRunner 交付验收闭环接口（测试助手大改，2026-09-12）：
@@ -51,6 +52,10 @@ type ReactService struct {
 	mailbox      *mailbox.Mailbox    // 邮箱，用于跨组件消息通知
 	memory       MemoryPipeline      // 记忆管道，负责会话记忆的写入与查询
 	runtimeCfg   ReactRuntimeConfig  // ReAct 主循环运行时参数（轮数/超时/重试/历史滑窗）
+
+	// notifier 会话终态 Webhook 通知器（TODO #18-5 T32）：finalizeSession 收尾时
+	// best-effort 通知外部渠道。为 nil 时零开销跳过；bootstrap 按 config.notify 构造注入。
+	notifier *Notifier
 
 	// pendingChecker 注入到每个 ReActAgent，用于父会话终结保护
 	// （有未决子 Agent 时阻止终结，防止迟到 mailbox 消息丢失）。
@@ -683,6 +688,12 @@ func (s *ReactService) SetAcceptanceRunner(r AcceptanceRunner) {
 	s.acceptance = r
 }
 
+// SetNotifier 注入会话终态 Webhook 通知器（TODO #18-5 T32）。
+// nil（默认，config 未配 webhook_url）时零开销跳过。
+func (s *ReactService) SetNotifier(n *Notifier) {
+	s.notifier = n
+}
+
 // NotifyUserSystemMessage 按会话 ID 向用户对话页发一条系统消息
 // （验收闭环进度通告：bootstrap 经 Dispatcher.WithUserNotify 接线到这里）。
 // 会话不在内存（已淘汰/未恢复）时静默跳过。
@@ -714,62 +725,78 @@ func (s *ReactService) injectUserMessageToRunningSession(session *reactInternalS
 
 // MessageAgent 用户直连子 Agent（编排页对话面板发送框）。状态机路由：
 // 等子返回（running + activity_kind=child_wait）→ 邮箱注入+唤醒；
-// 执行中（running 其他）→ ErrAgentBusy（前端禁用发送，引导先中断/终止）；
+// 执行中（running 其他）→ 邮箱排队（P0-2 steering，TODO #14 T8：不再 409 拒绝，
+// 下一个检查点即达；ErrAgentBusy 保留给注入失败路径）；
 // 终态（done/failed/cancelled/delivered-unverified）→ 复活重跑；
 // Idle（热驻待复用）→ 唤醒续聊，完成回 idle 后 TTL 重新起计；
 // Paused/meta → 拒绝（Paused 走监控页恢复；meta 走主对话页）。
+// 返回 queued=true 表示消息已入邮箱排队（running 态）；false = 即时投递/复活。
 // 成功写一条 System 会话事件留痕，主对话流可见"用户直连了某 Agent"。
-func (s *ReactService) MessageAgent(ctx context.Context, sessionID, instID, content string) error {
+func (s *ReactService) MessageAgent(ctx context.Context, sessionID, instID, content string) (bool, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
-		return fmt.Errorf("%w: 消息内容不能为空", ErrInvalidSessionState)
+		return false, fmt.Errorf("%w: 消息内容不能为空", ErrInvalidSessionState)
 	}
 	// 主 Agent 走主对话通道，不经此端点（设计 §4 明确 meta 不开放直连）。
 	if instID == "" || instID == "meta" {
-		return fmt.Errorf("%w: 主 Agent 请用主对话页", ErrAgentNotDirectable)
+		return false, fmt.Errorf("%w: 主 Agent 请用主对话页", ErrAgentNotDirectable)
 	}
 	if s.messenger == nil {
-		return fmt.Errorf("%w: 用户直连通道未接线", ErrAgentNotDirectable)
+		return false, fmt.Errorf("%w: 用户直连通道未接线", ErrAgentNotDirectable)
 	}
 	s.store.mu.RLock()
 	sess := s.store.sessions[sessionID]
 	s.store.mu.RUnlock()
 	if sess == nil {
-		return ErrSessionNotFound
+		return false, ErrSessionNotFound
 	}
 	node, ok := s.TreeFor(sessionID).Get(instID)
 	if !ok {
-		return ErrAgentNotFound
+		return false, ErrAgentNotFound
 	}
-	kind := ""
-	if s.activityEvidenceProvider != nil {
-		kind, _, _ = s.activityEvidenceProvider.ActivityEvidenceOf(instID)
-	}
+	queued := false
 	switch node.Status {
 	case orchestrator.StatusRunning:
-		if kind != "child_wait" {
-			return ErrAgentBusy
-		}
+		// P0-2 steering 排队（TODO #14 T8）：running 非 child_wait 不再 409 拒绝——
+		// 与 child_wait 同通道投邮箱排队，主循环在下一个检查点读到（generate 前补一次
+		// drain 压缩插入延迟上界）。邮箱注入失败（未接线等）才回 ErrAgentBusy（409）。
 		if err := s.messenger.InjectUserMessage(instID, content); err != nil {
-			return err
+			return false, fmt.Errorf("%w: 邮箱投递失败（%v）", ErrAgentBusy, err)
+		}
+		queued = true
+		// 竞态兜底：投递后复查节点状态——窗口内恰好落终态时邮箱消息可能永不被消费，
+		// 改走复活重跑通道（种子=原任务+上轮结果+用户消息）。
+		if n, ok2 := s.TreeFor(sessionID).Get(instID); ok2 && isTerminalNodeStatus(n.Status) {
+			if err := s.messenger.ReviveWithMessage(tool.WithSessionID(ctx, sessionID), n, content); err != nil {
+				return false, err
+			}
 		}
 	case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled, orchestrator.StatusUnverified:
 		// 直连 ctx 需补会话标识：HTTP 请求 ctx 不携带 sessionID，而复活路径靠它
 		// treeFn(sessionID) 取权威树、runSubAgent 靠它落终态/台账——缺了会取到空树，
 		// 每次复活都以"节点非终态，不可复活"失败（并把空树缓存进 s.trees）。
 		if err := s.messenger.ReviveWithMessage(tool.WithSessionID(ctx, sessionID), node, content); err != nil {
-			return err
+			return false, err
 		}
 	case orchestrator.StatusIdle:
 		// 热驻待复用：唤醒续聊（任务=用户消息），完成回 idle 后 TTL 按新权重重新起计。
 		if err := s.messenger.WakeIdleWithMessage(instID, content); err != nil {
-			return err
+			return false, err
 		}
 	default: // Paused / 未知
-		return fmt.Errorf("%w（Paused 请到监控页恢复）", ErrAgentNotDirectable)
+		return false, fmt.Errorf("%w（Paused 请到监控页恢复）", ErrAgentNotDirectable)
 	}
 	s.store.addEvent(sess, eventkind.System, "System", "用户直连 "+instID+"："+truncateRunes(content, 200), "", "", "", "", "", true)
-	return nil
+	return queued, nil
+}
+
+// isTerminalNodeStatus 树节点终态判定（MessageAgent 复活路由同口径）。
+func isTerminalNodeStatus(st orchestrator.Status) bool {
+	switch st {
+	case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled, orchestrator.StatusUnverified:
+		return true
+	}
+	return false
 }
 
 // SetSessionAgentWaker 注入会话挂起唤醒器（Domain 热驻），sendMessage 恢复路径
@@ -1411,6 +1438,10 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		// 信任模式切换（TODO 第10⑥）：提取 mode 校验枚举后落会话，下一工具调用生效。
 		mode, _ := cmd.Args["mode"].(string)
 		return s.SetSessionTrustMode(sessionID, mode)
+	case ControlOpGear:
+		// 执行档位切换（TODO #14 会话三档控制）：提取 gear 校验枚举后落会话，下一轮生效。
+		gear, _ := cmd.Args["gear"].(string)
+		return s.SetSessionGear(sessionID, gear)
 	case ControlOpWorkDir:
 		// 每会话工作目录修改：落库即时保存，下一回合生效（目录在每回合开始时读取）。
 		// 参数断言必须 fail-closed：空串是**合法**的"清除为默认目录"载荷，若把
@@ -1551,6 +1582,59 @@ func (s *ReactService) SetSessionTrustMode(sessionID, mode string) error {
 	}
 	sess.setTrustMode(mode)
 	return nil
+}
+
+// SetDefaultGear 设置新建会话的初始执行档位（TODO #14 会话三档控制）：config
+// agent.default_gear 经 bootstrap 注入。非法值返回错误（启动期 fail-fast），
+// 空串清空（会话 gear 不设置，runSession 按 auto 选档、集群兜底）。
+func (s *ReactService) SetDefaultGear(gear string) error {
+	if gear == "" {
+		s.store.mu.Lock()
+		s.store.defaultGear = ""
+		s.store.mu.Unlock()
+		return nil
+	}
+	if !tool.ValidGear(gear) {
+		return fmt.Errorf("invalid gear %q (want auto|fast|cluster)", gear)
+	}
+	s.store.mu.Lock()
+	s.store.defaultGear = gear
+	s.store.mu.Unlock()
+	return nil
+}
+
+// SetSessionGear 切换既有会话的执行档位（TODO #14，HTTP/TUI 切换通道）：
+// atomic 即时生效——正在运行的 ReAct 循环下一轮按新档裁决（在飞子 Agent 不强杀）。
+// 手动切换允许任意向（三档是实体控制，自动升档只升不降的约束只在 escalate 发起侧）。
+// 非法值返回错误（HTTP 400）；会话不存在返回错误。
+func (s *ReactService) SetSessionGear(sessionID, gear string) error {
+	if !tool.ValidGear(gear) {
+		return fmt.Errorf("invalid gear %q (want auto|fast|cluster)", gear)
+	}
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	// D-2 留痕（TODO #14 T7）：档位切换全量落事件（含方向与来源），会话事件流可追溯。
+	from := sess.currentGear()
+	sess.setGear(gear)
+	s.store.addEvent(sess, eventkind.System, "System",
+		fmt.Sprintf("档位切换: %s → %s（手动）", gearDisplayName(from), gear),
+		"", "", "", "", "", true)
+	return nil
+}
+
+// SessionGear 读取会话当前执行档位（HTTP GET 展示用）；未设置返回空串。
+func (s *ReactService) SessionGear(sessionID string) string {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return ""
+	}
+	return sess.currentGear()
 }
 
 // SetSessionWorkDir 修改会话的每会话工作目录（会话页"本会话目录"入口，HTTP/TUI 共用）。
@@ -1871,6 +1955,188 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 			s.store.mu.Unlock()
 			return answer, nil
 		}
+	}
+}
+
+// EscalateGearHook 返回 escalate_gear 工具的会话层回调（TODO #14 T7 升档 + D-2 留痕）。
+// 快速档 chat 角色接到工程任务时请求升级集群档：经 askUser 通道推确认卡（槽位不变式
+// 与 ask_user/审批一致，占用排队等空位），用户确认后切档 + 档位事件留痕 + 合成种子
+// 消息走"终态会话收消息→新 run"既有通道以集群档（meta 全装）重启；拒绝则原样返回
+// 继续快速档对话。升级只升不降：仅 fast/空档（auto 待裁决）响应，cluster 调用为误用。
+// 软停倒计时已武装（用户此前 Stop 过）时放弃自动续跑，只留档位（T7④）。
+func (s *ReactService) EscalateGearHook() tool.EscalateGearHookFunc {
+	return func(ctx context.Context, req tool.EscalateGearRequest) (string, error) {
+		sid := tool.SessionIDFromContext(ctx)
+		if sid == "" {
+			return "", fmt.Errorf("escalate_gear: missing session context")
+		}
+		// 等待用户期间保活 + 排队等槽位：与 AskUserHook 同范式（提问槽与审批共用一个）。
+		keepalive := s.startUserWaitKeepalive(ctx)
+		defer keepalive.Stop()
+		s.store.mu.Lock()
+		var sess *reactInternalSession
+		for {
+			sess = s.store.sessions[sid]
+			if sess == nil {
+				s.store.mu.Unlock()
+				return "", fmt.Errorf("escalate_gear: 会话不存在")
+			}
+			if sess.approval == nil && sess.askUser == nil {
+				break // 拿到空槽位；锁保持持有，下方直接占位
+			}
+			s.store.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+			s.store.mu.Lock()
+		}
+		// 占槽推确认卡：Kind=confirm（确认/拒绝两选项，答复经 resolveApproval 裁决）。
+		ch := make(chan string, 1)
+		sess.askUser = ch
+		question := "是否升级到集群档继续这个任务？原因：" + req.Reason
+		pc := &ClarifyRequest{
+			ID:        fmt.Sprintf("gear-%d", time.Now().UnixNano()),
+			Question:  question,
+			Context:   "快速档→集群档升级确认（确认后当前对话将以集群档工程模式自动重启）",
+			AgentID:   tool.AgentIDFromContext(ctx),
+			CreatedAt: time.Now(),
+			Kind:      "confirm",
+			Options: []ClarifyOption{
+				{ID: "confirm", Label: "升级集群档", Description: "以全量工程能力重启任务（快速档进展作为种子带上）"},
+				{ID: "reject", Label: "继续快速档", Description: "维持轻量对话，不升级"},
+			},
+		}
+		sess.pendingClarify = pc
+		sess.Status = enums.SessionStatusAwaitingClarify
+		report := clarifyReportJSON(strings.TrimSpace(sess.StreamingText))
+		s.store.mu.Unlock()
+		s.store.addEventDetail(sess, eventkind.Clarify, "System", question, "", "", "", "", "", true, report)
+
+		select {
+		case <-ctx.Done():
+			s.store.mu.Lock()
+			if sess.askUser == ch {
+				sess.askUser = nil
+				sess.pendingClarify = nil
+			}
+			s.store.mu.Unlock()
+			return "", ctx.Err()
+		case answer := <-ch:
+			// 收答复：清槽 + 恢复 Running + 捕获快速档进展（切档收尾要用，AskUserHook 同款清流缓冲）。
+			s.store.mu.Lock()
+			if sess.askUser == ch {
+				sess.askUser = nil
+				sess.pendingClarify = nil
+			}
+			if sess.Status == enums.SessionStatusAwaitingClarify {
+				sess.Status = enums.SessionStatusRunning
+			}
+			progress := strings.TrimSpace(sess.StreamingText)
+			sess.StreamingText = ""
+			currentGear := sess.currentGear()
+			goal := sess.Goal
+			s.store.mu.Unlock()
+
+			if !resolveApproval(answer, pc) {
+				s.store.addEvent(sess, eventkind.System, "System", "用户选择继续快速档，未升级", "", "", "", "", "", true)
+				return "用户选择继续快速档：请以轻量对话方式直接回应用户，不要再重复请求升级。", nil
+			}
+			// 升级只升不降：cluster 档调用本工具属模型误用（chat 角色只在 fast 档挂载，
+			// 防御性兜底），工具结果级提示不切档。
+			if currentGear == tool.GearCluster {
+				return "当前已是集群档，无需升级：请直接以对话方式处理任务。", nil
+			}
+			// 切档 + D-2 留痕（escalate 来源区分手动切换）。
+			s.store.mu.Lock()
+			sess.setGear(tool.GearCluster)
+			s.store.mu.Unlock()
+			s.store.addEvent(sess, eventkind.System, "System",
+				fmt.Sprintf("档位升级: %s → cluster（escalate_gear，用户已确认）", gearDisplayName(currentGear)),
+				"", "", "", "", "", true)
+
+			// 软停倒计时已武装（用户此前 Stop 过）：放弃自动续跑只留档位（T7④）——
+			// 倒计时到期硬销毁是用户明示意图，自动重启会违背它；用户下次发消息即按集群档续跑。
+			s.store.mu.RLock()
+			stopping := sess.destroyAt != nil || sess.stopTimer != nil
+			s.store.mu.RUnlock()
+			if stopping {
+				return "档位已切换为集群档；会话处于停止倒计时，不自动重启。用户发送消息时将按集群档续跑。", nil
+			}
+
+			// 软停当前快速档 run（落 awaiting_clarify 暂停态）→ 种子消息经 sendMessage
+			// → resumeSession 按新档位（cluster）选 meta 角色全装重启。
+			seed := gearEscalationSeed(goal, progress, req)
+			if err := s.Stop(ctx, sid); err != nil {
+				s.store.logError(ctx, "[agent] escalate 升级软停当前 run 失败，已保留集群档", err)
+				return "用户已确认升级集群档，但自动重启失败；请以对话方式告知用户稍后发送消息即可按集群档续跑。", nil
+			}
+			go s.restartWithGearSeed(sid, seed)
+			return "用户已确认升级集群档。当前快速档对话即将收尾，集群档任务已自动接手（含你的进展摘要与文件清单），无需你再输出。", nil
+		}
+	}
+}
+
+// gearDisplayName 档位展示名（事件文案用）：空档按 auto（runSession 同语义）。
+func gearDisplayName(gear string) string {
+	switch gear {
+	case tool.GearFast:
+		return "fast"
+	case tool.GearCluster:
+		return "cluster"
+	default:
+		return "auto"
+	}
+}
+
+// gearEscalationSeed 合成升档种子消息（T7③）：原目标 + 快速档进展摘要 + 升级原因 +
+// 任务简报 + 相关文件。集群档 meta 看不到快速档对话历史，这段种子是其唯一接手上下文。
+func gearEscalationSeed(goal, progress string, req tool.EscalateGearRequest) string {
+	var b strings.Builder
+	b.WriteString("【档位升级续跑】用户已确认把本会话从快速档升级为集群档，请以全量工程能力接手完成以下任务。\n")
+	fmt.Fprintf(&b, "原目标: %s\n", strings.TrimSpace(goal))
+	if p := truncateRunes(progress, 600); p != "" {
+		fmt.Fprintf(&b, "快速档阶段进展/结论: %s\n", p)
+	}
+	fmt.Fprintf(&b, "升级原因: %s\n", req.Reason)
+	fmt.Fprintf(&b, "任务简报: %s\n", req.TaskBrief)
+	if len(req.Files) > 0 {
+		fmt.Fprintf(&b, "相关文件: %s\n", strings.Join(req.Files, ", "))
+	}
+	return b.String()
+}
+
+// restartWithGearSeed 升档续跑：等旧快速档 run 落定（Stop 软停后 runSession 的
+// Canceled 分支落 awaiting_clarify）再投递种子消息——sendMessage 对非 running 会话
+// 走 resumeSession 新 run，resumeSession 按档位选 meta 角色全装。旧 run 若 30s 未落定
+//（流式重试等）放弃并留痕，用户手动发消息仍可续跑（档位已切换，不会丢）。
+func (s *ReactService) restartWithGearSeed(sessionID, seed string) {
+	bg := context.Background()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		s.store.mu.RLock()
+		sess := s.store.sessions[sessionID]
+		status := ""
+		if sess != nil {
+			status = string(sess.Status)
+		}
+		s.store.mu.RUnlock()
+		if sess == nil {
+			return // 会话已销毁（倒计时/硬删）：档位已随 MetaMemory 落库，无续跑可言
+		}
+		if status != string(enums.SessionStatusRunning) {
+			if err := s.sendMessage(bg, sessionID, seed); err != nil {
+				s.store.logError(bg, "[agent] escalate 升级续跑投递种子失败", err)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			s.store.logError(bg, "[agent] escalate 升级续跑超时：旧 run 未在预期内落定，等待用户手动续跑",
+				fmt.Errorf("session %s still running", sessionID))
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -2560,17 +2826,91 @@ func dispatchDomainJSON(domain string) string {
 	return string(b)
 }
 
-// metaProviderForCall 解析 meta 每次 LLM 调用应使用的 provider（WithProviderFunc 注入）：
-// 测试注入优先（此场景 modelFactory 可能为 nil），否则按当前角色绑定经模型工厂解析——
-// 运行期 set_role_model/TUI 切换在下一次调用即生效。
-func (s *ReactService) metaProviderForCall(ctx context.Context) (ModelProvider, error) {
-	if s.testProvider != nil {
-		return s.testProvider, nil
+// providerForRole 返回按角色解析 provider 的 WithProviderFunc 闭包（TODO #14 D-1 模型随档）：
+// 快速档 chat 角色解析 chat 模型绑定（roles.yaml model_ref），meta 解析 meta 绑定。
+// T17：sessionID 非空时走带备胎链的解析（models.json role_bindings[].fallback），
+// 降级切换写会话事件流 + 日志。测试注入优先；模型工厂未装配时报错（generateOnce
+// 侧保留旧 provider 不打断任务）。
+func (s *ReactService) providerForRole(roleID, sessionID string) func(context.Context) (ModelProvider, error) {
+	return func(ctx context.Context) (ModelProvider, error) {
+		if s.testProvider != nil {
+			return s.testProvider, nil
+		}
+		if s.modelFactory == nil {
+			return nil, errors.New("model factory not available")
+		}
+		if sessionID != "" {
+			return s.modelFactory.GetBladesProviderWithFallback(ctx, roleID, s.fallbackObserver(sessionID))
+		}
+		return s.modelFactory.GetBladesProvider(ctx, roleID)
 	}
-	if s.modelFactory == nil {
-		return nil, errors.New("model factory not available")
+}
+
+// fallbackObserver 返回会话作用域的模型降级观察者（TODO 第15项 T17）：每次 fallback
+// 切换向会话事件流落一条 System 事件（前端事件流可见"模型降级"），日志留档。
+// 会话已不存在（恢复/删除竞态）时只留日志。
+func (s *ReactService) fallbackObserver(sessionID string) model.FallbackObserver {
+	return func(evt model.FallbackEvent) {
+		log.Printf("[react] model fallback: session=%s role=%s %s → %s (attempt=%d, err=%s)",
+			sessionID, evt.RoleID, evt.From, evt.To, evt.Attempt, evt.Err)
+		s.store.mu.RLock()
+		sess := s.store.sessions[sessionID]
+		s.store.mu.RUnlock()
+		if sess == nil {
+			return
+		}
+		s.store.addEvent(sess, eventkind.System, "System",
+			fmt.Sprintf("模型降级: %s → %s（主模型出错，已自动切换备胎）", evt.From, evt.To),
+			"", "", "", "", "", true)
 	}
-	return s.modelFactory.GetBladesProvider(ctx, "meta")
+}
+
+// fixGearForRun 每轮起跑前的档位裁决（TODO #14 会话三档控制，自动档决策内核）：
+//   - auto（含未设置）按本轮目标文本规则重选（SelectGear），并**只升不降**：
+//     fast→cluster 允许（后续轮出现工程任务），cluster→fast 拒绝（宁慢勿浅）；
+//   - fast/cluster 已固化（config 默认档或手动切换）由用户掌控，自动规则不再改；
+//   - 选档变化落 System 事件（D-2 留痕），会话时间线可见"已自动选择 X 档"。
+func (s *ReactService) fixGearForRun(session *reactInternalSession, goal string) {
+	cur := session.currentGear()
+	switch cur {
+	case "", tool.GearAuto, tool.GearFast:
+		// 可裁决：auto/未设置按规则选；fast 只允许被升到 cluster。
+	default:
+		return // cluster（或未知值防御）：顶格/不可解，自动规则不动。
+	}
+	selected := SelectGear(goal)
+	if cur == tool.GearFast && selected != tool.GearCluster {
+		return // fast 固化后：仅 cluster 可升入，其余保持。
+	}
+	if cur == selected {
+		return // 裁决结果与当前一致，无变化不落事件。
+	}
+	session.setGear(selected)
+	label := "集群档"
+	if selected == tool.GearFast {
+		label = "快速档"
+	}
+	s.store.addEvent(session, eventkind.System, "System",
+		fmt.Sprintf("已自动选择%s（本轮目标轻量，直接对话处理）", label), "", "", "", "", "", true)
+}
+
+// resolveGearMetaRole 按会话档位解析本轮 meta 角色（TODO #14 P0-1 聊天模式）：
+// cluster/未设置 → "meta" 全装编排；fast → "chat" 轻量直达对话（未登记时回退 meta——
+// 配置残缺退化现行为而非报错）。返回角色定义与实际角色 ID（D-1 模型随档按其解析）。
+func (s *ReactService) resolveGearMetaRole(session *reactInternalSession) (*types.RoleDefinition, string) {
+	roleID := "meta"
+	if session.currentGear() == tool.GearFast {
+		roleID = "chat"
+	}
+	if r := s.roleRegistry.Get(roleID); r != nil {
+		return r, roleID
+	}
+	if roleID != "meta" {
+		if r := s.roleRegistry.Get("meta"); r != nil {
+			return r, "meta"
+		}
+	}
+	return nil, roleID
 }
 
 // runSession 为新创建的会话执行 ReAct 主循环。
@@ -2588,19 +2928,29 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
 
-	// 获取 meta 角色配置；若缺失则标记会话错误并退出。
-	metaRole := s.roleRegistry.Get("meta")
+	// 自动选档固化（TODO #14）：auto（含未设置）按目标文本规则选档，只升不降（见 fixGearForRun）。
+	s.fixGearForRun(session, session.Goal)
+
+	// 按档位解析本轮 meta 角色（fast=chat 轻量对话角色）；缺失则标记会话错误并退出。
+	metaRole, gearRoleID := s.resolveGearMetaRole(session)
 	if metaRole == nil {
-		s.setSessionError(session, "meta role not found")
+		s.setSessionError(session, fmt.Sprintf("role %q not found", gearRoleID))
 		return
 	}
 
+	// PROJECT.md 就绪有界等待（TODO 第14项 T9）：cluster/auto 等 ≤2s 让【项目概览】段
+	// 赶上首轮系统提示词前缀缓存；chat 档不等（秒回优先，缺失本就略段）。
+	if gearRoleID != "chat" {
+		waitProjectDoc(session, 2*time.Second)
+	}
+
 	// 确定模型 provider：优先使用测试注入的 provider，否则从模型工厂获取。
+	// D-1 模型随档（TODO #14）：按本轮角色 ID 解析（fast=chat 快模型，cluster=meta）。
 	var provider ModelProvider
 	if s.testProvider != nil {
 		provider = s.testProvider
 	} else {
-		p, err := s.modelFactory.GetBladesProvider(ctx, "meta")
+		p, err := s.modelFactory.GetBladesProvider(ctx, gearRoleID)
 		if err != nil {
 			s.setSessionError(session, fmt.Sprintf("failed to get blades provider: %v", err))
 			return
@@ -2614,34 +2964,44 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 任务看板注入（TODO #35 Phase 0）：每轮上下文末尾追加【任务看板】段——编排状态
 	// 机器可读且压缩不可达，"重新执行"类短指令的消歧锚点。仅 meta 注入，子 Agent 不注入。
 	// 热驻空闲领域清单注入（Domain 热驻）：供 MetaAgent 自主判定强相关复用 vs 弱相关新建。
+	// 快速档（chat）跳过看板/空闲清单/台账三段包装——直达对话不进编排观测（TODO #14 P0-1）。
 	// 系统提示词工作目录按会话解析(终审修复):会话 workDir 优先,空串回落进程默认目录,
 	// 使 buildEnvBlock/LoadProjectDoc 与 createSession 的 EnsureProjectDoc 落在同一目录。
 	wd := session.currentWorkDir()
 	if wd == "" {
 		wd = s.workDir()
 	}
-	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
-	metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
-	metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
-	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, "meta", s.pluginVisibility)).
+	metaMemory := s.memory
+	if gearRoleID != "chat" {
+		metaMemory = wrapMetaMemory(s.memory, s.boardFn, session.ID)
+		metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
+		metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
+	}
+	skillBlock := ""
+	if gearRoleID != "chat" {
+		skillBlock = s.metaSkillBlock()
+	}
+	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
-		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
+		WithLoopConfig(s.runtimeCfg.LoopConfigByRole(gearRoleID)).
 		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
-		WithSkillBlock(s.metaSkillBlock()).
+		WithSkillBlock(skillBlock).
 		WithPersonaInjector(s.metaPersona(session.currentWorkDir())).
 		WithMessageLogger(s.msgLogger).
 		// meta 长会话运行期间模型被切换时，下一次 LLM 调用即用新模型。
-		WithProviderFunc(s.metaProviderForCall)
-	// 注入未决子 Agent 检查器，开启父会话终结保护。
-	if s.pendingChecker != nil {
-		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
-	}
-	// 注入 Paused 子 Agent 检查器，使 MetaAgent 在 wait loop 检测 Paused 子 domain 并主动暂停。
-	if s.pausedChecker != nil {
-		agent = agent.WithPausedChildChecker(s.pausedChecker)
+		WithProviderFunc(s.providerForRole(gearRoleID, session.ID))
+	// 注入未决子 Agent 检查器，开启父会话终结保护（快速档无派发，跳过）。
+	if gearRoleID != "chat" {
+		if s.pendingChecker != nil {
+			agent = agent.WithPendingChildrenChecker(s.pendingChecker)
+		}
+		// 注入 Paused 子 Agent 检查器，使 MetaAgent 在 wait loop 检测 Paused 子 domain 并主动暂停。
+		if s.pausedChecker != nil {
+			agent = agent.WithPausedChildChecker(s.pausedChecker)
+		}
 	}
 
 	// 将会话 ID 注入工具上下文，便于工具内部识别当前会话。
@@ -2739,74 +3099,12 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 结束后清理资源。
 	defer s.finalizeSession(session)
 
-	// 获取 meta 角色；缺失则报错。
-	metaRole := s.roleRegistry.Get("meta")
-	if metaRole == nil {
-		s.setSessionError(session, "meta role not found")
-		return
-	}
-
-	// 确定模型 provider，逻辑同 runSession。
-	var provider ModelProvider
-	if s.testProvider != nil {
-		provider = s.testProvider
-	} else {
-		p, err := s.modelFactory.GetBladesProvider(ctx, "meta")
-		if err != nil {
-			s.setSessionError(session, fmt.Sprintf("failed to get blades provider: %v", err))
-			return
-		}
-		provider = p
-	}
-
-	// 构造并配置 ReActAgent。
-	// MetaAgent 暴露 call_sub_agent + 只读/信息类工具（ReadFile/ListDir/SearchInFiles/HTTPGet），
-	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
-	// 任务看板注入（TODO #35 Phase 0）：同 runSession，每轮末尾追加【任务看板】段。
-	// 热驻空闲领域清单注入（Domain 热驻）：供复用判定。
-	// 系统提示词工作目录按会话解析(终审修复,同 runSession):会话 workDir 优先,空串回落进程默认目录。
-	wd := session.currentWorkDir()
-	if wd == "" {
-		wd = s.workDir()
-	}
-	metaMemory := wrapMetaMemory(s.memory, s.boardFn, session.ID)
-	metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
-	metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
-	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, "meta", s.pluginVisibility)).
-		WithMailbox(s.mailbox).
-		WithMemory(metaMemory).
-		WithLoopConfig(s.runtimeCfg.LoopConfigByRole("meta")).
-		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
-		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
-		WithWorkDir(wd).
-		WithSkillBlock(s.metaSkillBlock()).
-		WithPersonaInjector(s.metaPersonaLite()).
-		WithMessageLogger(s.msgLogger).
-		// 同 runSession：运行期模型切换在下一次 LLM 调用生效。
-		WithProviderFunc(s.metaProviderForCall)
-	// 注入未决子 Agent 检查器，开启父会话终结保护。
-	if s.pendingChecker != nil {
-		agent = agent.WithPendingChildrenChecker(s.pendingChecker)
-	}
-	// 注入 Paused 子 Agent 检查器，使 MetaAgent 在 wait loop 检测 Paused 子 domain 并主动暂停。
-	if s.pausedChecker != nil {
-		agent = agent.WithPausedChildChecker(s.pausedChecker)
-	}
-
-	// 注入会话 ID 到工具上下文。
-	runCtx := tool.WithSessionID(ctx, session.ID)
-	// 注入每会话工作目录（空则原样返回，回落 Executor 默认目录）。
-	runCtx = tool.WithWorkDir(runCtx, session.currentWorkDir())
-	// 注入会话级 stopCtx（TODO 第10④）：续跑路径同 runSession，子派发以此取消基底。
-	runCtx = tool.WithStopContext(runCtx, session.stopCtx)
-	// 注入信任模式读取器（TODO 第10⑥）：同 runSession，中途切换下一工具调用生效。
-	runCtx = tool.WithTrustModeFunc(runCtx, session.currentTrustMode)
-
-	// 使用最新用户消息作为本轮输入，并以之前的历史作为种子。
-	// 挂起等子唤醒轮（WakeOnChildDone 写入 wakeInput）优先取 wakeInput 作输入，
-	// 即取即清（一次性）；否则倒序取最后一条 user 消息（中途可能追加了澄清/审批
-	// 答复等非 user 项），同步取出该轮用户图片注入 runCtx：带外穿透给
-	// RunWithHistory 的首条 user 消息与 call_sub_agent 子 Agent（每轮新 runCtx，图片按轮作用域）。
+	// 使用最新用户消息作为本轮输入（提前到角色解析前：档位自动裁决按本轮输入定，
+	// fast/cluster 的 meta 角色随档位选择）。挂起等子唤醒轮（WakeOnChildDone 写入
+	// wakeInput）优先取 wakeInput 作输入，即取即清（一次性）；否则倒序取最后一条
+	// user 消息（中途可能追加了澄清/审批答复等非 user 项），同步取出该轮用户图片
+	// 供 runCtx 注入：带外穿透给 RunWithHistory 的首条 user 消息与 call_sub_agent
+	// 子 Agent（每轮新 runCtx，图片按轮作用域）。
 	var input string
 	var turnImages []tool.ResultImage
 	s.store.mu.Lock()
@@ -2827,6 +3125,83 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	history := make([]ReactMessage, len(session.History))
 	copy(history, session.History)
 	s.store.mu.Unlock()
+
+	// 自动选档固化（TODO #14）：按本轮输入规则选档，只升不降（见 fixGearForRun）。
+	s.fixGearForRun(session, input)
+
+	// 按档位解析本轮 meta 角色（fast=chat 轻量对话角色）；缺失则报错。
+	metaRole, gearRoleID := s.resolveGearMetaRole(session)
+	if metaRole == nil {
+		s.setSessionError(session, fmt.Sprintf("role %q not found", gearRoleID))
+		return
+	}
+
+	// 确定模型 provider，逻辑同 runSession（D-1 模型随档：按本轮角色 ID 解析）。
+	var provider ModelProvider
+	if s.testProvider != nil {
+		provider = s.testProvider
+	} else {
+		p, err := s.modelFactory.GetBladesProvider(ctx, gearRoleID)
+		if err != nil {
+			s.setSessionError(session, fmt.Sprintf("failed to get blades provider: %v", err))
+			return
+		}
+		provider = p
+	}
+
+	// 构造并配置 ReActAgent。
+	// MetaAgent 暴露 call_sub_agent + 只读/信息类工具（ReadFile/ListDir/SearchInFiles/HTTPGet），
+	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
+	// 任务看板注入（TODO #35 Phase 0）：同 runSession，每轮末尾追加【任务看板】段。
+	// 热驻空闲领域清单注入（Domain 热驻）：供复用判定。
+	// 快速档（chat）跳过看板/空闲清单/台账三段包装（同 runSession，TODO #14 P0-1）。
+	// 系统提示词工作目录按会话解析(终审修复,同 runSession):会话 workDir 优先,空串回落进程默认目录。
+	wd := session.currentWorkDir()
+	if wd == "" {
+		wd = s.workDir()
+	}
+	metaMemory := s.memory
+	if gearRoleID != "chat" {
+		metaMemory = wrapMetaMemory(s.memory, s.boardFn, session.ID)
+		metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
+		metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
+	}
+	skillBlock := ""
+	if gearRoleID != "chat" {
+		skillBlock = s.metaSkillBlock()
+	}
+	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
+		WithMailbox(s.mailbox).
+		WithMemory(metaMemory).
+		WithLoopConfig(s.runtimeCfg.LoopConfigByRole(gearRoleID)).
+		WithLiveEvents(func(ev LiveEvent) { s.handleLiveEvent(session, ev) }).
+		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
+		WithWorkDir(wd).
+		WithSkillBlock(skillBlock).
+		WithPersonaInjector(s.metaPersonaLite()).
+		WithMessageLogger(s.msgLogger).
+		// 同 runSession：运行期模型切换在下一次 LLM 调用生效。
+		WithProviderFunc(s.providerForRole(gearRoleID, session.ID))
+	// 注入未决子 Agent 检查器，开启父会话终结保护（快速档无派发，跳过）。
+	if gearRoleID != "chat" {
+		if s.pendingChecker != nil {
+			agent = agent.WithPendingChildrenChecker(s.pendingChecker)
+		}
+		// 注入 Paused 子 Agent 检查器，使 MetaAgent 在 wait loop 检测 Paused 子 domain 并主动暂停。
+		if s.pausedChecker != nil {
+			agent = agent.WithPausedChildChecker(s.pausedChecker)
+		}
+	}
+
+	// 注入会话 ID 到工具上下文。
+	runCtx := tool.WithSessionID(ctx, session.ID)
+	// 注入每会话工作目录（空则原样返回，回落 Executor 默认目录）。
+	runCtx = tool.WithWorkDir(runCtx, session.currentWorkDir())
+	// 注入会话级 stopCtx（TODO 第10④）：续跑路径同 runSession，子派发以此取消基底。
+	runCtx = tool.WithStopContext(runCtx, session.stopCtx)
+	// 注入信任模式读取器（TODO 第10⑥）：同 runSession，中途切换下一工具调用生效。
+	runCtx = tool.WithTrustModeFunc(runCtx, session.currentTrustMode)
+
 	if len(turnImages) > 0 {
 		runCtx = WithUserImages(runCtx, turnImages)
 	}
@@ -2910,6 +3285,8 @@ func (s *ReactService) finalizeSession(session *reactInternalSession) {
 	// 会话结束（完成/出错/暂停）时清空流式输出与思考过程状态，UI 停止渲染瞬时内容。
 	s.store.setStreamingText(session, "")
 	s.store.setThinkingText(session, "")
+	// 会话终态 Webhook 通知（TODO #18-5 T32）：best-effort 异步，未接线/不关心该状态时零开销。
+	s.notifier.NotifySessionFinal(session.ID, string(session.Status), session.Goal)
 	// 暂停待续（awaiting_clarify / paused_on_child / awaiting_child）的会话保留临时目录，用户续跑时仍需其中的中间产物。
 	if session.Status != enums.SessionStatusAwaitingClarify && session.Status != enums.SessionStatusPausedOnChild && session.Status != enums.SessionStatusAwaitingChild {
 		// 清理会话临时目录。
@@ -3271,6 +3648,7 @@ func restartSessionContext(session *reactInternalSession) {
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 	session.stopCtx = stopCtx
 	session.stopCancel = stopCancel
+	session.runStartedAt = time.Now()
 }
 
 // sendMessage 向会话发送一条消息，并在必要时恢复会话运行。
@@ -3392,6 +3770,9 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	// 记录会话原先状态：Running 在跑；非 Running 需恢复（paused_on_child 优先恢复暂停的 domain）。
 	priorStatus := session.Status
 	wasRunning := priorStatus == enums.SessionStatusRunning
+	// T18 选档误判信号①（只落事件不改行为）：快速档 + 上一 run 终态 ≤5min + 行动动词
+	// ——疑似"工作活进了快速档"。数据锁内取（EndedAt 在下方被清），事件锁外落。
+	gearSignalDetail := gearSignalOnSend(session.currentGear(), session.EndedAt, content)
 	// 如果不在运行，则重新置为运行状态，清除结束时间，并重建上下文。
 	if !wasRunning {
 		session.Status = enums.SessionStatusRunning
@@ -3403,6 +3784,12 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	// 判定路径备注落 Prompt 事件（store.mu 已释放；addEvent 自身加锁，持锁调用死锁）。
 	if enhanceNote != "" {
 		s.store.addEvent(session, eventkind.Prompt, "System", "输入补全: "+enhanceNote, "", "", "", "", "", true)
+	}
+	// T18 信号①落事件（type=system，「档位信号:」前缀 + detail_json 结构化字段）。
+	if gearSignalDetail != "" {
+		s.store.addEventDetail(session, eventkind.System, "System",
+			"档位信号: 快速档会话收到任务型指令（距上次完成 ≤5min），疑似应升集群档",
+			"", "", "", "", "", true, gearSignalDetail)
 	}
 
 	// 软停止窗口内任何用户消息都视作续跑意图：清倒计时定时器 + 清标记（幂等）。
@@ -3913,6 +4300,9 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 		s.store.mu.Unlock()
 		return fmt.Errorf("%w: session is not running", ErrInvalidSessionState)
 	}
+	// T18 选档误判信号②（只落事件不改行为）：集群档 + 本次 run 开始 ≤30s 即被软停
+	// ——疑似"集群档太重（等不及）"。数据锁内取，事件锁外落（下方软停止事件旁）。
+	gearStopDetail := gearSignalOnStop(session.currentGear(), session.runStartedAt)
 	// 1. 置软停止标记（dispatcher 收尾分流依据；domain supervisor 的软停分支与叶子部分回灌共用）。
 	if s.stopMarker != nil {
 		s.stopMarker.SetSoftStop(sessionID)
@@ -3963,6 +4353,12 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 	} else {
 		s.store.addEvent(session, eventkind.System, "System",
 			fmt.Sprintf("软停止: 已停止全部子任务（%s 后未续跑将销毁）", s.stopCountdown), "", "", "", "", "", true)
+	}
+	// T18 信号②落事件（type=system，「档位信号:」前缀 + detail_json 结构化字段）。
+	if gearStopDetail != "" {
+		s.store.addEventDetail(session, eventkind.System, "System",
+			"档位信号: 集群档会话刚开始（≤30s）即被停止，疑似档位过重",
+			"", "", "", "", "", true, gearStopDetail)
 	}
 	log.Printf("[service] SOFT-STOP: session=%s countdown=%s hotResident=%t", sessionID, s.stopCountdown, s.hotResident)
 	return nil
@@ -4082,6 +4478,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		DestroyAt:      s.destroyAt,
 		ActiveTopicID:  s.activeTopicID,
 		TrustMode:      s.currentTrustMode(),
+		Gear:           s.currentGear(),
 	}
 }
 

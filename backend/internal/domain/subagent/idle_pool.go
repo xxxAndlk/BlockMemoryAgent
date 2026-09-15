@@ -131,6 +131,11 @@ type domainSlot struct {
 	ttlDeadline time.Time          // 武装时的到期时刻（IdleLeft 计算用）
 	idleSince  time.Time
 
+	// gear 进 Idle 时固化的会话档位（TODO #14 T22）：隐式复用解析按它裁决——
+	// 新派发会话档位与槽档位不符时不隐式接管（用户刚把会话切到快速档，不该吃
+	// 到集群档攒下的热驻上下文继续跑重活）。空串=未接线/存量槽，按匹配放行。
+	gear string
+
 	ops chan domainOp
 }
 
@@ -347,6 +352,11 @@ func (d *Dispatcher) enterIdle(s *domainSlot, summary string) {
 	}
 	s.state = slotIdle
 	s.idleSince = time.Now()
+	// T22 档位固化：进 Idle 时记录会话当前档位，隐式复用解析按它裁决
+	//（回调未接线/会话不存在时空串=复用守卫放行）。
+	if d.sessionGearFn != nil {
+		s.gear = d.sessionGearFn(s.sessionID)
+	}
 	s.ttlArmed = false
 	if s.ttlTimer != nil {
 		s.ttlTimer.Stop()
@@ -395,6 +405,13 @@ func (s *domainSlot) destroyFnLocked() context.CancelFunc {
 			// ops 满时丢弃：supervisor park 循环必消费，正常不达。
 		}
 	}
+}
+
+// gearOf 读取槽固化档位（mu 保护；enterIdle 写入）。
+func (s *domainSlot) gearOf() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gear
 }
 
 // armTTL 武装加权倒计时（幂等：已武装不重复）。

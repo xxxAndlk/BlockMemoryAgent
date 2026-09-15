@@ -25,6 +25,10 @@ type RoleBinding struct {
 	ModelID string `json:"model_id"`
 	// Thinking 思考强度覆盖（off/low/medium/high）；空 = 跟随角色 roles.yaml 配置。
 	Thinking string `json:"thinking,omitempty"`
+	// Fallback 备胎链（TODO 第15项 T17）：主模型调用出错（非 ctx 取消）时依序降级的
+	// 模型条目 ID 列表。空 = 无备胎（现状）。手改 models.json 配置；运行时切换通道
+	// 不写本字段（换主模型不影响已配置的备胎链）。
+	Fallback []string `json:"fallback,omitempty"`
 	// AppliedAt 应用时间（记录用，不参与逻辑）。
 	AppliedAt *time.Time `json:"applied_at,omitempty"`
 }

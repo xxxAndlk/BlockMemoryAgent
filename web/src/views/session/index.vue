@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage } from '@/types'
@@ -34,6 +34,7 @@ import { useSessionList } from '@/composables/useSessionList'
 import { useSessionStatus } from '@/composables/useSessionStatus'
 import { useWorkDir } from '@/composables/useWorkDir'
 import { normDir } from '@/utils/dir'
+import { maybeNotifySessionDone } from '@/utils/notifications'
 import ChatView from './chat/ChatView.vue'
 import MonitorView from './monitor/MonitorView.vue'
 import TaskBoardPanel from './components/panels/TaskBoardPanel.vue'
@@ -179,6 +180,31 @@ watch(() => route.query.id, (id) => {
   if (id && typeof id === 'string' && id !== activeSession.value?.id) {
     openSession(id)
   }
+})
+
+// 断线补播兜底（TODO #16-5 T20）：SSE 流自身带可见期持续重连（api/session.ts），
+// 这里负责「回页面/网络恢复」时的面板数据刷新——后台标签页的 3s 自动刷新定时器
+// 被浏览器节流，切回来时 agents/看板/指标往往已过期。SSE 重连后的全量快照只补
+// 事件流，面板得另刷一次。全部静默失败（面板刷新本就是 allSettled）。
+function reconcileAfterWake() {
+  if (document.visibilityState !== 'visible') return
+  const id = activeSession.value?.id
+  if (!id) return
+  void refreshPanels(id)
+  void loadSessions()
+}
+const onVisChange = () => {
+  if (document.visibilityState === 'visible') reconcileAfterWake()
+}
+const onNetBack = () => reconcileAfterWake()
+
+onMounted(() => {
+  document.addEventListener('visibilitychange', onVisChange)
+  window.addEventListener('online', onNetBack)
+})
+onUnmounted(() => {
+  document.removeEventListener('visibilitychange', onVisChange)
+  window.removeEventListener('online', onNetBack)
 })
 
 async function openSession(id: string) {
@@ -344,6 +370,8 @@ function startStream(s: Session) {
         activeSession.value = fresh
         events.value = [...(fresh.events || [])]
       }).catch((e) => console.error('done reconcile failed:', e))
+      // 浏览器通知（T32）：页面在后台（锁屏/切走）时终态弹系统级提醒
+      maybeNotifySessionDone(finalStatus, activeSession.value?.goal)
       sending.value = false
     },
     onError(err) {
@@ -735,7 +763,7 @@ function fmtDateTime(iso: string) {
           <SessionMemoryPanel v-else-if="rightTab === 'memory'" :session-id="activeSession?.id || ''" />
           <div v-else class="space-y-3">
             <MetricsCard :metrics="metrics" />
-            <TokenMetricsCard :token-metrics="tokenMetrics" />
+            <TokenMetricsCard :token-metrics="tokenMetrics" :session-id="activeSession?.id || ''" />
             <MailboxCard :messages="mailboxMessages" />
             <HealthCard :health="health" />
           </div>

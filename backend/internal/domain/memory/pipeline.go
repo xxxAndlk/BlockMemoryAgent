@@ -2,8 +2,9 @@ package memory
 
 // 导入所需标准库与项目内部包。
 import (
-	"context" // context 用于持久化存储接口的上下文传递
-	"fmt"     // fmt 用于格式化错误信息
+	"context"  // context 用于持久化存储接口的上下文传递
+	"fmt"      // fmt 用于格式化错误信息
+	"hash/fnv" // fnv 用于摘要备忘键的 hash（TODO 第15项 P2-6）
 	"log/slog" // slog 用于摘要失败时记录警告
 	"strings"  // strings 用于事件摘要拼装
 	"sync"     // sync 提供读写锁，保证并发安全
@@ -93,6 +94,56 @@ type Pipeline struct {
 	// ReadFile/WriteFile/EditFile 触碰过的文件符号轮廓，mtime 缓存）。为 nil 或返回空时不注入。
 	// 由 bootstrap 注入，避免 domain/memory 反向依赖 tool 包。
 	fileMapProvider func(agentID string) string
+	// sumMemoMu/sumMemo/sumMemoOrder 事件摘要 hash 备忘（TODO 第15项 P2-6）：
+	// 事件未新增的轮次（挂起等子、同轮多次装配）摘要输入逐字节相同，每轮重调轻量模型
+	// 纯浪费（单呼 120s 超时口径，白等一次就是一轮卡顿）——按输入 hash 缓存最近
+	// sumMemoCap 条结果，命中即复用，FIFO 淘汰防膨胀。受 sumMemoMu 保护（独立于 mu：
+	// 摘要调用在事件锁外，不能互相拖住）。
+	sumMemoMu    sync.Mutex
+	sumMemo      map[string]string
+	sumMemoOrder []string
+}
+
+// sumMemoCap 摘要备忘容量上限（FIFO 淘汰）：近期任务的摘要集足够，全量缓存无意义。
+const sumMemoCap = 16
+
+// summaryMemoKey 计算摘要输入的 hash 键（fnv64，仅进程内备忘用，无碰撞担忧——
+// 碰撞代价是复用一条近似摘要，不是正确性事故）。
+func summaryMemoKey(summary []string) string {
+	h := fnv.New64a()
+	for _, s := range summary {
+		_, _ = h.Write([]byte(s))
+		_, _ = h.Write([]byte{'\n'})
+	}
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+// summaryMemoGet 摘要备忘命中查询；未初始化视为未命中。
+func (p *Pipeline) summaryMemoGet(key string) (string, bool) {
+	p.sumMemoMu.Lock()
+	defer p.sumMemoMu.Unlock()
+	if p.sumMemo == nil {
+		return "", false
+	}
+	v, ok := p.sumMemo[key]
+	return v, ok
+}
+
+// summaryMemoPut 记录摘要结果（FIFO 淘汰超限条目）。
+func (p *Pipeline) summaryMemoPut(key, val string) {
+	p.sumMemoMu.Lock()
+	defer p.sumMemoMu.Unlock()
+	if p.sumMemo == nil {
+		p.sumMemo = make(map[string]string, sumMemoCap)
+	}
+	if _, exists := p.sumMemo[key]; !exists {
+		p.sumMemoOrder = append(p.sumMemoOrder, key)
+	}
+	p.sumMemo[key] = val
+	for len(p.sumMemoOrder) > sumMemoCap {
+		delete(p.sumMemo, p.sumMemoOrder[0])
+		p.sumMemoOrder = p.sumMemoOrder[1:]
+	}
 }
 
 // compressState 是某 agent 已冻结的压缩视图状态（层级压缩金字塔）。
@@ -359,26 +410,36 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 		// 若连续 2 次 Insufficient Balance，关闭摘要路径降级到 raw join 直到进程重启，
 		// 避免每次调用白等超时（实证 DeepSeek 余额耗尽持续 402）。
 		if !p.summarizerDisabled() {
-			// 超时取装配层注入值（默认 5s 仅适合秒回模型；思考型模型需 60-180s）。
-			// 超时立即降级 raw join，避免主循环无限卡顿。
-			timeout := p.summarizeTimeout
-			if timeout <= 0 {
-				timeout = 5 * time.Second
+			// hash 备忘（TODO 第15项 P2-6）：事件未新增的轮次输入逐字节相同，
+			// 直接复用上次摘要，省一次轻量模型调用（每轮 Assemble 都走到这里）。
+			memoKey := summaryMemoKey(summary)
+			cached, hit := p.summaryMemoGet(memoKey)
+			if !hit {
+				// 超时取装配层注入值（默认 5s 仅适合秒回模型；思考型模型需 60-180s）。
+				// 超时立即降级 raw join，避免主循环无限卡顿。
+				timeout := p.summarizeTimeout
+				if timeout <= 0 {
+					timeout = 5 * time.Second
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				summarized, err := p.summarizer(ctx, summary)
+				cancel()
+				if err != nil {
+					p.noteSummarizeError(agentID, err)
+					// 摘要失败：记录警告，降级为原始 join，主流程不中断。
+					slog.Warn("pipeline: summarize events failed, fallback to raw join",
+						"agent_id", agentID, "event_count", len(summary), "err", err)
+				} else if trimmed := strings.TrimSpace(summarized); trimmed != "" {
+					// 摘要成功：重置连续错误计数 + 记入备忘。
+					p.noteSummarizeSuccess()
+					p.summaryMemoPut(memoKey, trimmed)
+					cached, hit = trimmed, true
+				}
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			summarized, err := p.summarizer(ctx, summary)
-			cancel()
-			if err != nil {
-				p.noteSummarizeError(agentID, err)
-				// 摘要失败：记录警告，降级为原始 join，主流程不中断。
-				slog.Warn("pipeline: summarize events failed, fallback to raw join",
-					"agent_id", agentID, "event_count", len(summary), "err", err)
-			} else if trimmed := strings.TrimSpace(summarized); trimmed != "" {
-				// 摘要成功：重置连续错误计数。
-				p.noteSummarizeSuccess()
-				// 摘要成功且非空：用摘要替换原始 body，显著降低 token 占用。
+			if hit {
+				// 摘要成功且非空（含备忘命中）：用摘要替换原始 body，显著降低 token 占用。
 				// 保留原始事件数标注，便于 LLM 识别这是压缩后的快照。
-				body = fmt.Sprintf("[已摘要 %d 条事件] %s", len(summary), trimmed)
+				body = fmt.Sprintf("[已摘要 %d 条事件] %s", len(summary), cached)
 			}
 		}
 	}

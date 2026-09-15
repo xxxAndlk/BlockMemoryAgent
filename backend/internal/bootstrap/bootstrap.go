@@ -33,6 +33,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/plugins"
 	"github.com/blockmemory/agent/backend/internal/plugins/mcpbridge"
+	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/internal/retriever"
 	"github.com/blockmemory/agent/backend/internal/runtime"
 	"github.com/blockmemory/agent/backend/internal/server"
@@ -41,6 +42,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/userprofile"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
+	"github.com/blockmemory/agent/backend/pkg/prompts"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -135,6 +137,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load roles %s: %w", paths.RolePath, err)
 	}
+	// 提示词版本钉（TODO #15 T15）：一行日志对照"线上跑的是哪一版内置提示词"，
+	// 提示词改动/计量实验（#15）前后归因用；bump 时机见 pkg/prompts.Version 注释。
+	log.Printf("[bootstrap] prompts version: %s (built-in roles=%d)", prompts.Version, len(roleCfg.FixedRoles))
 
 	// 第五步：连接 PostgreSQL 并配置向量维度、记忆检索 token 上限。
 	pgStore, err := store.NewPostgresStore(ctx, cfg.Postgres.DSN)
@@ -279,16 +284,42 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		}
 		return rd.Sandbox.AllowedWritePaths
 	})
-	// 角色工具白名单硬门（默认关闭，config: role_tool_gate_enabled）：开启后 Dispatch
-	// 执行前按角色白名单硬校验，堵住 Schema 软过滤缺口。闭包直接复用 roleRegistry.Get
-	// （meta/domain 合成角色与 roles.yaml 覆盖列表同源，无需额外映射）。
+	// 角色工具白名单硬门（TODO 第15项 T13 起默认开启，config: role_tool_gate_enabled）：
+	// 开启后 Dispatch 执行前按角色白名单硬校验，堵住 Schema 软过滤缺口（LLM 幻觉/提示
+	// 注入出白名单外工具名此前仍会执行）。闭包直接复用 roleRegistry.Get（meta/domain
+	// 合成角色与 roles.yaml 覆盖列表同源，无需额外映射）；各 ReAct Agent 均经
+	// WithRoleID 自带角色 ID，verifyloop.ExecuteChild 等程序化路径同样覆盖。
+	// 白名单 = 角色静态 tools ∪ 该角色可见的插件工具（T13 并集）：roleDef.Tools 只覆盖
+	// 静态基础工具，插件工具经（角色可见 ∧ 运行期挂载）进入 Schema 软过滤集——硬门若
+	// 不并集会把 web_search 等已可见插件工具误拦在执行层。挂载集按 scope 运行期动态
+	// 变化（tool_mount/tools_hint/plugin_install 自动挂载），此处按可见性天花板放行；
+	// 未挂载工具本就不进 Schema，LLM 无从合法调用。插件可见性回调在下方 plugins.Manager
+	// 构建后才接线（pluginVis 间变量延迟取值，接线前闭包只按静态白名单裁决）。
+	var pluginVis tool.PluginVisibilityFunc
 	if cfg.Agent.RoleToolGateEnabled {
 		toolRegistry.SetRoleToolGateResolver(func(roleID string) []string {
 			rd := roleRegistry.Get(roleID)
 			if rd == nil {
 				return nil
 			}
-			return rd.Tools
+			if pluginVis == nil {
+				return rd.Tools
+			}
+			merged := make([]string, 0, len(rd.Tools)+8)
+			merged = append(merged, rd.Tools...)
+			seen := make(map[string]bool, len(rd.Tools))
+			for _, name := range rd.Tools {
+				seen[name] = true
+			}
+			for _, name := range toolRegistry.ToolNames() {
+				if seen[name] {
+					continue
+				}
+				if owned, visible := pluginVis(roleID, name); owned && visible {
+					merged = append(merged, name)
+				}
+			}
+			return merged
 		})
 	}
 	// 注入 LLM 领域分区器：RefreshProjectDoc 工具（MetaAgent 侧）与 EnsureProjectDoc（首 session）
@@ -465,6 +496,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
+	// 会话终态 Webhook 通知（TODO #18-5 T32）：webhook_url 空=关闭（NewNotifier 返 nil）。
+	agentSvc.SetNotifier(agent.NewNotifier(cfg.Notify.WebhookURL, cfg.Notify.WebhookEvents))
 	// MetaAgent 全池技能目录块（【可用技能】进 meta 系统提示；Meta 持全集可 load_skill
 	// 取全文，也可派发时经 skills 参数下放任意技能）。
 	agentSvc.SetSkillCatalog(skillPool)
@@ -544,6 +577,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err := agentSvc.SetDefaultTrustMode(cfg.Agent.TrustMode); err != nil {
 		return nil, fmt.Errorf("invalid agent.trust_mode: %w", err)
 	}
+	// 默认执行档位（TODO #14 会话三档控制）：config agent.default_gear 注入，同上。
+	if err := agentSvc.SetDefaultGear(cfg.Agent.DefaultGear); err != nil {
+		return nil, fmt.Errorf("invalid agent.default_gear: %w", err)
+	}
 	// 外部知识库检索（TODO #27 热路径 a）：search_knowledge 工具 → retriever 混合检索。
 	// 混合检索后端 = KnowledgeStore（直接满足 HybridSearchBackend：SearchByType + SearchKeywords）。
 	// 嵌入用全局 embedder（roles.yaml embed 段；当前 pseudo，真实 embed 激活后自动升级）。
@@ -581,6 +618,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 批量模式钩子（任务 140）：questions>1 时整组一次挂出（同屏分页、统一提交）。
 	toolRegistry.SetAskUserBatchHook(agentSvc.AskUserBatchHook())
 	toolRegistry.SetAskUserTimeoutDefault(cfg.Agent.AskUserTimeoutSec)
+	// 注入 escalate_gear 工具钩子（TODO #14 T7 档位升级）：快速档 chat 角色接工程任务时
+	// 推确认卡，用户确认后切集群档并以种子消息重启（与 ask_user 共用会话暂停/恢复通道）。
+	toolRegistry.SetEscalateGearHook(agentSvc.EscalateGearHook())
 	// 注入子 Agent 实时事件转发器：子 Agent token 用量/流式增量按 sessionID 路由回会话 service，
 	// 使 TUI/Web 看到所有 Agent（含子 Agent）的累计 token。
 	subAgentDispatcher.WithLiveEvents(agentSvc.ForwardLiveEvent)
@@ -762,6 +802,77 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 角色可见性：meta/domain/动态角色按 Manifest.Roles 判定插件工具是否可见（§4.3）。
 	agentSvc.SetPluginVisibility(pluginManager.ToolVisibility)
 	subAgentDispatcher.WithPluginVisibility(pluginManager.ToolVisibility)
+	// 会话档位只读回调（TODO #14 T22）：热驻槽 enterIdle 固化档位 + 隐式复用档位守卫。
+	subAgentDispatcher.WithSessionGearResolver(agentSvc.SessionGear)
+	// 领域注册表派发匹配（TODO #17 T24）：档案快照 + 记忆链两个只读回调，
+	// 派发侧按名字/别名/路径匹配命中后注入冷复活种子；store 与 dispatcher 解耦。
+	subAgentDispatcher.SetDomainProfileHook(func(ctx context.Context) []*subagent.DomainProfile {
+		recs, err := pgStore.Knowledge.ListDomainProfiles(ctx)
+		if err != nil {
+			log.Printf("[bootstrap] list domain profiles failed (non-fatal): %v", err)
+			return nil
+		}
+		out := make([]*subagent.DomainProfile, 0, len(recs))
+		for _, r := range recs {
+			p := &subagent.DomainProfile{
+				Domain:      strFromMeta(r.Meta, "domain"),
+				DisplayName: strFromMeta(r.Meta, "display_name"),
+				Subproject:  strFromMeta(r.Meta, "subproject"),
+				Summary:     r.Content,
+				Aliases:     strSliceFromMeta(r.Meta, "aliases"),
+				Files:       strSliceFromMeta(r.Meta, "files"),
+			}
+			if p.Domain == "" {
+				continue
+			}
+			if p.DisplayName == "" {
+				p.DisplayName = p.Domain
+			}
+			out = append(out, p)
+		}
+		return out
+	})
+	subAgentDispatcher.SetDomainMemoryHook(func(ctx context.Context, domain string, n int) []string {
+		recs, err := pgStore.Knowledge.QueryBlockMemoryByDomain(ctx, domain, n)
+		if err != nil {
+			log.Printf("[bootstrap] query block memory by domain failed (non-fatal): %v", err)
+			return nil
+		}
+		out := make([]string, 0, len(recs))
+		for _, r := range recs {
+			out = append(out, r.Content)
+		}
+		return out
+	})
+	// 档案增量写入（TODO #17 T25）：块记忆收尾旁路把 files_modified 并进档案文件清单。
+	subAgentDispatcher.SetDomainProfileSink(func(ctx context.Context, up subagent.DomainProfileUpdate) {
+		if err := pgStore.Knowledge.UpsertDomainProfile(ctx, store.DomainProfileUpsert{
+			Domain:  up.Domain,
+			Files:   up.Files,
+			Summary: up.Summary,
+			Source:  "block_memory",
+		}); err != nil {
+			log.Printf("[bootstrap] upsert domain profile failed (non-fatal): domain=%s err=%v", up.Domain, err)
+		}
+	})
+	// PROJECT.md 领域分区种子导入（TODO #17 T26）：Ensure/RefreshProjectDoc 成功后把
+	// 解析出的领域分区预先登记进领域注册表（source=project_md，冷启动种子）。
+	project.SetDomainSeedHook(func(ctx context.Context, workDir string, seeds []project.DomainSeed) {
+		for _, s := range seeds {
+			if err := pgStore.Knowledge.UpsertDomainProfile(ctx, store.DomainProfileUpsert{
+				Domain:      s.Name,
+				DisplayName: s.Name,
+				Files:       s.Files,
+				Summary:     s.Purpose,
+				Fingerprint: strings.TrimSpace(s.Name + "：" + s.Purpose),
+				Source:      "project_md",
+			}); err != nil {
+				log.Printf("[bootstrap] seed domain profile failed (non-fatal): domain=%s err=%v", s.Name, err)
+			}
+		}
+	})
+	// 角色工具硬门的插件并集（T13）：上方 gate 闭包经 pluginVis 延迟取值。
+	pluginVis = pluginManager.ToolVisibility
 	// 挂载天花板（TODO #52）：tool.Registry 同一回调校验 tool_mount/派发 tools_hint
 	// 是否越界（工具包不反向依赖 plugins，经同一函数值注入）。
 	toolRegistry.SetPluginVisibility(pluginManager.ToolVisibility)
@@ -805,6 +916,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	}
 
 	// 第二十一步：注册关闭时释放资源的回调，按依赖顺序排列（外层 Close 会逆序调用）。
+	// 数据生命周期维护（TODO #18-2 T29）：启动即跑一遍 + 每 24h 重复（陈旧知识归档/
+	// 日志与工具输出按保留期清理）；停在知识归档之后（归档走 PG）。
+	stopMaintenance := startDataMaintenance(cfg, workDir, pgStore.Knowledge)
 	app.cleanup = []func() error{
 		func() error {
 			// 先停全部插件（MCP 子进程/HTTP 连接），再关 DAG 调度器。
@@ -813,6 +927,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			_ = pluginManager.StopAll(stopCtx)
 			return nil
 		},
+		func() error { stopMaintenance(); return nil }, // 停数据维护定时器
 		func() error {
 			// 先停止 DAG 调度器，避免在数据库关闭后还在调度任务。
 			if dagScheduler != nil {
@@ -982,6 +1097,27 @@ func parseStrictJSON(s string, v any) error {
 	}
 	s = strings.TrimPrefix(strings.TrimSpace(s), "json")
 	return json.Unmarshal([]byte(strings.TrimSpace(s)), v)
+}
+
+// strFromMeta 取知识记录 meta 中的字符串字段（TODO #17 T24 档案快照转换用）。
+func strFromMeta(meta map[string]any, key string) string {
+	s, _ := meta[key].(string)
+	return s
+}
+
+// strSliceFromMeta 取 meta 中的字符串数组字段（JSONB 反序列化为 []any，逐项断言）。
+func strSliceFromMeta(meta map[string]any, key string) []string {
+	raw, ok := meta[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // newEventSummarizer 构造一个 memory.EventSummarizer，把近期事件列表交给轻量模型压成短摘要。

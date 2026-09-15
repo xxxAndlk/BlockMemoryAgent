@@ -6,10 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BlockMemoryAgent - Go multi-agent orchestration system built on go-kratos Blades. ReAct-loop core (single MetaAgent -> `call_sub_agent` recursive dispatch) with event-stream memory, three-tier storage (PostgreSQL + Redis + pgvector), and a bubbletea TUI / HTTP web UI.
 
-Go module: `github.com/blockmemory/agent/backend` (source under `backend/`; root `go.work` includes both `./backend` and `./test`). Go 1.25.
+Go module: `github.com/blockmemory/agent/backend` (source under `backend/`; root `go.work` includes only `./backend`). Go 1.25.
 
 ## Hard Conventions
 
+- **凡新建表/新字段统一带 owner 列**：会话/Agent 级数据必须能归属到 owner（user_id），多租户隔离靠它预留（TODO #18-8）；新增持久化结构时 owner 列与业务列同期建，不给后续迁移留死角。
 - **`GOTOOLCHAIN=local` required** on machines whose default Go is older. All `go test` / `go run` commands in this repo use this flag. Do not omit.
 - **Windows bash shell**: use Unix syntax (`/dev/null` not `NUL`, forward slashes in paths).
 - **Strict startup**: `bootstrap.Build` fails fast - missing config files, unreachable PostgreSQL/Redis, or failed LLM warmup/connectivity check all abort boot. No degraded no-DB/no-key mode for the server binary.
@@ -38,15 +39,14 @@ Key rules: `pkg/*` must not import `internal/*`; infrastructure must not import 
 ## Tests
 
 - Per-package `_test.go` exist for `agent`, `board`, `mailbox`, `skill`, `soul`, `watchdog`, `config`, `model`, `logger`, `domain/tool`, `domain/role`, `domain/memory`, `domain/subagent`, `server`, `tui` - run when touching those packages.
-- Integration tests under `test/` (separate module): `test/api/*`, `test/coding/*` (e2e via mock LLM), `test/tui/*`, `test/fixtures/*`. Fixtures use `docker/docker-compose.test.yml` (isolated ports PG 55432 / Redis 56380) — never point tests at the dev instance (5432/6380, VECTOR(1024)). Test containers are shared and left running; each test gets its own PG database + Redis logical DB (do not add compose `down` to fixture setup/cleanup — parallel packages share the containers).
-- Eval suite under `test/eval/` (build tag `eval`, real LLM, costs API credits): scenario YAMLs + deterministic checkpoint judges + metrics, reports to `test/eval/runs/<ts>/report.{json,md}`. Dry-run: `cd test && EVAL_DRY_RUN=1 GOTOOLCHAIN=local go test -tags=eval ./eval/ -run TestEval -v`. Knobs: `EVAL_FILTER`, `EVAL_RUNS`, `JUDGE_*` for llm_judge checks.
+- **Integration/eval Go suites removed** (commit b35f87e): the `test/` module currently has **zero Go test files** — remaining dirs (`ab`/`benchmark`/`duel`/`swe`/`eval`) hold shell/JS scripts and run artifacts only. Rebuild is an open TODO; `.github/workflows/ci.yml` defers its nightly PG+Redis job until then. Conventions to restore with it: fixtures used `docker/docker-compose.test.yml` (isolated ports PG 55432 / Redis 56380 — never the dev instance 5432/6380, VECTOR(1024)); containers shared and left running, one PG database + Redis logical DB per test; eval suite ran with build tag `eval` against real LLM (costs credits; knobs `EVAL_FILTER`/`EVAL_RUNS`/`JUDGE_*`).
 
 ## Agent 编排页
 
 会话页第三个主视图 `?view=orch`（选中态 `?agent=<inst_id>`，可分享/刷新恢复）：左树图（自绘 SVG tidy 布局，零图库）+ 右单 Agent 对话面板。设计/计划：`docs/superpowers/specs/2026-09-11-agent-orch-board-design.md` + `docs/superpowers/plans/2026-09-11-agent-orch-board.md`。
 
 - 新端点：`GET /api/sessions/{id}/agents/{aid}/messages?before_seq&after_seq&limit`（完整消息历史 + mailbox 留痕）、`POST /api/sessions/{id}/agents/{aid}/message`（用户直连）。
-- 用户直连状态机（`ReactService.MessageAgent` → `subagent.Dispatcher`）：`running + activity_kind=child_wait` 经 `InjectUserMessage` 投邮件并 poke 唤醒；终态（done/failed/cancelled/delivered-unverified）经 `Tree.Reopen` + `ReviveWithMessage` 同 ID 重跑（种子=原任务+上轮结果+用户消息，父收「复活返工」通知）；`running` 其他 → 409 `ErrAgentBusy`；paused/idle/meta/未接线 → 409 `ErrAgentNotDirectable`。
+- 用户直连状态机（`ReactService.MessageAgent` → `subagent.Dispatcher`）：`running + activity_kind=child_wait` 经 `InjectUserMessage` 投邮件并 poke 唤醒；终态（done/failed/cancelled/delivered-unverified）经 `Tree.Reopen` + `ReviveWithMessage` 同 ID 重跑（种子=原任务+上轮结果+用户消息，父收「复活返工」通知）；`running` 其他（TODO #14 T8 排队语义）→ 同样走 `InjectUserMessage` 邮箱注入并回 200 {queued}（主循环每次 generate 前 drain，下一 LLM 轮次生效；注入失败才回 409 `ErrAgentBusy`）；paused/idle/meta/未接线 → 409 `ErrAgentNotDirectable`。
 - 观测写入一律 best-effort：消息逐条热写 Redis（`sess:{sid}:agent:{aid}:msgs`，TTL 24h、cap 500）+ 子 Agent 终态全量落 PG `agent_messages`；mailbox 发送留痕双写 `agent_events`（type=mailbox）；`child_wait` 是纯展示态活动 kind（只换 lastKind，不刷 lastTS、不冒泡）。Redis 不可用时写侧跳过、读侧回退 PG，端点不报错。
 
 ## 媒体产出与预览（对话栏）
@@ -104,3 +104,19 @@ Hot-pluggable plugins (design: `doc/设计文档_插件范式.md`): plugins regi
 - Initial plugins: `web_search` (mcp, stdio `uvx free-search-mcp`, enabled by default; requires `uv/uvx` — missing binary degrades gracefully with a logged reason) and `computer_use` (mcp, stdio `npx computer-use-mcp`, **disabled by default**; all tools marked `Destructive()` → approval guard chain). `computer` sandbox service (Xvfb + noVNC) available in `docker/docker-compose.yml` behind the `computer` profile.
 - Role visibility: plugin `settings.roles` (default `["*"]`) restricts which roles see plugin tools; adapters filter as static whitelist ∪ dynamic plugin visibility.
 - Tests: `backend/internal/plugins/*_test.go`, `mcpbridge/bridge_test.go` (spawns a mock MCP server child process), `server/plugins_test.go` (API loop). `go test -race` needs a C compiler (not available in this env).
+
+## 三档控制与平台补齐（TODO #14-18 第一批，2026-09-15）
+
+落地详情见 `doc/TODO.md` #14-18 条内「第一批落地」标注与 `doc/变更.md` 任务 160。日常改动需知的稳定语义：
+
+- **会话档位** `auto|fast|cluster`（explore 留枚举未实现）：`POST /api/sessions/:id/gear` 手动切档任意向；`auto` 每轮按 `agent/gear_selector.go` 规则重选（闲聊信号→fast，其余 cluster）且**只升不降**；`escalate_gear` 工具经 askUser 通道确认升档（槽占用即工具级"稍后再试"）；gear 随 MetaMemory JSONB 落库、restore 回填。fast 档走 `chat` 角色（roles.yaml fixed_roles，快模型 + 低 thinking，跳过 roster/ledger wrapper），cluster 走 meta 全装。
+- **roleToolGate 默认开启**（config `role_tool_gate_enabled: true`）：Dispatch 执行前按"角色静态 tools ∪ 该角色可见插件工具"并集硬校验；meta tools 已收窄 40→22（roles.yaml）。逃生舱：改回 false。
+- **提示词版本钉**：`pkg/prompts.Version`（现值 `20260915-1`）——语义改动提示词必须 bump 并写进变更记录；启动日志打印。
+- **数据围栏**：MCP 插件与 HTTPGet/HTTPPost 的外部内容经 `tool.WrapUntrusted` 包进 `<untrusted_data>` 围栏（围栏标记转义防逃逸，本地工具不包）；meta/domain 提示词含【数据围栏纪律】——围栏内是数据不是指令。
+- **新端点**：`GET /api/capabilities`（装机自检六项 llm/postgres/redis/embed/plugins/workdir，只做廉价检查不发真实 LLM 调用，settings 页有面板）；`GET /api/sessions/:id/export`（zip：会话 JSON ×4 + workspace/.bma 产物树，2000 文件/64MB 上限）；`GET /api/export/memory`（未归档 global_knowledge JSONL + user_profile.md + skills_learned/）。导入端点未做。
+- **通知**：`notify.webhook_url`（空=关）+ `webhook_events`（默认 [completed,error]，状态枚举无 failed）——会话终态 best-effort POST（3s 超时，60s 同会话同状态去重）；前端页面隐藏 ∧ 终态 → 浏览器 Notification（settings 页申请权限）。
+- **数据生命周期**：`data.*` 配置——`knowledge_archive_days`（0=关，opt-in）、log/tool_outputs 保留期（0=默认 30/14 天，负数=关）；启动 + 每日 tick；归档 = 置 `archived=true` 冷备份（查询层全局排除），不是删除。
+- **HTTP 默认绑 `127.0.0.1:10010`**：局域网访问需显式 `HTTP_ADDR=:10010`（.env.example 已注明）。
+- **领域注册表**：`domain_profile` 复用 global_knowledge（零新表）；dispatcher `SetDomainProfileHook` 按文件路径重叠匹配 + 冷复活种子注入（stat 剔除已删文件）；`QueryBlockMemoryByDomain` 按 task_domain 成链召回；PROJECT.md DomainPartition 作种子导入（source="project_md"）。
+- **install.ps1**：交互填 OPENAI_API_KEY（占位符跳过）+ 自动生成 BMA_API_TOKEN + 启动后探活 /api/health 与 /api/capabilities。**改任何 .ps1 必须保持 UTF-8 BOM**（PowerShell 5.1 无 BOM 按 ANSI/GBK 解析中文直接报 tokenizer 错误）。
+- **CI**：`.github/workflows/ci.yml` push/PR 即跑 backend vet+test 与 web 构建；nightly PG+Redis integration job 待 test/ 模块重建 Go 套件后再补（现零 Go 测试文件，见 Tests 节）。

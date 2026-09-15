@@ -2,8 +2,8 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import type { Session, AgentNode, TrustMode } from '@/types'
-import { setTrustMode } from '@/api/session'
+import type { Session, AgentNode, TrustMode, SessionGear } from '@/types'
+import { setTrustMode, setSessionGear } from '@/api/session'
 
 const props = defineProps<{
   session: Session | null
@@ -29,6 +29,27 @@ async function onTrustModeChange(mode: TrustMode) {
     ElMessage.success(`信任模式已切换为 ${mode}（下一工具调用生效）`)
   } catch (e) {
     ElMessage.error('切换信任模式失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+// 执行档位（TODO #14 三档控制）：auto=规则自动选 / fast=轻聊快答 / cluster=完整重装；
+// explore 预留未实现（禁用项）。手动切档任意向、原子即时生效；在飞子 Agent 不强杀，
+// 下轮按新档裁决（同 trustMode 语义）。本地值以会话快照回显（gear 空 = 未设置，显示 auto）。
+const gear = ref<SessionGear>('auto')
+watch(
+  () => props.session?.gear,
+  (g) => { gear.value = g === 'fast' || g === 'cluster' ? g : 'auto' },
+  { immediate: true }
+)
+
+async function onGearChange(v: SessionGear) {
+  if (!props.session) return
+  try {
+    await setSessionGear(props.session.id, v)
+    gear.value = v
+    ElMessage.success(`执行档位已切换为 ${v === 'auto' ? '自动' : v === 'fast' ? '快速' : '集群'}（即时生效）`)
+  } catch (e) {
+    ElMessage.error('切换执行档位失败：' + (e instanceof Error ? e.message : String(e)))
   }
 }
 
@@ -155,6 +176,15 @@ function nodeColor(type: string) {
         <el-option value="suggest" label="suggest 逐条审批" />
         <el-option value="auto-edit" label="auto-edit 审命令" />
         <el-option value="full-auto" label="full-auto 全自主" />
+      </el-select>
+      <!-- 执行档位三档下拉（TODO #14）：auto=规则自动选 / fast=轻聊快答 / cluster=完整重装；explore 预留 -->
+      <el-select v-if="session" :model-value="gear" size="small" class="!w-28 shrink-0"
+                 title="执行档位：快速档秒回轻聊，集群档完整重装；手动切换即时生效"
+                 @update:model-value="onGearChange($event as SessionGear)">
+        <el-option value="auto" label="自动选档" />
+        <el-option value="fast" label="快速档" />
+        <el-option value="cluster" label="集群档" />
+        <el-option value="explore" label="探索（即将上线）" disabled />
       </el-select>
     </div>
 

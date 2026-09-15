@@ -1,5 +1,6 @@
 <script setup lang="ts">
-// AgentChatPanel.vue 单 Agent 完整对话面板 + 三态发送框（选中 Agent 的对话视图）。
+// AgentChatPanel.vue 单 Agent 完整对话面板 + 多态发送框（选中 Agent 的对话视图；
+// 执行中发送走邮箱排队 queued=true，P0-2 steering）。
 // 数据源：GET /sessions/:id/agents/:aid/messages（热层+PG 合并分页）+ POST .../message（用户直连）。
 // 轮询策略与面板其余部分一致（3s 增量 after_seq），不新增推送通道（设计 §5）。
 import { computed, onUnmounted, ref, watch } from 'vue'
@@ -131,7 +132,7 @@ function stopPolling() {
 startPolling()
 onUnmounted(stopPolling)
 
-/** 发送框三态（设计 §4 表）：waiting 可发 / 终态可发（复活）/ 其余禁用并说明原因。 */
+/** 发送框状态（设计 §4 表 + P0-2 steering 排队）：waiting/running/终态/热驻均可发，仅 paused/meta 禁用。 */
 const sendState = computed<'meta' | 'waiting' | 'running' | 'done' | 'paused' | 'idle'>(() => {
   const a = props.agent
   if (!a || a.inst_id === 'meta' || a.type === 'meta') return 'meta'
@@ -142,7 +143,10 @@ const sendState = computed<'meta' | 'waiting' | 'running' | 'done' | 'paused' | 
 })
 
 // idle（热驻待复用）可发：发送即唤醒热驻 Agent 续聊并刷新墙钟（后端 WakeIdleWithMessage）。
-const canSend = computed(() => sendState.value === 'waiting' || sendState.value === 'done' || sendState.value === 'idle')
+// running 可发（P0-2 steering）：消息入邮箱排队（后端 200{queued:true}），下一步生效。
+const canSend = computed(
+  () => sendState.value === 'waiting' || sendState.value === 'running' || sendState.value === 'done' || sendState.value === 'idle'
+)
 const placeholder = computed(() => {
   switch (sendState.value) {
     case 'waiting':
@@ -150,7 +154,7 @@ const placeholder = computed(() => {
     case 'done':
       return '发送将复活该 Agent 并以消息为增量输入重跑'
     case 'running':
-      return '正在执行任务——可中断或终止后再发'
+      return '正在执行任务——消息将排队入邮箱，下一步生效'
     case 'paused':
       return '已暂停——请到监控页恢复'
     case 'idle':
@@ -164,16 +168,22 @@ async function handleSend() {
   const agent = props.agent
   const content = draft.value.trim()
   if (!agent || !content || !canSend.value || sending.value) return
+  const state = sendState.value
   sending.value = true
   try {
-    await sendAgentMessage(props.sessionId, agent.inst_id, content)
+    const res = await sendAgentMessage(props.sessionId, agent.inst_id, content)
     draft.value = ''
-    ElMessage.success(sendState.value === 'done' ? '已请求复活重跑' : '已注入并唤醒')
+    // queued=true：Agent 执行中，消息已入邮箱排队（区别于等子返回时的立即注入）。
+    if (res.queued) {
+      ElMessage.success('已排队：Agent 执行中，消息将在下一步生效')
+    } else {
+      ElMessage.success(state === 'done' ? '已请求复活重跑' : '已注入并唤醒')
+    }
     emit('refresh')
-    // 立即拉一次：注入/复活产生的消息不必等下一个 3s 周期。
+    // 立即拉一次：注入/复活/排队留痕产生的消息不必等下一个 3s 周期。
     await pullIncrement()
   } catch (e) {
-    // 后端 409 = 状态竞态（如刚转入执行中），如实回显原因而非笼统失败。
+    // 后端 409 = 不可直连或注入失败竞态，如实回显原因而非笼统失败。
     ElMessage.error('发送失败：' + (e instanceof Error ? e.message : String(e)))
   } finally {
     sending.value = false

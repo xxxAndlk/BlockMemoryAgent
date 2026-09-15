@@ -104,25 +104,39 @@ func TestMessageAgentStateRouting(t *testing.T) {
 		svc, fm, tr, sid := newMessageAgentEnv(t)
 		svc.SetActivityEvidenceProvider(&fakeActivityEvidence{kind: "child_wait"})
 		registerNode(t, tr, sid, "child-1", orchestrator.StatusRunning)
-		if err := svc.MessageAgent(ctx, sid, "child-1", "看看进度"); err != nil {
-			t.Fatalf("waiting 注入应成功: %v", err)
+		queued, err := svc.MessageAgent(ctx, sid, "child-1", "看看进度")
+		if err != nil || !queued {
+			t.Fatalf("waiting 注入应成功且 queued=true: err=%v queued=%v", err, queued)
 		}
 		if len(fm.injected) != 1 || fm.injected[0] != "child-1" || fm.contents[0] != "看看进度" {
 			t.Fatalf("注入分支不符: %+v", fm)
 		}
 	})
 
-	// 分支 2：running（非 child_wait）→ ErrAgentBusy。
-	t.Run("running_busy", func(t *testing.T) {
+	// 分支 2：running（非 child_wait）→ 邮箱排队（P0-2 steering，TODO #14 T8）：
+	// 不再 409 拒绝，queued=true + 注入触达；ErrAgentBusy 保留给注入失败路径。
+	t.Run("running_queue", func(t *testing.T) {
 		svc, fm, tr, sid := newMessageAgentEnv(t)
 		svc.SetActivityEvidenceProvider(&fakeActivityEvidence{kind: "tool:ReadFile"})
 		registerNode(t, tr, sid, "child-2", orchestrator.StatusRunning)
-		err := svc.MessageAgent(ctx, sid, "child-2", "在吗")
-		if !errors.Is(err, ErrAgentBusy) {
-			t.Fatalf("running 应 ErrAgentBusy, got %v", err)
+		queued, err := svc.MessageAgent(ctx, sid, "child-2", "在吗")
+		if err != nil || !queued {
+			t.Fatalf("running 应排队成功: err=%v queued=%v", err, queued)
 		}
-		if len(fm.injected) != 0 || len(fm.revived) != 0 {
-			t.Fatal("running 分支不应触达 messenger")
+		if len(fm.injected) != 1 || fm.injected[0] != "child-2" || fm.contents[0] != "在吗" {
+			t.Fatalf("排队分支应注入邮箱: %+v", fm)
+		}
+	})
+
+	// 分支 2b：排队注入失败 → ErrAgentBusy（哨兵保留给注入失败路径）。
+	t.Run("running_inject_fail_busy", func(t *testing.T) {
+		svc, fm, tr, sid := newMessageAgentEnv(t)
+		svc.SetActivityEvidenceProvider(&fakeActivityEvidence{kind: "tool:ReadFile"})
+		registerNode(t, tr, sid, "child-2b", orchestrator.StatusRunning)
+		fm.injectErr = errors.New("mailbox closed")
+		_, err := svc.MessageAgent(ctx, sid, "child-2b", "在吗")
+		if !errors.Is(err, ErrAgentBusy) {
+			t.Fatalf("注入失败应 ErrAgentBusy, got %v", err)
 		}
 	})
 
@@ -138,8 +152,9 @@ func TestMessageAgentStateRouting(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, fm, tr, sid := newMessageAgentEnv(t)
 			registerNode(t, tr, sid, "child-3", tc.status)
-			if err := svc.MessageAgent(ctx, sid, "child-3", "返工一下"); err != nil {
-				t.Fatalf("终态复活应成功: %v", err)
+			queued, err := svc.MessageAgent(ctx, sid, "child-3", "返工一下")
+			if err != nil || queued {
+				t.Fatalf("终态复活应即时投递: err=%v queued=%v", err, queued)
 			}
 			if len(fm.revived) != 1 || fm.revived[0].ID != "child-3" || fm.contents[0] != "返工一下" {
 				t.Fatalf("复活分支不符: %+v", fm)
@@ -158,8 +173,9 @@ func TestMessageAgentStateRouting(t *testing.T) {
 	t.Run("idle_wake", func(t *testing.T) {
 		svc, fm, tr, sid := newMessageAgentEnv(t)
 		registerNode(t, tr, sid, "child-4", orchestrator.StatusIdle)
-		if err := svc.MessageAgent(ctx, sid, "child-4", "喂"); err != nil {
-			t.Fatalf("idle 唤醒应成功: %v", err)
+		queued, err := svc.MessageAgent(ctx, sid, "child-4", "喂")
+		if err != nil || queued {
+			t.Fatalf("idle 唤醒应成功且 queued=false: err=%v queued=%v", err, queued)
 		}
 		if len(fm.woken) != 1 || fm.woken[0] != "child-4" || fm.contents[0] != "喂" {
 			t.Fatalf("idle 分支应走 WakeIdleWithMessage: %+v", fm)
@@ -170,7 +186,7 @@ func TestMessageAgentStateRouting(t *testing.T) {
 	t.Run("paused_reject", func(t *testing.T) {
 		svc, fm, tr, sid := newMessageAgentEnv(t)
 		registerNode(t, tr, sid, "child-4", orchestrator.StatusPaused)
-		err := svc.MessageAgent(ctx, sid, "child-4", "喂")
+		_, err := svc.MessageAgent(ctx, sid, "child-4", "喂")
 		if !errors.Is(err, ErrInvalidSessionState) {
 			t.Fatalf("paused 应 ErrInvalidSessionState, got %v", err)
 		}
@@ -183,10 +199,10 @@ func TestMessageAgentStateRouting(t *testing.T) {
 	t.Run("meta_and_empty_reject", func(t *testing.T) {
 		svc, fm, tr, sid := newMessageAgentEnv(t)
 		registerNode(t, tr, sid, "child-5", orchestrator.StatusDone)
-		if err := svc.MessageAgent(ctx, sid, "meta", "喂"); !errors.Is(err, ErrInvalidSessionState) {
+		if _, err := svc.MessageAgent(ctx, sid, "meta", "喂"); !errors.Is(err, ErrInvalidSessionState) {
 			t.Fatalf("meta 应拒绝, got %v", err)
 		}
-		if err := svc.MessageAgent(ctx, sid, "child-5", "   "); err == nil {
+		if _, err := svc.MessageAgent(ctx, sid, "child-5", "   "); err == nil {
 			t.Fatal("空 content 应参数错")
 		}
 		if len(fm.injected) != 0 || len(fm.revived) != 0 {
@@ -199,7 +215,7 @@ func TestMessageAgentStateRouting(t *testing.T) {
 		svc, _, tr, sid := newMessageAgentEnv(t)
 		svc.SetActivityEvidenceProvider(&fakeActivityEvidence{kind: "child_wait"})
 		registerNode(t, tr, sid, "child-6", orchestrator.StatusRunning)
-		if err := svc.MessageAgent(ctx, sid, "child-6", "留痕检查"); err != nil {
+		if _, err := svc.MessageAgent(ctx, sid, "child-6", "留痕检查"); err != nil {
 			t.Fatalf("注入应成功: %v", err)
 		}
 		svc.store.mu.RLock()

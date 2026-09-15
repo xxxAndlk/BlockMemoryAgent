@@ -209,3 +209,37 @@ func TestLightweightResolution(t *testing.T) {
 		t.Fatalf("expected direct deepseek-v4-flash, got src=%q model=%q", src, m.Model)
 	}
 }
+
+// TestChatRoleResolution 验证 chat 固定角色（TODO #14 T6 D-1 模型随档）按自身配置解析：
+// resolveConfig 走 default 分支 GetFixedRole——chat 用 roles.yaml 里配的快模型
+//（ark-deepseek-v4-flash 等），不得回落 DomainAgent 的重模型；行为参数（temperature/
+// thinking）同源角色配置。
+func TestChatRoleResolution(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "glm-5.2"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "chat", ModelConfig: types.AgentModelConfig{Provider: "volcengine", Model: "deepseek-v4-flash", Temperature: 0.3, Thinking: "low"}},
+		},
+	}
+	f := NewModelFactory(cfg)
+
+	m, err := f.resolveConfig("chat")
+	if err != nil {
+		t.Fatalf("resolveConfig(chat): %v", err)
+	}
+	if m.Model != "deepseek-v4-flash" || m.Provider != "volcengine" {
+		t.Fatalf("chat should resolve its own fast model, got provider=%q model=%q", m.Provider, m.Model)
+	}
+	if m.Temperature != 0.3 || m.Thinking != "low" {
+		t.Fatalf("chat behavior params should come from role config, got temp=%v thinking=%q", m.Temperature, m.Thinking)
+	}
+
+	// 对照：同工厂下 domain 仍解析 DomainAgent 配置——随档互不串味。
+	d, err := f.resolveConfig("domain")
+	if err != nil {
+		t.Fatalf("resolveConfig(domain): %v", err)
+	}
+	if d.Model != "glm-5.2" {
+		t.Fatalf("domain should stay on its own model, got %q", d.Model)
+	}
+}

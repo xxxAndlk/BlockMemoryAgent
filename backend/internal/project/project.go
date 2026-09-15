@@ -249,10 +249,11 @@ func EnsureProjectDoc(ctx context.Context, workDir string, cls DomainClassifier)
 
 // writeFresh 首次生成 PROJECT.md：managed 区 + 人手补充提示脚注。
 func writeFresh(ctx context.Context, workDir string, cls DomainClassifier) error {
-	body, err := scanProject(ctx, workDir, cls)
+	body, domains, err := scanProject(ctx, workDir, cls)
 	if err != nil {
 		return err
 	}
+	seedDomainProfiles(ctx, workDir, domains)
 	content := ManagedBegin + "\n" + body + "\n" + ManagedEnd + "\n\n" +
 		"<!-- 标记区外可写人手补充；RefreshProjectDoc 只重写上方 managed 区，不覆盖本提示以下内容。 -->\n"
 	return os.WriteFile(ProjectDocPath(workDir), []byte(content), 0o644)
@@ -265,10 +266,11 @@ func RefreshProjectDoc(ctx context.Context, workDir string, cls DomainClassifier
 	if workDir == "" {
 		return fmt.Errorf("workDir is empty")
 	}
-	body, err := scanProject(ctx, workDir, cls)
+	body, domains, err := scanProject(ctx, workDir, cls)
 	if err != nil {
 		return err
 	}
+	seedDomainProfiles(ctx, workDir, domains)
 	p := ProjectDocPath(workDir)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return fmt.Errorf("mkdir .bma: %w", err)
@@ -292,6 +294,46 @@ func rebuildManaged(existing, body string) string {
 		return before + managedBlock + after
 	}
 	return managedBlock + "\n\n" + existing
+}
+
+// DomainSeed 是 PROJECT.md 生成/刷新后产生的领域档案种子（TODO #17 T26）：
+// 领域分区名 + 职责描述 + 影响文件清单（工作目录相对路径）。
+type DomainSeed struct {
+	Name    string
+	Purpose string
+	Files   []string
+}
+
+// domainSeedHook 领域档案种子回调（TODO #17 T26）：EnsureProjectDoc/RefreshProjectDoc
+// 成功产生领域分区后调用，bootstrap 接 KnowledgeStore.UpsertDomainProfile（source=project_md），
+// 把项目结构里解析出的领域预先登记进领域注册表（跨场景冷复用的冷启动种子）。
+// 包级钩子是刻意取舍：Ensure/Refresh 有 4 个调用点（agent 层×2 + tool 层×2），
+// 逐层穿针会污染 tool.Executor 与 agent service 的构造签名；project 是底层叶子包，
+// 钩子由 bootstrap 装配期一次性设置，运行期不可变。
+var domainSeedHook func(ctx context.Context, workDir string, seeds []DomainSeed)
+
+// SetDomainSeedHook 设置领域档案种子回调（TODO #17 T26）；nil 关闭。装配期调用一次。
+func SetDomainSeedHook(fn func(ctx context.Context, workDir string, seeds []DomainSeed)) {
+	domainSeedHook = fn
+}
+
+// seedDomainProfiles 在 PROJECT.md 生成/刷新成功后触发种子回调（best-effort：回调
+// 内部自行容错；分区为空或未接线时零开销）。
+func seedDomainProfiles(ctx context.Context, workDir string, domains []domainInfo) {
+	if domainSeedHook == nil || len(domains) == 0 {
+		return
+	}
+	seeds := make([]DomainSeed, 0, len(domains))
+	for _, d := range domains {
+		if strings.TrimSpace(d.Name) == "" {
+			continue
+		}
+		seeds = append(seeds, DomainSeed{Name: d.Name, Purpose: d.Purpose, Files: d.Files})
+	}
+	if len(seeds) == 0 {
+		return
+	}
+	domainSeedHook(ctx, workDir, seeds)
 }
 
 // LoadProjectDoc 读取 managed 区正文供注入系统提示词。缺失或无标记返回空串。
@@ -323,15 +365,16 @@ type domainInfo struct {
 	Entry     string
 }
 
-// scanProject 启发式扫描 workDir，返回 managed 区正文（不含标记）。
-func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (string, error) {
+// scanProject 启发式扫描 workDir，返回 managed 区正文（不含标记）与领域分区列表
+//（TODO #17 T26 领域档案种子导入用）。
+func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (string, []domainInfo, error) {
 	abs, err := filepath.Abs(filepath.Clean(workDir))
 	if err != nil {
 		abs = workDir
 	}
 	entries, err := os.ReadDir(abs)
 	if err != nil {
-		return "", fmt.Errorf("read workDir %s: %w", abs, err)
+		return "", nil, fmt.Errorf("read workDir %s: %w", abs, err)
 	}
 
 	var b strings.Builder
@@ -400,7 +443,7 @@ func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (str
 		}
 	}
 
-	return strings.TrimRight(b.String(), "\n"), nil
+	return strings.TrimRight(b.String(), "\n"), domains, nil
 }
 
 // outlineExts 是需要抽取符号轮廓的源码扩展名（其余文件只列路径与行数意义不大，不注）。

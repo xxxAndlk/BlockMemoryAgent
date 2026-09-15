@@ -161,6 +161,21 @@ type Dispatcher struct {
 	// nil 或空串时零注入。
 	projectPrefs func(ctx context.Context) string
 
+	// sessionGear 会话档位只读回调（TODO #14 T22）：sessionID -> 当前档位
+	//（auto/fast/cluster）。热驻槽 enterIdle 固化档位、隐式复用解析按它裁决。
+	// 刻意用普通 func 而非 agent 包类型（与 projectPrefs 同风格）；nil 时空串、守卫放行。
+	sessionGearFn func(sessionID string) string
+
+	// domainProfilesFn 领域档案快照回调（TODO #17 T24）：ctx -> 全部未归档领域档案。
+	// 派发侧做名字/别名/路径匹配；nil 时档案匹配整体关闭。
+	domainProfilesFn func(ctx context.Context) []*DomainProfile
+	// domainMemoriesFn 领域记忆链回调（TODO #17 T24）：task_domain -> 最近 n 条块记忆正文。
+	// 仅档案命中后惰性调用；nil 时种子不含结论链。
+	domainMemoriesFn func(ctx context.Context, domain string, n int) []string
+	// domainProfileSinkFn 领域档案增量写入回调（TODO #17 T25）：块记忆收尾旁路
+	// 把 files_modified 并进档案文件清单；nil 时旁路关闭。
+	domainProfileSinkFn func(ctx context.Context, up DomainProfileUpdate)
+
 	// skillRecall 经验技能向量预答回调（2026-09-02 设计 §6.5）：task 文本 -> 提示行列表
 	//（「有相关经验技能 <name>——<title>，可 load_skill 查看」）。nil 时零注入。
 	skillRecall func(ctx context.Context, task string) []SkillHint
@@ -1338,6 +1353,21 @@ func (d *Dispatcher) WithProjectPreferences(fn func(ctx context.Context) string)
 	return d
 }
 
+// WithSessionGearResolver 注入会话档位只读回调（TODO #14 T22）：
+// bootstrap 接 agentSvc.SessionGear；enterIdle 固化与隐式复用裁决用。nil 时守卫全放行。
+func (d *Dispatcher) WithSessionGearResolver(fn func(sessionID string) string) *Dispatcher {
+	d.sessionGearFn = fn
+	return d
+}
+
+// sessionGearOf nil 安全读会话档位；回调未接线或返回空串均得空串（空=守卫放行）。
+func (d *Dispatcher) sessionGearOf(sessionID string) string {
+	if d.sessionGearFn == nil {
+		return ""
+	}
+	return d.sessionGearFn(sessionID)
+}
+
 // SkillHint 经验技能召回提示（设计 §6.5：只注一行提示，不注全文）。
 type SkillHint struct {
 	Name  string
@@ -2377,6 +2407,13 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		}
 	}
 
+	// 领域档案冷复活（TODO #17 T24）：热驻/同名复用未命中才走——档案只管跨会话冷复活。
+	// 名字（精确/别名）或路径（任务文本+spec 文件 ∩ 档案清单）命中 → domain 归一化到
+	// 档案正名 + 种子段（摘要/存活文件/既有结论链）拼进 task；未命中零改动自由命名。
+	if reuseAgentID == "" && roleID == "domain" {
+		task, domain = d.applyDomainProfileSeed(ctx, parentID, domain, task)
+	}
+
 	msg, warning := t.dispatcher.validateDispatchArgs(roleID, task, responsibility, mode, verifyKind, domain)
 	if reuseAgentID == "" && msg != "" {
 		return &tool.Result{Tool: "call_sub_agent", Error: msg, Category: tool.ResultCategoryValidationRejected}
@@ -2468,6 +2505,8 @@ func (d *Dispatcher) checkActiveSiblingDomain(ctx context.Context, parentID, dom
 // 实例同名、且池内槽健在时返回该槽 agent_id，调用方将其视同显式 reuse_agent_id 走
 // dispatchToIdleSlot——等效自动复用。仅精确同名；Running/Paused 不命中（仍走
 // checkActiveSiblingDomain 并行拒绝）；终态节点无热驻槽，天然不命中。
+// T22 档位守卫：槽 enterIdle 固化的档位与当前会话档位不符则跳过（不隐式接管旧档
+// 上下文）；槽 gear 为空（存量槽/回调未接线）或当前档位空时按匹配放行。
 // 背景（2026-08-27 派发死循环实证）：MetaAgent 叙述复用意图却漏传 reuse_agent_id
 // （整场 0 次），同名+空 responsibility 双错循环 8 连败；与其硬拒自纠，不如直接路由。
 // 注意必须在 validateDispatchArgs 之前解析——空 responsibility 会被参数校验先拒，
@@ -2492,8 +2531,18 @@ func (d *Dispatcher) resolveIdleSiblingReuse(ctx context.Context, parentID, doma
 		if n.ParentID != parentID || n.Role != "domain" || strings.TrimSpace(n.Domain) != domain {
 			continue
 		}
-		if n.Status == orchestrator.StatusIdle && d.pool.slot(sid, n.ID) != nil {
-			return n.ID
+		if n.Status == orchestrator.StatusIdle {
+			if slot := d.pool.slot(sid, n.ID); slot != nil {
+				// T22 档位守卫：热驻槽固化档位与会话当前档位不符时不隐式复用——
+				// 用户切档（如转快速档）后，不该静默吃到旧档攒下的热驻上下文。
+				// 槽 gear 为空（存量槽/回调未接线）或当前档位空=按匹配放行，防误杀。
+				if slotGear := slot.gearOf(); slotGear != "" {
+					if cur := d.sessionGearOf(sid); cur != "" && cur != slotGear {
+						continue
+					}
+				}
+				return n.ID
+			}
 		}
 	}
 	return ""
@@ -5053,6 +5102,13 @@ func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID,
 		CreatedAt:     time.Now(),
 	}
 	d.saveBlockRecord(ctx, rec, "block memory")
+	// 领域档案增量维护（TODO #17 T25）：files_modified 并进档案清单；
+	// 成功 outcome 才用本次结论接管档案摘要（失败/部分不值得刷新）。
+	summary := ""
+	if outcome == "success" {
+		summary = truncateRunes(strings.TrimSpace(content), 300)
+	}
+	d.bumpDomainProfile(ctx, taskDomain, filesModified, summary)
 }
 
 // saveFacts 把提取出的事实逐条落库，每条单独向量化以提升召回精度。
@@ -5060,6 +5116,12 @@ func (d *Dispatcher) saveRawBlockMemory(ctx context.Context, subAgentID, roleID,
 func (d *Dispatcher) saveFacts(ctx context.Context, subAgentID, roleID, parentID, taskDomain, goal string, facts []string, outcome string, filesModified []string) {
 	trimmedGoal := truncateRunes(strings.TrimSpace(goal), blockMemoryGoalMaxRunes)
 	sid := tool.SessionIDFromContext(ctx)
+	// 领域档案增量维护（TODO #17 T25）：整批事实写一次旁路（不随循环重复）。
+	summary := ""
+	if outcome == "success" && len(facts) > 0 {
+		summary = truncateRunes(strings.Join(facts, "；"), 300)
+	}
+	d.bumpDomainProfile(ctx, taskDomain, filesModified, summary)
 	for i, fact := range facts {
 		fact = strings.TrimSpace(fact)
 		if fact == "" {

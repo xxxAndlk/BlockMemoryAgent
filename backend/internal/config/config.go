@@ -21,6 +21,34 @@ type Config struct {
 	Memory   MemoryConfig   `yaml:"memory"`   // 记忆管线运行参数（批写/刷新/快照间隔）
 	Agent    AgentConfig    `yaml:"agent"`    // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
 	Logging  LoggingConfig  `yaml:"logging"`  // 日志文件输出（按天分割，按入口分文件）
+	Data     DataConfig     `yaml:"data"`     // 数据生命周期（陈旧知识归档/日志与工具输出保留期，TODO #18-2 T29）
+	Notify   NotifyConfig   `yaml:"notify"`   // 会话终态 Webhook 通知（TODO #18-5 T32）
+}
+
+// NotifyConfig 会话终态 Webhook 通知配置（TODO #18-5 T32）。
+type NotifyConfig struct {
+	// WebhookURL 通知目标地址；空=关闭（默认）。会话到达终态时 best-effort
+	// POST 一条 JSON（3s 超时，失败仅记日志）。
+	WebhookURL string `yaml:"webhook_url"`
+	// WebhookEvents 触发通知的会话终态列表，默认 [completed, error]
+	//（会话状态枚举值见 pkg/enums：running/completed/error/awaiting_clarify/...）。
+	WebhookEvents []string `yaml:"webhook_events"`
+}
+
+// DataConfig 数据生命周期配置（TODO #18-2 T29），时间以"天"为单位。
+// 语义约定：knowledge_archive_days 缺省 0=关（归档是数据保全动作，opt-in）；
+// 两个保留期 0=按默认开启、负数=关（日志/工具输出是可再生产物，默认清理防磁盘涨满）。
+type DataConfig struct {
+	// KnowledgeArchiveDays 陈旧知识归档阈值：block_memory/external_kb 中 last_accessed
+	// 早于 N 天的记录 archived=true（查询层已全局排除 archived，语义是"冷备不删"）。
+	// 0=关闭（默认），正数=开启。
+	KnowledgeArchiveDays int `yaml:"knowledge_archive_days"`
+	// LogRetentionDays 日志文件保留天数（logs/<entry>/YYYY-MM-DD.log 按文件 mtime 清理）。
+	// 0=默认 30 天；负数=关闭清理。
+	LogRetentionDays int `yaml:"log_retention_days"`
+	// ToolOutputsRetentionDays 工具输出全文落盘保留天数（<workDir>/.bma/tool_outputs）。
+	// 0=默认 14 天；负数=关闭清理。
+	ToolOutputsRetentionDays int `yaml:"tool_outputs_retention_days"`
 }
 
 // LoggingConfig 日志文件输出配置。
@@ -254,6 +282,15 @@ type AgentConfig struct {
 	// 非法值回落 full-auto。ctx 未携带模式时 Registry 仍按生产边界 + 危险命令规则兜底。
 	TrustMode string `yaml:"trust_mode"`
 
+	// DefaultGear 默认执行档位（TODO #14 会话三档控制）：会话创建时取此值为初始档，
+	// 会话内可经 API 随时切换（下一轮生效，随 session_history.meta_memory 持久化跨重启）。
+	// 取值：
+	//   - auto：自动选档（默认）——明确闲聊信号 → fast，其余一律 cluster（零回归）；
+	//   - fast：固定快速档（轻量对话角色，秒回）；
+	//   - cluster：固定集群档（Meta 全装编排，现行为）。
+	// 非法值回落 auto。explore 为设计预留档，暂不可配置。
+	DefaultGear string `yaml:"default_gear"`
+
 	// WorktreeEnabled worktree 隔离派发开关（TODO 第9项⑤/#10项⑤，默认 true）：允许
 	// call_sub_agent 携带 worktree=true 派发到 git worktree 副本——子 Agent 全部文件
 	// 写入落在副本（主目录零写入），成功收尾产出全量 patch，meta 经 merge_worktree
@@ -435,7 +472,15 @@ func (c *Config) applyDefaults() error {
 		return err
 	}
 	c.applyLoggingDefaults()
+	c.applyNotifyDefaults()
 	return nil
+}
+
+// applyNotifyDefaults 填充通知配置默认值：事件列表为空时默认 [completed, error]。
+func (c *Config) applyNotifyDefaults() {
+	if len(c.Notify.WebhookEvents) == 0 {
+		c.Notify.WebhookEvents = []string{"completed", "error"}
+	}
 }
 
 func (c *Config) applyPostgresDefaults() {
@@ -493,9 +538,13 @@ func (c *Config) applyRedisDefaults() {
 }
 
 func (c *Config) applyHTTPDefaults() error {
-	// -- HTTP 默认值：10010 端口、30 秒超时 --
+	// -- HTTP 默认值：本机回环 10010 端口、30 秒超时 --
+	// 默认只绑 127.0.0.1（TODO #18 T27）：API 有会话执行/文件写/审批等能力，默认
+	// ":10010" 会监听全部网卡把服务暴露到局域网。单机装机场景（install.ps1 + 本机
+	// 浏览器）够用；确需局域网/容器访问时显式配置 addr（如 ":10010" 或 "0.0.0.0:10010"）。
+	// 注意：docker 容器内跑服务端必须显式设 addr（回环地址容器外不可达）。
 	if c.HTTP.Addr == "" {
-		c.HTTP.Addr = ":10010"
+		c.HTTP.Addr = "127.0.0.1:10010"
 	}
 	if c.HTTP.ReadTimeout == 0 {
 		c.HTTP.ReadTimeout = 30
@@ -739,6 +788,13 @@ func (c *Config) applyAgentStandaloneDefaults() {
 	case "suggest", "auto-edit", "full-auto":
 	default:
 		c.Agent.TrustMode = "full-auto"
+	}
+	// 默认执行档位（TODO #14 会话三档控制）：空/非法值回落 auto（自动选档，
+	// 未知任务一律走 cluster——零回归）。
+	switch c.Agent.DefaultGear {
+	case "auto", "fast", "cluster":
+	default:
+		c.Agent.DefaultGear = "auto"
 	}
 	// worktree 隔离派发开关（TODO 第9项⑤）：nil（未配置）默认开启，显式 false 关闭。
 	if c.Agent.WorktreeEnabled == nil {

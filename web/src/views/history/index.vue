@@ -95,38 +95,78 @@ function duration(s: Session) {
     </div>
 
     <div class="flex-1 min-h-0 bg-card border border-line rounded-card overflow-hidden">
-      <el-table v-loading="loading" :data="rows" class="w-full" height="100%">
-        <el-table-column label="目标" min-width="280">
-          <template #default="{ row }">
-            <div class="font-bold text-sm truncate">{{ row.goal || '(无目标)' }}</div>
-            <div class="text-[11px] text-ink-3 font-mono">{{ row.id }}</div>
+      <!-- 桌面（≥768px）：表格原样 -->
+      <div class="hidden md:block h-full">
+        <el-table v-loading="loading" :data="rows" class="w-full" height="100%">
+          <el-table-column label="目标" min-width="280">
+            <template #default="{ row }">
+              <div class="font-bold text-sm truncate">{{ row.goal || '(无目标)' }}</div>
+              <div class="text-[11px] text-ink-3 font-mono">{{ row.id }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="110">
+            <template #default="{ row }">
+              <el-tag size="small" :type="statusTagType(row.status)" effect="plain">{{ statusText(row.status) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="工作目录" min-width="220">
+            <template #default="{ row }">
+              <span class="font-mono text-xs text-ink-2">{{ row.work_dir || '默认目录' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="开始时间" width="160">
+            <template #default="{ row }"><span class="text-xs text-ink-2">{{ fmt(row.started_at) }}</span></template>
+          </el-table-column>
+          <el-table-column label="耗时" width="100">
+            <template #default="{ row }"><span class="text-xs text-ink-2">{{ duration(row) }}</span></template>
+          </el-table-column>
+          <el-table-column width="80" align="right">
+            <template #default="{ row }">
+              <el-button size="small" link type="primary" @click="open(row)">打开</el-button>
+            </template>
+          </el-table-column>
+          <template #empty>
+            <div class="text-sm text-ink-3 py-10">暂无会话历史</div>
           </template>
-        </el-table-column>
-        <el-table-column label="状态" width="110">
-          <template #default="{ row }">
-            <el-tag size="small" :type="statusTagType(row.status)" effect="plain">{{ statusText(row.status) }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="工作目录" min-width="220">
-          <template #default="{ row }">
-            <span class="font-mono text-xs text-ink-2">{{ row.work_dir || '默认目录' }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="开始时间" width="160">
-          <template #default="{ row }"><span class="text-xs text-ink-2">{{ fmt(row.started_at) }}</span></template>
-        </el-table-column>
-        <el-table-column label="耗时" width="100">
-          <template #default="{ row }"><span class="text-xs text-ink-2">{{ duration(row) }}</span></template>
-        </el-table-column>
-        <el-table-column width="80" align="right">
-          <template #default="{ row }">
-            <el-button size="small" link type="primary" @click="open(row)">打开</el-button>
-          </template>
-        </el-table-column>
-        <template #empty>
-          <div class="text-sm text-ink-3 py-10">暂无会话历史</div>
-        </template>
-      </el-table>
+        </el-table>
+      </div>
+
+      <!-- 小屏（<768px，T33）：卡片化兜底——六列表格在手机上只剩横向滚动，
+           切成单列卡片（目标/状态/目录/时间堆叠），整卡可点打开 -->
+      <div v-loading="loading" class="md:hidden h-full overflow-y-auto">
+        <button
+          v-for="row in rows"
+          :key="row.id"
+          class="w-full text-left px-4 py-3 border-b border-line last:border-b-0 hover:bg-page transition-colors"
+          @click="open(row)"
+        >
+          <div class="flex items-start gap-2">
+            <div class="flex-1 min-w-0">
+              <div class="font-bold text-sm leading-5 line-clamp-2">{{ row.goal || '(无目标)' }}</div>
+              <div class="text-[11px] text-ink-3 font-mono truncate mt-0.5">{{ row.id }}</div>
+            </div>
+            <el-tag size="small" :type="statusTagType(row.status)" effect="plain" class="shrink-0 mt-0.5">
+              {{ statusText(row.status) }}
+            </el-tag>
+          </div>
+          <div class="flex items-center gap-2 mt-1.5 text-xs text-ink-3">
+            <span class="font-mono truncate min-w-0" :title="row.work_dir || ''">{{ row.work_dir || '默认目录' }}</span>
+            <span class="ml-auto shrink-0">{{ fmt(row.started_at) }}</span>
+            <span v-if="duration(row) !== '—'" class="shrink-0">· {{ duration(row) }}</span>
+          </div>
+        </button>
+        <div v-if="!loading && rows.length === 0" class="text-sm text-ink-3 py-10 text-center">暂无会话历史</div>
+      </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 小屏卡片目标两行截断（项目 Tailwind 版本未含 line-clamp，各视图自定义） */
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+</style>

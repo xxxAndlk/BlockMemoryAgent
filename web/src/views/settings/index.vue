@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { getHealth, getStatus, type HealthResponse, type StatusResponse } from '@/api/health'
+import { getCapabilities, getHealth, getStatus, type CapabilitiesResponse, type HealthResponse, type StatusResponse } from '@/api/health'
+import { notificationPermission, requestNotificationPermission } from '@/utils/notifications'
 import { useTheme } from '@/composables/useTheme'
 
 const { theme, toggleTheme } = useTheme()
@@ -14,10 +15,41 @@ const themeModel = computed<'light' | 'dark'>({
 const status = ref<StatusResponse | null>(null)
 const health = ref<HealthResponse | null>(null)
 
+// 能力自检（T28）：六类能力逐项 ok/缺失/修复提示，装机排障一屏看完
+const caps = ref<CapabilitiesResponse | null>(null)
+const capsLoading = ref(false)
+async function loadCaps() {
+  capsLoading.value = true
+  try { caps.value = await getCapabilities() } catch { caps.value = null } finally { capsLoading.value = false }
+}
+
 onMounted(async () => {
   try { status.value = await getStatus() } catch { status.value = null }
   try { health.value = await getHealth() } catch { health.value = null }
+  void loadCaps()
 })
+
+// 能力名 → 展示名（其余原样直出）
+const capLabels: Record<string, string> = {
+  llm: 'LLM 模型',
+  postgres: 'Postgres',
+  redis: 'Redis',
+  embed: '向量嵌入',
+  plugins: '插件',
+  workdir: '工作目录',
+}
+
+// 浏览器通知权限（T32）：页面在后台时收会话终态提醒
+const perm = ref(notificationPermission())
+async function askPermission() {
+  perm.value = await requestNotificationPermission()
+}
+const permLabel = computed(() => ({
+  unsupported: '当前浏览器不支持',
+  default: '未授权',
+  granted: '已授权',
+  denied: '已禁止（需在浏览器站点设置里恢复）',
+}[perm.value] || perm.value))
 
 function dot(service?: { online?: boolean }) {
   return service?.online ? 'bg-green-500' : 'bg-red-500'
@@ -63,6 +95,42 @@ function dot(service?: { online?: boolean }) {
               <span class="text-xs text-ink-3">{{ (health as any)?.[svc.key]?.detail || '未知' }}</span>
             </span>
           </div>
+        </div>
+      </div>
+
+      <!-- 装机能力自检（T28）：ok 绿点 + 现状；失败红点 + 缺失项 + 可行动修复提示 -->
+      <div class="bg-card border border-line rounded-card p-5">
+        <div class="flex justify-between items-center mb-3">
+          <div class="font-bold text-sm">能力自检</div>
+          <el-button size="small" text :loading="capsLoading" @click="loadCaps">重新检测</el-button>
+        </div>
+        <template v-if="caps">
+          <div class="text-sm space-y-2">
+            <div v-for="it in caps.items" :key="it.name" class="flex items-start justify-between gap-3">
+              <span class="text-ink-2 shrink-0">{{ capLabels[it.name] || it.name }}</span>
+              <span class="flex items-start gap-2 text-right">
+                <span class="flex flex-col items-end gap-0.5">
+                  <span class="text-xs text-ink-3">{{ it.detail || (it.ok ? '就绪' : '未就绪') }}</span>
+                  <span v-if="!it.ok && it.hint" class="text-[11px] text-amber-600 dark:text-amber-400 leading-5">{{ it.hint }}</span>
+                </span>
+                <span class="w-2 h-2 rounded-full inline-block mt-1.5 shrink-0" :class="it.ok ? 'bg-green-500' : 'bg-red-500'"></span>
+              </span>
+            </div>
+          </div>
+        </template>
+        <p v-else class="text-xs text-ink-3">能力自检不可用（接口请求失败或服务未启动）。</p>
+      </div>
+
+      <!-- 浏览器通知（T32）：页面在后台时收会话终态提醒 -->
+      <div class="bg-card border border-line rounded-card p-5">
+        <div class="flex justify-between items-center">
+          <div>
+            <div class="font-bold text-sm mb-1">桌面通知</div>
+            <p class="text-xs text-ink-3 leading-5">页面切到后台时，会话完成/失败弹出系统级提醒；前台使用不打扰。权限状态：{{ permLabel }}</p>
+          </div>
+          <el-button v-if="perm === 'default'" size="small" type="primary" plain @click="askPermission">申请权限</el-button>
+          <el-tag v-else-if="perm === 'granted'" size="small" type="success" effect="plain">已开启</el-tag>
+          <el-tag v-else size="small" type="info" effect="plain">不可用</el-tag>
         </div>
       </div>
 

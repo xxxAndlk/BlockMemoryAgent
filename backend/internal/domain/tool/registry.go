@@ -219,6 +219,9 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	// 注册 ask_user 工具（TODO #24 人在回路）；hook 在 SetAskUserHook 注入后生效。
 	// 注册始终发生，使 Schema 中可见；调用时 hook 未注入返回错误。
 	r.Register(&askUserTool{})
+	// 注册 escalate_gear 工具（TODO #14 T7 档位升级）；hook 在 SetEscalateGearHook 注入后生效。
+	// 注册始终发生，使 Schema 中可见（roles.yaml 白名单按角色挑选）；调用时 hook 未注入返回错误。
+	r.Register(&escalateGearTool{})
 	// 注册 remember_preference 工具（TODO #28 用户画像）；hook 在 SetUserProfileHook 注入后生效。
 	r.Register(&rememberPreferenceTool{})
 	// 注册 search_knowledge 工具（TODO #27 外部知识库）；hook 在 SetKnowledgeSearchHook 注入后生效。
@@ -325,6 +328,17 @@ func (r *Registry) toolByName(name string) (Tool, bool) {
 func (r *Registry) Has(name string) bool {
 	_, ok := r.toolByName(name)
 	return ok
+}
+
+// ToolNames 返回全部已注册工具的标准名（按注册顺序，只取名字不构建 Schema）。
+// 供角色工具硬门闭包（SetRoleToolGateResolver）廉价枚举注册表全集后按插件可见性
+// 求并集——Schema() 每次重建全部工具的 JSON Schema，放每次 Dispatch 的硬门路径太贵。
+func (r *Registry) ToolNames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, len(r.schemaOrder))
+	copy(out, r.schemaOrder)
+	return out
 }
 
 // WorkDir 返回 Executor 的工作目录，供 ReActAgent 在系统提示词中注入环境信息。
@@ -1065,9 +1079,9 @@ func (r *Registry) Schema() []tools.Tool {
 	// 编辑纪律（2026-08-31 实证）：域 Agent 修改已有文件 90 次全走 WriteFile 整写
 	// （EditFile 仅 3 次），单轮流式输出 30-64K token 拖慢 5-22 分钟/轮。修改已有
 	// 文件一律 EditFile 局部替换；WriteFile 限新建文件与整文件重写。
-	if t, err := tools.NewFunc("WriteFile", "新建文件（整文件写入）。**修改已存在的文件禁止用本工具**：一律用 EditFile 局部替换（只输出改动片段，省 token 且快）；仅当改动面覆盖文件大半时才允许 WriteFile 整写。content 必须是文件的**完整内容**--绝不允许只发修改片段（只发片段会把原文件整文件覆盖为片段，造成数据丢失）。若文件仅作为临时产物使用（例如运行脚本、中间分析、一次性计算），请设置 temporary=true，文件会写入会话级临时目录并在会话结束后自动清理；用户明确要求保留的文件请保持 temporary=false（默认）。极端缩小（新内容 < 原文件 10% 且原文件 >= 5KB）默认拒收，确为有意精简时加 confirm_shrink=true 绕过。", func(ctx context.Context, in writeFileInput) (string, error) {
-		// 转发到内部 WriteFile 工具，包含路径、内容和 temporary/confirm_shrink 标志。
-		res, _ := r.Dispatch(ctx, "WriteFile", map[string]any{"path": in.Path, "content": in.Content, "temporary": in.Temporary, "confirm_shrink": in.ConfirmShrink})
+	if t, err := tools.NewFunc("WriteFile", "新建文件（整文件写入）。**修改已存在的文件禁止用本工具**：一律用 EditFile 局部替换（只输出改动片段，省 token 且快）；仅当改动面覆盖文件大半时才允许 WriteFile 整写。content 必须是文件的**完整内容**--绝不允许只发修改片段（只发片段会把原文件整文件覆盖为片段，造成数据丢失）。若文件仅作为临时产物使用（例如运行脚本、中间分析、一次性计算），请设置 temporary=true，文件会写入会话级临时目录并在会话结束后自动清理；用户明确要求保留的文件请保持 temporary=false（默认）。极端缩小（新内容 < 原文件 10% 且原文件 >= 5KB）默认拒收，确为有意精简时加 confirm_shrink=true 绕过。覆盖已有文件时建议带 expected_mtime（ReadFile 分页头 mtime=... 原值）：文件在读取后被其他 Agent/进程改过会拒收并提示重读，防并发覆盖。", func(ctx context.Context, in writeFileInput) (string, error) {
+		// 转发到内部 WriteFile 工具，包含路径、内容与 temporary/confirm_shrink/expected_mtime 标志。
+		res, _ := r.Dispatch(ctx, "WriteFile", map[string]any{"path": in.Path, "content": in.Content, "temporary": in.Temporary, "confirm_shrink": in.ConfirmShrink, "expected_mtime": in.ExpectedMtime})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
 	}); err == nil {
@@ -1075,9 +1089,9 @@ func (r *Registry) Schema() []tools.Tool {
 	}
 	// 注册 EditFile 工具：精确局部替换（TODO #49）。
 	// 修改已有文件的首选方式（对齐 Claude Code Edit 惯例）；仅新建文件走 WriteFile。
-	if t, err := tools.NewFunc("EditFile", "修改已存在文件的首选方式：精确局部替换，只改指定片段，不重写整个文件（输出 token 与耗时仅为整文件重写的零头）。old_string 必须与文件现有内容逐字符一致（含缩进/空格；行尾 \\r\\n 与 \\n 视为等价），默认须唯一匹配，多处匹配会报错；确需全部替换时传 replace_all=true。定位片段前可先 ReadFile 该文件的目标行段（用 offset/limit 只读相关区间，不必整读大文件）。匹配失败返回错误并附文件开头片段供自查，不会改动文件；多处匹配时在 old_string 中多带几行上下文使其唯一。新建文件用 WriteFile；改动面确实覆盖文件大半时才整写。EditFile 与 WriteFile 同等触发共享记忆/spec 失效与 .bma/snapshots 备份。", func(ctx context.Context, in editFileInput) (string, error) {
-		// 转发到内部 EditFile 工具，包含路径、old_string/new_string 与 replace_all 标志。
-		res, _ := r.Dispatch(ctx, "EditFile", map[string]any{"path": in.Path, "old_string": in.OldString, "new_string": in.NewString, "replace_all": in.ReplaceAll})
+	if t, err := tools.NewFunc("EditFile", "修改已存在文件的首选方式：精确局部替换，只改指定片段，不重写整个文件（输出 token 与耗时仅为整文件重写的零头）。old_string 必须与文件现有内容逐字符一致（含缩进/空格；行尾 \\r\\n 与 \\n 视为等价），默认须唯一匹配，多处匹配会报错；确需全部替换时传 replace_all=true。定位片段前可先 ReadFile 该文件的目标行段（用 offset/limit 只读相关区间，不必整读大文件）。匹配失败返回错误并附文件开头片段供自查，不会改动文件；多处匹配时在 old_string 中多带几行上下文使其唯一。新建文件用 WriteFile；改动面确实覆盖文件大半时才整写。多 Agent 并行编辑同一文件时建议带 expected_mtime（ReadFile 分页头 mtime=... 原值）：文件在读取后被他人改过会拒收并提示重读，防并发覆盖。EditFile 与 WriteFile 同等触发共享记忆/spec 失效与 .bma/snapshots 备份。", func(ctx context.Context, in editFileInput) (string, error) {
+		// 转发到内部 EditFile 工具，包含路径、old_string/new_string、replace_all 与 expected_mtime。
+		res, _ := r.Dispatch(ctx, "EditFile", map[string]any{"path": in.Path, "old_string": in.OldString, "new_string": in.NewString, "replace_all": in.ReplaceAll, "expected_mtime": in.ExpectedMtime})
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
 	}); err == nil {
