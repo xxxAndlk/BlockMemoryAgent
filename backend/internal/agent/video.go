@@ -63,6 +63,8 @@ type VideoOptions struct {
 // DefaultVideoOptions 返回带默认值的 VideoOptions。
 func DefaultVideoOptions() VideoOptions {
 	return VideoOptions{
+		FFmpegBin:         "ffmpeg",
+		FFprobeBin:        "ffprobe",
 		MaxVideoBytes:     DefaultMaxVideoBytes,
 		FrameCount:        6,
 		FrameMaxPixels:    1024,
