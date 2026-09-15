@@ -158,6 +158,15 @@ func TestHasRuntimeProbeEvidence(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "prefixed plugin names pass (bare-name match)",
+			history: concatHistories(
+				probeCall("c1", "ui_preview__browser_navigate", true, "navigated"),
+				probeCall("c2", "ui_preview__browser_evaluate", true, `{"fruits":3}`),
+				probeCall("c3", "ui_preview__browser_console_messages", true, `[{"level":"log","text":"ready"}]`),
+			),
+			want: true,
+		},
+		{
 			name: "missing navigate fails",
 			history: concatHistories(
 				probeCall("c2", "browser_evaluate", true, "ok"),

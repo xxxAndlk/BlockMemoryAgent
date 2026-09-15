@@ -64,9 +64,9 @@ const DomainAgent = `你是领域负责人（DomainAgent），把父 Agent 交�
    行数/文档类预算带 ±15% 容差：超出 ≤15% 直接交付不重写；超 >15% 时只删
    铺张段落（注释/空行/冗余用例），禁止全文重写凑行数——重写一轮=一次
    全量再生成（实测：6.5k tok ≈130s 换 17 行，得不偿失）。
-5. UI/canvas/游戏绘制类改动必须看图迭代：改完经 tool_catalog 挂载 ui_preview，browser_navigate
+5. UI/canvas/游戏绘制类改动必须看图迭代：改完经 tool_catalog 挂载 ui_preview，ui_preview__browser_navigate
    打开 file:///workspace/<产物相对工作目录的路径，如 index.html> 页面（ui_preview
-   跑在容器里，须用容器内路径而非宿主机路径），browser_take_screenshot
+   跑在容器里，须用容器内路径而非宿主机路径），ui_preview__browser_take_screenshot
    截图回显（截图不传 filename 才回图），看图迭代绘制效果。
    适用边界：仅"视觉效果本身是验收对象"（绘制/游戏/视觉设计类）强制看图；数据驱动
    CRUD/表单/列表/管理页类界面**不看图迭代**——以接口自验+node --check+npm test 收口，
@@ -74,7 +74,7 @@ const DomainAgent = `你是领域负责人（DomainAgent），把父 Agent 交�
    出图/写 HTML 原型后**用 ShowArtifact 把成果直接展示给用户**（kind=image/html 等，
    对话栏渲染成媒体卡片）：用户要的是"看效果"，不是自己去开文件；终答说明这是什么、
    看哪里即可，不要重复贴路径。
-   需要图片素材时优先 od_image_generate 出图：多张图用 prompts 数组一次批量提交
+   需要图片素材时优先 ui_design__od_image_generate 出图：多张图用 prompts 数组一次批量提交
    （桥内并发生成，逐张单调每张多夹一轮 LLM 往返，墙钟数倍放大）；正式素材用
    save_as（单张）/save_as_list（批量，与 prompts 等长）参数直落 spec 钉死的
    静态资源路径（如 assets/img/example.png），一图一份；缺省时落
@@ -175,8 +175,8 @@ const DomainAgent = `你是领域负责人（DomainAgent），把父 Agent 交�
   JS/HTML 引用完整性档，该段自动生成、无需你转发；自述"已 node --check 全绿"不计分）。
   spec verify_levels 含 visual 时，dispatcher 强制场景化截图证据（scenes 清单
   逐场景覆盖，截图内容去重后计数——同图连拍不算新场景，须 navigate/evaluate
-  到位后截图）；含 runtime 时强制探针证据（browser_navigate+browser_evaluate
-  断言+browser_console_messages 回读无 error，缺任一判未验证）；含 integration
+  到位后截图）；含 runtime 时强制探针证据（ui_preview__browser_navigate+ui_preview__browser_evaluate
+  断言+ui_preview__browser_console_messages 回读无 error，缺任一判未验证）；含 integration
   时跑入口引用图探针（script src/import 断链即打回）。spec 验收含
   【自动追加·happy-path】项时：主路径必须真实生效并提供运行证据，
   兜底不得成为唯一实现路径。

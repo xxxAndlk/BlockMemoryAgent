@@ -1014,6 +1014,10 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 	}
 	// 在内存中创建会话对象（携带每会话工作目录，空=进程默认）。
 	sess := s.store.createSession(goal, req.WorkDir)
+	// 显式初始档位（TODO #14 新会话页选档）：合法枚举覆盖 store 默认档，其余回落默认。
+	if tool.ValidGear(req.Gear) {
+		sess.setGear(req.Gear)
+	}
 	// 首条消息携带的用户图片（Alt+V 粘贴）：runSession 注入 runCtx 后一次性消费。
 	sess.firstTurnImages = append(req.Images, frames...)
 	s.maybeWatchWallClock(sess)

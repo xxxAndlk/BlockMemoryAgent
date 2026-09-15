@@ -133,6 +133,9 @@ type CreateRequest struct {
 	// Videos 首条消息携带的视频（Alt+V 粘贴视频文件）：CreateSession 内抽帧
 	// 并入 Images、元数据文本并入 Goal，Videos 本身不持久化。
 	Videos []WireVideo
+	// Gear 显式指定初始执行档位（TODO #14 新会话页选档）：合法枚举（auto|fast|cluster）
+	// 覆盖 config agent.default_gear；空/非法 = 回落默认。HTTP 层负责 400 校验。
+	Gear string
 }
 
 // ResumeRequest 表示恢复一个此前暂停或已结束的会话。

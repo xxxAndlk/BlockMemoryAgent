@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage } from '@/types'
+import type { Session, SessionSummary, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear } from '@/types'
 import { isAssistantTextEvent, isToolCallEvent, isUserMessageEvent, clarifyArtifactsFromFrame } from '@/types'
 import {
   createSession,
@@ -383,7 +383,7 @@ function startStream(s: Session) {
   })
 }
 
-async function handleSubmit(content: string, images: WireImage[] = []) {
+async function handleSubmit(content: string, images: WireImage[] = [], gear: SessionGear = 'auto') {
   if (!content.trim() && !images.length) return
   sending.value = true
   try {
@@ -433,8 +433,8 @@ async function handleSubmit(content: string, images: WireImage[] = []) {
       }
       return
     }
-    // 3) 无选中会话 → 创建新会话
-    const s = await createSession(content, images, workDir.value || undefined)
+    // 3) 无选中会话 → 创建新会话（携带创建时选档，后端非法值 400）
+    const s = await createSession(content, images, workDir.value || undefined, gear)
     setWorkDir(workDir.value)
     sessions.value.unshift(s)
     router.replace({ path: '/session', query: { id: s.id } })
@@ -587,7 +587,7 @@ async function handleNewSession() {
 
 /** 会话列表状态文案：用户主动"终止"的单列"已终止"（后端落 error + Result=cancelled by user），
  *  否则与真失败同标"失败"，用户会以为是自己点终止点坏了。 */
-function sessionStatusLabel(s: Session): string {
+function sessionStatusLabel(s: SessionSummary): string {
   if (s.status === 'error' && (s.result || '').includes('cancelled by user')) return '已终止'
   return statusText(s.status)
 }

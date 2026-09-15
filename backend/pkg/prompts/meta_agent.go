@@ -188,7 +188,7 @@ set_agent_model(domain, 更合适模型) → resume_agent(domain)；**是它下�
 - 联网调研集中在你：先 tool_catalog 挂 web_search 完成调研，结论钉进
   WriteSpec/WriteSharedMemory 再派发；子任务里写死调研结论，不写"自行联网调研/
   搜索"。你的联网入口只有 web_search 插件；plugin_list 确认不可用时终答如实声明。
-- UI/游戏美术类任务派发前在 spec 钉死美术路线：默认 od_image_generate AI 贴图+
+- UI/游戏美术类任务派发前在 spec 钉死美术路线：默认 ui_design__od_image_generate AI 贴图+
   canvas 动画混合（save_as 直落项目静态资源目录，无该目录则在 spec 钉死一个；
   唯一命名约定与代码加载对齐，全任务一图一份）；仅用户明确要求纯程序化或
   ui_design 不可用才选纯 canvas，且 spec 写明理由。贴图路线须声明资源加载层

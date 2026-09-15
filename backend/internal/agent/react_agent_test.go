@@ -1178,8 +1178,8 @@ func readCallMsg(i int) *blades.Message {
 	}
 }
 
-// TestReActAgent_StagnationGuard_HardKill 连续 24 轮只读探查（无产出性工具/无 mailbox
-// 新消息/无终答）触发停滞守卫 ErrLoopExit 硬杀；第 6/12 轮已注入递进预警。
+// TestReActAgent_StagnationGuard_HardKill 连续 30 轮只读探查（无产出性工具/无 mailbox
+// 新消息/无终答）触发停滞守卫 ErrLoopExit 硬杀；第 10/20 轮已注入递进预警。
 // 覆盖既有守卫够不着的语义死循环（重复探针/完美主义不收口，2026-08-28 两小时撞墙实证）。
 func TestReActAgent_StagnationGuard_HardKill(t *testing.T) {
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
@@ -1237,7 +1237,7 @@ func TestReActAgent_StagnationGuard_ProductiveResets(t *testing.T) {
 }
 
 // TestReActAgent_StagnationGuard_MetaExempt MetaAgent 豁免硬杀（ErrLoopExit 会终止整个
-// 会话）：连续 24 轮无产出仅收预警，耗尽后默认终答正常返回。
+// 会话）：连续 30 轮无产出仅收预警，耗尽后默认终答正常返回。
 func TestReActAgent_StagnationGuard_MetaExempt(t *testing.T) {
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	responses := make([]*blades.Message, 0, stagnationExitRounds)

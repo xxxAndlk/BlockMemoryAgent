@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import type { Session } from '@/types'
+import type { SessionSummary } from '@/types'
 import { listSessions } from '@/api/session'
 import { getProfile, getProjectPreferences } from '@/api/preferences'
 import {
@@ -12,7 +12,7 @@ import {
 } from '@/api/learned'
 import { normDir } from '@/utils/dir'
 
-const sessions = ref<Session[]>([])
+const sessions = ref<SessionSummary[]>([])
 const skills = ref<LearnedSkill[]>([])
 const entries = ref<EvolutionLogEntry[]>([])
 const profile = ref('')

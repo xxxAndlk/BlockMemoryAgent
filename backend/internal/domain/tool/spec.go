@@ -96,7 +96,7 @@ type Spec struct {
 	Contract *Contract `json:"contract,omitempty"`
 	// Probes 运行时探针声明（TODO #67 runtime 层）：探针操作序列的散文描述
 	// （navigate → 交互 → 断言 → console 无 error）。runtime 层的证据扫描按
-	// browser_navigate/browser_evaluate/browser_console_messages 机器强制，
+	// ui_preview__browser_navigate/browser_evaluate/browser_console_messages 机器强制（裸名匹配），
 	// 本字段供子 Agent 知道探针要做什么（人读提示），dispatcher 不解析其内容。
 	Probes []string `json:"probes,omitempty"`
 	// Scenes 场景化截图清单（TODO #69 visual 层）：UI/游戏类任务须覆盖的场景名列表
@@ -294,7 +294,7 @@ func (t *writeSpecTool) Execute(ctx context.Context, args map[string]any) *Resul
 	}
 	out := fmt.Sprintf("spec written (key=%s, goal=%q, %d acceptance, %d constraints, %d files tracked)", key, truncateRunesForLog(goal, 60), len(acceptance), len(constraints), len(filesMtime))
 	if len(probes) > 0 {
-		out += fmt.Sprintf("。runtime 探针 %d 条（dispatcher 机器强制：browser_navigate+browser_evaluate+console 回读无 error 缺任一判未验证）", len(probes))
+		out += fmt.Sprintf("。runtime 探针 %d 条（dispatcher 机器强制：ui_preview__browser_navigate+browser_evaluate+console 回读无 error 缺任一判未验证）", len(probes))
 	}
 	if len(scenes) > 0 {
 		out += fmt.Sprintf("。visual 场景清单 %d 个（截图按内容去重后须覆盖全部场景）", len(scenes))
@@ -347,7 +347,7 @@ type writeSpecInput struct {
 	Files []string `json:"files" description:"涉及的文件路径列表（相对或绝对）。任一文件被 WriteFile 修改后该规范自动失效，避免子 Agent 读到旧规范。可空。"`
 	// VerifyLevels 验收层级（TODO #59）：existence/static/integration/runtime/visual 子集。
 	// UI/游戏类任务填 visual；多文件集成填 integration；默认存在性+静态由 dispatcher 自动覆盖。
-	VerifyLevels []string `json:"verify_levels" description:"验收层级（只接受 existence/static/integration/runtime/visual 五个值，可空）。注意：probes 和 scenes 是本工具的独立参数，不是验收层级，严禁填入 verify_levels。UI/游戏/绘制类任务必须含 visual（dispatcher 强制截图回显证据，缺则判未验证）与 runtime（dispatcher 机器强制 browser_navigate+browser_evaluate+console 无 error 探针证据，缺则判未验证）；多文件集成类任务含 integration（dispatcher 跑入口引用图探针）。"`
+	VerifyLevels []string `json:"verify_levels" description:"验收层级（只接受 existence/static/integration/runtime/visual 五个值，可空）。注意：probes 和 scenes 是本工具的独立参数，不是验收层级，严禁填入 verify_levels。UI/游戏/绘制类任务必须含 visual（dispatcher 强制截图回显证据，缺则判未验证）与 runtime（dispatcher 机器强制 ui_preview__browser_navigate+browser_evaluate+console 无 error 探针证据，缺则判未验证）；多文件集成类任务含 integration（dispatcher 跑入口引用图探针）。"`
 	// Key 命名槽位（TODO #65 多 key 化）：可空（默认 spec，全兄弟共享一份）。
 	// 多领域任务建议按领域名各写一份（key=领域名），兄弟各持各的、staleness 互不误伤。
 	Key string `json:"key" description:"命名槽位（默认 spec）。多领域任务按领域名各写一份（key=领域名）可隔离 staleness；同 key 写入覆盖前值。key 必须与 call_sub_agent 的 domain 参数一致（dispatcher 按 domain 查键）。可空。"`
@@ -356,7 +356,7 @@ type writeSpecInput struct {
 	// 四类条目均可空；单域/无跨域引用任务整个 contract 可空。
 	Contract *Contract `json:"contract" description:"跨域契约（多域任务填写）：symbols=跨域符号映射（symbol 声明于 file，refs 列引用方文件）；dom_ids=DOM 元素 id 清单；scripts=script 加载顺序；signatures=跨域函数签名（signature 文本必须出现在 file 中，只写代码文本、禁全角标点/中文注解）。dispatcher 机器校验用，零 LLM；单域任务可空。"`
 	// Probes 运行时探针声明（TODO #67）：runtime 层验收须声明的探针操作序列描述。
-	Probes []string `json:"probes" description:"运行时探针序列声明（verify_levels 含 runtime 时填写）：每条一个操作步骤描述（如 打开页面/点击开始按钮/断言实体生成/console 无 error）。dispatcher 机器强制探针证据（browser_navigate+browser_evaluate+browser_console_messages 回读无 error），缺任一判未验证。"`
+	Probes []string `json:"probes" description:"运行时探针序列声明（verify_levels 含 runtime 时填写）：每条一个操作步骤描述（如 打开页面/点击开始按钮/断言实体生成/console 无 error）。dispatcher 机器强制探针证据（ui_preview__browser_navigate+ui_preview__browser_evaluate+ui_preview__browser_console_messages 回读无 error），缺任一判未验证。"`
 	// Scenes 场景化截图清单（TODO #69）：visual 层须覆盖的场景名列表。
 	Scenes []string `json:"scenes" description:"场景化截图清单（verify_levels 含 visual 时填写）：UI/游戏类任务须覆盖的场景名列表（如 主菜单/游玩中/切割瞬间/结算页）。dispatcher 按截图内容哈希去重后核对覆盖数，同图连拍充数无效。"`
 	// Baseline 对标基线产物清单（TODO #75）：还原/复刻/对标类任务必填。
@@ -630,7 +630,7 @@ func ValidateContractShape(c *Contract) string {
 //   - static 静态：语法/格式检查（node --check/tsc --noEmit/gofmt，冒烟层自动覆盖）；
 //   - integration 集成：入口引用图探针（script src/import 解析到存在的文件，防"空壳产物"）；
 //   - runtime 运行时：探针脚本实跑断言（验收标准自带可执行断言，agent 自执行）；
-//   - visual 视觉：截图回显证据（dispatcher 强制 browser_take_screenshot 成功证据，缺则未验证）。
+//   - visual 视觉：截图回显证据（dispatcher 强制 ui_preview__browser_take_screenshot 成功证据，缺则未验证）。
 var VerifyLevelsAllowed = []string{"existence", "static", "integration", "runtime", "visual"}
 
 // verifyLevelAlias 是模型高频混淆值的自动纠正表（2026-09-12 事故：提示词把

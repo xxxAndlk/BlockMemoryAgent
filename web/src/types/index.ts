@@ -52,21 +52,31 @@ export type TrustMode = 'suggest' | 'auto-edit' | 'full-auto'
 /** 会话执行档位（TODO #14 三档控制）：auto=规则自动选 / fast=轻聊快答 / cluster=完整重装；explore 预留未实现。 */
 export type SessionGear = 'auto' | 'fast' | 'cluster'
 
-export interface Session {
+/**
+ * 会话摘要（GET /sessions 列表线型，与后端 server.sessionSummary 对齐）。
+ * 列表不带 events/messages：单会话事件流可达数 MB，整包下发会把首屏拖慢；
+ * 需要明细的页面走 GET /sessions/{id}（返回完整 Session）。
+ */
+export interface SessionSummary {
   id: string
   goal: string
   status: SessionStatus
   result?: string
   started_at: string
   ended_at?: string
-  /** 软停止销毁倒计时截止时间（TODO #37）：软停止后非空，续跑/到期后清空。 */
-  destroy_at?: string | null
   /** 每会话工作目录：空/缺省 = 后端默认目录。 */
   work_dir?: string
+  /** 临时工作目录（可选）。 */
+  temp_dir?: string
   /** 信任模式（TODO 第10⑥）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主；空 = 后端回退现网语义。 */
   trust_mode?: TrustMode | ''
   /** 执行档位（TODO #14）：auto|fast|cluster；空 = 未设置（按集群档现行为兜底）。 */
   gear?: SessionGear | ''
+}
+
+export interface Session extends SessionSummary {
+  /** 软停止销毁倒计时截止时间（TODO #37）：软停止后非空，续跑/到期后清空。 */
+  destroy_at?: string | null
   /** 当前正在流式生成的助手文本（仅运行中有值，SSE 快照/live 帧携带），对齐 TUI 实时汇报展示。 */
   streaming_text?: string
   /** 当前思考阶段过程文本（瞬时，仅运行中有值）。 */

@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import type { Session } from '@/types'
+import type { SessionSummary } from '@/types'
 import { listSessions } from '@/api/session'
 import { statusTagType, statusText } from '@/utils/sessionStatus'
 
@@ -10,7 +10,7 @@ import { normDir } from '@/utils/dir'
 const route = useRoute()
 const router = useRouter()
 
-const sessions = ref<Session[]>([])
+const sessions = ref<SessionSummary[]>([])
 const loading = ref(false)
 const search = ref('')
 const statusFilter = ref('')
@@ -61,7 +61,7 @@ onMounted(async () => {
   }
 })
 
-function open(s: Session) {
+function open(s: SessionSummary) {
   router.push({ path: '/session', query: { id: s.id, view: 'monitor' } })
 }
 
@@ -69,7 +69,7 @@ function fmt(t?: string) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : '—'
 }
 
-function duration(s: Session) {
+function duration(s: SessionSummary) {
   if (!s.started_at || !s.ended_at) return '—'
   const ms = new Date(s.ended_at).getTime() - new Date(s.started_at).getTime()
   if (ms < 0) return '—'

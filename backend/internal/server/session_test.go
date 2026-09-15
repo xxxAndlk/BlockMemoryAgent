@@ -84,7 +84,7 @@ func (m *mockAgentForServer) Control(ctx context.Context, sessionID string, cmd 
 }
 
 // List 按过滤条件列出会话。
-// 参数 ctx：上下文；filter：过滤条件（目前仅按 Status 过滤）。
+// 参数 ctx：上下文；filter：过滤条件（按 Status 过滤，Limit>0 时截断）。
 // 返回值：会话指针切片与错误。
 func (m *mockAgentForServer) List(ctx context.Context, filter agent.Filter) ([]*agent.Session, error) {
 	m.mu.RLock()
@@ -95,6 +95,10 @@ func (m *mockAgentForServer) List(ctx context.Context, filter agent.Filter) ([]*
 			continue // 状态不匹配则跳过
 		}
 		out = append(out, s)
+	}
+	// 与真实门面一致：Limit 语义是"最多返回这么多条"。
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
 	}
 	return out, nil
 }

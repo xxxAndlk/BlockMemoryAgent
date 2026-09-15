@@ -40,12 +40,14 @@ func workDirAbs(c *gin.Context, dir string) (string, bool) {
 func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	// 解析请求体：goal 必填；images 可选（首条消息粘贴/上传的图片，与 /message 同规则限流）；
 	// videos 可选（首条消息粘贴的视频文件路径，服务端抽帧后走图片链路）；
-	// work_dir 可选（每会话工作目录，绝对/相对均转绝对）。
+	// work_dir 可选（每会话工作目录，绝对/相对均转绝对）；
+	// gear 可选（TODO #14 新会话页选档）：显式指定初始执行档位，非法枚举 400。
 	req, err := DecodeBody[struct {
 		Goal    string            `json:"goal"`
 		Images  []agent.WireImage `json:"images,omitempty"`
 		Videos  []agent.WireVideo `json:"videos,omitempty"`
 		WorkDir string            `json:"work_dir,omitempty"`
+		Gear    string            `json:"gear,omitempty"`
 	}](c.Request)
 	if err != nil {
 		c.String(http.StatusBadRequest, "请求体无效")
@@ -53,6 +55,10 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	}
 	if req.Goal == "" {
 		c.String(http.StatusBadRequest, "目标 (goal) 不能为空")
+		return
+	}
+	if req.Gear != "" && !tool.ValidGear(req.Gear) {
+		c.String(http.StatusBadRequest, "gear 非法（want auto|fast|cluster）")
 		return
 	}
 	// work_dir 校验：转绝对路径，不存在或非目录直接 400（在到达 agent 前拦截）。
@@ -75,7 +81,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	}
 
 	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费）。
-	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos, WorkDir: req.WorkDir})
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos, WorkDir: req.WorkDir, Gear: req.Gear})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
@@ -98,18 +104,69 @@ func (m *SessionManager) HandleGetSession(c *gin.Context) {
 	c.JSON(http.StatusOK, ToServerSession(session))
 }
 
+// 会话列表的条数边界：默认 200（历史行为），上限 1000（防误配置一次拉爆内存/带宽）。
+const (
+	listSessionsDefaultLimit = 200
+	listSessionsMaxLimit     = 1000
+)
+
+// sessionSummary 是会话列表的轻量线型：只带列表页需要的字段。
+// 全量线型（server.Session）带 events/messages，实测 200 条 ≈ 14MB（单条最高 7.7MB），
+// 整包下发会把首屏拖慢并把前端内存顶起来；详情/监控页走 GET /sessions/{id} 取全量。
+type sessionSummary struct {
+	ID        string     `json:"id"`
+	Goal      string     `json:"goal"`
+	Status    string     `json:"status"`
+	Result    string     `json:"result,omitempty"`
+	StartedAt time.Time  `json:"started_at"`
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
+	WorkDir   string     `json:"work_dir,omitempty"`
+	TempDir   string     `json:"temp_dir,omitempty"`
+	Gear      string     `json:"gear,omitempty"`
+	TrustMode string     `json:"trust_mode,omitempty"`
+}
+
+// toSessionSummary 把会话 DTO 投影成列表摘要（EndedAt 零值表示未结束，不下发）。
+func toSessionSummary(s *agent.Session) sessionSummary {
+	sum := sessionSummary{
+		ID:        s.ID,
+		Goal:      s.Goal,
+		Status:    s.Status,
+		Result:    s.Result,
+		StartedAt: s.StartedAt,
+		WorkDir:   s.WorkDir,
+		TempDir:   s.TempDir,
+		Gear:      s.Gear,
+		TrustMode: s.TrustMode,
+	}
+	if !s.EndedAt.IsZero() {
+		end := s.EndedAt
+		sum.EndedAt = &end
+	}
+	return sum
+}
+
 // HandleListSessions 处理 GET /api/sessions。
-// 职责：列出所有会话。
+// 职责：列出会话摘要，按开始时间降序。?limit= 控制条数（默认 200，上限 1000）。
+// 注意：agent.List 内部对 PG 历史有 200 条默认上限（defaultSessionListLimit），
+// 前端要全量口径的计数/分页时必须显式放大 limit，否则数字落在被截断的子集上
+// （表现为"删掉十几条但总数纹丝不动"）。
 func (m *SessionManager) HandleListSessions(c *gin.Context) {
-	sessions, err := m.agent.List(c.Request.Context(), agent.Filter{})
+	limit := listSessionsDefaultLimit
+	if q := c.Query("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 {
+			limit = min(n, listSessionsMaxLimit)
+		}
+	}
+	sessions, err := m.agent.List(c.Request.Context(), agent.Filter{Limit: limit})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
 
-	all := make([]*Session, 0, len(sessions))
+	all := make([]sessionSummary, 0, len(sessions))
 	for _, s := range sessions {
-		all = append(all, ToServerSession(s))
+		all = append(all, toSessionSummary(s))
 	}
 
 	c.JSON(http.StatusOK, all)

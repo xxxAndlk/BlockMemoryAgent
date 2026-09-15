@@ -20,10 +20,15 @@
     <!-- Main Body -->
     <div class="flex flex-1 min-h-0">
       <!-- Sidebar -->
-      <div class="w-56 bg-card border-r border-line flex flex-col shrink-0">
+      <div class="w-[280px] bg-card border-r border-line flex flex-col shrink-0">
+        <!-- 会话目录树（Codex 式）：按工作目录分组会话，取代原来的「会话 / 工作目录」两个导航项 -->
+        <div class="flex-1 min-h-0 flex flex-col pt-3">
+          <WorkDirTree class="min-h-0 flex-1" />
+        </div>
+
         <el-menu
           :default-active="route.path"
-          class="flex-1 overflow-y-auto !border-r-0 py-3"
+          class="!border-r-0 py-2 shrink-0 overflow-y-auto max-h-[45vh]"
           background-color="transparent"
           router
         >
@@ -76,6 +81,7 @@ import { ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { getStatus } from '@/api/health'
 import { useTheme } from '@/composables/useTheme'
+import WorkDirTree from '@/components/WorkDirTree.vue'
 
 const route = useRoute()
 const { theme, toggleTheme } = useTheme()
@@ -93,18 +99,13 @@ async function loadStatus() {
 
 onMounted(loadStatus)
 
-// 静态分组菜单（IA 定稿：4 组 + 底部 Beta 预留项，见 spec §信息架构）
+// 静态分组菜单（IA 定稿：4 组 + 底部 Beta 预留项，见 spec §信息架构）。
+// 「会话 / 工作目录」两项已并入上方目录树（树里可直接开旧会话、起新会话、改目录配置），
+// 故不再重复占位；/projects、/session 路由仍可用（后者由目录树与首页的跳转进入）。
 const menuGroups = [
   {
     title: '工作台',
-    items: [
-      { path: '/dashboard', title: '首页', icon: 'House' },
-      { path: '/session', title: '会话', icon: 'ChatDotRound' },
-    ],
-  },
-  {
-    title: '项目',
-    items: [{ path: '/projects', title: '工作目录', icon: 'FolderOpened' }],
+    items: [{ path: '/dashboard', title: '首页', icon: 'House' }],
   },
   {
     title: '资源库',

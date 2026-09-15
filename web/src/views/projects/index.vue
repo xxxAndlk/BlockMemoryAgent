@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import type { Session } from '@/types'
+import type { SessionSummary } from '@/types'
 import { listSessions } from '@/api/session'
 import { getProjectPreferences, saveProjectPreferences } from '@/api/preferences'
 import { getTesterConfig, saveTesterConfig } from '@/api/tester'
@@ -16,7 +16,7 @@ const DIRS_KEY = 'bma:workdirs'
 const router = useRouter()
 const { setWorkDir } = useWorkDir()
 
-const sessions = ref<Session[]>([])
+const sessions = ref<SessionSummary[]>([])
 const loading = ref(false)
 
 // 手工添加的目录（无会话也能出现在列表）

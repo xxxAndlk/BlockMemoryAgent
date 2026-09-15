@@ -361,7 +361,9 @@ func (m *Manager) Enable(ctx context.Context, id string) error {
 		inst.state = StateRegistered
 		return fmt.Errorf("启动插件 %q 失败: %w", id, err)
 	}
-	// 注册工具：冲突预检 + 失败回滚（已注册的摘除，插件 Stop）。
+	// 注册工具：冲突预检 + 失败回滚（注册语义全有或全无）。
+	// MCP 插件工具本地名统一带 "<插件ID>__" 前缀（mcpbridge wrapTool），跨插件
+	// 不重名，此预检兜底"插件工具撞内置工具名"等残余场景。
 	tools := inst.plugin.Tools()
 	for i, t := range tools {
 		if m.registry.Has(t.Name()) {

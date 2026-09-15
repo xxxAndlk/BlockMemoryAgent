@@ -20,8 +20,8 @@ import (
 func runtimeProbeRetryMessage(probes []string) string {
 	var b strings.Builder
 	b.WriteString("【运行时探针证据要求】本任务验收层级含 runtime：终答前必须经 tool_catalog 挂载 ui_preview，" +
-		"完成完整探针序列——① browser_navigate 打开页面；② browser_evaluate 执行至少一次行为断言" +
-		"（如 实体生成/状态变更/资源加载 getImage('x')!==null）；③ browser_console_messages 回读控制台且无 error/severe 级条目。" +
+		"完成完整探针序列——① ui_preview__browser_navigate 打开页面；② ui_preview__browser_evaluate 执行至少一次行为断言" +
+		"（如 实体生成/状态变更/资源加载 getImage('x')!==null）；③ ui_preview__browser_console_messages 回读控制台且无 error/severe 级条目。" +
 		"三者缺任一或 console 有 error 均判未验证（dispatcher 机器扫描，自述不算证据）。")
 	if len(probes) > 0 {
 		b.WriteString("\nspec 声明的探针序列：\n")

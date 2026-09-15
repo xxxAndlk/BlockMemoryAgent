@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, reactive, watch, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import type { WireImage } from '@/types'
+import type { WireImage, SessionGear } from '@/types'
 import { useModelSelection } from '@/composables/useModelSelection'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 
@@ -25,12 +25,20 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'submit', content: string, images: WireImage[]): void
+  (e: 'submit', content: string, images: WireImage[], gear: SessionGear): void
   (e: 'new-session'): void
   (e: 'update-workdir', dir: string): void
 }>()
 
 const content = ref('')
+
+// 创建会话时的执行档位选择（TODO #14）：仅新会话（!sessionBound）显示在输入框右下角，
+// 选择随 localStorage 记住（下次开新会话默认上次所选）；会话创建后的切档走 ChatHeader 下拉。
+const GEAR_STORAGE_KEY = 'bma:newSessionGear'
+const gear = ref<SessionGear>((localStorage.getItem(GEAR_STORAGE_KEY) as SessionGear) || 'auto')
+function persistGear() {
+  localStorage.setItem(GEAR_STORAGE_KEY, gear.value)
+}
 
 // 待发送图片（任务 111 Web 侧同步）：顺序与 [image:N] 占位符编号升序对齐
 // （顺序对齐非解析对齐，与 TUI 同策略）。base64 不带 data: 前缀。
@@ -236,7 +244,7 @@ async function onAddModel() {
 
 function handleSubmit() {
   if (!canSend.value) return
-  emit('submit', content.value.trim(), pendingImages.value.slice())
+  emit('submit', content.value.trim(), pendingImages.value.slice(), gear.value)
   content.value = ''
   pendingImages.value = []
 }
@@ -360,6 +368,15 @@ function onKeydown(e: KeyboardEvent) {
               :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
           ↑{{ fmtTokens(props.inputTokens || 0) }} ↓{{ fmtTokens(props.outputTokens || 0) }}
         </span>
+        <!-- 创建时选档（TODO #14）：仅未绑定会话（新会话）显示；建后会话切档走头部下拉 -->
+        <el-select v-if="!sessionBound" v-model="gear" size="small" class="!w-28 shrink-0"
+                   title="执行档位：快速档秒回轻聊，集群档完整重装；创建会话时生效"
+                   @change="persistGear">
+          <el-option value="auto" label="自动选档" />
+          <el-option value="fast" label="快速档" />
+          <el-option value="cluster" label="集群档" />
+          <el-option value="explore" label="探索（即将上线）" disabled />
+        </el-select>
         <el-button type="primary" size="small" round
                    :loading="loading"
                    :disabled="!canSend"

@@ -192,13 +192,17 @@ func TestBridgeStdioConnectCall(t *testing.T) {
 		t.Fatalf("应暴露 3 个远端工具，got %d", len(tools))
 	}
 	// 调用往返。
-	echo := mustTool(t, tools, "echo")
+	echo := mustTool(t, tools, "mock__echo")
 	res := echo.Execute(ctx, map[string]any{"text": "hello"})
 	if !res.Success || res.Output != tool.WrapUntrusted("mcp:echo", "echo:hello") { // T31: MCP 输出带 untrusted 围栏
 		t.Fatalf("echo 调用失败: %+v", res)
 	}
+	// 本地注册名带插件前缀（防撞名），Result.Tool 回填本地名与 LLM 调用名对齐。
+	if res.Tool != "mock__echo" {
+		t.Fatalf("Result.Tool 应为本地注册名 mock__echo, got %q", res.Tool)
+	}
 	// 服务端 IsError → 失败结果回灌。
-	boom := mustTool(t, tools, "boom")
+	boom := mustTool(t, tools, "mock__boom")
 	res = boom.Execute(ctx, map[string]any{})
 	if res.Success || !strings.Contains(res.Error, "boom happened") {
 		t.Fatalf("boom 应回灌错误: %+v", res)
@@ -222,7 +226,7 @@ func TestBridgeSchemaPassthrough(t *testing.T) {
 	}
 	defer func() { _ = b.Stop(context.Background()) }()
 
-	echo := mustTool(t, b.Tools(), "echo")
+	echo := mustTool(t, b.Tools(), "mock__echo")
 	if d := echo.(interface{ Description() string }).Description(); d != "回显文本" {
 		t.Fatalf("描述应透传服务端值，got %q", d)
 	}
@@ -256,7 +260,7 @@ func TestBridgeReconnect(t *testing.T) {
 	defer func() { _ = b.Stop(context.Background()) }()
 
 	// 触发子进程退出。
-	die := mustTool(t, b.Tools(), "die")
+	die := mustTool(t, b.Tools(), "mock__die")
 	die.Execute(ctx, map[string]any{})
 
 	select {
@@ -273,7 +277,7 @@ func TestBridgeReconnect(t *testing.T) {
 		if len(newTools) != 3 {
 			t.Fatalf("重连后工具数应为 3，got %d", len(newTools))
 		}
-		echo := mustTool(t, newTools, "echo")
+		echo := mustTool(t, newTools, "mock__echo")
 		res := echo.Execute(ctx, map[string]any{"text": "again"})
 		if !res.Success || res.Output != tool.WrapUntrusted("mcp:echo", "echo:again") {
 			t.Fatalf("重连后调用失败: %+v", res)

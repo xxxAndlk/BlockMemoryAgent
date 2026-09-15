@@ -870,7 +870,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		history, drainedMbx = a.drainMailbox(history)
 
 		// 停滞守卫：本轮无产出性工具且无 mailbox 新消息则累加计数（有则清零），
-		// 连续无产出 6 轮注入预警、12 轮最终通牒、24 轮 ErrLoopExit 硬杀（meta 豁免硬杀）。
+		// 连续无产出 10 轮注入预警、20 轮最终通牒、30 轮 ErrLoopExit 硬杀（meta 豁免硬杀）。
 		var stagnationErr error
 		history, unproductiveStreak, stagnationErr = a.stagnationGuard(unproductiveStreak, assistant.ToolCalls, drainedMbx, history)
 		if stagnationErr != nil {
@@ -885,19 +885,23 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 }
 
 // 停滞守卫阈值：连续 N 轮"无产出"（无产出性工具调用 ∧ 无 mailbox 新消息 ∧ 无终答）逐级响应。
-// 6 轮注入停滞预警、12 轮注入最终通牒、24 轮返回 ErrLoopExit 硬杀（meta 豁免，见 stagnationGuard）。
-// 24 轮 × 慢模型单轮 2-5 分钟 ≈ 50-120 分钟：必在 2h 墙钟前触发，失败打捞回灌父 Agent 可立即
-// 重派，而不是空转到墙钟零产出硬杀（2026-08-28 渲染领域 Agent 两小时撞墙事故）。
+// 10 轮注入停滞预警、20 轮注入最终通牒、30 轮返回 ErrLoopExit 硬杀（meta 豁免，见 stagnationGuard）。
+// 阈值 2026-09-15 由 6/12/24 放宽为 10/20/30：6 轮对合法长验证期（跑测试/逐条核对）催得过紧，
+// 模型被推着草率收口（补丁式绕过根因，文件反复报错反复改）。硬杀仍须先于 2h 子 Agent 墙钟
+// （sub_agent_timeout_min=120）：30 轮 × 单轮 2-5 分钟 ≈ 60-150 分钟，快模型远早于墙钟，慢模型
+// 最坏端贴墙钟——打捞回灌父 Agent 可立即重派的价值保留在多数场景（2026-08-28 渲染领域 Agent
+// 两小时纯读零产出撞墙事故即此守卫的由来）。
 const (
-	stagnationWarnRounds      = 6
-	stagnationFinalWarnRounds = 12
-	stagnationExitRounds      = 24
+	stagnationWarnRounds      = 10
+	stagnationFinalWarnRounds = 20
+	stagnationExitRounds      = 30
 )
 
-// productiveToolNames 产出性工具集合：调用即视为"有产出"，重置停滞计数。
+// productiveToolNames 产出性工具集合（裸名）：调用即视为"有产出"，重置停滞计数。
 // 取"改外部状态类"（写文件/派发/消息/浏览器驱动）；只读探查（ReadFile/搜索/RunCommand
-// 验证类）不算产出——连续 24 轮纯探查零写入本身就是异常信号，且 6/12 轮两次预警给了
+// 验证类）不算产出——连续 30 轮纯探查零写入本身就是异常信号，且 10/20 轮两次预警给了
 // 正常长验证充足的自我收口窗口（预警只提示不杀）。
+// 匹配前经 tool.BareToolName 剥离 MCP 插件前缀（browser_* 注册名为 ui_preview__browser_* 等）。
 var productiveToolNames = map[string]bool{
 	"WriteFile": true, "EditFile": true, "RestoreFile": true,
 	"call_sub_agent": true, "call_sub_agents": true,
@@ -915,7 +919,7 @@ func (a *ReActAgent) stagnationGuard(streak int, calls []ToolCall, mailboxDraine
 	productive := mailboxDrained > 0
 	if !productive {
 		for _, tc := range calls {
-			if productiveToolNames[tc.Name] {
+			if productiveToolNames[tool.BareToolName(tc.Name)] {
 				productive = true
 				break
 			}

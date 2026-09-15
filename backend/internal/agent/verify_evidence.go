@@ -50,8 +50,9 @@ func HasExecutableVerification(history []ReactMessage) bool {
 	return false
 }
 
-// ScreenshotToolNames 是视觉层证据认可的截图工具名（TODO #59 验收分层 visual 层）。
+// ScreenshotToolNames 是视觉层证据认可的截图工具裸名（TODO #59 验收分层 visual 层）。
 // ui_preview 插件的浏览器截图工具；可扩展（如 computer_use 的截图变体）。
+// 匹配前经 tool.BareToolName 剥离 MCP 插件前缀，兼容改名前的历史记录。
 var ScreenshotToolNames = []string{"browser_take_screenshot"}
 
 // HasScreenshotEvidence 返回 history 中是否存在成功的截图工具调用证据（TODO #59 视觉层）：
@@ -66,7 +67,7 @@ func HasScreenshotEvidence(history []ReactMessage) bool {
 			continue
 		}
 		for _, tc := range m.ToolCalls {
-			if slices.Contains(ScreenshotToolNames, tc.Name) {
+			if slices.Contains(ScreenshotToolNames, tool.BareToolName(tc.Name)) {
 				shotIDs[tc.ID] = true
 			}
 		}
@@ -86,11 +87,12 @@ func HasScreenshotEvidence(history []ReactMessage) bool {
 	return false
 }
 
-// RuntimeProbeToolNames 是 runtime 层证据认可的浏览器探针工具名（TODO #67）。
+// RuntimeProbeToolNames 是 runtime 层证据认可的浏览器探针工具裸名（TODO #67）。
 // ui_preview MCP 插件：navigate（打开页面）/ evaluate（JS 断言）/ console_messages（错误回读）。
+// 匹配前经 tool.BareToolName 剥离插件前缀（本地注册名为 ui_preview__browser_*）。
 var RuntimeProbeToolNames = map[string]bool{
-	"browser_navigate":        true,
-	"browser_evaluate":        true,
+	"browser_navigate":         true,
+	"browser_evaluate":         true,
 	"browser_console_messages": true,
 }
 
@@ -109,10 +111,11 @@ func HasRuntimeProbeEvidence(history []ReactMessage) bool {
 			continue
 		}
 		for _, tc := range m.ToolCalls {
-			if !RuntimeProbeToolNames[tc.Name] {
+			bare := tool.BareToolName(tc.Name)
+			if !RuntimeProbeToolNames[bare] {
 				continue
 			}
-			switch tc.Name {
+			switch bare {
 			case "browser_navigate":
 				if toolResultSuccess(history, tc.ID) {
 					hasNavigate = true
@@ -218,12 +221,12 @@ func HasSceneEvidence(history []ReactMessage, wantScenes int) SceneEvidenceRepor
 			continue
 		}
 		for _, tc := range m.ToolCalls {
-			switch {
-			case slices.Contains(ScreenshotToolNames, tc.Name):
+			switch bare := tool.BareToolName(tc.Name); {
+			case slices.Contains(ScreenshotToolNames, bare):
 				seq = append(seq, ev{kind: "shot", callID: tc.ID})
-			case tc.Name == "browser_navigate":
+			case bare == "browser_navigate":
 				seq = append(seq, ev{kind: "nav", callID: tc.ID})
-			case tc.Name == "browser_evaluate":
+			case bare == "browser_evaluate":
 				seq = append(seq, ev{kind: "eval", callID: tc.ID})
 			}
 		}

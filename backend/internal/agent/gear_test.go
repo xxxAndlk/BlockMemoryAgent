@@ -7,6 +7,7 @@ package agent
 //   （落库/恢复全链路在集成测试覆盖，此处验证纯函数与字段接线）。
 
 import (
+	"context"
 	"testing"
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
@@ -88,5 +89,31 @@ func TestGearMetaMemoryRoundTrip(t *testing.T) {
 	bogus := []map[string]any{{"gear": "warp"}, {"other": 1}}
 	if got := gearFromMetaMemory(bogus, "auto"); got != "auto" {
 		t.Fatalf("invalid stored gear must fall back, got %q", got)
+	}
+}
+
+// TestReactService_CreateSessionGearOverride 验证 CreateRequest.Gear（TODO #14 新会话页
+// 选档）：合法枚举覆盖 store 默认档；非法/空值回落默认（HTTP 层已先行 400，服务层宽容兜底）。
+func TestReactService_CreateSessionGearOverride(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	if err := svc.SetDefaultGear(tool.GearCluster); err != nil {
+		t.Fatalf("SetDefaultGear: %v", err)
+	}
+	ctx := context.Background()
+
+	fast, err := svc.CreateSession(ctx, CreateRequest{Goal: "显式快速档", Gear: tool.GearFast})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if got := svc.SessionGear(fast.ID); got != tool.GearFast {
+		t.Fatalf("显式 gear 应覆盖默认档, got %q", got)
+	}
+
+	fallback, err := svc.CreateSession(ctx, CreateRequest{Goal: "非法值回落", Gear: "warp"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if got := svc.SessionGear(fallback.ID); got != tool.GearCluster {
+		t.Fatalf("非法 gear 应回落默认 cluster, got %q", got)
 	}
 }

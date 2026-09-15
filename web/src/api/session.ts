@@ -1,15 +1,22 @@
-import type { Session, SessionEvent, AgentNode, TaskBoardData, WireImage, TrustMode, SessionGear } from '@/types'
+import type { Session, SessionEvent, SessionSummary, AgentNode, TaskBoardData, WireImage, TrustMode, SessionGear } from '@/types'
 import { fetchJson } from './client'
 import { APP_CONFIG } from '@/config/app'
 
-export function listSessions(): Promise<Session[]> {
-  return fetchJson('/sessions')
+/**
+ * 会话列表（摘要线型，不含 events/messages）。
+ * `limit` 省略时后端按 200 条截断——首页要对全量会话做计数/分页，
+ * 必须显式传大 limit（上限 1000），否则删掉的会话会被更旧的行悄悄顶上来，数字纹丝不动。
+ */
+export function listSessions(limit?: number): Promise<SessionSummary[]> {
+  return fetchJson(`/sessions${limit ? `?limit=${limit}` : ''}`)
 }
 
-export function createSession(goal: string, images?: WireImage[], workDir?: string): Promise<Session> {
+export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear): Promise<Session> {
   const body: Record<string, unknown> = { goal }
   if (images?.length) body.images = images
   if (workDir) body.work_dir = workDir
+  // 创建时选档（TODO #14）：仅显式选择时携带；省略由后端按默认档位规则裁决。
+  if (gear) body.gear = gear
   return fetchJson('/sessions', { method: 'POST', body: JSON.stringify(body) })
 }
 

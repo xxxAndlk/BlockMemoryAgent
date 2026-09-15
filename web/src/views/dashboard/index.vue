@@ -2,10 +2,10 @@
 import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Session } from '@/types'
+import type { SessionStatus, SessionSummary } from '@/types'
 import { listSessions, createSession, deleteSession, deleteSessions } from '@/api/session'
 import { getTimeline, getActivity, type TimelinePoint, type ActivityItem } from '@/api/metrics'
-import { statusTagType, statusText } from '@/utils/sessionStatus'
+import { statusDotClass, statusText } from '@/utils/sessionStatus'
 import { fmtDate } from '@/utils/date'
 import { kindIcon, kindTagType } from '@/views/session/chat/utils/eventStyles'
 import { useWorkDir } from '@/composables/useWorkDir'
@@ -15,10 +15,16 @@ const router = useRouter()
 const goal = ref('')
 const { workDir, setWorkDir } = useWorkDir()
 const searchSession = ref('')
-const sessions = ref<Session[]>([])
+const sessions = ref<SessionSummary[]>([])
 const loading = ref(false)
 const filter = ref('all')
 const usingMock = ref(false)
+
+// 列表条数与后端上限（listSessionsMaxLimit=1000）对齐：首页的计数/分页/搜索都是
+// 客户端口径，只取默认 200 条会让删掉的会话被更旧的行顶上来——总数看着纹丝不动，
+// 用户以为"删除没生效"（2026-09-15 实证）。
+const SESSION_LIST_LIMIT = 1000
+const listCapped = ref(false)
 
 const timeline = ref<TimelinePoint[]>([])
 const activities = ref<ActivityItem[]>([])
@@ -29,11 +35,19 @@ async function load() {
   loading.value = true
   try {
     const [sessionsRes, timelineRes, activityRes] = await Promise.all([
-      listSessions().catch(() => null),
+      listSessions(SESSION_LIST_LIMIT).catch(() => null),
       getTimeline(12).catch(() => null),
       getActivity(8).catch(() => null),
     ])
-    sessions.value = sessionsRes || (usingMock.value = true, mockSessions())
+    if (sessionsRes) {
+      // 成功后必须清 mock 标记：否则后端恢复可用仍走"示例数据"分支（删除只改本地、不发请求）。
+      sessions.value = sessionsRes
+      usingMock.value = false
+      listCapped.value = sessionsRes.length >= SESSION_LIST_LIMIT
+    } else {
+      usingMock.value = true
+      sessions.value = mockSessions()
+    }
     timeline.value = timelineRes?.points || []
     activities.value = activityRes?.activities || []
   } finally {
@@ -41,14 +55,14 @@ async function load() {
   }
 }
 
-function mockSessions(): Session[] {
+function mockSessions(): SessionSummary[] {
   return [
-    { id: 's-1', goal: '生成项目架构设计文档', status: 'running', started_at: new Date(Date.now() - 3600000).toISOString(), events: [], messages: [] },
-    { id: 's-2', goal: '排查 Redis 连接池告警', status: 'completed', started_at: new Date(Date.now() - 1800000).toISOString(), events: [], messages: [] },
-    { id: 's-3', goal: '编写 v3 接口测试用例', status: 'completed', started_at: new Date(Date.now() - 7200000).toISOString(), events: [], messages: [] },
-    { id: 's-4', goal: '重构 Skill 注册逻辑', status: 'error', started_at: new Date(Date.now() - 10800000).toISOString(), events: [], messages: [] },
-    { id: 's-5', goal: '演练 Chaos 自动回滚', status: 'completed', started_at: new Date(Date.now() - 14400000).toISOString(), events: [], messages: [] },
-    { id: 's-6', goal: '分析日志异常模式', status: 'running', started_at: new Date(Date.now() - 15000000).toISOString(), events: [], messages: [] },
+    { id: 's-1', goal: '生成项目架构设计文档', status: 'running', started_at: new Date(Date.now() - 3600000).toISOString() },
+    { id: 's-2', goal: '排查 Redis 连接池告警', status: 'completed', started_at: new Date(Date.now() - 1800000).toISOString() },
+    { id: 's-3', goal: '编写 v3 接口测试用例', status: 'completed', started_at: new Date(Date.now() - 7200000).toISOString() },
+    { id: 's-4', goal: '重构 Skill 注册逻辑', status: 'error', started_at: new Date(Date.now() - 10800000).toISOString() },
+    { id: 's-5', goal: '演练 Chaos 自动回滚', status: 'completed', started_at: new Date(Date.now() - 14400000).toISOString() },
+    { id: 's-6', goal: '分析日志异常模式', status: 'running', started_at: new Date(Date.now() - 15000000).toISOString() },
   ]
 }
 
@@ -92,7 +106,7 @@ function toggleSelect(id: string) {
 }
 
 // 「全选」作用于**当前页**：列表分页后"全选"只对看得见的这 10 条生效，
-// 否则一次全选会静默勾中全部 58 条（搜索/状态页签过滤后也一样），配合"删除选中"极易误删。
+// 否则一次全选会静默勾中全部会话（搜索/状态页签过滤后也一样），配合"删除选中"极易误删。
 // 已选集合跨页保留——"删除选中(N)"仍显示真实总数。
 const allSelected = computed(
   () => pagedSessions.value.length > 0 && pagedSessions.value.every((s) => selectedIds.value.includes(s.id)),
@@ -154,11 +168,47 @@ async function confirmDelete(ids: string[]) {
   }
 }
 
-function progressOf(s: Session) {
-  if (s.status === 'completed') return 100
-  if (s.status === 'error') return 0
-  return 35
+// 状态分档：运行中把"挂起等子/暂停于子"一并算上（对用户都是"还在跑"），
+// 待澄清单列（等的是人，不是机器）。旧页签里的"已暂停"从来没统计过（后端无 paused 状态），
+// 数字恒为 0，已由"待澄清"取代。
+const RUNNING_STATUSES: SessionStatus[] = ['running', 'awaiting_child', 'paused_on_child']
+const FILTER_STATUSES: Record<string, SessionStatus[]> = {
+  running: RUNNING_STATUSES,
+  clarify: ['awaiting_clarify'],
+  completed: ['completed'],
+  failed: ['error'],
 }
+const FILTERS = [
+  { key: 'all', label: '全部' },
+  { key: 'running', label: '运行中' },
+  { key: 'clarify', label: '待澄清' },
+  { key: 'completed', label: '已完成' },
+  { key: 'failed', label: '已失败' },
+] as const
+
+const filteredSessions = computed(() => {
+  let list = sessions.value
+  const q = searchSession.value.trim().toLowerCase()
+  if (q) {
+    list = list.filter(
+      (s) => (s.goal || '').toLowerCase().includes(q) || (s.work_dir || '').toLowerCase().includes(q),
+    )
+  }
+  const want = FILTER_STATUSES[filter.value]
+  return want ? list.filter((s) => want.includes(s.status)) : list
+})
+
+const counts = computed(() => {
+  const total = sessions.value.length
+  const by = (sts: SessionStatus[]) => sessions.value.filter((s) => sts.includes(s.status)).length
+  return {
+    all: total,
+    running: by(RUNNING_STATUSES),
+    clarify: by(['awaiting_clarify']),
+    completed: by(['completed']),
+    failed: by(['error']),
+  }
+})
 
 // 会话列表分页：列表按页切片渲染（此前 el-pagination 只绑了 :total、列表渲染全量，
 // 点页码只改分页器自身状态，看起来"点了没用"）。
@@ -170,17 +220,6 @@ const pagedSessions = computed(() => {
 })
 const pageCount = computed(() => Math.max(1, Math.ceil(filteredSessions.value.length / PAGE_SIZE)))
 
-const filteredSessions = computed(() => {
-  let list = sessions.value
-  const q = searchSession.value.trim().toLowerCase()
-  if (q) list = list.filter(s => s.goal.toLowerCase().includes(q))
-  if (filter.value === 'all') return list
-  const map: Record<string, string> = { running: 'running', completed: 'completed', failed: 'error', paused: 'paused' }
-  const want = map[filter.value]
-  if (!want) return list
-  return list.filter(s => s.status === want)
-})
-
 // 过滤条件/搜索变化 → 回到第 1 页；数据减少（删除后）→ 把越界的页码收回来，
 // 否则会停在一个空页上（"共 N 条会话"却一条都不显示）。
 watch([() => filter.value, searchSession], () => { currentPage.value = 1 })
@@ -188,39 +227,39 @@ watch(filteredSessions, () => {
   if (currentPage.value > pageCount.value) currentPage.value = pageCount.value
 })
 
-const counts = computed(() => {
-  const total = sessions.value.length
-  return {
-    all: total,
-    running: sessions.value.filter(s => s.status === 'running').length,
-    completed: sessions.value.filter(s => s.status === 'completed').length,
-    failed: sessions.value.filter(s => s.status === 'error').length,
-    paused: 0,
+// 耗时：运行中算到此刻，已结束算到 ended_at（旧的"进度 35%"是写死的假数据，已删）。
+// 注意只存库的历史会话没有真实结束时间——后端用 created_at 占位，差值 ≤0 时留白，
+// 别显示成"耗时 0s"。
+function fmtElapsed(ms: number) {
+  const sec = Math.round(ms / 1000)
+  if (sec < 60) return `${sec}s`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}m ${sec % 60}s`
+  const h = Math.floor(min / 60)
+  return `${h}h ${min % 60}m`
+}
+
+function sessionDuration(s: SessionSummary) {
+  const start = new Date(s.started_at).getTime()
+  if (!Number.isFinite(start)) return '—'
+  if (s.ended_at) {
+    const end = new Date(s.ended_at).getTime()
+    if (!Number.isFinite(end) || end <= start) return '—'
+    return fmtElapsed(end - start)
   }
-})
+  return fmtElapsed(Date.now() - start)
+}
 
 const stats = computed(() => {
   const total = sessions.value.length
-  const completed = sessions.value.filter(s => s.status === 'completed').length
-  const rate = total > 0 ? Math.round((completed / total) * 100) : 0
-  let calls = 0, tokens = 0, timeouts = 0
-  sessions.value.forEach(s => {
-    (s.events || []).forEach(ev => {
-      if (ev.kind === 'token_usage') {
-        calls++
-        tokens += (ev.input_tokens || 0) + (ev.output_tokens || 0)
-      }
-      if (ev.kind === 'error' && (ev.message?.toLowerCase().includes('timeout') || ev.message?.includes('超时'))) {
-        timeouts++
-      }
-    })
-  })
-  const timeoutRate = calls > 0 ? parseFloat(((timeouts / calls) * 100).toFixed(1)) : 0
+  const completed = counts.value.completed
+  const calls = timeline.value.reduce((n, p) => n + (p.calls || 0), 0)
+  const tokens = timeline.value.reduce((n, p) => n + (p.tokens || 0), 0)
   return {
     total,
-    rate,
+    rate: total > 0 ? Math.round((completed / total) * 100) : 0,
+    running: counts.value.running,
     calls,
-    timeout: timeoutRate,
     tokens,
   }
 })
@@ -321,27 +360,27 @@ function activityStyle(kind: string) {
            保留 min-h 避免空结果时卡片塌成一条。 -->
       <el-card class="!border-line !bg-card flex flex-col min-h-[400px]">
         <template #header>
-          <div class="flex justify-between items-center">
-            <div class="font-bold text-sm text-ink">会话列表</div>
-            <el-input v-model="searchSession" size="small" placeholder="搜索会话..." class="w-48 !bg-page">
+          <div class="flex justify-between items-center gap-3">
+            <div class="font-bold text-sm text-ink shrink-0">会话列表</div>
+            <el-input v-model="searchSession" size="small" placeholder="搜索会话或目录..." class="w-56 !bg-page">
               <template #suffix><el-icon><Search /></el-icon></template>
             </el-input>
           </div>
         </template>
 
         <!-- Tabs + 批量操作 -->
-        <div class="flex gap-2 mb-4 items-center">
+        <div class="flex gap-2 mb-4 items-center flex-wrap">
           <el-button
-            v-for="f in ['all','running','completed','failed','paused']"
-            :key="f"
+            v-for="f in FILTERS"
+            :key="f.key"
             size="small"
-            :type="filter===f ? 'primary' : ''"
-            :class="filter===f ? '!bg-primary !border-none !text-white' : '!bg-transparent !border-none !text-ink-2 hover:!text-ink'"
-            @click="filter=f"
+            :type="filter===f.key ? 'primary' : ''"
+            :class="filter===f.key ? '!bg-primary !border-none !text-white' : '!bg-transparent !border-none !text-ink-2 hover:!text-ink'"
+            @click="filter=f.key"
           >
-            {{ {all:'全部', running:'运行中', completed:'已完成', failed:'已失败', paused:'已暂停'}[f] }} {{ counts[f as keyof typeof counts] }}
+            {{ f.label }} {{ counts[f.key] }}
           </el-button>
-          <div class="ml-auto flex items-center gap-2">
+          <div class="ml-auto flex items-center gap-2 shrink-0">
             <!-- 本页全选：分页后只勾当前页这 10 条（范围写在按钮上，不再用含义模糊的"全选"）。
                  已选集合跨页保留，"删除选中(N)"显示真实总数。 -->
             <el-button
@@ -375,7 +414,8 @@ function activityStyle(kind: string) {
           <div
             v-for="s in pagedSessions"
             :key="s.id"
-            class="p-3 bg-page rounded border border-line flex items-center justify-between group hover:border-primary transition-colors cursor-pointer"
+            class="p-3 bg-page rounded border flex items-center justify-between group cursor-pointer transition-colors"
+            :class="selectedIds.includes(s.id) ? 'border-primary ring-1 ring-primary/40' : 'border-line hover:border-primary'"
             @click="viewSession(s.id)"
           >
             <span class="mr-3 shrink-0" @click.stop>
@@ -385,29 +425,28 @@ function activityStyle(kind: string) {
               />
             </span>
             <div class="flex-1 min-w-0">
-              <div class="flex items-center gap-3 mb-1">
+              <div class="flex items-center gap-2 mb-1 min-w-0">
                 <span class="font-bold text-sm text-ink truncate">{{ s.goal }}</span>
-                <el-tag :type="statusTagType(s.status)" size="small" effect="plain" class="!bg-transparent !border-none px-0"
-                >
-                  {{ statusText(s.status) }} <span class="ml-1" :class="s.status==='running'?'text-blue-500':s.status==='completed'?'text-green-500':s.status==='awaiting_child'?'text-sky-500':'text-red-500'">●</span>
-                </el-tag>
+                <span class="shrink-0 inline-flex items-center gap-1.5 text-xs text-ink-2 whitespace-nowrap">
+                  <span class="w-1.5 h-1.5 rounded-full" :class="statusDotClass(s.status)"></span>
+                  {{ statusText(s.status) }}
+                </span>
               </div>
-              <div class="text-xs text-ink-2">创建时间: {{ fmtDate(s.started_at) }}</div>
-              <div class="text-xs text-ink-2 truncate">目录: {{ s.work_dir || '默认目录' }}</div>
+              <div class="text-xs text-ink-2 truncate">
+                {{ fmtDate(s.started_at) }}
+                <span class="mx-1 text-ink-3">·</span>
+                {{ s.work_dir || '默认目录' }}
+              </div>
             </div>
-            <div class="w-48 px-4 flex flex-col items-end">
-              <div v-if="s.status === 'running'" class="w-full flex items-center gap-2">
-                <span class="text-xs text-ink-2 whitespace-nowrap">进度 {{ progressOf(s) }}%</span>
-                <el-progress :percentage="progressOf(s)" :show-text="false" class="flex-1" />
+            <div class="w-40 px-4 text-right shrink-0">
+              <!-- 只存库的历史会话没有结束时间（后端用 created_at 占位），此时整格留白而不是写"耗时 —" -->
+              <div v-if="sessionDuration(s) !== '—'" class="text-xs text-ink-2 whitespace-nowrap">
+                耗时 {{ sessionDuration(s) }}
               </div>
-              <div v-else-if="s.status === 'completed'" class="w-full flex items-center gap-2">
-                <span class="text-xs text-ink-2 whitespace-nowrap">100%</span>
-                <el-progress :percentage="100" :show-text="false" status="success" class="flex-1" />
-              </div>
-              <div v-else class="text-xs text-ink-2">-</div>
+              <div v-if="s.status === 'running'" class="text-[11px] text-blue-400 mt-0.5">执行中</div>
             </div>
 
-            <div class="w-28 text-right text-xs text-ink-2 flex items-center justify-end gap-2">
+            <div class="w-20 text-right text-xs text-ink-2 flex items-center justify-end gap-2 shrink-0">
               <el-button
                 link
                 type="danger"
@@ -422,10 +461,17 @@ function activityStyle(kind: string) {
               <el-icon class="text-ink-3 group-hover:text-primary"><ArrowRight /></el-icon>
             </div>
           </div>
+
+          <div v-if="!pagedSessions.length" class="text-xs text-ink-2 text-center py-10">
+            {{ searchSession.trim() ? '没有匹配的会话' : '暂无会话' }}
+          </div>
         </div>
 
-        <div class="mt-4 flex justify-between items-center text-xs text-ink-2">
-          <span>共 {{ filteredSessions.length }} 条会话</span>
+        <div class="mt-4 flex justify-between items-center text-xs text-ink-2 gap-3 flex-wrap">
+          <span>
+            共 {{ filteredSessions.length }} 条会话
+            <span v-if="listCapped" class="text-ink-3">（仅显示最近 {{ SESSION_LIST_LIMIT }} 条，更早的未加载）</span>
+          </span>
           <el-pagination v-model:current-page="currentPage" small background layout="prev, pager, next"
                          :total="filteredSessions.length" :page-size="PAGE_SIZE" class="!p-0" />
         </div>
@@ -433,39 +479,39 @@ function activityStyle(kind: string) {
     </div>
 
     <!-- Right Column -->
-    <div class="w-[400px] flex flex-col gap-6 shrink-0 overflow-y-auto">
+    <div class="w-[360px] flex flex-col gap-6 shrink-0 overflow-y-auto">
       <!-- Stats -->
       <el-card class="!border-line !bg-card">
         <template #header>
           <div class="flex justify-between items-center">
-            <div class="font-bold text-sm text-ink">统计概览 (今日)</div>
-            <el-button link type="primary" size="small">查看更多 <el-icon><ArrowRight /></el-icon></el-button>
+            <div class="font-bold text-sm text-ink">统计概览</div>
+            <el-button link type="primary" size="small" @click="load">刷新 <el-icon><Refresh /></el-icon></el-button>
           </div>
         </template>
 
         <div class="grid grid-cols-2 gap-4 mb-6">
           <div class="p-3 bg-page rounded border border-line relative overflow-hidden">
             <div class="text-xs text-ink-2 mb-1">会话总数</div>
-            <div class="text-2xl font-bold text-ink">{{ stats.total }}</div>
-            <div class="text-xs text-ink-2 mt-1">当前内存中的会话</div>
+            <div class="text-2xl font-bold text-ink">{{ listCapped ? SESSION_LIST_LIMIT + '+' : stats.total }}</div>
+            <div class="text-xs text-ink-2 mt-1">运行中 {{ stats.running }} · 待澄清 {{ counts.clarify }}</div>
           </div>
 
           <div class="p-3 bg-page rounded border border-line relative overflow-hidden">
             <div class="text-xs text-ink-2 mb-1">完成率</div>
             <div class="text-2xl font-bold text-ink">{{ stats.rate }}%</div>
-            <div class="text-xs text-ink-2 mt-1">已完成 / 总数</div>
+            <div class="text-xs text-ink-2 mt-1">已完成 {{ counts.completed }} / {{ stats.total }}</div>
           </div>
 
           <div class="p-3 bg-page rounded border border-line relative overflow-hidden">
-            <div class="text-xs text-ink-2 mb-1">LLM 调用总数</div>
+            <div class="text-xs text-ink-2 mb-1">近 12 小时调用</div>
             <div class="text-2xl font-bold text-ink">{{ stats.calls.toLocaleString() }}</div>
-            <div class="text-xs text-ink-2 mt-1">累计 Token: {{ stats.tokens.toLocaleString() }}</div>
+            <div class="text-xs text-ink-2 mt-1">LLM 请求次数</div>
           </div>
 
           <div class="p-3 bg-page rounded border border-line relative overflow-hidden">
-            <div class="text-xs text-ink-2 mb-1">超时率</div>
-            <div class="text-2xl font-bold text-ink">{{ stats.timeout }}%</div>
-            <div class="text-xs text-ink-2 mt-1">按 token_usage 事件估算</div>
+            <div class="text-xs text-ink-2 mb-1">近 12 小时 Token</div>
+            <div class="text-2xl font-bold text-ink">{{ stats.tokens.toLocaleString() }}</div>
+            <div class="text-xs text-ink-2 mt-1">输入 + 输出</div>
           </div>
         </div>
 
@@ -489,7 +535,6 @@ function activityStyle(kind: string) {
         <template #header>
           <div class="flex justify-between items-center">
             <div class="font-bold text-sm text-ink">最近活动</div>
-            <el-button link type="primary" size="small">查看更多 <el-icon><ArrowRight /></el-icon></el-button>
           </div>
         </template>
 

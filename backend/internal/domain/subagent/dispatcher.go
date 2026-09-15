@@ -3813,8 +3813,9 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 				result.MachineCheck = strings.TrimRight(result.MachineCheck, "\n") + "\n\n" + section
 			}
 		}
-		// runtime 层机器强制（TODO #67）：探针证据 = browser_navigate 成功 +
-		// browser_evaluate 断言成功 + console 回读无 error，缺任一判未验证。
+		// runtime 层机器强制（TODO #67）：探针证据 = ui_preview__browser_navigate 成功 +
+		// ui_preview__browser_evaluate 断言成功 + console 回读无 error，缺任一判未验证
+		//（HasRuntimeProbeEvidence 按裸名匹配，兼容无前缀历史记录）。
 		// 与 visual 层同构：缺证据重试 1 轮 → 仍缺 → delivered-unverified 黄态。
 		if levels["runtime"] && !agent.HasRuntimeProbeEvidence(result.History) {
 			log.Printf("[subagent] verify runtime probe missing: sub=%s role=%s (retry 1 round)", subAgentID, roleDef.ID)
@@ -4388,13 +4389,13 @@ var errVerifyMissing = errors.New("sub-agent missing executable verification evi
 
 // errVisualEvidenceMissing 标记视觉层缺截图回显证据（TODO #59 验收分层 visual 层）：
 // spec verify_levels 含 visual 的任务（UI/游戏/绘制类），重试 1 轮后仍无成功的
-// browser_take_screenshot 证据。语义同 verify_missing（产出可用但未验证），
+// ui_preview__browser_take_screenshot 证据。语义同 verify_missing（产出可用但未验证），
 // failureKindOf 归并到 FailureKindVerifyMissing → delivered-unverified 黄态。
 var errVisualEvidenceMissing = errors.New("sub-agent missing visual (screenshot) evidence")
 
 // visualRetryMessage 是视觉层缺截图证据时的 1 轮反馈重试指令（TODO #59）。
 const visualRetryMessage = "【视觉证据要求】本任务验收层级含 visual（UI/游戏/绘制类）：终答前必须" +
-	"经 tool_catalog 挂载 ui_preview，browser_navigate 打开页面后 browser_take_screenshot " +
+	"经 tool_catalog 挂载 ui_preview，ui_preview__browser_navigate 打开页面后 ui_preview__browser_take_screenshot " +
 	"截图回显实际渲染效果（file:///workspace/<相对工作目录> 路径），截图成功即视觉证据。" +
 	"截图必须展示真实渲染结果（贴图/动画/布局可见），仅空页面不算。请补充截图证据后重新产出最终答复。"
 
@@ -4441,7 +4442,7 @@ func formatSubAgentFailure(ctx context.Context, err error, result agent.ReactRes
 		return "子 Agent 未提供可执行验证证据（没有成功运行的测试/lint/--check 命令）。"
 	}
 	if errors.Is(err, errVisualEvidenceMissing) {
-		return "子 Agent 未提供视觉验证证据（UI/游戏/绘制类任务要求 browser_take_screenshot 截图回显，没有成功截图记录）。"
+		return "子 Agent 未提供视觉验证证据（UI/游戏/绘制类任务要求 ui_preview__browser_take_screenshot 截图回显，没有成功截图记录）。"
 	}
 	if errors.Is(err, errSmokeFailed) {
 		// 错误文本携带冒烟失败明细（命令 + 退出码 + 输出尾部），剥掉哨兵前缀直陈证据。
