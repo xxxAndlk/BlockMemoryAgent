@@ -223,34 +223,18 @@ fixed_roles:
       thinking: medium     # 2026-09-07 恢复 medium（TODO 第八项 P0-1）：正确率>延迟，测试编写同样需要推理预算
     can_be_called: true
 
-  # 文档助手
+  # 文档助手（2026-09-16 起兼快速档 gear=fast 的顶层角色：直达快速档会话，
+  # 文档/问答类轻任务直接完成；识别出超范围工程任务调 escalate_gear 升档到集群档。
+  # 作为叶子被 domain 派发时旧语义不变。）
   - id: doc_assistant
     name: 文档助手
     type: fixed
     description: 技术文档编写与维护助手
     keywords: ["文档", "doc", "README", "注释", "example"]
     skills: []
-    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill, escalate_gear]
     model_config:
       model_ref: ark-deepseek-v4-flash # 连接参数见 config/models.json
       temperature: 0.5
       thinking: off       # 执行型角色关思考（同 domain_agent 实证）
     can_be_called: true
-
-  # 快速对话角色（TODO #14 会话三档控制 P0-1）：快速档（gear=fast）会话的直达对话角色。
-  # 不进集群编排（无子 Agent 派发/看板/台账）；can_be_called=false 禁止经 call_sub_agent
-  # 派发（只由 runSession/resumeSession 按档位选择）；唯一工具 escalate_gear 用于把
-  # 会话中识别出的工程任务升档到集群档（TODO #14 升档机制）。提示词内置 pkg/prompts Chat。
-  - id: chat
-    name: 对话助手
-    type: fixed
-    description: 快速档直达对话：闲聊/快问快答秒回；工程任务经 escalate_gear 升档
-    keywords: []
-    skills: []
-    tools: [escalate_gear]
-    model_config:
-      model_ref: ark-deepseek-v4-flash # 快模型抵扣 0.5；快速档要秒回，thinking=low 保底推理
-      temperature: 0.3
-      thinking: low
-    can_be_called: false
-    spec_exempt: true

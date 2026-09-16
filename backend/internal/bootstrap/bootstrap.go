@@ -577,7 +577,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err := agentSvc.SetDefaultTrustMode(cfg.Agent.TrustMode); err != nil {
 		return nil, fmt.Errorf("invalid agent.trust_mode: %w", err)
 	}
-	// 默认执行档位（TODO #14 会话三档控制）：config agent.default_gear 注入，同上。
+	// 默认执行档位（TODO #14 三档全手动）：config agent.default_gear 注入（现为 daily），同上。
 	if err := agentSvc.SetDefaultGear(cfg.Agent.DefaultGear); err != nil {
 		return nil, fmt.Errorf("invalid agent.default_gear: %w", err)
 	}

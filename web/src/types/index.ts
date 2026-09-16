@@ -49,8 +49,11 @@ export interface ChatMessage {
 /** 信任模式（TODO 第10⑥ 三级信任，对标 Codex）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主。 */
 export type TrustMode = 'suggest' | 'auto-edit' | 'full-auto'
 
-/** 会话执行档位（TODO #14 三档控制）：auto=规则自动选 / fast=轻聊快答 / cluster=完整重装；explore 预留未实现。 */
-export type SessionGear = 'auto' | 'fast' | 'cluster'
+/** 会话执行档位（TODO #14 三档全手动，2026-09-16）：fast=文档助手顶层直达 / daily=DomainAgent 顶层直接执行（默认）/ cluster=Meta 全装编排。 */
+export type SessionGear = 'fast' | 'daily' | 'cluster'
+
+/** 会话级思考强度（2026-09-16）：off|low|medium|high；空串 = 跟随角色默认。只影响本会话顶层 Agent。 */
+export type SessionThinking = '' | 'off' | 'low' | 'medium' | 'high'
 
 /**
  * 会话摘要（GET /sessions 列表线型，与后端 server.sessionSummary 对齐）。
@@ -70,8 +73,10 @@ export interface SessionSummary {
   temp_dir?: string
   /** 信任模式（TODO 第10⑥）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主；空 = 后端回退现网语义。 */
   trust_mode?: TrustMode | ''
-  /** 执行档位（TODO #14）：auto|fast|cluster；空 = 未设置（按集群档现行为兜底）。 */
+  /** 执行档位（TODO #14 三档全手动）：fast|daily|cluster；空 = 未设置（按集群档现行为兜底）。 */
   gear?: SessionGear | ''
+  /** 会话级思考强度（2026-09-16）：off|low|medium|high；空/缺省 = 跟随角色默认。 */
+  thinking?: SessionThinking
 }
 
 export interface Session extends SessionSummary {

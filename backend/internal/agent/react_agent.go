@@ -117,6 +117,12 @@ type ReActAgent struct {
 	// 无限 budget 不会自行暂停，需靠此检查跳出 wait loop 返回 PausedOnChild，由上层 pauseSession
 	// 置会话暂停态。为 nil 时不检查（默认关闭，仅 MetaAgent 注入）。
 	pausedChecker PausedChildChecker
+	// suspendOnChildWait 顶层 Agent 挂起等子语义（WithSuspendOnChildWait 注入）：终答轮
+	// 仍有未决子 Agent 时置 awaiting_child 立即返回，而非原地阻塞 waitForChildren。
+	// 仅会话顶层 Agent（runSession/resumeSession 构造）开启；dispatcher 子 Agent 保持
+	// false（其运行由 runSubAgent 同步承载，无会话态可落，提前返回会被当终答回传）。
+	// 原按 role.ID=="meta" 硬判——daily 档（domain 顶层）放开为显式开关。
+	suspendOnChildWait bool
 	// activityReporter 可选的活动上报回调，由 Dispatcher 心跳巡检注入。
 	// 语义化 kind 上报（TODO 第10项②证据化）：llm_start/llm_end（LLM 调用首尾）、
 	// tool:<名>/tool_end（工具派发首尾）、stream（流式 chunk）、keepalive（保活 tick，
@@ -381,6 +387,14 @@ func (a *ReActAgent) WithPersonaInjector(p PersonaInjector) *ReActAgent {
 // 传 nil 关闭检查（默认关闭，仅 MetaAgent 注入）。
 func (a *ReActAgent) WithPausedChildChecker(p PausedChildChecker) *ReActAgent {
 	a.pausedChecker = p
+	return a
+}
+
+// WithSuspendOnChildWait 开启顶层挂起等子语义（会话顶层 Agent 专用）：
+// 终答轮仍有未决子 Agent 时返回 SuspendOnChildWait，由上层置 awaiting_child。
+// 默认关闭（dispatcher 子 Agent 保持阻塞 waitForChildren 旧行为）。
+func (a *ReActAgent) WithSuspendOnChildWait(v bool) *ReActAgent {
+	a.suspendOnChildWait = v
 	return a
 }
 
@@ -739,9 +753,10 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				// 未决子 Agent 时不再原地阻塞 waitForChildren，立即带本轮中继文本返回，
 				// 由上层置 awaiting_child——子完成（dispatcher childDoneFn 回调）或用户
 				// 新消息唤醒 resumeSession 续跑整合，token 开销与原阻塞等待平价。
-				// 仅 meta 适用：domain/leaf 等子仍走 waitForChildren 阻塞——其运行由
-				// dispatcher runSubAgent 同步承载，无会话态可落，提前返回会被当终答回传。
-				if a.role.ID == "meta" {
+				// 仅会话顶层 Agent 适用（WithSuspendOnChildWait，meta/domain 顶层）：
+				// dispatcher 子 Agent 仍走 waitForChildren 阻塞——其运行由 runSubAgent
+				// 同步承载，无会话态可落，提前返回会被当终答回传。
+				if a.suspendOnChildWait {
 					return ReactResult{Text: assistant.Content, History: history, SuspendOnChildWait: true}, nil
 				}
 				// 等待期间不烧 LLM 轮次：纯阻塞等子 Agent 完成信号，仅当 mailbox

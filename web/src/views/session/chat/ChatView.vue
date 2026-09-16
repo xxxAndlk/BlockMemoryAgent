@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { Session, SessionEvent, AgentNode, ClarifyPending, WireImage } from '@/types'
+import type { Session, SessionEvent, AgentNode, ClarifyPending, WireImage, SessionGear, SessionThinking } from '@/types'
 import ChatHeader from './components/ChatHeader.vue'
 import MessageList from './components/MessageList.vue'
 import ChatInput from './components/ChatInput.vue'
@@ -37,7 +37,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  submit: [content: string, images: WireImage[]]
+  submit: [content: string, images: WireImage[], gear: SessionGear, thinking: SessionThinking]
   cancel: []
   stop: []
   interrupt: []
@@ -91,7 +91,7 @@ const showStatusLine = computed(() =>
                  :work-dir="workDir || ''"
                  :work-dir-saving="workDirSaving"
                  :recent-dirs="recentDirs"
-                 @submit="(c: string, i: WireImage[]) => emit('submit', c, i)"
+                 @submit="(c: string, i: WireImage[], g: SessionGear, t: SessionThinking) => emit('submit', c, i, g, t)"
                  @new-session="emit('new-session')"
                  @update-workdir="(d: string) => emit('update-workdir', d)" />
     </template>

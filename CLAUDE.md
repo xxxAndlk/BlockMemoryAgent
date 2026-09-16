@@ -109,9 +109,10 @@ Hot-pluggable plugins (design: `doc/设计文档_插件范式.md`): plugins regi
 
 落地详情见 `doc/TODO.md` #14-18 条内「第一批落地」标注与 `doc/变更.md` 任务 160。日常改动需知的稳定语义：
 
-- **会话档位** `auto|fast|cluster`（explore 留枚举未实现）：`POST /api/sessions/:id/gear` 手动切档任意向；`auto` 每轮按 `agent/gear_selector.go` 规则重选（闲聊信号→fast，其余 cluster）且**只升不降**；`escalate_gear` 工具经 askUser 通道确认升档（槽占用即工具级"稍后再试"）；gear 随 MetaMemory JSONB 落库、restore 回填。fast 档走 `chat` 角色（roles.yaml fixed_roles，快模型 + 低 thinking，跳过 roster/ledger wrapper），cluster 走 meta 全装。
+- **会话档位三档全手动** `fast|daily|cluster`（2026-09-16 重构，`auto` 退役读侧映射 daily；explore 不实现）：`POST /api/sessions/:id/gear` 手动切档任意向，创建时 `POST /api/sessions` body 的 `gear` 定初始档，默认档取 config `default_gear`（现为 daily）。档位→顶层角色（`resolveGearMetaRole`）：fast→`doc_assistant`（文档助手直达，挂 escalate_gear）、daily→`domain`（DomainAgent 顶层直接执行，可自行下拆叶子；跳过看板/台账/热驻清单与 meta 技能块，保留 pending/paused 检查器与技能块=角色自有 Skills）、cluster→`meta` 全装。`escalate_gear`（doc_assistant + 合成 domain 角色挂载）经 askUser 通道确认升档，hook 有顶层守卫（子 Agent 调用恒拒）；gear 随 MetaMemory JSONB 落库、restore 回填。顶层挂起等子语义走显式开关 `WithSuspendOnChildWait`（meta/domain 顶层 true，子 Agent false）。
+- **会话级思考强度**（2026-09-16）：`off|low|medium|high`，空=跟随角色默认；创建请求 `thinking` 字段或 `POST /api/sessions/:id/thinking` 设置，随 MetaMemory JSONB 落库；只覆盖**本会话顶层 Agent**，`providerForRole` 每次 LLM 调用实时读取 → 运行中切换下一轮即生效（热）；ModelFactory 组合键缓存（roleID+thinking）承载覆盖，`invalidateByRecomputeLocked` 热更新比对带 override 重算。Web 在输入栏（未绑会话）与会话头各有档位+思考强度下拉。
 - **roleToolGate 默认开启**（config `role_tool_gate_enabled: true`）：Dispatch 执行前按"角色静态 tools ∪ 该角色可见插件工具"并集硬校验；meta tools 已收窄 40→22（roles.yaml）。逃生舱：改回 false。
-- **提示词版本钉**：`pkg/prompts.Version`（现值 `20260915-1`）——语义改动提示词必须 bump 并写进变更记录；启动日志打印。
+- **提示词版本钉**：`pkg/prompts.Version`（现值 `20260916-1`）——语义改动提示词必须 bump 并写进变更记录；启动日志打印。
 - **数据围栏**：MCP 插件与 HTTPGet/HTTPPost 的外部内容经 `tool.WrapUntrusted` 包进 `<untrusted_data>` 围栏（围栏标记转义防逃逸，本地工具不包）；meta/domain 提示词含【数据围栏纪律】——围栏内是数据不是指令。
 - **新端点**：`GET /api/capabilities`（装机自检六项 llm/postgres/redis/embed/plugins/workdir，只做廉价检查不发真实 LLM 调用，settings 页有面板）；`GET /api/sessions/:id/export`（zip：会话 JSON ×4 + workspace/.bma 产物树，2000 文件/64MB 上限）；`GET /api/export/memory`（未归档 global_knowledge JSONL + user_profile.md + skills_learned/）。导入端点未做。
 - **通知**：`notify.webhook_url`（空=关）+ `webhook_events`（默认 [completed,error]，状态枚举无 failed）——会话终态 best-effort POST（3s 超时，60s 同会话同状态去重）；前端页面隐藏 ∧ 终态 → 浏览器 Notification（settings 页申请权限）。

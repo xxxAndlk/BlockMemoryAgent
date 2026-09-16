@@ -43,11 +43,12 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	// work_dir 可选（每会话工作目录，绝对/相对均转绝对）；
 	// gear 可选（TODO #14 新会话页选档）：显式指定初始执行档位，非法枚举 400。
 	req, err := DecodeBody[struct {
-		Goal    string            `json:"goal"`
-		Images  []agent.WireImage `json:"images,omitempty"`
-		Videos  []agent.WireVideo `json:"videos,omitempty"`
-		WorkDir string            `json:"work_dir,omitempty"`
-		Gear    string            `json:"gear,omitempty"`
+		Goal     string            `json:"goal"`
+		Images   []agent.WireImage `json:"images,omitempty"`
+		Videos   []agent.WireVideo `json:"videos,omitempty"`
+		WorkDir  string            `json:"work_dir,omitempty"`
+		Gear     string            `json:"gear,omitempty"`
+		Thinking string            `json:"thinking,omitempty"`
 	}](c.Request)
 	if err != nil {
 		c.String(http.StatusBadRequest, "请求体无效")
@@ -58,7 +59,11 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		return
 	}
 	if req.Gear != "" && !tool.ValidGear(req.Gear) {
-		c.String(http.StatusBadRequest, "gear 非法（want auto|fast|cluster）")
+		c.String(http.StatusBadRequest, "gear 非法（want fast|daily|cluster）")
+		return
+	}
+	if !tool.ValidThinking(req.Thinking) {
+		c.String(http.StatusBadRequest, "thinking 非法（want off|low|medium|high，或留空跟随角色默认）")
 		return
 	}
 	// work_dir 校验：转绝对路径，不存在或非目录直接 400（在到达 agent 前拦截）。
@@ -81,7 +86,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	}
 
 	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费）。
-	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos, WorkDir: req.WorkDir, Gear: req.Gear})
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos, WorkDir: req.WorkDir, Gear: req.Gear, Thinking: req.Thinking})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
@@ -123,6 +128,7 @@ type sessionSummary struct {
 	WorkDir   string     `json:"work_dir,omitempty"`
 	TempDir   string     `json:"temp_dir,omitempty"`
 	Gear      string     `json:"gear,omitempty"`
+	Thinking  string     `json:"thinking,omitempty"`
 	TrustMode string     `json:"trust_mode,omitempty"`
 }
 
@@ -137,6 +143,7 @@ func toSessionSummary(s *agent.Session) sessionSummary {
 		WorkDir:   s.WorkDir,
 		TempDir:   s.TempDir,
 		Gear:      s.Gear,
+		Thinking:  s.Thinking,
 		TrustMode: s.TrustMode,
 	}
 	if !s.EndedAt.IsZero() {
@@ -486,10 +493,10 @@ func (m *SessionManager) HandleSessionTrustMode(c *gin.Context) {
 	})
 }
 
-// HandleSessionGear 处理 POST /api/sessions/{id}/gear（TODO #14 会话三档控制）。
-// 职责：切换会话执行档位（auto|fast|cluster），经 Control 通道下发；
-// atomic 即时生效——正在运行的 ReAct 循环下一轮按新档裁决（在飞子 Agent 不强杀）。
-// 手动切换允许任意向（自动升档只升不降的约束只在 escalate 发起侧）。
+// HandleSessionGear 处理 POST /api/sessions/{id}/gear（TODO #14 三档全手动）。
+// 职责：切换会话执行档位（fast|daily|cluster），经 Control 通道下发；
+// atomic 即时生效——正在运行的 ReAct 循环下一轮按新档选角色（在飞子 Agent 不强杀）。
+// 手动切换允许任意向（升档只升不降的约束只在 escalate 发起侧）。
 // 非法枚举 400；会话不存在 404。
 func (m *SessionManager) HandleSessionGear(c *gin.Context) {
 	id := c.Param("id")
@@ -501,7 +508,7 @@ func (m *SessionManager) HandleSessionGear(c *gin.Context) {
 		return
 	}
 	if !tool.ValidGear(req.Gear) {
-		c.String(http.StatusBadRequest, "gear 非法（want auto|fast|cluster）")
+		c.String(http.StatusBadRequest, "gear 非法（want fast|daily|cluster）")
 		return
 	}
 	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
@@ -515,6 +522,37 @@ func (m *SessionManager) HandleSessionGear(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"gear":       req.Gear,
+	})
+}
+
+// HandleSessionThinking 处理 POST /api/sessions/{id}/thinking（2026-09-16 会话级思考强度）。
+// 职责：切换会话思考强度（off|low|medium|high，空串=跟随角色默认），经 Control 通道下发；
+// atomic 即时生效——providerForRole 每次 LLM 调用实时读取，下一次调用即用新档（热，免重启）。
+// 只覆盖本会话顶层 Agent，在飞子 Agent 不受影响。非法值 400；会话不存在 404。
+func (m *SessionManager) HandleSessionThinking(c *gin.Context) {
+	id := c.Param("id")
+	req, err := DecodeBody[struct {
+		Thinking string `json:"thinking"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	if !tool.ValidThinking(req.Thinking) {
+		c.String(http.StatusBadRequest, "thinking 非法（want off|low|medium|high，或留空跟随角色默认）")
+		return
+	}
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
+		Op:   agent.ControlOpThinking,
+		Args: map[string]any{"thinking": req.Thinking},
+	}); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"session_id": id,
+		"thinking":   req.Thinking,
 	})
 }
 

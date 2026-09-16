@@ -67,10 +67,18 @@ func GenerateWithTemperature(ctx context.Context, c LLMClient, prompt string, te
 
 // cachedClient 缓存条目：客户端 + 构造时使用的生效配置。
 // cfg 用于热更新比对：models.json 变更后重算生效配置，变化才失效重建。
+// roleID/thinkingOverride 记录构造来源：会话级思考强度覆盖走组合缓存键
+//（roleID+thinkingCacheKeySep+thinking），热更新比对时按 roleID 重算再套 override，
+// 避免组合键无法反解角色。
 type cachedClient struct {
-	client LLMClient
-	cfg    types.AgentModelConfig
+	client           LLMClient
+	cfg              types.AgentModelConfig
+	roleID           string
+	thinkingOverride string
 }
+
+// thinkingCacheKeySep 组合缓存键分隔符（不可出现在 roleID/thinking 字面量中）。
+const thinkingCacheKeySep = "\x1f"
 
 // agentOverride 实例级模型覆盖条目：只活在本进程内存，实例终结即回收，永不落盘。
 type agentOverride struct {
@@ -148,12 +156,24 @@ func NewModelFactory(cfg *config.RoleConfigFile) *ModelFactory {
 // 副作用：首次调用会构造并缓存客户端。
 // 并发安全：读写锁 + 双重检查，保证同角色只构造一次。
 func (f *ModelFactory) GetModel(ctx context.Context, roleDefID string) (LLMClient, error) {
+	return f.getModel(ctx, roleDefID, "")
+}
+
+// getModel GetModel 的内部实现，附加会话级思考强度覆盖（thinking 非空时生效）。
+// 覆盖客户端按 roleID+thinking 组合键独立缓存（同角色不同档位多份客户端）；
+// thinking 为空时键即 roleID，与旧行为完全一致。
+func (f *ModelFactory) getModel(ctx context.Context, roleDefID, thinking string) (LLMClient, error) {
 	// 热更新检查：models.json 变更则失效受影响的缓存条目（含缓存命中场景）。
 	f.checkRegistryReload()
 
+	key := roleDefID
+	if thinking != "" {
+		key = roleDefID + thinkingCacheKeySep + thinking
+	}
+
 	// 快路径：读锁查缓存
 	f.mu.RLock()
-	if m, ok := f.models[roleDefID]; ok {
+	if m, ok := f.models[key]; ok {
 		// 缓存命中，释放读锁并返回
 		f.mu.RUnlock()
 		return m.client, nil
@@ -167,7 +187,7 @@ func (f *ModelFactory) GetModel(ctx context.Context, roleDefID string) (LLMClien
 	defer f.mu.Unlock()
 
 	// 双重检查：防止等待锁期间已被其他协程构造
-	if m, ok := f.models[roleDefID]; ok {
+	if m, ok := f.models[key]; ok {
 		return m.client, nil
 	}
 
@@ -175,6 +195,10 @@ func (f *ModelFactory) GetModel(ctx context.Context, roleDefID string) (LLMClien
 	modelCfg, err := f.resolveConfig(roleDefID)
 	if err != nil {
 		return nil, err
+	}
+	// 会话级思考强度覆盖（非空才覆盖角色解析结果）。
+	if thinking != "" {
+		modelCfg.Thinking = thinking
 	}
 
 	// API Key 缺失直接报错，不再回退 mock
@@ -189,7 +213,7 @@ func (f *ModelFactory) GetModel(ctx context.Context, roleDefID string) (LLMClien
 	}
 
 	// 写入缓存并返回
-	f.models[roleDefID] = cachedClient{client: client, cfg: modelCfg}
+	f.models[key] = cachedClient{client: client, cfg: modelCfg, roleID: roleDefID, thinkingOverride: thinking}
 	return client, nil
 }
 
@@ -286,15 +310,48 @@ func (f *ModelFactory) fallbackChainFor(roleID string) []string {
 	return out
 }
 
+// GetBladesProviderWithThinking 按会话思考强度解析 provider（2026-09-16 会话级思考强度）：
+// thinking 为空时零覆盖，委托 GetBladesProviderWithFallback（现行为）；非空时主 provider
+// 按 roleID+thinking 组合键构造缓存，备胎链条目沿用同一 thinking 覆盖（换备胎不改档位）。
+func (f *ModelFactory) GetBladesProviderWithThinking(ctx context.Context, roleID, thinking string, observe FallbackObserver) (blades.ModelProvider, error) {
+	if thinking == "" {
+		return f.GetBladesProviderWithFallback(ctx, roleID, observe)
+	}
+	client, err := f.getModel(ctx, roleID, thinking)
+	if err != nil {
+		return nil, err
+	}
+	bc, ok := client.(*BladesClient)
+	if !ok {
+		return nil, fmt.Errorf("blades provider unavailable for %s", roleID)
+	}
+	ids := f.fallbackChainFor(roleID)
+	if len(ids) == 0 {
+		return bc.Provider(), nil
+	}
+	return newFallbackProvider(roleID, bc.Provider(), ids, func(rid, eid string) (blades.ModelProvider, error) {
+		return f.buildFallbackProviderWithThinking(rid, eid, thinking)
+	}, observe), nil
+}
+
 // buildFallbackProvider 构造单个备胎条目的 provider（惰性调用，构造失败由备胎层
 // 永久标记本档不可用）。生效配置 = 角色基础配置 + 条目连接参数（同 SetAgentModel
 // 的构造口径，但不做连通性探测——备胎启用时机在故障现场，预探测会拖慢每次解析）。
 func (f *ModelFactory) buildFallbackProvider(roleID, entryID string) (blades.ModelProvider, error) {
+	return f.buildFallbackProviderWithThinking(roleID, entryID, "")
+}
+
+// buildFallbackProviderWithThinking 同 buildFallbackProvider，附加会话思考强度覆盖
+//（thinking 非空时覆盖条目生效档；空则与 buildFallbackProvider 完全一致）。
+func (f *ModelFactory) buildFallbackProviderWithThinking(roleID, entryID, thinking string) (blades.ModelProvider, error) {
 	entry, ok := f.entryByID(entryID)
 	if !ok {
 		return nil, fmt.Errorf("条目 %q 不在模型注册表", entryID)
 	}
 	cfg := applyModelEntry(f.resolveBaseConfig(roleID), entry)
+	if thinking != "" {
+		cfg.Thinking = thinking
+	}
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("条目 %q 未配置 api_key", entryID)
 	}
@@ -601,10 +658,25 @@ func (f *ModelFactory) checkRegistryReload() {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for roleID, c := range f.models {
+	f.invalidateByRecomputeLocked()
+}
+
+// invalidateByRecomputeLocked 重算缓存中各条目的生效配置，变化（或解析失败）才删除。
+// 组合键条目（roleID+thinkingCacheKeySep+thinking）按来源角色 roleID 重算后套回
+// thinkingOverride 再比对——否则会话级思考强度客户端会在每次 models.json 触碰时误失效。
+// 调用方需持有 f.mu 写锁。
+func (f *ModelFactory) invalidateByRecomputeLocked() {
+	for key, c := range f.models {
+		roleID := c.roleID
+		if roleID == "" {
+			roleID = key // 兼容非常规写入路径：旧条目键即角色 ID
+		}
 		newCfg, err := f.resolveConfig(roleID)
+		if err == nil && c.thinkingOverride != "" {
+			newCfg.Thinking = c.thinkingOverride
+		}
 		if err != nil || newCfg != c.cfg {
-			delete(f.models, roleID)
+			delete(f.models, key)
 		}
 	}
 }
@@ -986,12 +1058,7 @@ func (f *ModelFactory) RegistryModels() []types.ModelEntry {
 func (f *ModelFactory) invalidateChangedClients() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for roleID, c := range f.models {
-		newCfg, err := f.resolveConfig(roleID)
-		if err != nil || newCfg != c.cfg {
-			delete(f.models, roleID)
-		}
-	}
+	f.invalidateByRecomputeLocked()
 }
 
 // probe 执行切换前连通性探测；probeHook 非空用注入实现，否则默认临时客户端。

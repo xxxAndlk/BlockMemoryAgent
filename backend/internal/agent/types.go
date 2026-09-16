@@ -133,9 +133,12 @@ type CreateRequest struct {
 	// Videos 首条消息携带的视频（Alt+V 粘贴视频文件）：CreateSession 内抽帧
 	// 并入 Images、元数据文本并入 Goal，Videos 本身不持久化。
 	Videos []WireVideo
-	// Gear 显式指定初始执行档位（TODO #14 新会话页选档）：合法枚举（auto|fast|cluster）
+	// Gear 显式指定初始执行档位（TODO #14 新会话页选档）：合法枚举（fast|daily|cluster）
 	// 覆盖 config agent.default_gear；空/非法 = 回落默认。HTTP 层负责 400 校验。
 	Gear string
+	// Thinking 会话级思考强度（2026-09-16）：off|low|medium|high，空=跟随角色默认。
+	// 只覆盖本会话顶层 Agent；HTTP 层负责 400 校验。
+	Thinking string
 }
 
 // ResumeRequest 表示恢复一个此前暂停或已结束的会话。
@@ -227,11 +230,15 @@ const (
 	// Args{"work_dir": 绝对路径，空串=回落进程默认}。落库即时保存，下一回合生效
 	//（正在执行的工具调用已按旧目录解析）。
 	ControlOpWorkDir = "work-dir"
-	// ControlOpGear 切换会话执行档位（TODO #14 会话三档控制）：
-	// Args{"gear": "auto|fast|cluster"}，atomic 即时生效——正在运行的 ReAct 循环
-	// 下一轮按新档裁决（在飞子 Agent 不强杀，同 trustMode 语义）。
-	// 手动切换允许任意向；自动升档（escalate）只升不降由发起侧约束。
+	// ControlOpGear 切换会话执行档位（TODO #14 三档全手动）：
+	// Args{"gear": "fast|daily|cluster"}，atomic 即时生效——正在运行的 ReAct 循环
+	// 下一轮按新档选角色（在飞子 Agent 不强杀，同 trustMode 语义）。
+	// 手动切换允许任意向；升档（escalate）只升不降由发起侧约束。
 	ControlOpGear = "gear"
+	// ControlOpThinking 切换会话级思考强度（2026-09-16）：
+	// Args{"thinking": "off|low|medium|high|空串=跟随角色默认"}，atomic 即时生效——
+	// providerForRole 每次 LLM 调用实时读取，下一次调用即用新档（热，免重启）。
+	ControlOpThinking = "thinking"
 )
 
 // Filter 表示列出会话时使用的筛选条件。
@@ -347,9 +354,12 @@ type Session struct {
 	// TrustMode 会话当前信任模式（TODO 第10⑥）：suggest|auto-edit|full-auto；
 	// 空串 = 未设置（Registry 回退现网生产边界 + 危险命令语义）。
 	TrustMode string
-	// Gear 会话执行档位（TODO #14 会话三档控制）：auto|fast|cluster；
+	// Gear 会话执行档位（TODO #14 三档全手动）：fast|daily|cluster；
 	// 空串 = 未设置（按集群档现行为兜底）。
 	Gear string
+	// Thinking 会话级思考强度（2026-09-16）：off|low|medium|high；
+	// 空串 = 跟随角色默认。
+	Thinking string
 }
 
 // Event 是会话事件的 DTO，按字段逐一对齐 server.SessionEvent。

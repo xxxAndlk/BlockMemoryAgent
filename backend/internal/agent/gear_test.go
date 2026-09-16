@@ -30,7 +30,7 @@ func TestReactService_GearLifecycle(t *testing.T) {
 		t.Fatalf("createSession should inherit default gear, got %q", got)
 	}
 
-	// 未配置默认档：新会话 gear 为空（runSession 按 auto 选档、集群兜底）。
+	// 未配置默认档：新会话 gear 为空（runSession 按集群档兜底）。
 	svc2 := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
 	sess2 := svc2.store.createSession("无默认档", "")
 	if got := sess2.currentGear(); got != "" {
@@ -72,7 +72,7 @@ func TestGearMetaMemoryRoundTrip(t *testing.T) {
 	if len(meta) != 1 || meta[0]["gear"] != tool.GearFast {
 		t.Fatalf("sessionMetaMemory should carry gear, got %+v", meta)
 	}
-	if got := gearFromMetaMemory(meta, tool.GearAuto); got != tool.GearFast {
+	if got := gearFromMetaMemory(meta, tool.GearDaily); got != tool.GearFast {
 		t.Fatalf("gearFromMetaMemory should read back fast, got %q", got)
 	}
 
@@ -87,8 +87,79 @@ func TestGearMetaMemoryRoundTrip(t *testing.T) {
 
 	// 旧记录缺键/非法值：回落 fallback。
 	bogus := []map[string]any{{"gear": "warp"}, {"other": 1}}
-	if got := gearFromMetaMemory(bogus, "auto"); got != "auto" {
+	if got := gearFromMetaMemory(bogus, "daily"); got != "daily" {
 		t.Fatalf("invalid stored gear must fall back, got %q", got)
+	}
+
+	// 历史值 "auto"（规则自动选档，2026-09-16 退役）：读侧映射 daily。
+	legacy := []map[string]any{{"gear": "auto"}}
+	if got := gearFromMetaMemory(legacy, tool.GearCluster); got != tool.GearDaily {
+		t.Fatalf("legacy auto should map to daily, got %q", got)
+	}
+}
+
+// TestSessionThinkingRoundTrip 验证会话级思考强度（2026-09-16）：
+// 切换校验、MetaMemory 持久化往返（gear+thinking 同 map）、缺键回落空串、CreateRequest 覆盖。
+func TestSessionThinkingRoundTrip(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	ctx := context.Background()
+
+	sess := svc.store.createSession("思考强度测试", "")
+	if err := svc.SetSessionThinking(sess.ID, "bogus"); err == nil {
+		t.Fatal("SetSessionThinking must reject invalid thinking")
+	}
+	// 大写/空白归一化（HTTP 层已先行校验，服务层宽容归一）。
+	if err := svc.SetSessionThinking(sess.ID, " High "); err != nil {
+		t.Fatalf("SetSessionThinking: %v", err)
+	}
+	if got := svc.SessionThinking(sess.ID); got != "high" {
+		t.Fatalf("SessionThinking should normalize to high, got %q", got)
+	}
+
+	// 空串 = 跟随角色默认（合法清除）。
+	if err := svc.SetSessionThinking(sess.ID, ""); err != nil {
+		t.Fatalf("SetSessionThinking(empty): %v", err)
+	}
+	if got := svc.store.sessions[sess.ID].currentThinking(); got != "" {
+		t.Fatalf("empty thinking should clear override, got %q", got)
+	}
+
+	// 不存在的会话报错。
+	if err := svc.SetSessionThinking("session-none", "low"); err == nil {
+		t.Fatal("SetSessionThinking must fail for unknown session")
+	}
+
+	// 持久化往返：gear+thinking 同 map 携带；缺键回落空串。
+	svc.SetSessionGear(sess.ID, tool.GearDaily)
+	svc.SetSessionThinking(sess.ID, "medium")
+	meta := sessionMetaMemory(svc.store.sessions[sess.ID])
+	if len(meta) != 1 || meta[0]["gear"] != tool.GearDaily || meta[0]["thinking"] != "medium" {
+		t.Fatalf("sessionMetaMemory should carry gear+thinking, got %+v", meta)
+	}
+	if got := thinkingFromMetaMemory(meta); got != "medium" {
+		t.Fatalf("thinkingFromMetaMemory should read back medium, got %q", got)
+	}
+	if got := thinkingFromMetaMemory([]map[string]any{{"gear": "daily"}}); got != "" {
+		t.Fatalf("missing thinking key should fall back empty, got %q", got)
+	}
+	if got := thinkingFromMetaMemory([]map[string]any{{"thinking": "warp"}}); got != "" {
+		t.Fatalf("invalid stored thinking should fall back empty, got %q", got)
+	}
+
+	// CreateRequest 覆盖：合法值入会话，非法值忽略。
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "创建带思考强度", Thinking: "low"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if got := svc.SessionThinking(created.ID); got != "low" {
+		t.Fatalf("CreateRequest.Thinking 应入会话, got %q", got)
+	}
+	bogus, err := svc.CreateSession(ctx, CreateRequest{Goal: "创建非法思考强度", Thinking: "warp"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if got := svc.SessionThinking(bogus.ID); got != "" {
+		t.Fatalf("非法 thinking 应回落空串, got %q", got)
 	}
 }
 

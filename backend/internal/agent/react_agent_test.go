@@ -1347,9 +1347,10 @@ func (f *fakeSuspendPendingChecker) WaitForAnyChild(string, time.Duration) bool 
 	return false
 }
 
-// TestReActAgent_SuspendOnChildWait 验证：meta 角色终答轮仍有未决子 Agent 时，
-// 不再走 waitForChildren 阻塞，而是立即带本轮中继文本返回 SuspendOnChildWait=true，
-// 由上层落 awaiting_child 会话态。非 meta（domain/leaf）不受此分支影响。
+// TestReActAgent_SuspendOnChildWait 验证：顶层 Agent（WithSuspendOnChildWait，meta/domain
+// 顶层）终答轮仍有未决子 Agent 时，不再走 waitForChildren 阻塞，而是立即带本轮中继文本
+// 返回 SuspendOnChildWait=true，由上层落 awaiting_child 会话态。
+// 未开启该开关的 Agent（dispatcher 子 Agent）不受此分支影响。
 func TestReActAgent_SuspendOnChildWait(t *testing.T) {
 	llm := &mockModelProvider{
 		responses: []*blades.Message{
@@ -1359,7 +1360,8 @@ func TestReActAgent_SuspendOnChildWait(t *testing.T) {
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	checker := &fakeSuspendPendingChecker{}
 	ag := NewReActAgent("test", types.RoleDefinition{ID: "meta", SystemPrompt: ""}, llm, NewToolRegistryAdapter(reg)).
-		WithPendingChildrenChecker(checker)
+		WithPendingChildrenChecker(checker).
+		WithSuspendOnChildWait(true)
 
 	start := time.Now()
 	res, err := ag.Run(context.Background(), "并行调研两个主题")

@@ -1,11 +1,11 @@
 package agent
 
 // escalate_gear_test.go 验证 TODO #14 T7 升档流全链路（fake provider 驱动真实状态机）：
-//   - 确认路：chat/fast 档调 escalate_gear → 确认卡挂起（awaiting_clarify）→ 用户答复
+//   - 确认路：fast/daily 档调 escalate_gear → 确认卡挂起（awaiting_clarify）→ 用户答复
 //     「确认」→ 切集群档（D-2）→ 旧 run 落定 → 种子消息经 sendMessage 重启为 meta 全装；
-//   - 拒绝路：答复「拒绝」→ 档位不变，快速档对话继续完成。
+//   - 拒绝路：答复「拒绝」→ 档位不变，当前档对话继续完成。
 //
-// 会话目标用闲聊信号（"你好呀"）保证 fixGearForRun 选 fast 档——escalate 只在 fast 档有意义。
+// 档位全手动（2026-09-16 起）：测试显式以 Gear=fast/daily 建会话——escalate 只在这些档有意义。
 
 import (
 	"context"
@@ -59,17 +59,12 @@ func TestReactService_EscalateGearFlow_Confirm(t *testing.T) {
 	svc := newEscalateTestService(t, llm)
 	ctx := context.Background()
 
-	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "你好呀"})
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "帮我写一份 README", Gear: tool.GearFast})
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	// 闲聊目标应自动选 fast 档（T3 规则选档，runSession 异步固化），升档有前提。
-	gearDeadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(gearDeadline) && svc.SessionGear(created.ID) != tool.GearFast {
-		time.Sleep(10 * time.Millisecond)
-	}
 	if got := svc.SessionGear(created.ID); got != tool.GearFast {
-		t.Fatalf("chatty goal should fix fast gear, got %q", got)
+		t.Fatalf("explicit fast gear should be set, got %q", got)
 	}
 
 	// 等待升级确认卡挂起。
@@ -121,7 +116,7 @@ func TestReactService_EscalateGearFlow_Reject(t *testing.T) {
 	svc := newEscalateTestService(t, llm)
 	ctx := context.Background()
 
-	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "你好呀"})
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "整理一下文档", Gear: tool.GearFast})
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -141,11 +136,46 @@ func TestReactService_EscalateGearFlow_Reject(t *testing.T) {
 	}
 }
 
+// TestReactService_EscalateGearFlow_DailyConfirm daily 档（domain 顶层）同样可升档
+//（2026-09-16 三档全手动：daily 挂 escalate_gear，支持 TUI 无档位 UI 场景升级）。
+func TestReactService_EscalateGearFlow_DailyConfirm(t *testing.T) {
+	llm := &mockReactModelProvider{responses: []*blades.Message{
+		{
+			Role: blades.RoleAssistant,
+			Parts: []blades.Part{
+				blades.ToolPart{Name: "escalate_gear", Request: string(mustJSON(map[string]any{
+					"reason":     "需要跨领域装配",
+					"task_brief": "搭建完整项目骨架",
+				}))},
+			},
+		},
+	}}
+	svc := newEscalateTestService(t, llm)
+	ctx := context.Background()
+
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "搭个项目骨架", Gear: tool.GearDaily})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	waitSessionEventual(t, svc, ctx, created.ID, func(s *Session) bool {
+		return s.PendingClarify != nil
+	})
+	if err := svc.sendMessage(ctx, created.ID, "确认"); err != nil {
+		t.Fatalf("sendMessage confirm: %v", err)
+	}
+	waitSessionEventual(t, svc, ctx, created.ID, func(s *Session) bool {
+		return s.Status == string(enums.SessionStatusCompleted)
+	})
+	if got := svc.SessionGear(created.ID); got != tool.GearCluster {
+		t.Fatalf("daily gear should escalate to cluster, got %q", got)
+	}
+}
+
 // TestReactService_SetSessionGear_RecordsEvent 手动切档落 D-2 系统事件（T7 留痕契约）。
 func TestReactService_SetSessionGear_RecordsEvent(t *testing.T) {
 	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
 	ctx := context.Background()
-	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "你好呀"})
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "档位留痕测试"})
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -162,7 +192,8 @@ func TestReactService_SetSessionGear_RecordsEvent(t *testing.T) {
 	})
 	found := false
 	for _, ev := range sess.Events {
-		if strings.Contains(ev.Message, "auto → cluster（手动）") {
+		// 未设置档位（空串）的展示名按默认档 daily。
+		if strings.Contains(ev.Message, "daily → cluster（手动）") {
 			found = true
 		}
 	}

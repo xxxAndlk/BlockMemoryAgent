@@ -282,13 +282,13 @@ type AgentConfig struct {
 	// 非法值回落 full-auto。ctx 未携带模式时 Registry 仍按生产边界 + 危险命令规则兜底。
 	TrustMode string `yaml:"trust_mode"`
 
-	// DefaultGear 默认执行档位（TODO #14 会话三档控制）：会话创建时取此值为初始档，
-	// 会话内可经 API 随时切换（下一轮生效，随 session_history.meta_memory 持久化跨重启）。
+	// DefaultGear 默认执行档位（TODO #14 三档全手动，2026-09-16）：会话创建时取此值为
+	// 初始档，会话内可经 API 随时切换（下一轮生效，随 session_history.meta_memory 持久化跨重启）。
 	// 取值：
-	//   - auto：自动选档（默认）——明确闲聊信号 → fast，其余一律 cluster（零回归）；
-	//   - fast：固定快速档（轻量对话角色，秒回）；
-	//   - cluster：固定集群档（Meta 全装编排，现行为）。
-	// 非法值回落 auto。explore 为设计预留档，暂不可配置。
+	//   - fast：快速档（文档助手 doc_assistant 顶层直达）；
+	//   - daily：日常档（默认）——DomainAgent 顶层直接执行，可自行下拆叶子；
+	//   - cluster：集群档（Meta 全装编排，现行为）。
+	// 非法值回落 daily。历史值 auto（规则自动选档）已退役，持久化数据读侧映射为 daily。
 	DefaultGear string `yaml:"default_gear"`
 
 	// WorktreeEnabled worktree 隔离派发开关（TODO 第9项⑤/#10项⑤，默认 true）：允许
@@ -789,12 +789,14 @@ func (c *Config) applyAgentStandaloneDefaults() {
 	default:
 		c.Agent.TrustMode = "full-auto"
 	}
-	// 默认执行档位（TODO #14 会话三档控制）：空/非法值回落 auto（自动选档，
-	// 未知任务一律走 cluster——零回归）。
+	// 默认执行档位（TODO #14 三档全手动）：空/非法值回落 daily（日常档）；
+	// 历史值 auto（已退役）同守读侧映射语义，显式配置 auto 时按 daily 处理。
 	switch c.Agent.DefaultGear {
-	case "auto", "fast", "cluster":
+	case "fast", "daily", "cluster":
+	case "auto":
+		c.Agent.DefaultGear = "daily"
 	default:
-		c.Agent.DefaultGear = "auto"
+		c.Agent.DefaultGear = "daily"
 	}
 	// worktree 隔离派发开关（TODO 第9项⑤）：nil（未配置）默认开启，显式 false 关闭。
 	if c.Agent.WorktreeEnabled == nil {

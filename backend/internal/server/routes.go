@@ -42,7 +42,8 @@ func RegisterSessionRoutes(rg gin.IRouter, m *SessionManager) {
 	rg.POST("/sessions/:id/stop", m.HandleSessionStop)                             // 软停止（可续跑，TODO #37）
 	rg.POST("/sessions/:id/topic", m.HandleSessionTopic)                           // 话题管理
 	rg.POST("/sessions/:id/trust-mode", m.HandleSessionTrustMode)                  // 信任模式切换（TODO 第10⑥）
-	rg.POST("/sessions/:id/gear", m.HandleSessionGear)                             // 执行档位切换（TODO #14 三档控制）
+	rg.POST("/sessions/:id/gear", m.HandleSessionGear)                             // 执行档位切换（TODO #14 三档全手动）
+	rg.POST("/sessions/:id/thinking", m.HandleSessionThinking)                     // 会话级思考强度切换（2026-09-16，热生效）
 	rg.POST("/sessions/:id/workdir", m.HandleSessionWorkDir)                       // 每会话工作目录修改（落库即时保存）
 	rg.GET("/sessions/:id/workspace/*path", m.HandleSessionWorkspace)              // 工作区文件服务（对话栏媒体/HTML 预览）
 	rg.DELETE("/sessions/:id", m.HandleDeleteSession)                              // 硬删除会话（不可恢复）

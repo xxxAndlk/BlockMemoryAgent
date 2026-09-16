@@ -1018,6 +1018,10 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 	if tool.ValidGear(req.Gear) {
 		sess.setGear(req.Gear)
 	}
+	// 会话级思考强度（2026-09-16 新会话页选择）：合法枚举入会话，空=跟随角色默认。
+	if t := tool.NormalizeThinking(req.Thinking); tool.ValidThinking(t) {
+		sess.setThinking(t)
+	}
 	// 首条消息携带的用户图片（Alt+V 粘贴）：runSession 注入 runCtx 后一次性消费。
 	sess.firstTurnImages = append(req.Images, frames...)
 	s.maybeWatchWallClock(sess)
@@ -1443,9 +1447,14 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		mode, _ := cmd.Args["mode"].(string)
 		return s.SetSessionTrustMode(sessionID, mode)
 	case ControlOpGear:
-		// 执行档位切换（TODO #14 会话三档控制）：提取 gear 校验枚举后落会话，下一轮生效。
+		// 执行档位切换（TODO #14 三档全手动）：提取 gear 校验枚举后落会话，下一轮生效。
 		gear, _ := cmd.Args["gear"].(string)
 		return s.SetSessionGear(sessionID, gear)
+	case ControlOpThinking:
+		// 会话级思考强度切换（2026-09-16）：提取 thinking（空串合法=跟随角色默认）落会话，
+		// providerForRole 每次 LLM 调用实时读取，下一次调用即生效。
+		thinking, _ := cmd.Args["thinking"].(string)
+		return s.SetSessionThinking(sessionID, thinking)
 	case ControlOpWorkDir:
 		// 每会话工作目录修改：落库即时保存，下一回合生效（目录在每回合开始时读取）。
 		// 参数断言必须 fail-closed：空串是**合法**的"清除为默认目录"载荷，若把
@@ -1590,7 +1599,7 @@ func (s *ReactService) SetSessionTrustMode(sessionID, mode string) error {
 
 // SetDefaultGear 设置新建会话的初始执行档位（TODO #14 会话三档控制）：config
 // agent.default_gear 经 bootstrap 注入。非法值返回错误（启动期 fail-fast），
-// 空串清空（会话 gear 不设置，runSession 按 auto 选档、集群兜底）。
+// 空串清空（会话 gear 不设置，runSession 按集群档兜底）。
 func (s *ReactService) SetDefaultGear(gear string) error {
 	if gear == "" {
 		s.store.mu.Lock()
@@ -1599,7 +1608,7 @@ func (s *ReactService) SetDefaultGear(gear string) error {
 		return nil
 	}
 	if !tool.ValidGear(gear) {
-		return fmt.Errorf("invalid gear %q (want auto|fast|cluster)", gear)
+		return fmt.Errorf("invalid gear %q (want fast|daily|cluster)", gear)
 	}
 	s.store.mu.Lock()
 	s.store.defaultGear = gear
@@ -1613,7 +1622,7 @@ func (s *ReactService) SetDefaultGear(gear string) error {
 // 非法值返回错误（HTTP 400）；会话不存在返回错误。
 func (s *ReactService) SetSessionGear(sessionID, gear string) error {
 	if !tool.ValidGear(gear) {
-		return fmt.Errorf("invalid gear %q (want auto|fast|cluster)", gear)
+		return fmt.Errorf("invalid gear %q (want fast|daily|cluster)", gear)
 	}
 	s.store.mu.RLock()
 	sess := s.store.sessions[sessionID]
@@ -1639,6 +1648,48 @@ func (s *ReactService) SessionGear(sessionID string) string {
 		return ""
 	}
 	return sess.currentGear()
+}
+
+// SetSessionThinking 切换会话级思考强度（2026-09-16，HTTP 切换通道）：
+// atomic 即时生效——providerForRole 闭包每次 LLM 调用实时读取，下一次调用即用新档
+//（免重启）；只覆盖本会话顶层 Agent，在飞子 Agent 各按角色解析不受影响。
+// 空串 = 跟随角色默认（清除会话覆盖）。非法值返回错误（HTTP 400）；会话不存在返回错误。
+func (s *ReactService) SetSessionThinking(sessionID, thinking string) error {
+	t := tool.NormalizeThinking(thinking)
+	if !tool.ValidThinking(t) {
+		return fmt.Errorf("invalid thinking %q (want off|low|medium|high or empty)", thinking)
+	}
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	from := sess.currentThinking()
+	sess.setThinking(t)
+	s.store.addEvent(sess, eventkind.System, "System",
+		fmt.Sprintf("思考强度切换: %s → %s（手动）", thinkingDisplayName(from), thinkingDisplayName(t)),
+		"", "", "", "", "", true)
+	return nil
+}
+
+// SessionThinking 读取会话当前思考强度（HTTP GET 展示用）；未设置（跟随角色默认）返回空串。
+func (s *ReactService) SessionThinking(sessionID string) string {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return ""
+	}
+	return sess.currentThinking()
+}
+
+// thinkingDisplayName 思考强度展示名（事件文案用）：空串显示为"跟随角色默认"。
+func thinkingDisplayName(t string) string {
+	if t == "" {
+		return "跟随角色默认"
+	}
+	return t
 }
 
 // SetSessionWorkDir 修改会话的每会话工作目录（会话页"本会话目录"入口，HTTP/TUI 共用）。
@@ -1963,16 +2014,23 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 }
 
 // EscalateGearHook 返回 escalate_gear 工具的会话层回调（TODO #14 T7 升档 + D-2 留痕）。
-// 快速档 chat 角色接到工程任务时请求升级集群档：经 askUser 通道推确认卡（槽位不变式
-// 与 ask_user/审批一致，占用排队等空位），用户确认后切档 + 档位事件留痕 + 合成种子
-// 消息走"终态会话收消息→新 run"既有通道以集群档（meta 全装）重启；拒绝则原样返回
-// 继续快速档对话。升级只升不降：仅 fast/空档（auto 待裁决）响应，cluster 调用为误用。
+// fast（doc_assistant）/daily（domain）档顶层接到超范围工程任务时请求升级集群档：
+// 经 askUser 通道推确认卡（槽位不变式与 ask_user/审批一致，占用排队等空位），用户确认后
+// 切档 + 档位事件留痕 + 合成种子消息走"终态会话收消息→新 run"既有通道以集群档
+// （meta 全装）重启；拒绝则原样返回继续当前档对话。cluster 档调用为误用（防御兜底）。
 // 软停倒计时已武装（用户此前 Stop 过）时放弃自动续跑，只留档位（T7④）。
 func (s *ReactService) EscalateGearHook() tool.EscalateGearHookFunc {
 	return func(ctx context.Context, req tool.EscalateGearRequest) (string, error) {
 		sid := tool.SessionIDFromContext(ctx)
 		if sid == "" {
 			return "", fmt.Errorf("escalate_gear: missing session context")
+		}
+		// 顶层守卫：escalate_gear 挂载于 doc_assistant（fast 顶层）与 domain（daily 顶层，
+		// 同时是全部 domain 子 Agent 共享的 schema）——升档是会话级动作，仅会话顶层 Agent
+		// 可调用（顶层 Agent name == 会话 ID，见 react_agent RunWithHistory 的 WithAgentID）。
+		// 子 Agent 调用为误用，返回提示不占确认槽。
+		if tool.AgentIDFromContext(ctx) != sid {
+			return "escalate_gear 仅会话顶层可用：你是子 Agent，请把超出范围的需求写进结果摘要交由上层处理。", nil
 		}
 		// 等待用户期间保活 + 排队等槽位：与 AskUserHook 同范式（提问槽与审批共用一个）。
 		keepalive := s.startUserWaitKeepalive(ctx)
@@ -2000,16 +2058,17 @@ func (s *ReactService) EscalateGearHook() tool.EscalateGearHookFunc {
 		ch := make(chan string, 1)
 		sess.askUser = ch
 		question := "是否升级到集群档继续这个任务？原因：" + req.Reason
+		curGearLabel := gearLabelCN(sess.currentGear())
 		pc := &ClarifyRequest{
 			ID:        fmt.Sprintf("gear-%d", time.Now().UnixNano()),
 			Question:  question,
-			Context:   "快速档→集群档升级确认（确认后当前对话将以集群档工程模式自动重启）",
+			Context:   fmt.Sprintf("%s→集群档升级确认（确认后当前对话将以集群档工程模式自动重启）", curGearLabel),
 			AgentID:   tool.AgentIDFromContext(ctx),
 			CreatedAt: time.Now(),
 			Kind:      "confirm",
 			Options: []ClarifyOption{
-				{ID: "confirm", Label: "升级集群档", Description: "以全量工程能力重启任务（快速档进展作为种子带上）"},
-				{ID: "reject", Label: "继续快速档", Description: "维持轻量对话，不升级"},
+				{ID: "confirm", Label: "升级集群档", Description: "以全量工程能力重启任务（当前进展作为种子带上）"},
+				{ID: "reject", Label: "继续当前档位", Description: "维持当前档位，不升级"},
 			},
 		}
 		sess.pendingClarify = pc
@@ -2028,7 +2087,7 @@ func (s *ReactService) EscalateGearHook() tool.EscalateGearHookFunc {
 			s.store.mu.Unlock()
 			return "", ctx.Err()
 		case answer := <-ch:
-			// 收答复：清槽 + 恢复 Running + 捕获快速档进展（切档收尾要用，AskUserHook 同款清流缓冲）。
+			// 收答复：清槽 + 恢复 Running + 捕获当前档位进展（切档收尾要用，AskUserHook 同款清流缓冲）。
 			s.store.mu.Lock()
 			if sess.askUser == ch {
 				sess.askUser = nil
@@ -2044,11 +2103,12 @@ func (s *ReactService) EscalateGearHook() tool.EscalateGearHookFunc {
 			s.store.mu.Unlock()
 
 			if !resolveApproval(answer, pc) {
-				s.store.addEvent(sess, eventkind.System, "System", "用户选择继续快速档，未升级", "", "", "", "", "", true)
-				return "用户选择继续快速档：请以轻量对话方式直接回应用户，不要再重复请求升级。", nil
+				s.store.addEvent(sess, eventkind.System, "System",
+					fmt.Sprintf("用户选择继续%s，未升级", curGearLabel), "", "", "", "", "", true)
+				return "用户选择保持当前档位：请以当前档位继续处理，不要再重复请求升级。", nil
 			}
-			// 升级只升不降：cluster 档调用本工具属模型误用（chat 角色只在 fast 档挂载，
-			// 防御性兜底），工具结果级提示不切档。
+			// 升级只升不降：cluster 档调用本工具属模型误用（本工具只在 fast/daily 档
+			// 顶层角色的 schema 里，防御性兜底），工具结果级提示不切档。
 			if currentGear == tool.GearCluster {
 				return "当前已是集群档，无需升级：请直接以对话方式处理任务。", nil
 			}
@@ -2069,20 +2129,20 @@ func (s *ReactService) EscalateGearHook() tool.EscalateGearHookFunc {
 				return "档位已切换为集群档；会话处于停止倒计时，不自动重启。用户发送消息时将按集群档续跑。", nil
 			}
 
-			// 软停当前快速档 run（落 awaiting_clarify 暂停态）→ 种子消息经 sendMessage
+			// 软停当前 run（落 awaiting_clarify 暂停态）→ 种子消息经 sendMessage
 			// → resumeSession 按新档位（cluster）选 meta 角色全装重启。
-			seed := gearEscalationSeed(goal, progress, req)
+			seed := gearEscalationSeed(currentGear, goal, progress, req)
 			if err := s.Stop(ctx, sid); err != nil {
 				s.store.logError(ctx, "[agent] escalate 升级软停当前 run 失败，已保留集群档", err)
 				return "用户已确认升级集群档，但自动重启失败；请以对话方式告知用户稍后发送消息即可按集群档续跑。", nil
 			}
 			go s.restartWithGearSeed(sid, seed)
-			return "用户已确认升级集群档。当前快速档对话即将收尾，集群档任务已自动接手（含你的进展摘要与文件清单），无需你再输出。", nil
+			return "用户已确认升级集群档。当前对话即将收尾，集群档任务已自动接手（含你的进展摘要与文件清单），无需你再输出。", nil
 		}
 	}
 }
 
-// gearDisplayName 档位展示名（事件文案用）：空档按 auto（runSession 同语义）。
+// gearDisplayName 档位展示名（事件箭头文案用，英文枚举 id）：空档按 daily（默认档语义）。
 func gearDisplayName(gear string) string {
 	switch gear {
 	case tool.GearFast:
@@ -2090,18 +2150,30 @@ func gearDisplayName(gear string) string {
 	case tool.GearCluster:
 		return "cluster"
 	default:
-		return "auto"
+		return "daily"
 	}
 }
 
-// gearEscalationSeed 合成升档种子消息（T7③）：原目标 + 快速档进展摘要 + 升级原因 +
-// 任务简报 + 相关文件。集群档 meta 看不到快速档对话历史，这段种子是其唯一接手上下文。
-func gearEscalationSeed(goal, progress string, req tool.EscalateGearRequest) string {
+// gearLabelCN 档位中文名（用户可见文案用）：空档按默认 daily。
+func gearLabelCN(gear string) string {
+	switch gear {
+	case tool.GearFast:
+		return "快速档"
+	case tool.GearCluster:
+		return "集群档"
+	default:
+		return "日常档"
+	}
+}
+
+// gearEscalationSeed 合成升档种子消息（T7③）：原目标 + 原档位进展摘要 + 升级原因 +
+// 任务简报 + 相关文件。集群档 meta 看不到原档位对话历史，这段种子是其唯一接手上下文。
+func gearEscalationSeed(gear, goal, progress string, req tool.EscalateGearRequest) string {
 	var b strings.Builder
-	b.WriteString("【档位升级续跑】用户已确认把本会话从快速档升级为集群档，请以全量工程能力接手完成以下任务。\n")
+	fmt.Fprintf(&b, "【档位升级续跑】用户已确认把本会话从%s升级为集群档，请以全量工程能力接手完成以下任务。\n", gearLabelCN(gear))
 	fmt.Fprintf(&b, "原目标: %s\n", strings.TrimSpace(goal))
 	if p := truncateRunes(progress, 600); p != "" {
-		fmt.Fprintf(&b, "快速档阶段进展/结论: %s\n", p)
+		fmt.Fprintf(&b, "%s阶段进展/结论: %s\n", gearLabelCN(gear), p)
 	}
 	fmt.Fprintf(&b, "升级原因: %s\n", req.Reason)
 	fmt.Fprintf(&b, "任务简报: %s\n", req.TaskBrief)
@@ -2111,7 +2183,7 @@ func gearEscalationSeed(goal, progress string, req tool.EscalateGearRequest) str
 	return b.String()
 }
 
-// restartWithGearSeed 升档续跑：等旧快速档 run 落定（Stop 软停后 runSession 的
+// restartWithGearSeed 升档续跑：等旧 run 落定（Stop 软停后 runSession 的
 // Canceled 分支落 awaiting_clarify）再投递种子消息——sendMessage 对非 running 会话
 // 走 resumeSession 新 run，resumeSession 按档位选 meta 角色全装。旧 run 若 30s 未落定
 //（流式重试等）放弃并留痕，用户手动发消息仍可续跑（档位已切换，不会丢）。
@@ -2831,10 +2903,12 @@ func dispatchDomainJSON(domain string) string {
 }
 
 // providerForRole 返回按角色解析 provider 的 WithProviderFunc 闭包（TODO #14 D-1 模型随档）：
-// 快速档 chat 角色解析 chat 模型绑定（roles.yaml model_ref），meta 解析 meta 绑定。
+// fast 档 doc_assistant 解析其模型绑定（roles.yaml model_ref），daily/cluster 解析 domain/meta 绑定。
 // T17：sessionID 非空时走带备胎链的解析（models.json role_bindings[].fallback），
-// 降级切换写会话事件流 + 日志。测试注入优先；模型工厂未装配时报错（generateOnce
-// 侧保留旧 provider 不打断任务）。
+// 降级切换写会话事件流 + 日志。
+// 会话级思考强度（2026-09-16）：sessionID 非空时实时读取会话 thinking 覆盖角色档，
+// 运行中切换下一次 LLM 调用即生效（热）。
+// 测试注入优先；模型工厂未装配时报错（generateOnce 侧保留旧 provider 不打断任务）。
 func (s *ReactService) providerForRole(roleID, sessionID string) func(context.Context) (ModelProvider, error) {
 	return func(ctx context.Context) (ModelProvider, error) {
 		if s.testProvider != nil {
@@ -2843,8 +2917,20 @@ func (s *ReactService) providerForRole(roleID, sessionID string) func(context.Co
 		if s.modelFactory == nil {
 			return nil, errors.New("model factory not available")
 		}
+		// 会话级思考强度实时读取（2026-09-16）：运行中切换，下一次 LLM 调用即生效
+		//（providerForRole 闭包每次调用重解析）；会话不存在（罕见竞态）按空串=跟随角色默认。
+		var thinking string
 		if sessionID != "" {
-			return s.modelFactory.GetBladesProviderWithFallback(ctx, roleID, s.fallbackObserver(sessionID))
+			s.store.mu.RLock()
+			sess := s.store.sessions[sessionID]
+			s.store.mu.RUnlock()
+			if sess != nil {
+				thinking = sess.currentThinking()
+			}
+			return s.modelFactory.GetBladesProviderWithThinking(ctx, roleID, thinking, s.fallbackObserver(sessionID))
+		}
+		if thinking != "" {
+			return s.modelFactory.GetBladesProviderWithThinking(ctx, roleID, thinking, nil)
 		}
 		return s.modelFactory.GetBladesProvider(ctx, roleID)
 	}
@@ -2869,42 +2955,20 @@ func (s *ReactService) fallbackObserver(sessionID string) model.FallbackObserver
 	}
 }
 
-// fixGearForRun 每轮起跑前的档位裁决（TODO #14 会话三档控制，自动档决策内核）：
-//   - auto（含未设置）按本轮目标文本规则重选（SelectGear），并**只升不降**：
-//     fast→cluster 允许（后续轮出现工程任务），cluster→fast 拒绝（宁慢勿浅）；
-//   - fast/cluster 已固化（config 默认档或手动切换）由用户掌控，自动规则不再改；
-//   - 选档变化落 System 事件（D-2 留痕），会话时间线可见"已自动选择 X 档"。
-func (s *ReactService) fixGearForRun(session *reactInternalSession, goal string) {
-	cur := session.currentGear()
-	switch cur {
-	case "", tool.GearAuto, tool.GearFast:
-		// 可裁决：auto/未设置按规则选；fast 只允许被升到 cluster。
-	default:
-		return // cluster（或未知值防御）：顶格/不可解，自动规则不动。
-	}
-	selected := SelectGear(goal)
-	if cur == tool.GearFast && selected != tool.GearCluster {
-		return // fast 固化后：仅 cluster 可升入，其余保持。
-	}
-	if cur == selected {
-		return // 裁决结果与当前一致，无变化不落事件。
-	}
-	session.setGear(selected)
-	label := "集群档"
-	if selected == tool.GearFast {
-		label = "快速档"
-	}
-	s.store.addEvent(session, eventkind.System, "System",
-		fmt.Sprintf("已自动选择%s（本轮目标轻量，直接对话处理）", label), "", "", "", "", "", true)
-}
-
-// resolveGearMetaRole 按会话档位解析本轮 meta 角色（TODO #14 P0-1 聊天模式）：
-// cluster/未设置 → "meta" 全装编排；fast → "chat" 轻量直达对话（未登记时回退 meta——
-// 配置残缺退化现行为而非报错）。返回角色定义与实际角色 ID（D-1 模型随档按其解析）。
+// resolveGearMetaRole 按会话档位解析本轮顶层角色（TODO #14 三档全手动，2026-09-16）：
+//   - fast → "doc_assistant"（文档助手顶层直达，挂 escalate_gear 升档）；
+//   - daily → "domain"（DomainAgent 顶层直接执行，可自执行亦可自行下拆叶子）；
+//   - cluster/未设置/未知 → "meta" 全装编排。
+//
+// 角色未登记时回退 "meta"（配置残缺退化现行为而非报错）。返回角色定义与实际角色 ID
+// （D-1 模型随档按其解析）。
 func (s *ReactService) resolveGearMetaRole(session *reactInternalSession) (*types.RoleDefinition, string) {
 	roleID := "meta"
-	if session.currentGear() == tool.GearFast {
-		roleID = "chat"
+	switch session.currentGear() {
+	case tool.GearFast:
+		roleID = "doc_assistant"
+	case tool.GearDaily:
+		roleID = "domain"
 	}
 	if r := s.roleRegistry.Get(roleID); r != nil {
 		return r, roleID
@@ -2915,6 +2979,30 @@ func (s *ReactService) resolveGearMetaRole(session *reactInternalSession) (*type
 		}
 	}
 	return nil, roleID
+}
+
+// roleSkillBlock 渲染指定角色的固定技能元数据块（【可用技能】第一层）。
+// daily 档（domain 顶层）复用 domain 角色 Skills（如【派发与规格】），与 dispatcher
+// 给子 Agent 的技能块同源（口径同 subagent.fixedSkillNames——agent 包不能反向
+// import subagent，此处复刻）。技能池未注入或角色无技能时返回空串（零注入）。
+func (s *ReactService) roleSkillBlock(roleDef *types.RoleDefinition) string {
+	if s.skillPool == nil || roleDef == nil || len(roleDef.Skills) == 0 {
+		return ""
+	}
+	var names []string
+	for _, key := range roleDef.Skills {
+		sk := s.skillPool.FindByNameOrID(strings.TrimSpace(key))
+		if sk == nil {
+			log.Printf("[agent] skill: role %s 固定技能 %q 不在池中，跳过", roleDef.ID, key)
+			continue
+		}
+		name := sk.Name
+		if name == "" {
+			name = sk.SkillID
+		}
+		names = append(names, name)
+	}
+	return skill.MetadataBlock(s.skillPool, names)
 }
 
 // runSession 为新创建的会话执行 ReAct 主循环。
@@ -2932,29 +3020,28 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
 
-	// 自动选档固化（TODO #14）：auto（含未设置）按目标文本规则选档，只升不降（见 fixGearForRun）。
-	s.fixGearForRun(session, session.Goal)
-
-	// 按档位解析本轮 meta 角色（fast=chat 轻量对话角色）；缺失则标记会话错误并退出。
+	// 按档位解析本轮顶层角色（fast=doc_assistant / daily=domain / cluster=meta）；
+	// 缺失则标记会话错误并退出。
 	metaRole, gearRoleID := s.resolveGearMetaRole(session)
 	if metaRole == nil {
 		s.setSessionError(session, fmt.Sprintf("role %q not found", gearRoleID))
 		return
 	}
 
-	// PROJECT.md 就绪有界等待（TODO 第14项 T9）：cluster/auto 等 ≤2s 让【项目概览】段
-	// 赶上首轮系统提示词前缀缓存；chat 档不等（秒回优先，缺失本就略段）。
-	if gearRoleID != "chat" {
+	// PROJECT.md 就绪有界等待（TODO 第14项 T9）：cluster/daily 等 ≤2s 让【项目概览】段
+	// 赶上首轮系统提示词前缀缓存；fast（doc_assistant）不等（秒回优先，缺失本就略段）。
+	if gearRoleID != "doc_assistant" {
 		waitProjectDoc(session, 2*time.Second)
 	}
 
 	// 确定模型 provider：优先使用测试注入的 provider，否则从模型工厂获取。
-	// D-1 模型随档（TODO #14）：按本轮角色 ID 解析（fast=chat 快模型，cluster=meta）。
+	// D-1 模型随档（TODO #14）：按本轮角色 ID 解析（fast=doc_assistant，daily=domain，cluster=meta）。
 	var provider ModelProvider
 	if s.testProvider != nil {
 		provider = s.testProvider
 	} else {
-		p, err := s.modelFactory.GetBladesProvider(ctx, gearRoleID)
+		// 会话级思考强度随首次解析生效（后续轮经 providerForRole 实时读取，见其注释）。
+		p, err := s.modelFactory.GetBladesProviderWithThinking(ctx, gearRoleID, session.currentThinking(), s.fallbackObserver(session.ID))
 		if err != nil {
 			s.setSessionError(session, fmt.Sprintf("failed to get blades provider: %v", err))
 			return
@@ -2968,7 +3055,8 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 任务看板注入（TODO #35 Phase 0）：每轮上下文末尾追加【任务看板】段——编排状态
 	// 机器可读且压缩不可达，"重新执行"类短指令的消歧锚点。仅 meta 注入，子 Agent 不注入。
 	// 热驻空闲领域清单注入（Domain 热驻）：供 MetaAgent 自主判定强相关复用 vs 弱相关新建。
-	// 快速档（chat）跳过看板/空闲清单/台账三段包装——直达对话不进编排观测（TODO #14 P0-1）。
+	// 看板/空闲清单/台账三段包装 + meta 技能块仅集群档（meta）注入；daily（domain 顶层）
+	// 与 fast（doc_assistant）跳过 meta 专属编排观测（TODO #14 P0-1 语义沿用）。
 	// 系统提示词工作目录按会话解析(终审修复):会话 workDir 优先,空串回落进程默认目录,
 	// 使 buildEnvBlock/LoadProjectDoc 与 createSession 的 EnsureProjectDoc 落在同一目录。
 	wd := session.currentWorkDir()
@@ -2976,14 +3064,15 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		wd = s.workDir()
 	}
 	metaMemory := s.memory
-	if gearRoleID != "chat" {
+	skillBlock := ""
+	switch gearRoleID {
+	case "meta":
 		metaMemory = wrapMetaMemory(s.memory, s.boardFn, session.ID)
 		metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
 		metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
-	}
-	skillBlock := ""
-	if gearRoleID != "chat" {
 		skillBlock = s.metaSkillBlock()
+	case "domain":
+		skillBlock = s.roleSkillBlock(metaRole)
 	}
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
 		WithMailbox(s.mailbox).
@@ -2995,14 +3084,18 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		WithSkillBlock(skillBlock).
 		WithPersonaInjector(s.metaPersona(session.currentWorkDir())).
 		WithMessageLogger(s.msgLogger).
+		// 顶层 Agent（meta/domain）挂起等子语义：终答轮仍有未决子 Agent 时置
+		// awaiting_child 而非原地阻塞（原按 role.ID=="meta" 硬判，daily 档放开为显式开关）。
+		WithSuspendOnChildWait(true).
 		// meta 长会话运行期间模型被切换时，下一次 LLM 调用即用新模型。
 		WithProviderFunc(s.providerForRole(gearRoleID, session.ID))
-	// 注入未决子 Agent 检查器，开启父会话终结保护（快速档无派发，跳过）。
-	if gearRoleID != "chat" {
+	// 注入未决子 Agent 检查器，开启父会话终结保护（fast=doc_assistant 无派发，跳过；
+	// daily=domain 可自行下拆叶子，需保留）。
+	if gearRoleID != "doc_assistant" {
 		if s.pendingChecker != nil {
 			agent = agent.WithPendingChildrenChecker(s.pendingChecker)
 		}
-		// 注入 Paused 子 Agent 检查器，使 MetaAgent 在 wait loop 检测 Paused 子 domain 并主动暂停。
+		// 注入 Paused 子 Agent 检查器，使顶层 Agent 在 wait loop 检测 Paused 子 domain 并主动暂停。
 		if s.pausedChecker != nil {
 			agent = agent.WithPausedChildChecker(s.pausedChecker)
 		}
@@ -3103,8 +3196,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 结束后清理资源。
 	defer s.finalizeSession(session)
 
-	// 使用最新用户消息作为本轮输入（提前到角色解析前：档位自动裁决按本轮输入定，
-	// fast/cluster 的 meta 角色随档位选择）。挂起等子唤醒轮（WakeOnChildDone 写入
+	// 使用最新用户消息作为本轮输入。挂起等子唤醒轮（WakeOnChildDone 写入
 	// wakeInput）优先取 wakeInput 作输入，即取即清（一次性）；否则倒序取最后一条
 	// user 消息（中途可能追加了澄清/审批答复等非 user 项），同步取出该轮用户图片
 	// 供 runCtx 注入：带外穿透给 RunWithHistory 的首条 user 消息与 call_sub_agent
@@ -3130,10 +3222,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	copy(history, session.History)
 	s.store.mu.Unlock()
 
-	// 自动选档固化（TODO #14）：按本轮输入规则选档，只升不降（见 fixGearForRun）。
-	s.fixGearForRun(session, input)
-
-	// 按档位解析本轮 meta 角色（fast=chat 轻量对话角色）；缺失则报错。
+	// 按档位解析本轮顶层角色（fast=doc_assistant / daily=domain / cluster=meta）；缺失则报错。
 	metaRole, gearRoleID := s.resolveGearMetaRole(session)
 	if metaRole == nil {
 		s.setSessionError(session, fmt.Sprintf("role %q not found", gearRoleID))
@@ -3145,7 +3234,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	if s.testProvider != nil {
 		provider = s.testProvider
 	} else {
-		p, err := s.modelFactory.GetBladesProvider(ctx, gearRoleID)
+		// 会话级思考强度随首次解析生效（后续轮经 providerForRole 实时读取，见其注释）。
+		p, err := s.modelFactory.GetBladesProviderWithThinking(ctx, gearRoleID, session.currentThinking(), s.fallbackObserver(session.ID))
 		if err != nil {
 			s.setSessionError(session, fmt.Sprintf("failed to get blades provider: %v", err))
 			return
@@ -3158,21 +3248,22 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 不暴露 WriteFile/RunCommand，防止越位直接改文件或跑命令（metaRole.Tools 白名单限定）。
 	// 任务看板注入（TODO #35 Phase 0）：同 runSession，每轮末尾追加【任务看板】段。
 	// 热驻空闲领域清单注入（Domain 热驻）：供复用判定。
-	// 快速档（chat）跳过看板/空闲清单/台账三段包装（同 runSession，TODO #14 P0-1）。
+	// 看板/空闲清单/台账三段包装 + meta 技能块仅集群档注入（同 runSession，TODO #14 P0-1）。
 	// 系统提示词工作目录按会话解析(终审修复,同 runSession):会话 workDir 优先,空串回落进程默认目录。
 	wd := session.currentWorkDir()
 	if wd == "" {
 		wd = s.workDir()
 	}
 	metaMemory := s.memory
-	if gearRoleID != "chat" {
+	skillBlock := ""
+	switch gearRoleID {
+	case "meta":
 		metaMemory = wrapMetaMemory(s.memory, s.boardFn, session.ID)
 		metaMemory = wrapMetaMemoryWithRoster(metaMemory, s.rosterFn(session.ID))
 		metaMemory = wrapMetaMemoryWithLedger(metaMemory, s.ledgerFn, session.ID)
-	}
-	skillBlock := ""
-	if gearRoleID != "chat" {
 		skillBlock = s.metaSkillBlock()
+	case "domain":
+		skillBlock = s.roleSkillBlock(metaRole)
 	}
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
 		WithMailbox(s.mailbox).
@@ -3184,14 +3275,17 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithSkillBlock(skillBlock).
 		WithPersonaInjector(s.metaPersonaLite()).
 		WithMessageLogger(s.msgLogger).
+		// 顶层 Agent（meta/domain）挂起等子语义（同 runSession）。
+		WithSuspendOnChildWait(true).
 		// 同 runSession：运行期模型切换在下一次 LLM 调用生效。
 		WithProviderFunc(s.providerForRole(gearRoleID, session.ID))
-	// 注入未决子 Agent 检查器，开启父会话终结保护（快速档无派发，跳过）。
-	if gearRoleID != "chat" {
+	// 注入未决子 Agent 检查器，开启父会话终结保护（fast=doc_assistant 无派发，跳过；
+	// daily=domain 可自行下拆叶子，需保留）。
+	if gearRoleID != "doc_assistant" {
 		if s.pendingChecker != nil {
 			agent = agent.WithPendingChildrenChecker(s.pendingChecker)
 		}
-		// 注入 Paused 子 Agent 检查器，使 MetaAgent 在 wait loop 检测 Paused 子 domain 并主动暂停。
+		// 注入 Paused 子 Agent 检查器，使顶层 Agent 在 wait loop 检测 Paused 子 domain 并主动暂停。
 		if s.pausedChecker != nil {
 			agent = agent.WithPausedChildChecker(s.pausedChecker)
 		}
@@ -4483,6 +4577,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		ActiveTopicID:  s.activeTopicID,
 		TrustMode:      s.currentTrustMode(),
 		Gear:           s.currentGear(),
+		Thinking:       s.currentThinking(),
 	}
 }
 

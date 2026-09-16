@@ -97,11 +97,16 @@ type reactInternalSession struct {
 	// atomic.Value 保证跨 goroutine 读取（ReAct 循环工具派发侧实时读取——切换下一工具调用生效）；
 	// 未设置返回空串 → Registry 回退现网生产边界 + 危险命令语义（测试/旧路径兼容）。
 	trustMode atomic.Value
-	// gear 是会话当前执行档位（TODO #14 会话三档控制，auto|fast|cluster）：
-	// createSession 取 config 默认（st.defaultGear），会话内可经 HTTP 随时切换。
-	// atomic.Value 保证跨 goroutine 读取（runSession 起跑时固化、控制通道切换下一轮生效）；
-	// 未设置返回空串 → 按集群档现行为兜底（与历史会话语义一致）。
+	// gear 是会话当前执行档位（TODO #14 三档全手动，fast|daily|cluster）：
+	// createSession 取 config 默认（st.defaultGear，默认 daily），会话内可经 HTTP 随时切换。
+	// atomic.Value 保证跨 goroutine 读取（控制通道切换下一轮生效）；
+	// 未设置返回空串 → 按集群档现行为兜底（与历史会话语义一致，旧 "auto" 读侧映射 daily）。
 	gear atomic.Value
+	// thinking 是会话级思考强度（2026-09-16，off|low|medium|high，空=跟随角色默认）：
+	// createSession 随创建请求设置，会话内可经 HTTP 随时切换。
+	// atomic.Value 保证跨 goroutine 读取（providerForRole 每次 LLM 调用实时读取，
+	// 切换下一次调用即生效）；只覆盖本会话顶层 Agent，子 Agent 各按角色解析。
+	thinking atomic.Value
 	// activeTopicID 当前活跃话题 ID。切换话题时旧 Agent 树终结 + 新树起,
 	// 旧话题摘要写入 sharedKV `topic:{sessionID}:{topicID}:summary`。空表示单话题(未切换过)。
 	// 话题 ID 也在切换时用于emetries 标签(若需)。
@@ -136,7 +141,7 @@ type reactInternalSession struct {
 	// projectDocReady 是 createSession 启动的 EnsureProjectDoc 完成信号（TODO 第14项 T9）：
 	// 首生成要跑 LLM 领域分区（秒级），异步化后 createSession 立即返回，
 	// runSession 起跑时有界等待 ≤2s 让【项目概览】段赶上进入首轮系统提示词前缀缓存；
-	// chat 档不等。nil（恢复会话/测试直建）= 不等待。
+	// fast 档（doc_assistant）不等。nil（恢复会话/测试直建）= 不等待。
 	projectDocReady chan struct{}
 }
 
@@ -378,7 +383,7 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 	// 首个 session 启动时确保有效工作目录下存在 .bma/PROJECT.md（缺失则按职责分区生成）。
 	// TODO 第14项 T9 异步化（仅 LLM 分区路径）：cls 非 nil 时首生成要调 LLM 领域分区
 	//（秒级），同步等会把"创建会话→首字"延迟整段加在用户头上——转 goroutine + done
-	// channel，createSession 立即返回；runSession 起跑时有界等待 ≤2s（chat 档不等），
+	// channel，createSession 立即返回；runSession 起跑时有界等待 ≤2s（fast 档不等），
 	// 失败仅日志不阻断会话。cls 为 nil（测试/启发式路径）保持同步：纯文件扫描毫秒级，
 	// 异步只会引入"测试临时目录清理撞上在写 goroutine"的竞态（Windows unlinkat 报错）。
 	if st.domainClassifier == nil {
@@ -406,9 +411,9 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 	return session
 }
 
-// waitProjectDoc 有界等待 PROJECT.md 就绪（TODO 第14项 T9）：cluster/auto 等 ≤2s——
+// waitProjectDoc 有界等待 PROJECT.md 就绪（TODO 第14项 T9）：cluster/daily 等 ≤2s——
 // 项目概览段进入首轮系统提示词即冻结进前缀缓存，首轮就值得等；超时不再等（晚到的
-// 生成结果由 projectRefresher/后续轮刷新，本会话前缀不受影响）。chat 档不等
+// 生成结果由 projectRefresher/后续轮刷新，本会话前缀不受影响）。fast 档不等
 //（buildSystemPrompt 对 PROJECT.md 缺失本就略段，秒回优先）。
 // 信号为 nil（恢复会话/测试直建）直接返回。
 func waitProjectDoc(session *reactInternalSession, timeout time.Duration) {
@@ -454,6 +459,22 @@ func (s *reactInternalSession) currentGear() string {
 // 在飞子 Agent 不强杀：正在运行的轮次按起跑时档位走完，下一轮按新档裁决（同 trustMode 语义）。
 func (s *reactInternalSession) setGear(gear string) {
 	s.gear.Store(gear)
+}
+
+// currentThinking 返回会话级思考强度（2026-09-16）；空串 = 跟随角色默认（零覆盖）。
+// providerForRole 闭包每次 LLM 调用实时读取，运行中改档下一次调用即生效。
+func (s *reactInternalSession) currentThinking() string {
+	if v := s.thinking.Load(); v != nil {
+		if t, ok := v.(string); ok {
+			return t
+		}
+	}
+	return ""
+}
+
+// setThinking 设置会话级思考强度（atomic 存储无需额外加锁）。
+func (s *reactInternalSession) setThinking(thinking string) {
+	s.thinking.Store(thinking)
 }
 
 // currentWorkDir 返回会话的每会话工作目录；未设置返回空串（= 回落进程默认目录）。
@@ -831,29 +852,55 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 	st.persistFullHistory(session)
 }
 
-// sessionMetaMemory 组装会话持久化 meta（TODO #14 会话三档控制）：当前仅档位 gear，
-// 重启恢复经 gearFromMetaMemory 回填；字段以 map 键增量扩展，旧记录缺键自然回落默认。
-// 无档位时返回空切片（与 MetaMemory 列历史写入形态一致）。
+// sessionMetaMemory 组装会话持久化 meta（TODO #14 会话三档控制 + 2026-09-16 会话级
+// 思考强度）：档位 gear + 思考强度 thinking，重启恢复分别经 gearFromMetaMemory /
+// thinkingFromMetaMemory 回填；字段以 map 键增量扩展，旧记录缺键自然回落默认。
+// 两者皆空返回空切片（与 MetaMemory 列历史写入形态一致）。
 func sessionMetaMemory(session *reactInternalSession) []map[string]any {
 	g := session.currentGear()
-	if g == "" {
+	t := session.currentThinking()
+	if g == "" && t == "" {
 		return []map[string]any{}
 	}
-	return []map[string]any{{"gear": g}}
+	m := map[string]any{}
+	if g != "" {
+		m["gear"] = g
+	}
+	if t != "" {
+		m["thinking"] = t
+	}
+	return []map[string]any{m}
 }
 
-// gearFromMetaMemory 从持久化 meta 读取档位（TODO #14）：取首个合法枚举值；
-// 缺键/非法值/无 meta 回落 fallback（store 默认档，最终缺省 auto=集群现行为）。
+// gearFromMetaMemory 从持久化 meta 读取档位（TODO #14）：取首个合法枚举值
+//（历史 "auto" 经 NormalizeGear 映射为 daily）；缺键/非法值/无 meta 回落 fallback
+//（store 默认档）。
 func gearFromMetaMemory(meta []map[string]any, fallback string) string {
 	for _, m := range meta {
 		if m == nil {
 			continue
 		}
-		if g, ok := m["gear"].(string); ok && tool.ValidGear(g) {
-			return g
+		if g, ok := m["gear"].(string); ok {
+			if ng := tool.NormalizeGear(g); tool.ValidGear(ng) {
+				return ng
+			}
 		}
 	}
 	return fallback
+}
+
+// thinkingFromMetaMemory 从持久化 meta 读取会话级思考强度（2026-09-16）：取首个合法值；
+// 缺键/非法值/无 meta 返回空串（跟随角色默认）。
+func thinkingFromMetaMemory(meta []map[string]any) string {
+	for _, m := range meta {
+		if m == nil {
+			continue
+		}
+		if t, ok := m["thinking"].(string); ok && tool.ValidThinking(t) {
+			return t
+		}
+	}
+	return ""
 }
 
 // persistFullHistory 把主对话（MetaAgent，agentID==sessionID）的完整 ReAct 消息历史
@@ -1068,9 +1115,11 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 	}
 	// S2: 恢复每会话工作目录，重启后续跑仍在原目录；空串回落进程默认（atomic，见字段注释）。
 	sess.setWorkDir(rec.WorkDir)
-	// 恢复执行档位（TODO #14）：MetaMemory 携带 gear 时回填；旧记录缺键回落 store
-	// 默认档（config agent.default_gear，未配置则保持空串=按集群档兜底）。
+	// 恢复执行档位（TODO #14）：MetaMemory 携带 gear 时回填（历史 "auto" 映射 daily）；
+	// 旧记录缺键回落 store 默认档（config agent.default_gear，未配置则保持空串=按集群档兜底）。
 	sess.setGear(gearFromMetaMemory(rec.MetaMemory, st.defaultGear))
+	// 恢复会话级思考强度（2026-09-16）：缺键回落空串=跟随角色默认。
+	sess.setThinking(thinkingFromMetaMemory(rec.MetaMemory))
 	return sess
 }
 

@@ -226,6 +226,10 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 				"plugin_list", "tool_catalog", "tool_mount", "tool_unmount",
 				"submit_plan", "review_plan",
 				"list_skills", "load_skill",
+				// 档位升级（TODO #14，2026-09-16 daily 档）：仅会话顶层生效——
+				// domain 角色同时是 daily 档顶层与全部 domain 子 Agent 的共享定义，
+				// hook 侧按 agentID==sessionID 守卫，子 Agent 调用返回拒绝文案。
+				"escalate_gear",
 			},
 			CanBeCalled: true,
 		}

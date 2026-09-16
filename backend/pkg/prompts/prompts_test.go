@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-// TestGet_AllRegisteredIDs 全部 11 个 roleID 可取且非空。
+// TestGet_AllRegisteredIDs 全部 10 个 roleID 可取且非空。
 func TestGet_AllRegisteredIDs(t *testing.T) {
 	ids := []string{
-		"meta", "domain", "chat",
+		"meta", "domain",
 		"scout", "light", "code_assistant", "ui_assistant",
 		"prompt_reviewer", "code_reviewer", "test_assistant", "doc_assistant",
 	}
@@ -24,18 +24,15 @@ func TestGet_AllRegisteredIDs(t *testing.T) {
 	}
 }
 
-// TestChat_SlimPrompt 快速档提示词瘦身契约（TODO #14 P0-1 / #15①）：
-// Chat ≤ 3K rune 且含升级纪律——提示词养肥即失败，秒回角色的存在意义是轻。
-func TestChat_SlimPrompt(t *testing.T) {
-	r := 0
-	for range Chat {
-		r++
+// TestDocAssistant_EscalateGuidance 快速档升档纪律契约（2026-09-16 fast 档改用
+// doc_assistant 顶层）：提示词必须写明 escalate_gear 升档规程，否则快速档识别出
+// 超范围任务时无路可走。
+func TestDocAssistant_EscalateGuidance(t *testing.T) {
+	if !strings.Contains(DocAssistant, "escalate_gear") {
+		t.Fatal("DocAssistant 缺快速档升档纪律（escalate_gear）")
 	}
-	if r > maxChatPromptRunes {
-		t.Fatalf("Chat 提示词 %d runes 超上限 %d（快速档瘦身契约）", r, maxChatPromptRunes)
-	}
-	if !strings.Contains(Chat, "escalate_gear") {
-		t.Fatal("Chat 缺升级纪律（escalate_gear）")
+	if !strings.Contains(DocAssistant, "【快速档直达模式】") {
+		t.Fatal("DocAssistant 缺【快速档直达模式】段")
 	}
 }
 

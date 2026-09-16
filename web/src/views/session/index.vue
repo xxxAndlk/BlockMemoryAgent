@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Session, SessionSummary, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear } from '@/types'
+import type { Session, SessionSummary, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear, SessionThinking } from '@/types'
 import { isAssistantTextEvent, isToolCallEvent, isUserMessageEvent, clarifyArtifactsFromFrame } from '@/types'
 import {
   createSession,
@@ -383,7 +383,7 @@ function startStream(s: Session) {
   })
 }
 
-async function handleSubmit(content: string, images: WireImage[] = [], gear: SessionGear = 'auto') {
+async function handleSubmit(content: string, images: WireImage[] = [], gear: SessionGear = 'daily', thinking: SessionThinking = '') {
   if (!content.trim() && !images.length) return
   sending.value = true
   try {
@@ -433,8 +433,8 @@ async function handleSubmit(content: string, images: WireImage[] = [], gear: Ses
       }
       return
     }
-    // 3) 无选中会话 → 创建新会话（携带创建时选档，后端非法值 400）
-    const s = await createSession(content, images, workDir.value || undefined, gear)
+    // 3) 无选中会话 → 创建新会话（携带创建时选档 + 会话级思考强度，后端非法值 400）
+    const s = await createSession(content, images, workDir.value || undefined, gear, thinking)
     setWorkDir(workDir.value)
     sessions.value.unshift(s)
     router.replace({ path: '/session', query: { id: s.id } })

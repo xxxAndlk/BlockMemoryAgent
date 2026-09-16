@@ -1,4 +1,4 @@
-import type { Session, SessionEvent, SessionSummary, AgentNode, TaskBoardData, WireImage, TrustMode, SessionGear } from '@/types'
+import type { Session, SessionEvent, SessionSummary, AgentNode, TaskBoardData, WireImage, TrustMode, SessionGear, SessionThinking } from '@/types'
 import { fetchJson } from './client'
 import { APP_CONFIG } from '@/config/app'
 
@@ -11,12 +11,14 @@ export function listSessions(limit?: number): Promise<SessionSummary[]> {
   return fetchJson(`/sessions${limit ? `?limit=${limit}` : ''}`)
 }
 
-export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear): Promise<Session> {
+export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking): Promise<Session> {
   const body: Record<string, unknown> = { goal }
   if (images?.length) body.images = images
   if (workDir) body.work_dir = workDir
-  // 创建时选档（TODO #14）：仅显式选择时携带；省略由后端按默认档位规则裁决。
+  // 创建时选档（TODO #14）：仅显式选择时携带；省略由后端取 config 默认档（daily）。
   if (gear) body.gear = gear
+  // 创建时选思考强度（2026-09-16）：空串 = 跟随角色默认，省略字段。
+  if (thinking) body.thinking = thinking
   return fetchJson('/sessions', { method: 'POST', body: JSON.stringify(body) })
 }
 
@@ -221,12 +223,22 @@ export function setTrustMode(id: string, mode: TrustMode): Promise<{ session_id:
   })
 }
 
-/** 切换会话执行档位（TODO #14 三档控制）：POST /sessions/{id}/gear，原子即时生效；
- *  手动切档允许任意向（auto 只升不降仅约束自动升档）；在飞子 Agent 不强杀，下轮按新档裁决。 */
+/** 切换会话执行档位（TODO #14 三档全手动）：POST /sessions/{id}/gear，原子即时生效；
+ *  手动切档允许任意向（升档只升不降仅约束 escalate 发起侧）；在飞子 Agent 不强杀，下轮按新档选角色。 */
 export function setSessionGear(id: string, gear: SessionGear): Promise<{ session_id: string; gear: string }> {
   return fetchJson(`/sessions/${id}/gear`, {
     method: 'POST',
     body: JSON.stringify({ gear }),
+  })
+}
+
+/** 切换会话级思考强度（2026-09-16）：POST /sessions/{id}/thinking，原子即时生效——
+ *  provider 每次 LLM 调用实时读取，下一次调用即用新档（热，免重启）；空串 = 跟随角色默认。
+ *  只影响本会话顶层 Agent，在飞子 Agent 不受影响。 */
+export function setSessionThinking(id: string, thinking: SessionThinking): Promise<{ session_id: string; thinking: string }> {
+  return fetchJson(`/sessions/${id}/thinking`, {
+    method: 'POST',
+    body: JSON.stringify({ thinking }),
   })
 }
 

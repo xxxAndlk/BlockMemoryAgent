@@ -1,7 +1,8 @@
 package agent
 
-// gear_signals.go 选档误判隐性信号采集（TODO #14 T18）：档位规则选档器（gear_selector.go）
-// 的误判观测面。只落事件不改行为——信号仅供后续调参统计，不触发任何档位变更。
+// gear_signals.go 档位使用隐性信号采集（TODO #14 T18）：档位全手动化（2026-09-16）后
+// 作为"档位选得合不合适"的观测面（快速档收任务、集群档被秒停）。只落事件不改行为——
+// 信号仅供后续统计，不触发任何档位变更。
 //
 //   - 信号①（sendMessage 侧）：快速档会话在上一 run 终态后 gearSignalRecentWindow 内
 //     收到含行动动词的新指令 → 疑似"工作活进了快速档"（用户把闲聊会话当工作会话续用）。
@@ -25,7 +26,22 @@ const gearSignalRecentWindow = 5 * time.Minute
 // gearSignalEarlyStopWindow 信号②的"刚开始就被停"窗口：run 开始 30s 内软停才算等不及。
 const gearSignalEarlyStopWindow = 30 * time.Second
 
-// hasActionVerb 判定文本是否含工程/行动动词（复用选档器词表，子串匹配）。
+// actionVerbs 工程/行动动词表（中英，子串匹配）：出现任一即视为任务型输入。
+// 供档位信号判定复用（原选档器词表；选档器随 auto 档退役后迁至此处）。
+var actionVerbs = []string{
+	// 中文：写改修删建 + 构建运维链路
+	"写", "改", "修", "删", "建", "实现", "开发", "重构", "修复", "构建", "编译",
+	"部署", "发布", "运行", "执行", "测试", "排查", "诊断", "调试", "分析", "生成",
+	"添加", "新增", "迁移", "升级", "接入", "对接", "安装", "配置", "爬取", "抓取",
+	"翻译", "总结", "搜索", "检索", "统计", "画", "做", "调", "改一下", "优化",
+	// 英文：子串匹配（误命中如 pruning 视为任务，安全向）
+	"write", "fix", "build", "compile", "deploy", "run", "test", "refactor",
+	"implement", "create", "add ", "delete", "remove", "update", "migrate",
+	"install", "generate", "analyze", "parse", "debug", "search", "translate",
+	"summarize", "optimiz", "config",
+}
+
+// hasActionVerb 判定文本是否含工程/行动动词（子串匹配）。
 func hasActionVerb(text string) bool {
 	lower := strings.ToLower(text)
 	for _, v := range actionVerbs {
