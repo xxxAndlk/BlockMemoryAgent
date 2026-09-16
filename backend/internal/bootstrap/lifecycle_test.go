@@ -69,7 +69,7 @@ func TestStartDataMaintenance_RunOnceAndStop(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{}
 	fake := &fakeArchiver{}
-	stop := startDataMaintenance(cfg, dir, fake)
+	stop := startDataMaintenance(cfg, dir, fake, nil)
 	stop()
 	stop() // 幂等
 	if fake.calls != 1 {

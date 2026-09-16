@@ -45,11 +45,56 @@ func (s *KnowledgeStore) Save(ctx context.Context, rec *types.KnowledgeRecord) e
 	if err != nil {
 		return fmt.Errorf("marshal knowledge meta: %w", err)
 	}
-	// 执行 INSERT，向量以 pgVector 文本形式传入
+	// 执行 INSERT，向量以 pgVector 文本形式传入。
+	// last_accessed 与 created_at 同值初始化：ArchiveStale（data.knowledge_archive_days）
+	// 按 last_accessed 判定陈旧度，缺省 NULL 会让归档条件恒为 NULL 而永不命中
+	//（2026-09-16 修复：1067 条块记忆全部 last_accessed IS NULL，归档开关形同虚设）。
 	_, err = s.db.ExecContext(ctx, `
-			INSERT INTO global_knowledge (knowledge_type, topic_id, content, embedding, meta, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			INSERT INTO global_knowledge (knowledge_type, topic_id, content, embedding, meta, created_at, last_accessed)
+			VALUES ($1, $2, $3, $4, $5, $6, $6)
 		`, rec.KnowledgeType, rec.TopicID, rec.Content, pgVector(rec.Embedding), meta, rec.CreatedAt)
+	return err
+}
+
+// FindSimilarBlockMemory 在同 task_domain 的未归档块记忆中按向量近邻找最相似一条
+// （cosine 距离 <= maxDistance 才返回，无命中返回 nil）。
+// 供写入侧近邻去重：同一结论跨会话反复沉淀时更新既有记录而非新增行。
+// taskDomain 为空串时只匹配 meta 无 task_domain 标签的记录（coalesce 归一）。
+func (s *KnowledgeStore) FindSimilarBlockMemory(ctx context.Context, embedding []float32, taskDomain string, maxDistance float64) (*types.KnowledgeRecord, error) {
+	if len(embedding) == 0 {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived,
+			       1 - (embedding <=> $1) AS score
+			FROM global_knowledge
+			WHERE archived = false AND knowledge_type = $2
+			  AND coalesce(meta->>'task_domain','') = $3
+			  AND embedding IS NOT NULL AND embedding <=> $1 <= $4
+			ORDER BY embedding <=> $1
+			LIMIT 1`,
+		pgVector(embedding), enums.KnowledgeTypeBlockMemory, strings.TrimSpace(taskDomain), maxDistance)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	recs, err := s.scanKnowledgeRowsWithScore(ctx, rows)
+	if err != nil || len(recs) == 0 {
+		return nil, err
+	}
+	return recs[0], nil
+}
+
+// UpdateContentEmbedding 就近刷新既有知识记录的内容与向量（去重合并写路径），
+// 同时刷新 last_accessed（视作一次"使用"）。不改 meta/created_at。
+func (s *KnowledgeStore) UpdateContentEmbedding(ctx context.Context, id int64, content string, embedding []float32) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `
+			UPDATE global_knowledge SET content = $2, embedding = $3, last_accessed = NOW() WHERE id = $1
+		`, id, content, pgVector(embedding))
 	return err
 }
 
@@ -429,14 +474,16 @@ func (s *KnowledgeStore) IncrementAccessCount(ctx context.Context, id int64) err
 	return err
 }
 
-// BumpReuse 递增知识记录的 Meta.reuse_count（JSONB 就地更新，缺省 0）。
+// BumpReuse 递增知识记录的 Meta.reuse_count（JSONB 就地更新，缺省 0），
+// 并同步刷新 last_accessed（召回命中 = 一次使用，归档判定据此延缓）。
 // 供块记忆召回侧价值反馈闭环使用：召回命中后标记复用次数，下次排序按 reuse_count 降序。
 // 返回 SQL 执行错误，调用方 best-effort 处理（失败仅记日志，不阻塞派发）。
 func (s *KnowledgeStore) BumpReuse(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `
 			UPDATE global_knowledge
 			SET meta = jsonb_set(meta, '{reuse_count}',
-				to_jsonb((COALESCE((meta->>'reuse_count')::int, 0) + 1)::int))
+				to_jsonb((COALESCE((meta->>'reuse_count')::int, 0) + 1)::int)),
+			    last_accessed = NOW()
 			WHERE id = $1
 		`, id)
 	return err

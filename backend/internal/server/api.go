@@ -60,6 +60,8 @@ type APIHandler struct {
 	statsService *StatsService             // 会话统计聚合服务
 	pluginMgr    *plugins.Manager          // 插件管理器（热插拔插件管理 API）
 	learnedSkills *store.LearnedSkillStore // 自进化技能库存储（2026-09-02 设计 §8）
+	// skillConsolidation 技能库整理器（C 库存治理）：手动触发一轮合并/归档，返回摘要。
+	skillConsolidation func(ctx context.Context) (string, error)
 	// defaultWorkDir 进程默认工作目录（bootstrap 注入）：work_dir 参数为空时
 	// tester-config 等工作目录级配置的回落目录（与 ReactService.workDir 同源）。
 	defaultWorkDir string

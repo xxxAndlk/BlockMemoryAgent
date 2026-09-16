@@ -29,8 +29,10 @@ const (
 // startDataMaintenance 启动数据生命周期维护循环，返回停止函数（幂等，可安全多次调用）。
 // 启动时先同步跑一遍（此时无并发压力，清理失败也只影响磁盘占用），随后按 24h 周期重复。
 // 参数 workDir：进程默认工作目录（.bma/tool_outputs 的清理根）；db：知识归档用存储，
-// 归档开关关闭或 db 为 nil 时跳过归档步骤（测试/无库场景）。
-func startDataMaintenance(cfg *config.Config, workDir string, db knowledgeArchiver) (stop func()) {
+// 归档开关关闭或 db 为 nil 时跳过归档步骤（测试/无库场景）；
+// onDaily：随每轮额外触发的维护（如经验技能库整理 C），可为 nil；内部含轻量模型调用
+// 等慢操作，放 goroutine 异步执行，不阻塞维护循环与启动路径。
+func startDataMaintenance(cfg *config.Config, workDir string, db knowledgeArchiver, onDaily func()) (stop func()) {
 	logDir := cfg.Logging.Dir
 	if logDir == "" {
 		logDir = "logs"
@@ -60,6 +62,10 @@ func startDataMaintenance(cfg *config.Config, workDir string, db knowledgeArchiv
 		}
 		if n := cleanOldToolOutputs(workDir, toolOutDays); n > 0 {
 			log.Printf("[data-maintenance] 已清理 %d 个过期工具输出文件（保留 %d 天）", n, toolOutDays)
+		}
+		// 附加日维护（如经验技能库整理）：慢操作异步执行，不阻塞清理循环。
+		if onDaily != nil {
+			go onDaily()
 		}
 	}
 

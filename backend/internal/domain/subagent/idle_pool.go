@@ -862,7 +862,7 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 	if result.VerifyNote != "" {
 		summary = fmt.Sprintf("【校验:通过(%s)】\n%s", result.VerifyNote, result.Text)
 	}
-	d.saveBlockMemory(taskCtx, s.id, "domain", s.parentID, s.domain, s.lastTaskGoal(), result.Text, blockOutcomeSuccess, files)
+	d.saveBlockMemory(taskCtx, s.id, "domain", s.parentID, s.domain, s.lastTaskGoal(), result.Text, blockOutcomeSuccess, files, result.History)
 	d.notify(s.parentID, s.id, summary, files)
 	d.trackChildDoneOnce(s)
 	d.enterIdle(s, summary)

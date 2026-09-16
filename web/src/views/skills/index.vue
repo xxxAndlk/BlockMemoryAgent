@@ -8,6 +8,7 @@ import {
   enableLearnedSkill,
   disableLearnedSkill,
   listEvolutionLog,
+  consolidateSkills,
   type LearnedSkill,
   type EvolutionLogEntry,
 } from '@/api/learned'
@@ -22,6 +23,22 @@ const mutating = ref<string | null>(null)
 
 const builtinSkills = ref<Skill[]>([])
 const builtinLoading = ref(false)
+
+const consolidating = ref(false)
+
+// 手动触发技能库整理（合并语义重复技能 + 归档零使用技能）；轻量模型调用，可能耗时 1-2 分钟。
+async function runConsolidate() {
+  consolidating.value = true
+  try {
+    const res = await consolidateSkills()
+    ElMessage.success(res.summary || '整理完成')
+    await Promise.all([loadSkills(), loadLog()])
+  } catch (e) {
+    ElMessage.error('整理失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    consolidating.value = false
+  }
+}
 
 async function loadBuiltin() {
   builtinLoading.value = true
@@ -127,6 +144,10 @@ function kindLabel(kind: string) {
     case 'project_lesson': return '项目经验'
     case 'skill_create': return '技能新建'
     case 'skill_update': return '技能更新'
+    case 'skill_dropped': return '技能未沉淀'  // 技能库满，建新被写入门拒绝
+    case 'skill_merge': return '技能合并'
+    case 'skill_archive': return '技能归档'
+    case 'consolidate_run': return '整理记录'
     default: return kind
   }
 }
@@ -135,6 +156,10 @@ function kindType(kind: string) {
   switch (kind) {
     case 'skill_create': return 'success'
     case 'skill_update': return 'warning'
+    case 'skill_merge': return 'warning'
+    case 'skill_dropped': return 'danger'
+    case 'skill_archive': return 'info'
+    case 'consolidate_run': return 'success'
     case 'user_pref': return ''
     case 'project_lesson': return 'info'
     default: return 'info'
@@ -154,11 +179,18 @@ onMounted(() => {
 
 <template>
   <div class="p-6 h-full overflow-y-auto text-ink">
-    <div class="mb-4">
-      <h2 class="text-lg font-bold text-ink">技能库</h2>
-      <p class="text-xs text-ink-2 mt-1">
-        会话结束自动沉淀的跨项目工艺技能包；任务派发时按语义召回提示（只注一行），load_skill 取全文。
-      </p>
+    <div class="mb-4 flex items-start justify-between gap-4">
+      <div>
+        <h2 class="text-lg font-bold text-ink">技能库</h2>
+        <p class="text-xs text-ink-2 mt-1">
+          会话结束自动沉淀的跨项目工艺技能包；任务派发时按语义召回提示（只注一行），load_skill 取全文。
+          技能过多会稀释选择，启用数达阈值后每日自动整理（合并重复 / 归档零使用）。
+        </p>
+      </div>
+      <el-button plain class="!bg-transparent !border-line !text-ink shrink-0"
+                 :loading="consolidating" @click="runConsolidate">
+        <el-icon class="mr-1"><MagicStick /></el-icon> 立即整理
+      </el-button>
     </div>
 
     <el-tabs v-model="activeTab">

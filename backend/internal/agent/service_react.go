@@ -184,6 +184,10 @@ type ReactService struct {
 	// skillPool 全局技能池（技能渐进披露）：nil 时不注入 MetaAgent 技能目录块。
 	// bootstrap 经 SetSkillCatalog 注入与 Dispatcher 同一个池。
 	skillPool *skill.Pool
+	// skillCatalog 经验技能（learned）目录收敛回调：返回 enabled 技能按价值排序的
+	// top-N 元数据与启用总数，供 meta 系统提示只列常用技能（其余经 list_skills 检索）。
+	// 由 bootstrap 接 learned_skills 的 TopEnabled 查询；nil 时 meta 提示不列经验技能。
+	skillCatalog func() ([]SkillRecallHint, int)
 
 	// agentMsgCache/msgLogger 编排页对话视图：Redis 热层读缓存 + meta 消息热写器；
 	// 均由 SetAgentMsgCache 一并装配，nil 时读侧回退 PG、写侧跳过。
@@ -199,10 +203,17 @@ type ReactService struct {
 	acceptance AcceptanceRunner
 }
 
-// SetSkillCatalog 注入全局技能池：MetaAgent 会话系统提示追加全池【可用技能】目录块
+// SetSkillCatalog 注入全局技能池：MetaAgent 会话系统提示追加【可用技能】目录块
 // （Meta 持全集、可派发任意技能给下级）；nil 关闭（测试/未配置场景）。
 func (s *ReactService) SetSkillCatalog(p *skill.Pool) {
 	s.skillPool = p
+}
+
+// SetSkillCatalogSource 注入经验技能目录收敛回调（A 目录治理）：fn 返回
+// enabled 经验技能按 use_count 排序的 top-N 与启用总数；nil 关闭（meta 提示
+// 不列经验技能）。bootstrap 接 learned_skills.TopEnabled。
+func (s *ReactService) SetSkillCatalogSource(fn func() ([]SkillRecallHint, int)) {
+	s.skillCatalog = fn
 }
 
 // SetAgentMsgCache 注入 Agent 消息 Redis 热层（编排页对话视图）：读侧缓存 + meta 热写器。
@@ -212,14 +223,51 @@ func (s *ReactService) SetAgentMsgCache(c *store.AgentMsgRedisStore) {
 	s.msgLogger = NewMessageLogger(c)
 }
 
-// metaSkillBlock 渲染 MetaAgent 的全池技能目录块：Meta 持全集（无需派发即可
-// load_skill 取全文，也可经 call_sub_agent 的 skills 参数下放任意技能）。
+// metaSkillBlock 渲染 MetaAgent 的技能目录块：静态技能（yaml/builtin/目录/插件包）
+// 全列，经验技能（learned）只列常用 top-N + 检索提示——自进化技能库随会话沉淀
+// 无限增长（每次会话最多 +2 且无淘汰），全量入提示会持续膨胀并干扰模型选择
+//（治理三件套：A 目录收敛 / B 写入门 / C 库存整理）。
 // skillPool 未注入或池为空时返回空串（零注入）。
 func (s *ReactService) metaSkillBlock() string {
 	if s.skillPool == nil {
 		return ""
 	}
-	return skill.MetadataBlock(s.skillPool, s.skillPool.Names())
+	base := skill.MetadataBlock(s.skillPool, s.skillPool.NamesExceptSource("learned"))
+	learned := s.learnedSkillCatalogBlock()
+	switch {
+	case learned == "":
+		return base
+	case base == "":
+		return learned + "\n用 load_skill(名称) 获取技能全文；派发子 Agent 时可用 skills 参数下放其中技能。"
+	default:
+		return learned + "\n" + base
+	}
+}
+
+// learnedSkillCatalogBlock 收敛后的经验技能目录（A）：列出价值 top-N，超出部分
+// 只提示总数与检索方式（list_skills 的 query 参数），不再全量进系统提示。
+// 回调未接线或无非禁用技能时返回空串。
+func (s *ReactService) learnedSkillCatalogBlock() string {
+	if s.skillCatalog == nil {
+		return ""
+	}
+	top, total := s.skillCatalog()
+	if total <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("【经验技能】\n")
+	for _, h := range top {
+		b.WriteString("- ")
+		b.WriteString(h.Name)
+		b.WriteString(": ")
+		b.WriteString(h.Title)
+		b.WriteByte('\n')
+	}
+	if total > len(top) {
+		fmt.Fprintf(&b, "经验技能共 %d 个，此处按使用频次列前 %d 个；检索其余用 list_skills(query=关键词)。\n", total, len(top))
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // SetActivityPinger 注入等待用户答复期间的心跳保活回调；nil 关闭（测试场景）。

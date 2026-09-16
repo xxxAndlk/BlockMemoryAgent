@@ -192,6 +192,43 @@ LIMIT $3`, pgVector(embedding), maxDistance, limit)
 	return out, rows.Err()
 }
 
+// CountEnabled 统计 enabled 技能数（技能库上限闸门用；写门在 persistOne 建新技能前调用）。
+func (s *LearnedSkillStore) CountEnabled(ctx context.Context) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM learned_skills WHERE enabled`).Scan(&n)
+	return n, err
+}
+
+// TopEnabled 返回 enabled 技能按价值排序的前 limit 条（use_count 降序，同分 updated_at 降序）。
+// 供 meta 系统提示【可用技能】块收敛：只列常用 top-N，其余经 list_skills(query) 按需检索。
+func (s *LearnedSkillStore) TopEnabled(ctx context.Context, limit int) ([]*LearnedSkill, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
+SELECT name, title, when_to_use, content_path, enabled, use_count, source_session, outcome, created_at, updated_at
+FROM learned_skills WHERE enabled
+ORDER BY use_count DESC, updated_at DESC
+LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*LearnedSkill
+	for rows.Next() {
+		rec, err := scanLearnedSkill(rows.Scan)
+		if err != nil {
+			continue
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 // SetEnabled 启用/禁用技能（禁用即从向量预筛与 list_skills 过滤，设计 §9）。
 func (s *LearnedSkillStore) SetEnabled(ctx context.Context, name string, enabled bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)

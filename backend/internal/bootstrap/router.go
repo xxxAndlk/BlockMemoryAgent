@@ -90,6 +90,7 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.PUT("/skills/learned/:name", apiHandler.SaveLearnedSkillHandler)             // 手动编辑（重写文件+向量）
 	api.POST("/skills/learned/:name/enable", apiHandler.EnableLearnedSkillHandler)   // 启用
 	api.POST("/skills/learned/:name/disable", apiHandler.DisableLearnedSkillHandler) // 禁用
+	api.POST("/skills/consolidate", apiHandler.ConsolidateSkillsHandler)             // 技能库整理（合并/归档，忽略每日阈值）
 	api.GET("/evolution/log", apiHandler.EvolutionLogHandler)                        // 进化审计流水
 
 	// 插件管理 API（设计文档 §5）。
@@ -125,5 +126,6 @@ func apiHandlerOf(app *App) *server.APIHandler {
 	if app.Postgres != nil {
 		h.SetLearnedSkills(app.Postgres.LearnedSkills) // 自进化技能库存储
 	}
+	h.SetSkillConsolidation(app.SkillConsolidation) // 技能库整理（C 库存治理，未装配时端点 503）
 	return h
 }

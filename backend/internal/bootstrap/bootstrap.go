@@ -85,6 +85,10 @@ type App struct {
 	Plugins      *plugins.Manager          // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
 	WorkDir      string                    // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
 
+	// SkillConsolidation 经验技能库整理（C 库存治理）：POST /api/skills/consolidate 手动触发，
+	// 忽略阈值直接整理；返回人类可读摘要。nil 时端点返回 503。
+	SkillConsolidation func(ctx context.Context) (string, error)
+
 	// cleanup 保存 App 关闭时需要按逆序释放的资源。
 	cleanup []func() error
 }
@@ -436,7 +440,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.WithBlockMemorySaver(&blockMemorySaver{pg: pgStore}, cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled)
 	// 事实提取：子 Agent 完成后用轻量模型提取 1-5 条关键事实，每条单独落 KnowledgeRecord，
 	// 替代原始 result.Text 整段落库。提取失败自动回退原始保存（saveBlockMemory 内部处理）。
-	subAgentDispatcher.WithFactExtractor(&llmFactExtractor{factory: modelFactory})
+	subAgentDispatcher.WithFactExtractor(&llmFactExtractor{factory: modelFactory, maxFacts: cfg.Agent.BlockMemoryFactsMax})
 	// 失败打捞（TODO #20 第二层）：子 Agent 失败（超时/被杀/循环守卫终止）时用轻量模型
 	// 提取"已读文件清单+已得结论+卡点"摘要，写共享槽位供同域重派带前序摘要 + 追加进父 mailbox。
 	// 超时配置化（TODO #33）：思考型模型首 token 数十秒，旧 5s 硬编码致打捞全超时降级。
@@ -498,9 +502,27 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
 	// 会话终态 Webhook 通知（TODO #18-5 T32）：webhook_url 空=关闭（NewNotifier 返 nil）。
 	agentSvc.SetNotifier(agent.NewNotifier(cfg.Notify.WebhookURL, cfg.Notify.WebhookEvents))
-	// MetaAgent 全池技能目录块（【可用技能】进 meta 系统提示；Meta 持全集可 load_skill
-	// 取全文，也可派发时经 skills 参数下放任意技能）。
+	// MetaAgent 技能目录块（【可用技能】进 meta 系统提示；Meta 持全集可 load_skill
+	// 取全文，也可派发时经 skills 参数下放任意技能）。经验技能（learned）目录收敛：
+	// 系统提示只列常用 top-N（config skills.meta_catalog_top），其余经 list_skills 检索。
 	agentSvc.SetSkillCatalog(skillPool)
+	agentSvc.SetSkillCatalogSource(func() ([]agent.SkillRecallHint, int) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		top, err := pgStore.LearnedSkills.TopEnabled(ctx, cfg.Skills.MetaCatalogTop)
+		if err != nil {
+			return nil, 0
+		}
+		total, err := pgStore.LearnedSkills.CountEnabled(ctx)
+		if err != nil {
+			total = len(top)
+		}
+		out := make([]agent.SkillRecallHint, 0, len(top))
+		for _, h := range top {
+			out = append(out, agent.SkillRecallHint{Name: h.Name, Title: h.Title})
+		}
+		return out, total
+	})
 	// 注入用户视频附件处理参数（Alt+V 粘贴视频）：默认 native——≤ native_max_mb 的
 	// mp4/avi/mov 整个直传，openai-chat 兼容端点映射 video_url 供 Ark/GLM 视频理解
 	// 模型原生消费（已对照火山文档 82379/1895586）；webm/mkv/超限视频回落抽帧，
@@ -656,7 +678,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return evolveSessionLLM(ctx, modelFactory, in)
 		})
 		skillSink := newLearnedSkillSink(pgStore.LearnedSkills,
-			filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"), skillPool)
+			filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"), skillPool, cfg.Skills.MaxCount)
 		agentSvc.SetSkillSink(skillSink.persist)
 		agentSvc.SetEvolutionLogger(func(ctx context.Context, sessionID, kind, target, summary string) error {
 			return pgStore.LearnedSkills.AppendEvolutionLog(ctx, kind, target, summary, sessionID)
@@ -897,6 +919,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 第十九步：创建 DAG HTTP 处理器。
 	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
 
+	// 经验技能库整理器（C 库存治理）：每日随数据维护 tick 自动跑（达阈值才动手），
+	// 也可经 POST /api/skills/consolidate 手动触发（忽略阈值）。
+	skillCons := newSkillConsolidator(pgStore.LearnedSkills, skillPool, modelFactory, cfg.Skills.ConsolidateThreshold)
+
 	// 第二十步：组装 App 实例。
 	app := &App{
 		Agent:        agentSvc,
@@ -913,12 +939,23 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		Logger:       sessionLogger,
 		Plugins:      pluginManager,
 		WorkDir:      workDir,
+
+		SkillConsolidation: func(ctx context.Context) (string, error) {
+			return skillCons.Run(ctx, true)
+		},
 	}
 
 	// 第二十一步：注册关闭时释放资源的回调，按依赖顺序排列（外层 Close 会逆序调用）。
 	// 数据生命周期维护（TODO #18-2 T29）：启动即跑一遍 + 每 24h 重复（陈旧知识归档/
 	// 日志与工具输出按保留期清理）；停在知识归档之后（归档走 PG）。
-	stopMaintenance := startDataMaintenance(cfg, workDir, pgStore.Knowledge)
+	// onDaily 附加技能库整理（含轻量模型调用，异步、达阈值才跑，失败仅记日志）。
+	stopMaintenance := startDataMaintenance(cfg, workDir, pgStore.Knowledge, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), skillConsolidateTimeout+30*time.Second)
+		defer cancel()
+		if _, err := skillCons.Run(ctx, false); err != nil {
+			log.Printf("[skill-consolidate] daily run failed (non-fatal): %v", err)
+		}
+	})
 	app.cleanup = []func() error{
 		func() error {
 			// 先停全部插件（MCP 子进程/HTTP 连接），再关 DAG 调度器。
@@ -1200,6 +1237,26 @@ func (s *blockMemorySaver) Save(ctx context.Context, rec *types.KnowledgeRecord)
 		return fmt.Errorf("embed block memory: %w", err)
 	}
 	rec.Embedding = emb
+	// 写入侧近邻去重（D 治理，2026-09-16）：同一结论跨会话反复沉淀时只更新既有记录，
+	// 不新增行（此前块记忆零去重，同事实随每个子 Agent 完成重复落库）。
+	// 作用域 = 同 task_domain 的未归档块记忆；距离阈值 0.15（相似度 >= 0.85，同一事实的改写）。
+	// 查询失败放行照常插入（best-effort，不阻塞沉淀）。
+	if rec.KnowledgeType == enums.KnowledgeTypeBlockMemory {
+		domain, _ := rec.Meta["task_domain"].(string)
+		if dup, err := s.pg.Knowledge.FindSimilarBlockMemory(ctx, emb, domain, blockMemoryDedupDistance); err != nil {
+			log.Printf("[block-memory] dedup lookup failed (non-fatal): %v", err)
+		} else if dup != nil {
+			if err := s.pg.Knowledge.UpdateContentEmbedding(ctx, dup.ID, rec.Content, emb); err != nil {
+				return fmt.Errorf("update duplicate block memory: %w", err)
+			}
+			log.Printf("[block-memory] near-duplicate merged: id=%d domain=%q", dup.ID, domain)
+			return nil
+		}
+	}
 	// 复用既有 SaveKnowledge（委托 KnowledgeStore.Save），不新增存储路径。
 	return s.pg.SaveKnowledge(ctx, rec)
 }
+
+// blockMemoryDedupDistance 块记忆写入去重的 cosine 距离阈值（对应相似度 >= 0.85）：
+// 同域内相似度高于此值视为"同一事实的再次沉淀"，更新既有记录而非新增行。
+const blockMemoryDedupDistance = 0.15

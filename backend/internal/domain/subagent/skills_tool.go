@@ -20,6 +20,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/skill"
+	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
@@ -47,13 +48,26 @@ func (t *listSkillsTool) Aliases() []string { return nil }
 func (t *listSkillsTool) Description() string {
 	return "列出你可用的技能（名称 + 一句话描述）。你系统提示中的【可用技能】块即本工具的范围；" +
 		"对某个技能需要详细操作指引时，用 load_skill(名称) 获取全文。" +
+		"技能多时用 query 关键词过滤（匹配名称/标题/描述）；经验技能（自进化沉淀）系统提示只列常用若干，" +
+		"剩余用本工具检索。" +
 		"派发子 Agent 时可把其中技能经 call_sub_agent 的 skills 参数下放给子 Agent。"
 }
 
-// InputSchema 返回工具入参 JSON Schema：本工具无入参。
-func (t *listSkillsTool) InputSchema() *jsonschema.Schema { return nil }
+// listSkillsMaxOutput 单次 list_skills 输出的技能条数上限（超限只列前 N 并提示用 query 过滤），
+// 防技能库膨胀后工具输出灌爆上下文。
+const listSkillsMaxOutput = 40
 
-// Execute 执行 list_skills：渲染调用方持有集的元数据目录。
+// InputSchema 返回工具入参 JSON Schema：可选 query 关键词过滤。
+func (t *listSkillsTool) InputSchema() *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"query": {Type: "string", Description: "可选关键词：按名称/标题/描述过滤技能（大小写不敏感子串匹配）"},
+		},
+	}
+}
+
+// Execute 执行 list_skills：渲染调用方持有集的元数据目录（可 query 过滤 + 输出条数封顶）。
 func (t *listSkillsTool) Execute(ctx context.Context, args map[string]any) *tool.Result {
 	d := t.dispatcher
 	if d.skillPool == nil {
@@ -74,10 +88,39 @@ func (t *listSkillsTool) Execute(ctx context.Context, args map[string]any) *tool
 			names = fixedSkillNames(d.skillPool, roleDef)
 		}
 	}
-	if block := skill.MetadataBlock(d.skillPool, names); block != "" {
-		return &tool.Result{Tool: "list_skills", Success: true, Output: block}
+	query, _ := args["query"].(string)
+	query = strings.ToLower(strings.TrimSpace(query))
+	total := 0
+	var kept []string
+	for _, n := range names {
+		s := d.skillPool.FindByNameOrID(n)
+		if s == nil {
+			continue
+		}
+		if query != "" && !skillMatchesQuery(s, query) {
+			continue
+		}
+		total++
+		if len(kept) < listSkillsMaxOutput {
+			kept = append(kept, n)
+		}
 	}
-	return &tool.Result{Tool: "list_skills", Success: true, Output: "你当前没有持有任何技能。"}
+	block := skill.MetadataBlock(d.skillPool, kept)
+	switch {
+	case block == "" && query != "":
+		return &tool.Result{Tool: "list_skills", Success: true, Output: fmt.Sprintf("没有匹配 %q 的技能（可省略 query 查看全部）。", query)}
+	case block == "":
+		return &tool.Result{Tool: "list_skills", Success: true, Output: "你当前没有持有任何技能。"}
+	case total > len(kept):
+		return &tool.Result{Tool: "list_skills", Success: true, Output: fmt.Sprintf("%s\n（共 %d 个匹配，只列前 %d 个；用 query 关键词缩小范围。）", block, total, len(kept))}
+	}
+	return &tool.Result{Tool: "list_skills", Success: true, Output: block}
+}
+
+// skillMatchesQuery 大小写不敏感子串匹配技能名称/标题/描述（query 需已小写）。
+func skillMatchesQuery(s *types.Skill, query string) bool {
+	hay := strings.ToLower(s.Name + "\n" + s.SkillID + "\n" + s.Description)
+	return strings.Contains(hay, query)
 }
 
 // loadSkillTool 实现 load_skill 工具。

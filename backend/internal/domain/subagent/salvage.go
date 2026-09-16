@@ -65,6 +65,7 @@ func (d *Dispatcher) salvageFailure(ctx context.Context, parentID, subAgentID st
 	}
 
 	salvage := text
+	extracted := false
 	// 仅在有真实历史时调 LLM 打捞提取；kill 场景（History nil）直接用回退文本，
 	// 避免对"心跳超时已取消"这类无信息文本空跑轻量模型。
 	if d.salvageExtractor != nil && result.History != nil {
@@ -79,9 +80,17 @@ func (d *Dispatcher) salvageFailure(ctx context.Context, parentID, subAgentID st
 		cancel()
 		if err == nil && len(facts) > 0 {
 			salvage = strings.Join(facts, "\n")
+			extracted = true
 		} else {
 			log.Printf("[subagent] salvage extract failed, fallback partial: sub=%s err=%v facts=%d", subAgentID, err, len(facts))
 		}
+	}
+	// 打捞兜底防污染（2026-09-16）：打捞 LLM 未提取成功时，回退文本可能整段是失败通知
+	// 原文（"[failure kind=killed retryable=false] 子 Agent ... 被停止"），对后续召回
+	// 零价值（存量实证：44 条 salvage 块记忆里 13 条是这类原文）。此时不写槽位也不写黑板。
+	if !extracted && strings.Contains(salvage, "[failure kind=") {
+		log.Printf("[subagent] salvage fallback is failure notice, skip sediment: sub=%s", subAgentID)
+		return ""
 	}
 	salvage = truncateRunes(strings.TrimSpace(salvage), salvageMaxRunes)
 	if salvage == "" {

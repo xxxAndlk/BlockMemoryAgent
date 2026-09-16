@@ -70,3 +70,29 @@ func TestPool_SourceTags(t *testing.T) {
 		t.Fatalf("expected builtin source, got %q", got)
 	}
 }
+
+// TestPool_NamesExceptSource 验证按 Source 排除（meta 提示词剥离 learned 用）：
+// 排除项不入列表、缺 Name 回退 SkillID、字典序稳定、Source 为空视为非排除项。
+func TestPool_NamesExceptSource(t *testing.T) {
+	p := NewPoolFromSkills([]*types.Skill{
+		{SkillID: "a", Name: "alpha", Source: "yaml"},
+		{SkillID: "b", Name: "beta", Source: "learned"},
+		{SkillID: "c", Name: "gamma", Source: "learned"},
+		{SkillID: "d", Source: "builtin"}, // 缺 Name 回退 SkillID
+		{SkillID: "e", Name: "eps", Source: "learned"},
+	})
+	got := p.NamesExceptSource("learned")
+	want := []string{"alpha", "d"}
+	if len(got) != len(want) {
+		t.Fatalf("NamesExceptSource = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("NamesExceptSource = %v, want %v（须字典序）", got, want)
+		}
+	}
+	// 全排除时返回空集而非 nil 崩。
+	if got := p.NamesExceptSource("yaml"); len(got) != 4 {
+		t.Fatalf("expected 4 non-yaml names, got %v", got)
+	}
+}

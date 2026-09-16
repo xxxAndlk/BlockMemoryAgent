@@ -58,3 +58,8 @@ export function disableLearnedSkill(name: string): Promise<{ ok: boolean }> {
 export function listEvolutionLog(limit = 200): Promise<{ entries: EvolutionLogEntry[] }> {
   return fetchJson(`/evolution/log?limit=${limit}`)
 }
+
+/** 手动触发一轮技能库整理（合并语义重复技能 + 归档零使用技能）；轻量模型调用，耗时可达约 2 分钟。 */
+export function consolidateSkills(): Promise<{ ok: boolean; summary: string }> {
+  return fetchJson('/skills/consolidate', { method: 'POST', timeoutMs: 150000 })
+}

@@ -25,6 +25,30 @@ func (h *APIHandler) SetLearnedSkills(s *store.LearnedSkillStore) {
 	h.learnedSkills = s
 }
 
+// SetSkillConsolidation 注入技能库整理器（C 库存治理，bootstrap 装配；nil 时端点 503）。
+// 手动触发忽略每日阈值直接整理，同步返回摘要（轻量模型调用，最长约 2 分钟）。
+func (h *APIHandler) SetSkillConsolidation(fn func(ctx context.Context) (string, error)) {
+	h.skillConsolidation = fn
+}
+
+// ConsolidateSkillsHandler 处理 POST /api/skills/consolidate —
+// 手动触发一轮技能库整理（合并语义重复技能 + 归档零使用技能），返回摘要。
+func (h *APIHandler) ConsolidateSkillsHandler(c *gin.Context) {
+	if h.skillConsolidation == nil {
+		c.String(http.StatusServiceUnavailable, "skill consolidation not wired")
+		return
+	}
+	// 整理含轻量模型调用（最长 ~2 分钟），超时与整理器内部预算对齐。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 150*time.Second)
+	defer cancel()
+	summary, err := h.skillConsolidation(ctx)
+	if err != nil {
+		c.String(http.StatusInternalServerError, "%s", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"ok": true, "summary": summary})
+}
+
 // ListLearnedSkillsHandler 处理 GET /api/skills/learned — 技能库全量列表（含禁用项）。
 func (h *APIHandler) ListLearnedSkillsHandler(c *gin.Context) {
 	if h.learnedSkills == nil {

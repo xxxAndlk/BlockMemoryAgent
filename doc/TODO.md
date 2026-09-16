@@ -275,3 +275,9 @@
       8. **单租户断层预留（零成本留缝，不是实施）**：全库无 user 维度（global_knowledge/session/文件皆然）；现在不做多用户完全正确，但**凡新建表/新字段（#16-6 ingest 归属、#17 领域档案、本条导出包）统一带 owner 列**——现在加一列零成本，以后补是拆骨。侵入度：零（纪律）。
     - **验收口径**：全新 Windows 机器 install 后 5 分钟内可用（向导填空+校验，无手工 docker 命令也能跑核心链路）；连续运行 30 天 global_knowledge 活跃行数有界、logs/tool_outputs 体积有界；push 即触发 backend-test；集群档任务完成时锁屏手机收到浏览器/webhook 通知；默认配置起服后外网不可达（127.0.0.1）；导出包在新机器可完整恢复会话+记忆+工件。
     - **明确不做**：不做多用户完整改造（断层预留 ≠ 实施，#13 仍挂起）；不做移动端原生应用/页面级移动重构（短期通知+列表够用）；不替换日志系统（按天切分够用，补清理即可）；不做插件自动构建编排（docker build 保留手动，向导里给显式清单即可——自动化构建链是另一个项目）。
+
+19. **经验沉淀治理四件套（技能目录收敛 / 写入门 / 库存整理 / 块记忆修复）**（2026-09-16 落地，动机与实现见 `doc/变更.md` 末条；此处只记观察点与遗留）
+    - **落地**：A meta 提示只列经验技能 top-N（`skills.meta_catalog_top`，配置 `list_skills(query=)` 检索其余）；B 满库拒新建（`skills.max_count`，evolution_log `skill_dropped`）；C 每日/手动整理（`skills.consolidate_threshold` + `POST /api/skills/consolidate` + Web「立即整理」）；D 块记忆写入近邻去重（同域 cosine ≤0.15 更新既有行）+ `last_accessed` 修复（INSERT/BumpReuse）+ 事实提取头 4000/尾 2000 + `agent.block_memory_facts_max`。
+    - **第二轮补丁（同日晚，用户定向"只沉淀改动的关键逻辑与信息"）**：块记忆触发门 `hasSubstantiveChange`（无文件改动+纯只读任务不沉淀）+ 提取失败/为空不回退原文 + 提取 prompt 跨任务复用判据 + salvage 失败原文不落库；存量 13 条 `[failure` 垃圾行 archived。
+    - **观察点**：块记忆日增量是否显著下降（基线 1067 行 / ~35 天 ≈ 30 行/天）；沉淀是否只剩真改动结论；技能库增长曲线是否被压平（`learned_skills` enabled 数 / evolution_log skill_dropped 频次）；整理质量（skill_merge 是否误并、skill_archive 是否误归档——两者都可手工恢复：enable + 文件仍在 `config/skills_learned/`）；块记忆增长速率（1067 行基线，观察增量是否显著放缓）。
+    - **遗留**：B 的「与 project_lessons 跨库判重」未做（项目经验无向量）；技能归档不自动恢复；块记忆**存量行**的去重与 `last_accessed` 回填未做（仅新写入生效——若要让 `knowledge_archive_days` 立即生效，需先手工 `UPDATE global_knowledge SET last_accessed = created_at WHERE last_accessed IS NULL`）；块记忆批量整理未做。

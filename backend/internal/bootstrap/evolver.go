@@ -116,10 +116,13 @@ type learnedSkillSink struct {
 	skills *store.LearnedSkillStore
 	dir    string
 	pool   *skill.Pool
+	// maxCount enabled 技能上限（B 写入门，config skills.max_count）；<=0 不限。
+	// 达到上限后新经验只允许走"近邻同名判定"合并进既有技能，不再新建（防无限膨胀）。
+	maxCount int
 }
 
-func newLearnedSkillSink(skills *store.LearnedSkillStore, dir string, pool *skill.Pool) *learnedSkillSink {
-	return &learnedSkillSink{skills: skills, dir: dir, pool: pool}
+func newLearnedSkillSink(skills *store.LearnedSkillStore, dir string, pool *skill.Pool, maxCount int) *learnedSkillSink {
+	return &learnedSkillSink{skills: skills, dir: dir, pool: pool, maxCount: maxCount}
 }
 
 // persist 技能包批量落库（单条失败记日志跳过，不拖垮其余沉淀）。
@@ -163,6 +166,16 @@ func (s *learnedSkillSink) persistOne(ctx context.Context, sessionID string, sk 
 		targetName = hits[0].Name
 		useCount = hits[0].UseCount
 		kind = "skill_update"
+	}
+	// B 写入门：技能库达上限后拒绝新建（更新既有技能不受限——合并路径正是满库时
+	// 期望的吸收方式）。拒绝也写 evolution_log（skill_dropped），在技能页可审计。
+	if kind == "skill_create" && s.maxCount > 0 {
+		if n, err := s.skills.CountEnabled(ctx); err == nil && n >= s.maxCount {
+			reason := fmt.Sprintf("技能库已满（enabled %d/%d），经验未沉淀为新技能：%s（可合并进既有技能或调大 skills.max_count）", n, s.maxCount, title)
+			log.Printf("[evolver] skill dropped: library full (%d/%d) name=%s", n, s.maxCount, name)
+			_ = s.skills.AppendEvolutionLog(ctx, "skill_dropped", name, truncateForPrompt(reason, 200), sessionID)
+			return nil
+		}
 	}
 
 	contentPath := filepath.Join(s.dir, targetName+".md")

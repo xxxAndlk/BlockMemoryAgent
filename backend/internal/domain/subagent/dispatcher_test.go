@@ -4,6 +4,7 @@ package subagent
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -38,6 +39,37 @@ func (m *mockProvider) Generate(ctx context.Context, req *blades.ModelRequest) (
 
 // Name 返回模拟提供者的名称标识。
 func (m *mockProvider) Name() string { return "mock" }
+
+// toolScriptProvider 按序返回预设 blades 消息（耗尽后重复末条），可携带工具调用。
+type toolScriptProvider struct {
+	responses []*blades.Message
+	mu        sync.Mutex
+	idx       int
+}
+
+func (p *toolScriptProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	p.mu.Lock()
+	i := p.idx
+	if i < len(p.responses)-1 {
+		p.idx++
+	}
+	msg := p.responses[i]
+	p.mu.Unlock()
+	return &blades.ModelResponse{Message: msg}, nil
+}
+
+func (p *toolScriptProvider) Name() string { return "mock" }
+
+// changeProvider 构造"首轮写文件、次轮终答"的脚本化 provider。
+// 块记忆沉淀触发门（2026-09-16）要求任务有实际改动（文件写入或非只读工具），
+// 纯文本终答的子任务不再沉淀；块记忆相关用例用它模拟"真正改了文件的子任务"。
+func changeProvider(text string) *toolScriptProvider {
+	req, _ := json.Marshal(map[string]any{"path": "note.txt", "content": "x"})
+	return &toolScriptProvider{responses: []*blades.Message{
+		{Role: blades.RoleAssistant, Parts: []blades.Part{blades.ToolPart{Name: "WriteFile", Request: string(req)}}},
+		blades.AssistantMessage(text),
+	}}
+}
 
 // mockModelFactory 是一个模拟的模型工厂，总是返回同一个 provider。
 type mockModelFactory struct {
@@ -472,7 +504,7 @@ func newWriteTestEnv(t *testing.T, saver BlockMemorySaver, enabled bool) (*tool.
 	reg := role.NewRegistry(cfg)
 	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	mb := mailbox.New()
-	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d := NewDispatcher(reg, &mockModelFactory{provider: changeProvider("done")}, toolsReg, mb, agent.NopMemoryPipeline{})
 	d.WithBlockMemorySaver(saver, enabled)
 	d.RegisterCallTool(toolsReg)
 	return toolsReg, mb
@@ -580,8 +612,8 @@ func (m *mockFactExtractor) Extract(ctx context.Context, text, goal, roleID stri
 }
 
 // TestRunSubAgent_FactExtraction 验证注入 FactExtractor 时,
-// 子 Agent 完成后调用 Extract 并把每条事实作为独立 KnowledgeRecord 落库。
-// 同时验证提取失败时回退到原始 result.Text 保存。
+// 子 Agent 完成后调用 Extract 并把每条事实作为独立 KnowledgeRecord 落库；
+// 提取失败（err）与提取为空（模型判定无可复用信息）均零写入（2026-09-16 政策）。
 func TestRunSubAgent_FactExtraction(t *testing.T) {
 	cfg := &config.RoleConfigFile{
 		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
@@ -596,7 +628,7 @@ func TestRunSubAgent_FactExtraction(t *testing.T) {
 	saver := &mockBlockMemorySaver{}
 	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	mb := mailbox.New()
-	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d := NewDispatcher(reg, &mockModelFactory{provider: changeProvider("done")}, toolsReg, mb, agent.NopMemoryPipeline{})
 	d.WithBlockMemorySaver(saver, true)
 	d.WithFactExtractor(&mockFactExtractor{facts: []string{"事实一", "事实二"}})
 	d.RegisterCallTool(toolsReg)
@@ -625,43 +657,35 @@ func TestRunSubAgent_FactExtraction(t *testing.T) {
 		t.Errorf("rec[1].Meta[fact_index] = %v, want 1", rec1.Meta["fact_index"])
 	}
 
-	// 情形二：提取失败（err），回退到原始文本保存。
+	// 情形二：提取失败（err）不再回退原文沉淀（2026-09-16 政策：原文多为本次状态
+	// 快照，是存量噪声主要来源）——应零写入，仅日志。
 	saver2 := &mockBlockMemorySaver{}
 	toolsReg2 := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	mb2 := mailbox.New()
-	d2 := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg2, mb2, agent.NopMemoryPipeline{})
+	d2 := NewDispatcher(reg, &mockModelFactory{provider: changeProvider("done")}, toolsReg2, mb2, agent.NopMemoryPipeline{})
 	d2.WithBlockMemorySaver(saver2, true)
 	d2.WithFactExtractor(&mockFactExtractor{err: errors.New("llm down")})
 	d2.RegisterCallTool(toolsReg2)
 
 	dispatchCodeAssistant(t, toolsReg2)
-	waitForCond(t, "fallback raw save", func() bool { return saver2.savedCount() > 0 })
-
-	if saver2.savedCount() != 1 {
-		t.Fatalf("expected 1 raw record on extract failure, got %d", saver2.savedCount())
-	}
-	raw := saver2.lastSaved()
-	if !strings.Contains(raw.Content, "目标:") {
-		t.Errorf("raw content missing 目标 prefix, got %q", raw.Content)
-	}
-	if raw.Meta["source"] != "sub_agent_result" {
-		t.Errorf("raw Meta[source] = %v, want sub_agent_result", raw.Meta["source"])
+	waitForCond(t, "parent notify", func() bool { return len(mb2.Drain("meta")) > 0 })
+	if saver2.savedCount() != 0 {
+		t.Fatalf("expected no sediment on extract failure, got %d records", saver2.savedCount())
 	}
 
-	// 情形三：提取返回空切片，回退到原始文本保存。
+	// 情形三：提取返回空切片（模型判定无可复用信息）同样零写入。
 	saver3 := &mockBlockMemorySaver{}
 	toolsReg3 := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	mb3 := mailbox.New()
-	d3 := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg3, mb3, agent.NopMemoryPipeline{})
+	d3 := NewDispatcher(reg, &mockModelFactory{provider: changeProvider("done")}, toolsReg3, mb3, agent.NopMemoryPipeline{})
 	d3.WithBlockMemorySaver(saver3, true)
 	d3.WithFactExtractor(&mockFactExtractor{facts: []string{}})
 	d3.RegisterCallTool(toolsReg3)
 
 	dispatchCodeAssistant(t, toolsReg3)
-	waitForCond(t, "fallback raw save on empty", func() bool { return saver3.savedCount() > 0 })
-
-	if saver3.savedCount() != 1 {
-		t.Fatalf("expected 1 raw record on empty facts, got %d", saver3.savedCount())
+	waitForCond(t, "parent notify empty", func() bool { return len(mb3.Drain("meta")) > 0 })
+	if saver3.savedCount() != 0 {
+		t.Fatalf("expected no sediment on empty facts, got %d records", saver3.savedCount())
 	}
 }
 
@@ -810,7 +834,7 @@ func TestDispatcher_PendingChildren(t *testing.T) {
 	mb := mailbox.New()
 	// 阻塞式 provider：使子 Agent Run 不立即返回，保证计数窗口可观测。
 	saver := &blockingSaver{entered: make(chan struct{}), release: make(chan struct{})}
-	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "ok"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d := NewDispatcher(reg, &mockModelFactory{provider: changeProvider("ok")}, toolsReg, mb, agent.NopMemoryPipeline{})
 	d.WithBlockMemorySaver(saver, true)
 	d.RegisterCallTool(toolsReg)
 

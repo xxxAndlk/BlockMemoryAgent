@@ -23,6 +23,22 @@ type Config struct {
 	Logging  LoggingConfig  `yaml:"logging"`  // 日志文件输出（按天分割，按入口分文件）
 	Data     DataConfig     `yaml:"data"`     // 数据生命周期（陈旧知识归档/日志与工具输出保留期，TODO #18-2 T29）
 	Notify   NotifyConfig   `yaml:"notify"`   // 会话终态 Webhook 通知（TODO #18-5 T32）
+	Skills   SkillsConfig   `yaml:"skills"`   // 经验技能库治理（上限/目录收敛/自动整理）
+}
+
+// SkillsConfig 经验技能库（learned_skills）治理配置。
+// 背景：SessionEvolver 每次会话结束最多新增 2 个技能且没有淘汰，技能库无限增长时
+// meta 系统提示的【可用技能】块越拉越长、模型选择准确率下降。三档闸门：
+//   - MaxCount 写入上限（B）：达到上限后新技能只允许合并进既有技能，不再新建；
+//   - MetaCatalogTop 目录收敛（A）：meta 提示只列常用 top-N，其余经 list_skills 检索；
+//   - ConsolidateThreshold 库存整理（C）：启用数达到阈值后每日跑一次合并/归档。
+type SkillsConfig struct {
+	// MaxCount enabled 经验技能上限；默认 50；负数/0=不限（回退默认）。
+	MaxCount int `yaml:"max_count"`
+	// MetaCatalogTop meta 系统提示列出的经验技能条数（按 use_count 降序）；默认 20。
+	MetaCatalogTop int `yaml:"meta_catalog_top"`
+	// ConsolidateThreshold 达到该启用数后每日自动整理（合并/归档）；默认 30；<=0 关闭。
+	ConsolidateThreshold int `yaml:"consolidate_threshold"`
 }
 
 // NotifyConfig 会话终态 Webhook 通知配置（TODO #18-5 T32）。
@@ -183,6 +199,9 @@ type FeatureTogglesConfig struct {
 	DAGEnabled              bool  `yaml:"dag_enabled"`                // 是否启动 DAG 调度器
 	RestoreSessions         *bool `yaml:"restore_sessions"`           // 启动时是否从 session_history 恢复最近会话到内存（默认 true；显式 false 关闭）
 	BlockMemoryWriteEnabled *bool `yaml:"block_memory_write_enabled"` // 子 Agent 成功完成后是否将结果摘要沉淀到块记忆知识库（默认 true；显式 false 关闭）
+	// BlockMemoryFactsMax 单次子 Agent 输出提取的关键事实条数上限（默认 5，1-8 区间）。
+	// 事实逐条向量化落库，条数多则召回粒度细但噪声大；1-5 条为设计定档（每条 <=80 字）。
+	BlockMemoryFactsMax int `yaml:"block_memory_facts_max"`
 	// MaxTotalDispatches 单 session 内所有角色派发总数上限（合计），超过拒绝派发。
 	// 计数在用户发送新消息时重置。默认 30；<=0 时回退默认，负数表示不限制。
 	MaxTotalDispatches int `yaml:"max_total_dispatches"`
@@ -473,7 +492,21 @@ func (c *Config) applyDefaults() error {
 	}
 	c.applyLoggingDefaults()
 	c.applyNotifyDefaults()
+	c.applySkillsDefaults()
 	return nil
+}
+
+// applySkillsDefaults 技能库治理默认值（语义见 SkillsConfig）：50 / 20 / 30。
+func (c *Config) applySkillsDefaults() {
+	if c.Skills.MaxCount <= 0 {
+		c.Skills.MaxCount = 50
+	}
+	if c.Skills.MetaCatalogTop <= 0 {
+		c.Skills.MetaCatalogTop = 20
+	}
+	if c.Skills.ConsolidateThreshold == 0 {
+		c.Skills.ConsolidateThreshold = 30
+	}
 }
 
 // applyNotifyDefaults 填充通知配置默认值：事件列表为空时默认 [completed, error]。
@@ -670,6 +703,9 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	if c.Agent.BlockMemoryWriteEnabled == nil {
 		t := true
 		c.Agent.BlockMemoryWriteEnabled = &t
+	}
+	if c.Agent.BlockMemoryFactsMax <= 0 {
+		c.Agent.BlockMemoryFactsMax = 5
 	}
 	// 全局派发总数默认 30：按"13 文件级编排任务约需 25-30 次派发"的实证校准；
 	// 旧的按角色对 5 次限额会在多文件任务中途卡死派发。

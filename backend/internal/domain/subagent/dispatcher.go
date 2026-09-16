@@ -3730,7 +3730,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		// 叶子助手触达 token 上限:不持久化,把部分产出塞 result.Text 返回给父 mailbox + 标 Done。
 		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 		result.Text = partial
-		d.saveBlockMemory(ctx, subAgentID, roleDef.ID, parentID, domain, origTask, partial, blockOutcomePartial, agent.FilesModifiedFromHistory(result.History))
+		d.saveBlockMemory(ctx, subAgentID, roleDef.ID, parentID, domain, origTask, partial, blockOutcomePartial, agent.FilesModifiedFromHistory(result.History), result.History)
 		log.Printf("[subagent] PARTIAL: sub=%s role=%s (token budget, partial returned)", subAgentID, roleDef.ID)
 		return sub, result, errPartialReturn
 	}
@@ -3872,7 +3872,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		Content: result.Text,
 	})
 
-	d.saveBlockMemory(ctx, subAgentID, roleDef.ID, parentID, domain, origTask, result.Text, blockOutcomeSuccess, agent.FilesModifiedFromHistory(result.History))
+	d.saveBlockMemory(ctx, subAgentID, roleDef.ID, parentID, domain, origTask, result.Text, blockOutcomeSuccess, agent.FilesModifiedFromHistory(result.History), result.History)
 
 	return sub, result, nil
 }
@@ -5018,11 +5018,19 @@ func (d *Dispatcher) WithSharedMemory(r tool.SharedMemoryStore) *Dispatcher {
 // task_domain/files_modified，供 BlackboardSearcher.Query 按 scope 确定性过滤（兄弟产出按 scope
 // 共享，替纯语义召回的跨 scope 串扰）。taskDomain 为空时仅落语义召回可用字段，scope 查询召回不到。
 //
-// 提取策略：若 factExtractor 已注入，先调用 LLM 提取 1-5 条关键事实，
-// 每条事实单独落 KnowledgeRecord（向量化后召回精度更高）。
-// 提取失败或未注入时回退到原始 result.Text 落库（向后兼容）。
-func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, parentID, taskDomain, goal, result, outcome string, filesModified []string) {
+// 提取策略（2026-09-16 收紧）：factExtractor 已注入时只认 LLM 提取结果——
+// 提取成功但零事实（模型判定无可复用信息）**不沉淀**；提取失败也不回退原文
+//（原文多为本次状态快照，是存量噪声的主要来源），仅记日志。未注入提取器时
+// 才回退原始 result.Text 落库（测试/未接线场景的向后兼容）。
+func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, parentID, taskDomain, goal, result, outcome string, filesModified []string, history []agent.ReactMessage) {
 	if d.saver == nil || !d.writeEnabled {
+		return
+	}
+	// 触发门（2026-09-16 用户定向"只沉淀改动的关键逻辑与信息"）：纯检查/调研/问答
+	// 任务（无文件改动且全程只调只读类工具）不留沉淀——存量 1067 行里相当比例是
+	// 验收/状态类快照，对后续任务召回是噪声。
+	if !hasSubstantiveChange(history, filesModified) {
+		log.Printf("[subagent] skip block memory (no substantive change): sub=%s role=%s outcome=%s", subAgentID, roleID, outcome)
 		return
 	}
 	content := strings.TrimSpace(result)
@@ -5031,13 +5039,51 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, pa
 	}
 	if d.factExtractor != nil {
 		facts, err := d.factExtractor.Extract(ctx, content, goal, roleID)
-		if err == nil && len(facts) > 0 {
-			d.saveFacts(ctx, subAgentID, roleID, parentID, taskDomain, goal, facts, outcome, filesModified)
+		if err != nil {
+			log.Printf("[subagent] extract facts failed, skip sediment: sub=%s err=%v", subAgentID, err)
 			return
 		}
-		log.Printf("[subagent] extract facts failed, fallback raw: sub=%s err=%v facts=%d", subAgentID, err, len(facts))
+		if len(facts) == 0 {
+			log.Printf("[subagent] no reusable facts extracted, skip sediment: sub=%s role=%s", subAgentID, roleID)
+			return
+		}
+		d.saveFacts(ctx, subAgentID, roleID, parentID, taskDomain, goal, facts, outcome, filesModified)
+		return
 	}
 	d.saveRawBlockMemory(ctx, subAgentID, roleID, parentID, taskDomain, goal, content, outcome, filesModified)
+}
+
+// blockMemoryNoChangeTools 判定"本次任务无实际改动"的只读/无产出工具集：
+// history 里全部工具调用都落在此集合内且无 WriteFile/EditFile 轨迹 → 视为纯检查/
+// 调研/问答任务，不沉淀。未列出的工具（含插件、MCP、未知工具）一律视为有产出——
+// 门只拦"确定什么都没改"的任务，宁多沉淀可疑项也不放过真实改动。
+var blockMemoryNoChangeTools = map[string]bool{
+	"ReadFile": true, "ListDir": true, "SearchInFiles": true, "ReadMedia": true,
+	"ReadSharedMemory": true, "search_knowledge": true,
+	"GitStatus": true, "GitLog": true, "GitDiff": true, "GitBlame": true,
+	"list_skills": true, "load_skill": true, "tool_catalog": true,
+	"ask_user": true, "send_message": true,
+	"write_plan": true, "submit_plan": true, "review_plan": true,
+	"list_models": true, "set_agent_model": true, "pause_agent": true, "resume_agent": true,
+	"cancel_agent": true, "escalate_gear": true,
+}
+
+// hasSubstantiveChange 判断子 Agent 本次任务是否有实际改动（块记忆沉淀的触发门）。
+func hasSubstantiveChange(history []agent.ReactMessage, filesModified []string) bool {
+	if len(filesModified) > 0 {
+		return true
+	}
+	for _, m := range history {
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if !blockMemoryNoChangeTools[tc.Name] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // domainReuseCountOf 返回热驻槽的当前复用次数（Domain 热驻两层权重：域级 reuse_count

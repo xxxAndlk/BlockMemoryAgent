@@ -118,6 +118,32 @@ func (p *Pool) Names() []string {
 	return names
 }
 
+// NamesExceptSource 返回 Source 不等于 exclude 的 Skill Name（缺 Name 回退 SkillID），
+// 字典序稳定排序、同名去重。供 meta 提示词把"经验技能（learned）"从全池目录中剥离，
+// 改由收敛后的 top-N 目录呈现（source 为空视为非 learned，不会被排除）。
+func (p *Pool) NamesExceptSource(exclude string) []string {
+	p.mu.RLock()
+	seen := make(map[string]struct{})
+	names := make([]string, 0, len(p.skills))
+	for _, s := range p.skills {
+		if s.Source == exclude {
+			continue
+		}
+		n := s.Name
+		if n == "" {
+			n = s.SkillID
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		names = append(names, n)
+	}
+	p.mu.RUnlock()
+	sort.Strings(names)
+	return names
+}
+
 // LoadFromYAML 从 YAML 文件加载 Skill（工具别名类），Source 标记为 "yaml"。
 //
 // 文件格式（顶层 skills 数组）：
