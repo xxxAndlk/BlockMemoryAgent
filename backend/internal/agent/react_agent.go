@@ -22,6 +22,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/middleware"
+	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
@@ -550,6 +551,10 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// "MetaAgent"/"代码助手" 而非 session-ID（"session-1"）。sub-agent 的
 	// 展示名在 dispatcher 侧覆写 roleDef.Name 后同样经此注入。
 	ctx = WithAgentDisplayName(ctx, a.role.Name)
+	// 读图能力门控注入（2026-09-16）：ReadMedia / 图片透传兜底据此在"模型不支持图片输入"
+	// 时改走文本说明，不再把图像塞进对话触发 provider 400。闭包实时读进程缓存，
+	// 运行中换模型（set_agent_model）即自动恢复；子 Agent 走同一 RunWithHistory 同样注入。
+	ctx = tool.WithImageInputSupported(ctx, func() bool { return !a.noImageInput() })
 
 	// 把会话级 logger 挂到 ctx：轻量 LLM 调用（记忆流水线事件摘要等经
 	// ModelFactory.CallLightweightWithRetry）链路只持有 ctx，由此取出 logger 写 session_logs。
@@ -570,6 +575,11 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		userMsg.Images = imgs
 	}
 	history = a.appendLogged(history, userMsg)
+	// 已知当前模型不支持图片输入：本轮图片不会进入请求（视图层剥图，见循环内
+	// stripImagesForRequest），先给模型一条说明，避免它对着 [image:N] 占位符空想。
+	if len(userMsg.Images) > 0 && a.noImageInput() {
+		history = a.appendLogged(history, ReactMessage{Role: "user", Content: imageUnsupportedNotice(a.llmModelName())})
+	}
 
 	// 根据当前角色构建系统提示词，作为模型行为约束。
 	system := a.systemPrompt()
@@ -583,6 +593,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// unproductiveStreak 记录连续"无产出"轮数（无产出性工具 ∧ 无 mailbox 新消息 ∧ 无终答），
 	// 供循环尾部的停滞守卫（stagnationGuard）使用。
 	unproductiveStreak := 0
+	// visionDegraded 记录本 run 是否已因"模型不支持图片输入"降级过一次（见 generate 错误分支）：
+	// 降级是单向的一次性动作，二次复现说明剥图路径有漏，按普通错误上报而非继续空转。
+	visionDegraded := false
 	for i := 0; a.maxIter <= 0 || i < a.maxIter; i++ {
 		// 会话级挂起检查点（热驻模式）：挂起期间阻塞在此，恢复返回 nil 继续本轮。
 		// 在飞 LLM/工具调用跑完（有界超时）才到达这里，非抢占式。
@@ -623,6 +636,13 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 此前所有 LLM 耗时全部作废（实证 domain-2 白跑 31m43s）。发送前强制配对。
 		messages = sanitizeToolPairing(messages)
 
+		// 视觉能力缺失降级（2026-09-16）：当前模型已知不支持图片输入时，请求视图剥掉
+		// 全部图像（含用户上传与 ReadMedia/插件截图透传），避免每次调用都撞 provider 400；
+		// canonical history 与持久化不受影响，换模型后图片自动恢复。
+		if a.noImageInput() {
+			messages = stripImagesForRequest(messages)
+		}
+
 		// 上下文 token 预算（替换原累计 token 预算，150K 唯一上限）：Assemble 已按阈值
 		// 压缩（保留近 N，旧压成上下文内摘要块）；压缩后仍超阈值 = 近 N 单独就超、压不下去，
 		// 触达上限返回部分完成，由上层暂停会话等续跑。与 windowMessages（消息数硬上限）正交。
@@ -651,6 +671,18 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		a.reportStableHash(system, i)
 		resp, err := a.generate(ctx, req)
 		if err != nil {
+			// 视觉能力缺失（模型不支持图片输入）不判死（2026-09-16）：这是环境性错误，
+			// 首次命中时记住该模型、注入说明并剥图重试（下轮请求已不含图像，工具侧也已门控）；
+			// 同一 run 已因该原因降级过仍复现（剥图路径漏了）则照常报错，防 400 空转。
+			if model.IsImageInputUnsupported(err) && !visionDegraded {
+				visionDegraded = true
+				markModelNoImage(a.llmModelName())
+				notice := imageUnsupportedNotice(a.llmModelName())
+				log.Printf("[react] image input unsupported: role=%s model=%s，剥图降级继续", a.role.Name, a.llmModelName())
+				a.emitLive(LiveEvent{Kind: LiveEventNotify, Text: notice})
+				history = a.appendLogged(history, ReactMessage{Role: "user", Content: notice})
+				continue
+			}
 			// 出错时返回已累计的历史，便于上层回传部分进度或排查。
 			return ReactResult{History: history}, fmt.Errorf("llm generate: %w", err)
 		}
@@ -1242,7 +1274,7 @@ func (a *ReActAgent) logPromptStats(round int, system string, messages, history 
 func (a *ReActAgent) generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
 	c := &middleware.LLMCtx{Request: req, Call: a.generateOnce}
 	chain := middleware.New[middleware.LLMCtx]().
-		Use(middleware.RetryLLM(a.retryCount, a.retryBackoff, nil)).
+		Use(middleware.RetryLLM(a.retryCount, a.retryBackoff, shouldRetryLLMCall)).
 		Use(middleware.CallLLM(a.llmTimeout)).
 		Then(middleware.TerminalCall)
 	if err := chain(ctx, c); err != nil {

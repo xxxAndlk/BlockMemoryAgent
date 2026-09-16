@@ -268,6 +268,10 @@ func TestIsNonRetryableErr(t *testing.T) {
 		{" 500 internal error", false},
 		{" 503 service unavailable", false},
 		{"connection refused", false},
+		// 视觉能力缺失（2026-09-16）：环境性错误重试必然复现，快速失败；
+		// openai-chat 文案无 " 400 " 边界，靠 IsImageInputUnsupported 兜住。
+		{`anthropic messages POST "https://x": 400 Bad Request {"error":{"message":"Model do not support image input."}}`, true},
+		{`openai-chat 400: {"message":"Model do not support image input."}`, true},
 	}
 	for _, c := range cases {
 		if got := isNonRetryableErr(errors.New(c.msg)); got != c.want {

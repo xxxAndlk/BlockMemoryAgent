@@ -216,6 +216,9 @@ const (
 	// LiveEventTokenUsage 是单次 LLM 调用 token 用量事件，
 	// InputTokens/OutputTokens 字段携带用量；provider 未返回用量时不发射。
 	LiveEventTokenUsage = "token_usage"
+	// LiveEventNotify 是系统级通知事件（Text 为面向用户/模型的完整说明）：
+	// 目前用于"模型不支持图片输入"的降级告知（2026-09-16），会话层落 System 事件。
+	LiveEventNotify = "notify"
 )
 
 // LiveEvent 是 ReAct 运行过程中的实时进度事件，

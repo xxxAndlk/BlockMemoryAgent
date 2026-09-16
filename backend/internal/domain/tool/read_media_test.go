@@ -39,6 +39,39 @@ func TestReadMedia_Image(t *testing.T) {
 	}
 }
 
+// TestReadMedia_NoVisionGate 验证视觉能力门控（2026-09-16）：当前模型不支持图片输入时
+// 不附图像、返回文本说明（不报错），并保留文件存在性核查；未注入读取器时行为不变。
+func TestReadMedia_NoVisionGate(t *testing.T) {
+	dir := t.TempDir()
+	r := NewBuiltinRegistry(dir, nil, nil)
+
+	png := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a}
+	path := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(path, png, 0o644); err != nil {
+		t.Fatalf("seed png: %v", err)
+	}
+
+	ctx := WithImageInputSupported(context.Background(), func() bool { return false })
+	res, err := r.Dispatch(ctx, "ReadMedia", map[string]any{"path": "shot.png"})
+	if err != nil || !res.Success {
+		t.Fatalf("门控降级应为成功态文本结果: res=%v err=%v", res, err)
+	}
+	if len(res.Images) != 0 {
+		t.Fatalf("无视觉模型不应附图像, got %d", len(res.Images))
+	}
+	for _, want := range []string{"不支持图片输入", "存在", "escalate_gear"} {
+		if !strings.Contains(res.Output, want) {
+			t.Fatalf("说明缺少 %q: %s", want, res.Output)
+		}
+	}
+
+	// 缺省（未注入读取器）：行为不变，图片照常附加。
+	res2, err := r.Dispatch(context.Background(), "ReadMedia", map[string]any{"path": "shot.png"})
+	if err != nil || len(res2.Images) != 1 {
+		t.Fatalf("缺省行为应不变: res=%v err=%v", res2, err)
+	}
+}
+
 // TestReadMedia_ImageOverLimit 验证：超过 4MiB 的图片拒绝并提示压缩。
 func TestReadMedia_ImageOverLimit(t *testing.T) {
 	dir := t.TempDir()

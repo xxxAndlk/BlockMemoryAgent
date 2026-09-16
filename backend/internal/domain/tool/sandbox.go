@@ -350,6 +350,30 @@ func TrustModeOf(ctx context.Context) string {
 	return TrustModeFullAuto
 }
 
+// imageInputSupportedKey 携带"当前模型是否支持图片输入"读取器。
+// agent 层在 run ctx 注入（闭包实时读进程级"无视觉模型"记忆），
+// ReadMedia 等工具每次执行前查询：不支持时不把图像塞进对话（会触发 provider 400），
+// 改返回文本说明。
+type imageInputSupportedKey struct{}
+
+// WithImageInputSupported 注入图片输入能力读取器。fn 返回 false 表示当前模型
+// 不支持图片输入；nil 读取器视为支持（缺省行为不变）。
+func WithImageInputSupported(ctx context.Context, fn func() bool) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, imageInputSupportedKey{}, fn)
+}
+
+// ImageInputSupportedOf 查询当前模型是否支持图片输入：
+// 未注入读取器（测试/旧调用路径）或缺省时返回 true。
+func ImageInputSupportedOf(ctx context.Context) bool {
+	if fn, ok := ctx.Value(imageInputSupportedKey{}).(func() bool); ok && fn != nil {
+		return fn()
+	}
+	return true
+}
+
 // roleIDKey 用于在 context 中携带当前 Agent 的角色 ID，供角色级写沙箱校验读取。
 type roleIDKey struct{}
 

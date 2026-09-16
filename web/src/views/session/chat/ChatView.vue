@@ -83,6 +83,7 @@ const showStatusLine = computed(() =>
         {{ latestStatus }}
       </div>
       <ChatInput :loading="sending"
+                 :session="session"
                  :session-active="session?.status === 'running' || session?.status === 'awaiting_clarify' || session?.status === 'awaiting_child'"
                  :inject-hint="session?.status === 'running'"
                  :input-tokens="inputTokens"

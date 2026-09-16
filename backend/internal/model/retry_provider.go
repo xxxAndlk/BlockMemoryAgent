@@ -45,6 +45,11 @@ func isNonRetryableErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	// 模型不支持图片输入：环境性能力缺失，重试必然复现，且文案可能不含 " 400 "
+	// 片段（openai-chat 的 "openai-chat 400: %s" 无尾随空格）。
+	if IsImageInputUnsupported(err) {
+		return true
+	}
 	msg := err.Error()
 	for _, marker := range nonRetryableStatusMarkers {
 		if strings.Contains(msg, marker) {

@@ -21,8 +21,15 @@
     <div class="flex flex-1 min-h-0">
       <!-- Sidebar -->
       <div class="w-[280px] bg-card border-r border-line flex flex-col shrink-0">
+        <!-- 首页：置顶在会话树上方（用户要求），与右侧菜单项同款高亮 -->
+        <router-link to="/dashboard"
+                     class="flex items-center gap-2 px-5 py-2.5 mt-1 text-sm shrink-0 transition-colors"
+                     :class="route.path === '/dashboard' ? 'text-primary font-semibold' : 'text-ink-2 hover:text-primary'">
+          <el-icon><House /></el-icon>
+          <span>首页</span>
+        </router-link>
         <!-- 会话目录树（Codex 式）：按工作目录分组会话，取代原来的「会话 / 工作目录」两个导航项 -->
-        <div class="flex-1 min-h-0 flex flex-col pt-3">
+        <div class="flex-1 min-h-0 flex flex-col pt-1">
           <WorkDirTree class="min-h-0 flex-1" />
         </div>
 
@@ -101,12 +108,9 @@ onMounted(loadStatus)
 
 // 静态分组菜单（IA 定稿：4 组 + 底部 Beta 预留项，见 spec §信息架构）。
 // 「会话 / 工作目录」两项已并入上方目录树（树里可直接开旧会话、起新会话、改目录配置），
-// 故不再重复占位；/projects、/session 路由仍可用（后者由目录树与首页的跳转进入）。
+// 「首页」已上移到侧栏顶部（会话树上方），故均不再在此占位；
+// /projects、/session 路由仍可用（后者由目录树与首页的跳转进入）。
 const menuGroups = [
-  {
-    title: '工作台',
-    items: [{ path: '/dashboard', title: '首页', icon: 'House' }],
-  },
   {
     title: '资源库',
     items: [

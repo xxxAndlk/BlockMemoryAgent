@@ -1,9 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import type { Session, AgentNode, TrustMode, SessionGear, SessionThinking } from '@/types'
-import { setTrustMode, setSessionGear, setSessionThinking } from '@/api/session'
+import type { Session, AgentNode } from '@/types'
 
 const props = defineProps<{
   session: Session | null
@@ -11,69 +9,6 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{ (e: 'cancel'): void; (e: 'stop'): void; (e: 'interrupt'): void }>()
-
-// 信任模式（TODO 第10⑥ 三级信任，对标 Codex）：三态下拉，切换即时 POST 后端，
-// 下一工具调用生效。本地值以会话快照回显（trust_mode 空 = 后端回退现网语义，显示 full-auto）。
-const trustMode = ref<TrustMode>('full-auto')
-watch(
-  () => props.session?.trust_mode,
-  (m) => { trustMode.value = m === 'suggest' || m === 'auto-edit' ? m : 'full-auto' },
-  { immediate: true }
-)
-
-async function onTrustModeChange(mode: TrustMode) {
-  if (!props.session) return
-  try {
-    await setTrustMode(props.session.id, mode)
-    trustMode.value = mode
-    ElMessage.success(`信任模式已切换为 ${mode}（下一工具调用生效）`)
-  } catch (e) {
-    ElMessage.error('切换信任模式失败：' + (e instanceof Error ? e.message : String(e)))
-  }
-}
-
-// 执行档位（TODO #14 三档全手动）：fast=文档助手直达 / daily=DomainAgent 直接执行 / cluster=Meta 全装编排。
-// 手动切档任意向、原子即时生效；在飞子 Agent 不强杀，下轮按新档选角色（同 trustMode 语义）。
-// 本地值以会话快照回显（gear 空 = 未设置，显示默认 daily）。
-const gear = ref<SessionGear>('daily')
-watch(
-  () => props.session?.gear,
-  (g) => { gear.value = g === 'fast' || g === 'cluster' ? g : 'daily' },
-  { immediate: true }
-)
-
-const GEAR_LABEL: Record<SessionGear, string> = { fast: '快速', daily: '日常', cluster: '集群' }
-
-async function onGearChange(v: SessionGear) {
-  if (!props.session) return
-  try {
-    await setSessionGear(props.session.id, v)
-    gear.value = v
-    ElMessage.success(`执行档位已切换为${GEAR_LABEL[v]}档（即时生效，下一轮按新档选角色）`)
-  } catch (e) {
-    ElMessage.error('切换执行档位失败：' + (e instanceof Error ? e.message : String(e)))
-  }
-}
-
-// 会话级思考强度（2026-09-16）：空 = 跟随角色默认；切换即时 POST 后端，下一次 LLM 调用生效（热）。
-// 只影响本会话顶层 Agent（meta/domain/doc_assistant 按档位），在飞子 Agent 不受影响。
-const thinking = ref<SessionThinking>('')
-watch(
-  () => props.session?.thinking,
-  (t) => { thinking.value = t === 'off' || t === 'low' || t === 'medium' || t === 'high' ? t : '' },
-  { immediate: true }
-)
-
-async function onThinkingChange(v: SessionThinking) {
-  if (!props.session) return
-  try {
-    await setSessionThinking(props.session.id, v)
-    thinking.value = v
-    ElMessage.success(`思考强度已切换为 ${v === '' ? '跟随角色默认' : v}（下一次 LLM 调用生效）`)
-  } catch (e) {
-    ElMessage.error('切换思考强度失败：' + (e instanceof Error ? e.message : String(e)))
-  }
-}
 
 /** 用户主动"终止"的会话：后端落 error 态 + Result="cancelled by user"（见 service_react.cancel），
  *  但这是预期内的中止，不该和真失败共用红色"失败"——单列"已终止"。 */
@@ -191,32 +126,6 @@ function nodeColor(type: string) {
                  @click="emit('cancel')">
         <el-icon class="mr-1"><CircleClose /></el-icon>终止
       </el-button>
-      <!-- 信任模式三态下拉（TODO 第10⑥）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主 -->
-      <el-select v-if="session" :model-value="trustMode" size="small" class="!w-32 shrink-0"
-                 title="信任模式：变更类操作的审批档位，切换下一工具调用生效"
-                 @update:model-value="onTrustModeChange($event as TrustMode)">
-        <el-option value="suggest" label="suggest 逐条审批" />
-        <el-option value="auto-edit" label="auto-edit 审命令" />
-        <el-option value="full-auto" label="full-auto 全自主" />
-      </el-select>
-      <!-- 执行档位三档下拉（TODO #14 三档全手动）：fast=文档助手直达 / daily=DomainAgent 直接执行 / cluster=Meta 全装编排 -->
-      <el-select v-if="session" :model-value="gear" size="small" class="!w-24 shrink-0"
-                 title="执行档位：快速档=文档助手直达，日常档=DomainAgent 直接执行，集群档=Meta 全装编排；手动切换即时生效"
-                 @update:model-value="onGearChange($event as SessionGear)">
-        <el-option value="fast" label="快速档" />
-        <el-option value="daily" label="日常档" />
-        <el-option value="cluster" label="集群档" />
-      </el-select>
-      <!-- 思考强度下拉（2026-09-16 会话级）：空=跟随角色默认；切换下一次 LLM 调用生效（热） -->
-      <el-select v-if="session" :model-value="thinking" size="small" class="!w-28 shrink-0"
-                 title="思考强度（本会话顶层 Agent）：空=跟随角色默认；只影响本会话顶层 Agent，切换下一次 LLM 调用生效"
-                 @update:model-value="onThinkingChange($event as SessionThinking)">
-        <el-option value="" label="思考 跟随角色" />
-        <el-option value="off" label="思考 off" />
-        <el-option value="low" label="思考 low" />
-        <el-option value="medium" label="思考 medium" />
-        <el-option value="high" label="思考 high" />
-      </el-select>
     </div>
 
     <!-- Agent 链路（独立一行，横向滚动；chip 可点击选中，选中高亮，点 meta 清除选择） -->

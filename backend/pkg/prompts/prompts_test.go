@@ -36,6 +36,30 @@ func TestDocAssistant_EscalateGuidance(t *testing.T) {
 	}
 }
 
+// TestDomainAgent_DailyGearGuidance 日常档顶层升档规程（2026-09-16）：domain 提示词
+// 必须写明「先探索、能力/范围不足才 escalate_gear」以及子 Agent 不适用，否则日常档
+// 遇能力墙（如模型不支持读图）时无路可走或误在子 Agent 里调用被拒工具。
+func TestDomainAgent_DailyGearGuidance(t *testing.T) {
+	if !strings.Contains(DomainAgent, "【日常档直达模式】") {
+		t.Fatal("DomainAgent 缺【日常档直达模式】段")
+	}
+	for _, want := range []string{"escalate_gear", "子 Agent 被派发时本段不适用"} {
+		if !strings.Contains(DomainAgent, want) {
+			t.Fatalf("DomainAgent 日常档段落缺 %q", want)
+		}
+	}
+}
+
+// TestMetaAgent_EnvironmentalFailureDiscipline 环境性失败不重派纪律（2026-09-16）：
+// 子 Agent 报能力缺失（模型不支持读图等）时 Meta 不得原样重派同类域。
+func TestMetaAgent_EnvironmentalFailureDiscipline(t *testing.T) {
+	for _, want := range []string{"环境性/能力性失败不重派", "set_agent_model", "tool_mount"} {
+		if !strings.Contains(MetaAgent, want) {
+			t.Fatalf("MetaAgent 缺环境性失败重派纪律 %q", want)
+		}
+	}
+}
+
 // TestVersionPinned 版本钉契约（TODO #15 T15）：非空且符合 yyyymmdd-N 形态——
 // bootstrap 启动日志拿它对照线上提示词版本，形态散了归因就没锚点。
 func TestVersionPinned(t *testing.T) {

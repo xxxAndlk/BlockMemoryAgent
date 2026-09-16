@@ -12,7 +12,7 @@ import "fmt"
 // Version 内置提示词集版本钉（TODO #15 T15）。任何提示词常量的语义性改动
 //（措辞微调不算）都应 bump，让启动日志可对照"线上跑的是哪一版提示词"，
 // 也方便提示词工程实验（#15 计量）前后归因。bootstrap 启动日志输出该值。
-const Version = "20260916-1"
+const Version = "20260916-2"
 
 // registry roleID → 内置提示词。键与运行时角色 ID 对齐：
 // "meta"/"domain"（MetaAgentConfig/DomainAgentConfig 专用段）、fixed_roles[].id。

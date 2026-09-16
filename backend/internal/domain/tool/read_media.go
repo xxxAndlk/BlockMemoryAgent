@@ -64,7 +64,8 @@ func readMediaToolDescription() string {
 	return "按文件路径读取本地图片或视频并附加到对话，用于查看截图/设计稿/录屏核对 UI 与视觉产物。" +
 		"图片支持 png/jpg/jpeg/gif/webp（单张 ≤4MiB）原图直读；" +
 		"视频支持 mp4/webm/mov/mkv/avi（≤200MB），自动抽取关键帧（需要 ffmpeg，缺失时降级为元数据说明）。" +
-		"路径相对当前工作目录解析，禁止越出沙箱；每次调用一个文件，多文件多次调用。"
+		"路径相对当前工作目录解析，禁止越出沙箱；每次调用一个文件，多文件多次调用。" +
+		"当前模型不支持图片输入时会改为返回文本说明（不附图像、不报错）：此时需换视觉模型或升档。"
 }
 
 // InputSchema 返回 LLM 可见的参数 schema。
@@ -103,6 +104,15 @@ func (t *readMediaTool) Execute(ctx context.Context, args map[string]any) *Resul
 		return res
 	}
 	res.Path = absPath
+
+	// 视觉能力门控（2026-09-16）：当前模型已知不支持图片输入时，读图只会让下一轮
+	// 请求带上 image block 而被 provider 以 400 拒绝（整轮作废）。此处改返回文本说明
+	// （仍做存在性/大小核查，保留可行动的排查信息），并指出换模型/升档路径。
+	if !ImageInputSupportedOf(ctx) {
+		res.Success = true
+		res.Output = readMediaNoVisionNote(absPath)
+		return res
+	}
 
 	ext := strings.ToLower(filepath.Ext(absPath))
 	if mime, ok := readMediaImageMIMEs[ext]; ok {
@@ -173,6 +183,19 @@ func (t *readMediaTool) readVideo(ctx context.Context, res *Result, absPath stri
 	res.Output = fmt.Sprintf("已读取视频 %s（%d 字节），附加 %d 帧关键帧。\n%s",
 		absPath, info.Size(), len(images), strings.Join(notes, "\n"))
 	return res
+}
+
+// readMediaNoVisionNote 生成"模型不支持图片输入"的文本说明（含文件存在性核查），
+// 替代原图直读：既不触发 provider 400，又保留可行动的下一步路径。
+func readMediaNoVisionNote(absPath string) string {
+	exist := "不存在或不可访问"
+	if info, err := os.Stat(absPath); err == nil {
+		exist = fmt.Sprintf("存在，%d 字节", info.Size())
+	}
+	return fmt.Sprintf("当前模型不支持图片输入，无法把图像附到对话（文件 %s %s）。"+
+		"需要看图核对时的可行路径：① 换用支持视觉的模型（list_models 查看可用模型，"+
+		"set_agent_model / set_role_model 切换后重试本工具）；② 会话顶层执行者可用 escalate_gear "+
+		"请求升档处理；③ 改走文字描述或其他证据（文件清单、代码审查、让用户描述画面）完成核对。", absPath, exist)
 }
 
 // supportedImageExts 返回图片扩展名清单（错误提示用）。

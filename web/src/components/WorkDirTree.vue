@@ -19,6 +19,7 @@ const SESSION_LIST_LIMIT = 1000
 
 const DEFAULT_DIR = '' // 空 work_dir = 后端默认目录
 const DIRS_KEY = 'bma:workdirs'
+const COLLAPSED_KEY = 'bma:collapsedWorkdirs'
 
 type DirGroup = {
   dir: string
@@ -36,6 +37,8 @@ const { setWorkDir } = useWorkDir()
 const sessions = ref<SessionSummary[]>([])
 const loading = ref(false)
 const expandedDirs = ref<string[]>([]) // 展开「显示更多」的目录（normDir 键）
+// 整组收起（点目录行切换；与「显示更多」的 expandedDirs 互不干扰），localStorage 记忆。
+const collapsedDirs = ref<string[]>(JSON.parse(localStorage.getItem(COLLAPSED_KEY) || '[]'))
 const customDirs = ref<string[]>(JSON.parse(localStorage.getItem(DIRS_KEY) || '[]'))
 
 // 添加目录弹窗
@@ -113,6 +116,19 @@ function toggleMore(g: DirGroup) {
     : [...expandedDirs.value, key]
 }
 
+function isCollapsed(g: DirGroup) {
+  return collapsedDirs.value.includes(normDir(g.dir))
+}
+
+/** 点目录行：整组会话收起/展开（状态随 localStorage 记忆）。 */
+function toggleCollapse(g: DirGroup) {
+  const key = normDir(g.dir)
+  collapsedDirs.value = isCollapsed(g)
+    ? collapsedDirs.value.filter((k) => k !== key)
+    : [...collapsedDirs.value, key]
+  localStorage.setItem(COLLAPSED_KEY, JSON.stringify(collapsedDirs.value))
+}
+
 function openSession(s: SessionSummary) {
   router.push({ path: '/session', query: { id: s.id } })
 }
@@ -187,9 +203,14 @@ function relTime(iso: string) {
       <div v-if="!groups.length" class="px-3 py-2 text-xs text-ink-3">暂无会话</div>
 
       <div v-for="g in groups" :key="g.dir" class="mb-1">
-        <!-- 目录行：单击展开/收起目录配置由此进 ⋯；双击无特殊语义 -->
-        <div class="group/dir flex items-center gap-1.5 px-3 py-1.5 rounded-card mx-2 hover:bg-page transition-colors">
-          <el-icon class="text-ink-2 shrink-0 text-sm"><FolderOpened /></el-icon>
+        <!-- 目录行：单击整组收起/展开（箭头指示）；目录配置走右侧 ⋯ -->
+        <div class="group/dir flex items-center gap-1.5 px-3 py-1.5 rounded-card mx-2 hover:bg-page transition-colors cursor-pointer select-none"
+             @click="toggleCollapse(g)">
+          <el-icon class="text-ink-3 shrink-0 text-xs transition-transform"
+                   :class="isCollapsed(g) ? '' : 'rotate-90'"><ArrowRight /></el-icon>
+          <el-icon class="text-ink-2 shrink-0 text-sm">
+            <Folder v-if="isCollapsed(g)" /><FolderOpened v-else />
+          </el-icon>
           <span class="text-xs font-bold truncate min-w-0 flex-1" :title="g.dir || '默认目录'">{{ g.label }}</span>
           <el-tag v-if="g.running" size="small" type="warning" effect="plain" class="shrink-0 !px-1 !h-4 text-[10px]">{{ g.running }}</el-tag>
           <span v-else-if="g.total" class="text-[10px] text-ink-3 shrink-0">{{ g.total }}</span>
@@ -209,7 +230,8 @@ function relTime(iso: string) {
           </el-dropdown>
         </div>
 
-        <!-- 会话行：最多 5 条 + 显示更多 -->
+        <!-- 会话行：最多 5 条 + 显示更多（整组收起时全隐） -->
+        <template v-if="!isCollapsed(g)">
         <div
           v-for="s in visibleSessions(g)"
           :key="s.id"
@@ -230,6 +252,7 @@ function relTime(iso: string) {
         >
           {{ isExpanded(g) ? '收起' : `显示更多 (${g.sessions.length - SESSIONS_PER_DIR})` }}
         </div>
+        </template>
       </div>
     </div>
 

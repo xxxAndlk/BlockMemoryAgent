@@ -5,6 +5,7 @@ package agent
 import (
 	// context 提供带取消、超时、键值对的能力，用于在工具调用链路中传递请求上下文。
 	"context"
+	"strings"
 
 	// domain/tool 是领域层的工具注册表，避免 agent 包直接依赖它而导致循环导入。
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
@@ -178,6 +179,14 @@ func (a *toolRegistryAdapter) Dispatch(ctx context.Context, call ToolCall) (Tool
 		Output:  res.Output,
 		Error:   res.Error,
 		Images:  res.Images,
+	}
+	// 视觉能力门控兜底（2026-09-16）：模型不支持图片输入时，任何来源的工具图片
+	// （ui_preview 截图透传等，ReadMedia 已在工具内自拦）在此统一剥离，避免下一轮
+	// 请求带 image block 被 provider 400 拒绝整轮。文本 Output 保留（含路径/说明）。
+	if len(out.Images) > 0 && !tool.ImageInputSupportedOf(ctx) {
+		out.Output = strings.TrimSpace(out.Output + "\n（图像已省略：当前模型不支持图片输入，" +
+			"需要看图请换视觉模型或用 escalate_gear 升档。）")
+		out.Images = nil
 	}
 	// 截图/图片降采样（TODO 第9项④）：全部工具图片的唯一汇流点。png/jpeg 长边超上限
 	// 等比缩小（不放大小图），原图落盘 <workDir>/.bma/images/ 并在 Output 追加「原图已落盘」；

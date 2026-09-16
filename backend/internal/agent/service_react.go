@@ -3528,6 +3528,12 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		if strings.TrimSpace(ev.Text) != "" {
 			s.store.addEventDetail(session, eventkind.Progress, "SubAgent", ev.Text, eventkind.LLMResult, ev.Tool, "", "", "", true, agentIDJSON(ev.Tool))
 		}
+	case LiveEventNotify:
+		// 系统级通知（如"模型不支持图片输入，已剥图降级"）：落 System 事件，
+		// 让用户在对白流里看到 agent 为何改变了做法（而非静默换路）。
+		if strings.TrimSpace(ev.Text) != "" {
+			s.store.addEvent(session, eventkind.System, ev.Agent, ev.Text, "", "", "", "", "", true)
+		}
 	case LiveEventTokenUsage:
 		// 单次 LLM 调用 token 用量：记为 token_usage 调试事件，供前端实时累加展示。
 		// 消息格式 in=<n> out=<n> cache_hit=<n> cache_miss=<n> 与 textutil.ParseTokenUsage
