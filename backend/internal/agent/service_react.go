@@ -3528,6 +3528,13 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		if strings.TrimSpace(ev.Text) != "" {
 			s.store.addEventDetail(session, eventkind.Progress, "SubAgent", ev.Text, eventkind.LLMResult, ev.Tool, "", "", "", true, agentIDJSON(ev.Tool))
 		}
+	case LiveEventPeerAsk:
+		// 收到其他 Agent 的提问（cross-Agent 问答，send_message request/escalate 投递）：
+		// 落 Message 事件供用户看到问答在发生；正文为提问方+摘要。
+		s.store.addEvent(session, eventkind.Message, "PeerAsk", "收到 "+ev.Tool+" 的询问", "peer_ask", ev.Tool, "", "", "", true)
+		if strings.TrimSpace(ev.Text) != "" {
+			s.store.addEventDetail(session, eventkind.Progress, "PeerAsk", ev.Text, eventkind.LLMResult, ev.Tool, "", "", "", true, agentIDJSON(ev.Tool))
+		}
 	case LiveEventNotify:
 		// 系统级通知（如"模型不支持图片输入，已剥图降级"）：落 System 事件，
 		// 让用户在对白流里看到 agent 为何改变了做法（而非静默换路）。

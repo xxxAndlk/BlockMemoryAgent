@@ -1984,8 +1984,14 @@ func (a *ReActAgent) drainMailbox(history []ReactMessage) ([]ReactMessage, int) 
 		// 实时推送子 Agent 完成事件，UI 可据此更新"等待子 Agent"状态。
 		// 用户注入（From=user，如运行中重新下达指令）不是子 Agent 完成，不推该事件——
 		// 否则 UI 会多出一条 "子Agent 完成: user" 的假完成记录。
+		// 协作询问（request/escalate）单列 peer_ask：语义是"需要本 Agent 回答"而非
+		// "某子 Agent 完成"，混在 sub_agent_done 里既误导用户也淹没问答使用情况。
 		if m.From != "user" {
-			a.emitLive(LiveEvent{Kind: LiveEventSubAgentDone, Tool: m.From, Text: truncateRunes(m.Body, 200)})
+			kind := LiveEventSubAgentDone
+			if m.Type == mailbox.MsgRequest || m.Type == mailbox.MsgEscalate {
+				kind = LiveEventPeerAsk
+			}
+			a.emitLive(LiveEvent{Kind: kind, Tool: m.From, Text: truncateRunes(m.Subject+m.Body, 200)})
 		}
 
 		// 同时把子代理摘要作为记忆事件写入，供后续上下文组装使用。

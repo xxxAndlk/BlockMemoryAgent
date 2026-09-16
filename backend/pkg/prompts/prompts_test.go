@@ -50,6 +50,26 @@ func TestDomainAgent_DailyGearGuidance(t *testing.T) {
 	}
 }
 
+// TestDomainAgent_PeerQA 跨 Agent 协作问答纪律（2026-09-16）：domain 提示词必须写明
+// 可以直问兄弟域（send_message request）且收到询问当轮必回（reply）——否则该通道
+// 形同虚设（此前 send_message 只出现在续建/归因语境，实测零使用）。
+func TestDomainAgent_PeerQA(t *testing.T) {
+	for _, want := range []string{"【跨 Agent 协作问答】", "message_type=reply", "当轮必须回复"} {
+		if !strings.Contains(DomainAgent, want) {
+			t.Fatalf("DomainAgent 缺协作问答纪律 %q", want)
+		}
+	}
+}
+
+// TestMetaAgent_PeerQARelay 跨域问答不必经 Meta 中转（2026-09-16）。
+func TestMetaAgent_PeerQARelay(t *testing.T) {
+	for _, want := range []string{"跨域问答直连", "message_type=reply"} {
+		if !strings.Contains(MetaAgent, want) {
+			t.Fatalf("MetaAgent 缺跨域问答直连纪律 %q", want)
+		}
+	}
+}
+
 // TestMetaAgent_EnvironmentalFailureDiscipline 环境性失败不重派纪律（2026-09-16）：
 // 子 Agent 报能力缺失（模型不支持读图等）时 Meta 不得原样重派同类域。
 func TestMetaAgent_EnvironmentalFailureDiscipline(t *testing.T) {

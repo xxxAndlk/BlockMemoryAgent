@@ -163,3 +163,30 @@ func TestDrainMailbox_UserMessageNoSubAgentDone(t *testing.T) {
 		}
 	}
 }
+
+// TestDrainMailbox_PeerAskEvent 跨 Agent 询问（MsgRequest/MsgEscalate）单列 peer_ask
+// 事件（用户能看到问答在用）；普通通知（MsgInfo）仍走 sub_agent_done。
+func TestDrainMailbox_PeerAskEvent(t *testing.T) {
+	cases := []struct {
+		msgType mailbox.MessageType
+		want    string
+	}{
+		{mailbox.MsgRequest, string(LiveEventPeerAsk)},
+		{mailbox.MsgEscalate, string(LiveEventPeerAsk)},
+		{mailbox.MsgInfo, string(LiveEventSubAgentDone)},
+	}
+	for _, c := range cases {
+		mb := mailbox.New()
+		ag := NewReActAgent("session-1", types.RoleDefinition{SystemPrompt: "t"}, nil, nil).WithMailbox(mb)
+		var kinds []string
+		ag.WithLiveEvents(func(ev LiveEvent) { kinds = append(kinds, string(ev.Kind)) })
+
+		if _, err := mb.Send(&mailbox.Message{From: "domain-2", To: "session-1", Type: c.msgType, Subject: "接口口径", Body: "x"}); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		ag.drainMailbox([]ReactMessage{})
+		if len(kinds) != 1 || kinds[0] != c.want {
+			t.Fatalf("type=%s 应推 %s, got %v", c.msgType, c.want, kinds)
+		}
+	}
+}

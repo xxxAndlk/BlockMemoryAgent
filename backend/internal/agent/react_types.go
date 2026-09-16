@@ -216,6 +216,10 @@ const (
 	// LiveEventTokenUsage 是单次 LLM 调用 token 用量事件，
 	// InputTokens/OutputTokens 字段携带用量；provider 未返回用量时不发射。
 	LiveEventTokenUsage = "token_usage"
+	// LiveEventPeerAsk 是收到其他 Agent 提问（mailbox MsgRequest/MsgEscalate）的事件：
+	// 与 sub_agent_done（完成回传）语义不同——这是一条"需要我回答"的询问，
+	// 会话层落 peer_ask 事件供用户看到跨 Agent 问答确实在用。
+	LiveEventPeerAsk = "peer_ask"
 	// LiveEventNotify 是系统级通知事件（Text 为面向用户/模型的完整说明）：
 	// 目前用于"模型不支持图片输入"的降级告知（2026-09-16），会话层落 System 事件。
 	LiveEventNotify = "notify"
