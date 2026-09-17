@@ -33,34 +33,31 @@
 registry_sources:
   - https://registry.modelcontextprotocol.io/v0/servers
 plugins:
-  # 联网搜索：firecrawl 自托管栈（数据不出本机，免 API key）。
-  # 链路：后端 --(docker stdio MCP)--> bma/firecrawl-mcp 容器
-  #       --(REST http://host.docker.internal:3002)--> 本地 firecrawl 栈。
-  # 前置：
-  #   1) docker compose -f docker/docker-compose.firecrawl.yml up -d   （自托管栈）
-  #   2) docker build -t bma/firecrawl-mcp:local docker/firecrawl-mcp  （MCP 封装镜像）
-  # docker transport 由后端直接拉起/回收容器（bma-plugin-web_search），
-  # 经 /api/plugins/enable|disable|reload 热插拔。
+  # 联网搜索：firecrawl 官方云端托管 MCP（免 key 会话）。
+  # 2026-09-15 切换：本地自托管栈判退——实测本地 search 返回空结果（data:{}，CN 网络
+  # 到 Google/DDG 搜索源不可达），且全栈常驻约 3.5GB 内存；云端实测 search 1-2s 出真
+  # 结果、scrape 0.9-12s、连发 6 次无限速。本地栈已撤（compose 文件与镜像保留在
+  # docker/docker-compose.firecrawl.yml，需要时可按下方"备选 1"重新拉起）。
+  # 免 key 会话仅暴露 firecrawl_search / firecrawl_scrape / firecrawl_parse（有限速）；
+  # 要 crawl/map/agent 等全工具与更高配额：firecrawl.dev 注册取 key 走 stdio npx
+  #（需 mcpbridge 增加自定义 header 支持才能走 http 带 Authorization，见备选 2）。
   web_search:
     kind: mcp
     enabled: true
     settings:
-      transport: docker
-      image: bma/firecrawl-mcp:local
-      # 跨实例共享容器（shared: true）：容器 docker run -d 常驻 keeper，每会话经
-      # docker exec -i 起独立 MCP server 进程；多开 TUI 全局共用一套容器，不重复拉起。
-      # Stop 只断本会话不回收容器；显式回收 docker rm -f bma-plugin-web_search。
-      shared: true
-      exec_command: ["firecrawl-mcp"]
-      env:
-        FIRECRAWL_API_URL: http://host.docker.internal:3002
-        # 自托管栈不校验 key（USE_DB_AUTHENTICATION=false），给个非空默认值即可；
-        # 若改回云端 API，则在 .env 配 FIRECRAWL_API_KEY=fc-xxx。
-        FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:self-hosted}
-      # 备选 1（云端免 key 兜底，限速，仅 search/scrape/parse）：
-      # transport: http
-      # url: https://mcp.firecrawl.dev/v2/mcp
-      # 备选 2（云端 API + key，全工具）：
+      transport: http
+      url: https://mcp.firecrawl.dev/v2/mcp
+      # 备选 1（本地自托管栈，数据不出本机；前置：docker compose -f
+      # docker/docker-compose.firecrawl.yml up -d + docker build -t bma/firecrawl-mcp:local
+      # docker/firecrawl-mcp）：
+      # transport: docker
+      # image: bma/firecrawl-mcp:local
+      # shared: true
+      # exec_command: ["firecrawl-mcp"]
+      # env:
+      #   FIRECRAWL_API_URL: http://host.docker.internal:3002
+      #   FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:self-hosted}
+      # 备选 2（云端 API + key，全工具；FIRECRAWL_API_KEY 配在 .env）：
       # transport: stdio
       # command: npx
       # args: ["-y", "firecrawl-mcp"]

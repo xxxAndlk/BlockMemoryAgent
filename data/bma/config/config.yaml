@@ -113,6 +113,7 @@ agent:
   # A/B 实证自动验证闭环是负资产（开 5/16 + 558 万 token vs 关 16/16 + 284 万 token），
   # 业务级测试（computer-use 点击页面 / CLI 跑命令断言）移至 doc/扩展设计_Agent工作流平台.md §12 作后期扩展。
   block_memory_write_enabled: true   # 子 Agent 完成后沉淀结果摘要到块记忆知识库
+  block_memory_facts_max: 5          # 单次子 Agent 输出提取的关键事实条数上限（默认 5）：事实逐条向量化落库，多则召回粒度细但噪声大
 
   # -- 强制门（spec 强制默认开启：塔防实证 WriteSpec 有用；Pipeline 重构后由 PlanStage 替代）--
   spec_enforcement_enabled: true     # call_sub_agent 前是否强制 WriteSpec
@@ -121,6 +122,8 @@ agent:
   plan_confirmation_enabled: true   # 开关：子 Agent 任何任务动手前 submit_plan 阻塞等上级确认（无大小豁免）；false=直通不阻塞
   plan_confirm_timeout_sec: 600     # 单次审批等待超时（秒）：超时 fail-open 按计划继续，防上级忙线时下级永久挂起
   plan_max_revisions: 0             # 每 Agent 计划被驳回重提上限：0=不限制，循环修订直到上级批准；>0 达上限不放行、转 escalate 升级仲裁（防失控兜底）
+  # -- 波聚合整合纪要（集群档提速 C-3a，2026-09-17）--
+  batch_digest_enabled: true        # call_sub_agents 同波 domain 项 ≥2 时完成回传汇成一条【整合纪要】单条送达父邮箱（轻量模型按领域归并，失败回退逐领域拼接），省父 Agent "收到，继续等" 空转轮；false=退回逐条回传
   prompt_enhance: true               # 用户输入自动提示词补全（TODO #36 Phase 0 规则版）：命中续跑/控制/诊断意图时附加【系统补全】段（意图标签+最近失败/未完成任务绑定），只增不改用户原文；false=原样直通
   prompt_enhance_llm: true           # L2 轻量模型仲裁开关（TODO #39）：灰区输入（L1 未命中但句中有弱词信号）调轻量模型四分类（none/resume/control/diagnose）；超时/失败/低置信一律按普通任务直通（宁漏判不误判）；false=降级纯规则（Phase 0 行为）
   prompt_enhance_llm_timeout_sec: 10 # L2 仲裁单次超时秒（TODO #39）：轻量模型首 token 慢，宁短超时降级也不阻塞用户输入（最坏延迟=本值）
@@ -168,3 +171,10 @@ data:
 notify:
   webhook_url: ""                     # 空=关闭（默认）。填入如 http://127.0.0.1:9000/bma-hook 开启
   webhook_events: [completed, error]  # 触发通知的会话终态；可选值见 pkg/enums（running/completed/error/awaiting_clarify/paused_on_child）
+
+# 经验技能库治理（SessionEvolver 会话结束沉淀的 config/skills_learned/ + learned_skills 表）
+# 动机：沉淀无准入、存量无淘汰时技能库无限膨胀，meta 系统提示【可用技能】块越拉越长、选择准确率下降。
+skills:
+  max_count: 50             # enabled 经验技能上限（B 写入门）：达到后新经验只允许合并进既有技能（近邻同名判定），不再新建；0=不限
+  meta_catalog_top: 20      # meta 系统提示【可用技能】块列出的经验技能条数（A 目录收敛，按 use_count 降序）；完整目录经 list_skills(query) 检索
+  consolidate_threshold: 30 # 启用数达到该值后每日（复用数据维护 tick）自动整理一次（C）：轻量模型合并语义重复技能 + 归档零使用技能；<=0 关闭自动整理（仍可 POST /api/skills/consolidate 手动触发）

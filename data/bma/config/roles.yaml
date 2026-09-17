@@ -22,7 +22,6 @@
 # provider 支持：
 #   - openai-chat：OpenAI Chat Completions 协议（/v1/chat/completions），适用于 OpenAI / DeepSeek / Kimi / GLM / 豆包等；
 #     自研实现，内置字段兼容（reasoning_content 回传、max_tokens vs max_completion_tokens 按模型名自适应、usage cache 字段回退）。
-#     旧名 openai / openai-deepseek 作为其别名仍可用。
 #   - openai-responses：OpenAI Responses API 协议（/v1/responses），适用于 gpt-4.1 / o 系 / gpt-5 等新一代接口。
 #   - ollama：Ollama 原生 /api/chat 协议，默认 http://localhost:11434
 #   - anthropic：Anthropic 原生 Messages API，默认 https://api.anthropic.com
@@ -59,9 +58,9 @@ meta_agent:
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:
   model_config:
-    model_ref: ark-deepseek-v4-flash # 2026-09-06 对擂实测：ark-glm-5.3-flash domain 单呼均延 57.6s（80 呼 4608s，占总耗时 71%）；evolving 同端点同协议 meta 侧均延 27.6s，切域执行层提速
+    model_ref: ark-deepseek-v4.1-flash
     temperature: 0
-    thinking: medium     # 2026-09-07 恢复 medium（TODO 第八项 P0-1）：off 档正确率损失大于延迟收益（2026-09-06 对擂实测 off 步数翻倍且完成度下滑 round-5 C=0.849），编码执行层须留推理预算；off 仅 meta 这类路由/汇总角色适用。glm 系 ark 端点不支持 disabled（400），仅 doubao 角色可关
+    thinking: high     # 2026-09-07 恢复 medium（TODO 第八项 P0-1）：off 档正确率损失大于延迟收益（2026-09-06 对擂实测 off 步数翻倍且完成度下滑 round-5 C=0.849），编码执行层须留推理预算；off 仅 meta 这类路由/汇总角色适用。glm 系 ark 端点不支持 disabled（400），仅 doubao 角色可关
   skills: [派发与规格]   # 工具描述精简（P0-3）后字段全语义承接进技能文档，下拆写 spec 拿不准时 load_skill
 
 # 轻量模型配置（用于历史会话总结、检索 query 改写等低开销任务）
