@@ -97,6 +97,32 @@ func TestAdapterVisibilityMountNarrows(t *testing.T) {
 	}
 }
 
+// TestAdapterPreMountedBypassesCeiling 验证配置预挂载（顶层必备工具）：
+// 不在角色天花板内的插件工具（doc_assistant 视角的 web_search），经预挂载后进 Schema；
+// 未预挂的其他 scope 不受影响（子 Agent 不预挂）。
+func TestAdapterPreMountedBypassesCeiling(t *testing.T) {
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	reg.SetPluginVisibility(visCeiling)
+	reg.Register(&visTool{name: "web_search"})
+
+	reg.MountPreApprovedForScope("session-1", "doc_assistant", []string{"web_search"})
+
+	top := NewToolRegistryAdapterForRole(reg, "session-1", []string{"ReadFile"}, "doc_assistant", visCeiling)
+	if !schemaNames(top.Schema())["web_search"] {
+		t.Fatal("顶层 scope 预挂载后应可见（不经角色天花板）")
+	}
+	// 子 Agent scope 无预挂：同角色也不可见。
+	child := NewToolRegistryAdapterForRole(reg, "session-1/domain-1", []string{"ReadFile"}, "doc_assistant", visCeiling)
+	if schemaNames(child.Schema())["web_search"] {
+		t.Fatal("子 Agent scope 不应看到顶层预挂载")
+	}
+	// 卸载（tool_unmount 语义）后不再可见。
+	reg.UnmountTools("session-1", []string{"web_search"})
+	if schemaNames(top.Schema())["web_search"] {
+		t.Fatal("卸载后预挂工具不应再暴露")
+	}
+}
+
 // TestAdapterMountScopeIsolation 验证挂载集按 scope（agentID）隔离：
 // meta 挂载不影响 domain 子 Agent 的可见集；domain 越界挂载被拒绝。
 func TestAdapterMountScopeIsolation(t *testing.T) {

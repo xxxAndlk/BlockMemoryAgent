@@ -348,6 +348,37 @@ func TestToolVisibleForRole(t *testing.T) {
 	}
 }
 
+// TestTopLevelTools 验证顶层必备工具枚举：只收 running + enabled 的 TopLevel 插件；
+// 停用/未标记的插件工具一律不在列。
+func TestTopLevelTools(t *testing.T) {
+	h := newHarness(t, func(id string) *fakePlugin {
+		return &fakePlugin{
+			tools:    []tool.Tool{fakeTool(id + "_tool")},
+			manifest: Manifest{ID: id, Name: id, Kind: KindMCP, TopLevel: id == "top"},
+		}
+	})
+	ctx := context.Background()
+	h.setCfg(&config.PluginsConfig{Plugins: map[string]config.PluginConfig{
+		"top":   {Kind: "mcp", EnabledFlag: boolPtr(true)},
+		"off":   {Kind: "mcp", EnabledFlag: boolPtr(false)},
+		"plain": {Kind: "mcp", EnabledFlag: boolPtr(true)},
+	}})
+	if err := h.mgr.Load(ctx); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := h.mgr.TopLevelTools()
+	if len(got) != 1 || got[0] != "top_tool" {
+		t.Fatalf("只应收 running+enabled 的 TopLevel 插件工具，got %v", got)
+	}
+	// 停用后缺席（下次会话启动不再预挂）。
+	if err := h.mgr.Disable(ctx, "top"); err != nil {
+		t.Fatalf("Disable: %v", err)
+	}
+	if got := h.mgr.TopLevelTools(); len(got) != 0 {
+		t.Fatalf("停用后不应再返回: %v", got)
+	}
+}
+
 // TestReloadDiff 验证 Reload：移除插件被停用、新增插件被装载。
 func TestReloadDiff(t *testing.T) {
 	h := newHarness(t, nil)

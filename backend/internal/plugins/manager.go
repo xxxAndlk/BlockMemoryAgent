@@ -12,6 +12,7 @@ import (
 	"fmt"         // 错误包装
 	"log/slog"    // 结构化日志
 	"reflect"     // 配置差异比对
+	"sort"        // TopLevelTools 稳定排序
 	"strings"     // 错误文案拼接
 	"sync"        // 注册表锁
 
@@ -521,6 +522,31 @@ func (m *Manager) ToolVisibility(roleID, toolName string) (owned, visible bool) 
 		return true, false // 已停用/降级的插件工具不可见
 	}
 	return true, inst.manifest.VisibleForRole(roleID)
+}
+
+// TopLevelTools 返回全部「顶层必备」插件的工具名（Manifest.TopLevel ∧ enabled ∧ running）。
+// 快速/日常档会话启动时把这些工具预挂到顶层 Agent 的 scope（见 agent 包会话装配点），
+// 使顶层对接用户时直接具备联网搜索等能力，不必先 tool_catalog 再 tool_mount。
+// 插件停用/降级时其工具自然缺席（下次会话启动不再预挂）；排序保证输出稳定。
+func (m *Manager) TopLevelTools() []string {
+	m.mu.RLock()
+	insts := make([]*instance, 0, len(m.instances))
+	for _, inst := range m.instances {
+		insts = append(insts, inst)
+	}
+	m.mu.RUnlock()
+	var out []string
+	for _, inst := range insts {
+		inst.lock.Lock()
+		if inst.manifest.TopLevel && inst.state == StateRunning && inst.config.Enabled() {
+			for _, t := range inst.tools {
+				out = append(out, t.Name())
+			}
+		}
+		inst.lock.Unlock()
+	}
+	sort.Strings(out)
+	return out
 }
 
 // StopAll 停用全部插件（App.Close 时调用）。

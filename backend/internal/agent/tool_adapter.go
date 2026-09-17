@@ -123,9 +123,16 @@ func (a *toolRegistryAdapter) Schema() []tools.Tool {
 	}
 	// 已挂载插件工具集（tool_mount / tools_hint / plugin_install 自动挂载，TODO #52）。
 	mounted := a.inner.MountedTools(a.scope)
+	// 配置预挂载的顶层必备工具（插件 settings.top_level，会话启动授予）：不经角色
+	// 可见性天花板即放行——授权来自配置人工声明（见 tool.MountPreApprovedForScope）。
+	preMounted := a.inner.PreMountedTools(a.scope)
 	// 按白名单 + 插件可见性∩挂载过滤；保持原注册顺序，便于工具列表稳定。
 	out := make([]tools.Tool, 0, len(all))
 	for _, t := range all {
+		if preMounted[t.Name()] {
+			out = append(out, t)
+			continue
+		}
 		owned, visible := false, true
 		if a.pluginVisibility != nil {
 			owned, visible = a.pluginVisibility(a.roleID, t.Name())

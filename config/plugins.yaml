@@ -67,6 +67,11 @@ plugins:
       # 实证 2026-08-18：放给 domain 也不会被选中（内置 HTTPGet 零摩擦），反而两套路径并存。
       # test_assistant（验收测试员）联网核实文件/事实类结论用。
       roles: ["meta", "test_assistant"]
+      # 顶层必备（2026-09-17）：快速/日常档顶层 Agent（doc_assistant/domain）启动时自动预挂本插件
+      # 工具到会话顶层 scope——顶层是对接用户的入口，"问一句搜一下"不该先走 tool_catalog+tool_mount
+      # 两步（实证 2026-09-17：顶层说"没这个功能"要派子 Agent，子 Agent 更没授权，任务死锁）。
+      # 子 Agent 的独立 scope 不预挂（联网仍集中顶层）；cluster 档 meta 已有角色授权，不重复挂。
+      top_level: true
 
   # Computer Use：高危插件，默认关闭，显式开启（设计文档 §6.2/§6.4）。
   # docker transport：enable 时后端拉起 bma/computer-use-mcp 沙箱容器

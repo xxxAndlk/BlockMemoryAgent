@@ -171,6 +171,10 @@ type Registry struct {
 	// mounted 按 scope（agentID）记录已挂载的插件工具名；agent 包 adapter.Schema() 读此
 	// 集收窄插件工具可见集 = 天花板 ∩ 已挂载集（默认收窄为角色基础工具）。
 	mounted map[string]map[string]bool
+	// preMounted 按 scope 记录「配置预挂载」的顶层必备工具（插件 settings.top_level 声明，
+	// 会话启动时授予）：这些名字不经角色可见性天花板即可进 Schema、过执行硬门——授权来自
+	// 配置作者的人工声明，天花板拦的是 Agent 自提权，不拦配置。见 MountPreApprovedForScope。
+	preMounted map[string]map[string]bool
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -553,7 +557,9 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 该角色白名单非空时，白名单外工具直接拒绝执行——Schema 白名单只是 LLM 可见性软过滤，
 	// 幻觉/提示注入出白名单外工具名此前仍会执行，此门把它变成执行层硬约束。
 	// 拒绝返回工具级错误（Agent 可见并自行改用白名单内工具），不中止循环。
-	if r.roleToolGate != nil {
+	// 预挂载豁免（顶层必备插件工具）：授权来自 plugins.yaml 人工声明而非角色白名单，
+	// 对顶层 scope 的预挂载名放行（见 MountPreApprovedForScope）。
+	if r.roleToolGate != nil && !r.isPreMounted(scopeKeyFromCtx(ctx), name) {
 		if roleID := RoleIDFromContext(ctx); roleID != "" {
 			if allowed := r.roleToolGate(roleID); len(allowed) > 0 && !slices.Contains(allowed, name) {
 				log.Printf("[tool] role-tool-gate deny: role=%s tool=%s", roleID, name)

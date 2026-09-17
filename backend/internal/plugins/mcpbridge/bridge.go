@@ -79,6 +79,8 @@ type Settings struct {
 	ImagePassthrough bool
 	// Roles 可见角色白名单（透传到 Manifest，缺省全角色）。
 	Roles []string
+	// TopLevel 顶层必备能力（透传到 Manifest.TopLevel）：快速/日常档顶层 Agent 启动时自动预挂载。
+	TopLevel bool
 	// ExecTimeout 单次工具调用超时（默认 120s）。
 	ExecTimeout time.Duration
 }
@@ -171,6 +173,9 @@ func FromSettings(settings map[string]any) Settings {
 			}
 		}
 	}
+	if v, ok := settings["top_level"].(bool); ok {
+		s.TopLevel = v
+	}
 	if v, ok := settings["exec_timeout_sec"].(float64); ok && v > 0 {
 		s.ExecTimeout = time.Duration(v * float64(time.Second))
 	}
@@ -245,6 +250,7 @@ func New(id string, settings Settings, logger *slog.Logger) *Bridge {
 			Kind:        plugins.KindMCP,
 			Description: "MCP 外部插件 " + id,
 			Roles:       settings.Roles,
+			TopLevel:    settings.TopLevel,
 		},
 		settings: settings,
 		logger:   logger,

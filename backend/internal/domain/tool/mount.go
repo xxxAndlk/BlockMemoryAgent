@@ -46,6 +46,86 @@ func (r *Registry) MountedTools(scope string) map[string]bool {
 	return out
 }
 
+// PreMountedTools 返回 scope 的「配置预挂载」工具集快照（插件 settings.top_level 声明，
+// 会话启动时经 MountPreApprovedForScope 授予）。agent 包 adapter.Schema() 对这些名字
+// 无条件放行——它们在天花板之外，但授权来自配置作者而非 Agent。
+func (r *Registry) PreMountedTools(scope string) map[string]bool {
+	r.mountedMu.RLock()
+	defer r.mountedMu.RUnlock()
+	if scope == "" {
+		return map[string]bool{}
+	}
+	mounted, pre := r.mounted[scope], r.preMounted[scope]
+	out := make(map[string]bool, len(pre))
+	for name := range pre {
+		// 与挂载集取交集：tool_unmount 卸载后预挂标记随之失效（卸载是明确收缩动作）。
+		if mounted[name] {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// MountPreApprovedForScope 把配置声明的顶层必备工具挂进 scope（会话顶层 Agent 专用），
+// 不经角色可见性天花板——授权是 plugins.yaml 的人工声明（settings.top_level），与
+// tool_mount 的"Agent 天花板内自选"是两个来源；天花板拦的是 Agent 自提权，不拦配置。
+// 只挂已注册工具（插件未运行/已停用则静默跳过，下次会话启动重试）；落进普通挂载集
+// （与 tool_mount 同一套记账，tool_unmount/插件卸载行为一致），另记 preMounted 供
+// Schema 放行与执行硬门豁免。返回实际挂上的工具名。
+func (r *Registry) MountPreApprovedForScope(scope, roleID string, names []string) []string {
+	if scope == "" || len(names) == 0 {
+		return nil
+	}
+	r.mountedMu.Lock()
+	defer r.mountedMu.Unlock()
+	if r.mounted == nil {
+		r.mounted = make(map[string]map[string]bool)
+	}
+	if r.preMounted == nil {
+		r.preMounted = make(map[string]map[string]bool)
+	}
+	set := r.mounted[scope]
+	if set == nil {
+		set = make(map[string]bool)
+		r.mounted[scope] = set
+	}
+	pre := r.preMounted[scope]
+	if pre == nil {
+		pre = make(map[string]bool)
+		r.preMounted[scope] = pre
+	}
+	var accepted []string
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		r.mu.RLock()
+		_, registered := r.tools[name]
+		r.mu.RUnlock()
+		if !registered {
+			continue
+		}
+		pre[name] = true
+		if !set[name] {
+			set[name] = true
+			log.Printf("[tool] pre-mount: scope=%s role=%s tool=%s", scope, roleID, name)
+		}
+		accepted = append(accepted, name)
+	}
+	return accepted
+}
+
+// isPreMounted 判断 name 是否已预挂到 scope（执行硬门豁免依据）。
+func (r *Registry) isPreMounted(scope, name string) bool {
+	if scope == "" {
+		return false
+	}
+	r.mountedMu.RLock()
+	defer r.mountedMu.RUnlock()
+	return r.mounted[scope][name] && r.preMounted[scope][name]
+}
+
 // MountForScope 把插件工具挂载进 scope（agentID）的挂载集，校验权限天花板（TODO #52）：
 //   - 工具必须已注册（未注册 → 拒绝）；
 //   - 工具必须是插件工具（owned=true）——非插件工具由角色基础白名单管理，无需挂载；

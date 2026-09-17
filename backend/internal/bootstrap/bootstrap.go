@@ -832,6 +832,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	}
 	// 角色可见性：meta/domain/动态角色按 Manifest.Roles 判定插件工具是否可见（§4.3）。
 	agentSvc.SetPluginVisibility(pluginManager.ToolVisibility)
+	// 顶层必备插件工具（plugins.yaml settings.top_level）：fast/daily 会话启动时预挂到
+	// 顶层 Agent scope（agent 包据此调 tool.Registry.MountPreApprovedForScope），
+	// 使顶层对接用户直接具备联网搜索等能力；子 Agent 不预挂。
+	agentSvc.SetTopLevelToolsProvider(pluginManager.TopLevelTools)
 	subAgentDispatcher.WithPluginVisibility(pluginManager.ToolVisibility)
 	// 会话档位只读回调（TODO #14 T22）：热驻槽 enterIdle 固化档位 + 隐式复用档位守卫。
 	subAgentDispatcher.WithSessionGearResolver(agentSvc.SessionGear)

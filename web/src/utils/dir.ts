@@ -26,6 +26,41 @@ export function dirBaseName(dir: string): string {
 }
 
 /**
+ * 已从工作目录列表移除的目录（本地记忆，默认目录不可移除故空串不入表）。
+ * 只在"列表展示"层生效：磁盘目录与会话一概不动，重新添加/选定该目录即恢复。
+ */
+const REMOVED_DIRS_KEY = 'bma:removedWorkdirs'
+
+function readRemovedDirs(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(REMOVED_DIRS_KEY) || '[]')
+    return Array.isArray(v) ? v.filter((d): d is string => typeof d === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+/** 该目录是否已被移出列表（规范化比较，同址不同写法一视同仁）。 */
+export function isWorkDirRemoved(dir: string | undefined | null): boolean {
+  const key = normDir(dir)
+  return !!key && readRemovedDirs().some((d) => normDir(d) === key)
+}
+
+/** 把目录移出列表（幂等）。 */
+export function removeWorkDir(dir: string): void {
+  if (isWorkDirRemoved(dir)) return
+  localStorage.setItem(REMOVED_DIRS_KEY, JSON.stringify([...readRemovedDirs(), dir]))
+}
+
+/** 取消移除（显式添加或重新选定该目录时调用，幂等）。 */
+export function restoreWorkDir(dir: string | undefined | null): void {
+  const key = normDir(dir)
+  if (!key) return
+  const rest = readRemovedDirs().filter((d) => normDir(d) !== key)
+  localStorage.setItem(REMOVED_DIRS_KEY, JSON.stringify(rest))
+}
+
+/**
  * 从会话列表聚合"已有工作目录"（跨会话去重、保持会话列表的先后即最近使用序）。
  * 选择目录时优先给用户挑已有目录，而不是每次都去浏览文件系统。
  */

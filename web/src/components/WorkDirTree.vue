@@ -4,10 +4,11 @@
 // 合并进常驻侧栏后，一屏内完成"选目录 → 开旧会话 / 起新会话 / 改目录配置"。
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import type { SessionSummary } from '@/types'
 import { listSessions } from '@/api/session'
 import { useWorkDir } from '@/composables/useWorkDir'
-import { normDir } from '@/utils/dir'
+import { normDir, isWorkDirRemoved, removeWorkDir, restoreWorkDir } from '@/utils/dir'
 import { statusDotClass, statusText } from '@/utils/sessionStatus'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 import WorkDirDrawer from '@/components/WorkDirDrawer.vue'
@@ -82,6 +83,10 @@ const groups = computed<DirGroup[]>(() => {
       map.set(key, { dir: d, label: dirLabel(d), total: 0, running: 0, lastActive: '', sessions: [] })
     }
   }
+  // 已移除的目录从列表隐藏（磁盘与会话不动；含会话的目录同样隐——「查看全部会话」仍可见其会话）。
+  for (const key of [...map.keys()]) {
+    if (isWorkDirRemoved(map.get(key)!.dir)) map.delete(key)
+  }
   for (const g of map.values()) {
     g.sessions.sort((a, b) => (b.started_at || '').localeCompare(a.started_at || ''))
   }
@@ -155,14 +160,19 @@ function viewAll(dir: string) {
   router.push({ path: '/history', query: dir ? { work_dir: dir } : {} })
 }
 
+/** 从侧栏列表移除该目录（本地记忆；磁盘目录与其中的会话一概不动，重新添加即恢复）。 */
 function removeDir(dir: string) {
+  if (!dir) return
   customDirs.value = customDirs.value.filter((d) => normDir(d) !== normDir(dir))
   localStorage.setItem(DIRS_KEY, JSON.stringify(customDirs.value))
+  removeWorkDir(dir)
+  ElMessage.success('已从列表移除「' + dirLabel(dir) + '」（目录与会话未删除，重新添加该目录即恢复）')
 }
 
 function addDir() {
   const d = newDir.value.trim()
   if (!d) return
+  restoreWorkDir(d)
   if (!customDirs.value.some((x) => normDir(x) === normDir(d))) {
     customDirs.value = [...customDirs.value, d]
     localStorage.setItem(DIRS_KEY, JSON.stringify(customDirs.value))
@@ -185,10 +195,6 @@ function onDirCommand(cmd: string, g: DirGroup) {
 /** 该目录下是否有当前打开的会话（目录行给底色用）。 */
 function containsActive(g: DirGroup) {
   return !!activeSessionId.value && g.sessions.some((s) => s.id === activeSessionId.value)
-}
-
-function isCustom(g: DirGroup) {
-  return customDirs.value.some((d) => normDir(d) === normDir(g.dir))
 }
 
 function relTime(iso: string) {
@@ -252,7 +258,11 @@ function relTime(iso: string) {
                 <el-dropdown-item command="new"><el-icon><Promotion /></el-icon>在此目录新建会话</el-dropdown-item>
                 <el-dropdown-item command="all"><el-icon><Clock /></el-icon>查看全部会话</el-dropdown-item>
                 <el-dropdown-item command="prefs" divided><el-icon><Setting /></el-icon>项目偏好与测试助手</el-dropdown-item>
-                <el-dropdown-item v-if="isCustom(g)" command="remove"><el-icon><Delete /></el-icon>移除目录</el-dropdown-item>
+                <!-- 任意目录（含会话目录）都可移除：只影响侧栏列表，磁盘不动，重新添加即恢复。
+                     默认目录（空 work_dir）没有可回添的路径，不给入口。 -->
+                <el-dropdown-item v-if="g.dir" command="remove">
+                  <el-icon><Delete /></el-icon>从列表移除目录
+                </el-dropdown-item>
               </el-dropdown-menu>
             </template>
           </el-dropdown>

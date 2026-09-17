@@ -7,7 +7,7 @@
 import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { browseFS, pickSystemDir, type BrowseResult } from '@/api/fs'
-import { dirBaseName, sameDir } from '@/utils/dir'
+import { dirBaseName, sameDir, restoreWorkDir } from '@/utils/dir'
 
 const props = defineProps<{
   modelValue: string
@@ -86,7 +86,7 @@ async function chooseDir() {
   try {
     const r = await pickSystemDir()
     if (r.path) {
-      emit('update:modelValue', r.path)
+      select(r.path)
       return
     }
     // path 为空 = 用户在原生的框里点了取消：不改变现值，也不再弹第二个框。
@@ -106,6 +106,12 @@ function openDialog() {
   open.value = true
 }
 
+/** 选定目录的统一出口：显式选定 = 重新纳入工作目录列表（撤销此前的「从列表移除」）。 */
+function select(d: string) {
+  restoreWorkDir(d)
+  emit('update:modelValue', d)
+}
+
 // 打开时定位到：绑定值 → 上次浏览位置（都不行则交给后端回默认根，如盘符列表）。
 watch(open, (v) => {
   if (v) load(props.modelValue || current.value || '')
@@ -121,7 +127,7 @@ function goManual() {
 function confirm() {
   const target = effective.value
   if (!target) return
-  emit('update:modelValue', target)
+  select(target)
   open.value = false
 }
 
@@ -133,7 +139,7 @@ function useDefault() {
 
 /** 快捷选中已有目录：直接选定，不再要求逐级进入。 */
 function pickExisting(d: string) {
-  emit('update:modelValue', d)
+  select(d)
   open.value = false
 }
 

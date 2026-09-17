@@ -8,7 +8,7 @@ import { getProjectPreferences, saveProjectPreferences } from '@/api/preferences
 import { getTesterConfig, saveTesterConfig } from '@/api/tester'
 import { useWorkDir } from '@/composables/useWorkDir'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
-import { normDir } from '@/utils/dir'
+import { normDir, isWorkDirRemoved, removeWorkDir, restoreWorkDir } from '@/utils/dir'
 
 const DEFAULT_DIR = '' // 空 work_dir = 后端默认目录
 const DIRS_KEY = 'bma:workdirs'
@@ -62,6 +62,10 @@ const groups = computed<DirGroup[]>(() => {
     const key = normDir(d)
     if (!map.has(key)) map.set(key, { dir: d, total: 0, running: 0, lastActive: '' })
   }
+  // 已移除的目录不列出（磁盘与会话不动，重新添加即恢复；其会话仍可在会话页/历史页打开）。
+  for (const key of [...map.keys()]) {
+    if (isWorkDirRemoved(map.get(key)!.dir)) map.delete(key)
+  }
   return [...map.values()].sort((a, b) => b.lastActive.localeCompare(a.lastActive))
 })
 
@@ -83,6 +87,7 @@ async function load() {
 function addDir() {
   const d = newDir.value.trim()
   if (!d) return
+  restoreWorkDir(d)
   // 归一化去重：与已有手工目录/会话目录同址时不重复入表（否则分组会出现两张同址卡）。
   if (!customDirs.value.some((x) => normDir(x) === normDir(d))) {
     customDirs.value = [...customDirs.value, d]
@@ -92,10 +97,13 @@ function addDir() {
   newDir.value = ''
 }
 
-function removeCustomDir(dir: string) {
+/** 从列表移除（本地记忆；磁盘目录与会话一概不动，重新添加即恢复）。 */
+function removeDir(dir: string) {
   customDirs.value = customDirs.value.filter((d) => normDir(d) !== normDir(dir))
   localStorage.setItem(DIRS_KEY, JSON.stringify(customDirs.value))
+  removeWorkDir(dir)
   if (selected.value === dir) selected.value = DEFAULT_DIR
+  ElMessage.success('已从列表移除「' + dir + '」（目录与会话未删除，重新添加该目录即恢复）')
 }
 
 // 发起新会话：固化工作目录并跳入会话页（容器读 ?work_dir= 预填；?new=1 让它清空重来，
@@ -225,9 +233,9 @@ function fmtTime(iso: string) {
             </el-button>
             <el-button size="small" plain @click.stop="viewSessions(g.dir)">查看会话</el-button>
             <el-button
-              v-if="customDirs.some((x) => normDir(x) === normDir(g.dir)) && !g.total"
+              v-if="g.dir"
               size="small" plain type="danger"
-              @click.stop="removeCustomDir(g.dir)"
+              @click.stop="removeDir(g.dir)"
             >移除</el-button>
           </div>
         </div>

@@ -75,6 +75,11 @@ type Manifest struct {
 	URL string
 	// Roles 可见角色白名单，缺省 ["*"] 全角色可见。
 	Roles []string
+	// TopLevel 顶层必备能力标记（plugins.yaml settings.top_level: true）：
+	// 与对接用户的顶层 Agent 直接相关的能力（如联网搜索），会话启动时自动预挂到
+	// 顶层 scope，无需 tool_catalog+tool_mount 两步，也不占角色白名单。
+	// 只挂顶层（fast/daily 档）；子 Agent scope 不预挂，仍走按需挂载。
+	TopLevel bool
 }
 
 // VisibleForRole 判断插件工具是否对指定角色可见：

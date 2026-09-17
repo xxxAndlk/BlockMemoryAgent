@@ -176,6 +176,10 @@ type ReactService struct {
 	// fn(roleID, toolName) -> (owned, visible)；nil 时插件工具不额外过滤
 	//（白名单语义不变）。由 bootstrap 注入 plugins.Manager.ToolVisibility。
 	pluginVisibility ToolVisibilityFunc
+	// topLevelTools 顶层必备插件工具提供者（bootstrap 注入 plugins.Manager.TopLevelTools）：
+	// 快速/日常档会话启动时把返回的工具名预挂到顶层 Agent scope（=sessionID），
+	// 使顶层对接用户即具备联网搜索等能力；子 Agent scope 不预挂。nil 时零行为变化。
+	topLevelTools func() []string
 	// activityPinger 等待用户答复期间的心跳保活回调（bootstrap 注入
 	// subagent.Dispatcher.PingActivity）：审批/提问阻塞时周期性刷新子 Agent 活动时间，
 	// 防止心跳巡检把"等用户操作"误判假死 kill（实证 2026-08-18：三次误杀均卡在
@@ -384,6 +388,32 @@ func (s *ReactService) SaveProjectPreferences(ctx context.Context, content strin
 // 由 bootstrap 注入 plugins.Manager.ToolVisibility；传 nil 关闭插件可见性过滤。
 func (s *ReactService) SetPluginVisibility(fn ToolVisibilityFunc) {
 	s.pluginVisibility = fn
+}
+
+// SetTopLevelToolsProvider 注入顶层必备插件工具提供者（bootstrap 注入
+// plugins.Manager.TopLevelTools）；传 nil 关闭预挂载。
+func (s *ReactService) SetTopLevelToolsProvider(fn func() []string) {
+	s.topLevelTools = fn
+}
+
+// mountTopLevelEssentials 把配置声明的顶层必备插件工具（web_search 等）预挂到
+// 会话顶层 scope：只对快速/日常档生效（cluster 档 MetaAgent 已有角色授权，走
+// 既有 tool_catalog+tool_mount 流程，不再叠一层），子 Agent 的独立 scope 不受影响。
+// 幂等；插件未运行/未接线时零行为变化。
+func (s *ReactService) mountTopLevelEssentials(sessionID string, gear string) {
+	if s.toolRegistry == nil || s.topLevelTools == nil {
+		return
+	}
+	if gear != tool.GearFast && gear != tool.GearDaily {
+		return
+	}
+	names := s.topLevelTools()
+	if len(names) == 0 {
+		return
+	}
+	if accepted := s.toolRegistry.MountPreApprovedForScope(sessionID, gear, names); len(accepted) > 0 {
+		log.Printf("[agent] top-level essentials mounted: session=%s gear=%s tools=%v", sessionID, gear, accepted)
+	}
 }
 
 // Profile 返回用户画像全文快照（TODO #28 查看/编辑入口）。未接线返回空画像。
@@ -3080,6 +3110,10 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		return
 	}
 
+	// 顶层必备插件工具预挂载（fast/daily：联网搜索等直接可用，不必 tool_catalog+tool_mount；
+	// cluster 的 meta 已有角色授权不重复挂；子 Agent scope 不受影响）。
+	s.mountTopLevelEssentials(session.ID, tool.NormalizeGear(session.currentGear()))
+
 	// PROJECT.md 就绪有界等待（TODO 第14项 T9）：cluster/daily 等 ≤2s 让【项目概览】段
 	// 赶上首轮系统提示词前缀缓存；fast（doc_assistant）不等（秒回优先，缺失本就略段）。
 	if gearRoleID != "doc_assistant" {
@@ -3280,6 +3314,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		s.setSessionError(session, fmt.Sprintf("role %q not found", gearRoleID))
 		return
 	}
+
+	// 顶层必备插件工具预挂载（同 runSession：fast/daily 顶层直接可用，子 Agent 不受影响）。
+	s.mountTopLevelEssentials(session.ID, tool.NormalizeGear(session.currentGear()))
 
 	// 确定模型 provider，逻辑同 runSession（D-1 模型随档：按本轮角色 ID 解析）。
 	var provider ModelProvider

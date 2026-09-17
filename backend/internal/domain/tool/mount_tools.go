@@ -51,6 +51,9 @@ func (t *toolCatalogTool) Execute(ctx context.Context, args map[string]any) *Res
 	roleID := RoleIDFromContext(ctx)
 	scope := scopeKeyFromCtx(ctx)
 	mounted := r.MountedTools(scope)
+	// 配置预挂载的顶层必备工具（settings.top_level）不在角色天花板的也要列出（已挂 ✓）：
+	// 它们已在 Schema 里，catalog 漏列会让模型误判"没有这个能力"。
+	pre := r.PreMountedTools(scope)
 
 	var b strings.Builder
 	b.WriteString("当前角色权限天花板内的插件工具（✓=已挂载，下一轮即对本 Agent 可见；空=未挂载）：\n")
@@ -62,7 +65,7 @@ func (t *toolCatalogTool) Execute(ctx context.Context, args map[string]any) *Res
 			if r.pluginVisibility != nil {
 				owned, visible = r.pluginVisibility(roleID, tn)
 			}
-			if !owned || !visible {
+			if !pre[tn] && (!owned || !visible) {
 				continue
 			}
 			mark := " "
