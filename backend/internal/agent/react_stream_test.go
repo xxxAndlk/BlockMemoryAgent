@@ -3,6 +3,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
@@ -144,5 +145,54 @@ func TestReActAgent_SubAgentDoneEvent(t *testing.T) {
 	}
 	if got.Tool != "meta/code_assistant-1" {
 		t.Fatalf("Tool 应为子 Agent ID, got %q", got.Tool)
+	}
+}
+
+// TestReActAgent_MilestoneEvent 验证 mailbox 收到 subject 前缀「里程碑:」的 info
+// 消息时推送 LiveEventMilestone（而非 sub_agent_done——里程碑是中途播报不是完成）。
+func TestReActAgent_MilestoneEvent(t *testing.T) {
+	llm := &mockStreamProvider{
+		chunks: []string{"done"},
+		final:  blades.AssistantMessage("done"),
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	agent := NewReActAgent("meta", types.RoleDefinition{SystemPrompt: "s"}, llm, NewToolRegistryAdapter(reg)).
+		WithMailbox(mb)
+
+	// 预置一封里程碑播报 + 一封普通完成通知。
+	_, _ = mb.Send(&mailbox.Message{
+		From: "meta/domain-1", To: "meta", Type: mailbox.MsgInfo,
+		Subject: "里程碑: 渲染链路已打通", Body: "三层拆分完成，js/render.js",
+	})
+	_, _ = mb.Send(&mailbox.Message{
+		From: "meta/code_assistant-2", To: "meta", Type: mailbox.MsgInfo,
+		Subject: "子 Agent 完成", Body: "写入完成",
+	})
+
+	var events []LiveEvent
+	agent.WithLiveEvents(func(ev LiveEvent) {
+		if ev.Kind == LiveEventMilestone || ev.Kind == LiveEventSubAgentDone {
+			events = append(events, ev)
+		}
+	})
+
+	if _, err := agent.Run(context.Background(), "hi"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var milestone, done bool
+	for _, ev := range events {
+		switch ev.Kind {
+		case LiveEventMilestone:
+			milestone = ev.Tool == "meta/domain-1" && strings.Contains(ev.Text, "渲染链路已打通")
+		case LiveEventSubAgentDone:
+			done = ev.Tool == "meta/code_assistant-2"
+		}
+	}
+	if !milestone {
+		t.Fatalf("里程碑: 前缀 info 应推送 LiveEventMilestone, got %+v", events)
+	}
+	if !done {
+		t.Fatalf("普通完成通知仍应推送 LiveEventSubAgentDone, got %+v", events)
 	}
 }

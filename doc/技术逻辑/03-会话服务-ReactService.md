@@ -72,7 +72,8 @@ ID/Goal/Status/Result/StartedAt/EndedAt/Events[]/Messages[]；`firstTurnImages`�
 | `SummarizeTaskTitle` / `ClearSessionChat` / `SessionCount` / `LLMStats` / `LaunchSession` / `RestoreSessions` | :2529/2569/2574/2579/2555/2564 | 杂项 |
 | `SwitchTopic(ctx, sid, name, goal)` | :2595 | 旧树 EndCurrentTopic + 旧话题摘要写 KV `topic:{sid}:{topicID}:summary` + 新 topicID 递增 + 事件 |
 | `ForwardLiveEvent(sid, ev)` | :820 | dispatcher 侧子 Agent 事件转投会话流（加【展示名】前缀） |
-| `WakeOnChildDone(parentID)` | :3690 | 仅 awaiting_child 翻转 + wakeInput + persist + `go resumeSession` |
+| `WakeOnChildDone(parentID)` | :3690 | 智能唤醒（2026-09-17）：pending>0 且邮箱无未读时**不**翻态（省"收到，继续等"空转轮）；末次完成或邮箱有未读必醒；pendingChecker/mailbox 未注入时保守恒唤醒 |
+| `WakeSuspended(parentID, wakeInput)` | :3746 | 参数化唤醒（2026-09-17）：仅 awaiting_child 翻转 + wakeInput + persist + `go resumeSession`；`WakeOnChildDone` 与邮箱 MsgRequest 到达路径（submit_plan 审批 / send_message request·escalate，经 dispatcher `WithSessionWake` 接线）共用 |
 | `NotifyUserSystemMessage` | :700 | 落 System 事件 |
 | `TreeFor/Tree/ListAgents` | :2422/2441/2362 | 权威树（lazy init + LoadFromStore 3s）；ListAgents 中 parent==sessionID 归一为 "meta" |
 | 配置读写 | :1567-1762 | SetDefault/SessionTrustMode、Set/Get Gear、Thinking、WorkDir |
@@ -98,7 +99,7 @@ ID/Goal/Status/Result/StartedAt/EndedAt/Events[]/Messages[]；`firstTurnImages`�
 | → running | 新建（session_react.go:339）；hook 收答复（:1553 等）；非 running 会话收消息 + `go resumeSession` |
 | running → awaiting_clarify | 三 hook 占槽（:1528/:1975/:2315）；pauseSession 的 PauseUserStop/PauseIterationLimit 分支 |
 | running → paused_on_child | result.PausedOnChild（:3149/:3338）或软停时树有 Running/Paused domain（:3621）；恢复走 resumePausedDomain 或 waker |
-| running → awaiting_child | suspendOnChildWait → pauseSession(PauseChildWait)；恢复走 WakeOnChildDone 或用户消息 |
+| running → awaiting_child | suspendOnChildWait → pauseSession(PauseChildWait)；恢复走 WakeOnChildDone（智能唤醒）/ WakeSuspended（邮箱 MsgRequest 到达）/ 用户消息 |
 | running → completed | runSession:3174 / resumeSession:3364；**先落 agent_done 事件再翻状态**（防 SSE done 帧抢跑） |
 | 任意 → error | setSessionError（首次错误胜出守卫 :3720）；cancel（"cancelled by user"）；墙钟；优雅停机 |
 

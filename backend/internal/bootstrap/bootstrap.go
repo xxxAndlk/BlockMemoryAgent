@@ -460,6 +460,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		time.Duration(cfg.Agent.PlanConfirmTimeoutSec)*time.Second,
 		cfg.Agent.PlanMaxRevisions,
 	)
+	// 波聚合整合纪要（集群档提速 C-3a）：call_sub_agents 同波 domain 项 ≥2 时，
+	// 完成回传汇成一条【整合纪要】单条送达父邮箱（轻量模型按领域归并，失败回退
+	// 逐领域拼接），省父 Agent "收到，继续等" 空转轮。config 默认 true，可显式关闭。
+	subAgentDispatcher.WithBatchDigest(cfg.Agent.BatchDigestEnabled == nil || *cfg.Agent.BatchDigestEnabled)
+	subAgentDispatcher.WithSummaryMerger(&llmDigestMerger{factory: modelFactory})
 	// 共享记忆/spec：文件后端落盘到 <workDir>/.bma/shared/<hex(agentID)>__<slot>.md。
 	// 主线程 Agent（meta/domain）持可写实例写关键上下文与 spec，
 	// 子 Agent 派发时经 Dispatcher 的只读视图读取并注入任务前。
@@ -763,6 +768,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.WithUserNotify(agentSvc.NotifyUserSystemMessage)
 	// 「挂起等子」唤醒接线：子 Agent 完成（trackChildDone）回调唤醒 awaiting_child 会话续跑整合。
 	subAgentDispatcher.WithChildDoneNotify(agentSvc.WakeOnChildDone)
+	// 邮箱请求死信修复：submit_plan 审批请求 / send_message request/escalate 到达
+	// 挂起（awaiting_child）会话时翻态续跑 drain 邮箱——poke 只够 waitForChildren
+	// 轮询，够不到挂起会话（否则每子白等 plan_confirm_timeout 才 fail-open）。
+	subAgentDispatcher.WithSessionWake(agentSvc.WakeSuspended)
 	agentSvc.SetAcceptanceRunner(subagent.NewAcceptanceManager(subAgentDispatcher, modelFactory.CallLightweightWithRetry))
 	// DomainAgent 热驻留（Domain 热驻 + 复用权重）：开启后 domain 任务完成/用户停止转
 	// Idle 热驻（goroutine park 等复用，call_sub_agent(reuse_agent_id=X) 唤醒），

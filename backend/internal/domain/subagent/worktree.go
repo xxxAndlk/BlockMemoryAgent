@@ -9,7 +9,8 @@ package subagent
 //   - 交付侧：子 Agent 成功收尾时 `git add -A` + `git diff --cached <base>` 产出
 //     全量 patch 落盘（副本同目录 .patch 文件）+ --stat 摘要，notify 摘要附路径。
 //   - 合并门（meta 工具 merge_worktree）：review 返回逐文件 diff；merge 先做 base
-//     漂移检测（主仓库 HEAD ≠ 建副本时 base → 拒绝，提示人工 rebase/重派），再对
+//     漂移检测（主仓库 HEAD ≠ 建副本时 base），漂移时走 3way 回退链（`git apply
+//     --3way --check` 模拟合并，真冲突才拒绝并提示人工 rebase/重派，P1-5），再对
 //     worktree 副本跑跨域契约静态检查（patch 触及契约文件才跑，防对其他域范围误报），
 //     通过后 `git apply --check` + `git apply` + 清理副本与分支，全链幂等；
 //     reject 把修改意见经 mailbox 回该域（热驻槽存活则续改，已销毁提示重派）。
@@ -277,15 +278,14 @@ func (d *Dispatcher) mergeWorktree(ctx context.Context, sessionID, agentID strin
 	if h.Removed {
 		return "", fmt.Errorf("worktree 副本已删除，无法合并: agent=%s", agentID)
 	}
-	// 1. base 漂移检测：主仓库 HEAD 相对建副本时已前进（他域已合入）→ 拒绝，
-	//    强制人工 rebase/重派——v1 不做自动冲突解决。
+	// 1. base 漂移检测：主仓库 HEAD 相对建副本时已前进（他域已合入）。漂移不再直接
+	//    拒绝——先记标记，应用阶段走三方合并回退链（P1-5：多域并行写码除首个合入者
+	//    外不再全部人工 rebase）；三方合并仍冲突才拒绝并提示人工处置。
 	head, err := gitOut(h.RepoRoot, "rev-parse", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("读取主仓库 HEAD 失败: %w", err)
 	}
-	if head != h.BaseCommit {
-		return "", fmt.Errorf("base 漂移: 建副本时 HEAD=%s，当前 HEAD=%s（他域已合入）。请人工 rebase 副本分支或重派该域任务后再合并", shortSHA(h.BaseCommit), shortSHA(head))
-	}
+	drifted := head != h.BaseCommit
 	// 2. patch 就绪：成功收尾已产出；未产出（异常路径）此处补产。
 	if h.PatchPath == "" {
 		if note := d.producePatchForAgent(ctx, agentID); note == "" {
@@ -298,17 +298,64 @@ func (d *Dispatcher) mergeWorktree(ctx context.Context, sessionID, agentID strin
 		return "", fmt.Errorf("契约检查未通过，合并被拒绝:\n%s", violations)
 	}
 	// 4. 应用前预检 + 应用（--check 幂等保证：预检不过不动主仓库）。
-	if _, err := gitOut(h.RepoRoot, "apply", "--check", h.PatchPath); err != nil {
-		return "", fmt.Errorf("patch 应用预检失败（主仓库未动）: %v", err)
-	}
-	if _, err := gitOut(h.RepoRoot, "apply", h.PatchPath); err != nil {
-		return "", fmt.Errorf("patch 应用失败（主仓库未动）: %v", err)
+	if !drifted {
+		if _, err := gitOut(h.RepoRoot, "apply", "--check", h.PatchPath); err != nil {
+			return "", fmt.Errorf("patch 应用预检失败（主仓库未动）: %v", err)
+		}
+		if _, err := gitOut(h.RepoRoot, "apply", h.PatchPath); err != nil {
+			return "", fmt.Errorf("patch 应用失败（主仓库未动）: %v", err)
+		}
+	} else {
+		// 漂移回退链（P1-5）：patch 由 `git diff --cached <base>` 产出、携带 blob 身份，
+		// 副本与主仓共享对象库 → --3way 能找到 base blob 做三方合并。
+		// 预检必须在**临时索引**上跑：`git apply --check --3way` 不模拟三方合并冲突
+		// （实证放行后真 apply 会把冲突标记写进主仓工作区）；`--3way --cached` 配合
+		// GIT_INDEX_FILE 指向主索引副本，冲突只落在废弃副本里，主仓工作区零触碰。
+		if reason := d.threeWayCheck(h); reason != "" {
+			return "", fmt.Errorf("base 漂移: 建副本时 HEAD=%s，当前 HEAD=%s（他域已合入），且三方合并仍有真冲突（%s）。请人工 rebase 副本分支或重派该域任务后再合并", shortSHA(h.BaseCommit), shortSHA(head), reason)
+		}
+		if _, err := gitOut(h.RepoRoot, "apply", "--3way", h.PatchPath); err != nil {
+			return "", fmt.Errorf("patch 三方合并失败（主仓库未动）: %v", err)
+		}
 	}
 	// 5. 清理副本与专属分支（best-effort，失败不回滚已应用的 patch）。
 	d.removeWorktreeCopy(h)
 	h.Merged = true
-	log.Printf("[subagent] WORKTREE-MERGED: sub=%s patch=%s", agentID, h.PatchPath)
-	return "已合入主仓库并清理副本：" + h.PatchPath + "\n" + h.PatchStat, nil
+	log.Printf("[subagent] WORKTREE-MERGED: sub=%s patch=%s drifted=%v", agentID, h.PatchPath, drifted)
+	way := "已合入主仓库并清理副本"
+	if drifted {
+		way = "主仓库已有他域产出（base 漂移），已三方合并后清理副本"
+	}
+	return way + "：" + h.PatchPath + "\n" + h.PatchStat, nil
+}
+
+// threeWayCheck 在临时索引上模拟 `git apply --3way`：无冲突返回空串；
+// 有冲突返回错误文案（主仓索引与工作区零触碰）。主索引不可读（异常仓库）时
+// 返回保守文案（等同拒绝，不做三方合并）。
+func (d *Dispatcher) threeWayCheck(h *worktreeHandle) string {
+	gitDir, err := gitOut(h.RepoRoot, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return "无法定位主仓库索引: " + err.Error()
+	}
+	data, err := os.ReadFile(filepath.Join(gitDir, "index"))
+	if err != nil {
+		return "无法读取主仓库索引: " + err.Error()
+	}
+	tmpIndex := filepath.ToSlash(filepath.Join(os.TempDir(), fmt.Sprintf("bma-3way-%d.index", time.Now().UnixNano())))
+	if err := os.WriteFile(filepath.FromSlash(tmpIndex), data, 0600); err != nil {
+		return "无法写临时索引: " + err.Error()
+	}
+	defer func() {
+		_ = os.Remove(filepath.FromSlash(tmpIndex))
+		_ = os.Remove(filepath.FromSlash(tmpIndex + ".lock"))
+	}()
+	cmd := exec.Command("git", "-C", h.RepoRoot, "apply", "--3way", "--cached", h.PatchPath)
+	cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+tmpIndex)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // worktreeContractCheck 对 worktree 副本跑父 spec 契约静态检查。

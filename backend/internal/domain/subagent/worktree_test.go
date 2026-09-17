@@ -3,7 +3,7 @@ package subagent
 // worktree_test.go 验证 worktree 隔离派发与合并门（TODO 第9⑤/#10⑤）：
 //   - 副本创建 + 隔离性（副本写入主目录不可见）；
 //   - 成功收尾 patch 产出 + 合并门 merge 全流程（apply 后主目录可见、副本与分支清理）；
-//   - base 漂移拒绝（他域已合入场景）；
+//   - base 漂移 3way 回退链（不同文件改动自动合并；同行冲突拒绝）；
 //   - 跨域契约违例拦截（patch 触及契约文件才跑的收窄逻辑）；
 //   - reject 驳回经 mailbox 回信；
 //   - 非 git 目录拒绝（不静默降级）与开关关闭拒绝。
@@ -138,9 +138,9 @@ func TestWorktreeCreateIsolatePatchMerge(t *testing.T) {
 	}
 }
 
-// TestWorktreeMergeBaseDriftReject 验证 base 漂移拒绝：他域已合入（主仓库 HEAD 前进）
-// 后合并被拒，副本保留待人工 rebase/重派。
-func TestWorktreeMergeBaseDriftReject(t *testing.T) {
+// TestWorktreeMergeBaseDrift3WaySuccess 漂移 + 不同文件改动：3way 回退链自动合并
+// （P1-5 多域并行主路径），两主目录产物共存、副本清理。
+func TestWorktreeMergeBaseDrift3WaySuccess(t *testing.T) {
 	repoDir := newWorktreeRepo(t)
 	d, _, _ := newWorktreeTestEnv(t)
 	ctx := worktreeCtx(repoDir)
@@ -156,7 +156,7 @@ func TestWorktreeMergeBaseDriftReject(t *testing.T) {
 		t.Fatal("patch should be produced")
 	}
 
-	// 主仓库前进一格 HEAD（模拟他域已合入）。
+	// 主仓库前进一格 HEAD（模拟他域已合入，不过与副本改动不同文件）。
 	if err := os.WriteFile(filepath.Join(repoDir, "other.txt"), []byte("other domain\n"), 0644); err != nil {
 		t.Fatalf("write other.txt: %v", err)
 	}
@@ -167,13 +167,67 @@ func TestWorktreeMergeBaseDriftReject(t *testing.T) {
 		t.Fatalf("git commit: %v", err)
 	}
 
+	out, err := d.MergeWorktree(ctx, "s1", "s1/domain-1")
+	if err != nil {
+		t.Fatalf("drifted merge with disjoint changes should 3way-merge, got %v", err)
+	}
+	if !strings.Contains(out, "三方合并") {
+		t.Errorf("merge output should mention 3way, got %q", out)
+	}
+	// 两域产物共存。
+	if _, statErr := os.Stat(filepath.Join(repoDir, "wt_only.txt")); statErr != nil {
+		t.Error("worktree file should be merged into main repo")
+	}
+	if _, statErr := os.Stat(filepath.Join(repoDir, "other.txt")); statErr != nil {
+		t.Error("other domain file should stay in main repo")
+	}
+	if _, statErr := os.Stat(h.Path); !os.IsNotExist(statErr) {
+		t.Error("worktree copy should be removed after 3way merge")
+	}
+}
+
+// TestWorktreeMergeBaseDriftConflictReject 漂移 + 同行冲突：3way 预检失败仍拒绝，
+// 副本保留待人工 rebase/重派，主仓库保持原样。
+func TestWorktreeMergeBaseDriftConflictReject(t *testing.T) {
+	repoDir := newWorktreeRepo(t)
+	d, _, _ := newWorktreeTestEnv(t)
+	ctx := worktreeCtx(repoDir)
+
+	h, rej := d.createWorktreeForDispatch(ctx, "s1", "s1/domain-1", "s1", "测试域", "domain")
+	if rej != nil || h == nil {
+		t.Fatalf("create worktree failed: %+v", rej)
+	}
+	// 副本改 base.txt 第一行。
+	if err := os.WriteFile(filepath.Join(h.Path, "base.txt"), []byte("worktree change\n"), 0644); err != nil {
+		t.Fatalf("write in worktree: %v", err)
+	}
+	if note := d.worktreePatchNote(ctx, "s1/domain-1"); note == "" {
+		t.Fatal("patch should be produced")
+	}
+
+	// 主仓库同行改成不同内容（模拟他域合入冲突改动）。
+	if err := os.WriteFile(filepath.Join(repoDir, "base.txt"), []byte("main change\n"), 0644); err != nil {
+		t.Fatalf("write base.txt: %v", err)
+	}
+	if _, err := gitOut(repoDir, "add", "-A"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := gitOut(repoDir, "commit", "-m", "other domain touched same line"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
 	_, err := d.MergeWorktree(ctx, "s1", "s1/domain-1")
-	if err == nil || !strings.Contains(err.Error(), "base 漂移") {
-		t.Fatalf("merge should be rejected for base drift, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "base 漂移") || !strings.Contains(err.Error(), "真冲突") {
+		t.Fatalf("same-line conflict should be rejected with drift message, got %v", err)
+	}
+	// 主仓库保持原样（他域内容未被覆盖）。
+	data, readErr := os.ReadFile(filepath.Join(repoDir, "base.txt"))
+	if readErr != nil || strings.TrimSpace(string(data)) != "main change" {
+		t.Fatalf("main repo must stay untouched on conflict, got %v %q", readErr, data)
 	}
 	// 副本保留（人工 rebase/重派需要）。
 	if _, statErr := os.Stat(h.Path); statErr != nil {
-		t.Error("worktree copy should be kept after drift rejection")
+		t.Error("worktree copy should be kept after conflict rejection")
 	}
 }
 

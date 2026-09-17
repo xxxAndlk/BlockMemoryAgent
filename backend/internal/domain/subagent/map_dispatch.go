@@ -47,17 +47,29 @@ type mapAggItemResult struct {
 }
 
 // mapAggregation 收口同波全部项后回调 onDone（只触发一次，done 后 onDone 置 nil 防重放）。
+// abandon 可放弃聚合：已收口与后续到达的项改经 flush 逐条直发（call_sub_agents
+// 波聚合成功项不足 2 时回退旧逐条回传行为用），onDone 永不触发。
 type mapAggregation struct {
-	mu       sync.Mutex
-	total    int
-	results  []mapAggItemResult
-	finished int
-	onDone   func(results []mapAggItemResult)
+	mu        sync.Mutex
+	total     int
+	results   []mapAggItemResult
+	finished  int
+	onDone    func(results []mapAggItemResult)
+	abandoned bool
+	flush     func(idx int, item, summary string, ok bool)
 }
 
-// record 记入单项结果；全部项收口时触发一次 onDone。
+// record 记入单项结果；全部项收口时触发一次 onDone。放弃聚合后改走 flush 直发。
 func (a *mapAggregation) record(idx int, item, summary string, ok bool) {
 	a.mu.Lock()
+	if a.abandoned {
+		flush := a.flush
+		a.mu.Unlock()
+		if flush != nil {
+			flush(idx, item, summary, ok)
+		}
+		return
+	}
 	a.results = append(a.results, mapAggItemResult{Idx: idx, Item: item, Summary: summary, OK: ok})
 	a.finished++
 	done := a.finished >= a.total
@@ -71,6 +83,25 @@ func (a *mapAggregation) record(idx int, item, summary string, ok bool) {
 		// 按派发顺序排列（并发完成顺序不定，聚合消息保持 items 原序）。
 		sort.Slice(res, func(i, j int) bool { return res[i].Idx < res[j].Idx })
 		cb(res)
+	}
+}
+
+// abandon 放弃聚合：onDone 置空永不触发，已记入与后续 record 的项均改经 flush
+// 逐条直发（防消息丢失——notify 拦截可能已吞掉直发路径）。只调用一次有效。
+func (a *mapAggregation) abandon(flush func(idx int, item, summary string, ok bool)) {
+	a.mu.Lock()
+	if a.abandoned {
+		a.mu.Unlock()
+		return
+	}
+	a.abandoned = true
+	a.flush = flush
+	pending := a.results
+	a.results = nil
+	a.onDone = nil
+	a.mu.Unlock()
+	for _, r := range pending {
+		flush(r.Idx, r.Item, r.Summary, r.OK)
 	}
 }
 

@@ -1984,12 +1984,18 @@ func (a *ReActAgent) drainMailbox(history []ReactMessage) ([]ReactMessage, int) 
 		// 实时推送子 Agent 完成事件，UI 可据此更新"等待子 Agent"状态。
 		// 用户注入（From=user，如运行中重新下达指令）不是子 Agent 完成，不推该事件——
 		// 否则 UI 会多出一条 "子Agent 完成: user" 的假完成记录。
+		// 系统通知（From=system，依赖就绪等）同理：非完成也非询问，不推活动事件，
+		// 正文照常入史供 LLM 消化。
 		// 协作询问（request/escalate）单列 peer_ask：语义是"需要本 Agent 回答"而非
 		// "某子 Agent 完成"，混在 sub_agent_done 里既误导用户也淹没问答使用情况。
-		if m.From != "user" {
+		if m.From != "user" && m.From != "system" {
 			kind := LiveEventSubAgentDone
-			if m.Type == mailbox.MsgRequest || m.Type == mailbox.MsgEscalate {
+			switch {
+			case m.Type == mailbox.MsgRequest || m.Type == mailbox.MsgEscalate:
 				kind = LiveEventPeerAsk
+			case m.Type == mailbox.MsgMilestone || (m.Type == mailbox.MsgInfo && strings.HasPrefix(m.Subject, "里程碑:")):
+				// 里程碑是中途播报不是终态回传，单列 kind 防前端误读为完成（C-2）。
+				kind = LiveEventMilestone
 			}
 			a.emitLive(LiveEvent{Kind: kind, Tool: m.From, Text: truncateRunes(m.Subject+m.Body, 200)})
 		}

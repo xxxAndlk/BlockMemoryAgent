@@ -22,7 +22,6 @@
 # provider 支持：
 #   - openai-chat：OpenAI Chat Completions 协议（/v1/chat/completions），适用于 OpenAI / DeepSeek / Kimi / GLM / 豆包等；
 #     自研实现，内置字段兼容（reasoning_content 回传、max_tokens vs max_completion_tokens 按模型名自适应、usage cache 字段回退）。
-#     旧名 openai / openai-deepseek 作为其别名仍可用。
 #   - openai-responses：OpenAI Responses API 协议（/v1/responses），适用于 gpt-4.1 / o 系 / gpt-5 等新一代接口。
 #   - ollama：Ollama 原生 /api/chat 协议，默认 http://localhost:11434
 #   - anthropic：Anthropic 原生 Messages API，默认 https://api.anthropic.com

@@ -217,6 +217,10 @@ type FeatureTogglesConfig struct {
 	// PlanMaxRevisions 每 Agent 计划被驳回重提上限。默认 0=不限制（循环直到批准，
 	// 对齐"未经批准不执行"）；>0 时达上限不放行、转 send_message(escalate) 升级仲裁。
 	PlanMaxRevisions int `yaml:"plan_max_revisions"`
+	// BatchDigestEnabled call_sub_agents 波聚合整合纪要开关：domain 项 ≥2 的同波派发
+	// 完成回传汇成一条【整合纪要】单条送达父邮箱（防 N 子完成 N 次打扰父）。
+	// 默认 true；显式 false 退回逐条回传（逃生舱）。
+	BatchDigestEnabled *bool `yaml:"batch_digest_enabled"`
 }
 
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
@@ -725,6 +729,11 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	}
 	if c.Agent.PlanConfirmTimeoutSec <= 0 {
 		c.Agent.PlanConfirmTimeoutSec = 600
+	}
+	// 波聚合整合纪要默认开启（集群档提速：N 子完成汇 1 条，省父 Agent N-1 轮空转）。
+	if c.Agent.BatchDigestEnabled == nil {
+		t := true
+		c.Agent.BatchDigestEnabled = &t
 	}
 	// PlanMaxRevisions 默认 0=不限制：子 Agent 计划必须循环修订直到上级批准，
 	// 不做"达上限放行"；>0 仅作防失控兜底（达上限转升级仲裁，仍不放行）。

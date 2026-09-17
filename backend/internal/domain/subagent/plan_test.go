@@ -139,6 +139,80 @@ depCleared:
 	}
 }
 
+// TestDepGateReadyNotify 依赖门就绪通知（轻量排队）：拒派登记 waiter；前置任务
+// 全 done 后 boardUpdate 触发邮箱 MsgInfo（From=system）+ 唤醒回调；依赖未完成不通知。
+func TestDepGateReadyNotify(t *testing.T) {
+	d, mb, bm, toolsReg := newPlanTestEnv(t, &mockProvider{text: "done"})
+	wake := make(chan string, 2)
+	d.WithSessionWake(func(parentID, hint string) bool {
+		wake <- parentID + "|" + hint
+		return true
+	})
+	_, err := toolsReg.Dispatch(dispatchCtx(), "write_plan", map[string]any{
+		"goal": "实现塔防游戏",
+		"tasks": []any{
+			map[string]any{"id": "render", "title": "渲染引擎", "domain": "渲染"},
+			map[string]any{"id": "config", "title": "配置模块", "domain": "配置", "depends_on": []any{"render"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("write_plan: %v", err)
+	}
+
+	// 依赖未完成：拒派配置 + 登记 waiter + 文案含自动通知提示。
+	blocked, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id": "domain", "domain": "配置", "task": "实现配置", "responsibility": "负责配置",
+	})
+	if err != nil {
+		t.Fatalf("dispatch should not error: %v", err)
+	}
+	if blocked.Success || !strings.Contains(blocked.Error, "依赖未满足") || !strings.Contains(blocked.Error, "自动通知") {
+		t.Fatalf("dep gate rejection missing notify hint: %+v", blocked)
+	}
+
+	// 派渲染（无依赖放行），异步完成回写 render=Done → 配置 waiter 依赖全就绪，
+	// 应收到 From=system 的就绪通知 + 唤醒回调。
+	if _, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id": "domain", "domain": "渲染", "task": "实现渲染", "responsibility": "负责渲染",
+	}); err != nil {
+		t.Fatalf("render dispatch: %v", err)
+	}
+	var gotNotify bool
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !gotNotify {
+		for _, m := range mb.Peek("s1") {
+			if m.From == "system" && strings.Contains(m.Body, "依赖就绪") && strings.Contains(m.Body, "配置") {
+				gotNotify = true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !gotNotify {
+		t.Fatal("dep-ready notify not delivered to parent mailbox after render done")
+	}
+	select {
+	case c := <-wake:
+		if !strings.Contains(c, "s1|") || !strings.Contains(c, "依赖就绪") {
+			t.Fatalf("wake unexpected: %s", c)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session wake not invoked on dep-ready notify")
+	}
+
+	// waiter 已删：重复 boardUpdate 不重复通知（数量仍为 1）。
+	_ = bm.Get("s1").MarkDone("config", "done")
+	d.notifyDepWaiters(dispatchCtx(), "s1")
+	count := 0
+	for _, m := range mb.Peek("s1") {
+		if m.From == "system" && strings.Contains(m.Body, "依赖就绪") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("dep-ready notify should fire once, got %d", count)
+	}
+}
+
 // TestDispatchNoBoard_ZeroChange 无看板接线/无计划时派发零行为变化。
 func TestDispatchNoBoard_ZeroChange(t *testing.T) {
 	d, _, _, toolsReg, _ := newSalvageTestEnv(t, &mockProvider{text: "done"})

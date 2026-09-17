@@ -3583,6 +3583,13 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		if strings.TrimSpace(ev.Text) != "" {
 			s.store.addEventDetail(session, eventkind.Progress, "PeerAsk", ev.Text, eventkind.LLMResult, ev.Tool, "", "", "", true, agentIDJSON(ev.Tool))
 		}
+	case LiveEventMilestone:
+		// 子 Agent 关键节点里程碑（C-2：subject 前缀「里程碑:」的 info 播报）：
+		// 落 Message 事件让用户看到长任务中途进展；kind=milestone 与 sub_agent_done
+		// 区分（是中途播报不是完成回传），前端按发言档展示。
+		if strings.TrimSpace(ev.Text) != "" {
+			s.store.addEvent(session, eventkind.Message, "SubAgent", ev.Text, "milestone", ev.Tool, "", "", "", true)
+		}
 	case LiveEventNotify:
 		// 系统级通知（如"模型不支持图片输入，已剥图降级"）：落 System 事件，
 		// 让用户在对白流里看到 agent 为何改变了做法（而非静默换路）。
@@ -3732,22 +3739,41 @@ func (s *ReactService) suspendOnChildWait(session *reactInternalSession, result 
 
 // WakeOnChildDone 子 Agent 完成回传时唤醒「挂起等子」会话（awaiting_child → running）。
 // 由 bootstrap 经 Dispatcher.WithChildDoneNotify 接线到 trackChildDone 回调；
-// trackChildDone 对每次子完成都触发（含父非 meta 的场景），此处按会话态过滤幂等：
-// 仅 awaiting_child 翻转并起 resumeSession（wakeInput 作本轮输入，替代用户新指令）；
-// 其余状态（Running/Completed/会话不在内存/父是 domain 等）一律空转。
+// trackChildDone 对每次子完成都触发（含父非 meta 的场景），此处按会话态过滤幂等。
+//
+// 智能唤醒（C-3b 集群档提速）：仍有未决子（pending>0）且邮箱无未读时**不**翻态——
+// 中间完成往往只有"收到，继续等"可说，保持挂起省一轮空转；最后一个完成
+// （trackChildDone 先减计数再触发回调，末次必见 pending==0）或邮箱有未读
+// （回传摘要/审批请求/直问/纪要）时必醒。漏醒无路径：邮箱到达自带独立唤醒
+// （wakeSuspendedParent），pending 归零必经本回调。pendingChecker/mailbox 任一
+// 未注入时保守退回旧行为（恒唤醒）。
 func (s *ReactService) WakeOnChildDone(parentID string) {
+	if s.pendingChecker != nil && s.mailbox != nil &&
+		s.pendingChecker.PendingChildren(parentID) > 0 && s.mailbox.Count(parentID) == 0 {
+		return
+	}
+	s.WakeSuspended(parentID, "【系统】有子 Agent 完成回传，请查收邮箱摘要、整合进度后继续（用户暂无新指令）。")
+}
+
+// WakeSuspended 唤醒「挂起等子」会话（awaiting_child → running），wakeInput 作本轮
+// 输入（即取即清，替代用户新指令）。除子完成（WakeOnChildDone）外，还服务邮箱
+// MsgRequest 到达路径——submit_plan 审批请求与 send_message request/escalate 直问：
+// 挂起中的会话不会 drain 邮箱，不先翻态续跑消息会滞留到超时（死信）。
+// 仅 awaiting_child 翻转并起 resumeSession；其余状态（Running/Completed/会话不在
+// 内存/父是 domain 等）幂等空转返回 false。
+func (s *ReactService) WakeSuspended(parentID, wakeInput string) bool {
 	session := s.store.getSession(parentID)
 	if session == nil {
-		return
+		return false
 	}
 	s.store.mu.Lock()
 	if session.Status != enums.SessionStatusAwaitingChild {
 		s.store.mu.Unlock()
-		return
+		return false
 	}
 	session.Status = enums.SessionStatusRunning
 	session.EndedAt = nil
-	session.wakeInput = "【系统】有子 Agent 完成回传，请查收邮箱摘要、整合进度后继续（用户暂无新指令）。"
+	session.wakeInput = wakeInput
 	restartSessionContext(session)
 	s.store.mu.Unlock()
 
@@ -3756,6 +3782,7 @@ func (s *ReactService) WakeOnChildDone(parentID string) {
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
 	go s.resumeSession(session)
+	return true
 }
 
 // setSessionError 将会话标记为错误状态，并记录相关事件与持久化。

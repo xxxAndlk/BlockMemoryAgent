@@ -226,6 +226,10 @@ func (d *Dispatcher) submitPlanToParent(ctx context.Context, w *planWaiter, plan
 	}
 	// 立刻唤醒父 Agent 的 waitForChildren 轮询（不等 30s tick）。
 	d.pokeParent(w.parentID)
+	// 父会话处于「挂起等子」（awaiting_child）时 poke 够不到（wait loop 已退出、
+	// 挂起会话不 drain 邮箱）：不翻态续跑，审批请求要滞留满超时才 fail-open，
+	// 纯付 10 分钟延迟。此处显式唤醒挂起父会话，使其 drain 邮箱及时 review_plan。
+	d.wakeSuspendedParent(w.parentID, "【系统】子 Agent 已提交开工计划待你审批（邮箱【计划审批请求】），请查收邮箱并调用 review_plan 审阅；超时未审批将按计划自动通过（fail-open）。")
 
 	timeout := d.planConfirmTimeout
 	if timeout <= 0 {

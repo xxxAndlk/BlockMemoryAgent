@@ -220,6 +220,10 @@ const (
 	// 与 sub_agent_done（完成回传）语义不同——这是一条"需要我回答"的询问，
 	// 会话层落 peer_ask 事件供用户看到跨 Agent 问答确实在用。
 	LiveEventPeerAsk = "peer_ask"
+	// LiveEventMilestone 是子 Agent 关键节点里程碑事件（mailbox 收到 subject 前缀
+	// 「里程碑:」的消息时触发）：任务中途的"打通链路/确认方案/踩坑结论"播报，
+	// 供用户看到长任务的关键进展；与 sub_agent_done（终态回传）区分。
+	LiveEventMilestone = "milestone"
 	// LiveEventNotify 是系统级通知事件（Text 为面向用户/模型的完整说明）：
 	// 目前用于"模型不支持图片输入"的降级告知（2026-09-16），会话层落 System 事件。
 	LiveEventNotify = "notify"

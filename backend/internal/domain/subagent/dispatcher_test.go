@@ -768,6 +768,62 @@ func TestSendMessageTool(t *testing.T) {
 	}
 }
 
+// TestSendMessageTool_WakesSuspendedTarget request/escalate 消息应触发挂起会话
+// 唤醒回调（邮箱死信修复：挂起会话不 drain 邮箱）；info 单向通知不唤醒。
+func TestSendMessageTool_WakesSuspendedTarget(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "x"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.RegisterMessagingTool(toolsReg)
+
+	type wakeCall struct{ parentID, hint string }
+	wake := make(chan wakeCall, 4)
+	d.WithSessionWake(func(parentID, hint string) bool {
+		wake <- wakeCall{parentID, hint}
+		return true
+	})
+	ctx := agent.WithAgentID(context.Background(), "session-1/domain-1")
+	send := func(args map[string]any) {
+		t.Helper()
+		res, err := toolsReg.Dispatch(ctx, "send_message", args)
+		if err != nil || !res.Success {
+			t.Fatalf("send_message failed: err=%v res=%+v", err, res)
+		}
+	}
+
+	send(map[string]any{"to_agent_id": "session-1", "subject": "help", "body": "b", "message_type": "request"})
+	select {
+	case c := <-wake:
+		if c.parentID != "session-1" || !strings.Contains(c.hint, "询问") {
+			t.Fatalf("request wake unexpected: %+v", c)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("request message should wake suspended target")
+	}
+
+	send(map[string]any{"to_agent_id": "session-1", "subject": "stuck", "body": "b", "message_type": "escalate"})
+	select {
+	case c := <-wake:
+		if !strings.Contains(c.hint, "升级") {
+			t.Fatalf("escalate wake hint unexpected: %+v", c)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("escalate message should wake suspended target")
+	}
+
+	send(map[string]any{"to_agent_id": "session-1", "subject": "fyi", "body": "b", "message_type": "info"})
+	select {
+	case c := <-wake:
+		t.Fatalf("info should not wake target, got %+v", c)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 // TestSendMessageTool_MissingArgs 验证 send_message 工具在缺少必填参数时返回错误。
 func TestSendMessageTool_MissingArgs(t *testing.T) {
 	cfg := &config.RoleConfigFile{

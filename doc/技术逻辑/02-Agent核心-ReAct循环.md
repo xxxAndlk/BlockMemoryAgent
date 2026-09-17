@@ -71,7 +71,7 @@
 - `ToolCall`：`ID` / `Name` / `Input map[string]any`。
 - `ToolResult`（react_types.go:163-171）：`Tool` / `Success` / `Output` / `Error` / `Images`。
 - `ReactResult`（react_types.go:174-199）：`Text` / `History`，加四个互斥的暂停语义标记 —— `LimitReached`（自身触限）/ `PausedOnChild`（子触限）/ `SuspendOnChildWait`（顶层挂起等子），以及 `Unverified`/`VerifyNote`（校验层 fail-closed）/ `MachineCheck`（dispatcher 机器校验段）。
-- `LiveEvent`（react_types.go:230-247）：`Kind`（llm_delta/tool_call/tool_exec/think_delta/sub_agent_done/token_usage/peer_ask/notify）+ `Agent`/`AgentID`（emit 时自动填充，react_agent.go:456-467）+ Text/Tool/Input/Output/Error/Success + token 用量（含缓存命中/未命中）。
+- `LiveEvent`（react_types.go:230-247）：`Kind`（llm_delta/tool_call/tool_exec/think_delta/sub_agent_done/token_usage/peer_ask/milestone/notify）+ `Agent`/`AgentID`（emit 时自动填充，react_agent.go:456-467）+ Text/Tool/Input/Output/Error/Success + token 用量（含缓存命中/未命中）。
 - 接口族（react_types.go:251-362）：`ToolRegistry`、`RoleProvider`、`PendingChildrenChecker`、`PausedChildChecker`、`PausedDomainResumer`、`DispatchCountResetter`、`SoftStopMarker`、`SuspendGate`、`IdleRosterProvider`、`IdleTTLArmer`、`SessionAgentWaker`、`ModelProvider` —— 全部由 `domain/subagent.Dispatcher` 或 ReactService 实现，agent 包只声明接口（防循环依赖）。
 
 ## 2.3 RunWithHistory 完整流程（逐点）
@@ -196,7 +196,7 @@
 
 ## 2.7 mailbox 交互
 
-- `drainMailbox`（1967-2007）：`mailbox.Drain(a.name)` 取全部未读 → 每条转 `ReactMessage{Role:"user", Content:"[mailbox from X] ..."}`（mailboxMessageToReact，1934-1962：MsgEscalate 加 [升级] 前缀、Payload JSON 追加、FilesModified 列表追加）→ emit 事件（**From=user 不推完成事件**；MsgRequest/MsgEscalate 推 `peer_ask`，其余 `sub_agent_done`）→ `memory.Write(sub_agent_summary)`。
+- `drainMailbox`（1967-2007）：`mailbox.Drain(a.name)` 取全部未读 → 每条转 `ReactMessage{Role:"user", Content:"[mailbox from X] ..."}`（mailboxMessageToReact，1934-1962：MsgEscalate 加 [升级] 前缀、Payload JSON 追加、FilesModified 列表追加）→ emit 事件（**From=user / From=system 不推完成事件**（system=依赖就绪等通知，正文照常入史）；MsgRequest/MsgEscalate 推 `peer_ask`；`MsgMilestone` 或 subject 前缀「里程碑:」的 info 推 `milestone`（中途播报非完成，2026-09-17）；其余 `sub_agent_done`）→ `memory.Write(sub_agent_summary)`。
 - drain 时机：主循环顶部（generate 前）、无 tool_calls 分支、工具结果全部入史后、waitForChildren 循环内。**不能在 tool_calls 与 tool 结果之间注入**（配对 400）。
 - `waitForChildren`（1639-1662）：`PendingChildren>0` 时每 30s `WaitForAnyChild` + drain；drain 到新消息或 ctx 取消即返回；`HasPausedChild` 时返回 paused=true。
 

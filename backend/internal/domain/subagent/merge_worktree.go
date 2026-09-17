@@ -6,7 +6,8 @@ package subagent
 //   - action=review：返回该 worktree 的全量 diff（patch 未产出时读副本实时 diff），
 //     超长截断（防 meta 上下文被大 patch 撑爆，完整 patch 落盘路径随附可 ReadFile）；
 //   - action=merge：走合并门（base 漂移检测 → 契约静态检查 → git apply --check →
-//     apply → 清理副本与分支），任何一步失败主仓库保持原样；
+//     apply → 清理副本与分支；漂移时改走 git apply --3way 回退链，真冲突才拒绝），
+//     任何一步失败主仓库保持原样；
 //   - action=reject：驳回交付，comments 经 mailbox 回该域（热驻槽续改，销毁则提示重派）。
 //
 // 白名单仅 meta：roles.yaml meta_agent.tools 与 domain/role/registry.go meta 表各加一项
@@ -40,9 +41,9 @@ func (t *mergeWorktreeTool) Description() string {
 	return "worktree 隔离派发（call_sub_agent worktree=true）的交付审查与合并门。" +
 		"参数 agent_id 为派发时返回的 sub_agent_id；action=review 返回该副本的全量 diff" +
 		"（超长截断，完整 patch 路径随附）；action=merge 执行合并门：base 漂移检测" +
-		"（他域已合入则拒绝，需人工 rebase 或重派）→ 跨域契约静态检查 → patch 应用，" +
-		"失败时主仓库保持原样；action=reject 驳回交付，comments 修改意见经邮箱回该域" +
-		"（热驻槽续改后重新提交；实例已销毁则需携带意见重派）。" +
+		"（他域已合入则自动三方合并，仅真冲突才拒绝并需人工 rebase 或重派）→ 跨域契约" +
+		"静态检查 → patch 应用，失败时主仓库保持原样；action=reject 驳回交付，comments" +
+		"修改意见经邮箱回该域（热驻槽续改后重新提交；实例已销毁则需携带意见重派）。" +
 		"合并前必须先 review 全量 diff，确认质量与无越界改动后再 merge。"
 }
 

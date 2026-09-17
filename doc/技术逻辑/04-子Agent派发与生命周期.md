@@ -270,7 +270,8 @@
 
 ## 4.17 聚合模式与批间校验
 
-- `map_sub_agents`（map_dispatch.go）：N 项经 `dispatchOpts.aggregate` 登记，完成不直发父邮箱而记入聚合器，全部收口后汇一条；notify 未触达路径有兜底收口（防聚合器永久悬挂）。
+- `map_sub_agents`（map_dispatch.go）：N 项经 `dispatchOpts.aggregate` 登记，完成不直发父邮箱而记入聚合器，全部收口后汇一条；notify 未触达路径有兜底收口（防聚合器永久悬挂）。聚合器带 `abandon(flush)` 放弃语义：放弃后已收口与后续到达的项改经 flush 逐条直发（onDone 永不触发），防消息因放弃而丢失。
+- `call_sub_agents` 波聚合（2026-09-17，C-3a）：同波 domain 项 ≥2 且 `agent.batch_digest_enabled`（默认 true）时整波聚合（batchID=`<parentID>/wave-<seq>`）；全部完成经 `deliverWaveDigest` 汇一条【整合纪要】（`SummaryMerger` 轻量模型按领域归并/冲突单列，失败回退逐领域拼接）经 notify 单条送达父邮箱；成功 domain <2 时 `abandon` 回退逐条直发；拒派项在 okDomains≥2 时事后补记（防全败波中途触发纪要）。台账 Files 经 `LastEntryByChild` 取。
 - 跨域契约检查（`maybeRunContractChecks`，513-595）：父下全部兄弟完成（count 归零）且 spec 缓存含非空契约时触发；**变更屏障**（recMtimesMatch，文件已变则跳过该份）；违例按文件归属批量打回；**指纹去重**（`violationFingerprint` = parent+file+detail）：已推过未修复的收敛为"已知违例仍未修复（首次报告于 HH:MM）"升级提示。
 
 ## 4.18 隐含约定与坑
@@ -283,6 +284,7 @@
 6. `Context.Background()` 派生语义 + stopCtx 继承，是本文件最容易误判的两条 ctx 规则。
 7. 墙钟值藏在多处（wallClock / domainReconClock / timeout / slot timer），报文案必须用 `effectiveTimeout(subAgentID)`。
 8. spec 失效（Layer 2）由工具侧删除时**写墓碑值**留痕，不是简单 delete。
+9. **`git apply --check --3way` 不模拟三方合并冲突**（2026-09-17 实证：预检放行后真 apply 把冲突标记写进主仓工作区）——三方合并预检必须在临时索引上跑（`GIT_INDEX_FILE` + `--3way --cached`）。
 
 ---
 
@@ -346,7 +348,7 @@ dispatchHotDomain 建槽 → slotRunning ──DONE/软停──→ slotIdle ─
 - **建**（`createWorktreeForDispatch`）：git 仓库校验 → 名字 `session-domain-unix` 净化 → 路径 `<repoRoot>/.bma/worktrees/<name>` + 分支 `bma/<name>` → `git worktree add`（失败 prune+RemoveAll）→ 记 BaseCommit → 句柄登记。子 Agent workDir 切副本（**主目录零写入**）。
 - **交付**：`git add -A` + `git diff --cached <base>` → patch 落 `<副本>.patch` + stat → 成功摘要追加【worktree 交付】附言。
 - **review**：句柄 Removed 报错；未产出 patch 时读副本实时 diff；工具层截断 20000 runes。
-- **合并门 `mergeWorktree`**：幂等 → **base 漂移检测**（主仓 HEAD ≠ BaseCommit → 拒，提示人工 rebase 或重派）→ 补产 patch → **契约静态检查**（只跑"契约文件 ∩ patch 变更清单"非空的记录）→ `git apply --check` → `git apply` → 移除副本 → Merged=true。
+- **合并门 `mergeWorktree`**：幂等 → **base 漂移检测**（主仓 HEAD ≠ BaseCommit → **3way 回退链**，2026-09-17 P1-5）→ 补产 patch → **契约静态检查**（只跑"契约文件 ∩ patch 变更清单"非空的记录）→ 未漂移 `git apply --check` + `git apply`；漂移 `git apply --3way`（预检在**临时索引**上跑：`GIT_INDEX_FILE` 指向主索引副本 + `--3way --cached`，冲突只落废弃副本）→ 移除副本 → Merged=true。真冲突才拒绝并保留副本提示人工 rebase/重派。
 - **驳回**：comments 经 mailbox 回该域；槽存活 pokeParent；副本 patch 保留。
 - 约束：与 reuse_agent_id 互斥、与热驻 domain 互斥；git 缺失/非仓库**明确拒绝不降级**。
 
@@ -387,8 +389,8 @@ dispatchHotDomain 建槽 → slotRunning ──DONE/软停──→ slotIdle ─
 
 ## 4.29 计划确认与执行计划（plan_confirm.go / plan.go）
 
-- `submit_plan`：未启用（planState nil）**直通**；顶层 → ask_user（approve/revise，超时/未答复 **fail-open 视为批准**）；子 Agent → mailbox MsgRequest（ThreadID=planID、Priority 10、30s PingActivity 保活、10min 超时 fail-open、ctx.Done 报错）→ 父 `review_plan`（caller 必须等于 waiter.parentID；reject 必带 feedback）。驳回次数超 maxRevisions → 升级仲裁。
-- `write_plan`：校验（id 空/重复/依赖未知/环检测）；`check_dep_gate` 仅对 domain 生效；`board_update` 终态回写（Unverified→MarkUnverified、其他→MarkFailed）；`boardAssign` 派发即 in_progress（跳过 Done）。
+- `submit_plan`：未启用（planState nil）**直通**；顶层 → ask_user（approve/revise，超时/未答复 **fail-open 视为批准**）；子 Agent → mailbox MsgRequest（ThreadID=planID、Priority 10、30s PingActivity 保活、10min 超时 fail-open、ctx.Done 报错）→ 父 `review_plan`（caller 必须等于 waiter.parentID；reject 必带 feedback）。驳回次数超 maxRevisions → 升级仲裁。**死信修复（2026-09-17）**：审批请求投递后经 dispatcher `sessionWakeFn`（bootstrap 接线 `WakeSuspended`）唤醒挂起的父会话——`pokeParent` 只够 waitForChildren 轮询、够不到 SuspendOnChildWait 挂起的顶层会话（此前每子白等 600s fail-open）。
+- `write_plan`：校验（id 空/重复/依赖未知/环检测）；`check_dep_gate` 仅对 domain 生效；`board_update` 终态回写（Unverified→MarkUnverified、其他→MarkFailed）；`boardAssign` 派发即 in_progress（跳过 Done）。**依赖门就绪通知（2026-09-17，P1-4 轻量版）**：拒派登记 `depWaiters`（键 parentID+domain）；boardUpdate 后 `notifyDepWaiters` 对前置全 done 的 waiter 投 From=system 的 MsgInfo（「依赖就绪…会自动通知」）+ 唤醒挂起父；**不自动派发**（用户拍板）。
 
 ## 4.30 map_sub_agents（map_dispatch.go）
 
@@ -411,3 +413,5 @@ worker 池 6 并发 `dispatchOne`；单项上限：默认角色 6 / **scout 32**
 **事件与观测**：drainMailbox 对 `MsgRequest`/`MsgEscalate` 推 `LiveEventPeerAsk`（与 sub_agent_done 区分——"需要我回答"而非"某子 Agent 完成"）→ 会话层落 Message 事件 `kind=peer_ask` + 正文 llm_result 详情；前端 `kindLabel/kindPhrase` 映射（"跨Agent询问"/"收到其他 Agent 的询问"）。mailbox 留痕异步双写 `agent_events`（type=mailbox）；编排页单 Agent 消息接口含 `mails` 留痕。
 
 **机器通道同款**：plan_confirm 的 `submit_plan`/`review_plan` 机器问答走同一条邮箱 request/reply（ThreadID=planID、Priority 10、30s PingActivity 保活、10min 超时 fail-open）——这是此前唯一的 request/reply 系统消费者。**A2A 协议（AgentCard/JSON-RPC）未做**（决策：无跨团队接入需求前不引入）。
+
+**唤醒语义（2026-09-17）**：request/escalate 成功投递给**挂起（awaiting_child）的顶层会话**时经 `wakeSuspendedParent` 唤醒续跑 drain（挂起会话不 drain 邮箱，不唤醒=死信）；**info 不唤醒**（中间信息不值得烧上级一轮）。里程碑播报（domain 提示词纪律：`message_type=info, subject="里程碑: …"`，每任务 ≤3 条）走 info 通道，drainMailbox 单列 `LiveEventMilestone`（kind=milestone，中途播报非完成），前端已映射中文标签。

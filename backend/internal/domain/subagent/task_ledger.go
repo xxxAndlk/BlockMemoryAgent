@@ -132,6 +132,22 @@ func (l *TaskLedger) RecordDispatch(sessionID, parentID, childID, domain, brief,
 	})
 }
 
+// LastEntryByChild 返回该子 Agent 最新台账条目副本（整合纪要合成取 Files 用）。
+func (l *TaskLedger) LastEntryByChild(sessionID, childID string) (ledgerEntry, bool) {
+	if l == nil || sessionID == "" || childID == "" {
+		return ledgerEntry{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entries := l.bySess[sessionID]
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].ChildID == childID {
+			return *entries[i], true
+		}
+	}
+	return ledgerEntry{}, false
+}
+
 // RecordTerminal 登记终态（notify 咽喉点调用）：按失败机读标记区分 失败/未验证/完成，
 // 记录终态摘要与修改文件。匹配该 childID 最后一条进行中条目就地收口；找不到
 //（条目被容量淘汰或台账晚于派发启用）则补记一条终态记录。过滤规则同 RecordDispatch。

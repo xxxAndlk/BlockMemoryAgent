@@ -238,6 +238,13 @@ type Dispatcher struct {
 	// planState 计划确认会话级状态（等待者注册表 + 驳回计数），NewDispatcher 初始化。
 	planState *planConfirmState
 
+	// depWaiters 依赖门就绪通知登记（TODO #22 依赖门排队化轻量版）：checkDepGate
+	// 拒派时登记（键 parentID+"\x00"+domain，同键覆盖幂等），boardUpdate 终态回写
+	// 后扫描该父的 waiter——依赖已全 done 则删登记 + 邮箱通知「可派发」+ 唤醒
+	// 挂起会话（只通知不自动派发）。失败依赖不算了结（DependsDone 只认 done），
+	// waiter 小结构静默留存无害（会话结束自然失效）。
+	depWaiters sync.Map
+
 	// maxTotalDispatches 全局派发总数上限：同一 session 内所有角色的派发合计超过该值时
 	// 拒绝进一步派发，防止编排失控。<=0 表示不限制。计数随用户新消息重置。
 	maxTotalDispatches int
@@ -292,6 +299,24 @@ type Dispatcher struct {
 	// trackChildDone 每次递减后异步触发（含失败/被杀/收口路径），接收方按会话态过滤
 	// 幂等空转。由 bootstrap 接线到 ReactService.WakeOnChildDone；nil 时跳过。
 	childDoneFn func(parentID string)
+
+	// sessionWakeFn 挂起会话唤醒回调（邮箱请求死信修复）：上级会话处于
+	// awaiting_child 挂起时不会 drain 邮箱，submit_plan 审批请求与 send_message
+	// request/escalate 直问会滞留到超时白付延迟。Send 成功后经它唤醒挂起上级
+	//（翻态 + resumeSession，wakeInput 提示查收邮箱）；目标非顶层会话（ID 含
+	// "/"，getSession 不可达）接收方自然空转——子 Agent 间请求走
+	// waitForChildren/pokeParent 既有路径。由 bootstrap 接线到
+	// ReactService.WakeSuspended；nil 时跳过。
+	sessionWakeFn func(parentID, hint string) bool
+
+	// summaryMerger 整合纪要合成器（call_sub_agents 波聚合，C-3a）：同波各领域
+	// 回传合成一条紧凑纪要（轻量 LLM 归并）。nil 时回退逐行拼接（fail-open）。
+	// 由 bootstrap 注入（digest_merger.go）；测试可注入 stub。
+	summaryMerger SummaryMerger
+	// batchDigestEnabled call_sub_agents 波聚合开关（config agent.batch_digest_enabled，
+	// 默认 true）：false 时退回逐条回传（逃生舱）。零值 false 会让测试环境意外
+	// 静默——NewDispatcher 显式置 true，bootstrap 按配置覆盖。
+	batchDigestEnabled bool
 
 	// treeFn 按 sessionID 取得权威 Agent 树（lazy init）。
 	// 派发前 Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
@@ -1255,6 +1280,7 @@ func NewDispatcher(
 		softStops:         make(map[string]bool),
 		pauseRequests:     make(map[string]bool),
 		planState:         newPlanConfirmState(),
+		batchDigestEnabled: true, // call_sub_agents 波聚合默认开（config agent.batch_digest_enabled 可关）
 	}
 }
 
@@ -1638,6 +1664,120 @@ func (d *Dispatcher) WithChildDoneNotify(fn func(parentID string)) *Dispatcher {
 	return d
 }
 
+// WithSessionWake 注入挂起会话唤醒回调（邮箱请求死信修复）：submit_plan 审批请求
+// 与 send_message request/escalate Send 成功后调用 fn(parentID, hint)，唤醒
+// awaiting_child 挂起的上级会话续跑 drain 邮箱（返回是否完成翻态，调用方不消费）。
+// 由 bootstrap 接线到 ReactService.WakeSuspended；nil 时跳过。
+func (d *Dispatcher) WithSessionWake(fn func(parentID, hint string) bool) *Dispatcher {
+	d.sessionWakeFn = fn
+	return d
+}
+
+// WithSummaryMerger 注入整合纪要合成器（call_sub_agents 波聚合，C-3a）：
+// 同波各领域回传经 Merge 合成一条紧凑纪要单条送达父邮箱。nil 时回退逐行拼接。
+func (d *Dispatcher) WithSummaryMerger(m SummaryMerger) *Dispatcher {
+	d.summaryMerger = m
+	return d
+}
+
+// WithBatchDigest 开关 call_sub_agents 波聚合整合纪要（config agent.batch_digest_enabled
+// 逃生舱）：false 时退回逐条回传。
+func (d *Dispatcher) WithBatchDigest(enabled bool) *Dispatcher {
+	d.batchDigestEnabled = enabled
+	return d
+}
+
+// SummaryMerger 整合纪要合成器（call_sub_agents 波聚合消费）：把同波各领域回传
+// 合成一条紧凑纪要（按领域归并事实、冲突点单列、保留文件清单与验证状态）。
+// Merge 失败或未注入时调用方回退逐行拼接（fail-open）。
+type SummaryMerger interface {
+	Merge(ctx context.Context, goal string, entries []DigestEntry) (string, error)
+}
+
+// DigestEntry 波聚合中单个领域的回传项（Files 取自任务台账，不进 mapAggregation）。
+type DigestEntry struct {
+	Domain  string
+	Summary string
+	OK      bool
+	Files   []string
+}
+
+// digestMergeTimeout 整合纪要合成（轻量 LLM）的单次超时；超时回退逐行拼接。
+const digestMergeTimeout = 2 * time.Minute
+
+// deliverWaveDigest 整合纪要单条送达父邮箱：优先注入的 SummaryMerger 归并，
+// 失败/未注入回退逐行拼接（fail-open）。经 notify 咽喉走台账 + >4000 runes 落盘收口。
+func (d *Dispatcher) deliverWaveDigest(batchID, parentID, goal string, entries []DigestEntry) {
+	text := ""
+	if d.summaryMerger != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), digestMergeTimeout)
+		merged, err := d.summaryMerger.Merge(ctx, goal, entries)
+		cancel()
+		if err != nil {
+			log.Printf("[subagent] wave digest merge failed (fallback concat): batch=%s err=%v", batchID, err)
+		} else {
+			text = merged
+		}
+	}
+	if strings.TrimSpace(text) == "" {
+		var b strings.Builder
+		okCount := 0
+		for _, e := range entries {
+			status := "失败"
+			if e.OK {
+				status = "完成"
+				okCount++
+			}
+			b.WriteString(fmt.Sprintf("【%s】[%s] %s\n", e.Domain, status, truncateRunes(firstLine(e.Summary), 300)))
+			if len(e.Files) > 0 {
+				b.WriteString("  文件: " + strings.Join(e.Files, ", ") + "\n")
+			}
+		}
+		b.WriteString(fmt.Sprintf("\n共 %d 个领域：完成 %d / 失败 %d。全文见任务台账或各子 Agent 回传。", len(entries), okCount, len(entries)-okCount))
+		text = b.String()
+	}
+	d.notify(parentID, batchID, "【整合纪要】\n"+text, nil)
+}
+
+// deliverAbandonedWaveItem 波聚合放弃后的单项直发（成功派出 domain <2 回退旧
+// 逐条回传行为）：不经 notify（其台账登记与聚合拦截已在原路径完成），只投邮箱。
+func (d *Dispatcher) deliverAbandonedWaveItem(parentID, domain, summary string) {
+	if d.mailbox == nil {
+		return
+	}
+	_, _ = d.mailbox.Send(&mailbox.Message{
+		From:    domain,
+		To:      parentID,
+		Type:    mailbox.MsgInfo,
+		Subject: "子 Agent 完成: " + domain,
+		Body:    d.returnBodyFor(domain, summary),
+	})
+}
+
+// returnBodyFor 回传正文收口：超阈值全文落盘，邮箱只留摘要头 + 全文路径；
+// 落盘失败降级原样发送（notify 是 best-effort，不因收口失败丢消息）。
+func (d *Dispatcher) returnBodyFor(subAgentID, summary string) string {
+	if runeLen(summary) <= mailboxReturnDumpRunes {
+		return summary
+	}
+	path, dumpErr := d.dumpReturnToDisk(subAgentID, summary)
+	if dumpErr != nil {
+		log.Printf("[subagent] return dump failed (degrade to full body): sub=%s err=%v", subAgentID, dumpErr)
+		return summary
+	}
+	log.Printf("[subagent] return dumped: sub=%s path=%s total=%d runes", subAgentID, path, runeLen(summary))
+	return truncateRunes(summary, mailboxReturnDigestRunes) + "\n\n【全文已落盘】" + path
+}
+
+// wakeSuspendedParent 唤醒挂起中的上级会话（nil 安全，幂等）：仅目标为顶层会话且
+// 处于 awaiting_child 时生效，其余自然空转。
+func (d *Dispatcher) wakeSuspendedParent(parentID, hint string) {
+	if d.sessionWakeFn == nil || parentID == "" {
+		return
+	}
+	d.sessionWakeFn(parentID, hint)
+}
+
 // WithTree 注入权威 Agent 树访问器。
 // fn 按 sessionID 返回 *orchestrator.Tree（lazy init），供 Dispatcher 在派发时
 // Register 节点 + SetCancel 绑定 cancel func，完成时 Finish。
@@ -1857,6 +1997,19 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 	if err != nil {
 		// 死信可见（TODO #23）：目标已销毁时告知发送方，不再静默消失。
 		return &tool.Result{Tool: "send_message", Error: fmt.Sprintf("消息未送达: %v", err)}
+	}
+
+	// 请求/升级类消息到达挂起（awaiting_child）的顶层会话时唤醒续跑：挂起会话
+	// 不 drain 邮箱，不唤醒要等子完成或用户发消息才看到（死信）。info 单向通知
+	// 不唤醒——不值得为中间信息烧上级一轮。
+	if msgType == mailbox.MsgRequest || msgType == mailbox.MsgEscalate {
+		if toID != fromID {
+			hint := "【系统】有 Agent 发来询问（request），请查收邮箱并当轮答复。"
+			if msgType == mailbox.MsgEscalate {
+				hint = "【系统】有 Agent 发来升级请求（escalate），请查收邮箱处置。"
+			}
+			d.wakeSuspendedParent(toID, hint)
+		}
 	}
 
 	return &tool.Result{
@@ -2633,7 +2786,8 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// 无计划（board nil/领域未覆盖）零行为变化；拒绝不烧派发配额。
 	if roleID == "domain" {
 		if gate := d.checkDepGate(ctx, parentID, domain); gate != "" {
-			return "", &tool.Result{Error: gate, Category: tool.ResultCategoryValidationRejected}
+			d.registerDepWaiter(parentID, domain, gate)
+			return "", &tool.Result{Error: gate + "；依赖完成时会自动通知你，勿重复尝试派发", Category: tool.ResultCategoryValidationRejected}
 		}
 		// 同父同名活跃 domain 查重（跨调用）：call_sub_agents 的批内查重拦不住同一轮
 		// 多次 call_sub_agent 单派同名 domain（实证 parallel-independent 任务 Meta 同轮
@@ -3168,12 +3322,72 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		}
 	}
 
-	var okIDs, errs []string
+	// 波聚合整合纪要（C-3a）：domain 项 ≥2 时整波聚合——各领域完成回传汇成一条
+	// 【整合纪要】经 notify 单条送达父邮箱（中间完成不逐条打扰父，配合智能唤醒
+	// N 子完成从 N 次唤醒轮降为 1 轮消化）。单项/全拒/开关关闭不聚合（行为不变）。
+	domainCount := 0
 	for _, it := range items {
-		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint, it.skillsHint, it.wallClock, it.reuseAgentID, it.takeover)
+		if it.roleID == "domain" {
+			domainCount++
+		}
+	}
+	var waveAgg *mapAggregation
+	batchID := ""
+	domainToSub := &sync.Map{} // 领域名 → subAgentID（纪要合成时从台账取文件清单；并发安全：onDone 在子 Agent goroutine 读）
+	if d.batchDigestEnabled && domainCount >= 2 {
+		waveAgg = &mapAggregation{total: domainCount}
+		batchID = fmt.Sprintf("%s/wave-%d", parentID, d.seq.Add(1))
+		sid := tool.SessionIDFromContext(ctx)
+		goal := ""
+		if b := d.boardFor(parentID); b != nil {
+			goal = b.Snapshot().Goal
+		}
+		waveAgg.onDone = func(results []mapAggItemResult) {
+			entries := make([]DigestEntry, 0, len(results))
+			for _, r := range results {
+				e := DigestEntry{Domain: r.Item, Summary: r.Summary, OK: r.OK}
+				if subID, ok := domainToSub.Load(r.Item); ok {
+					if le, ok := d.ledger.LastEntryByChild(sid, subID.(string)); ok {
+						e.Files = le.Files
+					}
+				}
+				entries = append(entries, e)
+			}
+			d.deliverWaveDigest(batchID, parentID, goal, entries)
+		}
+	}
+
+	type waveReject struct {
+		idx    int
+		domain string
+		reason string
+	}
+	var okIDs, errs []string
+	var rejects []waveReject
+	domainIdx := 0
+	okDomains := 0
+	for _, it := range items {
+		isDomain := it.roleID == "domain"
+		idx := -1
+		var callOpts []*dispatchOpts
+		if isDomain {
+			idx = domainIdx
+			domainIdx++
+			if waveAgg != nil {
+				callOpts = append(callOpts, &dispatchOpts{aggregate: waveAgg, aggItem: strings.TrimSpace(it.domain), aggIdx: idx})
+			}
+		}
+		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint, it.skillsHint, it.wallClock, it.reuseAgentID, it.takeover, callOpts...)
 		if errRes != nil {
 			errs = append(errs, fmt.Sprintf("%s(%s): %s", it.roleID, it.domain, errRes.Error))
+			if isDomain && waveAgg != nil {
+				rejects = append(rejects, waveReject{idx: idx, domain: strings.TrimSpace(it.domain), reason: errRes.Error})
+			}
 			continue
+		}
+		if isDomain && waveAgg != nil {
+			okDomains++
+			domainToSub.Store(strings.TrimSpace(it.domain), subAgentID)
 		}
 		id := subAgentID
 		if it.takeover != "" && it.takeover != strings.TrimSpace(it.domain) {
@@ -3181,7 +3395,24 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		}
 		okIDs = append(okIDs, id)
 	}
+	if waveAgg != nil {
+		if okDomains >= 2 {
+			// 整波聚合成立：拒派项事后补记（ok=false），聚合器收口齐后发整合纪要。
+			for _, r := range rejects {
+				waveAgg.record(r.idx, r.domain, "派发失败："+r.reason, false)
+			}
+		} else {
+			// 成功 domain <2：放弃聚合回退逐条直发（拒绝项错误已在 Output 汇总）。
+			// abandon 后已登记项的 notify 拦截仍在，record 改走 flush 直发，防丢消息。
+			waveAgg.abandon(func(idx int, item, summary string, ok bool) {
+				d.deliverAbandonedWaveItem(parentID, item, summary)
+			})
+		}
+	}
 	out := fmt.Sprintf("已并行派出 %d 个子 Agent：%s", len(okIDs), strings.Join(okIDs, ", "))
+	if waveAgg != nil && okDomains >= 2 {
+		out += fmt.Sprintf("；本波 %d 个领域完成后将汇总为一条【整合纪要】经邮箱送达，一次消化即可", okDomains)
+	}
 	if len(errs) > 0 {
 		out += fmt.Sprintf("\n未派出 %d 个：%s", len(errs), strings.Join(errs, "；"))
 	}
@@ -5433,18 +5664,8 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 		return
 	}
 	// mailbox 收口（TODO 第七项④）：超阈值回传全文落盘，邮箱只留摘要头 + 全文路径。
-	// 防 4K+ 大回传整段灌进父上下文（父 MetaAgent context 最贵）；
-	// 落盘失败降级原样发送（notify 是 best-effort，不因收口失败丢消息）。
-	body := summary
-	if runeLen(summary) > mailboxReturnDumpRunes {
-		path, dumpErr := d.dumpReturnToDisk(subAgentID, summary)
-		if dumpErr != nil {
-			log.Printf("[subagent] return dump failed (degrade to full body): sub=%s err=%v", subAgentID, dumpErr)
-		} else {
-			body = truncateRunes(summary, mailboxReturnDigestRunes) + "\n\n【全文已落盘】" + path
-			log.Printf("[subagent] return dumped: sub=%s path=%s total=%d runes", subAgentID, path, runeLen(summary))
-		}
-	}
+	// 防 4K+ 大回传整段灌进父上下文（父 MetaAgent context 最贵）。
+	body := d.returnBodyFor(subAgentID, summary)
 	// 构造并发送消息：发件人为子 Agent，收件人为父 Agent，主题为子 Agent 完成提示，正文为摘要。
 	// 死信错误（父已销毁）仅记日志：notify 是 best-effort 通知，不阻塞失败主流程。
 	if _, err := d.mailbox.Send(&mailbox.Message{

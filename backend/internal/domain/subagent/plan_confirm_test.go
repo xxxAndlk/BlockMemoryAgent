@@ -331,6 +331,35 @@ func TestSubmitPlanTopLevelUsesAskUser(t *testing.T) {
 	}
 }
 
+// TestSubmitPlanWakesSuspendedParent 下级提交计划时应触发挂起父会话唤醒回调
+//（sessionWakeFn）：父挂起（awaiting_child）不 drain 邮箱，不唤醒则审批请求
+// 滞留满超时才 fail-open（死信纯付延迟）。
+func TestSubmitPlanWakesSuspendedParent(t *testing.T) {
+	d, toolsReg, _ := newPlanConfirmEnv(t)
+	d.WithPlanConfirmation(true, 80*time.Millisecond, 3)
+	type wakeCall struct{ parentID, hint string }
+	wake := make(chan wakeCall, 1)
+	d.WithSessionWake(func(parentID, hint string) bool {
+		wake <- wakeCall{parentID, hint}
+		return true
+	})
+	go func() {
+		ctx := agent.WithAgentID(context.Background(), "session-1/domain-7")
+		_, _ = toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
+	}()
+	select {
+	case c := <-wake:
+		if c.parentID != "session-1" {
+			t.Fatalf("wake parent=%q, want session-1", c.parentID)
+		}
+		if !strings.Contains(c.hint, "review_plan") {
+			t.Fatalf("wake hint should mention review_plan: %s", c.hint)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("sessionWakeFn not invoked on submit_plan to parent")
+	}
+}
+
 // TestReviewPlanValidations review_plan 的校验拒绝分支：非法 verdict、驳回缺 feedback、
 // 未知 plan_id、非上级调用。
 func TestReviewPlanValidations(t *testing.T) {

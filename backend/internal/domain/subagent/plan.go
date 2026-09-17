@@ -9,10 +9,13 @@ package subagent
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
+	"time"
 
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
+	"github.com/blockmemory/agent/backend/internal/mailbox"
 )
 
 // writePlanTool 实现 write_plan 工具：写入/覆盖会话级执行计划。
@@ -175,6 +178,78 @@ func tskTitle(snap board.Snapshot, id string) string {
 	return id
 }
 
+// depWaiter 一次依赖门拒派的就绪通知登记（轻量排队：只通知不自动派发）。
+type depWaiter struct {
+	parentID string    // 被拒派的父 Agent（通知目标）
+	domain   string    // 被拒派的领域
+	reason   string    // 拒派原因原文（含未完成依赖清单，诊断用）
+	at       time.Time // 登记时间
+}
+
+// registerDepWaiter 登记一次依赖门拒派（同父同域覆盖，幂等）：依赖就绪时经
+// notifyDepWaiters 发邮箱通知 + 唤醒挂起会话，替代上级反复烧轮次重试派发。
+func (d *Dispatcher) registerDepWaiter(parentID, domain, reason string) {
+	if parentID == "" || domain == "" {
+		return
+	}
+	d.depWaiters.Store(parentID+"\x00"+domain, &depWaiter{
+		parentID: parentID,
+		domain:   domain,
+		reason:   reason,
+		at:       time.Now(),
+	})
+}
+
+// notifyDepWaiters 依赖就绪通知：某父名下领域任务终态回写后扫描其 waiter——
+// waiter 领域的计划任务依赖已全 done 时，删登记并发邮箱 MsgInfo（From=system，
+// drainMailbox 对 From=system 不推活动事件）+ 唤醒挂起（awaiting_child）会话。
+// 失败依赖不算了结（DependsDone 只认 done，计划任务失败本就该人工介入），
+// 未就绪 waiter 留存待下次回写再查。
+func (d *Dispatcher) notifyDepWaiters(ctx context.Context, parentID string) {
+	if parentID == "" || d.mailbox == nil || d.boardFn == nil {
+		return
+	}
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" {
+		if i := strings.Index(parentID, "/"); i > 0 {
+			sid = parentID[:i]
+		}
+	}
+	b := d.boardFn(sid)
+	if b == nil {
+		return
+	}
+	d.depWaiters.Range(func(k, v any) bool {
+		w, ok := v.(*depWaiter)
+		if !ok || w.parentID != parentID {
+			return true
+		}
+		taskIDs := b.FindAllByDomain(w.domain)
+		if len(taskIDs) == 0 {
+			return true
+		}
+		for _, id := range taskIDs {
+			if !b.DependsDone(id) {
+				return true // 仍有未完成依赖，留存待下次回写再查
+			}
+		}
+		d.depWaiters.Delete(k)
+		if _, err := d.mailbox.Send(&mailbox.Message{
+			From:    "system",
+			To:      parentID,
+			Type:    mailbox.MsgInfo,
+			Subject: "依赖就绪: " + w.domain,
+			Body: fmt.Sprintf("【依赖就绪】你派发 %s 曾被依赖门拒绝（%s）。其前置任务已全部完成，现在可以派发了。",
+				w.domain, w.reason),
+		}); err != nil {
+			log.Printf("[dep-gate] 就绪通知发送失败: parent=%s domain=%s err=%v", parentID, w.domain, err)
+			return true
+		}
+		d.wakeSuspendedParent(parentID, "【系统】依赖就绪通知已入邮箱：此前被依赖门拒绝的领域现在可以派发，请查收邮箱。")
+		return true
+	})
+}
+
 // boardUpdate 把子 Agent 完成/失败/未验证状态回写计划任务（按 domain 匹配，TODO #22 Phase 1；
 // #60 三态化：status 可为 TaskDone/TaskFailed/TaskUnverified）。
 // 一个领域对应多个子任务时整组联动（FindAllByDomain），否则细粒度计划里
@@ -205,6 +280,8 @@ func (d *Dispatcher) boardUpdate(ctx context.Context, parentID, domain string, s
 			_ = b.MarkFailed(taskID, summary)
 		}
 	}
+	// 依赖门就绪通知：本领域任务终态落定后，查同父 waiter 是否有领域依赖已全就绪。
+	d.notifyDepWaiters(ctx, parentID)
 }
 
 // boardAssign 派发回写（TODO #22 Phase 1 补全）：子 Agent 起步即把匹配 domain 的
