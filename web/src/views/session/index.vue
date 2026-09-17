@@ -33,7 +33,7 @@ import { usePanelRefresh } from '@/composables/usePanelRefresh'
 import { useSessionList } from '@/composables/useSessionList'
 import { useSessionStatus } from '@/composables/useSessionStatus'
 import { useWorkDir } from '@/composables/useWorkDir'
-import { normDir } from '@/utils/dir'
+import { knownWorkDirs as knownWorkDirsOf } from '@/utils/dir'
 import { maybeNotifySessionDone } from '@/utils/notifications'
 import ChatView from './chat/ChatView.vue'
 import MonitorView from './monitor/MonitorView.vue'
@@ -159,13 +159,15 @@ onMounted(async () => {
   // 带 id 时是"打开既有会话"，不写全局——否则只是浏览一次旧会话，就会把新会话默认目录
   // 悄悄改成该会话的目录（会话目录本身以服务端 work_dir 为准，与此无关）。
   const qwd = route.query.work_dir as string
+  // ?new=1 = 侧栏/工作目录页点「新建会话」：要空白新会话，不是恢复上次那个。
+  const isNew = !!route.query.new
   if (qwd && !route.query.id) setWorkDir(qwd)
 
   await loadSessions()
   const id = route.query.id as string
   if (id) {
     await openSession(id)
-  } else {
+  } else if (!isNew) {
     // 无 URL id 时优先恢复上次活跃会话（localStorage），否则打开最近一个
     const last = localStorage.getItem('lastSessionID')
     if (last && sessions.value.some((s) => s.id === last)) {
@@ -180,6 +182,16 @@ watch(() => route.query.id, (id) => {
   if (id && typeof id === 'string' && id !== activeSession.value?.id) {
     openSession(id)
   }
+})
+
+// ?new=1 意图的「路由内」响应：在会话页再点一次「新建会话/在此目录新建会话」时，
+// 同路由只变 query 不重新挂载，onMounted 不会再跑——不补这条 watcher 就是"点了没反应"。
+// 带 id 的导航优先（点会话 = 打开它），只有纯新会话意图才清空。
+watch(() => [route.query.new, route.query.work_dir], () => {
+  if (!route.query.new || route.query.id) return
+  const qwd = route.query.work_dir
+  if (typeof qwd === 'string') setWorkDir(qwd)
+  resetToBlank()
 })
 
 // 断线补播兜底（TODO #16-5 T20）：SSE 流自身带可见期持续重连（api/session.ts），
@@ -452,17 +464,8 @@ const workDirSaving = ref(false)
 const activeWorkDir = computed(() =>
   activeSession.value ? activeSession.value.work_dir || '' : workDir.value,
 )
-/** 最近使用过的目录（跨会话去重，规范化大小写与尾分隔符）：多会话共用同目录的快捷入口。 */
-const recentWorkDirs = computed(() => {
-  const seen = new Map<string, string>()
-  for (const s of sessions.value) {
-    const d = s.work_dir
-    if (!d) continue
-    const key = normDir(d)
-    if (!seen.has(key)) seen.set(key, d)
-  }
-  return [...seen.values()].slice(0, 8)
-})
+/** 已有工作目录（跨会话去重，规范化大小写与尾分隔符）：新建会话时直接挑旧的，不必每次浏览文件系统。 */
+const knownWorkDirs = computed(() => knownWorkDirsOf(sessions.value))
 
 /**
  * 目录变更：有活跃会话 → 保存到该会话（服务端权威值就地回填，SSE 快照随后亦是该值，
@@ -569,7 +572,8 @@ async function handleStop() {
   }
 }
 
-async function handleNewSession() {
+/** 清空一切会话态回到"待创建"（不动路由）：?new=1 入口与页内「新建会话」按钮共用。 */
+function resetToBlank() {
   stream.close()
   panel.stopPanelTimer()
   events.value = []
@@ -579,10 +583,19 @@ async function handleNewSession() {
   metrics.value = null
   tokenMetrics.value = null
   board.value = null
+  sessionLogs.value = []
+  liveStreaming.value = ''
+  liveThinking.value = ''
+  sending.value = false
   clarifyPending.value = null
   clarifyAck.value = false
   clarifyDrafts.value = {}
-  router.replace({ path: '/session' })
+}
+
+function handleNewSession() {
+  resetToBlank()
+  // 落 ?new=1：刷新/分享链接仍是新会话，且与上一条会话的 id 明确区分
+  router.replace({ path: '/session', query: { new: '1' } })
 }
 
 /** 会话列表状态文案：用户主动"终止"的单列"已终止"（后端落 error + Result=cancelled by user），
@@ -698,7 +711,7 @@ function fmtDateTime(iso: string) {
         :session-bound="!!activeSession"
         :work-dir="activeWorkDir"
         :work-dir-saving="workDirSaving"
-        :recent-dirs="recentWorkDirs"
+        :known-dirs="knownWorkDirs"
         @submit="handleSubmit"
         @cancel="handleCancel"
         @stop="handleStop"

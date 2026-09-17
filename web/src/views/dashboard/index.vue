@@ -9,6 +9,7 @@ import { statusDotClass, statusText } from '@/utils/sessionStatus'
 import { fmtDate } from '@/utils/date'
 import { kindIcon, kindTagType } from '@/views/session/chat/utils/eventStyles'
 import { useWorkDir } from '@/composables/useWorkDir'
+import { knownWorkDirs } from '@/utils/dir'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 
 const router = useRouter()
@@ -16,6 +17,8 @@ const goal = ref('')
 const { workDir, setWorkDir } = useWorkDir()
 const searchSession = ref('')
 const sessions = ref<SessionSummary[]>([])
+/** 已有工作目录：新会话目录下拉里直接复用，不必每次浏览文件系统。 */
+const knownDirs = computed(() => knownWorkDirs(sessions.value))
 const loading = ref(false)
 const filter = ref('all')
 const usingMock = ref(false)
@@ -321,7 +324,7 @@ function activityStyle(kind: string) {
               class="w-full bg-page border-none"
               @keydown="onGoalKeydown"
             />
-            <WorkDirPicker v-model="workDir" placeholder="进程默认目录（可更改）" />
+            <WorkDirPicker v-model="workDir" placeholder="进程默认目录（可更改）" :existing="knownDirs" />
           </div>
           <div class="w-48 h-32 flex flex-col items-center justify-center shrink-0 gap-3">
             <svg class="w-28 h-28" viewBox="0 0 140 140" fill="none">

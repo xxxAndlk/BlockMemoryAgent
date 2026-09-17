@@ -1,16 +1,18 @@
 <script setup lang="ts">
-// WorkDirPicker.vue 工作目录选择器：行内只读展示 + 「更改」开弹窗，
-// 弹窗内提供面包屑跳转、最近目录快捷选择、手输路径三种定位方式。
+// WorkDirPicker.vue 工作目录选择器：行内只读展示 + 「选择目录」下拉。
+// 首屏就是"已有工作目录"清单（会话用过的目录，由调用方聚合去重）——多数场景是复用旧目录，
+// 浏览文件系统是备选；弹窗保留面包屑/手输路径/已有目录三种定位方式。
 // 契约仍是 v-model（modelValue/update:modelValue），emit 只在"选定"时发生一次——
 // 此前行内是实时输入框，逐字符 emit，调用方若是"改即保存"会把半截路径写进会话。
 import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { browseFS, pickSystemDir, type BrowseResult } from '@/api/fs'
+import { dirBaseName, sameDir } from '@/utils/dir'
 
 const props = defineProps<{
   modelValue: string
-  /** 最近使用过的目录（多会话共用同目录的快捷入口，由调用方聚合去重） */
-  recent?: string[]
+  /** 已有工作目录（会话用过的目录，多会话共用同目录的快捷入口，由调用方聚合去重） */
+  existing?: string[]
   /** 空值时行内展示的占位文案（如「进程默认目录」） */
   placeholder?: string
 }>()
@@ -129,10 +131,18 @@ function useDefault() {
   open.value = false
 }
 
-/** 快捷选中最近目录：直接选定，不再要求逐级进入。 */
-function pickRecent(d: string) {
+/** 快捷选中已有目录：直接选定，不再要求逐级进入。 */
+function pickExisting(d: string) {
   emit('update:modelValue', d)
   open.value = false
+}
+
+/** 下拉命令：已有目录直接选定；其余三种入口复用旧路径（原生选择器 / 网页版弹窗 / 清空）。 */
+function onCommand(cmd: { kind: string; dir?: string }) {
+  if (cmd.kind === 'dir' && cmd.dir) return pickExisting(cmd.dir)
+  if (cmd.kind === 'browse') return void chooseDir()
+  if (cmd.kind === 'manual') return openDialog()
+  if (cmd.kind === 'default') return useDefault()
 }
 </script>
 
@@ -141,13 +151,33 @@ function pickRecent(d: string) {
     <span class="font-mono text-xs truncate min-w-0 flex-1 text-ink-2"
           :class="hasValue ? '' : 'text-ink-3'"
           :title="modelValue || display">{{ display }}</span>
-    <el-button size="small" type="primary" plain class="shrink-0" :loading="picking" @click="chooseDir">
-      {{ picking ? '选择中…' : '浏览…' }}
-    </el-button>
-    <!-- 手动入口：系统选择器不可用时才会自动弹，这里给个显式入口（手输/最近目录/面包屑） -->
-    <el-button size="small" text class="shrink-0 !text-ink-3" title="手动输入 / 从最近目录选" @click="openDialog">
-      <el-icon><EditPen /></el-icon>
-    </el-button>
+    <!-- 主入口：已有目录下拉（复用旧目录是常态），浏览/手输收在菜单里 -->
+    <el-dropdown trigger="click" class="shrink-0" @command="onCommand">
+      <el-button size="small" type="primary" plain :loading="picking" class="shrink-0">
+        {{ picking ? '选择中…' : '选择目录' }}<el-icon class="ml-1"><ArrowDown /></el-icon>
+      </el-button>
+      <template #dropdown>
+        <el-dropdown-menu class="workdir-menu">
+          <el-dropdown-item v-for="d in existing || []" :key="d"
+                            :command="{ kind: 'dir', dir: d }" :title="d">
+            <span class="dd-item">
+              <el-icon v-if="sameDir(d, modelValue)" class="text-primary shrink-0"><Check /></el-icon>
+              <span class="dd-name" :class="sameDir(d, modelValue) ? 'text-primary font-bold' : ''">{{ dirBaseName(d) }}</span>
+              <span class="dd-path">{{ d }}</span>
+            </span>
+          </el-dropdown-item>
+          <el-dropdown-item :command="{ kind: 'browse' }" :divided="!!existing?.length">
+            <el-icon><FolderOpened /></el-icon>浏览其它目录…
+          </el-dropdown-item>
+          <el-dropdown-item :command="{ kind: 'manual' }">
+            <el-icon><EditPen /></el-icon>手动输入路径…
+          </el-dropdown-item>
+          <el-dropdown-item v-if="hasValue" :command="{ kind: 'default' }">
+            <el-icon><Refresh /></el-icon>使用默认目录
+          </el-dropdown-item>
+        </el-dropdown-menu>
+      </template>
+    </el-dropdown>
 
     <el-dialog v-model="open" title="选择工作目录（网页版）" width="560px" append-to-body>
       <!-- 面包屑：任意祖先层可点击直达 -->
@@ -168,12 +198,12 @@ function pickRecent(d: string) {
         </el-input>
       </div>
 
-      <!-- 最近目录：多会话共用同目录的主路径 -->
-      <div v-if="recent?.length" class="recent">
-        <div class="recent-title">最近使用</div>
+      <!-- 已有工作目录：多会话共用同目录的主路径 -->
+      <div v-if="existing?.length" class="recent">
+        <div class="recent-title">已有工作目录</div>
         <div class="recent-list">
-          <button v-for="d in recent" :key="d" class="recent-item font-mono" :title="d"
-                  @click="pickRecent(d)">{{ d }}</button>
+          <button v-for="d in existing" :key="d" class="recent-item font-mono" :title="d"
+                  @click="pickExisting(d)">{{ d }}</button>
         </div>
       </div>
 
@@ -238,6 +268,27 @@ function pickRecent(d: string) {
   cursor: pointer;
 }
 .recent-item:hover { border-color: var(--el-color-primary); color: var(--el-color-primary); }
+/* 下拉项：目录名 + 灰色全路径（同一目录名的不同盘符要能分辨） */
+.workdir-menu :deep(.el-dropdown-menu__item) {
+  padding: 0;
+}
+.dd-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  max-width: 380px;
+  padding: 5px 12px;
+  min-width: 0;
+}
+.dd-name { flex-shrink: 0; }
+.dd-path {
+  color: var(--el-text-color-placeholder);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .dir-item { padding: 4px 8px; cursor: pointer; border-radius: 4px; }
 .dir-item:hover { background: var(--el-fill-color-light); }
 .dir-item.active { background: var(--el-color-primary-light-8); }

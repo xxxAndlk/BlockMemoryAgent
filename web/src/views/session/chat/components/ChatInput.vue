@@ -23,8 +23,8 @@ const props = defineProps<{
   workDir?: string
   /** 目录保存中（请求在途，按钮转圈） */
   workDirSaving?: boolean
-  /** 最近使用过的目录（选择器快捷区） */
-  recentDirs?: string[]
+  /** 已有工作目录（选择器里可直接复用的旧目录） */
+  knownDirs?: string[]
 }>()
 
 const emit = defineEmits<{
@@ -341,7 +341,7 @@ function onKeydown(e: KeyboardEvent) {
       <div class="flex items-center gap-4 text-xs text-ink-2 flex-1 min-w-0">
         <div class="flex items-center gap-2 min-w-0 max-w-[26rem] workdir-cell">
           <span class="text-ink-2 whitespace-nowrap">{{ workDirLabel }}</span>
-          <WorkDirPicker :model-value="workDir || ''" :recent="recentDirs"
+          <WorkDirPicker :model-value="workDir || ''" :existing="knownDirs"
                          placeholder="进程默认目录"
                          @update:model-value="(d: string) => emit('update-workdir', d)" />
           <el-icon v-if="workDirSaving" class="animate-spin text-ink-3 shrink-0"><Loading /></el-icon>

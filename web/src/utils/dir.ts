@@ -18,3 +18,25 @@ export function normDir(p: string | undefined | null): string {
 export function sameDir(a: string | undefined | null, b: string | undefined | null): boolean {
   return normDir(a) === normDir(b)
 }
+
+/** 目录展示名：取路径末段（列表/下拉里放不下完整路径，完整路径进 title）。 */
+export function dirBaseName(dir: string): string {
+  const parts = dir.split(/[\\/]+/).filter(Boolean)
+  return parts[parts.length - 1] || dir
+}
+
+/**
+ * 从会话列表聚合"已有工作目录"（跨会话去重、保持会话列表的先后即最近使用序）。
+ * 选择目录时优先给用户挑已有目录，而不是每次都去浏览文件系统。
+ */
+export function knownWorkDirs(sessions: { work_dir?: string }[], limit = 0): string[] {
+  const seen = new Map<string, string>()
+  for (const s of sessions) {
+    const d = s.work_dir
+    if (!d) continue
+    const key = normDir(d)
+    if (!seen.has(key)) seen.set(key, d)
+  }
+  const all = [...seen.values()]
+  return limit > 0 ? all.slice(0, limit) : all
+}

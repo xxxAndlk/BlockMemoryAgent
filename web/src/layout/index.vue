@@ -28,10 +28,9 @@
           <el-icon><House /></el-icon>
           <span>首页</span>
         </router-link>
-        <!-- 会话目录树（Codex 式）：按工作目录分组会话，取代原来的「会话 / 工作目录」两个导航项 -->
-        <div class="flex-1 min-h-0 flex flex-col pt-1">
-          <WorkDirTree class="min-h-0 flex-1" />
-        </div>
+        <!-- 会话目录树（Codex 式）：按工作目录分组会话，取代原来的「会话 / 工作目录」两个导航项。
+             自身按展开/收起决定是否 flex-1（收起时不吃剩余高度），故外面不再套弹性容器。 -->
+        <WorkDirTree class="min-h-0" />
 
         <el-menu
           :default-active="route.path"
@@ -51,8 +50,8 @@
           </el-menu-item-group>
         </el-menu>
 
-        <!-- Beta 预留：工作流编排 -->
-        <div class="px-3 pb-3">
+        <!-- Beta 预留：工作流编排（mt-auto：会话树收起时把尾部区块钉在侧栏底部） -->
+        <div class="px-3 pb-3 mt-auto">
           <router-link to="/workflow"
                        class="flex items-center justify-between px-3 py-2.5 rounded-card border border-dashed border-line text-ink-3 hover:text-primary hover:border-primary transition-colors">
             <span class="flex items-center gap-2 text-sm">
@@ -112,8 +111,10 @@ onMounted(loadStatus)
 // /projects、/session 路由仍可用（后者由目录树与首页的跳转进入）。
 const menuGroups = [
   {
+    // 「工作目录」页不只是目录清单：项目偏好、测试助手、目录增删都在这，侧栏树再方便也替代不了
     title: '资源库',
     items: [
+      { path: '/projects', title: '工作目录', icon: 'FolderOpened' },
       { path: '/skills', title: '技能库', icon: 'Connection' },
       { path: '/plugins', title: '插件', icon: 'MagicStick' },
       { path: '/knowledge', title: '知识库', icon: 'Document' },

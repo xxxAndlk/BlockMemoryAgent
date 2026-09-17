@@ -98,10 +98,11 @@ function removeCustomDir(dir: string) {
   if (selected.value === dir) selected.value = DEFAULT_DIR
 }
 
-// 发起新会话：固化工作目录并跳入会话页（容器读取 ?work_dir= 预填）
+// 发起新会话：固化工作目录并跳入会话页（容器读 ?work_dir= 预填；?new=1 让它清空重来，
+// 否则无 id 的入口会被会话页当成"恢复上次会话"，点了像没反应）
 function startSession(dir: string) {
   setWorkDir(dir)
-  router.push({ path: '/session', query: dir ? { work_dir: dir } : {} })
+  router.push({ path: '/session', query: dir ? { work_dir: dir, new: '1' } : { new: '1' } })
 }
 
 function viewSessions(dir: string) {
@@ -192,7 +193,7 @@ function fmtTime(iso: string) {
         <div class="font-bold text-sm mb-1">工作目录</div>
         <p class="text-xs text-ink-2">按目录组织会话与项目偏好；新会话将以此目录作为 Agent 的工作根目录。</p>
         <div class="flex gap-2 mt-3">
-          <div class="flex-1"><WorkDirPicker v-model="newDir" placeholder="选择要添加的目录" /></div>
+          <div class="flex-1"><WorkDirPicker v-model="newDir" placeholder="选择要添加的目录" :existing="groups.map((g) => g.dir).filter(Boolean)" /></div>
           <el-button type="primary" :disabled="!newDir.trim()" @click="addDir">
             <el-icon class="mr-1"><FolderAdd /></el-icon>添加目录
           </el-button>

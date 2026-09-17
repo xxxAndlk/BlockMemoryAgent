@@ -32,8 +32,8 @@ const props = defineProps<{
   workDir?: string
   /** 工作目录保存中（按钮转圈） */
   workDirSaving?: boolean
-  /** 最近使用过的目录（多会话共用同目录的快捷入口） */
-  recentDirs?: string[]
+  /** 已有工作目录（多会话共用同目录的快捷入口） */
+  knownDirs?: string[]
 }>()
 
 const emit = defineEmits<{
@@ -91,7 +91,7 @@ const showStatusLine = computed(() =>
                  :session-bound="sessionBound"
                  :work-dir="workDir || ''"
                  :work-dir-saving="workDirSaving"
-                 :recent-dirs="recentDirs"
+                 :known-dirs="knownDirs"
                  @submit="(c: string, i: WireImage[], g: SessionGear, t: SessionThinking) => emit('submit', c, i, g, t)"
                  @new-session="emit('new-session')"
                  @update-workdir="(d: string) => emit('update-workdir', d)" />
