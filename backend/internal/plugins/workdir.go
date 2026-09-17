@@ -2,7 +2,6 @@ package plugins
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -12,8 +11,10 @@ import (
 // 配置不再钉死绝对路径，支持同机在多个目录多开实例互不串产物。
 const WorkDirPlaceholder = "${WORKDIR}"
 
-// ExpandWorkDir 将 s 中的 ${WORKDIR} 替换为 workDir（Windows 反斜杠统一为正斜杠，
-// docker -v 与容器内 file:// 均接受）；无占位符原样返回。workDir 为空回退 os.Getwd()。
+// ExpandWorkDir 将 s 中的 ${WORKDIR} 替换为 workDir（反斜杠统一为正斜杠，
+// docker -v 与容器内 file:// 均接受；不依赖平台，filepath.ToSlash 在非 Windows 上
+// 原样保留反斜杠，会让同配置在不同平台产出不同的卷映射）；无占位符原样返回。
+// workDir 为空回退 os.Getwd()。
 // 与配置加载期的 ${VAR} 环境变量插值（仅整串 ${...} 形态才展开）互不干扰：
 // "${WORKDIR}/sub:/out" 非整串形态，会原样透传到此处展开。
 func ExpandWorkDir(s, workDir string) string {
@@ -25,5 +26,5 @@ func ExpandWorkDir(s, workDir string) string {
 			workDir = wd
 		}
 	}
-	return strings.ReplaceAll(s, WorkDirPlaceholder, filepath.ToSlash(workDir))
+	return strings.ReplaceAll(s, WorkDirPlaceholder, strings.ReplaceAll(workDir, `\`, "/"))
 }

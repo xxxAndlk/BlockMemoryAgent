@@ -15,7 +15,6 @@ package subagent
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
@@ -140,8 +139,10 @@ func specFilesOfKey(ctx context.Context, store tool.SharedMemoryStore, key strin
 }
 
 // normPathKey 归一化路径比较键：斜杠统一、去 ./ 前缀、lower（Windows 大小写不敏感）。
+// 反斜杠统一不依赖平台：两侧路径来自 spec 文本与写盘记录，可能混用 Windows 形态，
+// 比对要跨平台一致（filepath.ToSlash 在非 Windows 上原样保留反斜杠，会让同一文件判为不同）。
 func normPathKey(p string) string {
-	p = filepath.ToSlash(strings.TrimSpace(p))
+	p = strings.ReplaceAll(strings.TrimSpace(p), `\`, "/")
 	p = strings.TrimPrefix(p, "./")
 	return strings.ToLower(p)
 }
