@@ -26,6 +26,11 @@ type MessagesStore interface {
 	SaveMessages(ctx context.Context, agentID, sessionID string, msgs []ReactMessage) error
 	// LoadMessages 按 seq ASC 加载该 agent 的全部消息历史。无数据返回 nil。
 	LoadMessages(ctx context.Context, agentID string) ([]ReactMessage, error)
+	// DeleteMessages 删除该 agent 的全部消息历史（复活重跑前作废旧 run 的终态快照）。
+	// 读路径在热层不足 limit 时会并 PG 兜底，旧快照会被当成当前对话续上去（对话面板
+	// 显示新内容一瞬间又变回旧的）；而旧快照本就是待覆盖的死数据（终态 SaveMessages
+	// 是 delete-then-insert 全量覆盖），提前作废不丢任何在用状态。
+	DeleteMessages(ctx context.Context, agentID string) error
 }
 
 // PostgresMessagesStore 基于 *sql.DB 实现 MessagesStore,写入 agent_messages 表。
@@ -103,6 +108,16 @@ FROM agent_messages WHERE agent_id=$1 ORDER BY seq ASC`, agentID)
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// DeleteMessages 删除该 agent 的全部消息历史（复活重跑前作废旧 run 的终态快照），
+// 幂等（无行也不报错）。
+func (s *PostgresMessagesStore) DeleteMessages(ctx context.Context, agentID string) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_messages WHERE agent_id=$1`, agentID)
+	return err
 }
 
 // messagesStoreSessionID 从 agentID 派生 sessionID(同 memory.pg_store.sessionIDFromAgentID)。

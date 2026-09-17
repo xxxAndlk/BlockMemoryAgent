@@ -620,6 +620,24 @@ func (m *SessionManager) HandleSessionAgentEvents(c *gin.Context) {
 	c.JSON(http.StatusOK, res.Data)
 }
 
+// HandleSessionMailboxTrace 处理 GET /api/sessions/{id}/mailbox-trace（主对话栏邮件留痕）：
+// 会话内全部 Agent 的 mailbox 往来（一行一封，收发双方重复行已去重），按时间正序。
+// 与 /mailbox（未取走的邮箱队列）语义不同——那个是"待办"，这个是"历史往来"。
+func (m *SessionManager) HandleSessionMailboxTrace(c *gin.Context) {
+	id := c.Param("id")
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	res, err := m.agent.Query(c.Request.Context(), id, agent.Query{
+		Kind: agent.QueryKindMailboxTrace,
+		Args: map[string]any{"limit": limit},
+	})
+	if err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, res.Data)
+}
+
 // HandleSessionAgentMessages 处理 GET /api/sessions/{id}/agents/{aid}/messages（编排页对话视图）。
 // 返回该实例完整消息历史（热层+PG 合并分页）与 mailbox 留痕；aid=meta 映射为会话主 Agent。
 func (m *SessionManager) HandleSessionAgentMessages(c *gin.Context) {

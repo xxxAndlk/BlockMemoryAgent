@@ -70,13 +70,57 @@ func (s *AgentMsgRedisStore) AppendMsg(ctx context.Context, agentID string, e Ag
 	return err
 }
 
-// ClearMsg 清空某 Agent 的热层（复活重跑前调用：新 run 的 seq 从 0 重编号，
+// agentMsgRunKey 生成对话序号 key：sess:{sessionID}:agent:{agentID}:run。
+func agentMsgRunKey(agentID string) string {
+	return fmt.Sprintf("sess:%s:agent:%s:run", sessionFromAgentID(agentID), agentID)
+}
+
+// ClearMsg 清空某 Agent 的热层并递增对话序号（复活重跑前调用：新 run 的 seq 从 0 重编号，
 // 与旧 run 重叠会让对话页增量游标永久失效）。
+// 序号供读侧识别重置：前端存一份，变了就整表重载——只用 seq 比较会在"新 run 已写到比
+// 旧游标更大的 seq"时漏判（竞态窗口 3s 轮询），序号是单调的，不受此影响。
 func (s *AgentMsgRedisStore) ClearMsg(ctx context.Context, agentID string) error {
 	if s == nil || s.client == nil || agentID == "" {
 		return nil
 	}
-	return s.client.Del(ctx, agentMsgKey(agentID)).Err()
+	pipe := s.client.Pipeline()
+	pipe.Del(ctx, agentMsgKey(agentID))
+	pipe.Incr(ctx, agentMsgRunKey(agentID))
+	// 序号 key 比消息活得久（消息 TTL 24h）：TTL 到期后序号不能跟着消失——它一旦归零，
+	// 前端会误判成"又重置了一次"而整表重载（无害但白刷一次），且新旧序号可能撞回同一个值。
+	pipe.Expire(ctx, agentMsgRunKey(agentID), 7*24*time.Hour)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// RunID 取该 Agent 的对话序号（0=从未重置/未接线）。
+func (s *AgentMsgRedisStore) RunID(ctx context.Context, agentID string) int64 {
+	if s == nil || s.client == nil || agentID == "" {
+		return 0
+	}
+	n, err := s.client.Get(ctx, agentMsgRunKey(agentID)).Int64()
+	if err != nil {
+		return 0 // redis.Nil（键不存在）与真错误同处理
+	}
+	return n
+}
+
+// MaxSeq 取热层最大 seq（空/未接线返回 -1）。
+// 对话面板据此识别"编号被重置"：复活重跑会清空热层、新 run 从 0 重编号，前端游标
+// （after_seq=旧最大值）此后永远取不到新消息，必须整表重载而不是继续增量。
+func (s *AgentMsgRedisStore) MaxSeq(ctx context.Context, agentID string) int {
+	if s == nil || s.client == nil || agentID == "" {
+		return -1
+	}
+	raw, err := s.client.LIndex(ctx, agentMsgKey(agentID), -1).Result()
+	if err != nil {
+		return -1 // redis.Nil（空列表）与真错误同处理
+	}
+	var e AgentMsgEntry
+	if json.Unmarshal([]byte(raw), &e) != nil {
+		return -1
+	}
+	return e.Seq
 }
 
 // TailMsg 取热层尾部 limit 条（seq 升序）。

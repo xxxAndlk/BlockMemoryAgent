@@ -9,6 +9,8 @@ import { renderMd } from '@/utils/markdown'
 import { submitClarify } from '../utils/clarifySubmit'
 import ThinkChain from './ThinkChain.vue'
 import ToolActivity from './ToolActivity.vue'
+import PlanCard from './PlanCard.vue'
+import MailBubble from './MailBubble.vue'
 import ArtifactCard from './ArtifactCard.vue'
 import SubAgentList from './SubAgentList.vue'
 
@@ -23,7 +25,20 @@ const props = defineProps<{
   liveThinking: string
   /** 会话内全部 Agent 实例：子 Agent 列表取实时状态（每 3s 轮询刷新） */
   agents?: AgentNode[]
+  /** 本视图"我"的实例 ID（邮件气泡判方向用）：主对话栏 = 会话主 Agent（传 sessionId），
+   *  子 Agent 面板 = 该实例 ID；不传则邮件一律按"来自"渲染 */
+  mailSelfId?: string
 }>()
+
+/** 邮件气泡的实例 ID → 展示名：会话主 Agent（inst_id == sessionId）显示为「主 Agent」，
+ *  子 Agent 查领域名，user/dispatcher 是系统侧来源，其余回退原值。 */
+function agentNameOf(id: string): string {
+  if (!id) return '(未知)'
+  if (id === props.sessionId || id === 'meta') return '主 Agent'
+  if (id === 'user') return '用户'
+  if (id === 'dispatcher') return '调度器'
+  return props.agents?.find((a) => a.inst_id === id)?.name || id
+}
 
 // 澄清提交成功 → 通知父级置 running + 确认条（不再全量重载，任务 140 问题④）
 const emit = defineEmits<{
@@ -348,9 +363,6 @@ async function submitBatch() {
         </span>
       </div>
 
-      <!-- 子 Agent 列表：派了谁、各自干什么、进展如何（一人一行，状态实时） -->
-      <SubAgentList :items="turn.subAgents" :agents="agents || []" :running="turn.status === 'running'" />
-
       <!-- 思考链（全部推理段落，可折叠）+ 工具活动（单行就地替换 / 结束后折叠汇总） -->
       <ThinkChain v-if="thinkEvents.length" :events="thinkEvents" :verbose="verbose" />
 
@@ -363,6 +375,15 @@ async function submitBatch() {
         <div v-if="n.agent && n.agent !== primaryAgent" class="text-[11px] text-ink-3 mb-0.5">{{ n.agent }}</div>
         <div class="md-article" @click="onMdAction" v-html="renderMd(n.message)"></div>
       </div>
+
+      <!-- 计划确认（submit_plan / review_plan）：单列成卡，不随工具活动折叠——提交计划是
+           里程碑（阻塞等审批、决定后续要不要动手），折进「已执行 N 次工具」等于看不见 -->
+      <PlanCard v-for="p in turn.plans" :key="'plan-' + p.id" :plan="p" />
+
+      <!-- Agent 间邮件（mailbox 留痕，按时间归属本回合）：外发此前完全不可见——
+           外发只是一次被折叠的工具调用，「我怎么回上级的」在界面上无从查起（2026-09-17 实证） -->
+      <MailBubble v-for="(m, i) in turn.mails" :key="'mail-' + i + '-' + m.at"
+                  :mail="m" :self-id="mailSelfId" :name-of="agentNameOf" />
 
       <ToolActivity :groups="turn.toolCalls" :running="turn.status === 'running'" :session-id="sessionId" />
 
@@ -584,6 +605,10 @@ async function submitBatch() {
           <span>正在生成回答…</span>
         </div>
       </div>
+
+      <!-- 子 Agent 列表放回合最下方（用户定调 2026-09-17）：它是本轮的"执行单元状态"，
+           压在最前面会把回复正文挤到下面——先看答复、再看谁在跑 -->
+      <SubAgentList :items="turn.subAgents" :agents="agents || []" :running="turn.status === 'running'" />
     </div>
   </div>
 </template>

@@ -16,6 +16,8 @@ import {
   getSessionMailbox,
   getSessionLogs,
   setSessionWorkDir,
+  getSessionMailboxTrace,
+  type AgentMailItem,
   type MailboxMessage,
   type SessionLog,
 } from '@/api/session'
@@ -61,6 +63,9 @@ const agents = ref<AgentNode[]>([])
 const metrics = ref<SessionMetrics | null>(null)
 const tokenMetrics = ref<SessionTokenMetricsResponse | null>(null)
 const mailboxMessages = ref<MailboxMessage[]>([])
+// 会话级邮件留痕（全部 Agent 收发的历史往来）：对话栏里渲染成邮件气泡。
+// 与 mailboxMessages（未取走的邮箱队列 = 待办）语义不同，别混用。
+const mails = ref<AgentMailItem[]>([])
 const health = ref<HealthResponse | null>(null)
 const board = ref<TaskBoardData | null>(null)
 
@@ -249,18 +254,20 @@ async function refreshPanels(id: string) {
   // 共享同一刷新周期 epoch：Promise.allSettled 里多个 run 若各自 ++epoch，
   // 只有最后一个能存活（前四个结果到达时 epoch 已变被丢弃）→ 面板永远空白。
   const ep = panel.cycle()
-  const [agentsRes, boardRes, metricsRes, mbRes, healthRes] = await Promise.allSettled([
+  const [agentsRes, boardRes, metricsRes, mbRes, healthRes, mailsRes] = await Promise.allSettled([
     panel.run(() => getSessionAgents(id), ep),
     panel.run(() => getSessionBoard(id), ep),
     panel.run(() => getSessionMetrics(id), ep),
     panel.run(() => getSessionMailbox(id), ep),
     panel.run(() => getHealth(), ep),
+    panel.run(() => getSessionMailboxTrace(id), ep),
   ])
   agents.value = agentsRes.status === 'fulfilled' && agentsRes.value ? agentsRes.value.agents || [] : []
   board.value = boardRes.status === 'fulfilled' && boardRes.value ? boardRes.value.board || null : null
   metrics.value = metricsRes.status === 'fulfilled' && metricsRes.value ? metricsRes.value : null
   mailboxMessages.value = mbRes.status === 'fulfilled' && mbRes.value ? mbRes.value.messages || [] : []
   health.value = healthRes.status === 'fulfilled' && healthRes.value ? healthRes.value : null
+  mails.value = mailsRes.status === 'fulfilled' && mailsRes.value ? mailsRes.value : []
   await loadSessionLogs(id)
 }
 
@@ -708,6 +715,7 @@ function fmtDateTime(iso: string) {
         :live-streaming="liveStreaming"
         :live-thinking="liveThinking"
         :prior-replies="replyStash"
+        :mails="mails"
         :session-bound="!!activeSession"
         :work-dir="activeWorkDir"
         :work-dir-saving="workDirSaving"

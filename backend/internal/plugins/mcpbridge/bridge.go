@@ -208,10 +208,21 @@ type Bridge struct {
 	cmd     *exec.Cmd // stdio 子进程（http 传输为 nil）
 	tools   []tool.Tool
 
-	// containerName 仅 shared docker 使用：Init 时预计算的全局共享容器名。
+	// containerName 仅 shared docker 使用：默认会话（启动目录）的容器名。
 	containerName string
-	// workDir 仅 shared docker 使用：Init 时记录的当前工作目录，复用容器时校验挂载一致性。
+	// workDir 仅 shared docker 使用：Init 时记录的启动目录（默认会话的工作目录）。
 	workDir string
+	// volumesRaw ${WORKDIR} 占位符的原始卷模板：settings.Volumes 在 Init 时已按启动目录
+	// 展开，异目录会话要重新展开，故原样留一份。
+	volumesRaw []string
+	// 按工作目录分容器（见 docker.go dockerSharedContainerName）：只在卷里带
+	// ${WORKDIR} 时启用——这类插件的 /workspace 必须指向会话自己的工作目录。
+	perWorkDir bool
+	// extraSessions 异目录会话缓存（key=归一化工作目录）：容器卷在创建时固定，
+	// 异目录会话必须用自己容器的 exec 会话，否则读到/写到别人的项目目录。
+	extraSessions map[string]*bridgeSession
+	// dialMu 串行化异目录会话的建立（docker run/inspect 是秒级操作，不该占着 b.mu）。
+	dialMu sync.Mutex
 
 	// lifecycle
 	stopCtx    context.Context
@@ -247,9 +258,15 @@ func (b *Bridge) Manifest() plugins.Manifest { return b.manifest }
 // Init 实现 plugins.Plugin：校验配置，并展开 volumes 中的 ${WORKDIR} 占位符
 //（deps.WorkDir 即 bootstrap 的 os.Getwd()，挂载随启动目录解析，支持多目录多开）。
 func (b *Bridge) Init(ctx context.Context, deps plugins.Deps) error {
+	b.volumesRaw = append([]string(nil), b.settings.Volumes...)
 	for i, v := range b.settings.Volumes {
 		b.settings.Volumes[i] = plugins.ExpandWorkDir(v, deps.WorkDir)
+		// 卷里带占位符 = 该插件必须看到会话的工作目录 → 按目录分容器（见 docker.go）。
+		if strings.Contains(b.volumesRaw[i], plugins.WorkDirPlaceholder) {
+			b.perWorkDir = true
+		}
 	}
+	b.extraSessions = map[string]*bridgeSession{}
 	if b.settings.Shared && b.settings.Transport != "docker" {
 		return fmt.Errorf("mcp 插件 %q: shared 仅支持 docker transport（当前 %q）", b.id, b.settings.Transport)
 	}
@@ -271,7 +288,13 @@ func (b *Bridge) Init(ctx context.Context, deps plugins.Deps) error {
 				return fmt.Errorf("mcp 插件 %q: shared 模式需要 settings.exec_command（容器内 MCP server 启动命令）", b.id)
 			}
 			b.workDir = deps.WorkDir
-			b.containerName = dockerSharedContainerName(b.id)
+			// 按目录分容器时默认容器也带哈希（与异目录会话同一套命名规则，
+			// 免得默认目录的容器名与"某会话目录"的容器名撞车或语义不一）。
+			if b.perWorkDir {
+				b.containerName = dockerSharedContainerName(b.id, deps.WorkDir)
+			} else {
+				b.containerName = dockerSharedContainerName(b.id, "")
+			}
 		}
 	default:
 		return fmt.Errorf("mcp 插件 %q: 未知 transport %q（支持 stdio/http/docker）", b.id, b.settings.Transport)
@@ -320,7 +343,12 @@ func (b *Bridge) Start(ctx context.Context) error {
 // connect 建立一次会话并列出工具；失败时清理半开资源。
 // 返回的 cmd 供调用方在失败/停止时 kill；成功后归 Bridge 持有。
 func (b *Bridge) connect(ctx context.Context) (*mcp.ClientSession, *exec.Cmd, []tool.Tool, error) {
-	transport, cmd, err := b.newTransport(ctx)
+	return b.connectWith(ctx, b.containerName, b.workDir, b.settings.Volumes)
+}
+
+// connectWith 按给定的容器与卷建立一次会话（默认会话与异目录会话共用）。
+func (b *Bridge) connectWith(ctx context.Context, container, workDir string, volumes []string) (*mcp.ClientSession, *exec.Cmd, []tool.Tool, error) {
+	transport, cmd, err := b.newTransport(ctx, container, workDir, volumes)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -346,7 +374,7 @@ func (b *Bridge) connect(ctx context.Context) (*mcp.ClientSession, *exec.Cmd, []
 //   - stdio：spawn 子进程，stdin/stdout 管道桥接（stderr 走日志）；
 //   - http：streamable HTTP client transport；
 //   - docker：docker run 容器，stdio 管道桥接（见 docker.go）。
-func (b *Bridge) newTransport(ctx context.Context) (mcp.Transport, *exec.Cmd, error) {
+func (b *Bridge) newTransport(ctx context.Context, container, workDir string, volumes []string) (mcp.Transport, *exec.Cmd, error) {
 	switch b.settings.Transport {
 	case "http":
 		return &mcp.StreamableClientTransport{
@@ -358,7 +386,7 @@ func (b *Bridge) newTransport(ctx context.Context) (mcp.Transport, *exec.Cmd, er
 			MaxRetries:           -1, // 重连由本桥退避循环负责，传输层不自行重试
 		}, nil, nil
 	case "docker":
-		return b.newDockerTransport(ctx)
+		return b.newDockerTransport(ctx, container, workDir, volumes)
 	default: // stdio
 		cmd := exec.CommandContext(ctx, b.settings.Command, b.settings.Args...)
 		cmd.Env = os.Environ()
@@ -459,6 +487,7 @@ func (b *Bridge) Stop(ctx context.Context) error {
 		_ = session.Close()
 	}
 	b.killCmd(cmd)
+	b.closeExtraSessions()
 	return nil
 }
 
@@ -469,11 +498,107 @@ func (b *Bridge) Tools() []tool.Tool {
 	return append([]tool.Tool(nil), b.tools...)
 }
 
+// bridgeSession 一个按工作目录建立的 MCP 会话（容器 + exec 子进程）。
+type bridgeSession struct {
+	session *mcp.ClientSession
+	cmd     *exec.Cmd
+}
+
+// sessionFor 取本次调用应使用的会话：插件的卷绑定了 ${WORKDIR} 时，按调用 ctx 里的
+// 会话工作目录选容器——异目录用自己的容器（卷指向该目录），同目录/无卷走默认会话。
+//
+// 建立失败退回默认会话（并记日志）：拿到错目录的产物，好过整个插件用不了。
+func (b *Bridge) sessionFor(ctx context.Context) *mcp.ClientSession {
+	b.mu.Lock()
+	def := b.session
+	stopped := b.stopped
+	b.mu.Unlock()
+	if def == nil || !b.perWorkDir || b.settings.Transport != "docker" || !b.settings.Shared {
+		return def
+	}
+	wd := tool.WorkDirFromContext(ctx)
+	if wd == "" || normalizeMountPath(wd) == normalizeMountPath(b.workDir) {
+		return def
+	}
+	key := normalizeMountPath(wd)
+	b.mu.Lock()
+	if s := b.extraSessions[key]; s != nil {
+		b.mu.Unlock()
+		return s.session
+	}
+	b.mu.Unlock()
+
+	b.dialMu.Lock()
+	defer b.dialMu.Unlock()
+	// 双检：等锁期间别的 goroutine 可能已建好。
+	b.mu.Lock()
+	if s := b.extraSessions[key]; s != nil {
+		b.mu.Unlock()
+		return s.session
+	}
+	b.mu.Unlock()
+	if stopped {
+		return def
+	}
+	vols := b.volumesFor(wd)
+	container := dockerSharedContainerName(b.id, wd)
+	dialCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	sess, cmd, _, err := b.connectWith(dialCtx, container, wd, vols)
+	if err != nil {
+		b.logger.Warn("异目录 MCP 会话建立失败，回退默认会话（产物将落默认目录）",
+			"plugin", b.id, "workdir", wd, "container", container, "err", err)
+		return def
+	}
+	b.mu.Lock()
+	if b.stopped {
+		b.mu.Unlock()
+		_ = sess.Close()
+		b.killCmd(cmd)
+		return def
+	}
+	b.extraSessions[key] = &bridgeSession{session: sess, cmd: cmd}
+	b.mu.Unlock()
+	b.logger.Info("异目录 MCP 会话就绪", "plugin", b.id, "workdir", wd, "container", container)
+	// 会话断开即从缓存摘掉（下次调用按需重建）；不接退避重连循环——异目录会话是
+	// 按需资源，重建成本远低于维护每个目录一套重连状态机。
+	go func() {
+		_ = sess.Wait()
+		b.mu.Lock()
+		if cur := b.extraSessions[key]; cur != nil && cur.session == sess {
+			delete(b.extraSessions, key)
+		}
+		b.mu.Unlock()
+		_ = sess.Close()
+		b.killCmd(cmd)
+	}()
+	return sess
+}
+
+// volumesFor 按工作目录重新展开卷模板（无占位符的卷原样保留）。
+func (b *Bridge) volumesFor(workDir string) []string {
+	out := make([]string, 0, len(b.volumesRaw))
+	for _, v := range b.volumesRaw {
+		out = append(out, plugins.ExpandWorkDir(v, workDir))
+	}
+	return out
+}
+
+// closeExtraSessions 关闭全部异目录会话（Stop 时调用）。
+func (b *Bridge) closeExtraSessions() {
+	b.mu.Lock()
+	extras := b.extraSessions
+	b.extraSessions = map[string]*bridgeSession{}
+	b.mu.Unlock()
+	for _, s := range extras {
+		_ = s.session.Close()
+		b.killCmd(s.cmd)
+	}
+}
+
 // callTool 执行一次远端工具调用，结果转 *tool.Result。
 func (b *Bridge) callTool(ctx context.Context, name string, args map[string]any) *tool.Result {
-	b.mu.Lock()
-	session := b.session
-	b.mu.Unlock()
+	session := b.sessionFor(ctx)
 	if session == nil {
 		return &tool.Result{Tool: name, Error: "MCP 连接不可用（插件已断开，等待重连）", Category: tool.ResultCategoryExecutionFailed}
 	}

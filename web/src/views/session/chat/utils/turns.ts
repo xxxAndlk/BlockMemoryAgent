@@ -10,6 +10,8 @@ import {
   clarifyReportFromDetail,
   domainFromDetail,
 } from '@/types'
+import { buildPlanStep, fillPlanResult, isPlanTool, type PlanStep } from './plan'
+import type { AgentMailItem as MailItem } from '@/api/session'
 
 /** 一次工具调用：把 tool_call (intent) + tool_exec (结果) 配对 */
 export interface ToolCallGroup {
@@ -38,11 +40,12 @@ export interface SubAgentRef {
   ts: string
 }
 
-/** 回合内一个按时间顺序的步骤：一段思考 / 一段中间正文 / 一次工具调用 */
+/** 回合内一个按时间顺序的步骤：一段思考 / 一段中间正文 / 一次工具调用 / 一次计划提交 */
 export interface TurnStep {
-  kind: 'think' | 'narrate' | 'tool'
+  kind: 'think' | 'narrate' | 'tool' | 'plan'
   event?: SessionEvent // think / narrate 步骤对应的事件
   group?: ToolCallGroup // tool 步骤对应的工具调用组
+  plan?: PlanStep // plan 步骤对应的计划提交（submit_plan / review_plan）
 }
 
 /** 一个对话回合：用户消息 → 助手处理过程 → 最终答案 */
@@ -53,6 +56,12 @@ export interface Turn {
   steps: TurnStep[]
   thinkChain: SessionEvent[] // 兼容字段：所有思考事件扁平集合
   toolCalls: ToolCallGroup[] // 兼容字段：所有工具调用组
+  /** 计划提交/审批（submit_plan / review_plan，按时间顺序）：单列成卡，不进 toolCalls
+   *  （进去了就会被「已执行 N 次工具」折叠吞掉——用户实证看不到计划记录） */
+  plans: PlanStep[]
+  /** 本回合时段的 Agent 间邮件（mailbox 留痕，按时间挂入，见 utils/mails.ts）：
+   *  邮件不在事件流里，只能事后按时间归属；外发消息在界面上此前完全不可见。 */
+  mails: MailItem[]
   errors: SessionEvent[]
   /** 本回合派发出去的子 Agent（按派发顺序，一人一行） */
   subAgents: SubAgentRef[]
@@ -311,6 +320,10 @@ function tokenOut(ev: SessionEvent): number {
 export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record<string, string>): Turn[] {
   const turns: Turn[] = []
   let current: Turn | null = null
+  // 待回填结论的计划卡，跨回合保留：提交计划是**阻塞**调用，中间夹着上级/用户的
+  // 澄清答复（那条答复是新回合的用户消息），结论事件因此常落在下一个回合里——
+  // 只在本回合内找 pending 卡会永远匹配不上，卡片卡在"等待审批…"（2026-09-17 实证）。
+  const pendingPlans: PlanStep[] = []
 
   const openTurn = (ev?: SessionEvent, startedAt?: string) => {
     current = {
@@ -319,6 +332,8 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
       steps: [],
       thinkChain: [],
       toolCalls: [],
+      plans: [],
+      mails: [],
       errors: [],
       subAgents: [],
       clarifyDetails: [],
@@ -396,14 +411,20 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
 
     // 子 Agent 派发：收集成列表（一次批量派发落多条事件，一人一行）
     if (category === 'sub_agent_dispatch') {
-      current!.subAgents.push({
-        key: ev.timestamp,
-        // 领域名优先；旧事件（后端未带 domain，Tool 恒为 "domain"）回退通用标签，
-        // 不把角色 ID "domain" 当名字展示给用户。
-        name: domainFromDetail(ev.detail_json) || (ev.tool && ev.tool !== 'domain' ? ev.tool : '') || '子 Agent',
-        task: (ev.message || '').trim(),
-        ts: ev.timestamp,
-      })
+      // 领域名优先；旧事件（后端未带 domain，Tool 恒为 "domain"）回退通用标签，
+      // 不把角色 ID "domain" 当名字展示给用户。
+      const name = domainFromDetail(ev.detail_json) || (ev.tool && ev.tool !== 'domain' ? ev.tool : '') || '子 Agent'
+      const task = (ev.message || '').trim()
+      // 同一领域的重复派发（复活返工/续建/复用热驻实例）合并成一行：这个列表回答的是
+      // "派了哪些领域、各自什么状态"，不是派发动作流水——不合并就会出现同一领域多行
+      // 重复（用户实证：两个域复活后列表变成 5 行）。保留最新的任务摘要与时间。
+      const prev = current!.subAgents.find((s) => s.name === name)
+      if (prev) {
+        prev.task = task
+        prev.ts = ev.timestamp
+      } else {
+        current!.subAgents.push({ key: ev.timestamp, name, task, ts: ev.timestamp })
+      }
       continue
     }
 
@@ -424,6 +445,21 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
 
     // 工具调用意图（pending）：新建组并占一个 tool 步骤
     if (category === 'tool_call') {
+      // 计划确认类单列成卡：提交计划是里程碑（阻塞等审批），折进「已执行 N 次工具」里
+      // 用户根本看不见，而它恰恰是判断"要不要动手"的关键一步。
+      if (isPlanTool(ev.tool)) {
+        const plan = buildPlanStep({
+          id: ev.timestamp,
+          tool: ev.tool || '',
+          agent: ev.agent || '',
+          rawArgs: ev.detail_json || ev.tool_args,
+          ts: ev.timestamp,
+        })
+        current!.plans.push(plan)
+        current!.steps.push({ kind: 'plan', plan })
+        pendingPlans.push(plan)
+        continue
+      }
       const group = createToolGroup(ev)
       current!.toolCalls.push(group)
       current!.steps.push({ kind: 'tool', group })
@@ -433,6 +469,15 @@ export function groupEventsToTurns(events: SessionEvent[], priorReplies?: Record
     // 工具执行结果（type=tool_exec）：配对到同名 pending 组填 result，不新增步骤
     if (category === 'tool_exec') {
       const toolName = ev.tool || extractToolName(ev.message) || 'unknown'
+      if (isPlanTool(toolName)) {
+        // 审批结论回填同一张卡（提交时先渲染"等待审批…"）；跨回合找，见 pendingPlans 注释
+        const idx = pendingPlans.map((p) => p.tool).lastIndexOf(toolName)
+        if (idx >= 0) {
+          fillPlanResult(pendingPlans[idx], ev.tool_output || ev.message, ev.success !== false)
+          pendingPlans.splice(idx, 1)
+          continue
+        }
+      }
       // 可视成果：ShowArtifact 显式登记（detail_json.artifacts）优先；
       // 没登记时从工具输出里兜底识别 .bma/ 产物路径（Agent 忘了调工具也看得到）。
       const arts = collectArtifacts(ev)

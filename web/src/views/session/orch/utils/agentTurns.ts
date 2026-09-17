@@ -8,6 +8,7 @@
 import type { AgentMessageItem } from '@/api/session'
 import type { AgentNode, SessionEvent } from '@/types'
 import type { ToolCallGroup, Turn, TurnStep } from '../../chat/utils/turns'
+import { buildPlanStep, fillPlanResult, isPlanTool, type PlanStep } from '../../chat/utils/plan'
 
 const MAILBOX_PREFIX = '[mailbox from '
 
@@ -52,6 +53,9 @@ export function groupAgentMessagesToTurns(messages: AgentMessageItem[], agent: A
   let current: Turn | null = null
   // tool_call_id → 待配对工具组（role='tool' 结果回填）
   const pendingTools = new Map<string, ToolCallGroup>()
+  // tool_call_id → 待配对计划卡（submit_plan / review_plan 单列，不进 toolCalls）。
+  // 不随回合清空：审批结论可能在若干轮之后才回来，清了旧卡就永远停在"等待审批…"。
+  const pendingPlans = new Map<string, PlanStep>()
   const agentName = agent?.name || agent?.inst_id || 'Agent'
   const agentRunning = !!agent && (agent.status === 'running' || agent.status === 'active')
   // 无前缀 user 消息（首条派发任务/复活种子）的真实发送者：meta 的任务来自人类，
@@ -71,6 +75,8 @@ export function groupAgentMessagesToTurns(messages: AgentMessageItem[], agent: A
       steps: [],
       thinkChain: [],
       toolCalls: [],
+      plans: [],
+      mails: [],
       errors: [],
       subAgents: [], // 单 Agent 对话面板不展示子 Agent 列表（该 Agent 自身即对话主体）
       clarifyDetails: [],
@@ -130,6 +136,20 @@ export function groupAgentMessagesToTurns(messages: AgentMessageItem[], agent: A
       }
       // 工具调用意图 → tool_call 事件 + 待配对组
       for (const tc of m.tool_calls || []) {
+        // 计划确认类单列成卡（提交/审批是里程碑，折进「已执行 N 次工具」里就看不见了）
+        if (isPlanTool(tc.name)) {
+          const plan = buildPlanStep({
+            id: evId(m, tc.id),
+            tool: tc.name || '',
+            agent: agentName,
+            rawArgs: stringifyArgs(tc.input),
+            ts: atOf(m),
+          })
+          turn.plans.push(plan)
+          turn.steps.push({ kind: 'plan', plan })
+          if (tc.id) pendingPlans.set(tc.id, plan)
+          continue
+        }
         const callEv: SessionEvent = {
           type: 'tool_call',
           kind: 'tool_call',
@@ -167,6 +187,13 @@ export function groupAgentMessagesToTurns(messages: AgentMessageItem[], agent: A
     }
 
     if (m.role === 'tool') {
+      // 计划卡结果回填（审批批准/驳回）：同一张卡从"等待审批…"翻成结论，不新增卡片。
+      const plan = m.tool_call_id ? pendingPlans.get(m.tool_call_id) : undefined
+      if (plan) {
+        fillPlanResult(plan, m.content)
+        pendingPlans.delete(m.tool_call_id!)
+        continue
+      }
       // 工具结果按 tool_call_id 配对；配对不到时建自包含组（历史截断/孤儿结果）。
       const group = (m.tool_call_id && pendingTools.get(m.tool_call_id)) || undefined
       const execEv: SessionEvent = {

@@ -3,10 +3,13 @@
 //     停止时显式 `docker rm -f`（Windows 下 kill CLI 不转发信号）；
 //   - shared（shared=true）：`docker run -d` 常驻 keeper 容器（容器内无 MCP 业务
 //     进程），每个会话经 `docker exec -i` 在容器内起独立 MCP server 进程做 stdio
-//     桥接。多个 BMA 实例（多开 TUI）复用同一容器；Stop 只断本会话不回收容器。
+//     桥接。Stop 只断本会话不回收容器。带 ${WORKDIR} 卷的插件按**会话工作目录**
+//     分容器（容器名带目录哈希，见 dockerSharedContainerName），异目录会话各用各的；
+//     不带该卷的插件全局一个容器。
 //
 // 生命周期要点（两种形态共用）：
-//   - legacy 容器名带进程号后缀、shared 容器名带 workdir 哈希后缀，见各自函数注释；
+//   - legacy 容器名带进程号后缀、shared 容器名带 workdir 哈希后缀（仅带
+//     ${WORKDIR} 卷的插件），见各自函数注释；
 //   - 启动前 best-effort `docker rm -f` 同名容器，防上次崩溃残留导致 name 冲突；
 //   - 只经 -e KEY=VALUE 显式传递 settings.env，不继承宿主全部环境。
 package mcpbridge
@@ -14,6 +17,7 @@ package mcpbridge
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -73,12 +77,14 @@ func dockerRunArgs(pluginID string, s Settings) (name string, args []string) {
 	return name, args
 }
 
-// dockerSharedContainerName 共享容器名：全局确定性（bma-plugin-<id>，无后缀）。
-// 用户约定：插件运行环境全局只构建一套，所有 BMA 实例（跨目录、跨项目）共用。
-// 代价：挂载（${WORKDIR} 卷）固定为首个创建实例的目录——异目录实例的工具产物
-// 会落首个实例的工作目录；ensure 检测到挂载源与当前 workdir 不一致只告警不重建
-//（重建会杀掉其他实例的会话）。换项目目录需手动 docker rm -f 重建容器。
-func dockerSharedContainerName(pluginID string) string {
+// dockerSharedContainerName 共享容器名：确定性（bma-plugin-<id>[-<workdir 哈希 8 位>]）。
+//
+// 带 ${WORKDIR} 卷的插件（ui_preview/ui_design/computer_use）按**工作目录分容器**：
+// 容器卷在创建时固定，全局共用一个容器会让异目录会话的 /workspace 指向别人的项目——
+// 产物落错目录（Agent 在自己目录里找不到截图，反复"排查同步"死循环）、file:// 读到
+// 错项目的文件（2026-09-17 实证：chess 会话的截图全落进启动目录 D:\data\bma）。
+// 不带该占位符的插件（web_search 等）仍用全局单容器，避免无谓的容器膨胀。
+func dockerSharedContainerName(pluginID, workDir string) string {
 	var sb strings.Builder
 	sb.WriteString("bma-plugin-")
 	for _, r := range pluginID {
@@ -90,6 +96,11 @@ func dockerSharedContainerName(pluginID string) string {
 			sb.WriteByte('-')
 		}
 	}
+	if workDir != "" {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(normalizeMountPath(workDir)))
+		fmt.Fprintf(&sb, "-%08x", h.Sum32())
+	}
 	return sb.String()
 }
 
@@ -97,13 +108,13 @@ func dockerSharedContainerName(pluginID string) string {
 // 常驻 keeper 容器（--entrypoint 覆盖，缺省 sleep infinity，容器内无常驻业务进程，
 // MCP server 全部由 exec 按会话拉起），无 --rm/-i，settings.Args 不追加
 //（那是 exec 会话的 MCP server 参数，见 dockerExecArgs）。
-func dockerRunArgsShared(name string, s Settings) []string {
+func dockerRunArgsShared(name string, s Settings, volumes []string) []string {
 	args := []string{"run", "-d", "--name", name}
 	args = append(args, "--add-host", "host.docker.internal:host-gateway")
 	for _, p := range s.Ports {
 		args = append(args, "-p", p)
 	}
-	for _, v := range s.Volumes {
+	for _, v := range volumes {
 		args = append(args, "-v", v)
 	}
 	keys := make([]string, 0, len(s.Env)+len(s.ContainerEnv))
@@ -165,25 +176,25 @@ func parseDockerInspectRunning(out string) (bool, string) {
 	return fields[0] == "true", fields[1]
 }
 
-// warnMountMismatch 复用共享容器时校验挂载源与当前工作目录一致性：不一致只告警
-// 不重建（重建会杀掉其他实例的 exec 会话）——带 ${WORKDIR} 卷的工具（ui_design/
-// ui_preview/computer_use）产物将落首个创建实例的目录，换项目目录需手动重建容器。
-func (b *Bridge) warnMountMismatch() {
-	if b.workDir == "" || len(b.settings.Volumes) == 0 {
+// warnMountMismatch 复用共享容器时校验挂载源与预期工作目录一致性：不一致只告警
+// 不重建（重建会杀掉其他实例的 exec 会话）。按目录分容器（见 dockerSharedContainerName）
+// 后正常不再触发；留着兜"容器名哈希碰撞/被人手动改挂载"这类异常，是排查线索。
+func (b *Bridge) warnMountMismatch(container, workDir string) {
+	if workDir == "" {
 		return
 	}
-	srcs, ok := dockerInspectMountSources(b.logger, b.containerName)
+	srcs, ok := dockerInspectMountSources(b.logger, container)
 	if !ok || len(srcs) == 0 {
 		return
 	}
-	want := normalizeMountPath(b.workDir)
+	want := normalizeMountPath(workDir)
 	for _, s := range srcs {
 		if normalizeMountPath(s) == want {
 			return
 		}
 	}
-	b.logger.Warn("共享容器挂载目录与当前工作目录不一致，工具产物将落首个创建实例的目录（换项目需 docker rm -f 重建容器）",
-		"plugin", b.id, "container", b.containerName, "mounted", srcs, "current_workdir", b.workDir)
+	b.logger.Warn("共享容器挂载目录与预期工作目录不一致（工具产物将落容器实际挂载的目录）",
+		"plugin", b.id, "container", container, "mounted", srcs, "want_workdir", workDir)
 }
 
 // dockerInspectMountSources 返回容器全部挂载的宿主侧源路径（bind 与命名卷均含）。
@@ -212,46 +223,50 @@ func parseDockerMountSources(out string) []string {
 	return srcs
 }
 
-// normalizeMountPath 归一 Windows/Linux 路径用于比较（反斜杠转斜杠 + 小写）。
+// normalizeMountPath 归一 Windows/Linux 路径用于比较与容器名哈希
+//（反斜杠转斜杠 + 小写 + 去尾分隔符）：`D:\a\` 与 `d:/a` 必须归一，否则同一目录
+// 会算出两个容器名、挂载一致性校验也会误报。
 func normalizeMountPath(p string) string {
-	return strings.ToLower(strings.ReplaceAll(p, "\\", "/"))
+	return strings.TrimRight(strings.ToLower(strings.ReplaceAll(p, "\\", "/")), "/")
 }
 
 // ensureSharedContainer 确保共享容器在运行且镜像匹配。
 // 容器不在/已停止 → rm 残留后 `docker run -d` 重建；镜像不匹配（配置改了）→ 重建。
 // 并发竞态：另一实例同时重建撞名失败时重新 inspect，running 且镜像一致即放行。
-func (b *Bridge) ensureSharedContainer(ctx context.Context) error {
-	running, image := dockerInspectRunning(b.logger, b.containerName)
+func (b *Bridge) ensureSharedContainer(ctx context.Context, container, workDir string, volumes []string) error {
+	running, image := dockerInspectRunning(b.logger, container)
 	if running && image == b.settings.Image {
-		b.warnMountMismatch()
+		b.warnMountMismatch(container, workDir)
 		return nil
 	}
 	if running {
-		b.logger.Warn("共享容器镜像不匹配，重建", "plugin", b.id, "container", b.containerName,
+		b.logger.Warn("共享容器镜像不匹配，重建", "plugin", b.id, "container", container,
 			"running_image", image, "want_image", b.settings.Image)
 	}
-	removeDockerContainer(b.logger, b.containerName)
-	args := dockerRunArgsShared(b.containerName, b.settings)
+	removeDockerContainer(b.logger, container)
+	args := dockerRunArgsShared(container, b.settings, volumes)
 	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 	if err != nil {
-		if r, img := dockerInspectRunning(b.logger, b.containerName); r && img == b.settings.Image {
-			b.logger.Info("共享容器已被并发实例创建，复用", "plugin", b.id, "container", b.containerName)
+		if r, img := dockerInspectRunning(b.logger, container); r && img == b.settings.Image {
+			b.logger.Info("共享容器已被并发实例创建，复用", "plugin", b.id, "container", container)
 			return nil
 		}
 		return fmt.Errorf("mcp docker run -d %q: %w (%s)", b.settings.Image, err, strings.TrimSpace(string(out)))
 	}
-	b.logger.Info("共享容器已启动", "plugin", b.id, "container", b.containerName)
+	b.logger.Info("共享容器已启动", "plugin", b.id, "container", container, "workdir", workDir)
 	return nil
 }
 
 // newSharedDockerTransport 确保共享 keeper 容器在运行，然后 `docker exec -i` 在
 // 容器内起本会话独立的 MCP server 进程并返回 stdio 桥接传输。
 // exec CLI 退出只结束本会话，容器（其他实例的会话）不受影响。
-func (b *Bridge) newSharedDockerTransport(ctx context.Context) (mcp.Transport, *exec.Cmd, error) {
-	if err := b.ensureSharedContainer(ctx); err != nil {
+// container/volumes 由调用方按工作目录给出（见 bridge.sessionFor）：默认会话用启动
+// 目录，异目录会话各自落在自己的容器与卷上。
+func (b *Bridge) newSharedDockerTransport(ctx context.Context, container, workDir string, volumes []string) (mcp.Transport, *exec.Cmd, error) {
+	if err := b.ensureSharedContainer(ctx, container, workDir, volumes); err != nil {
 		return nil, nil, err
 	}
-	args := dockerExecArgs(b.containerName, b.settings)
+	args := dockerExecArgs(container, b.settings)
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -271,9 +286,9 @@ func (b *Bridge) newSharedDockerTransport(ctx context.Context) (mcp.Transport, *
 // newDockerTransport 启动 docker 容器并返回 stdio 桥接传输：
 // shared 模式走常驻 keeper 容器 + exec 会话（见 newSharedDockerTransport）；
 // legacy 模式 `docker run -i --rm` 容器即会话。
-func (b *Bridge) newDockerTransport(ctx context.Context) (mcp.Transport, *exec.Cmd, error) {
+func (b *Bridge) newDockerTransport(ctx context.Context, container, workDir string, volumes []string) (mcp.Transport, *exec.Cmd, error) {
 	if b.settings.Shared {
-		return b.newSharedDockerTransport(ctx)
+		return b.newSharedDockerTransport(ctx, container, workDir, volumes)
 	}
 	name, args := dockerRunArgs(b.id, b.settings)
 	// 上次异常退出可能残留同名容器（--rm 在 CLI 被 kill 时不生效），先清场。

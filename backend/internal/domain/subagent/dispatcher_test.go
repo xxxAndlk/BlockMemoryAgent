@@ -1857,3 +1857,48 @@ func TestDispatchOne_PropagatesUserImages(t *testing.T) {
 		t.Fatalf("子 Agent 首轮请求应含带图 user 消息, messages=%+v", req.Messages)
 	}
 }
+
+// TestSendMessageTool_MislabeledInquiryHint 验证"把问句标成 reply/info"时工具就地提示
+// 发送方（2026-09-17 实证：meta 用 reply 发「进度询问」给 domain，对方整段任务零回复）。
+// 只提示不拒绝：消息照常投递，Output 末尾追加一条改发 request 的提示。
+func TestSendMessageTool_MislabeledInquiryHint(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "x"}}, toolsReg, mb, agent.NopMemoryPipeline{})
+	d.RegisterMessagingTool(toolsReg)
+	ctx := agent.WithAgentID(context.Background(), "sess-1")
+
+	// 问句 + reply → 提示改发 request（消息仍然投递成功）。
+	res, _ := toolsReg.Dispatch(ctx, "send_message", map[string]any{
+		"to_agent_id": "sess-1/domain-1", "subject": "进度询问: engine.js 与测试状态",
+		"body": "请简短回复你本人当前进度", "message_type": "reply",
+	})
+	if !res.Success {
+		t.Fatalf("mislabeled inquiry must still be delivered: %s", res.Error)
+	}
+	if !strings.Contains(res.Output, "message_type=request 重发") {
+		t.Fatalf("expected request hint, got: %s", res.Output)
+	}
+
+	// 真回复（无问句特征）→ 不提示。
+	res, _ = toolsReg.Dispatch(ctx, "send_message", map[string]any{
+		"to_agent_id": "sess-1/domain-1", "subject": "计划修改意见",
+		"body": "步骤 3 请补充错误处理", "message_type": "reply",
+	})
+	if strings.Contains(res.Output, "重发") {
+		t.Fatalf("plain reply must not be flagged: %s", res.Output)
+	}
+
+	// request 类型永不提示。
+	res, _ = toolsReg.Dispatch(ctx, "send_message", map[string]any{
+		"to_agent_id": "sess-1/domain-1", "subject": "进度询问: engine.js", "message_type": "request",
+	})
+	if strings.Contains(res.Output, "重发") {
+		t.Fatalf("request must not be flagged: %s", res.Output)
+	}
+}

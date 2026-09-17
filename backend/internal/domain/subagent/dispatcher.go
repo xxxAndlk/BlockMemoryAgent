@@ -1183,6 +1183,20 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 	if d.msgLogger != nil {
 		d.msgLogger.Clear(subAgentID)
 	}
+	// 终态快照一并删掉（PG agent_messages）：热层已清，但读路径在"热层不足 limit"时会
+	// 并 PG 兜底，旧 run 的终态快照会被当成当前对话续上去——面板显示新内容一瞬间又变回
+	// 旧的（2026-09-17 用户实证）。旧快照本就是待覆盖的死数据（终态 SaveMessages 是
+	// delete-then-insert 全量覆盖），先删只是把它提前作废，不丢任何在用的状态。
+	// best-effort：删失败只记日志，面板最坏退化成旧行为。
+	// 只清子 Agent：会话级 agent_messages（agent_id == sessionID）是进程重启后的会话恢复
+	// 数据源（session_react.restoreSessions → LoadMessages），删了会话就丢了。
+	if d.msgStore != nil && strings.Contains(subAgentID, "/") {
+		delCtx, delCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := d.msgStore.DeleteMessages(delCtx, subAgentID); err != nil {
+			log.Printf("[dispatcher] revive: drop stale agent_messages failed: agent=%s err=%v", subAgentID, err)
+		}
+		delCancel()
+	}
 	// 看板回写：该领域对应计划条目从"完成/失败"翻回进行中，否则面板显示已完成、
 	// 实际又在重跑（与派发路径同口径）。
 	d.boardAssign(ctx, parentID, node.Domain, subAgentID)
@@ -1948,7 +1962,11 @@ func (t *sendMessageTool) Description() string {
 		"用于多 Agent 协作验证闭环：例如代码 Agent 完成后可向测试 Agent 发送验证请求，" +
 		"测试 Agent 在下一轮 ReAct 迭代中 Drain 收件箱即可看到该消息并据此回复。" +
 		"参数 to_agent_id 为目标 Agent 实例 ID（即 call_sub_agent 返回的 sub_agent_id，或父 Agent ID）；" +
-		"subject 为一行摘要；body 为详情正文（可空）；message_type 可选 info（单向通知）/reply（回复）/escalate（升级求助，父 Agent 收到 [升级] 前缀消息需按规程处置）。" +
+		"subject 为一行摘要；body 为详情正文（可空）；" +
+		"message_type：凡要对方**回答**的（提问/追问进度/要口径）一律 request（缺省值）；" +
+		"纯告知用 info；reply 只用于**回答别人对你的提问**；escalate 为升级求助" +
+		"（父 Agent 收到 [升级] 前缀消息需按规程处置）。" +
+		"注意：把问句标成 reply/info 时对方不会按询问处置（不触发\"当轮必须回复\"纪律），你会等到沉默。" +
 		"目标 Agent 已销毁时返回\"消息未送达\"。"
 }
 
@@ -2015,8 +2033,36 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 	return &tool.Result{
 		Tool:    "send_message",
 		Success: true,
-		Output:  id,
+		Output:  id + mislabeledInquiryHint(msgType, subject, body),
 	}
+}
+
+// inquiryMarkers 问句特征词（软提示用，命中任一即提示"这像是提问"）。
+// 只做放行+提示，不硬拒——与 validateDispatchArgs 同款（硬拒会与重试叠加成拒绝循环）。
+var inquiryMarkers = []string{"询问", "请问", "请回复", "请简短回复", "请告知", "请说明", "请回答", "想知道", "？", "?"}
+
+// mislabeledInquiryHint 把"问句标成 reply/info"的情况就地提示给发送方：
+// 收件方的"当轮必须回复"纪律只认 request，标错类型等于让对方永远不回（2026-09-17 实证：
+// meta 用 reply 发「进度询问」给 domain，对方整段任务零回复，用户在面板看不到任何答复）。
+func mislabeledInquiryHint(msgType mailbox.MessageType, subject, body string) string {
+	if msgType == mailbox.MsgRequest || msgType == mailbox.MsgEscalate {
+		return ""
+	}
+	// 只看 subject 与首行——正文大段复述里出现"？"的概率高，不该据此提示。
+	head := subject + "\n" + body
+	if i := strings.IndexByte(head, '\n'); i >= 0 {
+		if j := strings.IndexByte(head[i+1:], '\n'); j >= 0 {
+			head = head[:i+1+j]
+		}
+	}
+	for _, m := range inquiryMarkers {
+		if strings.Contains(head, m) {
+			return "\n【提示】这条消息读起来像在**提问**，但 message_type=" + string(msgType) +
+				"：收件方不会按询问处置（\"当轮必须回复\"只认 request），你等来的可能是沉默。" +
+				"追问请改用 message_type=request 重发一次。"
+		}
+	}
+	return ""
 }
 
 // RegisterControlTool 将 cancel_agent 工具安装到传入的工具注册表中。

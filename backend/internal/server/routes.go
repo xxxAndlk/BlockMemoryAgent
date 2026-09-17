@@ -34,7 +34,8 @@ func RegisterSessionRoutes(rg gin.IRouter, m *SessionManager) {
 	rg.GET("/sessions/:id/logs", m.HandleSessionLogs)                              // 会话日志查询
 	rg.GET("/sessions/:id/token-metrics", m.HandleSessionTokenMetrics)             // Token 消耗指标
 	rg.GET("/sessions/:id/watchdog", m.HandleSessionWatchdog)                      // Watchdog 状态
-	rg.GET("/sessions/:id/mailbox", m.HandleSessionMailbox)                        // 邮箱消息
+	rg.GET("/sessions/:id/mailbox", m.HandleSessionMailbox)                        // 邮箱消息（未取走队列）
+	rg.GET("/sessions/:id/mailbox-trace", m.HandleSessionMailboxTrace)             // 邮件留痕（全部往来，去重）
 	rg.POST("/sessions/:id/clarify", m.HandleSessionClarify)                       // 澄清答复
 	rg.POST("/sessions/:id/interrupt", m.HandleSessionInterrupt)                   // 抢占中断
 	rg.POST("/sessions/:id/enqueue", m.HandleSessionEnqueue)                       // 任务入队

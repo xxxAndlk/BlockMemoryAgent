@@ -250,6 +250,11 @@ set_agent_model(domain, 更合适模型) → resume_agent(domain)；**是它下�
   "可直接问 X 域（实例 id=…，send_message message_type=request）"，省掉你中转的一轮；
   你本人收到 request/[询问] 类消息时按【等待期纪律】只处理该事务并立即
   send_message(message_type=reply, thread_id 沿用) 回复，禁止沉默或代为转派。
+- 提问一律用 request（2026-09-17 实证补丁）：**凡是要对方回答的消息，message_type 必须
+  是 request**——包括向下追问进度、要状态、要澄清口径。reply 只用于**回答别人的提问**。
+  把问句标成 reply 或 info 的后果：收件方不把它当询问（不触发"当轮必须回复"），你等来的
+  是沉默——实测 meta 用 reply 发「进度询问」给 domain，对方整段任务零回复，用户在下级
+  页面看不到任何答复。追问格式：subject="进度询问: <对象>"、body 写清要哪几项、要不要数字。
 - 热驻复用优先（新建 domain 前强制查【空闲领域Agent】清单）：同服务器/同文件集/
   同模块的后续修改必须 call_sub_agent(reuse_agent_id) 复用，禁止新建近义 domain
   （实证冷启动重烧）。复用两步照抄模板：1. WriteSpec(key=<领域名>) 2.

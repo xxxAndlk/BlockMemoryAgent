@@ -124,6 +124,10 @@ export interface AgentConversation {
   total: number
   messages: AgentMessageItem[]
   mails: AgentMailItem[]
+  /** 热层最大 seq（-1=热层为空）：兜底的重置判据，小于前端游标即需整表重载。 */
+  hotMaxSeq: number
+  /** 对话序号（复活重跑递增）：权威的重置判据——变了就整表重载，与 seq 竞态无关。 */
+  runId: number
   /** 头部还有更早消息（before_seq 翻页用；本次取满 limit 即视为可能还有）。 */
   has_more: boolean
 }
@@ -152,6 +156,17 @@ function toMailItem(m: WireMailItem): AgentMailItem {
 }
 
 /**
+ * 取会话级邮件留痕（全部 Agent 的 mailbox 收发，一行一封、收发双方重复行已去重）。
+ * 主对话栏用：把"上级 ↔ 下级"的往来显示出来（外发此前在界面上完全不可见）。
+ */
+export async function getSessionMailboxTrace(id: string, limit = 200): Promise<AgentMailItem[]> {
+  const res = await fetchJson<{ mails?: WireMailItem[] }>(
+    `/sessions/${id}/mailbox-trace?limit=${limit}`,
+  )
+  return (res.mails ?? []).map(toMailItem)
+}
+
+/**
  * 取单个 Agent 的完整对话（编排页对话面板数据源）。
  * 滚动窗口三态：`afterSeq` 增量轮询 / `beforeSeq` 上翻 / 都不传取尾部。
  * `aid='meta'` 后端映射为会话主 Agent（前端正常不传 meta）。
@@ -173,6 +188,8 @@ export async function getAgentMessages(
     agent_id: string
     messages?: AgentMessageItem[]
     mails?: WireMailItem[]
+    hot_max_seq?: number
+    run_id?: number
   }>(`/sessions/${id}/agents/${encodeURIComponent(aid)}/messages?${qs.toString()}`)
   const messages = res.messages ?? []
   const mails = (res.mails ?? []).map(toMailItem)
@@ -182,6 +199,9 @@ export async function getAgentMessages(
     total: messages.length,
     messages,
     mails,
+    // 重置判据：runId 权威（复活重跑递增，与 seq 竞态无关），hotMaxSeq 兜底。
+    hotMaxSeq: res.hot_max_seq ?? -1,
+    runId: res.run_id ?? 0,
     has_more: !opts?.afterSeq && messages.length >= limit,
   }
 }

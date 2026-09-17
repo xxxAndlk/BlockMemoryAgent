@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { Session, SessionEvent, AgentNode, ClarifyPending, WireImage, SessionGear, SessionThinking } from '@/types'
+import type { AgentMailItem } from '@/api/session'
 import ChatHeader from './components/ChatHeader.vue'
 import MessageList from './components/MessageList.vue'
 import ChatInput from './components/ChatInput.vue'
@@ -26,6 +27,8 @@ const props = defineProps<{
   liveThinking: string
   /** 接替回合的流式文本快照（key=接替用 user_message 事件时间戳），透传 MessageList → groupEventsToTurns */
   priorReplies?: Record<string, string>
+  /** 会话级邮件留痕（全部 Agent 收发）：对话栏里把"上级 ↔ 下级"的往来显示出来 */
+  mails?: AgentMailItem[]
   /** 是否已绑定会话（有 activeSession）：决定底部栏标签是本会话目录还是新会话默认目录 */
   sessionBound?: boolean
   /** 本会话工作目录（无会话时为新会话默认目录），底部栏展示 + 更改入口 */
@@ -74,7 +77,7 @@ const showStatusLine = computed(() =>
                    :session-id="session?.id || ''"
                    :session-status="session?.status"
                    :live-streaming="liveStreaming" :live-thinking="liveThinking"
-                   :prior-replies="priorReplies"
+                   :prior-replies="priorReplies" :mails="mails"
                    @submit-clarify="emit('clarify-submitted')"
                    @update-clarify-drafts="(d: string[]) => emit('update-clarify-drafts', d)" />
       <!-- 常驻最新状态行（T10）：运行中展示最近事件的人话短语 -->

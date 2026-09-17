@@ -195,6 +195,9 @@ const (
 	// QueryKindAgentMessages 编排页 Agent 对话视图：Args{"agent","before_seq","after_seq","limit"}，
 	// 返回完整消息历史（Redis 热层 + PG 合并分页）+ mailbox 留痕。
 	QueryKindAgentMessages = "agent-messages"
+	// QueryKindMailboxTrace 会话级 mailbox 留痕（全部 Agent 的收发，双方重复行已去重）：
+	// Args{"limit"}。主对话栏展示"上级 ↔ 下级"邮件往来（父侧视角此前看不到任何邮件）。
+	QueryKindMailboxTrace = "mailbox-trace"
 	// QueryKindWorktrees 会话 worktree 副本清单（TODO 第9⑤/#10⑤）：
 	// 返回 ListWorktrees 快照（路径/分支/base/patch 路径与 stat/合并状态）。
 	QueryKindWorktrees = "worktrees"

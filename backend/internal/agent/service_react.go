@@ -1420,6 +1420,10 @@ func (s *ReactService) Query(ctx context.Context, sessionID string, q Query) (Re
 		afterSeq, _ := q.Args["after_seq"].(int)
 		limit, _ := q.Args["limit"].(int)
 		return s.agentMessagesQueryResult(ctx, sessionID, agentID, beforeSeq, afterSeq, limit), nil
+	case QueryKindMailboxTrace:
+		// 会话级邮件留痕：主对话栏展示"上级 ↔ 下级"全部往来（父侧视角此前看不到邮件）。
+		limit, _ := q.Args["limit"].(int)
+		return s.mailboxTraceQueryResult(ctx, sessionID, limit), nil
 	case QueryKindWorktrees:
 		// 会话 worktree 副本清单（TODO 第9⑤/#10⑤）：经结构化接口断言访问 Dispatcher。
 		// 未接线（nil/未实现）返回空列表，端点可安全轮询。

@@ -7,10 +7,11 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { AgentNode } from '@/types'
 import { getAgentMessages, sendAgentMessage } from '@/api/session'
-import type { AgentMessageItem } from '@/api/session'
+import type { AgentMessageItem, AgentMailItem } from '@/api/session'
 import { cancelSessionAgent, pauseSessionAgent } from '@/api/metrics'
 import { isChildWaiting } from '@/composables/useTreeLayout'
 import { groupAgentMessagesToTurns } from './utils/agentTurns'
+import { attachMailsToTurns } from '../chat/utils/mails'
 import AgentTurnList from './AgentTurnList.vue'
 
 const props = defineProps<{
@@ -22,13 +23,24 @@ const props = defineProps<{
 const emit = defineEmits<{ refresh: [] }>()
 
 const messages = ref<AgentMessageItem[]>([])
+const mails = ref<AgentMailItem[]>([])
+// 后端对话序号（复活重跑递增）：变了一律整表重载，见 pullIncrement 注释。
+const runId = ref(-1)
 const hasMore = ref(false)
 const loading = ref(false)
 const sending = ref(false)
 const draft = ref('')
 
 /** 消息流适配为对话页回合结构（思考链/工具卡/最终回答），computed 仅在消息变化时重算。 */
-const turns = computed(() => groupAgentMessagesToTurns(messages.value, props.agent))
+const turns = computed(() => {
+  const ts = groupAgentMessagesToTurns(messages.value, props.agent)
+  // 只挂**外发**邮件：入站邮件已在消息流里（`[mailbox from X]` 注入 → PeerBubble），
+  // 再渲染一遍就是同一封信两个气泡。外发此前完全不可见——它只是一次被折叠的工具调用，
+  // 「我怎么回上级的」无从查起（2026-09-17 用户实证）。
+  const self = props.agent?.inst_id || ''
+  attachMailsToTurns(ts, mails.value, (m) => !!self && m.from === self)
+  return ts
+})
 
 const PAGE = 100
 
@@ -52,6 +64,8 @@ async function reload() {
   try {
     const res = await getAgentMessages(props.sessionId, agent.inst_id, { limit: PAGE })
     messages.value = res.messages
+    mails.value = res.mails
+    runId.value = res.runId
     hasMore.value = res.has_more
   } catch (e) {
     ElMessage.error('加载对话失败：' + (e instanceof Error ? e.message : String(e)))
@@ -72,7 +86,16 @@ async function pullIncrement() {
   }
   try {
     const res = await getAgentMessages(props.sessionId, agent.inst_id, { afterSeq: lastSeq, limit: PAGE })
+    // 复活重跑检测：后端清了热层、新 run 从 seq 0 重编号，本地游标（旧最大值）此后
+    // 永远取不到新消息——不整表重载就会一直停在旧对话上（用户实证："切换时闪一下新内容
+    // 又变回旧的"）。runId 是权威判据；hotMaxSeq 兜底旧后端/Redis 冷启动。
+    if (res.runId !== runId.value || (res.hotMaxSeq >= 0 && res.hotMaxSeq < lastSeq)) {
+      await reload()
+      return
+    }
     mergeMessages(res.messages)
+    // 外发邮件不在消息流里（增量只跟着 seq 走），轮询时整取一次留痕（信件量小，成本可忽略）
+    if (res.mails.length || mails.value.length) mails.value = res.mails.length ? res.mails : mails.value
   } catch {
     // 轮询失败静默（下一周期重试），避免每 3s 弹一次错误。
   }
@@ -112,6 +135,8 @@ watch(
   () => [props.sessionId, props.agent?.inst_id],
   () => {
     messages.value = []
+    mails.value = []
+    runId.value = -1
     hasMore.value = false
     void reload()
   },
@@ -288,7 +313,7 @@ const statusClass = computed(() => {
 
     <!-- 对话：回合式渲染（UserBubble/PeerBubble/AssistantTurn），分页与吸底在 AgentTurnList 内 -->
     <div v-if="agent" class="flex-1 flex flex-col min-h-0">
-      <AgentTurnList :turns="turns" :session-id="sessionId" :agents="agents || []"
+      <AgentTurnList :turns="turns" :session-id="sessionId" :agents="agents || []" :mail-self-id="agent?.inst_id || ''"
                      :has-more="hasMore" :loading="loading"
                      @load-earlier="loadEarlier" />
     </div>

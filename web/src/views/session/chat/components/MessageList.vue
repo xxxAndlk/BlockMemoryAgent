@@ -2,6 +2,8 @@
 import { ref, watch, nextTick, onMounted, computed } from 'vue'
 import type { AgentNode, SessionEvent, ClarifyPending } from '@/types'
 import { groupEventsToTurns, settleTurnsBySessionStatus } from '../utils/turns'
+import { attachMailsToTurns } from '../utils/mails'
+import type { AgentMailItem } from '@/api/session'
 import UserBubble from './UserBubble.vue'
 import AssistantTurn from './AssistantTurn.vue'
 
@@ -22,6 +24,8 @@ const props = defineProps<{
   priorReplies?: Record<string, string>
   /** 会话内全部 Agent 实例：透传给回合，用于子 Agent 列表的实时状态 */
   agents?: AgentNode[]
+  /** 会话级邮件留痕（全部 Agent 的收发）：按时间挂到回合上渲染，双向都显示 */
+  mails?: AgentMailItem[]
 }>()
 
 // 澄清选项提交成功 → 透传给父级（index.vue 置 running + ack，不再全量重载）
@@ -35,12 +39,16 @@ const stickToBottom = ref(true)
 
 // F9 修复：原 groupEventsToTurns(events) 在模板内直接调用，
 // 每次 patch 都重新 O(n) 分组。改 computed 仅在 events 变化时重算。
-const turns = computed(() =>
-  settleTurnsBySessionStatus(
+const turns = computed(() => {
+  const ts = settleTurnsBySessionStatus(
     groupEventsToTurns(props.events, props.priorReplies),
     props.sessionStatus,
-  ),
-)
+  )
+  // 邮件留痕不在事件流里：按时间挂到回合上（主对话栏双向都收——"我发了什么"和
+  // "谁回了我什么"同等重要；子 Agent 面板只收外发，入站已有注入气泡）
+  attachMailsToTurns(ts, props.mails || [], () => true)
+  return ts
+})
 
 function onScroll() {
   if (!containerRef.value) return
@@ -94,6 +102,7 @@ defineExpose({ scrollToBottom })
         <UserBubble v-if="turn.userMessage" :event="turn.userMessage" />
         <AssistantTurn :turn="turn" :verbose="verbose" :clarify="clarify"
                        :clarify-drafts="clarifyDrafts" :session-id="sessionId" :agents="agents"
+                       :mail-self-id="sessionId"
                        :live-streaming="ti === turns.length - 1 ? liveStreaming : ''"
                        :live-thinking="ti === turns.length - 1 ? liveThinking : ''"
                        @submit-clarify="emit('submit-clarify')"

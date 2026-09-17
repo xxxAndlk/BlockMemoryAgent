@@ -286,9 +286,15 @@ plugins:
       # 跨实例共享容器（同 web_search 注释）：exec_command 对齐官方镜像 ENTRYPOINT
       #（node /app/cli.js --browser chromium --no-sandbox，exec 不继承 ENTRYPOINT
       # 故需显式带上）；settings.args 附加其后。每 exec 会话独立浏览器实例。
+      # 卷里带 ${WORKDIR} → 按**会话工作目录**分容器（2026-09-17）：此前全局一个容器、
+      # 卷在首次创建时固定，异目录会话的 /workspace 指向别人的项目——Agent 截图落错
+      # 目录、在自己目录里找不到，反复"排查同步"死循环（chess 会话实证，卡到父 Agent
+      # 永远等不到回传）。现容器名 bma-plugin-ui_preview-<目录哈希>，同目录复用、
+      # 异目录各自一套；无该卷的插件（web_search 等）仍全局单容器。
       shared: true
       exec_command: ["node", "/app/cli.js", "--browser", "chromium", "--no-sandbox"]
-      # 产物落盘目录：截图保存到 <工作目录>/.bma/ui-artifacts（容器内 /workspace/.bma/ui-artifacts）。
+      # 产物落盘目录：截图保存到 <本会话工作目录>/.bma/ui-artifacts（容器内 /workspace/.bma/ui-artifacts，
+      # /workspace 恒等于本会话工作目录——分容器后成立，Agent 不必再怀疑"没同步"）。
       volumes: ["${WORKDIR}:/workspace"]
       # --image-responses 缺省即 allow（截图回 image content），显式写出防误改 omit。
       args: ["--headless", "--output-dir", "/workspace/.bma/ui-artifacts", "--allow-unrestricted-file-access", "--image-responses", "allow"]

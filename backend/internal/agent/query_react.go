@@ -452,12 +452,38 @@ func (s *ReactService) agentMessagesQueryResult(ctx context.Context, sessionID, 
 			mails = rows
 		}
 	}
+	hotMaxSeq := -1
+	var runID int64
+	if s.agentMsgCache != nil {
+		hotMaxSeq = s.agentMsgCache.MaxSeq(ctx, agentID)
+		runID = s.agentMsgCache.RunID(ctx, agentID)
+	}
 	return Result{Data: map[string]any{
 		"session_id": sessionID,
 		"agent_id":   agentID,
 		"messages":   s.readAgentMessages(ctx, agentID, beforeSeq, afterSeq, limit),
 		"mails":      mails,
+		// 对话序号 + 热层最大 seq：复活重跑会清空热层并从 0 重编号，前端增量游标此后
+		// 取不到任何东西、面板停在旧内容上（2026-09-17 用户实证）。序号（单调递增）是
+		// 权威判据，hot_max_seq 是兜底。
+		"run_id":      runID,
+		"hot_max_seq": hotMaxSeq,
 	}}
+}
+
+// mailboxTraceQueryResult 会话级邮件留痕（主对话栏数据源）：全部 Agent 的收发，
+// 一行一封（同封信的收发双方重复行在 store 层 DISTINCT 掉）。
+// PG 未接线/查询失败返回空列表，端点可安全轮询。
+func (s *ReactService) mailboxTraceQueryResult(ctx context.Context, sessionID string, limit int) Result {
+	mails := []map[string]any{}
+	if s.store.pgStore != nil {
+		if rows, err := s.store.pgStore.QuerySessionMailboxTrace(ctx, sessionID, limit); err == nil {
+			mails = rows
+		} else {
+			log.Printf("[query] session mailbox trace failed: session=%s err=%v", sessionID, err)
+		}
+	}
+	return Result{Data: map[string]any{"session_id": sessionID, "mails": mails}}
 }
 
 // readAgentMessages 读消息窗口：热层优先，热层不足时与 PG 全量切片按 seq 合并

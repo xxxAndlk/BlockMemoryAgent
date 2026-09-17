@@ -36,12 +36,20 @@ const STATUS_MAP: Record<string, StatusStyle> = {
 }
 const UNKNOWN: StatusStyle = { text: '—', cls: 'text-ink-3', dot: 'bg-ink-3' }
 
-/** 领域名 → 实时实例（派发瞬间实例尚未进树，下一次轮询即补齐）。 */
+/**
+ * 领域名 → 实时实例（派发瞬间实例尚未进树，下一次轮询即补齐）。
+ * 同名多实例（旧实例已完成、复活/续建起了新实例）时优先取**在跑的**——否则状态会
+ * 挂在早已结束的旧实例上显示"已完成/空闲"，而实际工作还在跑。
+ */
 const byName = computed(() => {
   const m = new Map<string, AgentNode>()
+  const put = (key: string, a: AgentNode) => {
+    const prev = m.get(key)
+    if (!prev || (prev.status !== 'running' && a.status === 'running')) m.set(key, a)
+  }
   for (const a of props.agents) {
-    if (a.domain) m.set(a.domain, a)
-    if (a.name && !m.has(a.name)) m.set(a.name, a)
+    if (a.domain) put(a.domain, a)
+    if (a.name) put(a.name, a)
   }
   return m
 })

@@ -19,6 +19,8 @@ const props = defineProps<{
   /** 头部还有更早消息（before_seq 翻页）：显示"加载更早消息"入口 */
   hasMore?: boolean
   loading?: boolean
+  /** 本面板 Agent 实例 ID：邮件气泡判方向（from===该 id 即"我发出的"） */
+  mailSelfId?: string
 }>()
 
 const emit = defineEmits<{ (e: 'load-earlier'): void }>()
@@ -82,6 +84,7 @@ defineExpose({ scrollToBottom })
                     :label="senderLabel(turn.userMessage.agent)" :color-key="turn.userMessage.agent" />
       </template>
       <AssistantTurn :turn="turn" :clarify="null" :session-id="sessionId"
+                     :agents="agents" :mail-self-id="mailSelfId"
                      live-streaming="" live-thinking="" />
     </div>
   </div>

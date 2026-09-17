@@ -64,6 +64,18 @@ func (c *captureMessagesStore) LoadMessages(_ context.Context, agentID string) (
 	return nil, nil
 }
 
+// DeleteMessages 复活重跑前作废旧快照：清掉该 agent 的缓存记录（幂等）。
+func (c *captureMessagesStore) DeleteMessages(_ context.Context, agentID string) error {
+	kept := c.saved[:0]
+	for _, m := range c.saved {
+		if m.agentID != agentID {
+			kept = append(kept, m)
+		}
+	}
+	c.saved = kept
+	return nil
+}
+
 // newPauseTestEnv 构造一个带 tree + msgStore + 小 budget 的 Dispatcher 测试环境，
 // 并注册 call_sub_agent 工具，使测试可经 Execute（含 trackChildDone 包装器）派发。
 func newPauseTestEnv(t *testing.T, provider agent.ModelProvider) (*Dispatcher, *role.Registry, *mailbox.Mailbox, *captureMessagesStore, *orchestrator.Tree, *tool.Registry) {
