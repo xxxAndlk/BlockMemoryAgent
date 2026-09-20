@@ -7,6 +7,7 @@ import (
 	// os 与 path/filepath 用于在临时目录相关测试中创建/校验目录与文件。
 	// strings 用于断言事件消息内容。
 	"strings"
+	"sync"
 	"os"
 	"path/filepath"
 	// testing 提供 Go 标准测试框架。
@@ -1001,6 +1002,141 @@ func TestWallClock_ExpiryTerminatesSession(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("session did not terminate within wall clock deadline (stuck node: %s)", stuckNode)
+}
+
+// secondCallGateProvider 包装 mock：第二次 Generate 进入时发信号（随后被 mock 的
+// block 卡住），供测试精确等待"工具回合已完成、下一次 LLM 调用在飞"的时刻；
+// 同时捕获每次请求的完整消息列表，供断言续跑后模型第一眼能看到全部前文。
+type secondCallGateProvider struct {
+	inner   *mockReactModelProvider
+	entered chan struct{}
+	once    sync.Once
+
+	mu      sync.Mutex
+	lastReq *blades.ModelRequest
+}
+
+func (p *secondCallGateProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	if p.inner.calls >= 1 {
+		p.once.Do(func() { close(p.entered) })
+	}
+	p.mu.Lock()
+	p.lastReq = req
+	p.mu.Unlock()
+	return p.inner.Generate(ctx, req)
+}
+
+func (p *secondCallGateProvider) Name() string { return "second-call-gate" }
+
+// requestContains 报告最近一次的 LLM 请求消息里是否含指定子串。
+func (p *secondCallGateProvider) requestContains(sub string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lastReq == nil {
+		return false
+	}
+	for _, m := range p.lastReq.Messages {
+		if strings.Contains(m.Text(), sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCancelMidRun_PreservesHistoryForResume 回归 2026-09-20 线上事故（会话
+// session-1789909779862275000-f6d467e3-6，日志 2026-09-20.log）：
+// 用户首轮要求"提取全部学习文档示例代码"，MetaAgent 提交计划被驳回，用户终止
+// 会话后补发"rag_qa_bot文件夹与RAG实战课程，RAG实战指南文件不用管，修改记录与
+// README也不用"——执行却只做被剔除的那几个文件夹/文件，意图完全做反。
+// 根因：runSession/resumeSession 的错误分支不把 result.History 提交到
+// session.History（只有成功/暂停分支提交），用户终止即丢弃全部前文——
+// 续跑时 History 为空（线上实测 msgs=3/hist=301），模型只看到当条补充消息。
+// 本测试使用与线上一致的用户输入串，复刻"工具回合在飞时被终止→补发消息续跑"全程。
+func TestCancelMidRun_PreservesHistoryForResume(t *testing.T) {
+	block := make(chan struct{})
+	llm := &secondCallGateProvider{
+		inner: &mockReactModelProvider{
+			responses: []*blades.Message{
+				{
+					Role: blades.RoleAssistant,
+					Parts: []blades.Part{
+						blades.ToolPart{Name: "ListDir", Request: string(mustJSON(map[string]any{"path": "."}))},
+					},
+				},
+			},
+			block: block,
+		},
+		entered: make(chan struct{}),
+	}
+	svc := newReactServiceForTest(llm, t.TempDir())
+	// 与线上一致的首轮输入（2026-09-20.log 22:04 会话原话）。
+	goal := "查看文件夹下的学习文档，其中有大量示例代码。你新建一个文件夹，里面提取出所有文档中的示例代码，每一段完整代码示例一个文件。你要全部提取出来的同时验证是否能跑跑不起来修复文档中代码再提取出文件。一个个完整代码示例一个文件，一节内容一个文件夹，一个章内容一个大文件夹分层级，方便学习时找到例子"
+	created, err := svc.CreateSession(context.Background(), CreateRequest{Goal: goal})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	// 等第二次 LLM 调用进入阻塞（第一次工具调用回合已累积进循环内 history）。
+	select {
+	case <-llm.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("2nd llm call did not enter Generate")
+	}
+	// 用户终止（复刻事故：计划被驳回、修订中点终止）。
+	if err := svc.cancel(context.Background(), created.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	waitForStatus(t, svc, created.ID, enums.SessionStatusError, "cancelled")
+
+	// 修复点：error 终态后 History 必须已提交（修复前为 nil，续跑丢光前文）。
+	// cancel() 先翻终态、ReAct 收尾 goroutine 滞后——轮询等 History 落库。
+	var hist []ReactMessage
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		svc.store.mu.Lock()
+		hist = make([]ReactMessage, len(svc.store.sessions[created.ID].History))
+		copy(hist, svc.store.sessions[created.ID].History)
+		svc.store.mu.Unlock()
+		if len(hist) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(hist) == 0 {
+		t.Fatal("cancelled session should keep accumulated History, got empty")
+	}
+	contains := func(sub string) bool {
+		for _, m := range hist {
+			if strings.Contains(m.Content, sub) {
+				return true
+			}
+		}
+		return false
+	}
+	if !contains(goal) {
+		t.Fatal("History lost original goal after cancel")
+	}
+
+	// 事故续跑路径：终止后补发与线上一致的剔除消息。
+	followUp := "rag_qa_bot文件夹与RAG实战课程，RAG实战指南文件不用管，修改记录与README也不用"
+	close(block)
+	if err := svc.enqueue(context.Background(), created.ID, followUp); err != nil {
+		t.Fatalf("enqueue after cancel: %v", err)
+	}
+	waitForStatus(t, svc, created.ID, enums.SessionStatusCompleted, "resumed completed")
+
+	svc.store.mu.Lock()
+	hist = make([]ReactMessage, len(svc.store.sessions[created.ID].History))
+	copy(hist, svc.store.sessions[created.ID].History)
+	svc.store.mu.Unlock()
+	if !contains(goal) || !contains(followUp) {
+		t.Fatalf("resumed run lost context: goal=%v follow-up=%v", contains(goal), contains(followUp))
+	}
+	// 决定性断言：续跑后的第一次 LLM 请求必须同时携带原始任务与补充消息——
+	// 模型第一眼就能看到全部前文，而不是只看到当条消息（线上事故形态）。
+	if !llm.requestContains(goal) || !llm.requestContains(followUp) {
+		t.Fatalf("resumed first LLM request missing context: goal=%v follow-up=%v",
+			llm.requestContains(goal), llm.requestContains(followUp))
+	}
 }
 
 // blockingLLMProvider Generate 阻塞直到 ctx 取消：模拟长跑会话（供墙钟测试保持 running 态）。

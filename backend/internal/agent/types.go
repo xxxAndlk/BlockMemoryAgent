@@ -325,6 +325,9 @@ type ClarifyRequest struct {
 	Questions []ClarifyQuestionItem
 	// Artifacts 随问题附带的产物（如演示评审卡内嵌演示视频），空表示无产物。
 	Artifacts []ClarifyArtifact
+	// Deadline 提问答复截止（ask_user 的 timeout_sec 生成，仅提问侧带截止时非 nil）。
+	// 前端据此显示倒计时；到点工具侧兜底"用户未答复，自行决策"，会话恢复运行。
+	Deadline *time.Time
 }
 
 // Session 是会话对象的 DTO，按字段逐一对齐 server.Session。

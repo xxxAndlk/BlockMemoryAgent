@@ -20,7 +20,7 @@ const verdictLabel = computed(() => {
     case 'pending': return isReview.value ? '审批中…' : '等待审批…'
     case 'approved': return '已批准'
     case 'rejected': return '已驳回'
-    default: return props.plan.success ? '已返回' : '失败'
+    default: return props.plan.timedOut ? '已超时自动放行' : props.plan.success ? '已返回' : '失败'
   }
 })
 
@@ -29,7 +29,7 @@ const verdictColor = computed(() => {
     case 'pending': return 'text-blue-400'
     case 'approved': return 'text-green-500'
     case 'rejected': return 'text-red-400'
-    default: return props.plan.success ? 'text-ink-2' : 'text-red-400'
+    default: return props.plan.timedOut ? 'text-amber-500' : props.plan.success ? 'text-ink-2' : 'text-red-400'
   }
 })
 
@@ -38,7 +38,7 @@ const accent = computed(() => {
     case 'pending': return 'border-l-blue-400'
     case 'approved': return 'border-l-green-500'
     case 'rejected': return 'border-l-red-400'
-    default: return 'border-l-line'
+    default: return props.plan.timedOut ? 'border-l-amber-400' : 'border-l-line'
   }
 })
 

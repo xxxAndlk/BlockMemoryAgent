@@ -36,7 +36,7 @@ import { useSessionList } from '@/composables/useSessionList'
 import { useSessionStatus } from '@/composables/useSessionStatus'
 import { useWorkDir } from '@/composables/useWorkDir'
 import { knownWorkDirs as knownWorkDirsOf } from '@/utils/dir'
-import { maybeNotifySessionDone } from '@/utils/notifications'
+import { maybeNotifySessionDone, maybeNotifyClarifyWaiting } from '@/utils/notifications'
 import ChatView from './chat/ChatView.vue'
 import MonitorView from './monitor/MonitorView.vue'
 import TaskBoardPanel from './components/panels/TaskBoardPanel.vue'
@@ -86,6 +86,18 @@ const clarifyAck = ref(false)
 // 批量问答草稿（任务 140 问题③）：键=question_id，值=逐题草稿（下标对齐 questions）。
 // 上浮到本层抗 500ms 帧重推/断线重连；状态离开 awaiting_clarify 或切换会话时清除。
 const clarifyDrafts = ref<Record<string, string[]>>({})
+
+// 新提问到达（questionId 变化）且页面在后台 → 系统通知"AI 等待你的回答"。
+// 同一 questionId 只弹一次（通知 tag 去重 + watcher 只在变化时触发）；答复/超时后
+// clarifyPending 复位，下一场提问 id 必变，不会漏通知（2026-09-20：此前只有终态通知，
+// ask_user 超时自行决策用户毫无感知）。
+watch(
+  () => clarifyPending.value?.questionId,
+  (qid) => {
+    if (!qid) return
+    maybeNotifyClarifyWaiting(qid, clarifyPending.value?.detail || clarifyPending.value?.questions?.[0]?.question || '')
+  },
+)
 
 // 模型实时汇报/思考文本：由 SSE live 帧驱动（不 push 进 events），对齐 TUI 流式展示
 const liveStreaming = ref('')
@@ -337,6 +349,8 @@ function startStream(s: Session) {
           detail: (ev as any).detail || '',
           questions: qs.length > 1 ? qs : undefined,
           artifacts: arts.length ? arts : undefined,
+          // 剩余秒数服务端每帧现算（150ms 重推），直接透给问答卡做倒计时
+          timeoutSec: typeof (ev as any).timeout_sec === 'number' ? (ev as any).timeout_sec : undefined,
         }
         // 批量题：懒初始化逐题草稿（键=question_id，抗帧重推/重连）
         if (qs.length > 1 && !clarifyDrafts.value[qid]) {

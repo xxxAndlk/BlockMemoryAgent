@@ -35,6 +35,15 @@ const emit = defineEmits<{
 
 const content = ref('')
 
+// 待澄清语境（2026-09-20）：会话 awaiting_clarify 时发送 = 回答上方问题（走 /clarify），
+// 不是下新指令。placeholder 与边框高亮跟着语境变，用户不必猜此刻该在哪输入。
+const awaitingClarify = computed(() => props.session?.status === 'awaiting_clarify')
+const placeholderText = computed(() =>
+  awaitingClarify.value
+    ? '回答上方问题，回车发送（Shift+Enter 换行）'
+    : '向 AI 下达命令…（Enter 发送，Shift+Enter 换行，可直接粘贴图片）',
+)
+
 // 执行档位三档（TODO #14 三档全手动，2026-09-16 由会话头移入对话栏）：
 // 未绑定会话 = 创建选择（localStorage 记忆）；已绑定 = 即时 POST 切档，下一轮按新档选角色。
 const GEAR_STORAGE_KEY = 'bma:newSessionGear'
@@ -380,12 +389,14 @@ function onKeydown(e: KeyboardEvent) {
       </div>
     </div>
 
-    <!-- 输入区：圆角容器内 上=文本域 下=工具行（左：模型/图片；右：发送），对齐主流对话产品 -->
-    <div class="chat-box flex flex-col rounded-xl border border-line bg-page focus-within:border-primary transition-colors">
+    <!-- 输入区：圆角容器内 上=文本域 下=工具行（左：模型/图片；右：发送），对齐主流对话产品。
+         待澄清时边框琥珀高亮（此刻发送=回答上方问题，见 script 注释） -->
+    <div class="chat-box flex flex-col rounded-xl border bg-page transition-colors"
+         :class="awaitingClarify ? 'border-amber-400 dark:border-yellow-600' : 'border-line focus-within:border-primary'">
       <el-input ref="textareaRef" v-model="content"
                 type="textarea"
                 :autosize="{ minRows: 2, maxRows: 8 }"
-                placeholder="向 AI 下达命令…（Enter 发送，Shift+Enter 换行，可直接粘贴图片）"
+                :placeholder="placeholderText"
                 resize="none"
                 class="chat-input"
                 @keydown="onKeydown"

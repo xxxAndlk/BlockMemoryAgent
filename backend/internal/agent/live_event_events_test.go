@@ -121,15 +121,16 @@ func TestHandleLiveEvent_ClusterTopThinkDropped(t *testing.T) {
 	if sess.ThinkingText != "" {
 		t.Fatalf("集群顶层 Meta 思考不应进 ThinkingText，got %q", sess.ThinkingText)
 	}
-	// 思考结束边界（答复输出）：不得落 think 事件，正文只进轮缓冲。
+	// 思考结束边界（答复输出）：不得落 think 事件。此时树上无运行中子 Agent，
+	// 按直推语义（2026-09-20）正文实时进 StreamingText——终答生成期不再整段转圈。
 	svc.handleLiveEvent(sess, LiveEvent{
 		Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "终答",
 	})
 	if ev := findEventByKind(sess.Events, eventkind.Think); ev != nil {
 		t.Fatalf("集群顶层 Meta 思考不应落 think 事件，got %q", ev.Message)
 	}
-	if sess.StreamingText != "" {
-		t.Fatalf("集群顶层 Meta 正文应只进轮缓冲不进 StreamingText，got %q", sess.StreamingText)
+	if sess.StreamingText != "终答" {
+		t.Fatalf("无子 Agent 时顶层正文应直推 StreamingText，got %q", sess.StreamingText)
 	}
 
 	// 子 Agent 思考：照常展示。
