@@ -77,6 +77,10 @@ type reactInternalSession struct {
 	// lastInterimText 是已落事件流的最后一条 assistant_text 文本：persistInterimText 去重依据。
 	// 同轮并行多个工具调用会连发多条 ToolCall 事件而流式文本不变，同一段正文只落一次。
 	lastInterimText string
+	// pendingTopText 是集群档顶层 Meta 当前轮的正文缓冲：该档中间轮口播不进用户流
+	//（LiveEventLLMDelta 只写这里不推 StreamingText），轮末由工具调用边界丢弃、
+	// ask_user 或 run 完成时冲刷进 StreamingText（2026-09-18 编排内心独白泄露修复）。
+	pendingTopText string
 	// ctx 是会话的运行上下文，用于控制生命周期与取消。
 	ctx context.Context
 	// cancelFn 用于取消 ctx，通常在会话结束或关闭时调用。

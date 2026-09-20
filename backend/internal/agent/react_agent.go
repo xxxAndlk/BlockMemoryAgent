@@ -86,6 +86,10 @@ type ReActAgent struct {
 	// 异路径并行。仅并行派发路径使用；串行路径零开销。
 	pathMu      sync.Mutex
 	pathMutexes map[string]*sync.Mutex
+	// dispatchMu 轮内并行的编排类工具互斥锁（P0-1：同轮并发 call_sub_agent 使
+	// dispatcher 同领域查重的"查树快照→Register"临界区 TOCTOU 失效，可产生两个同名
+	// 并行 domain 互写同批文件）。编排类工具只做起始登记（毫秒级），串行化不损并行度。
+	dispatchMu sync.Mutex
 	// stableHashLast 上次记录的 stable 层（系统指令）内容哈希（TODO 第10项①缓存纪律）。
 	// stable 段按实例 sync.Once 冻结，跨轮哈希应恒定；变化即 WARN（防回归断言）。
 	// 仅 Run 循环 goroutine 读写，无需加锁。
@@ -803,6 +807,20 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				continue
 			}
 
+			// 终答前补刀 drain（P1-4）：上方 drain 与 PendingChildren 检查之间存在毫秒
+			// 窗口——子 Agent 的 notify(Send) 与计数递减都落在窗口内时，drain 未取到消息、
+			// 计数已归零，终答将不含该子结果（摘要滞留已完成会话的邮箱成死信；心跳杀路径
+			// 递减先于 Send，把窗口从微秒级拉大到毫秒级）。pending==0 分支再补一次 drain，
+			// 有消息则回主循环整合。
+			if a.mailbox != nil {
+				var late int
+				history, late = a.drainMailbox(history)
+				if late > 0 {
+					unproductiveStreak = 0
+					continue
+				}
+			}
+
 			// 将最终答案作为记忆事件写入。
 			a.memory.Write(a.name, MemoryEvent{
 				Type:     "answer",
@@ -1163,9 +1181,23 @@ func (a *ReActAgent) dispatchToolWithKeepalive(ctx context.Context, tc ToolCall)
 // 同路径并发写会产生交错损坏（半截内容/双写冲突），同路径串行、异路径并行。
 var writeLockedTools = map[string]bool{"WriteFile": true, "EditFile": true, "RestoreFile": true}
 
-// dispatchToolSerialized 带同路径互斥的工具派发：写类工具按目标路径加锁
-//（相对路径按 agent workDir 解析，worktree 副本天然不同键），其余零开销直通。
+// dispatchSerializedTools 轮内并行时需要全互斥的编排类工具（P0-1）：它们修改共享
+// 编排状态（权威树注册/同领域查重/派发配额/git worktree index），并发执行会击穿
+// 串行时代成立的"同父同 domain 唯一活跃"不变量；与子 Agent 派发额度无关的两个
+// 不同 domain 单派也经 call_sub_agents 批量入口，串行化无损并行度。
+var dispatchSerializedTools = map[string]bool{
+	"call_sub_agent": true, "call_sub_agents": true, "map_sub_agents": true,
+	"merge_worktree": true,
+	"cancel_agent": true, "pause_agent": true, "resume_agent": true,
+}
+
+// dispatchToolSerialized 带互斥的工具派发：写类工具按目标路径加锁、编排类工具
+// 全互斥（相对路径按 agent workDir 解析，worktree 副本天然不同键），其余零开销直通。
 func (a *ReActAgent) dispatchToolSerialized(ctx context.Context, tc ToolCall) (ToolResult, error) {
+	if dispatchSerializedTools[tc.Name] {
+		a.dispatchMu.Lock()
+		defer a.dispatchMu.Unlock()
+	}
 	if mu := a.pathLockFor(tc); mu != nil {
 		mu.Lock()
 		defer mu.Unlock()

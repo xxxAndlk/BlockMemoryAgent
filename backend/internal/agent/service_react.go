@@ -397,14 +397,13 @@ func (s *ReactService) SetTopLevelToolsProvider(fn func() []string) {
 }
 
 // mountTopLevelEssentials 把配置声明的顶层必备插件工具（web_search 等）预挂到
-// 会话顶层 scope：只对快速/日常档生效（cluster 档 MetaAgent 已有角色授权，走
-// 既有 tool_catalog+tool_mount 流程，不再叠一层），子 Agent 的独立 scope 不受影响。
-// 幂等；插件未运行/未接线时零行为变化。
+// 会话顶层 scope：三档全挂（2026-09-18 修复：原实现排除 cluster 档，前提是
+// "cluster 档 MetaAgent 已有角色授权，走 tool_catalog+tool_mount"——T13 收窄把这两个
+// 工具从 meta 白名单删了，前提失效，实测集群档 meta 无 web_search 可用、联网调研
+// 任务结构性卡死。统一预挂后三档顶层"问一句搜一下"同权）。子 Agent 的独立 scope
+// 不受影响。幂等；插件未运行/未接线时零行为变化。
 func (s *ReactService) mountTopLevelEssentials(sessionID string, gear string) {
 	if s.toolRegistry == nil || s.topLevelTools == nil {
-		return
-	}
-	if gear != tool.GearFast && gear != tool.GearDaily {
 		return
 	}
 	names := s.topLevelTools()
@@ -3255,6 +3254,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 运行成功：先落完成事件再翻状态——SSE 流见终态即推 done 帧关流（stream_http.go），
 	// 事件必须先入列才能被最后一个 tick 带出；先翻状态的话 tick 落在窗口内就只推
 	// session_status+done，最终答复永远到不了前端（2026-09-09 事故缺口 B）。
+	s.flushPendingTopText(session)
 	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", finalText, "", "", "", "", "", true)
 
 	// 更新会话状态为已完成，并记录结果与历史。
@@ -3448,6 +3448,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 	// 先落完成事件再翻状态（同 runSession：done 帧关流前事件必须已在列，
 	// 2026-09-09 事故缺口 B）。
+	s.flushPendingTopText(session)
 	s.store.addEvent(session, eventkind.AgentDone, "MetaAgent", finalText, "", "", "", "", "", true)
 
 	// 更新会话状态为已完成。
@@ -3512,6 +3513,26 @@ func (s *ReactService) finalizeThinking(session *reactInternalSession, ev LiveEv
 	session.lastThinkEventText = text
 	s.store.addEventDetail(session, eventkind.Think, ev.Agent, text, eventkind.Think, "", "", "", "", true, agentIDJSON(ev.AgentID))
 	s.store.setThinkingText(session, "")
+}
+
+// isClusterTopEvent 判定事件是否来自集群档的顶层 Meta（而非子 Agent 转发）：
+// ev.Agent 为空即顶层（子 Agent 经 ForwardLiveEvent 都带展示名前缀，见 finalizeThinking
+// 的剥前缀逻辑）。该档顶层 Meta 的中间轮口播必须与用户流隔离——LiveEventLLMDelta
+// 只进轮缓冲、LiveEventToolCall 边界丢弃（2026-09-18 编排内心独白泄露进对话栏实证）。
+func (s *ReactService) isClusterTopEvent(session *reactInternalSession, ev LiveEvent) bool {
+	return ev.Agent == "" && session.currentGear() == tool.GearCluster
+}
+
+// flushPendingTopText 把集群档顶层 Meta 的轮缓冲冲刷进 StreamingText：
+// 中间轮口播在工具调用边界已丢弃，能活到 run 完成的只有终答（或 ask_user 正文，
+// 那条在 ToolCall 分支已自行冲刷）——冲刷让 SSE 末帧快照带上最终答复文本，
+// 与 agent_done 事件同 tick 推送，前端直播行与完成气泡都有内容。
+func (s *ReactService) flushPendingTopText(session *reactInternalSession) {
+	if session.pendingTopText == "" {
+		return
+	}
+	s.store.setStreamingText(session, session.pendingTopText)
+	session.pendingTopText = ""
 }
 
 // persistInterimText 把"调用工具前模型输出的正文"落为会话 assistant_text 事件。
@@ -3582,16 +3603,35 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 	case LiveEventLLMDelta:
 		// 答复文本开始输出时，思考阶段结束：先落 think 事件，再清空瞬时思考展示。
 		s.finalizeThinking(session, ev)
+		if s.isClusterTopEvent(session, ev) {
+			// 集群档顶层 Meta：正文只进轮缓冲不推 StreamingText——中间轮的编排口播
+			//（"已派出 N 个子 agent…"之类）绝对不能进用户流（2026-09-18 用户实证）；
+			// 终答由 agent_done 事件承载，不依赖流式推送。ask_user 恢复路径本就
+			// 会清 StreamingText（2026-09-09 修复），旧正文重推有既有兜底。
+			session.pendingTopText = ev.Text
+			break
+		}
 		s.store.setStreamingText(session, ev.Text)
 	case LiveEventThinkDelta:
 		s.store.setThinkingText(session, ev.Text)
 	case LiveEventToolCall:
 		// 工具调用开始同样意味着思考阶段结束（思考型模型常见 think→tool 而非 think→text）。
 		s.finalizeThinking(session, ev)
-		// 同一边界也是"这一轮正文说完了"：模型常见「口播一句（做了什么/接下来干什么）→调工具」，
-		// 那段正文只活在瞬时 StreamingText 里，下一个轮次的 delta 直接覆盖、前端 live 行也在
-		// 工具调用事件到达时清掉——用户看到的是"话刚出现就凭空消失"（2026-09-13 用户实证）。
-		s.persistInterimText(session, ev)
+		if s.isClusterTopEvent(session, ev) {
+			// 集群档顶层 Meta：本轮正文是中间轮口播，连同缓冲一起丢弃——不落 assistant_text
+			// 事件、不进 StreamingText（用户流里绝不出现编排内心独白，2026-09-18 用户实证）。
+			// ask_user 例外：提问正文快照（clarifyReportJSON）读 StreamingText，冲刷保留，
+			// 提问卡上方要展示这段正文。
+			if ev.Tool == "ask_user" {
+				s.store.setStreamingText(session, session.pendingTopText)
+			}
+			session.pendingTopText = ""
+		} else {
+			// 同一边界也是"这一轮正文说完了"：模型常见「口播一句（做了什么/接下来干什么）→调工具」，
+			// 那段正文只活在瞬时 StreamingText 里，下一个轮次的 delta 直接覆盖、前端 live 行也在
+			// 工具调用事件到达时清掉——用户看到的是"话刚出现就凭空消失"（2026-09-13 用户实证）。
+			s.persistInterimText(session, ev)
+		}
 		// call_sub_agent 是子 Agent 派发：记录专用派发事件（角色 ID 与任务摘要），
 		// 供 TUI 对话区展示阶段标记、编排面板派生子 Agent 节点。
 		if ev.Tool == "call_sub_agent" || ev.Tool == "call_sub_agents" {
@@ -3766,14 +3806,20 @@ func (s *ReactService) pauseSession(session *reactInternalSession, history []Rea
 // suspendOnChildWait 落定「挂起等子」：Meta 中继文本落普通消息事件（前端按正常发言展示），
 // 会话置 awaiting_child（保留 History 与临时目录）。
 // 竞态收口：Run 判定 pending>0 到挂起落定之间有时间窗——若窗口内最后一个子 Agent 已完成
-// （trackChildDone 的唤醒回调彼时见 Running 态空转），此处补检 pending==0 立即自唤醒，
-// 否则再无完成事件触发唤醒，会话死等。
+// （trackChildDone 的唤醒回调彼时见 Running 态空转），此处补检 pending==0 立即自唤醒；
+// 同理窗口内子 Agent 发来 send_message(request)/submit_plan 审批等任意邮箱消息，
+// 投递时的唤醒因状态仍 Running 被过滤空转、消息滞留邮箱（发信方阻塞等答复，双方死锁），
+// 补检邮箱未读同样立即自唤醒（P0-2a）。否则再无事件触发唤醒，会话死等。
 func (s *ReactService) suspendOnChildWait(session *reactInternalSession, result ReactResult) {
 	if text := strings.TrimSpace(result.Text); text != "" {
 		s.store.addEvent(session, eventkind.Message, "MetaAgent", text, "", "", "", "", "", true)
 	}
 	s.pauseSession(session, result.History, PauseChildWait)
-	if s.pendingChecker != nil && s.pendingChecker.PendingChildren(session.ID) == 0 {
+	pending := 0
+	if s.pendingChecker != nil {
+		pending = s.pendingChecker.PendingChildren(session.ID)
+	}
+	if pending == 0 || (s.mailbox != nil && s.mailbox.Count(session.ID) > 0) {
 		s.WakeOnChildDone(session.ID)
 	}
 }

@@ -135,3 +135,78 @@ func TestTrimDebugEvents_KeepsAssistantText(t *testing.T) {
 		t.Fatalf("裁剪后应只留 assistant_text，got %v", out)
 	}
 }
+
+// TestClusterTopNarration_Suppressed 验证集群档顶层 Meta 的中间轮口播与用户流完全隔离
+//（2026-09-18 用户实证：「已确认根因：环境性失败…我注意到自己可用技能中有…」这类
+// 编排内心独白原样出现在对话栏）：LLMDelta 只进轮缓冲不推 StreamingText，
+// 工具调用边界丢弃且不落 assistant_text 事件。
+func TestClusterTopNarration_Suppressed(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	sess.setGear("cluster")
+
+	// 顶层 Meta 流式输出中间轮口播（Agent 为空 = 顶层，非子 Agent 转发）。
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Text: "已确认根因：环境性失败——重派同类子 agent 必然同样失败"})
+	if sess.StreamingText != "" {
+		t.Fatalf("集群档顶层口播不得推 StreamingText，got %q", sess.StreamingText)
+	}
+	if sess.pendingTopText == "" {
+		t.Fatal("口播应进轮缓冲 pendingTopText")
+	}
+
+	// 工具调用边界：缓冲丢弃、不落 assistant_text、不进 StreamingText。
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Tool: "call_sub_agent"})
+	if n := countEventsByKind(sess.Events, eventkind.AssistantText); n != 0 {
+		t.Fatalf("集群档顶层口播不得落 assistant_text 事件，got %d", n)
+	}
+	if sess.StreamingText != "" || sess.pendingTopText != "" {
+		t.Fatalf("工具调用边界应丢弃缓冲，stream=%q pending=%q", sess.StreamingText, sess.pendingTopText)
+	}
+}
+
+// TestClusterTopNarration_AskUserFlush 验证 ask_user 例外：提问正文要供提问卡上方展示
+//（clarifyReportJSON 读 StreamingText），轮缓冲在 ask_user 工具调用边界冲刷保留。
+func TestClusterTopNarration_AskUserFlush(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	sess.setGear("cluster")
+
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Text: "开始前需要确认：目标目录用哪个？"})
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Tool: "ask_user"})
+	if sess.StreamingText != "开始前需要确认：目标目录用哪个？" {
+		t.Fatalf("ask_user 边界应冲刷提问正文进 StreamingText，got %q", sess.StreamingText)
+	}
+
+	// 用户答复后恢复路径会清 StreamingText（2026-09-09 修复，service_react askUser 钩子）；
+	// 此后新一轮口播继续只进缓冲，不把旧提问正文当实时流重推。
+	svc.store.setStreamingText(sess, "")
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Text: "收到，继续处理"})
+	if sess.StreamingText != "" {
+		t.Fatalf("恢复后口播不得重推 StreamingText，got %q", sess.StreamingText)
+	}
+}
+
+// TestClusterTopNarration_FinalAnswerFlush 验证 run 完成时终答缓冲冲刷进 StreamingText
+//（与 agent_done 事件同 tick 推送），非集群档不受影响。
+func TestClusterTopNarration_FinalAnswerFlush(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	sess.setGear("cluster")
+
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Text: "最终答复：三处热修已全部完成并验证"})
+	svc.flushPendingTopText(sess)
+	if sess.StreamingText != "最终答复：三处热修已全部完成并验证" {
+		t.Fatalf("完成时应冲刷终答进 StreamingText，got %q", sess.StreamingText)
+	}
+	if sess.pendingTopText != "" {
+		t.Fatal("冲刷后缓冲应清空")
+	}
+
+	// 日常档（非集群）：LLMDelta 照常直推 StreamingText，缓冲不启用。
+	svc2, sess2 := newLiveEventTestSession(t)
+	svc2.handleLiveEvent(sess2, LiveEvent{Kind: LiveEventLLMDelta, Text: "日常档中间正文"})
+	if sess2.StreamingText != "日常档中间正文" {
+		t.Fatalf("日常档 LLMDelta 应直推 StreamingText，got %q", sess2.StreamingText)
+	}
+	svc2.handleLiveEvent(sess2, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", Tool: "ReadFile"})
+	if findEventByKind(sess2.Events, eventkind.AssistantText) == nil {
+		t.Fatal("日常档中间正文应照常落 assistant_text 事件")
+	}
+}

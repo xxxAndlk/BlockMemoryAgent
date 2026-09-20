@@ -74,6 +74,15 @@ func (d *Dispatcher) PurgeSession(sessionID string, nodeIDs []string) {
 		}
 		return true
 	})
+	// 4.5 未决子计数表（F3①）：parentID 恒为会话 ID 或 "会话ID/节点ID" 前缀，此前
+	// 无任何 Delete——每个派发过子 Agent 的节点条目永久驻留 sync.Map，长会话内存只增不减。
+	// 会话已整体终结（前面已取消全部节点），不存在新派发与删除的竞态，前缀整批回收。
+	d.pending.Range(func(k, _ any) bool {
+		if key, ok := k.(string); ok && inSession(key) {
+			d.pending.Delete(k)
+		}
+		return true
+	})
 	if d.planState != nil {
 		d.planState.purgeSession(sessionID)
 	}

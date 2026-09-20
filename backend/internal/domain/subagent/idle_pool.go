@@ -350,6 +350,26 @@ func (d *Dispatcher) enterIdle(s *domainSlot, summary string) {
 		s.mu.Unlock()
 		return
 	}
+	killFn := s.destroyFnLocked()
+	s.mu.Unlock()
+
+	// P0-2c 树先行：树翻 Idle 必须先于槽状态翻转——复用临界区（dispatchToIdleSlot/
+	// WakeIdleWithMessage）持 s.mu 复核"槽 Idle ⇒ 树 Idle"并同临界区完成树 Wake，
+	// 消除"槽已 Idle 树仍 Running"导致的 t.Wake 假失败窗口（旧顺序下该窗口会让
+	// 合法复用被误拒或树卡 Idle）。
+	if d.treeFn != nil {
+		if t := d.treeFn(s.sessionID); t != nil {
+			t.Idle(s.id, summary, killFn)
+		}
+	}
+
+	s.mu.Lock()
+	if s.state != slotRunning {
+		// 窗口内槽被复用唤醒/销毁：树状态由该路径自纠（复用完成重新 enterIdle；
+		// 销毁路径 Finish），此处不再翻转。
+		s.mu.Unlock()
+		return
+	}
 	s.state = slotIdle
 	s.idleSince = time.Now()
 	// T22 档位固化：进 Idle 时记录会话当前档位，隐式复用解析按它裁决
@@ -362,16 +382,9 @@ func (d *Dispatcher) enterIdle(s *domainSlot, summary string) {
 		s.ttlTimer.Stop()
 		s.ttlTimer = nil
 	}
-	killFn := s.destroyFnLocked()
 	s.mu.Unlock()
 
 	d.activity.Delete(s.id)
-	// 树转 Idle 并绑定销毁句柄：硬取消/话题切换/TTL 到期统一走 Tree.Cancel 或直接调用。
-	if d.treeFn != nil {
-		if t := d.treeFn(s.sessionID); t != nil {
-			t.Idle(s.id, summary, killFn)
-		}
-	}
 	d.armTTL(s)
 	log.Printf("[subagent] IDLE: sub=%s domain=%s reuse=%d (hot-resident)", s.id, s.domain, s.reuseCount)
 }
@@ -516,8 +529,17 @@ func (d *Dispatcher) runDomainSupervisor(s *domainSlot, firstTask string, firstW
 			if q, ok := s.dequeueNext(); ok {
 				task, wc, imgs = q.task, q.wallClock, q.images
 				// 唤醒槽（Idle→Running）继续执行队头任务。
+				// P0-2f（2026-09-18 实测审查发现）：出队续跑必须同时解除 TTL 武装——
+				// enterIdle 刚武装的倒计时原样遗留，任务执行期间 TTL 到期投 opDestroy，
+				// 收尾 park 即销毁槽（队列剩余任务连带静默丢弃）。与 dispatchToIdleSlot
+				// idle 分支的解除序列（停表+nil+ttlArmed=false）对齐。
 				s.mu.Lock()
 				s.state = slotRunning
+				if s.ttlTimer != nil {
+					s.ttlTimer.Stop()
+					s.ttlTimer = nil
+				}
+				s.ttlArmed = false
 				cancelRef := s.cancelTask
 				s.mu.Unlock()
 				if d.treeFn != nil {
@@ -627,6 +649,28 @@ func (d *Dispatcher) destroySlot(s *domainSlot, reason string) {
 	// 队列中已 trackChildStart 的任务补偿递减（销毁时永不执行）。
 	for range queued {
 		d.trackChildDone(s.parentID)
+	}
+	// P0-2c 排空滞留指令：复用派发（dispatchToIdleSlot/WakeIdleWithMessage）与销毁竞态时，
+	// opNewTask 可能已入通道但排在在飞 opDestroy（TTL AfterFunc/destroyFnLocked 投递）
+	// 之后——supervisor 消费销毁指令后退出，通道永不再被读取，任务静默丢失且父未决
+	// 计数挂账永不递减。此处逐项补偿递减并回告父 Agent。
+	drainedNewTasks := 0
+	drainLoop:
+	for {
+		select {
+		case op := <-s.ops:
+			if op.kind == opNewTask {
+				drainedNewTasks++
+			}
+		default:
+			break drainLoop
+		}
+	}
+	for i := 0; i < drainedNewTasks; i++ {
+		d.trackChildDone(s.parentID)
+	}
+	if drainedNewTasks > 0 {
+		d.notify(s.parentID, s.id, fmt.Sprintf("子 Agent 销毁时丢弃 %d 个竞态投递的复用任务（父未决计数已补偿递减），如需继续请重新派发。", drainedNewTasks), nil)
 	}
 	// 树收尾：TTL 到期=Done（自然退役）；硬取消路径树已 Cancelled（Finish 幂等 no-op）。
 	if d.treeFn != nil && s.sessionID != "" {
@@ -776,6 +820,10 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 		d.activity.Delete(s.id)
 		// 挂起全树（叶子经 SuspendGate 在下个检查点 park；在飞的跑完或完成回灌）。
 		d.SuspendSession(s.sessionID)
+		// P0-2b：父会话若正处于挂起等子（awaiting_child），暂停事件无任何唤醒源
+		// （无 notify/无递减）——显式唤醒让父走 PausedChildChecker 转 paused_on_child。
+		d.pokeParent(s.parentID)
+		d.wakeSuspendedParent(s.parentID, "【系统】子 Agent "+s.id+" 触达 token 上限已暂停，请检测并处置（可换模型续跑或 cancel 放弃）。")
 		return domainTaskSuspended
 	}
 	if errors.Is(err, context.Canceled) {
@@ -818,6 +866,9 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 			s.suspended = true
 			s.mu.Unlock()
 			d.activity.Delete(s.id)
+			// P0-2b：同触限挂起路径——父若挂起等子需显式唤醒当轮处置。
+			d.pokeParent(s.parentID)
+			d.wakeSuspendedParent(s.parentID, "【系统】子 Agent "+s.id+" 已按指令暂停，请查收邮箱处置。")
 			log.Printf("[subagent] MANUAL-PAUSED: sub=%s domain=%s duration=%s (hot-resident awaiting resume)", s.id, s.domain, duration)
 			return domainTaskSuspended
 		}
@@ -1133,6 +1184,10 @@ func (d *Dispatcher) SuspendSession(sessionID string) {
 				s.ttlTimer = nil
 				// 记剩余量，恢复时重挂。
 				s.ttlDeadline = time.Now() // 暂以当前时间占位，resume 重算
+				// P0-2g（2026-09-18 实测审查发现）：冻结必须连 ttlArmed 一起复位——
+				// 原实现只停表，armTTL 的"已武装"幂等守卫令 ResumeSessionAgents
+				// 的重挂调用永远被拒，槽退出 TTL 治理永久驻留。
+				s.ttlArmed = false
 			}
 			s.mu.Unlock()
 		}
@@ -1227,19 +1282,60 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 
 	s.mu.Lock()
 	state := s.state
-	qlen := len(s.taskQueue)
 	s.mu.Unlock()
 
 	// 本轮用户图片（Alt+V 粘贴）：从父 ctx 带外取出，随任务捎带给该 domain
 	//（本任务首条 user 消息挂图；忙碌入队则随 queuedTask 缓冲）。
 	imgs := agent.UserImagesFromContext(ctx)
 
+	// 忙碌入队闭包：slotIdle 竞态复核发现槽已转 Running 时与 default 分支同语义复用。
+	// P0-2d（2026-09-18 集群档实测审查发现，严重）：挂账 trackChildStart 与入队必须
+	// 同事务——原实现先挂账（s.mu 外）后入队，destroySlot 排空队列并补偿递减（s.mu 外，
+	// idle_pool.go destroySlot 尾部）若先执行，本任务的补偿 -1 先于挂账 +1，父未决
+	// 计数永久 +1（终结保护空等）。现整段持 s.mu：锁内复核状态（销毁即拒，不挂账）→
+	// 容量复核 → 入队 → 同事务挂账。destroy 先持锁则见 destroyed 拒绝；后持锁则队列
+	// 含本任务且挂账已完成，其补偿 -1 与本 +1 平账。
+	enqueue := func() (string, *tool.Result) {
+		taskText := d.buildReuseTask(ctx, s, task)
+		s.mu.Lock()
+		if s.state == slotDestroyed {
+			s.mu.Unlock()
+			return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s 已被销毁（TTL/取消竞态），请用 role_id=domain 新建", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
+		}
+		if len(s.taskQueue) >= d.hotCfg.TaskQueueLen {
+			s.mu.Unlock()
+			return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s 任务队列已满（%d），请稍后重派或新建", reuseAgentID, len(s.taskQueue)), Category: tool.ResultCategoryValidationRejected}
+		}
+		s.taskQueue = append(s.taskQueue, queuedTask{task: taskText, wallClock: wallClock, images: imgs})
+		qlen := len(s.taskQueue)
+		d.trackChildStart(parentID)
+		s.mu.Unlock()
+		log.Printf("[subagent] QUEUE: sub=%s domain=%s queued=%d (busy, will run after current task)", s.id, s.domain, qlen)
+		// 任务台账登记：忙碌入队同样记"进行中"（备注队列位置），任务执行后由 notify 收口。
+		d.ledger.RecordDispatch(s.sessionID, parentID, s.id, s.domain, task, fmt.Sprintf("入队第%d位", qlen))
+		return s.id + "（忙碌中，任务已入队，当前任务完成后执行）", nil
+	}
+
 	switch state {
 	case slotDestroyed:
 		return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s already destroyed，请用 role_id=domain 新建", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
 	case slotIdle:
 		// 唤醒：树 Idle→Running + reuseCount+1 + TTL 重置满额 + opNewTask。
+		// P0-2c 竞态收口（整个分支持 s.mu）：读状态与投递 opNewTask 必须原子——否则槽可在
+		// 期间被 TTL/硬取消销毁（opDestroy 先被 supervisor 消费 → 槽销毁退出 → opNewTask
+		// 滞留死通道），父未决计数挂账永不递减、任务静默丢失。持锁投递为 non-blocking
+		//（default 分支），不与 supervisor 的 s.mu 形成死锁；op 仍可能落在在飞 opDestroy
+		// 之后，由 destroySlot 排空通道兜底补偿。
 		s.mu.Lock()
+		if s.state != slotIdle {
+			// 读取状态后槽被销毁/转 Running：销毁拒绝；Running 落入队（同 busy 语义）。
+			st := s.state
+			s.mu.Unlock()
+			if st == slotDestroyed {
+				return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s 已被销毁（取消/TTL 到期竞态），请用 role_id=domain 新建", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
+			}
+			return enqueue()
+		}
 		s.reuseCount++
 		if s.ttlTimer != nil {
 			s.ttlTimer.Stop()
@@ -1249,40 +1345,39 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 		// 任务文本注入前缀（共享记忆 + 召回），responsibility 用槽内冻结值。
 		taskText := d.buildReuseTask(ctx, s, task)
 		cancelRef := s.cancelTask
-		s.mu.Unlock()
-
+		// 树 Idle→Running 与槽状态复核同临界区（enterIdle 已改为树先行，"槽 Idle ⇒ 树
+		// Idle"不变量成立）：Wake 失败=状态失步，拒绝并回滚 reuseCount，不投递 op。
 		if d.treeFn != nil {
 			if t := d.treeFn(s.sessionID); t != nil {
-				t.Wake(s.id, cancelRef)
+				if !t.Wake(s.id, cancelRef) {
+					s.reuseCount--
+					s.mu.Unlock()
+					return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s 树节点非空闲（状态失步），请用 role_id=domain 新建", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
+				}
 			}
 		}
+		// P0-2d：未决计数与 opNewTask 投递必须同事务（同持 s.mu 先计数后投递）——
+		// destroySlot 排空滞留 op 的补偿递减在 s.mu 外执行，若计数留在投递后（锁外），
+		// 销毁可先补偿 -1 后计数 +1，父未决永久挂账。default 分支回滚计数并补偿递减。
 		d.trackChildStart(parentID)
-		// 活动恢复（心跳豁免解除）：enterIdle 已 Delete 旧条目，Load 必落空，须重建。
-		d.rearmSlotActivity(s.id)
 		select {
 		case s.ops <- domainOp{kind: opNewTask, task: taskText, wallClock: wallClock, images: imgs}:
 		default:
-			// ops 满（异常）：回滚挂账。
+			// ops 满（异常）：回滚计数与未决挂账。
+			s.reuseCount--
+			s.mu.Unlock()
 			d.trackChildDone(parentID)
 			return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s 指令通道满，请稍后重试", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
 		}
+		s.mu.Unlock()
+		// 活动恢复（心跳豁免解除）：enterIdle 已 Delete 旧条目，Load 必落空，须重建。
+		d.rearmSlotActivity(s.id)
 		log.Printf("[subagent] REUSE: sub=%s domain=%s reuse=%d task_len=%d", s.id, s.domain, s.reuseCount, len(task))
 		// 任务台账登记：续建复用新开一条任务记录（台账按任务粒度，热驻槽跨任务不累加）。
 		d.ledger.RecordDispatch(s.sessionID, parentID, s.id, s.domain, task, fmt.Sprintf("续建#%d", s.reuseCount))
 		return s.id, nil
 	default: // slotRunning（含挂起）
-		if qlen >= d.hotCfg.TaskQueueLen {
-			return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s 任务队列已满（%d），请稍后重派或新建", reuseAgentID, qlen), Category: tool.ResultCategoryValidationRejected}
-		}
-		taskText := d.buildReuseTask(ctx, s, task)
-		d.trackChildStart(parentID)
-		s.mu.Lock()
-		s.taskQueue = append(s.taskQueue, queuedTask{task: taskText, wallClock: wallClock, images: imgs})
-		s.mu.Unlock()
-		log.Printf("[subagent] QUEUE: sub=%s domain=%s queued=%d (busy, will run after current task)", s.id, s.domain, qlen+1)
-		// 任务台账登记：忙碌入队同样记"进行中"（备注队列位置），任务执行后由 notify 收口。
-		d.ledger.RecordDispatch(s.sessionID, parentID, s.id, s.domain, task, fmt.Sprintf("入队第%d位", qlen+1))
-		return s.id + "（忙碌中，任务已入队，当前任务完成后执行）", nil
+		return enqueue()
 	}
 }
 
@@ -1312,6 +1407,7 @@ func (d *Dispatcher) WakeIdleWithMessage(agentID, content string) error {
 		return fmt.Errorf("%w: 热驻槽 %s 已销毁", agent.ErrAgentNotDirectable, agentID)
 	}
 	// idle 分支（同 dispatchToIdleSlot）：reuseCount+1 + TTL 重置 + 树 Idle→Running + opNewTask。
+	// P0-2c：状态复核→树 Wake→op 投递整段持 s.mu（竞态与回滚口径同 dispatchToIdleSlot）。
 	s.reuseCount++
 	if s.ttlTimer != nil {
 		s.ttlTimer.Stop()
@@ -1320,24 +1416,32 @@ func (d *Dispatcher) WakeIdleWithMessage(agentID, content string) error {
 	s.ttlArmed = false
 	taskText := "【用户直连消息】\n" + content
 	cancelRef := s.cancelTask
-	s.mu.Unlock()
-
 	if d.treeFn != nil {
 		if t := d.treeFn(s.sessionID); t != nil {
-			t.Wake(s.id, cancelRef)
+			if !t.Wake(s.id, cancelRef) {
+				s.reuseCount--
+				s.mu.Unlock()
+				return fmt.Errorf("%w: 热驻槽 %s 树节点非空闲（状态失步）", agent.ErrAgentNotDirectable, agentID)
+			}
 		}
 	}
-	// 父未决计数挂账（对齐 ReviveWithMessage）：完成时 trackChildDoneOnce 配对递减。
+	// P0-2d：未决计数与 opNewTask 投递同事务（口径同 dispatchToIdleSlot idle 分支）；
+	// default 分支回滚计数并补偿递减。
 	d.trackChildStart(s.parentID)
-	// 活动恢复（心跳豁免解除）：enterIdle 已 Delete 旧条目，须重建。
-	d.rearmSlotActivity(s.id)
 	select {
 	case s.ops <- domainOp{kind: opNewTask, task: taskText}:
 	default:
-		// ops 满（异常）：回滚挂账。
+		s.reuseCount--
+		s.mu.Unlock()
 		d.trackChildDone(s.parentID)
 		return fmt.Errorf("%w: 热驻槽 %s 指令通道满，请稍后重试", agent.ErrAgentNotDirectable, agentID)
 	}
+	s.mu.Unlock()
+
+	// 父未决计数已在上方临界区内与 opNewTask 投递同事务挂账（P0-2d），
+	// 完成时 trackChildDoneOnce 配对递减。
+	// 活动恢复（心跳豁免解除）：enterIdle 已 Delete 旧条目，须重建。
+	d.rearmSlotActivity(s.id)
 	log.Printf("[subagent] USER-WAKE: sub=%s domain=%s reuse=%d msg_len=%d", s.id, s.domain, s.reuseCount, len(content))
 	// 任务台账登记：用户直连单独备注，区别于主 Agent 续建派发。
 	d.ledger.RecordDispatch(s.sessionID, s.parentID, s.id, s.domain, truncateRunes(content, 80), fmt.Sprintf("用户直连#%d", s.reuseCount))
@@ -1444,6 +1548,42 @@ func (d *Dispatcher) dispatchHotDomain(ctx context.Context, parentID, subAgentID
 
 	d.pool.store(s)
 	log.Printf("[subagent] dispatch: parent=%s sub=%s role=domain domain=%s task=%q (hot-resident)", parentID, subAgentID, domain, taskBrief)
-	go d.runDomainSupervisor(s, taskText, wallClock, agent.UserImagesFromContext(ctx))
+	// P1-3 panic 兜底：supervisor 内任何 panic（SDK 空指针/工具 panic）不得崩掉整个
+	// 后端带走全部在跑会话——recover 后走无锁清理（panic 可能持 s.mu 未放，禁碰槽锁），
+	// 父未决计数补偿与树收尾对齐 destroySlot 语义。
+	go func() {
+		defer d.recoverSlotPanic(s)
+		d.runDomainSupervisor(s, taskText, wallClock, agent.UserImagesFromContext(ctx))
+	}()
 	return subAgentID, nil
+}
+
+// recoverSlotPanic 热驻 supervisor goroutine 的 panic 兜底（defer 调用，无 panic 时
+// 零开销直接返回）。刻意不触碰 s.mu：panic 展开点可能仍持有槽锁，加锁即死锁；
+// 只做 sync.Map/pool 级无锁清理 + 父补偿，槽从池摘除防泄漏。
+func (d *Dispatcher) recoverSlotPanic(s *domainSlot) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	log.Printf("[subagent] PANIC RECOVERED: supervisor sub=%s domain=%s panic=%v", s.id, s.domain, r)
+	if v, ok := d.subMeta.LoadAndDelete(s.id); ok {
+		if m, ok2 := v.(*subAgentMeta); ok2 {
+			m.doneOnce.Do(func() { d.trackChildDone(s.parentID) })
+		}
+	}
+	d.pool.remove(s.sessionID, s.id)
+	d.running.Delete(s.id)
+	d.activity.Delete(s.id)
+	d.lastWrites.Delete(s.id)
+	d.heldSkills.Delete(s.id)
+	if d.treeFn != nil && s.sessionID != "" {
+		if t := d.treeFn(s.sessionID); t != nil {
+			t.Finish(s.id, "panic recovered", errPanicRecovered)
+		}
+	}
+	if d.mailbox != nil {
+		d.mailbox.Purge(s.id)
+	}
+	d.notify(s.parentID, s.id, failureMarker(FailureKindKilled, true)+"\n子 Agent 因内部异常（panic）被回收，任务未回传；父未决计数已补偿递减。", nil)
 }

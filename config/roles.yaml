@@ -44,16 +44,19 @@ meta_agent:
   # 实证 2026-08-18，MetaAgent 联网永远默认走内置 HTTPGet 硬刮搜索引擎（零摩擦路径依赖），
   # web_search 插件（firecrawl，roles:["meta"]）需要 tool_catalog+tool_mount 两步而从不被选中。
   # 去掉后 meta 联网只能挂 web_search 插件，调研结论钉进 spec 再派发（见派发铁律）。
-  # TODO 第15项 T13（2026-09-14）提示词瘦身：meta 收窄为编排/汇总最小集（40→22 个）——
-  # 去掉直接执行类（WriteFile/RunCommand/ReadMedia：meta 只派发与汇总，读写自有 domain 承担；
-  # 2026-09-07 单循环默认化的"发还"重新收回）、模型/角色管理类（create_role/list_roles/
-  # list_models/set_role_model/set_agent_model：运维动作不属任务循环）、项目刷新与记忆类
-  # （RefreshProjectDoc/remember_preference/search_knowledge：写侧自动触发 + 检索走 domain）、
-  # 插件管理类（plugin_*/tool_catalog/tool_mount/tool_unmount：装机一次性动作，不在任务循环）。
-  # 保留读三件（ReadFile/EditFile/RestoreFile）+ SearchInFiles（新增：汇总阶段复核交付物）。
+  # 历史收窄（TODO 第15项 T13，2026-09-14）曾删直接执行/模型管理/插件管理三类，2026-09-18
+  # 集群档实测全部回滚恢复：meta 无 WriteFile 落盘卡死 6 分钟（绕 shared memory→复用热驻
+  # domain 代写）、无 RunCommand 自证"我这边也缺少可用的命令执行工具"致首轮全灭、无
+  # tool_catalog/tool_mount 时 web_search 角色授权形同虚设。恢复清单：WriteFile/RunCommand/
+  # ReadMedia（提示词能力声明/探索落盘直写/返工直达/CLI 交付物章节直接引用）、tool_catalog/
+  # tool_mount（联网与插件挂载）、list_models/set_role_model/set_agent_model（模型选型/
+  # 实例换档/慢域归因章节引用）。仍不收：HTTPGet（联网走 web_search 预挂）、create_role/
+  # list_roles（运维动作）、RefreshProjectDoc/remember_preference/search_knowledge（写侧
+  # 自动触发/检索走 domain）、plugin_list/plugin_unload 等（plugin_list 提示词仅用于
+  # 确认不可用，非任务循环）。
   # 插件工具（web_search 等）不经此列表：由 role_tool_gate 硬门闭包按"角色可见"并集放行
   #（bootstrap.go），Schema 可见性仍走 白名单 ∪（可见 ∧ 已挂载）软过滤。
-  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, write_plan, submit_plan, review_plan, ReadFile, EditFile, RestoreFile, SearchInFiles, ShowArtifact, list_skills, load_skill]
+  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, write_plan, submit_plan, review_plan, ReadFile, EditFile, RestoreFile, WriteFile, RunCommand, ReadMedia, SearchInFiles, ShowArtifact, list_skills, load_skill, tool_catalog, tool_mount, list_models, set_role_model, set_agent_model]
 
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:

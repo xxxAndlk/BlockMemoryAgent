@@ -6,10 +6,12 @@ import (
 	"encoding/json" // encoding/json 解析 SharedEntry 做 stat 校验
 	"errors"        // errors 提供哨兵错误 errLimitReached 与 errors.Is 判定
 	"fmt"           // fmt 用于格式化子 Agent ID 与错误信息
+	"hash/fnv"      // fnv 用于派发分条锁的父 ID 哈希（P0-1）
 	"log"           // log 用于记录块记忆写入失败等不影响主流程的错误
 	"log/slog"      // slog 用于块记忆连续失败阈值告警（单条 log 在长任务中被淹没）
 	"os"            // os 用于 stat 文件 mtime 校验（Layer 3 缓存一致性）
 	"path/filepath" // filepath 用于 spec 文件路径规范化（冒烟检查/契约检查）
+	"regexp"        // regexp 用于派前能力校验的任务文本信号匹配（P0-2e）
 	"sort"          // sort 用于召回结果按 outcome/reuse_count 价值排序
 	"strings"       // strings 用于从 Agent ID 中提取角色 ID
 	"sync"          // sync 提供 sync.Map 存储运行中的子 Agent
@@ -190,6 +192,13 @@ type Dispatcher struct {
 	// sessionCounts 跟踪每个 session 的累计派发总数（所有角色合计），用于全局派发限额。
 	// 键为 sessionID（parentID 首段），值为 *atomic.Int64。用户发送新消息时重置。
 	sessionCounts sync.Map
+
+	// dispatchStripes 按父 Agent ID 哈希分条的派发互斥锁（P0-1 双保险）：把
+	// "同领域查重 → 权威树 Register" 做成原子临界区，杜绝同名 domain 并行双发
+	//（轮内并行工具开启后，react_agent 层已串行化编排类工具，本锁兜住未来其他
+	// 并发派发入口）。锁内只做派发起始登记（校验/配额/树注册/goroutine 启动，
+	// 毫秒级），不含子 Agent 执行体；分条而非全局，避免无关父 Agent 互等。
+	dispatchStripes [32]sync.Mutex
 
 	// sharedMem 是共享记忆的只读视图（tool.SharedMemoryStore 接口的子集），
 	// 供子 Agent 派发时读取主 Agent 写入的关键上下文与任务规范。
@@ -432,7 +441,10 @@ type Dispatcher struct {
 	// doneOnce 保证 patrol 与 goroutine 任一方 trackChildDone 仅触发一次，防双递减。
 	subMeta sync.Map // subAgentID -> *subAgentMeta
 	// patrolOnce 保证巡检 goroutine 只启动一次；patrolStop 关闭后巡检退出（测试用 ClosePatrol）。
+	// patrolMu 保护 patrolStop 的 close 与置 nil：ClosePatrol 可被并发/重复调用
+	//（多个 t.Cleanup、defer+显式双路径），无锁时 close of closed channel 直接 panic。
 	patrolOnce sync.Once
+	patrolMu   sync.Mutex
 	patrolStop chan struct{}
 
 	// hotCfg DomainAgent 热驻留配置（idle_pool.go）；Enabled=false（默认零值）时
@@ -513,7 +525,18 @@ func (d *Dispatcher) trackChildStart(parentID string) {
 // 保证唤醒 resume 时摘要已落箱且重复唤醒幂等。
 func (d *Dispatcher) trackChildDone(parentID string) {
 	ps := d.getOrCreatePending(parentID)
-	ps.count.Add(-1)
+	// CAS 下限保护：正常结束与 kill 兜底靠 subMeta.doneOnce 单触达，但未来若出现
+	// 第三补偿路径或 doneOnce 失守，裸 Add(-1) 会把计数打穿到负数——负数同样满足
+	// count>0 判定之外的所有归零检查，父终结保护与 pending 回收会一并失真（F3②）。
+	for {
+		cur := ps.count.Load()
+		if cur <= 0 {
+			break
+		}
+		if ps.count.CompareAndSwap(cur, cur-1) {
+			break
+		}
+	}
 	select {
 	case ps.notify <- struct{}{}:
 	default:
@@ -877,7 +900,10 @@ func (d *Dispatcher) ensurePatrol() {
 }
 
 // ClosePatrol 关闭心跳巡检 goroutine，供测试清理；生产生命周期内无需调用。
+// 幂等：并发/重复调用由 patrolMu 串行化，close 后再调用为空操作。
 func (d *Dispatcher) ClosePatrol() {
+	d.patrolMu.Lock()
+	defer d.patrolMu.Unlock()
 	if d.patrolStop != nil {
 		close(d.patrolStop)
 		d.patrolStop = nil
@@ -886,6 +912,9 @@ func (d *Dispatcher) ClosePatrol() {
 
 // patrol 周期扫描叶子子 Agent，超 heartbeatTimeout 无活动则判定假死并 kill。
 func (d *Dispatcher) patrol() {
+	// 启动时持 channel 引用：ClosePatrol 会把字段置 nil，select 里每次重读字段的话，
+	// nil channel 的 case 永久阻塞、 ticker case 仍触发——巡检退不出还继续扫（goroutine 泄漏）。
+	stop := d.patrolStop
 	interval := d.heartbeatTimeout / 2
 	if interval < 10*time.Millisecond {
 		interval = 10 * time.Millisecond
@@ -894,10 +923,19 @@ func (d *Dispatcher) patrol() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-d.patrolStop:
+		case <-stop:
 			return
 		case <-ticker.C:
-			d.scanStuck()
+			// P1-3：巡检单次 panic（证据记录/树遍历的边界 bug）不得杀死整个巡检
+			// goroutine——心跳兜底停摆会让全部卡死子 Agent 失去止损。recover 后下 tick 继续。
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[subagent] PANIC RECOVERED: scanStuck panic=%v", r)
+					}
+				}()
+				d.scanStuck()
+			}()
 		}
 	}
 }
@@ -970,7 +1008,6 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	if meta.cancel != nil {
 		meta.cancel()
 	}
-	meta.doneOnce.Do(func() { d.trackChildDone(meta.parentID) })
 	// retryable=true（2026-08-27）：killed 实际多死于验证阶段长工具执行中，盘上产物
 	// 大概率可续建——retryable=false 曾误导父 LLM 从零重派（fruit 任务实证）。
 	// 自动重派策略不受影响：runSubAgentWithAutoRetry 只认 kind=error+叶子，标记仅供父决策。
@@ -987,7 +1024,30 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	if s := d.recentActivitySummary(subAgentID); s != "" {
 		killMsg += "\n\n终止前活动摘要：\n" + s
 	}
-	d.notify(meta.parentID, subAgentID, killMsg, nil)
+	// P0-2b 顺序约束：notify（投递父邮箱）必须先于 trackChildDone（递减触发
+	// WakeOnChildDone 智能唤醒判定）。原顺序递减在前：挂起等子的父会话若还有其他
+	// Paused 子节点（pending 仍 >0），此刻邮箱为空 → 唤醒被抑制；随后才到的 kill
+	// 消息再无触发源 → 父永久睡眠。先投递邮箱再递减，唤醒判定必见未读消息。
+	// recover 双层保护（F3②）：notify 内层 recover 保证即便投递 panic 也继续执行
+	// 补偿递减——否则 panic 跳过 trackChildDone，父未决计数永久 +1（PendingChildren
+	// 恒 >0，终结保护空等）；Do 闭包外层 recover 保住本闭包内后续步骤。
+	meta.doneOnce.Do(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[subagent] PANIC RECOVERED: killStuckSubAgent收尾 panic=%v (sub=%s parent=%s)，计数补偿已先行保证",
+					r, subAgentID, meta.parentID)
+			}
+		}()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[subagent] PANIC RECOVERED: kill notify panic=%v (sub=%s)，继续计数补偿", r, subAgentID)
+				}
+			}()
+			d.notify(meta.parentID, subAgentID, killMsg, nil)
+		}()
+		d.trackChildDone(meta.parentID)
+	})
 	if d.treeFn != nil && meta.sessionID != "" {
 		if t := d.treeFn(meta.sessionID); t != nil {
 			t.Finish(subAgentID, "心跳超时疑似卡死", errors.New("heartbeat timeout"))
@@ -1017,6 +1077,24 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	if d.mailbox != nil {
 		d.mailbox.Purge(subAgentID)
 	}
+}
+
+// recoverDispatchPanic 异步派发 goroutine 的 panic 兜底（defer 调用，无 panic 零开销
+// 直接返回）。recover 后按 kill 路径语义收尾：父未决计数兜底递减 + 树 Failed + 回告父。
+// 注册在 goroutine 全部清理 defer 之前（LIFO 最后运行），清理动作先落地再转换 panic。
+func (d *Dispatcher) recoverDispatchPanic(parentID, subAgentID string, meta *subAgentMeta, roleID string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	log.Printf("[subagent] PANIC RECOVERED: dispatch sub=%s role=%s parent=%s panic=%v", subAgentID, roleID, parentID, r)
+	meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
+	if d.treeFn != nil && meta.sessionID != "" {
+		if t := d.treeFn(meta.sessionID); t != nil {
+			t.Finish(subAgentID, "panic recovered", errPanicRecovered)
+		}
+	}
+	d.notify(parentID, subAgentID, failureMarker(FailureKindKilled, true)+"\n子 Agent 因内部异常（panic）被回收，任务未回传；父未决计数已补偿递减。", nil)
 }
 
 // killDescendants BFS 遍历树快照，递归对后代调用 killStuckSubAgent（cancel + notify 父 +
@@ -1068,9 +1146,20 @@ func (d *Dispatcher) PendingChildren(parentID string) int {
 // WaitForAnyChild 阻塞等待父 Agent 的任一子 Agent 完成，最长 timeout。
 // 返回 true 表示收到完成信号（或调用时已无未决子 Agent）；false 表示超时。
 // 实现 agent.PendingChildrenChecker 接口，供 ReActAgent 终结保护分支消费。
+//
+// 语义契约：notify 是"有事发生"的合并提示（子完成或 pokeParent），返回 true 只表示
+// "请调用方重查条件"——waitForChildren 循环自行复核 PendingChildren/mailbox，
+// 不信赖本函数的布尔值。因此收到信号即返回，不做 count 判定（保留 poke 唤醒路径）。
+// F2 修复点仅在 count<=0 短路分支清缓冲：上一波完成/历史 poke 残留的信号若不清，
+// 下一波派发后首次等待会被旧信号立即唤醒，多一轮空转重查。
 func (d *Dispatcher) WaitForAnyChild(parentID string, timeout time.Duration) bool {
 	ps := d.getOrCreatePending(parentID)
 	if ps.count.Load() <= 0 {
+		// 短路前清掉残留信号，防下一波误唤醒。
+		select {
+		case <-ps.notify:
+		default:
+		}
 		return true
 	}
 	if timeout <= 0 {
@@ -1078,11 +1167,6 @@ func (d *Dispatcher) WaitForAnyChild(parentID string, timeout time.Duration) boo
 	}
 	select {
 	case <-ps.notify:
-		// 收到信号后清空缓冲，使下一次等待能再次阻塞。
-		select {
-		case <-ps.notify:
-		default:
-		}
 		return true
 	case <-time.After(timeout):
 		return false
@@ -2472,6 +2556,52 @@ func hasHanRunes(s string) bool {
 	return false
 }
 
+// taskToolDemandSignals 派前能力校验信号表（P0-2e，2026-09-18 集群档实测修复）：
+// 任务文本出现"零歧义"的工具调用信号即认定任务需要对应工具能力。刻意取命令名/
+// 工具名直写形态——误判代价是一次改派往返（父 Agent 收工具错误即重派），漏判代价
+// 是整波子 Agent 空转（实测 meta 给 scout 派"用 PowerShell Get-Content 读文件"，
+// 3 个 scout 全无 RunCommand，一波全灭浪费数分钟与数万 token）。角色工具面空表
+//（domain 等未声明 tools）= 全量暴露，天然通过。
+var taskToolDemandSignals = []struct {
+	tool string
+	re   *regexp.Regexp
+}{
+	{"RunCommand", regexp.MustCompile(`(?i)(runcommand|powershell|cmd\.exe|get-content|set-content|get-childitem|set-location|select-object|findstr|\bawk\b|\bsed\b|\bgrep\b|执行命令|运行命令|用命令|命令行|go\s+(test|build|run|vet|fmt)\b|npm\s+\w|pip\s+\w|python\s+[\w.-]+\.py|git\s+(diff|status|log|blame|clone)\b)`)},
+	{"WriteFile", regexp.MustCompile(`(?i)(writefile|editfile|restorefile|写入文件|创建文件|新建文件|写一个文件|保存文件)`)},
+}
+
+// roleHasTool 判定角色工具面是否含指定工具：空表（未声明 tools 的角色）= 全量
+// 暴露视为具备；否则按声明列表大小写不敏感匹配。
+func roleHasTool(rd *types.RoleDefinition, name string) bool {
+	if len(rd.Tools) == 0 {
+		return true
+	}
+	for _, t := range rd.Tools {
+		if strings.EqualFold(strings.TrimSpace(t), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkRoleTaskFit 派前能力校验（P0-2e）：任务文本的工具需求信号 × 目标角色工具面，
+// 不匹配即拒绝并给出改派方向。返回空串 = 通过。覆盖 call_sub_agent/call_sub_agents/
+// map_sub_agents 全部派发路径（统一在 dispatchOne 入口校验，拒绝发生在配额与
+// 树登记之前，零消耗）。
+func checkRoleTaskFit(rd *types.RoleDefinition, task string) string {
+	for _, sig := range taskToolDemandSignals {
+		if !sig.re.MatchString(task) {
+			continue
+		}
+		if roleHasTool(rd, sig.tool) {
+			continue
+		}
+		return fmt.Sprintf("能力不匹配：任务文本要求 %s 能力，但角色 %s 的工具面无此工具，直接派发必然失败。请改派具备 %s 的角色（domain/code_assistant/light 等），或修改任务文本去掉该要求后重试",
+			sig.tool, rd.ID, sig.tool)
+	}
+	return ""
+}
+
 // joinWarnings 以"；"拼接两条非空警告（空串自动跳过），保持工具结果可读。
 func joinWarnings(a, b string) string {
 	switch {
@@ -2775,6 +2905,13 @@ type dispatchOpts struct {
 	worktree bool
 }
 
+// fnvHash32 计算字符串的 FNV-1a 32 位哈希（派发分条锁用，纯函数无状态）。
+func fnvHash32(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
+}
+
 func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint, skillsHint []string, wallClock time.Duration, reuseAgentID, takeover string, opts ...*dispatchOpts) (string, *tool.Result) {
 	var opt *dispatchOpts
 	if len(opts) > 0 {
@@ -2799,6 +2936,12 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	roleDef := d.registry.Get(roleID)
 	if roleDef == nil {
 		return "", &tool.Result{Error: fmt.Sprintf("unknown role: %s", roleID), Category: tool.ResultCategoryValidationRejected}
+	}
+
+	// 派前能力校验（P0-2e，2026-09-18 实测修复）：任务文本的工具需求信号与目标角色
+	// 工具面不匹配时直接拒绝——防止"派 scout 执行 PowerShell"式能力错配整波空转。
+	if msg := checkRoleTaskFit(roleDef, task); msg != "" {
+		return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
 	// worktree 派发约束（TODO 第9⑤）：开关关闭拒绝；热驻 domain 拒绝（槽沿主目录
@@ -2827,6 +2970,14 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		return "", &tool.Result{Error: fmt.Sprintf("role %s cannot be called by %s", roleID, parentID), Category: tool.ResultCategoryValidationRejected}
 	}
 
+	// P0-1 派发临界区：同领域查重（checkActiveSiblingDomain）与权威树 Register 之间
+	// 在并行工具开启后存在 TOCTOU 窗口——同轮两个 call_sub_agent(domain="X") 曾双双
+	// 通过查重、双双注册，产生同名并行 domain 互写同批文件。按父 ID 分条加锁把
+	// 查重→登记→goroutine 启动整段做成原子（含热驻 dispatchHotDomain 的树注册）。
+	stripe := &d.dispatchStripes[fnvHash32(parentID)%uint32(len(d.dispatchStripes))]
+	stripe.Lock()
+	defer stripe.Unlock()
+
 	// 派发依赖门（TODO #22 Phase 1）：计划中该领域子任务的 depends_on 未全部完成时拒绝，
 	// 提示等谁（实证：MetaAgent 未等回传重复派发渲染引擎×3 互相覆盖——依赖门治本）。
 	// 无计划（board nil/领域未覆盖）零行为变化；拒绝不烧派发配额。
@@ -2838,7 +2989,8 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		// 同父同名活跃 domain 查重（跨调用）：call_sub_agents 的批内查重拦不住同一轮
 		// 多次 call_sub_agent 单派同名 domain（实证 parallel-independent 任务 Meta 同轮
 		// 两次单派 "CLI工具"，9ms 之差并行启动，回灌摘要/树展示无法区分责任域）。
-		// 工具调用在同轮内串行执行（react_agent.go），首个派发注册节点后第二个必被拦。
+		// 原注释"工具调用在同轮内串行执行"在轮内并行工具开启后不再成立——本检查与
+		// 下方树 Register 同处 dispatchStripes 临界区（P0-1），第二个并行派发必被拦。
 		if msg := d.checkActiveSiblingDomain(ctx, parentID, domain); msg != "" {
 			return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
 		}
@@ -3037,6 +3189,10 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	}
 	go func() {
 		defer cancel()
+		// P1-3 panic 兜底：recover 后按 kill 路径语义收尾（父计数递减 + 树 Failed +
+		// 回告父），防一处 SDK/工具 panic 崩掉整个后端带走全部在跑会话。
+		// 注册在最前 → panic 展开时最后运行，排在下方各清理 defer 之后。
+		defer d.recoverDispatchPanic(parentID, subAgentID, meta, roleDef.ID)
 		// CompareAndDelete（而非 Delete）：复活/复用会在同一 ID 上重新 Store 新条目，
 		// 旧 run 的无条件 Delete 会把新 run 的条目误删——被复活的 Agent 随即失去活动监控
 		// 与取消句柄（scanStuck/ActivityEvidenceOf/cancel_agent 全部落空）。
@@ -3522,6 +3678,9 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 				}
 				d.ClearPauseNode(subAgentID)
 				d.pokeParent(parentID)
+				// P0-2b：同 token 触限路径——父若挂起等子，MsgInfo 不含唤醒语义，
+				// 需显式唤醒让父当轮处置（换模型续跑 / cancel 放弃）。
+				d.wakeSuspendedParent(parentID, "【系统】子 Agent "+subAgentID+" 已按指令暂停，请查收邮箱处置。")
 				if d.mailbox != nil {
 					if _, err := d.mailbox.Send(&mailbox.Message{
 						From:    "dispatcher",
@@ -4001,6 +4160,11 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 					t.Pause(subAgentID, "token budget exhausted")
 				}
 			}
+			// P0-2b 唤醒挂起等子的父会话：Paused 子节点不会再有完成事件，父若正处于
+			// awaiting_child 将永久睡死（运行中的父由 PausedChildChecker 在终答轮检测，
+			// 不受影响）。唤醒后父续跑一轮即转 paused_on_child，等用户"继续"。
+			d.pokeParent(parentID)
+			d.wakeSuspendedParent(parentID, "【系统】子 Agent "+subAgentID+" 触达 token 上限已暂停，请检测并处置（可换模型续跑或 cancel 放弃）。")
 			log.Printf("[subagent] PAUSED: sub=%s role=domain (token budget, history persisted)", subAgentID)
 			return sub, result, errPaused
 		}
@@ -4680,6 +4844,10 @@ const visualRetryMessage = "【视觉证据要求】本任务验收层级含 vis
 // 语法检查未通过（反馈重试 1 轮后仍失败），错误文本携带失败明细。
 // runSubAgent 见此信号按 FailureKindSmokeFailed notify 父（打回责任域）。
 var errSmokeFailed = errors.New("sub-agent smoke check failed")
+
+// errPanicRecovered 标记 supervisor goroutine 被 panic 兜底回收（P1-3）：树终态
+// 文案与父回告共用，区别于心跳杀（heartbeat timeout）。
+var errPanicRecovered = errors.New("sub-agent supervisor panic recovered")
 
 // isLLMCallDeadline 判定 DeadlineExceeded 是否源自单次 LLM 调用内部（provider
 // http.Client 整体超时 / react_llm_timeout），而非子 Agent 墙钟到期。两者同走
