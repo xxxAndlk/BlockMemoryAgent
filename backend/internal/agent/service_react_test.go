@@ -974,24 +974,33 @@ func TestWallClock_ExpiryTerminatesSession(t *testing.T) {
 	sess := svc.store.snapshotSessionByID(created.ID)
 	svc.startWallClock(sess, 200*time.Millisecond)
 
+	// 墙钟先发布会话终态、再级联取消树节点（setSessionError 的"首次错误胜出"要求
+	// 时限文案不能被随后 ctx 取消触发的 runSession 收尾覆写），两步之间存在微秒级
+	// 窗口——轮询等树收敛，不能"看到 error 立即断言"（Linux 容器实测 4/30 挂）。
 	deadline := time.Now().Add(5 * time.Second)
+	var stuckNode string
 	for time.Now().Before(deadline) {
 		snap, _ := svc.Get(context.Background(), created.ID)
-		if snap.Status == string(enums.SessionStatusError) {
-			if !strings.Contains(snap.Result, "超全局时限") {
-				t.Fatalf("expected wall-clock error text, got: %s", snap.Result)
+		if snap.Status != string(enums.SessionStatusError) {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		if !strings.Contains(snap.Result, "超全局时限") {
+			t.Fatalf("expected wall-clock error text, got: %s", snap.Result)
+		}
+		// 树节点应被级联取消（级联滞后于终态发布，等其收敛）。
+		stuckNode = ""
+		for _, n := range tr.Snapshot() {
+			if n.Status != orchestrator.StatusCancelled {
+				stuckNode = n.ID
 			}
-			// 树节点应被级联取消。
-			for _, n := range tr.Snapshot() {
-				if n.Status != orchestrator.StatusCancelled {
-					t.Fatalf("node should be Cancelled after wall clock, got status=%v", n.Status)
-				}
-			}
+		}
+		if stuckNode == "" {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatal("session did not terminate within wall clock deadline")
+	t.Fatalf("session did not terminate within wall clock deadline (stuck node: %s)", stuckNode)
 }
 
 // blockingLLMProvider Generate 阻塞直到 ctx 取消：模拟长跑会话（供墙钟测试保持 running 态）。

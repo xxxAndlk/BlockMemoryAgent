@@ -12,6 +12,7 @@ import (
 	"os"            // os 用于 stat 文件 mtime 校验（Layer 3 缓存一致性）
 	"path/filepath" // filepath 用于 spec 文件路径规范化（冒烟检查/契约检查）
 	"regexp"        // regexp 用于派前能力校验的任务文本信号匹配（P0-2e）
+	"runtime"       // runtime 用于路径沙箱比对的大小写归一化（Windows 不敏感）
 	"sort"          // sort 用于召回结果按 outcome/reuse_count 价值排序
 	"strings"       // strings 用于从 Agent ID 中提取角色 ID
 	"sync"          // sync 提供 sync.Map 存储运行中的子 Agent
@@ -2602,6 +2603,87 @@ func checkRoleTaskFit(rd *types.RoleDefinition, task string) string {
 	return ""
 }
 
+// taskWinAbsPathRe 从任务文本提取 Windows 盘符绝对路径（D:\... / D:/...）。
+// taskPosixAbsPathRe 提取 POSIX 绝对路径（/usr/...）：首字符须为路径名字符，
+// 避免匹配 // 注释与 /* */；前缀处容许空白/引号/括号边界。
+// 刻意保守——带空格路径截断在首个空白处，但根前缀仍足以判定是否越出工作目录
+// （判据是前缀比较，不需完整路径）。
+var (
+	taskWinAbsPathRe   = regexp.MustCompile(`(?i)[A-Za-z]:[\\/][^\s"'<>，。；、（）()\[\]【】]+`)
+	taskPosixAbsPathRe = regexp.MustCompile(`(?:^|[\s"'（(])(/[A-Za-z0-9._~+-][^\s"'<>，。；、（）()\[\]【】]*)`)
+)
+
+// pathWithinWorkDir 判定 child 是否落在 parent 目录内（含相等）：显式拼分隔符
+// 前缀防 /foo 匹配 /foobar；Windows 文件系统大小写不敏感，统一转小写再比较
+// （D:\ 与 d:/ 同盘，否则会被误判为越界）。
+func pathWithinWorkDir(child, parent string) bool {
+	if runtime.GOOS == "windows" {
+		child = strings.ToLower(child)
+		parent = strings.ToLower(parent)
+	}
+	if child == parent {
+		return true
+	}
+	return strings.HasPrefix(child, parent+string(filepath.Separator))
+}
+
+// hintHasTool 判定 tools_hint 建议工具集是否含指定工具（大小写不敏感、去空白）。
+func hintHasTool(hint []string, name string) bool {
+	for _, h := range hint {
+		if strings.EqualFold(strings.TrimSpace(h), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkTaskPathsFit 派前路径沙箱校验（2026-09-19 实测修复）：任务文本引用的绝对
+// 路径落在会话工作目录之外、且目标角色工具面无 RunCommand（文件读写被沙箱拦在
+// 工作目录内，越界即 path escapes sandbox 反复报错）时直接拒绝并给改派方向。
+// toolsHint 显式预挂的执行能力并入判定；返回空串 = 通过。与 checkRoleTaskFit
+// 同点调用（dispatchOne 入口），拒绝发生在配额与树登记之前，零消耗。
+// 实测背景：meta 给 code_reviewer 派"审查 D:\proj 下 X"而会话工作目录在别处的
+// 任务，3 个子 Agent 84 次调用全在跟 path escapes sandbox 缠斗，900s 零交付。
+func checkTaskPathsFit(rd *types.RoleDefinition, task, workDir string, toolsHint []string) string {
+	if workDir == "" {
+		return ""
+	}
+	base := filepath.Clean(workDir)
+	seen := map[string]bool{}
+	var outside []string
+	collect := func(p string) {
+		p = strings.TrimRight(p, ".") // 句尾英文句点非路径成分（Win32 亦自动剥除）
+		abs := filepath.Clean(p)
+		key := strings.ToLower(abs)
+		if !filepath.IsAbs(abs) || pathWithinWorkDir(abs, base) || seen[key] {
+			return
+		}
+		seen[key] = true
+		outside = append(outside, abs)
+	}
+	for _, m := range taskWinAbsPathRe.FindAllString(task, -1) {
+		collect(m)
+	}
+	for _, m := range taskPosixAbsPathRe.FindAllStringSubmatch(task, -1) {
+		if len(m) > 1 {
+			collect(m[1])
+		}
+	}
+	if len(outside) == 0 {
+		return ""
+	}
+	if roleHasTool(rd, "RunCommand") || hintHasTool(toolsHint, "RunCommand") {
+		return ""
+	}
+	return fmt.Sprintf("路径沙箱不匹配：任务引用的 %s 在会话工作目录（%s）之外，角色 %s 的"+
+		"文件工具被沙箱限制只能读写工作目录内路径，派发后必然反复报 path escapes sandbox"+
+		"空转。可选处置（择一）：①改派 domain（带 RunCommand，可经 PowerShell Get-Content 读"+
+		"工作目录外文件，文件工具仍不可用）；②ask_user 请用户把会话工作目录切到目标项目"+
+		"（中途可改）；③用 PowerShell Copy-Item 把所需材料拷进工作目录后重派本角色"+
+		"（cp/rm 命中命令黑名单，Copy-Item 不在黑名单）",
+		strings.Join(outside, "、"), base, rd.ID)
+}
+
 // joinWarnings 以"；"拼接两条非空警告（空串自动跳过），保持工具结果可读。
 func joinWarnings(a, b string) string {
 	switch {
@@ -2941,6 +3023,13 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// 派前能力校验（P0-2e，2026-09-18 实测修复）：任务文本的工具需求信号与目标角色
 	// 工具面不匹配时直接拒绝——防止"派 scout 执行 PowerShell"式能力错配整波空转。
 	if msg := checkRoleTaskFit(roleDef, task); msg != "" {
+		return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
+	}
+
+	// 派前路径沙箱校验（2026-09-19 实测修复）：任务引用工作目录外的绝对路径且角色
+	// 无 RunCommand（文件工具越界必失败）时零消耗拒绝——防子 Agent 跟
+	// path escapes sandbox 缠斗空转（实测 3 个 code_reviewer 84 次调用零交付）。
+	if msg := checkTaskPathsFit(roleDef, task, d.subAgentWorkDirFor(ctx), toolsHint); msg != "" {
 		return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
@@ -5867,11 +5956,14 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 	d.ledger.RecordTerminal(sessionIDFromAgentID(parentID), parentID, subAgentID, summary, filesModified)
 	// 聚合模式拦截（TODO 第七项⑤）：map_sub_agents 的项完成时记入聚合器，
 	// 不逐项直发父邮箱（N 个子 Agent 完成汇成一条消息，防邮箱淹没）。
+	// ok 按失败机读标记判定（2026-09-20 修复）：旧实现恒 true——墙钟被杀/守卫终止的
+	// 子 Agent 在聚合消息里被标"完成"，父级"完成 N/失败 0"误导读决策（设计与
+	// map_dispatch.go 派发期拒绝口径一致：失败项显式标败，summary 仍带全文供自决）。
 	if e, ok := d.aggByAgent.Load(subAgentID); ok {
 		d.aggByAgent.Delete(subAgentID)
 		entry := e.(*mapAggEntry)
 		entry.once.Do(func() {
-			entry.agg.record(entry.idx, entry.item, summary, true)
+			entry.agg.record(entry.idx, entry.item, summary, !failureMarkerRe.MatchString(summary))
 		})
 		return
 	}

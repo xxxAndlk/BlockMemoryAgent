@@ -106,6 +106,54 @@ func TestHandleLiveEvent_ThinkEmptyNoEvent(t *testing.T) {
 	}
 }
 
+// TestHandleLiveEvent_ClusterTopThinkDropped 验证集群档顶层 Meta 的思考链被丢弃：
+// 不进 ThinkingText（live 思考盒）也不落 think 事件（与中间轮口播同治理）；
+// 子 Agent 思考与日常档顶层思考不受影响。
+func TestHandleLiveEvent_ClusterTopThinkDropped(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	sess.ID = "session-1" // 顶层 Meta 实例 ID = 会话 ID
+	sess.setGear(tool.GearCluster)
+
+	// 顶层 Meta 思考：丢弃。
+	svc.handleLiveEvent(sess, LiveEvent{
+		Kind: LiveEventThinkDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "编排推理：先派侦察…",
+	})
+	if sess.ThinkingText != "" {
+		t.Fatalf("集群顶层 Meta 思考不应进 ThinkingText，got %q", sess.ThinkingText)
+	}
+	// 思考结束边界（答复输出）：不得落 think 事件，正文只进轮缓冲。
+	svc.handleLiveEvent(sess, LiveEvent{
+		Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "终答",
+	})
+	if ev := findEventByKind(sess.Events, eventkind.Think); ev != nil {
+		t.Fatalf("集群顶层 Meta 思考不应落 think 事件，got %q", ev.Message)
+	}
+	if sess.StreamingText != "" {
+		t.Fatalf("集群顶层 Meta 正文应只进轮缓冲不进 StreamingText，got %q", sess.StreamingText)
+	}
+
+	// 子 Agent 思考：照常展示。
+	svc.handleLiveEvent(sess, LiveEvent{
+		Kind: LiveEventThinkDelta, Agent: "代码助手", AgentID: "session-1/code_assistant-5", Text: "【代码助手】\n分析文件结构…",
+	})
+	if sess.ThinkingText != "【代码助手】\n分析文件结构…" {
+		t.Fatalf("子 Agent 思考应照常进 ThinkingText，got %q", sess.ThinkingText)
+	}
+}
+
+// TestHandleLiveEvent_DailyGearTopThinkKept 验证日常档顶层思考展示不受影响。
+func TestHandleLiveEvent_DailyGearTopThinkKept(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	sess.ID = "session-1"
+	sess.setGear(tool.GearDaily)
+	svc.handleLiveEvent(sess, LiveEvent{
+		Kind: LiveEventThinkDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "日常档思考",
+	})
+	if sess.ThinkingText != "日常档思考" {
+		t.Fatalf("日常档顶层思考应照常进 ThinkingText，got %q", sess.ThinkingText)
+	}
+}
+
 // TestHandleLiveEvent_SubAgentDoneLLMResult 验证子 Agent 完成时摘要落 llm_result 事件
 // （Tool 承载实例 ID）；摘要为空时不落。
 func TestHandleLiveEvent_SubAgentDoneLLMResult(t *testing.T) {

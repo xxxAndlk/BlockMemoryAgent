@@ -3615,6 +3615,13 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		}
 		s.store.setStreamingText(session, ev.Text)
 	case LiveEventThinkDelta:
+		if s.isClusterTopEvent(session, ev) {
+			// 集群档顶层 Meta：思考链与中间轮口播同治理（2026-09-19 定案修复）——
+			// 编排推理既不进 ThinkingText（live 思考盒）也不落 think 事件（回放不再
+			// 以同等级推理重现）。该档用户只看最终交付；日常档与子 Agent 的思考
+			// 展示不受影响。
+			break
+		}
 		s.store.setThinkingText(session, ev.Text)
 	case LiveEventToolCall:
 		// 工具调用开始同样意味着思考阶段结束（思考型模型常见 think→tool 而非 think→text）。

@@ -403,3 +403,102 @@ func TestWallClockWarnLadder_DoneStopsDelivery(t *testing.T) {
 		t.Fatalf("no warnings should be delivered after done, got %d", len(msgs))
 	}
 }
+
+// mapWallClockTestEnv 构造 map 墙钟测试环境：spec_exempt 侦察角色 + 挂起 provider。
+// 全局超时 10min（远大于各项预算，证明收口来自派发级墙钟）。
+func mapWallClockTestEnv(t *testing.T) (*Dispatcher, *mailbox.Mailbox, chan struct{}) {
+	t.Helper()
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "scout", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "scout", SpecExempt: true},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	mb := mailbox.New()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	d := NewDispatcher(reg, &mockModelFactory{provider: &ctxAwareHangingProvider{release: release}}, toolsReg, mb, agent.NopMemoryPipeline{}).
+		WithTimeout(10 * time.Minute)
+	d.RegisterCallTool(toolsReg)
+	t.Cleanup(d.ClosePatrol)
+	return d, mb, release
+}
+
+// TestMapSubAgents_SpecExemptDefaultWallClock 验证 map 批量路径继承 spec_exempt 缺省墙钟：
+// 角色 SpecExempt=true 且未给 wall_clock_min 时，每项经 dispatchOne 注入 5 分钟兜底预算
+// （2026-09-20 关闭 V5 遗留"map 批量实际生效路径未验证"——与单派同一条注入链）。
+func TestMapSubAgents_SpecExemptDefaultWallClock(t *testing.T) {
+	d, _, _ := mapWallClockTestEnv(t)
+
+	ctx := agent.WithAgentID(context.Background(), "meta")
+	if _, err := d.tools.Dispatch(ctx, "map_sub_agents", map[string]any{
+		"role_id":       "scout",
+		"task_template": "侦察 {{item}}",
+		"items":         []any{"alpha"},
+	}); err != nil {
+		t.Fatalf("map dispatch: %v", err)
+	}
+
+	// dispatchOne 同步注册 subMeta：逐项读有效墙钟，应为缺省 5 分钟（非全局 10 分钟、非 0）。
+	found := false
+	d.subMeta.Range(func(k, v any) bool {
+		found = true
+		if got := v.(*subAgentMeta).wallClock; got != 5*time.Minute {
+			t.Fatalf("spec_exempt default wall clock via map = %v, want 5m (sub=%s)", got, k.(string))
+		}
+		return true
+	})
+	if !found {
+		t.Fatal("no sub-agent registered after map dispatch")
+	}
+}
+
+// TestMapSubAgents_ExplicitWallClockEnforced 验证 map 批量 + 显式 wall_clock_min 的
+// 端到端强制收口（V5 遗留核心疑问）：到点硬杀、父未决计数归 0、聚合消息把被杀项
+// 标"失败"（而非旧实现的恒"完成"）且文案报显式预算 300ms。
+func TestMapSubAgents_ExplicitWallClockEnforced(t *testing.T) {
+	d, mb, _ := mapWallClockTestEnv(t)
+
+	ctx := agent.WithAgentID(context.Background(), "meta")
+	if _, err := d.tools.Dispatch(ctx, "map_sub_agents", map[string]any{
+		"role_id":        "scout",
+		"task_template":  "侦察 {{item}}",
+		"items":          []any{"alpha", "beta"},
+		"wall_clock_min": 0.005, // 300ms/项
+		"aggregate":      true,
+	}); err != nil {
+		t.Fatalf("map dispatch: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.PendingChildren("meta") == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if d.PendingChildren("meta") != 0 {
+		t.Fatalf("explicit wall clock should terminate map items, pending=%d", d.PendingChildren("meta"))
+	}
+
+	// 聚合单条回传：两项均标失败、计数 0/2、失败项首行带 timeout 机读标记
+	//（单项摘要按首行展示，"上限 300ms"全文在台账/回传路径可查——firstLine 截断为设计口径）。
+	msgs := mb.Drain("meta")
+	if len(msgs) != 1 {
+		t.Fatalf("expected exactly one aggregate message, got %d", len(msgs))
+	}
+	body := msgs[0].Body
+	if !strings.Contains(body, "【map_sub_agents 聚合回传】") {
+		t.Fatalf("aggregate message marker missing, got: %s", body)
+	}
+	if !strings.Contains(body, "完成 0 / 失败 2") {
+		t.Fatalf("killed items should be counted as failed, got: %s", body)
+	}
+	if strings.Count(body, "[failure kind=timeout") != 2 {
+		t.Fatalf("both items should carry timeout failure marker, got: %s", body)
+	}
+}

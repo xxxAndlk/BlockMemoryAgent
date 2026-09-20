@@ -197,6 +197,11 @@ fixed_roles:
     can_be_called: true
 
   # 代码审查助手
+  # spec_exempt：只读 findings 任务没有工程契约可钉——acceptance 天然是纸面核对
+  #（findings 列表+[VERIFY] 标记已由本角色提示词自带结构强制），WriteSpec 门对审查
+  # 类任务倒置（2026-09-19 压测实证：模糊质量审查 600s/18 呼，5 次拒派全耗在
+  # spec 门与批量上限，审查波次从未发出）；批量上限 6→32 随豁免生效（审查维度
+  # 常 6-9 个）。缺省墙钟 5 分钟（dispatcher 兜底），大范围审查显式给 wall_clock_min。
   - id: code_reviewer
     name: 代码审查助手
     type: fixed
@@ -209,6 +214,7 @@ fixed_roles:
       temperature: 0.2
       thinking: low
     can_be_called: true
+    spec_exempt: true
 
   # 测试助手（验收测试员：与 Meta/Domain 同级的交付验收角色，只验收不实现）
   - id: test_assistant
