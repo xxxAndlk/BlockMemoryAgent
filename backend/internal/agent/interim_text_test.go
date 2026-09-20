@@ -144,8 +144,9 @@ func TestClusterTopNarration_Suppressed(t *testing.T) {
 	svc, sess := newLiveEventTestSession(t)
 	sess.setGear("cluster")
 
-	// 顶层 Meta 流式输出中间轮口播（Agent 为空 = 顶层，非子 Agent 转发）。
-	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Text: "已确认根因：环境性失败——重派同类子 agent 必然同样失败"})
+	// 顶层 Meta 流式输出中间轮口播（AgentID=会话 ID 即顶层实例；Agent 展示名
+	// "MetaAgent" 子 Agent 也有，不能用作判定依据）。
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: sess.ID, Text: "已确认根因：环境性失败——重派同类子 agent 必然同样失败"})
 	if sess.StreamingText != "" {
 		t.Fatalf("集群档顶层口播不得推 StreamingText，got %q", sess.StreamingText)
 	}
@@ -154,7 +155,7 @@ func TestClusterTopNarration_Suppressed(t *testing.T) {
 	}
 
 	// 工具调用边界：缓冲丢弃、不落 assistant_text、不进 StreamingText。
-	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Tool: "call_sub_agent"})
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: sess.ID, Tool: "call_sub_agent"})
 	if n := countEventsByKind(sess.Events, eventkind.AssistantText); n != 0 {
 		t.Fatalf("集群档顶层口播不得落 assistant_text 事件，got %d", n)
 	}
@@ -169,8 +170,8 @@ func TestClusterTopNarration_AskUserFlush(t *testing.T) {
 	svc, sess := newLiveEventTestSession(t)
 	sess.setGear("cluster")
 
-	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Text: "开始前需要确认：目标目录用哪个？"})
-	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Tool: "ask_user"})
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: sess.ID, Text: "开始前需要确认：目标目录用哪个？"})
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: sess.ID, Tool: "ask_user"})
 	if sess.StreamingText != "开始前需要确认：目标目录用哪个？" {
 		t.Fatalf("ask_user 边界应冲刷提问正文进 StreamingText，got %q", sess.StreamingText)
 	}
@@ -178,7 +179,7 @@ func TestClusterTopNarration_AskUserFlush(t *testing.T) {
 	// 用户答复后恢复路径会清 StreamingText（2026-09-09 修复，service_react askUser 钩子）；
 	// 此后新一轮口播继续只进缓冲，不把旧提问正文当实时流重推。
 	svc.store.setStreamingText(sess, "")
-	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Text: "收到，继续处理"})
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: sess.ID, Text: "收到，继续处理"})
 	if sess.StreamingText != "" {
 		t.Fatalf("恢复后口播不得重推 StreamingText，got %q", sess.StreamingText)
 	}
@@ -190,7 +191,7 @@ func TestClusterTopNarration_FinalAnswerFlush(t *testing.T) {
 	svc, sess := newLiveEventTestSession(t)
 	sess.setGear("cluster")
 
-	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Text: "最终答复：三处热修已全部完成并验证"})
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: sess.ID, Text: "最终答复：三处热修已全部完成并验证"})
 	svc.flushPendingTopText(sess)
 	if sess.StreamingText != "最终答复：三处热修已全部完成并验证" {
 		t.Fatalf("完成时应冲刷终答进 StreamingText，got %q", sess.StreamingText)

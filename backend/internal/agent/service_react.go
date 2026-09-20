@@ -3516,11 +3516,13 @@ func (s *ReactService) finalizeThinking(session *reactInternalSession, ev LiveEv
 }
 
 // isClusterTopEvent 判定事件是否来自集群档的顶层 Meta（而非子 Agent 转发）：
-// ev.Agent 为空即顶层（子 Agent 经 ForwardLiveEvent 都带展示名前缀，见 finalizeThinking
-// 的剥前缀逻辑）。该档顶层 Meta 的中间轮口播必须与用户流隔离——LiveEventLLMDelta
-// 只进轮缓冲、LiveEventToolCall 边界丢弃（2026-09-18 编排内心独白泄露进对话栏实证）。
+// 顶层 Meta 的实例 ID 就是会话 ID（emitLive：AgentID 填实例 ID，MetaAgent=session ID；
+// 子 Agent 为 "session-1/code_assistant-5"）。该档顶层 Meta 的中间轮口播必须与
+// 用户流隔离——LiveEventLLMDelta 只进轮缓冲、LiveEventToolCall 边界丢弃
+//（2026-09-18 编排内心独白泄露进对话栏实证；初版误用 ev.Agent=="" 判定，实测顶层
+// 事件带展示名 role.Name="MetaAgent"，条件永不命中）。
 func (s *ReactService) isClusterTopEvent(session *reactInternalSession, ev LiveEvent) bool {
-	return ev.Agent == "" && session.currentGear() == tool.GearCluster
+	return ev.AgentID == session.ID && session.currentGear() == tool.GearCluster
 }
 
 // flushPendingTopText 把集群档顶层 Meta 的轮缓冲冲刷进 StreamingText：
