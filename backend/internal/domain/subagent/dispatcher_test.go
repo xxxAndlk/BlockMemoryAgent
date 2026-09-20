@@ -234,7 +234,10 @@ func TestInjectRecalledMemory(t *testing.T) {
 	// 注入 sessionID 到 ctx，验证召回侧按 session 过滤。
 	ctx := tool.WithSessionID(context.Background(), "session-42")
 	got, recs := d.injectRecalledMemory(ctx, "查询任务", "原始任务")
-	want := blockMemoryRecallHeader + "\n成功经验:\n1. 记忆一\n2. 记忆二\n\n【当前任务】\n原始任务"
+	// 2026-09-20 注入防线：召回记录包 untrusted 围栏（LLM 生成内容不可信）。
+	f1 := tool.WrapUntrusted("block-memory", "记忆一")
+	f2 := tool.WrapUntrusted("block-memory", "记忆二")
+	want := blockMemoryRecallHeader + "\n成功经验:\n1. " + f1 + "\n2. " + f2 + "\n\n【当前任务】\n原始任务"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
@@ -289,7 +292,11 @@ func TestInjectRecalledMemory_OutcomeSections(t *testing.T) {
 	}}
 	d := NewDispatcher(nil, nil, nil, nil, nil).WithBlockMemorySearcher(mock)
 	got, _ := d.injectRecalledMemory(context.Background(), "查询任务", "")
-	want := blockMemoryRecallHeader + "\n成功经验:\n1. 成功实现\n避坑经验:\n1. 部分完成\n2. 上次这么改失败了"
+	// 2026-09-20 注入防线：召回记录包 untrusted 围栏。
+	fs := tool.WrapUntrusted("block-memory", "成功实现")
+	fp1 := tool.WrapUntrusted("block-memory", "部分完成")
+	fp2 := tool.WrapUntrusted("block-memory", "上次这么改失败了")
+	want := blockMemoryRecallHeader + "\n成功经验:\n1. " + fs + "\n避坑经验:\n1. " + fp1 + "\n2. " + fp2
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
 	}

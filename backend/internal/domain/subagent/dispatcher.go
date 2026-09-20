@@ -5684,6 +5684,8 @@ func (d *Dispatcher) bumpReuses(ctx context.Context, recs []*types.KnowledgeReco
 
 // renderRecalledMemory 把命中记录渲染为成功经验/避坑经验两段文本。
 // header 由调用方指定（播种召回用【相关记忆】，每轮摄取用【兄弟产出】）。
+// 记录内容均为 LLM 生成文本（可能转述过外部源），整条注入通道按 TODO #18-4 防线
+// 包 untrusted 围栏——记忆/兄弟产出里的命令式文本不得指挥当前 Agent。
 func renderRecalledMemory(header string, recs []*types.KnowledgeRecord) string {
 	var sb strings.Builder
 	sb.WriteString(header + "\n")
@@ -5698,13 +5700,13 @@ func renderRecalledMemory(header string, recs []*types.KnowledgeRecord) string {
 	if len(successLines) > 0 {
 		sb.WriteString("成功经验:\n")
 		for i, l := range successLines {
-			fmt.Fprintf(&sb, "%d. %s\n", i+1, l)
+			fmt.Fprintf(&sb, "%d. %s\n", i+1, tool.WrapUntrusted("block-memory", l))
 		}
 	}
 	if len(pitfallLines) > 0 {
 		sb.WriteString("避坑经验:\n")
 		for i, l := range pitfallLines {
-			fmt.Fprintf(&sb, "%d. %s\n", i+1, l)
+			fmt.Fprintf(&sb, "%d. %s\n", i+1, tool.WrapUntrusted("block-memory", l))
 		}
 	}
 	return strings.TrimRight(sb.String(), "\n")

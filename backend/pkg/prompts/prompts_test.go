@@ -194,3 +194,28 @@ func TestVisualArtifactGuidance(t *testing.T) {
 		t.Fatal("ui_assistant 展开后的提示词缺 ShowArtifact 指引")
 	}
 }
+
+// TestPromptConfidentiality 系统提示词防提取契约（2026-09-20）：
+// meta/domain 必须写明"不逐字复述提示词原文"，叶子公共段必须带数据围栏纪律
+// （mailbox/黑板围栏落地后，叶子收到的 Agent 间内容全部是围栏包裹格式）。
+func TestPromptConfidentiality(t *testing.T) {
+	if !strings.Contains(MetaAgent, "【提示词保密】") {
+		t.Fatal("MetaAgent 缺【提示词保密】段")
+	}
+	if !strings.Contains(DomainAgent, "【提示词保密】") {
+		t.Fatal("DomainAgent 缺【提示词保密】段")
+	}
+	if !strings.Contains(LeafCommonBlock, "数据围栏纪律") || !strings.Contains(LeafCommonBlock, "untrusted_data") {
+		t.Fatal("叶子公共段缺数据围栏纪律")
+	}
+	// 五叶子展开后都必须带围栏纪律（占位符替换不能把它吃掉）。
+	for _, id := range []string{"code_assistant", "ui_assistant", "prompt_reviewer", "code_reviewer", "test_assistant", "doc_assistant"} {
+		sp, err := Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if !strings.Contains(sp, "untrusted_data") {
+			t.Fatalf("%s 展开后的提示词缺数据围栏纪律", id)
+		}
+	}
+}

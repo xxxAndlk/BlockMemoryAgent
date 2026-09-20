@@ -1963,28 +1963,38 @@ func buildTimeMessage() ReactMessage {
 // mailboxMessageToReact 把异步 mailbox 消息转换为模型可见的 ReactMessage。
 // 使用 user role 并在内容前加 [mailbox] 前缀，兼容 Anthropic Messages API
 // （该 API 不允许在会话中途插入 system 消息）。
+//
+// 安全（TODO #18-4 防线延伸到 Agent 间通道）：主题/正文/载荷对其他 Agent 而言
+// 均为不可信内容（LLM 生成，可能转述过被污染的外部源），包进 untrusted 围栏；
+// 框架信号留在围栏外——[升级] 前缀、[mailbox from X] 前缀与"修改文件"清单。
+// From=user 的用户直接指令不围栏：用户指令优先级最高，降格为"数据"会违义。
 func mailboxMessageToReact(m *mailbox.Message) ReactMessage {
-	// 主题作为消息正文的基础部分。
-	body := m.Subject
-
-	// 升级消息（TODO #23）加 [升级] 前缀，父 LLM 一眼识别"需要干预"类消息，
-	// 按 meta prompt 的升级处置规程（重派/接手/回报用户）决策。
-	if m.Type == mailbox.MsgEscalate {
-		body = "[升级] " + body
-	}
+	// 主题作为不可信正文的基础部分。
+	untrusted := m.Subject
 
 	// 如果邮件有正文，则追加到主题之后。
 	if m.Body != "" {
-		body += "\n" + m.Body
+		untrusted += "\n" + m.Body
 	}
 
 	// 如果邮件携带结构化载荷，则序列化为 JSON 字符串并追加，方便模型读取。
 	if len(m.Payload) > 0 {
 		b, _ := json.Marshal(m.Payload)
-		body += "\n" + string(b)
+		untrusted += "\n" + string(b)
 	}
 
-	// Layer 5：展示子 Agent 修改的文件清单，使父 LLM 知晓子改了哪些文件。
+	body := untrusted
+	if m.From != "user" {
+		body = tool.WrapUntrusted("mail:"+m.From, untrusted)
+	}
+
+	// 升级消息（TODO #23）加 [升级] 前缀（围栏外），父 LLM 一眼识别"需要干预"类消息，
+	// 按 meta prompt 的升级处置规程（重派/接手/回报用户）决策。
+	if m.Type == mailbox.MsgEscalate {
+		body = "[升级] " + body
+	}
+
+	// Layer 5：展示子 Agent 修改的文件清单（框架生成，围栏外），使父 LLM 知晓子改了哪些文件。
 	if len(m.FilesModified) > 0 {
 		body += "\n修改文件: " + strings.Join(m.FilesModified, ", ")
 	}
