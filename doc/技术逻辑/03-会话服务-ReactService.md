@@ -82,7 +82,7 @@ ID/Goal/Status/Result/StartedAt/EndedAt/Events[]/Messages[]；`firstTurnImages`�
 
 ### Query Kind 全表（:1320-1393）
 
-`session-count` / `llm-stats` / `logs` / `board` / `metrics` / `mailbox` / `watchdog`（空列表兼容）/ `token-metrics` / `efficiency` / `agent-events` / `agent-messages` / `worktrees` / `worktree-diff`；default 空结果。
+`session-count` / `llm-stats` / `logs` / `board` / `metrics` / `mailbox` / `mailbox-trace`（2026-09-17，会话级邮件留痕：全部 Agent 往来一行一封、收发双方重复行 store 层 DISTINCT，按时间正序；与 `mailbox` 的"未取走队列"语义不同——那是待办、这是历史）/ `watchdog`（空列表兼容）/ `token-metrics` / `efficiency` / `agent-events` / `agent-messages`（响应带 `run_id` 与 `hot_max_seq`，2026-09-17——复活重跑热层清空重编号后，前端增量游标以 run_id 单调性为权威判据、hot_max_seq 兜底）/ `worktrees` / `worktree-diff`；default 空结果。
 
 ### Control Op 全表（:1400-1470）
 
@@ -124,7 +124,7 @@ createMu 锁 → 同 goal running 查重（findRunningDuplicateSession:299）→
 
 ### runSession（:3009）
 
-persist running → `resolveGearMetaRole` → fast 档不等 PROJECT.md（其他等 ≤2s）→ provider（`GetBladesProviderWithThinking(gearRoleID, thinking, fallbackObserver)`）→ 记忆包装（meta 档：看板/roster/台账 + metaSkillBlock；daily 档：roleSkillBlock）→ `NewReActAgent` 链式注入（LiveEvents、WithSuspendOnChildWait(true)、WithProviderFunc；**非 fast 才注 pending/paused checker**）→ runCtx 注入 sessionID/workDir/stopCtx/trustMode 读取器 + 首轮图片 → goal 拼话题召回 + 技能预筛 → `agent.Run`：软停错误 → pauseSession；其他错误 → setSessionError；成功：SuspendOnChildWait → suspendOnChildWait；LimitReached → pauseSession；否则验收 RunWrap → agent_done 事件 → completed → evolveSession("success") → persistHistory/Events。
+persist running → `resolveGearMetaRole` → `mountTopLevelEssentials`（插件 `top_level: true` 的顶层必备工具预挂到会话顶层 scope，**三档全挂**，2026-09-18 起——原排除 cluster 的前提"T13 收窄后 meta 仍可用 tool_catalog+tool_mount"已失效；幂等，子 Agent scope 不受影响）→ fast 档不等 PROJECT.md（其他等 ≤2s）→ provider（`GetBladesProviderWithThinking(gearRoleID, thinking, fallbackObserver)`）→ 记忆包装（meta 档：看板/roster/台账 + metaSkillBlock；daily 档：roleSkillBlock）→ `NewReActAgent` 链式注入（LiveEvents、WithSuspendOnChildWait(true)、WithProviderFunc；**非 fast 才注 pending/paused checker**）→ runCtx 注入 sessionID/workDir/stopCtx/trustMode 读取器 + 首轮图片 → goal 拼话题召回 + 技能预筛 → `agent.Run`：软停错误 → pauseSession；其他错误 → setSessionError；成功：SuspendOnChildWait → suspendOnChildWait；LimitReached → pauseSession；否则验收 RunWrap → agent_done 事件 → completed → evolveSession("success") → persistHistory/Events。
 
 ### resumeSession（:3193）
 
@@ -142,14 +142,16 @@ persist running → `resolveGearMetaRole` → fast 档不等 PROJECT.md（其他
 
 | LiveEvent | 事件 |
 |---|---|
-| `llm_delta` | finalizeThinking + setStreamingText（**不落事件**） |
-| `think_delta` | setThinkingText |
-| `tool_call` | finalizeThinking + persistInterimText（口播正文落 `assistant_text`）；`call_sub_agent(s)` 逐项落 `kind=sub_agent_dispatch`（中文领域名进 detail_json） |
+| `llm_delta` | finalizeThinking + setStreamingText（**不落事件**）；**集群档顶层 Meta 例外**：只写轮缓冲 `pendingTopText` 不推 StreamingText（见下"集群档顶层治理"） |
+| `think_delta` | setThinkingText；**集群档顶层 Meta 直接丢弃**（不进 ThinkingText、不落 think 事件，2026-09-19 定案） |
+| `tool_call` | finalizeThinking + persistInterimText（口播正文落 `assistant_text`）；**集群档顶层 Meta 例外**：中间轮口播随缓冲一起丢弃（不落 assistant_text），ask_user 边界把缓冲灌回 StreamingText（提问正文快照依赖它）；`call_sub_agent(s)` 逐项落 `kind=sub_agent_dispatch`（中文领域名进 detail_json） |
 | `tool_exec` | 仅补 call_sub_agent 的 tool_exec 事件（其他工具由 handleToolEvent 记） |
 | `sub_agent_done` | Message `kind=sub_agent_done` + 摘要 `llm_result` |
 | `peer_ask` | Message `kind=peer_ask` + 正文 `llm_result` |
 | `notify` | System 事件 |
 | `token_usage` | debug 事件，msg `in=… out=… cache_hit=… cache_miss=…` |
+
+**集群档顶层治理（2026-09-18/19）**：判定 `isClusterTopEvent` = `ev.AgentID == session.ID`（顶层实例 ID 即会话 ID；初版误用 `ev.Agent==""`，实测顶层事件带展示名 "MetaAgent" 永不命中，已修正）。该档用户只看最终交付：中间轮的编排口播/编排推理绝不进用户流——LLM delta 只进轮缓冲 `pendingTopText`，ToolCall 边界丢弃缓冲且不调 persistInterimText；run 完成收尾时 `flushPendingTopText`（:3532）把终答灌进 StreamingText（与 agent_done 同 tick 快照）。日常/快速档与子 Agent（含集群档 domain/叶子）两路径零改动。
 
 `handleToolEvent`（:2734）：从 ctx 取 AgentID/展示名 → 仅 running 会话记录 → 跳过 call_sub_agent → tool_call/tool_exec 事件（artifacts merge 进 detail_json）；失败拼 `path= err=`。
 

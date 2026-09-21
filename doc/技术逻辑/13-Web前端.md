@@ -27,7 +27,7 @@
 | 层 | 位置 | 说明 |
 |---|---|---|
 | 入口 | `main.ts` / `App.vue` | createApp → **64 个图标白名单注册** → router + ElementPlus → mount；App 仅 config-provider + router-view |
-| 布局 | `layout/index.vue` | Header（Logo/主题/设置）+ 侧栏（首页链接 + WorkDirTree + 3 组菜单 + 工作流 Beta + 人格状态）+ main router-view（fade 过渡） |
+| 布局 | `layout/index.vue` | Header（Logo/主题/设置）+ 侧栏 280px（2026-09-17 加宽自 224px：首页链接置顶 + 会话树 WorkDirTree〔高度随内容，不 flex-1 撑满〕+ 导航组〔资源库组含「工作目录」/projects 入口〕+ 工作流 Beta + 人格状态钉底）+ main router-view（fade 过渡） |
 | 路由 | `router/index.ts` | 12 子路由 + 2 旧重定向；**无守卫、无 404 兜底** |
 | API | `api/`（12 模块） | 全部经 `client.ts::fetchJson` 单点收口 |
 | 状态复用 | `composables/`（10 个） | useSessionStream/usePanelRefresh/useTreeLayout 等 |
@@ -43,14 +43,14 @@
 | `/` → `/dashboard` | Layout | 首页入口 |
 | `/dashboard` | dashboard/index.vue | 建会话 + 会话列表 + 统计/趋势 |
 | `/session` | session/index.vue | 三视图同页（`?view&id&work_dir&agent`） |
-| `/projects` | projects | 目录卡片（**不在侧栏菜单**） |
+| `/projects` | projects | 目录卡片（「工作目录」导航 2026-09-17 回归侧栏资源库组——项目偏好/测试助手/目录增删在侧栏树里替代不了；页面与 WorkDirDrawer 抽屉功能重复，是否删页待定） |
 | `/skills` `/plugins` `/knowledge` | 资源库组 | knowledge 占位 |
 | `/memory` `/profile` `/soul` `/history` | 记忆组 | soul 只读 |
 | `/settings` | 系统组 | |
 | `/workflow` | 侧栏 Beta 卡进入 | 纯占位 |
 | `/chat` → `/session`、`/project-prefs` → `/projects` | 重定向 | |
 
-- **菜单是硬编码数组**（layout/index.vue:113-135），与路由表**手工同步**（加页面要改两处；`/session`、`/projects`、`/workflow` 刻意不入菜单）。
+- **菜单是硬编码数组**（layout/index.vue:113-135），与路由表**手工同步**（加页面要改两处；`/session`、`/workflow` 不入菜单；`/projects` 2026-09-17 起入资源库组首项——「会话」「工作目录」两项曾移除，前者入口已在树里）。
 - 密钥状态共享：`useWorkDir`（localStorage `bma:last-workdir`）、`useTheme`（`bma:theme`，默认浅色，首屏不闪；App.vue 刻意不强制挂 dark class——历史事故：默认进暗色 + 图标状态错反）。
 - 首页/目录树/会话页动线：`WorkDirTree` 点目录 → `setWorkDir` + `/session?work_dir=`（**双通道**）；`watch(route.fullPath)` 每次路由变化重拉会话列表。
 
@@ -65,6 +65,8 @@
 **提交流程 handleSubmit 三分支**：待澄清（批量态拒绝输入框、走问答卡；带图警告）→ 已有会话（running=邮箱即时注入；非 running 重载 openSession）→ 无会话（createSession + 路由跳转）。
 
 **唤醒补刷**：`visibilitychange→visible` 与 `online` → reconcileAfterWake（refreshPanels + loadSessions）——后台 3s 定时器被浏览器节流、SSE 快照只补事件流。
+
+**邮件气泡 MailBubble**（views/session/chat/components/，2026-09-17）：主对话栏把 Agent 间 mailbox 通信按正文渲染成气泡——数据源 `GET /sessions/:id/mailbox-trace`（会话级全部 Agent 往来、一行一封、收发双方重复行去重、时间正序）；与编排页单 Agent 对话视图的 mails 留痕互补（那个按 Agent 查、这个按会话查）。同轮顺带修复新建会话链路：会话页对无 id 入口一律回落 `localStorage.lastSessionID`，且同路由仅 query 变化不重挂组件——新增 `?new=1` 信令跳过恢复分支 + 路由 watcher 页内再点也能清空。
 
 ## 13.4 事件分类三档（turns.ts，核心）
 
@@ -173,7 +175,7 @@
 
 ## 13.11 通用组件与管理页
 
-- **WorkDirTree**（侧栏核心）：按 work_dir 分组（customDirs 补空组 + customDirs/collapsedDirs 在 localStorage）、SESSIONS_PER_DIR=5 + 显示更多、⋯ 菜单（新建/查看全部/偏好/移除）、**显式 limit 1000**（不传会被 200 截断）。
+- **WorkDirTree**（侧栏核心，2026-09-17 交互重做）：按 `work_dir` 分组（`normDir` 归一化同址写法）、**逐级展开**——「会话」标题行是总开关（收起时显示 `会话 (N)`），目录行默认收起、点击才展开其中会话，展开态持久化 `bma:treeOpen`/`bma:openWorkdirs`（旧键 `bma:collapsedWorkdirs` 不再读取）；手工目录（localStorage `bma:workdirs`）无会话也常驻；SESSIONS_PER_DIR=5 + 显示更多 (N)；⋯ 菜单（新建会话/查看全部/项目偏好/从列表移除）——**移除对全部目录开放**（`bma:removedWorkdirs` 本地隐藏清单，磁盘目录与会话一概不动，WorkDirPicker 选定/重新添加即恢复）；目录功能走 ⋯ 菜单 + WorkDirDrawer 抽屉（与 /projects 右栏同源）；`utils/dir.ts: knownWorkDirs()/dirBaseName()` 统一"已有工作目录"聚合口径（会话栏/首页/工作目录页/侧栏添加弹窗四个调用点）；**显式 limit 1000**（不传会被 200 截断）。
 - **WorkDirPicker**：**只在"选定"时 emit 一次**（此前逐字 emit 会写半截路径）；原生目录选择优先（501/504/409 退网页版：面包屑 Windows 盘符兼容/手输/最近/子目录单击选中双击进入）。
 - **WorkDirDrawer**：与 /projects 右栏**同源**（改一处要考虑另一处）；关闭时 emit `update:dir null`（否则同一目录再点打不开）。
 - **MarkdownRenderer**：`marked.parse`（gfm + breaks 单换行即 `<br>`）→ `DOMPurify.sanitize`（标签白名单、禁 data: URI、剥原始 HTML）；自定义 link 渲染器（非 https 归一 # + target blank）；code 渲染器输出 DeepSeek 风格头栏（复制/下载按钮靠事件委托）。
@@ -198,6 +200,7 @@
 15. **`has_more` 是前端推断值**（取满即视为可能还有；afterSeq 模式恒 false）。
 16. **SSE 重连自理**：done 后不置 closed 靠 `online && es` 巧合拦住重连（改 onVisible 守卫会引出"完成后反复重连"）。
 17. **ExecutionLog 进度条仍认旧完成合同**（口径已漂移）。
+18. **复活重跑后增量游标失效**（2026-09-17 修复）：终态节点 ReviveWithMessage 同 ID 重跑会清空热层并从 0 重编 seq，前端 `after_seq` 增量此后取不到任何东西、面板停在旧内容——agent messages 响应补 `run_id`（单调递增，权威判据）与 `hot_max_seq`（兜底）；后端同时在复活前 DeleteMessages 作废旧 run 终态快照（防 PG 兜底把旧消息续上来）。
 18. **SkillSet.vue 是死代码**；`filterTurnForConcise`/`isLLMEvent`/`esc`/`sameDir`/`fmtTime` 无引用；`fmtDateTime` 与 `fmtDate` 实现逐字相同；`healthPollInterval` 死配置。
 19. **FilePreview 的"VS Code 打开/下载"是空按钮**。
 20. **artifact 路径全部工作区相对**（workspaceUrl 逐段 encode 保斜杠；HTML 相对引用可解析）；inferArtifactsFromOutput 只认 `.bma/` 下五个产物目录。

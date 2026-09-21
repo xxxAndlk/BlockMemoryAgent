@@ -54,11 +54,12 @@
 | POST | `/api/sessions/:id/agents/:aid/cancel` | :446 | 取消子 Agent |
 | POST | `/api/sessions/:id/agents/:aid/pause` | :563 | 暂停 domain 支路 |
 | GET | `/api/sessions/:id/agents/:aid/events` | :602 | 子 Agent 逐轮事件 |
-| GET | `/api/sessions/:id/agents/:aid/messages` | :625 | 完整消息历史 + mailbox 留痕（`before_seq/after_seq/limit`；aid=meta 映射主 Agent） |
+| GET | `/api/sessions/:id/agents/:aid/messages` | :625 | 完整消息历史 + mailbox 留痕（`before_seq/after_seq/limit`；aid=meta 映射主 Agent；响应含 `run_id`/`hot_max_seq`，2026-09-17——复活重跑后前端增量游标以 run_id 单调性判新旧） |
 | POST | `/api/sessions/:id/agents/:aid/message` | :650 | 用户直连（返回 `{ok, queued}`） |
 | GET | `/api/sessions/:id/worktrees` / `:aid/diff` | :708/:721 | worktree 清单 / 全量 diff |
 | POST | `/api/sessions/:id/worktrees/:aid/:action` | :742 | 合并门 merge/reject（reject 可带 comments） |
 | GET | `/api/sessions/:id/metrics` / `efficiency` / `logs` / `token-metrics` / `watchdog` / `mailbox` | session.go | 只读查询族 |
+| GET | `/api/sessions/:id/mailbox-trace` | session_http.go:626 | 会话级邮件留痕（2026-09-17）：全部 Agent 的 mailbox 往来一行一封、收发双方重复行 store 层 DISTINCT、按时间正序；与 `/mailbox`（未取走的待办队列）语义不同——那是待办、这是历史，主对话栏 MailBubble 数据源 |
 | POST | `/api/sessions/:id/clarify` / `interrupt` / `enqueue` / `cancel` / `stop` / `topic` / `trust-mode` / `gear` / `thinking` / `workdir` | control_http.go / session_http.go | 控制族 |
 | GET | `/api/sessions/:id/workspace/*path` | workspace_http.go:35 | 工作区文件流式服务 |
 | DELETE | `/api/sessions/:id` | :184 | 硬删单会话 |

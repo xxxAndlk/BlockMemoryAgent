@@ -196,7 +196,7 @@
 
 ## 2.7 mailbox 交互
 
-- `drainMailbox`（1967-2007）：`mailbox.Drain(a.name)` 取全部未读 → 每条转 `ReactMessage{Role:"user", Content:"[mailbox from X] ..."}`（mailboxMessageToReact，1934-1962：MsgEscalate 加 [升级] 前缀、Payload JSON 追加、FilesModified 列表追加）→ emit 事件（**From=user / From=system 不推完成事件**（system=依赖就绪等通知，正文照常入史）；MsgRequest/MsgEscalate 推 `peer_ask`；`MsgMilestone` 或 subject 前缀「里程碑:」的 info 推 `milestone`（中途播报非完成，2026-09-17）；其余 `sub_agent_done`）→ `memory.Write(sub_agent_summary)`。
+- `drainMailbox`（1967-2007）：`mailbox.Drain(a.name)` 取全部未读 → 每条转 `ReactMessage{Role:"user", Content:"[mailbox from X] ..."}`（mailboxMessageToReact：主题/正文/Payload 整体包 `WrapUntrusted("mail:<From>")` 围栏，2026-09-20 防线延伸到 Agent 间通道——兄弟 Agent 产出对收件方是不可信内容；**From=user 用户直接指令豁免**（指令优先级最高，降格为"数据"违义）；框架信号留围栏外——[升级] 前缀、[mailbox from X] 前缀、"修改文件" 清单；MsgEscalate 加 [升级] 前缀、Payload JSON 追加、FilesModified 列表追加）→ emit 事件（**From=user / From=system 不推完成事件**（system=依赖就绪等通知，正文照常入史）；MsgRequest/MsgEscalate 推 `peer_ask`；`MsgMilestone` 或 subject 前缀「里程碑:」的 info 推 `milestone`（中途播报非完成，2026-09-17）；其余 `sub_agent_done`）→ `memory.Write(sub_agent_summary)`。
 - drain 时机：主循环顶部（generate 前）、无 tool_calls 分支、工具结果全部入史后、waitForChildren 循环内。**不能在 tool_calls 与 tool 结果之间注入**（配对 400）。
 - `waitForChildren`（1639-1662）：`PendingChildren>0` 时每 30s `WaitForAnyChild` + drain；drain 到新消息或 ctx 取消即返回；`HasPausedChild` 时返回 paused=true。
 

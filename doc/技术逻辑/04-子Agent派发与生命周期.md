@@ -121,7 +121,9 @@
 `dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, wallClock, reuseAgentID, takeover, opts...)`（2579-2905）：
 
 1. **reuse 分流**（2592-2597）：`reuseAgentID != ""` → 热驻未开启报错；否则 `dispatchToIdleSlot`（idle_pool.go）——idle 唤醒注入任务 / busy 入队 / 不存在报错。
-2. 角色解析 + worktree 约束（开关关闭拒；热驻 domain 拒）。
+2. 角色解析 + worktree 约束（开关关闭拒；热驻 domain 拒）。**派前双校验**（dispatchOne 入口，2026-09-18/19 实测修复，拒绝发生在配额/树登记前零消耗）：
+   - `checkRoleTaskFit`（2588）：任务文本的工具需求信号（powershell/get-content/grep/sed/go test/npm/pip/writefile/写入文件等直写形态）× 目标角色工具面，不匹配硬拒并给改派方向——防"派 scout 执行 PowerShell"式能力错配整波空转；
+   - `checkTaskPathsFit`（2640）：任务文本提取零歧义绝对路径信号（Windows 盘符 + POSIX 绝对路径正则，带空格路径截断但根前缀足够判定），越出会话 workDir 且角色工具面无 RunCommand 时硬拒（tools_hint 预挂的也算，`hintHasTool`）——防子 Agent 跟 "path escapes sandbox" 缠斗空转（实测 3 个 code_reviewer 84 次调用零交付）；拒绝消息给三选一处置：改派 domain / ask_user 请用户切换会话 workdir / Copy-Item 摄入工作目录；`pathWithinWorkDir` 为 Windows 大小写不敏感前缀比较。
 3. **scout 类缺省墙钟**：`SpecExempt` 角色无显式 wall_clock_min → 5min（light 10min）（2618-2624）。
 4. **权限校验**：`CanCall(roleIDFromAgentID(parentID), roleID)`。
 5. **域控守卫**（仅 domain，2634-2652）：
@@ -171,7 +173,7 @@
 1. `providerForAgent`（实例级覆盖优先）；memory 空实现兜底。
 2. **domain 命名**（3504-3532）：`roleDef.Name = "<domain>领域Agent"`（无 domain 用 task 首行）；responsibility 非空则**追加身份头到 SystemPrompt 末尾**（置末尾保前缀缓存）。
 3. **不注入用户人格**（soul）给子 Agent（身份混淆实证，3533-3538）。
-4. **黑板摄取包装**（3542-3548）：domain + 非空 domain + searcher 实现 BlackboardSearcher → `newSiblingUptakePipeline`（每轮 Assemble 末尾按 scope 注入【兄弟产出】）。
+4. **黑板摄取包装**（3542-3548）：domain + 非空 domain + searcher 实现 BlackboardSearcher → `newSiblingUptakePipeline`（每轮 Assemble 末尾按 scope 注入【兄弟产出】；**【兄弟产出】逐条包 `WrapUntrusted("block-memory")` 围栏**，2026-09-20——兄弟产出是 LLM 生成文本，可能是被污染外部源的二阶转述；与【相关记忆】召回同经 `renderRecalledMemory` 一处收口，头部行留围栏外）。
 5. 构造 `ReActAgent`（3549-3598）：`NewToolRegistryAdapterForRole(tools, subAgentID, roleDef.Tools, roleDef.ID, pluginVisibility)`；`WithProviderFunc`（每次调用重解析实例级 provider）；mailbox/memory/loopConfig/workDir；`WithSkillBlock`；`WithPendingChildrenChecker(d)`（子 Agent 也可能递归派发）；`WithActivityReporter(d.activityReporterFn(...))`（活动冒泡）；`WithMessageLogger`；`WithLogger`；**liveFn 包装**：先 `recordFileWrite`/`recordRecentActivity` 再转发会话。
 6. `running.Store`；defer Purge mailbox。
 7. **前缀拼装**（3607-3671）：`origTask` 留档 → `recordParentSpec`（抓 spec 切片）→ 依次拼：`projectBriefPrefix`（AGENTS.md）→ `buildSharedPrefix`（spec+共享记忆）→ `projectPrefsPrefix`（项目偏好）→ `skillRecallPrefix`（相关经验）→ `injectScopedRecall`（块记忆召回）→ domain 标签行 → `\n\n【当前任务】\n` + task；五路 runes 记账日志（ctx_inject）。
@@ -193,6 +195,7 @@
 - `killStuckSubAgent`（925-995）：LoadAndDelete subMeta → cancel（nil 安全）→ doneOnce 兜底 trackChildDone → **构造 kill 消息**（含近期写入文件清单"盘上产物大概率可用" + 杀前活动摘要）→ notify 父 → tree.Finish(Failed) → clearAgentModel → salvageFailure → **`killDescendants` 级联杀后代** → 清 activity/running/mailbox。
 - 活动冒泡（`bubbleActivity`，688-704）：子活动沿 parentID 链向上 stamp("descendant")，使 domain 等子期间保活（防误杀合法等待）。`child_wait` kind 只标记展示态（不刷 lastTS、不冒泡）。
 - `PingActivity`（832-841）：等用户答复（审批/提问）期间由会话层周期调用，以 `user_wait` 证据防误杀。
+- `ClosePatrol`（904-，2026-09-18 修复）：`patrolMu` 串行化 stop channel 的 close + 置 nil——并发/重复调用曾可 close-of-closed panic；patrol goroutine 启动即持 channel 引用（原实现 select 每轮重读字段，置 nil 后 `<-nil` 永久阻塞、ticker 照走，巡检 goroutine 泄漏）一并修掉。
 
 ## 4.10 暂停 / 恢复 / 复活
 
@@ -206,7 +209,7 @@
 
 - `ResumePaused`（4080-4239）：前置（sid/tree/msgStore）→ 续跑次数检查（达 `maxPausedResumes` → `concludePaused` 强制收口）→ `msgStore.LoadMessages` 重建 → domain 名覆写 + 黑板摄取包装 → 构造 ReActAgent（同 runSubAgentOnce 接线）→ `t.Resume` + activity 注册 → `RunWithHistory(ctx,"继续",msgs)` → 三态：再触限（存史+再 Pause+notify）、出错（treeFinish+notify+trackChildDone）、完成（落史+tree.Finish+notify+trackChildDone）。
 - `resumePausedNode`（4248-4272）：异步 goroutine 包装 + 失败兜底通知（节点仍 Paused 时补失败邮件，防永久挂账）。
-- `ReviveWithMessage`（1102-1200）：用户直连复活终态节点——`tree.Reopen` + SetCancel；种子 = 原任务 + 上轮 Summary/Err + 用户消息；trackChildStart；**mailbox.Reopen**（原 run 已 Purge，不重开则死信）；**msgLogger.Clear**（seq 重新编号）；看板翻回进行中；goroutine runSubAgent(mode=react)；给父发"复活返工，勿重复派发"邮件；ledger 重记。
+- `ReviveWithMessage`（1102-1200）：用户直连复活终态节点——`tree.Reopen` + SetCancel；种子 = 原任务 + 上轮 Summary/Err + 用户消息；trackChildStart；**mailbox.Reopen**（原 run 已 Purge，不重开则死信）；**msgLogger.Clear**（seq 重新编号）；**`msgStore.DeleteMessages`（2026-09-17）作废旧 run 的终态消息快照**——热层清空后读路径在热层不足时会 PG 兜底，把旧快照当成当前对话续上（面板显示新内容又跳回旧内容）；只清该子 Agent，会话级消息保留供进程重启恢复；看板翻回进行中；goroutine runSubAgent(mode=react)；给父发"复活返工，勿重复派发"邮件；ledger 重记。
 - `InjectUserMessage`（1081-1096）：From="user" 邮件 + pokeParent。
 
 ## 4.11 失败分类与结构化失败标记
@@ -270,7 +273,7 @@
 
 ## 4.17 聚合模式与批间校验
 
-- `map_sub_agents`（map_dispatch.go）：N 项经 `dispatchOpts.aggregate` 登记，完成不直发父邮箱而记入聚合器，全部收口后汇一条；notify 未触达路径有兜底收口（防聚合器永久悬挂）。聚合器带 `abandon(flush)` 放弃语义：放弃后已收口与后续到达的项改经 flush 逐条直发（onDone 永不触发），防消息因放弃而丢失。
+- `map_sub_agents`（map_dispatch.go）：N 项经 `dispatchOpts.aggregate` 登记，完成不直发父邮箱而记入聚合器，全部收口后汇一条；notify 未触达路径有兜底收口（防聚合器永久悬挂）。聚合器带 `abandon(flush)` 放弃语义：放弃后已收口与后续到达的项改经 flush 逐条直发（onDone 永不触发），防消息因放弃而丢失。**聚合 record 的 ok 按失败机读标记判定**（notify 咽喉 5966：`ok = !failureMarkerRe.MatchString(summary)`，2026-09-19 修复——墙钟被杀/守卫终止的项不再在"完成 N/失败 0"聚合消息里误标完成，与派发期拒绝口径一致）。
 - `call_sub_agents` 波聚合（2026-09-17，C-3a）：同波 domain 项 ≥2 且 `agent.batch_digest_enabled`（默认 true）时整波聚合（batchID=`<parentID>/wave-<seq>`）；全部完成经 `deliverWaveDigest` 汇一条【整合纪要】（`SummaryMerger` 轻量模型按领域归并/冲突单列，失败回退逐领域拼接）经 notify 单条送达父邮箱；成功 domain <2 时 `abandon` 回退逐条直发；拒派项在 okDomains≥2 时事后补记（防全败波中途触发纪要）。台账 Files 经 `LastEntryByChild` 取。
 - 跨域契约检查（`maybeRunContractChecks`，513-595）：父下全部兄弟完成（count 归零）且 spec 缓存含非空契约时触发；**变更屏障**（recMtimesMatch，文件已变则跳过该份）；违例按文件归属批量打回；**指纹去重**（`violationFingerprint` = parent+file+detail）：已推过未修复的收敛为"已知违例仍未修复（首次报告于 HH:MM）"升级提示。
 
@@ -285,6 +288,9 @@
 7. 墙钟值藏在多处（wallClock / domainReconClock / timeout / slot timer），报文案必须用 `effectiveTimeout(subAgentID)`。
 8. spec 失效（Layer 2）由工具侧删除时**写墓碑值**留痕，不是简单 delete。
 9. **`git apply --check --3way` 不模拟三方合并冲突**（2026-09-17 实证：预检放行后真 apply 把冲突标记写进主仓工作区）——三方合并预检必须在临时索引上跑（`GIT_INDEX_FILE` + `--3way --cached`）。
+10. **`WaitForAnyChild` 跨波残留信号**（2026-09-18 修复）：notify 语义是"有事发生请重查"（返回 true 只提示调用方重查计数与邮箱，waitForChildren 循环自行复核）——不可改成"消费后重查"（吞掉 poke 必现回归）；仅 count<=0 短路分支落缓冲前加非阻塞 drain，清上波完成/poke 残留信号。
+11. **pending 计数不下探负数**：`trackChildDone` 裸 `Add(-1)` 改 CAS 下限循环（重复/过量补偿不得打穿）；`killStuckSubAgent` 的 doneOnce 闭包双层 recover——notify 投递 panic 时原实现会跳过 trackChildDone，父未决计数永久 +1、终结保护空等。
+12. **`PurgeSession` 补 pending 前缀整批回收**（2026-09-18）：原 pending map 只增不减，每派发过的节点条目永久驻留 sync.Map；会话整体终结后无竞态，按 `parentID` 前缀清扫。
 
 ---
 
@@ -333,7 +339,7 @@ dispatchHotDomain 建槽 → slotRunning ──DONE/软停──→ slotIdle ─
 
 ## 4.21 复用守卫（reuse_guard.go）
 
-`checkIdleDomainReuse`（仅新建 domain 且热驻开启时）：早退=`【新领域声明` 标记；对每个 idle 槽算**双信号**——①命名包含（相等或全串包含，短侧 ≥2 rune；game-core vs game-ui 不命中）；②**spec 文件 ∩ 槽 24h 内写入文件**重叠（路径归一后互为目录后缀判重）。任一命中 → 拒绝 + `reuse_agent_id` 指引 + 逃生口说明。
+`checkIdleDomainReuse`（仅新建 domain 且热驻开启时）：早退=`【新领域声明` 标记；对每个 idle 槽算**双信号**——①命名包含（相等或全串包含，短侧 ≥2 rune；game-core vs game-ui 不命中）；②**spec 文件 ∩ 槽 24h 内写入文件**重叠（路径归一后互为目录后缀判重；归一用 `strings.ReplaceAll(p,"\\","/")` 而非 `filepath.ToSlash`——后者在非 Windows 平台不转反斜杠，2026-09-17 Linux CI 修复，与 `plugins.ExpandWorkDir` 同口径）。任一命中 → 拒绝 + `reuse_agent_id` 指引 + 逃生口说明。
 
 ## 4.22 领域档案冷复活（domain_profile.go）
 
@@ -394,7 +400,7 @@ dispatchHotDomain 建槽 → slotRunning ──DONE/软停──→ slotIdle ─
 
 ## 4.30 map_sub_agents（map_dispatch.go）
 
-worker 池 6 并发 `dispatchOne`；单项上限：默认角色 6 / **scout 32**；**spec 门整波只查一次**；`batchID = <parentID>/map-<seq>`；聚合 `mapAggregation`（按 idx 排序）——整波完成**只发一条 mailbox 汇总**（不逐项通知，防邮箱淹没）；立即派发失败直接 record(false)；notify 命中 aggByAgent 时只 record 不通知，goroutine 兜底收口防聚合器悬挂。
+worker 池 6 并发 `dispatchOne`；单项上限：默认角色 6 / **scout 32**；**spec 门整波只查一次**；`batchID = <parentID>/map-<seq>`；聚合 `mapAggregation`（按 idx 排序）——整波完成**只发一条 mailbox 汇总**（不逐项通知，防邮箱淹没）；立即派发失败直接 record(false)；notify 命中 aggByAgent 时只 record 不通知，goroutine 兜底收口防聚合器悬挂。**spec_exempt 角色经 map 路径无显式 wall_clock_min 时注入 5 分钟兜底墙钟**（3050，与单派 scout 缺省同口径；显式值优先，端到端硬杀后聚合消息带 timeout 机读标记、单项标败）。
 
 ## 4.31 技能工具（skills_tool.go）
 
@@ -402,7 +408,7 @@ worker 池 6 并发 `dispatchOne`；单项上限：默认角色 6 / **scout 32**
 
 ## 4.32 跨 Agent 协作问答（send_message 通道）
 
-**工具面**（`sendMessageTool`，dispatcher.go:1788-1867）：`send_message{to_agent_id, subject, body, message_type?, thread_id?}`——`message_type`：默认 `request`（期望回复）/ `info`（单向通知）/ `reply`（回复）/ `escalate`（升级求助，父侧收 `[升级]` 前缀）；发送时自动 `ReplyTo=发送方ID`；返回消息 ID；目标已销毁返回 `消息未送达: X`（死信可见，不静默消失）。**叶子角色无此工具**（工具面未变）。
+**工具面**（`sendMessageTool`，dispatcher.go:1788-1867）：`send_message{to_agent_id, subject, body, message_type?, thread_id?}`——`message_type`：默认 `request`（期望回复）/ `info`（单向通知）/ `reply`（回复）/ `escalate`（升级求助，父侧收 `[升级]` 前缀）；发送时自动 `ReplyTo=发送方ID`；返回消息 ID；目标已销毁返回 `消息未送达: X`（死信可见，不静默消失）。**问句类型提示**（2125-2133，2026-09-17）：发送文本命中问句特征词（`inquiryMarkers`）而 message_type 标成 reply/info 时，工具结果就地附 `mislabeledInquiryHint` 提示——"对方不会按询问处置（不触发当轮必须回复纪律），你会等到沉默"，防类型错标导致沉默回复。**叶子角色无此工具**（工具面未变）。
 
 **语义**：异步投邮箱，收件方下一轮 `drainMailbox` 才读到，**提问方不阻塞**；多轮问答靠 `thread_id` 聚合、`ReplyTo` 指向被答复消息（mailbox 本身纯透传不做配对校验）。
 
