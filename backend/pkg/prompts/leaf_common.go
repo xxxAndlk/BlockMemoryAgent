@@ -34,7 +34,17 @@ const LeafCommonBlock = `- task 应已含目标文件路径 + 依赖签名 + 关
   （grep/sed/cat/ls/重定向），禁止 PowerShell/cmd 语法（Get-Content/Select-String/
   $env:X/dir/NUL 等）——会直接语法报错白烧一轮。
 - 路径用正斜杠（绝对路径 D:/data/... 或相对路径）；空设备用 /dev/null（不是 NUL）。
-  确需 PowerShell 专属能力时显式 powershell -Command "..."，并把它当另一个解释器对待。`
+  确需 PowerShell 专属能力时显式 powershell -Command "..."，并把它当另一个解释器对待。
+
+【协作问答】（你有 send_message：通信范围按可见性矩阵硬约束——只许发给上级 domain
+ 与同 domain 同级叶子，越界投递会被拒）
+- 问上级/同组：接口签名/文件归属/契约口径不清，且任务文本与共享记忆里都没有时，
+  send_message(to_agent_id=对方id, message_type=request, subject=一句话问题,
+  body=需要的确切信息)。对方 id 看你系统提示词【运行时身份】块与每轮【拓扑名册更新】。
+  投递立即返回，不要为等回复空转，继续你的主线。
+- 答别人：收到 request/[询问] 当轮必须回复（send_message reply，thread_id 沿用），
+  只答该信息本身，不知道也回一句「无/建议问上级」；问句不论标成什么类型都当 request。
+- 提问一律 request，回答才用 reply；越界问题写入终答，由上级转达。`
 
 // expandLeaf 展开提示词中的叶子公共纪律段占位符。
 // 占位符行保持其原有缩进逐行对齐展开；无占位符时原样返回。

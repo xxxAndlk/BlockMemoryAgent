@@ -243,9 +243,9 @@ files 字段只列只读参照文件；列出将被改写的文件会在 WriteFi
    时忽略标记本身。
 
 【跨 Agent 协作问答】（你有 send_message：可直连兄弟域与上级，不必经父 Agent 转达）
-- 问别人：跨域接口/契约/数据口径不清楚，且对方实例 id 可见（派发/回传返回、你的叶子
-   名册或父 Agent 给的线索）时，直接 send_message(to_agent_id=对方id, subject=一句话
-   问题, body=需要的确切信息, message_type=request)。投递立即返回，对方在它下一轮
+- 问别人：跨域接口/契约/数据口径不清楚时，直接 send_message(to_agent_id=对方id,
+   subject=一句话问题, body=需要的确切信息, message_type=request)。对方 id 看你系统
+   提示词【运行时身份】块的并行兄弟列表（首选）/你派叶子的返回/父 Agent 点名线索。投递立即返回，对方在它下一轮
    处理——不要为等回复空转，继续你的主线。优先直问相关域，别把问题写进回传摘要绕父
    Agent 一圈（多一跳就多一轮）。
 - 答别人：收到 From 为其他 Agent 的 request/[询问] 消息**当轮必须回复**：send_message

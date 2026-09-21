@@ -115,7 +115,7 @@ fixed_roles:
     description: 轻量只读侦察：在代码库中定位文件/函数/符号/行号，回答一个具体问题
     keywords: ["侦察", "定位", "找", "scout", "explore", "在哪", "哪里"]
     skills: []
-    tools: [ReadFile, ListDir, SearchInFiles]
+    tools: [send_message, ReadFile, ListDir, SearchInFiles]
     model_config:
       model_ref: ark-deepseek-v4-flash # 抵扣 0.5 最便宜档；侦察任务短平快，thinking=low 保底推理。连接参数见 config/models.json
       temperature: 0
@@ -135,7 +135,7 @@ fixed_roles:
     description: 查修一体速修：定位并直接修复单点小问题（报障/小改，≤3 文件），边查边改一竿到底
     keywords: ["速修", "轻量修复", "小修", "报障", "快速修复", "light", "fix"]
     skills: []
-    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, GitDiff, GitStatus, load_skill]
+    tools: [send_message, ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, GitDiff, GitStatus, load_skill]
     model_config:
       model_ref: ark-deepseek-v4-flash # 同 domain/scout 便宜档；小修短平快 thinking=low 保底推理。连接参数见 config/models.json
       temperature: 0
@@ -158,7 +158,7 @@ fixed_roles:
     keywords: ["代码", "编程", "开发", "bug", "修复", "重构", "review", "code"]
     skills: []
     # 只暴露执行类工具；call_sub_agent 由 dispatcher 注册但不在此白名单中。
-    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    tools: [send_message, ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config:
       model_ref: ark-deepseek-v4-flash # 叶子是最高频角色，规格已被 spec 钉死、单文件闭环，flash（抵扣 0.5）性价比最优；k2.7-code（抵扣 4.5）留作质量不足时的升级档。连接参数见 config/models.json
       temperature: 0.4
@@ -172,7 +172,7 @@ fixed_roles:
     description: 前端UI/UX设计与实现助手，擅长CSS/HTML/组件开发
     keywords: ["UI", "界面", "前端", "CSS", "HTML", "样式", "布局", "page"]
     skills: []
-    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    tools: [send_message, ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config:
       model_ref: ark-glm-5.3-flash # gemini-webapi 网关（连接参数见 config/models.json）
       temperature: 0.7
@@ -186,7 +186,7 @@ fixed_roles:
     description: 专门审查和优化AI提示词（Prompt）的助手
     keywords: ["提示词", "prompt", "审查", "优化", "template"]
     skills: []
-    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
+    tools: [send_message, ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill]
     model_config:
       model_ref: ark-deepseek-v4-flash # 连接参数见 config/models.json
       temperature: 0.2
@@ -208,7 +208,7 @@ fixed_roles:
     description: 静态代码审查助手，只读不改，输出结构化 findings
     keywords: ["review", "审查", "code_review"]
     skills: []
-    tools: [ReadFile, ListDir, SearchInFiles, GitDiff, GitStatus, GitLog, GitBlame, HTTPGet, load_skill]
+    tools: [send_message, ReadFile, ListDir, SearchInFiles, GitDiff, GitStatus, GitLog, GitBlame, HTTPGet, load_skill]
     model_config:
       model_ref: ark-deepseek-v4-flash # 同 prompt_reviewer（原 *review_model）：0.2/16384/low。连接参数见 config/models.json
       temperature: 0.2
@@ -225,7 +225,7 @@ fixed_roles:
     skills: []
     spec_exempt: true  # 验收派发由 dispatcher 验收闭环内部发起（Meta 终答后），不走 WriteSpec 门禁
     # tool_catalog/tool_mount 用于按需挂载 web_search / host_computer_use 插件工具（plugins.yaml roles 已授权）。
-    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill, tool_catalog, tool_mount]
+    tools: [send_message, ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill, tool_catalog, tool_mount]
     model_config:
       model_ref: ark-deepseek-v4-flash # 连接参数见 config/models.json。deepseek 端点不稳会拖死 strict 启动校验（2026-08-04 实证），统一切 k3
       thinking: medium     # 2026-09-07 恢复 medium（TODO 第八项 P0-1）：正确率>延迟，测试编写同样需要推理预算
@@ -240,7 +240,7 @@ fixed_roles:
     description: 技术文档编写与维护助手
     keywords: ["文档", "doc", "README", "注释", "example"]
     skills: []
-    tools: [ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill, escalate_gear]
+    tools: [send_message, ReadFile, ShowArtifact, WriteFile, EditFile, RestoreFile, ListDir, RunCommand, SearchInFiles, HTTPGet, HTTPPost, GitDiff, GitStatus, GitLog, GitBlame, load_skill, escalate_gear]
     model_config:
       model_ref: ark-deepseek-v4-flash # 连接参数见 config/models.json
       temperature: 0.5

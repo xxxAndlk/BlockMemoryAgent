@@ -419,6 +419,75 @@ func (m *gateProvider) Generate(ctx context.Context, req *blades.ModelRequest) (
 }
 func (m *gateProvider) Name() string { return "gate-mock" }
 
+// TestHotDomain_MailWakeIdle 验证兄弟邮件唤醒热驻 idle 槽（WakeIdleForMail，2026-09-21
+// 问答面闭环修复）：idle 槽被 request 命中后唤醒续答——任务文本为【邮箱请求】处置提示
+//（含提问方 id），槽回 running、父邮箱有唤醒 MsgInfo；非 idle 目标返回 busy/not-directable。
+func TestHotDomain_MailWakeIdle(t *testing.T) {
+	provider := &gateProvider{blockOn: 2, entered: make(chan struct{}), release: make(chan struct{})}
+	d, mb, tr, toolsReg := newIdleTestEnv(t, provider, time.Hour)
+
+	res, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id":        "domain",
+		"task":           "第一任务",
+		"domain":         "金融",
+		"responsibility": "负责金融模块",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
+	}
+	subID := subAgentIDOf(res)
+	waitForCond(t, "tree idle", func() bool {
+		n, ok := tr.Get(subID)
+		return ok && n.Status == orchestrator.StatusIdle
+	})
+	mb.Drain("s1")
+
+	// 兄弟 Agent 邮件唤醒 idle 槽。
+	if err := d.WakeIdleForMail(subID, "s1/domain-9", "汇率 JSON 结构确认"); err != nil {
+		t.Fatalf("WakeIdleForMail failed: %v", err)
+	}
+
+	// 等唤醒任务进入执行（第二次 LLM 调用被 gate 卡住）——任务文本应为【邮箱请求】。
+	select {
+	case <-provider.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("邮件唤醒任务未开始执行")
+	}
+	s := d.pool.slot("s1", subID)
+	if s == nil {
+		t.Fatal("slot missing after mail wake")
+	}
+	s.mu.Lock()
+	state, rc := s.state, s.reuseCount
+	s.mu.Unlock()
+	if state != slotRunning || rc != 1 {
+		t.Errorf("after mail wake: state=%d rc=%d, want slotRunning/1", state, rc)
+	}
+	if n, _ := tr.Get(subID); n.Status != orchestrator.StatusRunning {
+		t.Errorf("tree status = %v, want Running", n.Status)
+	}
+	// 父邮箱有唤醒 MsgInfo。
+	found := false
+	for _, m := range mb.Drain("s1") {
+		if m.Type == mailbox.MsgInfo && m.From == "dispatcher" && strings.Contains(m.Body, "邮件提问唤醒") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("parent should receive mail-wake notice")
+	}
+
+	// 非 idle 目标（running）返回 busy。
+	if err := d.WakeIdleForMail(subID, "s1/domain-9", "x"); !errors.Is(err, agent.ErrAgentBusy) {
+		t.Errorf("wake running slot should be busy, got %v", err)
+	}
+	// 不存在的热驻实例返回 not-directable。
+	if err := d.WakeIdleForMail("s1/domain-99", "s1/domain-9", "x"); !errors.Is(err, agent.ErrAgentNotDirectable) {
+		t.Errorf("wake unknown slot should be not-directable, got %v", err)
+	}
+	close(provider.release)
+}
+
 // TestHotDomain_UserWakeIdle 验证用户直连唤醒热驻 idle 槽（WakeIdleWithMessage）：
 // 槽回 running + reuseCount+1 + 任务文本=用户消息原文（无派发前缀）；
 // 完成回 idle 后 pending 对称、父邮箱有"用户直连唤醒"MsgInfo。

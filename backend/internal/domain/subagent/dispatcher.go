@@ -2046,7 +2046,9 @@ func (t *sendMessageTool) Description() string {
 	return "向另一个 Agent 实例的邮箱投递一条消息（请求/通知/升级），立即返回。" +
 		"用于多 Agent 协作验证闭环：例如代码 Agent 完成后可向测试 Agent 发送验证请求，" +
 		"测试 Agent 在下一轮 ReAct 迭代中 Drain 收件箱即可看到该消息并据此回复。" +
-		"参数 to_agent_id 为目标 Agent 实例 ID（即 call_sub_agent 返回的 sub_agent_id，或父 Agent ID）；" +
+		"参数 to_agent_id 为目标 Agent 实例 ID——来源优先级：①你系统提示词【运行时身份】块的" +
+		"并行兄弟列表与父 Agent id；②你 call_sub_agent 返回的 sub_agent_id；③对方来信 From 头。" +
+		"（发不出去的已终结 id 会返回\"消息未送达\"，以对方最新来信的 From 为准。）" +
 		"subject 为一行摘要；body 为详情正文（可空）；" +
 		"message_type：凡要对方**回答**的（提问/追问进度/要口径）一律 request（缺省值）；" +
 		"纯告知用 info；reply 只用于**回答别人对你的提问**；escalate 为升级求助" +
@@ -2085,6 +2087,21 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 		msgType = mailbox.MsgEscalate
 	}
 
+	// 可见性矩阵硬校验（2026-09-21 用户定版，投递前拒绝）：domain 只能发给上级+同级+
+	// 下级；叶子只能发给上级 domain+同 domain 同级叶子；meta 不限（visibleTargets
+	// 返回 nil）。越界即拒（消息不进对方邮箱），错误文案给出发送方自己的允许范围。
+	if targets := d.visibleTargets(sessionIDFromAgentID(fromID), fromID); targets != nil && !targets[toID] {
+		scope := "你的上级 domain 与同 domain 同级叶子"
+		if roleIDFromAgentID(fromID) == "domain" {
+			scope = "你的上级、同级 domain 与你的下级叶子"
+		}
+		return &tool.Result{
+			Tool:     "send_message",
+			Error:    "目标超出你的通信范围（可见性矩阵）。你只能说给：" + scope + "。超出范围的问题写入终答/回传摘要，由上级转达。",
+			Category: tool.ResultCategoryValidationRejected,
+		}
+	}
+
 	// thread_id 可选：同一问答链上的消息共享 ThreadID，便于多轮验证闭环聚合。
 	threadID, _ := args["thread_id"].(string)
 
@@ -2112,6 +2129,11 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 				hint = "【系统】有 Agent 发来升级请求（escalate），请查收邮箱处置。"
 			}
 			d.wakeSuspendedParent(toID, hint)
+			// 热驻 idle 槽唤醒（2026-09-21 问答面闭环修复）：idle 槽不在 ReAct 循环里，
+			// 不唤醒则 request 躺在邮箱无人 drain（实证：request 发出后 idle 槽 5 分钟零回复）。
+			// WakeIdleForMail 内部校验槽状态——running/非热驻实例返回 busy/not-directable，
+			// 此处尽力而为忽略错误（消息已在邮箱，复用时可见兜底）。
+			_ = d.WakeIdleForMail(toID, fromID, subject)
 		}
 	}
 
@@ -3993,6 +4015,147 @@ func (d *Dispatcher) treeFinishStatus(ctx context.Context, subAgentID, summary s
 	}
 }
 
+// runtimeIdentityBlock 构建【运行时身份】块（拓扑可见性矩阵，2026-09-21 用户定版）：
+//   - DomainAgent：上级（父 meta id）+ 同级 domain（同父活跃兄弟）+ 下级（自己直派的
+//     活跃叶子）；
+//   - 叶子：上级 domain（父 id）+ 同 domain 同级叶子（同父活跃兄弟）——不注祖父
+//     （meta）与他域节点，天然满足"只能知道同级叶子+上级 domain"。
+// 块内 id 是 send_message 的寻址前提（2026-09-21 实证根因修复：此前系统提示词无任何
+// 运行时身份，问答面纪律因此零使用）。尾部注入 fork 尾部，公共前缀缓存复用不破。
+// 名册均为派发时点快照，运行中变化由 siblingUptakePipeline 每轮【拓扑名册更新】
+// 实时刷新（diff 无变化零注入）。
+func (d *Dispatcher) runtimeIdentityBlock(sid, parentID, selfID string) string {
+	roleID := roleIDFromAgentID(selfID)
+	var b strings.Builder
+	b.WriteString("【运行时身份】（send_message 的 to_agent_id 填下列实例 id）\n")
+	fmt.Fprintf(&b, "- 你的实例 id：%s\n", selfID)
+	fmt.Fprintf(&b, "- 你的上级：%s（里程碑播报、升级求助、回传摘要都发给它）\n", parentID)
+	siblings := d.rosterEntries(sid, parentID, selfID)
+	if roleID == "domain" {
+		if len(siblings) == 0 {
+			b.WriteString("- 同级 domain：当前无。后续出现时会有【拓扑名册更新】消息列出其 id。\n")
+		} else {
+			b.WriteString("- 同级 domain（跨域问题直接 send_message(to_agent_id=…, message_type=request)，不必经上级转达）：\n")
+			for _, e := range siblings {
+				fmt.Fprintf(&b, "  - %s（%s，任务：%s）\n", e.id, e.label, e.task)
+			}
+		}
+		children := d.childEntries(sid, selfID)
+		if len(children) == 0 {
+			b.WriteString("- 你的下级执行者：当前无（你派发后出现）。\n")
+		} else {
+			b.WriteString("- 你的下级执行者（你直派的叶子，可 send_message 问进度/要口径）：\n")
+			for _, e := range children {
+				fmt.Fprintf(&b, "  - %s（%s，任务：%s）\n", e.id, e.label, e.task)
+			}
+		}
+		return b.String()
+	}
+	// 叶子（及其他非 meta/domain 角色）：只给上级 + 同组同级。
+	if len(siblings) == 0 {
+		b.WriteString("- 同组并行执行者：当前无。\n")
+	} else {
+		b.WriteString("- 同组并行执行者（同一上级的兄弟叶子，可 send_message 协作）：\n")
+		for _, e := range siblings {
+			fmt.Fprintf(&b, "  - %s（%s，任务：%s）\n", e.id, e.label, e.task)
+		}
+	}
+	return b.String()
+}
+
+// rosterEntries 返回同父活跃兄弟的名册条目（Running/Paused/Idle——可收消息的实例；
+// Done/Failed/Cancelled 已终结，发送会死信返回"消息未送达"，不列）。
+// domain 视角=同级 domain；叶子视角=同 domain 同级叶子——同一公式天然满足可见性矩阵。
+func (d *Dispatcher) rosterEntries(sid, parentID, selfID string) []rosterEntry {
+	if d.treeFn == nil || sid == "" || parentID == "" {
+		return nil
+	}
+	t := d.treeFn(sid)
+	if t == nil {
+		return nil
+	}
+	var out []rosterEntry
+	for _, n := range t.Snapshot() {
+		if n.ParentID != parentID || n.ID == selfID {
+			continue
+		}
+		switch n.Status {
+		case orchestrator.StatusRunning, orchestrator.StatusPaused, orchestrator.StatusIdle:
+			out = append(out, rosterEntry{
+				id:    n.ID,
+				label: nodeLabel(n),
+				task:  textutil.TruncateRunes(strings.TrimSpace(n.Task), 40, "…"),
+			})
+		}
+	}
+	return out
+}
+
+// childEntries 返回 self 直派的活跃下级名册（ParentID==selfID）。domain 的下级=叶子；
+// 叶子的下级通常为空（叶子不能再派发）。
+func (d *Dispatcher) childEntries(sid, selfID string) []rosterEntry {
+	if d.treeFn == nil || sid == "" || selfID == "" {
+		return nil
+	}
+	t := d.treeFn(sid)
+	if t == nil {
+		return nil
+	}
+	var out []rosterEntry
+	for _, n := range t.Snapshot() {
+		if n.ParentID != selfID {
+			continue
+		}
+		switch n.Status {
+		case orchestrator.StatusRunning, orchestrator.StatusPaused, orchestrator.StatusIdle:
+			out = append(out, rosterEntry{
+				id:    n.ID,
+				label: nodeLabel(n),
+				task:  textutil.TruncateRunes(strings.TrimSpace(n.Task), 40, "…"),
+			})
+		}
+	}
+	return out
+}
+
+// nodeLabel 树节点的展示标签：领域名优先，回退角色 id。
+func nodeLabel(n orchestrator.Node) string {
+	label := strings.TrimSpace(n.Domain)
+	if label == "" {
+		label = n.Role
+	}
+	return label
+}
+
+// visibleTargets 返回发送方按可见性矩阵允许通信的目标实例 id 集合（send_message 硬校验）：
+//   - meta（无 '/' 句柄）：不限——返回 nil 表示不校验；
+//   - domain：上级 + 同级 domain + 下级叶子；
+//   - 叶子：上级 domain + 同 domain 同级叶子。
+func (d *Dispatcher) visibleTargets(sid, fromID string) map[string]bool {
+	parentID := parentIDOfAgentID(fromID)
+	if parentID == "" {
+		return nil // meta 顶层：不限
+	}
+	out := map[string]bool{parentID: true}
+	for _, e := range d.rosterEntries(sid, parentID, fromID) {
+		out[e.id] = true
+	}
+	if roleIDFromAgentID(fromID) == "domain" {
+		for _, e := range d.childEntries(sid, fromID) {
+			out[e.id] = true
+		}
+	}
+	return out
+}
+
+// parentIDOfAgentID 取实例句柄的父段（末个 '/' 之前）。顶层句柄（无 '/'）返回空。
+func parentIDOfAgentID(agentID string) string {
+	if idx := strings.LastIndex(agentID, "/"); idx > 0 {
+		return agentID[:idx]
+	}
+	return ""
+}
+
 // runSubAgentOnce 纯执行路径：创建子 Agent、注入块记忆、驱动 Run、校验分层（TODO #43）、沉淀块记忆，
 // 返回子 Agent 实例 + 完整结果 + 错误。不 notify、不触发钩子、不进入实例池。
 // 供异步 runSubAgent 包装器与同步 ExecuteChild（编排器）共用。
@@ -4055,21 +4218,44 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			roleDef.SystemPrompt = roleDef.SystemPrompt + "\n\n" + header
 		}
 	}
+	// 运行时身份块注入（2026-09-21 拓扑可见性矩阵，domain 与叶子都注）：domain 注
+	// 上级+同级+下级，叶子注上级+同组同级（不注祖父 meta/他域节点）。同 responsibility
+	// 的尾部注入口径（fork 提示词尾部，公共前缀缓存复用不破）。
+	roleDef.SystemPrompt = roleDef.SystemPrompt + "\n\n" +
+		d.runtimeIdentityBlock(tool.SessionIDFromContext(ctx), parentID, subAgentID)
 	// 不注入用户级人格（soul.md"多 Agent 编排助手"）：人格前缀首行即编排者身份，
 	// 子 Agent（领域/叶子）读到的第一身份是"编排助手"，与角色提示词冲突，
 	// thinking 模型据此长期停留在"等待兄弟回传"的编排者叙事里空转
-	// （实证 2026-08-13：三个领域 Agent 与叶子 code_assistant 的思考流全是
+	//（实证 2026-08-13：三个领域 Agent 与叶子 code_assistant 的思考流全是
 	// "三个领域 Agent 已成功派发，等待回传"，3 参数改动跑 12 分钟）。
 	// 子 Agent 身份只由角色提示词（叶子=执行者/领域=领域负责人）定义。
-	// 黑板模式（TODO #42）每轮兄弟产出摄取：仅 DomainAgent + 非空 domain + searcher 实现
-	// BlackboardSearcher 时包装记忆流水线，每轮 Assemble 末尾按 scope 查询兄弟产出注入【兄弟产出】段
-	// （等待兄弟时见其完成结论，替"等待回传"叙事空转）。持指针供播种召回后 seedSeen 去重。
+	// 黑板（TODO #42）每轮兄弟产出摄取 + 拓扑名册实时刷新：domain 与叶子都包装
+	//（叶子的同组名册运行中随上级新派而变化）。黑板查询需 searcher 实现
+	// BlackboardSearcher 且仅 domain 有意义（叶子无兄弟产出语义，bb 恒 nil 亦安全）。
+	// 名册来自权威树：每轮 diff，任何变化注入全量当前名册（无变化零注入）。
+	// domain 的刷新范围 = 同级 domain + 下级叶子（合并）；叶子 = 同组同级。
 	var uptake *siblingUptakePipeline
-	if roleDef.ID == "domain" && strings.TrimSpace(domain) != "" {
-		if bb, ok := d.searcher.(BlackboardSearcher); ok {
-			uptake = newSiblingUptakePipeline(mem, bb, tool.SessionIDFromContext(ctx), parentID, domain, subAgentID)
-			mem = uptake
+	if roleDef.ID != "meta" {
+		var bb BlackboardSearcher
+		if d.searcher != nil && roleDef.ID == "domain" {
+			bb, _ = d.searcher.(BlackboardSearcher)
 		}
+		sid := tool.SessionIDFromContext(ctx)
+		// seed = 系统提示词【运行时身份】块首注时已列出的节点（首轮不重复注入）。
+		seeded := map[string]bool{}
+		liveRoster := func() []rosterEntry {
+			out := d.rosterEntries(sid, parentID, subAgentID)
+			if roleDef.ID == "domain" {
+				out = append(out, d.childEntries(sid, subAgentID)...)
+			}
+			return out
+		}
+		for _, e := range liveRoster() {
+			seeded[e.id] = true
+		}
+		uptake = newSiblingUptakePipeline(mem, bb, sid, parentID, domain, subAgentID).
+			WithRoster(liveRoster, seeded)
+		mem = uptake
 	}
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, subAgentID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
 		WithProviderFunc(func(callCtx context.Context) (agent.ModelProvider, error) {
@@ -4672,12 +4858,21 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	if mem == nil {
 		mem = agent.NopMemoryPipeline{}
 	}
-	// 黑板模式（TODO #42）：resume 的 domain Agent 同样每轮摄取兄弟产出--它正是因等兄弟而暂停的，
-	// 恢复后兄弟可能已完成，uptake 让它立即见到兄弟结论而非空等/重做。叶子无兄弟语义。
+	// 黑板（TODO #42）每轮兄弟产出摄取 + 兄弟名册增量更新：resume 的 domain Agent
+	// 同样每轮摄取——它正是因等兄弟而暂停的，恢复后兄弟可能已完成/新增，uptake 让它
+	// 立即见到兄弟结论与新兄弟 id 而非空等/重做。叶子无兄弟语义。seeded=resume 时点
+	// 的现存名册（现存活跃兄弟不重复播报）。
 	if roleDef.ID == "domain" {
-		if bb, ok := d.searcher.(BlackboardSearcher); ok && strings.TrimSpace(pausedNode.Domain) != "" {
-			mem = newSiblingUptakePipeline(mem, bb, sid, pausedNode.ParentID, pausedNode.Domain, pausedNodeID)
+		var bb BlackboardSearcher
+		if d.searcher != nil {
+			bb, _ = d.searcher.(BlackboardSearcher)
 		}
+		seeded := map[string]bool{}
+		for _, e := range d.rosterEntries(sid, pausedNode.ParentID, pausedNodeID) {
+			seeded[e.id] = true
+		}
+		mem = newSiblingUptakePipeline(mem, bb, sid, pausedNode.ParentID, pausedNode.Domain, pausedNodeID).
+			WithRoster(func() []rosterEntry { return d.rosterEntries(sid, pausedNode.ParentID, pausedNodeID) }, seeded)
 	}
 	// 不注入编排者人格（理由同 runSubAgentOnce：身份混淆实证）。
 	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, pausedNodeID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).

@@ -165,6 +165,52 @@ func TestSiblingUptake_FailOpen(t *testing.T) {
 	}
 }
 
+// TestSiblingUptake_RosterRealtimeRefresh 验证拓扑名册实时刷新（全量 diff 语义）：
+// 与已播报快照无变化时零注入；任何变化（新增或消失）注入**全量当前名册**一次；
+// 持续无变化后不再重复注入。
+func TestSiblingUptake_RosterRealtimeRefresh(t *testing.T) {
+	mock := &mockBlackboardSearcher{queryRecs: nil}
+	p := newSiblingUptakePipeline(agent.NopMemoryPipeline{}, mock, "s1", "s1", "渲染", "s1/domain-1")
+
+	current := []rosterEntry{{id: "s1/domain-2", label: "核心层", task: "任务A"}}
+	// seeded = 首注名册（domain-2 系统提示词里已列出）。
+	p = p.WithRoster(func() []rosterEntry { return current }, map[string]bool{"s1/domain-2": true})
+
+	// 轮1：无变化 -> 不注入。
+	out := p.Assemble(types.RoleDefinition{}, "s1/domain-1", []agent.ReactMessage{{Role: "user", Content: "t"}})
+	if len(out) != 1 {
+		t.Fatalf("无变化时应零注入, got %d msgs", len(out))
+	}
+	// 新兄弟出现 -> 注入全量（含已知兄弟，替换旧认知）。
+	current = []rosterEntry{{id: "s1/domain-2", label: "核心层", task: "任务A"}, {id: "s1/domain-9", label: "命令层", task: "任务B"}}
+	out = p.Assemble(types.RoleDefinition{}, "s1/domain-1", []agent.ReactMessage{{Role: "user", Content: "t"}})
+	if len(out) != 2 || !strings.Contains(out[1].Content, "【拓扑名册更新】") ||
+		!strings.Contains(out[1].Content, "s1/domain-9") || !strings.Contains(out[1].Content, "s1/domain-2") {
+		t.Fatalf("名册变化应注入全量当前名册, got: %v", out[1:])
+	}
+	// 下一轮无变化 -> 不重复。
+	out = p.Assemble(types.RoleDefinition{}, "s1/domain-1", []agent.ReactMessage{{Role: "user", Content: "t"}})
+	if len(out) != 1 {
+		t.Fatalf("已播报快照无变化不得重复注入, got %d msgs", len(out))
+	}
+	// 兄弟消失（domain-2 完成）-> 变化触发，注入剩余全量（domain-2 不再出现）。
+	current = []rosterEntry{{id: "s1/domain-9", label: "命令层", task: "任务B"}}
+	out = p.Assemble(types.RoleDefinition{}, "s1/domain-1", []agent.ReactMessage{{Role: "user", Content: "t"}})
+	if len(out) != 2 || strings.Contains(out[1].Content, "s1/domain-2") || !strings.Contains(out[1].Content, "s1/domain-9") {
+		t.Fatalf("兄弟消失应注入不含该节点的全量名册, got: %v", out[1:])
+	}
+}
+
+// TestSiblingUptake_RosterNilFn 验证未装配 rosterFn（旧调用形态）时零行为。
+func TestSiblingUptake_RosterNilFn(t *testing.T) {
+	mock := &mockBlackboardSearcher{queryRecs: nil}
+	p := newSiblingUptakePipeline(agent.NopMemoryPipeline{}, mock, "s1", "s1", "渲染", "s1/domain-1")
+	out := p.Assemble(types.RoleDefinition{}, "s1/domain-1", []agent.ReactMessage{{Role: "user", Content: "t"}})
+	if len(out) != 1 {
+		t.Fatalf("nil rosterFn should not inject, got %d msgs", len(out))
+	}
+}
+
 // TestWithPriorSalvage_ReadsBlackboard 验证 withPriorSalvage 黑板优先读（替 slot）。
 func TestWithPriorSalvage_ReadsBlackboard(t *testing.T) {
 	d, _, _, _, _ := newSalvageTestEnv(t, &mockProvider{text: "ok"})

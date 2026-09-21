@@ -1023,6 +1023,10 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 			textutil.TruncateRunes(domainLabel, 16, "…"), textutil.TruncateRunes(resp, 200, "…"))
 		roleDef.SystemPrompt = roleDef.SystemPrompt + "\n\n" + header
 	}
+	// 运行时身份块注入（同 runSubAgentOnce，2026-09-21）：槽创建时点（首派）的兄弟名册
+	// 冻结进系统提示词；后续复用时的兄弟变化经 mailbox 消息 From 头兜底（提示词已注明）。
+	roleDef.SystemPrompt = roleDef.SystemPrompt + "\n\n" +
+		d.runtimeIdentityBlock(s.sessionID, parentIDOfAgentID(s.id), s.id)
 
 	// 首次解析仅作建槽期 fail-fast 与初值；WithProviderFunc 使槽存活期内每次 LLM
 	// 调用按当前绑定重解析——否则 set_role_model/TUI 切换对热驻槽永久不可见。
@@ -1037,6 +1041,24 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 	mem := d.memory
 	if mem == nil {
 		mem = agent.NopMemoryPipeline{}
+	}
+	// 拓扑名册实时刷新（2026-09-21 可见性矩阵，热驻路径补齐）：槽的系统提示词创建时
+	// 冻结（身份块首注快照），复用续作不再重注——每轮【拓扑名册更新】是本路径唯一的
+	// 拓扑更新通道。seeded=创建时点名册，此后每轮 diff（任何变化注入全量当前名册）。
+	// 黑板摄取（兄弟产出）此处不挂——热驻路径该缺口为旧账（TODO #42 仅非热驻路径），
+	// 本轮只补名册刷新，不扩散行为面。
+	{
+		liveRoster := func() []rosterEntry {
+			out := d.rosterEntries(s.sessionID, parentIDOfAgentID(s.id), s.id)
+			out = append(out, d.childEntries(s.sessionID, s.id)...)
+			return out
+		}
+		seeded := map[string]bool{}
+		for _, e := range liveRoster() {
+			seeded[e.id] = true
+		}
+		mem = newSiblingUptakePipeline(mem, nil, s.sessionID, parentIDOfAgentID(s.id), s.domain, s.id).
+			WithRoster(liveRoster, seeded)
 	}
 	// 系统提示词工作目录按会话解析(终审修复,同 dispatcher 派发路径):槽创建时已从派发 ctx
 	// 捕获会话 workDir,优先使用;空串回落工具注册表默认目录。
@@ -1390,6 +1412,37 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 //   - 邮箱通知父 Agent（MsgInfo，对齐 ReviveWithMessage 的父感知口径）并 pokeParent。
 // 槽不存在/已销毁 → ErrAgentNotDirectable；槽 running → ErrAgentBusy。
 func (d *Dispatcher) WakeIdleWithMessage(agentID, content string) error {
+	taskText := "【用户直连消息】\n" + content
+	if err := d.wakeIdleWithTask(agentID, taskText, "用户直连", "用户直连唤醒热驻 Agent"); err != nil {
+		return err
+	}
+	log.Printf("[subagent] USER-WAKE: sub=%s msg_len=%d", agentID, len(content))
+	return nil
+}
+
+// WakeIdleForMail 兄弟 Agent 邮件唤醒热驻 idle 槽（2026-09-21 问答面闭环修复）。
+// 实证：domain-2 向 idle 槽 domain-1 发出 request 后 5 分钟零回复——消息躺在邮箱里
+// 无人 drain（idle 槽只被用户直连/复用派发唤醒，send_message 投递不触发唤醒），
+// 「答别人：当轮必须回复」纪律因收件方根本不在循环里而落空。本方法在 request/
+// escalate 命中 idle 槽时复用 idle 唤醒序列，任务文本为邮箱处置提示：槽续答先
+// drain 邮箱看到提问并 reply，无其他待办则自然回 idle。
+// 唤醒是尽力而为：失败（槽已销毁/忙碌）时消息仍在邮箱，复用时可见（现状兜底）。
+func (d *Dispatcher) WakeIdleForMail(agentID, askerID, subject string) error {
+	taskText := "【邮箱请求】Agent " + askerID + " 向你提问（request 消息已在你的邮箱）。\n" +
+		"本轮只处置该提问：查看邮箱，用 send_message(to_agent_id=对方id, message_type=reply, thread_id 沿用) 回复，" +
+		"给结论+关键依据+文件路径；回复后若无其他待办即结束。"
+	if err := d.wakeIdleWithTask(agentID, taskText, "邮箱请求", "Agent "+askerID+" 邮件提问唤醒"); err != nil {
+		return err
+	}
+	log.Printf("[subagent] MAIL-WAKE: sub=%s asker=%s subject=%q", agentID, askerID, truncateRunes(subject, 60))
+	return nil
+}
+
+// wakeIdleWithTask 是 WakeIdleWithMessage / WakeIdleForMail 共享的 idle 唤醒序列：
+// 槽 idle 校验 → reuseCount+1 / 停 TTL / 树 Idle→Running（失败回滚计数）→
+// trackChildStart + opNewTask（P0-2d 同事务）→ rearmSlotActivity → 台账 + 父感知。
+// ledgerVerb 入账备注动词（"用户直连#N"/"邮箱请求#N"），parentNote 父感知邮件正文前缀。
+func (d *Dispatcher) wakeIdleWithTask(agentID, taskText, ledgerVerb, parentNote string) error {
 	if !d.hotEnabled() {
 		return fmt.Errorf("%w: 热驻未开启", agent.ErrAgentNotDirectable)
 	}
@@ -1414,7 +1467,6 @@ func (d *Dispatcher) WakeIdleWithMessage(agentID, content string) error {
 		s.ttlTimer = nil
 	}
 	s.ttlArmed = false
-	taskText := "【用户直连消息】\n" + content
 	cancelRef := s.cancelTask
 	if d.treeFn != nil {
 		if t := d.treeFn(s.sessionID); t != nil {
@@ -1442,15 +1494,14 @@ func (d *Dispatcher) WakeIdleWithMessage(agentID, content string) error {
 	// 完成时 trackChildDoneOnce 配对递减。
 	// 活动恢复（心跳豁免解除）：enterIdle 已 Delete 旧条目，须重建。
 	d.rearmSlotActivity(s.id)
-	log.Printf("[subagent] USER-WAKE: sub=%s domain=%s reuse=%d msg_len=%d", s.id, s.domain, s.reuseCount, len(content))
-	// 任务台账登记：用户直连单独备注，区别于主 Agent 续建派发。
-	d.ledger.RecordDispatch(s.sessionID, s.parentID, s.id, s.domain, truncateRunes(content, 80), fmt.Sprintf("用户直连#%d", s.reuseCount))
+	// 任务台账登记：直连/邮件唤醒单独备注，区别于主 Agent 续建派发。
+	d.ledger.RecordDispatch(s.sessionID, s.parentID, s.id, s.domain, truncateRunes(taskText, 80), fmt.Sprintf("%s#%d", ledgerVerb, s.reuseCount))
 	// 父感知（对齐 ReviveWithMessage）：邮件通知父"等其回传，勿重复派发同领域任务"。
 	if s.parentID != "" && d.mailbox != nil {
 		_, _ = d.mailbox.Send(&mailbox.Message{
 			From: "dispatcher", To: s.parentID, Type: mailbox.MsgInfo,
-			Subject: "热驻 Agent 用户直连唤醒",
-			Body:    fmt.Sprintf("用户直连唤醒热驻 Agent %s，等待其回传，勿重复派发同领域任务。", s.id),
+			Subject: "热驻 Agent 唤醒",
+			Body:    fmt.Sprintf("%s：%s，等待其回传，勿重复派发同领域任务。", parentNote, s.id),
 		})
 		d.pokeParent(s.parentID)
 	}
