@@ -60,8 +60,9 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 	// enqueue 通道（内容丢失 + 会话卡死）。状态变化即推 session_status 帧（2026-09-08）。
 	lastPushedStatus := snapshot.Status
 
-	// 500ms 轮询一次会话状态。
-	ticker := time.NewTicker(500 * time.Millisecond)
+	// 150ms 轮询一次会话状态（2026-09-20：500ms 一档让流式输出最多滞后半秒一帧、
+	// 跟手度差；内部 TUI 泵用 50ms，web 出口 150ms 兼顾实时性与 Get+序列化开销）。
+	ticker := time.NewTicker(150 * time.Millisecond)
 	defer ticker.Stop()
 
 	lastEventCount := len(snapshot.Events)
@@ -100,7 +101,7 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 				flusher.Flush()
 			}
 
-			// 模型实时汇报/思考文本变化 → 推 live 帧（500ms tick 变化才推，零增量流量）。
+			// 模型实时汇报/思考文本变化 → 推 live 帧（150ms tick 变化才推，零增量流量）。
 			if snapshot.StreamingText != lastStreamedText || snapshot.ThinkingText != lastThinkingText {
 				frame := map[string]string{
 					"type":           "live",
@@ -137,6 +138,7 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 				multi := false
 				var items []types.ClarifyQuestionItem
 				var arts []types.ClarifyArtifact
+				frameTimeoutSec := 0 // 提问答复剩余秒（deadline 现算，>0 才下发）
 				if snapshot.State != nil && snapshot.State.PendingClarify != nil {
 					pc := snapshot.State.PendingClarify
 					pending = pc.Question
@@ -146,6 +148,13 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 					detail = pc.Detail
 					items = pc.Questions
 					arts = pc.Artifacts
+					if pc.Deadline != nil {
+						// 剩余秒数服务端现算（前端时钟不可信）；到点工具侧兜底
+						// "用户未答复，自行决策"，前端无需处理归零翻转。
+						if sec := int(time.Until(*pc.Deadline).Seconds()); sec > 0 {
+							frameTimeoutSec = sec
+						}
+					}
 				}
 				frame := map[string]any{
 					"type":         "awaiting_clarify",
@@ -153,6 +162,9 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 					"question":     pending,
 					"question_id":  qid,
 					"multi_select": multi,
+				}
+				if frameTimeoutSec > 0 {
+					frame["timeout_sec"] = frameTimeoutSec
 				}
 				if len(opts) > 0 {
 					frame["options"] = opts

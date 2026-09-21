@@ -171,14 +171,128 @@ const questionText = computed(() => {
   return m.replace(/^Agent 提问[:：]\s*/, '')
 })
 
-// ---- 单题模式选项交互（现状标记） ----
-// 多选已勾选项；提交中禁用按钮防止重复提交。
-// 注意：awaiting_clarify 帧每秒推送、对象引用会变，因此按 questionId 复位而不是按对象引用。
-const selectedOptions = ref<string[]>([])
+// ---- 单题模式选项交互（2026-09-20 重做）----
+// 点选项=选中态（不再即提交，防误触即答无法反悔）；「提交答复」把选中项的中文 label
+//（而非 id——回显/事件流里用户不应看到自己答了 "pg"/"revise" 这类字符串）与卡内补充
+// 说明组合成答复文本。补充说明框常驻卡内：选选项可补充两句，不选则直接作为文字答复，
+// 视线不再需要在卡片与页面底部输入框之间来回跳。
+const selectedOptionId = ref('')
+const singleDraft = ref('')
+const singleDraftRef = ref<HTMLTextAreaElement | null>(null)
+const selectedOptions = ref<string[]>([]) // 多选勾选集（内部仍按 id，提交时 label 化）
 const submitting = ref(false)
 
+// 计划审批（submit_plan 顶层走 ask_user 澄清通道，问题带【计划确认】前缀）：专属卡面 +
+// 批准二次确认 + 修改意见内联输入。修 bug：旧实现点"需要修改"直接提交选项 id "revise"，
+// 后端 parsePlanAnswer 关键词不命中，计划被驳回且修改意见 = 英文单词 "revise"。
+const isPlanApproval = computed(() => questionText.value.startsWith('【计划确认】'))
+const approveArmed = ref(false) // 批准二次确认：首点进入武装态，再点才真正提交
+let approveArmTimer: ReturnType<typeof setTimeout> | undefined
+const reviseOpen = ref(false)
+const reviseDraft = ref('')
+
 watch(() => props.clarify?.questionId, () => {
+  selectedOptionId.value = ''
+  singleDraft.value = ''
   selectedOptions.value = []
+  approveArmed.value = false
+  reviseOpen.value = false
+  reviseDraft.value = ''
+})
+
+/** id → label：选项 id 只作内部状态，答复文本提交中文 label。 */
+function labelOf(optionId: string): string {
+  return props.clarify?.options.find((o) => o.id === optionId)?.label || optionId
+}
+
+function selectSingle(id: string) {
+  if (submitting.value) return
+  // 「其他」逃生项：不选中，引导卡内补充说明输入
+  if (id === 'other') {
+    singleDraftRef.value?.focus()
+    return
+  }
+  selectedOptionId.value = selectedOptionId.value === id ? '' : id
+}
+
+/** 单题提交：选中选项 + 可选补充组合（"label：补充"）；未选选项时提交纯文本。 */
+async function submitSingle() {
+  if (submitting.value) return
+  const opt = selectedOptionId.value
+  const draft = singleDraft.value.trim()
+  const answer = opt ? (draft ? `${labelOf(opt)}：${draft}` : labelOf(opt)) : draft
+  if (!answer) return
+  submitting.value = true
+  try {
+    await runClarifySubmit({ answer })
+  } finally {
+    submitting.value = false
+  }
+}
+
+/** 多选提交：勾选项中文 label 全角逗号拼接。 */
+async function submitMulti() {
+  if (submitting.value || selectedOptions.value.length === 0) return
+  submitting.value = true
+  try {
+    await runClarifySubmit({ answer: selectedOptions.value.map(labelOf).join('，') })
+  } finally {
+    submitting.value = false
+  }
+}
+
+/** 多选全选/清空（不含「其他」逃生项）。 */
+function toggleSelectAll() {
+  const all = (props.clarify?.options || []).filter((o) => o.id !== 'other').map((o) => o.id)
+  selectedOptions.value = selectedOptions.value.length === all.length ? [] : all
+}
+
+// ---- 计划审批操作 ----
+function armApprove() {
+  if (submitting.value) return
+  if (approveArmed.value) {
+    void submitApprove()
+    return
+  }
+  approveArmed.value = true
+  clearTimeout(approveArmTimer)
+  approveArmTimer = setTimeout(() => {
+    approveArmed.value = false
+  }, 4000)
+}
+async function submitApprove() {
+  clearTimeout(approveArmTimer)
+  approveArmed.value = false
+  if (submitting.value) return
+  submitting.value = true
+  try {
+    // "批准开工"命中后端 parsePlanAnswer 批准关键词（plan_confirm.go）
+    await runClarifySubmit({ answer: '批准开工' })
+  } finally {
+    submitting.value = false
+  }
+}
+async function submitRevise() {
+  const fb = reviseDraft.value.trim()
+  if (!fb || submitting.value) return
+  submitting.value = true
+  try {
+    // "需要修改：xxx"命中驳回关键词，意见随答复直达提交计划的 Agent
+    await runClarifySubmit({ answer: `需要修改：${fb}` })
+  } finally {
+    submitting.value = false
+  }
+}
+
+// ---- 答复倒计时（2026-09-20）：timeout_sec 由服务端 awaiting_clarify 帧每拍现算
+//（ask_user 的 timeout_sec 截止；帧在待澄清期间每 150ms 重推），ref 刷新天然驱动
+// 倒计时跳动，无需本地 interval；归零后的状态翻转由 SSE session_status 驱动。
+const countdownText = computed(() => {
+  const sec = props.clarify?.timeoutSec
+  if (typeof sec !== 'number' || sec <= 0) return ''
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
+  return `${m}:${String(s).padStart(2, '0')}`
 })
 
 // ---- 提交韧性：后端重启/连接中断时答复不能一发就丢（2026-09-12 实证） ----
@@ -190,6 +304,7 @@ const submitError = ref('') // 最终失败原因（常驻，不随 toast 消失
 const disposed = ref(false)
 onUnmounted(() => {
   disposed.value = true
+  clearTimeout(approveArmTimer)
 })
 
 /** 统一提交入口：成功 → 通知父级置 running + 确认条；失败 → 卡片内保留错误与草稿。 */
@@ -212,29 +327,6 @@ async function runClarifySubmit(payload: { answer?: string; answers?: string[] }
     submitNotice.value = ''
     submitError.value = e instanceof Error ? e.message : String(e)
     console.error('clarify submit failed:', e)
-  }
-}
-
-async function submitOption(optionId?: string) {
-  if (submitting.value) return
-  // 「其他」逃生选项：不提交，引导用户在下方输入框自由填写答案
-  // （awaiting_clarify 状态下输入框内容会作为澄清答复发送到 /clarify）。
-  if (optionId === 'other') {
-    ElMessage.info('请在下方输入框输入你的答案，回车/发送提交')
-    return
-  }
-  let answer = ''
-  if (optionId) {
-    answer = optionId // 单选：直接提交选项 ID
-  } else {
-    if (selectedOptions.value.length === 0) return // 多选：无选中项不提交
-    answer = selectedOptions.value.join(',') // 多选：选项 ID 逗号分隔
-  }
-  submitting.value = true
-  try {
-    await runClarifySubmit({ answer })
-  } finally {
-    submitting.value = false
   }
 }
 
@@ -328,11 +420,25 @@ function onDraftInput(i: number, e: Event) {
   setDraft(i, (e.target as HTMLTextAreaElement).value)
 }
 
+/** 批量单题草稿 → 答复文本（2026-09-20）：草稿是机器态（选项 id 或自由文本），提交时
+ *  把纯 id / 逗号拼接的 id 组合翻译成中文 label（与单题同策略），自由文本草稿原样提交。 */
+function draftToAnswer(i: number): string {
+  const draft = draftOf(i).trim()
+  if (!draft) return ''
+  const opts = batchQuestions.value[i]?.options || []
+  const byId = new Map(opts.map((o) => [o.id, o.label]))
+  const parts = draft.split(',')
+  if (parts.length && parts.every((p) => byId.has(p))) {
+    return parts.map((p) => byId.get(p)!).join('，')
+  }
+  return draft
+}
+
 async function submitBatch() {
   if (!allAnswered.value || submittingBatch.value || !props.clarify) return
   submittingBatch.value = true
   try {
-    await runClarifySubmit({ answers: batchQuestions.value.map((_, i) => draftOf(i).trim()) })
+    await runClarifySubmit({ answers: batchQuestions.value.map((_, i) => draftToAnswer(i)) })
   } finally {
     submittingBatch.value = false
   }
@@ -423,8 +529,16 @@ async function submitBatch() {
            class="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 my-2 text-xs text-amber-700 dark:bg-yellow-900/20 dark:border-yellow-700/40 dark:text-yellow-300">
         <div class="flex items-center gap-2 font-medium mb-1">
           <el-icon><QuestionFilled /></el-icon>
-          <span>{{ isBatch ? '需要你的澄清（批量提问）' : '需要你的澄清' }}</span>
+          <span>{{ isPlanApproval ? '📋 计划待批准' : (isBatch ? '需要你的澄清（批量提问）' : '需要你的澄清') }}</span>
           <span class="text-ink-2 ml-auto">{{ fmtTime(clarifyCard.timestamp) }}</span>
+        </div>
+
+        <!-- 答复倒计时（2026-09-20，ask_user timeout_sec）：服务端每帧现算剩余秒，
+             到点工具侧兜底"用户未答复，自行决策"，会话自动恢复运行。 -->
+        <div v-if="countdownText"
+             class="mb-2 flex items-center gap-1.5 rounded-md border border-amber-200/80 bg-white/60 dark:bg-yellow-900/20 px-2.5 py-1 text-[11px] text-amber-700 dark:text-yellow-300">
+          <el-icon class="is-loading"><Timer /></el-icon>
+          <span>剩余 {{ countdownText }}，超时将自行决策</span>
         </div>
 
         <!-- 提交韧性（2026-09-12）：重试进度 / 最终失败原因就地常驻显示——
@@ -538,7 +652,7 @@ async function submitBatch() {
           </div>
         </template>
 
-        <!-- 单题模式（现状标记）：问题 + 选项 + 提交 -->
+        <!-- 单题模式：问题 + 作答区（计划审批走专属卡面） -->
         <template v-else>
           <div class="whitespace-pre-wrap">{{ questionText }}</div>
 
@@ -549,40 +663,98 @@ async function submitBatch() {
                           :artifact="a" :session-id="sessionId" />
           </div>
 
-          <!-- 澄清选项（来自 SSE awaiting_clarify 帧）：单选按钮 / 多选复选框 + 提交 -->
-          <template v-if="clarify && clarify.options.length > 0">
-            <div class="mt-2 flex flex-col gap-1.5">
-              <template v-if="!clarify.multiSelect">
-                <button v-for="opt in clarify.options" :key="opt.id" type="button"
-                        :disabled="submitting"
-                        class="text-left text-xs rounded-md border border-amber-300 bg-amber-50 hover:bg-amber-100 px-2.5 py-1.5 text-amber-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed dark:border-yellow-700/40 dark:bg-yellow-900/30 dark:hover:bg-yellow-900/50 dark:text-yellow-200"
-                        @click="submitOption(opt.id)">
-                  {{ opt.label }}
-                  <span v-if="opt.description" class="text-amber-600/80 dark:text-yellow-400/70 ml-1.5">{{ opt.description }}</span>
+          <!-- 计划审批专属卡面（2026-09-20）：批准二次确认防误触开工；驳回必须给出
+               具体修改意见（内联输入，修掉旧版提交 "revise" 字面量当意见的 bug）。
+               计划正文由上方 clarifyDetails 完整展示。 -->
+          <template v-if="isPlanApproval && clarify">
+            <div class="mt-2 flex flex-col gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
+                <button type="button" :disabled="submitting"
+                        class="text-xs rounded-md px-3 py-1.5 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        :class="approveArmed
+                          ? 'bg-green-600 hover:bg-green-700 text-white'
+                          : 'bg-amber-500 hover:bg-amber-600 text-white dark:bg-yellow-500 dark:hover:bg-yellow-600'"
+                        @click="armApprove">
+                  {{ submitting ? '提交中…' : (approveArmed ? '确认批准？再点一次' : '✅ 批准开工') }}
                 </button>
-              </template>
-              <template v-else>
-                <label v-for="opt in clarify.options" :key="opt.id"
-                       class="flex items-center gap-2 text-xs text-amber-700 cursor-pointer dark:text-yellow-200">
-                  <input type="checkbox" :value="opt.id" v-model="selectedOptions" :disabled="submitting"
-                         class="accent-yellow-500" />
-                  <span>{{ opt.label }}</span>
-                  <span v-if="opt.description" class="text-amber-600/80 dark:text-yellow-400/70">{{ opt.description }}</span>
-                </label>
+                <button type="button" :disabled="submitting"
+                        class="text-xs rounded-md border px-3 py-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        :class="reviseOpen
+                          ? 'border-amber-500 text-amber-800 bg-amber-100 dark:border-yellow-500 dark:text-yellow-100 dark:bg-yellow-900/50'
+                          : 'border-amber-300 text-amber-700 hover:bg-amber-100 dark:border-yellow-700/40 dark:text-yellow-200 dark:hover:bg-yellow-900/50'"
+                        @click="reviseOpen = !reviseOpen">
+                  ✏️ 需要修改
+                </button>
+                <span class="text-[11px] text-amber-600/70 dark:text-yellow-500/60">批准后立即开工；驳回请给出具体修改意见</span>
+              </div>
+              <div v-if="reviseOpen">
+                <textarea v-model="reviseDraft" rows="3" :disabled="submitting"
+                          placeholder="请给出具体修改意见（必填），提交后 Agent 将按意见修订计划重提…"
+                          class="w-full text-xs rounded-md border border-amber-300 dark:border-yellow-700/40 bg-white/80 dark:bg-yellow-900/30 px-2 py-1.5 text-amber-800 dark:text-yellow-200 outline-none focus:border-amber-400 dark:focus:border-yellow-500"></textarea>
+                <button type="button"
+                        :disabled="submitting || !reviseDraft.trim()"
+                        class="mt-1.5 text-xs rounded-md px-3 py-1.5 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        :class="'bg-amber-500 hover:bg-amber-600 text-white dark:bg-yellow-500 dark:hover:bg-yellow-600'"
+                        @click="submitRevise">
+                  {{ submitting ? '提交中…' : '提交修改意见' }}
+                </button>
+              </div>
+            </div>
+          </template>
+
+          <!-- 通用单题问答（2026-09-20 重做）：点选项=选中态 + 卡内补充说明，
+               「提交答复」统一提交；无候选项的纯文本提问也有卡内输入框——
+               答复入口就在问题旁，不再依赖页面底部输入框。 -->
+          <template v-else-if="clarify">
+            <div v-if="clarify.options.length > 0 && !clarify.multiSelect"
+                 class="mt-2 flex flex-col gap-1.5">
+              <button v-for="opt in clarify.options" :key="opt.id" type="button"
+                      :disabled="submitting"
+                      class="text-left text-xs rounded-md border px-2.5 py-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      :class="selectedOptionId === opt.id
+                        ? 'border-amber-400 bg-amber-200/80 text-amber-800 dark:border-yellow-500 dark:bg-yellow-800/60 dark:text-yellow-100'
+                        : 'border-amber-300 bg-amber-50 hover:bg-amber-100 text-amber-700 dark:border-yellow-700/40 dark:bg-yellow-900/30 dark:hover:bg-yellow-900/50 dark:text-yellow-200'"
+                      @click="selectSingle(opt.id)">
+                {{ opt.label }}
+                <span v-if="opt.description" class="text-amber-600/80 dark:text-yellow-400/70 ml-1.5">{{ opt.description }}</span>
+              </button>
+            </div>
+            <div v-else-if="clarify.options.length > 0" class="mt-2 flex flex-col gap-1.5">
+              <label v-for="opt in clarify.options" :key="opt.id"
+                     class="flex items-center gap-2 text-xs text-amber-700 cursor-pointer dark:text-yellow-200">
+                <input type="checkbox" :value="opt.id" v-model="selectedOptions" :disabled="submitting"
+                       class="accent-yellow-500" />
+                <span>{{ opt.label }}</span>
+                <span v-if="opt.description" class="text-amber-600/80 dark:text-yellow-400/70">{{ opt.description }}</span>
+              </label>
+              <div class="flex items-center gap-2">
+                <button type="button" :disabled="submitting"
+                        class="self-start text-xs rounded-md border border-amber-300 bg-amber-50 hover:bg-amber-100 px-2.5 py-1 text-amber-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed dark:border-yellow-700/40 dark:bg-yellow-900/30 dark:hover:bg-yellow-900/50 dark:text-yellow-200"
+                        @click="toggleSelectAll">
+                  {{ selectedOptions.length === (clarify.options.filter(o => o.id !== 'other')).length && selectedOptions.length > 0 ? '清空' : '全选' }}
+                </button>
                 <button type="button"
                         :disabled="submitting || selectedOptions.length === 0"
                         class="self-start text-xs rounded-md border border-amber-300 bg-amber-50 hover:bg-amber-100 px-2.5 py-1 text-amber-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed dark:border-yellow-700/40 dark:bg-yellow-900/30 dark:hover:bg-yellow-900/50 dark:text-yellow-200"
-                        @click="submitOption()">
+                        @click="submitMulti">
                   提交选择
                 </button>
-              </template>
+              </div>
             </div>
-            <div class="mt-1.5 text-[11px] text-amber-600/70 dark:text-yellow-500/60">也可直接输入文字答复</div>
-          </template>
-          <!-- 无候选项的提问（ask_user 纯文本，选项区为空）：给出输入框答复引导，
-               避免用户面对问题卡没有任何操作入口（2026-09-08 web 端 ask_user 修复）。 -->
-          <template v-else-if="clarify">
-            <div class="mt-1.5 text-[11px] text-amber-600/70 dark:text-yellow-500/60">该提问无候选项：直接在下方输入框输入答复并发送即可</div>
+            <div class="mt-2">
+              <textarea ref="singleDraftRef" v-model="singleDraft" rows="2" :disabled="submitting"
+                        :placeholder="clarify.options.length ? '补充说明（可选）：选中选项后可补充两句；点「其他」在此填写自定义答复' : '请输入你的答复…'"
+                        class="w-full text-xs rounded-md border border-amber-300 dark:border-yellow-700/40 bg-white/80 dark:bg-yellow-900/30 px-2 py-1.5 text-amber-800 dark:text-yellow-200 outline-none focus:border-amber-400 dark:focus:border-yellow-500"></textarea>
+              <button type="button"
+                      :disabled="submitting || (!selectedOptionId && !singleDraft.trim())"
+                      class="mt-1.5 text-xs rounded-md px-3 py-1.5 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      :class="selectedOptionId || singleDraft.trim()
+                        ? 'bg-amber-500 hover:bg-amber-600 text-white dark:bg-yellow-500 dark:hover:bg-yellow-600'
+                        : 'border border-amber-300 text-amber-600 dark:border-yellow-700/40 dark:text-yellow-500/70'"
+                      @click="submitSingle">
+                {{ submitting ? '提交中…' : '提交答复' }}
+              </button>
+            </div>
           </template>
         </template>
       </div>

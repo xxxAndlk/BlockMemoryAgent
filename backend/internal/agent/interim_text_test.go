@@ -7,6 +7,7 @@ package agent
 import (
 	"testing"
 
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 )
 
@@ -138,11 +139,16 @@ func TestTrimDebugEvents_KeepsAssistantText(t *testing.T) {
 
 // TestClusterTopNarration_Suppressed 验证集群档顶层 Meta 的中间轮口播与用户流完全隔离
 //（2026-09-18 用户实证：「已确认根因：环境性失败…我注意到自己可用技能中有…」这类
-// 编排内心独白原样出现在对话栏）：LLMDelta 只进轮缓冲不推 StreamingText，
-// 工具调用边界丢弃且不落 assistant_text 事件。
+// 编排内心独白原样出现在对话栏）：子 Agent 在跑时 LLMDelta 只进轮缓冲不推 StreamingText，
+// 工具调用边界丢弃且不落 assistant_text 事件。无子 Agent 运行时的直推语义见
+// TestClusterTopNarration_NoSubAgentsStreamed。
 func TestClusterTopNarration_Suppressed(t *testing.T) {
 	svc, sess := newLiveEventTestSession(t)
 	sess.setGear("cluster")
+	// 编排口播的前提是"正在编排"：树上有运行中的子 Agent 节点。
+	svc.TreeFor(sess.ID).Register(orchestrator.Node{
+		ID: sess.ID + "/domain-1", ParentID: sess.ID, Role: "domain", Status: orchestrator.StatusRunning,
+	})
 
 	// 顶层 Meta 流式输出中间轮口播（AgentID=会话 ID 即顶层实例；Agent 展示名
 	// "MetaAgent" 子 Agent 也有，不能用作判定依据）。
@@ -164,11 +170,45 @@ func TestClusterTopNarration_Suppressed(t *testing.T) {
 	}
 }
 
+// TestClusterTopNarration_NoSubAgentsStreamed 验证直推语义（2026-09-20）：集群档顶层
+// Meta 在子 Agent 全部结束后输出的文本即终答/直接汇报，实时直推 StreamingText——
+// 否则终答生成期（可达数分钟）前端 live 行恒为空，只剩转圈占位。直推同时清空轮缓冲，
+// ask_user 边界/完成时的旧冲刷路径不会把已清空的缓冲再覆盖回去。
+func TestClusterTopNarration_NoSubAgentsStreamed(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	sess.setGear("cluster")
+
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: sess.ID, Text: "终答：三处热修已全部完成并验证"})
+	if sess.StreamingText != "终答：三处热修已全部完成并验证" {
+		t.Fatalf("无子 Agent 时顶层正文应直推 StreamingText，got %q", sess.StreamingText)
+	}
+	if sess.pendingTopText != "" {
+		t.Fatalf("直推时轮缓冲应保持为空，got %q", sess.pendingTopText)
+	}
+
+	// 子 Agent 开跑后回到缓冲抑制语义。
+	svc.TreeFor(sess.ID).Register(orchestrator.Node{
+		ID: sess.ID + "/domain-1", ParentID: sess.ID, Role: "domain", Status: orchestrator.StatusRunning,
+	})
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: sess.ID, Text: "已派出子 Agent 继续排查"})
+	if sess.StreamingText != "终答：三处热修已全部完成并验证" {
+		t.Fatalf("子 Agent 在跑时口播不得覆盖 StreamingText，got %q", sess.StreamingText)
+	}
+	if sess.pendingTopText != "已派出子 Agent 继续排查" {
+		t.Fatalf("子 Agent 在跑时口播应进轮缓冲，got %q", sess.pendingTopText)
+	}
+}
+
 // TestClusterTopNarration_AskUserFlush 验证 ask_user 例外：提问正文要供提问卡上方展示
 //（clarifyReportJSON 读 StreamingText），轮缓冲在 ask_user 工具调用边界冲刷保留。
+// 直推模式（无子 Agent 在跑）下 StreamingText 本就是实时正文，冲刷不得把它清空。
 func TestClusterTopNarration_AskUserFlush(t *testing.T) {
 	svc, sess := newLiveEventTestSession(t)
 	sess.setGear("cluster")
+	// 子 Agent 在跑：提问正文进轮缓冲，ask_user 边界冲刷。
+	svc.TreeFor(sess.ID).Register(orchestrator.Node{
+		ID: sess.ID + "/domain-1", ParentID: sess.ID, Role: "domain", Status: orchestrator.StatusRunning,
+	})
 
 	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: sess.ID, Text: "开始前需要确认：目标目录用哪个？"})
 	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: sess.ID, Tool: "ask_user"})

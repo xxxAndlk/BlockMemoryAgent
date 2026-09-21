@@ -38,6 +38,8 @@ export interface ClarifyPending {
   questions?: ClarifyQuestionItem[]
   /** 澄清附带的产物（演示视频等，SSE awaiting_clarify 帧 artifacts 字段）：问答卡内嵌展示 */
   artifacts?: ArtifactRef[]
+  /** 答复剩余秒数（SSE 帧 timeout_sec，服务端现算；存在即显示倒计时，超时工具侧自行决策） */
+  timeoutSec?: number
 }
 
 export interface ChatMessage {

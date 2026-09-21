@@ -2052,6 +2052,9 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		} else {
 			req.Kind = "text"
 		}
+		if dl, ok := ctx.Deadline(); ok {
+			req.Deadline = &dl
+		}
 		sess.pendingClarify = req
 		sess.Status = enums.SessionStatusAwaitingClarify
 		report := clarifyReportJSON(strings.TrimSpace(sess.StreamingText))
@@ -2391,6 +2394,9 @@ func (s *ReactService) AskUserBatchHook() tool.AskUserBatchHookFunc {
 			req.Kind = first.Kind
 			req.MultiSelect = first.MultiSelect
 			req.Options = first.Options
+		}
+		if dl, ok := ctx.Deadline(); ok {
+			req.Deadline = &dl
 		}
 		sess.pendingClarify = req
 		sess.Status = enums.SessionStatusAwaitingClarify
@@ -3217,6 +3223,11 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 			s.pauseSession(session, result.History, s.softStopPauseKind(session))
 			return
 		}
+		// 错误分支同样落历史：ReAct 循环内部累积的 history 原本只在成功/暂停分支
+		// 提交到 session.History，出错即丢弃——用户终止/出错后发新消息续跑时
+		// History 为空，前文意图全失（2026-09-20 实证：计划被驳回后用户终止、
+		// 补发"剔除范围"消息，模型只看当条消息做事，范围完全做反）。
+		s.commitHistory(session, result.History)
 		// 运行出错时标记会话错误并退出。
 		s.setSessionError(session, err.Error())
 		return
@@ -3413,6 +3424,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 			s.pauseSession(session, result.History, s.softStopPauseKind(session))
 			return
 		}
+		// 错误分支同样落历史（同 runSession：终止/出错后续跑不丢前文意图）。
+		s.commitHistory(session, result.History)
 		s.setSessionError(session, err.Error())
 		return
 	}
@@ -3525,6 +3538,24 @@ func (s *ReactService) isClusterTopEvent(session *reactInternalSession, ev LiveE
 	return ev.AgentID == session.ID && session.currentGear() == tool.GearCluster
 }
 
+// hasActiveSubAgents 判定会话编排树上是否存在运行中的子 Agent 节点（不含顶层会话节点）。
+// 集群档顶层 Meta 的流式分流依据：子 Agent 在跑时的顶层文本是编排口播（缓冲丢弃，防
+// 内心独白泄露进用户流，2026-09-18 治理）；子 Agent 全部结束后顶层文本即终答/直接汇报，
+// 实时直推 StreamingText——否则终答生成期（可达数分钟）前端只有一个转圈占位，
+// 用户长时间看不到任何内容（2026-09-20 用户实证）。树注册表自带锁，可与 store.mu 嵌套。
+func (s *ReactService) hasActiveSubAgents(sessionID string) bool {
+	t := s.TreeFor(sessionID)
+	if t == nil {
+		return false
+	}
+	for _, n := range t.Snapshot() {
+		if n.ID != sessionID && n.Status == orchestrator.StatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
 // flushPendingTopText 把集群档顶层 Meta 的轮缓冲冲刷进 StreamingText：
 // 中间轮口播在工具调用边界已丢弃，能活到 run 完成的只有终答（或 ask_user 正文，
 // 那条在 ToolCall 分支已自行冲刷）——冲刷让 SSE 末帧快照带上最终答复文本，
@@ -3606,11 +3637,16 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		// 答复文本开始输出时，思考阶段结束：先落 think 事件，再清空瞬时思考展示。
 		s.finalizeThinking(session, ev)
 		if s.isClusterTopEvent(session, ev) {
-			// 集群档顶层 Meta：正文只进轮缓冲不推 StreamingText——中间轮的编排口播
-			//（"已派出 N 个子 agent…"之类）绝对不能进用户流（2026-09-18 用户实证）；
-			// 终答由 agent_done 事件承载，不依赖流式推送。ask_user 恢复路径本就
-			// 会清 StreamingText（2026-09-09 修复），旧正文重推有既有兜底。
-			session.pendingTopText = ev.Text
+			// 集群档顶层 Meta 分流：子 Agent 在跑 → 正文只进轮缓冲不推 StreamingText
+			//（中间轮的编排口播绝对不能进用户流，2026-09-18 用户实证）；子 Agent 全部
+			// 结束 → 顶层文本即终答/直接汇报，实时直推——终答生成期不再整段转圈
+			//（2026-09-20 用户实证）。ask_user 恢复路径会清 StreamingText，无残留问题。
+			if s.hasActiveSubAgents(session.ID) {
+				session.pendingTopText = ev.Text
+			} else {
+				session.pendingTopText = ""
+				s.store.setStreamingText(session, ev.Text)
+			}
 			break
 		}
 		s.store.setStreamingText(session, ev.Text)
@@ -3631,7 +3667,8 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 			// 事件、不进 StreamingText（用户流里绝不出现编排内心独白，2026-09-18 用户实证）。
 			// ask_user 例外：提问正文快照（clarifyReportJSON）读 StreamingText，冲刷保留，
 			// 提问卡上方要展示这段正文。
-			if ev.Tool == "ask_user" {
+			if ev.Tool == "ask_user" && session.pendingTopText != "" {
+				// 直推模式下缓冲恒空、StreamingText 已是实时正文，不得冲刷覆盖为空。
 				s.store.setStreamingText(session, session.pendingTopText)
 			}
 			session.pendingTopText = ""
@@ -3783,6 +3820,18 @@ func (s *ReactService) softStopPauseKind(session *reactInternalSession) PauseKin
 // 其他 -> awaiting_clarify（普通续跑）。
 // History 完整保留，sendMessage -> resumeSession/resumePausedDomain 从当前进度续跑。
 // 不动 EndedAt：暂停态会话非终态，evictCompletedSessions 不会将其淘汰。
+// commitHistory 把 ReAct 循环返回的历史提交到会话（错误/取消路径专用）。
+// history 为本次运行累积的完整历史（RunWithHistory 返回时必然 ⊇ 续跑前历史），
+// 仅在非空时覆盖，避免异常路径把会话历史清空。
+func (s *ReactService) commitHistory(session *reactInternalSession, history []ReactMessage) {
+	if len(history) == 0 {
+		return
+	}
+	s.store.mu.Lock()
+	session.History = history
+	s.store.mu.Unlock()
+}
+
 func (s *ReactService) pauseSession(session *reactInternalSession, history []ReactMessage, kind PauseKind) {
 	s.store.mu.Lock()
 	session.History = history

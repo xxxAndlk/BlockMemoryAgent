@@ -96,6 +96,8 @@ type ClarifyRequest struct {
 	Questions []ClarifyQuestionItem `json:"questions,omitempty"`
 	// Artifacts 随问题附带的产物（如演示评审卡内嵌演示视频），空表示无产物。
 	Artifacts []ClarifyArtifact `json:"artifacts,omitempty"`
+	// Deadline 提问答复截止（ask_user timeout_sec；nil=不限时）。前端据此显示倒计时。
+	Deadline *time.Time `json:"deadline,omitempty"`
 }
 
 // UIEvent TUI 推送事件：向 bubbletea TUI / Web SSE 订阅者广播的事件信封。

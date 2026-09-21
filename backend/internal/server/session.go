@@ -316,6 +316,10 @@ func ToServerSession(a *agent.Session) *Session {
 				Kind: a.Kind, Path: a.Path, Title: a.Title, Caption: a.Caption, MIME: a.MIME,
 			})
 		}
+		if req.Deadline != nil {
+			dl := *req.Deadline
+			pc.Deadline = &dl
+		}
 		state.PendingClarify = pc
 	}
 	// 如果没有任何三层状态内容，则把 state 置为 nil，避免返回空对象。

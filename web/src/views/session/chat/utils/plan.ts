@@ -31,10 +31,18 @@ export interface PlanStep {
   verdict: 'pending' | 'approved' | 'rejected' | 'unknown'
   /** 驳回时的修改意见（从结果文案剥出，独立展示） */
   feedback: string
+  /** fail-open（2026-09-20）：审批等待超时/通道不可用，未经批准按计划自动放行——
+   *  界面上必须与普通"已返回"区分，否则用户看不出计划其实没被审批 */
+  timedOut: boolean
   /** 结果原文（兜底折叠展示） */
   resultText: string
   success: boolean
   ts: string
+}
+
+/** 结果文案是否 fail-open（超时/通道不可用自动放行，文案见 plan_confirm.go）。 */
+export function isFailOpenText(resultText: string): boolean {
+  return /fail-open|审批等待超时|未及时答复|按计划继续执行/.test(resultText)
 }
 
 /** 工具入参取字段：入参是 JSON 文本（detail_json / tool_args / stringifyArgs 的产物）。 */
@@ -106,6 +114,7 @@ export function buildPlanStep(input: {
     planText: typeof args.plan === 'string' ? args.plan : '',
     verdict: hasResult ? verdictOf(resultText) : 'pending',
     feedback: hasResult ? feedbackOf(resultText) : '',
+    timedOut: hasResult && isFailOpenText(resultText),
     resultText,
     success: input.success !== false,
     ts: input.ts,
@@ -119,4 +128,5 @@ export function fillPlanResult(step: PlanStep, resultText?: string, success?: bo
   step.success = success !== false
   step.verdict = verdictOf(text)
   step.feedback = feedbackOf(text)
+  step.timedOut = isFailOpenText(text)
 }

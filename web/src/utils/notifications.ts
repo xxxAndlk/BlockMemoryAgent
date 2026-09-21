@@ -51,3 +51,25 @@ export function maybeNotifySessionDone(status: string | undefined, goal: string 
     // 个别浏览器在无 Service Worker 时构造可能抛错：通知是锦上添花，静默失败
   }
 }
+
+/**
+ * 待澄清提醒（2026-09-20）：Agent 挂起等用户回答时页面在后台 → 系统级提醒，
+ * 避免 ask_user 超时自行决策用户毫无感知（此前只有会话终态才通知）。
+ * 同一 questionId 只弹一次（tag 去重）；前台不打扰。
+ */
+export function maybeNotifyClarifyWaiting(questionId: string, question: string) {
+  if (!notificationSupported()) return
+  if (Notification.permission !== 'granted') return
+  if (!document.hidden) return
+  if (!questionId) return
+  const body = (question || '').replace(/^Agent 提问[:：]\s*/, '').slice(0, 80) || '点击回到页面回答'
+  try {
+    const n = new Notification('❓ AI 等待你的回答', { body, tag: 'bma-clarify-' + questionId, silent: false })
+    n.onclick = () => {
+      window.focus()
+      n.close()
+    }
+  } catch {
+    // 同 maybeNotifySessionDone：通知是锦上添花，静默失败
+  }
+}
