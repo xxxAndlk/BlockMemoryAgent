@@ -441,6 +441,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 事实提取：子 Agent 完成后用轻量模型提取 1-5 条关键事实，每条单独落 KnowledgeRecord，
 	// 替代原始 result.Text 整段落库。提取失败自动回退原始保存（saveBlockMemory 内部处理）。
 	subAgentDispatcher.WithFactExtractor(&llmFactExtractor{factory: modelFactory, maxFacts: cfg.Agent.BlockMemoryFactsMax})
+	// 决策层（TODO #23）：类型化决策 + 置信度分级 + 影子先行。六个切入点（任务意图分诊/
+	// 失败处置路由/派发门灰区/摄取打分/沉淀省流/档位建议）只做灰区判断与建议，硬规则
+	// 一律留确定性代码；provider 故障 fail-open 回退现状行为。影子行落 agent_events
+	// type=decision_shadow（零 DDL），对拍达标才逐点切 enforce。
+	decisionLayer := newDecisionLayer(cfg, modelFactory, memoryPipeline)
+	subAgentDispatcher.WithDecisionLayer(decisionLayer)
 	// 失败打捞（TODO #20 第二层）：子 Agent 失败（超时/被杀/循环守卫终止）时用轻量模型
 	// 提取"已读文件清单+已得结论+卡点"摘要，写共享槽位供同域重派带前序摘要 + 追加进父 mailbox。
 	// 超时配置化（TODO #33）：思考型模型首 token 数十秒，旧 5s 硬编码致打捞全超时降级。
@@ -585,6 +591,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		time.Duration(cfg.Agent.PromptEnhanceLLMTimeoutSec)*time.Second,
 		cfg.Agent.PromptEnhanceMaxInputRunes,
 	)
+	// 决策层（TODO #23）：sendMessageFull 意图分诊切入点 + gear 档位建议切入点。
+	// 与 SetPromptEnhanceLLM 同位注入（消费侧照 WithFactExtractor 模式）。
+	agentSvc.SetDecisionLayer(decisionLayer)
 	subAgentDispatcher.WithBoard(rt.Boards.Get, func(sid, goal string) *board.TaskBoard {
 		return rt.Boards.GetOrCreate(sid, goal)
 	})

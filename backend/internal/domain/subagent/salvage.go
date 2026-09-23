@@ -69,6 +69,13 @@ func (d *Dispatcher) salvageFailure(ctx context.Context, parentID, subAgentID st
 	// 仅在有真实历史时调 LLM 打捞提取；kill 场景（History nil）直接用回退文本，
 	// 避免对"心跳超时已取消"这类无信息文本空跑轻量模型。
 	if d.salvageExtractor != nil && result.History != nil {
+		// 决策层⑤打捞提取预判（TODO #23 切入点5）：kill 场景跳过已是规则版先例，
+		// 此处 Noul 预判再省一层无效提取调用。影子期照常提取补对拍真值。
+		skip, decAns := d.decisionGateSalvageWorth(ctx, subAgentID, roleDef.ID, text)
+		if skip {
+			log.Printf("[subagent] decision salvage_worth=no, skip extraction: sub=%s role=%s", subAgentID, roleDef.ID)
+			return ""
+		}
 		// 超时取配置值（默认 30s，思考型模型场景 60s+）：思考型模型首 token 就要数十秒，
 		// 旧 5s 硬编码致打捞提取全超时降级 facts=0（TODO #33 事故链），超时兜底保留。
 		timeout := d.salvageTimeout
@@ -84,6 +91,7 @@ func (d *Dispatcher) salvageFailure(ctx context.Context, parentID, subAgentID st
 		} else {
 			log.Printf("[subagent] salvage extract failed, fallback partial: sub=%s err=%v facts=%d", subAgentID, err, len(facts))
 		}
+		d.observeExtractOutcome(ctx, subAgentID, decAns, extracted)
 	}
 	// 打捞兜底防污染（2026-09-16）：打捞 LLM 未提取成功时，回退文本可能整段是失败通知
 	// 原文（"[failure kind=killed retryable=false] 子 Agent ... 被停止"），对后续召回

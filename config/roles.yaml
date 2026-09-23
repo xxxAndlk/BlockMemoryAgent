@@ -78,6 +78,14 @@ lightweight_model:
   temperature: 0.2
   max_tokens: 2048 # 角色侧显式覆盖（总结类任务要短上限），优先于模型条目 max_output_tokens
 
+# 决策层模型配置（TODO #23）：灰区判断/建议用极小调用面（Choice/Score/Noul 三原语分类）。
+# 未配置本节（或留空 model/model_ref）时回退 lightweight_model——白拿缓存/绑定/热更新/日志。
+# 调用日志 Meta.layer=decision（session_logs 可与 lightweight 归因区分）。
+decision_model:
+  model_ref: doubao-seed-2.0-mini # 连接参数见 config/models.json；可指向更便宜更快模型
+  temperature: 0
+  max_tokens: 2048
+
 # 文本嵌入模型配置（P3-3）
 # provider: pseudo（默认，零依赖字符哈希） | openai（OpenAI 兼容端点） | local（本地 ollama/xinference HTTP 服务） | onnx（进程内 ONNX Runtime，TODO #41 真本地）
 # 向量维度需与上方 pgvector.dimensions 一致。

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/internal/domain/decision"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -50,6 +51,7 @@ type siblingUptakePipeline struct {
 	mu                             sync.Mutex
 	rosterFn                       func() []rosterEntry // 每轮查询活跃兄弟名册（nil=不注入名册更新）
 	seenRoster                     map[string]bool      // 已告知的兄弟 id（初始=系统提示词首注名册）
+	decLayer                       *decision.Layer      // 决策层④摄取打分（TODO #23）；nil=不打分
 }
 
 // newSiblingUptakePipeline 构造摄取包装器。selfID 用于排除自身产出（不回显自己刚写的结论）。
@@ -73,6 +75,12 @@ func (p *siblingUptakePipeline) WithRoster(fn func() []rosterEntry, seeded map[s
 	if p.seenRoster == nil {
 		p.seenRoster = make(map[string]bool)
 	}
+	return p
+}
+
+// WithDecisionLayer 装配决策层摄取打分（TODO #23 切入点4）。nil=不打分（测试兼容）。
+func (p *siblingUptakePipeline) WithDecisionLayer(l *decision.Layer) *siblingUptakePipeline {
+	p.decLayer = l
 	return p
 }
 
@@ -128,6 +136,12 @@ func (p *siblingUptakePipeline) Assemble(role types.RoleDefinition, agentID stri
 		return p.appendRosterUpdates(out, agentID)
 	}
 	rankBlockMemory(fresh)
+	// 决策层④摄取相关性打分（TODO #23 切入点4）：现排序规则不动，决策层逐候选 Score
+	// 影子对拍；enforce 点低于 score_floor 剔除。fail-open 故障/影子期原样保留。
+	fresh = gateUptakeScore(ctx, p.decLayer, agentID, "", fresh)
+	if len(fresh) == 0 {
+		return p.appendRosterUpdates(out, agentID)
+	}
 	msg := renderRecalledMemory(siblingOutputHeader, fresh)
 	if msg == "" {
 		return p.appendRosterUpdates(out, agentID)

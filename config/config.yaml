@@ -124,6 +124,14 @@ agent:
   plan_max_revisions: 0             # 每 Agent 计划被驳回重提上限：0=不限制，循环修订直到上级批准；>0 达上限不放行、转 escalate 升级仲裁（防失控兜底）
   # -- 波聚合整合纪要（集群档提速 C-3a，2026-09-17）--
   batch_digest_enabled: true        # call_sub_agents 同波 domain 项 ≥2 时完成回传汇成一条【整合纪要】单条送达父邮箱（轻量模型按领域归并，失败回退逐领域拼接），省父 Agent "收到，继续等" 空转轮；false=退回逐条回传
+  # -- 决策层（TODO #23，Jev 范式：类型化决策+置信度分级+影子先行）--
+  # 硬规则永远留确定性代码；决策层只做灰区判断与建议。候选集代码持有（结构性防幻觉），
+  # 按后果分级置信度阈值；影子先行、对拍达标才晋级强制；provider 故障 fail-open 不阻塞链路。
+  decision_shadow_enabled: true     # 影子总开关：true=全部决策点影子运行（只记录不生效，agent_events type=decision_shadow）；false=仅 enforce 点运行
+  decision_timeout_sec: 5           # 单次决策 provider 往返超时；超时/解析失败回退现状行为
+  # decision_points: {}             # per-决策点晋级开关（逐点独立，不做全量开关）。示例：
+  #   failure_disposition: {mode: shadow, min_confidence: 0.7}   # 影子对拍达标后手动切 enforce
+  #   uptake_score:        {mode: shadow, min_confidence: 0.6, score_floor: 0.5}
   prompt_enhance: true               # 用户输入自动提示词补全（TODO #36 Phase 0 规则版）：命中续跑/控制/诊断意图时附加【系统补全】段（意图标签+最近失败/未完成任务绑定），只增不改用户原文；false=原样直通
   prompt_enhance_llm: true           # L2 轻量模型仲裁开关（TODO #39）：灰区输入（L1 未命中但句中有弱词信号）调轻量模型四分类（none/resume/control/diagnose）；超时/失败/低置信一律按普通任务直通（宁漏判不误判）；false=降级纯规则（Phase 0 行为）
   prompt_enhance_llm_timeout_sec: 10 # L2 仲裁单次超时秒（TODO #39）：轻量模型首 token 慢，宁短超时降级也不阻塞用户输入（最坏延迟=本值）
@@ -178,3 +186,11 @@ skills:
   max_count: 50             # enabled 经验技能上限（B 写入门）：达到后新经验只允许合并进既有技能（近邻同名判定），不再新建；0=不限
   meta_catalog_top: 20      # meta 系统提示【可用技能】块列出的经验技能条数（A 目录收敛，按 use_count 降序）；完整目录经 list_skills(query) 检索
   consolidate_threshold: 30 # 启用数达到该值后每日（复用数据维护 tick）自动整理一次（C）：轻量模型合并语义重复技能 + 归档零使用技能；<=0 关闭自动整理（仍可 POST /api/skills/consolidate 手动触发）
+
+# 决策层 provider（TODO #23）：默认 llm 兜底（roles.yaml decision_model 未配置时回退 lightweight），
+# 外部 HTTP（TypeSafe 兼容）默认关——学范式不接死外部 API，provider 可插拔、失败自动回退 llm。
+decision:
+  provider: llm             # llm（默认）| http
+  http_url: ""              # 外部决策服务端点（provider=http 必填）；空即视为未配置回退 llm
+  http_api_key: ""          # 外部服务 Bearer 鉴权；空=不带
+  http_timeout_sec: 8       # 外部服务单次超时（秒）

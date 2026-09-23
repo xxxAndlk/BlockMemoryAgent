@@ -24,6 +24,22 @@ type Config struct {
 	Data     DataConfig     `yaml:"data"`     // 数据生命周期（陈旧知识归档/日志与工具输出保留期，TODO #18-2 T29）
 	Notify   NotifyConfig   `yaml:"notify"`   // 会话终态 Webhook 通知（TODO #18-5 T32）
 	Skills   SkillsConfig   `yaml:"skills"`   // 经验技能库治理（上限/目录收敛/自动整理）
+	Decision DecisionConfig `yaml:"decision"` // 决策层 provider（TODO #23）：默认 LLM 兜底，外部 HTTP 默认关
+}
+
+// DecisionConfig 决策层 provider 配置（TODO #23，config.yaml 顶级 decision: 节）。
+// 立场：学范式不接死外部 API——provider 可插拔，默认 lightweight 通道；
+// 外部 HTTP（TypeSafe 兼容）仅显式配置时启用，失败自动回退 LLM 兜底。
+// 行为参数（影子开关/超时/per-点阈值）在 agent: 节，不在此处。
+type DecisionConfig struct {
+	// Provider 提供者选择：llm（默认）| http。llm 走 CallDecisionWithRetry。
+	Provider string `yaml:"provider"`
+	// HTTPURL 外部决策服务端点（provider=http 必填；空即视为未配置回退 llm）。
+	HTTPURL string `yaml:"http_url"`
+	// HTTPAPIKey 外部服务鉴权（Bearer）；空=不带。
+	HTTPAPIKey string `yaml:"http_api_key"`
+	// HTTPTimeoutSec 外部服务单次超时（秒，默认 8）。
+	HTTPTimeoutSec int `yaml:"http_timeout_sec"`
 }
 
 // SkillsConfig 经验技能库（learned_skills）治理配置。
@@ -221,6 +237,27 @@ type FeatureTogglesConfig struct {
 	// 完成回传汇成一条【整合纪要】单条送达父邮箱（防 N 子完成 N 次打扰父）。
 	// 默认 true；显式 false 退回逐条回传（逃生舱）。
 	BatchDigestEnabled *bool `yaml:"batch_digest_enabled"`
+
+	// DecisionShadowEnabled 决策层影子总开关（TODO #23，默认 true）：true=全部决策点
+	// 影子运行（只记录不生效）；false=仅 enforce 点运行（省轻量调用成本）。
+	DecisionShadowEnabled *bool `yaml:"decision_shadow_enabled"`
+	// DecisionTimeoutSec 决策层单次 provider 往返超时（秒，默认 5）。超时 fail-open
+	// 回退现状行为——决策层故障不阻塞链路。
+	DecisionTimeoutSec int `yaml:"decision_timeout_sec"`
+	// DecisionPoints per-决策点策略（晋级开关）：mode=shadow|enforce、min_confidence
+	// 按后果分级、score_floor 仅 uptake_score 筛选下限。影子对拍达标才允许单点切
+	// enforce（逐点独立晋级，不做全量开关）；未列的点按影子+0.6 兜底。
+	DecisionPoints map[string]DecisionPointConfig `yaml:"decision_points"`
+}
+
+// DecisionPointConfig 单决策点行为参数（agent.decision_points.<point>）。
+type DecisionPointConfig struct {
+	// Mode shadow（默认，只记录不生效）| enforce（置信达标时答案生效）。
+	Mode string `yaml:"mode"`
+	// MinConfidence 强制生效置信门槛（高后果动作配高门槛）；<=0 按默认 0.6。
+	MinConfidence float64 `yaml:"min_confidence"`
+	// ScoreFloor Score 原语筛选下限（uptake_score 过滤低相关候选用）；<=0 按默认 0.5。
+	ScoreFloor float64 `yaml:"score_floor"`
 }
 
 // AgentConfig 集中所有 Agent 运行时动态可配置参数。
@@ -734,6 +771,27 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	if c.Agent.BatchDigestEnabled == nil {
 		t := true
 		c.Agent.BatchDigestEnabled = &t
+	}
+	// 决策层（TODO #23）：影子默认开（影子先行是本层立身原则）；超时默认 5s
+	// （provider 故障/超时 fail-open 回退现状行为，不阻塞链路）。
+	if c.Agent.DecisionShadowEnabled == nil {
+		t := true
+		c.Agent.DecisionShadowEnabled = &t
+	}
+	if c.Agent.DecisionTimeoutSec == 0 {
+		c.Agent.DecisionTimeoutSec = 5
+	}
+	// decision_points 未配置时每点按影子+0.6 门槛兜底（decision.DefaultPolicy 同款）；
+	// 影子对拍达标（单点 ≥200 样本或满 7 天、准确率≥阈值）才允许单点手动切 enforce。
+	if c.Agent.DecisionPoints == nil {
+		c.Agent.DecisionPoints = map[string]DecisionPointConfig{}
+	}
+	// decision provider 默认 llm 兜底；http 仅显式配置启用。
+	if c.Decision.Provider == "" {
+		c.Decision.Provider = "llm"
+	}
+	if c.Decision.HTTPTimeoutSec == 0 {
+		c.Decision.HTTPTimeoutSec = 8
 	}
 	// PlanMaxRevisions 默认 0=不限制：子 Agent 计划必须循环修订直到上级批准，
 	// 不做"达上限放行"；>0 仅作防失控兜底（达上限转升级仲裁，仍不放行）。

@@ -598,6 +598,13 @@ func (f *ModelFactory) resolveBaseConfig(roleDefID string) types.AgentModelConfi
 			return f.cfg.LightweightModel
 		}
 		return f.cfg.DomainAgent.ModelConfig
+	case "decision":
+		// 决策层模型槽位（TODO #23）：灰区判断/建议用极小调用面。
+		// 未配置 decision_model 时回退 lightweight 解析链——白拿缓存/绑定/热更新/日志。
+		if f.cfg.DecisionModel.Model != "" || f.cfg.DecisionModel.ModelRef != "" {
+			return f.cfg.DecisionModel
+		}
+		return f.resolveBaseConfig("lightweight")
 	default:
 		// 1. 运行时动态角色配置（P3-4）：RoleFactory 创建动态角色后注册到 ModelFactory
 		f.dynMu.RLock()
@@ -846,6 +853,63 @@ func (f *ModelFactory) CallLightweightWithRetry(ctx context.Context, prompt stri
 	// 补齐评测耗时归因缺口：轻量调用此前不产生 llm_input/llm_output 记录。
 	f.logLightweightCall(ctx, prompt, resp, meta, err, time.Since(start))
 	return resp, err
+}
+
+// CallDecisionWithRetry 用决策层模型生成（带 3 次重试）（TODO #23）。
+// 与 CallLightweightWithRetry 同构：流式累积（方舟 coding 端点拒非流式）+ 30s 单次超时；
+// 模型槽位走 "decision"（roles.yaml decision_model，未配置回退 lightweight）；
+// 调用日志 Meta.layer=decision（logLightweightCall 同款 schema，layer 区分归因）。
+//
+// 参数：
+//   - ctx: 上下文
+//   - prompt: 提示词
+//
+// 返回：
+//   - string: 模型回复
+//   - error: 调用错误（调用方 fail-open 回退现状行为，决策层故障不阻塞链路）
+func (f *ModelFactory) CallDecisionWithRetry(ctx context.Context, prompt string) (string, error) {
+	llm, err := f.GetModel(ctx, "decision")
+	if err != nil {
+		return "", err
+	}
+	start := time.Now()
+	resp, meta, err, _ := retryStreamGenerate(ctx, llm, prompt, 30*time.Second)
+	f.logDecisionCall(ctx, prompt, resp, meta, err, time.Since(start))
+	return resp, err
+}
+
+// logDecisionCall 决策层调用落 session_logs（Meta.layer=decision 可区分归因）。
+// ctx 未携带会话 logger（启动期/无会话场景）时跳过，不影响主流程。
+func (f *ModelFactory) logDecisionCall(ctx context.Context, prompt, resp string, meta map[string]any, callErr error, dur time.Duration) {
+	lg := logger.FromContext(ctx)
+	if lg == nil {
+		return
+	}
+	if callErr != nil {
+		resp = "[ERROR] " + callErr.Error() + "\n" + resp
+	}
+	var cacheHit, cacheMiss int
+	if meta != nil {
+		if v, ok := meta["cache_hit_tokens"].(int64); ok {
+			cacheHit = int(v)
+		}
+		if v, ok := meta["cache_miss_tokens"].(int64); ok {
+			cacheMiss = int(v)
+		}
+	}
+	cfg, _ := f.resolveConfig("decision")
+	lg.LLMCall(ctx, logger.LLMCallRecord{
+		Agent:           "decision",
+		Model:           cfg.Model,
+		Prompt:          prompt,
+		Response:        resp,
+		InputTokens:     EstimateTokens(prompt),
+		OutputTokens:    EstimateTokens(resp),
+		CacheHitTokens:  cacheHit,
+		CacheMissTokens: cacheMiss,
+		LatencyMs:       int(dur.Milliseconds()),
+		Meta:            map[string]any{"layer": "decision"},
+	})
 }
 
 // logLightweightCall 把一次轻量 LLM 调用写入 session_logs（复用 Logger.LLMCall 路径）。

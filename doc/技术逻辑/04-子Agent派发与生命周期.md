@@ -123,7 +123,8 @@
 1. **reuse 分流**（2592-2597）：`reuseAgentID != ""` → 热驻未开启报错；否则 `dispatchToIdleSlot`（idle_pool.go）——idle 唤醒注入任务 / busy 入队 / 不存在报错。
 2. 角色解析 + worktree 约束（开关关闭拒；热驻 domain 拒）。**派前双校验**（dispatchOne 入口，2026-09-18/19 实测修复，拒绝发生在配额/树登记前零消耗）：
    - `checkRoleTaskFit`（2588）：任务文本的工具需求信号（powershell/get-content/grep/sed/go test/npm/pip/writefile/写入文件等直写形态）× 目标角色工具面，不匹配硬拒并给改派方向——防"派 scout 执行 PowerShell"式能力错配整波空转；
-   - `checkTaskPathsFit`（2640）：任务文本提取零歧义绝对路径信号（Windows 盘符 + POSIX 绝对路径正则，带空格路径截断但根前缀足够判定），越出会话 workDir 且角色工具面无 RunCommand 时硬拒（tools_hint 预挂的也算，`hintHasTool`）——防子 Agent 跟 "path escapes sandbox" 缠斗空转（实测 3 个 code_reviewer 84 次调用零交付）；拒绝消息给三选一处置：改派 domain / ask_user 请用户切换会话 workdir / Copy-Item 摄入工作目录；`pathWithinWorkDir` 为 Windows 大小写不敏感前缀比较。
+   - `checkTaskPathsFit`（2640）：任务文本提取零歧义绝对路径信号（Windows 盘符 + POSIX 绝对路径正则，带空格路径截断但根前缀足够判定），越出会话 workDir 且角色工具面无 RunCommand 时硬拒（tools_hint 预挂的也算，`hintHasTool`）——防子 Agent 跟 "path escapes sandbox" 缠斗空转（实测 3 个 code_reviewer 84 次调用零交付）；拒绝消息给三选一处置：改派 domain / ask_user 请用户切换会话 workdir / Copy-Item 摄入工作目录；`pathWithinWorkDir` 为 Windows 大小写不敏感前缀比较；
+   - **决策层③派发门灰区补充**（decisionGateDispatchGap，2026-09-23 TODO #23 切入点3）：两条硬拒**保持 rules-first 不动**，决策层只补规则正则覆盖不到的需求信号（needs_browser/needs_mcp/needs_vision）；影子期只落对拍行（actual=none=现状放行）零行为变化，enforce 点命中缺口且置信达标才拦（fail-open 故障不拦派发）。
 3. **scout 类缺省墙钟**：`SpecExempt` 角色无显式 wall_clock_min → 5min（light 10min）（2618-2624）。
 4. **权限校验**：`CanCall(roleIDFromAgentID(parentID), roleID)`。
 5. **域控守卫**（仅 domain，2634-2652）：
@@ -163,7 +164,7 @@
 | `context.Canceled` 且 `isPauseRequested` | **手动暂停**：`savePausedHistory`（脱离取消 ctx，10s 超时）+ `tree.Pause` + pokeParent + 邮件通知父（"已暂停，可 set_agent_model/resume_agent/cancel_agent"）；返回 true |
 | `context.Canceled` 且 `isSoftStop(sid)` | **软停止**：domain → 存 history + tree.Pause + pokeParent（返回 true）；叶子 → treeFinish Done + notify "已被软停止…部分成果" + 热驻域额外"子 Agent 已取消"提示邮件 |
 | `context.Canceled` 其他（硬取消/心跳杀） | 清暂停残留标记 + `saveTerminalHistory`（仅存史），通知/树收尾由取消方负责（防双通知） |
-| 通用 err | `salvageFailure`（打捞摘要双路：写槽位 `<parentID>:salvage:<domain>` + 失败消息）；`renderLegacyList`（结构化遗产清单）；`failureKindOf` 分类 + retryable 判定（kind==error ∧ 非 domain/meta ∧ ctx 未取消）；`formatSubAgentFailure` 文案；**unverified/verify_missing 附产出全文**；看板/树三态（unverified→`StatusUnverified`/TaskUnverified，否则 Failed）；saveTerminalHistory + treeFinishStatus + notify |
+| 通用 err | `salvageFailure`（打捞摘要双路：写槽位 `<parentID>:salvage:<domain>` + 失败消息）；`renderLegacyList`（结构化遗产清单）；`failureKindOf` 分类 + retryable 判定（kind==error ∧ 非 domain/meta ∧ ctx 未取消）；`formatSubAgentFailure` 文案；**决策层②失败处置路由**（decisionGateFailureDisposition，2026-09-23 TODO #23 切入点2：Choice retry/redelegate/escalate/suspend 建议——failureKindOf/retryable **rules-first 不动**，enforce 点把【处置建议】段附进失败消息供父 LLM 裁量，影子对拍 auto-retry 实际发生与否）；**unverified/verify_missing 附产出全文**；看板/树三态（unverified→`StatusUnverified`/TaskUnverified，否则 Failed）；saveTerminalHistory + treeFinishStatus + notify |
 | 成功 | 看板 Done；saveTerminalHistory；treeFinish；**domain 且终答缺【未验证项】段 → 追加机器警告行**（`appendUnverifiedWarning`）；`MachineCheck` 拼进摘要；`VerifyNote` 前缀【校验:通过(...)】；worktree 收尾 patch 附言（`worktreePatchNote`）；`notify(parentID, subAgentID, summary, files)`（files=FilesModifiedFromHistory） |
 
 ## 4.8 runSubAgentOnce（纯执行路径）
@@ -248,10 +249,10 @@
 1. 优先 `BlackboardSearcher.Query(ctx, sid, parentID, domain, query=task, topK=3, "")`（scope 确定性：parent_id+task_domain 过滤 + 可选语义排序）；
 2. 空则回退 `SearchBlockMemoryByGoal(sid, query, topK)`（纯语义）；
 3. 不足 topK → `CrossSessionSearcher.SearchBlockMemoryCrossSession`（跨 session 补位，排除当前 session，更严阈值）；
-4. `rankBlockMemory`（5165-5176）：outcome 排序（success=0 < partial=1 < fail=2）→ reuse_count 降序 → 新近优先；`bumpReuses` 递增命中 reuse_count；
+4. `rankBlockMemory`（5165-5176）：outcome 排序（success=0 < partial=1 < fail=2）→ reuse_count 降序 → 新近优先；`bumpReuses` 递增命中 reuse_count；**决策层④摄取打分**（gateUptakeScore，2026-09-23 TODO #23 切入点4：现排序不动，逐候选 Score 相关性——影子对拍 actual=yes=现状全保留，enforce 点低于 score_floor 剔除；siblingUptakePipeline.Assemble 每轮摄取与本播种召回两侧同口径，单次批量往返）；
 5. `renderRecalledMemory`（5196-5220）：成功经验/避坑经验两段；头部 `blockMemoryRecallHeader`（5161）防"把旧完成当待办"。
 
-**沉淀**（`saveBlockMemory`，5024-5041）：开关关闭/空内容跳过；有 factExtractor 先 LLM 提取 1-5 条事实（`saveFacts` 逐条落库 `source=fact_extraction`），失败回退原始全文（`saveRawBlockMemory`，`source=sub_agent_result`）。
+**沉淀**（`saveBlockMemory`，5024-5041）：开关关闭/空内容跳过；**决策层⑤沉淀提取预判**（decisionGateExtractWorth，2026-09-23 TODO #23 切入点5：hasSubstantiveChange 规则门保留为硬底，其后 Noul"值得提取?"预判省无效 LLM 提取调用——影子期照常提取补对拍真值 observeExtractOutcome，enforce 点判 no 且置信达标才跳过；salvageFailure 侧 decisionGateSalvageWorth 同款）；有 factExtractor 先 LLM 提取 1-5 条事实（`saveFacts` 逐条落库 `source=fact_extraction`），失败回退原始全文（`saveRawBlockMemory`，`source=sub_agent_result`）。
 
 - Meta 标签：goal/domain(roleID)/session_id/sub_agent_id/parent_id/task_domain/files_modified/outcome/reuse_count/domain_reuse_count(SKILL域级复用权重)。
 - 内容三段式"目标:/角色:/结果:"（各截断 200/500 runes）。

@@ -23,6 +23,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/agent"               // agent 包提供 ReActAgent、MemoryPipeline、ModelProvider 等类型
 	"github.com/blockmemory/agent/backend/internal/board"               // board 提供任务看板（TODO #22 执行计划）
+	"github.com/blockmemory/agent/backend/internal/domain/decision"     // decision 决策层（TODO #23）
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator" // orchestrator 提供 Agent 树元数据层
 	"github.com/blockmemory/agent/backend/internal/domain/role"         // role 包提供角色注册表
 	"github.com/blockmemory/agent/backend/internal/domain/tool"         // tool 包提供工具注册表与 Result 类型
@@ -381,6 +382,10 @@ type Dispatcher struct {
 	// 为 nil 时回退到原始文本保存（测试场景或未配置时）；bootstrap 在启用块记忆写入时注入。
 	// 提取失败（LLM 出错或返回空）自动回退原始保存，保证不丢结果。
 	factExtractor FactExtractor
+
+	// decisionLayer 决策层（TODO #23）：灰区判断与建议（失败处置/派发门/摄取打分/沉淀省流）。
+	// nil=关闭（默认，测试场景零行为变化）；影子先行，对拍达标才逐点 enforce。
+	decisionLayer *decision.Layer
 
 	// blockSaveFailures 连续块记忆写入失败计数（观测）：达阈值触发醒目告警，
 	// 提示链路损坏（embedding 端点/DB 表缺失）。成功写入时重置为 0。
@@ -1917,6 +1922,14 @@ func (d *Dispatcher) WithFactExtractor(e FactExtractor) *Dispatcher {
 	return d
 }
 
+// WithDecisionLayer 注入决策层（TODO #23，消费侧照 WithFactExtractor 模式）。
+// 六切入点（失败处置路由/派发门灰区/摄取打分/沉淀省流 ×2）只做灰区判断与建议；
+// 传 nil 关闭（默认关闭，测试场景零行为变化）。
+func (d *Dispatcher) WithDecisionLayer(l *decision.Layer) *Dispatcher {
+	d.decisionLayer = l
+	return d
+}
+
 // WithDispatchRetryCount 设置叶子助手 kind=error 失败的自动重派次数（TODO #23）。
 // n<=0 关闭自动重派（默认关闭，测试场景）；bootstrap 按 cfg.Agent.DispatchRetryCount 注入。
 func (d *Dispatcher) WithDispatchRetryCount(n int) *Dispatcher {
@@ -3055,6 +3068,13 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
+	// 决策层③派发门灰区补充（TODO #23 切入点3）：上述两条高置信硬拒保持 rules-first
+	// 不动；决策层只补规则正则覆盖不到的需求信号（needs_browser/needs_mcp/needs_vision）。
+	// 影子期只落对拍行零行为变化；enforce 点命中缺口才拦（fail-open 故障不拦）。
+	if msg := d.decisionGateDispatchGap(ctx, parentID, roleDef.ID, task); msg != "" {
+		return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
+	}
+
 	// worktree 派发约束（TODO 第9⑤）：开关关闭拒绝；热驻 domain 拒绝（槽沿主目录
 	// 上下文冻结，切副本破坏 reuse 语义）。callSubAgentTool 已拒 reuse 组合。
 	if opt != nil && opt.worktree {
@@ -3872,6 +3892,9 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		retryable := kind == FailureKindError && roleDef.ID != "domain" && roleDef.ID != "meta" && ctx.Err() == nil
 		failText := formatSubAgentFailure(ctx, err, result, d.effectiveTimeout(subAgentID), partial)
 		msg := failureMarker(kind, retryable) + "\n" + failText
+		// 决策层②失败处置路由（TODO #23 切入点2）：failureKindOf/retryable 硬规则
+		// 保持 rules-first；决策层只出灰区处置建议（影子对拍父 LLM 实际选择）。
+		msg += d.decisionGateFailureDisposition(ctx, subAgentID, roleDef, kind, retryable, retried, failText, partial)
 		// 校验分层（TODO #43）两类"未验证/缺证据"：附产出全文供父 Agent 自决
 		// （重派/降级/收口）——非"失败"语义，产出可能可用，不能只给 500 字截断。
 		if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
@@ -4254,7 +4277,8 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			seeded[e.id] = true
 		}
 		uptake = newSiblingUptakePipeline(mem, bb, sid, parentID, domain, subAgentID).
-			WithRoster(liveRoster, seeded)
+			WithRoster(liveRoster, seeded).
+			WithDecisionLayer(d.decisionLayer) // 决策层④摄取打分（TODO #23）
 		mem = uptake
 	}
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, subAgentID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
@@ -4872,7 +4896,8 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 			seeded[e.id] = true
 		}
 		mem = newSiblingUptakePipeline(mem, bb, sid, pausedNode.ParentID, pausedNode.Domain, pausedNodeID).
-			WithRoster(func() []rosterEntry { return d.rosterEntries(sid, pausedNode.ParentID, pausedNodeID) }, seeded)
+			WithRoster(func() []rosterEntry { return d.rosterEntries(sid, pausedNode.ParentID, pausedNodeID) }, seeded).
+			WithDecisionLayer(d.decisionLayer) // 决策层④摄取打分（TODO #23）
 	}
 	// 不注入编排者人格（理由同 runSubAgentOnce：身份混淆实证）。
 	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, pausedNodeID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
@@ -5767,7 +5792,17 @@ func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, pa
 		return
 	}
 	if d.factExtractor != nil {
+		// 决策层⑤沉淀提取预判（TODO #23 切入点5）：hasSubstantiveChange 规则门保留为
+		// 硬底，此处 Noul 预判省无效 LLM 提取调用。影子期照常提取补对拍真值；
+		// enforce 点判 no 且置信达标才跳过提取。
+		skip, decAns := d.decisionGateExtractWorth(ctx, subAgentID, goal, roleID, content)
+		if skip {
+			log.Printf("[subagent] decision extract_worth=no, skip extraction: sub=%s role=%s", subAgentID, roleID)
+			return
+		}
 		facts, err := d.factExtractor.Extract(ctx, content, goal, roleID)
+		extracted := err == nil && len(facts) > 0
+		d.observeExtractOutcome(ctx, subAgentID, decAns, extracted)
 		if err != nil {
 			log.Printf("[subagent] extract facts failed, skip sediment: sub=%s err=%v", subAgentID, err)
 			return
@@ -6047,6 +6082,11 @@ func (d *Dispatcher) injectScopedRecall(ctx context.Context, parentID, taskDomai
 		return task, nil
 	}
 	rankBlockMemory(recs)
+	// 决策层④摄取相关性打分（TODO #23 切入点4，播种召回侧）：同 Assemble 每轮摄取口径。
+	recs = d.decisionGateUptakeScore(ctx, agent.AgentIDFromContext(ctx), query, recs)
+	if len(recs) == 0 {
+		return task, nil
+	}
 	d.bumpReuses(ctx, recs)
 	prefix := renderRecalledMemory(blockMemoryRecallHeader, recs)
 	if task == "" {

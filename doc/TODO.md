@@ -34,9 +34,9 @@
     - 子项 1 测试：mock computer_use MCP server 下——三场景清单顺序执行、启动门选跳过该场景被标 skipped、步骤失败截断后续并回传失败场景号；真实环境人工冒烟（登录 -> 滑动 -> 点按钮两场景）。
     - 子项 1 验收：发起带 UI 交互验收的任务时，日志可见逐场景 ask_user 确认 -> 截图证据落盘 -> 完成/打回结论；插件未启用/沙箱未起时给明确不可用原因而非挂起等待。
     - 子项 2 设计（上下文压缩 auto/manual 双模式）：
-      1. 现状：仅 auto——每 Agent 150K 阈值即触发压缩（任务 45），保留近 10 条、其余压成摘要块，压完回落阈值附近；无手动入口。
+      1. 现状：仅 auto——每 Agent 150K 阈值即触发压缩（任务 45），保留近 15 条（`summarize_keep_recent`，2026-08-21 由 10 上调；代码兜底 10）、其余压成摘要块，压完回落阈值附近；无手动入口。
       2. 配置：`config.yaml` 加 `context_compression_mode: auto|manual`（默认 auto，不改现状语义）。
-      3. manual 语义：Pipeline 不再按 token 阈值自动压缩；新增 TUI 命令 `/compact [keep_n]` 触发即时压缩（keep_n 缺省取默认近 10 条）；TUI 状态栏常驻显示当前会话 token 用量 / 150K 百分比，>=80% 黄色提示建议 /compact。触达硬上限（LimitReached 暂停）时暂停文案追加「输入 /compact 压缩上下文后继续」引导。
+      3. manual 语义：Pipeline 不再按 token 阈值自动压缩；新增 TUI 命令 `/compact [keep_n]` 触发即时压缩（keep_n 缺省取默认近 15 条）；TUI 状态栏常驻显示当前会话 token 用量 / 150K 百分比，>=80% 黄色提示建议 /compact。触达硬上限（LimitReached 暂停）时暂停文案追加「输入 /compact 压缩上下文后继续」引导。
       4. HTTP 同步暴露 `POST /api/sessions/{id}/compact`，web 端按钮走同一通路。
     - 子项 2 测试：manual 模式下长会话超阈值不自动压缩 + /compact 后窗口收缩摘要生成、首条 user 与看板注入段保留；auto 模式回归零变化；HTTP compact 对非活跃会话幂等。
     - 子项 2 验收：双开关切换行为各自正确；manual 模式长跑塔防会话中用户 /compact 后 MetaAgent 继续编排不丢目标。
@@ -282,3 +282,79 @@
     - **第二轮补丁（同日晚，用户定向"只沉淀改动的关键逻辑与信息"）**：块记忆触发门 `hasSubstantiveChange`（无文件改动+纯只读任务不沉淀）+ 提取失败/为空不回退原文 + 提取 prompt 跨任务复用判据 + salvage 失败原文不落库；存量 13 条 `[failure` 垃圾行 archived。
     - **观察点**：块记忆日增量是否显著下降（基线 1067 行 / ~35 天 ≈ 30 行/天）；沉淀是否只剩真改动结论；技能库增长曲线是否被压平（`learned_skills` enabled 数 / evolution_log skill_dropped 频次）；整理质量（skill_merge 是否误并、skill_archive 是否误归档——两者都可手工恢复：enable + 文件仍在 `config/skills_learned/`）；块记忆增长速率（1067 行基线，观察增量是否显著放缓）。
     - **遗留**：B 的「与 project_lessons 跨库判重」未做（项目经验无向量）；技能归档不自动恢复；块记忆**存量行**的去重与 `last_accessed` 回填未做（仅新写入生效——若要让 `knowledge_archive_days` 立即生效，需先手工 `UPDATE global_knowledge SET last_accessed = created_at WHERE last_accessed IS NULL`）；块记忆批量整理未做。
+20. **Claude Code 上下文管理机制借鉴四件（底账 append-only 纪律 / 压缩生命周期钩子 / 记忆两级配额 / 失败分支整支剪枝）**（2026-09-23 立项；依据当日对 Claude Code 官方文档（checkpointing/memory/sessions/hooks）+ Anthropic 工程博客《Effective context engineering for AI agents》+ 2026-09 第三方实测的查证。调研触发点：CC"路径 A/B 失败被丢弃、经验本地留存、下次推理需要时回灌"的实现方式——结论：非单一功能，是四机制复合。2026-09-23 晚经双向复核修订：CC 侧逐条核证官方文档/issue 原文，BMA 侧经源码级台账排查——排查结论直接改写①④）
+    - **核心观念（本项全部子项的立意）**：Claude Code 里"丢弃"从来不是删除，只是**剥夺窗口占用权**；经验的价值 = 被蒸馏成一行索引 + 可随时取回的细节，模型不需要记住任何事，只需要知道"去哪取"。BMA 侧对应物基本齐全（压缩金字塔 ≈ auto-compact，已代码级证实为 Assemble 只读视图、只写 agent_compress_states：pipeline.go:319-369/689-711；meta_memory ≈ auto memory；黑板 ≈ structured note-taking；session_history/session_events ≈ CC 的 append-only jsonl transcript——**最后一项名不副实**：两表写入是 delete-then-insert 全量重写，复活路径还物理删子 Agent 快照，纪律违反恰好发生在存储层，见①排查）。差距大头在纪律与钩子——故本项 = 三处写入点归档改造 + 轻量钩子挂载，零新表起步（归档走同表标记列）。与 #7（CC 子 Agent 机制借鉴）、#10（Hermes/Codex）不重叠：那两个是协作与执行切面，本项是上下文与记忆切面。
+    - **① 底账 append-only 纪律**（侵入度低；2026-09-23 全仓排查已完成——结果非零，须改造）
+      - 排查结论（代码级证实）：#14B"压缩金字塔=视图变换非销毁"**属实**（压缩只写状态不动消息）；以下三处是真实删除/覆盖点——
+        1. **复活路径删快照**：ReviveWithMessage → DeleteMessages 物理删该子 Agent 上轮 run 的终态快照（dispatcher.go:1280 → messages_store.go:115-121；守卫仅删含"/"的子行，会话级行保留作恢复源）。调度主干例行 DELETE，不属"用户显式删除"例外——**它正是 ④ 返工场景的底账，不补归档则 ④ 做完也是漏的**；
+        2. **话题切换整树 wipe**：EndCurrentTopic → DeleteNodesBySession（orchestrator/tree.go:445 → agent_tree_store.go:108-117）。删前有节点快照返回 + 话题摘要写 sharedKV 留痕——补"wipe 必留摘要"规矩即可，不动代码；
+        3. **重写式写入**：SaveMessages/SaveEvents delete-then-insert 全量覆盖（messages_store.go:59、session_store.go:138；session_events 每轮结束重写）——旧版行物理消失，按 append-only 严格语义违规，改"旧版移归档（同表 archived 标记）"或修订立规措辞二选一。
+        - 边缘不处置：dag_jobs 按 id 删（dag.go:173，DAG 管理端点，与记忆底账无关）；DeleteSessionData 7 表级联（session_store.go:214-227，用户显式删会话）——后者留在验收口径允许的例外内。
+      - 规矩（写入 CLAUDE.md）：任何上下文剪枝（压缩/重派/rewind 类操作）只改视图或标记，不物理删行；失败分支的完整轨迹永远 SQL 可查——这是其余三件的地基，CC 的 rewind/compact 均不删 transcript 同款。
+      - 验收：改造后历史数据物理删除点仅剩"用户显式删除会话级联"一处；规矩入 CLAUDE.md；压缩/重派/复活发生后失败轨迹可用 level SQL 查回。**顺序约束：本件必须先于 ④ 落地**（④ 的失败轨迹留底账依赖本件补归档）。
+    - **② 压缩生命周期钩子三件**（侵入度低-中；CC 对应物 = PreCompact/PostCompact hooks）
+      - **压缩前快照**：150K 阈值触发压缩时，把当前任务账本 + 拓扑名册 + 未读工具链快照随压缩事件落 agent_events（指针+版本号，不存全文——账本本来就在 PG，防 agent_events 体积通胀）；防 CC 社区著名事故同类（anthropics/claude-code#34674：压缩时**未提交的 Edit 改动（git 追踪文件）被静默回退到 git HEAD**；Write 新建文件、Bash 写入、已提交改动均不受影响——是物理丢改动，不是"忘掉改到一半用陈旧内容覆盖"）。
+      - **压缩后热改动重注入**（CC 对该事故的实际解药，初稿漏借本次补上）：压缩完成后按"最近改动文件清单"自动重读回灌——≤5 个、最近修改优先、单文件 >5K tokens 只回路径引用（CC 官方 context-window 页 "What survives compaction" 文档化；总量预算 ~50K 出自第三方源码分析 POST_COMPACT_TOKEN_BUDGET=50_000，官方未文档化）；项目 CLAUDE.md 类文件与记忆索引从盘重注入。BMA 可行性现成：session_events.tool_path+timestamp 持久可查、FilesModifiedFromHistory 轨迹现成（内存热层 lastWrites 仅 run 内 8 条不落库，跨 run 靠 PG 重扫）。快照是"记录"、本条是"解药"，两件配套才算对齐 CC。
+      - **压缩后审计**：压缩事件落 before/after 体积与摘要本体；对标 CC PostCompact（v2.1.76+，收 compact_summary payload，无决策权仅 follow-up），BMA 版为用户脚本可配钩子位。拦截分寸校正（官方文档核证）：PreCompact 否决（exit 2 / `{"decision":"block"}`，block 能力 v2.1.105+，事件本身 v1.0.48+）对 manual/auto 两种触发**同权**，官方无 matcher 权限差别——"只拦 auto"是社区自律约定，不是 CC 硬限制；且 issue #50467 报告 v2.1.105–114 auto 路径 PreCompact 实际不触发（stale 关闭未修）——CC 该机制自身尚在 flaky 期，BMA 自建钩子不受影响。本件采纳社区分寸作 **BMA 自律约定**：manual 不可拦、auto 可拦。
+      - 与 #5 子项 2 关系：那是用户控制面（auto/manual 双模式 + TUI /compact），本件是机器钩子面，叠加不冲突；建议 #5 子项 2 先落，本件挂其压缩入口复用。
+      - 验收：任意压缩发生后可回答"压掉了什么、账本当时在什么状态"（agent_events 可查）；压缩后热改动清单重注入生效（追问改到一半的文件能答出磁盘当前状态）；压缩后 domain 拓扑身份块按既有每轮注入机制自动恢复（现状已有，回归确认即可）。
+    - **③ 记忆两级配额**（侵入度低；抄纪律不抄文件）
+      - 范式来源：CC auto memory = MEMORY.md 索引（前 200 行/25KB 启动注入）+ topic 文件按需 Read + **超限写成功但返回错误逼模型重写索引**（官方 memory 页已文档化：近限 reminder、超限 error 逼重写、超限部分下次加载丢弃，errors#memory-index-is-over-its-read-limit——此句初稿曾被第三方审计判"未证实"，经核证维持原文）；#15④ 角色手册已立"索引常驻、正文按需"同范式（skills.yaml 声明层 + AGENTS.md 注入槽），本件是该范式在记忆层的应用。
+      - 动作：meta_memory/global_knowledge 层加"索引槽"——每会话启动注入限定行数的一行式沉淀索引（配置项 `memory_index_max_lines` / `memory_index_max_runes`，对标 CC 的 200 行/25KB）；详情行照旧走向量召回，检索端不动。BMA 是 DB 方案：不抄 jsonl 文件路径、不抄 MEMORY.md 文件名，只抄**两级结构 + 配额 + 超限逼重写**三件套。
+      - 与 #14 C-1 关系：C-1 分层契约缺的"共享事实层持久化实体"的最小补。
+      - 验收：会话启动注入的记忆 token 有上限且可配（prompt 构成报表依赖 #15①——现状 logPromptStats 仅 react_agent.go:1268 日志行、无端点无工具，验收前须先建）；索引槽超限时写侧收到重写指令而非静默截断；存量 meta_memory 行无需迁移（索引槽从新写入开始累积，存量行由向量召回兜底）。
+    - **④ 失败分支整支剪枝**（侵入度中，四件中唯一动派发主干；CC 对应物 = rewind 检查点 + /branch）
+      - 现状痛点（按实情重写，替代初稿）：#14 已记录"纠偏代价=重做"——ReviveWithMessage 重跑时旧 run 消息**已被物理删**（dispatcher.go:1280 → messages_store.go:115-121，见①排查），新上下文只带【上一轮结果+上轮错误】摘要种子（dispatcher.go:1251-1256）——失败轨迹两头不靠：活跃上下文只剩二手摘要，底账 SQL 不可查。**真实病灶是"底账被删"而非"上下文被污染"**（初稿"留在活跃上下文收注意力税"对 revive 路径不成立）。CC 侧经济学参照：官方 best-practices 对"同一问题纠正超 2 次"的建议是 **/clear + 更具体的初始提示词**（不是 rewind——rewind 定位是恢复对话/代码状态）。
+      - 动作：domain 会话**逻辑检查点**——派发时 + 里程碑时快照任务账本（落 agent_events）；失败处置三选对齐 CC rewind 菜单语义：
+        1. **剪枝重派**（对齐 restore both）：账本回滚到检查点 + 活跃上下文在轮边界截断（sanitizeToolPairing 残对兜底），失败轨迹移出活跃上下文、留底账（与 ①联动，① 归档先行）；
+        2. **同支续跑**（现状语义保留，错误轻微时仍是正确选择）；
+        3. **分叉重派**（对齐 /branch，v2.1.77 由 /fork 更名）：新支重跑，旧支归档——CC 的 /branch 只复制 transcript、不动磁盘文件（继承表无 worktree 项）；BMA worktree 副本机制是超出 CC 的加分项（旧支 worktree 保留可考古），旧支入口挂编排页 #12 Task 13 看板时间线（useGoalTimeline.ts）。
+      - 默认策略：剪枝重派为默认（零用户决策），meta 经既有里程碑/邮件机制感知"某域剪枝重派"。
+      - 验收：失败域重派后活跃上下文不含上轮失败过程（prompt-stats 前后对照）；完整失败轨迹底账可查（与 ① 联动验收，① 未落则本条不验收）；分叉支旧支可经编排页 resume 考古；剪枝不误伤进行中工作——双重兜底（底账不动 + 账本快照可回滚），截断点只选轮边界不选轮内。
+    - **端到端验收场景**：集群档 3 域并行、1 域失败——重派后该域活跃上下文零失败残留、meta 收到剪枝通知、失败轨迹编排页可查、压缩发生时可回答"压掉了什么"。
+    - **明确不做**：
+      - 不抄 jsonl 文件方案——BMA 的 PG 底账比文件更强，抄的是纪律不是载体；
+      - 不做用户可见的 rewind UI（CC 的 Esc Esc 菜单）——先落机器侧剪枝，人机界面缓做（编排页 #12 已是自然载体）；
+      - 不做 CC 全套 30 钩子总线——只落与压缩相关的 PreCompact/PostCompact 两个；SessionStart/Stop 类钩子位已有 MetaMemory 注入与 evolveSession 对应，不重复建设；
+      - 不做 CC 的 auto memory 自动写记忆（模型自主决定记什么）——BMA 已有 evolveSession 显式沉淀管道，两套并存会打架，只借其两级配额；
+      - rules 路径作用域按需注入（CC `.claude/rules/*.md` 的 `paths:` frontmatter）**列观察不做**——BMA 沙箱面是权限语义，加载语义价值低，咬人再议；
+      - 不做 CC 式"跨主机 resume"（session 文件搬家的多机接续）——单节点部署下负资产，#14 明确不做协作状态持久化的决策不变。
+21. **Kimi Code 压缩管线借鉴（笔记三件套 / 回灌内置指引 / 压缩质量门 / 会话恢复中间层 / thinking 压缩取舍 A/B）**（2026-09-23 立项；依据当日对 Kimi Code 官方 changelog（v0.15.0→2.0.2 逐版反推）+ hooks/agents/会话文档 + 本机 `~/.kimi-code` 实证的三路查证。与 #20 是姊妹篇：#20 借 CC 的"结构"——底账纪律/钩子位/两级配额/剪枝；本条借 KC 的"管线细则"——压缩前后话术与质量门。实施时①②③与 #20② 合并设计一次落地，避免两次改压缩管线）
+    - **动机**：#20② 给了压缩"钩子位与快照"，但没定"摘要怎么写、压缩后模型去哪找细节、质量怎么兜底"；KC 的 changelog 恰好把这套细则全部公开过——机制同源（reserved_context_size 50K ≈ 现状 150K 阈值同构；micro compaction ≈ 任务 131③ 陈旧驱逐等价），细则可直接移植。
+    - **① 压缩笔记三件套格式标准**（侵入度低）：压缩摘要 prompt 从自由摘要改为结构化模板——【已定决策】【后续步骤】【可预见的障碍】三字段（KC v0.23.0 同款；其演进史正是"只记下一步 → 补三件套"，直接抄终点不抄弯路）；TodoList/看板注入段随摘要保留（KC v0.41.0 同款，#5 子项 2 已要求保留看板段，本条核实即可）。
+    - **② 压缩前后提示词纪律两件**（侵入度低，纯提示词）：
+      - **压缩前预算提醒**：触发压缩的那轮先给模型一次"自盘状态"的提示再生成摘要（KC v0.41.0 同款）——摘要质量的前置增益；
+      - **压缩后回灌指引**：压缩后系统提示内置"精确细节查 agent_events/session_history，历史轨迹 SQL 可查"（KC 压缩后指引"查阅会话事件日志"同款）——把 JIT 回灌做成内置纪律，补上 #20① 底账纪律的回灌端闭环，不靠钩子不靠模型自觉。
+    - **③ 压缩质量门两条**（侵入度低）：**无摘要重试**——压缩响应不含摘要块即重试一次（KC v0.3.0 同款）；摘要必须出现在压缩后的交接文本中（KC v0.15.0 同款）。**压缩事件留痕**——compaction 作为独立事件类型落 agent_events（KC wire 的 CompactionBegin 事件 vocabulary 同款；并入 #20② 事件 schema，不重复设计）。
+    - **④ 会话恢复三层连续体补中间层**（侵入度中；#17 增补）：BMA 复活路径现状两级——热驻池（分钟级 LRU）与领域档案（跨会话永久级，#17）；缺"会话 resume 时子 Agent 实例状态+上下文恢复"这一中间层（KC 官方明文：恢复会话还原子 Agent 实例状态与上下文历史）。动作：会话 resume 时对树中未终态/终态不久的 domain 实例按 (session_id, agent_id) 从 agent_messages/agent_tree_nodes 重建热驻槽或冷复活种子——#17 档案匹配管跨会话冷复活，本条管同会话内 resume，同一连续体两个入口。**边界**：只还原"落库数据已够"的会话历史，不新增持久化面（TODO#14 明确不做协作状态持久化的决策不破）。
+    - **⑤ thinking 压缩取舍 A/B**（侵入度低，eval 实验）：KC 默认跨轮保留 thinking（`[thinking] keep="off"` 可关）与 CC"压缩时丢弃重插轮次 thinking"是两家相反押注。BMA thinking 恢复后（#8 观察点）必然面对同一选择——两案各跑一轮 eval（#8 P2-1 UGit 基线现成），按"压缩后任务续跑准确率/一次通过率"数据拍板，不做理论判断；不引入 KC 的全局 keep 开关，拍板后按档/角色定。
+    - **⑥ KC 差距反向佐证（记档不实施）**：KC 无蒸馏记忆层（无 auto memory/MEMORY.md）、无 AGENTS.md per-directory 嵌套与 `paths:` 作用域、PreCompact 只观察不可拦——BMA 的 meta_memory（#20③）、沙箱面、#20② 的 auto 可拦设计在对应维度领先或更完整，本条仅作立项信心记录。另留两个观察点：KC `/import` 跨会话导入（CC 无；若 #17 跑通后仍有"整段历史搬运"需求再评）、wire 事件 vocabulary（若 agent_events 未来做事件回放可借鉴）。
+    - **端到端验收场景**：长集群档任务自然触发压缩——摘要三字段齐全、看板段保留、压缩后追问细节时模型主动查事件日志（真机观察）、compaction 事件编排页时间线可见；重启 resume 场景子域上下文还原（对照现状重启即失忆）；两案 thinking eval 数据留档。
+    - **风险与对策**：三件套模板增量 <200 token，相对 150K 阈值可忽略；压缩前自盘增加一轮 LLM 延迟——每会话低频发生且可用轻量模型跑摘要（llmDigestMerger 通路现成），收益 > 成本。
+    - **明确不做**：不重做压缩触发内核（阈值/reserved 余量沿用现状）；不给用户暴露 thinking keep 底层开关；不做跨会话 `/import` 命令（#17 种子注入已是受控版跨会话搬运）；不用 wire 事件 schema 重写 agent_events（只借事件类型枚举思路）。
+
+22. **ContextEngine 分档槽位（三档引擎分化 + 失败隔离 + announce 边界协议 + 展开式召回）**（2026-09-23 立项；依据当日对 OpenClaw ContextEngine 插件槽（docs.openclaw.ai + PR #22201）、Hermes 委派预算、LCM/lossless-claw 摘要 DAG 三家官方文档+源码的调研。与 #20（借 CC 纪律）、#21（借 KC 管线）同族姊妹篇：#20 借纪律、#21 借细则、本条借骨架）
+    - **动机**：现状一套压缩逻辑打三档——快速档要响应速度（纯裁剪就够）、日常档居中、集群档要长会话无损召回（摘要 DAG+按需展开）；"压缩误伤快速档体验"的老顾虑靠 if-else 补丁而非架构解。OpenClaw 2026.3.7 把 context engine 做成独占插件槽（ownsCompaction 契约 + 失败隔离 quarantine→降级 legacy），证明正路是把"引擎"做成可替换件；Hermes/LCM 给出三档各自的具体形态与数字。
+    - **① 引擎槽位与三档分化**（侵入度中）：定义 BMA ContextEngine 接口（assemble/compact/afterTurn/prepareSubagentSpawn/onSubagentEnded 五钩子，对标 OpenClaw 子集）按档装配——快速档=纯裁剪引擎（零 LLM：旧 tool result >200 字符→stub + 截断，Hermes Phase 1 同款）；日常档=safeguard 单摘要引擎（handoff 摘要 + qualityGuard，与 #20②/#21 合并落地）；集群档=LCM 式引擎（摘要 DAG：leaf 800–1,200 tok/condensed 1,500–2,000 tok、fanout 8/4、常驻 30–100K、大文件 >25K tok 外置换 ~200 tok 探查摘要）。配失败隔离：引擎异常/契约失败→隔离并降级日常档引擎，报错留痕不静默。
+    - **② announce 边界协议**（侵入度低-中，集群档子 agent 边界）：派发前上下文预算（对标父 fork 硬顶 100K，超限转 isolated 不硬灌）；子 agent minimal 提示词面（人格/用户画像不入子上下文）；回灌走规范化 announce（Result+Status+Notes+统计行）+ 逐级上灌纪律（DomainAgent 只见直接子级，跨域走黑板——与 #2 正交，不动 mailbox）；回灌预算公式（Hermes：静态封顶 vs 父剩余余量×0.5÷子数、floor 2K，取小）。
+    - **③ 记忆信任分层**（侵入度低，并入 #20③ 设计，不单独立项）：provenance 标记（untrusted 结构性禁止进 curated 层与自动注入）+ 召回循环防护（被召回内容结构标记、不再反向提取为新记忆）+ trigger 式注入（score 阈值 + 每轮上限 3 条）——上下文注入防泄漏的完整参照。
+    - **④ 展开式召回**（侵入度中，集群档长会话）：老段折 DAG 摘要挂黑板/会话，agent 遇摘要点派**只读**子 agent 沿链展开原文取细节（答案 ≤2K tok + delegation grant token cap + TTL + 结构性禁递归——子 agent 只持低层展开工具）；与既有 salvage 失败注入合成完整记忆环（失败主动重注 + 成功按需展开）。
+    - **顺序与依赖**：① 挂 #5 子项 2 压缩入口、快照/质量门与 #20②/#21①②③ 合并实施一次；② 独立可做，先于①的集群档部分见效；③ 随 #20③；④ 依赖 #17 档案与黑板，最后做。前置件：#5 子项 2 → #20①（归档）→ #20②/#21 → 本条①② → ④。
+    - **明确不做**：不做 OpenClaw 全 9 钩子总线（只取五钩子子集）；不做第三方引擎插件 SDK（先内部三档自用）；不做 LCM 全层级联（incrementalMaxDepth=1 够用）；不改 #14"不做协作状态持久化"决策；不替 #2 黑板两件剩余（mailbox 改造另案）。
+
+23. **决策层（DecisionLayer）抽象与六个切入点（Jev 范式：类型化决策 + 置信度分级 + 影子先行）**（2026-09-23 立项同日落地，实现见 `doc/变更.md` 2026-09-23 条；此处只记观察点与遗留。立场：学范式不接死外部 API——provider 可插拔、默认走现有 lightweight 模型通道；Jev 发布仅一周、数字为厂商自评，正确架构是带升级机制的级联而非替换）
+    - **核心原则（Jev 工程学翻译成本仓库纪律）**：硬规则（沙箱/配额/幂等/审批/终止条件/FailureKind errors.Is/salvage 防污染闸）永远留确定性代码；决策层只做灰区判断与建议；候选集由代码持有（结构性防幻觉）；按后果分级置信度阈值；影子先行、对拍达标才晋级强制；永远保留旁路（决策层故障=回退现状行为，不阻塞链路）。
+    - **① 抽象与接线**（侵入度低，零行为变更）：新包 `backend/internal/domain/decision`——`Decide(ctx, Request{State, Questions[]}) (Response{Answers}, error)`，三原语 Choice/Score/Noul，每答案带 confidence；provider 二实现：LLM 兜底（委托 `CallLightweightWithRetry` factory.go:835 + parseStrictJSON 严格解析——newIntentArbiter bootstrap.go:1099-1137 的"类型化输出+confidence<0.6 拒判"范式直接泛化）+ 外部 HTTP（TypeSafe 兼容，config.yaml 顶级 `decision:` 节，默认关）；模型槽位走 roles.yaml 新增 `decision_model:` 节（与 lightweight_model 平级，resolveBaseConfig 加 `case "decision"`，未配置回退 lightweight——白拿缓存/绑定/热更新/日志）；行为参数入 config.yaml agent: 节（`decision_shadow_enabled` 默认 true、`decision_timeout_sec`、per-决策点 thresholds）；消费侧注入照 WithFactExtractor 模式加 `WithDecisionLayer`。
+    - **② 影子模式与晋级机制**：agent_events 加 `type='decision_shadow'`（零 DDL——type 自由文本；role=决策点名、content=答案 JSON、input=实际路径取值、output=对照结果；调用日志走 session_logs Meta.layer=decision，logLightweightCall 同款）。晋级标准：单决策点影子对拍满 7 天或 ≥200 样本、准确率≥该点阈值且延迟达标，才允许该点切强制；逐点独立晋级，不做全量开关。
+    - **③ 六个切入点（按价值排序，行号为 2026-09-23 核实）**：
+      1. **任务级意图分诊**（现状空缺，价值最高）：挂 `sendMessageFull` 的 enhanceUserInput 同位（service_react.go:4073 前）——现有 prompt_enhance.go 四层管线只覆盖短指令 IntentKind，任务级意图无前置（MetaAgent 靠 meta_agent.go:30-41 提示词纪律硬解）。产出 Choice(任务性质=速答/单agent/多域编排)+Choice(所需工具面)+Noul(需澄清?)，低置信→触发 ask_user 而非硬猜；只做建议与澄清触发，不自动改档。
+      2. **失败处置路由**（现状只有一条硬规则）：挂点 runSubAgent:3871-3902 失败消息组装处与 runSubAgentWithAutoRetry:3952——除 auto-retry（kind=error+非 domain/meta+ctx 存活、仅重跑 1 次）外，重派/降级/收口/挂起的分支选择全交父 LLM，代码里无 kind 分派路由表。决策层出 Choice(retry/redelegate/escalate/suspend)+confidence，影子对拍父 LLM 实际选择；failureKindOf（:5062，纯 errors.Is）保持 rules-first 不动，决策层只做不可分类兜底。
+      3. **派发门灰区补充**：dispatchOne:3047-3056 规则簇之后——注意 checkRoleTaskFit（:2614，需求信号正则×roleHasTool）与 checkTaskPathsFit（:2669，路径×沙箱前缀比对）**已存在且为高置信硬拒**（2026-09-18/19 两轮修复产物），决策层只补规则覆盖不到的需求信号（needs_browser/needs_mcp/needs_vision 等灰区拦截建议），先影子。
+      4. **黑板摄取打分**：siblingUptakePipeline.Assemble（blackboard_uptake.go:98）Query 后 rank 前 + injectScopedRecall（dispatcher.go:6006）——现 topK=3 + outcome/复用/新近规则排序（rankBlockMemory:5940）、无独立 runes 预算，决策层做相关性 Score 筛选，影子对拍现有排序。
+      5. **沉淀门/打捞门省流**：saveBlockMemory:5761（hasSubstantiveChange 规则门保留为硬底）后加"值得提取"Noul 预判，省无效 LLM 提取调用；salvage.go:71 同款（kill 场景跳过已是规则版先例）。
+      6. **gear 档位建议（只读）**：gear_signals.go 已只落事件不改行为——决策层并行给档位建议落影子；**auto 自动选档 2026-09-16 已退役（gear.go:24），本期决策不破，永不做自动选档**；escalate_gear 用户确认卡流程不动。
+      - 顺带确认（#20② 数据源）：压缩后热改动重注入的最可靠数据源是 agent_events（append-only、tool_call 的 input JSON 含 path+occurred；lastWrites 内存 8 条即清、session_events 是快照语义，均不可靠），重放需直接 SQL 不走 Pipeline（LoadEvents 有 DefaultEventLimit）。
+    - **验收**：Phase A 影子期任意决策点可经 SQL 回答"决策层怎么想、实际怎么走、分歧多少"；decision provider 故障时链路零阻塞（超时/解析失败→回退现状行为）；Phase B 晋级点行为变化有前后对照数据。端到端：短模糊消息触发任务级分诊与澄清（而不是 MetaAgent 硬猜）；一次失败派生的处置建议与父 LLM 选择的对照行可查。
+    - **观察点（2026-09-23 落地后）**：①影子期各点分歧率（`SELECT role, output, count(*) FROM agent_events WHERE type='decision_shadow' GROUP BY 1,2`，mismatch/(match+mismatch)）——分歧率低的点优先晋级；②切入点 1/2 的"实际怎么走"离线对拍（手工关联 sub_agent_dispatch / mailbox 后续动作，未建视图）；③影子期 lightweight QPS 上升幅度（决策与摘要/提取共用槽位）；④enforce 点晋级后行为前后对照（Phase B 数据）。
+    - **遗留**：①对拍视图（决策行 ⋈ 实际路由/父选择）未建；②HTTP provider 仅形态兼容未联调真实端点（默认关）；③Phase B 晋级全靠人工改 config `decision_points.<point>.mode`（无自动晋级——对拍达标才允许，刻意不做自动开关）。
+    - **明确不做**：不接 TypeSafe 外网 API 为唯一依赖（默认 lightweight 兜底，外网 provider 默认关）；不做自动选档/自动派发；不替换任何硬规则；不动 #3 退役方向（探索预算/连杀指纹不复活）；不新增表（影子行复用 agent_events）。

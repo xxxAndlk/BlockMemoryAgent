@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/blockmemory/agent/backend/internal/board" // board 提供任务看板快照（TODO #22）
+	"github.com/blockmemory/agent/backend/internal/domain/decision"
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
@@ -143,6 +144,9 @@ type ReactService struct {
 	promptEnhanceTimeout time.Duration
 	// promptEnhanceMaxRunes L0 输入形态闸门长度上限（rune；<=0 用默认 30）。
 	promptEnhanceMaxRunes int
+	// decisionLayer 决策层（TODO #23）：①任务级意图分诊 + ⑥档位建议（只读影子）两个
+	// 消费切入点。nil=关闭（默认，测试场景零行为变化）；影子先行，对拍达标才逐点 enforce。
+	decisionLayer *decision.Layer
 	// stopMarker 会话软停止标记器（TODO #37，subagent.Dispatcher 实现）：
 	// Stop 先标记再触发子 Agent cancel，dispatcher 收尾分支据此刻意落 Paused/部分回灌。
 	// nil 时 Stop 退化为仅级联取消（无暂停语义）。
@@ -503,6 +507,69 @@ func (s *ReactService) SetPromptEnhanceLLM(enabled bool, arbiter IntentArbiter, 
 	s.promptEnhanceArbiter = arbiter
 	s.promptEnhanceTimeout = timeout
 	s.promptEnhanceMaxRunes = maxRunes
+}
+
+// SetDecisionLayer 注入决策层（TODO #23，消费侧照 WithFactExtractor 模式）。
+// 两个切入点：① sendMessageFull 任务级意图分诊（只做建议与澄清触发，不自动改档）、
+// ⑥ gear 档位建议（只读影子，永不做自动选档）。传 nil 关闭（默认）。
+func (s *ReactService) SetDecisionLayer(l *decision.Layer) {
+	s.decisionLayer = l
+}
+
+// decideTaskTriage ①任务级意图分诊（TODO #23 切入点1）：Choice(任务性质)+
+// Choice(所需工具面)+Noul(需澄清?)。低置信→建议先澄清而非硬猜；只做建议与
+// 澄清触发（返回建议前缀文本），不自动改档。影子期返回空串（GoObserve 异步落
+// 对拍行，零延迟税）；enforce 点同步取建议。失败 fail-open 返回空串。
+func (s *ReactService) decideTaskTriage(ctx context.Context, sessionID, content string) string {
+	if s.decisionLayer == nil {
+		return ""
+	}
+	qs := decision.TaskTriageQuestions(content)
+	req := decision.Request{State: "任务级意图分诊", Questions: qs}
+	anyEnforce := s.decisionLayer.EnforceMode(decision.PointIntentKind) ||
+		s.decisionLayer.EnforceMode(decision.PointToolFace) ||
+		s.decisionLayer.EnforceMode(decision.PointNeedClarify)
+	if !anyEnforce {
+		// 影子期异步观测：MetaAgent 实际路由（速答/单/多域）离线经 sub_agent_dispatch
+		// 事件关联补对拍（actual 留空 → pending）。
+		s.decisionLayer.GoObserve(ctx, sessionID, req, nil)
+		return ""
+	}
+	resp, err := s.decisionLayer.Decide(ctx, req)
+	if err != nil {
+		return ""
+	}
+	for _, ans := range resp.Answers {
+		s.decisionLayer.Observe(ctx, sessionID, "", ans)
+	}
+	nature, ok1 := resp.AnswerOf("task_nature")
+	face, ok2 := resp.AnswerOf("tool_face")
+	clar, ok3 := resp.AnswerOf("need_clarify")
+	// 低置信→触发澄清而非硬猜：need_clarify 判 yes 或整批置信低于门槛时，
+	// 建议先 ask_user 澄清；其余情况给分诊建议。永不改档。
+	if ok3 && s.decisionLayer.ShouldEnforce(decision.PointNeedClarify, clar.Confidence) && clar.Value == "yes" {
+		return fmt.Sprintf("【决策层分诊】任务意图存在关键缺口（置信 %.2f），建议先调用 ask_user 澄清目标/范围/验收标准再开工，勿硬猜", clar.Confidence)
+	}
+	if ok1 && s.decisionLayer.ShouldEnforce(decision.PointIntentKind, nature.Confidence) {
+		advice := "【决策层分诊】任务性质=" + nature.Value
+		if ok2 && s.decisionLayer.ShouldEnforce(decision.PointToolFace, face.Confidence) {
+			advice += "，所需工具面=" + face.Value
+		}
+		return fmt.Sprintf("%s（置信 %.2f）", advice, nature.Confidence)
+	}
+	return ""
+}
+
+// gearHintShadow ⑥档位建议（只读影子，TODO #23 切入点6）：与 T18 隐性信号并行给
+// 档位建议落影子对拍（suggestion vs 当前实际档位）。**永不做自动选档**——auto 档
+// 2026-09-16 已退役，本切入点不破该决策；escalate_gear 用户确认卡流程不动。
+func (s *ReactService) gearHintShadow(ctx context.Context, sessionID, content, currentGear string) {
+	if s.decisionLayer == nil {
+		return
+	}
+	req := decision.Request{State: "档位建议（只读）", Questions: []decision.Question{decision.GearHintQuestion(content)}}
+	// 对拍值=会话当前实际档位（同步已知，match/mismatch 即时可算）。
+	s.decisionLayer.GoObserve(ctx, sessionID, req, func(decision.Answer) string { return currentGear })
 }
 
 // enhanceUserInput 对用户输入做意图分类 + 消歧绑定（TODO #36 Phase 0 规则版 + #39 四层管线）。
@@ -4070,6 +4137,13 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	// askUser/approval 澄清答复分支在上面已提前返回，不经过补全（答复非新任务）。
 	// 判定路径备注暂存，待 store.mu 释放后落 Prompt 事件（addEvent 自身要加锁，
 	// 持锁调用会死锁——approval 分支同款模式），便于复盘误判率与 L2 调用率（TODO #39 可观测性）。
+	// 决策层①任务级意图分诊（TODO #23 切入点1）：四层管线只覆盖短指令 IntentKind，
+	// 任务级意图无前置——决策层补 Choice(任务性质)+Choice(工具面)+Noul(需澄清?)。
+	// 只做建议与澄清触发（建议前缀并入 content），不自动改档；影子期异步零延迟。
+	triageAdvice := s.decideTaskTriage(ctx, sessionID, content)
+	if triageAdvice != "" {
+		content = content + "\n\n" + triageAdvice
+	}
 	content, enhanceNote := s.enhanceUserInput(ctx, sessionID, content)
 
 	// 将用户消息追加到会话消息列表。
@@ -4104,6 +4178,9 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	// T18 选档误判信号①（只落事件不改行为）：快速档 + 上一 run 终态 ≤5min + 行动动词
 	// ——疑似"工作活进了快速档"。数据锁内取（EndedAt 在下方被清），事件锁外落。
 	gearSignalDetail := gearSignalOnSend(session.currentGear(), session.EndedAt, content)
+	// 决策层⑥档位建议（只读影子，TODO #23 切入点6）：与 T18 信号并行落对拍行，
+	// 永不做自动选档（auto 退役决策不破）。数据锁内取当前档位，异步观测。
+	s.gearHintShadow(ctx, sessionID, content, session.currentGear())
 	// 如果不在运行，则重新置为运行状态，清除结束时间，并重建上下文。
 	if !wasRunning {
 		session.Status = enums.SessionStatusRunning

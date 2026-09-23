@@ -120,7 +120,7 @@ createMu 锁 → 同 goal running 查重（findRunningDuplicateSession:299）→
 1. `askUser != nil` → 选项解析 recordClarifyAnswer → 写通道 + Messages 追加 `[澄清答复]`；
 2. `askUserBatch != nil` → 拒（引导面板，ErrInvalidSessionState）；
 3. `approval != nil` → resolveApproval 写通道；
-4. 常规 → `enhanceUserInput`（输入补全）→ Messages 追加 → ResetReadHistory + ResetDispatchCounts + ArmIdleTTLs → 非 running 置 running + restartSessionContext → 信号①计算 → 锁外落 Prompt/信号事件 → `cancelSoftStopState`（软停窗口内任意消息=续跑意图）→ UserMessage 事件 → **wasRunning 则邮箱注入**（主循环不读 Messages，唯一触达是邮箱）→ 非 running 则 persist + persistHistory → ResumeSessionAgents → PausedOnChild 且 waker 未接线时 resumePausedDomain → `go resumeSession`。
+4. 常规 → **决策层①任务级意图分诊**（decideTaskTriage，2026-09-23 TODO #23 切入点1：Choice 任务性质 quick/single/multi + Choice 工具面 none/read/write/exec + Noul 需澄清?；低置信→建议先 ask_user 澄清而非硬猜；只做建议与澄清触发——建议前缀并入 content，**不自动改档**；影子期 GoObserve 异步零延迟税）→ `enhanceUserInput`（输入补全）→ Messages 追加 → ResetReadHistory + ResetDispatchCounts + ArmIdleTTLs → 非 running 置 running + restartSessionContext → 信号①计算 + **决策层⑥档位建议只读影子**（gearHintShadow，与 T18 信号并行落对拍行，actual=当前档位；**永不做自动选档**）→ 锁外落 Prompt/信号事件 → `cancelSoftStopState`（软停窗口内任意消息=续跑意图）→ UserMessage 事件 → **wasRunning 则邮箱注入**（主循环不读 Messages，唯一触达是邮箱）→ 非 running 则 persist + persistHistory → ResumeSessionAgents → PausedOnChild 且 waker 未接线时 resumePausedDomain → `go resumeSession`。
 
 ### runSession（:3009）
 
@@ -196,6 +196,8 @@ persist running → `resolveGearMetaRole` → `mountTopLevelEssentials`（插件
 - 落库 MetaMemory JSONB 双键 gear+thinking；恢复 `thinkingFromMetaMemory`（:894）。
 
 **信任模式**：`suggest|auto-edit|full-auto`，同 atomic 模式；runCtx 经 `tool.WithTrustModeFunc` 实时读。
+
+**决策层消费面（2026-09-23 TODO #23）**：`SetDecisionLayer` 注入 `domain/decision.Layer`（nil=关闭零行为）。本服务持两个切入点——①任务级意图分诊（decideTaskTriage，sendMessageFull enhanceUserInput 同位，只做建议与澄清触发不自动改档）与⑥档位建议只读影子（gearHintShadow，与 T18 隐性信号并行；永不做自动选档，auto 退役决策不破）。影子行落 `agent_events type=decision_shadow`，晋级按点切 enforce（config agent.decision_points）。
 
 ## 3.10 周边文件
 

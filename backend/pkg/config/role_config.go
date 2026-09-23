@@ -25,6 +25,9 @@ type RoleConfigFile struct {
 	// LightweightModel 轻量模型配置，用于历史总结/检索 query 改写等低开销任务。
 	// 与 MetaAgent/DomainAgent 模型解耦，可指向更便宜更快的模型（如 deepseek-v4-lite）。
 	LightweightModel types.AgentModelConfig `yaml:"lightweight_model"`
+	// DecisionModel 决策层模型配置（TODO #23）：灰区判断/建议用的极小调用面。
+	// 未配置时回退 lightweight_model——白拿缓存/绑定/热更新/日志（同一 resolveConfig 链）。
+	DecisionModel types.AgentModelConfig `yaml:"decision_model"`
 	// Embed 文本嵌入模型配置（已从 config.yaml 迁移到 roles.yaml）。
 	Embed types.EmbedConfig `yaml:"embed"`
 	// FixedRoles 固定角色定义列表，对应 fixed_roles 配置项。
@@ -142,6 +145,10 @@ func (c *RoleConfigFile) resolveEnvVars() {
 	c.LightweightModel.Model = resolveEnv(c.LightweightModel.Model)
 	c.LightweightModel.APIKey = resolveEnv(c.LightweightModel.APIKey)
 	c.LightweightModel.BaseURL = resolveEnv(c.LightweightModel.BaseURL)
+	// 决策层模型配置: 模型名/密钥与 BaseURL。
+	c.DecisionModel.Model = resolveEnv(c.DecisionModel.Model)
+	c.DecisionModel.APIKey = resolveEnv(c.DecisionModel.APIKey)
+	c.DecisionModel.BaseURL = resolveEnv(c.DecisionModel.BaseURL)
 	// 文本嵌入模型配置: 密钥与 BaseURL。
 	c.Embed.APIKey = resolveEnv(c.Embed.APIKey)
 	c.Embed.BaseURL = resolveEnv(c.Embed.BaseURL)
