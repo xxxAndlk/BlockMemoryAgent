@@ -1,6 +1,6 @@
 package tool
 
-// destructive.go 破坏性工具分级 + 生产边界确认（TODO #17 P1，AICP「破坏性操作权限隔离」轻量版）。
+// destructive.go 破坏性工具分级 + 生产边界确认（AICP「破坏性操作权限隔离」轻量版）。
 //
 // 分级：
 //   - 工具静态标记：WriteFile 实现 DestructiveTool 接口（Destructive()=true）。
@@ -16,6 +16,8 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 )
 
 // DestructiveTool 是工具的可选接口：标记该工具为破坏性操作（不可逆 / 影响共享状态）。
@@ -105,10 +107,7 @@ func ApprovalMessage(toolName string, args map[string]any) string {
 	return "【需确认】" + desc + "，且当前处于生产环境/命中危险命令模式。回复「确认」执行，「拒绝」取消；其余答复按拒绝处理。"
 }
 
+// truncate 按 rune 数截断并追加省略号（textutil 单源）。
 func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n]) + "…"
+	return textutil.TruncateRunes(s, n, "…")
 }

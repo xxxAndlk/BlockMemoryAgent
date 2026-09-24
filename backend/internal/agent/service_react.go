@@ -1656,7 +1656,7 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 	}
 }
 
-// ApprovalHook 返回破坏性操作的用户确认回调（TODO #17 P1 生产边界确认）。
+// ApprovalHook 返回破坏性操作的用户确认回调（生产边界确认）。
 // 由 bootstrap 注入 tool.Registry.SetApprovalHook；仅对命中边界的调用触发。
 //
 // 流程：置 PendingClarify + 会话暂停（awaiting_clarify）+ 推 clarify 事件 → 阻塞等用户答复
@@ -4136,7 +4136,7 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 		return fmt.Errorf("%w: 批量提问待答复，请在问答面板逐题作答后一次性提交", ErrInvalidSessionState)
 	}
 
-	// 待审批的破坏性操作（TODO #17 P1；#53 选项化）：答复路由进审批通道。
+	// 待审批的破坏性操作（##53 选项化）：答复路由进审批通道。
 	// Agent goroutine 存活，不重建会话不 resume（避免双跑）；答复不进入 LLM 对话历史，
 	// 由工具结果带回 ReAct 循环。confirm 选项命中（confirm/reject/数字序号）直接裁决，
 	// 否则 parseApproval 关键词兑底（fail-closed：不明确即拒绝）。
@@ -4387,7 +4387,7 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 		s.store.addEvent(session, eventkind.Clarify, "User", "提问答复: "+answer, "", "", "", "", "", true)
 		return nil
 	}
-	// 待审批的破坏性操作确认（TODO #17 P1；#53 选项化）：答复路由进审批通道，不重建会话（Agent goroutine 存活）。
+	// 待审批的破坏性操作确认（##53 选项化）：答复路由进审批通道，不重建会话（Agent goroutine 存活）。
 	if session.approval != nil {
 		_, _ = recordClarifyAnswer(session.pendingClarify, answer)
 		session.approval <- resolveApproval(answer, session.pendingClarify)

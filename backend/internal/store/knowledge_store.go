@@ -98,37 +98,6 @@ func (s *KnowledgeStore) UpdateContentEmbedding(ctx context.Context, id int64, c
 	return err
 }
 
-// GetByType 按知识类型列出记录 (按最近访问时间倒序)。
-// 参数:
-//   - ctx: 请求上下文。
-//   - knowledgeType: 例如 "playbook"/"postmortem"
-//   - limit: 返回上限,<=0 时默认 10
-//
-// 返回: 知识记录切片与 SQL 错误。
-// 设计意图: 排除已归档记录,优先返回热数据。
-func (s *KnowledgeStore) GetByType(ctx context.Context, knowledgeType string, limit int) ([]*types.KnowledgeRecord, error) {
-	if limit <= 0 {
-		// 兜底默认值，防止因 limit 非法导致 SQL 报错
-		limit = 10
-	}
-	// 查询未归档记录，按最近访问时间倒序，NULL 排最后
-	rows, err := s.db.QueryContext(ctx, `
-			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
-			FROM global_knowledge
-			WHERE knowledge_type = $1 AND archived = false
-			ORDER BY last_accessed DESC NULLS LAST
-			LIMIT $2
-		`, knowledgeType, limit)
-	if err != nil {
-		return nil, err
-	}
-	// 确保结果集关闭，避免连接泄漏
-	defer rows.Close()
-
-	// 复用统一的行扫描逻辑
-	return s.scanKnowledgeRows(ctx, rows)
-}
-
 // ListIndexEntries 返回沉淀索引槽的一行式条目（TODO #20③+#22③）：
 // 全类型未归档记录按 (last_accessed DESC NULLS LAST, created_at DESC) 取 limit 条，
 // 供会话启动渲染【沉淀索引】。含 untrusted 围栏的行由调用方过滤（provenance 门）。
@@ -148,96 +117,6 @@ func (s *KnowledgeStore) ListIndexEntries(ctx context.Context, limit int) ([]*ty
 	}
 	defer rows.Close()
 	return s.scanKnowledgeRows(ctx, rows)
-}
-
-// Search 向量相似搜索 (依赖 pgvector)。
-// 参数:
-//   - ctx: 请求上下文。
-//   - embedding: 查询向量
-//   - topK: 返回前 K 条,<=0 时默认 5
-//
-// 返回: 按相似度 (L2 距离) 升序的知识记录切片。
-// 注意: <=> 是 pgvector 的距离算子,值越小越相似。
-func (s *KnowledgeStore) Search(ctx context.Context, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
-	if topK <= 0 {
-		// 兜底默认值
-		topK = 5
-	}
-	// 使用 L2 距离算子 <=> 排序，未归档记录中搜索最相似的 topK 条
-	rows, err := s.db.QueryContext(ctx, `
-			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
-			FROM global_knowledge
-			WHERE archived = false
-			ORDER BY embedding <=> $1
-			LIMIT $2
-		`, pgVector(embedding), topK)
-	if err != nil {
-		return nil, err
-	}
-	// 确保结果集关闭
-	defer rows.Close()
-
-	return s.scanKnowledgeRows(ctx, rows)
-}
-
-// SearchByTypeAndDomain 按 knowledge_type 与 meta->>'domain' 双重过滤的向量相似搜索。
-// 职责：先按类型和领域精确过滤，再在过滤后的结果中按 pgvector 余弦距离排序取 topK，
-// 避免不同领域块记忆之间的串扰。
-//
-// 参数：
-//   - ctx：请求上下文。
-//   - knowledgeType：必填过滤条件（如 KnowledgeTypeBlockMemory）
-//   - domain：meta->>'domain' 精确匹配值
-//   - embedding：查询向量
-//   - topK：返回上限
-//
-// 返回: 按相似度排序的知识记录切片与错误。
-func (s *KnowledgeStore) SearchByTypeAndDomain(ctx context.Context, knowledgeType enums.KnowledgeType, domain string, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
-	if topK <= 0 {
-		topK = 5
-	}
-	// pgvector 检索可能因数据量大或索引失效而变慢，加独立超时防止阻塞主流程
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	// 双重过滤：类型 + 领域，再按向量距离排序
-	rows, err := s.db.QueryContext(ctx, `
-			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
-			FROM global_knowledge
-			WHERE archived = false AND knowledge_type = $1 AND meta->>'domain' = $2
-			ORDER BY embedding <=> $3
-			LIMIT $4
-		`, knowledgeType, domain, pgVector(embedding), topK)
-	if err != nil {
-		return nil, err
-	}
-	// 确保结果集关闭
-	defer rows.Close()
-	return s.scanKnowledgeRows(ctx, rows)
-}
-
-// SearchBlockMemory 按 domain 过滤后再语义匹配检索块记忆。
-// 先通过 meta->>'domain' 做精确过滤，再在过滤后的结果中按向量相似度排序，
-// 避免不同领域块记忆之间的串扰。
-// 参数:
-//   - ctx: 请求上下文。
-//   - domain: 领域标识。
-//   - goal:   目标文本，用于生成查询向量。
-//   - topK:   返回上限。
-//
-// 返回: 知识记录切片与错误。
-func (s *KnowledgeStore) SearchBlockMemory(ctx context.Context, domain, goal string, topK int) ([]*types.KnowledgeRecord, error) {
-	if topK <= 0 {
-		topK = 5
-	}
-	// 组合 domain 与 goal 生成查询文本，提升语义匹配精度
-	query := fmt.Sprintf("领域:%s\n目标:%s", domain, goal)
-	// 调用 PostgresStore.Embed 将查询文本转为向量（支持外部 embedder 回退）
-	emb, err := s.pg.Embed(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("embed query: %w", err)
-	}
-	// 复用 SearchByTypeAndDomain 完成类型+领域过滤的向量检索
-	return s.SearchByTypeAndDomain(ctx, enums.KnowledgeTypeBlockMemory, domain, emb, topK)
 }
 
 // SearchBlockMemoryByGoal 按 sessionID 过滤后做语义匹配检索块记忆。
@@ -305,7 +184,7 @@ func (s *KnowledgeStore) SearchBlockMemoryCrossSession(ctx context.Context, excl
 	return s.scanKnowledgeRowsWithScore(ctx, rows)
 }
 
-// Query 黑板模式（TODO #42）scope 确定性检索：按 session_id + parent_id + task_domain
+// Query 黑板模式scope 确定性检索：按 session_id + parent_id + task_domain
 // 精确过滤块记忆，替纯语义召回的"按兄弟真实 scope 取切片"。在 SearchBlockMemoryByGoal
 // 语义召回之上叠加 scope 过滤--兄弟产出按 scope 共享，每个 Agent 只取自己 scope 的切片，
 // 避免 mailbox 全量广播的上下文互染。
@@ -479,22 +358,6 @@ func (s *KnowledgeStore) ListAll(ctx context.Context) ([]*types.KnowledgeRecord,
 	return s.scanKnowledgeRows(ctx, rows)
 }
 
-// IncrementAccessCount 自增访问计数并刷新最近访问时间。
-// 参数:
-//   - ctx: 请求上下文。
-//   - id: 知识记录主键
-//
-// 返回: SQL 执行错误。
-// 设计意图: 配合 GetByType 的排序,实现简单的热度衰减。
-func (s *KnowledgeStore) IncrementAccessCount(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `
-			UPDATE global_knowledge
-			SET access_count = access_count + 1, last_accessed = NOW()
-			WHERE id = $1
-		`, id)
-	return err
-}
-
 // BumpReuse 递增知识记录的 Meta.reuse_count（JSONB 就地更新，缺省 0），
 // 并同步刷新 last_accessed（召回命中 = 一次使用，归档判定据此延缓）。
 // 供块记忆召回侧价值反馈闭环使用：召回命中后标记复用次数，下次排序按 reuse_count 降序。
@@ -573,7 +436,7 @@ func (s *KnowledgeStore) scanKnowledgeRowsWithScore(ctx context.Context, rows *s
 	return results, rows.Err()
 }
 
-// SearchKeywords 按 knowledge_type 过滤的全文关键词检索（TODO #27 外部知识库混合检索）。
+// SearchKeywords 按 knowledge_type 过滤的全文关键词检索（外部知识库混合检索）。
 // 使用生成列 content_tsv（to_tsvector('simple', content)，见 schema.go）做 tsvector 匹配，
 // 按 ts_rank 相关度排序取 topK。中文分词需部署 zhparser/pg_jieba 后把 'simple' 换 'zhparser'
 //（retriever 文档备注）；'simple' 对英文/代码/数字词元已可用。

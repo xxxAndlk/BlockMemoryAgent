@@ -22,6 +22,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 )
 
 // SpecSlot 是 WriteSpec 写入的默认 slot 名。
@@ -91,7 +93,7 @@ type Spec struct {
 	// integration 触发入口引用图探针、visual 强制截图回显证据（缺则落 delivered-unverified）。
 	// 可空=不强制额外层级（默认存在性+静态）。
 	VerifyLevels []string `json:"verify_levels,omitempty"`
-	// Contract 跨域引用协议（TODO #57）：机器可校验的集成点清单，可空。
+	// Contract 跨域引用协议：机器可校验的集成点清单，可空。
 	// dispatcher 在兄弟域全完成后跑静态契约检查器逐条核对。
 	Contract *Contract `json:"contract,omitempty"`
 	// Probes 运行时探针声明（TODO #67 runtime 层）：探针操作序列的散文描述
@@ -351,7 +353,7 @@ type writeSpecInput struct {
 	// Key 命名槽位（TODO #65 多 key 化）：可空（默认 spec，全兄弟共享一份）。
 	// 多领域任务建议按领域名各写一份（key=领域名），兄弟各持各的、staleness 互不误伤。
 	Key string `json:"key" description:"命名槽位（默认 spec）。多领域任务按领域名各写一份（key=领域名）可隔离 staleness；同 key 写入覆盖前值。key 必须与 call_sub_agent 的 domain 参数一致（dispatcher 按 domain 查键）。可空。"`
-	// Contract 跨域契约（TODO #57）：多域任务必须填写机器可校验的集成点清单。
+	// Contract 跨域契约：多域任务必须填写机器可校验的集成点清单。
 	// dispatcher 在全部兄弟域完成后自动跑静态契约检查，违例按文件归属打回责任域。
 	// 四类条目均可空；单域/无跨域引用任务整个 contract 可空。
 	Contract *Contract `json:"contract" description:"跨域契约（多域任务填写）：symbols=跨域符号映射（symbol 声明于 file，refs 列引用方文件）；dom_ids=DOM 元素 id 清单；scripts=script 加载顺序；signatures=跨域函数签名（signature 文本必须出现在 file 中，只写代码文本、禁全角标点/中文注解）。dispatcher 机器校验用，零 LLM；单域任务可空。"`
@@ -475,14 +477,9 @@ func writeBaselineFiles(workDir string, items []BaselineContentItem) ([]string, 
 	return rel, nil
 }
 
-// truncateRunesForLog 按 rune 数截断字符串并追加省略号，用于日志输出。
-// 与 dispatcher.truncateRunes 同语义，独立保留避免跨包依赖。
+// truncateRunesForLog 按 rune 数截断字符串并追加省略号，用于日志输出（textutil 单源）。
 func truncateRunesForLog(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n]) + "…"
+	return textutil.TruncateRunes(s, n, "…")
 }
 
 // parseAcceptanceArg 从 args["acceptance"] 提取验收条目（TODO #68 双形态）：

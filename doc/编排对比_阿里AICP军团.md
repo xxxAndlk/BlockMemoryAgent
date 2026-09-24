@@ -170,14 +170,16 @@ A2A 协议、Registry 心跳、外部 Agent 独立部署，是为跨团队协作
 
 ## 5. 落地建议（按优先级）
 
-| 优先级 | 项 | 改动点 | 估算 |
-|---|---|---|---|
-| **P0** | 块记忆加 `outcome`/`reuse_count`，召回按价值排序（3.1） | `dispatcher.go:1373` saveBlockMemory 写字段、`:1450` injectRecalledMemory 排序 | 小 |
-| **P0** | 子 Agent 心跳检活，早发现卡死（3.2） | ReActAgent 加活动时间戳，Dispatcher 巡检 goroutine | 中 |
-| **P1** | 共享记忆 slot 写入方校验（3.3） | SharedMemory 写入加 caller 校验，file_tree 单写多读 | 小 |
-| **P1** | 破坏性工具分级 + 生产环境命令用户确认（3.4） | 工具元数据加 destructive 标记，liveFn 推确认事件 | 中 |
-| **P2** | 固定流程状态机工具化（3.5） | 仅在实证失控流程出现时仿 verify_and_fix 抽工具 | 按需 |
-| **P2** | AgentCard + A2A（3.6） | 仅当开放外部 Agent 接入时，RoleDefinition 扩展 AgentCard | 按需 |
+> **状态复核（2026-09-24）**：P0/P1 四项已全部落地（详见 `doc/变更.md` 任务 5-14 与 `doc/技术逻辑/06-记忆与检索.md`、`11-运行时组件.md`）；P2 两项维持"按需"，均未做（理由不变）。
+
+| 优先级 | 项 | 改动点 | 估算 | 状态 |
+|---|---|---|---|---|
+| **P0** | 块记忆加 `outcome`/`reuse_count`，召回按价值排序（3.1） | `saveBlockMemory` 写字段、召回侧排序 | 小 | ✅ 已落地（`rankBlockMemory` outcome/复用/新近三级排序） |
+| **P0** | 子 Agent 心跳检活，早发现卡死（3.2） | ReActAgent 活动证据 + Dispatcher 巡检 | 中 | ✅ 已落地（`dispatcher.ensurePatrol`/`scanStuck` + activityEvidence，任务 112/115 两修；退役条件见 TODO #3） |
+| **P1** | 共享记忆 slot 写入方校验（3.3） | SharedMemory 写入加 caller 校验，file_tree 单写多读 | 小 | ✅ 已落地（MD frontmatter agent/owner 溯源 + 路径失效链） |
+| **P1** | 破坏性工具分级 + 生产环境命令用户确认（3.4） | 工具元数据加 destructive 标记，liveFn 推确认事件 | 中 | ✅ 已落地（`DestructiveTool` 接口 + production_workdir 审批链） |
+| **P2** | 固定流程状态机工具化（3.5） | 仅在实证失控流程出现时仿 verify_and_fix 抽工具 | 按需 | 未做（按需） |
+| **P2** | AgentCard + A2A（3.6） | 仅当开放外部 Agent 接入时，RoleDefinition 扩展 AgentCard | 按需 | 未做（#23 决策：无跨团队接入需求前不引入） |
 
 **不 adopt**：9 层固定分层（4.1）、纯状态机主循环（4.2）、黑板替代 mailbox（4.3）、全局双签（4.4）、三道安全闸门（4.5）、完整权重飞轮（4.6）、无外部需求时的 A2A（4.7）。
 

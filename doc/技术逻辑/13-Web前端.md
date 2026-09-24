@@ -200,19 +200,19 @@
 15. **`has_more` 是前端推断值**（取满即视为可能还有；afterSeq 模式恒 false）。
 16. **SSE 重连自理**：done 后不置 closed 靠 `online && es` 巧合拦住重连（改 onVisible 守卫会引出"完成后反复重连"）。
 17. **ExecutionLog 进度条仍认旧完成合同**（口径已漂移）。
-18. **复活重跑后增量游标失效**（2026-09-17 修复）：终态节点 ReviveWithMessage 同 ID 重跑会清空热层并从 0 重编 seq，前端 `after_seq` 增量此后取不到任何东西、面板停在旧内容——agent messages 响应补 `run_id`（单调递增，权威判据）与 `hot_max_seq`（兜底）；后端同时在复活前 DeleteMessages 作废旧 run 终态快照（防 PG 兜底把旧消息续上来）。
-18. **SkillSet.vue 是死代码**；`filterTurnForConcise`/`isLLMEvent`/`esc`/`sameDir`/`fmtTime` 无引用；`fmtDateTime` 与 `fmtDate` 实现逐字相同；`healthPollInterval` 死配置。
-19. **FilePreview 的"VS Code 打开/下载"是空按钮**。
-20. **artifact 路径全部工作区相对**（workspaceUrl 逐段 encode 保斜杠；HTML 相对引用可解析）；inferArtifactsFromOutput 只认 `.bma/` 下五个产物目录。
-21. **SubAgentList 旧事件回退匹配要求唯一**（并列宁可不显示状态）。
-22. **ChatHeader 销毁倒计时本地 1s timer**；destroy_at 非空时三个控制按钮全隐藏。
-23. **ChatInput 档位/思考 localStorage 只在未绑定会话时读写**；绑定后即时 POST。
-24. **吸底阈值 80px**；onMounted 双帧滚底防异步撑高。
-25. **ThinkChain 的 expanded 必须整体替换 Set**（ref 不追踪 Set 内部变更）。
-26. **状态字典需与后端全量对齐**（SubAgentList 9 态 / OrchMiniCanvas 色点）；新增状态不补映射会显示英文原值。
-27. **图标白名单制**：`MoreFilled` 不在 main.ts 注册列表 → WorkDirTree ⋯ 触发器视觉上隐形（可点但看不见）。
-28. **`fetchJson` 200 也 json()**；传 headers 会替换 Content-Type。
-29. **UI 无鉴权注入**：auth_enabled 后整体不可用。
-30. **notifications.ts 的 tag 是固定常量**（`bma-session-done`）→ 多会话完成互相顶掉；触发四重闸门（Notification 存在 ∧ granted ∧ document.hidden ∧ 终态）；`cancelled` 不在 SessionStatus 类型里但通知层认它。
-31. **监控页过滤行布局约定**：会话页监控面板实测只有 600-800px 宽，而 Element Plus 的 `.el-input/.el-select` `width:100%` 会顶掉 Tailwind `w-*`（flex 基准=整行宽，挤压时把下拉压成光杆箭头、徽标盖住标签）。约定：过滤行控件一律「定宽包装 div + `!w-full`」，分组 `shrink-0`，弹性交给搜索框（`flex-1 min-w-[160px] max-w-[256px] ml-auto`），整行 `flex-wrap` 兜底；锁定徽标 `max-w-[220px] truncate` + `title`。
-32. **首页会话列表口径**：`GET /api/sessions` 返回轻量 `sessionSummary`（去 events/messages）；`?limit=` 缺省 200 上限 1000，首页显式 1000；**上限内计数真实、超过 1000 页脚提示"仅显示最近 1000 条"**——历史事故：不传 limit 被 200 截断导致"删除没生效"错觉。
+18. **复活重跑后增量游标失效**（2026-09-17 修复）：终态节点 ReviveWithMessage 同 ID 重跑会清空热层并从 0 重编 seq，前端 `after_seq` 增量此后取不到任何东西、面板停在旧内容——agent messages 响应补 `run_id`（单调递增，权威判据）与 `hot_max_seq`（兜底）；后端同时在复活前 **ArchiveMessages**（原 DeleteMessages，物理删 → #20① 起改归档 `archived=true`）作废旧 run 终态快照（防 PG 兜底把旧消息续上来）。
+19. **SkillSet.vue 是死代码**；`filterTurnForConcise`/`isLLMEvent`/`esc`/`sameDir`/`fmtTime` 无引用；`fmtDateTime` 与 `fmtDate` 实现逐字相同；`healthPollInterval` 死配置。
+20. **FilePreview 的"VS Code 打开/下载"是空按钮**。
+21. **artifact 路径全部工作区相对**（workspaceUrl 逐段 encode 保斜杠；HTML 相对引用可解析）；inferArtifactsFromOutput 只认 `.bma/` 下五个产物目录。
+22. **SubAgentList 旧事件回退匹配要求唯一**（并列宁可不显示状态）。
+23. **ChatHeader 销毁倒计时本地 1s timer**；destroy_at 非空时三个控制按钮全隐藏。
+24. **ChatInput 档位/思考 localStorage 只在未绑定会话时读写**；绑定后即时 POST。
+25. **吸底阈值 80px**；onMounted 双帧滚底防异步撑高。
+26. **ThinkChain 的 expanded 必须整体替换 Set**（ref 不追踪 Set 内部变更）。
+27. **状态字典需与后端全量对齐**（SubAgentList 9 态 / OrchMiniCanvas 色点）；新增状态不补映射会显示英文原值。
+28. **图标白名单制**：`MoreFilled` 不在 main.ts 注册列表 → WorkDirTree ⋯ 触发器视觉上隐形（可点但看不见）。
+29. **`fetchJson` 200 也 json()**；传 headers 会替换 Content-Type。
+30. **UI 无鉴权注入**：auth_enabled 后整体不可用。
+31. **notifications.ts 的 tag 是固定常量**（`bma-session-done`）→ 多会话完成互相顶掉；触发四重闸门（Notification 存在 ∧ granted ∧ document.hidden ∧ 终态）；`cancelled` 不在 SessionStatus 类型里但通知层认它。
+32. **监控页过滤行布局约定**：会话页监控面板实测只有 600-800px 宽，而 Element Plus 的 `.el-input/.el-select` `width:100%` 会顶掉 Tailwind `w-*`（flex 基准=整行宽，挤压时把下拉压成光杆箭头、徽标盖住标签）。约定：过滤行控件一律「定宽包装 div + `!w-full`」，分组 `shrink-0`，弹性交给搜索框（`flex-1 min-w-[160px] max-w-[256px] ml-auto`），整行 `flex-wrap` 兜底；锁定徽标 `max-w-[220px] truncate` + `title`。
+33. **首页会话列表口径**：`GET /api/sessions` 返回轻量 `sessionSummary`（去 events/messages）；`?limit=` 缺省 200 上限 1000，首页显式 1000；**上限内计数真实、超过 1000 页脚提示"仅显示最近 1000 条"**——历史事故：不传 limit 被 200 截断导致"删除没生效"错觉。

@@ -1,6 +1,6 @@
 package retriever
 
-// rrf.go 实现 TODO #27 混合检索的 RRF（Reciprocal Rank Fusion）融合排序：
+// rrf.go 实现 混合检索的 RRF（Reciprocal Rank Fusion）融合排序：
 // 向量检索与全文关键词检索各自召回 topK，按 1/(k+rank) 加权融合，去重保序。
 
 import (

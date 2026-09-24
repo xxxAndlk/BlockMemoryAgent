@@ -124,7 +124,7 @@ type reactInternalSession struct {
 	// 下次 MetaAgent 运行前 recallTopicSummaries 注入旧话题摘要并更新此字段,
 	// 避免同一话题多次 resume 重复注入(省 token)。
 	recalledTopicID string
-	// approval 是待审批的破坏性操作确认通道（TODO #17 P1）：非 nil 表示有工具调用
+	// approval 是待审批的破坏性操作确认通道：非 nil 表示有工具调用
 	// 正在等用户确认，sendMessage/answerClarify 把答复写入通道；Agent goroutine 仍存活，
 	// 收到答复后工具调用返回裁决继续 ReAct 循环。会话取消时由 ctx 取消解除阻塞。
 	approval chan bool
@@ -827,7 +827,7 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 			continue
 		}
 		// 将工具名、路径、输出、错误、成功标志加入结果集，并对输出截断。
-		// 文本字段统一过 sanitizeUTF8：Postgres jsonb 同样拒绝 NUL（），
+		// 文本字段统一过 sanitizeUTF8：Postgres jsonb 同样拒绝 NUL，
 		// 工具输出夹带 0x00 会导致整条历史写入失败。
 		toolResults = append(toolResults, map[string]any{
 			"tool":   ev.Tool,

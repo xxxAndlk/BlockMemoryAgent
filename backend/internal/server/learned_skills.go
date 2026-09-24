@@ -7,7 +7,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -17,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/blockmemory/agent/backend/internal/store"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 )
 
@@ -128,14 +128,8 @@ func (h *APIHandler) SaveLearnedSkillHandler(c *gin.Context) {
 	}
 	// 重写文件：frontmatter（name/title/when_to_use/outcome）+ 正文原样。
 	var b strings.Builder
-	b.WriteString("---\n")
-	fmt.Fprintf(&b, "name: %s\n", name)
-	fmt.Fprintf(&b, "title: %s\n", title)
-	fmt.Fprintf(&b, "when_to_use: %s\n", whenToUse)
-	if rec.Outcome != "" {
-		fmt.Fprintf(&b, "outcome: %s\n", rec.Outcome)
-	}
-	b.WriteString("---\n\n")
+	b.WriteString(textutil.RenderSkillFrontmatter(name, title, whenToUse, rec.Outcome))
+	b.WriteString("\n")
 	b.WriteString(strings.ReplaceAll(req.Content, "\r\n", "\n"))
 	if err := os.WriteFile(rec.ContentPath, []byte(b.String()), 0o644); err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())

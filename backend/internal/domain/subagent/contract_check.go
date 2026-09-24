@@ -1,6 +1,6 @@
 package subagent
 
-// contract_check.go 提供跨域契约静态校验（TODO #57 校验三层方案第二层）：
+// contract_check.go 提供跨域契约静态校验（校验三层方案第二层）：
 // dispatcher 在父节点下全部兄弟域完成时对 WriteSpec contract 字段逐条核对
 // （regex/文本解析，零 LLM）。违例按文件归属批量打回责任域（一次消息列全部违例），
 // 通过结果以【机器校验】段入摘要供 meta 纸面对照。
@@ -40,7 +40,7 @@ func (r contractReport) pass() bool { return len(r.violations) == 0 }
 // identifierRegexp 单词边界匹配单标识符（防 CONFIG 匹配 MYCONFIGX）。
 var identifierRegexp = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
 
-// symbolFound 判断符号是否出现在文件内容中（TODO #62 语义化匹配）：
+// symbolFound 判断符号是否出现在文件内容中（语义化匹配）：
 //   - 字面包含（复合符号如 `GameEngine.init` 的引用形态 `GameEngine.init()`）直接命中；
 //   - 复合符号按 "." 拆段逐段词边界匹配——覆盖声明形态
 //     `var GameEngine = { init: function() {} }`（字面不含 `GameEngine.init`）；
@@ -169,7 +169,7 @@ func (d *Dispatcher) runContractChecksIn(workdir string, c *tool.Contract, specF
 	checkScriptOrder(workdir, specFiles, c.Scripts, &rep)
 
 	// 4. 跨域函数签名：签名文本字面/空白归一后匹配；未命中时对 .ts/.tsx 文件以
-	// tsc 单文件编译为判据（TODO #62 语义化：能编译=兼容）——tsc 编译通过则
+	// tsc 单文件编译为判据（语义化：能编译=兼容）——tsc 编译通过则
 	// "先质疑契约"：签名兼容但契约字面过时，降级为存疑条目而非违例打回。
 	// tsc 缺失/超时/非 TS 文件维持原字面判定（漏报优于复杂化）。
 	for _, sg := range c.Signatures {
@@ -220,7 +220,7 @@ func (d *Dispatcher) runContractChecksIn(workdir string, c *tool.Contract, specF
 }
 
 // signatureMatched 签名匹配：字面包含优先，未命中时空白归一后包含
-// （`attack (target, dmg)` 与 `attack(target, dmg)` 等价，TODO #62 语义化）。
+// （`attack (target, dmg)` 与 `attack(target, dmg)` 等价，语义化）。
 // TODO #70 注解剥离：字面/空白归一匹配前先把文件内容中的行注释（// 与 #）与
 // 行尾注解段剥掉——含注解的真实代码因注释干扰漏匹配会产生假违例
 // （实证 2026-08-25：签名对多行字面量真实代码永不命中，同一假违例 3 次推送）。
@@ -294,7 +294,7 @@ func isTSFile(p string) bool {
 	return false
 }
 
-// tscCompiles 以 tsc --noEmit --skipLibCheck 单文件编译为签名兼容仲裁（TODO #62）。
+// tscCompiles 以 tsc --noEmit --skipLibCheck 单文件编译为签名兼容仲裁。
 // 编译退出码 0 = 能编译 = 签名兼容（契约疑似过时）。tsc 缺失/超时/无法启动返回
 // false（不误判"编译过"，仍按字面判定原路走）。runner/lookPath 复用冒烟注入
 // （测试可注入假实现），nil 时用默认实现。30s 超时兜底。

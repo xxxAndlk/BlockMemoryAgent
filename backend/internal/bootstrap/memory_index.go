@@ -13,7 +13,6 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/store"
-	"github.com/blockmemory/agent/backend/internal/userprofile"
 )
 
 // memoryIndexSummaryRunes 单条索引摘要上限（一行式，长文截断）。
@@ -21,8 +20,9 @@ const memoryIndexSummaryRunes = 120
 
 // newMemoryIndexProvider 构造【沉淀索引】渲染器：knowledge 表沉淀 → 过滤 untrusted
 // 围栏行 → 一行式摘要 → RenderMemoryIndex 双配额渲染（超限自带重写指令）。
-// 用户画像段一并入索引（#20③ 覆盖 meta_memory/global_knowledge 层的人-事-偏好沉淀）。
-func newMemoryIndexProvider(ks *store.KnowledgeStore, profile *userprofile.Store, maxLines, maxRunes int) func() string {
+// 用户画像不入索引——react_agent 的全量【用户画像】段已单独注入 MetaAgent 系统提示，
+// 索引再放一条是每轮重复 token（TODO #24 批二⑨）。
+func newMemoryIndexProvider(ks *store.KnowledgeStore, maxLines, maxRunes int) func() string {
 	return func() string {
 		if ks == nil {
 			return ""
@@ -45,17 +45,6 @@ func newMemoryIndexProvider(ks *store.KnowledgeStore, profile *userprofile.Store
 				summary = string(rr[:memoryIndexSummaryRunes]) + "…"
 			}
 			entries = append(entries, agent.MemoryIndexEntry{Type: string(r.KnowledgeType), Summary: summary})
-		}
-		// 用户画像摘要（有则首条，CC 记忆索引人-事业务同构）。
-		if profile != nil {
-			if cur := profile.Current(); cur != nil {
-				if text := strings.TrimSpace(cur.Content); text != "" && !agent.ContainsUntrustedFence(text) {
-					if rr := []rune(text); len(rr) > memoryIndexSummaryRunes {
-						text = string(rr[:memoryIndexSummaryRunes]) + "…"
-					}
-					entries = append([]agent.MemoryIndexEntry{{Type: "用户画像", Summary: strings.ReplaceAll(text, "\n", " ")}}, entries...)
-				}
-			}
 		}
 		block, _ := agent.RenderMemoryIndex(entries, maxLines, maxRunes)
 		if block == "" {

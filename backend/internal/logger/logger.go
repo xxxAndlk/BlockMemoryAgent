@@ -10,16 +10,16 @@ import (
 	"io"           // io.Writer 接口
 	"log/slog"     // 标准结构化日志 Attr 类型，保留以兼容现有调用方
 	"os"           // os.Stderr
-	"runtime"      // 捕获调用栈
-	"strings"      // 字符串处理
-	"time"         // 时间戳
-	"unicode/utf8" // 按 rune 截断字符串
+	"runtime" // 捕获调用栈
+	"strings" // 字符串处理
+	"time"    // 时间戳
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/pkgerrors"
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/store"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 )
 
 func init() {
@@ -515,11 +515,7 @@ func firstNonEmpty(ss ...string) string {
 	return ""
 }
 
-// truncate 按 rune 截断字符串并加省略号，避免破坏多字节 UTF-8 字符。
+// truncate 按 rune 截断字符串并加省略号（textutil 单源）。
 func truncate(s string, maxRunes int) string {
-	if utf8.RuneCountInString(s) <= maxRunes {
-		return s
-	}
-	runes := []rune(s)
-	return string(runes[:maxRunes]) + "..."
+	return textutil.TruncateRunes(s, maxRunes, "...")
 }

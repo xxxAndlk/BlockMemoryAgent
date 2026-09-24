@@ -162,7 +162,7 @@ func (l *TaskLedger) RecordTerminal(sessionID, parentID, childID, summary string
 		failKind = m[1]
 		text = strings.TrimSpace(failureMarkerRe.ReplaceAllString(text, ""))
 		if failKind == string(FailureKindUnverified) || failKind == string(FailureKindVerifyMissing) {
-			// 三态黄态（TODO #60）：产出已回传但缺验证证据，非失败语义。
+			// 三态黄态：产出已回传但缺验证证据，非失败语义。
 			status = ledgerUnverified
 		} else {
 			status = ledgerFailed

@@ -95,7 +95,7 @@ func TestSearchHybrid_RRFAndType(t *testing.T) {
 		vec: []*types.KnowledgeRecord{rec(1, "vec1")},
 		kw:  []*types.KnowledgeRecord{rec(1, "kw1"), rec(2, "kw2")},
 	}
-	r := NewGlobalKnowledgeRetriever(nil, nil, fakeEmbedder{})
+	r := NewGlobalKnowledgeRetriever(fakeEmbedder{})
 	r.SetHybridBackend(hy)
 	hits, err := r.SearchHybrid(context.Background(), "塔防游戏怎么实现", "", 3)
 	if err != nil {

@@ -157,7 +157,7 @@ persist running → `resolveGearMetaRole` → `mountTopLevelEssentials`（插件
 
 **去重/裁剪约定**：finalizeThinking 用 `lastThinkEventText` 去重；persistInterimText 用 `lastInterimText` 去重且跳过 ask_user；`trimDebugEvents` 只裁 think/prompt/token_usage/graph_step（不裁 assistant_text）；`sanitizeUTF8` 剥 NUL 防 PG jsonb 拒收。
 
-持久化目标：session_history（MetaMemory JSONB 含 gear+thinking）、session_events（每轮全量 delete-then-insert）、agent_messages（主对话 agentID==sessionID，全量覆盖）、session_logs。
+持久化目标：session_history（MetaMemory JSONB 含 gear+thinking）、session_events（**append-only**：按 `(session_id, seq)` 唯一键 ON CONFLICT DO NOTHING 幂等纯追加，seq 永不清零）、agent_messages（主对话 agentID==sessionID，**尾差量追加**：边界行一致则只补尾段，复活重跑前旧 run 快照经 `ArchiveMessages` 移归档 archived=true 不物理删）、session_logs。
 
 ## 3.7 人在回路三通道（澄清/审批/升档）
 
@@ -205,7 +205,7 @@ persist running → `resolveGearMetaRole` → `mountTopLevelEssentials`（插件
 |---|---|
 | `query_react.go` | Query 各 kind 实现：看板快照合成（board 权威优先回退树）、指标/token 聚合、邮箱清单、效率表、agent_events/agent_messages 下钻（Redis 热层 + PG 合并分页；`after_seq>0` 且热层有数据时只用热层） |
 | `session_shared.go` | internalEvent → Event DTO；`trimDebugEvents`；`sanitizeUTF8` |
-| `messages_store.go` | agent_messages 读写：**delete-then-insert 全量覆盖**；nil db no-op |
+| `messages_store.go` | agent_messages 读写：**尾差量追加**（边界行前缀探测；`ArchiveMessages` 归档旧 run 快照，append-only 纪律）**（位于 `internal/agent/`）**；nil db no-op |
 | `message_log.go` | Redis 热写消息（best-effort 2s 超时，绝不影响主循环）；`Clear` 复活前调用（seq 重置） |
 | `evolver.go` | 会话结束自进化：≥5 事件才跑，一次轻量 LLM 产出画像增量/项目偏好/技能包 → PrefMerger 合并 → skillSink 落库 → evolution_log |
 | `metrics.go` | 进程级 LLM 调用累计器（次数/超时/总时长/最大） |

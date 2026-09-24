@@ -1,6 +1,6 @@
 package subagent
 
-// legacy_test.go 测试 TODO #72 遗产清单：【遗产清单】结构化段组装。
+// handover_test.go 测试结构化遗产清单：【遗产清单】结构化段组装。
 
 import (
 	"context"

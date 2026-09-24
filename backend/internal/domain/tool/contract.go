@@ -1,6 +1,6 @@
 package tool
 
-// contract.go 定义跨域契约（TODO #57）：WriteSpec 的 contract 字段承载派发时
+// contract.go 定义跨域契约：WriteSpec 的 contract 字段承载派发时
 // 父 Agent 显式钉死的跨域引用协议，dispatcher 在父节点下全部兄弟域完成后
 // 跑静态契约检查器（regex/文本解析，零 LLM）逐条核对。
 //

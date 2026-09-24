@@ -1,6 +1,6 @@
 package retriever
 
-// chunker.go 实现 TODO #27 外部知识库摄入的文档切块：
+// chunker.go 实现 外部知识库摄入的文档切块：
 // Markdown/纯文本按段落/标题切块，块间带重叠避免切碎语义。
 
 import (

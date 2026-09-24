@@ -31,7 +31,7 @@ const (
 	TaskDone TaskStatus = "done"
 	// TaskFailed 表示失败：执行出错或被否决。
 	TaskFailed TaskStatus = "failed"
-	// TaskUnverified 表示已交付但未验证（TODO #60 三态化）：
+	// TaskUnverified 表示已交付但未验证（三态化）：
 	// 产出已回传但缺机器可执行的验证证据（L0 证据缺/校验不可用），非失败语义。
 	// 看板展示标黄不标红，由父 Agent 决定补验证或收口。
 	TaskUnverified TaskStatus = "delivered-unverified"
@@ -50,7 +50,7 @@ const (
 	BoardStatusDone BoardStatus = "DONE"
 	// BoardStatusFailed 表示失败：所有子任务都已结束但至少有一个失败。
 	BoardStatusFailed BoardStatus = "FAILED"
-	// BoardStatusDelivered 表示已交付但存在未验证任务（TODO #60）：
+	// BoardStatusDelivered 表示已交付但存在未验证任务：
 	// 所有子任务都已结束、无失败，但至少有一个是 delivered-unverified。
 	// 与 DONE 区分：整品可用性未经全部验证；与 FAILED 区分：没有真失败。
 	BoardStatusDelivered BoardStatus = "DELIVERED"
@@ -440,7 +440,7 @@ func (b *TaskBoard) MarkFailed(taskID, reason string) error {
 	return b.transition(taskID, TaskFailed, reason)
 }
 
-// MarkUnverified 标记任务"已交付但未验证"（TODO #60 三态化）。
+// MarkUnverified 标记任务"已交付但未验证"（三态化）。
 //
 // 职责：将子任务置为 delivered-unverified，并记录缺验证原因。
 // 不触发看板 FAILED（非失败语义），整体状态走 DELIVERED。
@@ -503,7 +503,7 @@ func (b *TaskBoard) transition(taskID string, status TaskStatus, result string) 
 // 职责：遍历所有子任务，根据其终态推导看板 Status：
 //   - 无任务 → NEW
 //   - 全部终态且有失败 → FAILED
-//   - 全部终态、无失败但有 delivered-unverified → DELIVERED（TODO #60 三态化）
+//   - 全部终态、无失败但有 delivered-unverified → DELIVERED（三态化）
 //   - 全部终态且无失败无未验证 → DONE
 //   - 否则 → IN_PROGRESS
 //

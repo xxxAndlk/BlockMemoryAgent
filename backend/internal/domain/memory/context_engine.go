@@ -32,6 +32,7 @@ import (
 	"sync"
 
 	"github.com/blockmemory/agent/backend/internal/agent"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 )
 
 // ContextEngine 上下文引擎槽位契约（TODO #22①，OpenClaw 9 钩子只取五钩子子集）。
@@ -244,15 +245,12 @@ func probeBigFiles(history []agent.ReactMessage, bigRunes, probeRunes, keep int)
 }
 
 // trimToRunes 超长截断（包体瘦身用；无省略语义损失提示，包体本就是摘要）。
+// textutil 单源；max<=0 原样返回（与 TruncateRunes 的 <=0 返空语义不同，故保留守卫）。
 func trimToRunes(s string, max int) string {
 	if max <= 0 {
 		return s
 	}
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max])
+	return textutil.TruncateRunes(s, max, "")
 }
 
 // -- 失败隔离：QuarantineEngine --

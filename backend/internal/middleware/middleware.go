@@ -1,4 +1,4 @@
-// Package middleware 提供链式中间件核心抽象（TODO #19 统一拦截链）。
+// Package middleware 提供链式中间件核心抽象（统一拦截链）。
 //
 // 设计：洋葱模型 + 泛型 + 纯标准库。Handler 是链上可执行的下一步；
 // Middleware 拿到 next 返回包装后的 Handler；Chain 按 Use 顺序构建洋葱。

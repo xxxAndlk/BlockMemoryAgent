@@ -1,6 +1,6 @@
 package subagent
 
-// legacy.go 提供非正常终止子 Agent 的结构化遗产清单（TODO #72 第二层）：
+// handover.go 提供非正常终止子 Agent 的结构化遗产清单（第二层）：
 // 成功写入文件（仅 WriteFile/EditFile Success=true）+ 看板在办步骤 + 打捞摘要，
 // 组装为【遗产清单】段随失败消息送达父 Agent，文案明示"可直接作为续建 spec 骨架"。
 // 实证（2026-08-25 水果忍者）：domain-2 被连读守卫杀时 plan_execute 仅 1/6、

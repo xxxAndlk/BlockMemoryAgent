@@ -115,7 +115,7 @@ func FilesModifiedFromHistory(history []ReactMessage) []string {
 	return out
 }
 
-// FilesWrittenFromHistory 从 ReAct 历史中收集"写入成功"的文件清单（TODO #72 遗产清单）：
+// FilesWrittenFromHistory 从 ReAct 历史中收集"写入成功"的文件清单（遗产清单）：
 // 仅统计 assistant 发起 WriteFile/EditFile 调用且对应 tool 结果 Success=true 的路径，
 // 去重保序。与 FilesModifiedFromHistory（不校验成功）相对——遗产清单只认真实落盘的文件，
 // 作为续建 spec 骨架的素材必须可信。
@@ -192,7 +192,7 @@ type ReactResult struct {
 	// VerifyNote 是校验层状态标签：非空=校验通过（"L0 证据"/"L2 rubric"）；
 	// Unverified 时为 judge 失败原因。上层据此在完成摘要里标注校验状态。
 	VerifyNote string `json:"verify_note,omitempty"`
-	// MachineCheck 是 dispatcher 域完成机器校验的【机器校验】段（TODO #56 冒烟层）：
+	// MachineCheck 是 dispatcher 域完成机器校验的【机器校验】段（冒烟层）：
 	// dispatcher 对产出文件自动执行语法检查（node --check 等），非 agent 自述。
 	// 非空时上层追加进完成摘要供父 Agent 纸面对照（meta 验收只信这段 + spec 对照）。
 	MachineCheck string `json:"machine_check,omitempty"`

@@ -97,20 +97,17 @@ func domainNameOverlap(a, b string) bool {
 }
 
 // dispatchSpecFiles 取本次派发对应的 spec files（文件重叠信号源）：
-// 依次试 domain 键、遗留单键、唯一 keyed spec（与 hasFreshSpec 回退同口径）。
+// 依次试 domain 键、遗留单键、唯一 keyed spec——回退链与 hasFreshSpec 同口径
+// （resolveSpecKeyCandidates 单源）。
 // sharedMem 缺失/spec 解析失败返回 nil（信号静默降级，不阻塞派发）。
 func (d *Dispatcher) dispatchSpecFiles(ctx context.Context, parentID, domain string) []string {
 	if d.sharedMem == nil {
 		return nil
 	}
-	if files := specFilesOfKey(ctx, d.sharedMem, specKeyFor(parentID, domain)); len(files) > 0 {
-		return files
-	}
-	if files := specFilesOfKey(ctx, d.sharedMem, parentID+":"+specSlotName); len(files) > 0 {
-		return files
-	}
-	if keys := d.specKeysOfParent(ctx, parentID); len(keys) == 1 {
-		return specFilesOfKey(ctx, d.sharedMem, keys[0])
+	for _, key := range d.resolveSpecKeyCandidates(ctx, parentID, domain) {
+		if files := specFilesOfKey(ctx, d.sharedMem, key); len(files) > 0 {
+			return files
+		}
 	}
 	return nil
 }

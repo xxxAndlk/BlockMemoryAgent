@@ -1,6 +1,6 @@
 package subagent
 
-// blackboard_uptake.go 实现黑板模式（TODO #42）的每轮兄弟产出摄取：
+// blackboard_uptake.go 实现黑板模式的每轮兄弟产出摄取：
 // DomainAgent 每轮 Assemble 末尾按 scope（parent_id + task_domain）查询黑板块记忆，
 // 把同领域兄弟 Agent 的完成结论作为【兄弟产出】尾部 system 消息注入上下文。
 //

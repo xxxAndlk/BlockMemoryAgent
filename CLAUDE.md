@@ -39,8 +39,8 @@ Key rules: `pkg/*` must not import `internal/*`; infrastructure must not import 
 
 ## Tests
 
-- Per-package `_test.go` exist for `agent`, `board`, `mailbox`, `skill`, `soul`, `watchdog`, `config`, `model`, `logger`, `domain/tool`, `domain/role`, `domain/memory`, `domain/subagent`, `server`, `tui` - run when touching those packages.
-- **Integration/eval Go suites removed** (commit b35f87e): the `test/` module currently has **zero Go test files** — remaining dirs (`ab`/`benchmark`/`duel`/`swe`/`eval`) hold shell/JS scripts and run artifacts only. Rebuild is an open TODO; `.github/workflows/ci.yml` defers its nightly PG+Redis job until then. Conventions to restore with it: fixtures used `docker/docker-compose.test.yml` (isolated ports PG 55432 / Redis 56380 — never the dev instance 5432/6380, VECTOR(1024)); containers shared and left running, one PG database + Redis logical DB per test; eval suite ran with build tag `eval` against real LLM (costs credits; knobs `EVAL_FILTER`/`EVAL_RUNS`/`JUDGE_*`).
+- Per-package `_test.go` exist for `agent`, `board`, `mailbox`, `skill`, `soul`, `config`, `model`, `logger`, `domain/tool`, `domain/role`, `domain/memory`, `domain/subagent`, `server`, `tui`, `bootstrap`, `store`, `retriever`, `plugins` - run when touching those packages. (History: `watchdog`/`memory`/`graph`/`runtime` packages were deleted in the ReAct refactor.)
+- **`test/` 模块已重建**（2026-09-24 复核，37 个 `_test.go`）：`test/coding`（编程场景）/ `test/api`（HTTP 端点）/ `fixtures`（共享基建），31 文件带 `//go:build integration` 标签，跑法 `cd test && GOTOOLCHAIN=local go test ./...`（纯单测）或 `-tags integration ./...`（需 PG+Redis，fixtures 经 `docker/docker-compose.test.yml` 起共享容器：隔离端口 PG 55432 / Redis 56380 — never the dev instance 5432/6380，VECTOR(1024)，每包独立库）。eval 套件仍以 build tag `eval` 对真实 LLM 跑（花费 credits；knobs `EVAL_FILTER`/`EVAL_RUNS`/`JUDGE_*`）。`.github/workflows/ci.yml` 的 nightly PG+Redis job 待挂回。
 
 ## Agent 编排页
 

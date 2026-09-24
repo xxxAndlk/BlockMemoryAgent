@@ -87,7 +87,7 @@ type BlockMemorySearcher interface {
 	SearchBlockMemoryByGoal(ctx context.Context, sessionID, goal string, topK int) ([]*types.KnowledgeRecord, error)
 }
 
-// BlackboardSearcher 抽象黑板模式（TODO #42）的 scope 确定性检索能力，由 store.PostgresStore 实现。
+// BlackboardSearcher 抽象黑板模式的 scope 确定性检索能力，由 store.PostgresStore 实现。
 // 在 BlockMemorySearcher 语义召回之上叠加 parent_id + task_domain 精确过滤：兄弟产出按 scope
 // 共享，每个 Agent 只取自己 scope 的切片（替 mailbox 全量广播 / 父注入全量 spec 的上下文互染）。
 //
@@ -215,7 +215,7 @@ type Dispatcher struct {
 	// 进程内有效；重启后 Render 时从权威树（PG 恢复）播种。
 	ledger *TaskLedger
 
-	// parentSpecs 缓存每个父 Agent 的 spec 结构化切片（TODO #56/#57/#65）：
+	// parentSpecs 缓存每个父 Agent 的 spec 结构化切片（æ ¡éªåå±/å¥çº¦/spec å¤ key）：
 	// 键为 specRecKey{parentID, domain}，值为 *parentSpecRecord（files 绝对路径 +
 	// 跨域契约 + 验收层级）。domain 空=遗留单键 spec；非空=该领域专属 spec（多 key 化）。
 	// 派发时从 spec 槽位捕获（此时 spec 尚新鲜，随后子 Agent 写入会触发 Layer 2
@@ -224,10 +224,10 @@ type Dispatcher struct {
 	// 条目为小切片 + 契约指针），进程重启不保留。
 	parentSpecs sync.Map
 
-	// smokeRunner 冒烟命令执行器（TODO #56）；nil 时用 defaultSmokeRunner 真跑命令。
+	// smokeRunner 冒烟命令执行器；nil 时用 defaultSmokeRunner 真跑命令。
 	// 测试注入假实现，避免依赖机器上的 node/gofmt 工具链。
 	smokeRunner smokeRunner
-	// smokeLookPath 工具链探测函数（TODO #56）；nil 时用 exec.LookPath。测试注入假实现。
+	// smokeLookPath 工具链探测函数；nil 时用 exec.LookPath。测试注入假实现。
 	smokeLookPath lookPathFunc
 
 	// specEnforcementEnabled 派发方调用 call_sub_agent 前是否强制先写 WriteSpec。
@@ -537,7 +537,7 @@ func (d *Dispatcher) trackChildStart(parentID string) {
 
 // trackChildDone 在子 Agent 结束（成功/失败/超时）时递减父 Agent 未决计数，
 // 并非阻塞地通知一声，唤醒可能在 WaitForAnyChild 中等待的父 Agent。
-// 计数归零（全部兄弟完成）时异步触发跨域契约检查（TODO #57）。
+// 计数归零（全部兄弟完成）时异步触发跨域契约检查。
 // childDoneFn（「挂起等子」唤醒回调）每次递减后异步触发：各路径 mailbox 完成摘要
 // 落箱与 trackChildDone 的先后序不一，异步回调 + 接收方按 awaiting_child 态过滤，
 // 保证唤醒 resume 时摘要已落箱且重复唤醒幂等。
@@ -568,7 +568,7 @@ func (d *Dispatcher) trackChildDone(parentID string) {
 	}
 }
 
-// maybeRunContractChecks 在父节点下全部兄弟域完成时跑跨域契约静态检查（TODO #57）。
+// maybeRunContractChecks 在父节点下全部兄弟域完成时跑跨域契约静态检查。
 // 触发条件：父 spec 缓存含非空契约 + 无 spec 缓存/空契约/新一波派发已开始（未决计数
 // 回升）则跳过。结果经 mailbox 通知父 Agent：通过=【机器校验】段（纸面对照证据），
 // 违例=failure marker + 按文件归属批量列出全部违例（打回责任域，一次消息列全）。
@@ -601,9 +601,9 @@ func (d *Dispatcher) maybeRunContractChecks(parentID string) {
 		if rec == nil || rec.contract == nil || rec.contract.Empty() {
 			continue
 		}
-		// 变更屏障（TODO #62 时序串行化）：capture 后涉及文件已变（兄弟返工落地）时
+		// 变更屏障（时序串行化）：capture 后涉及文件已变（兄弟返工落地）时
 		// 跳过该份契约，避免对着旧状态误报——等下一波全完成再查。
-		if !recMtimesMatch(rec.filesMtime) {
+		if !verifyFileMtimes(rec.filesMtime) {
 			continue
 		}
 		sub := d.runContractChecks(rec.contract, rec.files)
@@ -676,6 +676,10 @@ type subAgentMeta struct {
 	sessionID string
 	wallClock time.Duration
 	doneOnce  sync.Once
+	// notifyOnce 终态回传去重（TODO #24 顺手修①）：巡检杀与墙钟/超时/失败/成功分支
+	// 可并发收口，此前父会收到 killed/timeout 等矛盾双消息（树 Finish 幂等、计数有
+	// doneOnce 保护，仅消息侧缺去重）。每 run 一个新 meta，跨任务自然重置。
+	notifyOnce sync.Once
 }
 
 // effectiveTimeout 返回子 Agent 的有效墙钟：优先派发级 wall_clock_min（已 min 全局值），
@@ -687,6 +691,51 @@ func (d *Dispatcher) effectiveTimeout(subAgentID string) time.Duration {
 		}
 	}
 	return d.timeout
+}
+
+// effectiveWallClock 统一墙钟解析（派发/复活/分叉三路共用，2026-09-24 批二④）：
+// 起点 d.timeout（全局上限）；domain 无显式预算时侦察墙钟兜底（不放大全局上限）；
+// 显式 wallClock>0 时取 min。此前三处逐字重复，改一处漏两处即口径漂移。
+func (d *Dispatcher) effectiveWallClock(roleID string, wallClock time.Duration) time.Duration {
+	effective := d.timeout
+	if wallClock <= 0 && roleID == "domain" && d.domainReconClock > 0 &&
+		(effective <= 0 || d.domainReconClock < effective) {
+		effective = d.domainReconClock
+	}
+	if wallClock > 0 && (effective <= 0 || wallClock < effective) {
+		effective = wallClock
+	}
+	return effective
+}
+
+// domainAgentDisplayName 生成 DomainAgent 展示名：domain 非空用领域简称，否则取 task 首行；
+// 都为空返回空串（调用方跳过覆写）。runSubAgentOnce 与 buildDomainAgent 共用。
+func domainAgentDisplayName(domain, task string) string {
+	if hint := strings.TrimSpace(domain); hint != "" {
+		return textutil.TruncateRunes(hint, 16, "…") + "领域Agent"
+	}
+	firstLine := strings.SplitN(strings.TrimSpace(task), "\n", 2)[0]
+	if hint := textutil.TruncateRunes(firstLine, 16, "…"); hint != "" {
+		return "领域Agent:" + hint
+	}
+	return ""
+}
+
+// domainResponsibilityHeader 组装 DomainAgent 职责身份头（runSubAgentOnce /
+// buildDomainAgent 曾逐字重复）。responsibility 为空返回空串（调用方跳过注入）。
+func domainResponsibilityHeader(domain, responsibility string) string {
+	resp := strings.TrimSpace(responsibility)
+	if resp == "" {
+		return ""
+	}
+	domainLabel := strings.TrimSpace(domain)
+	if domainLabel == "" {
+		domainLabel = "综合"
+	}
+	return fmt.Sprintf("你是负责【%s】领域的 DomainAgent。\n你的职责：%s\n"+
+		"只实现/改写职责内的文件与模块；职责外的文件禁止创建或修改，"+
+		"需要的跨领域数据从共享记忆契约或 ReadFile 读取。",
+		textutil.TruncateRunes(domainLabel, 16, "…"), textutil.TruncateRunes(resp, 200, "…"))
 }
 
 // WithHeartbeatTimeout 配置子 Agent 心跳超时；<=0 关闭巡检（测试场景默认关闭）。
@@ -1062,10 +1111,21 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 					log.Printf("[subagent] PANIC RECOVERED: kill notify panic=%v (sub=%s)，继续计数补偿", r, subAgentID)
 				}
 			}()
-			d.notify(meta.parentID, subAgentID, killMsg, nil)
+			d.notifyTerminal(subAgentID, meta.parentID, killMsg, nil)
 		}()
 		d.trackChildDone(meta.parentID)
 	})
+	// 槽侧回告标记（TODO #24 顺手修①）：kill 已代行终态回执，热驻槽随后走 destroySlot
+	// 时不得再发第二条"被强制销毁"消息（双发竞态的槽侧半边，子侧由 notifyOnce 兜住）。
+	// 同时避免 destroySlot 的补偿递减在 subMeta 已删后重复触发（trackChildDoneOnce 回退分支）。
+	// pool 仅在热驻开启时非 nil（非热驻路径/测试），nil 时跳过。
+	if d.pool != nil {
+		if s := d.pool.slot(meta.sessionID, subAgentID); s != nil {
+			s.mu.Lock()
+			s.childReported = true
+			s.mu.Unlock()
+		}
+	}
 	if d.treeFn != nil && meta.sessionID != "" {
 		if t := d.treeFn(meta.sessionID); t != nil {
 			t.Finish(subAgentID, "心跳超时疑似卡死", errors.New("heartbeat timeout"))
@@ -1073,20 +1133,6 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	}
 	// 被杀节点不再续跑（热驻槽随后走 destroySlot），回收实例级模型覆盖。
 	d.clearAgentModel(subAgentID)
-	// 失败打捞（kill 场景）：从树节点取 domain，以 kill 消息文本作回退摘要写槽位，
-	// 供同域重派带前序摘要；goroutine 若尊重 cancel 会经 runSubAgent 失败路径覆盖为真实摘要。
-	if d.treeFn != nil && meta.sessionID != "" {
-		if t := d.treeFn(meta.sessionID); t != nil {
-			for _, n := range t.Snapshot() {
-				if n.ID != subAgentID {
-					continue
-				}
-				d.salvageFailure(context.Background(), meta.parentID, subAgentID,
-					types.RoleDefinition{ID: n.Role}, n.Domain, agent.ReactResult{}, killMsg)
-				break
-			}
-		}
-	}
 	// 级联停止：被杀 Agent 名下所有后代子 Agent 一并取消（防孤儿叶子继续空跑，
 	// 其结果无人消费）。每代复用 killStuckSubAgent 完整收尾链。
 	d.killDescendants(subAgentID, meta.sessionID)
@@ -1095,6 +1141,20 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	if d.mailbox != nil {
 		d.mailbox.Purge(subAgentID)
 	}
+}
+
+// panicNotifyParent panic 收尾公共段：父未决计数兜底递减 + 树 Failed + 回告父。
+// recoverDispatchPanic / recoverSlotPanic 共用，防两处文案与收尾顺序漂移。
+func (d *Dispatcher) panicNotifyParent(parentID, subAgentID, sessionID string, doneOnce *sync.Once) {
+	if doneOnce != nil {
+		doneOnce.Do(func() { d.trackChildDone(parentID) })
+	}
+	if d.treeFn != nil && sessionID != "" {
+		if t := d.treeFn(sessionID); t != nil {
+			t.Finish(subAgentID, "panic recovered", errPanicRecovered)
+		}
+	}
+	d.notifyTerminal(subAgentID, parentID, failureMarker(FailureKindKilled, true)+"\n子 Agent 因内部异常（panic）被回收，任务未回传；父未决计数已补偿递减。", nil)
 }
 
 // recoverDispatchPanic 异步派发 goroutine 的 panic 兜底（defer 调用，无 panic 零开销
@@ -1106,13 +1166,7 @@ func (d *Dispatcher) recoverDispatchPanic(parentID, subAgentID string, meta *sub
 		return
 	}
 	log.Printf("[subagent] PANIC RECOVERED: dispatch sub=%s role=%s parent=%s panic=%v", subAgentID, roleID, parentID, r)
-	meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
-	if d.treeFn != nil && meta.sessionID != "" {
-		if t := d.treeFn(meta.sessionID); t != nil {
-			t.Finish(subAgentID, "panic recovered", errPanicRecovered)
-		}
-	}
-	d.notify(parentID, subAgentID, failureMarker(FailureKindKilled, true)+"\n子 Agent 因内部异常（panic）被回收，任务未回传；父未决计数已补偿递减。", nil)
+	d.panicNotifyParent(parentID, subAgentID, meta.sessionID, &meta.doneOnce)
 }
 
 // killDescendants BFS 遍历树快照，递归对后代调用 killStuckSubAgent（cancel + notify 父 +
@@ -1242,13 +1296,9 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 		subAgentCtx = tool.WithSessionID(subAgentCtx, sid)
 	}
 	subAgentCtx = tool.WithWorkDir(subAgentCtx, d.subAgentWorkDirFor(ctx))
-	// 墙钟与派发路径同口径：domain 未显式给出预算时用侦察墙钟兜底（d.timeout 是全局上限），
-	// 否则复活一个侦察失控的 domain 会拿满全局墙钟（默认 30min）继续空转。
-	effectiveTimeout := d.timeout
-	if roleDef.ID == "domain" && d.domainReconClock > 0 &&
-		(effectiveTimeout <= 0 || d.domainReconClock < effectiveTimeout) {
-		effectiveTimeout = d.domainReconClock
-	}
+	// 墙钟与派发路径同口径（reconClock 兜底），否则复活一个侦察失控的 domain
+	// 会拿满全局墙钟（默认 30min）继续空转。
+	effectiveTimeout := d.effectiveWallClock(roleDef.ID, 0)
 	var cancel context.CancelFunc = func() {}
 	if effectiveTimeout > 0 {
 		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)
@@ -3260,18 +3310,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	//     否则事件 SessionID 为空被静默丢弃（参见 service_react.handleToolEvent 的 isRunning 分支）。
 	// 派发级墙钟（2026-08-19）：wall_clock_min 是代码级预算，替代 roles.yaml 提示词墙钟
 	//（对 LLM 只是软约束，实证验收 Agent 拿 15 分钟预算实际跑 39 分钟）。
-	// 取 min(wallClock, d.timeout)：派发级预算不放大全局上限。
-	// Domain 侦察墙钟（2026-08-21）：domain 无显式 wall_clock_min 时注入默认预算——
-	// 实证领域 Agent 侦察失控（炮塔 1.5h 零交付：15+ 轮慢思考"契约反推"从未派发/写入），
-	// reconClock 兜住侦察阶段，中点邮件预警"停止侦察开始产出"。
-	effectiveTimeout := d.timeout
-	if wallClock <= 0 && roleDef.ID == "domain" && d.domainReconClock > 0 &&
-		(effectiveTimeout <= 0 || d.domainReconClock < effectiveTimeout) {
-		effectiveTimeout = d.domainReconClock
-	}
-	if wallClock > 0 && (effectiveTimeout <= 0 || wallClock < effectiveTimeout) {
-		effectiveTimeout = wallClock
-	}
+	effectiveTimeout := d.effectiveWallClock(roleDef.ID, wallClock)
 	taskBrief := truncateRunes(strings.ReplaceAll(strings.TrimSpace(task), "\n", " "), 100)
 	started := time.Now()
 
@@ -3838,7 +3877,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		log.Printf("[subagent] PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
 		d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
 		d.treeFinish(ctx, subAgentID, "部分完成: "+partial, nil)
-		d.notify(parentID, subAgentID, "子 Agent 已达 token 上限,返回部分完成。\n"+partial, files)
+		d.notifyTerminal(subAgentID, parentID, "子 Agent 已达 token 上限,返回部分完成。\n"+partial, files)
 		return false
 	}
 	if err != nil {
@@ -3903,7 +3942,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 				log.Printf("[subagent] SOFT-STOP LEAF PARTIAL: sub=%s role=%s duration=%s partial_len=%d", subAgentID, roleDef.ID, duration, len(partial))
 				d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
 				d.treeFinish(ctx, subAgentID, "软停止部分完成: "+partial, nil)
-				d.notify(parentID, subAgentID, "子 Agent 已被软停止（会话停止中），返回当前部分成果；续跑后可按需重派。\n"+partial, files)
+				d.notifyTerminal(subAgentID, parentID, "子 Agent 已被软停止（会话停止中），返回当前部分成果；续跑后可按需重派。\n"+partial, files)
 				// Domain 热驻：父是热驻 domain 时追加一条取消提示邮件（"记忆补一句：子 Agent 已取消"）——
 				// domain 转 Idle 前读邮箱即可感知下属被停止，复用续跑时不误以为叶子仍在执行。
 				if d.hotEnabled() && d.mailbox != nil {
@@ -3934,7 +3973,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		// 失败打捞（TODO #20 第二层）：提取已读文件/已得结论/卡点摘要双路送达——
 		// 写共享槽位 <parentID>:salvage:<domain> 供同域重派带前序摘要；追加进父 mailbox 失败消息。
 		salvage := d.salvageFailure(ctx, parentID, subAgentID, roleDef, domain, result, partial)
-		// 结构化遗产清单（TODO #72）：成功写入文件 + 看板在办步骤 + 打捞摘要，
+		// 结构化遗产清单：成功写入文件 + 看板在办步骤 + 打捞摘要，
 		// 文案明示"可直接作为续建 spec 骨架"——守卫终止后 meta 人肉盘点 5 步未做
 		// 白烧一轮（实证 2026-08-25 domain-2 被杀时 plan_execute 仅 1/6）。
 		legacy := d.renderLegacyList(ctx, parentID, domain, result)
@@ -3957,23 +3996,18 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		} else if salvage != "" {
 			msg += "\n\n" + salvagePrefixMarker + salvage
 		}
-		// 遗产清单（TODO #72）随失败消息送达：成功写入文件 + 在办步骤 + 打捞摘要。
+		// 遗产清单随失败消息送达：成功写入文件 + 在办步骤 + 打捞摘要。
 		if legacy != "" {
 			msg += "\n\n" + legacy
 		}
-		// 状态语义三态化（TODO #60）：缺验证证据（verify_missing/unverified）不是失败——
+		// 状态语义三态化：缺验证证据（verify_missing/unverified）不是失败——
 		// 树落 delivered-unverified、看板标黄不标红，让父 Agent 看到"产出已交付但没证据"
 		// 而非满屏错误；真失败（冒烟不过/超时/守卫）仍标红。
-		boardSt := board.TaskFailed
-		treeStatus := orchestrator.StatusFailed
-		if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
-			boardSt = board.TaskUnverified
-			treeStatus = orchestrator.StatusUnverified
-		}
+		boardSt, treeStatus := failureStatusTri(kind)
 		d.boardUpdate(ctx, parentID, domain, boardSt, truncateRunes(msg, 300))
 		d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
 		d.treeFinishStatus(ctx, subAgentID, partial, treeStatus, failText)
-		d.notify(parentID, subAgentID, msg, files)
+		d.notifyTerminal(subAgentID, parentID, msg, files)
 		return false
 	}
 
@@ -3987,7 +4021,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	d.treeFinish(ctx, subAgentID, result.Text, nil)
 	// 校验分层（TODO #43）状态标注：VerifyNote 非空=校验通过（L0 证据/L2 rubric），
 	// 完成摘要前缀一行，父 Agent 可见校验依据；空=未启用校验（none），零变化。
-	// 域完成机器校验（TODO #56）：MachineCheck 非空时把【机器校验】段追加进摘要，
+	// 域完成机器校验：MachineCheck 非空时把【机器校验】段追加进摘要，
 	// dispatcher 执行的客观证据，meta 验收只信这段 + spec 纸面对照（#58）。
 	// 终答【未验证项】强制（TODO #76）：建设域（domain）摘要缺该段时追加机器警告行
 	//（可观测不硬拒），meta 纸面对照时不得按"全过"口径采信缺声明的摘要。
@@ -4008,7 +4042,7 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	if note := d.worktreePatchNote(ctx, subAgentID); note != "" {
 		summary += note
 	}
-	d.notify(parentID, subAgentID, summary, files)
+	d.notifyTerminal(subAgentID, parentID, summary, files)
 	return false
 }
 
@@ -4063,7 +4097,7 @@ func (d *Dispatcher) treeFinish(ctx context.Context, subAgentID, summary string,
 	d.treeFinishStatus(ctx, subAgentID, summary, orchestrator.StatusDone, "")
 }
 
-// treeFinishStatus 按指定终态写树（TODO #60 三态化）：StatusUnverified 走
+// treeFinishStatus 按指定终态写树（三态化）：StatusUnverified 走
 // Tree.FinishUnverified（非失败语义、看板标黄），其余与 treeFinish 同语义。
 func (d *Dispatcher) treeFinishStatus(ctx context.Context, subAgentID, summary string, status orchestrator.Status, errText string) {
 	// 终态漏斗：节点死亡即回收实例级模型覆盖（暂停路径不走本函数，覆盖跨 resume 存活）。
@@ -4264,13 +4298,8 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// 优先用 LLM 提供的 domain 字段命名（如"金融"->"金融领域Agent"），无则按 task 首行兜底，
 	// 让日志/对话页一眼看出在做什么领域。固定助手用 roleDef.Name（"代码助手"/"UI助手" 等），不覆写。
 	if roleDef.ID == "domain" {
-		if hint := strings.TrimSpace(domain); hint != "" {
-			roleDef.Name = textutil.TruncateRunes(hint, 16, "…") + "领域Agent"
-		} else {
-			firstLine := strings.SplitN(strings.TrimSpace(task), "\n", 2)[0]
-			if hint := textutil.TruncateRunes(firstLine, 16, "…"); hint != "" {
-				roleDef.Name = "领域Agent:" + hint
-			}
+		if n := domainAgentDisplayName(domain, task); n != "" {
+			roleDef.Name = n
 		}
 		// 职责槽注入：responsibility 非空时在通用领域 prompt 末尾加身份头。
 		// task 文本在长 ReAct 循环中会被历史压缩摘要掉，system prompt 不会，
@@ -4280,15 +4309,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		// 所有领域 Agent 的 system 前缀逐字节一致，DeepSeek/glm 前缀缓存可跨
 		// 领域复用整个通用 prompt（公共前缀规则：2 次落盘、第 3 次起命中）。
 		// 末尾紧邻首条 user 消息，处于注意力近因区，身份约束力不降。
-		if resp := strings.TrimSpace(responsibility); resp != "" {
-			domainLabel := strings.TrimSpace(domain)
-			if domainLabel == "" {
-				domainLabel = "综合"
-			}
-			header := fmt.Sprintf("你是负责【%s】领域的 DomainAgent。\n你的职责：%s\n"+
-				"只实现/改写职责内的文件与模块；职责外的文件禁止创建或修改，"+
-				"需要的跨领域数据从共享记忆契约或 ReadFile 读取。",
-				textutil.TruncateRunes(domainLabel, 16, "…"), textutil.TruncateRunes(resp, 200, "…"))
+		if header := domainResponsibilityHeader(domain, responsibility); header != "" {
 			roleDef.SystemPrompt = roleDef.SystemPrompt + "\n\n" + header
 		}
 	}
@@ -4303,7 +4324,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	//（实证 2026-08-13：三个领域 Agent 与叶子 code_assistant 的思考流全是
 	// "三个领域 Agent 已成功派发，等待回传"，3 参数改动跑 12 分钟）。
 	// 子 Agent 身份只由角色提示词（叶子=执行者/领域=领域负责人）定义。
-	// 黑板（TODO #42）每轮兄弟产出摄取 + 拓扑名册实时刷新：domain 与叶子都包装
+	// 黑板每轮兄弟产出摄取 + 拓扑名册实时刷新：domain 与叶子都包装
 	//（叶子的同组名册运行中随上级新派而变化）。黑板查询需 searcher 实现
 	// BlackboardSearcher 且仅 domain 有意义（叶子无兄弟产出语义，bb 恒 nil 亦安全）。
 	// 名册来自权威树：每轮 diff，任何变化注入全量当前名册（无变化零注入）。
@@ -4391,7 +4412,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 
 	// 保留原始任务文本，供块记忆沉淀时作为 goal 标签使用（避免混入召回前缀）。
 	origTask := task
-	// 捕获父 spec 结构化切片（TODO #56/#57）：派发时 spec 尚新鲜，完成后 Layer 2
+	// 捕获父 spec 结构化切片（æ ¡éªåå±/å¥çº¦）：派发时 spec 尚新鲜，完成后 Layer 2
 	// 失效删除 spec 就再也读不到——冒烟检查目标与契约检查依赖此刻的捕获。
 	d.recordParentSpec(ctx, parentID, domain)
 	// 上下文前缀注入：共享记忆（spec + 自由槽位）+ 块记忆召回。两段独立前缀统一拼装，避免嵌套
@@ -4537,7 +4558,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		return sub, result, errPartialReturn
 	}
 
-	// 域完成机器校验冒烟层（TODO #56）：对 spec.files ∩ 本子 Agent 实际写入文件
+	// 域完成机器校验冒烟层：对 spec.files ∩ 本子 Agent 实际写入文件
 	// 自动派生并执行语法检查（node --check 等），结果以【机器校验】段入完成摘要。
 	// 失败走 verify_kind 反馈重试通道：反馈 1 轮自修，仍失败按 errSmokeFailed 打回父
 	// （复用 #43 校验分层路由，不新建通路）。
@@ -4944,7 +4965,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	if mem == nil {
 		mem = agent.NopMemoryPipeline{}
 	}
-	// 黑板（TODO #42）每轮兄弟产出摄取 + 兄弟名册增量更新：resume 的 domain Agent
+	// 黑板每轮兄弟产出摄取 + 兄弟名册增量更新：resume 的 domain Agent
 	// 同样每轮摄取——它正是因等兄弟而暂停的，恢复后兄弟可能已完成/新增，uptake 让它
 	// 立即见到兄弟结论与新兄弟 id 而非空等/重做。叶子无兄弟语义。seeded=resume 时点
 	// 的现存名册（现存活跃兄弟不重复播报）。
@@ -5136,11 +5157,11 @@ const (
 	// FailureKindVerifyMissing L0 可执行校验缺验证证据（无成功运行的测试/lint/--check，
 	// 重试 1 轮后仍缺）。retryable=false，父 Agent 自决。
 	FailureKindVerifyMissing FailureKind = "verify_missing"
-	// FailureKindSmokeFailed 域完成机器校验冒烟失败（TODO #56）：dispatcher 对产出文件
+	// FailureKindSmokeFailed 域完成机器校验冒烟失败：dispatcher 对产出文件
 	// 自动执行的语法检查（node --check 等）未通过，反馈重试 1 轮后仍失败。
 	// retryable=false，父 Agent 打回责任域自修。
 	FailureKindSmokeFailed FailureKind = "smoke_failed"
-	// FailureKindContractViolation 跨域契约违例（TODO #57）：兄弟域全完成后的静态契约检查
+	// FailureKindContractViolation 跨域契约违例：兄弟域全完成后的静态契约检查
 	// 发现违例条目。retryable=false，父 Agent 按文件归属打回责任域。
 	FailureKindContractViolation FailureKind = "contract_violation"
 )
@@ -5171,6 +5192,28 @@ func failureKindOf(ctx context.Context, err error) FailureKind {
 	default:
 		return FailureKindError
 	}
+}
+
+// failureStatusTri 失败状态语义三态化：缺验证证据（verify_missing/unverified）
+// 非失败——看板标黄、树落 delivered-unverified；其余真失败标红。
+// runSubAgent 与热驻 runDomainTask 失败收口共用（TODO #24 批二②）。
+func failureStatusTri(kind FailureKind) (board.TaskStatus, orchestrator.Status) {
+	if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
+		return board.TaskUnverified, orchestrator.StatusUnverified
+	}
+	return board.TaskFailed, orchestrator.StatusFailed
+}
+
+// hotResidentFailureNotice 热驻 domain 失败回传消息（有意差异于 runSubAgent，TODO #24 批二②）：
+//   - retryable 恒 false——热驻侧全为 domain，auto-retry 硬规则只认叶子（与 runSubAgent 口径一致）；
+//   - 不附遗产清单/决策建议——domain 自有收尾验收，父为 meta 时走整合纪要，再附会稀释回传；
+//   - 缺验证证据时不附产出全文——domain 产出经 boardUpdate 全量落看板，消息只留索引。
+func hotResidentFailureNotice(kind FailureKind, failText, salvage string) string {
+	msg := failureMarker(kind, false) + "\n" + failText
+	if salvage != "" {
+		msg += "\n\n" + salvagePrefixMarker + salvage
+	}
+	return msg
 }
 
 // failureMarker 渲染失败消息头部的机读标记行。
@@ -5211,7 +5254,7 @@ const visualRetryMessage = "【视觉证据要求】本任务验收层级含 vis
 	"截图回显实际渲染效果（file:///workspace/<相对工作目录> 路径），截图成功即视觉证据。" +
 	"截图必须展示真实渲染结果（贴图/动画/布局可见），仅空页面不算。请补充截图证据后重新产出最终答复。"
 
-// errSmokeFailed 标记域完成机器校验冒烟失败（TODO #56）：dispatcher 自动执行的
+// errSmokeFailed 标记域完成机器校验冒烟失败：dispatcher 自动执行的
 // 语法检查未通过（反馈重试 1 轮后仍失败），错误文本携带失败明细。
 // runSubAgent 见此信号按 FailureKindSmokeFailed notify 父（打回责任域）。
 var errSmokeFailed = errors.New("sub-agent smoke check failed")
@@ -5397,11 +5440,11 @@ type specMirror struct {
 	Contract     *tool.Contract `json:"contract,omitempty"`
 }
 
-// parentSpecRecord 是父 Agent spec 的结构化缓存（TODO #56/#57/#59）：
+// parentSpecRecord 是父 Agent spec 的结构化缓存（æ ¡éªåå±/å¥çº¦/éªæ¶å±çº§）：
 // files 为 spec.files 的绝对路径，contract 为跨域契约（可 nil），
 // verifyLevels 为验收层级（可空，驱动集成/视觉层机器校验）。
 // filesMtime 为捕获时刻的 frontmatter files mtime 快照：契约检查前比对，
-// 涉及文件已变更（兄弟返工落地）则跳过该份契约（TODO #62 时序串行化变更屏障）。
+// 涉及文件已变更（兄弟返工落地）则跳过该份契约（时序串行化变更屏障）。
 // 派发时捕获（spec 尚新鲜），完成收尾/兄弟域全完成时消费（spec 可能已被 Layer 2 失效删除）。
 // probes/scenes/baseline（TODO #67/#69/#75）：runtime 探针声明 / visual 场景清单 /
 // 对标基线，供完成收尾路径的层级证据扫描与计分。
@@ -5500,7 +5543,7 @@ func (d *Dispatcher) parentSpecRecordsOf(parentID string) []*parentSpecRecord {
 	return out
 }
 
-// smokeTargetsFor 计算冒烟检查目标（TODO #56）：spec.files ∩ 本子 Agent 实际写入文件。
+// smokeTargetsFor 计算冒烟检查目标：spec.files ∩ 本子 Agent 实际写入文件。
 // 交集为空（无 spec 缓存 / 子 Agent 未写文件 / 写入文件不在 spec 范围）返回 nil，
 // 跳过冒烟检查。收敛到交集是为责任归属精确：并行兄弟域中途写入共享文件时，
 // 先完成的一方不会被兄弟的半成品误打回。domain 定位本子 Agent 专属 spec（#65）。
@@ -5549,8 +5592,9 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain str
 		if strings.HasPrefix(strings.TrimSpace(val), tool.SpecTombstonePrefix) {
 			continue
 		}
-		// 打捞槽位（salvage:<domain>）不走通用共享注入：域相关性强，通用注入会污染
-		// 无关子 Agent 上下文；由同域重派经 withPriorSalvage 显式读回（TODO #20 第三层）。
+		// 遗留打捞槽位（salvage:<domain>）不走通用共享注入：域相关性强，通用注入会污染
+		// 无关子 Agent 上下文。槽位读写已删（TODO #24 批二⑩，黑板单通道），此过滤仅为
+		// 历史遗留值兜底（旧盘上文件不经此路径外泄）。
 		if strings.HasPrefix(slotName, salvageSlotPrefix) {
 			continue
 		}
@@ -5637,6 +5681,19 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain str
 	return strings.TrimRight(strings.Join(parts, "\n\n"), "\n")
 }
 
+// resolveSpecKeyCandidates 返回 spec 键三级回退候选序：domain 专属键 → 遗留单键
+// → 唯一 keyed spec。hasFreshSpec 与 dispatchSpecFiles 共用，防两套回退口径漂移。
+func (d *Dispatcher) resolveSpecKeyCandidates(ctx context.Context, parentID, domain string) []string {
+	keys := []string{specKeyFor(parentID, domain)}
+	if strings.TrimSpace(domain) != "" {
+		keys = append(keys, parentID+":"+specSlotName)
+	}
+	if ks := d.specKeysOfParent(ctx, parentID); len(ks) == 1 {
+		keys = append(keys, ks[0])
+	}
+	return keys
+}
+
 // hasFreshSpec 校验 parentID 的 spec 是否存在且新鲜（Spec.Goal 非空 + 至少一条
 // Acceptance + files mtime 一致）。供 callSubAgentTool.Execute 在 SpecEnforcementEnabled
 // 开启时调用，缺失则拒绝派发。domain 非空时校验该领域专属 spec（TODO #65 多 key 化），
@@ -5652,34 +5709,25 @@ func (d *Dispatcher) hasFreshSpec(ctx context.Context, parentID, domain string) 
 	if d.sharedMem == nil {
 		return false, "spec missing: 共享记忆未启用"
 	}
-	ok, reason := d.checkSpecKey(ctx, specKeyFor(parentID, domain))
-	if ok {
+	candidates := d.resolveSpecKeyCandidates(ctx, parentID, domain)
+	ok, reason := d.checkSpecKey(ctx, candidates[0])
+	if ok || !strings.Contains(reason, "missing") {
 		return ok, reason
 	}
-	if strings.TrimSpace(domain) == "" {
-		// reuse 派发省略 domain：主键（=遗留单键）已由上面查过，唯一 keyed spec
-		// 候选回退对称放行--复用派发刚写的 spec 用任意 key 都能命中，消除复用路径摩擦。
-		if strings.Contains(reason, "missing") {
-			if keys := d.specKeysOfParent(ctx, parentID); len(keys) == 1 {
-				if altOK, _ := d.checkSpecKey(ctx, keys[0]); altOK {
-					return true, fmt.Sprintf("spec 按唯一候选放行（key=%q）--reuse 派发可在 call_sub_agent 的 domain 参数填该 key 对应 domain 以消除歧义", keys[0])
-				}
-			}
+	domainTrimmed := strings.TrimSpace(domain)
+	// 回退链（与 dispatchSpecFiles 同口径）：遗留单键（仅 domain 非空）→ 唯一 keyed spec。
+	for i, key := range candidates[1:] {
+		if altOK, _ := d.checkSpecKey(ctx, key); !altOK {
+			continue
 		}
-		return ok, reason
-	}
-	// 领域专属 spec 缺失 → 回退遗留单键（老流程兼容）；仅当单键存在且新鲜才放行。
-	if strings.Contains(reason, "missing") {
-		if legacyOK, _ := d.checkSpecKey(ctx, parentID+":"+specSlotName); legacyOK {
+		// 遗留单键回退（domain 非空时的第二级）：老流程兼容，无警告。
+		if i == 0 && domainTrimmed != "" {
 			return true, ""
 		}
-		// 唯一候选回退（TODO #74）：该 parent 下仅存在一个 keyed spec（spec:<key>）时，
-		// 按该唯一候选校验并在通过时附警告——自由命名的 key 与 domain 错配不再双双报错。
-		if keys := d.specKeysOfParent(ctx, parentID); len(keys) == 1 {
-			if altOK, _ := d.checkSpecKey(ctx, keys[0]); altOK {
-				return true, fmt.Sprintf("spec key %q 与 domain %q 不一致，已按唯一候选放行——后续 WriteSpec 的 key 请与 call_sub_agent 的 domain 对齐", keys[0], strings.TrimSpace(domain))
-			}
+		if domainTrimmed == "" {
+			return true, fmt.Sprintf("spec 按唯一候选放行（key=%q）--reuse 派发可在 call_sub_agent 的 domain 参数填该 key 对应 domain 以消除歧义", key)
 		}
+		return true, fmt.Sprintf("spec key %q 与 domain %q 不一致，已按唯一候选放行——后续 WriteSpec 的 key 请与 call_sub_agent 的 domain 对齐", key, domainTrimmed)
 	}
 	return ok, reason
 }
@@ -5830,7 +5878,7 @@ func (d *Dispatcher) WithSharedMemory(r tool.SharedMemoryStore) *Dispatcher {
 // outcome 标记执行状态（blockOutcomeSuccess/Partial/Fail），写入 Meta 供召回侧排序：
 // success 优先、partial/fail 降权为避坑经验，避免失败记忆与成功记忆并列误导子 Agent。
 //
-// parentID/taskDomain/filesModified 是黑板模式（TODO #42）scope 标签：写入 Meta 的 parent_id/
+// parentID/taskDomain/filesModified 是黑板模式scope 标签：写入 Meta 的 parent_id/
 // task_domain/files_modified，供 BlackboardSearcher.Query 按 scope 确定性过滤（兄弟产出按 scope
 // 共享，替纯语义召回的跨 scope 串扰）。taskDomain 为空时仅落语义召回可用字段，scope 查询召回不到。
 //
@@ -6093,7 +6141,7 @@ func renderRecalledMemory(header string, recs []*types.KnowledgeRecord) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
-// injectScopedRecall 黑板模式（TODO #42）scope 确定性召回：优先 BlackboardSearcher.Query
+// injectScopedRecall 黑板模式scope 确定性召回：优先 BlackboardSearcher.Query
 // 按 parent_id + task_domain 过滤（兄弟产出按 scope 共享，每个 Agent 只取自己 scope 切片）；
 // searcher 未实现 BlackboardSearcher（mock）/ scope 0 命中 / 出错时回退 SearchBlockMemoryByGoal
 // 语义召回（向后兼容旧数据与现有测试）。query 为语义检索目标文本（原始任务，避免空串向量召回垃圾）。
@@ -6157,12 +6205,6 @@ func (d *Dispatcher) injectScopedRecall(ctx context.Context, parentID, taskDomai
 	return prefix + "\n\n【当前任务】\n" + task, recs
 }
 
-// injectRecalledMemory 旧语义召回 wrapper（向后兼容现有测试调用点）：不带 scope，
-// 走 injectScopedRecall 的回退路径（纯语义 SearchBlockMemoryByGoal）。
-func (d *Dispatcher) injectRecalledMemory(ctx context.Context, query, task string) (string, []*types.KnowledgeRecord) {
-	return d.injectScopedRecall(ctx, "", "", query, task)
-}
-
 // blockOutcomeRank 返回 outcome 的排序权重：success=0 优先召回，partial/fail 降权为避坑经验。
 // 历史记录缺 outcome 字段时按 success 处理（旧数据全部来自成功路径沉淀，向后兼容）。
 func blockOutcomeRank(meta map[string]any) int {
@@ -6213,17 +6255,10 @@ func staleFilePaths(files map[string]int64) []string {
 	return bad
 }
 
-// verifyFileMtimes 校验各 path 当前 mtime 与 frontmatter 中记录的是否一致。
-// 任一 path stat 失败或 mtime 不匹配返回 false（视为 stale）。
+// verifyFileMtimes 校验各 path 当前 mtime 与记录的是否一致（spec frontmatter / 契约检查
+// capture 快照共用）。任一 path stat 失败或 mtime 不匹配返回 false（视为 stale）。
 // 空 Files 视为通过（无 path 需校验，可能是旧 entry 或纯结论摘要）。
 func verifyFileMtimes(files map[string]int64) bool {
-	return len(staleFilePaths(files)) == 0
-}
-
-// recMtimesMatch 变更屏障（TODO #62 时序串行化）：契约检查前比对 capture 时刻的
-// files mtime 快照与当前磁盘状态，全部一致返回 true。任何文件被兄弟返工落地改写
-// 即 false（跳过该份契约检查，避免对着旧状态误报）。空快照视为一致。
-func recMtimesMatch(files map[string]int64) bool {
 	return len(staleFilePaths(files)) == 0
 }
 
@@ -6235,13 +6270,23 @@ func partialSuffix(partial string) string {
 	return "\n当前已完成的部分进度：\n" + partial
 }
 
-// truncateRunes 按 rune 数截断字符串并追加省略提示。
+// truncateRunes 按 rune 数截断字符串并追加省略提示（textutil 单源）。
 func truncateRunes(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
+	return textutil.TruncateRunes(s, n, "...(truncated)")
+}
+
+// notifyTerminal 终态回传父邮箱（同一 run 至多一条，TODO #24 顺手修①）：
+// 巡检杀（killStuckSubAgent）与墙钟/超时失败、软停部分回传、成功等分支可同时收口，
+// 此前父会收到 killed/timeout 矛盾双消息。meta 缺失（resume/复用重建间隙）退化为直发，
+// 保持既有语义（批量聚合/纪要等非终态通道不走本函数）。
+func (d *Dispatcher) notifyTerminal(subAgentID, parentID, msg string, files []string) {
+	if v, ok := d.subMeta.Load(subAgentID); ok {
+		if m, ok2 := v.(*subAgentMeta); ok2 {
+			m.notifyOnce.Do(func() { d.notify(parentID, subAgentID, msg, files) })
+			return
+		}
 	}
-	return string(runes[:n]) + "...(truncated)"
+	d.notify(parentID, subAgentID, msg, files)
 }
 
 // notify 向父 Agent 邮箱发送一条子 Agent 完成或失败的通知消息。
@@ -6290,12 +6335,6 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 		log.Printf("[subagent] notify dead-letter: to=%s from=%s err=%v", parentID, subAgentID, err)
 	}
 }
-
-// mailboxReturnDumpRunes 超过该 rune 数的回传全文落盘、邮箱只留摘要。
-const mailboxReturnDumpRunes = 4000
-
-// mailboxReturnDigestRunes 落盘时邮箱保留的摘要头 rune 数。
-const mailboxReturnDigestRunes = 1500
 
 // runeLen 返回字符串 rune 数。
 func runeLen(s string) int { return len([]rune(s)) }
@@ -6406,9 +6445,3 @@ func sessionIDFromAgentID(agentID string) string {
 	return agentID
 }
 
-// MarshalResult 将 tool.Result 序列化为 JSON 字符串，用于 blades 工具响应。
-func MarshalResult(r *tool.Result) string {
-	// 忽略序列化错误：tool.Result 结构由可控字段组成，通常不会序列化失败。
-	b, _ := json.Marshal(r)
-	return string(b)
-}

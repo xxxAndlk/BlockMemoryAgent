@@ -91,13 +91,16 @@ func (d *Dispatcher) lastCheckpointBrief(agentID string) string {
 	return rec.brief
 }
 
-// resolveReviveMode 归一化处置档：空=auto（失败→剪枝重派默认，其余→同支续跑）。
+// resolveReviveMode 归一化处置档：空=auto。auto 映射（TODO #24 顺手修②）：
+// Failed / Cancelled / 带错误 → 剪枝重派（回滚到检查点；Cancelled 此前落 continue，
+// 会把 kill 消息/中断片段当"上一轮结果"带进种子，语义上更该 prune）；
+// Done / delivered-unverified → 同支续跑（用户直连跟进语义，保留上轮结果）。
 func resolveReviveMode(node orchestrator.Node, mode ReviveMode) ReviveMode {
 	switch mode {
 	case RevivePrune, ReviveContinue, ReviveFork:
 		return mode
 	}
-	if node.Status == orchestrator.StatusFailed || node.Err != "" {
+	if node.Status == orchestrator.StatusFailed || node.Status == orchestrator.StatusCancelled || node.Err != "" {
 		return RevivePrune
 	}
 	return ReviveContinue
@@ -161,11 +164,7 @@ func (d *Dispatcher) ReviveFork(ctx context.Context, node orchestrator.Node, use
 	}
 	subAgentCtx = tool.WithWorkDir(subAgentCtx, d.subAgentWorkDirFor(ctx))
 	// 墙钟与复活路径同口径：domain 无显式预算时用侦察墙钟兜底。
-	effectiveTimeout := d.timeout
-	if roleDef.ID == "domain" && d.domainReconClock > 0 &&
-		(effectiveTimeout <= 0 || d.domainReconClock < effectiveTimeout) {
-		effectiveTimeout = d.domainReconClock
-	}
+	effectiveTimeout := d.effectiveWallClock(roleDef.ID, 0)
 	var cancel context.CancelFunc = func() {}
 	if effectiveTimeout > 0 {
 		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)

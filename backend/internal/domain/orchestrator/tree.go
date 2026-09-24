@@ -44,7 +44,7 @@ const (
 	// 与 Paused 区分:Paused=任务中断待续(等"继续"),Idle=任务完结待复用。
 	// Idle 非终态:可 Cancel(硬取消/话题切换)、可 Finish(TTL 到期销毁)、可 Wake(复用)。
 	StatusIdle
-	// StatusUnverified 标记"已交付但未验证"（TODO #60 三态化）：
+	// StatusUnverified 标记"已交付但未验证"（三态化）：
 	// 产出已回传（正文含结果），但缺少机器可执行的验证证据（L0 证据缺/校验不可用），
 	// 非失败语义——看板标黄不标红，由父 Agent 决定补验证或收口。
 	// 与 Failed 区分:Failed=真失败(冒烟不过/超时/守卫终止),Unverified=产出可用但没证据。
@@ -171,7 +171,7 @@ func (t *Tree) Finish(id, summary string, err error) {
 	t.finishWithStatus(id, summary, StatusDone, "")
 }
 
-// FinishUnverified 标记节点"已交付但未验证"（TODO #60 三态化）：
+// FinishUnverified 标记节点"已交付但未验证"（三态化）：
 // errVerifyMissing/errUnverified 类缺证据产出走此通道——节点不标红（非失败语义），
 // summary 附产出，reason 记缺证据原因。其余语义与 Finish 相同。
 func (t *Tree) FinishUnverified(id, summary, reason string) {

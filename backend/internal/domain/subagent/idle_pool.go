@@ -833,7 +833,7 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 			d.saveSlotMessages(s, result.History)
 			partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 			d.boardUpdate(taskCtx, s.parentID, s.domain, board.TaskFailed, truncateRunes(partial, 300))
-			d.notify(s.parentID, s.id, "子 Agent 已被用户停止，当前任务中断；成果已保留，热驻待复用。\n"+partial, files)
+			d.notifyTerminal(s.id, s.parentID, "子 Agent 已被用户停止，当前任务中断；成果已保留，热驻待复用。\n"+partial, files)
 			d.trackChildDoneOnce(s)
 			d.enterIdle(s, "user stop: "+partial)
 			log.Printf("[subagent] SOFT-STOP IDLE: sub=%s domain=%s duration=%s", s.id, s.domain, duration)
@@ -885,20 +885,14 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 		log.Printf("[subagent] FAIL: sub=%s domain=%s duration=%s err=%v partial=%q", s.id, s.domain, duration, err, truncateRunes(partial, 200))
 		salvage := d.salvageFailure(taskCtx, s.parentID, s.id, s.slotRoleDef(), s.domain, result, partial)
 		kind := failureKindOf(taskCtx, err)
-		msg := failureMarker(kind, false) + "\n" + formatSubAgentFailure(taskCtx, err, result, d.effectiveTimeout(s.id), partial)
-		if salvage != "" {
-			msg += "\n\n" + salvagePrefixMarker + salvage
-		}
-		// 状态语义三态化（TODO #60）：缺验证证据非失败——树落 delivered-unverified、看板标黄。
-		boardSt := board.TaskFailed
-		treeStatus := orchestrator.StatusFailed
-		if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
-			boardSt = board.TaskUnverified
-			treeStatus = orchestrator.StatusUnverified
-		}
+		// 双调修复（TODO #24 批二②）：failText 一次计算复用，此前 888/900 两行各调一次。
+		failText := formatSubAgentFailure(taskCtx, err, result, d.effectiveTimeout(s.id), partial)
+		msg := hotResidentFailureNotice(kind, failText, salvage)
+		// 状态语义三态化：缺验证证据非失败——树落 delivered-unverified、看板标黄。
+		boardSt, treeStatus := failureStatusTri(kind)
 		d.boardUpdate(taskCtx, s.parentID, s.domain, boardSt, truncateRunes(msg, 300))
-		d.treeFinishStatus(taskCtx, s.id, partial, treeStatus, formatSubAgentFailure(taskCtx, err, result, d.effectiveTimeout(s.id), partial))
-		d.notify(s.parentID, s.id, msg, files)
+		d.treeFinishStatus(taskCtx, s.id, partial, treeStatus, failText)
+		d.notifyTerminal(s.id, s.parentID, msg, files)
 		d.trackChildDoneOnce(s)
 		return domainTaskFailed
 	}
@@ -914,7 +908,7 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 		summary = fmt.Sprintf("【校验:通过(%s)】\n%s", result.VerifyNote, result.Text)
 	}
 	d.saveBlockMemory(taskCtx, s.id, "domain", s.parentID, s.domain, s.lastTaskGoal(), result.Text, blockOutcomeSuccess, files, result.History)
-	d.notify(s.parentID, s.id, summary, files)
+	d.notifyTerminal(s.id, s.parentID, summary, files)
 	d.trackChildDoneOnce(s)
 	d.enterIdle(s, summary)
 	return domainTaskDone
@@ -957,7 +951,7 @@ func (d *Dispatcher) wallClockWrapUp(s *domainSlot, taskCtx context.Context, res
 	}
 	d.boardUpdate(taskCtx, s.parentID, s.domain, board.TaskFailed, truncateRunes(msg, 300))
 	d.treeFinishStatus(taskCtx, s.id, partial, orchestrator.StatusFailed, fmt.Sprintf("wall clock budget %v exhausted", budget))
-	d.notify(s.parentID, s.id, msg, files)
+	d.notifyTerminal(s.id, s.parentID, msg, files)
 	d.trackChildDoneOnce(s)
 	log.Printf("[subagent] WALL CLOCK WRAP-UP: sub=%s domain=%s duration=%s budget=%v (parent notified, pending decremented)",
 		s.id, s.domain, duration, budget)
@@ -1008,19 +1002,11 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 	if roleDef == nil {
 		return nil, fmt.Errorf("domain role not found")
 	}
-	if hint := strings.TrimSpace(s.domain); hint != "" {
-		roleDef.Name = textutil.TruncateRunes(hint, 16, "…") + "领域Agent"
+	if n := domainAgentDisplayName(s.domain, ""); n != "" {
+		roleDef.Name = n
 	}
 	// responsibility 头注入（同 runSubAgentOnce，冻结进实例 systemPrompt）。
-	if resp := strings.TrimSpace(s.responsibility); resp != "" {
-		domainLabel := strings.TrimSpace(s.domain)
-		if domainLabel == "" {
-			domainLabel = "综合"
-		}
-		header := fmt.Sprintf("你是负责【%s】领域的 DomainAgent。\n你的职责：%s\n"+
-			"只实现/改写职责内的文件与模块；职责外的文件禁止创建或修改，"+
-			"需要的跨领域数据从共享记忆契约或 ReadFile 读取。",
-			textutil.TruncateRunes(domainLabel, 16, "…"), textutil.TruncateRunes(resp, 200, "…"))
+	if header := domainResponsibilityHeader(s.domain, s.responsibility); header != "" {
 		roleDef.SystemPrompt = roleDef.SystemPrompt + "\n\n" + header
 	}
 	// 运行时身份块注入（同 runSubAgentOnce，2026-09-21）：槽创建时点（首派）的兄弟名册
@@ -1045,7 +1031,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 	// 拓扑名册实时刷新（2026-09-21 可见性矩阵，热驻路径补齐）：槽的系统提示词创建时
 	// 冻结（身份块首注快照），复用续作不再重注——每轮【拓扑名册更新】是本路径唯一的
 	// 拓扑更新通道。seeded=创建时点名册，此后每轮 diff（任何变化注入全量当前名册）。
-	// 黑板摄取（兄弟产出）此处不挂——热驻路径该缺口为旧账（TODO #42 仅非热驻路径），
+	// 黑板摄取（兄弟产出）此处不挂——热驻路径该缺口为旧账（仅非热驻路径），
 	// 本轮只补名册刷新，不扩散行为面。
 	{
 		liveRoster := func() []rosterEntry {
@@ -1694,9 +1680,10 @@ func (d *Dispatcher) recoverSlotPanic(s *domainSlot) {
 		return
 	}
 	log.Printf("[subagent] PANIC RECOVERED: supervisor sub=%s domain=%s panic=%v", s.id, s.domain, r)
+	var doneOnce *sync.Once
 	if v, ok := d.subMeta.LoadAndDelete(s.id); ok {
 		if m, ok2 := v.(*subAgentMeta); ok2 {
-			m.doneOnce.Do(func() { d.trackChildDone(s.parentID) })
+			doneOnce = &m.doneOnce
 		}
 	}
 	d.pool.remove(s.sessionID, s.id)
@@ -1704,13 +1691,8 @@ func (d *Dispatcher) recoverSlotPanic(s *domainSlot) {
 	d.activity.Delete(s.id)
 	d.lastWrites.Delete(s.id)
 	d.heldSkills.Delete(s.id)
-	if d.treeFn != nil && s.sessionID != "" {
-		if t := d.treeFn(s.sessionID); t != nil {
-			t.Finish(s.id, "panic recovered", errPanicRecovered)
-		}
-	}
 	if d.mailbox != nil {
 		d.mailbox.Purge(s.id)
 	}
-	d.notify(s.parentID, s.id, failureMarker(FailureKindKilled, true)+"\n子 Agent 因内部异常（panic）被回收，任务未回传；父未决计数已补偿递减。", nil)
+	d.panicNotifyParent(s.parentID, s.id, s.sessionID, doneOnce)
 }

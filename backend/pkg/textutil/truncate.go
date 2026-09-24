@@ -2,6 +2,16 @@ package textutil
 
 import "unicode/utf8"
 
+// TruncateHeadTail 超长时保留头部 head 个 rune + 尾部 tail 个 rune，中间以省略标记连接。
+// 用于长输出尾部含最终结论的场景（事实提取/摘要），比只裁尾少丢结论段。
+func TruncateHeadTail(s string, head, tail int) string {
+	r := []rune(s)
+	if len(r) <= head+tail {
+		return s
+	}
+	return string(r[:head]) + "\n...(中间省略)...\n" + string(r[len(r)-tail:])
+}
+
 // TruncateRunes 按 rune（字符）截断字符串，超长时追加 suffix。
 //
 // 参数:

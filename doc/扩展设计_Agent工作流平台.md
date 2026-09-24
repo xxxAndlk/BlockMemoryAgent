@@ -2,7 +2,7 @@
 
 > 从"编程助手"扩展为"Agent 工作流平台"，支持编排、测试、研究、团队协作等多场景。核心设计理念不变：上下文恒定、话题隔离、跨会话记忆。
 >
-> 本文为扩展愿景，未实现；其中架构叙述（Router / Agent Core / SessionBlock 等）基于 v3 历史框架，当前实现以 `doc/项目说明.md` 为准（单一 ReAct 主循环 + `call_sub_agent` 分发，无 Router/状态机）。
+> 本文为扩展愿景，未实现；其中架构叙述（Router / Agent Core / SessionBlock 等）基于 v3 历史框架，当前实现以 `doc/技术逻辑/`（16 章代码级还原）为准（单一 ReAct 主循环 + `call_sub_agent` 分发，无 Router/状态机）。
 
 ---
 

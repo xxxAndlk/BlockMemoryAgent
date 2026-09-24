@@ -1,6 +1,6 @@
 package subagent
 
-// smoke_check.go 提供域完成机器校验冒烟层（TODO #56 校验三层方案第一层）：
+// smoke_check.go 提供域完成机器校验冒烟层（校验三层方案第一层）：
 // dispatcher 在子 Agent 完成收尾路径对 spec.files ∩ 本子 Agent 实际写入文件
 // 自动派生并执行冒烟命令（.js → node --check、.go → gofmt -l、.ts → tsc --noEmit），
 // 零 LLM 调用，结果以【机器校验】段入完成摘要（dispatcher 执行，非 agent 自述）。

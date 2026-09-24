@@ -634,7 +634,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注入共享记忆 KV：话题切换时把旧 Agent 树摘要写入 `topic:{id}:summary`,
 	// 供新话题 MetaAgent 召回(召回注入侧步骤 4 part C 未做,摘要已落 KV)。
 	agentSvc.SetSharedMemoryStore(sharedKV)
-	// 注入破坏性操作审批钩子（TODO #17 P1）：命中生产边界/危险命令模式时
+	// 注入破坏性操作审批钩子：命中生产边界/危险命令模式时
 	// 工具调用暂停会话推「需确认」事件，用户答复经 sendMessage/answerClarify 路由回放行。
 	// approvalHook 非 nil 仅影响命中边界的调用，常规编码流零阻塞。
 	// 等待用户答复期间的心跳保活：审批/提问阻塞时周期性刷新子 Agent 活动时间，
@@ -650,10 +650,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err := agentSvc.SetDefaultGear(cfg.Agent.DefaultGear); err != nil {
 		return nil, fmt.Errorf("invalid agent.default_gear: %w", err)
 	}
-	// 外部知识库检索（TODO #27 热路径 a）：search_knowledge 工具 → retriever 混合检索。
+	// 外部知识库检索（热路径 a）：search_knowledge 工具 → retriever 混合检索。
 	// 混合检索后端 = KnowledgeStore（直接满足 HybridSearchBackend：SearchByType + SearchKeywords）。
 	// 嵌入用全局 embedder（roles.yaml embed 段；当前 pseudo，真实 embed 激活后自动升级）。
-	kbRetriever := retriever.NewGlobalKnowledgeRetriever(nil, nil, embedder)
+	kbRetriever := retriever.NewGlobalKnowledgeRetriever(embedder)
 	kbRetriever.SetHybridBackend(pgStore.Knowledge)
 	toolRegistry.SetKnowledgeSearchHook(func(ctx context.Context, query string, topK int) (string, error) {
 		hits, err := kbRetriever.SearchHybrid(ctx, query, enums.KnowledgeTypeExternalKB, topK)
@@ -836,7 +836,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	agentSvc.SetTaskLedgerProvider(subAgentDispatcher.TaskLedgerBrief)
 	// 记忆索引槽（TODO #20③+#22③，memory_index.go）：会话启动注入一行式沉淀索引
 	//（行数/runes 双配额 + 超限重写指令），untrusted 围栏行结构性丢弃（信任分层）。
-	agentSvc.SetMemoryIndexProvider(newMemoryIndexProvider(pgStore.Knowledge, profileStore, cfg.Agent.MemoryIndexMaxLines, cfg.Agent.MemoryIndexMaxRunes))
+	agentSvc.SetMemoryIndexProvider(newMemoryIndexProvider(pgStore.Knowledge, cfg.Agent.MemoryIndexMaxLines, cfg.Agent.MemoryIndexMaxRunes))
 	agentSvc.SetIdleTTLArmer(subAgentDispatcher)
 	// 活动证据展示面（TODO 第10项②）：ListAgents 填充各节点 ActivityKind/LastActivityAgo，
 	// TUI/Web 渲染 "in <tool> · active Xs ago" 让假死可见。

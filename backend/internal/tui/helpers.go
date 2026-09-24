@@ -114,7 +114,7 @@ func (m *Model) boardSnapshot(s *server.Session) board.Snapshot {
 		case orchestrator.StatusFailed:
 			st = board.TaskFailed
 		case orchestrator.StatusUnverified:
-			// 已交付未验证（TODO #60）：看板标黄不标红。
+			// 已交付未验证：看板标黄不标红。
 			st = board.TaskUnverified
 		case orchestrator.StatusPaused:
 			// 触达 token 上限暂停（待用户"继续"）：展示为 Blocked 而非 Running。

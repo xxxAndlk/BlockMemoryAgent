@@ -5,20 +5,26 @@
 ## 1. 单元测试
 
 ```bash
-cd D:/data/project/BlockMemoryAgent
-GOTOOLCHAIN=local go test ./backend/... -count=1
+cd D:/data/project/BlockMemoryAgent/backend
+GOTOOLCHAIN=local go test ./... -count=1
 ```
 
-关键包覆盖：`internal/board`、`internal/mailbox`、`internal/skill`、`internal/soul`、`internal/watchdog`、`internal/config`、`internal/model`、`internal/memory`、`internal/server`、`internal/tui`、`internal/graph`。
+关键包覆盖（现行，2026-09-24 复核）：`internal/agent`、`internal/domain/subagent`、`internal/domain/tool`、`internal/domain/memory`、`internal/domain/orchestrator`、`internal/board`、`internal/mailbox`、`internal/skill`、`internal/soul`、`internal/config`、`internal/model`、`internal/server`、`internal/tui`、`internal/bootstrap`、`internal/store`、`internal/retriever`、`internal/plugins`、`pkg/textutil` 等 37 个 `_test.go`。**历史包已删**：`internal/watchdog`、`internal/memory`、`internal/graph`、`internal/runtime` 死重（ReAct 重构期清理，见 `doc/变更.md`）。
 
 ## 2. 集成测试
 
-集成测试位于独立模块 `test/`，使用 mock LLM 驱动完整 graph + memory 栈。
+集成测试位于独立模块 `test/`（`module .../backend/test`，`replace` 指向 `../backend`；根 `go.work` 当前**不含** `./test`，在 `test/` 目录内独立跑）。31 个文件带 `//go:build integration` 标签，用 mock LLM/SSE 驱动完整链路（`test/coding/` 编程场景、`test/api/` HTTP 端点、`fixtures/` 共享测试基建）。
 
 ```bash
-# 依赖：PostgreSQL + Redis 已启动并应用 migrations/*.sql
-GOTOOLCHAIN=local go test -tags=integration ./test/... -count=1
+cd D:/data/project/BlockMemoryAgent/test
+# 纯单测（无 tag，如 role_config_sanity_test.go）：
+GOTOOLCHAIN=local go test ./... -count=1
+# 集成套件（需 PG + Redis：fixtures 经 docker-compose.test.yml 起共享容器，
+# 隔离端口 PG 55432 / Redis 56380，每包独立库；表结构由服务启动期 ensureSchemas 幂等自举）
+GOTOOLCHAIN=local go test -tags integration ./... -count=1
 ```
+
+> 注：PG/Redis 集成套件曾在 commit b35f87e 移除，其后按新端点逐步重建（现行 37 个 `_test.go`，与 `doc/TODO.md` #1 口径一致）；**无需手工执行 `migrations/*.sql`**——表结构由服务启动期 `ensureSchemas` 幂等自举（见 `doc/技术逻辑/10-存储层与数据表.md`）。
 
 ### 2.1 编程主场景（`test/coding/`）
 

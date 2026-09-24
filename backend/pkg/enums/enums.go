@@ -135,7 +135,7 @@ const (
 	// 终态,触发升级/上抛给更高层 Agent 处理。
 	RoleStatusError RoleStatus = "error"
 
-	// RoleStatusUnverified 未验证:产出已交付但缺机器可执行验证证据（TODO #60 三态化）。
+	// RoleStatusUnverified 未验证:产出已交付但缺机器可执行验证证据（三态化）。
 	// 终态,非失败语义——展示标黄不标红,由父 Agent 决定补验证或收口。
 	RoleStatusUnverified RoleStatus = "unverified"
 )
@@ -245,7 +245,7 @@ const (
 	// 见 internal/memory/block_vector.go,跨会话复用 DomainAgent 经验。
 	KnowledgeTypeBlockMemory KnowledgeType = "block_memory"
 
-	// KnowledgeTypeExternalKB 外部知识库:预置领域文档（TODO #27 外部知识库检索层）。
+	// KnowledgeTypeExternalKB 外部知识库:预置领域文档（外部知识库检索层）。
 	// 只读为主、与块记忆（block_memory）分层：摄入管道切块落库（meta.namespace=external），
 	// search_knowledge 工具 / 混合检索按此类型召回。
 	KnowledgeTypeExternalKB KnowledgeType = "external_kb"

@@ -1,6 +1,6 @@
 package middleware
 
-// llm.go 实现 LLM 链（TODO #19 Phase 1 起点）：
+// llm.go 实现 LLM 链（中间件链 Phase 1 起点）：
 // RetryLLM + CallLLM 迁移自 ReActAgent.generate 的重试/超时/审计逻辑，
 // 行为保持不变（4xx 快速失败、DeadlineExceeded 不重试、指数退避、空响应不重试）。
 

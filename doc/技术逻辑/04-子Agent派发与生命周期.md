@@ -210,7 +210,7 @@
 
 - `ResumePaused`（4080-4239）：前置（sid/tree/msgStore）→ 续跑次数检查（达 `maxPausedResumes` → `concludePaused` 强制收口）→ `msgStore.LoadMessages` 重建 → domain 名覆写 + 黑板摄取包装 → 构造 ReActAgent（同 runSubAgentOnce 接线）→ `t.Resume` + activity 注册 → `RunWithHistory(ctx,"继续",msgs)` → 三态：再触限（存史+再 Pause+notify）、出错（treeFinish+notify+trackChildDone）、完成（落史+tree.Finish+notify+trackChildDone）。
 - `resumePausedNode`（4248-4272）：异步 goroutine 包装 + 失败兜底通知（节点仍 Paused 时补失败邮件，防永久挂账）。
-- `ReviveWithMessage`（1102-1200）：用户直连复活终态节点——`tree.Reopen` + SetCancel；种子 = 原任务 + 上轮 Summary/Err + 用户消息；trackChildStart；**mailbox.Reopen**（原 run 已 Purge，不重开则死信）；**msgLogger.Clear**（seq 重新编号）；**`msgStore.DeleteMessages`（2026-09-17）作废旧 run 的终态消息快照**——热层清空后读路径在热层不足时会 PG 兜底，把旧快照当成当前对话续上（面板显示新内容又跳回旧内容）；只清该子 Agent，会话级消息保留供进程重启恢复；看板翻回进行中；goroutine runSubAgent(mode=react)；给父发"复活返工，勿重复派发"邮件；ledger 重记。
+- `ReviveWithMessage`（1102-1200）：用户直连复活终态节点——`tree.Reopen` + SetCancel；种子 = 原任务 + 检查点账本/上轮结果（按处置档，TODO #20④）+ 用户消息；trackChildStart；**mailbox.Reopen**（原 run 已 Purge，不重开则死信）；**msgLogger.Clear**（seq 重新编号）；**`msgStore.ArchiveMessages`（#20① 起；原名 DeleteMessages，2026-09-17 引入时是物理删）把旧 run 的终态消息快照移归档 `archived=true`**——底账 append-only 不物理删，读路径只取 archived=false 防旧快照续上；只归档该子 Agent，会话级消息保留供进程重启恢复；看板翻回进行中；goroutine runSubAgent(mode=react)；给父发"复活返工，勿重复派发"邮件；ledger 重记。
 - `InjectUserMessage`（1081-1096）：From="user" 邮件 + pokeParent。
 
 ## 4.11 失败分类与结构化失败标记

@@ -99,6 +99,19 @@ func TestPruneSeedExcludesFailureTrail(t *testing.T) {
 	if !strings.Contains(seed2, "上一轮已写 config.js") {
 		t.Fatalf("continue seed must keep last summary, got:\n%s", seed2)
 	}
+
+	// Cancelled（Err 空，Cancel 只置状态）auto 档走剪枝：kill 消息/中断片段不进种子（TODO #24 顺手修②）。
+	cancelled := orchestrator.Node{
+		ID: "s1/domain-1", Task: "实现 config.js", Summary: "【failure kind=killed】被巡检取消",
+		Status: orchestrator.StatusCancelled,
+	}
+	if got := resolveReviveMode(cancelled, ReviveAuto); got != RevivePrune {
+		t.Fatalf("cancelled node should auto-resolve to prune, got %v", got)
+	}
+	seed3 := d.buildReviveSeed(cancelled, "继续", resolveReviveMode(cancelled, ReviveAuto))
+	if strings.Contains(seed3, "failure kind=killed") {
+		t.Fatalf("cancelled prune seed must exclude kill notice, got:\n%s", seed3)
+	}
 	_ = tr
 }
 

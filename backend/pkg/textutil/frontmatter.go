@@ -1,10 +1,27 @@
 package textutil
 
 import (
+	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// RenderSkillFrontmatter 渲染经验技能文件头（name/title/when_to_use[/outcome] + 闭合围栏）。
+// bootstrap/evolver、bootstrap/skill_consolidate、server/learned_skills 三处共用，
+// 防 frontmatter 字段口径漂移。outcome 空串不写该行。
+func RenderSkillFrontmatter(name, title, whenToUse, outcome string) string {
+	var b strings.Builder
+	b.WriteString("---\n")
+	fmt.Fprintf(&b, "name: %s\n", name)
+	fmt.Fprintf(&b, "title: %s\n", title)
+	fmt.Fprintf(&b, "when_to_use: %s\n", whenToUse)
+	if outcome != "" {
+		fmt.Fprintf(&b, "outcome: %s\n", outcome)
+	}
+	b.WriteString("---\n")
+	return b.String()
+}
 
 // ParseFrontmatter 解析 Markdown frontmatter（`---` 围栏的 YAML 块）。
 //

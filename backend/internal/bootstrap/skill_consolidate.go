@@ -264,18 +264,8 @@ func (c *skillConsolidator) disableOne(ctx context.Context, sk *store.LearnedSki
 
 // renderSkillFile 渲染技能文件：frontmatter（name/title/when_to_use/outcome）+ 正文。
 func renderSkillFile(name, title, whenToUse, outcome, body string) string {
-	var b strings.Builder
-	b.WriteString("---\n")
-	fmt.Fprintf(&b, "name: %s\n", name)
-	fmt.Fprintf(&b, "title: %s\n", title)
-	fmt.Fprintf(&b, "when_to_use: %s\n", whenToUse)
-	if outcome != "" {
-		fmt.Fprintf(&b, "outcome: %s\n", outcome)
-	}
-	b.WriteString("---\n\n")
-	b.WriteString(strings.TrimSpace(body))
-	b.WriteString("\n")
-	return b.String()
+	return textutil.RenderSkillFrontmatter(name, title, whenToUse, outcome) + "\n" +
+		strings.TrimSpace(body) + "\n"
 }
 
 // skillFileExcerpt 读技能文件正文前 n 个 rune（剥 frontmatter、压平空白），供整理模型判重。

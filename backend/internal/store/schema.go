@@ -303,7 +303,7 @@ CREATE INDEX IF NOT EXISTS idx_gk_topic ON global_knowledge(topic_id);
 CREATE INDEX IF NOT EXISTS idx_gk_access ON global_knowledge(last_accessed, access_count);
 CREATE INDEX IF NOT EXISTS idx_gk_archived ON global_knowledge(archived);
 CREATE INDEX IF NOT EXISTS idx_global_knowledge_domain ON global_knowledge USING btree ((meta->>'domain'));
--- 外部知识库全文检索（TODO #27）：生成列 + GIN 索引。
+-- 外部知识库全文检索：生成列 + GIN 索引。
 -- 'simple' 配置对英文分词可用；中文需部署 zhparser/pg_jieba 后改 'zhparser'（见 retriever 文档）。
 ALTER TABLE global_knowledge ADD COLUMN IF NOT EXISTS content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;
 CREATE INDEX IF NOT EXISTS idx_gk_content_tsv ON global_knowledge USING GIN (content_tsv);

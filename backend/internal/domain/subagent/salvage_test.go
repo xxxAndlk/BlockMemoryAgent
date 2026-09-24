@@ -69,9 +69,11 @@ func newSalvageTestEnv(t *testing.T, provider agent.ModelProvider) (*Dispatcher,
 
 // TestDispatcher_LoopGuardFailsChildWithSalvage 端到端：子 Agent 反复 ReadFile 同参
 // 命中连读守卫 -> ErrLoopExit -> runSubAgent 失败路径 -> 树 Failed + 父 mailbox 收
-// "被循环守卫终止"失败消息（含【失败打捞】摘要）+ 共享槽位 s1:salvage:配置 可读。
+// "被循环守卫终止"失败消息（含【失败打捞】摘要）+ 打捞摘要落黑板块记忆（source=salvage）。
 func TestDispatcher_LoopGuardFailsChildWithSalvage(t *testing.T) {
 	d, mb, tr, toolsReg, dir := newSalvageTestEnv(t, &loopCallProvider{resp: readFileToolCall("a.txt")})
+	saver := &mockBlockMemorySaver{}
+	d.WithBlockMemorySaver(saver, true)
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("v1"), 0644); err != nil {
 		t.Fatalf("write a.txt: %v", err)
 	}
@@ -127,23 +129,26 @@ func TestDispatcher_LoopGuardFailsChildWithSalvage(t *testing.T) {
 		t.Fatal("domain node not registered in tree")
 	}
 
-	// 打捞槽位 <parentID>:salvage:<domain> 可读（fallback = 末条 assistant 文本截断）。
-	val, err := d.sharedMem.Get(context.Background(), "s1:salvage:配置")
-	if err != nil || strings.TrimSpace(val) == "" {
-		t.Fatalf("salvage slot should be readable, err=%v val=%q", err, val)
+	// 打捞摘要落黑板块记忆（fallback = 末条 assistant 文本截断；slot 通道已删）。
+	rec := saver.lastSaved()
+	if rec == nil {
+		t.Fatal("salvage should be saved to blackboard")
 	}
-	if !strings.Contains(val, "我正在读取文件") {
-		t.Fatalf("salvage slot should hold last assistant text fallback, got: %q", val)
+	if !strings.Contains(rec.Content, "我正在读取文件") {
+		t.Fatalf("blackboard salvage should hold last assistant text fallback, got: %q", rec.Content)
+	}
+	if rec.Meta["source"] != "salvage" || rec.Meta["task_domain"] != "配置" {
+		t.Fatalf("blackboard meta mismatch: %v", rec.Meta)
 	}
 	if !strings.Contains(msg.Body, "失败打捞") {
 		t.Fatalf("failure message should carry salvage summary, got: %s", msg.Body)
 	}
 }
 
-// TestSalvageFailure_WritesSlotWithExtractedFacts 打捞提取成功：槽位写入 LLM 提取的事实。
-func TestSalvageFailure_WritesSlotWithExtractedFacts(t *testing.T) {
+// TestSalvageFailure_WritesBlackboardWithExtractedFacts 打捞提取成功：黑板写入 LLM 提取的事实。
+func TestSalvageFailure_WritesBlackboardWithExtractedFacts(t *testing.T) {
 	_, _, _, _, dir := newSalvageTestEnv(t, &mockProvider{text: "ok"})
-	// 独立构造：注入 fake 提取器 + 共享槽位断言。
+	// 独立构造：注入 fake 提取器 + 黑板写入断言。
 	cfg := &config.RoleConfigFile{
 		MetaAgent: config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		DomainAgent: config.DomainAgentConfig{
@@ -155,8 +160,8 @@ func TestSalvageFailure_WritesSlotWithExtractedFacts(t *testing.T) {
 	toolsReg := tool.NewBuiltinRegistry(dir, nil, nil)
 	mb := mailbox.New()
 	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "ok"}}, toolsReg, mb, agent.NopMemoryPipeline{})
-	shared := tool.NewFileSharedMemoryStore(dir)
-	d.WithSharedMemory(shared)
+	saver := &mockBlockMemorySaver{}
+	d.WithBlockMemorySaver(saver, true)
 	d.WithSalvageExtractor(&mockFactExtractor{facts: []string{"已读: config.js", "卡点: 路径引用错误"}})
 
 	roleDef := reg.Get("domain")
@@ -167,9 +172,9 @@ func TestSalvageFailure_WritesSlotWithExtractedFacts(t *testing.T) {
 	if !strings.Contains(salvage, "已读: config.js") || !strings.Contains(salvage, "卡点") {
 		t.Fatalf("salvage should contain extracted facts, got: %s", salvage)
 	}
-	val, _ := shared.Get(context.Background(), "s1:salvage:配置")
-	if !strings.Contains(val, "已读: config.js") {
-		t.Fatalf("slot should hold extracted facts, got: %q", val)
+	rec := saver.lastSaved()
+	if rec == nil || !strings.Contains(rec.Content, "已读: config.js") {
+		t.Fatalf("blackboard should hold extracted facts, got: %+v", rec)
 	}
 }
 
@@ -183,8 +188,8 @@ func TestSalvageFailure_ExtractorErrorFallsBack(t *testing.T) {
 	reg := role.NewRegistry(cfg)
 	toolsReg := tool.NewBuiltinRegistry(dir, nil, nil)
 	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "ok"}}, toolsReg, mailbox.New(), agent.NopMemoryPipeline{})
-	shared := tool.NewFileSharedMemoryStore(dir)
-	d.WithSharedMemory(shared)
+	saver := &mockBlockMemorySaver{}
+	d.WithBlockMemorySaver(saver, true)
 	d.WithSalvageExtractor(&mockFactExtractor{err: errors.New("llm down")})
 
 	roleDef := reg.Get("domain")
@@ -194,15 +199,14 @@ func TestSalvageFailure_ExtractorErrorFallsBack(t *testing.T) {
 	if !strings.Contains(salvage, "末条部分产出文本") {
 		t.Fatalf("fallback should be last assistant text, got: %q", salvage)
 	}
-	val, _ := shared.Get(context.Background(), "s1:salvage:配置")
-	if !strings.Contains(val, "末条部分产出文本") {
-		t.Fatalf("slot should hold fallback text, got: %q", val)
+	if rec := saver.lastSaved(); rec == nil || !strings.Contains(rec.Content, "末条部分产出文本") {
+		t.Fatalf("blackboard should hold fallback text, got: %+v", rec)
 	}
 }
 
-// TestSalvageFailure_LeafWritesRoleSlot 叶子派发（domain 空）以 role:<roleID> 为 scope 写槽位，
-// 供同角色重派带回前序摘要（2026-08-19：心跳误杀叶子重派不再从零重跑）。
-func TestSalvageFailure_LeafWritesRoleSlot(t *testing.T) {
+// TestSalvageFailure_LeafWritesRoleScopeBlackboard 叶子派发（domain 空）以 role.<roleID>
+// 为 scope 写黑板，供同角色重派带回前序摘要（2026-08-19：心跳误杀叶子重派不再从零重跑）。
+func TestSalvageFailure_LeafWritesRoleScopeBlackboard(t *testing.T) {
 	_, _, _, _, dir := newSalvageTestEnv(t, &mockProvider{text: "ok"})
 	cfg := &config.RoleConfigFile{
 		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
@@ -211,8 +215,8 @@ func TestSalvageFailure_LeafWritesRoleSlot(t *testing.T) {
 	reg := role.NewRegistry(cfg)
 	toolsReg := tool.NewBuiltinRegistry(dir, nil, nil)
 	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "ok"}}, toolsReg, mailbox.New(), agent.NopMemoryPipeline{})
-	shared := tool.NewFileSharedMemoryStore(dir)
-	d.WithSharedMemory(shared)
+	saver := &mockBlockMemorySaver{}
+	d.WithBlockMemorySaver(saver, true)
 
 	roleDef := reg.Get("domain")
 	history := []agent.ReactMessage{{Role: "assistant", Content: "探索成果"}}
@@ -220,43 +224,46 @@ func TestSalvageFailure_LeafWritesRoleSlot(t *testing.T) {
 	if !strings.Contains(salvage, "探索成果") {
 		t.Fatalf("salvage should return text even without domain, got: %q", salvage)
 	}
-	val, err := shared.Get(context.Background(), "s1:salvage:role.domain")
-	if err != nil || !strings.Contains(val, "探索成果") {
-		t.Fatalf("leaf salvage should write role-scoped slot, err=%v val=%q", err, val)
+	rec := saver.lastSaved()
+	if rec == nil || !strings.Contains(rec.Content, "探索成果") {
+		t.Fatalf("leaf salvage should write role-scoped blackboard record, got: %+v", rec)
+	}
+	if rec.Meta["task_domain"] != "role.domain" {
+		t.Fatalf("leaf salvage scope should be role.<roleID>, got: %v", rec.Meta["task_domain"])
 	}
 }
 
-// TestWithPriorSalvage_AppendsToSameDomainReDispatch 同父同 domain 存在 Failed 兄弟：
-// 新任务文本带【前序探索摘要】；无失败兄弟 / 摘要为空时任务零变化。
+// TestWithPriorSalvage_AppendsToSameDomainReDispatch 同父同 domain 重派：黑板命中带
+// 【前序探索摘要】；0 命中 / 未接线 searcher / 空 scope 防御时任务零变化（slot 通道已删）。
 func TestWithPriorSalvage_AppendsToSameDomainReDispatch(t *testing.T) {
-	d, _, tr, _, _ := newSalvageTestEnv(t, &mockProvider{text: "ok"})
-
-	// 注册一个 Failed 兄弟节点（同父同 domain）。
-	tr.Register(orchestrator.Node{ID: "s1/domain-1", ParentID: "s1", Role: "domain", Domain: "配置", Status: orchestrator.StatusRunning})
-	tr.Finish("s1/domain-1", "failed", errors.New("timeout"))
-	_ = d.sharedMem.Set(context.Background(), "s1:salvage:配置", "已读: config.js 结构\n卡点: 渲染接口签名未确认")
+	d, _, _, _, _ := newSalvageTestEnv(t, &mockProvider{text: "ok"})
+	mock := &mockBlackboardSearcher{
+		queryRecs: []*types.KnowledgeRecord{{Content: "已读: config.js 结构\n卡点: 渲染接口签名未确认", Meta: map[string]any{"outcome": "fail"}}},
+	}
+	d.WithBlockMemorySearcher(mock)
 
 	task := d.withPriorSalvage(dispatchCtx(), "s1", "配置", "domain", "实现 config.js 渲染")
 	if !strings.Contains(task, "【前序探索摘要】") || !strings.Contains(task, "config.js") {
 		t.Fatalf("re-dispatch task should carry prior salvage, got: %s", task)
 	}
+	if mock.queryCalls == 0 || mock.lastQueryDomain != "配置" {
+		t.Fatalf("expected blackboard Query by scope, calls=%d domain=%s", mock.queryCalls, mock.lastQueryDomain)
+	}
 
-	// 其他 domain（无失败兄弟）：任务零变化。
-	other := d.withPriorSalvage(dispatchCtx(), "s1", "渲染", "domain", "实现渲染引擎")
-	if other != "实现渲染引擎" {
-		t.Fatalf("task without failed sibling should be unchanged, got: %s", other)
+	// 黑板 0 命中：任务零变化。
+	d2, _, _, _, _ := newSalvageTestEnv(t, &mockProvider{text: "ok"})
+	d2.WithBlockMemorySearcher(&mockBlackboardSearcher{})
+	if got := d2.withPriorSalvage(dispatchCtx(), "s1", "渲染", "domain", "实现渲染引擎"); got != "实现渲染引擎" {
+		t.Fatalf("task without blackboard hit should be unchanged, got: %s", got)
 	}
-	// 叶子派发（domain 空）无同角色失败前任：零变化。
-	empty := d.withPriorSalvage(dispatchCtx(), "s1", "", "code_assistant", "任务")
-	if empty != "任务" {
-		t.Fatalf("leaf without failed sibling should be unchanged, got: %s", empty)
+	// 未接线 searcher：任务零变化。
+	d3, _, _, _, _ := newSalvageTestEnv(t, &mockProvider{text: "ok"})
+	if got := d3.withPriorSalvage(dispatchCtx(), "s1", "配置", "domain", "实现 config.js"); got != "实现 config.js" {
+		t.Fatalf("unwired searcher should leave task unchanged, got: %s", got)
 	}
-	// 摘要槽位为空：零变化。
-	tr.Register(orchestrator.Node{ID: "s1/domain-2", ParentID: "s1", Role: "domain", Domain: "测试", Status: orchestrator.StatusRunning})
-	tr.Finish("s1/domain-2", "failed", errors.New("timeout"))
-	nofail := d.withPriorSalvage(dispatchCtx(), "s1", "测试", "domain", "写测试")
-	if nofail != "写测试" {
-		t.Fatalf("task with failed sibling but empty salvage should be unchanged, got: %s", nofail)
+	// 空 scope 防御分支（domain 与 roleID 皆空）：任务零变化。
+	if got := d.withPriorSalvage(dispatchCtx(), "s1", "", "", "任务"); got != "任务" {
+		t.Fatalf("empty scope should be unchanged, got: %s", got)
 	}
 }
 

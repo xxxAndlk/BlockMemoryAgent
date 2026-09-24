@@ -226,14 +226,8 @@ func normalizeSkillName(name, title string) string {
 // renderLearnedSkillMD 渲染 SKILL.md 式技能文件（YAML frontmatter + 步骤/坑点/验证正文）。
 func renderLearnedSkillMD(name, title, whenToUse, outcome string, sk agent.EvolvedSkill) string {
 	var b strings.Builder
-	b.WriteString("---\n")
-	fmt.Fprintf(&b, "name: %s\n", name)
-	fmt.Fprintf(&b, "title: %s\n", title)
-	fmt.Fprintf(&b, "when_to_use: %s\n", whenToUse)
-	if outcome != "" {
-		fmt.Fprintf(&b, "outcome: %s\n", outcome)
-	}
-	b.WriteString("---\n\n")
+	b.WriteString(textutil.RenderSkillFrontmatter(name, title, whenToUse, outcome))
+	b.WriteString("\n")
 	if len(sk.Steps) > 0 {
 		b.WriteString("## 步骤\n")
 		for i, st := range sk.Steps {

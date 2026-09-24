@@ -37,7 +37,7 @@ type MDFrontmatter struct {
 	InvalidatedAt string `yaml:"invalidated_at,omitempty"`
 	// FileList 是 spec.files 的完整原始清单（含当时不存在的待创建文件）。
 	// Files map 只收录 stat 成功的文件（mtime 索引），创建类任务的待创建文件
-	// 不在其中；dispatcher 冒烟检查（TODO #56）需要全量清单，读 FileList 兜底。
+	// 不在其中；dispatcher 冒烟检查需要全量清单，读 FileList 兜底。
 	FileList []string `yaml:"file_list,omitempty"`
 	// Spec 专属字段：仅 slot == SpecSlot 时填充。
 	// 其余 slot 这些字段为空，解码时忽略。
@@ -46,7 +46,7 @@ type MDFrontmatter struct {
 	Constraints []string `yaml:"constraints,omitempty"`
 	// VerifyLevels 验收层级（TODO #59）：existence/static/integration/runtime/visual 子集。
 	VerifyLevels []string `yaml:"verify_levels,omitempty"`
-	// Contract 跨域契约（TODO #57），仅 spec slot 填充；nil 等价于未填。
+	// Contract 跨域契约，仅 spec slot 填充；nil 等价于未填。
 	Contract *Contract `yaml:"contract,omitempty"`
 	// Probes 运行时探针声明（TODO #67 runtime 层），仅 spec slot 填充。
 	Probes []string `yaml:"probes,omitempty"`

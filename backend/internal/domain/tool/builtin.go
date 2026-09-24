@@ -37,6 +37,8 @@ import (
 	"time"
 	// unicode 用于 Git 子命令首字母大写转换。
 	"unicode"
+
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 )
 
 // 以下输入结构体用于 JSON Schema 生成与运行时参数反序列化。
@@ -889,13 +891,9 @@ func normalizeCRLF(s string) string {
 	return strings.ReplaceAll(s, "\r\n", "\n")
 }
 
-// truncateRunes 按 rune 数截断字符串并追加省略号（省略号占 1 个 rune）。
+// truncateRunes 按 rune 数截断字符串并追加省略号（textutil 单源）。
 func truncateRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n]) + "…"
+	return textutil.TruncateRunes(s, n, "…")
 }
 
 // ---- ListDir（列出目录） ----

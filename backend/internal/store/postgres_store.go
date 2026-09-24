@@ -166,69 +166,9 @@ func (s *PostgresStore) DB() *sql.DB {
 // ---- 向后兼容的薄包装方法 ----
 // 以下方法全部委托给对应子存储，保持现有调用方无需修改。
 
-// SaveEpisode 保存单条 Episode；委托给 EpisodeStore.Save。
-func (s *PostgresStore) SaveEpisode(ctx context.Context, agentID, topicID string, ep *types.Episode) error {
-	return s.Episode.Save(ctx, agentID, topicID, ep)
-}
-
-// SaveEpisodeWithStepCount 保存单条 Episode（带 step_count 幂等键）；委托给 EpisodeStore.SaveWithStepCount。
-func (s *PostgresStore) SaveEpisodeWithStepCount(ctx context.Context, agentID, topicID string, stepCount int, ep *types.Episode) error {
-	return s.Episode.SaveWithStepCount(ctx, agentID, topicID, stepCount, ep)
-}
-
-// IsDuplicateError 判断是否为唯一约束冲突；委托给 EpisodeStore.IsDuplicateError。
-func (s *PostgresStore) IsDuplicateError(err error) bool {
-	return s.Episode.IsDuplicateError(err)
-}
-
-// GetEpisodes 获取 Episode 列表；委托给 EpisodeStore.GetEpisodes。
-func (s *PostgresStore) GetEpisodes(ctx context.Context, agentID, topicID string, limit int) ([]*types.Episode, error) {
-	return s.Episode.GetEpisodes(ctx, agentID, topicID, limit)
-}
-
-// CountEpisodes 统计 Episode 总数；委托给 EpisodeStore.CountEpisodes。
-func (s *PostgresStore) CountEpisodes(ctx context.Context, agentID, topicID string) (int, error) {
-	return s.Episode.CountEpisodes(ctx, agentID, topicID)
-}
-
-// CountEpisodesByLevel 按压缩层级统计 Episode 数量；委托给 EpisodeStore.CountEpisodesByLevel。
-func (s *PostgresStore) CountEpisodesByLevel(ctx context.Context, agentID, topicID string) (map[int]int, error) {
-	return s.Episode.CountEpisodesByLevel(ctx, agentID, topicID)
-}
-
-// SaveSnapshot 保存 Agent 快照；委托给 SnapshotStore.Save。
-func (s *PostgresStore) SaveSnapshot(ctx context.Context, snapshot *types.AgentSnapshot) error {
-	return s.Snapshot.Save(ctx, snapshot)
-}
-
-// GetSnapshot 读取 Agent 快照；委托给 SnapshotStore.Get。
-func (s *PostgresStore) GetSnapshot(ctx context.Context, agentID, topicID string) (*types.AgentSnapshot, error) {
-	return s.Snapshot.Get(ctx, agentID, topicID)
-}
-
 // SaveKnowledge 写入全局知识记录；委托给 KnowledgeStore.Save。
 func (s *PostgresStore) SaveKnowledge(ctx context.Context, rec *types.KnowledgeRecord) error {
 	return s.Knowledge.Save(ctx, rec)
-}
-
-// GetKnowledgeByType 按类型查询知识记录；委托给 KnowledgeStore.GetByType。
-func (s *PostgresStore) GetKnowledgeByType(ctx context.Context, knowledgeType string, limit int) ([]*types.KnowledgeRecord, error) {
-	return s.Knowledge.GetByType(ctx, knowledgeType, limit)
-}
-
-// SearchKnowledge 向量相似搜索；委托给 KnowledgeStore.Search。
-func (s *PostgresStore) SearchKnowledge(ctx context.Context, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
-	return s.Knowledge.Search(ctx, embedding, topK)
-}
-
-// SearchKnowledgeByTypeAndDomain 按类型+domain 过滤的向量搜索；委托给 KnowledgeStore.SearchByTypeAndDomain。
-func (s *PostgresStore) SearchKnowledgeByTypeAndDomain(ctx context.Context, knowledgeType enums.KnowledgeType, domain string, embedding []float32, topK int) ([]*types.KnowledgeRecord, error) {
-	return s.Knowledge.SearchByTypeAndDomain(ctx, knowledgeType, domain, embedding, topK)
-}
-
-// SearchBlockMemory 按 domain 过滤检索块记忆；委托给 KnowledgeStore.SearchBlockMemory。
-func (s *PostgresStore) SearchBlockMemory(ctx context.Context, domain, goal string, topK int) ([]*types.KnowledgeRecord, error) {
-	return s.Knowledge.SearchBlockMemory(ctx, domain, goal, topK)
 }
 
 // SearchBlockMemoryByGoal 按 sessionID 过滤后做语义检索块记忆；
@@ -237,7 +177,7 @@ func (s *PostgresStore) SearchBlockMemoryByGoal(ctx context.Context, sessionID, 
 	return s.Knowledge.SearchBlockMemoryByGoal(ctx, sessionID, goal, topK)
 }
 
-// Query 黑板模式（TODO #42）scope 确定性检索块记忆；委托给 KnowledgeStore.Query。
+// Query 黑板模式scope 确定性检索块记忆；委托给 KnowledgeStore.Query。
 // 实现 domain/subagent.BlackboardSearcher 接口（鸭子类型，store 不依赖 domain）。
 func (s *PostgresStore) Query(ctx context.Context, sessionID, parentID, taskDomain, query string, topK int, excludeSubAgentID string) ([]*types.KnowledgeRecord, error) {
 	return s.Knowledge.Query(ctx, sessionID, parentID, taskDomain, query, topK, excludeSubAgentID)
@@ -251,11 +191,6 @@ func (s *PostgresStore) SearchKnowledgeByType(ctx context.Context, knowledgeType
 // ArchiveKnowledge 归档指定知识记录；委托给 KnowledgeStore.Archive。
 func (s *PostgresStore) ArchiveKnowledge(ctx context.Context, id int64) error {
 	return s.Knowledge.Archive(ctx, id)
-}
-
-// IncrementAccessCount 自增访问计数；委托给 KnowledgeStore.IncrementAccessCount。
-func (s *PostgresStore) IncrementAccessCount(ctx context.Context, id int64) error {
-	return s.Knowledge.IncrementAccessCount(ctx, id)
 }
 
 // BumpReuse 递增知识记录 Meta.reuse_count；委托给 KnowledgeStore.BumpReuse。

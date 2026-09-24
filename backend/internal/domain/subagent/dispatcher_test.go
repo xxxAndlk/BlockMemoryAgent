@@ -215,6 +215,12 @@ func (m *mockBlockMemorySearcher) SearchBlockMemoryByGoal(ctx context.Context, s
 	return m.recs, m.err
 }
 
+// injectRecalledMemory 测试 helper：不带 scope 走 injectScopedRecall 的回退路径
+// （纯语义 SearchBlockMemoryByGoal）。原生产 wrapper 已删，仅测试使用。
+func (d *Dispatcher) injectRecalledMemory(ctx context.Context, query, task string) (string, []*types.KnowledgeRecord) {
+	return d.injectScopedRecall(ctx, "", "", query, task)
+}
+
 // BumpReuse 实现 reuseBumper 可选接口，记录调用次数供断言。
 func (m *mockBlockMemorySearcher) BumpReuse(ctx context.Context, id int64) error {
 	m.bumpCalls++

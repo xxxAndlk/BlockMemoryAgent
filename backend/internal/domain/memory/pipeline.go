@@ -11,6 +11,7 @@ import (
 	"time"     // time 用于为事件填充发生时间
 
 	"github.com/blockmemory/agent/backend/internal/agent" // agent 包提供 MemoryEvent、MemoryPipeline、ReactMessage 等类型
+	"github.com/blockmemory/agent/backend/pkg/textutil"   // 统一截断工具
 	"github.com/blockmemory/agent/backend/pkg/types"      // types 包提供 RoleDefinition 类型
 )
 
@@ -629,14 +630,10 @@ func formatEvent(ev agent.MemoryEvent) string {
 	}
 }
 
-// truncate 将字符串 s 截断到最多 n 个字符，超过时尾部补 "..." 表示省略。
+// truncate 按 rune 数截断并追加省略号（textutil 单源；原为 byte 截断，
+// 与其余调用点口径不一，统一为 rune 防多字节字符切断）。
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		// 长度未超限，原样返回
-		return s
-	}
-	// 超过限制则保留前 n 个字符并附加省略号
-	return s[:n] + "..."
+	return textutil.TruncateRunes(s, n, "...")
 }
 
 // joinNonEmpty 用分隔符 sep 连接切片中非空的字符串片段。

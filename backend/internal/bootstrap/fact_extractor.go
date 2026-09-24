@@ -8,6 +8,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/domain/subagent"
 	"github.com/blockmemory/agent/backend/internal/model"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 )
 
 // llmFactExtractor 用轻量模型从子 Agent 输出中提取关键事实。
@@ -95,21 +96,12 @@ Agent 输出:
 %s`, maxFacts, goal, roleID, truncateHeadTail(text, factPromptHeadRunes, factPromptTailRunes))
 }
 
-// truncateHeadTail 超长时保留头部 head 个 rune + 尾部 tail 个 rune，中间以省略标记连接。
-// 与只裁尾部的 truncateForPrompt 相比，保留长输出尾部的最终结论段。
+// truncateHeadTail 超长时保留头部 head 个 rune + 尾部 tail 个 rune（textutil 单源）。
 func truncateHeadTail(s string, head, tail int) string {
-	r := []rune(s)
-	if len(r) <= head+tail {
-		return s
-	}
-	return string(r[:head]) + "\n...(中间省略)...\n" + string(r[len(r)-tail:])
+	return textutil.TruncateHeadTail(s, head, tail)
 }
 
-// truncateForPrompt 截断输入避免超长 prompt。
+// truncateForPrompt 截断输入避免超长 prompt（textutil 单源，保省略后缀口径）。
 func truncateForPrompt(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max]) + "\n...(已截断)"
+	return textutil.TruncateRunes(s, max, "\n...(已截断)")
 }

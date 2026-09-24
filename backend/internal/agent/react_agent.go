@@ -24,6 +24,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/middleware"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/project"
+	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
 	"github.com/go-kratos/blades/tools"
@@ -1310,7 +1311,7 @@ func (a *ReActAgent) logPromptStats(round int, system string, messages, history 
 	}
 }
 
-// generate 包装一次 LLM 调用：带单次超时与指数退避重试（TODO #19 LLM 链）。
+// generate 包装一次 LLM 调用：带单次超时与指数退避重试（LLM 链）。
 // 重试/退避/超时/空响应判定迁移到 middleware 包（RetryLLM + CallLLM + TerminalCall），
 // 行为不变：重试 retryCount+1 次尝试；会话取消（ctx.Err() 非空）与单次调用超时
 // （DeadlineExceeded，慢推理模型重试只会重复超时——实证 180s×4=12min）不重试；
@@ -1828,13 +1829,9 @@ func sanitizeToolPairing(messages []ReactMessage) []ReactMessage {
 	return out
 }
 
-// truncateRunes 按 rune 数截断字符串并追加省略提示。
+// truncateRunes 按 rune 数截断字符串并追加省略提示（textutil 单源）。
 func truncateRunes(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n]) + "...(truncated)"
+	return textutil.TruncateRunes(s, n, "...(truncated)")
 }
 
 // systemPrompt 为当前角色构建系统提示词。

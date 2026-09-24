@@ -1,6 +1,6 @@
 package retriever
 
-// hybrid.go 实现 TODO #27 外部知识库检索层的热路径：
+// hybrid.go 实现 外部知识库检索层的热路径：
 //   - SearchHybrid：向量 + 全文关键词 RRF 混合检索（external_kb 命名空间隔离）；
 //   - IngestDir：本地 Markdown/文本目录批量摄入（切块 → embed → 落库）。
 

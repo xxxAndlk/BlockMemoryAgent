@@ -1,6 +1,6 @@
 package tool
 
-// search_knowledge.go 实现 TODO #27 外部知识库检索工具（热路径 a）：
+// search_knowledge.go 实现 外部知识库检索工具（热路径 a）：
 // meta/domain Agent 显式按需检索外部预置知识（与 ReadFile 读 wiki 页互补）。
 
 import (

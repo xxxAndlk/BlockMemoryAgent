@@ -126,7 +126,7 @@ type Registry struct {
 	// 达 maxConsecutiveSameRead 触发 LoopExit（真死循环兜底）；
 	// 参数有任何变化（翻页/换文件）即归零——重读本身合法，每次直返磁盘最新内容。
 	sameReadCount map[string]int
-	// longFileScopes 按 agentID 记录最近一次成功 ReadFile 是否为长文件（TODO #72）：
+	// longFileScopes 按 agentID 记录最近一次成功 ReadFile 是否为长文件：
 	// 返回总行数 > longFileReadLines 时置 true，下一次同文件同区间连读上限放宽。
 	longFileScopes map[string]bool
 	// fileReadMtime 按 agentID 记录该 scope 已读文件的 mtime（cleanPath → 上次成功
@@ -144,7 +144,7 @@ type Registry struct {
 	// fileMap 任务级文件小地图追踪器：ReadFile/WriteFile/EditFile 成功后按 Agent 登记
 	// 触碰文件（mtime 缓存符号轮廓），FileMapText 渲染注入文本供记忆流水线尾部常驻注入。
 	fileMap *fileMapTracker
-	// approvalHook 是破坏性操作的用户确认回调（TODO #17 P1）。nil（默认）= 全放行，
+	// approvalHook 是破坏性操作的用户确认回调。nil（默认）= 全放行，
 	// 零行为变化；非 nil 时仅对命中边界的调用触发（WriteFile 在生产目录 / 危险命令模式），
 	// 常规编码流不阻塞。由 bootstrap 注入 ReactService.ApprovalHook。
 	approvalHook ApprovalHookFunc
@@ -228,7 +228,7 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	r.Register(&escalateGearTool{})
 	// 注册 remember_preference 工具（TODO #28 用户画像）；hook 在 SetUserProfileHook 注入后生效。
 	r.Register(&rememberPreferenceTool{})
-	// 注册 search_knowledge 工具（TODO #27 外部知识库）；hook 在 SetKnowledgeSearchHook 注入后生效。
+	// 注册 search_knowledge 工具（外部知识库）；hook 在 SetKnowledgeSearchHook 注入后生效。
 	r.Register(&searchKnowledgeTool{})
 	// 注册 plugin_* 工具组（TODO #51 插件自安装闭环）；mgr 在 SetPluginManager 注入后生效。
 	r.Register(&pluginSearchTool{})
@@ -353,7 +353,7 @@ func (r *Registry) WorkDir() string {
 	return r.exec.WorkDir()
 }
 
-// SetApprovalHook 注入破坏性操作的用户确认回调（TODO #17 P1）。
+// SetApprovalHook 注入破坏性操作的用户确认回调。
 // nil（默认）= 全放行，零行为变化；非 nil 时仅对命中边界的调用触发，常规编码流不阻塞。
 func (r *Registry) SetApprovalHook(fn ApprovalHookFunc) {
 	if r != nil {
@@ -380,7 +380,7 @@ func (r *Registry) SetRoleToolGateResolver(fn func(roleID string) []string) {
 	}
 }
 
-// needsApproval 判定本次工具调用是否需要用户确认（TODO #17 P1 破坏性分级 + 第10⑥ 三级信任模式）。
+// needsApproval 判定本次工具调用是否需要用户确认（破坏性分级 + 第10⑥ 三级信任模式）。
 // 信任模式经 ctx 携带的读取器实时读取（会话层注入闭包，会话中途切换模式下一工具调用即生效）：
 //   - suggest：全部变更类动作（WriteFile/EditFile/RestoreFile/RunCommand/动态 Destructive 工具）
 //     逐条审批，读类工具直通（比 TODO 字面「全部动作」收窄为变更类，防 ReadFile 审批风暴）；
@@ -574,7 +574,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// ReadFile 连读检测：重读不再拦截（每次直返磁盘最新内容，天然无脏数据，
 	// 也兼容 WriteFile/sed/外部进程改写等一切修改途径）。仅检测"参数完全相同"的连续
 	// 调用：第 2 次直返内容并附提醒，达上限判定死循环触发 LoopExit。
-	// TODO #72 确认性复读放行：长文件（返回总行数 > longFileReadLines）上限放宽到
+	// 确认性复读放行：长文件（返回总行数 > longFileReadLines）上限放宽到
 	// maxConsecutiveSameReadLongFile——编辑前后同区间复读是合理确认工作流；
 	// 短文件保持 3（真死循环）。
 	readNote := ""
@@ -616,7 +616,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 		}
 	}
 
-	// 破坏性工具分级（TODO #17 P1）：命中生产边界/危险命令模式时先经 approvalHook 等用户确认。
+	// 破坏性工具分级：命中生产边界/危险命令模式时先经 approvalHook 等用户确认。
 	// 拒绝则返回工具级错误（不执行），Agent 可见并自行决策；hook 错误上抛中止本次调用。
 	// 非生产环境与普通工具不经过此路径，保持自主。
 	if r.needsApproval(ctx, name, args) {
@@ -657,7 +657,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	result := t.Execute(ctx, args)
 
 	// ReadFile 成功读取后：连续第 2 次相同参数调用时附上翻页提醒（内容直返，不拦截）；
-	// 按总行数标记长文件状态（下一次连读上限放宽，TODO #72）。
+	// 按总行数标记长文件状态（下一次连读上限放宽，）。
 	if name == "ReadFile" && result.Success && result.Output != "" {
 		if readNote != "" {
 			result.Output += readNote
@@ -682,7 +682,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 普通槽不物理删除、内容保留：标记 stale 后注入时照常注入并附行号漂移警告，
 	// 防止旧逻辑"删记忆"导致下次派发/复用时 Agent 拿裸任务从零重读同一批文件。
 	// ReadFile 无需清已读记录：重读本就直返磁盘最新内容，不存在脏数据问题。
-	// TODO #72 确认性复读放行：写入成功同时清零该路径连读计数——
+	// 确认性复读放行：写入成功同时清零该路径连读计数——
 	// Read(A)→Write(A)→Read(A)→Read(A) 的编辑后确认不再被杀。
 	if (name == "WriteFile" || name == "EditFile" || name == "RestoreFile") && result.Success && result.Path != "" {
 		r.invalidateSharedMemoryForPath(ctx, result.Path)
@@ -989,14 +989,14 @@ func (r *Registry) recordFileMtime(scopeKey, path string, mtime time.Time) {
 }
 
 // maxConsecutiveSameReadLongFile 是长文件（ReadFile 返回总行数 > longFileReadLines）的
-// 连读上限放宽值（TODO #72）：编辑长文件前后同区间确认性复读是合理工作流，
+// 连读上限放宽值：编辑长文件前后同区间确认性复读是合理工作流，
 // 扁平常量 3 误杀（实证 2026-08-25 domain-2 被连读守卫杀时 plan_execute 仅 1/6）。
 const maxConsecutiveSameReadLongFile = 6
 
-// longFileReadLines 判定"长文件"的输出行数阈值（TODO #72）。
+// longFileReadLines 判定"长文件"的输出行数阈值。
 const longFileReadLines = 500
 
-// resetSameReadForPath 清零指定 scope 中匹配 path 的连读计数（TODO #72 确认性复读放行）：
+// resetSameReadForPath 清零指定 scope 中匹配 path 的连读计数（确认性复读放行）：
 // WriteFile/EditFile 成功写某路径后调用——编辑后的同区间复读是确认性工作流
 //（Read(A)→Write(A)→Read(A)→Read(A) 不再第 3 次被杀），纯探索性 3 连读仍杀。
 func (r *Registry) resetSameReadForPath(scopeKey, path string) {
@@ -1016,7 +1016,7 @@ func (r *Registry) resetSameReadForPath(scopeKey, path string) {
 	}
 }
 
-// isLongFileScope 返回该 scope 最近一次 ReadFile 是否为长文件（TODO #72）。
+// isLongFileScope 返回该 scope 最近一次 ReadFile 是否为长文件。
 func (r *Registry) isLongFileScope(scopeKey, path string) bool {
 	if scopeKey == "" {
 		return false
@@ -1026,7 +1026,7 @@ func (r *Registry) isLongFileScope(scopeKey, path string) bool {
 	return r.longFileScopes[scopeKey]
 }
 
-// markLongFileScope 按 ReadFile 成功结果的总行数标记长文件状态（TODO #72）。
+// markLongFileScope 按 ReadFile 成功结果的总行数标记长文件状态。
 // Output 分页头格式 `[共 %d 行 | ...`，解析失败按短文件处理（保守不放宽）。
 func (r *Registry) markLongFileScope(scopeKey, output string) {
 	long := false
@@ -1617,7 +1617,7 @@ func (t *writeFileTool) Name() string { return "WriteFile" }
 func (t *writeFileTool) Aliases() []string { return []string{"write_file", "writeFile"} }
 
 // Destructive 标记 WriteFile 为破坏性操作（文件内容不可逆覆盖）：
-// 生产工作目录下触发用户确认（TODO #17 P1 破坏性工具分级）。
+// 生产工作目录下触发用户确认（破坏性工具分级）。
 func (t *writeFileTool) Destructive() bool { return true }
 
 // Execute 调用 Executor 的 writeFile 方法完成写入。
@@ -1635,7 +1635,7 @@ func (t *editFileTool) Name() string { return "EditFile" }
 func (t *editFileTool) Aliases() []string { return []string{"edit_file", "editFile"} }
 
 // Destructive 标记 EditFile 为破坏性操作（文件内容不可逆修改）：
-// 生产工作目录下触发用户确认，与 WriteFile 同边界（TODO #17 P1）。
+// 生产工作目录下触发用户确认，与 WriteFile 同边界。
 func (t *editFileTool) Destructive() bool { return true }
 
 // Execute 调用 Executor 的 editFile 方法完成局部替换。
@@ -1653,7 +1653,7 @@ func (t *restoreFileTool) Name() string { return "RestoreFile" }
 func (t *restoreFileTool) Aliases() []string { return []string{"restore_file", "restoreFile"} }
 
 // Destructive 标记 RestoreFile 为破坏性操作（覆盖目标文件当前内容）：
-// 生产工作目录下触发用户确认，与 WriteFile/EditFile 同边界（TODO #17 P1）。
+// 生产工作目录下触发用户确认，与 WriteFile/EditFile 同边界。
 func (t *restoreFileTool) Destructive() bool { return true }
 
 // Execute 调用 Executor 的 restoreFile 方法完成快照恢复。

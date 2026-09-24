@@ -267,7 +267,7 @@ func orchestratorNodeDepth(n orchestrator.Node, nodes []orchestrator.Node, byID 
 
 // orchestratorStatusToRole 把 orchestrator.Status 映射为 TUI RoleStatus。
 // Cancelled 归入 Done(终态,非错误)；Paused(触达 token 上限待恢复)归入 Waiting；
-// Idle(热驻待复用,Domain 热驻)归入 Idle；Unverified(已交付未验证, TODO #60)归入
+// Idle(热驻待复用,Domain 热驻)归入 Idle；Unverified(已交付未验证, )归入
 // 独立 Unverified 态（标黄不标红）。
 func orchestratorStatusToRole(s orchestrator.Status) enums.RoleStatus {
 	switch s {
