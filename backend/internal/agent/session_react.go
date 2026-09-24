@@ -1172,7 +1172,12 @@ func (st *reactSessionStore) restoreOneSession(ctx context.Context, id string) *
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	rec, err := st.pgStore.GetSessionHistoryByID(ctx, id)
-	if err != nil || rec == nil {
+	if err != nil {
+		// 超时/扫描错误 ≠ 会话不存在，记日志便于排查（此前一律静默→前端只看到 404）
+		log.Printf("[session] restoreOneSession get history failed: id=%s err=%v", id, err)
+		return nil
+	}
+	if rec == nil {
 		return nil
 	}
 	built := st.buildRestoredSession(ctx, rec)

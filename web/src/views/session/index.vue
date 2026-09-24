@@ -181,22 +181,28 @@ onMounted(async () => {
   if (qwd && !route.query.id) setWorkDir(qwd)
 
   await loadSessions()
-  const id = route.query.id as string
+  const rawId = route.query.id
+  // vue-router 会把 undefined 序列化成字面量 "undefined"，过滤脏 id 防止 GET /sessions/undefined
+  const id = typeof rawId === 'string' && rawId && rawId !== 'undefined' ? rawId : ''
   if (id) {
     await openSession(id)
   } else if (!isNew) {
-    // 无 URL id 时优先恢复上次活跃会话（localStorage），否则打开最近一个
+    // 无 URL id 时优先恢复上次活跃会话（localStorage），否则打开最近一个。
+    // 自动打开失败静默——用户没主动选会话，弹「会话不存在」是噪音（截图场景）。
     const last = localStorage.getItem('lastSessionID')
-    if (last && sessions.value.some((s) => s.id === last)) {
-      await openSession(last)
-    } else if (sessions.value.length) {
-      await openSession(sessions.value[0].id)
+    const autoId = last && sessions.value.some((s) => s.id === last) ? last : (sessions.value[0]?.id ?? '')
+    if (autoId) {
+      try {
+        await openSession(autoId)
+      } catch {
+        // openSession 内部已吞掉异常并置 activeSession=null，这里保底不冒泡
+      }
     }
   }
 })
 
 watch(() => route.query.id, (id) => {
-  if (id && typeof id === 'string' && id !== activeSession.value?.id) {
+  if (id && typeof id === 'string' && id !== 'undefined' && id !== activeSession.value?.id) {
     openSession(id)
   }
 })
@@ -256,7 +262,11 @@ async function openSession(id: string) {
   } catch (e) {
     localStorage.removeItem('lastSessionID')
     activeSession.value = null
-    ElMessage.error('会话不存在或加载失败：' + (e instanceof Error ? e.message : String(e)))
+    // 自动打开（无 ?id=）失败时静默——列表还在，用户可手动点选，不需要红色报错
+    const isExplicit = !!(typeof route.query.id === 'string' && route.query.id && route.query.id !== 'undefined')
+    if (isExplicit) {
+      ElMessage.error('会话不存在或加载失败：' + (e instanceof Error ? e.message : String(e)))
+    }
   } finally {
     loading.value = false
   }

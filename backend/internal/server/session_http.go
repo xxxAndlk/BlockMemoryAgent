@@ -102,7 +102,8 @@ func (m *SessionManager) HandleGetSession(c *gin.Context) {
 
 	session, err := m.agent.Get(c.Request.Context(), id)
 	if err != nil {
-		c.String(http.StatusNotFound, "会话不存在")
+		msg, code := agentErrorStatus(err)
+		c.String(code, "%s", msg)
 		return
 	}
 
