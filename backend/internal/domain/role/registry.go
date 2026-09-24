@@ -185,7 +185,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 		// 注意：生产 config/roles.yaml 已通过 meta_agent.tools 覆盖去掉 HTTPGet——实证其
 		// 永远优先于需挂载的 web_search 插件被选中；联网调研集中于 meta + web_search 插件。
 		// roles.yaml meta_agent.tools 非空时整体覆盖白名单；为空保持上述内置默认。
-		tools := []string{"call_sub_agent", "call_sub_agents", "map_sub_agents", "merge_worktree", "WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "ReadMedia", "ShowArtifact", "WriteFile", "EditFile", "RestoreFile", "ReadFile", "RunCommand", "HTTPGet", "create_role", "list_roles", "list_models", "set_role_model", "set_agent_model", "RefreshProjectDoc", "send_message", "cancel_agent", "pause_agent", "resume_agent", "ask_user", "write_plan", "submit_plan", "review_plan", "remember_preference", "search_knowledge", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount", "list_skills", "load_skill"}
+		tools := []string{"call_sub_agent", "call_sub_agents", "map_sub_agents", "merge_worktree", "WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "ReadMedia", "ShowArtifact", "WriteFile", "EditFile", "RestoreFile", "ReadFile", "RunCommand", "HTTPGet", "create_role", "list_roles", "list_models", "set_role_model", "set_agent_model", "RefreshProjectDoc", "send_message", "cancel_agent", "pause_agent", "resume_agent", "ask_user", "write_plan", "submit_plan", "review_plan", "remember_preference", "search_knowledge", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount", "list_skills", "load_skill", "expand_memory"}
 		if len(r.cfg.MetaAgent.Tools) > 0 {
 			tools = r.cfg.MetaAgent.Tools
 		}
@@ -226,6 +226,8 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 				"plugin_list", "tool_catalog", "tool_mount", "tool_unmount",
 				"submit_plan", "review_plan",
 				"list_skills", "load_skill",
+				// 展开式召回（TODO #22④）：压缩摘要点派只读展开器取回细节。
+				"expand_memory",
 				// 档位升级（TODO #14，2026-09-16 daily 档）：仅会话顶层生效——
 				// domain 角色同时是 daily 档顶层与全部 domain 子 Agent 的共享定义，
 				// hook 侧按 agentID==sessionID 守卫，子 Agent 调用返回拒绝文案。

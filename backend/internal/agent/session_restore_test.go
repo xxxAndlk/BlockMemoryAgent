@@ -187,14 +187,15 @@ func TestSaveHistoryUpsertKeepsLatest(t *testing.T) {
 	}
 }
 
-// TestSaveEventsDeleteThenInsert 验证事件全量覆盖语义: 重复落库不叠加(修复每轮翻倍)。
-func TestSaveEventsDeleteThenInsert(t *testing.T) {
+// TestSaveEventsAppendIdempotent 验证事件纯追加幂等（TODO #20①）: 同 (session_id,seq)
+// 重放不叠加（ON CONFLICT DO NOTHING），新 seq 追加不覆盖旧行——旧行物理留存可 SQL 查回。
+func TestSaveEventsAppendIdempotent(t *testing.T) {
 	pg := newPGStoreForRestoreTest(t)
 	ctx := context.Background()
 	id := fmt.Sprintf("session-test-events-%d", time.Now().UnixNano())
 	events := []store.SessionEventRecord{
-		{SessionID: id, Type: eventkind.System, Agent: "System", Message: "m1", Timestamp: time.Now()},
-		{SessionID: id, Type: eventkind.UserMessage, Agent: "User", Message: "m2", Timestamp: time.Now()},
+		{SessionID: id, Seq: 1, Type: eventkind.System, Agent: "System", Message: "m1", Timestamp: time.Now()},
+		{SessionID: id, Seq: 2, Type: eventkind.UserMessage, Agent: "User", Message: "m2", Timestamp: time.Now()},
 	}
 	if err := pg.SaveSessionEvents(ctx, id, events); err != nil {
 		t.Fatalf("first SaveSessionEvents: %v", err)
@@ -207,7 +208,19 @@ func TestSaveEventsDeleteThenInsert(t *testing.T) {
 		t.Fatalf("GetSessionEvents: %v", err)
 	}
 	if len(got) != 2 {
-		t.Errorf("delete-then-insert 后应仍为 2 条, got %d", len(got))
+		t.Errorf("同 seq 重放后应仍为 2 条, got %d", len(got))
+	}
+	// 新 seq 追加：旧行留存（append-only，不覆盖不删除）。
+	events = append(events, store.SessionEventRecord{SessionID: id, Seq: 3, Type: eventkind.System, Agent: "System", Message: "m3", Timestamp: time.Now()})
+	if err := pg.SaveSessionEvents(ctx, id, events); err != nil {
+		t.Fatalf("third SaveSessionEvents: %v", err)
+	}
+	got, err = pg.GetSessionEvents(ctx, id)
+	if err != nil {
+		t.Fatalf("GetSessionEvents: %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("追加后应为 3 条, got %d", len(got))
 	}
 }
 

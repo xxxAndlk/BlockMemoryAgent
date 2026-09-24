@@ -117,6 +117,10 @@ type ReActAgent struct {
 	// 纪律块之后 = 只 fork 提示词尾部，envBlock+base 公共前缀跨 Agent 前缀缓存不受影响。
 	// 正文获取经 load_skill 工具按需进行，整块内容不随提示词重复展开。
 	skillBlock string
+	// memoryIndex 记忆索引槽（TODO #20③+#22③）：会话启动注入的一行式沉淀索引
+	//（renderMemoryIndex 渲染，行数/runes 双配额），详情走向量召回。同 skillBlock
+	// 尾部注入位（前缀缓存安全）；空串=未接线/无沉淀。
+	memoryIndex string
 	// pausedChecker 可选的"是否有 Paused 子 DomainAgent"检查器，由 WithPausedChildChecker 注入。
 	// 父终结保护 wait loop 中检查：若有 Paused 子节点（触达 token 上限），父 MetaAgent
 	// 无限 budget 不会自行暂停，需靠此检查跳出 wait loop 返回 PausedOnChild，由上层 pauseSession
@@ -310,6 +314,13 @@ func (a *ReActAgent) WithWorkDir(wd string) *ReActAgent {
 // 空串为零行为（未启用技能/无持有技能时 dispatcher 传空即自动跳过）。
 func (a *ReActAgent) WithSkillBlock(block string) *ReActAgent {
 	a.skillBlock = block
+	return a
+}
+
+// WithMemoryIndex 注入【沉淀索引】块（TODO #20③，构造期一次性冻结进 systemPrompt）。
+// 空串为零行为。索引超限时调用方（renderMemoryIndex）已带重写指令，不静默截断。
+func (a *ReActAgent) WithMemoryIndex(block string) *ReActAgent {
+	a.memoryIndex = block
 	return a
 }
 
@@ -1292,9 +1303,10 @@ func (a *ReActAgent) logPromptStats(round int, system string, messages, history 
 	log.Printf("[prompt-stats] agent=%s round=%d sys=%d tools=%d/%dr hist=%d dyn=%d",
 		a.name, round, sysRunes, len(toolSchemas), toolDescRunes, histRunes, dynRunes)
 	if round == 0 && len(a.promptStatsSegs) > 0 {
-		log.Printf("[prompt-stats] sys segments agent=%s persona=%d env=%d role_base=%d discipline=%d skill=%d",
+		log.Printf("[prompt-stats] sys segments agent=%s persona=%d env=%d role_base=%d discipline=%d skill=%d memidx=%d",
 			a.name, a.promptStatsSegs["persona"], a.promptStatsSegs["env"],
-			a.promptStatsSegs["role_base"], a.promptStatsSegs["discipline"], a.promptStatsSegs["skill"])
+			a.promptStatsSegs["role_base"], a.promptStatsSegs["discipline"], a.promptStatsSegs["skill"],
+			a.promptStatsSegs["memory_index"])
 	}
 }
 
@@ -1869,17 +1881,26 @@ func (a *ReActAgent) buildSystemPrompt() string {
 	if a.skillBlock != "" {
 		prompt += "\n\n" + a.skillBlock
 	}
+	// 记忆索引槽（TODO #20③）：再往尾部追加——与 skillBlock 同为尾部注入位，
+	// 公共前缀（env+base+纪律+技能）跨实例/跨会话字节稳定。
+	if a.memoryIndex != "" {
+		prompt += "\n\n" + a.memoryIndex
+	}
 	// 提示词构成分段计量（TODO #15①）：各分段 rune 快照，首轮 LLM 调用输出明细行，
 	// 供瘦身边际对照（T13 meta 收窄前后对比 sys 分段降幅）。sync.Once 内写入，无竞争。
 	seps := 4 // env+base、base+discipline 两处 "\n\n"
 	if a.skillBlock != "" {
 		seps += 2
 	}
+	if a.memoryIndex != "" {
+		seps += 2
+	}
 	a.promptStatsSegs = map[string]int{
-		"env":        utf8.RuneCountInString(envBlock),
-		"role_base":  utf8.RuneCountInString(base),
-		"discipline": utf8.RuneCountInString(discipline),
-		"skill":      utf8.RuneCountInString(a.skillBlock),
+		"env":          utf8.RuneCountInString(envBlock),
+		"role_base":    utf8.RuneCountInString(base),
+		"discipline":   utf8.RuneCountInString(discipline),
+		"skill":        utf8.RuneCountInString(a.skillBlock),
+		"memory_index": utf8.RuneCountInString(a.memoryIndex),
 	}
 	// 人格注入器非 nil 时，把人格内容拼到完整 prompt 最前（envBlock 之前），
 	// 作为用户级人格前缀。人格为空时 Inject 原样返回，无副作用。
@@ -1888,7 +1909,8 @@ func (a *ReActAgent) buildSystemPrompt() string {
 		// 人格规模按差值计（Injector 可能拼多段前缀）：总量 − 其余分段与分隔符。
 		if total := utf8.RuneCountInString(prompt); total > 0 {
 			other := a.promptStatsSegs["env"] + a.promptStatsSegs["role_base"] +
-				a.promptStatsSegs["discipline"] + a.promptStatsSegs["skill"] + seps
+				a.promptStatsSegs["discipline"] + a.promptStatsSegs["skill"] +
+				a.promptStatsSegs["memory_index"] + seps
 			if total > other {
 				a.promptStatsSegs["persona"] = total - other
 			}

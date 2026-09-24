@@ -127,6 +127,10 @@ type ReactService struct {
 	// 空串=无台账不注入，nil 表示未接线。由 bootstrap 注入 Dispatcher.TaskLedgerBrief。
 	ledgerFn func(sessionID string) string
 
+	// memoryIndexFn 渲染【沉淀索引】块（TODO #20③+#22③ 记忆索引槽）：会话启动注入，
+	// 行数/runes 双配额（超限自带重写指令），nil=未接线不注入。
+	memoryIndexFn func() string
+
 	// VideoOpts 用户消息视频附件（Alt+V 粘贴视频文件）抽帧参数：
 	// bootstrap 从 config.Video 注入，零值字段内部回落 DefaultVideoOptions。
 	VideoOpts VideoOptions
@@ -484,6 +488,21 @@ func (s *ReactService) SetBoard(fn func(sessionID string) *board.TaskBoard) {
 // 由 bootstrap 注入 Dispatcher.TaskLedgerBrief。
 func (s *ReactService) SetTaskLedgerProvider(fn func(sessionID string) string) {
 	s.ledgerFn = fn
+}
+
+// SetMemoryIndexProvider 注入【沉淀索引】渲染器（TODO #20③+#22③）：
+// fn() 返回已按配额渲染的索引块（renderMemoryIndex 产物，超限自带重写指令），
+// 空串=无沉淀不注入。传 nil 关闭索引槽。由 bootstrap 接 KnowledgeStore 组装。
+func (s *ReactService) SetMemoryIndexProvider(fn func() string) {
+	s.memoryIndexFn = fn
+}
+
+// memoryIndexBlock 取当前索引块（未接线返回空串）。
+func (s *ReactService) memoryIndexBlock() string {
+	if s.memoryIndexFn == nil {
+		return ""
+	}
+	return s.memoryIndexFn()
 }
 
 // SetBoardRemover 注入会话任务看板移除器（DeleteSession 硬删除路径）。
@@ -3240,6 +3259,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
+		WithMemoryIndex(s.memoryIndexBlock()).
 		WithPersonaInjector(s.metaPersona(session.currentWorkDir())).
 		WithMessageLogger(s.msgLogger).
 		// 顶层 Agent（meta/domain）挂起等子语义：终答轮仍有未决子 Agent 时置
@@ -3440,6 +3460,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
+		WithMemoryIndex(s.memoryIndexBlock()).
 		WithPersonaInjector(s.metaPersonaLite()).
 		WithMessageLogger(s.msgLogger).
 		// 顶层 Agent（meta/domain）挂起等子语义（同 runSession）。

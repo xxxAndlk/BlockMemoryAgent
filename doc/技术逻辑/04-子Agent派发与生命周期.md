@@ -422,3 +422,31 @@ worker 池 6 并发 `dispatchOne`；单项上限：默认角色 6 / **scout 32**
 **机器通道同款**：plan_confirm 的 `submit_plan`/`review_plan` 机器问答走同一条邮箱 request/reply（ThreadID=planID、Priority 10、30s PingActivity 保活、10min 超时 fail-open）——这是此前唯一的 request/reply 系统消费者。**A2A 协议（AgentCard/JSON-RPC）未做**（决策：无跨团队接入需求前不引入）。
 
 **唤醒语义（2026-09-17）**：request/escalate 成功投递给**挂起（awaiting_child）的顶层会话**时经 `wakeSuspendedParent` 唤醒续跑 drain（挂起会话不 drain 邮箱，不唤醒=死信）；**info 不唤醒**（中间信息不值得烧上级一轮）。里程碑播报（domain 提示词纪律：`message_type=info, subject="里程碑: …"`，每任务 ≤3 条）走 info 通道，drainMailbox 单列 `LiveEventMilestone`（kind=milestone，中途播报非完成），前端已映射中文标签。
+
+## 4.33 逻辑检查点与失败分支剪枝（failure_prune.go，#20④）
+
+**逻辑检查点**：派发时 + 里程碑时快照任务账本落 `agent_events`（type=checkpoint，Input=TaskLedgerBrief 快照）+ 内存回读点（`lastCheckpoints`）。落点四处相位：dispatch（dispatchOne/dispatchHotDomain 派发即记）/ reuse（热驻续建/入队/唤醒）/ user_direct（ReviveWithMessage）/ milestone（send_message 发"里程碑:"即记发送方检查点）。审计行不进上下文（`isContextHiddenEvent`）。
+
+**失败处置三选**（`ReviveMode`，对齐 CC rewind 菜单 + /branch）：
+
+| 档 | 触发 | 种子 | 旧轨迹 |
+|---|---|---|---|
+| prune 剪枝重派（**默认**） | Failed/Err 非空 | 原任务+检查点账本+用户消息 | 移出活跃上下文、底账 archived 可查 |
+| continue 同支续跑 | Done/轻微（auto） | 原任务+上轮结果+上轮错误+用户消息（现状） | 留活跃上下文 |
+| fork 分叉重派 | 显式 ReviveFork | 同 prune（新支 ID） | 旧支节点与消息**原样保留**可 resume 考古 |
+
+`resolveReviveMode`：空=auto（Failed→prune，其余→continue），显式 prune/continue/fork 直通。截断点只选轮边界（新 run 起步=run 边界；sanitizeToolPairing 请求装配兜底残对）。fork ID 分配防撞（逐个试号跳过树中已存在——进程重启 seq 归零，旧支节点经 PG 恢复树仍在，Register 撞名会覆盖考古入口）。父感知邮件带处置口径（"剪枝重派/分叉重派"），meta 经既有邮件机制感知。
+
+## 4.34 announce 边界协议（announce.go，#22②）
+
+- **规范化回报信封**（`buildAnnounce`，notify 咽喉一处全覆盖）：summary 原文**置顶不动**（`^` 锚定的 failureMarkerRe 等机读消费方依赖标记在首行）；尾部【回报】收口块——Status（`deriveAnnounceStatus` 机械推导 done/failed/partial/delivered-unverified）、Notes（修改文件清单）、统计行（回报 runes/文件数）。
+- **回灌预算公式**（Hermes 同款）：`announceBudgetRunes(子数) = clamp(父剩余 150K×0.5÷子数, floor 2K, 静态封顶 4K)`——高扇出每份回报自动收窄，防 N 子回传同灌父上下文；超预算全文落盘 `<workDir>/.bma/returns/`、邮箱留摘要头+路径。
+- **派发前上下文预算**（`capSpawnPrefixes`）：前缀+任务合计超 fork 硬顶 100K runes 转 **isolated**——前缀全弃（不截断硬灌），任务尾附隔离说明引导 ReadFile 按需取。首派（runSubAgentOnce）与热驻续建（buildReuseTask）同口径。
+- **minimal 提示词面**：人格/用户画像不入子上下文（bootstrap metaPersona 仅注 MetaAgent，runSubAgentOnce/buildDomainAgent 不下发）——既有装配保证，本协议不重复建设。
+- **逐级上灌纪律不变**：notify 只发直接父级，跨域走黑板（与 #2 黑板正交，不动 mailbox）。
+
+## 4.35 会话恢复中间层与展开式召回（idle_pool.go / expand.go）
+
+**RestoreSessionDomains**（#21④）：会话 resume 时按 (session_id, agent_id) 从 agent_messages + agent_tree_nodes 重建热驻槽（未终态/终态 30min 内 domain）——ResumeSessionAgents 头部接线，重建槽同样被 armTTL/opResume 扫到（零特判）。与 #17 领域档案构成三级连续体：热驻池（分钟级）→ **会话 resume 中间层（本条）** → 领域档案（跨会话永久级）。
+
+**expand_memory**（#22④ 展开式召回，expand.go）：压缩摘要讲不细时派**只读**展开器沿摘要链（`Pipeline.Bundles`：leaf→condensed 包链副本）定位细节所属段，再用低层工具取原文（workspace 文件 / .bma/returns 全文 / .bma/tool_outputs 落盘件）。约束：delegation grant 双闸（token 预算 8K + TTL 3min，超限截答返回已有部分）+ 答案硬顶 2000 rune + **结构性禁递归**（展开器工具面只给 ReadFile/SearchInFiles/ListDir——无 call_sub_agent/send_message/写工具，派不出下级）。与 salvage 合成完整记忆环：失败轨迹 salvage 主动重注（现状），成功细节 expand_memory 按需展开——一推一拉，压缩不再等于失忆。meta/domain 白名单放行。

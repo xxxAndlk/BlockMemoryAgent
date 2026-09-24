@@ -15,6 +15,7 @@ import (
 // 同时被旧版会话存储和 ReAct 会话存储共用，
 // 用于在内存中统一传递事件数据。
 type internalEvent struct {
+	Seq          int64     `json:"seq,omitempty"`           // 会话内单调序号（TODO #20① append-only 幂等键）；0=未分配（仅内存/合成事件）
 	Type         string    `json:"type"`                    // Type 表示事件类型，例如消息、工具调用等
 	Agent        string    `json:"agent"`                   // Agent 表示产生该事件的 Agent 标识
 	Message      string    `json:"message"`                 // Message 是事件的主要文本内容

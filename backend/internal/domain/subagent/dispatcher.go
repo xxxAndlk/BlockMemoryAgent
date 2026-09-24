@@ -446,6 +446,18 @@ type Dispatcher struct {
 	// subMeta 存子 Agent 的 cancel/parentID/sessionID/doneOnce，供巡检卡死时主动 cancel + 兜底递减。
 	// doneOnce 保证 patrol 与 goroutine 任一方 trackChildDone 仅触发一次，防双递减。
 	subMeta sync.Map // subAgentID -> *subAgentMeta
+	// lastCheckpoints 存子 Agent 最近逻辑检查点账本快照（TODO #20④ 失败分支剪枝），
+	// 键 subAgentID -> checkpointRec。剪枝重派种子从此回读"回滚点"账本；
+	// 同内容已落 agent_events type=checkpoint（SQL 可查），此处仅内存回读加速。
+	lastCheckpoints sync.Map // subAgentID -> checkpointRec
+	// engineSpawnNote/engineEndShape 分档引擎边界钩子（TODO #22① ContextEngine 子集）：
+	// 派发前子任务上下文注记 / 子回传摄入整形。bootstrap 经 WithEngineHooks 接线
+	// QuarantineEngine.PrepareSubagentSpawn/OnSubagentEnded；nil=零注入（现状）。
+	engineSpawnNote func(agentID, task string) string
+	engineEndShape  func(agentID, result string) string
+	// expandChain 提取摘要包链回调（TODO #22④ 展开式召回）：bootstrap 经 WithExpandChain
+	// 接线 memory.Pipeline.Bundles；nil=无链可展开（expand_memory 仍可展开文件类细节）。
+	expandChain expandChainFn
 	// patrolOnce 保证巡检 goroutine 只启动一次；patrolStop 关闭后巡检退出（测试用 ClosePatrol）。
 	// patrolMu 保护 patrolStop 的 close 与置 nil：ClosePatrol 可被并发/重复调用
 	//（多个 t.Cleanup、defer+显式双路径），无锁时 close of closed channel 直接 panic。
@@ -1253,12 +1265,11 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 	}
 	t.SetCancel(subAgentID, cancel)
 
-	// 复活种子：原任务 + 上轮结果留痕 + 用户新指令，让模型明确"这是返工/追加"。
-	seed := node.Task + "\n\n【上一轮结果】\n" + node.Summary
-	if node.Err != "" {
-		seed += "\n【上轮错误】\n" + node.Err
-	}
-	seed += "\n\n【用户直连消息】\n" + userMsg
+	// 复活种子（TODO #20④ 失败处置三选）：默认剪枝重派——种子=原任务+检查点账本+用户
+	// 新指令，上轮失败轨迹不进活跃上下文（底账 archived 可查）；Done/轻微场景自动走
+	// 同支续跑（现状语义：带上轮结果/错误）。分叉重派走 ReviveFork（新 ID）。
+	reviveMode := resolveReviveMode(node, ReviveAuto)
+	seed := d.buildReviveSeed(node, userMsg, reviveMode)
 
 	if parentID != "" {
 		d.trackChildStart(parentID)
@@ -1273,17 +1284,18 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 	if d.msgLogger != nil {
 		d.msgLogger.Clear(subAgentID)
 	}
-	// 终态快照一并删掉（PG agent_messages）：热层已清，但读路径在"热层不足 limit"时会
-	// 并 PG 兜底，旧 run 的终态快照会被当成当前对话续上去——面板显示新内容一瞬间又变回
-	// 旧的（2026-09-17 用户实证）。旧快照本就是待覆盖的死数据（终态 SaveMessages 是
-	// delete-then-insert 全量覆盖），先删只是把它提前作废，不丢任何在用的状态。
-	// best-effort：删失败只记日志，面板最坏退化成旧行为。
-	// 只清子 Agent：会话级 agent_messages（agent_id == sessionID）是进程重启后的会话恢复
-	// 数据源（session_react.restoreSessions → LoadMessages），删了会话就丢了。
+	// 终态快照归档（PG agent_messages，TODO #20① append-only——归档替代物理删除）：
+	// 热层已清，但读路径在"热层不足 limit"时会并 PG 兜底，旧 run 的终态快照会被当成
+	// 当前对话续上去——面板显示新内容一瞬间又变回旧的（2026-09-17 用户实证）。
+	// 归档（archived=true）后 LoadMessages 读路径过滤掉旧快照，隔离效果同旧删除；
+	// 旧 run 完整轨迹留底账，#20④ 失败分支剪枝经 SQL WHERE archived=true 查回。
+	// best-effort：归档失败只记日志，面板最坏退化成旧行为。
+	// 只归档子 Agent：会话级 agent_messages（agent_id == sessionID）是进程重启后的会话恢复
+	// 数据源（session_react.restoreSessions → LoadMessages），动了会话就丢了。
 	if d.msgStore != nil && strings.Contains(subAgentID, "/") {
 		delCtx, delCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := d.msgStore.DeleteMessages(delCtx, subAgentID); err != nil {
-			log.Printf("[dispatcher] revive: drop stale agent_messages failed: agent=%s err=%v", subAgentID, err)
+		if err := d.msgStore.ArchiveMessages(delCtx, subAgentID); err != nil {
+			log.Printf("[dispatcher] revive: archive stale agent_messages failed: agent=%s err=%v", subAgentID, err)
 		}
 		delCancel()
 	}
@@ -1314,16 +1326,22 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 		}
 	}()
 	// 父感知（提示词 Task 8 配套）：复活返工属调度事实，邮件通知父"等重新回传，勿重复派发"。
+	// 剪枝重派时明示"剪枝"（TODO #20④ meta 感知口径）。
 	if parentID != "" && d.mailbox != nil {
+		verb := "复活重跑"
+		if reviveMode == RevivePrune {
+			verb = "剪枝重派（失败轨迹留底账，上下文回滚至检查点）"
+		}
 		_, _ = d.mailbox.Send(&mailbox.Message{
 			From: "dispatcher", To: parentID, Type: mailbox.MsgInfo,
 			Subject: "子 Agent 复活返工",
-			Body:    fmt.Sprintf("子 Agent %s 已被用户直连复活重跑，等待其重新回传，勿重复派发同领域任务。", subAgentID),
+			Body:    fmt.Sprintf("子 Agent %s 已被用户直连%s，等待其重新回传，勿重复派发同领域任务。", subAgentID, verb),
 		})
 		d.pokeParent(parentID)
 	}
 	if sid := tool.SessionIDFromContext(subAgentCtx); sid != "" {
 		d.ledger.RecordDispatch(sid, parentID, subAgentID, node.Domain, truncateRunes(node.Task, 80), "")
+		d.writeCheckpoint(subAgentID, checkpointPhaseUserDirect)
 	}
 	return nil
 }
@@ -1860,8 +1878,17 @@ func (d *Dispatcher) deliverAbandonedWaveItem(parentID, domain, summary string) 
 
 // returnBodyFor 回传正文收口：超阈值全文落盘，邮箱只留摘要头 + 全文路径；
 // 落盘失败降级原样发送（notify 是 best-effort，不因收口失败丢消息）。
+// 预算走 announce 口径（TODO #22②）：默认静态封顶，buildAnnounce 传入动态预算。
 func (d *Dispatcher) returnBodyFor(subAgentID, summary string) string {
-	if runeLen(summary) <= mailboxReturnDumpRunes {
+	return d.returnBodyForBudget(subAgentID, summary, announceStaticCapRunes)
+}
+
+// returnBodyForBudget 带预算版收口（预算=回报进父邮箱的正文上限，超限落盘留摘要头）。
+func (d *Dispatcher) returnBodyForBudget(subAgentID, summary string, budget int) string {
+	if budget <= 0 {
+		budget = announceStaticCapRunes
+	}
+	if runeLen(summary) <= budget {
 		return summary
 	}
 	path, dumpErr := d.dumpReturnToDisk(subAgentID, summary)
@@ -1870,7 +1897,11 @@ func (d *Dispatcher) returnBodyFor(subAgentID, summary string) string {
 		return summary
 	}
 	log.Printf("[subagent] return dumped: sub=%s path=%s total=%d runes", subAgentID, path, runeLen(summary))
-	return truncateRunes(summary, mailboxReturnDigestRunes) + "\n\n【全文已落盘】" + path
+	digest := announceDigestRunes
+	if digest > budget {
+		digest = budget
+	}
+	return truncateRunes(summary, digest) + "\n\n【全文已落盘】" + path
 }
 
 // wakeSuspendedParent 唤醒挂起中的上级会话（nil 安全，幂等）：仅目标为顶层会话且
@@ -1928,6 +1959,18 @@ func (d *Dispatcher) WithFactExtractor(e FactExtractor) *Dispatcher {
 func (d *Dispatcher) WithDecisionLayer(l *decision.Layer) *Dispatcher {
 	d.decisionLayer = l
 	return d
+}
+
+// WithEngineHooks 注入分档引擎边界钩子（TODO #22①）：派发前子任务上下文注记 /
+// 子回传摄入整形。nil 参数 = 对应钩子关闭（零注入）。
+func (d *Dispatcher) WithEngineHooks(spawnNote func(agentID, task string) string, endShape func(agentID, result string) string) {
+	d.engineSpawnNote = spawnNote
+	d.engineEndShape = endShape
+}
+
+// WithExpandChain 注入摘要包链提取回调（TODO #22④ 展开式召回）。
+func (d *Dispatcher) WithExpandChain(fn expandChainFn) {
+	d.expandChain = fn
 }
 
 // WithDispatchRetryCount 设置叶子助手 kind=error 失败的自动重派次数（TODO #23）。
@@ -2130,6 +2173,12 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 	if err != nil {
 		// 死信可见（TODO #23）：目标已销毁时告知发送方，不再静默消失。
 		return &tool.Result{Tool: "send_message", Error: fmt.Sprintf("消息未送达: %v", err)}
+	}
+
+	// 里程碑检查点（TODO #20④）：发送方播报里程碑即快照任务账本——中途好状态成为
+	// 失败剪枝的候选回滚点（派发时+里程碑时两处逻辑检查点）。
+	if msgType == mailbox.MsgMilestone || strings.HasPrefix(subject, "里程碑:") {
+		d.writeCheckpoint(fromID, checkpointPhaseMilestone)
 	}
 
 	// 请求/升级类消息到达挂起（awaiting_child）的顶层会话时唤醒续跑：挂起会话
@@ -3288,6 +3337,8 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// 终态由 notify 收口；仅 Meta 直派入账（RecordDispatch 内部过滤父角色）。
 	if sid := tool.SessionIDFromContext(ctx); sid != "" {
 		d.ledger.RecordDispatch(sid, parentID, subAgentID, domain, taskBrief, "")
+		// 逻辑检查点（TODO #20④）：派发时快照任务账本，失败剪枝重派以此为回滚点。
+		d.writeCheckpoint(subAgentID, checkpointPhaseDispatch)
 	}
 	// 计划状态回写（TODO #22 Phase 1 补全）：派发即把该领域的计划子任务置为 in_progress，
 	// 否则任务只有完成/失败才翻状态，TUI 执行计划面板全程 Waiting、进度 0%。
@@ -4396,6 +4447,17 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		}
 	}
 	// 统一拼装前缀与原任务：单一【当前任务】标记，避免嵌套混淆模型。
+	// 派发前上下文预算（TODO #22②）：超 fork 硬顶转 isolated（前缀全弃不硬灌）。
+	prefixes, task, isolated := capSpawnPrefixes(prefixes, task)
+	if isolated {
+		log.Printf("[subagent] spawn isolated (fork cap): sub=%s role=%s dropped_prefixes", subAgentID, roleDef.ID)
+	}
+	// 分档引擎派发注记（TODO #22①）：快速档/集群档的上下文纪律提示随任务下发。
+	if d.engineSpawnNote != nil {
+		if note := d.engineSpawnNote(subAgentID, origTask); note != "" {
+			task += "\n\n" + note
+		}
+	}
 	if len(prefixes) > 0 {
 		task = strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + task
 	}
@@ -6206,9 +6268,15 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 	if d.mailbox == nil {
 		return
 	}
-	// mailbox 收口（TODO 第七项④）：超阈值回传全文落盘，邮箱只留摘要头 + 全文路径。
-	// 防 4K+ 大回传整段灌进父上下文（父 MetaAgent context 最贵）。
-	body := d.returnBodyFor(subAgentID, summary)
+	// 规范化回报（TODO #22② announce）：Result+Status+Notes+统计行信封 + 动态回灌预算
+	// （min(静态封顶, 父剩余×0.5÷子数)，floor 2K——高扇出每份自动收窄）。
+	// 子数取父当前未决数（含本份，≥1）。
+	// 分档引擎回传整形（TODO #22①）先于信封（快速档摘录化等）。
+	if d.engineEndShape != nil {
+		summary = d.engineEndShape(subAgentID, summary)
+	}
+	budget := announceBudgetRunes(d.PendingChildren(parentID))
+	body := d.buildAnnounce(parentID, subAgentID, summary, filesModified, budget)
 	// 构造并发送消息：发件人为子 Agent，收件人为父 Agent，主题为子 Agent 完成提示，正文为摘要。
 	// 死信错误（父已销毁）仅记日志：notify 是 best-effort 通知，不阻塞失败主流程。
 	if _, err := d.mailbox.Send(&mailbox.Message{
@@ -6261,6 +6329,50 @@ func (d *Dispatcher) TaskLedgerBrief(sessionID string) string {
 		}
 	}
 	return d.ledger.Render(sessionID, tv)
+}
+
+// TopologyBrief 渲染 agent 视角的活跃拓扑名册快照（TODO #20② 压缩前快照用）：
+// 上级 + 同级兄弟 + 直派下级的 id/标签/任务短报（截断，指针级不存全文）。
+// agentID 可为顶层句柄（无 '/'，此时兄弟/下级按整树活跃节点取）。空树返回空串。
+func (d *Dispatcher) TopologyBrief(agentID string) string {
+	if d.treeFn == nil || agentID == "" {
+		return ""
+	}
+	sid, parentID := agentID, parentIDOfAgentID(agentID)
+	if i := strings.Index(agentID, "/"); i > 0 {
+		sid = agentID[:i]
+	}
+	t := d.treeFn(sid)
+	if t == nil {
+		return ""
+	}
+	var sb strings.Builder
+	if parentID != "" {
+		fmt.Fprintf(&sb, "上级: %s\n", parentID)
+	}
+	sibs := d.rosterEntries(sid, parentID, agentID)
+	if len(sibs) > 0 {
+		sb.WriteString("同级: ")
+		for i, e := range sibs {
+			if i > 0 {
+				sb.WriteString("；")
+			}
+			fmt.Fprintf(&sb, "%s(%s)", e.id, e.label)
+		}
+		sb.WriteString("\n")
+	}
+	kids := d.childEntries(sid, agentID)
+	if len(kids) > 0 {
+		sb.WriteString("下级: ")
+		for i, e := range kids {
+			if i > 0 {
+				sb.WriteString("；")
+			}
+			fmt.Fprintf(&sb, "%s(%s)", e.id, e.label)
+		}
+		sb.WriteString("\n")
+	}
+	return truncateRunes(sb.String(), 800)
 }
 
 // roleIDFromAgentID 从 Agent 句柄中还原出角色 ID。

@@ -11,6 +11,7 @@ Go module: `github.com/blockmemory/agent/backend` (source under `backend/`; root
 ## Hard Conventions
 
 - **凡新建表/新字段统一带 owner 列**：会话/Agent 级数据必须能归属到 owner（user_id），多租户隔离靠它预留（TODO #18-8）；新增持久化结构时 owner 列与业务列同期建，不给后续迁移留死角。
+- **底账 append-only（TODO #20①）**：任何上下文剪枝（压缩/重派/rewind/复活类操作）只改视图或标记（`archived`），不物理删行；失败分支的完整轨迹永远 SQL 可查（`agent_messages`/`session_events`/`agent_events`，归档行 `WHERE archived=true` 查回）。唯一物理删除例外：用户显式删除会话的 7 表级联。**话题切换 wipe 必留摘要**——节点快照 + `topic:*:summary` KV 留痕后才可清树。写入侧纪律：`agent_messages` 尾差量追加（分叉时旧版移归档）、`session_events` 按 `(session_id,seq)` 幂等纯追加（seq 永不清零）。
 - **`GOTOOLCHAIN=local` required** on machines whose default Go is older. All `go test` / `go run` commands in this repo use this flag. Do not omit.
 - **Windows bash shell**: use Unix syntax (`/dev/null` not `NUL`, forward slashes in paths).
 - **Strict startup**: `bootstrap.Build` fails fast - missing config files, unreachable PostgreSQL/Redis, or failed LLM warmup/connectivity check all abort boot. No degraded no-DB/no-key mode for the server binary.

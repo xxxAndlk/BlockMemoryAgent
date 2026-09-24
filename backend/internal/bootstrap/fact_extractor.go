@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/blockmemory/agent/backend/internal/agent"
 	"github.com/blockmemory/agent/backend/internal/domain/subagent"
 	"github.com/blockmemory/agent/backend/internal/model"
 )
@@ -39,6 +40,11 @@ func filterJunkFacts(facts []string) []string {
 	for _, f := range facts {
 		f = strings.TrimSpace(f)
 		if f == "" || strings.HasPrefix(f, "[failure") || strings.Contains(f, "failure kind=") {
+			continue
+		}
+		// 召回循环防护（TODO #22③）：被召回内容已围栏标记（WrapUntrusted），带围栏的
+		// 事实不反向沉淀为新记忆——防"召回→转述→再沉淀"无限循环与 untrusted 入 curated 层。
+		if agent.ContainsUntrustedFence(f) {
 			continue
 		}
 		out = append(out, f)

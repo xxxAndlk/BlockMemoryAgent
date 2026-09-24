@@ -218,6 +218,11 @@ type FeatureTogglesConfig struct {
 	// BlockMemoryFactsMax 单次子 Agent 输出提取的关键事实条数上限（默认 5，1-8 区间）。
 	// 事实逐条向量化落库，条数多则召回粒度细但噪声大；1-5 条为设计定档（每条 <=80 字）。
 	BlockMemoryFactsMax int `yaml:"block_memory_facts_max"`
+	// MemoryIndexMaxLines 记忆索引槽行数配额（TODO #20③，对标 CC MEMORY.md 200 行）。
+	// 会话启动注入一行式沉淀索引；超限带重写指令不静默截断。<=0 按默认 200。
+	MemoryIndexMaxLines int `yaml:"memory_index_max_lines"`
+	// MemoryIndexMaxRunes 记忆索引槽 runes 配额（对标 CC 25KB）。<=0 按默认 25000。
+	MemoryIndexMaxRunes int `yaml:"memory_index_max_runes"`
 	// MaxTotalDispatches 单 session 内所有角色派发总数上限（合计），超过拒绝派发。
 	// 计数在用户发送新消息时重置。默认 30；<=0 时回退默认，负数表示不限制。
 	MaxTotalDispatches int `yaml:"max_total_dispatches"`

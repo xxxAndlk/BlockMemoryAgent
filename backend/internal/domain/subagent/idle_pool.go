@@ -1217,12 +1217,82 @@ func (d *Dispatcher) SuspendSession(sessionID string) {
 	log.Printf("[subagent] SESSION SUSPENDED: session=%s (all agents parking)", sessionID)
 }
 
+// RestoreSessionDomains 会话恢复中间层（TODO #21④）：进程重启后 resume 会话时，
+// 树中未终态（Paused/Idle/Running）或终态不久（Done/Failed/Cancelled/Unverified 且
+// finished 在 30min 内）的 domain 实例，按 (sessionID, agentID) 从 agent_messages 取回
+// history、树元数据经 TreeFor→LoadNodes 已恢复，重建热驻槽（state=Idle park 等复用/唤醒）。
+// 三层连续体中间层：热驻池（分钟级 LRU）与领域档案（跨会话永久级，#17）之间的
+// "会话 resume 级"实例+上下文恢复（KC 语义：恢复会话还原子 Agent 实例状态与上下文历史）。
+// 边界（TODO#14 不破）：只还原落库数据已够的会话历史——agent_messages 无行不建空壳槽
+// （冷复活走 #17 档案匹配），不新增持久化面；已在池的槽（同进程 resume 热驻未死）跳过。
+// best-effort：单实例失败仅记日志。返回重建槽数。
+func (d *Dispatcher) RestoreSessionDomains(sessionID string) int {
+	if sessionID == "" || !d.hotEnabled() || d.treeFn == nil || d.msgStore == nil {
+		return 0
+	}
+	t := d.treeFn(sessionID)
+	if t == nil {
+		return 0
+	}
+	const recentTerminalWindow = 30 * time.Minute
+	now := time.Now()
+	restored := 0
+	for _, n := range t.Snapshot() {
+		if n.Role != "domain" {
+			continue
+		}
+		switch n.Status {
+		case orchestrator.StatusRunning, orchestrator.StatusPaused, orchestrator.StatusIdle:
+			// 未终态：实例+上下文都该回温。
+		case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled, orchestrator.StatusUnverified:
+			// 终态不久：仍可作热驻续建种子（复用上下文继续追问）；太久远交 #17 冷复活。
+			if n.Finished.IsZero() || now.Sub(n.Finished) > recentTerminalWindow {
+				continue
+			}
+		default:
+			continue
+		}
+		if d.pool.slot(sessionID, n.ID) != nil {
+			continue // 热驻未死（同进程 resume），已有实例不重建
+		}
+		msgs, err := d.msgStore.LoadMessages(context.Background(), n.ID)
+		if err != nil {
+			log.Printf("[subagent] restore domain: load messages failed: sub=%s err=%v", n.ID, err)
+			continue
+		}
+		if len(msgs) == 0 {
+			// 落库数据不够（无 history）：不建空壳槽，冷复活走 #17 档案匹配。
+			continue
+		}
+		s := &domainSlot{
+			id:        n.ID,
+			sessionID: sessionID,
+			parentID:  n.ParentID,
+			domain:    strings.TrimSpace(n.Domain),
+			history:   msgs,
+			state:     slotIdle,
+			idleSince: now,
+			ops:       make(chan domainOp, 8),
+		}
+		d.pool.store(s)
+		// 树绑定销毁句柄（重建槽的 TTL/硬取消出口），与 dispatchHotDomain 首绑同语义。
+		t.SetCancel(n.ID, s.destroyFnLocked())
+		d.armTTL(s)
+		restored++
+		log.Printf("[subagent] RESTORE DOMAIN SLOT: sub=%s domain=%s msgs=%d status=%s", n.ID, n.Domain, len(msgs), n.Status)
+	}
+	return restored
+}
+
 // ResumeSessionAgents 唤醒 session 全部挂起 Agent：
 // close wake 广播 + Paused 树节点 Resume（绑槽任务 cancel）+ 恢复冻结的 idle TTL。
 func (d *Dispatcher) ResumeSessionAgents(sessionID string) {
 	if sessionID == "" {
 		return
 	}
+	// 会话恢复中间层（TODO #21④）：进程重启后先重建未终态/终态不久 domain 槽，
+	// 再走既有唤醒广播——重建槽同样被下方 armTTL/opResume 扫到，零特判。
+	d.RestoreSessionDomains(sessionID)
 	st := d.suspendState(sessionID)
 	if st == nil {
 		return
@@ -1335,6 +1405,7 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 		log.Printf("[subagent] QUEUE: sub=%s domain=%s queued=%d (busy, will run after current task)", s.id, s.domain, qlen)
 		// 任务台账登记：忙碌入队同样记"进行中"（备注队列位置），任务执行后由 notify 收口。
 		d.ledger.RecordDispatch(s.sessionID, parentID, s.id, s.domain, task, fmt.Sprintf("入队第%d位", qlen))
+		d.writeCheckpoint(s.id, checkpointPhaseReuse)
 		return s.id + "（忙碌中，任务已入队，当前任务完成后执行）", nil
 	}
 
@@ -1397,6 +1468,7 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 		log.Printf("[subagent] REUSE: sub=%s domain=%s reuse=%d task_len=%d", s.id, s.domain, s.reuseCount, len(task))
 		// 任务台账登记：续建复用新开一条任务记录（台账按任务粒度，热驻槽跨任务不累加）。
 		d.ledger.RecordDispatch(s.sessionID, parentID, s.id, s.domain, task, fmt.Sprintf("续建#%d", s.reuseCount))
+		d.writeCheckpoint(s.id, checkpointPhaseReuse)
 		return s.id, nil
 	default: // slotRunning（含挂起）
 		return enqueue()
@@ -1496,6 +1568,7 @@ func (d *Dispatcher) wakeIdleWithTask(agentID, taskText, ledgerVerb, parentNote 
 	d.rearmSlotActivity(s.id)
 	// 任务台账登记：直连/邮件唤醒单独备注，区别于主 Agent 续建派发。
 	d.ledger.RecordDispatch(s.sessionID, s.parentID, s.id, s.domain, truncateRunes(taskText, 80), fmt.Sprintf("%s#%d", ledgerVerb, s.reuseCount))
+	d.writeCheckpoint(s.id, checkpointPhaseReuse)
 	// 父感知（对齐 ReviveWithMessage）：邮件通知父"等其回传，勿重复派发同领域任务"。
 	if s.parentID != "" && d.mailbox != nil {
 		_, _ = d.mailbox.Send(&mailbox.Message{
@@ -1524,6 +1597,8 @@ func (d *Dispatcher) buildReuseTask(ctx context.Context, s *domainSlot, task str
 	if label := strings.TrimSpace(s.domain); label != "" {
 		task = "【你的领域】" + textutil.TruncateRunes(label, 16, "…") + "\n" + task
 	}
+	// 派发前上下文预算（TODO #22②）：超 fork 硬顶转 isolated（前缀全弃不硬灌）。
+	prefixes, task, _ = capSpawnPrefixes(prefixes, task)
 	if len(prefixes) > 0 {
 		return strings.Join(prefixes, "\n\n") + "\n\n【当前任务】\n" + task
 	}
@@ -1581,6 +1656,7 @@ func (d *Dispatcher) dispatchHotDomain(ctx context.Context, parentID, subAgentID
 	}
 	// 任务台账登记（热驻新建路径，与 dispatchOne 非热路径并列）。
 	d.ledger.RecordDispatch(sid, parentID, subAgentID, domain, taskBrief, "")
+	d.writeCheckpoint(subAgentID, checkpointPhaseDispatch)
 	// 心跳元数据：subMeta 供巡检兜底；activity 由 buildDomainAgent 注册。
 	d.subMeta.Store(subAgentID, &subAgentMeta{parentID: parentID, sessionID: sid, wallClock: wallClock})
 	d.ensurePatrol()

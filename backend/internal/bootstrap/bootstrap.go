@@ -471,6 +471,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 逐领域拼接），省父 Agent "收到，继续等" 空转轮。config 默认 true，可显式关闭。
 	subAgentDispatcher.WithBatchDigest(cfg.Agent.BatchDigestEnabled == nil || *cfg.Agent.BatchDigestEnabled)
 	subAgentDispatcher.WithSummaryMerger(&llmDigestMerger{factory: modelFactory})
+	// 压缩生命周期钩子（TODO #20②+#21，compaction_hooks.go）：压缩前账本/名册/未读
+	// 快照随压缩事件落底账 + 压缩后热改动重读回灌（≤5 文件、>5K tokens 只回路径、
+	// 项目自述从盘重注入）。Pipeline 实例复用后挂（dispatcher 已就绪）。
+	memoryPipeline.WithCompactionHooks(newCompactionSnapshot(subAgentDispatcher, sharedMailbox), newHotReinjectProvider(workDir))
 	// 共享记忆/spec：文件后端落盘到 <workDir>/.bma/shared/<hex(agentID)>__<slot>.md。
 	// 主线程 Agent（meta/domain）持可写实例写关键上下文与 spec，
 	// 子 Agent 派发时经 Dispatcher 的只读视图读取并注入任务前。
@@ -497,6 +501,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 注册 list_skills / load_skill 工具（技能渐进披露）：meta/domain 及叶子角色白名单
 	// 含这两个工具；范围判定（meta=全池，其他=持有集）由 Dispatcher 的 heldSkills 权威管理。
 	subAgentDispatcher.RegisterSkillTools(toolRegistry)
+	// 注册 expand_memory 工具（TODO #22④ 展开式召回）：压缩摘要点派只读展开器取回细节，
+	// 摘要链回调接 memory.Pipeline.Bundles（leaf→condensed 包链）。
+	subAgentDispatcher.RegisterExpandTool(toolRegistry)
+	subAgentDispatcher.WithExpandChain(memoryPipeline.Bundles)
 	// 技能池注入：call_sub_agent 的 skills 参数校验（⊆ 父持有集）、子 Agent
 	// 【可用技能】提示块渲染与 load_skill/list_skills 的池查询共用同一池。
 	subAgentDispatcher.WithSkillPool(skillPool)
@@ -511,6 +519,31 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
+	// 分档上下文引擎（TODO #22①）：按会话档位选引擎——fast=纯裁剪（零 LLM）/daily=现状
+	// safeguard/cluster=LCM 摘要 DAG；QuarantineEngine 失败隔离降级 daily 并落
+	// engine_quarantine 留痕。gear 读取走 SessionGear（agentID 前缀即 sessionID）。
+	{
+		fastEng := memory.NewFastTrimEngine(memoryPipeline)
+		dailyEng := memory.NewSafeguardEngine(memoryPipeline)
+		clusterEng := memory.NewDAGEngine(memoryPipeline)
+		engineFor := func(agentID string) memory.ContextEngine {
+			sid := agentID
+			if i := strings.Index(agentID, "/"); i > 0 {
+				sid = agentID[:i]
+			}
+			switch agentSvc.SessionGear(sid) {
+			case tool.GearFast:
+				return fastEng
+			case tool.GearCluster:
+				return clusterEng
+			default:
+				return dailyEng
+			}
+		}
+		quarantine := memory.NewQuarantineEngine(memoryPipeline, engineFor, dailyEng)
+		memoryPipeline.WithContextEngine(quarantine)
+		subAgentDispatcher.WithEngineHooks(quarantine.PrepareSubagentSpawn, quarantine.OnSubagentEnded)
+	}
 	// 会话终态 Webhook 通知（TODO #18-5 T32）：webhook_url 空=关闭（NewNotifier 返 nil）。
 	agentSvc.SetNotifier(agent.NewNotifier(cfg.Notify.WebhookURL, cfg.Notify.WebhookEvents))
 	// MetaAgent 技能目录块（【可用技能】进 meta 系统提示；Meta 持全集可 load_skill
@@ -670,8 +703,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	//（防上下文膨胀/偏好泄露；项目偏好例外，见下）。
 	// 双路写入：remember_preference 工具（用户显式陈述，立即生效）+ 会话完成轻量模型提取。
 	// Merge 整理（2026-09-02 期 1）：提取增量经轻量模型去重/冲突归档进偏好/技术栈/沟通风格小节。
+	var profileStore *userprofile.Store
 	if paths.ProfilePath != "" {
-		profileStore := userprofile.NewStore(paths.ProfilePath)
+		profileStore = userprofile.NewStore(paths.ProfilePath)
 		if err := profileStore.Load(); err != nil {
 			closeStores(pgStore, redisStore)
 			return nil, fmt.Errorf("load user profile %s: %w", paths.ProfilePath, err)
@@ -800,6 +834,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 任务台账注入（2026-08-28 旧需求重派事故根治）：MetaAgent 每轮见【任务台账】段——
 	// 派发任务的机器权威状态（完成/失败+原因/进行中），完成项禁止重新派发查询，防旧需求返工。
 	agentSvc.SetTaskLedgerProvider(subAgentDispatcher.TaskLedgerBrief)
+	// 记忆索引槽（TODO #20③+#22③，memory_index.go）：会话启动注入一行式沉淀索引
+	//（行数/runes 双配额 + 超限重写指令），untrusted 围栏行结构性丢弃（信任分层）。
+	agentSvc.SetMemoryIndexProvider(newMemoryIndexProvider(pgStore.Knowledge, profileStore, cfg.Agent.MemoryIndexMaxLines, cfg.Agent.MemoryIndexMaxRunes))
 	agentSvc.SetIdleTTLArmer(subAgentDispatcher)
 	// 活动证据展示面（TODO 第10项②）：ListAgents 填充各节点 ActivityKind/LastActivityAgo，
 	// TUI/Web 渲染 "in <tool> · active Xs ago" 让假死可见。
@@ -1197,28 +1234,35 @@ func newEventSummarizer(f *model.ModelFactory) memory.EventSummarizer {
 
 // newHistorySummarizer 构造一个 memory.HistorySummarizer，供层级压缩（压缩金字塔）使用：
 // merge=false 把新滑出保留段的中段历史压成结构化压缩包；merge=true 把若干旧压缩包
-// 合并为一个更粗的包。结构化五节（决策/进展/待办/约束/文件要点）比纯散文在多层合并时更抗漂移。
-// 【文件要点】节的动机（实证）：压缩丢已读文件内容导致领域 Agent 失忆、反复重读同一文件
-//（实测单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）——读到的文件关键事实
-//（路径 + 行号区间 + 函数签名/常量值/结论）必须随压缩包存活，总字数上限相应从 300 放宽到 500。
+// 合并为一个更粗的包。压缩笔记三件套（TODO #21①，KC v0.23.0 同款直接抄终点）：
+// 【已定决策】【后续步骤】【可预见的障碍】；另保留【文件要点】节——
+// 压缩丢已读文件内容导致领域 Agent 失忆、反复重读同一文件（实测单领域 Agent 两小时
+// ReadFile 610 次 + SearchInFiles 351 次），读到的文件关键事实必须随压缩包存活。
+// 压缩前自盘提醒（TODO #21②，KC v0.41.0 同款）：提示先自盘状态再出包，摘要质量前置增益。
+// 看板/台账注入段在压缩视图之外常驻（wrapMetaMemory 尾部注入，压缩不触碰），
+// 随摘要天然保留（KC v0.41.0 同款语义，核实项）。
 // 失败时返回错误，由 Pipeline 降级为截断式压缩，主流程不受影响。
 func newHistorySummarizer(f *model.ModelFactory) memory.HistorySummarizer {
 	if f == nil {
 		return nil
 	}
+	const threePiece = "四节结构：" +
+		"【已定决策】已拍板的结论与用户明确要求（含约束）；" +
+		"【后续步骤】未完成事项与已完成工作的关键文件路径；" +
+		"【可预见的障碍】已识别的坑/风险/依赖（如配置缺失、接口未定、待验证假设）；" +
+		"【文件要点】已读文件的关键事实：路径 + 行号区间 + 函数签名/常量值/结论（此节必须保留，防压缩后失忆重读）。"
 	return func(ctx context.Context, text string, merge bool) (string, error) {
+		// 压缩前自盘提醒：先盘状态再出包，防直接生成时丢三件套骨架。
+		preamble := "先自盘状态（已定决策/后续步骤/可预见的障碍），然后输出压缩包。"
 		var prompt string
 		if merge {
-			prompt = "以下是一个 Agent 会话的若干历史压缩包（按时间从旧到新）。把它们合并为一个结构化压缩包，" +
-				"500 字以内，保持五节结构：【决策】已拍板的结论；【进展】已完成的工作与关键文件路径；" +
-				"【待办】未完成事项；【约束】用户明确要求；【文件要点】已读文件的关键事实：" +
-				"路径 + 行号区间 + 函数签名/常量值/结论。保留仍然有效的结论、文件路径与文件要点，" +
+			prompt = preamble + "以下是一个 Agent 会话的若干历史压缩包（按时间从旧到新）。把它们合并为一个结构化压缩包，" +
+				"500 字以内，保持" + threePiece +
+				"保留仍然有效的结论、文件路径与文件要点，" +
 				"丢弃已被推翻或完成清理的内容。直接输出压缩包，不要解释：\n" + text
 		} else {
-			prompt = "将以下 Agent 对话中段历史压成一个结构化压缩包，500 字以内，分五节：" +
-				"【决策】已拍板的结论；【进展】已完成的工作与关键文件路径；【待办】未完成事项；" +
-				"【约束】用户明确要求；【文件要点】已读文件的关键事实：路径 + 行号区间 + " +
-				"函数签名/常量值/结论（此节必须保留，防压缩后失忆重读）。直接输出压缩包，不要解释：\n" + text
+			prompt = preamble + "将以下 Agent 对话中段历史压成一个结构化压缩包，500 字以内，" + threePiece +
+				"直接输出压缩包，不要解释：\n" + text
 		}
 		return f.CallLightweightWithRetry(ctx, prompt)
 	}

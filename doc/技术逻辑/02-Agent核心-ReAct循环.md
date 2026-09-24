@@ -243,3 +243,8 @@
 8. **`maxIter<=0` 表示不限制**（meta 用 0）；tokenBudget 才是 meta 的实际收敛闸。
 9. `truncateRunes` 按 rune（中文安全）；多处截断阈值硬编码（如 `historyToolCallInputMaxRunes=12000` 无配置项）。
 10. 会话级 logger 经 ctx 传递（`logger.NewContext`），轻量 LLM 调用（事实提取/打捞/judge）靠它写 session_logs。
+
+## 2.12 记忆索引与轮末微压缩（#20③/#22①，2026-09-23）
+
+- **记忆索引槽**（memory_index.go + bootstrap/memory_index.go）：会话启动注入【记忆索引】一行式沉淀索引（global_knowledge ListIndexEntries 按 last_accessed 降序 + 用户画像摘要首条），双配额 `memory_index_max_lines: 200` / `memory_index_max_runes: 25000`——超限带【记忆索引超限】重写指令逼模型整理旧沉淀（不静默截断，CC errors#memory-index 同款）；`<untrusted_data` 围栏行结构性丢弃（provenance 门 + 召回循环防护，filterJunkFacts 同款丢围栏事实）。注入位 skillBlock 之后（promptStatsSegs memidx 记账）。
+- **轮末微压缩**（ContextEngine.AfterTurn）：Assemble 尾部每轮调用——快速档在此做旧 tool result stub 修剪（>200 rune，近保留段不动，幂等防重复改写破前缀缓存）。契约=条数不变（TailStart 下标依赖），详见 06 章引擎节。

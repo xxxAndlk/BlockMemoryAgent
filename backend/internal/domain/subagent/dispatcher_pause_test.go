@@ -64,8 +64,8 @@ func (c *captureMessagesStore) LoadMessages(_ context.Context, agentID string) (
 	return nil, nil
 }
 
-// DeleteMessages 复活重跑前作废旧快照：清掉该 agent 的缓存记录（幂等）。
-func (c *captureMessagesStore) DeleteMessages(_ context.Context, agentID string) error {
+// ArchiveMessages 复活重跑前作废旧快照（TODO #20① 归档语义）：清掉该 agent 的缓存记录（幂等）。
+func (c *captureMessagesStore) ArchiveMessages(_ context.Context, agentID string) error {
 	kept := c.saved[:0]
 	for _, m := range c.saved {
 		if m.agentID != agentID {

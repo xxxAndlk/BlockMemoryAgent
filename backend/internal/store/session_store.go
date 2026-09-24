@@ -24,6 +24,7 @@ type SessionHistoryRecord struct {
 // SessionEventRecord 会话事件归档记录。
 type SessionEventRecord struct {
 	SessionID    string    `json:"session_id"`    // 所属会话 ID
+	Seq          int64     `json:"seq"`           // 会话内单调序号（TODO #20① append-only 幂等键）；<=0 由 SaveEvents 兜底补号
 	Type         string    `json:"type"`          // 事件类型
 	Agent        string    `json:"agent"`         // 产生事件的 Agent
 	Message      string    `json:"message"`       // 事件消息
@@ -116,15 +117,10 @@ func (s *SessionStore) UpdateWorkDir(ctx context.Context, sessionID, workDir str
 	return n > 0, nil
 }
 
-// SaveEvents 批量持久化会话事件(全量覆盖语义)。
-// 每轮结束调用方都会重写该会话的全部事件,先 DELETE 再 INSERT 保证幂等,
-// 恢复-续跑场景不会与已落库的旧行叠加重复(与 PostgresMessagesStore.SaveMessages 同语义)。
-// 参数:
-//   - ctx:       请求上下文。
-//   - sessionID: 会话 ID。
-//   - events:    待写入事件列表。
-//
-// 返回: 事务开始、准备语句、执行或提交错误。
+// SaveEvents 纯追加写入会话事件（TODO #20① append-only，零物理删除）。
+// 旧语义 delete-then-insert 全量覆盖——旧行每轮物理消失，失败轨迹不可 SQL 查回。
+// 现语义：按 (session_id, seq) 唯一键 ON CONFLICT DO NOTHING 追加，同快照重放幂等
+// （恢复-续跑/每轮全量重存不叠加）；seq<=0 的行（旧调用方）在 tx 内从 MAX(seq)+1 补号。
 func (s *SessionStore) SaveEvents(ctx context.Context, sessionID string, events []SessionEventRecord) error {
 	// 开启事务保证批量写入原子性
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -134,15 +130,18 @@ func (s *SessionStore) SaveEvents(ctx context.Context, sessionID string, events 
 	// 任何返回路径都回滚；成功提交会覆盖回滚操作
 	defer tx.Rollback()
 
-	// 先清空该会话的旧事件,再全量写入本轮快照(delete-then-insert)
-	if _, err := tx.ExecContext(ctx, `DELETE FROM session_events WHERE session_id = $1`, sessionID); err != nil {
-		return fmt.Errorf("delete old events: %w", err)
+	// 兜底补号水位：调用方未带 seq 时从既有最大值续号（带 seq 的行不受影响）。
+	var maxSeq int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(seq), 0) FROM session_events WHERE session_id = $1`, sessionID).Scan(&maxSeq); err != nil {
+		return fmt.Errorf("max seq: %w", err)
 	}
 
-	// 预编译 INSERT 语句，提升批量写入性能
+	// 预编译 INSERT 语句，提升批量写入性能；唯一键 (session_id, seq) 幂等去重。
 	stmt, err := tx.PrepareContext(ctx, `
-			INSERT INTO session_events (session_id, type, agent, message, kind, tool, tool_path, tool_output, tool_error, success, timestamp, prompt, input_tokens, output_tokens, detail_json)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			INSERT INTO session_events (session_id, type, agent, message, kind, tool, tool_path, tool_output, tool_error, success, timestamp, prompt, input_tokens, output_tokens, detail_json, seq)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			ON CONFLICT (session_id, seq) DO NOTHING
 		`)
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
@@ -150,9 +149,16 @@ func (s *SessionStore) SaveEvents(ctx context.Context, sessionID string, events 
 	defer stmt.Close()
 
 	for _, e := range events {
+		seq := e.Seq
+		if seq <= 0 {
+			maxSeq++
+			seq = maxSeq
+		} else if seq > maxSeq {
+			maxSeq = seq
+		}
 		// 存储层兜底清洗：调用方未必都做过 sanitize，
 		// NUL/非法 UTF-8 会让整批写入被 Postgres 拒绝（22021）。
-		_, err := stmt.ExecContext(ctx, sessionID, e.Type, e.Agent, sanitizeUTF8(e.Message), e.Kind, e.Tool, sanitizeUTF8(e.ToolPath), sanitizeUTF8(e.ToolOutput), sanitizeUTF8(e.ToolError), e.Success, e.Timestamp, sanitizeUTF8(e.Prompt), e.InputTokens, e.OutputTokens, sanitizeUTF8(e.DetailJSON))
+		_, err := stmt.ExecContext(ctx, sessionID, e.Type, e.Agent, sanitizeUTF8(e.Message), e.Kind, e.Tool, sanitizeUTF8(e.ToolPath), sanitizeUTF8(e.ToolOutput), sanitizeUTF8(e.ToolError), e.Success, e.Timestamp, sanitizeUTF8(e.Prompt), e.InputTokens, e.OutputTokens, sanitizeUTF8(e.DetailJSON), seq)
 		if err != nil {
 			return fmt.Errorf("insert event: %w", err)
 		}
@@ -167,12 +173,13 @@ func (s *SessionStore) SaveEvents(ctx context.Context, sessionID string, events 
 //   - sessionID: 会话 ID。
 //
 // 返回: 事件切片与 SQL 错误。
+// GetEvents 读取某个会话的全部事件（按 seq 升序，TODO #20① 同刻时间戳下确定序）。
 func (s *SessionStore) GetEvents(ctx context.Context, sessionID string) ([]SessionEventRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-			SELECT session_id, type, agent, message, kind, tool, tool_path, tool_output, tool_error, success, timestamp, prompt, input_tokens, output_tokens, detail_json
+			SELECT session_id, seq, type, agent, message, kind, tool, tool_path, tool_output, tool_error, success, timestamp, prompt, input_tokens, output_tokens, detail_json
 			FROM session_events
 			WHERE session_id = $1
-			ORDER BY timestamp ASC
+			ORDER BY seq ASC
 		`, sessionID)
 	if err != nil {
 		return nil, err
@@ -182,7 +189,7 @@ func (s *SessionStore) GetEvents(ctx context.Context, sessionID string) ([]Sessi
 	var events []SessionEventRecord
 	for rows.Next() {
 		var e SessionEventRecord
-		if err := rows.Scan(&e.SessionID, &e.Type, &e.Agent, &e.Message, &e.Kind, &e.Tool, &e.ToolPath, &e.ToolOutput, &e.ToolError, &e.Success, &e.Timestamp, &e.Prompt, &e.InputTokens, &e.OutputTokens, &e.DetailJSON); err != nil {
+		if err := rows.Scan(&e.SessionID, &e.Seq, &e.Type, &e.Agent, &e.Message, &e.Kind, &e.Tool, &e.ToolPath, &e.ToolOutput, &e.ToolError, &e.Success, &e.Timestamp, &e.Prompt, &e.InputTokens, &e.OutputTokens, &e.DetailJSON); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
 		events = append(events, e)

@@ -236,3 +236,7 @@ persist running → `resolveGearMetaRole` → `mountTopLevelEssentials`（插件
 14. **worktree 能力经 stopMarker 变量二次断言**：同一接口变量承载多能力（SoftStop/Worktree/Purge/PauseMark），未实现走断言失败分支。
 15. **evolveSession 阈值**：minEvolveEvents=5 / digest 1500 runes / 90s 超时；画像合并 90s。
 16. **持久化失败只记日志**：persistEvents/persistHistory 失败不阻塞会话（存储层另有 sanitize 兜底）。
+
+## 3.12 会话恢复中间层（#21④，2026-09-23）
+
+resume 路径（ResumeSessionAgents）头部调 `Dispatcher.RestoreSessionDomains`：按 (session_id, agent_id) 从 agent_messages + agent_tree_nodes 重建热驻槽（未终态/终态 30min 内 domain），重建槽同样被 armTTL/opResume 扫到（零特判）。三级连续体：热驻池（分钟级 LRU）→ 本条（同会话 resume）→ 领域档案（跨会话永久，#17）。边界：只还原落库数据已够的会话历史，不新增持久化面（#14"不做协作状态持久化"决策不破）。

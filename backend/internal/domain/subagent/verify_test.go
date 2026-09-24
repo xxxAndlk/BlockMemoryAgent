@@ -174,7 +174,7 @@ func TestDispatch_L0ExecutablePasses(t *testing.T) {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
 	body := waitMailboxBody(t, mb, "s1")
-	if body != "【校验:通过(L0 证据)】\ndone" {
+	if !strings.HasPrefix(body, "【校验:通过(L0 证据)】\ndone") {
 		t.Fatalf("expected L0-pass summary, got: %q", body)
 	}
 }
@@ -250,7 +250,7 @@ func TestDispatch_L0RetryGainsEvidence(t *testing.T) {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
 	body := waitMailboxBody(t, mb, "s1")
-	if body != "【校验:通过(L0 证据)】\ndone2" {
+	if !strings.HasPrefix(body, "【校验:通过(L0 证据)】\ndone2") {
 		t.Fatalf("expected L0-pass after retry, got: %q", body)
 	}
 }

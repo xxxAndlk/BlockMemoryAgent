@@ -129,6 +129,27 @@ func (s *KnowledgeStore) GetByType(ctx context.Context, knowledgeType string, li
 	return s.scanKnowledgeRows(ctx, rows)
 }
 
+// ListIndexEntries 返回沉淀索引槽的一行式条目（TODO #20③+#22③）：
+// 全类型未归档记录按 (last_accessed DESC NULLS LAST, created_at DESC) 取 limit 条，
+// 供会话启动渲染【沉淀索引】。含 untrusted 围栏的行由调用方过滤（provenance 门）。
+func (s *KnowledgeStore) ListIndexEntries(ctx context.Context, limit int) ([]*types.KnowledgeRecord, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE archived = false
+			ORDER BY last_accessed DESC NULLS LAST, created_at DESC
+			LIMIT $1
+		`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return s.scanKnowledgeRows(ctx, rows)
+}
+
 // Search 向量相似搜索 (依赖 pgvector)。
 // 参数:
 //   - ctx: 请求上下文。

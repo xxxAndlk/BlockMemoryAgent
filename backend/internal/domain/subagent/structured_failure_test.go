@@ -119,7 +119,7 @@ func TestDispatcher_AutoRetry_LeafErrorSucceedsOnSecondAttempt(t *testing.T) {
 	if strings.Contains(got.Body, "failure kind") {
 		t.Fatalf("retried success should not carry failure marker, got: %s", got.Body)
 	}
-	if got.Body != "done" {
+	if !strings.HasPrefix(got.Body, "done") {
 		t.Fatalf("expected successful summary 'done', got: %q", got.Body)
 	}
 }

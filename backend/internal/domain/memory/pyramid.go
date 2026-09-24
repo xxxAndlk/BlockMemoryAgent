@@ -33,18 +33,51 @@ import (
 // 20 个包 × 每包覆盖一个压缩周期（约 10 步）≈ 200+ 步上下文仍有粗粒度记忆。
 const DefaultMaxBundles = 20
 
+// defaultKeepRecent 压缩保留段默认条数（compressKeepRecent<=0 时的回落值）。
+const defaultKeepRecent = 10
+
 // maxMergedBundleRunes 是合并降级路径（LLM 不可用直接拼接）的单包最大 rune 数，
 // 防拼接兜底时单包无限增长。LLM 合并路径由 prompt 约束篇幅（约 400 字）。
 const maxMergedBundleRunes = 3000
 
-// advanceCompression 执行一次层级压缩推进：计算新保留段边界，把新滑出的中段
-// 压成一个压缩包追加到金字塔，超限合并最老一半，冻结新状态并落库。
-// LLM 调用在锁外进行（慢调用不阻塞其他 agent 的 Assemble）；并发重复触发
-// 最坏情况是同一 agent 多压一次包，内容等价，无害（与旧实现的并发语义一致）。
+// compactStyle 压缩风格参数（TODO #22① 三档分化）：daily 用 defaultCompactStyle()，
+// cluster（DAGEngine）传 LCM 参数，fast 传 useLLM=false（截断包零 LLM）。
+type compactStyle struct {
+	useLLM           bool  // 允许 LLM 摘要（false=截断包，零 LLM）
+	leafCapRunes     int   // leaf 包截断上限（0=不截）
+	condCapRunes     int   // 合并（condensed）包截断上限（0=不限，走 maxMergedBundleRunes 兜底）
+	fanout           int   // 包数合并触发阈值（0=用 maxBundles）
+	mergeK           int   // 一次合并最老几个（0=最老一半，现有语义）
+	probeBigFile     bool  // 大文件外置换探查摘要（LCM）
+	bigFileRunes     int   // 大文件阈值
+	probeRunes       int   // 探查摘要目标长度
+	residentMinRunes int   // 常驻下界：压缩后保留段不足此量时多保一条消息（LCM 常驻 30K）
+}
+
+// defaultCompactStyle 日常档风格 = 现状管线语义（LLM 摘要 + 超限合并最老一半）。
+func defaultCompactStyle() compactStyle {
+	return compactStyle{useLLM: true}
+}
+
+// advanceCompression 现状语义入口（日常档/未接引擎路径）。
 func (p *Pipeline) advanceCompression(agentID string, history []agent.ReactMessage) {
+	p.advanceCompressionStyled(agentID, history, defaultCompactStyle())
+}
+
+// advanceCompressionStyled 执行一次层级压缩推进（风格参数化，TODO #22①）：
+// 计算新保留段边界，把新滑出的中段压成一个压缩包追加到金字塔，超 fanout 合并
+// 最老 mergeK 个，冻结新状态并落库。LLM 调用在锁外进行；并发重复触发最坏同包重压，无害。
+func (p *Pipeline) advanceCompressionStyled(agentID string, history []agent.ReactMessage, style compactStyle) {
 	firstUserIdx, recentStart, ok := compressBoundary(history, p.compressKeepRecent)
 	if !ok {
 		return
+	}
+	// 常驻下界（LCM 30K）：保留段 token 估算不足 min 时向前多保消息，防压缩后活跃段过薄。
+	if style.residentMinRunes > 0 && p.tokenEstimator != nil {
+		for recentStart > firstUserIdx+1 &&
+			p.tokenEstimator(history[recentStart:]) < style.residentMinRunes {
+			recentStart--
+		}
 	}
 
 	p.mu.RLock()
@@ -65,37 +98,112 @@ func (p *Pipeline) advanceCompression(agentID string, history []agent.ReactMessa
 		return
 	}
 
-	bundle := p.summarizeSegment(agentID, segment)
+	// 压缩前状态快照（TODO #20②）：账本/名册/未读指针级摘要，随压缩事件落底账——
+	// 压缩后可 SQL 回答"压掉了什么、账本当时在什么状态"（CC 压缩事故同类防护）。
+	// 快照是"记录"；下方 HotReinject 是"解药"，两件配套。
+	preSnap := ""
+	if p.preCompactSnapshot != nil {
+		preSnap = p.preCompactSnapshot(agentID)
+	}
+
+	// 大文件外置（LCM，TODO #22①）：leaf 摘要前把段内 >bigRunes 的工具输出换探查摘要，
+	// 防整段大文件灌爆摘要 prompt。条数不变（内容替换）。
+	// 注意：probeBigFiles 的 keep=0（段内全部替换，段本身就是滑出区）。
+	if style.probeBigFile {
+		segment = probeBigFiles(segment, style.bigFileRunes, style.probeRunes, 0)
+	}
+
+	bundle := p.summarizeSegmentStyled(agentID, segment, style)
 	// 拷贝后追加，避免与并发读取共享底层数组。
 	bundles = append(append([]string(nil), bundles...), bundle)
-	if p.maxBundles > 0 && len(bundles) > p.maxBundles {
-		bundles = p.mergeOldestBundles(agentID, bundles)
+	fanout := style.fanout
+	if fanout <= 0 {
+		fanout = p.maxBundles
+	}
+	if fanout > 0 && len(bundles) > fanout {
+		bundles = p.mergeOldestBundlesStyled(agentID, bundles, style)
+	}
+
+	// 压缩后热改动重读回灌（TODO #20②）：最近改动文件（≤5 个，>5K tokens 只回路径）
+	// + 项目自述从盘重读，冻结进视图——未提交热改动不随压缩蒸发（CC 压缩回退事故解药）。
+	hot := ""
+	if p.hotReinjectProvider != nil {
+		hot = p.hotReinjectProvider(agentID, agent.FilesModifiedFromHistory(history))
 	}
 
 	p.mu.Lock()
-	p.compressStates[agentID] = compressState{Bundles: bundles, TailStart: recentStart}
+	p.compressStates[agentID] = compressState{Bundles: bundles, TailStart: recentStart, HotReinject: hot}
 	p.mu.Unlock()
 	p.persistCompressState(agentID)
+
+	// 压缩审计事件（TODO #20②+#21③）：type=compaction 独立事件类型落 agent_events——
+	// before/after 体积 + 摘要本体 + 压缩前快照。落库失败仅告警（观测数据不阻塞主流程）。
+	p.writeCompactionEvent(agentID, bundle, preSnap, len(history), recentStart)
+}
+
+// writeCompactionEvent 落压缩审计事件（agent_events type=compaction，零 DDL——type 自由文本）。
+// 字段映射：Input=压缩前快照、Content=摘要本体、Output=before/after 体积指标。
+// 直写 store 不走 Write：审计行是 SQL 取证数据（"压掉了什么、账本当时什么状态"），
+// 进内存事件流会被 injectEvents 渲染进【近期事件】尾巴——既污染上下文又每轮变字节
+// 打断前缀缓存（TestPipeline_CompressionFrozenView 实证）。
+func (p *Pipeline) writeCompactionEvent(agentID, bundle, preSnap string, beforeMsgs, afterTailStart int) {
+	if p.store == nil {
+		return
+	}
+	out := fmt.Sprintf("before_msgs=%d after_tail_start=%d bundle_runes=%d",
+		beforeMsgs, afterTailStart, len([]rune(bundle)))
+	p.mu.RLock()
+	if st, ok := p.compressStates[agentID]; ok {
+		out = fmt.Sprintf("before_msgs=%d after_tail_start=%d bundles=%d bundle_runes=%d",
+			beforeMsgs, afterTailStart, len(st.Bundles), len([]rune(bundle)))
+	}
+	p.mu.RUnlock()
+	ev := agent.MemoryEvent{
+		Type:     "compaction",
+		AgentID:  agentID,
+		Content:  bundle,
+		Input:    preSnap,
+		Output:   out,
+		Occurred: time.Now(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.store.SaveEvent(ctx, agentID, ev); err != nil {
+		slog.Warn("pipeline: write compaction event failed", "agent_id", agentID, "err", err)
+	}
 }
 
 // summarizeSegment 把一段中段历史压成一个压缩包：优先 LLM 结构化摘要，
 // 未注入摘要器 / 402 已关停 / 调用失败或返空时降级为截断式压缩（旧行为）。
+// 质量门（TODO #21③）：响应不含摘要块（返空）即重试一次再降级——
+// KC v0.3.0 同款，防偶发空响应把整段历史打成截断包。
 func (p *Pipeline) summarizeSegment(agentID string, segment []agent.ReactMessage) string {
-	if p.historySummarizer != nil && !p.summarizerDisabled() {
+	return p.summarizeSegmentStyled(agentID, segment, defaultCompactStyle())
+}
+
+// summarizeSegmentStyled 风格化压缩包生成（TODO #22①）：
+// style.useLLM=false → 截断包（快速档零 LLM）；否则 LLM 摘要 + leafCap 截断收口。
+func (p *Pipeline) summarizeSegmentStyled(agentID string, segment []agent.ReactMessage, style compactStyle) string {
+	if style.useLLM && p.historySummarizer != nil && !p.summarizerDisabled() {
 		timeout := p.summarizeTimeout
 		if timeout <= 0 {
 			timeout = 5 * time.Second
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		text, err := p.historySummarizer(ctx, formatSegmentText(segment), false)
-		cancel()
-		if err != nil {
-			p.noteSummarizeError(agentID, err)
-			slog.Warn("pipeline: history bundle summarize failed, fallback to truncation",
-				"agent_id", agentID, "segment_messages", len(segment), "err", err)
-		} else if trimmed := strings.TrimSpace(text); trimmed != "" {
-			p.noteSummarizeSuccess()
-			return trimmed
+		for attempt := 0; attempt < 2; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			text, err := p.historySummarizer(ctx, formatSegmentText(segment), false)
+			cancel()
+			if err != nil {
+				p.noteSummarizeError(agentID, err)
+				slog.Warn("pipeline: history bundle summarize failed, fallback to truncation",
+					"agent_id", agentID, "segment_messages", len(segment), "err", err)
+				break
+			}
+			if trimmed := strings.TrimSpace(text); trimmed != "" {
+				p.noteSummarizeSuccess()
+				return trimToRunes(trimmed, style.leafCapRunes)
+			}
+			// 空摘要：重试一次（质量门），仍空则落截断降级。
 		}
 	}
 	return truncateSegment(segment)
@@ -106,7 +214,16 @@ func (p *Pipeline) summarizeSegment(agentID string, segment []agent.ReactMessage
 // （k=1 时总数不变，小上限下永不收敛）。合并优先走 LLM（merge=true）；
 // 不可用/失败时降级为直接拼接并截断兜底。
 func (p *Pipeline) mergeOldestBundles(agentID string, bundles []string) []string {
-	k := len(bundles) / 2
+	return p.mergeOldestBundlesStyled(agentID, bundles, defaultCompactStyle())
+}
+
+// mergeOldestBundlesStyled 风格化合并（TODO #22①）：style.mergeK 显式指定一次合并个数
+// （cluster=4，LCM fanout 8/4）；0=最老一半（现状语义）。condCap 收口合并包长度。
+func (p *Pipeline) mergeOldestBundlesStyled(agentID string, bundles []string, style compactStyle) []string {
+	k := style.mergeK
+	if k <= 0 {
+		k = len(bundles) / 2
+	}
 	if k < 2 {
 		k = 2
 	}
@@ -115,28 +232,38 @@ func (p *Pipeline) mergeOldestBundles(agentID string, bundles []string) []string
 	}
 	oldest := bundles[:k]
 	merged := ""
-	if p.historySummarizer != nil && !p.summarizerDisabled() {
+	if style.useLLM && p.historySummarizer != nil && !p.summarizerDisabled() {
 		timeout := p.summarizeTimeout
 		if timeout <= 0 {
 			timeout = 5 * time.Second
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		text, err := p.historySummarizer(ctx, joinNonEmpty("\n\n", oldest), true)
-		cancel()
-		if err != nil {
-			p.noteSummarizeError(agentID, err)
-			slog.Warn("pipeline: bundle merge failed, fallback to concat",
-				"agent_id", agentID, "merged_bundles", k, "err", err)
-		} else if trimmed := strings.TrimSpace(text); trimmed != "" {
-			p.noteSummarizeSuccess()
-			merged = trimmed
+		// 质量门（TODO #21③）：空摘要重试一次再降级拼接——与 summarizeSegment 同款。
+		for attempt := 0; attempt < 2; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			text, err := p.historySummarizer(ctx, joinNonEmpty("\n\n", oldest), true)
+			cancel()
+			if err != nil {
+				p.noteSummarizeError(agentID, err)
+				slog.Warn("pipeline: bundle merge failed, fallback to concat",
+					"agent_id", agentID, "merged_bundles", k, "err", err)
+				break
+			}
+			if trimmed := strings.TrimSpace(text); trimmed != "" {
+				p.noteSummarizeSuccess()
+				merged = trimToRunes(trimmed, style.condCapRunes)
+				break
+			}
 		}
 	}
 	if merged == "" {
 		// 降级：直接拼接最老的一半并截断兜底，保证包数收敛、单包不爆炸。
 		merged = joinNonEmpty("\n\n", oldest)
-		if r := []rune(merged); len(r) > maxMergedBundleRunes {
-			merged = string(r[:maxMergedBundleRunes]) + "…"
+		capRunes := maxMergedBundleRunes
+		if style.condCapRunes > 0 && style.condCapRunes < capRunes {
+			capRunes = style.condCapRunes
+		}
+		if r := []rune(merged); len(r) > capRunes {
+			merged = string(r[:capRunes]) + "…"
 		}
 	}
 	out := make([]string, 0, len(bundles)-k+1)
@@ -224,8 +351,21 @@ func renderBundles(bundles []string) string {
 		sb.WriteString(b)
 		sb.WriteString("\n")
 	}
-	sb.WriteString("\n（以上为早期对话的分层压缩摘要；需要被压缩段落的细节时可用工具重新读取相关文件，近期上下文见下方最近消息）")
+	sb.WriteString("\n（以上为早期对话的分层压缩摘要；需要被压缩段落的细节时可用工具重新读取相关文件，" +
+		"或查 agent_events / session_events 事件流（历史轨迹 SQL 可查），近期上下文见下方最近消息）")
 	return sb.String()
+}
+
+// Bundles 返回该 agent 压缩金字塔的摘要包链（leaf→condensed，时序旧→新）副本。
+// 展开式召回（TODO #22④）用：只读展开器沿链定位细节所属段再取原文。无状态返回 nil。
+func (p *Pipeline) Bundles(agentID string) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	st, ok := p.compressStates[agentID]
+	if !ok || len(st.Bundles) == 0 {
+		return nil
+	}
+	return append([]string(nil), st.Bundles...)
 }
 
 // persistCompressState 把当前冻结的压缩状态落库（失败仅告警，不影响主流程）。
@@ -298,6 +438,15 @@ func (p *Pipeline) loadEventsOnce(agentID string) []agent.MemoryEvent {
 		slog.Warn("pipeline: load events failed", "agent_id", agentID, "err", err)
 		return nil
 	}
+	// 审计行（type=compaction/checkpoint）是 SQL 取证数据，不是上下文事件——懒加载过滤，
+	// 否则会随【近期事件】渲染进尾巴（既占上下文又每轮变字节打断前缀缓存）。
+	filtered := events[:0]
+	for _, ev := range events {
+		if !isContextHiddenEvent(ev.Type) {
+			filtered = append(filtered, ev)
+		}
+	}
+	events = filtered
 	if len(events) == 0 {
 		return nil
 	}

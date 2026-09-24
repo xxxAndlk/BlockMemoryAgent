@@ -105,6 +105,8 @@ CREATE INDEX IF NOT EXISTS idx_session_logs_created_at ON session_logs(created_a
 }
 
 // EnsureSessionEventsSchema 自动创建 session_events 表 (幂等)。
+// TODO #20① 底账 append-only：seq 列承载逐事件幂等追加（SaveEvents 纯追加不删行），
+// 存量 seq=0 行按 (timestamp,id) 回填行号后建 (session_id,seq) 唯一索引。
 // 参数:
 //   - ctx: 超时与取消控制。
 //   - db:  *sql.DB 连接池。
@@ -128,10 +130,22 @@ CREATE TABLE IF NOT EXISTS session_events (
     prompt        TEXT NOT NULL DEFAULT '',
     input_tokens  INT NOT NULL DEFAULT 0,
     output_tokens INT NOT NULL DEFAULT 0,
-    detail_json   TEXT NOT NULL DEFAULT ''
+    detail_json   TEXT NOT NULL DEFAULT '',
+    owner         VARCHAR(64) NOT NULL DEFAULT '',
+    seq           BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_session_events_session_ts
     ON session_events (session_id, timestamp);
+-- 老库缺列补齐（CREATE TABLE IF NOT EXISTS 对存量表是空操作）。
+-- TODO #20① 底账 append-only：SaveEvents 从 delete-then-insert 改纯追加（seq 水位），
+-- 旧版行不再物理消失；seq 唯一键支撑 ON CONFLICT 幂等重放。owner 多租户预留。
+ALTER TABLE session_events ADD COLUMN IF NOT EXISTS owner VARCHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE session_events ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT 0;
+-- 存量行 seq=0 全员重复，回填为行 id（BIGSERIAL 全局唯一单调 → (session_id,seq) 天然无冲突，
+-- 且崩溃中断后重跑仍幂等安全：WHERE seq=0 只补未回填行，不会与已回填值撞号）。
+UPDATE session_events SET seq = id WHERE seq = 0;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_session_events_session_seq
+    ON session_events (session_id, seq);
 `)
 	return err
 }
@@ -181,10 +195,17 @@ CREATE TABLE IF NOT EXISTS agent_messages (
     tool_call_id VARCHAR(64)  NOT NULL DEFAULT '',
     tool_calls   JSONB        NOT NULL DEFAULT '[]',
     reasoning    TEXT         NOT NULL DEFAULT '',
+    owner        VARCHAR(64)  NOT NULL DEFAULT '',
+    archived     BOOLEAN      NOT NULL DEFAULT FALSE,
     created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_agent_messages_agent_seq
     ON agent_messages (agent_id, seq ASC);
+-- 老库缺列补齐（CREATE TABLE IF NOT EXISTS 对存量表是空操作）。
+-- TODO #20① 底账 append-only：archived 标记替代物理删除（复活/重派只改标记不删行），
+-- 读路径过滤 archived=false，失败轨迹经 SQL WHERE archived 查回；owner 多租户预留。
+ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS owner VARCHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_agent_messages_session
     ON agent_messages (session_id);
 `)

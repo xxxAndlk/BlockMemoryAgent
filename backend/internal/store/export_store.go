@@ -86,9 +86,11 @@ func (s *PostgresStore) queryAgentEventsForExport(ctx context.Context, sessionID
 }
 
 // queryAgentMessagesForExport 子 Agent 完整消息历史（按 agent_id + seq 升序）。
+// 归档行（archived=true，复活/分叉前旧 run 快照）一并导出并带 archived 标记——
+// 导出是全量备份（TODO #20①），失败轨迹考古不该被读路径过滤挡住。
 func (s *PostgresStore) queryAgentMessagesForExport(ctx context.Context, sessionID string) ([]map[string]any, error) {
 	rows, err := s.db.QueryContext(ctx, `
-			SELECT id, agent_id, seq, role, content, tool_call_id, tool_calls, reasoning, created_at
+			SELECT id, agent_id, seq, role, content, tool_call_id, tool_calls, reasoning, archived, created_at
 			FROM agent_messages
 			WHERE session_id = $1
 			ORDER BY agent_id ASC, seq ASC
@@ -102,15 +104,17 @@ func (s *PostgresStore) queryAgentMessagesForExport(ctx context.Context, session
 		var id int64
 		var agentID, role, content, toolCallID, reasoning string
 		var seq int
+		var archived bool
 		var toolCalls []byte
 		var createdAt time.Time
-		if err := rows.Scan(&id, &agentID, &seq, &role, &content, &toolCallID, &toolCalls, &reasoning, &createdAt); err != nil {
+		if err := rows.Scan(&id, &agentID, &seq, &role, &content, &toolCallID, &toolCalls, &reasoning, &archived, &createdAt); err != nil {
 			return nil, err
 		}
 		out = append(out, map[string]any{
 			"id": id, "agent_id": agentID, "seq": seq, "role": role,
 			"content": content, "tool_call_id": toolCallID,
-			"tool_calls": json.RawMessage(toolCalls), "reasoning": reasoning, "created_at": createdAt,
+			"tool_calls": json.RawMessage(toolCalls), "reasoning": reasoning,
+			"archived": archived, "created_at": createdAt,
 		})
 	}
 	return out, rows.Err()

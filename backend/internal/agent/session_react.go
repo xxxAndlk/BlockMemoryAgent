@@ -47,6 +47,11 @@ type reactInternalSession struct {
 	EndedAt *time.Time
 	// Events 按时间顺序保存会话生命周期内的内部事件。
 	Events []internalEvent
+	// eventSeqNext 是事件 seq 分配计数器（TODO #20① append-only 幂等键）：addEventDebug
+	// 在 st.mu 锁内递增并盖进事件；恢复会话从已加载事件的 MAX(seq) 续号。**永不清零**——
+	// 内存事件窗（trimDebugEvents/清空 Events）只影响视图，seq 回退会让 ON CONFLICT
+	// (session_id,seq) 把新事件当重复静默丢弃。
+	eventSeqNext int64
 	// Messages 保存用于前端/LLM 对话上下文的聊天消息。
 	Messages []Message
 	// firstTurnImages 是首条消息（创建会话时）携带的用户图片（Alt+V 粘贴）：
@@ -696,6 +701,9 @@ func (st *reactSessionStore) addEventDebug(session *reactInternalSession, eventT
 	}
 	// 加写锁后追加事件，保证并发安全。
 	st.mu.Lock()
+	// seq 在锁内分配（TODO #20①）：persistEvents 纯追加幂等键，内存窗裁剪/清空不清号。
+	session.eventSeqNext++
+	ev.Seq = session.eventSeqNext
 	session.Events = append(session.Events, ev)
 	// 若事件数超过 500，则裁剪到 200，避免内存无限增长。
 	if len(session.Events) > 500 {
@@ -953,6 +961,7 @@ func (st *reactSessionStore) persistEvents(session *reactInternalSession) {
 	for _, ev := range events {
 		records = append(records, store.SessionEventRecord{
 			SessionID:    session.ID,
+			Seq:          ev.Seq,
 			Type:         ev.Type,
 			Agent:        ev.Agent,
 			Message:      sanitizeUTF8(ev.Message),
@@ -994,6 +1003,7 @@ func (st *reactSessionStore) loadSessionEvents(ctx context.Context, sessionID st
 	// 将数据库记录转换回内部事件结构。
 	for _, r := range records {
 		events = append(events, internalEvent{
+			Seq:          r.Seq,
 			Type:         r.Type,
 			Agent:        r.Agent,
 			Message:      r.Message,
@@ -1071,6 +1081,14 @@ func detailStringField(detailJSON, key string) string {
 func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *store.SessionHistoryRecord) *reactInternalSession {
 	// 加载该会话关联的详细事件。
 	restoredEvents := st.loadSessionEvents(ctx, rec.SessionID)
+	// seq 续号水位（TODO #20①）：事件 seq 是持久层幂等追加键，恢复后必须从已加载最大值
+	// 续号——否则新事件从 1 重编，ON CONFLICT (session_id,seq) 会把它们当重复静默丢弃。
+	maxSeq := int64(0)
+	for _, e := range restoredEvents {
+		if e.Seq > maxSeq {
+			maxSeq = e.Seq
+		}
+	}
 	// 状态映射：running（进程死亡遗留）→ error + 中断提示，并补一条合成系统事件说明原因，
 	// 使时间线在 Web/TUI 上可见中断原因。
 	status, result, interrupted := restoredSessionStatus(rec.Status, rec.Summary)
@@ -1081,7 +1099,9 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 		if obit := restartObituary(restoredEvents); obit != "" {
 			msg += "；上次任务断在" + obit
 		}
+		maxSeq++ // 合成事件同样盖 seq：persistEvents 全量重发时稳定幂等，不重复落库
 		restoredEvents = append(restoredEvents, internalEvent{
+			Seq:       maxSeq,
 			Type:      eventkind.System,
 			Agent:     "System",
 			Message:   msg,
@@ -1104,6 +1124,8 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 		StartedAt: rec.CreatedAt,
 		EndedAt:   &endedAt,
 		Events:    restoredEvents,
+		// seq 续号水位（TODO #20①）：见上方 maxSeq 注释。
+		eventSeqNext: maxSeq,
 		// TempDir 与 createSession 同款规则计算（createSession 也从不预建目录，
 		// cleanupSessionTempDir 对不存在路径幂等）。
 		TempDir: filepath.Join(eff, ".bma", "tmp", rec.SessionID),

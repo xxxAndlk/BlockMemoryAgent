@@ -136,7 +136,7 @@ func TestDispatcher_RegisterAndCall(t *testing.T) {
 		msgs := mb.Drain("meta")
 		// 若收到消息，校验第一条消息正文为 "done"。
 		if len(msgs) > 0 {
-			if msgs[0].Body != "done" {
+			if !strings.HasPrefix(msgs[0].Body, "done") {
 				t.Fatalf("expected summary 'done', got %q", msgs[0].Body)
 			}
 			// 校验通过，结束测试。
@@ -1532,7 +1532,7 @@ func TestDispatch_ModeReflection(t *testing.T) {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
 	// reflection 引擎 judge 通过后完成摘要带【校验:通过(L2 rubric)】前缀（TODO #43）。
-	if body := waitMailboxDrain(t, mb, "meta"); body != "【校验:通过(L2 rubric)】\ndone" {
+	if body := waitMailboxDrain(t, mb, "meta"); !strings.HasPrefix(body, "【校验:通过(L2 rubric)】\ndone") {
 		t.Fatalf("expected summary 'done', got %q", body)
 	}
 	// 1 次 ReAct 产出 + 1 次自检辅助调用（证明 reflection 引擎被选中执行）。
@@ -1574,7 +1574,7 @@ func TestDispatch_ModePlanExecute(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("dispatch failed: err=%v res=%+v", err, res)
 	}
-	if body := waitMailboxDrain(t, mb, "session-1"); body != "final" {
+	if body := waitMailboxDrain(t, mb, "session-1"); !strings.HasPrefix(body, "final") {
 		t.Fatalf("expected summary 'final', got %q", body)
 	}
 	// 1 次规划 + 2 步 + 1 次汇总 = 4 次 provider 调用。

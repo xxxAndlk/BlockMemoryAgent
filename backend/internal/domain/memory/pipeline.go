@@ -82,6 +82,9 @@ type Pipeline struct {
 	// 压成一个结构化压缩包（LLM），并在压缩包超上限时合并最老的一半。
 	// 为 nil 或失败时降级截断式压缩（旧行为）。见 pyramid.go。
 	historySummarizer HistorySummarizer
+	// engine 是可选的分档上下文引擎（TODO #22①）：nil=现状管线（daily 行为）。
+	// Assemble/AfterTurn 走引擎视图变换，压缩触发走引擎 Compact（风格参数化金字塔）。
+	engine ContextEngine
 	// maxBundles 是每个 agent 压缩包数量上限；超限时把最老的一半合并为 1 个更粗的包。
 	// <=0 视为 DefaultMaxBundles。
 	maxBundles int
@@ -94,6 +97,15 @@ type Pipeline struct {
 	// ReadFile/WriteFile/EditFile 触碰过的文件符号轮廓，mtime 缓存）。为 nil 或返回空时不注入。
 	// 由 bootstrap 注入，避免 domain/memory 反向依赖 tool 包。
 	fileMapProvider func(agentID string) string
+	// preCompactSnapshot 返回压缩前状态快照（TODO #20②）：任务账本+拓扑名册+未读工具链
+	// 的指针级摘要（截断，不存全文防 agent_events 体积通胀），随压缩事件落底账——
+	// 压缩后可 SQL 回答"压掉了什么、账本当时在什么状态"。nil=不落快照。
+	// 由 bootstrap 组装 TaskLedgerBrief/TopologyBrief/Mailbox.Count 闭包注入。
+	preCompactSnapshot func(agentID string) string
+	// hotReinjectProvider 返回压缩后热改动重读回灌文本（TODO #20②）：按 files（最近改动
+	// 清单）重读 ≤5 个文件 + 项目自述；>5K tokens 只回路径引用。nil=不回灌。
+	// 由 bootstrap 组装（盘读+token 估算）闭包注入，避免 domain/memory 依赖 model 包。
+	hotReinjectProvider func(agentID string, files []string) string
 	// sumMemoMu/sumMemo/sumMemoOrder 事件摘要 hash 备忘（TODO 第15项 P2-6）：
 	// 事件未新增的轮次（挂起等子、同轮多次装配）摘要输入逐字节相同，每轮重调轻量模型
 	// 纯浪费（单呼 120s 超时口径，白等一次就是一轮卡顿）——按输入 hash 缓存最近
@@ -153,6 +165,11 @@ type compressState struct {
 	// TailStart 是压缩包覆盖到的 history 下标（不含）；history[tailStart:] 原样保留。
 	// 仅当全量 history 同时被持久化/恢复（MetaAgent 走 agent_messages）时下标语义跨重启有效。
 	TailStart int `json:"tail_start"`
+	// HotReinject 是压缩时点的热改动重读回灌文本（TODO #20②）：最近改动文件（≤5 个，
+	// 单文件 >5K tokens 只回路径引用）+ CLAUDE.md 类项目自述从盘重读。压缩完成即冻结进
+	// 视图（压缩那轮前缀缓存本就失效），两次压缩之间随视图字节级稳定；
+	// 下一次压缩随整体换新。对齐 CC "What survives compaction"——未提交热改动不随压缩蒸发。
+	HotReinject string `json:"hot_reinject,omitempty"`
 }
 
 // Store 抽象了事件流的持久化能力，实现者负责把事件保存到磁盘或数据库。
@@ -261,10 +278,30 @@ func (p *Pipeline) WithFileMapProvider(f func(agentID string) string) *Pipeline 
 	return p
 }
 
+// WithCompactionHooks 注入压缩生命周期钩子（TODO #20②+#21）：
+//   - snapshot：压缩前状态快照（账本/名册/未读指针），随压缩事件落 agent_events 底账；
+//   - reinject：压缩后热改动重读回灌（≤5 最近改动文件 + 项目自述，>5K tokens 只回路径），
+//     冻结进压缩视图——对齐 CC "What survives compaction"（热改动不随压缩蒸发）。
+//
+// 任一传 nil 关闭对应钩子（默认关闭，零行为变化）。
+func (p *Pipeline) WithCompactionHooks(snapshot func(agentID string) string, reinject func(agentID string, files []string) string) *Pipeline {
+	p.preCompactSnapshot = snapshot
+	p.hotReinjectProvider = reinject
+	return p
+}
+
 // WithHistorySummarizer 注入层级压缩摘要器（轻量模型）。传 nil 关闭 LLM 压缩包路径，
 // 降级为截断式压缩（旧行为）。摘要失败时同样降级，不影响主流程。
 func (p *Pipeline) WithHistorySummarizer(f HistorySummarizer) *Pipeline {
 	p.historySummarizer = f
+	return p
+}
+
+// WithContextEngine 注入分档上下文引擎（TODO #22①）。nil=现状管线（daily 行为）。
+// 引擎负责视图变换（Assemble/AfterTurn）与压缩风格（Compact）；失败隔离壳
+// （QuarantineEngine）在引擎异常时降级 daily 并留痕。
+func (p *Pipeline) WithContextEngine(e ContextEngine) *Pipeline {
+	p.engine = e
 	return p
 }
 
@@ -304,7 +341,17 @@ func (p *Pipeline) resolveContextBudget(roleID string) int {
 //   - 压缩状态随压缩触发落库（agent_compress_states），进程重启后懒加载恢复；
 //   - 近期事件与本任务文件地图注入永远放在视图末尾（内容每轮变化，尾部变化不破坏前缀缓存）。
 func (p *Pipeline) Assemble(role types.RoleDefinition, agentID string, history []agent.ReactMessage) []agent.ReactMessage {
-	return p.injectFileMap(agentID, p.injectEvents(agentID, p.compressedView(role.ID, agentID, history)))
+	// 引擎视图装配（TODO #22①）：内容替换、条数不变（TailStart 下标安全）。
+	if p.engine != nil {
+		history = p.engine.Assemble(agentID, history)
+	}
+	out := p.injectFileMap(agentID, p.injectEvents(agentID, p.compressedView(role.ID, agentID, history)))
+	// 轮末微压缩钩子（fast=stub 修剪）：只动本请求视图副本（Assemble 输入是调用方切片，
+	// 引擎契约=内容替换不增删条数），持久化历史由调用方持有、下轮重新修剪（幂等）。
+	if p.engine != nil {
+		out = p.engine.AfterTurn(agentID, out)
+	}
+	return out
 }
 
 // compressedView 返回该 agent 的压缩视图：未触发过压缩时原样返回 history；
@@ -343,10 +390,19 @@ func (p *Pipeline) compressedView(roleID, agentID string, history []agent.ReactM
 	}
 
 	threshold := p.resolveContextBudget(roleID)
+	// 引擎阈值覆盖（TODO #22①）：cluster 常驻上界 100K 比全局 150K 更早触发。
+	if p.engine != nil {
+		threshold = engineThreshold(p.engine, agentID, threshold)
+	}
 	overBudget := threshold > 0 && p.tokenEstimator(candidate) >= threshold
 	if overBudget {
 		// 层级压缩：把新滑出保留段的中段历史压成一个压缩包并冻结新视图（见 pyramid.go）。
-		p.advanceCompression(agentID, history)
+		// 引擎在场时走引擎 Compact（风格参数化：fast=截断包零 LLM / cluster=LCM 参数）。
+		if p.engine != nil {
+			p.engine.Compact(agentID, history)
+		} else {
+			p.advanceCompression(agentID, history)
+		}
 		// 上下文层（context）变更日志（TODO 第10项①缓存纪律）：压缩即冻结新视图，
 		// 前缀缓存只在压缩这一轮失效——记录指纹供与 stable 层逐呼日志对账。
 		p.mu.RLock()
@@ -399,6 +455,10 @@ func (p *Pipeline) injectEvents(agentID string, history []agent.ReactMessage) []
 	// summary 收集每个事件格式化后的简短文本
 	var summary []string
 	for _, ev := range events[start:] {
+		// 审计行不进上下文（Write 已只落 store；此处兜内存旧数据/直写路径）
+		if isContextHiddenEvent(ev.Type) {
+			continue
+		}
 		// 对单条事件按类型格式化并追加到 summary
 		summary = append(summary, formatEvent(ev))
 	}
@@ -484,7 +544,14 @@ func (p *Pipeline) injectFileMap(agentID string, history []agent.ReactMessage) [
 	return out
 }
 
+// isContextHiddenEvent 判定审计/取证类事件（compaction/checkpoint）：SQL 可查但不进
+// 上下文——既不渲染【近期事件】也不进内存事件流（防每轮变字节打断前缀缓存）。
+func isContextHiddenEvent(t string) bool {
+	return t == "compaction" || t == "checkpoint"
+}
+
 // Write 把一条事件追加到指定 agent 的事件流中；如果配置了 Store，还会异步超时持久化。
+// 审计类事件（isContextHiddenEvent）只落 store 不进内存事件流（与 compaction 直写同语义）。
 func (p *Pipeline) Write(agentID string, event agent.MemoryEvent) error {
 	if agentID == "" {
 		// agentID 为空无法归属事件，直接忽略，不报错也不保存
@@ -493,6 +560,18 @@ func (p *Pipeline) Write(agentID string, event agent.MemoryEvent) error {
 	if event.Occurred.IsZero() {
 		// 事件未设置发生时间时，自动填充当前时间，保证时间线完整
 		event.Occurred = time.Now()
+	}
+
+	if isContextHiddenEvent(event.Type) {
+		if p.store == nil {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.store.SaveEvent(ctx, agentID, event); err != nil {
+			return fmt.Errorf("persist event: %w", err)
+		}
+		return nil
 	}
 
 	p.mu.Lock()
@@ -702,10 +781,15 @@ func buildCompressedView(messages []agent.ReactMessage, st compressState) []agen
 		return messages
 	}
 
-	out := make([]agent.ReactMessage, 0, keep+2+(len(messages)-st.TailStart))
+	out := make([]agent.ReactMessage, 0, keep+3+(len(messages)-st.TailStart))
 	out = append(out, messages[:keep]...)
 	out = append(out, messages[firstUserIdx]) // 首条 user 任务目标
 	out = append(out, agent.ReactMessage{Role: "system", Content: renderBundles(st.Bundles)})
+	// 热改动重读回灌（TODO #20②）：压缩时点冻结进视图的文件现状，随压缩包一起构成
+	// 稳定前缀——未提交热改动不随压缩蒸发（对齐 CC "What survives compaction"）。
+	if st.HotReinject != "" {
+		out = append(out, agent.ReactMessage{Role: "system", Content: st.HotReinject})
+	}
 	out = append(out, messages[st.TailStart:]...)
 	return out
 }
