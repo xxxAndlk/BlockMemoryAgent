@@ -89,15 +89,15 @@ decision_model:
 # 文本嵌入模型配置（P3-3）
 # provider: pseudo（默认，零依赖字符哈希） | openai（OpenAI 兼容端点） | local（本地 ollama/xinference HTTP 服务） | onnx（进程内 ONNX Runtime，TODO #41 真本地）
 # 向量维度需与上方 pgvector.dimensions 一致。
-# 2026-08-12 生效配置：provider=local + ollama bge-m3（OpenAI 兼容端点，零 api_key）。
-# 注意：base_url 只写主机根路径（EMBEDDING_BASE_URL=http://localhost:11434），客户端自行拼 /v1/embeddings；
+# 2026-09-25 生效配置：provider=local + 远端 bge-m3（OpenAI 兼容 /v1/embeddings），端点以 --api-key 启动，api_key 必配。
+# 注意：base_url 只写主机根路径（EMBEDDING_BASE_URL=http://120.26.102.114:11434），客户端自行拼 /v1/embeddings；
 # 不要带 /api/embeddings（ollama 原生端点格式）——会拼出 /api/embeddings/v1/embeddings 404。
 # onnx（TODO #41，进程内零外部服务方向）：需 -tags onnx 构建 + models/bge-base-zh-v1.5/ 模型文件
 # （见 models/README），BGE-base-zh-v1.5 为 768 维；bge-m3 为 1024 维（当前 pgvector.dimensions）。
 embed:
   provider: local             # 默认 pseudo；本地 HTTP 服务（ollama/xinference）用 local；进程内真本地改 onnx（-tags onnx）
   model: bge-m3           # ollama 已拉取的嵌入模型；onnx 示例：bge-base-zh-v1.5
-  # api_key: ${EMBEDDING_API_KEY}                  # openai 需要；ollama（local）与 onnx 忽略
+  api_key: ${EMBEDDING_API_KEY}                   # 端点带鉴权，必须带；空=不发 Authorization → 401 Invalid API Key（onnx 忽略）
   base_url: ${EMBEDDING_BASE_URL} # OpenAI 兼容端点根路径（ollama: http://localhost:11434）；onnx 忽略
   batch_size: 1                  # 单次嵌入条数上限
   # model_path: ./models/bge-base-zh-v1.5   # provider=onnx 专用（TODO #41）；默认 ./models/<model>/

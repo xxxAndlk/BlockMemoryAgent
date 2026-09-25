@@ -1,6 +1,10 @@
 import type { Session, SessionEvent, SessionSummary, AgentNode, TaskBoardData, WireImage, TrustMode, SessionGear, SessionThinking } from '@/types'
 import { fetchJson } from './client'
 import { APP_CONFIG } from '@/config/app'
+import { TERMINAL_STATUSES } from '@/utils/notifications'
+
+/** 非终态 done（旧后端把挂起态当会话结束关连接）的续连间隔：只作兜底轮询，新后端不会走到。 */
+const SUSPENDED_DONE_RETRY_MS = 1500
 
 /**
  * 会话列表（摘要线型，不含 events/messages）。
@@ -324,6 +328,17 @@ export function streamSession(
       try {
         const d = JSON.parse(e.data)
         if (d.type === 'done') {
+          // 非终态 done = 旧后端把「挂起等子/暂停于子」误当会话结束（推完 done 就关连接，
+          // 2026-09-25 实证：对话栏从挂起那刻起永久冻在「挂起等待子」、最终答复不渲染）。
+          // 会话还在跑，不能收口（不停面板定时器、不跑对账），改为续连补全量快照。
+          if (d.status && !TERMINAL_STATUSES.has(d.status)) {
+            es?.close()
+            es = null
+            online = false
+            if (reconnectTimer) clearTimeout(reconnectTimer)
+            reconnectTimer = setTimeout(connect, SUSPENDED_DONE_RETRY_MS)
+            return
+          }
           es?.close()
           onDone?.(d.status)
           return

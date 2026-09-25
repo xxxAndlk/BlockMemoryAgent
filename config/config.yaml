@@ -104,7 +104,7 @@ agent:
   context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
 
   # -- DAG / 会话恢复 --
-  dag_enabled: false             # DAG 定时任务调度（默认关闭）
+  dag_enabled: true              # DAG 定时任务调度
   restore_sessions: true         # 启动时从 session_history 恢复最近 50 个会话到内存（Web 重启续聊依赖此预热；列表合并与懒恢复不受此开关影响，关闭仅跳过预热）
 
   # -- 验证机制：分层自检（2026-08-08 起，替代已下线的 verifyloop 测试助手自动验证）--

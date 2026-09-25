@@ -150,6 +150,18 @@ func (m *SessionManager) GetSession(id string) *Session {
 	return ToServerSession(s)
 }
 
+// GetSessionStatus 实现 dag.SessionLauncher 接口，查询会话当前状态。
+// 参数 id：会话 ID。
+// 返回值：(status, found)；会话不存在时 found=false。
+// status 取值为 enums.SessionStatus 字符串（running/completed/error 等）。
+func (m *SessionManager) GetSessionStatus(id string) (string, bool) {
+	s := m.GetSession(id)
+	if s == nil {
+		return "", false
+	}
+	return string(s.Status), true
+}
+
 // LLMStats 通过 Agent 门面聚合 LLM 调用统计。
 // 返回值：调用次数、超时次数、平均耗时、最大耗时。
 func (m *SessionManager) LLMStats() (callCount, timeoutCount int, avgDur, maxDur time.Duration) {

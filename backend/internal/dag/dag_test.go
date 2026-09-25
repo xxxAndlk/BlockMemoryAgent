@@ -2,6 +2,7 @@ package dag
 
 import (
 	"context" // 测试用上下文
+	"strconv" // 伪 sessionID 生成
 	"testing" // Go 测试框架
 	"time"    // 时间构造与比较
 )
@@ -325,6 +326,9 @@ func (r *recordingLauncher) LaunchSession(goal string) string {
 	return goal + "-session"
 }
 
+// GetSessionStatus 实现 SessionLauncher 接口；runner 用不到，恒返回未找到。
+func (r *recordingLauncher) GetSessionStatus(string) (string, bool) { return "", false }
+
 // TestSchedulerStopWaitsForLoop 验证 Stop 会等待 loop goroutine 退出，
 // 且可多次调用而不会 panic 或永久阻塞。
 func TestSchedulerStopWaitsForLoop(t *testing.T) {
@@ -363,3 +367,370 @@ func (fakeStore) DeleteDAG(context.Context, string) error      { return nil }
 type fakeLauncher struct{}
 
 func (fakeLauncher) LaunchSession(string) string { return "" }
+
+// GetSessionStatus 实现 SessionLauncher 接口；恒返回未找到。
+func (fakeLauncher) GetSessionStatus(string) (string, bool) { return "", false }
+
+// ==================== Scheduler reap / cron 测试 ====================
+
+// memStore 是基于内存的 Store 实现，支持列出、读取与回写 DAG，
+// 供调度器集成路径（Trigger / tick / reapRunning）测试使用。
+type memStore struct {
+	dags  map[string]*DAG // id -> DAG 定义（含运行态）
+	saves int             // SaveDAG 调用次数
+}
+
+// newMemStore 创建内存存储并预置给定 DAG。
+func newMemStore(dags ...*DAG) *memStore {
+	m := &memStore{dags: make(map[string]*DAG)}
+	for _, d := range dags {
+		m.dags[d.ID] = d
+	}
+	return m
+}
+
+// SaveDAG 回写 DAG 深拷贝并计数。
+func (m *memStore) SaveDAG(_ context.Context, d *DAG) error {
+	m.dags[d.ID] = cloneDAG(d)
+	m.saves++
+	return nil
+}
+
+// GetDAG 按 ID 返回 DAG 深拷贝；不存在返回 nil。
+func (m *memStore) GetDAG(_ context.Context, id string) (*DAG, error) {
+	if d, ok := m.dags[id]; ok {
+		return cloneDAG(d), nil
+	}
+	return nil, nil
+}
+
+// ListDAGs 返回全部 DAG 深拷贝。
+func (m *memStore) ListDAGs(context.Context) ([]*DAG, error) {
+	out := make([]*DAG, 0, len(m.dags))
+	for _, d := range m.dags {
+		out = append(out, cloneDAG(d))
+	}
+	return out, nil
+}
+
+// DeleteDAG 从内存中删除 DAG。
+func (m *memStore) DeleteDAG(_ context.Context, id string) error {
+	delete(m.dags, id)
+	return nil
+}
+
+// stubLauncher 是可控的 SessionLauncher 实现：
+// LaunchSession 生成递增 sessionID 并初始置 running；
+// 会话状态可通过 setStatus 外部操控，模拟会话终态。
+type stubLauncher struct {
+	nextID   int               // 递增 sessionID 计数器
+	statuses map[string]string // sessionID -> 会话状态
+	goals    []string          // 已派发 goal 列表（按派发顺序）
+	sessions map[string]string // sessionID -> goal
+	fail     bool              // true 时 LaunchSession 返回空串（模拟派发失败）
+}
+
+func newStubLauncher() *stubLauncher {
+	return &stubLauncher{statuses: map[string]string{}, sessions: map[string]string{}}
+}
+
+// LaunchSession 生成伪 sessionID；fail 时返回空串模拟创建失败。
+func (l *stubLauncher) LaunchSession(goal string) string {
+	if l.fail {
+		return ""
+	}
+	l.nextID++
+	sid := "sess-" + strconv.Itoa(l.nextID)
+	l.statuses[sid] = "running"
+	l.goals = append(l.goals, goal)
+	l.sessions[sid] = goal
+	return sid
+}
+
+// GetSessionStatus 返回可控的会话状态。
+func (l *stubLauncher) GetSessionStatus(sid string) (string, bool) {
+	st, ok := l.statuses[sid]
+	return st, ok
+}
+
+// setStatus 修改指定会话的状态（如 completed / error）。
+func (l *stubLauncher) setStatus(sid, status string) { l.statuses[sid] = status }
+
+// sessionOf 按 goal 反查其 sessionID。
+func (l *stubLauncher) sessionOf(goal string) string {
+	for sid, g := range l.sessions {
+		if g == goal {
+			return sid
+		}
+	}
+	return ""
+}
+
+// TestSchedulerReapAdvancesDependencyChain 验证 A→B 依赖链：
+// A 会话 completed 后，reap 置 A 完成并派发 B；B 完成后整个 DAG 从 running map 清除。
+func TestSchedulerReapAdvancesDependencyChain(t *testing.T) {
+	store := newMemStore(&DAG{
+		ID:   "chain",
+		Name: "chain",
+		// 禁用 cron，避免 tick 重新触发干扰断言
+		Enabled: false,
+		Tasks: []*Task{
+			{ID: "a", Goal: "goal a"},
+			{ID: "b", Goal: "goal b", DependsOn: []string{"a"}},
+		},
+	})
+	launcher := newStubLauncher()
+	s := NewScheduler(store, launcher, time.Second)
+
+	ctx := t.Context()
+	if err := s.Trigger(ctx, "chain"); err != nil {
+		t.Fatalf("Trigger failed: %v", err)
+	}
+	// 初始只派发 a
+	if len(launcher.goals) != 1 || launcher.goals[0] != "goal a" {
+		t.Fatalf("expected only goal a launched, got %v", launcher.goals)
+	}
+
+	// a 会话完成，tick 内 reap 应推进 b
+	launcher.setStatus(launcher.sessionOf("goal a"), "completed")
+	s.tick(ctx)
+
+	snap := s.Snapshot()
+	d, ok := snap["chain"]
+	if !ok {
+		t.Fatal("dag missing from running map after first reap")
+	}
+	var a, b *Task
+	for _, task := range d.Tasks {
+		switch task.ID {
+		case "a":
+			a = task
+		case "b":
+			b = task
+		}
+	}
+	if a.Status != TaskStatusCompleted {
+		t.Errorf("task a status = %q, want completed", a.Status)
+	}
+	if b.Status != TaskStatusRunning || b.SessionID == "" {
+		t.Errorf("task b status = %q session=%q, want running with session", b.Status, b.SessionID)
+	}
+	if len(launcher.goals) != 2 || launcher.goals[1] != "goal b" {
+		t.Errorf("expected goal b launched, got %v", launcher.goals)
+	}
+	// 状态迁移应已回写存储
+	persisted, _ := store.GetDAG(ctx, "chain")
+	var pa *Task
+	for _, task := range persisted.Tasks {
+		if task.ID == "a" {
+			pa = task
+		}
+	}
+	if pa.Status != TaskStatusCompleted {
+		t.Errorf("persisted task a status = %q, want completed", pa.Status)
+	}
+
+	// b 会话完成，整个 DAG 到达终态，应从 running map 删除
+	launcher.setStatus(launcher.sessionOf("goal b"), "completed")
+	s.tick(ctx)
+	if _, ok := s.Snapshot()["chain"]; ok {
+		t.Error("finished dag should be removed from running map")
+	}
+}
+
+// TestSchedulerReapFailureBlocksDownstream 验证 A 会话 error 后，
+// A 置 Failed，下游 B 永久保持 pending，不再派发。
+func TestSchedulerReapFailureBlocksDownstream(t *testing.T) {
+	store := newMemStore(&DAG{
+		ID:   "fail-chain",
+		Name: "fail-chain",
+		Tasks: []*Task{
+			{ID: "a", Goal: "goal a"},
+			{ID: "b", Goal: "goal b", DependsOn: []string{"a"}},
+		},
+	})
+	launcher := newStubLauncher()
+	s := NewScheduler(store, launcher, time.Second)
+
+	ctx := t.Context()
+	if err := s.Trigger(ctx, "fail-chain"); err != nil {
+		t.Fatalf("Trigger failed: %v", err)
+	}
+	launcher.setStatus(launcher.sessionOf("goal a"), "error")
+	s.tick(ctx)
+	// 再来一轮，确认 b 不会被派发
+	s.tick(ctx)
+
+	snap := s.Snapshot()
+	d, ok := snap["fail-chain"]
+	if !ok {
+		t.Fatal("dag with pending downstream should stay in running map")
+	}
+	var a, b *Task
+	for _, task := range d.Tasks {
+		switch task.ID {
+		case "a":
+			a = task
+		case "b":
+			b = task
+		}
+	}
+	if a.Status != TaskStatusFailed {
+		t.Errorf("task a status = %q, want failed", a.Status)
+	}
+	if b.Status != TaskStatusPending {
+		t.Errorf("task b status = %q, want pending (blocked by failed dep)", b.Status)
+	}
+	if len(launcher.goals) != 1 {
+		t.Errorf("downstream must not be launched, got %v", launcher.goals)
+	}
+}
+
+// TestSchedulerReapRemovesFinishedDAG 验证单任务 DAG 完成后从 running map 清除。
+func TestSchedulerReapRemovesFinishedDAG(t *testing.T) {
+	store := newMemStore(&DAG{
+		ID:    "single",
+		Name:  "single",
+		Tasks: []*Task{{ID: "a", Goal: "goal a"}},
+	})
+	launcher := newStubLauncher()
+	s := NewScheduler(store, launcher, time.Second)
+
+	ctx := t.Context()
+	if err := s.Trigger(ctx, "single"); err != nil {
+		t.Fatalf("Trigger failed: %v", err)
+	}
+	if _, ok := s.Snapshot()["single"]; !ok {
+		t.Fatal("dag should be in running map after trigger")
+	}
+	launcher.setStatus(launcher.sessionOf("goal a"), "completed")
+	s.tick(ctx)
+	if _, ok := s.Snapshot()["single"]; ok {
+		t.Error("finished dag should be removed from running map")
+	}
+}
+
+// TestDispatchEmptySessionIDMarksFailed 验证 LaunchSession 返回空串时
+// task 直接标 Failed 并回写存储。
+func TestDispatchEmptySessionIDMarksFailed(t *testing.T) {
+	store := newMemStore(&DAG{
+		ID:    "no-sid",
+		Name:  "no-sid",
+		Tasks: []*Task{{ID: "a", Goal: "goal a"}},
+	})
+	launcher := newStubLauncher()
+	launcher.fail = true
+	s := NewScheduler(store, launcher, time.Second)
+
+	ctx := t.Context()
+	if err := s.Trigger(ctx, "no-sid"); err != nil {
+		t.Fatalf("Trigger failed: %v", err)
+	}
+	snap := s.Snapshot()
+	d := snap["no-sid"]
+	if d == nil || len(d.Tasks) != 1 {
+		t.Fatalf("unexpected snapshot: %+v", snap)
+	}
+	if d.Tasks[0].Status != TaskStatusFailed {
+		t.Errorf("task status = %q, want failed on empty session id", d.Tasks[0].Status)
+	}
+	// 应已回写存储
+	persisted, _ := store.GetDAG(ctx, "no-sid")
+	if persisted.Tasks[0].Status != TaskStatusFailed {
+		t.Errorf("persisted task status = %q, want failed", persisted.Tasks[0].Status)
+	}
+}
+
+// TestParseCronStandardAndLegacy 验证标准 5 段 cron 与旧 Ns/Nm/Nh 间隔解析。
+func TestParseCronStandardAndLegacy(t *testing.T) {
+	// 标准 cron 表达式
+	sched, err := ParseCron("0 9 * * *")
+	if err != nil || sched == nil {
+		t.Fatalf("ParseCron standard expr failed: %v", err)
+	}
+	// 空串：手动触发，不报错
+	sched, err = ParseCron("")
+	if err != nil || sched != nil {
+		t.Errorf("ParseCron empty = (%v, %v), want (nil, nil)", sched, err)
+	}
+	// 非法表达式：4 段、非数字、越界值均应报错
+	for _, bad := range []string{"* * * *", "not a cron", "61 * * * *"} {
+		if _, err := ParseCron(bad); err == nil {
+			t.Errorf("ParseCron(%q) expected error", bad)
+		}
+	}
+	// 旧间隔格式保持原有语义
+	for expr, want := range map[string]time.Duration{
+		"30s": 30 * time.Second,
+		"15m": 15 * time.Minute,
+		"24h": 24 * time.Hour,
+	} {
+		got, err := ParseInterval(expr)
+		if err != nil || got != want {
+			t.Errorf("ParseInterval(%q) = (%v, %v), want (%v, nil)", expr, got, err, want)
+		}
+	}
+	if got, err := ParseInterval(""); err != nil || got != 0 {
+		t.Errorf("ParseInterval(\"\") = (%v, %v), want (0, nil)", got, err)
+	}
+	// 旧格式非法输入
+	for _, bad := range []string{"0s", "xm", "5d"} {
+		if _, err := ParseInterval(bad); err == nil {
+			t.Errorf("ParseInterval(%q) expected error", bad)
+		}
+	}
+	// 格式识别：旧间隔 vs 标准 cron
+	if !isLegacyInterval("30m") {
+		t.Error("isLegacyInterval(\"30m\") = false, want true")
+	}
+	if isLegacyInterval("0 9 * * *") {
+		t.Error("isLegacyInterval(\"0 9 * * *\") = true, want false")
+	}
+}
+
+// TestTickCronTriggerSemantics 验证 tick 的 cron 触发判定：
+// 标准 cron 到点触发、旧间隔到期触发、未到点/非法表达式不触发。
+func TestTickCronTriggerSemantics(t *testing.T) {
+	now := time.Now()
+	mk := func(id, cronExpr string, updatedAt time.Time) *DAG {
+		return &DAG{
+			ID:        id,
+			Name:      id,
+			Cron:      cronExpr,
+			Enabled:   true,
+			UpdatedAt: updatedAt,
+			Tasks:     []*Task{{ID: "a", Goal: "goal " + id}},
+		}
+	}
+	store := newMemStore(
+		mk("cron-due", "* * * * *", now.Add(-2*time.Hour)), // 每分钟触发，早已到点
+		mk("cron-not-due", "0 9 * * *", now),               // 下次触发在未来
+		mk("legacy-due", "30m", now.Add(-time.Hour)),       // 旧间隔已到期
+		mk("legacy-not-due", "30m", now),                   // 旧间隔未到期
+		mk("bad-cron", "not a cron", now.Add(-time.Hour)),  // 非法表达式
+	)
+	launcher := newStubLauncher()
+	s := NewScheduler(store, launcher, time.Second)
+	s.tick(t.Context())
+
+	launched := map[string]bool{}
+	for _, g := range launcher.goals {
+		launched[g] = true
+	}
+	for id, want := range map[string]bool{
+		"cron-due":       true,
+		"legacy-due":     true,
+		"cron-not-due":   false,
+		"legacy-not-due": false,
+		"bad-cron":       false,
+	} {
+		if launched["goal "+id] != want {
+			t.Errorf("dag %s launched=%v, want %v", id, launched["goal "+id], want)
+		}
+	}
+	// 触发过的 DAG 应回写新的 UpdatedAt，避免同周期重复触发
+	d, _ := store.GetDAG(t.Context(), "cron-due")
+	if !d.UpdatedAt.After(now.Add(-time.Hour)) {
+		t.Errorf("cron-due UpdatedAt not refreshed: %v", d.UpdatedAt)
+	}
+}

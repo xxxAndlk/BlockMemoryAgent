@@ -17,6 +17,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.6.0
 	github.com/ollama/ollama v0.5.13
 	github.com/redis/go-redis/v9 v9.20.1
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/rs/zerolog v1.33.0
 	github.com/yalue/onnxruntime_go v1.32.1
 	golang.org/x/text v0.34.0
@@ -24,6 +25,7 @@ require (
 )
 
 require (
+	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect

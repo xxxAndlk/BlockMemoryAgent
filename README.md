@@ -34,7 +34,7 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 - **结构化日志**：所有 Agent 关键事件写 `session_logs` 表并按 session/agent/level 可查；各组件注入 `*logger.Logger`，错误类日志真实输出 `[ERRO]`；文件日志按天分割（`logs/backend/`、`logs/tui/`）
 - **严格启动**：config/roles/env/soul/skills 任一配置文件缺失，或 PG/Redis/LLM 后端不可达，启动即失败并明确报错
 - **双入口 + 可观测**：HTTP Web UI（Vue 3 SPA）+ bubbletea TUI；SSE 实时推送事件；`/api/metrics` 输出 Prometheus 格式指标
-- **可选 DAG 调度**：`dag_enabled` 开启后按简易 cron（`Ns/Nm/Nh`）定时触发任务流程（默认关闭）
+- **可选 DAG 调度**：`dag_enabled` 开启后按标准 5 段 cron（如 `0 9 * * *`）或简易间隔（`Ns/Nm/Nh`）定时触发任务流程，Web 端「定时任务」页可视化管理
 
 ---
 
@@ -146,7 +146,7 @@ make plugins-build   # 构建/拉取三个插件镜像：
 │   │   ├── store/              # PostgreSQL（领域子存储）+ Redis
 │   │   ├── logger/ logging/    # 结构化日志 + 文件按天分割
 │   │   ├── runtime/            # 运行时聚合（board/mailbox/skill/soul/watchdog/cmdqueue）
-│   │   ├── dag/ cmdqueue/      # DAG 调度（默认关）/ 用户指令队列
+│   │   ├── dag/ cmdqueue/      # DAG 调度（cron/间隔定时）/ 用户指令队列
 │   │   ├── server/             # HTTP API + SSE + 会话管理
 │   │   ├── tui/ testserver/    # bubbletea TUI / 测试用薄封装（委托 bootstrap）
 │   │   └── config/ embed/ retriever/ plugins/ computeruse/ ...
@@ -195,9 +195,9 @@ zerolog 实现，console/json 两种格式；error 级别可附调用栈（`logg
 
 单一 `Runtime` 持有 Boards / Mailbox / Skills / Soul / Watchdog / CmdQueue。当前接线现状：**Mailbox 是活的**（子 Agent 摘要回灌主循环）；Board → TUI 面板与 board API；Skill 池 → `/api/skills` 查询（prompt 装配未接入 ReAct）；Soul → 加载并经 API 暴露（未注入 prompt）；Watchdog → 阈值经 Query API 暴露（未在主循环执行，历史压缩在 ReAct 层部分缓解）；CmdQueue → enqueue/interrupt 端点。见 `doc/TODO.md`。
 
-### 8. DAG 调度（`internal/dag/`，默认关闭）
+### 8. DAG 调度（`internal/dag/`）
 
-`agent.dag_enabled: true` 后，调度器按简易 cron（`Ns`/`Nm`/`Nh`）轮询 `dag_jobs` 表，按 `depends_on` 依赖把 task 派发为新会话。HTTP 端点：`GET/POST /api/dag`、`GET/DELETE /api/dag/{id}`、`POST /api/dag/{id}/trigger`、`GET /api/dag/running`。
+`agent.dag_enabled` 默认开启。调度器轮询 `dag_jobs` 表，支持标准 5 段 cron（robfig/cron，`0 9 * * *` 表每天 9 点）与简易间隔（`Ns`/`Nm`/`Nh`），按 `depends_on` 依赖把 task 派发为新会话；tick 轮询 task 会话终态推进下游并回写运行态，全部终态后清理运行实例。HTTP 端点：`GET/POST /api/dag`、`GET/DELETE /api/dag/{id}`、`POST /api/dag/{id}/trigger`、`GET /api/dag/running`。Web 端「定时任务」页（`/dag`）可视化创建/触发/查看运行快照。已知限制：无失败自动重试、无断点续跑（重启后重新整体触发）、保存 DAG 会重置触发计时基准。
 
 ---
 

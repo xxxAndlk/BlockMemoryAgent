@@ -194,8 +194,8 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 				flusher.Flush()
 			}
 
-			// 会话结束且非等待澄清，推送 done 事件并关闭连接。
-			if snapshot.Status != enums.SessionStatusRunning && snapshot.Status != enums.SessionStatusAwaitingClarify {
+			// 真终态才推 done 并关闭连接（见 streamAlive）。
+			if !streamAlive(snapshot.Status) {
 				data, _ := json.Marshal(map[string]string{"type": "done", "status": string(snapshot.Status)})
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				flusher.Flush()
@@ -206,5 +206,27 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 			// 客户端断开或请求被取消。
 			return
 		}
+	}
+}
+
+// streamAlive 判断会话是否仍可能产生新事件（SSE 不该推 done 收口）。
+//
+// 只对**已知非终态**续流：running 继续跑、awaiting_clarify 等答复、awaiting_child 子完成
+// 自动唤醒、paused_on_child 用户发消息续跑——后两者是"会话还没结束、随时会自己动起来"的
+// 挂起态，其余（completed/error/未知状态）一律收口，保持旧契约。
+//
+// 教训（2026-09-25 用户实证）：旧条件只豁免 running/awaiting_clarify，Meta 一挂起等子就推
+// done 关连接；前端收 done 视为终态（关 EventSource + 停面板定时器、不再重连），对话栏从
+// 挂起那刻起永久收不到事件——头部徽标冻在「挂起等待子」、子完成唤醒后的最终答复永不渲染，
+// 而侧栏列表走另一条刷新路却显示「完成」，两路分叉成自相矛盾的画面。挂起态必须保持推流。
+func streamAlive(st enums.SessionStatus) bool {
+	switch st {
+	case enums.SessionStatusRunning,
+		enums.SessionStatusAwaitingClarify,
+		enums.SessionStatusAwaitingChild,
+		enums.SessionStatusPausedOnChild:
+		return true
+	default:
+		return false
 	}
 }

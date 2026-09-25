@@ -6,8 +6,9 @@
 //   - Scheduler：进程级后台 goroutine，按 cron 触发 DAG，按依赖关系串/并行
 //     派发任务；每个 Task 对应一个 SessionManager.CreateSession 调用
 //
-// 当前实现：cron 仅支持简单 "every N seconds" 形式（"<N>s"），避免引入
-// 完整 cron 库依赖。依赖检测通过轮询 SessionManager 中 session.Status 完成。
+// 当前实现：cron 同时支持标准 5 段表达式（robfig/cron/v3）与旧的
+// "Ns/Nm/Nh" 相对间隔格式。依赖检测通过轮询 SessionManager 中
+// session.Status 完成（tick 内 reapRunning）。
 package dag
 
 import (
@@ -19,7 +20,10 @@ import (
 	"sync"    // 互斥锁与 WaitGroup
 	"time"    // 时间解析与定时器
 
+	"github.com/robfig/cron/v3" // 标准 5 段 cron 表达式解析
+
 	"github.com/blockmemory/agent/backend/internal/logger" // 结构化日志器
+	"github.com/blockmemory/agent/backend/pkg/enums"       // 会话状态枚举
 	"github.com/blockmemory/agent/backend/pkg/types"       // Task / DAG 等公共类型
 )
 
@@ -91,12 +95,48 @@ func ParseInterval(cron string) (time.Duration, error) {
 	return 0, fmt.Errorf("unsupported cron unit: %c", unit)
 }
 
+// ParseCron 解析标准 5 段 cron 表达式（分 时 日 月 周），如 "0 9 * * *"。
+//
+// 参数：
+//   - expr：标准 cron 表达式字符串。
+//
+// 返回：
+//   - 解析成功返回 cron.Schedule 与 nil error。
+//   - 空串返回 nil 与 nil error（表示仅手动触发）。
+//   - 非法表达式返回 nil 与描述性 error。
+func ParseCron(expr string) (cron.Schedule, error) {
+	expr = strings.TrimSpace(expr)
+	// 空串视为手动触发，不报错
+	if expr == "" {
+		return nil, nil
+	}
+	sched, err := cron.ParseStandard(expr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cron expression: %s: %w", expr, err)
+	}
+	return sched, nil
+}
+
+// isLegacyInterval 判断 cron 字段是否为旧的 "Ns/Nm/Nh" 相对间隔格式。
+//
+// 判定规则：能按 ParseInterval 解析为正值即视为旧间隔格式；
+// 其余（含空串）交由标准 cron 解析或手动触发语义处理。
+func isLegacyInterval(expr string) bool {
+	d, err := ParseInterval(expr)
+	return err == nil && d > 0
+}
+
 // SessionLauncher 把一个 task.goal 派发为新 session。
 //
 // 实现说明：由 server.SessionManager 实现并通过构造函数注入 Scheduler。
 type SessionLauncher interface {
-	// LaunchSession 接收 task 的目标描述，创建并返回新 session 的 ID。
+	// LaunchSession 接收 task 的目标描述，创建并返回新 session 的 ID；
+	// 创建失败时返回空字符串。
 	LaunchSession(goal string) string
+	// GetSessionStatus 查询 session 当前状态。
+	// 返回 (status, found)；found=false 表示会话不存在。
+	// status 取值见 pkg/enums.SessionStatus（running/completed/error 等）。
+	GetSessionStatus(sessionID string) (string, bool)
 }
 
 // Scheduler DAG 调度器：周期轮询所有启用 DAG，按 cron 触发，按依赖派发任务。
@@ -245,54 +285,133 @@ func (s *Scheduler) loop(ctx context.Context) {
 	}
 }
 
-// tick 一次调度轮询：检查 cron 触发 + 推进运行中 DAG 的依赖。
+// tick 一次调度轮询：检查 cron 触发 + 收割运行中 DAG 的会话终态 + 推进依赖。
 //
-// cron 触发判定（简化版）：
-//   - 当前时间 - updatedAt >= interval 即触发。
-//   - trigger 后回写 updatedAt 作为下次触发起点。
+// cron 触发判定：
+//   - 旧 "Ns/Nm/Nh" 间隔格式：当前时间 - updatedAt >= interval 即触发。
+//   - 标准 5 段 cron 表达式：sched.Next(updatedAt) 已不晚于 now 即触发。
+//   - trigger 后回写 updatedAt 作为下次触发起点（编辑 DAG 会重置基准）。
 //   - 这样避免引入独立 lastFire 字段，但也意味着触发后必须落库。
 func (s *Scheduler) tick(ctx context.Context) {
+	// 收割运行中 task 的会话终态（不依赖 DAG 列表，先执行）
+	s.reapRunning(ctx)
 	// 列出所有 DAG 定义
 	dags, err := s.store.ListDAGs(ctx)
-	// 读取失败或无 DAG 时本次 tick 直接结束
+	// 读取失败或无 DAG 时本次 tick 的 cron 检查直接结束
 	if err != nil || len(dags) == 0 {
 		return
 	}
 	now := time.Now()
+	// fire 触发指定 DAG 并回写 updatedAt，避免同一周期重复触发
+	fire := func(d *DAG) {
+		if err := s.Trigger(ctx, d.ID); err != nil {
+			s.logError(ctx, fmt.Sprintf("[DAG] trigger failed: id=%s", d.ID), err)
+		}
+		// 更新 updatedAt 为当前时间，避免同一周期重复触发
+		d.UpdatedAt = now
+		// 持久化新的 updatedAt，避免进程重启后重复触发
+		if err := s.store.SaveDAG(ctx, d); err != nil {
+			s.logError(ctx, fmt.Sprintf("[DAG] save dag failed: id=%s", d.ID), err)
+		}
+	}
 	// 遍历每个 DAG，检查是否需要按 cron 触发
 	for _, d := range dags {
 		// 未启用或仅手动触发的 DAG 跳过 cron 检查
 		if !d.Enabled || d.Cron == "" {
 			continue
 		}
-		// 解析 cron 为定时间隔
-		interval, err := ParseInterval(d.Cron)
-		if err != nil || interval <= 0 {
+		// 旧间隔格式：距 updatedAt 超过 interval 则触发
+		if isLegacyInterval(d.Cron) {
+			interval, _ := ParseInterval(d.Cron)
+			if now.Sub(d.UpdatedAt) >= interval {
+				fire(d)
+			}
 			continue
 		}
-		// 简化：若距 updatedAt 超过 interval，则触发该 DAG
-		if now.Sub(d.UpdatedAt) >= interval {
-			if err := s.Trigger(ctx, d.ID); err != nil {
-				s.logError(ctx, fmt.Sprintf("[DAG] trigger failed: id=%s", d.ID), err)
-			}
-			// 更新 updatedAt 为当前时间，避免同一周期重复触发
-			d.UpdatedAt = now
-			// 持久化新的 updatedAt，避免进程重启后重复触发
-			if err := s.store.SaveDAG(ctx, d); err != nil {
-				s.logError(ctx, fmt.Sprintf("[DAG] save dag failed: id=%s", d.ID), err)
-			}
+		// 标准 cron 表达式：Next(updatedAt) 已过即触发
+		sched, err := ParseCron(d.Cron)
+		if err != nil || sched == nil {
+			continue
+		}
+		if !sched.Next(d.UpdatedAt).After(now) {
+			fire(d)
 		}
 	}
-	// 推进运行中 DAG：先拷贝一份引用后释放锁，再逐个 dispatchReady，避免长持锁
+}
+
+// reapRunning 轮询 running map 中 running 状态 task 的会话终态并收尾。
+//
+// 规则：
+//   - 会话 completed → task 置 Completed，并 dispatchReady 推进下游。
+//   - 会话 error → task 置 Failed，下游依赖保持 pending（永久阻断）。
+//   - 会话不存在（found=false）→ 跳过本轮（可能刚创建尚未落库）。
+//   - 每次状态迁移后 SaveDAG 回写 tasks JSONB（运行态落库）。
+//   - DAG 全部 task 到达终态（completed/failed）→ 从 running map 删除。
+//
+// 并发说明：先拷贝 running map 引用后释放锁，再调用 launcher（可能涉及
+// 网络/内部锁），与 tick 原有"拷贝引用后释放锁"风格一致，避免持锁调外部依赖。
+func (s *Scheduler) reapRunning(ctx context.Context) {
+	// 拷贝一份运行实例引用后释放锁
 	s.mu.Lock()
 	running := make(map[string]*DAG, len(s.running))
 	for k, v := range s.running {
 		running[k] = v
 	}
 	s.mu.Unlock()
-	for _, d := range running {
-		s.dispatchReady(ctx, d)
+	for id, d := range running {
+		changed := false
+		// 逐个检查 running 状态 task 的会话终态
+		for _, t := range d.Tasks {
+			if t.Status != TaskStatusRunning || t.SessionID == "" {
+				continue
+			}
+			status, found := s.launcher.GetSessionStatus(t.SessionID)
+			if !found {
+				// 会话查询不到：可能刚创建尚未可见，跳过本轮
+				continue
+			}
+			switch status {
+			case string(enums.SessionStatusCompleted):
+				now := time.Now()
+				t.FinishedAt = &now
+				t.Status = TaskStatusCompleted
+				changed = true
+			case string(enums.SessionStatusError):
+				now := time.Now()
+				t.FinishedAt = &now
+				// 失败标记让下游依赖永远不会 ready
+				t.Status = TaskStatusFailed
+				changed = true
+			}
+		}
+		if changed {
+			// 推进后续依赖：依赖已完成 task 的 pending 任务会被派发
+			s.dispatchReady(ctx, d)
+			// 状态迁移后回写 tasks JSONB，运行态落库
+			if err := s.store.SaveDAG(ctx, d); err != nil {
+				s.logError(ctx, fmt.Sprintf("[DAG] save dag failed: id=%s", id), err)
+			}
+		}
+		// DAG 全部 task 到达终态：从 running map 删除，避免只增不减
+		if dagFinished(d) {
+			s.mu.Lock()
+			// 仅当 map 中仍是同一实例时删除，避免误删并发重新触发的实例
+			if cur, ok := s.running[id]; ok && cur == d {
+				delete(s.running, id)
+			}
+			s.mu.Unlock()
+		}
 	}
+}
+
+// dagFinished 报告 DAG 的所有 task 是否都已到达终态（completed/failed）。
+func dagFinished(d *DAG) bool {
+	for _, t := range d.Tasks {
+		if t.Status == TaskStatusPending || t.Status == TaskStatusRunning {
+			return false
+		}
+	}
+	return true
 }
 
 // dispatchReady 把所有依赖已完成的 pending 任务派发为 session。
@@ -332,8 +451,18 @@ func (s *Scheduler) dispatchReady(ctx context.Context, d *DAG) {
 		if !ready {
 			continue
 		}
-		// 派发：把 task.goal 作为新 session 的输入；sessionID 用于后续 MarkCompleted 回调
+		// 派发：把 task.goal 作为新 session 的输入；sessionID 用于后续 reap 轮询
 		sid := s.launcher.LaunchSession(t.Goal)
+		if sid == "" {
+			// 派发失败：task 直接标 Failed（下游保持 pending），并回写落库
+			now := time.Now()
+			t.FinishedAt = &now
+			t.Status = TaskStatusFailed
+			if err := s.store.SaveDAG(ctx, d); err != nil {
+				s.logError(ctx, fmt.Sprintf("[DAG] save dag failed: id=%s", d.ID), err)
+			}
+			continue
+		}
 		t.SessionID = sid
 		t.Status = TaskStatusRunning
 		now := time.Now()

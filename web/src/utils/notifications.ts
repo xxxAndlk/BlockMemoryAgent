@@ -5,8 +5,12 @@
  * 权限申请按钮在设置页；未授权/被拒绝时静默跳过，零打扰。
  */
 
-/** 终态集合：这些状态值得通知用户（运行中/等待澄清不打扰）。 */
-const TERMINAL_STATUSES = new Set(['completed', 'error', 'cancelled'])
+/**
+ * 终态集合：会话真正结束的状态（运行中/等待澄清/挂起等子/暂停于子都不算）。
+ * 两处判定共用：终态通知（这些状态值得提醒，挂起态不打扰）、
+ * SSE `done` 帧收口（api/session.ts：非终态 done 是旧后端的挂起态误报，必须续连而非收口）。
+ */
+export const TERMINAL_STATUSES = new Set(['completed', 'error', 'cancelled'])
 
 /** 浏览器是否支持 Notification API。 */
 export function notificationSupported(): boolean {

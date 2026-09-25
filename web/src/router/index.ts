@@ -69,6 +69,12 @@ const routes: Array<RouteRecordRaw> = [
         meta: { title: '会话历史', icon: 'Clock' }
       },
       {
+        path: 'dag',
+        name: 'Dag',
+        component: () => import('@/views/dag/index.vue'),
+        meta: { title: '定时任务', icon: 'AlarmClock' }
+      },
+      {
         path: 'settings',
         name: 'Settings',
         component: () => import('@/views/settings/index.vue'),

@@ -131,7 +131,10 @@ const menuGroups = [
   },
   {
     title: '系统',
-    items: [{ path: '/settings', title: '系统设置', icon: 'Setting' }],
+    items: [
+      { path: '/dag', title: '定时任务', icon: 'AlarmClock' },
+      { path: '/settings', title: '系统设置', icon: 'Setting' },
+    ],
   },
 ]
 </script>

@@ -14,8 +14,8 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载 config.yaml 失败: %v", err)
 	}
-	if cfg.Agent.DAGEnabled {
-		t.Fatal("dag_enabled 应为 false")
+	if !cfg.Agent.DAGEnabled {
+		t.Fatal("dag_enabled 应为 true")
 	}
 	// 块记忆写入开关未在 config.yaml 中显式配置时，applyDefaults 应兜底为 true。
 	if cfg.Agent.BlockMemoryWriteEnabled == nil || !*cfg.Agent.BlockMemoryWriteEnabled {

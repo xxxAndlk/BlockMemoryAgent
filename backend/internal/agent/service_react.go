@@ -2733,6 +2733,16 @@ func (s *ReactService) LaunchSession(goal string) string {
 	return sess.ID
 }
 
+// GetSessionStatus 实现 dag.SessionLauncher 接口：查询会话当前状态。
+// 返回 (status, found)；会话不存在时 found=false。
+func (s *ReactService) GetSessionStatus(sessionID string) (string, bool) {
+	sess, err := s.Get(context.Background(), sessionID)
+	if err != nil || sess == nil {
+		return "", false
+	}
+	return sess.Status, true
+}
+
 // RestoreSessions 从 PostgreSQL 加载历史会话到内存。
 func (s *ReactService) RestoreSessions(ctx context.Context, limit int) int {
 	return s.store.restoreSessions(ctx, limit)
