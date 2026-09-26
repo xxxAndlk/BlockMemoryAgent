@@ -118,7 +118,8 @@ func (m *SessionManager) SetModelFactory(mf *model.ModelFactory) {}
 // 返回值：新创建会话的 ID；创建失败时返回空字符串。
 func (m *SessionManager) LaunchSession(goal string) string {
 	// 使用后台上下文创建会话，因为 DAG 触发器不依赖具体请求上下文。
-	s, err := m.agent.CreateSession(context.Background(), agent.CreateRequest{Goal: goal})
+	// NonInteractive：无人值守会话，ask_user 不挂起等用户，直接返回"自行决策"。
+	s, err := m.agent.CreateSession(context.Background(), agent.CreateRequest{Goal: goal, NonInteractive: true})
 	if err != nil || s == nil {
 		return ""
 	}

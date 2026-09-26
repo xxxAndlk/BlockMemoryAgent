@@ -5,6 +5,7 @@ import type { WireImage, SessionGear, SessionThinking, TrustMode, Session } from
 import { setTrustMode, setSessionGear, setSessionThinking } from '@/api/session'
 import { useModelSelection } from '@/composables/useModelSelection'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
+import { useWorkDir } from '@/composables/useWorkDir'
 
 const props = defineProps<{
   loading?: boolean
@@ -19,7 +20,7 @@ const props = defineProps<{
   /** 是否绑定了会话（有 activeSession）。区别于 sessionActive=运行中：
    * 已完成的会话同样"有本会话目录"，不能因为没在跑就显示成"新会话目录"。 */
   sessionBound?: boolean
-  /** 工作目录：有会话=本会话目录；无会话=新会话默认目录（空串=进程默认目录） */
+  /** 工作目录：有会话=本会话目录；无会话=新会话默认目录（空串=服务端默认工作目录 agent.default_workdir） */
   workDir?: string
   /** 目录保存中（请求在途，按钮转圈） */
   workDirSaving?: boolean
@@ -34,6 +35,10 @@ const emit = defineEmits<{
 }>()
 
 const content = ref('')
+
+// 服务端默认工作目录（新建会话不选目录时的落盘根）：会话页挂载时经 /api/capabilities 填好，
+// 这里只读来渲染目录选择器占位——用户建会话前就知道文件会写到哪个目录。
+const { defaultDir } = useWorkDir()
 
 // 待澄清语境（2026-09-20）：会话 awaiting_clarify 时发送 = 回答上方问题（走 /clarify），
 // 不是下新指令。placeholder 与边框高亮跟着语境变，用户不必猜此刻该在哪输入。
@@ -351,7 +356,7 @@ function onKeydown(e: KeyboardEvent) {
         <div class="flex items-center gap-2 min-w-0 max-w-[26rem] workdir-cell">
           <span class="text-ink-2 whitespace-nowrap">{{ workDirLabel }}</span>
           <WorkDirPicker :model-value="workDir || ''" :existing="knownDirs"
-                         placeholder="进程默认目录"
+                         :placeholder="defaultDir || '默认目录'"
                          @update:model-value="(d: string) => emit('update-workdir', d)" />
           <el-icon v-if="workDirSaving" class="animate-spin text-ink-3 shrink-0"><Loading /></el-icon>
           <span v-if="workDirHint" class="text-[10px] text-ink-3 whitespace-nowrap shrink-0"

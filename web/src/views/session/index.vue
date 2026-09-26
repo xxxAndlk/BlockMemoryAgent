@@ -21,7 +21,7 @@ import {
   type MailboxMessage,
   type SessionLog,
 } from '@/api/session'
-import { getHealth, type HealthResponse } from '@/api/health'
+import { getCapabilities, getHealth, type HealthResponse } from '@/api/health'
 import {
   getSessionMetrics,
   getSessionTokenMetrics,
@@ -55,7 +55,7 @@ const { sessions, loadSessions } = useSessionList()
 const stream = useSessionStream()
 const panel = usePanelRefresh()
 const { statusDotClass, statusText } = useSessionStatus()
-const { workDir, setWorkDir } = useWorkDir()
+const { workDir, setWorkDir, setDefaultDir } = useWorkDir()
 
 const activeSession = ref<Session | null>(null)
 const events = ref<SessionEvent[]>([])
@@ -179,6 +179,10 @@ onMounted(async () => {
   // ?new=1 = 侧栏/工作目录页点「新建会话」：要空白新会话，不是恢复上次那个。
   const isNew = !!route.query.new
   if (qwd && !route.query.id) setWorkDir(qwd)
+
+  // 目录选择器占位要显示「不选目录时的真实落盘根」（服务端 agent.default_workdir 解析值）：
+  // 挂载拉一次即可，失败静默——占位退回通用文案，不影响建会话。
+  void getCapabilities().then((c) => setDefaultDir(c.default_work_dir || '')).catch(() => {})
 
   await loadSessions()
   const rawId = route.query.id

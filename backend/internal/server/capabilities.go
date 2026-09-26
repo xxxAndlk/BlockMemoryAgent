@@ -49,7 +49,10 @@ func (h *APIHandler) CapabilitiesHandler(c *gin.Context) {
 			break
 		}
 	}
-	c.JSON(200, gin.H{"items": items, "all_ok": allOK})
+	// default_work_dir：新会话未选工作目录时的落盘根（进程默认工作目录，bootstrap 经
+	// SetDefaultWorkDir 注入）。前端用它填目录选择器的占位文案，免得用户新建会话时
+	// 不知道文件会落到哪儿（与 workdir 探针同源，都取 h.defaultWorkDir）。
+	c.JSON(200, gin.H{"items": items, "all_ok": allOK, "default_work_dir": h.defaultWorkDir})
 }
 
 // capabilityLLM 检查 LLM 配置可解析（生产严格启动已保证连通，这里只报当前生效模型）。

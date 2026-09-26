@@ -273,12 +273,16 @@ type AgentConfig struct {
 	FeatureTogglesConfig `yaml:",inline"`
 
 	// 其余不适合归入上述子配置的独立字段。
-	ContextWindow              int `yaml:"context_window"`                 // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
-	ReadFileMaxChars           int `yaml:"read_file_max_chars"`            // ReadFile / SearchInFiles 输出截断字符数
-	RunCommandMaxOutput        int `yaml:"run_command_max_output"`         // RunCommand 输出截断字符数
-	RunCommandTimeoutSec       int `yaml:"run_command_timeout_sec"`        // RunCommand 最大允许超时（秒）
-	ToolExecMaxBytes           int `yaml:"tool_exec_max_bytes"`            // Execute 入参 JSON 摘要截断字节数
-	SearchBlockMemoryMaxTokens int `yaml:"search_block_memory_max_tokens"` // 块记忆检索摘要 token 上限
+	// DefaultWorkDir 新会话未选工作目录时的默认目录：相对路径按安装目录（BMA_HOME）解析，
+	// 绝对路径原样；空=保持旧行为（回落进程 cwd，即服务从哪儿启动就用哪儿）。
+	// bootstrap 启动时 MkdirAll，见 resolveDefaultWorkDir。
+	DefaultWorkDir             string `yaml:"default_workdir"`
+	ContextWindow              int    `yaml:"context_window"`                 // Agent 上下文窗口（token 数），用于 Watchdog / 装配预算
+	ReadFileMaxChars           int    `yaml:"read_file_max_chars"`            // ReadFile / SearchInFiles 输出截断字符数
+	RunCommandMaxOutput        int    `yaml:"run_command_max_output"`         // RunCommand 输出截断字符数
+	RunCommandTimeoutSec       int    `yaml:"run_command_timeout_sec"`        // RunCommand 最大允许超时（秒）
+	ToolExecMaxBytes           int    `yaml:"tool_exec_max_bytes"`            // Execute 入参 JSON 摘要截断字节数
+	SearchBlockMemoryMaxTokens int    `yaml:"search_block_memory_max_tokens"` // 块记忆检索摘要 token 上限
 	// DispatchRetryCount 叶子助手 kind=error 失败的自动重派次数（TODO #23，最小一档）。
 	// 默认 1：失败自动重跑一次（同任务同前缀）；domain/timeout/killed/loop_guard 不自动重试。
 	// 与 LLM 调用层重试（retry_count）正交：那层重试模型调用本身，这层重跑整个子 Agent。

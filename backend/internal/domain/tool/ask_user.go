@@ -126,10 +126,12 @@ func (t *askUserTool) Aliases() []string { return nil }
 
 // Description 返回 LLM 可见的工具描述。
 func (t *askUserTool) Description() string {
-	return "向用户提问并等待答复（人在回路）。推荐批量模式：questions 一次问齐 2-5 个" +
-		"关键分叉（选错要返工、缺失无法定案的决策；不问琐碎，用户已明确的禁止再问），" +
-		"全部题目同屏分页呈现、用户可回退改选后一次性提交，答复按题号汇总返回——" +
-		"提问是最省时间的行动。说人话，每个选项讲清对结果的影响。" +
+	return "向用户提问并等待答复（人在回路）。提问是最后手段而非默认动作：仅当存在" +
+		"上下文推不出来的方向分叉（选错要返工、缺失无法定案）时才问；提问前先自查" +
+		"对话/规格/共享记忆，已有答案或用户已明确的禁止再问，琐碎细节与常量级参数" +
+		"按最常见约定自行决定并标注待验证。确有多处分叉时才用批量模式 questions" +
+		"一次问齐（2-5 题），全部题目同屏分页呈现、用户可回退改选后一次性提交，" +
+		"答复按题号汇总返回。说人话，每个选项讲清对结果的影响。" +
 		"参数：questions 每项 {question,options,multi_select}；options 每项 {id,label,description}" +
 		"（label 简短可点选，给候选不开放式让用户打字；multi_select=true 可多选）。" +
 		"question 只写一句短问题（进度盘点/计划全文等长上下文一律放 detail，展示时" +
@@ -171,7 +173,7 @@ func (t *askUserTool) InputSchema() *jsonschema.Schema {
 					},
 					Required: []string{"question"},
 				},
-				Description: "批量模式：2-5 个问题一次问齐（新任务开工前澄清必用），全部题目同屏分页呈现、用户统一提交，答复按题号汇总返回",
+				Description: "批量模式：2-5 个问题一次问齐（仅当确有多处方向分叉时，非默认动作），全部题目同屏分页呈现、用户统一提交，答复按题号汇总返回",
 			},
 			"detail": {Type: "string", Description: "附加长上下文（如计划全文、进度盘点）：完整展示在问题之前供用户滚动查看，问答面板只显示 question 与选项；question 写一句短引导语即可"},
 			"artifacts": {

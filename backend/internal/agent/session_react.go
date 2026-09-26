@@ -86,6 +86,9 @@ type reactInternalSession struct {
 	//（LiveEventLLMDelta 只写这里不推 StreamingText），轮末由工具调用边界丢弃、
 	// ask_user 或 run 完成时冲刷进 StreamingText（2026-09-18 编排内心独白泄露修复）。
 	pendingTopText string
+	// nonInteractive 无人值守会话（DAG 定时派发）：ask_user/批量提问不挂起等用户，
+	// hook 直接返回"自行决策"答复。纯内存标记，重启恢复的会话不保留。
+	nonInteractive bool
 	// ctx 是会话的运行上下文，用于控制生命周期与取消。
 	ctx context.Context
 	// cancelFn 用于取消 ctx，通常在会话结束或关闭时调用。

@@ -1177,6 +1177,8 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 	}
 	// 在内存中创建会话对象（携带每会话工作目录，空=进程默认）。
 	sess := s.store.createSession(goal, req.WorkDir)
+	// 无人值守会话（DAG 定时派发）：ask_user 不挂起等用户，直接返回"自行决策"。
+	sess.nonInteractive = req.NonInteractive
 	// 显式初始档位（TODO #14 新会话页选档）：合法枚举覆盖 store 默认档，其余回落默认。
 	if tool.ValidGear(req.Gear) {
 		sess.setGear(req.Gear)
@@ -2073,6 +2075,19 @@ func resolveApproval(answer string, pc *ClarifyRequest) bool {
 	return parseApproval(answer)
 }
 
+// nonInteractiveSelfDecision 是无人值守会话（DAG 定时派发）中 ask_user 的固定答复：
+// 无人可答，提示 Agent 按最常见约定自行决策并把假设写进交付说明。
+const nonInteractiveSelfDecision = "无人值守会话（用户不在线）：按最常见约定自行决策，并在交付说明中标注该假设。"
+
+// isNonInteractiveSession 报告会话是否为无人值守会话（DAG 定时派发）。
+// 会话不存在时按交互式处理（保守：不拦截正常提问链路）。
+func (s *ReactService) isNonInteractiveSession(sid string) bool {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	sess := s.store.sessions[sid]
+	return sess != nil && sess.nonInteractive
+}
+
 // AskUserHook 返回 ask_user 工具的会话层回调（TODO #24 人在回路，#53 结构化选项）。
 // 由 bootstrap 注入 tool.Registry.SetAskUserHook；meta/domain Agent 在任务执行中
 // 主动提问时触发。与 ApprovalHook 同通道范式：置 PendingClarify + 会话暂停
@@ -2085,6 +2100,10 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		sid := tool.SessionIDFromContext(ctx)
 		if sid == "" {
 			return "", fmt.Errorf("ask_user: missing session context")
+		}
+		// 无人值守会话（DAG 定时派发）：无人可答，直接返回自行决策，不挂起会话。
+		if s.isNonInteractiveSession(sid) {
+			return nonInteractiveSelfDecision, nil
 		}
 		// 等待用户期间保活：同 ApprovalHook，等答复不被心跳巡检误判假死。
 		// 提前到排队之前启动：排队等槽位期间本 Agent 同样阻塞无活动，需要保活覆盖。
@@ -2427,6 +2446,14 @@ func (s *ReactService) AskUserBatchHook() tool.AskUserBatchHookFunc {
 		sid := tool.SessionIDFromContext(ctx)
 		if sid == "" {
 			return nil, fmt.Errorf("ask_user: missing session context")
+		}
+		// 无人值守会话（DAG 定时派发）：逐题返回自行决策，不挂起会话。
+		if s.isNonInteractiveSession(sid) {
+			answers := make([]string, len(questions))
+			for i := range answers {
+				answers[i] = nonInteractiveSelfDecision
+			}
+			return answers, nil
 		}
 		// 等待用户期间保活：同 AskUserHook，排队与阻塞阶段都覆盖。
 		keepalive := s.startUserWaitKeepalive(ctx)

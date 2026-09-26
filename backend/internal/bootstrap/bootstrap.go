@@ -227,9 +227,23 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 第十一步：加载技能池 + 扫描主流 Agent 工具约定目录（技能渐进披露）。
 	// skills.yaml（工具别名技能）与 <cwd>/{.claude,.codex,.agents,.cursor,.gemini,.agent}/skills/
 	// 的 SKILL.md 合并进同一池；两路均为空时回退内置池，保证开箱可用。
-	workDir, err := os.Getwd()
+	// 约定目录按**进程 cwd** 扫（项目约定，与默认工作目录解耦）。
+	cwd, err := os.Getwd()
 	if err != nil {
-		workDir = "."
+		cwd = "."
+	}
+	// 进程默认工作目录：新会话未选 work_dir 时的回落根（config agent.default_workdir，
+	// 相对路径按安装目录 BMA_HOME 解析；未配置=旧行为回落 cwd）。它是新会话的落盘根，
+	// 启动期就 MkdirAll——建不出属启动硬失败，不能拖到首次写文件才暴露。
+	workDir, err := resolveDefaultWorkDir(cfg.Agent.DefaultWorkDir)
+	if err != nil {
+		closeStores(pgStore, redisStore)
+		return nil, err
+	}
+	if workDir == "" {
+		workDir = cwd
+	} else {
+		log.Printf("[bootstrap] default session workdir: %s (config agent.default_workdir=%s)", workDir, cfg.Agent.DefaultWorkDir)
 	}
 	var skillPool *skill.Pool
 	if paths.SkillPath == "" {
@@ -241,8 +255,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return nil, fmt.Errorf("load skills %s: %w", paths.SkillPath, err)
 		}
 	}
-	if loaded, skipped := skillPool.LoadFromDir(workDir); loaded > 0 {
-		log.Printf("[bootstrap] skill dir scan: loaded=%d skipped=%v root=%s", loaded, skipped, workDir)
+	if loaded, skipped := skillPool.LoadFromDir(cwd); loaded > 0 {
+		log.Printf("[bootstrap] skill dir scan: loaded=%d skipped=%v root=%s", loaded, skipped, cwd)
 	} else if len(skipped) > 0 {
 		log.Printf("[bootstrap] skill dir scan: 0 loaded, skipped=%v", skipped)
 	}
@@ -266,9 +280,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	rt.SetAgentConfig(&cfg.Agent)
 
 	// 第十四步：装配 ReAct 引擎依赖。
-	// workDir 已在第十一步取得（技能目录扫描同根）：工具注册表定位工作区。
-	// workDir 本身即沙箱：Agent 直接在用户项目目录内读写，不再创建 workspace/ 子区。
-	// guards 仅挡 VCS/IDE/构建产物目录；sandbox.go 拦截路径逃逸 workDir。
+	// workDir 已在第十一步取得 = 进程默认工作目录（agent.default_workdir，未配置回落 cwd）：
+	// 作为 Executor 的兜底沙箱根，会话自身 work_dir 经 ctx 注入**优先**（sandbox.go workDirOf）——
+	// 选了目录的会话照旧直接在用户项目目录内读写，默认目录只兜未选目录的新会话。
+	// guards 仅挡 VCS/IDE/构建产物目录；sandbox.go 拦截路径逃逸 workDirOf(ctx)。
 	roleRegistry := role.NewRegistry(roleCfg)
 	toolRegistry := tool.NewBuiltinRegistry(workDir, &cfg.Agent, nil) // 内置工具注册表
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，

@@ -444,3 +444,58 @@ func TestUserProfile_ExtractFailureNoSideEffect(t *testing.T) {
 		t.Fatalf("extract failure must not write profile, got: %s", store.Current().Content)
 	}
 }
+
+// TestAskUser_NonInteractiveSession 无人值守会话（DAG 定时派发）：ask_user 不挂起
+// 等用户，hook 直接返回"自行决策"答复，会话保持 running 不进 awaiting_clarify。
+func TestAskUser_NonInteractiveSession(t *testing.T) {
+	llm := &blockProvider{release: make(chan struct{})}
+	defer close(llm.release)
+	svc := newAskUserTestService(t, llm)
+	ctx := context.Background()
+
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "定时任务", NonInteractive: true})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	askCtx := tool.WithAgentID(tool.WithSessionID(ctx, created.ID), "domain-1")
+	hook := svc.AskUserHook()
+	done := make(chan struct{})
+	var answer string
+	var herr error
+	go func() {
+		answer, herr = hook(askCtx, "配色？", tool.AskUserOptions{})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("non-interactive ask_user should return immediately")
+	}
+	if herr != nil {
+		t.Fatalf("hook err: %v", herr)
+	}
+	if !strings.Contains(answer, "自行决策") {
+		t.Fatalf("want self-decision answer, got %q", answer)
+	}
+	// 会话不挂出待澄清卡片。
+	sess, _ := svc.Get(ctx, created.ID)
+	if sess != nil && sess.PendingClarify != nil {
+		t.Fatalf("non-interactive session should not pend clarify, got %+v", sess.PendingClarify)
+	}
+
+	// 批量模式同样直达。
+	batchHook := svc.AskUserBatchHook()
+	answers, err := batchHook(askCtx, []tool.AskUserQuestion{{Question: "q1"}, {Question: "q2"}}, "")
+	if err != nil {
+		t.Fatalf("batch hook err: %v", err)
+	}
+	if len(answers) != 2 {
+		t.Fatalf("want 2 answers, got %d", len(answers))
+	}
+	for _, a := range answers {
+		if !strings.Contains(a, "自行决策") {
+			t.Fatalf("want self-decision answer, got %q", a)
+		}
+	}
+}

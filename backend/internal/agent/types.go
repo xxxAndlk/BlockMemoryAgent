@@ -139,6 +139,9 @@ type CreateRequest struct {
 	// Thinking 会话级思考强度（2026-09-16）：off|low|medium|high，空=跟随角色默认。
 	// 只覆盖本会话顶层 Agent；HTTP 层负责 400 校验。
 	Thinking string
+	// NonInteractive 无人值守会话（DAG 定时派发等）：ask_user 不挂起等用户，
+	// 直接返回"自行决策"答复让 Agent 继续跑。
+	NonInteractive bool
 }
 
 // ResumeRequest 表示恢复一个此前暂停或已结束的会话。

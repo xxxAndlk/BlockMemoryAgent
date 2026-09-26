@@ -55,6 +55,10 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if cfg.Agent.TaskMaxRunesHard != 4000 {
 		t.Fatalf("task_max_runes_hard 应为 4000，got %d", cfg.Agent.TaskMaxRunesHard)
 	}
+	// 新会话默认工作目录（2026-09-26）：config.yaml 显式 workspace（解析到安装目录下）。
+	if cfg.Agent.DefaultWorkDir != "workspace" {
+		t.Fatalf("default_workdir 应为 workspace，got %q", cfg.Agent.DefaultWorkDir)
+	}
 }
 
 // TestApplyDefaults_TaskRuneLimits 验证未配置时 task 双档上限兜底 3000/4000（TODO #35）。

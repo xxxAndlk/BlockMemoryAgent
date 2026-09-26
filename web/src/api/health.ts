@@ -40,6 +40,8 @@ export interface CapabilityItem {
 export interface CapabilitiesResponse {
   items: CapabilityItem[]
   all_ok: boolean
+  /** 新会话未选工作目录时的默认落盘根（服务端进程默认工作目录，如 D:\WebApp\bma\workspace） */
+  default_work_dir?: string
 }
 
 /** 六类能力逐项自检（LLM/PG/Redis/嵌入/插件/工作目录），settings 能力面板数据源。 */
