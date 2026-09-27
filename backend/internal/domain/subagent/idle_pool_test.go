@@ -2,7 +2,7 @@ package subagent
 
 // idle_pool_test.go 验证 DomainAgent 热驻留核心路径（仅 hotCfg.Enabled 开启时）：
 //   - domain 任务完成 → tree.Idle + 父 notify + pending 归零 + 槽 idle 热存（enterIdle 即武装 TTL）。
-//   - TTL 到期投 opDestroy 销毁槽 + tree Finish Done；复用/直连唤醒停表，完成按新权重重新武装。
+//   - TTL 到期投 opDestroy 销毁槽（冷驻：树节点保 Idle 可复活）；复用/直连唤醒停表，完成按新权重重新武装。
 //   - 复用派发（reuse_agent_id）：idle 槽唤醒 + reuseCount++ + 新任务执行。
 //   - 忙碌槽入队：当前任务完成后自动出队执行。
 //   - 失败销毁：err 路径 slot destroyed + treeFinish Failed。
@@ -127,7 +127,7 @@ func TestHotDomain_TaskDoneEntersIdle(t *testing.T) {
 }
 
 // TestHotDomain_ArmAndExpiry 验证 TTL 生命周期：enterIdle 完成即武装（ArmIdleTTLs 幂等兼容）；
-// 到期销毁槽 + tree Done。
+// 到期销毁槽（冷驻语义：树节点保持 Idle 作可复活注册表条目，不置 Done）。
 func TestHotDomain_ArmAndExpiry(t *testing.T) {
 	provider := &scriptProvider{lines: []string{"result"}}
 	d, _, tr, toolsReg := newIdleTestEnv(t, provider, 500*time.Millisecond)
@@ -157,14 +157,14 @@ func TestHotDomain_ArmAndExpiry(t *testing.T) {
 		t.Fatal("TTL not armed after enterIdle")
 	}
 
-	// 到期：槽销毁 + tree Done。
+	// 到期：槽销毁（冷驻——树节点保持 Idle 可复活，不再置 Done）。
 	waitForCond(t, "slot destroyed after TTL", func() bool {
 		return d.pool.slot("s1", subID) == nil
 	})
-	waitForCond(t, "tree done after TTL", func() bool {
-		n, ok := tr.Get(subID)
-		return ok && n.Status == orchestrator.StatusDone
-	})
+	n, ok := tr.Get(subID)
+	if !ok || n.Status != orchestrator.StatusIdle {
+		t.Errorf("tree status after TTL = %v, want Idle (cold-resident, revivable)", n.Status)
+	}
 }
 
 // TestHotDomain_ReuseWake 验证复用派发：idle 槽唤醒 + reuseCount++ + 新任务完成再 idle。
@@ -579,7 +579,8 @@ func TestHotDomain_UserWakeIdle(t *testing.T) {
 }
 
 // TestHotDomain_UserWakeRearmsTTL 验证对话刷新寿命：完成即武装 TTL（无需用户消息触发）；
-// 用户直连唤醒停表执行，任务完成回 idle 后按新权重重新武装满额，到期销毁槽 + tree Done。
+// 用户直连唤醒停表执行，任务完成回 idle 后按新权重重新武装满额，到期销毁槽（冷驻——
+// 树节点保持 Idle 可复活，不置 Done）。
 func TestHotDomain_UserWakeRearmsTTL(t *testing.T) {
 	provider := &scriptProvider{lines: []string{"first result", "second result"}}
 	d, _, tr, toolsReg := newIdleTestEnv(t, provider, 500*time.Millisecond)
@@ -619,14 +620,14 @@ func TestHotDomain_UserWakeRearmsTTL(t *testing.T) {
 		return s.state == slotIdle && s.ttlArmed && s.reuseCount == 1
 	})
 
-	// 到期：槽销毁 + tree Done。
+	// 到期：槽销毁（冷驻——树节点保持 Idle 可复活，不再置 Done）。
 	waitForCond(t, "slot destroyed after re-armed TTL", func() bool {
 		return d.pool.slot("s1", subID) == nil
 	})
-	waitForCond(t, "tree done after TTL", func() bool {
-		n, ok := tr.Get(subID)
-		return ok && n.Status == orchestrator.StatusDone
-	})
+	n, ok := tr.Get(subID)
+	if !ok || n.Status != orchestrator.StatusIdle {
+		t.Errorf("tree status after re-armed TTL = %v, want Idle (cold-resident, revivable)", n.Status)
+	}
 }
 
 // TestHotDomain_UserWakeRejected 验证错误路径：不存在槽 → ErrAgentNotDirectable；

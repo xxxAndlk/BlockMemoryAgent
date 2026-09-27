@@ -10,6 +10,9 @@ package subagent
 //   - Idle 加权 TTL：effectiveTTL = min(BaseTTL + reuseCount*Extend, MaxTTL)。
 //     enterIdle 即武装倒计时（任务完成≈父收到回传时就开始计时，避免完成后无限期热存
 //     占内存）；复用/用户直连唤醒时停表且 reuseCount+1，本轮完成回 idle 按新权重重新武装满额。
+//   - TTL 到期=冷驻（非终态 Done）：实例销毁释放资源，树节点保持 Idle 作可复活
+//     注册表条目；reuse_agent_id 命中冷驻节点时 restoreColdSlot 从 agent_messages
+//     重建槽（dormant，无 supervisor，首个唤醒序列惰性启动）续跑历史上下文。
 //   - 会话级挂起（触限暂停全树）：sessionSuspendState 广播 wake channel，叶子与
 //     domain 的 SuspendGate.Park 阻塞其上；ResumeSessionAgents close 广播唤醒。
 //   - 心跳/墙钟豁免：Idle/挂起时 activity.Delete（scanStuck Range 不到）；
@@ -69,6 +72,7 @@ type domainOp struct {
 	wallClock time.Duration      // opNewTask：本次派发级墙钟
 	resumeMsg string             // opResume：续跑输入（默认"继续"）
 	images    []tool.ResultImage // opNewTask：本轮用户图片（Alt+V 粘贴，带外穿透；仅内存不持久化）
+	byTTL     bool               // opDestroy：TTL 到期触发（冷驻语义：destroySlot 跳过树 Finish，节点保 Idle）
 }
 
 // queuedTask 是忙碌 domain 缓冲的新任务（PendingChildren 已挂账，销毁时须补偿递减）。
@@ -110,6 +114,9 @@ type domainSlot struct {
 	suspended  bool // running 期间被会话级挂起（Park 阻塞中）
 	reuseCount int
 	taskQueue  []queuedTask
+	// dormant 冷恢复重建槽标记（restoreColdSlot）：无 supervisor 常驻 goroutine，
+	// 首个唤醒序列（dispatchToIdleSlot/wakeIdleWithTask）惰性启动并清零。
+	dormant bool
 
 	wallRemain time.Duration       // 挂起时冻结的剩余墙钟
 	wallTimer  *time.Timer         // 墙钟 timer（到期 cancel 当前任务 ctx）
@@ -439,7 +446,7 @@ func (d *Dispatcher) armTTL(s *domainSlot) {
 	s.ttlDeadline = time.Now().Add(ttl)
 	slot := s
 	s.ttlTimer = time.AfterFunc(ttl, func() {
-		slot.ops <- domainOp{kind: opDestroy}
+		slot.ops <- domainOp{kind: opDestroy, byTTL: true}
 	})
 	log.Printf("[subagent] IDLE TTL armed: sub=%s ttl=%v reuse=%d", s.id, ttl, s.reuseCount)
 }
@@ -464,7 +471,9 @@ func (d *Dispatcher) ArmIdleTTLs(sessionID string) {
 	}
 }
 
-// IdleRoster 返回 session 的热驻 domain 清单（实现 agent.IdleRosterProvider）。
+// IdleRoster 返回 session 的可复用 domain 清单（实现 agent.IdleRosterProvider）：
+// 池内热驻槽 + 树中 Status==Idle 但池内无槽的冷驻节点（TTL 到期销毁的可复活注册表
+// 条目，Cold=true）——冷驻不可见则 MetaAgent 不会发起复用，冷恢复通路即成死路。
 func (d *Dispatcher) IdleRoster(sessionID string) []agent.IdleDomainInfo {
 	if !d.hotEnabled() || sessionID == "" {
 		return nil
@@ -511,7 +520,43 @@ func (d *Dispatcher) IdleRoster(sessionID string) []agent.IdleDomainInfo {
 		s.mu.Unlock()
 		out = append(out, info)
 	}
+	// 冷驻条目：树节点 Status==Idle 但池内无槽（TTL 到期已销毁实例）。只取树元数据
+	//（无 history 读取，保持清单廉价）；复用命中时 dispatchToIdleSlot 才冷恢复。
+	if d.treeFn != nil {
+		if t := d.treeFn(sessionID); t != nil {
+			for _, n := range t.Snapshot() {
+				if n.Role != "domain" || n.Status != orchestrator.StatusIdle {
+					continue
+				}
+				if d.pool.slot(sessionID, n.ID) != nil {
+					continue // 热驻槽已在上方列出
+				}
+				out = append(out, agent.IdleDomainInfo{
+					AgentID:  n.ID,
+					Domain:   n.Domain,
+					LastTask: truncateRunes(n.Task, 100),
+					Cold:     true,
+				})
+			}
+		}
+	}
 	return out
+}
+
+// SlotAlive 报告指定 domain 的热驻槽是否存活（池内存在且未销毁）——实现
+// agent.IdleRosterProvider 的扩展方法，ReactService.ListAgents 据此给树节点
+// 实例补 Hot 字段（热驻=true；冷驻/无槽/热驻未开启=false）。
+func (d *Dispatcher) SlotAlive(sessionID, agentID string) bool {
+	if !d.hotEnabled() || sessionID == "" || agentID == "" {
+		return false
+	}
+	s := d.pool.slot(sessionID, agentID)
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state != slotDestroyed
 }
 
 // runDomainSupervisor 热驻 domain 的常驻 goroutine 主循环：
@@ -564,7 +609,12 @@ func (d *Dispatcher) runDomainSupervisor(s *domainSlot, firstTask string, firstW
 		op := <-s.ops
 		switch op.kind {
 		case opDestroy:
-			d.destroySlot(s, "destroy")
+			// TTL 到期走冷驻语义（destroySlot 跳过树 Finish，节点保 Idle 可复活）。
+			if op.byTTL {
+				d.destroySlot(s, "ttl")
+			} else {
+				d.destroySlot(s, "destroy")
+			}
 			return
 		case opResume:
 			// 挂起唤醒："继续"续跑当前任务（history 在内存，budget 由 Assemble 独立轮估）。
@@ -607,8 +657,9 @@ func (s *domainSlot) resumeWallClock() time.Duration {
 	return r
 }
 
-// destroySlot 清理槽资源：树终态由调用路径决定（TTL 到期=Finish Done；硬取消=已 Cancelled）。
-// 队列中已挂账任务补偿递减（PendingChildren 对称性）。
+// destroySlot 清理槽资源：树终态由调用路径决定（TTL 到期=冷驻，节点保 Idle 作可复活
+// 注册表条目；硬取消=已 Cancelled；失败=已 Failed）。队列中已挂账任务补偿递减
+//（PendingChildren 对称性）。
 func (d *Dispatcher) destroySlot(s *domainSlot, reason string) {
 	s.mu.Lock()
 	if s.state == slotDestroyed {
@@ -672,8 +723,10 @@ func (d *Dispatcher) destroySlot(s *domainSlot, reason string) {
 	if drainedNewTasks > 0 {
 		d.notify(s.parentID, s.id, fmt.Sprintf("子 Agent 销毁时丢弃 %d 个竞态投递的复用任务（父未决计数已补偿递减），如需继续请重新派发。", drainedNewTasks), nil)
 	}
-	// 树收尾：TTL 到期=Done（自然退役）；硬取消路径树已 Cancelled（Finish 幂等 no-op）。
-	if d.treeFn != nil && s.sessionID != "" {
+	// 树收尾：TTL 到期=冷驻——跳过 Finish，节点保持 Idle 作可复活注册表条目
+	//（reuse_agent_id 命中时 restoreColdSlot 从 agent_messages 重建槽续跑）；
+	// 其余路径（失败已 Failed/硬取消已 Cancelled）Finish 幂等 no-op，调用兜底。
+	if reason != "ttl" && d.treeFn != nil && s.sessionID != "" {
 		if t := d.treeFn(s.sessionID); t != nil {
 			t.Finish(s.id, "idle expired (TTL)", nil)
 		}
@@ -958,13 +1011,16 @@ func (d *Dispatcher) wallClockWrapUp(s *domainSlot, taskCtx context.Context, res
 }
 
 // runDomainEngine 构造/复用 ReActAgent 并驱动引擎。
-// ReActAgent 实例跨任务复用（存 s.agent）：systemPrompt 含冻结 responsibility 头，
-// 后续任务 RunWithHistory 续上下文（修复 resume 丢职责头缺口）；每次任务前重挂 running。
+// ReActAgent 实例跨任务复用（存 s.agent）：systemPrompt 含冻结 responsibility 头；
+// 每次任务前重挂 running。实例新建（freshBuild）且槽内带 history 时（冷恢复重建槽：
+// dormant 唤醒/会话 resume，history 来自 agent_messages）以 RunWithHistory 携带种子
+// 续上下文（同 ResumePaused 的 msgs 续跑口径）；热驻复用与全新首派走原 runEngine 路径。
 func (d *Dispatcher) runDomainEngine(s *domainSlot, taskCtx context.Context, task string) (agent.ReactResult, error) {
 	s.mu.Lock()
 	agentInst := s.agent
 	s.mu.Unlock()
 
+	freshBuild := false
 	if agentInst == nil {
 		sub, err := d.buildDomainAgent(s)
 		if err != nil {
@@ -974,10 +1030,24 @@ func (d *Dispatcher) runDomainEngine(s *domainSlot, taskCtx context.Context, tas
 		s.agent = sub
 		s.mu.Unlock()
 		agentInst = sub
+		freshBuild = true
 	}
 	d.running.Store(s.id, agentInst)
 
-	result, err := d.runEngine(taskCtx, agentInst, s.id, "domain", "", "", task)
+	var result agent.ReactResult
+	var err error
+	if freshBuild {
+		s.mu.Lock()
+		seed := s.history
+		s.mu.Unlock()
+		if len(seed) > 0 {
+			result, err = agentInst.RunWithHistory(taskCtx, task, seed)
+		} else {
+			result, err = d.runEngine(taskCtx, agentInst, s.id, "domain", "", "", task)
+		}
+	} else {
+		result, err = d.runEngine(taskCtx, agentInst, s.id, "domain", "", "", task)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -1238,36 +1308,69 @@ func (d *Dispatcher) RestoreSessionDomains(sessionID string) int {
 		default:
 			continue
 		}
-		if d.pool.slot(sessionID, n.ID) != nil {
-			continue // 热驻未死（同进程 resume），已有实例不重建
-		}
-		msgs, err := d.msgStore.LoadMessages(context.Background(), n.ID)
-		if err != nil {
-			log.Printf("[subagent] restore domain: load messages failed: sub=%s err=%v", n.ID, err)
+		s := d.restoreColdSlot(sessionID, n)
+		if s == nil {
 			continue
 		}
-		if len(msgs) == 0 {
-			// 落库数据不够（无 history）：不建空壳槽，冷复活走 #17 档案匹配。
-			continue
-		}
-		s := &domainSlot{
-			id:        n.ID,
-			sessionID: sessionID,
-			parentID:  n.ParentID,
-			domain:    strings.TrimSpace(n.Domain),
-			history:   msgs,
-			state:     slotIdle,
-			idleSince: now,
-			ops:       make(chan domainOp, 8),
-		}
-		d.pool.store(s)
-		// 树绑定销毁句柄（重建槽的 TTL/硬取消出口），与 dispatchHotDomain 首绑同语义。
-		t.SetCancel(n.ID, s.destroyFnLocked())
 		d.armTTL(s)
 		restored++
-		log.Printf("[subagent] RESTORE DOMAIN SLOT: sub=%s domain=%s msgs=%d status=%s", n.ID, n.Domain, len(msgs), n.Status)
+		s.mu.Lock()
+		msgN := len(s.history)
+		s.mu.Unlock()
+		log.Printf("[subagent] RESTORE DOMAIN SLOT: sub=%s domain=%s msgs=%d status=%s", n.ID, n.Domain, msgN, n.Status)
 	}
 	return restored
+}
+
+// restoreColdSlot 按树节点+agent_messages 重建冷驻 Idle 槽（TTL 冷驻/会话 resume 共用）：
+// Role==domain、池内无槽、LoadMessages 非空才建（无 history 不建空壳，返回 nil）；
+// 节点存在性/状态资格/终态时间窗由调用方过滤（RestoreSessionDomains 的未终态+
+// 终态 30min 窗口；dispatchToIdleSlot 的冷驻 Idle 复用）。建槽后 pool.store +
+// 树 SetCancel 绑销毁句柄，不 armTTL——由调用方决定（会话 resume 补 armTTL 保持原语义；
+// 复用派发由紧接的唤醒序列接管）。
+// 重建槽 dormant（无 supervisor 常驻 goroutine），首个唤醒序列惰性启动。
+// 邮箱 Reopen：TTL 销毁路径已 Purge（closed 标记），不重开则唤醒后回传/直连死信。
+func (d *Dispatcher) restoreColdSlot(sessionID string, n orchestrator.Node) *domainSlot {
+	if sessionID == "" || n.ID == "" || !d.hotEnabled() || d.msgStore == nil {
+		return nil
+	}
+	if n.Role != "domain" {
+		return nil
+	}
+	if d.pool.slot(sessionID, n.ID) != nil {
+		return nil // 热驻未死（同进程 resume），已有实例不重建
+	}
+	msgs, err := d.msgStore.LoadMessages(context.Background(), n.ID)
+	if err != nil {
+		log.Printf("[subagent] restore domain: load messages failed: sub=%s err=%v", n.ID, err)
+		return nil
+	}
+	if len(msgs) == 0 {
+		// 落库数据不够（无 history）：不建空壳槽，冷复活走 #17 档案匹配。
+		return nil
+	}
+	s := &domainSlot{
+		id:        n.ID,
+		sessionID: sessionID,
+		parentID:  n.ParentID,
+		domain:    strings.TrimSpace(n.Domain),
+		history:   msgs,
+		state:     slotIdle,
+		idleSince: time.Now(),
+		dormant:   true,
+		ops:       make(chan domainOp, 8),
+	}
+	d.pool.store(s)
+	if d.treeFn != nil {
+		if t := d.treeFn(sessionID); t != nil {
+			// 树绑定销毁句柄（重建槽的 TTL/硬取消出口），与 dispatchHotDomain 首绑同语义。
+			t.SetCancel(n.ID, s.destroyFnLocked())
+		}
+	}
+	if d.mailbox != nil {
+		d.mailbox.Reopen(n.ID)
+	}
+	return s
 }
 
 // ResumeSessionAgents 唤醒 session 全部挂起 Agent：
@@ -1337,10 +1440,26 @@ func (d *Dispatcher) DestroyAllIdle() {
 // dispatchToIdleSlot 复用派发入口（call_sub_agent reuse_agent_id 参数）：
 //   - 槽 idle：Wake（树 Idle→Running）+ opNewTask；reuseCount+1；TTL 重置满额。
 //   - 槽 busy（running/挂起）：入 taskQueue（挂账 trackChildStart），当前任务完成后自动出队。
-//   - 槽不存在/已销毁：返回错误提示新建。
+//   - 槽不存在但树节点为冷驻（Role==domain && Status==Idle）：restoreColdSlot 从
+//     agent_messages 重建 dormant 槽，落入同一 idle 唤醒序列（惰性启动 supervisor）。
+//   - 槽不存在且不可冷恢复/已销毁：返回错误提示新建。
 // 返回 subAgentID 与错误结果。
 func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgentID, task string, wallClock time.Duration, mode, verifyKind string) (string, *tool.Result) {
-	s := d.pool.slot(sessionIDFromAgentID(parentID), reuseAgentID)
+	sessionID := sessionIDFromAgentID(parentID)
+	s := d.pool.slot(sessionID, reuseAgentID)
+	if s == nil && d.treeFn != nil {
+		// 冷驻恢复（TTL 到期销毁后节点保 Idle 的可复活注册表条目）：池内无槽时
+		// 查树节点，Role==domain && Status==Idle 且有 history 则重建槽。
+		// 重建在持锁外完成，下方 idle 唤醒序列持锁复核状态，竞态安全。
+		if t := d.treeFn(sessionID); t != nil {
+			if n, ok := t.Get(reuseAgentID); ok && n.Role == "domain" && n.Status == orchestrator.StatusIdle {
+				s = d.restoreColdSlot(sessionID, n)
+				if s != nil {
+					log.Printf("[subagent] COLD RESTORE: sub=%s domain=%s (reuse dispatch)", n.ID, n.Domain)
+				}
+			}
+		}
+	}
 	if s == nil {
 		return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s not found（已销毁或不存在），请用 role_id=domain 新建", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
 	}
@@ -1439,16 +1558,44 @@ func (d *Dispatcher) dispatchToIdleSlot(ctx context.Context, parentID, reuseAgen
 		// destroySlot 排空滞留 op 的补偿递减在 s.mu 外执行，若计数留在投递后（锁外），
 		// 销毁可先补偿 -1 后计数 +1，父未决永久挂账。default 分支回滚计数并补偿递减。
 		d.trackChildStart(parentID)
-		select {
-		case s.ops <- domainOp{kind: opNewTask, task: taskText, wallClock: wallClock, images: imgs}:
-		default:
-			// ops 满（异常）：回滚计数与未决挂账。
-			s.reuseCount--
-			s.mu.Unlock()
-			d.trackChildDone(parentID)
-			return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s 指令通道满，请稍后重试", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
+		// dormant（冷恢复重建槽）：无 supervisor 常驻 goroutine，opNewTask 无消费者——
+		// 锁内置 Running + 清 dormant + 排空死信期滞留 op（RestoreSessionDomains 重建槽
+		// 武装过 TTL，timer 与停表竞态可能在飞的 opDestroy），解锁后惰性启动
+		// supervisor 以本任务为首任务直入。state=slotRunning 同时令并发复用落入队分支。
+		dormant := s.dormant
+		if dormant {
+			s.dormant = false
+			s.state = slotRunning
+		drainLoop:
+			for {
+				select {
+				case <-s.ops:
+				default:
+					break drainLoop
+				}
+			}
+		} else {
+			select {
+			case s.ops <- domainOp{kind: opNewTask, task: taskText, wallClock: wallClock, images: imgs}:
+			default:
+				// ops 满（异常）：回滚计数与未决挂账。
+				s.reuseCount--
+				s.mu.Unlock()
+				d.trackChildDone(parentID)
+				return "", &tool.Result{Error: fmt.Sprintf("reuse_agent_id %s 指令通道满，请稍后重试", reuseAgentID), Category: tool.ResultCategoryValidationRejected}
+			}
 		}
 		s.mu.Unlock()
+		if dormant {
+			// 与 dispatchHotDomain 同口径：巡检元数据（runDomainTask 入口换绑真实 cancel）+
+			// panic 兜底，supervisor 常驻 goroutine 惰性启动（首任务即本次复用任务）。
+			d.subMeta.Store(s.id, &subAgentMeta{parentID: s.parentID, sessionID: s.sessionID, wallClock: wallClock})
+			d.ensurePatrol()
+			go func() {
+				defer d.recoverSlotPanic(s)
+				d.runDomainSupervisor(s, taskText, wallClock, imgs)
+			}()
+		}
 		// 活动恢复（心跳豁免解除）：enterIdle 已 Delete 旧条目，Load 必落空，须重建。
 		d.rearmSlotActivity(s.id)
 		log.Printf("[subagent] REUSE: sub=%s domain=%s reuse=%d task_len=%d", s.id, s.domain, s.reuseCount, len(task))
@@ -1538,15 +1685,40 @@ func (d *Dispatcher) wakeIdleWithTask(agentID, taskText, ledgerVerb, parentNote 
 	// P0-2d：未决计数与 opNewTask 投递同事务（口径同 dispatchToIdleSlot idle 分支）；
 	// default 分支回滚计数并补偿递减。
 	d.trackChildStart(s.parentID)
-	select {
-	case s.ops <- domainOp{kind: opNewTask, task: taskText}:
-	default:
-		s.reuseCount--
-		s.mu.Unlock()
-		d.trackChildDone(s.parentID)
-		return fmt.Errorf("%w: 热驻槽 %s 指令通道满，请稍后重试", agent.ErrAgentNotDirectable, agentID)
+	// dormant（冷恢复重建槽）：无 supervisor 常驻 goroutine——锁内置 Running + 清
+	// dormant + 排空死信期滞留 op，解锁后惰性启动 supervisor（首任务即本次任务）。
+	// 口径同 dispatchToIdleSlot idle 分支的 dormant 处理。
+	dormant := s.dormant
+	if dormant {
+		s.dormant = false
+		s.state = slotRunning
+	drainLoop:
+		for {
+			select {
+			case <-s.ops:
+			default:
+				break drainLoop
+			}
+		}
+	} else {
+		select {
+		case s.ops <- domainOp{kind: opNewTask, task: taskText}:
+		default:
+			s.reuseCount--
+			s.mu.Unlock()
+			d.trackChildDone(s.parentID)
+			return fmt.Errorf("%w: 热驻槽 %s 指令通道满，请稍后重试", agent.ErrAgentNotDirectable, agentID)
+		}
 	}
 	s.mu.Unlock()
+	if dormant {
+		d.subMeta.Store(s.id, &subAgentMeta{parentID: s.parentID, sessionID: s.sessionID})
+		d.ensurePatrol()
+		go func() {
+			defer d.recoverSlotPanic(s)
+			d.runDomainSupervisor(s, taskText, 0, nil)
+		}()
+	}
 
 	// 父未决计数已在上方临界区内与 opNewTask 投递同事务挂账（P0-2d），
 	// 完成时 trackChildDoneOnce 配对递减。

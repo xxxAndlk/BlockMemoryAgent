@@ -1635,9 +1635,18 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 		final = resp
 		// 思考过程增量（provider 经 Metadata 传递）：瞬时推送，答复文本开始输出后由
 		// 上层清除；思考内容不进入答复文本，避免与正式输出混淆。
+		// Anthropic 用 "thinking" 键（独立思考块，本帧无正文，跳过安全）。
 		if thinking, ok := resp.Message.Metadata["thinking"].(string); ok && thinking != "" {
 			a.emitLive(LiveEvent{Kind: LiveEventThinkDelta, Text: thinking})
 			continue
+		}
+		// OpenAI 系（deepseek/ark/glm 等 openai 兼容端点）用 "reasoning_content" 键
+		//（provider_openai_chat/responses 累积写入）。此前只认 "thinking"，该键从未被
+		// 消费 → OpenAI 系模型既无实时思考也无 think 事件（2026-09-26 实证）。
+		// 不 continue：这类 provider 单帧可同时携带累积正文（下方按前缀去重吸收），
+		// 跳过会丢本帧文本增量（末帧丢失无法由后续帧补回）。
+		if reasoning, ok := resp.Message.Metadata["reasoning_content"].(string); ok && reasoning != "" {
+			a.emitLive(LiveEvent{Kind: LiveEventThinkDelta, Text: reasoning})
 		}
 		text := bladesText(resp.Message)
 		if text == "" {

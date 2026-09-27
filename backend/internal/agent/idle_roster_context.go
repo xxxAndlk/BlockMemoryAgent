@@ -81,6 +81,9 @@ func idleStateLabel(info IdleDomainInfo) string {
 	if info.Busy {
 		return "忙碌中"
 	}
+	if info.Cold {
+		return "空闲可复用（已休眠，复用将自动唤醒并恢复上下文）"
+	}
 	return "空闲可复用"
 }
 

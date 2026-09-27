@@ -75,6 +75,7 @@ const showStatusLine = computed(() =>
       <MessageList :events="events" :verbose="false" :clarify="clarify" :agents="agents"
                    :clarify-ack="clarifyAck" :clarify-drafts="clarifyDrafts"
                    :session-id="session?.id || ''"
+                   :first-goal="session?.goal || ''"
                    :session-status="session?.status"
                    :live-streaming="liveStreaming" :live-thinking="liveThinking"
                    :prior-replies="priorReplies" :mails="mails"

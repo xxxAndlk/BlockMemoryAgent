@@ -93,6 +93,32 @@ function nodeColor(type: string) {
   if (type === 'assistant') return 'text-emerald-400'
   return 'text-ink-2'
 }
+
+/** 切换条活/死指示：hot 缺失（旧后端）不额外标注；其余按 status+hot 给圆点与文案。 */
+const TERMINAL_STATUS = new Set(['done', 'failed', 'error', 'cancelled', 'delivered-unverified'])
+interface NodeLiveBadge { dot: string; text: string }
+
+function nodeLiveBadge(a: AgentNode): NodeLiveBadge | null {
+  if (a.hot === undefined) return null
+  if (a.status === 'running') return { dot: 'bg-green-500 animate-pulse', text: '运行中' }
+  if (a.status === 'idle') {
+    return a.hot
+      ? { dot: 'bg-yellow-500', text: '热驻' } // 可唤醒
+      : { dot: 'bg-ink-3', text: '休眠' } // 已销毁，复用时自动冷恢复
+  }
+  if (TERMINAL_STATUS.has(a.status)) return { dot: 'bg-ink-3', text: '已结束' }
+  return null // 未覆盖状态（paused 等）不强行归类
+}
+
+/** inst_id → 活/死徽标，模板按 key 取值避免重复计算。 */
+const liveBadges = computed(() => {
+  const m = new Map<string, NodeLiveBadge>()
+  for (const a of chain.value) {
+    const b = nodeLiveBadge(a)
+    if (b) m.set(a.inst_id, b)
+  }
+  return m
+})
 </script>
 
 <template>
@@ -133,8 +159,12 @@ function nodeColor(type: string) {
       <template v-for="(a, i) in chain" :key="a.inst_id">
         <button class="whitespace-nowrap rounded px-1 transition-colors hover:bg-page"
                 :class="[nodeColor(a.type), a.inst_id === selectedId ? 'font-bold ring-1 ring-primary' : '']"
-                title="查看该 Agent 的对话与监控"
-                @click="handleChainClick(a)">{{ a.name }}</button>
+                :title="`查看该 Agent 的对话与监控${liveBadges.get(a.inst_id) ? ' · ' + liveBadges.get(a.inst_id)!.text : ''}`"
+                @click="handleChainClick(a)">
+          <span v-if="liveBadges.get(a.inst_id)"
+                class="inline-block w-1.5 h-1.5 rounded-full align-middle mr-1"
+                :class="liveBadges.get(a.inst_id)!.dot"></span>{{ a.name }}<span v-if="liveBadges.get(a.inst_id)"
+                class="text-[10px] text-ink-3 ml-0.5">{{ liveBadges.get(a.inst_id)!.text }}</span></button>
         <el-icon v-if="i < chain.length - 1" class="text-ink-3 text-[10px]"><ArrowRight /></el-icon>
       </template>
     </div>

@@ -17,6 +17,8 @@ import (
 
 	// enums 提供会话状态等枚举常量。
 	"github.com/blockmemory/agent/backend/pkg/enums"
+	// eventkind 提供事件类型常量（user_message / system 等）。
+	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	// blades 提供可编程的模型消息与 provider 接口。
 	"github.com/go-kratos/blades"
 
@@ -127,6 +129,57 @@ func TestReactService_CreateAndGet(t *testing.T) {
 	// 最终结果应等于 mock provider 返回的文本。
 	if got.Result != "hello world" {
 		t.Errorf("Result = %q, want %q", got.Result, "hello world")
+	}
+}
+
+// TestReactService_CreateSessionEmitsUserMessageEvent 验证新建会话把首条消息（goal）
+// 落成 user_message 事件：Web 聊天面板只从事件流渲染用户气泡与首回合容器，缺该事件时
+// 首条消息仅存在于标题（goal）永不展示、首轮流式文本无处渲染（2026-09-26 实证）。
+// 事件顺序固定：会话启动 → user_message（runSession 同 goroutine 顺序落，无交错）。
+func TestReactService_CreateSessionEmitsUserMessageEvent(t *testing.T) {
+	llm := &mockReactModelProvider{
+		responses: []*blades.Message{
+			blades.AssistantMessage("hello"),
+		},
+	}
+	svc := newReactServiceForTest(llm, t.TempDir())
+	ctx := context.Background()
+
+	created, err := svc.CreateSession(ctx, CreateRequest{Goal: "完成TODO.md中的任务"})
+	if err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+
+	// 轮询最多 2 秒，等待会话执行完成（终态后事件流稳定）。
+	deadline := time.Now().Add(2 * time.Second)
+	var got *Session
+	for time.Now().Before(deadline) {
+		got, err = svc.Get(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("Get error: %v", err)
+		}
+		if got.Status == string(enums.SessionStatusCompleted) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 首事件应为「会话启动」锚点，紧随其后应为 goal 的 user_message 事件。
+	if len(got.Events) < 2 {
+		t.Fatalf("expected >=2 events (启动锚点 + user_message), got %d", len(got.Events))
+	}
+	if got.Events[0].Type != eventkind.System || !strings.HasPrefix(got.Events[0].Message, "会话启动") {
+		t.Errorf("events[0] = {%q %q}, want system 会话启动", got.Events[0].Type, got.Events[0].Message)
+	}
+	um := got.Events[1]
+	if um.Type != eventkind.UserMessage {
+		t.Errorf("events[1].Type = %q, want %q", um.Type, eventkind.UserMessage)
+	}
+	if um.Agent != "User" {
+		t.Errorf("events[1].Agent = %q, want User", um.Agent)
+	}
+	if um.Message != "完成TODO.md中的任务" {
+		t.Errorf("events[1].Message = %q, want goal 原文", um.Message)
 	}
 }
 

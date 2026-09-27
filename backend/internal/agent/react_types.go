@@ -334,13 +334,16 @@ type IdleDomainInfo struct {
 	ReuseCount   int           `json:"reuse_count"`              // ReuseCount 已被复用次数（权重）
 	IdleLeft     time.Duration `json:"idle_left"`                // IdleLeft 加权倒计时剩余（未武装为 0）
 	Busy         bool          `json:"busy"`                     // Busy 正在执行任务（派发将入队）
+	Cold         bool          `json:"cold"`                     // Cold 冷驻（TTL 到期实例已销毁，树节点保 Idle；复用将自动唤醒并从 agent_messages 恢复上下文）
 }
 
 // IdleRosterProvider 抽象"查询某 session 的热驻 Idle DomainAgent 清单"，
 // 由 subagent.Dispatcher 实现。ReactService 组装 MetaAgent 记忆管线时轮询注入
 // 【空闲领域Agent】上下文段，MetaAgent 据此自主判定强相关复用 vs 弱相关新建。
+// SlotAlive 供 ListAgents 给树节点实例补 Hot 字段（区分活实例与冷驻/历史节点）。
 type IdleRosterProvider interface {
 	IdleRoster(sessionID string) []IdleDomainInfo
+	SlotAlive(sessionID, agentID string) bool
 }
 
 // IdleTTLArmer 由 subagent.Dispatcher 实现：武装全部 Idle domain 的加权销毁倒计时。

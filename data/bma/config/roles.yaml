@@ -53,7 +53,7 @@ meta_agent:
   # 保留读三件（ReadFile/EditFile/RestoreFile）+ SearchInFiles（新增：汇总阶段复核交付物）。
   # 插件工具（web_search 等）不经此列表：由 role_tool_gate 硬门闭包按"角色可见"并集放行
   #（bootstrap.go），Schema 可见性仍走 白名单 ∪（可见 ∧ 已挂载）软过滤。
-  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, write_plan, submit_plan, review_plan, ReadFile, EditFile, RestoreFile, SearchInFiles, ShowArtifact, list_skills, load_skill]
+  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, schedule_task, write_plan, submit_plan, review_plan, ReadFile, EditFile, RestoreFile, SearchInFiles, ShowArtifact, list_skills, load_skill]
 
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:

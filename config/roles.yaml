@@ -56,7 +56,7 @@ meta_agent:
   # 确认不可用，非任务循环）。
   # 插件工具（web_search 等）不经此列表：由 role_tool_gate 硬门闭包按"角色可见"并集放行
   #（bootstrap.go），Schema 可见性仍走 白名单 ∪（可见 ∧ 已挂载）软过滤。
-  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, write_plan, submit_plan, review_plan, ReadFile, EditFile, RestoreFile, WriteFile, RunCommand, ReadMedia, SearchInFiles, ListDir, ShowArtifact, list_skills, load_skill, tool_catalog, tool_mount, list_models, set_role_model, set_agent_model, expand_memory]
+  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, schedule_task, write_plan, submit_plan, review_plan, ReadFile, EditFile, RestoreFile, WriteFile, RunCommand, ReadMedia, SearchInFiles, ListDir, ShowArtifact, list_skills, load_skill, tool_catalog, tool_mount, list_models, set_role_model, set_agent_model, expand_memory]
 
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:

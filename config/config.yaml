@@ -145,9 +145,9 @@ agent:
 
   # -- DomainAgent 热驻留 + 复用权重 --
   domain_hot_resident_enabled: true  # DomainAgent 热驻留总开关：true 时 domain 任务完成/用户停止后转 Idle 热驻（goroutine 挂起等复用，复用经 call_sub_agent(reuse_agent_id=X)），false=旧行为（完成即销毁）
-  domain_idle_base_ttl_min: 30        # Idle 基础寿命（分钟）：任务完成（父收到回传）即开始销毁倒计时的存活基数
-  domain_idle_extend_on_reuse_min: 30 # 每次成功复用延长量：复用时 reuse_count+1 且 TTL 重置为 min(base+reuse*extend, max)
-  domain_idle_max_ttl_min: 240        # 加权倒计时上限（分钟）
+  domain_idle_base_ttl_min: 10        # Idle 基础寿命（分钟）：任务完成（父收到回传）即开始销毁倒计时的存活基数；到期转冷驻（实例销毁、树节点保 Idle 可经 reuse_agent_id 冷恢复）
+  domain_idle_extend_on_reuse_min: 10 # 每次成功复用延长量：复用时 reuse_count+1 且 TTL 重置为 min(base+reuse*extend, max)
+  domain_idle_max_ttl_min: 60         # 加权倒计时上限（分钟）
   domain_idle_max_per_session: 4      # 单 session 热驻 domain 上限；超限新 domain 进 Idle 前 LRU 淘毁最旧 idle
   domain_idle_task_queue_len: 4       # 忙碌 domain 新任务缓冲上限；超限拒绝派发提示父 Agent 稍后重派
   domain_reuse_roster_inject: true    # 向 MetaAgent 上下文注入【空闲领域Agent】清单（ID/方向/reuse_count/剩余寿命），由其自主判定强相关复用 vs 弱相关新建

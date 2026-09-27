@@ -2577,6 +2577,7 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 			RoleType: enums.RoleTypeMeta,
 			Status:   status,
 			ModuleID: "meta",
+			Hot:      true, // meta 根节点恒存活
 		},
 	}
 	// 权威树快照 → 实例视图：ModuleID=节点 ID，ParentID=父节点 ID（顶层挂 meta）。
@@ -2601,6 +2602,11 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 			Domain:    n.Domain,
 			Goal:      n.Task,
 			RoleDefID: n.Role,
+		}
+		// 热驻存活标记（Domain 热驻）：区分活实例与冷驻（TTL 到期销毁、节点保 Idle
+		// 待冷恢复）/终态历史节点；provider 未注入（热驻未开启）时恒 false。
+		if s.idleRosterProvider != nil {
+			inst.Hot = s.idleRosterProvider.SlotAlive(sessionID, n.ID)
 		}
 		// 活动证据展示面（TODO 第10项②）：运行中节点附"最近活动种类 + 距今时长"，
 		// TUI/Web 渲染为 "in <tool> · active Xs ago"，让假死可见可判。
@@ -3223,6 +3229,13 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 
 	// 记录会话启动事件。
 	s.store.addEvent(session, eventkind.System, "System", "会话启动", "", "", "", "", "", true)
+	// 首条消息（goal）落 user_message 事件：Web 聊天面板只从事件流渲染用户气泡与
+	// 首回合容器——缺此事件时首条消息仅存在于 goal（标题）与 Messages（前端不读），
+	// 永不展示；首轮流式文本也因无回合容器无处渲染（2026-09-26 实证，与
+	// sendMessageFull 的用户消息事件同形状）。空 goal（理论边界）不落。
+	if session.Goal != "" {
+		s.store.addEvent(session, eventkind.UserMessage, "User", session.Goal, "", "", "", "", "", true)
+	}
 
 	// 轮开始落库 running 状态行（009 status 列；History 为空时 persistFullHistory 自动跳过）：
 	// 进程在本轮中途崩溃/断电时，重启恢复逻辑依据库中 running 状态把会话标记为"因服务重启中断"，

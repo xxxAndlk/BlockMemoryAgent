@@ -194,6 +194,9 @@ export interface AgentNode {
   domain: string
   status: string
   parent_id: string
+  /** 实例活性（2026-09 后端新增）：true=活着（运行中或热驻 idle 可直接唤醒），
+   *  false=冷驻（已销毁可复活）或终态；缺失=旧后端，前端不额外标注。 */
+  hot?: boolean
   goal?: string
   block_id?: string
   /** 活动证据：最近活动种类（llm_start/tool:<名>/stream 等），空=无监控条目 */

@@ -107,6 +107,73 @@ func TestReActAgent_Streaming_CumulativeChunks(t *testing.T) {
 	}
 }
 
+// TestReActAgent_Streaming_ReasoningContent 验证 OpenAI 系 provider 的思考键
+// reasoning_content 被消费为 think_delta：此前只认 Anthropic 的 "thinking" 键，
+// deepseek/ark/glm 等 openai 兼容端点的实时思考与 think 事件恒空（2026-09-26 实证）。
+// 同时验证这类 provider 单帧可同时携带累积正文，思考分支不得跳过本帧文本。
+func TestReActAgent_Streaming_ReasoningContent(t *testing.T) {
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	a := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "s"},
+		&reasoningStreamProvider{}, NewToolRegistryAdapter(reg))
+
+	var thinks, texts []string
+	a.WithLiveEvents(func(ev LiveEvent) {
+		switch ev.Kind {
+		case LiveEventThinkDelta:
+			thinks = append(thinks, ev.Text)
+		case LiveEventLLMDelta:
+			texts = append(texts, ev.Text)
+		}
+	})
+
+	res, err := a.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Text != "答" {
+		t.Fatalf("final text = %q, want %q", res.Text, "答")
+	}
+	// reasoning_content 应逐帧产生 think_delta（累积快照），末帧为全量推理。
+	if len(thinks) == 0 {
+		t.Fatal("reasoning_content 应产生 think_delta 事件，got 0 条")
+	}
+	if thinks[len(thinks)-1] != "想清楚了" {
+		t.Fatalf("末帧思考 = %q, want %q", thinks[len(thinks)-1], "想清楚了")
+	}
+	// 携带正文的同帧不得被思考分支跳过（不 continue）：正文增量仍要推送。
+	if len(texts) == 0 || texts[len(texts)-1] != "答" {
+		t.Fatalf("正文增量被跳过: texts = %v", texts)
+	}
+}
+
+// reasoningStreamProvider 模拟 openai 兼容端点的流式行为：思考经 Metadata
+// ["reasoning_content"] 累积传递，且单帧可同时携带累积正文（provider_openai_chat.go
+// 的 reasoningBuf + contentBuf 同帧 yield）。第二帧即"思考+正文同帧"关键场景。
+type reasoningStreamProvider struct{}
+
+func (p *reasoningStreamProvider) Name() string { return "mock-reasoning" }
+
+func (p *reasoningStreamProvider) Generate(ctx context.Context, req *blades.ModelRequest) (*blades.ModelResponse, error) {
+	return &blades.ModelResponse{Message: blades.AssistantMessage("答")}, nil
+}
+
+func (p *reasoningStreamProvider) NewStreaming(ctx context.Context, req *blades.ModelRequest) blades.Generator[*blades.ModelResponse, error] {
+	return func(yield func(*blades.ModelResponse, error) bool) {
+		// 帧1：仅推理。
+		m1 := blades.AssistantMessage("")
+		m1.Metadata = map[string]any{"reasoning_content": "想"}
+		yield(&blades.ModelResponse{Message: m1}, nil)
+		// 帧2：推理 + 正文同帧（关键：思考分支不得 continue 吃掉正文）。
+		m2 := blades.AssistantMessage("答")
+		m2.Metadata = map[string]any{"reasoning_content": "想清楚了"}
+		yield(&blades.ModelResponse{Message: m2}, nil)
+		// 末帧：全量响应。
+		final := blades.AssistantMessage("答")
+		final.Metadata = map[string]any{"reasoning_content": "想清楚了"}
+		yield(&blades.ModelResponse{Message: final}, nil)
+	}
+}
+
 // TestReActAgent_SubAgentDoneEvent 验证 mailbox 收到子 Agent 摘要时会推送
 // LiveEventSubAgentDone 实时事件（Tool 字段为子 Agent ID）。
 func TestReActAgent_SubAgentDoneEvent(t *testing.T) {

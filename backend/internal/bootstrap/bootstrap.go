@@ -993,6 +993,60 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 第十九步：创建 DAG HTTP 处理器。
 	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
 
+	// schedule_task 工具接线（2026-09-27）：MetaAgent 创建/更新定时任务的入口。
+	// cron 合法性在此校验（标准 5 段或 Ns/Nm/Nh 相对间隔），upsert 走 dag.Store；
+	// 调度器未启用（dag_enabled=false）时返回明确错误。
+	toolRegistry.SetScheduleTaskHook(func(ctx context.Context, spec tool.ScheduleTaskSpec) (string, error) {
+		if dagScheduler == nil {
+			return "", fmt.Errorf("DAG 调度未启用（config dag_enabled=false），无法创建定时任务")
+		}
+		var nextFire time.Time
+		if spec.Cron != "" {
+			if sched, err := dag.ParseCron(spec.Cron); err == nil {
+				nextFire = sched.Next(time.Now())
+			} else if iv, err2 := dag.ParseInterval(spec.Cron); err2 == nil {
+				nextFire = time.Now().Add(iv)
+			} else {
+				return "", fmt.Errorf("调度规则非法: %s（支持标准 5 段 cron 如 0 9 * * *，或相对间隔 30m/24h）", spec.Cron)
+			}
+		}
+		now := time.Now()
+		if spec.ID == "" {
+			// 新建：单节点 DAG，节点 id 固定 main。
+			d := &types.DAG{
+				ID:      fmt.Sprintf("dag-%d", now.UnixMilli()),
+				Name:    spec.Name,
+				Cron:    spec.Cron,
+				Enabled: spec.Enabled,
+				Tasks: []*types.Task{{
+					ID: "main", Goal: spec.Goal, Status: types.TaskStatusPending,
+				}},
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+			if err := pgStore.SaveDAG(ctx, d); err != nil {
+				return "", err
+			}
+			return scheduleTaskSummary("已创建定时任务", d.ID, spec, nextFire), nil
+		}
+		// 更新：只改名称/调度/启用；goal 仅对单节点任务可改（多节点请到页面编辑）。
+		d, err := pgStore.GetDAG(ctx, spec.ID)
+		if err != nil {
+			return "", fmt.Errorf("任务不存在: %s", spec.ID)
+		}
+		d.Name, d.Cron, d.Enabled = spec.Name, spec.Cron, spec.Enabled
+		if len(d.Tasks) == 1 {
+			d.Tasks[0].Goal = spec.Goal
+		} else {
+			return "", fmt.Errorf("任务 %s 有 %d 个节点，多节点任务请到「定时任务」页面编辑", spec.ID, len(d.Tasks))
+		}
+		d.UpdatedAt = now
+		if err := pgStore.SaveDAG(ctx, d); err != nil {
+			return "", err
+		}
+		return scheduleTaskSummary("已更新定时任务", d.ID, spec, nextFire), nil
+	})
+
 	// 经验技能库整理器（C 库存治理）：每日随数据维护 tick 自动跑（达阈值才动手），
 	// 也可经 POST /api/skills/consolidate 手动触发（忽略阈值）。
 	skillCons := newSkillConsolidator(pgStore.LearnedSkills, skillPool, modelFactory, cfg.Skills.ConsolidateThreshold)
@@ -1285,6 +1339,22 @@ func newHistorySummarizer(f *model.ModelFactory) memory.HistorySummarizer {
 
 // registryStartupWarnings 检查注册表绑定引用的模型条目是否存在，
 // 缺失的返回警告列表（运行期 resolveConfig 对这些绑定 fail-open 回落角色配置）。
+// scheduleTaskSummary 生成 schedule_task 工具的人类可读结果摘要。
+func scheduleTaskSummary(verb, id string, spec tool.ScheduleTaskSpec, nextFire time.Time) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s: id=%s 名称=%q 状态=%s", verb, id, spec.Name, map[bool]string{true: "启用", false: "停用"}[spec.Enabled])
+	if spec.Cron == "" {
+		sb.WriteString(" 调度=仅手动触发")
+	} else {
+		fmt.Fprintf(&sb, " 调度=%s", spec.Cron)
+	}
+	if !nextFire.IsZero() {
+		fmt.Fprintf(&sb, " 下次触发=%s", nextFire.Format("2006-01-02 15:04"))
+	}
+	sb.WriteString("。用户可在「定时任务」页面查看/暂停/删除/手动触发。")
+	return sb.String()
+}
+
 func registryStartupWarnings(reg *pkgconfig.RegistryStore) []string {
 	var warns []string
 	for roleID, b := range reg.Bindings() {

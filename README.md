@@ -197,7 +197,7 @@ zerolog 实现，console/json 两种格式；error 级别可附调用栈（`logg
 
 ### 8. DAG 调度（`internal/dag/`）
 
-`agent.dag_enabled` 默认开启。调度器轮询 `dag_jobs` 表，支持标准 5 段 cron（robfig/cron，`0 9 * * *` 表每天 9 点）与简易间隔（`Ns`/`Nm`/`Nh`），按 `depends_on` 依赖把 task 派发为新会话；tick 轮询 task 会话终态推进下游并回写运行态，全部终态后清理运行实例。HTTP 端点：`GET/POST /api/dag`、`GET/DELETE /api/dag/{id}`、`POST /api/dag/{id}/trigger`、`GET /api/dag/running`。Web 端「定时任务」页（`/dag`）可视化创建/触发/查看运行快照。已知限制：无失败自动重试、无断点续跑（重启后重新整体触发）、保存 DAG 会重置触发计时基准。
+`agent.dag_enabled` 默认开启。调度器轮询 `dag_jobs` 表，支持标准 5 段 cron（robfig/cron，`0 9 * * *` 表每天 9 点）与简易间隔（`Ns`/`Nm`/`Nh`），按 `depends_on` 依赖把 task 派发为新会话；tick 轮询 task 会话终态推进下游并回写运行态，全部终态后清理运行实例。HTTP 端点：`GET/POST /api/dag`、`GET/DELETE /api/dag/{id}`、`POST /api/dag/{id}/trigger`、`GET /api/dag/running`。Web 端「定时任务」页（`/dag`）可视化创建/触发/查看运行快照；MetaAgent 也可用内置 `schedule_task` 工具直接创建/更新单节点定时任务（「每天X点做Y」类需求的正典入口）。已知限制：无失败自动重试、无断点续跑（重启后重新整体触发）、保存 DAG 会重置触发计时基准。
 
 ---
 

@@ -81,6 +81,10 @@ const dialogVisible = ref(false)
 const saving = ref(false)
 const editing = ref(false)
 const form = ref<DagJob>(emptyForm())
+// 简单模式（默认）：名称 + 任务描述 + 时间选择，后端落单节点 DAG；
+// 高级模式：多节点 DAG 编辑器（编辑多节点任务时自动进入）。
+const advanced = ref(false)
+const description = ref('')
 
 function emptyForm(): DagJob {
   return {
@@ -96,8 +100,11 @@ function emptyForm(): DagJob {
 
 function openCreate() {
   editing.value = false
+  advanced.value = false
+  description.value = ''
   form.value = emptyForm()
   form.value.tasks.push(emptyTask())
+  resetSchedule()
   dialogVisible.value = true
 }
 
@@ -106,6 +113,10 @@ function openEdit(d: DagJob) {
   // 深拷贝，避免编辑过程中直接改到列表数据
   form.value = JSON.parse(JSON.stringify(d))
   form.value.tasks = form.value.tasks || []
+  // 单节点任务走简单模式；多节点自动进入高级模式
+  advanced.value = form.value.tasks.length > 1
+  description.value = form.value.tasks.length === 1 ? form.value.tasks[0].goal : ''
+  parseCronToForm(form.value.cron)
   dialogVisible.value = true
 }
 
@@ -126,10 +137,125 @@ function depOptions(row: DagTask): string[] {
   return form.value.tasks.map(t => t.id).filter(id => id && id !== row.id)
 }
 
-/** 保存前校验：名称、至少一个任务、id 非空不重复、依赖引用存在。 */
+// ---------- 调度规则：友好选择 <-> cron 互转 ----------
+type SchedMode = 'manual' | 'daily' | 'weekly' | 'monthly' | 'interval' | 'cron'
+const schedMode = ref<SchedMode>('daily')
+const schedTime = ref('09:00')
+const schedWeekDays = ref<number[]>([1])
+const schedMonthDay = ref(1)
+const intervalNum = ref(30)
+const intervalUnit = ref<'m' | 'h'>('h')
+
+const weekDayOptions = [
+  { value: 1, label: '周一' },
+  { value: 2, label: '周二' },
+  { value: 3, label: '周三' },
+  { value: 4, label: '周四' },
+  { value: 5, label: '周五' },
+  { value: 6, label: '周六' },
+  { value: 0, label: '周日' },
+]
+
+function resetSchedule() {
+  schedMode.value = 'daily'
+  schedTime.value = '09:00'
+  schedWeekDays.value = [1]
+  schedMonthDay.value = 1
+  intervalNum.value = 30
+  intervalUnit.value = 'h'
+}
+
+function pad2(n: number | string): string {
+  return String(n).padStart(2, '0')
+}
+
+/** 当前选择对应的 cron 表达式（对话框实时预览 + 保存时写入）。 */
+function buildCron(): string {
+  const [h, m] = (schedTime.value || '09:00').split(':').map(Number)
+  switch (schedMode.value) {
+    case 'manual':
+      return ''
+    case 'daily':
+      return `${m || 0} ${h || 0} * * *`
+    case 'weekly': {
+      const ds = [...schedWeekDays.value].sort((a, b) => a - b)
+      return `${m || 0} ${h || 0} * * ${ds.join(',')}`
+    }
+    case 'monthly':
+      return `${m || 0} ${h || 0} ${schedMonthDay.value} * *`
+    case 'interval':
+      return `${intervalNum.value}${intervalUnit.value}`
+    case 'cron':
+      return form.value.cron.trim()
+  }
+}
+
+/** 编辑时把已有 cron 反解到选择器；认不出的落入「cron 表达式」模式原样编辑。 */
+function parseCronToForm(cron: string) {
+  resetSchedule()
+  const c = (cron || '').trim()
+  if (!c) {
+    schedMode.value = 'manual'
+    return
+  }
+  let m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* \*$/)
+  if (m) {
+    schedMode.value = 'daily'
+    schedTime.value = `${pad2(+m[2])}:${pad2(+m[1])}`
+    return
+  }
+  m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* ([\d,]+)$/)
+  if (m) {
+    schedMode.value = 'weekly'
+    schedTime.value = `${pad2(+m[2])}:${pad2(+m[1])}`
+    schedWeekDays.value = m[3].split(',').map(Number)
+    return
+  }
+  m = c.match(/^(\d{1,2}) (\d{1,2}) (\d{1,2}) \* \*$/)
+  if (m) {
+    schedMode.value = 'monthly'
+    schedTime.value = `${pad2(+m[2])}:${pad2(+m[1])}`
+    schedMonthDay.value = +m[3]
+    return
+  }
+  m = c.match(/^(\d+)([mh])$/)
+  if (m) {
+    schedMode.value = 'interval'
+    intervalNum.value = +m[1]
+    intervalUnit.value = m[2] as 'm' | 'h'
+    return
+  }
+  schedMode.value = 'cron'
+}
+
+/** 列表页调度规则的人类可读描述。 */
+function describeCron(cron: string): string {
+  const c = (cron || '').trim()
+  if (!c) return '仅手动'
+  let m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* \*$/)
+  if (m) return `每天 ${pad2(+m[2])}:${pad2(+m[1])}`
+  m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* ([\d,]+)$/)
+  if (m) {
+    const names = '日一二三四五六'
+    return `每周${m[3].split(',').map(d => names[+d]).join('、')} ${pad2(+m[2])}:${pad2(+m[1])}`
+  }
+  m = c.match(/^(\d{1,2}) (\d{1,2}) (\d{1,2}) \* \*$/)
+  if (m) return `每月 ${+m[3]} 日 ${pad2(+m[2])}:${pad2(+m[1])}`
+  m = c.match(/^(\d+)([mh])$/)
+  if (m) return `每隔 ${+m[1]} ${m[2] === 'm' ? '分钟' : '小时'}`
+  return c
+}
+
+/** 保存前校验：名称必填；简单模式校验描述；高级模式校验节点图。 */
 function validate(): string | null {
   const f = form.value
   if (!f.name.trim()) return '请填写任务名称'
+  if (schedMode.value === 'weekly' && !schedWeekDays.value.length) return '请选择每周的哪几天'
+  if (schedMode.value === 'interval' && (!intervalNum.value || intervalNum.value <= 0)) return '间隔必须为正整数'
+  if (!advanced.value) {
+    if (!description.value.trim()) return '请填写任务描述'
+    return null
+  }
   if (!f.tasks.length) return '至少需要一个任务节点'
   const ids = new Set<string>()
   for (const t of f.tasks) {
@@ -154,8 +280,17 @@ async function save() {
   }
   saving.value = true
   try {
+    const payload = { ...form.value, cron: buildCron() }
+    if (!advanced.value) {
+      // 简单模式：落单节点；编辑已有单节点任务时保留原节点 id/状态
+      const node: DagTask =
+        editing.value && form.value.tasks.length === 1
+          ? { ...form.value.tasks[0], goal: description.value.trim() }
+          : { id: 'main', goal: description.value.trim(), depends_on: [], status: 'pending', session_id: '' }
+      payload.tasks = [node]
+    }
     // 保存后后端刷新 updated_at，cron 以此刻为基准重新计时
-    const saved = await saveDag(form.value)
+    const saved = await saveDag(payload)
     const idx = dags.value.findIndex(x => x.id === saved.id)
     if (idx >= 0) dags.value[idx] = saved
     else dags.value.push(saved)
@@ -232,9 +367,10 @@ onMounted(load)
           <div class="text-[10px] text-ink-3 font-mono">{{ row.id }}</div>
         </template>
       </el-table-column>
-      <el-table-column label="调度规则" width="140">
+      <el-table-column label="调度规则" width="150">
         <template #default="{ row }">
-          <span class="font-mono text-xs">{{ row.cron || '仅手动' }}</span>
+          <div class="text-xs text-ink">{{ describeCron(row.cron) }}</div>
+          <div v-if="row.cron && describeCron(row.cron) !== row.cron" class="font-mono text-[10px] text-ink-3">{{ row.cron }}</div>
         </template>
       </el-table-column>
       <el-table-column label="任务数" width="80" align="center">
@@ -275,23 +411,81 @@ onMounted(load)
       top="6vh"
     >
       <el-form label-width="90px" label-position="left">
-        <el-form-item label="ID">
+        <el-form-item v-if="advanced || editing" label="ID">
           <el-input v-model="form.id" :disabled="editing" class="font-mono" />
         </el-form-item>
-        <el-form-item label="名称" required>
-          <el-input v-model="form.name" placeholder="例如：每日视频流水线" />
+        <el-form-item label="任务名称" required>
+          <el-input v-model="form.name" placeholder="例如：每日 AI 新闻日报" />
         </el-form-item>
-        <el-form-item label="调度规则">
-          <el-input v-model="form.cron" placeholder="0 9 * * * 或 30m / 24h，留空则仅手动触发" />
-          <div class="text-[11px] text-ink-3 mt-1 leading-5">
-            支持标准 5 段 cron 表达式（如 <code>0 9 * * *</code> 表示每天 9 点），或 <code>30m</code>/<code>24h</code> 相对间隔；留空表示仅手动触发。
-            保存后以此刻为基准重新计时。
+        <el-form-item v-if="!advanced" label="任务描述" required>
+          <el-input
+            v-model="description"
+            type="textarea"
+            :rows="3"
+            placeholder="到点要 Agent 做什么。例如：汇总最近 36 小时的 AI 大事件，生成 HTML 日报保存到 ai-daily/reports/ 目录"
+          />
+        </el-form-item>
+        <el-form-item label="执行时间">
+          <div class="w-full space-y-2">
+            <div class="flex items-center gap-2 flex-wrap">
+              <el-select v-model="schedMode" class="!w-32">
+                <el-option label="仅手动触发" value="manual" />
+                <el-option label="每天" value="daily" />
+                <el-option label="每周" value="weekly" />
+                <el-option label="每月" value="monthly" />
+                <el-option label="每隔一段" value="interval" />
+                <el-option label="cron 表达式" value="cron" />
+              </el-select>
+              <el-time-picker
+                v-if="schedMode === 'daily' || schedMode === 'weekly' || schedMode === 'monthly'"
+                v-model="schedTime"
+                format="HH:mm"
+                value-format="HH:mm"
+                placeholder="选择时间"
+                class="!w-28"
+              />
+              <el-select
+                v-if="schedMode === 'weekly'"
+                v-model="schedWeekDays"
+                multiple
+                collapse-tags
+                placeholder="哪几天"
+                class="!w-44"
+              >
+                <el-option v-for="o in weekDayOptions" :key="o.value" :label="o.label" :value="o.value" />
+              </el-select>
+              <template v-if="schedMode === 'monthly'">
+                <el-input-number v-model="schedMonthDay" :min="1" :max="31" class="!w-28" />
+                <span class="text-xs text-ink-2">日</span>
+              </template>
+              <template v-if="schedMode === 'interval'">
+                <span class="text-xs text-ink-2">每隔</span>
+                <el-input-number v-model="intervalNum" :min="1" :max="9999" class="!w-28" />
+                <el-select v-model="intervalUnit" class="!w-24">
+                  <el-option label="分钟" value="m" />
+                  <el-option label="小时" value="h" />
+                </el-select>
+              </template>
+              <el-input
+                v-if="schedMode === 'cron'"
+                v-model="form.cron"
+                placeholder="0 9 * * * 或 30m / 24h"
+                class="flex-1 font-mono"
+              />
+            </div>
+            <div class="text-[11px] text-ink-3 leading-5">
+              <template v-if="schedMode === 'manual'">不自动触发，只能在列表里手动「立即触发」。</template>
+              <template v-else>
+                将按 <code>{{ buildCron() }}</code> 执行；保存后以此刻为基准重新计时。
+              </template>
+              「每隔一段」为相对间隔，适合巡检类；定点执行用每天/每周/每月。
+            </div>
           </div>
         </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />
         </el-form-item>
-        <el-form-item label="任务节点" required>
+        <el-form-item v-if="advanced" label="任务节点" required>
           <div class="w-full space-y-3">
             <el-card v-for="(t, i) in form.tasks" :key="i" class="!border-line !bg-page" shadow="never">
               <div class="flex items-center gap-2 mb-2">
@@ -321,6 +515,11 @@ onMounted(load)
               <el-icon class="mr-1"><Plus /></el-icon> 添加任务
             </el-button>
           </div>
+        </el-form-item>
+        <el-form-item>
+          <el-button link type="primary" size="small" @click="advanced = !advanced">
+            {{ advanced ? '收起多节点编辑（简单模式）' : '需要多个步骤有依赖关系？展开多节点编辑' }}
+          </el-button>
         </el-form-item>
       </el-form>
       <template #footer>

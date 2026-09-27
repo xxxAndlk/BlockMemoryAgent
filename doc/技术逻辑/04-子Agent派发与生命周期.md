@@ -297,7 +297,7 @@
 
 ## 4.19 热驻池（idle_pool.go，1449 行）
 
-**核心设计：一个槽 = 一个常驻 supervisor goroutine 的 DomainAgent 实例**。任务完成进 Idle 等复用，按加权 TTL 自然退役。
+**核心设计：一个槽 = 一个常驻 supervisor goroutine 的 DomainAgent 实例**。任务完成进 Idle 等复用，按加权 TTL 冷驻（TTL 到期销毁实例释放资源，但树节点保持 Idle 作可复活注册表条目；`reuse_agent_id` 命中冷驻节点时从 agent_messages 重建槽续跑，非终态 Done）。
 
 ### 数据结构
 
@@ -313,8 +313,8 @@
 - **dispatchHotDomain**（:1395）：buildReuseTask 拼首任务 → 建槽 → 树 Register+SetCancel(destroyFnLocked) → 台账 + **subMeta.Store（cancel=nil！）** + ensurePatrol → **LRU**（idle 数 ≥ MaxPerSession 时对最旧数个投 opDestroy）→ pool.store + `go runDomainSupervisor`。
 - **supervisor 循环**（:508-577）：runDomainTask → Done/Stopped 时出队缓冲任务继续 → Suspended 保持 PendingChildren>0 → Failed/Destroyed 则 destroySlot 退出；否则 park 等 ops（opDestroy 退出 / opResume 续跑 / opNewTask 换任务）。**唯一退出路径是 opDestroy**。
 - **runDomainTask**（:657-870）：建任务 ctx（stopCtx 基底）→ 绑定 taskCtx/cancelTask + 重置 childReported → **subMeta 换绑新实例（带真实 cancelTask，禁止原地改写）** → `rearmSlotActivity`（重建活动条目）→ armWallClock + tree.SetCancel → **早到指令收口**（cancelPending：暂停则暂存任务文本 + tree.Pause 返回 suspended；否则 destroyed）→ 引擎执行 → stopWallClock → 收尾分支：errPaused（存史+tree.Pause+冻结墙钟+suspended+**SuspendSession 全树挂起**）、Canceled（软停→存史+看板+notify+**enterIdle**；wallFired→wallClockWrapUp 收口；手动暂停→存史+Pause+不 SuspendSession；硬取消→destroyed）、其他 err（salvage+三态化）、成功（存史+看板+saveBlockMemory+notify+**enterIdle**）。
-- **enterIdle**（:347）：Running→Idle、记 idleSince、**固化 gear**、清 TTL → `activity.Delete`（巡检豁免）→ `tree.Idle(id, summary, killFn)` → armTTL。TTL = `min(BaseTTL + reuseCount*ExtendPerReuse, MaxTTL)`，到期 AfterFunc 投 opDestroy。
-- **dispatchToIdleSlot**（:1209）：槽存在性 + 跨会话校验 → **刷新 stopCtx**（会话恢复后旧基底已取消）→ 取图片 → idle 分流（reuseCount++ / 停清 TTL / buildReuseTask / tree.Wake / trackChildStart / rearmSlotActivity / 投 opNewTask（满则**回滚 trackChildDone** 并拒）/ 台账"续建#N"）/ running 分流（队列满拒；否则入 taskQueue + 台账"入队第N位"）。
+- **enterIdle**（:347）：Running→Idle、记 idleSince、**固化 gear**、清 TTL → `activity.Delete`（巡检豁免）→ `tree.Idle(id, summary, killFn)` → armTTL。TTL = `min(BaseTTL + reuseCount*ExtendPerReuse, MaxTTL)`，到期 AfterFunc 投 `opDestroy{byTTL:true}`（destroySlot 据此跳过树 Finish——冷驻，节点保 Idle 可复活）。
+- **dispatchToIdleSlot**（:1209）：槽存在性（池内无槽则查树冷驻节点——Role==domain && Status==Idle 且有 history 时 `restoreColdSlot` 从 agent_messages 重建 dormant 槽）+ 跨会话校验 → **刷新 stopCtx**（会话恢复后旧基底已取消）→ 取图片 → idle 分流（reuseCount++ / 停清 TTL / buildReuseTask / tree.Wake / trackChildStart / rearmSlotActivity / 投 opNewTask（满则**回滚 trackChildDone** 并拒）；dormant 槽无 supervisor，改为锁内置 Running 后惰性启动 runDomainSupervisor，新建实例经 RunWithHistory 带 history 种子续上下文 / 台账"续建#N"）/ running 分流（队列满拒；否则入 taskQueue + 台账"入队第N位"）。
 - **WakeIdleWithMessage**（:1297，编排页直连）：热驻未开/槽不存在 → ErrAgentNotDirectable；running → ErrAgentBusy；idle 同复用（任务文本 = `【用户直连消息】`）。
 - **挂起/恢复**：`SuspendSession`（置挂起态 + **冻结 idle TTL**）；`ResumeSessionAgents`（close(wake) 广播 + armTTL + suspended 的 running 槽投 opResume"继续"）；`DestroyAllIdle`（Shutdown 调用）。
 - **destroyFnLocked 三态分流**（:387-408）：Idle → 投 opDestroy；Running 且有 ctx → **直接 cancel**（不能投 opDestroy——会排队到任务结束才生效）；Running 无 ctx → 记 cancelPending。
@@ -322,7 +322,7 @@
 ### 生命周期图
 
 ```
-dispatchHotDomain 建槽 → slotRunning ──DONE/软停──→ slotIdle ──TTL 到期/LRU/会话删/Shutdown──→ slotDestroyed
+dispatchHotDomain 建槽 → slotRunning ──DONE/软停──→ slotIdle ──TTL 到期（冷驻：树节点保 Idle，reuse 命中冷恢复）/LRU/会话删/Shutdown──→ slotDestroyed
                             │  ▲                    │  ▲
                      errPaused/手动暂停(suspended)   复用唤醒（reuseCount++ 延寿）
                             └──opResume──┘            └───────────┘
@@ -447,6 +447,6 @@ worker 池 6 并发 `dispatchOne`；单项上限：默认角色 6 / **scout 32**
 
 ## 4.35 会话恢复中间层与展开式召回（idle_pool.go / expand.go）
 
-**RestoreSessionDomains**（#21④）：会话 resume 时按 (session_id, agent_id) 从 agent_messages + agent_tree_nodes 重建热驻槽（未终态/终态 30min 内 domain）——ResumeSessionAgents 头部接线，重建槽同样被 armTTL/opResume 扫到（零特判）。与 #17 领域档案构成三级连续体：热驻池（分钟级）→ **会话 resume 中间层（本条）** → 领域档案（跨会话永久级）。
+**RestoreSessionDomains**（#21④）：会话 resume 时按 (session_id, agent_id) 从 agent_messages + agent_tree_nodes 重建热驻槽（未终态/终态 30min 内 domain；单节点重建段已抽取为 `restoreColdSlot`，与 reuse 冷恢复共用，重建槽 dormant 无 supervisor、首个唤醒序列惰性启动）——ResumeSessionAgents 头部接线，重建槽同样被 armTTL/opResume 扫到（零特判）。与 #17 领域档案构成三级连续体：热驻池（分钟级）→ **会话 resume 中间层（本条）** → 领域档案（跨会话永久级）。
 
 **expand_memory**（#22④ 展开式召回，expand.go）：压缩摘要讲不细时派**只读**展开器沿摘要链（`Pipeline.Bundles`：leaf→condensed 包链副本）定位细节所属段，再用低层工具取原文（workspace 文件 / .bma/returns 全文 / .bma/tool_outputs 落盘件）。约束：delegation grant 双闸（token 预算 8K + TTL 3min，超限截答返回已有部分）+ 答案硬顶 2000 rune + **结构性禁递归**（展开器工具面只给 ReadFile/SearchInFiles/ListDir——无 call_sub_agent/send_message/写工具，派不出下级）。与 salvage 合成完整记忆环：失败轨迹 salvage 主动重注（现状），成功细节 expand_memory 按需展开——一推一拉，压缩不再等于失忆。meta/domain 白名单放行。

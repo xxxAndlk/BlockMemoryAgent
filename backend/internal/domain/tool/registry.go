@@ -223,6 +223,8 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	// 注册 ask_user 工具（TODO #24 人在回路）；hook 在 SetAskUserHook 注入后生效。
 	// 注册始终发生，使 Schema 中可见；调用时 hook 未注入返回错误。
 	r.Register(&askUserTool{})
+	// 注册 schedule_task 工具（DAG 定时任务创建入口）；hook 在 SetScheduleTaskHook 注入后生效。
+	r.Register(&scheduleTaskTool{})
 	// 注册 escalate_gear 工具（TODO #14 T7 档位升级）；hook 在 SetEscalateGearHook 注入后生效。
 	// 注册始终发生，使 Schema 中可见（roles.yaml 白名单按角色挑选）；调用时 hook 未注入返回错误。
 	r.Register(&escalateGearTool{})

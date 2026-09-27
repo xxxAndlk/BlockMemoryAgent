@@ -16,6 +16,8 @@ const props = defineProps<{
   /** 批量问答逐题草稿（任务 140，下标对齐 clarify.questions；单题态为空数组） */
   clarifyDrafts?: string[]
   sessionId: string
+  /** 会话标题 = 首条用户消息（goal）：存量会话事件流里缺 user_message 事件时据此合成首条用户气泡 */
+  firstGoal?: string
   /** 会话状态：终态兜底收口最后一个回合（事件流缺终结文案时不至于永久转圈） */
   sessionStatus?: string
   liveStreaming: string
@@ -44,6 +46,19 @@ const turns = computed(() => {
     groupEventsToTurns(props.events, props.priorReplies),
     props.sessionStatus,
   )
+  // 存量会话兜底：2026-09-26 之前创建的会话，首条消息只写进了 goal（标题）没落
+  // user_message 事件——首回合由兜底路径开启、userMessage 恒空，用户气泡从不显示。
+  // goal 即首条用户消息，据此合成。新会话后端已补真事件（真事件先于兜底开启回合），
+  // 此分支不会命中，不存在双气泡。
+  if (ts.length > 0 && !ts[0].userMessage && props.firstGoal) {
+    ts[0].userMessage = {
+      type: 'user_message',
+      agent: 'User',
+      message: props.firstGoal,
+      timestamp: ts[0].startedAt,
+      success: true,
+    }
+  }
   // 邮件留痕不在事件流里：按时间挂到回合上（主对话栏双向都收——"我发了什么"和
   // "谁回了我什么"同等重要；子 Agent 面板只收外发，入站已有注入气泡）
   attachMailsToTurns(ts, props.mails || [], () => true)
