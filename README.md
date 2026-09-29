@@ -62,6 +62,97 @@ Wiring:  bootstrap.Build（HTTP 服务 / TUI / 集成测试共用同一份装配
 
 ---
 
+## 初次使用指引（从零跑通）
+
+按以下顺序执行，每步都有验证方法，卡在哪一步先看末节「常见坑」。
+
+### 第 0 步：准备环境
+
+| 依赖 | 版本 | 用途 |
+|------|------|------|
+| Go | 1.25+（机器默认 Go 较旧时所有 go 命令前缀 `GOTOOLCHAIN=local`） | 构建/运行后端 |
+| Node.js + npm | Node 18+ | 构建前端 SPA（`web/dist`） |
+| Docker + docker compose | 任意近期版本 | 一键起 PostgreSQL + Redis；也可自备实例 |
+| LLM API Key | 至少一个 | OpenAI 兼容 / Anthropic / 本地 Ollama 均可 |
+
+Windows 下命令在 Git Bash 中执行；没有 `make` 时用下文给出的等价原始命令。
+
+### 第 1 步：最小配置（三个文件）
+
+```bash
+cp .env.example .env
+```
+
+1. **`.env`（必填）**：按你的模型供应商填一组 Key 与端点，例如 DeepSeek 填 `OPENAI_API_KEY` + `OPENAI_BASE_URL=https://api.deepseek.com/v1`；Claude 系填 `ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL`。`POSTGRES_DSN` / `REDIS_ADDR` 用 compose 默认值即可。
+   - 注意：自带 compose 的 Redis 设了密码，`.env` 里需填 `REDIS_PASSWORD=blockmemory_dev`（`.env.example` 默认为空，不配会在启动探活时认证失败）。
+   - 块记忆向量化需要 Embedding：填 `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY`（OpenAI 兼容 `/v1/embeddings`，roles.yaml 的 `embed` 段选模型）；不填则 `embed` 能力不可用（其余功能不受影响）。
+2. **`config/models.json`（必填）**：模型连接参数清单（provider/model/api_key/base_url，`${VAR}` 从 `.env` 插值）。照模板加一条你自己的模型条目即可，`api_key`/`base_url` 引用 `.env` 变量，不要把密钥直接写进 json。
+3. **`config/roles.yaml`（必填）**：把 `meta_agent.model_config.model_ref`、`domain_agent.model_config.model_ref`、`lightweight_model.model_ref` 指向 models.json 里可用的条目 id。这三个角色是最小可跑集合；meta 建议非推理或低思考档模型（路由/汇总要快），domain 建议留思考档（编码执行要正确率），lightweight 选最便宜快的（做摘要/压缩）。
+
+其余配置文件（`config/config.yaml` / `skills.yaml` / `soul.md` / `user_profile.md`）保持仓库默认值即可，但**必须存在**——严格启动，任一缺失或 PG/Redis/LLM 不可达都会启动失败并报出具体原因。
+
+### 第 2 步：启动 PostgreSQL + Redis
+
+```bash
+make up        # 等价：docker compose -f docker/docker-compose.yml up -d
+```
+
+起两个容器：`blockmemory-postgres`（:5432，含 pgvector）与 `blockmemory-redis`（:6380）。已有自备实例则跳过本步，改 `.env` 里的 DSN/地址指向它们。
+
+### 第 3 步：建表
+
+```bash
+make migrate   # 需 POSTGRES_DSN 环境变量；等价：for f in migrations/*.sql; do psql "$POSTGRES_DSN" -f "$f"; done
+```
+
+全新数据库其实可以跳过：`bootstrap.Build` 启动时会幂等自动建表。仍建议跑一遍，保证索引等细节与 migrations 一致。
+
+### 第 4 步：构建前端 + 启动后端
+
+```bash
+make run       # 等价：cd web && npm install && npm run build，然后 go run ./backend
+```
+
+前端只需首次（或前端改动后）构建；日常改后端代码直接 `go run ./backend`。启动日志出现监听 `127.0.0.1:10010` 即成功。
+
+### 第 5 步：自检（六类能力探活）
+
+```bash
+curl http://127.0.0.1:10010/api/health          # {"status":"ok"} 即进程就绪
+curl http://127.0.0.1:10010/api/capabilities    # 逐项核对 llm/postgres/redis/embed/plugins/workdir
+```
+
+`/api/capabilities` 对每项给出 `ok` + 失败原因 + 修复提示（hint），是首次部署排障的固定入口。全绿后浏览器打开 `http://127.0.0.1:10010` 进 Web UI。
+
+### 第 6 步：第一次对话
+
+1. Web UI 新建会话：填目标（goal），选执行档位——**fast**（文档助手直达，轻任务）/ **daily**（DomainAgent 直接执行，默认）/ **cluster**（MetaAgent 全装编排多领域子 Agent，大任务）。
+2. 工作目录不选则落到 `agent.default_workdir`（默认安装目录下 `workspace/`）；建议指向一个测试目录，Agent 的文件读写都在该目录沙箱内。
+3. 发送后右侧 SSE 流实时展示思考、工具调用与子 Agent 树；子 Agent 状态可经 `GET /api/sessions/{id}/tree` 查看。
+4. 偏爱终端可用 TUI：`go run ./backend/cmd/tui`。
+
+### 第 7 步（可选）：Windows 装机部署
+
+不想守着仓库目录跑，可打包安装到固定目录：
+
+```powershell
+.\dist.ps1        # 构建前端+后端二进制，生成 dist/ 布局（PowerShell 版 make dist）
+.\install.ps1     # 复制到安装目录（默认 D:\WebApp\bma），写入 BMA_HOME，向导式补填 LLM Key、自动生成 BMA_API_TOKEN
+```
+
+install.ps1 幂等可重复跑（即升级流程）；服务已在跑时会自动调 `/api/capabilities` 做六类能力自检。
+
+### 常见坑
+
+- **`go: toolchain ...` 报错**：所有 go 命令加前缀 `GOTOOLCHAIN=local`（仓库 go.work 锁定工具链）。
+- **启动报 Redis 认证失败**：`.env` 补 `REDIS_PASSWORD=blockmemory_dev`（compose 容器设了 `requirepass`）。
+- **端口冲突**：5432 / 6380 / 10010 被占用时，改 compose 端口映射或 `.env` 的 `POSTGRES_DSN` / `REDIS_ADDR` / `HTTP_ADDR`。
+- **开启鉴权后 401**：`config.yaml` 的 `http.auth_enabled: true` 时，前端登录与 API 调用都需 `Authorization: Bearer <BMA_API_TOKEN>`。
+- **局域网访问不到**：默认只绑回环，`.env` 设 `HTTP_ADDR=0.0.0.0:10010`（请同时开启鉴权）。
+- **embed 能力 FAIL**：只影响块记忆向量化检索，补 `EMBEDDING_*` 后重启即可；其余功能不受影响。
+
+---
+
 ## 快速开始
 
 ### 依赖
