@@ -3789,22 +3789,23 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		}
 		s.store.setStreamingText(session, ev.Text)
 	case LiveEventThinkDelta:
-		if s.isClusterTopEvent(session, ev) {
-			// 集群档顶层 Meta：思考链与中间轮口播同治理（2026-09-19 定案修复）——
-			// 编排推理既不进 ThinkingText（live 思考盒）也不落 think 事件（回放不再
-			// 以同等级推理重现）。该档用户只看最终交付；日常档与子 Agent 的思考
-			// 展示不受影响。
+		// 集群档顶层 Meta 的思考抑制只在"正在编排"（树上有运行中子 Agent）时生效：
+		// 此时顶层推理是编排内心独白（2026-09-19 定案），不进 ThinkingText 也不落 think
+		// 事件，与中间轮口播同治理。**无子 Agent 在跑时顶层 Meta 就是执行者本身**，其
+		// 思考是干活过程而非编排独白，照常进 ThinkingText / 落 think 事件——否则会话
+		// 全程只剩"正在生成中"占位，思考闪一下即消失（2026-09-29 用户实证）。
+		if s.isClusterTopEvent(session, ev) && s.hasActiveSubAgents(session.ID) {
 			break
 		}
 		s.store.setThinkingText(session, ev.Text)
 	case LiveEventToolCall:
 		// 工具调用开始同样意味着思考阶段结束（思考型模型常见 think→tool 而非 think→text）。
 		s.finalizeThinking(session, ev)
-		if s.isClusterTopEvent(session, ev) {
-			// 集群档顶层 Meta：本轮正文是中间轮口播，连同缓冲一起丢弃——不落 assistant_text
-			// 事件、不进 StreamingText（用户流里绝不出现编排内心独白，2026-09-18 用户实证）。
-			// ask_user 例外：提问正文快照（clarifyReportJSON）读 StreamingText，冲刷保留，
-			// 提问卡上方要展示这段正文。
+		if s.isClusterTopEvent(session, ev) && s.hasActiveSubAgents(session.ID) {
+			// 集群档顶层 Meta 且子 Agent 在跑：本轮正文是中间轮编排口播，连同缓冲一起丢弃——
+			// 不落 assistant_text 事件、不进 StreamingText（用户流里绝不出现编排内心独白，
+			// 2026-09-18 用户实证）。ask_user 例外：提问正文快照（clarifyReportJSON）读
+			// StreamingText，冲刷保留，提问卡上方要展示这段正文。
 			if ev.Tool == "ask_user" && session.pendingTopText != "" {
 				// 直推模式下缓冲恒空、StreamingText 已是实时正文，不得冲刷覆盖为空。
 				s.store.setStreamingText(session, session.pendingTopText)
@@ -3814,6 +3815,11 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 			// 同一边界也是"这一轮正文说完了"：模型常见「口播一句（做了什么/接下来干什么）→调工具」，
 			// 那段正文只活在瞬时 StreamingText 里，下一个轮次的 delta 直接覆盖、前端 live 行也在
 			// 工具调用事件到达时清掉——用户看到的是"话刚出现就凭空消失"（2026-09-13 用户实证）。
+			// 集群档顶层无子 Agent 在跑时同此语义：顶层即执行者，口播照常落 assistant_text
+			//（2026-09-29 用户实证：集群档直干活全程零中间正文，只剩"正在生成中"）。
+			if s.isClusterTopEvent(session, ev) {
+				session.pendingTopText = ""
+			}
 			s.persistInterimText(session, ev)
 		}
 		// call_sub_agent 是子 Agent 派发：记录专用派发事件（角色 ID 与任务摘要），

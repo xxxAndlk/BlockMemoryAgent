@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-kratos/blades"
 
+	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	"github.com/blockmemory/agent/backend/pkg/types"
@@ -106,31 +107,34 @@ func TestHandleLiveEvent_ThinkEmptyNoEvent(t *testing.T) {
 	}
 }
 
-// TestHandleLiveEvent_ClusterTopThinkDropped 验证集群档顶层 Meta 的思考链被丢弃：
-// 不进 ThinkingText（live 思考盒）也不落 think 事件（与中间轮口播同治理）；
+// TestHandleLiveEvent_ClusterTopThinkDropped 验证集群档顶层 Meta 的思考抑制以
+// "正在编排"（树上有运行中子 Agent）为前提：
+//   - 子 Agent 在跑：编排推理既不进 ThinkingText（live 思考盒）也不落 think 事件；
+//   - 无子 Agent 在跑：顶层 Meta 即执行者本身，思考照常展示并落事件
+//     （2026-09-29 用户实证：集群档直干活会话全程零思考展示，只剩"正在生成中"）。
 // 子 Agent 思考与日常档顶层思考不受影响。
 func TestHandleLiveEvent_ClusterTopThinkDropped(t *testing.T) {
 	svc, sess := newLiveEventTestSession(t)
 	sess.ID = "session-1" // 顶层 Meta 实例 ID = 会话 ID
 	sess.setGear(tool.GearCluster)
+	// 编排口播的前提是"正在编排"：树上挂一个运行中子 Agent 节点。
+	svc.TreeFor(sess.ID).Register(orchestrator.Node{
+		ID: sess.ID + "/domain-1", ParentID: sess.ID, Role: "domain", Status: orchestrator.StatusRunning,
+	})
 
-	// 顶层 Meta 思考：丢弃。
+	// 子 Agent 在跑时的顶层 Meta 思考：丢弃。
 	svc.handleLiveEvent(sess, LiveEvent{
 		Kind: LiveEventThinkDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "编排推理：先派侦察…",
 	})
 	if sess.ThinkingText != "" {
-		t.Fatalf("集群顶层 Meta 思考不应进 ThinkingText，got %q", sess.ThinkingText)
+		t.Fatalf("编排中集群顶层 Meta 思考不应进 ThinkingText，got %q", sess.ThinkingText)
 	}
-	// 思考结束边界（答复输出）：不得落 think 事件。此时树上无运行中子 Agent，
-	// 按直推语义（2026-09-20）正文实时进 StreamingText——终答生成期不再整段转圈。
+	// 思考结束边界（答复输出）：不得落 think 事件。正文按缓冲语义进 pendingTopText。
 	svc.handleLiveEvent(sess, LiveEvent{
-		Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "终答",
+		Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "口播",
 	})
 	if ev := findEventByKind(sess.Events, eventkind.Think); ev != nil {
-		t.Fatalf("集群顶层 Meta 思考不应落 think 事件，got %q", ev.Message)
-	}
-	if sess.StreamingText != "终答" {
-		t.Fatalf("无子 Agent 时顶层正文应直推 StreamingText，got %q", sess.StreamingText)
+		t.Fatalf("编排中集群顶层 Meta 思考不应落 think 事件，got %q", ev.Message)
 	}
 
 	// 子 Agent 思考：照常展示。
@@ -139,6 +143,41 @@ func TestHandleLiveEvent_ClusterTopThinkDropped(t *testing.T) {
 	})
 	if sess.ThinkingText != "【代码助手】\n分析文件结构…" {
 		t.Fatalf("子 Agent 思考应照常进 ThinkingText，got %q", sess.ThinkingText)
+	}
+}
+
+// TestHandleLiveEvent_ClusterTopThinkKeptWithoutSubAgents 验证集群档顶层 Meta 在无
+// 子 Agent 在跑时（顶层即执行者）：思考照常进 ThinkingText，思考结束边界落 think 事件，
+// 工具调用边界落 assistant_text——与日常档同语义。
+func TestHandleLiveEvent_ClusterTopThinkKeptWithoutSubAgents(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	sess.ID = "session-1"
+	sess.setGear(tool.GearCluster)
+
+	svc.handleLiveEvent(sess, LiveEvent{
+		Kind: LiveEventThinkDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "先查用量记录再回答",
+	})
+	if sess.ThinkingText != "先查用量记录再回答" {
+		t.Fatalf("无子 Agent 时顶层思考应进 ThinkingText，got %q", sess.ThinkingText)
+	}
+	// 正文直推（2026-09-20 语义），思考在答复输出边界落 think 事件。
+	svc.handleLiveEvent(sess, LiveEvent{
+		Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "我去查一下真实记录",
+	})
+	if sess.StreamingText != "我去查一下真实记录" {
+		t.Fatalf("无子 Agent 时顶层正文应直推 StreamingText，got %q", sess.StreamingText)
+	}
+	think := findEventByKind(sess.Events, eventkind.Think)
+	if think == nil || think.Message != "先查用量记录再回答" {
+		t.Fatalf("无子 Agent 时思考结束应落 think 事件，got %+v", think)
+	}
+	// 工具调用边界：中间正文落 assistant_text（不再随缓冲丢弃）。
+	svc.handleLiveEvent(sess, LiveEvent{
+		Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: "session-1", Tool: "RunCommand",
+	})
+	interim := findEventByKind(sess.Events, eventkind.AssistantText)
+	if interim == nil || interim.Message != "我去查一下真实记录" {
+		t.Fatalf("无子 Agent 时工具调用边界应落 assistant_text，got %+v", interim)
 	}
 }
 
