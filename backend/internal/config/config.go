@@ -294,6 +294,12 @@ type AgentConfig struct {
 	// 默认 0 = 2× sub_agent_heartbeat_timeout_min：domain 等子/等回信靠后代活动冒泡保活，
 	// 后代全静默后超该阈值判假死。
 	DomainHeartbeatTimeoutMin int `yaml:"domain_heartbeat_timeout_min"`
+	// PeerRequestTimeoutMin 协作问答（send_message request/escalate）超时升级（分钟）。
+	// 默认 15：超期未获 reply 给提问方父 Agent 投 escalate 告警。<=0 按默认。
+	PeerRequestTimeoutMin int `yaml:"peer_request_timeout_min"`
+	// MaxConcurrentSubAgents 同时在跑的子 Agent 全局上限（2026-09-28 P1 并发池）。
+	// 默认 8；超额派发 FIFO 排队（排队不计墙钟）。<=0 按默认；显式不限需注释掉默认值。
+	MaxConcurrentSubAgents int `yaml:"max_concurrent_sub_agents"`
 	// AskUserTimeoutSec ask_user 工具提问默认超时（秒）（TODO #24 人在回路）。
 	// 默认 0=不限；>0 时超时未答复工具返回"用户未答复，自行决策"。单次调用可经
 	// ask_user(timeout_sec=N) 覆盖。
@@ -875,6 +881,14 @@ func (c *Config) applyAgentStandaloneDefaults() {
 	// 叶子助手 kind=error 失败自动重派一次（TODO #23）；<=0 关闭。
 	if c.Agent.DispatchRetryCount == 0 {
 		c.Agent.DispatchRetryCount = 1
+	}
+	// 协作询问超时升级（2026-09-28 P0 配对）：默认 15 分钟。
+	if c.Agent.PeerRequestTimeoutMin == 0 {
+		c.Agent.PeerRequestTimeoutMin = 15
+	}
+	// 子 Agent 全局并发上限（2026-09-28 P1）：默认 8，超顶排队不拒绝。
+	if c.Agent.MaxConcurrentSubAgents == 0 {
+		c.Agent.MaxConcurrentSubAgents = 8
 	}
 	// domain 心跳默认 0 = 2× 叶子（bootstrap 侧兜底），此处只保证非负。
 	if c.Agent.DomainHeartbeatTimeoutMin < 0 {

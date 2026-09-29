@@ -1137,7 +1137,7 @@ func NewReactService(
 ) *ReactService {
 	// 初始化 ReactService 实例，并构建新的内存会话存储。
 	s := &ReactService{
-		store:        newReactSessionStore(),
+		store:        newReactSessionStore(mailbox),
 		roleRegistry: roleRegistry,
 		modelFactory: modelFactory,
 		toolRegistry: toolRegistry,

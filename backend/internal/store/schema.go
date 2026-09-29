@@ -350,6 +350,35 @@ WITH (lists = 100);
 	return err
 }
 
+// EnsureMailboxSchema 自动创建 mailbox_messages 表 (幂等)。
+// 对应 migrations/010_mailbox_messages.sql：mailbox 持久化（2026-09-28）——
+// Send 双写 / Drain 标 read / Purge 标 dead / 重启 LoadUnread 重投。
+// append-only：状态翻转只 UPDATE，不物理删行（删除仅会话级联）；owner 多租户预留。
+func EnsureMailboxSchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS mailbox_messages (
+    id          VARCHAR(128) PRIMARY KEY,
+    owner       VARCHAR(64) NOT NULL DEFAULT '',
+    session_id  VARCHAR(64) NOT NULL,
+    from_agent  VARCHAR(128) NOT NULL DEFAULT '',
+    to_agent    VARCHAR(128) NOT NULL DEFAULT '',
+    type        VARCHAR(16) NOT NULL,
+    subject     TEXT,
+    body        TEXT,
+    payload     JSONB,
+    priority    INT NOT NULL DEFAULT 0,
+    status      VARCHAR(16) NOT NULL DEFAULT 'unread',
+    reply_to    VARCHAR(128),
+    thread_id   VARCHAR(128),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    read_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_mailbox_messages_session
+    ON mailbox_messages (session_id, status);
+`)
+	return err
+}
+
 // ValidateEmbeddingDimension 校验 global_knowledge.embedding 列的实际向量维度与配置一致。
 //
 // 职责：pgvector 的 VECTOR(N) 列维度在建表时固定；若 config 的 pgvector.dimensions 与列维度
@@ -402,4 +431,20 @@ func parseVectorDim(typeStr string) int {
 		return 0
 	}
 	return n
+}
+
+// EnsureBoardSchema 自动创建 session_boards 表 (幂等)。
+// 对应 migrations/011_session_boards.sql：看板整板快照持久化（2026-09-28），
+// 重启后依赖门状态可恢复；owner 多租户预留；删除仅会话级联。
+func EnsureBoardSchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS session_boards (
+    owner      VARCHAR(64) NOT NULL DEFAULT '',
+    session_id VARCHAR(64) PRIMARY KEY,
+    goal       TEXT,
+    snapshot   JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`)
+	return err
 }

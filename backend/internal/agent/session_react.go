@@ -22,6 +22,7 @@ import (
 	// 内部包：模型工厂、事件类型、持久化存储、枚举、文本工具
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
+	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/project"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
@@ -203,6 +204,9 @@ type reactSessionStore struct {
 	bootRand  string
 	// pgStore 是 PostgreSQL 持久化存储，用于保存历史与事件。
 	pgStore *store.PostgresStore
+	// mailbox 用于崩溃恢复时把 mailbox_messages 的未读邮件重投进箱（Task：P0 持久化）。
+	// 由 ReactService 构造时注入；nil（测试）时重载跳过。
+	mailbox *mailbox.Mailbox
 	// modelFactory 提供 LLM 模型实例，供推理时调用。
 	modelFactory *model.ModelFactory
 	// workDir 是当前工作目录，作为临时目录的根路径。
@@ -230,7 +234,8 @@ type reactSessionStore struct {
 // newReactSessionStore 创建一个新的 reactSessionStore 实例。
 // workDir 不在此自取：由 bootstrap 经 ReactService.SetWorkDir 注入权威值，
 // 消除与 bootstrap.go 各自 os.Getwd 的双源漂移；未注入时为空，createSession 退回相对路径。
-func newReactSessionStore() *reactSessionStore {
+// mb: ReactService 持有的共享邮箱，供崩溃恢复重投未读邮件；测试传 nil 跳过重载。
+func newReactSessionStore(mb *mailbox.Mailbox) *reactSessionStore {
 	// 生成 4 字节随机 hex 作为实例唯一后缀，防止 Windows 低精度时钟导致 bootEpoch 相同。
 	bootRand := genBootRand()
 	return &reactSessionStore{
@@ -238,6 +243,7 @@ func newReactSessionStore() *reactSessionStore {
 		metrics:   newMetricsCollector(),
 		bootEpoch: time.Now().UnixNano(),
 		bootRand:  bootRand,
+		mailbox:   mb,
 	}
 }
 
@@ -1149,6 +1155,9 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 	sess.setGear(gearFromMetaMemory(rec.MetaMemory, st.defaultGear))
 	// 恢复会话级思考强度（2026-09-16）：缺键回落空串=跟随角色默认。
 	sess.setThinking(thinkingFromMetaMemory(rec.MetaMemory))
+	// mailbox 未读重投（P0 持久化）：重启前已投递未消费的邮件回箱，meta/热驻槽
+	// 恢复后经 drainMailbox 自然消费；同 ID 幂等（Restore 内部去重）。
+	st.reloadUnreadMailbox(rec.SessionID)
 	return sess
 }
 
@@ -1348,4 +1357,55 @@ func (st *reactSessionStore) queryLogs(ctx context.Context, sessionID, agent, le
 		return nil
 	}
 	return recs
+}
+
+// reloadUnreadMailbox 从 mailbox_messages 读该会话全部未读邮件并重投进内存邮箱。
+// best-effort：PG 故障仅记日志，不影响会话恢复主流程。
+func (st *reactSessionStore) reloadUnreadMailbox(sessionID string) {
+	if st.pgStore == nil || st.pgStore.Mailbox == nil || st.mailbox == nil || sessionID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := st.pgStore.Mailbox.LoadUnread(ctx, sessionID)
+	if err != nil {
+		log.Printf("[mailbox] reload unread failed: session=%s err=%v", sessionID, err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	n := 0
+	for _, row := range rows {
+		if err := st.mailbox.Restore(rowToMailboxMessage(row)); err != nil {
+			log.Printf("[mailbox] restore failed: id=%s err=%v", row.ID, err)
+			continue
+		}
+		n++
+	}
+	log.Printf("[mailbox] unread restored: session=%s total=%d restored=%d", sessionID, len(rows), n)
+}
+
+// rowToMailboxMessage 把 store 行转回 mailbox.Message（agent 包内适配，分层纪律）。
+func rowToMailboxMessage(row store.MailboxMessage) *mailbox.Message {
+	m := &mailbox.Message{
+		ID:        row.ID,
+		From:      row.FromAgent,
+		To:        row.ToAgent,
+		Type:      mailbox.MessageType(row.Type),
+		Subject:   row.Subject,
+		Body:      row.Body,
+		Priority:  row.Priority,
+		ReplyTo:   row.ReplyTo,
+		ThreadID:  row.ThreadID,
+		Status:    mailbox.StatusUnread,
+		CreatedAt: row.CreatedAt,
+	}
+	if len(row.Payload) > 0 {
+		var payload map[string]any
+		if json.Unmarshal(row.Payload, &payload) == nil {
+			m.Payload = payload
+		}
+	}
+	return m
 }

@@ -9,7 +9,9 @@ package board
 import (
 	"errors"      // errors.New 构造任务不存在等错误
 	"fmt"         // fmt.Sprintf 生成任务 ID 与 Brief 文本
+	"log"         // log.Printf 记录持久化/恢复失败（fail-open）
 	"sort"        // sort.Strings 稳定化约束键输出顺序
+	"strconv"     // strconv.ParseInt 解析任务 ID 的 _t<n> 后缀恢复 seq
 	"strings"     // strings.TrimSpace 规范化计划任务 ID
 	"sync"        // sync.RWMutex 保护 TaskBoard / Manager 的并发访问
 	"sync/atomic" // atomic.Int64 生成唯一任务 ID
@@ -96,6 +98,7 @@ type TaskBoard struct {
 	Order       []string            // 子任务展示顺序（创建序）
 	UpdatedAt   time.Time           // 看板最近变更时间
 	seq         atomic.Int64        // 原子计数器，生成唯一任务序号
+	persistFn   func(Snapshot)      // 持久化回调（Manager.WithStore 接线时注入）；nil=纯内存
 }
 
 // NewTaskBoard 新建空看板。
@@ -136,11 +139,11 @@ func NewTaskBoard(topicID, goal string) *TaskBoard {
 //
 // 并发安全：内部持写锁，可被多 goroutine 并发调用。
 func (b *TaskBoard) AddSubTask(title string) string {
-	b.mu.Lock()         // 加写锁，独占看板
-	defer b.mu.Unlock() // 函数返回时释放
-	// 遍历已有任务，若发现同名则幂等返回其 ID
+	b.mu.Lock() // 加写锁，独占看板
+	// 遍历已有任务，若发现同名则幂等返回其 ID（无状态变化，不调 persist）
 	for _, id := range b.Order {
 		if t := b.Tasks[id]; t != nil && t.Title == title {
+			b.mu.Unlock()
 			return id
 		}
 	}
@@ -157,6 +160,8 @@ func (b *TaskBoard) AddSubTask(title string) string {
 	b.Order = append(b.Order, id)    // 维持创建顺序，Brief 按此输出
 	b.Status = BoardStatusInProgress // 只要有任务，看板即进入进行中
 	b.UpdatedAt = now                // 刷新看板更新时间
+	b.mu.Unlock()
+	b.persist()
 	return id
 }
 
@@ -173,9 +178,10 @@ func (b *TaskBoard) AddSubTask(title string) string {
 // 并发安全：内部持写锁。
 func (b *TaskBoard) SetConstraint(key, value string) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.Constraints[key] = value // 写入或覆盖约束
 	b.UpdatedAt = time.Now()   // 刷新更新时间
+	b.mu.Unlock()
+	b.persist()
 }
 
 // SetPlan 全量覆盖看板计划（write_plan 工具用，TODO #22）。
@@ -191,7 +197,6 @@ func (b *TaskBoard) SetConstraint(key, value string) {
 // 并发安全：内部持写锁。
 func (b *TaskBoard) SetPlan(goal string, tasks []PlanTask) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if goal != "" {
 		b.Goal = goal
@@ -201,9 +206,11 @@ func (b *TaskBoard) SetPlan(goal string, tasks []PlanTask) error {
 	for _, t := range tasks {
 		id := strings.TrimSpace(t.ID)
 		if id == "" {
+			b.mu.Unlock()
 			return fmt.Errorf("plan task id must be non-empty")
 		}
 		if _, dup := seen[id]; dup {
+			b.mu.Unlock()
 			return fmt.Errorf("plan task id %q duplicated", id)
 		}
 		seen[id] = struct{}{}
@@ -219,6 +226,7 @@ func (b *TaskBoard) SetPlan(goal string, tasks []PlanTask) error {
 	for _, t := range tasks {
 		for _, dep := range t.DependsOn {
 			if !exists(dep) {
+				b.mu.Unlock()
 				return fmt.Errorf("plan task %q depends on unknown task %q", t.ID, dep)
 			}
 		}
@@ -255,6 +263,7 @@ func (b *TaskBoard) SetPlan(goal string, tasks []PlanTask) error {
 	for _, t := range tasks {
 		if color[t.ID] == 0 {
 			if err := dfs(t.ID); err != nil {
+				b.mu.Unlock()
 				return err
 			}
 		}
@@ -284,6 +293,8 @@ func (b *TaskBoard) SetPlan(goal string, tasks []PlanTask) error {
 	}
 	b.Status = BoardStatusInProgress
 	b.UpdatedAt = now
+	b.mu.Unlock()
+	b.persist()
 	return nil
 }
 
@@ -337,7 +348,6 @@ func (b *TaskBoard) TakeoverFrom(oldDomain, newDomain string) int {
 		return 0
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	migrated := 0
 	now := time.Now()
 	for _, id := range b.Order {
@@ -356,6 +366,10 @@ func (b *TaskBoard) TakeoverFrom(oldDomain, newDomain string) int {
 	}
 	if migrated > 0 {
 		b.UpdatedAt = now
+	}
+	b.mu.Unlock()
+	if migrated > 0 {
+		b.persist()
 	}
 	return migrated
 }
@@ -394,15 +408,17 @@ func (b *TaskBoard) DependsDone(taskID string) bool {
 // 并发安全：内部持写锁。
 func (b *TaskBoard) Assign(taskID, assignee string) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	t, ok := b.Tasks[taskID] // 查找任务
 	if !ok {
+		b.mu.Unlock()
 		return errors.New("task not found") // 任务不存在，直接报错
 	}
 	t.Assignee = assignee     // 记录责任人
 	t.Status = TaskInProgress // 分配后自动进入进行中
 	t.UpdatedAt = time.Now()  // 刷新任务更新时间
 	b.UpdatedAt = t.UpdatedAt // 同步看板更新时间
+	b.mu.Unlock()
+	b.persist()
 	return nil
 }
 
@@ -485,9 +501,9 @@ func (b *TaskBoard) MarkBlocked(taskID, reason string) error {
 // 并发安全：内部持写锁；调用方无需再加锁。
 func (b *TaskBoard) transition(taskID string, status TaskStatus, result string) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	t, ok := b.Tasks[taskID] // 查找任务
 	if !ok {
+		b.mu.Unlock()
 		return errors.New("task not found") // 不存在则报错
 	}
 	t.Status = status         // 切换状态
@@ -495,6 +511,8 @@ func (b *TaskBoard) transition(taskID string, status TaskStatus, result string) 
 	t.UpdatedAt = time.Now()  // 刷新任务时间
 	b.UpdatedAt = t.UpdatedAt // 同步看板时间
 	b.recomputeStatusLocked() // 联动重算看板整体状态
+	b.mu.Unlock()
+	b.persist()
 	return nil
 }
 
@@ -553,6 +571,7 @@ type Snapshot struct {
 	Constraints map[string]string `json:"constraints"` // 全局约束快照
 	Tasks       []SubTask         `json:"tasks"`       // 子任务列表（按创建序）
 	UpdatedAt   time.Time         `json:"updated_at"`  // 快照时间
+	Seq         int64             `json:"seq"`         // 自动编号计数器（AddSubTask 的 _t<n> 后缀水位）
 }
 
 // Snapshot 返回看板视图。
@@ -587,7 +606,33 @@ func (b *TaskBoard) Snapshot() Snapshot {
 		Constraints: cs,
 		Tasks:       tasks,
 		UpdatedAt:   b.UpdatedAt,
+		Seq:         b.seq.Load(),
 	}
+}
+
+// BoardFromSnapshot 从持久化快照重建看板（2026-09-28 P1：重启后依赖门状态恢复）。
+// seq 取快照水位与任务 ID 后缀（_t<n>）解析的最大值，防自动编号冲突
+//（write_plan 自定义 ID 无 _t 后缀，解析失败跳过即可）。
+func BoardFromSnapshot(s Snapshot) *TaskBoard {
+	b := NewTaskBoard(s.TopicID, s.Goal)
+	b.Status = s.Status
+	for k, v := range s.Constraints {
+		b.Constraints[k] = v
+	}
+	b.UpdatedAt = s.UpdatedAt
+	maxSeq := s.Seq
+	for _, t := range s.Tasks {
+		tc := t // 值拷贝，防切片元素复用共享
+		b.Tasks[t.ID] = &tc
+		b.Order = append(b.Order, t.ID)
+		if i := strings.LastIndex(t.ID, "_t"); i >= 0 {
+			if n, err := strconv.ParseInt(t.ID[i+2:], 10, 64); err == nil && n > maxSeq {
+				maxSeq = n
+			}
+		}
+	}
+	b.seq.Store(maxSeq)
+	return b
 }
 
 // Brief 紧凑文字表示，用于注入子 Agent 上下文（≈200 token）。
@@ -662,12 +707,29 @@ func (b *TaskBoard) Brief(maxTasks int) string {
 	return out
 }
 
+// persist 持久化切面（2026-09-28 P1 看板持久化）：每个 mutator 成功后调用。
+// 快照经 RLock 拷贝后回调；回调失败由实现方 fail-open（log），不影响内存行为。
+func (b *TaskBoard) persist() {
+	if b.persistFn == nil {
+		return
+	}
+	b.persistFn(b.Snapshot())
+}
+
+// Store 看板持久化接口（bootstrap 适配到 store.BoardStore；board 包不依赖 store——
+// 分层纪律）。实现必须幂等（SaveBoard 为 UPSERT）。
+type Store interface {
+	LoadBoard(topicID string) (Snapshot, bool, error)
+	SaveBoard(snap Snapshot) error
+}
+
 // Manager 多看板管理器（一个会话一个 TaskBoard）。
 //
 // 并发说明：boards map 受 mu 保护；读用 RLock，写用 Lock。
 type Manager struct {
 	mu     sync.RWMutex          // 读写锁保护 boards map
 	boards map[string]*TaskBoard // 按 topicID 索引的看板表
+	store  Store                 // 持久化（nil=纯内存，测试/未接线）
 }
 
 // NewManager 创建管理器。
@@ -681,6 +743,27 @@ type Manager struct {
 // 并发安全：构造期无共享，返回后可并发使用。
 func NewManager() *Manager {
 	return &Manager{boards: make(map[string]*TaskBoard)}
+}
+
+// WithStore 注入持久化（bootstrap 接 store.BoardStore 适配器）。重复注入后者覆盖。
+func (m *Manager) WithStore(s Store) *Manager {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store = s
+	return m
+}
+
+// persist 是注入各 TaskBoard 的持久化回调（持 Manager 读锁取 store，fail-open）。
+func (m *Manager) persist(snap Snapshot) {
+	m.mu.RLock()
+	s := m.store
+	m.mu.RUnlock()
+	if s == nil {
+		return
+	}
+	if err := s.SaveBoard(snap); err != nil {
+		log.Printf("[board] persist failed: topic=%s err=%v", snap.TopicID, err)
+	}
 }
 
 // Get 获取看板，没有则返回 nil。
@@ -701,28 +784,67 @@ func (m *Manager) Get(topicID string) *TaskBoard {
 	return m.boards[topicID] // map 缺键时返回 nil
 }
 
-// GetOrCreate 取或新建看板。
+// restoreLocked 从持久层恢复看板到内存（mu 已持写锁时调用）。
+// 命中则经 BoardFromSnapshot 重建、注入 persistFn 并登记到 boards 后返回；
+// 未接 store / 无记录 / 读取出错返回 nil（出错仅记日志，fail-open 由调用方决定回落）。
+func (m *Manager) restoreLocked(topicID string) *TaskBoard {
+	if m.store == nil {
+		return nil
+	}
+	snap, found, err := m.store.LoadBoard(topicID)
+	if err != nil {
+		log.Printf("[board] restore failed: topic=%s err=%v", topicID, err)
+		return nil
+	}
+	if !found {
+		return nil
+	}
+	b := BoardFromSnapshot(snap)
+	b.persistFn = m.persist
+	m.boards[topicID] = b
+	return b
+}
+
+// GetRestored 取看板；内存 miss 且接了 store 时先从持久层恢复（不新建）。
+// 与 GetOrCreate 的唯一差别是缺失时不新建——供派发依赖门/看板回写等只读消费方
+// 在重启后、write_plan 重建之前找回依赖门状态（P1-5：依赖门状态随之恢复）。
 //
-// 职责：若 topicID 已有看板则返回旧的；否则新建并登记。
-// 用于会话首次访问时惰性创建看板。
+// 返回：已存在或恢复的 *TaskBoard；未接 store / 无记录 / 恢复失败返回 nil。
 //
-// 参数：
-//   - topicID：话题 ID。
-//   - goal：新建时使用的全局目标。
-//
-// 返回：已存在或新建的 *TaskBoard。
-//
-// 副作用：可能向 boards 写入新条目。
-//
-// 并发安全：内部持写锁，保证同 topicID 只创建一次。
-func (m *Manager) GetOrCreate(topicID, goal string) *TaskBoard {
+// 并发安全：内部持写锁；恢复路径 PG 查询在锁内（惰性低频，与 GetOrCreate 同一权衡）。
+func (m *Manager) GetRestored(topicID string) *TaskBoard {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if b, ok := m.boards[topicID]; ok {
 		return b // 命中已有看板
 	}
+	return m.restoreLocked(topicID)
+}
+
+// GetOrCreate 取或新建看板；内存 miss 且接了 store 时先从持久层恢复
+//（重启后依赖门/任务状态随之找回），恢复失败/无记录才新建。
+//
+// 参数：
+//   - topicID：话题 ID。
+//   - goal：新建时使用的全局目标。
+//
+// 返回：已存在、恢复或新建的 *TaskBoard。
+//
+// 副作用：可能向 boards 写入新条目；可能触发一次 store 读。
+//
+// 并发安全：内部持写锁，保证同 topicID 只创建一次。
+func (m *Manager) GetOrCreate(topicID, goal string) *TaskBoard {
+	m.mu.Lock()
+	defer m.mu.Unlock() // 恢复路径 PG 查询在锁内（惰性触发、低频，换取单创建语义）
+	if b, ok := m.boards[topicID]; ok {
+		return b // 命中已有看板
+	}
+	if b := m.restoreLocked(topicID); b != nil {
+		return b // 从持久层恢复
+	}
 	b := NewTaskBoard(topicID, goal) // 否则新建
-	m.boards[topicID] = b            // 登记到管理器
+	b.persistFn = m.persist
+	m.boards[topicID] = b // 登记到管理器
 	return b
 }
 

@@ -209,6 +209,8 @@ var sessionScopedTables = []string{
 	"agent_messages",
 	"agent_compress_states",
 	"agent_tree_nodes",
+	"mailbox_messages",
+	"session_boards",
 }
 
 // DeleteSessionData 硬删除会话的全部持久化数据（sessionScopedTables 逐表 DELETE）。

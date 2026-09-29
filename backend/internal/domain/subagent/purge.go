@@ -30,6 +30,9 @@ func (d *Dispatcher) PurgeSession(sessionID string, nodeIDs []string) {
 		d.ledger.Purge(sessionID)
 	}
 	d.suspendStates.Delete(sessionID)
+	if d.pendingReqs != nil {
+		d.pendingReqs.purgeSession(sessionID)
+	}
 	// 2. 节点级标记：手动暂停标记 + 各类 sync.Map。
 	d.pauseRequestMu.Lock()
 	for _, id := range nodeIDs {

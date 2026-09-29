@@ -357,6 +357,15 @@ type Dispatcher struct {
 	// maxPausedResumes 同一 Paused domain 允许的最大续跑次数；<=0 时按默认值 1。
 	maxPausedResumes int
 
+	// concPool 子 Agent 全局并发池（2026-09-28 P1）：nil=不限（旧行为）。
+	// 只做准入控制，生命周期权威仍是 Tree。注意与 d.pool（热驻 idle 池）命名区分。
+	concPool *execPool
+
+	// pendingReqs 协作问答待应答注册表（2026-09-28 P0 request/reply 配对）。
+	pendingReqs *pendingRequestRegistry
+	// peerReqTimeout 协作询问超时升级时长（patrol sweep 用）；<=0 按默认 15min。
+	peerReqTimeout time.Duration
+
 	// dispatchRetryCount 叶子助手 kind=error 失败的自动重派次数（TODO #23，最小一档）。
 	// 同任务同前缀重跑一次；domain/timeout/killed/loop_guard 不自动重试（交 MetaAgent 决策）。
 	// 与 LLM 调用层重试（react_agent retry_count）正交：那层重试的是模型调用本身。
@@ -1002,6 +1011,7 @@ func (d *Dispatcher) patrol() {
 					}
 				}()
 				d.scanStuck()
+				d.sweepPendingRequests()
 			}()
 		}
 	}
@@ -1029,6 +1039,10 @@ func (d *Dispatcher) scanStuck() {
 		threshold := d.heartbeatTimeout
 		if roleIDFromAgentID(k.(string)) == "domain" {
 			threshold = domainThreshold
+		}
+		// 0. 并发池排队中：豁免（未开始执行，无"静默"可言）。
+		if e.queued.Load() {
+			return true
 		}
 		// 1. 在飞 LLM：豁免（只展示不杀）。
 		if e.llmInFlight.Load() {
@@ -1074,6 +1088,13 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	// 递减 + notify 收尾。
 	if meta.cancel != nil {
 		meta.cancel()
+	}
+	// 并发池名额口径（2026-09-28 终审 #5，接受有界）：名额由执行 goroutine 的
+	// defer release() 归还；若 goroutine 挂死在无视 ctx 的 SDK/流式调用里，名额随
+	// goroutine 一起滞留直至进程重启——kill 无法强收（强收后迟到的 Release 会超发
+	// 名额）。此处打日志暴露口径，占满时排查有据。
+	if d.concPool != nil {
+		log.Printf("[subagent] exec-pool note: sub=%s 名额随 goroutine 退出才归还；若其挂死不退，名额滞留至进程重启", subAgentID)
 	}
 	// retryable=true（2026-08-27）：killed 实际多死于验证阶段长工具执行中，盘上产物
 	// 大概率可续建——retryable=false 曾误导父 LLM 从零重派（fruit 任务实证）。
@@ -1139,7 +1160,7 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	d.activity.Delete(subAgentID)
 	d.running.Delete(subAgentID)
 	if d.mailbox != nil {
-		d.mailbox.Purge(subAgentID)
+		d.purgeMailboxWithNotice(subAgentID, "已因长时间无活动被判定假死终止")
 	}
 }
 
@@ -1299,21 +1320,18 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 	// 墙钟与派发路径同口径（reconClock 兜底），否则复活一个侦察失控的 domain
 	// 会拿满全局墙钟（默认 30min）继续空转。
 	effectiveTimeout := d.effectiveWallClock(roleDef.ID, 0)
-	var cancel context.CancelFunc = func() {}
-	if effectiveTimeout > 0 {
-		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)
-	}
+	baseCtx, baseCancel := context.WithCancel(subAgentCtx)
 
 	if d.treeFn == nil {
-		cancel()
+		baseCancel()
 		return fmt.Errorf("权威树未接线，无法复活 %s", subAgentID)
 	}
 	t := d.treeFn(tool.SessionIDFromContext(subAgentCtx))
 	if t == nil || !t.Reopen(subAgentID) {
-		cancel()
+		baseCancel()
 		return fmt.Errorf("节点 %s 非终态，不可复活", subAgentID)
 	}
-	t.SetCancel(subAgentID, cancel)
+	t.SetCancel(subAgentID, baseCancel)
 
 	// 复活种子（TODO #20④ 失败处置三选）：默认剪枝重派——种子=原任务+检查点账本+用户
 	// 新指令，上轮失败轨迹不进活跃上下文（底账 archived 可查）；Done/轻微场景自动走
@@ -1352,7 +1370,7 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 	// 看板回写：该领域对应计划条目从"完成/失败"翻回进行中，否则面板显示已完成、
 	// 实际又在重跑（与派发路径同口径）。
 	d.boardAssign(ctx, parentID, node.Domain, subAgentID)
-	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(subAgentCtx), wallClock: effectiveTimeout}
+	meta := &subAgentMeta{cancel: baseCancel, parentID: parentID, sessionID: tool.SessionIDFromContext(subAgentCtx), wallClock: effectiveTimeout}
 	d.subMeta.Store(subAgentID, meta)
 	ev := newEvidence()
 	if roleDef.ID != "meta" {
@@ -1361,7 +1379,7 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 	d.ensurePatrol()
 	started := time.Now()
 	go func() {
-		defer cancel()
+		defer baseCancel()
 		// CompareAndDelete：只清自己登记的那份（见 dispatchOne 同名注释）。
 		defer d.subMeta.CompareAndDelete(subAgentID, meta)
 		defer d.activity.CompareAndDelete(subAgentID, ev)
@@ -1370,7 +1388,17 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 		// 复活按默认 ReAct 模式重跑（mode=react、verify_kind 留空走角色默认校验分层）——
 		// 原派发的 mode/responsibility 未随节点持久化，无法复原；职责边界由种子里的
 		// 原任务文本与领域标签承载，必要时模型可自行重新派发下游。
-		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, seed, node.Domain, "", agent.ModeReact, "", started)
+		paused := false
+		runCtx, runCancel, release, gateErr := d.enterExecGate(baseCtx, ev, subAgentID, effectiveTimeout)
+		if gateErr != nil {
+			log.Printf("[subagent] revive gate-abort: sub=%s err=%v", subAgentID, gateErr)
+			// 会话软停止的 gate-abort 由 settleGateAbort 代收口（见 dispatchOne 同名注释）。
+			paused = d.settleGateAbort(baseCtx, parentID, subAgentID, roleDef.ID)
+		} else {
+			defer runCancel()
+			defer release()
+			paused = d.runSubAgent(runCtx, parentID, subAgentID, *roleDef, seed, node.Domain, "", agent.ModeReact, "", started)
+		}
 		if !paused && parentID != "" {
 			meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
 		}
@@ -1452,6 +1480,7 @@ func NewDispatcher(
 		softStops:         make(map[string]bool),
 		pauseRequests:     make(map[string]bool),
 		planState:         newPlanConfirmState(),
+		pendingReqs:       newPendingRequestRegistry(),
 		batchDigestEnabled: true, // call_sub_agents 波聚合默认开（config agent.batch_digest_enabled 可关）
 	}
 }
@@ -1797,6 +1826,30 @@ func (d *Dispatcher) WithMaxTotalDispatches(n int) *Dispatcher {
 	return d
 }
 
+// WithPeerRequestTimeout 配置协作询问的超时升级时长（patrol 每 tick 扫超期项，
+// 给提问方父 Agent 投 escalate）。<=0 保持默认 15min。
+func (d *Dispatcher) WithPeerRequestTimeout(t time.Duration) *Dispatcher {
+	if t > 0 {
+		d.peerReqTimeout = t
+	}
+	return d
+}
+
+// WithConcurrencyLimit 配置同时在跑的子 Agent 全局上限（2026-09-28 P1）：
+// 超额派发 FIFO 排队（排队不计墙钟、巡检豁免），<=0 不限（旧行为）。
+func (d *Dispatcher) WithConcurrencyLimit(n int) *Dispatcher {
+	d.concPool = newExecPool(n)
+	return d
+}
+
+// peerRequestTimeoutOrDefault 读协作询问超时（未配置按 15min）。
+func (d *Dispatcher) peerRequestTimeoutOrDefault() time.Duration {
+	if d.peerReqTimeout > 0 {
+		return d.peerReqTimeout
+	}
+	return 15 * time.Minute
+}
+
 // ResetDispatchCounts 清空指定 session 的派发计数。
 // 新用户消息 = 新任务起点：上一任务的限额消耗不应卡死下一任务。
 func (d *Dispatcher) ResetDispatchCounts(sessionID string) {
@@ -1961,6 +2014,70 @@ func (d *Dispatcher) wakeSuspendedParent(parentID, hint string) {
 		return
 	}
 	d.sessionWakeFn(parentID, hint)
+}
+
+// sweepPendingRequests 扫超期未答的协作询问，给提问方的父 Agent 投 escalate 告警
+//（提问方等不到回复不该只能沉默）。父取不到（树未接线/节点无父）时回退发到会话
+// 顶层（meta，agentID==sessionID）；提问方本身是顶层 meta 时无人可升
+//（to=="" 或 to==pr.From），跳过不升级。
+func (d *Dispatcher) sweepPendingRequests() {
+	if d.pendingReqs == nil || d.mailbox == nil {
+		return
+	}
+	for _, pr := range d.pendingReqs.expire(time.Now()) {
+		to := ""
+		if d.treeFn != nil {
+			if t := d.treeFn(sessionIDFromAgentID(pr.From)); t != nil {
+				if n, ok := t.Get(pr.From); ok {
+					to = n.ParentID
+				}
+			}
+		}
+		if to == "" {
+			to = sessionIDFromAgentID(pr.From)
+		}
+		if to == "" || to == pr.From {
+			continue
+		}
+		if _, err := d.mailbox.Send(&mailbox.Message{
+			From:    "dispatcher",
+			To:      to,
+			Type:    mailbox.MsgEscalate,
+			Subject: "协作询问超时未答: " + truncateRunes(pr.Subject, 60),
+			Body: fmt.Sprintf("【系统】%s 向 %s 的询问（消息 %s：%s）超过 %s 未获回复，登记已销账。"+
+				"请处置：代为追问/改派/据现有信息收口。",
+				pr.From, pr.To, pr.MsgID, truncateRunes(pr.Subject, 80), d.peerRequestTimeoutOrDefault()),
+		}); err != nil {
+			log.Printf("[subagent] pending-timeout escalate failed: to=%s err=%v", to, err)
+			continue
+		}
+		d.wakeSuspendedParent(to, "【系统】有协作询问超时未答，请查收邮箱处置。")
+		log.Printf("[subagent] PENDING-TIMEOUT: msg=%s from=%s to=%s escalated=%s", pr.MsgID, pr.From, pr.To, to)
+	}
+}
+
+// RegisterRestoredPending 崩溃恢复重投时重建待应答注册（bootstrap 经 mailbox
+// WithRestoreHandler 接线）：未读 request/escalate 顺延一个超时周期重新计时。
+// user/dispatcher/system 等系统侧发送者不登记（它们不等回复）。
+func (d *Dispatcher) RegisterRestoredPending(msg *mailbox.Message) {
+	if d.pendingReqs == nil || msg == nil {
+		return
+	}
+	if msg.Type != mailbox.MsgRequest && msg.Type != mailbox.MsgEscalate {
+		return
+	}
+	if msg.From == "" || msg.From == "user" || msg.From == "dispatcher" || msg.From == "system" {
+		return
+	}
+	d.pendingReqs.add(&pendingRequest{
+		MsgID:     msg.ID,
+		From:      msg.From,
+		To:        msg.To,
+		ThreadID:  msg.ThreadID,
+		Subject:   msg.Subject,
+		CreatedAt: time.Now(),
+		Deadline:  time.Now().Add(d.peerRequestTimeoutOrDefault()),
+	})
 }
 
 // WithTree 注入权威 Agent 树访问器。
@@ -2135,8 +2252,8 @@ func (d *Dispatcher) RegisterMessagingTool(r *tool.Registry) {
 }
 
 // sendMessageTool 实现 send_message 工具：向指定 Agent 实例邮箱投递一条消息。
-// 消息 Type 为 MsgRequest，携带 ReplyTo=caller Agent ID，使接收方可按请求-响应
-// 语义回投递回复（用 send_message 再发一条 Type=MsgReply 的消息）。
+// request/escalate 投递即登记进 pending 问答注册表；reply 经 reply_to（或自动配对）
+// 销账，使接收方可按请求-响应语义回投递回复（用 send_message 再发一条 Type=MsgReply 的消息）。
 type sendMessageTool struct {
 	dispatcher *Dispatcher
 }
@@ -2160,7 +2277,9 @@ func (t *sendMessageTool) Description() string {
 		"纯告知用 info；reply 只用于**回答别人对你的提问**；escalate 为升级求助" +
 		"（父 Agent 收到 [升级] 前缀消息需按规程处置）。" +
 		"注意：把问句标成 reply/info 时对方不会按询问处置（不触发\"当轮必须回复\"纪律），你会等到沉默。" +
-		"目标 Agent 已销毁时返回\"消息未送达\"。"
+		"目标 Agent 已销毁时返回\"消息未送达\"。" +
+		"reply_to：回答提问时填来信的 id（来信注入头 [mailbox from X id=…] 里有），" +
+		"未填时系统自动配对最近一条该方向的未答提问；问答超时会升级给你的上级。"
 }
 
 // Execute 执行 send_message 工具调用。
@@ -2210,19 +2329,49 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 
 	// thread_id 可选：同一问答链上的消息共享 ThreadID，便于多轮验证闭环聚合。
 	threadID, _ := args["thread_id"].(string)
+	// reply_to 可选（2026-09-28 配对机制）：回答别人提问时填来信的 id（注入文本
+	// [mailbox from X id=… thread=…] 里可查）。未填时自动配对最近一条该方向未答请求。
+	replyTo, _ := args["reply_to"].(string)
+	if msgType == mailbox.MsgReply {
+		if replyTo == "" && d.pendingReqs != nil {
+			if pr := d.pendingReqs.matchAuto(fromID, toID, threadID); pr != nil {
+				replyTo = pr.MsgID
+				if threadID == "" {
+					threadID = pr.ThreadID
+				}
+			}
+		} else if replyTo != "" && d.pendingReqs != nil {
+			d.pendingReqs.complete(replyTo)
+		}
+	}
 
-	id, err := d.mailbox.Send(&mailbox.Message{
+	msg := &mailbox.Message{
 		From:     fromID,
 		To:       toID,
 		Type:     msgType,
 		Subject:  subject,
 		Body:     body,
-		ReplyTo:  fromID,
+		ReplyTo:  replyTo,
 		ThreadID: threadID,
-	})
+	}
+	id, err := d.mailbox.Send(msg)
 	if err != nil {
 		// 死信可见（TODO #23）：目标已销毁时告知发送方，不再静默消失。
 		return &tool.Result{Tool: "send_message", Error: fmt.Sprintf("消息未送达: %v", err)}
+	}
+
+	// 问答配对登记：request/escalate 入册等答，patrol sweep 超时升级；Send 已把
+	// 缺省 ThreadID 回填为消息 ID，这里直接读。
+	if (msgType == mailbox.MsgRequest || msgType == mailbox.MsgEscalate) && d.pendingReqs != nil {
+		d.pendingReqs.add(&pendingRequest{
+			MsgID:     id,
+			From:      fromID,
+			To:        toID,
+			ThreadID:  msg.ThreadID,
+			Subject:   subject,
+			CreatedAt: time.Now(),
+			Deadline:  time.Now().Add(d.peerRequestTimeoutOrDefault()),
+		})
 	}
 
 	// 里程碑检查点（TODO #20④）：发送方播报里程碑即快照任务账本——中途好状态成为
@@ -3305,7 +3454,8 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// 异步启动子 Agent，并立即返回子 Agent ID 作为句柄。
 	// 使用 context.Background() 创建独立于父 ctx 的上下文：
 	//   - 父会话取消不会波及子 Agent，避免长任务结果丢失。
-	//   - timeout>0 时才叠加超时；defer cancel 确保 goroutine 退出时释放上下文资源。
+	//   - timeout>0 时才叠加超时（2026-09-28 P1 起在并发池出队后才挂载，见 enterExecGate）；
+	//     defer baseCancel 确保 goroutine 退出时释放上下文资源。
 	//   - 继承父 ctx 的 sessionID：子 Agent 工具事件经 handleToolEvent 写入会话日志，
 	//     否则事件 SessionID 为空被静默丢弃（参见 service_react.handleToolEvent 的 isRunning 分支）。
 	// 派发级墙钟（2026-08-19）：wall_clock_min 是代码级预算，替代 roles.yaml 提示词墙钟
@@ -3349,10 +3499,10 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	if imgs := agent.UserImagesFromContext(ctx); len(imgs) > 0 {
 		subAgentCtx = agent.WithUserImages(subAgentCtx, imgs)
 	}
-	cancel := context.CancelFunc(func() {})
-	if effectiveTimeout > 0 {
-		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)
-	}
+	// 墙钟移位（2026-09-28 P1）：派发点只建可取消基底，WithTimeout 挪到并发池
+	// 出队后（enterExecGate）——排队不烧墙钟预算；树/巡检的 cancel 句柄绑基底
+	//（baseCancel），排队期取消 Acquire 立即返回，无空窗。
+	baseCtx, baseCancel := context.WithCancel(subAgentCtx)
 	log.Printf("[subagent] dispatch: parent=%s sub=%s role=%s task=%q", parentID, subAgentID, roleID, taskBrief)
 	// 权威树注册：在 goroutine 启动前同步 Register + SetCancel，保证 Cancel 端点不会因时序漏掉句柄。
 	// treeFn 为 nil 时（测试场景）跳过，不影响派发主流程。
@@ -3368,7 +3518,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 					Started:  started,
 					Status:   orchestrator.StatusRunning,
 				})
-				t.SetCancel(subAgentID, cancel)
+				t.SetCancel(subAgentID, baseCancel)
 			}
 		}
 	}
@@ -3397,7 +3547,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// parentID 链向上冒泡刷新祖先时间戳，domain 等子/等回信期间靠后代活动保持存活；
 	// 自身无 LLM/工具活动且无活跃后代超阈值才判假死。meta 不注册（会话级由用户/墙钟控制）。
 	isMeta := roleDef.ID == "meta"
-	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: tool.SessionIDFromContext(ctx), wallClock: effectiveTimeout}
+	meta := &subAgentMeta{cancel: baseCancel, parentID: parentID, sessionID: tool.SessionIDFromContext(ctx), wallClock: effectiveTimeout}
 	d.subMeta.Store(subAgentID, meta)
 	ev := newEvidence()
 	if !isMeta {
@@ -3409,7 +3559,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		d.aggByAgent.Store(subAgentID, &mapAggEntry{agg: opt.aggregate, idx: opt.aggIdx, item: opt.aggItem})
 	}
 	go func() {
-		defer cancel()
+		defer baseCancel()
 		// P1-3 panic 兜底：recover 后按 kill 路径语义收尾（父计数递减 + 树 Failed +
 		// 回告父），防一处 SDK/工具 panic 崩掉整个后端带走全部在跑会话。
 		// 注册在最前 → panic 展开时最后运行，排在下方各清理 defer 之后。
@@ -3424,7 +3574,21 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
 		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
-		paused := d.runSubAgent(subAgentCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, mode, verifyKind, started)
+		paused := false
+		runCtx, runCancel, release, gateErr := d.enterExecGate(baseCtx, ev, subAgentID, effectiveTimeout)
+		if gateErr != nil {
+			// 排队期被取消：cancel_agent/巡检硬取消由取消方收口树态与父通知，
+			// 此处只走正常尾部清理（trackChildDone 经下方 doneOnce 兜底），不调 runSubAgent。
+			// 会话软停止例外：ReactService.Stop 刻意不改树态、委托 runSubAgent 的取消分支
+			// 收口，gate 出局时该分支永不执行——settleGateAbort 代收口（domain→Paused
+			// 待续跑返回 true；叶子→终态+通知父返回 false，尾部照常递减计数）。
+			log.Printf("[subagent] gate-abort: sub=%s err=%v（排队期被取消）", subAgentID, gateErr)
+			paused = d.settleGateAbort(baseCtx, parentID, subAgentID, roleDef.ID)
+		} else {
+			defer runCancel()
+			defer release()
+			paused = d.runSubAgent(runCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, mode, verifyKind, started)
+		}
 		// 聚合模式：notify 未触达（暂停/无邮箱等路径）时兜底收口本项，防聚合器永久悬挂。
 		// 正常完成路径 notify 已先消费登记，此处 Load 不到即 no-op。
 		if opt != nil && opt.aggregate != nil {
@@ -3445,8 +3609,11 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	// grace=min(2min,T/4) 才投）实证失效：2h 预算第 118 分钟才警告，慢模型单轮 2-5 分钟，
 	// 警告被 drain 时 Agent 已被杀，全程无感知硬杀（2026-08-28 渲染领域 Agent 两小时撞墙）。
 	// agent 提前完成时 ctx 被 defer cancel，goroutine 随之退出，零泄漏。
+	//（2026-09-28 P1 墙钟移位：退出信号绑 baseCtx——run goroutine 的 defer baseCancel()
+	// 在完成/取消/排队期 gate-abort 时关闭它；subAgentCtx 已不带 timeout/cancel，
+	// 其 Done() 对 Background 基底恒为 nil，会静默禁用整条预警阶梯。）
 	if effectiveTimeout > 0 && d.mailbox != nil {
-		wallClockWarnLadder(d.mailbox, subAgentID, effectiveTimeout, subAgentCtx.Done())
+		wallClockWarnLadder(d.mailbox, subAgentID, effectiveTimeout, baseCtx.Done())
 	}
 
 	// 侦察中点预警（2026-08-21）：domain 用侦察墙钟（未显式给 wall_clock_min）时，
@@ -3459,7 +3626,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 			go func() {
 				select {
 				case <-time.After(half):
-				case <-subAgentCtx.Done():
+				case <-baseCtx.Done():
 					return
 				}
 				_, _ = d.mailbox.Send(&mailbox.Message{
@@ -4278,7 +4445,11 @@ func parentIDOfAgentID(agentID string) string {
 //   - errVerifyMissing：L0 校验缺验证证据（重试 1 轮后仍缺）；
 //   - errUnverified：judge LLM 不可用（fail-closed，result.Unverified=true）；
 //   - 成功时 err == nil，result.Text 为最终答复。
-func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode, verifyKind string) (*agent.ReActAgent, agent.ReactResult, error) {
+//
+// 出口邮箱处置：仅终结出口（成功/失败/部分返回/硬取消）清空邮箱并回投死信；
+// 暂停出口（errPaused / 手动暂停 / 软停止 domain，见 pauseExit）保留邮箱待续跑 drain。
+// 命名返回 err 供收尾 defer 判定出口类别（前两返回值本函数不使用命名形参）。
+func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode, verifyKind string) (_ *agent.ReActAgent, _ agent.ReactResult, err error) {
 	provider, err := d.providerForAgent(ctx, roleDef.ID, subAgentID)
 	if err != nil {
 		return nil, agent.ReactResult{}, fmt.Errorf("get model: %w", err)
@@ -4404,9 +4575,13 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 
 	d.running.Store(subAgentID, sub)
 	defer d.running.Delete(subAgentID)
+	// 仅终结出口清邮箱回投死信：暂停出口（errPaused / 手动暂停 / 软停止 domain）
+	// 的 Agent 会经 resume 续跑，收件箱必须保留——误清会给提问方回投"已终结"死信、
+	// 销账 pending（15 分钟超时升级随之失效）、PG 侧 MarkDead（重启恢复丢问题），
+	// 而对方其实还会被续跑。会话级硬删除仍由 PurgeSession/finalizeSession 负责。
 	defer func() {
-		if d.mailbox != nil {
-			d.mailbox.Purge(subAgentID)
+		if !d.pauseExit(subAgentID, roleDef.ID, tool.SessionIDFromContext(ctx), err) {
+			d.purgeMailboxWithNotice(subAgentID, "已终结")
 		}
 	}()
 
@@ -4894,9 +5069,11 @@ func (d *Dispatcher) planProgress(ctx context.Context, subAgentID string) func(s
 // 按 roleDef.ID == "domain" 分支。
 //
 // 生命周期：
-//   - 再触限：SaveMessages 覆盖 + tree.Pause + 通知父 + 返回 result.LimitReached=true。
+//   - 再触限：SaveMessages 覆盖 + tree.Pause + 通知父 + 返回 result.LimitReached=true
+//     （非终结：邮箱保留待续跑 drain，收尾 defer 不清）。
 //   - 完成：tree.Finish Done + notify 父 mailbox + trackChildDone（父 Agent 解除阻塞）。
 //   - 出错：treeFinish Failed + notify 失败 + trackChildDone + 返回 err。
+//   - 终结出口（完成/出错/准入失败）收尾 defer 清邮箱并回投死信（同 runSubAgentOnce 口径）。
 //
 // pausedNodeID 为 Paused 节点 ID；parentID 从节点 ParentID 取。
 // 前置缺失（sid/treeFn/msgStore 为空）或加载空时返回错误，调用方应回退 pauseSession 不跑（防丢上下文）。
@@ -5020,28 +5197,42 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	// 每会话工作目录（S2）：subCtx 由基底重建，从入站 ctx（resumePausedDomain
 	// 已注入）显式重注入，保证 resume 的 domain Agent 工具执行落在会话工作目录。
 	subCtx = tool.WithWorkDir(subCtx, tool.WorkDirFromContext(ctx))
-	cancel := context.CancelFunc(func() {})
-	if d.timeout > 0 {
-		subCtx, cancel = context.WithTimeout(subCtx, d.timeout)
-	}
-	t.Resume(pausedNodeID, cancel)
+	baseCtx, baseCancel := context.WithCancel(subCtx)
+	t.Resume(pausedNodeID, baseCancel)
 	d.running.Store(pausedNodeID, sub)
 	// 心跳（TODO #25-3）：resume 的 domain 注册 activity 证据，其子 Agent 活动冒泡保活；
 	// 巡检超 domain 阈值判假死。defer 清理与子 Agent 派发路径一致。
-	d.activity.Store(pausedNodeID, newEvidence())
+	ev := newEvidence()
+	d.activity.Store(pausedNodeID, ev)
 	defer d.activity.Delete(pausedNodeID)
 	defer d.running.Delete(pausedNodeID)
 	defer d.heldSkills.Delete(pausedNodeID)
-	defer cancel()
+	defer baseCancel()
+	// 仅终结出口清邮箱回投死信（同 runSubAgentOnce 口径）：再触限重暂停的节点
+	// 还会被 resume，误清会回投"已终结"死信并销账 pending；会话级硬删除仍由
+	// PurgeSession/finalizeSession 负责。
+	rePaused := false
 	defer func() {
-		if d.mailbox != nil {
-			d.mailbox.Purge(pausedNodeID)
+		if !rePaused {
+			d.purgeMailboxWithNotice(pausedNodeID, "已终结")
 		}
 	}()
 
 	log.Printf("[subagent] resume: sub=%s parent=%s domain=%s msgs=%d", pausedNodeID, parentID, pausedNode.Domain, len(msgs))
 
-	result, err := sub.RunWithHistory(subCtx, "继续", msgs)
+	// 并发池准入（P1）：resume 是完整任务执行，同样占名额；排队期 ctx 取消按
+	// 续跑失败收口（树 Failed + 通知父 + 计数递减），与下方 err 分支同构。
+	runCtx, runCancel, release, gateErr := d.enterExecGate(baseCtx, ev, pausedNodeID, d.timeout)
+	if gateErr != nil {
+		d.treeFinish(subCtx, pausedNodeID, "", gateErr)
+		d.notify(parentID, pausedNodeID, formatSubAgentFailure(subCtx, gateErr, agent.ReactResult{}, d.timeout, ""), nil)
+		d.trackChildDone(parentID)
+		return agent.ReactResult{}, gateErr
+	}
+	defer runCancel()
+	defer release()
+
+	result, err := sub.RunWithHistory(runCtx, "继续", msgs)
 	files := agent.FilesModifiedFromHistory(result.History)
 	if err != nil {
 		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
@@ -5056,6 +5247,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 			log.Printf("[subagent] resume re-pause save messages failed: sub=%s err=%v", pausedNodeID, saveErr)
 		}
 		t.Pause(pausedNodeID, "token budget exhausted (resume)")
+		rePaused = true // 重暂停非终结：邮箱保留待续跑 drain，收尾 defer 不清
 		// 再触限：父必须知情（否则父等 resume 时该节点静默占着未决计数）。
 		d.notify(parentID, pausedNodeID, "子 Agent 再次触达 token 上限已重新暂停（上下文保留）；可稍后 resume_agent 继续，或 cancel_agent 放弃并按部分产出收口。", agent.FilesModifiedFromHistory(result.History))
 		log.Printf("[subagent] resume RE-PAUSED: sub=%s (token budget)", pausedNodeID)
@@ -5130,7 +5322,7 @@ func (d *Dispatcher) concludePaused(ctx context.Context, pausedNode orchestrator
 	d.notify(parentID, pausedNodeID, text, files)
 	d.trackChildDone(parentID)
 	if d.mailbox != nil {
-		d.mailbox.Purge(pausedNodeID)
+		d.purgeMailboxWithNotice(pausedNodeID, "已达续跑上限强制收口")
 	}
 	log.Printf("[subagent] CONCLUDED: sub=%s parent=%s (resume cap %d reached, partial len=%d)", pausedNodeID, parentID, maxRes, len(partial))
 	return agent.ReactResult{Text: text}, nil
@@ -5232,6 +5424,29 @@ var errPaused = errors.New("sub-agent paused on token budget")
 // runSubAgent 见此信号:treeFinish Done("部分完成")+ notify 父 mailbox 部分 + trackChildDone 照常减
 // (叶子是叶子,不持久化 history,父 domain 收部分后自行决定重派或接手)。
 var errPartialReturn = errors.New("sub-agent partial return on token budget")
+
+// pauseExit 判定 runSubAgentOnce 的出口是否为"暂停待续跑"而非终结，与 runSubAgent
+// 的取消收尾分流同口径：
+//   - errPaused：domain 触达 token 上限（history 已存 + tree.Pause，等 resume 续跑）；
+//   - context.Canceled + 手动暂停标记（pause_agent/TUI PauseAgent 先标记再取消，
+//     runSubAgent 收尾落 tree.Pause，domain 与叶子同路径）；
+//   - context.Canceled + 会话软停止 + domain（runSubAgent 落 tree.Pause；
+//     叶子软停按部分完成终结，不在此列）。
+//
+// 暂停出口的 Agent 还会被 resume：收尾 defer 据此跳过 purgeMailboxWithNotice，
+// 收件箱保留（未读邮件等续跑后 drain），不发"已终结"死信、不销账 pending。
+func (d *Dispatcher) pauseExit(subAgentID, roleID, sessionID string, err error) bool {
+	if errors.Is(err, errPaused) {
+		return true
+	}
+	if !errors.Is(err, context.Canceled) {
+		return false
+	}
+	if d.isPauseRequested(subAgentID) {
+		return true
+	}
+	return roleID == "domain" && d.isSoftStop(sessionID)
+}
 
 // errUnverified 标记校验 judge LLM 不可用（TODO #43 fail-closed）：result.Unverified=true，
 // runSubAgent 见此信号按 FailureKindUnverified（retryable=false）notify 父并附未验证产出全文，

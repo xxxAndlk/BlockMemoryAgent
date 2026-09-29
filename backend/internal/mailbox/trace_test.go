@@ -2,7 +2,7 @@ package mailbox
 
 import "testing"
 
-// TestSendTraceHook 验证 WithTrace 钩子：定向投递与广播投递成功后各触发一次；
+// TestSendTraceHook 验证 WithTrace 钩子：定向投递成功后触发一次；
 // 死信（收件人已 Purge）不触发；钩子收到的副本与 inbox 中消息解耦。
 func TestSendTraceHook(t *testing.T) {
 	m := New()
@@ -15,17 +15,11 @@ func TestSendTraceHook(t *testing.T) {
 	if len(traced) != 1 || traced[0].To != "b" || traced[0].From != "a" {
 		t.Fatalf("定向投递应留痕 1 条, got %+v", traced)
 	}
-	if _, err := m.Send(&Message{From: "a", To: "*", Type: MsgInfo, Subject: "b"}); err != nil {
-		t.Fatal(err)
-	}
-	if len(traced) != 2 {
-		t.Fatalf("广播应留痕, got %d", len(traced))
-	}
 	m.Purge("b")
 	if _, err := m.Send(&Message{From: "a", To: "b", Type: MsgRequest, Subject: "x"}); err == nil {
 		t.Fatal("已销毁收件人应死信")
 	}
-	if len(traced) != 2 {
+	if len(traced) != 1 {
 		t.Fatalf("死信不应留痕, got %d", len(traced))
 	}
 }

@@ -16,7 +16,8 @@ package subagent
 //   - 会话级挂起（触限暂停全树）：sessionSuspendState 广播 wake channel，叶子与
 //     domain 的 SuspendGate.Park 阻塞其上；ResumeSessionAgents close 广播唤醒。
 //   - 心跳/墙钟豁免：Idle/挂起时 activity.Delete（scanStuck Range 不到）；
-//     domain 墙钟为 slot timer（挂起时 Stop 存剩余 wallRemain，恢复重挂），非 ctx deadline。
+//     domain 墙钟为 slot timer（挂起时 Stop 存剩余 wallRemain，恢复重挂；并发池
+//     过闸/出队才挂载，排队不计预算），非 ctx deadline。
 //
 // 关闭（默认）时所有路径零变化：dispatchOne 不分流，supervisor 不启动。
 
@@ -695,7 +696,7 @@ func (d *Dispatcher) destroySlot(s *domainSlot, reason string) {
 	d.lastWrites.Delete(s.id)
 	d.heldSkills.Delete(s.id)
 	if d.mailbox != nil {
-		d.mailbox.Purge(s.id)
+		d.purgeMailboxWithNotice(s.id, "热驻槽已销毁")
 	}
 	// 队列中已 trackChildStart 的任务补偿递减（销毁时永不执行）。
 	for range queued {
@@ -753,7 +754,8 @@ const (
 // user 消息，并随 domain 自身的工具执行 ctx 递归穿透给其派发的叶子 Agent。
 func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Duration, images []tool.ResultImage) domainTaskOutcome {
 	// 每任务 ctx：stopCtx 基底（TODO 第10④，会话 Stop 即刻取消执行中任务；
-	// 缺省回退 Background）+ sessionID；墙钟由 slot timer 驱动（可挂起停表）。
+	// 缺省回退 Background）+ sessionID；墙钟由 slot timer 驱动（可挂起停表），
+	// 过闸（出队）才挂载——并发池排队不计预算。
 	ctx := context.Background()
 	if s.stopCtx != nil {
 		ctx = s.stopCtx
@@ -790,7 +792,15 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 	//（此前唤醒分支只 Load 刷新，enterIdle Delete 后必落空--复用任务心跳永久失明）。
 	d.rearmSlotActivity(s.id)
 
-	wallClock = d.armWallClock(s, taskCtx, cancelTask, wallClock)
+	// 排队不计墙钟（P1"出队才计墙钟"在热驻路径的补齐）：入口不再挂 timer——并发池
+	// 排队期它会把等待时长烧进预算；排队超预算时 timer 更会在 runDomainEngine 的 gate
+	// 排队中触发 cancelTask -> Acquire 出局 -> wallFired 分支，给从未执行过一轮的任务
+	// 误报墙钟失败。此处仅停残留 timer + 重置触发标志（保留原 armWallClock 头部的
+	// 入场 bookkeeping：gate-abort/外部取消的 Canceled 分类依赖 wallFired=false）；
+	// timer 改由 runDomainEngine 过闸（出队）成功后 armWallClock 挂载，任务以全额预算
+	// 起跑。有效值解析（0 回退 d.timeout）随 arm 一并后移——pendingWallClock 暂存原值，
+	// 恢复时经 armWallClock 同样解析，口径等价。
+	resetSlotWallClock(s)
 
 	// 树节点保持 Running + 绑任务 cancel（Wake 已由派发方完成；首任务 Register 时已绑）。
 	if d.treeFn != nil {
@@ -834,7 +844,7 @@ func (d *Dispatcher) runDomainTask(s *domainSlot, task string, wallClock time.Du
 	}
 
 	started := time.Now()
-	result, err := d.runDomainEngine(s, taskCtx, task)
+	result, err := d.runDomainEngine(s, taskCtx, cancelTask, task, wallClock)
 	files := agent.FilesModifiedFromHistory(result.History)
 	duration := time.Since(started)
 
@@ -1015,7 +1025,7 @@ func (d *Dispatcher) wallClockWrapUp(s *domainSlot, taskCtx context.Context, res
 // 每次任务前重挂 running。实例新建（freshBuild）且槽内带 history 时（冷恢复重建槽：
 // dormant 唤醒/会话 resume，history 来自 agent_messages）以 RunWithHistory 携带种子
 // 续上下文（同 ResumePaused 的 msgs 续跑口径）；热驻复用与全新首派走原 runEngine 路径。
-func (d *Dispatcher) runDomainEngine(s *domainSlot, taskCtx context.Context, task string) (agent.ReactResult, error) {
+func (d *Dispatcher) runDomainEngine(s *domainSlot, taskCtx context.Context, cancelTask context.CancelFunc, task string, wallClock time.Duration) (agent.ReactResult, error) {
 	s.mu.Lock()
 	agentInst := s.agent
 	s.mu.Unlock()
@@ -1034,6 +1044,26 @@ func (d *Dispatcher) runDomainEngine(s *domainSlot, taskCtx context.Context, tas
 	}
 	d.running.Store(s.id, agentInst)
 
+	// 并发池准入（P1）：热驻槽只在真正跑任务时占名额，park/idle 不占。
+	// 墙钟传 0——槽任务墙钟由 slot timer 管理（dispatchOne :3317-3318 注释），
+	// 且过闸（出队）后才挂载：排队不烧预算（下方 armWallClock）。
+	ev := d.activityEvidenceFor(s.id)
+	runCtx, runCancel, release, gateErr := d.enterExecGate(taskCtx, ev, s.id, 0)
+	if gateErr != nil {
+		// gate-abort 无 timer 可残留（任务入口仅 reset 未 arm）；runDomainTask 的
+		// Canceled 分类读 wallFired=false，外部取消（软停止/暂停/硬取消）语义保持正确。
+		d.running.Delete(s.id)
+		return agent.ReactResult{}, gateErr
+	}
+	defer runCancel()
+	defer release()
+
+	// 出队此刻才挂槽任务墙钟：任务以全额预算起跑，排队时长不计入（任务入口
+	// resetSlotWallClock 已停残留并复位标志；armWallClock 内部再停一次为幂等兜底）。
+	// 预警阶梯同步从执行起点计时。runCtx==taskCtx（gate 墙钟传 0），timer 到期
+	// cancelTask 即断引擎，走 runDomainTask 的 wallFired 收口。
+	d.armWallClock(s, taskCtx, cancelTask, wallClock)
+
 	var result agent.ReactResult
 	var err error
 	if freshBuild {
@@ -1041,12 +1071,12 @@ func (d *Dispatcher) runDomainEngine(s *domainSlot, taskCtx context.Context, tas
 		seed := s.history
 		s.mu.Unlock()
 		if len(seed) > 0 {
-			result, err = agentInst.RunWithHistory(taskCtx, task, seed)
+			result, err = agentInst.RunWithHistory(runCtx, task, seed)
 		} else {
-			result, err = d.runEngine(taskCtx, agentInst, s.id, "domain", "", "", task)
+			result, err = d.runEngine(runCtx, agentInst, s.id, "domain", "", "", task)
 		}
 	} else {
-		result, err = d.runEngine(taskCtx, agentInst, s.id, "domain", "", "", task)
+		result, err = d.runEngine(runCtx, agentInst, s.id, "domain", "", "", task)
 	}
 	if err != nil {
 		return result, err
@@ -1162,6 +1192,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 }
 
 // armWallClock 启动 slot 墙钟 timer：到期 cancelTask（软停止/硬收口由任务 ctx 分支处理）。
+// 由 runDomainEngine 在并发池过闸（出队）成功后调用——排队不计墙钟，任务以全额预算起跑。
 // 返回有效墙钟（0=不限制）。同时挂 50%/75%/90% 递进预警（wallClockWarnLadder）——此前热驻
 // domain 完全没有预警（仅到期杀），而 config 默认 domain_hot_resident_enabled=true 即主路径，
 // 渲染领域 Agent 两小时零预警撞墙即此路径（2026-08-28 实证）。taskCtx 结束预警 goroutine 即退出。
@@ -1200,6 +1231,19 @@ func stopWallClock(s *domainSlot) {
 		s.wallTimer.Stop()
 		s.wallTimer = nil
 	}
+	s.mu.Unlock()
+}
+
+// resetSlotWallClock 任务入场的墙钟 bookkeeping（不挂载 timer）：停残留 timer 并重置
+// 触发标志——每任务以 wallFired=false 起步，gate-abort/外部取消的 Canceled 分类不受
+// 上一任务残留污染。timer 挂载推迟到 runDomainEngine 过闸（出队）后（排队不计墙钟）。
+func resetSlotWallClock(s *domainSlot) {
+	s.mu.Lock()
+	if s.wallTimer != nil {
+		s.wallTimer.Stop()
+		s.wallTimer = nil
+	}
+	s.wallFired = false
 	s.mu.Unlock()
 }
 
@@ -1634,7 +1678,8 @@ func (d *Dispatcher) WakeIdleWithMessage(agentID, content string) error {
 // 唤醒是尽力而为：失败（槽已销毁/忙碌）时消息仍在邮箱，复用时可见（现状兜底）。
 func (d *Dispatcher) WakeIdleForMail(agentID, askerID, subject string) error {
 	taskText := "【邮箱请求】Agent " + askerID + " 向你提问（request 消息已在你的邮箱）。\n" +
-		"本轮只处置该提问：查看邮箱，用 send_message(to_agent_id=对方id, message_type=reply, thread_id 沿用) 回复，" +
+		"本轮只处置该提问：查看邮箱，用 send_message(to_agent_id=对方id, message_type=reply, " +
+		"reply_to=来信注入头里的 id, thread_id 沿用) 回复，" +
 		"给结论+关键依据+文件路径；回复后若无其他待办即结束。"
 	if err := d.wakeIdleWithTask(agentID, taskText, "邮箱请求", "Agent "+askerID+" 邮件提问唤醒"); err != nil {
 		return err
@@ -1864,7 +1909,7 @@ func (d *Dispatcher) recoverSlotPanic(s *domainSlot) {
 	d.lastWrites.Delete(s.id)
 	d.heldSkills.Delete(s.id)
 	if d.mailbox != nil {
-		d.mailbox.Purge(s.id)
+		d.purgeMailboxWithNotice(s.id, "异常终止")
 	}
 	d.panicNotifyParent(s.parentID, s.id, s.sessionID, doneOnce)
 }

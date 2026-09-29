@@ -34,7 +34,7 @@ func newEvolverTestSession(events int) *reactInternalSession {
 
 func newEvolverTestService(t *testing.T) *ReactService {
 	t.Helper()
-	return &ReactService{store: newReactSessionStore()}
+	return &ReactService{store: newReactSessionStore(nil)}
 }
 
 // TestEvolveSessionGateOnEventCount 事件数 < minEvolveEvents 不进进化（防噪音）。

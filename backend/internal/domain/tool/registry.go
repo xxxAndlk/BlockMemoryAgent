@@ -1309,6 +1309,9 @@ func (r *Registry) Schema() []tools.Tool {
 			if in.ThreadID != "" {
 				args["thread_id"] = in.ThreadID
 			}
+			if in.ReplyTo != "" {
+				args["reply_to"] = in.ReplyTo
+			}
 			res, _ := r.Dispatch(ctx, "send_message", args)
 			b, _ := marshalNoHTMLEscape(res)
 			return string(b), nil
@@ -1549,6 +1552,9 @@ type sendMessageInput struct {
 	Body        string `json:"body" description:"详情正文（可空）"`
 	MessageType string `json:"message_type" description:"消息类型：request（默认，期望回复）/ info（单向通知）/ reply（对先前 request 的回复）"`
 	ThreadID    string `json:"thread_id" description:"会话线程标识（可空，同一问答链共享）"`
+	// ReplyTo 配对机制：回答提问时填来信的 id；omitempty 使其在 schema 中为可选
+	//（schema 严格 Provider 会丢弃未声明字段，缺了它问答配对会退化为自动匹配）。
+	ReplyTo string `json:"reply_to,omitempty" description:"回复目标消息 ID（可空，回答提问时填来信的 id，见来信注入头 [mailbox from X id=…]）"`
 }
 
 // createRoleInput 是 create_role 工具的入参结构。

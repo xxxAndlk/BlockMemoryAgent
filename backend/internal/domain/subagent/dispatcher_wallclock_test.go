@@ -502,3 +502,79 @@ func TestMapSubAgents_ExplicitWallClockEnforced(t *testing.T) {
 		t.Fatalf("both items should carry timeout failure marker, got: %s", body)
 	}
 }
+
+
+// TestSlotWallClock_QueueDoesNotBurnBudget 验证热驻槽"排队不计墙钟"（P1"出队才计墙钟"
+// 在热驻第5条路径的补齐）：任务入场仅 resetSlotWallClock（timer 不挂载），并发池排队
+// 等待再久也不触发；过闸（出队）后 armWallClock 挂载，任务以全额预算起跑——到期点 =
+// 挂载点+预算，而非入场点+预算。
+// 旧行为回归：runDomainTask 入口 armWallClock 会把排队时长烧进预算；排队超预算时 timer
+// mid-queue 触发 cancelTask -> Acquire 出局 -> wallFired 分支，给从未执行一轮的任务
+// 误报墙钟失败。本测试的"reset 后排队超预算不触发"在旧语义下必然失败（timer 会 firing）。
+func TestSlotWallClock_QueueDoesNotBurnBudget(t *testing.T) {
+	d := &Dispatcher{timeout: time.Hour} // mailbox=nil：wallClockWarnLadder 直通返回
+	s := &domainSlot{id: "s1/domain-1", domain: "金融"}
+	taskCtx, cancelTask := context.WithCancel(context.Background())
+	t.Cleanup(cancelTask)
+
+	const budget = 150 * time.Millisecond
+
+	// 模拟残留/旧式入场挂载，随后走新入场 bookkeeping：reset 必须解除已挂载的 timer。
+	d.armWallClock(s, taskCtx, cancelTask, budget)
+	resetSlotWallClock(s)
+	s.mu.Lock()
+	if s.wallTimer != nil || s.wallFired {
+		s.mu.Unlock()
+		t.Fatal("entry reset should leave no armed timer and wallFired=false")
+	}
+	s.mu.Unlock()
+
+	// 排队等待 2 倍预算：原 timer 不得再 firing，任务 ctx 不得被取消（排队不烧预算）。
+	time.Sleep(2 * budget)
+	s.mu.Lock()
+	firedDuringQueue := s.wallFired
+	s.mu.Unlock()
+	if firedDuringQueue || taskCtx.Err() != nil {
+		t.Fatalf("queue wait must not fire wall clock: fired=%v ctxErr=%v", firedDuringQueue, taskCtx.Err())
+	}
+
+	// 过闸（出队）挂载：起足全额预算——半预算点不触发，满预算才触发并 cancel 任务 ctx。
+	armAt := time.Now()
+	d.armWallClock(s, taskCtx, cancelTask, budget)
+	time.Sleep(budget / 2)
+	s.mu.Lock()
+	firedEarly := s.wallFired
+	s.mu.Unlock()
+	if firedEarly {
+		t.Fatal("post-gate arm should grant a fresh full budget; fired at half budget")
+	}
+	waitForCond(t, "wall clock fires full budget after dequeue", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.wallFired
+	})
+	if elapsed := time.Since(armAt); elapsed < budget {
+		t.Fatalf("wall clock fired %v after post-gate arm, before full budget %v", elapsed, budget)
+	}
+	if taskCtx.Err() == nil {
+		t.Fatal("wall clock fire should cancel task ctx")
+	}
+}
+
+// TestSlotWallClock_GateAbortLeavesNoTimer 验证 gate-abort（排队期被取消、未过闸即出局）
+// 路径的 timer 状态：入场 reset 后不再 arm，wallTimer 保持 nil、wallFired=false——
+// runDomainTask 的 Canceled 分支据此走外部取消分类（软停止/手动暂停/硬取消），不会把
+// 排队期取消误判成墙钟失败；任务终结的统一停表 stopWallClock 对无 timer 槽为无害 no-op。
+func TestSlotWallClock_GateAbortLeavesNoTimer(t *testing.T) {
+	s := &domainSlot{id: "s1/domain-2", domain: "金融"}
+	resetSlotWallClock(s) // 入场 bookkeeping；gateErr 路径不再 arm
+	stopWallClock(s)      // runDomainTask 任务终结统一停表：无 timer 时 no-op
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wallTimer != nil {
+		t.Fatal("gate-abort path should leave no wall timer")
+	}
+	if s.wallFired {
+		t.Fatal("gate-abort path must keep wallFired=false for external-cancel classification")
+	}
+}

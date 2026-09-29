@@ -9,8 +9,8 @@
 //   - 每个 Agent 拥有独立的收件箱队列（inbox map）。
 //   - 投递（Send）与拉取（Peek/Drain）均通过 sync.RWMutex 保证线程安全。
 //   - 每条消息有 Status 标记，Drain 后置为已读，不再被重复拉取。
-//   - 当目标 Agent 不存在（To == "*"）时，消息转入广播桶 bcast，
-//     由主 Agent 决议后再 Forward 到具体 Agent。
+//   - 收件人必须显式指定（To 空/"*" 一律拒收）：广播桶曾长期无消费方，
+//     消息永久堆积内存，已删除（2026-09-28）。
 package mailbox
 
 import (
@@ -62,8 +62,8 @@ type Message struct {
 	ID string `json:"id"`
 	// From 发送者 Agent 实例 ID。
 	From string `json:"from"` // 发送者 agent 实例 ID
-	// To 收件者 Agent 实例 ID；"*" 表示广播，由主 Agent 决议。
-	To string `json:"to"` // 收件者 agent 实例 ID（"*" 广播）
+	// To 收件者 Agent 实例 ID；必须显式指定，空/"*" 一律拒收（广播已删除）。
+	To string `json:"to"` // 收件者 agent 实例 ID
 	// Type 事件类型，影响接收方的处理策略。
 	Type MessageType `json:"type"`
 	// Subject 一行摘要，注入上下文时作为标题展示。
@@ -96,25 +96,32 @@ type Message struct {
 // 发送方（send_message 工具）据此返回"消息未送达"，消除发给已死 Agent 的消息静默消失。
 var ErrRecipientClosed = errors.New("mailbox: recipient closed")
 
-// Mailbox 多 Agent 邮箱管理器，维护每个 Agent 的收件箱与广播桶。
+// Mailbox 多 Agent 邮箱管理器，维护每个 Agent 的收件箱。
 //
 // 字段说明：
-//   - mu：读写锁，保护 inbox 与 bcast 的并发访问。
+//   - mu：读写锁，保护 inbox 的并发访问。
 //   - inbox：按 agentID 索引的消息队列，存放定向投递的消息。
-//   - bcast：广播桶，存放 To == "*" 的消息，等待主 Agent 决议。
 //   - closed：已销毁（Purge 过）的收件人集合，向其 Send 返回 ErrRecipientClosed（死信可见）。
 //   - seq：原子计数器，用于生成全局唯一的消息 ID。
 //
 // 并发安全：所有公开方法均自行加锁，可被多 goroutine 同时调用。
 type Mailbox struct {
-	mu     sync.RWMutex          // 读写锁：保护 inbox 与 bcast 的并发访问
+	mu     sync.RWMutex          // 读写锁：保护 inbox 的并发访问
 	inbox  map[string][]*Message // agentID -> messages
-	bcast  []*Message            // To == "*" 等待主 Agent 决议
 	closed map[string]struct{}   // 已销毁收件人（Purge 过），Send 死信
 	seq    atomic.Int64          // 全局递增序号，用于生成消息 ID
-	// trace 可选的发送留痕回调（编排页 Agent 间交互留痕数据源）：Send 投递成功
-	//（含广播桶）后持锁外调用；nil 时零行为。实现方必须 best-effort 非阻塞。
+	// trace 可选的发送留痕回调（编排页 Agent 间交互留痕数据源）：Send 投递成功后持锁外调用；
+	// nil 时零行为。实现方必须 best-effort 非阻塞。
 	trace func(*Message)
+	// persist 可选的持久化回调（mailbox_messages 表双写）：Send 入箱后持锁外同步调用——
+	// 同步是为把"内存有、PG 没有"的崩溃丢失窗口压到最小；实现方 fail-open（失败仅日志）。
+	persist func(*Message)
+	// readMark 可选的已读标记回调：Drain 翻转后持锁外调用（异步批量落库即可）。
+	readMark func(ids []string)
+	// deadMark 可选的死信标记回调：Purge 丢弃未读消息时持锁外调用。
+	deadMark func(ids []string)
+	// restoreHook 可选的恢复回调：Restore 重投后持锁外调用（Task 4 接 pending 重建）。
+	restoreHook func(*Message)
 }
 
 // New 创建并返回一个新的邮箱管理器实例。
@@ -138,21 +145,55 @@ func (m *Mailbox) WithTrace(fn func(*Message)) {
 	m.trace = fn
 }
 
-// Send 投递一条邮件到目标 Agent 的收件箱或广播桶。
+// WithPersist 注入持久化回调（bootstrap 接 store.MailboxStore.Save）。重复注入后者覆盖。
+func (m *Mailbox) WithPersist(fn func(*Message)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.persist = fn
+}
+
+// WithReadMarker 注入已读标记回调（bootstrap 接 store.MailboxStore.MarkRead）。
+func (m *Mailbox) WithReadMarker(fn func(ids []string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.readMark = fn
+}
+
+// WithDeadMarker 注入死信标记回调（bootstrap 接 store.MailboxStore.MarkDead）。
+func (m *Mailbox) WithDeadMarker(fn func(ids []string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deadMark = fn
+}
+
+// WithRestoreHandler 注入恢复重投回调（bootstrap 接 Dispatcher.RegisterRestoredPending）。
+func (m *Mailbox) WithRestoreHandler(fn func(*Message)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreHook = fn
+}
+
+// Send 投递一条邮件到目标 Agent 的收件箱。
 //
-// 职责：填充 ID/CreatedAt/Status，并按 To 字段路由消息。
-// 死信可见（TODO #23）：定向收件人已销毁（Purge 过）时返回 ErrRecipientClosed，
-// 发送方据此告知"消息未送达"，消除发给已死 Agent 的消息静默消失；广播不校验。
+// 职责：填充 ID/CreatedAt/Status，并定向投递。收件人必须显式指定：
+// To 空/"*" 返回校验错误（广播桶已无消费方，2026-09-28 删除，防消息永久堆积）。
+// request/escalate 且未填 ThreadID 时自动回填为消息 ID（问答链配对锚点：
+// 回复方凭来信注入里的 id/thread 填 reply_to 即可配对，见 mailboxMessageToReact）。
+// 死信可见：定向收件人已销毁（Purge 过）时返回 ErrRecipientClosed。
+// 持久化：入箱成功后持锁外同步调 persist hook（fail-open，见字段注释）。
 // 返回：消息 ID 与投递错误（nil 表示已入箱；msg 为 nil 返回错误）。
 func (m *Mailbox) Send(msg *Message) (string, error) {
 	// 防御 nil 入参，避免后续解引用 panic。
 	if msg == nil {
 		return "", errors.New("mailbox: nil message")
 	}
-	// 优先复用调用方传入的 ID。
+	// 收件人必须显式指定：广播语义无消费方（DrainBroadcast/Forward 已删），空收件人等同丢失。
+	if msg.To == "" || msg.To == "*" {
+		return "", fmt.Errorf("mailbox: recipient required (broadcast removed): from=%s subject=%q", msg.From, msg.Subject)
+	}
+	// 优先复用调用方传入的 ID（Restore 重投保留原 ID，ON CONFLICT 幂等）。
 	id := msg.ID
 	if id == "" {
-		// 未提供 ID 时，用原子自增计数器生成全局唯一序号。
 		id = formatID(m.seq.Add(1))
 	}
 	msg.ID = id
@@ -162,27 +203,31 @@ func (m *Mailbox) Send(msg *Message) (string, error) {
 	}
 	// 投递时统一标记为未读，等待接收方拉取。
 	msg.Status = StatusUnread
-
-	// 加写锁保护 inbox/bcast 的写入。
-	m.mu.Lock()
-	if msg.To == "" || msg.To == "*" {
-		// 无明确收件人或广播：进入广播桶，交主 Agent 决议。
-		m.bcast = append(m.bcast, msg)
-	} else {
-		// 定向投递：目标已销毁则返回死信错误，不入箱。
-		if _, ok := m.closed[msg.To]; ok {
-			m.mu.Unlock()
-			return "", fmt.Errorf("%w: %s", ErrRecipientClosed, msg.To)
-		}
-		// 定向投递：追加到目标 Agent 的收件箱末尾。
-		m.inbox[msg.To] = append(m.inbox[msg.To], msg)
+	// request/escalate 缺省 ThreadID 回填为消息 ID：问答链以首问 ID 为根，
+	// 回复方只填 reply_to 即可隐式入链（thread_id 沿用纪律不变）。
+	if (msg.Type == MsgRequest || msg.Type == MsgEscalate) && msg.ThreadID == "" {
+		msg.ThreadID = id
 	}
+
+	// 加写锁保护 inbox 的写入。
+	m.mu.Lock()
+	// 定向投递：目标已销毁则返回死信错误，不入箱。
+	if _, ok := m.closed[msg.To]; ok {
+		m.mu.Unlock()
+		return "", fmt.Errorf("%w: %s", ErrRecipientClosed, msg.To)
+	}
+	m.inbox[msg.To] = append(m.inbox[msg.To], msg)
 	trace := m.trace
+	persist := m.persist
 	m.mu.Unlock()
-	// 投递成功后留痕（持锁外 + 值拷贝：防回调慢/再入 mailbox 死锁，防调用方后续改 msg）。
+	// 投递成功后留痕/落库（持锁外 + 值拷贝：防回调慢/再入 mailbox 死锁，防调用方后续改 msg）。
 	if trace != nil {
 		cp := *msg
 		trace(&cp)
+	}
+	if persist != nil {
+		cp := *msg
+		persist(&cp)
 	}
 	return id, nil
 }
@@ -218,42 +263,27 @@ func (m *Mailbox) Peek(agentID string) []*Message {
 // Drain 拉取目标 Agent 的所有未读消息并将其标记为已读。
 //
 // 职责：消费式拉取，确保每条消息只被注入上下文一次。
-// 参数：
-//   - agentID：目标 Agent 实例 ID。
-//
-// 返回：本次从 unread 翻转为 read 的消息列表，按优先级排序。
-// 副作用：
-//   - 修改消息的 Status 为 StatusRead。
-//   - 设置 ReadAt 为当前时间。
-//
-// 并发安全：通过 m.mu 写锁保护状态变更。
+// 持久化：本次翻转的消息 ID 持锁外回调 readMark（批量落库标记，崩溃最晚丢到下次
+// 翻转前——恢复侧 LoadUnread 会把它们当未读重投一次，注入侧幂等消化）。
+// 其余语义不变（优先级降序+时间升序）。
 func (m *Mailbox) Drain(agentID string) []*Message {
-	// 加写锁，因为要修改消息状态。
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return drainMessages(m.inbox[agentID], true)
-}
-
-// DrainBroadcast 主 Agent 专用：拉取广播桶中的全部未读消息并标记为已读。
-//
-// 职责：消费广播桶，交由主 Agent 决议后续 Forward 或丢弃。
-// 参数：无。
-// 返回：本次从 unread 翻转为 read 的广播消息列表，按优先级排序。
-// 副作用：
-//   - 修改广播桶中消息的 Status 为 StatusRead。
-//   - 设置 ReadAt 为当前时间。
-//
-// 并发安全：通过 m.mu 写锁保护状态变更。
-func (m *Mailbox) DrainBroadcast() []*Message {
-	// 加写锁，因为要修改消息状态。
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return drainMessages(m.bcast, true)
+	out := drainMessages(m.inbox[agentID], true)
+	readMark := m.readMark
+	m.mu.Unlock()
+	if readMark != nil && len(out) > 0 {
+		ids := make([]string, 0, len(out))
+		for _, msg := range out {
+			ids = append(ids, msg.ID)
+		}
+		readMark(ids)
+	}
+	return out
 }
 
 // drainMessages 从消息切片中筛选未读消息，可选标记为已读并返回按优先级排序的副本。
 //
-// 职责：被 Drain / DrainBroadcast 共用，消除重复的状态翻转与排序逻辑。
+// 职责：Drain 的状态翻转与排序逻辑。
 // 参数：
 //   - msgs：待扫描消息切片。
 //   - markRead：true 时将未读消息翻转为已读并记录 ReadAt。
@@ -303,60 +333,37 @@ func (m *Mailbox) Count(agentID string) int {
 	return count
 }
 
-// Forward 把广播桶中的某条消息转交到具体 Agent 的收件箱。
-//
-// 职责：主 Agent 对广播消息做决议后，调用此方法投递到真正目标。
-// 参数：
-//   - msgID：待转发的广播消息 ID。
-//   - targetAgent：最终收件 Agent 实例 ID。
-//
-// 返回：true 表示找到并转发成功；false 表示广播桶中无此 ID。
-// 副作用：
-//   - 修改消息的 To/Status/ReadAt 字段。
-//   - 将消息从 bcast 移除并追加到 inbox[targetAgent]。
-//
-// 并发安全：通过 m.mu 写锁保护 map 读写。
-func (m *Mailbox) Forward(msgID, targetAgent string) bool {
-	// 加写锁，因为要同时修改 bcast 与 inbox。
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// 线性扫描广播桶，定位目标消息。
-	for i, msg := range m.bcast {
-		if msg.ID == msgID {
-			// 更新收件人为最终目标。
-			msg.To = targetAgent
-			// 重置为未读，等待目标 Agent 拉取。
-			msg.Status = StatusUnread
-			// 清空历史读取时间。
-			msg.ReadAt = nil
-			// 追加到目标 Agent 收件箱。
-			m.inbox[targetAgent] = append(m.inbox[targetAgent], msg)
-			// 从广播桶移除：用切片拼接保持顺序。
-			m.bcast = append(m.bcast[:i], m.bcast[i+1:]...)
-			return true
-		}
-	}
-	// 未找到对应 ID 的广播消息。
-	return false
-}
-
-// Purge 清空指定 Agent 的全部邮件（含未读与已读）。
+// Purge 清空指定 Agent 的全部邮件（含未读与已读），返回被丢弃的**未读**消息。
 //
 // 职责：Agent 销毁或会话结束时回收其收件箱，避免内存泄漏。
-// 参数：
-//   - agentID：待清空的 Agent 实例 ID。
-//
-// 返回：无。
-// 副作用：从 inbox map 中删除该 key 对应的全部消息。
+// 死信可见（2026-09-28）：未读消息随 Purge 丢弃前，先回调 deadMark（PG 标 dead），
+// 并把清单返回给调用方——dispatcher 据此给 request/escalate 的发送方回投"未送达"
+// 通知，消除"发送方拿到成功、消息却被静默清掉"的假投递。
 // 并发安全：通过 m.mu 写锁保护 map 删除。
-func (m *Mailbox) Purge(agentID string) {
-	// 加写锁，执行 map 删除。
+func (m *Mailbox) Purge(agentID string) []*Message {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	// 直接删除 key，消息切片随之被 GC 回收。
+	var dropped []*Message
+	var deadMark func([]string)
+	for _, msg := range m.inbox[agentID] {
+		if msg.Status == StatusUnread {
+			dropped = append(dropped, msg)
+		}
+	}
 	delete(m.inbox, agentID)
-	// 标记收件人已销毁：此后 Send 至该 ID 返回死信错误（TODO #23 死信可见）。
+	// 标记收件人已销毁：此后 Send 至该 ID 返回死信错误。
 	m.closed[agentID] = struct{}{}
+	if len(dropped) > 0 {
+		deadMark = m.deadMark
+	}
+	m.mu.Unlock()
+	if deadMark != nil {
+		ids := make([]string, 0, len(dropped))
+		for _, msg := range dropped {
+			ids = append(ids, msg.ID)
+		}
+		deadMark(ids)
+	}
+	return dropped
 }
 
 // Reopen 重新打开一个已被 Purge 的收件人（编排页"复活重跑"）：撤销 closed 标记。
@@ -371,6 +378,43 @@ func (m *Mailbox) Reopen(agentID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.closed, agentID)
+}
+
+// Restore 崩溃恢复重投（2026-09-28 mailbox_messages 持久化）：把 PG LoadUnread 读回的
+// 未读消息按原 ID 重新入箱，等接收方（复活的 meta/热驻槽/用户续跑）自然 Drain。
+//
+// 与 Send 的差异：不触发 trace/persist（PG 行已存在，重投只是重建内存态）；
+// 触发 restoreHook（dispatcher 据此重建 pending 问答注册表）；
+// 同 ID 幂等（已在箱不重复入箱，恢复路径可安全重入）。
+// 收件人已 closed（Purge 过）时先撤销标记再入箱（恢复语义等价 Reopen）。
+func (m *Mailbox) Restore(msg *Message) error {
+	if msg == nil || msg.ID == "" {
+		return errors.New("mailbox: restore requires message with ID")
+	}
+	if msg.To == "" || msg.To == "*" {
+		return fmt.Errorf("mailbox: restore recipient required: id=%s", msg.ID)
+	}
+	msg.Status = StatusUnread
+	msg.ReadAt = nil
+	m.mu.Lock()
+	delete(m.closed, msg.To)
+	dup := false
+	for _, ex := range m.inbox[msg.To] {
+		if ex.ID == msg.ID {
+			dup = true
+			break
+		}
+	}
+	if !dup {
+		m.inbox[msg.To] = append(m.inbox[msg.To], msg)
+	}
+	hook := m.restoreHook
+	m.mu.Unlock()
+	if hook != nil && !dup {
+		cp := *msg
+		hook(&cp)
+	}
+	return nil
 }
 
 // sortByPriority 按优先级降序、创建时间升序稳定排序消息。

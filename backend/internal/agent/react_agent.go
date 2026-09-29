@@ -2027,8 +2027,16 @@ func mailboxMessageToReact(m *mailbox.Message) ReactMessage {
 		body += "\n修改文件: " + strings.Join(m.FilesModified, ", ")
 	}
 
-	// 组合成带发送者标记的 user 消息返回。
-	return ReactMessage{Role: "user", Content: fmt.Sprintf("[mailbox from %s] %s", m.From, body)}
+	// 组合成带发送者标记的 user 消息返回（2026-09-28 配对：头里带消息 id/thread，
+	// 被问方回复时按 id 填 reply_to；回复消息带 reply_to 便于提问方对账）。
+	prefix := fmt.Sprintf("[mailbox from %s id=%s]", m.From, m.ID)
+	if m.ThreadID != "" {
+		prefix += " thread=" + m.ThreadID
+	}
+	if m.ReplyTo != "" {
+		prefix += " reply_to=" + m.ReplyTo
+	}
+	return ReactMessage{Role: "user", Content: prefix + " " + body}
 }
 
 // drainMailbox 取出所有以当前 Agent 为收件人的未读 mailbox 消息，

@@ -236,8 +236,9 @@ message_type=request) 问：「你本人慢还是你下拆的叶子慢？给出�
 - 跨域问答直连，不必经你转达：domain 之间**可以直接用 send_message 互相提问与回复**。
    已知下游大概率要问别的域接口/契约时，派发里点明"可直接问 X 域（实例 id=…，
    send_message message_type=request）"。你本人收到 request/[询问] 类消息时按【等待期
-   纪律】只处理该事务并立即 send_message(message_type=reply, thread_id 沿用) 回复，
-   禁止沉默或代为转派。
+   纪律】只处理该事务并立即 send_message(message_type=reply, reply_to=来信注入头
+   里的 id, thread_id 沿用) 回复，禁止沉默或代为转派（问答有超时升级机制：
+   沉默会被升级给你的上级处置）。
 - 提问一律用 request：**凡是要对方回答的消息，message_type 必须是 request**——
    包括追问进度、要状态、要澄清口径；reply 只用于**回答别人的提问**。标错的后果：
    收件方不触发"当轮必须回复"，你等来沉默（实测 reply 发进度询问，对方整段任务零

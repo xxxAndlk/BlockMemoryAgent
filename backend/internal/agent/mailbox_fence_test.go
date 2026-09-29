@@ -27,11 +27,11 @@ func TestMailboxMessageToReact_AgentMailFenced(t *testing.T) {
 	got := mailboxMessageToReact(m)
 	c := got.Content
 
-	if !strings.HasPrefix(c, "[mailbox from domain-ui] ") {
+	if !strings.HasPrefix(c, "[mailbox from domain-ui id=] ") {
 		t.Fatalf("发送者前缀应在围栏外, got: %s", c)
 	}
 	// 围栏必须出现在前缀之后。
-	rest := strings.TrimPrefix(c, "[mailbox from domain-ui] ")
+	rest := strings.TrimPrefix(c, "[mailbox from domain-ui id=] ")
 	if !strings.HasPrefix(rest, tool.UntrustedTagOpen) {
 		t.Fatalf("Agent 邮件正文应立即进入围栏, got: %s", c)
 	}
@@ -52,7 +52,7 @@ func TestMailboxMessageToReact_EscalateMarkerOutsideFence(t *testing.T) {
 		From: "domain-ui", To: "meta", Type: mailbox.MsgEscalate, Subject: "验证未通过",
 	}
 	c := mailboxMessageToReact(m).Content
-	if !strings.HasPrefix(c, "[mailbox from domain-ui] [升级] "+tool.UntrustedTagOpen) {
+	if !strings.HasPrefix(c, "[mailbox from domain-ui id=] [升级] "+tool.UntrustedTagOpen) {
 		t.Fatalf("[升级] 前缀应在围栏外且紧邻围栏, got: %s", c)
 	}
 }

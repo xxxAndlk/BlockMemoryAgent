@@ -770,7 +770,9 @@ func TestSendMessageTool(t *testing.T) {
 	if m.From != "meta" {
 		t.Fatalf("From mismatch: got %q", m.From)
 	}
-	if m.ReplyTo != "meta" {
+	// 2026-09-28 配对机制：ReplyTo 改为承载"被回答消息的 id"（reply 经 reply_to 填），
+	// 不再误填发送方 id——新 request 的 ReplyTo 应为空。
+	if m.ReplyTo != "" {
 		t.Fatalf("ReplyTo mismatch: got %q", m.ReplyTo)
 	}
 	if m.ThreadID != "verify-1" {

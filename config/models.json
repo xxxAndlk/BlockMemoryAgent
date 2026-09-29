@@ -61,16 +61,6 @@
       "description": "domain 主力（2.5 ，128K）：多轮编码/测试/集成修复，性价比最优"
     },
     {
-      "id": "deepseek-flash",
-      "name": "DeepSeek V4.1 Flash",
-      "provider": "openai-responses",
-      "model": "deepseek-flash",
-      "api_key": "${OPENAI_API_KEY}",
-      "base_url": "${OPENAI_BASE_URL}",
-      "max_output_tokens": 64000,
-      "description": "官方直连备线（64K）：带前缀缓存命中统计；成本略高于 ark 档"
-    },
-    {
       "id": "ark-glm-5.3",
       "name": "ARK GLM 5.3",
       "provider": "anthropic",
@@ -89,16 +79,6 @@
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 16384,
       "description": "文档档（16K）：README/CHANGELOG 等中等文本产出"
-    },
-    {
-      "id": "kimi-k3",
-      "name": "Kimi K3",
-      "provider": "anthropic",
-      "model": "k3",
-      "api_key": "${ANTHROPIC_API_KEY_TWO}",
-      "base_url": "${ANTHROPIC_BASE_URL_TWO}",
-      "max_output_tokens": 32768,
-      "description": "峰值推理（10，全表最贵）：仅 meta 可选，硬骨头任务临时换档"
     },
     {
       "id": "gemini-3.8-flash",

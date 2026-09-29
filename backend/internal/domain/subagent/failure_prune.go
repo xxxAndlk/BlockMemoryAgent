@@ -165,19 +165,16 @@ func (d *Dispatcher) ReviveFork(ctx context.Context, node orchestrator.Node, use
 	subAgentCtx = tool.WithWorkDir(subAgentCtx, d.subAgentWorkDirFor(ctx))
 	// 墙钟与复活路径同口径：domain 无显式预算时用侦察墙钟兜底。
 	effectiveTimeout := d.effectiveWallClock(roleDef.ID, 0)
-	var cancel context.CancelFunc = func() {}
-	if effectiveTimeout > 0 {
-		subAgentCtx, cancel = context.WithTimeout(subAgentCtx, effectiveTimeout)
-	}
+	baseCtx, baseCancel := context.WithCancel(subAgentCtx)
 
 	if d.treeFn == nil {
-		cancel()
+		baseCancel()
 		return fmt.Errorf("权威树未接线，无法分叉 %s", node.ID)
 	}
 	sid := tool.SessionIDFromContext(subAgentCtx)
 	t := d.treeFn(sid)
 	if t == nil {
-		cancel()
+		baseCancel()
 		return fmt.Errorf("会话 %s 无权威树，无法分叉", sid)
 	}
 	t.Register(orchestrator.Node{
@@ -189,7 +186,7 @@ func (d *Dispatcher) ReviveFork(ctx context.Context, node orchestrator.Node, use
 		Started:  time.Now(),
 		Status:   orchestrator.StatusRunning,
 	})
-	t.SetCancel(newID, cancel)
+	t.SetCancel(newID, baseCancel)
 
 	seed := d.buildReviveSeed(node, userMsg, RevivePrune)
 	if parentID != "" {
@@ -201,7 +198,7 @@ func (d *Dispatcher) ReviveFork(ctx context.Context, node orchestrator.Node, use
 	if parentID != "" {
 		d.boardAssign(ctx, parentID, node.Domain, newID)
 	}
-	meta := &subAgentMeta{cancel: cancel, parentID: parentID, sessionID: sid, wallClock: effectiveTimeout}
+	meta := &subAgentMeta{cancel: baseCancel, parentID: parentID, sessionID: sid, wallClock: effectiveTimeout}
 	d.subMeta.Store(newID, meta)
 	ev := newEvidence()
 	if roleDef.ID != "meta" {
@@ -210,12 +207,22 @@ func (d *Dispatcher) ReviveFork(ctx context.Context, node orchestrator.Node, use
 	d.ensurePatrol()
 	started := time.Now()
 	go func() {
-		defer cancel()
+		defer baseCancel()
 		defer d.subMeta.CompareAndDelete(newID, meta)
 		defer d.activity.CompareAndDelete(newID, ev)
 		defer d.lastWrites.Delete(newID)
 		defer d.heldSkills.Delete(newID)
-		paused := d.runSubAgent(subAgentCtx, parentID, newID, *roleDef, seed, node.Domain, "", agent.ModeReact, "", started)
+		paused := false
+		runCtx, runCancel, release, gateErr := d.enterExecGate(baseCtx, ev, newID, effectiveTimeout)
+		if gateErr != nil {
+			log.Printf("[subagent] fork gate-abort: sub=%s err=%v", newID, gateErr)
+			// 会话软停止的 gate-abort 由 settleGateAbort 代收口（见 dispatchOne 同名注释）。
+			paused = d.settleGateAbort(baseCtx, parentID, newID, roleDef.ID)
+		} else {
+			defer runCancel()
+			defer release()
+			paused = d.runSubAgent(runCtx, parentID, newID, *roleDef, seed, node.Domain, "", agent.ModeReact, "", started)
+		}
 		if !paused && parentID != "" {
 			meta.doneOnce.Do(func() { d.trackChildDone(parentID) })
 		}

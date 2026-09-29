@@ -388,6 +388,37 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		}()
 	})
 
+	// mailbox 持久化（2026-09-28 P0）：Send 同步双写 mailbox_messages（崩溃丢失窗口
+	// 压到最小；PG 抖动 fail-open 仅日志）；Drain/Purge 状态翻转异步批量落库。
+	mailboxStore := store.NewMailboxStore(pgStore.DB())
+	sharedMailbox.WithPersist(func(msg *mailbox.Message) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := mailboxStore.Save(ctx, mailboxMessageToRow(msg)); err != nil {
+			log.Printf("[mailbox] persist failed: id=%s err=%v", msg.ID, err)
+		}
+	})
+	sharedMailbox.WithReadMarker(func(ids []string) {
+		// 已读标记异步：读侧已消费注入，落库慢不阻塞 ReAct 主循环；崩溃重投一次
+		// 由注入侧幂等消化（Drain 再翻已读是空操作）。
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := mailboxStore.MarkRead(ctx, ids, time.Now()); err != nil {
+				log.Printf("[mailbox] mark read failed: ids=%d err=%v", len(ids), err)
+			}
+		}()
+	})
+	sharedMailbox.WithDeadMarker(func(ids []string) {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := mailboxStore.MarkDead(ctx, ids); err != nil {
+				log.Printf("[mailbox] mark dead failed: ids=%d err=%v", len(ids), err)
+			}
+		}()
+	})
+
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
 	reactCfg := agent.ReactRuntimeConfig{
@@ -469,6 +500,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		WithSalvageTimeout(time.Duration(cfg.Agent.SalvageLLMTimeoutSec) * time.Second)
 	// 全局派发总数上限：单 session 所有角色派发合计超限拒绝；用户新消息重置。
 	subAgentDispatcher.WithMaxTotalDispatches(cfg.Agent.MaxTotalDispatches)
+	// 协作问答配对：request/reply 机制配对 + 超时升级（patrol sweep）。
+	subAgentDispatcher.WithPeerRequestTimeout(time.Duration(cfg.Agent.PeerRequestTimeoutMin) * time.Minute)
+	// 子 Agent 全局并发池：同时在跑总数上限，超额 FIFO 排队（排队不计墙钟）。
+	subAgentDispatcher.WithConcurrencyLimit(cfg.Agent.MaxConcurrentSubAgents)
 	// Spec 强制：开启时 call_sub_agent 前必须先 WriteSpec(goal, acceptance, ...)，
 	// dispatcher 校验 parentID:spec 存在且新鲜，缺失则拒绝派发。config 层默认 true，
 	// config.yaml 可显式关闭；applyDefaults 保证非 nil，else 分支为防御。
@@ -531,6 +566,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// （domain + 固定角色）换档；写路径委托 ModelFactory.SwitchModel（校验/探活/持久化）。
 	// 仅 MetaAgent 的 Tools 白名单含这两个工具（registry.go meta 角色 Tools + roles.yaml）。
 	role.RegisterModelTools(toolRegistry, modelFactory)
+	// 崩溃恢复重投时重建 pending 问答注册表（未读 request 的 deadline 顺延一个周期）。
+	sharedMailbox.WithRestoreHandler(func(msg *mailbox.Message) {
+		subAgentDispatcher.RegisterRestoredPending(msg)
+	})
 
 	// 第十六步：创建 ReAct Agent 服务。
 	agentSvc := agent.NewReactService(roleRegistry, modelFactory, toolRegistry, sharedMailbox, memoryPipeline, pgStore)
@@ -625,6 +664,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	agentSvc.SetTreeStore(store.NewPostgresTreeStore(pgStore.DB()))
 	// 注入任务看板（TODO #22 执行计划）：write_plan 写板、派发依赖门、TUI 面板真相源。
 	// 看板按 sessionID 惰性创建（write_plan 首次调用 GetOrCreate）。
+	// 看板持久化（2026-09-28 P1）：整板快照写穿 session_boards，重启惰性恢复。
+	rt.Boards.WithStore(boardStoreAdapter{st: store.NewBoardStore(pgStore.DB())})
 	agentSvc.SetBoard(rt.Boards.Get)
 	// 看板移除器（会话硬删除路径）：DeleteSession 清掉该会话看板，防残留串台到同名新会话。
 	agentSvc.SetBoardRemover(rt.Boards.Remove)
@@ -642,7 +683,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 决策层（TODO #23）：sendMessageFull 意图分诊切入点 + gear 档位建议切入点。
 	// 与 SetPromptEnhanceLLM 同位注入（消费侧照 WithFactExtractor 模式）。
 	agentSvc.SetDecisionLayer(decisionLayer)
-	subAgentDispatcher.WithBoard(rt.Boards.Get, func(sid, goal string) *board.TaskBoard {
+	// 派发依赖门/回写用 GetRestored（2026-09-29 终审修复）：重启后 meta 重放 write_plan 之前，
+	// 内存无看板时从持久层惰性恢复，依赖门不静默放行；上面 agentSvc.SetBoard 仍用 Get
+	//（wrapMetaMemory 每轮调用，恢复语义会对无看板会话每轮打一次 PG，不可接受）。
+	subAgentDispatcher.WithBoard(rt.Boards.GetRestored, func(sid, goal string) *board.TaskBoard {
 		return rt.Boards.GetOrCreate(sid, goal)
 	})
 	subAgentDispatcher.RegisterPlanTool(toolRegistry)
@@ -1171,6 +1215,8 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 		"memory":                store.EnsureInitialMemorySchema,
 		"agent_tree":            store.EnsureAgentTreeSchema,
 		"learned_skills":        store.EnsureLearnedSkillsSchema,
+		"mailbox_messages":      store.EnsureMailboxSchema,
+		"session_boards":        store.EnsureBoardSchema,
 	} {
 		if err := fn(ctx, pgStore.DB()); err != nil {
 			return fmt.Errorf("ensure %s schema: %w", name, err)
@@ -1411,3 +1457,63 @@ func (s *blockMemorySaver) Save(ctx context.Context, rec *types.KnowledgeRecord)
 // blockMemoryDedupDistance 块记忆写入去重的 cosine 距离阈值（对应相似度 >= 0.85）：
 // 同域内相似度高于此值视为"同一事实的再次沉淀"，更新既有记录而非新增行。
 const blockMemoryDedupDistance = 0.15
+
+// mailboxMessageToRow 把 mailbox.Message 转为 store 行（分层纪律：store 不 import mailbox）。
+// session_id 从收件人 ID 派生（MetaAgent agentID==sessionID；子 Agent "session/…" 取首段）。
+func mailboxMessageToRow(msg *mailbox.Message) store.MailboxMessage {
+	return store.MailboxMessage{
+		ID:        msg.ID,
+		SessionID: sessionIDOfAgentID(msg.To),
+		FromAgent: msg.From,
+		ToAgent:   msg.To,
+		Type:      string(msg.Type),
+		Subject:   msg.Subject,
+		Body:      msg.Body,
+		Payload:   store.MailboxPayloadToJSON(msg.Payload),
+		Priority:  msg.Priority,
+		ReplyTo:   msg.ReplyTo,
+		ThreadID:  msg.ThreadID,
+		CreatedAt: msg.CreatedAt,
+	}
+}
+
+// sessionIDOfAgentID 取 agentID 的会话前缀（"sess/domain-1" → "sess"）。
+func sessionIDOfAgentID(agentID string) string {
+	if i := strings.IndexByte(agentID, '/'); i > 0 {
+		return agentID[:i]
+	}
+	return agentID
+}
+
+// boardStoreAdapter 把 store.BoardStore（[]byte 出入参）适配为 board.Store
+//（Snapshot 出入参）——分层纪律：store 不 import board，JSON 编解码在此收口。
+type boardStoreAdapter struct {
+	st *store.BoardStore
+}
+
+func (a boardStoreAdapter) LoadBoard(topicID string) (board.Snapshot, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	goal, raw, found, err := a.st.LoadBoard(ctx, topicID)
+	if err != nil || !found {
+		return board.Snapshot{}, found, err
+	}
+	var snap board.Snapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return board.Snapshot{}, false, fmt.Errorf("decode board snapshot %s: %w", topicID, err)
+	}
+	if snap.Goal == "" {
+		snap.Goal = goal
+	}
+	return snap, true, nil
+}
+
+func (a boardStoreAdapter) SaveBoard(snap board.Snapshot) error {
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return fmt.Errorf("encode board snapshot %s: %w", snap.TopicID, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return a.st.SaveBoard(ctx, snap.TopicID, snap.Goal, raw)
+}

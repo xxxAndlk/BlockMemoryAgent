@@ -509,6 +509,64 @@ func TestSchemaCallSubAgent_ModeField(t *testing.T) {
 	t.Fatal("call_sub_agent not found in schema")
 }
 
+// stubSendMessage 是 send_message 的测试桩，捕获 Execute 收到的 args 供断言。
+type stubSendMessage struct {
+	gotArgs map[string]any
+}
+
+func (s *stubSendMessage) Name() string      { return "send_message" }
+func (s *stubSendMessage) Aliases() []string { return nil }
+func (s *stubSendMessage) Description() string {
+	return "stub: 向另一个 Agent 实例邮箱投递消息。"
+}
+func (s *stubSendMessage) Execute(ctx context.Context, args map[string]any) *Result {
+	s.gotArgs = args
+	return &Result{Tool: "send_message", Success: true, Output: "ok"}
+}
+
+// TestSchemaSendMessage_ReplyTo 验证 send_message 的 LLM schema 含 reply_to 参数
+//（可选，不在 required 中），且适配层把 reply_to 透传进工具 Execute 的 args。
+// 缺失时 schema 严格 Provider 会静默丢弃该字段，问答配对退化为自动匹配（归因可能错）。
+func TestSchemaSendMessage_ReplyTo(t *testing.T) {
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	stub := &stubSendMessage{}
+	r.Register(stub)
+	for _, tl := range r.Schema() {
+		if tl.Name() != "send_message" {
+			continue
+		}
+		// schema 断言：reply_to 在 properties 中且不在 required 中。
+		props := tl.InputSchema().Properties
+		if _, ok := props["reply_to"]; !ok {
+			t.Fatalf("send_message schema missing parameter %q (have %v)", "reply_to", keysOf(props))
+		}
+		for _, req := range tl.InputSchema().Required {
+			if req == "reply_to" {
+				t.Fatalf("reply_to must be optional, but found in required: %v", tl.InputSchema().Required)
+			}
+		}
+		// 适配层断言：reply_to 非空时透传进 Execute 的 args。
+		if _, err := tl.Handle(context.Background(),
+			`{"to_agent_id":"a1","subject":"s","message_type":"reply","reply_to":"m-42"}`); err != nil {
+			t.Fatalf("Handle failed: %v", err)
+		}
+		if got := stub.gotArgs["reply_to"]; got != "m-42" {
+			t.Fatalf("expected reply_to forwarded as m-42, got %v (args=%v)", got, stub.gotArgs)
+		}
+		// reply_to 为空时不应出现在 args 中（与 thread_id 同款"非空才设置"纪律）。
+		stub.gotArgs = nil
+		if _, err := tl.Handle(context.Background(),
+			`{"to_agent_id":"a1","subject":"s"}`); err != nil {
+			t.Fatalf("Handle failed: %v", err)
+		}
+		if _, ok := stub.gotArgs["reply_to"]; ok {
+			t.Fatalf("reply_to should be absent from args when empty, got %v", stub.gotArgs)
+		}
+		return
+	}
+	t.Fatal("send_message not found in schema")
+}
+
 // keysOf 提取 map 键切片，用于断言信息展示。
 func keysOf(m map[string]*jsonschema.Schema) []string {
 	out := make([]string, 0, len(m))

@@ -1020,7 +1020,7 @@ func TestMailboxMessageToReact_EscalatePrefix(t *testing.T) {
 		From: "sub-1", To: "meta", Type: mailbox.MsgEscalate, Subject: "验证未通过",
 	})
 	// 2026-09-20 注入防线：Agent 邮件主题/正文包 untrusted 围栏，[升级] 前缀留在围栏外。
-	if !strings.HasPrefix(esc.Content, "[mailbox from sub-1] [升级] ") {
+	if !strings.HasPrefix(esc.Content, "[mailbox from sub-1 id=] [升级] ") {
 		t.Fatalf("escalate message should carry [升级] prefix outside fence, got: %s", esc.Content)
 	}
 	if !strings.Contains(esc.Content, "<untrusted_data>") || !strings.Contains(esc.Content, "验证未通过") {

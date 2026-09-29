@@ -227,3 +227,61 @@ func TestDispatchNoBoard_ZeroChange(t *testing.T) {
 		t.Fatalf("dispatch without board should be unaffected, err=%v res=%+v", err, res)
 	}
 }
+
+// memBoardStore 内存 board.Store（重启恢复测试用：跨 Manager 共享快照）。
+type memBoardStore struct {
+	snaps map[string]board.Snapshot
+}
+
+func (s *memBoardStore) LoadBoard(topicID string) (board.Snapshot, bool, error) {
+	snap, ok := s.snaps[topicID]
+	return snap, ok, nil
+}
+
+func (s *memBoardStore) SaveBoard(snap board.Snapshot) error {
+	if s.snaps == nil {
+		s.snaps = make(map[string]board.Snapshot)
+	}
+	s.snaps[snap.TopicID] = snap
+	return nil
+}
+
+// TestDepGateRestoredAfterRestart 重启后（write_plan 尚未重放、内存无看板）依赖门
+// 经 GetRestored 从持久层找回计划：依赖未完成仍拒派（P1-5：依赖门状态随恢复）。
+// 复刻 bootstrap 接线：WithBoard(GetRestored, GetOrCreate)。
+func TestDepGateRestoredAfterRestart(t *testing.T) {
+	st := &memBoardStore{}
+	// 崩溃前：Manager-1 写计划并持久化。
+	bm1 := board.NewManager().WithStore(st)
+	b1 := bm1.GetOrCreate("s1", "实现塔防游戏")
+	if err := b1.SetPlan("实现塔防游戏", []board.PlanTask{
+		{ID: "render", Title: "渲染引擎", Domain: "渲染"},
+		{ID: "config", Title: "配置模块", Domain: "配置", DependsOn: []string{"render"}},
+	}); err != nil {
+		t.Fatalf("SetPlan: %v", err)
+	}
+
+	// 模拟重启：新 Manager（空内存）同一 store；dispatcher 接 GetRestored（同 bootstrap）。
+	d, _, _, toolsReg, _ := newSalvageTestEnv(t, &mockProvider{text: "done"})
+	bm2 := board.NewManager().WithStore(st)
+	d.WithBoard(bm2.GetRestored, func(sid, goal string) *board.TaskBoard { return bm2.GetOrCreate(sid, goal) })
+	d.RegisterPlanTool(toolsReg)
+
+	// meta 尚未重放 write_plan（内存无看板）：依赖门应经恢复看到 config 依赖 render(pending) → 拒派。
+	if bm2.Get("s1") != nil {
+		t.Fatal("前置：重启后内存应无看板")
+	}
+	blocked, err := toolsReg.Dispatch(dispatchCtx(), "call_sub_agent", map[string]any{
+		"role_id": "domain", "domain": "配置", "task": "实现配置", "responsibility": "负责配置",
+	})
+	if err != nil {
+		t.Fatalf("dispatch should not error: %v", err)
+	}
+	if blocked.Success || !strings.Contains(blocked.Error, "依赖未满足") {
+		t.Fatalf("dep gate should reject via restored board, got: %+v", blocked)
+	}
+	// 恢复已登记内存：后续命中同一实例，无需重复读 store。
+	if bm2.Get("s1") == nil {
+		t.Fatal("GetRestored 恢复后看板应入内存")
+	}
+}

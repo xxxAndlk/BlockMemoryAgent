@@ -40,6 +40,9 @@ type activityEvidence struct {
 	// 否则 child_wait 展示态会被 descendant 冒泡秒刷掉（实证：子 Agent 流式期间
 	// child_wait 占空比≈0，前端恒显"执行中"、直连恒 409）；Agent 自身恢复活动即清除。
 	waitingChildren atomic.Bool
+	// queued 并发池排队标记（2026-09-28 P1 并发池）：Acquire 等待期间置位，巡检豁免——
+	// 排队中的 Agent 还没开始执行，lastTS 停留在派发时刻，不豁免则排队超阈值被误杀。
+	queued atomic.Bool
 }
 
 // newEvidence 创建并初始化一条活动证据（lastTS=now，kind=created）。
@@ -96,6 +99,19 @@ func (e *activityEvidence) stamp(kind string, now int64) {
 func (e *activityEvidence) markChildWait() {
 	e.lastKind.Store("child_wait")
 	e.waitingChildren.Store(true)
+}
+
+// markQueued 标记进入并发池排队（巡检豁免 + 展示态 "queued"）。
+func (e *activityEvidence) markQueued() {
+	e.queued.Store(true)
+	e.lastKind.Store("queued")
+}
+
+// clearQueued 标记出队开始执行：刷 lastTS（排队时长不计入静默）并落 "dequeued" 展示态。
+func (e *activityEvidence) clearQueued(now int64) {
+	e.queued.Store(false)
+	e.lastTS.Store(now)
+	e.lastKind.Store("dequeued")
 }
 
 // beginAuxLLM 标记引擎辅助 LLM（judge/plan_execute）开始：在飞 LLM 豁免巡检
