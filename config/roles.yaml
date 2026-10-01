@@ -61,7 +61,7 @@ meta_agent:
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:
   model_config:
-    model_ref: glm-5.3-flash
+    model_ref: ark-glm-5.3-flash
     temperature: 0
     thinking: high     # 2026-09-07 恢复 medium（TODO 第八项 P0-1）：off 档正确率损失大于延迟收益（2026-09-06 对擂实测 off 步数翻倍且完成度下滑 round-5 C=0.849），编码执行层须留推理预算；off 仅 meta 这类路由/汇总角色适用。glm 系 ark 端点不支持 disabled（400），仅 doubao 角色可关
   skills: [派发与规格]   # 工具描述精简（P0-3）后字段全语义承接进技能文档，下拆写 spec 拿不准时 load_skill
