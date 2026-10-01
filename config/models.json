@@ -21,16 +21,6 @@
       "description": "质量型执行档（128K）：UI/长 HTML 输出；思考档单轮可达 459s，忌高频"
     },
     {
-      "id": "glm-5.3-flash",
-      "name": "GLM 5.3 Flash",
-      "provider": "anthropic",
-      "model": "glm-5.3-flash",
-      "api_key": "${ANTHROPIC_BASE_URL_FOUR}",
-      "base_url": "${OPENAI_API_KEY_TWO}",
-      "max_output_tokens": 32768,
-      "description": "同 GLM 5.3 Flash 备用端点：仅 23:00-9:00 免费时段用，输出 32K"
-    },
-    {
       "id": "doubao-seed-2.0-mini",
       "name": "豆包 Seed 2.0 Mini",
       "provider": "anthropic",
