@@ -3,7 +3,9 @@ package server
 import (
 	"context"            // 超时上下文
 	"fmt"                // 格式化字符串
+	"mime"               // 按扩展名探测 Content-Type
 	"net/http"           // HTTP 状态码
+	"net/url"            // Content-Disposition 文件名 URL 编码
 	"os"                 // 文件读取 / Stat
 	"path/filepath"      // filepath.Base
 	stdruntime "runtime" // 进程运行时指标
@@ -529,6 +531,8 @@ func (h *APIHandler) BrowseFSHandler(c *gin.Context) {
 
 // FileContentHandler 处理 GET /api/files/content — 读取文件内容。
 // 职责：按 ?path=... 读取文件全文，返回 JSON（content 为字符串）。
+// 增强：附带 size / mime / truncated（文本超过 fileContentMaxBytes 截断），
+// 前端据此渲染「文件过大」提示；content 字段保持旧契约不变。
 func (h *APIHandler) FileContentHandler(c *gin.Context) {
 	path := c.Query("path")
 	if path == "" {
@@ -537,14 +541,158 @@ func (h *APIHandler) FileContentHandler(c *gin.Context) {
 	}
 	data, err := os.ReadFile(path) // 读取文件
 	if err != nil {
+		if os.IsNotExist(err) {
+			c.String(http.StatusNotFound, "file not found")
+			return
+		}
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
 	}
+	size := fileSizeOf(data)
+	truncated := false
+	if len(data) > fileContentMaxBytes {
+		data = data[:fileContentMaxBytes] // 大文件截断，前端提示下载查看
+		truncated = true
+	}
 	c.JSON(http.StatusOK, map[string]any{
-		"path":    path,
-		"content": string(data),
+		"path":      path,
+		"content":   string(data),
+		"size":      size,
+		"mime":      detectFileContentType(filepath.Ext(path)),
+		"truncated": truncated,
 	})
 }
+
+// 文件预览相关上限（/api/files/raw 与 /api/files/content 共用）。
+const (
+	fileRawMaxBytes     = 20 << 20 // 20MB：raw 下载/内联渲染上限，超限 413
+	fileContentMaxBytes = 300 << 10 // 300KB：content JSON 文本截断阈值
+)
+
+// fileRawMimeTypes 常见扩展名 → Content-Type 白名单（mime.TypeByExtension 在
+// Windows 下读注册表、结果不可控，预览相关类型在这里钉死）。
+var fileRawMimeTypes = map[string]string{
+	// 图片（内联渲染主力）
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+	".svg":  "image/svg+xml",
+	".ico":  "image/x-icon",
+	// 文档/数据
+	".pdf":       "application/pdf",
+	".json":      "application/json",
+	".md":        "text/markdown; charset=utf-8",
+	".markdown":  "text/markdown; charset=utf-8",
+	".txt":       "text/plain; charset=utf-8",
+	".log":       "text/plain; charset=utf-8",
+	".csv":       "text/csv; charset=utf-8",
+	".html":      "text/html; charset=utf-8",
+	".htm":       "text/html; charset=utf-8",
+	".xml":       "text/xml; charset=utf-8",
+	".yaml":      "text/yaml; charset=utf-8",
+	".yml":       "text/yaml; charset=utf-8",
+	// 代码（按纯文本返回，高亮由前端 highlight.js 负责）
+	".go":   "text/plain; charset=utf-8",
+	".py":   "text/plain; charset=utf-8",
+	".js":   "text/plain; charset=utf-8",
+	".jsx":  "text/plain; charset=utf-8",
+	".ts":   "text/plain; charset=utf-8",
+	".tsx":  "text/plain; charset=utf-8",
+	".vue":  "text/plain; charset=utf-8",
+	".java": "text/plain; charset=utf-8",
+	".c":    "text/plain; charset=utf-8",
+	".cc":   "text/plain; charset=utf-8",
+	".cpp":  "text/plain; charset=utf-8",
+	".h":    "text/plain; charset=utf-8",
+	".hpp":  "text/plain; charset=utf-8",
+	".cs":   "text/plain; charset=utf-8",
+	".rs":   "text/plain; charset=utf-8",
+	".rb":   "text/plain; charset=utf-8",
+	".php":  "text/plain; charset=utf-8",
+	".sh":   "text/plain; charset=utf-8",
+	".bat":  "text/plain; charset=utf-8",
+	".ps1":  "text/plain; charset=utf-8",
+	".sql":  "text/plain; charset=utf-8",
+	".css":  "text/plain; charset=utf-8",
+	".scss": "text/plain; charset=utf-8",
+	".less": "text/plain; charset=utf-8",
+	".toml": "text/plain; charset=utf-8",
+	".ini":  "text/plain; charset=utf-8",
+}
+
+// detectFileContentType 按扩展名检测响应 Content-Type：白名单优先，
+// 其次 mime.TypeByExtension（仅放行 text/* 与 image/*，防注册表脏数据），
+// 其余统一 application/octet-stream。
+func detectFileContentType(ext string) string {
+	if ct, ok := fileRawMimeTypes[strings.ToLower(ext)]; ok {
+		return ct
+	}
+	if ct := mime.TypeByExtension(ext); ct != "" &&
+		(strings.HasPrefix(ct, "text/") || strings.HasPrefix(ct, "image/")) {
+		return ct
+	}
+	return "application/octet-stream"
+}
+
+// isKnownWriteFilePath 校验 path 是否为任一会话中成功 WriteFile 事件的产物路径。
+// 这是 /api/files/raw 的安全边界（与 FilesHandler 同源）：不做任意路径读取，
+// 只有 Agent 自己写出且记录在会话事件里的文件才允许被浏览器取走。
+func (h *APIHandler) isKnownWriteFilePath(path string) bool {
+	if h.sessionMgr == nil {
+		return false
+	}
+	for _, s := range h.sessionMgr.ListSessions() {
+		for _, ev := range s.Events {
+			if ev.Type == eventkind.ToolExec && ev.Tool == "WriteFile" && ev.Success && ev.ToolPath == path {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// FileRawHandler 处理 GET /api/files/raw?path=... [&download=1] — 按真实
+// Content-Type 返回文件字节，供 <img> 内联渲染与浏览器直接下载。
+// 安全边界：path 必须命中某会话的成功 WriteFile 产物（isKnownWriteFilePath），
+// 否则一律 404（不区分"不存在"与"越界"，避免路径探测）；大小超 fileRawMaxBytes 返回 413。
+func (h *APIHandler) FileRawHandler(c *gin.Context) {
+	path := c.Query("path")
+	if path == "" {
+		c.String(http.StatusBadRequest, "path required")
+		return
+	}
+	if !h.isKnownWriteFilePath(path) {
+		c.String(http.StatusNotFound, "file not found")
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		c.String(http.StatusNotFound, "file not found")
+		return
+	}
+	if info.Size() > fileRawMaxBytes {
+		c.String(http.StatusRequestEntityTooLarge, "file too large (max 20MB)")
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.String(http.StatusNotFound, "file not found")
+		return
+	}
+	ct := detectFileContentType(filepath.Ext(path))
+	c.Header("Content-Type", ct)
+	c.Header("X-Content-Type-Options", "nosniff")
+	if c.Query("download") == "1" {
+		name := url.PathEscape(filepath.Base(path))
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", name))
+	}
+	c.Data(http.StatusOK, ct, data)
+}
+
+// fileSizeOf 返回字节切片长度（int64），避免与 os.FileInfo 版 fileSize 混淆。
+func fileSizeOf(data []byte) int64 { return int64(len(data)) }
 
 // fileSize 安全地获取文件大小，info 为 nil 时返回 0。
 // 参数 info：os.FileInfo（可为 nil）。

@@ -14,6 +14,12 @@ export interface FilesResponse {
 export interface FileContentResponse {
   path: string
   content: string
+  /** 完整文件大小（字节），截断时仍返回真实大小 */
+  size?: number
+  /** 后端按扩展名探测的 MIME 类型 */
+  mime?: string
+  /** 文本超过 300KB 被截断时为 true，前端应提示下载查看 */
+  truncated?: boolean
 }
 
 export function listFiles(sessionID: string): Promise<FilesResponse> {

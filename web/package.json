@@ -15,6 +15,7 @@
     "dompurify": "^3.4.11",
     "echarts": "^5.5.0",
     "element-plus": "^2.7.5",
+    "highlight.js": "^11.12.0",
     "marked": "^18.0.5",
     "vue": "^3.4.29",
     "vue-echarts": "^6.7.2",

@@ -24,6 +24,7 @@ type LearnedSkill struct {
 	Embedding     []float32 `json:"-"`
 	Enabled       bool      `json:"enabled"`
 	UseCount      int       `json:"use_count"`
+	HasTools      bool      `json:"has_tools"` // 带配套脚本（C1：技能目录含 scripts/，列表页角标）
 	SourceSession string    `json:"source_session"`
 	Outcome       string    `json:"outcome"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -53,11 +54,14 @@ CREATE TABLE IF NOT EXISTS learned_skills (
     embedding VECTOR(1024),
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     use_count INT NOT NULL DEFAULT 0,
+    has_tools BOOLEAN NOT NULL DEFAULT FALSE,
     source_session TEXT,
     outcome TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 老库补 has_tools 列（012_learned_skills_tools.sql；CREATE TABLE IF NOT EXISTS 对存量表是空操作）。
+ALTER TABLE learned_skills ADD COLUMN IF NOT EXISTS has_tools BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_learned_skills_embedding ON learned_skills
 USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
@@ -104,17 +108,18 @@ func (s *LearnedSkillStore) Upsert(ctx context.Context, rec *LearnedSkill) error
 		emb = pgVector(rec.Embedding)
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO learned_skills (name, title, when_to_use, content_path, embedding, enabled, use_count, source_session, outcome, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
+INSERT INTO learned_skills (name, title, when_to_use, content_path, embedding, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
 ON CONFLICT (name) DO UPDATE SET
     title = EXCLUDED.title,
     when_to_use = EXCLUDED.when_to_use,
     content_path = EXCLUDED.content_path,
     embedding = EXCLUDED.embedding,
+    has_tools = EXCLUDED.has_tools,
     outcome = EXCLUDED.outcome,
     updated_at = now()`,
 		rec.Name, rec.Title, rec.WhenToUse, rec.ContentPath, emb,
-		rec.Enabled, rec.UseCount, rec.SourceSession, rec.Outcome)
+		rec.Enabled, rec.UseCount, rec.HasTools, rec.SourceSession, rec.Outcome)
 	return err
 }
 
@@ -123,7 +128,7 @@ func (s *LearnedSkillStore) Get(ctx context.Context, name string) (*LearnedSkill
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	row := s.db.QueryRowContext(ctx, `
-SELECT name, title, when_to_use, content_path, enabled, use_count, source_session, outcome, created_at, updated_at
+SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at
 FROM learned_skills WHERE name = $1`, name)
 	rec, err := scanLearnedSkill(row.Scan)
 	if err == sql.ErrNoRows {
@@ -136,7 +141,7 @@ FROM learned_skills WHERE name = $1`, name)
 func (s *LearnedSkillStore) List(ctx context.Context, enabledOnly bool) ([]*LearnedSkill, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	q := `SELECT name, title, when_to_use, content_path, enabled, use_count, source_session, outcome, created_at, updated_at
+	q := `SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at
 FROM learned_skills`
 	if enabledOnly {
 		q += ` WHERE enabled`
@@ -170,7 +175,7 @@ func (s *LearnedSkillStore) SearchSkills(ctx context.Context, embedding []float3
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, `
-SELECT name, title, when_to_use, content_path, enabled, use_count, source_session, outcome, created_at, updated_at,
+SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at,
        1 - (embedding <=> $1) AS score
 FROM learned_skills
 WHERE enabled AND embedding IS NOT NULL AND embedding <=> $1 <= $2
@@ -184,7 +189,7 @@ LIMIT $3`, pgVector(embedding), maxDistance, limit)
 	for rows.Next() {
 		var rec LearnedSkill
 		if err := rows.Scan(&rec.Name, &rec.Title, &rec.WhenToUse, &rec.ContentPath, &rec.Enabled,
-			&rec.UseCount, &rec.SourceSession, &rec.Outcome, &rec.CreatedAt, &rec.UpdatedAt, &rec.Score); err != nil {
+			&rec.UseCount, &rec.HasTools, &rec.SourceSession, &rec.Outcome, &rec.CreatedAt, &rec.UpdatedAt, &rec.Score); err != nil {
 			continue
 		}
 		out = append(out, &rec)
@@ -210,7 +215,7 @@ func (s *LearnedSkillStore) TopEnabled(ctx context.Context, limit int) ([]*Learn
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, `
-SELECT name, title, when_to_use, content_path, enabled, use_count, source_session, outcome, created_at, updated_at
+SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at
 FROM learned_skills WHERE enabled
 ORDER BY use_count DESC, updated_at DESC
 LIMIT $1`, limit)
@@ -252,8 +257,8 @@ func (s *LearnedSkillStore) IncrementUseCount(ctx context.Context, name string) 
 	return err
 }
 
-// UpdateMeta 手动编辑（HTTP PUT）：刷新 title/when_to_use/重嵌入向量。
-func (s *LearnedSkillStore) UpdateMeta(ctx context.Context, name, title, whenToUse string, embedding []float32) error {
+// UpdateMeta 手动编辑（HTTP PUT）：刷新 title/when_to_use/重嵌入向量/has_tools。
+func (s *LearnedSkillStore) UpdateMeta(ctx context.Context, name, title, whenToUse string, embedding []float32, hasTools bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	var emb any
@@ -261,8 +266,8 @@ func (s *LearnedSkillStore) UpdateMeta(ctx context.Context, name, title, whenToU
 		emb = pgVector(embedding)
 	}
 	res, err := s.db.ExecContext(ctx, `
-UPDATE learned_skills SET title = $2, when_to_use = $3, embedding = $4, updated_at = now()
-WHERE name = $1`, name, title, whenToUse, emb)
+UPDATE learned_skills SET title = $2, when_to_use = $3, embedding = $4, has_tools = $5, updated_at = now()
+WHERE name = $1`, name, title, whenToUse, emb, hasTools)
 	if err != nil {
 		return err
 	}
@@ -285,7 +290,7 @@ func scanLearnedSkill(scan func(dest ...any) error) (*LearnedSkill, error) {
 	var rec LearnedSkill
 	var sourceSession, outcome sql.NullString
 	if err := scan(&rec.Name, &rec.Title, &rec.WhenToUse, &rec.ContentPath, &rec.Enabled,
-		&rec.UseCount, &sourceSession, &outcome, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		&rec.UseCount, &rec.HasTools, &sourceSession, &outcome, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		return nil, err
 	}
 	rec.SourceSession = sourceSession.String

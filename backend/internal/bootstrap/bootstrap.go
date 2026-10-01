@@ -288,7 +288,13 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	toolRegistry := tool.NewBuiltinRegistry(workDir, &cfg.Agent, nil) // 内置工具注册表
 	// 把 yaml 中的 tool_sandbox_* 配置真正注入 Executor；否则 SafetyConfig 是死配置，
 	// Executor 永远跑 DefaultSandboxConfig（默认禁写工作目录外、保留命令黑名单）。
-	toolRegistry.SetSandboxConfig(&cfg.Agent.SafetyConfig)
+	// C2 技能携带工具：把经验技能目录并入沙箱允许读前缀——agent 执行 scripts/ 前常先用
+	// ReadFile 看脚本，skills_learned 在工作目录之外会被 resolvePathWithSandbox 拦截；
+	// 与 tool_sandbox_allowed_paths 同机制放行（读+执行，RunCommand 本身不做路径校验只过黑名单）。
+	sandboxCfg := cfg.Agent.SafetyConfig
+	sandboxCfg.ToolSandboxAllowedPaths = append(append([]string{}, sandboxCfg.ToolSandboxAllowedPaths...),
+		filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"))
+	toolRegistry.SetSandboxConfig(&sandboxCfg)
 	// 全信任模式（tool_approval_disabled，默认 false）：true 时关闭全部破坏性操作审批
 	// ——WriteFile/EditFile 生产写入、RunCommand 危险命令模式、插件 Destructive 工具
 	// （computer_use 全工具自标 destructive）不再推「需确认」，直接执行。仅关闭确认链，
@@ -785,7 +791,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return evolveSessionLLM(ctx, modelFactory, in)
 		})
 		skillSink := newLearnedSkillSink(pgStore.LearnedSkills,
-			filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"), skillPool, cfg.Skills.MaxCount)
+			filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"), skillPool, cfg.Skills.MaxCount, modelFactory)
 		agentSvc.SetSkillSink(skillSink.persist)
 		agentSvc.SetEvolutionLogger(func(ctx context.Context, sessionID, kind, target, summary string) error {
 			return pgStore.LearnedSkills.AppendEvolutionLog(ctx, kind, target, summary, sessionID)

@@ -10,6 +10,7 @@ import {
   listEvolutionLog,
   consolidateSkills,
   type LearnedSkill,
+  type SkillTool,
   type EvolutionLogEntry,
 } from '@/api/learned'
 import { listSkills } from '@/api/skills'
@@ -58,6 +59,41 @@ const editName = ref('')
 const editTitle = ref('')
 const editWhenToUse = ref('')
 const editContent = ref('')
+/** 编辑弹窗「配套脚本」只读清单（从详情 content 的 frontmatter 解析；后端 PUT 不接收 tools 变更）。 */
+const editTools = ref<SkillTool[]>([])
+
+// 宽容解析 SKILL.md frontmatter 的 tools 清单（仅认后端 RenderSkillFrontmatter 产出的
+// 固定 YAML 形状：`- path:` / `desc:` / `run:` 二级缩进；解析失败返回空清单，不影响编辑）。
+function parseSkillTools(raw: string): SkillTool[] {
+  if (!raw.startsWith('---')) return []
+  const end = raw.indexOf('\n---', 4)
+  if (end < 0) return []
+  const tools: SkillTool[] = []
+  let cur: SkillTool | null = null
+  let inTools = false
+  for (const line of raw.slice(4, end).split('\n')) {
+    if (!inTools) {
+      if (/^tools:\s*$/.test(line)) inTools = true
+      continue
+    }
+    const item = line.match(/^\s+- path:\s*(.+?)\s*$/)
+    if (item) {
+      cur = { path: item[1], desc: '' }
+      tools.push(cur)
+      continue
+    }
+    if (!cur) {
+      if (/^\S/.test(line)) inTools = false
+      continue
+    }
+    const desc = line.match(/^\s+desc:\s*(.+?)\s*$/)
+    if (desc) { cur.desc = desc[1]; continue }
+    const run = line.match(/^\s+run:\s*(.+?)\s*$/)
+    if (run) { cur.run = run[1]; continue }
+    if (/^\S/.test(line)) { inTools = false; cur = null }
+  }
+  return tools.filter(t => t.path)
+}
 
 async function loadSkills() {
   loading.value = true
@@ -112,10 +148,13 @@ async function openEdit(s: LearnedSkill) {
   editVisible.value = true
   try {
     const res = await getLearnedSkill(s.name)
+    // 配套脚本清单先于 frontmatter 剥离解析。
+    editTools.value = parseSkillTools(res.content)
     // 内容含 frontmatter，编辑框只展示正文（frontmatter 由保存时重建）。
     const idx = res.content.indexOf('---\n\n')
     editContent.value = idx >= 0 ? res.content.slice(idx + 5) : res.content
   } catch (e) {
+    editTools.value = []
     ElMessage.error('技能详情加载失败：' + (e instanceof Error ? e.message : String(e)))
   }
 }
@@ -127,6 +166,8 @@ async function saveEdit() {
       title: editTitle.value,
       when_to_use: editWhenToUse.value,
       content: editContent.value,
+      // C4：配套脚本清单随保存整体提交（后端校验 path 并同步删除已移除的 scripts/ 文件）。
+      tools: editTools.value.map(t => ({ path: t.path, desc: t.desc, run: t.run })),
     })
     editVisible.value = false
     ElMessage.success('技能已更新')
@@ -208,6 +249,10 @@ onMounted(() => {
                   <el-tag v-if="s.outcome" size="small" :type="s.outcome === 'success' ? 'success' : 'danger'" effect="plain">
                     源自{{ s.outcome === 'success' ? '成功' : '失败' }}会话
                   </el-tag>
+                  <el-tag v-if="s.has_tools" size="small" type="warning" effect="plain"
+                          title="该技能携带可执行脚本" class="!cursor-help">
+                    ⚙ 带工具
+                  </el-tag>
                 </div>
                 <p class="text-xs text-ink-2 mt-2 line-clamp-2">{{ s.when_to_use }}</p>
                 <div class="mt-2 text-[11px] text-ink-3 flex gap-3">
@@ -282,6 +327,28 @@ onMounted(() => {
         <div>
           <div class="text-xs text-ink-2 mb-1">正文（步骤 / 坑点 / 验证）</div>
           <el-input v-model="editContent" type="textarea" :rows="14" spellcheck="false" class="skill-editor" />
+        </div>
+        <div v-if="editTools.length">
+          <div class="text-xs text-ink-2 mb-1">配套脚本（{{ editTools.length }}）</div>
+          <div class="rounded-md border border-line bg-page">
+            <div v-for="t in editTools" :key="t.path"
+                 class="flex items-center gap-2 px-3 py-2 text-xs border-b border-line last:border-b-0">
+              <span class="font-mono text-primary shrink-0">{{ t.path }}</span>
+              <span v-if="t.desc" class="text-ink-2 shrink-0 max-w-[40%] truncate" :title="t.desc">{{ t.desc }}</span>
+              <span v-if="t.run" class="text-ink-3 truncate flex-1 text-right" :title="t.run">{{ t.run }}</span>
+              <el-popconfirm title="从该技能中移除此脚本？（scripts/ 下对应文件将一并删除）"
+                             confirm-button-text="移除" cancel-button-text="取消"
+                             width="260" @confirm="editTools = editTools.filter(x => x.path !== t.path)">
+                <template #reference>
+                  <el-button size="small" text type="danger" class="!px-1 shrink-0">移除</el-button>
+                </template>
+              </el-popconfirm>
+            </div>
+          </div>
+          <p class="text-[11px] text-ink-3 mt-1">
+            脚本由会话沉淀自动生成；移除脚本在点击「保存」后生效。新增脚本请放入
+            config/skills_learned/{{ editName }}/scripts/ 后重新编辑本技能登记。
+          </p>
         </div>
       </div>
       <template #footer>

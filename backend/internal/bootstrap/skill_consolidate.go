@@ -38,14 +38,14 @@ const (
 
 // skillConsolidator 经验技能库整理器。
 type skillConsolidator struct {
-	skills    *store.LearnedSkillStore
+	skills    learnedSkillStoreOps
 	pool      *skill.Pool
 	factory   *model.ModelFactory
 	threshold int // 启用技能数达到该值才自动整理；<=0 关闭自动（手动触发不受限）
 	mu        sync.Mutex
 }
 
-func newSkillConsolidator(skills *store.LearnedSkillStore, pool *skill.Pool, factory *model.ModelFactory, threshold int) *skillConsolidator {
+func newSkillConsolidator(skills learnedSkillStoreOps, pool *skill.Pool, factory *model.ModelFactory, threshold int) *skillConsolidator {
 	return &skillConsolidator{skills: skills, pool: pool, factory: factory, threshold: threshold}
 }
 
@@ -204,9 +204,38 @@ func (c *skillConsolidator) apply(ctx context.Context, enabled []*store.LearnedS
 
 // mergeOne 把一个来源技能并入保留者：重写保留者文件（追加来源正文段 + 合并 when_to_use）、
 // 重嵌入向量、刷新技能池注册；来源全部禁用退池；写 skill_merge 审计。
+// B4：合并前经共用 judge（judgeDuplicateMerge）逐来源复核，防整理模型误并——
+// judge 明确判"不重复"的来源跳过不合并；judge 失败/超时保守按重复处理（维持合并，
+// 与 persist 侧"宁可合并不灌水"策略一致）。
 func (c *skillConsolidator) mergeOne(ctx context.Context, keep *store.LearnedSkill, srcs []*store.LearnedSkill, note string) error {
+	confirmed := make([]*store.LearnedSkill, 0, len(srcs))
+	for _, src := range srcs {
+		if c.factory != nil {
+			res, err := judgeDuplicateMerge(ctx, c.factory, keep.Title, keep.WhenToUse, src)
+			if err != nil {
+				log.Printf("[skill-consolidate] merge judge failed (conservative merge): keep=%s src=%s err=%v", keep.Name, src.Name, err)
+				confirmed = append(confirmed, src)
+				continue
+			}
+			if !res.Duplicate {
+				log.Printf("[skill-consolidate] merge judge rejected (skip): keep=%s src=%s reason=%s", keep.Name, src.Name, res.Reason)
+				continue
+			}
+		}
+		confirmed = append(confirmed, src)
+	}
+	if len(confirmed) == 0 {
+		return fmt.Errorf("merge aborted: all sources rejected by judge (keep=%s)", keep.Name)
+	}
+	srcs = confirmed
+	// C1 统一路径解析 + C2 保留既有 tools（合并重写 frontmatter 时带上，scripts/ 不动）。
+	keepPath := textutil.ResolveSkillMDPathFromRef(keep.ContentPath)
+	var keepTools []textutil.SkillTool
+	if data, err := os.ReadFile(keepPath); err == nil {
+		keepTools = textutil.ParseSkillTools(data)
+	}
 	var b strings.Builder
-	b.WriteString(skillFileBody(keep.ContentPath))
+	b.WriteString(skillFileBody(keepPath))
 	whenParts := []string{}
 	if w := strings.TrimSpace(keep.WhenToUse); w != "" {
 		whenParts = append(whenParts, w)
@@ -218,8 +247,8 @@ func (c *skillConsolidator) mergeOne(ctx context.Context, keep *store.LearnedSki
 		}
 	}
 	newWhen := truncateForPrompt(strings.Join(whenParts, "；"), 300)
-	content := renderSkillFile(keep.Name, keep.Title, newWhen, keep.Outcome, strings.TrimSpace(b.String()))
-	if err := writeSkillFile(keep.ContentPath, content); err != nil {
+	content := renderSkillFile(keep.Name, keep.Title, newWhen, keep.Outcome, strings.TrimSpace(b.String()), keepTools)
+	if err := writeSkillFile(keepPath, content); err != nil {
 		return fmt.Errorf("write merged skill file: %w", err)
 	}
 	emb, err := c.skills.Embed(ctx, keep.Title+" "+newWhen)
@@ -228,15 +257,17 @@ func (c *skillConsolidator) mergeOne(ctx context.Context, keep *store.LearnedSki
 	}
 	rec := &store.LearnedSkill{
 		Name: keep.Name, Title: keep.Title, WhenToUse: newWhen,
-		ContentPath: keep.ContentPath, Embedding: emb,
-		Enabled: true, UseCount: keep.UseCount,
+		ContentPath: keepPath, Embedding: emb,
+		Enabled: true, UseCount: keep.UseCount, HasTools: len(keepTools) > 0,
 		SourceSession: keep.SourceSession, Outcome: keep.Outcome,
 	}
 	if err := c.skills.Upsert(ctx, rec); err != nil {
 		return fmt.Errorf("upsert merged skill: %w", err)
 	}
 	if c.pool != nil {
-		c.pool.Register(learnedSkillToPool(keep.Name, keep.Title, newWhen, keep.ContentPath, content))
+		_, body := textutil.ParseFrontmatter([]byte(content))
+		c.pool.Register(learnedSkillToPool(keep.Name, keep.Title, newWhen, keepPath,
+			body+textutil.SkillToolSection(keepTools)))
 	}
 	for _, src := range srcs {
 		if err := c.disableOne(ctx, src, "skill_merge", fmt.Sprintf("合并进 %s：%s", keep.Name, truncateForPrompt(note, 120))); err != nil {
@@ -262,9 +293,10 @@ func (c *skillConsolidator) disableOne(ctx context.Context, sk *store.LearnedSki
 	return nil
 }
 
-// renderSkillFile 渲染技能文件：frontmatter（name/title/when_to_use/outcome）+ 正文。
-func renderSkillFile(name, title, whenToUse, outcome, body string) string {
-	return textutil.RenderSkillFrontmatter(name, title, whenToUse, outcome) + "\n" +
+// renderSkillFile 渲染技能文件：frontmatter（name/title/when_to_use/outcome[/tools]）+ 正文。
+// 可选 tools（C1）：非空时 frontmatter 渲染 tools 清单。
+func renderSkillFile(name, title, whenToUse, outcome, body string, tools ...[]textutil.SkillTool) string {
+	return textutil.RenderSkillFrontmatter(name, title, whenToUse, outcome, tools...) + "\n" +
 		strings.TrimSpace(body) + "\n"
 }
 
@@ -275,8 +307,9 @@ func skillFileExcerpt(path string, n int) string {
 }
 
 // skillFileBody 读技能文件正文（剥 YAML frontmatter）；读失败返回空串（best-effort）。
+// C1：路径经 ResolveSkillMDPathFromRef 归一（PG content_path 新老格式混存，目录式优先）。
 func skillFileBody(path string) string {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(textutil.ResolveSkillMDPathFromRef(path))
 	if err != nil {
 		return ""
 	}

@@ -24,6 +24,9 @@ type SandboxConfig struct {
 	BlockedCmds []string
 	// AllowedPaths 是允许访问的额外绝对路径列表。
 	// 除了工作目录之外，这些路径下的读写操作也会被允许。
+	// C2 技能携带工具：bootstrap 启动时把 <config>/skills_learned 并入本列表——
+	// agent 经 RunCommand 执行 <skills_learned>/<name>/scripts/ 下脚本前，常先用
+	// ReadFile/写入类工具接触该目录（工作目录之外），统一在此放行读+执行前缀。
 	AllowedPaths []string
 	// AllowWriteOutsideWorkDir 控制是否允许在工作目录之外写入。
 	// 如果为 true，则跳过路径沙箱检查；命令黑名单仍然生效。
