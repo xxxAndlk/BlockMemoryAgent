@@ -210,12 +210,14 @@ export interface AgentNode {
  * 只带工作区相对路径，媒体本体走 GET /api/sessions/:id/workspace/*path 流式读取。
  */
 export interface ArtifactRef {
-  kind: 'image' | 'video' | 'audio' | 'html' | string
+  kind: 'image' | 'video' | 'audio' | 'html' | 'pdf' | 'markdown' | 'code' | 'json' | 'csv' | 'xlsx' | 'txt' | 'unknown' | string
   /** 工作区相对路径（正斜杠） */
   path: string
   title?: string
   caption?: string
   mime?: string
+  /** 文件大小（字节）；后端未下发时不显示大小（TODO #26 A 卡片不强加后端改动） */
+  size?: number
   /** 自动兜底识别出来的（非工具显式登记）：用于文案区分 */
   inferred?: boolean
 }
@@ -265,12 +267,25 @@ export function domainFromDetail(detailJson?: string): string {
   }
 }
 
-/** 媒体扩展名 → 展示类型（自动兜底识别用）。 */
-const MEDIA_EXT_KIND: Record<string, string> = {
+/** 扩展名 → 成果卡片类型（自动兜底识别用，TODO #26 A 扩展文档/代码类）。 */
+const EXT_ARTIFACT_KIND: Record<string, string> = {
   png: 'image', jpg: 'image', jpeg: 'image', gif: 'image', webp: 'image', svg: 'image',
   mp4: 'video', webm: 'video', mov: 'video', mkv: 'video',
   mp3: 'audio', wav: 'audio', m4a: 'audio', ogg: 'audio', flac: 'audio',
   html: 'html', htm: 'html',
+  // 文档/数据：紧凑文件卡（不内嵌预览，操作=预览/下载/在文件夹中显示）
+  pdf: 'pdf',
+  md: 'markdown', markdown: 'markdown',
+  json: 'json', csv: 'csv', tsv: 'csv', txt: 'txt', log: 'txt',
+  xlsx: 'xlsx', xls: 'xlsx', docx: 'unknown', doc: 'unknown', zip: 'unknown',
+  // 代码：按「代码」文件卡处理（预览走文件树高亮）
+  go: 'code', py: 'code', js: 'code', mjs: 'code', cjs: 'code', jsx: 'code',
+  ts: 'code', mts: 'code', tsx: 'code', vue: 'code',
+  java: 'code', c: 'code', cc: 'code', cpp: 'code', h: 'code', hpp: 'code',
+  cs: 'code', rs: 'code', rb: 'code', php: 'code', swift: 'code', kt: 'code',
+  sh: 'code', bash: 'code', ps1: 'code', bat: 'code',
+  css: 'code', scss: 'code', less: 'code', sql: 'code', yaml: 'code', yml: 'code',
+  xml: 'code', toml: 'code', ini: 'code', dockerfile: 'code',
 }
 
 /**
@@ -295,7 +310,7 @@ export function inferArtifactsFromOutput(output?: string): ArtifactRef[] {
     // 只认产物目录下的媒体文件（.bma/shared、.bma/tool_outputs 等非展示内容不在此列）。
     if (!/^(images|od-artifacts|ui-artifacts|videos|artifacts)\//.test(path.slice(5))) continue
     const ext = path.split('.').pop()?.toLowerCase() || ''
-    const kind = MEDIA_EXT_KIND[ext]
+    const kind = EXT_ARTIFACT_KIND[ext]
     if (!kind || seen.has(path)) continue
     seen.add(path)
     out.push({ kind, path, inferred: true })
@@ -303,12 +318,15 @@ export function inferArtifactsFromOutput(output?: string): ArtifactRef[] {
   return out
 }
 
-const ARTIFACT_KINDS = new Set(['image', 'video', 'audio', 'html'])
+// kind 合法值：四类内嵌媒体 + 紧凑文件卡类型（TODO #26 A）。
+// 不在集合内时按 path 扩展名推断（复用 EXT_ARTIFACT_KIND），推断不出同样丢弃。
+const ARTIFACT_KINDS = new Set(['image', 'video', 'audio', 'html',
+  'pdf', 'markdown', 'code', 'json', 'csv', 'xlsx', 'txt', 'unknown'])
 
 /**
  * 清洗 SSE awaiting_clarify 帧的 artifacts 字段（后端契约外的脏数据不放进问答卡）：
- * 非数组按无产物处理；元素缺 kind/path 丢弃；kind 不在四值枚举内时按 path 扩展名
- * 推断（复用 MEDIA_EXT_KIND），推断不出同样丢弃。
+ * 非数组按无产物处理；元素缺 kind/path 丢弃；kind 不在合法枚举内时按 path 扩展名
+ * 推断（复用 EXT_ARTIFACT_KIND），推断不出同样丢弃。
  */
 export function clarifyArtifactsFromFrame(raw: unknown): ArtifactRef[] {
   if (!Array.isArray(raw)) return []
@@ -320,7 +338,7 @@ export function clarifyArtifactsFromFrame(raw: unknown): ArtifactRef[] {
     let kind = typeof item.kind === 'string' ? item.kind : ''
     if (!ARTIFACT_KINDS.has(kind)) {
       const ext = item.path.split('.').pop()?.toLowerCase() || ''
-      kind = MEDIA_EXT_KIND[ext] || ''
+      kind = EXT_ARTIFACT_KIND[ext] || ''
     }
     if (!kind) continue
     out.push({ ...item, kind })

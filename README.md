@@ -26,6 +26,8 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 - **共享记忆**：`WriteSharedMemory` 工具让主 Agent 把关键上下文（文件路径/行号/函数签名/验收标准）写入 `sharedKV`，子 Agent 自动读取，避免重读全文件；`task` 入参 2000 runes 上限强制规格走共享记忆
 - **验证闭环编排器**：`verifyloop` 原生驱动"产出 -> 自测 -> 修正 -> 上级统一测试"状态机，`Verifier`/`Fixer`/`Reporter` 三接口解耦，`PlanConfirmVerifier` 支持"测试方向不明确 -> 列方案 -> 产出方确认 -> 符合才自测"前置
 - **角色工具白名单**：`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集；MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet` 防越位，DomainAgent 开放完整权限承担上下文采集 + 任务拆分 + 派发执行
+- **经验技能自进化与「技能携带工具」**：会话结束由 SessionEvolver 沉淀经验技能（写入前轻量模型评分门禁 <3 拒收、title+when_to_use 向量近重复 LLM-judge 合并、每日自动整理）；目录式落盘 `<name>/SKILL.md + scripts/`，会话中跑通的自写脚本可固化为技能配套工具（≤60 行 + 写入前冒烟执行），`load_skill` 注入「配套工具」段、沙箱放行执行
+- **工作区文件树与全屏预览（Kimi Work 形态）**：会话侧栏整棵工作区目录树（实时筛选/tab 多开/面包屑跳转/在线编辑 Ctrl+S 保存带 mtime 409 冲突与 .bak），消息流统一文件卡片 + 全局 FileViewer 全屏预览（图片画廊/PDF/视频 Range 流/Markdown/代码高亮/CSV/xlsx/ipynb），支持「在文件夹中显示」与本机编辑器扫码打开（VS Code/Cursor/记事本等）
 - **热插拔插件系统**（[设计文档](doc/设计文档_插件范式.md)）：MCP 外部插件（stdio 子进程 / streamable HTTP / docker 容器）、Claude/Codex 插件包（`.mcp.json` + `SKILL.md`）与 Docker 长驻服务统一挂进 `tool.Registry` 或生命周期管理，运行中 enable/disable 下一轮迭代即生效；三个初始插件全部容器化：`web_search`（firecrawl 自托管栈，默认开）、`computer_use`（Xvfb 虚拟桌面，默认关，全部工具接审批守卫链）、`open_design`（画图设计台 service 插件，默认关）；管理 API：`/api/plugins`（list/get/enable/disable/reload），配置 `config/plugins.yaml` + `config/plugins.d/`，部署见下文「插件（Docker 部署）」
 - **14 个内置工具**：文件/命令（ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles）、HTTP（HTTPGet/HTTPPost）、Git（GitDiff/GitStatus/GitLog/GitBlame）、共享内存（WriteSharedMemory）、Agent 通信（call_sub_agent/send_message），统一经沙箱守卫
 - **两段事件流记忆**：`Write` 追加事件（tool_call / call_sub_agent / sub_agent_summary / answer）并落 `agent_events` 表，`Assemble` 在 LLM 调用前注入最近 N 条（超 8 条经轻量模型压成 ≤200 字摘要，失败降级 raw join）；重启后懒加载恢复；无 RAG 自动注入（块记忆经 `SearchBlockMemory` 工具按需调用）
@@ -228,7 +230,7 @@ make plugins-build   # 构建/拉取三个插件镜像：
 .
 ├── backend/                    # Go 主模块 (github.com/blockmemory/agent/backend)
 │   ├── main.go                 # HTTP 入口（flag/日志/监听，装配委托 bootstrap.Build）
-│   ├── cmd/                    # tui / memory-console
+│   ├── cmd/                    # tui / memory-console / skill-cleanup（存量技能一次性清洗）
 │   ├── internal/
 │   │   ├── agent/              # ReAct 主循环 + Agent facade + 会话生命周期
 │   │   ├── domain/             # tool（注册表+内置工具）/ role / memory（事件流）/ subagent / verifyloop / orchestrator
@@ -243,7 +245,7 @@ make plugins-build   # 构建/拉取三个插件镜像：
 │   │   └── config/ embed/ retriever/ plugins/ computeruse/ ...
 │   └── pkg/                    # types / enums / config / 工具包
 ├── config/                     # config.yaml / roles.yaml / skills.yaml / soul.md
-├── migrations/                 # SQL schema (001-006)
+├── migrations/                 # SQL schema (001-012)
 ├── web/                        # Vue 3 + Vite SPA
 ├── test/                       # 集成测试（独立模块）：api / coding / tui / fixtures
 ├── doc/                        # 设计文档

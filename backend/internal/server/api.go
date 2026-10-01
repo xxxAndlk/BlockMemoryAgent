@@ -3,6 +3,7 @@ package server
 import (
 	"context"            // 超时上下文
 	"fmt"                // 格式化字符串
+	"io"                 // SectionReader / ReadFull / EOF（分段读文件）
 	"mime"               // 按扩展名探测 Content-Type
 	"net/http"           // HTTP 状态码
 	"net/url"            // Content-Disposition 文件名 URL 编码
@@ -18,12 +19,12 @@ import (
 	"github.com/gin-gonic/gin" // Gin Web 框架
 
 	"github.com/blockmemory/agent/backend/internal/agent"            // ModelManager（模型动态切换）
+	"github.com/blockmemory/agent/backend/internal/domain/tool"      // WithWorkDir(work_dir 注入)
 	"github.com/blockmemory/agent/backend/internal/model"            // ModelFactory
 	"github.com/blockmemory/agent/backend/internal/plugins"          // 插件管理器
 	"github.com/blockmemory/agent/backend/internal/runtime"          // Runtime
 	"github.com/blockmemory/agent/backend/internal/server/eventkind" // 事件类型常量
 	"github.com/blockmemory/agent/backend/internal/store"            // Postgres / Redis
-	"github.com/blockmemory/agent/backend/internal/domain/tool"      // WithWorkDir(work_dir 注入)
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"      // RoleConfigFile
 	"github.com/blockmemory/agent/backend/pkg/types"                 // 共享类型
 )
@@ -52,21 +53,28 @@ type APIHandler struct {
 	paused   map[string]bool // topic_id -> 是否暂停
 	pausedMu sync.RWMutex    // 保护 paused 的并发读写
 
-	rt           *runtime.Runtime          // 聚合运行时
-	sessionMgr   *SessionManager           // 会话管理器
-	pgStore      *store.PostgresStore      // Postgres 存储
-	redisStore   *store.RedisStore         // Redis 存储
-	roleCfg      *pkgconfig.RoleConfigFile // 角色配置
-	modelFactory *model.ModelFactory       // 模型工厂
-	modelMgr     agent.ModelManager        // 模型动态切换能力（ReactService 实现）
-	statsService *StatsService             // 会话统计聚合服务
-	pluginMgr    *plugins.Manager          // 插件管理器（热插拔插件管理 API）
-	learnedSkills *store.LearnedSkillStore // 自进化技能库存储（2026-09-02 设计 §8）
+	rt            *runtime.Runtime          // 聚合运行时
+	sessionMgr    *SessionManager           // 会话管理器
+	pgStore       *store.PostgresStore      // Postgres 存储
+	redisStore    *store.RedisStore         // Redis 存储
+	roleCfg       *pkgconfig.RoleConfigFile // 角色配置
+	modelFactory  *model.ModelFactory       // 模型工厂
+	modelMgr      agent.ModelManager        // 模型动态切换能力（ReactService 实现）
+	statsService  *StatsService             // 会话统计聚合服务
+	pluginMgr     *plugins.Manager          // 插件管理器（热插拔插件管理 API）
+	learnedSkills *store.LearnedSkillStore  // 自进化技能库存储（2026-09-02 设计 §8）
 	// skillConsolidation 技能库整理器（C 库存治理）：手动触发一轮合并/归档，返回摘要。
 	skillConsolidation func(ctx context.Context) (string, error)
 	// defaultWorkDir 进程默认工作目录（bootstrap 注入）：work_dir 参数为空时
 	// tester-config 等工作目录级配置的回落目录（与 ReactService.workDir 同源）。
 	defaultWorkDir string
+
+	// 编辑器扫码缓存（TODO #26 阶段 F）：进程内 60s，editorsScanned 区分"没扫过"
+	// 与"扫过但零命中"（后者也缓存，避免空结果期间反复扫注册表/磁盘）。
+	editorsMu      sync.Mutex
+	editorsAt      time.Time
+	editorsCached  []EditorInfo
+	editorsScanned bool
 }
 
 // NewAPIHandler 创建 API 处理器。
@@ -448,7 +456,7 @@ func (h *APIHandler) SkillsHandler(c *gin.Context) {
 }
 
 // FilesHandler 处理 GET /api/files — 返回某会话 WriteFile 输出文件列表。
-// 职责：扫描会话事件中的 WriteFile 工具调用，去重后返回文件路径 / 大小 / 名称。
+// 职责：扫描会话事件中的 WriteFile 工具调用，去重后返回文件路径 / 大小 / 名称 / mime。
 // 参数：?session=session-N。
 func (h *APIHandler) FilesHandler(c *gin.Context) {
 	sessionID := c.Query("session")
@@ -474,7 +482,8 @@ func (h *APIHandler) FilesHandler(c *gin.Context) {
 				files = append(files, map[string]any{
 					"path": ev.ToolPath,
 					"size": fileSize(info),
-					"name": filepath.Base(ev.ToolPath), // 仅文件名
+					"name": filepath.Base(ev.ToolPath),                       // 仅文件名
+					"mime": detectFileContentType(filepath.Ext(ev.ToolPath)), // TODO #26 D：批量 mime，消前端 N+1
 				})
 			}
 		}
@@ -530,43 +539,88 @@ func (h *APIHandler) BrowseFSHandler(c *gin.Context) {
 }
 
 // FileContentHandler 处理 GET /api/files/content — 读取文件内容。
-// 职责：按 ?path=... 读取文件全文，返回 JSON（content 为字符串）。
+// 职责：按 ?path=... 读取文件内容，返回 JSON（content 为字符串）。
 // 增强：附带 size / mime / truncated（文本超过 fileContentMaxBytes 截断），
 // 前端据此渲染「文件过大」提示；content 字段保持旧契约不变。
+// mtime（Unix 毫秒）供 TODO #26 阶段 G：前端打开文件时记录，PUT 保存时作 base_mtime。
+//
+// TODO #26 阶段 D 分段读取：offset（字节，默认 0）+ limit（默认 fileContentMaxBytes，
+// 上限 fileContentChunkMaxBytes=1MB）配合前端「加载更多」；响应增 total_size /
+// next_offset（还有数据时为下一字节偏移，取尽时为 null）。truncated 语义统一为
+// 「还有未返回的数据」（旧语义=文件超阈值，与新语义在默认参数下一致）。
 func (h *APIHandler) FileContentHandler(c *gin.Context) {
 	path := c.Query("path")
 	if path == "" {
 		c.String(http.StatusBadRequest, "path required")
 		return
 	}
-	data, err := os.ReadFile(path) // 读取文件
+	offset, err := parseNonNegInt64(c.Query("offset"), 0)
 	if err != nil {
-		if os.IsNotExist(err) {
+		c.String(http.StatusBadRequest, "invalid offset")
+		return
+	}
+	limit, err := parseNonNegInt64(c.Query("limit"), fileContentMaxBytes)
+	if err != nil {
+		c.String(http.StatusBadRequest, "invalid limit")
+		return
+	}
+	if limit == 0 {
+		c.String(http.StatusBadRequest, "invalid limit")
+		return
+	}
+	if limit > fileContentChunkMaxBytes {
+		limit = fileContentChunkMaxBytes // 1MB 硬上限
+	}
+
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		if err != nil && !os.IsNotExist(err) {
+			c.String(http.StatusInternalServerError, "%s", err.Error())
+			return
+		}
+		c.String(http.StatusNotFound, "file not found") // 不存在与目录同码
+		return
+	}
+	total := info.Size()
+	if offset > total {
+		offset = total // 越界 offset：空片段收尾而非报错
+	}
+
+	data := []byte{}
+	if total > offset {
+		f, err := os.Open(path)
+		if err != nil {
 			c.String(http.StatusNotFound, "file not found")
 			return
 		}
-		c.String(http.StatusInternalServerError, "%s", err.Error())
-		return
+		defer f.Close()
+		data = make([]byte, limit)
+		n, _ := io.ReadFull(io.NewSectionReader(f, offset, limit), data)
+		data = data[:n] // 读到 EOF 为止
 	}
-	size := fileSizeOf(data)
-	truncated := false
-	if len(data) > fileContentMaxBytes {
-		data = data[:fileContentMaxBytes] // 大文件截断，前端提示下载查看
-		truncated = true
+	truncated := offset+int64(len(data)) < total
+	var nextOffset any
+	if truncated {
+		nextOffset = offset + int64(len(data))
 	}
 	c.JSON(http.StatusOK, map[string]any{
-		"path":      path,
-		"content":   string(data),
-		"size":      size,
-		"mime":      detectFileContentType(filepath.Ext(path)),
-		"truncated": truncated,
+		"path":        path,
+		"content":     string(data),
+		"size":        total,
+		"total_size":  total,
+		"mime":        detectFileContentType(filepath.Ext(path)),
+		"truncated":   truncated,
+		"next_offset": nextOffset,
+		"mtime":       info.ModTime().UnixMilli(),
 	})
 }
 
 // 文件预览相关上限（/api/files/raw 与 /api/files/content 共用）。
 const (
-	fileRawMaxBytes     = 20 << 20 // 20MB：raw 下载/内联渲染上限，超限 413
-	fileContentMaxBytes = 300 << 10 // 300KB：content JSON 文本截断阈值
+	fileRawMaxBytes          = 20 << 20  // 20MB：raw 全量下载/内联渲染上限，超限 413
+	fileRawRangeMaxBytes     = 50 << 20  // 50MB：raw 单区间 Range 长度上限（不卡文件总大小，只卡区间）
+	fileContentMaxBytes      = 300 << 10 // 300KB：content JSON 文本默认分段大小
+	fileContentChunkMaxBytes = 1 << 20   // 1MB：content 单次 limit 硬上限
 )
 
 // fileRawMimeTypes 常见扩展名 → Content-Type 白名单（mime.TypeByExtension 在
@@ -581,18 +635,18 @@ var fileRawMimeTypes = map[string]string{
 	".svg":  "image/svg+xml",
 	".ico":  "image/x-icon",
 	// 文档/数据
-	".pdf":       "application/pdf",
-	".json":      "application/json",
-	".md":        "text/markdown; charset=utf-8",
-	".markdown":  "text/markdown; charset=utf-8",
-	".txt":       "text/plain; charset=utf-8",
-	".log":       "text/plain; charset=utf-8",
-	".csv":       "text/csv; charset=utf-8",
-	".html":      "text/html; charset=utf-8",
-	".htm":       "text/html; charset=utf-8",
-	".xml":       "text/xml; charset=utf-8",
-	".yaml":      "text/yaml; charset=utf-8",
-	".yml":       "text/yaml; charset=utf-8",
+	".pdf":      "application/pdf",
+	".json":     "application/json",
+	".md":       "text/markdown; charset=utf-8",
+	".markdown": "text/markdown; charset=utf-8",
+	".txt":      "text/plain; charset=utf-8",
+	".log":      "text/plain; charset=utf-8",
+	".csv":      "text/csv; charset=utf-8",
+	".html":     "text/html; charset=utf-8",
+	".htm":      "text/html; charset=utf-8",
+	".xml":      "text/xml; charset=utf-8",
+	".yaml":     "text/yaml; charset=utf-8",
+	".yml":      "text/yaml; charset=utf-8",
 	// 代码（按纯文本返回，高亮由前端 highlight.js 负责）
 	".go":   "text/plain; charset=utf-8",
 	".py":   "text/plain; charset=utf-8",
@@ -655,8 +709,18 @@ func (h *APIHandler) isKnownWriteFilePath(path string) bool {
 
 // FileRawHandler 处理 GET /api/files/raw?path=... [&download=1] — 按真实
 // Content-Type 返回文件字节，供 <img> 内联渲染与浏览器直接下载。
-// 安全边界：path 必须命中某会话的成功 WriteFile 产物（isKnownWriteFilePath），
-// 否则一律 404（不区分"不存在"与"越界"，避免路径探测）；大小超 fileRawMaxBytes 返回 413。
+//
+// 安全边界（TODO #26 阶段 D 放宽）：path 命中某会话成功 WriteFile 产物
+// （isKnownWriteFilePath，保留兼容）**或**位于任一会话工作区内
+// （isWithinAnyWorkspace，工作区树里能看到的文件都能取），否则一律 404
+// （不区分"不存在"与"越界"，避免路径探测）。
+//
+// 缓存与分段（TODO #26 阶段 D）：
+//   - 全量 GET：20MB 上限（超限 413），带 ETag（W/"size-mtime" 弱校验值）与
+//     Last-Modified；If-None-Match 命中回 304；
+//   - Range: bytes=a-b / a- / -N（单区间）：回 206 + Content-Range + Accept-Ranges，
+//     越界回 416（Content-Range: bytes */size）；区间请求不卡文件总大小，
+//     只卡区间长度 50MB（fileRawRangeMaxBytes）。
 func (h *APIHandler) FileRawHandler(c *gin.Context) {
 	path := c.Query("path")
 	if path == "" {
@@ -664,15 +728,64 @@ func (h *APIHandler) FileRawHandler(c *gin.Context) {
 		return
 	}
 	if !h.isKnownWriteFilePath(path) {
-		c.String(http.StatusNotFound, "file not found")
-		return
+		if _, ok := h.isWithinAnyWorkspace(path); !ok {
+			c.String(http.StatusNotFound, "file not found")
+			return
+		}
 	}
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		c.String(http.StatusNotFound, "file not found")
 		return
 	}
-	if info.Size() > fileRawMaxBytes {
+	size := info.Size()
+
+	etag := rawETagOf(info)
+	lastMod := info.ModTime().UTC().Format(http.TimeFormat)
+
+	// 全量 GET 的缓存协商：If-None-Match 命中 → 304。
+	// （Range 请求不做协商，206 恒发内容。）
+	rangeHeader := c.GetHeader("Range")
+	if rangeHeader == "" && etagMatches(c.GetHeader("If-None-Match"), etag) {
+		c.Header("ETag", etag)
+		c.Header("Last-Modified", lastMod)
+		c.Status(http.StatusNotModified)
+		return
+	}
+
+	ct := detectFileContentType(filepath.Ext(path))
+	c.Header("X-Content-Type-Options", "nosniff")
+	if c.Query("download") == "1" {
+		name := url.PathEscape(filepath.Base(path))
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", name))
+	}
+
+	// Range 单区间解析：缺失/非法 → 全量 GET；区间越界 → 416。
+	start, end, ranged, unsat := parseBytesRange(rangeHeader, size)
+	if unsat {
+		c.Header("Content-Range", fmt.Sprintf("bytes */%d", size))
+		c.String(http.StatusRequestedRangeNotSatisfiable, "range not satisfiable")
+		return
+	}
+	if ranged {
+		length := end - start + 1
+		if length > fileRawRangeMaxBytes {
+			c.String(http.StatusRequestEntityTooLarge, "range too large (max 50MB)")
+			return
+		}
+		data, err := readFileRange(path, start, length)
+		if err != nil {
+			c.String(http.StatusNotFound, "file not found")
+			return
+		}
+		c.Header("Content-Type", ct)
+		c.Header("Accept-Ranges", "bytes")
+		c.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+		c.Data(http.StatusPartialContent, ct, data)
+		return
+	}
+
+	if size > fileRawMaxBytes {
 		c.String(http.StatusRequestEntityTooLarge, "file too large (max 20MB)")
 		return
 	}
@@ -681,14 +794,116 @@ func (h *APIHandler) FileRawHandler(c *gin.Context) {
 		c.String(http.StatusNotFound, "file not found")
 		return
 	}
-	ct := detectFileContentType(filepath.Ext(path))
 	c.Header("Content-Type", ct)
-	c.Header("X-Content-Type-Options", "nosniff")
-	if c.Query("download") == "1" {
-		name := url.PathEscape(filepath.Base(path))
-		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", name))
-	}
+	c.Header("Accept-Ranges", "bytes")
+	c.Header("ETag", etag)
+	c.Header("Last-Modified", lastMod)
 	c.Data(http.StatusOK, ct, data)
+}
+
+// rawETagOf 生成 raw 端点的弱校验 ETag：W/"size-mtimeUnix"（同内容同 mtime 即命中）。
+func rawETagOf(info os.FileInfo) string {
+	return fmt.Sprintf("W/\"%d-%d\"", info.Size(), info.ModTime().Unix())
+}
+
+// etagMatches 按 RFC 9110 弱比较判断 If-None-Match 是否命中 etag：
+// 支持逗号分隔列表与 "*"（任意资源存在即命中）；比较前剥掉 W/ 前缀。
+func etagMatches(ifNoneMatch, etag string) bool {
+	ifNoneMatch = strings.TrimSpace(ifNoneMatch)
+	if ifNoneMatch == "" {
+		return false
+	}
+	weak := strings.TrimPrefix(etag, "W/")
+	for _, candidate := range strings.Split(ifNoneMatch, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" || strings.TrimPrefix(candidate, "W/") == weak {
+			return true
+		}
+	}
+	return false
+}
+
+// parseBytesRange 解析单区间 Range 头（bytes=a-b / bytes=a- / 后缀 bytes=-N）。
+// 返回 ranged=false 表示头缺失/多区间/格式非法——调用方按全量 GET 处理；
+// unsat=true 表示区间本身不可满足——调用方回 416。size 为资源总大小。
+func parseBytesRange(header string, size int64) (start, end int64, ranged, unsat bool) {
+	if size < 0 {
+		return 0, 0, false, false
+	}
+	if !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, false, false
+	}
+	spec := strings.TrimSpace(strings.TrimPrefix(header, "bytes="))
+	if spec == "" || strings.Contains(spec, ",") {
+		return 0, 0, false, false // 不支持多区间：按全量处理
+	}
+	dash := strings.IndexByte(spec, '-')
+	if dash < 0 {
+		return 0, 0, false, false
+	}
+	a, b := strings.TrimSpace(spec[:dash]), strings.TrimSpace(spec[dash+1:])
+	if a == "" {
+		// 后缀区间 bytes=-N：取末尾 N 字节（N 超 size 取全量）。
+		n, err := strconv.ParseInt(b, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, false, false
+		}
+		if size == 0 {
+			return 0, 0, false, true
+		}
+		if n > size {
+			n = size
+		}
+		return size - n, size - 1, true, false
+	}
+	start, err := strconv.ParseInt(a, 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, false, false
+	}
+	if start >= size {
+		return 0, 0, false, true // 起点越界
+	}
+	if b == "" {
+		return start, size - 1, true, false
+	}
+	end, err = strconv.ParseInt(b, 10, 64)
+	if err != nil {
+		return 0, 0, false, false
+	}
+	if end > size-1 {
+		end = size - 1 // 终点越界：截到末尾
+	}
+	if start > end {
+		return 0, 0, false, true
+	}
+	return start, end, true, false
+}
+
+// readFileRange 读取文件 [start, start+length) 字节（调用方已校验边界与上限）。
+func readFileRange(path string, start, length int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data := make([]byte, length)
+	n, err := f.ReadAt(data, start)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+// parseNonNegInt64 解析非负整数查询参数：空串取 def；非法或负数返回 err。
+func parseNonNegInt64(s string, def int64) (int64, error) {
+	if s == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v < 0 {
+		return 0, fmt.Errorf("invalid int: %q", s)
+	}
+	return v, nil
 }
 
 // fileSizeOf 返回字节切片长度（int64），避免与 os.FileInfo 版 fileSize 混淆。
@@ -756,7 +971,7 @@ func prefsWorkDirCtx(c *gin.Context, dir string) (context.Context, bool) {
 }
 
 // ProjectPreferencesHandler 处理 GET /api/project/preferences — 返回当前 workDir 项目偏好全文
-//（2026-09-02 设计 §5：.bma/project_preferences.md）。可选 query work_dir 按会话目录解析。
+// （2026-09-02 设计 §5：.bma/project_preferences.md）。可选 query work_dir 按会话目录解析。
 func (h *APIHandler) ProjectPreferencesHandler(c *gin.Context) {
 	if h.sessionMgr == nil {
 		c.JSON(http.StatusOK, map[string]any{"content": ""})

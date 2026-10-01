@@ -75,8 +75,13 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.GET("/skills", apiHandler.SkillsHandler)                              // Skill 列表
 	api.GET("/files", apiHandler.FilesHandler)                                // 文件列表
 	api.GET("/files/content", apiHandler.FileContentHandler)                  // 文件内容读取
-	api.GET("/files/raw", apiHandler.FileRawHandler)                          // 文件原始字节（图片内联/下载，限 WriteFile 产物）
+	api.PUT("/files/content", apiHandler.SaveFileContentHandler)              // 在线编辑保存（TODO #26 G，限会话工作区）
+	api.GET("/files/raw", apiHandler.FileRawHandler)                          // 文件原始字节（图片内联/下载，限工作区）
+	api.GET("/files/reveal", apiHandler.FileRevealHandler)                    // 在文件夹中显示（TODO #26 C，explorer/open -R/xdg-open，限工作区）
+	api.GET("/editors", apiHandler.EditorsHandler)                            // 已安装编辑器扫码（TODO #26 F，60s 缓存）
+	api.POST("/editors/open", apiHandler.EditorOpenHandler)                   // 编辑器/系统默认打开（限工作区/WriteFile 产物路径）
 	api.GET("/fs/browse", apiHandler.BrowseFSHandler)                         // 目录浏览（前端工作目录选择器）
+	api.GET("/fs/tree", apiHandler.FSTreeHandler)                             // 会话工作区目录树（TODO #26 E，depth/节点数双上限+黑名单）
 	api.POST("/fs/pick-dir", apiHandler.PickDirHandler)                       // 系统原生目录选择框（服务端主机）
 	api.GET("/profile", apiHandler.ProfileHandler)                            // 用户画像查看（TODO #28）
 	api.PUT("/profile", apiHandler.SaveProfileHandler)                        // 用户画像编辑

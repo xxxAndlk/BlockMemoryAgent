@@ -6,6 +6,7 @@ import type { Turn } from '../utils/turns'
 import { turnArtifacts } from '../utils/turns'
 import { fmtTime, agentTextColor } from '../utils/eventStyles'
 import { renderMd } from '@/utils/markdown'
+import { useFileOpener } from '@/composables/fileOpener'
 import { submitClarify } from '../utils/clarifySubmit'
 import ThinkChain from './ThinkChain.vue'
 import ToolActivity from './ToolActivity.vue'
@@ -108,9 +109,20 @@ const liveStreamingHtml = computed(() => {
   return renderMd(props.liveStreaming) + '<span class="live-cursor">▍</span>'
 })
 
-// 代码块头栏复制/下载（事件委托：md-article 内 v-html 按钮无 Vue 绑定）
+// 本地文件链接（TODO #26 A）：data-bma-file = 工作区文件入口，点击在右侧文件树打开。
+const fileOpener = useFileOpener()
+
+// 代码块头栏复制/下载 + 本地文件链接（事件委托：md-article 内 v-html 无 Vue 绑定）
 function onMdAction(e: MouseEvent) {
   const el = e.target as HTMLElement
+  const fileLink = el.closest('a[data-bma-file]')
+  if (fileLink) {
+    e.preventDefault()
+    const p = fileLink.getAttribute('data-bma-file') || ''
+    if (fileOpener) fileOpener.openInTree(p)
+    else ElMessage.info('文件：' + p)
+    return
+  }
   if (!el.closest('.md-code-actions')) return
   const code = (el.closest('.md-code')?.querySelector('pre')?.textContent || '').replace(/\n$/, '')
   if (!code) return

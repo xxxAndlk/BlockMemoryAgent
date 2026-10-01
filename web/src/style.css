@@ -197,6 +197,18 @@ body {
 .md-article th { background: var(--bma-page); font-weight: 600; }
 .md-article img { max-width: 100%; border-radius: 8px; }
 
+/* 本地文件链接入口（TODO #26 A）：📄 前缀由渲染器输出，虚线下划线 + 悬停高亮标识 */
+.md-article a.md-file-link,
+.markdown-body a.md-file-link {
+  text-decoration: underline dotted;
+  cursor: pointer;
+}
+.md-article a.md-file-link:hover,
+.markdown-body a.md-file-link:hover {
+  color: var(--bma-primary);
+  background: var(--bma-primary-soft);
+}
+
 /* 等宽工具类：路径 / 日志 / 代码 */
 .font-mono,
 code,
@@ -229,4 +241,13 @@ pre {
 
 .el-table tr {
   background-color: var(--bma-card);
+}
+
+/* 文件树"在对话中定位"命中后的高亮闪烁（TODO #26 C 双向定位） */
+@keyframes bma-locate-flash {
+  0%, 100% { box-shadow: none; }
+  30% { box-shadow: 0 0 0 2px var(--bma-primary); border-radius: 6px; }
+}
+.bma-locate-flash {
+  animation: bma-locate-flash 0.6s ease 3;
 }

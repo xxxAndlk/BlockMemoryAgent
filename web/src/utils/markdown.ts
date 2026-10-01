@@ -12,10 +12,40 @@ const renderer = new marked.Renderer()
 // undefined，任何裸链接（GFM autolink，如 **http://x**）触发即抛 "parseInline of
 // undefined"，Vue 组件渲染整体失败空白（2026-09-11 实证：回复含粗体裸链接时
 // 对话框该回合/日志该行全部空白）。
+/** 本地文件链接识别（TODO #26 A）：无 scheme 且长得像文件路径（含分隔符或有文件扩展名）。
+ *  Windows 盘符路径（C:\...）先于 scheme 判断（"C:" 会被 scheme 正则误吞）。 */
+const FILE_LINK_EXTS = new Set([
+  'md', 'markdown', 'txt', 'log', 'pdf', 'json', 'csv', 'tsv', 'xlsx', 'xls', 'docx', 'doc',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'mp4', 'webm', 'mov', 'mp3', 'wav',
+  'html', 'htm', 'xml', 'yaml', 'yml', 'toml', 'ini', 'sql', 'zip',
+  'go', 'py', 'js', 'mjs', 'cjs', 'jsx', 'ts', 'mts', 'tsx', 'vue', 'java', 'c', 'cc', 'cpp',
+  'h', 'hpp', 'cs', 'rs', 'rb', 'php', 'sh', 'bash', 'css', 'scss', 'less', 'ps1', 'bat',
+])
+
+/** href 是本地工作区文件链接时返回原路径串，否则 null。 */
+export function localFileLinkPath(href: string | null | undefined): string | null {
+  const h = (href || '').trim()
+  if (!h || h.startsWith('#')) return null
+  if (/^[a-zA-Z]:[\\/]/.test(h)) return h // Windows 绝对路径
+  if (/^[a-z][a-z0-9+.-]*:/i.test(h)) return null // http/mailto/javascript 等 scheme
+  if (h.startsWith('//')) return null // 协议相对
+  const ext = h.includes('.') ? h.split('.').pop()!.toLowerCase().split(/[?#]/)[0] : ''
+  if (h.includes('/') || h.includes('\\') || FILE_LINK_EXTS.has(ext)) return h
+  return null
+}
+
 renderer.link = function (this: Renderer, { href, title, tokens }) {
-  const safe = /^https?:\/\//i.test(href || '') ? href : '#'
   const t = title ? ` title="${String(title).replace(/"/g, '&quot;')}"` : ''
   const text = this.parser ? this.parser.parseInline(tokens) : escapePlain(tokens)
+  // 本地文件链接（工作区相对/绝对路径）：渲染成 📄 文件入口，点击由容器事件委托
+  // 调 fileOpener.openInTree 在文件树中打开（AssistantTurn.onMdAction /
+  // MarkdownRenderer 的 click）；外部 http 链接行为不变。
+  const localPath = localFileLinkPath(href)
+  if (localPath) {
+    const p = localPath.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    return `<a href="#" data-bma-file="${p}" class="md-file-link">📄 ${text}</a>`
+  }
+  const safe = /^https?:\/\//i.test(href || '') ? href : '#'
   return `<a href="${safe}" target="_blank" rel="noopener noreferrer"${t}>${text}</a>`
 }
 
@@ -55,7 +85,9 @@ const purifyConfig = {
     // 仅代码块渲染器输出 button（原始 HTML 已被 renderer.html 剥除），供复制/下载
     'button',
   ],
-  ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class', 'target', 'rel', 'colspan', 'rowspan'],
+  ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class', 'target', 'rel', 'colspan', 'rowspan',
+    // 本地文件链接入口（TODO #26 A）：点击由容器事件委托调 fileOpener.openInTree
+    'data-bma-file'],
   ALLOW_DATA_ATTR: false,
   FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input', 'style', 'link', 'meta', 'base'],
   FORBID_ATTR: ['style', 'onerror', 'onload', 'onclick', 'onmouseover'],

@@ -59,7 +59,7 @@ const editName = ref('')
 const editTitle = ref('')
 const editWhenToUse = ref('')
 const editContent = ref('')
-/** 编辑弹窗「配套脚本」只读清单（从详情 content 的 frontmatter 解析；后端 PUT 不接收 tools 变更）。 */
+/** 编辑弹窗「配套脚本」清单（从详情 content 的 frontmatter 解析；可移除，保存时随 PUT 整体替换提交）。 */
 const editTools = ref<SkillTool[]>([])
 
 // 宽容解析 SKILL.md frontmatter 的 tools 清单（仅认后端 RenderSkillFrontmatter 产出的

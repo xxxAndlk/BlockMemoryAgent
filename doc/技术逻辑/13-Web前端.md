@@ -29,8 +29,8 @@
 | 入口 | `main.ts` / `App.vue` | createApp → **64 个图标白名单注册** → router + ElementPlus → mount；App 仅 config-provider + router-view |
 | 布局 | `layout/index.vue` | Header（Logo/主题/设置）+ 侧栏 280px（2026-09-17 加宽自 224px：首页链接置顶 + 会话树 WorkDirTree〔高度随内容，不 flex-1 撑满〕+ 导航组〔资源库组含「工作目录」/projects 入口〕+ 工作流 Beta + 人格状态钉底）+ main router-view（fade 过渡） |
 | 路由 | `router/index.ts` | 12 子路由 + 2 旧重定向；**无守卫、无 404 兜底** |
-| API | `api/`（12 模块） | 全部经 `client.ts::fetchJson` 单点收口 |
-| 状态复用 | `composables/`（10 个） | useSessionStream/usePanelRefresh/useTreeLayout 等 |
+| API | `api/`（14 模块） | 全部经 `client.ts::fetchJson` 单点收口 |
+| 状态复用 | `composables/`（11 个） | useSessionStream/usePanelRefresh/useTreeLayout/fileOpener 等 |
 | 会话视图 | `views/session/**`（~30 文件） | chat/orch/monitor 三视图 + 面板 |
 | 管理页 | `views/{dashboard,history,knowledge,memory,plugins,profile,projects,settings,skills,soul,workflow}` | knowledge/workflow 为纯占位 |
 | 通用 | `components/`（6） | WorkDirTree/Picker/Drawer、MarkdownRenderer、AppCard、FeaturePlaceholder |
@@ -139,12 +139,16 @@
 |---|---|---|
 | board 看板 | board(3s) + agents(3s) + events(live) | 响应式；含 OrchMiniCanvas |
 | tools 工具 | events | 事件流配对 |
-| files 文件 | listFiles + getFileContent | watch sessionId 一次性，**不轮询** |
+| files 文件 | getFSTree（404 降级 listFiles）+ getFileContent（offset/limit 分段） | watch sessionId 一次性，**不轮询** |
 | memory 记忆 | listEvolutionLog + listLearnedSkills | watch sessionId 一次性 |
 | metrics 指标 | metrics/mailbox/health(3s) + tokenMetrics + efficiency | 混合 |
 
 - `useTaskBoard`：board.tasks 优先，否则由非 meta Agent 合成（`toTaskStatus`：paused/cancelled/idle 一律 blocked；delivered-unverified 保留）。
 - `useGoalTimeline`：从事件提 user/dispatch/done/failed 里程碑（上限 50 截最近）；空则 board.tasks 兜底（**保证面板永不空白**）。
+
+**files 面板 = 工作区文件树 + 在线编辑（TODO #26 E/G，2026-10-01，FilePreview.vue 重做）**：自绘递归树（WorkspaceTreeNode.vue：展开箭头/深度缩进/类型着色图标/大小列；树数据 `GET /fs/tree`，404 降级旧 WriteFile 平铺列表）；顶部「筛选文件…」实时过滤（命中保留父链自动展开）；tab 多开（● 脏标记/关闭确认/`v-show` 保滚动与编辑态/+ 回树）；面包屑目录段点击→树展开祖先链+虚线高亮+滚动定位；文本类「编辑」进等宽 textarea，Ctrl/Cmd+S 保存（409 弹覆盖/放弃，切文件/切会话先确认）；收起状态 localStorage `bma.sidebarOpen`。
+
+**全屏预览层 FileViewer（TODO #26 A/B/C）**：`components/FileViewer.vue` 全局单例（session/index.vue 挂载 + Teleport body），统一入口走 `fileOpener.openInViewer`；11 类视图——图片画廊（FileViewerImage：切换/缩放/平移/适应-原始）、PDF（FileViewerPdf：pdfjs 动态 chunk 分页 + IntersectionObserver 懒渲染）、视频/音频（raw Range 拖进度）、Markdown、代码（FileViewerCode：highlight.js+行号，`utils/hljs.ts` 注册 go/py/js/ts/yaml/json/css/xml/bash/sql/ini/diff/markdown/dockerfile 等，`.vue→xml`/`.toml→ini` 映射）、JSON pretty、CSV（FileViewerSheet：引号感知，2 万行/40 万格上限）、xlsx（SheetJS 动态 chunk 多 sheet 只读）、ipynb（FileViewerNotebook）、HTML（sandbox iframe 无 allow-same-origin）；工具条=面包屑/类型徽标/下载/新窗口/reveal/「打开 ▾」编辑器下拉（OpenInEditorMenu，展开即刷新 GET /editors，仅文本类显示）/全屏；←→（画廊）/ESC/F 导航。消息侧统一文件卡片=ArtifactCard 扩展（KIND_META 覆盖 pdf/md/code/json/csv/xlsx/txt/unknown，操作=预览/下载/在文件夹中显示）；Markdown 本地文件链接经 `utils/markdown.ts` 识别为 `a[data-bma-file]` 文件链接（Windows 盘符先于 scheme 判断；**裸路径不识别**——遗留）；树↔消息双向定位（树行「在对话中定位」→ `a[data-bma-file]`/`[data-bma-file-card]` scrollIntoView + `bma-locate-flash` 闪烁）。
 
 ## 13.9 API client 层
 
@@ -156,7 +160,7 @@
 
 **无鉴权头**（不注入 Authorization、不拼 `?token=`）→ 开启 auth_enabled 后 Web 整体 401 不可用；当前只适用本机 127.0.0.1 + 关闭鉴权。
 
-主要端点（相对 /api）：sessions CRUD/delete 批量(≤200)/board/agents/tree/agents/:aid/{cancel,pause,events,messages,message}/worktrees{/diff,/action}/message/stop/cancel/interrupt/enqueue/clarify(+batch)/trust-mode/gear/thinking/workdir/topic/stream(SSE)/logs/watchdog/mailbox/metrics/token-metrics/efficiency；models{/switch}；plugins{/enable,/disable,/reload}；skills/learned{/name,/enable,/disable}、evolution/log；profile、project/preferences、project/tester-config；fs/browse、fs/pick-dir；files、files/content。
+主要端点（相对 /api）：sessions CRUD/delete 批量(≤200)/board/agents/tree/agents/:aid/{cancel,pause,events,messages,message}/worktrees{/diff,/action}/message/stop/cancel/interrupt/enqueue/clarify(+batch)/trust-mode/gear/thinking/workdir/topic/stream(SSE)/logs/watchdog/mailbox/metrics/token-metrics/efficiency；models{/switch}；plugins{/enable,/disable,/reload}；skills/learned{/name,/enable,/disable}、evolution/log；profile、project/preferences、project/tester-config；fs/browse、fs/pick-dir、fs/tree；files、files/raw、files/content（GET/PUT）、files/reveal；editors、editors/open。
 
 ## 13.10 composables 逐个
 
@@ -172,6 +176,7 @@
 | `useTheme` | localStorage bma:theme |
 | `useWorkDir` | 模块级单例 + bma:last-workdir |
 | `useModelSelection` | 模块级单例（catalog/selectedRole='meta'/thinking）；ensureLoaded 并发去重；doSwitch/doAdd **不 catch**（错误交调用方） |
+| `fileOpener` | 文件打开统一入口（provide/inject）：openInTree/openInViewer/resolveAbsolute/locateRequest；会话页 provide，ArtifactCard/MarkdownRenderer/AssistantTurn/FilePreview inject |
 
 ## 13.11 通用组件与管理页
 
@@ -202,7 +207,7 @@
 17. **ExecutionLog 进度条仍认旧完成合同**（口径已漂移）。
 18. **复活重跑后增量游标失效**（2026-09-17 修复）：终态节点 ReviveWithMessage 同 ID 重跑会清空热层并从 0 重编 seq，前端 `after_seq` 增量此后取不到任何东西、面板停在旧内容——agent messages 响应补 `run_id`（单调递增，权威判据）与 `hot_max_seq`（兜底）；后端同时在复活前 **ArchiveMessages**（原 DeleteMessages，物理删 → #20① 起改归档 `archived=true`）作废旧 run 终态快照（防 PG 兜底把旧消息续上来）。
 19. **SkillSet.vue 是死代码**；`filterTurnForConcise`/`isLLMEvent`/`esc`/`sameDir`/`fmtTime` 无引用；`fmtDateTime` 与 `fmtDate` 实现逐字相同；`healthPollInterval` 死配置。
-20. **FilePreview 的"VS Code 打开/下载"是空按钮**。
+20. ~~**FilePreview 的"VS Code 打开/下载"是空按钮**~~（已失效：2026-09-30 接通，2026-10-01 #26 重做为工作区树面板 + FileViewer，见 13.8）。
 21. **artifact 路径全部工作区相对**（workspaceUrl 逐段 encode 保斜杠；HTML 相对引用可解析）；inferArtifactsFromOutput 只认 `.bma/` 下五个产物目录。
 22. **SubAgentList 旧事件回退匹配要求唯一**（并列宁可不显示状态）。
 23. **ChatHeader 销毁倒计时本地 1s timer**；destroy_at 非空时三个控制按钮全隐藏。

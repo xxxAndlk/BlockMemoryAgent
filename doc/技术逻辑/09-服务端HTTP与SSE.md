@@ -68,7 +68,7 @@
 
 ### C. 系统/管理端点（bootstrap/router.go:60-105）
 
-metrics、status、metrics/timeline、activity、capabilities、export/memory、DAG 六端点（GET/POST /dag、/dag/running、/dag/:id、DELETE、/dag/:id/trigger）、snapshot/memory/search/memory/levels/memory/eval（**三个 memory 桩**）、skills、files、files/content、fs/browse、fs/pick-dir、profile（GET/PUT）、project/preferences（GET/PUT）、project/tester-config（GET/PUT）、skills/learned（列表/详情/PUT/enable/disable）、evolution/log、plugins（列表/详情/enable/disable/reload）、models（GET/POST /models/switch/POST）。
+metrics、status、metrics/timeline、activity、capabilities、export/memory、DAG 六端点（GET/POST /dag、/dag/running、/dag/:id、DELETE、/dag/:id/trigger）、snapshot/memory/search/memory/levels/memory/eval（**三个 memory 桩**）、skills、files、files/raw、files/content（GET+PUT）、files/reveal、editors、editors/open、fs/browse、fs/pick-dir、fs/tree、profile（GET/PUT）、project/preferences（GET/PUT）、project/tester-config（GET/PUT）、skills/learned（列表/详情/PUT/enable/disable）、evolution/log、plugins（列表/详情/enable/disable/reload）、models（GET/POST /models/switch/POST）。
 
 ### D. 非 /api（main.go）
 
@@ -132,7 +132,7 @@ metrics、status、metrics/timeline、activity、capabilities、export/memory、
 
 - path 型路由让 HTML 产物内相对引用（`assets/x.png`）自然可用。
 - **符号链接未拦截**：工作目录内软链指向外部仍会被服务（词法级防护）。
-- 同类遗留：`/api/files/content`（任意宿主路径读全文）与 `/api/fs/browse`（列目录）**无任何路径限制**，唯一门槛是鉴权。
+- 同类遗留：`/api/files/content` 的 **GET**（任意宿主路径读全文）与 `/api/fs/browse`（列目录）**无任何路径限制**，唯一门槛是鉴权；`PUT /api/files/content` 已限会话工作区（#26 G，见 9.9）。
 
 ## 9.8 导出
 
@@ -144,7 +144,14 @@ metrics、status、metrics/timeline、activity、capabilities、export/memory、
 - **capabilities**（capabilities.go:33）：3s ctx，六项 llm/postgres/redis/embed/plugins/workdir；**只做廉价检查不发真实 LLM 调用**：LLM 看 `CurrentModelInfo("meta")`；PG/Redis 双判空+Ping；embed 按 provider 分支（openai/local 要求 api_key 或 base_url，缺给 `Missing` 提示）；plugins 停用不计入、启用有 MissingEnv/LastError 即不合格；workdir 写探针文件即删。返回 `{items, all_ok}`。
 - **models**（model.go）：`GET /models`（无 api_key）/`POST /models/switch`（**70s**，含 60s 探活；错误 400 非 500；**未走 DecodeBody 无 UTF-8 校验**）/`POST /models`（`slugModelID` 生成 ID、重名追加 -2）。
 - **plugins**（plugins.go）：list/get/enable/disable/reload（30s/60s）；**`GetPluginHandler` 缺 nil 守卫**（其余三个有）。
-- **learned_skills**：全部端点 `learnedSkills==nil` → 503；`PUT /:name` 最重：校验→Get→重写文件（CRLF→LF）→重嵌入（失败不阻塞）→UpdateMeta→注册进技能池。
+- **learned_skills**：全部端点 `learnedSkills==nil` → 503；`PUT /:name` 最重：校验（含可选 `tools` 整体替换，`sanitizeSkillTools`）→Get→重写文件（CRLF→LF；目录式技能同步删已移除 scripts/ 文件）→重嵌入（失败不阻塞）→UpdateMeta（同步 has_tools）→注册进技能池。
+- **files/editors/fs-tree（TODO #26，2026-10-01）**：
+  - `GET /files/raw`（api.go）：原始字节流；边界=会话 WriteFile 产物 ∪ 任一会话工作区内；Range 单区间 206/416（`Accept-Ranges`），弱 ETag `W/"size-mtimeUnix"` + Last-Modified + If-None-Match→304（**不处理 If-Modified-Since**）；Content-Type 白名单、20MB 上限、`download=1` 走 attachment。
+  - `GET /files/content` 增 offset/limit 分段（`total_size`/`next_offset`/`truncated`/`mtime`，limit 默认 300KB 硬上限 1MB）；files 列表批量 mime（消前端 N+1）。
+  - `PUT /files/content`（files_write.go）：在线保存——边界 `isWithinAnyWorkspace`（任一会话 WorkDir 前缀，Windows 大小写不敏感，空 WorkDir 不参与）；5MB 上限（413）；`base_mtime` 不一致 409 `{code:"conflict",current_mtime}`；temp+rename 原子写；一次性 `.bak` 不覆盖；审计写 session_logs `phase=file_write`。
+  - `GET /files/reveal`（files_reveal.go + 平台分文件）：在文件夹中显示——Windows `explorer /select,`、macOS `open -R`、Linux `xdg-open <所在目录>`（无 /select 等价物，退化开目录）；边界同 raw。
+  - `GET /editors` + `POST /editors/open`（editors.go + 平台分文件）：扫码本机编辑器——Windows 注册表 App Paths（HKLM/HKCU×默认/WOW64 双视图）+ 常见安装路径探测，macOS /Applications，Linux LookPath；8 个稳定 id 目录、按 id 去重、60s 进程内缓存（零命中也缓存）；open 的 `editor_id` 必须命中服务端缓存（exe 不接受前端注入，防任意进程拉起），path 边界同 raw（**2026-10-01 起与 raw/reveal 对齐为工作区级**，此前仅 WriteFile 产物致树面板非产物文件打不开）；editor_id 空=系统默认打开（rundll32 FileProtocolHandler / open / xdg-open），detached + 隐藏窗口启动。
+  - `GET /fs/tree?session=<id>[&depth=N]`（fs_tree.go）：会话 WorkDir（Clean+Abs 防穿越）递归整树，目录前文件后按名排序；depth 默认 8 上限 12；节点 5000 硬上限 + `truncated` 标记（上限为包级 var 便于测试）；黑名单 .git/node_modules/dist/__pycache__/.next/.cache/vendor/target（大小写不敏感）跳过；单目录读取失败跳过继续；404 区分 `no_session`（无效会话）/`no_workspace`（无工作区），前端据此降级旧 WriteFile 平铺列表。
 - **fs/pick-dir**（fs_pick.go）：进程级单例（`TryLock`，第二个请求 409）→ 5min ctx → Windows PowerShell -STA WinForms（**结果经临时文件 UTF-8 回传防中文乱码**）/darwin osascript/linux zenity→kdialog→501。
 - **tester-config**（tester_config.go）：`.bma/tester.yaml` 读写（off|auto|on + max_rounds 1-5）。
 - **DAG**（dag.go）：guard（scheduler nil → 503）；SaveDAG 拒环（400）+ 每次刷新 UpdatedAt；trigger 5s。
@@ -159,7 +166,7 @@ metrics、status、metrics/timeline、activity、capabilities、export/memory、
 6. **done 判定口径 = 非 running 且非 awaiting_clarify**：awaiting_child/paused_on_child 直接关流。
 7. **SSE 每连接每秒 2 次全量 Get** 是放大点。
 8. **子 Agent 实例 ID 含 `/` 必须开 RawPath**：`router.UseRawPath=true + UnescapePathValues=true`（bootstrap/router.go:29-30）；**TUI 本地 gin 没开** → TUI 下编排页子 Agent 路由 404。
-9. **workspace 符号链接未拦截**；`/api/files/content` 与 `/api/fs/browse` 无路径限制。
+9. **workspace 符号链接未拦截**；`/api/files/content`（GET）与 `/api/fs/browse` 无路径限制。
 10. **NoRoute 全回 index.html 200**：拼错的 API 路径也回 HTML，排查时别被误导。
 11. **死代码**：`NewAPIHandler(nil)` 使 broadcaster 恒 nil；`RetrieveHandler`/`EventResolveHandler`/`GraphPause/Resume` 未注册路由（一旦接上会 nil panic）；`TUIBroadcaster.SSEHandler` 无注册点；`APIHandler.paused` 无生产读写。
 12. **`SessionManager.SetPostgresStore/SetModelFactory` 空实现**（bootstrap 仍在调）。

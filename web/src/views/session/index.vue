@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch, provide } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Session, SessionSummary, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear, SessionThinking } from '@/types'
@@ -35,6 +35,7 @@ import { usePanelRefresh } from '@/composables/usePanelRefresh'
 import { useSessionList } from '@/composables/useSessionList'
 import { useSessionStatus } from '@/composables/useSessionStatus'
 import { useWorkDir } from '@/composables/useWorkDir'
+import { FILE_OPENER_KEY, resolveWorkspacePath, type FileOpener } from '@/composables/fileOpener'
 import { knownWorkDirs as knownWorkDirsOf } from '@/utils/dir'
 import { maybeNotifySessionDone, maybeNotifyClarifyWaiting } from '@/utils/notifications'
 import ChatView from './chat/ChatView.vue'
@@ -43,6 +44,7 @@ import TaskBoardPanel from './components/panels/TaskBoardPanel.vue'
 import ToolPanel from './components/panels/ToolPanel.vue'
 import SessionMemoryPanel from './components/panels/SessionMemoryPanel.vue'
 import FilePreview from './components/FilePreview.vue'
+import FileViewer from '@/components/FileViewer.vue'
 import MetricsCard from './components/MetricsCard.vue'
 import TokenMetricsCard from './components/TokenMetricsCard.vue'
 import MailboxCard from './components/MailboxCard.vue'
@@ -134,9 +136,10 @@ watch(
   }
 )
 
-// 右栏统一 5 Tab；侧栏默认收起为图标条，点击展开
+// 右栏统一 5 Tab；侧栏默认收起为图标条，点击展开；展开/收起状态 localStorage 记忆（TODO #26 E）
 const rightTab = ref<'board' | 'tools' | 'files' | 'memory' | 'metrics'>('board')
-const sidebarOpen = ref(false)
+const sidebarOpen = ref(localStorage.getItem('bma.sidebarOpen') === '1')
+watch(sidebarOpen, (v) => localStorage.setItem('bma.sidebarOpen', v ? '1' : '0'))
 const sideTabs = [
   { name: 'board', label: '任务看板', icon: 'DataLine', width: 760 },
   { name: 'tools', label: '工具', icon: 'Tools', width: 640 },
@@ -145,6 +148,28 @@ const sideTabs = [
   { name: 'metrics', label: '指标', icon: 'DataAnalysis', width: 600 },
 ] as const
 const activeSideTab = computed(() => sideTabs.find((t) => t.name === rightTab.value))
+
+// ── 文件打开器（TODO #26 阶段 A/C）：消息卡片 / Markdown 本地文件链接 →
+//    切到文件 tab、树展开祖先链并打开预览。FilePreview 通过 locateRequest 消费请求
+//    （组件可能尚未挂载，用响应式请求而非直接调方法）；绝对路径解析拼会话 work_dir。
+const locateRequest = ref<{ path: string; seq: number } | null>(null)
+let locateSeq = 0
+/** 全屏 FileViewer 实例（TODO #26 阶段 B）：openInViewer 统一入口。 */
+const fileViewerRef = ref<InstanceType<typeof FileViewer> | null>(null)
+const fileOpener: FileOpener = {
+  openInTree: (path: string) => {
+    locateRequest.value = { path, seq: ++locateSeq }
+    rightTab.value = 'files'
+    sidebarOpen.value = true
+  },
+  openInViewer: (path: string, opts?: { siblings?: string[]; size?: number }) => {
+    fileViewerRef.value?.open(path, opts)
+  },
+  resolveAbsolute: (path: string) => resolveWorkspacePath(path, activeSession.value?.work_dir || ''),
+  workDir: computed(() => activeSession.value?.work_dir || ''),
+  locateRequest,
+}
+provide(FILE_OPENER_KEY, fileOpener)
 
 // 选中 Agent（经任务看板迷你画布/头部链条点击，?agent=<inst_id> 双向同步，刷新可恢复）：
 // 对话/监控两视图随选中 Agent 切换；未选中或选中 MetaAgent 时保持主会话视图。
@@ -819,6 +844,9 @@ function fmtDateTime(iso: string) {
         </div>
       </template>
     </aside>
+
+    <!-- 全局全屏预览层（TODO #26 阶段 B）：fileOpener.openInViewer 打开 -->
+    <FileViewer ref="fileViewerRef" />
   </div>
 </template>
 
