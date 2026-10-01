@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onUnmounted } from 'vue'
+import { computed, ref, watch, nextTick, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { AgentNode, SessionEvent, ClarifyPending, ClarifyQuestionItem } from '@/types'
 import type { Turn } from '../utils/turns'
@@ -96,11 +96,34 @@ const showRunning = computed(
   () => !finalText.value && !clarifyCard.value && props.turn.status === 'running',
 )
 
-// 实时思考行只显示尾部 ~300 字符（对齐 TUI 滚动显示当前行的行为），避免长思考占满聊天区
-const liveThinkingTail = computed(() => {
-  const s = props.liveThinking.trim()
-  if (!s) return ''
-  return s.length > 300 ? '…' + s.slice(-300) : s
+// 实时思考面板（2026-10-01 用户诉求）：原先只显示尾部 ~300 字符的单行，思考流快速
+// 闪动根本看不清。改为 DeepSeek 风格可折叠面板：标题行常驻「正在思考…」，点击展开/
+// 收起；展开时全文进定高滚动区，新内容自动滚到底（用户上翻阅读时不强拉）。
+const thinkOpen = ref(true)
+const thinkStick = ref(true) // 用户滚离底部后暂停自动跟随，回到底部附近恢复
+const liveThinkBodyRef = ref<HTMLElement | null>(null)
+
+function scrollThinkToBottom() {
+  const el = liveThinkBodyRef.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function toggleThink() {
+  thinkOpen.value = !thinkOpen.value
+  if (thinkOpen.value) {
+    thinkStick.value = true
+    void nextTick(scrollThinkToBottom)
+  }
+}
+
+function onThinkScroll(e: Event) {
+  const el = e.target as HTMLElement
+  thinkStick.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+}
+
+watch(() => props.liveThinking, () => {
+  if (!thinkOpen.value || !thinkStick.value) return
+  void nextTick(scrollThinkToBottom)
 })
 
 // 流式汇报文本 markdown 化并追加流式光标（对齐 TUI 正文 + ▍）
@@ -771,12 +794,22 @@ async function submitBatch() {
         </template>
       </div>
 
-      <!-- 运行中：模型实时思考行 + 流式汇报文本（SSE live 帧，对齐 TUI 展示），两者皆空时兜底静态占位 -->
+      <!-- 运行中：实时思考（DeepSeek 风格可折叠面板）+ 流式汇报文本（SSE live 帧，对齐 TUI 展示），两者皆空时兜底静态占位 -->
       <div v-if="showRunning" class="mt-2">
-        <div v-if="liveThinking" class="text-xs text-ink-2 flex items-start gap-1.5">
-          <span>💭</span>
-          <span class="italic break-all">{{ liveThinkingTail }}</span>
-          <span class="live-cursor">▍</span>
+        <div v-if="liveThinking" class="rounded-lg border border-line bg-page">
+          <button type="button"
+                  class="w-full text-left px-3 py-2 flex items-center justify-between hover:bg-card transition-colors"
+                  @click="toggleThink">
+            <span class="flex items-center gap-2 text-xs text-ink-2">
+              <span>💭</span>
+              <span class="font-medium italic">正在思考…</span>
+              <span class="text-ink-3">{{ liveThinking.length }} 字</span>
+            </span>
+            <el-icon class="text-ink-2 transition-transform" :class="{ 'rotate-180': thinkOpen }"><ArrowDown /></el-icon>
+          </button>
+          <div v-show="thinkOpen" ref="liveThinkBodyRef" class="live-think-body px-3 pb-3" @scroll="onThinkScroll">
+            <div class="text-xs text-ink-2 italic whitespace-pre-wrap break-all leading-relaxed">{{ liveThinking }}<span class="live-cursor">▍</span></div>
+          </div>
         </div>
         <!-- 流式口播：模型正在说的那句话，按正文展示（与落盘后的发言块同字号，
              中途不会跳字号） -->
@@ -798,6 +831,13 @@ async function submitBatch() {
 </template>
 
 <style scoped>
+/* 实时思考内容区定高滚动：思考全文可能很长，收进固定高度内部滚动窗，
+   滚到底不把整页带着滚（与 ThinkChain 的 chain-body 同策略）。 */
+.live-think-body {
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .live-cursor {
   color: var(--bma-primary);
   margin-left: 2px;

@@ -137,6 +137,48 @@ func TestTrimDebugEvents_KeepsAssistantText(t *testing.T) {
 	}
 }
 
+// TestThinkDelta_ClearsStaleStreamingText 验证新一轮思考开始时清掉已落盘的口播正文
+//（2026-10-01 用户实证：正文落 assistant_text 事件后 StreamingText 仍残留，思考更新
+// 触发的 SSE live 帧把它一并重推，前端已清掉的 live 行被"复活"，与落盘正文同屏重复
+// 且定格不动）。ask_user/审批 hook 保留的提问正文（≠lastInterimText）不得误清。
+func TestThinkDelta_ClearsStaleStreamingText(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	svc.store.setStreamingText(sess, "按批准的计划执行。先精确定位归属小节")
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: "session-1", Tool: "SearchInFiles"})
+	if findEventByKind(sess.Events, eventkind.AssistantText) == nil {
+		t.Fatal("工具调用边界应落 assistant_text 事件")
+	}
+
+	// 新一轮思考开始：已落盘正文从瞬时字段清掉，思考文本照常更新。
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventThinkDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "思考下一步"})
+	if sess.StreamingText != "" {
+		t.Fatalf("已落盘口播正文应在思考轮清空，got %q", sess.StreamingText)
+	}
+	if sess.ThinkingText != "思考下一步" {
+		t.Fatalf("思考文本应照常更新，got %q", sess.ThinkingText)
+	}
+
+	// ask_user 保留的提问正文（未落 assistant_text，≠lastInterimText）不得误清。
+	svc.store.setStreamingText(sess, "开始前需要确认：目标目录用哪个？")
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventThinkDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "继续思考"})
+	if sess.StreamingText != "开始前需要确认：目标目录用哪个？" {
+		t.Fatalf("提问正文不得在思考轮被清，got %q", sess.StreamingText)
+	}
+}
+
+// TestThinkDelta_ClearsStaleStreamingText_SubAgent 验证子 Agent 场景：StreamingText 带
+// 【展示名】前缀而 lastInterimText 是剥前缀后的落盘文本，比较时同样剥前缀才能命中清理。
+func TestThinkDelta_ClearsStaleStreamingText_SubAgent(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	svc.store.setStreamingText(sess, "【代码助手】\n正在重构渲染循环")
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "代码助手", AgentID: "session-1/code_assistant-5", Tool: "EditFile"})
+
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventThinkDelta, Agent: "代码助手", AgentID: "session-1/code_assistant-5", Text: "思考中"})
+	if sess.StreamingText != "" {
+		t.Fatalf("子 Agent 已落盘口播正文应在思考轮清空，got %q", sess.StreamingText)
+	}
+}
+
 // TestClusterTopNarration_Suppressed 验证集群档顶层 Meta 的中间轮口播与用户流完全隔离
 //（2026-09-18 用户实证：「已确认根因：环境性失败…我注意到自己可用技能中有…」这类
 // 编排内心独白原样出现在对话栏）：子 Agent 在跑时 LLMDelta 只进轮缓冲不推 StreamingText，

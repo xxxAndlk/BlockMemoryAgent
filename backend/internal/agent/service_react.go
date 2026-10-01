@@ -3797,6 +3797,19 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		if s.isClusterTopEvent(session, ev) && s.hasActiveSubAgents(session.ID) {
 			break
 		}
+		// 新一轮思考开始 = 上一轮口播正文已在工具调用边界落 assistant_text 事件
+		//（persistInterimText）：清掉瞬时 StreamingText。否则它一直残留到下一个正文
+		// delta 才被覆盖——思考更新触发的 SSE live 帧把这份陈旧正文一并重推，前端
+		// 已在工具事件时清掉的 live 行被"复活"，与落盘正文同屏重复且定格不动
+		//（2026-10-01 用户实证：旧正文卡住）。只在与已落盘文本一致时清：
+		// ask_user/审批 hook 阻塞期间保留的提问正文不等于 lastInterimText，不受影响。
+		st := strings.TrimSpace(session.StreamingText)
+		if ev.Agent != "" {
+			st = strings.TrimSpace(strings.TrimPrefix(st, "【"+ev.Agent+"】\n"))
+		}
+		if st != "" && st == session.lastInterimText {
+			s.store.setStreamingText(session, "")
+		}
 		s.store.setThinkingText(session, ev.Text)
 	case LiveEventToolCall:
 		// 工具调用开始同样意味着思考阶段结束（思考型模型常见 think→tool 而非 think→text）。
