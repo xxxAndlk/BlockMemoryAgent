@@ -86,6 +86,26 @@ func TestLearnedSkillMDRoundtrip(t *testing.T) {
 	}
 }
 
+// TestRenderLearnedSkillMDStripsLeadingMarkers 模型返回的条目自带行首序号/符号时，
+// 渲染只保留一层编号（回归：出现 "1. 1. xxx" 双层序号）。
+func TestRenderLearnedSkillMDStripsLeadingMarkers(t *testing.T) {
+	sk := agent.EvolvedSkill{
+		Steps:    []string{"1. 识别指令", "2、直接返回", "3) 核对", "- 不加修饰", "5. 已经带.的点"},
+		Pitfalls: []string{"1. 误加解释", "• 多余内容"},
+	}
+	content := renderLearnedSkillMD("fixed-short-reply", "固定简短回复", "仅要求指定回复时", "success", sk)
+	for _, bad := range []string{"1. 1.", "2. 2、", "3. 3)", "4. - ", "5. 5.", "- 1.", "- • "} {
+		if strings.Contains(content, bad) {
+			t.Errorf("content has double marker %q:\n%s", bad, content)
+		}
+	}
+	for _, want := range []string{"识别指令", "直接返回", "核对", "不加修饰", "已经带.的点", "误加解释", "多余内容"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("content lost %q:\n%s", want, content)
+		}
+	}
+}
+
 // TestParseLearnedSkillFileMissingFrontmatter 缺关键字段报错（孤儿修复跳过依据）。
 func TestParseLearnedSkillFileMissingFrontmatter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.md")

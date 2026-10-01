@@ -34,14 +34,24 @@ type EvolveInput struct {
 	Outcome      string // success|failed|mixed（失败会话的踩坑经验价值更高）
 }
 
+// EvolvedSkillTool 会话中实际自写并执行成功的辅助脚本（TODO 25 阶段 C3 沉淀候选，
+// Voyager 式"验证过才入库"）。Filename 限 scripts/ 下小写字母数字连字符 + 点扩展名。
+type EvolvedSkillTool struct {
+	Filename string `json:"filename"` // 相对技能目录路径，如 scripts/check.py
+	Language string `json:"language"` // py|sh|js|ts
+	Code     string `json:"code"`     // 脚本全文，≤60 行（prompt 明示）
+	Desc     string `json:"desc"`     // 一句话用途
+}
+
 // EvolvedSkill 提取出的技能包（SKILL.md 式结构，设计 §6.2）。
 type EvolvedSkill struct {
-	Name      string   // 小写连字符全局唯一；缺省由 title 规范化
-	Title     string   // 展示标题（必填）
-	WhenToUse string   // 适用场景（必填，与 title 构成召回向量）
-	Steps     []string // 步骤
-	Pitfalls  []string // 坑点
-	Verify    string   // 验证方法
+	Name      string             // 小写连字符全局唯一；缺省由 title 规范化
+	Title     string             // 展示标题（必填）
+	WhenToUse string             // 适用场景（必填，与 title 构成召回向量）
+	Steps     []string           // 步骤
+	Pitfalls  []string           // 坑点
+	Verify    string             // 验证方法
+	Tools     []EvolvedSkillTool // 配套脚本候选（C3，可空）
 }
 
 // EvolveOutput 一次会话进化的三类沉淀（设计 §3）。

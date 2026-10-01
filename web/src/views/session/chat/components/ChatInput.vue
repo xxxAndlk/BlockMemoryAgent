@@ -350,54 +350,53 @@ function onKeydown(e: KeyboardEvent) {
 
 <template>
   <div class="border-t border-line bg-card px-6 py-3">
-    <!-- 模式开关 + 快捷标签 + Token 计数 -->
-    <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
-      <div class="flex items-center gap-4 text-xs text-ink-2 flex-1 min-w-0">
-        <div class="flex items-center gap-2 min-w-0 max-w-[26rem] workdir-cell">
-          <span class="text-ink-2 whitespace-nowrap">{{ workDirLabel }}</span>
-          <WorkDirPicker :model-value="workDir || ''" :existing="knownDirs"
+    <!-- Kimi 风格 composer：一张 bg-card + border-line + rounded-card 统一卡片，
+         内部分三层（目录条 / 输入框 / 工具条），层间统一间距；
+         focus-within 时边框转主色；待澄清时琥珀高亮（此刻发送=回答上方问题） -->
+    <div class="composer flex flex-col gap-2 p-3 rounded-card border bg-page transition-colors"
+         :class="awaitingClarify ? 'border-amber-400 dark:border-yellow-600' : 'border-line focus-within:border-primary'">
+      <!-- 目录条：单行等高对齐——文件夹图标 + 路径 + 选择目录 + 状态提示 + 新建会话 -->
+      <div class="flex items-center gap-2 min-w-0">
+        <div class="flex items-center gap-2 min-w-0 flex-1">
+          <el-icon class="text-sm text-ink-3 shrink-0"><FolderOpened /></el-icon>
+          <span class="text-xs text-ink-2 whitespace-nowrap shrink-0">{{ workDirLabel }}</span>
+          <WorkDirPicker class="min-w-0 flex-1" :model-value="workDir || ''" :existing="knownDirs"
                          :placeholder="defaultDir || '默认目录'"
                          @update:model-value="(d: string) => emit('update-workdir', d)" />
           <el-icon v-if="workDirSaving" class="animate-spin text-ink-3 shrink-0"><Loading /></el-icon>
           <span v-if="workDirHint" class="text-[10px] text-ink-3 whitespace-nowrap shrink-0"
                 title="目录在每回合开始时读取，正在执行的工具调用仍按旧目录">下回合生效</span>
         </div>
-        <span v-if="sessionActive" class="text-green-400 flex items-center gap-1">
-          <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
-          会话已连接
-        </span>
-        <!-- 运行中的输入语义：不再是"排到队尾"，而是即时注入当前执行（仅真 running；
-             待澄清是答复、挂起等子是唤醒新消息，都不是注入，故用 injectHint 而非 sessionActive） -->
-        <span v-if="injectHint" class="text-[10px] text-ink-3 whitespace-nowrap shrink-0"
-              title="运行中发送的指令会投进当前 Agent 的邮箱：等待子 Agent 时立即读到并重新规划，其他阶段在当前步骤结束后生效">
-          运行中发送＝即时注入当前执行
-        </span>
-        <span v-else class="text-ink-2">将创建新会话</span>
+        <div class="flex items-center gap-3 text-xs shrink-0 ml-2">
+          <span v-if="sessionActive" class="text-green-400 flex items-center gap-1 whitespace-nowrap">
+            <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+            会话已连接
+          </span>
+          <!-- 运行中的输入语义：不再是"排到队尾"，而是即时注入当前执行（仅真 running；
+               待澄清是答复、挂起等子是唤醒新消息，都不是注入，故用 injectHint 而非 sessionActive） -->
+          <span v-if="injectHint" class="text-[10px] text-ink-3 whitespace-nowrap"
+                title="运行中发送的指令会投进当前 Agent 的邮箱：等待子 Agent 时立即读到并重新规划，其他阶段在当前步骤结束后生效">
+            运行中发送＝即时注入当前执行
+          </span>
+          <span v-else class="text-ink-3 whitespace-nowrap">将创建新会话</span>
+          <el-button text size="small" class="!text-ink-2 hover:!text-primary !px-1.5 shrink-0"
+                     @click="emit('new-session')">
+            <el-icon class="mr-1"><Plus /></el-icon> 新建会话
+          </el-button>
+        </div>
       </div>
-      <div class="flex items-center gap-3 text-xs">
-        <el-button size="small" plain class="!bg-transparent !border-line !text-ink-2 hover:!text-white"
-                   @click="emit('new-session')">
-          <el-icon class="mr-1"><Plus /></el-icon> 新建会话
-        </el-button>
-      </div>
-    </div>
 
-    <!-- 待发送图片预览（可移除） -->
-    <div v-if="pendingImages.length" class="flex gap-2 mb-2 flex-wrap">
-      <div v-for="(img, i) in pendingImages" :key="i"
-           class="relative w-14 h-14 rounded border border-line overflow-hidden group">
-        <img :src="previewUrl(img)" class="w-full h-full object-cover" alt="待发送图片" />
-        <button @click="removeImage(i)"
-                class="absolute inset-0 hidden group-hover:flex items-center justify-center bg-black/60 text-red-400 text-xs">
-          移除
-        </button>
+      <!-- 待发送图片预览（可移除） -->
+      <div v-if="pendingImages.length" class="flex gap-2 flex-wrap">
+        <div v-for="(img, i) in pendingImages" :key="i"
+             class="relative w-14 h-14 rounded border border-line overflow-hidden group">
+          <img :src="previewUrl(img)" class="w-full h-full object-cover" alt="待发送图片" />
+          <button @click="removeImage(i)"
+                  class="absolute inset-0 hidden group-hover:flex items-center justify-center bg-black/60 text-red-400 text-xs">
+            移除
+          </button>
+        </div>
       </div>
-    </div>
-
-    <!-- 输入区：圆角容器内 上=文本域 下=工具行（左：模型/图片；右：发送），对齐主流对话产品。
-         待澄清时边框琥珀高亮（此刻发送=回答上方问题，见 script 注释） -->
-    <div class="chat-box flex flex-col rounded-xl border bg-page transition-colors"
-         :class="awaitingClarify ? 'border-amber-400 dark:border-yellow-600' : 'border-line focus-within:border-primary'">
       <el-input ref="textareaRef" v-model="content"
                 type="textarea"
                 :autosize="{ minRows: 2, maxRows: 8 }"
@@ -406,9 +405,12 @@ function onKeydown(e: KeyboardEvent) {
                 class="chat-input"
                 @keydown="onKeydown"
                 @paste="onPaste" />
-      <div class="flex items-center gap-1 px-2 pb-2">
-        <!-- 模型选择弹层（工具行左）：角色 → 模型 → 思考强度 -->
-        <el-popover v-model:visible="modelPopoverVisible" placement="top-start" :width="380" trigger="click">
+      <!-- 工具条：左侧模型/信任档/档位/思考档控件组（统一 small 高度、gap-1.5），
+           右侧 token 计数 + 发送按钮；过窄时自动折行 -->
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex items-center gap-1.5 min-w-0 flex-wrap">
+          <!-- 模型选择弹层（工具行左）：角色 → 模型 → 思考强度 -->
+          <el-popover v-model:visible="modelPopoverVisible" placement="top-start" :width="380" trigger="click">
           <template #reference>
             <el-button text size="small" class="!text-ink-2 hover:!text-primary max-w-52 !px-2"
                        title="选择模型（角色 / 模型 / 思考强度，可新增模型）">
@@ -449,49 +451,53 @@ function onKeydown(e: KeyboardEvent) {
             </div>
           </div>
         </el-popover>
-        <el-button text size="small" class="!text-ink-2 hover:!text-primary !px-2"
-                   :disabled="pendingImages.length >= 4"
-                   title="添加图片（或直接粘贴截图）"
-                   @click="pickFiles">
-          <el-icon><Picture /></el-icon>
-        </el-button>
-        <span class="ml-auto mr-1 text-[11px] text-ink-3 font-mono hidden sm:inline"
-              :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
-          ↑{{ fmtTokens(props.inputTokens || 0) }} ↓{{ fmtTokens(props.outputTokens || 0) }}
-        </span>
-        <!-- 信任模式（仅已绑定会话）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主 -->
-        <el-select v-if="sessionBound && session" :model-value="trustMode" size="small" class="!w-32 shrink-0"
-                   title="信任模式：变更类操作的审批档位，切换下一工具调用生效"
-                   @update:model-value="onTrustModeChange($event as TrustMode)">
-          <el-option value="suggest" label="suggest 逐条审批" />
-          <el-option value="auto-edit" label="auto-edit 审命令" />
-          <el-option value="full-auto" label="full-auto 全自主" />
-        </el-select>
-        <!-- 执行档位（TODO #14 三档全手动）：未绑会话=创建时选档；已绑会话=即时切档，下一轮按新档选角色 -->
-        <el-select v-model="gear" size="small" class="!w-24 shrink-0"
-                   title="执行档位：快速档=文档助手直达，日常档=DomainAgent 直接执行，集群档=Meta 全装编排"
-                   @change="onGearChange($event as SessionGear)">
-          <el-option value="fast" label="快速档" />
-          <el-option value="daily" label="日常档" />
-          <el-option value="cluster" label="集群档" />
-        </el-select>
-        <!-- 思考强度（2026-09-16 会话级）：空=跟随角色默认；只影响本会话顶层 Agent，切换下一次 LLM 调用生效 -->
-        <el-select v-model="thinking" size="small" class="!w-28 shrink-0"
-                   title="思考强度（本会话顶层 Agent）：空=跟随角色默认；运行中可改，下一次 LLM 调用生效"
-                   @change="onThinkingChange($event as SessionThinking)">
-          <el-option value="" label="思考 跟随角色" />
-          <el-option value="off" label="思考 off" />
-          <el-option value="low" label="思考 low" />
-          <el-option value="medium" label="思考 medium" />
-          <el-option value="high" label="思考 high" />
-        </el-select>
-        <el-button type="primary" size="small" round
-                   :loading="loading"
-                   :disabled="!canSend"
-                   class="!bg-primary !border-primary hover:!bg-[var(--bma-primary-hover)] hover:!border-[var(--bma-primary-hover)]"
-                   @click="handleSubmit">
-          <el-icon class="mr-1"><Promotion /></el-icon> 发送
-        </el-button>
+          <el-button text size="small" class="!text-ink-2 hover:!text-primary !px-2"
+                     :disabled="pendingImages.length >= 4"
+                     title="添加图片（或直接粘贴截图）"
+                     @click="pickFiles">
+            <el-icon><Picture /></el-icon>
+          </el-button>
+          <!-- 信任模式（仅已绑定会话）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主 -->
+          <el-select v-if="sessionBound && session" :model-value="trustMode" size="small" class="!w-32 shrink-0"
+                     title="信任模式：变更类操作的审批档位，切换下一工具调用生效"
+                     @update:model-value="onTrustModeChange($event as TrustMode)">
+            <el-option value="suggest" label="suggest 逐条审批" />
+            <el-option value="auto-edit" label="auto-edit 审命令" />
+            <el-option value="full-auto" label="full-auto 全自主" />
+          </el-select>
+          <!-- 执行档位（TODO #14 三档全手动）：未绑会话=创建时选档；已绑会话=即时切档，下一轮按新档选角色 -->
+          <el-select v-model="gear" size="small" class="!w-24 shrink-0"
+                     title="执行档位：快速档=文档助手直达，日常档=DomainAgent 直接执行，集群档=Meta 全装编排"
+                     @change="onGearChange($event as SessionGear)">
+            <el-option value="fast" label="快速档" />
+            <el-option value="daily" label="日常档" />
+            <el-option value="cluster" label="集群档" />
+          </el-select>
+          <!-- 思考强度（2026-09-16 会话级）：空=跟随角色默认；只影响本会话顶层 Agent，切换下一次 LLM 调用生效 -->
+          <el-select v-model="thinking" size="small" class="!w-28 shrink-0"
+                     title="思考强度（本会话顶层 Agent）：空=跟随角色默认；运行中可改，下一次 LLM 调用生效"
+                     @change="onThinkingChange($event as SessionThinking)">
+            <el-option value="" label="思考 跟随角色" />
+            <el-option value="off" label="思考 off" />
+            <el-option value="low" label="思考 low" />
+            <el-option value="medium" label="思考 medium" />
+            <el-option value="high" label="思考 high" />
+          </el-select>
+        </div>
+        <div class="flex items-center gap-2 shrink-0">
+          <span class="text-[11px] text-ink-3 font-mono hidden sm:inline"
+                :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
+            ↑{{ fmtTokens(props.inputTokens || 0) }} ↓{{ fmtTokens(props.outputTokens || 0) }}
+          </span>
+          <el-button type="primary" size="small" round
+                     :loading="loading"
+                     :disabled="!canSend"
+                     title="Enter 发送，Shift+Enter 换行"
+                     class="!bg-primary !border-primary hover:!bg-[var(--bma-primary-hover)] hover:!border-[var(--bma-primary-hover)] disabled:opacity-50"
+                     @click="handleSubmit">
+            <el-icon class="mr-1"><Promotion /></el-icon> 发送
+          </el-button>
+        </div>
       </div>
     </div>
     <input ref="fileRef" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple class="hidden" @change="onFileChange" />
@@ -528,23 +534,19 @@ function onKeydown(e: KeyboardEvent) {
 </template>
 
 <style scoped>
-/* 容器（.chat-box）负责边框/聚焦态，文本域自身去边框 */
-:deep(.chat-box .el-textarea__inner) {
+/* 容器（.composer）负责边框/聚焦态，文本域自身去边框、透明背景；
+   min-height 固定 72px，placeholder 用 ink-3 弱色 */
+:deep(.composer .el-textarea__inner) {
   background-color: transparent !important;
   border: none;
   color: var(--bma-text);
   box-shadow: none !important;
   font-size: 13px;
-  padding: 10px 12px 4px;
+  min-height: 72px !important;
+  padding: 8px 8px 4px;
 }
-:deep(.workdir-cell .el-input__wrapper) {
-  background-color: var(--bma-page);
-  box-shadow: 0 0 0 1px var(--bma-border) inset;
-  padding: 0 8px;
-  min-height: 28px;
-}
-:deep(.workdir-cell .el-input__inner) {
-  font-size: 12px;
+:deep(.composer .el-textarea__inner)::placeholder {
+  color: var(--bma-text-3);
 }
 .hidden {
   display: none;

@@ -418,3 +418,65 @@
       - **批三（8/8）**：① 项目说明.md 降级为 2026-09-08 历史快照 + v3/workflow 权威指针改指 `doc/技术逻辑/`；② doc 03/04/10/13/14 append-only 语义全部回改（session_events seq 幂等追加 / agent_messages 尾差量追加 / DeleteMessages→ArchiveMessages），另同步 Redis 子存储删除（doc 10 §10.1/10.3/坑 #10-11）；③ 计划_共享记忆一致性.md 补"已实现"状态头 + 修失效交叉引用；④ doc 00 行号政策（以函数名为准）；⑤ TODO #18 "test/ 零 Go 文件"更新 + **CLAUDE.md Tests 节同步**；⑥ doc 06 6.10 坑清单重号修复（17-23 两遍 → 顺延 21-27）；⑦ doc 10 owner 列缺口清单 / doc 11.4 工具面 22→32 回滚补记 / 编排对比落地建议标状态 / doc/test/测试demo.md 包清单与跑法修订；⑧ 代码注释旧 TODO 号改述（#27/#42/#56/#57/#60/#62/#72 全清 + 撞现役号的两组 #17 P1/#19）+ `legacy.go`→`handover.go`（含测试）。
       - **顺手修**：① notify 双发竞态——`subAgentMeta.notifyOnce` + `notifyTerminal`（巡检杀/墙钟/失败/成功/软停/热驻五处终态通知去重）+ kill 标记槽 `childReported`（防 destroySlot 第二条"被强制销毁"矛盾消息与补偿递减）；② `resolveReviveMode` auto 档 Cancelled→prune（原 continue 会把 kill 消息当"上一轮结果"带进种子），补测试。
       - **验证**：`go build` + `go vet` + 全量 `go test ./...` 全绿（含新增 `failure_notice_test.go` 3 例）。**遗留**：批三⑧ 仅清理审计列举号段与撞现役号的两组，代码注释中其余历史号（#33/#37/#40/#43/#53 等）仍为历史标记（跨多轮重编号，映射不可考，维持原样）。
+
+25. **经验技能质量治理与"技能携带工具"改造**（2026-09-30 立项，**阶段 A/B/C 已于 2026-09-30 全部落地**，实录见 `doc/变更.md` 2026-09-30 条；此处留原设计与观察点。完整设计含调研出处见 `doc/计划_技能进化与工具携带.md`
+    - **根因核实（2026-09-30）**：① 双层序号 = `bootstrap/evolver.go` 渲染 steps 时无条件拼 `i+1.` 不剥模型自带编号（**已修**：`stripLeadingMarker` + 回归测试 `TestRenderLearnedSkillMDStripsLeadingMarkers`，整包测试全绿）；② 随意/过多 = 轻量模型产出门槛松（0-2 个/会话）+ 去重只靠 name 精确匹配与向量近邻，不同 name 语义近重复漏过（实证库里 "CLI工具验收验证" 两个名字不同变体并存）；③ 不能携带工具 = 技能模型仅 title/when_to_use/content 三段，无附件/脚本概念（PG 表、PUT API、前端编辑弹窗同限）。
+    - **阶段 A：存量清洗 + 渲染防御（1 天）**
+      - A1 双层序号渲染修复 ✅（2026-09-30 完成）。
+      - A2 存量脏数据清洗：一次性脚本扫 `config/skills_learned/*.md`，复用 stripLeadingMarker 正则清洗 `## 步骤`/`## 坑点` 段双层序号；输出清洗报告（改哪些文件/几行），人工抽查后提交；脚本用完可删，不进主链路。
+    - **阶段 B：质量门禁与去重（1.5 周）**
+      - B1 收紧生成 prompt（写入端）：门槛改"必须本次会话实际走通/验证过的工艺"；单会话产出上限 2→1；steps 必须是动词开头的可执行动作，拒"检查/注意/确保"类空泛条目；prompt 明示 steps 元素不带自带序号。
+      - B2 写入时质量门禁：复用轻量模型对产出技能打 1-5 分（具体性/可执行性/可复用性），<3 分丢弃并写 evolution_log（kind=skill_rejected 留审计）；门禁失败不阻塞会话结束流程（降级直接丢弃）。
+      - B3 写入时近重复预检：persist 前对 `title+when_to_use` 拼接向量与存量检索，cosine ≥0.9 进 LLM-judge 确认——确认重复走 `skill_update` 合并（steps/pitfalls union 去重，正文重渲染走 renderLearnedSkillMD 顺带消编号）；judge 超时/失败保守合并（MUSE-Autoskill 方向：多技能→一个更通用的）；不是重复才新建。
+      - B4 整理任务对齐：`skill_consolidate.go` 每日整理复用 B3 同一套 judge 逻辑，避免两条判定标准。
+    - **阶段 C：技能携带工具（2 周，本期核心）**
+      - C1 存储形态（对齐标准 Skill 格式）：落盘从 `<name>.md` 单文件改 `<name>/SKILL.md + scripts/ + references/` 目录式；frontmatter 增 `tools: [{path, desc, run}]`；存量 `.md` 首次加载自动搬迁（老路径保留只读，迁移失败回退不丢数据）；PG 增 `has_tools BOOL`（列表页"⚙ 带工具"角标）；tools desc 单独建向量先不做。
+      - C2 执行链路（渐进披露第三层）：load_skill 时有 tools 则在正文追加"配套工具"段（路径+运行方式+用途）；agent 复用现有 RunCommand/sandbox 工具执行 scripts/（OpenSkills 模式：只有脚本输出进上下文）；执行前 chmod +x，Windows 下 .sh 走 git-bash / .py 走项目 Python；安全底线=仅技能目录内可写 + evolution_log 审计（沿用现有沙箱路径合规检查）。
+      - C3 沉淀链路（Voyager 式"验证过才入库"）：evolver prompt 增可选 `tools: [{filename, language, code, desc}]`——会话中实际用过且成功的自写脚本固化为技能工具；轻量模型只生成 ≤60 行小脚本，超长降级为正文附录代码块；写入前冒烟执行（有运行时且声明 run 时），失败→脚本降级正文、不生成 scripts/ 目录。
+      - C4 前端：技能卡片 ⚙ 带工具角标；编辑弹窗正文下增"配套脚本"区（查看/删除，新建走沉淀链路不做在线编辑）；API：GET 增 tools 字段、PUT 支持 tools 编辑。
+      - C5 与标准技能体系关系：`types.Skill` 已有 Path，内置技能加载器同步支持目录式 SKILL.md（内置技能带 scripts 为后续独立迭代）；长期 learned 与内置合并为同一套目录式规范、仅 source 不同。
+    - **验收**：A——存量清洗报告零"1. 1."残留；B——造 3 组近重复会话 2 组合并 1 组新建、空泛技能被拒留日志、技能库周增量降 ≥50%；C——"会话用脚本完成任务→技能带 scripts/ 落盘→新会话 load_skill 后 agent 可执行脚本拿输出"全链路打通、冒烟失败正确降级。
+    - **风险与对策**：LLM-judge 延迟/成本——门禁与 judge 全走轻量模型且只在会话结束后触发，失败一律保守合并或丢弃不产生半成品；脚本安全——固定仅技能目录内可写+审计，不做任意路径执行；存量迁移——搬迁失败回退只读老文件不丢数据。
+    - **建议开工顺序**：A2 存量清洗脚本（半天、独立见效快）→ B1 prompt 收紧 + B2 门禁（同源改动一次做完）→ B3/B4 去重预检 → C 阶段按 C1→C3→C2→C4 实施（C3 依赖 C1 落盘格式，C2 依赖 C1+C3 产物）。
+
+
+26. **文件查看/预览功能全面对齐 Kimi Work 形态**（2026-09-30 立项，同日两次追加需求后重定范围。基座：当日已落地的 FilePreview 改造（类型化文件行 + 图片/Markdown/JSON/代码分类型渲染 + `/api/files/raw` 端点 + 下载/VS Code 按钮接通，见 git 工作区）。可行性已核实：后端与浏览器同机运行（`/fs/pick-dir` 原生对话框先例证明 OS 集成通路已通），编辑器扫码=注册表/路径扫描，在线保存=写文件+边界检查，全部可做）
+    - **现状盘点（割裂点）**：两条文件链路——① 聊天流 `ArtifactCard.vue`（图片/视频/音频/HTML，走 `/api/sessions/:id/workspace/*` 流式 Range，AssistantTurn/ToolCallCard 挂载）；② 会话侧栏 `FilePreview.vue`（WriteFile 产物列表 + 文本类预览）。问题：类型覆盖互不重叠、侧栏只见编辑过的文件不见整个工作区目录结构、无全屏预览层、无编辑器集成、无在线编辑。可复用资产：`/fs/browse`（仅目录）、`/fs/pick-dir`（OS 集成先例）、workspace 流式（含 Range）、highlight.js（已引入）。
+    - **阶段 A：统一消息内文件卡片**
+      - 新建统一 `FileCard.vue`（或扩展 ArtifactCard）：类型图标 + 文件名 + 大小 + 类型徽标 + 操作（预览/下载/复制路径/在文件夹中显示）；覆盖 pdf/markdown/code/json/csv/xlsx/txt 补全现有 image/video/audio/html。
+      - Markdown 正文中的本地文件链接与裸文件路径经 MarkdownRenderer 的 link 规则识别为 FileCard（Kimi Work 消息附件引用形态）。
+      - 挂载点沿用 AssistantTurn / ToolCallCard / clarifyArtifacts，不改数据流。
+    - **阶段 B：统一全屏预览层 FileViewer**
+      - 全局单例（provide/inject），任何 FileCard/文件树点击都进同一查看器。
+      - 分类型视图：图片=画廊（多图切换、滚轮/按钮缩放、适应/原始尺寸）；PDF=pdf.js 分页懒渲染 + 页码跳转；视频=复用 workspace Range 流（拖进度）；Markdown=MarkdownRenderer；代码/文本=highlight.js 高亮 + 行号（语言集见阶段 H）；JSON pretty-print；CSV/TSV=表格渲染；xlsx=SheetJS 只读多 sheet；ipynb=cell+输出渲染；未知/二进制=信息卡 + 下载。
+      - 顶部工具条：面包屑路径、类型徽标、大小、下载、新窗口、编辑器打开（F 的下拉）、关闭；左右键/ESC 导航。
+    - **阶段 C：联动与操作**
+      - 消息卡片 ↔ 文件树互相定位（「在文件列表中显示」高亮对应节点；点树节点若消息流有对应卡片则滚动定位）。
+      - 「在文件夹中显示」：后端 `GET /api/files/reveal?path=...`（限工作区边界）→ Windows `explorer /select,`、macOS `open -R`、Linux xdg-open；无桌面 501 前端降级隐藏。
+      - 大文本分段加载（依赖 D 的 content offset/limit）。
+    - **阶段 D：后端配套**
+      - `/api/files/raw` 增 Range + ETag/Last-Modified；`/api/files/content` 增 offset/limit 分段；FilesHandler 扩展批量 mime/大小字段（消 N+1）。
+      - **新增 `GET /api/fs/tree?root=<工作区绝对路径>[&depth=N]`**：返回整棵目录树（目录/文件节点、name/path/size/mtime、缩进层级由 path 深度表达），root 必须命中已登记工作区（复用 WorkDirPicker 的登记校验），depth 默认 8、节点数硬上限（如 5000，超出截断+truncated 标记）防爆；跳过 .git/node_modules/dist 等（可配黑名单）。
+      - **新增 `PUT /api/files/content`**（在线保存，见 G）。
+      - **新增编辑器扫描两端点**（见 F）。
+      - 缩略图（可选兜底，最后做）：图片 gallery 缩略图缓存，仅当大图列表实测不达标再做。
+    - **阶段 E：工作区文件树面板（本次新需求核心，Kimi Work 截图形态）**
+      - 侧栏从「WriteFile 产物平铺列表」改为**整棵工作区目录树**：目录可展开/收起（缩进层级线）、按类型着色图标、节点显示大小；顶部「筛选文件…」输入框按文件名实时过滤（保留父链上下文）。
+      - **Tab 多文件**：顶部 tab 栏（文件名 + 关闭按钮，+ 号回到树），点击文件在 tab 打开预览，切 tab 保留各文件滚动/编辑状态；脏 tab 加 ● 标记。
+      - 面包屑：面板顶 BlockMemoryAgent > config > config.yaml 式路径，每段可点击跳转对应目录。
+      - **面板可收起/展开**：右上角按钮收起为窄图标条（再点展开恢复），收起状态 localStorage 记忆；窄屏默认收起。
+      - 树的初始根=会话工作区；无工作区会话降级为现有 WriteFile 列表。
+    - **阶段 F：编辑器扫码与「打开方式」下拉**
+      - **后端 `GET /api/editors`**：扫描本机已安装编辑器并返回 `[{id, name, exe}]`——Windows 双通道：注册表 App Paths（`HKLM/HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths`）+ 常见安装路径探测（notepad、notepad++、vscode、vscode-insiders、trae、cursor、sublime、webstorm 等，Program Files 与 %LOCALAPPDATA% 两处）；macOS 扫 /Applications；Linux 走 which。扫码结果缓存 60s，零命中不报错返回空数组。
+      - **后端 `POST /api/editors/open`** `{editor_id?, path}`：exec 启动（detached，hide 窗口），editor_id 缺省=系统默认打开（Windows `rundll32 url.dll,FileProtocolHandler`、macOS `open`、Linux xdg-open）；path 限工作区边界，返回 404/501 语义同 reveal。
+      - **前端**：预览头部「打开 ▾」下拉=扫码到的编辑器列表 + 「系统默认打开」；每次展开下拉时刷新扫码结果（缓存由后端兜）；仅文本类文件显示编辑器入口，图片/视频保持下载/新窗口。
+    - **阶段 G：在线编辑与 Ctrl+S 保存**
+      - **后端 `PUT /api/files/content`** `{path, content, base_mtime?}`：path 限工作区边界（同 raw 的 isKnownWriteFilePath 语义扩展为「工作区内任意路径」，不再限 WriteFile 产物）；原子写（temp+rename）；写前 mtime 与 base_mtime 不一致返回 409（前端弹冲突选择覆盖/放弃）；可选写 `.bak`（同名备份一次）；全部写操作落 evolution 之外的操作日志（session_logs 或独立 audit 表，记 path/大小/会话）；单文件上限 5MB。
+      - **前端**：文本类文件默认只读预览，头部「编辑」按钮进入编辑态（textarea/编辑器切换）；编辑态 dirty 标记（tab ● 与关闭前确认）；**Ctrl/Cmd+S 保存**（拦截默认行为，保存中/成功/失败 toast）；保存后刷新 mtime/大小并清 dirty；切换文件/关闭带脏标记先提示。
+      - 图片/PDF/视频/xlsx 不提供编辑（无编辑按钮）。
+    - **阶段 H：语法高亮语言集核对扩充**
+      - 现有 highlight.js 为 core+15 语言，逐一核对并确保含：**go、python、javascript、typescript、vue**（用户点名）+ yaml、json、css、html/xml、shell、sql、ini/toml、diff、markdown、dockerfile；补注册 vue SFC（hljs 无官方 vue 语法，用 xml+javascript+css 组合注册兜底）；未覆盖语言纯文本转义兜底。
+    - **验收**：消息里任何工作区文件引用都是统一 FileCard；图片/PDF/视频/markdown/代码/xlsx 在 FileViewer 全屏预览可切换；**目录树展示整个工作区缩进结构、可筛选、tab 多开、面包屑可跳转、面板收起展开状态记忆**；本机实测扫码到 ≥1 个编辑器并成功打开文件（vscode/trae/记事本任一）+ 系统默认打开可用；**编辑文件 Ctrl+S 后磁盘内容变更、重开可见、mtime 冲突 409 正确触发**；「在文件夹中显示」三平台正确（无桌面 501 降级）；`go build/test` + `npm run build` 全绿。
+    - **风险与对策**：写文件安全——PUT 边界严格限工作区（复用 raw 校验思路）+ 409 冲突 + .bak + 审计四重保护，不做工作区外任意写；编辑器扫码机器差异大——双通道扫描+缓存+空结果优雅降级（下拉只剩「系统默认打开」）；目录树爆炸——depth/节点数双上限+黑名单目录+truncated 标记；多 tab 编辑态内存——仅缓存文本类内容，图片/PDF 关闭 tab 即释放。
+    - **明确不做**：不做云存储/外链分享/上传（本地优先不动）；不做 Office 在线编辑（xlsx 只读）；PDF 不做标注/表单填写（纯预览）；不做 IDE 级编辑能力（无 LSP/补全，轻量 textarea 级编辑）；FileContentHandler 遗留无约束读取不在本项收紧（另案）。
+    - **依赖与顺序**：E 的树干依赖 D 的 /fs/tree；G 依赖 D 的 PUT；F 独立可先行（后端扫描+前端下拉，半天-1 天）；A 与 D 其余可并行 → B（依赖 A+D）→ C（依赖 A+B）→ E+G（依赖 D 新端点）。总预计 3 周（比原 2-2.5 周增加 E/F/G 的约 1 周）；最先落地的建议顺序：F（编辑器打开，独立小件）→ D 的 /fs/tree + PUT → E（树面板+tab+面包屑）→ G（编辑保存）→ A/B/C/H。

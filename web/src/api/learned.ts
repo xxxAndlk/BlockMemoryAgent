@@ -10,8 +10,17 @@ export interface LearnedSkill {
   use_count: number
   source_session?: string
   outcome?: string
+  /** 是否携带配套可执行脚本（frontmatter tools 清单非空，阶段 C）。 */
+  has_tools?: boolean
   created_at: string
   updated_at: string
+}
+
+/** 技能配套脚本条目（frontmatter tools 清单项；PUT 编辑不支持变更，仅只读展示）。 */
+export interface SkillTool {
+  path: string
+  desc: string
+  run?: string
 }
 
 export interface LearnedSkillDetail {
@@ -39,7 +48,7 @@ export function getLearnedSkill(name: string): Promise<LearnedSkillDetail> {
 
 export function saveLearnedSkill(
   name: string,
-  body: { title: string; when_to_use: string; content: string }
+  body: { title: string; when_to_use: string; content: string; tools?: SkillTool[] }
 ): Promise<{ ok: boolean }> {
   return fetchJson(`/skills/learned/${encodeURIComponent(name)}`, {
     method: 'PUT',

@@ -75,6 +75,7 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.GET("/skills", apiHandler.SkillsHandler)                              // Skill 列表
 	api.GET("/files", apiHandler.FilesHandler)                                // 文件列表
 	api.GET("/files/content", apiHandler.FileContentHandler)                  // 文件内容读取
+	api.GET("/files/raw", apiHandler.FileRawHandler)                          // 文件原始字节（图片内联/下载，限 WriteFile 产物）
 	api.GET("/fs/browse", apiHandler.BrowseFSHandler)                         // 目录浏览（前端工作目录选择器）
 	api.POST("/fs/pick-dir", apiHandler.PickDirHandler)                       // 系统原生目录选择框（服务端主机）
 	api.GET("/profile", apiHandler.ProfileHandler)                            // 用户画像查看（TODO #28）

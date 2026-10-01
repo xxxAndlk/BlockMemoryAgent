@@ -1,18 +1,23 @@
 <template>
   <div class="flex flex-col h-screen w-full overflow-hidden bg-page text-ink">
     <!-- Header -->
-    <header class="h-14 bg-card border-b border-line flex items-center px-4 shrink-0">
-      <div class="flex items-center w-52 shrink-0">
+    <header class="h-14 bg-card border-b border-line flex items-center justify-between px-4 shrink-0">
+      <div class="flex items-center">
         <el-icon class="text-primary text-2xl mr-2"><Grid /></el-icon>
         <span class="font-bold text-lg">BlockMemoryAgent</span>
       </div>
 
-      <div class="flex items-center space-x-3 shrink-0 ml-auto">
-        <el-icon class="text-xl cursor-pointer text-ink-2 hover:text-primary" @click="toggleTheme">
-          <Moon v-if="theme === 'light'" /><Sunny v-else />
-        </el-icon>
-        <router-link to="/settings">
-          <el-icon class="text-xl cursor-pointer text-ink-2 hover:text-primary"><Setting /></el-icon>
+      <!-- 顶栏右侧操作区：统一 pill 容器（底色 + 描边 + 圆角），
+           与左侧标题同一行、垂直居中，hover 与项目现有按钮一致 -->
+      <div class="flex items-center gap-0.5 p-1 rounded-full border border-line bg-page">
+        <button type="button" title="切换主题"
+                class="w-8 h-8 rounded-full flex items-center justify-center text-ink-2 hover:text-primary hover:bg-primary-soft transition-colors cursor-pointer"
+                @click="toggleTheme">
+          <el-icon class="text-lg"><Moon v-if="theme === 'light'" /><Sunny v-else /></el-icon>
+        </button>
+        <router-link to="/settings" title="系统设置"
+                     class="w-8 h-8 rounded-full flex items-center justify-center text-ink-2 hover:text-primary hover:bg-primary-soft transition-colors">
+          <el-icon class="text-lg"><Setting /></el-icon>
         </router-link>
       </div>
     </header>
