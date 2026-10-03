@@ -67,7 +67,9 @@
     <div class="flex-1 flex flex-col overflow-hidden min-w-0">
       <el-card class="!border-line !bg-card h-full flex flex-col body-flex-1" shadow="never">
         <template #header>
-          <div class="flex justify-between items-center gap-3">
+          <!-- 窄面板下按钮组整体换到第二行右对齐，不再与面包屑互相挤压重叠
+               （2026-10-01 用户实证：预览栏窄时按钮挤一行，文字重叠成一团）。 -->
+          <div class="flex justify-between items-center gap-3 flex-wrap">
             <!-- 面包屑：根名 > 子目录 > 文件名，目录段可点击（树内定位高亮） -->
             <div class="min-w-0 flex items-center gap-1 text-sm flex-1 breadcrumb-bar">
               <template v-if="activeTab">
@@ -86,7 +88,7 @@
               <span v-if="activeTab?.editing" class="text-xs text-ink-3 shrink-0">编辑中</span>
               <span v-if="activeTab" class="text-xs text-ink-3 shrink-0">{{ formatSize(activeTab.size) }}</span>
             </div>
-            <div v-if="activeTab" class="flex gap-2 shrink-0">
+            <div v-if="activeTab" class="flex gap-2 shrink-0 ml-auto">
               <!-- 编辑态：保存（Ctrl+S）/ 取消 -->
               <template v-if="activeTab.editing">
                 <el-button type="primary" size="small" :loading="saving" @click="saveEdit(false)">

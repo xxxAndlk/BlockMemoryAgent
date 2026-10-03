@@ -73,17 +73,36 @@ const chain = computed(() => {
     (order.indexOf(a.type) - order.indexOf(b.type)) || a.name.localeCompare(b.name))
 })
 
-// 链条 chip 可点击选中 Agent（?agent=<inst_id>，留在当前 tab）：对话/监控随选中切换；
-// 点 meta 节点清除选择回主会话。当前选中 chip 高亮。
+// 存活判定（2026-10 用户诉求：续话反复新建子 Agent，顶栏只该看"还活着的"）：
+// meta 常驻（回主会话入口）；其余 hot=true（运行中/热驻可唤醒）或 running 才算存活，
+// 休眠（已销毁）与终态不再占展示位。hot 缺失的旧后端兜底按 running 算。
+function isAlive(a: AgentNode): boolean {
+  if (a.type === 'meta' || a.inst_id === 'meta') return true
+  if (a.hot === undefined) return a.status === 'running'
+  return a.hot || a.status === 'running'
+}
+
+const aliveChain = computed(() => chain.value.filter(isAlive))
+const aliveCount = computed(
+  () => aliveChain.value.filter((a) => a.type !== 'meta' && a.inst_id !== 'meta').length,
+)
+
+// 列表弹窗入口的显隐：有存活子 Agent，或当前选中着某个 Agent（可能已死，要留回主会话的路）才显示。
 const route = useRoute()
 const router = useRouter()
 const selectedId = computed(() => (route.query.agent as string) || '')
+const selectedAgent = computed(
+  () => chain.value.find((a) => a.inst_id === selectedId.value) || null,
+)
+const showAgentEntry = computed(() => aliveCount.value > 0 || !!selectedId.value)
+const agentListVisible = ref(false)
 
 function handleChainClick(a: AgentNode) {
   const q = { ...route.query }
   if (a.type === 'meta' || a.inst_id === 'meta') delete q.agent
   else q.agent = a.inst_id
   void router.replace({ query: q })
+  agentListVisible.value = false
 }
 
 function nodeColor(type: string) {
@@ -94,7 +113,7 @@ function nodeColor(type: string) {
   return 'text-ink-2'
 }
 
-/** 切换条活/死指示：hot 缺失（旧后端）不额外标注；其余按 status+hot 给圆点与文案。 */
+/** 活/死指示：hot 缺失（旧后端）不额外标注；其余按 status+hot 给圆点与文案。 */
 const TERMINAL_STATUS = new Set(['done', 'failed', 'error', 'cancelled', 'delivered-unverified'])
 interface NodeLiveBadge { dot: string; text: string }
 
@@ -122,7 +141,7 @@ const liveBadges = computed(() => {
 </script>
 
 <template>
-  <!-- 两行布局：操作区与 Agent 链路分行，中栏被侧栏挤窄时不再互相叠压 -->
+  <!-- 单行布局：操作区 + 存活 Agent 列表弹窗入口（链条不再独立占行） -->
   <div class="border-b border-line bg-card px-6 py-2 shrink-0">
     <div class="flex items-center gap-2 min-w-0 flex-wrap">
       <el-icon class="text-blue-400"><ChatLineRound /></el-icon>
@@ -147,26 +166,40 @@ const liveBadges = computed(() => {
       <span v-if="destroyCountdown" class="text-xs text-orange-400 font-mono shrink-0 animate-pulse">
         {{ destroyCountdown }}
       </span>
+      <!-- 存活 Agent 列表入口（替代原顶部链条：只展示活着的，点开弹窗选择查看） -->
+      <el-popover v-if="showAgentEntry" v-model:visible="agentListVisible"
+                  placement="bottom-start" :width="320" trigger="click">
+        <template #reference>
+          <el-button size="small"
+                     class="!bg-transparent !border-line !text-ink-2 hover:!text-primary shrink-0"
+                     :class="selectedAgent ? '!text-primary !border-primary' : ''">
+            <el-icon class="mr-1"><Connection /></el-icon>
+            <span class="max-w-40 truncate">{{ selectedAgent ? selectedAgent.name : `Agent · ${aliveCount}` }}</span>
+          </el-button>
+        </template>
+        <div class="text-xs">
+          <div class="px-1 pb-1 text-ink-3">存活 Agent（{{ aliveCount }}）</div>
+          <div class="max-h-72 overflow-y-auto">
+            <button v-for="a in aliveChain" :key="a.inst_id"
+                    class="w-full flex items-center gap-1.5 rounded px-2 py-1.5 text-left transition-colors hover:bg-page"
+                    :class="a.inst_id === selectedId ? 'ring-1 ring-primary' : ''"
+                    @click="handleChainClick(a)">
+              <span v-if="liveBadges.get(a.inst_id)"
+                    class="shrink-0 inline-block w-1.5 h-1.5 rounded-full"
+                    :class="liveBadges.get(a.inst_id)!.dot"></span>
+              <span class="flex-1 min-w-0 truncate" :class="nodeColor(a.type)">{{ a.name }}</span>
+              <span v-if="liveBadges.get(a.inst_id)" class="shrink-0 text-[10px] text-ink-3">
+                {{ liveBadges.get(a.inst_id)!.text }}
+              </span>
+            </button>
+          </div>
+        </div>
+      </el-popover>
       <el-button v-if="(session?.status === 'running' || session?.status === 'awaiting_child') && !session?.destroy_at" size="small"
                  class="!bg-red-50 !border-red-300 !text-red-700 dark:!bg-red-900/30 dark:!border-red-700/40 dark:!text-red-400 shrink-0"
                  @click="emit('cancel')">
         <el-icon class="mr-1"><CircleClose /></el-icon>终止
       </el-button>
-    </div>
-
-    <!-- Agent 链路（独立一行，横向滚动；chip 可点击选中，选中高亮，点 meta 清除选择） -->
-    <div v-if="chain.length" class="flex items-center gap-1.5 text-xs text-ink-2 overflow-x-auto mt-1.5">
-      <template v-for="(a, i) in chain" :key="a.inst_id">
-        <button class="whitespace-nowrap rounded px-1 transition-colors hover:bg-page"
-                :class="[nodeColor(a.type), a.inst_id === selectedId ? 'font-bold ring-1 ring-primary' : '']"
-                :title="`查看该 Agent 的对话与监控${liveBadges.get(a.inst_id) ? ' · ' + liveBadges.get(a.inst_id)!.text : ''}`"
-                @click="handleChainClick(a)">
-          <span v-if="liveBadges.get(a.inst_id)"
-                class="inline-block w-1.5 h-1.5 rounded-full align-middle mr-1"
-                :class="liveBadges.get(a.inst_id)!.dot"></span>{{ a.name }}<span v-if="liveBadges.get(a.inst_id)"
-                class="text-[10px] text-ink-3 ml-0.5">{{ liveBadges.get(a.inst_id)!.text }}</span></button>
-        <el-icon v-if="i < chain.length - 1" class="text-ink-3 text-[10px]"><ArrowRight /></el-icon>
-      </template>
     </div>
   </div>
 </template>

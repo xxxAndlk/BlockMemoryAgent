@@ -71,6 +71,34 @@ async function choose(editorId: string) {
 </template>
 
 <style scoped>
+/* fv-btn 样式内聚在本组件：此前依赖 FileViewer.vue 的 scoped .fv-btn，而 Vue scoped
+   样式不会穿透进子组件内部（子组件仅根节点带父 scope id），按钮在任何使用处都是
+   浏览器默认样式——FilePreview 头部夹在 el-button 之间错位重叠（2026-10-01 用户实证）。
+   尺寸对齐 el-button small（24px）；颜色走 bma token——FileViewer 深色作用域在
+   .bma-viewer 覆写了同一组 token，两处使用各自跟随上下文主题。 */
+.fv-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--bma-border, #2a2d35);
+  border-radius: 4px;
+  background: var(--bma-page, #1a1d24);
+  color: var(--bma-text-2, #a8afba);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+.fv-btn:hover:not(:disabled) {
+  color: var(--bma-primary, #4f5dff);
+  border-color: var(--bma-primary, #4f5dff);
+}
+.fv-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
 .editor-menu {
   position: absolute;
   top: calc(100% + 4px);
