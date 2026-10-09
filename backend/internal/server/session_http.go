@@ -264,7 +264,7 @@ type agentNode struct {
 	Domain    string `json:"domain"`             // 所属领域
 	Status    string `json:"status"`             // 当前状态
 	ParentID  string `json:"parent_id"`          // 父节点 ID（空表示顶层）
-	Hot       bool   `json:"hot"`                // 实例是否热驻存活（冷驻/历史节点为 false，meta 恒 true）
+	Hot       bool   `json:"hot"`                // 实例是否热驻存活（冷驻/终态/历史节点为 false，meta 恒 true）
 	Goal      string `json:"goal,omitempty"`     // 目标（可选）
 	BlockID   string `json:"block_id,omitempty"` // 所属 Block ID（可选）
 	// 活动证据（TODO 第10项②展示面）：最近活动种类与距今时长，前端渲染

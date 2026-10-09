@@ -447,6 +447,16 @@ func (d *Dispatcher) armTTL(s *domainSlot) {
 	s.ttlDeadline = time.Now().Add(ttl)
 	slot := s
 	s.ttlTimer = time.AfterFunc(ttl, func() {
+		// dormant 重建槽（RestoreSessionDomains/restoreColdSlot）无 supervisor 常驻
+		// goroutine，ops 无消费者——投递即永久滞留、槽永不销毁（2026-10 实测：resume
+		// 重建的已结束 Agent 热驻标记永不灭）。dormant+Idle 直毁；守卫与唤醒路径
+		//（dispatchToIdleSlot/wakeIdleWithTask 锁内置 Running）互斥，恰被唤醒则
+		// 回退 ops 投递由 supervisor park 消费（同非常驻槽口径）。
+		if d.destroySlotGuarded(slot, "ttl", func(s *domainSlot) bool {
+			return s.dormant && s.state == slotIdle
+		}) {
+			return
+		}
 		slot.ops <- domainOp{kind: opDestroy, byTTL: true}
 	})
 	log.Printf("[subagent] IDLE TTL armed: sub=%s ttl=%v reuse=%d", s.id, ttl, s.reuseCount)
@@ -662,10 +672,17 @@ func (s *domainSlot) resumeWallClock() time.Duration {
 // 注册表条目；硬取消=已 Cancelled；失败=已 Failed）。队列中已挂账任务补偿递减
 //（PendingChildren 对称性）。
 func (d *Dispatcher) destroySlot(s *domainSlot, reason string) {
+	d.destroySlotGuarded(s, reason, nil)
+}
+
+// destroySlotGuarded 同 destroySlot；guard 非 nil 时在 s.mu 临界区内复核（与唤醒路径
+// 锁内状态迁移互斥），不满足则放弃销毁并返回 false——dormant 重建槽的 TTL 直毁
+// 借此避免"检查通过→恰被唤醒→仍被毁"的竞态。
+func (d *Dispatcher) destroySlotGuarded(s *domainSlot, reason string, guard func(*domainSlot) bool) bool {
 	s.mu.Lock()
-	if s.state == slotDestroyed {
+	if s.state == slotDestroyed || (guard != nil && !guard(s)) {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	s.state = slotDestroyed
 	queued := s.taskQueue
@@ -735,6 +752,7 @@ func (d *Dispatcher) destroySlot(s *domainSlot, reason string) {
 	// 槽终结即回收实例级模型覆盖（暂停 park 不销毁槽，覆盖跨 resume 存活）。
 	d.clearAgentModel(s.id)
 	log.Printf("[subagent] SLOT DESTROYED: sub=%s domain=%s reason=%s reuse=%d", s.id, s.domain, reason, s.reuseCount)
+	return true
 }
 
 // domainTaskOutcome 是 runDomainTask 的结果分类。
@@ -1402,7 +1420,11 @@ func (d *Dispatcher) restoreColdSlot(sessionID string, n orchestrator.Node) *dom
 		state:     slotIdle,
 		idleSince: time.Now(),
 		dormant:   true,
-		ops:       make(chan domainOp, 8),
+		// 重建槽的历史任务计数在上一进程生命周期已结清（父未决计数为内存态，重启后
+		// 本就重建）：标记已回传，防 TTL/销毁时 destroySlot 兜底重复递减 + 误报父。
+		// 新任务入口（runDomainTask）会重置为 false，不污染新任务兜底判定。
+		childReported: true,
+		ops:           make(chan domainOp, 8),
 	}
 	d.pool.store(s)
 	if d.treeFn != nil {

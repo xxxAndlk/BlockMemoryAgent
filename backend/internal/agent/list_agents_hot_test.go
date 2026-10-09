@@ -27,13 +27,18 @@ func TestListAgents_HotField(t *testing.T) {
 	hotID := sess.ID + "/domain-1"
 	coldID := sess.ID + "/domain-2"
 	doneID := sess.ID + "/domain-3"
+	doneHotID := sess.ID + "/domain-4"
 	tr.Register(orchestrator.Node{ID: hotID, ParentID: sess.ID, Role: "domain", Domain: "金融", Status: orchestrator.StatusRunning})
 	tr.Register(orchestrator.Node{ID: coldID, ParentID: sess.ID, Role: "domain", Domain: "物流", Status: orchestrator.StatusRunning})
 	tr.Idle(coldID, "done", nil) // 冷驻：树 Idle 但无热驻槽
 	tr.Register(orchestrator.Node{ID: doneID, ParentID: sess.ID, Role: "domain", Domain: "旧域", Status: orchestrator.StatusRunning})
 	tr.Finish(doneID, "done", nil)
+	// 终态但槽仍活：会话 resume 给终态不久的 domain 重建续建槽（RestoreSessionDomains
+	// 终态 30min 窗口）——槽活≠节点活，终态节点 Hot 恒 false（2026-10 实证回归）。
+	tr.Register(orchestrator.Node{ID: doneHotID, ParentID: sess.ID, Role: "domain", Domain: "审计", Status: orchestrator.StatusRunning})
+	tr.Finish(doneHotID, "done", nil)
 
-	svc.SetIdleRosterProvider(&fakeRosterProvider{alive: map[string]bool{hotID: true}})
+	svc.SetIdleRosterProvider(&fakeRosterProvider{alive: map[string]bool{hotID: true, doneHotID: true}})
 
 	insts, err := svc.ListAgents(context.Background(), sess.ID)
 	if err != nil {
@@ -54,6 +59,9 @@ func TestListAgents_HotField(t *testing.T) {
 	}
 	if byID[doneID].Hot {
 		t.Error("done node without slot should be hot=false")
+	}
+	if byID[doneHotID].Hot {
+		t.Error("done node with live slot (restored seed) should still be hot=false")
 	}
 
 	// provider 未注入：子节点恒 false，meta 恒 true。

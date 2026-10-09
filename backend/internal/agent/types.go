@@ -412,7 +412,7 @@ type AgentInstance struct {
 	// LastActivityAgo 最近活动距今时长（"5m12s" 格式，展示用）；空串同上。
 	LastActivityAgo string
 	// Hot 实例是否热驻存活（Domain 热驻：池内槽存在且未销毁）。meta 根节点恒 true；
-	// 冷驻（TTL 到期销毁、树节点保 Idle 待冷恢复）与终态无槽节点为 false；
-	// 热驻未开启（无 provider）时子节点恒 false。
+	// 冷驻（TTL 到期销毁、树节点保 Idle 待冷恢复）与终态节点为 false（终态恒 false——
+	// resume 重建的续建槽不改变节点已结束的事实）；热驻未开启（无 provider）时子节点恒 false。
 	Hot bool
 }

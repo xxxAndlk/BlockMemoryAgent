@@ -734,3 +734,39 @@ func TestTickCronTriggerSemantics(t *testing.T) {
 		t.Errorf("cron-due UpdatedAt not refreshed: %v", d.UpdatedAt)
 	}
 }
+
+// TestTickNoRefireAfterReap 回归（2026-10-05 实证：每日任务半天刷出 235 个重复会话）：
+// cron 触发 → 会话完成 → reapRunning 收尾 SaveDAG → 下一 tick 不得重复触发。
+// 旧实现 fire 内先 Trigger 后落库 updatedAt，运行实例携带旧 updatedAt，
+// reap 收尾回写把 updatedAt 回退 → Next(旧值)<=now → 会话一结束立刻再触发。
+func TestTickNoRefireAfterReap(t *testing.T) {
+	now := time.Now()
+	store := newMemStore(&DAG{
+		ID:        "daily",
+		Name:      "daily",
+		Cron:      "* * * * *", // 每分钟到点，放大回归场景的误触发窗口
+		Enabled:   true,
+		UpdatedAt: now.Add(-2 * time.Hour),
+		Tasks:     []*Task{{ID: "a", Goal: "goal daily"}},
+	})
+	launcher := newStubLauncher()
+	s := NewScheduler(store, launcher, time.Second)
+
+	s.tick(t.Context())
+	if got := len(launcher.goals); got != 1 {
+		t.Fatalf("first tick should launch once, got %d", got)
+	}
+	// 会话完成 → reap 收尾（内部 SaveDAG 运行实例）→ DAG 从 running 清除
+	launcher.setStatus(launcher.sessionOf("goal daily"), "completed")
+	s.reapRunning(t.Context())
+	// 关键断言：reap 回写后 updatedAt 不得回退到触发前
+	d, _ := store.GetDAG(t.Context(), "daily")
+	if !d.UpdatedAt.After(now.Add(-time.Hour)) {
+		t.Fatalf("reap reverted UpdatedAt: %v", d.UpdatedAt)
+	}
+	// 同一分钟内再次 tick：不得重复派发
+	s.tick(t.Context())
+	if got := len(launcher.goals); got != 1 {
+		t.Fatalf("second tick must not refire, got %d launches", got)
+	}
+}

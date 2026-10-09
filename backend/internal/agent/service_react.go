@@ -2608,6 +2608,13 @@ func (s *ReactService) ListAgents(ctx context.Context, sessionID string) ([]Agen
 		if s.idleRosterProvider != nil {
 			inst.Hot = s.idleRosterProvider.SlotAlive(sessionID, n.ID)
 		}
+		// 终态节点恒非存活（2026-10 实证：会话 resume 会给 30min 内结束的 domain 重建
+		// 续建槽（RestoreSessionDomains 终态窗口），SlotAlive=true 令已完成/失败的
+		// Agent 在展示面"复活"成存活——槽活≠节点活）。
+		switch n.Status {
+		case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled, orchestrator.StatusUnverified:
+			inst.Hot = false
+		}
 		// 活动证据展示面（TODO 第10项②）：运行中节点附"最近活动种类 + 距今时长"，
 		// TUI/Web 渲染为 "in <tool> · active Xs ago"，让假死可见可判。
 		if s.activityEvidenceProvider != nil {

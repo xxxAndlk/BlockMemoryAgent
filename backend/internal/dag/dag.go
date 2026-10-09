@@ -290,7 +290,8 @@ func (s *Scheduler) loop(ctx context.Context) {
 // cron 触发判定：
 //   - 旧 "Ns/Nm/Nh" 间隔格式：当前时间 - updatedAt >= interval 即触发。
 //   - 标准 5 段 cron 表达式：sched.Next(updatedAt) 已不晚于 now 即触发。
-//   - trigger 后回写 updatedAt 作为下次触发起点（编辑 DAG 会重置基准）。
+//   - trigger 前先把 updatedAt 推进并落库（Trigger 内部读库拷贝运行实例，顺序反了
+//     会被 reapRunning 的 SaveDAG 把 updatedAt 回写旧值造成重复触发）。
 //   - 这样避免引入独立 lastFire 字段，但也意味着触发后必须落库。
 func (s *Scheduler) tick(ctx context.Context) {
 	// 收割运行中 task 的会话终态（不依赖 DAG 列表，先执行）
@@ -302,16 +303,20 @@ func (s *Scheduler) tick(ctx context.Context) {
 		return
 	}
 	now := time.Now()
-	// fire 触发指定 DAG 并回写 updatedAt，避免同一周期重复触发
+	// fire 触发指定 DAG 并回写 updatedAt，避免同一周期重复触发。
+	// 必须先推进并落库 updatedAt 再 Trigger：Trigger 内部重新读库深拷贝运行实例，
+	// 若先 Trigger 后落库，运行实例携带的是旧 updatedAt，reapRunning 收尾 SaveDAG
+	// 会把 updatedAt 回写成旧值——cron 判定 Next(旧值)<=now 立即重复触发，会话
+	// 一结束就再触发一次（2026-10-05 实证：每日任务半天刷出 235 个重复会话）。
 	fire := func(d *DAG) {
-		if err := s.Trigger(ctx, d.ID); err != nil {
-			s.logError(ctx, fmt.Sprintf("[DAG] trigger failed: id=%s", d.ID), err)
-		}
 		// 更新 updatedAt 为当前时间，避免同一周期重复触发
 		d.UpdatedAt = now
 		// 持久化新的 updatedAt，避免进程重启后重复触发
 		if err := s.store.SaveDAG(ctx, d); err != nil {
 			s.logError(ctx, fmt.Sprintf("[DAG] save dag failed: id=%s", d.ID), err)
+		}
+		if err := s.Trigger(ctx, d.ID); err != nil {
+			s.logError(ctx, fmt.Sprintf("[DAG] trigger failed: id=%s", d.ID), err)
 		}
 	}
 	// 遍历每个 DAG，检查是否需要按 cron 触发
