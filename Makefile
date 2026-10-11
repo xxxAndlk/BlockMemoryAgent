@@ -20,11 +20,11 @@ web-build:
 lint:
 	GOTOOLCHAIN=local go vet ./backend/... ./test/...
 
-## Start PostgreSQL + Redis via docker compose.
+## Start PostgreSQL + Redis + open_design via docker compose.
 up:
 	docker compose -f docker/docker-compose.yml up -d
 
-## Stop PostgreSQL + Redis via docker compose.
+## Stop PostgreSQL + Redis + open_design via docker compose.
 down:
 	docker compose -f docker/docker-compose.yml down
 
@@ -47,12 +47,11 @@ run: web-build
 bma-plugin:
 	bash docker/bma-plugin.sh
 
-## Build/pull plugin images: local MCP bridges (bma/*:local) + open_design (ghcr pull).
+## Build plugin images: local MCP bridges (bma/*:local). open_design daemon 由 compose 统一管理（up 时自动构建）。
 plugins-build:
 	docker build -t bma/computer-use-mcp:local docker/computer-use
 	docker build -t bma/open-design-mcp:local docker/open-design-mcp
 	docker build -t bma/ui-preview-mcp:local docker/ui-preview-mcp
-	docker pull ghcr.io/nexu-io/od:latest
 
 ## Build dist/ install layout: dist/{bin,config,web/dist,plugins.d}. Then run install.ps1 to install. PowerShell 无 make 时用 .\dist.ps1。
 dist: web-build
@@ -73,11 +72,11 @@ help:
 	@echo "  test-compile  - compile integration tests without running"
 	@echo "  web-build     - install deps and build the Vue SPA"
 	@echo "  lint          - run go vet on backend and test modules"
-	@echo "  up            - start docker compose services"
+	@echo "  up            - start docker compose services (postgres / redis / open_design)"
 	@echo "  down          - stop docker compose services"
 	@echo "  migrate       - apply SQL migrations (requires POSTGRES_DSN)"
 	@echo "  run           - build web UI and run backend server"
-	@echo "  bma-plugin    - one command: build/pull all plugin images"
-	@echo "  plugins-build - build/pull plugin images (computer_use / open_design / ui_design / ui_preview)"
+	@echo "  bma-plugin    - one command: build all plugin MCP bridge images"
+	@echo "  plugins-build - build plugin MCP bridge images (computer_use / ui_design / ui_preview)"
 	@echo "  dist          - build dist/ install layout (bin/config/web/dist/plugins.d)"
 	@echo "  note: TUI 视频附件默认 native 直传（mp4/avi/mov ≤ native_max_mb 无需 ffmpeg）；webm/mkv/超限回落抽帧需宿主机 ffmpeg（winget install Gyan.FFmpeg），缺失时降级为仅元数据"

@@ -31,6 +31,12 @@ import (
 // 默认单次工具调用超时（MCP 服务端可能长时间无响应，兜底防挂死 Agent 循环）。
 const defaultExecTimeout = 120 * time.Second
 
+// connectHandshakeTimeout 是连接握手（MCP initialize + ListTools）的超时上限：
+// Docker Desktop 卡死/远端无响应时不无限挂起插件预热。注意只掐握手——
+// 传输进程（docker run -i / docker exec）是长会话，沿用传入的生命周期 ctx，
+// 不能用超时 ctx spawn（超时到期会杀掉会话进程）。
+const connectHandshakeTimeout = 120 * time.Second
+
 // Settings 是 plugins.yaml 中 mcp 插件 settings 段的解析结果。
 type Settings struct {
 	// Transport 传输方式：stdio（默认）| http | docker。
@@ -353,17 +359,22 @@ func (b *Bridge) connect(ctx context.Context) (*mcp.ClientSession, *exec.Cmd, []
 }
 
 // connectWith 按给定的容器与卷建立一次会话（默认会话与异目录会话共用）。
+// 握手（initialize + ListTools）包 connectHandshakeTimeout 超时；SDK 的
+// jsonrpc2 连接不绑定该 ctx 生命周期（内部 notDone 包装），超时到期只让
+// 本次握手失败，已建立会话不受影响；失败路径 killCmd 显式回收半开进程。
 func (b *Bridge) connectWith(ctx context.Context, container, workDir string, volumes []string) (*mcp.ClientSession, *exec.Cmd, []tool.Tool, error) {
 	transport, cmd, err := b.newTransport(ctx, container, workDir, volumes)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	session, err := b.client.Connect(ctx, transport, nil)
+	hsCtx, hsCancel := context.WithTimeout(ctx, connectHandshakeTimeout)
+	defer hsCancel()
+	session, err := b.client.Connect(hsCtx, transport, nil)
 	if err != nil {
 		b.killCmd(cmd)
 		return nil, nil, nil, fmt.Errorf("mcp connect %s: %w", b.id, err)
 	}
-	list, err := session.ListTools(ctx, &mcp.ListToolsParams{})
+	list, err := session.ListTools(hsCtx, &mcp.ListToolsParams{})
 	if err != nil {
 		_ = session.Close()
 		b.killCmd(cmd)

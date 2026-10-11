@@ -55,8 +55,10 @@ func dockerContainerName(pluginID string) string {
 func dockerRunArgs(pluginID string, s Settings) (name string, args []string) {
 	name = dockerContainerName(pluginID)
 	args = []string{"run", "-i", "--rm", "--name", name}
-	// 容器内访问宿主服务（如自托管 firecrawl 栈发布在 localhost:3002）。
+	// 容器内访问宿主服务（发布在宿主 localhost 上的服务经 host.docker.internal 可达）。
 	args = append(args, "--add-host", "host.docker.internal:host-gateway")
+	// compose 标签归组：让 Docker Desktop 把后端拉起的容器归入 bma 项目组。
+	args = append(args, composeLabels(pluginID)...)
 	for _, p := range s.Ports {
 		args = append(args, "-p", p)
 	}
@@ -104,13 +106,23 @@ func dockerSharedContainerName(pluginID, workDir string) string {
 	return sb.String()
 }
 
+// composeLabels 返回 compose 归组标签参数：Docker Desktop 据此把后端拉起的
+// 容器归入 bma 项目组（service 取插件 id，便于按插件辨认）。
+func composeLabels(pluginID string) []string {
+	return []string{
+		"--label", "com.docker.compose.project=bma",
+		"--label", "com.docker.compose.service=" + pluginID,
+	}
+}
+
 // dockerRunArgsShared 构造 shared 模式 `docker run -d` 参数（不含 "docker" 本身）：
 // 常驻 keeper 容器（--entrypoint 覆盖，缺省 sleep infinity，容器内无常驻业务进程，
 // MCP server 全部由 exec 按会话拉起），无 --rm/-i，settings.Args 不追加
 //（那是 exec 会话的 MCP server 参数，见 dockerExecArgs）。
-func dockerRunArgsShared(name string, s Settings, volumes []string) []string {
+func dockerRunArgsShared(pluginID, name string, s Settings, volumes []string) []string {
 	args := []string{"run", "-d", "--name", name}
 	args = append(args, "--add-host", "host.docker.internal:host-gateway")
+	args = append(args, composeLabels(pluginID)...)
 	for _, p := range s.Ports {
 		args = append(args, "-p", p)
 	}
@@ -233,6 +245,7 @@ func normalizeMountPath(p string) string {
 // ensureSharedContainer 确保共享容器在运行且镜像匹配。
 // 容器不在/已停止 → rm 残留后 `docker run -d` 重建；镜像不匹配（配置改了）→ 重建。
 // 并发竞态：另一实例同时重建撞名失败时重新 inspect，running 且镜像一致即放行。
+// `docker run -d` 单独包 60s 超时：Docker Desktop 卡死时不无限挂起预热。
 func (b *Bridge) ensureSharedContainer(ctx context.Context, container, workDir string, volumes []string) error {
 	running, image := dockerInspectRunning(b.logger, container)
 	if running && image == b.settings.Image {
@@ -244,8 +257,10 @@ func (b *Bridge) ensureSharedContainer(ctx context.Context, container, workDir s
 			"running_image", image, "want_image", b.settings.Image)
 	}
 	removeDockerContainer(b.logger, container)
-	args := dockerRunArgsShared(container, b.settings, volumes)
-	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	args := dockerRunArgsShared(b.id, container, b.settings, volumes)
+	runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	out, err := exec.CommandContext(runCtx, "docker", args...).CombinedOutput()
+	cancel()
 	if err != nil {
 		if r, img := dockerInspectRunning(b.logger, container); r && img == b.settings.Image {
 			b.logger.Info("共享容器已被并发实例创建，复用", "plugin", b.id, "container", container)

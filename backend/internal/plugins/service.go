@@ -159,10 +159,13 @@ func serviceContainerName(pluginID string) string {
 }
 
 // serviceRunArgs 构造 `docker run -d` 参数（不含 "docker" 本身）；纯函数便于测试。
-func serviceRunArgs(name string, s serviceSettings) []string {
+func serviceRunArgs(pluginID, name string, s serviceSettings) []string {
 	args := []string{"run", "-d", "--name", name}
 	// 容器内访问宿主服务（与其他插件容器一致的约定）。
 	args = append(args, "--add-host", "host.docker.internal:host-gateway")
+	// compose 标签归组：让 Docker Desktop 把后端拉起的容器归入 bma 项目组。
+	args = append(args, "--label", "com.docker.compose.project=bma",
+		"--label", "com.docker.compose.service="+pluginID)
 	for _, p := range s.Ports {
 		args = append(args, "-p", p)
 	}
@@ -251,8 +254,11 @@ func (p *servicePlugin) Start(ctx context.Context) error {
 		// 不存在/已停止：上次异常退出可能残留同名已停止容器，先清场。
 		p.removeContainer()
 	}
-	args := serviceRunArgs(p.container, p.settings)
-	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	args := serviceRunArgs(p.id, p.container, p.settings)
+	// 单独包 60s 超时：Docker Desktop 卡死时不无限挂起 enable。
+	runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	out, err := exec.CommandContext(runCtx, "docker", args...).CombinedOutput()
+	cancel()
 	if err != nil {
 		return fmt.Errorf("service 插件 %q docker run 失败: %w (%s)", p.id, err, strings.TrimSpace(string(out)))
 	}

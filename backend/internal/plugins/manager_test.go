@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
@@ -31,6 +32,7 @@ type fakePlugin struct {
 	manifest   Manifest
 	initErr    error
 	startErr   error
+	startBlock chan struct{} // 非 nil 时 Start 阻塞至关闭（异步预热测试用）
 	stopCalls  atomic.Int32
 	startCalls atomic.Int32
 	tools      []tool.Tool
@@ -42,6 +44,13 @@ func (f *fakePlugin) Init(ctx context.Context, deps Deps) error {
 }
 func (f *fakePlugin) Start(ctx context.Context) error {
 	f.startCalls.Add(1)
+	if f.startBlock != nil {
+		select {
+		case <-f.startBlock:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	return f.startErr
 }
 func (f *fakePlugin) Stop(ctx context.Context) error {
@@ -376,6 +385,92 @@ func TestTopLevelTools(t *testing.T) {
 	}
 	if got := h.mgr.TopLevelTools(); len(got) != 0 {
 		t.Fatalf("停用后不应再返回: %v", got)
+	}
+}
+
+// TestLoadAsyncEnable 验证异步预热（WithAsyncEnable）：Load 在慢插件 Start 阻塞时
+// 立即返回；WaitWarmup 阻塞至全部 enable 收尾；单个失败不拖垮其他插件；
+// Reload 不受开关影响，保持同步语义（返回前差异已生效）。
+func TestLoadAsyncEnable(t *testing.T) {
+	gate := make(chan struct{})
+	h := newHarness(t, func(id string) *fakePlugin {
+		fp := &fakePlugin{tools: []tool.Tool{fakeTool(id + "_tool")}}
+		switch id {
+		case "slow":
+			fp.startBlock = gate
+		case "bad":
+			fp.startErr = fmt.Errorf("boom")
+		}
+		return fp
+	})
+	h.mgr.asyncEnable = true
+	h.setCfg(&config.PluginsConfig{Plugins: map[string]config.PluginConfig{
+		"ok":   {Kind: "mcp", EnabledFlag: boolPtr(true)},
+		"slow": {Kind: "mcp", EnabledFlag: boolPtr(true)},
+		"bad":  {Kind: "mcp", EnabledFlag: boolPtr(true)},
+	}})
+	ctx := context.Background()
+	start := time.Now()
+	if err := h.mgr.Load(ctx); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Load 应异步返回（slow 的 Start 仍阻塞中），耗时 %v", elapsed)
+	}
+	// 预热未收尾：WaitWarmup 应阻塞。
+	warm := make(chan struct{})
+	go func() { h.mgr.WaitWarmup(); close(warm) }()
+	select {
+	case <-warm:
+		t.Fatal("slow 尚未就绪，WaitWarmup 不应返回")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(gate)
+	select {
+	case <-warm:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gate 关闭后 WaitWarmup 应在预热完成时返回")
+	}
+	// 并行收尾后：ok/slow 已注册，bad 失败仅记录不拖垮其他插件。
+	if !h.reg.Has("ok_tool") || !h.reg.Has("slow_tool") {
+		t.Fatal("预热完成后 ok/slow 工具应已注册")
+	}
+	if h.reg.Has("bad_tool") {
+		t.Fatal("bad 启动失败，工具不应注册")
+	}
+	if info, _ := h.mgr.Get("bad"); info.State != StateRegistered {
+		t.Fatalf("bad 应回滚 registered, got %s", info.State)
+	}
+
+	// Reload 保持同步：新插件 Start 阻塞时 Reload 不返回。
+	gate2 := make(chan struct{})
+	h.setCfg(&config.PluginsConfig{Plugins: map[string]config.PluginConfig{
+		"ok":   {Kind: "mcp", EnabledFlag: boolPtr(true)},
+		"slow": {Kind: "mcp", EnabledFlag: boolPtr(true)},
+		"bad":  {Kind: "mcp", EnabledFlag: boolPtr(true)},
+		"late": {Kind: "mcp", EnabledFlag: boolPtr(true)},
+	}})
+	h.mgr.mcpFactory = func(id string, settings map[string]any, deps Deps) (Plugin, error) {
+		fp := &fakePlugin{tools: []tool.Tool{fakeTool(id + "_tool")}}
+		if id == "late" {
+			fp.startBlock = gate2
+		}
+		fp.manifest = Manifest{ID: id, Name: id, Kind: KindMCP, Roles: []string{"*"}}
+		return fp, nil
+	}
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- h.mgr.Reload(ctx) }()
+	select {
+	case <-reloadDone:
+		t.Fatal("late 的 Start 阻塞中，同步 Reload 不应返回")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(gate2)
+	if err := <-reloadDone; err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if !h.reg.Has("late_tool") {
+		t.Fatal("同步 Reload 返回后 late 工具应已注册")
 	}
 }
 

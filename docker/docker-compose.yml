@@ -1,4 +1,6 @@
-version: '3.8'
+# 固定 compose 项目名（Docker Desktop 归组；长驻服务统一收进本项目，
+# 安装时 up -d 一次，App 只连接）。
+name: bma
 
 services:
   postgres:
@@ -39,8 +41,50 @@ services:
   # 由后端经 /api/plugins/computer_use/enable 按需拉起 stdio 容器，
   # noVNC 观察口经 settings.ports 映射到宿主 6081。不再使用 compose 常驻服务。
 
+  # Open Design 长驻服务（2026-10-10 起由 compose 统一管理，替代后端
+  # service 插件按需拉起）：UI 设计台 daemon，同端口服务 API + Web UI。
+  # 镜像为上游 ghcr.io/nexu-io/od 的本地补丁版（volcengine 生图 size
+  # 1024x1024→2048x2048，见 docker/open-design-daemon/Dockerfile），
+  # compose 缺镜像时自动构建。
+  # 访问入口：http://localhost:7456（Basic 认证：用户名 open-design，
+  # 密码 = .env 的 OD_API_TOKEN，openssl rand -hex 32 生成）。
+  # 环境变量经 env_file 整体注入（compose ${VAR} 插值读不到仓库根 .env，
+  # 故 KEY 改名映射 ARK_API_KEY←IMAGE_KEY 等在镜像 entrypoint.sh 内完成），
+  # baseUrl/model 由 entrypoint 启动前深合并写入 /app/.od/media-config.json。
+  open_design:
+    build: ./open-design-daemon
+    image: bma/open-design-daemon:local
+    container_name: bma-open-design
+    restart: unless-stopped
+    env_file:
+      - path: ../.env
+        required: false
+    ports:
+      - "127.0.0.1:7456:7456"
+    volumes:
+      - bma-open-design-data:/app/.od
+    healthcheck:
+      # 注意：daemon 对容器内环回来源的 API 请求强制要求 Origin 头
+      #（缺失返回 403 "Powered preview origin cannot access this API route"），
+      # 且必须用 127.0.0.1——localhost 可能解析到 ::1，同样被 403 拒绝。
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:7456/api/health',{headers:{Origin:'http://127.0.0.1:7456'}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
 volumes:
+  # 固定卷名（不带 compose 项目前缀）：兼容项目名定死为 bma 之前以默认
+  # 项目名 docker 创建的存量卷（docker_postgres_data/docker_redis_data），
+  # 避免 up 时静默新建空卷丢掉开发库数据。
   postgres_data:
+    name: docker_postgres_data
     driver: local
   redis_data:
+    name: docker_redis_data
+    driver: local
+  # 固定卷名（不带 compose 项目前缀）：兼容迁移前 service 插件
+  # docker run -v bma-open-design-data:... 创建的存量卷，数据无缝衔接。
+  bma-open-design-data:
+    name: bma-open-design-data
     driver: local

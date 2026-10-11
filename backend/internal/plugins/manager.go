@@ -52,6 +52,11 @@ func WithMCPFactory(f MCPFactory) Option { return func(m *Manager) { m.mcpFactor
 // WithConfig 直接注入配置（测试用；跳过文件加载）。
 func WithConfig(cfg *config.PluginsConfig) Option { return func(m *Manager) { m.cfg = cfg } }
 
+// WithAsyncEnable 开启异步预热：Load 时实例表（loadDesired+createInstance，
+// 纯内存操作）仍同步建好，enable 阶段放后台 goroutine 并行执行，Load 立即返回
+//（CLI 启动不被 docker/stdio/http 握手拖慢）。Reload 不受此开关影响，保持同步。
+func WithAsyncEnable(on bool) Option { return func(m *Manager) { m.asyncEnable = on } }
+
 // instance 是单个插件的运行时记录。
 type instance struct {
 	id       string
@@ -100,6 +105,11 @@ type Manager struct {
 	workDir    string
 	mcpFactory MCPFactory
 
+	// asyncEnable 异步预热开关（见 WithAsyncEnable）。
+	asyncEnable bool
+	// warmupDone 异步预热批次完成信号（close 即完成）；同步模式恒为 nil。
+	warmupDone chan struct{}
+
 	// installMu 串行化 Install/回滚（持久化 + 实例变更复合操作，TODO #51）。
 	installMu sync.Mutex
 	// searchCache 是 Search 的条目缓存（plugin_install 按 ID 解析安装用，TODO #51）。
@@ -134,19 +144,32 @@ func (m *Manager) RegisterBuiltin(p Plugin) {
 }
 
 // Load 装载配置 + 扫描 bundles，构造实例表（全部停在 registered 态），
-// 并自动 enable 配置 enabled: true 的插件。启动期调用；Reload 复用同一实现。
+// 并自动 enable 配置 enabled: true 的插件。启动期调用；Reload 复用同一套差异应用。
+// 异步预热模式（WithAsyncEnable）下 enable 阶段在后台并行执行，Load 立即返回。
 func (m *Manager) Load(ctx context.Context) error {
 	desired, err := m.loadDesired()
 	if err != nil {
 		return err
 	}
 	m.applyDesired(ctx, desired)
+	if m.asyncEnable {
+		m.enableDesiredAsync(desired)
+	} else {
+		m.enableDesired(ctx, desired)
+	}
 	return nil
 }
 
 // Reload 重读 plugins.yaml + 重扫 plugins.d/ 并差异应用（设计文档 §5 管理 API）。
+// 保持同步语义：HTTP 热重载返回前差异（含 enable）已全部生效，不受异步预热开关影响。
 func (m *Manager) Reload(ctx context.Context) error {
-	return m.Load(ctx)
+	desired, err := m.loadDesired()
+	if err != nil {
+		return err
+	}
+	m.applyDesired(ctx, desired)
+	m.enableDesired(ctx, desired)
+	return nil
 }
 
 // loadDesired 构建期望插件表：yaml 条目 + bundle 展开条目（yaml 覆盖 bundle 派生）。
@@ -234,7 +257,8 @@ func (m *Manager) loadDesired() (map[string]config.PluginConfig, error) {
 	return desired, nil
 }
 
-// applyDesired 差异应用：创建/替换/移除实例，然后 enable 期望运行的插件。
+// applyDesired 差异应用：创建/替换/移除实例（纯内存操作，同步完成）；
+// enable 阶段由调用方选择同步（enableDesired）或异步并行（enableDesiredAsync）。
 func (m *Manager) applyDesired(ctx context.Context, desired map[string]config.PluginConfig) {
 	// 第一轮：收集消失的与配置变更的实例（配置 DeepEqual 比对）。
 	m.mu.RLock()
@@ -282,13 +306,80 @@ func (m *Manager) applyDesired(ctx context.Context, desired map[string]config.Pl
 			continue
 		}
 	}
-	// 自动 enable 期望运行的插件（失败仅记录，不阻断启动/重载）。
+}
+
+// enableDesired 同步串行 enable 期望运行的插件（失败仅记录，不阻断启动/重载）。
+func (m *Manager) enableDesired(ctx context.Context, desired map[string]config.PluginConfig) {
 	for id, pc := range desired {
 		if pc.Enabled() {
 			if err := m.Enable(ctx, id); err != nil {
 				m.logger.Warn("插件自动启用失败", "plugin", id, "err", err)
 			}
 		}
+	}
+}
+
+// enableDesiredAsync 异步并行预热：后台 goroutine 内用 WaitGroup 每插件并行 Enable
+//（docker/stdio/http 握手互不阻塞），单个失败仅记日志（与同步路径同语义），
+// 全部完成后打一条汇总日志并关闭 warmupDone。
+// ctx 派生自 context.Background()：启动流程的 ctx 可能被提前 cancel，
+// 插件预热不能跟着死（对齐 Enable 内 lifecycleCtx 的做法，见 Enable）。
+func (m *Manager) enableDesiredAsync(desired map[string]config.PluginConfig) {
+	done := make(chan struct{})
+	m.mu.Lock()
+	m.warmupDone = done
+	m.mu.Unlock()
+	go func() {
+		defer close(done)
+		ctx := context.Background()
+		var wg sync.WaitGroup
+		for id, pc := range desired {
+			if !pc.Enabled() {
+				continue
+			}
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				if err := m.Enable(ctx, id); err != nil {
+					m.logger.Warn("插件自动启用失败", "plugin", id, "err", err)
+				}
+			}(id)
+		}
+		wg.Wait()
+		// 汇总：以实例当前状态为准列出就绪/失败清单。
+		var ready, failed []string
+		for id, pc := range desired {
+			if !pc.Enabled() {
+				continue
+			}
+			inst := m.getInstance(id)
+			if inst == nil {
+				failed = append(failed, id)
+				continue
+			}
+			inst.lock.Lock()
+			ok := inst.state == StateRunning
+			inst.lock.Unlock()
+			if ok {
+				ready = append(ready, id)
+			} else {
+				failed = append(failed, id)
+			}
+		}
+		sort.Strings(ready)
+		sort.Strings(failed)
+		m.logger.Info("插件异步预热完成", "ready", ready, "failed", failed)
+	}()
+}
+
+// WaitWarmup 阻塞至启动期异步预热完成；同步模式/未开启预热时立即返回。
+// 供顶层必备工具预挂等消费方在预热窗口内等待首批插件就绪（对齐同步 Load 的旧语义）。
+func (m *Manager) WaitWarmup() {
+	m.mu.RLock()
+	done := m.warmupDone
+	m.mu.RUnlock()
+	if done != nil {
+		<-done
 	}
 }
 

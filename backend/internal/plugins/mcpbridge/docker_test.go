@@ -30,7 +30,7 @@ func TestDockerContainerName(t *testing.T) {
 func TestDockerRunArgs(t *testing.T) {
 	s := Settings{
 		Transport: "docker",
-		Image:     "bma/firecrawl-mcp:local",
+		Image:     "bma/test-mcp:local",
 		Args:      []string{"--verbose"},
 		Ports:     []string{"6081:6081"},
 		Volumes:   []string{"D:/data/workspace/od-artifacts:/out"},
@@ -46,11 +46,13 @@ func TestDockerRunArgs(t *testing.T) {
 	want := []string{
 		"run", "-i", "--rm", "--name", name,
 		"--add-host", "host.docker.internal:host-gateway",
+		"--label", "com.docker.compose.project=bma",
+		"--label", "com.docker.compose.service=web_search",
 		"-p", "6081:6081",
 		"-v", "D:/data/workspace/od-artifacts:/out",
 		"-e", "FIRECRAWL_API_KEY=self-hosted",
 		"-e", "FIRECRAWL_API_URL=http://host.docker.internal:3002",
-		"bma/firecrawl-mcp:local", "--verbose",
+		"bma/test-mcp:local", "--verbose",
 	}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("args =\n%q\nwant\n%q", args, want)
@@ -97,19 +99,21 @@ func TestParseDockerMountSources(t *testing.T) {
 func TestDockerRunArgsShared(t *testing.T) {
 	s := Settings{
 		Transport: "docker",
-		Image:     "bma/firecrawl-mcp:local",
+		Image:     "bma/test-mcp:local",
 		Ports:     []string{"6081:6081"},
 		Volumes:   []string{"D:/data/workspace:/workspace"},
 		Env:       map[string]string{"FIRECRAWL_API_KEY": "self-hosted"},
 	}
-	args := dockerRunArgsShared("bma-plugin-web_search-ab12cd34", s, s.Volumes)
+	args := dockerRunArgsShared("web_search", "bma-plugin-web_search-ab12cd34", s, s.Volumes)
 	want := []string{
 		"run", "-d", "--name", "bma-plugin-web_search-ab12cd34",
 		"--add-host", "host.docker.internal:host-gateway",
+		"--label", "com.docker.compose.project=bma",
+		"--label", "com.docker.compose.service=web_search",
 		"-p", "6081:6081",
 		"-v", "D:/data/workspace:/workspace",
 		"-e", "FIRECRAWL_API_KEY=self-hosted",
-		"--entrypoint", "sleep", "bma/firecrawl-mcp:local", "infinity",
+		"--entrypoint", "sleep", "bma/test-mcp:local", "infinity",
 	}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("args =\n%q\nwant\n%q", args, want)
@@ -123,9 +127,10 @@ func TestDockerRunArgsShared(t *testing.T) {
 		ContainerEnv:        map[string]string{"K": "container", "BMA_KEEPER": "1"},
 		ContainerEntrypoint: []string{"/entrypoint.sh"},
 	}
-	args2 := dockerRunArgsShared("c", s2, nil)
+	args2 := dockerRunArgsShared("computer_use", "c", s2, nil)
 	got := strings.Join(args2, " ")
 	wantStr := "run -d --name c --add-host host.docker.internal:host-gateway " +
+		"--label com.docker.compose.project=bma --label com.docker.compose.service=computer_use " +
 		"-e BMA_KEEPER=1 -e K=env --entrypoint /entrypoint.sh bma/computer-use-mcp:local"
 	if got != wantStr {
 		t.Errorf("args = %q, want %q", got, wantStr)

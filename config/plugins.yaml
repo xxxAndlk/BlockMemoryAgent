@@ -36,28 +36,17 @@ plugins:
   # 联网搜索：firecrawl 官方云端托管 MCP（免 key 会话）。
   # 2026-09-15 切换：本地自托管栈判退——实测本地 search 返回空结果（data:{}，CN 网络
   # 到 Google/DDG 搜索源不可达），且全栈常驻约 3.5GB 内存；云端实测 search 1-2s 出真
-  # 结果、scrape 0.9-12s、连发 6 次无限速。本地栈已撤（compose 文件与镜像保留在
-  # docker/docker-compose.firecrawl.yml，需要时可按下方"备选 1"重新拉起）。
+  # 结果、scrape 0.9-12s、连发 6 次无限速。本地栈已撤（compose 文件与镜像已删除）。
   # 免 key 会话仅暴露 firecrawl_search / firecrawl_scrape / firecrawl_parse（有限速）；
   # 要 crawl/map/agent 等全工具与更高配额：firecrawl.dev 注册取 key 走 stdio npx
-  #（需 mcpbridge 增加自定义 header 支持才能走 http 带 Authorization，见备选 2）。
+  #（需 mcpbridge 增加自定义 header 支持才能走 http 带 Authorization，见下方备选）。
   web_search:
     kind: mcp
     enabled: true
     settings:
       transport: http
       url: https://mcp.firecrawl.dev/v2/mcp
-      # 备选 1（本地自托管栈，数据不出本机；前置：docker compose -f
-      # docker/docker-compose.firecrawl.yml up -d + docker build -t bma/firecrawl-mcp:local
-      # docker/firecrawl-mcp）：
-      # transport: docker
-      # image: bma/firecrawl-mcp:local
-      # shared: true
-      # exec_command: ["firecrawl-mcp"]
-      # env:
-      #   FIRECRAWL_API_URL: http://host.docker.internal:3002
-      #   FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:self-hosted}
-      # 备选 2（云端 API + key，全工具；FIRECRAWL_API_KEY 配在 .env）：
+      # 备选（云端 API + key，全工具；FIRECRAWL_API_KEY 配在 .env）：
       # transport: stdio
       # command: npx
       # args: ["-y", "firecrawl-mcp"]
@@ -148,69 +137,10 @@ plugins:
       # 真机操作一律在会话工作目录语义之外(作用于桌面),工具描述尾部明示风险。
       tool_description_suffix: "注意:本工具直接操作宿主机真实桌面(非沙箱):截图为真机屏幕,鼠标键盘事件作用于真机前台窗口。文件落盘仍用内置 WriteFile/EditFile(会话工作目录),不要用本工具的 filesystem 能力落盘任务产物。"
 
-  # Open Design：UI 设计台（开源 Claude Design 替代品，github.com/nexu-io/open-design）。
-  # kind=service：Docker 长驻 HTTP 服务（非 MCP，不注入工具），生命周期与 mcp 插件
-  # 一样经 /api/plugins/enable|disable|reload 热插拔（docker run -d / rm -f + 健康探针）。
-  # 官方发布镜像 ghcr.io/nexu-io/od（Alpine 单容器，daemon 同端口服务 API + Web UI），
-  # 实际使用本地补丁镜像 bma/open-design-daemon:local（docker/open-design-daemon：
-  # 仅修 volcengine 生图 size 1024x1024→2048x2048，适配 Agent Plan seedream-5.0-lite）。
-  # 访问入口：http://localhost:7456（Basic 认证：用户名 open-design，密码 = OD_API_TOKEN）。
-  # 前置：docker build -t bma/open-design-daemon:local docker/open-design-daemon
-  # （或 docker/bma-plugin.sh 一把梭）；.env 配 OD_API_TOKEN（openssl rand -hex 32）。
-  # 同机多实例：service 插件容器名确定性（bma-plugin-svc-<id>），Start 复用已在
-  # 运行的容器——第二个实例不再端口冲突（2026-09-01 起，原 pid 后缀方案已废弃）。
-  open_design:
-    kind: service
-    enabled: true
-    settings:
-      image: bma/open-design-daemon:local
-      ports: ["127.0.0.1:7456:7456"]
-      volumes: ["bma-open-design-data:/app/.od"]
-      env:
-        OD_API_TOKEN: ${OD_API_TOKEN:}
-        # ---- 媒体生成统一入口（6 个值全在 .env「媒体生成」块，见 .env.example）----
-        # 生图 KEY：同时点亮 volcengine 与 custom-image 两个 provider 槽位
-        #（Agent 生图实际走 custom-image = OpenAI 兼容 /images/generations，
-        #  baseUrl/model 由下方 sync_files 落盘 media-config.json——daemon 对
-        #  这两项无 env 覆盖）。
-        ARK_API_KEY: ${IMAGE_KEY:}
-        OD_CUSTOM_IMAGE_API_KEY: ${IMAGE_KEY:}
-        # 生视频 KEY：OpenAI /videos 协议网关（aihubmix provider 槽位，配
-        # VIDEO_PROVIDER=openai）。若切 VIDEO_PROVIDER=volcengine（方舟 tasks
-        # 协议），视频 key 复用 ARK_API_KEY（daemon 上游限制：volcengine 槽位
-        # 无独立 key），届时 VIDEO_KEY 不生效。
-        OD_AIHUBMIX_API_KEY: ${VIDEO_KEY:}
-        # 方舟自定义接入点映射（仅 provider=volcengine 且用接入点 id 时需要，
-        # daemon 渲染前改写 wire 模型名）：
-        # OD_MEDIA_MODEL_ALIASES: {"doubao-seedance-2-0-fast-260128":"ep-xxx"}
-      requires_env: ["OD_API_TOKEN"]
-      url: http://localhost:7456
-      health_url: http://localhost:7456/api/health
-      # 生图/生视频 baseUrl + 模型：daemon 对这些项无环境变量覆盖（env 只覆盖
-      # apiKey），故经 sync_files 在容器健康就绪后深合并写入容器内
-      # /app/.od/media-config.json（volume 持久）。变量未填时展开为空串、该键
-      # 跳过（provider 保持 daemon 缺省/容器内旧值）。6 个值统一在 .env 维护。
-      sync_files:
-        - path: /app/.od/media-config.json
-          json:
-            providers:
-              # 生图（custom-image provider = OpenAI 兼容 /images/generations
-              # 直调；model = 发给网关的真实模型名）
-              custom-image:
-                baseUrl: ${IMAGE_URL:}
-                model: ${IMAGE_MODEL:}
-              # 生视频（OpenAI /videos 协议，VIDEO_PROVIDER=openai 时用；模型名任意）
-              aihubmix:
-                baseUrl: ${VIDEO_URL:}
-                model: ${VIDEO_MODEL:}
-              # 生视频（方舟 tasks 协议，VIDEO_PROVIDER=volcengine 时用；baseUrl
-              # 缺省官方地址，仅自定义网关时填 VIDEO_URL 覆盖）
-              volcengine:
-                baseUrl: ${VIDEO_URL:}
-      # 注：service 插件不注入工具也不解析 roles（Tools 恒空），角色门控无意义。
-
   # ui_design：Agent 画图工具（kind: mcp，2026-08-17 新增）。
-  # open_design 守护进程（上方 service 插件）无 MCP 端点，本插件是其 REST API 的
+  # open_design 守护进程（2026-10-10 起由 docker compose 统一管理，见
+  # docker/docker-compose.yml open_design 服务，安装时 up -d 一次、App 只连接）
+  # 无 MCP 端点，本插件是其 REST API 的
   # stdio MCP 桥（docker/open-design-mcp）：od_image_generate 生成图片（单张 prompt /
   # 批量 prompts 数组桥内顺序串行）并落盘 volumes 映射的宿主目录（返回 workspace
   # 相对路径供 HTML/CSS 引用），od_image_list 列历史产物。

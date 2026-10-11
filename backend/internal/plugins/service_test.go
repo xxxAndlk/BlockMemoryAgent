@@ -151,9 +151,10 @@ func TestServiceRunArgs(t *testing.T) {
 		"volumes": []any{"data:/app/.od"},
 		"args":    []any{"--no-open"},
 	})
-	args := serviceRunArgs("bma-plugin-svc-x-1", s)
+	args := serviceRunArgs("x", "bma-plugin-svc-x-1", s)
 	got := strings.Join(args, " ")
 	want := "run -d --name bma-plugin-svc-x-1 --add-host host.docker.internal:host-gateway " +
+		"--label com.docker.compose.project=bma --label com.docker.compose.service=x " +
 		"-p 127.0.0.1:7456:7456 -v data:/app/.od -e A=1 -e B=2 img:tag --no-open"
 	if got != want {
 		t.Fatalf("docker run 参数不符:\n got: %s\nwant: %s", got, want)

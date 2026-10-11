@@ -28,7 +28,7 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 - **角色工具白名单**：`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集；MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet` 防越位，DomainAgent 开放完整权限承担上下文采集 + 任务拆分 + 派发执行
 - **经验技能自进化与「技能携带工具」**：会话结束由 SessionEvolver 沉淀经验技能（写入前轻量模型评分门禁 <3 拒收、title+when_to_use 向量近重复 LLM-judge 合并、每日自动整理）；目录式落盘 `<name>/SKILL.md + scripts/`，会话中跑通的自写脚本可固化为技能配套工具（≤60 行 + 写入前冒烟执行），`load_skill` 注入「配套工具」段、沙箱放行执行
 - **工作区文件树与全屏预览（Kimi Work 形态）**：会话侧栏整棵工作区目录树（实时筛选/tab 多开/面包屑跳转/在线编辑 Ctrl+S 保存带 mtime 409 冲突与 .bak），消息流统一文件卡片 + 全局 FileViewer 全屏预览（图片画廊/PDF/视频 Range 流/Markdown/代码高亮/CSV/xlsx/ipynb），支持「在文件夹中显示」与本机编辑器扫码打开（VS Code/Cursor/记事本等）
-- **热插拔插件系统**（[设计文档](doc/设计文档_插件范式.md)）：MCP 外部插件（stdio 子进程 / streamable HTTP / docker 容器）、Claude/Codex 插件包（`.mcp.json` + `SKILL.md`）与 Docker 长驻服务统一挂进 `tool.Registry` 或生命周期管理，运行中 enable/disable 下一轮迭代即生效；三个初始插件全部容器化：`web_search`（firecrawl 自托管栈，默认开）、`computer_use`（Xvfb 虚拟桌面，默认关，全部工具接审批守卫链）、`open_design`（画图设计台 service 插件，默认关）；管理 API：`/api/plugins`（list/get/enable/disable/reload），配置 `config/plugins.yaml` + `config/plugins.d/`，部署见下文「插件（Docker 部署）」
+- **热插拔插件系统**（[设计文档](doc/设计文档_插件范式.md)）：MCP 外部插件（stdio 子进程 / streamable HTTP / docker 容器）、Claude/Codex 插件包（`.mcp.json` + `SKILL.md`）与 Docker 长驻服务统一挂进 `tool.Registry` 或生命周期管理，运行中 enable/disable 下一轮迭代即生效；初始插件：`web_search`（firecrawl 官方云端免 key 端点，默认开）、`computer_use`（Xvfb 虚拟桌面容器，默认关，全部工具接审批守卫链）、`open_design`（画图设计台，随 `docker/docker-compose.yml` 统一启停）；管理 API：`/api/plugins`（list/get/enable/disable/reload），配置 `config/plugins.yaml` + `config/plugins.d/`，部署见下文「插件（Docker 部署）」
 - **14 个内置工具**：文件/命令（ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles）、HTTP（HTTPGet/HTTPPost）、Git（GitDiff/GitStatus/GitLog/GitBlame）、共享内存（WriteSharedMemory）、Agent 通信（call_sub_agent/send_message），统一经沙箱守卫
 - **两段事件流记忆**：`Write` 追加事件（tool_call / call_sub_agent / sub_agent_summary / answer）并落 `agent_events` 表，`Assemble` 在 LLM 调用前注入最近 N 条（超 8 条经轻量模型压成 ≤200 字摘要，失败降级 raw join）；重启后懒加载恢复；无 RAG 自动注入（块记忆经 `SearchBlockMemory` 工具按需调用）
 - **会话持久化，默认全新启动**：会话历史（goal/summary/工具结果）、主对话完整消息历史（`agent_messages`）与事件流写入 PostgreSQL；每次启动默认是全新会话列表，`agent.restore_sessions: true` 时才恢复最近 50 个会话到内存（含完整对话历史，续跑不再失忆）
@@ -201,26 +201,26 @@ flags：`-config config/config.yaml -roles config/roles.yaml -env .env -soul con
 
 ### 插件（Docker 部署）
 
-三个初始插件全部容器化运行，新机器首次部署：
+web_search 走 firecrawl 官方云端免 key 端点，无本地数据面；其余插件的桥镜像容器化运行，open_design 设计台并入统一 compose。新机器首次部署：
 
 ```bash
-make plugins-up      # 联网搜索数据面：firecrawl 自托管栈（api :3002，免 API Key）
-make plugins-build   # 构建/拉取三个插件镜像：
-                     #   bma/firecrawl-mcp:local（web_search，本地构建）
+make plugins-build   # 构建本地插件镜像：
                      #   bma/computer-use-mcp:local（computer_use，本地构建，含 Xvfb/noVNC 虚拟桌面）
-                     #   ghcr.io/nexu-io/od:latest（open_design 画图台，直接拉取）
+                     #   bma/open-design-mcp:local / bma/ui-preview-mcp:local（ui_design / ui_preview 桥）
+make up              # 起 PostgreSQL + Redis + open_design 设计台（compose project bma，
+                     # 容器 bma-open-design，127.0.0.1:7456；需先在 .env 填 OD_API_TOKEN）
 ```
 
 启用方式（`config/plugins.yaml`）：
 
-- **web_search**：默认 `enabled: true`，后端启动即自动起容器可用（依赖 firecrawl 栈已起）。
-- **computer_use** / **open_design**：默认 `enabled: false`，改配置为 `true` 随启动自动起，或运行时热启用 `POST /api/plugins/computer_use/enable`、`POST /api/plugins/open_design/enable`。open_design 需先在 `.env` 填 `OD_API_TOKEN`。
+- **web_search**：默认 `enabled: true`，http transport 直连官方云端 `https://mcp.firecrawl.dev/v2/mcp`（免 key，仅 search/scrape/parse 三工具）；配 `FIRECRAWL_API_KEY` 后可按 plugins.yaml 注释改走备选 2（stdio `npx firecrawl-mcp`）解锁全工具与更高配额。
+- **computer_use** 等其余插件：默认 `enabled: false`，改配置为 `true` 随启动自动起，或运行时热启用 `POST /api/plugins/<id>/enable`。
+- **open_design**：不再是后端拉起的插件，随 `docker/docker-compose.yml` 统一启停（`make up`），UI：`http://localhost:7456`（Basic 认证 `open-design` / `OD_API_TOKEN`）。
 
 入口与验证：
 
-- `GET /api/plugins` 查看插件状态；open_design UI：`http://localhost:7456`（Basic 认证 `open-design` / `OD_API_TOKEN`）；computer_use 虚拟桌面观察口：`http://localhost:6081`（noVNC，操作发生在容器内 Xvfb 虚拟桌面，不控制宿主机）。
-- 同机多个 BMA 实例（如 tui.exe + headless 后端）不要同时 enable 带端口映射的同一插件（7456/6081 宿主端口冲突）。
-- `docker-compose.firecrawl.yml` 中 redis/rabbitmq 走 `docker.m.daocloud.io` 加速前缀（Docker Hub 不可达环境的 workaround）；网络正常时可去掉前缀。
+- `GET /api/plugins` 查看插件状态；computer_use 虚拟桌面观察口：`http://localhost:6081`（noVNC，操作发生在容器内 Xvfb 虚拟桌面，不控制宿主机）。
+- 同机多个 BMA 实例（如 tui.exe + headless 后端）不要同时 enable 带端口映射的同一插件（6081 宿主端口冲突）。
 
 ---
 

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # bma-plugin：BMA 插件 docker 一键集成命令。
 # 执行一次即可备齐 config/plugins.yaml 全部插件的 docker 依赖：
-#   本地构建 4 个镜像（3 个 MCP 桥 bma/*:local + open_design 补丁守护进程
-#   bma/open-design-daemon:local，docker/*/Dockerfile）。
-# 注意：MCP stdio 容器（computer_use/ui_design/ui_preview）与 open_design service
-# 容器由后端在插件 enable 时按需拉起/回收（/api/plugins/enable|disable|reload），
+#   本地构建 3 个 MCP 桥镜像（bma/*:local，docker/*/Dockerfile）。
+# 注意：MCP stdio 容器（computer_use/ui_design/ui_preview）由后端在插件
+# enable 时按需拉起/回收（/api/plugins/enable|disable|reload），
 # 本命令只负责"镜像就绪"。
+# open_design 长驻服务已迁移为 docker compose 统一管理
+#（docker/docker-compose.yml open_design 服务，up -d 时缺镜像自动构建），
+# 不再由本脚本构建、也不再经后端插件按需拉起。
 # web_search 已切 firecrawl 官方云端（config/plugins.yaml，http transport），
-# 不再构建/拉起本地 firecrawl 栈；需要回退自托管时按 plugins.yaml 备选 1 注释
-# 手动 docker compose -f docker/docker-compose.firecrawl.yml up -d + 自 build。
+# 不再构建/拉起本地 firecrawl 栈。
 #
 # 用法：
 #   docker/bma-plugin.sh           # = all（build + status）
@@ -25,13 +26,10 @@ BUILD_IMAGES=(
   "bma/computer-use-mcp:local|docker/computer-use"
   "bma/open-design-mcp:local|docker/open-design-mcp"
   "bma/ui-preview-mcp:local|docker/ui-preview-mcp"
-  # open_design service（kind: service，:7456）：上游 ghcr.io/nexu-io/od 的
-  # 本地补丁镜像（volcengine 生图 size 适配 Agent Plan），FROM 自动拉上游。
-  "bma/open-design-daemon:local|docker/open-design-daemon"
 )
 
 cmd_build() {
-  echo "=== 构建插件镜像（MCP 桥 + open_design 补丁守护进程） ==="
+  echo "=== 构建插件镜像（MCP 桥） ==="
   for entry in "${BUILD_IMAGES[@]}"; do
     tag="${entry%%|*}"; dir="${entry##*|}"
     echo "--- docker build -t $tag $dir"
@@ -42,10 +40,13 @@ cmd_build() {
 cmd_status() {
   echo "=== 插件镜像 ==="
   docker images --format '{{.Repository}}:{{.Tag}}  {{.Size}}' \
-    | grep -E '^(bma/|ghcr\.io/nexu-io/od)' || echo "(无 bma/* 镜像，先执行 build)"
+    | grep -E '^bma/' || echo "(无 bma/* 镜像，先执行 build)"
   echo
-  echo "=== 后端拉起的插件容器（bma-plugin-<id>-<pid> / bma-plugin-svc-<id>-<pid>） ==="
+  echo "=== 后端拉起的插件容器（bma-plugin-<id>[-<目录哈希>]） ==="
   docker ps --filter "name=bma-plugin-" --format '{{.Names}}  {{.Image}}  {{.Status}}'
+  echo
+  echo "=== compose 统一管理的长驻服务（open_design） ==="
+  docker ps --filter "name=bma-open-design" --format '{{.Names}}  {{.Image}}  {{.Status}}'
 }
 
 case "${1:-all}" in

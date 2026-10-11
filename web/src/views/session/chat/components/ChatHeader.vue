@@ -195,7 +195,10 @@ const liveBadges = computed(() => {
           </div>
         </div>
       </el-popover>
-      <el-button v-if="(session?.status === 'running' || session?.status === 'awaiting_child') && !session?.destroy_at" size="small"
+      <!-- 终止：待澄清（ask_user 挂起）也必须可终止——后端 cancel 明确支持
+           awaiting_clarify（ctx 取消自动解除挂起），这是放弃当前问题的唯一逃生口。
+           软停止/中断不对该态开放（后端拒绝 / 有双开 ReAct 循环风险）。 -->
+      <el-button v-if="(session?.status === 'running' || session?.status === 'awaiting_child' || session?.status === 'awaiting_clarify') && !session?.destroy_at" size="small"
                  class="!bg-red-50 !border-red-300 !text-red-700 dark:!bg-red-900/30 dark:!border-red-700/40 dark:!text-red-400 shrink-0"
                  @click="emit('cancel')">
         <el-icon class="mr-1"><CircleClose /></el-icon>终止

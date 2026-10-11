@@ -6,10 +6,15 @@
 # InvalidParameter 拒绝。补丁把 renderVolcengineImage 与 renderCustomOpenAIImage
 # 两处的 size 钉为 2048x2048，其余与上游一致。
 #
-# 构建：docker build -t bma/open-design-daemon:local docker/open-design-daemon
-# （或一把梭 docker/bma-plugin.sh）。上游镜像更新后若补丁锚点失效，build 会
+# 构建：docker compose -f docker/docker-compose.yml up -d open_design
+# （compose 缺镜像自动构建；或手动 docker build -t bma/open-design-daemon:local
+# docker/open-design-daemon）。上游镜像更新后若补丁锚点失效，build 会
 # 直接失败（锚点校验），届时人工复核 patch-image-size.js。
 FROM ghcr.io/nexu-io/od:latest
 COPY patch-image-size.js /tmp/patch-image-size.js
 # 注：不 rm 补丁脚本——镜像以非 root 运行，/tmp sticky 位下删 root 属主文件会失败。
 RUN node /tmp/patch-image-size.js
+# 入口脚本：启动前深合并 media-config.json + env 改名映射，再 exec 原命令。
+# 基础镜像 USER 为 open-design（非 root），COPY --chmod 避免 RUN chmod 权限失败。
+COPY --chmod=0755 entrypoint.sh /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

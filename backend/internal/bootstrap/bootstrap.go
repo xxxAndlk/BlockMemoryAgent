@@ -926,14 +926,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 第十六步半：插件系统（设计文档《插件系统设计 v2》）。
 	// 热插拔插件：MCP 桥（web_search / computer_use 等）+ bundle 外部插件包。
 	// plugins.yaml 与 config.yaml 同目录；plugins.d/ 亦与配置同目录（外部插件包目录）。
-	// 装配：manager → 注入 mcp 工厂 → Load（自动 enable enabled:true）→ 注入角色可见性回调。
-	// Load/Reload 失败不阻断启动（插件系统为可选能力，配置损坏仅记录）。
+	// 装配：manager → 注入 mcp 工厂 → Load（异步预热）→ 注入角色可见性回调。
+	// Load 开异步预热（WithAsyncEnable）：实例表同步建好即返回，enabled 插件的
+	// enable（docker 容器拉起/MCP 握手，可能耗时几十秒）在后台并行执行，不拖慢
+	// CLI 启动；单个插件失败仅记日志，预热完成打汇总日志。Load/Reload 配置损坏
+	// 不阻断启动（插件系统为可选能力，仅记录）。
 	pluginManager := plugins.NewManager(toolRegistry,
 		plugins.WithLogger(slog.Default()),
 		plugins.WithConfigDir(filepath.Dir(paths.ConfigPath)),
 		plugins.WithBundlesDir(filepath.Join(filepath.Dir(paths.ConfigPath), "plugins.d")),
 		plugins.WithSkillPool(skillPool),
 		plugins.WithWorkDir(workDir),
+		plugins.WithAsyncEnable(true),
 		plugins.WithMCPFactory(func(id string, settings map[string]any, deps plugins.Deps) (plugins.Plugin, error) {
 			return mcpbridge.NewFromSettings(id, settings, deps)
 		}),
@@ -942,11 +946,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		log.Printf("[bootstrap] plugins load failed (non-fatal): %v", err)
 	}
 	// 角色可见性：meta/domain/动态角色按 Manifest.Roles 判定插件工具是否可见（§4.3）。
+	// 惰性回调（会话/调用期求值），预热窗口内未就绪的插件工具自然不可见，与降级语义一致。
 	agentSvc.SetPluginVisibility(pluginManager.ToolVisibility)
 	// 顶层必备插件工具（plugins.yaml settings.top_level）：fast/daily 会话启动时预挂到
 	// 顶层 Agent scope（agent 包据此调 tool.Registry.MountPreApprovedForScope），
 	// 使顶层对接用户直接具备联网搜索等能力；子 Agent 不预挂。
-	agentSvc.SetTopLevelToolsProvider(pluginManager.TopLevelTools)
+	// 预热窗口内先 WaitWarmup 等首批插件就绪再取名清单：MCP 工具名只有连接后
+	// ListTools 才可知（配置/manifest 无静态声明），不等待会让窗口内新建的会话
+	// 整个生命周期缺席预挂工具——等待语义对齐旧同步 Load（只是从启动期移到首个会话期）。
+	agentSvc.SetTopLevelToolsProvider(func() []string {
+		pluginManager.WaitWarmup()
+		return pluginManager.TopLevelTools()
+	})
 	subAgentDispatcher.WithPluginVisibility(pluginManager.ToolVisibility)
 	// 会话档位只读回调（TODO #14 T22）：热驻槽 enterIdle 固化档位 + 隐式复用档位守卫。
 	subAgentDispatcher.WithSessionGearResolver(agentSvc.SessionGear)

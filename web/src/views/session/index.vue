@@ -564,8 +564,10 @@ async function handleCancel() {
   if (!activeSession.value) return
   try {
     await ElMessageBox.confirm(
-      '硬终止会立即取消全部子 Agent 与当前任务，且不可续跑。建议优先使用软停止。',
-      '确认硬终止？',
+      activeSession.value.status === 'awaiting_clarify'
+        ? '终止后当前澄清问题作废，会话立即结束且不可续跑。'
+        : '硬终止会立即取消全部子 Agent 与当前任务，且不可续跑。建议优先使用软停止。',
+      activeSession.value.status === 'awaiting_clarify' ? '放弃回答并终止？' : '确认硬终止？',
       { confirmButtonText: '硬终止', cancelButtonText: '取消', type: 'warning' }
     )
   } catch {

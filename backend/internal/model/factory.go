@@ -726,6 +726,8 @@ const probePrompt = "ping"
 //   - 按 (provider,model,apikey,baseURL) 去重：roles.yaml 多角色常共享同一后端，去重后仅探测一次
 //   - APIKey 为空视为未配置，加入失败列表，不允许 Mock/无 key 跳过启动
 //   - 每个唯一后端用 probeLLM 探测（3 次重试，短超时）
+//   - 两阶段执行：第一阶段串行完成角色遍历/配置解析/去重（纯内存操作）；
+//     第二阶段对每个唯一后端并行探测（每后端一个 goroutine），大幅缩短启动时间
 //
 // 参数：
 //   - ctx: 上下文
@@ -734,7 +736,9 @@ const probePrompt = "ping"
 //   - error: 任一角色不可达或未配置时返回聚合错误（列出全部失败角色），全部可达则返回 nil
 //
 // 副作用：可能触发 GetModel 缓存填充（与 WarmUp 重叠，幂等）。
-// 并发安全：GetModel 内部锁保护。
+// 并发安全：第二阶段并行探测中，每个 goroutine 持有独立的探测客户端
+// （NewBladesClient 每次调用新建 provider，无共享可变状态），
+// 失败结果通过互斥锁保护的 failed slice 汇总。
 func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 	// 候选角色列表：三个内置角色 + 全部固定角色
 	roles := []string{"meta", "domain", "lightweight"}
@@ -745,10 +749,18 @@ func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 		}
 	}
 
-	// 按 (provider,model,key,baseURL) 去重，避免同一后端重复探测
-	seen := make(map[string]bool)
 	// 收集所有失败角色的描述
 	var failed []string
+
+	// 第一阶段（串行，纯内存操作）：遍历角色、解析配置、按后端去重，
+	// 收集每个唯一后端对应的 roleID 与 cfg，留待第二阶段并行探测。
+	seen := make(map[string]bool)
+	// 待探测的唯一后端列表
+	type probeTarget struct {
+		roleID string
+		cfg    types.AgentModelConfig
+	}
+	var targets []probeTarget
 	// 遍历每个候选角色
 	for _, roleID := range roles {
 		// 解析该角色的模型配置（含注册表合并；model_ref 缺失即失败）
@@ -765,39 +777,56 @@ func (f *ModelFactory) VerifyConnectivity(ctx context.Context) error {
 		}
 		// 用 \x00 拼接配置字段作为去重 key
 		key := cfg.Provider + "\x00" + cfg.Model + "\x00" + cfg.APIKey + "\x00" + cfg.BaseURL
-		// 若同一后端已探测，则跳过
+		// 若同一后端已加入待探测列表，则跳过
 		if seen[key] {
 			continue
 		}
-		// 标记该后端已探测
+		// 标记该后端已收录
 		seen[key] = true
-
-		// 构造一个 MaxTokens=1 的临时探测客户端：连通性探测只需模型"能应答"，
-		// 用极小输出预算避免推理类模型（如 deepseek-v4-flash）为 "ping" 生成大段
-		// reasoning 而拖慢/超时启动校验。正常 LLM 在 ~1s 内返回；错误配置（key/
-		// 端点/模型名）通常在 <1s 内返回 4xx，仍能快速失败。
-		probeCfg := cfg
-		probeCfg.MaxTokens = 1
-		// 创建临时探测客户端
-		probeClient, err := NewBladesClient(ctx, probeCfg)
-		if err != nil {
-			// 构造失败计入失败列表
-			failed = append(failed, fmt.Sprintf("%s (构造失败: %v)", roleID, err))
-			// 继续探测下一个角色
-			continue
-		}
-		// 探测：整体 150s（容纳 3 次重试 ×30s 单次 + 退避 + 慢网关冷启动），单次 30s
-		// deepseek-v4-flash 等推理类模型首包冷启动可能 >12s；gemini-flash 经
-		// gemini-webapi 网关单呼实测 ~10s（2026-09-08），原 60s 总窗会截断重试链
-		probeCtx, cancel := context.WithTimeout(ctx, 150*time.Second)
-		// 发起最小化调用验证连通性
-		if err := probeLLM(probeCtx, probeClient); err != nil {
-			// 探测失败，记录失败原因
-			failed = append(failed, fmt.Sprintf("%s (model=%s: %v)", roleID, cfg.Model, err))
-		}
-		// 释放探测上下文
-		cancel()
+		targets = append(targets, probeTarget{roleID: roleID, cfg: cfg})
 	}
+
+	// 第二阶段（并行）：对每个唯一后端各起一个 goroutine 执行探测，
+	// 探测耗时从"各后端串行累加"降为"最慢单个后端"，缩短启动时间。
+	var wg sync.WaitGroup
+	// 保护并行追加 failed 的互斥锁
+	var mu sync.Mutex
+	for _, t := range targets {
+		wg.Add(1)
+		go func(t probeTarget) {
+			defer wg.Done()
+			// 构造一个 MaxTokens=1 的临时探测客户端：连通性探测只需模型"能应答"，
+			// 用极小输出预算避免推理类模型（如 deepseek-v4-flash）为 "ping" 生成大段
+			// reasoning 而拖慢/超时启动校验。正常 LLM 在 ~1s 内返回；错误配置（key/
+			// 端点/模型名）通常在 <1s 内返回 4xx，仍能快速失败。
+			probeCfg := t.cfg
+			probeCfg.MaxTokens = 1
+			// 创建临时探测客户端
+			probeClient, err := NewBladesClient(ctx, probeCfg)
+			if err != nil {
+				// 构造失败计入失败列表
+				mu.Lock()
+				failed = append(failed, fmt.Sprintf("%s (构造失败: %v)", t.roleID, err))
+				mu.Unlock()
+				return
+			}
+			// 探测：整体 150s（容纳 3 次重试 ×30s 单次 + 退避 + 慢网关冷启动），单次 30s
+			// deepseek-v4-flash 等推理类模型首包冷启动可能 >12s；gemini-flash 经
+			// gemini-webapi 网关单呼实测 ~10s（2026-09-08），原 60s 总窗会截断重试链
+			probeCtx, cancel := context.WithTimeout(ctx, 150*time.Second)
+			// 发起最小化调用验证连通性
+			if err := probeLLM(probeCtx, probeClient); err != nil {
+				// 探测失败，记录失败原因
+				mu.Lock()
+				failed = append(failed, fmt.Sprintf("%s (model=%s: %v)", t.roleID, t.cfg.Model, err))
+				mu.Unlock()
+			}
+			// 释放探测上下文
+			cancel()
+		}(t)
+	}
+	// 等待全部探测 goroutine 结束
+	wg.Wait()
 
 	// 若存在失败角色，返回聚合错误
 	if len(failed) > 0 {
