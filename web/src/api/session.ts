@@ -15,7 +15,7 @@ export function listSessions(limit?: number): Promise<SessionSummary[]> {
   return fetchJson(`/sessions${limit ? `?limit=${limit}` : ''}`)
 }
 
-export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking): Promise<Session> {
+export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking, plugins?: string[]): Promise<Session> {
   const body: Record<string, unknown> = { goal }
   if (images?.length) body.images = images
   if (workDir) body.work_dir = workDir
@@ -23,6 +23,8 @@ export function createSession(goal: string, images?: WireImage[], workDir?: stri
   if (gear) body.gear = gear
   // 创建时选思考强度（2026-09-16）：空串 = 跟随角色默认，省略字段。
   if (thinking) body.thinking = thinking
+  // 创建时指定插件（KIMI 式插件选择）：空数组 = 不指定（模型自行判断），省略字段。
+  if (plugins?.length) body.plugins = plugins
   return fetchJson('/sessions', { method: 'POST', body: JSON.stringify(body) })
 }
 
@@ -263,6 +265,17 @@ export function setSessionThinking(id: string, thinking: SessionThinking): Promi
   return fetchJson(`/sessions/${id}/thinking`, {
     method: 'POST',
     body: JSON.stringify({ thinking }),
+  })
+}
+
+/**
+ * 切换会话级指定插件（KIMI 式插件选择）：选中 = 优先/强制使用（工具预挂 + 提示词强约束），
+ * 空数组 = 清空（模型自行判断）。即时生效，下一轮起跑按新集合构建。
+ */
+export function setSessionPlugins(id: string, plugins: string[]): Promise<{ session_id: string; plugins: string[] }> {
+  return fetchJson(`/sessions/${id}/plugins`, {
+    method: 'POST',
+    body: JSON.stringify({ plugins }),
   })
 }
 

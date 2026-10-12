@@ -958,6 +958,30 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		pluginManager.WaitWarmup()
 		return pluginManager.TopLevelTools()
 	})
+	// 会话级指定插件解析器（KIMI 式插件选择）：把用户勾选的插件 ID 解析为
+	// 展示名 + 已注册工具名（带 <pluginID>__ 前缀）；仅 enabled 且 running 的插件
+	// 有效，其余（不存在/未启用/未运行/预热中）归入 invalid 由调用方处理。
+	// 惰性求值（勾选/起跑期调用），同样先 WaitWarmup 等首批插件就绪再判定。
+	agentSvc.SetPluginToolsResolver(func(ids []string) (valid []agent.PinnedPluginInfo, invalid []string) {
+		pluginManager.WaitWarmup()
+		infos := make(map[string]plugins.Info, len(ids))
+		for _, info := range pluginManager.List() {
+			infos[info.ID] = info
+		}
+		for _, id := range ids {
+			info, ok := infos[id]
+			if !ok || !info.Enabled || info.State != plugins.StateRunning || len(info.Tools) == 0 {
+				invalid = append(invalid, id)
+				continue
+			}
+			name := info.Name
+			if name == "" {
+				name = info.ID
+			}
+			valid = append(valid, agent.PinnedPluginInfo{ID: info.ID, Name: name, Tools: info.Tools})
+		}
+		return valid, invalid
+	})
 	subAgentDispatcher.WithPluginVisibility(pluginManager.ToolVisibility)
 	// 会话档位只读回调（TODO #14 T22）：热驻槽 enterIdle 固化档位 + 隐式复用档位守卫。
 	subAgentDispatcher.WithSessionGearResolver(agentSvc.SessionGear)

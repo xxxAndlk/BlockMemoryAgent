@@ -188,6 +188,10 @@ type ReactService struct {
 	// 快速/日常档会话启动时把返回的工具名预挂到顶层 Agent scope（=sessionID），
 	// 使顶层对接用户即具备联网搜索等能力；子 Agent scope 不预挂。nil 时零行为变化。
 	topLevelTools func() []string
+	// pluginToolsResolver 指定插件解析器（KIMI 式插件选择，bootstrap 注入 plugins.Manager
+	// 实现）：输入插件 ID 列表，返回有效插件（展示名+已注册工具名）与无效 ID
+	//（不存在/未启用/未运行）。nil 时指定插件功能不可用（Set 报错/Create 丢弃）。
+	pluginToolsResolver func(ids []string) (valid []PinnedPluginInfo, invalid []string)
 	// activityPinger 等待用户答复期间的心跳保活回调（bootstrap 注入
 	// subagent.Dispatcher.PingActivity）：审批/提问阻塞时周期性刷新子 Agent 活动时间，
 	// 防止心跳巡检把"等用户操作"误判假死 kill（实证 2026-08-18：三次误杀均卡在
@@ -402,6 +406,42 @@ func (s *ReactService) SetPluginVisibility(fn ToolVisibilityFunc) {
 // plugins.Manager.TopLevelTools）；传 nil 关闭预挂载。
 func (s *ReactService) SetTopLevelToolsProvider(fn func() []string) {
 	s.topLevelTools = fn
+}
+
+// PinnedPluginInfo 是会话级指定插件的解析结果元素（resolver 返回值，KIMI 式插件选择）。
+type PinnedPluginInfo struct {
+	ID    string   // 插件 ID
+	Name  string   // 展示名（提示块与事件文案用）
+	Tools []string // 已注册工具名（带 <pluginID>__ 前缀）
+}
+
+// SetPluginToolsResolver 注入指定插件解析器（bootstrap 用 plugins.Manager 实现）；
+// 传 nil 关闭会话级指定插件功能（Set 报错、Create 丢弃、提示块零注入）。
+func (s *ReactService) SetPluginToolsResolver(fn func(ids []string) (valid []PinnedPluginInfo, invalid []string)) {
+	s.pluginToolsResolver = fn
+}
+
+// resolvePinnedPlugins 经 resolver 解析插件 ID 列表；resolver 未接线时全部视为无效。
+func (s *ReactService) resolvePinnedPlugins(ids []string) (valid []PinnedPluginInfo, invalid []string) {
+	if s.pluginToolsResolver == nil {
+		return nil, ids
+	}
+	return s.pluginToolsResolver(ids)
+}
+
+// normalizePluginIDs 归一化插件 ID 列表：去空白、去空串、去重（保序）。
+func normalizePluginIDs(ids []string) []string {
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 // mountTopLevelEssentials 把配置声明的顶层必备插件工具（web_search 等）预挂到
@@ -1187,6 +1227,24 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 	if t := tool.NormalizeThinking(req.Thinking); tool.ValidThinking(t) {
 		sess.setThinking(t)
 	}
+	// 会话级指定插件（KIMI 式插件选择）：创建路径从宽——无效 ID（不存在/未启用/未运行）
+	// 丢弃并记事件，不阻断建会话（同 MountPreApprovedForScope 的静默跳过语义）；
+	// 工具预挂在 runSession 起跑时经 applyPinnedPlugins 完成。
+	if ids := normalizePluginIDs(req.PinnedPlugins); len(ids) > 0 {
+		valid, invalid := s.resolvePinnedPlugins(ids)
+		if len(valid) > 0 {
+			okIDs := make([]string, 0, len(valid))
+			for _, p := range valid {
+				okIDs = append(okIDs, p.ID)
+			}
+			sess.setPinnedPlugins(okIDs)
+		}
+		if len(invalid) > 0 {
+			s.store.addEvent(sess, eventkind.System, "System",
+				fmt.Sprintf("指定插件忽略无效项: %s（不存在/未启用/未运行）", strings.Join(invalid, ", ")),
+				"", "", "", "", "", true)
+		}
+	}
 	// 首条消息携带的用户图片（Alt+V 粘贴）：runSession 注入 runCtx 后一次性消费。
 	sess.firstTurnImages = append(req.Images, frames...)
 	s.maybeWatchWallClock(sess)
@@ -1624,6 +1682,34 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		// providerForRole 每次 LLM 调用实时读取，下一次调用即生效。
 		thinking, _ := cmd.Args["thinking"].(string)
 		return s.SetSessionThinking(sessionID, thinking)
+	case ControlOpPinnedPlugins:
+		// 会话级指定插件切换（KIMI 式插件选择）：Args{"plugins": []string}，空数组=清空。
+		// 参数断言 fail-closed（同 ControlOpWorkDir）：序列化误差不得静默清空用户选择。
+		raw, ok := cmd.Args["plugins"]
+		if !ok {
+			return fmt.Errorf("%w: plugins 参数缺失", ErrInvalidSessionState)
+		}
+		rawList, ok := raw.([]any)
+		if !ok {
+			// 兼容进程内直接构造的 []string 形态（HTTP JSON 解码为 []any）。
+			if ss, ok2 := raw.([]string); ok2 {
+				rawList = make([]any, 0, len(ss))
+				for _, id := range ss {
+					rawList = append(rawList, id)
+				}
+			} else {
+				return fmt.Errorf("%w: plugins 参数类型不符", ErrInvalidSessionState)
+			}
+		}
+		ids := make([]string, 0, len(rawList))
+		for _, v := range rawList {
+			id, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("%w: plugins 元素类型不符", ErrInvalidSessionState)
+			}
+			ids = append(ids, id)
+		}
+		return s.SetSessionPinnedPlugins(sessionID, ids)
 	case ControlOpWorkDir:
 		// 每会话工作目录修改：落库即时保存，下一回合生效（目录在每回合开始时读取）。
 		// 参数断言必须 fail-closed：空串是**合法**的"清除为默认目录"载荷，若把
@@ -1851,6 +1937,119 @@ func (s *ReactService) SessionThinking(sessionID string) string {
 		return ""
 	}
 	return sess.currentThinking()
+}
+
+// SetSessionPinnedPlugins 切换会话级指定插件（KIMI 式插件选择，HTTP 切换通道）：
+// 选中=优先（强制）使用——插件工具经 MountPreApprovedForScope 预挂进会话顶层 scope
+//（用户显式授权，与 plugins.yaml top_level 同为配置外的人工声明，绕过角色天花板）；
+// 取消勾选的工具按 mounted 集前缀匹配卸载（插件中途停用也能卸）。空列表=清空（合法）。
+// 无效 ID（不存在/未启用/未运行）整体拒绝并列明（HTTP 400），不做半套切换；
+// 会话不存在返回错误。atomic 即时生效，下一轮起跑按新集合构建提示块。
+func (s *ReactService) SetSessionPinnedPlugins(sessionID string, ids []string) error {
+	norm := normalizePluginIDs(ids)
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
+	}
+	valid, invalid := s.resolvePinnedPlugins(norm)
+	if len(invalid) > 0 {
+		return fmt.Errorf("%w: 无效插件（不存在/未启用/未运行）: %s", ErrInvalidSessionState, strings.Join(invalid, ", "))
+	}
+	// 差集卸载：被移除插件的工具从会话 scope 摘除（按 <pluginID>__ 前缀匹配 mounted 集，
+	// 不依赖 resolver 再解析——插件在勾选期间被停用/卸载时工具仍可卸净）。
+	removed := make(map[string]bool)
+	newSet := make(map[string]bool, len(norm))
+	for _, id := range norm {
+		newSet[id] = true
+	}
+	for _, old := range sess.currentPinnedPlugins() {
+		if !newSet[old] {
+			removed[old] = true
+		}
+	}
+	if s.toolRegistry != nil && len(removed) > 0 {
+		var unmount []string
+		for name := range s.toolRegistry.MountedTools(sessionID) {
+			for pid := range removed {
+				if strings.HasPrefix(name, pid+"__") {
+					unmount = append(unmount, name)
+					break
+				}
+			}
+		}
+		s.toolRegistry.UnmountTools(sessionID, unmount)
+	}
+	// 新增/保留插件工具预挂（幂等；插件未运行时工具未注册，静默跳过，下次起跑重挂）。
+	var tools []string
+	for _, p := range valid {
+		tools = append(tools, p.Tools...)
+	}
+	if s.toolRegistry != nil && len(tools) > 0 {
+		s.toolRegistry.MountPreApprovedForScope(sessionID, tool.NormalizeGear(sess.currentGear()), tools)
+	}
+	from := sess.currentPinnedPlugins()
+	sess.setPinnedPlugins(norm)
+	s.store.addEvent(sess, eventkind.System, "System",
+		fmt.Sprintf("指定插件切换: %v → %v（手动）", from, norm),
+		"", "", "", "", "", true)
+	return nil
+}
+
+// SessionPinnedPlugins 读取会话当前指定插件 ID 列表（HTTP GET 展示用）；未设置返回 nil。
+func (s *ReactService) SessionPinnedPlugins(sessionID string) []string {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return nil
+	}
+	return sess.currentPinnedPlugins()
+}
+
+// applyPinnedPlugins 把会话指定插件的工具预挂到顶层 scope（KIMI 式插件选择）：
+// runSession 起跑调用——挂载集纯内存，重启恢复/每轮起跑都需重挂（幂等），
+// 与 mountTopLevelEssentials 同语义。未指定/resolver 未接线/插件已停用
+//（工具未注册被 MountPreApprovedForScope 静默跳过）时零行为变化。
+func (s *ReactService) applyPinnedPlugins(session *reactInternalSession) {
+	ids := session.currentPinnedPlugins()
+	if len(ids) == 0 || s.toolRegistry == nil {
+		return
+	}
+	valid, _ := s.resolvePinnedPlugins(ids)
+	var names []string
+	for _, p := range valid {
+		names = append(names, p.Tools...)
+	}
+	if len(names) == 0 {
+		return
+	}
+	if accepted := s.toolRegistry.MountPreApprovedForScope(session.ID, tool.NormalizeGear(session.currentGear()), names); len(accepted) > 0 {
+		log.Printf("[agent] pinned plugins mounted: session=%s plugins=%v tools=%v", session.ID, ids, accepted)
+	}
+}
+
+// pinnedPluginBlock 构建【用户指定插件】系统提示块（KIMI 式插件选择）：
+// 用户显式勾选 = 优先（强制）使用该插件，与"不选则模型自行判断"互补。
+// 拼进 skillBlock 尾部注入系统提示词（react_agent.go systemPrompt 尾部槽位）。
+// 空选择/resolver 未接线/插件全部失效时返回空串（零注入）。
+func (s *ReactService) pinnedPluginBlock(session *reactInternalSession) string {
+	ids := session.currentPinnedPlugins()
+	if len(ids) == 0 {
+		return ""
+	}
+	valid, _ := s.resolvePinnedPlugins(ids)
+	if len(valid) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n\n【用户指定插件】用户在本会话明确指定了以下插件，其工具已直接可用（无需 tool_catalog/tool_mount 发现）：\n")
+	for _, p := range valid {
+		sb.WriteString(fmt.Sprintf("- %s（%s）：%s\n", p.Name, p.ID, strings.Join(p.Tools, ", ")))
+	}
+	sb.WriteString("请优先使用上述插件的工具完成用户需求；仅当其能力确实不敷使用时，才考虑其他途径。")
+	return sb.String()
 }
 
 // thinkingDisplayName 思考强度展示名（事件文案用）：空串显示为"跟随角色默认"。
@@ -3261,6 +3460,8 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 顶层必备插件工具预挂载（fast/daily：联网搜索等直接可用，不必 tool_catalog+tool_mount；
 	// cluster 的 meta 已有角色授权不重复挂；子 Agent scope 不受影响）。
 	s.mountTopLevelEssentials(session.ID, tool.NormalizeGear(session.currentGear()))
+	// 会话级指定插件工具重挂（KIMI 式插件选择）：挂载集纯内存，每轮起跑幂等重挂。
+	s.applyPinnedPlugins(session)
 
 	// PROJECT.md 就绪有界等待（TODO 第14项 T9）：cluster/daily 等 ≤2s 让【项目概览】段
 	// 赶上首轮系统提示词前缀缓存；fast（doc_assistant）不等（秒回优先，缺失本就略段）。
@@ -3308,6 +3509,9 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	case "domain":
 		skillBlock = s.roleSkillBlock(metaRole)
 	}
+	// 会话级指定插件提示块（KIMI 式插件选择）：选中=优先使用，拼进系统提示词尾部槽位；
+	// 空选择零注入（模型自行判断）。每轮起跑重建，HTTP 切换下一轮生效。
+	skillBlock += s.pinnedPluginBlock(session)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
@@ -3472,6 +3676,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 	// 顶层必备插件工具预挂载（同 runSession：fast/daily 顶层直接可用，子 Agent 不受影响）。
 	s.mountTopLevelEssentials(session.ID, tool.NormalizeGear(session.currentGear()))
+	// 会话级指定插件工具重挂（KIMI 式插件选择，同 runSession：幂等）。
+	s.applyPinnedPlugins(session)
 
 	// 确定模型 provider，逻辑同 runSession（D-1 模型随档：按本轮角色 ID 解析）。
 	var provider ModelProvider
@@ -3509,6 +3715,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	case "domain":
 		skillBlock = s.roleSkillBlock(metaRole)
 	}
+	// 会话级指定插件提示块（KIMI 式插件选择）：选中=优先使用，拼进系统提示词尾部槽位；
+	// 空选择零注入（模型自行判断）。每轮起跑重建，HTTP 切换下一轮生效。
+	skillBlock += s.pinnedPluginBlock(session)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
@@ -4985,6 +5194,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		TrustMode:      s.currentTrustMode(),
 		Gear:           s.currentGear(),
 		Thinking:       s.currentThinking(),
+		PinnedPlugins:  s.currentPinnedPlugins(),
 	}
 }
 

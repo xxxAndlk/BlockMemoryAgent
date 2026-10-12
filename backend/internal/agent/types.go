@@ -139,6 +139,11 @@ type CreateRequest struct {
 	// Thinking 会话级思考强度（2026-09-16）：off|low|medium|high，空=跟随角色默认。
 	// 只覆盖本会话顶层 Agent；HTTP 层负责 400 校验。
 	Thinking string
+	// PinnedPlugins 会话级指定插件（KIMI 式插件选择）：用户显式勾选后其工具强制预挂到
+	// 会话顶层 scope（绕过角色天花板，同 plugins.yaml top_level 语义）并注入提示块
+	// 要求优先使用；空=不指定（模型经 tool_catalog/tool_mount 自行判断）。
+	// 创建路径从宽：无效 ID（不存在/未启用/未运行）丢弃并记事件，不阻断建会话。
+	PinnedPlugins []string
 	// NonInteractive 无人值守会话（DAG 定时派发等）：ask_user 不挂起等用户，
 	// 直接返回"自行决策"答复让 Agent 继续跑。
 	NonInteractive bool
@@ -245,6 +250,10 @@ const (
 	// Args{"thinking": "off|low|medium|high|空串=跟随角色默认"}，atomic 即时生效——
 	// providerForRole 每次 LLM 调用实时读取，下一次调用即用新档（热，免重启）。
 	ControlOpThinking = "thinking"
+	// ControlOpPinnedPlugins 切换会话级指定插件（KIMI 式插件选择）：
+	// Args{"plugins": []string}，空数组=清空（合法）。atomic 即时生效——新插件工具
+	// 预挂进会话顶层 scope、取消勾选的工具卸载，下一轮起跑按新集合构建提示块。
+	ControlOpPinnedPlugins = "pinned-plugins"
 )
 
 // Filter 表示列出会话时使用的筛选条件。
@@ -369,6 +378,9 @@ type Session struct {
 	// Thinking 会话级思考强度（2026-09-16）：off|low|medium|high；
 	// 空串 = 跟随角色默认。
 	Thinking string
+	// PinnedPlugins 会话级指定插件 ID 列表（KIMI 式插件选择）：空 = 未指定
+	// （模型自行判断）。前端插件选择器据此回显。
+	PinnedPlugins []string
 }
 
 // Event 是会话事件的 DTO，按字段逐一对齐 server.SessionEvent。

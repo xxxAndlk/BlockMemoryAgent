@@ -49,6 +49,9 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		WorkDir  string            `json:"work_dir,omitempty"`
 		Gear     string            `json:"gear,omitempty"`
 		Thinking string            `json:"thinking,omitempty"`
+		// Plugins 会话级指定插件（KIMI 式插件选择）：创建时勾选，无效 ID 由 agent 层
+		// 丢弃并记事件（创建路径从宽，不阻断建会话）。
+		Plugins []string `json:"plugins,omitempty"`
 	}](c.Request)
 	if err != nil {
 		c.String(http.StatusBadRequest, "请求体无效")
@@ -86,7 +89,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	}
 
 	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费）。
-	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos, WorkDir: req.WorkDir, Gear: req.Gear, Thinking: req.Thinking})
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos, WorkDir: req.WorkDir, Gear: req.Gear, Thinking: req.Thinking, PinnedPlugins: req.Plugins})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
@@ -556,6 +559,38 @@ func (m *SessionManager) HandleSessionThinking(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"thinking":   req.Thinking,
+	})
+}
+
+// HandleSessionPlugins 处理 POST /api/sessions/{id}/plugins（KIMI 式插件选择）。
+// 职责：切换会话级指定插件（选中=优先/强制使用，不选=模型自行判断），经 Control 通道下发；
+// atomic 即时生效——新插件工具预挂进会话顶层 scope、取消勾选的卸载，下一轮起跑按新集合
+// 构建提示块。空数组=清空（合法）；无效插件 ID 400（列明）；会话不存在 404。
+func (m *SessionManager) HandleSessionPlugins(c *gin.Context) {
+	id := c.Param("id")
+	req, err := DecodeBody[struct {
+		Plugins []string `json:"plugins"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	// plugins 字段缺失（null）视为清空——与显式空数组同语义，前端"清空"按钮直发 []。
+	plugins := req.Plugins
+	if plugins == nil {
+		plugins = []string{}
+	}
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
+		Op:   agent.ControlOpPinnedPlugins,
+		Args: map[string]any{"plugins": plugins},
+	}); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"session_id": id,
+		"plugins":    plugins,
 	})
 }
 
