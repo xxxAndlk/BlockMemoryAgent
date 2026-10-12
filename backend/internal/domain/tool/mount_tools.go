@@ -34,7 +34,8 @@ func (t *toolCatalogTool) Aliases() []string { return nil }
 // Description 返回 LLM 可见的工具描述。
 func (t *toolCatalogTool) Description() string {
 	return "列出当前角色权限天花板内可用的全部插件工具（名称 + 一句话描述，不含入参 schema），按插件分组并标注已挂载项。" +
-		"插件工具默认不注入本 Agent 上下文（避免 schema 膨胀）：先用本工具发现，再用 tool_mount 挂载，下一轮迭代即对当前 Agent 可见。"
+		"插件工具默认不注入本 Agent 上下文（避免 schema 膨胀）：先用本工具发现，再用 tool_mount 挂载，下一轮迭代即对当前 Agent 可见。" +
+		"目录中都没有需要的能力时，MetaAgent 可经 plugin_search 检索可安装插件目录、plugin_install 安装（装完当轮自动挂载）。"
 }
 
 // InputSchema 返回入参 JSON Schema（无字段）。
@@ -88,7 +89,9 @@ func (t *toolCatalogTool) Execute(ctx context.Context, args map[string]any) *Res
 		b.WriteString("（无）——本角色没有可用的插件工具。\n")
 	}
 	b.WriteString("规则：天花板 = roles.yaml 角色基础白名单 ∪ 插件 roles 白名单（仅人改配置，Agent 不可改）；" +
-		"越界挂载会被 tool_mount 拒绝。发现需要的工具后调 tool_mount(tools=[...]) 挂载。")
+		"越界挂载会被 tool_mount 拒绝。发现需要的工具后调 tool_mount(tools=[...]) 挂载。\n" +
+		"目录中没有需要的能力？MetaAgent 可用 plugin_search(关键词) 检索可安装插件目录（内置精选 + MCP 官方 registry），" +
+		"命中后 plugin_install(id) 安装，装完当轮自动挂载即可用；其他角色请把能力缺口回告上级。")
 	return &Result{Tool: "tool_catalog", Success: true, Output: b.String()}
 }
 

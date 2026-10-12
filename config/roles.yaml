@@ -52,11 +52,14 @@ meta_agent:
   # tool_mount（联网与插件挂载）、list_models/set_role_model/set_agent_model（模型选型/
   # 实例换档/慢域归因章节引用）。仍不收：HTTPGet（联网走 web_search 预挂）、create_role/
   # list_roles（运维动作）、RefreshProjectDoc/remember_preference/search_knowledge（写侧
-  # 自动触发/检索走 domain）、plugin_list/plugin_unload 等（plugin_list 提示词仅用于
-  # 确认不可用，非任务循环）。
+  # 自动触发/检索走 domain）。
+  # 2026-10-11 收回插件管理面（TODO #51 自安装闭环）：plugin_search/plugin_install/
+  # plugin_enable/plugin_disable/plugin_list + tool_unmount。实证：该清单此前不含 plugin_*，
+  # meta Schema 里根本没有自安装工具（会话 352 次 LLM 调用 prompt 中 plugin_search/install
+  # 出现 0 次），遇到能力缺口（如微信公众号抓取）只会绕路硬试，不知道能搜目录装新插件。
   # 插件工具（web_search 等）不经此列表：由 role_tool_gate 硬门闭包按"角色可见"并集放行
   #（bootstrap.go），Schema 可见性仍走 白名单 ∪（可见 ∧ 已挂载）软过滤。
-  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, schedule_task, write_plan, submit_plan, review_plan, ReadFile, EditFile, RestoreFile, WriteFile, RunCommand, ReadMedia, SearchInFiles, ListDir, ShowArtifact, list_skills, load_skill, tool_catalog, tool_mount, list_models, set_role_model, set_agent_model, expand_memory]
+  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, schedule_task, write_plan, submit_plan, review_plan, ReadFile, EditFile, RestoreFile, WriteFile, RunCommand, ReadMedia, SearchInFiles, ListDir, ShowArtifact, list_skills, load_skill, tool_catalog, tool_mount, tool_unmount, plugin_search, plugin_install, plugin_enable, plugin_disable, plugin_list, list_models, set_role_model, set_agent_model, expand_memory]
 
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:
