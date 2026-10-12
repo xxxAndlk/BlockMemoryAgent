@@ -80,8 +80,12 @@ type reactInternalSession struct {
 	// 数十次完全相同的事件（实证：一条"等待回传"叙事在日志重复 40+ 行），
 	// 相同文本只落一次。
 	lastThinkEventText string
-	// lastInterimText 是已落事件流的最后一条 assistant_text 文本：persistInterimText 去重依据。
-	// 同轮并行多个工具调用会连发多条 ToolCall 事件而流式文本不变，同一段正文只落一次。
+	// lastInterimText 是已落事件流的最后一条 assistant_text 文本，两个用途：
+	// 1) persistInterimText 同轮去重——并行工具调用连发多条 ToolCall 而流式文本未变，
+	//    同一段正文只落一次；新一段流式正文直推 StreamingText 时本字段复位（LLMDelta
+	//    分支），跨轮逐字重复的口播（轮询等待循环）每轮都落，不复位则第二轮起口播
+	//    不落事件、前端 live 行被工具事件清掉后无接力，"闪一下就消失"（2026-10-12 实证）。
+	// 2) ThinkDelta 判定 StreamingText 是否为已落盘残留，据以清理防"复活"。
 	lastInterimText string
 	// pendingTopText 是集群档顶层 Meta 当前轮的正文缓冲：该档中间轮口播不进用户流
 	//（LiveEventLLMDelta 只写这里不推 StreamingText），轮末由工具调用边界丢弃、

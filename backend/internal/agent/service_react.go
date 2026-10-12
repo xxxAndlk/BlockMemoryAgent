@@ -3972,6 +3972,8 @@ func (s *ReactService) persistInterimText(session *reactInternalSession, ev Live
 		text = strings.TrimSpace(strings.TrimPrefix(text, "【"+ev.Agent+"】\n"))
 	}
 	// 同轮并行多个工具调用会连发多条 ToolCall 事件而流式文本未变——同一段正文只落一条。
+	// 去重键 lastInterimText 随新一段流式正文复位（handleLiveEvent LLMDelta 直推分支），
+	// 因此轮询等待这类跨轮逐字重复的口播每轮都照落；同轮去重不受影响。
 	if text == "" || text == session.lastInterimText {
 		return
 	}
@@ -4027,10 +4029,17 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 				session.pendingTopText = ev.Text
 			} else {
 				session.pendingTopText = ""
+				// 新正文直推覆盖 StreamingText = 上一段口播的同轮去重使命结束：复位去重键，
+				// 跨轮逐字重复的口播（轮询等待循环）下一轮才能再落 assistant_text
+				//（2026-10-12 用户实证：扫码等待循环第二轮起口播不落事件，前端闪没）。
+				// 缓冲分支（子 Agent 在跑）刻意不复位：StreamingText 未被覆盖，
+				// ThinkDelta 的陈旧清理仍要靠 lastInterimText 命中。
+				session.lastInterimText = ""
 				s.store.setStreamingText(session, ev.Text)
 			}
 			break
 		}
+		session.lastInterimText = "" // 同上：新正文覆盖 StreamingText，复位同轮去重键
 		s.store.setStreamingText(session, ev.Text)
 	case LiveEventThinkDelta:
 		// 集群档顶层 Meta 的思考抑制只在"正在编排"（树上有运行中子 Agent）时生效：

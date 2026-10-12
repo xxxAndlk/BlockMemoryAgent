@@ -79,6 +79,30 @@ func TestPersistInterimText_ParallelToolCallsOnce(t *testing.T) {
 	}
 }
 
+// TestPersistInterimText_RepeatedNarrationAcrossRounds 验证轮询等待循环里跨轮逐字重复的
+// 口播每轮都落 assistant_text（2026-10-12 用户实证：微信扫码登录等待循环中模型每轮重复
+// 同一句"我盯着登录器，等你扫码确认"，去重键 lastInterimText 跨轮不复位，第二轮起不再落
+// 事件，前端 live 行在工具调用时清掉后无正文接力——口播"闪一下就消失"）。
+// 新一段流式正文（LLMDelta 直推 StreamingText）即复位去重键；同轮并行工具调用仍只落一条。
+func TestPersistInterimText_RepeatedNarrationAcrossRounds(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+
+	for round := 0; round < 3; round++ {
+		// 新一轮流式输出（逐字重复同一句话），随后调工具。
+		svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventLLMDelta, Agent: "MetaAgent", AgentID: "session-1", Text: "我盯着登录器，等你扫码确认。稍候片刻我查一次实时状态。"})
+		svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: "session-1", Tool: "RunCommand"})
+	}
+	if n := countEventsByKind(sess.Events, eventkind.AssistantText); n != 3 {
+		t.Fatalf("跨轮逐字重复的口播每轮都应落 assistant_text，got %d", n)
+	}
+
+	// 同轮内并行工具调用（无新流式正文）仍只落一条——去重未被破坏。
+	svc.handleLiveEvent(sess, LiveEvent{Kind: LiveEventToolCall, Agent: "MetaAgent", AgentID: "session-1", Tool: "ReadFile"})
+	if n := countEventsByKind(sess.Events, eventkind.AssistantText); n != 3 {
+		t.Fatalf("同轮并行工具调用不得重复落 assistant_text，got %d", n)
+	}
+}
+
 // TestPersistInterimText_Skips 验证空正文与 ask_user 不落事件。
 func TestPersistInterimText_Skips(t *testing.T) {
 	svc, sess := newLiveEventTestSession(t)
