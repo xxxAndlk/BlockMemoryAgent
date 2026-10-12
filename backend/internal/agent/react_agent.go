@@ -122,6 +122,10 @@ type ReActAgent struct {
 	//（renderMemoryIndex 渲染，行数/runes 双配额），详情走向量召回。同 skillBlock
 	// 尾部注入位（前缀缓存安全）；空串=未接线/无沉淀。
 	memoryIndex string
+	// evolutionBlock 自进化准则槽（角色级、AI 自维护、≤300字）：本角色历史沉淀的
+	// 抽象行为准则，由 WithEvolutionBlock 在构造期注入。同 skillBlock/memoryIndex
+	// 尾部注入位（前缀缓存安全）；空串=该角色无准则不注入。
+	evolutionBlock string
 	// pausedChecker 可选的"是否有 Paused 子 DomainAgent"检查器，由 WithPausedChildChecker 注入。
 	// 父终结保护 wait loop 中检查：若有 Paused 子节点（触达 token 上限），父 MetaAgent
 	// 无限 budget 不会自行暂停，需靠此检查跳出 wait loop 返回 PausedOnChild，由上层 pauseSession
@@ -322,6 +326,13 @@ func (a *ReActAgent) WithSkillBlock(block string) *ReActAgent {
 // 空串为零行为。索引超限时调用方（renderMemoryIndex）已带重写指令，不静默截断。
 func (a *ReActAgent) WithMemoryIndex(block string) *ReActAgent {
 	a.memoryIndex = block
+	return a
+}
+
+// WithEvolutionBlock 注入【自进化准则】块（角色级、AI 自维护、≤300字），尾部槽位追加。
+// 空串为零行为（该角色无准则/未接线时调用方传空即自动跳过）。
+func (a *ReActAgent) WithEvolutionBlock(block string) *ReActAgent {
+	a.evolutionBlock = block
 	return a
 }
 
@@ -1892,6 +1903,10 @@ func (a *ReActAgent) buildSystemPrompt() string {
 	if a.memoryIndex != "" {
 		prompt += "\n\n" + a.memoryIndex
 	}
+	// 自进化准则槽（角色级、AI 自维护、≤300字）：再往尾部追加，同为尾部注入位。
+	if a.evolutionBlock != "" {
+		prompt += "\n\n" + a.evolutionBlock
+	}
 	// 提示词构成分段计量（TODO #15①）：各分段 rune 快照，首轮 LLM 调用输出明细行，
 	// 供瘦身边际对照（T13 meta 收窄前后对比 sys 分段降幅）。sync.Once 内写入，无竞争。
 	seps := 4 // env+base、base+discipline 两处 "\n\n"
@@ -1901,12 +1916,16 @@ func (a *ReActAgent) buildSystemPrompt() string {
 	if a.memoryIndex != "" {
 		seps += 2
 	}
+	if a.evolutionBlock != "" {
+		seps += 2
+	}
 	a.promptStatsSegs = map[string]int{
 		"env":          utf8.RuneCountInString(envBlock),
 		"role_base":    utf8.RuneCountInString(base),
 		"discipline":   utf8.RuneCountInString(discipline),
 		"skill":        utf8.RuneCountInString(a.skillBlock),
 		"memory_index": utf8.RuneCountInString(a.memoryIndex),
+		"evolution":    utf8.RuneCountInString(a.evolutionBlock),
 	}
 	// 人格注入器非 nil 时，把人格内容拼到完整 prompt 最前（envBlock 之前），
 	// 作为用户级人格前缀。人格为空时 Inject 原样返回，无副作用。
@@ -1916,7 +1935,7 @@ func (a *ReActAgent) buildSystemPrompt() string {
 		if total := utf8.RuneCountInString(prompt); total > 0 {
 			other := a.promptStatsSegs["env"] + a.promptStatsSegs["role_base"] +
 				a.promptStatsSegs["discipline"] + a.promptStatsSegs["skill"] +
-				a.promptStatsSegs["memory_index"] + seps
+				a.promptStatsSegs["memory_index"] + a.promptStatsSegs["evolution"] + seps
 			if total > other {
 				a.promptStatsSegs["persona"] = total - other
 			}

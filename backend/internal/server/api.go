@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin" // Gin Web 框架
 
 	"github.com/blockmemory/agent/backend/internal/agent"            // ModelManager（模型动态切换）
+	"github.com/blockmemory/agent/backend/internal/domain/role"      // Registry（角色注册表）
 	"github.com/blockmemory/agent/backend/internal/domain/tool"      // WithWorkDir(work_dir 注入)
 	"github.com/blockmemory/agent/backend/internal/model"            // ModelFactory
 	"github.com/blockmemory/agent/backend/internal/plugins"          // 插件管理器
@@ -65,6 +66,10 @@ type APIHandler struct {
 	learnedSkills *store.LearnedSkillStore  // 自进化技能库存储（2026-09-02 设计 §8）
 	// skillConsolidation 技能库整理器（C 库存治理）：手动触发一轮合并/归档，返回摘要。
 	skillConsolidation func(ctx context.Context) (string, error)
+	// roleEvolution 角色自进化准则存储（窄接口，*store.RoleEvolutionStore 实现；未注入端点 503）。
+	roleEvolution roleEvolutionStoreOps
+	// roleRegistry 角色注册表（角色全集与显示名来源；未注入端点 503）。
+	roleRegistry *role.Registry
 	// defaultWorkDir 进程默认工作目录（bootstrap 注入）：work_dir 参数为空时
 	// tester-config 等工作目录级配置的回落目录（与 ReactService.workDir 同源）。
 	defaultWorkDir string

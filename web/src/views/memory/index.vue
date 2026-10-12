@@ -10,6 +10,7 @@ import {
   type LearnedSkill,
   type EvolutionLogEntry,
 } from '@/api/learned'
+import { listEvolutionPrompts, setEvolutionPrompt, type RoleEvolutionPrompt } from '@/api/evolution'
 import { normDir } from '@/utils/dir'
 
 const sessions = ref<SessionSummary[]>([])
@@ -17,7 +18,41 @@ const skills = ref<LearnedSkill[]>([])
 const entries = ref<EvolutionLogEntry[]>([])
 const profile = ref('')
 const projectPref = ref('')
+const evolutionPrompts = ref<RoleEvolutionPrompt[]>([])
 const loading = ref(false)
+
+// 角色自进化准则：内联编辑状态（同一时间只编辑一个角色）
+const EVOLUTION_MAX_LEN = 300
+const editingRoleId = ref('')
+const editingContent = ref('')
+const evolutionSaving = ref(false)
+const editingTooLong = computed(() => editingContent.value.length > EVOLUTION_MAX_LEN)
+
+function startEditEvolution(p: RoleEvolutionPrompt) {
+  editingRoleId.value = p.role_id
+  editingContent.value = p.content
+}
+
+function cancelEditEvolution() {
+  editingRoleId.value = ''
+  editingContent.value = ''
+}
+
+async function saveEvolution(p: RoleEvolutionPrompt) {
+  if (editingTooLong.value || evolutionSaving.value) return
+  evolutionSaving.value = true
+  try {
+    const saved = await setEvolutionPrompt(p.role_id, editingContent.value)
+    const idx = evolutionPrompts.value.findIndex((x) => x.role_id === p.role_id)
+    if (idx >= 0) evolutionPrompts.value[idx] = saved
+    cancelEditEvolution()
+    ElMessage.success(`已保存 ${saved.role_name || saved.role_id} 的自进化准则`)
+  } catch (e) {
+    ElMessage.error('保存失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    evolutionSaving.value = false
+  }
+}
 
 // 项目筛选：'' = 全部项目；否则为某 work_dir
 const project = ref('')
@@ -77,16 +112,18 @@ const stats = computed(() => ({
 async function load() {
   loading.value = true
   try {
-    const [sRes, skRes, logRes, pfRes] = await Promise.allSettled([
+    const [sRes, skRes, logRes, pfRes, evRes] = await Promise.allSettled([
       listSessions(),
       listLearnedSkills(),
       listEvolutionLog(200),
       getProfile(),
+      listEvolutionPrompts(),
     ])
     sessions.value = sRes.status === 'fulfilled' ? sRes.value || [] : []
     skills.value = skRes.status === 'fulfilled' ? skRes.value.skills || [] : []
     entries.value = logRes.status === 'fulfilled' ? logRes.value.entries || [] : []
     profile.value = pfRes.status === 'fulfilled' ? pfRes.value.content || '' : ''
+    evolutionPrompts.value = evRes.status === 'fulfilled' ? evRes.value.prompts || [] : []
   } catch (e) {
     ElMessage.error('记忆数据加载失败：' + (e instanceof Error ? e.message : String(e)))
   } finally {
@@ -205,6 +242,54 @@ function summarize(text: string) {
               </el-tag>
             </div>
             <p class="text-ink-2 mt-1 line-clamp-2">{{ s.when_to_use }}</p>
+          </div>
+        </div>
+
+        <!-- 角色自进化准则：每角色一条 ≤300 字抽象行为准则，AI 会话中自维护，可人工校正 -->
+        <div class="bg-card border border-line rounded-card p-4">
+          <div class="mb-1">
+            <span class="font-bold text-sm">角色自进化准则</span>
+          </div>
+          <p class="text-xs text-ink-2 mb-2">
+            每个角色一条 ≤300 字的抽象行为准则，AI 在会话中自维护，每轮直接注入该角色系统提示词。
+          </p>
+          <div v-if="!evolutionPrompts.length" class="text-xs text-ink-3 py-2">暂无角色</div>
+          <div v-for="p in evolutionPrompts" :key="p.role_id"
+               class="p-2 bg-page rounded border border-line mb-1.5 text-xs">
+            <div class="flex items-center gap-2">
+              <span class="font-bold">{{ p.role_name || p.role_id }}</span>
+              <span v-if="p.updated_at" class="text-[10px] text-ink-3">{{ fmtTime(p.updated_at) }}</span>
+              <el-button
+                v-if="editingRoleId !== p.role_id"
+                link type="primary" size="small" class="ml-auto"
+                @click="startEditEvolution(p)"
+              >编辑</el-button>
+            </div>
+            <template v-if="editingRoleId === p.role_id">
+              <el-input
+                v-model="editingContent"
+                type="textarea"
+                autosize
+                class="mt-1"
+                placeholder="输入该角色的行为准则（≤300 字）"
+              />
+              <div class="flex items-center justify-between mt-1">
+                <span class="text-[10px]" :class="editingTooLong ? 'text-red-500' : 'text-ink-3'">
+                  {{ editingContent.length }}/{{ EVOLUTION_MAX_LEN }}
+                </span>
+                <div class="flex gap-1">
+                  <el-button size="small" @click="cancelEditEvolution">取消</el-button>
+                  <el-button
+                    type="primary" size="small"
+                    :loading="evolutionSaving"
+                    :disabled="editingTooLong"
+                    @click="saveEvolution(p)"
+                  >保存</el-button>
+                </div>
+              </div>
+            </template>
+            <pre v-else-if="p.content" class="text-ink-2 mt-1 whitespace-pre-wrap break-all font-mono">{{ p.content }}</pre>
+            <div v-else class="text-ink-3 mt-1">暂无准则（AI 会在使用中自行沉淀）</div>
           </div>
         </div>
 

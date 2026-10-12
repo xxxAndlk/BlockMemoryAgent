@@ -89,6 +89,12 @@ type App struct {
 	// 忽略阈值直接整理；返回人类可读摘要。nil 时端点返回 503。
 	SkillConsolidation func(ctx context.Context) (string, error)
 
+	// RoleEvolution 角色自进化准则存储（role_evolution_prompts 表）；与 RoleRegistry
+	// 一并供 server 层角色演化端点接线（apiHandler.SetRoleEvolution，见 router.go apiHandlerOf）。
+	RoleEvolution *store.RoleEvolutionStore
+	// RoleRegistry 角色注册表（固定+动态合成角色），供演化准则按角色展示/编辑。
+	RoleRegistry *role.Registry
+
 	// cleanup 保存 App 关闭时需要按逆序释放的资源。
 	cleanup []func() error
 }
@@ -176,6 +182,13 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err := ensureSchemas(ctx, pgStore, cfg.PgVector.Dimensions); err != nil {
 		pgStore.Close()
 		return nil, err
+	}
+	// 角色自进化准则存储（role_evolution_prompts 表，schema 已在上方 ensure）：
+	// 每角色一条自维护行为准则，注入系统提示词尾部。pg 不可用时保持 nil，
+	// 下游 provider / 工具 hook / server 端点全部按 nil 降级。
+	var roleEvolutionStore *store.RoleEvolutionStore
+	if pgStore != nil {
+		roleEvolutionStore = store.NewRoleEvolutionStore(pgStore.DB())
 	}
 
 	// 第八步：连接 Redis；失败时关闭 pgStore。
@@ -745,6 +758,47 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		}
 		return b.String(), nil
 	})
+	// 角色自进化准则写入钩子（update_evolution_prompt 工具）：按角色 upsert 准则
+	//（全量替换语义），并把变更摘要追加进 evolution_log 审计流水（记忆中心时间线可见）。
+	toolRegistry.SetEvolutionPromptHook(func(ctx context.Context, roleID, content, sessionID string) error {
+		if roleEvolutionStore == nil {
+			return fmt.Errorf("演化准则存储未启用")
+		}
+		if err := roleEvolutionStore.Upsert(ctx, &store.RoleEvolutionPrompt{RoleID: roleID, Content: content, SourceSession: sessionID}); err != nil {
+			return err
+		}
+		if pgStore != nil && pgStore.LearnedSkills != nil {
+			_ = pgStore.LearnedSkills.AppendEvolutionLog(context.Background(), "role_evolution", roleID, truncateForPrompt(content, 120), sessionID)
+		}
+		return nil
+	})
+	// 块记忆检索钩子（search_block_memory 工具）：跨 session 语义召回全局块记忆沉淀
+	//（excludeSessionID 传空 = 不排除任何会话）。每条结果包 <untrusted_data> 围栏
+	//（防注入纪律，同 dispatcher renderRecalledMemory），内容截 600 runes，
+	// 附来源会话与沉淀时间供溯源。
+	toolRegistry.SetBlockMemorySearchHook(func(ctx context.Context, query string) (string, error) {
+		if pgStore == nil || pgStore.Knowledge == nil {
+			return "", fmt.Errorf("块记忆存储未启用")
+		}
+		hits, err := pgStore.Knowledge.SearchBlockMemoryCrossSession(ctx, "", query, 5)
+		if err != nil {
+			return "", err
+		}
+		if len(hits) == 0 {
+			return "没有检索到相关块记忆。", nil
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "块记忆命中 %d 条（历史任务沉淀，仅作背景参考）：", len(hits))
+		for i, rec := range hits {
+			src := strFromMeta(rec.Meta, "session_id")
+			if src == "" {
+				src = "unknown"
+			}
+			fmt.Fprintf(&b, "\n--- [%d] 来源会话: %s · 沉淀时间: %s ---\n", i+1, src, rec.CreatedAt.Format("2006-01-02 15:04"))
+			b.WriteString(tool.WrapUntrusted("block-memory", truncateForPrompt(rec.Content, 600)))
+		}
+		return b.String(), nil
+	})
 	// 注入 ask_user 工具钩子（TODO #24 人在回路）：meta/domain Agent 主动提问时
 	// 置 PendingClarify + 暂停会话 + 阻塞等答复，答复作为工具结果带回 ReAct 循环。
 	// 默认超时从 config.AskUserTimeoutSec 注入（0=不限），单次调用 timeout_sec 可覆盖。
@@ -797,6 +851,48 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return pgStore.LearnedSkills.AppendEvolutionLog(ctx, kind, target, summary, sessionID)
 		})
 	}
+	// 手动提炼块记忆（/提炼 指令 → ReactService → 此回调）：复用与子 Agent 沉淀同款的
+	// llmFactExtractor（轻量模型提取事实）+ blockMemorySaver（embed + ≥0.85 近邻去重 + 落库），
+	// 每条事实单独成记录（KnowledgeType=block_memory，meta 标 source=manual_distill + session_id）。
+	// pg 不可用直接报错；单条落库失败仅记日志跳过，不影响其余事实。
+	agentSvc.SetBlockMemoryDistiller(func(ctx context.Context, sessionID, text string) (int, error) {
+		if pgStore == nil || pgStore.Knowledge == nil {
+			return 0, fmt.Errorf("块记忆存储未启用")
+		}
+		extractor := &llmFactExtractor{factory: modelFactory, maxFacts: cfg.Agent.BlockMemoryFactsMax}
+		saver := &blockMemorySaver{pg: pgStore}
+		facts, err := extractor.Extract(ctx, text, "手动提炼会话沉淀（/提炼 指令）", "meta")
+		if err != nil {
+			return 0, fmt.Errorf("事实提取: %w", err)
+		}
+		saved := 0
+		for i, f := range facts {
+			f = strings.TrimSpace(f)
+			if f == "" {
+				continue
+			}
+			rec := &types.KnowledgeRecord{
+				KnowledgeType: enums.KnowledgeTypeBlockMemory,
+				Content:       f,
+				Meta: map[string]any{
+					"goal":        "手动提炼会话沉淀（/提炼 指令）",
+					"domain":      "meta",
+					"session_id":  sessionID,
+					"source":      "manual_distill",
+					"fact_index":  i,
+					"outcome":     "success",
+					"reuse_count": 0,
+				},
+				CreatedAt: time.Now(),
+			}
+			if err := saver.Save(ctx, rec); err != nil {
+				log.Printf("[distill] block memory save failed (skip one): %v", err)
+				continue
+			}
+			saved++
+		}
+		return saved, nil
+	})
 	// 项目偏好（2026-09-02 设计 §5）：per workDir .bma/project_preferences.md。
 	// 首次写入才创建文件（Load 容忍缺失，零注入直到有内容）；
 	// MetaAgent 经 persona 链【项目偏好】段注入，子 Agent 经 Dispatcher 前缀注入（执行层工艺）。
@@ -902,6 +998,23 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 记忆索引槽（TODO #20③+#22③，memory_index.go）：会话启动注入一行式沉淀索引
 	//（行数/runes 双配额 + 超限重写指令），untrusted 围栏行结构性丢弃（信任分层）。
 	agentSvc.SetMemoryIndexProvider(newMemoryIndexProvider(pgStore.Knowledge, cfg.Agent.MemoryIndexMaxLines, cfg.Agent.MemoryIndexMaxRunes))
+	// 角色自进化准则注入（role_evolution_prompts）：MetaAgent 系统提示与子 Agent 派发前缀
+	// 追加该角色积累的行为准则；同一闭包供 ReactService 与 Dispatcher 两侧消费。
+	// 未写入过准则的角色返回空串（零注入）；5s 超时 best-effort，读失败按无准则处理。
+	evolutionPromptOf := func(roleID string) string {
+		if roleEvolutionStore == nil {
+			return ""
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		rec, err := roleEvolutionStore.Get(ctx, roleID)
+		if err != nil || rec == nil {
+			return ""
+		}
+		return rec.Content
+	}
+	agentSvc.SetEvolutionPromptProvider(evolutionPromptOf)
+	subAgentDispatcher.WithEvolutionPromptProvider(evolutionPromptOf)
 	agentSvc.SetIdleTTLArmer(subAgentDispatcher)
 	// 活动证据展示面（TODO 第10项②）：ListAgents 填充各节点 ActivityKind/LastActivityAgo，
 	// TUI/Web 渲染 "in <tool> · active Xs ago" 让假死可见。
@@ -1156,6 +1269,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		SkillConsolidation: func(ctx context.Context) (string, error) {
 			return skillCons.Run(ctx, true)
 		},
+
+		RoleEvolution: roleEvolutionStore, // 角色自进化准则存储
+		RoleRegistry:  roleRegistry,       // 角色注册表（server 演化端点用）
 	}
 
 	// 第二十一步：注册关闭时释放资源的回调，按依赖顺序排列（外层 Close 会逆序调用）。
@@ -1246,18 +1362,19 @@ func validatePaths(paths ConfigPaths) error {
 func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDim int) error {
 	// 依次确保各业务表/扩展已创建。
 	for name, fn := range map[string]func(context.Context, *sql.DB) error{
-		"session_history":       store.EnsureSessionHistorySchema,
-		"session_events":        store.EnsureSessionEventsSchema,
-		"agent_events":          store.EnsureAgentEventsSchema,
-		"agent_messages":        store.EnsureAgentMessagesSchema,
-		"agent_compress_states": store.EnsureCompressStateSchema,
-		"session_logs":          store.EnsureSessionLogsSchema,
-		"dag":                   store.EnsureDAGSchema,
-		"memory":                store.EnsureInitialMemorySchema,
-		"agent_tree":            store.EnsureAgentTreeSchema,
-		"learned_skills":        store.EnsureLearnedSkillsSchema,
-		"mailbox_messages":      store.EnsureMailboxSchema,
-		"session_boards":        store.EnsureBoardSchema,
+		"session_history":        store.EnsureSessionHistorySchema,
+		"session_events":         store.EnsureSessionEventsSchema,
+		"agent_events":           store.EnsureAgentEventsSchema,
+		"agent_messages":         store.EnsureAgentMessagesSchema,
+		"agent_compress_states":  store.EnsureCompressStateSchema,
+		"session_logs":           store.EnsureSessionLogsSchema,
+		"dag":                    store.EnsureDAGSchema,
+		"memory":                 store.EnsureInitialMemorySchema,
+		"agent_tree":             store.EnsureAgentTreeSchema,
+		"learned_skills":         store.EnsureLearnedSkillsSchema,
+		"mailbox_messages":       store.EnsureMailboxSchema,
+		"session_boards":         store.EnsureBoardSchema,
+		"role_evolution_prompts": store.EnsureRoleEvolutionSchema,
 	} {
 		if err := fn(ctx, pgStore.DB()); err != nil {
 			return fmt.Errorf("ensure %s schema: %w", name, err)

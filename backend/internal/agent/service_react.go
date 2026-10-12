@@ -130,6 +130,10 @@ type ReactService struct {
 	// memoryIndexFn 渲染【沉淀索引】块（TODO #20③+#22③ 记忆索引槽）：会话启动注入，
 	// 行数/runes 双配额（超限自带重写指令），nil=未接线不注入。
 	memoryIndexFn func() string
+	// evolutionPromptFn 读取角色自进化准则全文（角色级、AI 自维护、≤300字）：
+	// 每回合注入系统提示词尾部槽位，空串=该角色无准则不注入，nil=未接线。
+	// 由 bootstrap 接 RoleEvolutionStore。
+	evolutionPromptFn func(roleID string) string
 
 	// VideoOpts 用户消息视频附件（Alt+V 粘贴视频文件）抽帧参数：
 	// bootstrap 从 config.Video 注入，零值字段内部回落 DefaultVideoOptions。
@@ -177,6 +181,9 @@ type ReactService struct {
 	skillSink func(ctx context.Context, sessionID string, skills []EvolvedSkill, outcome string) error
 	// evolutionLog 进化审计写回调（evolution_log 表）；nil 时跳过审计。
 	evolutionLog func(ctx context.Context, sessionID, kind, target, summary string) error
+	// blockDistiller 手动提炼（/提炼 快捷指令）的块记忆沉淀回调：bootstrap 接
+	// 事实提取器+块记忆写入器；返回成功沉淀条数。nil 时 /提炼 只做技能提炼。
+	blockDistiller func(ctx context.Context, sessionID, text string) (int, error)
 	// skillRecall MetaAgent 侧经验技能向量预答回调（设计 §6.5）：goal -> top-3 提示行；
 	// nil 时零注入。与 Dispatcher 侧召回同源（bootstrap 注入同一检索函数）。
 	skillRecall func(ctx context.Context, task string) []SkillRecallHint
@@ -543,6 +550,25 @@ func (s *ReactService) memoryIndexBlock() string {
 		return ""
 	}
 	return s.memoryIndexFn()
+}
+
+// SetEvolutionPromptProvider 注入角色自进化准则读取回调（bootstrap 接 RoleEvolutionStore）；
+// fn 返回角色当前准则全文（≤300字），空串=该角色无准则不注入。传 nil 关闭。
+func (s *ReactService) SetEvolutionPromptProvider(fn func(roleID string) string) {
+	s.evolutionPromptFn = fn
+}
+
+// evolutionBlockFor 渲染【自进化准则】系统提示块：本角色历史沉淀的抽象行为准则，
+// 每回合直接注入（与 skill/块记忆互不相关）。空内容/未接线返回空串（零注入）。
+func (s *ReactService) evolutionBlockFor(roleID string) string {
+	if s.evolutionPromptFn == nil || roleID == "" {
+		return ""
+	}
+	content := strings.TrimSpace(s.evolutionPromptFn(roleID))
+	if content == "" {
+		return ""
+	}
+	return "【自进化准则】本角色在历史使用中沉淀的抽象行为准则（可经 update_evolution_prompt 全量更新，≤300字）：\n" + content
 }
 
 // SetBoardRemover 注入会话任务看板移除器（DeleteSession 硬删除路径）。
@@ -3521,6 +3547,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
 		WithMemoryIndex(s.memoryIndexBlock()).
+		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
 		WithPersonaInjector(s.metaPersona(session.currentWorkDir())).
 		WithMessageLogger(s.msgLogger).
 		// 顶层 Agent（meta/domain）挂起等子语义：终答轮仍有未决子 Agent 时置
@@ -3727,6 +3754,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
 		WithMemoryIndex(s.memoryIndexBlock()).
+		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
 		WithPersonaInjector(s.metaPersonaLite()).
 		WithMessageLogger(s.msgLogger).
 		// 顶层 Agent（meta/domain）挂起等子语义（同 runSession）。
@@ -4399,6 +4427,33 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 		session = restored
 	}
 
+	// 快捷指令拦截：仅当整条消息是单 token 斜杠指令（^/\S+$）时按指令处理，
+	// 不进 LLM 对话历史、不触发续跑；多行/带空格的文本正常透传。
+	// 锁纪律：本拦截点位于持锁区间，两条分支均先 Unlock 再 addEvent（addEvent 自身加锁）。
+	if slashCmd := parseSlashCommand(content); slashCmd != "" {
+		if slashCmd == "distill" {
+			// 命中 /提炼：持锁快照会话数据供异步提炼（goroutine 只读快照，不触活会话）。
+			snap := distillSnapshot{
+				goal:         strings.TrimSpace(session.Goal),
+				result:       strings.TrimSpace(session.Result),
+				events:       append([]internalEvent(nil), session.Events...),
+				userMessages: userMessagesText(session),
+			}
+			s.store.mu.Unlock()
+			// 指令消息落用户气泡事件（开新回合可见），随后异步提炼。
+			s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)
+			go s.distillSession(session, snap)
+			return nil
+		}
+		// 未识别指令：落用户气泡 + System 提示，不进 LLM 对话历史、不触发续跑。
+		s.store.mu.Unlock()
+		s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)
+		s.store.addEvent(session, eventkind.System, "System",
+			fmt.Sprintf("未知指令 %s。可用指令：/提炼（把本会话上文提炼为经验技能与块记忆）", strings.TrimSpace(content)),
+			"", "", "", "", "", true)
+		return nil
+	}
+
 	// 待答复的 Agent 提问（TODO #24 ask_user；#53 选项解析）：答复写 askUser 通道。
 	// 带选项时按选项 ID/Label/数字序号解析回传（Label 连接文本），自由文本原样透传。
 	if session.askUser != nil {
@@ -4552,6 +4607,186 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 		go s.resumeSession(session)
 	}
 	return nil
+}
+
+// parseSlashCommand 解析快捷指令：trim 后整体匹配单 token 斜杠指令（^/\S+$）才返回
+// 指令名（小写化），否则返回空串。/提炼 与 /distill 都映射为 "distill"；其余返回原指令名。
+func parseSlashCommand(content string) string {
+	t := strings.TrimSpace(content)
+	if len(t) < 2 || t[0] != '/' {
+		return ""
+	}
+	// 单 token：指令本体不含任何空白（多行/带空格文本正常透传，不拦截）。
+	if strings.ContainsAny(t, " \t\r\n\v\f") {
+		return ""
+	}
+	name := strings.ToLower(t[1:])
+	if name == "提炼" || name == "distill" {
+		return "distill"
+	}
+	return name
+}
+
+// distillSnapshot 是 /提炼 指令命中时在 store.mu 锁内拷贝的会话数据快照：
+// 异步提炼 goroutine 只读快照，不回访活会话对象（会话可能同时在新回合写入）。
+type distillSnapshot struct {
+	goal         string          // 会话目标（trim 后）
+	result       string          // 会话总结（trim 后；进行中会话通常为空）
+	events       []internalEvent // 事件流拷贝（append 拷贝，非共享底层数组）
+	userMessages string          // 用户消息拼接（userMessagesText 同口径）
+}
+
+// SetBlockMemoryDistiller 注入手动提炼的块记忆沉淀回调（bootstrap 接事实提取器+块记忆写入器）；
+// fn 返回成功沉淀条数。nil 时 /提炼 只做技能提炼。
+func (s *ReactService) SetBlockMemoryDistiller(fn func(ctx context.Context, sessionID, text string) (int, error)) {
+	s.blockDistiller = fn
+}
+
+// distillEventsSnapshot 对事件快照做摘要：与 evolver.go eventsDigest 同口径
+//（最近 30 条、单行 120 runes、整体 1500 runes），但接受快照切片而非活会话，
+// 供 /提炼 异步 goroutine 在不持锁、不触活会话的前提下构造 EvolveInput。
+func distillEventsSnapshot(events []internalEvent) string {
+	const keep = 30
+	if len(events) > keep {
+		events = events[len(events)-keep:]
+	}
+	var b strings.Builder
+	for _, ev := range events {
+		agent := ev.Agent
+		if agent == "" {
+			agent = ev.Type
+		}
+		line := strings.TrimSpace(ev.Message)
+		if line == "" {
+			continue
+		}
+		if ev.Tool != "" {
+			line = ev.Tool + " " + line
+		}
+		b.WriteString(agent)
+		b.WriteString(": ")
+		b.WriteString(truncateRunesForEvolver(line, 120))
+		b.WriteString("\n")
+	}
+	return truncateRunesForEvolver(strings.TrimRight(b.String(), "\n"), evolveDigestMaxRunes)
+}
+
+// distillSession /提炼 快捷指令本体：把本会话上文立即提炼为经验技能（复用会话结束
+// 同一 evolver 管线，只落技能包——画像/项目偏好仍归会话结束自动路径，避免双写）
+// + 块记忆（blockDistiller）。结果以 System 事件回执进聊天流。异步 goroutine 内运行。
+func (s *ReactService) distillSession(session *reactInternalSession, snap distillSnapshot) {
+	// 全程 recover：异步 goroutine 内 panic 不能拖垮进程。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[distill] panic recovered: session=%s panic=%v", session.ID, r)
+		}
+	}()
+	receipt := func(msg string) {
+		s.store.addEvent(session, eventkind.System, "System", msg, "", "", "", "", "", true)
+	}
+	if len(snap.events) < minEvolveEvents {
+		receipt(fmt.Sprintf("手动提炼：会话内容太少（事件 %d < %d），暂不沉淀", len(snap.events), minEvolveEvents))
+		return
+	}
+	digest := distillEventsSnapshot(snap.events)
+	if snap.goal == "" && snap.userMessages == "" {
+		receipt("手动提炼：无可用内容（无目标且无用户消息）")
+		return
+	}
+
+	// ① 经验技能：会话结束同一 evolver 管线（EvolveInput 同构），只取 Skills 落 skillSink；
+	// 失败/未接线不中断，记入回执原因后继续块记忆。
+	var skillTitles []string
+	skillNote := ""
+	if s.evolver == nil {
+		skillNote = "技能提炼跳过: evolver 未接线"
+	} else {
+		in := EvolveInput{
+			Goal:         snap.goal,
+			Summary:      snap.result,
+			EventsDigest: digest,
+			UserMessages: snap.userMessages,
+			Outcome:      "mixed",
+		}
+		ctx, cancel := context.WithTimeout(
+			logger.NewContext(context.Background(), s.sessionLogger(session.ID, "ManualDistill")),
+			evolveTimeout)
+		out, err := s.evolver(ctx, in)
+		cancel()
+		switch {
+		case err != nil || out == nil:
+			skillNote = fmt.Sprintf("技能提炼失败: %v", err)
+			log.Printf("[distill] evolve failed: session=%s err=%v", session.ID, err)
+		case len(out.Skills) == 0:
+			// 无新技能：不进回执明细（最终回执有"未产出"兜底文案）。
+		case s.skillSink == nil:
+			skillNote = "技能落库跳过: skillSink 未接线"
+		default:
+			sinkCtx, sinkCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			err := s.skillSink(sinkCtx, session.ID, out.Skills, "mixed")
+			sinkCancel()
+			if err != nil {
+				skillNote = fmt.Sprintf("技能落库失败: %v", err)
+				log.Printf("[distill] skill sink failed: session=%s err=%v", session.ID, err)
+			} else {
+				for _, sk := range out.Skills {
+					skillTitles = append(skillTitles, sk.Title)
+				}
+			}
+		}
+	}
+
+	// ② 块记忆：goal + result + 事件摘要 + 用户消息拼接（各自 trim 后非空段）交 distiller。
+	saved := 0
+	memNote := ""
+	if s.blockDistiller == nil {
+		memNote = "块记忆沉淀跳过: 未接线"
+	} else {
+		var segs []string
+		for _, seg := range []string{snap.goal, snap.result, digest, snap.userMessages} {
+			if seg = strings.TrimSpace(seg); seg != "" {
+				segs = append(segs, seg)
+			}
+		}
+		memCtx, memCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		n, err := s.blockDistiller(memCtx, session.ID, strings.Join(segs, "\n"))
+		memCancel()
+		if err != nil {
+			memNote = fmt.Sprintf("块记忆沉淀失败: %v", err)
+			log.Printf("[distill] block distill failed: session=%s err=%v", session.ID, err)
+		} else {
+			saved = n
+		}
+	}
+
+	// 最终回执：产出明细在前，失败/跳过原因附括号；全空给兜底文案。
+	var parts []string
+	if len(skillTitles) > 0 {
+		parts = append(parts, "技能 "+strings.Join(skillTitles, "、"))
+	}
+	if saved > 0 {
+		parts = append(parts, fmt.Sprintf("块记忆 +%d 条", saved))
+	}
+	var notes []string
+	if len(skillTitles) == 0 && skillNote != "" {
+		notes = append(notes, skillNote)
+	}
+	if saved == 0 && memNote != "" {
+		notes = append(notes, memNote)
+	}
+	switch {
+	case len(parts) == 0 && len(notes) == 0:
+		receipt("手动提炼完成：未产出可沉淀内容（无新技能、无新块记忆）")
+	case len(parts) == 0:
+		receipt("手动提炼完成：未产出可沉淀内容（" + strings.Join(notes, "；") + "）")
+	default:
+		msg := "手动提炼完成：" + strings.Join(parts, "；")
+		if len(notes) > 0 {
+			msg += "（" + strings.Join(notes, "；") + "）"
+		}
+		receipt(msg)
+	}
+	log.Printf("[distill] done: session=%s skills=%d blocks=%d", session.ID, len(skillTitles), saved)
 }
 
 // resumePausedDomain 恢复一个因触达 token 上限而 Paused 的 DomainAgent。

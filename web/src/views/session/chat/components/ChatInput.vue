@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, reactive, watch, onUnmounted } from 'vue'
+import { ref, computed, reactive, watch, nextTick, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { WireImage, SessionGear, SessionThinking, TrustMode, Session } from '@/types'
 import { setTrustMode, setSessionGear, setSessionThinking, setSessionPlugins } from '@/api/session'
@@ -401,9 +401,72 @@ function handleSubmit() {
   pendingImages.value = []
 }
 
+// ── /提炼 快捷指令面板：已绑定会话时输入 "/" 开头弹出。后端拦截 /提炼 做记忆提炼，
+// 前端只负责补全与发送（无需新 API）。 ──
+const SLASH_COMMANDS = [
+  { cmd: '/提炼', aliases: ['/distill'], desc: '把本会话上文提炼为经验技能与块记忆' },
+] as const
+
+const slashHighlight = ref(0)
+// Esc 关闭标记：可见性由内容推导，Esc 只是"本次输入别再弹"，内容一变即重置。
+const slashDismissed = ref(false)
+
+const slashMatches = computed(() => {
+  if (!props.sessionBound) return []
+  const text = content.value
+  if (!text.startsWith('/') || text.includes('\n')) return []
+  return SLASH_COMMANDS.filter(
+    (c) => c.cmd.startsWith(text) || c.aliases.some((a) => a.startsWith(text)),
+  )
+})
+
+const slashPanelVisible = computed(() => {
+  if (slashDismissed.value || !slashMatches.value.length) return false
+  const trimmed = content.value.trim()
+  // 已是某命令完整形态（含别名）：隐藏面板，让 Enter 直接发送给后端拦截处理。
+  return !SLASH_COMMANDS.some((c) => trimmed === c.cmd || c.aliases.some((a) => trimmed === a))
+})
+
+watch(content, () => {
+  slashHighlight.value = 0
+  slashDismissed.value = false
+})
+
+// 补全：写入命令完整形态、关面板、光标到末尾；用户再按 Enter 走原 handleSubmit 发送。
+async function applySlashCommand(cmd: string) {
+  content.value = cmd
+  slashDismissed.value = true
+  await nextTick()
+  const el = textareaRef.value?.textarea as HTMLTextAreaElement | undefined
+  if (el) {
+    el.focus()
+    el.selectionStart = el.selectionEnd = el.value.length
+  }
+}
+
 function onKeydown(e: KeyboardEvent) {
   // 中文输入法组词回车不发送（isComposing）；Shift+Enter 换行走默认行为，Enter 直接发送
   if (e.isComposing || e.keyCode === 229) return
+  // 快捷指令面板可见时优先接管按键（Enter 分支须在现有发送逻辑之前判断）
+  if (slashPanelVisible.value) {
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault()
+      const n = slashMatches.value.length
+      slashHighlight.value = (slashHighlight.value + (e.key === 'ArrowDown' ? 1 : n - 1)) % n
+      return
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault()
+      const item = slashMatches.value[slashHighlight.value]
+      if (item) applySlashCommand(item.cmd)
+      return
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      slashDismissed.value = true
+      return
+    }
+  }
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     handleSubmit()
@@ -460,14 +523,28 @@ function onKeydown(e: KeyboardEvent) {
           </button>
         </div>
       </div>
-      <el-input ref="textareaRef" v-model="content"
-                type="textarea"
-                :autosize="{ minRows: 2, maxRows: 8 }"
-                :placeholder="placeholderText"
-                resize="none"
-                class="chat-input"
-                @keydown="onKeydown"
-                @paste="onPaste" />
+      <div class="relative">
+        <!-- /提炼 快捷指令面板：已绑定会话且输入 "/" 开头时弹出，Enter/Tab/点击补全 -->
+        <div v-if="slashPanelVisible"
+             class="absolute bottom-full left-0 mb-2 w-full bg-card border border-line rounded shadow-lg z-10 overflow-hidden">
+          <div v-for="(c, i) in slashMatches" :key="c.cmd"
+               class="flex items-baseline gap-2 px-3 py-2 cursor-pointer"
+               :class="i === slashHighlight ? 'bg-page' : ''"
+               @mouseenter="slashHighlight = i"
+               @click="applySlashCommand(c.cmd)">
+            <span class="font-mono font-bold text-sm text-ink">{{ c.cmd }}</span>
+            <span class="text-xs text-ink-2">{{ c.desc }}</span>
+          </div>
+        </div>
+        <el-input ref="textareaRef" v-model="content"
+                  type="textarea"
+                  :autosize="{ minRows: 2, maxRows: 8 }"
+                  :placeholder="placeholderText"
+                  resize="none"
+                  class="chat-input"
+                  @keydown="onKeydown"
+                  @paste="onPaste" />
+      </div>
       <!-- 工具条：左侧 模型与会话设置/插件/图片（统一 small 高度、gap-1.5；
            信任模式/执行档位/思考强度已收编进模型弹层"本会话设置"分区），
            右侧 token 计数 + 发送按钮；过窄时自动折行 -->
