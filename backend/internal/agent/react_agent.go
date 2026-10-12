@@ -1315,10 +1315,10 @@ func (a *ReActAgent) logPromptStats(round int, system string, messages, history 
 	log.Printf("[prompt-stats] agent=%s round=%d sys=%d tools=%d/%dr hist=%d dyn=%d",
 		a.name, round, sysRunes, len(toolSchemas), toolDescRunes, histRunes, dynRunes)
 	if round == 0 && len(a.promptStatsSegs) > 0 {
-		log.Printf("[prompt-stats] sys segments agent=%s persona=%d env=%d role_base=%d discipline=%d skill=%d memidx=%d",
+		log.Printf("[prompt-stats] sys segments agent=%s persona=%d env=%d role_base=%d discipline=%d skill=%d memidx=%d evolution=%d",
 			a.name, a.promptStatsSegs["persona"], a.promptStatsSegs["env"],
 			a.promptStatsSegs["role_base"], a.promptStatsSegs["discipline"], a.promptStatsSegs["skill"],
-			a.promptStatsSegs["memory_index"])
+			a.promptStatsSegs["memory_index"], a.promptStatsSegs["evolution"])
 	}
 }
 
