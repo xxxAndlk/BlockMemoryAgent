@@ -230,8 +230,14 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 	r.Register(&escalateGearTool{})
 	// 注册 remember_preference 工具（TODO #28 用户画像）；hook 在 SetUserProfileHook 注入后生效。
 	r.Register(&rememberPreferenceTool{})
+	// 注册 update_evolution_prompt 工具（AI 自维护角色演化准则）；hook 在 SetEvolutionPromptHook 注入后生效。
+	// 注册始终发生，使 Schema 中可见；调用时 hook 未注入返回错误。
+	r.Register(&updateEvolutionPromptTool{})
 	// 注册 search_knowledge 工具（外部知识库）；hook 在 SetKnowledgeSearchHook 注入后生效。
 	r.Register(&searchKnowledgeTool{})
+	// 注册 search_block_memory 工具（跨会话块记忆语义检索，顶层读侧）；hook 在 SetBlockMemorySearchHook 注入后生效。
+	// 注册始终发生，使 Schema 中可见；调用时 hook 未注入返回错误。
+	r.Register(&searchBlockMemoryTool{})
 	// 注册 plugin_* 工具组（TODO #51 插件自安装闭环）；mgr 在 SetPluginManager 注入后生效。
 	r.Register(&pluginSearchTool{})
 	r.Register(&pluginInstallTool{})
@@ -530,6 +536,28 @@ func (r *Registry) SetMediaResolver(fn MediaResolveFunc) {
 	defer r.mu.RUnlock()
 	if t, ok := r.tools["ReadMedia"].(*readMediaTool); ok {
 		t.resolver = fn
+	}
+}
+
+// SetEvolutionPromptHook 注入角色自进化准则写入回调（bootstrap 接 RoleEvolutionStore.Upsert）。
+// nil 时工具返回未接线错误（与 remember_preference 同款语义）。
+func (r *Registry) SetEvolutionPromptHook(h func(ctx context.Context, roleID, content, sessionID string) error) {
+	if r == nil {
+		return
+	}
+	if t, ok := r.tools["update_evolution_prompt"].(*updateEvolutionPromptTool); ok {
+		t.hook = h
+	}
+}
+
+// SetBlockMemorySearchHook 注入块记忆语义检索回调（bootstrap 接 KnowledgeStore，返回格式化结果）。
+// nil 时工具返回未接线错误（与 search_knowledge 同款语义）。
+func (r *Registry) SetBlockMemorySearchHook(h func(ctx context.Context, query string) (string, error)) {
+	if r == nil {
+		return
+	}
+	if t, ok := r.tools["search_block_memory"].(*searchBlockMemoryTool); ok {
+		t.hook = h
 	}
 }
 

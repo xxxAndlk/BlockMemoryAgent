@@ -120,6 +120,10 @@ type reactInternalSession struct {
 	// atomic.Value 保证跨 goroutine 读取（providerForRole 每次 LLM 调用实时读取，
 	// 切换下一次调用即生效）；只覆盖本会话顶层 Agent，子 Agent 各按角色解析。
 	thinking atomic.Value
+	// pinnedPlugins 是会话级指定插件 ID 列表（KIMI 式插件选择）：用户显式勾选后其工具
+	// 强制预挂到会话顶层 scope 并注入提示块要求优先使用；空=不指定（模型自行判断）。
+	// atomic.Value 保证跨 goroutine 读写（HTTP 切换即时生效，runSession 起跑重挂读取）。
+	pinnedPlugins atomic.Value
 	// activeTopicID 当前活跃话题 ID。切换话题时旧 Agent 树终结 + 新树起,
 	// 旧话题摘要写入 sharedKV `topic:{sessionID}:{topicID}:summary`。空表示单话题(未切换过)。
 	// 话题 ID 也在切换时用于emetries 标签(若需)。
@@ -493,6 +497,26 @@ func (s *reactInternalSession) currentThinking() string {
 // setThinking 设置会话级思考强度（atomic 存储无需额外加锁）。
 func (s *reactInternalSession) setThinking(thinking string) {
 	s.thinking.Store(thinking)
+}
+
+// currentPinnedPlugins 返回会话级指定插件 ID 列表（KIMI 式插件选择）；
+// 未设置返回 nil（= 不指定，模型自行判断）。
+// runSession 起跑重挂与提示块构建读取；HTTP 切换经 setPinnedPlugins 原子生效。
+func (s *reactInternalSession) currentPinnedPlugins() []string {
+	if v := s.pinnedPlugins.Load(); v != nil {
+		if ids, ok := v.([]string); ok {
+			return ids
+		}
+	}
+	return nil
+}
+
+// setPinnedPlugins 设置会话级指定插件（atomic 存储无需额外加锁；空切片=清空）。
+func (s *reactInternalSession) setPinnedPlugins(ids []string) {
+	if ids == nil {
+		ids = []string{}
+	}
+	s.pinnedPlugins.Store(ids)
 }
 
 // currentWorkDir 返回会话的每会话工作目录；未设置返回空串（= 回落进程默认目录）。
@@ -874,13 +898,15 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 }
 
 // sessionMetaMemory 组装会话持久化 meta（TODO #14 会话三档控制 + 2026-09-16 会话级
-// 思考强度）：档位 gear + 思考强度 thinking，重启恢复分别经 gearFromMetaMemory /
-// thinkingFromMetaMemory 回填；字段以 map 键增量扩展，旧记录缺键自然回落默认。
-// 两者皆空返回空切片（与 MetaMemory 列历史写入形态一致）。
+// 思考强度 + 会话级指定插件）：档位 gear + 思考强度 thinking + 指定插件 pinned_plugins，
+// 重启恢复分别经 gearFromMetaMemory / thinkingFromMetaMemory / pinnedPluginsFromMetaMemory
+// 回填；字段以 map 键增量扩展，旧记录缺键自然回落默认。
+// 三者皆空返回空切片（与 MetaMemory 列历史写入形态一致）。
 func sessionMetaMemory(session *reactInternalSession) []map[string]any {
 	g := session.currentGear()
 	t := session.currentThinking()
-	if g == "" && t == "" {
+	ids := session.currentPinnedPlugins()
+	if g == "" && t == "" && len(ids) == 0 {
 		return []map[string]any{}
 	}
 	m := map[string]any{}
@@ -889,6 +915,9 @@ func sessionMetaMemory(session *reactInternalSession) []map[string]any {
 	}
 	if t != "" {
 		m["thinking"] = t
+	}
+	if len(ids) > 0 {
+		m["pinned_plugins"] = ids
 	}
 	return []map[string]any{m}
 }
@@ -922,6 +951,42 @@ func thinkingFromMetaMemory(meta []map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// pinnedPluginsFromMetaMemory 从持久化 meta 读取会话级指定插件 ID 列表（KIMI 式插件选择）：
+// 取首个非空列表；元素逐个断言为字符串（脏数据跳过）。缺键/无 meta 返回 nil（= 不指定）。
+// 插件可用性不在此校验——恢复后由 runSession 的 applyPinnedPlugins 经 resolver 重挂，
+// 已停用/已卸载的插件自然挂不上（MountPreApprovedForScope 跳过未注册工具）。
+func pinnedPluginsFromMetaMemory(meta []map[string]any) []string {
+	for _, m := range meta {
+		if m == nil {
+			continue
+		}
+		raw, ok := m["pinned_plugins"].([]any)
+		if !ok {
+			// 内存直写形态（未经 JSONB 往返）容忍 []string。
+			if ss, ok2 := m["pinned_plugins"].([]string); ok2 {
+				raw = make([]any, 0, len(ss))
+				for _, id := range ss {
+					raw = append(raw, id)
+				}
+				ok = true
+			}
+		}
+		if !ok {
+			continue
+		}
+		ids := make([]string, 0, len(raw))
+		for _, v := range raw {
+			if id, ok := v.(string); ok && id != "" {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) > 0 {
+			return ids
+		}
+	}
+	return nil
 }
 
 // persistFullHistory 把主对话（MetaAgent，agentID==sessionID）的完整 ReAct 消息历史
@@ -1155,6 +1220,9 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 	sess.setGear(gearFromMetaMemory(rec.MetaMemory, st.defaultGear))
 	// 恢复会话级思考强度（2026-09-16）：缺键回落空串=跟随角色默认。
 	sess.setThinking(thinkingFromMetaMemory(rec.MetaMemory))
+	// 恢复会话级指定插件（KIMI 式插件选择）：缺键回落 nil=不指定；
+	// 工具重挂在 runSession 起跑时经 applyPinnedPlugins 完成（挂载集纯内存）。
+	sess.setPinnedPlugins(pinnedPluginsFromMetaMemory(rec.MetaMemory))
 	// mailbox 未读重投（P0 持久化）：重启前已投递未消费的邮件回箱，meta/热驻槽
 	// 恢复后经 drainMailbox 自然消费；同 ID 幂等（Restore 内部去重）。
 	st.reloadUnreadMailbox(rec.SessionID)

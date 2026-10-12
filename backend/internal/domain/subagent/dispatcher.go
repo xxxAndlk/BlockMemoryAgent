@@ -291,6 +291,10 @@ type Dispatcher struct {
 	saver BlockMemorySaver
 	// writeEnabled 块记忆写入开关，由配置（agent.block_memory_write_enabled）注入。
 	writeEnabled bool
+	// evolutionPromptFn 角色自进化准则读取回调（WithEvolutionPromptProvider 注入，
+	// bootstrap 接 RoleEvolutionStore）：返回角色当前准则全文（≤300字），
+	// 空串=该角色无准则不注入，nil=未接线。
+	evolutionPromptFn func(roleID string) string
 
 	// log 是会话级日志器，用于记录子 Agent LLM I/O（完整 prompt/response）到 session_logs。
 	// 为 nil 时子 Agent 不写 LLM I/O 日志，不影响派发主流程。
@@ -1774,6 +1778,20 @@ func (d *Dispatcher) skillBlockFor(agentID string, roleDef *types.RoleDefinition
 	return skill.MetadataBlock(d.skillPool, names)
 }
 
+// evolutionBlockFor 渲染【自进化准则】系统提示块：本角色历史沉淀的抽象行为准则，
+// 每回合直接注入（与 skill/块记忆互不相关）。空内容/未接线返回空串（零注入）。
+// 渲染文案与 ReactService.evolutionBlockFor 保持一致（全系统统一格式）。
+func (d *Dispatcher) evolutionBlockFor(roleID string) string {
+	if d.evolutionPromptFn == nil || roleID == "" {
+		return ""
+	}
+	content := strings.TrimSpace(d.evolutionPromptFn(roleID))
+	if content == "" {
+		return ""
+	}
+	return "【自进化准则】本角色在历史使用中沉淀的抽象行为准则（可经 update_evolution_prompt 全量更新，≤300字）：\n" + content
+}
+
 // WithTaskRuneLimits 配置派发 task 文本双档上限（TODO #35 放开预算）：
 // 超 soft 未达 hard 软着陆放行附警告，超 hard 硬拒。<=0 按默认 3000/4000。
 // bootstrap 按 cfg.Agent.TaskMaxRunes / TaskMaxRunesHard 注入。
@@ -2196,6 +2214,14 @@ func (d *Dispatcher) WithSalvageTimeout(t time.Duration) *Dispatcher {
 func (d *Dispatcher) WithBlockMemorySaver(s BlockMemorySaver, enabled bool) *Dispatcher {
 	d.saver = s
 	d.writeEnabled = enabled
+	return d
+}
+
+// WithEvolutionPromptProvider 注入角色自进化准则读取回调（bootstrap 接
+// RoleEvolutionStore）；fn 返回角色当前准则全文（≤300字），空串=该角色无准则
+// 不注入。传 nil 关闭。
+func (d *Dispatcher) WithEvolutionPromptProvider(fn func(roleID string) string) *Dispatcher {
+	d.evolutionPromptFn = fn
 	return d
 }
 
@@ -4535,6 +4561,8 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// 技能渐进披露第一层：【可用技能】元数据块注入系统提示（正文经 load_skill 按需取）。
 	// 持有集以 heldSkills 为权威（未登记回退角色固定集），skillPool nil 时零行为。
 	sub = sub.WithSkillBlock(d.skillBlockFor(subAgentID, &roleDef))
+	// 自进化准则槽：角色级抽象行为准则注入（未接线/无准则返回空串，零注入）。
+	sub = sub.WithEvolutionBlock(d.evolutionBlockFor(roleDef.ID))
 	// 注入未决子 Agent 检查器：子 Agent 也能递归派发（domain -> 叶子助手），
 	// 无此检查时子 Agent 会在派发后立刻给出中间汇报式终答（不等待 mailbox），
 	// 父链路上的 Agent 会把“中间状态”误当最终结果（实证：domain-1 拆两个子任务后
@@ -5171,6 +5199,8 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	// resume 重建的 Agent 恢复技能块：持有集从 heldSkills 取（一次性路径派发时已登记；
 	// 进程重启丢失则回退角色固定集）。
 	sub = sub.WithSkillBlock(d.skillBlockFor(pausedNodeID, roleDef))
+	// 自进化准则槽：同一次性派发路径（未接线/无准则返回空串，零注入）。
+	sub = sub.WithEvolutionBlock(d.evolutionBlockFor(roleDef.ID))
 	// 同 runSubAgentOnce：resume 重建的 domain Agent 也可能继续递归派发，
 	// 需要终结保护等待自己的子 Agent（Dispatcher 自身实现 PendingChildrenChecker）。
 	sub = sub.WithPendingChildrenChecker(d)

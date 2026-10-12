@@ -185,7 +185,7 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 		// 注意：生产 config/roles.yaml 已通过 meta_agent.tools 覆盖去掉 HTTPGet——实证其
 		// 永远优先于需挂载的 web_search 插件被选中；联网调研集中于 meta + web_search 插件。
 		// roles.yaml meta_agent.tools 非空时整体覆盖白名单；为空保持上述内置默认。
-		tools := []string{"call_sub_agent", "call_sub_agents", "map_sub_agents", "merge_worktree", "WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "ReadMedia", "ShowArtifact", "WriteFile", "EditFile", "RestoreFile", "ReadFile", "RunCommand", "HTTPGet", "create_role", "list_roles", "list_models", "set_role_model", "set_agent_model", "RefreshProjectDoc", "send_message", "cancel_agent", "pause_agent", "resume_agent", "ask_user", "schedule_task", "write_plan", "submit_plan", "review_plan", "remember_preference", "search_knowledge", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount", "list_skills", "load_skill", "expand_memory"}
+		tools := []string{"call_sub_agent", "call_sub_agents", "map_sub_agents", "merge_worktree", "WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "ReadMedia", "ShowArtifact", "WriteFile", "EditFile", "RestoreFile", "ReadFile", "RunCommand", "HTTPGet", "create_role", "list_roles", "list_models", "set_role_model", "set_agent_model", "RefreshProjectDoc", "send_message", "cancel_agent", "pause_agent", "resume_agent", "ask_user", "schedule_task", "write_plan", "submit_plan", "review_plan", "remember_preference", "search_knowledge", "update_evolution_prompt", "search_block_memory", "plugin_search", "plugin_install", "plugin_enable", "plugin_disable", "plugin_list", "tool_catalog", "tool_mount", "tool_unmount", "list_skills", "load_skill", "expand_memory"}
 		if len(r.cfg.MetaAgent.Tools) > 0 {
 			tools = r.cfg.MetaAgent.Tools
 		}
@@ -232,6 +232,8 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 				// domain 角色同时是 daily 档顶层与全部 domain 子 Agent 的共享定义，
 				// hook 侧按 agentID==sessionID 守卫，子 Agent 调用返回拒绝文案。
 				"escalate_gear",
+				// 自进化准则自维护 + 块记忆读侧语义召回（与 meta 对齐）。
+				"update_evolution_prompt", "search_block_memory",
 			},
 			CanBeCalled: true,
 		}

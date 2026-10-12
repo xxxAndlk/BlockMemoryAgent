@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { ref, computed, reactive, watch, onUnmounted } from 'vue'
+import { ref, computed, reactive, watch, nextTick, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { WireImage, SessionGear, SessionThinking, TrustMode, Session } from '@/types'
-import { setTrustMode, setSessionGear, setSessionThinking } from '@/api/session'
+import { setTrustMode, setSessionGear, setSessionThinking, setSessionPlugins } from '@/api/session'
 import { useModelSelection } from '@/composables/useModelSelection'
+import { usePluginSelection } from '@/composables/usePluginSelection'
+import { useRouter } from 'vue-router'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 import { useWorkDir } from '@/composables/useWorkDir'
 
@@ -29,7 +31,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'submit', content: string, images: WireImage[], gear: SessionGear, thinking: SessionThinking): void
+  (e: 'submit', content: string, images: WireImage[], gear: SessionGear, thinking: SessionThinking, plugins: string[]): void
   (e: 'new-session'): void
   (e: 'update-workdir', dir: string): void
 }>()
@@ -127,6 +129,67 @@ async function onTrustModeChange(mode: TrustMode) {
   } catch (e) {
     ElMessage.error('切换信任模式失败：' + (e instanceof Error ? e.message : String(e)))
   }
+}
+
+// ── 会话级指定插件（KIMI 式插件选择）：选中 = 优先/强制使用（后端预挂工具 + 提示词强约束），
+// 不选 = 模型自行判断。未绑定会话 = 创建选择（localStorage 记忆，随创建请求携带）；
+// 已绑定 = 勾选即 POST 即时切换（下一轮起跑生效），失败回滚勾选。
+const PLUGINS_STORAGE_KEY = 'bma:newSessionPlugins'
+const { selectable: selectablePlugins, loading: pluginsLoading, ensureLoaded: ensurePluginsLoaded } = usePluginSelection()
+const pluginPopoverVisible = ref(false)
+const pluginSaving = ref(false)
+const router = useRouter()
+
+function loadStoredPlugins(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PLUGINS_STORAGE_KEY) || '[]')
+    return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : []
+  } catch {
+    return []
+  }
+}
+const pinnedPlugins = ref<string[]>(loadStoredPlugins())
+// 绑定会话后以会话快照回显（pinned_plugins 空 = 未指定）。
+watch(
+  () => [props.sessionBound, props.session?.pinned_plugins] as const,
+  ([bound, ids]) => { if (bound) pinnedPlugins.value = [...(ids ?? [])] },
+  { immediate: true },
+)
+watch(pluginPopoverVisible, (v) => { if (v) ensurePluginsLoaded() })
+
+async function applyPinnedPlugins(next: string[]) {
+  const prev = pinnedPlugins.value
+  pinnedPlugins.value = next
+  if (!props.sessionBound || !props.session) {
+    localStorage.setItem(PLUGINS_STORAGE_KEY, JSON.stringify(next))
+    return
+  }
+  pluginSaving.value = true
+  try {
+    await setSessionPlugins(props.session.id, next)
+    ElMessage.success(next.length ? `已指定 ${next.length} 个插件（优先使用，下一轮生效）` : '已清空指定插件（模型自行判断）')
+  } catch (e) {
+    ElMessage.error('切换指定插件失败：' + (e instanceof Error ? e.message : String(e)))
+    pinnedPlugins.value = prev
+  } finally {
+    pluginSaving.value = false
+  }
+}
+
+function onTogglePlugin(id: string, checked: boolean) {
+  const set = new Set(pinnedPlugins.value)
+  if (checked) set.add(id)
+  else set.delete(id)
+  applyPinnedPlugins([...set])
+}
+
+function clearPlugins() {
+  applyPinnedPlugins([])
+}
+
+function goPluginsPage() {
+  pluginPopoverVisible.value = false
+  router.push('/plugins')
 }
 
 // 待发送图片（任务 111 Web 侧同步）：顺序与 [image:N] 占位符编号升序对齐
@@ -333,14 +396,77 @@ async function onAddModel() {
 
 function handleSubmit() {
   if (!canSend.value) return
-  emit('submit', content.value.trim(), pendingImages.value.slice(), gear.value, thinking.value)
+  emit('submit', content.value.trim(), pendingImages.value.slice(), gear.value, thinking.value, pinnedPlugins.value.slice())
   content.value = ''
   pendingImages.value = []
+}
+
+// ── /提炼 快捷指令面板：已绑定会话时输入 "/" 开头弹出。后端拦截 /提炼 做记忆提炼，
+// 前端只负责补全与发送（无需新 API）。 ──
+const SLASH_COMMANDS = [
+  { cmd: '/提炼', aliases: ['/distill'], desc: '把本会话上文提炼为经验技能与块记忆' },
+] as const
+
+const slashHighlight = ref(0)
+// Esc 关闭标记：可见性由内容推导，Esc 只是"本次输入别再弹"，内容一变即重置。
+const slashDismissed = ref(false)
+
+const slashMatches = computed(() => {
+  if (!props.sessionBound) return []
+  const text = content.value
+  if (!text.startsWith('/') || text.includes('\n')) return []
+  return SLASH_COMMANDS.filter(
+    (c) => c.cmd.startsWith(text) || c.aliases.some((a) => a.startsWith(text)),
+  )
+})
+
+const slashPanelVisible = computed(() => {
+  if (slashDismissed.value || !slashMatches.value.length) return false
+  const trimmed = content.value.trim()
+  // 已是某命令完整形态（含别名）：隐藏面板，让 Enter 直接发送给后端拦截处理。
+  return !SLASH_COMMANDS.some((c) => trimmed === c.cmd || c.aliases.some((a) => trimmed === a))
+})
+
+watch(content, () => {
+  slashHighlight.value = 0
+  slashDismissed.value = false
+})
+
+// 补全：写入命令完整形态、关面板、光标到末尾；用户再按 Enter 走原 handleSubmit 发送。
+async function applySlashCommand(cmd: string) {
+  content.value = cmd
+  slashDismissed.value = true
+  await nextTick()
+  const el = textareaRef.value?.textarea as HTMLTextAreaElement | undefined
+  if (el) {
+    el.focus()
+    el.selectionStart = el.selectionEnd = el.value.length
+  }
 }
 
 function onKeydown(e: KeyboardEvent) {
   // 中文输入法组词回车不发送（isComposing）；Shift+Enter 换行走默认行为，Enter 直接发送
   if (e.isComposing || e.keyCode === 229) return
+  // 快捷指令面板可见时优先接管按键（Enter 分支须在现有发送逻辑之前判断）
+  if (slashPanelVisible.value) {
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault()
+      const n = slashMatches.value.length
+      slashHighlight.value = (slashHighlight.value + (e.key === 'ArrowDown' ? 1 : n - 1)) % n
+      return
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault()
+      const item = slashMatches.value[slashHighlight.value]
+      if (item) applySlashCommand(item.cmd)
+      return
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      slashDismissed.value = true
+      return
+    }
+  }
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     handleSubmit()
@@ -397,23 +523,38 @@ function onKeydown(e: KeyboardEvent) {
           </button>
         </div>
       </div>
-      <el-input ref="textareaRef" v-model="content"
-                type="textarea"
-                :autosize="{ minRows: 2, maxRows: 8 }"
-                :placeholder="placeholderText"
-                resize="none"
-                class="chat-input"
-                @keydown="onKeydown"
-                @paste="onPaste" />
-      <!-- 工具条：左侧模型/信任档/档位/思考档控件组（统一 small 高度、gap-1.5），
+      <div class="relative">
+        <!-- /提炼 快捷指令面板：已绑定会话且输入 "/" 开头时弹出，Enter/Tab/点击补全 -->
+        <div v-if="slashPanelVisible"
+             class="absolute bottom-full left-0 mb-2 w-full bg-card border border-line rounded shadow-lg z-10 overflow-hidden">
+          <div v-for="(c, i) in slashMatches" :key="c.cmd"
+               class="flex items-baseline gap-2 px-3 py-2 cursor-pointer"
+               :class="i === slashHighlight ? 'bg-page' : ''"
+               @mouseenter="slashHighlight = i"
+               @click="applySlashCommand(c.cmd)">
+            <span class="font-mono font-bold text-sm text-ink">{{ c.cmd }}</span>
+            <span class="text-xs text-ink-2">{{ c.desc }}</span>
+          </div>
+        </div>
+        <el-input ref="textareaRef" v-model="content"
+                  type="textarea"
+                  :autosize="{ minRows: 2, maxRows: 8 }"
+                  :placeholder="placeholderText"
+                  resize="none"
+                  class="chat-input"
+                  @keydown="onKeydown"
+                  @paste="onPaste" />
+      </div>
+      <!-- 工具条：左侧 模型与会话设置/插件/图片（统一 small 高度、gap-1.5；
+           信任模式/执行档位/思考强度已收编进模型弹层"本会话设置"分区），
            右侧 token 计数 + 发送按钮；过窄时自动折行 -->
       <div class="flex items-center justify-between gap-2">
         <div class="flex items-center gap-1.5 min-w-0 flex-wrap">
-          <!-- 模型选择弹层（工具行左）：角色 → 模型 → 思考强度 -->
+          <!-- 模型与会话设置弹层：角色 → 模型 → 角色思考强度；本会话设置（档位/思考/信任） -->
           <el-popover v-model:visible="modelPopoverVisible" placement="top-start" :width="380" trigger="click">
           <template #reference>
             <el-button text size="small" class="!text-ink-2 hover:!text-primary max-w-52 !px-2"
-                       title="选择模型（角色 / 模型 / 思考强度，可新增模型）">
+                       title="模型与会话设置（角色 / 模型 / 本会话档位 / 思考强度 / 信任模式）">
               <el-icon><Coin /></el-icon>
               <span class="ml-1 truncate text-xs">{{ currentRoleStatus?.model || '模型' }}</span>
             </el-button>
@@ -436,11 +577,43 @@ function onKeydown(e: KeyboardEvent) {
               </el-select>
             </div>
             <div>
-              <div class="mb-1 text-ink-2">思考强度</div>
+              <div class="mb-1 text-ink-2">思考强度（角色绑定）</div>
               <el-select v-model="selectedThinking" size="small" class="w-full">
                 <el-option value="" label="跟随角色默认" />
                 <el-option v-for="t in ['off', 'low', 'medium', 'high']" :key="t" :value="t" :label="t" />
               </el-select>
+            </div>
+            <!-- 本会话设置（自工具栏收编，输入栏精简）：热生效，切换即 POST 后端 -->
+            <div class="border-t border-line pt-2 space-y-2">
+              <div>
+                <div class="mb-1 text-ink-2" title="快速档=文档助手直达，日常档=DomainAgent 直接执行，集群档=Meta 全装编排">执行档位（本会话）</div>
+                <el-select v-model="gear" size="small" class="w-full"
+                           @change="onGearChange($event as SessionGear)">
+                  <el-option value="fast" label="快速档（文档助手直达）" />
+                  <el-option value="daily" label="日常档（DomainAgent 直接执行）" />
+                  <el-option value="cluster" label="集群档（Meta 全装编排）" />
+                </el-select>
+              </div>
+              <div>
+                <div class="mb-1 text-ink-2" title="只影响本会话顶层 Agent；运行中可改，下一次 LLM 调用生效">思考强度（本会话）</div>
+                <el-select v-model="thinking" size="small" class="w-full"
+                           @change="onThinkingChange($event as SessionThinking)">
+                  <el-option value="" label="跟随角色默认" />
+                  <el-option value="off" label="off" />
+                  <el-option value="low" label="low" />
+                  <el-option value="medium" label="medium" />
+                  <el-option value="high" label="high" />
+                </el-select>
+              </div>
+              <div v-if="sessionBound && session">
+                <div class="mb-1 text-ink-2" title="变更类操作的审批档位，切换下一工具调用生效">信任模式（本会话）</div>
+                <el-select :model-value="trustMode" size="small" class="w-full"
+                           @update:model-value="onTrustModeChange($event as TrustMode)">
+                  <el-option value="suggest" label="suggest 逐条审批" />
+                  <el-option value="auto-edit" label="auto-edit 审命令" />
+                  <el-option value="full-auto" label="full-auto 全自主" />
+                </el-select>
+              </div>
             </div>
             <div class="flex items-center justify-between pt-1">
               <el-button link type="primary" size="small" @click="addDialogVisible = true">＋ 新增模型</el-button>
@@ -451,38 +624,45 @@ function onKeydown(e: KeyboardEvent) {
             </div>
           </div>
         </el-popover>
+          <!-- 插件选择弹层（KIMI 式）：勾选 = 本会话优先/强制使用该插件；不勾选 = 模型自行判断 -->
+          <el-popover v-model:visible="pluginPopoverVisible" placement="top-start" :width="340" trigger="click">
+            <template #reference>
+              <el-button text size="small" class="!text-ink-2 hover:!text-primary !px-2"
+                         title="指定插件：勾选后本会话优先使用其工具；不勾选由模型自行判断">
+                <el-icon><MagicStick /></el-icon>
+                <span class="ml-1 text-xs">插件{{ pinnedPlugins.length ? `·${pinnedPlugins.length}` : '' }}</span>
+              </el-button>
+            </template>
+            <div class="text-xs" v-loading="pluginsLoading">
+              <div class="mb-1 text-ink-2">指定插件（勾选后本会话优先使用其工具）</div>
+              <div v-if="selectablePlugins.length" class="max-h-64 overflow-y-auto">
+                <div v-for="p in selectablePlugins" :key="p.id"
+                     class="flex items-start gap-2 py-1.5 border-b border-line last:border-b-0">
+                  <el-checkbox :model-value="pinnedPlugins.includes(p.id)" :disabled="pluginSaving"
+                               class="!mr-0 shrink-0"
+                               @change="onTogglePlugin(p.id, $event as boolean)" />
+                  <div class="min-w-0 flex-1">
+                    <div class="text-ink truncate">{{ p.name || p.id }}</div>
+                    <div class="text-ink-3 text-[11px] truncate" :title="p.description">{{ p.description || p.id }}</div>
+                  </div>
+                  <span class="text-[10px] text-ink-3 shrink-0">{{ p.tools?.length ?? 0 }} 工具</span>
+                </div>
+              </div>
+              <div v-else class="py-3 text-center text-ink-3">
+                暂无可用插件（已启用且运行中的插件才会出现在这里）
+              </div>
+              <div class="flex items-center justify-between pt-2">
+                <el-button link type="primary" size="small" @click="goPluginsPage">管理插件</el-button>
+                <el-button link size="small" :disabled="!pinnedPlugins.length || pluginSaving" @click="clearPlugins">清空</el-button>
+              </div>
+            </div>
+          </el-popover>
           <el-button text size="small" class="!text-ink-2 hover:!text-primary !px-2"
                      :disabled="pendingImages.length >= 4"
                      title="添加图片（或直接粘贴截图）"
                      @click="pickFiles">
             <el-icon><Picture /></el-icon>
           </el-button>
-          <!-- 信任模式（仅已绑定会话）：suggest=变更逐条审批 / auto-edit=命令与破坏性工具审批 / full-auto=全自主 -->
-          <el-select v-if="sessionBound && session" :model-value="trustMode" size="small" class="!w-32 shrink-0"
-                     title="信任模式：变更类操作的审批档位，切换下一工具调用生效"
-                     @update:model-value="onTrustModeChange($event as TrustMode)">
-            <el-option value="suggest" label="suggest 逐条审批" />
-            <el-option value="auto-edit" label="auto-edit 审命令" />
-            <el-option value="full-auto" label="full-auto 全自主" />
-          </el-select>
-          <!-- 执行档位（TODO #14 三档全手动）：未绑会话=创建时选档；已绑会话=即时切档，下一轮按新档选角色 -->
-          <el-select v-model="gear" size="small" class="!w-24 shrink-0"
-                     title="执行档位：快速档=文档助手直达，日常档=DomainAgent 直接执行，集群档=Meta 全装编排"
-                     @change="onGearChange($event as SessionGear)">
-            <el-option value="fast" label="快速档" />
-            <el-option value="daily" label="日常档" />
-            <el-option value="cluster" label="集群档" />
-          </el-select>
-          <!-- 思考强度（2026-09-16 会话级）：空=跟随角色默认；只影响本会话顶层 Agent，切换下一次 LLM 调用生效 -->
-          <el-select v-model="thinking" size="small" class="!w-28 shrink-0"
-                     title="思考强度（本会话顶层 Agent）：空=跟随角色默认；运行中可改，下一次 LLM 调用生效"
-                     @change="onThinkingChange($event as SessionThinking)">
-            <el-option value="" label="思考 跟随角色" />
-            <el-option value="off" label="思考 off" />
-            <el-option value="low" label="思考 low" />
-            <el-option value="medium" label="思考 medium" />
-            <el-option value="high" label="思考 high" />
-          </el-select>
         </div>
         <div class="flex items-center gap-2 shrink-0">
           <span class="text-[11px] text-ink-3 font-mono hidden sm:inline"

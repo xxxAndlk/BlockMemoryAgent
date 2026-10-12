@@ -130,6 +130,10 @@ type ReactService struct {
 	// memoryIndexFn 渲染【沉淀索引】块（TODO #20③+#22③ 记忆索引槽）：会话启动注入，
 	// 行数/runes 双配额（超限自带重写指令），nil=未接线不注入。
 	memoryIndexFn func() string
+	// evolutionPromptFn 读取角色自进化准则全文（角色级、AI 自维护、≤300字）：
+	// 每回合注入系统提示词尾部槽位，空串=该角色无准则不注入，nil=未接线。
+	// 由 bootstrap 接 RoleEvolutionStore。
+	evolutionPromptFn func(roleID string) string
 
 	// VideoOpts 用户消息视频附件（Alt+V 粘贴视频文件）抽帧参数：
 	// bootstrap 从 config.Video 注入，零值字段内部回落 DefaultVideoOptions。
@@ -177,6 +181,9 @@ type ReactService struct {
 	skillSink func(ctx context.Context, sessionID string, skills []EvolvedSkill, outcome string) error
 	// evolutionLog 进化审计写回调（evolution_log 表）；nil 时跳过审计。
 	evolutionLog func(ctx context.Context, sessionID, kind, target, summary string) error
+	// blockDistiller 手动提炼（/提炼 快捷指令）的块记忆沉淀回调：bootstrap 接
+	// 事实提取器+块记忆写入器；返回成功沉淀条数。nil 时 /提炼 只做技能提炼。
+	blockDistiller func(ctx context.Context, sessionID, text string) (int, error)
 	// skillRecall MetaAgent 侧经验技能向量预答回调（设计 §6.5）：goal -> top-3 提示行；
 	// nil 时零注入。与 Dispatcher 侧召回同源（bootstrap 注入同一检索函数）。
 	skillRecall func(ctx context.Context, task string) []SkillRecallHint
@@ -188,6 +195,10 @@ type ReactService struct {
 	// 快速/日常档会话启动时把返回的工具名预挂到顶层 Agent scope（=sessionID），
 	// 使顶层对接用户即具备联网搜索等能力；子 Agent scope 不预挂。nil 时零行为变化。
 	topLevelTools func() []string
+	// pluginToolsResolver 指定插件解析器（KIMI 式插件选择，bootstrap 注入 plugins.Manager
+	// 实现）：输入插件 ID 列表，返回有效插件（展示名+已注册工具名）与无效 ID
+	//（不存在/未启用/未运行）。nil 时指定插件功能不可用（Set 报错/Create 丢弃）。
+	pluginToolsResolver func(ids []string) (valid []PinnedPluginInfo, invalid []string)
 	// activityPinger 等待用户答复期间的心跳保活回调（bootstrap 注入
 	// subagent.Dispatcher.PingActivity）：审批/提问阻塞时周期性刷新子 Agent 活动时间，
 	// 防止心跳巡检把"等用户操作"误判假死 kill（实证 2026-08-18：三次误杀均卡在
@@ -404,6 +415,42 @@ func (s *ReactService) SetTopLevelToolsProvider(fn func() []string) {
 	s.topLevelTools = fn
 }
 
+// PinnedPluginInfo 是会话级指定插件的解析结果元素（resolver 返回值，KIMI 式插件选择）。
+type PinnedPluginInfo struct {
+	ID    string   // 插件 ID
+	Name  string   // 展示名（提示块与事件文案用）
+	Tools []string // 已注册工具名（带 <pluginID>__ 前缀）
+}
+
+// SetPluginToolsResolver 注入指定插件解析器（bootstrap 用 plugins.Manager 实现）；
+// 传 nil 关闭会话级指定插件功能（Set 报错、Create 丢弃、提示块零注入）。
+func (s *ReactService) SetPluginToolsResolver(fn func(ids []string) (valid []PinnedPluginInfo, invalid []string)) {
+	s.pluginToolsResolver = fn
+}
+
+// resolvePinnedPlugins 经 resolver 解析插件 ID 列表；resolver 未接线时全部视为无效。
+func (s *ReactService) resolvePinnedPlugins(ids []string) (valid []PinnedPluginInfo, invalid []string) {
+	if s.pluginToolsResolver == nil {
+		return nil, ids
+	}
+	return s.pluginToolsResolver(ids)
+}
+
+// normalizePluginIDs 归一化插件 ID 列表：去空白、去空串、去重（保序）。
+func normalizePluginIDs(ids []string) []string {
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
 // mountTopLevelEssentials 把配置声明的顶层必备插件工具（web_search 等）预挂到
 // 会话顶层 scope：三档全挂（2026-09-18 修复：原实现排除 cluster 档，前提是
 // "cluster 档 MetaAgent 已有角色授权，走 tool_catalog+tool_mount"——T13 收窄把这两个
@@ -503,6 +550,25 @@ func (s *ReactService) memoryIndexBlock() string {
 		return ""
 	}
 	return s.memoryIndexFn()
+}
+
+// SetEvolutionPromptProvider 注入角色自进化准则读取回调（bootstrap 接 RoleEvolutionStore）；
+// fn 返回角色当前准则全文（≤300字），空串=该角色无准则不注入。传 nil 关闭。
+func (s *ReactService) SetEvolutionPromptProvider(fn func(roleID string) string) {
+	s.evolutionPromptFn = fn
+}
+
+// evolutionBlockFor 渲染【自进化准则】系统提示块：本角色历史沉淀的抽象行为准则，
+// 每回合直接注入（与 skill/块记忆互不相关）。空内容/未接线返回空串（零注入）。
+func (s *ReactService) evolutionBlockFor(roleID string) string {
+	if s.evolutionPromptFn == nil || roleID == "" {
+		return ""
+	}
+	content := strings.TrimSpace(s.evolutionPromptFn(roleID))
+	if content == "" {
+		return ""
+	}
+	return "【自进化准则】本角色在历史使用中沉淀的抽象行为准则（可经 update_evolution_prompt 全量更新，≤300字）：\n" + content
 }
 
 // SetBoardRemover 注入会话任务看板移除器（DeleteSession 硬删除路径）。
@@ -1187,6 +1253,24 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 	if t := tool.NormalizeThinking(req.Thinking); tool.ValidThinking(t) {
 		sess.setThinking(t)
 	}
+	// 会话级指定插件（KIMI 式插件选择）：创建路径从宽——无效 ID（不存在/未启用/未运行）
+	// 丢弃并记事件，不阻断建会话（同 MountPreApprovedForScope 的静默跳过语义）；
+	// 工具预挂在 runSession 起跑时经 applyPinnedPlugins 完成。
+	if ids := normalizePluginIDs(req.PinnedPlugins); len(ids) > 0 {
+		valid, invalid := s.resolvePinnedPlugins(ids)
+		if len(valid) > 0 {
+			okIDs := make([]string, 0, len(valid))
+			for _, p := range valid {
+				okIDs = append(okIDs, p.ID)
+			}
+			sess.setPinnedPlugins(okIDs)
+		}
+		if len(invalid) > 0 {
+			s.store.addEvent(sess, eventkind.System, "System",
+				fmt.Sprintf("指定插件忽略无效项: %s（不存在/未启用/未运行）", strings.Join(invalid, ", ")),
+				"", "", "", "", "", true)
+		}
+	}
 	// 首条消息携带的用户图片（Alt+V 粘贴）：runSession 注入 runCtx 后一次性消费。
 	sess.firstTurnImages = append(req.Images, frames...)
 	s.maybeWatchWallClock(sess)
@@ -1624,6 +1708,34 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		// providerForRole 每次 LLM 调用实时读取，下一次调用即生效。
 		thinking, _ := cmd.Args["thinking"].(string)
 		return s.SetSessionThinking(sessionID, thinking)
+	case ControlOpPinnedPlugins:
+		// 会话级指定插件切换（KIMI 式插件选择）：Args{"plugins": []string}，空数组=清空。
+		// 参数断言 fail-closed（同 ControlOpWorkDir）：序列化误差不得静默清空用户选择。
+		raw, ok := cmd.Args["plugins"]
+		if !ok {
+			return fmt.Errorf("%w: plugins 参数缺失", ErrInvalidSessionState)
+		}
+		rawList, ok := raw.([]any)
+		if !ok {
+			// 兼容进程内直接构造的 []string 形态（HTTP JSON 解码为 []any）。
+			if ss, ok2 := raw.([]string); ok2 {
+				rawList = make([]any, 0, len(ss))
+				for _, id := range ss {
+					rawList = append(rawList, id)
+				}
+			} else {
+				return fmt.Errorf("%w: plugins 参数类型不符", ErrInvalidSessionState)
+			}
+		}
+		ids := make([]string, 0, len(rawList))
+		for _, v := range rawList {
+			id, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("%w: plugins 元素类型不符", ErrInvalidSessionState)
+			}
+			ids = append(ids, id)
+		}
+		return s.SetSessionPinnedPlugins(sessionID, ids)
 	case ControlOpWorkDir:
 		// 每会话工作目录修改：落库即时保存，下一回合生效（目录在每回合开始时读取）。
 		// 参数断言必须 fail-closed：空串是**合法**的"清除为默认目录"载荷，若把
@@ -1851,6 +1963,119 @@ func (s *ReactService) SessionThinking(sessionID string) string {
 		return ""
 	}
 	return sess.currentThinking()
+}
+
+// SetSessionPinnedPlugins 切换会话级指定插件（KIMI 式插件选择，HTTP 切换通道）：
+// 选中=优先（强制）使用——插件工具经 MountPreApprovedForScope 预挂进会话顶层 scope
+//（用户显式授权，与 plugins.yaml top_level 同为配置外的人工声明，绕过角色天花板）；
+// 取消勾选的工具按 mounted 集前缀匹配卸载（插件中途停用也能卸）。空列表=清空（合法）。
+// 无效 ID（不存在/未启用/未运行）整体拒绝并列明（HTTP 400），不做半套切换；
+// 会话不存在返回错误。atomic 即时生效，下一轮起跑按新集合构建提示块。
+func (s *ReactService) SetSessionPinnedPlugins(sessionID string, ids []string) error {
+	norm := normalizePluginIDs(ids)
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
+	}
+	valid, invalid := s.resolvePinnedPlugins(norm)
+	if len(invalid) > 0 {
+		return fmt.Errorf("%w: 无效插件（不存在/未启用/未运行）: %s", ErrInvalidSessionState, strings.Join(invalid, ", "))
+	}
+	// 差集卸载：被移除插件的工具从会话 scope 摘除（按 <pluginID>__ 前缀匹配 mounted 集，
+	// 不依赖 resolver 再解析——插件在勾选期间被停用/卸载时工具仍可卸净）。
+	removed := make(map[string]bool)
+	newSet := make(map[string]bool, len(norm))
+	for _, id := range norm {
+		newSet[id] = true
+	}
+	for _, old := range sess.currentPinnedPlugins() {
+		if !newSet[old] {
+			removed[old] = true
+		}
+	}
+	if s.toolRegistry != nil && len(removed) > 0 {
+		var unmount []string
+		for name := range s.toolRegistry.MountedTools(sessionID) {
+			for pid := range removed {
+				if strings.HasPrefix(name, pid+"__") {
+					unmount = append(unmount, name)
+					break
+				}
+			}
+		}
+		s.toolRegistry.UnmountTools(sessionID, unmount)
+	}
+	// 新增/保留插件工具预挂（幂等；插件未运行时工具未注册，静默跳过，下次起跑重挂）。
+	var tools []string
+	for _, p := range valid {
+		tools = append(tools, p.Tools...)
+	}
+	if s.toolRegistry != nil && len(tools) > 0 {
+		s.toolRegistry.MountPreApprovedForScope(sessionID, tool.NormalizeGear(sess.currentGear()), tools)
+	}
+	from := sess.currentPinnedPlugins()
+	sess.setPinnedPlugins(norm)
+	s.store.addEvent(sess, eventkind.System, "System",
+		fmt.Sprintf("指定插件切换: %v → %v（手动）", from, norm),
+		"", "", "", "", "", true)
+	return nil
+}
+
+// SessionPinnedPlugins 读取会话当前指定插件 ID 列表（HTTP GET 展示用）；未设置返回 nil。
+func (s *ReactService) SessionPinnedPlugins(sessionID string) []string {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return nil
+	}
+	return sess.currentPinnedPlugins()
+}
+
+// applyPinnedPlugins 把会话指定插件的工具预挂到顶层 scope（KIMI 式插件选择）：
+// runSession 起跑调用——挂载集纯内存，重启恢复/每轮起跑都需重挂（幂等），
+// 与 mountTopLevelEssentials 同语义。未指定/resolver 未接线/插件已停用
+//（工具未注册被 MountPreApprovedForScope 静默跳过）时零行为变化。
+func (s *ReactService) applyPinnedPlugins(session *reactInternalSession) {
+	ids := session.currentPinnedPlugins()
+	if len(ids) == 0 || s.toolRegistry == nil {
+		return
+	}
+	valid, _ := s.resolvePinnedPlugins(ids)
+	var names []string
+	for _, p := range valid {
+		names = append(names, p.Tools...)
+	}
+	if len(names) == 0 {
+		return
+	}
+	if accepted := s.toolRegistry.MountPreApprovedForScope(session.ID, tool.NormalizeGear(session.currentGear()), names); len(accepted) > 0 {
+		log.Printf("[agent] pinned plugins mounted: session=%s plugins=%v tools=%v", session.ID, ids, accepted)
+	}
+}
+
+// pinnedPluginBlock 构建【用户指定插件】系统提示块（KIMI 式插件选择）：
+// 用户显式勾选 = 优先（强制）使用该插件，与"不选则模型自行判断"互补。
+// 拼进 skillBlock 尾部注入系统提示词（react_agent.go systemPrompt 尾部槽位）。
+// 空选择/resolver 未接线/插件全部失效时返回空串（零注入）。
+func (s *ReactService) pinnedPluginBlock(session *reactInternalSession) string {
+	ids := session.currentPinnedPlugins()
+	if len(ids) == 0 {
+		return ""
+	}
+	valid, _ := s.resolvePinnedPlugins(ids)
+	if len(valid) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n\n【用户指定插件】用户在本会话明确指定了以下插件，其工具已直接可用（无需 tool_catalog/tool_mount 发现）：\n")
+	for _, p := range valid {
+		sb.WriteString(fmt.Sprintf("- %s（%s）：%s\n", p.Name, p.ID, strings.Join(p.Tools, ", ")))
+	}
+	sb.WriteString("请优先使用上述插件的工具完成用户需求；仅当其能力确实不敷使用时，才考虑其他途径。")
+	return sb.String()
 }
 
 // thinkingDisplayName 思考强度展示名（事件文案用）：空串显示为"跟随角色默认"。
@@ -3261,6 +3486,8 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 顶层必备插件工具预挂载（fast/daily：联网搜索等直接可用，不必 tool_catalog+tool_mount；
 	// cluster 的 meta 已有角色授权不重复挂；子 Agent scope 不受影响）。
 	s.mountTopLevelEssentials(session.ID, tool.NormalizeGear(session.currentGear()))
+	// 会话级指定插件工具重挂（KIMI 式插件选择）：挂载集纯内存，每轮起跑幂等重挂。
+	s.applyPinnedPlugins(session)
 
 	// PROJECT.md 就绪有界等待（TODO 第14项 T9）：cluster/daily 等 ≤2s 让【项目概览】段
 	// 赶上首轮系统提示词前缀缓存；fast（doc_assistant）不等（秒回优先，缺失本就略段）。
@@ -3308,6 +3535,9 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	case "domain":
 		skillBlock = s.roleSkillBlock(metaRole)
 	}
+	// 会话级指定插件提示块（KIMI 式插件选择）：选中=优先使用，拼进系统提示词尾部槽位；
+	// 空选择零注入（模型自行判断）。每轮起跑重建，HTTP 切换下一轮生效。
+	skillBlock += s.pinnedPluginBlock(session)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
@@ -3317,6 +3547,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
 		WithMemoryIndex(s.memoryIndexBlock()).
+		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
 		WithPersonaInjector(s.metaPersona(session.currentWorkDir())).
 		WithMessageLogger(s.msgLogger).
 		// 顶层 Agent（meta/domain）挂起等子语义：终答轮仍有未决子 Agent 时置
@@ -3472,6 +3703,8 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 	// 顶层必备插件工具预挂载（同 runSession：fast/daily 顶层直接可用，子 Agent 不受影响）。
 	s.mountTopLevelEssentials(session.ID, tool.NormalizeGear(session.currentGear()))
+	// 会话级指定插件工具重挂（KIMI 式插件选择，同 runSession：幂等）。
+	s.applyPinnedPlugins(session)
 
 	// 确定模型 provider，逻辑同 runSession（D-1 模型随档：按本轮角色 ID 解析）。
 	var provider ModelProvider
@@ -3509,6 +3742,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	case "domain":
 		skillBlock = s.roleSkillBlock(metaRole)
 	}
+	// 会话级指定插件提示块（KIMI 式插件选择）：选中=优先使用，拼进系统提示词尾部槽位；
+	// 空选择零注入（模型自行判断）。每轮起跑重建，HTTP 切换下一轮生效。
+	skillBlock += s.pinnedPluginBlock(session)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
@@ -3518,6 +3754,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
 		WithMemoryIndex(s.memoryIndexBlock()).
+		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
 		WithPersonaInjector(s.metaPersonaLite()).
 		WithMessageLogger(s.msgLogger).
 		// 顶层 Agent（meta/domain）挂起等子语义（同 runSession）。
@@ -4190,6 +4427,33 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 		session = restored
 	}
 
+	// 快捷指令拦截：仅当整条消息是单 token 斜杠指令（^/\S+$）时按指令处理，
+	// 不进 LLM 对话历史、不触发续跑；多行/带空格的文本正常透传。
+	// 锁纪律：本拦截点位于持锁区间，两条分支均先 Unlock 再 addEvent（addEvent 自身加锁）。
+	if slashCmd := parseSlashCommand(content); slashCmd != "" {
+		if slashCmd == "distill" {
+			// 命中 /提炼：持锁快照会话数据供异步提炼（goroutine 只读快照，不触活会话）。
+			snap := distillSnapshot{
+				goal:         strings.TrimSpace(session.Goal),
+				result:       strings.TrimSpace(session.Result),
+				events:       append([]internalEvent(nil), session.Events...),
+				userMessages: userMessagesText(session),
+			}
+			s.store.mu.Unlock()
+			// 指令消息落用户气泡事件（开新回合可见），随后异步提炼。
+			s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)
+			go s.distillSession(session, snap)
+			return nil
+		}
+		// 未识别指令：落用户气泡 + System 提示，不进 LLM 对话历史、不触发续跑。
+		s.store.mu.Unlock()
+		s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)
+		s.store.addEvent(session, eventkind.System, "System",
+			fmt.Sprintf("未知指令 %s。可用指令：/提炼（把本会话上文提炼为经验技能与块记忆）", strings.TrimSpace(content)),
+			"", "", "", "", "", true)
+		return nil
+	}
+
 	// 待答复的 Agent 提问（TODO #24 ask_user；#53 选项解析）：答复写 askUser 通道。
 	// 带选项时按选项 ID/Label/数字序号解析回传（Label 连接文本），自由文本原样透传。
 	if session.askUser != nil {
@@ -4343,6 +4607,186 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 		go s.resumeSession(session)
 	}
 	return nil
+}
+
+// parseSlashCommand 解析快捷指令：trim 后整体匹配单 token 斜杠指令（^/\S+$）才返回
+// 指令名（小写化），否则返回空串。/提炼 与 /distill 都映射为 "distill"；其余返回原指令名。
+func parseSlashCommand(content string) string {
+	t := strings.TrimSpace(content)
+	if len(t) < 2 || t[0] != '/' {
+		return ""
+	}
+	// 单 token：指令本体不含任何空白（多行/带空格文本正常透传，不拦截）。
+	if strings.ContainsAny(t, " \t\r\n\v\f") {
+		return ""
+	}
+	name := strings.ToLower(t[1:])
+	if name == "提炼" || name == "distill" {
+		return "distill"
+	}
+	return name
+}
+
+// distillSnapshot 是 /提炼 指令命中时在 store.mu 锁内拷贝的会话数据快照：
+// 异步提炼 goroutine 只读快照，不回访活会话对象（会话可能同时在新回合写入）。
+type distillSnapshot struct {
+	goal         string          // 会话目标（trim 后）
+	result       string          // 会话总结（trim 后；进行中会话通常为空）
+	events       []internalEvent // 事件流拷贝（append 拷贝，非共享底层数组）
+	userMessages string          // 用户消息拼接（userMessagesText 同口径）
+}
+
+// SetBlockMemoryDistiller 注入手动提炼的块记忆沉淀回调（bootstrap 接事实提取器+块记忆写入器）；
+// fn 返回成功沉淀条数。nil 时 /提炼 只做技能提炼。
+func (s *ReactService) SetBlockMemoryDistiller(fn func(ctx context.Context, sessionID, text string) (int, error)) {
+	s.blockDistiller = fn
+}
+
+// distillEventsSnapshot 对事件快照做摘要：与 evolver.go eventsDigest 同口径
+//（最近 30 条、单行 120 runes、整体 1500 runes），但接受快照切片而非活会话，
+// 供 /提炼 异步 goroutine 在不持锁、不触活会话的前提下构造 EvolveInput。
+func distillEventsSnapshot(events []internalEvent) string {
+	const keep = 30
+	if len(events) > keep {
+		events = events[len(events)-keep:]
+	}
+	var b strings.Builder
+	for _, ev := range events {
+		agent := ev.Agent
+		if agent == "" {
+			agent = ev.Type
+		}
+		line := strings.TrimSpace(ev.Message)
+		if line == "" {
+			continue
+		}
+		if ev.Tool != "" {
+			line = ev.Tool + " " + line
+		}
+		b.WriteString(agent)
+		b.WriteString(": ")
+		b.WriteString(truncateRunesForEvolver(line, 120))
+		b.WriteString("\n")
+	}
+	return truncateRunesForEvolver(strings.TrimRight(b.String(), "\n"), evolveDigestMaxRunes)
+}
+
+// distillSession /提炼 快捷指令本体：把本会话上文立即提炼为经验技能（复用会话结束
+// 同一 evolver 管线，只落技能包——画像/项目偏好仍归会话结束自动路径，避免双写）
+// + 块记忆（blockDistiller）。结果以 System 事件回执进聊天流。异步 goroutine 内运行。
+func (s *ReactService) distillSession(session *reactInternalSession, snap distillSnapshot) {
+	// 全程 recover：异步 goroutine 内 panic 不能拖垮进程。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[distill] panic recovered: session=%s panic=%v", session.ID, r)
+		}
+	}()
+	receipt := func(msg string) {
+		s.store.addEvent(session, eventkind.System, "System", msg, "", "", "", "", "", true)
+	}
+	if len(snap.events) < minEvolveEvents {
+		receipt(fmt.Sprintf("手动提炼：会话内容太少（事件 %d < %d），暂不沉淀", len(snap.events), minEvolveEvents))
+		return
+	}
+	digest := distillEventsSnapshot(snap.events)
+	if snap.goal == "" && snap.userMessages == "" {
+		receipt("手动提炼：无可用内容（无目标且无用户消息）")
+		return
+	}
+
+	// ① 经验技能：会话结束同一 evolver 管线（EvolveInput 同构），只取 Skills 落 skillSink；
+	// 失败/未接线不中断，记入回执原因后继续块记忆。
+	var skillTitles []string
+	skillNote := ""
+	if s.evolver == nil {
+		skillNote = "技能提炼跳过: evolver 未接线"
+	} else {
+		in := EvolveInput{
+			Goal:         snap.goal,
+			Summary:      snap.result,
+			EventsDigest: digest,
+			UserMessages: snap.userMessages,
+			Outcome:      "mixed",
+		}
+		ctx, cancel := context.WithTimeout(
+			logger.NewContext(context.Background(), s.sessionLogger(session.ID, "ManualDistill")),
+			evolveTimeout)
+		out, err := s.evolver(ctx, in)
+		cancel()
+		switch {
+		case err != nil || out == nil:
+			skillNote = fmt.Sprintf("技能提炼失败: %v", err)
+			log.Printf("[distill] evolve failed: session=%s err=%v", session.ID, err)
+		case len(out.Skills) == 0:
+			// 无新技能：不进回执明细（最终回执有"未产出"兜底文案）。
+		case s.skillSink == nil:
+			skillNote = "技能落库跳过: skillSink 未接线"
+		default:
+			sinkCtx, sinkCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			err := s.skillSink(sinkCtx, session.ID, out.Skills, "mixed")
+			sinkCancel()
+			if err != nil {
+				skillNote = fmt.Sprintf("技能落库失败: %v", err)
+				log.Printf("[distill] skill sink failed: session=%s err=%v", session.ID, err)
+			} else {
+				for _, sk := range out.Skills {
+					skillTitles = append(skillTitles, sk.Title)
+				}
+			}
+		}
+	}
+
+	// ② 块记忆：goal + result + 事件摘要 + 用户消息拼接（各自 trim 后非空段）交 distiller。
+	saved := 0
+	memNote := ""
+	if s.blockDistiller == nil {
+		memNote = "块记忆沉淀跳过: 未接线"
+	} else {
+		var segs []string
+		for _, seg := range []string{snap.goal, snap.result, digest, snap.userMessages} {
+			if seg = strings.TrimSpace(seg); seg != "" {
+				segs = append(segs, seg)
+			}
+		}
+		memCtx, memCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		n, err := s.blockDistiller(memCtx, session.ID, strings.Join(segs, "\n"))
+		memCancel()
+		if err != nil {
+			memNote = fmt.Sprintf("块记忆沉淀失败: %v", err)
+			log.Printf("[distill] block distill failed: session=%s err=%v", session.ID, err)
+		} else {
+			saved = n
+		}
+	}
+
+	// 最终回执：产出明细在前，失败/跳过原因附括号；全空给兜底文案。
+	var parts []string
+	if len(skillTitles) > 0 {
+		parts = append(parts, "技能 "+strings.Join(skillTitles, "、"))
+	}
+	if saved > 0 {
+		parts = append(parts, fmt.Sprintf("块记忆 +%d 条", saved))
+	}
+	var notes []string
+	if len(skillTitles) == 0 && skillNote != "" {
+		notes = append(notes, skillNote)
+	}
+	if saved == 0 && memNote != "" {
+		notes = append(notes, memNote)
+	}
+	switch {
+	case len(parts) == 0 && len(notes) == 0:
+		receipt("手动提炼完成：未产出可沉淀内容（无新技能、无新块记忆）")
+	case len(parts) == 0:
+		receipt("手动提炼完成：未产出可沉淀内容（" + strings.Join(notes, "；") + "）")
+	default:
+		msg := "手动提炼完成：" + strings.Join(parts, "；")
+		if len(notes) > 0 {
+			msg += "（" + strings.Join(notes, "；") + "）"
+		}
+		receipt(msg)
+	}
+	log.Printf("[distill] done: session=%s skills=%d blocks=%d", session.ID, len(skillTitles), saved)
 }
 
 // resumePausedDomain 恢复一个因触达 token 上限而 Paused 的 DomainAgent。
@@ -4985,6 +5429,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		TrustMode:      s.currentTrustMode(),
 		Gear:           s.currentGear(),
 		Thinking:       s.currentThinking(),
+		PinnedPlugins:  s.currentPinnedPlugins(),
 	}
 }
 

@@ -99,6 +99,10 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/skills/consolidate", apiHandler.ConsolidateSkillsHandler)             // 技能库整理（合并/归档，忽略每日阈值）
 	api.GET("/evolution/log", apiHandler.EvolutionLogHandler)                        // 进化审计流水
 
+	// 角色自进化准则（每个角色一条 ≤300 字行为修正准则；存储装配前未接线时端点 503）。
+	api.GET("/roles/evolution-prompts", apiHandler.ListRoleEvolutionPromptsHandler)   // 角色自进化准则列表
+	api.PUT("/roles/:id/evolution-prompt", apiHandler.SaveRoleEvolutionPromptHandler) // 角色自进化准则编辑（≤300字）
+
 	// 插件管理 API（设计文档 §5）。
 	api.GET("/plugins", apiHandler.ListPluginsHandler)                // 插件列表
 	api.GET("/plugins/:id", apiHandler.GetPluginHandler)              // 插件详情
@@ -131,6 +135,7 @@ func apiHandlerOf(app *App) *server.APIHandler {
 	}
 	if app.Postgres != nil {
 		h.SetLearnedSkills(app.Postgres.LearnedSkills) // 自进化技能库存储
+		h.SetRoleEvolution(app.RoleEvolution, app.RoleRegistry) // 角色自进化准则存储（≤300字/角色，AI 自维护）
 	}
 	h.SetSkillConsolidation(app.SkillConsolidation) // 技能库整理（C 库存治理，未装配时端点 503）
 	return h
