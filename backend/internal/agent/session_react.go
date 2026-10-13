@@ -164,6 +164,18 @@ type reactInternalSession struct {
 	// runSession 起跑时有界等待 ≤2s 让【项目概览】段赶上进入首轮系统提示词前缀缓存；
 	// fast 档（doc_assistant）不等。nil（恢复会话/测试直建）= 不等待。
 	projectDocReady chan struct{}
+	// widgetData 是界面部件（Widget）的瞬时数据通道：widget_id -> 最新 payload。
+	// 最新值覆盖、不落库不持久化（二维码刷新这类高频推送不值得进历史），
+	// SSE 轮询快照发现变化即推 widget_data 帧，前端原地重绘卡片。
+	// 访问走 store.mu（同 setStreamingText 的加锁模式）。
+	widgetData map[string]widgetDataEntry
+}
+
+// widgetDataEntry 是单个部件的最新推送值；seq 单调递增，供变化检测（比对 payload
+// 之外的廉价判定；SSE 帧与快照线型只携带 payload，seq 留在内存态）。
+type widgetDataEntry struct {
+	seq     int64  // 该部件第几次推送（从 1 起）
+	payload string // 最新数据（JSON 字符串，上限 64KB，截断在 PushWidgetData 完成）
 }
 
 // maxReactInMemorySessions 限制 ReactService 同时保留在内存中的最大会话数，
@@ -580,6 +592,13 @@ func (st *reactSessionStore) snapshotSession(session *reactInternalSession) *rea
 		cp.History = make([]ReactMessage, len(session.History))
 		copy(cp.History, session.History)
 	}
+	// widgetData 深拷贝：浅拷贝会共享 map，快照返回后并发写入构成数据竞争。
+	if session.widgetData != nil {
+		cp.widgetData = make(map[string]widgetDataEntry, len(session.widgetData))
+		for k, v := range session.widgetData {
+			cp.widgetData[k] = v
+		}
+	}
 	// 返回拷贝后的指针，原始会话仍由仓库持有。
 	return &cp
 }
@@ -700,6 +719,20 @@ func (st *reactSessionStore) addEventDetail(session *reactInternalSession, event
 func (st *reactSessionStore) setStreamingText(session *reactInternalSession, text string) {
 	st.mu.Lock()
 	session.StreamingText = text
+	st.mu.Unlock()
+}
+
+// setWidgetData 写入/覆盖部件最新推送值（瞬时通道，不落库）。
+// seq 按部件单调递增，与 setStreamingText 同款 store 层统一加锁。
+func (st *reactSessionStore) setWidgetData(session *reactInternalSession, widgetID, payload string) {
+	st.mu.Lock()
+	if session.widgetData == nil {
+		session.widgetData = make(map[string]widgetDataEntry)
+	}
+	e := session.widgetData[widgetID]
+	e.seq++
+	e.payload = payload
+	session.widgetData[widgetID] = e
 	st.mu.Unlock()
 }
 

@@ -68,6 +68,7 @@
 - `lastWrites`：近期写入文件（WriteFile/EditFile live 事件识别，kill 时回告"盘上有货"）。
 - `recentActs`：杀前最近叙述片段 + 工具轨迹（机械归纳"已完成事项"）。
 - `heldSkills`：agentID → 持有技能名列表（技能渐进披露权威源）。
+- `heldTools`（2026-10-12 二期）：scope → `{tools, mode}`（`extend`=角色基线∪授权 / `only`=仅授权集收窄）——派发级工具/插件授权权威源；登记/清理时机全量对齐 heldSkills（含 idle_pool 热驻槽、failure_prune、purge 全部清理点）。
 - `parentSpecs`：`specRecKey{parentID,domain}` → `*parentSpecRecord`（spec 结构化切片：files 绝对路径/contract/verifyLevels/filesMtime 快照/probes/scenes/baseline/acceptance）。
 - `pausedResumes`：nodeID → 续跑次数（上限 maxPausedResumes，默认 1）。
 - `worktrees`：subAgentID → `*worktreeHandle`（worktree 隔离派发句柄）。
@@ -94,7 +95,7 @@
 
 `callSubAgentTool.Execute`（2366-2468）：
 
-1. 解析参数：`role_id`/`task`/`domain`/`responsibility`/`mode`/`verify_kind`/`tools_hint`/`skills`/`wall_clock_min`/`reuse_agent_id`/`takeover`/`worktree`（参数提取辅助函数 2983-3032）。
+1. 解析参数：`role_id`/`task`/`domain`/`responsibility`/`mode`/`verify_kind`/`tools_hint`/`tools`/`tools_mode`/`skills`/`wall_clock_min`/`reuse_agent_id`/`takeover`/`worktree`（参数提取辅助函数 2983-3032）。
 2. 取 `parentID = AgentIDFromContext(ctx)`，缺失即拒。
 3. **同名热驻槽隐式复用**（2404-2408）：`roleID==domain && reuseAgentID==""` 时 `resolveIdleSiblingReuse`（2514-2549）——同父下同名且状态 Idle 的热驻槽存在则自动复用（含档位守卫：槽固化档位与会话当前档位不符则不复用）。注意这一步**先于参数校验**（空 responsibility 会被校验拒掉，复用路径不应被它挡住）。
 4. **领域档案冷复活**（2413-2415）：`applyDomainProfileSeed`（domain_profile.go）——名字/别名/路径匹配档案，命中则 domain 归一化 + 种子段（摘要/存活文件/结论链）拼进 task。
@@ -118,11 +119,11 @@
 
 ## 4.6 dispatchOne 逐点
 
-`dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, wallClock, reuseAgentID, takeover, opts...)`（2579-2905）：
+`dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, wallClock, reuseAgentID, takeover, opts...)`（2579-2905；2026-10-12 起增 `tools`/`tools_mode` 派发级授权参数，见步骤 11）：
 
 1. **reuse 分流**（2592-2597）：`reuseAgentID != ""` → 热驻未开启报错；否则 `dispatchToIdleSlot`（idle_pool.go）——idle 唤醒注入任务 / busy 入队 / 不存在报错。
 2. 角色解析 + worktree 约束（开关关闭拒；热驻 domain 拒）。**派前双校验**（dispatchOne 入口，2026-09-18/19 实测修复，拒绝发生在配额/树登记前零消耗）：
-   - `checkRoleTaskFit`（2588）：任务文本的工具需求信号（powershell/get-content/grep/sed/go test/npm/pip/writefile/写入文件等直写形态）× 目标角色工具面，不匹配硬拒并给改派方向——防"派 scout 执行 PowerShell"式能力错配整波空转；
+   - `checkRoleTaskFit`（2588）：任务文本的工具需求信号（powershell/get-content/grep/sed/go test/npm/pip/writefile/写入文件等直写形态）× 目标角色工具面（2026-10-12 起为 heldTools 授权后的有效工具面），不匹配硬拒并给改派方向——防"派 scout 执行 PowerShell"式能力错配整波空转；
    - `checkTaskPathsFit`（2640）：任务文本提取零歧义绝对路径信号（Windows 盘符 + POSIX 绝对路径正则，带空格路径截断但根前缀足够判定），越出会话 workDir 且角色工具面无 RunCommand 时硬拒（tools_hint 预挂的也算，`hintHasTool`）——防子 Agent 跟 "path escapes sandbox" 缠斗空转（实测 3 个 code_reviewer 84 次调用零交付）；拒绝消息给三选一处置：改派 domain / ask_user 请用户切换会话 workdir / Copy-Item 摄入工作目录；`pathWithinWorkDir` 为 Windows 大小写不敏感前缀比较；
    - **决策层③派发门灰区补充**（decisionGateDispatchGap，2026-09-23 TODO #23 切入点3）：两条硬拒**保持 rules-first 不动**，决策层只补规则正则覆盖不到的需求信号（needs_browser/needs_mcp/needs_vision）；影子期只落对拍行（actual=none=现状放行）零行为变化，enforce 点命中缺口且置信达标才拦（fail-open 故障不拦派发）。
 3. **scout 类缺省墙钟**：`SpecExempt` 角色无显式 wall_clock_min → 5min（light 10min）（2618-2624）。
@@ -136,7 +137,7 @@
 8. **全局派发限额**（2677-2685）：session 级计数超 maxTotalDispatches 拒（超限回滚计数）。
 9. **生成 ID**：`parentID/roleID-seq`（全局原子序，2688）。
 10. **worktree 创建**（2694-2700）：`createWorktreeForDispatch` 失败按 validation_rejected 拒（不泄漏 pending 计数）。
-11. **tools_hint 预挂载**（2706-2710）：`tools.MountForScope(subAgentID, roleID, hint)` ∩ 角色天花板，越界项回告。
+11. **tools_hint 预挂载**（2706-2710）+ **heldTools 派发级授权**（2026-10-12 二期）：hint 走 `tools.MountForScope(subAgentID, roleID, hint)` ∩ 角色天花板，越界项回告；新参数 `tools`（授权清单，可含内置+插件工具）/`tools_mode`（`extend` 默认=角色白名单∪授权 / `only`=仅授权集收窄）经 `resolveChildTools` 校验 ⊆ 父可分配集（meta=全注册工具；其他父=自身有效集）且插件工具受子角色 Manifest.Roles 天花板后登记进 heldTools，越界忽略并回告；空白名单角色（domain 等 Tools 空=全量）extend 特例不收窄、授权插件工具经 MountForScope 入 Schema。有效工具面统一由 `effectiveToolAllowlist`（dispatcher.go:1826）求值——无覆盖时行为逐字不变，4 处子 Agent adapter 构造点（dispatcher/idle_pool/恢复/expand）全走它；roleToolGate 硬门同步 scope 化（先查 heldTools 覆盖再回落角色基线，见 05.3）。
 12. **技能解析**（2715-2718）：`resolveChildSkills` = 角色固定集 ∪ 父分配集（⊆ 父持有集）。
 13. `trackChildStart(parentID)`；**热驻 domain 走 `dispatchHotDomain`（2748-2754）**（常驻 supervisor goroutine，ctx 不带 deadline）。
 14. 否则：构造 subAgentCtx（stopCtx 基底 + SessionID + WorkDir〔worktree 时切副本路径〕+ 用户图片带外重注入）；`effectiveTimeout` = min(wallClock/domainReconClock, d.timeout)；`context.WithTimeout`。

@@ -934,6 +934,53 @@ func (s *ReactService) NotifyUserSystemMessage(sessionID, msg string) {
 	s.store.addEvent(sess, eventkind.System, "System", msg, "", "", "", "", "", true)
 }
 
+// widgetPayloadMaxBytes 是部件瞬时数据通道的单次 payload 上限（64KB）：
+// 通道定位是"二维码刷新/卡片数据"这类小 payload 高频推送，超限截断防止
+// 64KB 快照 150ms 轮询序列化把 SSE 出口打爆（截断后部件端 JSON 解析失败会
+// 经 report 通道回错，可观测，不静默吞）。
+const widgetPayloadMaxBytes = 64 << 10
+
+// PushWidgetData 向会话的部件瞬时数据通道写入最新值（POST /api/widgets/push
+// 与 widget_save 工具热刷新的写侧）。最新值覆盖旧值，不落库；
+// 会话不在内存（bridge 轮询推给已结束/未恢复会话）时静默跳过——
+// 与 NotifyUserSystemMessage 同语义，推送方无需感知会话生命周期。
+func (s *ReactService) PushWidgetData(sessionID, widgetID, payload string) {
+	if widgetID == "" {
+		return
+	}
+	sess := s.store.getSession(sessionID)
+	if sess == nil {
+		return
+	}
+	if len(payload) > widgetPayloadMaxBytes {
+		payload = payload[:widgetPayloadMaxBytes]
+	}
+	s.store.setWidgetData(sess, widgetID, payload)
+}
+
+// ReportWidgetError 部件渲染错误回报（POST /api/widgets/report）：
+// 落一条 System 会话事件（用户可见）；会话仍在运行时额外向 MetaAgent 邮箱
+// 注入"【部件报错】"FYI，让 Agent 看到并可自行修代码（messenger 未接线的
+// 精简装配降级为只落 System 事件）。会话不在内存时静默跳过。
+func (s *ReactService) ReportWidgetError(sessionID, widgetID, errText string) {
+	sess := s.store.getSession(sessionID)
+	if sess == nil {
+		return
+	}
+	msg := fmt.Sprintf("【部件报错】%s：%s", widgetID, truncateRunes(errText, 500))
+	s.store.addEvent(sess, eventkind.System, "System", msg, "", "", "", "", "", true)
+	// 仅"还活着、会自己继续跑"的状态注入邮箱——终态会话注入无人消费，
+	// 恢复运行时也不会回溯邮箱里的 FYI。
+	switch sess.Status {
+	case enums.SessionStatusRunning, enums.SessionStatusAwaitingChild, enums.SessionStatusPausedOnChild:
+		if s.messenger != nil {
+			if err := s.messenger.InjectUserMessage(sess.ID, msg); err != nil {
+				log.Printf("[widgets] inject widget error to mailbox failed: session=%s widget=%s err=%v", sessionID, widgetID, err)
+			}
+		}
+	}
+}
+
 // injectUserMessageToRunningSession 把用户新指令投给**运行中**会话的 MetaAgent 邮箱。
 //
 // 为什么需要（2026-09-12 用户实证）：任务全部派发出去、正在等子 Agent 时用户重新输入，
@@ -5416,6 +5463,15 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 	messages := make([]Message, len(s.Messages))
 	copy(messages, s.Messages)
 
+	// 部件瞬时数据通道摊平成 widget_id -> 最新 payload（seq 留在内存态）。
+	var widgetData map[string]string
+	if len(s.widgetData) > 0 {
+		widgetData = make(map[string]string, len(s.widgetData))
+		for id, e := range s.widgetData {
+			widgetData[id] = e.payload
+		}
+	}
+
 	// 组装并返回公共 Session。
 	return &Session{
 		ID:             s.ID,
@@ -5439,6 +5495,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		Gear:           s.currentGear(),
 		Thinking:       s.currentThinking(),
 		PinnedPlugins:  s.currentPinnedPlugins(),
+		WidgetData:     widgetData,
 	}
 }
 

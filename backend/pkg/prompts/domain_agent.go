@@ -68,7 +68,8 @@ const DomainAgent = `你是领域负责人（DomainAgent），把父 Agent 交�
    数据驱动 CRUD/表单/列表/管理页类界面**不看图迭代**——以接口自验+node --check+
    npm test 收口，最多做一次 navigate+console 无 error 检查。出图/写 HTML 原型后
    **用 ShowArtifact 把成果直接展示给用户**（kind=image/html，对话栏渲染成媒体卡片），
-   终答说明这是什么、看哪里即可，不要重复贴路径。需要图片素材时优先
+   终答说明这是什么、看哪里即可，不要重复贴路径。需实时刷新的展示（二维码画布、
+   轮询数据卡）用 kind=widget 引用界面部件（widget_save 创建，widget_id 引用，须已启用）。需要图片素材时优先
    ui_design__od_image_generate 出图：多张图用 prompts 数组一次批量提交（桥内并发生成，
    逐张单调每张多夹一轮 LLM 往返，墙钟数倍放大）；正式素材用 save_as（单张）/
    save_as_list（批量，与 prompts 等长）直落 spec 钉死的静态资源路径（如 assets/img/

@@ -38,6 +38,7 @@ import { useWorkDir } from '@/composables/useWorkDir'
 import { FILE_OPENER_KEY, resolveWorkspacePath, type FileOpener } from '@/composables/fileOpener'
 import { knownWorkDirs as knownWorkDirsOf } from '@/utils/dir'
 import { maybeNotifySessionDone, maybeNotifyClarifyWaiting } from '@/utils/notifications'
+import { setWidgetData } from '@/utils/widgetBus'
 import ChatView from './chat/ChatView.vue'
 import MonitorView from './monitor/MonitorView.vue'
 import TaskBoardPanel from './components/panels/TaskBoardPanel.vue'
@@ -355,12 +356,26 @@ function startStream(s: Session) {
       if (snap.status !== 'awaiting_clarify' && clarifyPending.value) {
         clarifyPending.value = null
       }
+      // 界面部件快照数据（重连/刷新补断档）：逐项写入总线，WidgetFrame 订阅后自动推给 iframe
+      if (snap.widget_data) {
+        for (const [wid, payload] of Object.entries(snap.widget_data)) {
+          setWidgetData(wid, payload)
+        }
+      }
     },
     onLive(d) {
       liveStreaming.value = d.streaming_text || ''
       liveThinking.value = d.thinking_text || ''
     },
     onEvent(ev) {
+      // 界面部件实时数据帧（瞬时通道，不落时间线）：写入总线即返回，WidgetFrame 订阅后推给 iframe。
+      if ((ev as any).type === 'widget_data') {
+        const wid = (ev as any).widget_id
+        if (typeof wid === 'string' && wid) {
+          setWidgetData(wid, typeof (ev as any).payload === 'string' ? (ev as any).payload : '')
+        }
+        return
+      }
       // 会话状态变化帧（后端 500ms 轮询，状态翻转即推）：同步头部状态徽标与输入答复
       // 路由依据。此前快照仅在连接建立时推一次，awaiting_clarify 帧只喂选项区不更新
       // status，导致待澄清时输入框答复误走 enqueue 通道（内容丢失 + 会话卡死不恢复）。

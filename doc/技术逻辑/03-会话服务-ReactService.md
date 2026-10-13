@@ -142,7 +142,7 @@ persist running → `resolveGearMetaRole` → `mountTopLevelEssentials`（插件
 
 | LiveEvent | 事件 |
 |---|---|
-| `llm_delta` | finalizeThinking + setStreamingText（**不落事件**）；**集群档顶层 Meta 例外**：只写轮缓冲 `pendingTopText` 不推 StreamingText（见下"集群档顶层治理"） |
+| `llm_delta` | finalizeThinking + setStreamingText（**不落事件**；直推写点同时复位 `lastInterimText`——新正文覆盖 StreamingText 即上一段口播的同轮去重使命结束，跨轮逐字重复的口播〔轮询等待循环〕下一轮才能再落 assistant_text，2026-10-12 修复"等待循环第二轮起口播闪一下就消失"）；**集群档顶层 Meta 例外**：只写轮缓冲 `pendingTopText` 不推 StreamingText（缓冲分支刻意不复位去重键——StreamingText 未被覆盖，陈旧清理仍靠 lastInterimText 命中，见下"集群档顶层治理"） |
 | `think_delta` | setThinkingText；**集群档顶层 Meta 直接丢弃**（不进 ThinkingText、不落 think 事件，2026-09-19 定案） |
 | `tool_call` | finalizeThinking + persistInterimText（口播正文落 `assistant_text`）；**集群档顶层 Meta 例外**：中间轮口播随缓冲一起丢弃（不落 assistant_text），ask_user 边界把缓冲灌回 StreamingText（提问正文快照依赖它）；`call_sub_agent(s)` 逐项落 `kind=sub_agent_dispatch`（中文领域名进 detail_json） |
 | `tool_exec` | 仅补 call_sub_agent 的 tool_exec 事件（其他工具由 handleToolEvent 记） |
@@ -155,7 +155,7 @@ persist running → `resolveGearMetaRole` → `mountTopLevelEssentials`（插件
 
 `handleToolEvent`（:2734）：从 ctx 取 AgentID/展示名 → 仅 running 会话记录 → 跳过 call_sub_agent → tool_call/tool_exec 事件（artifacts merge 进 detail_json）；失败拼 `path= err=`。
 
-**去重/裁剪约定**：finalizeThinking 用 `lastThinkEventText` 去重；persistInterimText 用 `lastInterimText` 去重且跳过 ask_user；`trimDebugEvents` 只裁 think/prompt/token_usage/graph_step（不裁 assistant_text）；`sanitizeUTF8` 剥 NUL 防 PG jsonb 拒收。
+**去重/裁剪约定**：finalizeThinking 用 `lastThinkEventText` 去重；persistInterimText 用 `lastInterimText` 去重且跳过 ask_user（去重键在新正文直推 StreamingText 时复位，见上表 llm_delta 行）；`trimDebugEvents` 只裁 think/prompt/token_usage/graph_step（不裁 assistant_text）；`sanitizeUTF8` 剥 NUL 防 PG jsonb 拒收。
 
 持久化目标：session_history（MetaMemory JSONB 含 gear+thinking）、session_events（**append-only**：按 `(session_id, seq)` 唯一键 ON CONFLICT DO NOTHING 幂等纯追加，seq 永不清零）、agent_messages（主对话 agentID==sessionID，**尾差量追加**：边界行一致则只补尾段，复活重跑前旧 run 快照经 `ArchiveMessages` 移归档 archived=true 不物理删）、session_logs。
 

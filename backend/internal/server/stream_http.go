@@ -55,6 +55,13 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 	lastStreamedText := snapshot.StreamingText
 	lastThinkingText := snapshot.ThinkingText
 
+	// 部件瞬时数据上次推送值（widget_id -> payload）：变化才推 widget_data 帧；
+	// 初始快照已携带全量 map，基线直接从快照取，避免连接建立即重复推一遍。
+	lastWidgetData := make(map[string]string, len(snapshot.WidgetData))
+	for id, payload := range snapshot.WidgetData {
+		lastWidgetData[id] = payload
+	}
+
 	// 上次推送的会话状态：快照仅在连接建立时推一次，运行中状态翻转（running↔awaiting_clarify）
 	// 前端无从感知——web 输入框答复路由依赖 status，状态滞后会把 ask_user 澄清答复误入
 	// enqueue 通道（内容丢失 + 会话卡死）。状态变化即推 session_status 帧（2026-09-08）。
@@ -112,6 +119,23 @@ func (m *SessionManager) HandleSessionStream(c *gin.Context) {
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				lastStreamedText = snapshot.StreamingText
 				lastThinkingText = snapshot.ThinkingText
+				flusher.Flush()
+			}
+
+			// 部件瞬时数据变化 → 按 widget_id 逐个推 widget_data 帧（前端原地重绘卡片，
+			// 不整卡重建；二维码刷新这类高频推送只带增量，快照帧全量 map 兜底补断档）。
+			for widgetID, payload := range snapshot.WidgetData {
+				if last, ok := lastWidgetData[widgetID]; ok && last == payload {
+					continue
+				}
+				frame := map[string]string{
+					"type":      "widget_data",
+					"widget_id": widgetID,
+					"payload":   payload,
+				}
+				data, _ := json.Marshal(frame)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				lastWidgetData[widgetID] = payload
 				flusher.Flush()
 			}
 

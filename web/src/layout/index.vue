@@ -122,6 +122,7 @@ const menuGroups = [
       { path: '/projects', title: '工作目录', icon: 'FolderOpened' },
       { path: '/skills', title: '技能库', icon: 'Connection' },
       { path: '/plugins', title: '插件', icon: 'MagicStick' },
+      { path: '/widgets', title: '界面部件', icon: 'Grid' },
       { path: '/knowledge', title: '知识库', icon: 'Document' },
     ],
   },

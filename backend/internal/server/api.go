@@ -26,6 +26,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/runtime"          // Runtime
 	"github.com/blockmemory/agent/backend/internal/server/eventkind" // 事件类型常量
 	"github.com/blockmemory/agent/backend/internal/store"            // Postgres / Redis
+	"github.com/blockmemory/agent/backend/internal/widgets"          // 界面部件管理器
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"      // RoleConfigFile
 	"github.com/blockmemory/agent/backend/pkg/types"                 // 共享类型
 )
@@ -63,6 +64,7 @@ type APIHandler struct {
 	modelMgr      agent.ModelManager        // 模型动态切换能力（ReactService 实现）
 	statsService  *StatsService             // 会话统计聚合服务
 	pluginMgr     *plugins.Manager          // 插件管理器（热插拔插件管理 API）
+	widgetMgr     *widgets.Manager          // 界面部件管理器（widgets/ 目录包管理 API）
 	learnedSkills *store.LearnedSkillStore  // 自进化技能库存储（2026-09-02 设计 §8）
 	// skillConsolidation 技能库整理器（C 库存治理）：手动触发一轮合并/归档，返回摘要。
 	skillConsolidation func(ctx context.Context) (string, error)

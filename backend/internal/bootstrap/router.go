@@ -43,6 +43,7 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	// 构造通用 APIHandler 并注入业务依赖。
 	apiHandler := apiHandlerOf(app)
 	apiHandler.SetPluginManager(app.Plugins) // 插件管理器（热插拔插件管理 API）
+	apiHandler.SetWidgetManager(app.Widgets) // 界面部件管理器（widgets/ 目录包管理 API）
 
 	// /api 分组：全部业务端点统一经 Bearer Token 鉴权。
 	api := router.Group("/api", auth)
@@ -109,6 +110,17 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/plugins/:id/enable", apiHandler.EnablePluginHandler)   // 热启用
 	api.POST("/plugins/:id/disable", apiHandler.DisablePluginHandler) // 热停用
 	api.POST("/plugins/reload", apiHandler.ReloadPluginsHandler)      // 重读配置 + 重扫 plugins.d/
+
+	// 界面部件（Widget）管理 API：目录包热载 + 卡片文件服务 + 瞬时数据推送 + 错误回报。
+	// 静态段 reload/push/report 与 :id 同层注册（与 plugins 段同款，gin 静态优先）。
+	api.GET("/widgets", apiHandler.ListWidgetsHandler)                 // 部件列表
+	api.GET("/widgets/:id", apiHandler.GetWidgetHandler)               // 部件详情（Info JSON）
+	api.POST("/widgets/:id/enable", apiHandler.EnableWidgetHandler)    // 热启用
+	api.POST("/widgets/:id/disable", apiHandler.DisableWidgetHandler)  // 热停用
+	api.POST("/widgets/reload", apiHandler.ReloadWidgetsHandler)       // 重扫 widgets/ 目录
+	api.GET("/widgets/:id/files/*path", apiHandler.HandleWidgetFile)   // 部件文件服务（iframe 渲染源）
+	api.POST("/widgets/push", apiHandler.PushWidgetHandler)            // 瞬时数据推送（bridge 等进程插件）
+	api.POST("/widgets/report", apiHandler.ReportWidgetHandler)        // 部件渲染错误回报
 
 	// 模型动态切换 API（TUI 走进程内直调，不经此端点）。
 	api.GET("/models", apiHandler.ListModelsHandler)          // 模型目录：注册表清单 + 各角色当前模型

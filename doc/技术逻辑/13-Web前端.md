@@ -29,11 +29,11 @@
 | 入口 | `main.ts` / `App.vue` | createApp → **64 个图标白名单注册** → router + ElementPlus → mount；App 仅 config-provider + router-view |
 | 布局 | `layout/index.vue` | Header（Logo/主题/设置）+ 侧栏 280px（2026-09-17 加宽自 224px：首页链接置顶 + 会话树 WorkDirTree〔高度随内容，不 flex-1 撑满〕+ 导航组〔资源库组含「工作目录」/projects 入口〕+ 工作流 Beta + 人格状态钉底）+ main router-view（fade 过渡） |
 | 路由 | `router/index.ts` | 12 子路由 + 2 旧重定向；**无守卫、无 404 兜底** |
-| API | `api/`（14 模块） | 全部经 `client.ts::fetchJson` 单点收口 |
+| API | `api/`（15 模块） | 全部经 `client.ts::fetchJson` 单点收口 |
 | 状态复用 | `composables/`（11 个） | useSessionStream/usePanelRefresh/useTreeLayout/fileOpener 等 |
 | 会话视图 | `views/session/**`（~30 文件） | chat/orch/monitor 三视图 + 面板 |
-| 管理页 | `views/{dashboard,history,knowledge,memory,plugins,profile,projects,settings,skills,soul,workflow}` | knowledge/workflow 为纯占位 |
-| 通用 | `components/`（6） | WorkDirTree/Picker/Drawer、MarkdownRenderer、AppCard、FeaturePlaceholder |
+| 管理页 | `views/{dashboard,history,knowledge,memory,plugins,profile,projects,settings,skills,soul,widgets,workflow}` | knowledge/workflow 为纯占位 |
+| 通用 | `components/`（7） | WorkDirTree/Picker/Drawer、MarkdownRenderer、AppCard、FeaturePlaceholder、WidgetFrame |
 | 工具 | `utils/` | markdown 渲染管线、status、date、dir、notifications |
 
 ## 13.2 路由与布局
@@ -103,7 +103,7 @@
 `useSessionStream.startStream(id, handlers)` → `streamSession`（api/session.ts:281-373）：
 
 - `EventSource('/api/sessions/{id}/stream')`；`isSnapshot`（鸭子类型 `'id' && 'goal' && 'events'` 三键）分流全量快照 vs 增量事件。
-- `done` 帧 → `es.close()` + `onDone(status)`，**不进 onEvent**；`live` 帧 → `onLive`，**不进 onEvent**。
+- `done` 帧 → `es.close()` + `onDone(status)`，**不进 onEvent**；`live` 帧 → `onLive`，**不进 onEvent**；`widget_data` 帧（2026-10-13，见 16）→ index.vue onEvent 头部拦截写 `widgetBus`（部件卡 postMessage 数据源），**不进 events 时间线**；快照 `widget_data` 字段在 onSnapshot 逐项补发（重连补断档）。
 - `onerror` **主动 close 掐掉 EventSource 自带重连**，改自己的指数退避（1s→2s→…封顶 30s，无次数上限）；页面不可见时挂起（注册一次性 visibilitychange）；`online` 事件立即重连。
 - **重连补播策略：不需要补播端点**——重连后服务端先推全量快照，断档由快照补齐。
 - `onDone` 处理（index.vue:354-376）：清 live、停面板、refreshPanels + loadSessions、**对账重取 getSession 原子替换 events**（补 SSE 切片竞态丢的尾部事件）、浏览器通知。

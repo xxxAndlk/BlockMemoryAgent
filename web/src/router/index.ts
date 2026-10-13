@@ -39,6 +39,12 @@ const routes: Array<RouteRecordRaw> = [
         meta: { title: '插件', icon: 'MagicStick' }
       },
       {
+        path: 'widgets',
+        name: 'Widgets',
+        component: () => import('@/views/widgets/index.vue'),
+        meta: { title: '界面部件', icon: 'Grid' }
+      },
+      {
         path: 'knowledge',
         name: 'Knowledge',
         component: () => import('@/views/knowledge/index.vue'),

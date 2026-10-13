@@ -1,5 +1,5 @@
 // show_artifact.go 提供 ShowArtifact 工具：把 Agent 产出的**可视成果**（效果图/视频/
-// 音频/HTML 原型）显式"拿给用户看"——对话栏据此渲染媒体卡片，而不是让用户对着
+// 音频/HTML 原型/界面部件）显式"拿给用户看"——对话栏据此渲染媒体卡片，而不是让用户对着
 // 一串路径自行想象。
 //
 // 与 ReadMedia 的分工：ReadMedia 是"把媒体读进**模型**上下文"（base64 喂多模态），
@@ -7,6 +7,11 @@
 //
 // 内联 HTML（content 参数）统一落盘到 <工作目录>/.bma/artifacts/ 再展示：
 // 走同一条"路径引用"通道，历史回放/新窗口打开/分享都自然可用。
+//
+// kind=widget 是独立分支：引用 widgets/ 目录包里 Agent 自写的界面部件（widget_save
+// 工具创建），工件 path 为 widget://<id>，对话栏渲染成 sandbox iframe 卡片；
+// 不校验扩展名、不要求工作区文件，但要求部件存在且已启用（经 Registry 注入的
+// widgetLookup 校验，未接线时拒绝并提示）。
 package tool
 
 import (
@@ -34,20 +39,29 @@ var artifactExts = map[string]map[string]string{
 // artifactInlineHTMLMaxBytes 是 content 内联 HTML 的上限：防把整份数据当 HTML 贴进来。
 const artifactInlineHTMLMaxBytes = 2 << 20
 
+// artifactWidgetDataMaxBytes 是 kind=widget 的 data 初始数据上限（64KB）：
+// 与 widget_data 瞬时通道同口径——初始值走 detail_json 落库，不能无界膨胀历史。
+const artifactWidgetDataMaxBytes = 64 << 10
+
 // showArtifactTool 是 ShowArtifact 工具的封装。
 type showArtifactTool struct {
 	exec *Executor
+	// widgetLookup 校验 kind=widget 引用的部件存在且已启用（bootstrap 注入，
+	// 接 widgets.Manager.Get）；nil 时 kind=widget 一律拒绝并提示未接线。
+	widgetLookup func(id string) (name string, enabled bool, ok bool)
 }
 
 func (t *showArtifactTool) Name() string      { return "ShowArtifact" }
 func (t *showArtifactTool) Aliases() []string { return []string{"show_artifact"} }
 
 func (t *showArtifactTool) Description() string {
-	return "把产出的可视成果直接展示给用户：对话栏会渲染成图片/视频/音频/HTML 预览卡片。" +
+	return "把产出的可视成果直接展示给用户：对话栏会渲染成图片/视频/音频/HTML 预览卡片或界面部件卡片。" +
 		"产出效果图、截图、录屏、UI 原型（HTML）后调用本工具让用户直接看到效果，" +
-		"不要只在终答里贴文件路径。参数：kind=image|video|audio|html；" +
+		"不要只在终答里贴文件路径。参数：kind=image|video|audio|html|widget；" +
 		"path=工作区内文件路径（图片/视频/音频/已有 HTML 文件）；" +
-		"kind=html 时也可用 content 直接给 HTML 源码（自动落盘到 .bma/artifacts/ 再展示）。" +
+		"kind=html 时也可用 content 直接给 HTML 源码（自动落盘到 .bma/artifacts/ 再展示）；" +
+		"kind=widget 时用 widget_id 引用已创建的界面部件（widget_save 创建，须已启用），" +
+		"可选 data 给初始数据（JSON 字符串）。" +
 		"一次一个成果，多个成果多次调用；title/caption 是卡片标题与说明。"
 }
 
@@ -57,7 +71,7 @@ func (t *showArtifactTool) InputSchema() *jsonschema.Schema {
 		Properties: map[string]*jsonschema.Schema{
 			"kind": {
 				Type:        "string",
-				Enum:        []any{"image", "video", "audio", "html"},
+				Enum:        []any{"image", "video", "audio", "html", "widget"},
 				Description: "展示类型",
 			},
 			"path": {
@@ -67,6 +81,14 @@ func (t *showArtifactTool) InputSchema() *jsonschema.Schema {
 			"content": {
 				Type:        "string",
 				Description: "kind=html 时的 HTML 源码（与 path 二选一；自动落盘到 .bma/artifacts/）",
+			},
+			"widget_id": {
+				Type:        "string",
+				Description: "kind=widget 时的部件 id（widget_save 创建；须已启用）",
+			},
+			"data": {
+				Type:        "string",
+				Description: "kind=widget 时给部件的初始数据（JSON 字符串，可选，≤64KB）",
 			},
 			"title":   {Type: "string", Description: "卡片标题（可选）"},
 			"caption": {Type: "string", Description: "一句话说明（可选，如“主界面效果图 v2”）"},
@@ -80,9 +102,14 @@ func (t *showArtifactTool) InputSchema() *jsonschema.Schema {
 func (t *showArtifactTool) Execute(ctx context.Context, args map[string]any) *Result {
 	res := &Result{Tool: "ShowArtifact"}
 	kind := strings.ToLower(strings.TrimSpace(strArg(args, "kind")))
+	// kind=widget 走独立分支：引用 widgets/ 目录包而非工作区文件，
+	// 不校验扩展名、不解析工作目录。
+	if kind == "widget" {
+		return t.executeWidget(args)
+	}
 	exts, ok := artifactExts[kind]
 	if !ok {
-		res.Error = fmt.Sprintf("kind 非法 %q（可选 image/video/audio/html）", kind)
+		res.Error = fmt.Sprintf("kind 非法 %q（可选 image/video/audio/html/widget）", kind)
 		res.Category = ResultCategoryValidationRejected
 		return res
 	}
@@ -162,6 +189,61 @@ func (t *showArtifactTool) Execute(ctx context.Context, args map[string]any) *Re
 	return res
 }
 
+// executeWidget 处理 kind=widget：引用 widgets/ 目录包里的界面部件。
+// 部件由 widget_save 工具创建（Agent 自写渲染代码），工件 path 为 widget://<id>，
+// 对话栏渲染成 sandbox iframe 卡片；data 是卡片挂载时下发给部件的初始数据。
+func (t *showArtifactTool) executeWidget(args map[string]any) *Result {
+	res := &Result{Tool: "ShowArtifact"}
+	widgetID := strings.TrimSpace(strArg(args, "widget_id"))
+	data := strArg(args, "data")
+	title := strings.TrimSpace(strArg(args, "title"))
+	caption := strings.TrimSpace(strArg(args, "caption"))
+
+	if widgetID == "" {
+		res.Error = "kind=widget 缺少必填参数 widget_id"
+		res.Category = ResultCategoryValidationRejected
+		return res
+	}
+	if t.widgetLookup == nil {
+		res.Error = "界面部件校验未接线（widgets 管理面未注入），无法展示部件"
+		res.Category = ResultCategoryValidationRejected
+		return res
+	}
+	if len(data) > artifactWidgetDataMaxBytes {
+		res.Error = fmt.Sprintf("data 初始数据 %d 字节超过上限 %d", len(data), artifactWidgetDataMaxBytes)
+		res.Category = ResultCategoryValidationRejected
+		return res
+	}
+	name, enabled, ok := t.widgetLookup(widgetID)
+	if !ok {
+		res.Error = fmt.Sprintf("部件不存在: %s（先用 widget_save 创建，widget_list 可查已有部件）", widgetID)
+		res.Category = ResultCategoryValidationRejected
+		return res
+	}
+	if !enabled {
+		res.Error = fmt.Sprintf("部件 %s 已停用，请先在界面部件页启用后再展示", widgetID)
+		res.Category = ResultCategoryValidationRejected
+		return res
+	}
+
+	res.Success = true
+	res.Artifacts = []Artifact{{
+		Kind:    "widget",
+		Path:    "widget://" + widgetID,
+		Title:   title,
+		Caption: caption,
+		Data:    data,
+	}}
+	label := title
+	if label == "" {
+		label = name
+	}
+	res.Output = fmt.Sprintf("已把界面部件 %s（%s）展示给用户（对话栏出现部件卡片，数据更新走 widget_data 推送通道）。不要在终答里重复贴路径，直接说明这是什么、要看哪里即可。",
+		label, widgetID)
+	return res
+}
+
+
 // workDirFor 取工作目录：ctx 注入值优先，缺失回落 Executor 配置目录。
 func (t *showArtifactTool) workDirFor(ctx context.Context) string {
 	if wd := WorkDirFromContext(ctx); wd != "" {
@@ -235,6 +317,8 @@ func kindLabelCN(kind string) string {
 		return "音频"
 	case "html":
 		return "网页预览"
+	case "widget":
+		return "界面部件"
 	}
 	return kind
 }

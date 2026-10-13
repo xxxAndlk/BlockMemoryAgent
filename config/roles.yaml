@@ -64,7 +64,7 @@ meta_agent:
           submit_plan, review_plan, ReadFile, EditFile, RestoreFile, WriteFile, RunCommand, ReadMedia, SearchInFiles,
           ListDir, ShowArtifact, list_skills, load_skill, tool_catalog, tool_mount, tool_unmount, plugin_search,
           plugin_install, plugin_enable, plugin_disable, plugin_list, list_models, set_role_model, set_agent_model,
-          expand_memory, update_evolution_prompt, search_block_memory]
+          expand_memory, update_evolution_prompt, search_block_memory, widget_save, widget_list]
 
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:

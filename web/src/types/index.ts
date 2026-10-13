@@ -90,6 +90,8 @@ export interface Session extends SessionSummary {
   streaming_text?: string
   /** 当前思考阶段过程文本（瞬时，仅运行中有值）。 */
   thinking_text?: string
+  /** 界面部件最新数据快照（widget_id → payload 文本，瞬时通道；重连后随快照补发）。 */
+  widget_data?: Record<string, string>
   events: SessionEvent[]
   messages: ChatMessage[]
 }
@@ -222,6 +224,8 @@ export interface ArtifactRef {
   size?: number
   /** 自动兜底识别出来的（非工具显式登记）：用于文案区分 */
   inferred?: boolean
+  /** kind=widget 时的初始数据（JSON 字符串，由 ShowArtifact 的 data 参数透传） */
+  data?: string
 }
 
 /** 从 tool_exec 事件的 detail_json 里取出 ShowArtifact 登记的成果。 */
@@ -320,10 +324,10 @@ export function inferArtifactsFromOutput(output?: string): ArtifactRef[] {
   return out
 }
 
-// kind 合法值：四类内嵌媒体 + 紧凑文件卡类型（TODO #26 A）。
+// kind 合法值：四类内嵌媒体 + 紧凑文件卡类型（TODO #26 A）+ widget（界面部件，2026-10-13）。
 // 不在集合内时按 path 扩展名推断（复用 EXT_ARTIFACT_KIND），推断不出同样丢弃。
 const ARTIFACT_KINDS = new Set(['image', 'video', 'audio', 'html',
-  'pdf', 'markdown', 'code', 'json', 'csv', 'xlsx', 'txt', 'unknown'])
+  'pdf', 'markdown', 'code', 'json', 'csv', 'xlsx', 'txt', 'unknown', 'widget'])
 
 /**
  * 清洗 SSE awaiting_clarify 帧的 artifacts 字段（后端契约外的脏数据不放进问答卡）：
@@ -383,4 +387,25 @@ export interface HealthStatus {
   online: boolean
   latency_ms?: number
   detail: string
+}
+
+// ---- 界面部件（Widget，2026-10-13）----
+
+/** SSE widget_data 帧（瞬时通道，不落库）：widget_id → 最新 payload 文本（可能是 JSON 文本）。 */
+export interface WidgetDataFrame {
+  type: 'widget_data'
+  widget_id: string
+  payload: string
+}
+
+/** 部件清单信息（与后端 widgets.Info 对齐；id = widgets/ 下的目录名）。 */
+export interface WidgetInfo {
+  id: string
+  name: string
+  version?: string
+  description?: string
+  entry: string
+  enabled: boolean
+  updated_at?: string
+  files?: string[]
 }

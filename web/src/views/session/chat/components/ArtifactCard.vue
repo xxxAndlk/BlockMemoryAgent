@@ -16,6 +16,7 @@ import { workspaceUrl } from '@/api/session'
 import { revealFile } from '@/api/files'
 import { APIError } from '@/api/client'
 import { useFileOpener } from '@/composables/fileOpener'
+import WidgetFrame from '@/components/WidgetFrame.vue'
 
 const props = defineProps<{
   artifact: ArtifactRef
@@ -24,6 +25,10 @@ const props = defineProps<{
 
 /** 内嵌预览的四类媒体；其余 kind 一律走紧凑文件卡（图片/视频/音频/HTML 行为不动）。 */
 const MEDIA_KINDS = new Set(['image', 'video', 'audio', 'html'])
+
+/** 界面部件（2026-10-13 Widget 机制）：kind=widget 且 path 为 widget://<id> 时整卡交给 WidgetFrame。 */
+const isWidget = computed(() => props.artifact.kind === 'widget' && props.artifact.path.startsWith('widget://'))
+const widgetId = computed(() => (isWidget.value ? props.artifact.path.slice('widget://'.length) : ''))
 
 const url = computed(() => workspaceUrl(props.sessionId, props.artifact.path))
 const title = computed(() => props.artifact.title || props.artifact.path.split('/').pop() || props.artifact.path)
@@ -108,7 +113,10 @@ async function revealInFolder() {
 </script>
 
 <template>
-  <div class="rounded-card border border-line bg-card overflow-hidden" :data-bma-file-card="absPath ?? undefined">
+  <!-- 界面部件：整卡交给 WidgetFrame（自带头部/错误条/沙箱 iframe），path 解析出 widget id -->
+  <WidgetFrame v-if="isWidget" :widget-id="widgetId" :title="artifact.title" :data="artifact.data"
+               :session-id="sessionId" />
+  <div v-else class="rounded-card border border-line bg-card overflow-hidden" :data-bma-file-card="absPath ?? undefined">
     <!-- 头部：图标 + 文件名 + 操作（媒体卡与文件卡共用） -->
     <div class="flex items-center gap-2 px-2.5 py-1.5 border-b border-line text-[11px] text-ink-2">
       <el-icon class="text-primary shrink-0">

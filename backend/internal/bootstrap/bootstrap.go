@@ -40,6 +40,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/internal/store"
 	"github.com/blockmemory/agent/backend/internal/userprofile"
+	"github.com/blockmemory/agent/backend/internal/widgets"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/prompts"
@@ -83,6 +84,7 @@ type App struct {
 	DAGScheduler *dag.Scheduler            // DAG 调度器；DAG 关闭时为 nil
 	Logger       *logger.Logger            // 结构化会话日志器
 	Plugins      *plugins.Manager          // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
+	Widgets      *widgets.Manager          // 界面部件管理器（widgets/ 目录包，Widget 机制）
 	WorkDir      string                    // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
 
 	// SkillConsolidation 经验技能库整理（C 库存治理）：POST /api/skills/consolidate 手动触发，
@@ -1223,6 +1225,25 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		return nil, fmt.Errorf("init dag file store %s: %w", schedulesDir, err)
 	}
 	dagStore.SetLogger(sessionLogger)
+
+	// 界面部件（Widget）：widgets/<id>/ 目录包（与 schedules/ 同目录推导），文件即
+	// 唯一事实源，Manager 按 mtime 增量热载。注入：HTTP 管理面（App.Widgets →
+	// router.go SetWidgetManager）、ShowArtifact kind=widget 的存在/启用校验、
+	// widget_save 工具（保存成功后推 __reload__ 热刷新已打开的卡片）。
+	widgetsDir := filepath.Join(filepath.Dir(paths.ConfigPath), "widgets")
+	widgetMgr, err := widgets.NewManager(widgetsDir)
+	if err != nil {
+		return nil, fmt.Errorf("init widgets manager %s: %w", widgetsDir, err)
+	}
+	widgetMgr.SetLogger(sessionLogger)
+	toolRegistry.SetWidgetLookup(func(id string) (string, bool, bool) {
+		info, ok := widgetMgr.Get(id)
+		if !ok {
+			return "", false, false
+		}
+		return info.Name, info.Enabled, true
+	})
+	toolRegistry.SetWidgetManager(widgetMgr, agentSvc.PushWidgetData)
 	// 存量迁移（幂等）：PG 里有定义但磁盘无文件的 dag_jobs 行导出为 YAML，
 	// 文件已存在则跳过；导出后 PG 行保留作运行态。失败不阻断启动。
 	if n, err := dagStore.Migrate(ctx); err != nil {
@@ -1315,6 +1336,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		DAGScheduler: dagScheduler,
 		Logger:       sessionLogger,
 		Plugins:      pluginManager,
+		Widgets:      widgetMgr,
 		WorkDir:      workDir,
 
 		SkillConsolidation: func(ctx context.Context) (string, error) {

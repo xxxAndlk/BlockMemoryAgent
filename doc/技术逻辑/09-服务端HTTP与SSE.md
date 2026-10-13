@@ -68,7 +68,7 @@
 
 ### C. 系统/管理端点（bootstrap/router.go:60-105）
 
-metrics、status、metrics/timeline、activity、capabilities、export/memory、DAG 六端点（GET/POST /dag、/dag/running、/dag/:id、DELETE、/dag/:id/trigger）、snapshot/memory/search/memory/levels/memory/eval（**三个 memory 桩**）、skills、files、files/raw、files/content（GET+PUT）、files/reveal、editors、editors/open、fs/browse、fs/pick-dir、fs/tree、profile（GET/PUT）、project/preferences（GET/PUT）、project/tester-config（GET/PUT）、skills/learned（列表/详情/PUT/enable/disable）、evolution/log、plugins（列表/详情/enable/disable/reload）、models（GET/POST /models/switch/POST）。
+metrics、status、metrics/timeline、activity、capabilities、export/memory、DAG 六端点（GET/POST /dag、/dag/running、/dag/:id、DELETE、/dag/:id/trigger）、snapshot/memory/search/memory/levels/memory/eval（**三个 memory 桩**）、skills、files、files/raw、files/content（GET+PUT）、files/reveal、editors、editors/open、fs/browse、fs/pick-dir、fs/tree、profile（GET/PUT）、project/preferences（GET/PUT）、project/tester-config（GET/PUT）、skills/learned（列表/详情/PUT/enable/disable）、evolution/log、plugins（列表/详情/enable/disable/reload）、widgets 八端点（列表/详情/enable/disable/reload + `/widgets/:id/files/*path` 文件服务 + push/report，见 16）、models（GET/POST /models/switch/POST）。
 
 ### D. 非 /api（main.go）
 
@@ -80,12 +80,13 @@ metrics、status、metrics/timeline、activity、capabilities、export/memory、
 
 - 建立（:18-52）：`Get` 探活（失败 404 文本非 SSE 帧）→ 头（`text/event-stream`/no-cache/keep-alive/`Access-Control-Allow-Origin: *`——全仓唯一 CORS 头）→ **`SetWriteDeadline(time.Time{})` 清除 server 级 WriteTimeout**（否则 30s 掐断长任务；依赖 gin ResponseWriter 的 Unwrap）→ Flusher 断言 → **首帧=完整 Session JSON 快照**。
 - 帧格式：一律 `data: <json>\n\n` 单行帧，**不用 `event:`/`id:`/`retry:`**。
-- 轮询循环（500ms ticker）：
+- 轮询循环（150ms ticker，2026-09-20 自 500ms 调快）：
   | 帧 | 触发 | 内容 |
   |---|---|---|
   | 全量快照 | 事件切片被头部裁剪（`lastEventCount > len`） | 完整 Session |
   | 增量事件 | 新事件逐条 | SessionEvent |
   | `live` | StreamingText/ThinkingText 变化 | `{type:"live", streaming_text, thinking_text}` |
+  | `widget_data` | 会话 widgetData 某 widget_id 的 payload 变化（2026-10-13，见 16） | `{type:"widget_data", widget_id, payload}` |
   | `session_status` | Status 变化一次 | `{type, status}` |
   | `awaiting_clarify` | **status==awaiting_clarify 时每 tick 都推** | `{type,status,question,question_id,multi_select,options?,detail?,artifacts?,questions?}` |
   | `done` | 非 running 且非 awaiting_clarify → 推完 return（关连接） | `{type:"done", status}` |
@@ -144,6 +145,7 @@ metrics、status、metrics/timeline、activity、capabilities、export/memory、
 - **capabilities**（capabilities.go:33）：3s ctx，六项 llm/postgres/redis/embed/plugins/workdir；**只做廉价检查不发真实 LLM 调用**：LLM 看 `CurrentModelInfo("meta")`；PG/Redis 双判空+Ping；embed 按 provider 分支（openai/local 要求 api_key 或 base_url，缺给 `Missing` 提示）；plugins 停用不计入、启用有 MissingEnv/LastError 即不合格；workdir 写探针文件即删。返回 `{items, all_ok}`。
 - **models**（model.go）：`GET /models`（无 api_key）/`POST /models/switch`（**70s**，含 60s 探活；错误 400 非 500；**未走 DecodeBody 无 UTF-8 校验**）/`POST /models`（`slugModelID` 生成 ID、重名追加 -2）。
 - **plugins**（plugins.go）：list/get/enable/disable/reload（30s/60s）；**`GetPluginHandler` 缺 nil 守卫**（其余三个有）。
+- **widgets**（widgets_http.go，2026-10-13，见 16）：list/get/enable/disable/reload + `/widgets/:id/files/*path` 文件服务（防护照搬 workspace_http.go）+ `push`/`report`（均恒 204 静默——会话不存在不报错，调用方拿不到投递凭证）。
 - **learned_skills**：全部端点 `learnedSkills==nil` → 503；`PUT /:name` 最重：校验（含可选 `tools` 整体替换，`sanitizeSkillTools`）→Get→重写文件（CRLF→LF；目录式技能同步删已移除 scripts/ 文件）→重嵌入（失败不阻塞）→UpdateMeta（同步 has_tools）→注册进技能池。
 - **files/editors/fs-tree（TODO #26，2026-10-01）**：
   - `GET /files/raw`（api.go）：原始字节流；边界=会话 WriteFile 产物 ∪ 任一会话工作区内；Range 单区间 206/416（`Accept-Ranges`），弱 ETag `W/"size-mtimeUnix"` + Last-Modified + If-None-Match→304（**不处理 If-Modified-Since**）；Content-Type 白名单、20MB 上限、`download=1` 走 attachment。

@@ -138,3 +138,90 @@ func TestShowArtifact_ResultJSONCarriesArtifacts(t *testing.T) {
 		t.Fatalf("Result JSON 不应含 base64 内容:\n%s", s)
 	}
 }
+
+
+// dispatchShowArtifactWidget 在注入了 widgetLookup 的 Registry 上跑一次 kind=widget 调用。
+func dispatchShowArtifactWidget(t *testing.T, lookup func(id string) (string, bool, bool), args map[string]any) *Result {
+	t.Helper()
+	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
+	r.SetWidgetLookup(lookup)
+	res, err := r.Dispatch(context.Background(), "ShowArtifact", args)
+	if err != nil {
+		t.Fatalf("Dispatch 出错: %v", err)
+	}
+	return res
+}
+
+// TestShowArtifact_WidgetKind 钉死 kind=widget 契约：引用已启用部件登记
+// widget:// 工件、data 透传进 Result JSON（detail_json 链路）；
+// 部件不存在/停用/未接线一律 validation_rejected。
+func TestShowArtifact_WidgetKind(t *testing.T) {
+	enabledLookup := func(id string) (string, bool, bool) {
+		if id == "wechat-qr" {
+			return "微信二维码", true, true
+		}
+		if id == "disabled-card" {
+			return "停用卡片", false, true
+		}
+		return "", false, false
+	}
+
+	// 正常登记：Path 为 widget://<id>，data/title/caption 透传。
+	res := dispatchShowArtifactWidget(t, enabledLookup, map[string]any{
+		"kind": "widget", "widget_id": "wechat-qr", "title": "扫码登录", "caption": "二维码实时刷新",
+		"data": `{"url":"https://x/qr"}`,
+	})
+	if !res.Success {
+		t.Fatalf("应成功: %+v", res)
+	}
+	if len(res.Artifacts) != 1 {
+		t.Fatalf("应登记 1 个成果: %+v", res.Artifacts)
+	}
+	a := res.Artifacts[0]
+	if a.Kind != "widget" || a.Path != "widget://wechat-qr" || a.Title != "扫码登录" ||
+		a.Caption != "二维码实时刷新" || a.Data != `{"url":"https://x/qr"}` {
+		t.Fatalf("成果字段不符: %+v", a)
+	}
+	// data 透传进 Result JSON（registry.emitResult → 事件 detail_json 的 marshal 路径）。
+	raw, err := marshalNoHTMLEscape(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := string(raw); !strings.Contains(s, `"data":"{\"url\":\"https://x/qr\"}"`) {
+		t.Fatalf("Result JSON 应携带 data:\n%s", s)
+	}
+
+	// 拒绝场景：部件不存在 / 停用 / 缺 widget_id / 未接线 / data 超限。
+	t.Run("部件不存在", func(t *testing.T) {
+		res := dispatchShowArtifactWidget(t, enabledLookup, map[string]any{"kind": "widget", "widget_id": "ghost"})
+		if res.Success || res.Category != ResultCategoryValidationRejected || !strings.Contains(res.Error, "不存在") {
+			t.Fatalf("应拒绝: %+v", res)
+		}
+	})
+	t.Run("部件停用", func(t *testing.T) {
+		res := dispatchShowArtifactWidget(t, enabledLookup, map[string]any{"kind": "widget", "widget_id": "disabled-card"})
+		if res.Success || res.Category != ResultCategoryValidationRejected || !strings.Contains(res.Error, "停用") {
+			t.Fatalf("应拒绝: %+v", res)
+		}
+	})
+	t.Run("缺 widget_id", func(t *testing.T) {
+		res := dispatchShowArtifactWidget(t, enabledLookup, map[string]any{"kind": "widget"})
+		if res.Success || res.Category != ResultCategoryValidationRejected {
+			t.Fatalf("应拒绝: %+v", res)
+		}
+	})
+	t.Run("未接线", func(t *testing.T) {
+		res := dispatchShowArtifactWidget(t, nil, map[string]any{"kind": "widget", "widget_id": "wechat-qr"})
+		if res.Success || res.Category != ResultCategoryValidationRejected || !strings.Contains(res.Error, "未接线") {
+			t.Fatalf("应拒绝并提示未接线: %+v", res)
+		}
+	})
+	t.Run("data 超限", func(t *testing.T) {
+		res := dispatchShowArtifactWidget(t, enabledLookup, map[string]any{
+			"kind": "widget", "widget_id": "wechat-qr", "data": strings.Repeat("x", artifactWidgetDataMaxBytes+1),
+		})
+		if res.Success || res.Category != ResultCategoryValidationRejected {
+			t.Fatalf("应拒绝: %+v", res)
+		}
+	})
+}

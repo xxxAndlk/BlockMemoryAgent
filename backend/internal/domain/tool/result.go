@@ -67,6 +67,10 @@ type Artifact struct {
 	Caption string `json:"caption,omitempty"`
 	// MIME 内容类型（可选，前端据此兜底渲染方式）。
 	MIME string `json:"mime,omitempty"`
+	// Data 初始数据（可选，仅 kind=widget）：JSON 字符串，卡片 iframe 挂载后
+	// 经 postMessage init 消息下发给部件；走 detail_json 落库属一次性初始值，
+	// 后续实时更新走 widget_data 瞬时通道，不经本字段。
+	Data string `json:"data,omitempty"`
 }
 
 // ResultImage 是工具结果携带的单张图片。

@@ -381,6 +381,9 @@ type Session struct {
 	// PinnedPlugins 会话级指定插件 ID 列表（KIMI 式插件选择）：空 = 未指定
 	// （模型自行判断）。前端插件选择器据此回显。
 	PinnedPlugins []string
+	// WidgetData 界面部件瞬时数据通道的最新值（widget_id -> payload，仅内存态，
+	// 不持久化）；快照线型 json 名 widget_data 由 server 层接线决定，此处先行声明。
+	WidgetData map[string]string
 }
 
 // Event 是会话事件的 DTO，按字段逐一对齐 server.SessionEvent。
