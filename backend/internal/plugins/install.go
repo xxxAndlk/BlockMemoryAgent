@@ -29,7 +29,7 @@ var pluginIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
 // 可安装的插件形态（builtin 编译进二进制、bundle 需目录包，均不可动态安装）。
 func installableKind(k Kind) bool {
-	return k == KindMCP || k == KindService
+	return k == KindMCP || k == KindService || k == KindProcess
 }
 
 // installedConfigPath 推导 installed 文件路径。
@@ -50,7 +50,7 @@ func validateInstall(manifest Manifest, settings map[string]any) error {
 		return fmt.Errorf("插件 ID %q 与 bundle 展开命名空间冲突", manifest.ID)
 	}
 	if !installableKind(manifest.Kind) {
-		return fmt.Errorf("插件形态 %q 不可动态安装（仅支持 mcp/service）", manifest.Kind)
+		return fmt.Errorf("插件形态 %q 不可动态安装（仅支持 mcp/service/process）", manifest.Kind)
 	}
 	// 天花板红线（TODO #52 执行项 1）：destructive 插件（工具全进审批链，如 computer_use）
 	// 必须显式声明可见角色——缺省/["*"] 全角色授权是权限事故，安装时直接拒绝，绝不停留在文档层。
@@ -81,6 +81,10 @@ func validateInstall(manifest Manifest, settings map[string]any) error {
 	case KindService:
 		if img, _ := settings["image"].(string); strings.TrimSpace(img) == "" {
 			return fmt.Errorf("service 插件 %q: 必须提供 settings.image", manifest.ID)
+		}
+	case KindProcess:
+		if cmd, _ := settings["command"].(string); strings.TrimSpace(cmd) == "" {
+			return fmt.Errorf("process 插件 %q: 必须提供 settings.command", manifest.ID)
 		}
 	}
 	return nil

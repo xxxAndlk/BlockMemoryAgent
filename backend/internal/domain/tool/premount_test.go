@@ -57,7 +57,7 @@ func TestMountPreApproved_RegisteredOnlyAndScopeIsolated(t *testing.T) {
 // 同一工具在未预挂的 scope 上照旧被硬门拒绝（豁免按 scope 生效）。
 func TestRoleToolGate_PreMountedExempt(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	r.SetRoleToolGateResolver(func(roleID string) []string { return []string{"ReadFile"} })
+	r.SetRoleToolGateResolver(func(roleID, scope string) []string { return []string{"ReadFile"} })
 	r.Register(&fakePluginTool{name: "plug_a"})
 
 	ctx := WithAgentID(WithRoleID(context.Background(), "doc_assistant"), "sess-1")

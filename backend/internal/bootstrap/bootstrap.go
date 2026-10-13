@@ -333,31 +333,63 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 变化（tool_mount/tools_hint/plugin_install 自动挂载），此处按可见性天花板放行；
 	// 未挂载工具本就不进 Schema，LLM 无从合法调用。插件可见性回调在下方 plugins.Manager
 	// 构建后才接线（pluginVis 间变量延迟取值，接线前闭包只按静态白名单裁决）。
+	// heldToolGrantFn 派发级工具授权查询（二期）：按 ctx scope（agentID）查 dispatcher
+	// 的 heldTools 覆盖——only=仅授权集、extend=角色并集再并授权集；下方 NewDispatcher
+	// 后接线（同 pluginVis 的延迟取值模式），接线前按无授权处理（现状行为）。
 	var pluginVis tool.PluginVisibilityFunc
+	var heldToolGrantFn func(scope string) ([]string, string, bool)
 	if cfg.Agent.RoleToolGateEnabled {
-		toolRegistry.SetRoleToolGateResolver(func(roleID string) []string {
+		toolRegistry.SetRoleToolGateResolver(func(roleID, scope string) []string {
 			rd := roleRegistry.Get(roleID)
 			if rd == nil {
 				return nil
 			}
+			var base []string
 			if pluginVis == nil {
-				return rd.Tools
-			}
-			merged := make([]string, 0, len(rd.Tools)+8)
-			merged = append(merged, rd.Tools...)
-			seen := make(map[string]bool, len(rd.Tools))
-			for _, name := range rd.Tools {
-				seen[name] = true
-			}
-			for _, name := range toolRegistry.ToolNames() {
-				if seen[name] {
-					continue
+				base = rd.Tools
+			} else {
+				merged := make([]string, 0, len(rd.Tools)+8)
+				merged = append(merged, rd.Tools...)
+				seen := make(map[string]bool, len(rd.Tools))
+				for _, name := range rd.Tools {
+					seen[name] = true
 				}
-				if owned, visible := pluginVis(roleID, name); owned && visible {
-					merged = append(merged, name)
+				for _, name := range toolRegistry.ToolNames() {
+					if seen[name] {
+						continue
+					}
+					if owned, visible := pluginVis(roleID, name); owned && visible {
+						merged = append(merged, name)
+					}
+				}
+				base = merged
+			}
+			// 派发级授权覆盖（二期）：该 scope 携带授权时按模式裁决——only 收窄为
+			// 仅授权集，extend 在现状并集上再并授权集；授权已在派发时校验 ⊆ 父可分配集
+			// ∩ 子角色插件可见性天花板，此处直接信任。
+			if heldToolGrantFn != nil {
+				if grants, mode, ok := heldToolGrantFn(scope); ok && len(grants) > 0 {
+					if mode == subagent.ToolGrantModeOnly {
+						return grants
+					}
+					// extend：基线为空=角色全量暴露，并集仍是全量（授权插件工具经挂载放行）。
+					if len(base) == 0 {
+						return base
+					}
+					seen := make(map[string]bool, len(base))
+					for _, name := range base {
+						seen[name] = true
+					}
+					out := append([]string{}, base...)
+					for _, name := range grants {
+						if !seen[name] {
+							out = append(out, name)
+						}
+					}
+					return out
 				}
 			}
-			return merged
+			return base
 		})
 	}
 	// 注入 LLM 领域分区器：RefreshProjectDoc 工具（MetaAgent 侧）与 EnsureProjectDoc（首 session）
@@ -466,6 +498,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		subAgentTimeout = 0 // 负数表示不限制
 	}
 	subAgentDispatcher := subagent.NewDispatcher(roleRegistry, &reactModelFactory{modelFactory}, toolRegistry, sharedMailbox, memoryPipeline)
+	// 派发级工具授权查询接入执行硬门（二期）：闭包按 ctx scope 查 heldTools 覆盖。
+	heldToolGrantFn = subAgentDispatcher.HeldToolGrant
 	// 心跳检活：叶子 Agent 超过该时长无 generateOnce/工具派发判定假死，巡检主动 cancel+notify 父，
 	// 比等满 sub_agent_timeout（60min）早暴露第二次 session 卡死（LLM 流式挂起等）。<=0 关闭。
 	subAgentHeartbeat := time.Duration(cfg.Agent.SubAgentHeartbeatTimeoutMin) * time.Minute
@@ -1180,16 +1214,33 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	sessionMgr.SetPostgresStore(pgStore)
 	sessionMgr.SetModelFactory(modelFactory)
 
+	// 定时任务定义文件化：定义唯一活源为 schedules/<id>.yaml（与配置同目录，
+	// 推导方式同上方 plugins.d），PG dag_jobs 退化为运行态载体；FileStore
+	// 包装 pgStore 完成定义/运行态拆分，对 Scheduler/Handler/hook 接口不变。
+	schedulesDir := filepath.Join(filepath.Dir(paths.ConfigPath), "schedules")
+	dagStore, err := dag.NewFileStore(pgStore, schedulesDir)
+	if err != nil {
+		return nil, fmt.Errorf("init dag file store %s: %w", schedulesDir, err)
+	}
+	dagStore.SetLogger(sessionLogger)
+	// 存量迁移（幂等）：PG 里有定义但磁盘无文件的 dag_jobs 行导出为 YAML，
+	// 文件已存在则跳过；导出后 PG 行保留作运行态。失败不阻断启动。
+	if n, err := dagStore.Migrate(ctx); err != nil {
+		log.Printf("[bootstrap] dag schedules migrate failed (non-fatal): %v", err)
+	} else if n > 0 {
+		log.Printf("[bootstrap] dag schedules migrated: %d 条存量任务已导出到 %s", n, schedulesDir)
+	}
+
 	// 第十八步：若 DAG 功能开启，创建并启动 DAG 调度器。
 	var dagScheduler *dag.Scheduler
 	if cfg.Agent.DAGEnabled {
-		dagScheduler = dag.NewScheduler(pgStore, sessionMgr, 10*time.Second)
+		dagScheduler = dag.NewScheduler(dagStore, sessionMgr, 10*time.Second)
 		dagScheduler.SetLogger(sessionLogger)
 		dagScheduler.Start(ctx)
 	}
 
 	// 第十九步：创建 DAG HTTP 处理器。
-	dagHandler := server.NewDAGHandler(pgStore, dagScheduler)
+	dagHandler := server.NewDAGHandler(dagStore, dagScheduler)
 
 	// schedule_task 工具接线（2026-09-27）：MetaAgent 创建/更新定时任务的入口。
 	// cron 合法性在此校验（标准 5 段或 Ns/Nm/Nh 相对间隔），upsert 走 dag.Store；
@@ -1222,13 +1273,13 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 				CreatedAt: now,
 				UpdatedAt: now,
 			}
-			if err := pgStore.SaveDAG(ctx, d); err != nil {
+			if err := dagStore.SaveDAG(ctx, d); err != nil {
 				return "", err
 			}
 			return scheduleTaskSummary("已创建定时任务", d.ID, spec, nextFire), nil
 		}
 		// 更新：只改名称/调度/启用；goal 仅对单节点任务可改（多节点请到页面编辑）。
-		d, err := pgStore.GetDAG(ctx, spec.ID)
+		d, err := dagStore.GetDAG(ctx, spec.ID)
 		if err != nil {
 			return "", fmt.Errorf("任务不存在: %s", spec.ID)
 		}
@@ -1239,7 +1290,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return "", fmt.Errorf("任务 %s 有 %d 个节点，多节点任务请到「定时任务」页面编辑", spec.ID, len(d.Tasks))
 		}
 		d.UpdatedAt = now
-		if err := pgStore.SaveDAG(ctx, d); err != nil {
+		if err := dagStore.SaveDAG(ctx, d); err != nil {
 			return "", err
 		}
 		return scheduleTaskSummary("已更新定时任务", d.ID, spec, nextFire), nil

@@ -52,11 +52,16 @@ func (d *Dispatcher) decisionGateFailureDisposition(ctx context.Context, subAgen
 // 覆盖不到的需求信号（needs_browser/needs_mcp/needs_vision）。影子期只落对拍行
 // （actual=none，现状=规则放行）；enforce 点命中缺口且置信达标时返回拦截消息
 // （validation_rejected 同款语义），空串=放行。
-func (d *Dispatcher) decisionGateDispatchGap(ctx context.Context, parentID, roleID, task string) string {
+// grantTools 非空时（派发级工具授权，二期）把授权后的有效工具面并入问题上下文，
+// 使"角色有没有某工具"的判定基于有效白名单而非角色静态面。
+func (d *Dispatcher) decisionGateDispatchGap(ctx context.Context, parentID, roleID, task string, grantTools []string) string {
 	if d.decisionLayer == nil {
 		return ""
 	}
 	q := decision.DispatchGapQuestion(roleID, task)
+	if len(grantTools) > 0 {
+		q.Context += "\neffective_tools=" + strings.Join(grantTools, ",")
+	}
 	req := decision.Request{State: "派发前灰区需求信号检查", Questions: []decision.Question{q}}
 	resp, err := d.decisionLayer.Decide(ctx, req)
 	if err != nil || len(resp.Answers) == 0 {

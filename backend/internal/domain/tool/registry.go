@@ -159,7 +159,8 @@ type Registry struct {
 	// 该角色白名单非空时，Dispatch 拒绝执行白名单外工具——堵住 Schema 软过滤缺口（LLM
 	// 幻觉/提示注入出白名单外工具名此前仍会执行）。nil 解析器 / 空 roleID / 空白名单 =
 	// 现状行为不变（verifyloop ExecuteChild 等程序化派发依赖现状，默认关闭）。
-	roleToolGate func(roleID string) []string
+	// scope=调用方 agentID：供闭包叠加派发级工具授权覆盖（二期，heldToolGrant）。
+	roleToolGate func(roleID, scope string) []string
 	// pluginMgr 是 plugin_* 工具（TODO #51）依赖的插件管理面，由 bootstrap 注入
 	// plugins.ToolManagerAdapter；nil 时工具返回未配置错误。
 	pluginMgr PluginManager
@@ -380,9 +381,10 @@ func (r *Registry) SetApprovalDisabled(disabled bool) {
 // SetRoleToolGateResolver 注入角色工具白名单硬门解析器（dormant opt-in，
 // config: role_tool_gate_enabled，默认关闭）。fn 返回该角色的工具白名单；
 // 返 nil/空切片表示该角色不限制。nil 解析器 = 全局关闭（现状行为）。
+// scope=调用方 agentID（scopeKeyFromCtx）：闭包可据它叠加派发级工具授权覆盖。
 // 注意：开启后 verifyloop ExecuteChild 等绕过 adapter Schema 过滤的程序化路径
 // 同样被拦截——这正是本门的目的，但启用前需确认各角色白名单完整覆盖其实际所需。
-func (r *Registry) SetRoleToolGateResolver(fn func(roleID string) []string) {
+func (r *Registry) SetRoleToolGateResolver(fn func(roleID, scope string) []string) {
 	if r != nil {
 		r.roleToolGate = fn
 	}
@@ -591,7 +593,7 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	// 对顶层 scope 的预挂载名放行（见 MountPreApprovedForScope）。
 	if r.roleToolGate != nil && !r.isPreMounted(scopeKeyFromCtx(ctx), name) {
 		if roleID := RoleIDFromContext(ctx); roleID != "" {
-			if allowed := r.roleToolGate(roleID); len(allowed) > 0 && !slices.Contains(allowed, name) {
+			if allowed := r.roleToolGate(roleID, scopeKeyFromCtx(ctx)); len(allowed) > 0 && !slices.Contains(allowed, name) {
 				log.Printf("[tool] role-tool-gate deny: role=%s tool=%s", roleID, name)
 				result := &Result{Tool: name, Error: fmt.Sprintf("角色 %s 的白名单不含工具 %s，执行被硬门拒绝。请改用白名单内工具推进任务。", roleID, name)}
 				r.fillResult(ctx, result, args)

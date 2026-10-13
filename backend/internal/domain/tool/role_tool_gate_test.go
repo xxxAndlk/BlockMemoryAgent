@@ -38,7 +38,7 @@ func TestRoleToolGate_DefaultOff(t *testing.T) {
 func TestRoleToolGate_DenyOutsideWhitelist(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
 	r.Register(&gateStubTool{name: "probe-gate"})
-	r.SetRoleToolGateResolver(func(roleID string) []string {
+	r.SetRoleToolGateResolver(func(roleID, scope string) []string {
 		if roleID == "code_assistant" {
 			return []string{"ReadFile", "WriteFile"}
 		}
@@ -62,7 +62,7 @@ func TestRoleToolGate_DenyOutsideWhitelist(t *testing.T) {
 func TestRoleToolGate_AllowInsideWhitelist(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
 	r.Register(&gateStubTool{name: "probe-gate"})
-	r.SetRoleToolGateResolver(func(string) []string { return []string{"probe-gate"} })
+	r.SetRoleToolGateResolver(func(string, string) []string { return []string{"probe-gate"} })
 	ctx := WithRoleID(WithSessionID(context.Background(), "s1"), "code_assistant")
 
 	res, err := r.Dispatch(ctx, "probe-gate", nil)
@@ -76,7 +76,7 @@ func TestRoleToolGate_AllowInsideWhitelist(t *testing.T) {
 func TestRoleToolGate_PassthroughEdgeCases(t *testing.T) {
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
 	r.Register(&gateStubTool{name: "probe-gate"})
-	r.SetRoleToolGateResolver(func(roleID string) []string {
+	r.SetRoleToolGateResolver(func(roleID, scope string) []string {
 		if roleID == "code_assistant" {
 			return []string{"ReadFile"}
 		}

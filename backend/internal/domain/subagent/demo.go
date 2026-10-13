@@ -108,7 +108,7 @@ func (m *AcceptanceManager) runDemo(ctx context.Context, sessionID string, t *or
 	// 内部派发：以 Meta（agentID=sessionID）为父走 dispatchOne 同链路，墙钟复用验收派发预算。
 	dctx := agent.WithAgentID(ctx, sessionID)
 	demoID, errRes := m.d.dispatchOne(dctx, "test_assistant", demoDomain, task, "", "", "",
-		nil, nil, acceptanceTesterWallClock, "", "")
+		nil, nil, nil, "", acceptanceTesterWallClock, "", "")
 	if errRes != nil {
 		log.Printf("[acceptance] dispatch demo failed: session=%s round=%d err=%s", sessionID, round, errRes.Error)
 		m.notifyUser(sessionID, "演示录制未能启动（"+errRes.Error+"），跳过演示直接交付。")
@@ -247,7 +247,7 @@ func (m *AcceptanceManager) attributeDemoRejection(ctx context.Context, sessionI
 	task := buildAttributionTask(feedback, reportPath, roster)
 	dctx := agent.WithAgentID(ctx, sessionID)
 	attrID, errRes := m.d.dispatchOne(dctx, "test_assistant", acceptanceDomain, task, "", "", "",
-		nil, nil, acceptanceTesterWallClock, "", "")
+		nil, nil, nil, "", acceptanceTesterWallClock, "", "")
 	if errRes != nil {
 		log.Printf("[acceptance] dispatch demo attribution failed: session=%s err=%s", sessionID, errRes.Error)
 	} else if node, ok := m.waitNodeTerminal(ctx, t, attrID); ok &&

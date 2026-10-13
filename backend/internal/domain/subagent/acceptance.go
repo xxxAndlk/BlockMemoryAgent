@@ -234,7 +234,7 @@ func (m *AcceptanceManager) run(ctx context.Context, cfg TesterConfig, sessionID
 		// test_assistant spec_exempt 豁免 WriteSpec 门禁（门禁在 Execute 层，dispatchOne 本身不含）。
 		dctx := agent.WithAgentID(ctx, sessionID)
 		testerID, errRes := m.d.dispatchOne(dctx, "test_assistant", acceptanceDomain, task, "", "", "",
-			nil, nil, acceptanceTesterWallClock, "", "")
+			nil, nil, nil, "", acceptanceTesterWallClock, "", "")
 		if errRes != nil {
 			log.Printf("[acceptance] dispatch tester failed: session=%s round=%d err=%s", sessionID, round, errRes.Error)
 			return finalAnswer + "\n\n（交付验收未完成：测试助手派发失败——" + errRes.Error + "，本次交付未经验收）"

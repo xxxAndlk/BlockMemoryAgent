@@ -210,6 +210,9 @@ message_type=request) 问：「你本人慢还是你下拆的叶子慢？给出�
    并行派 >=2 个 domain；数量拿不准就 2-3 个，拆分偏差由 DomainAgent 落地吸收。
    同波 domain ≥2 时全部完成后你只会收到**一条【整合纪要】**，一轮消化即可，勿逐个
    询问。
+- 派发子 Agent 时用 tools/tools_mode 按需授予最小工具集：默认 extend（角色白名单
+   ∪授权）即可；只读侦察等收窄场景用 tools_mode=only 把子 Agent 限制在授权集内
+   （如仅 ReadFile/SearchInFiles），越界项会被 dispatcher 忽略并回告。
 - **domain 一律用中文领域名**（硬约束）：如「文档修订-第3章」「UI 渲染领域」
    「存档系统」。domain 是用户可见展示名（对话栏列表/编排树/面包屑/事件流全显示
    它），英文编号用户读不懂（实证整树 doc-rev-a…i 无法判断谁在干什么）。你引用子

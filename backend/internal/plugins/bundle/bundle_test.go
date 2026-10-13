@@ -3,6 +3,7 @@ package bundle
 // bundle_test.go 覆盖插件目录包加载（设计文档 §3.3、Phase 7）：
 //   - .claude-plugin/plugin.json 元数据解析；
 //   - .mcp.json server 展开 + ${CLAUDE_PLUGIN_ROOT} 替换 + 环境变量注入；
+//   - bma-plugin.json 展开 process 条目 + ${PLUGIN_DIR} 替换 + 三清单共存优先级；
 //   - skills/*/SKILL.md frontmatter 解析；
 //   - Scan 目录扫描（非插件包跳过、排序稳定）。
 
@@ -158,6 +159,92 @@ func TestScanMissingDir(t *testing.T) {
 	bundles, warnings := Scan(filepath.Join(t.TempDir(), "nope"))
 	if len(bundles) != 0 || len(warnings) != 0 {
 		t.Fatalf("缺失目录应返回空: bundles=%v warnings=%v", bundles, warnings)
+	}
+}
+
+func TestLoadBundleBMAPluginJSON(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, map[string]string{
+		// 三种清单共存：元数据 bma-plugin.json 优先于 plugin.json；
+		// .mcp.json 的 server 与 bma-plugin.json 的 process 条目各自展开。
+		".claude-plugin/plugin.json": `{"name": "Old Name", "version": "0.0.1", "description": "旧描述"}`,
+		".mcp.json":                  `{"mcpServers": {"s1": {"command": "npx"}}}`,
+		"bma-plugin.json": `{
+			"name": "wechat-ilink",
+			"version": "1.0.0",
+			"description": "微信 iLink 直连桥",
+			"plugins": [
+				{"id": "wechat-ilink-bridge", "kind": "process",
+				 "settings": {"command": "node", "args": ["bridge.mjs"], "cwd": "${PLUGIN_DIR}",
+				              "env": {"ILINK_HOME": "${PLUGIN_DIR}/data"},
+				              "health_url": "http://127.0.0.1:4000/health", "auto_restart": true}}
+			]
+		}`,
+	})
+	b, err := loadBundle(dir, "wechat-ilink")
+	if err != nil {
+		t.Fatalf("loadBundle: %v", err)
+	}
+	// 元数据：bma-plugin.json 优先于 .claude-plugin/plugin.json。
+	if b.Name != "wechat-ilink" || b.Version != "1.0.0" || b.Description != "微信 iLink 直连桥" {
+		t.Fatalf("bma-plugin.json 元数据优先解析错误: %+v", b)
+	}
+	// 共存：.mcp.json server 仍展开。
+	if len(b.Servers) != 1 {
+		t.Fatalf(".mcp.json 应共存展开 1 个 server，got %d", len(b.Servers))
+	}
+	// process 条目展开。
+	if len(b.Processes) != 1 {
+		t.Fatalf("应展开 1 个 process 条目，got %d", len(b.Processes))
+	}
+	pr := b.Processes[0]
+	if pr.ID != "wechat-ilink-bridge" || pr.Kind != "process" {
+		t.Fatalf("process 条目解析错误: %+v", pr)
+	}
+	abs, _ := filepath.Abs(dir)
+	if pr.Settings["cwd"] != abs {
+		t.Fatalf("cwd 的 ${PLUGIN_DIR} 展开错误: %v", pr.Settings["cwd"])
+	}
+	env, _ := pr.Settings["env"].(map[string]any)
+	if env["ILINK_HOME"] != abs+"/data" {
+		t.Fatalf("env 内嵌套 ${PLUGIN_DIR} 展开错误: %v", env)
+	}
+	if pr.Settings["command"] != "node" || pr.Settings["health_url"] != "http://127.0.0.1:4000/health" {
+		t.Fatalf("settings 透传错误: %+v", pr.Settings)
+	}
+	if pr.Settings["auto_restart"] != true {
+		t.Fatalf("布尔 settings 应原样保留: %v", pr.Settings["auto_restart"])
+	}
+}
+
+func TestLoadBundleBMAPluginInvalid(t *testing.T) {
+	// kind 不支持 / 缺 id：解析报错（Scan 记警告）。
+	for name, content := range map[string]string{
+		"bad_kind":   `{"plugins": [{"id": "x", "kind": "mcp", "settings": {}}]}`,
+		"missing_id": `{"plugins": [{"kind": "process", "settings": {"command": "node"}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTree(t, dir, map[string]string{"bma-plugin.json": content})
+			if _, err := loadBundle(dir, "bad"); err == nil {
+				t.Fatal("非法 bma-plugin.json 应报错")
+			}
+		})
+	}
+}
+
+func TestScanBMAPluginOnly(t *testing.T) {
+	// 仅含 bma-plugin.json 的目录也算插件包。
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		"plugins.d/wx/bma-plugin.json": `{"name": "wx", "plugins": [{"id": "p1", "kind": "process", "settings": {"command": "node"}}]}`,
+	})
+	bundles, warnings := Scan(filepath.Join(root, "plugins.d"))
+	if len(warnings) != 0 {
+		t.Fatalf("不应有警告: %v", warnings)
+	}
+	if len(bundles) != 1 || len(bundles[0].Processes) != 1 {
+		t.Fatalf("仅 bma-plugin.json 的目录应被识别为插件包: %+v", bundles)
 	}
 }
 

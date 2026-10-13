@@ -308,7 +308,7 @@ func TestWorktreeCreateNonRepoReject(t *testing.T) {
 func TestDispatchOneWorktreeDisabledReject(t *testing.T) {
 	d, _, _ := newWorktreeTestEnv(t)
 	d.WithWorktreeEnabled(false)
-	_, res := d.dispatchOne(worktreeCtx(t.TempDir()), "code_assistant", "", "task", "", "", "none", nil, nil, 0, "", "", &dispatchOpts{worktree: true})
+	_, res := d.dispatchOne(worktreeCtx(t.TempDir()), "code_assistant", "", "task", "", "", "none", nil, nil, nil, "", 0, "", "", &dispatchOpts{worktree: true})
 	if res == nil || !strings.Contains(res.Error, "worktree 派发未启用") {
 		t.Fatalf("disabled worktree should be rejected, got %+v", res)
 	}

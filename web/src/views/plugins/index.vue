@@ -79,12 +79,13 @@ function transportBadge(p: PluginInfo): { label: string; type: 'warning' | 'info
   return null
 }
 
-// kind 徽标色系：mcp / service / bundle 三种形态一眼区分。
+// kind 徽标色系：mcp / service / bundle / process 四种形态一眼区分。
 function kindBadge(p: PluginInfo) {
   const map: Record<string, { label: string; cls: string }> = {
     mcp: { label: 'MCP', cls: 'kind-mcp' },
     service: { label: 'Service', cls: 'kind-service' },
     bundle: { label: 'Bundle', cls: 'kind-bundle' },
+    process: { label: '进程', cls: 'kind-process' },
   }
   const hit = map[p.kind]
   return hit || { label: p.kind, cls: 'kind-other' }
@@ -212,6 +213,11 @@ onMounted(load)
   color: #059669;
   background: rgba(5, 150, 105, 0.08);
   border-color: rgba(5, 150, 105, 0.35);
+}
+.kind-process {
+  color: #d97706;
+  background: rgba(217, 119, 6, 0.08);
+  border-color: rgba(217, 119, 6, 0.35);
 }
 .kind-other {
   color: var(--bma-text-2, #666);

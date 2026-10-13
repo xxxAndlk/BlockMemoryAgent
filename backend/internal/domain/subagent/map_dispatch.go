@@ -125,6 +125,7 @@ func (t *mapSubAgentsTool) Description() string {
 		"典型 role_id=scout（侦察）。异构多领域拆分请用 call_sub_agents。\n" +
 		"参数：role_id 必填；task_template 必填（须含 {{item}} 占位）；items 必填（字符串数组）；" +
 		"context 可选（每项任务前附加的共享上下文）；wall_clock_min 可选（单项目标墙钟，分钟）；" +
+		"tools/tools_mode/skills 可选（逐项透传的派发级工具授权与技能下放，规则同 call_sub_agent）；" +
 		"aggregate 可选（默认 false）。返回派发清单；aggregate 模式汇总稍后经邮箱到达。"
 }
 
@@ -138,7 +139,10 @@ func (t *mapSubAgentsTool) InputSchema() *jsonschema.Schema {
 			"items":         {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "字符串列表，每项替换进模板"},
 			"context":       {Type: "string", Description: "可选：每项任务前附加的共享上下文（结论/契约/路径前缀）"},
 			"wall_clock_min": {Type: "number", Description: "可选：单项墙钟预算（分钟），缺省由角色决定（scout=5）"},
-			"aggregate":     {Type: "boolean", Description: "可选：true 时 N 项完成汇成一条邮箱消息，默认 false 逐项回传"},
+			"tools":          {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "可选：逐项透传的派发级工具授权清单（内置/插件工具名）"},
+			"tools_mode":     {Type: "string", Description: "可选：extend（默认，角色白名单∪授权）/ only（仅授权集，收窄场景）"},
+			"skills":         {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "可选：逐项透传的下放技能集（⊆ 父持有集）"},
+			"aggregate":      {Type: "boolean", Description: "可选：true 时 N 项完成汇成一条邮箱消息，默认 false 逐项回传"},
 		},
 		Required: []string{"role_id", "task_template", "items"},
 	}
@@ -203,6 +207,15 @@ func (t *mapSubAgentsTool) Execute(ctx context.Context, args map[string]any) *to
 	}
 
 	wallClock := d.wallClockArg(args)
+	// 派发级授权与技能下放（二期）：按波解析一次，逐项透传给 dispatchOne（越界项逐项忽略回告）。
+	toolsGrant := d.toolsArg(args)
+	toolsMode, _ := args["tools_mode"].(string)
+	if !validToolGrantMode(toolsMode) {
+		res.Error = fmt.Sprintf("unknown tools_mode %q: 可选 extend / only（省略=extend）", toolsMode)
+		res.Category = tool.ResultCategoryValidationRejected
+		return res
+	}
+	skillsHint := d.skillsArg(args)
 	items := make([]string, 0, len(rawItems))
 	for i, r := range rawItems {
 		s, ok := r.(string)
@@ -255,7 +268,7 @@ func (t *mapSubAgentsTool) Execute(ctx context.Context, args map[string]any) *to
 			if agg != nil {
 				callOpts = append(callOpts, &dispatchOpts{aggregate: agg, aggItem: it, aggIdx: idx})
 			}
-			subAgentID, errRes := d.dispatchOne(ctx, roleID, "", task, "", "", "", nil, nil, wallClock, "", "", callOpts...)
+			subAgentID, errRes := d.dispatchOne(ctx, roleID, "", task, "", "", "", nil, skillsHint, toolsGrant, toolsMode, wallClock, "", "", callOpts...)
 			if errRes != nil {
 				errsMu.Lock()
 				errs = append(errs, fmt.Sprintf("items[%d](%s): %s", idx, truncateRunes(it, 60), errRes.Error))

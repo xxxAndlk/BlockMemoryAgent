@@ -10,7 +10,9 @@
 //   - bundle：Claude/Codex 插件目录包（.claude-plugin/plugin.json + .mcp.json +
 //     skills/*/SKILL.md），由 bundle 包展开为若干 mcp 插件与 skill 条目；
 //   - service：Docker 化长驻 HTTP 服务（无 MCP 工具，如 Open Design UI 设计台），
-//     只挂生命周期（docker run -d / rm -f + 健康探针），与 mcp 插件一样热插拔。
+//     只挂生命周期（docker run -d / rm -f + 健康探针），与 mcp 插件一样热插拔；
+//   - process：宿主机长驻进程（无工具注入，如微信 iLink 桥 Node 脚本），
+//     exec.Cmd spawn + 健康探针 + 崩溃自动重启，与 service 同思路不同载体。
 //
 // 状态机：registered → initialized → running → stopped / degraded。
 package plugins
@@ -36,6 +38,8 @@ const (
 	KindBundle Kind = "bundle"
 	// KindService Docker 化长驻 HTTP 服务（无工具注入，仅生命周期管理）。
 	KindService Kind = "service"
+	// KindProcess 宿主机长驻进程（无工具注入，spawn + 探针 + 崩溃自动重启）。
+	KindProcess Kind = "process"
 )
 
 // State 插件实例生命周期状态。

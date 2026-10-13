@@ -217,6 +217,7 @@ func TestInstall_Validation(t *testing.T) {
 		{"http缺url", Manifest{ID: "x", Kind: KindMCP}, map[string]any{"transport": "http"}, "url"},
 		{"未知transport", Manifest{ID: "x", Kind: KindMCP}, map[string]any{"transport": "websocket"}, "transport"},
 		{"service缺镜像", Manifest{ID: "x", Kind: KindService}, map[string]any{}, "image"},
+		{"process缺命令", Manifest{ID: "x", Kind: KindProcess}, map[string]any{}, "command"},
 		{"destructive缺roles", Manifest{ID: "x", Kind: KindMCP},
 			map[string]any{"transport": "stdio", "command": "x", "destructive": true}, "显式声明可见角色"},
 		{"destructive通配roles", Manifest{ID: "x", Kind: KindMCP, Roles: []string{"*"}},
@@ -386,6 +387,35 @@ func TestInstall_DisabledPersists(t *testing.T) {
 	info2, ok := mgr2.Get("lazy")
 	if !ok || info2.Enabled {
 		t.Fatalf("重启后应保持未启用，got %+v", info2)
+	}
+}
+
+// TestInstall_ProcessKind process 形态安装：enabled=false 持久化 + 建实例（不 spawn 进程）。
+func TestInstall_ProcessKind(t *testing.T) {
+	mgr, _, _, dir := newInstallHarness(t)
+	ctx := context.Background()
+	info, err := mgr.Install(ctx, Manifest{ID: "wx_bridge", Name: "WX Bridge", Kind: KindProcess},
+		map[string]any{"command": "node", "args": []any{"bridge.mjs"}}, false)
+	if err != nil {
+		t.Fatalf("process 插件安装失败: %v", err)
+	}
+	if info.Kind != "process" || info.State != StateRegistered {
+		t.Fatalf("enabled=false 安装后应 registered，got %+v", info)
+	}
+	// 持久化：installed 文件含 process 条目。
+	content := readInstalled(t, dir)
+	if !strings.Contains(content, "wx_bridge") || !strings.Contains(content, "kind: process") {
+		t.Fatalf("installed 文件缺少 process 条目: %s", content)
+	}
+	// 重启（新 Manager 装载 installed 文件）：实例恢复，仍不启用。
+	re := NewManager(tool.NewBuiltinRegistry(t.TempDir(), nil, nil),
+		WithConfigDir(dir), WithConfig(&config.PluginsConfig{}))
+	if err := re.Load(ctx); err != nil {
+		t.Fatalf("重载失败: %v", err)
+	}
+	info2, ok := re.Get("wx_bridge")
+	if !ok || info2.Kind != "process" || info2.Enabled {
+		t.Fatalf("重启后 process 实例应恢复且保持未启用，got %+v", info2)
 	}
 }
 

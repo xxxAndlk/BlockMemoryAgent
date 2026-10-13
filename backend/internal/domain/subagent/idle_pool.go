@@ -712,6 +712,7 @@ func (d *Dispatcher) destroySlotGuarded(s *domainSlot, reason string, guard func
 	d.subMeta.Delete(s.id)
 	d.lastWrites.Delete(s.id)
 	d.heldSkills.Delete(s.id)
+	d.heldTools.Delete(s.id)
 	if d.mailbox != nil {
 		d.purgeMailboxWithNotice(s.id, "热驻槽已销毁")
 	}
@@ -1170,7 +1171,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 	if wd == "" {
 		wd = d.subAgentWorkDir()
 	}
-	sub := agent.NewReActAgent(s.id, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, s.id, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
+	sub := agent.NewReActAgent(s.id, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, s.id, d.effectiveToolAllowlist(s.id, roleDef), roleDef.ID, d.pluginVisibility)).
 		WithProviderFunc(providerFn).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
@@ -1930,6 +1931,7 @@ func (d *Dispatcher) recoverSlotPanic(s *domainSlot) {
 	d.activity.Delete(s.id)
 	d.lastWrites.Delete(s.id)
 	d.heldSkills.Delete(s.id)
+	d.heldTools.Delete(s.id)
 	if d.mailbox != nil {
 		d.purgeMailboxWithNotice(s.id, "异常终止")
 	}

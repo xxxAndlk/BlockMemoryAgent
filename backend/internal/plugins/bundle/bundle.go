@@ -1,10 +1,17 @@
 // Package bundle 实现外部插件目录包加载（设计文档 §3.3、§7 生态兼容）。
 //
-// 兼容 Claude Code / Codex 插件包格式：
+// 兼容 Claude Code / Codex 插件包格式，另加 BMA 自有清单：
 //   - .claude-plugin/plugin.json → Manifest 元数据；
 //   - .mcp.json → 展开为若干 mcp 插件（支持 ${CLAUDE_PLUGIN_ROOT} 路径替换，
 //     并自动注入 CLAUDE_PLUGIN_ROOT 环境变量，与 Claude Code 行为一致）；
+//   - bma-plugin.json → BMA 自有清单：元数据（优先级高于 plugin.json）+
+//     plugins 数组展开为 process 插件条目（settings 内 ${PLUGIN_DIR}
+//     替换为插件包绝对路径）；
 //   - skills/*/SKILL.md → frontmatter 解析，注入现有 skill.Pool。
+//
+// 三种清单可共存：元数据取 bma-plugin.json 优先、plugin.json 兜底；
+// .mcp.json 的 mcp server 与 bma-plugin.json 的 process 条目各自独立展开
+// （合并而非互斥——一个目录包可以同时带 MCP server 与宿主进程桥）。
 //
 // hooks/hooks.json 暂不支持（事件模型为 Claude Code 专有）。
 //
@@ -50,8 +57,36 @@ type Bundle struct {
 	Description string
 	// Servers .mcp.json 展开出的 MCP server 列表。
 	Servers []MCPServer
+	// Processes bma-plugin.json 展开出的 process 插件条目。
+	Processes []ProcessPlugin
 	// Skills skills/*/SKILL.md 解析出的 Skill 条目。
 	Skills []*types.Skill
+}
+
+// ProcessPlugin 是 bma-plugin.json plugins 数组中的一个 process 插件条目。
+type ProcessPlugin struct {
+	// ID 插件标识（插件包内唯一，构成展开插件 ID 的一部分："bundle/<目录>/<id>"）。
+	ID string
+	// Kind 插件形态（当前仅支持 "process"）。
+	Kind string
+	// Settings 插件 settings（command/args/env/cwd/health_url 等，
+	// 字符串值中的 ${PLUGIN_DIR} 已替换为插件包绝对路径）。
+	Settings map[string]any
+}
+
+// bmaPluginFile 对应 bma-plugin.json 的根结构（BMA 自有插件包清单）。
+type bmaPluginFile struct {
+	Name        string           `yaml:"name"`
+	Version     string           `yaml:"version"`
+	Description string           `yaml:"description"`
+	Plugins     []bmaPluginEntry `yaml:"plugins"`
+}
+
+// bmaPluginEntry 对应 bma-plugin.json plugins 数组中的单个插件条目。
+type bmaPluginEntry struct {
+	ID       string         `yaml:"id"`
+	Kind     string         `yaml:"kind"`
+	Settings map[string]any `yaml:"settings"`
 }
 
 // mcpServersFile 对应 .mcp.json 的根结构。
@@ -128,9 +163,38 @@ func loadBundle(dir, dirName string) (*Bundle, error) {
 		return nil, fmt.Errorf("read plugin.json: %w", err)
 	}
 
-	// 2. .mcp.json → MCP server 展开（可选；两文件皆无则不是插件包）。
-	mcpPath := filepath.Join(dir, ".mcp.json")
+	// 2. bma-plugin.json → BMA 自有清单（可选）：元数据优先级高于
+	// .claude-plugin/plugin.json；plugins 数组展开为 process 插件条目。
+	bmaPath := filepath.Join(dir, "bma-plugin.json")
 	hasPlugin := false
+	if data, err := os.ReadFile(bmaPath); err == nil {
+		var bf bmaPluginFile
+		if err := yaml.Unmarshal(data, &bf); err != nil {
+			return nil, fmt.Errorf("parse bma-plugin.json: %w", err)
+		}
+		hasPlugin = true
+		b.Name = firstNonEmpty(bf.Name, b.Name)
+		b.Version = firstNonEmpty(bf.Version, b.Version)
+		b.Description = firstNonEmpty(bf.Description, b.Description)
+		for _, e := range bf.Plugins {
+			if e.ID == "" {
+				return nil, fmt.Errorf("bma-plugin.json 存在缺 id 的插件条目")
+			}
+			if e.Kind != "process" {
+				return nil, fmt.Errorf("bma-plugin.json 插件 %q: 不支持的 kind %q（当前仅支持 process）", e.ID, e.Kind)
+			}
+			b.Processes = append(b.Processes, ProcessPlugin{
+				ID:       e.ID,
+				Kind:     e.Kind,
+				Settings: expandPluginDir(e.Settings, dir),
+			})
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read bma-plugin.json: %w", err)
+	}
+
+	// 3. .mcp.json → MCP server 展开（可选；三种清单皆无则不是插件包）。
+	mcpPath := filepath.Join(dir, ".mcp.json")
 	if data, err := os.ReadFile(mcpPath); err == nil {
 		var mf mcpServersFile
 		if err := yaml.Unmarshal(data, &mf); err != nil {
@@ -162,7 +226,7 @@ func loadBundle(dir, dirName string) (*Bundle, error) {
 		return nil, fmt.Errorf("read .mcp.json: %w", err)
 	}
 
-	// 3. skills/*/SKILL.md → skill 条目（可选）。
+	// 4. skills/*/SKILL.md → skill 条目（可选）。
 	// Claude 约定技能名即子目录名（skills/<name>/SKILL.md）；直接平铺的 *.md 也兼容。
 	skillsDir := filepath.Join(dir, "skills")
 	if skillEntries, err := os.ReadDir(skillsDir); err == nil {
@@ -246,6 +310,49 @@ func expandRoot(s, dir string) string {
 		abs = dir
 	}
 	return strings.ReplaceAll(s, "${CLAUDE_PLUGIN_ROOT}", abs)
+}
+
+// PluginDirPlaceholder 是 bma-plugin.json settings 字符串值中的占位符，
+// 解析期展开为插件包绝对路径（如 cwd: "${PLUGIN_DIR}"）。
+const PluginDirPlaceholder = "${PLUGIN_DIR}"
+
+// expandPluginDir 递归展开 settings 树内所有字符串值中的 ${PLUGIN_DIR}
+// （map 值与数组元素均处理；非字符串叶子原样保留）。
+func expandPluginDir(settings map[string]any, dir string) map[string]any {
+	if settings == nil {
+		return nil
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	out := make(map[string]any, len(settings))
+	for k, v := range settings {
+		out[k] = expandPluginDirValue(v, abs)
+	}
+	return out
+}
+
+// expandPluginDirValue 递归替换单个 settings 值中的 ${PLUGIN_DIR}。
+func expandPluginDirValue(v any, abs string) any {
+	switch t := v.(type) {
+	case string:
+		return strings.ReplaceAll(t, PluginDirPlaceholder, abs)
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = expandPluginDirValue(val, abs)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = expandPluginDirValue(val, abs)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // firstNonEmpty 返回第一个非空字符串；全空返回空串。

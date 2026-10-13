@@ -509,6 +509,11 @@ type Dispatcher struct {
 	// load_skill/list_skills 范围都以此为权威。一次性 Agent 结束时删除；
 	// 热驻槽随槽存活（destroySlot 清理）；未命中回退角色固定集。
 	heldSkills sync.Map
+	// heldTools 每个 Agent 实例的派发级工具授权（agentID -> heldToolGrant，二期）：
+	// 父 Agent 派发携带 tools/tools_mode 时登记，子 Agent 的有效工具白名单
+	//（Schema 软过滤与执行硬门）以此为覆盖。生命周期与清理点同 heldSkills；
+	// 未登记=角色白名单原样（零行为变化）。
+	heldTools sync.Map
 }
 
 // relayRewriteAssessGen 是注入【重写评估】强制段的起始代数（TODO #76）。
@@ -1389,6 +1394,7 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 		defer d.activity.CompareAndDelete(subAgentID, ev)
 		defer d.lastWrites.Delete(subAgentID)
 		defer d.heldSkills.Delete(subAgentID)
+		defer d.heldTools.Delete(subAgentID)
 		// 复活按默认 ReAct 模式重跑（mode=react、verify_kind 留空走角色默认校验分层）——
 		// 原派发的 mode/responsibility 未随节点持久化，无法复原；职责边界由种子里的
 		// 原任务文本与领域标签承载，必要时模型可自行重新派发下游。
@@ -1749,6 +1755,156 @@ func (d *Dispatcher) resolveChildSkills(parentID string, roleDef *types.RoleDefi
 		}
 	}
 	return held, rejected
+}
+
+// heldToolGrant 是一次派发级工具授权（派发级工具授权二期）：父 Agent 派发时
+// 经 tools/tools_mode 参数授予子 Agent 的工具面覆盖。
+// mode=extend：子有效白名单 = 角色白名单 ∪ tools（默认）；mode=only：仅 tools
+//（只读侦察等收窄场景）。tools 已在派发时校验 ⊆ 父可分配集（插件工具另受
+// 子角色 Manifest.Roles 可见性天花板约束）。
+type heldToolGrant struct {
+	tools []string
+	mode  string
+}
+
+const (
+	// ToolGrantModeExtend 授权与角色白名单取并集（tools_mode 缺省值）。
+	ToolGrantModeExtend = "extend"
+	// ToolGrantModeOnly 子 Agent 仅持授权集（收窄场景）。
+	ToolGrantModeOnly = "only"
+)
+
+// validToolGrantMode 校验 tools_mode 取值；空串=缺省 extend。
+func validToolGrantMode(mode string) bool {
+	switch mode {
+	case "", ToolGrantModeExtend, ToolGrantModeOnly:
+		return true
+	}
+	return false
+}
+
+// normalizeToolGrantMode 归一化 tools_mode：空串回落 extend。
+func normalizeToolGrantMode(mode string) string {
+	if mode == "" {
+		return ToolGrantModeExtend
+	}
+	return mode
+}
+
+// HeldToolGrant 查询指定 scope（agentID）的派发级工具授权；未登记返回 ok=false。
+// 供 bootstrap 的执行硬门闭包按 scope 把授权并入/替代角色白名单。
+func (d *Dispatcher) HeldToolGrant(scope string) ([]string, string, bool) {
+	v, ok := d.heldTools.Load(scope)
+	if !ok {
+		return nil, "", false
+	}
+	g := v.(heldToolGrant)
+	return g.tools, g.mode, true
+}
+
+// mergeToolGrant 计算授权叠加后的工具清单：mode=only 取授权集，
+// 否则角色白名单 ∪ 授权集（去重保序，角色清单在前）。
+func mergeToolGrant(roleTools, grants []string, mode string) []string {
+	if mode == ToolGrantModeOnly {
+		return append([]string{}, grants...)
+	}
+	out := append([]string{}, roleTools...)
+	for _, name := range grants {
+		if !containsString(out, name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// effectiveToolAllowlist 计算子 Agent 的有效工具白名单：无派发级授权=角色白名单
+// 原样返回（现状逐字一致）；mode=extend=角色白名单 ∪ 授权集；mode=only=仅授权集。
+// 注意角色白名单为空=全量暴露（adapter 不过滤）：extend 语义下并集仍是全量，
+// 原样返回（授权的插件工具经 MountForScope 挂载进入 Schema，不靠白名单）。
+// 各 adapter 构造点（新建/热驻槽/暂停恢复/展开器）统一走它——恢复路径 scope 不变，
+// 覆盖仍在 heldTools 里即自然生效。
+func (d *Dispatcher) effectiveToolAllowlist(scope string, roleDef *types.RoleDefinition) []string {
+	if roleDef == nil {
+		return nil
+	}
+	grants, mode, ok := d.HeldToolGrant(scope)
+	if !ok || len(grants) == 0 {
+		return roleDef.Tools
+	}
+	if mode != ToolGrantModeOnly && len(roleDef.Tools) == 0 {
+		return roleDef.Tools
+	}
+	return mergeToolGrant(roleDef.Tools, grants, mode)
+}
+
+// parentAssignableTools 返回父 Agent 可下放给子 Agent 的工具查找集（内置工具口径）：
+// meta 或未声明 tools 的角色（空表=全量暴露）= 全注册工具；其他父 = 其角色白名单 ∪
+// 其自身携带的派发级授权（extend/only 授权集都是父的当前有效工具面，可继续下放）。
+// 插件工具的可见性天花板由 resolveChildTools 另行判定（不经本集合）。
+func (d *Dispatcher) parentAssignableTools(parentID string) map[string]bool {
+	out := map[string]bool{}
+	if d.tools == nil {
+		return out
+	}
+	roleID := roleIDFromAgentID(parentID)
+	rd := d.registry.Get(roleID)
+	if roleID == "meta" || rd == nil || len(rd.Tools) == 0 {
+		for _, n := range d.tools.ToolNames() {
+			out[n] = true
+		}
+		return out
+	}
+	for _, n := range rd.Tools {
+		out[n] = true
+	}
+	if grants, _, ok := d.HeldToolGrant(parentID); ok {
+		for _, n := range grants {
+			out[n] = true
+		}
+	}
+	return out
+}
+
+// resolveChildTools 解析子 Agent 的派发级工具授权（二期）：逐项校验 ⊆ 父可分配集；
+// 插件工具还须对子角色可见（Manifest.Roles 天花板不变——基础插件保留角色分配）。
+// 越界/未注册项忽略并收进 rejected，由派发结果回告父 Agent（同 tools_hint/skills 口径）。
+func (d *Dispatcher) resolveChildTools(parentID string, roleDef *types.RoleDefinition, tools []string) (grants []string, rejected []string) {
+	if len(tools) == 0 || d.tools == nil || roleDef == nil {
+		return nil, nil
+	}
+	assignable := d.parentAssignableTools(parentID)
+	for _, name := range tools {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !d.tools.Has(name) {
+			rejected = append(rejected, name+"（工具未注册）")
+			continue
+		}
+		// 插件工具：天花板=对子角色可见（ToolVisibility）；可见即可授。
+		if d.pluginVisibility != nil {
+			if owned, visible := d.pluginVisibility(roleDef.ID, name); owned {
+				if !visible {
+					rejected = append(rejected, name+"（超出子角色插件可见性天花板）")
+					continue
+				}
+				if !containsString(grants, name) {
+					grants = append(grants, name)
+				}
+				continue
+			}
+		}
+		// 内置工具：须在父可分配集内（父没有的工具不能下放）。
+		if !assignable[name] {
+			rejected = append(rejected, name+"（父 Agent 未持有该工具）")
+			continue
+		}
+		if !containsString(grants, name) {
+			grants = append(grants, name)
+		}
+	}
+	return grants, rejected
 }
 
 // containsString 判断切片中是否含指定字符串。
@@ -2850,6 +3006,7 @@ func (t *callSubAgentTool) Description() string {
 		"字段：domain=**中文领域名**（仅 domain 角色用；它是子 Agent 对用户可见的展示名，如「文档修订-第3章」「UI 渲染领域」，禁止英文缩写/编号 doc-rev-a 这类）；responsibility=职责边界 <=200 字（domain 必填，注入子提示词防越界）；" +
 		"mode=react(默认)/reflection/plan_execute（判断不准省略）；verify_kind=auto(默认)/executable/rubric/none；" +
 		"tools_hint=预挂载插件工具名列表（受角色白名单天花板约束）；wall_clock_min=墙钟分钟（普通任务省略，仅侦察/巡检给小预算）；" +
+		"tools=派发级工具授权清单（内置/插件工具名，越界项忽略回告）、tools_mode=extend(默认，角色白名单∪授权)/only(仅授权集)——授权纪律：按需授予最小可用集，only 仅用于只读侦察等收窄场景，与 tools_hint（插件预挂载）正交互不替代；" +
 		"reuse_agent_id=热驻复用（填【空闲领域Agent】的 agent_id，保留全部上下文，spec 照写、key 与领域名对齐）；" +
 		"takeover=异名续建时填旧 domain 名，看板未完成条目迁移留痕（同名续建自动覆盖无需填）；" +
 		"worktree=true 隔离派发到 git worktree 副本（子 Agent 全部文件写入落在副本，主目录零写入；成功收尾产出全量 patch，用 merge_worktree review 看完整 diff 后 merge/reject——仅文件级独立且需并行的任务使用；与 reuse_agent_id 互斥，热驻 domain 不支持）。\n" +
@@ -3101,6 +3258,13 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	toolsHint := d.toolsHintArg(args)
 	// skills 可选：下放技能集（渐进披露）——校验 ⊆ 父持有集后并入子持有集。
 	skillsHint := d.skillsArg(args)
+	// tools/tools_mode 可选（派发级工具授权，二期）：父授予工具清单（内置/插件均可），
+	// ⊆ 父可分配集校验（插件工具另受子角色可见性天花板），越界项忽略回告。
+	toolsGrant := d.toolsArg(args)
+	toolsMode, _ := args["tools_mode"].(string)
+	if !validToolGrantMode(toolsMode) {
+		return &tool.Result{Tool: "call_sub_agent", Error: fmt.Sprintf("unknown tools_mode %q: 可选 extend / only（省略=extend）", toolsMode), Category: tool.ResultCategoryValidationRejected}
+	}
 	// wall_clock_min 可选：派发级墙钟（分钟），代码级强制收口，替代提示词墙钟。
 	wallClock := d.wallClockArg(args)
 	// reuse_agent_id 可选：热驻复用（idle domain 唤醒/忙碌入队），非空时忽略 role_id。
@@ -3164,7 +3328,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: "worktree 与 reuse_agent_id 互斥：复用槽沿主目录上下文续作，请二选一", Category: tool.ResultCategoryValidationRejected}
 	}
 
-	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, wallClock, reuseAgentID, takeover, &dispatchOpts{worktree: wantWorktree})
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, toolsGrant, toolsMode, wallClock, reuseAgentID, takeover, &dispatchOpts{worktree: wantWorktree})
 	if errRes != nil {
 		errRes.Tool = "call_sub_agent"
 		return errRes
@@ -3303,7 +3467,7 @@ func fnvHash32(s string) uint32 {
 	return h.Sum32()
 }
 
-func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint, skillsHint []string, wallClock time.Duration, reuseAgentID, takeover string, opts ...*dispatchOpts) (string, *tool.Result) {
+func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint, skillsHint, toolsGrant []string, toolsMode string, wallClock time.Duration, reuseAgentID, takeover string, opts ...*dispatchOpts) (string, *tool.Result) {
 	var opt *dispatchOpts
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -3329,23 +3493,35 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		return "", &tool.Result{Error: fmt.Sprintf("unknown role: %s", roleID), Category: tool.ResultCategoryValidationRejected}
 	}
 
+	// 派发级工具授权解析（二期）：tools ⊆ 父可分配集（插件工具另受子角色可见性
+	// 天花板），越界项忽略、派发成功后随结果回告父 Agent。在派前能力校验之前解析，
+	// 使授权计入"有效工具面"（授权含 RunCommand 等能力即视为具备）。
+	toolsMode = normalizeToolGrantMode(toolsMode)
+	grantedTools, toolRejected := d.resolveChildTools(parentID, roleDef, toolsGrant)
+	fitRoleDef := roleDef
+	if len(grantedTools) > 0 {
+		fitCopy := *roleDef
+		fitCopy.Tools = mergeToolGrant(roleDef.Tools, grantedTools, toolsMode)
+		fitRoleDef = &fitCopy
+	}
+
 	// 派前能力校验（P0-2e，2026-09-18 实测修复）：任务文本的工具需求信号与目标角色
 	// 工具面不匹配时直接拒绝——防止"派 scout 执行 PowerShell"式能力错配整波空转。
-	if msg := checkRoleTaskFit(roleDef, task); msg != "" {
+	if msg := checkRoleTaskFit(fitRoleDef, task); msg != "" {
 		return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
 	// 派前路径沙箱校验（2026-09-19 实测修复）：任务引用工作目录外的绝对路径且角色
 	// 无 RunCommand（文件工具越界必失败）时零消耗拒绝——防子 Agent 跟
 	// path escapes sandbox 缠斗空转（实测 3 个 code_reviewer 84 次调用零交付）。
-	if msg := checkTaskPathsFit(roleDef, task, d.subAgentWorkDirFor(ctx), toolsHint); msg != "" {
+	if msg := checkTaskPathsFit(fitRoleDef, task, d.subAgentWorkDirFor(ctx), toolsHint); msg != "" {
 		return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
 	// 决策层③派发门灰区补充（TODO #23 切入点3）：上述两条高置信硬拒保持 rules-first
 	// 不动；决策层只补规则正则覆盖不到的需求信号（needs_browser/needs_mcp/needs_vision）。
 	// 影子期只落对拍行零行为变化；enforce 点命中缺口才拦（fail-open 故障不拦）。
-	if msg := d.decisionGateDispatchGap(ctx, parentID, roleDef.ID, task); msg != "" {
+	if msg := d.decisionGateDispatchGap(ctx, parentID, roleDef.ID, task, grantedTools); msg != "" {
 		return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
 	}
 
@@ -3474,6 +3650,26 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		d.heldSkills.Store(subAgentID, heldSkills)
 	}
 
+	// 派发级工具授权登记（二期）：子 Agent 有效白名单（Schema 软过滤）与执行硬门
+	// 均以此为覆盖；生命周期与清理点同 heldSkills。热驻复用路径已在上方返回
+	//（授权不随复用变更，沿用槽建时冻结值）。
+	if len(grantedTools) > 0 {
+		d.heldTools.Store(subAgentID, heldToolGrant{tools: grantedTools, mode: toolsMode})
+		// 授权的插件工具同步挂载进子 scope：角色白名单为空（全量暴露）时 adapter 不过滤，
+		// 插件工具需经（角色可见 ∩ 已挂载）进入 Schema。内置工具无需挂载，跳过。
+		if d.tools != nil && d.pluginVisibility != nil {
+			var grantPluginTools []string
+			for _, n := range grantedTools {
+				if owned, _ := d.pluginVisibility(roleDef.ID, n); owned {
+					grantPluginTools = append(grantPluginTools, n)
+				}
+			}
+			if len(grantPluginTools) > 0 {
+				d.tools.MountForScope(subAgentID, roleDef.ID, grantPluginTools)
+			}
+		}
+	}
+
 	// 在派发前递增父 Agent 的未决子 Agent 计数，供终结保护消费。
 	d.trackChildStart(parentID)
 
@@ -3497,7 +3693,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		if res != nil {
 			return id, res
 		}
-		return appendRejectNotes(id, hintRejected, skillRejected), nil
+		return appendRejectNotes(id, hintRejected, skillRejected, toolRejected), nil
 	}
 
 	// 中断传播基底（TODO 第10④）：父 ctx 携带会话级 stopCtx（tool.WithStopContext 注入）
@@ -3597,6 +3793,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		defer d.activity.CompareAndDelete(subAgentID, ev)
 		defer d.lastWrites.Delete(subAgentID)
 		defer d.heldSkills.Delete(subAgentID)
+		defer d.heldTools.Delete(subAgentID)
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
 		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
@@ -3667,21 +3864,24 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	}
 
 	// 返回子 Agent ID 作为句柄，父 Agent 可用该 ID 查询或接收后续通知。
-	if len(hintRejected) > 0 || len(skillRejected) > 0 {
-		// tools_hint / skills 越界项回告父 Agent：越界委派被拒绝且可查。
-		return appendRejectNotes(subAgentID, hintRejected, skillRejected), nil
+	if len(hintRejected) > 0 || len(skillRejected) > 0 || len(toolRejected) > 0 {
+		// tools_hint / skills / tools 越界项回告父 Agent：越界委派被拒绝且可查。
+		return appendRejectNotes(subAgentID, hintRejected, skillRejected, toolRejected), nil
 	}
 	return subAgentID, nil
 }
 
-// appendRejectNotes 把 tools_hint / skills 越界忽略说明追加到派发结果尾部；
+// appendRejectNotes 把 tools_hint / skills / tools 越界忽略说明追加到派发结果尾部；
 // 均为空时原样返回。与既有 tools_hint 回告文案同构。
-func appendRejectNotes(id string, hintRejected, skillRejected []string) string {
+func appendRejectNotes(id string, hintRejected, skillRejected, toolRejected []string) string {
 	if len(hintRejected) > 0 {
 		id += "。tools_hint 越界忽略（子 Agent 角色权限天花板外）: " + strings.Join(hintRejected, "; ")
 	}
 	if len(skillRejected) > 0 {
 		id += "。skills 越界忽略（父 Agent 未持有）: " + strings.Join(skillRejected, "; ")
+	}
+	if len(toolRejected) > 0 {
+		id += "。tools 授权越界忽略: " + strings.Join(toolRejected, "; ")
 	}
 	return id
 }
@@ -3791,6 +3991,27 @@ func (d *Dispatcher) skillsArg(args map[string]any) []string {
 	return nil
 }
 
+// toolsArg 从 args 提取 tools 参数（派发级工具授权清单，二期），口径同 skillsArg。
+func (d *Dispatcher) toolsArg(args map[string]any) []string {
+	raw, ok := args["tools"]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 // wallClockArg 从 args 提取 wall_clock_min 参数（分钟，JSON number）转为 Duration。
 // 缺失/非数值/<=0 返回 0（用全局 sub_agent_timeout）。
 func (d *Dispatcher) wallClockArg(args map[string]any) time.Duration {
@@ -3820,7 +4041,7 @@ func (t *callSubAgentsTool) Description() string {
 	return "同波多领域批量原子派发：多文件/多领域拆分任务的全部建设领域用它一次派出" +
 		"（等价多次 call_sub_agent，但保证同波同时启动；同波 domain 名必须唯一）。\n" +
 		"参数：tasks 数组（<=6 项），每项 {role_id, task, domain?, responsibility?, mode?, " +
-		"verify_kind?, tools_hint?, wall_clock_min?, reuse_agent_id?}，字段规则与 call_sub_agent 一致" +
+		"verify_kind?, tools_hint?, tools?, tools_mode?, skills?, wall_clock_min?, reuse_agent_id?}，字段规则与 call_sub_agent 一致" +
 		fmt.Sprintf("（domain 角色 responsibility 必填，task 自包含 <=%d 字）。", t.dispatcher.taskRuneSoftLimit) +
 		"前置依赖与 call_sub_agent 相同：派发前先 WriteSpec（整波共用一份，spec missing/stale 拒绝）。" +
 		"逐项返回派出结果，某项失败不影响其他项。"
@@ -3848,8 +4069,10 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 	type batchItem struct {
 		roleID, domain, task, responsibility, mode, verifyKind, takeover string
 		reuseAgentID                                                     string
+		toolsMode                                                        string
 		toolsHint                                                        []string
 		skillsHint                                                       []string
+		toolsGrant                                                       []string
 		wallClock                                                        time.Duration
 	}
 	items := make([]batchItem, 0, len(raw))
@@ -3871,6 +4094,11 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 		it.takeover = strings.TrimSpace(it.takeover)
 		it.toolsHint = d.toolsHintArg(m) // TODO #52：建议工具集（∩ 子 Agent 天花板后预挂载）
 		it.skillsHint = d.skillsArg(m)   // 下放技能集（⊆ 父持有集校验后并入子持有集）
+		it.toolsGrant = d.toolsArg(m)    // 派发级工具授权清单（二期，⊆ 父可分配集校验）
+		it.toolsMode, _ = m["tools_mode"].(string)
+		if !validToolGrantMode(it.toolsMode) {
+			return &tool.Result{Tool: "call_sub_agents", Error: fmt.Sprintf("tasks[%d]: unknown tools_mode %q: 可选 extend / only（省略=extend）", i, it.toolsMode), Category: tool.ResultCategoryValidationRejected}
+		}
 		it.wallClock = d.wallClockArg(m)
 		// 同名热驻 Idle 槽隐式复用（先于参数校验，口径同单派入口）。
 		if it.reuseAgentID == "" && it.roleID == "domain" {
@@ -3993,7 +4221,7 @@ func (t *callSubAgentsTool) Execute(ctx context.Context, args map[string]any) *t
 				callOpts = append(callOpts, &dispatchOpts{aggregate: waveAgg, aggItem: strings.TrimSpace(it.domain), aggIdx: idx})
 			}
 		}
-		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint, it.skillsHint, it.wallClock, it.reuseAgentID, it.takeover, callOpts...)
+		subAgentID, errRes := d.dispatchOne(ctx, it.roleID, it.domain, it.task, it.responsibility, it.mode, it.verifyKind, it.toolsHint, it.skillsHint, it.toolsGrant, it.toolsMode, it.wallClock, it.reuseAgentID, it.takeover, callOpts...)
 		if errRes != nil {
 			errs = append(errs, fmt.Sprintf("%s(%s): %s", it.roleID, it.domain, errRes.Error))
 			if isDomain && waveAgg != nil {
@@ -4550,7 +4778,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			WithDecisionLayer(d.decisionLayer) // 决策层④摄取打分（TODO #23）
 		mem = uptake
 	}
-	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, subAgentID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
+	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, subAgentID, d.effectiveToolAllowlist(subAgentID, &roleDef), roleDef.ID, d.pluginVisibility)).
 		WithProviderFunc(func(callCtx context.Context) (agent.ModelProvider, error) {
 			return d.providerForAgent(callCtx, roleDef.ID, subAgentID)
 		}).
@@ -5188,7 +5416,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 			WithDecisionLayer(d.decisionLayer) // 决策层④摄取打分（TODO #23）
 	}
 	// 不注入编排者人格（理由同 runSubAgentOnce：身份混淆实证）。
-	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, pausedNodeID, roleDef.Tools, roleDef.ID, d.pluginVisibility)).
+	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, pausedNodeID, d.effectiveToolAllowlist(pausedNodeID, roleDef), roleDef.ID, d.pluginVisibility)).
 		WithProviderFunc(func(callCtx context.Context) (agent.ModelProvider, error) {
 			return d.providerForAgent(callCtx, roleDef.ID, pausedNodeID)
 		}).
@@ -5237,6 +5465,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	defer d.activity.Delete(pausedNodeID)
 	defer d.running.Delete(pausedNodeID)
 	defer d.heldSkills.Delete(pausedNodeID)
+	defer d.heldTools.Delete(pausedNodeID)
 	defer baseCancel()
 	// 仅终结出口清邮箱回投死信（同 runSubAgentOnce 口径）：再触限重暂停的节点
 	// 还会被 resume，误清会回投"已终结"死信并销账 pending；会话级硬删除仍由

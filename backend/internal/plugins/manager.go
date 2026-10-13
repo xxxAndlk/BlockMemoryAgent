@@ -252,6 +252,26 @@ func (m *Manager) loadDesired() (map[string]config.PluginConfig, error) {
 					Settings:   base,
 				}
 			}
+			// bma-plugin.json 展开出的 process 插件：与 .mcp.json 同一注册管线
+			//（ID 规则 bundle/<目录>/<id>、yaml 同 ID 覆盖、默认启用均一致）。
+			for _, pr := range b.Processes {
+				id := bundlePluginID(b.Dir, pr.ID)
+				base := bundleProcessSettings(b, pr)
+				if pc, ok := desired[id]; ok {
+					merged := mergeSettings(base, pc.Settings)
+					pc.Settings = merged
+					if pc.Kind == "" {
+						pc.Kind = string(KindProcess)
+					}
+					desired[id] = pc
+					continue
+				}
+				desired[id] = config.PluginConfig{
+					Kind:       string(KindProcess),
+					EnabledFlag: boolPtr(true), // bundle 插件默认启用
+					Settings:   base,
+				}
+			}
 		}
 	}
 	return desired, nil
@@ -406,8 +426,11 @@ func (m *Manager) createInstance(id string, pc config.PluginConfig) error {
 	case "service":
 		// Docker 长驻 HTTP 服务（无工具注入），plugins 包内直接构造，无需工厂。
 		plugin = newServicePlugin(id, pc.Settings, m.logger)
+	case "process":
+		// 宿主机长驻进程（无工具注入），plugins 包内直接构造，无需工厂。
+		plugin = newProcessPlugin(id, pc.Settings, m.logger)
 	default:
-		return fmt.Errorf("插件 %q: 未知 kind %q（支持 builtin/mcp/bundle/service）", id, pc.Kind)
+		return fmt.Errorf("插件 %q: 未知 kind %q（支持 builtin/mcp/bundle/service/process）", id, pc.Kind)
 	}
 	inst := &instance{
 		id:       id,
@@ -751,6 +774,27 @@ func bundleServerSettings(s bundle.MCPServer) map[string]any {
 			env[k] = v
 		}
 		settings["env"] = env
+	}
+	return settings
+}
+
+// bundleProcessSettings 把 bma-plugin.json 的 process 条目转成插件 settings：
+// 原样透传条目 settings（${PLUGIN_DIR} 已在 bundle 包解析期展开），
+// 并注入 bundle 元数据（name/version/description）供实例展示名使用——
+// 条目 settings 已显式声明的同名键优先，不覆盖。
+func bundleProcessSettings(b *bundle.Bundle, p bundle.ProcessPlugin) map[string]any {
+	settings := make(map[string]any, len(p.Settings)+3)
+	for k, v := range p.Settings {
+		settings[k] = v
+	}
+	if _, ok := settings["name"]; !ok {
+		settings["name"] = b.Name
+	}
+	if _, ok := settings["version"]; !ok && b.Version != "" {
+		settings["version"] = b.Version
+	}
+	if _, ok := settings["description"]; !ok && b.Description != "" {
+		settings["description"] = b.Description
 	}
 	return settings
 }
