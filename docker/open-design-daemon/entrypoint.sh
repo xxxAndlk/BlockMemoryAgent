@@ -48,6 +48,13 @@ const toApiRoot = (u) => {
   if (stripped !== u) console.error(`[bma-entrypoint] VIDEO_URL 含协议后缀，已归一为 API 根: ${stripped}`);
   return stripped;
 };
+// 图像侧 nanobanana 的 URL 归一：填了 generateContent 全路径会拼出双路径，剥到网关根。
+const toNanoRoot = (u) => {
+  if (!u) return u;
+  const stripped = u.replace(/\/v1beta\/models\/[^/]+:(stream)?[Gg]enerateContent\/?$/, "");
+  if (stripped !== u) console.error(`[bma-entrypoint] IMAGE_URL 含 generateContent 全路径，已归一为网关根: ${stripped}`);
+  return stripped;
+};
 const videoUrl = pick("VIDEO_URL", "VIDEOS_URL");
 const videoModel = pick("VIDEO_MODEL", "VIDEOS_MODEL");
 if (!process.env.VIDEO_URL && process.env.VIDEOS_URL) {
@@ -56,28 +63,77 @@ if (!process.env.VIDEO_URL && process.env.VIDEOS_URL) {
 if (!process.env.VIDEO_MODEL && process.env.VIDEOS_MODEL) {
   console.error("[bma-entrypoint] 警告: 只找到 VIDEOS_MODEL（应为 VIDEO_MODEL）——已按兼容名读入，建议改正 .env 键名");
 }
-// 生图（custom-image provider = OpenAI 兼容 /images/generations 直调）
-set("custom-image", "baseUrl", process.env.IMAGE_URL);
-set("custom-image", "model", process.env.IMAGE_MODEL);
-// 生视频（OpenAI /videos 协议，VIDEO_PROVIDER=openai 时用）
-set("aihubmix", "baseUrl", toApiRoot(videoUrl));
-set("aihubmix", "model", videoModel);
-// 生视频（方舟 tasks 协议，VIDEO_PROVIDER=volcengine 时用）
-set("volcengine", "baseUrl", toApiRoot(videoUrl));
+// ---- 媒体配置单点化（2026-10-14）：仓库根 .env 媒体段 = 唯一手改点 ----
+// 按 IMAGE_PROVIDER / VIDEO_PROVIDER 排他写入槽位——桥（ui_design MCP）以
+// "providers.<槽>.model 是否非空"探测用户选定通道，因此**未选中的槽必须清掉 model**。
+// 声明闸门：媒体段一个变量都没有时不动 media-config（保护存量容器里 Web UI 手配的值）。
+const imageProvider = (pick("IMAGE_PROVIDER") || "custom-image").toLowerCase();
+const videoProvider = (pick("VIDEO_PROVIDER") || "volcengine").toLowerCase();
+const imageDeclared = Boolean(pick("IMAGE_PROVIDER", "IMAGE_URL", "IMAGE_MODEL"));
+const videoDeclared = Boolean(pick("VIDEO_PROVIDER", "VIDEO_URL", "VIDEOS_URL", "VIDEO_MODEL", "VIDEOS_MODEL"));
+const del = (prov, key) => {
+  const slot = cfg.providers[prov];
+  if (slot && Object.prototype.hasOwnProperty.call(slot, key)) {
+    delete slot[key];
+    touched = true;
+  }
+};
+if (imageDeclared) {
+  if (imageProvider === "custom-image") {
+    // OpenAI 兼容 /images/generations 直调（聚合网关/Gemini 兼容网关等）
+    set("custom-image", "baseUrl", process.env.IMAGE_URL);
+    set("custom-image", "model", process.env.IMAGE_MODEL);
+    del("nanobanana", "model");
+  } else if (imageProvider === "nanobanana") {
+    // Google nano-banana；baseUrl 空 = daemon 默认官方端点
+    set("nanobanana", "baseUrl", toNanoRoot(process.env.IMAGE_URL));
+    set("nanobanana", "model", process.env.IMAGE_MODEL);
+    del("custom-image", "model"); // baseUrl 残留无害：判定键是 model 非空
+  } else {
+    console.error(`[bma-entrypoint] 未知 IMAGE_PROVIDER=${imageProvider}（可选 custom-image|nanobanana），本次不改图像槽位`);
+  }
+}
+if (videoDeclared) {
+  if (videoProvider === "openai") {
+    // OpenAI /videos 协议聚合网关
+    set("aihubmix", "baseUrl", toApiRoot(videoUrl));
+    set("aihubmix", "model", videoModel);
+    del("volcengine", "model");
+  } else if (videoProvider === "volcengine") {
+    // 方舟 tasks 协议（模型须目录 id / OD_MEDIA_MODEL_ALIASES 可解析）
+    set("volcengine", "baseUrl", toApiRoot(videoUrl));
+    set("volcengine", "model", videoModel);
+    del("aihubmix", "model");
+  } else {
+    console.error(`[bma-entrypoint] 未知 VIDEO_PROVIDER=${videoProvider}（可选 openai|volcengine），本次不改视频槽位`);
+  }
+}
 if (touched || existed) {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
 }
+// 生效摘要（仅配置非密文；secrets 不落）。
+const slotOf = (p) => (cfg.providers[p] && cfg.providers[p].model) || "无";
+console.error(
+  `[bma-entrypoint] 媒体单点生效（源=仓库根 .env 媒体段）：IMAGE_PROVIDER=${imageProvider} ｜ custom-image.model=${slotOf("custom-image")} ｜ nanobanana.model=${slotOf("nanobanana")} ｜ VIDEO_PROVIDER=${videoProvider} ｜ aihubmix.model=${slotOf("aihubmix")} ｜ volcengine.model=${slotOf("volcengine")}`
+);
 EOF
 
-# 生图 KEY：同时点亮 volcengine 与 custom-image 两个 provider 槽位
-#（对齐原 plugins.yaml settings.env 的强制映射：IMAGE_KEY 优先，未设时
-# 才保留 .env 里已有的 ARK_API_KEY 等值）
-export ARK_API_KEY="${IMAGE_KEY:-$ARK_API_KEY}"
+# 生图 KEY：按 provider 点亮对应链首（依据 daemon media/config.js 的 ENV_KEYS：
+# nanobanana=[OD_NANOBANANA_API_KEY, GOOGLE_API_KEY, GEMINI_API_KEY]、
+# custom-image=[OD_CUSTOM_IMAGE_API_KEY,...]）——导出链首最稳，不依赖通用名杂散值。
+if [ "${IMAGE_PROVIDER:-custom-image}" = "nanobanana" ]; then
+  export OD_NANOBANANA_API_KEY="${IMAGE_KEY:-$OD_NANOBANANA_API_KEY}"
+fi
 export OD_CUSTOM_IMAGE_API_KEY="${IMAGE_KEY:-$OD_CUSTOM_IMAGE_API_KEY}"
-# 生视频 KEY：OpenAI /videos 协议网关（aihubmix provider 槽位）；若切
-# VIDEO_PROVIDER=volcengine，视频 key 复用 ARK_API_KEY，VIDEO_KEY 不生效
-export OD_AIHUBMIX_API_KEY="${VIDEO_KEY:-$OD_AIHUBMIX_API_KEY}"
+export ARK_API_KEY="${IMAGE_KEY:-$ARK_API_KEY}"
+# 生视频 KEY：openai → aihubmix 槽位；volcengine → 方舟 key（VIDEO_KEY 优先，
+# 2026-10-14 起在 volcengine 侧生效——旧文档"VIDEO_KEY 不生效"作废）。
+if [ "${VIDEO_PROVIDER:-volcengine}" = "openai" ]; then
+  export OD_AIHUBMIX_API_KEY="${VIDEO_KEY:-$OD_AIHUBMIX_API_KEY}"
+elif [ -n "${VIDEO_KEY:-}" ]; then
+  export ARK_API_KEY="$VIDEO_KEY"
+fi
 
 # 原镜像启动命令（ghcr.io/nexu-io/od：ENTRYPOINT ["/sbin/tini","--"] +
 # CMD ["node","apps/daemon/dist/cli.js","--no-open"]，WORKDIR /app）。

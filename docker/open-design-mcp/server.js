@@ -26,11 +26,18 @@ import { z } from 'zod';
 const OD_API_URL = (process.env.OD_API_URL || 'http://host.docker.internal:7456').replace(/\/$/, '');
 const OD_API_TOKEN = process.env.OD_API_TOKEN || '';
 const OD_HOST_HEADER = process.env.OD_HOST_HEADER || 'localhost:7456';
-// 默认模型 = od 守护进程模型目录 id（非上游模型名）。"custom-image" 走 daemon 的
-// OpenAI 兼容 custom-image provider，真实模型名由 daemon media-config.json 的
-// providers.custom-image.model 决定（2026-10-14 起 BMA 部署切 doubao-seedream-5.0-pro，
-// 火山方舟 Agent Plan 网关旗舰图像模型）。
-const OD_DEFAULT_MODEL = process.env.OD_DEFAULT_MODEL || 'custom-image';
+// 图像默认模型（daemon 模型目录 id，非上游模型名）：env 显式设置最优先（逃生舱）；
+// 未设置时走 fetchMediaDefaults() 向 daemon 探测（media-config 槽位 model 非空 =
+// "用户选了这条通道"）。"custom-image" = OpenAI 兼容 custom-image provider 的占位条目，
+// 真实模型名由 providers.custom-image.model 决定（配置优先型渲染器）。
+// 2026-10-14 媒体配置单点化：真实模型/网关/key 的唯一定义处 = 仓库根 .env 媒体段。
+const OD_DEFAULT_MODEL_ENV = (process.env.OD_DEFAULT_MODEL || '').trim();
+// 单点探测的硬兜底（daemon 不可达/槽位未配置时 = 单点化之前的默认行为）。
+const IMAGE_FALLBACK_MODEL_ID = 'custom-image';
+const NANOBANANA_FALLBACK_MODEL_ID = 'gemini-3.1-flash-image-preview'; // 对齐 daemon NANOBANANA_DEFAULT_MODEL
+const VIDEO_FALLBACK_PROVIDER = 'volcengine';
+const VOLCENGINE_FALLBACK_VIDEO_MODEL = 'doubao-seedance-2-0-fast-260128';
+const AIHUBMIX_PLACEHOLDER_VIDEO_MODEL = 'aihubmix-bma';
 const OD_PROJECT_ID = process.env.OD_PROJECT_ID || 'bma-agent-artifacts';
 // 批量生成并发上限：daemon 每 task 独立异步（无串行限制），上限只防上游配额打爆。
 const OD_BATCH_CONCURRENCY = Math.max(1, Number(process.env.OD_BATCH_CONCURRENCY || 3));
@@ -62,11 +69,81 @@ const VIDEO_EXTS = ['.mp4', '.webm', '.mov'];
 //     aihubmix- 前缀触发 daemon 目录旁路（任意模型名），用户给裸名时桥自动补前缀；
 //     网关 baseUrl/key 由 daemon media-config providers.aihubmix 提供（桥侧不可见，
 //     缺失时 daemon 任务 failed、错误原文透传）。
-const OD_VIDEO_PROVIDER = (process.env.OD_VIDEO_PROVIDER || 'volcengine').toLowerCase();
-const OD_VOLCENGINE_VIDEO_MODEL = process.env.OD_VOLCENGINE_VIDEO_MODEL || 'doubao-seedance-2-0-fast-260128';
-const OD_OPENAI_VIDEO_MODEL = process.env.OD_OPENAI_VIDEO_MODEL || '';
+// 2026-10-14 单点化后：三项 env 仅作逃生舱（显式设置最优先）；未设置时向 daemon 探测
+// （providers.aihubmix.model / providers.volcengine.model 非空即选定对应 wire）。
+const OD_VIDEO_PROVIDER_ENV = (process.env.OD_VIDEO_PROVIDER || '').trim().toLowerCase();
+const OD_VOLCENGINE_VIDEO_MODEL_ENV = (process.env.OD_VOLCENGINE_VIDEO_MODEL || '').trim();
+const OD_OPENAI_VIDEO_MODEL_ENV = (process.env.OD_OPENAI_VIDEO_MODEL || '').trim();
 // 视频 30s–5min（ark 队列峰值更久），远超图片的 180s 上限，独立超时。
 const OD_VIDEO_TIMEOUT_MS = Number(process.env.OD_VIDEO_TIMEOUT_MS || 720000);
+
+// ---- 媒体默认值探测（2026-10-14 配置单点化）----
+// 真实模型/网关/key 的唯一定义处 = 仓库根 .env 媒体段（compose env_file → entrypoint
+// 排他写入 media-config.json）。桥在 env 未显式设置时向 daemon 探测"用户选了哪条通道"
+// ——判定键是 providers.<槽>.model 非空，**不能用 configured**（LLM 的 OPENAI_API_KEY
+// 会让 openai.configured 恒为 true 假阳性）。60s 进程内缓存 + 并发去重 + 失败负缓存；
+// 失败静默回落硬默认（绝不阻断生成）。
+const MEDIA_DEFAULTS_TTL_MS = 60000;
+let mediaDefaultsLastGood = null; // { value, at }
+let mediaDefaultsRetryAfter = 0;
+let mediaDefaultsInFlight = null;
+
+async function probeMediaDefaults() {
+  const [cfg, models] = await Promise.all([
+    odJson('/api/media/config', { timeoutMs: 5000 }),
+    odJson('/api/media/models', { timeoutMs: 5000 }).catch(() => null), // 目录失败不致命
+  ]);
+  const providers = (cfg && cfg.providers) || {};
+  const modelOf = (id) => String((providers[id] && providers[id].model) || '').trim();
+  let imageModel = '';
+  if (modelOf('custom-image')) {
+    imageModel = 'custom-image';
+  } else if (modelOf('nanobanana')) {
+    // nanobanana 是 provider id 不是模型 id；桥须传具体目录模型 id（随 daemon 版本变化 → 动态取）。
+    const list = Array.isArray(models && models.image) ? models.image : [];
+    const hit = list.find((m) => m && m.provider === 'nanobanana' && Array.isArray(m.caps) && m.caps.includes('t2i'));
+    imageModel = (hit && hit.id) || NANOBANANA_FALLBACK_MODEL_ID;
+  }
+  let videoProvider = '';
+  let videoModel = '';
+  if (modelOf('aihubmix')) {
+    // openai wire：renderAIHubMixVideo 配置优先（credentials.model 恒胜于桥传值），桥传
+    // 占位即可。禁止用目录 id（如 veo-3）当占位——provider=google 会落 stub 假成功；
+    // 占位自带 aihubmix- 前缀，被清空时上游报 model 'bma' not found，失败可见。
+    videoProvider = 'openai';
+    videoModel = AIHUBMIX_PLACEHOLDER_VIDEO_MODEL;
+  } else if (modelOf('volcengine')) {
+    videoProvider = 'volcengine';
+    videoModel = modelOf('volcengine'); // volcengine 视频纯用桥传值，须目录 id/别名可解析
+  }
+  return { imageModel, videoProvider, videoModel };
+}
+
+// fetchMediaDefaults 带缓存/去重/静默失败的探测入口；永不抛（daemon 未起时返回 null）。
+async function fetchMediaDefaults() {
+  const now = Date.now();
+  if (mediaDefaultsLastGood && now - mediaDefaultsLastGood.at < MEDIA_DEFAULTS_TTL_MS) {
+    return mediaDefaultsLastGood.value;
+  }
+  if (now < mediaDefaultsRetryAfter) {
+    return mediaDefaultsLastGood ? mediaDefaultsLastGood.value : null;
+  }
+  if (mediaDefaultsInFlight) return mediaDefaultsInFlight;
+  mediaDefaultsInFlight = (async () => {
+    try {
+      const value = await probeMediaDefaults();
+      mediaDefaultsLastGood = { value, at: Date.now() };
+      return value;
+    } catch (err) {
+      mediaDefaultsRetryAfter = Date.now() + MEDIA_DEFAULTS_TTL_MS;
+      log('媒体默认值探测失败（静默回退硬默认）:', err.message);
+      return mediaDefaultsLastGood ? mediaDefaultsLastGood.value : null;
+    } finally {
+      mediaDefaultsInFlight = null;
+    }
+  })();
+  return mediaDefaultsInFlight;
+}
 
 // resolveWorkspaceRel 把工作目录相对路径解析为容器内绝对路径（save_as 与
 // reference/first_frame 读侧共用）。防路径穿越：拒绝绝对路径、盘符、`..` 上跳；
@@ -350,7 +427,7 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg
     refFile = resolveReferenceImagePath(reference, 'reference');
     if (saveTarget) assertRefNotOutput(saveTarget, refFile);
   }
-  const useModel = model || OD_DEFAULT_MODEL;
+  const useModel = await resolveImageModel(model);
   const startedAtMs = Date.now();
   await ensureProject();
   // 参考图上传（幂等 + 缓存）：daemon 只认项目内文件，body.image 传项目相对名。
@@ -437,6 +514,8 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
       }
     }
   }
+  // 默认模型整批解析一次（探测走缓存；避免每张各探测）。
+  const useModel = await resolveImageModel(model);
   const startedAtMs = Date.now();
   const results = new Array(prompts.length);
   let next = 0;
@@ -448,7 +527,7 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
       // save_as_list 元素为空串 = 该项走默认 .bma/od-artifacts 命名。
       const saveAs = saveAsList?.[i] || undefined;
       try {
-        const r = await generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg: removeBg, reference: refFile ? refFile.rel : undefined });
+        const r = await generateImage({ prompt, aspect, model: useModel, save_as: saveAs, remove_bg: removeBg, reference: refFile ? refFile.rel : undefined });
         results[i] = { index: i, prompt, path: r.path, filename: r.filename, bytes: r.bytes };
         log(`批量进度 ${++settled}/${prompts.length} 完成:`, r.path);
       } catch (err) {
@@ -465,7 +544,7 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
     total: prompts.length,
     succeeded,
     failed: prompts.length - succeeded,
-    model: model || OD_DEFAULT_MODEL,
+    model: useModel,
     aspect: aspect || null,
     reference: refFile ? refFile.rel : null,
     elapsedSec: Math.round((Date.now() - startedAtMs) / 1000),
@@ -474,23 +553,41 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
   };
 }
 
-function resolveVideoProvider(provider) {
-  const p = String(provider || OD_VIDEO_PROVIDER).toLowerCase();
+// resolveImageModel 图像默认模型：参数 > env OD_DEFAULT_MODEL > daemon 单点探测 > 硬默认。
+async function resolveImageModel(explicitModel) {
+  if (explicitModel) return explicitModel;
+  if (OD_DEFAULT_MODEL_ENV) return OD_DEFAULT_MODEL_ENV;
+  const d = await fetchMediaDefaults();
+  return (d && d.imageModel) || IMAGE_FALLBACK_MODEL_ID;
+}
+
+function normalizeVideoProvider(raw) {
+  const p = String(raw || '').toLowerCase();
   if (p !== 'volcengine' && p !== 'openai') {
     throw new Error(`未知视频 provider：${p}（可选 volcengine / openai；对应网关协议分别为方舟 tasks 与 OpenAI /videos）`);
   }
   return p;
 }
 
-function resolveVideoModel(provider, model) {
+// resolveVideoTarget 视频默认目标：参数 > env > daemon 单点探测 > 硬默认。
+// openai wire 侧模型统一补 aihubmix- 前缀（探测给的占位自带前缀=no-op；真实裸名由
+// 用户在仓库根 .env 填）。volcengine 侧纯用桥传值，须目录 id / 别名可解析。
+async function resolveVideoTarget(providerArg, modelArg) {
+  const explicitProvider = providerArg ? normalizeVideoProvider(providerArg) : '';
+  const explicitModel = String(modelArg || '').trim();
+  const d = await fetchMediaDefaults();
+  const provider = explicitProvider || OD_VIDEO_PROVIDER_ENV || (d && d.videoProvider) || VIDEO_FALLBACK_PROVIDER;
+  const envModel = provider === 'openai' ? OD_OPENAI_VIDEO_MODEL_ENV : OD_VOLCENGINE_VIDEO_MODEL_ENV;
+  let model = explicitModel || envModel || (d && d.videoProvider === provider ? d.videoModel : '');
   if (provider === 'openai') {
-    const m = model || OD_OPENAI_VIDEO_MODEL;
-    if (!m) {
-      throw new Error('provider=openai 但未配置视频模型：.env 填 VIDEO_OPENAI_MODEL（你的 /videos 网关模型名，如 veo-3.1-fast）后 POST /api/plugins/reload');
+    if (!model) {
+      throw new Error('provider=openai 但未解析到视频模型：在仓库根 .env 媒体段填 VIDEO_MODEL（你的 /videos 网关模型名）后运行 bash docker/bma-plugin.sh media；或临时设桥 env OD_OPENAI_VIDEO_MODEL');
     }
-    return m.startsWith('aihubmix-') ? m : `aihubmix-${m}`;
+    model = model.startsWith('aihubmix-') ? model : `aihubmix-${model}`;
+  } else {
+    model = model || VOLCENGINE_FALLBACK_VIDEO_MODEL;
   }
-  return model || OD_VOLCENGINE_VIDEO_MODEL;
+  return { provider, model };
 }
 
 // generateVideo 文生视频（t2v）/ 首帧图生视频（i2v，first_frame）：daemon media/generate
@@ -508,8 +605,7 @@ async function generateVideo({ prompt, aspect, duration_sec: durationSec, provid
     frameFile = resolveReferenceImagePath(firstFrame, 'first_frame');
     if (saveTarget) assertRefNotOutput(saveTarget, frameFile);
   }
-  const useProvider = resolveVideoProvider(provider);
-  const useModel = resolveVideoModel(useProvider, model);
+  const { provider: useProvider, model: useModel } = await resolveVideoTarget(provider, model);
   const startedAtMs = Date.now();
   await ensureProject();
   const frameName = frameFile ? await ensureProjectFileUploaded(frameFile) : null;
@@ -592,7 +688,7 @@ const server = new McpServer({ name: 'open-design-mcp', version: '0.1.0' });
 server.registerTool('od_image_generate', {
   title: 'Open Design 图像生成',
   description:
-    '经本地 open_design 守护进程生成图片（默认火山方舟 Seedream）。' +
+    '经本地 open_design 守护进程生成图片（默认模型按 daemon 单点配置自动选择——真实模型/网关在仓库根 .env 媒体段，一般无需传 model）。' +
     '【批量优先】帧序列/多素材场景（如塔防游戏的 6 塔 × 4 帧动画、整套怪物贴图）' +
     '务必用 prompts 数组一次提交整批：桥内并发生成（上限 ' + OD_BATCH_CONCURRENCY + '，' +
     'OD_BATCH_CONCURRENCY 可调），一次调用拿全部结果；' +
@@ -614,7 +710,7 @@ server.registerTool('od_image_generate', {
       '批量模式：prompt 数组，每个元素各生成一张（桥内并发生成，上限 OD_BATCH_CONCURRENCY 默认 3）。帧序列/多素材场景优先用此参数一次提交，' +
       '避免逐张调用各产生一轮 LLM 往返。与 prompt 二选一；空数组报错'),
     aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例（批量时整批共用），缺省由模型决定'),
-    model: z.string().optional().describe(`覆盖默认模型（缺省 ${OD_DEFAULT_MODEL}）`),
+    model: z.string().optional().describe('覆盖默认模型（缺省按 daemon 单点配置自动选择，一般无需指定）'),
     save_as: z.string().optional().describe(
       '单张模式产物落盘的工作目录相对路径（如 assets/img/mon-zombie.png）。目录自动创建；' +
       '无扩展名时按生成文件实际格式补齐；不可含 .. 或盘符。命名须与代码加载约定一致'),
@@ -680,7 +776,7 @@ server.registerTool('od_video_generate', {
     prompt: z.string().min(1).describe('视频描述（建议具体描述主体/动作/镜头运动/风格）'),
     aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例，缺省由模型决定'),
     duration_sec: z.number().int().min(2).max(15).optional().describe('时长秒数，缺省 5；daemon 自动 snap 到模型允许桶（Veo 4/6/8、Sora 4/8/12、Seedance 常用 5/10）'),
-    provider: z.enum(['volcengine', 'openai']).optional().describe(`网关协议，缺省 ${OD_VIDEO_PROVIDER}（env OD_VIDEO_PROVIDER 可改）`),
+    provider: z.enum(['volcengine', 'openai']).optional().describe('网关协议（缺省按 daemon 单点配置自动选择，一般无需指定）'),
     model: z.string().optional().describe('覆盖默认模型 id（openai 侧给裸模型名即可，桥自动补 aihubmix- 前缀；volcengine 侧须为 daemon 目录 id）'),
     save_as: z.string().optional().describe('产物落盘的工作目录相对路径（如 assets/video/intro.mp4）。目录自动创建；无扩展名时补实际格式；不可含 .. 或盘符'),
     first_frame: z.string().optional().describe(
