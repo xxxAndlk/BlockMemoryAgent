@@ -143,5 +143,5 @@ provider 选择语义(火山=方舟 tasks 协议网关,openai=OpenAI /videos 协
 
 ## 明确不做(v1,YAGNI)
 
-- i2v 首帧图生视频(daemon 两条 renderer 均支持 imageRef,后续需要再加)
+- ~~i2v 首帧图生视频~~（2026-10-14 已实现：`od_video_generate` 的 `first_frame` 参数，见 doc/变更.md 同日条目）
 - 音频 surface、独立 video 插件、daemon 补丁、视频缩略图回显

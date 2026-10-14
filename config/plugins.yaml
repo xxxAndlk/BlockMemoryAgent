@@ -142,10 +142,17 @@ plugins:
   # docker/docker-compose.yml open_design 服务，安装时 up -d 一次、App 只连接）
   # 无 MCP 端点，本插件是其 REST API 的
   # stdio MCP 桥（docker/open-design-mcp）：od_image_generate 生成图片（单张 prompt /
-  # 批量 prompts 数组桥内顺序串行）并落盘 volumes 映射的宿主目录（返回 workspace
-  # 相对路径供 HTML/CSS 引用），od_image_list 列历史产物。
-  # 2026-09-04 新增 od_video_generate（文生视频，双协议：方舟 tasks / OpenAI /videos）
+  # 批量 prompts 数组桥内并发生成，上限 OD_BATCH_CONCURRENCY 默认 3）并落盘 volumes
+  # 映射的宿主目录（返回 workspace 相对路径供 HTML/CSS 引用），od_image_list 列历史产物。
+  # 2026-09-04 新增 od_video_generate（文生视频 t2v，双协议：方舟 tasks / OpenAI /videos）
   # 与 od_video_list；视频产物 mp4 同机制落盘，HTML <video> 引用。
+  # 2026-10-14：od_image_generate 支持 reference 参考图（图生图：工作区图片经 daemon
+  # POST /api/projects/:id/files multipart 上传进项目，再以 body.image 传项目相对名，
+  # daemon 自动切 /images/edits）；od_video_generate 支持 first_frame 首帧（图生视频 i2v）。
+  # 两者均为工作目录相对路径、≤16MB、格式 png/jpg/jpeg/webp/gif；批量图片整批共用一张参考图。
+  # 运维：桥镜像重建后，共享 keeper 容器按 image **tag 字符串**比较复用（不认镜像 ID）——
+  # 光 reload/disable→enable 不会换新，须 `docker rm -f bma-plugin-ui_design-<hash>` 后再
+  # enable；后端重启后同理需再换一次 keeper 才吃到本文件 env 变更。
   # roles（TODO #55 由 ["ui_assistant"] 放宽）：meta 纳入派发考量（MetaAgent 看得见才会把
   # AI 贴图路线写进 spec）；domain 允许领域 Agent 直接出图；ui_assistant 原有专用角色保留。
   # 落盘目录约定（2026-08-18 修订）：产物默认落 <工作目录>/.bma/od-artifacts（草稿/临时用途）；
@@ -175,24 +182,30 @@ plugins:
         OD_API_TOKEN: ${OD_API_TOKEN:}
         # 生图模型：daemon 目录 id（非上游模型名）。"custom-image" = daemon 内置
         # custom-image provider 的目录条目，真实模型名由守护进程
-        # media-config.json providers.custom-image.model 决定（默认
-        # doubao-seedream-5.0-lite，Agent Plan 网关唯一可用图像模型）。
-        # 改走标准 /api/v3 按量时，可换成 volcengine 目录 id
-        # doubao-seedream-3-0-t2i-250415。
+        # media-config.json providers.custom-image.model 决定（2026-10-14 起 BMA 部署
+        # 切 doubao-seedream-5.0-pro；来源 = compose env_file 的仓库根 .env IMAGE_MODEL，
+        # 容器重建时经 entrypoint 写入，restart 不重读）。
         OD_DEFAULT_MODEL: custom-image
+        # 单张生图等待上限（毫秒）：lite 时代 180000 够用；2026-10-14 切
+        # doubao-seedream-5.0-pro 后实测 1.5–4.5 分钟，提高默认防掐断
+        #（须 < exec_timeout_sec 1200s）。
+        OD_TIMEOUT_MS: ${OD_TIMEOUT_MS:600000}
         # 缺省产物（未传 save_as 的草稿）返回给 Agent 的宿主侧相对路径前缀（相对工作目录）。
         OD_OUTPUT_REL_PREFIX: .bma/od-artifacts
         # 生视频（od_video_generate）：provider 取 .env VIDEO_PROVIDER（缺省
         # volcengine=方舟 tasks 协议；openai=OpenAI /videos 协议，模型名裸填，
         # 桥自动补 aihubmix- 前缀）。两个模型槽位统一喂 VIDEO_MODEL（同一视频
-        # 网关下只需填一个模型名）。视频单条 30s–5min，桥侧超时独立，单位毫秒
-        #（缺省 720000=720s，须小于下方 exec_timeout_sec 1200s；图片仍 180s）。
-        OD_VIDEO_PROVIDER: ${VIDEO_PROVIDER:openai}
+        # 网关下只需填一个模型名；**volcengine 侧须为 daemon 目录 id**，如
+        # doubao-seedance-1-0-pro-250528——要用目录外真实模型名（如
+        # doubao-seedance-1.5-pro）须配 daemon 容器的 OD_MEDIA_MODEL_ALIASES 别名改写）。
+        # 视频单条 30s–5min，桥侧超时独立，单位毫秒（缺省 720000=720s，
+        # 须小于下方 exec_timeout_sec 1200s；图片仍 180s）。
+        OD_VIDEO_PROVIDER: ${VIDEO_PROVIDER:volcengine}
         OD_VOLCENGINE_VIDEO_MODEL: ${VIDEO_MODEL:}
         OD_OPENAI_VIDEO_MODEL: ${VIDEO_MODEL:}
-        OD_VIDEO_TIMEOUT_MS: ${OD_VIDEO_TIMEOUT_MS:120000}
+        OD_VIDEO_TIMEOUT_MS: ${OD_VIDEO_TIMEOUT_MS:720000}
       roles: ["meta","domain","ui_assistant"]
-      # 1200s：批量 20+ 张 × 单张最长 60s（桥内串行）可能逼近 20min，见上方注释。
+      # 1200s：批量 20+ 张 × 单张最长 60s ÷ 桥内并发 3 ≈ 8min，见上方注释。
       exec_timeout_sec: 1200
 
   # ui_preview：UI 渲染回显（Agent 的"眼睛"，2026-08-17 新增）。

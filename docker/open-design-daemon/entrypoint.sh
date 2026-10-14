@@ -30,14 +30,40 @@ const set = (prov, key, val) => {
   cfg.providers[prov][key] = val;
   touched = true;
 };
+// 变量名容错：主名优先，兼容旧文档/笔误的 VIDEOS_*（2026-10-14 线上曾用
+// VIDEOS_MODEL/VIDEOS_URL 导致配置被静默丢弃——别再静默：检测到即 stderr 告警）。
+const pick = (...names) => {
+  for (const n of names) {
+    const v = process.env[n];
+    if (v && v.trim()) return v.trim();
+  }
+  return undefined;
+};
+// URL 归一：daemon 渲染器自行拼接协议后缀（volcengine 拼 ${baseUrl}/contents/
+// generations/tasks、aihubmix 拼 ${baseUrl}/videos），.env 里带后缀会拼出双路径 404
+// ——统一剥掉常见后缀取 API 根，并提示实际生效值。
+const toApiRoot = (u) => {
+  if (!u) return u;
+  const stripped = u.replace(/\/(contents\/generations\/tasks|videos\/generations|videos)\/?$/, "");
+  if (stripped !== u) console.error(`[bma-entrypoint] VIDEO_URL 含协议后缀，已归一为 API 根: ${stripped}`);
+  return stripped;
+};
+const videoUrl = pick("VIDEO_URL", "VIDEOS_URL");
+const videoModel = pick("VIDEO_MODEL", "VIDEOS_MODEL");
+if (!process.env.VIDEO_URL && process.env.VIDEOS_URL) {
+  console.error("[bma-entrypoint] 警告: 只找到 VIDEOS_URL（应为 VIDEO_URL）——已按兼容名读入，建议改正 .env 键名");
+}
+if (!process.env.VIDEO_MODEL && process.env.VIDEOS_MODEL) {
+  console.error("[bma-entrypoint] 警告: 只找到 VIDEOS_MODEL（应为 VIDEO_MODEL）——已按兼容名读入，建议改正 .env 键名");
+}
 // 生图（custom-image provider = OpenAI 兼容 /images/generations 直调）
 set("custom-image", "baseUrl", process.env.IMAGE_URL);
 set("custom-image", "model", process.env.IMAGE_MODEL);
 // 生视频（OpenAI /videos 协议，VIDEO_PROVIDER=openai 时用）
-set("aihubmix", "baseUrl", process.env.VIDEO_URL);
-set("aihubmix", "model", process.env.VIDEO_MODEL);
+set("aihubmix", "baseUrl", toApiRoot(videoUrl));
+set("aihubmix", "model", videoModel);
 // 生视频（方舟 tasks 协议，VIDEO_PROVIDER=volcengine 时用）
-set("volcengine", "baseUrl", process.env.VIDEO_URL);
+set("volcengine", "baseUrl", toApiRoot(videoUrl));
 if (touched || existed) {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");

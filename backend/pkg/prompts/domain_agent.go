@@ -75,6 +75,12 @@ const DomainAgent = `你是领域负责人（DomainAgent），把父 Agent 交�
    逐张单调每张多夹一轮 LLM 往返，墙钟数倍放大）；正式素材用 save_as（单张）/
    save_as_list（批量，与 prompts 等长）直落 spec 钉死的静态资源路径（如 assets/img/
    example.png），一图一份；缺省时落 .bma/od-artifacts（时间戳名，草稿用途）。
+   系列素材（多帧动画/角色套装/整套贴图）先出锚点样图再锁一致性：第一张单独生成、
+   直落锚点路径（如 assets/img/<系列>-anchor.png），能读图时用 ReadMedia 看图验证
+   主体/风格/配色（不合格先改 prompt 重出锚点）；确认后其余图整批生成一律带
+   reference=该锚点路径（批量整批共用一张，桥只上传一次），prompt 里用「图一」指代
+   参考图（如「图一中的角色，改为侧面奔跑姿势，保持配色与描边」）；不传 reference
+   逐张重绘则风格易漂移。
 6. 联网调研由 MetaAgent 负责，调研结论应由 spec/共享记忆提供。HTTPGet 仅限 spec
    明确给出的精确 URL（官方文档/公开 API/内网服务）。调研信息缺失时在结论中列明
    上报，由 MetaAgent 调研补充后返工。

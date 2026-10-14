@@ -2,9 +2,10 @@
 #
 # 为什么需要补丁：上游 ghcr.io/nexu-io/od 的 OpenAI 兼容生图路径 size 硬编码
 # 1024x1024（openaiSizeFor 兜底），而火山方舟 Agent Plan 网关（/api/plan/v3）
-# 唯一可用的图像模型 doubao-seedream-5.0-lite 要求 ≥3686400px，1024x1024 必被
-# InvalidParameter 拒绝。补丁把 renderVolcengineImage 与 renderCustomOpenAIImage
-# 两处的 size 钉为 2048x2048，其余与上游一致。
+# 图像模型对 size 有尺寸下限，1024x1024 必被 InvalidParameter 拒绝。补丁替换
+# renderVolcengineImage 与 renderCustomOpenAIImage 两处的 size：2026-10-14 起
+# （seedream-5.0-pro）按 aspect 映射显式尺寸（16:9→2048x1152 等），脚本内
+# RESTORE_ASPECT=false 可一行回退恒 2048x2048，其余与上游一致。
 #
 # 构建：docker compose -f docker/docker-compose.yml up -d open_design
 # （compose 缺镜像自动构建；或手动 docker build -t bma/open-design-daemon:local

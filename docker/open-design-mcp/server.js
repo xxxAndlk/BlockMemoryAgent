@@ -7,11 +7,17 @@
 //   - /api/media/tasks/:id/wait 需 odtt_ 工具令牌（仅 OD 内部 chat run 可铸），外部不可用；
 //     改用 GET /api/projects/:id/media/tasks?includeDone=1 轮询。
 //   - Basic 认证：用户名 open-design，密码 = OD_API_TOKEN。
+//   - 参考图/首帧（2026-10-14）：daemon /media/generate 原生接收 image（单张，项目内
+//     相对路径）→ 图片路径 renderCustomOpenAIImage 自动切 /images/edits（图生图）、
+//     视频两条 renderer 把它当首帧（i2v）。桥须先把工作区文件经
+//     POST /api/projects/:id/files 上传进 daemon 项目——**必须 multipart**（全局
+//     express.json 上限 4mb，JSON base64 传不了大图）。
 //
 // stdout 只承载 MCP JSON-RPC 帧，日志一律 stderr。
 import http from 'node:http';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, extname, join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { PNG } from 'pngjs';
@@ -22,8 +28,8 @@ const OD_API_TOKEN = process.env.OD_API_TOKEN || '';
 const OD_HOST_HEADER = process.env.OD_HOST_HEADER || 'localhost:7456';
 // 默认模型 = od 守护进程模型目录 id（非上游模型名）。"custom-image" 走 daemon 的
 // OpenAI 兼容 custom-image provider，真实模型名由 daemon media-config.json 的
-// providers.custom-image.model 决定（BMA 默认 doubao-seedream-5.0-lite，
-// 火山方舟 Agent Plan 网关唯一可用图像模型）。
+// providers.custom-image.model 决定（2026-10-14 起 BMA 部署切 doubao-seedream-5.0-pro，
+// 火山方舟 Agent Plan 网关旗舰图像模型）。
 const OD_DEFAULT_MODEL = process.env.OD_DEFAULT_MODEL || 'custom-image';
 const OD_PROJECT_ID = process.env.OD_PROJECT_ID || 'bma-agent-artifacts';
 // 批量生成并发上限：daemon 每 task 独立异步（无串行限制），上限只防上游配额打爆。
@@ -33,7 +39,10 @@ const OD_BATCH_CONCURRENCY = Math.max(1, Number(process.env.OD_BATCH_CONCURRENCY
 // 不连通而保留。实证 2026-08-31：seedream 对"透明背景"提示词执行不稳定，
 // tower/monster 系列整图白底，纯 prompt 不可靠，必须落盘前后处理。
 const WHITE_BG_THRESHOLD = 240;
-const OD_TIMEOUT_MS = Number(process.env.OD_TIMEOUT_MS || 180000);
+// 单张生图等待上限：seedream-5.0-lite 时代实测 10–60s（默认曾为 180s），2026-10-14
+// 切 5.0-pro 后实测 1.5–4.5 分钟（含排队），180s 会掐断——默认提到 10 分钟
+//（仍 < plugins.yaml 的 exec_timeout_sec 1200）。
+const OD_TIMEOUT_MS = Number(process.env.OD_TIMEOUT_MS || 600000);
 // 容器内挂载的工作目录根（plugins.yaml volumes: ${WORKDIR}:/workspace）。
 // save_as 相对路径以此解析；默认产物落其子目录 .bma/od-artifacts。
 const WORKSPACE_DIR = (process.env.OD_WORKSPACE_DIR || '/workspace').replace(/\/$/, '');
@@ -59,14 +68,104 @@ const OD_OPENAI_VIDEO_MODEL = process.env.OD_OPENAI_VIDEO_MODEL || '';
 // 视频 30s–5min（ark 队列峰值更久），远超图片的 180s 上限，独立超时。
 const OD_VIDEO_TIMEOUT_MS = Number(process.env.OD_VIDEO_TIMEOUT_MS || 720000);
 
-// resolveSaveAs 把 Agent 给的 save_as（宿主工作目录相对路径）解析为容器内绝对路径。
-// 防路径穿越：拒绝绝对路径、盘符、`..` 上跳；统一为正斜杠。
-function resolveSaveAs(saveAs) {
-  const rel = String(saveAs).replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+// resolveWorkspaceRel 把工作目录相对路径解析为容器内绝对路径（save_as 与
+// reference/first_frame 读侧共用）。防路径穿越：拒绝绝对路径、盘符、`..` 上跳；
+// 统一为正斜杠。label 进错误文案（save_as / reference / first_frame）。
+function resolveWorkspaceRel(raw, label) {
+  const rel = String(raw).replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
   if (!rel || rel.startsWith('..') || rel.includes('/../') || /^[a-zA-Z]:/.test(rel)) {
-    throw new Error(`save_as 非法（须为工作目录内的相对路径，不可含 .. 或盘符）: ${saveAs}`);
+    throw new Error(`${label} 非法（须为工作目录内的相对路径，不可含 .. 或盘符）: ${raw}`);
   }
   return { rel, abs: `${WORKSPACE_DIR}/${rel}` };
+}
+
+// resolveSaveAs 把 Agent 给的 save_as（宿主工作目录相对路径）解析为容器内绝对路径。
+function resolveSaveAs(saveAs) {
+  return resolveWorkspaceRel(saveAs, 'save_as');
+}
+
+// ---- 参考图/首帧（2026-10-14）----
+// daemon /media/generate 接收 image（单张，daemon 项目内相对路径）：图片路径走
+// renderCustomOpenAIImage → 自动切 /images/edits（图生图）；视频两条 renderer 作
+// 首帧（i2v）。参考图必须先在 daemon 项目里，桥负责把工作区文件搬运进去。
+const REF_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif']; // 对齐 daemon resolveProjectImage 白名单
+const REF_MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
+const REF_MAX_BYTES = 16 * 1024 * 1024; // 对齐 daemon 上限（其上传路由 multer 侧 20MB，取小值）
+const OD_UPLOAD_TIMEOUT_MS = 120000;
+// 上传结果缓存：key=abs|size|mtimeMs → Promise<项目相对名>。内容寻址命名 + daemon 同名
+// 覆盖幂等，正确性不依赖缓存；缓存只省重复 HTTP——并发批量（同参考图）只上传一次。
+const uploadedRefs = new Map();
+
+// resolveReferenceImagePath 读侧校验：路径防穿越 + 扩展名白名单 + 存在 + 常规文件
+// + ≤16MB。label 进错误文案（reference / first_frame）。
+function resolveReferenceImagePath(raw, label) {
+  const { rel, abs } = resolveWorkspaceRel(raw, label);
+  const ext = extname(rel).toLowerCase();
+  if (!REF_IMAGE_EXTS.includes(ext)) {
+    throw new Error(`${label} 不支持的文件类型（${ext || '无扩展名'}）：须为 ${REF_IMAGE_EXTS.join(' / ')} 之一`);
+  }
+  let st;
+  try {
+    st = statSync(abs);
+  } catch {
+    throw new Error(`${label} 文件不存在: ${rel}（路径相对工作目录，例如 assets/img/anchor.png）`);
+  }
+  if (!st.isFile()) {
+    throw new Error(`${label} 不是常规文件: ${rel}`);
+  }
+  if (st.size > REF_MAX_BYTES) {
+    throw new Error(`${label} 文件过大（${(st.size / 1048576).toFixed(1)}MB，上限 16MB）：请先压缩或换更小的图`);
+  }
+  return { rel, abs, ext, size: st.size, mtimeMs: st.mtimeMs };
+}
+
+// buildRefMultipart 手写 multipart（daemon /files 路由是 upload.single('file')，
+// 同名文本字段 name 决定项目内最终文件名；JSON base64 路径受全局 express.json
+// 4mb 上限，大图必须走 multipart）。
+function buildRefMultipart(name, mime, buf) {
+  const boundary = `----bmaod${randomBytes(10).toString('hex')}`;
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="name"\r\n\r\n${name}\r\n` +
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\n` +
+    `Content-Type: ${mime}\r\n\r\n`, 'utf8');
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
+  return { body: Buffer.concat([head, buf, tail]), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+// ensureProjectFileUploaded 工作区图片 → OD 项目文件，返回项目相对名
+//（ref-<内容 sha1[:16]>.<ext>；内容寻址天然去重，同名重传 daemon 侧覆盖 = 幂等）。
+async function ensureProjectFileUploaded(refFile) {
+  const key = `${refFile.abs}|${refFile.size}|${refFile.mtimeMs}`;
+  const hit = uploadedRefs.get(key);
+  if (hit) return hit;
+  const p = (async () => {
+    await ensureProject();
+    const buf = readFileSync(refFile.abs);
+    const name = `ref-${createHash('sha1').update(buf).digest('hex').slice(0, 16)}${refFile.ext}`;
+    const { body, contentType } = buildRefMultipart(name, REF_MIME[refFile.ext], buf);
+    const res = await odJson(`/api/projects/${OD_PROJECT_ID}/files`, {
+      method: 'POST', rawBody: body, contentType, timeoutMs: OD_UPLOAD_TIMEOUT_MS,
+    });
+    const uploaded = String(res?.file?.name || res?.file?.fileName || name);
+    log('参考图已上传:', uploaded, `${refFile.size}B`);
+    return uploaded;
+  })();
+  uploadedRefs.set(key, p);
+  try {
+    return await p;
+  } catch (err) {
+    uploadedRefs.delete(key); // 失败不留毒缓存
+    throw err;
+  }
+}
+
+// assertRefNotOutput 拒绝"输出路径 = 参考图路径"（生成会覆盖锚点图）：比对去扩展名
+// 后的相对路径（兼容 save_as 无扩展名写法）；宿主 Windows 大小写不敏感，统一小写比对。
+function assertRefNotOutput(saveTarget, refFile) {
+  const strip = (p) => p.replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+  if (strip(saveTarget.rel) === strip(refFile.rel)) {
+    throw new Error(`输出路径与参考图指向同一文件（${refFile.rel}）：生成会覆盖参考图，请改 save_as 或先复制一份锚点图`);
+  }
 }
 
 function log(...args) {
@@ -75,14 +174,18 @@ function log(...args) {
 
 // odRequest 调用守护进程 REST API（node:http 原生实现，确保 Host 头可改写）。
 // 返回 { status, buffer }；json() 解析 JSON，文本错误取 OD 的 error.message。
-function odRequest(path, { method = 'GET', body, timeoutMs = 30000 } = {}) {
+// rawBody/contentType：multipart 等原始字节体（参考图上传用）；JSON 调用不受影响。
+function odRequest(path, { method = 'GET', body, rawBody, contentType, timeoutMs = 30000 } = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(OD_API_URL + path);
     const headers = { host: OD_HOST_HEADER };
     if (OD_API_TOKEN) {
       headers.authorization = 'Basic ' + Buffer.from(`open-design:${OD_API_TOKEN}`).toString('base64');
     }
-    if (body !== undefined) {
+    if (rawBody !== undefined) {
+      headers['content-type'] = contentType;
+      headers['content-length'] = String(rawBody.length);
+    } else if (body !== undefined) {
       headers['content-type'] = 'application/json';
     }
     const req = http.request({
@@ -99,7 +202,8 @@ function odRequest(path, { method = 'GET', body, timeoutMs = 30000 } = {}) {
     });
     req.on('timeout', () => req.destroy(new Error(`请求超时（${timeoutMs}ms）`)));
     req.on('error', reject);
-    if (body !== undefined) req.write(JSON.stringify(body));
+    if (rawBody !== undefined) req.write(rawBody);
+    else if (body !== undefined) req.write(JSON.stringify(body));
     req.end();
   });
 }
@@ -235,18 +339,25 @@ function removeWhiteBackground(buf) {
   return PNG.sync.write(png);
 }
 
-async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg: removeBg }) {
+async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg: removeBg, reference }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
-  // 先校验 save_as（fail fast：路径非法不必浪费一次生成）。
+  // 先校验 save_as 与参考图（fail fast：路径非法不必浪费一次生成/上传）。
   const saveTarget = saveAs ? resolveSaveAs(saveAs) : null;
+  let refFile = null;
+  if (reference !== undefined && reference !== null && String(reference).trim() !== '') {
+    refFile = resolveReferenceImagePath(reference, 'reference');
+    if (saveTarget) assertRefNotOutput(saveTarget, refFile);
+  }
   const useModel = model || OD_DEFAULT_MODEL;
   const startedAtMs = Date.now();
   await ensureProject();
+  // 参考图上传（幂等 + 缓存）：daemon 只认项目内文件，body.image 传项目相对名。
+  const refName = refFile ? await ensureProjectFileUploaded(refFile) : null;
   const gen = await odJson(`/api/projects/${OD_PROJECT_ID}/media/generate`, {
     method: 'POST',
-    body: { surface: 'image', model: useModel, prompt, ...(aspect ? { aspect } : {}) },
+    body: { surface: 'image', model: useModel, prompt, ...(aspect ? { aspect } : {}), ...(refName ? { image: refName } : {}) },
   });
   const taskId = gen?.taskId;
   if (!taskId) throw new Error(`OD 未返回 taskId：${JSON.stringify(gen).slice(0, 300)}`);
@@ -294,6 +405,7 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg
     bg_removed: bgRemoved,
     model: useModel,
     aspect: aspect || null,
+    reference: refName,
     elapsedSec,
     hint: '在 HTML/CSS/JS 中以该相对路径（path 字段）引用此图片',
   };
@@ -304,7 +416,7 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg
 // generateMedia 后台异步跑、HTTP 立即回 taskId（routes/media.js），无队列无锁——
 // 旧"daemon 单任务语义"注释不成立，纯串行白等（23 张 × 30s ≈ 11.5min，并发 3 压到 ~4min）。
 // 单张失败不中断整批，结果逐项标注 path 或 error，由 Agent 决定重试/降级。
-async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAsList, remove_bg: removeBg }) {
+async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAsList, remove_bg: removeBg, reference }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
@@ -313,6 +425,17 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
   }
   if (saveAsList !== undefined && saveAsList.length !== prompts.length) {
     throw new Error(`save_as_list 长度（${saveAsList.length}）须与 prompts（${prompts.length}）等长`);
+  }
+  // 参考图（整批共用一张）：先整体校验一次（fail fast——非法参考图不让整批变 N 条
+  // 相同 item error）；逐张生成时经缓存上传只发一次。save_as_list 逐项防覆盖锚点图。
+  let refFile = null;
+  if (reference !== undefined && reference !== null && String(reference).trim() !== '') {
+    refFile = resolveReferenceImagePath(reference, 'reference');
+    if (Array.isArray(saveAsList)) {
+      for (const s of saveAsList) {
+        if (s) assertRefNotOutput(resolveSaveAs(s), refFile);
+      }
+    }
   }
   const startedAtMs = Date.now();
   const results = new Array(prompts.length);
@@ -325,7 +448,7 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
       // save_as_list 元素为空串 = 该项走默认 .bma/od-artifacts 命名。
       const saveAs = saveAsList?.[i] || undefined;
       try {
-        const r = await generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg: removeBg });
+        const r = await generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg: removeBg, reference: refFile ? refFile.rel : undefined });
         results[i] = { index: i, prompt, path: r.path, filename: r.filename, bytes: r.bytes };
         log(`批量进度 ${++settled}/${prompts.length} 完成:`, r.path);
       } catch (err) {
@@ -344,6 +467,7 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
     failed: prompts.length - succeeded,
     model: model || OD_DEFAULT_MODEL,
     aspect: aspect || null,
+    reference: refFile ? refFile.rel : null,
     elapsedSec: Math.round((Date.now() - startedAtMs) / 1000),
     results,
     hint: '在 HTML/CSS/JS 中以各项结果的相对路径（path 字段）引用图片；带 error 的项需换 prompt 重试或人工处理',
@@ -369,18 +493,26 @@ function resolveVideoModel(provider, model) {
   return model || OD_VOLCENGINE_VIDEO_MODEL;
 }
 
-// generateVideo 文生视频（t2v）：daemon media/generate surface='video'，length 传时长秒数。
-// 无白底抠除（图片专属）；产物 mp4 经 downloadFile 落盘，路径语义与 generateImage 一致。
-async function generateVideo({ prompt, aspect, duration_sec: durationSec, provider, model, save_as: saveAs }) {
+// generateVideo 文生视频（t2v）/ 首帧图生视频（i2v，first_frame）：daemon media/generate
+// surface='video'，length 传时长秒数；带 image 时两条 renderer（volcengine tasks 协议 /
+// aihubmix /videos 协议）均把它当首帧。无白底抠除（图片专属）；产物 mp4 经 downloadFile
+// 落盘，路径语义与 generateImage 一致。
+async function generateVideo({ prompt, aspect, duration_sec: durationSec, provider, model, save_as: saveAs, first_frame: firstFrame }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
-  // 先校验 save_as（fail fast：路径非法不必浪费一次生成）。
+  // 先校验 save_as 与首帧图（fail fast：路径非法不必浪费一次生成/上传）。
   const saveTarget = saveAs ? resolveSaveAs(saveAs) : null;
+  let frameFile = null;
+  if (firstFrame !== undefined && firstFrame !== null && String(firstFrame).trim() !== '') {
+    frameFile = resolveReferenceImagePath(firstFrame, 'first_frame');
+    if (saveTarget) assertRefNotOutput(saveTarget, frameFile);
+  }
   const useProvider = resolveVideoProvider(provider);
   const useModel = resolveVideoModel(useProvider, model);
   const startedAtMs = Date.now();
   await ensureProject();
+  const frameName = frameFile ? await ensureProjectFileUploaded(frameFile) : null;
   const gen = await odJson(`/api/projects/${OD_PROJECT_ID}/media/generate`, {
     method: 'POST',
     body: {
@@ -389,6 +521,7 @@ async function generateVideo({ prompt, aspect, duration_sec: durationSec, provid
       prompt,
       ...(aspect ? { aspect } : {}),
       ...(durationSec ? { length: durationSec } : {}),
+      ...(frameName ? { image: frameName } : {}),
     },
   });
   const taskId = gen?.taskId;
@@ -420,6 +553,7 @@ async function generateVideo({ prompt, aspect, duration_sec: durationSec, provid
     provider: useProvider,
     model: useModel,
     duration_sec: durationSec || 5,
+    first_frame: frameName,
     elapsedSec,
     hint: '在 HTML 中以该相对路径（path 字段）用 <video src> 引用此视频',
   };
@@ -470,7 +604,9 @@ server.registerTool('od_image_generate', {
     '禁止事后再复制/重命名出第二份。缺省落盘 .bma/od-artifacts（时间戳命名，仅适合草稿/临时用途）。' +
     '产物默认白底抠除（remove_bg=true）：边缘连通白色背景自动置透明，贴图/图标/精灵开箱即用；' +
     '满幅背景图（9:16 场景底图等）必须传 remove_bg=false 保留背景。' +
-    '单张生成约需 10–60 秒，请勿重复提交相同 prompt。',
+    '图生图（reference）：系列素材先出锚点样图再批量锁一致性——第一张单独生成并保存为锚点（如 assets/img/<系列>-anchor.png），' +
+    '确认后其余图带 reference=锚点路径（批量整批共用一张，桥只上传一次），prompt 里用「图一」指代参考图；不传 reference 逐张重绘风格易漂移。' +
+    '单张生成约需 1–5 分钟（pro 档较慢），请勿重复提交相同 prompt。',
   inputSchema: {
     prompt: z.string().min(1).optional().describe(
       '单张模式的图像描述（建议具体描述主体/风格/配色/构图）。与 prompts 二选一；同时给 prompts 时以 prompts 为准'),
@@ -489,6 +625,12 @@ server.registerTool('od_image_generate', {
       '白底抠除（默认 true）：落盘前把边缘连通的白色背景置为透明（贴图/图标/精灵类需要）。' +
       '满幅背景图（如 9:16 场景底图、整页背景）必须传 false 保留背景，否则会被抠透。' +
       '仅对 PNG 生效，非 PNG 产物自动跳过'),
+    reference: z.string().optional().describe(
+      '参考图（图生图，可选）：工作目录相对路径（如 assets/img/anchor.png），生成时作为风格/主体锚点。' +
+      '【系列素材一致性】先单独生成一张锚点样图并确认，再整批传同一 reference 锁一致性；' +
+      'prompt 里用「图一」指代参考图（如「图一中的角色，改为侧面奔跑姿势，保持配色与描边」）。' +
+      '约束：png/jpg/jpeg/webp/gif、≤16MB、文件须已存在于工作目录；批量模式整批共用一张。' +
+      'save_as/save_as_list 中与参考图同路径的条目会被拒绝（防覆盖锚点图）。'),
   },
 }, async (args) => {
   try {
@@ -528,10 +670,11 @@ server.registerTool('od_image_list', {
 server.registerTool('od_video_generate', {
   title: 'Open Design 视频生成',
   description:
-    '经本地 open_design 守护进程生成短视频（文生视频 t2v）。' +
+    '经本地 open_design 守护进程生成短视频（文生视频 t2v / 首帧图生视频 i2v）。' +
     'provider 二选一：volcengine=方舟 tasks 协议网关（模型为 daemon 目录 id，自定义接入点由 daemon 的 OD_MEDIA_MODEL_ALIASES 别名改写）；' +
-    'openai=OpenAI /videos 协议网关（模型名任意，需 .env 配 VIDEO_OPENAI_URL/VIDEO_OPENAI_MODEL/VIDEO_OPENAI_API_KEY）。' +
+    'openai=OpenAI /videos 协议网关（模型名任意，.env 配 VIDEO_URL/VIDEO_MODEL；裸名桥自动补 aihubmix- 前缀）。' +
     '正式素材务必用 save_as 直落工作目录相对路径（如 assets/video/intro.mp4），一视频一份；缺省落 .bma/od-artifacts（时间戳命名，仅草稿）。' +
+    '首帧图生视频（i2v）：先出定稿画面（od_image_generate），再传 first_frame 让它动起来，prompt 里用「图一」指代首帧。' +
     '单条约 30 秒–5 分钟，请勿重复提交相同 prompt；超时（默认 720s）后可调 od_video_list 查看结果。',
   inputSchema: {
     prompt: z.string().min(1).describe('视频描述（建议具体描述主体/动作/镜头运动/风格）'),
@@ -540,6 +683,10 @@ server.registerTool('od_video_generate', {
     provider: z.enum(['volcengine', 'openai']).optional().describe(`网关协议，缺省 ${OD_VIDEO_PROVIDER}（env OD_VIDEO_PROVIDER 可改）`),
     model: z.string().optional().describe('覆盖默认模型 id（openai 侧给裸模型名即可，桥自动补 aihubmix- 前缀；volcengine 侧须为 daemon 目录 id）'),
     save_as: z.string().optional().describe('产物落盘的工作目录相对路径（如 assets/video/intro.mp4）。目录自动创建；无扩展名时补实际格式；不可含 .. 或盘符'),
+    first_frame: z.string().optional().describe(
+      '首帧图（图生视频 i2v，可选）：工作目录相对路径，作为视频第一帧；prompt 里用「图一」指代该首帧' +
+      '（如「图一中的角色向前走两步，镜头缓慢推进」）。约束同 od_image_generate 的 reference' +
+      '（png/jpg/jpeg/webp/gif、≤16MB、须已存在）。网关不支持 i2v 时任务失败并透传上游错误原文，去掉本参数即回退纯 t2v。'),
   },
 }, async (args) => {
   try {

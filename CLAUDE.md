@@ -57,7 +57,7 @@ Agent 产出的图/视频/音频/HTML 原型可直接在对话栏渲染（效果
 - **读侧**：`GET /api/sessions/:id/workspace/*path` 流式服务该会话工作目录内的文件（`http.ServeContent`，带 Range/Content-Type；越界/目录 404，nosniff）。path 型路由是为了让 HTML 产物里的相对引用（`assets/x.png`）自然可用。鉴权组的中间件额外接受 `?token=`（`<img>/<video>/<iframe>` 带不了请求头）。
 - **写侧**：`ShowArtifact` 工具（`internal/domain/tool/show_artifact.go`）登记 `Result.Artifacts`（只带工作区相对路径，零二进制）；`kind=html` 可传 `content`，自动落 `<workdir>/.bma/artifacts/`。成果随 `ProgressEvent.Detail` → `session_events.detail_json`（既有持久列，无需迁移）到前端。
 - **前端**：`ArtifactCard.vue`（图/视频/音频/`sandbox="allow-scripts"` iframe）；兜底识别 `inferArtifactsFromOutput` 会扫工具输出里的 `.bma/{images,od-artifacts,ui-artifacts,videos,artifacts}/` 媒体路径，Agent 未调工具也能出卡。
-- 生图/生视频沿用 `ui_design` 插件（`od_image_generate`/`od_video_generate`）；`ReadMedia` 是喂模型的，别与 ShowArtifact 混用。
+- 生图/生视频沿用 `ui_design` 插件（`od_image_generate`/`od_video_generate`）；2026-10-14 起支持 i2i 参考图（`reference`，系列素材"锚点样图+参考图锁一致性"）与视频首帧（`first_frame`，i2v）——守护进程读**仓库根 .env**（compose env_file，部署目录 .env 只喂后端/bridge），改模型需 force-recreate。`ReadMedia` 是喂模型的，别与 ShowArtifact 混用。
 
 ## 对话栏子 Agent 列表与运行中干预
 
