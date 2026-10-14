@@ -5,7 +5,9 @@ $repo = $PSScriptRoot
 
 # web 前端
 Push-Location "$repo\web"
-npm install; if ($LASTEXITCODE -ne 0) { throw "npm install 失败" }
+# --no-audit --no-fund：跳过 registry.npmjs.org 的 audit/fund 网络请求——国内网络到该源
+# 时通时断，裸 install 会卡在重试上数分钟~十几分钟（install 本体其实 <1s~15s，2026-10-14 实测）。
+npm install --no-audit --no-fund; if ($LASTEXITCODE -ne 0) { throw "npm install 失败" }
 npm run build; if ($LASTEXITCODE -ne 0) { throw "npm run build 失败" }
 Pop-Location
 
