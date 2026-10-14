@@ -68,6 +68,8 @@ type APIHandler struct {
 	learnedSkills *store.LearnedSkillStore  // 自进化技能库存储（2026-09-02 设计 §8）
 	// skillConsolidation 技能库整理器（C 库存治理）：手动触发一轮合并/归档，返回摘要。
 	skillConsolidation func(ctx context.Context) (string, error)
+	// memoryConsolidation 块记忆库整理器（2026-10-13）：手动触发一轮近重复合并/零访问归档，返回摘要。
+	memoryConsolidation func(ctx context.Context) (string, error)
 	// roleEvolution 角色自进化准则存储（窄接口，*store.RoleEvolutionStore 实现；未注入端点 503）。
 	roleEvolution roleEvolutionStoreOps
 	// roleRegistry 角色注册表（角色全集与显示名来源；未注入端点 503）。

@@ -25,22 +25,22 @@ func TestRenderMemoryIndex_QuotasAndRewrite(t *testing.T) {
 	if got := strings.Count(block, "- [项目经验]"); got != 3 {
 		t.Fatalf("rendered lines = %d, want 3", got)
 	}
-	if !strings.Contains(block, "重写索引") {
-		t.Fatalf("over-limit block must carry rewrite instruction, got:\n%s", block)
+	if !strings.Contains(block, "自动整理") {
+		t.Fatalf("over-limit block must carry the auto-consolidation notice, got:\n%s", block)
 	}
 
-	// runes 超限：按 runes 截停 + 重写指令。
+	// runes 超限：按 runes 截停 + 超限告知。
 	block2, over2 := RenderMemoryIndex(entries(5), 100, 50)
 	if !over2 {
 		t.Fatal("runes overflow must set over=true")
 	}
-	if !strings.Contains(block2, "重写索引") {
-		t.Fatalf("runes overflow block must carry rewrite instruction, got:\n%s", block2)
+	if !strings.Contains(block2, "自动整理") {
+		t.Fatalf("runes overflow block must carry the auto-consolidation notice, got:\n%s", block2)
 	}
 
-	// 不超限：无指令、全量注入。
+	// 不超限：无超限注记、全量注入。
 	block3, over3 := RenderMemoryIndex(entries(2), 3, 100000)
-	if over3 || strings.Contains(block3, "重写索引") {
+	if over3 || strings.Contains(block3, "记忆索引超限") {
 		t.Fatalf("within quota must be clean, over=%v block=%s", over3, block3)
 	}
 

@@ -34,7 +34,10 @@ func RenderMemoryIndex(entries []MemoryIndexEntry, maxLines, maxRunes int) (stri
 	}
 	over := len(entries) > maxLines
 	var sb strings.Builder
-	sb.WriteString("【沉淀索引】（本会话相关沉淀的一行式索引；详情按需向量召回，勿全文臆测）\n")
+	// 选主在装配侧（bootstrap newMemoryIndexProvider）：按会话目标相关召回的条目在前，
+	// 相关不足时补近期条目——标签如实描述语义（2026-10-13：此前装配实为全局取前 N，
+	// "本会话相关"名不副实，误导模型把无关条目当相关记忆用）。
+	sb.WriteString("【沉淀索引】（一行式沉淀索引：按本会话目标相关度优先召回；详情按需向量召回，勿全文臆测）\n")
 	used := 0
 	shown := 0
 	for _, e := range entries {
@@ -54,9 +57,13 @@ func RenderMemoryIndex(entries []MemoryIndexEntry, maxLines, maxRunes int) (stri
 		shown++
 	}
 	if over {
-		// 重写指令（不静默截断）：写侧收到的是"请整理"，不是"悄悄丢"。
+		// 超限如实告知（不静默截断）。历史文案"请整理合并旧沉淀条目后重写索引"是对模型
+		// 的死路指令——没有对应工具可执行（2026-10-13 实证从未被执行）。改为可行动的
+		// 两条：整理由系统每日维护自动执行（bootstrap/memory_consolidate，POST
+		// /api/memory/consolidate 手动）；索引外条目用 search_block_memory 按需检索。
 		fmt.Fprintf(&sb, "【记忆索引超限】沉淀共 %d 条，本次仅注入 %d 条（配额 %d 行/%d runes）。"+
-			"请整理合并旧沉淀条目后重写索引（删除/归档过期条目），超限条目本次未注入。\n",
+			"超限条目本次未注入（旧沉淀的合并/归档由系统每日维护自动整理）；"+
+			"需要索引外条目时用 search_block_memory 按需检索，勿臆测。\n",
 			len(entries), shown, maxLines, maxRunes)
 	}
 	return strings.TrimRight(sb.String(), "\n"), over

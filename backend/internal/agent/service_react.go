@@ -129,7 +129,9 @@ type ReactService struct {
 
 	// memoryIndexFn 渲染【沉淀索引】块（TODO #20③+#22③ 记忆索引槽）：会话启动注入，
 	// 行数/runes 双配额（超限自带重写指令），nil=未接线不注入。
-	memoryIndexFn func() string
+	// 入参 goal=会话目标：装配侧据此做目标相关召回（2026-10-13——原实现全局按
+	// last_accessed 取前 N 条，与当前会话无关的沉淀占绝大多数，模型在无关条目上混线）。
+	memoryIndexFn func(goal string) string
 	// evolutionPromptFn 读取角色自进化准则全文（角色级、AI 自维护、≤300字）：
 	// 每回合注入系统提示词尾部槽位，空串=该角色无准则不注入，nil=未接线。
 	// 由 bootstrap 接 RoleEvolutionStore。
@@ -538,18 +540,19 @@ func (s *ReactService) SetTaskLedgerProvider(fn func(sessionID string) string) {
 }
 
 // SetMemoryIndexProvider 注入【沉淀索引】渲染器（TODO #20③+#22③）：
-// fn() 返回已按配额渲染的索引块（renderMemoryIndex 产物，超限自带重写指令），
-// 空串=无沉淀不注入。传 nil 关闭索引槽。由 bootstrap 接 KnowledgeStore 组装。
-func (s *ReactService) SetMemoryIndexProvider(fn func() string) {
+// fn(goal) 返回已按配额渲染的索引块（renderMemoryIndex 产物，超限自带重写指令），
+// 空串=无沉淀不注入。goal=会话目标，供目标相关召回（2026-10-13）。
+// 传 nil 关闭索引槽。由 bootstrap 接 KnowledgeStore 组装。
+func (s *ReactService) SetMemoryIndexProvider(fn func(goal string) string) {
 	s.memoryIndexFn = fn
 }
 
-// memoryIndexBlock 取当前索引块（未接线返回空串）。
-func (s *ReactService) memoryIndexBlock() string {
+// memoryIndexBlock 取当前索引块（未接线返回空串）。goal=会话目标，供按相关性召回。
+func (s *ReactService) memoryIndexBlock(goal string) string {
 	if s.memoryIndexFn == nil {
 		return ""
 	}
-	return s.memoryIndexFn()
+	return s.memoryIndexFn(goal)
 }
 
 // SetEvolutionPromptProvider 注入角色自进化准则读取回调（bootstrap 接 RoleEvolutionStore）；
@@ -797,13 +800,10 @@ func (s *ReactService) metaPersona(workDir string) PersonaInjector {
 	)
 }
 
-// metaPersonaLite 返回续轮（resumeSession）的轻量注入器：仅人格（soul）。
-// 画像/偏好属于首轮一次性注入（TODO 第八项 P0-2）：runSession 首轮带全量
-// metaPersona，此后每轮重发 ~4K runes 属纯重复（画像/偏好极少变化，且已在前缀
-// 缓存的历史里）——续轮只保留 soul 前缀，省 ~4K runes/呼。
-func (s *ReactService) metaPersonaLite() PersonaInjector {
-	return s.persona
-}
+// 历史：metaPersonaLite（续轮仅 soul 的轻量注入器，TODO 第八项 P0-2 省 ~4K runes/呼）
+// 已于 2026-10-13 删除——其前提"画像/偏好已在前缀缓存的历史里"不成立：系统提示词
+// 从不进入 message 历史，resumeSession 换轻量注入器等于续跑后模型整段看不到画像/
+// 偏好（实证见 resumeSession 构造处注释）。runSession/resumeSession 统一走 metaPersona。
 
 // ReactRuntimeConfig 是 ReAct 引擎的运行时参数快照。
 // 由 bootstrap 从 cfg.Agent 派生注入，避免 agent 包反向依赖 config 包；
@@ -3593,7 +3593,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
-		WithMemoryIndex(s.memoryIndexBlock()).
+		WithMemoryIndex(s.memoryIndexBlock(session.Goal)).
 		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
 		WithPersonaInjector(s.metaPersona(session.currentWorkDir())).
 		WithMessageLogger(s.msgLogger).
@@ -3800,9 +3800,13 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithLogger(s.sessionLogger(session.ID, metaRole.Name)).
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
-		WithMemoryIndex(s.memoryIndexBlock()).
+		WithMemoryIndex(s.memoryIndexBlock(session.Goal)).
 		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
-		WithPersonaInjector(s.metaPersonaLite()).
+		// 人设链与首轮一致（2026-10-13 修复）：续跑曾用 metaPersonaLite（仅 soul），
+		// 依据"画像/偏好已在前缀缓存的历史里"节省 ~4K runes——该前提不成立：系统
+		// 提示词从不进入 message 历史，续跑后模型整段看不到画像/偏好（实证：删插件
+		// 会话完成后续聊，系统提示词 33408→30661 字节，紧随其后两轮行为崩坏）。
+		WithPersonaInjector(s.metaPersona(wd)).
 		WithMessageLogger(s.msgLogger).
 		// 顶层 Agent（meta/domain）挂起等子语义（同 runSession）。
 		WithSuspendOnChildWait(true).

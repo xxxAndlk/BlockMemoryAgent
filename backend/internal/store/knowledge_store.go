@@ -98,6 +98,15 @@ func (s *KnowledgeStore) UpdateContentEmbedding(ctx context.Context, id int64, c
 	return err
 }
 
+// Embed 生成文本向量（委托 PostgresStore.Embed）。供记忆整理器合并重写后重嵌入
+// 与目标相关召回等调用方使用（KnowledgeStore 此前只有内部 pg 反向引用）。
+func (s *KnowledgeStore) Embed(ctx context.Context, text string) ([]float32, error) {
+	if s == nil || s.pg == nil {
+		return nil, fmt.Errorf("knowledge store not wired")
+	}
+	return s.pg.Embed(ctx, text)
+}
+
 // ListIndexEntries 返回沉淀索引槽的一行式条目（TODO #20③+#22③）：
 // 全类型未归档记录按 (last_accessed DESC NULLS LAST, created_at DESC) 取 limit 条，
 // 供会话启动渲染【沉淀索引】。含 untrusted 围栏的行由调用方过滤（provenance 门）。
@@ -145,6 +154,42 @@ func (s *KnowledgeStore) SearchBlockMemoryByGoal(ctx context.Context, sessionID,
 	}
 	// 仅按 knowledge_type 过滤做向量检索，不做 domain/session 过滤
 	return s.SearchByType(ctx, enums.KnowledgeTypeBlockMemory, emb, topK)
+}
+
+// SearchBlockMemoryRelevant 按目标语义召回全局块记忆（带相似度下限过滤），
+// 供【沉淀索引】装配做目标相关选择（2026-10-13）：旧装配走 ListIndexEntries
+//（按 last_accessed 全局取前 N 条），把与当前会话无关的沉淀也注进每个会话，
+// 模型在无关条目上混线（实证："删除微信插件"会话里注入其它项目的教材/新闻记忆，
+// 条目被转述进结论）。与 SearchBlockMemoryCrossSession 的区别：不做补位、不排除
+// 任何 session（选主逻辑在装配侧），故单列本方法而不改动既有两处召回语义。
+// 参数:
+//   - ctx:      请求上下文。
+//   - goal:     目标文本，用于生成查询向量。
+//   - topK:     返回上限。
+//   - minScore: 余弦相似度下限（1 - 距离），由调用方按使用场景给阈值。
+//
+// 返回: 按相似度降序的知识记录切片与错误（embed 失败时返回错误，调用方降级）。
+func (s *KnowledgeStore) SearchBlockMemoryRelevant(ctx context.Context, goal string, topK int, minScore float64) ([]*types.KnowledgeRecord, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	emb, err := s.pg.Embed(ctx, goal)
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
+			FROM global_knowledge
+			WHERE archived = false AND knowledge_type = $1
+			  AND 1 - (embedding <=> $2) >= $3
+			ORDER BY embedding <=> $2
+			LIMIT $4
+		`, enums.KnowledgeTypeBlockMemory, pgVector(emb), minScore, topK)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return s.scanKnowledgeRows(ctx, rows)
 }
 
 // SearchBlockMemoryCrossSession 跨 session 语义补位检索块记忆。

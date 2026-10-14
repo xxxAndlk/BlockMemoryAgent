@@ -354,6 +354,62 @@ func LoadProjectDoc(workDir string) string {
 	return strings.TrimSpace(s[startIdx+len(ManagedBegin) : endIdx])
 }
 
+// ProjectDocStaleRefs 扫描 managed 区引用的目录/文件，返回磁盘上已不存在的顶层条目
+//（去重、排序）。概览只在缺失生成/工具层写后刷新时重写——外部手工删除/重命名
+//（不经 BMA 工具层）后概览会滞留旧路径（2026-10-13 实证：wechat-ilink 目录已删，
+// 概览仍列其全部文件，被 Agent 当作现状引用进结论）。注入侧据此加【概览过期提醒】
+// 标注，会话启动侧据此触发异步重刷新。无引用或全部存在返回 nil。
+func ProjectDocStaleRefs(workDir string) []string {
+	body := LoadProjectDoc(workDir)
+	if body == "" || workDir == "" {
+		return nil
+	}
+	seen := map[string]bool{}
+	var stale []string
+	check := func(p string) {
+		p = topSegment(p)
+		if p == "" || p == "(根级)" || seen[p] {
+			return
+		}
+		seen[p] = true
+		if _, err := os.Stat(filepath.Join(workDir, filepath.FromSlash(p))); err != nil {
+			stale = append(stale, p)
+		}
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimRight(line, "\r")
+		switch {
+		case strings.HasPrefix(line, "- 影响目录: "):
+			// 形如 `- 影响目录: a, b`（多目录逗号分隔；根级标 "(根级)"，check 内跳过）。
+			for _, d := range strings.Split(strings.TrimPrefix(line, "- 影响目录: "), ", ") {
+				check(d)
+			}
+		case strings.HasPrefix(line, "  - "):
+			// 形如 `  - ai-daily/fetch_ai_news.py (349 行): setup_logger() L56, ...`
+			// 或 `  - wechat-ilink/data/ot.err.log`——剥掉行数/符号注记只留路径本体。
+			rest := strings.TrimPrefix(line, "  - ")
+			if i := strings.Index(rest, " ("); i >= 0 {
+				rest = rest[:i]
+			}
+			check(rest)
+		}
+	}
+	sort.Strings(stale)
+	return stale
+}
+
+// topSegment 取相对路径的顶层段（目录名或根级文件）。空串原样返回。
+func topSegment(p string) string {
+	p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
+	if p == "" {
+		return ""
+	}
+	if i := strings.Index(p, "/"); i >= 0 {
+		return strings.TrimSpace(p[:i])
+	}
+	return p
+}
+
 // domainInfo 是单个领域簇的摘要（managed 区展示用）。
 type domainInfo struct {
 	Name      string

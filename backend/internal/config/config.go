@@ -23,8 +23,18 @@ type Config struct {
 	Logging  LoggingConfig  `yaml:"logging"`  // 日志文件输出（按天分割，按入口分文件）
 	Data     DataConfig     `yaml:"data"`     // 数据生命周期（陈旧知识归档/日志与工具输出保留期，TODO #18-2 T29）
 	Notify   NotifyConfig   `yaml:"notify"`   // 会话终态 Webhook 通知（TODO #18-5 T32）
-	Skills   SkillsConfig   `yaml:"skills"`   // 经验技能库治理（上限/目录收敛/自动整理）
-	Decision DecisionConfig `yaml:"decision"` // 决策层 provider（TODO #23）：默认 LLM 兜底，外部 HTTP 默认关
+	Skills      SkillsConfig      `yaml:"skills"`       // 经验技能库治理（上限/目录收敛/自动整理）
+	BlockMemory BlockMemoryConfig `yaml:"block_memory"` // 块记忆库治理（近重复合并/零访问归档，2026-10-13）
+	Decision    DecisionConfig    `yaml:"decision"`     // 决策层 provider（TODO #23）：默认 LLM 兜底，外部 HTTP 默认关
+}
+
+// BlockMemoryConfig 块记忆库（global_knowledge type=block_memory）治理配置。
+// 背景：任务沉淀只增不并会稀释【沉淀索引】槽并让无关条目进入会话上下文
+//（2026-10-13 实证），对齐经验技能库的 C 库存整理范式做 LLM 自清理。
+type BlockMemoryConfig struct {
+	// ConsolidateThreshold 激活块记忆数达到该值后每日自动整理（合并/归档），
+	// 默认 200；负数=关闭自动（0 取默认；手动触发不受限）。
+	ConsolidateThreshold int `yaml:"consolidate_threshold"`
 }
 
 // DecisionConfig 决策层 provider 配置（TODO #23，config.yaml 顶级 decision: 节）。
@@ -549,6 +559,7 @@ func (c *Config) applyDefaults() error {
 	c.applyLoggingDefaults()
 	c.applyNotifyDefaults()
 	c.applySkillsDefaults()
+	c.applyBlockMemoryDefaults()
 	return nil
 }
 
@@ -562,6 +573,13 @@ func (c *Config) applySkillsDefaults() {
 	}
 	if c.Skills.ConsolidateThreshold == 0 {
 		c.Skills.ConsolidateThreshold = 30
+	}
+}
+
+// applyBlockMemoryDefaults 块记忆治理默认值（语义见 BlockMemoryConfig）：200（0 取默认，负数=关）。
+func (c *Config) applyBlockMemoryDefaults() {
+	if c.BlockMemory.ConsolidateThreshold == 0 {
+		c.BlockMemory.ConsolidateThreshold = 200
 	}
 }
 

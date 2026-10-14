@@ -98,6 +98,7 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/skills/learned/:name/enable", apiHandler.EnableLearnedSkillHandler)   // 启用
 	api.POST("/skills/learned/:name/disable", apiHandler.DisableLearnedSkillHandler) // 禁用
 	api.POST("/skills/consolidate", apiHandler.ConsolidateSkillsHandler)             // 技能库整理（合并/归档，忽略每日阈值）
+	api.POST("/memory/consolidate", apiHandler.ConsolidateMemoryHandler)             // 块记忆库整理（近重复合并/零访问归档，忽略每日阈值）
 	api.GET("/evolution/log", apiHandler.EvolutionLogHandler)                        // 进化审计流水
 
 	// 角色自进化准则（每个角色一条 ≤300 字行为修正准则；存储装配前未接线时端点 503）。
@@ -149,6 +150,7 @@ func apiHandlerOf(app *App) *server.APIHandler {
 		h.SetLearnedSkills(app.Postgres.LearnedSkills) // 自进化技能库存储
 		h.SetRoleEvolution(app.RoleEvolution, app.RoleRegistry) // 角色自进化准则存储（≤300字/角色，AI 自维护）
 	}
-	h.SetSkillConsolidation(app.SkillConsolidation) // 技能库整理（C 库存治理，未装配时端点 503）
+	h.SetSkillConsolidation(app.SkillConsolidation)   // 技能库整理（C 库存治理，未装配时端点 503）
+	h.SetMemoryConsolidation(app.MemoryConsolidation) // 块记忆库整理（2026-10-13，未装配时端点 503）
 	return h
 }

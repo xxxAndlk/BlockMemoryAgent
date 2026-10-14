@@ -445,6 +445,23 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 		}()
 	}
 
+	// 概览过期自愈（2026-10-13）：PROJECT.md 引用的目录/文件被外部删除或改名
+	//（不经工具层刷新器）后，概览会滞留旧路径并进入系统提示词。会话启动即检测
+	//（引用扫描 stat 级、毫秒开销；文档缺失时引用为空自然跳过），过期则异步重生成——
+	// 本次注入侧另有【概览过期提醒】标注兜底（react_agent.buildEnvBlock），后续构造
+	//（本会话续跑轮/后续会话）拿到新概览。cls 为 nil（测试路径）不触发：异步写盘
+	// 会与测试临时目录清理竞态（同上方 Ensure 注释）。
+	if st.domainClassifier != nil && len(project.ProjectDocStaleRefs(eff)) > 0 {
+		go func() {
+			if err := project.RefreshProjectDoc(session.ctx, eff, st.domainClassifier); err != nil {
+				if session.ctx.Err() != nil {
+					return
+				}
+				st.logError(context.Background(), "refresh stale project doc", err)
+			}
+		}()
+	}
+
 	// 返回刚创建的会话指针，调用方可立即使用。
 	return session
 }

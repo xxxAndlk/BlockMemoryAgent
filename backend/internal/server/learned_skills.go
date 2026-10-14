@@ -74,6 +74,30 @@ func (h *APIHandler) ConsolidateSkillsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]any{"ok": true, "summary": summary})
 }
 
+// SetMemoryConsolidation 注入块记忆库整理器（2026-10-13，bootstrap 装配；nil 时端点 503）。
+// 手动触发忽略每日阈值直接整理，同步返回摘要（轻量模型调用，最长约 2 分钟）。
+func (h *APIHandler) SetMemoryConsolidation(fn func(ctx context.Context) (string, error)) {
+	h.memoryConsolidation = fn
+}
+
+// ConsolidateMemoryHandler 处理 POST /api/memory/consolidate —
+// 手动触发一轮块记忆整理（近重复合并 + 零访问归档），返回摘要。
+func (h *APIHandler) ConsolidateMemoryHandler(c *gin.Context) {
+	if h.memoryConsolidation == nil {
+		c.String(http.StatusServiceUnavailable, "memory consolidation not wired")
+		return
+	}
+	// 整理含轻量模型调用（最长 ~2 分钟），超时与整理器内部预算对齐。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 150*time.Second)
+	defer cancel()
+	summary, err := h.memoryConsolidation(ctx)
+	if err != nil {
+		c.String(http.StatusInternalServerError, "%s", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"ok": true, "summary": summary})
+}
+
 // ListLearnedSkillsHandler 处理 GET /api/skills/learned — 技能库全量列表（含禁用项）。
 func (h *APIHandler) ListLearnedSkillsHandler(c *gin.Context) {
 	if h.learnedSkills == nil {

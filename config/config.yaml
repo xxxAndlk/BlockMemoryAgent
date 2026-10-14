@@ -196,6 +196,13 @@ skills:
   meta_catalog_top: 20      # meta 系统提示【可用技能】块列出的经验技能条数（A 目录收敛，按 use_count 降序）；完整目录经 list_skills(query) 检索
   consolidate_threshold: 30 # 启用数达到该值后每日（复用数据维护 tick）自动整理一次（C）：轻量模型合并语义重复技能 + 归档零使用技能；<=0 关闭自动整理（仍可 POST /api/skills/consolidate 手动触发）
 
+# 块记忆库治理（2026-10-13，对齐技能库库存治理）：任务沉淀只增不并会稀释【沉淀索引】槽
+# 并让无关条目进入会话上下文（10-13 实证）。达阈值后每日由轻量模型整理一轮：近重复
+# 合并（keep 内容重写+重嵌入、来源 archived=true 冷备不删）+ 零访问归档（access_count==0
+# 才可归档；judge 复核防误并；全部动作写 evolution_log 可审计）。
+block_memory:
+  consolidate_threshold: 200 # 激活块记忆数达到该值后每日自动整理；<=0 关闭自动（仍可 POST /api/memory/consolidate 手动触发）
+
 # 决策层 provider（TODO #23）：默认 llm 兜底（roles.yaml decision_model 未配置时回退 lightweight），
 # 外部 HTTP（TypeSafe 兼容）默认关——学范式不接死外部 API，provider 可插拔、失败自动回退 llm。
 decision:

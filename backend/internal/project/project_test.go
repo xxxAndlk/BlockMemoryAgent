@@ -101,6 +101,44 @@ func TestLoadProjectDoc_EmptyWhenMissing(t *testing.T) {
 	}
 }
 
+// TestProjectDocStaleRefs 概览过期引用检测（2026-10-13）：外部删除被引用目录后
+// 注入侧要能报告（"概览过期提醒"）并驱动会话启动侧异步重刷新。
+func TestProjectDocStaleRefs(t *testing.T) {
+	root := writeTestProject(t)
+	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	// 文档刚生成：引用与磁盘一致，无过期引用。
+	if got := ProjectDocStaleRefs(root); len(got) != 0 {
+		t.Fatalf("fresh doc should have no stale refs, got %v", got)
+	}
+
+	// 外部删除一个被引用的顶层目录（不经工具层刷新器）→ 该目录应被报告（去重一条，
+	// 目录行与文件行都指向同一顶层段）。
+	if err := os.RemoveAll(filepath.Join(root, "backend")); err != nil {
+		t.Fatalf("remove backend: %v", err)
+	}
+	got := ProjectDocStaleRefs(root)
+	if len(got) != 1 || got[0] != "backend" {
+		t.Fatalf("expected stale ref [backend], got %v", got)
+	}
+
+	// Refresh 后引用按磁盘重建，不再报过期。
+	if err := RefreshProjectDoc(context.Background(), root, nil); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got := ProjectDocStaleRefs(root); len(got) != 0 {
+		t.Fatalf("after refresh stale refs should clear, got %v", got)
+	}
+}
+
+func TestProjectDocStaleRefs_MissingDoc(t *testing.T) {
+	root := t.TempDir()
+	if got := ProjectDocStaleRefs(root); got != nil {
+		t.Fatalf("missing doc must return nil, got %v", got)
+	}
+}
+
 func TestRefreshProjectDoc_PreservesHumanEdits(t *testing.T) {
 	root := writeTestProject(t)
 	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {

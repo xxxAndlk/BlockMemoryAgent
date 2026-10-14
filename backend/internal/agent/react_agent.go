@@ -1984,6 +1984,12 @@ func buildEnvBlock(workDir string, agentsMDMaxRunes int) string {
 	// 缺失或无标记返回空串，略去本段。让 Agent 了解工作目录的模块/领域拆分/命令/文档地图。
 	// TODO #40 块 4：会话级冻结（projectRefresher 刷新不污染当前会话前缀）另行处理。
 	if projDoc := project.LoadProjectDoc(workDir); projDoc != "" {
+		// 概览过期提醒（2026-10-13 实证：外部删除的目录仍被概览列为现状，Agent 据此
+		// 引用了不存在的路径）：managed 区引用的顶层目录/文件已不存在时显式标注，
+		// 防止按旧地图推断存在性；会话启动侧另有异步重刷新自愈（session_react.createSession）。
+		if stale := project.ProjectDocStaleRefs(workDir); len(stale) > 0 {
+			projDoc += fmt.Sprintf("\n\n【概览过期提醒】以下目录/文件在当前磁盘上已不存在：%s（概览生成后被删除或重命名）——凡涉及它们的结论先以实际目录为准，不要按本概览推断其存在。", strings.Join(stale, "、"))
+		}
 		env += "\n\n【项目概览】\n" + projDoc
 	}
 	// 项目自述（TODO 第10项⑦）：workDir 根部 AGENTS.md（优先）或 CLAUDE.md 的项目级说明，

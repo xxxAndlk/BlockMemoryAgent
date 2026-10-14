@@ -91,6 +91,11 @@ type App struct {
 	// 忽略阈值直接整理；返回人类可读摘要。nil 时端点返回 503。
 	SkillConsolidation func(ctx context.Context) (string, error)
 
+	// MemoryConsolidation 块记忆库整理（2026-10-13，对齐技能库库存治理）：
+	// POST /api/memory/consolidate 手动触发，忽略阈值直接整理；返回人类可读摘要。
+	// nil 时端点返回 503。
+	MemoryConsolidation func(ctx context.Context) (string, error)
+
 	// RoleEvolution 角色自进化准则存储（role_evolution_prompts 表）；与 RoleRegistry
 	// 一并供 server 层角色演化端点接线（apiHandler.SetRoleEvolution，见 router.go apiHandlerOf）。
 	RoleEvolution *store.RoleEvolutionStore
@@ -1321,6 +1326,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 也可经 POST /api/skills/consolidate 手动触发（忽略阈值）。
 	skillCons := newSkillConsolidator(pgStore.LearnedSkills, skillPool, modelFactory, cfg.Skills.ConsolidateThreshold)
 
+	// 块记忆库整理器（2026-10-13）：同范式——每日 tick 达阈值自动跑（近重复合并 +
+	// 零访问归档，消灭"沉淀索引超限无人整理"死结），POST /api/memory/consolidate 手动。
+	// 轻量模型整理；审计写 evolution_log（复用技能库的审计表写入器）。
+	memCons := newMemoryConsolidator(pgStore.Knowledge, pgStore.LearnedSkills, modelFactory, cfg.BlockMemory.ConsolidateThreshold)
+
 	// 第二十步：组装 App 实例。
 	app := &App{
 		Agent:        agentSvc,
@@ -1343,6 +1353,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return skillCons.Run(ctx, true)
 		},
 
+		MemoryConsolidation: func(ctx context.Context) (string, error) {
+			return memCons.Run(ctx, true)
+		},
+
 		RoleEvolution: roleEvolutionStore, // 角色自进化准则存储
 		RoleRegistry:  roleRegistry,       // 角色注册表（server 演化端点用）
 	}
@@ -1356,6 +1370,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		defer cancel()
 		if _, err := skillCons.Run(ctx, false); err != nil {
 			log.Printf("[skill-consolidate] daily run failed (non-fatal): %v", err)
+		}
+		// 块记忆库整理（2026-10-13）：同上，达阈值才跑，失败仅记日志。
+		mctx, mcancel := context.WithTimeout(context.Background(), memoryConsolidateTimeout+30*time.Second)
+		defer mcancel()
+		if _, err := memCons.Run(mctx, false); err != nil {
+			log.Printf("[memory-consolidate] daily run failed (non-fatal): %v", err)
 		}
 	})
 	app.cleanup = []func() error{
