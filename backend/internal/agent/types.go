@@ -133,6 +133,10 @@ type CreateRequest struct {
 	// Videos 首条消息携带的视频（Alt+V 粘贴视频文件）：CreateSession 内抽帧
 	// 并入 Images、元数据文本并入 Goal，Videos 本身不持久化。
 	Videos []WireVideo
+	// Attachments 首条会话消息携带的文件附件（Web 粘贴/上传 SQL、Excel 等）：
+	// server 层已落盘到会话工作区、引用文本已拼进 Goal，这里只透传结构化列表
+	// 供首条 user_message 事件的 detail_json（前端文件卡片）；不持久化。
+	Attachments []WireAttachment
 	// Gear 显式指定初始执行档位（TODO #14 新会话页选档）：合法枚举（fast|daily|cluster）
 	// 覆盖 config agent.default_gear；空/非法 = 回落默认。HTTP 层负责 400 校验。
 	Gear string
@@ -169,6 +173,11 @@ type Message struct {
 	// 并入 Images、元数据文本并入 Content 后即弃（不入 session.Messages），
 	// 与 Images 同为内存透传不持久化。
 	Videos []WireVideo
+	// Attachments 用户随消息粘贴的文件附件（Web 粘贴/上传 SQL、Excel 等）：
+	// server 层已落盘到会话工作区、引用文本已拼进 Content，这里只透传结构化
+	// 列表供 user_message 事件的 detail_json（前端文件卡片）；与 Images 同为
+	// 内存透传不持久化。
+	Attachments []WireAttachment
 }
 
 // Query 表示对会话发起的只读查询。

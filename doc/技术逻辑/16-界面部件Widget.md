@@ -64,7 +64,7 @@
 
 ## 16.6 Agent 自写工具 widget_save / widget_list
 
-`backend/internal/domain/tool/widget_tools.go`（registerDefaults 注册在 ShowArtifact 旁；meta 工具清单 = `domain/role/registry.go:188` + `config/roles.yaml` meta_agent.tools，**子 Agent 默认不给**——与"工具/插件分配权归顶层"一致）：
+`backend/internal/domain/tool/widget_tools.go`（registerDefaults 注册在 ShowArtifact 旁）。**挂载口径（2026-10-14 更新）**：三档顶层统一可用——cluster=meta 走角色授权（`domain/role/registry.go:188` 兜底 + `config/roles.yaml` meta_agent.tools），daily=domain 与 fast=doc_assistant 经 `mountTopLevelEssentials` 内建顶层必备清单预挂（role 列表未动，见 05-工具系统 §5.12）；**子 Agent 默认不给**——与"工具/插件分配权归顶层"一致：
 
 - `widget_save{id, name?, description?, entry?, files:[{path, content}]}` → Manager.Save；成功且 ctx 带 sessionID 时向本会话推 `{"__reload__":true}`——已打开的部件卡收到即热刷新 iframe（改代码无需用户手动刷新）。
 - `widget_list`：列 id/name/description/enabled/updated_at。
@@ -104,5 +104,5 @@
 4. **部件文件服务对停用部件仍可读**（前端只在启用时渲染 iframe；管理页预览可用）——要严格化需在 files handler 加 enabled 校验。
 5. **postMessage targetOrigin 只能是 `'*'`**（沙箱不透明源）：部件只收数据不收密钥，宿主侧不往部件发敏感信息。
 6. **同一张卡多实例/同 id 多卡**：widgetBus 按 widget_id 分发，同 id 的多张卡都会收到同一份数据（当前语义为共享）。
-7. **widget_save/widget_list 只挂 meta**（roles.yaml 顶层）；子 Agent 要写部件须回告顶层代办。
+7. **widget_save/widget_list 挂三档顶层**（2026-10-14：meta 角色授权 + domain/doc_assistant 经 `mountTopLevelEssentials` 预挂，角色列表未动）；子 Agent 仍无此工具，要写部件须回告顶层代办。
 8. **明确不做**：部件间通信、部件主动调后端任意 API、部件版本历史/回滚、FileViewer 全屏层集成。

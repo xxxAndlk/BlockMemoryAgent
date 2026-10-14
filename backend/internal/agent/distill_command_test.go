@@ -153,7 +153,7 @@ func TestSendMessageDistillCommand(t *testing.T) {
 		return 2, nil
 	})
 
-	if err := svc.sendMessageFull(context.Background(), sess.ID, "/提炼", nil); err != nil {
+	if err := svc.sendMessageFull(context.Background(), sess.ID, "/提炼", nil, nil); err != nil {
 		t.Fatalf("sendMessageFull: %v", err)
 	}
 
@@ -201,7 +201,7 @@ func TestSendMessageUnknownSlashCommand(t *testing.T) {
 	svc := newDistillTestService(t)
 	sess := seedDistillSession(svc, 1)
 
-	if err := svc.sendMessageFull(context.Background(), sess.ID, "/foo", nil); err != nil {
+	if err := svc.sendMessageFull(context.Background(), sess.ID, "/foo", nil, nil); err != nil {
 		t.Fatalf("sendMessageFull: %v", err)
 	}
 
@@ -236,7 +236,7 @@ func TestSendMessageSlashWithSpacePassthrough(t *testing.T) {
 	svc := newDistillTestService(t)
 	sess := seedDistillSession(svc, 1)
 
-	if err := svc.sendMessageFull(context.Background(), sess.ID, "/提炼 一下", nil); err != nil {
+	if err := svc.sendMessageFull(context.Background(), sess.ID, "/提炼 一下", nil, nil); err != nil {
 		t.Fatalf("sendMessageFull: %v", err)
 	}
 

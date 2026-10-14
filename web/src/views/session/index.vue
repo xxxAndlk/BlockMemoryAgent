@@ -166,8 +166,10 @@ const fileOpener: FileOpener = {
   openInViewer: (path: string, opts?: { siblings?: string[]; size?: number }) => {
     fileViewerRef.value?.open(path, opts)
   },
-  resolveAbsolute: (path: string) => resolveWorkspacePath(path, activeSession.value?.work_dir || ''),
-  workDir: computed(() => activeSession.value?.work_dir || ''),
+  // 回退全局默认目录（useWorkDir）：会话 work_dir 为空 = 服务端按其进程默认目录解析，
+  // 前端同口径回退，否则"未选目录的会话"里附件/产物卡片点预览·下载一律提示无工作区。
+  resolveAbsolute: (path: string) => resolveWorkspacePath(path, activeSession.value?.work_dir || workDir.value || ''),
+  workDir: computed(() => activeSession.value?.work_dir || workDir.value || ''),
   locateRequest,
 }
 provide(FILE_OPENER_KEY, fileOpener)
@@ -470,8 +472,8 @@ function startStream(s: Session) {
   })
 }
 
-async function handleSubmit(content: string, images: WireImage[] = [], gear: SessionGear = 'daily', thinking: SessionThinking = '', plugins: string[] = []) {
-  if (!content.trim() && !images.length) return
+async function handleSubmit(content: string, images: WireImage[] = [], files: File[] = [], gear: SessionGear = 'daily', thinking: SessionThinking = '', plugins: string[] = []) {
+  if (!content.trim() && !images.length && !files.length) return
   sending.value = true
   try {
     // 1) 待澄清会话 → 调 /clarify 提交答复
@@ -483,6 +485,7 @@ async function handleSubmit(content: string, images: WireImage[] = [], gear: Ses
         return
       }
       if (images.length) ElMessage.warning('澄清答复不支持携带图片，已忽略')
+      if (files.length) ElMessage.warning('澄清答复不支持携带文件，已忽略')
       // 答复提交带网络级重试（后端重启窗口内不再一句话丢答复），确认条只在真正落地后显示。
       await submitClarify(
         activeSession.value.id,
@@ -504,16 +507,17 @@ async function handleSubmit(content: string, images: WireImage[] = [], gear: Ses
         // 检查点就读到它（等子 Agent 时立即生效，其他阶段下一步生效）。此前的 enqueue
         // 只写事件不投递，消息静默丢失：用户看着"已发送"，Agent 毫无反应（2026-09-12 实证）。
         if (images.length) ElMessage.warning('运行中注入的指令不支持携带图片，已忽略')
-        if (!content.trim()) {
+        // 文件附件可注入：服务端落盘 + 引用文本随邮箱文本注入（比图片强，运行中补文件有效）。
+        if (!content.trim() && !files.length) {
           sending.value = false // 只带了图片：没内容可注入，别把发送按钮卡在 loading
           return
         }
-        await sendMessage(activeSession.value.id, content, [])
+        await sendMessage(activeSession.value.id, content, [], files)
         ElMessage.success('指令已注入当前执行（等待子 Agent 时立即生效）')
         sending.value = false
         return
       }
-      await sendMessage(activeSession.value.id, content, images)
+      await sendMessage(activeSession.value.id, content, images, files)
       if (!wasRunning) {
         activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
         await openSession(activeSession.value.id)
@@ -521,7 +525,7 @@ async function handleSubmit(content: string, images: WireImage[] = [], gear: Ses
       return
     }
     // 3) 无选中会话 → 创建新会话（携带创建时选档 + 会话级思考强度 + 指定插件，后端非法值 400）
-    const s = await createSession(content, images, workDir.value || undefined, gear, thinking, plugins)
+    const s = await createSession(content, images, workDir.value || undefined, gear, thinking, plugins, files)
     setWorkDir(workDir.value)
     sessions.value.unshift(s)
     router.replace({ path: '/session', query: { id: s.id } })

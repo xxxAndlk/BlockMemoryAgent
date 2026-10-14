@@ -114,7 +114,7 @@ defineExpose({ scrollToBottom })
     </template>
     <template v-else>
       <div v-for="(turn, ti) in turns" :key="turn.id">
-        <UserBubble v-if="turn.userMessage" :event="turn.userMessage" />
+        <UserBubble v-if="turn.userMessage" :event="turn.userMessage" :session-id="sessionId" />
         <AssistantTurn :turn="turn" :verbose="verbose" :clarify="clarify"
                        :clarify-drafts="clarifyDrafts" :session-id="sessionId" :agents="agents"
                        :mail-self-id="sessionId"

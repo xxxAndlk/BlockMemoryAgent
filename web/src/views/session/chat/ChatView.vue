@@ -40,7 +40,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  submit: [content: string, images: WireImage[], gear: SessionGear, thinking: SessionThinking, plugins: string[]]
+  submit: [content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[]]
   cancel: []
   stop: []
   interrupt: []
@@ -96,7 +96,7 @@ const showStatusLine = computed(() =>
                  :work-dir="workDir || ''"
                  :work-dir-saving="workDirSaving"
                  :known-dirs="knownDirs"
-                 @submit="(c: string, i: WireImage[], g: SessionGear, t: SessionThinking, p: string[]) => emit('submit', c, i, g, t, p)"
+                 @submit="(c: string, i: WireImage[], f: File[], g: SessionGear, t: SessionThinking, p: string[]) => emit('submit', c, i, f, g, t, p)"
                  @new-session="emit('new-session')"
                  @update-workdir="(d: string) => emit('update-workdir', d)" />
     </template>

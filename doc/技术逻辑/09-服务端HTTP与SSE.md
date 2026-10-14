@@ -44,10 +44,10 @@
 | 方法 | 路径 | handler | 语义 |
 |---|---|---|---|
 | GET | `/api/sessions` | session_http.go:161 | 摘要列表，`?limit=`（默认 200，上限 1000） |
-| POST | `/api/sessions` | :40 | 创建 `{goal, images?, videos?, work_dir?, gear?, thinking?}` |
+| POST | `/api/sessions` | :40 | 创建 `{goal, images?, videos?, work_dir?, gear?, thinking?}`；**带文件附件时 multipart/form-data**（2026-10-14，见 9.6） |
 | POST | `/api/sessions/delete` | :200 | 批量硬删除 `{ids[]}`（≤200，逐条独立结果，恒 200） |
 | GET | `/api/sessions/:id/stream` | stream_http.go:18 | SSE 长连接 |
-| POST | `/api/sessions/:id/message` | :383 | 发消息 `{content, images?, videos?}` |
+| POST | `/api/sessions/:id/message` | :383 | 发消息 `{content, images?, videos?}`；**带文件附件时 multipart/form-data**（2026-10-14，见 9.6） |
 | GET | `/api/sessions/:id/board` | :237 | 看板（QueryKindBoard） |
 | GET | `/api/sessions/:id/agents` | :276 | Agent 实例列表（block 目标覆盖 goal + 活动证据） |
 | GET | `/api/sessions/:id/tree` | :430 | 权威 Agent 树 |
@@ -123,6 +123,8 @@ metrics、status、metrics/timeline、activity、capabilities、export/memory、
 
 - **创建会话**（session_http.go:40-96）：DecodeBody → goal 非空 → gear/thinking 枚举校验 → `workDirAbs`（必须存在且是目录，**到达 agent 前拦截**）→ `ParseWireImages`（≤4 张/≤4MiB）→ `ParseWireVideos`（≤2 个/白名单扩展名/存在/≤200MB）→ CreateSession。
 - **发消息**：DecodeBody → content 非空 → 图片/视频校验 → `Send` → 成功后再 Get 一次返回最新快照。
+- **文件附件双模式**（2026-10-14，`uploads_http.go` + 上述两入口）：带文件时以 `multipart/form-data` 提交——文本字段 content/goal/work_dir/gear/thinking、images/plugins 为 JSON 字符串字段、files 为文件 part（`http.MaxBytesReader` 整请求 256MiB 兜底，超限 413）；落盘到会话生效工作目录的 `.bma/uploads/`（文件名消毒保中文、重名 -1/-2 后缀 `O_CREATE|O_EXCL` 防覆盖；上限 8 个/单文件 64MiB）；引用行 `[附件 N: 名 | 路径 | 大小]` 拼进 content/goal（Agent 从消息文本拿路径），结构化列表随 `AgentMessage` 走 user_message 事件 `detail_json`（前端文件卡片）；create 流程目录 = 显式 work_dir 或 `DefaultWorkDir()`（鸭子接口），message 流程经 `SessionWorkDir(id)`（空→404）。只带文件不带文字合法（引用行拼入后非空）。JSON 路径零变化（TUI/旧客户端不受影响）。
+- **isWithinAnyWorkspace 空 WorkDir 对齐**（2026-10-14，files_write.go）：`WorkDir==""` 的会话按进程默认目录（`h.defaultWorkDir`）参与 raw/reveal/PUT 边界匹配——此前直接跳过，导致未显式选目录的会话里文件经 raw 一律 404（附件卡片点不动）。
 - **控制族**（control_http.go）：DecodeBody → 业务校验 → `Control(ControlCommand)` → 回 `{session_id, status}`（clarify/interrupt/enqueue 回 running，stop 回 stopping，cancel 回 error）。
 - **workdir**：`WorkDir *string` 指针字段——nil=参数错 400；显式 ""=清除回落进程默认。
 - **worktree action**：ToLower+TrimSpace 后仅 merge|reject；reject 的 comments 解析失败**静默吞掉**。

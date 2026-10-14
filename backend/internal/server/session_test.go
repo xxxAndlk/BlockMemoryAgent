@@ -28,6 +28,22 @@ type mockAgentForServer struct {
 	mu       sync.RWMutex              // 保护 sessions 并发访问
 	sessions map[string]*agent.Session // 会话 ID -> 会话对象
 	seq      int                       // 自增 ID 序列号
+	// 文件附件上传测试（2026-10-14）注入与捕获：工作目录鸭子接口 + 请求留痕。
+	defaultWorkDir string                // DefaultWorkDir 返回值（空=未接线语义）
+	workDirs       map[string]string     // SessionWorkDir: 会话 ID -> 有效工作目录
+	createdReqs    []agent.CreateRequest // CreateSession 收到的请求（保序）
+	sentMsgs       []agent.Message       // Send 收到的消息（保序）
+}
+
+// DefaultWorkDir 实现 defaultWorkDirProvider（创建会话携带附件时的落盘目录解析）。
+func (m *mockAgentForServer) DefaultWorkDir() string { return m.defaultWorkDir }
+
+// SessionWorkDir 实现 sessionWorkDirProvider（/message 携带附件时按会话解析落盘目录；
+// 未登记会话返回空串，与真实实现"会话不存在返回空串"语义一致）。
+func (m *mockAgentForServer) SessionWorkDir(sessionID string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.workDirs[sessionID]
 }
 
 // newMockAgentForServer 创建并初始化一个 mock Agent。
@@ -55,6 +71,7 @@ func (m *mockAgentForServer) CreateSession(ctx context.Context, req agent.Create
 		},
 	}
 	m.sessions[id] = s
+	m.createdReqs = append(m.createdReqs, req)
 	return s, nil
 }
 
@@ -63,8 +80,11 @@ func (m *mockAgentForServer) ResumeSession(ctx context.Context, sessionID string
 	return m.Get(ctx, sessionID)
 }
 
-// Send 发送消息，测试实现为空操作。
+// Send 发送消息，测试实现记录消息供上传用例断言。
 func (m *mockAgentForServer) Send(ctx context.Context, sessionID string, msg agent.Message) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sentMsgs = append(m.sentMsgs, msg)
 	return nil
 }
 

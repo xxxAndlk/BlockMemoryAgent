@@ -1,13 +1,14 @@
 package server
 
 import (
-	"context"       // 请求上下文
-	"net/http"      // HTTP 状态码
-	"os"            // work_dir 目录存在性校验
-	"path/filepath" // work_dir 转绝对路径
-	"strconv"       // 审计事件分页参数解析
-	"strings"       // 合并门 action 归一化
-	"time"          // 消息时间戳
+	"context"        // 请求上下文
+	"mime/multipart" // 文件附件上传（multipart 请求解析）
+	"net/http"       // HTTP 状态码
+	"os"             // work_dir 目录存在性校验
+	"path/filepath"  // work_dir 转绝对路径
+	"strconv"        // 审计事件分页参数解析
+	"strings"        // 合并门 action 归一化
+	"time"           // 消息时间戳
 
 	"github.com/gin-gonic/gin" // Gin Web 框架
 
@@ -38,58 +39,120 @@ func workDirAbs(c *gin.Context, dir string) (string, bool) {
 }
 
 func (m *SessionManager) HandleCreateSession(c *gin.Context) {
-	// 解析请求体：goal 必填；images 可选（首条消息粘贴/上传的图片，与 /message 同规则限流）；
-	// videos 可选（首条消息粘贴的视频文件路径，服务端抽帧后走图片链路）；
-	// work_dir 可选（每会话工作目录，绝对/相对均转绝对）；
+	// 解析请求体（双模式，2026-10-14 文件附件）：images 可选（首条消息粘贴/上传的图片，
+	// 与 /message 同规则限流）；videos 可选（首条消息粘贴的视频文件路径，服务端抽帧后走
+	// 图片链路）；work_dir 可选（每会话工作目录，绝对/相对均转绝对）；
 	// gear 可选（TODO #14 新会话页选档）：显式指定初始执行档位，非法枚举 400。
-	req, err := DecodeBody[struct {
-		Goal     string            `json:"goal"`
-		Images   []agent.WireImage `json:"images,omitempty"`
-		Videos   []agent.WireVideo `json:"videos,omitempty"`
-		WorkDir  string            `json:"work_dir,omitempty"`
-		Gear     string            `json:"gear,omitempty"`
-		Thinking string            `json:"thinking,omitempty"`
-		// Plugins 会话级指定插件（KIMI 式插件选择）：创建时勾选，无效 ID 由 agent 层
-		// 丢弃并记事件（创建路径从宽，不阻断建会话）。
-		Plugins []string `json:"plugins,omitempty"`
-	}](c.Request)
-	if err != nil {
-		c.String(http.StatusBadRequest, "请求体无效")
-		return
+	// 带文件附件时以 multipart/form-data 提交（goal/work_dir/gear/thinking 为文本字段、
+	// images/plugins 为 JSON 字符串字段、files 为文件 part），文件落盘到目标工作目录的
+	// .bma/uploads/ 并把引用文本拼进 goal；不带文件保持 JSON 请求体原样。
+	var (
+		goal     string
+		wireImgs []agent.WireImage
+		wireVids []agent.WireVideo
+		workDir  string
+		gear     string
+		thinking string
+		plugins  []string
+		files    []*multipart.FileHeader
+	)
+	if isMultipartRequest(c) {
+		form, ok := parseMultipartForm(c)
+		if !ok {
+			return
+		}
+		defer form.RemoveAll()
+		goal = formValue(form, "goal")
+		workDir = formValue(form, "work_dir")
+		gear = formValue(form, "gear")
+		thinking = formValue(form, "thinking")
+		var err error
+		if wireImgs, err = parseMultipartImages(formValue(form, "images")); err != nil {
+			c.String(http.StatusBadRequest, "%s", err.Error())
+			return
+		}
+		if plugins, err = parseMultipartStrings(formValue(form, "plugins")); err != nil {
+			c.String(http.StatusBadRequest, "%s", err.Error())
+			return
+		}
+		files = form.File["files"]
+	} else {
+		req, err := DecodeBody[struct {
+			Goal     string            `json:"goal"`
+			Images   []agent.WireImage `json:"images,omitempty"`
+			Videos   []agent.WireVideo `json:"videos,omitempty"`
+			WorkDir  string            `json:"work_dir,omitempty"`
+			Gear     string            `json:"gear,omitempty"`
+			Thinking string            `json:"thinking,omitempty"`
+			// Plugins 会话级指定插件（KIMI 式插件选择）：创建时勾选，无效 ID 由 agent 层
+			// 丢弃并记事件（创建路径从宽，不阻断建会话）。
+			Plugins []string `json:"plugins,omitempty"`
+		}](c.Request)
+		if err != nil {
+			c.String(http.StatusBadRequest, "请求体无效")
+			return
+		}
+		goal, wireImgs, wireVids = req.Goal, req.Images, req.Videos
+		workDir, gear, thinking, plugins = req.WorkDir, req.Gear, req.Thinking, req.Plugins
 	}
-	if req.Goal == "" {
+	// 目标必填：纯文字创建必须带 goal；只带文件附件时 goal 可空（引用行拼入后即非空）。
+	if goal == "" && len(files) == 0 {
 		c.String(http.StatusBadRequest, "目标 (goal) 不能为空")
 		return
 	}
-	if req.Gear != "" && !tool.ValidGear(req.Gear) {
+	if gear != "" && !tool.ValidGear(gear) {
 		c.String(http.StatusBadRequest, "gear 非法（want fast|daily|cluster）")
 		return
 	}
-	if !tool.ValidThinking(req.Thinking) {
+	if !tool.ValidThinking(thinking) {
 		c.String(http.StatusBadRequest, "thinking 非法（want off|low|medium|high，或留空跟随角色默认）")
 		return
 	}
 	// work_dir 校验：转绝对路径，不存在或非目录直接 400（在到达 agent 前拦截）。
-	abs, ok := workDirAbs(c, req.WorkDir)
+	abs, ok := workDirAbs(c, workDir)
 	if !ok {
 		return
 	}
-	req.WorkDir = abs
 	// 用户图片限流（与 /message、TUI 粘贴侧同规则）：超限直接 400。
-	images, err := agent.ParseWireImages(req.Images)
+	images, err := agent.ParseWireImages(wireImgs)
 	if err != nil {
 		c.String(http.StatusBadRequest, "%s", err.Error())
 		return
 	}
 	// 用户视频限流：扩展名白名单/文件存在/大小上限，超限直接 400。
-	videos, err := agent.ParseWireVideos(req.Videos, 0)
+	videos, err := agent.ParseWireVideos(wireVids, 0)
 	if err != nil {
 		c.String(http.StatusBadRequest, "%s", err.Error())
 		return
 	}
 
-	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费）。
-	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: req.Goal, Images: images, Videos: videos, WorkDir: req.WorkDir, Gear: req.Gear, Thinking: req.Thinking, PinnedPlugins: req.Plugins})
+	// 文件附件落盘（2026-10-14）：目标目录 = 显式 work_dir（已校验转绝对），为空回落
+	// 进程默认目录（与创建后会话的生效工作目录同口径）。引用文本拼进 goal（内容持久载体）。
+	var atts []agent.WireAttachment
+	if len(files) > 0 {
+		upDir := abs
+		if upDir == "" {
+			wdProvider, ok := m.agent.(defaultWorkDirProvider)
+			if !ok {
+				c.String(http.StatusNotImplemented, "文件上传未接线")
+				return
+			}
+			if upDir = wdProvider.DefaultWorkDir(); upDir == "" {
+				c.String(http.StatusInternalServerError, "默认工作目录不可用")
+				return
+			}
+		}
+		atts, err = saveUploadedFiles(upDir, files)
+		if err != nil {
+			c.String(http.StatusBadRequest, "%s", err.Error())
+			return
+		}
+		goal = agent.AppendAttachmentRefs(goal, atts)
+	}
+
+	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费；
+	// Attachments 仅透传首条 user_message 事件的 detail_json，引用文本已在 goal 里）。
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: goal, Images: images, Videos: videos, Attachments: atts, WorkDir: abs, Gear: gear, Thinking: thinking, PinnedPlugins: plugins})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
@@ -386,36 +449,84 @@ func (m *SessionManager) HandleSessionTopic(c *gin.Context) {
 
 // HandleSessionMessage 处理 POST /api/sessions/{id}/message。
 // 职责：向会话发送用户消息，并返回最新会话快照。
+// 双模式（2026-10-14 文件附件）：带文件时 multipart/form-data（content 文本字段、
+// images JSON 字符串字段、files 文件 part），文件落盘到会话工作目录的 .bma/uploads/
+// 并把引用文本拼进 content；不带文件保持 JSON 请求体原样。
 func (m *SessionManager) HandleSessionMessage(c *gin.Context) {
 	id := c.Param("id")
 
-	req, err := DecodeBody[struct {
-		Content string            `json:"content"`
-		Images  []agent.WireImage `json:"images,omitempty"`
-		Videos  []agent.WireVideo `json:"videos,omitempty"`
-	}](c.Request)
-	if err != nil {
-		c.String(http.StatusBadRequest, "请求体无效")
-		return
+	var (
+		content  string
+		wireImgs []agent.WireImage
+		wireVids []agent.WireVideo
+		files    []*multipart.FileHeader
+	)
+	if isMultipartRequest(c) {
+		form, ok := parseMultipartForm(c)
+		if !ok {
+			return
+		}
+		defer form.RemoveAll()
+		content = formValue(form, "content")
+		var err error
+		if wireImgs, err = parseMultipartImages(formValue(form, "images")); err != nil {
+			c.String(http.StatusBadRequest, "%s", err.Error())
+			return
+		}
+		files = form.File["files"]
+	} else {
+		req, err := DecodeBody[struct {
+			Content string            `json:"content"`
+			Images  []agent.WireImage `json:"images,omitempty"`
+			Videos  []agent.WireVideo `json:"videos,omitempty"`
+		}](c.Request)
+		if err != nil {
+			c.String(http.StatusBadRequest, "请求体无效")
+			return
+		}
+		content, wireImgs, wireVids = req.Content, req.Images, req.Videos
 	}
-	if req.Content == "" {
+	// 内容判空：纯文字消息必须非空；只带文件附件时可为空（引用行拼入后即非空）。
+	if content == "" && len(files) == 0 {
 		c.String(http.StatusBadRequest, "内容不能为空")
 		return
 	}
 	// 用户图片限流（与 TUI 粘贴侧同规则）：超限直接 400，防御直连 API 的调用方。
-	images, err := agent.ParseWireImages(req.Images)
+	images, err := agent.ParseWireImages(wireImgs)
 	if err != nil {
 		c.String(http.StatusBadRequest, "%s", err.Error())
 		return
 	}
 	// 用户视频限流（与 TUI 粘贴侧同规则）：扩展名白名单/文件存在/大小上限。
-	videos, err := agent.ParseWireVideos(req.Videos, 0)
+	videos, err := agent.ParseWireVideos(wireVids, 0)
 	if err != nil {
 		c.String(http.StatusBadRequest, "%s", err.Error())
 		return
 	}
+	// 文件附件落盘（2026-10-14）：目标目录 = 会话生效工作目录（无显式目录回落进程默认）；
+	// 会话不存在/无目录 → 404（与工作区文件服务同口径）。引用文本拼进 content（内容持久
+	// 载体），结构化列表随 Send 透传供 user_message 事件的 detail_json（前端文件卡片）。
+	var atts []agent.WireAttachment
+	if len(files) > 0 {
+		wdProvider, ok := m.agent.(sessionWorkDirProvider)
+		if !ok {
+			c.String(http.StatusNotImplemented, "文件上传未接线")
+			return
+		}
+		wd := wdProvider.SessionWorkDir(id)
+		if wd == "" {
+			c.String(http.StatusNotFound, "会话或工作目录不存在")
+			return
+		}
+		atts, err = saveUploadedFiles(wd, files)
+		if err != nil {
+			c.String(http.StatusBadRequest, "%s", err.Error())
+			return
+		}
+		content = agent.AppendAttachmentRefs(content, atts)
+	}
 
-	if err := m.agent.Send(c.Request.Context(), id, agent.Message{Content: req.Content, Images: images, Videos: videos, Timestamp: time.Now()}); err != nil {
+	if err := m.agent.Send(c.Request.Context(), id, agent.Message{Content: content, Images: images, Videos: videos, Attachments: atts, Timestamp: time.Now()}); err != nil {
 		msg, status := agentErrorStatus(err)
 		c.String(status, "%s", msg)
 		return

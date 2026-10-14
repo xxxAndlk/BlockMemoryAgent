@@ -38,7 +38,9 @@ const fileWriteMaxBytes = 5 << 20
 //   - 命中条件：path == WorkDir，或以 WorkDir + 路径分隔符 为前缀（前缀自带分隔符，
 //     杜绝 C:\foo 误配 C:\foobar）；
 //   - Windows 下两侧 ToLower 后比较（文件系统不区分大小写）；
-//   - WorkDir 为空的会话（=进程默认目录，无明确边界）不参与匹配；
+//   - WorkDir 为空的会话按进程默认目录（h.defaultWorkDir）参与匹配（2026-10-14 对齐：
+//     与 agent 层 SessionWorkDir "空=进程默认"同口径——此前直接跳过，导致"未显式选
+//     目录的会话"在默认目录下的文件经 raw/reveal/PUT 一律 404，附件卡片看得到点不动）；
 //   - 不解析符号链接：WorkDir 经软链指到别处时以登记字符串为准（遗留限制）。
 func (h *APIHandler) isWithinAnyWorkspace(path string) (string, bool) {
 	if h.sessionMgr == nil {
@@ -55,7 +57,11 @@ func (h *APIHandler) isWithinAnyWorkspace(path string) (string, bool) {
 	for _, s := range h.sessionMgr.ListSessions() {
 		wd := s.WorkDir
 		if wd == "" {
-			continue // 空 WorkDir = 进程默认，无明确目录边界，不作为写白名单
+			// 空 WorkDir = 进程默认目录（bootstrap 经 SetDefaultWorkDir 注入）。
+			wd = h.defaultWorkDir
+		}
+		if wd == "" {
+			continue // 默认目录未知（未接线/未配置）：无边界可判，不参与匹配
 		}
 		wa, err := filepath.Abs(wd)
 		if err != nil {

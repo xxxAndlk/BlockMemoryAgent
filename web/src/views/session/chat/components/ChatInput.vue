@@ -8,6 +8,7 @@ import { usePluginSelection } from '@/composables/usePluginSelection'
 import { useRouter } from 'vue-router'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 import { useWorkDir } from '@/composables/useWorkDir'
+import { convertXlsxToCsv } from '@/utils/sheetConvert'
 
 const props = defineProps<{
   loading?: boolean
@@ -31,7 +32,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'submit', content: string, images: WireImage[], gear: SessionGear, thinking: SessionThinking, plugins: string[]): void
+  (e: 'submit', content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[]): void
   (e: 'new-session'): void
   (e: 'update-workdir', dir: string): void
 }>()
@@ -48,7 +49,7 @@ const awaitingClarify = computed(() => props.session?.status === 'awaiting_clari
 const placeholderText = computed(() =>
   awaitingClarify.value
     ? '回答上方问题，回车发送（Shift+Enter 换行）'
-    : '向 AI 下达命令…（Enter 发送，Shift+Enter 换行，可直接粘贴图片）',
+    : '向 AI 下达命令…（Enter 发送，Shift+Enter 换行；可直接粘贴/拖入图片与文件）',
 )
 
 // 执行档位三档（TODO #14 三档全手动，2026-09-16 由会话头移入对话栏）：
@@ -200,7 +201,36 @@ const MAX_IMAGES = 4
 const MAX_IMAGE_BYTES = 4 << 20
 const MIME_WHITELIST = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
 
-const canSend = computed(() => (content.value.trim().length > 0 || pendingImages.value.length > 0) && !props.loading)
+// ── 待发送文件附件（2026-10-14）：粘贴/选择/拖入 SQL、Excel 等文件，发送时随消息
+// multipart 上传到会话工作区 .bma/uploads/（Agent 按引用路径直读）；xlsx/xls 由前端
+// SheetJS 转 CSV 随原文件一并上传（后端无 Excel 解析能力，ReadFile 读二进制是乱码）。──
+interface PendingFileItem {
+  id: number
+  file: File
+  name: string
+  size: number
+  /** 由 Excel 自动转写的 CSV（随原文件一并上传） */
+  derived?: boolean
+  /** Excel 转换进行中（禁发 + 转圈，防派生 CSV 缺席） */
+  converting?: boolean
+}
+const pendingFiles = ref<PendingFileItem[]>([])
+let pendingFileSeq = 0
+// 与后端 agent 包上限同规则：最多 8 个、单文件 ≤64MiB、总量 ≤256MiB。
+const MAX_FILES = 8
+const MAX_FILE_BYTES = 64 << 20
+const MAX_FILES_TOTAL_BYTES = 256 << 20
+
+/** 转换完可发的文件；转换中整体禁发（防派生 CSV 缺席）。 */
+const readyFiles = computed(() => pendingFiles.value.filter((f) => !f.converting))
+const convertingAny = computed(() => pendingFiles.value.some((f) => f.converting))
+// 只带文件不写字也允许发送（服务端会拼附件引用行，消息非空）。
+const canSend = computed(
+  () =>
+    (content.value.trim().length > 0 || pendingImages.value.length > 0 || readyFiles.value.length > 0) &&
+    !props.loading &&
+    !convertingAny.value,
+)
 
 // token 数值格式化：≥1000 显示为 1.2k，否则原样显示。
 function fmtTokens(n: number): string {
@@ -251,18 +281,74 @@ function insertPlaceholder(text: string) {
   content.value = content.value.slice(0, start) + text + content.value.slice(end)
 }
 
-// 粘贴剪贴板图片（对齐 TUI Alt+V 的粘贴入口）。
+// 通用附件收口（粘贴/选择/拖入共用）：命中图片白名单且 ≤4MiB 的走原图片链路
+//（[image:N] 占位与 base64 传输不变）；其余任意文件进 pendingFiles。
+function addAnyFiles(files: File[]) {
+  const imageFiles: File[] = []
+  const docFiles: File[] = []
+  for (const f of files) {
+    if (MIME_WHITELIST.includes(f.type) && f.size <= MAX_IMAGE_BYTES) {
+      imageFiles.push(f)
+      continue
+    }
+    if (f.type.startsWith('image/') && MIME_WHITELIST.includes(f.type)) {
+      // 超过图片 4MiB 上限的图片：改按文件附件携带（原规则直接拒收，现在有更好去处）。
+      ElMessage.info(`图片 ${f.name} 超过 4MiB，已按文件附件携带`)
+    }
+    docFiles.push(f)
+  }
+  if (imageFiles.length) void addImageFiles(imageFiles)
+  for (const f of docFiles) addDocumentFile(f)
+}
+
+/** 单个文件进 pendingFiles（xlsx/xls 触发异步转 CSV 派生项）。 */
+function addDocumentFile(f: File) {
+  if (f.size > MAX_FILE_BYTES) {
+    ElMessage.warning(`文件 ${f.name} 超过大小上限（64MiB）`)
+    return
+  }
+  if (pendingFiles.value.length >= MAX_FILES) {
+    ElMessage.warning(`单条消息最多携带 ${MAX_FILES} 个文件`)
+    return
+  }
+  if (pendingFiles.value.reduce((n, it) => n + it.size, 0) + f.size > MAX_FILES_TOTAL_BYTES) {
+    ElMessage.warning('附件总量超过上限（256MiB）')
+    return
+  }
+  const item: PendingFileItem = { id: ++pendingFileSeq, file: f, name: f.name, size: f.size }
+  pendingFiles.value.push(item)
+  if (/\.(xlsx|xls)$/i.test(f.name)) {
+    item.converting = true
+    void convertXlsxToCsv(f).then((res) => {
+      if (!pendingFiles.value.includes(item)) return // 转换途中已被移除
+      item.converting = false
+      if (res.skipped) {
+        ElMessage.info(`${f.name}：${res.skipped}`)
+        return
+      }
+      for (const csv of res.csvs) {
+        if (pendingFiles.value.length >= MAX_FILES) {
+          ElMessage.warning(`单条消息最多携带 ${MAX_FILES} 个文件，部分转换结果未加入`)
+          break
+        }
+        pendingFiles.value.push({ id: ++pendingFileSeq, file: csv, name: csv.name, size: csv.size, derived: true })
+      }
+    })
+  }
+}
+
+// 粘贴（对齐 TUI Alt+V 入口）：剪贴板里的图片与文件都收（此前只认图片，SQL/Excel
+// 等文件被静默丢弃）；纯文本粘贴不拦，正常落输入框。
 function onPaste(e: ClipboardEvent) {
   const files: File[] = []
   for (const item of e.clipboardData?.items || []) {
-    if (item.kind === 'file' && item.type.startsWith('image/')) {
-      const f = item.getAsFile()
-      if (f) files.push(f)
-    }
+    if (item.kind !== 'file') continue
+    const f = item.getAsFile()
+    if (f) files.push(f)
   }
   if (files.length) {
-    e.preventDefault() // 阻止把图片当文件名文本插入
-    addImageFiles(files)
+    e.preventDefault() // 阻止把文件当文本插入
+    addAnyFiles(files)
   }
 }
 
@@ -287,8 +373,43 @@ function onFileChange(e: Event) {
   input.value = '' // 允许重复选择同一文件
 }
 
+function removeFile(idx: number) {
+  pendingFiles.value.splice(idx, 1)
+}
+
+function pickAnyFiles() {
+  fileInputRef.value?.click()
+}
+
+function onAnyFileChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  if (input.files?.length) addAnyFiles(Array.from(input.files))
+  input.value = '' // 允许重复选择同一文件
+}
+
+// 拖拽文件到 composer：仅对"文件拖拽"preventDefault（否则浏览器会直接打开文件），
+// 纯文本拖拽维持默认行为（拖字进输入框等不受影响）。
+function onDragOver(e: DragEvent) {
+  if (e.dataTransfer?.types?.includes('Files')) e.preventDefault()
+}
+
+function onDrop(e: DragEvent) {
+  const files = Array.from(e.dataTransfer?.files || [])
+  if (!files.length) return
+  e.preventDefault()
+  addAnyFiles(files)
+}
+
+/** 附件大小展示（与后端引用行同档：B/KB/MB）。 */
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
 const textareaRef = ref()
 const fileRef = ref<HTMLInputElement>()
+const fileInputRef = ref<HTMLInputElement>()
 
 // 工作目录：有会话时是"本会话目录"（改动经父级落库保存，下一回合生效），
 // 无会话时是新会话默认目录（父级写全局默认）。不再是模块级共享 ref——
@@ -396,9 +517,11 @@ async function onAddModel() {
 
 function handleSubmit() {
   if (!canSend.value) return
-  emit('submit', content.value.trim(), pendingImages.value.slice(), gear.value, thinking.value, pinnedPlugins.value.slice())
+  const files = readyFiles.value.map((f) => f.file)
+  emit('submit', content.value.trim(), pendingImages.value.slice(), files, gear.value, thinking.value, pinnedPlugins.value.slice())
   content.value = ''
   pendingImages.value = []
+  pendingFiles.value = []
 }
 
 // ── /提炼 快捷指令面板：已绑定会话时输入 "/" 开头弹出。后端拦截 /提炼 做记忆提炼，
@@ -480,7 +603,9 @@ function onKeydown(e: KeyboardEvent) {
          内部分三层（目录条 / 输入框 / 工具条），层间统一间距；
          focus-within 时边框转主色；待澄清时琥珀高亮（此刻发送=回答上方问题） -->
     <div class="composer flex flex-col gap-2 p-3 rounded-card border bg-page transition-colors"
-         :class="awaitingClarify ? 'border-amber-400 dark:border-yellow-600' : 'border-line focus-within:border-primary'">
+         :class="awaitingClarify ? 'border-amber-400 dark:border-yellow-600' : 'border-line focus-within:border-primary'"
+         @dragover="onDragOver"
+         @drop="onDrop">
       <!-- 目录条：单行等高对齐——文件夹图标 + 路径 + 选择目录 + 状态提示 + 新建会话 -->
       <div class="flex items-center gap-2 min-w-0">
         <div class="flex items-center gap-2 min-w-0 flex-1">
@@ -521,6 +646,20 @@ function onKeydown(e: KeyboardEvent) {
                   class="absolute inset-0 hidden group-hover:flex items-center justify-center bg-black/60 text-red-400 text-xs">
             移除
           </button>
+        </div>
+      </div>
+
+      <!-- 待发送文件附件（粘贴/选择/拖入；Excel 转换中带转圈，转写 CSV 带「转换」徽标） -->
+      <div v-if="pendingFiles.length" class="flex gap-2 flex-wrap">
+        <div v-for="(f, i) in pendingFiles" :key="f.id"
+             class="flex items-center gap-1.5 px-2 py-1 rounded border border-line bg-card text-xs max-w-64">
+          <el-icon v-if="f.converting" class="is-loading text-ink-3 shrink-0"><Loading /></el-icon>
+          <el-icon v-else class="text-ink-3 shrink-0"><Document /></el-icon>
+          <span class="truncate" :title="f.name">{{ f.name }}</span>
+          <span v-if="f.derived" class="text-[10px] px-1 rounded bg-page border border-line shrink-0"
+                title="由 Excel 自动转写（后端无 Excel 解析能力，Agent 读取此 CSV），随原文件一并上传">转换</span>
+          <span class="text-ink-3 shrink-0">{{ fmtBytes(f.size) }}</span>
+          <button class="text-ink-3 hover:text-red-400 shrink-0" title="移除" @click="removeFile(i)">✕</button>
         </div>
       </div>
       <div class="relative">
@@ -663,6 +802,12 @@ function onKeydown(e: KeyboardEvent) {
                      @click="pickFiles">
             <el-icon><Picture /></el-icon>
           </el-button>
+          <el-button text size="small" class="!text-ink-2 hover:!text-primary !px-2"
+                     :disabled="pendingFiles.length >= MAX_FILES"
+                     title="添加文件（SQL/Excel/PDF 等，也可直接粘贴或拖入）"
+                     @click="pickAnyFiles">
+            <el-icon><UploadFilled /></el-icon>
+          </el-button>
         </div>
         <div class="flex items-center gap-2 shrink-0">
           <span class="text-[11px] text-ink-3 font-mono hidden sm:inline"
@@ -681,6 +826,7 @@ function onKeydown(e: KeyboardEvent) {
       </div>
     </div>
     <input ref="fileRef" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple class="hidden" @change="onFileChange" />
+    <input ref="fileInputRef" type="file" multiple class="hidden" @change="onAnyFileChange" />
 
     <!-- 新增模型对话框：4 字段落盘 config/models.json，免重启生效 -->
     <el-dialog v-model="addDialogVisible" title="新增模型（写入 config/models.json，免重启）" width="460" append-to-body>

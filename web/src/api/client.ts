@@ -55,31 +55,71 @@ export async function fetchJson<T>(
       }
       throw new NetworkError('offline', `无法连接后端服务（${e instanceof Error ? e.message : String(e)}）`)
     }
-    if (!res.ok) {
-      // 后端错误分支用 c.String(status, msg) 返回纯文本原因（如"agent 正在执行任务，
-      // 发送已禁用（可先中断或终止）"）。此前只带 statusText 上抛，调用方拿到的永远是
-      // "409 Conflict"，用户看不到该等/该中断/该去监控页——三态发送框的提示因此失效。
-      // JSON 错误体（如 PUT /api/files/content 的 409 {code, current_mtime}）整体挂到
-      // error.data，调用方按 code 分支（文件保存冲突弹覆盖/放弃）。
-      let detail = ''
-      let data: unknown
-      let raw = ''
-      try {
-        raw = (await res.text()).trim()
-      } catch {
-        // 读体失败（连接中断等）时退回 statusText，不让错误路径二次抛错。
-      }
-      if (raw) {
-        try {
-          data = JSON.parse(raw)
-          const m = (data as { message?: unknown }).message
-          detail = typeof m === 'string' ? m : raw
-        } catch {
-          detail = raw
-        }
-      }
-      throw new APIError(res.status, res.statusText, detail || undefined, data)
+    if (!res.ok) await raiseAPIError(res)
+    return res.json() as Promise<T>
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+/**
+ * 请求失败的统一翻译（fetchJson / fetchForm 共用）：
+ * 后端错误分支用 c.String(status, msg) 返回纯文本原因（如"agent 正在执行任务，
+ * 发送已禁用（可先中断或终止）"）。此前只带 statusText 上抛，调用方拿到的永远是
+ * "409 Conflict"，用户看不到该等/该中断/该去监控页——三态发送框的提示因此失效。
+ * JSON 错误体（如 PUT /api/files/content 的 409 {code, current_mtime}）整体挂到
+ * error.data，调用方按 code 分支（文件保存冲突弹覆盖/放弃）。
+ */
+async function raiseAPIError(res: Response): Promise<never> {
+  let detail = ''
+  let data: unknown
+  let raw = ''
+  try {
+    raw = (await res.text()).trim()
+  } catch {
+    // 读体失败（连接中断等）时退回 statusText，不让错误路径二次抛错。
+  }
+  if (raw) {
+    try {
+      data = JSON.parse(raw)
+      const m = (data as { message?: unknown }).message
+      detail = typeof m === 'string' ? m : raw
+    } catch {
+      detail = raw
     }
+  }
+  throw new APIError(res.status, res.statusText, detail || undefined, data)
+}
+
+/**
+ * multipart/form-data 提交（文件附件上传专用，2026-10-14）：不设 Content-Type
+ *（由浏览器自动带 multipart boundary），默认超时 5 分钟（上传大文件远超普通接口的
+ * 10s）；NetworkError/APIError 语义与 fetchJson 一致。
+ */
+export async function fetchForm<T>(
+  url: string,
+  form: FormData,
+  options?: { timeoutMs?: number },
+): Promise<T> {
+  const controller = new AbortController()
+  const timeoutMs = options?.timeoutMs ?? 300_000
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    let res: Response
+    try {
+      res = await fetch(`${APP_CONFIG.apiBase}${url}`, {
+        method: 'POST',
+        body: form,
+        signal: controller.signal,
+      })
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        throw new NetworkError('timeout', `上传超时（${Math.round(timeoutMs / 1000)} 秒无响应）`)
+      }
+      throw new NetworkError('offline', `无法连接后端服务（${e instanceof Error ? e.message : String(e)}）`)
+    }
+    if (!res.ok) await raiseAPIError(res)
     return res.json() as Promise<T>
   } finally {
     clearTimeout(timeoutId)

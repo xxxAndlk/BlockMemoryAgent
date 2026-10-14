@@ -241,6 +241,34 @@ export function artifactsFromDetail(detailJson?: string): ArtifactRef[] {
 }
 
 /**
+ * 从 user_message 事件的 detail_json 里取出用户上传的文件附件（2026-10-14 对话输入
+ * 文件附件）：后端落盘到工作区 .bma/uploads/ 后挂 {"attachments":[{"name","path","size"}]}，
+ * 前端在用户气泡下渲染文件卡片。kind 按扩展名推断（复用 EXT_ARTIFACT_KIND），
+ * 推断不出给 'unknown' 不丢卡；解析失败/非数组返回 []（同 artifactsFromDetail 容错）。
+ */
+export function attachmentsFromDetail(detailJson?: string): ArtifactRef[] {
+  if (!detailJson) return []
+  try {
+    const d = JSON.parse(detailJson) as { attachments?: { name?: string; path?: string; size?: number }[] }
+    if (!Array.isArray(d.attachments)) return []
+    return d.attachments
+      .filter((a) => a && typeof a.path === 'string' && a.path.length > 0)
+      .map((a) => {
+        const path = a.path as string
+        const ext = path.split('.').pop()?.toLowerCase() || ''
+        return {
+          kind: EXT_ARTIFACT_KIND[ext] || 'unknown',
+          path,
+          title: a.name || path.split('/').pop() || path,
+          size: typeof a.size === 'number' ? a.size : undefined,
+        }
+      })
+  } catch {
+    return [] // detail_json 是自由字段，解析失败按无附件处理
+  }
+}
+
+/**
  * 从提问事件的 detail_json 里取出「提问前的答复正文」快照。
  *
  * 模型常见「先输出正文、再调 ask_user」：正文只活在流式瞬时字段里，不落事件，

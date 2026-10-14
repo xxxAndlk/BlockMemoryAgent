@@ -453,19 +453,28 @@ func normalizePluginIDs(ids []string) []string {
 	return out
 }
 
-// mountTopLevelEssentials 把配置声明的顶层必备插件工具（web_search 等）预挂到
-// 会话顶层 scope：三档全挂（2026-09-18 修复：原实现排除 cluster 档，前提是
-// "cluster 档 MetaAgent 已有角色授权，走 tool_catalog+tool_mount"——T13 收窄把这两个
-// 工具从 meta 白名单删了，前提失效，实测集群档 meta 无 web_search 可用、联网调研
-// 任务结构性卡死。统一预挂后三档顶层"问一句搜一下"同权）。子 Agent 的独立 scope
-// 不受影响。幂等；插件未运行/未接线时零行为变化。
+// topLevelBuiltinTools 顶层必备内建工具（2026-10-14）：与插件 top_level 声明走同一
+// 预挂通道（MountPreApprovedForScope），仅挂会话顶层 scope——三档顶层
+// （meta/domain/doc_assistant）都能自写界面部件（widget_save/widget_list），
+// 子 Agent 独立 scope 不预挂、角色列表（roles.yaml / role/registry.go）一律不动，
+// 维持"子 Agent 要写部件回告顶层代办"的既定语义。widget 管理器未接线时工具自身
+// 返回未接线错误（同 plugin_* 模式），不影响其他工具。
+var topLevelBuiltinTools = []string{"widget_save", "widget_list"}
+
+// mountTopLevelEssentials 把顶层必备工具（内建 topLevelBuiltinTools + 配置声明的
+// 顶层必备插件工具 web_search 等）预挂到会话顶层 scope：三档全挂（2026-09-18 修复：
+// 原实现排除 cluster 档，前提是 "cluster 档 MetaAgent 已有角色授权，走
+// tool_catalog+tool_mount"——T13 收窄把这两个工具从 meta 白名单删了，前提失效，实测
+// 集群档 meta 无 web_search 可用、联网调研任务结构性卡死。统一预挂后三档顶层
+// "问一句搜一下"同权）。子 Agent 的独立 scope 不受影响。幂等；插件未运行/未接线时
+// 零行为变化（内建工具名在注册表中已存在，始终可挂）。
 func (s *ReactService) mountTopLevelEssentials(sessionID string, gear string) {
-	if s.toolRegistry == nil || s.topLevelTools == nil {
+	if s.toolRegistry == nil {
 		return
 	}
-	names := s.topLevelTools()
-	if len(names) == 0 {
-		return
+	names := append([]string{}, topLevelBuiltinTools...)
+	if s.topLevelTools != nil {
+		names = append(names, s.topLevelTools()...)
 	}
 	if accepted := s.toolRegistry.MountPreApprovedForScope(sessionID, gear, names); len(accepted) > 0 {
 		log.Printf("[agent] top-level essentials mounted: session=%s gear=%s tools=%v", sessionID, gear, accepted)
@@ -1320,6 +1329,9 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 	}
 	// 首条消息携带的用户图片（Alt+V 粘贴）：runSession 注入 runCtx 后一次性消费。
 	sess.firstTurnImages = append(req.Images, frames...)
+	// 首条消息携带的文件附件（Web 粘贴/上传）：结构化列表供首条 user_message 事件
+	// 的 detail_json（前端文件卡片），runSession 一次性消费。
+	sess.firstTurnAttachments = req.Attachments
 	s.maybeWatchWallClock(sess)
 	// 在独立 goroutine 中运行 ReAct 循环，避免阻塞调用方。
 	go s.runSession(sess)
@@ -1514,7 +1526,7 @@ func (s *ReactService) List(ctx context.Context, filter Filter) ([]*Session, err
 
 // Send 向指定会话投递一条用户消息。
 func (s *ReactService) Send(ctx context.Context, sessionID string, msg Message) error {
-	return s.sendMessageFull(ctx, sessionID, msg.Content, msg.Videos, msg.Images...)
+	return s.sendMessageFull(ctx, sessionID, msg.Content, msg.Videos, msg.Attachments, msg.Images...)
 }
 
 // ResumeSession 继续一个之前已结束或暂停的会话。
@@ -2195,6 +2207,13 @@ func (s *ReactService) SessionWorkDir(sessionID string) string {
 	if wd := sess.currentWorkDir(); wd != "" {
 		return wd
 	}
+	return s.workDir()
+}
+
+// DefaultWorkDir 返回进程默认工作目录（会话无显式 work_dir 时的回落目录）。
+// server 层经鸭子接口（defaultWorkDirProvider）消费：创建会话携带文件附件时，
+// 会话尚未存在，上传落盘的目标目录即取此值解析。
+func (s *ReactService) DefaultWorkDir() string {
 	return s.workDir()
 }
 
@@ -3513,8 +3532,15 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 永不展示；首轮流式文本也因无回合容器无处渲染（2026-09-26 实证，与
 	// sendMessageFull 的用户消息事件同形状）。空 goal（理论边界）不落。
 	if session.Goal != "" {
-		s.store.addEvent(session, eventkind.UserMessage, "User", session.Goal, "", "", "", "", "", true)
+		// 文件附件（Web 粘贴/上传）的结构化列表挂事件的 detail_json（前端文件卡片）；
+		// 无附件走原 addEvent（零行为变化）。
+		if detail := MarshalAttachmentsJSON(session.firstTurnAttachments); detail != "" {
+			s.store.addEventDetail(session, eventkind.UserMessage, "User", session.Goal, "", "", "", "", "", true, detail)
+		} else {
+			s.store.addEvent(session, eventkind.UserMessage, "User", session.Goal, "", "", "", "", "", true)
+		}
 	}
+	session.firstTurnAttachments = nil
 
 	// 轮开始落库 running 状态行（009 status 列；History 为空时 persistFullHistory 自动跳过）：
 	// 进程在本轮中途崩溃/断电时，重启恢复逻辑依据库中 running 状态把会话标记为"因服务重启中断"，
@@ -4447,13 +4473,14 @@ func restartSessionContext(session *reactInternalSession) {
 // images 为用户随消息粘贴的图片（Alt+V），内存透传：挂到该条 Message 上，
 // 由 resumeSession 取出注入 runCtx（带外穿透到 call_sub_agent 子 Agent）。
 func (s *ReactService) sendMessage(ctx context.Context, sessionID, content string, images ...tool.ResultImage) error {
-	return s.sendMessageFull(ctx, sessionID, content, nil, images...)
+	return s.sendMessageFull(ctx, sessionID, content, nil, nil, images...)
 }
 
-// sendMessageFull 是 sendMessage 的完整版，额外接收视频附件 vids：
-// 服务端抽帧（兼容全部 provider）并入 images、元数据文本并入 content，
-// 转换后 vids 即弃（与 Images 同为内存透传不持久化）。
-func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content string, vids []WireVideo, images ...tool.ResultImage) error {
+// sendMessageFull 是 sendMessage 的完整版，额外接收视频附件 vids 与文件附件 atts：
+// 视频服务端抽帧（兼容全部 provider）并入 images、元数据文本并入 content，转换后
+// vids 即弃；文件附件已由 server 层落盘到会话工作区、引用文本已拼进 content，atts
+// 仅透传供 user_message 事件的 detail_json（前端文件卡片）。均为内存透传不持久化。
+func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content string, vids []WireVideo, atts []WireAttachment, images ...tool.ResultImage) error {
 	// 空内容直接拒绝。
 	if content == "" {
 		return fmt.Errorf("content cannot be empty")
@@ -4569,10 +4596,11 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 
 	// 将用户消息追加到会话消息列表。
 	session.Messages = append(session.Messages, Message{
-		Role:      string(enums.ChatRoleUser),
-		Content:   content,
-		Timestamp: time.Now(),
-		Images:    images,
+		Role:        string(enums.ChatRoleUser),
+		Content:     content,
+		Timestamp:   time.Now(),
+		Images:      images,
+		Attachments: atts,
 	})
 
 	// 新用户消息 = 新任务起点：清空该 session 的 ReadFile 已读记录。
@@ -4626,8 +4654,13 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	// 调用正在中断收尾途中），消息只入队不清倒计时，销毁倒计时到期会整体销毁。
 	s.cancelSoftStopState(sessionID)
 
-	// 添加用户消息事件。
-	s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)
+	// 添加用户消息事件。文件附件（Web 粘贴/上传）的结构化列表挂事件的 detail_json
+	// （前端文件卡片）；无附件走原 addEvent（零行为变化）。
+	if detail := MarshalAttachmentsJSON(atts); detail != "" {
+		s.store.addEventDetail(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true, detail)
+	} else {
+		s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)
+	}
 
 	// 运行中的会话：把新指令**投进 MetaAgent 邮箱**，本轮内的下一个检查点即读到它
 	//（等子 Agent 时 waitForChildren 每周期 drain，立即生效；其他阶段主循环顶部 drain，

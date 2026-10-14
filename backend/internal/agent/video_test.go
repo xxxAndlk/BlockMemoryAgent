@@ -242,7 +242,7 @@ func TestSendMessageWithVideos(t *testing.T) {
 	}
 
 	vids := []WireVideo{{Path: "D:/clip/a.mp4", MIMEType: "video/mp4"}}
-	if err := svc.sendMessageFull(ctx, created.ID, "看视频继续", vids,
+	if err := svc.sendMessageFull(ctx, created.ID, "看视频继续", vids, nil,
 		tool.ResultImage{MIMEType: "image/png", Data: []byte("aQ==")}); err != nil {
 		t.Fatalf("sendMessageFull: %v", err)
 	}

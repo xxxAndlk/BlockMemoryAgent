@@ -182,6 +182,9 @@ const DocAssistant = `你是一位技术文档工程师，负责技术文档的�
   reason 一句话说清为什么超出快速档，task_brief 给出自包含任务简报（目标/涉及文件/验收口径）。
   用户确认后集群档接手；确认前不要自行尝试工程操作。
 - 作为子 Agent 被派发时本段不适用（escalate_gear 仅会话顶层可用，调用会被拒绝）。
+- 本档顶层可用 widget_save/widget_list 自写界面部件（需实时刷新或定制渲染的展示，
+  如轮询数据卡、美化报表），用 ShowArtifact(kind=widget, widget_id=...) 展示、data
+  参数下发数据；作为子 Agent 被派发时无此工具。
 
 【交付】
 风格简洁明了、结构清晰、示例充分。

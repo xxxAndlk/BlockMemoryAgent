@@ -59,6 +59,10 @@ type reactInternalSession struct {
 	// 纯内存，runSession 注入 runCtx 后一次性消费置 nil；重启丢失，
 	// 历史只剩 [image:N] 占位文本。
 	firstTurnImages []tool.ResultImage
+	// firstTurnAttachments 是首条消息（创建会话时）携带的文件附件（Web 粘贴/上传）：
+	// 结构化列表仅用于 runSession 首条 user_message 事件的 detail_json（前端文件卡片），
+	// 读取后一次性消费置 nil。引用文本已由 server 层拼进 Goal（持久载体），重启不丢。
+	firstTurnAttachments []WireAttachment
 	// TempDir 是会话专用的临时工作目录路径。
 	TempDir string
 	// workDir 是每会话工作目录（绝对路径，空=进程默认 st.workDir）：S2 每会话工作目录，

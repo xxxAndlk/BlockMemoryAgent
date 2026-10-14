@@ -62,7 +62,7 @@
 
 **refreshPanels**：`const ep = panel.cycle()` 共享 epoch → `Promise.allSettled([agents, board, metrics, mailbox, health])` → 拉 logs + tokenMetrics。**关键：`run` 必须共享同一 cycle epoch**——各自 ++epoch 只有最后一个能存活（面板永远空白）。
 
-**提交流程 handleSubmit 三分支**：待澄清（批量态拒绝输入框、走问答卡；带图警告）→ 已有会话（running=邮箱即时注入；非 running 重载 openSession）→ 无会话（createSession + 路由跳转）。
+**提交流程 handleSubmit 三分支**：待澄清（批量态拒绝输入框、走问答卡；带图/带文件警告忽略）→ 已有会话（running=邮箱即时注入，文件附件同样注入；非 running 重载 openSession）→ 无会话（createSession + 路由跳转）。**文件附件（2026-10-14）**：ChatInput 支持粘贴文件（onPaste 收非图片 file items）/回形针选择/拖入 composer（仅 Files 类型拖拽 preventDefault）——图片走原 `[image:N]` base64 链路，其余文件进 pendingFiles chips，xlsx/xls 经 SheetJS 转 CSV 随原文件一并上传（上限同后端：8 个/64MiB/256MiB）；发送时 sendMessage/createSession 自动改走 multipart（fetchForm）。服务端落盘 + 引用行拼进消息，user_message 事件 detail_json 带附件列表 → UserBubble 渲染 ArtifactCard 文件卡片（正文区剥掉引用行，防与卡片重复）。
 
 **唤醒补刷**：`visibilitychange→visible` 与 `online` → reconcileAfterWake（refreshPanels + loadSessions）——后台 3s 定时器被浏览器节流、SSE 快照只补事件流。
 
@@ -156,6 +156,7 @@
 
 - 错误分类：`APIError{status,statusText}`（服务端明确拒绝，message = 响应体文本 detail || "413 Conflict"）；`NetworkError{reason:'timeout'|'offline'}`（请求没到/响应没回来）。读 `res.text()` 作 detail 是"三态发送框只显示 409 Conflict"的修复。
 - `fetchJson`：AbortController 超时（默认 10s）；`...options` 在 headers 之后展开（传 headers 会整体替换 Content-Type）；**200 也 res.json()**（空 body 会抛 SyntaxError——所有端点必须回合法 JSON）。
+- `fetchForm`（2026-10-14，文件附件上传专用）：multipart 提交——**不设 Content-Type**（浏览器自动带 boundary）、默认超时 5min；错误语义与 fetchJson 共用 `raiseAPIError`。`sendMessage`/`createSession` 带 files 时自动改走（images/plugins 以 JSON 字符串字段进表单）。
 - 超时定制：`/models/switch` 70s（含 60s 探测）、`/fs/pick-dir` 5min（等人操作）、`/clarify` 30s。
 
 **无鉴权头**（不注入 Authorization、不拼 `?token=`）→ 开启 auth_enabled 后 Web 整体 401 不可用；当前只适用本机 127.0.0.1 + 关闭鉴权。

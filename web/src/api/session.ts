@@ -1,5 +1,5 @@
 import type { Session, SessionEvent, SessionSummary, AgentNode, TaskBoardData, WireImage, TrustMode, SessionGear, SessionThinking } from '@/types'
-import { fetchJson } from './client'
+import { fetchForm, fetchJson } from './client'
 import { APP_CONFIG } from '@/config/app'
 import { TERMINAL_STATUSES } from '@/utils/notifications'
 
@@ -15,7 +15,27 @@ export function listSessions(limit?: number): Promise<SessionSummary[]> {
   return fetchJson(`/sessions${limit ? `?limit=${limit}` : ''}`)
 }
 
-export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking, plugins?: string[]): Promise<Session> {
+/**
+ * 文件附件表单组装（2026-10-14）：带文件时走 multipart —— 文本字段直接 append
+ *（空值省略，语义同 JSON 省略字段），images/plugins 以 JSON 字符串字段携带，
+ * files 同名多 append（后端 form.File["files"] 顺序收）。
+ */
+function buildUploadForm(fields: Record<string, string>, images?: WireImage[], plugins?: string[], files?: File[]): FormData {
+  const form = new FormData()
+  for (const [k, v] of Object.entries(fields)) {
+    if (v) form.append(k, v)
+  }
+  if (images?.length) form.append('images', JSON.stringify(images))
+  if (plugins?.length) form.append('plugins', JSON.stringify(plugins))
+  for (const f of files || []) form.append('files', f, f.name)
+  return form
+}
+
+export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking, plugins?: string[], files?: File[]): Promise<Session> {
+  // 带文件附件（粘贴/上传 SQL/Excel 等）：multipart 提交，其余语义不变。
+  if (files?.length) {
+    return fetchForm('/sessions', buildUploadForm({ goal, work_dir: workDir || '', gear: gear || '', thinking: thinking || '' }, images, plugins, files))
+  }
   const body: Record<string, unknown> = { goal }
   if (images?.length) body.images = images
   if (workDir) body.work_dir = workDir
@@ -88,7 +108,12 @@ export function getSessionAgents(
   return fetchJson(`/sessions/${id}/agents`)
 }
 
-export function sendMessage(id: string, content: string, images?: WireImage[]): Promise<void> {
+export function sendMessage(id: string, content: string, images?: WireImage[], files?: File[]): Promise<void> {
+  // 带文件附件（粘贴/上传 SQL/Excel 等）：multipart 提交（content 可为空——服务端
+  // 会拼附件引用行）；否则维持 JSON 原样。
+  if (files?.length) {
+    return fetchForm(`/sessions/${id}/message`, buildUploadForm({ content }, images, undefined, files))
+  }
   return fetchJson(`/sessions/${id}/message`, {
     method: 'POST',
     body: JSON.stringify(images?.length ? { content, images } : { content }),
