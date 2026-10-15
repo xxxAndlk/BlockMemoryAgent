@@ -529,6 +529,7 @@ func (b *Bridge) sessionFor(ctx context.Context) *mcp.ClientSession {
 	b.mu.Lock()
 	def := b.session
 	stopped := b.stopped
+	lifecycleCtx := b.stopCtx
 	b.mu.Unlock()
 	if def == nil || !b.perWorkDir || b.settings.Transport != "docker" || !b.settings.Shared {
 		return def
@@ -559,9 +560,14 @@ func (b *Bridge) sessionFor(ctx context.Context) *mcp.ClientSession {
 	}
 	vols := b.volumesFor(wd)
 	container := dockerSharedContainerName(b.id, wd)
-	dialCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	sess, cmd, _, err := b.connectWith(dialCtx, container, wd, vols)
+	// 传输进程（docker exec）是长会话，必须绑桥的生命周期 ctx：用超时 ctx spawn
+	// 会在该 ctx 取消/到期时杀掉会话进程（同 connectHandshakeTimeout 注释的约束）。
+	// 实修（2026-10-15）：此前这里用 90s 超时 ctx + defer cancel——函数一返回即
+	// 取消，刚建好的 exec 会话当场被杀：异目录会话的工具调用必回 EOF，而桥内
+	// 副作用（参考图上传、任务下发）却已完成（实证：daemon 侧任务全部 done、
+	// 产物滞留 daemon 项目库，Agent 侧只见 5 连 EOF）。容器创建
+	//（ensureSharedContainer 自带 60s 界）与握手（connectWith 120s 界）各自有界。
+	sess, cmd, _, err := b.connectWith(lifecycleCtx, container, wd, vols)
 	if err != nil {
 		b.logger.Warn("异目录 MCP 会话建立失败，回退默认会话（产物将落默认目录）",
 			"plugin", b.id, "workdir", wd, "container", container, "err", err)
