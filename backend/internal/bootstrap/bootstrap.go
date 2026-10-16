@@ -1257,7 +1257,13 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		}
 		return info.Name, info.Enabled, true
 	})
-	toolRegistry.SetWidgetManager(widgetMgr, agentSvc.PushWidgetData)
+		toolRegistry.SetWidgetManager(widgetMgr, agentSvc.PushWidgetData)
+		// owner 归属（TODO #18-8 多租户预留）：widget_save 落盘 Manifest.owner。
+		// 运行态会话内存当前不维护 user_id（owner 列仅落在 events/messages 等持久层），
+		// 会话 owner 来源接线后在此替换；返回空串时 owner 字段留空（不阻断保存）。
+		toolRegistry.SetWidgetOwnerResolver(func(sessionID string) string {
+			return "" // TODO(#18-8): 会话 owner 来源接线后返回 s.Owner
+		})
 	// 存量迁移（幂等）：PG 里有定义但磁盘无文件的 dag_jobs 行导出为 YAML，
 	// 文件已存在则跳过；导出后 PG 行保留作运行态。失败不阻断启动。
 	if n, err := dagStore.Migrate(ctx); err != nil {

@@ -83,3 +83,40 @@ func TestReportWidgetError(t *testing.T) {
 		t.Fatalf("运行中应注入邮箱: %v", m.contents)
 	}
 }
+
+// TestReportWidgetAction 钉死上行操作契约（仿 ReportWidgetError）：System 会话事件
+// "【部件操作】" 用户可见；运行中会话注入邮箱；终态/不存在静默。
+func TestReportWidgetAction(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+
+	// 会话不存在：静默。
+	svc.ReportWidgetAction("ghost", "w", "click", "{}")
+
+	svc.ReportWidgetAction(sess.ID, "qr", "submit", `{"x":1}`)
+	var sysEv *internalEvent
+	for i := range sess.Events {
+		if sess.Events[i].Type == eventkind.System && strings.Contains(sess.Events[i].Message, "【部件操作】") {
+			sysEv = &sess.Events[i]
+		}
+	}
+	if sysEv == nil {
+		t.Fatal("应落【部件操作】System 事件")
+	}
+	if !strings.Contains(sysEv.Message, "qr") || !strings.Contains(sysEv.Message, "submit") {
+		t.Fatalf("事件应带部件 id 与 action: %q", sysEv.Message)
+	}
+
+	// 运行中会话 + messenger 接线：注入邮箱；终态不注入。
+	svc.SetAgentMessenger(&fakeMessenger{})
+	m := &fakeMessenger{}
+	svc.SetAgentMessenger(m)
+	svc.ReportWidgetAction(sess.ID, "qr", "click", `{"ok":true}`)
+	if len(m.contents) != 1 || !strings.Contains(m.contents[0], "【部件操作】") {
+		t.Fatalf("运行中应注入邮箱: %v", m.contents)
+	}
+	sess.Status = enums.SessionStatusCompleted
+	svc.ReportWidgetAction(sess.ID, "qr", "click", "{}")
+	if len(m.contents) != 1 {
+		t.Fatalf("终态会话不应注入邮箱: %v", m.contents)
+	}
+}

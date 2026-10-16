@@ -436,4 +436,13 @@ export interface WidgetInfo {
   enabled: boolean
   updated_at?: string
   files?: string[]
+  /** 创建者归属（Agent 实例/用户），旧清单缺省为空。 */
+  owner?: string
+}
+
+/** 回收站条目（GET /widgets/trash 返回 trash 数组项；目录名形如 <id>.<timestamp>）。 */
+export interface WidgetTrashEntry {
+  name: string
+  id?: string
+  deleted_at?: string
 }

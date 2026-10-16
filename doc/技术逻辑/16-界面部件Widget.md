@@ -14,6 +14,7 @@
 - [16.7 前端渲染 WidgetFrame 与 postMessage 协议](#167-前端渲染-widgetframe-与-postmessage-协议)
 - [16.8 管理页与 API](#168-管理页与-api)
 - [16.9 边界与坑](#169-边界与坑)
+- [16.10 软删回收站·版本快照·owner·action 上行（2026-10 扩展）](#1610-软删回收站版本快照owneraction-上行2026-10-扩展)
 
 ---
 
@@ -66,9 +67,11 @@
 
 `backend/internal/domain/tool/widget_tools.go`（registerDefaults 注册在 ShowArtifact 旁）。**挂载口径（2026-10-14 更新）**：三档顶层统一可用——cluster=meta 走角色授权（`domain/role/registry.go:188` 兜底 + `config/roles.yaml` meta_agent.tools），daily=domain 与 fast=doc_assistant 经 `mountTopLevelEssentials` 内建顶层必备清单预挂（role 列表未动，见 05-工具系统 §5.12）；**子 Agent 默认不给**——与"工具/插件分配权归顶层"一致：
 
-- `widget_save{id, name?, description?, entry?, files:[{path, content}]}` → Manager.Save；成功且 ctx 带 sessionID 时向本会话推 `{"__reload__":true}`——已打开的部件卡收到即热刷新 iframe（改代码无需用户手动刷新）。
+- `widget_save{id, name?, description?, entry?, files:[{path, content}]}` → Manager.Save；成功且 ctx 带 sessionID 时向本会话推 `{"__widget_reload__":true}` 结构化热刷新帧——已打开的部件卡收到即热刷新 iframe（改代码无需用户手动刷新）。**增量模式**：`upsert:[{path,content}] + delete:[path...]`（与 files 互斥）只改列出文件、其余保持，局部修改不必整包重发。
 - `widget_list`：列 id/name/description/enabled/updated_at。
-- 工具 schema 钉死数随两处注册 33→35（registry_test.go 断言同步）。
+- `widget_push_data{widget_id, payload}`：校验部件存在且启用后经 PushWidgetData 推瞬时数据（64KB 截断复用通道逻辑）；会话上下文缺失/部件不存在 → validation_rejected。
+- `widget_delete{id}` / `widget_restore{name?}`：软删进回收站（回执带路径与恢复方式）/ 恢复（不带 name 列回收站条目）。
+- **挂载与授权（2026-10-16 扩展）**：五件套（save/list/push_data/delete/restore）进 topLevelBuiltinTools 三档顶层预挂 + meta 角色授权（registry.go 兜底 + config/roles.yaml）+ **domain 角色天花板**——子 Agent 可经派发级 tools 授权拿到 widget 工具组（此前子 Agent 完全无部件工具，须回告顶层代办）。工具 schema 钉死数 35→38（registry_test.go 断言同步）。
 
 ## 16.7 前端渲染 WidgetFrame 与 postMessage 协议
 
@@ -95,14 +98,31 @@
 | `GET /api/widgets/:id/files/*path` | 部件文件服务：防护完全照搬 workspace_http.go（Clean/IsAbs/`..` 双重校验、nosniff、no-referrer、ServeContent 流式） |
 | `POST /api/widgets/push` | `{session_id, widget_id, payload}` → 204（静默） |
 | `POST /api/widgets/report` | `{session_id, widget_id, error}` → 204（静默） |
+| `POST /api/widgets/action` | `{session_id, widget_id, action, payload}` → 204（静默）：部件内用户交互上行（见 16.10） |
+| `DELETE /api/widgets/:id` | 软删：目录移入 `widgets/.trash/<id>-del-<ts>/`，不存在幂等 `{deleted:false}` |
+| `GET /api/widgets/trash` | 回收站条目列表（del=软删 / snap=覆写前快照） |
+| `POST /api/widgets/trash/:name/restore` | 恢复条目（现存同名部件先入回收站不覆盖丢失） |
 
 ## 16.9 边界与坑
 
 1. **widget_data 是瞬时态**：不落库、不持久化——重启/换会话即无；部件必须能容忍"打开时只有 init 数据"，后续数据等推送。
-2. **`__reload__` 是字符串包含匹配**：payload 文本含该子串即触发整帧重建，业务 payload 里别用这个词。
-3. **push/report 恒 204**：调用方拿不到"会话不存在/部件不存在"信号——bridge 侧别拿 204 当成功投递凭证。
+2. **热刷新信号已结构化**（2026-10-16）：`widget_save` 推 `{"__widget_reload__":true}` JSON 帧（WidgetFrame 按 `type` 识别）；旧子串包含匹配由前端兼容层负责过渡，业务 payload 别用这个词。
+3. **push/report/action 恒 204**：调用方拿不到"会话不存在/部件不存在"信号——bridge 侧别拿 204 当成功投递凭证。
 4. **部件文件服务对停用部件仍可读**（前端只在启用时渲染 iframe；管理页预览可用）——要严格化需在 files handler 加 enabled 校验。
 5. **postMessage targetOrigin 只能是 `'*'`**（沙箱不透明源）：部件只收数据不收密钥，宿主侧不往部件发敏感信息。
 6. **同一张卡多实例/同 id 多卡**：widgetBus 按 widget_id 分发，同 id 的多张卡都会收到同一份数据（当前语义为共享）。
-7. **widget_save/widget_list 挂三档顶层**（2026-10-14：meta 角色授权 + domain/doc_assistant 经 `mountTopLevelEssentials` 预挂，角色列表未动）；子 Agent 仍无此工具，要写部件须回告顶层代办。
-8. **明确不做**：部件间通信、部件主动调后端任意 API、部件版本历史/回滚、FileViewer 全屏层集成。
+7. **widget 工具组挂三档顶层 + 子 Agent 可授权**（2026-10-16：save/list/push_data/delete/restore 五件套，meta 角色授权 + domain 天花板 + `mountTopLevelEssentials` 预挂；子 Agent 经派发级 tools 授权使用）。
+8. **明确不做**：部件间通信、部件主动调后端任意 API、FileViewer 全屏层集成。（版本历史/回滚已由 16.10 快照机制落地。）
+
+## 16.10 软删回收站·版本快照·owner·action 上行（2026-10 扩展）
+
+`backend/internal/widgets/store.go` + `server/widgets_http.go` + `domain/tool/widget_tools.go`（命名约定：回收站条目 `<id>-del-<ts>` / `<id>-snap-<ts>`，目录 `widgets/.trash/`）：
+
+- **软删回收站**：`Manager.Delete(id)` 从物理 RemoveAll 改为把部件目录移入 `widgets/.trash/<id>-del-<ts>/`（`.trash` 隐藏前缀不进 List，Windows rename 不覆盖目录的既有处理保持）；缓存同步失效；不存在幂等（空条目名）。`TrashList()` 列条目 `{name, widget_id, kind:del|snap, deleted_at, files[]}`（只认 `-del-/-snap-` 形态，按时间倒序）；`Restore(name)` 还原——del 条目还原部件、snap 条目即回滚到覆写前版本；恢复时现存同名部件**先入回收站再换名**，不覆盖丢失。
+- **版本快照**：`Save` 覆写已存在部件时旧目录整包快照进 `.trash/<id>-snap-<ts>/`（快照失败降级删除不阻断保存）——误改可回滚，替代"版本历史"诉求。
+- **owner 归属（TODO #18-8 预留）**：`Manifest`/`Info` 加 `owner` 字段（omitempty，留空不透出）；`Registry.SetWidgetOwnerResolver(fn(sessionID))` 由 bootstrap 注入（运行态会话内存暂无 user_id，现返回空串，owner 来源接线后替换 TODO 标记）；`widget_save` 经 ctx sessionID 解析填充，更新未带 owner 保留原值，SetEnabled 原子改写清单时同步透传。
+- **增量保存**：`Manager.SaveIncremental(id, mf, upsert, deletePaths)`；工具 `widget_save` 入参加 `upsert:[{path,content}] + delete:[path...]`（与 files 互斥）——只写列出文件、其余磁盘文件保持原样，局部修改不必整包重发；沿用"先快照再整目录替换"原子写骨架；entry 校验同款（删入口必须给新 entry）；保留 enabled/owner。
+- **action 上行**：`POST /api/widgets/action {session_id, widget_id, action, payload}` → `ReactService.ReportWidgetAction`（仿 ReportWidgetError）：落"【部件操作】"System 会话事件 + 运行中会话邮箱注入（Agent 可感知卡片内交互）；会话不在内存静默 204，缺字段 400，未接线 501。
+- **文件服务 CSP 加固**：全部部件文件响应带 `Content-Security-Policy: default-src 'self' 'unsafe-inline' data: blob:`；html/htm/svg 活动文档（可被顶层导航直接打开）叠加 `; sandbox allow-scripts`（禁表单提交/顶层导航/弹窗），与既有 nosniff/no-referrer 叠加生效。
+- **子 Agent 授权**：五件套（save/list/push_data/delete/restore）进 meta 角色授权、domain 角色天花板（registry.go）与 topLevelBuiltinTools，子 Agent 可经派发级 tools 授权使用（见 16.6）。
+

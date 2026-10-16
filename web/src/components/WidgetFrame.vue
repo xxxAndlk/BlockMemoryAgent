@@ -8,11 +8,13 @@
 // postMessage 协议（message 事件校验 e.source === iframe.contentWindow）：
 //   宿主→部件：{type:'init', payload}（iframe load 或收到 ready 后发，payload=初始 data，
 //               JSON.parse 失败给原文）；{type:'data', payload}（widgetBus 该 id 有更新时发）。
-//   部件→宿主：{type:'ready'} / {type:'error', message} / {type:'resize', height}。
-// payload 文本含 "__reload__"（widget_save 成功后后端推送）→ 重建 iframe 热刷新。
+//   部件→宿主：{type:'ready'} / {type:'error', message} / {type:'resize', height} /
+//              {type:'action', action, payload}（部件主动上行动作，宿主调 sendWidgetAction
+//              上报后端：落 System 会话事件 + 运行中会话注入 Agent 邮箱；失败静默）。
+// 热刷新：payload JSON 解析后 __widget_reload__===true（结构化帧）或文本含 "__reload__"（旧协议兜底）→ 重建 iframe。
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { WidgetInfo } from '@/types'
-import { getWidget, reportWidgetError } from '@/api/widgets'
+import { getWidget, reportWidgetError, sendWidgetAction } from '@/api/widgets'
 import { useWidgetData } from '@/utils/widgetBus'
 import { APP_CONFIG } from '@/config/app'
 
@@ -31,6 +33,8 @@ const unavailable = ref<'' | 'missing' | 'disabled'>('')
 const errorMsg = ref('')
 /** 已回报过后端的最后一条错误：同一条错误不重复 report（防刷屏） */
 const lastReported = ref('')
+/** 已上报过后端的最后一条 action（action+payload 序列化拼接）：同动作不重复上报（防连点刷屏） */
+const lastAction = ref('')
 const frameHeight = ref(420)
 /** 刷新键：__reload__ 或手动刷新时置 Date.now()，src 变化即重建 iframe */
 const reloadKey = ref(0)
@@ -79,7 +83,16 @@ function rebuild() {
 
 watch(busData, (payload) => {
   if (!payload) return
-  // widget_save 成功后后端推 {"__reload__":true}：代码已更新，整帧重建而不是发数据
+  // 热刷新判定：结构化帧 {"__widget_reload__":true} 优先；旧协议 payload 文本含 "__reload__" 兜底。
+  // widget_save 成功后后端推送，命中即整帧重建（而不是把内容发给部件）。
+  try {
+    if ((JSON.parse(payload) as { __widget_reload__?: unknown }).__widget_reload__ === true) {
+      rebuild()
+      return
+    }
+  } catch {
+    // 非 JSON 文本走子串兜底
+  }
   if (payload.includes('__reload__')) {
     rebuild()
     return
@@ -90,7 +103,7 @@ watch(busData, (payload) => {
 function onMessage(e: MessageEvent) {
   // 只收本卡 iframe 的消息（同页可能有多张部件卡；沙箱源为 null 无法按 origin 过滤）
   if (!iframeEl.value || e.source !== iframeEl.value.contentWindow) return
-  const d = e.data as { type?: string; message?: string; height?: number }
+  const d = e.data as { type?: string; message?: string; height?: number; action?: unknown; payload?: unknown }
   if (!d || typeof d !== 'object') return
   if (d.type === 'ready') {
     sendInit()
@@ -105,6 +118,21 @@ function onMessage(e: MessageEvent) {
   } else if (d.type === 'resize') {
     const h = Number(d.height)
     if (Number.isFinite(h)) frameHeight.value = Math.min(Math.max(Math.round(h), 120), 2000)
+  } else if (d.type === 'action') {
+    // 部件上行动作：上报后端（System 事件 + Agent 邮箱）；失败静默同 report，同 action+payload 去重防连点
+    const action = typeof d.action === 'string' ? d.action : ''
+    if (!action) return
+    let payloadKey: string
+    try {
+      payloadKey = JSON.stringify(d.payload ?? null)
+    } catch {
+      payloadKey = String(d.payload)
+    }
+    const key = `${action}\u0000${payloadKey}`
+    if (props.sessionId && key !== lastAction.value) {
+      lastAction.value = key
+      sendWidgetAction(props.sessionId, props.widgetId, action, d.payload).catch(() => {})
+    }
   }
 }
 

@@ -20,6 +20,7 @@ import (
 	"path/filepath" // 路径拼接
 	"regexp"        // id 合法性校验
 	"sort"          // 列表稳定排序
+	"strconv"       // 回收站条目名时间戳解析
 	"strings"       // 路径越界判定
 	"sync"          // 缓存互斥锁
 	"time"          // mtime 基线与 updated_at
@@ -51,6 +52,7 @@ type Manifest struct {
 	Description string `json:"description,omitempty"` // 一句话说明
 	Entry       string `json:"entry"`                 // 渲染入口文件（相对部件目录，缺省 index.html）
 	Enabled     bool   `json:"enabled"`               // 启停开关（文件即唯一事实源，可手改热生效）
+	Owner       string `json:"owner,omitempty"`       // 归属用户（TODO #18-8 多租户预留；未接线留空）
 }
 
 // Info 是部件对外视图（HTTP API 与 widget_list 工具的线型）。
@@ -61,8 +63,9 @@ type Info struct {
 	Description string    `json:"description"`
 	Entry       string    `json:"entry"`
 	Enabled     bool      `json:"enabled"`
-	UpdatedAt   time.Time `json:"updated_at"` // 取 widget.json 的 mtime（保存/手改的时间戳）
-	Files       []string  `json:"files"`      // 部件文件相对路径列表（正斜杠，不含 widget.json）
+	Owner       string    `json:"owner,omitempty"` // 归属用户（TODO #18-8 多租户预留；未接线留空）
+	UpdatedAt   time.Time `json:"updated_at"`      // 取 widget.json 的 mtime（保存/手改的时间戳）
+	Files       []string  `json:"files"`           // 部件文件相对路径列表（正斜杠，不含 widget.json）
 }
 
 // FileInput 是 Save 的单个待写文件。
@@ -202,6 +205,7 @@ func (m *Manager) refreshLocked(id string) *fileEntry {
 		Description: mf.Description,
 		Entry:       mf.Entry,
 		Enabled:     mf.Enabled,
+		Owner:       mf.Owner,
 		UpdatedAt:   fi.ModTime(),
 		Files:       m.listFilesLocked(id),
 	}
@@ -363,11 +367,21 @@ func (m *Manager) Save(id string, mf Manifest, files []FileInput) (*Info, error)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.saveLocked(id, mf, entry, files)
+}
+
+// saveLocked 是 Save/SaveIncremental 共用的写侧（调用方持锁）：更新场景保留原
+// enabled/version/owner（保存语义是"改代码/改描述"，不是"改开关/改归属"），
+// 写临时目录 → 旧目录快照进回收站 → rename 原子替换（Windows rename 不覆盖目录，走备份换名）。
+func (m *Manager) saveLocked(id string, mf Manifest, entry string, files []FileInput) (*Info, error) {
 	// 更新场景保留原 enabled/version：保存语义是"改代码/改描述"，不是"改开关"。
 	if e := m.refreshLocked(id); e.info != nil {
 		mf.Enabled = e.info.Enabled
 		if mf.Version == "" {
 			mf.Version = e.info.Version
+		}
+		if mf.Owner == "" {
+			mf.Owner = e.info.Owner
 		}
 	}
 	mf.Entry = entry
@@ -422,7 +436,12 @@ func (m *Manager) Save(id string, mf Manifest, files []FileInput) (*Info, error)
 		return nil, fmt.Errorf("replace widget dir: %w", err)
 	}
 	if backup != "" {
-		_ = os.RemoveAll(backup)
+		// 覆写快照：旧目录整包移入回收站（<id>-snap-<ts>），可经 Restore 回滚；
+		// 快照失败不阻断保存（降级删除，保持原行为）。
+		if err := m.moveToTrashPath(backup, trashName(id, "snap")); err != nil {
+			m.logWarnf("[widgets] snapshot old widget failed: %s: %v", id, err)
+			_ = os.RemoveAll(backup)
+		}
 	}
 	// 清缓存强制下一次读重建基线（新清单 mtime/size 必变，此处防御性兜底）
 	delete(m.entries, id)
@@ -441,13 +460,14 @@ func (m *Manager) SetEnabled(id string, enabled bool) (*Info, error) {
 	if e.info == nil {
 		return nil, fmt.Errorf("部件不存在: %s", id)
 	}
-	mf := Manifest{
-		Name:        e.info.Name,
-		Version:     e.info.Version,
-		Description: e.info.Description,
-		Entry:       e.info.Entry,
-		Enabled:     enabled,
-	}
+		mf := Manifest{
+			Name:        e.info.Name,
+			Version:     e.info.Version,
+			Description: e.info.Description,
+			Entry:       e.info.Entry,
+			Enabled:     enabled,
+			Owner:       e.info.Owner, // owner 归属随清单保留（TODO #18-8）
+		}
 	if mf.Name == id {
 		mf.Name = "" // 缺省回落 id 的不落盘，保持清单干净
 	}
@@ -485,17 +505,251 @@ func (m *Manager) SetEnabled(id string, enabled bool) (*Info, error) {
 	return e.info, nil
 }
 
-// Delete 删除整个部件目录（仅 HTTP 管理面用，工具不开放删除）。
-// 不存在不视为错误（幂等）。
-func (m *Manager) Delete(id string) error {
-	if err := ValidateID(id); err != nil {
+// trashDirName 是回收站目录名（. 前缀，List 与文件服务已按隐藏目录跳过）。
+const trashDirName = ".trash"
+
+// TrashInfo 是回收站条目的对外视图（GET /api/widgets/trash）。
+type TrashInfo struct {
+	Name      string    `json:"name"`       // 条目名（<id>-del-<ts> / <id>-snap-<ts>）
+	WidgetID  string    `json:"widget_id"`  // 原部件 id
+	Kind      string    `json:"kind"`       // del=软删 snap=覆写前自动快照
+	DeletedAt time.Time `json:"deleted_at"` // 移入时间（条目名时间戳还原）
+	Files     []string  `json:"files"`      // 条目内文件相对路径列表
+}
+
+// trashName 生成回收站条目名：UnixNano 保证同秒多次操作不撞名。
+func trashName(id, kind string) string {
+	return fmt.Sprintf("%s-%s-%d", id, kind, time.Now().UnixNano())
+}
+
+// trashEntryOf 从条目名解析 (widgetID, kind)；不匹配返回 ok=false。
+func trashEntryOf(name string) (string, string, bool) {
+	for _, kind := range []string{"del", "snap"} {
+		sep := "-" + kind + "-"
+		if i := strings.LastIndex(name, sep); i > 0 {
+			return name[:i], kind, true
+		}
+	}
+	return "", "", false
+}
+
+// trashDir 返回回收站目录路径。
+func (m *Manager) trashDir() string { return filepath.Join(m.dir, trashDirName) }
+
+// moveToTrashPath 把 src 目录/文件移入回收站并按 name 命名（调用方持锁）。
+func (m *Manager) moveToTrashPath(src, name string) error {
+	if err := os.MkdirAll(m.trashDir(), 0o755); err != nil {
 		return err
+	}
+	return os.Rename(src, filepath.Join(m.trashDir(), name))
+}
+
+// Delete 软删整个部件目录：移入 widgets/.trash/<id>-del-<ts>/（不物理删，可恢复），
+// 缓存失效。不存在时幂等返回空条目名。返回回收站条目名（供回执/端点透出）。
+func (m *Manager) Delete(id string) (string, error) {
+	if err := ValidateID(id); err != nil {
+		return "", err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := os.RemoveAll(m.dirOf(id)); err != nil {
-		return fmt.Errorf("remove widget dir %s: %w", id, err)
+	if _, err := os.Stat(m.dirOf(id)); err != nil {
+		if os.IsNotExist(err) {
+			delete(m.entries, id)
+			return "", nil // 幂等：已不存在
+		}
+		return "", fmt.Errorf("stat widget dir %s: %w", id, err)
+	}
+	name := trashName(id, "del")
+	if err := m.moveToTrashPath(m.dirOf(id), name); err != nil {
+		return "", fmt.Errorf("move widget dir %s to trash: %w", id, err)
 	}
 	delete(m.entries, id)
-	return nil
+	return name, nil
+}
+
+// TrashList 列出回收站条目（<id>-del/snap-<ts> 形态的目录），按移入时间倒序。
+func (m *Manager) TrashList() []TrashInfo {
+	dirEntries, err := os.ReadDir(m.trashDir())
+	if err != nil {
+		return []TrashInfo{}
+	}
+	out := make([]TrashInfo, 0, len(dirEntries))
+	for _, de := range dirEntries {
+		if !de.IsDir() {
+			continue
+		}
+		id, kind, ok := trashEntryOf(de.Name())
+		if !ok || ValidateID(id) != nil {
+			continue // 异形条目（人工放的杂物）不参与管理
+		}
+		sep := "-" + kind + "-"
+		i := strings.LastIndex(de.Name(), sep)
+		ts, err := strconv.ParseInt(de.Name()[i+len(sep):], 10, 64)
+		if err != nil {
+			continue
+		}
+		out = append(out, TrashInfo{
+			Name:      de.Name(),
+			WidgetID:  id,
+			Kind:      kind,
+			DeletedAt: time.Unix(0, ts),
+			Files:     listPackageFiles(filepath.Join(m.trashDir(), de.Name())),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DeletedAt.After(out[j].DeletedAt) })
+	return out
+}
+
+// listPackageFiles 扫部件目录收集文件相对路径（不含清单与隐藏临时文件；同
+// listFilesLocked 的无锁纯路径版，供回收站条目复用）。
+func listPackageFiles(root string) []string {
+	var files []string
+	_ = filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
+		if err != nil || fi.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == manifestFile || strings.HasPrefix(filepath.Base(rel), ".") {
+			return nil
+		}
+		files = append(files, rel)
+		return nil
+	})
+	sort.Strings(files)
+	return files
+}
+
+// Restore 从回收站恢复条目（按条目名，del/snap 皆可——snap 恢复即回滚到覆写前版本）：
+// 目标 id 已存在时先把现存目录移入回收站（不覆盖丢失），再 rename 回 widgets/<id>/。
+func (m *Manager) Restore(entry string) (*Info, error) {
+	id, _, ok := trashEntryOf(entry)
+	if !ok || ValidateID(id) != nil || strings.ContainsAny(entry, "/\\") || strings.Contains(entry, "..") {
+		return nil, fmt.Errorf("回收站条目名非法 %q（须为 .trash/ 下的 <id>-del/snap-<ts> 目录名）", entry)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	src := filepath.Join(m.trashDir(), entry)
+	if _, err := os.Stat(src); err != nil {
+		return nil, fmt.Errorf("回收站条目不存在: %s", entry)
+	}
+	if _, err := os.Stat(m.dirOf(id)); err == nil {
+		// 现存同名部件先挪进回收站，避免恢复覆盖丢数据（Windows rename 不覆盖目录）
+		if err := m.moveToTrashPath(m.dirOf(id), trashName(id, "del")); err != nil {
+			return nil, fmt.Errorf("move existing widget %s to trash: %w", id, err)
+		}
+	}
+	if err := os.Rename(src, m.dirOf(id)); err != nil {
+		return nil, fmt.Errorf("restore widget dir %s: %w", id, err)
+	}
+	delete(m.entries, id)
+	e := m.refreshLocked(id)
+	return e.info, nil
+}
+
+// SaveIncremental 增量更新已有部件包（widget_save upsert/delete 模式的写侧）：
+// upsert 覆盖/新增文件、delPaths 删除文件，其余文件保持原样——局部改不丢其余文件。
+// 清单字段语义同 Save（保留原 enabled/version/owner；entry 缺省沿用现有清单）。
+func (m *Manager) SaveIncremental(id string, mf Manifest, upsert []FileInput, delPaths []string) (*Info, error) {
+	if err := ValidateID(id); err != nil {
+		return nil, err
+	}
+	if len(upsert) == 0 && len(delPaths) == 0 {
+		return nil, fmt.Errorf("upsert 与 delete 至少一项")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.refreshLocked(id)
+	if e.info == nil {
+		return nil, fmt.Errorf("部件不存在: %s（增量保存仅支持已有部件，新建用全量 files 模式）", id)
+	}
+	root := m.dirOf(id)
+	content := make(map[string]string)
+	var walkErr error
+	_ = filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			walkErr = err
+			return err
+		}
+		if fi.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == manifestFile || strings.HasPrefix(filepath.Base(rel), ".") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			walkErr = err
+			return err
+		}
+		content[rel] = string(data)
+		return nil
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("read existing widget files: %w", walkErr)
+	}
+	// 删除项：不存在视为参数错误（增量模式要求精确指认，防拼错路径静默无效果）。
+	for _, p := range delPaths {
+		rel, err := validateRelPath(p)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := content[rel]; !ok {
+			return nil, fmt.Errorf("待删除文件不存在 %q", rel)
+		}
+		delete(content, rel)
+	}
+	// upsert：路径清洗 + 清单冲突 + 大小预算（同批次重复路径后者覆盖前者）。
+	total := 0
+	for _, v := range content {
+		total += len(v)
+	}
+	for i := range upsert {
+		rel, err := validateRelPath(upsert[i].Path)
+		if err != nil {
+			return nil, err
+		}
+		if rel == manifestFile {
+			return nil, fmt.Errorf("文件路径 %q 与清单文件名冲突", manifestFile)
+		}
+		total -= len(content[rel])
+		content[rel] = upsert[i].Content
+		total += len(upsert[i].Content)
+	}
+	if len(content) > maxWidgetFiles {
+		return nil, fmt.Errorf("文件数 %d 超过上限 %d", len(content), maxWidgetFiles)
+	}
+	if total > maxWidgetTotalBytes {
+		return nil, fmt.Errorf("总大小 %d 字节超过上限 %d", total, maxWidgetTotalBytes)
+	}
+	entry := mf.Entry
+	if entry == "" {
+		entry = e.info.Entry
+	}
+	cleanEntry, err := validateRelPath(entry)
+	if err != nil {
+		return nil, fmt.Errorf("entry 非法: %v", err)
+	}
+	if _, ok := content[cleanEntry]; !ok {
+		return nil, fmt.Errorf("entry %q 不在文件列表中", entry)
+	}
+	entry = cleanEntry
+	keys := make([]string, 0, len(content))
+	for k := range content {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	files := make([]FileInput, 0, len(keys))
+	for _, k := range keys {
+		files = append(files, FileInput{Path: k, Content: content[k]})
+	}
+	return m.saveLocked(id, mf, entry, files)
 }

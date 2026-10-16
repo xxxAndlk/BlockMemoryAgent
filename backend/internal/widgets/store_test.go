@@ -178,12 +178,16 @@ func TestManager_SavePreservesEnabledAndFilesOnDisk(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(m.Dir(), "wechat-qr", "app.js")); !os.IsNotExist(err) {
 		t.Fatal("整目录替换后旧文件应不存在")
 	}
-	// 临时/备份目录无残留。
+	// 临时/备份目录无残留（.trash 回收站是设计内常驻目录，不算残留；其下应有本次覆写快照）。
 	entries, _ := os.ReadDir(m.Dir())
 	for _, de := range entries {
-		if strings.HasPrefix(de.Name(), ".") {
+		if strings.HasPrefix(de.Name(), ".") && de.Name() != ".trash" {
 			t.Fatalf("原子写残留临时目录: %s", de.Name())
 		}
+	}
+	snapEntries, _ := os.ReadDir(filepath.Join(m.Dir(), ".trash"))
+	if len(snapEntries) != 1 || !strings.HasPrefix(snapEntries[0].Name(), "wechat-qr-snap-") {
+		t.Fatalf("覆写前旧目录应快照进 .trash/<id>-snap-<ts>: %v", snapEntries)
 	}
 }
 
@@ -220,7 +224,7 @@ func TestManager_Delete(t *testing.T) {
 	m := newTestManager(t)
 	writeManifest(t, m, "card", `{"entry":"index.html","enabled":true}`, map[string]string{"index.html": "a"})
 
-	if err := m.Delete("card"); err != nil {
+	if _, err := m.Delete("card"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if _, ok := m.Get("card"); ok {
@@ -230,10 +234,170 @@ func TestManager_Delete(t *testing.T) {
 		t.Fatal("删除后目录应不存在")
 	}
 	// 幂等：再删一次不报错；非法 id 报错。
-	if err := m.Delete("card"); err != nil {
+	if _, err := m.Delete("card"); err != nil {
 		t.Fatal("重复删除应幂等")
 	}
-	if err := m.Delete("../x"); err == nil {
+	if _, err := m.Delete("../x"); err == nil {
 		t.Fatal("非法 id 应拒绝")
+	}
+}
+
+// TestManager_SoftDeleteTrashAndRestore 钉死软删回收站契约：Delete 把部件目录移入
+// .trash/<id>-del-<ts>/（不物理删）、缓存失效、TrashList 可见（del 类型）、Restore 还原
+// 到 widgets/<id>/ 且条目消失；恢复时现存同名部件先入回收站不覆盖丢失。
+func TestManager_SoftDeleteTrashAndRestore(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.Save("card", Manifest{Name: "卡片", Entry: "index.html"},
+		[]FileInput{{Path: "index.html", Content: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := m.Delete("card")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if entry == "" || !strings.HasPrefix(entry, "card-del-") {
+		t.Fatalf("应返回 card-del-* 条目名: %q", entry)
+	}
+	if _, ok := m.Get("card"); ok {
+		t.Fatal("软删后缓存应失效")
+	}
+	if _, err := os.Stat(filepath.Join(m.Dir(), ".trash", entry)); err != nil {
+		t.Fatalf("回收站目录应存在: %v", err)
+	}
+	// 恢复路径不存在：报错。
+	if _, err := m.Restore("card-del-9999999999"); err == nil {
+		t.Fatal("恢复不存在的条目应报错")
+	}
+	// 条目名非法：报错。
+	if _, err := m.Restore("../evil"); err == nil {
+		t.Fatal("非法条目名应拒绝")
+	}
+
+	// 重建同名部件后恢复：现存版本先入回收站。
+	if _, err := m.Save("card", Manifest{Name: "卡片", Entry: "index.html"},
+		[]FileInput{{Path: "index.html", Content: "v2"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Restore(entry); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	info, ok := m.Get("card")
+	if !ok || info.Entry != "index.html" {
+		t.Fatalf("恢复后应可见: %+v ok=%v", info, ok)
+	}
+	data, _ := os.ReadFile(filepath.Join(m.Dir(), "card", "index.html"))
+	if string(data) != "v1" {
+		t.Fatalf("恢复应是旧版本内容: %q", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(m.Dir(), ".trash", entry)); !os.IsNotExist(err) {
+		t.Fatal("恢复后条目应消失")
+	}
+	// 现存 v2 已被挪进回收站。
+	if len(m.TrashList()) != 1 {
+		t.Fatalf("现存版本应入回收站: %+v", m.TrashList())
+	}
+}
+
+// TestManager_TrashListAndSnapshot 钉死回收站列表与覆写快照：TrashList 只认
+// <id>-del/snap-<ts> 形态目录并按时间倒序；Save 覆写把旧目录快照进
+// .trash/<id>-snap-<ts>/（可经 Restore 回滚到旧版本），异形目录不进列表。
+func TestManager_TrashListAndSnapshot(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.Save("card", Manifest{Name: "c", Entry: "index.html"},
+		[]FileInput{{Path: "index.html", Content: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	// 异形目录（人工放的杂物）不进列表。
+	_ = os.MkdirAll(filepath.Join(m.Dir(), trashDirName, "junk-dir"), 0o755)
+	// 覆写 → 快照。
+	if _, err := m.Save("card", Manifest{Name: "c", Entry: "index.html"},
+		[]FileInput{{Path: "index.html", Content: "v2"}}); err != nil {
+		t.Fatal(err)
+	}
+	list := m.TrashList()
+	if len(list) != 1 || list[0].WidgetID != "card" || list[0].Kind != "snap" ||
+		!strings.HasPrefix(list[0].Name, "card-snap-") || len(list[0].Files) != 1 {
+		t.Fatalf("TrashList 应含 card-snap-* 快照: %+v", list)
+	}
+	if list[0].DeletedAt.IsZero() {
+		t.Fatal("deleted_at 应有时间戳")
+	}
+	// 回滚到快照版本。
+	if _, err := m.Restore(list[0].Name); err != nil {
+		t.Fatalf("Restore snap: %v", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(m.Dir(), "card", "index.html"))
+	if string(data) != "v1" {
+		t.Fatalf("快照恢复应回到 v1: %q", string(data))
+	}
+}
+
+// TestManager_SaveIncremental 钉死增量保存契约：upsert 只改列出文件（其余保持）、
+// delete 删列出的文件（不存在报错）、保留 enabled/owner、与 files 语义同款校验
+//（超清单/超大/entry 缺失）、新部件不允许增量。
+func TestManager_SaveIncremental(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.Save("card", Manifest{Name: "c", Entry: "index.html", Owner: "u1"},
+		[]FileInput{{Path: "index.html", Content: "v1"}, {Path: "app.js", Content: "js1"}, {Path: "lib/util.js", Content: "u"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SetEnabled("card", true); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := m.SaveIncremental("card", Manifest{Name: "c2"},
+		[]FileInput{{Path: "app.js", Content: "js2"}, {Path: "extra.css", Content: "x"}}, []string{"lib/util.js"})
+	if err != nil {
+		t.Fatalf("SaveIncremental: %v", err)
+	}
+	// enabled/owner 保留；name/entry 沿用原清单；文件三存一改一增一删。
+	if !info.Enabled || info.Owner != "u1" || info.Name != "c2" || info.Entry != "index.html" {
+		t.Fatalf("清单保留语义不符: %+v", info)
+	}
+	got := map[string]bool{}
+	for _, f := range info.Files {
+		got[f] = true
+	}
+	if !got["index.html"] || !got["app.js"] || !got["extra.css"] || got["lib/util.js"] {
+		t.Fatalf("文件集合不符: %v", info.Files)
+	}
+	if data, _ := os.ReadFile(filepath.Join(m.Dir(), "card", "index.html")); string(data) != "v1" {
+		t.Fatalf("未列出的文件应保持原样: %q", string(data))
+	}
+	// 覆盖前快照进回收站。
+	if len(m.TrashList()) != 1 {
+		t.Fatalf("增量覆写应先快照: %+v", m.TrashList())
+	}
+
+	// 不存在的删除路径报错；未知部件报错；空参数报错。
+	if _, err := m.SaveIncremental("card", Manifest{}, nil, []string{"nope.js"}); err == nil {
+		t.Fatal("删除不存在文件应报错")
+	}
+	if _, err := m.SaveIncremental("ghost", Manifest{}, []FileInput{{Path: "a", Content: "b"}}, nil); err == nil {
+		t.Fatal("未知部件增量应报错")
+	}
+	if _, err := m.SaveIncremental("card", Manifest{}, nil, nil); err == nil {
+		t.Fatal("空 upsert/delete 应报错")
+	}
+}
+
+// TestManager_OwnerPropagation 钉死 owner 归属：Save 带.owner 落盘并在 Info/JSON 透出；
+// 更新未带 owner 时保留原值；未接线留空。
+func TestManager_OwnerPropagation(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.Save("card", Manifest{Name: "c", Entry: "index.html", Owner: "user-9"},
+		[]FileInput{{Path: "index.html", Content: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	info, _ := m.Get("card")
+	if info.Owner != "user-9" {
+		t.Fatalf("Info 应透出 owner: %+v", info)
+	}
+	if _, err := m.Save("card", Manifest{Name: "c", Entry: "index.html"},
+		[]FileInput{{Path: "index.html", Content: "y"}}); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ = m.Get("card"); info.Owner != "user-9" {
+		t.Fatalf("更新应保留原 owner: %+v", info)
 	}
 }

@@ -459,7 +459,7 @@ func normalizePluginIDs(ids []string) []string {
 // 子 Agent 独立 scope 不预挂、角色列表（roles.yaml / role/registry.go）一律不动，
 // 维持"子 Agent 要写部件回告顶层代办"的既定语义。widget 管理器未接线时工具自身
 // 返回未接线错误（同 plugin_* 模式），不影响其他工具。
-var topLevelBuiltinTools = []string{"widget_save", "widget_list"}
+var topLevelBuiltinTools = []string{"widget_save", "widget_list", "widget_push_data", "widget_delete", "widget_restore"}
 
 // mountTopLevelEssentials 把顶层必备工具（内建 topLevelBuiltinTools + 配置声明的
 // 顶层必备插件工具 web_search 等）预挂到会话顶层 scope：三档全挂（2026-09-18 修复：
@@ -988,6 +988,31 @@ func (s *ReactService) ReportWidgetError(sessionID, widgetID, errText string) {
 		if s.messenger != nil {
 			if err := s.messenger.InjectUserMessage(sess.ID, msg); err != nil {
 				log.Printf("[widgets] inject widget error to mailbox failed: session=%s widget=%s err=%v", sessionID, widgetID, err)
+			}
+		}
+	}
+}
+
+// ReportWidgetAction 部件上行 action 回报（POST /api/widgets/action）：部件卡片内的
+// 用户交互（按钮点击/表单提交）经 postMessage {type:'action',...} 上报后落到这里。
+// 与 ReportWidgetError 同款通道：落一条 System 会话事件（"【部件操作】"，用户可见）；
+// 会话仍在运行时额外向 MetaAgent 邮箱注入，让 Agent 感知部件交互并可继续编排
+//（messenger 未接线的精简装配降级为只落 System 事件）。会话不在内存时静默跳过
+//（HTTP 侧表现为 204）。
+func (s *ReactService) ReportWidgetAction(sessionID, widgetID, action, payload string) {
+	sess := s.store.getSession(sessionID)
+	if sess == nil {
+		return
+	}
+	msg := fmt.Sprintf("【部件操作】%s：%s %s", widgetID, action, truncateRunes(payload, 500))
+	s.store.addEvent(sess, eventkind.System, "System", msg, "", "", "", "", "", true)
+	// 仅"还活着、会自己继续跑"的状态注入邮箱——终态会话注入无人消费，
+	// 恢复运行时也不会回溯邮箱里的 FYI。
+	switch sess.Status {
+	case enums.SessionStatusRunning, enums.SessionStatusAwaitingChild, enums.SessionStatusPausedOnChild:
+		if s.messenger != nil {
+			if err := s.messenger.InjectUserMessage(sess.ID, msg); err != nil {
+				log.Printf("[widgets] inject widget action to mailbox failed: session=%s widget=%s err=%v", sessionID, widgetID, err)
 			}
 		}
 	}

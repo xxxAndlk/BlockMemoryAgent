@@ -26,6 +26,7 @@ type widgetTestAgent struct {
 	*mockAgentForServer
 	pushes  []string
 	reports []string
+	actions []string
 }
 
 func (w *widgetTestAgent) PushWidgetData(sessionID, widgetID, payload string) {
@@ -34,6 +35,10 @@ func (w *widgetTestAgent) PushWidgetData(sessionID, widgetID, payload string) {
 
 func (w *widgetTestAgent) ReportWidgetError(sessionID, widgetID, errText string) {
 	w.reports = append(w.reports, sessionID+"|"+widgetID+"|"+errText)
+}
+
+func (w *widgetTestAgent) ReportWidgetAction(sessionID, widgetID, action, payload string) {
+	w.actions = append(w.actions, sessionID+"|"+widgetID+"|"+action+"|"+payload)
 }
 
 // newWidgetTestRouter 构造挂部件路由的测试路由器（与生产路由形态一致）。
@@ -49,6 +54,10 @@ func newWidgetTestRouter(h *APIHandler) *gin.Engine {
 	r.GET("/api/widgets/:id/files/*path", h.HandleWidgetFile)
 	r.POST("/api/widgets/push", h.PushWidgetHandler)
 	r.POST("/api/widgets/report", h.ReportWidgetHandler)
+	r.POST("/api/widgets/action", h.WidgetActionHandler)
+	r.DELETE("/api/widgets/:id", h.DeleteWidgetHandler)
+	r.GET("/api/widgets/trash", h.ListWidgetTrashHandler)
+	r.POST("/api/widgets/trash/:name/restore", h.RestoreWidgetTrashHandler)
 	return r
 }
 
@@ -231,4 +240,112 @@ func TestWidgetAPI_FileServing(t *testing.T) {
 	if rec := doWidgetJSON(t, r, http.MethodGet, "/api/widgets/card/files/nope.js", ""); rec.Code != http.StatusNotFound {
 		t.Fatalf("缺失文件应 404, got %d", rec.Code)
 	}
+}
+
+// TestWidgetAPI_DeleteTrashRestore 钉死软删/回收站端点：DELETE 移入回收站（幂等）、
+// trash 列表、restore 还原可见。
+func TestWidgetAPI_DeleteTrashRestore(t *testing.T) {
+	r, mgr, _ := newWidgetTestEnv(t)
+	if _, err := mgr.Save("card", widgets.Manifest{Name: "c", Entry: "index.html"},
+		[]widgets.FileInput{{Path: "index.html", Content: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 软删。
+	rec := doWidgetJSON(t, r, http.MethodDelete, "/api/widgets/card", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var del struct {
+		Deleted bool   `json:"deleted"`
+		Trash   string `json:"trash_name"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &del)
+	if !del.Deleted || del.Trash == "" {
+		t.Fatalf("应带 deleted 与 trash_name: %+v", del)
+	}
+	if _, ok := mgr.Get("card"); ok {
+		t.Fatal("软删后 Get 应未命中")
+	}
+	// 幂等删除。
+	if rec := doWidgetJSON(t, r, http.MethodDelete, "/api/widgets/card", ""); rec.Code != http.StatusOK {
+		t.Fatalf("重复删除应 200, got %d", rec.Code)
+	}
+
+	// 回收站列表。
+	rec = doWidgetJSON(t, r, http.MethodGet, "/api/widgets/trash", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trash list: %d", rec.Code)
+	}
+	var trash struct {
+		Trash []widgets.TrashInfo `json:"trash"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &trash); err != nil || len(trash.Trash) != 1 {
+		t.Fatalf("trash 应有 1 条: %s err=%v", rec.Body.String(), err)
+	}
+	// 恢复。
+	rec = doWidgetJSON(t, r, http.MethodPost, "/api/widgets/trash/"+trash.Trash[0].Name+"/restore", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("restore: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, ok := mgr.Get("card"); !ok {
+		t.Fatal("恢复后应可见")
+	}
+	// 恢复不存在的条目 → 400。
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/trash/card-del-1/restore", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("恢复不存在条目应 400, got %d", rec.Code)
+	}
+}
+
+// TestWidgetAPI_ActionReporter 钉死 action 上行端点：转发 ReportWidgetAction；
+// 缺字段 400；未接线 501。
+func TestWidgetAPI_ActionReporter(t *testing.T) {
+	r, _, facade := newWidgetTestEnv(t)
+
+	rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/action",
+		`{"session_id":"s1","widget_id":"qr","action":"submit","payload":"{\"x\":1}"}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("action 应 204, got %d", rec.Code)
+	}
+	if len(facade.actions) != 1 || facade.actions[0] != `s1|qr|submit|{"x":1}` {
+		t.Fatalf("应转发 ReportWidgetAction: %v", facade.actions)
+	}
+
+	// 缺字段 400。
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/action", `{"session_id":"s1"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("缺字段应 400, got %d", rec.Code)
+	}
+
+	// 未接线（无 ReportWidgetAction 能力的门面）→ 501。
+	h2 := NewAPIHandler(nil)
+	h2.SetSessionManager(NewSessionManager(newMockAgentForServer()))
+	r2 := newWidgetTestRouter(h2)
+	if rec := doWidgetJSON(t, r2, http.MethodPost, "/api/widgets/action", `{"session_id":"s1","widget_id":"w","action":"a"}`); rec.Code != http.StatusNotImplemented {
+		t.Fatalf("未接线应 501, got %d", rec.Code)
+	}
+}
+
+// TestWidgetAPI_FileCSP 钉死文件服务 CSP 加固：默认 CSP 全部响应携带；html/svg
+// 活动文档叠加 sandbox 指令。
+func TestWidgetAPI_FileCSP(t *testing.T) {
+	r, mgr, _ := newWidgetTestEnv(t)
+	if _, err := mgr.Save("card", widgets.Manifest{},
+		[]widgets.FileInput{{Path: "index.html", Content: "<h1>hi</h1>"}, {Path: "pic.svg", Content: "<svg/>"}, {Path: "app.js", Content: "//x"}}); err != nil {
+		t.Fatal(err)
+	}
+	const base = "default-src 'self' 'unsafe-inline' data: blob:"
+
+	check := func(path, want string) {
+		t.Helper()
+		rec := doWidgetJSON(t, r, http.MethodGet, path, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status=%d", path, rec.Code)
+		}
+		if got := rec.Header().Get("Content-Security-Policy"); got != want {
+			t.Fatalf("%s CSP=%q want=%q", path, got, want)
+		}
+	}
+	check("/api/widgets/card/files/app.js", base)
+	check("/api/widgets/card/files/index.html", base+"; sandbox allow-scripts")
+	check("/api/widgets/card/files/pic.svg", base+"; sandbox allow-scripts")
 }

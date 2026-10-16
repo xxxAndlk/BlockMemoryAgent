@@ -125,8 +125,12 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/widgets/:id/disable", apiHandler.DisableWidgetHandler)  // 热停用
 	api.POST("/widgets/reload", apiHandler.ReloadWidgetsHandler)       // 重扫 widgets/ 目录
 	api.GET("/widgets/:id/files/*path", apiHandler.HandleWidgetFile)   // 部件文件服务（iframe 渲染源）
-	api.POST("/widgets/push", apiHandler.PushWidgetHandler)            // 瞬时数据推送（bridge 等进程插件）
-	api.POST("/widgets/report", apiHandler.ReportWidgetHandler)        // 部件渲染错误回报
+		api.POST("/widgets/push", apiHandler.PushWidgetHandler)            // 瞬时数据推送（bridge 等进程插件）
+		api.POST("/widgets/report", apiHandler.ReportWidgetHandler)        // 部件渲染错误回报
+		api.POST("/widgets/action", apiHandler.WidgetActionHandler)        // 部件上行操作（卡片内用户交互）
+		api.DELETE("/widgets/:id", apiHandler.DeleteWidgetHandler)         // 软删（目录移入回收站）
+		api.GET("/widgets/trash", apiHandler.ListWidgetTrashHandler)       // 回收站条目列表
+		api.POST("/widgets/trash/:name/restore", apiHandler.RestoreWidgetTrashHandler) // 恢复回收站条目
 
 	// 模型动态切换 API（TUI 走进程内直调，不经此端点）。
 	api.GET("/models", apiHandler.ListModelsHandler)          // 模型目录：注册表清单 + 各角色当前模型

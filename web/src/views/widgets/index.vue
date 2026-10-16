@@ -3,12 +3,23 @@
 // 部件本体由 Agent 经 widget_save 工具创建/更新，本页只做状态管理，不提供编辑。
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { listWidgets, enableWidget, disableWidget, reloadWidgets } from '@/api/widgets'
-import type { WidgetInfo } from '@/types'
+import {
+  listWidgets,
+  enableWidget,
+  disableWidget,
+  reloadWidgets,
+  deleteWidget,
+  listTrash,
+  restoreWidget,
+} from '@/api/widgets'
+import type { WidgetInfo, WidgetTrashEntry } from '@/types'
 
 const widgets = ref<WidgetInfo[]>([])
 const loading = ref(false)
 const mutating = ref<string | null>(null)
+const trashOpen = ref(false)
+const trash = ref<WidgetTrashEntry[]>([])
+const trashLoading = ref(false)
 
 async function load() {
   loading.value = true
@@ -38,6 +49,20 @@ async function toggle(w: WidgetInfo) {
   }
 }
 
+/** 删除部件：软删进后端回收站（widgets/.trash/），可从回收站抽屉恢复。 */
+async function handleDelete(w: WidgetInfo) {
+  mutating.value = w.id
+  try {
+    await deleteWidget(w.id)
+    widgets.value = widgets.value.filter((x) => x.id !== w.id)
+    ElMessage.success(`部件 ${w.id} 已移入回收站`)
+  } catch (e) {
+    ElMessage.error('删除失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    mutating.value = null
+  }
+}
+
 async function handleReload() {
   loading.value = true
   try {
@@ -48,6 +73,34 @@ async function handleReload() {
     ElMessage.error('重载失败：' + (e instanceof Error ? e.message : String(e)))
   } finally {
     loading.value = false
+  }
+}
+
+/** 回收站：打开抽屉即拉取列表。 */
+async function openTrash() {
+  trashOpen.value = true
+  trashLoading.value = true
+  try {
+    trash.value = (await listTrash()).trash || []
+  } catch (e) {
+    ElMessage.error('回收站加载失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    trashLoading.value = false
+  }
+}
+
+/** 恢复后同时刷新部件列表与回收站。 */
+async function handleRestore(entry: WidgetTrashEntry) {
+  trashLoading.value = true
+  try {
+    await restoreWidget(entry.name)
+    ElMessage.success(`部件 ${entry.id || entry.name} 已恢复`)
+    load()
+    trash.value = (await listTrash()).trash || []
+  } catch (e) {
+    ElMessage.error('恢复失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    trashLoading.value = false
   }
 }
 
@@ -68,9 +121,14 @@ onMounted(load)
         <h2 class="text-lg font-bold text-ink">界面部件</h2>
         <p class="text-xs text-ink-2 mt-1">Agent 自写的渲染部件（二维码画布、美化展示卡等），在对话栏以沙箱卡片展示。</p>
       </div>
-      <el-button plain class="!bg-transparent !border-line !text-ink" :loading="loading" @click="handleReload">
-        <el-icon class="mr-1"><Refresh /></el-icon> 重载部件
-      </el-button>
+      <div class="flex items-center gap-2">
+        <el-button plain class="!bg-transparent !border-line !text-ink" @click="openTrash">
+          <el-icon class="mr-1"><Delete /></el-icon> 回收站
+        </el-button>
+        <el-button plain class="!bg-transparent !border-line !text-ink" :loading="loading" @click="handleReload">
+          <el-icon class="mr-1"><Refresh /></el-icon> 重载部件
+        </el-button>
+      </div>
     </div>
 
     <div class="grid gap-4 md:grid-cols-2 items-stretch">
@@ -84,6 +142,13 @@ onMounted(load)
             </el-tag>
             <span v-if="w.version" class="text-[10px] text-ink-3 font-mono">v{{ w.version }}</span>
           </div>
+          <el-popconfirm title="删除该部件？可稍后在回收站恢复" confirm-button-text="删除" cancel-button-text="取消"
+                         width="220" @confirm="() => handleDelete(w)">
+            <template #reference>
+              <el-button size="small" text type="danger" class="mr-1" :loading="mutating === w.id"
+                         :disabled="mutating === w.id">删除</el-button>
+            </template>
+          </el-popconfirm>
           <el-switch :model-value="w.enabled" :loading="mutating === w.id"
                      :disabled="mutating === w.id"
                      @change="() => toggle(w)" />
@@ -101,6 +166,9 @@ onMounted(load)
             入口：<span class="font-mono text-ink-2">{{ w.entry }}</span>
             <span v-if="w.files?.length"> · {{ w.files.length }} 个文件</span>
           </div>
+          <div class="text-ink-2">
+            Owner：<span class="font-mono text-ink-2">{{ w.owner || '-' }}</span>
+          </div>
           <div v-if="w.updated_at" class="text-ink-3">更新于：{{ formatTime(w.updated_at) }}</div>
         </div>
       </el-card>
@@ -109,6 +177,23 @@ onMounted(load)
     <div v-if="!loading && !widgets.length" class="text-center text-sm text-ink-2 py-16">
       暂无界面部件。部件由 Agent 经 widget_save 创建，目录为 config.yaml 同级的 widgets/。
     </div>
+
+    <!-- 回收站抽屉：软删部件列表与恢复 -->
+    <el-drawer v-model="trashOpen" title="部件回收站" size="360px">
+      <div v-loading="trashLoading" class="space-y-2">
+        <div v-for="t in trash" :key="t.name"
+             class="flex items-center justify-between gap-2 border border-line rounded px-3 py-2">
+          <div class="min-w-0">
+            <div class="text-xs text-ink font-mono truncate">{{ t.id || t.name }}</div>
+            <div v-if="t.deleted_at" class="text-[10px] text-ink-3">删除于 {{ formatTime(t.deleted_at) }}</div>
+          </div>
+          <el-button size="small" plain type="primary" :disabled="trashLoading" @click="handleRestore(t)">
+            恢复
+          </el-button>
+        </div>
+        <div v-if="!trashLoading && !trash.length" class="text-center text-xs text-ink-3 py-8">回收站为空</div>
+      </div>
+    </el-drawer>
   </div>
 </template>
 

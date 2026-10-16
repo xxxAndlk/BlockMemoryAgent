@@ -277,10 +277,14 @@ func (r *Registry) registerDefaults() {
 	// ShowArtifact：把可视成果（图/视频/音频/HTML/界面部件）展示到对话栏（媒体卡片）。
 	// 与 ReadMedia 互补：ReadMedia 喂模型，ShowArtifact 给用户看。
 	r.Register(&showArtifactTool{exec: r.exec})
-	// widget_save / widget_list：Agent 自写界面部件（widgets/ 目录包）；
-	// 管理面与数据推送回调经 SetWidgetManager 注入，未接线时调用返回未接线错误。
-	r.Register(&widgetSaveTool{})
-	r.Register(&widgetListTool{})
+		// widget_save / widget_list / widget_push_data / widget_delete / widget_restore：
+		// Agent 自写界面部件（widgets/ 目录包）；管理面与数据推送回调经 SetWidgetManager
+		// 注入，未接线时调用返回未接线错误。restore 不带 name 列回收站条目。
+		r.Register(&widgetSaveTool{})
+		r.Register(&widgetListTool{})
+		r.Register(&widgetPushDataTool{})
+		r.Register(&widgetDeleteTool{})
+		r.Register(&widgetRestoreTool{})
 }
 
 // Register 将工具及其别名注册到注册表中；若传入 nil 则忽略。

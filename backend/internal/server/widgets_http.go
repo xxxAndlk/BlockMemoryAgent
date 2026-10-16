@@ -155,6 +155,15 @@ func (h *APIHandler) HandleWidgetFile(c *gin.Context) {
 
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("Referrer-Policy", "no-referrer")
+	// CSP（2026-10 安全加固）：部件卡片需要内联脚本与 data:/blob: 图像，默认源收紧到
+	// self/inline/data/blob；活动文档（html/htm/svg 可被顶层导航直接打开）叠加 sandbox
+	// 指令——仍允许脚本（部件需要），但禁表单提交/顶层导航/弹窗，防钓鱼跳转。
+	csp := "default-src 'self' 'unsafe-inline' data: blob:"
+	switch strings.ToLower(filepath.Ext(abs)) {
+	case ".html", ".htm", ".svg":
+		csp += "; sandbox allow-scripts"
+	}
+	c.Header("Content-Security-Policy", csp)
 	// ServeContent 自行按扩展名推断 Content-Type 并处理 Range；
 	// 未知扩展名回落 application/octet-stream（浏览器会下载而非执行）。
 	http.ServeContent(c.Writer, c.Request, filepath.Base(abs), modTimeOf(info), f)
@@ -233,4 +242,96 @@ func (h *APIHandler) widgetReporter() (widgetErrorReporter, bool) {
 	}
 	r, ok := h.sessionMgr.agent.(widgetErrorReporter)
 	return r, ok
+}
+
+// widgetActionReporter 是"部件上行操作回报"能力的鸭子类型接口
+//（System 会话事件 + 运行中会话邮箱注入，同 widgetErrorReporter 模式）。
+type widgetActionReporter interface {
+	ReportWidgetAction(sessionID, widgetID, action, payload string)
+}
+
+// widgetActionReporter 从会话门面取部件操作上行能力。
+func (h *APIHandler) widgetActionReporter() (widgetActionReporter, bool) {
+	if h.sessionMgr == nil {
+		return nil, false
+	}
+	r, ok := h.sessionMgr.agent.(widgetActionReporter)
+	return r, ok
+}
+
+// DeleteWidgetHandler 处理 DELETE /api/widgets/:id — 软删部件：目录移入回收站
+// widgets/.trash/<id>-del-<ts>/（不物理删除，可恢复）。不存在时幂等返回 deleted=false。
+func (h *APIHandler) DeleteWidgetHandler(c *gin.Context) {
+	if h.widgetMgr == nil {
+		c.String(http.StatusServiceUnavailable, "widget manager not initialized")
+		return
+	}
+	entry, err := h.widgetMgr.Delete(c.Param("id"))
+	if err != nil {
+		c.String(http.StatusBadRequest, "%v", err)
+		return
+	}
+	if entry == "" {
+		c.JSON(http.StatusOK, map[string]any{"deleted": false, "message": "widget not found（幂等，无变化）"})
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"deleted":    true,
+		"trash_name": entry,
+		"restore":    "POST /api/widgets/trash/" + entry + "/restore",
+	})
+}
+
+// ListWidgetTrashHandler 处理 GET /api/widgets/trash — 回收站条目列表（del=软删 / snap=覆写前快照）。
+func (h *APIHandler) ListWidgetTrashHandler(c *gin.Context) {
+	if h.widgetMgr == nil {
+		c.String(http.StatusServiceUnavailable, "widget manager not initialized")
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"trash": h.widgetMgr.TrashList()})
+}
+
+// RestoreWidgetTrashHandler 处理 POST /api/widgets/trash/:name/restore — 恢复回收站条目
+//（del 条目还原部件；snap 条目即回滚到覆写前版本；现存同名部件先入回收站不覆盖丢失）。
+func (h *APIHandler) RestoreWidgetTrashHandler(c *gin.Context) {
+	if h.widgetMgr == nil {
+		c.String(http.StatusServiceUnavailable, "widget manager not initialized")
+		return
+	}
+	info, err := h.widgetMgr.Restore(c.Param("name"))
+	if err != nil {
+		c.String(http.StatusBadRequest, "%v", err)
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
+// widgetActionRequest 是 POST /api/widgets/action 的请求体。
+type widgetActionRequest struct {
+	SessionID string `json:"session_id"`
+	WidgetID  string `json:"widget_id"`
+	Action    string `json:"action"`
+	Payload   string `json:"payload"`
+}
+
+// WidgetActionHandler 处理 POST /api/widgets/action — 部件卡片内用户交互上行
+//（仿 report：落 System 会话事件"【部件操作】"，运行中会话额外注入 MetaAgent 邮箱）。
+// 会话不在内存静默 204；仅请求体缺字段才 400。
+func (h *APIHandler) WidgetActionHandler(c *gin.Context) {
+	var req widgetActionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.String(http.StatusBadRequest, "请求体非法: %v", err)
+		return
+	}
+	if strings.TrimSpace(req.SessionID) == "" || strings.TrimSpace(req.WidgetID) == "" || strings.TrimSpace(req.Action) == "" {
+		c.String(http.StatusBadRequest, "session_id、widget_id 与 action 必填")
+		return
+	}
+	reporter, ok := h.widgetActionReporter()
+	if !ok {
+		c.String(http.StatusNotImplemented, "部件操作上行通道未接线")
+		return
+	}
+	reporter.ReportWidgetAction(req.SessionID, req.WidgetID, req.Action, req.Payload)
+	c.Status(http.StatusNoContent)
 }
