@@ -99,13 +99,23 @@ if (videoDeclared) {
     set("aihubmix", "baseUrl", toApiRoot(videoUrl));
     set("aihubmix", "model", videoModel);
     del("volcengine", "model");
+    del("grok", "model");
   } else if (videoProvider === "volcengine") {
     // 方舟 tasks 协议（模型须目录 id / OD_MEDIA_MODEL_ALIASES 可解析）
     set("volcengine", "baseUrl", toApiRoot(videoUrl));
     set("volcengine", "model", videoModel);
     del("aihubmix", "model");
+    del("grok", "model");
+  } else if (videoProvider === "grok") {
+    // grok 线 = OpenAI 同步形状 POST {base}/videos/generations（2026-10-16：BMA 本机
+    // 8090 Gemini 桥走这条；配套 patch-image-size.js ③ 让 renderGrokVideo 接受其
+    // video_url 字段。模型仍写目录 id——daemon 按目录定义分发到 grok 渲染器）。
+    set("grok", "baseUrl", toApiRoot(videoUrl));
+    set("grok", "model", videoModel);
+    del("aihubmix", "model");
+    del("volcengine", "model");
   } else {
-    console.error(`[bma-entrypoint] 未知 VIDEO_PROVIDER=${videoProvider}（可选 openai|volcengine），本次不改视频槽位`);
+    console.error(`[bma-entrypoint] 未知 VIDEO_PROVIDER=${videoProvider}（可选 openai|volcengine|grok），本次不改视频槽位`);
   }
 }
 if (touched || existed) {
@@ -115,7 +125,7 @@ if (touched || existed) {
 // 生效摘要（仅配置非密文；secrets 不落）。
 const slotOf = (p) => (cfg.providers[p] && cfg.providers[p].model) || "无";
 console.error(
-  `[bma-entrypoint] 媒体单点生效（源=仓库根 .env 媒体段）：IMAGE_PROVIDER=${imageProvider} ｜ custom-image.model=${slotOf("custom-image")} ｜ nanobanana.model=${slotOf("nanobanana")} ｜ VIDEO_PROVIDER=${videoProvider} ｜ aihubmix.model=${slotOf("aihubmix")} ｜ volcengine.model=${slotOf("volcengine")}`
+  `[bma-entrypoint] 媒体单点生效（源=仓库根 .env 媒体段）：IMAGE_PROVIDER=${imageProvider} ｜ custom-image.model=${slotOf("custom-image")} ｜ nanobanana.model=${slotOf("nanobanana")} ｜ VIDEO_PROVIDER=${videoProvider} ｜ aihubmix.model=${slotOf("aihubmix")} ｜ volcengine.model=${slotOf("volcengine")} ｜ grok.model=${slotOf("grok")}`
 );
 EOF
 
@@ -127,10 +137,13 @@ if [ "${IMAGE_PROVIDER:-custom-image}" = "nanobanana" ]; then
 fi
 export OD_CUSTOM_IMAGE_API_KEY="${IMAGE_KEY:-$OD_CUSTOM_IMAGE_API_KEY}"
 export ARK_API_KEY="${IMAGE_KEY:-$ARK_API_KEY}"
-# 生视频 KEY：openai → aihubmix 槽位；volcengine → 方舟 key（VIDEO_KEY 优先，
-# 2026-10-14 起在 volcengine 侧生效——旧文档"VIDEO_KEY 不生效"作废）。
+# 生视频 KEY：openai → aihubmix 槽位；grok → OD_GROK_API_KEY（8090 桥不鉴权，但
+# renderGrokVideo 要求 apiKey 非空才进场，占位即可）；volcengine → 方舟 key
+#（VIDEO_KEY 优先，2026-10-14 起在 volcengine 侧生效——旧文档"VIDEO_KEY 不生效"作废）。
 if [ "${VIDEO_PROVIDER:-volcengine}" = "openai" ]; then
   export OD_AIHUBMIX_API_KEY="${VIDEO_KEY:-$OD_AIHUBMIX_API_KEY}"
+elif [ "${VIDEO_PROVIDER:-volcengine}" = "grok" ]; then
+  export OD_GROK_API_KEY="${VIDEO_KEY:-$OD_GROK_API_KEY}"
 elif [ -n "${VIDEO_KEY:-}" ]; then
   export ARK_API_KEY="$VIDEO_KEY"
 fi

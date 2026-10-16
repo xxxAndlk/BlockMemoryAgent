@@ -19,6 +19,12 @@
 // 本替换（或另配 provider）。响应若为 URL，daemon 的 bytesFromOpenAICompatibleData
 // 会自动下载（文生图路径同款，已验证）。
 //
+// ③ grok 视频同步形状（2026-10-16）：BMA 本机 8090 Gemini 桥以 OpenAI 同步形状
+// POST {base}/videos/generations 返回 {status:'completed', video_url}，而上游
+// renderGrokVideo 只认内联 data.video.url（读不到即转 GET {base}/videos/{id} 轮询，
+// 桥无该路由 → 404 任务失败）。接受平铺 video_url：命中即直接下载，跳掉轮询。
+// 替换点：renderGrokVideo 内 "let videoUrl = submitData?.video?.url || null;"（全文件唯一）。
+//
 // 锚点校验：上游 dist 变更导致锚点缺失时直接 throw（docker build 失败，
 // 响亮失败不静默），此时需人工复核上游的新实现。
 const fs = require('node:fs');
@@ -60,6 +66,10 @@ const PATCHES = [
   ['async function renderCustomOpenAIImage', "size: openaiSizeFor('gpt-image-1', ctx.aspect),", SIZE],
   // i2i 形状补丁（同函数内，anchor 之后查找）。
   ['async function renderCustomOpenAIImage', I2I_NEEDLE, I2I_REPLACEMENT],
+  // ③ grok 视频同步形状：needle 全文件唯一（仅 renderGrokVideo 内一处）。
+  ['async function renderGrokVideo',
+    'let videoUrl = submitData?.video?.url || null;',
+    "let videoUrl = submitData?.video?.url || submitData?.video_url || null; // BMA patch: 兼容同步形状 {status:'completed', video_url}（8090 桥）"],
 ];
 
 let src = fs.readFileSync(FILE, 'utf8');
@@ -70,7 +80,7 @@ for (const [anchor, needle, replacement] of PATCHES) {
   if (ni < 0) throw new Error(`锚点缺失: ${anchor} 之后未找到 ${needle.slice(0, 60)}…`);
   src = src.slice(0, ni) + replacement + src.slice(ni + needle.length);
 }
-console.log(`[bma-patch] size → ${RESTORE_ASPECT ? 'aspect 映射' : '2048x2048'}；i2i → 方舟 generations/image 形状`);
+console.log(`[bma-patch] size → ${RESTORE_ASPECT ? 'aspect 映射' : '2048x2048'}；i2i → 方舟 generations/image 形状；grok video → 接受同步 video_url`);
 if (RESTORE_ASPECT && !src.includes('function bmaImageSizeFor')) {
   src += HELPER;
   console.log('[bma-patch] bmaImageSizeFor 已注入');

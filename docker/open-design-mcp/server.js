@@ -38,6 +38,10 @@ const NANOBANANA_FALLBACK_MODEL_ID = 'gemini-3.1-flash-image-preview'; // 对齐
 const VIDEO_FALLBACK_PROVIDER = 'volcengine';
 const VOLCENGINE_FALLBACK_VIDEO_MODEL = 'doubao-seedance-2-0-fast-260128';
 const AIHUBMIX_PLACEHOLDER_VIDEO_MODEL = 'aihubmix-bma';
+// grok 线（2026-10-16）：桥必须传 daemon **目录 id**——daemon 按目录定义分发
+// renderGrokVideo（POST {base}/videos/generations 同步形状）。真实上游模型名在
+// daemon 侧（providers.grok / OD_MEDIA_MODEL_ALIASES），桥侧传目录 id 即可。
+const GROK_VIDEO_CATALOG_MODEL = 'grok-imagine-video';
 const OD_PROJECT_ID = process.env.OD_PROJECT_ID || 'bma-agent-artifacts';
 // 批量生成并发上限：daemon 每 task 独立异步（无串行限制），上限只防上游配额打爆。
 const OD_BATCH_CONCURRENCY = Math.max(1, Number(process.env.OD_BATCH_CONCURRENCY || 3));
@@ -60,8 +64,8 @@ const POLL_INTERVAL_MS = 2000;
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
 const VIDEO_EXTS = ['.mp4', '.webm', '.mov'];
 
-// ---- 视频生成（od_video_generate，2026-09-04）----
-// 双协议兼容（设计 docs/superpowers/specs/2026-09-04-video-generation-design.md）：
+// ---- 视频生成（od_video_generate，2026-09-04；grok 线 2026-10-16）----
+// 三协议兼容（设计 docs/superpowers/specs/2026-09-04-video-generation-design.md）：
 //   - volcengine：daemon 内置 renderVolcengineVideo（方舟 tasks 协议），模型须为目录 id
 //     （doubao-seedance-*）；wire 模型名可被 daemon 的 OD_MEDIA_MODEL_ALIASES 别名改写
 //     （自定义接入点场景，env 在 open_design service 插件侧注入）。
@@ -69,11 +73,16 @@ const VIDEO_EXTS = ['.mp4', '.webm', '.mov'];
 //     aihubmix- 前缀触发 daemon 目录旁路（任意模型名），用户给裸名时桥自动补前缀；
 //     网关 baseUrl/key 由 daemon media-config providers.aihubmix 提供（桥侧不可见，
 //     缺失时 daemon 任务 failed、错误原文透传）。
-// 2026-10-14 单点化后：三项 env 仅作逃生舱（显式设置最优先）；未设置时向 daemon 探测
-// （providers.aihubmix.model / providers.volcengine.model 非空即选定对应 wire）。
+//   - grok：daemon 内置 renderGrokVideo 讲 OpenAI 同步形状 POST {base}/videos/generations
+//     （可内联 {video:{url}}，或 {id} 转 GET /videos/{id} 轮询）。模型须为目录 id
+//     （grok-imagine-video）——daemon 按目录定义分发到该渲染器；BMA 本机 8090 Gemini 桥
+//     走这条（配套 daemon 补丁 ③ 让它接受同步形状的平铺 video_url 字段）。
+// 2026-10-14 单点化后：四项 env 仅作逃生舱（显式设置最优先）；未设置时向 daemon 探测
+// （providers.aihubmix / providers.volcengine / providers.grok 的 model 非空即选定对应 wire）。
 const OD_VIDEO_PROVIDER_ENV = (process.env.OD_VIDEO_PROVIDER || '').trim().toLowerCase();
 const OD_VOLCENGINE_VIDEO_MODEL_ENV = (process.env.OD_VOLCENGINE_VIDEO_MODEL || '').trim();
 const OD_OPENAI_VIDEO_MODEL_ENV = (process.env.OD_OPENAI_VIDEO_MODEL || '').trim();
+const OD_GROK_VIDEO_MODEL_ENV = (process.env.OD_GROK_VIDEO_MODEL || '').trim();
 // 视频 30s–5min（ark 队列峰值更久），远超图片的 180s 上限，独立超时。
 const OD_VIDEO_TIMEOUT_MS = Number(process.env.OD_VIDEO_TIMEOUT_MS || 720000);
 
@@ -115,6 +124,10 @@ async function probeMediaDefaults() {
   } else if (modelOf('volcengine')) {
     videoProvider = 'volcengine';
     videoModel = modelOf('volcengine'); // volcengine 视频纯用桥传值，须目录 id/别名可解析
+  } else if (modelOf('grok')) {
+    // grok 线（2026-10-16）：桥传目录 id（daemon 按目录定义分发 renderGrokVideo）。
+    videoProvider = 'grok';
+    videoModel = GROK_VIDEO_CATALOG_MODEL;
   }
   return { imageModel, videoProvider, videoModel };
 }
@@ -563,8 +576,8 @@ async function resolveImageModel(explicitModel) {
 
 function normalizeVideoProvider(raw) {
   const p = String(raw || '').toLowerCase();
-  if (p !== 'volcengine' && p !== 'openai') {
-    throw new Error(`未知视频 provider：${p}（可选 volcengine / openai；对应网关协议分别为方舟 tasks 与 OpenAI /videos）`);
+  if (p !== 'volcengine' && p !== 'openai' && p !== 'grok') {
+    throw new Error(`未知视频 provider：${p}（可选 volcengine / openai / grok；网关协议分别为方舟 tasks、OpenAI /videos、同步 /videos/generations）`);
   }
   return p;
 }
@@ -572,18 +585,26 @@ function normalizeVideoProvider(raw) {
 // resolveVideoTarget 视频默认目标：参数 > env > daemon 单点探测 > 硬默认。
 // openai wire 侧模型统一补 aihubmix- 前缀（探测给的占位自带前缀=no-op；真实裸名由
 // 用户在仓库根 .env 填）。volcengine 侧纯用桥传值，须目录 id / 别名可解析。
+// grok 线（2026-10-16）桥传 daemon 目录 id（按目录定义分发），真实上游模型名在 daemon 侧。
 async function resolveVideoTarget(providerArg, modelArg) {
   const explicitProvider = providerArg ? normalizeVideoProvider(providerArg) : '';
   const explicitModel = String(modelArg || '').trim();
   const d = await fetchMediaDefaults();
   const provider = explicitProvider || OD_VIDEO_PROVIDER_ENV || (d && d.videoProvider) || VIDEO_FALLBACK_PROVIDER;
-  const envModel = provider === 'openai' ? OD_OPENAI_VIDEO_MODEL_ENV : OD_VOLCENGINE_VIDEO_MODEL_ENV;
+  const envModel = provider === 'openai'
+    ? OD_OPENAI_VIDEO_MODEL_ENV
+    : provider === 'grok'
+      ? OD_GROK_VIDEO_MODEL_ENV
+      : OD_VOLCENGINE_VIDEO_MODEL_ENV;
   let model = explicitModel || envModel || (d && d.videoProvider === provider ? d.videoModel : '');
   if (provider === 'openai') {
     if (!model) {
       throw new Error('provider=openai 但未解析到视频模型：在仓库根 .env 媒体段填 VIDEO_MODEL（你的 /videos 网关模型名）后运行 bash docker/bma-plugin.sh media；或临时设桥 env OD_OPENAI_VIDEO_MODEL');
     }
     model = model.startsWith('aihubmix-') ? model : `aihubmix-${model}`;
+  } else if (provider === 'grok') {
+    // grok 线传 daemon 目录 id（renderGrokVideo 由目录定义分发）；缺省 grok-imagine-video。
+    model = model || GROK_VIDEO_CATALOG_MODEL;
   } else {
     model = model || VOLCENGINE_FALLBACK_VIDEO_MODEL;
   }
@@ -591,9 +612,9 @@ async function resolveVideoTarget(providerArg, modelArg) {
 }
 
 // generateVideo 文生视频（t2v）/ 首帧图生视频（i2v，first_frame）：daemon media/generate
-// surface='video'，length 传时长秒数；带 image 时两条 renderer（volcengine tasks 协议 /
-// aihubmix /videos 协议）均把它当首帧。无白底抠除（图片专属）；产物 mp4 经 downloadFile
-// 落盘，路径语义与 generateImage 一致。
+// surface='video'，length 传时长秒数；带 image 时 volcengine/aihubmix 两条 renderer 把它
+// 当首帧（grok 线也会带 image 字段，但 8090 上游忽略它——i2v 不可用，去掉 first_frame 走
+// 纯 t2v）。无白底抠除（图片专属）；产物 mp4 经 downloadFile 落盘，路径语义与 generateImage 一致。
 async function generateVideo({ prompt, aspect, duration_sec: durationSec, provider, model, save_as: saveAs, first_frame: firstFrame }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
@@ -767,8 +788,9 @@ server.registerTool('od_video_generate', {
   title: 'Open Design 视频生成',
   description:
     '经本地 open_design 守护进程生成短视频（文生视频 t2v / 首帧图生视频 i2v）。' +
-    'provider 二选一：volcengine=方舟 tasks 协议网关（模型为 daemon 目录 id，自定义接入点由 daemon 的 OD_MEDIA_MODEL_ALIASES 别名改写）；' +
-    'openai=OpenAI /videos 协议网关（模型名任意，.env 配 VIDEO_URL/VIDEO_MODEL；裸名桥自动补 aihubmix- 前缀）。' +
+    'provider 三选一：volcengine=方舟 tasks 协议网关（模型为 daemon 目录 id，自定义接入点由 daemon 的 OD_MEDIA_MODEL_ALIASES 别名改写）；' +
+    'openai=OpenAI /videos 协议网关（模型名任意，.env 配 VIDEO_URL/VIDEO_MODEL；裸名桥自动补 aihubmix- 前缀）；' +
+    'grok=OpenAI 同步形状 /videos/generations 网关（BMA 本机 8090 Gemini 桥走这条，缺省模型 grok-imagine-video；该上游忽略画幅/时长/i2v 参数）。' +
     '正式素材务必用 save_as 直落工作目录相对路径（如 assets/video/intro.mp4），一视频一份；缺省落 .bma/od-artifacts（时间戳命名，仅草稿）。' +
     '首帧图生视频（i2v）：先出定稿画面（od_image_generate），再传 first_frame 让它动起来，prompt 里用「图一」指代首帧。' +
     '单条约 30 秒–5 分钟，请勿重复提交相同 prompt；超时（默认 720s）后可调 od_video_list 查看结果。',
@@ -776,8 +798,8 @@ server.registerTool('od_video_generate', {
     prompt: z.string().min(1).describe('视频描述（建议具体描述主体/动作/镜头运动/风格）'),
     aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例，缺省由模型决定'),
     duration_sec: z.number().int().min(2).max(15).optional().describe('时长秒数，缺省 5；daemon 自动 snap 到模型允许桶（Veo 4/6/8、Sora 4/8/12、Seedance 常用 5/10）'),
-    provider: z.enum(['volcengine', 'openai']).optional().describe('网关协议（缺省按 daemon 单点配置自动选择，一般无需指定）'),
-    model: z.string().optional().describe('覆盖默认模型 id（openai 侧给裸模型名即可，桥自动补 aihubmix- 前缀；volcengine 侧须为 daemon 目录 id）'),
+    provider: z.enum(['volcengine', 'openai', 'grok']).optional().describe('网关协议（缺省按 daemon 单点配置自动选择，一般无需指定）'),
+    model: z.string().optional().describe('覆盖默认模型 id（openai 侧给裸模型名即可，桥自动补 aihubmix- 前缀；volcengine/grok 侧须为 daemon 目录 id）'),
     save_as: z.string().optional().describe('产物落盘的工作目录相对路径（如 assets/video/intro.mp4）。目录自动创建；无扩展名时补实际格式；不可含 .. 或盘符'),
     first_frame: z.string().optional().describe(
       '首帧图（图生视频 i2v，可选）：工作目录相对路径，作为视频第一帧；prompt 里用「图一」指代该首帧' +
