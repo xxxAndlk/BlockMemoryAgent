@@ -18,6 +18,11 @@ const props = defineProps<{
   /** 注入提示开关：仅真 running 为 true。sessionActive 还含 awaiting_clarify/awaiting_child
    * （会话活着、可发送），但那时发送是澄清答复/唤醒新消息，不是即时注入当前执行。 */
   injectHint?: boolean
+  /** 运行中（session.status==='running' 且无销毁倒计时）：发送按钮切换为红色「停止」。 */
+  running?: boolean
+  /** 有真实待澄清提问（clarifyPending 非空）。注意 awaiting_clarify 状态亦承载"已停止"停放态，
+   *  该态没有提问——两者必须靠本 prop 区分（停放态走普通发送=续跑，不是答复）。 */
+  clarifyActive?: boolean
   inputTokens?: number
   outputTokens?: number
   /** 是否绑定了会话（有 activeSession）。区别于 sessionActive=运行中：
@@ -35,6 +40,7 @@ const emit = defineEmits<{
   (e: 'submit', content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[]): void
   (e: 'new-session'): void
   (e: 'update-workdir', dir: string): void
+  (e: 'stop'): void
 }>()
 
 const content = ref('')
@@ -45,7 +51,9 @@ const { defaultDir } = useWorkDir()
 
 // 待澄清语境（2026-09-20）：会话 awaiting_clarify 时发送 = 回答上方问题（走 /clarify），
 // 不是下新指令。placeholder 与边框高亮跟着语境变，用户不必猜此刻该在哪输入。
-const awaitingClarify = computed(() => props.session?.status === 'awaiting_clarify')
+// 注意 awaiting_clarify 亦承载"已停止"停放态（无提问）：只有真实提问（clarifyActive）
+// 才按"答复"语境渲染，停放态按普通发送（消息即续跑）。
+const awaitingClarify = computed(() => props.clarifyActive === true && props.session?.status === 'awaiting_clarify')
 const placeholderText = computed(() =>
   awaitingClarify.value
     ? '回答上方问题，回车发送（Shift+Enter 换行）'
@@ -814,14 +822,31 @@ function onKeydown(e: KeyboardEvent) {
                 :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
             ↑{{ fmtTokens(props.inputTokens || 0) }} ↓{{ fmtTokens(props.outputTokens || 0) }}
           </span>
-          <el-button type="primary" size="small" round
-                     :loading="loading"
-                     :disabled="!canSend"
-                     title="Enter 发送，Shift+Enter 换行"
-                     class="!bg-primary !border-primary hover:!bg-[var(--bma-primary-hover)] hover:!border-[var(--bma-primary-hover)] disabled:opacity-50"
-                     @click="handleSubmit">
-            <el-icon class="mr-1"><Promotion /></el-icon> 发送
+          <!-- 运行中 → 红色「停止」（对标 ChatGPT，唯一停止入口：弹窗可选是否同时停子 Agent）；
+               其余状态一律「发送」。待澄清时额外挂一个静态「停止」逃生口（放弃当前提问），
+               主按钮保持"发送"用于答复——旧"终止"按钮是该态唯一出口，不能没有。 -->
+          <el-button v-if="running" type="danger" size="small" round
+                     title="停止运行（可选择是否同时停止运行中的子 Agent）；Enter 仍可发送指令"
+                     class="!bg-red-500 !border-red-500 hover:!bg-red-600 hover:!border-red-600"
+                     @click="emit('stop')">
+            <el-icon class="mr-1"><VideoPause /></el-icon> 停止
           </el-button>
+          <template v-else>
+            <el-button v-if="awaitingClarify" text size="small"
+                       class="!text-ink-3 hover:!text-red-500 !px-2 shrink-0"
+                       title="放弃当前提问并停止会话"
+                       @click="emit('stop')">
+              停止
+            </el-button>
+            <el-button type="primary" size="small" round
+                       :loading="loading"
+                       :disabled="!canSend"
+                       title="Enter 发送，Shift+Enter 换行"
+                       class="!bg-primary !border-primary hover:!bg-[var(--bma-primary-hover)] hover:!border-[var(--bma-primary-hover)] disabled:opacity-50"
+                       @click="handleSubmit">
+              <el-icon class="mr-1"><Promotion /></el-icon> {{ awaitingClarify ? '答复' : '发送' }}
+            </el-button>
+          </template>
         </div>
       </div>
     </div>

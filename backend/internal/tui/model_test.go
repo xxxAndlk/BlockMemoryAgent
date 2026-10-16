@@ -133,7 +133,7 @@ func (m *mockAgentForPlan) CancelAgent(ctx context.Context, sessionID, instID st
 }
 
 // PauseAgent 暂停 domain 支路，测试实现返回 nil。
-func (m *mockAgentForPlan) PauseAgent(ctx context.Context, sessionID, instID string) error {
+func (m *mockAgentForPlan) PauseAgent(ctx context.Context, sessionID, instID string, cascade bool) error {
 	return nil
 }
 

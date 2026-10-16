@@ -124,8 +124,13 @@ export function getAgentEvents(id: string, agentId: string, limit = 200, offset 
   return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(agentId)}/events?limit=${limit}&offset=${offset}`)
 }
 
-export function pauseSessionAgent(id: string, agentId: string): Promise<{ session_id: string; agent_id: string; status: string }> {
-  return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(agentId)}/pause`, { method: 'POST' })
+/** 停止子 Agent（2026-10-16 编排页"停止"按钮）：opts.cascade 缺省 false 只停本支路
+ * （其子 Agent 继续跑完）；true 连带子树一起停。停止后对该 Agent 发消息即恢复。 */
+export function pauseSessionAgent(id: string, agentId: string, opts?: { cascade?: boolean }): Promise<{ session_id: string; agent_id: string; status: string }> {
+  return fetchJson(`/sessions/${id}/agents/${encodeURIComponent(agentId)}/pause`, {
+    method: 'POST',
+    body: JSON.stringify({ cascade: opts?.cascade ?? false }),
+  })
 }
 
 /** 终止指定子 Agent 实例（硬取消，不可恢复；编排页节点卡/面板的 ⏹ 动作）。 */

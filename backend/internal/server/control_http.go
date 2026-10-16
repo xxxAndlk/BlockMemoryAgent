@@ -105,10 +105,27 @@ func (m *SessionManager) HandleSessionEnqueue(c *gin.Context) {
 // HandleSessionStop 处理 POST /api/sessions/{id}/stop（TODO #37 软停止）。
 // 与 /cancel 的区别：不销毁——停止当前会话全部子任务（domain 落 Paused 可续跑、
 // 叶子部分回灌），会话转入 PausedOnChild；倒计时内任意消息续跑，到期未续跑硬销毁。
+// 可选 body {"stop_children": bool}（2026-10-16 统一停止按钮）：缺省 true 保持旧行为
+// （兼容无 body 的存量调用与 TUI 发 `{}` 的调用）；false = 只停主 Agent——运行中的
+// 子 Agent 继续执行、结果滞留邮箱，发消息续跑时整合（见 StopMetaOnly）。
 func (m *SessionManager) HandleSessionStop(c *gin.Context) {
 	id := c.Param("id")
+	req, hasBody, err := DecodeBodyOptional[struct {
+		StopChildren *bool `json:"stop_children"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	stopChildren := true
+	if hasBody && req.StopChildren != nil {
+		stopChildren = *req.StopChildren
+	}
 
-	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{Op: agent.ControlOpStop}); err != nil {
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
+		Op:   agent.ControlOpStop,
+		Args: map[string]any{"stop_children": stopChildren},
+	}); err != nil {
 		msg, status := agentErrorStatus(err)
 		c.String(status, "%s", msg)
 		return

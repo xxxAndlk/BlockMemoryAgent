@@ -706,8 +706,10 @@ func (m *SessionManager) HandleSessionPlugins(c *gin.Context) {
 }
 
 // HandleSessionAgentPause 处理 POST /api/sessions/{id}/agents/{aid}/pause
-// （TODO 第10项③ 审计面手动止血）。
-// 职责：暂停指定 domain 支路（dispatcher Pause 收尾，热驻槽 parked 可 resume 续跑）。
+// （TODO 第10项③ 审计面手动止血；2026-10-16 编排页"停止"按钮）。
+// 职责：暂停指定 domain 支路（dispatcher Pause 收尾，parked 可续跑——热驻槽 ResumePaused、
+// 非热驻对该 Agent 发消息即恢复）。
+// 可选 body {"cascade": bool}：缺省 false 只停本支路（子 Agent 继续跑）；true 连带子树。
 // 仅 domain + Running 可暂停；叶子用 cancel 端点，全树用 stop 端点。
 func (m *SessionManager) HandleSessionAgentPause(c *gin.Context) {
 	id := c.Param("id")
@@ -716,7 +718,18 @@ func (m *SessionManager) HandleSessionAgentPause(c *gin.Context) {
 		c.String(http.StatusBadRequest, "缺少 Agent 实例 ID")
 		return
 	}
-	if err := m.agent.PauseAgent(c.Request.Context(), id, instID); err != nil {
+	req, hasBody, err := DecodeBodyOptional[struct {
+		Cascade *bool `json:"cascade"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	cascade := false
+	if hasBody && req.Cascade != nil {
+		cascade = *req.Cascade
+	}
+	if err := m.agent.PauseAgent(c.Request.Context(), id, instID, cascade); err != nil {
 		msg, status := agentErrorStatus(err)
 		c.String(status, "%s", msg)
 		return

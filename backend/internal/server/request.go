@@ -4,6 +4,7 @@ import (
 	"encoding/json" // JSON 解码
 	"io"            // 读取请求体
 	"net/http"      // HTTP 请求
+	"strings"       // 空 body 判定
 	"unicode/utf8"  // UTF-8 校验
 )
 
@@ -34,4 +35,25 @@ func DecodeBody[T any](r *http.Request) (T, error) {
 		return v, err
 	}
 	return v, nil
+}
+
+// DecodeBodyOptional 读取并解码可选的 JSON 请求体：空 body（或全空白）时返回
+// hasBody=false 且不报错——供"旧调用方无 body / 新调用方带参数"兼容的端点使用
+//（/sessions/:id/stop、/agents/:aid/pause：web 存量调用无 body、TUI 发 `{}`、测试发空 body）。
+// 非空 body 的 UTF-8 校验与解码语义同 DecodeBody。
+func DecodeBodyOptional[T any](r *http.Request) (v T, hasBody bool, err error) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return v, false, err
+	}
+	if !utf8.Valid(raw) {
+		return v, false, errInvalidUTF8
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return v, false, nil
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return v, false, err
+	}
+	return v, true, nil
 }

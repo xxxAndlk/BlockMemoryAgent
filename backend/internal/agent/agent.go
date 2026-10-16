@@ -76,15 +76,18 @@ type Agent interface {
 	// 节点不存在或已 terminal 返回 ErrAgentNotFound。
 	CancelAgent(ctx context.Context, sessionID, instID string) error
 
-	// PauseAgent 手动暂停指定 domain 支路（TODO 第10项③ 审计面止血）。
-	// 仅 Role=domain 且 Running 的节点可暂停；走 dispatcher Pause 收尾
-	// （SaveMessages + tree.Pause），热驻槽 parked 可 ResumePaused 续跑。
-	PauseAgent(ctx context.Context, sessionID, instID string) error
+	// PauseAgent 手动暂停指定 domain 支路（TODO 第10项③ 审计面止血；
+	// 2026-10-16 编排页"停止"按钮：cascade=false 只停本支路（子 Agent 继续跑），
+	// cascade=true 连带子树一起停）。仅 Role=domain 且 Running 的节点可暂停；
+	// 走 dispatcher Pause 收尾（SaveMessages + tree.Pause），parked 可续跑
+	// （热驻槽 ResumePaused / 非热驻发消息即恢复）。
+	PauseAgent(ctx context.Context, sessionID, instID string, cascade bool) error
 
 	// MessageAgent 用户直连子 Agent（编排页对话面板发送框）。
 	// 状态机：等子返回→注入唤醒；执行中→邮箱排队（queued=true，P0-2 steering）；
-	// 终态→复活重跑；Paused/Idle/meta→ErrInvalidSessionState。
-	// queued=true 表示消息入邮箱排队（running 态）；false = 即时投递/复活/唤醒。
+	// 终态→复活重跑；Paused→投消息入箱并异步续跑（2026-10-16，停止后发消息即恢复）；
+	// Idle→唤醒续聊；meta→ErrAgentNotDirectable。
+	// queued=true 表示消息入邮箱排队（running 态）；false = 即时投递/复活/唤醒/续跑。
 	MessageAgent(ctx context.Context, sessionID, instID, content string) (queued bool, err error)
 
 	// Board 返回会话任务看板快照（TODO #22 执行计划面板真相源）。

@@ -163,6 +163,14 @@ type reactInternalSession struct {
 	stopTimer *time.Timer
 	// destroyAt 是软停止销毁截止时间（倒计时期间非 nil，供 TUI 显示剩余时间）。
 	destroyAt *time.Time
+	// runSeq 是会话的运行代际：每次 restartSessionContext（续跑/唤醒重建 ctx）自增。
+	// 供 metaStopSeq 比对——停止请求只对发起时的那个 run 有效，防止陈旧标记误停
+	// 后续新 run（访问走 store.mu）。
+	runSeq int64
+	// metaStopSeq 是「只停主 Agent」请求登记（= 发起时 session.runSeq；0=无请求）：
+	// runSession/resumeSession 的 Canceled 分支据此落停放态而非 error。
+	// restartSessionContext 清零（新 run 不受旧请求影响），访问走 store.mu。
+	metaStopSeq int64
 	// projectDocReady 是 createSession 启动的 EnsureProjectDoc 完成信号（TODO 第14项 T9）：
 	// 首生成要跑 LLM 领域分区（秒级），异步化后 createSession 立即返回，
 	// runSession 起跑时有界等待 ≤2s 让【项目概览】段赶上进入首轮系统提示词前缀缓存；
@@ -379,6 +387,7 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 		ID:        sessionID,
 		Goal:      goal,
 		Status:    enums.SessionStatusRunning,
+		runSeq:    1, // 运行代际从 1 起（restartSessionContext 自增，见字段注释）
 		StartedAt: time.Now(),
 		Events:    make([]internalEvent, 0),
 		TempDir:   filepath.Join(eff, ".bma", "tmp", sessionID),

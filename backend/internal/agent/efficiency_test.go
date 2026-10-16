@@ -132,22 +132,22 @@ func TestPauseAgent_Rejections(t *testing.T) {
 	ctx := context.Background()
 
 	// 会话不存在。
-	if err := svc.PauseAgent(ctx, "session-none", "x"); err == nil {
+	if err := svc.PauseAgent(ctx, "session-none", "x", false); err == nil {
 		t.Fatal("unknown session must be rejected")
 	}
 	tr := svc.TreeFor(sess.ID)
 	// 节点不存在。
-	if err := svc.PauseAgent(ctx, sess.ID, sess.ID+"/domain-none"); err == nil {
+	if err := svc.PauseAgent(ctx, sess.ID, sess.ID+"/domain-none", false); err == nil {
 		t.Fatal("unknown node must be rejected")
 	}
 	// 非 domain 角色（叶子用 cancel）。
 	tr.Register(orchestrator.Node{ID: sess.ID + "/leaf-1", ParentID: sess.ID, Role: "code_assistant", Status: orchestrator.StatusRunning})
-	if err := svc.PauseAgent(ctx, sess.ID, sess.ID+"/leaf-1"); err == nil {
+	if err := svc.PauseAgent(ctx, sess.ID, sess.ID+"/leaf-1", false); err == nil {
 		t.Fatal("non-domain node must be rejected")
 	}
 	// 非 Running 状态（已 Done）。
 	tr.Register(orchestrator.Node{ID: sess.ID + "/domain-9", ParentID: sess.ID, Role: "domain", Status: orchestrator.StatusDone})
-	if err := svc.PauseAgent(ctx, sess.ID, sess.ID+"/domain-9"); err == nil {
+	if err := svc.PauseAgent(ctx, sess.ID, sess.ID+"/domain-9", false); err == nil {
 		t.Fatal("non-running domain must be rejected")
 	}
 }

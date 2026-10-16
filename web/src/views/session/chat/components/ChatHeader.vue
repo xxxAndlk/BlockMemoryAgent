@@ -6,9 +6,10 @@ import type { Session, AgentNode } from '@/types'
 const props = defineProps<{
   session: Session | null
   agents: AgentNode[]
+  /** 有真实待澄清提问（区分 awaiting_clarify 的双语义："待澄清" vs "已停止"停放态）。
+   *  2026-10-16 统一停止交互：中断/软停止/终止 三按钮已移除，停止统一走发送区按钮。 */
+  clarifyActive?: boolean
 }>()
-
-const emit = defineEmits<{ (e: 'cancel'): void; (e: 'stop'): void; (e: 'interrupt'): void }>()
 
 /** 用户主动"终止"的会话：后端落 error 态 + Result="cancelled by user"（见 service_react.cancel），
  *  但这是预期内的中止，不该和真失败共用红色"失败"——单列"已终止"。 */
@@ -39,7 +40,8 @@ const statusLabel = computed(() => {
     case 'completed': return '已完成'
     case 'error': return '失败'
     case 'paused_on_child': return '子 Agent 暂停'
-    case 'awaiting_clarify': return '待澄清'
+    // awaiting_clarify 双语义：有真实提问=待澄清；无（用户停止后的停放态）=已停止。
+    case 'awaiting_clarify': return props.clarifyActive ? '待澄清' : '已停止'
     case 'awaiting_child': return '挂起等待子 Agent'
     default: return props.session.status
   }
@@ -151,18 +153,6 @@ const liveBadges = computed(() => {
       <el-tag size="small" effect="plain"
               class="!bg-transparent !border-line scale-90 shrink-0"
               :class="statusColor">{{ statusLabel }}</el-tag>
-      <!-- 抢占中断：打断当前执行并注入新指令（对齐 TUI /interrupt） -->
-      <el-button v-if="(session?.status === 'running' || session?.status === 'awaiting_child') && !session?.destroy_at" size="small"
-                 class="!bg-transparent !border-line !text-ink-2 hover:!text-primary shrink-0"
-                 @click="emit('interrupt')">
-        <el-icon class="mr-1"><Pointer /></el-icon>中断
-      </el-button>
-      <!-- 软停止：可续跑（TODO #37）；硬终止走原 cancel（带确认） -->
-      <el-button v-if="(session?.status === 'running' || session?.status === 'awaiting_child') && !session?.destroy_at" size="small"
-                 class="!bg-amber-50 !border-amber-300 !text-amber-700 dark:!bg-orange-900/30 dark:!border-orange-700/40 dark:!text-orange-400 shrink-0"
-                 @click="emit('stop')">
-        <el-icon class="mr-1"><SwitchButton /></el-icon>软停止
-      </el-button>
       <span v-if="destroyCountdown" class="text-xs text-orange-400 font-mono shrink-0 animate-pulse">
         {{ destroyCountdown }}
       </span>
@@ -195,14 +185,8 @@ const liveBadges = computed(() => {
           </div>
         </div>
       </el-popover>
-      <!-- 终止：待澄清（ask_user 挂起）也必须可终止——后端 cancel 明确支持
-           awaiting_clarify（ctx 取消自动解除挂起），这是放弃当前问题的唯一逃生口。
-           软停止/中断不对该态开放（后端拒绝 / 有双开 ReAct 循环风险）。 -->
-      <el-button v-if="(session?.status === 'running' || session?.status === 'awaiting_child' || session?.status === 'awaiting_clarify') && !session?.destroy_at" size="small"
-                 class="!bg-red-50 !border-red-300 !text-red-700 dark:!bg-red-900/30 dark:!border-red-700/40 dark:!text-red-400 shrink-0"
-                 @click="emit('cancel')">
-        <el-icon class="mr-1"><CircleClose /></el-icon>终止
-      </el-button>
+      <!-- 停止统一走发送区按钮（运行中→红色「停止」；待澄清→发送区小「停止」逃生口）。
+           此处不再放任何停止/中断/终止按钮（2026-10-16 统一停止交互）。 -->
     </div>
   </div>
 </template>

@@ -41,15 +41,17 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   submit: [content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[]]
-  cancel: []
+  /** 停止（发送区红色按钮；弹窗与接口调用在会话页 index.vue 处理） */
   stop: []
-  interrupt: []
   'new-session': []
   'clarify-submitted': []
   'update-clarify-drafts': [drafts: string[]]
   'update-workdir': [dir: string]
   refresh: []
 }>()
+
+/** 运行中（发送区按钮切换为「停止」）：软停止倒计时窗口内不算运行中（按钮回「发送」=续跑）。 */
+const chatRunning = computed(() => props.session?.status === 'running' && !props.session?.destroy_at)
 
 // 常驻最新状态行（TODO #15 翻译层① T10）：运行中在消息区下方展示最近事件的
 // 人话短语（"正在执行工具操作"），比"运行中"标签更可感知。流式思考优先展示。
@@ -65,8 +67,7 @@ const showStatusLine = computed(() =>
 
 <template>
   <div class="flex-1 flex flex-col bg-card border border-line rounded-card overflow-hidden min-w-0 min-h-0">
-    <ChatHeader :session="session" :agents="agents"
-                @cancel="emit('cancel')" @stop="emit('stop')" @interrupt="emit('interrupt')" />
+    <ChatHeader :session="session" :agents="agents" :clarify-active="!!clarify" />
     <!-- 选中非 meta Agent：消息区+输入框换成该 Agent 的对话面板（多人对话 + 三态发送框） -->
     <AgentChatPanel v-if="agent" class="flex-1 min-h-0"
                     :session-id="session?.id || ''" :agent="agent" :agents="agents"
@@ -90,6 +91,8 @@ const showStatusLine = computed(() =>
                  :session="session"
                  :session-active="session?.status === 'running' || session?.status === 'awaiting_clarify' || session?.status === 'awaiting_child'"
                  :inject-hint="session?.status === 'running'"
+                 :running="chatRunning"
+                 :clarify-active="!!clarify"
                  :input-tokens="inputTokens"
                  :output-tokens="outputTokens"
                  :session-bound="sessionBound"
@@ -98,7 +101,8 @@ const showStatusLine = computed(() =>
                  :known-dirs="knownDirs"
                  @submit="(c: string, i: WireImage[], f: File[], g: SessionGear, t: SessionThinking, p: string[]) => emit('submit', c, i, f, g, t, p)"
                  @new-session="emit('new-session')"
-                 @update-workdir="(d: string) => emit('update-workdir', d)" />
+                 @update-workdir="(d: string) => emit('update-workdir', d)"
+                 @stop="emit('stop')" />
     </template>
   </div>
 </template>

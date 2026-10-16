@@ -17,16 +17,20 @@ import (
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 )
 
-// fakeMessenger 记录直连分支调用（注入 / 复活）。
+// fakeMessenger 记录直连分支调用（注入 / 复活 / 续跑）。
 type fakeMessenger struct {
 	injected  []string
 	revived   []orchestrator.Node
 	woken     []string
+	resumed   []string
 	contents  []string
 	injectErr error
 	reviveErr error
+	resumeErr error
 	// reviveCtxSession 记录复活调用 ctx 中的会话标识（须等于目标会话 ID）。
 	reviveCtxSession string
+	// resumeCtxSession 记录 Paused 续跑调用 ctx 中的会话标识（须等于目标会话 ID）。
+	resumeCtxSession string
 }
 
 func (f *fakeMessenger) InjectUserMessage(agentID, content string) error {
@@ -49,6 +53,14 @@ func (f *fakeMessenger) ReviveWithMessage(ctx context.Context, node orchestrator
 	// 会取到空树、复活必然失败（回归护栏）。
 	f.reviveCtxSession = tool.SessionIDFromContext(ctx)
 	return f.reviveErr
+}
+
+// ResumePausedWithMessage Paused 续跑（停止后发消息恢复），记录调用与种子。
+func (f *fakeMessenger) ResumePausedWithMessage(ctx context.Context, pausedNodeID, seed string) error {
+	f.resumed = append(f.resumed, pausedNodeID)
+	f.contents = append(f.contents, seed)
+	f.resumeCtxSession = tool.SessionIDFromContext(ctx)
+	return f.resumeErr
 }
 
 // fakeActivityEvidence 固定返回某 kind 的活动证据（模拟 waitForChildren 上报的 child_wait）。
@@ -182,16 +194,20 @@ func TestMessageAgentStateRouting(t *testing.T) {
 		}
 	})
 
-	// 分支 4b：Paused → 拒绝（走监控页恢复 / 经 MetaAgent 派发）。
-	t.Run("paused_reject", func(t *testing.T) {
+	// 分支 4b：Paused（停止后）→ 投消息续跑（2026-10-16：发送消息即恢复该 Agent，
+	// 不再要求去监控页）。种子为用户消息；ctx 须带会话标识（同复活分支）。
+	t.Run("paused_resume", func(t *testing.T) {
 		svc, fm, tr, sid := newMessageAgentEnv(t)
 		registerNode(t, tr, sid, "child-4", orchestrator.StatusPaused)
-		_, err := svc.MessageAgent(ctx, sid, "child-4", "喂")
-		if !errors.Is(err, ErrInvalidSessionState) {
-			t.Fatalf("paused 应 ErrInvalidSessionState, got %v", err)
+		queued, err := svc.MessageAgent(ctx, sid, "child-4", "接着干")
+		if err != nil || queued {
+			t.Fatalf("paused 续跑应成功且 queued=false: err=%v queued=%v", err, queued)
 		}
-		if len(fm.injected) != 0 || len(fm.revived) != 0 || len(fm.woken) != 0 {
-			t.Fatal("拒绝分支不应触达 messenger")
+		if len(fm.resumed) != 1 || fm.resumed[0] != "child-4" || fm.contents[0] != "接着干" {
+			t.Fatalf("paused 分支应走 ResumePausedWithMessage: %+v", fm)
+		}
+		if fm.resumeCtxSession != sid {
+			t.Fatalf("续跑 ctx 会话标识 = %q, want %q", fm.resumeCtxSession, sid)
 		}
 	})
 

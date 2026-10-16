@@ -1,15 +1,13 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch, provide } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch, provide, h } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Session, SessionSummary, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear, SessionThinking } from '@/types'
+import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear, SessionThinking } from '@/types'
 import { isAssistantTextEvent, isToolCallEvent, isUserMessageEvent, clarifyArtifactsFromFrame } from '@/types'
 import {
   createSession,
   sendMessage,
-  cancelSession,
   stopSession,
-  interruptSession,
   getSession,
   getSessionAgents,
   getSessionBoard,
@@ -33,7 +31,6 @@ import { classifyEvent } from '@/views/session/chat/utils/turns'
 import { submitClarify } from '@/views/session/chat/utils/clarifySubmit'
 import { usePanelRefresh } from '@/composables/usePanelRefresh'
 import { useSessionList } from '@/composables/useSessionList'
-import { useSessionStatus } from '@/composables/useSessionStatus'
 import { useWorkDir } from '@/composables/useWorkDir'
 import { FILE_OPENER_KEY, resolveWorkspacePath, type FileOpener } from '@/composables/fileOpener'
 import { knownWorkDirs as knownWorkDirsOf } from '@/utils/dir'
@@ -57,7 +54,6 @@ const router = useRouter()
 const { sessions, loadSessions } = useSessionList()
 const stream = useSessionStream()
 const panel = usePanelRefresh()
-const { statusDotClass, statusText } = useSessionStatus()
 const { workDir, setWorkDir, setDefaultDir } = useWorkDir()
 
 const activeSession = ref<Session | null>(null)
@@ -113,7 +109,6 @@ const replyStash = ref<Record<string, string>>({})
 
 const loading = ref(false)
 const sending = ref(false)
-const sessionFilter = ref('')
 
 // 视图切换：?view=chat|monitor，缺省 chat；chat 为缺省视图不污染 URL。
 // 旧链接的 view=orch（已删除的编排页）兼容映射为 chat。
@@ -476,8 +471,10 @@ async function handleSubmit(content: string, images: WireImage[] = [], files: Fi
   if (!content.trim() && !images.length && !files.length) return
   sending.value = true
   try {
-    // 1) 待澄清会话 → 调 /clarify 提交答复
-    if (activeSession.value && activeSession.value.status === 'awaiting_clarify') {
+    // 1) 待澄清会话（有真实提问）→ 调 /clarify 提交答复。
+    // 注意 awaiting_clarify 亦承载"已停止"停放态（无提问）——该情况是普通发送=续跑，
+    // 不能路由到 /clarify（后端无待答提问会报错，用户消息也就丢了）。
+    if (activeSession.value && activeSession.value.status === 'awaiting_clarify' && clarifyPending.value) {
       // 批量提问（任务 140 问题③）：输入框通道拒绝，引导走问答卡逐题作答统一提交
       if ((clarifyPending.value?.questions?.length || 0) > 1) {
         sending.value = false
@@ -579,77 +576,63 @@ async function handleClarifySubmitted() {
   // 不再 openSession 全量重载（任务 140 问题④）：重载清空 events 导致滚动跳变。
 }
 
-async function handleCancel() {
-  if (!activeSession.value) return
+/**
+ * 停止（2026-10-16 统一停止交互，唯一停止入口：运行中发送区红色「停止」按钮 /
+ * 待澄清态发送区小「停止」逃生口）。
+ * 弹窗带勾选框（默认不勾选）：勾选=停止子 Agent + 主 Agent（全停，软停止语义可续跑）；
+ * 不勾选=只停主 Agent——运行中的子 Agent 继续执行、结果保留，停止后发送消息即可继续。
+ * 待澄清态 = 放弃当前提问并停止（无勾选，固定全停）。
+ */
+async function handleStop() {
+  const sess = activeSession.value
+  if (!sess) return
+  // 待澄清（有真实提问）：放弃提问并停止，无勾选框。
+  const clarifyAsk = sess.status === 'awaiting_clarify' && !!clarifyPending.value
+  // 勾选值（非响应式渲染——原生 checkbox 自持视觉态，事件回写即可）。
+  const picked = { stopAll: false }
   try {
-    await ElMessageBox.confirm(
-      activeSession.value.status === 'awaiting_clarify'
-        ? '终止后当前澄清问题作废，会话立即结束且不可续跑。'
-        : '硬终止会立即取消全部子 Agent 与当前任务，且不可续跑。建议优先使用软停止。',
-      activeSession.value.status === 'awaiting_clarify' ? '放弃回答并终止？' : '确认硬终止？',
-      { confirmButtonText: '硬终止', cancelButtonText: '取消', type: 'warning' }
-    )
+    await ElMessageBox({
+      title: clarifyAsk ? '放弃当前提问并停止？' : '停止运行？',
+      message: h('div', { class: 'space-y-1.5 text-sm leading-relaxed', style: 'max-width: 380px' }, clarifyAsk
+        ? [
+            h('div', null, '将放弃当前待回答的提问，并停止运行中的全部 Agent（含子 Agent）。停止后发送消息可继续。'),
+          ]
+        : [
+            h('div', null, '不勾选（默认）：只停主 Agent——运行中的子 Agent 会继续执行，结果保留；停止后发送消息即可继续。'),
+            h('label', { class: 'flex items-center gap-2 pt-1 cursor-pointer select-none' }, [
+              h('input', {
+                type: 'checkbox',
+                class: 'accent-[var(--bma-primary)]',
+                onChange: (e: Event) => { picked.stopAll = (e.target as HTMLInputElement).checked },
+              }),
+              h('span', null, '同时停止运行中的子 Agent'),
+            ]),
+          ]),
+      showCancelButton: true,
+      confirmButtonText: '停止',
+      cancelButtonText: '取消',
+      confirmButtonClass: 'el-button--danger',
+      type: 'warning',
+    })
   } catch {
-    return
+    return // 取消/关闭
   }
   try {
-    await cancelSession(activeSession.value.id)
-    ElMessage.success('已终止')
-    // 立即回取快照收口回合：终止事件（"会话已被用户取消"，turns.ts isUserCancel 认它）
-    // 在 cancel 返回前就已入库，快照里必然带着它——不等 SSE 轮询，用户点完立刻看到
-    // "已终止"而不是继续假转圈（实证：只发请求不回取时，回合停在"处理中"直到下次
-    // 有点击/刷新，用户以为终止没生效）。
-    finishCancelledTurn()
-  } catch (e) {
-    ElMessage.error('取消会话失败：' + (e instanceof Error ? e.message : String(e)))
-  }
-}
-
-/** 终止后即时收口：拉最新快照替换事件流 + 清运行中残留（流式文本/待澄清）。 */
-async function finishCancelledTurn() {
-  const id = activeSession.value?.id
-  if (!id) return
-  liveStreaming.value = ''
-  liveThinking.value = ''
-  clarifyPending.value = null
-  clarifyAck.value = false
-  try {
-    const s = await getSession(id)
+    await stopSession(sess.id, { stop_children: clarifyAsk ? true : picked.stopAll })
+    ElMessage.success('已停止；发送消息可继续')
+    // 立即回取快照收口：SSE 状态帧到达前先把徽章/按钮切到停止态，避免"点了没反应"
+    //（对齐原终止路径的即时收口）。
+    liveStreaming.value = ''
+    liveThinking.value = ''
+    if (clarifyAsk) clarifyPending.value = null
+    clarifyAck.value = false
+    const s = await getSession(sess.id)
     activeSession.value = s
     events.value = [...(s.events || [])]
-    const idx = sessions.value.findIndex((x) => x.id === id)
+    const idx = sessions.value.findIndex((x) => x.id === s.id)
     if (idx >= 0) sessions.value[idx] = { ...sessions.value[idx], status: s.status }
-  } catch {
-    // 快照取失败不阻塞：SSE 的 session_status/事件帧随后仍会把状态带回来。
-  }
-}
-
-async function handleInterrupt() {
-  if (!activeSession.value) return
-  try {
-    const { value } = await ElMessageBox.prompt(
-      '将打断当前执行，并把输入内容作为新指令注入继续运行',
-      '抢占中断',
-      { confirmButtonText: '中断', cancelButtonText: '取消', inputPlaceholder: '新指令（必填）', type: 'warning' }
-    )
-    if (!value || !value.trim()) return
-    await interruptSession(activeSession.value.id, value.trim())
-    ElMessage.success('已中断并注入新指令')
   } catch (e) {
-    if (e === 'cancel' || (e instanceof Error && e.message === 'cancel')) return
-    ElMessage.error('中断失败：' + (e instanceof Error ? e.message : String(e)))
-  }
-}
-
-async function handleStop() {
-  if (!activeSession.value) return
-  try {
-    await stopSession(activeSession.value.id)
-    ElMessage.success('已软停止，倒计时内发送新消息可续跑')
-    const s = await getSession(activeSession.value.id)
-    activeSession.value = s
-  } catch (e) {
-    ElMessage.error('软停止失败：' + (e instanceof Error ? e.message : String(e)))
+    ElMessage.error('停止失败：' + (e instanceof Error ? e.message : String(e)))
   }
 }
 
@@ -679,21 +662,6 @@ function handleNewSession() {
   router.replace({ path: '/session', query: { new: '1' } })
 }
 
-/** 会话列表状态文案：用户主动"终止"的单列"已终止"（后端落 error + Result=cancelled by user），
- *  否则与真失败同标"失败"，用户会以为是自己点终止点坏了。 */
-function sessionStatusLabel(s: SessionSummary): string {
-  if (s.status === 'error' && (s.result || '').includes('cancelled by user')) return '已终止'
-  return statusText(s.status)
-}
-
-const filteredSessions = computed(() => {
-  const q = sessionFilter.value.trim().toLowerCase()
-  if (!q) return sessions.value
-  return sessions.value.filter(s =>
-    s.id.toLowerCase().includes(q) ||
-    (s.goal || '').toLowerCase().includes(q))
-})
-
 const tokenUsage = computed(() => {
   let input = 0
   let output = 0
@@ -718,49 +686,12 @@ function handleUpdateClarifyDrafts(drafts: string[]) {
   if (!p) return
   clarifyDrafts.value = { ...clarifyDrafts.value, [p.questionId]: [...drafts] }
 }
-
-function fmtDateTime(iso: string) {
-  if (!iso) return ''
-  return new Date(iso).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
 </script>
 
 <template>
   <div class="h-full flex gap-4 overflow-hidden text-ink">
-    <!-- 左侧会话列表 -->
-    <aside class="w-[280px] flex flex-col shrink-0 bg-card border border-line rounded-card overflow-hidden">
-      <div class="px-3 py-3 border-b border-line flex items-center justify-between gap-2">
-        <span class="text-sm font-bold text-ink">会话列表</span>
-        <el-button size="small" plain @click="handleNewSession">
-          <el-icon><Plus /></el-icon>
-        </el-button>
-      </div>
-      <div class="px-3 py-2 border-b border-line">
-        <el-input v-model="sessionFilter" size="small" placeholder="搜索会话…" class="chat-search">
-          <template #prefix><el-icon class="text-ink-3"><Search /></el-icon></template>
-        </el-input>
-      </div>
-
-      <div class="flex-1 overflow-y-auto">
-        <button v-for="s in filteredSessions" :key="s.id"
-                @click="openSession(s.id)"
-                class="w-full text-left px-3 py-2.5 border-b border-line hover:bg-page transition-colors"
-                :class="{ 'bg-primary-soft': activeSession?.id === s.id }">
-          <div class="flex items-center gap-2 mb-1">
-            <span class="w-1.5 h-1.5 rounded-full shrink-0" :class="statusDotClass(s.status)"></span>
-            <span class="text-[10px] text-ink-3 ml-auto shrink-0">{{ sessionStatusLabel(s) }}</span>
-          </div>
-          <div class="text-sm text-ink line-clamp-2 break-words">{{ s.goal || '(无目标)' }}</div>
-          <div class="text-[10px] text-ink-3 mt-1">{{ fmtDateTime(s.started_at) }}</div>
-        </button>
-
-        <div v-if="!filteredSessions.length" class="text-center text-xs text-ink-3 py-10">
-          暂无会话，在下方输入框直接下达命令即可创建。
-        </div>
-      </div>
-    </aside>
-
-    <!-- 中栏：标题 + 视图切换 + 双视图 -->
+    <!-- 中栏：标题 + 视图切换 + 双视图（左列「会话列表」面板已删除——会话入口统一走
+         全局侧栏目录树，见 2026-10-16 用户定调；原搜索/新建入口随之移除） -->
     <main class="flex-1 flex flex-col min-w-0 gap-3">
       <div class="h-12 bg-card border border-line rounded-card flex items-center px-4 gap-3 shrink-0">
         <span class="font-bold text-sm text-ink truncate">{{ activeSession?.goal || '新会话' }}</span>
@@ -795,9 +726,7 @@ function fmtDateTime(iso: string) {
         :work-dir-saving="workDirSaving"
         :known-dirs="knownWorkDirs"
         @submit="handleSubmit"
-        @cancel="handleCancel"
         @stop="handleStop"
-        @interrupt="handleInterrupt"
         @new-session="handleNewSession"
         @clarify-submitted="handleClarifySubmitted"
         @update-clarify-drafts="handleUpdateClarifyDrafts"
@@ -872,18 +801,5 @@ function fmtDateTime(iso: string) {
 </template>
 
 <style scoped>
-:deep(.chat-search .el-input__wrapper) {
-  background-color: var(--bma-page);
-  box-shadow: 0 0 0 1px var(--bma-border) inset;
-}
-:deep(.chat-search .el-input__wrapper.is-focus) {
-  box-shadow: 0 0 0 1px var(--bma-primary) inset;
-}
-
-.line-clamp-2 {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
+/* 会话列表面板删除后原 .chat-search / .line-clamp-2 样式一并移除（2026-10-16）。 */
 </style>

@@ -214,40 +214,50 @@ function relTime(iso: string) {
   <!-- 高度随内容（不再 flex-1 撑满）：目录少时菜单紧跟其后，不做出一大片空白；
        内容超一屏时收缩（flex-shrink 默认）→ 列表内滚动。 -->
   <div class="flex flex-col min-h-0" :class="treeOpen ? 'pt-1' : 'shrink-0'">
-    <!-- 左内边距与目录行/会话行对齐（三者箭头同一条竖线），右侧留给图标按钮 -->
-    <div class="flex items-center justify-between mx-2 pl-3 pr-1 pt-1 pb-1 shrink-0">
+    <!-- 左内边距与目录行/会话行对齐（三者箭头同一条竖线），右侧留给图标按钮。
+         WorkBuddy 式分区头：小号灰字「会话 (N)」，计数常显；动作图标收成 ghost 圆角小钮。 -->
+    <div class="flex items-center justify-between mx-2 pl-2.5 pr-1 pt-1 pb-0.5 shrink-0">
       <!-- 标题行即总开关：整行左段可点，hover 有底色（此前只有小字本身可点，看不出能点） -->
-      <div class="flex items-center gap-1.5 min-w-0 flex-1 self-stretch py-1.5 rounded-card cursor-pointer select-none hover:bg-page transition-colors"
+      <div class="flex items-center gap-1 min-w-0 flex-1 self-stretch py-1 rounded-lg cursor-pointer select-none hover:bg-page transition-colors"
            title="展开/收起会话目录" @click="toggleTree">
-        <el-icon class="text-ink-3 shrink-0 text-xs transition-transform" :class="treeOpen ? 'rotate-90' : ''"><ArrowRight /></el-icon>
-        <span class="text-xs font-medium" :class="treeOpen ? 'text-ink-2' : 'text-ink-3'">会话</span>
-        <span v-if="!treeOpen && groups.length" class="text-[10px] text-ink-3 shrink-0">{{ groups.length }}</span>
+        <el-icon class="text-ink-3 shrink-0 text-[10px] transition-transform" :class="treeOpen ? 'rotate-90' : ''"><ArrowRight /></el-icon>
+        <span class="text-xs text-ink-3">会话<span v-if="groups.length"> ({{ groups.length }})</span></span>
       </div>
-      <div class="flex items-center gap-1 shrink-0">
-        <el-button v-if="loading" link size="small" disabled><el-icon class="animate-spin"><Loading /></el-icon></el-button>
-        <el-button link size="small" title="刷新会话列表" @click="load"><el-icon><Refresh /></el-icon></el-button>
-        <el-button link size="small" title="新建会话" @click="startSession('')"><el-icon><Plus /></el-icon></el-button>
-        <el-button link size="small" title="添加工作目录" @click="addOpen = true"><el-icon><FolderAdd /></el-icon></el-button>
+      <div class="flex items-center shrink-0">
+        <button v-if="loading" class="w-6 h-6 rounded-md flex items-center justify-center text-ink-3 cursor-default" disabled>
+          <el-icon class="animate-spin text-sm"><Loading /></el-icon>
+        </button>
+        <button class="w-6 h-6 rounded-md flex items-center justify-center text-ink-3 hover:text-primary hover:bg-page transition-colors"
+                title="刷新会话列表" @click="load"><el-icon class="text-sm"><Refresh /></el-icon></button>
+        <button class="w-6 h-6 rounded-md flex items-center justify-center text-ink-3 hover:text-primary hover:bg-page transition-colors"
+                title="新建会话" @click="startSession('')"><el-icon class="text-sm"><Plus /></el-icon></button>
+        <button class="w-6 h-6 rounded-md flex items-center justify-center text-ink-3 hover:text-primary hover:bg-page transition-colors"
+                title="添加工作目录" @click="addOpen = true"><el-icon class="text-sm"><FolderAdd /></el-icon></button>
       </div>
     </div>
 
-    <div v-show="treeOpen" class="overflow-y-auto min-h-0 pb-2">
+    <div v-show="treeOpen" class="tree-scroll overflow-y-auto min-h-0 pb-2 space-y-0.5">
       <div v-if="!groups.length" class="px-3 py-2 text-xs text-ink-3">暂无会话</div>
 
       <div v-for="g in groups" :key="g.dir">
-        <!-- 目录行：单击整组收起/展开（箭头指示）；目录配置走右侧 ⋯。
-             含当前打开会话的目录给一层底色，收起状态下也能一眼定位。 -->
-        <div class="group/dir flex items-center gap-1.5 px-3 py-1.5 rounded-card mx-2 transition-colors cursor-pointer select-none"
-             :class="containsActive(g) ? 'bg-page' : 'hover:bg-page'"
+        <!-- 目录行（WorkBuddy「空间」式）：圆角 hover 药丸、常规字重，含当前会话的目录给
+             品牌软色底；目录配置走右侧 ⋯（hover 显形）。 -->
+        <div class="group/dir flex items-center gap-2 mx-2 px-2.5 py-2 rounded-lg transition-colors cursor-pointer select-none"
+             :class="containsActive(g) ? 'bg-primary-soft' : 'hover:bg-page'"
              @click="toggleCollapse(g)">
-          <el-icon class="text-ink-3 shrink-0 text-xs transition-transform"
+          <el-icon class="text-ink-3 shrink-0 text-[10px] transition-transform"
                    :class="isOpen(g) ? 'rotate-90' : ''"><ArrowRight /></el-icon>
-          <el-icon class="text-ink-2 shrink-0 text-sm">
+          <el-icon class="shrink-0 text-[15px]" :class="containsActive(g) ? 'text-primary' : 'text-ink-2'">
             <Folder v-if="!isOpen(g)" /><FolderOpened v-else />
           </el-icon>
-          <span class="text-xs font-bold truncate min-w-0 flex-1" :title="g.dir || '默认目录'">{{ g.label }}</span>
-          <el-tag v-if="g.running" size="small" type="warning" effect="plain" class="shrink-0 !px-1 !h-4 text-[10px]">{{ g.running }}</el-tag>
-          <span v-else-if="g.total" class="text-[10px] text-ink-3 shrink-0 tabular-nums">{{ g.total }}</span>
+          <span class="text-[13px] truncate min-w-0 flex-1"
+                :class="containsActive(g) ? 'text-primary font-medium' : 'text-ink'"
+                :title="g.dir || '默认目录'">{{ g.label }}</span>
+          <!-- 右侧元信息：运行中=琥珀点+数，否者纯计数（WorkBuddy 空间行的右对齐小灰字） -->
+          <span v-if="g.running" class="flex items-center gap-1 shrink-0 text-[11px] text-[var(--bma-warning)] tabular-nums" title="运行中的会话数">
+            <span class="w-1.5 h-1.5 rounded-full bg-[var(--bma-warning)] animate-pulse"></span>{{ g.running }}
+          </span>
+          <span v-else-if="g.total" class="text-[11px] text-ink-3 shrink-0 tabular-nums">{{ g.total }}</span>
 
           <el-dropdown trigger="click" @command="(c: string) => onDirCommand(c, g)">
             <el-icon class="shrink-0 text-ink-3 cursor-pointer opacity-0 group-hover/dir:opacity-100 hover:text-primary transition-opacity" @click.stop>
@@ -269,25 +279,25 @@ function relTime(iso: string) {
         </div>
 
         <!-- 会话行：最多 5 条 + 显示更多（整组收起时全隐）。
-             左侧竖线把子项挂到父目录上（缩进之外的层级线索），线随缩进对齐目录箭头。 -->
+             WorkBuddy 式扁平子项：去竖线靠缩进挂层级，选中=软色药丸，标题灰一档、时间右对齐。 -->
         <template v-if="isOpen(g)">
-        <div class="ml-[26px] mr-2 border-l border-line">
+        <div class="ml-[31px] mr-2 space-y-0.5">
           <div
             v-for="s in visibleSessions(g)"
             :key="s.id"
-            class="flex items-center gap-2 pl-3 pr-2 py-1 rounded-card cursor-pointer transition-colors"
-            :class="s.id === activeSessionId ? 'bg-[var(--bma-primary-soft)] text-[var(--bma-primary)]' : 'hover:bg-page'"
+            class="flex items-center gap-2 pl-2.5 pr-2 py-1.5 rounded-lg cursor-pointer transition-colors"
+            :class="s.id === activeSessionId ? 'bg-primary-soft' : 'hover:bg-page'"
             :title="s.goal"
             @click="openSession(s)"
           >
             <span class="w-1.5 h-1.5 rounded-full shrink-0" :class="statusDotClass(s.status)"></span>
-            <span class="text-xs truncate min-w-0 flex-1">{{ s.goal || '(无目标)' }}</span>
+            <span class="text-xs truncate min-w-0 flex-1" :class="s.id === activeSessionId ? 'text-primary font-medium' : 'text-ink-2'">{{ s.goal || '(无目标)' }}</span>
             <span class="text-[10px] text-ink-3 shrink-0 tabular-nums" :title="statusText(s.status)">{{ relTime(s.started_at) }}</span>
           </div>
 
           <div
             v-if="g.sessions.length > SESSIONS_PER_DIR"
-            class="pl-3 pr-2 py-1 text-[11px] text-ink-3 cursor-pointer hover:text-primary"
+            class="pl-2.5 pr-2 py-1 text-[11px] text-ink-3 cursor-pointer hover:text-primary transition-colors"
             @click="toggleMore(g)"
           >
             {{ isShowAll(g) ? '收起' : `显示更多 (${g.sessions.length - SESSIONS_PER_DIR})` }}
@@ -311,3 +321,30 @@ function relTime(iso: string) {
     <WorkDirDrawer v-model:dir="drawerDir" />
   </div>
 </template>
+
+<style scoped>
+/* 细滚动条（WorkBuddy 式覆盖感）：webkit 系 6px 自定义条；Chromium≥121 里
+   scrollbar-width 非 auto 会禁用 ::-webkit-scrollbar，故标准属性只给非 webkit 兜底。 */
+.tree-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.tree-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.tree-scroll::-webkit-scrollbar-thumb {
+  background: var(--bma-border);
+  border-radius: 3px;
+}
+.tree-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--bma-text-3);
+}
+.tree-scroll::-webkit-scrollbar-button {
+  display: none;
+}
+@supports not selector(::-webkit-scrollbar) {
+  .tree-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--bma-border) transparent;
+  }
+}
+</style>

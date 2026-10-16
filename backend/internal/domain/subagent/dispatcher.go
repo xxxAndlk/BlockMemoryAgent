@@ -5555,6 +5555,52 @@ func (d *Dispatcher) resumePausedNode(ctx context.Context, nodeID string) {
 	}()
 }
 
+// ResumePausedWithMessage 用户直连"停止后"的 Paused 子 Agent（编排页发送框，2026-10-16）：
+// seed 非空时先投一封 From="user" 消息入邮箱（Paused 出口不清邮箱，续跑首轮 drain 消费，
+// 成为该轮用户输入）；随后异步 resumePausedNode 续跑——续跑是完整任务执行，不能阻塞请求方。
+// seed 为空 = "消息已在箱里，只触发续跑"（Running→Paused 竞态路径，避免二次投递）。
+//
+// 时序前提：暂停收尾分支先 savePausedHistory 后 tree.Pause，故看到 Status==Paused 时
+// 历史必已落库，ResumePaused 的 LoadMessages 不会空载（无需额外等待）。
+// 实现 agent.AgentMessenger 接口，由 ReactService.MessageAgent 的 Paused 分支调用。
+func (d *Dispatcher) ResumePausedWithMessage(ctx context.Context, pausedNodeID, seed string) error {
+	sid := tool.SessionIDFromContext(ctx)
+	if sid == "" || d.treeFn == nil || d.msgStore == nil {
+		return fmt.Errorf("resume prerequisites not met (sid/tree/msgStore)")
+	}
+	t := d.treeFn(sid)
+	if t == nil {
+		return fmt.Errorf("tree not found for session %s", sid)
+	}
+	n, ok := t.Get(pausedNodeID)
+	if !ok {
+		return fmt.Errorf("paused node not found: %s", pausedNodeID)
+	}
+	if n.Status != orchestrator.StatusPaused {
+		return fmt.Errorf("node %s is not paused (status %s)", pausedNodeID, n.Status)
+	}
+	if seed != "" {
+		if d.mailbox == nil {
+			return fmt.Errorf("mailbox 未初始化")
+		}
+		if _, err := d.mailbox.Send(&mailbox.Message{
+			From:    "user",
+			To:      pausedNodeID,
+			Type:    mailbox.MsgRequest,
+			Subject: "用户直连消息",
+			Body:    seed,
+		}); err != nil {
+			return err
+		}
+	}
+	// 工作目录口径同复活路径（HTTP ctx 不携带 workdir，回落进程默认；见 subAgentWorkDirFor）。
+	if wd := d.subAgentWorkDirFor(ctx); wd != "" {
+		ctx = tool.WithWorkDir(ctx, wd)
+	}
+	d.resumePausedNode(ctx, pausedNodeID)
+	return nil
+}
+
 // concludePaused 在 Paused domain 触达续跑上限时强制收口：
 // 从 msgStore 加载已持久化历史提取部分产出（LastAssistantText 截 500 字），
 // tree.Finish 标 Done + notify 父 mailbox（文案明确标注"触限强制收口"）+ trackChildDone + 清邮箱。

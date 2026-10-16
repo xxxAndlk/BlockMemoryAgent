@@ -220,7 +220,9 @@ func (stubAgent) Tree(ctx context.Context, sessionID string) ([]orchestrator.Nod
 func (stubAgent) CancelAgent(ctx context.Context, sessionID, instID string) error { return nil }
 
 // PauseAgent 是 stubAgent 的空实现。
-func (stubAgent) PauseAgent(ctx context.Context, sessionID, instID string) error { return nil }
+func (stubAgent) PauseAgent(ctx context.Context, sessionID, instID string, cascade bool) error {
+	return nil
+}
 
 // MessageAgent 是 stubAgent 的用户直连空实现（编排页不在 TUI 测试范围）。
 func (stubAgent) MessageAgent(ctx context.Context, sessionID, instID, content string) (bool, error) {

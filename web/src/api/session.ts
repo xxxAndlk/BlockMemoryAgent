@@ -253,9 +253,14 @@ export function cancelSession(id: string): Promise<{ session_id: string; status:
   return fetchJson(`/sessions/${id}/cancel`, { method: 'POST' })
 }
 
-/** 软停止（TODO #37）：停止当前子任务、销毁倒计时窗口内可续跑。 */
-export function stopSession(id: string): Promise<{ session_id: string; status: string }> {
-  return fetchJson(`/sessions/${id}/stop`, { method: 'POST' })
+/** 停止（TODO #37 软停止；2026-10-16 统一停止按钮）：
+ *  opts.stop_children 缺省 true=全停（软停止语义，可续跑）；
+ *  false=只停主 Agent——运行中的子 Agent 继续执行、结果保留，发消息续跑时整合。 */
+export function stopSession(id: string, opts?: { stop_children?: boolean }): Promise<{ session_id: string; status: string }> {
+  return fetchJson(`/sessions/${id}/stop`, {
+    method: 'POST',
+    body: JSON.stringify({ stop_children: opts?.stop_children ?? true }),
+  })
 }
 
 /** 抢占中断：停止当前 LLM 调用并把内容作为新指令注入。 */

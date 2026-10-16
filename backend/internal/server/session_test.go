@@ -33,6 +33,15 @@ type mockAgentForServer struct {
 	workDirs       map[string]string     // SessionWorkDir: 会话 ID -> 有效工作目录
 	createdReqs    []agent.CreateRequest // CreateSession 收到的请求（保序）
 	sentMsgs       []agent.Message       // Send 收到的消息（保序）
+	// 控制面留痕（2026-10-16 /stop 可选 body 契约测试）：参数原样记录供断言。
+	controlCmds []agent.ControlCommand
+	pauseCalls  []mockPauseCall
+}
+
+// mockPauseCall 记录一次 PauseAgent 调用参数。
+type mockPauseCall struct {
+	instID  string
+	cascade bool
 }
 
 // DefaultWorkDir 实现 defaultWorkDirProvider（创建会话携带附件时的落盘目录解析）。
@@ -98,8 +107,11 @@ func (m *mockAgentForServer) Query(ctx context.Context, sessionID string, q agen
 	return agent.Result{}, nil
 }
 
-// Control 控制命令，测试实现为空操作。
+// Control 控制命令：原样留痕后返回成功（/stop 可选 body 契约测试用）。
 func (m *mockAgentForServer) Control(ctx context.Context, sessionID string, cmd agent.ControlCommand) error {
+	m.mu.Lock()
+	m.controlCmds = append(m.controlCmds, cmd)
+	m.mu.Unlock()
 	return nil
 }
 
@@ -162,8 +174,11 @@ func (m *mockAgentForServer) CancelAgent(ctx context.Context, sessionID, instID 
 	return nil
 }
 
-// PauseAgent 暂停 domain 支路，测试实现返回 nil。
-func (m *mockAgentForServer) PauseAgent(ctx context.Context, sessionID, instID string) error {
+// PauseAgent 暂停 domain 支路：留痕 cascade 后返回成功。
+func (m *mockAgentForServer) PauseAgent(ctx context.Context, sessionID, instID string, cascade bool) error {
+	m.mu.Lock()
+	m.pauseCalls = append(m.pauseCalls, mockPauseCall{instID: instID, cascade: cascade})
+	m.mu.Unlock()
 	return nil
 }
 

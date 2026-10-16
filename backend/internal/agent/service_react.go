@@ -907,11 +907,14 @@ func (s *ReactService) SetActivityEvidenceProvider(p ActivityEvidenceProvider) {
 //   - InjectUserMessage：向等子返回中的 Agent 邮箱投 From=user 消息并唤醒其 wait loop；
 //   - ReviveWithMessage：终态节点 Reopen 后同 ID 重跑（种子=原任务+上轮结果+用户消息）；
 //   - WakeIdleWithMessage：热驻 idle 节点唤醒续聊（任务=用户消息，完成回 idle 后
-//     按新权重重新武装 TTL——对话刷新墙钟）。
+//     按新权重重新武装 TTL——对话刷新墙钟）；
+//   - ResumePausedWithMessage：Paused（手动停止/软停）节点续跑——seed 非空先投消息
+//     入箱再异步 ResumePaused；seed 空 = 消息已在箱里只触发续跑（Running→Paused 竞态）。
 type AgentMessenger interface {
 	InjectUserMessage(agentID, content string) error
 	ReviveWithMessage(ctx context.Context, node orchestrator.Node, userMsg string) error
 	WakeIdleWithMessage(agentID, content string) error
+	ResumePausedWithMessage(ctx context.Context, pausedNodeID, seed string) error
 }
 
 // SetAgentMessenger 注入用户直连写通道（编排页）。nil 时 MessageAgent 一律拒绝
@@ -1049,11 +1052,31 @@ func (s *ReactService) MessageAgent(ctx context.Context, sessionID, instID, cont
 			return false, fmt.Errorf("%w: 邮箱投递失败（%v）", ErrAgentBusy, err)
 		}
 		queued = true
-		// 竞态兜底：投递后复查节点状态——窗口内恰好落终态时邮箱消息可能永不被消费，
-		// 改走复活重跑通道（种子=原任务+上轮结果+用户消息）。
-		if n, ok2 := s.TreeFor(sessionID).Get(instID); ok2 && isTerminalNodeStatus(n.Status) {
-			if err := s.messenger.ReviveWithMessage(tool.WithSessionID(ctx, sessionID), n, content); err != nil {
-				return false, err
+		// 竞态兜底：投递后复查节点状态——窗口内恰好落终态 / 转暂停（用户刚点过"停止"，
+		// pause 收尾 savePausedHistory+tree.Pause 是毫秒级但异步）时，邮箱消息可能永远
+		// 没人消费：终态→复活重跑（种子=原任务+上轮结果+用户消息）；Paused→触发续跑
+		// （消息已在箱里，续跑首轮 drain 读到）。短轮询 ≤300ms 覆盖暂停收尾窗口，
+		// 避免"刚停止就发消息"卡死在无人唤醒的暂停态。
+		for i := 0; i < 5; i++ {
+			n, ok2 := s.TreeFor(sessionID).Get(instID)
+			if !ok2 {
+				break
+			}
+			if isTerminalNodeStatus(n.Status) {
+				if err := s.messenger.ReviveWithMessage(tool.WithSessionID(ctx, sessionID), n, content); err != nil {
+					return false, err
+				}
+				break
+			}
+			if n.Status == orchestrator.StatusPaused {
+				// seed 空 = 消息已在箱里，只触发续跑（避免二次投递）。
+				if err := s.messenger.ResumePausedWithMessage(tool.WithSessionID(ctx, sessionID), instID, ""); err != nil {
+					return false, err
+				}
+				break
+			}
+			if i < 4 {
+				time.Sleep(60 * time.Millisecond)
 			}
 		}
 	case orchestrator.StatusDone, orchestrator.StatusFailed, orchestrator.StatusCancelled, orchestrator.StatusUnverified:
@@ -1068,8 +1091,15 @@ func (s *ReactService) MessageAgent(ctx context.Context, sessionID, instID, cont
 		if err := s.messenger.WakeIdleWithMessage(instID, content); err != nil {
 			return false, err
 		}
-	default: // Paused / 未知
-		return false, fmt.Errorf("%w（Paused 请到监控页恢复）", ErrAgentNotDirectable)
+	case orchestrator.StatusPaused:
+		// 停止后的直接续跑（2026-10-16 编排页"停止"交互）：用户直连消息即恢复该支路——
+		// 先投消息入箱（Paused 出口不清邮箱，续跑首轮 drain 消费），再异步 ResumePaused；
+		// 完成/失败回传由续跑路径负责（不阻塞本请求）。
+		if err := s.messenger.ResumePausedWithMessage(tool.WithSessionID(ctx, sessionID), instID, content); err != nil {
+			return false, err
+		}
+	default: // 未知状态
+		return false, fmt.Errorf("%w（该状态不支持直连）", ErrAgentNotDirectable)
 	}
 	s.store.addEvent(sess, eventkind.System, "System", "用户直连 "+instID+"："+truncateRunes(content, 200), "", "", "", "", "", true)
 	return queued, nil
@@ -1746,8 +1776,17 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		// 取消会话。
 		return s.cancel(ctx, sessionID)
 	case ControlOpStop:
-		// 软停止（TODO #37）：停止当前会话全部子任务，可续跑。
-		return s.Stop(ctx, sessionID)
+		// 停止会话（TODO #37）：默认全停（软停止语义——兼容旧调用方：TUI 发 `{}`、
+		// 存量前端无 body）；stop_children=false = 只停主 Agent（子 Agent 继续执行，
+		// 见 StopMetaOnly）。
+		stopChildren := true
+		if v, ok := cmd.Args["stop_children"].(bool); ok {
+			stopChildren = v
+		}
+		if stopChildren {
+			return s.Stop(ctx, sessionID)
+		}
+		return s.StopMetaOnly(ctx, sessionID)
 	case ControlOpTopic:
 		// 话题切换：提取 name 与 goal 并切换话题。
 		name, _ := cmd.Args["name"].(string)
@@ -2968,12 +3007,13 @@ func (s *ReactService) CancelAgent(ctx context.Context, sessionID, instID string
 	return nil
 }
 
-// PauseAgent 手动暂停指定 domain 支路（TODO 第10项③ 审计面止血动作）。
+// PauseAgent 手动暂停指定 domain 支路（TODO 第10项③ 审计面止血动作；
+// 2026-10-16 编排页"停止"按钮：不勾选=暂停本支路 cascade=false，勾选=连带子树 cascade=true）。
 // 仅 Role=domain 且 Running 的节点可暂停：先 MarkPauseNode 让 dispatcher 收尾分流到
 // Pause 分支（SaveMessages + tree.Pause，热驻槽 parked 可 ResumePaused 续），再
 // StopRunning 触发该支路 cancel；StopRunning 落空（节点已终态等）则回滚标记返回错误。
 // 非热驻叶子请用 CancelAgent；全树软停请用 Stop——两者语义不同勿混。
-func (s *ReactService) PauseAgent(ctx context.Context, sessionID, instID string) error {
+func (s *ReactService) PauseAgent(ctx context.Context, sessionID, instID string, cascade bool) error {
 	s.store.mu.Lock()
 	session, ok := s.store.sessions[sessionID]
 	s.store.mu.Unlock()
@@ -2994,6 +3034,21 @@ func (s *ReactService) PauseAgent(ctx context.Context, sessionID, instID string)
 	// 先登记暂停意图，再触发 cancel：runSubAgent/runDomainTask 的 Canceled 分支
 	// 据此路由到 Pause 收尾而非软停/硬销毁。
 	if pm, ok := s.stopMarker.(interface{ MarkPauseNode(string) }); ok {
+		// 级联（勾选"同时停止子 Agent"）：先停后代、后停本支路——先停本支路会立刻
+		// 打断其循环，正在进行的 call_sub_agent 可能在标记之后才注册新叶子，快照窗口漏停。
+		// 后代逐个 MarkPauseNode 走同一条 Pause 收尾（孙代 ctx 挂会话 stopCtx，不受本支路
+		// 取消影响，必须显式枚举）；StopRunning 落空（终态竞态）的撤销标记后跳过，不阻断整体。
+		if cascade {
+			for _, descID := range descendantRunningIDs(t, instID) {
+				pm.MarkPauseNode(descID)
+				if t.StopRunning(descID) {
+					continue
+				}
+				if cl, ok2 := s.stopMarker.(interface{ ClearPauseNode(string) }); ok2 {
+					cl.ClearPauseNode(descID)
+				}
+			}
+		}
 		pm.MarkPauseNode(instID)
 	} else {
 		return fmt.Errorf("%w: dispatcher 未接线，无法暂停", ErrInvalidSessionState)
@@ -3010,6 +3065,33 @@ func (s *ReactService) PauseAgent(ctx context.Context, sessionID, instID string)
 		"", "", "", "", "", true)
 	log.Printf("[service] PAUSE-AGENT: session=%s agent=%s domain=%s", sessionID, instID, node.Domain)
 	return nil
+}
+
+// descendantRunningIDs 返回 rootID 子树中所有 Running 后代节点 ID（不含 root 自身）。
+// 树无 Descendants API：BFS + Snapshot + ParentID 匹配（与 dispatcher.killDescendants
+// 同构，visited 防环）；非 Running 中间节点也继续下钻（孙代可能仍在跑）。
+func descendantRunningIDs(t *orchestrator.Tree, rootID string) []string {
+	if t == nil {
+		return nil
+	}
+	var out []string
+	visited := map[string]bool{rootID: true}
+	queue := []string{rootID}
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		for _, n := range t.Snapshot() {
+			if n.ParentID != pid || visited[n.ID] {
+				continue
+			}
+			visited[n.ID] = true
+			queue = append(queue, n.ID)
+			if n.Status == orchestrator.StatusRunning {
+				out = append(out, n.ID)
+			}
+		}
+	}
+	return out
 }
 
 // Shutdown 取消所有正在运行的会话。Domain 热驻模式下同时销毁全部热驻槽
@@ -3522,6 +3604,11 @@ func (s *ReactService) roleSkillBlock(roleDef *types.RoleDefinition) string {
 // runSession 为新创建的会话执行 ReAct 主循环。
 func (s *ReactService) runSession(session *reactInternalSession) { // 获取会话上下文；若不存在则使用 Background。
 	ctx := sessionContext(session)
+	// 本次 run 的运行代际快照：Canceled 分支据此判「只停主 Agent」请求是否属于本 run
+	//（防止停止请求之后消息续跑重建 context 时，旧请求误停新 run）。
+	s.store.mu.RLock()
+	myRunSeq := session.runSeq
+	s.store.mu.RUnlock()
 	// 会话结束后清理临时目录并淘汰已完成会话。
 	defer s.finalizeSession(session)
 
@@ -3671,6 +3758,13 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 			s.pauseSession(session, result.History, s.softStopPauseKind(session))
 			return
 		}
+		// 「只停主 Agent」（停止按钮未勾选，StopMetaOnly）：本 run 被 cancelFn 打断是
+		// 预期动作，落停放态而非 error——子 Agent 的 ctx 挂独立 stopCtx 不受影响，
+		// 继续跑完、结果滞留邮箱，用户发消息走 resumeSession 唤醒整合。
+		if errors.Is(err, context.Canceled) && s.consumeMetaOnlyStop(session, myRunSeq) {
+			s.pauseSession(session, result.History, PauseMetaOnlyPark)
+			return
+		}
 		// 错误分支同样落历史：ReAct 循环内部累积的 history 原本只在成功/暂停分支
 		// 提交到 session.History，出错即丢弃——用户终止/出错后发新消息续跑时
 		// History 为空，前文意图全失（2026-09-20 实证：计划被驳回后用户终止、
@@ -3738,6 +3832,10 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 获取会话上下文。
 	ctx := sessionContext(session)
+	// 本次 run 的运行代际快照（同 runSession：只停主 Agent 请求按代际消费）。
+	s.store.mu.RLock()
+	myRunSeq := session.runSeq
+	s.store.mu.RUnlock()
 	// 结束后清理资源。
 	defer s.finalizeSession(session)
 
@@ -3881,6 +3979,11 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		// 软停止分流（同 runSession）。
 		if s.isSoftStopCancel(session, err) {
 			s.pauseSession(session, result.History, s.softStopPauseKind(session))
+			return
+		}
+		// 「只停主 Agent」分流（同 runSession）。
+		if errors.Is(err, context.Canceled) && s.consumeMetaOnlyStop(session, myRunSeq) {
+			s.pauseSession(session, result.History, PauseMetaOnlyPark)
 			return
 		}
 		// 错误分支同样落历史（同 runSession：终止/出错后续跑不丢前文意图）。
@@ -4235,6 +4338,11 @@ const (
 	// PauseChildWait 挂起等子（awaiting_child）：Meta 任务已全部派发、终答轮仍有未决
 	// 子 Agent，挂起等子完成回调（WakeOnChildDone）或用户新消息唤醒续跑。
 	PauseChildWait
+	// PauseMetaOnlyPark 「只停主 Agent」停放（awaiting_clarify，无倒计时）：用户点"停止"
+	// 未勾选"同时停止子 Agent"时，仅取消 Meta 的 run——子 Agent 继续跑完、结果滞留邮箱，
+	// 发消息走 resumeSession 唤醒整合。不自动续跑（保持停止）；与 PauseUserStop 区分
+	// 在不武装销毁倒计时（文案不得提"倒计时内未续跑将销毁"）。
+	PauseMetaOnlyPark
 )
 
 // pauseMessage 按 PauseKind 返回面向用户的暂停提示文案。
@@ -4251,6 +4359,8 @@ func (s *ReactService) pauseMessage(kind PauseKind) string {
 			return "任务已停止（领域 Agent 已热驻保留）。发送消息可继续任务或派发新任务（空闲领域 Agent 可复用）。"
 		}
 		return "任务已停止。发送消息可继续任务（销毁倒计时内未续跑将销毁）。"
+	case PauseMetaOnlyPark:
+		return "已停止主 Agent。运行中的子 Agent 未被停止，会继续执行并保留结果；发送消息可继续。"
 	default:
 		// PauseIterationLimit：maxIter<=0（不限制）时不显示具体轮数，避免 "0 轮" 误报。
 		maxIter := s.runtimeCfg.LoopConfig().MaxIterations
@@ -4336,6 +4446,9 @@ func (s *ReactService) pauseSession(session *reactInternalSession, history []Rea
 		} else {
 			session.Result = "任务已停止，发送消息可续跑（销毁倒计时内未续跑将销毁）"
 		}
+	case PauseMetaOnlyPark:
+		session.Status = enums.SessionStatusAwaitingClarify
+		session.Result = "已停止主 Agent，子 Agent 继续执行并保留结果，发送消息可继续"
 	default:
 		session.Status = enums.SessionStatusAwaitingClarify
 		session.Result = "已达上限，会话暂停，等待用户消息续跑"
@@ -4467,6 +4580,10 @@ func restartSessionContext(session *reactInternalSession) {
 	session.stopCtx = stopCtx
 	session.stopCancel = stopCancel
 	session.runStartedAt = time.Now()
+	// 运行代际自增 + 清「只停主 Agent」请求：新 run 不受旧停止请求影响
+	//（停止请求只对发起时的那个 run 有效，见 metaStopSeq 字段注释）。
+	session.runSeq++
+	session.metaStopSeq = 0
 }
 
 // sendMessage 向会话发送一条消息，并在必要时恢复会话运行。
@@ -5329,8 +5446,9 @@ func (s *ReactService) SetHotResident(enabled bool) {
 // domain supervisor 的 taskStopped 分支收尾（SaveMessages + tree.Idle + trackChildDone
 // + enterIdle）；session 级倒计时停用（idle 域由加权 TTL 治理，用户下次消息才武装）。
 //
-// 边界：仅 Running 会话可停止；停止中发消息照常入 Messages，待会话落入
-// PausedOnChild 后按既有恢复路由处理（不注入正在收尾的 MetaAgent）。
+// 边界：Running 会话可停止；awaiting_clarify（2026-10-16 放宽）仅在确有 hook 等待时
+// 受理（"放弃当前提问并停止"，无 hook 的停放态幂等空转）；停止中发消息照常入 Messages，
+// 待会话落入 PausedOnChild 后按既有恢复路由处理（不注入正在收尾的 MetaAgent）。
 func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 	s.store.mu.Lock()
 	session, ok := s.store.sessions[sessionID]
@@ -5338,7 +5456,19 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 		s.store.mu.Unlock()
 		return ErrSessionNotFound
 	}
-	if session.Status != enums.SessionStatusRunning {
+	switch session.Status {
+	case enums.SessionStatusRunning:
+		// 常规软停止路径。
+	case enums.SessionStatusAwaitingClarify:
+		// 待澄清（2026-10-16 放宽：含子 Agent 提问把会话置入该态）：全停是"放弃当前提问
+		// 并停止"的逃生口——hook 阻塞在 ctx.Done 上，cancelFn/stopCancel 取消即释放提问。
+		// 但无任何 hook 在等时（停放态/重启遗留 waiting 通道为空）没有活 run 会落定，
+		// 武装倒计时后 300s 到期会把停放会话硬销毁落 error——幂等空转（会话本就已停止）。
+		if session.askUser == nil && session.approval == nil && session.askUserBatch == nil {
+			s.store.mu.Unlock()
+			return nil
+		}
+	default:
 		s.store.mu.Unlock()
 		return fmt.Errorf("%w: session is not running", ErrInvalidSessionState)
 	}
@@ -5404,6 +5534,62 @@ func (s *ReactService) Stop(ctx context.Context, sessionID string) error {
 	}
 	log.Printf("[service] SOFT-STOP: session=%s countdown=%s hotResident=%t", sessionID, s.stopCountdown, s.hotResident)
 	return nil
+}
+
+// StopMetaOnly 只停止主 Agent（停止按钮未勾选"同时停止子 Agent"）：
+// 仅取消 MetaAgent 的 run ctx（cancelFn）——子 Agent 的 ctx 挂在独立 stopCtx 上
+// 不受影响，继续跑完、结果滞留邮箱；会话落 PauseMetaOnlyPark（awaiting_clarify 停放，
+// 保持停止不自动续跑），用户发消息走 resumeSession 唤醒整合。
+//
+// 与 Stop 的区别：不置软停止标记、不停树节点、不取消 stopCtx、不武装销毁倒计时。
+func (s *ReactService) StopMetaOnly(ctx context.Context, sessionID string) error {
+	s.store.mu.Lock()
+	session, ok := s.store.sessions[sessionID]
+	if !ok {
+		s.store.mu.Unlock()
+		return ErrSessionNotFound
+	}
+	// 仅 Running 可"只停 Meta"：awaiting_clarify 若由子 Agent 提问挂起，cancelFn 解除
+	// 不了子 Agent 的等待（其阻塞挂在 stopCtx/树 cancel 上）——该态走全停（Stop）。
+	if session.Status != enums.SessionStatusRunning {
+		s.store.mu.Unlock()
+		return fmt.Errorf("%w: session is not running", ErrInvalidSessionState)
+	}
+	// 与全停窗口互斥：软停止进行中（倒计时/标记已置）时，两套 Canceled 落定分支会在
+	// 同一 run 上竞争（isSoftStopCancel 恒先判，只停请求必然落空）——直接拒绝。
+	if session.destroyAt != nil || session.stopTimer != nil {
+		s.store.mu.Unlock()
+		return fmt.Errorf("%w: session is stopping", ErrInvalidSessionState)
+	}
+	if q, ok := s.stopMarker.(interface{ IsSoftStop(string) bool }); ok && q.IsSoftStop(sessionID) {
+		s.store.mu.Unlock()
+		return fmt.Errorf("%w: session is stopping", ErrInvalidSessionState)
+	}
+	// 登记只停请求（按运行代际）：仅本 run 的 Canceled 分支消费，防止误停后续新 run。
+	session.metaStopSeq = session.runSeq
+	seq := session.runSeq
+	cancelFn := session.cancelFn
+	s.store.mu.Unlock()
+
+	s.store.addEvent(session, eventkind.System, "System",
+		"停止主 Agent：运行中的子 Agent 未受影响，会继续执行并保留结果；发送消息可继续。", "", "", "", "", "", true)
+	if cancelFn != nil {
+		cancelFn()
+	}
+	log.Printf("[service] META-ONLY-STOP: session=%s runSeq=%d", sessionID, seq)
+	return nil
+}
+
+// consumeMetaOnlyStop 在 Canceled 分支判定"本次取消是否来自只停主 Agent 请求"：
+// 命中即清标记返回 true（一次停止只消费一次）。代际对不上（请求后已续跑重建
+// context 等）视为陈旧标记，清掉返回 false——不误停新 run。
+func (s *ReactService) consumeMetaOnlyStop(session *reactInternalSession, myRunSeq int64) bool {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	hit := session.metaStopSeq != 0 && session.metaStopSeq == myRunSeq &&
+		(session.Status == enums.SessionStatusRunning || session.Status == enums.SessionStatusAwaitingClarify)
+	session.metaStopSeq = 0
+	return hit
 }
 
 // destroyAfterSoftStop 软停止倒计时到期：硬销毁会话（cascadeCancelTree 含 Paused 节点），
