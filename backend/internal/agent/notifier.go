@@ -94,6 +94,79 @@ func (n *Notifier) NotifySessionFinal(sessionID, status, goal string) {
 	})
 }
 
+// NotifyRunFinalPayload 是工作流量产 run 的终态通知报文（POST body）。
+type NotifyRunFinalPayload struct {
+	Type       string `json:"type"` // 固定 "workflow_run_final"
+	RunID      string `json:"run_id"`
+	SessionID  string `json:"session_id"`
+	Status     string `json:"status"` // done / failed / aborted
+	RecipeID   string `json:"recipe_id"`
+	Note       string `json:"note,omitempty"` // 补充说明（pause_reason 等）
+	OccurredAt string `json:"occurred_at"` // RFC3339
+}
+
+// NotifyRunFinal 工作流量产 run 终态通知入口（workflow 引擎终态回调；异步 best-effort）。
+// 过滤规则：webhook_events 命中 run 原始状态（done/failed/aborted）**或其会话语义别名**
+//（done↔completed、failed↔error）即发——默认配置 [completed, error] 无需改动即可收到
+// run 终态；60s 同 run 同状态去重。
+func (n *Notifier) NotifyRunFinal(runID, sessionID, status, recipeID, note string) {
+	if n == nil || !n.runFinalWanted(status) {
+		return
+	}
+	key := "wf\x00" + runID + "\x00" + status
+	if t, ok := n.lastFir[key]; ok && time.Since(t) < 60*time.Second {
+		return
+	}
+	n.lastFir[key] = time.Now()
+	if len(n.lastFir) > 256 {
+		for k, t := range n.lastFir {
+			if time.Since(t) >= 60*time.Second {
+				delete(n.lastFir, k)
+			}
+		}
+	}
+	go n.postAny(NotifyRunFinalPayload{
+		Type:       "workflow_run_final",
+		RunID:      runID,
+		SessionID:  sessionID,
+		Status:     status,
+		RecipeID:   recipeID,
+		Note:       truncateNotifyRunes(note, 200),
+		OccurredAt: time.Now().Format(time.RFC3339),
+	})
+}
+
+// runFinalWanted run 终态是否在配置的关注集合内（原始状态或会话语义别名）。
+func (n *Notifier) runFinalWanted(status string) bool {
+	if n.events[status] {
+		return true
+	}
+	switch status {
+	case "done":
+		return n.events["completed"]
+	case "failed":
+		return n.events["error"]
+	}
+	return false
+}
+
+// postAny 发送任意报文（post 的泛化版本，工作流通知复用同一 3s 客户端与日志口径）。
+func (n *Notifier) postAny(p any) {
+	body, err := json.Marshal(p)
+	if err != nil {
+		return
+	}
+	resp, err := n.client.Post(n.url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[notify] [WARN] webhook 发送失败: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		log.Printf("[notify] [WARN] webhook 返回 %d", resp.StatusCode)
+	}
+}
+
 // post 发送 HTTP POST；失败仅记日志（通知属 best-effort，不影响会话主流程）。
 func (n *Notifier) post(p NotifyWebhookPayload) {
 	body, err := json.Marshal(p)

@@ -91,6 +91,13 @@ const routes: Array<RouteRecordRaw> = [
         name: 'Workflow',
         component: () => import('@/views/workflow/index.vue'),
         meta: { title: '工作流编排', icon: 'SetUp' }
+      },
+      {
+        // 运行详情（名册×阶段网格 + 联系表审查 + 回灌配方）；扁平兄弟路由与其余页面一致。
+        path: 'workflow/runs/:id',
+        name: 'WorkflowRun',
+        component: () => import('@/views/workflow/RunDetail.vue'),
+        meta: { title: '工作流运行', icon: 'SetUp' }
       }
     ]
   },

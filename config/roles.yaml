@@ -59,12 +59,13 @@ meta_agent:
   # 出现 0 次），遇到能力缺口（如微信公众号抓取）只会绕路硬试，不知道能搜目录装新插件。
   # 插件工具（web_search 等）不经此列表：由 role_tool_gate 硬门闭包按"角色可见"并集放行
   #（bootstrap.go），Schema 可见性仍走 白名单 ∪（可见 ∧ 已挂载）软过滤。
-  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory, 
-          WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, schedule_task, write_plan, 
+  tools: [call_sub_agent, call_sub_agents, map_sub_agents, merge_worktree, WriteSharedMemory, ReadSharedMemory,
+          WriteSpec, send_message, cancel_agent, pause_agent, resume_agent, ask_user, schedule_task, write_plan,
           submit_plan, review_plan, ReadFile, EditFile, RestoreFile, WriteFile, RunCommand, ReadMedia, SearchInFiles,
           ListDir, ShowArtifact, list_skills, load_skill, tool_catalog, tool_mount, tool_unmount, plugin_search,
           plugin_install, plugin_enable, plugin_disable, plugin_list, list_models, set_role_model, set_agent_model,
-          expand_memory, update_evolution_prompt, search_block_memory, widget_save, widget_list]
+          expand_memory, update_evolution_prompt, search_block_memory, widget_save, widget_list,
+          workflow_freeze, workflow_run, workflow_status]
 
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:

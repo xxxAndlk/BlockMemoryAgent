@@ -86,6 +86,19 @@ Agent 产出的图/视频/音频/HTML 原型可直接在对话栏渲染（效果
 - **提交韧性**：`chat/utils/clarifySubmit.ts` 把「网络层失败」（`client.ts` 的 `NetworkError`：timeout/offline）与「业务拒绝」（`APIError` 400/409）分开——前者退避重试（2s→10s，上限 150s，覆盖本机约 1 分钟的部署重启窗口），且**每次重试前先查会话状态**确认答复是否已落地，避免二次答复；后者仅在"会话已不在待澄清"时按已提交处理。`/clarify` 超时 30s。失败时问答卡内常驻显示原因、**草稿保留**，可直接再点提交。
 - 排查提示：`Failed to fetch` 是浏览器网络层错误（请求根本没到服务端），先看 `D:\WebApp\bma\logs\backend_restart_*.log` 是否正逢重启。
 
+## 工作流量产流水线（internal/workflow，2026-10-16）
+
+配方 / 名册 / 运行三元组：Agent 打样定标 → `workflow_freeze` 冻结配方 → `workflow_run` 有界单位流水线量产 → `workflow_status` 查进度；页面 `/workflow`（配方库 + 运行列表 + 运行详情：名册×阶段网格 + 联系表人审 + 回灌配方）。
+
+- **真相源**：配方 = 工作区 `.bma/workflows/<id>.yaml`（**不落配方库表**；run 启动快照全文进 `workflow_runs.recipe_yaml`）。**版本规则：落盘时文件已存在则 version 至少现版+1**（冻结/回灌产物不覆盖同版本）；run 绑定的版本不变。名册 = workflow_run 参数内联 JSON 或 `roster_*.yaml`；件级 `stages` 裁剪。
+- **权威全在表**：`workflow_runs`/`workflow_units`（带 owner；unit 状态迁移全**行内乐观更新** `UPDATE ... WHERE status=旧值`）；**run 不是 Agent**，不挂任何对话状态。重启恢复 = 启动把全表 running 的 unit 标回 pending（幂等键不变，重跑重执行该 attempt 行，不重不漏）+ running run 重新入调度。重摇 = 新 attempt 行（产物路径带 `_aN` 后缀防覆盖）；被否 attempt **只标不删**（reject_reason 是配方演化输入）。
+- **调度语义**：件间并发 = `run.concurrency`（全局活跃 run 闸 `workflow.max_active_runs`，超额入队 pending FIFO）；件内阶段串行 + 锚点自前向后传播（`anchor_out` 采纳件写运行期锚点池，`anchor_in` 消费——重启从 done 单元重建）。pause/abort 在阶段/attempt 边界生效；结算写路径解除上游取消（`context.WithoutCancel`），防 abort 把 unit 卡死在 running。
+- **预算与熔断**：`spent_estimate` 每 attempt 累计，超 cap → run `paused(budget_exceeded)`，续跑必须提额（resume 带 `extra_budget`）；`fail_fast` 熔断 = **前 5 个到达终态的 cell 未通过（failed/needs_review）≥3 → run failed(circuit_breaker)**（回打样期修配方，不烧整批）。
+- **三层校验**：程序（`check.program` 关键字 exists/path_template/format/dimensions——png 按 cell×frames 网格乘积 + alpha 颜色模型判，免费）→ 模型评委（轻量调用**纯文本**通道：按生成提示词/契约/清单自洽判，**看不了像素**，像素品味判定归人审联系表）→ 人审（accept/reject+理由/reroll/skip；reroll 复活终态 run）。**评委不可用不重摇（重摇治不了评委）直接 needs_review**；重摇耗尽有产物→needs_review、无产物→failed；配方声明 `escalate:` 时派真子 Agent（`Dispatcher.DispatchProgrammatic` 薄封装，进 Agent 树/池）。
+- **事件与 UI**：unit 迁移落 session_events（kind=`workflow_unit`，detail 带 run_id/unit_id/from/to；引擎经 `ForwardLiveEvent` 注入，LiveEvent 有 `Detail` 字段）；前端 `turns.ts` 折进调试档（不进对话栏正文）；`eventStyles.ts` 四处映射已补。运行页 3s 轮询（非终态才开）。产物预览走 `workspaceUrl` 自渲染 `<img>`（脱离会话页不依赖 fileOpener）。
+- **工具与权限**：三工具进 meta 白名单**两处**（`domain/role/registry.go` + `roles.yaml`）；引擎生成调用经 `Registry.Dispatch`（ctx 带 session/workdir/agentID），run 创建时 `MountPreApprovedForScope(sessionID, roleID, 生成工具)` 预挂（gate 开启部署的声明式放行）；run 内的生成单位**不占** `max_concurrent_sub_agents` 池（只有升级出的例外占）。
+- **关键文件**：`internal/workflow/{recipe,roster,prompt,check,judge,drift,store,engine,executor,escalate,freeze,events,tools}.go`；`server/workflow.go`（`/api/workflow/*`）；`store.EnsureWorkflowSchema`（migration 014 双轨）；前端 `web/src/views/workflow/`。测试：包内 30+ 用例；PG 真库冒烟 `WORKFLOW_PG_DSN=... go test ./internal/workflow/ -run TestPGStoreSmoke`。遗留见 TODO #27。
+
 ## 监控页（?view=monitor）过滤行布局
 
 会话页右侧监控面板实测只有 **600~800px 宽**（1440 窗口下 806px），而 Element Plus 给 `.el-input`/`.el-select` 的 `width:100%` 会顶掉 Tailwind 的 `w-*`——它的 flex **基准尺寸=整行宽**，挤压时按基准比例分摊，把同行的下拉压成光杆箭头、溢出的徽标盖住邻座标签（2026-09-12 用户实证）。约定：

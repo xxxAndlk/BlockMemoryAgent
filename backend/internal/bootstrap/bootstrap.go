@@ -41,6 +41,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/store"
 	"github.com/blockmemory/agent/backend/internal/userprofile"
 	"github.com/blockmemory/agent/backend/internal/widgets"
+	"github.com/blockmemory/agent/backend/internal/workflow"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 	"github.com/blockmemory/agent/backend/pkg/prompts"
@@ -71,10 +72,12 @@ type ConfigPaths struct {
 // 在 ReAct 重构过程中，旧的 graph 相关字段已被移除；Runtime 字段保留，
 // 用于兼容 soul/skills/watchdog 等 API。
 type App struct {
-	Agent        agent.Agent               // ReAct Agent 服务，负责会话执行逻辑
-	Server       *server.SessionManager    // HTTP 会话管理器，处理 /api/sessions/* 请求
-	DAGHandler   *server.DAGHandler        // DAG HTTP 处理器
-	Runtime      *runtime.Runtime          // 运行时聚合器（人格、skill、watchdog 等）
+	Agent           agent.Agent            // ReAct Agent 服务，负责会话执行逻辑
+	Server          *server.SessionManager // HTTP 会话管理器，处理 /api/sessions/* 请求
+	DAGHandler      *server.DAGHandler     // DAG HTTP 处理器
+	WorkflowEngine  *workflow.Engine       // 工作流量产引擎（2026-10-16）
+	WorkflowHandler *server.WorkflowHandler // 工作流 HTTP 处理器（/api/workflow/*）
+	Runtime         *runtime.Runtime       // 运行时聚合器（人格、skill、watchdog 等）
 	Postgres     *store.PostgresStore      // PostgreSQL 持久化存储
 	Redis        *store.RedisStore         // Redis 缓存/消息存储
 	ModelFactory *model.ModelFactory       // 模型工厂，管理各角色模型连接
@@ -659,7 +662,13 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		subAgentDispatcher.WithEngineHooks(quarantine.PrepareSubagentSpawn, quarantine.OnSubagentEnded)
 	}
 	// 会话终态 Webhook 通知（TODO #18-5 T32）：webhook_url 空=关闭（NewNotifier 返 nil）。
-	agentSvc.SetNotifier(agent.NewNotifier(cfg.Notify.WebhookURL, cfg.Notify.WebhookEvents))
+	notifier := agent.NewNotifier(cfg.Notify.WebhookURL, cfg.Notify.WebhookEvents)
+	agentSvc.SetNotifier(notifier)
+	// 工作流量产引擎（2026-10-16，开发文档 §2）：装配在 RegisterCallTool 之后（依赖
+	// Dispatcher/ReactService/工具注册表已成型的部件）；三工具进 meta 白名单（role 注册表
+	// + roles.yaml 两处已同步）。
+	workflowEngine := buildWorkflowEngine(cfg, pgStore, toolRegistry, modelFactory, embedder, subAgentDispatcher, agentSvc, notifier, sessionLogger)
+	workflow.RegisterWorkflowTools(toolRegistry, workflowEngine)
 	// MetaAgent 技能目录块（【可用技能】进 meta 系统提示；Meta 持全集可 load_skill
 	// 取全文，也可派发时经 skills 参数下放任意技能）。经验技能（learned）目录收敛：
 	// 系统提示只列常用 top-N（config skills.meta_catalog_top），其余经 list_skills 检索。
@@ -1268,6 +1277,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 第十九步：创建 DAG HTTP 处理器。
 	dagHandler := server.NewDAGHandler(dagStore, dagScheduler)
 
+	// 第十九步附：启动工作流引擎（重启恢复 running runs / running unit 标回 pending）+
+	// 创建 HTTP 处理器（2026-10-16）。
+	workflowEngine.Start(ctx)
+	workflowHandler := server.NewWorkflowHandler(workflowEngine)
+	workflowHandler.SetSessionWorkDirProvider(agentSvc)
+
 	// schedule_task 工具接线（2026-09-27）：MetaAgent 创建/更新定时任务的入口。
 	// cron 合法性在此校验（标准 5 段或 Ns/Nm/Nh 相对间隔），upsert 走 dag.Store；
 	// 调度器未启用（dag_enabled=false）时返回明确错误。
@@ -1333,10 +1348,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第二十步：组装 App 实例。
 	app := &App{
-		Agent:        agentSvc,
-		Server:       sessionMgr,
-		DAGHandler:   dagHandler,
-		Runtime:      rt,
+		Agent:           agentSvc,
+		Server:          sessionMgr,
+		DAGHandler:      dagHandler,
+		WorkflowEngine:  workflowEngine,
+		WorkflowHandler: workflowHandler,
+		Runtime:         rt,
 		Postgres:     pgStore,
 		Redis:        redisStore,
 		ModelFactory: modelFactory,
@@ -1391,6 +1408,14 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			// 先停止 DAG 调度器，避免在数据库关闭后还在调度任务。
 			if dagScheduler != nil {
 				dagScheduler.Stop()
+			}
+			return nil
+		},
+		func() error {
+			// 停止工作流引擎（在途调度与生成调用取消、等 goroutine 退出），
+			// 先于存储关闭；running 的 run/unit 留在表里，下次启动恢复续跑。
+			if workflowEngine != nil {
+				workflowEngine.Stop()
 			}
 			return nil
 		},
@@ -1468,6 +1493,7 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 		"mailbox_messages":       store.EnsureMailboxSchema,
 		"session_boards":         store.EnsureBoardSchema,
 		"role_evolution_prompts": store.EnsureRoleEvolutionSchema,
+		"workflow":               store.EnsureWorkflowSchema,
 	} {
 		if err := fn(ctx, pgStore.DB()); err != nil {
 			return fmt.Errorf("ensure %s schema: %w", name, err)

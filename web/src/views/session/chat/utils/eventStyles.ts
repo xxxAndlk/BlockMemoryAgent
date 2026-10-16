@@ -19,6 +19,7 @@ export function kindTagType(kind?: string, type?: string): TagType {
   if (k === 'agent_done') return 'success'
   if (k === 'clarify') return 'warning'
   if (k === 'assistant_text') return 'primary'
+  if (k === 'workflow_unit') return 'primary'
   return 'info'
 }
 
@@ -39,6 +40,7 @@ export function kindIcon(kind?: string, type?: string): string {
   if (k === 'agent_done') return 'CircleCheck'
   if (k === 'clarify') return 'QuestionFilled'
   if (k === 'assistant_text') return 'ChatDotRound'
+  if (k === 'workflow_unit') return 'SetUp'
   return 'InfoFilled'
 }
 
@@ -77,6 +79,7 @@ export function kindLabel(kind?: string, type?: string): string {
     assistant_text: '中间正文',
     interrupt: '中断',
     enqueue: '入队',
+    workflow_unit: '工作流单元',
   }
   return map[k] || k
 }
@@ -107,6 +110,7 @@ const kindPhrases: Record<string, string> = {
   topic_switch: '切换话题上下文',
   interrupt: '已注入新指令',
   enqueue: '任务已排队',
+  workflow_unit: '量产流水线推进单元',
 }
 
 /** kind/type 对应的用户可读状态短语；无映射时回落 kindLabel。 */

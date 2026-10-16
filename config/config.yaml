@@ -187,7 +187,7 @@ data:
 # 会话到达终态时向 webhook_url best-effort POST 一条 JSON（3s 超时，失败仅记日志）。
 notify:
   webhook_url: ""                     # 空=关闭（默认）。填入如 http://127.0.0.1:9000/bma-hook 开启
-  webhook_events: [completed, error]  # 触发通知的会话终态；可选值见 pkg/enums（running/completed/error/awaiting_clarify/paused_on_child）
+  webhook_events: [completed, error]  # 触发通知的会话终态；可选值见 pkg/enums（running/completed/error/awaiting_clarify/paused_on_child）。工作流 run 终态(type=workflow_run_final)按别名匹配：done↔completed、failed↔error（默认即收）
 
 # 经验技能库治理（SessionEvolver 会话结束沉淀的 config/skills_learned/ + learned_skills 表）
 # 动机：沉淀无准入、存量无淘汰时技能库无限膨胀，meta 系统提示【可用技能】块越拉越长、选择准确率下降。
@@ -210,3 +210,11 @@ decision:
   http_url: ""              # 外部决策服务端点（provider=http 必填）；空即视为未配置回退 llm
   http_api_key: ""          # 外部服务 Bearer 鉴权；空=不带
   http_timeout_sec: 8       # 外部服务单次超时（秒）
+
+# 工作流量产流水线（2026-10-16）：Agent 打样定标 → 配方（.bma/workflows/*.yaml）→ 有界单位
+# 流水线批量产出；三层校验（程序/模型/人）+ 联系表人审。run/unit 权威在表（重启续跑）。
+workflow:
+  max_active_runs: 4        # 全局活跃 run 闸；超出的 run 入队 pending（FIFO 提升）
+  default_concurrency: 2    # 件间并发默认（配方 params.concurrency 与 workflow_run 参数优先）
+  budget_cap_default: 500   # 轻量调用次数默认上限（超限自动暂停，可在运行页提额续跑）
+  judge_timeout_ms: 30000   # 单次模型评委超时（毫秒）

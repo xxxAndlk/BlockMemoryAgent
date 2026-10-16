@@ -482,3 +482,13 @@
     - **明确不做**：不做云存储/外链分享/上传（本地优先不动）；不做 Office 在线编辑（xlsx 只读）；PDF 不做标注/表单填写（纯预览）；不做 IDE 级编辑能力（无 LSP/补全，轻量 textarea 级编辑）；FileContentHandler 遗留无约束读取不在本项收紧（另案）。
     - **依赖与顺序**：E 的树干依赖 D 的 /fs/tree；G 依赖 D 的 PUT；F 独立可先行（后端扫描+前端下拉，半天-1 天）；A 与 D 其余可并行 → B（依赖 A+D）→ C（依赖 A+B）→ E+G（依赖 D 新端点）。总预计 3 周（比原 2-2.5 周增加 E/F/G 的约 1 周）；最先落地的建议顺序：F（编辑器打开，独立小件）→ D 的 /fs/tree + PUT → E（树面板+tab+面包屑）→ G（编辑保存）→ A/B/C/H。
     - **补记（2026-10-01 核查）**：逐项核实 A–H 声明与代码一致（`internal/server` 测试 + `npm run build` 全绿）。查缺补漏一处已修：`POST /api/editors/open` 边界原为仅 WriteFile 产物（`isKnownWriteFilePath`），树面板里非产物文件可预览/编辑/reveal 却打不开编辑器——已对齐 raw/reveal 的「产物 ∪ 任一会话工作区」口径并补测试 `TestEditorOpen_WorkspaceNonArtifactAllowed`。确认仍留：Markdown **裸路径**不识别为文件链接（仅链接形态进 FileCard 链路，启发式只认扩展名/分隔符）；ArtifactCard 大小展示待后端下发 size。
+
+27. **工作流量产流水线的观察点与遗留**（2026-10-16 主体落地 M1-M5，设计/落地实录见 `docs/superpowers/plans/2026-10-16-workflow-batch-production.md` 与 `doc/变更.md` 同日条；此处只记观察点与遗留）
+    - **M6 指标待测**：单件均摊成本（轻量调用数/token）随批量上升是否持平（有界流水线成立的标志）、一次通过率、重摇收敛率、人审时间/件、漂移命中率——50 件批次与 `map_sub_agents` 同批对照跑（需真机 + 打样样本）。
+    - **视觉评委会（M3 定）**：当前评委走纯文本轻量通道（看不了像素，按提示词/契约自洽判 + 覆盖不明交人审）；视觉评委需多模态调用（抽帧/base64 喂图）或 ReadMedia 通道改造；视频类 judge 抽帧同批。json 评委"pass=true 但 reason 标需人审目检"的条目可在 M6 统计命中率。
+    - **升级 Agent 产物回收（M3）**：当前升级只派真子 Agent 并记 agent_id 到 `check_result.upgrade`，产物回收（轮询其终态把 artifact_path 写回 unit）未做。
+    - **多帧 prompts 批量**：v1 单 unit 单产物（sprite_sheet=一图网格）；"N 帧分别出文件"路线（prompts/save_as_list 数组）与帧级校验未做。
+    - **TUI**：v1 只读运行列表未做（Web 优先）。
+    - **列表 counts 成本**：`GET /workflow/runs` 每 run 一次 ListUnits（≤50 run 可接受），量大改单条聚合 SQL。
+    - **联系表**：视频产物只显示路径不内联播放（img 判定排除）；需要外发归档时再议后端拼图。
+    - **真机链路**：对话打样 → `workflow_freeze` 确认落盘 → `workflow_run` 批量 → 联系表审（reject 带理由）→ 回灌 v+1 确认落盘——待部署后实测（含重启续跑不重不漏、webhook `workflow_run_final`）。

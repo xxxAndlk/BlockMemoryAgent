@@ -490,10 +490,12 @@ async function submitBatch() {
         <span v-if="turn.agents.length > 1" class="text-ink-2">+{{ turn.agents.length - 1 }}</span>
         <span>·</span>
         <span>{{ fmtTime(turn.startedAt) }}</span>
-        <span>·</span>
-        <span :class="statusColor" class="flex items-center gap-1">
-          <el-icon v-if="turn.status === 'running'" class="is-loading"><Loading /></el-icon>
-          <el-icon v-else-if="turn.status === 'completed'"><CircleCheck /></el-icon>
+        <!-- 运行中不渲染状态块：正文里的「正在生成回答…/正在思考…/流式文本」已经是
+             权威的进行中指示，头部再挂一个「处理中」转圈是同屏双份进行中（2026-10-16
+             用户实证：两者冲突）。终态/挂起/待澄清仍照常显示。 -->
+        <span v-if="turn.status !== 'running'">·</span>
+        <span v-if="turn.status !== 'running'" :class="statusColor" class="flex items-center gap-1">
+          <el-icon v-if="turn.status === 'completed'"><CircleCheck /></el-icon>
           <el-icon v-else-if="turn.status === 'awaiting_clarify'"><QuestionFilled /></el-icon>
           <el-icon v-else-if="turn.status === 'awaiting_child'"><VideoPause /></el-icon>
           <el-icon v-else><CircleClose /></el-icon>

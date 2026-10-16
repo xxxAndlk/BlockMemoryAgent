@@ -211,6 +211,7 @@ var sessionScopedTables = []string{
 	"agent_tree_nodes",
 	"mailbox_messages",
 	"session_boards",
+	"workflow_runs", // 工作流量产运行（2026-10-16）；其 units 经 run_id 从属，见 DeleteSessionData 前置删除
 }
 
 // DeleteSessionData 硬删除会话的全部持久化数据（sessionScopedTables 逐表 DELETE）。
@@ -226,6 +227,10 @@ func (s *SessionStore) DeleteSessionData(ctx context.Context, sessionID string) 
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+	// workflow_units 无 session_id 列（经 run_id 归属），先按 run 从属删除（FK 顺序）。
+	if _, err := tx.ExecContext(ctx, `DELETE FROM workflow_units WHERE run_id IN (SELECT id FROM workflow_runs WHERE session_id = $1)`, sessionID); err != nil {
+		return fmt.Errorf("delete workflow_units: %w", err)
+	}
 	for _, table := range sessionScopedTables {
 		// 表名为编译期常量清单，非用户输入，直接内插安全。
 		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE session_id = $1`, sessionID); err != nil {

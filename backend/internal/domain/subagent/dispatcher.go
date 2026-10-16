@@ -3467,6 +3467,37 @@ func fnvHash32(s string) uint32 {
 	return h.Sum32()
 }
 
+// ProgrammaticSpec 是程序化派发（DispatchProgrammatic）的入参。
+type ProgrammaticSpec struct {
+	RoleID         string        // 子 Agent 角色 ID
+	Domain         string        // 中文领域展示名（roleID=domain 时非空）
+	Task           string        // 自包含任务简报
+	Responsibility string        // 职责说明（可空）
+	Mode           string        // 执行模式（可空）
+	VerifyKind     string        // 完成校验类型（可空；无验收传 none）
+	ToolsHint      []string      // 下放工具提示（可空）
+	SkillsHint     []string      // 下放技能集（可空）
+	ToolsGrant     []string      // 授权插件工具（可空）
+	ToolsMode      string        // 工具模式（可空）
+	WallClock      time.Duration // 派发级墙钟（<=0 用全局默认）
+}
+
+// DispatchProgrammatic 是程序化派发通道的导出薄封装（工作流量产引擎升级例外用，2026-10-16）：
+// 内部调 dispatchOne，与 call_sub_agent 同链路——RBAC（CanCall）/ 同域去重 / 派发配额 /
+// relay 熔断 / 并发池准入（enterExecGate）沿用；不入池不绕门。
+// 前置：调用方 ctx 必须携带父 agentID（agent.WithAgentID；建议同时带 tool.WithSessionID /
+// tool.WithWorkDir），父角色由 agentID 结构推断（"session-N"=meta 顶层）。
+// 不做 validateDispatchArgs 与 WriteSpec 门禁（与 acceptance.go 内部派发同先例：门禁在工具
+// Execute 层，dispatchOne 本身不含）；参数合法性由调用方保证。
+// 返回子 Agent ID 与错误 Result（成功时 Result 为 nil）。
+func (d *Dispatcher) DispatchProgrammatic(ctx context.Context, spec ProgrammaticSpec) (string, *tool.Result) {
+	if strings.TrimSpace(spec.RoleID) == "" {
+		return "", &tool.Result{Error: "programmatic dispatch: role_id required"}
+	}
+	return d.dispatchOne(ctx, spec.RoleID, spec.Domain, spec.Task, spec.Responsibility, spec.Mode, spec.VerifyKind,
+		spec.ToolsHint, spec.SkillsHint, spec.ToolsGrant, spec.ToolsMode, spec.WallClock, "", "")
+}
+
 func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint, skillsHint, toolsGrant []string, toolsMode string, wallClock time.Duration, reuseAgentID, takeover string, opts ...*dispatchOpts) (string, *tool.Result) {
 	var opt *dispatchOpts
 	if len(opts) > 0 {

@@ -26,6 +26,7 @@ type Config struct {
 	Skills      SkillsConfig      `yaml:"skills"`       // 经验技能库治理（上限/目录收敛/自动整理）
 	BlockMemory BlockMemoryConfig `yaml:"block_memory"` // 块记忆库治理（近重复合并/零访问归档，2026-10-13）
 	Decision    DecisionConfig    `yaml:"decision"`     // 决策层 provider（TODO #23）：默认 LLM 兜底，外部 HTTP 默认关
+	Workflow    WorkflowConfig    `yaml:"workflow"`     // 工作流量产流水线（2026-10-16）
 }
 
 // BlockMemoryConfig 块记忆库（global_knowledge type=block_memory）治理配置。
@@ -560,7 +561,36 @@ func (c *Config) applyDefaults() error {
 	c.applyNotifyDefaults()
 	c.applySkillsDefaults()
 	c.applyBlockMemoryDefaults()
+	c.applyWorkflowDefaults()
 	return nil
+}
+
+// WorkflowConfig 工作流量产流水线配置（2026-10-16，开发文档 §10）。
+type WorkflowConfig struct {
+	// MaxActiveRuns 全局活跃 run 闸：超出的 run 入队 pending，FIFO 提升。
+	MaxActiveRuns int `yaml:"max_active_runs"`
+	// DefaultConcurrency 件间并发默认（配方 params.concurrency 与请求参数优先）。
+	DefaultConcurrency int `yaml:"default_concurrency"`
+	// BudgetCapDefault 轻量调用次数默认上限（workflow_run 未传 budget_cap 时用）。
+	BudgetCapDefault int `yaml:"budget_cap_default"`
+	// JudgeTimeoutMS 单次模型评委超时（毫秒）。
+	JudgeTimeoutMS int `yaml:"judge_timeout_ms"`
+}
+
+// applyWorkflowDefaults 工作流默认值：4 / 2 / 500 / 30000ms。
+func (c *Config) applyWorkflowDefaults() {
+	if c.Workflow.MaxActiveRuns <= 0 {
+		c.Workflow.MaxActiveRuns = 4
+	}
+	if c.Workflow.DefaultConcurrency <= 0 {
+		c.Workflow.DefaultConcurrency = 2
+	}
+	if c.Workflow.BudgetCapDefault <= 0 {
+		c.Workflow.BudgetCapDefault = 500
+	}
+	if c.Workflow.JudgeTimeoutMS <= 0 {
+		c.Workflow.JudgeTimeoutMS = 30000
+	}
 }
 
 // applySkillsDefaults 技能库治理默认值（语义见 SkillsConfig）：50 / 20 / 30。

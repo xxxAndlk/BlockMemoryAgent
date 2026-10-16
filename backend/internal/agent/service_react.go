@@ -2661,6 +2661,96 @@ func (s *ReactService) EscalateGearHook() tool.EscalateGearHookFunc {
 	}
 }
 
+// WorkflowConfirmHook 返回工作流量产工具（workflow_run 预算审批 / workflow_freeze 配方
+// 草案确认，2026-10-16）的会话层回调。与 EscalateGearHook 同通道范式：askUser 槽位 +
+// Kind=confirm 确认卡 + resolveApproval 裁决；区别是答复原文一并返回——freeze 允许用户
+// 直接回复手改的 YAML 草案（可编辑确认）。
+// 无人值守会话（DAG 定时派发）无人可答，且审批涉及费用与批量执行：统一按"未确认"返回
+//（不自动放行——非交互会话的 self-decision 不适用于花钱的批量动作），工具侧如实回告。
+func (s *ReactService) WorkflowConfirmHook() tool.WorkflowConfirmHookFunc {
+	return func(ctx context.Context, req tool.WorkflowConfirmRequest) (tool.WorkflowConfirmResult, error) {
+		sid := tool.SessionIDFromContext(ctx)
+		if sid == "" {
+			return tool.WorkflowConfirmResult{}, fmt.Errorf("workflow confirm: missing session context")
+		}
+		if s.isNonInteractiveSession(sid) {
+			return tool.WorkflowConfirmResult{Approved: false, Answer: "无人值守会话（用户不在线）：工作流审批未确认。"}, nil
+		}
+		keepalive := s.startUserWaitKeepalive(ctx)
+		defer keepalive.Stop()
+		s.store.mu.Lock()
+		var sess *reactInternalSession
+		for {
+			sess = s.store.sessions[sid]
+			if sess == nil {
+				s.store.mu.Unlock()
+				return tool.WorkflowConfirmResult{}, fmt.Errorf("workflow confirm: 会话不存在")
+			}
+			if sess.approval == nil && sess.askUser == nil && sess.askUserBatch == nil {
+				break // 拿到空槽位；锁保持持有，下方直接占位
+			}
+			s.store.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return tool.WorkflowConfirmResult{}, ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+			s.store.mu.Lock()
+		}
+		ch := make(chan string, 1)
+		sess.askUser = ch
+		question := req.Question
+		if strings.TrimSpace(req.EditHint) != "" {
+			question += "\n\n" + req.EditHint
+		}
+		options := make([]ClarifyOption, 0, len(req.Options))
+		for _, o := range req.Options {
+			options = append(options, ClarifyOption{ID: o.ID, Label: o.Label, Description: o.Description})
+		}
+		if len(options) == 0 {
+			options = []ClarifyOption{{ID: "confirm", Label: "确认"}, {ID: "reject", Label: "拒绝"}}
+		}
+		pc := &ClarifyRequest{
+			ID:        fmt.Sprintf("wf-%d", time.Now().UnixNano()),
+			Question:  question,
+			Context:   req.Title,
+			AgentID:   tool.AgentIDFromContext(ctx),
+			CreatedAt: time.Now(),
+			Kind:      "confirm",
+			Options:   options,
+		}
+		sess.pendingClarify = pc
+		sess.Status = enums.SessionStatusAwaitingClarify
+		report := clarifyReportJSON(strings.TrimSpace(sess.StreamingText))
+		s.store.mu.Unlock()
+		// 事件留痕：正文截断（YAML 草案数千字符，事件列不装全文；全文在 pendingClarify/SSE）。
+		s.store.addEventDetail(sess, eventkind.Clarify, "System", textutil.TruncateRunes(question, 2000, "…(truncated)"), "", "", "", "", "", true, report)
+
+		select {
+		case <-ctx.Done():
+			s.store.mu.Lock()
+			if sess.askUser == ch {
+				sess.askUser = nil
+				sess.pendingClarify = nil
+			}
+			s.store.mu.Unlock()
+			return tool.WorkflowConfirmResult{}, ctx.Err()
+		case answer := <-ch:
+			s.store.mu.Lock()
+			if sess.askUser == ch {
+				sess.askUser = nil
+				sess.pendingClarify = nil
+			}
+			if sess.Status == enums.SessionStatusAwaitingClarify {
+				sess.Status = enums.SessionStatusRunning
+			}
+			sess.StreamingText = ""
+			s.store.mu.Unlock()
+			return tool.WorkflowConfirmResult{Approved: resolveApproval(answer, pc), Answer: answer}, nil
+		}
+	}
+}
+
 // gearDisplayName 档位展示名（事件箭头文案用，英文枚举 id）：空档按 daily（默认档语义）。
 func gearDisplayName(gear string) string {
 	switch gear {
@@ -4275,7 +4365,7 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 			// 带给前端——事件 Tool 字段只放得下角色 ID，domain 角色恒为 "domain"，
 			// 九个领域会同名无法区分谁是谁。
 			for _, dis := range parseSubAgentDispatch(ev.Input) {
-				s.store.addEventDetail(session, eventkind.Message, ev.Agent, dis.Task, "sub_agent_dispatch", dis.RoleID, "", "", "", true, dispatchDomainJSON(dis.Domain))
+				s.store.addEventDetail(session, eventkind.Message, ev.Agent, dis.Task, eventkind.SubAgentDispatch, dis.RoleID, "", "", "", true, dispatchDomainJSON(dis.Domain))
 			}
 		}
 		// 其他工具的调用事件已由工具注册表的进度回调记录（handleToolEvent），此处不重复。
@@ -4287,7 +4377,7 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		}
 		s.store.addEvent(session, eventkind.ToolExec, ev.Agent, "", "", ev.Tool, strings.TrimSpace(ev.Output), ev.Output, ev.Error, ev.Success)
 	case LiveEventSubAgentDone:
-		s.store.addEvent(session, eventkind.Message, "SubAgent", ev.Tool, "sub_agent_done", "", "", "", "", true)
+		s.store.addEvent(session, eventkind.Message, "SubAgent", ev.Tool, eventkind.SubAgentDone, "", "", "", "", true)
 		// 子 Agent 结果摘要（react_agent 侧已截断 200 runes）落 llm_result 事件，
 		// 让 TUI/Web 直接看到领域 Agent 的关键产出；Tool 承载子 Agent ID 供 TUI 映射展示名。
 		if strings.TrimSpace(ev.Text) != "" {
@@ -4296,7 +4386,7 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 	case LiveEventPeerAsk:
 		// 收到其他 Agent 的提问（cross-Agent 问答，send_message request/escalate 投递）：
 		// 落 Message 事件供用户看到问答在发生；正文为提问方+摘要。
-		s.store.addEvent(session, eventkind.Message, "PeerAsk", "收到 "+ev.Tool+" 的询问", "peer_ask", ev.Tool, "", "", "", true)
+		s.store.addEvent(session, eventkind.Message, "PeerAsk", "收到 "+ev.Tool+" 的询问", eventkind.PeerAsk, ev.Tool, "", "", "", true)
 		if strings.TrimSpace(ev.Text) != "" {
 			s.store.addEventDetail(session, eventkind.Progress, "PeerAsk", ev.Text, eventkind.LLMResult, ev.Tool, "", "", "", true, agentIDJSON(ev.Tool))
 		}
@@ -4305,13 +4395,20 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		// 落 Message 事件让用户看到长任务中途进展；kind=milestone 与 sub_agent_done
 		// 区分（是中途播报不是完成回传），前端按发言档展示。
 		if strings.TrimSpace(ev.Text) != "" {
-			s.store.addEvent(session, eventkind.Message, "SubAgent", ev.Text, "milestone", ev.Tool, "", "", "", true)
+			s.store.addEvent(session, eventkind.Message, "SubAgent", ev.Text, eventkind.Milestone, ev.Tool, "", "", "", true)
 		}
 	case LiveEventNotify:
 		// 系统级通知（如"模型不支持图片输入，已剥图降级"）：落 System 事件，
 		// 让用户在对白流里看到 agent 为何改变了做法（而非静默换路）。
 		if strings.TrimSpace(ev.Text) != "" {
 			s.store.addEvent(session, eventkind.System, ev.Agent, ev.Text, "", "", "", "", "", true)
+		}
+	case LiveEventWorkflowUnit:
+		// 工作流量产单元状态迁移（workflow 引擎经 ForwardLiveEvent 注入，2026-10-16）：
+		// 落 kind=workflow_unit 事件，detail_json 带 run_id/unit_id/from/to（监控页可见；
+		// Tool 字段承载 run_id）。运行详情页另有 3s 轮询，此处只做账本留痕。
+		if strings.TrimSpace(ev.Text) != "" {
+			s.store.addEventDetail(session, eventkind.Message, "Workflow", ev.Text, eventkind.WorkflowUnit, ev.Tool, "", "", "", true, ev.Detail)
 		}
 	case LiveEventTokenUsage:
 		// 单次 LLM 调用 token 用量：记为 token_usage 调试事件，供前端实时累加展示。

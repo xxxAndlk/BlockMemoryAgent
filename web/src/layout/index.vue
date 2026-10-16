@@ -48,23 +48,12 @@
               <span class="text-xs text-ink-3">{{ g.title }}</span>
             </template>
             <el-menu-item v-for="item in g.items" :key="item.path" :index="item.path"
-                          :class="{ 'is-active-custom': route.path === item.path }">
+                          :class="{ 'is-active-custom': activePath(item.path) }">
               <el-icon><component :is="item.icon" /></el-icon>
               <span>{{ item.title }}</span>
             </el-menu-item>
           </el-menu-item-group>
         </el-menu>
-
-        <!-- Beta 预留：工作流编排（mt-auto：会话树收起时把尾部区块钉在侧栏底部） -->
-        <div class="px-3 pb-3 mt-auto">
-          <router-link to="/workflow"
-                       class="flex items-center justify-between px-3 py-2.5 rounded-card border border-dashed border-line text-ink-3 hover:text-primary hover:border-primary transition-colors">
-            <span class="flex items-center gap-2 text-sm">
-              <el-icon><SetUp /></el-icon>工作流编排
-            </span>
-            <el-tag size="small" effect="plain" type="warning">Beta</el-tag>
-          </router-link>
-        </div>
 
         <div class="p-4 text-xs text-ink-3 border-t border-line flex justify-between items-center">
           <div>
@@ -95,6 +84,11 @@ import { useTheme } from '@/composables/useTheme'
 import WorkDirTree from '@/components/WorkDirTree.vue'
 
 const route = useRoute()
+
+/** 菜单高亮：精确匹配，或前缀匹配（详情页 /workflow/runs/:id 保持 /workflow 高亮）。 */
+function activePath(p: string): boolean {
+  return route.path === p || route.path.startsWith(p + '/')
+}
 const { theme, toggleTheme } = useTheme()
 
 const soulName = ref('default')
@@ -139,6 +133,9 @@ const menuGroups = [
     title: '系统',
     items: [
       { path: '/dag', title: '定时任务', icon: 'AlarmClock' },
+      // 工作流量产（2026-10-16）：原底部 Beta 占位项转正进菜单；详情页 /workflow/runs/:id
+      // 经 activePath 前缀匹配保持高亮。
+      { path: '/workflow', title: '工作流编排', icon: 'SetUp' },
       { path: '/settings', title: '系统设置', icon: 'Setting' },
     ],
   },

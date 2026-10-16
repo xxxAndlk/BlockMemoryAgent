@@ -29,4 +29,11 @@ const (
 	Message       = "message"        // 普通消息事件
 	Interrupt     = "interrupt"      // 中断事件
 	Enqueue       = "enqueue"        // 入队事件
+
+	// 以下为历史字面量收编（2026-10-16 工作流量产：新 kind 入库时顺带统一；值不变）。
+	SubAgentDispatch = "sub_agent_dispatch" // 子 Agent 派发事件（对话栏子 Agent 列表）
+	SubAgentDone     = "sub_agent_done"     // 子 Agent 完成事件
+	PeerAsk          = "peer_ask"           // 跨 Agent 提问（收到询问）事件
+	Milestone        = "milestone"          // 子 Agent 中途里程碑播报
+	WorkflowUnit     = "workflow_unit"      // 工作流量产单元状态迁移事件（2026-10-16）
 )

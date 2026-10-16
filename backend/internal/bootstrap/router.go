@@ -68,6 +68,11 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	// DAG 相关端点：调度器未启用时各 handler 自行返回 503。
 	app.DAGHandler.RegisterRoutes(api)
 
+	// 工作流量产端点（2026-10-16）：引擎未接线时各 handler 自行返回 503。
+	if app.WorkflowHandler != nil {
+		app.WorkflowHandler.RegisterRoutes(api)
+	}
+
 	// 其他业务端点。
 	api.POST("/snapshot", apiHandler.SnapshotHandler)                         // 快照管理
 	api.POST("/memory/search", apiHandler.MemorySearchHandler)                // 记忆检索

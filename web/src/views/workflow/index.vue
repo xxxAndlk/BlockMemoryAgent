@@ -1,21 +1,53 @@
 <template>
-  <div class="h-full overflow-y-auto text-ink">
-    <div class="max-w-2xl mx-auto flex flex-col items-center text-center pt-16">
-      <div class="rounded-full bg-primary-soft p-5 mb-4">
-        <el-icon class="text-5xl text-primary"><SetUp /></el-icon>
+  <div class="p-6 h-full overflow-y-auto text-ink">
+    <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
+      <div>
+        <h2 class="text-lg font-bold text-ink">工作流编排</h2>
+        <p class="text-xs text-ink-2 mt-1">
+          打样定标 → 配方（<code>.bma/workflows/*.yaml</code>）→ 有界单位流水线批量产出；配方库与运行记录都在这。
+        </p>
       </div>
-      <div class="flex items-center gap-2 mb-1">
-        <span class="text-lg font-bold">工作流编排</span>
-        <el-tag size="small" type="warning" effect="plain">Beta</el-tag>
-      </div>
-      <div class="text-sm text-ink-2 mb-6">可视化编排多 Agent 工作流，该能力为 Beta 预留，入口先行开放。</div>
-
-      <div class="w-full bg-card border border-line rounded-card p-5 text-left text-sm space-y-3">
-        <div class="font-bold text-sm">规划能力</div>
-        <div class="flex items-start gap-2 text-ink-2"><el-icon class="mt-0.5 text-primary"><Connection /></el-icon>拖拽节点编排：Meta / Domain / Assistant 角色自由组合</div>
-        <div class="flex items-start gap-2 text-ink-2"><el-icon class="mt-0.5 text-primary"><Share /></el-icon>依赖连线与条件分支，声明式 DAG</div>
-        <div class="flex items-start gap-2 text-ink-2"><el-icon class="mt-0.5 text-primary"><Monitor /></el-icon>运行观测：节点级状态、日志与指标联动会话监控</div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs text-ink-2 shrink-0">工作目录</span>
+        <div class="w-[320px] shrink-0">
+          <el-input v-model="workdir" size="small" placeholder="配方所在工作目录绝对路径" clearable class="!w-full"
+                    @change="persistWorkdir" />
+        </div>
+        <el-button size="small" plain class="!bg-transparent !border-line !text-ink" @click="refreshKey++">
+          <el-icon class="mr-1"><Refresh /></el-icon>刷新
+        </el-button>
       </div>
     </div>
+
+    <el-tabs v-model="tab">
+      <el-tab-pane label="配方库" name="recipes">
+        <RecipeList :workdir="workdir" :refresh-key="refreshKey" />
+      </el-tab-pane>
+      <el-tab-pane label="运行列表" name="runs">
+        <RunList :refresh-key="refreshKey" />
+      </el-tab-pane>
+    </el-tabs>
   </div>
 </template>
+
+<script setup lang="ts">
+import { ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import RecipeList from './RecipeList.vue'
+import RunList from './RunList.vue'
+
+const route = useRoute()
+const router = useRouter()
+
+const tab = ref<'recipes' | 'runs'>((route.query.tab as string) === 'runs' ? 'runs' : 'recipes')
+const refreshKey = ref(0)
+
+// 工作目录：?workdir= > localStorage 记忆 > 空（空时配方库提示先选目录）。
+const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('bma:workflow-workdir') || '' : ''
+const workdir = ref((route.query.workdir as string) || stored)
+
+function persistWorkdir() {
+  if (typeof localStorage !== 'undefined') localStorage.setItem('bma:workflow-workdir', workdir.value)
+  router.replace({ query: { ...route.query, workdir: workdir.value || undefined } })
+}
+</script>

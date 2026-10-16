@@ -227,6 +227,10 @@ const (
 	// LiveEventNotify 是系统级通知事件（Text 为面向用户/模型的完整说明）：
 	// 目前用于"模型不支持图片输入"的降级告知（2026-09-16），会话层落 System 事件。
 	LiveEventNotify = "notify"
+	// LiveEventWorkflowUnit 是工作流量产单元状态迁移事件（2026-10-16，workflow 引擎
+	// 经 ForwardLiveEvent 注入）：会话层落 kind=workflow_unit 事件（Detail 带
+	// run_id/unit_id/from/to），监控页可见。Tool 字段承载 run_id。
+	LiveEventWorkflowUnit = "workflow_unit"
 )
 
 // LiveEvent 是 ReAct 运行过程中的实时进度事件，
@@ -241,6 +245,7 @@ type LiveEvent struct {
 	Output  string // Output 工具输出（tool_exec 使用）
 	Error   string // Error 工具错误信息（tool_exec 使用）
 	Success bool   // Success 工具是否执行成功（tool_exec 使用）
+	Detail  string // Detail 扩展详情 JSON（workflow_unit 使用：run_id/unit_id/from/to 等，落 detail_json）
 	// InputTokens/OutputTokens 仅 token_usage 使用：本次 LLM 调用的输入/输出 token 数。
 	InputTokens  int64
 	OutputTokens int64
