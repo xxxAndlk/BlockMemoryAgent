@@ -120,3 +120,42 @@ func TestReportWidgetAction(t *testing.T) {
 		t.Fatalf("终态会话不应注入邮箱: %v", m.contents)
 	}
 }
+
+// TestBroadcastWidgetData 钉死连接器广播出口：payload 写入全部在内存会话的瞬时
+// 通道（webhook/调度器/poll 无单一目标会话，广播保证打开部件的所有会话都收到
+// widget_data 帧）；空 widgetID 忽略；64KB 截断与 PushWidgetData 同款。
+func TestBroadcastWidgetData(t *testing.T) {
+	svc, sess := newLiveEventTestSession(t)
+	sess2 := svc.store.createSession("test-2", "")
+	_ = sess2
+
+	// 空 widgetID 忽略。
+	svc.BroadcastWidgetData("", "x")
+	if len(sess.widgetData) != 0 {
+		t.Fatal("空 widgetID 不应写入")
+	}
+
+	// 多会话广播：两个会话都收到最新值。
+	svc.BroadcastWidgetData("conn-w", `{"n":1}`)
+	if e := sess.widgetData["conn-w"]; e.payload != `{"n":1}` || e.seq != 1 {
+		t.Fatalf("会话 1 未收到广播: %+v", e)
+	}
+	if e := sess2.widgetData["conn-w"]; e.payload != `{"n":1}` || e.seq != 1 {
+		t.Fatalf("会话 2 未收到广播: %+v", e)
+	}
+
+	// 覆盖写：seq 递增。
+	svc.BroadcastWidgetData("conn-w", `{"n":2}`)
+	if e := sess.widgetData["conn-w"]; e.payload != `{"n":2}` || e.seq != 2 {
+		t.Fatalf("覆盖写不符: %+v", e)
+	}
+	if e := sess2.widgetData["conn-w"]; e.payload != `{"n":2}` || e.seq != 2 {
+		t.Fatalf("会话 2 覆盖写不符: %+v", e)
+	}
+
+	// 64KB 截断语义与 PushWidgetData 同款。
+	svc.BroadcastWidgetData("big", strings.Repeat("x", widgetPayloadMaxBytes+100))
+	if got := sess.widgetData["big"].payload; len(got) != widgetPayloadMaxBytes {
+		t.Fatalf("payload 应截断到 %d, got %d", widgetPayloadMaxBytes, len(got))
+	}
+}

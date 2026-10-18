@@ -426,6 +426,31 @@ export interface WidgetDataFrame {
   payload: string
 }
 
+/**
+ * 部件连接器（2026-10-17 Widget「连接器」：万物皆可外接，widget.json 清单 connector 段）。
+ * 四种 type：url=iframe 直连外部页面 / api=后端定时拉外部 HTTP 接口 / mcp=后端定时调 MCP 插件工具 /
+ * webhook=反向，外部系统 POST 数据进来推给部件。后三种无 entry 文件时为「裸接件」，由通用数据卡直显。
+ */
+export interface WidgetConnector {
+  type: 'url' | 'api' | 'mcp' | 'webhook'
+  /** url=外部页面地址 / api=数据接口 URL / mcp=MCP 工具名（webhook 不需要） */
+  target?: string
+  /** api 类型的 HTTP 方法（GET/POST） */
+  method?: string
+  /** api 类型的请求头（值支持 ${ENV_VAR} 由后端展开） */
+  headers?: Record<string, string>
+  /** api 类型的请求体（POST 时可选，原文透传） */
+  body?: string
+  /** mcp 类型的工具调用参数（JSON 对象） */
+  args?: Record<string, unknown>
+  /** api/mcp 定时刷新间隔秒 */
+  interval_sec?: number
+  /** 单次请求/调用超时秒 */
+  timeout_sec?: number
+  /** webhook 明文 token（仅创建/再生时由后端生成返回） */
+  token?: string
+}
+
 /** 部件清单信息（与后端 widgets.Info 对齐；id = widgets/ 下的目录名）。 */
 export interface WidgetInfo {
   id: string
@@ -438,6 +463,10 @@ export interface WidgetInfo {
   files?: string[]
   /** 创建者归属（Agent 实例/用户），旧清单缺省为空。 */
   owner?: string
+  /** 连接器配置（清单 connector 段；无连接器部件缺省为空）。 */
+  connector?: WidgetConnector
+  /** webhook 类型详情/创建/再生响应附带：回调地址（相对路径，展示时拼 origin）。 */
+  hook_url?: string
 }
 
 /** 回收站条目（GET /widgets/trash 返回 trash 数组项；目录名形如 <id>.<timestamp>）。 */

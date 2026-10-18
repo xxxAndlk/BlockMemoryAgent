@@ -55,6 +55,10 @@ type reactInternalSession struct {
 	eventSeqNext int64
 	// Messages 保存用于前端/LLM 对话上下文的聊天消息。
 	Messages []Message
+	// writeArtifacts 是会话内 WriteFile 工具调用捕获的脚本产物（路径+原文节选，
+	// 技能进化输入）：技能沉淀要带"真实使用过的脚本代码"，靠事件摘要的截断行
+	// 无法还原全文，须在工具调用点原文捕获。容量见 captureWriteArtifact 上限。
+	writeArtifacts []writeArtifact
 	// firstTurnImages 是首条消息（创建会话时）携带的用户图片（Alt+V 粘贴）：
 	// 纯内存，runSession 注入 runCtx 后一次性消费置 nil；重启丢失，
 	// 历史只剩 [image:N] 占位文本。

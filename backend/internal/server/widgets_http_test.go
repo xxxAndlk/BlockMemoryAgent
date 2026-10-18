@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -24,9 +25,10 @@ import (
 //（其余走 mockAgentForServer）；记录调用供断言。
 type widgetTestAgent struct {
 	*mockAgentForServer
-	pushes  []string
-	reports []string
-	actions []string
+	pushes     []string
+	reports    []string
+	actions    []string
+	broadcasts []string
 }
 
 func (w *widgetTestAgent) PushWidgetData(sessionID, widgetID, payload string) {
@@ -41,13 +43,22 @@ func (w *widgetTestAgent) ReportWidgetAction(sessionID, widgetID, action, payloa
 	w.actions = append(w.actions, sessionID+"|"+widgetID+"|"+action+"|"+payload)
 }
 
+// BroadcastWidgetData 模拟 ReactService 的部件数据全会话广播（连接器出口断言用）。
+func (w *widgetTestAgent) BroadcastWidgetData(widgetID, payload string) {
+	w.broadcasts = append(w.broadcasts, widgetID+"|"+payload)
+}
+
 // newWidgetTestRouter 构造挂部件路由的测试路由器（与生产路由形态一致）。
 func newWidgetTestRouter(h *APIHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.HandleMethodNotAllowed = true
 	r.GET("/api/widgets", h.ListWidgetsHandler)
+	r.POST("/api/widgets", h.CreateWidgetHandler)
 	r.GET("/api/widgets/:id", h.GetWidgetHandler)
+	r.PUT("/api/widgets/:id/connector", h.UpdateWidgetConnectorHandler)
+	r.POST("/api/widgets/:id/poll", h.PollWidgetHandler)
+	r.POST("/api/widgets/:id/hook/:token", h.WidgetHookHandler)
 	r.POST("/api/widgets/:id/enable", h.EnableWidgetHandler)
 	r.POST("/api/widgets/:id/disable", h.DisableWidgetHandler)
 	r.POST("/api/widgets/reload", h.ReloadWidgetsHandler)
@@ -348,4 +359,318 @@ func TestWidgetAPI_FileCSP(t *testing.T) {
 	check("/api/widgets/card/files/app.js", base)
 	check("/api/widgets/card/files/index.html", base+"; sandbox allow-scripts")
 	check("/api/widgets/card/files/pic.svg", base+"; sandbox allow-scripts")
+}
+
+// ---- 连接器（2026-10-17）----
+
+var widgetHookTokenPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// widgetHookResp 解析创建/再生/详情响应（裸 Info + 顶层 hook_url）。
+type widgetHookResp struct {
+	widgets.Info
+	HookURL string `json:"hook_url"`
+}
+
+// createHookWidget 经 POST /api/widgets 建一个 webhook 裸接件，返回响应与 token。
+func createHookWidget(t *testing.T, r *gin.Engine, id string) widgetHookResp {
+	t.Helper()
+	body := `{"name":"推送接件","connector":{"type":"webhook"}}`
+	if id != "" {
+		body = `{"id":"` + id + `","name":"推送接件","connector":{"type":"webhook"}}`
+	}
+	rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp widgetHookResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// TestWidgetAPI_ManifestNotServed 钉死安全硬前提：widget.json（含 webhook token）
+// 与点开头文件不得经文件服务泄露——泄露 = 任何人可推数据。
+func TestWidgetAPI_ManifestNotServed(t *testing.T) {
+	r, mgr, _ := newWidgetTestEnv(t)
+	if _, err := mgr.Save("card", widgets.Manifest{Name: "c"},
+		[]widgets.FileInput{{Path: "index.html", Content: "<h1>hi</h1>"}}); err != nil {
+		t.Fatal(err)
+	}
+	// 手工放一个隐藏文件（Save 本身拒绝点开头路径，模拟运维手放杂物）。
+	hidden := filepath.Join(mgr.Dir(), "card", ".secret-env")
+	if err := os.WriteFile(hidden, []byte("TOKEN=SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 清单：403，且不泄露内容。
+	rec := doWidgetJSON(t, r, http.MethodGet, "/api/widgets/card/files/widget.json", "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("widget.json 应 403, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"entry"`) || strings.Contains(rec.Body.String(), "SECRET") {
+		t.Fatalf("响应不得含清单内容: %s", rec.Body.String())
+	}
+	// 隐藏文件：403；隐藏目录内的文件同样 403。
+	rec = doWidgetJSON(t, r, http.MethodGet, "/api/widgets/card/files/.secret-env", "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("隐藏文件应 403, got %d", rec.Code)
+	}
+	if err := os.MkdirAll(filepath.Join(mgr.Dir(), "card", ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mgr.Dir(), "card", ".git", "config"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doWidgetJSON(t, r, http.MethodGet, "/api/widgets/card/files/.git/config", ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("隐藏目录内文件应 403, got %d", rec.Code)
+	}
+	// 普通文件不受影响。
+	if rec := doWidgetJSON(t, r, http.MethodGet, "/api/widgets/card/files/index.html", ""); rec.Code != http.StatusOK {
+		t.Fatalf("普通文件应 200, got %d", rec.Code)
+	}
+}
+
+// TestWidgetAPI_CreateConnector 钉死 POST /api/widgets：webhook 裸接件返回 token 明文 +
+// 顶层 hook_url 且不生成 index.html；id 缺省生成 conn- 前缀；校验失败 400。
+func TestWidgetAPI_CreateConnector(t *testing.T) {
+	r, mgr, _ := newWidgetTestEnv(t)
+
+	// webhook 裸接件。
+	resp := createHookWidget(t, r, "conn-push")
+	if resp.ID != "conn-push" || resp.Connector == nil || resp.Connector.Type != "webhook" {
+		t.Fatalf("响应 Info 不符: %+v", resp)
+	}
+	if !widgetHookTokenPattern.MatchString(resp.Connector.Token) {
+		t.Fatalf("token 应为 32 位 hex: %q", resp.Connector.Token)
+	}
+	wantHook := "/api/widgets/conn-push/hook/" + resp.Connector.Token
+	if resp.HookURL != wantHook {
+		t.Fatalf("hook_url 不符: %q want %q", resp.HookURL, wantHook)
+	}
+	// 裸接件：无 index.html（文件服务 404），清单在册。
+	info, ok := mgr.Get("conn-push")
+	if !ok || len(info.Files) != 0 {
+		t.Fatalf("裸接件不应有文件: %+v ok=%v", info, ok)
+	}
+	if rec := doWidgetJSON(t, r, http.MethodGet, "/api/widgets/conn-push/files/index.html", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("裸接件 index.html 应 404, got %d", rec.Code)
+	}
+	// 详情 GET 也带 hook_url（顶层）。
+	rec := doWidgetJSON(t, r, http.MethodGet, "/api/widgets/conn-push", "")
+	var detail widgetHookResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil || detail.HookURL != wantHook {
+		t.Fatalf("详情应带 hook_url: %s err=%v", rec.Body.String(), err)
+	}
+
+	// id 缺省生成 conn-<8位小写字母数字>。
+	resp2 := createHookWidget(t, r, "")
+	if !regexp.MustCompile(`^conn-[a-z0-9]{8}$`).MatchString(resp2.ID) {
+		t.Fatalf("缺省 id 形态不符: %q", resp2.ID)
+	}
+
+	// 400 族：坏 id / 缺 name / 缺 connector / 坏 connector / 外部 token。
+	cases := []string{
+		`{"id":"Bad_ID","name":"x","connector":{"type":"webhook"}}`,
+		`{"connector":{"type":"webhook"}}`,                               // 缺 name
+		`{"name":"x"}`,                                                   // 缺 connector
+		`{"name":"x","connector":{"type":"sms"}}`,                        // 坏 type
+		`{"name":"x","connector":{"type":"api"}}`,                        // api 缺 target
+		`{"name":"x","connector":{"type":"webhook","token":"deadbeef"}}`, // 外部 token
+	}
+	for i, body := range cases {
+		if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets", body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("case %d 应 400, got %d body=%s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets", `{bad`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("坏 JSON 应 400, got %d", rec.Code)
+	}
+
+	// 带 files 创建（api 型）：文件落盘继承 Manager.Save 校验与上限。
+	rec = doWidgetJSON(t, r, http.MethodPost, "/api/widgets", `{
+		"id":"conn-quotes","name":"行情","connector":{"type":"api","target":"https://example.com/q","interval_sec":3},
+		"files":[{"path":"index.html","content":"<html/>"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("带 files 创建: %d body=%s", rec.Code, rec.Body.String())
+	}
+	info, ok = mgr.Get("conn-quotes")
+	if !ok || len(info.Files) != 1 || info.Connector.IntervalSec != 10 {
+		t.Fatalf("files/钳制不符: %+v ok=%v", info, ok)
+	}
+}
+
+// TestWidgetAPI_UpdateConnector 钉死 PUT connector：regen_token 换 token（旧地址 401、
+// 新地址 200），非 regen 续用；404/400 语义。
+func TestWidgetAPI_UpdateConnector(t *testing.T) {
+	r, mgr, facade := newWidgetTestEnv(t)
+	created := createHookWidget(t, r, "conn-upd")
+	oldToken := created.Connector.Token
+
+	// 非 regen：token 续用。
+	rec := doWidgetJSON(t, r, http.MethodPut, "/api/widgets/conn-upd/connector",
+		`{"type":"webhook"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp widgetHookResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Connector.Token != oldToken {
+		t.Fatal("非 regen 应续用 token")
+	}
+
+	// regen：新 token + 新 hook_url。
+	rec = doWidgetJSON(t, r, http.MethodPut, "/api/widgets/conn-upd/connector",
+		`{"type":"webhook","regen_token":true}`)
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Connector.Token == oldToken || resp.HookURL == "" {
+		t.Fatalf("regen 应换 token: %+v", resp)
+	}
+	// 旧地址 401，新地址 200 且广播。
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-upd/hook/"+oldToken, `{"a":1}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("旧 token 应 401, got %d", rec.Code)
+	}
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-upd/hook/"+resp.Connector.Token, `{"a":1}`); rec.Code != http.StatusOK {
+		t.Fatalf("新 token 应 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(facade.broadcasts) != 1 || facade.broadcasts[0] != `conn-upd|{"a":1}` {
+		t.Fatalf("应广播 webhook payload: %v", facade.broadcasts)
+	}
+
+	// 换 api 型：token 清空、target 写入、其余清单字段保留。
+	// 注意：每次都用新变量解析——json.Unmarshal 合并且不清零已存在的指针字段。
+	rec = doWidgetJSON(t, r, http.MethodPut, "/api/widgets/conn-upd/connector",
+		`{"type":"api","target":"https://example.com/feed","interval_sec":15}`)
+	var apiResp widgetHookResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &apiResp); err != nil {
+		t.Fatal(err)
+	}
+	if apiResp.Connector.Type != widgets.ConnectorTypeAPI || apiResp.Connector.Token != "" ||
+		apiResp.Connector.Target != "https://example.com/feed" || apiResp.Connector.IntervalSec != 15 {
+		t.Fatalf("api 化不符: %+v", apiResp.Connector)
+	}
+	info, _ := mgr.Get("conn-upd")
+	if info.Name != "推送接件" {
+		t.Fatalf("name 应保留: %+v", info)
+	}
+
+	// 404/400。
+	if rec := doWidgetJSON(t, r, http.MethodPut, "/api/widgets/ghost/connector", `{"type":"webhook"}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在应 404, got %d", rec.Code)
+	}
+	if rec := doWidgetJSON(t, r, http.MethodPut, "/api/widgets/conn-upd/connector", `{"type":"carrier"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("坏 connector 应 400, got %d", rec.Code)
+	}
+}
+
+// TestWidgetAPI_Hook 钉死 webhook 回调：对 token 推数据 → 200 {"ok":true} 且广播；
+// 错 token → 401；非 webhook / 不存在 → 404；超限 → 429。
+func TestWidgetAPI_Hook(t *testing.T) {
+	r, mgr, facade := newWidgetTestEnv(t)
+	created := createHookWidget(t, r, "conn-hook")
+
+	// 正常推送：200 + 广播原文。
+	rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-hook/hook/"+created.Connector.Token,
+		`{"event":"order.created","id":42}`)
+	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != `{"ok":true}` {
+		t.Fatalf("hook 应 200 {\"ok\":true}: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(facade.broadcasts) != 1 || facade.broadcasts[0] != `conn-hook|{"event":"order.created","id":42}` {
+		t.Fatalf("应广播原文 payload: %v", facade.broadcasts)
+	}
+
+	// 错 token → 401（与不存在部件同一文案，不区分存在性）。
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-hook/hook/00000000000000000000000000000000", `x`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("错 token 应 401, got %d", rec.Code)
+	}
+	// 不存在部件 → 404。
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/ghost/hook/"+created.Connector.Token, `x`); rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在部件应 404, got %d", rec.Code)
+	}
+	// 非 webhook 部件 → 404。
+	if _, err := mgr.Save("plain", widgets.Manifest{Name: "p"},
+		[]widgets.FileInput{{Path: "index.html", Content: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/plain/hook/"+created.Connector.Token, `x`); rec.Code != http.StatusNotFound {
+		t.Fatalf("非 webhook 应 404, got %d", rec.Code)
+	}
+
+	// 限流：新建接件连续推 61 次 → 第 61 次 429（前 60 次 200）。
+	burst := createHookWidget(t, r, "conn-burst")
+	for i := 0; i < 60; i++ {
+		if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-burst/hook/"+burst.Connector.Token, `x`); rec.Code != http.StatusOK {
+			t.Fatalf("第 %d 次应 200, got %d", i+1, rec.Code)
+		}
+	}
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-burst/hook/"+burst.Connector.Token, `x`); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("第 61 次应 429, got %d", rec.Code)
+	}
+}
+
+// TestWidgetAPI_Poll 钉死立即执行：api 用 httptest 真 HTTP 源断言 data 与广播；
+// webhook/url → 400；不存在 → 404。
+func TestWidgetAPI_Poll(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"price":1024}`))
+	}))
+	defer srv.Close()
+
+	r, _, facade := newWidgetTestEnv(t)
+	rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets", `{
+		"id":"conn-poll","name":"行情","connector":{"type":"api","target":"`+srv.URL+`"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// poll：{"ok":true,"data":"..."} 且照常广播。
+	rec = doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-poll/poll", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("poll: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		OK   bool   `json:"ok"`
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || !out.OK || out.Data != `{"price":1024}` {
+		t.Fatalf("poll 响应不符: %s err=%v", rec.Body.String(), err)
+	}
+	if len(facade.broadcasts) != 1 || facade.broadcasts[0] != `conn-poll|{"price":1024}` {
+		t.Fatalf("poll 应广播: %v", facade.broadcasts)
+	}
+
+	// webhook/url 型 → 400。
+	hook := createHookWidget(t, r, "conn-wh")
+	_ = hook
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-wh/poll", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("webhook poll 应 400, got %d", rec.Code)
+	}
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets", `{
+		"id":"conn-link","name":"外链","connector":{"type":"url","target":"https://example.com"}}`); rec.Code != http.StatusOK {
+		t.Fatalf("create url: %d", rec.Code)
+	}
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-link/poll", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("url poll 应 400, got %d", rec.Code)
+	}
+	// 不存在 → 404。
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/ghost/poll", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在应 404, got %d", rec.Code)
+	}
+	// api 源失败 → 500。
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer bad.Close()
+	rec = doWidgetJSON(t, r, http.MethodPost, "/api/widgets", `{
+		"id":"conn-bad","name":"坏源","connector":{"type":"api","target":"`+bad.URL+`"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create bad: %d", rec.Code)
+	}
+	if rec := doWidgetJSON(t, r, http.MethodPost, "/api/widgets/conn-bad/poll", ""); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("源失败应 500, got %d", rec.Code)
+	}
 }

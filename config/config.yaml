@@ -195,6 +195,9 @@ skills:
   max_count: 50             # enabled 经验技能上限（B 写入门）：达到后新经验只允许合并进既有技能（近邻同名判定），不再新建；0=不限
   meta_catalog_top: 20      # meta 系统提示【可用技能】块列出的经验技能条数（A 目录收敛，按 use_count 降序）；完整目录经 list_skills(query) 检索
   consolidate_threshold: 30 # 启用数达到该值后每日（复用数据维护 tick）自动整理一次（C）：轻量模型合并语义重复技能 + 归档零使用技能；<=0 关闭自动整理（仍可 POST /api/skills/consolidate 手动触发）
+  evict_cold_days: 30       # 满库冷淘汰第一档：use_count==0 且创建超过 N 天的技能可被自动归档腾位（evolver 写入门 + consolidate 每日兜底共用）；0=回退默认
+  evict_idle_days: 90       # 满库冷淘汰第二档：use_count<=evict_idle_max_use 且最近使用（从未使用按创建时间）超过 N 天的技能可被淘汰；0=回退默认
+  evict_idle_max_use: 1     # 第二档允许的 use_count 上限（用过 >=2 次的技能永不自动淘汰）；0=回退默认
 
 # 块记忆库治理（2026-10-13，对齐技能库库存治理）：任务沉淀只增不并会稀释【沉淀索引】槽
 # 并让无关条目进入会话上下文（10-13 实证）。达阈值后每日由轻量模型整理一轮：近重复

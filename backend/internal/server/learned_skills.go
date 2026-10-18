@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -50,10 +51,41 @@ func (h *APIHandler) SetLearnedSkills(s *store.LearnedSkillStore) {
 	h.learnedSkills = s
 }
 
+// SetLearnedSkillsDir 注入经验技能目录（bootstrap 装配，与 evolver 落库同口径）：
+// DELETE 端点删文件前做目录内安全校验用。空=跳过文件删除（仅删 PG 行 + 退池）。
+func (h *APIHandler) SetLearnedSkillsDir(dir string) {
+	h.learnedSkillsDir = dir
+}
+
 // SetSkillConsolidation 注入技能库整理器（C 库存治理，bootstrap 装配；nil 时端点 503）。
 // 手动触发忽略每日阈值直接整理，同步返回摘要（轻量模型调用，最长约 2 分钟）。
 func (h *APIHandler) SetSkillConsolidation(fn func(ctx context.Context) (string, error)) {
 	h.skillConsolidation = fn
+}
+
+// SetSkillReforge 注入技能重铸器（薄技能治理，bootstrap 装配；nil 时端点 503）。
+// 对单个存量技能按当前产出契约重写正文（decision 模型调用，最长约 2 分钟）。
+func (h *APIHandler) SetSkillReforge(fn func(ctx context.Context, name string) (string, error)) {
+	h.skillReforge = fn
+}
+
+// ReforgeLearnedSkillHandler 处理 POST /api/skills/learned/:name/reforge —
+// 重铸单个技能：decision 模型按契约重写正文，结构门+评分不过则旧内容保留。返回摘要。
+func (h *APIHandler) ReforgeLearnedSkillHandler(c *gin.Context) {
+	if h.skillReforge == nil {
+		c.String(http.StatusServiceUnavailable, "skill reforge not wired")
+		return
+	}
+	// 重铸含 decision 模型调用 + 评分（最长 ~2 分钟），超时与预算对齐。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 150*time.Second)
+	defer cancel()
+	summary, err := h.skillReforge(ctx, c.Param("name"))
+	if err != nil {
+		// 未过结构门/评分/模型调用失败：一律 422 带理由（旧内容未动，前端原样提示）。
+		c.String(http.StatusUnprocessableEntity, "%s", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"ok": true, "summary": summary})
 }
 
 // ConsolidateSkillsHandler 处理 POST /api/skills/consolidate —
@@ -240,6 +272,57 @@ func (h *APIHandler) EnableLearnedSkillHandler(c *gin.Context) {
 // 禁用并从共享技能池移除（list_skills/召回均不再可见）。
 func (h *APIHandler) DisableLearnedSkillHandler(c *gin.Context) {
 	h.setLearnedSkillEnabled(c, false)
+}
+
+// DeleteLearnedSkillHandler 处理 DELETE /api/skills/learned/:name — 手动删除（物理删）：
+// 删 PG 行 → 删技能文件（目录式删整个 <name>/ 目录含 scripts/，老格式删单 .md；
+// 解析路径必须落在技能目录内，防 content_path 穿越，越界则跳过文件删除只记日志）→
+// 技能池退池 → evolution_log（skill_delete）。文件删除失败仅记日志，不影响删除结果。
+func (h *APIHandler) DeleteLearnedSkillHandler(c *gin.Context) {
+	if h.learnedSkills == nil {
+		c.String(http.StatusServiceUnavailable, "learned skills store not wired")
+		return
+	}
+	name := c.Param("name")
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	rec, err := h.learnedSkills.Get(ctx, name)
+	if err != nil {
+		c.String(http.StatusInternalServerError, "%s", err.Error())
+		return
+	}
+	if rec == nil {
+		c.String(http.StatusNotFound, "skill not found")
+		return
+	}
+	if err := h.learnedSkills.Delete(ctx, name); err != nil {
+		c.String(http.StatusInternalServerError, "%s", err.Error())
+		return
+	}
+	// 删文件：解析路径必须落在技能目录内（防 content_path 穿越删到目录外）。
+	if h.learnedSkillsDir != "" {
+		resolved := filepath.Clean(textutil.ResolveSkillMDPathFromRef(rec.ContentPath))
+		dir := filepath.Clean(h.learnedSkillsDir)
+		if strings.HasPrefix(resolved, dir+string(os.PathSeparator)) {
+			// C1 目录式（<name>/SKILL.md）删整个技能目录（含 scripts/）；老格式 <name>.md 删单文件。
+			if filepath.Base(resolved) == "SKILL.md" {
+				if err := os.RemoveAll(filepath.Dir(resolved)); err != nil {
+					log.Printf("[api] remove learned skill dir failed (non-fatal): name=%s err=%v", name, err)
+				}
+			} else if err := os.Remove(resolved); err != nil && !os.IsNotExist(err) {
+				log.Printf("[api] remove learned skill file failed (non-fatal): name=%s err=%v", name, err)
+			}
+		} else {
+			log.Printf("[api] learned skill file outside skills dir, skip file removal: name=%s path=%s", name, resolved)
+		}
+	}
+	if h.rt != nil && h.rt.Skills != nil {
+		h.rt.Skills.Remove(name)
+	}
+	if err := h.learnedSkills.AppendEvolutionLog(ctx, "skill_delete", name, "手动删除", ""); err != nil {
+		log.Printf("[api] learned skill delete evolution log failed (non-fatal): name=%s err=%v", name, err)
+	}
+	c.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
 // setLearnedSkillEnabled 启用/禁用共用实现：更新 PG → 同步技能池。

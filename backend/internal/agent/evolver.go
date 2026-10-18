@@ -11,7 +11,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -32,6 +35,8 @@ type EvolveInput struct {
 	EventsDigest string
 	UserMessages string
 	Outcome      string // success|failed|mixed（失败会话的踩坑经验价值更高）
+	// Artifacts 会话内 WriteFile 产物渲染段（"脚本候选原文"，技能 tools 的代码从这里原样照抄）。
+	Artifacts string
 }
 
 // EvolvedSkillTool 会话中实际自写并执行成功的辅助脚本（TODO 25 阶段 C3 沉淀候选，
@@ -45,13 +50,15 @@ type EvolvedSkillTool struct {
 
 // EvolvedSkill 提取出的技能包（SKILL.md 式结构，设计 §6.2）。
 type EvolvedSkill struct {
-	Name      string             // 小写连字符全局唯一；缺省由 title 规范化
-	Title     string             // 展示标题（必填）
-	WhenToUse string             // 适用场景（必填，与 title 构成召回向量）
-	Steps     []string           // 步骤
-	Pitfalls  []string           // 坑点
-	Verify    string             // 验证方法
-	Tools     []EvolvedSkillTool // 配套脚本候选（C3，可空）
+	Name       string             // 小写连字符全局唯一；缺省由 title 规范化
+	Title      string             // 展示标题（必填）
+	WhenToUse  string             // 适用场景（必填，与 title 构成召回向量）
+	Background string             // 背景/原理（为什么这样做，2-4 句）
+	Steps      []string           // 步骤
+	Pitfalls   []string           // 坑点
+	Verify     string             // 验证方法
+	Example    string             // 具体使用示例（场景+命令/操作+预期结果）
+	Tools      []EvolvedSkillTool // 配套脚本候选（C3，可空）
 }
 
 // EvolveOutput 一次会话进化的三类沉淀（设计 §3）。
@@ -64,8 +71,94 @@ type EvolveOutput struct {
 // minEvolveEvents 事件数下限：琐碎问答不提取，防噪音（设计 §6.1）。
 const minEvolveEvents = 5
 
+// writeArtifact 会话内写盘脚本产物（技能进化"带真实代码"输入）：
+// 事件摘要的截断行还原不出脚本全文，须在 WriteFile 调用点原文捕获。
+type writeArtifact struct {
+	Path    string // 会话内路径（展示用）
+	Ext     string // 扩展名（py/sh/js/ts/mjs/cjs）
+	Lines   int    // 原文行数
+	Content string // 原文（行数已校验 ≤ 上限）
+}
+
+const (
+	// writeArtifactMaxLines 单产物行数上限：与技能 tools code ≤60 行契约对齐——
+	// 超行产物即使用作技能脚本也会被拒，带节选只会误导模型照抄半截。
+	writeArtifactMaxLines = 60
+	// writeArtifactMaxChars 单产物字符上限（防单行超长挤爆 prompt）。
+	writeArtifactMaxChars = 4000
+	// writeArtifactMaxCount 每会话最多保留几个产物（满时淘汰最旧的；同名后写覆盖先写）。
+	writeArtifactMaxCount = 3
+)
+
+// writeArtifactExts 可沉淀为技能配套脚本的扩展名白名单。
+var writeArtifactExts = map[string]bool{"py": true, "sh": true, "js": true, "ts": true, "mjs": true, "cjs": true}
+
+// captureWriteArtifact 在工具调用事件点捕获 WriteFile 产物为脚本候选。
+// 非写文件工具/非脚本扩展名/超行数一律跳过；同名路径后写覆盖先写（保留最终版）。
+func (st *reactSessionStore) captureWriteArtifact(session *reactInternalSession, toolName, argsJSON string) {
+	switch toolName {
+	case "WriteFile", "write_file", "writeFile":
+	default:
+		return
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return
+	}
+	path, _ := args["path"].(string)
+	content, _ := args["content"].(string)
+	path = strings.TrimSpace(path)
+	if path == "" || content == "" {
+		return
+	}
+	lower := strings.ToLower(path)
+	if strings.Contains(lower, "node_modules/") || strings.Contains(lower, "/.git/") {
+		return
+	}
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(path)), ".")
+	if !writeArtifactExts[ext] {
+		return
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) > writeArtifactMaxLines {
+		return
+	}
+	if len(content) > writeArtifactMaxChars {
+		content = string([]rune(content)[:writeArtifactMaxChars]) + "…"
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	arts := session.writeArtifacts
+	for i := range arts {
+		if arts[i].Path == path {
+			arts[i] = writeArtifact{Path: path, Ext: ext, Lines: len(lines), Content: content}
+			return
+		}
+	}
+	arts = append(arts, writeArtifact{Path: path, Ext: ext, Lines: len(lines), Content: content})
+	if len(arts) > writeArtifactMaxCount {
+		arts = arts[len(arts)-writeArtifactMaxCount:]
+	}
+	session.writeArtifacts = arts
+}
+
+// artifactsText 渲染写盘产物为进化 prompt 的「脚本候选原文」段；无产物返回空串。
+// 渲染进 prompt 后由模型从中挑选 tools（code 原样照抄），是"技能带真实代码"的供给通道。
+func artifactsText(session *reactInternalSession) string {
+	if len(session.writeArtifacts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, a := range session.writeArtifacts {
+		fmt.Fprintf(&b, "#### %s（%d 行）\n```%s\n%s\n```\n", a.Path, a.Lines, a.Ext, a.Content)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // evolveDigestMaxRunes 事件流摘要 rune 上限。
-const evolveDigestMaxRunes = 1500
+// 质量契约（薄技能治理）：技能步骤的金矿是完整命令行/报错/路径，摘要必须放得下一整场
+// 会话的 tool 证据——120 字符/行的旧预算把锚点全截断，模型只能写"注意检查"式空话。
+const evolveDigestMaxRunes = 6000
 
 // evolveTimeout SessionEvolver 单次轻量模型调用预算。
 const evolveTimeout = 90 * time.Second
@@ -89,6 +182,7 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 		EventsDigest: s.eventsDigest(session),
 		UserMessages: userMessagesText(session),
 		Outcome:      outcome,
+		Artifacts:    artifactsText(session),
 	}
 	if in.UserMessages == "" && in.Goal == "" {
 		return
@@ -171,8 +265,10 @@ func (s *ReactService) logEvolution(sessionID, kind, target, summary string) {
 }
 
 // eventsDigest 事件流摘要：最近事件拼接（Agent: 消息），整体截断。
+// 薄技能治理：keep 30→60、单行 120→600 runes——tool 调用的命令行/报错是技能锚点的
+// 唯一来源，旧预算在源头就切断了"具体性"，模型只能产出空泛步骤。
 func (s *ReactService) eventsDigest(session *reactInternalSession) string {
-	const keep = 30
+	const keep = 60
 	events := session.Events
 	if len(events) > keep {
 		events = events[len(events)-keep:]
@@ -192,7 +288,7 @@ func (s *ReactService) eventsDigest(session *reactInternalSession) string {
 		}
 		b.WriteString(agent)
 		b.WriteString(": ")
-		b.WriteString(truncateRunesForEvolver(line, 120))
+		b.WriteString(truncateRunesForEvolver(line, 600))
 		b.WriteString("\n")
 	}
 	return truncateRunesForEvolver(strings.TrimRight(b.String(), "\n"), evolveDigestMaxRunes)

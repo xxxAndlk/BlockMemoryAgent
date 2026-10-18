@@ -7,6 +7,8 @@ import {
   saveLearnedSkill,
   enableLearnedSkill,
   disableLearnedSkill,
+  deleteSkill,
+  reforgeSkill,
   listEvolutionLog,
   consolidateSkills,
   type LearnedSkill,
@@ -140,6 +142,47 @@ async function toggle(s: LearnedSkill) {
   }
 }
 
+// 手动删除（物理删）：PG 行 + 技能文件 + 退池。删除成功后刷新列表。
+async function removeSkill(s: LearnedSkill) {
+  mutating.value = s.name
+  try {
+    await deleteSkill(s.name)
+    ElMessage.success(`技能 ${s.name} 已删除`)
+    loadSkills()
+  } catch (e) {
+    ElMessage.error('删除失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    mutating.value = null
+  }
+}
+
+// 重铸（decision 模型按当前产出契约重写正文）：结构门/评分不过时后端 422，错误即理由，旧内容保留。
+async function reforge(s: LearnedSkill) {
+  mutating.value = s.name
+  try {
+    const res = await reforgeSkill(s.name)
+    ElMessage.success(res.summary || `技能 ${s.name} 已重铸`)
+    loadSkills()
+    loadLog()
+  } catch (e) {
+    ElMessage.error('重铸失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    mutating.value = null
+  }
+}
+
+// 最近使用人话格式化：空=从未；1 个月内相对天数，之后短日期。
+function fmtLastUsed(t?: string) {
+  if (!t) return '从未'
+  const then = new Date(t).getTime()
+  if (Number.isNaN(then)) return ''
+  const days = Math.floor((Date.now() - then) / 86400000)
+  if (days <= 0) return '今天'
+  if (days === 1) return '昨天'
+  if (days < 30) return `${days} 天前`
+  return new Date(t).toLocaleDateString('zh-CN')
+}
+
 async function openEdit(s: LearnedSkill) {
   editName.value = s.name
   editTitle.value = s.title
@@ -188,6 +231,9 @@ function kindLabel(kind: string) {
     case 'skill_dropped': return '技能未沉淀'  // 技能库满，建新被写入门拒绝
     case 'skill_merge': return '技能合并'
     case 'skill_archive': return '技能归档'
+    case 'skill_evict': return '冷淘汰'    // 满库确定性淘汰：最冷的 enabled 技能归档腾位
+    case 'skill_delete': return '技能删除'  // 手动删除（物理删）
+    case 'skill_reforge': return '技能重铸'  // decision 模型按契约重写正文
     case 'consolidate_run': return '整理记录'
     default: return kind
   }
@@ -200,6 +246,9 @@ function kindType(kind: string) {
     case 'skill_merge': return 'warning'
     case 'skill_dropped': return 'danger'
     case 'skill_archive': return 'info'
+    case 'skill_evict': return 'warning'
+    case 'skill_delete': return 'danger'
+    case 'skill_reforge': return 'warning'
     case 'consolidate_run': return 'success'
     case 'user_pref': return ''
     case 'project_lesson': return 'info'
@@ -257,6 +306,7 @@ onMounted(() => {
                 <p class="text-xs text-ink-2 mt-2 line-clamp-2">{{ s.when_to_use }}</p>
                 <div class="mt-2 text-[11px] text-ink-3 flex gap-3">
                   <span>使用 {{ s.use_count }} 次</span>
+                  <span>最近使用 {{ fmtLastUsed(s.last_used_at) }}</span>
                   <span>更新于 {{ fmtTime(s.updated_at) }}</span>
                 </div>
               </div>
@@ -266,6 +316,25 @@ onMounted(() => {
                 <el-button size="small" plain class="!bg-transparent !border-line !text-ink" @click="openEdit(s)">
                   <el-icon class="mr-1"><EditPen /></el-icon> 编辑
                 </el-button>
+                <el-popconfirm title="用 decision 模型按当前契约重写该技能正文？（重写不过质量门时保留旧内容；耗时约 1 分钟）"
+                               confirm-button-text="重铸" cancel-button-text="取消"
+                               width="280" @confirm="reforge(s)">
+                  <template #reference>
+                    <el-button size="small" plain class="!bg-transparent !border-line !text-ink"
+                               :loading="mutating === s.name">
+                      <el-icon class="mr-1"><MagicStick /></el-icon> 重铸
+                    </el-button>
+                  </template>
+                </el-popconfirm>
+                <el-popconfirm :title="s.enabled ? `确定删除技能 ${s.name}？` : `技能 ${s.name} 已禁用，删除后不可恢复，确定删除？`"
+                               confirm-button-text="删除" cancel-button-text="取消"
+                               width="260" @confirm="removeSkill(s)">
+                  <template #reference>
+                    <el-button size="small" plain type="danger" class="!bg-transparent" :loading="mutating === s.name">
+                      <el-icon class="mr-1"><Delete /></el-icon> 删除
+                    </el-button>
+                  </template>
+                </el-popconfirm>
               </div>
             </div>
           </el-card>

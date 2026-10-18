@@ -89,10 +89,17 @@ type App struct {
 	Plugins      *plugins.Manager          // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
 	Widgets      *widgets.Manager          // 界面部件管理器（widgets/ 目录包，Widget 机制）
 	WorkDir      string                    // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
+	// SkillsDir 经验技能目录（config/skills_learned/，与 evolver 落库同口径）：
+	// DELETE /api/skills/learned/:name 删文件前做目录内安全校验用。
+	SkillsDir    string
 
 	// SkillConsolidation 经验技能库整理（C 库存治理）：POST /api/skills/consolidate 手动触发，
 	// 忽略阈值直接整理；返回人类可读摘要。nil 时端点返回 503。
 	SkillConsolidation func(ctx context.Context) (string, error)
+
+	// SkillReforge 存量薄技能重铸（薄技能治理）：POST /api/skills/learned/:name/reforge，
+	// decision 模型按当前产出契约重写正文（结构门+评分不过则旧内容保留）。nil 时端点返回 503。
+	SkillReforge func(ctx context.Context, name string) (string, error)
 
 	// MemoryConsolidation 块记忆库整理（2026-10-13，对齐技能库库存治理）：
 	// POST /api/memory/consolidate 手动触发，忽略阈值直接整理；返回人类可读摘要。
@@ -895,7 +902,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return evolveSessionLLM(ctx, modelFactory, in)
 		})
 		skillSink := newLearnedSkillSink(pgStore.LearnedSkills,
-			filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"), skillPool, cfg.Skills.MaxCount, modelFactory)
+			filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"), skillPool, cfg.Skills.MaxCount,
+			cfg.Skills.EvictColdDays, cfg.Skills.EvictIdleDays, cfg.Skills.EvictIdleMaxUse, modelFactory)
 		agentSvc.SetSkillSink(skillSink.persist)
 		agentSvc.SetEvolutionLogger(func(ctx context.Context, sessionID, kind, target, summary string) error {
 			return pgStore.LearnedSkills.AppendEvolutionLog(ctx, kind, target, summary, sessionID)
@@ -1264,6 +1272,15 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		toolRegistry.SetWidgetOwnerResolver(func(sessionID string) string {
 			return "" // TODO(#18-8): 会话 owner 来源接线后返回 s.Owner
 		})
+	// 连接器调度器（2026-10-17 Widget「连接器」）：api/mcp 连接器按 interval_sec 定时
+	// 执行，结果经 BroadcastWidgetData 广播到打开部件的会话（widget_data 瞬时通道，
+	// 与 POST /widgets/push 同款出口；push 语义不变，只是新调用方）。mcp 工具调用经
+	// toolRegistry.Dispatch（ctx 注入主工作目录，与工作流量产程序化调用同口径）。
+	// 生命周期跟 startDataMaintenance 同款装配：goroutine + ctx 取消，cleanup 里停。
+	connectorSchedCtx, connectorSchedCancel := context.WithCancel(context.Background())
+	connectorSched := widgets.NewConnectorScheduler(widgetMgr, agentSvc.BroadcastWidgetData)
+	connectorSched.SetMCPToolCaller(connectorToolCaller{reg: toolRegistry, workDir: workDir})
+	go connectorSched.RunConnectors(connectorSchedCtx)
 	// 存量迁移（幂等）：PG 里有定义但磁盘无文件的 dag_jobs 行导出为 YAML，
 	// 文件已存在则跳过；导出后 PG 行保留作运行态。失败不阻断启动。
 	if n, err := dagStore.Migrate(ctx); err != nil {
@@ -1345,7 +1362,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 经验技能库整理器（C 库存治理）：每日随数据维护 tick 自动跑（达阈值才动手），
 	// 也可经 POST /api/skills/consolidate 手动触发（忽略阈值）。
-	skillCons := newSkillConsolidator(pgStore.LearnedSkills, skillPool, modelFactory, cfg.Skills.ConsolidateThreshold)
+	skillCons := newSkillConsolidator(pgStore.LearnedSkills, skillPool, modelFactory, cfg.Skills.ConsolidateThreshold,
+		cfg.Skills.MaxCount, cfg.Skills.EvictColdDays, cfg.Skills.EvictIdleDays, cfg.Skills.EvictIdleMaxUse)
 
 	// 块记忆库整理器（2026-10-13）：同范式——每日 tick 达阈值自动跑（近重复合并 +
 	// 零访问归档，消灭"沉淀索引超限无人整理"死结），POST /api/memory/consolidate 手动。
@@ -1371,9 +1389,14 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		Plugins:      pluginManager,
 		Widgets:      widgetMgr,
 		WorkDir:      workDir,
+		SkillsDir:    filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"),
 
 		SkillConsolidation: func(ctx context.Context) (string, error) {
 			return skillCons.Run(ctx, true)
+		},
+
+		SkillReforge: func(ctx context.Context, name string) (string, error) {
+			return reforgeLearnedSkill(ctx, pgStore.LearnedSkills, skillPool, modelFactory, name)
 		},
 
 		MemoryConsolidation: func(ctx context.Context) (string, error) {
@@ -1410,6 +1433,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return nil
 		},
 		func() error { stopMaintenance(); return nil }, // 停数据维护定时器
+		func() error { connectorSchedCancel(); return nil }, // 停连接器调度器（goroutine + ctx 取消）
 		func() error {
 			// 先停止 DAG 调度器，避免在数据库关闭后还在调度任务。
 			if dagScheduler != nil {
@@ -1439,6 +1463,29 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	}
 
 	return app, nil
+}
+
+// connectorToolCaller 把 toolRegistry.Dispatch 适配成 widgets.MCPToolCaller
+//（连接器 mcp 型的工具调用通道）：ctx 注入进程主工作目录（与程序化调用同口径），
+// 成功取 Result.Output，失败带 Error 明细（调度器记日志后跳过本次）。
+type connectorToolCaller struct {
+	reg     *tool.Registry
+	workDir string
+}
+
+// CallTool 实现 widgets.MCPToolCaller。
+func (c connectorToolCaller) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
+	res, err := c.reg.Dispatch(tool.WithWorkDir(ctx, c.workDir), name, args)
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "", fmt.Errorf("工具 %s 无返回", name)
+	}
+	if !res.Success {
+		return "", fmt.Errorf("%s", res.Error)
+	}
+	return res.Output, nil
 }
 
 // validatePaths 校验启动所需的文件路径。

@@ -5,7 +5,9 @@ package plugins
 //   - 远程 registry：MCP 官方 registry API（registry.modelcontextprotocol.io/v0/servers）
 //     JSON 契约：{"servers":[{"server":{name,title,description,version,
 //     remotes:[{type:"streamable-http",url}], packages:[{registryType:"npm",
-//     identifier, transport:{type:"stdio"}}]}, "_meta":{...}}]}；
+//     identifier, transport:{type:"stdio"}}]}, "_meta":{...}}],
+//     "metadata":{"nextCursor":...}}；带 query 传 server 端 search 参数，nextCursor
+//     非空按 cursor 参数翻页（共享 registryFetchTimeout 预算，截断记 note）；
 //     来源白名单 = config.PluginsConfig.RegistrySources（缺省官方端点），
 //     只查询白名单内 URL，防 Agent 拉任意来源；
 //   - Manager.Search 聚合三路：内置目录 + 已配置/已安装实例（带状态）+ 远程 registry
@@ -23,7 +25,17 @@ import (
 )
 
 // 远程 registry 请求超时：检索是工具调用路径，挂起会阻塞 ReAct 循环，必须短超时 fail-soft。
+// 预算为整页循环共享（翻页在预算内跟游标，耗尽返回已取页并记截断 note）。
 const registryFetchTimeout = 8 * time.Second
+
+// registryFetchMaxPages 单个来源翻页硬顶：全量列举按预算自然截断；硬顶防异常来源
+// 的游标死循环挂满工具调用。带 search 词时进一步收紧到 registryFetchSearchPages——
+// 输出端 Manager.Search 截断 30 条，深翻只会被丢弃还白烧预算。
+const registryFetchMaxPages = 10
+
+// registryFetchSearchPages 带 query 时的翻页硬顶：server 端 search 已过滤，
+// 前 3 页（约 90 条）远超输出上限，深翻无收益。
+const registryFetchSearchPages = 3
 
 // 单次检索输出上限（内置目录 + 配置实例 + 远程聚合后截断，防上下文膨胀）。
 const searchResultLimit = 30
@@ -148,8 +160,15 @@ func SearchCatalog(query string) []CatalogEntry {
 }
 
 // registryServersResponse 对应 MCP 官方 registry API 的响应外壳。
+// registry 为游标分页制：metadata.nextCursor 非空时带 cursor 参数续拉下一页。
 type registryServersResponse struct {
-	Servers []registryServerItem `json:"servers"`
+	Servers  []registryServerItem `json:"servers"`
+	Metadata registryMetadata     `json:"metadata"`
+}
+
+// registryMetadata 是 registry 分页元数据（count 未用，预留 nextCursor）。
+type registryMetadata struct {
+	NextCursor string `json:"nextCursor"`
 }
 
 type registryServerItem struct {
@@ -192,7 +211,8 @@ type registryOfficialMeta struct {
 
 // fetchRemoteRegistry 查询远程 registry 来源（白名单 = 传入的 sources 本身，调用方保证
 // 只传配置允许的 URL）。每个来源独立 fail-soft：失败记入 notes 不阻断其他来源。
-// 返回条目已按 query 过滤、按名称去重（isLatest 优先）、转成可安装的 CatalogEntry。
+// 返回条目已按 query 过滤、按名称去重（isLatest 优先）、转成可安装的 CatalogEntry；
+// 来源因超时/页数硬顶只覆盖部分分页时额外记截断 note（诚实标注覆盖范围）。
 func fetchRemoteRegistry(ctx context.Context, sources []string, query string) ([]CatalogEntry, []string) {
 	var out []CatalogEntry
 	var notes []string
@@ -204,10 +224,13 @@ func fetchRemoteRegistry(ctx context.Context, sources []string, query string) ([
 		if src == "" {
 			continue
 		}
-		entries, err := fetchRegistrySource(ctx, client, src, q)
+		entries, truncated, err := fetchRegistrySource(ctx, client, src, q)
 		if err != nil {
 			notes = append(notes, fmt.Sprintf("registry %s 不可用: %v", registryHost(src), err))
 			continue
+		}
+		if truncated {
+			notes = append(notes, fmt.Sprintf("registry %s 结果截断（超时/页数硬顶，仅覆盖部分分页）", registryHost(src)))
 		}
 		for _, e := range entries {
 			if seen[e.ID] {
@@ -220,32 +243,79 @@ func fetchRemoteRegistry(ctx context.Context, sources []string, query string) ([
 	return out, notes
 }
 
-// fetchRegistrySource 拉取单个 registry 来源全量清单并过滤/转换。
-func fetchRegistrySource(ctx context.Context, client *http.Client, base, q string) ([]CatalogEntry, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base, nil)
-	if err != nil {
-		return nil, err
+// fetchRegistrySource 拉取单个 registry 来源并过滤/转换：
+//   - 带 query 时传 server 端 search 参数（MCP 官方 registry 支持服务端过滤，
+//     首屏 30 条之后的命中也能查到；不识别该参数的来源忽略之，退回客户端过滤）；
+//   - 游标翻页：metadata.nextCursor 非空则带 cursor 参数续拉，合并全部页后再去重，
+//     整页循环共享 registryFetchTimeout 总预算（慢 registry 挂不满工具调用），
+//     预算耗尽/页数硬顶返回已取页并标 truncated（部分覆盖优于全丢）。
+func fetchRegistrySource(ctx context.Context, client *http.Client, base, q string) ([]CatalogEntry, bool, error) {
+	pctx, cancel := context.WithTimeout(ctx, registryFetchTimeout)
+	defer cancel()
+
+	var all []registryServerItem
+	truncated := false
+	maxPages := registryFetchMaxPages
+	if q != "" {
+		maxPages = registryFetchSearchPages
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+	cursor := ""
+	for page := 0; page < maxPages; page++ {
+		u, err := url.Parse(base)
+		if err != nil {
+			return nil, false, err
+		}
+		qu := u.Query()
+		if q != "" {
+			qu.Set("search", q)
+		}
+		if cursor != "" {
+			qu.Set("cursor", cursor)
+		}
+		u.RawQuery = qu.Encode()
+
+		req, err := http.NewRequestWithContext(pctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, false, err
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			if page > 0 && pctx.Err() != nil {
+				truncated = true
+				break // 总预算耗尽：返回已取页。
+			}
+			return nil, false, err
+		}
+		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		if rerr != nil {
+			if page > 0 && pctx.Err() != nil {
+				truncated = true
+				break
+			}
+			return nil, false, rerr
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, false, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		var parsed registryServersResponse
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return nil, false, fmt.Errorf("响应解析失败: %w", err)
+		}
+		all = append(all, parsed.Servers...)
+		cursor = strings.TrimSpace(parsed.Metadata.NextCursor)
+		if cursor == "" {
+			break
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	if cursor != "" {
+		truncated = true // 页数硬顶截断。
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return nil, err
-	}
-	var parsed registryServersResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("响应解析失败: %w", err)
-	}
+
 	// 去重：同一 name 多版本只留 isLatest（无 official 元数据的条目保留，宽松处理）。
 	latest := map[string]registryServerItem{}
-	for _, item := range parsed.Servers {
+	for _, item := range all {
 		meta := item.Meta.Official
 		if meta == nil {
 			if _, ok := latest[item.Server.Name]; !ok {
@@ -271,7 +341,7 @@ func fetchRegistrySource(ctx context.Context, client *http.Client, base, q strin
 			out = append(out, e)
 		}
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 // registryEntryFromServer 把 registry server 描述转换为可安装条目：

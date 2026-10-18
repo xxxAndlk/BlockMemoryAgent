@@ -133,6 +133,7 @@ persist running → `resolveGearMetaRole` → `mountTopLevelEssentials`（插件
 ### finalizeSession（defer，:3382）
 
 清 Streaming/Thinking → notifier.NotifySessionFinal → 暂停三态保留 TempDir，其余清理 → evictCompletedSessions。
+停放落定 pauseSession 已在与状态翻转**同一锁窗**内清空 StreamingText/ThinkingText（2026-10-17）：pauseSession 到 defer finalize 之间存在落事件窗口，SSE tick 此时见停放态但旧正文未清，会把上轮文字随 live 帧重推——停止会话后再发送时页面复活原有文字（用户实证）；ask_user 阻塞态（真澄清）不经 pauseSession，提问正文快照不受影响。
 
 ## 3.6 事件管线
 

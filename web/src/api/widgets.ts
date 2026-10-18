@@ -1,5 +1,5 @@
 import { fetchJson } from './client'
-import type { WidgetInfo, WidgetTrashEntry } from '@/types'
+import type { WidgetConnector, WidgetInfo, WidgetTrashEntry } from '@/types'
 
 /** 界面部件 API（与后端 widgets_http.go 对齐，2026-10-13 Widget 机制）。 */
 
@@ -68,4 +68,36 @@ export function listTrash(): Promise<{ trash: WidgetTrashEntry[] }> {
 /** 从回收站恢复部件（name = 回收站目录名）。 */
 export function restoreWidget(name: string): Promise<WidgetInfo> {
   return fetchJson(`/widgets/trash/${encodeURIComponent(name)}/restore`, { method: 'POST' })
+}
+
+// ---- 连接器（2026-10-17 Widget「连接器」：万物皆可外接）----
+
+/** 新建部件（含连接器）请求体；不带 files 时 api/mcp/webhook 为裸接件（后端不生成 index.html）。 */
+export interface CreateWidgetBody {
+  /** 缺省由后端生成。 */
+  id?: string
+  name: string
+  description?: string
+  connector: WidgetConnector
+  files?: { path: string; content: string }[]
+}
+
+/**
+ * 新建部件（含连接器）。webhook 类型响应 connector.token 为明文，且带 hook_url
+ * （"/api/widgets/<id>/hook/<token>"，展示时拼 origin 成完整回调地址）。
+ */
+export function createWidget(body: CreateWidgetBody): Promise<WidgetInfo> {
+  return fetchJson('/widgets', { method: 'POST', body: JSON.stringify(body) })
+}
+
+/** 更新连接器请求体：connector 字段 + regen_token（true 时后端重新生成 webhook token，响应带新 hook_url）。 */
+export type UpdateConnectorBody = WidgetConnector & { regen_token?: boolean }
+
+export function updateWidgetConnector(id: string, body: UpdateConnectorBody): Promise<WidgetInfo> {
+  return fetchJson(`/widgets/${encodeURIComponent(id)}/connector`, { method: 'PUT', body: JSON.stringify(body) })
+}
+
+/** 立即执行一次连接器（api/mcp），返回 {"ok": true, "data": "..."}（data 为最新拉取结果文本）。 */
+export function pollWidget(id: string): Promise<{ ok: boolean; data?: string }> {
+  return fetchJson(`/widgets/${encodeURIComponent(id)}/poll`, { method: 'POST' })
 }

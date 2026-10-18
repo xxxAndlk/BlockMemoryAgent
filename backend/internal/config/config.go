@@ -66,6 +66,12 @@ type SkillsConfig struct {
 	MetaCatalogTop int `yaml:"meta_catalog_top"`
 	// ConsolidateThreshold 达到该启用数后每日自动整理（合并/归档）；默认 30；<=0 关闭。
 	ConsolidateThreshold int `yaml:"consolidate_threshold"`
+	// EvictColdDays 满库淘汰第一档：use_count==0 且创建超过 N 天的技能可被自动归档腾位；默认 30；<=0 关闭。
+	EvictColdDays int `yaml:"evict_cold_days"`
+	// EvictIdleDays 满库淘汰第二档：use_count<=EvictIdleMaxUse 且最近使用（从未使用按创建时间）超过 N 天的技能可被淘汰；默认 90；<=0 关闭。
+	EvictIdleDays int `yaml:"evict_idle_days"`
+	// EvictIdleMaxUse 第二档允许的 use_count 上限；默认 1。
+	EvictIdleMaxUse int `yaml:"evict_idle_max_use"`
 }
 
 // NotifyConfig 会话终态 Webhook 通知配置（TODO #18-5 T32）。
@@ -593,7 +599,7 @@ func (c *Config) applyWorkflowDefaults() {
 	}
 }
 
-// applySkillsDefaults 技能库治理默认值（语义见 SkillsConfig）：50 / 20 / 30。
+// applySkillsDefaults 技能库治理默认值（语义见 SkillsConfig）：50 / 20 / 30；冷淘汰 30 / 90 / 1。
 func (c *Config) applySkillsDefaults() {
 	if c.Skills.MaxCount <= 0 {
 		c.Skills.MaxCount = 50
@@ -603,6 +609,16 @@ func (c *Config) applySkillsDefaults() {
 	}
 	if c.Skills.ConsolidateThreshold == 0 {
 		c.Skills.ConsolidateThreshold = 30
+	}
+	// 冷淘汰两档：<=0 一律回退默认（配置显式关闭可用极大值，不留 0 歧义）。
+	if c.Skills.EvictColdDays <= 0 {
+		c.Skills.EvictColdDays = 30
+	}
+	if c.Skills.EvictIdleDays <= 0 {
+		c.Skills.EvictIdleDays = 90
+	}
+	if c.Skills.EvictIdleMaxUse <= 0 {
+		c.Skills.EvictIdleMaxUse = 1
 	}
 }
 
@@ -1056,3 +1072,9 @@ func resolveEnvWithDefault(s string) string {
 	// 非环境变量引用格式，原样返回
 	return s
 }
+
+// ResolveEnvWithDefault 将形如 ${VAR} 或 ${VAR:"default"} 的字符串解析为实际值
+//（resolveEnvWithDefault 的导出版，语义与 plugins.yaml 密钥纪律完全同款）。
+// 供运行期按同款纪律做插值的包复用（如 widgets 连接器 api headers：清单落盘原文，
+// 执行请求时才展开密钥，密钥不进 widget.json）。
+func ResolveEnvWithDefault(s string) string { return resolveEnvWithDefault(s) }

@@ -147,6 +147,28 @@ func TestPauseMetaOnlyParkLanding(t *testing.T) {
 	}
 }
 
+// TestPauseSessionClearsLiveText 回归（2026-10-17 用户实证：停止会话后再发送，页面复活
+// 上轮回答文字）：停放落定必须与 StreamingText/ThinkingText 清零同窗原子——窗口期里
+// SSE tick 能看到停放态但旧正文未清，live 帧会把旧文字重推给前端。
+func TestPauseSessionClearsLiveText(t *testing.T) {
+	svc := newReactServiceForTest(&mockReactModelProvider{}, t.TempDir())
+	sess := svc.store.createSession("停放清正文测试", "")
+	svc.store.setStreamingText(sess, "上一轮流式正文残留")
+	svc.store.setThinkingText(sess, "上一轮思考残留")
+
+	svc.pauseSession(sess, nil, PauseUserStop)
+
+	svc.store.mu.RLock()
+	st, th, status := sess.StreamingText, sess.ThinkingText, sess.Status
+	svc.store.mu.RUnlock()
+	if st != "" || th != "" {
+		t.Fatalf("停放必须同窗清空瞬时文本: stream=%q think=%q", st, th)
+	}
+	if status != enums.SessionStatusAwaitingClarify {
+		t.Fatalf("停放态错误: %v", status)
+	}
+}
+
 // TestPauseAgentCascadePausesDescendants 级联暂停：cascade=true 标记并取消整棵子树
 // （先后代后本支路），cascade=false 只动本支路；无关支路不受影响。
 func TestPauseAgentCascadePausesDescendants(t *testing.T) {

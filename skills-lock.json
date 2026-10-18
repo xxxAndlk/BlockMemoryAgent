@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "skills": {
+    "byted-ark-seedance-skill": {
+      "source": "skills.volces.com",
+      "sourceUrl": "https://skills.volces.com/skills/volcengine/agentplan",
+      "sourceType": "well-known",
+      "computedHash": "65ebb4f6270481937ead782c4f2d2f015d6ab3a4ee47528d236da2fb33e5f0b9",
+      "wellKnownDigest": "sha256:71cde073eb52e6d745f92719b97194f1dbad0dfefcb70fbc4c34aa917c3fa802"
+    },
+    "byted-ark-seedream-skill": {
+      "source": "skills.volces.com",
+      "sourceUrl": "https://skills.volces.com/skills/volcengine/agentplan",
+      "sourceType": "well-known",
+      "computedHash": "e11bbd33031f6c2e975291d08cb7ab09a9468ec7442496744070fc54f12c4a94",
+      "wellKnownDigest": "sha256:ecd6b80fc5b2b10c6dc944fd8940126a289e9ffb7f6890672baaa9ece4410a2c"
+    }
+  }
+}

@@ -176,6 +176,10 @@ type Registry struct {
 	// 会话启动时授予）：这些名字不经角色可见性天花板即可进 Schema、过执行硬门——授权来自
 	// 配置作者的人工声明，天花板拦的是 Agent 自提权，不拦配置。见 MountPreApprovedForScope。
 	preMounted map[string]map[string]bool
+	// forgeScopes 是锻造簿记：工具名 → 属主 scope（tool_forge 锻造动态工具的
+	// 会话级可见性依据）。与 tools 同受 mu 保护：RegisterForged/UnregisterForgedByScope
+	// 写锁、ForgedScope 读锁。仅 forged__ 前缀工具会进入本表。
+	forgeScopes map[string]string
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -199,6 +203,7 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		longFileScopes:    make(map[string]bool),
 		fileReadMtime:     make(map[string]map[string]time.Time),
 		fileMap:           newFileMapTracker(),
+		forgeScopes:       make(map[string]string),
 		productionWorkDir: "",
 	}
 	if cfg != nil {
@@ -285,6 +290,9 @@ func (r *Registry) registerDefaults() {
 		r.Register(&widgetPushDataTool{})
 		r.Register(&widgetDeleteTool{})
 		r.Register(&widgetRestoreTool{})
+	// tool_forge：锻造自定义工具（脚本落盘 .bma/forged/，注册为 forged__<name>，
+	// 仅锻造者 scope 可见）；簿记走 RegisterForged（forgeScopes）。
+	r.Register(&forgeTool{exec: r.exec, registry: r})
 }
 
 // Register 将工具及其别名注册到注册表中；若传入 nil 则忽略。
@@ -335,6 +343,91 @@ func (r *Registry) Unregister(name string) bool {
 		}
 	}
 	return true
+}
+
+// RegisterForged 登记 tool_forge 锻造的动态工具并记录属主 scope（会话级可见性
+// 依据，adapter Schema() 按 forgeScopes 过滤）。同名且属主不同 = 名字被其他会话
+// 占用，报错拒绝；属主相同 = 覆盖更新（重写脚本 + 重注册）。
+// 并发安全：写锁（与 Register 同策略；注册逻辑内联避免重复取锁死锁）。
+func (r *Registry) RegisterForged(t Tool, scope string) error {
+	if t == nil {
+		return fmt.Errorf("tool: RegisterForged got nil tool")
+	}
+	if scope == "" {
+		return fmt.Errorf("tool: RegisterForged 需要非空属主 scope")
+	}
+	name := t.Name()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if owner, ok := r.forgeScopes[name]; ok && owner != scope {
+		return fmt.Errorf("tool: 名字 %s 已被其他会话占用（属主 scope=%s），请改名锻造", name, owner)
+	}
+	// 内联 Register 逻辑（持锁期间不能再调 Register）：
+	// 首次注册的标准名追加进 schemaOrder，保持注册顺序稳定。
+	if _, ok := r.tools[name]; !ok {
+		r.schemaOrder = append(r.schemaOrder, name)
+	}
+	r.tools[name] = t
+	for _, alias := range t.Aliases() {
+		r.aliases[alias] = name
+	}
+	r.forgeScopes[name] = scope
+	return nil
+}
+
+// UnregisterForgedByScope 摘除该 scope 锻造的全部工具（Unregister + 清簿），
+// 返回摘除名列表（排序后，日志/测试稳定）。会话结束 finalizeSession 调用；
+// .bma/forged/ 下的脚本文件不删（留档可审计，工作目录本就是用户资产）。
+// 并发安全：写锁。
+func (r *Registry) UnregisterForgedByScope(scope string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var removed []string
+	for name, owner := range r.forgeScopes {
+		if owner != scope {
+			continue
+		}
+		delete(r.tools, name)
+		for alias, canonical := range r.aliases {
+			if canonical == name {
+				delete(r.aliases, alias)
+			}
+		}
+		for i, n := range r.schemaOrder {
+			if n == name {
+				r.schemaOrder = append(r.schemaOrder[:i], r.schemaOrder[i+1:]...)
+				break
+			}
+		}
+		delete(r.forgeScopes, name)
+		removed = append(removed, name)
+	}
+	slices.Sort(removed)
+	return removed
+}
+
+// ForgedScope 查询锻造工具的属主 scope：name 在锻造簿记中返回 (owner, true)，
+// 非锻造工具返回 ("", false)。adapter Schema() 可见性过滤用。
+// 并发安全：读锁。
+func (r *Registry) ForgedScope(name string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	owner, ok := r.forgeScopes[name]
+	return owner, ok
+}
+
+// ForgedScopeOwnedByCount 统计属主 scope 名下的锻造工具数量（单 scope 锻造上限
+// 计数，tool_forge Execute 用）。并发安全：读锁。
+func (r *Registry) ForgedScopeOwnedByCount(scope string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, owner := range r.forgeScopes {
+		if owner == scope {
+			n++
+		}
+	}
+	return n
 }
 
 // toolByName 读锁取出已注册工具实例；未注册返回 nil, false。

@@ -510,6 +510,80 @@ func TestFetchRemoteRegistry_Contract(t *testing.T) {
 	}
 }
 
+// TestFetchRemoteRegistry_Pagination 游标翻页 + server 端 search 参数（httptest 离线验证）：
+// nextCursor 非空带 cursor 续拉、跨页同名片段按 isLatest 去重、search 参数透传、无截断 note。
+func TestFetchRemoteRegistry_Pagination(t *testing.T) {
+	var gotSearch []string
+	var gotCursors []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSearch = append(gotSearch, r.URL.Query().Get("search"))
+		cursor := r.URL.Query().Get("cursor")
+		gotCursors = append(gotCursors, cursor)
+		if cursor == "" {
+			// 第 1 页：alpha 旧版 + beta（明抢 isLatest 位），附 nextCursor。
+			fmt.Fprint(w, `{"servers":[
+				{"server":{"name":"org.alpha/alpha","title":"Alpha","description":"alpha tool","version":"1.0.0",
+					"remotes":[{"type":"streamable-http","url":"https://alpha.example/mcp"}]},
+				 "_meta":{"io.modelcontextprotocol.registry/official":{"isLatest":false}}},
+				{"server":{"name":"org.beta/beta","title":"Beta","description":"beta tool","version":"2.0.0",
+					"packages":[{"registryType":"npm","identifier":"beta-mcp","version":"2.0.0","transport":{"type":"stdio"}}]},
+				 "_meta":{"io.modelcontextprotocol.registry/official":{"isLatest":true}}}
+			],"metadata":{"nextCursor":"c2","count":30}}`)
+			return
+		}
+		if cursor == "c2" {
+			// 第 2 页：alpha 最新版（跨页同名片段，应覆盖第 1 页旧版）。
+			fmt.Fprint(w, `{"servers":[
+				{"server":{"name":"org.alpha/alpha","title":"Alpha","description":"alpha tool","version":"1.0.1",
+					"remotes":[{"type":"streamable-http","url":"https://alpha.example/mcp"}]},
+				 "_meta":{"io.modelcontextprotocol.registry/official":{"isLatest":true}}}
+			],"metadata":{"nextCursor":""}}`)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	entries, notes := fetchRemoteRegistry(context.Background(), []string{srv.URL}, "tool")
+	if len(notes) != 0 {
+		t.Fatalf("完整翻页不应有截断 note: %v", notes)
+	}
+	// search 参数应每页透传查询词。
+	for _, s := range gotSearch {
+		if s != "tool" {
+			t.Fatalf("search 参数透传错误: %v", gotSearch)
+		}
+	}
+	// 游标链：第 1 页无 cursor，第 2 页带 c2。
+	if len(gotCursors) != 2 || gotCursors[0] != "" || gotCursors[1] != "c2" {
+		t.Fatalf("翻页游标错误: %v", gotCursors)
+	}
+	// 跨页合并 + 去重：alpha 只剩 1.0.1，beta 在列。
+	if len(entries) != 2 {
+		t.Fatalf("跨页合并错误: %+v", entries)
+	}
+	byID := map[string]CatalogEntry{}
+	for _, e := range entries {
+		byID[e.ID] = e
+	}
+	if byID["org.alpha-alpha"].Version != "1.0.1" {
+		t.Fatalf("跨页 isLatest 去重错误: %+v", byID["org.alpha-alpha"])
+	}
+	if byID["org.beta-beta"].Settings["command"] != "npx" {
+		t.Fatalf("beta 转换错误: %+v", byID["org.beta-beta"])
+	}
+
+	// 截断 honesty：nextCursor 永不清空的来源应在页数硬顶后标截断 note。
+	loop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"servers":[],"metadata":{"nextCursor":"more"}}`)
+	}))
+	defer loop.Close()
+	_, notes = fetchRemoteRegistry(context.Background(), []string{loop.URL}, "")
+	if len(notes) == 0 || !strings.Contains(notes[0], "截断") {
+		t.Fatalf("游标死循环来源应有截断 note: %v", notes)
+	}
+}
+
 // TestSanitizeID ID 净化：非法字符替换为连字符。
 func TestSanitizeID(t *testing.T) {
 	cases := map[string]string{

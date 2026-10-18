@@ -457,19 +457,20 @@ func (s *stubCallSubAgent) Execute(ctx context.Context, args map[string]any) *Re
 }
 
 // TestSchemaIncludesCallSubAgent 验证：call_sub_agent 注册后出现在 LLM 工具
-// schema 中，且描述文本来自工具的 Description()；未注册时 schema 有 38 个工具
-//（明细含 2026-10 界面部件工具组 widget_save/widget_list/widget_push_data/widget_delete/widget_restore）。
+// schema 中，且描述文本来自工具的 Description()；未注册时 schema 有 39 个工具
+//（明细含 2026-10 界面部件工具组 widget_save/widget_list/widget_push_data/widget_delete/widget_restore
+// 与 tool_forge 锻造工具）。
 func TestSchemaIncludesCallSubAgent(t *testing.T) {
-	// 未安装 call_sub_agent 时，schema 恰为 38 个工具（含 RefreshProjectDoc/WriteSharedMemory/ReadSharedMemory/WriteSpec/ReadMedia/ShowArtifact/ask_user/schedule_task/escalate_gear/remember_preference/plugin_*/tool_*/update_evolution_prompt/search_block_memory/widget_save/widget_list/widget_push_data/widget_delete/widget_restore）。
+	// 未安装 call_sub_agent 时，schema 恰为 39 个工具（含 RefreshProjectDoc/WriteSharedMemory/ReadSharedMemory/WriteSpec/ReadMedia/ShowArtifact/ask_user/schedule_task/escalate_gear/remember_preference/plugin_*/tool_*/tool_forge/update_evolution_prompt/search_block_memory/widget_save/widget_list/widget_push_data/widget_delete/widget_restore）。
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	if n := len(r.Schema()); n != 38 {
-		t.Fatalf("expected 38 builtin tools without call_sub_agent, got %d", n)
+	if n := len(r.Schema()); n != 39 {
+		t.Fatalf("expected 39 builtin tools without call_sub_agent, got %d", n)
 	}
 	// 安装后应出现在 schema 中，且描述来自 Description()。
 	r.Register(&stubCallSubAgent{})
 	schema := r.Schema()
-	if len(schema) != 39 {
-		t.Fatalf("expected 39 tools with call_sub_agent, got %d", len(schema))
+	if len(schema) != 40 {
+		t.Fatalf("expected 40 tools with call_sub_agent, got %d", len(schema))
 	}
 	// 遍历查找 call_sub_agent 并校验描述文本。
 	found := false

@@ -391,6 +391,14 @@ function startStream(s: Session) {
       if ((ev as any).type === 'awaiting_clarify') {
         const qid = (ev as any).question_id || ''
         const qs = ((ev as any).questions || []) as ClarifyQuestionItem[]
+        // 停放态空壳帧：软停止后会话状态复用 awaiting_clarify（后端无 PendingClarify），
+        // 但流仍每 150ms 推该帧（question/question_id/questions 全空）。这不是真实提问，
+        // 不能当待澄清——否则徽标误显「待澄清」、按钮变「答复」、提交路由错走 /clarify，
+        // 停止后发消息会直接卡死（2026-10-17 用户实证：停止后发送按钮一直不可点）。
+        if (!qid && !(ev as any).question && !qs.length) {
+          clarifyPending.value = null
+          return
+        }
         // 帧附带的产物（演示视频等）：脏数据在 clarifyArtifactsFromFrame 内清洗/按扩展名兜底推断
         const arts = clarifyArtifactsFromFrame((ev as any).artifacts)
         clarifyPending.value = {
@@ -519,6 +527,10 @@ async function handleSubmit(content: string, images: WireImage[] = [], files: Fi
         activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
         await openSession(activeSession.value.id)
       }
+      // 提交已受理即收 loading：sending 只表示"提交请求在途"。此前只靠 SSE 终态 done 复位，
+      // 会话一落入非终态暂停（awaiting_child / 迭代上限 / 软停止停放）done 永远不来，
+      // 发送按钮就永远转圈不可点（2026-10-17 实证）。
+      sending.value = false
       return
     }
     // 3) 无选中会话 → 创建新会话（携带创建时选档 + 会话级思考强度 + 指定插件，后端非法值 400）
@@ -527,6 +539,7 @@ async function handleSubmit(content: string, images: WireImage[] = [], files: Fi
     sessions.value.unshift(s)
     router.replace({ path: '/session', query: { id: s.id } })
     await openSession(s.id)
+    sending.value = false
   } catch (e) {
     console.error('submit failed:', e)
     sending.value = false
@@ -624,8 +637,12 @@ async function handleStop() {
     //（对齐原终止路径的即时收口）。
     liveStreaming.value = ''
     liveThinking.value = ''
-    if (clarifyAsk) clarifyPending.value = null
+    // 停止即放弃一切待答提问（停放态 awaiting_clarify 不是提问，发送=续跑）。
+    clarifyPending.value = null
     clarifyAck.value = false
+    // 软停止落停放态、SSE 不推终态 done（onDone 不会来清 loading），此处必须复位，
+    // 否则发送按钮永远卡在 loading/disabled（2026-10-17 用户实证）。
+    sending.value = false
     const s = await getSession(sess.id)
     activeSession.value = s
     events.value = [...(s.events || [])]

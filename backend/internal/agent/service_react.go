@@ -970,6 +970,42 @@ func (s *ReactService) PushWidgetData(sessionID, widgetID, payload string) {
 	s.store.setWidgetData(sess, widgetID, payload)
 }
 
+// BroadcastWidgetData 把部件数据广播到全部在内存会话的瞬时数据通道（连接器
+// webhook 回调/调度器/poll 的写侧）：连接器没有单一目标会话，广播保证打开该
+// 部件的所有会话都收到 widget_data 帧；未打开的会话多一条快照数据无副作用
+// （前端按 widget_id 过滤）。截断语义与 PushWidgetData 同款（64KB）。
+func (s *ReactService) BroadcastWidgetData(widgetID, payload string) {
+	if widgetID == "" {
+		return
+	}
+	if len(payload) > widgetPayloadMaxBytes {
+		payload = payload[:widgetPayloadMaxBytes]
+	}
+	for _, sess := range s.store.listSessions() {
+		s.store.setWidgetData(sess, widgetID, payload)
+	}
+}
+
+// CallConnectorTool 供连接器（mcp 型）调用本进程工具：经 toolRegistry.Dispatch
+// 程序化派发（与工作流量产同款通道），ctx 注入进程主工作目录（与程序化调用同
+// 口径）；结果取 Output，失败带 Error 明细。toolRegistry 未接线时返回错误。
+func (s *ReactService) CallConnectorTool(ctx context.Context, name string, args map[string]any) (string, error) {
+	if s.toolRegistry == nil {
+		return "", fmt.Errorf("工具注册表未接线")
+	}
+	res, err := s.toolRegistry.Dispatch(tool.WithWorkDir(ctx, s.workDir()), name, args)
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "", fmt.Errorf("工具 %s 无返回", name)
+	}
+	if !res.Success {
+		return "", fmt.Errorf("%s", res.Error)
+	}
+	return res.Output, nil
+}
+
 // ReportWidgetError 部件渲染错误回报（POST /api/widgets/report）：
 // 落一条 System 会话事件（用户可见）；会话仍在运行时额外向 MetaAgent 邮箱
 // 注入"【部件报错】"FYI，让 Agent 看到并可自行修代码（messenger 未接线的
@@ -3476,6 +3512,8 @@ func (s *ReactService) handleToolEvent(ctx context.Context, ev tool.ProgressEven
 	// 工具调用事件：直接记录工具执行事件。
 	if ev.Kind == "tool_call" || ev.Kind == eventkind.ToolCall {
 		s.store.addEventDetail(session, eventkind.ToolExec, agentName, ev.Message, ev.Kind, ev.Tool, toolArgsLabel(ev.Detail), "", "", success, detailJSON)
+		// 技能进化的脚本候选供给：WriteFile 调用原文捕获（事件摘要截断行还原不出全文）。
+		s.store.captureWriteArtifact(session, ev.Tool, ev.Detail)
 		return
 	}
 	// 工具结果事件：尝试解析 Detail 中的 output、error 与 path 字段。
@@ -4169,6 +4207,12 @@ func (s *ReactService) finalizeSession(session *reactInternalSession) {
 	if session.Status != enums.SessionStatusAwaitingClarify && session.Status != enums.SessionStatusPausedOnChild && session.Status != enums.SessionStatusAwaitingChild {
 		// 清理会话临时目录。
 		s.store.cleanupSessionTempDir(session.ID, session.TempDir)
+		// 摘除本会话锻造的动态工具（forged__*，属主 scope = 会话 ID）：续跑场景同上方
+		// 保留临时目录的口径——暂停态不摘，用户续跑后锻造工具仍可用；终态才清理。
+		// .bma/forged/ 下的脚本文件不删（留档可审计，工作目录本就是用户资产）。
+		if removed := s.toolRegistry.UnregisterForgedByScope(session.ID); len(removed) > 0 {
+			log.Printf("[react] session %s finalized: unregistered forged tools: %s", session.ID, strings.Join(removed, ", "))
+		}
 	}
 	// 淘汰已完成的会话，避免内存无限增长。
 	s.store.evictCompletedSessions()
@@ -4575,6 +4619,13 @@ func (s *ReactService) pauseSession(session *reactInternalSession, history []Rea
 		session.Status = enums.SessionStatusAwaitingClarify
 		session.Result = "已达上限，会话暂停，等待用户消息续跑"
 	}
+	// 停放即清空瞬时流式文本/思考（2026-10-17 用户实证：停止会话后再发送，页面复活旧正文）：
+	// 状态翻转与文本清零必须同窗原子——pauseSession 与 defer 的 finalizeSession 之间存在
+	// 落事件的窗口期，SSE tick 此时已能看到停放态但 StreamingText 尚未清，会把旧正文随
+	// live 帧重推，前端 live 行复活、再发送时上一轮回答像被新回合复述。ask_user 阻塞态
+	//（真澄清）不走 pauseSession，提问正文快照不受影响；finalizeSession 的清空保留作兜底。
+	session.StreamingText = ""
+	session.ThinkingText = ""
 	s.store.mu.Unlock()
 
 	s.store.addEvent(session, eventkind.System, "System", s.pauseMessage(kind), "", "", "", "", "", true)

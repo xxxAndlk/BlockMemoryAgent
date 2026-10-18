@@ -12,6 +12,8 @@ export interface LearnedSkill {
   outcome?: string
   /** 是否携带配套可执行脚本（frontmatter tools 清单非空，阶段 C）。 */
   has_tools?: boolean
+  /** 最近一次 load_skill 加载时间（冷淘汰判定依据）；从未使用为空。 */
+  last_used_at?: string
   created_at: string
   updated_at: string
 }
@@ -62,6 +64,22 @@ export function enableLearnedSkill(name: string): Promise<{ ok: boolean }> {
 
 export function disableLearnedSkill(name: string): Promise<{ ok: boolean }> {
   return fetchJson(`/skills/learned/${encodeURIComponent(name)}/disable`, { method: 'POST' })
+}
+
+/** 手动删除经验技能（物理删）：PG 行 + 技能文件 + 技能池退池，写 evolution_log（skill_delete）。 */
+export function deleteSkill(name: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/skills/learned/${encodeURIComponent(name)}`, { method: 'DELETE' })
+}
+
+/**
+ * 重铸单个存量技能：decision 模型按当前产出契约重写正文（背景/≥3 条带锚点步骤/坑点/验证/示例）。
+ * 结构门或评分不过时后端返回 422，错误消息即拒绝理由（旧内容保留）。
+ */
+export function reforgeSkill(name: string): Promise<{ ok: boolean; summary: string }> {
+  return fetchJson(`/skills/learned/${encodeURIComponent(name)}/reforge`, {
+    method: 'POST',
+    timeoutMs: 150000,
+  })
 }
 
 export function listEvolutionLog(limit = 200): Promise<{ entries: EvolutionLogEntry[] }> {

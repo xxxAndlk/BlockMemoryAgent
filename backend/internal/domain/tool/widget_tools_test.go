@@ -9,11 +9,15 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/blockmemory/agent/backend/internal/widgets"
 )
+
+// connectorTokenRe 钉死 webhook token 形态：32 位小写 hex。
+var connectorTokenRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // newWidgetTestEnv 构造带真实 widgets.Manager 的 Registry + 记录推送的 pushFn。
 func newWidgetTestEnv(t *testing.T) (reg *Registry, mgr *widgets.Manager, pushes *[]string) {
@@ -326,5 +330,98 @@ func TestWidgetDeleteAndRestore(t *testing.T) {
 	res, _ = reg.Dispatch(context.Background(), "widget_restore", map[string]any{"name": "../evil"})
 	if res.Success {
 		t.Fatal("非法条目名应拒绝")
+	}
+}
+
+// TestWidgetSave_Connector 钉死 widget_save 的 connector 入参：api/mcp 透传 +
+// 钳制、webhook token 服务端生成、外部 token/坏 type → validation_rejected、
+// 增量保存未带 connector 时整段保留。
+func TestWidgetSave_Connector(t *testing.T) {
+	reg, mgr, _ := newWidgetTestEnv(t)
+	ctx := WithSessionID(context.Background(), "s1")
+
+	// api 裸接件（零 files 合法）：钳制与 headers 原文落盘。
+	res, err := reg.Dispatch(ctx, "widget_save", map[string]any{
+		"id":   "conn-quotes",
+		"name": "行情",
+		"connector": map[string]any{
+			"type":         "api",
+			"target":       "https://example.com/q",
+			"interval_sec": 3,
+			"timeout_sec":  99,
+			"headers":      map[string]any{"Authorization": "${QUOTES_KEY}"},
+		},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("api 接件应保存成功: %+v err=%v", res, err)
+	}
+	info, ok := mgr.Get("conn-quotes")
+	if !ok || info.Connector == nil || info.Connector.Type != widgets.ConnectorTypeAPI ||
+		info.Connector.IntervalSec != 10 || info.Connector.TimeoutSec != 60 ||
+		info.Connector.Headers["Authorization"] != "${QUOTES_KEY}" {
+		t.Fatalf("connector 透传/钳制不符: %+v ok=%v", info.Connector, ok)
+	}
+	if len(info.Files) != 0 {
+		t.Fatalf("裸接件不应有文件: %+v", info.Files)
+	}
+
+	// webhook：token 服务端生成（32 hex），勿填。
+	res, err = reg.Dispatch(ctx, "widget_save", map[string]any{
+		"id":        "conn-push",
+		"name":      "推送",
+		"connector": map[string]any{"type": "webhook"},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("webhook 接件应保存成功: %+v err=%v", res, err)
+	}
+	info, _ = mgr.Get("conn-push")
+	if info.Connector == nil || !connectorTokenRe.MatchString(info.Connector.Token) {
+		t.Fatalf("webhook token 应服务端生成: %+v", info.Connector)
+	}
+	// 回执应提示 connector 已接线（展示仍走 ShowArtifact）。
+	if !strings.Contains(res.Output, "ShowArtifact(kind=widget") {
+		t.Fatalf("回执应带调用示例: %q", res.Output)
+	}
+
+	// 全量重写（带 files）未给 connector：整段保留、token 不变。
+	res, err = reg.Dispatch(ctx, "widget_save", map[string]any{
+		"id":    "conn-push",
+		"files": []any{map[string]any{"path": "index.html", "content": "<html/>"}},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("重写应成功: %+v", res)
+	}
+	info, _ = mgr.Get("conn-push")
+	if info.Connector == nil || info.Connector.Token == "" || len(info.Files) != 1 {
+		t.Fatalf("重写应保留 connector/token: %+v files=%v", info.Connector, info.Files)
+	}
+
+	// 增量保存带 connector：正常改段。
+	res, err = reg.Dispatch(ctx, "widget_save", map[string]any{
+		"id":        "conn-push",
+		"upsert":    []any{map[string]any{"path": "app.js", "content": "// x"}},
+		"connector": map[string]any{"type": "mcp", "target": "some_tool", "args": map[string]any{"k": 1}},
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("增量+connector 应成功: %+v err=%v", res, err)
+	}
+	info, _ = mgr.Get("conn-push")
+	if info.Connector == nil || info.Connector.Type != widgets.ConnectorTypeMCP ||
+		info.Connector.Target != "some_tool" {
+		t.Fatalf("增量应改写 connector: %+v", info.Connector)
+	}
+
+	// 校验拒绝：坏 type / 外部 token / 非对象 connector。
+	bad := []map[string]any{
+		{"id": "c1", "connector": map[string]any{"type": "sms"}},
+		{"id": "c2", "connector": map[string]any{"type": "webhook", "token": "deadbeef"}},
+		{"id": "c3", "connector": "not-an-object"},
+		{"id": "c4", "connector": map[string]any{"type": "api"}}, // api 缺 target
+	}
+	for i, args := range bad {
+		res, _ := reg.Dispatch(ctx, "widget_save", args)
+		if res.Success || res.Category != ResultCategoryValidationRejected {
+			t.Fatalf("case %d 应 validation_rejected: %+v", i, res)
+		}
 	}
 }

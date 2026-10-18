@@ -29,6 +29,8 @@ type LearnedSkill struct {
 	Outcome       string    `json:"outcome"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	// LastUsedAt 最近一次 load_skill 加载时间（冷淘汰第二档"最近使用"判定依据）；从未使用为 NULL。
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 	// Score 召回相似度（仅 SearchSkills 填充，落库时忽略）。
 	Score float64 `json:"score,omitempty"`
 }
@@ -62,6 +64,8 @@ CREATE TABLE IF NOT EXISTS learned_skills (
 );
 -- 老库补 has_tools 列（012_learned_skills_tools.sql；CREATE TABLE IF NOT EXISTS 对存量表是空操作）。
 ALTER TABLE learned_skills ADD COLUMN IF NOT EXISTS has_tools BOOLEAN NOT NULL DEFAULT FALSE;
+-- 老库补 last_used_at 列（015_learned_skills_last_used.sql；冷淘汰判定"最近使用"）。
+ALTER TABLE learned_skills ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_learned_skills_embedding ON learned_skills
 USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
@@ -128,7 +132,7 @@ func (s *LearnedSkillStore) Get(ctx context.Context, name string) (*LearnedSkill
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	row := s.db.QueryRowContext(ctx, `
-SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at
+SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at, last_used_at
 FROM learned_skills WHERE name = $1`, name)
 	rec, err := scanLearnedSkill(row.Scan)
 	if err == sql.ErrNoRows {
@@ -141,7 +145,7 @@ FROM learned_skills WHERE name = $1`, name)
 func (s *LearnedSkillStore) List(ctx context.Context, enabledOnly bool) ([]*LearnedSkill, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	q := `SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at
+	q := `SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at, last_used_at
 FROM learned_skills`
 	if enabledOnly {
 		q += ` WHERE enabled`
@@ -175,7 +179,7 @@ func (s *LearnedSkillStore) SearchSkills(ctx context.Context, embedding []float3
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, `
-SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at,
+SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at, last_used_at,
        1 - (embedding <=> $1) AS score
 FROM learned_skills
 WHERE enabled AND embedding IS NOT NULL AND embedding <=> $1 <= $2
@@ -188,9 +192,13 @@ LIMIT $3`, pgVector(embedding), maxDistance, limit)
 	var out []*LearnedSkill
 	for rows.Next() {
 		var rec LearnedSkill
+		var lastUsedAt sql.NullTime
 		if err := rows.Scan(&rec.Name, &rec.Title, &rec.WhenToUse, &rec.ContentPath, &rec.Enabled,
-			&rec.UseCount, &rec.HasTools, &rec.SourceSession, &rec.Outcome, &rec.CreatedAt, &rec.UpdatedAt, &rec.Score); err != nil {
+			&rec.UseCount, &rec.HasTools, &rec.SourceSession, &rec.Outcome, &rec.CreatedAt, &rec.UpdatedAt, &lastUsedAt, &rec.Score); err != nil {
 			continue
+		}
+		if lastUsedAt.Valid {
+			rec.LastUsedAt = &lastUsedAt.Time
 		}
 		out = append(out, &rec)
 	}
@@ -215,7 +223,7 @@ func (s *LearnedSkillStore) TopEnabled(ctx context.Context, limit int) ([]*Learn
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, `
-SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at
+SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at, last_used_at
 FROM learned_skills WHERE enabled
 ORDER BY use_count DESC, updated_at DESC
 LIMIT $1`, limit)
@@ -249,12 +257,63 @@ func (s *LearnedSkillStore) SetEnabled(ctx context.Context, name string, enabled
 	return nil
 }
 
-// IncrementUseCount load_skill 加载计数 +1（设计 §6.5）。
+// IncrementUseCount load_skill 加载计数 +1，并刷新 last_used_at（冷淘汰"最近使用"依据）。
 func (s *LearnedSkillStore) IncrementUseCount(ctx context.Context, name string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	_, err := s.db.ExecContext(ctx, `UPDATE learned_skills SET use_count = use_count + 1, updated_at = now() WHERE name = $1`, name)
+	_, err := s.db.ExecContext(ctx, `UPDATE learned_skills SET use_count = use_count + 1, last_used_at = now(), updated_at = now() WHERE name = $1`, name)
 	return err
+}
+
+// ListColdEnabled 冷淘汰候选（满库腾位用）：tier1 = use_count==0 且创建早于 now()-coldDays 天；
+// tier2 = use_count<=idleMaxUse 且最近使用（从未使用按创建时间）早于 now()-idleDays 天。
+// 按 use_count 升序、最近使用升序取最冷的前 limit 个（确定性淘汰，不依赖 LLM）。
+func (s *LearnedSkillStore) ListColdEnabled(ctx context.Context, limit, coldDays, idleDays, idleMaxUse int) ([]*LearnedSkill, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
+SELECT name, title, when_to_use, content_path, enabled, use_count, has_tools, source_session, outcome, created_at, updated_at, last_used_at
+FROM learned_skills
+WHERE enabled AND (
+  (use_count = 0 AND created_at < now() - make_interval(days => $2))
+  OR (use_count <= $4 AND COALESCE(last_used_at, created_at) < now() - make_interval(days => $3))
+)
+ORDER BY use_count ASC, COALESCE(last_used_at, created_at) ASC, created_at ASC
+LIMIT $1`, limit, coldDays, idleDays, idleMaxUse)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*LearnedSkill
+	for rows.Next() {
+		rec, err := scanLearnedSkill(rows.Scan)
+		if err != nil {
+			if s.log != nil {
+				s.log.Error(ctx, "learned_skills scan row failed", err)
+			}
+			continue
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// Delete 物理删除技能记录（PG 行）；文件删除由调用方负责。不存在返回 sql.ErrNoRows。
+func (s *LearnedSkillStore) Delete(ctx context.Context, name string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	res, err := s.db.ExecContext(ctx, `DELETE FROM learned_skills WHERE name = $1`, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // UpdateMeta 手动编辑（HTTP PUT）：刷新 title/when_to_use/重嵌入向量/has_tools。
@@ -289,12 +348,16 @@ func (s *LearnedSkillStore) Embed(ctx context.Context, text string) ([]float32, 
 func scanLearnedSkill(scan func(dest ...any) error) (*LearnedSkill, error) {
 	var rec LearnedSkill
 	var sourceSession, outcome sql.NullString
+	var lastUsedAt sql.NullTime
 	if err := scan(&rec.Name, &rec.Title, &rec.WhenToUse, &rec.ContentPath, &rec.Enabled,
-		&rec.UseCount, &rec.HasTools, &sourceSession, &outcome, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		&rec.UseCount, &rec.HasTools, &sourceSession, &outcome, &rec.CreatedAt, &rec.UpdatedAt, &lastUsedAt); err != nil {
 		return nil, err
 	}
 	rec.SourceSession = sourceSession.String
 	rec.Outcome = outcome.String
+	if lastUsedAt.Valid {
+		rec.LastUsedAt = &lastUsedAt.Time
+	}
 	return &rec, nil
 }
 

@@ -17,6 +17,7 @@ package tool
 
 import (
 	"context"  // 工具执行上下文
+	"encoding/json" // connector 入参解析（JSON 对象 → ConnectorSpec）
 	"fmt"      // 结果文案
 	"path/filepath" // 回收站路径回执文案（Windows 反斜杠转正斜杠）
 	"strings" // 文案拼接
@@ -108,7 +109,9 @@ func (t *widgetSaveTool) Description() string {
 		"之后用 ShowArtifact(kind=widget, widget_id=<id>) 拿给用户看（对话栏渲染成沙箱 iframe 卡片）。" +
 		"适用：需要实时刷新或定制渲染的展示（二维码画布、轮询数据卡片、美化报表）。" +
 		"两种模式：全量 files=[{path, content}]（含入口 index.html，新建/整包重写）；或增量 upsert=[{path, content}] + delete=[path...]（与 files 互斥，只改列出的文件，其余保持原样，须为已有部件）。" +
-		"可选 name/description/entry；更新会保留原启用状态，已打开的卡片自动热刷新。部件内 JS 通过 postMessage 接收宿主消息：" +
+		"可选 name/description/entry；可选 connector 把外部数据源接进部件（url/api/mcp/webhook 四型，" +
+		"webhook 的 token 服务端生成、api 密钥走 headers 的 ${ENV} 插值不落明文）；更新会保留原启用状态，" +
+		"已打开的卡片自动热刷新。部件内 JS 通过 postMessage 接收宿主消息：" +
 		"{type:'init'|'data', payload:'...'}（payload 是字符串，自行 JSON.parse）；向上报借用 " +
 		"parent.postMessage({type:'error', message}, '*')。"
 }
@@ -154,6 +157,23 @@ func (t *widgetSaveTool) InputSchema() *jsonschema.Schema {
 				Description: "增量模式：待删除的文件路径列表（不存在则报错）",
 				Items:       &jsonschema.Schema{Type: "string"},
 			},
+			"connector": {
+				Type: "object",
+				Description: "连接器（可选）：把外部数据源/页面/回调接进部件，数据经数据总线（widget_data 帧）进部件。" +
+					"type 四选一——url=iframe 外链页面 / api=后端定时拉 HTTP 接口 / mcp=后端定时调插件工具 / " +
+					"webhook=外部系统反向推数（token 由服务端生成，勿填）；api 密钥走 headers 的 ${ENV_VAR:default} 插值不落明文；" +
+					"不带 files 时为裸接件（前端通用数据卡直显，无需写 index.html）",
+				Properties: map[string]*jsonschema.Schema{
+					"type":         {Type: "string", Description: "url|api|mcp|webhook（必填）"},
+					"target":       {Type: "string", Description: "url/api=http(s) 地址；mcp=工具名；webhook 留空"},
+					"method":       {Type: "string", Description: "api 的 HTTP 方法（GET/POST，缺省 GET）"},
+					"headers":      {Type: "object", Description: "api 请求头（值支持 ${ENV_VAR:default} 执行期插值，密钥不落盘）"},
+					"body":         {Type: "string", Description: "api POST 请求体（可选，原文透传）"},
+					"args":         {Type: "object", Description: "mcp 工具调用参数"},
+					"interval_sec": {Type: "integer", Description: "api/mcp 轮询间隔秒（10-3600，缺省 30）"},
+					"timeout_sec":  {Type: "integer", Description: "单次请求/调用超时秒（1-60，缺省 10）"},
+				},
+			},
 		},
 		Required: []string{"id"},
 	}
@@ -188,6 +208,16 @@ func (t *widgetSaveTool) Execute(ctx context.Context, args map[string]any) *Resu
 		Entry:       strings.TrimSpace(strArg(args, "entry")),
 		Owner:       owner,
 	}
+
+	// 连接器（可选）：JSON 对象 → ConnectorSpec，走保存期同款校验（webhook token
+	// 服务端生成、api 密钥 ${ENV} 插值不落盘）；校验失败 → validation_rejected。
+	conn, err := parseWidgetConnector(args["connector"])
+	if err != nil {
+		res.Error = err.Error()
+		res.Category = ResultCategoryValidationRejected
+		return res
+	}
+	mf.Connector = conn
 
 	// 增量模式：upsert / delete 任一出现即走增量（与 files 互斥）。
 	rawUpsert, hasUpsert := args["upsert"].([]any)
@@ -239,9 +269,11 @@ func (t *widgetSaveTool) Execute(ctx context.Context, args map[string]any) *Resu
 	}
 
 	// 全量模式（原语义）：files 逐个解析（JSON 反序列化进 map 的元素类型是 map[string]any）。
+	// 带 connector 时允许零文件——裸接件（前端通用数据卡/外链渲染，无需 index.html）。
 	rawFiles, ok := args["files"].([]any)
-	if !ok || len(rawFiles) == 0 {
-		res.Error = "files 必填且至少一个文件（含入口 index.html）；或用 upsert/delete 增量更新"
+	if (!ok || len(rawFiles) == 0) && mf.Connector == nil {
+		res.Error = "files 必填且至少一个文件（含入口 index.html）；或用 upsert/delete 增量更新；" +
+			"带 connector 创建外部接件时可省略 files（裸接件，前端通用数据卡直显）"
 		res.Category = ResultCategoryValidationRejected
 		return res
 	}
@@ -274,6 +306,31 @@ func (t *widgetSaveTool) Execute(ctx context.Context, args map[string]any) *Resu
 	res.Success = true
 	res.Output = t.saveOutput(info, "已保存")
 	return res
+}
+
+// parseWidgetConnector 解析 widget_save 的 connector 入参（JSON 对象，可选）：
+// 经 marshal→unmarshal 成 ConnectorSpec 并走保存期同款校验（webhook token 服务端
+// 生成、外部传入即拒）；入参缺省返回 nil（保存时保留部件原连接器段）。
+func parseWidgetConnector(raw any) (*widgets.ConnectorSpec, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("connector 须为 JSON 对象（{type, target, ...}）")
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("connector 序列化失败: %w", err)
+	}
+	var spec widgets.ConnectorSpec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return nil, fmt.Errorf("connector 字段非法: %w", err)
+	}
+	if err := widgets.ValidateConnector(&spec); err != nil {
+		return nil, err
+	}
+	return &spec, nil
 }
 
 // pushReload 向当前会话推热刷新信号；无会话上下文（测试/程序化调用）或推送通道

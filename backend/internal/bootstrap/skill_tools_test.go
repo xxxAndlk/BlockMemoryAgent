@@ -204,10 +204,10 @@ func TestParseLearnedSkillFileDirFormatTools(t *testing.T) {
 
 // ---- C3：prompt / 解析 ----
 
-// TestBuildEvolvePromptToolsRules C3 prompt 规则：仅实际用过、≤60 行、filename 规范。
+// TestBuildEvolvePromptToolsRules C3 prompt 规则：code 原样照抄会话产物候选、数量与 filename 规范。
 func TestBuildEvolvePromptToolsRules(t *testing.T) {
 	p := buildEvolvePrompt(agent.EvolveInput{Goal: "g", Summary: "s", Outcome: "success", EventsDigest: "e", UserMessages: "u"})
-	for _, want := range []string{"tools", "filename", "language", "code", "desc", "≤60 行", "实际自写并执行成功", "scripts/", "py|sh|js|ts"} {
+	for _, want := range []string{"tools", "filename", "language", "code", "desc", "原样", "最多 2 个", "scripts/", "py|sh|js|ts", "本次会话写出的脚本"} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt missing %q", want)
 		}

@@ -65,7 +65,7 @@ meta_agent:
           ListDir, ShowArtifact, list_skills, load_skill, tool_catalog, tool_mount, tool_unmount, plugin_search,
           plugin_install, plugin_enable, plugin_disable, plugin_list, list_models, set_role_model, set_agent_model,
           expand_memory, update_evolution_prompt, search_block_memory, widget_save, widget_list,
-          widget_push_data, widget_delete, widget_restore,
+          widget_push_data, widget_delete, widget_restore, tool_forge,
           workflow_freeze, workflow_run, workflow_status]
 
 # 领域Agent配置（domain 角色共用模型）
@@ -91,10 +91,14 @@ lightweight_model:
 # 决策层模型配置（TODO #23）：灰区判断/建议用极小调用面（Choice/Score/Noul 三原语分类）。
 # 未配置本节（或留空 model/model_ref）时回退 lightweight_model——白拿缓存/绑定/热更新/日志。
 # 调用日志 Meta.layer=decision（session_logs 可与 lightweight 归因区分）。
+# 薄技能治理（2026-10-18）：会话结束的技能沉淀（SessionEvolver）也走本槽——mini 级模型
+# 写不出带具体锚点的步骤，产出全是"百字小提示"。skill 沉淀每会话仅一次、成本可忽略，
+# 建议把 decision_model 指向 ≥seed-1.6 级别的模型；max_tokens 需 ≥4096 容纳
+# background+steps+pitfalls+verify+example 完整技能包。
 decision_model:
-  model_ref: doubao-seed-2.0-mini # 连接参数见 config/models.json；可指向更便宜更快模型
+  model_ref: doubao-seed-2.0-mini # 连接参数见 config/models.json；技能沉淀质量差时换更强模型
   temperature: 0
-  max_tokens: 2048
+  max_tokens: 4096 # 技能沉淀契约（背景/3-7步/坑点/验证/示例）需要比总结类更大的输出空间
 
 # 文本嵌入模型配置（P3-3）
 # provider: pseudo（默认，零依赖字符哈希） | openai（OpenAI 兼容端点） | local（本地 ollama/xinference HTTP 服务） | onnx（进程内 ONNX Runtime，TODO #41 真本地）

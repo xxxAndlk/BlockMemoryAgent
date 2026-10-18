@@ -100,8 +100,10 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.GET("/skills/learned", apiHandler.ListLearnedSkillsHandler)                  // 技能库列表（含禁用）
 	api.GET("/skills/learned/:name", apiHandler.GetLearnedSkillHandler)              // 技能详情 + 文件全文
 	api.PUT("/skills/learned/:name", apiHandler.SaveLearnedSkillHandler)             // 手动编辑（重写文件+向量）
+	api.DELETE("/skills/learned/:name", apiHandler.DeleteLearnedSkillHandler)        // 手动删除（PG 行 + 文件 + 退池）
 	api.POST("/skills/learned/:name/enable", apiHandler.EnableLearnedSkillHandler)   // 启用
 	api.POST("/skills/learned/:name/disable", apiHandler.DisableLearnedSkillHandler) // 禁用
+	api.POST("/skills/learned/:name/reforge", apiHandler.ReforgeLearnedSkillHandler) // 重铸（decision 模型按契约重写正文）
 	api.POST("/skills/consolidate", apiHandler.ConsolidateSkillsHandler)             // 技能库整理（合并/归档，忽略每日阈值）
 	api.POST("/memory/consolidate", apiHandler.ConsolidateMemoryHandler)             // 块记忆库整理（近重复合并/零访问归档，忽略每日阈值）
 	api.GET("/evolution/log", apiHandler.EvolutionLogHandler)                        // 进化审计流水
@@ -120,17 +122,24 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	// 界面部件（Widget）管理 API：目录包热载 + 卡片文件服务 + 瞬时数据推送 + 错误回报。
 	// 静态段 reload/push/report 与 :id 同层注册（与 plugins 段同款，gin 静态优先）。
 	api.GET("/widgets", apiHandler.ListWidgetsHandler)                 // 部件列表
-	api.GET("/widgets/:id", apiHandler.GetWidgetHandler)               // 部件详情（Info JSON）
+	api.GET("/widgets/:id", apiHandler.GetWidgetHandler)               // 部件详情（Info JSON；webhook 附顶层 hook_url）
+	api.POST("/widgets", apiHandler.CreateWidgetHandler)               // 新建部件（含连接器；webhook 响应带 token + hook_url）
+	api.PUT("/widgets/:id/connector", apiHandler.UpdateWidgetConnectorHandler) // 更新连接器段（可 regen_token 再生 token）
+	api.POST("/widgets/:id/poll", apiHandler.PollWidgetHandler)        // 连接器立即执行一次（api/mcp），同步返回结果
 	api.POST("/widgets/:id/enable", apiHandler.EnableWidgetHandler)    // 热启用
 	api.POST("/widgets/:id/disable", apiHandler.DisableWidgetHandler)  // 热停用
 	api.POST("/widgets/reload", apiHandler.ReloadWidgetsHandler)       // 重扫 widgets/ 目录
-	api.GET("/widgets/:id/files/*path", apiHandler.HandleWidgetFile)   // 部件文件服务（iframe 渲染源）
+	api.GET("/widgets/:id/files/*path", apiHandler.HandleWidgetFile)   // 部件文件服务（iframe 渲染源；拒发 widget.json 与隐藏文件）
 		api.POST("/widgets/push", apiHandler.PushWidgetHandler)            // 瞬时数据推送（bridge 等进程插件）
 		api.POST("/widgets/report", apiHandler.ReportWidgetHandler)        // 部件渲染错误回报
 		api.POST("/widgets/action", apiHandler.WidgetActionHandler)        // 部件上行操作（卡片内用户交互）
 		api.DELETE("/widgets/:id", apiHandler.DeleteWidgetHandler)         // 软删（目录移入回收站）
 		api.GET("/widgets/trash", apiHandler.ListWidgetTrashHandler)       // 回收站条目列表
 		api.POST("/widgets/trash/:name/restore", apiHandler.RestoreWidgetTrashHandler) // 恢复回收站条目
+
+	// webhook 回调端点（2026-10-17 连接器）：注册在无鉴权组——外部系统凭
+	// 部件 id + token 直推（token 即凭据），单部件 60s/60 次限流在 handler 内。
+	router.POST("/api/widgets/:id/hook/:token", apiHandler.WidgetHookHandler)
 
 	// 模型动态切换 API（TUI 走进程内直调，不经此端点）。
 	api.GET("/models", apiHandler.ListModelsHandler)          // 模型目录：注册表清单 + 各角色当前模型
@@ -157,9 +166,11 @@ func apiHandlerOf(app *App) *server.APIHandler {
 	}
 	if app.Postgres != nil {
 		h.SetLearnedSkills(app.Postgres.LearnedSkills) // 自进化技能库存储
+		h.SetLearnedSkillsDir(app.SkillsDir)           // 技能目录：DELETE 删文件安全校验（与 evolver 落库同口径）
 		h.SetRoleEvolution(app.RoleEvolution, app.RoleRegistry) // 角色自进化准则存储（≤300字/角色，AI 自维护）
 	}
 	h.SetSkillConsolidation(app.SkillConsolidation)   // 技能库整理（C 库存治理，未装配时端点 503）
+	h.SetSkillReforge(app.SkillReforge)               // 技能重铸（薄技能治理，未装配时端点 503）
 	h.SetMemoryConsolidation(app.MemoryConsolidation) // 块记忆库整理（2026-10-13，未装配时端点 503）
 	return h
 }

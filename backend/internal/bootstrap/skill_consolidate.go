@@ -42,11 +42,23 @@ type skillConsolidator struct {
 	pool      *skill.Pool
 	factory   *model.ModelFactory
 	threshold int // 启用技能数达到该值才自动整理；<=0 关闭自动（手动触发不受限）
-	mu        sync.Mutex
+	// floor enabled 技能容量线（= cfg.Skills.MaxCount）；<=0 表示无容量压力，不跑冷淘汰兜底。
+	floor int
+	// evictColdDays/evictIdleDays/evictIdleMaxUse 冷淘汰两档规则（确定性兜底与 evolver 写入门共用）。
+	evictColdDays   int
+	evictIdleDays   int
+	evictIdleMaxUse int
+	// callLLM 轻量模型调用（plan 用）；newSkillConsolidator 装配真实现，
+	// 单测注入 fake 覆盖"空方案走冷淘汰兜底"路径（对齐 evolver 的 judge/score 注入风格）。
+	callLLM func(ctx context.Context, prompt string) (string, error)
+	mu      sync.Mutex
 }
 
-func newSkillConsolidator(skills learnedSkillStoreOps, pool *skill.Pool, factory *model.ModelFactory, threshold int) *skillConsolidator {
-	return &skillConsolidator{skills: skills, pool: pool, factory: factory, threshold: threshold}
+func newSkillConsolidator(skills learnedSkillStoreOps, pool *skill.Pool, factory *model.ModelFactory, threshold, floor, evictColdDays, evictIdleDays, evictIdleMaxUse int) *skillConsolidator {
+	c := &skillConsolidator{skills: skills, pool: pool, factory: factory, threshold: threshold,
+		floor: floor, evictColdDays: evictColdDays, evictIdleDays: evictIdleDays, evictIdleMaxUse: evictIdleMaxUse}
+	c.callLLM = factory.CallLightweightWithRetry
+	return c
 }
 
 // consolidatePlan 轻量模型产出的整理方案。
@@ -65,7 +77,7 @@ type consolidatePlan struct {
 // Run 执行一轮整理，返回人类可读摘要（跳过原因也在此）。manual=true 时忽略阈值
 //（手动端点触发）；自动（每日 tick）时低于阈值直接跳过。
 func (c *skillConsolidator) Run(ctx context.Context, manual bool) (string, error) {
-	if c == nil || c.skills == nil || c.factory == nil {
+	if c == nil || c.skills == nil || (c.factory == nil && c.callLLM == nil) {
 		return "", fmt.Errorf("skill consolidator not wired")
 	}
 	if !c.mu.TryLock() {
@@ -87,8 +99,16 @@ func (c *skillConsolidator) Run(ctx context.Context, manual bool) (string, error
 		return "", err
 	}
 	groups, sources, archived := c.apply(ctx, enabled, plan)
-	summary := fmt.Sprintf("整理完成：合并 %d 组（吸收 %d 个技能）、归档 %d 个零使用技能；技能库 %d → %d 个",
-		groups, sources, archived, len(enabled), len(enabled)-sources-archived)
+	// 确定性冷淘汰兜底：LLM 方案不含容量控制，池满时按规则挤最冷的，保证技能库每日自愈到 max_count 以下。
+	remaining := len(enabled) - sources - archived
+	evicted := 0
+	if c.floor > 0 && remaining >= c.floor {
+		need := remaining - c.floor + 1
+		evicted = archiveColdSkills(ctx, c.skills, c.pool, need, c.evictColdDays, c.evictIdleDays, c.evictIdleMaxUse)
+		remaining -= evicted
+	}
+	summary := fmt.Sprintf("整理完成：合并 %d 组（吸收 %d 个技能）、归档 %d 个零使用技能、冷淘汰 %d 个；技能库 %d → %d 个",
+		groups, sources, archived, evicted, len(enabled), remaining)
 	_ = c.skills.AppendEvolutionLog(ctx, "consolidate_run", "learned_skills", summary, "")
 	log.Printf("[skill-consolidate] %s", summary)
 	return summary, nil
@@ -117,7 +137,7 @@ func (c *skillConsolidator) plan(ctx context.Context, enabled []*store.LearnedSk
 %s
 
 现在输出 JSON：`, b.String())
-	resp, err := c.factory.CallLightweightWithRetry(ctx, prompt)
+	resp, err := c.callLLM(ctx, prompt)
 	if err != nil {
 		return nil, fmt.Errorf("call lightweight: %w", err)
 	}

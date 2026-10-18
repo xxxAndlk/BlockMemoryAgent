@@ -25,11 +25,13 @@ import (
 
 // buildEvolvePrompt 构造 SessionEvolver 生成 prompt（B1 收紧门槛：单会话最多 1 个技能、
 // 三条件齐备才可产出、steps 必须动词开头且不带行首序号）。JSON 结构与 parseEvolveOutput 保持兼容。
+// 薄技能治理：产出契约要求 background/example、steps 3-7 条且每条带具体锚点——
+// 写不出 3 条具体步骤就必须输出空数组，从源头消灭"百字小提示"。
 func buildEvolvePrompt(in agent.EvolveInput) string {
 	return fmt.Sprintf(`你是会话进化器。分析刚结束的会话，提取可复用经验（失败会话的踩坑经验价值更高）。
 
 产出 JSON 对象（不要 markdown 围栏）:
-{"user_prefs": ["..."], "project_lessons": ["..."], "skills": [{"name": "...", "title": "...", "when_to_use": "...", "steps": ["..."], "pitfalls": ["..."], "verify": "..."}]}
+{"user_prefs": ["..."], "project_lessons": ["..."], "skills": [{"name": "...", "title": "...", "when_to_use": "...", "background": "...", "steps": ["..."], "pitfalls": ["..."], "verify": "...", "example": "..."}]}
 
 规则:
 - user_prefs: 用户的稳定偏好（跨项目通用，如沟通风格/技术栈），0-3 条；不确定就不提取
@@ -38,14 +40,21 @@ func buildEvolvePrompt(in agent.EvolveInput) string {
   ① 跨项目通用（不是本项目独有约定）；② 非显而易见（不是工程师默认都知道的做法）；
   ③ 有具体可执行步骤（步骤里能指到具体命令/参数/文件/工具）
 - name 用小写连字符英文；title 是中文短标题；when_to_use 描述何时使用；pitfalls 是踩过的坑；verify 是验证方法
-- steps 每条必须是动词开头的可执行动作（如"运行 xxx --yyy 生成 zzz"）；明确拒绝"检查/注意/确保/考虑/记得"这类空泛条目
+- background: 背景/原理，2-4 句话讲清"为什么这样做"（前置条件、机制、踩坑根因）；没有值得写的背景可省略
+- steps: 3-7 条，硬性要求：
+  ① 每条动词开头，格式为"动作 + 具体做法 + 预期结果"（如"运行 npx skills add <url> -s <name> 安装技能包，看到 added 即成功"）；
+  ② 每条必须至少含一个具体锚点：完整命令、文件路径、参数名=值、URL、代码片段之一；
+  ③ 明确拒绝"检查/注意/确保/考虑/记得/验证一下"这类空泛条目；
+  ④ 写不出 3 条带锚点的具体步骤，整个 skills 输出空数组——宁缺毋滥
 - steps 数组元素不要自带行首序号或符号（不要写"1. xxx""- xxx"，直接写动作本身）
-- tools: 可选，本次会话中实际自写并执行成功的辅助脚本（最多 1 个）；每项
+- verify: 可执行命令或可观察的判别标准（如"curl -s localhost:7456/api/health 返回 ok"）
+- example: 一个具体使用示例（什么场景下、执行哪条命令/操作、预期看到什么结果），1-3 句
+- tools: 配套脚本的 code 必须原样来自下方「本次会话写出的脚本」候选——逐字照抄，禁止凭记忆改写/重排/缩写；
+  最多 2 个，只选对该技能复用价值最高的；每项
   {"filename": "scripts/xxx.py", "language": "py", "code": "...", "desc": "一句话用途"}。
-  filename 限 scripts/ 下小写字母数字连字符加点扩展名（py/sh/js/ts）；code 必须 ≤60 行
-  （超长不要给 code，把做法写进 steps）；language ∈ py|sh|js|ts。
-  没有符合条件的脚本就省略 tools 字段；tools 不进入 steps，steps 照常写操作步骤
-- 技能包必须有明确的可复用价值，琐碎会话输出空数组
+  filename 限 scripts/ 下小写字母数字连字符加点扩展名（py/sh/js/ts）；language ∈ py|sh|js|ts。
+  没有合适候选就省略 tools 字段；steps 里引用已选脚本时用「运行 scripts/xxx.py（参数）」格式
+- 写作视角：读者是不了解本会话的未来工程师，照你的步骤做应能成功；照抄会话里出现过的真实命令/路径，不要凭印象编造
 - skills 中缺 title 或 when_to_use 的条目会被丢弃
 
 会话目标:
@@ -59,26 +68,41 @@ func buildEvolvePrompt(in agent.EvolveInput) string {
 
 事件流摘要:
 %s
-
+%s
 用户消息:
 %s
 
 现在输出 JSON：`,
-		truncateForPrompt(in.Goal, 500),
-		truncateForPrompt(in.Summary, 800),
+		truncateForPrompt(in.Goal, 1000),
+		truncateForPrompt(in.Summary, 2500),
 		in.Outcome,
-		truncateForPrompt(in.EventsDigest, 1500),
+		truncateForPrompt(in.EventsDigest, evolveDigestPromptMax),
+		artifactsPromptSection(in.Artifacts),
 		truncateForPrompt(in.UserMessages, 4000))
 }
 
-// evolveSessionLLM SessionEvolver 轻量模型调用（设计 §6.1）：
+// artifactsPromptSection 渲染「本次会话写出的脚本」候选段；无产物时返回空串（不占 prompt 位）。
+func artifactsPromptSection(artifacts string) string {
+	if strings.TrimSpace(artifacts) == "" {
+		return ""
+	}
+	return "\n本次会话写出的脚本（tools 的 code 从这里原样照抄，不要改写）：\n" + artifacts + "\n"
+}
+
+// evolveDigestPromptMax 事件摘要进 prompt 的 rune 上限（与 agent 侧 evolveDigestMaxRunes 对齐）。
+const evolveDigestPromptMax = 6000
+
+// evolveSessionLLM SessionEvolver 模型调用（设计 §6.1）：
 // 输入 goal+summary+事件摘要+用户消息（rune 上限在 agent 侧截断），产出三类沉淀。
+// 薄技能治理：走 decision 槽（roles.yaml decision_model）而非 lightweight——技能沉淀每会话
+// 仅一次、成本可忽略，但 mini 级模型写不出带锚点的具体步骤；decision 槽可独立指向更强模型，
+// 未配置时按既有决策回退 lightweight（行为同旧）。
 // 解析失败返回 error，调用方（evolveSession）降级纯画像提取。
 func evolveSessionLLM(ctx context.Context, factory *model.ModelFactory, in agent.EvolveInput) (*agent.EvolveOutput, error) {
 	prompt := buildEvolvePrompt(in)
-	resp, err := factory.CallLightweightWithRetry(ctx, prompt)
+	resp, err := factory.CallDecisionWithRetry(ctx, prompt)
 	if err != nil {
-		return nil, fmt.Errorf("call lightweight: %w", err)
+		return nil, fmt.Errorf("call decision: %w", err)
 	}
 	return parseEvolveOutput(resp)
 }
@@ -98,13 +122,15 @@ func parseEvolveOutput(resp string) (*agent.EvolveOutput, error) {
 		UserPrefs      []string `json:"user_prefs"`
 		ProjectLessons []string `json:"project_lessons"`
 		Skills         []struct {
-			Name      string   `json:"name"`
-			Title     string   `json:"title"`
-			WhenToUse string   `json:"when_to_use"`
-			Steps     []string `json:"steps"`
-			Pitfalls  []string `json:"pitfalls"`
-			Verify    string   `json:"verify"`
-			Tools     []struct {
+			Name       string   `json:"name"`
+			Title      string   `json:"title"`
+			WhenToUse  string   `json:"when_to_use"`
+			Background string   `json:"background"`
+			Steps      []string `json:"steps"`
+			Pitfalls   []string `json:"pitfalls"`
+			Verify     string   `json:"verify"`
+			Example    string   `json:"example"`
+			Tools      []struct {
 				Filename string `json:"filename"`
 				Language string `json:"language"`
 				Code     string `json:"code"`
@@ -119,7 +145,8 @@ func parseEvolveOutput(resp string) (*agent.EvolveOutput, error) {
 	for _, sk := range raw.Skills {
 		ev := agent.EvolvedSkill{
 			Name: sk.Name, Title: sk.Title, WhenToUse: sk.WhenToUse,
-			Steps: sk.Steps, Pitfalls: sk.Pitfalls, Verify: sk.Verify,
+			Background: sk.Background, Steps: sk.Steps, Pitfalls: sk.Pitfalls,
+			Verify: sk.Verify, Example: sk.Example,
 		}
 		for _, t := range sk.Tools {
 			ev.Tools = append(ev.Tools, agent.EvolvedSkillTool{
@@ -150,15 +177,21 @@ type learnedSkillSink struct {
 	// maxCount enabled 技能上限（B 写入门，config skills.max_count）；<=0 不限。
 	// 达到上限后新经验只允许走"近邻同名判定"合并进既有技能，不再新建（防无限膨胀）。
 	maxCount int
-	factory  *model.ModelFactory
+	// evictColdDays/evictIdleDays/evictIdleMaxUse 满库冷淘汰两档规则（config skills.evict_*）：
+	// 满库时先按确定性规则归档最冷的 enabled 技能腾位，仍满才 skill_dropped。
+	evictColdDays   int
+	evictIdleDays   int
+	evictIdleMaxUse int
+	factory         *model.ModelFactory
 	// judge/score 质量治理回调（B2/B3）；newLearnedSkillSink 装配真实现（轻量模型），
 	// 单测注入 fake 覆盖"评分拒绝/放行""judge 合并/保守合并/新建"各路径。
 	judge func(ctx context.Context, newTitle, newWhenToUse string, cand *store.LearnedSkill) (duplicateJudgeResult, error)
 	score func(ctx context.Context, sk agent.EvolvedSkill) (skillScoreResult, error)
 }
 
-func newLearnedSkillSink(skills learnedSkillStoreOps, dir string, pool *skill.Pool, maxCount int, factory *model.ModelFactory) *learnedSkillSink {
-	s := &learnedSkillSink{skills: skills, dir: dir, pool: pool, maxCount: maxCount, factory: factory}
+func newLearnedSkillSink(skills learnedSkillStoreOps, dir string, pool *skill.Pool, maxCount, evictColdDays, evictIdleDays, evictIdleMaxUse int, factory *model.ModelFactory) *learnedSkillSink {
+	s := &learnedSkillSink{skills: skills, dir: dir, pool: pool, maxCount: maxCount,
+		evictColdDays: evictColdDays, evictIdleDays: evictIdleDays, evictIdleMaxUse: evictIdleMaxUse, factory: factory}
 	s.judge = func(ctx context.Context, title, whenToUse string, cand *store.LearnedSkill) (duplicateJudgeResult, error) {
 		return judgeDuplicateMerge(ctx, factory, title, whenToUse, cand)
 	}
@@ -169,10 +202,18 @@ func newLearnedSkillSink(skills learnedSkillStoreOps, dir string, pool *skill.Po
 }
 
 // persist 技能包批量落库（单条失败记日志跳过，不拖垮其余沉淀）。
-// B2 写入门：落库前逐条轻量评分，<3 分丢弃并写 evolution_log（skill_rejected）；
+// 薄技能治理：落库前先做确定性结构门（thinSkillReason，零模型成本）——<3 条步骤/步骤无锚点/
+// 缺 verify 直接丢弃并写 evolution_log（skill_rejected）；结构门通过后再过 B2 轻量评分。
 // 评分调用/解析失败不阻塞（降级放行）。
 func (s *learnedSkillSink) persist(ctx context.Context, sessionID string, skills []agent.EvolvedSkill, outcome string) error {
 	for _, sk := range skills {
+		if reason := thinSkillReason(sk); reason != "" {
+			name := normalizeSkillName(sk.Name, sk.Title)
+			log.Printf("[evolver] skill rejected by thin gate: name=%q reason=%s", sk.Name, reason)
+			_ = s.skills.AppendEvolutionLog(ctx, "skill_rejected", name,
+				fmt.Sprintf("%s：结构过薄——%s", truncateForPrompt(sk.Title, 80), reason), sessionID)
+			continue
+		}
 		if s.score != nil {
 			res, err := s.score(ctx, sk)
 			switch {
@@ -258,11 +299,19 @@ func (s *learnedSkillSink) persistOne(ctx context.Context, sessionID string, sk 
 			kind = "skill_update"
 		}
 	}
-	// B 写入门：技能库达上限后拒绝新建（更新既有技能不受限——合并路径正是满库时
-	// 期望的吸收方式）。拒绝也写 evolution_log（skill_dropped），在技能页可审计。
+	// B 写入门 + 冷淘汰腾位：技能库达上限后先按确定性规则归档最冷的 enabled 技能
+	//（use_count==0 创建超期 / 低频且最近使用超期）腾位；腾位后仍满才拒绝新建（更新既有
+	// 技能不受限——合并路径正是满库时期望的吸收方式）。拒绝也写 evolution_log
+	//（skill_dropped），在技能页可审计。
 	if kind == "skill_create" && s.maxCount > 0 {
 		if n, err := s.skills.CountEnabled(ctx); err == nil && n >= s.maxCount {
-			reason := fmt.Sprintf("技能库已满（enabled %d/%d），经验未沉淀为新技能：%s（可合并进既有技能或调大 skills.max_count）", n, s.maxCount, title)
+			need := n - s.maxCount + 1
+			if evicted := archiveColdSkills(ctx, s.skills, s.pool, need, s.evictColdDays, s.evictIdleDays, s.evictIdleMaxUse); evicted > 0 {
+				log.Printf("[evolver] cold eviction freed %d slot(s) before write gate", evicted)
+			}
+		}
+		if n, err := s.skills.CountEnabled(ctx); err == nil && n >= s.maxCount {
+			reason := fmt.Sprintf("技能库已满（enabled %d/%d），经验未沉淀为新技能：%s（已尝试冷淘汰腾位；可合并进既有技能或调大 skills.max_count）", n, s.maxCount, title)
 			log.Printf("[evolver] skill dropped: library full (%d/%d) name=%s", n, s.maxCount, name)
 			_ = s.skills.AppendEvolutionLog(ctx, "skill_dropped", name, truncateForPrompt(reason, 200), sessionID)
 			return nil
@@ -434,6 +483,11 @@ func renderLearnedSkillMD(name, title, whenToUse, outcome string, sk agent.Evolv
 	var b strings.Builder
 	b.WriteString(textutil.RenderSkillFrontmatter(name, title, whenToUse, outcome, tools...))
 	b.WriteString("\n")
+	if v := strings.TrimSpace(sk.Background); v != "" {
+		b.WriteString("## 背景\n")
+		b.WriteString(v)
+		b.WriteString("\n\n")
+	}
 	if len(sk.Steps) > 0 {
 		b.WriteString("## 步骤\n")
 		for i, st := range sk.Steps {
@@ -450,6 +504,11 @@ func renderLearnedSkillMD(name, title, whenToUse, outcome string, sk agent.Evolv
 	}
 	if v := strings.TrimSpace(sk.Verify); v != "" {
 		b.WriteString("## 验证\n")
+		b.WriteString(v)
+		b.WriteString("\n")
+	}
+	if v := strings.TrimSpace(sk.Example); v != "" {
+		b.WriteString("\n## 示例\n")
 		b.WriteString(v)
 		b.WriteString("\n")
 	}

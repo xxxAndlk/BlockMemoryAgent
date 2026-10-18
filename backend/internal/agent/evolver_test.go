@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -186,4 +187,68 @@ func TestInjectSkillRecall(t *testing.T) {
 	if !strings.Contains(got, "frame-render-dedup") || !strings.Contains(got, "动画帧渲染去重") || !strings.Contains(got, goal) {
 		t.Fatalf("hint block incomplete: %q", got)
 	}
+}
+
+// ---- 写盘产物捕获（技能进化"带真实代码"供给） ----
+
+func TestCaptureWriteArtifact(t *testing.T) {
+	st := newReactSessionStore(nil)
+	s := &reactInternalSession{ID: "session-artifact-test"}
+	pyCode := "import os\nprint('hi')\n"
+	writeArgs := `{"path":"scripts/check.py","content":` + mustJSONString(pyCode) + `}`
+
+	// 非写文件工具：跳过。
+	st.captureWriteArtifact(s, "RunCommand", writeArgs)
+	if len(s.writeArtifacts) != 0 {
+		t.Fatalf("non-write tool must not capture, got %d", len(s.writeArtifacts))
+	}
+	// 非脚本扩展名：跳过。
+	st.captureWriteArtifact(s, "WriteFile", `{"path":"README.md","content":"# x"}`)
+	if len(s.writeArtifacts) != 0 {
+		t.Fatal("non-script ext must not capture")
+	}
+	// node_modules 路径：跳过。
+	st.captureWriteArtifact(s, "WriteFile", `{"path":"node_modules/x/index.js","content":"console.log(1)"}`)
+	if len(s.writeArtifacts) != 0 {
+		t.Fatal("node_modules path must not capture")
+	}
+	// 超行：跳过（照抄半截会误导模型）。
+	longCode := strings.Repeat("print(1)\n", 61)
+	st.captureWriteArtifact(s, "WriteFile", `{"path":"scripts/long.py","content":`+mustJSONString(longCode)+`}`)
+	if len(s.writeArtifacts) != 0 {
+		t.Fatal("over-long script must not capture")
+	}
+	// 正常捕获 + 别名工具名。
+	st.captureWriteArtifact(s, "write_file", writeArgs)
+	if len(s.writeArtifacts) != 1 || s.writeArtifacts[0].Path != "scripts/check.py" || s.writeArtifacts[0].Ext != "py" {
+		t.Fatalf("capture = %+v", s.writeArtifacts)
+	}
+	// 同路径后写覆盖。
+	st.captureWriteArtifact(s, "WriteFile", `{"path":"scripts/check.py","content":"print('v2')\n"}`)
+	if len(s.writeArtifacts) != 1 || !strings.Contains(s.writeArtifacts[0].Content, "v2") {
+		t.Fatalf("same path must be overwritten, got %+v", s.writeArtifacts)
+	}
+	// 容量淘汰最旧：check.py 是最早的产物，超容时先被淘汰。
+	for _, p := range []string{"scripts/a.py", "scripts/b.py", "scripts/c.py"} {
+		st.captureWriteArtifact(s, "WriteFile", `{"path":"`+p+`","content":"print(1)\n"}`)
+	}
+	if len(s.writeArtifacts) != writeArtifactMaxCount {
+		t.Fatalf("artifact count = %d, want %d", len(s.writeArtifacts), writeArtifactMaxCount)
+	}
+	if s.writeArtifacts[0].Path != "scripts/a.py" {
+		t.Fatalf("oldest must be evicted first, got %s", s.writeArtifacts[0].Path)
+	}
+	// 渲染段：含路径与代码原文，空产物返回空串。
+	text := artifactsText(s)
+	if !strings.Contains(text, "scripts/a.py") || !strings.Contains(text, "print(1)") {
+		t.Fatalf("artifactsText = %q", text)
+	}
+	if artifactsText(&reactInternalSession{}) != "" {
+		t.Fatal("empty artifacts must render empty section")
+	}
+}
+
+func mustJSONString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }

@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -35,6 +36,45 @@ type learnedSkillStoreOps interface {
 	Upsert(ctx context.Context, rec *store.LearnedSkill) error
 	AppendEvolutionLog(ctx context.Context, kind, target, summary, sourceSession string) error
 	Embed(ctx context.Context, text string) ([]float32, error)
+	// ListColdEnabled 冷淘汰候选（满库腾位用），确定性排序取最冷的前 limit 个。
+	ListColdEnabled(ctx context.Context, limit, coldDays, idleDays, idleMaxUse int) ([]*store.LearnedSkill, error)
+}
+
+// ---- 薄技能确定性结构门（薄技能治理，先于 LLM 评分执行） ----
+
+// skillAnchorRe 步骤"具体锚点"启发式：文件扩展名、CLI 开关（--flag/-s）、URL、路径、
+// k=v 参数、版本号，或 ≥3 字符的英文工具/命令名。命中任一即视为该步骤带可执行锚点。
+// 用途：拦截"注意检查/确保正确"式空话步骤——这类步骤不含任何命令/路径/参数，
+// 读者无法照做，是"百字小提示"技能的典型形态。
+var skillAnchorRe = regexp.MustCompile(`[A-Za-z0-9_.-]+\.(?:py|sh|js|ts|mjs|md|json|ya?ml|sql|go|txt|csv|toml|lock|html|css)|--?[A-Za-z][A-Za-z0-9-]*\b|https?://|(?:[A-Za-z]:)?/[A-Za-z0-9_.-]+/|[A-Za-z_][A-Za-z0-9_]*=[^ \x{4e00}-\x{9fff}]+|\b\d+\.\d+(?:\.\d+)?\b|[A-Za-z][A-Za-z0-9_.-]{2,}`)
+
+// thinSkillReason 确定性结构门：检查产出技能是否"薄"（空泛、不可照做）。
+// 返回空串=通过；否则返回拒绝理由（写入 evolution_log 供审计）。三条规则：
+// ① 有效步骤 ≥3 条；② 带锚点步骤占比 ≥2/3；③ verify 非空。
+// 规则与 buildEvolvePrompt 的产出契约一一对应——prompt 是软约束，本门是硬兜底。
+func thinSkillReason(sk agent.EvolvedSkill) string {
+	steps := make([]string, 0, len(sk.Steps))
+	for _, st := range sk.Steps {
+		if s := strings.TrimSpace(stripLeadingMarker(st)); s != "" {
+			steps = append(steps, s)
+		}
+	}
+	if len(steps) < 3 {
+		return fmt.Sprintf("步骤不足 3 条（实得 %d 条），达不到可照做标准", len(steps))
+	}
+	anchored := 0
+	for _, st := range steps {
+		if skillAnchorRe.MatchString(st) {
+			anchored++
+		}
+	}
+	if anchored*3 < len(steps)*2 {
+		return fmt.Sprintf("步骤缺具体锚点：仅 %d/%d 条含命令/路径/参数", anchored, len(steps))
+	}
+	if strings.TrimSpace(sk.Verify) == "" {
+		return "缺验证方法（verify 为空）"
+	}
+	return ""
 }
 
 // ---- B2 质量门禁 ----

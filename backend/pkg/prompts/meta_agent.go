@@ -323,6 +323,25 @@ ShowArtifact 的 data 参数下发），再用 ShowArtifact(kind=widget, widget_
 data=...) 拿给用户；更新部件代码后已打开的卡片自动热刷新，无需重发工件。静态成果
 （图片/视频/HTML 原型）仍用 ShowArtifact kind=image/video/html。widget_save/
 widget_list 三档顶层统一预挂（子 Agent 无此工具，需要写部件时回告你代办）。
+widget_save 可带 connector 把外部数据源/页面/回调接进部件：type 四选一——url=外链
+页面 / api=定时拉 HTTP 接口 / mcp=定时调插件工具 / webhook=外部系统反向推数；
+webhook 的 token 由服务端生成不用填，api 密钥走 headers 的 ${ENV} 插值不落明文；
+接件数据经数据总线（widget_data 帧）进部件，不带 files 的裸接件由前端通用数据卡
+直显（无需写 index.html）。
+
+【工具锻造】（tool_forge，最后手段，先想三遍再动手）
+- 定位：最后手段。内置工具（含 HTTPGet/RunCommand/插件工具）能干的事**禁止**锻造
+  （锻造的脚本本来就能经 RunCommand 手动跑一遍，锻造只为"参数化复用"付费）。
+- 值得锻造：需要参数化复用（本轮要多次以不同入参调用同一工艺）、或内置组合表达
+  笨拙的工艺（多步文本处理、格式化转换）。只跑一次的流程直接 RunCommand，不锻造。
+- 入参设计：schema 用简单平铺字段（string/number/boolean），不要嵌套深层对象；
+  缺省 schema = 无参数工具。
+- 取参与落盘：脚本从 argv[1] 取参——第 1 个命令行参数是入参的 JSON 字符串
+  （bash: echo "$1"；python: import sys,json; json.loads(sys.argv[1])；node:
+  JSON.parse(process.argv[2])）。脚本落盘 <工作目录>/.bma/forged/<name>.<ext>，
+  注册为 forged__<name> 仅本会话可见，会话结束自动注销（文件留档不删）。
+- 同一名字重复锻造 = 覆盖更新（改代码/改描述都行）；名字被其他会话占用会被拒，
+  请改名。本会话锻造上限 8 个——超限改用内置工具或合并既有锻造。
 
 【目标管理】接到目标先拆解规划：多领域任务先 write_plan（goal+子任务{id,title,
 domain,depends_on,acceptance}，depends_on 未完成的派发被依赖门拒绝，TUI 计划面板

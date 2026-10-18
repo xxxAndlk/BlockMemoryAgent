@@ -47,25 +47,27 @@ const (
 
 // Manifest 是 widget.json 的磁盘形态（id 不落盘，目录名即 id）。
 type Manifest struct {
-	Name        string `json:"name"`                  // 展示名（缺省回落 id）
-	Version     string `json:"version,omitempty"`     // 版本号（自由文本，展示用）
-	Description string `json:"description,omitempty"` // 一句话说明
-	Entry       string `json:"entry"`                 // 渲染入口文件（相对部件目录，缺省 index.html）
-	Enabled     bool   `json:"enabled"`               // 启停开关（文件即唯一事实源，可手改热生效）
-	Owner       string `json:"owner,omitempty"`       // 归属用户（TODO #18-8 多租户预留；未接线留空）
+	Name        string         `json:"name"`                  // 展示名（缺省回落 id）
+	Version     string         `json:"version,omitempty"`     // 版本号（自由文本，展示用）
+	Description string         `json:"description,omitempty"` // 一句话说明
+	Entry       string         `json:"entry"`                 // 渲染入口文件（相对部件目录，缺省 index.html）
+	Enabled     bool           `json:"enabled"`               // 启停开关（文件即唯一事实源，可手改热生效）
+	Owner       string         `json:"owner,omitempty"`       // 归属用户（TODO #18-8 多租户预留；未接线留空）
+	Connector   *ConnectorSpec `json:"connector,omitempty"`   // 连接器段（可选；url/api/mcp/webhook，见 connector.go）
 }
 
 // Info 是部件对外视图（HTTP API 与 widget_list 工具的线型）。
 type Info struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Version     string    `json:"version"`
-	Description string    `json:"description"`
-	Entry       string    `json:"entry"`
-	Enabled     bool      `json:"enabled"`
-	Owner       string    `json:"owner,omitempty"` // 归属用户（TODO #18-8 多租户预留；未接线留空）
-	UpdatedAt   time.Time `json:"updated_at"`      // 取 widget.json 的 mtime（保存/手改的时间戳）
-	Files       []string  `json:"files"`           // 部件文件相对路径列表（正斜杠，不含 widget.json）
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Version     string         `json:"version"`
+	Description string         `json:"description"`
+	Entry       string         `json:"entry"`
+	Enabled     bool           `json:"enabled"`
+	Owner       string         `json:"owner,omitempty"`     // 归属用户（TODO #18-8 多租户预留；未接线留空）
+	UpdatedAt   time.Time      `json:"updated_at"`          // 取 widget.json 的 mtime（保存/手改的时间戳）
+	Files       []string       `json:"files"`               // 部件文件相对路径列表（正斜杠，不含 widget.json）
+	Connector   *ConnectorSpec `json:"connector,omitempty"` // 连接器段原样透出（webhook 含 token；见 connector.go）
 }
 
 // FileInput 是 Save 的单个待写文件。
@@ -208,6 +210,7 @@ func (m *Manager) refreshLocked(id string) *fileEntry {
 		Owner:       mf.Owner,
 		UpdatedAt:   fi.ModTime(),
 		Files:       m.listFilesLocked(id),
+		Connector:   mf.Connector,
 	}
 	return e
 }
@@ -315,14 +318,21 @@ func validateRelPath(p string) (string, error) {
 
 // Save 校验并原子替换一个部件包（widget_save 工具的写侧）。
 //
-// 校验：id 形态、文件路径不越界、文件数与总大小上限、entry 必须在文件列表。
+// 校验：id 形态、connector 段（ValidateConnector，webhook token 服务端生成）、
+// 文件路径不越界、文件数与总大小上限、entry 必须在文件列表（裸连接器允许零文件：
+// files 为空且带 connector 时不生成 index.html，前端按通用数据卡/外链渲染）。
 // 更新已存在部件时保留原清单的 enabled 与 version（调用方未给 version 时），
 // 使"改代码"不会意外翻转启停状态。
 func (m *Manager) Save(id string, mf Manifest, files []FileInput) (*Info, error) {
 	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
-	if len(files) == 0 {
+	if mf.Connector != nil {
+		if err := ValidateConnector(mf.Connector); err != nil {
+			return nil, err
+		}
+	}
+	if len(files) == 0 && mf.Connector == nil {
 		return nil, fmt.Errorf("至少需要一个文件（入口 %s）", defaultEntry)
 	}
 	if len(files) > maxWidgetFiles {
@@ -336,10 +346,11 @@ func (m *Manager) Save(id string, mf Manifest, files []FileInput) (*Info, error)
 	if err != nil {
 		return nil, fmt.Errorf("entry 非法: %v", err)
 	}
-	// 逐个清洗路径 + 累计大小；entry 必须在文件列表（前端 iframe 加载的就是它）。
+	// 逐个清洗路径 + 累计大小；entry 必须在文件列表（前端 iframe 加载的就是它；
+	// 裸连接器零文件时跳过该项——entry 仅为清单缺省占位，不产生文件）。
 	seen := make(map[string]bool, len(files))
 	total := 0
-	entryFound := false
+	entryFound := len(files) == 0 // 零文件：不校验 entry 存在性
 	for i := range files {
 		rel, err := validateRelPath(files[i].Path)
 		if err != nil {
@@ -371,7 +382,8 @@ func (m *Manager) Save(id string, mf Manifest, files []FileInput) (*Info, error)
 }
 
 // saveLocked 是 Save/SaveIncremental 共用的写侧（调用方持锁）：更新场景保留原
-// enabled/version/owner（保存语义是"改代码/改描述"，不是"改开关/改归属"），
+// enabled/version/owner（保存语义是"改代码/改描述"，不是"改开关/改归属"），未给
+// connector 则保留原段、给了则继承 webhook token（改代码不使回调地址失效），
 // 写临时目录 → 旧目录快照进回收站 → rename 原子替换（Windows rename 不覆盖目录，走备份换名）。
 func (m *Manager) saveLocked(id string, mf Manifest, entry string, files []FileInput) (*Info, error) {
 	// 更新场景保留原 enabled/version：保存语义是"改代码/改描述"，不是"改开关"。
@@ -382,6 +394,16 @@ func (m *Manager) saveLocked(id string, mf Manifest, entry string, files []FileI
 		}
 		if mf.Owner == "" {
 			mf.Owner = e.info.Owner
+		}
+		if mf.Connector == nil {
+			mf.Connector = e.info.Connector // 未给 connector：整段保留（改代码不动接件）
+		} else if err := m.inheritConnectorTokenLocked(&mf, e.info.Connector); err != nil {
+			return nil, err
+		}
+	} else if mf.Connector != nil {
+		// 新建部件：webhook token 服务端生成（外部传入已被 ValidateConnector 拒绝）。
+		if err := m.inheritConnectorTokenLocked(&mf, nil); err != nil {
+			return nil, err
 		}
 	}
 	mf.Entry = entry
@@ -449,7 +471,7 @@ func (m *Manager) saveLocked(id string, mf Manifest, entry string, files []FileI
 	return e.info, nil
 }
 
-// SetEnabled 原子改写清单的 enabled 字段（热启停；保留其余字段原样）。
+// SetEnabled 原子改写清单的 enabled 字段（热启停；保留其余字段原样，含 connector 段）。
 func (m *Manager) SetEnabled(id string, enabled bool) (*Info, error) {
 	if err := ValidateID(id); err != nil {
 		return nil, err
@@ -460,49 +482,19 @@ func (m *Manager) SetEnabled(id string, enabled bool) (*Info, error) {
 	if e.info == nil {
 		return nil, fmt.Errorf("部件不存在: %s", id)
 	}
-		mf := Manifest{
-			Name:        e.info.Name,
-			Version:     e.info.Version,
-			Description: e.info.Description,
-			Entry:       e.info.Entry,
-			Enabled:     enabled,
-			Owner:       e.info.Owner, // owner 归属随清单保留（TODO #18-8）
-		}
+	mf := Manifest{
+		Name:        e.info.Name,
+		Version:     e.info.Version,
+		Description: e.info.Description,
+		Entry:       e.info.Entry,
+		Enabled:     enabled,
+		Owner:       e.info.Owner,     // owner 归属随清单保留（TODO #18-8）
+		Connector:   e.info.Connector, // 启停不丢连接器段（webhook token 随之保留）
+	}
 	if mf.Name == id {
 		mf.Name = "" // 缺省回落 id 的不落盘，保持清单干净
 	}
-	body, err := json.MarshalIndent(&mf, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal manifest %s: %w", id, err)
-	}
-	// 临时文件 + rename 原子改写（Windows rename 不覆盖，先删旧文件，
-	// 与 dag.FileStore.writeDefLocked 同款处理）。
-	tmp, err := os.CreateTemp(m.dirOf(id), ".manifest-*.tmp")
-	if err != nil {
-		return nil, fmt.Errorf("create temp manifest: %w", err)
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(body); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return nil, fmt.Errorf("write temp manifest: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return nil, fmt.Errorf("close temp manifest: %w", err)
-	}
-	path := m.manifestPathOf(id)
-	if err := os.Remove(path); err != nil {
-		os.Remove(tmpName)
-		return nil, fmt.Errorf("remove old manifest: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
-		return nil, fmt.Errorf("rename manifest: %w", err)
-	}
-	delete(m.entries, id)
-	e = m.refreshLocked(id)
-	return e.info, nil
+	return m.rewriteManifestLocked(id, &mf)
 }
 
 // trashDirName 是回收站目录名（. 前缀，List 与文件服务已按隐藏目录跳过）。
@@ -656,6 +648,11 @@ func (m *Manager) Restore(entry string) (*Info, error) {
 func (m *Manager) SaveIncremental(id string, mf Manifest, upsert []FileInput, delPaths []string) (*Info, error) {
 	if err := ValidateID(id); err != nil {
 		return nil, err
+	}
+	if mf.Connector != nil {
+		if err := ValidateConnector(mf.Connector); err != nil {
+			return nil, err
+		}
 	}
 	if len(upsert) == 0 && len(delPaths) == 0 {
 		return nil, fmt.Errorf("upsert 与 delete 至少一项")

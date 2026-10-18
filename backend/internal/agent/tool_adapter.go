@@ -110,7 +110,9 @@ func NewToolRegistryAdapterForRole(r *tool.Registry, scope string, allowed []str
 }
 
 // Schema 返回当前注册表下所有工具的 JSON Schema 描述。
-// 过滤语义：静态白名单（allowed）∪（插件动态可见集 ∩ 本 Agent 已挂载集）（TODO #52）。
+// 过滤语义：静态白名单（allowed）∪（插件动态可见集 ∩ 本 Agent 已挂载集）（TODO #52）；
+// 锻造工具（forged__ 前缀）按属主 scope 过滤——仅锻造者可见，白名单为空的分支同样生效
+//（白名单空 = 角色见全部内置，但兄弟会话/子 Agent 锻造的工具仍不可见）。
 // 白名单为空且无可见性回调时原样返回全部工具（向后兼容）。
 // 返回值:
 //
@@ -119,7 +121,7 @@ func (a *toolRegistryAdapter) Schema() []tools.Tool {
 	all := a.inner.Schema()
 	// 无过滤配置：原样返回。
 	if len(a.allowed) == 0 && a.pluginVisibility == nil {
-		return all
+		return a.filterForgedByOwner(all)
 	}
 	// 已挂载插件工具集（tool_mount / tools_hint / plugin_install 自动挂载，TODO #52）。
 	mounted := a.inner.MountedTools(a.scope)
@@ -131,6 +133,13 @@ func (a *toolRegistryAdapter) Schema() []tools.Tool {
 	for _, t := range all {
 		if preMounted[t.Name()] {
 			out = append(out, t)
+			continue
+		}
+		// 锻造工具：属主判定优先于白名单——属主不同一律不可见。
+		if owner, forged := a.inner.ForgedScope(t.Name()); forged {
+			if owner == a.scope {
+				out = append(out, t)
+			}
 			continue
 		}
 		owned, visible := false, true
@@ -155,6 +164,32 @@ func (a *toolRegistryAdapter) Schema() []tools.Tool {
 	return out
 }
 
+// filterForgedByOwner 对"无过滤配置"的快路径补锻造属主过滤：
+// 锻造工具仅属主 scope 可见，其余工具原样保留（零行为变化）。
+func (a *toolRegistryAdapter) filterForgedByOwner(all []tools.Tool) []tools.Tool {
+	hasForged := false
+	for _, t := range all {
+		if _, forged := a.inner.ForgedScope(t.Name()); forged {
+			hasForged = true
+			break
+		}
+	}
+	if !hasForged {
+		return all
+	}
+	out := make([]tools.Tool, 0, len(all))
+	for _, t := range all {
+		if owner, forged := a.inner.ForgedScope(t.Name()); forged {
+			if owner == a.scope {
+				out = append(out, t)
+			}
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
 // Dispatch 将 agent 层的 ToolCall 转换为领域层调用格式，再映射返回的 domain Result
 // 为 agent 层可识别的 ToolResult。
 //
@@ -168,6 +203,12 @@ func (a *toolRegistryAdapter) Schema() []tools.Tool {
 //	ToolResult - 封装工具执行结果，包括工具名、是否成功、输出与错误信息。
 //	error      - 当领域层调用失败时返回的 Go 错误。
 func (a *toolRegistryAdapter) Dispatch(ctx context.Context, call ToolCall) (ToolResult, error) {
+	// 锻造（tool_forge）的属主登记以 scope（agentID）为键：ctx 未携带 agentID
+	// （程序化调用路径）时以本 adapter 的 scope 补齐，保证锻造登记与 Schema()
+	// 可见性过滤同口径（agentID 回退 sessionID 的 scopeKey 语义不变）。
+	if a.scope != "" && tool.AgentIDFromContext(ctx) == "" {
+		ctx = tool.WithAgentID(ctx, a.scope)
+	}
 	// 调用领域层注册表的分发能力，将工具名 call.Name 与输入参数 call.Input 透传过去。
 	// res 是领域层返回的结果，err 是执行过程中可能发生的错误。
 	res, err := a.inner.Dispatch(ctx, call.Name, call.Input)

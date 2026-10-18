@@ -85,7 +85,7 @@ metrics、status、metrics/timeline、activity、capabilities、export/memory、
   |---|---|---|
   | 全量快照 | 事件切片被头部裁剪（`lastEventCount > len`） | 完整 Session |
   | 增量事件 | 新事件逐条 | SessionEvent |
-  | `live` | StreamingText/ThinkingText 变化 | `{type:"live", streaming_text, thinking_text}` |
+  | `live` | StreamingText/ThinkingText 变化 | `{type:"live", streaming_text, thinking_text}`（停放落定 pauseSession 与文本清零同窗原子，2026-10-17：停放态不会把上轮旧正文随 live 帧重推——停止后再发送页面不再复活原有文字） |
   | `widget_data` | 会话 widgetData 某 widget_id 的 payload 变化（2026-10-13，见 16） | `{type:"widget_data", widget_id, payload}` |
   | `session_status` | Status 变化一次 | `{type, status}` |
   | `awaiting_clarify` | **status==awaiting_clarify 时每 tick 都推** | `{type,status,question,question_id,multi_select,options?,detail?,artifacts?,questions?}` |

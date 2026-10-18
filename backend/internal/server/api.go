@@ -65,9 +65,15 @@ type APIHandler struct {
 	statsService  *StatsService             // 会话统计聚合服务
 	pluginMgr     *plugins.Manager          // 插件管理器（热插拔插件管理 API）
 	widgetMgr     *widgets.Manager          // 界面部件管理器（widgets/ 目录包管理 API）
+	hookLimiter   *widgets.HookRateLimiter // webhook 回调限流器（单部件 60s/60 次滑窗；懒初始化）
 	learnedSkills *store.LearnedSkillStore  // 自进化技能库存储（2026-09-02 设计 §8）
+	// learnedSkillsDir 经验技能目录（config/skills_learned/）：DELETE 端点删文件前
+	// 做"必须落在该目录内"的安全校验。空=不删文件（仅删 PG 行）。
+	learnedSkillsDir string
 	// skillConsolidation 技能库整理器（C 库存治理）：手动触发一轮合并/归档，返回摘要。
 	skillConsolidation func(ctx context.Context) (string, error)
+	// skillReforge 技能重铸器（薄技能治理）：按当前产出契约重写单个存量技能正文，返回摘要。
+	skillReforge func(ctx context.Context, name string) (string, error)
 	// memoryConsolidation 块记忆库整理器（2026-10-13）：手动触发一轮近重复合并/零访问归档，返回摘要。
 	memoryConsolidation func(ctx context.Context) (string, error)
 	// roleEvolution 角色自进化准则存储（窄接口，*store.RoleEvolutionStore 实现；未注入端点 503）。

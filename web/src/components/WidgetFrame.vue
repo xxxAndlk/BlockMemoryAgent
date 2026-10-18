@@ -12,11 +12,17 @@
 //              {type:'action', action, payload}（部件主动上行动作，宿主调 sendWidgetAction
 //              上报后端：落 System 会话事件 + 运行中会话注入 Agent 邮箱；失败静默）。
 // 热刷新：payload JSON 解析后 __widget_reload__===true（结构化帧）或文本含 "__reload__"（旧协议兜底）→ 重建 iframe。
+//
+// 连接器（2026-10-17 Widget「连接器」）三分支渲染，info 加载后按 connector.type 分流：
+//   url：iframe 直连外部页面（不加 sandbox：外部站点常需 cookie/跳转，跨域天然隔离父页面）；
+//   api/mcp/webhook 且有 entry 文件：现有沙箱 iframe 路径（不变，数据照旧经 widgetBus postMessage）；
+//   api/mcp/webhook 且无 entry（裸接件，info.files 不含 entry 所指文件）：GenericConnectorCard 直显（不走 iframe）。
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { WidgetInfo } from '@/types'
 import { getWidget, reportWidgetError, sendWidgetAction } from '@/api/widgets'
 import { useWidgetData } from '@/utils/widgetBus'
 import { APP_CONFIG } from '@/config/app'
+import GenericConnectorCard from '@/components/GenericConnectorCard.vue'
 
 const props = defineProps<{
   widgetId: string
@@ -41,6 +47,25 @@ const reloadKey = ref(0)
 const iframeEl = ref<HTMLIFrameElement | null>(null)
 
 const displayTitle = computed(() => props.title || info.value?.name || props.widgetId)
+
+/** 连接器配置（清单 connector 段；无连接器部件为 undefined）。 */
+const connector = computed(() => info.value?.connector)
+/** url 连接器：iframe 直连外链（不加 sandbox，外部站点常需 cookie/跳转）。 */
+const isUrlConnector = computed(() => connector.value?.type === 'url')
+/** 裸接件：api/mcp/webhook 且 files 不含 entry 所指文件（entry 缺省 index.html）→ 通用数据卡直显。 */
+const isBareConnector = computed(() => {
+  const c = connector.value
+  if (!c || c.type === 'url') return false
+  const entry = info.value?.entry || 'index.html'
+  return !(info.value?.files ?? []).includes(entry)
+})
+
+/** 新窗口打开的地址：url 连接器开外链，普通部件开本地入口文件，裸接件无文件可开（隐藏该操作）。 */
+const newWindowUrl = computed(() => {
+  if (isUrlConnector.value) return connector.value?.target || ''
+  if (isBareConnector.value) return ''
+  return frameSrc.value
+})
 
 /** 部件文件 URL：/api/widgets/<id>/files/<entry>（逐段编码保留斜杠，与 workspaceUrl 同法）。 */
 const frameSrc = computed(() => {
@@ -141,7 +166,8 @@ function onLoad() {
 }
 
 function openInNewWindow() {
-  if (frameSrc.value) window.open(frameSrc.value, '_blank', 'noopener')
+  const url = newWindowUrl.value
+  if (url) window.open(url, '_blank', 'noopener')
 }
 
 onMounted(async () => {
@@ -172,7 +198,7 @@ onUnmounted(() => {
       <span class="text-ink-3 font-mono truncate shrink-0" :title="widgetId">{{ widgetId }}</span>
       <span class="ml-auto flex items-center gap-2 shrink-0">
         <template v-if="info">
-          <button class="hover:text-primary" title="在新窗口打开" @click="openInNewWindow">新窗口</button>
+          <button v-if="newWindowUrl" class="hover:text-primary" title="在新窗口打开" @click="openInNewWindow">新窗口</button>
           <button class="hover:text-primary" title="重新加载部件" @click="rebuild">刷新</button>
         </template>
       </span>
@@ -195,6 +221,20 @@ onUnmounted(() => {
         部件 <span class="font-mono">{{ widgetId }}</span> 不存在或已被删除。
       </template>
     </div>
+
+    <!-- url 连接器：iframe 直连外部页面（不加 sandbox：外部站点常需 cookie/跳转，跨域天然隔离父页面；
+         保留 no-referrer，头部新窗口/刷新操作照常） -->
+    <div v-else-if="isUrlConnector" class="bg-white">
+      <iframe :key="'ext-' + reloadKey" :src="connector?.target" referrerpolicy="no-referrer"
+              class="w-full border-0 block" :style="{ height: frameHeight + 'px' }"
+              :title="displayTitle"></iframe>
+      <p class="px-3 py-1.5 text-[10px] text-ink-3 border-t border-line">
+        目标站点若禁止 iframe 嵌入（X-Frame-Options）将无法显示。
+      </p>
+    </div>
+
+    <!-- 裸接件（api/mcp/webhook 无 entry 文件）：通用数据卡直显推送数据（零代码，不走 iframe） -->
+    <GenericConnectorCard v-else-if="isBareConnector" :widget-id="widgetId" :connector="connector" />
 
     <!-- 部件本体：沙箱 iframe（脚本可跑、无同源权限），高度默认 420px、支持部件 resize 消息调高 -->
     <div v-else-if="info" class="bg-white">

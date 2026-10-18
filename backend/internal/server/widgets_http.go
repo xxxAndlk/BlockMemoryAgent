@@ -1,24 +1,36 @@
 package server
 
 // widgets_http.go 界面部件（Widget）管理 API（Gin 版）：
-//   - GET  /api/widgets                 — 列表（Info JSON：id/name/version/description/entry/enabled/updated_at/files）
-//   - GET  /api/widgets/{id}           — 单个部件详情
+//   - GET  /api/widgets                 — 列表（Info JSON：id/name/version/description/entry/enabled/updated_at/files[/connector]）
+//   - POST /api/widgets                 — 新建部件（含连接器；webhook 响应带 token 明文 + 顶层 hook_url）
+//   - GET  /api/widgets/{id}           — 单个部件详情（webhook 附顶层 hook_url）
+//   - PUT  /api/widgets/{id}/connector — 更新连接器段（可 regen_token 再生 webhook token）
+//   - POST /api/widgets/{id}/poll      — 连接器立即执行一次（api/mcp），同步返回 {"ok":true,"data":...}
+//   - POST /api/widgets/{id}/hook/{token} — webhook 回调（无会话鉴权；限 256KB + 单部件 60s/60 次限流）
 //   - POST /api/widgets/{id}/enable    — 热启用
 //   - POST /api/widgets/{id}/disable   — 热停用
 //   - POST /api/widgets/reload         — 重扫 widgets/ 目录
-//   - GET  /api/widgets/{id}/files/*   — 部件文件服务（卡片 iframe 的渲染入口与附属资源）
+//   - GET  /api/widgets/{id}/files/*   — 部件文件服务（卡片 iframe 的渲染入口与附属资源；
+//                                         widget.json 清单与点开头文件拒绝服务——token 不能泄露）
 //   - POST /api/widgets/push           — 推送瞬时数据 {session_id, widget_id, payload}
 //   - POST /api/widgets/report         — 部件渲染错误回报 {session_id, widget_id, error}
 //
-// 全部端点经 GinAuthMiddleware 保护（bootstrap/router.go 统一挂组中间件）。
+// 除 hook 外全部端点经 GinAuthMiddleware 保护（bootstrap/router.go 统一挂组中间件）；
+// hook 端点注册在无鉴权组：外部系统凭 id+token 直推（部件 id + token 即凭据）。
 // push/report 面向 bridge 等进程内插件轮询调用：会话不存在一律静默 204，
 // 推送方无需感知会话生命周期，也不会因会话结束而报错刷屏。
 
 import (
+	"context"       // mcp 连接器工具调用的 ctx
+	"crypto/rand"   // 接件缺省 id 随机化
+	"fmt"           // 错误文案
+	"io"            // webhook 请求体限长读取
+	"log"           // webhook 截断日志（APIHandler 无注入 logger，回退标准库）
 	"net/http"      // HTTP 状态码
 	"os"            // 文件 Stat/Open
 	"path/filepath" // 路径清洗与越界校验
 	"strings"       // 路径前缀判定
+	"time"          // 缺省 id 回退时间戳
 
 	"github.com/gin-gonic/gin" // Gin Web 框架
 
@@ -37,6 +49,13 @@ type widgetErrorReporter interface {
 	ReportWidgetError(sessionID, widgetID, errText string)
 }
 
+// widgetBroadcaster 是"部件数据全会话广播"能力的鸭子类型接口：连接器
+// （webhook 回调/调度器/poll）没有单一目标会话，广播保证打开该部件的所有
+// 会话都收到 widget_data 帧。由 *agent.ReactService 实现（BroadcastWidgetData）。
+type widgetBroadcaster interface {
+	BroadcastWidgetData(widgetID, payload string)
+}
+
 // SetWidgetManager 注入部件管理器（bootstrap 装配后调用）。
 func (h *APIHandler) SetWidgetManager(mgr *widgets.Manager) {
 	h.widgetMgr = mgr
@@ -51,7 +70,8 @@ func (h *APIHandler) ListWidgetsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]any{"widgets": h.widgetMgr.List()})
 }
 
-// GetWidgetHandler 处理 GET /api/widgets/{id} — 返回单个部件详情（Info JSON）。
+// GetWidgetHandler 处理 GET /api/widgets/{id} — 返回单个部件详情（Info JSON；
+// webhook 连接器附顶层 hook_url 回调地址，前端拼 origin 展示）。
 func (h *APIHandler) GetWidgetHandler(c *gin.Context) {
 	if h.widgetMgr == nil {
 		c.String(http.StatusServiceUnavailable, "widget manager not initialized")
@@ -62,7 +82,7 @@ func (h *APIHandler) GetWidgetHandler(c *gin.Context) {
 		c.String(http.StatusNotFound, "widget not found")
 		return
 	}
-	c.JSON(http.StatusOK, info)
+	h.respondWidgetInfo(c, info)
 }
 
 // EnableWidgetHandler 处理 POST /api/widgets/{id}/enable — 热启用部件。
@@ -129,6 +149,13 @@ func (h *APIHandler) HandleWidgetFile(c *gin.Context) {
 	}
 	if filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
 		c.String(http.StatusBadRequest, "非法路径")
+		return
+	}
+	// 清单与点开头文件拒绝服务（安全钉死）：widget.json 含 webhook token 等元数据，
+	// 经文件服务泄露 = 任何人可推数据（connector 明文 token 在清单里）；点开头文件
+	// 是原子写残留/手工杂物，无对外服务意义。
+	if rel == widgetManifestFile || hasHiddenPathSegment(rel) {
+		c.String(http.StatusForbidden, "禁止访问清单与隐藏文件")
 		return
 	}
 
@@ -334,4 +361,266 @@ func (h *APIHandler) WidgetActionHandler(c *gin.Context) {
 	}
 	reporter.ReportWidgetAction(req.SessionID, req.WidgetID, req.Action, req.Payload)
 	c.Status(http.StatusNoContent)
+}
+
+// ---- 连接器（2026-10-17 Widget「连接器」：万物皆可外接，见 widgets/connector.go）----
+
+// widgetManifestFile 是部件清单文件名（与 widgets 包 manifestFile 同字面量）：
+// 清单含 webhook token 等元数据，文件服务必须拒发（widgets.Save 也拒绝同名文件写入）。
+const widgetManifestFile = "widget.json"
+
+// hasHiddenPathSegment 判断清洗后的相对路径是否含点开头段（隐藏文件/目录）。
+func hasHiddenPathSegment(rel string) bool {
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if strings.HasPrefix(seg, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// widgetInfoWithHook 是部件响应线型：裸 Info JSON + webhook 的顶层 hook_url
+//（回调相对地址 "/api/widgets/<id>/hook/<token>"，前端拼 origin 展示；与前端
+// WidgetInfo 契约对齐，非 webhook 不输出该字段）。
+type widgetInfoWithHook struct {
+	*widgets.Info
+	HookURL string `json:"hook_url,omitempty"`
+}
+
+// respondWidgetInfo 回部件 Info JSON；webhook 连接器附顶层 hook_url。
+func (h *APIHandler) respondWidgetInfo(c *gin.Context, info *widgets.Info) {
+	if info.Connector != nil && info.Connector.Type == widgets.ConnectorTypeWebhook && info.Connector.Token != "" {
+		c.JSON(http.StatusOK, widgetInfoWithHook{
+			Info:    info,
+			HookURL: "/api/widgets/" + info.ID + "/hook/" + info.Connector.Token,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
+// widgetCreateRequest 是 POST /api/widgets（新建含连接器的部件）的请求体。
+type widgetCreateRequest struct {
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Connector   *widgets.ConnectorSpec `json:"connector"`
+	Files       []widgetFileInput      `json:"files"`
+}
+
+// widgetFileInput 是创建请求体的单个待写文件。
+type widgetFileInput struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// CreateWidgetHandler 处理 POST /api/widgets — 新建含连接器的部件（「接件」）。
+// id 缺省生成 conn-<8位随机小写字母数字>；name 必填；connector 走保存期同款校验
+//（webhook 的 token 服务端生成）；files 非空走 Manager.Save 同款落盘（单部件 32 文件
+///1MB 上限天然继承），files 为空不生成 index.html——裸接件由前端通用数据卡/外链渲染。
+// 响应为裸 Info JSON（webhook 时 connector.token 明文）+ 顶层 hook_url。
+func (h *APIHandler) CreateWidgetHandler(c *gin.Context) {
+	if h.widgetMgr == nil {
+		c.String(http.StatusServiceUnavailable, "widget manager not initialized")
+		return
+	}
+	var req widgetCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.String(http.StatusBadRequest, "请求体非法: %v", err)
+		return
+	}
+	if req.Connector == nil {
+		c.String(http.StatusBadRequest, "connector 必填（url/api/mcp/webhook 四选一）")
+		return
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		id = newConnectorWidgetID()
+	}
+	if err := widgets.ValidateID(id); err != nil {
+		c.String(http.StatusBadRequest, "%v", err)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.String(http.StatusBadRequest, "name 必填")
+		return
+	}
+	files := make([]widgets.FileInput, 0, len(req.Files))
+	for _, f := range req.Files {
+		files = append(files, widgets.FileInput{Path: f.Path, Content: f.Content})
+	}
+	mf := widgets.Manifest{
+		Name:        name,
+		Description: strings.TrimSpace(req.Description),
+		Connector:   req.Connector,
+	}
+	info, err := h.widgetMgr.Save(id, mf, files)
+	if err != nil {
+		c.String(http.StatusBadRequest, "%v", err)
+		return
+	}
+	h.respondWidgetInfo(c, info)
+}
+
+// newConnectorWidgetID 生成 conn-<8位随机小写字母数字> 的接件缺省 id
+//（crypto/rand；不可用时退回时间戳，仍满足 id 形态校验）。
+func newConnectorWidgetID() string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("conn-%08x", time.Now().UnixNano())
+	}
+	for i := range buf {
+		buf[i] = alphabet[int(buf[i])%len(alphabet)]
+	}
+	return "conn-" + string(buf)
+}
+
+// widgetConnectorUpdateRequest 是 PUT /api/widgets/:id/connector 的请求体：
+// connector 各字段 + regen_token（true 且 webhook 时重新生成 token，旧回调地址即刻失效）。
+type widgetConnectorUpdateRequest struct {
+	widgets.ConnectorSpec
+	RegenToken bool `json:"regen_token"`
+}
+
+// UpdateWidgetConnectorHandler 处理 PUT /api/widgets/:id/connector — 更新部件连接器段
+//（Manager.SaveConnector 原子改写清单，热载缓存一致；其余清单字段原样保留）。
+// 响应同 POST /api/widgets（裸 Info JSON；webhook 带 token 明文 + 顶层 hook_url）。
+func (h *APIHandler) UpdateWidgetConnectorHandler(c *gin.Context) {
+	if h.widgetMgr == nil {
+		c.String(http.StatusServiceUnavailable, "widget manager not initialized")
+		return
+	}
+	id := c.Param("id")
+	if _, ok := h.widgetMgr.Get(id); !ok {
+		c.String(http.StatusNotFound, "widget not found")
+		return
+	}
+	var req widgetConnectorUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.String(http.StatusBadRequest, "请求体非法: %v", err)
+		return
+	}
+	info, err := h.widgetMgr.SaveConnector(id, &req.ConnectorSpec, req.RegenToken)
+	if err != nil {
+		c.String(http.StatusBadRequest, "%v", err)
+		return
+	}
+	h.respondWidgetInfo(c, info)
+}
+
+// WidgetHookHandler 处理 POST /api/widgets/:id/hook/:token — webhook 连接器回调
+//（外部系统直推，注册在无鉴权组：部件 id + token 即凭据）。无 connector 或非
+// webhook 类型一律 404；token 不匹配 401（统一文案不区分存在性）；单部件 60s/60 次
+// 限流超限 429。通过则请求体（限 256KB，超出截断记日志）经部件数据总线广播到
+// 打开该部件的所有会话（widget_data 帧，与 POST /widgets/push 同款出口）。
+func (h *APIHandler) WidgetHookHandler(c *gin.Context) {
+	if h.widgetMgr == nil {
+		c.String(http.StatusServiceUnavailable, "widget manager not initialized")
+		return
+	}
+	info, ok := h.widgetMgr.Get(c.Param("id"))
+	if !ok {
+		c.String(http.StatusNotFound, "widget not found")
+		return
+	}
+	conn := info.Connector
+	if conn == nil || conn.Type != widgets.ConnectorTypeWebhook {
+		c.String(http.StatusNotFound, "widget not found") // 统一文案：不对外区分"无连接器"
+		return
+	}
+	if conn.Token == "" || c.Param("token") != conn.Token {
+		c.String(http.StatusUnauthorized, "token 无效")
+		return
+	}
+	if h.hookLimiter == nil {
+		h.hookLimiter = widgets.NewHookRateLimiter()
+	}
+	if !h.hookLimiter.Allow(info.ID) {
+		c.String(http.StatusTooManyRequests, "回调过于频繁（单部件限 60 秒 60 次）")
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(c.Request.Body, widgets.ConnectorPayloadMaxBytes+1))
+	if err != nil {
+		c.String(http.StatusBadRequest, "读取请求体失败: %v", err)
+		return
+	}
+	if len(data) > widgets.ConnectorPayloadMaxBytes {
+		data = data[:widgets.ConnectorPayloadMaxBytes]
+		log.Printf("[widgets] webhook payload 超 %d 字节已截断: widget=%s",
+			widgets.ConnectorPayloadMaxBytes, info.ID)
+	}
+	b, ok := h.widgetBroadcaster()
+	if !ok {
+		c.String(http.StatusNotImplemented, "部件数据通道未接线")
+		return
+	}
+	b.BroadcastWidgetData(info.ID, string(data))
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// PollWidgetHandler 处理 POST /api/widgets/:id/poll — 立即执行一次连接器（api/mcp），
+// 同步返回 {"ok":true,"data":"..."}（data 为最新拉取结果文本）并照常经数据总线分发；
+// webhook/url 类型（或无连接器）→ 400；执行失败 → 500。
+func (h *APIHandler) PollWidgetHandler(c *gin.Context) {
+	if h.widgetMgr == nil {
+		c.String(http.StatusServiceUnavailable, "widget manager not initialized")
+		return
+	}
+	id := c.Param("id")
+	info, ok := h.widgetMgr.Get(id)
+	if !ok {
+		c.String(http.StatusNotFound, "widget not found")
+		return
+	}
+	conn := info.Connector
+	if conn == nil || (conn.Type != widgets.ConnectorTypeAPI && conn.Type != widgets.ConnectorTypeMCP) {
+		c.String(http.StatusBadRequest, "该部件无 api/mcp 连接器，不支持立即执行")
+		return
+	}
+	payload, err := h.widgetMgr.ExecuteConnector(c.Request.Context(), id, h.connectorToolCaller())
+	if err != nil {
+		c.String(http.StatusInternalServerError, "连接器执行失败: %v", err)
+		return
+	}
+	if b, ok := h.widgetBroadcaster(); ok {
+		b.BroadcastWidgetData(id, payload)
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "data": payload})
+}
+
+// widgetBroadcaster 从会话门面取部件数据广播能力（未接线/测试桩缺能力返回 false）。
+func (h *APIHandler) widgetBroadcaster() (widgetBroadcaster, bool) {
+	if h.sessionMgr == nil {
+		return nil, false
+	}
+	b, ok := h.sessionMgr.agent.(widgetBroadcaster)
+	return b, ok
+}
+
+// widgetConnectorToolCaller 是 mcp 连接器工具调用能力的鸭子类型：poll 端点与
+// 调度器执行 mcp 连接器时经它调本进程工具（由 *agent.ReactService 实现，
+// 内部走 tool.Registry.Dispatch 并注入主工作目录）。
+type widgetConnectorToolCaller interface {
+	CallConnectorTool(ctx context.Context, name string, args map[string]any) (string, error)
+}
+
+// connectorToolCaller 从会话门面取 mcp 连接器工具调用能力（未接线返回 nil）。
+func (h *APIHandler) connectorToolCaller() widgets.MCPToolCaller {
+	if h.sessionMgr == nil {
+		return nil
+	}
+	if c, ok := h.sessionMgr.agent.(widgetConnectorToolCaller); ok {
+		return connectorToolCallerFunc(c.CallConnectorTool)
+	}
+	return nil
+}
+
+// connectorToolCallerFunc 把方法签名适配成 widgets.MCPToolCaller 接口。
+type connectorToolCallerFunc func(ctx context.Context, name string, args map[string]any) (string, error)
+
+// CallTool 实现 widgets.MCPToolCaller。
+func (f connectorToolCallerFunc) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
+	return f(ctx, name, args)
 }
