@@ -40,7 +40,7 @@ const displayMessage = computed(() => {
           <el-icon class="text-xs"><UserFilled /></el-icon> 你
         </span>
       </div>
-      <div v-if="displayMessage" class="bg-primary text-white rounded-2xl rounded-tr-md px-4 py-2.5 text-sm leading-relaxed shadow markdown-body" v-html="renderMd(displayMessage)"></div>
+      <div v-if="displayMessage" class="user-bubble rounded-2xl rounded-tr-md px-4 py-2.5 text-sm leading-relaxed shadow markdown-body" v-html="renderMd(displayMessage)"></div>
       <!-- 文件附件卡片（用户粘贴/上传）：预览/下载/在文件夹中显示复用 ArtifactCard -->
       <div v-if="attachments.length" class="w-full flex flex-col gap-1.5">
         <ArtifactCard v-for="(a, i) in attachments" :key="i" :artifact="a" :session-id="sessionId || ''" />
@@ -50,6 +50,12 @@ const displayMessage = computed(() => {
 </template>
 
 <style scoped>
+/* 白底蓝边气泡：蓝色链接在深蓝底上不可见，改为卡片底 + 主题色描边 */
+.user-bubble {
+  background: var(--bma-card);
+  border: 1px solid var(--bma-primary);
+  color: var(--bma-text);
+}
 .markdown-body :deep(p) { margin: 0; }
 .markdown-body :deep(pre) {
   background: var(--bma-page);

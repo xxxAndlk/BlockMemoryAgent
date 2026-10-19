@@ -51,6 +51,16 @@
       "description": "domain 主力（2.5 ，128K）：多轮编码/测试/集成修复，性价比最优"
     },
     {
+      "id": "wb-deepseek-v4.1-flash",
+      "name": "WB DeepSeek V4.1 Flash",
+      "provider": "openai-chat",
+      "model": "workbuddy-ai/deepseek-v4.1-flash",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "base_url": "http://127.0.0.1:3425/v1",
+      "max_output_tokens": 128000,
+      "description": "domain 主力（2.5 ，128K）：多轮编码/测试/集成修复，性价比最优"
+    },
+    {
       "id": "ark-glm-5.3",
       "name": "ARK GLM 5.3",
       "provider": "anthropic",

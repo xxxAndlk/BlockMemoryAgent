@@ -153,6 +153,7 @@ watch(
 )
 
 async function onSessionModelChange(v: string) {
+  if (v === sessionModel.value) return // 一键列表点选已生效项：不重复提交、不弹提示
   sessionModel.value = v
   if (!props.sessionBound || !props.session) {
     localStorage.setItem(MODEL_STORAGE_KEY, v) // 创建选择：下次开新会话默认上次所选
@@ -651,6 +652,24 @@ const switchableModels = computed(() =>
   ),
 )
 
+// ── 本会话模型一键列表（2026-10-19 改版）：点选即切，替代旧"会话模型"下拉 ──
+// 选择随会话各自记忆：已绑定 = 会话快照 session.model（后端持久化，重开会话仍在）；
+// 未绑定 = 创建默认值（localStorage，下次开新会话带上）。
+const modelFilter = ref('')
+const sessionModelCandidates = computed(() => {
+  const kw = modelFilter.value.trim().toLowerCase()
+  const all = catalog.value?.models ?? []
+  if (!kw) return all
+  return all.filter((m) =>
+    `${m.id} ${m.provider} ${m.model} ${m.name ?? ''}`.toLowerCase().includes(kw),
+  )
+})
+// 本会话顶层角色按档位映射（与档位文案一致）：跟随全局时展示该角色的全局绑定模型。
+const TOP_ROLE_BY_GEAR: Record<SessionGear, string> = { fast: 'doc_assistant', daily: 'domain', cluster: 'meta' }
+const sessionTopRole = computed(
+  () => catalog.value?.roles.find((r) => r.role_id === TOP_ROLE_BY_GEAR[gear.value]) ?? null,
+)
+
 watch(modelPopoverVisible, (v) => {
   if (v) ensureLoaded()
 })
@@ -940,51 +959,48 @@ function onKeydown(e: KeyboardEvent) {
               </div>
             </div>
           </el-popover>
-          <!-- 模型与会话设置弹层：角色 → 模型 → 角色思考强度；本会话设置（档位/思考/信任） -->
+          <!-- 模型与会话设置弹层：本会话模型一键点选（各自记住）；本会话设置（档位/思考/信任）；全局角色绑定（收底） -->
           <el-popover v-model:visible="modelPopoverVisible" placement="top-start" :width="380" trigger="click">
           <template #reference>
             <el-button text size="small" class="!text-ink-2 hover:!text-primary max-w-52 !px-2"
-                       title="模型与会话设置（角色 / 模型 / 本会话档位 / 思考强度 / 信任模式）">
+                       :class="sessionModel ? '!text-primary' : ''"
+                       title="模型与会话设置：本会话模型点选即切（仅本会话，各自记住）；档位/思考/信任；全局角色绑定">
               <el-icon><Coin /></el-icon>
-              <span class="ml-1 truncate text-xs">{{ currentRoleStatus?.model || '模型' }}</span>
+              <span class="ml-1 truncate text-xs">{{ sessionModel || sessionTopRole?.model || currentRoleStatus?.model || '模型' }}</span>
             </el-button>
           </template>
           <div class="space-y-2 text-xs">
+            <!-- 本会话模型：点选即切（热生效，下一次 LLM 调用）；每个会话各自记住选择，互不串联 -->
             <div>
-              <div class="mb-1 text-ink-2">角色</div>
-              <el-select v-model="selectedRole" size="small" class="w-full"
-                         placeholder="选择角色" :loading="modelsLoading">
-                <el-option v-for="r in catalog?.roles || []" :key="r.role_id" :value="r.role_id"
-                           :label="`${r.role_id}（${r.provider}/${r.model}）`" />
-              </el-select>
-            </div>
-            <div>
-              <div class="mb-1 text-ink-2">模型</div>
-              <el-select v-model="selectedModelId" size="small" class="w-full" filterable
-                         placeholder="选择模型" :loading="modelsLoading">
-                <el-option v-for="m in switchableModels" :key="m.id" :value="m.id"
-                           :label="`${m.id} · ${m.provider}/${m.model}`" />
-              </el-select>
-            </div>
-            <div>
-              <div class="mb-1 text-ink-2">思考强度（角色绑定）</div>
-              <el-select v-model="selectedThinking" size="small" class="w-full">
-                <el-option value="" label="跟随角色默认" />
-                <el-option v-for="t in ['off', 'low', 'medium', 'high']" :key="t" :value="t" :label="t" />
-              </el-select>
+              <div class="mb-1 flex items-center justify-between text-ink-2">
+                <span title="只影响本会话顶层 Agent；每个会话各自记住自己的选择，切换会话不互相影响">本会话模型（点选即切，仅本会话）</span>
+                <span class="text-[10px] text-ink-3 shrink-0">{{ sessionBound ? '已记住到本会话' : '作为新会话默认' }}</span>
+              </div>
+              <el-input v-model="modelFilter" size="small" clearable placeholder="搜索模型 id / provider / 名称" />
+              <div class="mt-1.5 max-h-56 overflow-y-auto">
+                <div class="model-row" :class="{ active: !sessionModel }" @click="onSessionModelChange('')">
+                  <div class="min-w-0">
+                    <div class="text-ink truncate">跟随全局配置</div>
+                    <div class="text-[10px] text-ink-3 truncate">
+                      {{ sessionTopRole ? `${sessionTopRole.role_id} → ${sessionTopRole.provider}/${sessionTopRole.model}` : '按角色绑定（models.json）' }}
+                    </div>
+                  </div>
+                  <el-icon v-if="!sessionModel" class="shrink-0 text-primary"><Check /></el-icon>
+                </div>
+                <div v-for="m in sessionModelCandidates" :key="m.id"
+                     class="model-row" :class="{ active: sessionModel === m.id }"
+                     @click="onSessionModelChange(m.id)">
+                  <div class="min-w-0">
+                    <div class="text-ink truncate">{{ m.id }}<span v-if="m.name" class="text-ink-3"> · {{ m.name }}</span></div>
+                    <div class="text-[10px] text-ink-3 truncate">{{ m.provider }}/{{ m.model }}</div>
+                  </div>
+                  <el-icon v-if="sessionModel === m.id" class="shrink-0 text-primary"><Check /></el-icon>
+                </div>
+                <div v-if="!sessionModelCandidates.length" class="py-3 text-center text-ink-3">无匹配模型</div>
+              </div>
             </div>
             <!-- 本会话设置（自工具栏收编，输入栏精简）：热生效，切换即 POST 后端 -->
             <div class="border-t border-line pt-2 space-y-2">
-              <div>
-                <div class="mb-1 text-ink-2" title="只影响本会话顶层 Agent；跟随全局=按角色绑定（models.json）；运行中可改，下一次 LLM 调用生效">会话模型（本会话）</div>
-                <el-select :model-value="sessionModel" size="small" class="w-full" filterable
-                           placeholder="跟随全局配置" :loading="modelsLoading"
-                           @update:model-value="onSessionModelChange($event as string)">
-                  <el-option value="" label="跟随全局配置" />
-                  <el-option v-for="m in catalog?.models || []" :key="m.id" :value="m.id"
-                             :label="`${m.id} · ${m.provider}/${m.model}`" />
-                </el-select>
-              </div>
               <div>
                 <div class="mb-1 text-ink-2" title="快速档=文档助手直达，日常档=DomainAgent 直接执行，集群档=Meta 全装编排">执行档位（本会话）</div>
                 <el-select v-model="gear" size="small" class="w-full"
@@ -1015,12 +1031,41 @@ function onKeydown(e: KeyboardEvent) {
                 </el-select>
               </div>
             </div>
-            <div class="flex items-center justify-between pt-1">
-              <el-button link type="primary" size="small" @click="addDialogVisible = true">＋ 新增模型</el-button>
-              <el-button type="primary" size="small" :loading="switching"
-                         :disabled="!selectedModelId" @click="onSwitchModel">
-                切换
-              </el-button>
+            <!-- 全局角色绑定：写入 models.json role_bindings，改变所有「跟随全局配置」会话的默认模型 -->
+            <div class="border-t border-line pt-2">
+              <div class="mb-1 text-[10px] text-ink-3" title="写入 config/models.json role_bindings；只影响选择「跟随全局配置」的会话">全局角色绑定（影响所有会话的默认）</div>
+              <div class="space-y-2">
+                <div>
+                  <div class="mb-1 text-ink-2">角色</div>
+                  <el-select v-model="selectedRole" size="small" class="w-full"
+                             placeholder="选择角色" :loading="modelsLoading">
+                    <el-option v-for="r in catalog?.roles || []" :key="r.role_id" :value="r.role_id"
+                               :label="`${r.role_id}（${r.provider}/${r.model}）`" />
+                  </el-select>
+                </div>
+                <div>
+                  <div class="mb-1 text-ink-2">模型</div>
+                  <el-select v-model="selectedModelId" size="small" class="w-full" filterable
+                             placeholder="选择模型" :loading="modelsLoading">
+                    <el-option v-for="m in switchableModels" :key="m.id" :value="m.id"
+                               :label="`${m.id} · ${m.provider}/${m.model}`" />
+                  </el-select>
+                </div>
+                <div>
+                  <div class="mb-1 text-ink-2">思考强度（角色绑定）</div>
+                  <el-select v-model="selectedThinking" size="small" class="w-full">
+                    <el-option value="" label="跟随角色默认" />
+                    <el-option v-for="t in ['off', 'low', 'medium', 'high']" :key="t" :value="t" :label="t" />
+                  </el-select>
+                </div>
+                <div class="flex items-center justify-between pt-1">
+                  <el-button link type="primary" size="small" @click="addDialogVisible = true">＋ 新增模型</el-button>
+                  <el-button type="primary" size="small" :loading="switching"
+                             :disabled="!selectedModelId" @click="onSwitchModel">
+                    切换
+                  </el-button>
+                </div>
+              </div>
             </div>
           </div>
         </el-popover>
@@ -1151,6 +1196,24 @@ function onKeydown(e: KeyboardEvent) {
 }
 :deep(.composer .el-textarea__inner)::placeholder {
   color: var(--bma-text-3);
+}
+/* 本会话模型一键列表行：整行可点，选中项主色描边高亮 */
+.model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.model-row:hover {
+  background: var(--bma-primary-soft);
+}
+.model-row.active {
+  border-color: var(--bma-primary);
+  background: var(--bma-primary-soft);
 }
 .hidden {
   display: none;
