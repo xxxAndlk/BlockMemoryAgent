@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { Session, SessionEvent, AgentNode, ClarifyPending, WireImage, SessionGear, SessionThinking } from '@/types'
+import type { Session, SessionEvent, AgentNode, ClarifyPending, WireImage, SessionGear, SessionThinking, SessionDirectiveSpec } from '@/types'
 import type { AgentMailItem } from '@/api/session'
 import ChatHeader from './components/ChatHeader.vue'
 import MessageList from './components/MessageList.vue'
@@ -40,7 +40,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  submit: [content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[]]
+  submit: [content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[], directive: SessionDirectiveSpec | null]
   /** 停止（发送区红色按钮；弹窗与接口调用在会话页 index.vue 处理） */
   stop: []
   'new-session': []
@@ -99,7 +99,7 @@ const showStatusLine = computed(() =>
                  :work-dir="workDir || ''"
                  :work-dir-saving="workDirSaving"
                  :known-dirs="knownDirs"
-                 @submit="(c: string, i: WireImage[], f: File[], g: SessionGear, t: SessionThinking, p: string[]) => emit('submit', c, i, f, g, t, p)"
+                 @submit="(c: string, i: WireImage[], f: File[], g: SessionGear, t: SessionThinking, p: string[], d: SessionDirectiveSpec | null) => emit('submit', c, i, f, g, t, p, d)"
                  @new-session="emit('new-session')"
                  @update-workdir="(d: string) => emit('update-workdir', d)"
                  @stop="emit('stop')" />

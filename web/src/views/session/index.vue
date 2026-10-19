@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted, computed, watch, provide, h } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear, SessionThinking } from '@/types'
+import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear, SessionThinking, SessionDirectiveSpec } from '@/types'
 import { isAssistantTextEvent, isToolCallEvent, isUserMessageEvent, clarifyArtifactsFromFrame } from '@/types'
 import {
   createSession,
@@ -475,7 +475,7 @@ function startStream(s: Session) {
   })
 }
 
-async function handleSubmit(content: string, images: WireImage[] = [], files: File[] = [], gear: SessionGear = 'daily', thinking: SessionThinking = '', plugins: string[] = []) {
+async function handleSubmit(content: string, images: WireImage[] = [], files: File[] = [], gear: SessionGear = 'daily', thinking: SessionThinking = '', plugins: string[] = [], directive: SessionDirectiveSpec | null = null) {
   if (!content.trim() && !images.length && !files.length) return
   sending.value = true
   try {
@@ -522,7 +522,7 @@ async function handleSubmit(content: string, images: WireImage[] = [], files: Fi
         sending.value = false
         return
       }
-      await sendMessage(activeSession.value.id, content, images, files)
+      await sendMessage(activeSession.value.id, content, images, files, directive)
       if (!wasRunning) {
         activeSession.value = { ...activeSession.value, status: 'running' as Session['status'] }
         await openSession(activeSession.value.id)
@@ -534,7 +534,7 @@ async function handleSubmit(content: string, images: WireImage[] = [], files: Fi
       return
     }
     // 3) 无选中会话 → 创建新会话（携带创建时选档 + 会话级思考强度 + 指定插件，后端非法值 400）
-    const s = await createSession(content, images, workDir.value || undefined, gear, thinking, plugins, files)
+    const s = await createSession(content, images, workDir.value || undefined, gear, thinking, plugins, files, directive)
     setWorkDir(workDir.value)
     sessions.value.unshift(s)
     router.replace({ path: '/session', query: { id: s.id } })

@@ -58,6 +58,10 @@ type ReactService struct {
 	// best-effort 通知外部渠道。为 nil 时零开销跳过；bootstrap 按 config.notify 构造注入。
 	notifier *Notifier
 
+	// directiveHook 指令模式钩子（goal/loop，2026-10-18）：回合成功结束评估续跑、
+	// 用户停止时同步停用。nil（默认）时 goal/loop 零行为；bootstrap 注入 goal.Manager。
+	directiveHook DirectiveHook
+
 	// pendingChecker 注入到每个 ReActAgent，用于父会话终结保护
 	// （有未决子 Agent 时阻止终结，防止迟到 mailbox 消息丢失）。
 	// 为 nil 时关闭保护；由 bootstrap 注入 subagent.Dispatcher 实现。
@@ -1424,6 +1428,19 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 	// 的 detail_json（前端文件卡片），runSession 一次性消费。
 	sess.firstTurnAttachments = req.Attachments
 	s.maybeWatchWallClock(sess)
+	// 指令模式（goal/loop）：创建即应用（须在 runSession 起跑前落库，否则首轮
+	// 结束的评估钩子读不到指令）。objective 缺省回落为会话目标文本；落库失败
+	// 不阻断建会话——退化为普通模式并记事件。
+	if req.Directive != nil && s.directiveHook != nil {
+		spec := *req.Directive
+		if spec.Mode != "" && spec.Mode != "normal" && spec.Objective == "" {
+			spec.Objective = goal
+		}
+		if err := s.directiveHook.ApplyDirective(ctx, sess.ID, &spec); err != nil {
+			s.store.addEvent(sess, eventkind.System, "System",
+				"指令模式未生效: "+err.Error(), "", "", "", "", "", true)
+		}
+	}
 	// 在独立 goroutine 中运行 ReAct 循环，避免阻塞调用方。
 	go s.runSession(sess)
 	// 返回转换后的公共 Session DTO。
@@ -1828,6 +1845,7 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 	case ControlOpInterrupt:
 		// 中断：提取 content 并触发中断处理。
 		content, _ := cmd.Args["content"].(string)
+		s.stopDirective(sessionID, "用户中断")
 		return s.interrupt(ctx, sessionID, content)
 	case ControlOpEnqueue:
 		// 队列注入：提取 content 并注入会话。
@@ -1835,6 +1853,7 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		return s.enqueue(ctx, sessionID, content)
 	case ControlOpCancel:
 		// 取消会话。
+		s.stopDirective(sessionID, "用户取消")
 		return s.cancel(ctx, sessionID)
 	case ControlOpStop:
 		// 停止会话（TODO #37）：默认全停（软停止语义——兼容旧调用方：TUI 发 `{}`、
@@ -1844,6 +1863,7 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		if v, ok := cmd.Args["stop_children"].(bool); ok {
 			stopChildren = v
 		}
+		s.stopDirective(sessionID, "用户停止")
 		if stopChildren {
 			return s.Stop(ctx, sessionID)
 		}
@@ -3979,6 +3999,9 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 持久化历史与事件到 Postgres。
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
+
+	// 指令模式分流（goal/loop）：completed 回合交给钩子评估（续跑/终局）。
+	s.notifyDirectiveTurnEnd(session.ID, string(session.Status), finalText)
 }
 
 // resumeSession 使用新的用户输入继续会话。
@@ -4194,6 +4217,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 
 	s.store.persistHistory(session)
 	s.store.persistEvents(session)
+
+	// 指令模式分流（同 runSession）：completed 回合交给钩子评估（续跑/终局）。
+	s.notifyDirectiveTurnEnd(session.ID, string(session.Status), finalText)
 }
 
 // finalizeSession 在会话结束时执行清理工作。

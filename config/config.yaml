@@ -221,3 +221,17 @@ workflow:
   default_concurrency: 2    # 件间并发默认（配方 params.concurrency 与 workflow_run 参数优先）
   budget_cap_default: 500   # 轻量调用次数默认上限（超限自动暂停，可在运行页提额续跑）
   judge_timeout_ms: 30000   # 单次模型评委超时（毫秒）
+
+# 可视化编排（2026-10-18）：扣子/Dify 式节点图（start/llm/tool/branch/approval/answer）。
+# 定义真相源 = 工作区 .bma/flows/*.json（git 可版本化）；run/node_run 权威在表（重启续跑）。
+flow:
+  max_active_runs: 8        # 全局活跃 run 闸（flow 节点轻量，闸比 workflow 宽）
+  node_timeout_ms: 120000   # 单节点执行超时（llm/tool 调用，毫秒）
+
+# 会话指令模式（2026-10-18）：goal 目标模式（自主多轮推进 + 评估器判达成，跨天任务由
+# Agent 用 schedule_followup 自排回查）与 loop 循环模式（固定间隔重复执行）。
+# 权威全在表（session_directive / goal_reminders），重启续跑 = 扫表。
+goal:
+  poll_interval_sec: 15     # 到期提醒扫描间隔（秒）
+  min_loop_interval_sec: 60 # loop 最小间隔（秒），防误配短间隔空转烧 token
+  judge_timeout_sec: 60     # 单次完成度评估（轻量模型）超时（秒）

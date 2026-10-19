@@ -96,6 +96,64 @@ export interface Session extends SessionSummary {
   messages: ChatMessage[]
 }
 
+// ---- 会话指令模式（goal/loop，2026-10-18）：指令经独立端点查询，不走会话快照 ----
+
+/** 会话运行模式：normal=普通单轮对话 / goal=多轮自主推进直到完成 / loop=按间隔重复执行。 */
+export type SessionRunMode = 'normal' | 'goal' | 'loop'
+
+/** 指令下发载荷（PUT /sessions/:id/directive 的 body；也是创建会话/发消息的可选 directive 字段）。 */
+export interface SessionDirectiveSpec {
+  mode: SessionRunMode
+  objective?: string
+  /** 完成条件（goal；可空，按目标语义判定） */
+  completion_criterion?: string
+  /** 最大轮数（goal；0/缺省 = 不限） */
+  max_turns?: number
+  /** 截止时间（goal；RFC3339，toISOString() 产物；可空） */
+  deadline?: string
+  /** 循环间隔秒（loop） */
+  loop_interval_sec?: number
+  /** 停止条件（loop；空 = 手动停） */
+  loop_until?: string
+}
+
+/** 会话指令（服务端行；status=active/complete/failed/stopped）。 */
+export interface SessionDirective {
+  id: string
+  session_id: string
+  mode: SessionRunMode
+  objective: string
+  completion_criterion: string
+  max_turns: number
+  deadline: string | null
+  loop_interval_sec: number
+  loop_until: string
+  status: 'active' | 'complete' | 'failed' | 'stopped'
+  turn_count: number
+  last_eval: string
+  created_at: string
+  updated_at: string
+}
+
+/** 指令回查提醒（遇审核等待自动安排的 once/interval 提醒）。 */
+export interface SessionReminder {
+  id: string
+  session_id: string
+  directive_id: string
+  kind: 'once' | 'interval'
+  text: string
+  run_at: string
+  status: string
+  created_by: string
+  created_at: string
+}
+
+/** GET/PUT /sessions/:id/directive 响应信封。 */
+export interface SessionDirectiveView {
+  directive: SessionDirective | null
+  pending_reminders: SessionReminder[]
+}
+
 export interface BaseSessionEvent {
   type: string
   agent: string

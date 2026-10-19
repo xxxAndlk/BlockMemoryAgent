@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, reactive, watch, nextTick, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import type { WireImage, SessionGear, SessionThinking, TrustMode, Session } from '@/types'
-import { setTrustMode, setSessionGear, setSessionThinking, setSessionPlugins } from '@/api/session'
+import type { WireImage, SessionGear, SessionThinking, TrustMode, Session, SessionRunMode, SessionDirectiveSpec, SessionDirective } from '@/types'
+import { setTrustMode, setSessionGear, setSessionThinking, setSessionPlugins, getSessionDirective, setSessionDirective } from '@/api/session'
 import { useModelSelection } from '@/composables/useModelSelection'
 import { usePluginSelection } from '@/composables/usePluginSelection'
 import { useRouter } from 'vue-router'
@@ -37,7 +37,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'submit', content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[]): void
+  (e: 'submit', content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[], directive: SessionDirectiveSpec | null): void
   (e: 'new-session'): void
   (e: 'update-workdir', dir: string): void
   (e: 'stop'): void
@@ -200,6 +200,163 @@ function goPluginsPage() {
   pluginPopoverVisible.value = false
   router.push('/plugins')
 }
+
+// ── 会话指令模式（goal/loop，2026-10-18）：normal=普通单轮；goal=多轮自主推进直到完成
+//（遇审核等待自动安排回查）；loop=按间隔重复执行本条指令，切回普通即停止。
+// 未激活（新会话/停放态）：选择随创建/发送请求携带，localStorage 记忆；
+// 会话激活：切换/改参防抖 300ms PUT 后端即时生效，失败提示并回滚到服务端当前状态。
+// 绑定会话后以 GET /sessions/:id/directive 回填（不走会话快照；已结束的指令不回填）。
+const RUN_MODE_STORAGE_KEY = 'bma.chat.runmode'
+const RUN_MODE_PARAMS_STORAGE_KEY = 'bma.chat.runmode.params'
+const ENDED_DIRECTIVE_STATUSES = new Set(['complete', 'failed', 'stopped'])
+
+const directivePopoverVisible = ref(false)
+const runMode = ref<SessionRunMode>(normalizeRunMode(localStorage.getItem(RUN_MODE_STORAGE_KEY)))
+const completionCriterion = ref('')
+const maxTurns = ref(0)
+// 截止时间存 Date|null（el-date-picker datetime 无 value-format 时即 Date），提交时转 ISO。
+const deadline = ref<Date | null>(null)
+const loopIntervalMin = ref(10)
+const loopUntil = ref('')
+
+function normalizeRunMode(m: string | null | undefined): SessionRunMode {
+  return m === 'goal' || m === 'loop' ? m : 'normal'
+}
+
+/** localStorage 记忆（照 GEAR_STORAGE_KEY 模式，模式存裸值、参数单独 try/catch JSON 序列化）。 */
+function persistRunModeLocal() {
+  try {
+    localStorage.setItem(RUN_MODE_STORAGE_KEY, runMode.value)
+    localStorage.setItem(RUN_MODE_PARAMS_STORAGE_KEY, JSON.stringify({
+      completionCriterion: completionCriterion.value,
+      maxTurns: maxTurns.value,
+      deadline: deadline.value ? deadline.value.toISOString() : null,
+      loopIntervalMin: loopIntervalMin.value,
+      loopUntil: loopUntil.value,
+    }))
+  } catch { /* localStorage 不可用（隐私模式等）：静默回落内存态 */ }
+}
+
+function loadRunModeParams() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(RUN_MODE_PARAMS_STORAGE_KEY) || 'null')
+    if (!raw || typeof raw !== 'object') return
+    if (typeof raw.completionCriterion === 'string') completionCriterion.value = raw.completionCriterion
+    if (typeof raw.maxTurns === 'number') maxTurns.value = raw.maxTurns
+    deadline.value = typeof raw.deadline === 'string' && raw.deadline ? new Date(raw.deadline) : null
+    if (typeof raw.loopIntervalMin === 'number') loopIntervalMin.value = raw.loopIntervalMin
+    if (typeof raw.loopUntil === 'string') loopUntil.value = raw.loopUntil
+  } catch { /* 脏数据回落默认值 */ }
+}
+loadRunModeParams()
+
+/** 组装指令载荷（normal 时调用方传 null，不进这里）；空串/0/null 字段省略，objective 不传（后端回落为消息内容）。 */
+function buildDirectiveSpec(): SessionDirectiveSpec {
+  const spec: SessionDirectiveSpec = { mode: runMode.value }
+  if (runMode.value === 'goal') {
+    if (completionCriterion.value.trim()) spec.completion_criterion = completionCriterion.value.trim()
+    if (maxTurns.value > 0) spec.max_turns = maxTurns.value
+    if (deadline.value) spec.deadline = deadline.value.toISOString()
+  } else if (runMode.value === 'loop') {
+    spec.loop_interval_sec = loopIntervalMin.value * 60
+    if (loopUntil.value.trim()) spec.loop_until = loopUntil.value.trim()
+  }
+  return spec
+}
+
+/** 把服务端指令应用到表单（回填/失败回滚共用）；已结束的指令不回填（保持 normal，避免重新激活）。 */
+function applyDirectiveView(d: SessionDirective | null, notifyEnded: boolean) {
+  if (!d || d.mode === 'normal') {
+    runMode.value = 'normal'
+    return
+  }
+  if (ENDED_DIRECTIVE_STATUSES.has(d.status)) {
+    if (notifyEnded && d.last_eval && endedNotifiedId !== d.id) {
+      endedNotifiedId = d.id // 同一指令只提示一次
+      ElMessage.info(`指令已结束：${d.last_eval}`)
+    }
+    return
+  }
+  runMode.value = d.mode
+  completionCriterion.value = d.completion_criterion || ''
+  maxTurns.value = d.max_turns || 0
+  deadline.value = d.deadline ? new Date(d.deadline) : null
+  loopIntervalMin.value = d.loop_interval_sec ? d.loop_interval_sec / 60 : 10
+  loopUntil.value = d.loop_until || ''
+}
+
+/** 拉取服务端指令并应用；返回期间会话已切走则丢弃。 */
+async function backfillDirective(id: string, notifyEnded: boolean) {
+  try {
+    const view = await getSessionDirective(id)
+    if (props.session?.id !== id) return
+    backfilling = true
+    try {
+      applyDirectiveView(view.directive, notifyEnded)
+    } finally {
+      backfilling = false
+    }
+  } catch { /* 静默：指令徽标侧独立轮询，这里失败不影响输入 */ }
+}
+
+// 回填/回滚守卫：期间对 runMode/参数的写入不再触发 PUT 或 localStorage 持久化。
+let backfilling = false
+// 已结束指令提示去重（按指令 id）。
+let endedNotifiedId = ''
+let directiveDebounceTimer: number | undefined
+
+function scheduleDirectivePush() {
+  if (!props.sessionActive || !props.session) return
+  window.clearTimeout(directiveDebounceTimer)
+  directiveDebounceTimer = window.setTimeout(() => {
+    const sess = props.session
+    if (!sess) return
+    setSessionDirective(sess.id, buildDirectiveSpec()).catch((e) => {
+      ElMessage.error('切换会话指令失败：' + (e instanceof Error ? e.message : String(e)))
+      void backfillDirective(sess.id, false) // 回滚选择：恢复到服务端当前指令状态
+    })
+  }, 300)
+}
+
+watch(runMode, () => {
+  if (backfilling) return
+  if (props.sessionActive && props.session) scheduleDirectivePush()
+  else persistRunModeLocal()
+})
+watch([completionCriterion, maxTurns, deadline, loopIntervalMin, loopUntil], () => {
+  if (backfilling) return
+  if (props.sessionActive && props.session) scheduleDirectivePush()
+  else persistRunModeLocal()
+})
+
+// 绑定会话 → GET 指令回填；切回新会话 → 恢复 localStorage 记忆（清掉上一个会话的状态）。
+// immediate：ChatView 视图切换会重挂本组件，挂载时若已绑定会话须立即回填。
+watch(
+  () => props.session?.id,
+  (id, prev) => {
+    if (id === prev) return
+    window.clearTimeout(directiveDebounceTimer)
+    backfilling = true
+    try {
+      runMode.value = 'normal'
+      completionCriterion.value = ''
+      maxTurns.value = 0
+      deadline.value = null
+      loopIntervalMin.value = 10
+      loopUntil.value = ''
+      if (!id) {
+        // 新会话态：恢复 localStorage 记忆的指令选择
+        runMode.value = normalizeRunMode(localStorage.getItem(RUN_MODE_STORAGE_KEY))
+        loadRunModeParams()
+      }
+    } finally {
+      backfilling = false
+    }
+    if (id) void backfillDirective(id, true)
+  },
+  { immediate: true },
+)
+onUnmounted(() => window.clearTimeout(directiveDebounceTimer))
 
 // 待发送图片（任务 111 Web 侧同步）：顺序与 [image:N] 占位符编号升序对齐
 // （顺序对齐非解析对齐，与 TUI 同策略）。base64 不带 data: 前缀。
@@ -526,7 +683,9 @@ async function onAddModel() {
 function handleSubmit() {
   if (!canSend.value) return
   const files = readyFiles.value.map((f) => f.file)
-  emit('submit', content.value.trim(), pendingImages.value.slice(), files, gear.value, thinking.value, pinnedPlugins.value.slice())
+  // 会话指令（goal/loop）随创建/发送请求携带；normal 传 null（objective 由后端回落为消息内容）。
+  const directive = runMode.value === 'normal' ? null : buildDirectiveSpec()
+  emit('submit', content.value.trim(), pendingImages.value.slice(), files, gear.value, thinking.value, pinnedPlugins.value.slice(), directive)
   content.value = ''
   pendingImages.value = []
   pendingFiles.value = []
@@ -697,6 +856,63 @@ function onKeydown(e: KeyboardEvent) {
            右侧 token 计数 + 发送按钮；过窄时自动折行 -->
       <div class="flex items-center justify-between gap-2">
         <div class="flex items-center gap-1.5 min-w-0 flex-wrap">
+          <!-- 会话指令模式弹层：normal=普通对话 / goal=目标模式（多轮自主推进直到完成）/
+               loop=循环模式（按间隔重复执行本条指令）；激活会话改动即时 PUT 后端 -->
+          <el-popover v-model:visible="directivePopoverVisible" placement="top-start" :width="280" trigger="click">
+            <template #reference>
+              <el-button text size="small" class="!text-ink-2 hover:!text-primary !px-2"
+                         :class="runMode !== 'normal' ? '!text-primary' : ''"
+                         title="会话指令模式：目标 / 循环 / 普通">
+                <el-icon><Aim /></el-icon>
+                <span class="ml-1 text-xs">指令{{ runMode === 'goal' ? '·目标' : runMode === 'loop' ? '·循环' : '' }}</span>
+              </el-button>
+            </template>
+            <div class="space-y-2 text-xs">
+              <div>
+                <div class="mb-1 text-ink-2">运行模式</div>
+                <el-select v-model="runMode" size="small" class="w-full">
+                  <el-option value="normal" label="普通对话" />
+                  <el-option value="goal" label="目标模式" />
+                  <el-option value="loop" label="循环模式" />
+                </el-select>
+              </div>
+              <template v-if="runMode === 'goal'">
+                <div>
+                  <div class="mb-1 text-ink-2">完成条件</div>
+                  <el-input v-model="completionCriterion" size="small" clearable
+                            placeholder="完成条件（可空，按目标语义判定）" />
+                </div>
+                <div>
+                  <div class="mb-1 text-ink-2">最大轮数（0 = 不限）</div>
+                  <el-input-number v-model="maxTurns" size="small" :min="0" :max="999" style="width: 120px" />
+                </div>
+                <div>
+                  <div class="mb-1 text-ink-2">截止时间</div>
+                  <el-date-picker v-model="deadline" size="small" type="datetime" clearable
+                                  placeholder="截止时间（可空）" style="width: 100%" />
+                </div>
+              </template>
+              <template v-else-if="runMode === 'loop'">
+                <div>
+                  <div class="mb-1 text-ink-2">重复间隔</div>
+                  <div class="flex items-center gap-2">
+                    <el-input-number v-model="loopIntervalMin" size="small" :min="1" :max="10080" style="width: 140px" />
+                    <span class="text-ink-3 shrink-0">分钟</span>
+                  </div>
+                </div>
+                <div>
+                  <div class="mb-1 text-ink-2">停止条件</div>
+                  <el-input v-model="loopUntil" size="small" clearable placeholder="停止条件（可空 = 手动停）" />
+                </div>
+              </template>
+              <div v-if="runMode === 'goal'" class="text-[10px] text-ink-3 leading-relaxed border-t border-line pt-2">
+                目标模式：多轮自主推进直到完成；遇审核等待会自动安排回查
+              </div>
+              <div v-else-if="runMode === 'loop'" class="text-[10px] text-ink-3 leading-relaxed border-t border-line pt-2">
+                循环模式：按间隔重复执行本条指令，切换回普通即停止
+              </div>
+            </div>
+          </el-popover>
           <!-- 模型与会话设置弹层：角色 → 模型 → 角色思考强度；本会话设置（档位/思考/信任） -->
           <el-popover v-model:visible="modelPopoverVisible" placement="top-start" :width="380" trigger="click">
           <template #reference>

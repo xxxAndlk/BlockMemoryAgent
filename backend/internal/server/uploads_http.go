@@ -108,6 +108,19 @@ func parseMultipartStrings(raw string) ([]string, error) {
 	return out, nil
 }
 
+// parseMultipartDirective 解析 multipart 表单里的 directive 字段（agent.DirectiveSpec
+// 的 JSON 序列化文本；空 = 不传）。指令模式（goal/loop）在带文件附件时同样可用。
+func parseMultipartDirective(raw string) (*agent.DirectiveSpec, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var spec agent.DirectiveSpec
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		return nil, fmt.Errorf("directive 字段不是合法 JSON 对象")
+	}
+	return &spec, nil
+}
+
 // sanitizeUploadName 把浏览器提交的文件名消毒为可安全落盘的名字：
 // 取 basename（剥任何目录成分，防路径穿越）；剔除控制字符与 Windows 非法字符
 // \/:*?"<>|（保留中文等 Unicode）；去首尾空白与点；非 UTF-8 或空名回落 "file"；

@@ -73,6 +73,16 @@ func NewDefaultRouter(app *App) *gin.Engine {
 		app.WorkflowHandler.RegisterRoutes(api)
 	}
 
+	// 可视化编排端点（2026-10-18）：引擎未接线时各 handler 自行返回 503。
+	if app.FlowHandler != nil {
+		app.FlowHandler.RegisterRoutes(api)
+	}
+
+	// 会话指令模式端点（2026-10-18）：GET/PUT /sessions/:id/directive（goal/loop）。
+	if app.DirectiveHandler != nil {
+		app.DirectiveHandler.RegisterRoutes(api)
+	}
+
 	// 其他业务端点。
 	api.POST("/snapshot", apiHandler.SnapshotHandler)                         // 快照管理
 	api.POST("/memory/search", apiHandler.MemorySearchHandler)                // 记忆检索

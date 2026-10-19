@@ -151,6 +151,9 @@ type CreateRequest struct {
 	// NonInteractive 无人值守会话（DAG 定时派发等）：ask_user 不挂起等用户，
 	// 直接返回"自行决策"答复让 Agent 继续跑。
 	NonInteractive bool
+	// Directive 指令模式（goal 目标 / loop 循环，2026-10-18）：非 nil 时创建即生效。
+	// objective 为空由 CreateSession 回落为 Goal 文本。
+	Directive *DirectiveSpec
 }
 
 // ResumeRequest 表示恢复一个此前暂停或已结束的会话。

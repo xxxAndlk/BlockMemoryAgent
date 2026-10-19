@@ -47,14 +47,15 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	// images/plugins 为 JSON 字符串字段、files 为文件 part），文件落盘到目标工作目录的
 	// .bma/uploads/ 并把引用文本拼进 goal；不带文件保持 JSON 请求体原样。
 	var (
-		goal     string
-		wireImgs []agent.WireImage
-		wireVids []agent.WireVideo
-		workDir  string
-		gear     string
-		thinking string
-		plugins  []string
-		files    []*multipart.FileHeader
+		goal      string
+		wireImgs  []agent.WireImage
+		wireVids  []agent.WireVideo
+		workDir   string
+		gear      string
+		thinking  string
+		plugins   []string
+		directive *agent.DirectiveSpec
+		files     []*multipart.FileHeader
 	)
 	if isMultipartRequest(c) {
 		form, ok := parseMultipartForm(c)
@@ -75,6 +76,10 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 			c.String(http.StatusBadRequest, "%s", err.Error())
 			return
 		}
+		if directive, err = parseMultipartDirective(formValue(form, "directive")); err != nil {
+			c.String(http.StatusBadRequest, "%s", err.Error())
+			return
+		}
 		files = form.File["files"]
 	} else {
 		req, err := DecodeBody[struct {
@@ -87,6 +92,9 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 			// Plugins 会话级指定插件（KIMI 式插件选择）：创建时勾选，无效 ID 由 agent 层
 			// 丢弃并记事件（创建路径从宽，不阻断建会话）。
 			Plugins []string `json:"plugins,omitempty"`
+			// Directive 指令模式（goal 目标 / loop 循环，2026-10-18）：非 nil 创建即生效，
+			// objective 缺省回落为 goal 文本（agent 层处理）。
+			Directive *agent.DirectiveSpec `json:"directive,omitempty"`
 		}](c.Request)
 		if err != nil {
 			c.String(http.StatusBadRequest, "请求体无效")
@@ -94,6 +102,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		}
 		goal, wireImgs, wireVids = req.Goal, req.Images, req.Videos
 		workDir, gear, thinking, plugins = req.WorkDir, req.Gear, req.Thinking, req.Plugins
+		directive = req.Directive
 	}
 	// 目标必填：纯文字创建必须带 goal；只带文件附件时 goal 可空（引用行拼入后即非空）。
 	if goal == "" && len(files) == 0 {
@@ -151,8 +160,9 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	}
 
 	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费；
-	// Attachments 仅透传首条 user_message 事件的 detail_json，引用文本已在 goal 里）。
-	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: goal, Images: images, Videos: videos, Attachments: atts, WorkDir: abs, Gear: gear, Thinking: thinking, PinnedPlugins: plugins})
+	// Attachments 仅透传首条 user_message 事件的 detail_json，引用文本已在 goal 里；
+	// Directive 指令模式创建即生效，落库失败退化为普通模式并记事件——不阻断建会话）。
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: goal, Images: images, Videos: videos, Attachments: atts, WorkDir: abs, Gear: gear, Thinking: thinking, PinnedPlugins: plugins, Directive: directive})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
@@ -456,10 +466,11 @@ func (m *SessionManager) HandleSessionMessage(c *gin.Context) {
 	id := c.Param("id")
 
 	var (
-		content  string
-		wireImgs []agent.WireImage
-		wireVids []agent.WireVideo
-		files    []*multipart.FileHeader
+		content   string
+		wireImgs  []agent.WireImage
+		wireVids  []agent.WireVideo
+		directive *agent.DirectiveSpec
+		files     []*multipart.FileHeader
 	)
 	if isMultipartRequest(c) {
 		form, ok := parseMultipartForm(c)
@@ -473,18 +484,26 @@ func (m *SessionManager) HandleSessionMessage(c *gin.Context) {
 			c.String(http.StatusBadRequest, "%s", err.Error())
 			return
 		}
+		if directive, err = parseMultipartDirective(formValue(form, "directive")); err != nil {
+			c.String(http.StatusBadRequest, "%s", err.Error())
+			return
+		}
 		files = form.File["files"]
 	} else {
 		req, err := DecodeBody[struct {
 			Content string            `json:"content"`
 			Images  []agent.WireImage `json:"images,omitempty"`
 			Videos  []agent.WireVideo `json:"videos,omitempty"`
+			// Directive 指令模式（goal/loop）：与消息同发时先落库指令再投消息，
+			// 保证本轮结束即进入评估闭环。
+			Directive *agent.DirectiveSpec `json:"directive,omitempty"`
 		}](c.Request)
 		if err != nil {
 			c.String(http.StatusBadRequest, "请求体无效")
 			return
 		}
 		content, wireImgs, wireVids = req.Content, req.Images, req.Videos
+		directive = req.Directive
 	}
 	// 内容判空：纯文字消息必须非空；只带文件附件时可为空（引用行拼入后即非空）。
 	if content == "" && len(files) == 0 {
@@ -524,6 +543,23 @@ func (m *SessionManager) HandleSessionMessage(c *gin.Context) {
 			return
 		}
 		content = agent.AppendAttachmentRefs(content, atts)
+	}
+
+	// 指令模式随消息同发：先落库指令再投消息（本轮结束即进入评估闭环）。
+	// objective 缺省回落为消息内容；校验失败 400（不投半吊子消息）。
+	if directive != nil && directive.Mode != "" && directive.Mode != "normal" {
+		if directive.Objective == "" {
+			directive.Objective = content
+		}
+		applier, ok := m.agent.(sessionDirectiveApplier)
+		if !ok {
+			c.String(http.StatusServiceUnavailable, "指令模式未接线")
+			return
+		}
+		if err := applier.ApplyDirective(c.Request.Context(), id, directive); err != nil {
+			c.String(http.StatusBadRequest, "%s", err.Error())
+			return
+		}
 	}
 
 	if err := m.agent.Send(c.Request.Context(), id, agent.Message{Content: content, Images: images, Videos: videos, Attachments: atts, Timestamp: time.Now()}); err != nil {

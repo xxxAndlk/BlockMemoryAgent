@@ -9,6 +9,7 @@ package server
 // 解析，天然可用；用查询参数则相对路径全部 404。
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +17,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/blockmemory/agent/backend/internal/agent"
 )
 
 // sessionWorkDirProvider 是"按会话解析有效工作目录"能力的鸭子类型接口
@@ -23,6 +26,13 @@ import (
 // 与各处测试 mock）。由 *agent.ReactService 实现。
 type sessionWorkDirProvider interface {
 	SessionWorkDir(sessionID string) string
+}
+
+// sessionDirectiveApplier 是"应用/切换会话指令模式"（goal/loop）能力的鸭子类型接口
+//（同 sessionWorkDirProvider 模式：只依赖一个方法，不动 agent.Agent 门面）。由
+// *agent.ReactService 实现（转发给注入的 DirectiveHook，即 goal.Manager）。
+type sessionDirectiveApplier interface {
+	ApplyDirective(ctx context.Context, sessionID string, spec *agent.DirectiveSpec) error
 }
 
 // HandleSessionWorkspace 处理 GET /api/sessions/{id}/workspace/*path。

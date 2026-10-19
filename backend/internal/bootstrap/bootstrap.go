@@ -23,6 +23,8 @@ import (
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
+	"github.com/blockmemory/agent/backend/internal/flow"
+	"github.com/blockmemory/agent/backend/internal/goal"
 	"github.com/blockmemory/agent/backend/internal/domain/memory"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/subagent"
@@ -77,6 +79,10 @@ type App struct {
 	DAGHandler      *server.DAGHandler     // DAG HTTP 处理器
 	WorkflowEngine  *workflow.Engine       // 工作流量产引擎（2026-10-16）
 	WorkflowHandler *server.WorkflowHandler // 工作流 HTTP 处理器（/api/workflow/*）
+	FlowEngine      *flow.Engine           // 可视化编排引擎（2026-10-18）
+	FlowHandler     *server.FlowHandler    // 可视化编排 HTTP 处理器（/api/flow/*）
+	GoalManager     *goal.Manager          // 指令模式管理器（goal 目标 / loop 循环，2026-10-18）
+	DirectiveHandler *server.DirectiveHandler // 指令模式 HTTP 处理器（/api/sessions/:id/directive）
 	Runtime         *runtime.Runtime       // 运行时聚合器（人格、skill、watchdog 等）
 	Postgres     *store.PostgresStore      // PostgreSQL 持久化存储
 	Redis        *store.RedisStore         // Redis 缓存/消息存储
@@ -1306,6 +1312,25 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	workflowHandler := server.NewWorkflowHandler(workflowEngine)
 	workflowHandler.SetSessionWorkDirProvider(agentSvc)
 
+	// 第十九步附二：可视化编排引擎（2026-10-18，扣子/Dify 式节点图）+ HTTP 处理器。
+	var flowEngine *flow.Engine
+	var flowHandler *server.FlowHandler
+	if fe := buildFlowEngine(cfg, pgStore, toolRegistry, modelFactory, sessionLogger); fe != nil {
+		flowEngine = fe
+		flowEngine.Start(ctx)
+		flowHandler = server.NewFlowHandler(flowEngine)
+		flowHandler.SetSessionWorkDirProvider(agentSvc)
+	}
+
+	// 第十九步附三：会话指令模式（goal 目标 / loop 循环，2026-10-18）管理器 + HTTP 处理器。
+	// 存储不可用时 goalManager=nil：端点 503、schedule_followup 未接线、会话行为不变。
+	goalManager := buildGoalManager(cfg, pgStore, modelFactory, toolRegistry, agentSvc, sessionLogger)
+	var directiveHandler *server.DirectiveHandler
+	if goalManager != nil {
+		goalManager.Start(ctx)
+		directiveHandler = server.NewDirectiveHandler(goalManager)
+	}
+
 	// schedule_task 工具接线（2026-09-27）：MetaAgent 创建/更新定时任务的入口。
 	// cron 合法性在此校验（标准 5 段或 Ns/Nm/Nh 相对间隔），upsert 走 dag.Store；
 	// 调度器未启用（dag_enabled=false）时返回明确错误。
@@ -1377,6 +1402,10 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		DAGHandler:      dagHandler,
 		WorkflowEngine:  workflowEngine,
 		WorkflowHandler: workflowHandler,
+		FlowEngine:      flowEngine,
+		FlowHandler:     flowHandler,
+		GoalManager:     goalManager,
+		DirectiveHandler: directiveHandler,
 		Runtime:         rt,
 		Postgres:     pgStore,
 		Redis:        redisStore,
@@ -1446,6 +1475,20 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			// 先于存储关闭；running 的 run/unit 留在表里，下次启动恢复续跑。
 			if workflowEngine != nil {
 				workflowEngine.Stop()
+			}
+			return nil
+		},
+		func() error {
+			// 停止可视化编排引擎（同纪律：running 的 run/node_run 留在表里下次恢复）。
+			if flowEngine != nil {
+				flowEngine.Stop()
+			}
+			return nil
+		},
+		func() error {
+			// 停止指令模式调度循环（到期提醒不再扫描；未触发提醒留在表里，重启续跑）。
+			if goalManager != nil {
+				goalManager.Stop()
 			}
 			return nil
 		},

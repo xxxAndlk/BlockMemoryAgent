@@ -98,6 +98,19 @@ const routes: Array<RouteRecordRaw> = [
         name: 'WorkflowRun',
         component: () => import('@/views/workflow/RunDetail.vue'),
         meta: { title: '工作流运行', icon: 'SetUp' }
+      },
+      {
+        path: 'flow',
+        name: 'Flow',
+        component: () => import('@/views/flow/index.vue'),
+        meta: { title: '流程编排', icon: 'Operation' }
+      },
+      {
+        // 流程可视化编辑器；?workdir=&id=|new=1 进入，不进侧栏菜单（经 activePath 前缀匹配保持 /flow 高亮）。
+        path: 'flow/edit',
+        name: 'FlowEditor',
+        component: () => import('@/views/flow/FlowEditor.vue'),
+        meta: { title: '流程编辑', icon: 'Operation' }
       }
     ]
   },

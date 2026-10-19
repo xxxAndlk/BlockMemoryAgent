@@ -1,4 +1,4 @@
-import type { Session, SessionEvent, SessionSummary, AgentNode, TaskBoardData, WireImage, TrustMode, SessionGear, SessionThinking } from '@/types'
+import type { Session, SessionEvent, SessionSummary, AgentNode, TaskBoardData, WireImage, TrustMode, SessionGear, SessionThinking, SessionDirectiveSpec, SessionDirectiveView } from '@/types'
 import { fetchForm, fetchJson } from './client'
 import { APP_CONFIG } from '@/config/app'
 import { TERMINAL_STATUSES } from '@/utils/notifications'
@@ -31,10 +31,11 @@ function buildUploadForm(fields: Record<string, string>, images?: WireImage[], p
   return form
 }
 
-export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking, plugins?: string[], files?: File[]): Promise<Session> {
+export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking, plugins?: string[], files?: File[], directive?: SessionDirectiveSpec | null): Promise<Session> {
   // 带文件附件（粘贴/上传 SQL/Excel 等）：multipart 提交，其余语义不变。
+  // 会话指令（goal/loop）：multipart 以 directive 文本字段携带（SessionDirectiveSpec 的 JSON 串）。
   if (files?.length) {
-    return fetchForm('/sessions', buildUploadForm({ goal, work_dir: workDir || '', gear: gear || '', thinking: thinking || '' }, images, plugins, files))
+    return fetchForm('/sessions', buildUploadForm({ goal, work_dir: workDir || '', gear: gear || '', thinking: thinking || '', directive: directive ? JSON.stringify(directive) : '' }, images, plugins, files))
   }
   const body: Record<string, unknown> = { goal }
   if (images?.length) body.images = images
@@ -45,6 +46,8 @@ export function createSession(goal: string, images?: WireImage[], workDir?: stri
   if (thinking) body.thinking = thinking
   // 创建时指定插件（KIMI 式插件选择）：空数组 = 不指定（模型自行判断），省略字段。
   if (plugins?.length) body.plugins = plugins
+  // 会话指令模式（goal/loop）：仅非常模式携带；objective 由后端自动回落为消息内容，前端不传。
+  if (directive) body.directive = directive
   return fetchJson('/sessions', { method: 'POST', body: JSON.stringify(body) })
 }
 
@@ -108,15 +111,30 @@ export function getSessionAgents(
   return fetchJson(`/sessions/${id}/agents`)
 }
 
-export function sendMessage(id: string, content: string, images?: WireImage[], files?: File[]): Promise<void> {
+export function sendMessage(id: string, content: string, images?: WireImage[], files?: File[], directive?: SessionDirectiveSpec | null): Promise<void> {
   // 带文件附件（粘贴/上传 SQL/Excel 等）：multipart 提交（content 可为空——服务端
-  // 会拼附件引用行）；否则维持 JSON 原样。
+  // 会拼附件引用行）；否则维持 JSON 原样。会话指令（goal/loop）仅非常模式携带。
   if (files?.length) {
-    return fetchForm(`/sessions/${id}/message`, buildUploadForm({ content }, images, undefined, files))
+    return fetchForm(`/sessions/${id}/message`, buildUploadForm({ content, directive: directive ? JSON.stringify(directive) : '' }, images, undefined, files))
   }
+  const body: Record<string, unknown> = images?.length ? { content, images } : { content }
+  if (directive) body.directive = directive
   return fetchJson(`/sessions/${id}/message`, {
     method: 'POST',
-    body: JSON.stringify(images?.length ? { content, images } : { content }),
+    body: JSON.stringify(body),
+  })
+}
+
+/** 会话指令视图（GET /sessions/:id/directive）：当前指令 + 待触发回查提醒。 */
+export function getSessionDirective(id: string): Promise<SessionDirectiveView> {
+  return fetchJson(`/sessions/${id}/directive`)
+}
+
+/** 设置会话指令（PUT /sessions/:id/directive）：模式/参数即时生效，objective 由后端回落为消息内容（前端不传）；响应同 GET。 */
+export function setSessionDirective(id: string, spec: SessionDirectiveSpec): Promise<SessionDirectiveView> {
+  return fetchJson(`/sessions/${id}/directive`, {
+    method: 'PUT',
+    body: JSON.stringify(spec),
   })
 }
 

@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import type { Session, AgentNode } from '@/types'
+import type { Session, AgentNode, SessionDirective, SessionReminder } from '@/types'
+import { getSessionDirective } from '@/api/session'
 
 const props = defineProps<{
   session: Session | null
@@ -140,6 +141,68 @@ const liveBadges = computed(() => {
   }
   return m
 })
+
+// ── 会话指令徽标（2026-10-18）：绑定会话即 5s 轮询 GET /sessions/:id/directive
+//（会话切换/组件卸载清理定时器；directive 为 null 或 mode=normal 时不显示）。 ──
+const DIRECTIVE_POLL_MS = 5000
+const directive = ref<SessionDirective | null>(null)
+const pendingReminders = ref<SessionReminder[]>([])
+let directiveTimer: ReturnType<typeof setInterval> | null = null
+
+async function pollDirective() {
+  const id = props.session?.id
+  if (!id) return
+  try {
+    const view = await getSessionDirective(id)
+    if (props.session?.id !== id) return // 返回期间已切换会话，丢弃
+    directive.value = view.directive
+    pendingReminders.value = view.pending_reminders || []
+  } catch { /* 静默：不打断头部展示，下个周期再试 */ }
+}
+
+function stopDirectiveTimer() {
+  if (directiveTimer) {
+    clearInterval(directiveTimer)
+    directiveTimer = null
+  }
+}
+
+watch(
+  () => props.session?.id,
+  (id) => {
+    stopDirectiveTimer()
+    directive.value = null
+    pendingReminders.value = []
+    if (!id) return
+    void pollDirective()
+    directiveTimer = setInterval(() => { void pollDirective() }, DIRECTIVE_POLL_MS)
+  },
+  { immediate: true },
+)
+onUnmounted(stopDirectiveTimer)
+
+interface DirectiveBadge { type: 'primary' | 'warning' | 'success' | 'danger'; text: string }
+
+const directiveBadge = computed<DirectiveBadge | null>(() => {
+  const d = directive.value
+  if (!d || d.mode === 'normal') return null
+  if (d.status === 'active') {
+    if (d.mode === 'goal') return { type: 'primary', text: `目标·第${d.turn_count}轮` }
+    const min = d.loop_interval_sec / 60
+    return { type: 'warning', text: `循环·每${Number.isInteger(min) ? min : min.toFixed(1)}分钟` }
+  }
+  if (d.status === 'complete') return { type: 'success', text: '目标达成' }
+  if (d.status === 'failed') return { type: 'danger', text: '指令停止·预算' }
+  return null // stopped：指令已被用户切回普通等场景停止，不显示
+})
+
+const directiveBadgeTitle = computed(() => {
+  const d = directive.value
+  if (!d) return ''
+  let t = `${d.objective}\n${d.last_eval}`
+  if (pendingReminders.value.length) t += `\n待触发回查 ${pendingReminders.value.length} 条`
+  return t
+})
 </script>
 
 <template>
@@ -153,6 +216,10 @@ const liveBadges = computed(() => {
       <el-tag size="small" effect="plain"
               class="!bg-transparent !border-line scale-90 shrink-0"
               :class="statusColor">{{ statusLabel }}</el-tag>
+      <!-- 会话指令徽标：goal/loop 运行中展示进度，终态展示结果（stopped 不显示） -->
+      <el-tag v-if="directiveBadge" size="small" effect="plain" :type="directiveBadge.type"
+              class="!bg-transparent !border-line scale-90 shrink-0"
+              :title="directiveBadgeTitle">{{ directiveBadge.text }}</el-tag>
       <span v-if="destroyCountdown" class="text-xs text-orange-400 font-mono shrink-0 animate-pulse">
         {{ destroyCountdown }}
       </span>

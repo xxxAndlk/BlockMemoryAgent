@@ -27,6 +27,8 @@ type Config struct {
 	BlockMemory BlockMemoryConfig `yaml:"block_memory"` // 块记忆库治理（近重复合并/零访问归档，2026-10-13）
 	Decision    DecisionConfig    `yaml:"decision"`     // 决策层 provider（TODO #23）：默认 LLM 兜底，外部 HTTP 默认关
 	Workflow    WorkflowConfig    `yaml:"workflow"`     // 工作流量产流水线（2026-10-16）
+	Flow        FlowConfig        `yaml:"flow"`         // 可视化编排（扣子/Dify 式节点图，2026-10-18）
+	Goal        GoalConfig        `yaml:"goal"`         // 会话指令模式：goal 目标 / loop 循环（2026-10-18）
 }
 
 // BlockMemoryConfig 块记忆库（global_knowledge type=block_memory）治理配置。
@@ -568,6 +570,8 @@ func (c *Config) applyDefaults() error {
 	c.applySkillsDefaults()
 	c.applyBlockMemoryDefaults()
 	c.applyWorkflowDefaults()
+	c.applyFlowDefaults()
+	c.applyGoalDefaults()
 	return nil
 }
 
@@ -596,6 +600,47 @@ func (c *Config) applyWorkflowDefaults() {
 	}
 	if c.Workflow.JudgeTimeoutMS <= 0 {
 		c.Workflow.JudgeTimeoutMS = 30000
+	}
+}
+
+// FlowConfig 可视化编排（flow）引擎配置（2026-10-18）。
+type FlowConfig struct {
+	// MaxActiveRuns 全局活跃 run 闸：超出的 run 入队 pending，FIFO 提升。
+	MaxActiveRuns int `yaml:"max_active_runs"`
+	// NodeTimeoutMS 单节点执行超时（llm/tool 调用，毫秒）。
+	NodeTimeoutMS int `yaml:"node_timeout_ms"`
+}
+
+// GoalConfig 会话指令模式（goal 目标 / loop 循环）配置（2026-10-18）。
+type GoalConfig struct {
+	// PollIntervalSec 到期提醒扫描间隔（秒）。默认 15。
+	PollIntervalSec int `yaml:"poll_interval_sec"`
+	// MinLoopIntervalSec loop 模式最小间隔（秒），SetMode 时收敛——防误配 1s 空转烧 token。默认 60。
+	MinLoopIntervalSec int `yaml:"min_loop_interval_sec"`
+	// JudgeTimeoutSec 单次完成度评估（轻量模型调用）超时（秒）。默认 60。
+	JudgeTimeoutSec int `yaml:"judge_timeout_sec"`
+}
+
+// applyGoalDefaults 指令模式默认值：15s / 60s / 60s。
+func (c *Config) applyGoalDefaults() {
+	if c.Goal.PollIntervalSec <= 0 {
+		c.Goal.PollIntervalSec = 15
+	}
+	if c.Goal.MinLoopIntervalSec <= 0 {
+		c.Goal.MinLoopIntervalSec = 60
+	}
+	if c.Goal.JudgeTimeoutSec <= 0 {
+		c.Goal.JudgeTimeoutSec = 60
+	}
+}
+
+// applyFlowDefaults flow 默认值：8 / 120000ms。
+func (c *Config) applyFlowDefaults() {
+	if c.Flow.MaxActiveRuns <= 0 {
+		c.Flow.MaxActiveRuns = 8
+	}
+	if c.Flow.NodeTimeoutMS <= 0 {
+		c.Flow.NodeTimeoutMS = 120000
 	}
 }
 
