@@ -79,6 +79,8 @@ export interface SessionSummary {
   gear?: SessionGear | ''
   /** 会话级思考强度（2026-09-16）：off|low|medium|high；空/缺省 = 跟随角色默认。 */
   thinking?: SessionThinking
+  /** 会话级模型覆盖（2026-10-19，models.json 条目 ID）：空/缺省 = 跟随全局角色绑定。 */
+  model?: string
   /** 会话级指定插件 ID 列表（KIMI 式插件选择）：选中 = 优先/强制使用；空/缺省 = 未指定（模型自行判断）。 */
   pinned_plugins?: string[]
 }

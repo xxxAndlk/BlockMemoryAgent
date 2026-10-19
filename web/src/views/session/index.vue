@@ -475,7 +475,7 @@ function startStream(s: Session) {
   })
 }
 
-async function handleSubmit(content: string, images: WireImage[] = [], files: File[] = [], gear: SessionGear = 'daily', thinking: SessionThinking = '', plugins: string[] = [], directive: SessionDirectiveSpec | null = null) {
+async function handleSubmit(content: string, images: WireImage[] = [], files: File[] = [], gear: SessionGear = 'daily', thinking: SessionThinking = '', plugins: string[] = [], directive: SessionDirectiveSpec | null = null, model = '') {
   if (!content.trim() && !images.length && !files.length) return
   sending.value = true
   try {
@@ -533,8 +533,8 @@ async function handleSubmit(content: string, images: WireImage[] = [], files: Fi
       sending.value = false
       return
     }
-    // 3) 无选中会话 → 创建新会话（携带创建时选档 + 会话级思考强度 + 指定插件，后端非法值 400）
-    const s = await createSession(content, images, workDir.value || undefined, gear, thinking, plugins, files, directive)
+    // 3) 无选中会话 → 创建新会话（携带创建时选档 + 会话级思考强度 + 指定插件 + 会话模型覆盖，后端非法值 400/记事件）
+    const s = await createSession(content, images, workDir.value || undefined, gear, thinking, plugins, files, directive, model)
     setWorkDir(workDir.value)
     sessions.value.unshift(s)
     router.replace({ path: '/session', query: { id: s.id } })

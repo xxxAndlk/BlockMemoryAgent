@@ -52,6 +52,9 @@ type Session struct {
 	// Thinking 会话级思考强度（2026-09-16）：off|low|medium|high；
 	// 空串 = 跟随角色默认。前端选择器据此回显。
 	Thinking string `json:"thinking,omitempty"`
+	// Model 会话级模型覆盖（2026-10-19，models.json 条目 ID）；
+	// 空串 = 跟随全局角色绑定。前端会话模型下拉据此回显。
+	Model string `json:"model,omitempty"`
 	// PinnedPlugins 会话级指定插件 ID 列表（KIMI 式插件选择）：选中=优先（强制）使用，
 	// 空 = 未指定（模型自行判断）。前端插件选择器据此回显。
 	PinnedPlugins []string `json:"pinned_plugins,omitempty"`
@@ -405,6 +408,7 @@ func ToServerSession(a *agent.Session) *Session {
 		TrustMode:     a.TrustMode,
 		Gear:          a.Gear,
 		Thinking:      a.Thinking,
+		Model:         a.Model,
 		PinnedPlugins: a.PinnedPlugins,
 		WidgetData:    a.WidgetData,
 	}

@@ -273,6 +273,60 @@ func (f *ModelFactory) GetBladesProviderForAgent(ctx context.Context, roleID, ag
 	return f.GetBladesProvider(ctx, roleID)
 }
 
+// GetBladesProviderForEntry 按模型条目 ID 解析 provider（2026-10-19 会话级模型覆盖）：
+// 生效配置 = 角色基础配置 + 条目连接参数（同备胎条目构造口径，但不做连通性探测——
+// 错误在 LLM 调用现场自然上浮）；客户端按 roleID+entryID+thinking 组合键缓存于 models
+// 缓存，随 models.json 热更新统一失效重建。会话覆盖不走备胎链（用户显式选定的模型，
+// 出错直接报错，不静默降级）。thinking 非空时覆盖条目生效档（同 getModel 语义）。
+func (f *ModelFactory) GetBladesProviderForEntry(ctx context.Context, roleID, entryID, thinking string) (blades.ModelProvider, error) {
+	// 热更新检查：条目被删/改则缓存经 invalidateByRecomputeLocked 统一重建。
+	f.checkRegistryReload()
+
+	key := roleID + thinkingCacheKeySep + "entry:" + entryID
+	if thinking != "" {
+		key += thinkingCacheKeySep + thinking
+	}
+
+	f.mu.RLock()
+	if m, ok := f.models[key]; ok {
+		f.mu.RUnlock()
+		return m.client.(*BladesClient).Provider(), nil
+	}
+	f.mu.RUnlock()
+
+	entry, ok := f.entryByID(entryID)
+	if !ok {
+		return nil, fmt.Errorf("模型条目 %q 不在模型注册表", entryID)
+	}
+	cfg := applyModelEntry(f.resolveBaseConfig(roleID), entry)
+	if thinking != "" {
+		cfg.Thinking = thinking
+	}
+	if cfg.APIKey == "" {
+		return nil, fmt.Errorf("missing API key for entry %s (provider=%s model=%s)", entryID, cfg.Provider, cfg.Model)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, ok := f.models[key]; ok {
+		return m.client.(*BladesClient).Provider(), nil
+	}
+	client, err := NewBladesClient(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create blades client for entry %s: %w", entryID, err)
+	}
+	f.models[key] = cachedClient{client: client, cfg: cfg, roleID: roleID, thinkingOverride: thinking}
+	return client.Provider(), nil
+}
+
+// ModelEntryExists 报告模型条目 ID 是否存在于 models.json 注册表（会话级模型切换
+// 校验用；含热更新检查）。registry 未装配时恒 false（调用方按无效处理）。
+func (f *ModelFactory) ModelEntryExists(modelID string) bool {
+	f.checkRegistryReload()
+	_, ok := f.entryByID(modelID)
+	return ok
+}
+
 // GetBladesProviderWithFallback 带备胎链的 provider 解析（TODO 第15项 T17）。
 // 主模型 = GetBladesProvider 现有解析（role_bindings 覆写 > model_ref）；备胎链 =
 // models.json role_bindings[roleID].fallback 依序列出的条目 ID。主模型调用出错

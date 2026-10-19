@@ -140,6 +140,10 @@ func synthesizeBoardSnapshot(sessionID string, nodes []orchestrator.Node) board.
 // 输入输出 token。调用与 token、耗时来自 pgStore session_logs（phase 前缀 llm，
 // 重启恢复的会话也可查）；超时数 logs 无标记字段，从会话 error 事件的超时
 // 关键词（timeout / DeadlineExceeded / Client.Timeout）匹配计数。
+// 调用数按 llm_input 行计——每次调用拆 llm_input/llm_output 两行（2026-10-19 修复
+// 原按 llm 行计次的双倍计数）；耗时只落在 llm_output 行（输入行 latency=0）。
+// current_context_tokens = 本会话顶层 Agent 最近一次 llm_input 的 input_tokens
+//（system+历史+tools 的真实请求输入），作为"当前上下文长度"口径，与累计消耗分开。
 func (s *ReactService) metricsQueryResult(ctx context.Context, sessionID string) Result {
 	calls := 0
 	timeouts := 0
@@ -153,7 +157,9 @@ func (s *ReactService) metricsQueryResult(ctx context.Context, sessionID string)
 				if !strings.HasPrefix(r.Phase, "llm") {
 					continue
 				}
-				calls++
+				if r.Phase == "llm_input" {
+					calls++
+				}
 				lat := time.Duration(r.LatencyMs) * time.Millisecond
 				if r.LatencyMs < 0 {
 					// 历史约定：latency 负值表示超时（metricsCollector.record 语义）。
@@ -178,15 +184,46 @@ func (s *ReactService) metricsQueryResult(ctx context.Context, sessionID string)
 		avg = (totalDur / time.Duration(calls)).Round(time.Millisecond).String()
 	}
 	return Result{Data: map[string]any{
-		"session_id":    sessionID,
-		"calls":         calls,
-		"timeouts":      timeouts,
-		"avg_duration":  avg,
-		"max_duration":  maxDur.Round(time.Millisecond).String(),
-		"input_tokens":  inTok,
-		"output_tokens": outTok,
-		"total_tokens":  inTok + outTok,
+		"session_id":            sessionID,
+		"calls":                 calls,
+		"timeouts":              timeouts,
+		"avg_duration":          avg,
+		"max_duration":          maxDur.Round(time.Millisecond).String(),
+		"input_tokens":          inTok,
+		"output_tokens":         outTok,
+		"total_tokens":          inTok + outTok,
+		"current_context_tokens": s.currentContextTokens(ctx, sessionID),
 	}}
+}
+
+// currentContextTokens 取"当前上下文长度"口径（2026-10-19）：本会话顶层 Agent
+// （按当前档位解析：fast→doc_assistant / daily→domain / cluster→meta）最近一次
+// llm_input 行的 input_tokens。会话不在内存（已驱逐未懒恢复）时退化取全会话任意
+// Agent 最近一次 llm_input；无记录返回 0。best-effort：查询失败返回 0。
+func (s *ReactService) currentContextTokens(ctx context.Context, sessionID string) int {
+	pg := s.store.pgStore
+	if pg == nil {
+		return 0
+	}
+	agentName := ""
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess != nil {
+		if roleDef, _ := s.resolveGearMetaRole(sess); roleDef != nil {
+			agentName = roleDef.Name
+		}
+	}
+	recs, err := pg.QuerySessionLogs(ctx, sessionID, agentName, "", 50, 0)
+	if err != nil {
+		return 0
+	}
+	for _, r := range recs {
+		if r.Phase == "llm_input" {
+			return r.InputTokens
+		}
+	}
+	return 0
 }
 
 // countTimeoutEvents 从会话事件（内存优先，已驱逐会话回退 PG 加载）统计

@@ -143,6 +143,10 @@ type CreateRequest struct {
 	// Thinking 会话级思考强度（2026-09-16）：off|low|medium|high，空=跟随角色默认。
 	// 只覆盖本会话顶层 Agent；HTTP 层负责 400 校验。
 	Thinking string
+	// Model 会话级模型覆盖（2026-10-19，models.json 条目 ID，空=跟随全局角色绑定）：
+	// 只覆盖本会话顶层 Agent（与会话级思考强度同口径），运行中可经 HTTP 热切换。
+	// 创建路径从宽：条目不存在则丢弃并记事件，不阻断建会话（agent 层校验）。
+	Model string
 	// PinnedPlugins 会话级指定插件（KIMI 式插件选择）：用户显式勾选后其工具强制预挂到
 	// 会话顶层 scope（绕过角色天花板，同 plugins.yaml top_level 语义）并注入提示块
 	// 要求优先使用；空=不指定（模型经 tool_catalog/tool_mount 自行判断）。
@@ -262,6 +266,11 @@ const (
 	// Args{"thinking": "off|low|medium|high|空串=跟随角色默认"}，atomic 即时生效——
 	// providerForRole 每次 LLM 调用实时读取，下一次调用即用新档（热，免重启）。
 	ControlOpThinking = "thinking"
+	// ControlOpModel 切换会话级模型覆盖（2026-10-19）：
+	// Args{"model_id": models.json 条目 ID，空串=恢复跟随全局角色绑定}，atomic 即时生效——
+	// providerForRole 每次 LLM 调用实时读取，下一次调用即用新模型（热，免重启）。
+	// 只覆盖本会话顶层 Agent（与会话级思考强度同口径）。
+	ControlOpModel = "model"
 	// ControlOpPinnedPlugins 切换会话级指定插件（KIMI 式插件选择）：
 	// Args{"plugins": []string}，空数组=清空（合法）。atomic 即时生效——新插件工具
 	// 预挂进会话顶层 scope、取消勾选的工具卸载，下一轮起跑按新集合构建提示块。
@@ -390,6 +399,9 @@ type Session struct {
 	// Thinking 会话级思考强度（2026-09-16）：off|low|medium|high；
 	// 空串 = 跟随角色默认。
 	Thinking string
+	// Model 会话级模型覆盖（2026-10-19，models.json 条目 ID）；
+	// 空串 = 跟随全局角色绑定（该角色 role_bindings 解析结果）。
+	Model string
 	// PinnedPlugins 会话级指定插件 ID 列表（KIMI 式插件选择）：空 = 未指定
 	// （模型自行判断）。前端插件选择器据此回显。
 	PinnedPlugins []string

@@ -53,6 +53,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		workDir   string
 		gear      string
 		thinking  string
+		model     string
 		plugins   []string
 		directive *agent.DirectiveSpec
 		files     []*multipart.FileHeader
@@ -67,6 +68,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		workDir = formValue(form, "work_dir")
 		gear = formValue(form, "gear")
 		thinking = formValue(form, "thinking")
+		model = formValue(form, "model_id")
 		var err error
 		if wireImgs, err = parseMultipartImages(formValue(form, "images")); err != nil {
 			c.String(http.StatusBadRequest, "%s", err.Error())
@@ -89,6 +91,9 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 			WorkDir  string            `json:"work_dir,omitempty"`
 			Gear     string            `json:"gear,omitempty"`
 			Thinking string            `json:"thinking,omitempty"`
+			// Model 会话级模型覆盖（2026-10-19，models.json 条目 ID）：空=跟随全局角色绑定。
+			// 创建路径从宽：条目不存在由 agent 层丢弃并记事件，不阻断建会话。
+			Model string `json:"model_id,omitempty"`
 			// Plugins 会话级指定插件（KIMI 式插件选择）：创建时勾选，无效 ID 由 agent 层
 			// 丢弃并记事件（创建路径从宽，不阻断建会话）。
 			Plugins []string `json:"plugins,omitempty"`
@@ -102,7 +107,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		}
 		goal, wireImgs, wireVids = req.Goal, req.Images, req.Videos
 		workDir, gear, thinking, plugins = req.WorkDir, req.Gear, req.Thinking, req.Plugins
-		directive = req.Directive
+		model, directive = req.Model, req.Directive
 	}
 	// 目标必填：纯文字创建必须带 goal；只带文件附件时 goal 可空（引用行拼入后即非空）。
 	if goal == "" && len(files) == 0 {
@@ -162,7 +167,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费；
 	// Attachments 仅透传首条 user_message 事件的 detail_json，引用文本已在 goal 里；
 	// Directive 指令模式创建即生效，落库失败退化为普通模式并记事件——不阻断建会话）。
-	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: goal, Images: images, Videos: videos, Attachments: atts, WorkDir: abs, Gear: gear, Thinking: thinking, PinnedPlugins: plugins, Directive: directive})
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: goal, Images: images, Videos: videos, Attachments: atts, WorkDir: abs, Gear: gear, Thinking: thinking, Model: model, PinnedPlugins: plugins, Directive: directive})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
@@ -675,6 +680,34 @@ func (m *SessionManager) HandleSessionGear(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"gear":       req.Gear,
+	})
+}
+
+// HandleSessionModel 处理 POST /api/sessions/{id}/model（2026-10-19 会话级模型覆盖）。
+// 职责：切换本会话顶层 Agent 的模型（models.json 条目 ID），经 Control 通道下发；
+// atomic 即时生效——providerForRole 每次 LLM 调用实时读取，下一次调用即用新模型。
+// 只影响本会话，不改全局角色绑定（models.json role_bindings）；空 model_id = 恢复跟随全局。
+// 条目不存在 400；会话不存在 404。
+func (m *SessionManager) HandleSessionModel(c *gin.Context) {
+	id := c.Param("id")
+	req, err := DecodeBody[struct {
+		ModelID string `json:"model_id"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
+		Op:   agent.ControlOpModel,
+		Args: map[string]any{"model_id": req.ModelID},
+	}); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"session_id": id,
+		"model_id":   req.ModelID,
 	})
 }
 

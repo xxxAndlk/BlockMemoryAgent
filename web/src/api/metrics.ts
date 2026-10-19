@@ -31,6 +31,8 @@ export interface SessionMetrics {
   input_tokens: number
   output_tokens: number
   total_tokens: number
+  /** 当前上下文长度（2026-10-19）：顶层 Agent 最近一次 LLM 调用的输入 token 数。 */
+  current_context_tokens?: number
 }
 
 export interface AgentModelTokenStats {

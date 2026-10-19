@@ -132,6 +132,11 @@ type reactInternalSession struct {
 	// atomic.Value 保证跨 goroutine 读取（providerForRole 每次 LLM 调用实时读取，
 	// 切换下一次调用即生效）；只覆盖本会话顶层 Agent，子 Agent 各按角色解析。
 	thinking atomic.Value
+	// model 是会话级模型覆盖（2026-10-19，models.json 条目 ID，空=跟随全局角色绑定）：
+	// createSession 随创建请求设置，会话内可经 HTTP 随时切换；atomic.Value 保证跨
+	// goroutine 读取（providerForRole 每次 LLM 调用实时读取，切换下一次调用即生效）；
+	// 只覆盖本会话顶层 Agent（与会话级思考强度同口径），子 Agent 各按角色解析。
+	model atomic.Value
 	// pinnedPlugins 是会话级指定插件 ID 列表（KIMI 式插件选择）：用户显式勾选后其工具
 	// 强制预挂到会话顶层 scope 并注入提示块要求优先使用；空=不指定（模型自行判断）。
 	// atomic.Value 保证跨 goroutine 读写（HTTP 切换即时生效，runSession 起跑重挂读取）。
@@ -547,6 +552,22 @@ func (s *reactInternalSession) currentThinking() string {
 // setThinking 设置会话级思考强度（atomic 存储无需额外加锁）。
 func (s *reactInternalSession) setThinking(thinking string) {
 	s.thinking.Store(thinking)
+}
+
+// currentModel 返回会话级模型覆盖（2026-10-19）；空串 = 跟随全局角色绑定（零覆盖）。
+// providerForRole 闭包每次 LLM 调用实时读取，运行中改模型下一次调用即生效。
+func (s *reactInternalSession) currentModel() string {
+	if v := s.model.Load(); v != nil {
+		if m, ok := v.(string); ok {
+			return m
+		}
+	}
+	return ""
+}
+
+// setModel 设置会话级模型覆盖（atomic 存储无需额外加锁；空串=清除覆盖跟随全局）。
+func (s *reactInternalSession) setModel(model string) {
+	s.model.Store(model)
 }
 
 // currentPinnedPlugins 返回会话级指定插件 ID 列表（KIMI 式插件选择）；
@@ -969,28 +990,33 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 }
 
 // sessionMetaMemory 组装会话持久化 meta（TODO #14 会话三档控制 + 2026-09-16 会话级
-// 思考强度 + 会话级指定插件）：档位 gear + 思考强度 thinking + 指定插件 pinned_plugins，
-// 重启恢复分别经 gearFromMetaMemory / thinkingFromMetaMemory / pinnedPluginsFromMetaMemory
-// 回填；字段以 map 键增量扩展，旧记录缺键自然回落默认。
-// 三者皆空返回空切片（与 MetaMemory 列历史写入形态一致）。
+// 思考强度 + 会话级指定插件 + 2026-10-19 会话级模型覆盖）：档位 gear + 思考强度 thinking +
+// 指定插件 pinned_plugins + 模型覆盖 model，重启恢复分别经 gearFromMetaMemory /
+// thinkingFromMetaMemory / pinnedPluginsFromMetaMemory / modelFromMetaMemory 回填；
+// 字段以 map 键增量扩展，旧记录缺键自然回落默认。
+// 四者皆空返回空切片（与 MetaMemory 列历史写入形态一致）。
 func sessionMetaMemory(session *reactInternalSession) []map[string]any {
 	g := session.currentGear()
 	t := session.currentThinking()
+	m := session.currentModel()
 	ids := session.currentPinnedPlugins()
-	if g == "" && t == "" && len(ids) == 0 {
+	if g == "" && t == "" && m == "" && len(ids) == 0 {
 		return []map[string]any{}
 	}
-	m := map[string]any{}
+	mmap := map[string]any{}
 	if g != "" {
-		m["gear"] = g
+		mmap["gear"] = g
 	}
 	if t != "" {
-		m["thinking"] = t
+		mmap["thinking"] = t
+	}
+	if m != "" {
+		mmap["model"] = m
 	}
 	if len(ids) > 0 {
-		m["pinned_plugins"] = ids
+		mmap["pinned_plugins"] = ids
 	}
-	return []map[string]any{m}
+	return []map[string]any{mmap}
 }
 
 // gearFromMetaMemory 从持久化 meta 读取档位（TODO #14）：取首个合法枚举值
@@ -1019,6 +1045,21 @@ func thinkingFromMetaMemory(meta []map[string]any) string {
 		}
 		if t, ok := m["thinking"].(string); ok && tool.ValidThinking(t) {
 			return t
+		}
+	}
+	return ""
+}
+
+// modelFromMetaMemory 从持久化 meta 读取会话级模型覆盖（2026-10-19）：取首个非空字符串；
+// 缺键/无 meta 返回空串（跟随全局角色绑定）。条目存在性不在此校验——恢复后由
+// providerForRole 解析时经 ModelFactory 按条目 ID 查注册表，失效条目自然报错上浮。
+func modelFromMetaMemory(meta []map[string]any) string {
+	for _, m := range meta {
+		if m == nil {
+			continue
+		}
+		if v, ok := m["model"].(string); ok && v != "" {
+			return v
 		}
 	}
 	return ""
@@ -1291,6 +1332,8 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 	sess.setGear(gearFromMetaMemory(rec.MetaMemory, st.defaultGear))
 	// 恢复会话级思考强度（2026-09-16）：缺键回落空串=跟随角色默认。
 	sess.setThinking(thinkingFromMetaMemory(rec.MetaMemory))
+	// 恢复会话级模型覆盖（2026-10-19）：缺键回落空串=跟随全局角色绑定。
+	sess.setModel(modelFromMetaMemory(rec.MetaMemory))
 	// 恢复会话级指定插件（KIMI 式插件选择）：缺键回落 nil=不指定；
 	// 工具重挂在 runSession 起跑时经 applyPinnedPlugins 完成（挂载集纯内存）。
 	sess.setPinnedPlugins(pinnedPluginsFromMetaMemory(rec.MetaMemory))

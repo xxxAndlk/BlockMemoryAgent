@@ -31,11 +31,11 @@ function buildUploadForm(fields: Record<string, string>, images?: WireImage[], p
   return form
 }
 
-export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking, plugins?: string[], files?: File[], directive?: SessionDirectiveSpec | null): Promise<Session> {
+export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking, plugins?: string[], files?: File[], directive?: SessionDirectiveSpec | null, model?: string): Promise<Session> {
   // 带文件附件（粘贴/上传 SQL/Excel 等）：multipart 提交，其余语义不变。
   // 会话指令（goal/loop）：multipart 以 directive 文本字段携带（SessionDirectiveSpec 的 JSON 串）。
   if (files?.length) {
-    return fetchForm('/sessions', buildUploadForm({ goal, work_dir: workDir || '', gear: gear || '', thinking: thinking || '', directive: directive ? JSON.stringify(directive) : '' }, images, plugins, files))
+    return fetchForm('/sessions', buildUploadForm({ goal, work_dir: workDir || '', gear: gear || '', thinking: thinking || '', directive: directive ? JSON.stringify(directive) : '', model_id: model || '' }, images, plugins, files))
   }
   const body: Record<string, unknown> = { goal }
   if (images?.length) body.images = images
@@ -44,6 +44,8 @@ export function createSession(goal: string, images?: WireImage[], workDir?: stri
   if (gear) body.gear = gear
   // 创建时选思考强度（2026-09-16）：空串 = 跟随角色默认，省略字段。
   if (thinking) body.thinking = thinking
+  // 创建时会话级模型覆盖（2026-10-19）：空串 = 跟随全局角色绑定，省略字段。
+  if (model) body.model_id = model
   // 创建时指定插件（KIMI 式插件选择）：空数组 = 不指定（模型自行判断），省略字段。
   if (plugins?.length) body.plugins = plugins
   // 会话指令模式（goal/loop）：仅非常模式携带；objective 由后端自动回落为消息内容，前端不传。
@@ -313,6 +315,16 @@ export function setSessionThinking(id: string, thinking: SessionThinking): Promi
   return fetchJson(`/sessions/${id}/thinking`, {
     method: 'POST',
     body: JSON.stringify({ thinking }),
+  })
+}
+
+/** 切换会话级模型覆盖（2026-10-19）：POST /sessions/{id}/model，原子即时生效——
+ *  provider 每次 LLM 调用实时读取，下一次调用即用新模型（热，免重启）；空串 = 恢复跟随全局角色绑定。
+ *  只影响本会话顶层 Agent，不改全局角色绑定（models.json role_bindings）。 */
+export function setSessionModel(id: string, modelId: string): Promise<{ session_id: string; model_id: string }> {
+  return fetchJson(`/sessions/${id}/model`, {
+    method: 'POST',
+    body: JSON.stringify({ model_id: modelId }),
   })
 }
 

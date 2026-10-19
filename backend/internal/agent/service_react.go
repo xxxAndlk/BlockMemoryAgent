@@ -1404,6 +1404,17 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 	if t := tool.NormalizeThinking(req.Thinking); tool.ValidThinking(t) {
 		sess.setThinking(t)
 	}
+	// 会话级模型覆盖（2026-10-19 新会话页选择）：条目存在才入会话（创建路径从宽，
+	// 无效 ID 丢弃并记事件，不阻断建会话，同指定插件口径）；空=跟随全局角色绑定。
+	if m := strings.TrimSpace(req.Model); m != "" {
+		if s.modelFactory != nil && s.modelFactory.ModelEntryExists(m) {
+			sess.setModel(m)
+		} else {
+			s.store.addEvent(sess, eventkind.System, "System",
+				fmt.Sprintf("会话模型覆盖忽略无效项: %s（不在模型注册表）", m),
+				"", "", "", "", "", true)
+		}
+	}
 	// 会话级指定插件（KIMI 式插件选择）：创建路径从宽——无效 ID（不存在/未启用/未运行）
 	// 丢弃并记事件，不阻断建会话（同 MountPreApprovedForScope 的静默跳过语义）；
 	// 工具预挂在 runSession 起跑时经 applyPinnedPlugins 完成。
@@ -1887,6 +1898,11 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 		// providerForRole 每次 LLM 调用实时读取，下一次调用即生效。
 		thinking, _ := cmd.Args["thinking"].(string)
 		return s.SetSessionThinking(sessionID, thinking)
+	case ControlOpModel:
+		// 会话级模型覆盖切换（2026-10-19）：提取 model_id（空串合法=恢复跟随全局）
+		// 落会话，providerForRole 每次 LLM 调用实时读取，下一次调用即生效。
+		modelID, _ := cmd.Args["model_id"].(string)
+		return s.SetSessionModel(sessionID, modelID)
 	case ControlOpPinnedPlugins:
 		// 会话级指定插件切换（KIMI 式插件选择）：Args{"plugins": []string}，空数组=清空。
 		// 参数断言 fail-closed（同 ControlOpWorkDir）：序列化误差不得静默清空用户选择。
@@ -2142,6 +2158,50 @@ func (s *ReactService) SessionThinking(sessionID string) string {
 		return ""
 	}
 	return sess.currentThinking()
+}
+
+// SetSessionModel 切换会话级模型覆盖（2026-10-19，HTTP 切换通道）：
+// atomic 即时生效——providerForRole 闭包每次 LLM 调用实时读取，下一次调用即用新模型
+//（免重启）；只覆盖本会话顶层 Agent，在飞子 Agent 各按角色解析不受影响。
+// 空串 = 清除覆盖、恢复跟随全局角色绑定（合法）。modelID 非空时校验条目须存在于
+// models.json 注册表（HTTP 400）；会话不存在返回错误。切换经 meta_memory 随下一次
+// persistHistory 落库（与会话档位同口径），重启后恢复。
+func (s *ReactService) SetSessionModel(sessionID, modelID string) error {
+	m := strings.TrimSpace(modelID)
+	if m != "" && (s.modelFactory == nil || !s.modelFactory.ModelEntryExists(m)) {
+		return fmt.Errorf("invalid model_id %q (不在模型注册表)", modelID)
+	}
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	from := sess.currentModel()
+	sess.setModel(m)
+	s.store.addEvent(sess, eventkind.System, "System",
+		fmt.Sprintf("会话模型切换: %s → %s（仅本会话，下一次 LLM 调用生效）", sessionModelDisplayName(from), sessionModelDisplayName(m)),
+		"", "", "", "", "", true)
+	return nil
+}
+
+// SessionModel 读取会话当前模型覆盖（HTTP GET 展示用）；未设置（跟随全局）返回空串。
+func (s *ReactService) SessionModel(sessionID string) string {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return ""
+	}
+	return sess.currentModel()
+}
+
+// sessionModelDisplayName 会话模型事件留痕的展示名：空串=跟随全局。
+func sessionModelDisplayName(modelID string) string {
+	if modelID == "" {
+		return "跟随全局"
+	}
+	return modelID
 }
 
 // SetSessionPinnedPlugins 切换会话级指定插件（KIMI 式插件选择，HTTP 切换通道）：
@@ -3695,6 +3755,11 @@ func (s *ReactService) providerForRole(roleID, sessionID string) func(context.Co
 			s.store.mu.RUnlock()
 			if sess != nil {
 				thinking = sess.currentThinking()
+				// 会话级模型覆盖（2026-10-19）：非空时按条目 ID 解析（角色基础配置 +
+				// 条目连接参数），实时读取——运行中切换下一次 LLM 调用即生效。
+				if m := sess.currentModel(); m != "" {
+					return s.modelFactory.GetBladesProviderForEntry(ctx, roleID, m, thinking)
+				}
 			}
 			return s.modelFactory.GetBladesProviderWithThinking(ctx, roleID, thinking, s.fallbackObserver(sessionID))
 		}
@@ -5916,6 +5981,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		TrustMode:      s.currentTrustMode(),
 		Gear:           s.currentGear(),
 		Thinking:       s.currentThinking(),
+		Model:          s.currentModel(),
 		PinnedPlugins:  s.currentPinnedPlugins(),
 		WidgetData:     widgetData,
 	}

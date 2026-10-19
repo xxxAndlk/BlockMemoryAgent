@@ -7,9 +7,13 @@ const props = defineProps<{
   metrics: SessionMetrics | null
 }>()
 
-const tokenPercent = computed(() => {
-  if (!props.metrics || props.metrics.total_tokens <= 0) return 0
-  return Math.min(100, Math.round((props.metrics.total_tokens / APP_CONFIG.tokenContextLimit) * 100))
+// 上下文占用（2026-10-19）：进度条口径 = 顶层 Agent 最近一次 LLM 调用的输入 token
+//（system+历史+tools 的真实请求输入），衡量"当前上下文有多长"；与会话累计消耗分开。
+const currentContext = computed(() => props.metrics?.current_context_tokens ?? 0)
+
+const contextPercent = computed(() => {
+  if (currentContext.value <= 0) return 0
+  return Math.min(100, Math.round((currentContext.value / APP_CONFIG.tokenContextLimit) * 100))
 })
 </script>
 
@@ -42,14 +46,14 @@ const tokenPercent = computed(() => {
     </div>
 
     <div class="text-xs text-ink-2 mb-2">上下文用量</div>
-    <div class="mb-6 text-xs">
+    <div class="mb-3 text-xs">
       <div class="flex justify-between mb-2">
-        <span>当前会话 Token 消耗</span>
-        <span class="text-blue-400 font-bold">{{ tokenPercent }}%</span>
+        <span>当前上下文占用</span>
+        <span class="text-blue-400 font-bold">{{ contextPercent }}%</span>
       </div>
-      <div class="text-ink-2 mb-2">{{ (metrics?.total_tokens ?? 0).toLocaleString() }} / {{ APP_CONFIG.tokenContextLimit.toLocaleString() }} <span class="text-[10px]">tokens</span></div>
+      <div class="text-ink-2 mb-2">{{ currentContext.toLocaleString() }} / {{ APP_CONFIG.tokenContextLimit.toLocaleString() }} <span class="text-[10px]">tokens</span></div>
       <div class="relative pt-1">
-        <el-progress :percentage="tokenPercent" :show-text="false" class="custom-progress" />
+        <el-progress :percentage="contextPercent" :show-text="false" class="custom-progress" />
         <div class="absolute top-0 bottom-0 left-[80%] border-l-2 border-yellow-500 z-10 h-full -mt-0.5" style="height: 12px;"></div>
         <div class="absolute top-0 bottom-0 left-[95%] border-l-2 border-red-500 z-10 h-full -mt-0.5" style="height: 12px;"></div>
         <div class="flex justify-between mt-1 text-[10px]">
@@ -57,6 +61,16 @@ const tokenPercent = computed(() => {
           <span class="text-red-500 flex items-center gap-1"><div class="w-1.5 h-1.5 rounded-full bg-red-500"></div> {{ Math.round(APP_CONFIG.errorThreshold * 100) }}% 硬限制</span>
         </div>
       </div>
+    </div>
+
+    <!-- 累计消耗（2026-10-19）：与上下文占用分开的总消耗口径（全会话所有 Agent 累计）。 -->
+    <div class="text-xs text-ink-2 mb-2">累计消耗</div>
+    <div class="mb-6 text-xs flex items-baseline justify-between">
+      <span class="text-ink-2">会话累计 Token</span>
+      <span class="text-ink font-bold text-base">{{ (metrics?.total_tokens ?? 0).toLocaleString() }}</span>
+    </div>
+    <div class="text-ink-3 text-[10px] -mt-5 mb-6 text-right">
+      输入 {{ (metrics?.input_tokens ?? 0).toLocaleString() }} · 输出 {{ (metrics?.output_tokens ?? 0).toLocaleString() }}
     </div>
 
     <slot name="footer" />

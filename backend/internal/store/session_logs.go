@@ -192,7 +192,8 @@ func (s *PostgresStore) QuerySessionLogs(ctx context.Context, sessionID, agent, 
 // 返回: TokenAggregation 指针与错误。
 func (s *PostgresStore) AggregateSessionTokens(ctx context.Context, sessionID string) (*TokenAggregation, error) {
 	rows, err := s.db.QueryContext(ctx, `
-			SELECT agent, model, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COUNT(*)
+			SELECT agent, model, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+			       COUNT(*) FILTER (WHERE phase = 'llm_input')
 			FROM session_logs
 			WHERE session_id = $1 AND (input_tokens > 0 OR output_tokens > 0)
 			GROUP BY agent, model

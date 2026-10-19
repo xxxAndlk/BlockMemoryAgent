@@ -2,7 +2,7 @@
 import { ref, computed, reactive, watch, nextTick, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { WireImage, SessionGear, SessionThinking, TrustMode, Session, SessionRunMode, SessionDirectiveSpec, SessionDirective } from '@/types'
-import { setTrustMode, setSessionGear, setSessionThinking, setSessionPlugins, getSessionDirective, setSessionDirective } from '@/api/session'
+import { setTrustMode, setSessionGear, setSessionThinking, setSessionPlugins, setSessionModel, getSessionDirective, setSessionDirective } from '@/api/session'
 import { useModelSelection } from '@/composables/useModelSelection'
 import { usePluginSelection } from '@/composables/usePluginSelection'
 import { useRouter } from 'vue-router'
@@ -37,7 +37,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'submit', content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[], directive: SessionDirectiveSpec | null): void
+  (e: 'submit', content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[], directive: SessionDirectiveSpec | null, model: string): void
   (e: 'new-session'): void
   (e: 'update-workdir', dir: string): void
   (e: 'stop'): void
@@ -137,6 +137,33 @@ async function onTrustModeChange(mode: TrustMode) {
     ElMessage.success(`信任模式已切换为 ${mode}（下一工具调用生效）`)
   } catch (e) {
     ElMessage.error('切换信任模式失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+// 会话级模型覆盖（2026-10-19）：未绑定 = 创建选择（localStorage 记忆）；已绑定 = 即时 POST
+// 切换，下一次 LLM 调用生效；空串 = 跟随全局角色绑定（默认取全局配置，如 ark-glm-5.3-flash）。
+// 只影响本会话顶层 Agent，不改全局角色绑定。
+const MODEL_STORAGE_KEY = 'bma:newSessionModel'
+const sessionModel = ref(localStorage.getItem(MODEL_STORAGE_KEY) || '')
+// 绑定会话后以会话快照回显（model 空 = 跟随全局配置）。
+watch(
+  () => [props.sessionBound, props.session?.model] as const,
+  ([bound, m]) => { if (bound) sessionModel.value = m || '' },
+  { immediate: true },
+)
+
+async function onSessionModelChange(v: string) {
+  sessionModel.value = v
+  if (!props.sessionBound || !props.session) {
+    localStorage.setItem(MODEL_STORAGE_KEY, v) // 创建选择：下次开新会话默认上次所选
+    return
+  }
+  try {
+    await setSessionModel(props.session.id, v)
+    ElMessage.success(v ? `会话模型已切换为 ${v}（仅本会话，下一次 LLM 调用生效）` : '会话模型已恢复跟随全局配置')
+  } catch (e) {
+    ElMessage.error('切换会话模型失败：' + (e instanceof Error ? e.message : String(e)))
+    sessionModel.value = props.session.model || ''
   }
 }
 
@@ -685,7 +712,7 @@ function handleSubmit() {
   const files = readyFiles.value.map((f) => f.file)
   // 会话指令（goal/loop）随创建/发送请求携带；normal 传 null（objective 由后端回落为消息内容）。
   const directive = runMode.value === 'normal' ? null : buildDirectiveSpec()
-  emit('submit', content.value.trim(), pendingImages.value.slice(), files, gear.value, thinking.value, pinnedPlugins.value.slice(), directive)
+  emit('submit', content.value.trim(), pendingImages.value.slice(), files, gear.value, thinking.value, pinnedPlugins.value.slice(), directive, sessionModel.value)
   content.value = ''
   pendingImages.value = []
   pendingFiles.value = []
@@ -948,6 +975,16 @@ function onKeydown(e: KeyboardEvent) {
             </div>
             <!-- 本会话设置（自工具栏收编，输入栏精简）：热生效，切换即 POST 后端 -->
             <div class="border-t border-line pt-2 space-y-2">
+              <div>
+                <div class="mb-1 text-ink-2" title="只影响本会话顶层 Agent；跟随全局=按角色绑定（models.json）；运行中可改，下一次 LLM 调用生效">会话模型（本会话）</div>
+                <el-select :model-value="sessionModel" size="small" class="w-full" filterable
+                           placeholder="跟随全局配置" :loading="modelsLoading"
+                           @update:model-value="onSessionModelChange($event as string)">
+                  <el-option value="" label="跟随全局配置" />
+                  <el-option v-for="m in catalog?.models || []" :key="m.id" :value="m.id"
+                             :label="`${m.id} · ${m.provider}/${m.model}`" />
+                </el-select>
+              </div>
               <div>
                 <div class="mb-1 text-ink-2" title="快速档=文档助手直达，日常档=DomainAgent 直接执行，集群档=Meta 全装编排">执行档位（本会话）</div>
                 <el-select v-model="gear" size="small" class="w-full"
