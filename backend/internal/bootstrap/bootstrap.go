@@ -896,8 +896,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		agentSvc.SetProfileExtractor(func(ctx context.Context, text string) ([]string, error) {
 			return extractProfilePreferences(ctx, modelFactory, text)
 		})
-		agentSvc.SetPrefMerger(func(ctx context.Context, view userprofile.MergeView, increments []string) (userprofile.MergePlan, error) {
-			return mergePreferences(ctx, modelFactory, view, increments)
+		agentSvc.SetPrefMerger(func(ctx context.Context, view userprofile.MergeView, archive, rejected, increments []string) (userprofile.MergePlan, error) {
+			return mergePreferences(ctx, modelFactory, view, archive, rejected, increments)
 		})
 		toolRegistry.SetUserProfileHook(func(ctx context.Context, text string) error {
 			return profileStore.Append("偏好", text)

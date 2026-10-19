@@ -31,11 +31,13 @@ func buildEvolvePrompt(in agent.EvolveInput) string {
 	return fmt.Sprintf(`你是会话进化器。分析刚结束的会话，提取可复用经验（失败会话的踩坑经验价值更高）。
 
 产出 JSON 对象（不要 markdown 围栏）:
-{"user_prefs": ["..."], "project_lessons": ["..."], "skills": [{"name": "...", "title": "...", "when_to_use": "...", "background": "...", "steps": ["..."], "pitfalls": ["..."], "verify": "...", "example": "..."}]}
+{"user_prefs": ["..."], "project_lessons": ["..."], "rejected": ["..."], "skills": [{"name": "...", "title": "...", "when_to_use": "...", "background": "...", "steps": ["..."], "pitfalls": ["..."], "verify": "...", "example": "..."}]}
 
 规则:
 - user_prefs: 用户的稳定偏好（跨项目通用，如沟通风格/技术栈），0-3 条；不确定就不提取
-- project_lessons: 本项目特有的工艺/经验/约定（如"渲染动画帧前先统一去白底""角色一致性需固定参考图+seed"），0-3 条；跨项目通用的工艺放 skills 不要放这里
+- project_lessons: 本项目特有的工艺/经验/约定（如"渲染动画帧前先统一去白底""角色一致性需固定参考图+seed"），0-3 条；跨项目通用的工艺放 skills 不要放这里。
+  排除"已确认/半成品/进行中/待开发/计划态"等过程状态表述——未落地、未验收的方案不是经验（实证：被中断任务的半成品设计入库后 33 小时持续污染后续会话）
+- rejected: 本会话中用户明确否决/不要/取消/作废/推翻的方案、设计或约定，0-3 条短词组（如"固定行走路径""弯曲围栏"）；没有就省略。系统用它作废历史沉淀中与之矛盾的内容
 - skills: 0 或 1 个结构化技能包（最多 1 个）。必须同时满足以下三者，缺一输出空数组：
   ① 跨项目通用（不是本项目独有约定）；② 非显而易见（不是工程师默认都知道的做法）；
   ③ 有具体可执行步骤（步骤里能指到具体命令/参数/文件/工具）
@@ -121,6 +123,7 @@ func parseEvolveOutput(resp string) (*agent.EvolveOutput, error) {
 	var raw struct {
 		UserPrefs      []string `json:"user_prefs"`
 		ProjectLessons []string `json:"project_lessons"`
+		Rejected       []string `json:"rejected"`
 		Skills         []struct {
 			Name       string   `json:"name"`
 			Title      string   `json:"title"`
@@ -141,7 +144,7 @@ func parseEvolveOutput(resp string) (*agent.EvolveOutput, error) {
 	if err := json.Unmarshal([]byte(cleaned[start:end+1]), &raw); err != nil {
 		return nil, fmt.Errorf("unmarshal evolve output: %w", err)
 	}
-	out := &agent.EvolveOutput{UserPrefs: raw.UserPrefs, ProjectLessons: raw.ProjectLessons}
+	out := &agent.EvolveOutput{UserPrefs: raw.UserPrefs, ProjectLessons: raw.ProjectLessons, Rejected: raw.Rejected}
 	for _, sk := range raw.Skills {
 		ev := agent.EvolvedSkill{
 			Name: sk.Name, Title: sk.Title, WhenToUse: sk.WhenToUse,

@@ -47,6 +47,11 @@ const ProjectArchiveSection = "经验归档"
 // defaultArchiveCap 归档小节保留的最大条数（超出裁最旧，原始审计线索限量）。
 const defaultArchiveCap = 20
 
+// maxAutoLinesPerSection 单个目标小节自动行的硬上限（2026-10-19）：超出时按时间戳
+// 最旧优先移入归档小节。merge prompt 里有同款预算规则（模型自律），这里是确定性兜底——
+// 注入面（项目经验/偏好）不随会话数无限膨胀（实证 AI_Agent_Learn_path 单行累积到 70 行）。
+const maxAutoLinesPerSection = 30
+
 // Store 结构化偏好文件存储：单文件，读多写少。
 //
 // 并发安全：current 用 atomic.Pointer 实现 RCU 风格读；写路径（Load/Append/Save/ApplyMerge）

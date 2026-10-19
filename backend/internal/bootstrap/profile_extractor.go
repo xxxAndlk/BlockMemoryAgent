@@ -37,9 +37,9 @@ func extractProfilePreferences(ctx context.Context, factory *model.ModelFactory,
 }
 
 // mergePreferences 把偏好增量合并进现有小节（设计 §4 Merge 流程）：
-// 轻量模型读当前自动行视图 + 增量，产出 MergePlan（合并后各行 + 被替换归档行）。
-// 解析失败返回 error，调用方降级直写归档小节。
-func mergePreferences(ctx context.Context, factory *model.ModelFactory, view userprofile.MergeView, increments []string) (userprofile.MergePlan, error) {
+// 轻量模型读当前自动行视图 + 归档视图（只读）+ 本会话否决清单（作废判据）+ 增量，
+// 产出 MergePlan（合并后各行 + 被替换归档行）。解析失败返回 error，调用方降级直写归档小节。
+func mergePreferences(ctx context.Context, factory *model.ModelFactory, view userprofile.MergeView, archive, rejected, increments []string) (userprofile.MergePlan, error) {
 	var b strings.Builder
 	b.WriteString("现有档案各小节的自动行（已带时间戳的机器行；无时间戳的人工行不在其中且永不可改）：\n")
 	for _, sec := range sortedViewSections(view) {
@@ -52,6 +52,22 @@ func mergePreferences(ctx context.Context, factory *model.ModelFactory, view use
 			b.WriteString(strings.Join(lines, " | "))
 		}
 		b.WriteString("\n")	}
+	if len(archive) > 0 {
+		b.WriteString("\n已归档的历史行（只读判据：与归档行矛盾的新增量直接丢弃；不得把归档行写回现行小节——它们是已被废止的内容）：\n")
+		for _, a := range archive {
+			b.WriteString("- ")
+			b.WriteString(a)
+			b.WriteString("\n")
+		}
+	}
+	if len(rejected) > 0 {
+		b.WriteString("\n本会话用户否决清单（作废判据：现行行与清单矛盾的移入 archived；增量与清单矛盾的直接丢弃）：\n")
+		for _, r := range rejected {
+			b.WriteString("- ")
+			b.WriteString(r)
+			b.WriteString("\n")
+		}
+	}
 	b.WriteString("\n新增增量:\n")
 	for i, inc := range increments {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, inc)
@@ -62,6 +78,8 @@ func mergePreferences(ctx context.Context, factory *model.ModelFactory, view use
 - 去重：与现有行语义重复的增量不再新增
 - 近重复整理：现有行之间语义近重复/互为子集的也要合并为一条（保留信息并集、去掉重复表述）——历史冗余借本轮一并清理，不要原样搬运
 - 冲突：新增量与现有行矛盾时（如 npm vs pnpm）新表述生效，被替换的现有行放入 archived
+- 作废：现行行与"用户否决清单"或"已归档历史行"矛盾时，现行行移入 archived（用户否决优先于历史沉淀）
+- 小节规模：每个小节合并后不超过 30 行；超出时把最弱、最项目特定的行并入更强的行或移入 archived（现行小节是注入上下文的"当前生效约定"，不是历史堆积）
 - 增量归属哪个小节由你判断（只能是上面列出的现有小节名）；不属于任何小节的丢弃
 - 与现有内容无关且无需整理的小节不要输出
 - 每行不超过 60 字、不带时间戳、不带序号（合并行以信息完整为先，可适当超长但需精炼）

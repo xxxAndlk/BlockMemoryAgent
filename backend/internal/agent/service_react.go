@@ -536,7 +536,7 @@ func (s *ReactService) extractProfilePreferences(session *reactInternalSession) 
 			cleaned = append(cleaned, p)
 		}
 	}
-	s.mergeIntoStore(session.ID, "UserProfileExtractor", s.userProfile, userProfileTargets, cleaned)
+	s.mergeIntoStore(session.ID, "UserProfileExtractor", s.userProfile, userProfileTargets, cleaned, nil)
 }
 
 // SetBoard 注入会话任务看板访问器（TODO #22）。
@@ -797,13 +797,18 @@ func (s *ReactService) metaPersona(workDir string) PersonaInjector {
 	var userCurrent func() string
 	if s.userProfile != nil {
 		store := s.userProfile
-		userCurrent = func() string { return store.Current().Content }
+		// 注入剥掉归档小节（反馈记录）：归档只做审计不进上下文（2026-10-19），
+		// 已废止内容不占用注入配额也不误导模型。
+		userCurrent = func() string {
+			return userprofile.StripSection(store.Current().Content, store.ArchiveSection())
+		}
 	}
 	var projCurrent func() string
 	if s.projectPrefs != nil {
 		store := s.projectPrefs
 		projCurrent = func() string {
-			return store.Current(tool.WithWorkDir(context.Background(), workDir)).Content
+			cur := store.Current(tool.WithWorkDir(context.Background(), workDir))
+			return userprofile.StripSection(cur.Content, store.ArchiveSection())
 		}
 	}
 	return CombinePersonaInjectors(

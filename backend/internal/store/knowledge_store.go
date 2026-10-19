@@ -108,8 +108,10 @@ func (s *KnowledgeStore) Embed(ctx context.Context, text string) ([]float32, err
 }
 
 // ListIndexEntries 返回沉淀索引槽的一行式条目（TODO #20③+#22③）：
-// 全类型未归档记录按 (last_accessed DESC NULLS LAST, created_at DESC) 取 limit 条，
+// block_memory 类型未归档记录按 (last_accessed DESC NULLS LAST, created_at DESC) 取 limit 条，
 // 供会话启动渲染【沉淀索引】。含 untrusted 围栏的行由调用方过滤（provenance 门）。
+// 2026-10-19 限定 knowledge_type=block_memory：块记忆已删除（否决方案复注实证），
+// domain_profile（派发档案）等其它类型不得借索引槽注入会话；本查询随块记忆退役自然返空。
 func (s *KnowledgeStore) ListIndexEntries(ctx context.Context, limit int) ([]*types.KnowledgeRecord, error) {
 	if limit <= 0 {
 		limit = 200
@@ -117,10 +119,10 @@ func (s *KnowledgeStore) ListIndexEntries(ctx context.Context, limit int) ([]*ty
 	rows, err := s.db.QueryContext(ctx, `
 			SELECT id, knowledge_type, topic_id, content, meta, access_count, last_accessed, created_at, archived
 			FROM global_knowledge
-			WHERE archived = false
+			WHERE archived = false AND knowledge_type = $1
 			ORDER BY last_accessed DESC NULLS LAST, created_at DESC
-			LIMIT $1
-		`, limit)
+			LIMIT $2
+		`, enums.KnowledgeTypeBlockMemory, limit)
 	if err != nil {
 		return nil, err
 	}

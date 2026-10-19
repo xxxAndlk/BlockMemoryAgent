@@ -10,6 +10,7 @@ package userprofile
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -121,9 +122,46 @@ func (s *Store) MergeView(targets []string) MergeView {
 	return view
 }
 
+// ArchiveView 返回归档小节的自动行文本（只读视图，供 merge 模型做冲突判据：
+// 与归档行矛盾的新增量直接丢弃、现行行不得复活归档内容——2026-10-19 实证
+// "移除掉落物系统"进归档后"击杀掉落无保底"被重新写回现行小节的活矛盾）。
+func (s *Store) ArchiveView() []string {
+	doc := ParseDocument(s.Current().Content)
+	sec := findSection(doc, s.archiveSec)
+	if sec == nil {
+		return nil
+	}
+	out := make([]string, 0, len(sec.Auto))
+	for _, a := range sec.Auto {
+		out = append(out, a.Text)
+	}
+	return out
+}
+
+// StripSection 从全文渲染中剔除指定小节（注入侧用：归档小节只做审计、不进上下文，
+// 避免已废止的历史行占注入配额并误导模型——与"经验归档/反馈记录"同款语义）。
+func StripSection(content, title string) string {
+	if strings.TrimSpace(title) == "" {
+		return content
+	}
+	doc := ParseDocument(content)
+	kept := make([]*DocSection, 0, len(doc.Sections))
+	for _, sec := range doc.Sections {
+		if sec.Title != title {
+			kept = append(kept, sec)
+		}
+	}
+	if len(kept) == len(doc.Sections) {
+		return content
+	}
+	doc.Sections = kept
+	return RenderDocument(doc)
+}
+
 // ApplyMerge 应用一次合并计划：重写目标小节的自动行、归档旧行（保留最近 archiveCap 条）。
 // 人工行（含其他小节）逐字节不动；归档小节是唯一允许增长的额外小节。
 // 计划中出现的未知小节名被忽略（模型越界输出不落盘）。
+// 小节行数硬上限 maxAutoLinesPerSection：超出按时间戳最旧优先移入归档（注入面有界）。
 func (s *Store) ApplyMerge(plan MergePlan, targets []string) error {
 	if len(plan.Merged) == 0 && len(plan.Archived) == 0 {
 		return nil
@@ -151,6 +189,7 @@ func (s *Store) ApplyMerge(plan MergePlan, targets []string) error {
 	}
 
 	// 重写目标小节自动行；目标小节缺失但计划有内容时补建到文档末尾。
+	var overflow []AutoLine // 超硬上限被移入归档的行（时间戳最旧优先，可审计）。
 	for _, sec := range doc.Sections {
 		if !targetSet[sec.Title] {
 			continue
@@ -160,6 +199,27 @@ func (s *Store) ApplyMerge(plan MergePlan, targets []string) error {
 			continue
 		}
 		sec.Auto = stampLines(merged, oldStamps, now)
+		if len(sec.Auto) > maxAutoLinesPerSection {
+			// 按时间戳升序淘汰最旧行（模型输出的行序不保证新旧，以时间戳为准）。
+			order := make([]int, len(sec.Auto))
+			for i := range order {
+				order[i] = i
+			}
+			sort.SliceStable(order, func(a, b int) bool { return sec.Auto[order[a]].Stamp < sec.Auto[order[b]].Stamp })
+			drop := map[int]bool{}
+			for _, idx := range order[:len(sec.Auto)-maxAutoLinesPerSection] {
+				drop[idx] = true
+			}
+			kept := sec.Auto[:0]
+			for i, a := range sec.Auto {
+				if drop[i] {
+					overflow = append(overflow, a)
+				} else {
+					kept = append(kept, a)
+				}
+			}
+			sec.Auto = kept
+		}
 	}
 	for _, t := range targets {
 		merged, ok := plan.Merged[t]
@@ -172,8 +232,10 @@ func (s *Store) ApplyMerge(plan MergePlan, targets []string) error {
 	}
 
 	// 归档：archived 文本匹配旧时间戳则保留原时间戳，否则当前时间。
-	if len(plan.Archived) > 0 {
+	// 超硬上限的 overflow 行（已带原时间戳）一并移入归档，淘汰不丢审计线索。
+	if len(plan.Archived) > 0 || len(overflow) > 0 {
 		arc := findOrCreateSection(&doc, s.archiveSec)
+		arc.Auto = append(arc.Auto, overflow...)
 		for _, text := range plan.Archived {
 			stamp := now
 			if old, ok := oldStamps[strings.TrimSpace(text)]; ok && old != "" {

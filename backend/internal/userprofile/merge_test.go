@@ -200,3 +200,49 @@ func TestMerge_EmptyPlanNoop(t *testing.T) {
 		t.Fatalf("empty plan should be noop, got: %s", s.Current().Content)
 	}
 }
+
+// TestMerge_SectionLineCap 目标小节行数硬上限（2026-10-19）：merged 超 30 行时按
+// 时间戳最旧优先移入归档小节（注入面有界），现行小节保持上限内。
+func TestMerge_SectionLineCap(t *testing.T) {
+	var merged []string
+	for i := range maxAutoLinesPerSection + 5 {
+		merged = append(merged, fmt.Sprintf("经验行%d", i))
+	}
+	s := newLoadedStore(t, "# 用户画像\n\n## 偏好\n- x（2026-01-01 10:00）\n")
+	plan := MergePlan{Merged: map[string][]string{"偏好": merged}}
+	if err := s.ApplyMerge(plan, []string{"偏好"}); err != nil {
+		t.Fatalf("ApplyMerge: %v", err)
+	}
+	got := s.Current().Content
+	doc := ParseDocument(got)
+	sec := findSection(doc, "偏好")
+	if sec == nil || len(sec.Auto) != maxAutoLinesPerSection {
+		t.Fatalf("section should be capped at %d auto lines: %v", maxAutoLinesPerSection, sec)
+	}
+	// 溢出 5 行进归档（带时间戳，可审计）。
+	arc := findSection(doc, DefaultArchiveSection)
+	if arc == nil || len(arc.Auto) != 5 {
+		t.Fatalf("overflow lines should move to archive: %v", arc)
+	}
+}
+
+// TestArchiveView_AndStripSection 归档视图（merge 冲突判据输入）与注入侧剥离：
+// StripSection 剔除归档小节，其余内容逐字保留。
+func TestArchiveView_AndStripSection(t *testing.T) {
+	s := newLoadedStore(t, "# 用户画像\n\n## 偏好\n- 现行行（2026-01-01 10:00）\n\n## 反馈记录\n- 已废止的旧行（2026-01-01 09:00）\n")
+	arch := s.ArchiveView()
+	if len(arch) != 1 || arch[0] != "已废止的旧行" {
+		t.Fatalf("ArchiveView wrong: %v", arch)
+	}
+	stripped := StripSection(s.Current().Content, DefaultArchiveSection)
+	if strings.Contains(stripped, "已废止的旧行") || !strings.Contains(stripped, "现行行") {
+		t.Fatalf("StripSection wrong: %s", stripped)
+	}
+	if strings.Contains(stripped, "## 反馈记录") {
+		t.Fatalf("archive section header should be stripped: %s", stripped)
+	}
+	// 目标小节不存在时原样返回。
+	if orig := s.Current().Content; StripSection(orig, "不存在的小节") != orig {
+		t.Fatalf("StripSection should return content unchanged when section absent")
+	}
+}

@@ -117,7 +117,7 @@ agent:
   # MetaAgent 对所有领域产出做整品验收，不过则返工领域。均走提示词纪律，无独立验证 Agent。
   # A/B 实证自动验证闭环是负资产（开 5/16 + 558 万 token vs 关 16/16 + 284 万 token），
   # 业务级测试（computer-use 点击页面 / CLI 跑命令断言）移至 doc/扩展设计_Agent工作流平台.md §12 作后期扩展。
-  block_memory_write_enabled: true   # 子 Agent 完成后沉淀结果摘要到块记忆知识库
+  block_memory_write_enabled: false  # 子 Agent 完成后沉淀结果摘要到块记忆知识库。2026-10-19 永久关停：实证"否决方案半成品入库→33h/1005次请求持续复注"，块记忆与用户画像/项目经验职责重复且无可信治理，存量已物理删除；重启生效
   block_memory_facts_max: 5          # 单次子 Agent 输出提取的关键事实条数上限（默认 5）：事实逐条向量化落库，多则召回粒度细但噪声大
 
   # -- 强制门（spec 强制默认开启：塔防实证 WriteSpec 有用；Pipeline 重构后由 PlanStage 替代）--

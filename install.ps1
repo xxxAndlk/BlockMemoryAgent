@@ -1,4 +1,4 @@
-﻿# BMA 安装脚本:复制 dist/ 到安装目录并写入 BMA_HOME 用户环境变量。幂等,可重复运行(升级)。
+# BMA 安装脚本:复制 dist/ 到安装目录并写入 BMA_HOME 用户环境变量。幂等,可重复运行(升级)。
 # TODO #18-1 T28 装机向导段:交互补填 LLM Key、自动生成 BMA_API_TOKEN、安装后能力探活。
 $ErrorActionPreference = "Stop"
 $default = "D:\WebApp\bma"
@@ -11,12 +11,17 @@ New-Item -ItemType Directory -Force -Path $target, "$target\bin", "$target\confi
 # 二进制与前端资源:覆盖(升级)
 Copy-Item -Force "$src\bin\*" "$target\bin\"
 if (Test-Path "$src\web\dist") { New-Item -ItemType Directory -Force -Path "$target\web" | Out-Null; if (Test-Path "$target\web\dist") { Remove-Item -Recurse -Force "$target\web\dist" }; Copy-Item -Force -Recurse "$src\web\dist" "$target\web\" }
-# 配置:config/ 下全部文件每次直接覆盖(roles.yaml/models.json/plugins.yaml/skills.yaml 等
-# 与二进制配套,旧版会缺新工具/新字段)。.env 不在此目录,仍只补缺不覆盖,保留现场密钥。
+# 配置:分两类处理——
+# ① 本机个性化/运行时文件(models.json 模型接入配置、user_profile.md 用户画像、soul.md 人格)：
+#    只补缺不覆盖(.env 同款语义),保留现场——每次升级都被重置很不方便,且画像是会话运行时的沉淀宿主。
+# ② 与二进制配套的工程配置(roles.yaml/plugins.yaml/skills.yaml/config.yaml 等)：仍覆盖,
+#    旧版会缺新工具/新字段。
 # skills_learned 例外:运行时产物(自进化技能),保留安装目录现场数据,不覆盖。
+$preserveFiles = @("models.json", "user_profile.md", "soul.md")
 foreach ($f in Get-ChildItem "$src\config") {
     if ($f.Name -eq "skills_learned") { continue }
     $dst = Join-Path "$target\config" $f.Name
+    if ($preserveFiles -contains $f.Name -and (Test-Path $dst)) { continue }
     Copy-Item -Force $f.FullName $dst
 }
 if (-not (Test-Path "$target\.env") -and (Test-Path "$PSScriptRoot\.env.example")) { Copy-Item "$PSScriptRoot\.env.example" "$target\.env" }

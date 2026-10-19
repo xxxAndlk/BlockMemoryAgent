@@ -24,9 +24,10 @@ import (
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
 
-// PrefMerger 偏好合并回调：读当前自动行视图 + 增量，产出合并计划。
-// 由 bootstrap 注入轻量模型实现；nil 时调用方降级直写归档小节。
-type PrefMerger func(ctx context.Context, view userprofile.MergeView, increments []string) (userprofile.MergePlan, error)
+// PrefMerger 偏好合并回调：读当前自动行视图 + 归档视图（只读冲突判据）+ 否决清单
+// （作废判据）+ 增量，产出合并计划。由 bootstrap 注入轻量模型实现；nil 时调用方降级
+// 直写归档小节。
+type PrefMerger func(ctx context.Context, view userprofile.MergeView, archive, rejected, increments []string) (userprofile.MergePlan, error)
 
 // EvolveInput SessionEvolver 输入（设计 §6.1）：goal + 总结 + 事件流摘要 + 用户消息。
 type EvolveInput struct {
@@ -65,6 +66,7 @@ type EvolvedSkill struct {
 type EvolveOutput struct {
 	UserPrefs      []string // ① 用户偏好增量（全局 user_profile.md，Merge 整理）
 	ProjectLessons []string // ② 项目经验增量（per workDir project_preferences.md ## 项目经验）
+	Rejected       []string // ②b 本会话被用户否决/作废的方案或约定（作废判据，Merge 时撤回矛盾旧行）
 	Skills         []EvolvedSkill // ③ 技能包 0-2 个（全局技能库）
 }
 
@@ -200,7 +202,7 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 	agentName := "SessionEvolver"
 	// ① 用户偏好增量：Merge 整理进画像 + evolution_log。
 	if prefs := cleanIncrements(out.UserPrefs); len(prefs) > 0 && s.userProfile != nil {
-		s.mergeIntoStore(session.ID, agentName, s.userProfile, userProfileTargets, prefs)
+		s.mergeIntoStore(session.ID, agentName, s.userProfile, userProfileTargets, prefs, out.Rejected)
 		s.logEvolution(session.ID, "user_pref", "用户画像", strings.Join(prefs, "；"))
 	}
 	// ② 项目经验增量：Merge 整理进项目偏好 + evolution_log。
@@ -208,7 +210,7 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 	// ForContext 返回 nil（目录不可解析）时既未写入也不应记 project_lesson 审计流水。
 	if lessons := cleanIncrements(out.ProjectLessons); len(lessons) > 0 && s.projectPrefs != nil {
 		if st := s.projectPrefs.ForContext(tool.WithWorkDir(ctx, session.currentWorkDir())); st != nil {
-			s.mergeIntoStore(session.ID, agentName, st, projectPrefsTargets, lessons)
+			s.mergeIntoStore(session.ID, agentName, st, projectPrefsTargets, lessons, out.Rejected)
 			s.logEvolution(session.ID, "project_lesson", "项目经验", strings.Join(lessons, "；"))
 		}
 	}
@@ -337,10 +339,12 @@ var userProfileTargets = []string{"偏好", "技术栈", "沟通风格"}
 var projectPrefsTargets = []string{"项目经验"}
 
 // mergeIntoStore 把偏好增量合并进目标 store（用户画像或项目偏好）：
-// 1) prefMerger 可用 → 轻量模型产出 MergePlan → ApplyMerge（人工行保护在 store 侧）；
-// 2) 合并调用失败/计划为空 → 降级直写归档小节（v1 行为，零信息丢失）。
+// 1) prefMerger 可用 → 轻量模型产出 MergePlan（输入含归档视图=只读冲突判据、rejected=
+//    本会话否决清单=作废判据）→ ApplyMerge（人工行保护在 store 侧）；
+// 2) 合并调用失败/计划为空 → 降级直写归档小节（v1 行为，零信息丢失；对归档已有文本
+//    去重，防降级路径重复堆积——实证画像归档同一行被原样追加 3 次）。
 // 目标小节维持 store 当前结构；计划为空且增量为空时零副作用。
-func (s *ReactService) mergeIntoStore(sessionID, agentName string, store *userprofile.Store, targets []string, increments []string) {
+func (s *ReactService) mergeIntoStore(sessionID, agentName string, store *userprofile.Store, targets []string, increments, rejected []string) {
 	if store == nil || len(increments) == 0 {
 		return
 	}
@@ -348,7 +352,7 @@ func (s *ReactService) mergeIntoStore(sessionID, agentName string, store *userpr
 		ctx, cancel := context.WithTimeout(
 			logger.NewContext(context.Background(), s.sessionLogger(sessionID, agentName)),
 			profileMergeTimeout)
-		plan, err := s.prefMerger(ctx, store.MergeView(targets), increments)
+		plan, err := s.prefMerger(ctx, store.MergeView(targets), store.ArchiveView(), rejected, increments)
 		cancel()
 		if err == nil {
 			if err := store.ApplyMerge(plan, targets); err == nil {
@@ -359,7 +363,16 @@ func (s *ReactService) mergeIntoStore(sessionID, agentName string, store *userpr
 			log.Printf("[evolver] merge llm failed, degrade to append: err=%v", err)
 		}
 	}
+	seen := map[string]bool{}
+	for _, a := range store.ArchiveView() {
+		seen[strings.TrimSpace(a)] = true
+	}
 	for _, inc := range increments {
+		t := strings.TrimSpace(inc)
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
 		if err := store.Append(store.ArchiveSection(), inc); err != nil {
 			log.Printf("[evolver] append increment to archive failed: err=%v", err)
 		}
