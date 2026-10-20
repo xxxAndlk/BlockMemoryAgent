@@ -1661,7 +1661,7 @@ func (d *Dispatcher) projectPrefsPrefix(ctx context.Context) string {
 	if len([]rune(content)) > projectPrefsRunes {
 		content = string([]rune(content)[:projectPrefsRunes]) + "\n...（项目偏好截断）"
 	}
-	return "【项目偏好】\n" + content + "\n（以上是本项目的约定与经验，执行任务时遵守）"
+	return "【项目偏好】\n" + content + "\n（以上是本项目的约定与经验。与用户当前指示/任务书冲突时以最新指示为准——经验可能滞后于最新决策，不是铁律）"
 }
 
 // WithSkillPool 注入全局技能池（技能渐进披露 + 树形分发）。传 nil 时技能参数、

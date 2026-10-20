@@ -814,7 +814,9 @@ func (s *ReactService) metaPersona(workDir string) PersonaInjector {
 	return CombinePersonaInjectors(
 		s.persona,
 		NewUserProfileInjector(userCurrent, 2000),
-		NewSectionInjector("【项目偏好】", projCurrent, 2000),
+		// 注入口径（2026-10-19）：经验行可能滞后于最新决策，header 内声明"冲突以用户
+		// 当前指示为准"——旧经验保留参考权重但不压过用户最新指示。
+		NewSectionInjector("【项目偏好】（约定与经验；与用户当前指示冲突时以最新指示为准）", projCurrent, 2000),
 	)
 }
 

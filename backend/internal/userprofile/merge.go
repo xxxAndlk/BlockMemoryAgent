@@ -189,6 +189,16 @@ func (s *Store) ApplyMerge(plan MergePlan, targets []string) error {
 	}
 
 	// 重写目标小节自动行；目标小节缺失但计划有内容时补建到文档末尾。
+	// 防复活（2026-10-19 实证）：merged 中与归档小节现有行同文本的行直接丢弃
+	//（历史已废止内容不得借合并复活进现行小节；语义近重复仍靠 merge 模型自律）。
+	archiveTexts := map[string]bool{}
+	for _, sec := range doc.Sections {
+		if sec.Title == s.archiveSec {
+			for _, a := range sec.Auto {
+				archiveTexts[a.Text] = true
+			}
+		}
+	}
 	var overflow []AutoLine // 超硬上限被移入归档的行（时间戳最旧优先，可审计）。
 	for _, sec := range doc.Sections {
 		if !targetSet[sec.Title] {
@@ -197,6 +207,15 @@ func (s *Store) ApplyMerge(plan MergePlan, targets []string) error {
 		merged, ok := plan.Merged[sec.Title]
 		if !ok {
 			continue
+		}
+		if len(archiveTexts) > 0 {
+			kept := merged[:0]
+			for _, m := range merged {
+				if !archiveTexts[strings.TrimSpace(m)] {
+					kept = append(kept, m)
+				}
+			}
+			merged = kept
 		}
 		sec.Auto = stampLines(merged, oldStamps, now)
 		if len(sec.Auto) > maxAutoLinesPerSection {
@@ -227,21 +246,63 @@ func (s *Store) ApplyMerge(plan MergePlan, targets []string) error {
 			continue
 		}
 		if findSection(doc, t) == nil {
+			if len(archiveTexts) > 0 {
+				kept := merged[:0]
+				for _, m := range merged {
+					if !archiveTexts[strings.TrimSpace(m)] {
+						kept = append(kept, m)
+					}
+				}
+				merged = kept
+			}
+			if len(merged) == 0 {
+				continue
+			}
 			doc.Sections = append(doc.Sections, &DocSection{Title: t, Auto: stampLines(merged, oldStamps, now)})
 		}
 	}
 
 	// 归档：archived 文本匹配旧时间戳则保留原时间戳，否则当前时间。
-	// 超硬上限的 overflow 行（已带原时间戳）一并移入归档，淘汰不丢审计线索。
+	// 去重（2026-10-19 实证：同文本被反复归档 4 次——rejected 多次命中/模型重复输出
+	// 而 append 无去重）：与现有归档行同文本的直接跳过。
 	if len(plan.Archived) > 0 || len(overflow) > 0 {
 		arc := findOrCreateSection(&doc, s.archiveSec)
 		arc.Auto = append(arc.Auto, overflow...)
+		existing := map[string]bool{}
+		for _, a := range arc.Auto {
+			existing[a.Text] = true
+		}
 		for _, text := range plan.Archived {
+			text = strings.TrimSpace(text)
+			if text == "" || existing[text] {
+				continue
+			}
+			existing[text] = true
 			stamp := now
-			if old, ok := oldStamps[strings.TrimSpace(text)]; ok && old != "" {
+			if old, ok := oldStamps[text]; ok && old != "" {
 				stamp = old
 			}
-			arc.Auto = append(arc.Auto, AutoLine{Text: strings.TrimSpace(text), Stamp: stamp})
+			arc.Auto = append(arc.Auto, AutoLine{Text: text, Stamp: stamp})
+		}
+	}
+
+	// 归档小节整体按文本去重（保留最后出现的时间戳）+ 封顶。独立运行（不依赖本次
+	// 是否有 archived 增量）——只要 ApplyMerge 被调用就顺带自愈历史脏数据。
+	if arc := findSection(doc, s.archiveSec); arc != nil {
+		if len(arc.Auto) > 1 {
+			seenText := map[string]bool{}
+			dedup := make([]AutoLine, 0, len(arc.Auto))
+			for i := len(arc.Auto) - 1; i >= 0; i-- {
+				if seenText[arc.Auto[i].Text] {
+					continue
+				}
+				seenText[arc.Auto[i].Text] = true
+				dedup = append(dedup, arc.Auto[i])
+			}
+			for i, j := 0, len(dedup)-1; i < j; i, j = i+1, j-1 {
+				dedup[i], dedup[j] = dedup[j], dedup[i]
+			}
+			arc.Auto = dedup
 		}
 		if len(arc.Auto) > s.archiveCap {
 			arc.Auto = arc.Auto[len(arc.Auto)-s.archiveCap:]

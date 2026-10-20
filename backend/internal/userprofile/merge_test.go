@@ -246,3 +246,52 @@ func TestArchiveView_AndStripSection(t *testing.T) {
 		t.Fatalf("StripSection should return content unchanged when section absent")
 	}
 }
+
+func TestMerge_ArchiveAppendDedupAndNoResurrect(t *testing.T) {
+	s := newLoadedStore(t, "# 用户画像\n\n## 偏好\n- 现行行（2026-01-01 10:00）\n\n## 反馈记录\n- 已废止旧行（2025-12-01 09:00）\n")
+	plan := MergePlan{
+		Merged:   map[string][]string{"偏好": {"现行行", "已废止旧行"}},
+		Archived: []string{"已废止旧行", "已废止旧行"},
+	}
+	if err := s.ApplyMerge(plan, []string{"偏好"}); err != nil {
+		t.Fatalf("ApplyMerge: %v", err)
+	}
+	doc := ParseDocument(s.Current().Content)
+	if pref := findSection(doc, "偏好"); pref != nil {
+		for _, a := range pref.Auto {
+			if a.Text == "已废止旧行" {
+				t.Fatalf("archived line resurrected into live section: %s", s.Current().Content)
+			}
+		}
+	}
+	arc := findSection(doc, "反馈记录")
+	n := 0
+	for _, a := range arc.Auto {
+		if a.Text == "已废止旧行" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("archive append dedup failed, got %d copies: %s", n, s.Current().Content)
+	}
+}
+
+func TestMerge_ArchiveSelfHealExistingDups(t *testing.T) {
+	// 历史脏数据：归档小节同文本多条；任意后续 merge 都应顺带自愈。
+	s := newLoadedStore(t, "# 用户画像\n\n## 偏好\n- 现行行（2026-01-01 10:00）\n\n## 反馈记录\n- 重复旧行（2025-12-01 09:00）\n- 重复旧行（2025-12-01 09:00）\n- 另一条（2025-12-02 09:00）\n")
+	plan := MergePlan{Merged: map[string][]string{"偏好": {"现行行", "新增行"}}}
+	if err := s.ApplyMerge(plan, []string{"偏好"}); err != nil {
+		t.Fatalf("ApplyMerge: %v", err)
+	}
+	doc := ParseDocument(s.Current().Content)
+	arc := findSection(doc, "反馈记录")
+	n := 0
+	for _, a := range arc.Auto {
+		if a.Text == "重复旧行" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("archive self-heal failed, %d copies remain: %s", n, s.Current().Content)
+	}
+}
