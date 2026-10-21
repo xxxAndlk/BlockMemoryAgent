@@ -1172,6 +1172,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 		wd = d.subAgentWorkDir()
 	}
 	sub := agent.NewReActAgent(s.id, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, s.id, d.effectiveToolAllowlist(s.id, roleDef), roleDef.ID, d.pluginVisibility)).
+		WithSubAgent().
 		WithProviderFunc(providerFn).
 		WithMailbox(d.mailbox).
 		WithMemory(mem).

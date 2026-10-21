@@ -1185,6 +1185,7 @@ func readCallMsg(i int) *blades.Message {
 // TestReActAgent_StagnationGuard_HardKill 连续 30 轮只读探查（无产出性工具/无 mailbox
 // 新消息/无终答）触发停滞守卫 ErrLoopExit 硬杀；第 10/20 轮已注入递进预警。
 // 覆盖既有守卫够不着的语义死循环（重复探针/完美主义不收口，2026-08-28 两小时撞墙实证）。
+// 守卫 2026-10-20 起仅子 Agent 启用：本测试经 WithSubAgent 标记子 Agent 身份。
 func TestReActAgent_StagnationGuard_HardKill(t *testing.T) {
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	responses := make([]*blades.Message, 0, stagnationExitRounds)
@@ -1192,7 +1193,7 @@ func TestReActAgent_StagnationGuard_HardKill(t *testing.T) {
 		responses = append(responses, readCallMsg(i))
 	}
 	llm := &mockModelProvider{responses: responses}
-	a := NewReActAgent("test", types.RoleDefinition{ID: "domain", SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg))
+	a := NewReActAgent("test", types.RoleDefinition{ID: "domain", SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg)).WithSubAgent()
 	res, err := a.Run(context.Background(), "probe")
 	if err == nil || !errors.Is(err, tool.ErrLoopExit) {
 		t.Fatalf("expected ErrLoopExit after %d unproductive rounds, got %v", stagnationExitRounds, err)
@@ -1225,7 +1226,7 @@ func TestReActAgent_StagnationGuard_ProductiveResets(t *testing.T) {
 	responses = append(responses, readCallMsg(5), readCallMsg(6), readCallMsg(7), readCallMsg(8), readCallMsg(9))
 	responses = append(responses, blades.AssistantMessage("done"))
 	llm := &mockModelProvider{responses: responses}
-	a := NewReActAgent("test", types.RoleDefinition{ID: "domain", SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg))
+	a := NewReActAgent("test", types.RoleDefinition{ID: "domain", SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg)).WithSubAgent()
 	res, err := a.Run(context.Background(), "task")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1240,22 +1241,32 @@ func TestReActAgent_StagnationGuard_ProductiveResets(t *testing.T) {
 	}
 }
 
-// TestReActAgent_StagnationGuard_MetaExempt MetaAgent 豁免硬杀（ErrLoopExit 会终止整个
-// 会话）：连续 30 轮无产出仅收预警，耗尽后默认终答正常返回。
-func TestReActAgent_StagnationGuard_MetaExempt(t *testing.T) {
+// TestReActAgent_StagnationGuard_TopLevelExempt 顶层 Agent 整体豁免停滞守卫（2026-10-20
+// 起：守卫仅子 Agent 启用）。meta 与 domain 直跑等顶层角色连续 30 轮无产出：不硬杀、
+// 也不注入预警（预警以 user 角色消息污染历史，且对弱模型无效——moyingshanhai 一日
+// 5 次强停、预警均被无视实证）。硬杀 ErrLoopExit 会连坐整个会话，误杀代价不可承受；
+// 子 Agent 则由 dispatcher 打捞回灌、父 Agent 可重派，杀伤可承受（见 stagnationGuard）。
+func TestReActAgent_StagnationGuard_TopLevelExempt(t *testing.T) {
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
-	responses := make([]*blades.Message, 0, stagnationExitRounds)
-	for i := 0; i < stagnationExitRounds; i++ {
-		responses = append(responses, readCallMsg(i))
-	}
-	llm := &mockModelProvider{responses: responses} // 耗尽后默认返回 "done" 终答
-	a := NewReActAgent("meta", types.RoleDefinition{ID: "meta", SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg))
-	res, err := a.Run(context.Background(), "task")
-	if err != nil {
-		t.Fatalf("meta must be exempt from stagnation kill, got %v", err)
-	}
-	if res.Text != "done" {
-		t.Fatalf("expected final answer after exemption, got %q", res.Text)
+	for _, roleID := range []string{"meta", "domain"} {
+		responses := make([]*blades.Message, 0, stagnationExitRounds)
+		for i := 0; i < stagnationExitRounds; i++ {
+			responses = append(responses, readCallMsg(i))
+		}
+		llm := &mockModelProvider{responses: responses} // 耗尽后默认返回 "done" 终答
+		a := NewReActAgent("top-"+roleID, types.RoleDefinition{ID: roleID, SystemPrompt: "x"}, llm, NewToolRegistryAdapter(reg))
+		res, err := a.Run(context.Background(), "task")
+		if err != nil {
+			t.Fatalf("top-level %s must be exempt from stagnation kill, got %v", roleID, err)
+		}
+		if res.Text != "done" {
+			t.Fatalf("expected final answer after exemption, got %q", res.Text)
+		}
+		for _, m := range res.History {
+			if strings.Contains(m.Content, "【停滞") {
+				t.Fatalf("top-level %s must not receive stagnation warnings, got %q", roleID, m.Content)
+			}
+		}
 	}
 }
 

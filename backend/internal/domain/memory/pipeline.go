@@ -778,7 +778,19 @@ func buildCompressedView(messages []agent.ReactMessage, st compressState) []agen
 		return messages
 	}
 
-	out := make([]agent.ReactMessage, 0, keep+3+(len(messages)-st.TailStart))
+	// 当前指令锚定（2026-10-20 事故修复）：压缩视图里"最后一条 user 消息"若已随
+	// 保留段滑出（keepRecent 窗口被本轮工作消息/尾部注入挤占），视图对用户指令
+	// 零可见——模型只能拿最老压缩包/首条 user 锚定块当任务，实测整轮答非所问
+	// （"完全可做"回答的是会话第一条提问）。把保留段起点回拉到最后一条真实用户
+	// 指令，使其原样出现在视图尾部。前缀（本函数前半段）不含回拉段，字节稳定、
+	// 前缀缓存不受影响；新一轮用户消息落在冻结 TailStart 之后时本回拉自动退化为
+	// 无操作，也不影响缓存。
+	tailStart := st.TailStart
+	if idx := lastTaskUserIdx(messages); idx > firstUserIdx && idx < tailStart {
+		tailStart = idx
+	}
+
+	out := make([]agent.ReactMessage, 0, keep+3+(len(messages)-tailStart))
 	out = append(out, messages[:keep]...)
 	out = append(out, messages[firstUserIdx]) // 首条 user 任务目标
 	out = append(out, agent.ReactMessage{Role: "system", Content: renderBundles(st.Bundles)})
@@ -787,6 +799,23 @@ func buildCompressedView(messages []agent.ReactMessage, st compressState) []agen
 	if st.HotReinject != "" {
 		out = append(out, agent.ReactMessage{Role: "system", Content: st.HotReinject})
 	}
-	out = append(out, messages[st.TailStart:]...)
+	out = append(out, messages[tailStart:]...)
 	return out
+}
+
+// lastTaskUserIdx 返回最后一条承载用户指令的 user 消息下标，找不到返回 -1。
+// 跳过 user 角色的系统注入（【停滞预警】/【停滞最终警告】，见 react_agent.go
+// stagnationGuard）——它们是看门狗消息，不是任务文本，锚错会让真实指令继续被压掉。
+func lastTaskUserIdx(messages []agent.ReactMessage) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		if strings.HasPrefix(messages[i].Content, "【停滞预警】") ||
+			strings.HasPrefix(messages[i].Content, "【停滞最终警告】") {
+			continue
+		}
+		return i
+	}
+	return -1
 }

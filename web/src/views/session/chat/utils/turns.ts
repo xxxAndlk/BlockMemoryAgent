@@ -205,6 +205,8 @@ const TERMINAL_SYSTEM_MESSAGES = [
   '已暂停', // pauseMessage（token/轮数触顶）
   '会话暂停',
   '任务已停止', // 软停止（可续跑）
+  '停止主 Agent', // 「只停主 Agent」停放：StopMetaOnly 立即事件 + PauseMetaOnlyPark 落态文案
+  '已停止全部子任务', // 全停（非热驻）的软停止事件
   '会话已被用户取消', // 硬取消：用户点"终止"
   '已强制终止', // 会话超全局时限
   '任务已销毁', // 软停止倒计时到期

@@ -4810,6 +4810,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		mem = uptake
 	}
 	sub := agent.NewReActAgent(subAgentID, roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, subAgentID, d.effectiveToolAllowlist(subAgentID, &roleDef), roleDef.ID, d.pluginVisibility)).
+		WithSubAgent().
 		WithProviderFunc(func(callCtx context.Context) (agent.ModelProvider, error) {
 			return d.providerForAgent(callCtx, roleDef.ID, subAgentID)
 		}).
@@ -5448,6 +5449,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	}
 	// 不注入编排者人格（理由同 runSubAgentOnce：身份混淆实证）。
 	sub := agent.NewReActAgent(pausedNodeID, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, pausedNodeID, d.effectiveToolAllowlist(pausedNodeID, roleDef), roleDef.ID, d.pluginVisibility)).
+		WithSubAgent().
 		WithProviderFunc(func(callCtx context.Context) (agent.ModelProvider, error) {
 			return d.providerForAgent(callCtx, roleDef.ID, pausedNodeID)
 		}).

@@ -525,3 +525,136 @@ func TestPipeline_SummarizeMemo(t *testing.T) {
 		t.Fatalf("new events must re-call summarizer, got %d calls", calls)
 	}
 }
+
+// TestBuildCompressedView_AnchorLastUserInstruction 回归 2026-10-20 "答非所问"事故：
+// moyingshanhai 会话第 16 轮，压缩触发点 keepRecent=10 的窗口被本轮工作消息+
+// 尾部注入（近期事件/文件地图/当前时间）挤占，本轮用户指令恰好滑出保留段 1 条——
+// 压缩视图里最后一条 user 消息退化成首条注入块（【相关经验】），模型对当前任务
+// 零可见，终答拿最老压缩包（会话开头的可行性讨论）当任务，整轮牛头不对马嘴。
+// 期望：保留段起点回拉到本轮用户指令，该指令原样出现在视图尾部。
+func TestBuildCompressedView_AnchorLastUserInstruction(t *testing.T) {
+	// 复刻事故结构：[0] 注入块(user) → 前史工作消息 → 本轮 user 指令 →
+	// 尾部注入三连(system) → 本轮工具调用/结果。冻结 TailStart 恰好在指令之后。
+	messages := []agent.ReactMessage{
+		{Role: "user", Content: "【相关经验】以下经验技能与当前任务相关"},
+	}
+	for i := 0; i < 12; i++ { // 前史（上一个压缩周期已覆盖，此处仅占位）
+		messages = append(messages, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("prev %d", i)})
+	}
+	messages = append(messages, agent.ReactMessage{Role: "user", Content: "首页不需要塔与术两个展开按钮，只有在进入游戏才出现"})
+	messages = append(messages,
+		agent.ReactMessage{Role: "system", Content: "【近期事件】"},
+		agent.ReactMessage{Role: "system", Content: "【本任务文件地图】"},
+		agent.ReactMessage{Role: "system", Content: "【当前时间】"},
+	)
+	toolStart := len(messages)
+	for i := 0; i < 5; i++ { // 本轮工具调用与结果
+		messages = append(messages,
+			agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("[tool_call] %d", i), ToolCalls: []agent.ToolCall{{ID: fmt.Sprintf("c%d", i)}}},
+			agent.ReactMessage{Role: "tool", Content: fmt.Sprintf("tool result %d", i)},
+		)
+	}
+	// 冻结状态：TailStart 在本轮第一条工具消息处——模拟"指令恰好被挤出保留段"。
+	st := compressState{TailStart: toolStart, Bundles: []string{"第 1 段旧摘要", "第 2 段较新摘要"}}
+
+	out := buildCompressedView(messages, st)
+
+	// 1) 指令必须原样出现在视图里。
+	found := false
+	for _, m := range out {
+		if m.Role == "user" && strings.Contains(m.Content, "首页不需要塔与术两个展开按钮") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("current user instruction must survive in compressed view, got %d messages", len(out))
+	}
+	// 2) 视图尾部最后一条 user 消息就是本轮指令（不是注入块/停滞预警）。
+	lastUser := ""
+	for _, m := range out {
+		if m.Role == "user" {
+			lastUser = m.Content
+		}
+	}
+	if !strings.Contains(lastUser, "首页不需要") {
+		t.Fatalf("last user message in view must be the current instruction, got %q", lastUser)
+	}
+	// 3) 前缀稳定性：视图前部（system 前缀+首条 user+摘要）不受回拉影响。
+	if out[0].Content != "【相关经验】以下经验技能与当前任务相关" {
+		t.Fatalf("first user anchor changed: %q", out[0].Content)
+	}
+}
+
+// TestBuildCompressedView_AnchorSkipsStagnationWarning 验证指令锚定跳过看门狗注入：
+// 【停滞预警】/【停滞最终警告】是 user 角色的系统消息，不是任务文本；
+// 若锚到它，真实指令（在其之前）会继续被压在压缩包里不可见。
+func TestBuildCompressedView_AnchorSkipsStagnationWarning(t *testing.T) {
+	messages := []agent.ReactMessage{
+		{Role: "user", Content: "【相关经验】经验块"},
+	}
+	for i := 0; i < 8; i++ {
+		messages = append(messages, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("prev %d", i)})
+	}
+	instrIdx := len(messages)
+	messages = append(messages, agent.ReactMessage{Role: "user", Content: "把游戏打开"})
+	for i := 0; i < 6; i++ {
+		messages = append(messages, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("[tool_call] %d", i), ToolCalls: []agent.ToolCall{{ID: fmt.Sprintf("c%d", i)}}})
+		messages = append(messages, agent.ReactMessage{Role: "tool", Content: fmt.Sprintf("result %d", i)})
+	}
+	// 停滞预警在本轮最后（看门狗后无新用户消息）。
+	messages = append(messages, agent.ReactMessage{Role: "user", Content: "【停滞预警】已连续 10 轮没有任何产出性动作"})
+
+	st := compressState{TailStart: instrIdx + 6, Bundles: []string{"旧摘要"}}
+	out := buildCompressedView(messages, st)
+
+	// 真实指令必须出现在视图里（跳过停滞预警回拉到"把游戏打开"）。
+	found := false
+	for _, m := range out {
+		if m.Role == "user" && strings.Contains(m.Content, "把游戏打开") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("instruction before stagnation warning must be anchored into view")
+	}
+}
+
+// TestBuildCompressedView_AnchorNoRegressionWhenInstructionInTail 验证常规路径不回退：
+// 本轮指令已处于冻结保留段内（idx >= TailStart）、或新指令落在 TailStart 之后时，
+// 回拉不触发，视图结构 = keep + 首条 user + 摘要 + messages[TailStart:]（前缀缓存零影响）。
+func TestBuildCompressedView_AnchorNoRegressionWhenInstructionInTail(t *testing.T) {
+	messages := []agent.ReactMessage{
+		{Role: "user", Content: "【相关经验】经验块"},
+		{Role: "user", Content: "本轮任务"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "tool", Content: "t1"},
+		{Role: "assistant", Content: "a2"},
+		{Role: "tool", Content: "t2"},
+	}
+	// 指令 messages[1] 已被回拉进视图（旧行为它会被压缩掉，新行为保留）：
+	// 视图 = keep(0) + 首条 user + 摘要 + messages[1:]。
+	st := compressState{TailStart: 2, Bundles: []string{"旧摘要"}}
+	out := buildCompressedView(messages, st)
+	if len(out) != 1+1+(len(messages)-1) {
+		t.Fatalf("unexpected view length %d", len(out))
+	}
+	if out[len(out)-1].Content != "t2" {
+		t.Fatalf("view tail must end with last message, got %q", out[len(out)-1].Content)
+	}
+	// 指令在保留段内（TailStart=1，指令 messages[1] 与保留段同起点）：
+	// idx < tailStart 不成立，不回拉，len = keep + 首条 user + 摘要 + messages[1:]。
+	st2 := compressState{TailStart: 1, Bundles: []string{"旧摘要"}}
+	out2 := buildCompressedView(messages, st2)
+	if len(out2) != 1+1+(len(messages)-1) {
+		t.Fatalf("instruction at tail start must not change view, got %d", len(out2))
+	}
+	// 新 user 消息落在冻结 TailStart 之后：不回拉，视图只随尾部追加变长。
+	messages2 := append(append([]agent.ReactMessage{}, messages...),
+		agent.ReactMessage{Role: "assistant", Content: "a3"},
+		agent.ReactMessage{Role: "tool", Content: "t3"},
+		agent.ReactMessage{Role: "user", Content: "第二轮指令"})
+	out3 := buildCompressedView(messages2, st2)
+	if len(out3) != 1+1+(len(messages2)-1) {
+		t.Fatalf("new instruction inside frozen tail must not extend it, got %d", len(out3))
+	}
+}

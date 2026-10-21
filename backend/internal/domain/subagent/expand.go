@@ -163,6 +163,7 @@ func (d *Dispatcher) runExpander(ctx context.Context, parentID, task string) (st
 	// 工具适配器白名单=有效白名单（roleDef.Tools 经派发级授权覆盖；展开器无授权=原样）。
 	adapter := agent.NewToolRegistryAdapterForRole(d.tools, subID, d.effectiveToolAllowlist(subID, &roleDef), roleDef.ID, nil)
 	sub := agent.NewReActAgent(subID, roleDef, provider, adapter).
+		WithSubAgent().
 		WithProviderFunc(func(callCtx context.Context) (agent.ModelProvider, error) {
 			return d.providerForAgent(callCtx, roleID, parentID)
 		}).

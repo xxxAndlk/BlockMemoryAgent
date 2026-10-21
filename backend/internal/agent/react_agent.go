@@ -168,6 +168,14 @@ type ReActAgent struct {
 	// 在 sysPromptOnce 内写入（单 goroutine，无竞争）——persona/env/role_base/discipline/skill
 	// 各分段规模。首轮 LLM 调用经 logPromptStats 以明细行输出，供提示词瘦身边际对照。
 	promptStatsSegs map[string]int
+	// subAgent 标记本实例是派发出去的子 Agent（dispatcher/expand/idle_pool 创建时
+	// 经 WithSubAgent 置 true）。仅子 Agent 启用停滞守卫（stagnationGuard）：
+	// 硬杀 ErrLoopExit 会连坐整个会话（顶层 Agent 被杀 = 本轮任务直接失败），而子 Agent
+	// 被杀后由 dispatcher 打捞回灌、父 Agent 可立即重派，杀伤可承受。顶层 Agent
+	// （meta/domain 直跑/doc_assistant）2026-10-20 起全量豁免——实测视觉打磨类任务
+	// 天然长只读验证期，30 轮硬杀对主 Agent 是误杀（moyingshanhai 一日 5 次强停实证），
+	// 预警注入对弱模型无效且以 user 角色消息污染历史。
+	subAgent bool
 }
 
 // PersonaInjector 把人格内容拼接到系统提示词之前；soul.Loader 实现该接口。
@@ -415,6 +423,15 @@ func (a *ReActAgent) WithPersonaInjector(p PersonaInjector) *ReActAgent {
 // 传 nil 关闭检查（默认关闭，仅 MetaAgent 注入）。
 func (a *ReActAgent) WithPausedChildChecker(p PausedChildChecker) *ReActAgent {
 	a.pausedChecker = p
+	return a
+}
+
+// WithSubAgent 标记本实例为派发出去的子 Agent（dispatcher/expand/idle_pool 创建点调用）。
+// 仅子 Agent 启用停滞守卫 stagnationGuard（10 轮预警/20 轮通牒/30 轮 ErrLoopExit 硬杀）；
+// 顶层 Agent（会话主 Agent）默认豁免——硬杀会连坐整个会话，而视觉验证类长只读期是
+// 主 Agent 的合法工作节奏（2026-10-20 主 Agent 误杀实证，见 stagnationGuard 注释）。
+func (a *ReActAgent) WithSubAgent() *ReActAgent {
+	a.subAgent = true
 	return a
 }
 
@@ -958,7 +975,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		history, drainedMbx = a.drainMailbox(history)
 
 		// 停滞守卫：本轮无产出性工具且无 mailbox 新消息则累加计数（有则清零），
-		// 连续无产出 10 轮注入预警、20 轮最终通牒、30 轮 ErrLoopExit 硬杀（meta 豁免硬杀）。
+		// 连续无产出 10 轮注入预警、20 轮最终通牒、30 轮 ErrLoopExit 硬杀。
+		// 仅子 Agent 启用（WithSubAgent）；顶层 Agent 整体跳过（硬杀会连坐会话，
+		// 见 stagnationGuard 注释）。
 		var stagnationErr error
 		history, unproductiveStreak, stagnationErr = a.stagnationGuard(unproductiveStreak, assistant.ToolCalls, drainedMbx, history)
 		if stagnationErr != nil {
@@ -973,12 +992,14 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 }
 
 // 停滞守卫阈值：连续 N 轮"无产出"（无产出性工具调用 ∧ 无 mailbox 新消息 ∧ 无终答）逐级响应。
-// 10 轮注入停滞预警、20 轮注入最终通牒、30 轮返回 ErrLoopExit 硬杀（meta 豁免，见 stagnationGuard）。
+// 10 轮注入停滞预警、20 轮注入最终通牒、30 轮返回 ErrLoopExit 硬杀。
 // 阈值 2026-09-15 由 6/12/24 放宽为 10/20/30：6 轮对合法长验证期（跑测试/逐条核对）催得过紧，
-// 模型被推着草率收口（补丁式绕过根因，文件反复报错反复改）。硬杀仍须先于 2h 子 Agent 墙钟
-// （sub_agent_timeout_min=120）：30 轮 × 单轮 2-5 分钟 ≈ 60-150 分钟，快模型远早于墙钟，慢模型
-// 最坏端贴墙钟——打捞回灌父 Agent 可立即重派的价值保留在多数场景（2026-08-28 渲染领域 Agent
-// 两小时纯读零产出撞墙事故即此守卫的由来）。
+// 模型被推着草率收口（补丁式绕过根因，文件反复报错反复改）。
+// 适用面 2026-10-20 收窄为仅子 Agent（WithSubAgent 标记）：硬杀会连坐整个会话，
+// 顶层 Agent 误杀代价不可承受（moyingshanhai 一日 5 次强停、每次靠用户手动"继续"重启），
+// 且硬杀须先于 2h 子 Agent 墙钟（sub_agent_timeout_min=120）才有打捞重派价值——
+// 该价值只对子 Agent 成立（2026-08-28 渲染领域 Agent 两小时纯读零产出撞墙事故
+// 即此守卫的由来，事发主体正是子 Agent）。
 const (
 	stagnationWarnRounds      = 10
 	stagnationFinalWarnRounds = 20
@@ -998,12 +1019,18 @@ var productiveToolNames = map[string]bool{
 	"browser_click": true, "browser_run_code_unsafe": true,
 }
 
-// stagnationGuard 无产出停滞守卫。覆盖既有守卫够不着的两类语义死循环：
-// 重复探针死循环（点击开始按钮 state 仍 idle 反复重试 19 分钟——连读同参×3 要求参数
-// 相同拦不住）与完美主义不收口（"还剩最后一处缺口"无限取证——探索预算只拦读类拦不住）。
-// 返回更新后的 history 与计数；达硬杀阈值返回 ErrLoopExit（dispatcher 侧 kind=loop_guard、
-// 失败打捞回灌父 Agent 语义现成）。meta 豁免硬杀（ErrLoopExit 会终止整个会话），仅收预警。
+// stagnationGuard 无产出停滞守卫（仅子 Agent 启用，见 WithSubAgent/subAgent 字段）。
+// 覆盖既有守卫够不着的两类语义死循环：重复探针死循环（点击开始按钮 state 仍 idle
+// 反复重试 19 分钟——连读同参×3 要求参数相同拦不住）与完美主义不收口（"还剩最后一处
+// 缺口"无限取证——探索预算只拦读类拦不住）。返回更新后的 history 与计数；达硬杀阈值
+// 返回 ErrLoopExit（dispatcher 侧 kind=loop_guard、失败打捞回灌父 Agent 语义现成）。
+// 顶层 Agent（meta/domain 直跑/doc_assistant）整体跳过：硬杀 ErrLoopExit 会终止整个
+// 会话（误杀代价不可承受，2026-10-20 moyingshanhai 一日 5 次强停实证），且视觉打磨类
+// 任务的长只读验证期是合法工作节奏；预警注入对弱模型无效，还以 user 角色消息污染历史。
 func (a *ReActAgent) stagnationGuard(streak int, calls []ToolCall, mailboxDrained int, history []ReactMessage) ([]ReactMessage, int, error) {
+	if !a.subAgent {
+		return history, 0, nil
+	}
 	productive := mailboxDrained > 0
 	if !productive {
 		for _, tc := range calls {
@@ -1018,7 +1045,7 @@ func (a *ReActAgent) stagnationGuard(streak int, calls []ToolCall, mailboxDraine
 	}
 	streak++
 	switch {
-	case streak >= stagnationExitRounds && a.role.ID != "meta":
+	case streak >= stagnationExitRounds:
 		return history, streak, fmt.Errorf("%w: 连续 %d 轮无任何产出性动作（未写文件/未派发/未收发消息/未终答），判定停滞强制终止。已有部分产出已保留，可缩小任务范围后重派", tool.ErrLoopExit, streak)
 	case streak == stagnationFinalWarnRounds:
 		history = a.appendLogged(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
