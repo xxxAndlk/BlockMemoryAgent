@@ -8,7 +8,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 128000,
-      "description": "Meta 编排主力（2.5）：规划/路由/汇总，128K 输出；不做编码执行"
+      "description": "Meta 编排主力（meta_agent 绑定）：规划、路由、汇总；输出上限 128K，不承担编码执行"
     },
     {
       "id": "ark-glm-5.3-flash",
@@ -18,7 +18,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 128000,
-      "description": "质量型执行档（128K）：UI/长 HTML 输出；思考档单轮可达 459s，忌高频"
+      "description": "质量型执行档（domain_agent 绑定）：UI 与长 HTML 输出；输出上限 128K，思考档单轮可达 459s，避免高频调用"
     },
     {
       "id": "doubao-seed-2.0-mini",
@@ -28,7 +28,27 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 32768,
-      "description": "轻量档：总结/query 改写等低开销调用；不能执行任务"
+      "description": "轻量档（lightweight_model、decision_model 绑定）：总结、query 改写等低开销调用；输出上限 32K，不能执行任务"
+    },
+    {
+      "id": "od-deepseek-v4.1-flash",
+      "name": "OD DeepSeek V4.1 Flash",
+      "provider": "openai-chat",
+      "model": "deepseek-v4.1-flash",
+      "api_key": "${OPENAI_API_KEY_THREE}",
+      "base_url": "${OPENAI_BASE_URL_TWO}",
+      "max_output_tokens": 128000,
+      "description": "domain 主力（OD 网关）：多轮编码、测试与集成修复；输出上限 128K，性价比高"
+    },
+    {
+      "id": "od-gpt-6-luna",
+      "name": "OD GPT-6 Luna",
+      "provider": "openai-chat",
+      "model": "gpt-6-luna",
+      "api_key": "${OPENAI_API_KEY_THREE}",
+      "base_url": "${OPENAI_BASE_URL_TWO}",
+      "max_output_tokens": 128000,
+      "description": "GPT-6 Luna（OD 网关）：多轮编码、测试与集成修复；输出上限 128K"
     },
     {
       "id": "ark-deepseek-v4-flash",
@@ -38,7 +58,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 32768,
-      "description": "最便宜高频档（0.5）：规格明确的执行/速修，固定角色现役"
+      "description": "最便宜高频档（抵扣 0.5）：规格明确的执行与速修；固定角色现役（侦察、叶子、审查类）"
     },
     {
       "id": "ark-deepseek-v4.1-flash",
@@ -48,17 +68,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 128000,
-      "description": "domain 主力（2.5 ，128K）：多轮编码/测试/集成修复，性价比最优"
-    },
-    {
-      "id": "wb-deepseek-v4.1-flash",
-      "name": "WB DeepSeek V4.1 Flash",
-      "provider": "openai-chat",
-      "model": "workbuddy-ai/deepseek-v4.1-flash",
-      "api_key": "${ANTHROPIC_API_KEY}",
-      "base_url": "http://127.0.0.1:3425/v1",
-      "max_output_tokens": 128000,
-      "description": "domain 主力（2.5 ，128K）：多轮编码/测试/集成修复，性价比最优"
+      "description": "domain 主力（2.5，ark 网关）：多轮编码、测试与集成修复；输出上限 128K"
     },
     {
       "id": "ark-glm-5.3",
@@ -68,7 +78,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 16384,
-      "description": "审查判断档（4.5）：提示词/代码审查；输出仅 16K，思考档慢（judge 易超时）"
+      "description": "审查判断档（4.5）：提示词与代码审查；输出上限 16K，思考档慢，judge 易超时"
     },
     {
       "id": "doubao-seed-2.0-lite",
@@ -78,7 +88,7 @@
       "api_key": "${ANTHROPIC_API_KEY}",
       "base_url": "${ANTHROPIC_BASE_URL}",
       "max_output_tokens": 16384,
-      "description": "文档档（16K）：README/CHANGELOG 等中等文本产出"
+      "description": "文档档：README、CHANGELOG 等中等长度文本产出；输出上限 16K"
     },
     {
       "id": "gemini-3.8-flash",
@@ -88,7 +98,7 @@
       "api_key": "xxx",
       "base_url": "${GEMINI_CHAT_URL}",
       "max_output_tokens": 32768,
-      "description": "UI 出图/前端档（32K）：长 HTML 输出防截断；间隔 ≥5s，网关不稳"
+      "description": "UI 出图与前端档：长 HTML 输出，防截断；输出上限 32K，请求间隔 ≥5s，网关不稳定"
     }
   ],
   "role_bindings": {}

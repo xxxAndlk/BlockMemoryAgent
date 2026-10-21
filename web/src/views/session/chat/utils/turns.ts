@@ -572,6 +572,13 @@ export function toolHeadline(group: ToolCallGroup): string {
       return String(args.url || '')
     case 'SearchInFiles':
       return String(args.pattern || '')
+    case 'CallExternalAgent':
+    case 'call_external_agent': {
+      const agent = String(args.agent || '')
+      if (!agent) return group.result?.tool_path || ''
+      const task = String(args.task || '')
+      return task ? `→ ${agent}：${task.slice(0, 80)}` : `→ ${agent}`
+    }
     default:
       return group.result?.tool_path || ''
   }

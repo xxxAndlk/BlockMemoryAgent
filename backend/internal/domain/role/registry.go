@@ -218,8 +218,11 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 			Tools: []string{
 				"call_sub_agent", "call_sub_agents", "map_sub_agents",
 				"ReadFile", "ListDir", "SearchInFiles", "HTTPGet", "ReadMedia",
-				"WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RestoreFile", "RunCommand",
-				"RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "search_knowledge",
+					"WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RestoreFile", "RunCommand",
+					// 外部 Agent 调用（2026-10 CallExternalAgent）：domain 可把超出内置工具
+					// 能力的任务派给本机外部 Agent CLI（external_agents.yaml 注册表，硬门同步）。
+					"CallExternalAgent",
+					"RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "search_knowledge",
 				// 叶子治理（2026-09-10）：domain 管理自己直派的叶子——暂停/换档/续跑，
 				// 与 meta 管理 domain 同构（授权 caller == node.ParentID）。
 				"pause_agent", "resume_agent", "set_agent_model", "list_models",

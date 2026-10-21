@@ -65,6 +65,10 @@ type APIHandler struct {
 	statsService  *StatsService             // 会话统计聚合服务
 	pluginMgr     *plugins.Manager          // 插件管理器（热插拔插件管理 API）
 	widgetMgr     *widgets.Manager          // 界面部件管理器（widgets/ 目录包管理 API）
+	// externalAgentList/Reload 外部 Agent 管理面闭包（bootstrap 注入）：清单读取与
+	// external_agents.yaml 重读热更新；未接线时端点 503。
+	externalAgentList   func() []tool.ExternalAgentDef
+	externalAgentReload func() ([]tool.ExternalAgentDef, error)
 	hookLimiter   *widgets.HookRateLimiter // webhook 回调限流器（单部件 60s/60 次滑窗；懒初始化）
 	learnedSkills *store.LearnedSkillStore  // 自进化技能库存储（2026-09-02 设计 §8）
 	// learnedSkillsDir 经验技能目录（config/skills_learned/）：DELETE 端点删文件前

@@ -1,0 +1,42 @@
+# 外部 Agent CLI 注册表（doc/计划_外部Agent调用.md §4.1）。
+# enabled=false 的条目不出现在 CallExternalAgent 工具描述里，也不可执行。
+# args 模板：{{task}} 占位符替换为任务文本（以独立 argv 元素传入，不经 shell）；
+# 无占位符时任务文本自动追加为最后一个 argv。timeout_sec 单调用墙钟上限（秒），
+# 缺省/<=0 回落 1800，调用方可经 timeout_sec 参数覆盖（封顶 7200）。
+agents:
+  claude_code:
+    enabled: true
+    command: claude
+    args: ["-p", "{{task}}", "--output-format", "json"]
+    timeout_sec: 1800
+    description: "Anthropic Claude Code，复杂重构/长任务"
+  codex:
+    enabled: true
+    command: codex
+    args: ["exec", "{{task}}"]
+    timeout_sec: 1800
+    description: "OpenAI Codex CLI"
+  kimi_code:
+    enabled: true
+    command: kimi
+    args: ["-p", "{{task}}"]
+    timeout_sec: 1800
+    description: "Kimi Code CLI"
+  opencode:
+    enabled: true
+    command: opencode
+    args: ["run", "{{task}}"]
+    timeout_sec: 1800
+    description: "OpenCode CLI"
+  hermes:
+    enabled: false            # 无公认 headless CLI 约定，占位模板：填对 command/args 后启用
+    command: hermes
+    args: ["{{task}}"]
+    timeout_sec: 1800
+    description: ""
+  deepseek_harness:
+    enabled: false            # 同上，占位模板
+    command: deepseek
+    args: ["{{task}}"]
+    timeout_sec: 1800
+    description: ""

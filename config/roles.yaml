@@ -66,7 +66,7 @@ meta_agent:
           plugin_install, plugin_enable, plugin_disable, plugin_list, list_models, set_role_model, set_agent_model,
           expand_memory, update_evolution_prompt, search_block_memory, widget_save, widget_list,
           widget_push_data, widget_delete, widget_restore, tool_forge,
-          workflow_freeze, workflow_run, workflow_status]
+          workflow_freeze, workflow_run, workflow_status, CallExternalAgent]
 
 # 领域Agent配置（domain 角色共用模型）
 domain_agent:

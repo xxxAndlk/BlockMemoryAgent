@@ -182,5 +182,6 @@ func apiHandlerOf(app *App) *server.APIHandler {
 	h.SetSkillConsolidation(app.SkillConsolidation)   // 技能库整理（C 库存治理，未装配时端点 503）
 	h.SetSkillReforge(app.SkillReforge)               // 技能重铸（薄技能治理，未装配时端点 503）
 	h.SetMemoryConsolidation(app.MemoryConsolidation) // 块记忆库整理（2026-10-13，未装配时端点 503）
+	h.SetExternalAgentProvider(app.ExternalAgentList, app.ExternalAgentReload) // 外部 Agent 管理面（未装配时端点 503）
 	return h
 }

@@ -117,6 +117,8 @@ const menuGroups = [
       { path: '/skills', title: '技能库', icon: 'Connection' },
       { path: '/plugins', title: '插件', icon: 'MagicStick' },
       { path: '/widgets', title: '界面部件', icon: 'Grid' },
+      // 外部 Agent 管理页（CallExternalAgent 工具配置面，2026-10-21）
+      { path: '/external-agents', title: '外部 Agent', icon: 'Promotion' },
       { path: '/knowledge', title: '知识库', icon: 'Document' },
     ],
   },

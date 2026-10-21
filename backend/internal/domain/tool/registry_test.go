@@ -461,16 +461,16 @@ func (s *stubCallSubAgent) Execute(ctx context.Context, args map[string]any) *Re
 //（明细含 2026-10 界面部件工具组 widget_save/widget_list/widget_push_data/widget_delete/widget_restore
 // 与 tool_forge 锻造工具）。
 func TestSchemaIncludesCallSubAgent(t *testing.T) {
-	// 未安装 call_sub_agent 时，schema 恰为 40 个工具（含 RefreshProjectDoc/WriteSharedMemory/ReadSharedMemory/WriteSpec/ReadMedia/ShowArtifact/ask_user/schedule_task/schedule_followup/escalate_gear/remember_preference/plugin_*/tool_*/tool_forge/update_evolution_prompt/search_block_memory/widget_save/widget_list/widget_push_data/widget_delete/widget_restore）。
+	// 未安装 call_sub_agent 时，schema 恰为 41 个工具（含 CallExternalAgent/RefreshProjectDoc/WriteSharedMemory/ReadSharedMemory/WriteSpec/ReadMedia/ShowArtifact/ask_user/schedule_task/schedule_followup/escalate_gear/remember_preference/plugin_*/tool_*/tool_forge/update_evolution_prompt/search_block_memory/widget_save/widget_list/widget_push_data/widget_delete/widget_restore）。
 	r := NewBuiltinRegistry(t.TempDir(), nil, nil)
-	if n := len(r.Schema()); n != 40 {
-		t.Fatalf("expected 40 builtin tools without call_sub_agent, got %d", n)
+	if n := len(r.Schema()); n != 41 {
+		t.Fatalf("expected 41 builtin tools without call_sub_agent, got %d", n)
 	}
 	// 安装后应出现在 schema 中，且描述来自 Description()。
 	r.Register(&stubCallSubAgent{})
 	schema := r.Schema()
-	if len(schema) != 41 {
-		t.Fatalf("expected 41 tools with call_sub_agent, got %d", len(schema))
+	if len(schema) != 42 {
+		t.Fatalf("expected 42 tools with call_sub_agent, got %d", len(schema))
 	}
 	// 遍历查找 call_sub_agent 并校验描述文本。
 	found := false

@@ -118,6 +118,11 @@ type App struct {
 	// RoleRegistry 角色注册表（固定+动态合成角色），供演化准则按角色展示/编辑。
 	RoleRegistry *role.Registry
 
+	// ExternalAgentList/ExternalAgentReload 外部 Agent 管理面闭包（2026-10 CallExternalAgent）：
+	// GET /api/external-agents 清单与 POST /api/external-agents/reload 热更新；未装配时端点 503。
+	ExternalAgentList   func() []tool.ExternalAgentDef
+	ExternalAgentReload func() ([]tool.ExternalAgentDef, error)
+
 	// cleanup 保存 App 关闭时需要按逆序释放的资源。
 	cleanup []func() error
 }
@@ -1122,6 +1127,25 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err := pluginManager.Load(ctx); err != nil {
 		log.Printf("[bootstrap] plugins load failed (non-fatal): %v", err)
 	}
+
+	// 外部 Agent 注册表（CallExternalAgent 数据源）：external_agents.yaml 与 config.yaml
+	// 同目录；缺文件返回空配置（零行为变化），解析失败仅记日志不阻断启动（同 plugins 惯例）。
+	extAgentCfgPath := externalAgentConfigPath(paths.ConfigPath)
+	if extCfg, err := config.LoadExternalAgentsConfig(extAgentCfgPath); err != nil {
+		log.Printf("[bootstrap] external agents load failed (non-fatal): %v", err)
+	} else {
+		toolRegistry.SetExternalAgentDefs(externalAgentDefsFromConfig(extCfg))
+	}
+	// reload 闭包：POST /api/external-agents/reload 重读 yaml 并整表热更新（Schema 描述下轮生效）。
+	reloadExternalAgents := func() ([]tool.ExternalAgentDef, error) {
+		extCfg, err := config.LoadExternalAgentsConfig(extAgentCfgPath)
+		if err != nil {
+			return nil, err
+		}
+		defs := externalAgentDefsFromConfig(extCfg)
+		toolRegistry.SetExternalAgentDefs(defs)
+		return defs, nil
+	}
 	// 角色可见性：meta/domain/动态角色按 Manifest.Roles 判定插件工具是否可见（§4.3）。
 	// 惰性回调（会话/调用期求值），预热窗口内未就绪的插件工具自然不可见，与降级语义一致。
 	agentSvc.SetPluginVisibility(pluginManager.ToolVisibility)
@@ -1434,6 +1458,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 		RoleEvolution: roleEvolutionStore, // 角色自进化准则存储
 		RoleRegistry:  roleRegistry,       // 角色注册表（server 演化端点用）
+
+		ExternalAgentList:   func() []tool.ExternalAgentDef { return toolRegistry.ExternalAgentDefs() },
+		ExternalAgentReload: reloadExternalAgents,
 	}
 
 	// 第二十一步：注册关闭时释放资源的回调，按依赖顺序排列（外层 Close 会逆序调用）。

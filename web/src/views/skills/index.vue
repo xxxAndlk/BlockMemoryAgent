@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   listLearnedSkills,
@@ -28,6 +28,62 @@ const builtinSkills = ref<Skill[]>([])
 const builtinLoading = ref(false)
 
 const consolidating = ref(false)
+
+// 多选批量删除：selected 存技能 name（技能名唯一）；列表刷新后按现存项修剪。
+const selected = ref<Set<string>>(new Set())
+const batchDeleting = ref(false)
+const selectedNames = computed(() => skills.value.filter(s => selected.value.has(s.name)).map(s => s.name))
+const selectedCount = computed(() => selectedNames.value.length)
+const allSelected = computed(() => skills.value.length > 0 && selectedCount.value === skills.value.length)
+const someSelected = computed(() => selectedCount.value > 0 && !allSelected.value)
+
+function toggleSelect(name: string, checked: boolean) {
+  const next = new Set(selected.value)
+  if (checked) next.add(name)
+  else next.delete(name)
+  selected.value = next
+}
+
+function toggleSelectAll(checked: boolean) {
+  selected.value = checked ? new Set(skills.value.map(s => s.name)) : new Set()
+}
+
+function clearSelection() {
+  selected.value = new Set()
+}
+
+// 批量删除：沿用单条 DELETE 端点并发提交（每批 4 个），逐条成功即从列表与选中集移除，
+// 全部结束后重拉列表校准；失败项保留选中并提示，避免"看起来删了其实没删"。
+async function removeSelected() {
+  const names = selectedNames.value.slice()
+  if (!names.length) return
+  batchDeleting.value = true
+  const failed: string[] = []
+  let deleted = 0
+  try {
+    for (let i = 0; i < names.length; i += 4) {
+      const chunk = names.slice(i, i + 4)
+      const results = await Promise.allSettled(chunk.map(n => deleteSkill(n)))
+      results.forEach((r, idx) => {
+        if (r.status === 'fulfilled') deleted++
+        else failed.push(chunk[idx])
+      })
+      const gone = new Set(chunk.filter((_, idx) => results[idx].status === 'fulfilled'))
+      skills.value = skills.value.filter(s => !gone.has(s.name))
+      const next = new Set(selected.value)
+      gone.forEach(n => next.delete(n))
+      selected.value = next
+    }
+    if (failed.length) {
+      ElMessage.error(`已删除 ${deleted} 个，${failed.length} 个失败：${failed.slice(0, 3).join('、')}${failed.length > 3 ? ' 等' : ''}`)
+    } else {
+      ElMessage.success(`已删除 ${deleted} 个技能`)
+    }
+    loadSkills()
+  } finally {
+    batchDeleting.value = false
+  }
+}
 
 // 手动触发技能库整理（合并语义重复技能 + 归档零使用技能）；轻量模型调用，可能耗时 1-2 分钟。
 async function runConsolidate() {
@@ -102,6 +158,12 @@ async function loadSkills() {
   try {
     const res = await listLearnedSkills()
     skills.value = res.skills || []
+    // 修剪选中集：已被删除/消失的技能不再算选中。
+    if (selected.value.size) {
+      const alive = new Set(skills.value.map(s => s.name))
+      const next = new Set([...selected.value].filter(n => alive.has(n)))
+      if (next.size !== selected.value.size) selected.value = next
+    }
   } catch (e) {
     ElMessage.error('技能库加载失败：' + (e instanceof Error ? e.message : String(e)))
   } finally {
@@ -142,11 +204,17 @@ async function toggle(s: LearnedSkill) {
   }
 }
 
-// 手动删除（物理删）：PG 行 + 技能文件 + 退池。删除成功后刷新列表。
+// 手动删除（物理删）：PG 行 + 技能文件 + 退池。成功后立即从列表移除（不等重新拉取），再后台校准。
 async function removeSkill(s: LearnedSkill) {
   mutating.value = s.name
   try {
     await deleteSkill(s.name)
+    skills.value = skills.value.filter(x => x.name !== s.name)
+    if (selected.value.has(s.name)) {
+      const next = new Set(selected.value)
+      next.delete(s.name)
+      selected.value = next
+    }
     ElMessage.success(`技能 ${s.name} 已删除`)
     loadSkills()
   } catch (e) {
@@ -285,9 +353,32 @@ onMounted(() => {
 
     <el-tabs v-model="activeTab">
       <el-tab-pane label="经验技能" name="skills">
+        <!-- 多选工具条：勾选卡片后批量删除（沿用单条 DELETE 端点并发提交）。 -->
+        <div class="mb-3 flex items-center gap-3 flex-wrap">
+          <el-checkbox :model-value="allSelected" :indeterminate="someSelected" :disabled="!skills.length"
+                       @change="(v: string | number | boolean) => toggleSelectAll(!!v)">
+            全选
+          </el-checkbox>
+          <span v-if="selectedCount" class="text-xs text-ink-2">已选 {{ selectedCount }} 项</span>
+          <el-popconfirm :title="`确定删除选中的 ${selectedCount} 个技能？删除后不可恢复（PG 元数据 + 技能文件一并删除）`"
+                         confirm-button-text="批量删除" cancel-button-text="取消" width="300"
+                         @confirm="removeSelected">
+            <template #reference>
+              <el-button v-if="selectedCount" size="small" plain type="danger" class="!bg-transparent"
+                         :loading="batchDeleting">
+                <el-icon class="mr-1"><Delete /></el-icon> 批量删除
+              </el-button>
+            </template>
+          </el-popconfirm>
+          <el-button v-if="selectedCount" size="small" text :disabled="batchDeleting" @click="clearSelection">
+            清空选择
+          </el-button>
+        </div>
         <div v-loading="loading" class="grid gap-3 md:grid-cols-2">
           <el-card v-for="s in skills" :key="s.name" class="!border-line !bg-card" shadow="never">
             <div class="flex items-start justify-between gap-3">
+              <el-checkbox class="mt-1 shrink-0" :model-value="selected.has(s.name)" :disabled="batchDeleting"
+                           @change="(v: string | number | boolean) => toggleSelect(s.name, !!v)" />
               <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-2 flex-wrap">
                   <span class="font-bold text-ink">{{ s.title }}</span>

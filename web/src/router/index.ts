@@ -45,6 +45,13 @@ const routes: Array<RouteRecordRaw> = [
         meta: { title: '界面部件', icon: 'Grid' }
       },
       {
+        // 外部 Agent 管理页（CallExternalAgent 工具的配置面）
+        path: 'external-agents',
+        name: 'ExternalAgents',
+        component: () => import('@/views/external-agents/index.vue'),
+        meta: { title: '外部 Agent', icon: 'Promotion' }
+      },
+      {
         path: 'knowledge',
         name: 'Knowledge',
         component: () => import('@/views/knowledge/index.vue'),

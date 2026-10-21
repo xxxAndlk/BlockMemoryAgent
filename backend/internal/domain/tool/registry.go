@@ -180,6 +180,9 @@ type Registry struct {
 	// 会话级可见性依据）。与 tools 同受 mu 保护：RegisterForged/UnregisterForgedByScope
 	// 写锁、ForgedScope 读锁。仅 forged__ 前缀工具会进入本表。
 	forgeScopes map[string]string
+	// externalAgents 是 CallExternalAgent 工具的外部 Agent 注册表（external_agents.yaml
+	// 经 SetExternalAgentDefs 整表热注入；NewBuiltinRegistry 恒初始化，未注入时空表）。
+	externalAgents *externalAgentRegistry
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -192,12 +195,13 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		exec.SetAgentConfig(cfg)
 	}
 	// 初始化 Registry 结构体，各 map 也一并初始化。
-	r := &Registry{
-		exec:              exec,
-		progress:          progress,
-		failures:          newFailureCounter(),
-		tools:             make(map[string]Tool),
-		aliases:           make(map[string]string),
+		r := &Registry{
+			exec:              exec,
+			progress:          progress,
+			failures:          newFailureCounter(),
+			tools:             make(map[string]Tool),
+			aliases:           make(map[string]string),
+			externalAgents:    newExternalAgentRegistry(),
 		lastReadKey:       make(map[string]string),
 		sameReadCount:     make(map[string]int),
 		longFileScopes:    make(map[string]bool),
@@ -296,6 +300,9 @@ func (r *Registry) registerDefaults() {
 	// tool_forge：锻造自定义工具（脚本落盘 .bma/forged/，注册为 forged__<name>，
 	// 仅锻造者 scope 可见）；簿记走 RegisterForged（forgeScopes）。
 	r.Register(&forgeTool{exec: r.exec, registry: r})
+	// CallExternalAgent：派发任务给外部 Agent CLI（external_agents.yaml 注册表）；
+	// defs 经 SetExternalAgentDefs 注入后生效（缺配置时空注册表，调用返回未注册错误）。
+	r.Register(&externalAgentTool{exec: r.exec, reg: r.externalAgents})
 }
 
 // Register 将工具及其别名注册到注册表中；若传入 nil 则忽略。
@@ -1272,6 +1279,19 @@ func (r *Registry) Schema() []tools.Tool {
 	}); err == nil {
 		toolsList = append(toolsList, t)
 	}
+	// 注册 CallExternalAgent 工具：派发任务给外部 Agent CLI（external_agents.yaml 注册表）。
+	// 描述动态内嵌当前启用清单（热重载后下轮 Schema 生效）。
+	if t, err := tools.NewFunc("CallExternalAgent", r.externalAgentSchemaDesc(), func(ctx context.Context, in callExternalAgentInput) (string, error) {
+		args := map[string]any{"agent": in.Agent, "task": in.Task}
+		if in.TimeoutSec > 0 {
+			args["timeout_sec"] = in.TimeoutSec
+		}
+		res, _ := r.Dispatch(ctx, "CallExternalAgent", args)
+		b, _ := marshalNoHTMLEscape(res)
+		return string(b), nil
+	}); err == nil {
+		toolsList = append(toolsList, t)
+	}
 	// 注册 SearchInFiles 工具：在文件中搜索文本。
 	// 描述显式声明字面匹配语义（不支持正则），防模型按 grep 习惯写正则导致零命中。
 	if t, err := tools.NewFunc("SearchInFiles", "在文件中搜索文本（字面文本匹配，大小写不敏感，不支持正则表达式）。pattern 含 | 时按关键词拆分、任意关键词命中即记一行（如 \"bug|error\" 等价于两次搜索的并集）；dir 为起始目录（默认当前工作目录）。适合先定位再精读，返回匹配行及上下文；无匹配时返回提示文案而非错误。", func(ctx context.Context, in searchInFilesInput) (string, error) {
@@ -1616,7 +1636,7 @@ func (r *Registry) Schema() []tools.Tool {
 	// 注册工具保持现状不暴露，避免 ask_user 等"注册但按需可见"内置工具行为漂移。
 	covered := map[string]bool{
 		"ReadFile": true, "WriteFile": true, "EditFile": true, "ListDir": true,
-		"RunCommand": true, "SearchInFiles": true, "HTTPGet": true, "HTTPPost": true,
+		"RunCommand": true, "CallExternalAgent": true, "SearchInFiles": true, "HTTPGet": true, "HTTPPost": true,
 		"GitDiff": true, "GitStatus": true, "GitLog": true, "GitBlame": true,
 		"RefreshProjectDoc": true, "WriteSharedMemory": true, "WriteSpec": true,
 		"call_sub_agent": true, "send_message": true, "create_role": true, "list_roles": true,
