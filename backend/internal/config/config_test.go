@@ -17,9 +17,10 @@ func TestLoadParsesFeatureFlags(t *testing.T) {
 	if !cfg.Agent.DAGEnabled {
 		t.Fatal("dag_enabled 应为 true")
 	}
-	// 块记忆写入开关未在 config.yaml 中显式配置时，applyDefaults 应兜底为 true。
-	if cfg.Agent.BlockMemoryWriteEnabled == nil || !*cfg.Agent.BlockMemoryWriteEnabled {
-		t.Fatal("block_memory_write_enabled 默认应为 true")
+	// 块记忆写入：2026-10-19 永久关停（实证"否决方案半成品入库→33h/1005次请求持续复注"），
+	// config.yaml 显式 false；未显式配置时 applyDefaults 兜底为 true。
+	if cfg.Agent.BlockMemoryWriteEnabled == nil || *cfg.Agent.BlockMemoryWriteEnabled {
+		t.Fatal("block_memory_write_enabled 应为显式 false（永久关停）")
 	}
 	// Spec 强制默认开启：config.yaml 显式 true（塔防实证 WriteSpec 有用）。
 	if cfg.Agent.SpecEnforcementEnabled == nil || !*cfg.Agent.SpecEnforcementEnabled {

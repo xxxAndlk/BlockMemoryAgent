@@ -307,12 +307,13 @@ func (m *tokenUsageProvider) Name() string { return "tokenUsage" }
 
 // TestReActAgent_ContextBudgetExceeded 验证上下文 token 超阈值（压缩后仍超=近 N 单独就超、
 // 压不下去）时返回部分完成（LimitReached），在首轮 LLM 调用前拦截，而非错误或继续烧轮次。
-// 与 maxIter 轮数上限正交。
+// 与 maxIter 轮数上限正交。预算暂停闸门 2026-10-21 起仅对子 Agent 生效，此处打 WithSubAgent。
 func TestReActAgent_ContextBudgetExceeded(t *testing.T) {
 	llm := &tokenUsageProvider{input: 60, output: 60} // 即使真调了也能计数
 	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
 	ag := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).
-		WithLoopConfig(LoopConfig{TokenBudget: 5, MaxIterations: 50}) // 极小阈值：任务+时间消息估算即超
+		WithLoopConfig(LoopConfig{TokenBudget: 5, MaxIterations: 50}). // 极小阈值：任务+时间消息估算即超
+		WithSubAgent()
 
 	res, err := ag.Run(context.Background(), "budget test")
 	if err != nil {
@@ -323,6 +324,29 @@ func TestReActAgent_ContextBudgetExceeded(t *testing.T) {
 	}
 	if llm.calls != 0 {
 		t.Fatalf("上下文超阈值应在首轮 LLM 调用前拦截，got %d calls", llm.calls)
+	}
+}
+
+// TestReActAgent_ContextBudgetTopLevelExempt 验证顶层主 Agent（未打 WithSubAgent）不受
+// token 预算暂停约束：阈值极小也不 LimitReached，直接跑至终答（2026-10-21 用户拍板：
+// 主模型无轮数/预算上限，"已达轮数上限"暂停对顶层是误停）。
+func TestReActAgent_ContextBudgetTopLevelExempt(t *testing.T) {
+	llm := &mockModelProvider{
+		responses: []*blades.Message{blades.AssistantMessage("done")},
+	}
+	reg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	ag := NewReActAgent("test", types.RoleDefinition{SystemPrompt: "t"}, llm, NewToolRegistryAdapter(reg)).
+		WithLoopConfig(LoopConfig{TokenBudget: 5, MaxIterations: 50}) // 极小阈值，但不带 WithSubAgent
+
+	res, err := ag.Run(context.Background(), "budget test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.LimitReached {
+		t.Fatal("顶层主 Agent 不应触发预算 LimitReached")
+	}
+	if res.Text != "done" {
+		t.Fatalf("expected 'done', got %q", res.Text)
 	}
 }
 

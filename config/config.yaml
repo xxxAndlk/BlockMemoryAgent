@@ -1,30 +1,19 @@
 # BlockMemoryAgent 基础设施配置
 
 # PostgreSQL 配置
+# 连接池参数未开放配置（store 层硬编码：max_open=20 / max_idle=10 / lifetime=1h）
 postgres:
   dsn: ${POSTGRES_DSN:"postgres://user:pass@localhost:5432/blockmemory?sslmode=disable"}
-  max_open_conns: 25
-  max_idle_conns: 5
-  conn_max_lifetime: 300  # 秒
 
-# pgvector 配置（依赖 PostgreSQL）
+# pgvector 配置（依赖 PostgreSQL）；维度须与嵌入模型一致：bge-m3=1024，BGE-base-zh=768
 pgvector:
-  enabled: true
-  dimensions: 1024  # bge-m3=1024 维（2026-08-12 切换 ollama 本地模型）；BGE-base-zh 用 768
-  index_type: ivfflat  # ivfflat | hnsw
-  distance_metric: cosine  # cosine | l2 | inner_product
+  dimensions: 1024  # bge-m3=1024 维（2026-08-12 切换 ollama 本地模型）
 
-# Redis 配置
+# Redis 配置（连接池/超时参数未开放配置，用库默认）
 redis:
   addr: ${REDIS_ADDR:"localhost:6380"}
   password: ${REDIS_PASSWORD:""}
   db: 5
-  pool_size: 10
-  min_idle_conns: 3
-  dial_timeout: 5000
-  read_timeout: 3000
-  write_timeout: 3000
-  snapshot_ttl_days: 7
 
 # HTTP 服务配置
 http:
@@ -36,18 +25,11 @@ http:
   auth_enabled: false                     # 是否启用 Token 鉴权（推荐生产环境开启）
   auth_token: ${BMA_API_TOKEN:""}        # API Token，建议通过环境变量注入
 
-# 记忆系统配置
-memory:
-  write_batch_size: 100
-  write_flush_interval: 5  # 秒
-  snapshot_interval: 300  # 秒
-
 # Agent 运行时动态参数
 agent:
   # 测试助手交付验收开关（2026-09-12）为工作目录级配置，不在本文件：
   # 见 <工作目录>/.bma/tester.yaml（mode: off|auto|on，默认 off；GET/PUT /api/project/tester-config 读写）。
   # -- ReAct 主循环 --
-  # summarize_every: 10            # 退役字段：原步频压缩扳机（每 N 步强制压缩），实测与上下文实际大小脱钩、致 Agent 每 10 步强制失忆反复重读文件。压缩已仅由 token 阈值（token_budget_per_role/context_token_budget，150K）驱动——唯一闸门。保留解析不报错，不再驱动任何逻辑（同 token_budget_per_goal 退役先例）
   summarize_keep_recent: 15      # 保留最近 15 条（2026-08-21 由 10 上调：压缩丢工具结果细节致领域 Agent 重读文件白烧慢思考轮；多留 5 条原始消息）
   summarize_max_bundles: 20      # 层级压缩包数量上限：每次压缩触发把新滑出保留段的中段压成一个结构化压缩包（轻量模型），超上限把最老的一半合并为 1 个更粗的包，循环往复——旧上下文渐变式遗忘而非 200 字符截断后丢弃；压缩状态落 agent_compress_states 表，重启后懒加载恢复
   summarize_timeout_sec: 120     # 事件摘要轻量模型调用超时（秒）。思考型模型首 token 需数十秒，旧硬编码 5s 致摘要全挂、上下文全量回注、token 预算提前烧穿（实证 verify 子 Agent 300K 预算 7 分钟耗尽）
@@ -85,7 +67,6 @@ agent:
   default_gear: daily            # 默认执行档位（TODO #14 三档全手动，2026-09-16）：fast=快速档（文档助手 doc_assistant 顶层直达，挂 escalate_gear 升档）| daily=日常档（DomainAgent 顶层直接执行，可自行下拆叶子，挂 escalate_gear）| cluster=集群档（Meta 全装编排，现行为）。新建会话取此值为初始档，会话内可经 POST /api/sessions/{id}/gear 随时切换（下一轮生效，跨重启持久）；非法值回落 daily。历史值 auto（规则自动选档）已退役，旧数据读侧映射为 daily。会话级思考强度（off|low|medium|high，空=跟随角色默认）随创建请求 thinking 字段设置，可经 POST /api/sessions/{id}/thinking 随时切换（下一次 LLM 调用生效）
   default_workdir: workspace     # 新会话默认工作目录（2026-09-26）：创建会话时不选目录就落这里（安装目录下自动创建，如 D:\WebApp\bma\workspace）。相对路径按安装目录（BMA_HOME）解析，绝对路径原样使用；空=旧行为（回落进程 cwd，即服务启动目录）。启动时 MkdirAll，建不出即启动失败；已有 work_dir 的会话不受影响（每会话目录优先）
   worktree_enabled: true         # worktree 隔离派发开关（TODO 第9项⑤/#10项⑤）：允许 call_sub_agent 携带 worktree=true 派发到 git worktree 副本（子 Agent 全部文件写入落在 <repoRoot>/.bma/worktrees/ 副本，主目录零写入；成功收尾产出全量 patch，meta 经 merge_worktree 工具 review/merge/reject 走合并门：base 漂移检测→跨域契约检查→git apply）；与 reuse_agent_id 互斥，热驻 domain 不支持；false=拒绝 worktree 参数；主目录非 git 仓库时派发侧同样拒绝（不静默降级）
-  token_budget_per_goal: 300000   # 退役字段（原累计跨轮 token 预算，已替换为按角色上下文阈值）。保留不破坏旧配置加载，不再驱动任何闸门。
   token_budget_per_role:          # 按角色上下文 token 阈值（替换原累计预算）：Assemble 压缩后估算 messages token >= 阈值即暂停（近 N 单独就超、压不下去），每轮独立估算（各 Agent 独立）。未列角色默认 150000。
     domain: 150000
     meta: 150000  # 2026-09-06 round-11 实测：40K 全程未触发压缩（上下文自由长到 46.8K，估算口径低于 API 实测），对成绩无影响；回滚默认消除未测风险。真正的 meta 减重靠 user_profile.md 去重（111→27 行）
@@ -106,7 +87,6 @@ agent:
     # ffmpeg_bin: ffmpeg         # ffmpeg 可执行文件（默认 PATH 探测；缺失时降级为仅元数据文本，消息照常发送）
     # ffprobe_bin: ffprobe       # ffprobe 可执行文件（默认 PATH 探测）
   paused_domain_max_resumes: 2   # 同一 Paused DomainAgent 允许的最大续跑次数。续跑重置 fresh token 预算，不设上限则"触限-暂停-续跑"环路永不绑定（实证 v10 基准验收领域研磨 32 轮 30 分钟不收敛）；触顶后强制收口：部分产出返回父 Agent 并标 Done，由 MetaAgent 决定返工。TODO #35 放开：1->2 多给一次续跑机会
-  context_window: 65536          # Agent 上下文窗口（token 数），驱动 TokenBudget 分配与 Watchdog 阈值
 
   # -- DAG / 会话恢复 --
   dag_enabled: true              # DAG 定时任务调度

@@ -98,6 +98,7 @@ type ReActAgent struct {
 	// tokenBudget 上下文 token 阈值（替换原累计跨轮 token 预算）：Assemble 压缩后
 	// 估算 messages token >= 阈值即 LimitReached（近 N 单独就超、压不下去），暂停等续跑。
 	// <=0 不限制。默认 150000（service_react roleTokenBudget 按角色配）。
+	// 2026-10-21 起仅对子 Agent（subAgent=true）生效，顶层主 Agent 不受预算暂停约束。
 	tokenBudget int
 	// liveFn 是实时进度事件回调，由 WithLiveEvents 注入；nil 时不推送任何进度事件。
 	liveFn func(LiveEvent)
@@ -690,7 +691,10 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 上下文 token 预算（替换原累计 token 预算，150K 唯一上限）：Assemble 已按阈值
 		// 压缩（保留近 N，旧压成上下文内摘要块）；压缩后仍超阈值 = 近 N 单独就超、压不下去，
 		// 触达上限返回部分完成，由上层暂停会话等续跑。与 windowMessages（消息数硬上限）正交。
-		if a.tokenBudget > 0 {
+		// 适用面 2026-10-21 收窄为仅子 Agent（WithSubAgent 标记）：顶层主 Agent 不因
+		// 预算暂停（实证 domain 当主模型被"已达轮数上限"误停，用户要求主模型无上限）；
+		// 压缩仍由记忆流水线按同一阈值驱动，顶层失控时靠 windowMessages 硬顶 + API 报错兜底。
+		if a.tokenBudget > 0 && a.subAgent {
 			if est := EstimateMessagesTokens(messages); est >= a.tokenBudget {
 				log.Printf("[react] context budget exceeded: role=%s est_tokens=%d budget=%d", a.role.Name, est, a.tokenBudget)
 				return ReactResult{History: history, LimitReached: true}, nil

@@ -1290,8 +1290,10 @@ func (c ReactRuntimeConfig) LoopConfigByRole(roleID string) LoopConfig {
 }
 
 // roleTokenBudget 返回角色上下文 token 阈值:显式配置优先，否则默认 ContextTokenBudget
-// （未配时 150000）。meta 不给 0（无限）:config tool_call_max_rounds=-1 已使 maxIter 无界，
-// 若阈值也无界，模型不收敛时会无限循环（实证:TUI 重复思考不前进）。150K 安全网让不收敛时压缩到限暂停等续跑。
+// （未配时 150000）。该阈值驱动两层机制：记忆流水线按它触发压缩（全 Agent 生效）；
+// ReActAgent 的预算暂停闸门 2026-10-21 起仅对子 Agent 生效（subAgent 标记）——顶层主
+// Agent 轮数（tool_call_max_rounds=-1）与预算均无界，不自动暂停（用户 2026-10-21 拍板），
+// 顶层失控靠 windowMessages 硬顶 + API 报错兜底，压缩本身不受影响。
 func (c ReactRuntimeConfig) roleTokenBudget(roleID string) int {
 	if v, ok := c.TokenBudgetPerRole[roleID]; ok {
 		return max(v, 0)
