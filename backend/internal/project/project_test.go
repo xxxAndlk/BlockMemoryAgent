@@ -451,3 +451,58 @@ func TestEnsureProjectDoc_LLMClassifierUsed(t *testing.T) {
 		t.Fatalf("blank label leaked:\n%s", body)
 	}
 }
+
+// TestEnsureProjectDoc_RefreshesOnAssetChange 验证资产指纹变化会刷新 managed 区
+// （2026-10-22 事故：项目新增 19 个页面/图集后概览仍是空壳，模型看不到可复用资产），
+// 同时保留标记区外的人手补充。
+func TestEnsureProjectDoc_RefreshesOnAssetChange(t *testing.T) {
+	root := writeTestProject(t)
+	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	p := ProjectDocPath(root)
+	// 人手补充写在 managed 区之外。
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString("\n## 人手补充\n- 保留我\n"); err != nil {
+		t.Fatalf("append human note: %v", err)
+	}
+	f.Close()
+
+	// 新增资产：图片/视频/HTML。
+	for _, name := range []string{"public/assets/img/run/frames16/a.png", "public/assets/video/x.mp4", "public/phaser-run.html"} {
+		full := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {
+		t.Fatalf("Ensure after assets: %v", err)
+	}
+	data, _ := os.ReadFile(p)
+	s := string(data)
+	if !strings.Contains(s, "## 已有资产") {
+		t.Fatalf("概览应包含资产清单:\n%s", s)
+	}
+	if !strings.Contains(s, "public/phaser-run.html") {
+		t.Fatalf("资产清单应列出 HTML 交付物:\n%s", s)
+	}
+	if !strings.Contains(s, "保留我") {
+		t.Fatalf("刷新不得覆盖标记区外的人手补充:\n%s", s)
+	}
+
+	// 指纹已更新：再次调用不应再改文件。
+	before, _ := os.ReadFile(p)
+	if err := EnsureProjectDoc(context.Background(), root, nil); err != nil {
+		t.Fatalf("Ensure third: %v", err)
+	}
+	after, _ := os.ReadFile(p)
+	if string(before) != string(after) {
+		t.Fatal("资产指纹未变化时 Ensure 不应重写文件")
+	}
+}

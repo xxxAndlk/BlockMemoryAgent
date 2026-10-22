@@ -77,6 +77,12 @@ type reactInternalSession struct {
 	workDir atomic.Value
 	// History 保存 React 对话历史，用于后续推理与恢复。
 	History []ReactMessage
+	// decisions 是会话决策账本（2026-10-22 上下文事故修复）：用户指令/路线/参考基准/
+	// 否决/已批准计划的独立副本。它不进对话历史、不参与压缩，由 decisionBlock 每轮以
+	// system 块注入——解决"压缩摘要被滑窗裁掉 / ask_user 答复只存在于 tool 结果"导致
+	// 正确指令权重最低的问题。权威副本在 PG session_decisions，内存仅作会话内缓存。
+	// 用指针承载：会话结构会被浅拷贝（snapshotSession），内嵌 mutex 会触发 copylocks。
+	decisions *sessionDecisionCache
 	// StreamingText 保存当前正在流式生成的助手文本（累积值，运行中才有意义），
 	// 供 TUI/Web 实时渲染"正在输出"的内容；会话结束时清空。
 	StreamingText string
@@ -405,6 +411,8 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 			{Role: string(enums.ChatRoleSystem), Content: "Goal: " + goal, Timestamp: time.Now()},
 			{Role: string(enums.ChatRoleUser), Content: goal, Timestamp: time.Now()},
 		},
+		// 决策账本缓存（权威副本在 PG session_decisions，runSession 首次使用时懒加载）。
+		decisions: newSessionDecisionCache(),
 	}
 
 	// runCtx 与 cancelFn 构成会话生命周期上下文，可外部取消。
@@ -1257,6 +1265,25 @@ func detailStringField(detailJSON, key string) string {
 	return s
 }
 
+// ensureGoalMessage 保证会话目标作为一条 user 消息留在历史最前（已存在则原样返回）。
+// 用途：恢复/续跑的 History 可能以"继续"开头（重启前没跑过一轮，或压缩把首条目标
+// 折进了摘要），此时窗口里再无任务书原文——账本只放路线摘录，不足以承载完整验收条款。
+func ensureGoalMessage(history []ReactMessage, goal string) []ReactMessage {
+	goal = strings.TrimSpace(goal)
+	if goal == "" {
+		return history
+	}
+	for _, m := range history {
+		if m.Role == "user" && strings.TrimSpace(m.Content) == goal {
+			return history
+		}
+	}
+	out := make([]ReactMessage, 0, len(history)+1)
+	out = append(out, ReactMessage{Role: "user", Content: goal})
+	out = append(out, history...)
+	return out
+}
+
 // buildRestoredSession 从一条 session_history 记录重建内存会话（不触碰 store 锁与映射）。
 // events 自 session_events 全量加载；History 自 agent_messages 重建（persistFullHistory
 // 每轮落库），续跑时 resumeSession 以其为种子，MetaAgent 上下文不再清零；更早的上下文
@@ -1320,11 +1347,18 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 			{Role: string(enums.ChatRoleUser), Content: rec.Goal, Timestamp: rec.CreatedAt},
 			{Role: string(enums.ChatRoleAssistant), Content: rec.Summary, Timestamp: rec.CreatedAt},
 		},
+		// 决策账本缓存：恢复会话首次续跑时从 PG session_decisions 懒加载。
+		decisions: newSessionDecisionCache(),
 	}
 	// 重建完整对话历史（若重启前经 persistFullHistory 持久化过）。
 	if msgs, err := NewPostgresMessagesStore(st.pgStore.DB()).LoadMessages(ctx, rec.SessionID); err == nil && len(msgs) > 0 {
 		sess.History = msgs
 	}
+	// 任务书必须留在历史首位：重启前若还没跑过一轮（或压缩把首条目标折进摘要），
+	// History 会以"继续"这类续跑消息开头，模型再也看不到任务书原文。2026-10-22 23:00
+	// 实证：会话恢复后首条 user 是"继续"，账本又只注入截断的路线摘录，模型连续 20 轮
+	// 在 /tmp、.workbuddy 里搜"完整账本"，任务停摆 6 分钟。
+	sess.History = ensureGoalMessage(sess.History, rec.Goal)
 	// S2: 恢复每会话工作目录，重启后续跑仍在原目录；空串回落进程默认（atomic，见字段注释）。
 	sess.setWorkDir(rec.WorkDir)
 	// 恢复执行档位（TODO #14）：MetaMemory 携带 gear 时回填（历史 "auto" 映射 daily）；

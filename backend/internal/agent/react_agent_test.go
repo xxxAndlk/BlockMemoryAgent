@@ -622,6 +622,41 @@ func TestWindowMessages(t *testing.T) {
 	}
 }
 
+// TestWindowMessagesKeepsCompactionPrefix 验证压缩视图固定前缀（历史压缩摘要/热回灌）
+// 在滑动窗口裁剪后仍完整保留——2026-10-22 事故：399 条窗口把【已定决策】摘要裁掉，
+// Agent 只剩陈旧首条目标可锚定，在错误路线上多跑 3 小时。
+func TestWindowMessagesKeepsCompactionPrefix(t *testing.T) {
+	msgs := []ReactMessage{
+		{Role: "user", Content: "原始目标：使用骨架拼接"},
+		{Role: "system", Content: "【历史压缩摘要】排除拼接方案，采用16帧图集"},
+		{Role: "system", Content: "【热改动回灌】public/js/run.js 当前内容…"},
+	}
+	for i := 0; i < 600; i++ {
+		msgs = append(msgs, ReactMessage{Role: "assistant", Content: "step"})
+		msgs = append(msgs, ReactMessage{Role: "tool", Content: "result"})
+	}
+	out := windowMessages(msgs, 20)
+	if len(out) > 20+2 { // 固定前缀 + 首条 user + 占位符之外允许少量超出
+		t.Fatalf("裁剪后条数异常: %d", len(out))
+	}
+	if out[0].Content != "原始目标：使用骨架拼接" {
+		t.Fatalf("首条 user 应保留，got %q", out[0].Content)
+	}
+	if !strings.Contains(out[1].Content, "排除拼接方案") {
+		t.Fatalf("压缩摘要应保留在首条 user 之后，got %q", out[1].Content)
+	}
+	if !strings.Contains(out[2].Content, "热改动回灌") {
+		t.Fatalf("热回灌应保留，got %q", out[2].Content)
+	}
+	if !strings.Contains(out[3].Content, "用户指令账本") {
+		t.Fatalf("占位符应指向用户指令账本，got %q", out[3].Content)
+	}
+	// 保留段不能从 tool 消息起刀（孤立 tool_result 会被 API 拒绝）。
+	if out[4].Role == "tool" {
+		t.Fatalf("保留段不应以 tool 起刀，got role=%s", out[4].Role)
+	}
+}
+
 // TestReActAgent_EmptyResponseNudged 验证模型返回空响应（无文本、无工具调用）时，
 // 不会被误判为"最终答复"导致任务静默中断，而是注入提示让模型继续。
 func TestReActAgent_EmptyResponseNudged(t *testing.T) {
@@ -1421,5 +1456,66 @@ func TestReActAgent_SuspendOnChildWait(t *testing.T) {
 	}
 	if got := checker.waitCalls.Load(); got != 0 {
 		t.Errorf("meta 挂起等子不应进入 waitForChildren 阻塞, WaitForAnyChild 调用 %d 次", got)
+	}
+}
+
+// TestRepetitionGuardWarns 验证同一动作重复 10 次时注入前提自检预警
+// （2026-10-22 事故：同一验收项补丁修了 12 轮，无任何机制提示换方案）。
+func TestRepetitionGuardWarns(t *testing.T) {
+	a := &ReActAgent{}
+	calls := []ToolCall{{Name: "RunCommand", Input: map[string]any{"command": "python seg.py --render"}}}
+	var history []ReactMessage
+	for i := 0; i < 9; i++ {
+		history = a.repetitionGuard(calls, history)
+	}
+	if len(history) != 0 {
+		t.Fatalf("未达阈值不应注入预警，got %d", len(history))
+	}
+	history = a.repetitionGuard(calls, history)
+	if len(history) != 1 || !strings.Contains(history[0].Content, "重复动作预警") {
+		t.Fatalf("第 10 次应注入预警，got %+v", history)
+	}
+	if !strings.Contains(history[0].Content, "前提自检") {
+		t.Fatalf("预警应要求前提自检: %s", history[0].Content)
+	}
+	// 同签名不重复刷屏。
+	for i := 0; i < 5; i++ {
+		history = a.repetitionGuard(calls, history)
+	}
+	if len(history) != 1 {
+		t.Fatalf("同一签名只应预警一次，got %d", len(history))
+	}
+}
+
+// TestBudgetProfileSections 验证画像按小节预算：各小节尾部（最新）保留，
+// 不会因为从头截断把「技术栈/反馈记录」整节砍掉（2026-10-22 事故）。
+func TestBudgetProfileSections(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("# 用户画像\n\n引言\n\n")
+	for _, sec := range []string{"偏好", "沟通风格", "技术栈", "反馈记录"} {
+		b.WriteString("## " + sec + "\n\n")
+		for i := 0; i < 20; i++ {
+			b.WriteString("- " + sec + "第" + string(rune('A'+i)) + "行 " + strings.Repeat("内容", 10) + "\n")
+		}
+	}
+	in := b.String()
+	if len([]rune(in)) <= 2000 {
+		t.Fatalf("测试输入应超过预算，got %d", len([]rune(in)))
+	}
+	out := budgetProfileSections(in, 2000)
+	if n := len([]rune(out)); n > 2000 {
+		t.Fatalf("输出应 ≤2000 runes，got %d", n)
+	}
+	for _, sec := range []string{"偏好", "沟通风格", "技术栈"} {
+		if !strings.Contains(out, "## "+sec) {
+			t.Errorf("小节 %s 标题应保留", sec)
+		}
+		// 每节最后一行（最新）应保留。
+		if !strings.Contains(out, "- "+sec+"第T行") {
+			t.Errorf("小节 %s 的最新行应保留", sec)
+		}
+	}
+	if strings.Contains(out, "## 反馈记录") {
+		t.Error("归档小节（反馈记录）不应进入注入视图")
 	}
 }

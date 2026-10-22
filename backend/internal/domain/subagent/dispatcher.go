@@ -31,6 +31,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/mailbox"             // mailbox 包用于子 Agent 向父 Agent 发送完成通知
 	"github.com/blockmemory/agent/backend/internal/project"             // project 包提供 AGENTS.md/CLAUDE.md 项目自述读取（TODO 第10项⑦）
 	"github.com/blockmemory/agent/backend/internal/skill"               // skill 包提供技能池与元数据块渲染（技能分发）
+	"github.com/blockmemory/agent/backend/internal/userprofile"         // 项目偏好注入视图（剥归档 + 按小节预算）
 	"github.com/blockmemory/agent/backend/pkg/enums"                    // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
 	"github.com/blockmemory/agent/backend/pkg/textutil"                 // textutil 提供截断展示名用工具
 	"github.com/blockmemory/agent/backend/pkg/types"                    // types 包提供 RoleDefinition 类型
@@ -1658,8 +1659,13 @@ func (d *Dispatcher) projectPrefsPrefix(ctx context.Context) string {
 	if content == "" {
 		return ""
 	}
-	if len([]rune(content)) > projectPrefsRunes {
-		content = string([]rune(content)[:projectPrefsRunes]) + "\n...（项目偏好截断）"
+	// 注入视图（2026-10-22 污染修复）：归档小节只做磁盘审计不进上下文；
+	// 按小节预算保留最新自动行——旧实现从头截 2000 runes，既会把已废止内容
+	// 注入子 Agent，又会砍掉文件尾部最新写入的项目经验。
+	content = userprofile.StripSection(content, userprofile.ProjectArchiveSection)
+	content = userprofile.BudgetSections(content, projectPrefsRunes)
+	if strings.TrimSpace(content) == "" {
+		return ""
 	}
 	return "【项目偏好】\n" + content + "\n（以上是本项目的约定与经验。与用户当前指示/任务书冲突时以最新指示为准——经验可能滞后于最新决策，不是铁律）"
 }

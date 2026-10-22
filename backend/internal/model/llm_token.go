@@ -5,9 +5,23 @@ import (
 	"unicode/utf8" // UTF-8 rune 统计
 )
 
+// token 估算标定（2026-10-22）：旧口径"非 ASCII 1 字 1 token / ASCII 4 字符 1 token"
+// 对中文+JSON/代码混合内容明显偏低，导致 150K token 预算迟迟不触发压缩、请求实际
+// 体积远超阈值（事故会话 prompt 峰值 34 万字符，单次 input 42.6 万 token）。
+// 新口径按主流 tokenizer 的中位经验值：中文/全角 1.4 token/字，ASCII 3.2 字符/token。
+// 估算仍不追求与某一家 tokenizer 对齐；偏高会提前压缩，代价可控，偏低会漏压。
+const (
+	nonASCIITokensPerRune = 1.4
+	asciiCharsPerToken    = 3.2
+	// ImageTokenEstimate 单张图片的估算 token 数（按 1024×1024 量级取中位值）。
+	// 图片不走文本 tokenizer（按面积计费），旧估算器完全不计，是"估算正常但真实
+	// 请求爆掉"的盲区。
+	ImageTokenEstimate = 1600
+)
+
 // EstimateTokens 粗略估算文本的 token 数量。
-// 策略：中文字符按 1 字 ≈ 1 token；ASCII 按 4 字符 ≈ 1 token。
-// 这是本地调试的估算值，不追求与 OpenAI tokenizer 完全对齐。
+// 策略见上方标定常量：中文/全角 1.4 token/字，ASCII 3.2 字符/token。
+// 这是本地预算估算值，不追求与某一家 tokenizer 完全对齐。
 //
 // 参数：
 //   - text: 待估算文本
@@ -22,20 +36,7 @@ func EstimateTokens(text string) int {
 	if text == "" {
 		return 0
 	}
-	// 默认 token 数
-	var tokens int
-	// 第一遍粗估：遍历 rune，非 ASCII 计 1，ASCII 也计 1（后续会被 refine 修正）
-	for _, r := range text {
-		if r > 127 {
-			// 非 ASCII（中文、emoji 等）按 1 字 1 token
-			tokens++
-		} else {
-			// ASCII 按 4 字符 1 token，先每个字符计 1（后续 refine 会总体除 4）
-			tokens += 1
-		}
-	}
-	// 使用更精确的算法重算 token 数
-	return refineEstimate(text, tokens)
+	return refineEstimate(text, 0)
 }
 
 // refineEstimate 用更精确的算法重算 token 数。
@@ -62,8 +63,8 @@ func refineEstimate(text string, rough int) int {
 			nonAsciiCount++
 		}
 	}
-	// ASCII 部分 4 字符 ≈ 1 token，非 ASCII 1 字符 ≈ 1 token
-	tokens := nonAsciiCount + asciiCount/4
+	// 中文/全角 1.4 token/字，ASCII 3.2 字符 ≈ 1 token（JSON/代码比英文散文更密）。
+	tokens := int(float64(nonAsciiCount)*nonASCIITokensPerRune + float64(asciiCount)/asciiCharsPerToken)
 	// 若文本非空但计算结果小于 1，则至少返回 1
 	if tokens < 1 && runes > 0 {
 		tokens = 1

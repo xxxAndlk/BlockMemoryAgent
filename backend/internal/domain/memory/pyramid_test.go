@@ -287,3 +287,22 @@ func TestFormatSegmentText_TotalCapDropsOldest(t *testing.T) {
 		t.Fatalf("oldest message should have been dropped")
 	}
 }
+
+// TestFormatSegmentText_KeepsAskUserAnswer 验证 ask_user 答复按用户指令保留：
+// 即便位于最老位置且整段超量，也不能被当普通工具输出丢弃（2026-10-22 事故：
+// "帧渲染是正确做法"只以 tool result 存在，压缩后从【已定决策】里消失）。
+func TestFormatSegmentText_KeepsAskUserAnswer(t *testing.T) {
+	segment := []agent.ReactMessage{
+		{Role: "tool", Content: `{"tool":"ask_user","output":"用户答复:\n1. 答复: 用之前的帧渲染方式做连续视频，这是正确做法"}`},
+	}
+	for i := 0; i < 30; i++ {
+		segment = append(segment, agent.ReactMessage{Role: "assistant", Content: fmt.Sprintf("MSG%02d-", i) + strings.Repeat("x", 900)})
+	}
+	out := formatSegmentText(segment)
+	if !strings.Contains(out, "这是正确做法") {
+		t.Fatalf("ask_user 答复不应被总量上限丢弃:\n%s", out[:min(300, len(out))])
+	}
+	if !strings.Contains(out, "用户指令") {
+		t.Fatalf("ask_user 答复应标记为用户指令")
+	}
+}

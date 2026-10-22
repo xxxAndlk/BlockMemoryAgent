@@ -448,3 +448,26 @@ CREATE TABLE IF NOT EXISTS session_boards (
 `)
 	return err
 }
+
+// EnsureSessionDecisionsSchema 自动创建 session_decisions 会话决策账本表（幂等）。
+// 2026-10-22 上下文事故修复：用户指令/路线/参考基准/否决从对话历史独立出来，
+// 每轮固定注入、不参与压缩；append-only，状态只 UPDATE（active/superseded/rejected）。
+// owner 多租户预留（硬约定：新表带 owner 列）。
+func EnsureSessionDecisionsSchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS session_decisions (
+    id            BIGSERIAL PRIMARY KEY,
+    session_id    VARCHAR(64) NOT NULL,
+    owner         VARCHAR(64) NOT NULL DEFAULT '',
+    kind          VARCHAR(32) NOT NULL DEFAULT 'user_directive',
+    content       TEXT NOT NULL,
+    source        VARCHAR(32) NOT NULL DEFAULT '',
+    status        VARCHAR(16) NOT NULL DEFAULT 'active',
+    superseded_by BIGINT NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_session_decisions_session
+    ON session_decisions (session_id, created_at DESC);
+`)
+	return err
+}

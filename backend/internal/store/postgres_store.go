@@ -33,6 +33,7 @@ type PostgresStore struct {
 	LearnedSkills              *LearnedSkillStore  // 自进化技能库 + 进化日志（migration 007）
 	Mailbox                    *MailboxStore       // Agent 间邮件持久化（010_mailbox_messages.sql）
 	Board                      *BoardStore         // 会话任务看板持久化（011_session_boards.sql）
+	Decisions                  *SessionDecisionStore // 会话决策账本（2026-10-22 上下文事故修复）
 }
 
 // NewPostgresStore 创建 PostgreSQL 存储实例。
@@ -77,6 +78,7 @@ func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 	s.LearnedSkills = &LearnedSkillStore{db: db, pg: s}
 	s.Mailbox = NewMailboxStore(db)
 	s.Board = NewBoardStore(db)
+	s.Decisions = NewSessionDecisionStore(db)
 	return s, nil
 }
 

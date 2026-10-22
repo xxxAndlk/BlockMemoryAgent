@@ -151,7 +151,10 @@ func (s *Store) Append(section, text string) error {
 			content = strings.TrimRight(content, "\n") + "\n" + line + "\n"
 		} else {
 			insertAt := idx + 3 + next
-			content = content[:insertAt] + line + "\n" + content[insertAt:]
+			// insertAt 指向下一小节前的换行符：必须先补一个换行再插新行——旧写法
+			// content[:insertAt]+line 会把新行拼到上一行末尾，产出
+			// "- 旧行（时间）- 新行（时间）" 的畸形行（2026-10-22 线上实证）。
+			content = content[:insertAt] + "\n" + line + content[insertAt:]
 		}
 	}
 

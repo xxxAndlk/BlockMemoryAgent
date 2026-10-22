@@ -754,6 +754,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 看板持久化（2026-09-28 P1）：整板快照写穿 session_boards，重启惰性恢复。
 	rt.Boards.WithStore(boardStoreAdapter{st: store.NewBoardStore(pgStore.DB())})
 	agentSvc.SetBoard(rt.Boards.Get)
+	// 会话决策账本（2026-10-22 上下文事故修复）：用户指令/路线/参考基准/否决落 PG，
+	// 每轮固定注入、不参与压缩。未接 PG 时服务内部降级为纯内存账本。
+	agentSvc.SetDecisionStore(pgStore.Decisions)
 	// 看板移除器（会话硬删除路径）：DeleteSession 清掉该会话看板，防残留串台到同名新会话。
 	agentSvc.SetBoardRemover(rt.Boards.Remove)
 	// 用户输入自动提示词补全（TODO #36 Phase 0 规则版 + #39 四层管线）：命中续跑/控制/
@@ -972,7 +975,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	} else {
 		agentSvc.SetProjectPreferencesStore(projectPrefsStore)
 		subAgentDispatcher.WithProjectPreferences(func(ctx context.Context) string {
-			return projectPrefsStore.Current(ctx).Content
+			// 注入侧剥归档小节（经验归档）：已废止经验只留磁盘审计，不污染子 Agent。
+			return userprofile.StripSection(projectPrefsStore.Current(ctx).Content, projectPrefsStore.ArchiveSection())
 		})
 		toolRegistry.SetProjectPreferenceHook(func(ctx context.Context, text string) error {
 			return projectPrefsStore.Append(ctx, "项目约定", text)
@@ -1615,6 +1619,7 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 		"learned_skills":         store.EnsureLearnedSkillsSchema,
 		"mailbox_messages":       store.EnsureMailboxSchema,
 		"session_boards":         store.EnsureBoardSchema,
+		"session_decisions":      store.EnsureSessionDecisionsSchema,
 		"role_evolution_prompts": store.EnsureRoleEvolutionSchema,
 		"workflow":               store.EnsureWorkflowSchema,
 	} {

@@ -200,6 +200,29 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 		return
 	}
 	agentName := "SessionEvolver"
+	// 用户否决门（2026-10-22 上下文事故）：模型"自报完成"不等于用户验收。事故里
+	// 08:54 的会话完成把"按枢轴拆 7 个部件做骨骼拼接"写成项目经验，17:58 用户却说
+	// "你做的什么玩意"，这条错误经验此后每轮注入、持续污染。用户明确否定时：
+	//   ① 本轮不写任何新经验/新偏好；
+	//   ② 用否决清单反向归档画像/项目偏好里与否定方案矛盾的现行行；
+	//   ③ evolution_log 记 user_rejected，便于审计。
+	rejectedFeedback := hasHardRejection(in.UserMessages)
+	rejected := append([]string(nil), out.Rejected...)
+	if rejectedFeedback {
+		rejected = append(rejected, extractRejections(in.UserMessages)...)
+	}
+	if rejectedFeedback && len(rejected) > 0 {
+		if s.userProfile != nil {
+			s.mergeIntoStore(session.ID, agentName, s.userProfile, userProfileTargets, nil, rejected)
+		}
+		if s.projectPrefs != nil {
+			if st := s.projectPrefs.ForContext(tool.WithWorkDir(ctx, session.currentWorkDir())); st != nil {
+				s.mergeIntoStore(session.ID, agentName, st, projectPrefsTargets, nil, rejected)
+			}
+		}
+		s.logEvolution(session.ID, "user_rejected", "用户画像/项目经验", strings.Join(rejected, "；"))
+		return
+	}
 	// ① 用户偏好增量：Merge 整理进画像 + evolution_log。
 	if prefs := cleanIncrements(out.UserPrefs); len(prefs) > 0 && s.userProfile != nil {
 		s.mergeIntoStore(session.ID, agentName, s.userProfile, userProfileTargets, prefs, out.Rejected)
@@ -345,7 +368,12 @@ var projectPrefsTargets = []string{"项目经验"}
 //    去重，防降级路径重复堆积——实证画像归档同一行被原样追加 3 次）。
 // 目标小节维持 store 当前结构；计划为空且增量为空时零副作用。
 func (s *ReactService) mergeIntoStore(sessionID, agentName string, store *userprofile.Store, targets []string, increments, rejected []string) {
-	if store == nil || len(increments) == 0 {
+	if store == nil {
+		return
+	}
+	// 无增量但有否决清单时也要跑一次 Merge：把与被否决方案矛盾的现行行归档
+	// （2026-10-22：用户骂完"做的什么玩意"后旧路线仍留在画像里，下一会话继续注入）。
+	if len(increments) == 0 && len(rejected) == 0 {
 		return
 	}
 	if s.prefMerger != nil {
@@ -377,4 +405,67 @@ func (s *ReactService) mergeIntoStore(sessionID, agentName string, store *userpr
 			log.Printf("[evolver] append increment to archive failed: err=%v", err)
 		}
 	}
+}
+
+// hardRejectMarkers 是"用户明确否定成果"的强标记（比决策账本的 negativeFeedbackMarkers
+// 更严格：排除"不对/不是"这类可能出现在任务描述里的词）。命中即拒绝本轮经验沉淀。
+var hardRejectMarkers = []string{
+	"做的什么玩意", "什么玩意", "为什么做的这么差", "为什么这么差", "太差", "垃圾",
+	"重做", "做错", "搞错", "跑偏", "不满意", "不能用", "这什么", "难看",
+}
+
+// hasHardRejection 只看用户消息尾部（最近 1500 runes）：早期吐槽后已修复的会话不应
+// 被永久判为否决；只有"结束时用户还在骂"才阻止经验沉淀。
+func hasHardRejection(userMessages string) bool {
+	r := []rune(userMessages)
+	if len(r) > 1500 {
+		r = r[len(r)-1500:]
+	}
+	tail := strings.ToLower(string(r))
+	for _, m := range hardRejectMarkers {
+		if strings.Contains(tail, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractRejections 从用户消息里抽出否定句作为否决判据（去重、最多 3 条）。
+func extractRejections(userMessages string) []string {
+	r := []rune(userMessages)
+	if len(r) > 3000 {
+		r = r[len(r)-3000:]
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, line := range strings.Split(string(r), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || len([]rune(line)) < 4 {
+			continue
+		}
+		low := strings.ToLower(line)
+		hit := false
+		for _, m := range hardRejectMarkers {
+			if strings.Contains(low, m) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		t := truncateRunes(line, 200)
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+		if len(out) >= 3 {
+			break
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, "用户否决当前成果（会话以负面反馈收场）")
+	}
+	return out
 }

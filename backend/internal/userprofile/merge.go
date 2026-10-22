@@ -158,6 +158,91 @@ func StripSection(content, title string) string {
 	return RenderDocument(doc)
 }
 
+// BudgetSections 按小节预算渲染注入视图（2026-10-22 上下文污染修复）：
+//   - skip 小节（归档/反馈记录）整节剔除——已废止内容只做磁盘审计，不进模型上下文；
+//   - 每小节均分 maxRunes，自动行从末尾（最新）往前保留，最旧的省略并标注行数；
+//   - 人工行（无时间戳）优先保留，但整体仍受 maxRunes 硬上限约束。
+//
+// 旧实现从头截断：既会把归档小节原样注入（已否决内容反复污染），又会砍掉文件尾部
+// 最新写入的偏好（技术栈/反馈记录整节消失）。本函数是注入侧唯一截断口径，
+// Agent 画像注入与 Dispatcher 项目偏好前缀共用。
+func BudgetSections(content string, maxRunes int, skip ...string) string {
+	if maxRunes <= 0 {
+		return content
+	}
+	skipSet := make(map[string]bool, len(skip))
+	for _, s := range skip {
+		if t := strings.TrimSpace(s); t != "" {
+			skipSet[t] = true
+		}
+	}
+	doc := ParseDocument(content)
+	kept := make([]*DocSection, 0, len(doc.Sections))
+	for _, sec := range doc.Sections {
+		if skipSet[sec.Title] {
+			continue
+		}
+		kept = append(kept, sec)
+	}
+	doc.Sections = kept
+	if out := RenderDocument(doc); len([]rune(out)) <= maxRunes {
+		return out
+	}
+	if len(doc.Sections) == 0 {
+		return hardTruncateRunes(content, maxRunes)
+	}
+	budget := maxRunes - len([]rune(doc.Head)) - 160 // 省略标记留量
+	if budget < 300 {
+		budget = maxRunes / 2
+	}
+	per := budget / len(doc.Sections)
+	if per < 60 {
+		per = 60
+	}
+	for _, sec := range doc.Sections {
+		humanRunes := 0
+		for _, h := range sec.Human {
+			humanRunes += len([]rune(h)) + 1
+		}
+		remain := per - humanRunes
+		if remain < 0 {
+			remain = 0
+		}
+		used := 0
+		var tail []AutoLine
+		for i := len(sec.Auto) - 1; i >= 0; i-- {
+			n := len([]rune(sec.Auto[i].Text)) + len([]rune(sec.Auto[i].Stamp)) + 8
+			if used+n > remain && len(tail) > 0 {
+				break
+			}
+			tail = append([]AutoLine{sec.Auto[i]}, tail...)
+			used += n
+		}
+		dropped := len(sec.Auto) - len(tail)
+		sec.Auto = tail
+		if dropped > 0 {
+			sec.Human = append(sec.Human, fmt.Sprintf("…（本小节较早 %d 行因注入预算省略）", dropped))
+		}
+	}
+	out := RenderDocument(doc)
+	if len([]rune(out)) > maxRunes {
+		out = hardTruncateRunes(out, maxRunes)
+	}
+	return out
+}
+
+// hardTruncateRunes 按 rune 硬截断（最后防线，正常路径不会走到）。
+func hardTruncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n <= 1 {
+		return string(r[:n])
+	}
+	return string(r[:n-1]) + "…"
+}
+
 // ApplyMerge 应用一次合并计划：重写目标小节的自动行、归档旧行（保留最近 archiveCap 条）。
 // 人工行（含其他小节）逐字节不动；归档小节是唯一允许增长的额外小节。
 // 计划中出现的未知小节名被忽略（模型越界输出不落盘）。

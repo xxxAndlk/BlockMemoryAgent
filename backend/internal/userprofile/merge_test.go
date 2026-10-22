@@ -295,3 +295,56 @@ func TestMerge_ArchiveSelfHealExistingDups(t *testing.T) {
 		t.Fatalf("archive self-heal failed, %d copies remain: %s", n, s.Current().Content)
 	}
 }
+
+// TestBudgetSections_SkipsArchiveAndKeepsNewest 验证注入视图：归档小节整节剔除，
+// 每小节优先保留最新自动行（2026-10-22 污染修复）。
+func TestBudgetSections_SkipsArchiveAndKeepsNewest(t *testing.T) {
+	content := `# 用户画像
+
+## 偏好
+- 旧偏好条目（2026-10-20 10:00）
+- 新偏好条目（2026-10-22 10:00）
+
+## 反馈记录
+- 已废止的旧方案（2026-10-21 10:00）
+
+## 技术栈
+- 技术栈条目（2026-10-22 11:00）
+`
+	out := BudgetSections(content, 1200, "反馈记录")
+	if strings.Contains(out, "已废止的旧方案") {
+		t.Fatalf("归档小节不应进入注入视图:\n%s", out)
+	}
+	if !strings.Contains(out, "新偏好条目") || !strings.Contains(out, "技术栈条目") {
+		t.Fatalf("最新自动行应保留:\n%s", out)
+	}
+	if n := len([]rune(out)); n > 1200 {
+		t.Fatalf("注入视图应 ≤1200 runes，got %d", n)
+	}
+}
+
+// TestBudgetSections_DropsOldestUnderTightBudget 验证预算紧张时按小节从最旧开始省略。
+func TestBudgetSections_DropsOldestUnderTightBudget(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("# 画像\n\n## 偏好\n\n")
+	for i := 0; i < 8; i++ {
+		b.WriteString("- 偏好条目" + string(rune('A'+i)) + strings.Repeat("内容", 20) + "（2026-10-2" + string(rune('0'+i%9)) + " 10:00）\n")
+	}
+	b.WriteString("\n## 技术栈\n\n")
+	for i := 0; i < 8; i++ {
+		b.WriteString("- 技术条目" + string(rune('A'+i)) + strings.Repeat("内容", 20) + "（2026-10-2" + string(rune('0'+i%9)) + " 10:00）\n")
+	}
+	out := BudgetSections(b.String(), 700)
+	if strings.Contains(out, "偏好条目A") {
+		t.Fatalf("最旧行应被省略:\n%s", out)
+	}
+	if !strings.Contains(out, "偏好条目H") || !strings.Contains(out, "技术条目H") {
+		t.Fatalf("最新行必须保留:\n%s", out)
+	}
+	if !strings.Contains(out, "省略") {
+		t.Fatalf("应标注省略行数:\n%s", out)
+	}
+	if n := len([]rune(out)); n > 700 {
+		t.Fatalf("输出应 ≤700 runes, got %d", n)
+	}
+}

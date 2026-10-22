@@ -114,6 +114,9 @@ type ReactService struct {
 	// treeStore 可选的 Agent 树持久化层。为 nil 时纯内存。
 	// 由 bootstrap 注入 store.PostgresTreeStore;测试场景保持 nil。
 	treeStore orchestrator.TreeStore
+	// decisionStore 会话决策账本存储（2026-10-22 上下文事故修复）：用户指令/路线/
+	// 参考基准/否决落 PG，每轮固定注入，不参与压缩。为 nil 时账本仅内存生效。
+	decisionStore *store.SessionDecisionStore
 	// sharedMemoryStore 可选的共享记忆 KV,用于话题切换时写入旧话题摘要。
 	// key 格式 `topic:{topicID}:summary`。为 nil 时跳过摘要写入(测试场景)。
 	// MetaAgent 在新话题召回该摘要依赖步骤 4 part C(MetaAgent 根 recall 注入,未做)。
@@ -813,7 +816,9 @@ func (s *ReactService) metaPersona(workDir string) PersonaInjector {
 	}
 	return CombinePersonaInjectors(
 		s.persona,
-		NewUserProfileInjector(userCurrent, 2000),
+		// 用户画像：剥归档后当前约 2.1K runes（反馈记录整节省略），上限放到 3000 避免
+		// 稳定偏好被"技术栈"等后置小节挤掉；超限时按小节保留最新行。
+		NewUserProfileInjector(userCurrent, 3000),
 		// 注入口径（2026-10-19）：经验行可能滞后于最新决策，header 内声明"冲突以用户
 		// 当前指示为准"——旧经验保留参考权重但不压过用户最新指示。
 		NewSectionInjector("【项目偏好】（约定与经验；与用户当前指示冲突时以最新指示为准）", projCurrent, 2000),
@@ -2614,13 +2619,25 @@ func (s *ReactService) AskUserHook() tool.AskUserHookFunc {
 		sess := s.store.sessions[sid]
 		ch := make(chan string, 1)
 		sess.askUser = ch
+		// 计划审批冲突提示（2026-10-22）：submit_plan 走 ask_user 通道，计划全文在
+		// opts.Detail。批准前把"计划 vs 现行路线"的互斥命中标出来——事故里 14:23 的
+		// 计划明确写着"替代此前的 16 帧整图序列"，审批卡却没有任何提示，用户秒批。
+		detail := strings.TrimSpace(opts.Detail)
+		if detail != "" && strings.Contains(question, "【计划确认】") {
+			if warn := s.planConflictWarning(sess, detail, question); warn != "" {
+				detail = warn + detail
+				if first := strings.SplitN(warn, "\n", 2)[0]; strings.TrimSpace(first) != "" {
+					question = strings.TrimSpace(first) + "\n" + question
+				}
+			}
+		}
 		req := &ClarifyRequest{
 			ID:        fmt.Sprintf("ask-%d", time.Now().UnixNano()),
 			Question:  question,
 			Context:   "Agent 向用户提问（人在回路）",
 			AgentID:   tool.AgentIDFromContext(ctx),
 			CreatedAt: time.Now(),
-			Detail:    strings.TrimSpace(opts.Detail),
+			Detail:    detail,
 		}
 		// 结构化选项（TODO #53）：Kind=choice；纯自由文本提问保持旧行为（Kind=text）。
 		// 单选自动追加「其他」逃生选项（buildClarifyOptions）。
@@ -3954,6 +3971,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
 		WithMemoryIndex(s.memoryIndexBlock(session.Goal)).
+		WithDirectiveBlock(func() string { return s.decisionBlock(session) }).
 		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
 		WithPersonaInjector(s.metaPersona(session.currentWorkDir())).
 		WithMessageLogger(s.msgLogger).
@@ -3993,6 +4011,11 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 召回旧话题摘要拼到目标前(切换话题后续接上下文);同一话题只注入一次。
 	// 用注入会话 workDir 后的 runCtx:话题摘要 KV 按会话目录解析 .bma 根。
 	goal := s.injectTopicRecall(runCtx, session, session.Goal)
+	// 决策账本（2026-10-22）：会话目标入账（route 判定见 recordDecision）。
+	// 账本每轮以 system 块注入，独立于压缩历史——首条目标被后续指令修订后，
+	// 模型仍能从账本看到"最初目标 + 当前路线 + 已废止路线"。
+	s.hydrateDecisions(runCtx, session)
+	s.recordDecision(runCtx, session, store.DecisionKindDirective, session.Goal, "goal")
 	// 经验技能预筛（设计 §6.5）：goal 向量 top-3 命中只注一行提示，不注全文。
 	goal = s.injectSkillRecall(ctx, goal)
 
@@ -4113,7 +4136,17 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 拷贝历史记录，避免在加锁期间被外部修改。
 	history := make([]ReactMessage, len(session.History))
 	copy(history, session.History)
+	// 任务书兜底：续跑历史若不以目标开头（重启恢复/压缩摘要吃掉了首条 user），
+	// 把 goal 补回首位，保证模型每轮都能看到完整任务书与验收条款。
+	history = ensureGoalMessage(history, session.Goal)
 	s.store.mu.Unlock()
+
+	// 决策账本（2026-10-22）：本轮用户消息入账（唤醒轮的系统提示不是用户指令，跳过）。
+	// 这是"压缩摘要丢了但账本还在"的写入点——用户中途改向/否决都在这里被独立留存。
+	s.hydrateDecisions(ctx, session)
+	if !wakeTurn {
+		s.recordDecision(ctx, session, store.DecisionKindDirective, input, "user_message")
+	}
 
 	// 按档位解析本轮顶层角色（fast=doc_assistant / daily=domain / cluster=meta）；缺失则报错。
 	metaRole, gearRoleID := s.resolveGearMetaRole(session)
@@ -4175,6 +4208,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
 		WithMemoryIndex(s.memoryIndexBlock(session.Goal)).
+		WithDirectiveBlock(func() string { return s.decisionBlock(session) }).
 		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
 		// 人设链与首轮一致（2026-10-13 修复）：续跑曾用 metaPersonaLite（仅 soul），
 		// 依据"画像/偏好已在前缀缓存的历史里"节省 ~4K runes——该前提不成立：系统
@@ -5051,6 +5085,11 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	} else {
 		s.store.addEvent(session, eventkind.UserMessage, "User", content, "", "", "", "", "", true)
 	}
+	// 决策账本（2026-10-22）：运行中用户消息走邮箱注入、不经过 resumeSession——若不
+	// 在这里入账，"不要一直空转了/改用图集"这类中途干预只存在于邮箱一次性投递里，
+	// 下一轮压缩就消失。非运行会话也会入账，resumeSession 的重复写入由去重吸收。
+	s.hydrateDecisions(ctx, session)
+	s.recordDecision(ctx, session, store.DecisionKindDirective, content, "user_message")
 
 	// 运行中的会话：把新指令**投进 MetaAgent 邮箱**，本轮内的下一个检查点即读到它
 	//（等子 Agent 时 waitForChildren 每周期 drain，立即生效；其他阶段主循环顶部 drain，
@@ -5373,13 +5412,17 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 			Timestamp: time.Now(),
 		})
 		s.store.mu.Unlock()
+		// 批量答复同样入账（逐题编号保留，避免压缩后只剩最后一句）。
+		s.hydrateDecisions(ctx, session)
+		s.recordDecision(ctx, session, store.DecisionKindClarify, numbered, "clarify_answer")
 		s.store.addEvent(session, eventkind.Clarify, "User", "提问答复: "+numbered, "", "", "", "", "", true)
 		return nil
 	}
 	// 待答复的 Agent 提问（TODO #24 ask_user；#53 选项解析）：答复写 askUser 通道。
 	// 带选项时按选项 ID/Label/数字序号解析回传，自由文本原样透传。
 	if session.askUser != nil {
-		text, _ := recordClarifyAnswer(session.pendingClarify, answer)
+		pc := session.pendingClarify
+		text, _ := recordClarifyAnswer(pc, answer)
 		session.askUser <- text
 		session.Messages = append(session.Messages, Message{
 			Role:      string(enums.ChatRoleUser),
@@ -5387,6 +5430,17 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 			Timestamp: time.Now(),
 		})
 		s.store.mu.Unlock()
+		// 决策账本（2026-10-22）：ask_user 答复只以 tool result 进历史，压缩时按工具
+		// 输出截断/丢弃；这里独立入账，保证"帧渲染是正确做法""要到这种类型"这类
+		// 用户裁决在任意压缩后仍然可见。
+		s.hydrateDecisions(ctx, session)
+		s.recordDecision(ctx, session, store.DecisionKindClarify, answer, "clarify_answer")
+		// 计划确认答复：批准则把计划摘要入账（kind=plan），供后续回溯"用户批准过什么"。
+		if pc != nil && strings.Contains(pc.Question, "【计划确认】") && clarifyAnswerApproved(pc, answer) {
+			if summary := planSummaryFromClarify(pc); summary != "" {
+				s.recordDecision(ctx, session, store.DecisionKindPlan, summary, "plan_approved")
+			}
+		}
 		s.store.addEvent(session, eventkind.Clarify, "User", "提问答复: "+answer, "", "", "", "", "", true)
 		return nil
 	}
@@ -5492,6 +5546,9 @@ func (s *ReactService) enqueue(ctx context.Context, sessionID, content string) e
 
 	// 记录队列注入事件。
 	s.store.addEvent(session, eventkind.Enqueue, "User", "队列注入: "+content, "", "", "", "", "", true)
+	// 决策账本：队列注入同样是用户指令，入账后才不会被下一轮压缩吞掉。
+	s.hydrateDecisions(ctx, session)
+	s.recordDecision(ctx, session, store.DecisionKindDirective, content, "enqueue")
 	// 运行中：投进 MetaAgent 邮箱即时生效（同 sendMessage）。此前该分支只发事件不投递，
 	// 内容根本没进对话历史/循环——"队列注入"名不副实（2026-09-12 实证）。
 	if wasRunning {

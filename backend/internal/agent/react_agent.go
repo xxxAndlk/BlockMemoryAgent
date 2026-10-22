@@ -24,6 +24,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/middleware"
 	"github.com/blockmemory/agent/backend/internal/model"
 	"github.com/blockmemory/agent/backend/internal/project"
+	"github.com/blockmemory/agent/backend/internal/userprofile"
 	"github.com/blockmemory/agent/backend/pkg/textutil"
 	"github.com/blockmemory/agent/backend/pkg/types"
 	"github.com/go-kratos/blades"
@@ -123,6 +124,22 @@ type ReActAgent struct {
 	//（renderMemoryIndex 渲染，行数/runes 双配额），详情走向量召回。同 skillBlock
 	// 尾部注入位（前缀缓存安全）；空串=未接线/无沉淀。
 	memoryIndex string
+	// directiveBlock 用户指令账本 provider（WithDirectiveBlock 注入，2026-10-22）：
+	// 每轮请求末尾追加一条 system 消息。它独立于对话历史与压缩摘要，是"用户最后
+	// 说了什么/哪条路线已被废止"的不可裁剪锚点。
+	directiveBlock func() string
+	// repeatSigs/repeatWarned 重复动作止损（2026-10-22，warning-only）：统计本轮内
+	// 同一"工具+关键参数"的出现次数，≥10 注入前提自检预警、≥20 注入最终警告。
+	// 顶层 Agent 不设硬杀（2026-10-20 误杀实证），只把"你在同一条路上反复打补丁"
+	// 摆到模型面前——事故里同一验收项修了 12 轮（填洞→髋盘→踝影→开运算）。
+	repeatSigs   map[string]int
+	repeatWarned map[string]bool
+	// emergencyWindow 空响应应急窗口（2026-10-22）：连续空响应时把下一次请求的
+	// 历史条数压到该值（0=不启用）；forceStripImages 同步剥掉图片。两者在收到
+	// 正常响应后复位。空响应常见于上下文过大/图片过多（事故：340k 字符 + 大图，
+	// 模型连续 3 次返回空，系统只回"你上一条回复为空"，把病因掩盖成模型抽风）。
+	emergencyWindow  int
+	forceStripImages bool
 	// evolutionBlock 自进化准则槽（角色级、AI 自维护、≤300字）：本角色历史沉淀的
 	// 抽象行为准则，由 WithEvolutionBlock 在构造期注入。同 skillBlock/memoryIndex
 	// 尾部注入位（前缀缓存安全）；空串=该角色无准则不注入。
@@ -246,9 +263,21 @@ func (p *sectionInjector) Inject(systemPrompt string) string {
 		return systemPrompt
 	}
 	if len([]rune(content)) > p.maxRunes {
-		content = string([]rune(content)[:p.maxRunes]) + "\n...（截断）"
+		// 按小节预算截断（2026-10-22）：旧逻辑从头截 2000 runes，直接把文件尾部的
+		// 「反馈记录」「技术栈」整节砍掉——而最新写入的偏好恰恰常在后面。改为每小节
+		// 保留"最新若干行"，并标注省略行数。
+		content = budgetProfileSections(content, p.maxRunes)
 	}
 	return p.header + "\n" + content + "\n\n" + systemPrompt
+}
+
+// budgetProfileSections 按小节预算渲染注入视图（委托 userprofile.BudgetSections）：
+// 归档小节（反馈记录/经验归档）整节剔除，每节保留最新自动行。2026-10-22 污染修复。
+func budgetProfileSections(content string, maxRunes int) string {
+	// 归档小节（用户画像「反馈记录」/项目偏好「经验归档」）永不进入注入视图：
+	// 它们是已废止内容的审计区，注入只会让模型把旧方案当现行偏好。
+	return userprofile.BudgetSections(content, maxRunes,
+		userprofile.DefaultArchiveSection, userprofile.ProjectArchiveSection)
 }
 
 // LoopConfig 是 ReAct 主循环的运行时参数，由 WithLoopConfig 注入。
@@ -335,6 +364,15 @@ func (a *ReActAgent) WithSkillBlock(block string) *ReActAgent {
 // 空串为零行为。索引超限时调用方（renderMemoryIndex）已带重写指令，不静默截断。
 func (a *ReActAgent) WithMemoryIndex(block string) *ReActAgent {
 	a.memoryIndex = block
+	return a
+}
+
+// WithDirectiveBlock 注入会话用户指令账本 provider（2026-10-22 上下文事故修复）。
+// 每轮构建请求时求值，作为 system 消息追加到消息尾部——既不被历史压缩吞掉，
+// 也不被 windowMessages 滑窗裁掉；账本内容只在用户发新指令时变化，前缀缓存影响可忽略。
+// 仅会话顶层 Agent 注入；子 Agent 不读用户账本（其任务由父 Agent 的任务书界定）。
+func (a *ReActAgent) WithDirectiveBlock(f func() string) *ReActAgent {
+	a.directiveBlock = f
 	return a
 }
 
@@ -667,6 +705,15 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 与持久化不受影响；驱逐保留 tool 消息本体，sanitizeToolPairing 配对不受影响。
 		assembled = evictStaleToolResults(assembled, a.staleToolEvictRounds)
 
+		// 用户指令账本（2026-10-22 上下文事故修复）：放在请求末尾，与时间块同构——
+		// 不进入压缩段、不会被 windowMessages 裁掉。账本与压缩摘要/项目偏好冲突时，
+		// 由账本块的显式规则宣告自己优先级更高（见 decisionBlock 渲染）。
+		if a.directiveBlock != nil {
+			if blk := strings.TrimSpace(a.directiveBlock()); blk != "" {
+				assembled = append(assembled, ReactMessage{Role: "system", Content: blk})
+			}
+		}
+
 		// 当前时间尾部注入（TODO #40 块 1）：时间每轮变化，放尾部不破坏前缀缓存。
 		// 所有 Agent（meta/domain/叶子）统一注入，与看板段同位（不可缓存尾部）。
 		assembled = append(assembled, buildTimeMessage())
@@ -675,7 +722,13 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 历史压缩（hot/cold 分层）已迁入 memory.Pipeline.Assemble，仅按 token 阈值触发
 		// （步频扳机已退役）；压缩先于窗口动手，窗口默认值已放大到 400 避免抢先裁剪。
 		// windowMessages 只影响本次请求，不修改 history（完整历史仍用于持久化与续跑）。
-		messages := windowMessages(assembled, a.historyMaxMessages)
+		// 空响应应急：连续空响应时把窗口压到 emergencyWindow，先排除"上下文过大"这个
+		// 机械病因，再谈模型是否抽风（2026-10-22：340k 字符 + 大图连续 3 次空响应）。
+		winLimit := a.historyMaxMessages
+		if a.emergencyWindow > 0 && (winLimit <= 0 || a.emergencyWindow < winLimit) {
+			winLimit = a.emergencyWindow
+		}
+		messages := windowMessages(assembled, winLimit)
 		// 兜底防线：任何裁剪/注入路径若留下不配对的 tool 调用（assistant tool_calls
 		// 未紧随 tool 结果，或孤立 tool 结果），Anthropic/OpenAI 会以 400 拒绝整轮请求，
 		// 此前所有 LLM 耗时全部作废（实证 domain-2 白跑 31m43s）。发送前强制配对。
@@ -684,7 +737,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 视觉能力缺失降级（2026-09-16）：当前模型已知不支持图片输入时，请求视图剥掉
 		// 全部图像（含用户上传与 ReadMedia/插件截图透传），避免每次调用都撞 provider 400；
 		// canonical history 与持久化不受影响，换模型后图片自动恢复。
-		if a.noImageInput() {
+		if a.noImageInput() || a.forceStripImages {
 			messages = stripImagesForRequest(messages)
 		}
 
@@ -785,8 +838,23 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		// 模型继续；连续空响应达到上限则显式报错，让上层以可见错误结束。
 		if len(assistant.ToolCalls) == 0 && strings.TrimSpace(assistant.Content) == "" {
 			emptyStreak++
+			// 诊断先行（2026-10-22）：空响应常被误读成"模型抽风"，实际多为上下文
+			// 过大/图片过多。把请求体积打进日志，并逐级应急缩窗/剥图；达到上限时
+			// 错误里带同一组数字，避免用户只能反复"继续"。
+			msgCount, estTokens, imgCount, maxRunes := requestStats(messages)
+			log.Printf("[react] empty response role=%s streak=%d finish=%s msgs=%d est_tokens=%d images=%d max_msg_runes=%d",
+				a.name, emptyStreak, resp.Message.FinishReason, msgCount, estTokens, imgCount, maxRunes)
+			switch emptyStreak {
+			case 1:
+				a.emergencyWindow = 160
+			case 2:
+				a.emergencyWindow = 60
+				a.forceStripImages = true
+			}
 			if emptyStreak >= maxEmptyResponses {
-				return ReactResult{History: history}, fmt.Errorf("model returned %d consecutive empty responses (finish_reason=%s)", emptyStreak, resp.Message.FinishReason)
+				return ReactResult{History: history}, fmt.Errorf(
+					"model returned %d consecutive empty responses (finish_reason=%s; msgs=%d est_tokens=%d images=%d max_msg_runes=%d)",
+					emptyStreak, resp.Message.FinishReason, msgCount, estTokens, imgCount, maxRunes)
 			}
 			// 空 assistant 消息不写入历史（空 content 块可能被 API 拒绝），
 			// 仅以一条提示消息要求模型继续。
@@ -794,6 +862,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			continue
 		}
 		emptyStreak = 0
+		// 正常响应说明应急缩窗/剥图已生效或模型恢复：复位，下一轮回到正常预算。
+		a.emergencyWindow = 0
+		a.forceStripImages = false
 
 		// 非空响应才追加到历史中。入史副本截断超长工具入参（如 WriteFile 全文件内容）：
 		// 完整入参仅用于本次派发执行；历史/持久化/续跑只保留截断副本。
@@ -987,6 +1058,9 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		if stagnationErr != nil {
 			return ReactResult{History: history}, stagnationErr
 		}
+		// 重复动作止损（2026-10-22，全部 Agent、warning-only）：同一"工具+关键参数"
+		// 反复出现时把"前提自检"摆到模型面前，打断"在错误前提上打补丁"的循环。
+		history = a.repetitionGuard(assistant.ToolCalls, history)
 	}
 
 	// 达到最大迭代次数上限（仅 maxIter>0 时可能触发）：
@@ -1059,6 +1133,63 @@ func (a *ReActAgent) stagnationGuard(streak int, calls []ToolCall, mailboxDraine
 			"【停滞预警】已连续 %d 轮没有任何产出性动作（仅只读探查/验证）。若证据已足够，直接基于已有信息推进下一步（写文件/派发/终答）；若仍缺信息，换一个检索角度或换策略，不要重复同一探查。", streak)})
 	}
 	return history, streak, nil
+}
+
+// repetitionTrackedTools 参与重复动作统计的工具（裸名）。只覆盖"改同一处/读同一物/
+// 跑同一命令"的高频循环源；派发/消息类天然带随机 ID，不统计。
+var repetitionTrackedTools = map[string]bool{
+	"EditFile": true, "WriteFile": true, "RunCommand": true, "ReadMedia": true,
+	"browser_take_screenshot": true, "browser_navigate": true,
+}
+
+// repetitionGuard 重复动作止损（2026-10-22，warning-only，全部 Agent 生效）。
+// 同一"工具 + 关键参数"累计出现 10 次注入前提自检预警、20 次注入最终警告。
+// 不做硬杀：顶层 Agent 硬杀会终止整个会话（2026-10-20 误杀实证），而这里要治的是
+// "在同一错误前提上连续打补丁"——把问题显式摆到模型面前，比替它做决定更安全。
+func (a *ReActAgent) repetitionGuard(calls []ToolCall, history []ReactMessage) []ReactMessage {
+	if len(calls) == 0 {
+		return history
+	}
+	if a.repeatSigs == nil {
+		a.repeatSigs = map[string]int{}
+		a.repeatWarned = map[string]bool{}
+	}
+	for _, tc := range calls {
+		name := tool.BareToolName(tc.Name)
+		if !repetitionTrackedTools[name] {
+			continue
+		}
+		sig := repetitionSignature(tc)
+		a.repeatSigs[sig]++
+		n := a.repeatSigs[sig]
+		if (n == 10 || n == 20) && !a.repeatWarned[sig] {
+			a.repeatWarned[sig] = true
+			history = a.appendLogged(history, ReactMessage{Role: "user", Content: fmt.Sprintf(
+				"【重复动作预警】同一动作已重复 %d 次：%s\n"+
+					"如果你正在反复修同一个验收项，先做「前提自检」：当前方法是否根本不可能达成目标？"+
+					"（例：刚体旋转必然在关节处裂开，继续调参数没有意义。）请换实现路线，或把卡点写进 ask_user/终答，不要继续同一动作。",
+				n, truncateRunes(sig, 160))})
+		}
+	}
+	return history
+}
+
+// repetitionSignature 生成"工具 + 关键参数"签名。优先取路径/命令，其次取首个小参数字符串，
+// 最后退回完整入参 JSON（截断 160 runes，控制内存）。
+func repetitionSignature(tc ToolCall) string {
+	key := ""
+	for _, k := range []string{"path", "file_path", "command", "url", "script"} {
+		if v, ok := tc.Input[k].(string); ok && strings.TrimSpace(v) != "" {
+			key = v
+			break
+		}
+	}
+	if key == "" {
+		if raw, err := json.Marshal(tc.Input); err == nil {
+			key = string(raw)
+		}
+	}
+	return tc.Name + "|" + truncateRunes(strings.TrimSpace(key), 160)
 }
 
 // condenseToolResult 工具结果统一收口（TODO 第9项②）：单条工具输出超过 toolResultDumpRunes
@@ -1762,6 +1893,19 @@ func (a *ReActAgent) waitForChildren(ctx context.Context, history []ReactMessage
 // 触发仅由 token 阈值驱动（memory.Pipeline.WithContextBudget + WithTokenEstimator，
 // bootstrap 注入；步频扳机已退役），保留段长度由 WithCompression(keepRecent) 配置。
 
+// requestStats 返回请求体积诊断（空响应/预算告警用）。images 单独计数：
+// EstimateMessagesTokens 按设计不计图片，这正是"估算正常但真实请求爆掉"的盲区。
+func requestStats(msgs []ReactMessage) (count, estTokens, images, maxRunes int) {
+	estTokens = EstimateMessagesTokens(msgs)
+	for _, m := range msgs {
+		images += len(m.Images)
+		if n := len([]rune(m.Content)); n > maxRunes {
+			maxRunes = n
+		}
+	}
+	return len(msgs), estTokens, images, maxRunes
+}
+
 // windowMessages 把发送给 LLM 的消息裁剪到最多 max 条（滑动窗口）：
 // 保留开头的 system 消息（记忆注入）与最近的对话，下刀处避开孤立的 tool 结果
 // （assistant 的 tool_calls 与后续 tool 结果须成对，部分 provider 校验不成对会报错；
@@ -1788,14 +1932,24 @@ func windowMessages(messages []ReactMessage, max int) []ReactMessage {
 	if firstUserIdx < 0 {
 		return messages
 	}
-	// 预算：system 前缀 + 首条 user + 省略说明各占 1 条，其余留给最近消息。
-	budget := max - keep - 2
+	// 首条 user 之后紧跟的连续 system 是压缩视图的固定前缀（历史压缩摘要 + 热改动回灌），
+	// 必须与首条 user 同权保留：它们承载【已定决策】，被窗口裁掉后模型只剩陈旧的首条
+	// 目标可锚定（2026-10-22 实证：11:48 的 399 条窗口把「排除拼接方案」整段摘要裁掉，
+	// Agent 在错误路线上又跑了 3 小时）。position 语义：位于首条 user 之后、保留段之前，
+	// 因此这里只扫描 firstUserIdx+1 起的连续 system，不动尾部注入（近期事件/文件地图/时间）。
+	prefixSysEnd := firstUserIdx + 1
+	for prefixSysEnd < len(messages) && messages[prefixSysEnd].Role == "system" {
+		prefixSysEnd++
+	}
+	pinned := prefixSysEnd - firstUserIdx - 1
+	// 预算：system 前缀 + 首条 user + 省略说明 + 压缩视图固定前缀，其余留给最近消息。
+	budget := max - keep - 2 - pinned
 	if budget < 1 {
 		budget = 1
 	}
 	start := len(messages) - budget
-	if start < firstUserIdx+1 {
-		start = firstUserIdx + 1
+	if start < prefixSysEnd {
+		start = prefixSysEnd
 	}
 	// 向前移动 start 避开孤立的 tool 结果消息：tool 结果必须跟随其 assistant tool_calls，
 	// 窗口从 tool 结果开始会被 API 拒绝（orphaned tool_result）。
@@ -1812,10 +1966,13 @@ func windowMessages(messages []ReactMessage, max int) []ReactMessage {
 	out := make([]ReactMessage, 0, len(messages)-omitted+1)
 	out = append(out, messages[:keep]...)
 	out = append(out, messages[firstUserIdx]) // 首条 user 任务目标
+	// 压缩视图固定前缀（历史压缩摘要/热回灌）原样保留，位于首条 user 之后、占位符之前。
+	// 这些 system 消息不进对话窗口预算之外还会被计入 pinned，前缀缓存字节稳定。
+	out = append(out, messages[firstUserIdx+1:prefixSysEnd]...)
 	// 占位文本固定（不含动态计数）：避免每轮 omitted 变化导致前缀缓存失效。
 	out = append(out, ReactMessage{
 		Role:    "user",
-		Content: "（上下文已省略早期对话，关键结论见下方近期事件）",
+		Content: "（上下文已省略早期对话；现行方向见下方【用户指令账本】，两者冲突时以账本为准）",
 	})
 	out = append(out, messages[start:]...)
 	return out
@@ -1921,7 +2078,8 @@ func (a *ReActAgent) buildSystemPrompt() string {
 			"1. 只在必要时调用工具；先用 SearchInFiles/ListDir 定位，再按需 ReadFile；不重复读取已读过的文件。\n" +
 			"2. 产出或修改文件后必须验证：代码类产出用 RunCommand 跑构建/测试/语法检查；非代码产出对照任务验收标准逐条核对。没有验证证据不得声称完成。\n" +
 			"3. 任务完成立即停止调用工具，输出最终答复；答复必须自包含：做了什么、结果如何、关键产出与文件路径。\n" +
-			"4. 形如 [mailbox from <agent_id>] 的消息是异步子 Agent 回传的结果摘要，阅读后整合进当前结论；若摘要表明失败，决定重试、自己接手或在答复中说明。\n"
+			"4. 形如 [mailbox from <agent_id>] 的消息是异步子 Agent 回传的结果摘要，阅读后整合进当前结论；若摘要表明失败，决定重试、自己接手或在答复中说明。\n" +
+			"5. 上下文出现【用户指令账本】时先读它：现行路线/验收基准/已否决项以账本为准；与压缩摘要、项目偏好、用户画像冲突时不得自行取舍，先停下来向用户确认。\n"
 	prompt := envBlock + "\n\n" + base + "\n\n" + discipline
 	// 技能元数据块（渐进披露第一层）追加在纪律块之后：持有技能的名称+一句话描述 +
 	// load_skill 取全文/派发下放提示。放在尾部只 fork 提示词尾部，envBlock+base+纪律块

@@ -66,3 +66,31 @@ func TestStore_SaveOverwrites(t *testing.T) {
 		t.Fatalf("Save should fully replace, got: %s", content)
 	}
 }
+
+// TestStore_AppendBeforeNextSectionKeepsLineBoundary 验证向"非末尾小节"追加时
+// 新行不会拼到上一行末尾（2026-10-22 线上用户画像出现 "- 旧行（时间）- 新行（时间）"）。
+func TestStore_AppendBeforeNextSectionKeepsLineBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profile.md")
+	seed := "# 用户画像\n\n## 反馈记录\n- 旧归档行（2026-10-20 10:00）\n\n## 技术栈\n- 技术行（2026-10-20 10:00）\n"
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	s := NewStore(path)
+	if err := s.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := s.Append("反馈记录", "新归档行"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	content := s.Current().Content
+	if strings.Contains(content, "）- 新归档行") || strings.Contains(content, "）- 新归档行") {
+		t.Fatalf("新行被拼到上一行末尾:\n%s", content)
+	}
+	if !strings.Contains(content, "- 新归档行（") {
+		t.Fatalf("新行缺失:\n%s", content)
+	}
+	// 技术栈小节必须还在。
+	if !strings.Contains(content, "## 技术栈") || !strings.Contains(content, "- 技术行（") {
+		t.Fatalf("下一小节被破坏:\n%s", content)
+	}
+}

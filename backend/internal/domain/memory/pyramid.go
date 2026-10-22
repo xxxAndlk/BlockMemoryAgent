@@ -303,20 +303,39 @@ func formatSegmentText(segment []agent.ReactMessage) string {
 		if role == "tool" {
 			limit = segmentTextToolMsgRunes
 		}
+		// ask_user 答复是用户裁决，不是工具输出（2026-10-22 事故）：它只以 tool result
+		// 进历史，旧逻辑按 800 runes 截断并在段超限时整条丢弃，导致"帧渲染是正确做法"
+		// "要到这种类型"在压缩后消失。这里显式标成用户指令并放宽到 user 档。
+		tag := role
+		if role == "tool" && isUserDirectiveToolResult(content) {
+			tag = "用户指令（ask_user 答复·优先级高于工具输出）"
+			limit = segmentTextMsgRunes
+		}
 		if r := []rune(content); len(r) > limit {
 			content = string(r[:limit]) + "…"
 		}
-		lines = append(lines, fmt.Sprintf("[%s] %s", role, content))
+		lines = append(lines, fmt.Sprintf("[%s] %s", tag, content))
 	}
-	// 段总量 cap：从最老消息开始丢弃，保留最新（近期上下文细节价值最高）。
+	// 段总量 cap：优先丢弃最老的非用户消息；用户指令（含 ask_user 答复）不因输入
+	// 超限被整条丢弃——它们是压缩包【已定决策】的唯一来源（2026-10-22 事故）。
 	total := 0
 	for _, l := range lines {
 		total += len([]rune(l)) + 1
 	}
 	dropped := 0
 	for total > maxSegmentTextRunes && len(lines) > 1 {
-		total -= len([]rune(lines[0])) + 1
-		lines = lines[1:]
+		drop := -1
+		for i, l := range lines {
+			if !strings.HasPrefix(l, "[user]") && !strings.HasPrefix(l, "[用户指令") {
+				drop = i
+				break
+			}
+		}
+		if drop < 0 {
+			drop = 0
+		}
+		total -= len([]rune(lines[drop])) + 1
+		lines = append(lines[:drop], lines[drop+1:]...)
 		dropped++
 	}
 	var sb strings.Builder
@@ -328,6 +347,17 @@ func formatSegmentText(segment []agent.ReactMessage) string {
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+// isUserDirectiveToolResult 判断一条 tool 消息是否是 ask_user 的用户答复。
+// 用户裁决只以 tool result 进 ReAct 历史（answerClarify 写的是 session.Messages，
+// 不是 History），压缩时若按普通工具输出处理，就会在【已定决策】里消失。
+func isUserDirectiveToolResult(content string) bool {
+	c := strings.TrimSpace(content)
+	if strings.HasPrefix(c, "用户答复:") || strings.HasPrefix(c, "用户答复：") {
+		return true
+	}
+	return strings.Contains(c, `"tool":"ask_user"`) && strings.Contains(c, "用户答复")
 }
 
 // truncateSegment 是压缩包的截断式降级：user 消息保前 500 字符，其余 200 字符。

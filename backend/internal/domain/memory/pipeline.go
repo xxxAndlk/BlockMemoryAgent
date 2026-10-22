@@ -720,6 +720,12 @@ func renderTruncated(sb *strings.Builder, messages []agent.ReactMessage) {
 		if role == "user" {
 			limit = midUserChunkMax
 		}
+		// ask_user 答复属于用户裁决，按 user 档保留（2026-10-22 事故：旧逻辑按工具输出
+		// 压到 200 字，关键指令在压缩降级路径里丢失）。
+		if role == "tool" && isUserDirectiveToolResult(content) {
+			role = "用户指令"
+			limit = midUserChunkMax
+		}
 		if r := []rune(content); len(r) > limit {
 			content = string(r[:limit]) + "…"
 		}

@@ -69,6 +69,9 @@ func mergePreferences(ctx context.Context, factory *model.ModelFactory, view use
 		}
 	}
 	b.WriteString("\n新增增量:\n")
+	if len(increments) == 0 {
+		b.WriteString("（本轮没有新增偏好；只执行「用户否决清单」的归档：把与被否决方案矛盾的现行行移入 archived，不要新增任何行）\n")
+	}
 	for i, inc := range increments {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, inc)
 	}
@@ -78,6 +81,7 @@ func mergePreferences(ctx context.Context, factory *model.ModelFactory, view use
 - 去重：与现有行语义重复的增量不再新增
 - 近重复整理：现有行之间语义近重复/互为子集的也要合并为一条（保留信息并集、去掉重复表述）——历史冗余借本轮一并清理，不要原样搬运
 - 冲突：新增量与现有行矛盾时（如 npm vs pnpm）新表述生效，被替换的现有行放入 archived
+- 跨小节一致性自检（重要）：矛盾可能分散在不同小节/不同行——例如「技术栈」写着"使用拼接骨架模拟行走"、「偏好」写着"不做部位拼接"，两者互斥却会同时注入模型。输出前必须通读 merged 的全部小节，把同一决策轴上的互斥表述收敛为一条（保留与新增量/用户否决一致的那条），其余移入 archived；**禁止把两个互斥方案同时留在现行档案里**
 - 作废：现行行与"用户否决清单"或"已归档历史行"矛盾时，现行行移入 archived（用户否决优先于历史沉淀）
 - 防复活：增量与已归档历史行相同或语义等同的，直接丢弃（历史已废止，不得借增量复活进 merged）
 - archived 输出自查：不得包含已归档历史行（避免同文本反复归档）；同文本只输出一次

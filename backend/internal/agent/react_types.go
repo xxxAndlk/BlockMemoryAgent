@@ -67,6 +67,9 @@ func EstimateMessagesTokens(msgs []ReactMessage) int {
 			total += model.EstimateTokens(tc.Name) + model.EstimateTokens(tc.ID)
 		}
 		total += model.EstimateTokens(m.ToolCallID)
+		// 图片按面积计费，不走文本 tokenizer；旧估算完全不计，导致"估算 150K 正常、
+		// 真实请求 40 万 token"（2026-10-22 空响应事故）。每张按中位值计。
+		total += len(m.Images) * model.ImageTokenEstimate
 	}
 	return total
 }
@@ -413,6 +416,30 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 			break
 		}
 	}
+	// 图片透传上限（2026-10-22 空响应事故）：单轮请求最多附带 4 张、合计 ≤8MiB 原始字节。
+	// 旧逻辑把"最新一批 tool 结果"的图片全部挂上，并行 ReadMedia/截图一轮 10+ 张即可把
+	// 请求推到 40 万 token，模型直接返回空响应。超限的图片只丢本次附件，文本占位符仍在，
+	// 模型需要时可按路径重新 ReadMedia。
+	const (
+		maxRequestImages     = 4
+		maxRequestImageBytes = 8 << 20
+	)
+	imgCount, imgBytes := 0, 0
+	takeImage := func(img tool.ResultImage) (blades.DataPart, bool) {
+		if imgCount >= maxRequestImages || imgBytes >= maxRequestImageBytes {
+			return blades.DataPart{}, false
+		}
+		raw, err := base64.StdEncoding.DecodeString(string(img.Data))
+		if err != nil || len(raw) == 0 || img.MIMEType == "" {
+			return blades.DataPart{}, false
+		}
+		if imgBytes+len(raw) > maxRequestImageBytes && imgCount > 0 {
+			return blades.DataPart{}, false
+		}
+		imgCount++
+		imgBytes += len(raw)
+		return blades.DataPart{MIMEType: blades.MIMEType(img.MIMEType), Bytes: raw}, true
+	}
 	// 遍历每一轮对话消息，根据角色转换为 blades 对应的消息类型。
 	for i, m := range history {
 		// 根据消息角色进入不同分支处理。
@@ -426,12 +453,16 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 				if m.Content != "" {
 					parts = append(parts, blades.TextPart{Text: m.Content})
 				}
+				skipped := 0
 				for _, img := range m.Images {
-					raw, err := base64.StdEncoding.DecodeString(string(img.Data))
-					if err != nil || len(raw) == 0 || img.MIMEType == "" {
-						continue
+					if part, ok := takeImage(img); ok {
+						parts = append(parts, part)
+					} else {
+						skipped++
 					}
-					parts = append(parts, blades.DataPart{MIMEType: blades.MIMEType(img.MIMEType), Bytes: raw})
+				}
+				if skipped > 0 {
+					parts = append(parts, blades.TextPart{Text: fmt.Sprintf("（%d 张图片因单次请求上限未随本轮发送；需要时用 ReadMedia 按路径重读）", skipped)})
 				}
 				if len(parts) > 0 {
 					out = append(out, &blades.Message{Role: blades.RoleUser, Parts: parts})
@@ -484,12 +515,16 @@ func ToBladesMessages(history []ReactMessage) []*blades.Message {
 			// Response 里的文本占位符仍保留痕迹）；是否序列化进请求由 provider 决定
 			//（anthropic 转 image block；openai 系忽略 DataPart，天然降级）。
 			if i >= imgBatchStart && i < imgBatchEnd {
+				skipped := 0
 				for _, img := range m.Images {
-					raw, err := base64.StdEncoding.DecodeString(string(img.Data))
-					if err != nil || len(raw) == 0 || img.MIMEType == "" {
-						continue
+					if part, ok := takeImage(img); ok {
+						parts = append(parts, part)
+					} else {
+						skipped++
 					}
-					parts = append(parts, blades.DataPart{MIMEType: blades.MIMEType(img.MIMEType), Bytes: raw})
+				}
+				if skipped > 0 {
+					parts = append(parts, blades.TextPart{Text: fmt.Sprintf("（%d 张图片因单次请求上限未随本轮发送；需要时用 ReadMedia 按路径重读）", skipped)})
 				}
 			}
 			out = append(out, &blades.Message{

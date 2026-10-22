@@ -211,6 +211,7 @@ var sessionScopedTables = []string{
 	"agent_tree_nodes",
 	"mailbox_messages",
 	"session_boards",
+	"session_decisions", // 会话决策账本（2026-10-22）：用户显式删会话时级联清理
 	"workflow_runs", // 工作流量产运行（2026-10-16）；其 units 经 run_id 从属，见 DeleteSessionData 前置删除
 }
 

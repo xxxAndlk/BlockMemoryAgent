@@ -237,6 +237,15 @@ func EnsureProjectDoc(ctx context.Context, workDir string, cls DomainClassifier)
 	}
 	p := ProjectDocPath(workDir)
 	if _, err := os.Stat(p); err == nil {
+		// 资产指纹变化即刷新 managed 区（2026-10-22）：旧逻辑"已存在则不动"，项目里
+		// 新增 19 个页面/几十张图后概览仍停留在三天前的空壳，模型看不到可复用资产。
+		// 只重写 managed 区，标记区外的人手补充保留。
+		body := LoadProjectDoc(workDir)
+		have := projectDocAssetFingerprint(body)
+		want := scanAssetAssets(workDir).fingerprint()
+		if want != "" && want != have && !strings.HasPrefix(want, "0-") {
+			return RefreshProjectDoc(ctx, workDir, cls)
+		}
 		return nil
 	} else if !os.IsNotExist(err) {
 		return err
@@ -499,7 +508,205 @@ func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (str
 		}
 	}
 
+	// 已有资产清单（2026-10-22）：旧概览只扫代码符号，做美术/动画/前端任务时
+	// 模型看不到项目里已有的帧序列、图集、交付页面，从零重造（事故里明明有 16 帧
+	// 图集却重新做了两小时骨架拼接）。这里给一个可复用资产索引 + 指纹，
+	// EnsureProjectDoc 据指纹判断是否需要刷新 managed 区。
+	if assets := scanAssetAssets(abs); assets.total > 0 {
+		b.WriteString("\n" + renderAssetSection(assets))
+	}
+
 	return strings.TrimRight(b.String(), "\n"), domains, nil
+}
+
+// assetKinds 是资产扫描关注的扩展名 → 归类。
+var assetKinds = map[string]string{
+	".png": "图片", ".jpg": "图片", ".jpeg": "图片", ".webp": "图片",
+	".gif": "图片", ".svg": "图片", ".bmp": "图片",
+	".mp4": "视频", ".webm": "视频", ".mov": "视频", ".mkv": "视频",
+	".mp3": "音频", ".wav": "音频", ".ogg": "音频", ".m4a": "音频", ".flac": "音频",
+	".html": "HTML", ".htm": "HTML",
+}
+
+// assetScanGlobalSkip 全局跳过目录：依赖、版本库、构建产物（不含 images/tmp 这类
+// 可能是项目资产目录的名字——它们只在 .bma 运行时目录下跳过）。
+var assetScanGlobalSkip = map[string]bool{
+	".git": true, ".svn": true, ".hg": true, "node_modules": true, "vendor": true,
+	"dist": true, "build": true, "bin": true, "__pycache__": true,
+}
+
+// assetScanBmaRuntimeSkip .bma 下的运行时目录（会话临时文件/快照/落盘工具输出），
+// 不是可复用资产。只按前缀匹配，不影响 public/images 等同名业务目录。
+var assetScanBmaRuntimeSkip = map[string]bool{
+	"tmp": true, "images": true, "logs": true, "snapshots": true, "tool_outputs": true,
+}
+
+// assetInventory 是资产扫描结果。
+type assetInventory struct {
+	images, videos, audios, htmls int
+	total                         int
+	newest                        time.Time
+	htmlFiles                     []string
+	dirExt                        map[string]map[string]int // 目录 → 扩展名 → 数量
+}
+
+// assetFingerprint 是「资产总量 + 最新 mtime」指纹，写进 PROJECT.md managed 区，
+// 下次 EnsureProjectDoc 比对不同即刷新（只重写 managed 区，保留人手补充）。
+func (a assetInventory) fingerprint() string {
+	return fmt.Sprintf("%d-%d", a.total, a.newest.Unix())
+}
+
+// scanAssetAssets 有界扫描工作目录（最大深度 6、最多 20000 个条目），统计媒体与
+// HTML 交付物。错误静默（概览是增益信息，不能阻断会话启动）。
+func scanAssetAssets(workDir string) assetInventory {
+	inv := assetInventory{dirExt: map[string]map[string]int{}}
+	if workDir == "" {
+		return inv
+	}
+	entries := 0
+	_ = filepath.WalkDir(workDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		entries++
+		if entries > 20000 {
+			return filepath.SkipAll
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if path != workDir {
+				if strings.HasPrefix(name, ".") && name != ".bma" {
+					return filepath.SkipDir
+				}
+				if assetScanGlobalSkip[name] {
+					return filepath.SkipDir
+				}
+				if rel, rerr := filepath.Rel(workDir, path); rerr == nil {
+					relSlash := filepath.ToSlash(rel)
+					if strings.HasPrefix(relSlash, ".bma/") && assetScanBmaRuntimeSkip[name] {
+						return filepath.SkipDir
+					}
+					if depth := strings.Count(relSlash, "/"); depth >= 6 {
+						return filepath.SkipDir
+					}
+				}
+			}
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(d.Name()))
+		kind := assetKinds[ext]
+		if kind == "" {
+			return nil
+		}
+		rel, rerr := filepath.Rel(workDir, path)
+		if rerr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		inv.total++
+		switch kind {
+		case "图片":
+			inv.images++
+		case "视频":
+			inv.videos++
+		case "音频":
+			inv.audios++
+		case "HTML":
+			inv.htmls++
+			if len(inv.htmlFiles) < 40 {
+				inv.htmlFiles = append(inv.htmlFiles, rel)
+			}
+		}
+		if info, ierr := d.Info(); ierr == nil && info.ModTime().After(inv.newest) {
+			inv.newest = info.ModTime()
+		}
+		dir := filepath.ToSlash(filepath.Dir(rel))
+		if dir == "." {
+			dir = "(根目录)"
+		}
+		if inv.dirExt[dir] == nil {
+			inv.dirExt[dir] = map[string]int{}
+		}
+		inv.dirExt[dir][strings.TrimPrefix(ext, ".")]++
+		return nil
+	})
+	return inv
+}
+
+// renderAssetSection 渲染【已有资产】段（有界：HTML 30 条、目录 12 条）。
+func renderAssetSection(inv assetInventory) string {
+	var b strings.Builder
+	b.WriteString("## 已有资产（自动扫描：做美术/动画/前端任务前先复用这些，勿从零重造）\n")
+	fmt.Fprintf(&b, "- 资产指纹: %s\n", inv.fingerprint())
+	fmt.Fprintf(&b, "- 图片 %d · 视频 %d · 音频 %d · HTML %d", inv.images, inv.videos, inv.audios, inv.htmls)
+	if !inv.newest.IsZero() {
+		fmt.Fprintf(&b, "；最近更新 %s", inv.newest.Format("2006-01-02 15:04"))
+	}
+	b.WriteString("\n")
+	if len(inv.htmlFiles) > 0 {
+		b.WriteString("### HTML 交付物（可直接预览/复用）\n")
+		files := inv.htmlFiles
+		if len(files) > 30 {
+			files = files[:30]
+		}
+		for _, f := range files {
+			fmt.Fprintf(&b, "- %s\n", f)
+		}
+		if len(inv.htmlFiles) > len(files) {
+			fmt.Fprintf(&b, "- …(+%d more)\n", len(inv.htmlFiles)-len(files))
+		}
+	}
+	type dirRow struct {
+		dir   string
+		total int
+		exts  string
+	}
+	rows := make([]dirRow, 0, len(inv.dirExt))
+	for dir, exts := range inv.dirExt {
+		total := 0
+		keys := make([]string, 0, len(exts))
+		for e, n := range exts {
+			total += n
+			keys = append(keys, e)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if exts[keys[i]] != exts[keys[j]] {
+				return exts[keys[i]] > exts[keys[j]]
+			}
+			return keys[i] < keys[j]
+		})
+		parts := make([]string, 0, len(keys))
+		for _, e := range keys {
+			parts = append(parts, fmt.Sprintf("%s×%d", e, exts[e]))
+		}
+		rows = append(rows, dirRow{dir, total, strings.Join(parts, " ")})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].total != rows[j].total {
+			return rows[i].total > rows[j].total
+		}
+		return rows[i].dir < rows[j].dir
+	})
+	if len(rows) > 12 {
+		rows = rows[:12]
+	}
+	if len(rows) > 0 {
+		b.WriteString("### 素材目录（按文件数）\n")
+		for _, r := range rows {
+			fmt.Fprintf(&b, "- %s/ — %s\n", r.dir, r.exts)
+		}
+	}
+	return b.String()
+}
+
+// projectDocAssetFingerprint 读取 PROJECT.md managed 区里的资产指纹；缺失返回空串。
+func projectDocAssetFingerprint(body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "- 资产指纹:") {
+			return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- 资产指纹:"))
+		}
+	}
+	return ""
 }
 
 // outlineExts 是需要抽取符号轮廓的源码扩展名（其余文件只列路径与行数意义不大，不注）。
