@@ -5,7 +5,8 @@ export const APP_CONFIG = {
   sseRetryMaxDelayMs: 30000,
   healthPollInterval: 10000,
   panelRefreshInterval: 3000,
-  tokenContextLimit: 128000,
+  // 上下文阈值不再在这里写死：分母来自后端 GET /sessions/:id/metrics 的
+  // context_token_budget（config.agent.token_budget_per_role / context_token_budget 同源）。
   warningThreshold: 0.8,
   errorThreshold: 0.95,
 } as const

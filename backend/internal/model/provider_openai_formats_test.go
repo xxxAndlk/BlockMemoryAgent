@@ -288,6 +288,52 @@ func TestChatProvider_StreamingTruncatedToolCallDropped(t *testing.T) {
 	}
 }
 
+// TestChatProvider_StreamingErrorEventSurfaces 验证流式响应里的网关错误事件
+// （HTTP 200 + data:{"error":{...}}，magpie/one-api 类网关上游失败时的形态）被
+// 当作错误上报，而不是被当成"模型返回空"（实证 2026-10-22 502 ECONNRESET 被
+// ReAct 空响应保护显示成 model returned 3 consecutive empty responses）。
+func TestChatProvider_StreamingErrorEventSurfaces(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, ": keepalive\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}]}\n\n")
+		fmt.Fprint(w, "data: {\"error\":{\"message\":\"Open Design: ECONNRESET: The socket connection was closed unexpectedly\",\"type\":\"api_error\"}}\n\n")
+	}))
+	defer srv.Close()
+	p := newOpenAIChatProvider(types.AgentModelConfig{Provider: "openai-chat", Model: "m", BaseURL: srv.URL})
+	var gotErr error
+	for _, err := range p.NewStreaming(context.Background(), chatTestRequest()) {
+		if err != nil {
+			gotErr = err
+			break
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("gateway error event must surface as an error")
+	}
+	if !strings.Contains(gotErr.Error(), "ECONNRESET") || !strings.Contains(gotErr.Error(), "api_error") {
+		t.Errorf("error should carry upstream message and type, got: %v", gotErr)
+	}
+}
+
+// TestChatProvider_NonStreamErrorBodySurfaces 验证非流式 200 + {"error":{...}}
+// 同样被当作错误上报。
+func TestChatProvider_NonStreamErrorBodySurfaces(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"error":{"message":"upstream exploded","type":"api_error","code":502}}`)
+	}))
+	defer srv.Close()
+	p := newOpenAIChatProvider(types.AgentModelConfig{Provider: "openai-chat", Model: "m", BaseURL: srv.URL})
+	_, err := p.Generate(context.Background(), chatTestRequest())
+	if err == nil {
+		t.Fatal("200 with error body must surface as an error")
+	}
+	if !strings.Contains(err.Error(), "upstream exploded") || !strings.Contains(err.Error(), "api_error") {
+		t.Errorf("error should carry upstream message and type, got: %v", err)
+	}
+}
+
 // TestResponsesProvider_IncompleteToolCallDropped 验证非流式 status=incomplete +
 // max_output_tokens 时 function_call 被丢弃（半截 arguments 写残文件）。
 func TestResponsesProvider_IncompleteToolCallDropped(t *testing.T) {

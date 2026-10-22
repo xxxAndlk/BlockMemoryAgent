@@ -41,16 +41,6 @@
       "description": "domain 主力（OD 网关）：多轮编码、测试与集成修复；输出上限 128K，性价比高"
     },
     {
-      "id": "od-gpt-6-luna",
-      "name": "OD GPT-6 Luna",
-      "provider": "openai-chat",
-      "model": "gpt-6-luna",
-      "api_key": "${OPENAI_API_KEY_THREE}",
-      "base_url": "${OPENAI_BASE_URL_TWO}",
-      "max_output_tokens": 128000,
-      "description": "GPT-6 Luna（OD 网关）：多轮编码、测试与集成修复；输出上限 128K"
-    },
-    {
       "id": "ark-deepseek-v4-flash",
       "name": "ARK DeepSeek V4 Flash",
       "provider": "anthropic",

@@ -1,4 +1,4 @@
-# BMA 安装脚本:复制 dist/ 到安装目录并写入 BMA_HOME 用户环境变量。幂等,可重复运行(升级)。
+﻿# BMA 安装脚本:复制 dist/ 到安装目录并写入 BMA_HOME 用户环境变量。幂等,可重复运行(升级)。
 # TODO #18-1 T28 装机向导段:交互补填 LLM Key、自动生成 BMA_API_TOKEN、安装后能力探活。
 $ErrorActionPreference = "Stop"
 $default = "D:\WebApp\bma"
@@ -11,18 +11,22 @@ New-Item -ItemType Directory -Force -Path $target, "$target\bin", "$target\confi
 # 二进制与前端资源:覆盖(升级)
 Copy-Item -Force "$src\bin\*" "$target\bin\"
 if (Test-Path "$src\web\dist") { New-Item -ItemType Directory -Force -Path "$target\web" | Out-Null; if (Test-Path "$target\web\dist") { Remove-Item -Recurse -Force "$target\web\dist" }; Copy-Item -Force -Recurse "$src\web\dist" "$target\web\" }
-# 配置:分两类处理——
-# ① 本机个性化/运行时文件(models.json 模型接入配置、user_profile.md 用户画像、soul.md 人格)：
-#    只补缺不覆盖(.env 同款语义),保留现场——每次升级都被重置很不方便,且画像是会话运行时的沉淀宿主。
-# ② 与二进制配套的工程配置(roles.yaml/plugins.yaml/skills.yaml/config.yaml 等)：仍覆盖,
-#    旧版会缺新工具/新字段。
-# skills_learned 例外:运行时产物(自进化技能),保留安装目录现场数据,不覆盖。
-$preserveFiles = @("models.json", "user_profile.md", "soul.md")
+# 配置:全量保留安装目录现场,只补缺不覆盖。
+# 2026-10-22 起不再覆盖任何 config 下的既有文件——插件管理页/模型页会在运行时改写
+# plugins.yaml、models.json(安装目录才是真相源),soul.md/user_profile.md 是会话沉淀宿主;
+# 升级时用 dist 里的同名文件盖回去,会静默抹掉已装插件、模型接入与画像。
+# 新增的配置文件仍随升级补入(目标不存在才拷贝);既有文件与新版模板的差异需人工
+# 对照 dist\config 合并。skills_learned 是运行时产物(自进化技能),本就不入 dist。
+$preserved = @()
 foreach ($f in Get-ChildItem "$src\config") {
     if ($f.Name -eq "skills_learned") { continue }
     $dst = Join-Path "$target\config" $f.Name
-    if ($preserveFiles -contains $f.Name -and (Test-Path $dst)) { continue }
-    Copy-Item -Force $f.FullName $dst
+    if (Test-Path $dst) { $preserved += $f.Name; continue }
+    if ($f.PSIsContainer) { Copy-Item -Recurse -Force $f.FullName $dst } else { Copy-Item -Force $f.FullName $dst }
+}
+if ($preserved.Count -gt 0) {
+    Write-Host ("保留现有配置(未覆盖): " + ($preserved -join ", "))
+    Write-Host "  新版配置模板在 $src\config,需要合并新字段时请手工对照"
 }
 if (-not (Test-Path "$target\.env") -and (Test-Path "$PSScriptRoot\.env.example")) { Copy-Item "$PSScriptRoot\.env.example" "$target\.env" }
 

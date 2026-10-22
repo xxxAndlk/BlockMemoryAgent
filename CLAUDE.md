@@ -142,5 +142,5 @@ Hot-pluggable plugins (design: `doc/设计文档_插件范式.md`): plugins regi
 - **数据生命周期**：`data.*` 配置——`knowledge_archive_days`（0=关，opt-in）、log/tool_outputs 保留期（0=默认 30/14 天，负数=关）；启动 + 每日 tick；归档 = 置 `archived=true` 冷备份（查询层全局排除），不是删除。
 - **HTTP 默认绑 `127.0.0.1:10010`**：局域网访问需显式 `HTTP_ADDR=:10010`（.env.example 已注明）。
 - **领域注册表**：`domain_profile` 复用 global_knowledge（零新表）；dispatcher `SetDomainProfileHook` 按文件路径重叠匹配 + 冷复活种子注入（stat 剔除已删文件）；`QueryBlockMemoryByDomain` 按 task_domain 成链召回；PROJECT.md DomainPartition 作种子导入（source="project_md"）。
-- **install.ps1**：交互填 OPENAI_API_KEY（占位符跳过）+ 自动生成 BMA_API_TOKEN + 启动后探活 /api/health 与 /api/capabilities。**改任何 .ps1 必须保持 UTF-8 BOM**（PowerShell 5.1 无 BOM 按 ANSI/GBK 解析中文直接报 tokenizer 错误）。
+- **install.ps1**：交互填 OPENAI_API_KEY（占位符跳过）+ 自动生成 BMA_API_TOKEN + 启动后探活 /api/health 与 /api/capabilities。**升级时 `config/` 既有文件全量保留、只补缺**（plugins.yaml/models.json 等会被运行时改写，覆盖即抹掉现场）；新版配置模板需人工对照 `dist\config` 合并。**改任何 .ps1 必须保持 UTF-8 BOM**（PowerShell 5.1 无 BOM 按 ANSI/GBK 解析中文直接报 tokenizer 错误）。
 - **CI**：`.github/workflows/ci.yml` push/PR 即跑 backend vet+test 与 web 构建；nightly PG+Redis integration job 待 test/ 模块重建 Go 套件后再补（现零 Go 测试文件，见 Tests 节）。

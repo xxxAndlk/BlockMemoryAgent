@@ -189,10 +189,13 @@ func (s *ReactService) metricsQueryResult(ctx context.Context, sessionID string)
 		"timeouts":              timeouts,
 		"avg_duration":          avg,
 		"max_duration":          maxDur.Round(time.Millisecond).String(),
-		"input_tokens":          inTok,
-		"output_tokens":         outTok,
-		"total_tokens":          inTok + outTok,
+		"input_tokens":           inTok,
+		"output_tokens":          outTok,
+		"total_tokens":           inTok + outTok,
 		"current_context_tokens": s.currentContextTokens(ctx, sessionID),
+		// context_token_budget：本会话顶层 Agent 的真实上下文阈值（与压缩/暂停闸门同源），
+		// 前端「上下文占用」用它做分母，不再写死窗口大小。
+		"context_token_budget": s.contextTokenBudget(sessionID),
 	}}
 }
 
@@ -224,6 +227,20 @@ func (s *ReactService) currentContextTokens(ctx context.Context, sessionID strin
 		}
 	}
 	return 0
+}
+
+// contextTokenBudget 返回本会话顶层 Agent 的上下文 token 阈值（2026-10-22）：
+// 与压缩/暂停闸门同源——按档位顶层角色（fast→doc_assistant / daily→domain /
+// cluster→meta）查 config.agent.token_budget_per_role，未列出用 context_token_budget，
+// 兜底 150000。会话不在内存时按 meta 取。显式配置 0 = 不限制，原样返回 0 交前端展示。
+func (s *ReactService) contextTokenBudget(sessionID string) int {
+	roleID := "meta"
+	if sess := s.store.getSession(sessionID); sess != nil {
+		if _, id := s.resolveGearMetaRole(sess); id != "" {
+			roleID = id
+		}
+	}
+	return s.runtimeCfg.roleTokenBudget(roleID)
 }
 
 // countTimeoutEvents 从会话事件（内存优先，已驱逐会话回退 PG 加载）统计

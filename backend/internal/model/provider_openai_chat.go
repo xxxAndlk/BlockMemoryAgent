@@ -169,10 +169,19 @@ func (p *openAIChatProvider) NewStreaming(ctx context.Context, req *blades.Model
 					} `json:"delta"`
 					FinishReason string `json:"finish_reason"`
 				} `json:"choices"`
-				Usage *chatUsage `json:"usage,omitempty"`
+				Usage *chatUsage     `json:"usage,omitempty"`
+				Error *chatErrorBody `json:"error,omitempty"`
 			}
 			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 				continue
+			}
+			// 网关级错误事件：部分 OpenAI 兼容网关（magpie/one-api 类）上游失败时仍以
+			// HTTP 200 开流，把错误塞进 data: {"error":{...}} 事件后关闭连接。不识别会让
+			// 整轮退化成"空响应"（空响应保护白跑数轮、错误串丢失，实证 2026-10-22
+			// 502 ECONNRESET 被显示成 model returned 3 consecutive empty responses）。
+			if chunk.Error != nil {
+				yield(nil, fmt.Errorf("openai-chat stream error: %s", chunk.Error.String()))
+				return
 			}
 			for _, c := range chunk.Choices {
 				if c.Delta.Content != "" {
@@ -247,6 +256,31 @@ func (p *openAIChatProvider) NewStreaming(ctx context.Context, req *blades.Model
 		setCacheUsageMeta(final, int64(usage.PromptCacheHitTokens), int64(usage.PromptCacheMissTokens))
 		yield(&blades.ModelResponse{Message: final}, nil)
 	}
+}
+
+// chatErrorBody 是 OpenAI 兼容端点在正常响应体/流事件里回传的错误体
+// （{"error":{"message":...,"type":...,"code":...}}）。网关类端点（magpie/one-api）
+// 上游失败时常以 200 + 该结构返回，而不是 4xx/5xx —— 官方 SDK 会自动转成异常，
+// 自研 provider 必须显式识别，否则表现为"模型返回空"。
+type chatErrorBody struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    any    `json:"code"`
+}
+
+// String 渲染成单行（保留 message 全文，附 type/code），供错误串与日志使用。
+func (e *chatErrorBody) String() string {
+	s := e.Message
+	if s == "" {
+		s = "unknown error"
+	}
+	if e.Type != "" {
+		s += " (" + e.Type + ")"
+	}
+	if e.Code != nil {
+		s += fmt.Sprintf(" code=%v", e.Code)
+	}
+	return s
 }
 
 // chatUsage 是 OpenAI 兼容的 usage 字段，兼容各端点变体。
@@ -612,10 +646,16 @@ func parseChatResponse(raw []byte) (*blades.ModelResponse, error) {
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
-		Usage chatUsage `json:"usage"`
+		Usage chatUsage      `json:"usage"`
+		Error *chatErrorBody `json:"error,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil, fmt.Errorf("openai-chat unmarshal: %w", err)
+	}
+	// 200 + 错误体：网关把上游失败包在正常响应里返回（见 chatErrorBody 注释）。
+	// 不拦截会解析出一条空消息，被 ReAct 空响应保护误判为"模型不说话"。
+	if resp.Error != nil {
+		return nil, fmt.Errorf("openai-chat response error: %s", resp.Error.String())
 	}
 
 	msg := blades.NewAssistantMessage(blades.StatusCompleted)

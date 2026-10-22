@@ -2,6 +2,7 @@
 import { ref, computed, watch } from 'vue'
 import type { SessionTokenMetricsResponse, SessionEfficiency } from '@/api/metrics'
 import { getSessionEfficiency } from '@/api/metrics'
+import { formatTokens } from '@/utils/tokens'
 
 const props = defineProps<{
   tokenMetrics: SessionTokenMetricsResponse | null
@@ -57,7 +58,7 @@ function fmtWall(sec: number): string {
       <div class="grid grid-cols-3 gap-2 mb-4 text-center">
         <div>
           <div class="text-xs text-ink-2">总 Token</div>
-          <div class="text-lg font-bold text-ink">{{ totalTokens.toLocaleString() }}</div>
+          <div class="text-lg font-bold text-ink">{{ formatTokens(totalTokens) }}</div>
         </div>
         <div>
           <div class="text-xs text-ink-2">支路耗时</div>
@@ -73,11 +74,11 @@ function fmtWall(sec: number): string {
     <div class="grid grid-cols-3 gap-2 mb-4 text-center">
       <div>
         <div class="text-xs text-ink-2">Input</div>
-        <div class="text-lg font-bold text-ink">{{ (tokenMetrics?.total_input_tokens ?? 0).toLocaleString() }}</div>
+        <div class="text-lg font-bold text-ink">{{ formatTokens(tokenMetrics?.total_input_tokens) }}</div>
       </div>
       <div>
         <div class="text-xs text-ink-2">Output</div>
-        <div class="text-lg font-bold text-ink">{{ (tokenMetrics?.total_output_tokens ?? 0).toLocaleString() }}</div>
+        <div class="text-lg font-bold text-ink">{{ formatTokens(tokenMetrics?.total_output_tokens) }}</div>
       </div>
       <div>
         <div class="text-xs text-ink-2">Calls</div>
@@ -88,7 +89,7 @@ function fmtWall(sec: number): string {
     <div class="space-y-1 text-xs">
       <div v-for="s in tokenMetrics?.stats || []" :key="s.agent + '|' + s.model" class="flex justify-between p-2 bg-page rounded">
         <span class="text-ink-2 truncate flex-1">{{ s.agent }} <span v-if="s.model" class="text-ink-3">({{ s.model }})</span></span>
-        <span class="text-ink">{{ s.input_tokens + s.output_tokens }}</span>
+        <span class="text-ink">{{ formatTokens(s.input_tokens + s.output_tokens) }}</span>
       </div>
       <div v-if="!tokenMetrics?.stats?.length" class="text-ink-2 text-xs text-center py-2">暂无 token 数据</div>
     </div>

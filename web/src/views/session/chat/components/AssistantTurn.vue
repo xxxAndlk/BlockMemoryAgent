@@ -6,6 +6,7 @@ import type { Turn } from '../utils/turns'
 import { turnArtifacts } from '../utils/turns'
 import { fmtTime, agentTextColor } from '../utils/eventStyles'
 import { renderMd } from '@/utils/markdown'
+import { formatTokens } from '@/utils/tokens'
 import { useFileOpener } from '@/composables/fileOpener'
 import { submitClarify } from '../utils/clarifySubmit'
 import ThinkChain from './ThinkChain.vue'
@@ -95,6 +96,11 @@ const clarifyCard = computed(() => {
 const showRunning = computed(
   () => !finalText.value && !clarifyCard.value && props.turn.status === 'running',
 )
+
+/** 是否有工具调用正在执行（2026-10-22）：ToolActivity 已用一行「调用 xxx 中」转圈
+ *  表达当前动作，此时不能再叠一条「正在生成回答…」兜底占位——同一时刻两个转圈，
+ *  看起来像"一边生成回答一边调工具"的冲突（用户实证）。 */
+const hasPendingTool = computed(() => props.turn.toolCalls.some((g) => g.pending))
 
 // 实时思考面板（2026-10-01 用户诉求）：原先只显示尾部 ~300 字符的单行，思考流快速
 // 闪动根本看不清。改为 DeepSeek 风格可折叠面板：标题行常驻「正在思考…」，点击展开/
@@ -502,7 +508,7 @@ async function submitBatch() {
           {{ statusLabel }}
         </span>
         <span v-if="turn.tokens.in || turn.tokens.out" class="text-ink-2">
-          · tokens {{ turn.tokens.in }} ↑ / {{ turn.tokens.out }} ↓
+          · tokens {{ formatTokens(turn.tokens.in) }} ↑ / {{ formatTokens(turn.tokens.out) }} ↓
         </span>
       </div>
 
@@ -819,7 +825,9 @@ async function submitBatch() {
              class="md-article mt-2"
              @click="onMdAction"
              v-html="liveStreamingHtml"></div>
-        <div v-if="!liveThinking && !liveStreaming" class="text-xs text-ink-2 flex items-center gap-2">
+        <!-- 兜底静态占位只在"确实没有任何实时信号"时出现：工具调用进行中由
+             ToolActivity 的活动行负责表达（否则两个转圈同屏，看起来像冲突）。 -->
+        <div v-if="!liveThinking && !liveStreaming && !hasPendingTool" class="text-xs text-ink-2 flex items-center gap-2">
           <el-icon class="is-loading"><Loading /></el-icon>
           <span>正在生成回答…</span>
         </div>

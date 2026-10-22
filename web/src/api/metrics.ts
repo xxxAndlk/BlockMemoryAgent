@@ -33,6 +33,9 @@ export interface SessionMetrics {
   total_tokens: number
   /** 当前上下文长度（2026-10-19）：顶层 Agent 最近一次 LLM 调用的输入 token 数。 */
   current_context_tokens?: number
+  /** 本会话顶层 Agent 的真实上下文阈值（2026-10-22）：与后端压缩/暂停闸门同源
+   *（config.agent.token_budget_per_role / context_token_budget）；0/缺省=不限制。 */
+  context_token_budget?: number
 }
 
 export interface AgentModelTokenStats {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { fmtDateTime } from '@/utils/date'
+import { formatTokens } from '@/utils/tokens'
 import type { SessionLog } from '@/api/session'
 
 const props = defineProps<{
@@ -55,7 +56,7 @@ const expandedLogId = defineModel<number | null>('expandedLogId')
           <span class="text-ink-2">{{ fmtDateTime(log.created_at) }}</span>
         </div>
         <div class="text-ink mb-1">{{ log.message }}</div>
-        <div v-if="log.input_tokens || log.output_tokens" class="text-ink-2 mb-1">tokens: {{ log.input_tokens }} / {{ log.output_tokens }} · latency: {{ log.latency_ms }}ms · model: {{ log.model || '-' }}</div>
+        <div v-if="log.input_tokens || log.output_tokens" class="text-ink-2 mb-1">tokens: {{ formatTokens(log.input_tokens) }} / {{ formatTokens(log.output_tokens) }} · latency: {{ log.latency_ms }}ms · model: {{ log.model || '-' }}</div>
         <div v-if="log.prompt || log.response" class="mt-2">
           <el-button link size="small" type="primary" @click="expandedLogId = expandedLogId === log.id ? null : log.id">
             {{ expandedLogId === log.id ? '收起' : '展开 Prompt/Response' }}

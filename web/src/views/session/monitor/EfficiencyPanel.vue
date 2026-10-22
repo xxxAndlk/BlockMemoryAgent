@@ -13,6 +13,7 @@ import {
   type AgentEventRow,
 } from '@/api/metrics'
 import type { Session } from '@/types'
+import { formatTokens } from '@/utils/tokens'
 
 const props = defineProps<{
   session: Session | null
@@ -150,7 +151,7 @@ function eventTitle(ev: AgentEventRow): string {
     <div v-if="!selectedNodeId" class="grid grid-cols-5 gap-2">
       <div class="p-3 bg-page rounded border border-line text-center">
         <div class="text-xs text-ink-2">每交付文件 token 成本</div>
-        <div class="text-lg font-bold text-ink">{{ fmtNum(eff?.tokens_per_file ?? 0) }}</div>
+        <div class="text-lg font-bold text-ink">{{ formatTokens(eff?.tokens_per_file ?? 0) }}</div>
         <div class="text-xs text-ink-3">交付 {{ eff?.files_delivered ?? 0 }} 个文件</div>
       </div>
       <div class="p-3 bg-page rounded border border-line text-center">
@@ -170,8 +171,8 @@ function eventTitle(ev: AgentEventRow): string {
       </div>
       <div class="p-3 bg-page rounded border border-line text-center">
         <div class="text-xs text-ink-2">单呼输入 P50 / P95</div>
-        <div class="text-lg font-bold text-ink">{{ fmtNum(eff?.input_p50 ?? 0) }} / {{ fmtNum(eff?.input_p95 ?? 0) }}</div>
-        <div class="text-xs text-ink-3">总入 {{ (eff?.total_input_tokens ?? 0).toLocaleString() }} / 出 {{ (eff?.total_output_tokens ?? 0).toLocaleString() }}</div>
+        <div class="text-lg font-bold text-ink">{{ formatTokens(eff?.input_p50 ?? 0) }} / {{ formatTokens(eff?.input_p95 ?? 0) }}</div>
+        <div class="text-xs text-ink-3">总入 {{ formatTokens(eff?.total_input_tokens) }} / 出 {{ formatTokens(eff?.total_output_tokens) }}</div>
       </div>
     </div>
 
@@ -258,19 +259,19 @@ function eventTitle(ev: AgentEventRow): string {
         <el-table-column prop="role" label="角色" min-width="140" show-overflow-tooltip />
         <el-table-column prop="calls" label="调用" width="70" />
         <el-table-column label="输入" width="100">
-          <template #default="{ row }">{{ row.input_tokens.toLocaleString() }}</template>
+          <template #default="{ row }">{{ formatTokens(row.input_tokens) }}</template>
         </el-table-column>
         <el-table-column label="输出" width="100">
-          <template #default="{ row }">{{ row.output_tokens.toLocaleString() }}</template>
+          <template #default="{ row }">{{ formatTokens(row.output_tokens) }}</template>
         </el-table-column>
         <el-table-column label="均延迟" width="90">
           <template #default="{ row }">{{ row.avg_latency_ms >= 1000 ? `${(row.avg_latency_ms / 1000).toFixed(1)}s` : `${row.avg_latency_ms}ms` }}</template>
         </el-table-column>
         <el-table-column label="入 P50" width="90">
-          <template #default="{ row }">{{ fmtNum(row.p50_input_tokens) }}</template>
+          <template #default="{ row }">{{ formatTokens(row.p50_input_tokens) }}</template>
         </el-table-column>
         <el-table-column label="入 P95" width="90">
-          <template #default="{ row }">{{ fmtNum(row.p95_input_tokens) }}</template>
+          <template #default="{ row }">{{ formatTokens(row.p95_input_tokens) }}</template>
         </el-table-column>
       </el-table>
     </div>

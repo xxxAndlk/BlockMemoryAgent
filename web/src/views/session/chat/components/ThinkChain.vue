@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import type { SessionEvent } from '@/types'
 import { fmtTime, kindTagType, kindIcon, kindLabel, agentTextColor, hasDetail } from '../utils/eventStyles'
 import { renderMd } from '@/utils/markdown'
+import { formatTokens } from '@/utils/tokens'
 
 const props = defineProps<{
   events: SessionEvent[]
@@ -106,7 +107,7 @@ function asText(s: string | undefined): string {
                 <pre class="bg-page p-2 rounded text-[11px] text-red-400 whitespace-pre-wrap font-mono">{{ ev.tool_error }}</pre>
               </div>
               <div v-if="ev.input_tokens || ev.output_tokens" class="text-[10px] text-ink-2">
-                Token: in={{ ev.input_tokens || 0 }} · out={{ ev.output_tokens || 0 }}
+                Token: in={{ formatTokens(ev.input_tokens) }} · out={{ formatTokens(ev.output_tokens) }}
               </div>
             </div>
           </div>

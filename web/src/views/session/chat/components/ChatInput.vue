@@ -9,6 +9,7 @@ import { useRouter } from 'vue-router'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 import { useWorkDir } from '@/composables/useWorkDir'
 import { convertXlsxToCsv } from '@/utils/sheetConvert'
+import { formatTokens } from '@/utils/tokens'
 
 const props = defineProps<{
   loading?: boolean
@@ -425,12 +426,7 @@ const canSend = computed(
     !convertingAny.value,
 )
 
-// token 数值格式化：≥1000 显示为 1.2k，否则原样显示。
-function fmtTokens(n: number): string {
-  if (!n) return '0'
-  if (n < 1000) return String(n)
-  return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
-}
+// token 数值格式化：统一走 @/utils/tokens（≥1000 显示为 k）。
 
 
 // 把图片加入待发送列表并在光标处插入 [image:N] 占位符。
@@ -1117,8 +1113,8 @@ function onKeydown(e: KeyboardEvent) {
         </div>
         <div class="flex items-center gap-2 shrink-0">
           <span class="text-[11px] text-ink-3 font-mono hidden sm:inline"
-                :title="`输入 ${props.inputTokens || 0} / 输出 ${props.outputTokens || 0} tokens`">
-            ↑{{ fmtTokens(props.inputTokens || 0) }} ↓{{ fmtTokens(props.outputTokens || 0) }}
+                :title="`输入 ${formatTokens(props.inputTokens || 0)} / 输出 ${formatTokens(props.outputTokens || 0)} tokens`">
+            ↑{{ formatTokens(props.inputTokens || 0) }} ↓{{ formatTokens(props.outputTokens || 0) }}
           </span>
           <!-- 运行中 → 红色「停止」（对标 ChatGPT，唯一停止入口：弹窗可选是否同时停子 Agent）；
                其余状态一律「发送」。待澄清时额外挂一个静态「停止」逃生口（放弃当前提问），

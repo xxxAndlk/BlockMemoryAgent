@@ -7,6 +7,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/domain/orchestrator"
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -135,6 +136,39 @@ func TestQueryMetrics_TimeoutEventCounting(t *testing.T) {
 	}
 	if m["timeouts"] != 1 {
 		t.Errorf("timeouts = %v, want 1", m["timeouts"])
+	}
+	// 未配置 token_budget_per_role/context_token_budget 时阈值兜底 150000。
+	if m["context_token_budget"] != 150000 {
+		t.Errorf("context_token_budget = %v, want 150000", m["context_token_budget"])
+	}
+}
+
+// TestQueryMetrics_ContextTokenBudget 验证 metrics 下发真实上下文阈值（2026-10-22）：
+// 与压缩/暂停闸门同源，按档位顶层角色（daily→domain / cluster→meta）取
+// token_budget_per_role，未列出角色回落 context_token_budget。
+func TestQueryMetrics_ContextTokenBudget(t *testing.T) {
+	svc := newReactServiceForTest(nil, "")
+	svc.runtimeCfg = ReactRuntimeConfig{
+		TokenBudgetPerRole: map[string]int{"domain": 30000},
+		ContextTokenBudget: 200000,
+	}
+	sess := svc.store.createSession("goal-budget", "")
+
+	budget := func() any {
+		res, err := svc.Query(context.Background(), sess.ID, Query{Kind: QueryKindMetrics})
+		if err != nil {
+			t.Fatalf("Query metrics: %v", err)
+		}
+		return res.Data.(map[string]any)["context_token_budget"]
+	}
+
+	sess.setGear(tool.GearDaily)
+	if got := budget(); got != 30000 {
+		t.Errorf("daily gear budget = %v, want 30000", got)
+	}
+	sess.setGear(tool.GearCluster)
+	if got := budget(); got != 200000 {
+		t.Errorf("cluster gear budget = %v, want 200000", got)
 	}
 }
 

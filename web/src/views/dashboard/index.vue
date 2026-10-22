@@ -10,6 +10,7 @@ import { fmtDate } from '@/utils/date'
 import { kindIcon, kindTagType } from '@/views/session/chat/utils/eventStyles'
 import { useWorkDir } from '@/composables/useWorkDir'
 import { knownWorkDirs } from '@/utils/dir'
+import { formatTokens } from '@/utils/tokens'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 
 const router = useRouter()
@@ -513,7 +514,7 @@ function activityStyle(kind: string) {
 
           <div class="p-3 bg-page rounded border border-line relative overflow-hidden">
             <div class="text-xs text-ink-2 mb-1">近 12 小时 Token</div>
-            <div class="text-2xl font-bold text-ink">{{ stats.tokens.toLocaleString() }}</div>
+            <div class="text-2xl font-bold text-ink">{{ formatTokens(stats.tokens) }}</div>
             <div class="text-xs text-ink-2 mt-1">输入 + 输出</div>
           </div>
         </div>
@@ -521,7 +522,7 @@ function activityStyle(kind: string) {
         <div>
           <div class="flex justify-between text-xs text-ink-2 mb-2">
             <span>Token 消耗趋势 (最近 12 小时)</span>
-            <span>单位: tokens</span>
+            <span>单位: tokens（k = 千）</span>
           </div>
           <div class="h-40 bg-page rounded-card border border-line p-3">
             <svg v-if="trendValues.length > 1" class="w-full h-full text-primary" viewBox="0 0 100 40" preserveAspectRatio="none" fill="none" stroke="currentColor" stroke-width="1.5">
