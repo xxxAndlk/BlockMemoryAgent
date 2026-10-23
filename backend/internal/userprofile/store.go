@@ -123,6 +123,13 @@ func (s *Store) ArchiveSection() string { return s.archiveSec }
 //   - 用户显式陈述（remember_preference 工具 / "记住我偏好 X"）→ 小节=偏好；
 //   - 会话完成轻量模型提取的偏好增量（Merge 不可用时降级直写）→ 归档小节。
 func (s *Store) Append(section, text string) error {
+	return s.AppendWithSource(section, text, "")
+}
+
+// AppendWithSource 同 Append，但给自动行附来源标签（2026-10-23 记忆出处）：
+// 行尾戳变为 `（2026-10-22 23:42 · 会话#65）`。source 为空退化为纯时间戳。
+// 出处只作"这条从哪来"的人类可读提示，不影响解析/排序（见 autoStampRe）。
+func (s *Store) AppendWithSource(section, text, source string) error {
 	text = strings.TrimSpace(text)
 	section = strings.TrimSpace(section)
 	if text == "" || section == "" {
@@ -140,7 +147,7 @@ func (s *Store) Append(section, text string) error {
 	}
 
 	// 定位小节（## <section>）；无该小节则文件末尾追加新小节。
-	line := fmt.Sprintf("- %s（%s）", text, time.Now().Format("2006-01-02 15:04"))
+	line := fmt.Sprintf("- %s（%s）", text, formatStamp(time.Now(), source))
 	idx := strings.Index(content, "## "+section)
 	if idx < 0 {
 		content = strings.TrimRight(content, "\n") + "\n\n## " + section + "\n" + line + "\n"

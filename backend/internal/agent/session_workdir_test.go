@@ -114,6 +114,11 @@ func TestRunSession_SystemPromptPerSessionWorkDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dirB, ".bma", "PROJECT.md"), []byte(doc), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// 2026-10-23 分层：符号索引文件缺失会触发 RefreshProjectDoc（补生成索引），
+	// 预写一份占位索引保持"已存在不覆盖"的测试前提。
+	if err := os.WriteFile(filepath.Join(dirB, ".bma", "PROJECT_FILES.md"), []byte("# idx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	// 自定义 workDir 会话:工作目录行与 PROJECT.md 均取自 dirB。
 	rec := &recordingModelProvider{}

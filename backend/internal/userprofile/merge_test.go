@@ -348,3 +348,37 @@ func TestBudgetSections_DropsOldestUnderTightBudget(t *testing.T) {
 		t.Fatalf("输出应 ≤700 runes, got %d", n)
 	}
 }
+
+// TestAppendWithSource 验证自动行出处后缀（2026-10-23）：写入带来源会话短标签、
+// 仍按自动行解析（时间戳+出处整体进 Stamp）、排序前缀仍是日期。
+func TestAppendWithSource(t *testing.T) {
+	s := NewStore(filepath.Join(t.TempDir(), "profile.md"))
+	if err := s.AppendWithSource("偏好", "采用16帧图集序列帧", "会话#65"); err != nil {
+		t.Fatalf("AppendWithSource: %v", err)
+	}
+	content := s.Current().Content
+	if !strings.Contains(content, "· 会话#65）") {
+		t.Fatalf("自动行应带出处后缀: %s", content)
+	}
+	found := false
+	for _, sec := range ParseDocument(content).Sections {
+		for _, a := range sec.Auto {
+			if a.Text == "采用16帧图集序列帧" && strings.Contains(a.Stamp, "会话#65") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("带出处的行应被解析为自动行: %s", content)
+	}
+}
+
+// TestSessionSource 验证会话 ID → 短标签。
+func TestSessionSource(t *testing.T) {
+	if got := SessionSource("session-1792684183766702800-85936e94-65"); got != "会话#65" {
+		t.Fatalf("SessionSource got %q", got)
+	}
+	if got := SessionSource(""); got != "" {
+		t.Fatalf("空 ID 应返回空标签, got %q", got)
+	}
+}

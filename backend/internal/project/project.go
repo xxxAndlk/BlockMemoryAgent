@@ -228,6 +228,62 @@ func ProjectDocPath(workDir string) string {
 	return filepath.Join(workDir, ".bma", "PROJECT.md")
 }
 
+// ProjectFilesIndexPath 是分层后的「文件符号索引」路径（2026-10-23）。
+// 每轮注入的 PROJECT.md 只保留目录树/领域/入口/资产；逐文件的"行数 + 顶层符号"
+// 移到这里，由 Agent 按需 ReadFile——实证每轮注入的符号表占 system prompt 37%
+// （9.3K/25K 字符），对具体任务绝大多数无关，却稀释了真正相关的指令。
+func ProjectFilesIndexPath(workDir string) string {
+	return filepath.Join(workDir, ".bma", "PROJECT_FILES.md")
+}
+
+// fileIndexMaxFiles 单次生成索引的文件数上限（大仓防失控）。
+const fileIndexMaxFiles = 2000
+
+// renderFileIndex 渲染「文件符号索引」正文：领域分组 + 每文件行数与顶层符号。
+func renderFileIndex(root string, domains []domainInfo) string {
+	var b strings.Builder
+	b.WriteString("# 文件符号索引（自动生成，勿手改）\n\n")
+	b.WriteString("> 随 `.bma/PROJECT.md` 一同刷新。用途：按符号行号带 offset 精读，跳过逐页盲扫。\n\n")
+	count := 0
+	for _, d := range domains {
+		if len(d.Files) == 0 || count >= fileIndexMaxFiles {
+			continue
+		}
+		fmt.Fprintf(&b, "## %s\n\n", d.Name)
+		for _, f := range d.Files {
+			if count >= fileIndexMaxFiles {
+				b.WriteString("\n…(已达上限，其余文件请用 SearchInFiles/ReadFile)\n")
+				break
+			}
+			count++
+			if out := fileOutline(root, f); out != "" {
+				fmt.Fprintf(&b, "- %s%s\n", f, out)
+				continue
+			}
+			fmt.Fprintf(&b, "- %s\n", f)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// writeFileIndex 落盘文件符号索引（best-effort：概览是增益信息，不阻断会话）。
+// 原子写（temp + rename）：并发会话可能同时刷新，避免读到半截文件。
+func writeFileIndex(workDir string, domains []domainInfo) error {
+	if workDir == "" || len(domains) == 0 {
+		return nil
+	}
+	p := ProjectFilesIndexPath(workDir)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, []byte(renderFileIndex(workDir, domains)), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
+}
+
 // EnsureProjectDoc 保证 workDir 下存在 PROJECT.md。已存在则不动；缺失则生成。
 // 在首个 session 启动时调用，幂等。cls 非 nil 时调 LLM 按职责分区，失败回退启发式；
 // cls nil 走启发式（依赖图聚类 + 文件夹兜底）。
@@ -237,6 +293,11 @@ func EnsureProjectDoc(ctx context.Context, workDir string, cls DomainClassifier)
 	}
 	p := ProjectDocPath(workDir)
 	if _, err := os.Stat(p); err == nil {
+		// 分层改造（2026-10-23）：符号索引文件缺失的老项目在下次会话启动时补生成
+		// （RefreshProjectDoc 同时重写概览与索引；幂等，只多扫一次盘）。
+		if _, ierr := os.Stat(ProjectFilesIndexPath(workDir)); os.IsNotExist(ierr) {
+			return RefreshProjectDoc(ctx, workDir, cls)
+		}
 		// 资产指纹变化即刷新 managed 区（2026-10-22）：旧逻辑"已存在则不动"，项目里
 		// 新增 19 个页面/几十张图后概览仍停留在三天前的空壳，模型看不到可复用资产。
 		// 只重写 managed 区，标记区外的人手补充保留。
@@ -263,6 +324,7 @@ func writeFresh(ctx context.Context, workDir string, cls DomainClassifier) error
 		return err
 	}
 	seedDomainProfiles(ctx, workDir, domains)
+	_ = writeFileIndex(workDir, domains) // best-effort：索引缺失不影响概览
 	content := ManagedBegin + "\n" + body + "\n" + ManagedEnd + "\n\n" +
 		"<!-- 标记区外可写人手补充；RefreshProjectDoc 只重写上方 managed 区，不覆盖本提示以下内容。 -->\n"
 	return os.WriteFile(ProjectDocPath(workDir), []byte(content), 0o644)
@@ -280,6 +342,7 @@ func RefreshProjectDoc(ctx context.Context, workDir string, cls DomainClassifier
 		return err
 	}
 	seedDomainProfiles(ctx, workDir, domains)
+	_ = writeFileIndex(workDir, domains) // best-effort：索引缺失不影响概览
 	p := ProjectDocPath(workDir)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return fmt.Errorf("mkdir .bma: %w", err)
@@ -470,7 +533,7 @@ func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (str
 	if len(domains) > 0 {
 		b.WriteString("\n## 推荐领域拆分\n\n")
 		b.WriteString("按文件职责/实体由 LLM 分区（无 LLM 时按依赖图聚类兜底）。Agent 无明确领域归属时参考本表定位。\n")
-		b.WriteString("源码文件后括注总行数与顶层符号（`名称 L行号`，`()` 后缀为函数），可直接按符号带 offset 精读，跳过逐页扫描。\n\n")
+		b.WriteString("源码文件清单只列路径（2026-10-23 分层：符号表移出常驻上下文）——每个文件的行数与顶层符号见 `.bma/PROJECT_FILES.md`，需要时 ReadFile 该索引，或直接 ReadFile 目标文件（返回头自带行数）。\n\n")
 		for _, d := range domains {
 			fmt.Fprintf(&b, "### `%s` - %s\n", d.Name, d.Purpose)
 			if len(d.Dirs) > 0 {
@@ -478,15 +541,16 @@ func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (str
 			}
 			if len(d.Files) > 0 {
 				fmt.Fprintf(&b, "- 影响文件 (%d):\n", len(d.Files))
-				if len(d.Files) > 50 {
-					for _, f := range d.Files[:20] {
-						fmt.Fprintf(&b, "  - %s\n", f)
-					}
-					fmt.Fprintf(&b, "  ...(+%d more)\n", len(d.Files)-20)
-				} else {
-					for _, f := range d.Files {
-						fmt.Fprintf(&b, "  - %s%s\n", f, fileOutline(abs, f))
-					}
+				// 常驻上下文只列前 8 个做"领域形状"提示，完整清单在索引文件里。
+				shown := d.Files
+				if len(shown) > 8 {
+					shown = shown[:8]
+				}
+				for _, f := range shown {
+					fmt.Fprintf(&b, "  - %s\n", f)
+				}
+				if len(d.Files) > len(shown) {
+					fmt.Fprintf(&b, "  ...(+%d more，见 .bma/PROJECT_FILES.md)\n", len(d.Files)-len(shown))
 				}
 			} else {
 				fmt.Fprintf(&b, "- 文件数: %d\n", d.FileCount)
@@ -506,6 +570,12 @@ func scanProject(ctx context.Context, workDir string, cls DomainClassifier) (str
 		for _, d := range docs {
 			fmt.Fprintf(&b, "- %s\n", d)
 		}
+	}
+
+	// 分层指针（2026-10-23）：符号表与完整文件清单不常驻上下文，给一条可查路径。
+	if len(domains) > 0 {
+		b.WriteString("\n## 文件符号索引（按需）\n")
+		b.WriteString("- `.bma/PROJECT_FILES.md` — 全量文件清单 + 每文件行数与顶层符号（`名称 L行号`），需要时 ReadFile。\n")
 	}
 
 	// 已有资产清单（2026-10-22）：旧概览只扫代码符号，做美术/动画/前端任务时

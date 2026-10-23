@@ -392,6 +392,7 @@ func (s *ReactService) decisionBlock(session *reactInternalSession) string {
 	}
 	var current *store.SessionDecision
 	var firstDirective *store.SessionDecision
+	var criteria *store.SessionDecision
 	var superseded, rejected []store.SessionDecision
 	var refs []store.SessionDecision
 	for i := range decisions {
@@ -410,6 +411,8 @@ func (s *ReactService) decisionBlock(session *reactInternalSession) string {
 			if firstDirective == nil {
 				firstDirective = d
 			}
+		case store.DecisionKindCriteria:
+			criteria = d // 列表按时间序，最后一条即最新批准计划的验收标准
 		case store.DecisionKindReference:
 			if d.Status == store.DecisionStatusActive {
 				refs = append(refs, *d)
@@ -429,6 +432,12 @@ func (s *ReactService) decisionBlock(session *reactInternalSession) string {
 		}
 	} else if firstDirective != nil {
 		b.WriteString("【最初目标·可能已被后续指令修订】" + routeHeadline(firstDirective.Content, 300) + "\n")
+	}
+	// 验收标准锚（2026-10-23）：计划批准时提取，随后续压缩不丢失——"验收口径"本来就是
+	// 最容易被压缩摘要吞掉、又最不该丢的部分。
+	if criteria != nil {
+		b.WriteString("【验收标准·已批准计划】" + ledgerEllipsis(criteria.Content, 400) + "\n")
+		b.WriteString("（交付前逐条对照；缺项不得以文字说明代替）\n")
 	}
 	for _, d := range rejected {
 		b.WriteString("【已否决·禁止继续】" + ledgerEllipsis(d.Content, 120) + "（" + d.CreatedAt.Format("01-02 15:04") + "）\n")
@@ -477,6 +486,8 @@ func (s *ReactService) decisionBlock(session *reactInternalSession) string {
 			tag = "澄清答复"
 		case store.DecisionKindPlan:
 			tag = "已批准计划"
+		case store.DecisionKindCriteria:
+			tag = "验收标准"
 		case store.DecisionKindRejection:
 			tag = "否决"
 		default:
@@ -635,6 +646,39 @@ func clarifyAnswerApproved(pc *ClarifyRequest, answer string) bool {
 	a := strings.ToLower(strings.TrimSpace(answer))
 	return strings.Contains(a, "批准") || strings.Contains(a, "同意") || strings.Contains(a, "approve")
 }
+
+// planCriteriaFromClarify 从计划确认卡里提取「验收标准」（2026-10-23）。
+// 计划正文是自由 markdown、没有结构化验收字段；取含"验收"的行最可靠——
+// submit_plan 契约要求计划写验收标准（实证形态："7) 验收：16帧无缺无重、邻帧SSIM …"）。
+// 无验收行返回空串（不硬造）。
+func planCriteriaFromClarify(pc *ClarifyRequest) string {
+	if pc == nil {
+		return ""
+	}
+	var picked []string
+	for _, line := range strings.Split(pc.Detail+"\n"+pc.Question, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || !strings.Contains(t, "验收") {
+			continue
+		}
+		t = planListPrefixRe.ReplaceAllString(t, "")
+		t = strings.TrimSpace(t)
+		if t == "" || strings.HasSuffix(t, "验收标准") {
+			continue // 纯标题行（如 "## 验收标准"）本身无信息
+		}
+		picked = append(picked, t)
+		if len(picked) >= 3 {
+			break
+		}
+	}
+	if len(picked) == 0 {
+		return ""
+	}
+	return ledgerEllipsis(strings.Join(picked, "；"), 600)
+}
+
+// planListPrefixRe 去掉计划行的列表序号/标题符号（"7) "、"## "、"- "、"• "）。
+var planListPrefixRe = regexp.MustCompile(`^([0-9]{1,2}[.、)）]\s*|[-*•]\s*|#+\s*)+`)
 
 // planSummaryFromClarify 从计划确认卡里提取一句话计划摘要（任务简介 + 计划首行），
 // 写入账本 kind=plan，供后续轮次回溯"用户批准过什么"。

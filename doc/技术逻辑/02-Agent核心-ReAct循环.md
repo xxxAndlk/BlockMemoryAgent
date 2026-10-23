@@ -101,7 +101,7 @@
 2. **drainMailbox（generate 前）**（607-615）：压缩用户注入消息延迟上界；有新消息重置停滞计数。history 以 tool 结果（或首条 user）收尾，追加 user 角色不破坏 tool 配对。
 3. **memory.Assemble**（617-619）：压缩历史/注入记忆视图（压缩在 `domain/memory.Pipeline` 内按 token 阈值触发）。
 4. **evictStaleToolResults**（620-623）：`staleToolEvictRounds` 轮前的 ReadFile/SearchInFiles 结果替换为"已驱逐需重读"占位符（仅请求视图；canonical history 不动）。
-5. **决策账本注入（2026-10-22）**：`a.directiveBlock()`（`WithDirectiveBlock` 装配，见 decision_ledger.go）渲染【用户指令账本】追加为**尾部 system 消息**——与时间块同构，不进入压缩段、不被 windowMessages 裁掉；块内自声明"与压缩摘要/项目偏好/用户画像冲突时以本块为准"。
+5. **决策账本注入（2026-10-22）**：`a.directiveBlock()`（`WithDirectiveBlock` 装配，见 decision_ledger.go）渲染【用户指令账本】追加为**尾部 system 消息**——与时间块同构，不进入压缩段、不被 windowMessages 裁掉；块内自声明"与压缩摘要/项目偏好/用户画像冲突时以本块为准"。2026-10-23 起块内还含【验收标准·已批准计划】（计划批准时提取入账 `DecisionKindCriteria`），压缩后验收口径不丢。
 6. **append(buildTimeMessage())**（625-627）：当前时间以**尾部 system 消息**注入（放头部会打碎前缀缓存）。
 7. **windowMessages**（629-633）：消息数滑动窗口硬上限（默认 400，兜底防上下文溢出）。保留三段：开头连续 system、**首条 user（任务目标）**、以及**首条 user 之后紧跟的连续 system**（压缩视图固定前缀=历史压缩摘要+热改动回灌，2026-10-22 新增，此前会被整段裁掉）；下刀避开孤立 tool 结果（从 assistant/user 起刀，绝不从 tool 起刀）。
 8. **sanitizeToolPairing**（634-637）：强制修正 tool_calls ↔ tool 结果配对（缺失补合成错误结果、孤立结果丢弃），避免 API 400 拒绝整轮（实证曾白跑 31m43s）。

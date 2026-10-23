@@ -382,6 +382,8 @@ func (s *ReactService) mergeIntoStore(sessionID, agentName string, store *userpr
 			profileMergeTimeout)
 		plan, err := s.prefMerger(ctx, store.MergeView(targets), store.ArchiveView(), rejected, increments)
 		cancel()
+		// 记忆出处（2026-10-23）：合并新增的行带来源会话短标签，便于回溯"这条从哪来"。
+		plan.Source = userprofile.SessionSource(sessionID)
 		if err == nil {
 			if err := store.ApplyMerge(plan, targets); err == nil {
 				return
@@ -401,7 +403,7 @@ func (s *ReactService) mergeIntoStore(sessionID, agentName string, store *userpr
 			continue
 		}
 		seen[t] = true
-		if err := store.Append(store.ArchiveSection(), inc); err != nil {
+		if err := store.AppendWithSource(store.ArchiveSection(), inc, userprofile.SessionSource(sessionID)); err != nil {
 			log.Printf("[evolver] append increment to archive failed: err=%v", err)
 		}
 	}

@@ -5667,6 +5667,11 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 			if summary := planSummaryFromClarify(pc); summary != "" {
 				s.recordDecision(ctx, session, store.DecisionKindPlan, summary, "plan_approved")
 			}
+			// 验收标准独立入账（2026-10-23）：计划批准即冻结验收口径，后续压缩/滑窗
+			// 都不会把它吞掉，账本块每轮以【验收标准·已批准计划】重述。
+			if criteria := planCriteriaFromClarify(pc); criteria != "" {
+				s.recordDecision(ctx, session, store.DecisionKindCriteria, criteria, "plan_approved")
+			}
 		}
 		s.store.addEvent(session, eventkind.Clarify, "User", "提问答复: "+answer, "", "", "", "", "", true)
 		return nil

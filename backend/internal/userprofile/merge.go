@@ -16,7 +16,33 @@ import (
 )
 
 // autoStampRe 匹配行尾的全角括号时间戳（程序经 Append 写入的自动行标志）。
-var autoStampRe = regexp.MustCompile(`（(\d{4}-\d{2}-\d{2} \d{2}:\d{2})）$`)
+// 2026-10-23 起时间戳可带来源后缀：`（2026-10-22 23:42 · 会话#65）`——出处只作
+// 人类可读提示；排序仍按日期前缀（字典序天然正确）。
+var autoStampRe = regexp.MustCompile(`（(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?: · [^）]*)?)）$`)
+
+// formatStamp 组装自动行时间戳；source 为空时退化为纯时间。
+func formatStamp(t time.Time, source string) string {
+	s := t.Format("2006-01-02 15:04")
+	if src := strings.TrimSpace(source); src != "" {
+		s += " · " + src
+	}
+	return s
+}
+
+// SessionSource 把会话 ID 压成短标签（取最后一段：session-…-65 → 会话#65）。
+// 用途：记忆条目出处。空 ID 返回空串（退化为无出处）。
+func SessionSource(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ""
+	}
+	parts := strings.Split(sessionID, "-")
+	tail := strings.TrimSpace(parts[len(parts)-1])
+	if tail == "" {
+		return ""
+	}
+	return "会话#" + tail
+}
 
 // AutoLine 自动行：文本 + 时间戳（由 Append 写入，可被 Merge 改写/归档）。
 type AutoLine struct {
@@ -99,6 +125,9 @@ type MergePlan struct {
 	Merged map[string][]string
 	// Archived 被新表述替换/删除的旧自动行文本（移入归档小节，可审计）。
 	Archived []string
+	// Source 本次合并的来源标签（如「会话#65」），写进新增行的出处后缀；
+	// 空串=无出处（老路径/测试）。
+	Source string
 }
 
 // MergeView 供轻量模型读取的当前自动行视图：目标小节名 -> 现有自动行文本。
@@ -263,7 +292,7 @@ func (s *Store) ApplyMerge(plan MergePlan, targets []string) error {
 	for _, t := range targets {
 		targetSet[t] = true
 	}
-	now := time.Now().Format("2006-01-02 15:04")
+	now := formatStamp(time.Now(), plan.Source)
 
 	// 旧自动行文本 -> 时间戳（合并后按文本回填原时间戳）。
 	oldStamps := map[string]string{}

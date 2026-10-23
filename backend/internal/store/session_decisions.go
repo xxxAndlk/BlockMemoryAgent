@@ -38,6 +38,7 @@ const (
 	DecisionKindRoute     = "route"          // 路线级指示（渲染方案/技术选型等互斥选择）
 	DecisionKindClarify   = "clarify_answer" // ask_user 答复（用户手输的关键裁决）
 	DecisionKindPlan      = "plan"           // 已批准的执行计划（历史记录，不作现行路线）
+	DecisionKindCriteria  = "criteria"       // 已批准计划的验收标准（2026-10-23：不可压缩锚，防止压缩后"验收口径"丢失）
 	DecisionKindReference = "reference"      // 用户给的参考产物/验收基准
 	DecisionKindRejection = "rejection"      // 用户明确否定当前成果/路线
 )

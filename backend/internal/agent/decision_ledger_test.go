@@ -244,3 +244,37 @@ func TestDecisionLedgerIncidentScenario(t *testing.T) {
 		t.Fatal("事故场景下骨架计划必须触发冲突警示")
 	}
 }
+
+// TestPlanCriteriaAnchor 回归 2026-10-23：计划批准时把"验收标准"提取入账，
+// 每轮以【验收标准·已批准计划】重述——压缩摘要最容易吞掉、又最不该丢的就是验收口径。
+func TestPlanCriteriaAnchor(t *testing.T) {
+	pc := &ClarifyRequest{
+		Question: "【计划确认】执行前请确认。\n任务简介: 用 16 帧素材做图集+播放器+成片",
+		Detail: "## 目标\n做成 16 帧图集序列帧\n## 步骤\n1) 资产扫描\n2) 打包图集\n" +
+			"7) 验收：16帧无缺无重、邻帧SSIM 0.80-0.99、接缝≥0.90、四角alpha=0\n",
+	}
+	got := planCriteriaFromClarify(pc)
+	if !strings.Contains(got, "16帧无缺无重") || !strings.Contains(got, "SSIM") {
+		t.Fatalf("应提取验收行，got %q", got)
+	}
+	if strings.HasPrefix(got, "7") || strings.HasPrefix(got, "##") {
+		t.Fatalf("应剥掉列表序号/标题符号，got %q", got)
+	}
+
+	svc := &ReactService{}
+	sess := &reactInternalSession{ID: "sess-criteria", Goal: "做 16 帧图集"}
+	svc.recordDecision(t.Context(), sess, store.DecisionKindDirective, sess.Goal, "goal")
+	svc.recordDecision(t.Context(), sess, store.DecisionKindCriteria, got, "plan_approved")
+	block := svc.decisionBlock(sess)
+	if !strings.Contains(block, "【验收标准·已批准计划】") {
+		t.Fatalf("账本应重述验收标准:\n%s", block)
+	}
+	if !strings.Contains(block, "16帧无缺无重") {
+		t.Fatalf("验收标准内容应进账本:\n%s", block)
+	}
+
+	// 无验收行的计划不硬造。
+	if c := planCriteriaFromClarify(&ClarifyRequest{Question: "【计划确认】", Detail: "## 目标\n随便做"}); c != "" {
+		t.Fatalf("无验收行应返回空串，got %q", c)
+	}
+}

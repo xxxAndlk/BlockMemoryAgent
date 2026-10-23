@@ -921,7 +921,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return mergePreferences(ctx, modelFactory, view, archive, rejected, increments)
 		})
 		toolRegistry.SetUserProfileHook(func(ctx context.Context, text string) error {
-			return profileStore.Append("偏好", text)
+			// 记忆出处（2026-10-23）：附带来源会话短标签，便于回溯这条偏好的来龙去脉。
+			return profileStore.AppendWithSource("偏好", text, userprofile.SessionSource(tool.SessionIDFromContext(ctx)))
 		})
 		// SessionEvolver（2026-09-02 设计 §6.1）：会话结束一次轻量模型调用产出三类沉淀。
 		// 未接线 ProfilePath 时不进化（画像是一切偏好的宿主）。

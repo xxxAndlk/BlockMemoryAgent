@@ -89,12 +89,13 @@ func (s *ProjectStore) Current(ctx context.Context) *Profile {
 }
 
 // Append 结构化追加一条项目偏好记录（语义同 Store.Append）。
+// 2026-10-23 起自动附来源会话短标签（ctx 会话目录解析失败时退化为无出处）。
 func (s *ProjectStore) Append(ctx context.Context, section, text string) error {
 	st, err := s.storeFor(ctx)
 	if err != nil {
 		return err
 	}
-	return st.Append(section, text)
+	return st.AppendWithSource(section, text, SessionSource(tool.SessionIDFromContext(ctx)))
 }
 
 // Save 全量覆盖 ctx 解析路径的项目偏好（HTTP PUT 用户手动编辑）。

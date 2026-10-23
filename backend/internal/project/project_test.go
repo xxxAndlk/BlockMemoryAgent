@@ -274,12 +274,20 @@ func TestScanDomains_DependencyGraphMergesCluster(t *testing.T) {
 	if !strings.Contains(body, "index.html") {
 		t.Fatalf("expected index.html anchor in body:\n%s", body)
 	}
-	// 轮廓注入：js 文件后应括注行数与顶层符号（window.A L1），css 不注。
-	if !strings.Contains(body, "js/a.js (1 行): window.A L1") {
-		t.Fatalf("expected outline suffix for js/a.js, got:\n%s", body)
+	// 分层（2026-10-23）：符号轮廓不再内联进 PROJECT.md（它每轮进 system prompt），
+	// 移到按需读取的 PROJECT_FILES.md；概览只给路径指针。
+	if strings.Contains(body, "js/a.js (1 行)") {
+		t.Fatalf("PROJECT.md 不应再内联符号轮廓（已分层到 PROJECT_FILES.md）:\n%s", body)
 	}
-	if strings.Contains(body, "css/s.css (") {
-		t.Fatalf("css should not carry outline suffix, got:\n%s", body)
+	if !strings.Contains(body, "PROJECT_FILES.md") {
+		t.Fatalf("PROJECT.md 应给出符号索引路径指针:\n%s", body)
+	}
+	idx, _ := os.ReadFile(ProjectFilesIndexPath(root))
+	if !strings.Contains(string(idx), "js/a.js (1 行): window.A L1") {
+		t.Fatalf("PROJECT_FILES.md 应含符号轮廓与行数，got:\n%s", idx)
+	}
+	if strings.Contains(string(idx), "css/s.css (") {
+		t.Fatalf("css should not carry outline suffix, got:\n%s", idx)
 	}
 }
 
