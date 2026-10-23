@@ -47,7 +47,9 @@
 | `/skills` `/plugins` `/knowledge` | 资源库组 | knowledge 占位 |
 | `/memory` `/profile` `/soul` `/history` | 记忆组 | soul 只读 |
 | `/settings` | 系统组 | |
-| `/workflow` | 侧栏 Beta 卡进入 | 纯占位 |
+| `/workflow` `/workflow/runs/:id` | 侧栏 Beta 卡进入 | 工作流量产流水线（`/workflow` 正文页 2026-10-16） |
+| `/flow` `/flow/edit` | 侧栏 | 可视化流程图（vue-flow，2026-10-19）：列表/运行 + 节点图编辑 |
+| `/external-agents` | 侧栏 | 外部 Agent 注册表管理（2026-10-21）：卡片网格 + 安装状态徽标 + 重载 |
 | `/chat` → `/session`、`/project-prefs` → `/projects` | 重定向 | |
 
 - **菜单是硬编码数组**（layout/index.vue:113-135），与路由表**手工同步**（加页面要改两处；`/session`、`/workflow` 不入菜单；`/projects` 2026-09-17 起入资源库组首项——「会话」「工作目录」两项曾移除，前者入口已在树里）。
@@ -176,7 +178,8 @@
 | `useTreeLayout` | tidy-tree 布局 + isChildWaiting |
 | `useTheme` | localStorage bma:theme |
 | `useWorkDir` | 模块级单例 + bma:last-workdir |
-| `useModelSelection` | 模块级单例（catalog/selectedRole='meta'/thinking）；ensureLoaded 并发去重；doSwitch/doAdd **不 catch**（错误交调用方） |
+| `useModelSelection` | 模块级单例（catalog/selectedRole='meta'/thinking）；ensureLoaded 并发去重；doSwitch/doAdd **不 catch**（错误交调用方）；2026-10-19 起同时承载**会话级模型点选**（本会话记忆 + 搜索过滤） |
+| `useSkillSelection` | 技能选择器（2026-10-23）：`GET /api/skills` 全池，仅保留 name/description/source（正文不留在前端状态）；未绑定会话写 `localStorage.bma:newSessionSkills`（下次新会话沿用），已绑定会话勾选即 `POST /sessions/:id/skills`，失败回滚 |
 | `fileOpener` | 文件打开统一入口（provide/inject）：openInTree/openInViewer/resolveAbsolute/locateRequest；会话页 provide，ArtifactCard/MarkdownRenderer/AssistantTurn/FilePreview inject |
 
 ## 13.11 通用组件与管理页
@@ -185,7 +188,8 @@
 - **WorkDirPicker**：**只在"选定"时 emit 一次**（此前逐字 emit 会写半截路径）；原生目录选择优先（501/504/409 退网页版：面包屑 Windows 盘符兼容/手输/最近/子目录单击选中双击进入）。
 - **WorkDirDrawer**：与 /projects 右栏**同源**（改一处要考虑另一处）；关闭时 emit `update:dir null`（否则同一目录再点打不开）。
 - **MarkdownRenderer**：`marked.parse`（gfm + breaks 单换行即 `<br>`）→ `DOMPurify.sanitize`（标签白名单、禁 data: URI、剥原始 HTML）；自定义 link 渲染器（非 https 归一 # + target blank）；code 渲染器输出 DeepSeek 风格头栏（复制/下载按钮靠事件委托）。
-- **管理页**：dashboard（Promise.all 三源 + 失败进 mock 模式琥珀告警；客户端分页 PAGE_SIZE=10；本页全选；自绘 SVG 折线**未归一化**）；history（`?work_dir=` 预过滤、`openSession` 默认落 monitor；**不传 limit**；**<768px 卡片化**——md 断点下 el-table 换卡片列表（`md:hidden`），桌面表格不动，仅此一处移动适配）；projects（左分组 + 右偏好/测试助手）；plugins（就地替换 + 失败回滚；transportBadge **硬编码 id 判定**）；memory（项目归属靠 source_session→work_dir 反查）；profile（dirty 才可保存；自动行带时间戳、人工行程序永不改写）；settings（外观/服务信息/连接健康/能力自检/桌面通知权限/资源目录）；skills（三 Tab：经验技能 frontmatter 剥离 + 内置 + 进化日志）；soul（只读）；knowledge/workflow（占位）。
+- **管理页**：dashboard（Promise.all 三源 + 失败进 mock 模式琥珀告警；客户端分页 PAGE_SIZE=10；本页全选；自绘 SVG 折线**未归一化**）；history（`?work_dir=` 预过滤、`openSession` 默认落 monitor；**不传 limit**；**<768px 卡片化**——md 断点下 el-table 换卡片列表（`md:hidden`），桌面表格不动，仅此一处移动适配）；projects（左分组 + 右偏好/测试助手）；plugins（就地替换 + 失败回滚；transportBadge **硬编码 id 判定**）；memory（项目归属靠 source_session→work_dir 反查）；profile（dirty 才可保存；自动行带时间戳、人工行程序永不改写）；settings（外观/服务信息/连接健康/能力自检/桌面通知权限/资源目录）；skills（三 Tab：经验技能 frontmatter 剥离 + 内置 + 进化日志）；soul（只读）；external-agents（2026-10-21）；workflow（2026-10-16 正文页）；flow（2026-10-19）。
+- **ChatInput 三个选择器（2026-09-15 ~ 10-23）**：插件（KIMI 式，`POST /sessions/:id/plugins`）、**技能**（2026-10-23，`POST /sessions/:id/skills`，弹层=搜索+多选+管理技能入口）、**模型**（2026-10-19，本会话一键点选 + 搜索）。未绑定会话时选择写 localStorage（`bma:newSessionSkills` 等）并在建会话时随 `createSession` 的 JSON/multipart 双通道携带（`plugins`/`skills` 为 JSON 字符串字段）。
 
 ## 13.12 隐含约定与坑
 

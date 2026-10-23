@@ -182,7 +182,7 @@
 8. `resolveVerifyKind`（3965-3981）：显式值优先；auto → reflection=rubric / 代码类角色=executable / 其余 none。executable 时 task 尾部追加证据格式模板（`tool.VerificationEvidenceTemplate`，与识别器同源）。
 9. `runEngine`（4.9 不在此，见 engine 章/第 02 章 2.9）。
 10. **L0 校验**（3693-3709）：executable 且无 `HasExecutableVerification` → 1 轮反馈重试 → 仍缺 `errVerifyMissing`；通过记 `VerifyNote="L0 证据"`。
-11. **LimitReached**（3711-3736）：domain → 存 history + tree.Pause + `errPaused`；叶子 → 部分产出塞 Text + saveBlockMemory(partial) + `errPartialReturn`。
+11. **LimitReached**（仅子 Agent 会触发，2026-10-21 起）：domain → 存 history + tree.Pause + `errPaused`；叶子 → 部分产出塞 Text + `saveBlockMemory(partial)`（开关已关，空操作）+ `errPartialReturn`。
 12. **冒烟层**（3742-3783）：`smokeTargetsFor` = spec.files ∩ 实际写入；`runSmokeChecks`（node --check 等）失败 → 反馈 1 轮 → 仍败 `errSmokeFailed`；成功渲染【机器校验】段；**JS/HTML 引用完整性第三档**（`runJSRefChecks`）。
 13. **验收分层**（3790-3866，spec verify_levels）：integration（入口引用图，失败走 errSmokeFailed 路由）；runtime（探针证据机器强制 `HasRuntimeProbeEvidence`，缺 → 重试 1 轮 → `errVisualEvidenceMissing`）；visual（场景化去重判定 `visualEvidenceCheck`）；**验收条目计分**（`scoreAcceptance` N/M + qualityBlocked）。
 14. `memory.Write(task_goal_summary)` → `saveBlockMemory(success, files)`。
@@ -244,9 +244,15 @@
 - 缺 `file_tree` 槽时注入探索提示（4803-4806）。
 - 总长上限 30000 runes 截断（4813）；尾部固定【读取纪律】（`sharedPrefixDisciplineNote`，4549：注入内容视为已验证禁止重读）。
 
-## 4.14 块记忆召回与沉淀
+## 4.14 块记忆召回与沉淀（**已停用：2026-10-19 写入永久关停、存量物理删除**）
 
-**召回**（`injectScopedRecall`，5229-5279）：
+> **现状**：`config.yaml agent.block_memory_write_enabled: false` 是 kill switch，`bootstrap` 传给 `Dispatcher.WithBlockMemorySaver(..., enabled=false)`；`saveBlockMemory` 首行即因开关关闭返回，**不再产生新数据**；存量 `global_knowledge` 的 block_memory 行已物理删除。召回链路（黑板 Query / `SearchBlockMemoryByGoal` / 跨 session 补位）代码保留但通常召回为空。回开只需把配置改回 true（无代码改动）。
+>
+> 停用原因：2026-10-19 实证"否决方案的半成品结论入库 → 后续 33 小时 / 1005 次请求持续复注"，且块记忆与用户画像/项目经验职责重复、无可信治理手段。
+
+保留下述历史行为描述备查：
+
+**召回**（`injectScopedRecall`）：
 1. 优先 `BlackboardSearcher.Query(ctx, sid, parentID, domain, query=task, topK=3, "")`（scope 确定性：parent_id+task_domain 过滤 + 可选语义排序）；
 2. 空则回退 `SearchBlockMemoryByGoal(sid, query, topK)`（纯语义）；
 3. 不足 topK → `CrossSessionSearcher.SearchBlockMemoryCrossSession`（跨 session 补位，排除当前 session，更严阈值）；
@@ -451,3 +457,9 @@ worker 池 6 并发 `dispatchOne`；单项上限：默认角色 6 / **scout 32**
 **RestoreSessionDomains**（#21④）：会话 resume 时按 (session_id, agent_id) 从 agent_messages + agent_tree_nodes 重建热驻槽（未终态/终态 30min 内 domain；单节点重建段已抽取为 `restoreColdSlot`，与 reuse 冷恢复共用，重建槽 dormant 无 supervisor、首个唤醒序列惰性启动）——ResumeSessionAgents 头部接线，重建槽同样被 armTTL/opResume 扫到（零特判）。与 #17 领域档案构成三级连续体：热驻池（分钟级）→ **会话 resume 中间层（本条）** → 领域档案（跨会话永久级）。
 
 **expand_memory**（#22④ 展开式召回，expand.go）：压缩摘要讲不细时派**只读**展开器沿摘要链（`Pipeline.Bundles`：leaf→condensed 包链副本）定位细节所属段，再用低层工具取原文（workspace 文件 / .bma/returns 全文 / .bma/tool_outputs 落盘件）。约束：delegation grant 双闸（token 预算 8K + TTL 3min，超限截答返回已有部分）+ 答案硬顶 2000 rune + **结构性禁递归**（展开器工具面只给 ReadFile/SearchInFiles/ListDir——无 call_sub_agent/send_message/写工具，派不出下级）。与 salvage 合成完整记忆环：失败轨迹 salvage 主动重注（现状），成功细节 expand_memory 按需展开——一推一拉，压缩不再等于失忆。meta/domain 白名单放行。
+
+## 4.36 近期增量（2026-10-19 ~ 10-23）
+
+- **子 Agent 标记 `WithSubAgent`（2026-10-21）**：`dispatcher.go` / `expand.go` / `idle_pool.go` 三处派发路径统一置位，是 ReAct 停滞守卫与 token 预算闸的**唯一开关**（置 false 即退化为"顶层主 Agent 语义"：守卫跳过、预算不暂停）。新增派发路径必须补这一句。
+- **块记忆沉淀永久关停（2026-10-19）**：`WithBlockMemorySaver(..., enabled=false)`；`saveBlockMemory` 仍是调用点（失败打捞/部分产出也走它），但首行立即返回，不产生 LLM 提取调用。
+- **项目经验治理（2026-10-20，dispatcher 侧无改动，仅注入前缀口径）**：`projectPrefsPrefix` 经 `userprofile.BudgetSections` 剥「经验归档」小节后渲染（已废止经验不进子 Agent 前缀），并在前缀首部加"与用户当前指示冲突时以最新指示为准"声明。

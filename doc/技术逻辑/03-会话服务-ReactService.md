@@ -86,7 +86,7 @@ ID/Goal/Status/Result/StartedAt/EndedAt/Events[]/Messages[]；`firstTurnImages`�
 
 ### Control Op 全表（:1400-1470）
 
-`message` / `clarify`（answers 兼容 []string 与 []any）/ `interrupt` / `enqueue` / `cancel` / `stop` / `topic` / `trust-mode` / `gear` / `thinking` / `work-dir`（fail-closed 缺参拒绝）/ `worktree`（merge/reject）；default 报 unknown op。
+`message` / `clarify`（answers 兼容 []string 与 []any）/ `interrupt` / `enqueue` / `cancel` / `stop` / `topic` / `trust-mode` / `gear` / `thinking` / `model`（会话级模型覆盖，空串=跟随全局，2026-10-19）/ `pinned-plugins`（会话级指定插件）/ `pinned-skills`（会话级指定技能，2026-10-23）/ `work-dir`（fail-closed 缺参拒绝）/ `worktree`（merge/reject）；default 报 unknown op。
 
 ## 3.4 会话状态机
 
@@ -241,3 +241,29 @@ persist running → `resolveGearMetaRole` → `mountTopLevelEssentials`（插件
 ## 3.12 会话恢复中间层（#21④，2026-09-23）
 
 resume 路径（ResumeSessionAgents）头部调 `Dispatcher.RestoreSessionDomains`：按 (session_id, agent_id) 从 agent_messages + agent_tree_nodes 重建热驻槽（未终态/终态 30min 内 domain），重建槽同样被 armTTL/opResume 扫到（零特判）。三级连续体：热驻池（分钟级 LRU）→ 本条（同会话 resume）→ 领域档案（跨会话永久，#17）。边界：只还原落库数据已够的会话历史，不新增持久化面（#14"不做协作状态持久化"决策不破）。
+
+## 3.13 会话级能力扩展（2026-10-19 ~ 10-23）
+
+四项都遵循同一模式：**会话内字段（atomic/map）+ `MetaMemory` JSONB 持久化 → 重启回填**，切换即时生效，nil/空值=零行为。
+
+### 指定技能 pinnedSkills（2026-10-23，技能选择器）
+
+- 存储：`reactInternalSession.pinnedSkills atomic.Value`（`setPinnedSkills`/`PinnedSkills`），落 `MetaMemory.pinned_skills`（`pinnedSkillsFromMetaMemory` 回填，restore 路径 `session_react.go`）。
+- 注入：`pinnedSkillBlock` 在系统提示尾部追加【用户指定技能】——learned/dir/bundle 技能注入 `Content` 全文，yaml/builtin 回退 `UsageExample`/`ToolRef` 说明；单技能 16000 runes 截断，其余仍可 `load_skill`。**三档顶层（fast/daily/cluster）都生效**。
+- 提权：切换/创建时对**新增的 learned 技能**异步 `use_count+1` + 刷 `last_used_at`（`SetSkillUsageBumper` → `learned_skills.IncrementUseCount`），提升 meta【经验技能】top-N 排序；创建路径对无效技能名从宽丢弃并记事件，`POST /api/sessions/:id/skills` 切换路径整体 400。
+
+### 会话级模型覆盖（2026-10-19）
+
+- 字段：`reactInternalSession.model atomic.Value`；`CreateRequest.Model` 建会话即定，`ControlOpModel`/`SetSessionModel` 运行中切换（空串=恢复跟随全局），落 `MetaMemory.model`。
+- 生效：`providerForRole` 每次 LLM 调用实时读取 → 下一轮即生效（热）；`model.ModelFactory.GetBladesProviderForEntry` 按条目 ID 解析 provider；`SetModelProvider` 注入回退才走全局角色绑定。
+
+### 决策账本写入点（2026-10-22）
+
+`decision_ledger.go` 的 `recordDecision` 覆盖全部用户输入入口：`runSession`/`hydrateDecisions`（goal 播种，source=goal）、`sendMessage` 与运行中邮箱注入（source=user_message）、`enqueue`、`answerClarify`（source=clarify_answer，计划批准另记 `kind=plan`）。落库 `session_decisions`（append-only，状态只 UPDATE）；内存缓存 `sessionDecisionCache`（上限 96），PG 不可用时纯内存降级。
+
+### 指令模式 goal / loop（2026-10-18 实现，2026-10-19 接入）
+
+- 契约在 `agent/directive.go`：`DirectiveSpec{Mode, Objective, CompletionCriterion, MaxTurns, Deadline, LoopIntervalSec, LoopUntil}` + `DirectiveHook` 接口；agent 包**不依赖 goal 包**（钩子反转）。
+- goal：每轮终答由外部评估器（`goal/judge.go`，轻量模型，`judge_timeout_sec`）判完成条件，未达成自动注入"继续推进"续跑；外部阻塞期 Agent 用 `schedule_followup` 自排回查。
+- loop：按 `loop_interval_sec`（最小 60s 收敛）重复执行 objective，直到手动停/切普通/`loop_until` 满足。
+- 权威在表：`session_directive` / `goal_reminders`（重启扫 due 表续跑）；端点 `GET/PUT /api/sessions/:id/directive`（管理器未接线 503）。

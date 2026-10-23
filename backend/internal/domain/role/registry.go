@@ -218,7 +218,12 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 			Tools: []string{
 				"call_sub_agent", "call_sub_agents", "map_sub_agents",
 				"ReadFile", "ListDir", "SearchInFiles", "HTTPGet", "ReadMedia",
-					"WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RestoreFile", "RunCommand",
+				// ShowArtifact（2026-10-23 修）：domain 提示词与叶子公共段都要求"产出后
+				// 用 ShowArtifact 把图/视频/HTML 拿给用户看"，但白名单漏了它——daily 档
+				// 顶层（domain 直接执行）实测 42 个工具里没有该工具，模型只能起本地服务
+				// 让用户自己开浏览器。补进 domain 清单，与 meta 侧对齐。
+				"ShowArtifact",
+				"WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RestoreFile", "RunCommand",
 					// 外部 Agent 调用（2026-10 CallExternalAgent）：domain 可把超出内置工具
 					// 能力的任务派给本机外部 Agent CLI（external_agents.yaml 注册表，硬门同步）。
 					"CallExternalAgent",

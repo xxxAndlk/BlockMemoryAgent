@@ -506,3 +506,47 @@ func TestEnsureProjectDoc_RefreshesOnAssetChange(t *testing.T) {
 		t.Fatal("资产指纹未变化时 Ensure 不应重写文件")
 	}
 }
+
+// TestScanAssetAssets_HiddenDirAndProducer 回归 2026-10-22 交付事故：
+// 素材目录 `hidden` 里的整条帧序列此前被"隐藏目录一律跳过"过滤掉；且清单不写来路，
+// 模型把 `tools/rig/bake.mjs` 用骨架烘焙出的帧当成合规的"连续 16 帧"照单全收。
+// 本测试要求：隐藏素材目录进清单，且能反查到生成脚本。
+func TestScanAssetAssets_HiddenDirAndProducer(t *testing.T) {
+	root := t.TempDir()
+	write := func(p, c string) {
+		full := filepath.Join(root, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+		if err := os.WriteFile(full, []byte(c), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	// 隐藏素材目录：16 帧 + 动作元数据。
+	for i := 0; i < 4; i++ {
+		write(filepath.ToSlash(filepath.Join(".workbuddy", "frames", "anim", "run", "f000"+string(rune('0'+i))+".png")), "x")
+	}
+	write(".workbuddy/frames/anim/_meta.json", "{}")
+	// 生成脚本：正文引用父目录（真实脚本会把 state 子目录拼出来）。
+	write("tools/rig/bake.mjs", "// 逐帧烘焙：骨架 IK 摆姿势后逐帧截图\nconst out = '.workbuddy/frames/anim';\n")
+	// 噪音隐藏目录：不得计入。
+	write(".git/objects/x.png", "x")
+
+	inv := scanAssetAssets(root)
+	if inv.images != 4 {
+		t.Fatalf("应只统计隐藏素材目录里的 4 张图（.git 不计），got %d", inv.images)
+	}
+	section := renderAssetSection(inv)
+	if !strings.Contains(section, ".workbuddy/frames/anim/run/") {
+		t.Fatalf("素材目录应包含隐藏目录 .workbuddy/frames/anim/run:\n%s", section)
+	}
+	if !strings.Contains(section, "生成脚本: tools/rig/bake.mjs") {
+		t.Fatalf("应反查到生成脚本 tools/rig/bake.mjs:\n%s", section)
+	}
+	if !strings.Contains(section, "明确排除") {
+		t.Fatalf("生成脚本存在时应附路线核对提醒:\n%s", section)
+	}
+	if strings.Contains(section, ".git/") {
+		t.Fatalf("噪音隐藏目录 .git 不应出现:\n%s", section)
+	}
+}

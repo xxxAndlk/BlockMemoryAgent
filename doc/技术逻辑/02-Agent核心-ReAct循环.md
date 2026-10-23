@@ -101,14 +101,15 @@
 2. **drainMailbox（generate 前）**（607-615）：压缩用户注入消息延迟上界；有新消息重置停滞计数。history 以 tool 结果（或首条 user）收尾，追加 user 角色不破坏 tool 配对。
 3. **memory.Assemble**（617-619）：压缩历史/注入记忆视图（压缩在 `domain/memory.Pipeline` 内按 token 阈值触发）。
 4. **evictStaleToolResults**（620-623）：`staleToolEvictRounds` 轮前的 ReadFile/SearchInFiles 结果替换为"已驱逐需重读"占位符（仅请求视图；canonical history 不动）。
-5. **append(buildTimeMessage())**（625-627）：当前时间以**尾部 system 消息**注入（放头部会打碎前缀缓存）。
-6. **windowMessages**（629-633）：消息数滑动窗口硬上限（默认 400，兜底防上下文溢出）；保留 system 前缀 + 首条 user，下刀避开孤立 tool 结果。
-7. **sanitizeToolPairing**（634-637）：强制修正 tool_calls ↔ tool 结果配对（缺失补合成错误结果、孤立结果丢弃），避免 API 400 拒绝整轮（实证曾白跑 31m43s）。
-8. **剥图**（639-644）：已知模型不支持图片时 `stripImagesForRequest`（视图变换）。
-9. **tokenBudget 检查**（646-654）：估算超阈值 → 返回 `{LimitReached:true}`（部分完成，上层暂停会话等续跑）。
-10. **ToBladesMessages**（656-657）→ 构造 `blades.ModelRequest{Instruction: system, Messages, Tools: a.tools.Schema()}`（**Schema 每轮实时读**，插件热插拔下一轮生效）。
-11. `logPromptStats` + `reportStableHash`（666-671）：提示词构成计量与 stable 层哈希监控（变化即 WARN）。
-12. **generate**（672）：链式中间件（2.3.5）。
+5. **决策账本注入（2026-10-22）**：`a.directiveBlock()`（`WithDirectiveBlock` 装配，见 decision_ledger.go）渲染【用户指令账本】追加为**尾部 system 消息**——与时间块同构，不进入压缩段、不被 windowMessages 裁掉；块内自声明"与压缩摘要/项目偏好/用户画像冲突时以本块为准"。
+6. **append(buildTimeMessage())**（625-627）：当前时间以**尾部 system 消息**注入（放头部会打碎前缀缓存）。
+7. **windowMessages**（629-633）：消息数滑动窗口硬上限（默认 400，兜底防上下文溢出）。保留三段：开头连续 system、**首条 user（任务目标）**、以及**首条 user 之后紧跟的连续 system**（压缩视图固定前缀=历史压缩摘要+热改动回灌，2026-10-22 新增，此前会被整段裁掉）；下刀避开孤立 tool 结果（从 assistant/user 起刀，绝不从 tool 起刀）。
+8. **sanitizeToolPairing**（634-637）：强制修正 tool_calls ↔ tool 结果配对（缺失补合成错误结果、孤立结果丢弃），避免 API 400 拒绝整轮（实证曾白跑 31m43s）。
+9. **剥图**（639-644）：已知模型不支持图片时 `stripImagesForRequest`（视图变换）。
+10. **tokenBudget 检查**（646-654，**仅子 Agent**）：估算超阈值 → 返回 `{LimitReached:true}`（部分完成，上层暂停会话等续跑）。顶层主 Agent（`subAgent=false`）不受预算暂停约束（2026-10-21 收窄），失控靠 windowMessages 400 硬顶 + API 报错兜底；压缩仍由 memory.Pipeline 按同一阈值独立驱动。
+11. **ToBladesMessages**（656-657）→ 构造 `blades.ModelRequest{Instruction: system, Messages, Tools: a.tools.Schema()}`（**Schema 每轮实时读**，插件热插拔下一轮生效）。
+12. `logPromptStats` + `reportStableHash`（666-671）：提示词构成计量与 stable 层哈希监控（变化即 WARN）。
+13. **generate**（672）：链式中间件（2.3.5）。
 
 ### 2.3.5 generate 与失败分支（672-688）
 
@@ -143,7 +144,7 @@
    - **并行段**（829-845，`parallelTools && len>1`）：信号量限 `toolParallelMax`（默认 4）；写类工具（WriteFile/EditFile/RestoreFile）按目标路径 `pathLockFor` 互斥；各自 keepalive/活动上报。
    - **串行回填段**（857-910）：逐条处理。`errors.Is(err, tool.ErrLoopExit)` → 直接带原因终止循环返回；否则结果序列化 emit `LiveEventToolExec` → `condenseToolResult`（超阈值落盘）→ 截断 → 追加 tool 消息（含 ToolCallID 配对与 Images）→ `memory.Write(tool_call)`。
    - **工具结果全部入史后才 drainMailbox**（912-917）：mailbox 消息是 user 角色，插在 tool_calls 与结果之间会触发配对 400。
-   - **stagnationGuard**（919-925）：产出性工具集合（写文件/派发/消息/浏览器驱动，`productiveToolNames`，react_agent.go:952-958）或 mailbox 有新消息即清零；连续无产出 10 轮预警 / 20 轮最终通牒 / 30 轮 `ErrLoopExit` 硬杀（**meta 豁免硬杀**，react_agent.go:965-990）。
+   - **stagnationGuard**（919-925，**仅子 Agent**：`a.subAgent` 由 `WithSubAgent` 置位，顶层直接返回）：产出性工具集合（写文件/派发/消息/浏览器驱动，`productiveToolNames`）或 mailbox 有新消息即清零；连续无产出 10 轮预警 / 20 轮最终通牒 / 30 轮 `ErrLoopExit` 硬杀。2026-10-21 起顶层主 Agent 整体跳过——长任务主 Agent 的合法慢节奏曾被误杀（dispatcher/expand/idle_pool 三处派发路径统一补 `WithSubAgent`）。
 
 ### 2.3.8 循环结束（928-931）
 
@@ -185,13 +186,14 @@
 |---|---|---|
 | 空响应保护 | react_agent.go:738-748 | 连续 3 次空响应 → 报错（防无声完成） |
 | 坏工具调用保护 | 718-732 | 连续 3 次参数非法被丢弃 → 报错；否则 nudge 重发 |
-| 停滞守卫 | 965-990 | 10/20/30 轮无产出阶梯（预警/通牒/ErrLoopExit 硬杀；meta 豁免硬杀） |
-| windowMessages | 1674-1726 | 消息数滑窗；从 assistant/user 起刀避孤立 tool；首条 user 保底 |
+| 停滞守卫 | `stagnationGuard` | 10/20/30 轮无产出阶梯（预警/通牒/ErrLoopExit 硬杀）；**2026-10-21 起仅子 Agent**（`WithSubAgent`），顶层跳过 |
+| windowMessages | `windowMessages` | 消息数滑窗；保留开头 system + 首条 user + **首条 user 后的压缩视图固定前缀**（2026-10-22）；从 assistant/user 起刀避孤立 tool |
+| 决策账本 | `decisionBlock`（decision_ledger.go） | 每轮尾部注入【用户指令账本】，不参与压缩/滑窗 |
 | sanitizeToolPairing | 1735-1785 | 发送前强制配对（最后防线） |
 | evictStaleToolResults | 1077-1130 | 只读探查结果过期驱逐（视图层） |
 | condenseToolResult | 996-1015 | 大输出落盘 + 摘要 |
 | 流式看门狗 | 1519-1566 | 首块 120s / 块间 300s 判死重试 |
-| 上下文预算 | 646-654 | token 估算 ≥ budget → LimitReached |
+| 上下文预算 | 646-654 | token 估算 ≥ budget → LimitReached（**仅子 Agent**，2026-10-21） |
 | 视觉降级 | 673-688 | 图片不支持 → 剥图续跑（一次性） |
 
 ## 2.7 mailbox 交互
@@ -239,8 +241,8 @@
 4. **图片只挂"最后一轮"**：user 最后一条 + tool 最后一批；旧轮 base64 自动卸载（词表占位符仍留）。
 5. **`Images json:"-"`**：不进持久化、不计 token 估算。
 6. **stable 层哈希恒定是断言**：`reportStableHash` 变化即 WARN。
-7. **meta 豁免停滞硬杀**：ErrLoopExit 会终止整个会话，故 meta 只收预警。
-8. **`maxIter<=0` 表示不限制**（meta 用 0）；tokenBudget 才是 meta 的实际收敛闸。
+7. **停滞守卫只对子 Agent**（2026-10-21 收窄）：顶层主 Agent 长任务节奏慢是常态，曾被误杀；父侧仍靠子 Agent 的心跳/墙钟兜底。
+8. **`maxIter<=0` 表示不限制**（meta 用 0）；顶层主 Agent 也无 token 预算闸（2026-10-21 起仅子 Agent 生效），失控靠 windowMessages 400 硬顶 + API 报错。
 9. `truncateRunes` 按 rune（中文安全）；多处截断阈值硬编码（如 `historyToolCallInputMaxRunes=12000` 无配置项）。
 10. 会话级 logger 经 ctx 传递（`logger.NewContext`），轻量 LLM 调用（事实提取/打捞/judge）靠它写 session_logs。
 

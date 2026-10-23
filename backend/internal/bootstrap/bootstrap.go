@@ -708,6 +708,19 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		}
 		return out, total
 	})
+	// 指定技能使用权重提升（技能选择器）：用户在新会话/会话内勾选 learned 技能时
+	// use_count+1（提升 meta【经验技能】top-N 排序并刷新 last_used_at，避免被冷淘汰）。
+	// 非 learned 技能（yaml/dir/bundle/builtin）无计数，UPDATE 零行、无副作用。
+	// 异步执行：建会话/切技能是用户交互路径，不被数据库抖动拖慢（失败只记日志）。
+	agentSvc.SetSkillUsageBumper(func(names []string) {
+		go func() {
+			for _, name := range names {
+				if err := pgStore.LearnedSkills.IncrementUseCount(context.Background(), name); err != nil {
+					log.Printf("[bootstrap] bump skill usage failed: skill=%s err=%v", name, err)
+				}
+			}
+		}()
+	})
 	// 注入用户视频附件处理参数（Alt+V 粘贴视频）：默认 native——≤ native_max_mb 的
 	// mp4/avi/mov 整个直传，openai-chat 兼容端点映射 video_url 供 Ark/GLM 视频理解
 	// 模型原生消费（已对照火山文档 82379/1895586）；webm/mkv/超限视频回落抽帧，

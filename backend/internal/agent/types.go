@@ -152,6 +152,11 @@ type CreateRequest struct {
 	// 要求优先使用；空=不指定（模型经 tool_catalog/tool_mount 自行判断）。
 	// 创建路径从宽：无效 ID（不存在/未启用/未运行）丢弃并记事件，不阻断建会话。
 	PinnedPlugins []string
+	// PinnedSkills 会话级指定技能（技能选择器）：用户显式勾选后技能全文直接注入本会话
+	// 顶层 Agent 系统提示（免 load_skill 按需取用）并要求优先使用；learned 技能同时
+	// 提升使用权重（use_count+1，影响经验技能 top-N 排序与冷淘汰）。空=不指定。
+	// 创建路径从宽：无效名称（不在技能池）丢弃并记事件，不阻断建会话。
+	PinnedSkills []string
 	// NonInteractive 无人值守会话（DAG 定时派发等）：ask_user 不挂起等用户，
 	// 直接返回"自行决策"答复让 Agent 继续跑。
 	NonInteractive bool
@@ -275,6 +280,10 @@ const (
 	// Args{"plugins": []string}，空数组=清空（合法）。atomic 即时生效——新插件工具
 	// 预挂进会话顶层 scope、取消勾选的工具卸载，下一轮起跑按新集合构建提示块。
 	ControlOpPinnedPlugins = "pinned-plugins"
+	// ControlOpPinnedSkills 切换会话级指定技能（技能选择器）：
+	// Args{"skills": []string}，空数组=清空（合法）。atomic 即时生效——下一轮起跑按
+	// 新集合重建技能提示块（全文直载）；新增的 learned 技能提升使用权重。
+	ControlOpPinnedSkills = "pinned-skills"
 )
 
 // Filter 表示列出会话时使用的筛选条件。
@@ -405,6 +414,9 @@ type Session struct {
 	// PinnedPlugins 会话级指定插件 ID 列表（KIMI 式插件选择）：空 = 未指定
 	// （模型自行判断）。前端插件选择器据此回显。
 	PinnedPlugins []string
+	// PinnedSkills 会话级指定技能名称列表（技能选择器）：空 = 未指定。
+	// 前端技能选择器据此回显。
+	PinnedSkills []string
 	// WidgetData 界面部件瞬时数据通道的最新值（widget_id -> payload，仅内存态，
 	// 不持久化）；快照线型 json 名 widget_data 由 server 层接线决定，此处先行声明。
 	WidgetData map[string]string

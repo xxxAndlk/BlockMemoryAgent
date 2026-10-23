@@ -212,7 +212,21 @@ var sessionScopedTables = []string{
 	"mailbox_messages",
 	"session_boards",
 	"session_decisions", // 会话决策账本（2026-10-22）：用户显式删会话时级联清理
+	"session_directive", // goal/loop 指令模式（2026-10-18，goal.Manager 懒建表）
+	"goal_reminders",    // schedule_followup 到期回查（2026-10-18，goal.Manager 懒建表）
+	"flow_runs",         // 可视化编排运行（2026-10-18）；其 node_runs 经 run_id 从属，见 DeleteSessionData 前置删除
 	"workflow_runs", // 工作流量产运行（2026-10-16）；其 units 经 run_id 从属，见 DeleteSessionData 前置删除
+}
+
+// tableExistsTx 判断表是否存在（to_regclass 对不存在的表返回 NULL）。
+// 用途：goal/flow 等子系统的表由各自 Manager 懒建（不在 ensureSchemas 清单内），
+// 测试库或未启用子系统的部署可能缺表——硬删会话时应跳过而不是让删除整体失败。
+func tableExistsTx(ctx context.Context, tx *sql.Tx, table string) (bool, error) {
+	var reg *string
+	if err := tx.QueryRowContext(ctx, `SELECT to_regclass($1)::text`, table).Scan(&reg); err != nil {
+		return false, err
+	}
+	return reg != nil, nil
 }
 
 // DeleteSessionData 硬删除会话的全部持久化数据（sessionScopedTables 逐表 DELETE）。
@@ -228,12 +242,32 @@ func (s *SessionStore) DeleteSessionData(ctx context.Context, sessionID string) 
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-	// workflow_units 无 session_id 列（经 run_id 归属），先按 run 从属删除（FK 顺序）。
-	if _, err := tx.ExecContext(ctx, `DELETE FROM workflow_units WHERE run_id IN (SELECT id FROM workflow_runs WHERE session_id = $1)`, sessionID); err != nil {
-		return fmt.Errorf("delete workflow_units: %w", err)
+	// workflow_units / flow_node_runs 无 session_id 列（经父表外键归属），先按从属删除
+	// （FK 顺序：子表先于父表）。
+	if ok, err := tableExistsTx(ctx, tx, "workflow_runs"); err != nil {
+		return fmt.Errorf("check workflow_runs: %w", err)
+	} else if ok {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM workflow_units WHERE run_id IN (SELECT id FROM workflow_runs WHERE session_id = $1)`, sessionID); err != nil {
+			return fmt.Errorf("delete workflow_units: %w", err)
+		}
+	}
+	if ok, err := tableExistsTx(ctx, tx, "flow_runs"); err != nil {
+		return fmt.Errorf("check flow_runs: %w", err)
+	} else if ok {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM flow_node_runs WHERE run_id IN (SELECT id FROM flow_runs WHERE session_id = $1)`, sessionID); err != nil {
+			return fmt.Errorf("delete flow_node_runs: %w", err)
+		}
 	}
 	for _, table := range sessionScopedTables {
 		// 表名为编译期常量清单，非用户输入，直接内插安全。
+		// 未建表的子系统（goal/flow 懒建）跳过，不阻断删除。
+		ok, err := tableExistsTx(ctx, tx, table)
+		if err != nil {
+			return fmt.Errorf("check %s: %w", table, err)
+		}
+		if !ok {
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE session_id = $1`, sessionID); err != nil {
 			return fmt.Errorf("delete %s: %w", table, err)
 		}

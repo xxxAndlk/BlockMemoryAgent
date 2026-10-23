@@ -147,6 +147,10 @@ type reactInternalSession struct {
 	// 强制预挂到会话顶层 scope 并注入提示块要求优先使用；空=不指定（模型自行判断）。
 	// atomic.Value 保证跨 goroutine 读写（HTTP 切换即时生效，runSession 起跑重挂读取）。
 	pinnedPlugins atomic.Value
+	// pinnedSkills 是会话级指定技能名称列表（技能选择器）：用户显式勾选后技能全文直接
+	// 注入会话顶层系统提示（免 load_skill 按需取用）并要求优先使用；空=不指定。
+	// atomic.Value 保证跨 goroutine 读写（HTTP 切换即时生效，runSession 起跑重建提示块）。
+	pinnedSkills atomic.Value
 	// activeTopicID 当前活跃话题 ID。切换话题时旧 Agent 树终结 + 新树起,
 	// 旧话题摘要写入 sharedKV `topic:{sessionID}:{topicID}:summary`。空表示单话题(未切换过)。
 	// 话题 ID 也在切换时用于emetries 标签(若需)。
@@ -598,6 +602,26 @@ func (s *reactInternalSession) setPinnedPlugins(ids []string) {
 	s.pinnedPlugins.Store(ids)
 }
 
+// currentPinnedSkills 返回会话级指定技能名称列表（技能选择器）；未设置返回 nil
+// （= 不指定）。runSession/resumeSession 起跑时据此重建技能提示块；HTTP 切换经
+// setPinnedSkills 原子生效。
+func (s *reactInternalSession) currentPinnedSkills() []string {
+	if v := s.pinnedSkills.Load(); v != nil {
+		if names, ok := v.([]string); ok {
+			return names
+		}
+	}
+	return nil
+}
+
+// setPinnedSkills 设置会话级指定技能（atomic 存储无需额外加锁；空切片=清空）。
+func (s *reactInternalSession) setPinnedSkills(names []string) {
+	if names == nil {
+		names = []string{}
+	}
+	s.pinnedSkills.Store(names)
+}
+
 // currentWorkDir 返回会话的每会话工作目录；未设置返回空串（= 回落进程默认目录）。
 // 供每回合开始的 runCtx 注入与持久化读取——中途改目录在下一回合生效。
 func (s *reactInternalSession) currentWorkDir() string {
@@ -998,17 +1022,18 @@ func (st *reactSessionStore) persistHistory(session *reactInternalSession) {
 }
 
 // sessionMetaMemory 组装会话持久化 meta（TODO #14 会话三档控制 + 2026-09-16 会话级
-// 思考强度 + 会话级指定插件 + 2026-10-19 会话级模型覆盖）：档位 gear + 思考强度 thinking +
-// 指定插件 pinned_plugins + 模型覆盖 model，重启恢复分别经 gearFromMetaMemory /
-// thinkingFromMetaMemory / pinnedPluginsFromMetaMemory / modelFromMetaMemory 回填；
-// 字段以 map 键增量扩展，旧记录缺键自然回落默认。
-// 四者皆空返回空切片（与 MetaMemory 列历史写入形态一致）。
+// 思考强度 + 会话级指定插件 + 2026-10-19 会话级模型覆盖 + 指定技能）：档位 gear +
+// 思考强度 thinking + 指定插件 pinned_plugins + 模型覆盖 model + 指定技能 pinned_skills，
+// 重启恢复分别经 gearFromMetaMemory / thinkingFromMetaMemory / pinnedPluginsFromMetaMemory /
+// modelFromMetaMemory / pinnedSkillsFromMetaMemory 回填；字段以 map 键增量扩展，
+// 旧记录缺键自然回落默认。全部为空返回空切片（与 MetaMemory 列历史写入形态一致）。
 func sessionMetaMemory(session *reactInternalSession) []map[string]any {
 	g := session.currentGear()
 	t := session.currentThinking()
 	m := session.currentModel()
 	ids := session.currentPinnedPlugins()
-	if g == "" && t == "" && m == "" && len(ids) == 0 {
+	skillNames := session.currentPinnedSkills()
+	if g == "" && t == "" && m == "" && len(ids) == 0 && len(skillNames) == 0 {
 		return []map[string]any{}
 	}
 	mmap := map[string]any{}
@@ -1023,6 +1048,9 @@ func sessionMetaMemory(session *reactInternalSession) []map[string]any {
 	}
 	if len(ids) > 0 {
 		mmap["pinned_plugins"] = ids
+	}
+	if len(skillNames) > 0 {
+		mmap["pinned_skills"] = skillNames
 	}
 	return []map[string]any{mmap}
 }
@@ -1078,14 +1106,28 @@ func modelFromMetaMemory(meta []map[string]any) string {
 // 插件可用性不在此校验——恢复后由 runSession 的 applyPinnedPlugins 经 resolver 重挂，
 // 已停用/已卸载的插件自然挂不上（MountPreApprovedForScope 跳过未注册工具）。
 func pinnedPluginsFromMetaMemory(meta []map[string]any) []string {
+	return metaStringList(meta, "pinned_plugins")
+}
+
+// pinnedSkillsFromMetaMemory 从持久化 meta 读取会话级指定技能名称列表（技能选择器）：
+// 取首个非空列表；元素逐个断言为字符串（脏数据跳过）。缺键/无 meta 返回 nil（= 不指定）。
+// 技能可用性不在此校验——恢复后由 runSession 重建提示块时经技能池解析，
+// 已删除/已禁用的技能自然零注入（同 pinnedPluginBlock 语义）。
+func pinnedSkillsFromMetaMemory(meta []map[string]any) []string {
+	return metaStringList(meta, "pinned_skills")
+}
+
+// metaStringList 从持久化 meta 读取指定键的字符串列表：取首个非空列表，容忍
+// JSONB 往返后的 []any 与进程内直写的 []string 两种形态，脏元素跳过。
+func metaStringList(meta []map[string]any, key string) []string {
 	for _, m := range meta {
 		if m == nil {
 			continue
 		}
-		raw, ok := m["pinned_plugins"].([]any)
+		raw, ok := m[key].([]any)
 		if !ok {
 			// 内存直写形态（未经 JSONB 往返）容忍 []string。
-			if ss, ok2 := m["pinned_plugins"].([]string); ok2 {
+			if ss, ok2 := m[key].([]string); ok2 {
 				raw = make([]any, 0, len(ss))
 				for _, id := range ss {
 					raw = append(raw, id)
@@ -1371,6 +1413,9 @@ func (st *reactSessionStore) buildRestoredSession(ctx context.Context, rec *stor
 	// 恢复会话级指定插件（KIMI 式插件选择）：缺键回落 nil=不指定；
 	// 工具重挂在 runSession 起跑时经 applyPinnedPlugins 完成（挂载集纯内存）。
 	sess.setPinnedPlugins(pinnedPluginsFromMetaMemory(rec.MetaMemory))
+	// 恢复会话级指定技能（技能选择器）：缺键回落 nil=不指定；
+	// 全文注入在 runSession 起跑重建提示块时完成（技能池解析）。
+	sess.setPinnedSkills(pinnedSkillsFromMetaMemory(rec.MetaMemory))
 	// mailbox 未读重投（P0 持久化）：重启前已投递未消费的邮件回箱，meta/热驻槽
 	// 恢复后经 drainMailbox 自然消费；同 ID 幂等（Restore 内部去重）。
 	st.reloadUnreadMailbox(rec.SessionID)

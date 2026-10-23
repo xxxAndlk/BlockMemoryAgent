@@ -83,6 +83,8 @@ export interface SessionSummary {
   model?: string
   /** 会话级指定插件 ID 列表（KIMI 式插件选择）：选中 = 优先/强制使用；空/缺省 = 未指定（模型自行判断）。 */
   pinned_plugins?: string[]
+  /** 会话级指定技能名称列表（技能选择器）：选中 = 技能全文直接加载并优先使用；空/缺省 = 未指定。 */
+  pinned_skills?: string[]
 }
 
 export interface Session extends SessionSummary {
@@ -468,6 +470,11 @@ export interface Skill {
   tool_ref: string
   cost: number
   tags: string[]
+  /** 来源：yaml | dir | bundle | builtin | learned（技能选择器展示用）。 */
+  source?: string
+  /** SKILL.md 正文全文（列表接口会返回，选择器不展示；勿在列表页大面积渲染）。 */
+  content?: string
+  usage_example?: string
 }
 
 export interface HealthStatus {

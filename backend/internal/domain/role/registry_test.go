@@ -292,3 +292,21 @@ func TestRegistry_DomainRetainsLeafDispatch(t *testing.T) {
 		t.Fatal("CanCall(domain, code_assistant) 应为 true（叶子保留为可选下拆层）")
 	}
 }
+
+// TestRegistry_DomainHasShowArtifact 回归 2026-10-23：domain 提示词与叶子公共段都
+// 要求"产出图/视频/HTML 后用 ShowArtifact 拿给用户看"，但 domain 工具白名单漏了它——
+// daily 档顶层（domain 直接执行）实测 42 个工具里没有该工具，模型只能起本地服务让用户
+// 自己开浏览器（2026-10-23 会话实证：查 tool_catalog 无果后改为 HTTPGet/启动服务）。
+func TestRegistry_DomainHasShowArtifact(t *testing.T) {
+	r := NewRegistry(&config.RoleConfigFile{})
+	d := r.Get("domain")
+	if d == nil {
+		t.Fatal("domain 角色定义不应为 nil")
+	}
+	for _, name := range d.Tools {
+		if name == "ShowArtifact" {
+			return
+		}
+	}
+	t.Fatal("domain 工具白名单应包含 ShowArtifact（提示词要求产出后展示给用户）")
+}

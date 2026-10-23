@@ -2,9 +2,10 @@
 import { ref, computed, reactive, watch, nextTick, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { WireImage, SessionGear, SessionThinking, TrustMode, Session, SessionRunMode, SessionDirectiveSpec, SessionDirective } from '@/types'
-import { setTrustMode, setSessionGear, setSessionThinking, setSessionPlugins, setSessionModel, getSessionDirective, setSessionDirective } from '@/api/session'
+import { setTrustMode, setSessionGear, setSessionThinking, setSessionPlugins, setSessionSkills, setSessionModel, getSessionDirective, setSessionDirective } from '@/api/session'
 import { useModelSelection } from '@/composables/useModelSelection'
 import { usePluginSelection } from '@/composables/usePluginSelection'
+import { useSkillSelection } from '@/composables/useSkillSelection'
 import { useRouter } from 'vue-router'
 import WorkDirPicker from '@/components/WorkDirPicker.vue'
 import { useWorkDir } from '@/composables/useWorkDir'
@@ -38,7 +39,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'submit', content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[], directive: SessionDirectiveSpec | null, model: string): void
+  (e: 'submit', content: string, images: WireImage[], files: File[], gear: SessionGear, thinking: SessionThinking, plugins: string[], skills: string[], directive: SessionDirectiveSpec | null, model: string): void
   (e: 'new-session'): void
   (e: 'update-workdir', dir: string): void
   (e: 'stop'): void
@@ -228,6 +229,84 @@ function clearPlugins() {
 function goPluginsPage() {
   pluginPopoverVisible.value = false
   router.push('/plugins')
+}
+
+// ── 会话级指定技能（技能选择器）：选中 = 技能全文直接加载并优先使用（learned 技能同时
+// 提升使用权重 use_count），不选 = 模型自行判断。未绑定会话 = 创建选择（localStorage
+// 记忆，随创建请求携带，下次会话沿用）；已绑定 = 勾选即 POST 即时切换（下一轮起跑生效），
+// 失败回滚勾选。
+const SKILLS_STORAGE_KEY = 'bma:newSessionSkills'
+const { selectable: selectableSkills, loading: skillsLoading, ensureLoaded: ensureSkillsLoaded } = useSkillSelection()
+const skillPopoverVisible = ref(false)
+const skillSaving = ref(false)
+const skillFilter = ref('')
+
+function loadStoredSkills(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SKILLS_STORAGE_KEY) || '[]')
+    return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : []
+  } catch {
+    return []
+  }
+}
+const pinnedSkills = ref<string[]>(loadStoredSkills())
+// 绑定会话后以会话快照回显（pinned_skills 空 = 未指定）。
+watch(
+  () => [props.sessionBound, props.session?.pinned_skills] as const,
+  ([bound, names]) => { if (bound) pinnedSkills.value = [...(names ?? [])] },
+  { immediate: true },
+)
+watch(skillPopoverVisible, (v) => { if (v) ensureSkillsLoaded() })
+
+const filteredSkills = computed(() => {
+  const kw = skillFilter.value.trim().toLowerCase()
+  const all = selectableSkills.value
+  if (!kw) return all
+  return all.filter((s) => `${s.id} ${s.name} ${s.description} ${s.source}`.toLowerCase().includes(kw))
+})
+
+const SKILL_SOURCE_LABEL: Record<string, string> = {
+  learned: '经验',
+  yaml: '工具',
+  dir: '目录',
+  bundle: '插件包',
+  builtin: '内置',
+}
+
+async function applyPinnedSkills(next: string[]) {
+  const prev = pinnedSkills.value
+  pinnedSkills.value = next
+  // 选择始终记忆：即便在已绑定会话里勾选，也作为"下次新会话"的默认沿用
+  // （用户诉求：选的技能下次会话直接加载）。
+  localStorage.setItem(SKILLS_STORAGE_KEY, JSON.stringify(next))
+  if (!props.sessionBound || !props.session) return
+  skillSaving.value = true
+  try {
+    await setSessionSkills(props.session.id, next)
+    ElMessage.success(next.length ? `已指定 ${next.length} 个技能（全文直载，下一轮生效）` : '已清空指定技能（模型自行判断）')
+  } catch (e) {
+    ElMessage.error('切换指定技能失败：' + (e instanceof Error ? e.message : String(e)))
+    pinnedSkills.value = prev
+    localStorage.setItem(SKILLS_STORAGE_KEY, JSON.stringify(prev))
+  } finally {
+    skillSaving.value = false
+  }
+}
+
+function onToggleSkill(id: string, checked: boolean) {
+  const set = new Set(pinnedSkills.value)
+  if (checked) set.add(id)
+  else set.delete(id)
+  applyPinnedSkills([...set])
+}
+
+function clearSkills() {
+  applyPinnedSkills([])
+}
+
+function goSkillsPage() {
+  skillPopoverVisible.value = false
+  router.push('/skills')
 }
 
 // ── 会话指令模式（goal/loop，2026-10-18）：normal=普通单轮；goal=多轮自主推进直到完成
@@ -727,7 +806,7 @@ function handleSubmit() {
   const files = readyFiles.value.map((f) => f.file)
   // 会话指令（goal/loop）随创建/发送请求携带；normal 传 null（objective 由后端回落为消息内容）。
   const directive = runMode.value === 'normal' ? null : buildDirectiveSpec()
-  emit('submit', content.value.trim(), pendingImages.value.slice(), files, gear.value, thinking.value, pinnedPlugins.value.slice(), directive, sessionModel.value)
+  emit('submit', content.value.trim(), pendingImages.value.slice(), files, gear.value, thinking.value, pinnedPlugins.value.slice(), pinnedSkills.value.slice(), directive, sessionModel.value)
   content.value = ''
   pendingImages.value = []
   pendingFiles.value = []
@@ -1095,6 +1174,44 @@ function onKeydown(e: KeyboardEvent) {
               <div class="flex items-center justify-between pt-2">
                 <el-button link type="primary" size="small" @click="goPluginsPage">管理插件</el-button>
                 <el-button link size="small" :disabled="!pinnedPlugins.length || pluginSaving" @click="clearPlugins">清空</el-button>
+              </div>
+            </div>
+          </el-popover>
+          <!-- 技能选择弹层：勾选 = 本会话直接加载技能全文并优先使用（learned 技能同时提权）；
+               不勾选 = 模型自行判断。未绑定会话时选择会被记住，下次开新会话沿用 -->
+          <el-popover v-model:visible="skillPopoverVisible" placement="top-start" :width="360" trigger="click">
+            <template #reference>
+              <el-button text size="small" class="!text-ink-2 hover:!text-primary !px-2"
+                         :class="pinnedSkills.length ? '!text-primary' : ''"
+                         title="指定技能：勾选后本会话直接加载技能全文并优先使用；learned 技能同时提升使用权重">
+                <el-icon><Reading /></el-icon>
+                <span class="ml-1 text-xs">技能{{ pinnedSkills.length ? `·${pinnedSkills.length}` : '' }}</span>
+              </el-button>
+            </template>
+            <div class="text-xs" v-loading="skillsLoading">
+              <div class="mb-1 text-ink-2">指定技能（勾选后全文直载并优先使用；下次新会话沿用）</div>
+              <el-input v-model="skillFilter" size="small" clearable placeholder="搜索技能名称 / 描述 / 来源" />
+              <div v-if="filteredSkills.length" class="mt-1.5 max-h-64 overflow-y-auto">
+                <div v-for="sk in filteredSkills" :key="sk.id"
+                     class="flex items-start gap-2 py-1.5 border-b border-line last:border-b-0">
+                  <el-checkbox :model-value="pinnedSkills.includes(sk.id)" :disabled="skillSaving"
+                               class="!mr-0 shrink-0"
+                               @change="onToggleSkill(sk.id, $event as boolean)" />
+                  <div class="min-w-0 flex-1">
+                    <div class="text-ink truncate">{{ sk.name }}</div>
+                    <div class="text-ink-3 text-[11px] truncate" :title="sk.description">{{ sk.description || sk.id }}</div>
+                  </div>
+                  <span v-if="sk.source" class="text-[10px] text-ink-3 shrink-0">
+                    {{ SKILL_SOURCE_LABEL[sk.source] || sk.source }}
+                  </span>
+                </div>
+              </div>
+              <div v-else class="py-3 text-center text-ink-3">
+                {{ skillFilter.trim() ? '无匹配技能' : '暂无可用技能（技能池为空）' }}
+              </div>
+              <div class="flex items-center justify-between pt-2">
+                <el-button link type="primary" size="small" @click="goSkillsPage">管理技能</el-button>
+                <el-button link size="small" :disabled="!pinnedSkills.length || skillSaving" @click="clearSkills">清空</el-button>
               </div>
             </div>
           </el-popover>

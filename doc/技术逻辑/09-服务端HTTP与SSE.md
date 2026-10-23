@@ -44,7 +44,7 @@
 | 方法 | 路径 | handler | 语义 |
 |---|---|---|---|
 | GET | `/api/sessions` | session_http.go:161 | 摘要列表，`?limit=`（默认 200，上限 1000） |
-| POST | `/api/sessions` | :40 | 创建 `{goal, images?, videos?, work_dir?, gear?, thinking?}`；**带文件附件时 multipart/form-data**（2026-10-14，见 9.6） |
+| POST | `/api/sessions` | :40 | 创建 `{goal, images?, videos?, work_dir?, gear?, thinking?, model?, plugins?, skills?, directive?}`；**带文件附件时 multipart/form-data**（2026-10-14，见 9.6）；`model` 会话级模型覆盖（2026-10-19）、`skills` 指定技能（2026-10-23）、`directive` goal/loop 指令模式 |
 | POST | `/api/sessions/delete` | :200 | 批量硬删除 `{ids[]}`（≤200，逐条独立结果，恒 200） |
 | GET | `/api/sessions/:id/stream` | stream_http.go:18 | SSE 长连接 |
 | POST | `/api/sessions/:id/message` | :383 | 发消息 `{content, images?, videos?}`；**带文件附件时 multipart/form-data**（2026-10-14，见 9.6） |
@@ -60,7 +60,12 @@
 | POST | `/api/sessions/:id/worktrees/:aid/:action` | :742 | 合并门 merge/reject（reject 可带 comments） |
 | GET | `/api/sessions/:id/metrics` / `efficiency` / `logs` / `token-metrics` / `watchdog` / `mailbox` | session.go | 只读查询族 |
 | GET | `/api/sessions/:id/mailbox-trace` | session_http.go:626 | 会话级邮件留痕（2026-09-17）：全部 Agent 的 mailbox 往来一行一封、收发双方重复行 store 层 DISTINCT、按时间正序；与 `/mailbox`（未取走的待办队列）语义不同——那是待办、这是历史，主对话栏 MailBubble 数据源 |
-| POST | `/api/sessions/:id/clarify` / `interrupt` / `enqueue` / `cancel` / `stop` / `topic` / `trust-mode` / `gear` / `thinking` / `workdir` | control_http.go / session_http.go | 控制族 |
+| POST | `/api/sessions/:id/clarify` / `interrupt` / `enqueue` / `cancel` / `stop` / `topic` / `trust-mode` / `gear` / `thinking` / `model` / `plugins` / `skills` / `workdir` | control_http.go / session_http.go | 控制族（`model`/`plugins`/`skills` 为 2026-10-19~23 新增，空数组/空串=清空） |
+| GET/PUT | `/api/sessions/:id/directive` | directive.go:29 | goal/loop 指令模式查询/切换；管理器未接线 503 |
+| GET | `/api/external-agents` | external_agents.go:35 | 外部 Agent 注册表清单（含 `exec.LookPath` 安装状态） |
+| POST | `/api/external-agents/reload` | external_agents.go:44 | 重读 `external_agents.yaml` + 热注入 Registry |
+| GET/PUT | `/api/flow/flows[/:id]` | flow.go:40 | 流程图定义读取/保存 |
+| POST/GET | `/api/flow/runs[/:id]`、`/abort`、`/nodes/:nid/decide` | flow.go:40 | 流程运行创建/查询/中止/人工裁决；引擎未接线 503 |
 | GET | `/api/sessions/:id/workspace/*path` | workspace_http.go:35 | 工作区文件流式服务 |
 | DELETE | `/api/sessions/:id` | :184 | 硬删单会话 |
 | GET | `/api/sessions/:id` | :100 | 详情（全量线型） |

@@ -45,3 +45,29 @@ func TestSessionHistoryRecord_WorkDirRoundTrip(t *testing.T) {
 		t.Fatalf("空 WorkDir 往返后应为空串, got %q", backEmpty.WorkDir)
 	}
 }
+
+// TestSessionScopedTablesCoverGoalAndFlow 回归 2026-10-23：
+// 硬删会话曾漏掉 goal/loop 与可视化编排的会话从属表（session_directive /
+// goal_reminders / flow_runs），删除后残留孤儿行。本测试锁住清单，
+// 并确认"经父表外键从属"的子表（flow_node_runs / workflow_units）不在其中
+// ——它们没有 session_id 列，必须在 DeleteSessionData 里按 run_id 前置删除。
+func TestSessionScopedTablesCoverGoalAndFlow(t *testing.T) {
+	have := make(map[string]bool, len(sessionScopedTables))
+	for _, table := range sessionScopedTables {
+		have[table] = true
+	}
+	for _, want := range []string{
+		"session_history", "session_events", "session_logs",
+		"session_decisions", "session_directive", "goal_reminders",
+		"flow_runs", "workflow_runs",
+	} {
+		if !have[want] {
+			t.Errorf("sessionScopedTables 缺少 %q（硬删会话会残留孤儿行）", want)
+		}
+	}
+	for _, child := range []string{"flow_node_runs", "workflow_units"} {
+		if have[child] {
+			t.Errorf("%q 没有 session_id 列，不能进 sessionScopedTables（须按 run_id 前置删除）", child)
+		}
+	}
+}

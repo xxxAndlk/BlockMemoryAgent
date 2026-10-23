@@ -220,6 +220,10 @@ type ReactService struct {
 	// top-N 元数据与启用总数，供 meta 系统提示只列常用技能（其余经 list_skills 检索）。
 	// 由 bootstrap 接 learned_skills 的 TopEnabled 查询；nil 时 meta 提示不列经验技能。
 	skillCatalog func() ([]SkillRecallHint, int)
+	// skillUsageBumper 指定技能使用权重提升回调（技能选择器）：用户勾选 learned 技能时
+	// 调用（use_count+1，提升经验技能 top-N 排序并刷新最近使用，避免被冷淘汰）；nil 时
+	// 零行为变化。bootstrap 接 learned_skills.IncrementUseCount。
+	skillUsageBumper func(names []string)
 
 	// agentMsgCache/msgLogger 编排页对话视图：Redis 热层读缓存 + meta 消息热写器；
 	// 均由 SetAgentMsgCache 一并装配，nil 时读侧回退 PG、写侧跳过。
@@ -246,6 +250,13 @@ func (s *ReactService) SetSkillCatalog(p *skill.Pool) {
 // 不列经验技能）。bootstrap 接 learned_skills.TopEnabled。
 func (s *ReactService) SetSkillCatalogSource(fn func() ([]SkillRecallHint, int)) {
 	s.skillCatalog = fn
+}
+
+// SetSkillUsageBumper 注入指定技能使用权重提升回调（技能选择器）：用户勾选 learned
+// 技能时调用（use_count+1）；nil 关闭（权重不变，全文注入照常）。
+// bootstrap 接 learned_skills.IncrementUseCount；回调内部须自行兜底错误。
+func (s *ReactService) SetSkillUsageBumper(fn func(names []string)) {
+	s.skillUsageBumper = fn
 }
 
 // SetAgentMsgCache 注入 Agent 消息 Redis 热层（编排页对话视图）：读侧缓存 + meta 热写器。
@@ -458,6 +469,75 @@ func normalizePluginIDs(ids []string) []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+// PinnedSkillInfo 是会话级指定技能的解析结果元素（技能选择器）。
+type PinnedSkillInfo struct {
+	ID           string // 规范化名称（FindByNameOrID 命中的 Name，缺省回退 SkillID）
+	Name         string // 展示名
+	Description  string // 一句话描述
+	Content      string // SKILL.md 正文全文（learned/dir/bundle 来源）
+	UsageExample string // 工具别名类技能的示例（无正文时兜底）
+	ToolRef      string // 绑定的工具（yaml/builtin 工具别名）
+	Source       string // 来源：yaml | dir | bundle | builtin | learned
+}
+
+// normalizeSkillKeys 归一化技能名称列表：去空白、去空串、去重（保序）。
+func normalizeSkillKeys(keys []string) []string {
+	return normalizePluginIDs(keys)
+}
+
+// resolvePinnedSkills 在共享技能池中解析技能名称/ID 列表：有效项返回全文信息，
+// 未命中项进 invalid（创建路径从宽丢弃、切换路径整体拒绝，同指定插件口径）。
+// 技能池未注入（nil）时全部视为无效（零行为变化）。
+func (s *ReactService) resolvePinnedSkills(keys []string) (valid []PinnedSkillInfo, invalid []string) {
+	if s.skillPool == nil {
+		return nil, keys
+	}
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		sk := s.skillPool.FindByNameOrID(key)
+		if sk == nil {
+			invalid = append(invalid, key)
+			continue
+		}
+		name := sk.Name
+		if name == "" {
+			name = sk.SkillID
+		}
+		// 不同键（SkillID/Name 混用）命中同一技能时只保留一次。
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		valid = append(valid, PinnedSkillInfo{
+			ID:           name,
+			Name:         name,
+			Description:  sk.Description,
+			Content:      sk.Content,
+			UsageExample: sk.UsageExample,
+			ToolRef:      sk.ToolRef,
+			Source:       sk.Source,
+		})
+	}
+	return valid, invalid
+}
+
+// bumpSkillUsage 提升指定技能的使用权重（技能选择器"加大使用权重"语义）：
+// 仅 learned 技能有 use_count 统计；回调未接线时零行为变化。
+func (s *ReactService) bumpSkillUsage(valid []PinnedSkillInfo) {
+	if s.skillUsageBumper == nil || len(valid) == 0 {
+		return
+	}
+	names := make([]string, 0, len(valid))
+	for _, sk := range valid {
+		if sk.Source == "learned" {
+			names = append(names, sk.ID)
+		}
+	}
+	if len(names) > 0 {
+		s.skillUsageBumper(names)
+	}
 }
 
 // topLevelBuiltinTools 顶层必备内建工具（2026-10-14）：与插件 top_level 声明走同一
@@ -1447,6 +1527,25 @@ func (s *ReactService) CreateSession(ctx context.Context, req CreateRequest) (*S
 				"", "", "", "", "", true)
 		}
 	}
+	// 会话级指定技能（技能选择器）：创建路径从宽——无效名称（不在技能池）丢弃并记事件，
+	// 不阻断建会话；有效技能全文由 runSession 起跑时经 pinnedSkillBlock 直接注入系统提示，
+	// 并即刻提升 learned 技能的使用权重（"下次会话直接加载并加大使用权重"）。
+	if keys := normalizeSkillKeys(req.PinnedSkills); len(keys) > 0 {
+		valid, invalid := s.resolvePinnedSkills(keys)
+		if len(valid) > 0 {
+			okNames := make([]string, 0, len(valid))
+			for _, sk := range valid {
+				okNames = append(okNames, sk.ID)
+			}
+			sess.setPinnedSkills(okNames)
+			s.bumpSkillUsage(valid)
+		}
+		if len(invalid) > 0 {
+			s.store.addEvent(sess, eventkind.System, "System",
+				fmt.Sprintf("指定技能忽略无效项: %s（不在技能池）", strings.Join(invalid, ", ")),
+				"", "", "", "", "", true)
+		}
+	}
 	// 首条消息携带的用户图片（Alt+V 粘贴）：runSession 注入 runCtx 后一次性消费。
 	sess.firstTurnImages = append(req.Images, frames...)
 	// 首条消息携带的文件附件（Web 粘贴/上传）：结构化列表供首条 user_message 事件
@@ -1945,6 +2044,34 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 			ids = append(ids, id)
 		}
 		return s.SetSessionPinnedPlugins(sessionID, ids)
+	case ControlOpPinnedSkills:
+		// 会话级指定技能切换（技能选择器）：Args{"skills": []string}，空数组=清空。
+		// 参数断言 fail-closed（同 ControlOpPinnedPlugins）：序列化误差不得静默清空用户选择。
+		raw, ok := cmd.Args["skills"]
+		if !ok {
+			return fmt.Errorf("%w: skills 参数缺失", ErrInvalidSessionState)
+		}
+		rawList, ok := raw.([]any)
+		if !ok {
+			// 兼容进程内直接构造的 []string 形态（HTTP JSON 解码为 []any）。
+			if ss, ok2 := raw.([]string); ok2 {
+				rawList = make([]any, 0, len(ss))
+				for _, name := range ss {
+					rawList = append(rawList, name)
+				}
+			} else {
+				return fmt.Errorf("%w: skills 参数类型不符", ErrInvalidSessionState)
+			}
+		}
+		names := make([]string, 0, len(rawList))
+		for _, v := range rawList {
+			name, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("%w: skills 元素类型不符", ErrInvalidSessionState)
+			}
+			names = append(names, name)
+		}
+		return s.SetSessionPinnedSkills(sessionID, names)
 	case ControlOpWorkDir:
 		// 每会话工作目录修改：落库即时保存，下一回合生效（目录在每回合开始时读取）。
 		// 参数断言必须 fail-closed：空串是**合法**的"清除为默认目录"载荷，若把
@@ -2287,6 +2414,57 @@ func (s *ReactService) SessionPinnedPlugins(sessionID string) []string {
 	return sess.currentPinnedPlugins()
 }
 
+// SetSessionPinnedSkills 切换会话级指定技能（技能选择器，HTTP 切换通道）：
+// 选中 = 技能全文直接注入下一轮系统提示（免 load_skill 按需取用）并要求优先使用，
+// 已勾选的 learned 技能同时提升使用权重（use_count+1）。
+// 无效名称（不在技能池）整体拒绝并列明（HTTP 400），不做半套切换；会话不存在返回错误。
+// atomic 即时生效，下一轮起跑按新集合构建提示块；空列表=清空（合法）。
+func (s *ReactService) SetSessionPinnedSkills(sessionID string, keys []string) error {
+	norm := normalizeSkillKeys(keys)
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
+	}
+	valid, invalid := s.resolvePinnedSkills(norm)
+	if len(invalid) > 0 {
+		return fmt.Errorf("%w: 无效技能（不在技能池）: %s", ErrInvalidSessionState, strings.Join(invalid, ", "))
+	}
+	// 规范化名称（Name/SkillID 混入统一为池内展示名），同时找出本次新增项用于提权：
+	// 仅"用户这次勾选"算一次使用信号；已勾选项保留原权重，避免重复切换反复刷计数。
+	prev := make(map[string]bool, len(sess.currentPinnedSkills()))
+	for _, name := range sess.currentPinnedSkills() {
+		prev[name] = true
+	}
+	names := make([]string, 0, len(valid))
+	var added []PinnedSkillInfo
+	for _, sk := range valid {
+		names = append(names, sk.ID)
+		if !prev[sk.ID] {
+			added = append(added, sk)
+		}
+	}
+	from := sess.currentPinnedSkills()
+	sess.setPinnedSkills(names)
+	s.bumpSkillUsage(added)
+	s.store.addEvent(sess, eventkind.System, "System",
+		fmt.Sprintf("指定技能切换: %v → %v（手动）", from, names),
+		"", "", "", "", "", true)
+	return nil
+}
+
+// SessionPinnedSkills 读取会话当前指定技能名称列表（HTTP GET 展示用）；未设置返回 nil。
+func (s *ReactService) SessionPinnedSkills(sessionID string) []string {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return nil
+	}
+	return sess.currentPinnedSkills()
+}
+
 // applyPinnedPlugins 把会话指定插件的工具预挂到顶层 scope（KIMI 式插件选择）：
 // runSession 起跑调用——挂载集纯内存，重启恢复/每轮起跑都需重挂（幂等），
 // 与 mountTopLevelEssentials 同语义。未指定/resolver 未接线/插件已停用
@@ -2328,6 +2506,49 @@ func (s *ReactService) pinnedPluginBlock(session *reactInternalSession) string {
 		sb.WriteString(fmt.Sprintf("- %s（%s）：%s\n", p.Name, p.ID, strings.Join(p.Tools, ", ")))
 	}
 	sb.WriteString("请优先使用上述插件的工具完成用户需求；仅当其能力确实不敷使用时，才考虑其他途径。")
+	return sb.String()
+}
+
+// pinnedSkillMaxRunes 单个指定技能正文注入上限：全文直载但防单文件灌爆系统提示；
+// 超限部分仍可经 load_skill 取回（工具返回完整正文）。
+const pinnedSkillMaxRunes = 16000
+
+// pinnedSkillBlock 构建【用户指定技能】系统提示块（技能选择器）：
+// 用户显式勾选 = 技能全文直接加载（无需再 load_skill）+ 优先使用要求。
+// 拼进 skillBlock 尾部注入系统提示词（react_agent.go systemPrompt 尾部槽位）。
+// 空选择/技能池未接线/技能全部失效时返回空串（零注入）。
+func (s *ReactService) pinnedSkillBlock(session *reactInternalSession) string {
+	keys := session.currentPinnedSkills()
+	if len(keys) == 0 {
+		return ""
+	}
+	valid, _ := s.resolvePinnedSkills(keys)
+	if len(valid) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n\n【用户指定技能】用户在本会话明确指定了以下技能，全文已直接加载（无需再 load_skill 获取），请优先遵循并应用到相关任务：\n")
+	for _, sk := range valid {
+		sb.WriteString(fmt.Sprintf("- %s：%s\n", sk.Name, sk.Description))
+	}
+	for _, sk := range valid {
+		body := sk.Content
+		if body == "" {
+			body = sk.UsageExample
+		}
+		if body == "" {
+			if sk.ToolRef != "" {
+				body = "（该技能为工具别名：直接调用工具 " + sk.ToolRef + " 即可。）"
+			} else {
+				body = "（该技能无正文内容，按上面的描述使用。）"
+			}
+		}
+		body = textutil.TruncateRunes(body, pinnedSkillMaxRunes,
+			"\n…（技能正文过长已截断，剩余部分用 load_skill 获取）")
+		sb.WriteString("\n## 技能全文：" + sk.Name + "\n")
+		sb.WriteString(body)
+		sb.WriteString("\n")
+	}
 	return sb.String()
 }
 
@@ -3962,6 +4183,9 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 会话级指定插件提示块（KIMI 式插件选择）：选中=优先使用，拼进系统提示词尾部槽位；
 	// 空选择零注入（模型自行判断）。每轮起跑重建，HTTP 切换下一轮生效。
 	skillBlock += s.pinnedPluginBlock(session)
+	// 会话级指定技能提示块（技能选择器）：选中=技能全文直接加载 + 优先使用；
+	// 空选择零注入。每轮起跑重建，HTTP 切换下一轮生效。
+	skillBlock += s.pinnedSkillBlock(session)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
@@ -4199,6 +4423,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	// 会话级指定插件提示块（KIMI 式插件选择）：选中=优先使用，拼进系统提示词尾部槽位；
 	// 空选择零注入（模型自行判断）。每轮起跑重建，HTTP 切换下一轮生效。
 	skillBlock += s.pinnedPluginBlock(session)
+	// 会话级指定技能提示块（技能选择器）：选中=技能全文直接加载 + 优先使用；
+	// 空选择零注入。每轮起跑重建，HTTP 切换下一轮生效。
+	skillBlock += s.pinnedSkillBlock(session)
 	agent := NewReActAgent(session.ID, *metaRole, provider, NewToolRegistryAdapterForRole(s.toolRegistry, session.ID, metaRole.Tools, gearRoleID, s.pluginVisibility)).
 		WithMailbox(s.mailbox).
 		WithMemory(metaMemory).
@@ -6049,6 +6276,7 @@ func toReactAgentSession(s *reactInternalSession) *Session {
 		Thinking:       s.currentThinking(),
 		Model:          s.currentModel(),
 		PinnedPlugins:  s.currentPinnedPlugins(),
+		PinnedSkills:   s.currentPinnedSkills(),
 		WidgetData:     widgetData,
 	}
 }

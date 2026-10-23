@@ -528,6 +528,17 @@ var assetKinds = map[string]string{
 	".html": "HTML", ".htm": "HTML",
 }
 
+// assetScanHiddenSkip 隐藏目录噪音清单（2026-10-23）。旧实现把一切 "." 开头的目录
+// 一律跳过，连 `.workbuddy` 里的整条动作帧序列也看不见——2026-10-22 交付事故里模型
+// 把该目录下的骨架烘焙帧当成"另一套合规 16 帧"。现改为只跳过已知工具/缓存目录。
+var assetScanHiddenSkip = map[string]bool{
+	".git": true, ".svn": true, ".hg": true, ".idea": true, ".vscode": true,
+	".venv": true, "venv": true, ".cache": true, ".next": true, ".nuxt": true,
+	".gradle": true, ".mvn": true, ".pnpm-store": true, ".yarn": true,
+	".parcel-cache": true, ".pytest_cache": true, ".mypy_cache": true, ".tox": true,
+	".cargo": true, ".rustup": true, ".npm": true, ".turbo": true,
+}
+
 // assetScanGlobalSkip 全局跳过目录：依赖、版本库、构建产物（不含 images/tmp 这类
 // 可能是项目资产目录的名字——它们只在 .bma 运行时目录下跳过）。
 var assetScanGlobalSkip = map[string]bool{
@@ -541,6 +552,20 @@ var assetScanBmaRuntimeSkip = map[string]bool{
 	"tmp": true, "images": true, "logs": true, "snapshots": true, "tool_outputs": true,
 }
 
+// assetProducerExtensions 可执行/脚本类文件扩展名——用于反查"谁生成了这个素材目录"。
+// 工作区里的 .md 不算（文档提到目录名不代表生成关系）。
+var assetProducerExtensions = map[string]bool{
+	".mjs": true, ".js": true, ".cjs": true, ".ts": true, ".py": true,
+	".sh": true, ".ps1": true, ".bat": true, ".cmd": true, ".go": true,
+}
+
+const (
+	assetProducerMaxScripts = 500       // 一次扫描最多收集的脚本候选数
+	assetProducerMaxBytes   = 256 << 10 // 单文件读取上限
+	assetProducerMaxTotal   = 4 << 20   // 单次反查总读取上限（概览刷新是异步任务，限流防大仓拖慢）
+	assetProducerMaxDirs    = 200       // 最多为多少个素材目录反查（匹配是 O(目录×父级) 的字符串包含，很便宜）
+)
+
 // assetInventory 是资产扫描结果。
 type assetInventory struct {
 	images, videos, audios, htmls int
@@ -548,6 +573,8 @@ type assetInventory struct {
 	newest                        time.Time
 	htmlFiles                     []string
 	dirExt                        map[string]map[string]int // 目录 → 扩展名 → 数量
+	scripts                       []string                 // 生成脚本候选（工作区相对路径，已限流）
+	producers                     map[string]string        // 素材目录 → 生成脚本摘要
 }
 
 // assetFingerprint 是「资产总量 + 最新 mtime」指纹，写进 PROJECT.md managed 区，
@@ -575,15 +602,14 @@ func scanAssetAssets(workDir string) assetInventory {
 		if d.IsDir() {
 			name := d.Name()
 			if path != workDir {
-				if strings.HasPrefix(name, ".") && name != ".bma" {
-					return filepath.SkipDir
-				}
-				if assetScanGlobalSkip[name] {
+				// 隐藏目录不再一律跳过（见 assetScanHiddenSkip 注释）：只跳已知噪音。
+				if assetScanHiddenSkip[name] || assetScanGlobalSkip[name] {
 					return filepath.SkipDir
 				}
 				if rel, rerr := filepath.Rel(workDir, path); rerr == nil {
 					relSlash := filepath.ToSlash(rel)
-					if strings.HasPrefix(relSlash, ".bma/") && assetScanBmaRuntimeSkip[name] {
+					if strings.HasPrefix(relSlash, ".bma/") &&
+						(assetScanBmaRuntimeSkip[name] || strings.HasPrefix(name, "trash")) {
 						return filepath.SkipDir
 					}
 					if depth := strings.Count(relSlash, "/"); depth >= 6 {
@@ -595,6 +621,12 @@ func scanAssetAssets(workDir string) assetInventory {
 		}
 		ext := strings.ToLower(filepath.Ext(d.Name()))
 		kind := assetKinds[ext]
+		// 生成脚本候选：与媒体统计共用同一次遍历（不再二次走盘）。
+		if assetProducerExtensions[ext] && len(inv.scripts) < assetProducerMaxScripts {
+			if rel, rerr := filepath.Rel(workDir, path); rerr == nil {
+				inv.scripts = append(inv.scripts, filepath.ToSlash(rel))
+			}
+		}
 		if kind == "" {
 			return nil
 		}
@@ -630,7 +662,143 @@ func scanAssetAssets(workDir string) assetInventory {
 		inv.dirExt[dir][strings.TrimPrefix(ext, ".")]++
 		return nil
 	})
+	inv.producers = matchAssetProducers(workDir, inv.scripts, inv.assetDirsForProvenance(assetProducerMaxDirs))
 	return inv
+}
+
+// assetDirsForProvenance 挑出值得反查生成脚本的素材目录（≥2 个文件，按文件数降序，限 max 个）。
+func (a assetInventory) assetDirsForProvenance(max int) []string {
+	type row struct {
+		dir   string
+		total int
+	}
+	rows := make([]row, 0, len(a.dirExt))
+	for dir, exts := range a.dirExt {
+		if dir == "(根目录)" {
+			continue
+		}
+		total := 0
+		for _, n := range exts {
+			total += n
+		}
+		if total >= 2 {
+			rows = append(rows, row{dir, total})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].total != rows[j].total {
+			return rows[i].total > rows[j].total
+		}
+		return rows[i].dir < rows[j].dir
+	})
+	if len(rows) > max {
+		rows = rows[:max]
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.dir)
+	}
+	return out
+}
+
+// matchAssetProducers 为每个素材目录反查"生成脚本"：读候选脚本正文，找出提到该目录
+// （或其任一父级路径）的文件，取首个命中并附文件首行摘要。
+//
+// 动机（2026-10-22 交付事故）：`.workbuddy/frames/anim/run/` 实际是 `tools/rig/bake.mjs`
+// 用 `public/bake.html` + `js/rig.js` 做骨架烘焙出来的帧——正是任务书"明确排除"的方案，
+// 但素材清单只写"另一套 16 帧"，模型只看得见像素、看不见来路，于是把它当合规素材交付。
+// 把「目录 ← 生成脚本」这条边放进上下文，任务书里的排除项才有判据。
+//
+// 有界：脚本数/单文件/总量均限流（见 assetProducer* 常量）；任何读取失败静默跳过。
+func matchAssetProducers(workDir string, scripts, dirs []string) map[string]string {
+	if workDir == "" || len(scripts) == 0 || len(dirs) == 0 {
+		return nil
+	}
+	// 每个目录准备候选匹配串：自身 + 逐级父目录（脚本里常写父目录再把子目录拼出来），
+	// 正反斜杠两种写法都试。保留 ≥2 段，避免 "run" 这类单词误命中。
+	type target struct {
+		dir  string
+		pats []string
+	}
+	targets := make([]target, 0, len(dirs))
+	for _, d := range dirs {
+		segs := strings.Split(d, "/")
+		var pats []string
+		for i := len(segs); i >= 2; i-- {
+			p := strings.Join(segs[:i], "/")
+			pats = append(pats, p, strings.ReplaceAll(p, "/", `\`))
+		}
+		targets = append(targets, target{d, pats})
+	}
+	out := map[string]string{}
+	total := 0
+	for _, rel := range scripts {
+		remaining := len(targets) - len(out)
+		if remaining == 0 || total >= assetProducerMaxTotal {
+			break
+		}
+		abs := filepath.Join(workDir, filepath.FromSlash(rel))
+		info, err := os.Stat(abs)
+		if err != nil || info.Size() > assetProducerMaxBytes {
+			continue
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			continue
+		}
+		total += len(data)
+		body := string(data)
+		for _, t := range targets {
+			if _, done := out[t.dir]; done {
+				continue
+			}
+			for _, p := range t.pats {
+				if strings.Contains(body, p) {
+					out[t.dir] = rel + scriptHeadline(body)
+					break
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// scriptHeadline 取脚本首个**注释**行作说明（跳过 shebang 与代码行，截 60 runes）。
+// 只认注释是有意的：`package main` / `const out = ...` 这类首行对读者没有信息量。
+func scriptHeadline(body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#!") {
+			continue
+		}
+		var text string
+		switch {
+		case strings.HasPrefix(t, "//"):
+			text = t[2:]
+		case strings.HasPrefix(t, "#"):
+			text = t[1:]
+		case strings.HasPrefix(t, "/*"), strings.HasPrefix(t, "*"):
+			text = strings.TrimLeft(t, "/*")
+		case strings.HasPrefix(t, "<!--"):
+			text = strings.TrimSuffix(strings.TrimPrefix(t, "<!--"), "-->")
+		default:
+			// 首行是代码：说明放后面也没意义，直接放弃（避免"package main"式噪声）。
+			return ""
+		}
+		text = strings.TrimSpace(text)
+		if text == "" || strings.Contains(text, "-*-") {
+			// 空行与 `-*- coding: utf-8 -*-` 这类编码声明对读者无信息量。
+			continue
+		}
+		if r := []rune(text); len(r) > 60 {
+			text = string(r[:60]) + "…"
+		}
+		return "（" + text + "）"
+	}
+	return ""
 }
 
 // renderAssetSection 渲染【已有资产】段（有界：HTML 30 条、目录 12 条）。
@@ -690,13 +858,63 @@ func renderAssetSection(inv assetInventory) string {
 	if len(rows) > 12 {
 		rows = rows[:12]
 	}
+	shown := make(map[string]bool, len(rows))
 	if len(rows) > 0 {
 		b.WriteString("### 素材目录（按文件数）\n")
+		if len(inv.producers) > 0 {
+			b.WriteString("（「生成脚本」= 正文里引用该目录的脚本：复用前先读它确认产法——**任务书明确排除的方案**（骨骼/部位拼接等）不得因“看起来更像参考片”而选用。）\n")
+		}
 		for _, r := range rows {
+			shown[r.dir] = true
+			if p, ok := inv.producers[r.dir]; ok {
+				fmt.Fprintf(&b, "- %s/ — %s；生成脚本: %s\n", r.dir, r.exts, p)
+				continue
+			}
 			fmt.Fprintf(&b, "- %s/ — %s\n", r.dir, r.exts)
 		}
 	}
+	// 按文件数排的 Top12 常把"文件少但关键"的生成目录挤掉（2026-10-22 事故里的
+	// `.workbuddy/frames/anim/run/` 只有 16 帧，正是被挤掉的那个）——单列一节兜底。
+	if extra := inv.producerDirs(shown, 12); len(extra) > 0 {
+		b.WriteString("### 有生成脚本的素材目录（未进上方 Top12）\n")
+		for _, dir := range extra {
+			fmt.Fprintf(&b, "- %s/ — 生成脚本: %s\n", dir, inv.producers[dir])
+		}
+	}
 	return b.String()
+}
+
+// producerDirs 返回有生成脚本、且不在 exclude 里的素材目录（按文件数降序，限 max 个）。
+func (a assetInventory) producerDirs(exclude map[string]bool, max int) []string {
+	type row struct {
+		dir   string
+		total int
+	}
+	rows := make([]row, 0, len(a.producers))
+	for dir := range a.producers {
+		if exclude[dir] {
+			continue
+		}
+		total := 0
+		for _, n := range a.dirExt[dir] {
+			total += n
+		}
+		rows = append(rows, row{dir, total})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].total != rows[j].total {
+			return rows[i].total > rows[j].total
+		}
+		return rows[i].dir < rows[j].dir
+	})
+	if len(rows) > max {
+		rows = rows[:max]
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.dir)
+	}
+	return out
 }
 
 // projectDocAssetFingerprint 读取 PROJECT.md managed 区里的资产指纹；缺失返回空串。

@@ -47,6 +47,7 @@ func RegisterSessionRoutes(rg gin.IRouter, m *SessionManager) {
 	rg.POST("/sessions/:id/model", m.HandleSessionModel)                           // 会话级模型覆盖切换（2026-10-19，热生效，空=跟随全局）
 	rg.POST("/sessions/:id/thinking", m.HandleSessionThinking)                     // 会话级思考强度切换（2026-09-16，热生效）
 	rg.POST("/sessions/:id/plugins", m.HandleSessionPlugins)                       // 会话级指定插件切换（KIMI 式插件选择：选中=优先使用）
+	rg.POST("/sessions/:id/skills", m.HandleSessionSkills)                         // 会话级指定技能切换（技能选择器：选中=全文直载并提权）
 	rg.POST("/sessions/:id/workdir", m.HandleSessionWorkDir)                       // 每会话工作目录修改（落库即时保存）
 	rg.GET("/sessions/:id/workspace/*path", m.HandleSessionWorkspace)              // 工作区文件服务（对话栏媒体/HTML 预览）
 	rg.DELETE("/sessions/:id", m.HandleDeleteSession)                              // 硬删除会话（不可恢复）

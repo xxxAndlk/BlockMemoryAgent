@@ -277,11 +277,11 @@
     - **验收口径**：全新 Windows 机器 install 后 5 分钟内可用（向导填空+校验，无手工 docker 命令也能跑核心链路）；连续运行 30 天 global_knowledge 活跃行数有界、logs/tool_outputs 体积有界；push 即触发 backend-test；集群档任务完成时锁屏手机收到浏览器/webhook 通知；默认配置起服后外网不可达（127.0.0.1）；导出包在新机器可完整恢复会话+记忆+工件。
     - **明确不做**：不做多用户完整改造（断层预留 ≠ 实施，#13 仍挂起）；不做移动端原生应用/页面级移动重构（短期通知+列表够用）；不替换日志系统（按天切分够用，补清理即可）；不做插件自动构建编排（docker build 保留手动，向导里给显式清单即可——自动化构建链是另一个项目）。
 
-19. **经验沉淀治理四件套（技能目录收敛 / 写入门 / 库存整理 / 块记忆修复）**（2026-09-16 落地，动机与实现见 `doc/变更.md` 末条；此处只记观察点与遗留）
+19. **经验沉淀治理四件套（技能目录收敛 / 写入门 / 库存整理 / 块记忆修复）**（2026-09-16 落地；**块记忆部分 2026-10-19 永久停用，见条末**）
     - **落地**：A meta 提示只列经验技能 top-N（`skills.meta_catalog_top`，配置 `list_skills(query=)` 检索其余）；B 满库拒新建（`skills.max_count`，evolution_log `skill_dropped`）；C 每日/手动整理（`skills.consolidate_threshold` + `POST /api/skills/consolidate` + Web「立即整理」）；D 块记忆写入近邻去重（同域 cosine ≤0.15 更新既有行）+ `last_accessed` 修复（INSERT/BumpReuse）+ 事实提取头 4000/尾 2000 + `agent.block_memory_facts_max`。
     - **第二轮补丁（同日晚，用户定向"只沉淀改动的关键逻辑与信息"）**：块记忆触发门 `hasSubstantiveChange`（无文件改动+纯只读任务不沉淀）+ 提取失败/为空不回退原文 + 提取 prompt 跨任务复用判据 + salvage 失败原文不落库；存量 13 条 `[failure` 垃圾行 archived。
     - **观察点**：块记忆日增量是否显著下降（基线 1067 行 / ~35 天 ≈ 30 行/天）；沉淀是否只剩真改动结论；技能库增长曲线是否被压平（`learned_skills` enabled 数 / evolution_log skill_dropped 频次）；整理质量（skill_merge 是否误并、skill_archive 是否误归档——两者都可手工恢复：enable + 文件仍在 `config/skills_learned/`）；块记忆增长速率（1067 行基线，观察增量是否显著放缓）。
-    - **遗留**：B 的「与 project_lessons 跨库判重」未做（项目经验无向量）；技能归档不自动恢复；块记忆**存量行**的去重与 `last_accessed` 回填未做（仅新写入生效——若要让 `knowledge_archive_days` 立即生效，需先手工 `UPDATE global_knowledge SET last_accessed = created_at WHERE last_accessed IS NULL`）；块记忆批量整理未做。
+    - **遗留**：B 的「与 project_lessons 跨库判重」未做（项目经验无向量）；技能归档不自动恢复；~~块记忆存量行去重/`last_accessed` 回填/批量整理~~——**2026-10-19 块记忆写入永久关停、存量行物理删除，以上块记忆项全部作废**（见本文件末「近期遗留」与 `doc/技术逻辑/06` §6.4）。
 20. **Claude Code 上下文管理机制借鉴四件（底账 append-only 纪律 / 压缩生命周期钩子 / 记忆两级配额 / 失败分支整支剪枝）**（2026-09-23 立项**同日落地**，实现见 `doc/变更.md` 2026-09-23 条 + `doc/技术逻辑` 06/04 章；此处只记观察点与遗留。调研触发点：CC"路径 A/B 失败被丢弃、经验本地留存、下次推理需要时回灌"的实现方式——结论：非单一功能，是四机制复合）
     - **核心观念（本项全部子项的立意）**：Claude Code 里"丢弃"从来不是删除，只是**剥夺窗口占用权**；经验的价值 = 被蒸馏成一行索引 + 可随时取回的细节，模型不需要记住任何事，只需要知道"去哪取"。BMA 侧对应物基本齐全（压缩金字塔 ≈ auto-compact，已代码级证实为 Assemble 只读视图、只写 agent_compress_states：pipeline.go:319-369/689-711；meta_memory ≈ auto memory；黑板 ≈ structured note-taking；session_history/session_events ≈ CC 的 append-only jsonl transcript——**最后一项名不副实**：两表写入是 delete-then-insert 全量重写，复活路径还物理删子 Agent 快照，纪律违反恰好发生在存储层，见①排查）。差距大头在纪律与钩子——故本项 = 三处写入点归档改造 + 轻量钩子挂载，零新表起步（归档走同表标记列）。与 #7（CC 子 Agent 机制借鉴）、#10（Hermes/Codex）不重叠：那两个是协作与执行切面，本项是上下文与记忆切面。
     - **① 底账 append-only 纪律**（侵入度低；2026-09-23 全仓排查已完成——结果非零，须改造）
@@ -492,3 +492,9 @@
     - **列表 counts 成本**：`GET /workflow/runs` 每 run 一次 ListUnits（≤50 run 可接受），量大改单条聚合 SQL。
     - **联系表**：视频产物只显示路径不内联播放（img 判定排除）；需要外发归档时再议后端拼图。
     - **真机链路**：对话打样 → `workflow_freeze` 确认落盘 → `workflow_run` 批量 → 联系表审（reject 带理由）→ 回灌 v+1 确认落盘——待部署后实测（含重启续跑不重不漏、webhook `workflow_run_final`）。
+
+28. **文档同步时记录的遗留（2026-10-23，同日三项已修）**
+    - ~~**硬删会话的孤儿行**~~ **已修（2026-10-23）**：`sessionScopedTables` 补 `session_directive` / `goal_reminders` / `flow_runs`，`DeleteSessionData` 改为先删 `flow_node_runs`（按 run_id）再删父表，并对懒建表加 `to_regclass` 存在性守卫（缺表跳过不阻断）；回归 `TestSessionScopedTablesCoverGoalAndFlow`。
+    - ~~**DomainAgent 没有 `ShowArtifact`**~~ **已修（2026-10-23）**：domain 合成角色白名单补 `ShowArtifact`（提示词与叶子公共段本来都要求用它展示成果，白名单漏了）；回归 `TestRegistry_DomainHasShowArtifact`。
+    - ~~**产物来路不在上下文**~~ **已修（2026-10-23）**：`project.scanAssetAssets` 不再一律跳过隐藏目录（改用 `assetScanHiddenSkip` 噪音清单），并在素材目录行附「生成脚本」（正文引用该目录/其父目录的脚本 + 首行摘要，限流 500 脚本/4MB）；回归 `TestScanAssetAssets_HiddenDirAndProducer`。
+    - **块记忆文档债已清**：2026-10-19 停用后，`CLAUDE.md` / `doc/项目说明.md` / `doc/技术逻辑/*` 中原把块记忆当现役的描述已在 2026-10-23 统一改为"已停用/存量已删/代码保留可回开"。

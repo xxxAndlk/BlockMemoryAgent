@@ -20,22 +20,23 @@ export function listSessions(limit?: number): Promise<SessionSummary[]> {
  *（空值省略，语义同 JSON 省略字段），images/plugins 以 JSON 字符串字段携带，
  * files 同名多 append（后端 form.File["files"] 顺序收）。
  */
-function buildUploadForm(fields: Record<string, string>, images?: WireImage[], plugins?: string[], files?: File[]): FormData {
+function buildUploadForm(fields: Record<string, string>, images?: WireImage[], plugins?: string[], skills?: string[], files?: File[]): FormData {
   const form = new FormData()
   for (const [k, v] of Object.entries(fields)) {
     if (v) form.append(k, v)
   }
   if (images?.length) form.append('images', JSON.stringify(images))
   if (plugins?.length) form.append('plugins', JSON.stringify(plugins))
+  if (skills?.length) form.append('skills', JSON.stringify(skills))
   for (const f of files || []) form.append('files', f, f.name)
   return form
 }
 
-export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking, plugins?: string[], files?: File[], directive?: SessionDirectiveSpec | null, model?: string): Promise<Session> {
+export function createSession(goal: string, images?: WireImage[], workDir?: string, gear?: SessionGear, thinking?: SessionThinking, plugins?: string[], files?: File[], directive?: SessionDirectiveSpec | null, model?: string, skills?: string[]): Promise<Session> {
   // 带文件附件（粘贴/上传 SQL/Excel 等）：multipart 提交，其余语义不变。
   // 会话指令（goal/loop）：multipart 以 directive 文本字段携带（SessionDirectiveSpec 的 JSON 串）。
   if (files?.length) {
-    return fetchForm('/sessions', buildUploadForm({ goal, work_dir: workDir || '', gear: gear || '', thinking: thinking || '', directive: directive ? JSON.stringify(directive) : '', model_id: model || '' }, images, plugins, files))
+    return fetchForm('/sessions', buildUploadForm({ goal, work_dir: workDir || '', gear: gear || '', thinking: thinking || '', directive: directive ? JSON.stringify(directive) : '', model_id: model || '' }, images, plugins, skills, files))
   }
   const body: Record<string, unknown> = { goal }
   if (images?.length) body.images = images
@@ -48,6 +49,8 @@ export function createSession(goal: string, images?: WireImage[], workDir?: stri
   if (model) body.model_id = model
   // 创建时指定插件（KIMI 式插件选择）：空数组 = 不指定（模型自行判断），省略字段。
   if (plugins?.length) body.plugins = plugins
+  // 创建时指定技能（技能选择器）：空数组 = 不指定，省略字段；选中技能下次会话全文直载。
+  if (skills?.length) body.skills = skills
   // 会话指令模式（goal/loop）：仅非常模式携带；objective 由后端自动回落为消息内容，前端不传。
   if (directive) body.directive = directive
   return fetchJson('/sessions', { method: 'POST', body: JSON.stringify(body) })
@@ -117,7 +120,7 @@ export function sendMessage(id: string, content: string, images?: WireImage[], f
   // 带文件附件（粘贴/上传 SQL/Excel 等）：multipart 提交（content 可为空——服务端
   // 会拼附件引用行）；否则维持 JSON 原样。会话指令（goal/loop）仅非常模式携带。
   if (files?.length) {
-    return fetchForm(`/sessions/${id}/message`, buildUploadForm({ content, directive: directive ? JSON.stringify(directive) : '' }, images, undefined, files))
+    return fetchForm(`/sessions/${id}/message`, buildUploadForm({ content, directive: directive ? JSON.stringify(directive) : '' }, images, undefined, undefined, files))
   }
   const body: Record<string, unknown> = images?.length ? { content, images } : { content }
   if (directive) body.directive = directive
@@ -336,6 +339,17 @@ export function setSessionPlugins(id: string, plugins: string[]): Promise<{ sess
   return fetchJson(`/sessions/${id}/plugins`, {
     method: 'POST',
     body: JSON.stringify({ plugins }),
+  })
+}
+
+/**
+ * 切换会话级指定技能（技能选择器）：选中 = 技能全文直接加载并优先使用（learned 技能同时
+ * 提升使用权重），空数组 = 清空（模型自行判断）。即时生效，下一轮起跑按新集合构建。
+ */
+export function setSessionSkills(id: string, skills: string[]): Promise<{ session_id: string; skills: string[] }> {
+  return fetchJson(`/sessions/${id}/skills`, {
+    method: 'POST',
+    body: JSON.stringify({ skills }),
   })
 }
 

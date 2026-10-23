@@ -58,6 +58,9 @@ type Session struct {
 	// PinnedPlugins 会话级指定插件 ID 列表（KIMI 式插件选择）：选中=优先（强制）使用，
 	// 空 = 未指定（模型自行判断）。前端插件选择器据此回显。
 	PinnedPlugins []string `json:"pinned_plugins,omitempty"`
+	// PinnedSkills 会话级指定技能名称列表（技能选择器）：选中=技能全文直接加载并优先使用，
+	// 空 = 未指定。前端技能选择器据此回显。
+	PinnedSkills []string `json:"pinned_skills,omitempty"`
 	// WidgetData 界面部件瞬时数据通道最新值（widget_id -> payload，仅内存态不持久化）：
 	// 快照帧携带全量 map，SSE 重连后首帧天然补齐断档期间错过的推送。
 	WidgetData map[string]string `json:"widget_data,omitempty"`
@@ -410,6 +413,7 @@ func ToServerSession(a *agent.Session) *Session {
 		Thinking:      a.Thinking,
 		Model:         a.Model,
 		PinnedPlugins: a.PinnedPlugins,
+		PinnedSkills:  a.PinnedSkills,
 		WidgetData:    a.WidgetData,
 	}
 }

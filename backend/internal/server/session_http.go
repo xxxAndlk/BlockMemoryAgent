@@ -55,6 +55,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		thinking  string
 		model     string
 		plugins   []string
+		skills    []string
 		directive *agent.DirectiveSpec
 		files     []*multipart.FileHeader
 	)
@@ -78,6 +79,10 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 			c.String(http.StatusBadRequest, "%s", err.Error())
 			return
 		}
+		if skills, err = parseMultipartStrings(formValue(form, "skills")); err != nil {
+			c.String(http.StatusBadRequest, "%s", err.Error())
+			return
+		}
 		if directive, err = parseMultipartDirective(formValue(form, "directive")); err != nil {
 			c.String(http.StatusBadRequest, "%s", err.Error())
 			return
@@ -97,6 +102,9 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 			// Plugins 会话级指定插件（KIMI 式插件选择）：创建时勾选，无效 ID 由 agent 层
 			// 丢弃并记事件（创建路径从宽，不阻断建会话）。
 			Plugins []string `json:"plugins,omitempty"`
+			// Skills 会话级指定技能（技能选择器）：创建时勾选，无效名称由 agent 层
+			// 丢弃并记事件（创建路径从宽，不阻断建会话）。
+			Skills []string `json:"skills,omitempty"`
 			// Directive 指令模式（goal 目标 / loop 循环，2026-10-18）：非 nil 创建即生效，
 			// objective 缺省回落为 goal 文本（agent 层处理）。
 			Directive *agent.DirectiveSpec `json:"directive,omitempty"`
@@ -107,7 +115,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 		}
 		goal, wireImgs, wireVids = req.Goal, req.Images, req.Videos
 		workDir, gear, thinking, plugins = req.WorkDir, req.Gear, req.Thinking, req.Plugins
-		model, directive = req.Model, req.Directive
+		model, directive, skills = req.Model, req.Directive, req.Skills
 	}
 	// 目标必填：纯文字创建必须带 goal；只带文件附件时 goal 可空（引用行拼入后即非空）。
 	if goal == "" && len(files) == 0 {
@@ -167,7 +175,7 @@ func (m *SessionManager) HandleCreateSession(c *gin.Context) {
 	// 调用 Agent 创建会话（images/videos 经 firstTurnImages 注入首轮 runCtx 后一次性消费；
 	// Attachments 仅透传首条 user_message 事件的 detail_json，引用文本已在 goal 里；
 	// Directive 指令模式创建即生效，落库失败退化为普通模式并记事件——不阻断建会话）。
-	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: goal, Images: images, Videos: videos, Attachments: atts, WorkDir: abs, Gear: gear, Thinking: thinking, Model: model, PinnedPlugins: plugins, Directive: directive})
+	session, err := m.agent.CreateSession(c.Request.Context(), agent.CreateRequest{Goal: goal, Images: images, Videos: videos, Attachments: atts, WorkDir: abs, Gear: gear, Thinking: thinking, Model: model, PinnedPlugins: plugins, PinnedSkills: skills, Directive: directive})
 	if err != nil {
 		c.String(http.StatusInternalServerError, "%s", err.Error())
 		return
@@ -771,6 +779,39 @@ func (m *SessionManager) HandleSessionPlugins(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]any{
 		"session_id": id,
 		"plugins":    plugins,
+	})
+}
+
+// HandleSessionSkills 处理 POST /api/sessions/{id}/skills（技能选择器）。
+// 职责：切换会话级指定技能（选中=技能全文直接加载并优先使用，不选=模型自行判断），
+// 经 Control 通道下发；atomic 即时生效——下一轮起跑按新集合重建技能提示块，
+// 新增的 learned 技能提升使用权重（use_count+1）。空数组=清空（合法）；
+// 无效技能名称 400（列明）；会话不存在 404。
+func (m *SessionManager) HandleSessionSkills(c *gin.Context) {
+	id := c.Param("id")
+	req, err := DecodeBody[struct {
+		Skills []string `json:"skills"`
+	}](c.Request)
+	if err != nil {
+		c.String(http.StatusBadRequest, "请求体无效")
+		return
+	}
+	// skills 字段缺失（null）视为清空——与显式空数组同语义，前端"清空"按钮直发 []。
+	skills := req.Skills
+	if skills == nil {
+		skills = []string{}
+	}
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
+		Op:   agent.ControlOpPinnedSkills,
+		Args: map[string]any{"skills": skills},
+	}); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"session_id": id,
+		"skills":     skills,
 	})
 }
 
