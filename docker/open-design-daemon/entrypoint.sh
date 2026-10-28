@@ -78,17 +78,39 @@ const del = (prov, key) => {
     touched = true;
   }
 };
+// ---- 能力声明（2026-10-24 媒体能力路由）----
+// IMAGE_CAPABILITIES / VIDEO_CAPABILITIES 是非敏感能力清单，例如：
+//   IMAGE_CAPABILITIES=t2i,subject_reference,aspect
+//   VIDEO_CAPABILITIES=t2v,i2v,aspect,duration
+// 写入选中槽位的 capabilities 数组，桥（ui_design MCP）探测后据此做本地校验：
+// 未声明的能力（尤其 image_edit/inpaint）一律拒绝，绝不静默丢弃参数。
+// 未声明 → 删除该键（桥回落保守默认集，不默认宣称局部编辑可用）。
+const capsList = (raw) => String(raw || '').split(/[,\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+const setCaps = (prov, raw) => {
+  const list = capsList(raw);
+  if (list.length) {
+    cfg.providers[prov] = cfg.providers[prov] || {};
+    cfg.providers[prov].capabilities = list;
+    touched = true;
+  } else {
+    del(prov, "capabilities");
+  }
+};
 if (imageDeclared) {
   if (imageProvider === "custom-image") {
     // OpenAI 兼容 /images/generations 直调（聚合网关/Gemini 兼容网关等）
     set("custom-image", "baseUrl", process.env.IMAGE_URL);
     set("custom-image", "model", process.env.IMAGE_MODEL);
+    setCaps("custom-image", process.env.IMAGE_CAPABILITIES);
     del("nanobanana", "model");
+    del("nanobanana", "capabilities");
   } else if (imageProvider === "nanobanana") {
     // Google nano-banana；baseUrl 空 = daemon 默认官方端点
     set("nanobanana", "baseUrl", toNanoRoot(process.env.IMAGE_URL));
     set("nanobanana", "model", process.env.IMAGE_MODEL);
+    setCaps("nanobanana", process.env.IMAGE_CAPABILITIES);
     del("custom-image", "model"); // baseUrl 残留无害：判定键是 model 非空
+    del("custom-image", "capabilities");
   } else {
     console.error(`[bma-entrypoint] 未知 IMAGE_PROVIDER=${imageProvider}（可选 custom-image|nanobanana），本次不改图像槽位`);
   }
@@ -98,22 +120,33 @@ if (videoDeclared) {
     // OpenAI /videos 协议聚合网关
     set("aihubmix", "baseUrl", toApiRoot(videoUrl));
     set("aihubmix", "model", videoModel);
+    setCaps("aihubmix", process.env.VIDEO_CAPABILITIES);
     del("volcengine", "model");
+    del("volcengine", "capabilities");
     del("grok", "model");
+    del("grok", "capabilities");
   } else if (videoProvider === "volcengine") {
     // 方舟 tasks 协议（模型须目录 id / OD_MEDIA_MODEL_ALIASES 可解析）
     set("volcengine", "baseUrl", toApiRoot(videoUrl));
     set("volcengine", "model", videoModel);
+    setCaps("volcengine", process.env.VIDEO_CAPABILITIES);
     del("aihubmix", "model");
+    del("aihubmix", "capabilities");
     del("grok", "model");
+    del("grok", "capabilities");
   } else if (videoProvider === "grok") {
     // grok 线 = OpenAI 同步形状 POST {base}/videos/generations（2026-10-16：BMA 本机
     // 8090 Gemini 桥走这条；配套 patch-image-size.js ③ 让 renderGrokVideo 接受其
     // video_url 字段。模型仍写目录 id——daemon 按目录定义分发到 grok 渲染器）。
+    // 2026-10-24：MiniMax 适配桥（docker/minimax-media）也挂在这条线上，
+    // agent 无需知道协议名——VIDEO_PROVIDER=grok + auto 路由即可。
     set("grok", "baseUrl", toApiRoot(videoUrl));
     set("grok", "model", videoModel);
+    setCaps("grok", process.env.VIDEO_CAPABILITIES);
     del("aihubmix", "model");
+    del("aihubmix", "capabilities");
     del("volcengine", "model");
+    del("volcengine", "capabilities");
   } else {
     console.error(`[bma-entrypoint] 未知 VIDEO_PROVIDER=${videoProvider}（可选 openai|volcengine|grok），本次不改视频槽位`);
   }
@@ -126,6 +159,11 @@ if (touched || existed) {
 const slotOf = (p) => (cfg.providers[p] && cfg.providers[p].model) || "无";
 console.error(
   `[bma-entrypoint] 媒体单点生效（源=仓库根 .env 媒体段）：IMAGE_PROVIDER=${imageProvider} ｜ custom-image.model=${slotOf("custom-image")} ｜ nanobanana.model=${slotOf("nanobanana")} ｜ VIDEO_PROVIDER=${videoProvider} ｜ aihubmix.model=${slotOf("aihubmix")} ｜ volcengine.model=${slotOf("volcengine")} ｜ grok.model=${slotOf("grok")}`
+);
+// 能力声明摘要（非敏感）：未声明时桥用保守默认集。
+const capsOf = (p) => ((cfg.providers[p] && cfg.providers[p].capabilities) || []).join(",") || "未声明(保守默认)";
+console.error(
+  `[bma-entrypoint] 能力声明：image=${capsOf(imageProvider === "nanobanana" ? "nanobanana" : "custom-image")} ｜ video=${capsOf(videoProvider === "openai" ? "aihubmix" : videoProvider)}`
 );
 EOF
 

@@ -26,11 +26,31 @@ type SessionDecision struct {
 	SessionID string    `json:"session_id"`
 	Owner     string    `json:"owner"`
 	Kind      string    `json:"kind"`
-	Content   string    `json:"content"`
-	Source    string    `json:"source"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
+	// Axis 决策轴（2026-10-24 多轴账本）：同一轴内新指令只替换该轴的旧行，
+	// 跨轴互不覆盖（"重新 AI 生图"不能撤销动画路线/锚点审批/视角）。
+	// 空串 = 无轴（普通指令/否决/参考基准，老数据兼容）。
+	Axis            string    `json:"axis"`
+	Content         string    `json:"content"`
+	Source          string    `json:"source"`
+	SourceMessageID string    `json:"source_message_id"`
+	Status          string    `json:"status"`
+	CreatedAt       time.Time `json:"created_at"`
 }
+
+// 决策轴枚举（2026-10-24 多轴账本，见 doc/计划_媒体动画与记忆质量修复.md §5.1）。
+// 同一轴内互斥；不同轴之间的约束同时有效。
+const (
+	AxisExecutionMode    = "execution_mode"     // execute | answer_only | discuss
+	AxisAssetSource      = "asset_source"       // existing | ai_image | video | mixed
+	AxisAnimationMethod  = "animation_method"   // frame_generate | warp | video_frames
+	AxisIdentity         = "identity"           // 当前角色/参考资产合同
+	AxisView             = "view"               // 当前视角
+	AxisApprovalAnchor   = "approval_anchor"    // pending | approved | rejected（锚点视觉审批门）
+	AxisApprovalKeyframe = "approval_keyframe" // pending | approved | rejected（关键姿态审批门）
+	AxisAcceptance       = "acceptance"         // 当前验收标准
+	AxisDelivery         = "delivery"           // 当前交付形式
+	AxisGeneral          = ""                   // 无轴（普通指令/否决/参考基准）
+)
 
 // 账本行类型。
 const (
@@ -76,14 +96,39 @@ func (s *SessionDecisionStore) Append(ctx context.Context, d SessionDecision) (i
 	}
 	var id int64
 	err := s.db.QueryRowContext(ctx, `
-INSERT INTO session_decisions (session_id, owner, kind, content, source, status)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO session_decisions (session_id, owner, kind, axis, content, source, source_message_id, status)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id`,
-		d.SessionID, d.Owner, d.Kind, d.Content, d.Source, d.Status).Scan(&id)
+		d.SessionID, d.Owner, d.Kind, d.Axis, d.Content, d.Source, d.SourceMessageID, d.Status).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("append decision %s: %w", d.SessionID, err)
 	}
 	return id, nil
+}
+
+// SupersedeAxis 把会话内指定轴（axis）的 active 行标记为 superseded（append-only：只改状态）。
+// keepID>0 时保留该行不动（新写入的现行行）。axis 为空串表示无轴行。
+// 2026-10-24：单路线账本升级为多轴账本——旧 Supersede(kind=route) 会把不同维度
+// （动画方式/视角/审批门）的约束一刀切作废，"重新 AI 生图"因此误撤动画路线。
+func (s *SessionDecisionStore) SupersedeAxis(ctx context.Context, sessionID, axis string, keepID int64, kinds []string) (int64, error) {
+	if s == nil || s.db == nil || sessionID == "" {
+		return 0, nil
+	}
+	q := `
+UPDATE session_decisions
+SET status = $3, superseded_by = $4
+WHERE session_id = $1 AND status = $5 AND axis = $2 AND id <> $4`
+	args := []any{sessionID, axis, DecisionStatusSuperseded, keepID, DecisionStatusActive}
+	if len(kinds) > 0 {
+		q += ` AND kind = ANY($6)`
+		args = append(args, pq.Array(kinds))
+	}
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, fmt.Errorf("supersede axis %q of %s: %w", axis, sessionID, err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // List 按时间正序返回会话账本（limit<=0 不限制）。owner 过滤留空=不限制（当前单租户）。
@@ -91,13 +136,13 @@ func (s *SessionDecisionStore) List(ctx context.Context, sessionID string, limit
 	if s == nil || s.db == nil || sessionID == "" {
 		return nil, nil
 	}
-	q := `SELECT id, session_id, owner, kind, content, source, status, created_at
+	q := `SELECT id, session_id, owner, kind, axis, content, source, source_message_id, status, created_at
 FROM session_decisions WHERE session_id = $1 ORDER BY id ASC`
 	args := []any{sessionID}
 	if limit > 0 {
 		// 只取最近 limit 条，再翻回时间正序。
-		q = `SELECT id, session_id, owner, kind, content, source, status, created_at FROM (
-    SELECT id, session_id, owner, kind, content, source, status, created_at
+		q = `SELECT id, session_id, owner, kind, axis, content, source, source_message_id, status, created_at FROM (
+    SELECT id, session_id, owner, kind, axis, content, source, source_message_id, status, created_at
     FROM session_decisions WHERE session_id = $1 ORDER BY id DESC LIMIT $2
 ) t ORDER BY id ASC`
 		args = append(args, limit)
@@ -110,7 +155,8 @@ FROM session_decisions WHERE session_id = $1 ORDER BY id ASC`
 	var out []SessionDecision
 	for rows.Next() {
 		var d SessionDecision
-		if err := rows.Scan(&d.ID, &d.SessionID, &d.Owner, &d.Kind, &d.Content, &d.Source, &d.Status, &d.CreatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.SessionID, &d.Owner, &d.Kind, &d.Axis, &d.Content,
+			&d.Source, &d.SourceMessageID, &d.Status, &d.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan decision: %w", err)
 		}
 		out = append(out, d)

@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted, computed, watch, provide, h } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear, SessionThinking, SessionDirectiveSpec } from '@/types'
+import type { Session, SessionEvent, AgentNode, TaskBoardData, ClarifyPending, ClarifyQuestionItem, WireImage, SessionGear, SessionThinking, TrustMode, SessionDirectiveSpec } from '@/types'
 import { isAssistantTextEvent, isToolCallEvent, isUserMessageEvent, clarifyArtifactsFromFrame } from '@/types'
 import {
   createSession,
@@ -590,6 +590,17 @@ async function handleClarifySubmitted() {
 }
 
 /**
+ * 会话级热设置回写（档位/思考/信任/模型，2026-10-23）：输入栏切换成功后父级就地更新
+ * 会话快照——对话↔监控切换等重挂场景以新值回显，不再弹回旧档；会话列表同步该字段。
+ */
+function handleSessionUpdated(patch: { gear?: SessionGear; thinking?: SessionThinking; trust_mode?: TrustMode; model?: string }) {
+  if (!activeSession.value) return
+  activeSession.value = { ...activeSession.value, ...patch }
+  const idx = sessions.value.findIndex((s) => s.id === activeSession.value!.id)
+  if (idx >= 0) sessions.value[idx] = { ...sessions.value[idx], ...patch }
+}
+
+/**
  * 停止（2026-10-16 统一停止交互，唯一停止入口：运行中发送区红色「停止」按钮 /
  * 待澄清态发送区小「停止」逃生口）。
  * 弹窗带勾选框（默认不勾选）：勾选=停止子 Agent + 主 Agent（全停，软停止语义可续跑）；
@@ -748,6 +759,7 @@ function handleUpdateClarifyDrafts(drafts: string[]) {
         @clarify-submitted="handleClarifySubmitted"
         @update-clarify-drafts="handleUpdateClarifyDrafts"
         @update-workdir="handleWorkDirChange"
+        @session-updated="handleSessionUpdated"
         @refresh="activeSession && refreshPanels(activeSession.id)"
       />
       <MonitorView

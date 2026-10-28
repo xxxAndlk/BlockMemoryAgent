@@ -47,8 +47,8 @@ cmd_status() {
   echo "=== 后端拉起的插件容器（bma-plugin-<id>[-<目录哈希>]） ==="
   docker ps --filter "name=bma-plugin-" --format '{{.Names}}  {{.Image}}  {{.Status}}'
   echo
-  echo "=== compose 统一管理的长驻服务（open_design） ==="
-  docker ps --filter "name=bma-open-design" --format '{{.Names}}  {{.Image}}  {{.Status}}'
+  echo "=== compose 统一管理的长驻服务（open_design / minimax-media） ==="
+  docker ps --filter "name=bma-open-design" --filter "name=bma-minimax-media" --format '{{.Names}}  {{.Image}}  {{.Status}}'
 }
 
 # cmd_media 媒体生成配置单点应用（2026-10-14）：唯一手改点 = 仓库根 .env 媒体段。
@@ -57,10 +57,12 @@ cmd_status() {
 # 字符串比较复用，不换新会继续跑旧代码/旧 env）。
 cmd_media() {
   echo "=== 媒体生成配置单点应用（源 = 仓库根 .env 媒体段） ==="
-  grep -E '^(IMAGE_PROVIDER|IMAGE_URL|IMAGE_MODEL|IMAGE_KEY|VIDEO_PROVIDER|VIDEO_URL|VIDEOS_URL|VIDEO_MODEL|VIDEOS_MODEL|VIDEO_KEY)=' "$REPO_ROOT/.env" \
-    | sed -E 's/(_KEY=).*/\1***/' || echo "(媒体段未声明任何变量——将保持容器内既有配置)"
+  grep -E '^(IMAGE_PROVIDER|IMAGE_URL|IMAGE_MODEL|IMAGE_KEY|VIDEO_PROVIDER|VIDEO_URL|VIDEOS_URL|VIDEO_MODEL|VIDEOS_MODEL|VIDEO_KEY|MINIMAX_[A-Z_]+)=' "$REPO_ROOT/.env" \
+    | sed -E 's/((_KEY|_TOKEN)=).*/\1***/' || echo "(媒体段未声明任何变量——将保持容器内既有配置)"
   echo "--- 重建桥镜像（层缓存幂等）"
   docker build -t bma/open-design-mcp:local docker/open-design-mcp >/dev/null
+  echo "--- 拉起 minimax-media 适配桥（通道 D 用；未选通道时空转，无副作用）"
+  docker compose -f docker/docker-compose.yml up -d --build minimax-media
   echo "--- 重建 open_design 容器（entrypoint 重写 media-config.json，排他写入按 PROVIDER 选择）"
   docker compose -f docker/docker-compose.yml up -d --build --force-recreate open_design
   sleep 5

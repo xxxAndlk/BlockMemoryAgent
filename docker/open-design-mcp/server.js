@@ -22,6 +22,27 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { PNG } from 'pngjs';
 import { z } from 'zod';
+import {
+  IMAGE_CAPABILITY_DEFAULTS,
+  VIDEO_CAPABILITY_DEFAULTS,
+  CapabilityError,
+  normalizeCapabilities,
+  resolveCapabilities,
+  resolveOperation,
+  validateStrictParams,
+  validateAspect,
+  normalizeStage,
+  pngSize,
+  hashBuffer,
+  hashString,
+  buildImageRequestManifest,
+  buildImageResultManifest,
+  writeTaskManifests,
+  rememberOutput,
+  approveGate,
+  assertGateAllows,
+  selectVideoProvider,
+} from './media-core.js';
 
 const OD_API_URL = (process.env.OD_API_URL || 'http://host.docker.internal:7456').replace(/\/$/, '');
 const OD_API_TOKEN = process.env.OD_API_TOKEN || '';
@@ -83,6 +104,11 @@ const OD_VIDEO_PROVIDER_ENV = (process.env.OD_VIDEO_PROVIDER || '').trim().toLow
 const OD_VOLCENGINE_VIDEO_MODEL_ENV = (process.env.OD_VOLCENGINE_VIDEO_MODEL || '').trim();
 const OD_OPENAI_VIDEO_MODEL_ENV = (process.env.OD_OPENAI_VIDEO_MODEL || '').trim();
 const OD_GROK_VIDEO_MODEL_ENV = (process.env.OD_GROK_VIDEO_MODEL || '').trim();
+// 能力声明（2026-10-24）：来源 = 仓库根 .env 的 IMAGE_CAPABILITIES / VIDEO_CAPABILITIES
+// （plugins.yaml settings.env 经 ${VAR:} 插值进桥容器环境）。这是桥能可靠拿到的唯一通道
+// ——daemon 的 /api/media/config 会丢弃未知字段，探测不到 capabilities。
+const OD_IMAGE_CAPABILITIES_ENV = (process.env.OD_IMAGE_CAPABILITIES || '').trim();
+const OD_VIDEO_CAPABILITIES_ENV = (process.env.OD_VIDEO_CAPABILITIES || '').trim();
 // 视频 30s–5min（ark 队列峰值更久），远超图片的 180s 上限，独立超时。
 const OD_VIDEO_TIMEOUT_MS = Number(process.env.OD_VIDEO_TIMEOUT_MS || 720000);
 
@@ -104,32 +130,79 @@ async function probeMediaDefaults() {
   ]);
   const providers = (cfg && cfg.providers) || {};
   const modelOf = (id) => String((providers[id] && providers[id].model) || '').trim();
+  // 能力声明（2026-10-24）：优先读桥 env（见 OD_IMAGE_CAPABILITIES_ENV 注释）；
+  // daemon 槽位的 capabilities 字段仅作探测兜底（当前 /api/media/config 会丢弃）。
+  // 两者都没有 → 保守默认集（不默认宣称 image_edit/inpaint 可用）。
+  const capsOf = (id) => normalizeCapabilities(
+    providers[id] && providers[id].capabilities !== undefined ? providers[id].capabilities : undefined, []);
   let imageModel = '';
+  let imageCaps = IMAGE_CAPABILITY_DEFAULTS;
+  let detectedImageCaps = ''; // daemon 侧声明的原值（E 能力探测用，未声明为空）
   if (modelOf('custom-image')) {
     imageModel = 'custom-image';
+    const declared = capsOf('custom-image');
+    detectedImageCaps = declared;
+    imageCaps = declared.length > 0 ? declared : IMAGE_CAPABILITY_DEFAULTS;
   } else if (modelOf('nanobanana')) {
     // nanobanana 是 provider id 不是模型 id；桥须传具体目录模型 id（随 daemon 版本变化 → 动态取）。
     const list = Array.isArray(models && models.image) ? models.image : [];
     const hit = list.find((m) => m && m.provider === 'nanobanana' && Array.isArray(m.caps) && m.caps.includes('t2i'));
     imageModel = (hit && hit.id) || NANOBANANA_FALLBACK_MODEL_ID;
+    const declared = capsOf('nanobanana');
+    detectedImageCaps = declared;
+    imageCaps = declared.length > 0 ? declared : IMAGE_CAPABILITY_DEFAULTS;
   }
+  // 视频通道按优先级构建（顺序即 auto 选择顺序，与历史默认一致）。
   let videoProvider = '';
   let videoModel = '';
+  const videoProviders = [];
+  let videoCaps = VIDEO_CAPABILITY_DEFAULTS;
+  let detectedVideoCaps = '';
   if (modelOf('aihubmix')) {
     // openai wire：renderAIHubMixVideo 配置优先（credentials.model 恒胜于桥传值），桥传
     // 占位即可。禁止用目录 id（如 veo-3）当占位——provider=google 会落 stub 假成功；
     // 占位自带 aihubmix- 前缀，被清空时上游报 model 'bma' not found，失败可见。
     videoProvider = 'openai';
     videoModel = AIHUBMIX_PLACEHOLDER_VIDEO_MODEL;
-  } else if (modelOf('volcengine')) {
-    videoProvider = 'volcengine';
-    videoModel = modelOf('volcengine'); // volcengine 视频纯用桥传值，须目录 id/别名可解析
-  } else if (modelOf('grok')) {
-    // grok 线（2026-10-16）：桥传目录 id（daemon 按目录定义分发 renderGrokVideo）。
-    videoProvider = 'grok';
-    videoModel = GROK_VIDEO_CATALOG_MODEL;
+    videoProviders.push('openai');
+    const declared = capsOf('aihubmix');
+    detectedVideoCaps = declared;
+    if (declared.length > 0) videoCaps = declared;
   }
-  return { imageModel, videoProvider, videoModel };
+  if (modelOf('volcengine')) {
+    const p = modelOf('volcengine'); // volcengine 视频纯用桥传值，须目录 id/别名可解析
+    videoProviders.push('volcengine');
+    if (!videoProvider) {
+      videoProvider = 'volcengine';
+      videoModel = p;
+      const declared = capsOf('volcengine');
+      detectedVideoCaps = declared;
+      if (declared.length > 0) videoCaps = declared;
+    }
+  }
+  if (modelOf('grok')) {
+    // grok 线（2026-10-16）：桥传目录 id（daemon 按目录定义分发 renderGrokVideo）。
+    videoProviders.push('grok');
+    if (!videoProvider) {
+      videoProvider = 'grok';
+      videoModel = GROK_VIDEO_CATALOG_MODEL;
+      const declared = capsOf('grok');
+      detectedVideoCaps = declared;
+      if (declared.length > 0) videoCaps = declared;
+    }
+  }
+  // 能力来源优先级：桥 env（仓库根 .env）> daemon 探测 > 保守默认集。
+  imageCaps = resolveCapabilities({
+    envDeclared: OD_IMAGE_CAPABILITIES_ENV,
+    detected: detectedImageCaps,
+    defaults: IMAGE_CAPABILITY_DEFAULTS,
+  });
+  videoCaps = resolveCapabilities({
+    envDeclared: OD_VIDEO_CAPABILITIES_ENV,
+    detected: detectedVideoCaps,
+    defaults: VIDEO_CAPABILITY_DEFAULTS,
+  });
+  return { imageModel, imageCaps, videoProvider, videoModel, videoProviders, videoCaps };
 }
 
 // fetchMediaDefaults 带缓存/去重/静默失败的探测入口；永不抛（daemon 未起时返回 null）。
@@ -339,16 +412,29 @@ function extractTaskFile(task) {
   return meta.fileName || meta.filename || meta.name || meta.path || null;
 }
 
-// newestImageFallback task.file 缺文件名时，取项目里 task 启动后最新修改的对应类型文件。
-async function newestImageFallback(sinceMs, exts = IMAGE_EXTS) {
-  const data = await odJson(`/api/projects/${OD_PROJECT_ID}/files`);
-  const files = Array.isArray(data?.files) ? data.files : [];
-  const images = files
-    .filter((f) => exts.some((ext) => String(f?.name || f?.fileName || '').toLowerCase().endsWith(ext)))
-    .filter((f) => !sinceMs || Number(f?.mtime || f?.updatedAt || f?.modifiedAt || 0) >= sinceMs - 5000)
-    .sort((a, b) => Number(b?.mtime || b?.updatedAt || b?.modifiedAt || 0) - Number(a?.mtime || a?.updatedAt || a?.modifiedAt || 0));
-  const first = images[0];
-  return first ? String(first.name || first.fileName) : null;
+// taskManifestDir task 级产物清单目录（2026-10-24 P0）。
+// 已删除旧的 newestImageFallback：task.file 缺文件名时取"项目里最新文件"在并发生成下
+// 会把同一份产物判给两个任务，Agent 只能靠 MD5 猜提示词是否被忽略（会话 #65/#66）。
+// 现在缺文件名就返回 reconcile_required + task_id，让任务可被人工/脚本对账。
+function taskManifestDir(taskId) {
+  return `${WORKSPACE_DIR}/.bma/media/${taskId}`;
+}
+
+// resolveMissingFileError 产物文件名缺失 → 可对账的结构化错误（不猜文件）。
+function reconcileRequiredError(taskId) {
+  const err = new Error(
+    `任务已完成但未返回产物文件名（task_id=${taskId}）：已拒绝"取项目最新文件"的汒底（并发任务会拿错图）。` +
+    `请用 od_image_list / od_video_list 按 taskId 对账，或直接重试同一个 save_as。`);
+  err.code = 'reconcile_required';
+  err.detail = { task_id: taskId };
+  return err;
+}
+
+// mediaCapabilities 读取当前图像/视频能力集（daemon 未起时回落保守默认）。
+async function mediaCapabilities(surface) {
+  const d = await fetchMediaDefaults();
+  if (surface === 'video') return (d && d.videoCaps) || VIDEO_CAPABILITY_DEFAULTS;
+  return (d && d.imageCaps) || IMAGE_CAPABILITY_DEFAULTS;
 }
 
 // waitTask 轮询任务直至 done/failed。label 用于错误文案（"图像"/"视频"），
@@ -429,7 +515,15 @@ function removeWhiteBackground(buf) {
   return PNG.sync.write(png);
 }
 
-async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg: removeBg, reference }) {
+// generateImage 单张图像生成（2026-10-24 P0/P1 加固）：
+//   - operation 能力路由（t2i / subject_reference / image_edit / inpaint）——
+//     不支持就在发上游请求前本地报错（capability_unsupported，零费用）；
+//   - 严格参数（input_fidelity / negative_prompt / seed）只在声明支持时透传；
+//   - stage（asset|anchor|keyframe|inbetween）参与审批硬门：未批准锚点不得进后续阶段；
+//   - 每个 task 落 .bma/media/<task_id>/{request,result}.json，记录 prompt/reference/
+//     raw/output/postprocess hash 与真实像素尺寸；缺文件名返回 reconcile_required；
+//   - 相同 output hash 对应不同请求 → duplicate_suspect（不计为可接受新帧）。
+async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg: removeBg, reference, operation, input_fidelity: inputFidelity, negative_prompt: negativePrompt, seed, stage }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
@@ -440,21 +534,54 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg
     refFile = resolveReferenceImagePath(reference, 'reference');
     if (saveTarget) assertRefNotOutput(saveTarget, refFile);
   }
+  // 能力路由 + 严格参数校验 + 画幅校验（全部在上游请求之前）。
+  const caps = await mediaCapabilities('image');
+  const op = resolveOperation({ operation, reference: refFile ? refFile.rel : undefined, capabilities: caps });
+  validateStrictParams({ input_fidelity: inputFidelity, negative_prompt: negativePrompt, seed }, caps);
+  const useAspect = validateAspect(aspect, caps);
+  const useStage = normalizeStage(stage);
+  // 阶段审批硬门：keyframe/inbetween 需要已批准且同一参考图的锚点。
+  if (refFile) {
+    const refHash = hashBuffer(readFileSync(refFile.abs));
+    assertGateAllows({ workdir: WORKSPACE_DIR, stage: useStage, refHash });
+  } else {
+    assertGateAllows({ workdir: WORKSPACE_DIR, stage: useStage });
+  }
+
   const useModel = await resolveImageModel(model);
   const startedAtMs = Date.now();
   await ensureProject();
   // 参考图上传（幂等 + 缓存）：daemon 只认项目内文件，body.image 传项目相对名。
-  const refName = refFile ? await ensureProjectFileUploaded(refFile) : null;
-  const gen = await odJson(`/api/projects/${OD_PROJECT_ID}/media/generate`, {
-    method: 'POST',
-    body: { surface: 'image', model: useModel, prompt, ...(aspect ? { aspect } : {}), ...(refName ? { image: refName } : {}) },
-  });
+  // operation=t2i 时绝不带图（resolveOperation 已保证 reference 与 t2i 不共存）。
+  const refName = refFile && op !== 't2i' ? await ensureProjectFileUploaded(refFile) : null;
+  const body = {
+    surface: 'image',
+    model: useModel,
+    prompt,
+    ...(useAspect ? { aspect: useAspect } : {}),
+    ...(refName ? { image: refName } : {}),
+  };
+  // 仅在能力声明支持时透传（否则 validateStrictParams 已抛错）；字段名对齐上游常见形状。
+  if (inputFidelity !== undefined && inputFidelity !== null) body.input_fidelity = inputFidelity;
+  if (negativePrompt !== undefined && negativePrompt !== null) body.negative_prompt = String(negativePrompt);
+  if (seed !== undefined && seed !== null) body.seed = Number(seed);
+  const gen = await odJson(`/api/projects/${OD_PROJECT_ID}/media/generate`, { method: 'POST', body });
   const taskId = gen?.taskId;
   if (!taskId) throw new Error(`OD 未返回 taskId：${JSON.stringify(gen).slice(0, 300)}`);
-  log('生成任务已受理:', taskId, 'model=', useModel);
+  log('生成任务已受理:', taskId, 'model=', useModel, 'op=', op, 'stage=', useStage);
+  // 请求清单立刻落盘（任务失败也能对账"到底发过什么请求"）。
+  const requestManifest = buildImageRequestManifest({
+    taskId, operation: op, provider: 'custom-image', model: useModel, prompt,
+    reference: refFile ? refFile.rel : null, aspect: useAspect, stage: useStage,
+  });
+  try {
+    writeTaskManifests({ workdir: WORKSPACE_DIR, taskId, request: requestManifest });
+  } catch (err) {
+    log('请求清单写入失败（不阻断生成）:', err.message);
+  }
   const task = await waitTask(taskId);
-  const fileName = (await extractTaskFile(task)) || (await newestImageFallback(startedAtMs));
-  if (!fileName) throw new Error('任务完成但未找到产物文件名');
+  const fileName = await extractTaskFile(task);
+  if (!fileName) throw reconcileRequiredError(taskId);
   const bytes = await downloadFile(fileName);
   // 白底抠除（默认开）：seedream 对"透明背景"提示词执行不稳定（实证 tower/monster
   // 系列整图白底），纯 prompt 不可靠，落盘前 flood-fill 边缘连通白区置透明。
@@ -486,6 +613,30 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg
   }
   mkdirSync(dirname(absPath), { recursive: true });
   writeFileSync(absPath, outBytes);
+  const rawHash = hashBuffer(bytes);
+  const outHash = hashBuffer(outBytes);
+  const dup = rememberOutput(outHash, {
+    promptHash: requestManifest.prompt_hash,
+    referenceHash: requestManifest.reference_hash,
+    taskId,
+  });
+  const size = pngSize(outBytes);
+  try {
+    writeTaskManifests({
+      workdir: WORKSPACE_DIR, taskId,
+      result: buildImageResultManifest({
+        taskId, file: fileName, workspacePath: relPath,
+        rawHash, outputHash: outHash, postprocess: bgRemoved || outHash !== rawHash,
+        width: size?.width, height: size?.height, duplicate: dup.duplicate, model: useModel,
+      }),
+    });
+  } catch (err) {
+    log('结果清单写入失败（不阻断返回）:', err.message);
+  }
+  if (dup.duplicate) {
+    log('⚠ duplicate_suspect:', taskId, 'output_hash=', outHash.slice(0, 12),
+      '与 task', dup.first && dup.first.taskId, '相同但请求不同');
+  }
   const elapsedSec = Math.round((Date.now() - startedAtMs) / 1000);
   log('产物已落盘:', relPath, `${outBytes.length}B${bgRemoved ? '（白底已抠除）' : ''}`, `${elapsedSec}s`);
   return {
@@ -494,8 +645,19 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg
     bytes: outBytes.length,
     bg_removed: bgRemoved,
     model: useModel,
-    aspect: aspect || null,
+    aspect: useAspect,
     reference: refName,
+    operation: op,
+    stage: useStage,
+    task_id: taskId,
+    output_hash: outHash,
+    width: size?.width || null,
+    height: size?.height || null,
+    ...(dup.duplicate ? {
+      duplicate_suspect: true,
+      duplicate_hint: `输出与 task ${dup.first && dup.first.taskId} 完全相同但 prompt/reference 不同：` +
+        '可能是上游忽略了提示词（或并发串产物），不得计为可接受新帧；请改用真正的编辑能力或换参考图。',
+    } : {}),
     elapsedSec,
     hint: '在 HTML/CSS/JS 中以该相对路径（path 字段）引用此图片',
   };
@@ -506,7 +668,8 @@ async function generateImage({ prompt, aspect, model, save_as: saveAs, remove_bg
 // generateMedia 后台异步跑、HTTP 立即回 taskId（routes/media.js），无队列无锁——
 // 旧"daemon 单任务语义"注释不成立，纯串行白等（23 张 × 30s ≈ 11.5min，并发 3 压到 ~4min）。
 // 单张失败不中断整批，结果逐项标注 path 或 error，由 Agent 决定重试/降级。
-async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAsList, remove_bg: removeBg, reference }) {
+async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAsList, remove_bg: removeBg, reference,
+  operation, input_fidelity: inputFidelity, negative_prompt: negativePrompt, seed, stage }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
@@ -540,12 +703,22 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
       // save_as_list 元素为空串 = 该项走默认 .bma/od-artifacts 命名。
       const saveAs = saveAsList?.[i] || undefined;
       try {
-        const r = await generateImage({ prompt, aspect, model: useModel, save_as: saveAs, remove_bg: removeBg, reference: refFile ? refFile.rel : undefined });
-        results[i] = { index: i, prompt, path: r.path, filename: r.filename, bytes: r.bytes };
+        const r = await generateImage({
+          prompt, aspect, model: useModel, save_as: saveAs, remove_bg: removeBg,
+          reference: refFile ? refFile.rel : undefined,
+          operation, input_fidelity: inputFidelity, negative_prompt: negativePrompt, seed, stage,
+        });
+        // 逐项带 task_id + status：批量结果必须能按任务对账（不能只回 path）。
+        results[i] = {
+          index: i, task_id: r.task_id, status: 'done', prompt,
+          path: r.path, filename: r.filename, bytes: r.bytes,
+          output_hash: r.output_hash, width: r.width, height: r.height,
+          ...(r.duplicate_suspect ? { duplicate_suspect: true, duplicate_hint: r.duplicate_hint } : {}),
+        };
         log(`批量进度 ${++settled}/${prompts.length} 完成:`, r.path);
       } catch (err) {
         log(`批量进度 ${++settled}/${prompts.length} 失败:`, err.message);
-        results[i] = { index: i, prompt, error: err.message };
+        results[i] = { index: i, status: 'error', prompt, error: err.message, task_id: err?.detail?.task_id || null };
       }
     }
   }
@@ -560,6 +733,9 @@ async function generateImageBatch({ prompts, aspect, model, save_as_list: saveAs
     model: useModel,
     aspect: aspect || null,
     reference: refFile ? refFile.rel : null,
+    operation: operation || null,
+    stage: stage || null,
+    duplicate_suspects: results.filter((r) => r && r.duplicate_suspect).length,
     elapsedSec: Math.round((Date.now() - startedAtMs) / 1000),
     results,
     hint: '在 HTML/CSS/JS 中以各项结果的相对路径（path 字段）引用图片；带 error 的项需换 prompt 重试或人工处理',
@@ -574,23 +750,29 @@ async function resolveImageModel(explicitModel) {
   return (d && d.imageModel) || IMAGE_FALLBACK_MODEL_ID;
 }
 
-function normalizeVideoProvider(raw) {
-  const p = String(raw || '').toLowerCase();
-  if (p !== 'volcengine' && p !== 'openai' && p !== 'grok') {
-    throw new Error(`未知视频 provider：${p}（可选 volcengine / openai / grok；网关协议分别为方舟 tasks、OpenAI /videos、同步 /videos/generations）`);
-  }
-  return p;
-}
-
-// resolveVideoTarget 视频默认目标：参数 > env > daemon 单点探测 > 硬默认。
+// resolveVideoTarget 视频目标解析（2026-10-24 P0：provider 默认 auto）。
+//
+// 事故形态（会话 #66）：当前唯一可用链路是 grok→minimax-media，Agent 却强制
+// provider=volcengine（401）/ openai（AIHubMix key 缺失）——纯路由错误，被误当成
+// "H3 质量结论"。现在：
+//   - provider 缺省或 auto → 用 daemon 当前已配置通道（桥主动探测，Agent 无需知道
+//     MiniMax 被包装成 grok 协议）；
+//   - 显式指定未配置 provider → 提交前本地拒绝（provider_not_configured），
+//     错误信息列出当前可用通道，绝不发上游请求。
+//
 // openai wire 侧模型统一补 aihubmix- 前缀（探测给的占位自带前缀=no-op；真实裸名由
 // 用户在仓库根 .env 填）。volcengine 侧纯用桥传值，须目录 id / 别名可解析。
 // grok 线（2026-10-16）桥传 daemon 目录 id（按目录定义分发），真实上游模型名在 daemon 侧。
 async function resolveVideoTarget(providerArg, modelArg) {
-  const explicitProvider = providerArg ? normalizeVideoProvider(providerArg) : '';
   const explicitModel = String(modelArg || '').trim();
   const d = await fetchMediaDefaults();
-  const provider = explicitProvider || OD_VIDEO_PROVIDER_ENV || (d && d.videoProvider) || VIDEO_FALLBACK_PROVIDER;
+  const picked = selectVideoProvider({
+    explicit: providerArg,
+    envProvider: OD_VIDEO_PROVIDER_ENV,
+    detected: (d && d.videoProviders) || (d && d.videoProvider ? [d.videoProvider] : []),
+    fallback: VIDEO_FALLBACK_PROVIDER,
+  });
+  const provider = picked.provider;
   const envModel = provider === 'openai'
     ? OD_OPENAI_VIDEO_MODEL_ENV
     : provider === 'grok'
@@ -608,14 +790,17 @@ async function resolveVideoTarget(providerArg, modelArg) {
   } else {
     model = model || VOLCENGINE_FALLBACK_VIDEO_MODEL;
   }
-  return { provider, model };
+  return { provider, model, reason: picked.reason };
 }
 
 // generateVideo 文生视频（t2v）/ 首帧图生视频（i2v，first_frame）：daemon media/generate
 // surface='video'，length 传时长秒数；带 image 时 volcengine/aihubmix 两条 renderer 把它
 // 当首帧（grok 线也会带 image 字段，但 8090 上游忽略它——i2v 不可用，去掉 first_frame 走
 // 纯 t2v）。无白底抠除（图片专属）；产物 mp4 经 downloadFile 落盘，路径语义与 generateImage 一致。
-async function generateVideo({ prompt, aspect, duration_sec: durationSec, provider, model, save_as: saveAs, first_frame: firstFrame }) {
+//
+// 2026-10-24 P0/P1 加固：能力/画幅校验先于请求；带首帧的运动视频必须已批准锚点
+//（审批硬门）；每个 task 落 request/result 清单；缺文件名返回 reconcile_required。
+async function generateVideo({ prompt, aspect, duration_sec: durationSec, provider, model, save_as: saveAs, first_frame: firstFrame, stage }) {
   if (!OD_API_TOKEN) {
     throw new Error('未配置 OD_API_TOKEN（插件 settings.env 缺失）；请检查 .env 后重启后端');
   }
@@ -626,7 +811,23 @@ async function generateVideo({ prompt, aspect, duration_sec: durationSec, provid
     frameFile = resolveReferenceImagePath(firstFrame, 'first_frame');
     if (saveTarget) assertRefNotOutput(saveTarget, frameFile);
   }
-  const { provider: useProvider, model: useModel } = await resolveVideoTarget(provider, model);
+  // 画幅校验（视频侧同样不允许未知比例被静默改方图）。
+  const caps = await mediaCapabilities('video');
+  const useAspect = validateAspect(aspect, caps);
+  if (useAspect && !caps.includes('aspect')) {
+    throw new CapabilityError(`当前视频通道未声明 aspect 能力（已声明 [${caps.join(',')}]）：请去掉 aspect 或换通道`,
+      { requested: useAspect, available: caps });
+  }
+  // 审批硬门：带首帧的运动视频 = 从已批准锚点起跑，未批准不得烧额度。
+  if (frameFile) {
+    assertGateAllows({
+      workdir: WORKSPACE_DIR,
+      stage: normalizeStage(stage || 'inbetween'),
+      refHash: hashBuffer(readFileSync(frameFile.abs)),
+      need: 'anchor',
+    });
+  }
+  const { provider: useProvider, model: useModel, reason } = await resolveVideoTarget(provider, model);
   const startedAtMs = Date.now();
   await ensureProject();
   const frameName = frameFile ? await ensureProjectFileUploaded(frameFile) : null;
@@ -636,17 +837,35 @@ async function generateVideo({ prompt, aspect, duration_sec: durationSec, provid
       surface: 'video',
       model: useModel,
       prompt,
-      ...(aspect ? { aspect } : {}),
+      ...(useAspect ? { aspect: useAspect } : {}),
       ...(durationSec ? { length: durationSec } : {}),
       ...(frameName ? { image: frameName } : {}),
     },
   });
   const taskId = gen?.taskId;
   if (!taskId) throw new Error(`OD 未返回 taskId：${JSON.stringify(gen).slice(0, 300)}`);
-  log('视频任务已受理:', taskId, 'provider=', useProvider, 'model=', useModel);
+  log('视频任务已受理:', taskId, 'provider=', useProvider, `(来源=${reason})`, 'model=', useModel);
+  const requestManifest = {
+    task_id: String(taskId),
+    operation: frameName ? 'i2v' : 't2v',
+    provider: useProvider,
+    provider_reason: reason,
+    model: useModel,
+    prompt_hash: hashString(prompt || ''),
+    reference_hash: frameFile ? hashString(frameFile.rel) : null,
+    aspect: useAspect,
+    duration_sec: durationSec || null,
+    stage: stage || null,
+    requested_at: new Date().toISOString(),
+  };
+  try {
+    writeTaskManifests({ workdir: WORKSPACE_DIR, taskId, request: requestManifest });
+  } catch (err) {
+    log('视频请求清单写入失败（不阻断生成）:', err.message);
+  }
   const task = await waitTask(taskId, { timeoutMs: OD_VIDEO_TIMEOUT_MS, label: '视频', listTool: 'od_video_list' });
-  const fileName = (await extractTaskFile(task)) || (await newestImageFallback(startedAtMs, VIDEO_EXTS));
-  if (!fileName) throw new Error('任务完成但未找到产物文件名');
+  const fileName = await extractTaskFile(task);
+  if (!fileName) throw reconcileRequiredError(taskId);
   const bytes = await downloadFile(fileName);
   const ext = (fileName.match(/\.[a-z0-9]+$/i)?.[0]) || '.mp4';
   let absPath;
@@ -661,6 +880,33 @@ async function generateVideo({ prompt, aspect, duration_sec: durationSec, provid
   }
   mkdirSync(dirname(absPath), { recursive: true });
   writeFileSync(absPath, bytes);
+  const outHash = hashBuffer(bytes);
+  const dup = rememberOutput(outHash, {
+    promptHash: requestManifest.prompt_hash,
+    referenceHash: requestManifest.reference_hash,
+    taskId,
+  });
+  try {
+    writeTaskManifests({
+      workdir: WORKSPACE_DIR, taskId,
+      result: {
+        task_id: String(taskId),
+        status: 'done',
+        file: fileName,
+        workspace_path: relPath,
+        output_hash: outHash,
+        raw_hash: outHash,
+        postprocess_hash: null,
+        width: null,
+        height: null,
+        duplicate_suspect: dup.duplicate,
+        provider: useProvider,
+        model: useModel,
+      },
+    });
+  } catch (err) {
+    log('视频结果清单写入失败（不阻断返回）:', err.message);
+  }
   const elapsedSec = Math.round((Date.now() - startedAtMs) / 1000);
   log('视频已落盘:', relPath, `${bytes.length}B`, `${elapsedSec}s`);
   return {
@@ -668,9 +914,16 @@ async function generateVideo({ prompt, aspect, duration_sec: durationSec, provid
     filename: relPath.split('/').pop(),
     bytes: bytes.length,
     provider: useProvider,
+    provider_reason: reason,
     model: useModel,
     duration_sec: durationSec || 5,
     first_frame: frameName,
+    task_id: taskId,
+    output_hash: outHash,
+    ...(dup.duplicate ? {
+      duplicate_suspect: true,
+      duplicate_hint: `输出与 task ${dup.first && dup.first.taskId} 完全相同但 prompt 不同：可能是上游忽略提示词，不得计为可接受产物。`,
+    } : {}),
     elapsedSec,
     hint: '在 HTML 中以该相对路径（path 字段）用 <video src> 引用此视频',
   };
@@ -723,6 +976,12 @@ server.registerTool('od_image_generate', {
     '满幅背景图（9:16 场景底图等）必须传 remove_bg=false 保留背景。' +
     '图生图（reference）：系列素材先出锚点样图再批量锁一致性——第一张单独生成并保存为锚点（如 assets/img/<系列>-anchor.png），' +
     '确认后其余图带 reference=锚点路径（批量整批共用一张，桥只上传一次），prompt 里用「图一」指代参考图；不传 reference 逐张重绘风格易漂移。' +
+    '【阶段纪律 2026-10-24】stage 声明当前阶段（asset|anchor|keyframe|inbetween）：' +
+    '锚点必须**单张**生成（stage=anchor，不准 prompts 批量盲抽）；关键姿态先 2～4 张（stage=keyframe，需已批准锚点）；' +
+    '未批准锚点/关键姿态时桥会**本地拒绝**进入 inbetween/运动视频（不消耗额度）。' +
+    'operation 缺省按能力自动推导（有 reference 且支持 subject_reference 就走它）；只有声明支持 image_edit/inpaint 的通道才允许局部编辑类请求；' +
+    '不支持的能力/参数（input_fidelity/negative_prompt/seed/扩展画幅）在发上游请求**之前报错**，不会静默丢弃。' +
+    '【确定性修复不重抽】留白、裁切、扩边、去背景、打包等确定性问题用代码/后处理修，禁止换 prompt 重新抽图。' +
     '单张生成约需 1–5 分钟（pro 档较慢），请勿重复提交相同 prompt。',
   inputSchema: {
     prompt: z.string().min(1).optional().describe(
@@ -730,7 +989,19 @@ server.registerTool('od_image_generate', {
     prompts: z.array(z.string().min(1)).min(1).optional().describe(
       '批量模式：prompt 数组，每个元素各生成一张（桥内并发生成，上限 OD_BATCH_CONCURRENCY 默认 3）。帧序列/多素材场景优先用此参数一次提交，' +
       '避免逐张调用各产生一轮 LLM 往返。与 prompt 二选一；空数组报错'),
-    aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例（批量时整批共用），缺省由模型决定'),
+    aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3']).optional().describe(
+      '画幅比例（批量时整批共用），缺省由模型决定。3:2 / 2:3 需通道声明对应能力（aspect_3:2 / aspect_2:3），未声明则本地报错'),
+    operation: z.enum(['t2i', 'subject_reference', 'image_edit', 'inpaint']).optional().describe(
+      '图像操作（缺省按能力自动推导）：t2i=纯文生图；subject_reference=参考图锁主体（当前默认通道的能力）；' +
+      'image_edit/inpaint=真正的局部编辑，**仅在通道声明该能力时可用**（否则本地 capability_unsupported）。' +
+      '要求“只改腿、其它不变”必须走 image_edit/inpaint 通道——subject_reference 没有保真度/遮罩接口。'),
+    stage: z.enum(['asset', 'anchor', 'keyframe', 'inbetween']).optional().describe(
+      '当前媒体阶段（默认 asset）：asset=独立素材；anchor=单张锚点（禁批量）；' +
+      'keyframe=关键姿态（先 2～4 张，需已批准锚点）；inbetween=中间帧（需已批准锚点）。未批准时桥本地拒绝，不消耗额度。'),
+    input_fidelity: z.enum(['low', 'medium', 'high']).optional().describe(
+      '参考图保真度（仅通道声明 input_fidelity 时允许）：锁角色合同/局部编辑时用 medium 以上'),
+    negative_prompt: z.string().optional().describe('负向提示（仅通道声明 negative_prompt 时允许）'),
+    seed: z.number().int().optional().describe('固定随机种子（仅通道声明 seed 时允许）；换姿势保身份时配合参考图用'),
     model: z.string().optional().describe('覆盖默认模型（缺省按 daemon 单点配置自动选择，一般无需指定）'),
     save_as: z.string().optional().describe(
       '单张模式产物落盘的工作目录相对路径（如 assets/img/mon-zombie.png）。目录自动创建；' +
@@ -788,7 +1059,9 @@ server.registerTool('od_video_generate', {
   title: 'Open Design 视频生成',
   description:
     '经本地 open_design 守护进程生成短视频（文生视频 t2v / 首帧图生视频 i2v）。' +
-    'provider 三选一：volcengine=方舟 tasks 协议网关（模型为 daemon 目录 id，自定义接入点由 daemon 的 OD_MEDIA_MODEL_ALIASES 别名改写）；' +
+    '【provider 默认 auto 2026-10-24】省略 provider 或传 auto = 用 daemon 当前已配置通道（桥主动探测，Agent 无需知道 MiniMax 被包装成 grok 协议）；' +
+    '显式指定未配置的 provider 会在提交前**本地拒绝**（provider_not_configured，零额度）并列出当前可用通道——绝不再出现"有可用通道却跑去错误网关鉴权"。' +
+    '兼容旧参数：volcengine=方舟 tasks 协议（模型为 daemon 目录 id）；' +
     'openai=OpenAI /videos 协议网关（模型名任意，.env 配 VIDEO_URL/VIDEO_MODEL；裸名桥自动补 aihubmix- 前缀）；' +
     'grok=OpenAI 同步形状 /videos/generations 网关（BMA 本机 8090 Gemini 桥走这条，缺省模型 grok-imagine-video；该上游忽略画幅/时长/i2v 参数）。' +
     '正式素材务必用 save_as 直落工作目录相对路径（如 assets/video/intro.mp4），一视频一份；缺省落 .bma/od-artifacts（时间戳命名，仅草稿）。' +
@@ -798,13 +1071,18 @@ server.registerTool('od_video_generate', {
     prompt: z.string().min(1).describe('视频描述（建议具体描述主体/动作/镜头运动/风格）'),
     aspect: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional().describe('画幅比例，缺省由模型决定'),
     duration_sec: z.number().int().min(2).max(15).optional().describe('时长秒数，缺省 5；daemon 自动 snap 到模型允许桶（Veo 4/6/8、Sora 4/8/12、Seedance 常用 5/10）'),
-    provider: z.enum(['volcengine', 'openai', 'grok']).optional().describe('网关协议（缺省按 daemon 单点配置自动选择，一般无需指定）'),
+    provider: z.enum(['auto', 'volcengine', 'openai', 'grok']).optional().describe(
+      '网关协议。默认/auto = 按 daemon 当前已配置通道自动选（推荐，协议名属于适配层）；' +
+      '显式指定未配置的 provider 会本地拒绝（provider_not_configured），不发上游请求。'),
+    stage: z.enum(['asset', 'anchor', 'keyframe', 'inbetween']).optional().describe(
+      '当前媒体阶段（默认 asset）。带 first_frame 的运动视频需已批准锚点（stage=inbetween/keyframe 触发本地审批门）。'),
     model: z.string().optional().describe('覆盖默认模型 id（openai 侧给裸模型名即可，桥自动补 aihubmix- 前缀；volcengine/grok 侧须为 daemon 目录 id）'),
     save_as: z.string().optional().describe('产物落盘的工作目录相对路径（如 assets/video/intro.mp4）。目录自动创建；无扩展名时补实际格式；不可含 .. 或盘符'),
     first_frame: z.string().optional().describe(
       '首帧图（图生视频 i2v，可选）：工作目录相对路径，作为视频第一帧；prompt 里用「图一」指代该首帧' +
       '（如「图一中的角色向前走两步，镜头缓慢推进」）。约束同 od_image_generate 的 reference' +
-      '（png/jpg/jpeg/webp/gif、≤16MB、须已存在）。网关不支持 i2v 时任务失败并透传上游错误原文，去掉本参数即回退纯 t2v。'),
+      '（png/jpg/jpeg/webp/gif、≤16MB、须已存在）。网关不支持 i2v 时任务失败并透传上游错误原文，去掉本参数即回退纯 t2v。' +
+      '【审批门】首帧会成为运动先验：未批准锚点（od_media_approve）时本地拒绝，避免在未定稿的角色上烧视频额度。'),
   },
 }, async (args) => {
   try {
@@ -812,6 +1090,35 @@ server.registerTool('od_video_generate', {
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     return { content: [{ type: 'text', text: `od_video_generate 失败: ${err.message}` }], isError: true };
+  }
+});
+
+// od_media_approve：锚点 / 关键姿态审批门（2026-10-24 P1 阶段审批硬门）。
+// 流程约定（工具描述与角色提示词同款）：ShowArtifact 展示 → ask_user 审批 →
+// 用户批准后调用本工具登记，之后才能进入 keyframe/inbetween/运动视频。
+// 门按"被审产物内容 hash"记忆：换参考图（hash 变）即旧批准失效，必须重新审批。
+server.registerTool('od_media_approve', {
+  title: 'Open Design 阶段审批登记',
+  description:
+    '登记锚点/关键姿态的人审结果（stage=anchor|keyframe）。**只能在用户明确批准后调用**；' +
+    '用户拒绝时传 approved=false。桥把审批状态写在 <工作目录>/.bma/media/gates.json（按产物内容 hash 记忆），' +
+    '未批准锚点时 od_image_generate(stage=keyframe/inbetween) 与带首帧的 od_video_generate 会被本地拒绝。' +
+    '换参考图（hash 变）后旧批准自动失效，必须重新展示并审批。',
+  inputSchema: {
+    stage: z.enum(['anchor', 'keyframe']).describe('审批阶段：anchor=锚点立绘；keyframe=关键姿态'),
+    ref: z.string().describe('被审批的产物路径（工作目录相对路径，如 assets/img/anchor.png）'),
+    approved: z.boolean().describe('用户是否批准（拒绝传 false，仍会记录以便审计）'),
+    note: z.string().optional().describe('用户审批意见（可选，落 gates.json 供复盘）'),
+  },
+}, async (args) => {
+  try {
+    const rec = approveGate({
+      workdir: WORKSPACE_DIR, stage: args.stage, ref: args.ref,
+      approved: args.approved, note: args.note,
+    });
+    return { content: [{ type: 'text', text: JSON.stringify({ ok: true, gate: args.stage, ...rec }, null, 2) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `od_media_approve 失败: ${err.message}` }], isError: true };
   }
 });
 

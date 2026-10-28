@@ -124,3 +124,33 @@ func TestApplyDefaults_ContextTokenBudget(t *testing.T) {
 		t.Fatalf("显式配置应保留，got %d", c2.Agent.ContextTokenBudget)
 	}
 }
+
+// TestMemoryWriteModeDefault 长期记忆写入模式（2026-10-24 P0）：默认 shadow；
+// 非法值回落 shadow；显式 off/enforce 保留。
+func TestMemoryWriteModeDefault(t *testing.T) {
+	root, _ := os.Getwd()
+	cfg, err := Load(filepath.Join(root, "..", "..", "..", "config", "config.yaml"))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Memory.WriteMode != "shadow" {
+		t.Fatalf("config.yaml 应默认 memory.write_mode=shadow，got %q", cfg.Memory.WriteMode)
+	}
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(p, []byte("memory:\n  write_mode: OFF\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := Load(p); err != nil || c.Memory.WriteMode != "off" {
+		t.Fatalf("显式 off 应保留（大小写归一），got %q err=%v", c.Memory.WriteMode, err)
+	}
+
+	p2 := filepath.Join(dir, "config2.yaml")
+	if err := os.WriteFile(p2, []byte("memory:\n  write_mode: bogus\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := Load(p2); err != nil || c.Memory.WriteMode != "shadow" {
+		t.Fatalf("非法值应回落 shadow，got %q err=%v", c.Memory.WriteMode, err)
+	}
+}

@@ -4,6 +4,8 @@ import { ElMessage } from 'element-plus'
 import type { WireImage, SessionGear, SessionThinking, TrustMode, Session, SessionRunMode, SessionDirectiveSpec, SessionDirective } from '@/types'
 import { setTrustMode, setSessionGear, setSessionThinking, setSessionPlugins, setSessionSkills, setSessionModel, getSessionDirective, setSessionDirective } from '@/api/session'
 import { useModelSelection } from '@/composables/useModelSelection'
+import { switchModel } from '@/api/models'
+import type { RoleModelStatus } from '@/api/models'
 import { usePluginSelection } from '@/composables/usePluginSelection'
 import { useSkillSelection } from '@/composables/useSkillSelection'
 import { useRouter } from 'vue-router'
@@ -43,6 +45,10 @@ const emit = defineEmits<{
   (e: 'new-session'): void
   (e: 'update-workdir', dir: string): void
   (e: 'stop'): void
+  /** 会话级热设置（档位/思考/信任/模型）切换成功后回写父级会话快照：
+   *  组件重挂（对话↔监控切换、选中子 Agent 再回主会话）时以回写值回显，
+   *  不再弹回旧档。 */
+  (e: 'session-updated', patch: { gear?: SessionGear; thinking?: SessionThinking; trust_mode?: TrustMode; model?: string }): void
 }>()
 
 const content = ref('')
@@ -66,30 +72,50 @@ const placeholderText = computed(() =>
 // 未绑定会话 = 创建选择（localStorage 记忆）；已绑定 = 即时 POST 切档，下一轮按新档选角色。
 const GEAR_STORAGE_KEY = 'bma:newSessionGear'
 const GEAR_LABEL: Record<SessionGear, string> = { fast: '快速', daily: '日常', cluster: '集群' }
+// 档位文案：选择器与输入栏按钮共用（切换后即时可见）。
+const GEAR_DESC: Record<SessionGear, string> = {
+  fast: '文档助手直达',
+  daily: 'DomainAgent 直接执行',
+  cluster: 'Meta 全装编排',
+}
 function normalizeGear(g: string | null | undefined): SessionGear {
   // 历史值 'auto'（规则自动选档，已退役）/未知值：回落默认日常档。
   return g === 'fast' || g === 'daily' || g === 'cluster' ? g : 'daily'
 }
 const gear = ref<SessionGear>(normalizeGear(localStorage.getItem(GEAR_STORAGE_KEY)))
+// 切档请求在途标记：在途期间快照回显 watch 跳过，避免重连补发的旧快照
+// 把用户刚选的新档弹回日常档（POST 成功后父级回写会再触发一次同值 watch，无害）。
+let gearSaving = false
+// 本次打开弹层内是否切过档：驱动"已切换，下次发送生效"常驻提示。
+const gearJustSwitched = ref(false)
 // 绑定会话后以会话快照回显（gear 空 = 未设置，显示默认 daily）。
 watch(
   () => [props.sessionBound, props.session?.gear] as const,
-  ([bound, g]) => { if (bound) gear.value = normalizeGear(g) },
+  ([bound, g]) => { if (bound && !gearSaving) gear.value = normalizeGear(g) },
   { immediate: true },
 )
 
 async function onGearChange(v: SessionGear) {
+  if (v === gear.value && props.sessionBound) return // 点选当前档：不重复提交
   gear.value = v
+  gearJustSwitched.value = true
   if (!props.sessionBound || !props.session) {
     localStorage.setItem(GEAR_STORAGE_KEY, v) // 创建选择：下次开新会话默认上次所选
+    ElMessage.success(`已选${GEAR_LABEL[v]}档（创建新会话时生效）`)
     return
   }
+  gearSaving = true
   try {
     await setSessionGear(props.session.id, v)
-    ElMessage.success(`执行档位已切换为${GEAR_LABEL[v]}档（即时生效，下一轮按新档选角色）`)
+    // 回写父级会话快照：对话↔监控切换等重挂场景不再弹回旧档。
+    emit('session-updated', { gear: v })
+    ElMessage.success(`已切换为${GEAR_LABEL[v]}档，下次发送生效`)
   } catch (e) {
     ElMessage.error('切换执行档位失败：' + (e instanceof Error ? e.message : String(e)))
     gear.value = normalizeGear(props.session.gear)
+    gearJustSwitched.value = false
+  } finally {
+    gearSaving = false
   }
 }
 
@@ -114,6 +140,7 @@ async function onThinkingChange(v: SessionThinking) {
   }
   try {
     await setSessionThinking(props.session.id, v)
+    emit('session-updated', { thinking: v })
     ElMessage.success(`思考强度已切换为 ${v === '' ? '跟随角色默认' : v}（下一次 LLM 调用生效）`)
   } catch (e) {
     ElMessage.error('切换思考强度失败：' + (e instanceof Error ? e.message : String(e)))
@@ -136,6 +163,7 @@ async function onTrustModeChange(mode: TrustMode) {
   try {
     await setTrustMode(props.session.id, mode)
     trustMode.value = mode
+    emit('session-updated', { trust_mode: mode })
     ElMessage.success(`信任模式已切换为 ${mode}（下一工具调用生效）`)
   } catch (e) {
     ElMessage.error('切换信任模式失败：' + (e instanceof Error ? e.message : String(e)))
@@ -163,6 +191,7 @@ async function onSessionModelChange(v: string) {
   }
   try {
     await setSessionModel(props.session.id, v)
+    emit('session-updated', { model: v })
     ElMessage.success(v ? `会话模型已切换为 ${v}（仅本会话，下一次 LLM 调用生效）` : '会话模型已恢复跟随全局配置')
   } catch (e) {
     ElMessage.error('切换会话模型失败：' + (e instanceof Error ? e.message : String(e)))
@@ -704,28 +733,72 @@ watch(
 onUnmounted(() => window.clearTimeout(workDirHintTimer))
 const workDirHint = computed(() => workDirJustChanged.value)
 
-// ── 模型选择（对话栏右下弹层）：角色 → 模型 → 思考强度；切换/新增落 config/models.json ──
+// ── 模型选择（对话栏右下弹层）：本会话模型点选即切 + 全局角色绑定逐行内联切换 ──
 const {
   catalog, loading: modelsLoading,
-  selectedRole, selectedThinking,
-  ensureLoaded, doSwitch, doAdd,
+  ensureLoaded, doAdd,
 } = useModelSelection()
 
 const modelPopoverVisible = ref(false)
-const switching = ref(false)
-// 选中的目标模型条目 ID（切换动作的提交值；打开弹层/切角色时预选当前生效值）。
-const selectedModelId = ref('')
 
-const currentRoleStatus = computed(
-  () => catalog.value?.roles.find((r) => r.role_id === selectedRole.value) ?? null,
-)
+// ── 全局角色绑定（逐行内联，2026-10-23 改版）：每行 = 角色 + 模型下拉 + 思考强度下拉，
+// 选完即 POST（后端含最长 60s 连通性探测；探测期间行上先行展示新值，失败回滚），
+// 取代旧"角色→模型→思考→切换按钮"四步操作；切换结果直接写在行上，不重开弹层。
+// roleOverride 记录行内乐观值；目录强制刷新后以服务端落盘值为准、丢弃本地覆盖。
+const roleOverride = reactive<Record<string, { model_id?: string; thinking?: string }>>({})
+const roleSwitching = reactive<Record<string, boolean>>({})
 
+function roleModelOf(role: RoleModelStatus): string {
+  return roleOverride[role.role_id]?.model_id ?? role.model_id ?? ''
+}
+function roleThinkingOf(role: RoleModelStatus): string {
+  return roleOverride[role.role_id]?.thinking ?? (role.bound ? role.thinking || '' : '')
+}
 // 切换候选：selectable_roles 白名单按目标角色过滤（缺省=全员可用）。
-const switchableModels = computed(() =>
-  (catalog.value?.models ?? []).filter(
-    (m) => !m.selectable_roles || m.selectable_roles.includes(selectedRole.value),
-  ),
-)
+function modelsForRole(roleId: string) {
+  return (catalog.value?.models ?? []).filter(
+    (m) => !m.selectable_roles || m.selectable_roles.includes(roleId),
+  )
+}
+
+async function onRoleModelChange(role: RoleModelStatus, modelId: string) {
+  if (!modelId || roleSwitching[role.role_id]) return
+  const prev = { ...roleOverride[role.role_id] }
+  roleOverride[role.role_id] = { ...prev, model_id: modelId }
+  roleSwitching[role.role_id] = true
+  try {
+    const resp = await switchModel(role.role_id, modelId, roleThinkingOf(role))
+    ElMessage.success(`${role.role_id} 已切换为 ${resp.provider}/${resp.model}`)
+    await ensureLoaded(true)
+    delete roleOverride[role.role_id]
+  } catch (e) {
+    ElMessage.error(`${role.role_id} 切换失败：${e instanceof Error ? e.message : String(e)}`)
+    if (prev.model_id !== undefined || prev.thinking !== undefined) roleOverride[role.role_id] = prev
+    else delete roleOverride[role.role_id]
+  } finally {
+    roleSwitching[role.role_id] = false
+  }
+}
+
+async function onRoleThinkingChange(role: RoleModelStatus, thinking: string) {
+  const modelId = roleModelOf(role)
+  if (!modelId || roleSwitching[role.role_id]) return
+  const prev = { ...roleOverride[role.role_id] }
+  roleOverride[role.role_id] = { ...prev, thinking }
+  roleSwitching[role.role_id] = true
+  try {
+    await switchModel(role.role_id, modelId, thinking)
+    ElMessage.success(`${role.role_id} 思考强度已更新`)
+    await ensureLoaded(true)
+    delete roleOverride[role.role_id]
+  } catch (e) {
+    ElMessage.error(`${role.role_id} 思考强度更新失败：${e instanceof Error ? e.message : String(e)}`)
+    if (prev.model_id !== undefined || prev.thinking !== undefined) roleOverride[role.role_id] = prev
+    else delete roleOverride[role.role_id]
+  } finally {
+    roleSwitching[role.role_id] = false
+  }
+}
 
 // ── 本会话模型一键列表（2026-10-19 改版）：点选即切，替代旧"会话模型"下拉 ──
 // 选择随会话各自记忆：已绑定 = 会话快照 session.model（后端持久化，重开会话仍在）；
@@ -746,29 +819,11 @@ const sessionTopRole = computed(
 )
 
 watch(modelPopoverVisible, (v) => {
-  if (v) ensureLoaded()
-})
-
-// 切角色时把模型/思考档预置为该角色当前生效值（思考档空=跟随角色默认）。
-watch(selectedRole, () => {
-  const role = currentRoleStatus.value
-  selectedModelId.value = role?.model_id ?? ''
-  selectedThinking.value = role?.bound ? role.thinking || '' : ''
-})
-
-async function onSwitchModel() {
-  if (!selectedModelId.value) return
-  switching.value = true
-  try {
-    const resp = await doSwitch(selectedModelId.value)
-    ElMessage.success(`已切换为 ${resp.model}（domain/叶子下次派发、meta 下一会话生效）`)
-    modelPopoverVisible.value = false
-  } catch (e) {
-    ElMessage.error(`切换失败: ${e instanceof Error ? e.message : String(e)}`)
-  } finally {
-    switching.value = false
+  if (v) {
+    gearJustSwitched.value = false
+    ensureLoaded()
   }
-}
+})
 
 // 新增模型对话框（4 字段落盘 models.json，免重启）。
 const addDialogVisible = ref(false)
@@ -788,9 +843,8 @@ async function onAddModel() {
       api_key: addForm.api_key.trim(),
       base_url: addForm.base_url.trim(),
     })
-    ElMessage.success(`已新增 ${resp.id} 到 models.json`)
+    ElMessage.success(`已新增 ${resp.id} 到 models.json（在角色行的模型下拉里选用）`)
     addDialogVisible.value = false
-    selectedModelId.value = resp.id
     addForm.model = ''
     addForm.api_key = ''
     addForm.base_url = ''
@@ -1034,25 +1088,45 @@ function onKeydown(e: KeyboardEvent) {
               </div>
             </div>
           </el-popover>
-          <!-- 模型与会话设置弹层：本会话模型一键点选（各自记住）；本会话设置（档位/思考/信任）；全局角色绑定（收底） -->
-          <el-popover v-model:visible="modelPopoverVisible" placement="top-start" :width="380" trigger="click">
+          <!-- 模型与会话设置弹层：执行档位三段点选（即切即换，下次发送生效）；本会话模型点选；
+               思考/信任；全局角色绑定逐行内联切换（选完即生效，行上直接展示） -->
+          <el-popover v-model:visible="modelPopoverVisible" placement="top-start" :width="400" trigger="click">
           <template #reference>
-            <el-button text size="small" class="!text-ink-2 hover:!text-primary max-w-52 !px-2"
+            <el-button text size="small" class="!text-ink-2 hover:!text-primary max-w-60 !px-2"
                        :class="sessionModel ? '!text-primary' : ''"
-                       title="模型与会话设置：本会话模型点选即切（仅本会话，各自记住）；档位/思考/信任；全局角色绑定">
+                       title="模型与会话设置：档位即切即换（下次发送生效）；角色模型逐行切换，选完即展示">
               <el-icon><Coin /></el-icon>
-              <span class="ml-1 truncate text-xs">{{ sessionModel || sessionTopRole?.model || currentRoleStatus?.model || '模型' }}</span>
+              <span class="ml-1 truncate text-xs">{{ GEAR_LABEL[gear] }}档 · {{ sessionModel || sessionTopRole?.model || '模型' }}</span>
             </el-button>
           </template>
-          <div class="space-y-2 text-xs">
-            <!-- 本会话模型：点选即切（热生效，下一次 LLM 调用）；每个会话各自记住选择，互不串联 -->
+          <div class="space-y-2.5 text-xs">
+            <!-- 执行档位：三段点选即切（热生效，下一轮按新档选角色）；
+                 常驻状态行明确"下次发送生效"，切换后变绿 ✓ -->
             <div>
+              <div class="mb-1 flex items-center justify-between text-ink-2">
+                <span title="快速档=文档助手直达，日常档=DomainAgent 直接执行，集群档=Meta 全装编排">执行档位（本会话）</span>
+                <span class="text-[10px] shrink-0" :class="gearJustSwitched ? 'text-green-500 font-bold' : 'text-ink-3'">
+                  {{ gearJustSwitched ? '✓ 已切换，下次发送生效' : '下次发送按此档执行' }}
+                </span>
+              </div>
+              <div class="grid grid-cols-3 gap-1.5">
+                <button v-for="g in (['fast', 'daily', 'cluster'] as SessionGear[])" :key="g"
+                        type="button" class="gear-option" :class="{ active: gear === g }"
+                        :title="`${GEAR_LABEL[g]}档（${GEAR_DESC[g]}）：点选即切换，下次发送生效`"
+                        @click="onGearChange(g)">
+                  <div class="gear-option-label">{{ GEAR_LABEL[g] }}档</div>
+                  <div class="gear-option-desc">{{ GEAR_DESC[g] }}</div>
+                </button>
+              </div>
+            </div>
+            <!-- 本会话模型：点选即切（热生效，下一次 LLM 调用）；每个会话各自记住选择，互不串联 -->
+            <div class="border-t border-line pt-2">
               <div class="mb-1 flex items-center justify-between text-ink-2">
                 <span title="只影响本会话顶层 Agent；每个会话各自记住自己的选择，切换会话不互相影响">本会话模型（点选即切，仅本会话）</span>
                 <span class="text-[10px] text-ink-3 shrink-0">{{ sessionBound ? '已记住到本会话' : '作为新会话默认' }}</span>
               </div>
               <el-input v-model="modelFilter" size="small" clearable placeholder="搜索模型 id / provider / 名称" />
-              <div class="mt-1.5 max-h-56 overflow-y-auto">
+              <div class="mt-1.5 max-h-44 overflow-y-auto">
                 <div class="model-row" :class="{ active: !sessionModel }" @click="onSessionModelChange('')">
                   <div class="min-w-0">
                     <div class="text-ink truncate">跟随全局配置</div>
@@ -1074,17 +1148,8 @@ function onKeydown(e: KeyboardEvent) {
                 <div v-if="!sessionModelCandidates.length" class="py-3 text-center text-ink-3">无匹配模型</div>
               </div>
             </div>
-            <!-- 本会话设置（自工具栏收编，输入栏精简）：热生效，切换即 POST 后端 -->
-            <div class="border-t border-line pt-2 space-y-2">
-              <div>
-                <div class="mb-1 text-ink-2" title="快速档=文档助手直达，日常档=DomainAgent 直接执行，集群档=Meta 全装编排">执行档位（本会话）</div>
-                <el-select v-model="gear" size="small" class="w-full"
-                           @change="onGearChange($event as SessionGear)">
-                  <el-option value="fast" label="快速档（文档助手直达）" />
-                  <el-option value="daily" label="日常档（DomainAgent 直接执行）" />
-                  <el-option value="cluster" label="集群档（Meta 全装编排）" />
-                </el-select>
-              </div>
+            <!-- 本会话设置：思考强度 / 信任模式（热生效，切换即 POST 后端） -->
+            <div class="border-t border-line pt-2 grid grid-cols-2 gap-2">
               <div>
                 <div class="mb-1 text-ink-2" title="只影响本会话顶层 Agent；运行中可改，下一次 LLM 调用生效">思考强度（本会话）</div>
                 <el-select v-model="thinking" size="small" class="w-full"
@@ -1106,40 +1171,37 @@ function onKeydown(e: KeyboardEvent) {
                 </el-select>
               </div>
             </div>
-            <!-- 全局角色绑定：写入 models.json role_bindings，改变所有「跟随全局配置」会话的默认模型 -->
+            <!-- 全局角色绑定：逐行内联（角色 | 模型下拉 | 思考强度下拉），选完即 POST 生效，
+                 行上直接展示新绑定；当前档的顶层角色带"本档顶层"徽标 -->
             <div class="border-t border-line pt-2">
-              <div class="mb-1 text-[10px] text-ink-3" title="写入 config/models.json role_bindings；只影响选择「跟随全局配置」的会话">全局角色绑定（影响所有会话的默认）</div>
-              <div class="space-y-2">
-                <div>
-                  <div class="mb-1 text-ink-2">角色</div>
-                  <el-select v-model="selectedRole" size="small" class="w-full"
-                             placeholder="选择角色" :loading="modelsLoading">
-                    <el-option v-for="r in catalog?.roles || []" :key="r.role_id" :value="r.role_id"
-                               :label="`${r.role_id}（${r.provider}/${r.model}）`" />
-                  </el-select>
-                </div>
-                <div>
-                  <div class="mb-1 text-ink-2">模型</div>
-                  <el-select v-model="selectedModelId" size="small" class="w-full" filterable
-                             placeholder="选择模型" :loading="modelsLoading">
-                    <el-option v-for="m in switchableModels" :key="m.id" :value="m.id"
+              <div class="mb-1 text-[10px] text-ink-3" title="写入 config/models.json role_bindings；只影响选择「跟随全局配置」的会话">全局角色绑定（影响所有会话的默认 · 选完即生效）</div>
+              <div class="space-y-1.5">
+                <div v-for="r in catalog?.roles || []" :key="r.role_id" class="role-row">
+                  <div class="flex items-center gap-1 min-w-0" :title="`${r.role_id} 当前绑定 ${r.provider}/${r.model}`">
+                    <span class="role-name">{{ r.role_id }}</span>
+                    <span v-if="TOP_ROLE_BY_GEAR[gear] === r.role_id"
+                          class="text-[9px] px-1 rounded shrink-0 bg-primary-soft text-primary">本档顶层</span>
+                  </div>
+                  <el-select :model-value="roleModelOf(r)" size="small" class="role-model-select" filterable
+                             :loading="!!roleSwitching[r.role_id]"
+                             :placeholder="`${r.provider}/${r.model}`"
+                             @update:model-value="onRoleModelChange(r, $event as string)">
+                    <el-option v-for="m in modelsForRole(r.role_id)" :key="m.id" :value="m.id"
                                :label="`${m.id} · ${m.provider}/${m.model}`" />
                   </el-select>
-                </div>
-                <div>
-                  <div class="mb-1 text-ink-2">思考强度（角色绑定）</div>
-                  <el-select v-model="selectedThinking" size="small" class="w-full">
-                    <el-option value="" label="跟随角色默认" />
+                  <el-select :model-value="roleThinkingOf(r)" size="small" class="role-thinking-select"
+                             :disabled="!roleModelOf(r) || !!roleSwitching[r.role_id]"
+                             title="角色绑定的思考强度（需先绑定模型）"
+                             @update:model-value="onRoleThinkingChange(r, $event as string)">
+                    <el-option value="" label="跟随" />
                     <el-option v-for="t in ['off', 'low', 'medium', 'high']" :key="t" :value="t" :label="t" />
                   </el-select>
                 </div>
-                <div class="flex items-center justify-between pt-1">
-                  <el-button link type="primary" size="small" @click="addDialogVisible = true">＋ 新增模型</el-button>
-                  <el-button type="primary" size="small" :loading="switching"
-                             :disabled="!selectedModelId" @click="onSwitchModel">
-                    切换
-                  </el-button>
-                </div>
+                <div v-if="!catalog?.roles?.length && !modelsLoading" class="py-2 text-center text-ink-3">角色目录加载失败，重开弹层重试</div>
+              </div>
+              <div class="flex items-center justify-between pt-2">
+                <el-button link type="primary" size="small" @click="addDialogVisible = true">＋ 新增模型</el-button>
+                <span class="text-[10px] text-ink-3">切换含连通性探测，失败自动回滚</span>
               </div>
             </div>
           </div>
@@ -1327,6 +1389,59 @@ function onKeydown(e: KeyboardEvent) {
 .model-row.active {
   border-color: var(--bma-primary);
   background: var(--bma-primary-soft);
+}
+/* 执行档位三段点选：选中项主色描边，悬停软底 */
+.gear-option {
+  border: 1px solid var(--bma-border);
+  border-radius: 6px;
+  padding: 5px 4px 4px;
+  text-align: center;
+  cursor: pointer;
+  background: transparent;
+  color: var(--bma-text);
+  line-height: 1.25;
+}
+.gear-option:hover {
+  background: var(--bma-primary-soft);
+}
+.gear-option.active {
+  border-color: var(--bma-primary);
+  background: var(--bma-primary-soft);
+}
+.gear-option.active .gear-option-label {
+  color: var(--bma-primary);
+}
+.gear-option-label {
+  font-weight: bold;
+  font-size: 12px;
+}
+.gear-option-desc {
+  font-size: 10px;
+  color: var(--bma-text-3);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 全局角色绑定行：角色名 | 模型下拉（自适应） | 思考强度下拉（窄） */
+.role-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) 64px;
+  align-items: center;
+  gap: 6px;
+}
+.role-name {
+  font-weight: 600;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.role-model-select {
+  width: 100%;
+}
+.role-thinking-select {
+  width: 64px;
 }
 .hidden {
   display: none;

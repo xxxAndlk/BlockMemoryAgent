@@ -449,10 +449,62 @@ CREATE TABLE IF NOT EXISTS session_boards (
 	return err
 }
 
+// EnsureLongTermMemorySchema 创建长期记忆生命周期两张表（幂等；对应 migrations/019）。
+//
+// 2026-10-24 长期记忆撤回与污染修复：用户画像/项目经验从 Markdown 自然语言行升级为
+// **有条目 ID 的条目**（items 当前状态投影 + events 只追加审计流），撤回=状态标记，
+// 才能在用户纠正的当轮把旧条目从注入视图里摘掉，并且不依赖会被裁剪的 Markdown 归档。
+// 硬约定：两张表都带 owner；events 只追加，items 状态只 UPDATE，不物理删行。
+func EnsureLongTermMemorySchema(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS long_term_memory_items (
+    id              TEXT PRIMARY KEY,
+    owner           VARCHAR(64) NOT NULL DEFAULT '',
+    scope           VARCHAR(16) NOT NULL,
+    project_key     TEXT NOT NULL DEFAULT '',
+    memory_key      TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    status          VARCHAR(16) NOT NULL DEFAULT 'candidate',
+    origin          VARCHAR(24) NOT NULL DEFAULT 'evolver',
+    verification    VARCHAR(16) NOT NULL DEFAULT 'unverified',
+    source_session  TEXT NOT NULL DEFAULT '',
+    source_message  TEXT NOT NULL DEFAULT '',
+    revision        BIGINT NOT NULL DEFAULT 1,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS long_term_memory_events (
+    id              BIGSERIAL PRIMARY KEY,
+    owner           VARCHAR(64) NOT NULL DEFAULT '',
+    memory_id       TEXT,
+    event_type      VARCHAR(24) NOT NULL,
+    actor           VARCHAR(16) NOT NULL,
+    source_session  TEXT NOT NULL DEFAULT '',
+    source_message  TEXT NOT NULL DEFAULT '',
+    reason          TEXT NOT NULL DEFAULT '',
+    payload         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_long_term_memory_active_key
+    ON long_term_memory_items(owner, scope, project_key, memory_key)
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_long_term_memory_effective
+    ON long_term_memory_items(owner, scope, project_key, status, memory_key);
+CREATE INDEX IF NOT EXISTS idx_long_term_memory_hash
+    ON long_term_memory_items(owner, scope, project_key, content_hash);
+CREATE INDEX IF NOT EXISTS idx_long_term_memory_events_item
+    ON long_term_memory_events(owner, memory_id, id);
+`)
+	return err
+}
+
 // EnsureSessionDecisionsSchema 自动创建 session_decisions 会话决策账本表（幂等）。
 // 2026-10-22 上下文事故修复：用户指令/路线/参考基准/否决从对话历史独立出来，
 // 每轮固定注入、不参与压缩；append-only，状态只 UPDATE（active/superseded/rejected）。
 // owner 多租户预留（硬约定：新表带 owner 列）。
+// 2026-10-24 多轴账本（migrations/018）：新增 axis / source_message_id 列——同轴才互斥，
+// 跨轴互不覆盖；老库走 ALTER TABLE IF NOT EXISTS（幂等，不删历史行）。
 func EnsureSessionDecisionsSchema(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS session_decisions (
@@ -460,14 +512,21 @@ CREATE TABLE IF NOT EXISTS session_decisions (
     session_id    VARCHAR(64) NOT NULL,
     owner         VARCHAR(64) NOT NULL DEFAULT '',
     kind          VARCHAR(32) NOT NULL DEFAULT 'user_directive',
+    axis          VARCHAR(32) NOT NULL DEFAULT '',
     content       TEXT NOT NULL,
     source        VARCHAR(32) NOT NULL DEFAULT '',
+    source_message_id VARCHAR(128) NOT NULL DEFAULT '',
     status        VARCHAR(16) NOT NULL DEFAULT 'active',
     superseded_by BIGINT NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE session_decisions
+    ADD COLUMN IF NOT EXISTS axis VARCHAR(32) NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS source_message_id VARCHAR(128) NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_session_decisions_session
     ON session_decisions (session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_session_decisions_axis
+    ON session_decisions (session_id, axis, status, id DESC);
 `)
 	return err
 }

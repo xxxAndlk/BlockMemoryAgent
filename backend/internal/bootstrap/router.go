@@ -101,6 +101,13 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/fs/pick-dir", apiHandler.PickDirHandler)                       // 系统原生目录选择框（服务端主机）
 	api.GET("/profile", apiHandler.ProfileHandler)                            // 用户画像查看（TODO #28）
 	api.PUT("/profile", apiHandler.SaveProfileHandler)                        // 用户画像编辑
+	// 长期记忆条目管理（2026-10-24 撤回与污染修复 §9.1）：只改状态、不物理删历史。
+	api.GET("/memory/items", apiHandler.ListMemoryItemsHandler)                                      // 有效/候选/隔离/替换/撤回条目
+	api.GET("/memory/items/:id", apiHandler.GetMemoryItemHandler)                                    // 单条详情
+	api.GET("/memory/items/:id/events", apiHandler.ListMemoryItemEventsHandler)                       // 事件时间线（只追加审计）
+	api.POST("/memory/items/:id/retract", apiHandler.RetractMemoryItemHandler)                        // 撤回
+	api.POST("/memory/items/:id/quarantine", apiHandler.QuarantineMemoryItemHandler)                  // 隔离（立即不注入）
+	api.POST("/memory/items/:id/restore", apiHandler.RestoreMemoryItemHandler)                        // 恢复（针对具体条目）
 	api.GET("/project/preferences", apiHandler.ProjectPreferencesHandler)     // 项目偏好查看（2026-09-02 设计 §5）
 	api.PUT("/project/preferences", apiHandler.SaveProjectPreferencesHandler) // 项目偏好编辑
 	api.GET("/project/tester-config", apiHandler.TesterConfigHandler)         // 测试助手验收开关查看（工作目录级）
@@ -182,6 +189,9 @@ func apiHandlerOf(app *App) *server.APIHandler {
 	h.SetSkillConsolidation(app.SkillConsolidation)   // 技能库整理（C 库存治理，未装配时端点 503）
 	h.SetSkillReforge(app.SkillReforge)               // 技能重铸（薄技能治理，未装配时端点 503）
 	h.SetMemoryConsolidation(app.MemoryConsolidation) // 块记忆库整理（2026-10-13，未装配时端点 503）
+	if lc, ok := app.Agent.(interface{ MemoryLifecycle() *agent.MemoryLifecycle }); ok {
+		h.SetMemoryLifecycle(lc.MemoryLifecycle()) // 长期记忆条目管理（未装配时端点 503）
+	}
 	h.SetExternalAgentProvider(app.ExternalAgentList, app.ExternalAgentReload) // 外部 Agent 管理面（未装配时端点 503）
 	return h
 }

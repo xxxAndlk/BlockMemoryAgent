@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { Session, SessionEvent, AgentNode, ClarifyPending, WireImage, SessionGear, SessionThinking, SessionDirectiveSpec } from '@/types'
+import type { Session, SessionEvent, AgentNode, ClarifyPending, WireImage, SessionGear, SessionThinking, TrustMode, SessionDirectiveSpec } from '@/types'
 import type { AgentMailItem } from '@/api/session'
 import ChatHeader from './components/ChatHeader.vue'
 import MessageList from './components/MessageList.vue'
@@ -47,6 +47,8 @@ const emit = defineEmits<{
   'clarify-submitted': []
   'update-clarify-drafts': [drafts: string[]]
   'update-workdir': [dir: string]
+  /** 会话级热设置（档位/思考/信任/模型）切换成功，回写会话快照（防组件重挂弹回旧值） */
+  'session-updated': [patch: { gear?: SessionGear; thinking?: SessionThinking; trust_mode?: TrustMode; model?: string }]
   refresh: []
 }>()
 
@@ -102,6 +104,7 @@ const showStatusLine = computed(() =>
                  @submit="(c: string, i: WireImage[], f: File[], g: SessionGear, t: SessionThinking, p: string[], sk: string[], d: SessionDirectiveSpec | null, m: string) => emit('submit', c, i, f, g, t, p, sk, d, m)"
                  @new-session="emit('new-session')"
                  @update-workdir="(d: string) => emit('update-workdir', d)"
+                 @session-updated="(p) => emit('session-updated', p)"
                  @stop="emit('stop')" />
     </template>
   </div>

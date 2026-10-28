@@ -120,14 +120,14 @@ func TestEvolveSessionThreeOutputs(t *testing.T) {
 		return nil
 	}
 	s.evolver = func(ctx context.Context, in EvolveInput) (*EvolveOutput, error) {
-		if in.Outcome != "failed" {
+		if in.Outcome != "success" {
 			t.Errorf("outcome should pass through, got %q", in.Outcome)
 		}
 		if in.Goal == "" || in.UserMessages == "" || in.EventsDigest == "" {
 			t.Errorf("evolve input incomplete: goal=%q msgs=%d digest=%d", in.Goal, len(in.UserMessages), len(in.EventsDigest))
 		}
 		return &EvolveOutput{
-			UserPrefs:      []string{"偏好简洁输出"},
+			UserPrefs:      []string{"以后所有输出都用中文，记住这个偏好"},
 			ProjectLessons: []string{"渲染动画帧前先统一去白底"},
 			Skills: []EvolvedSkill{{
 				Name: "frame-render-dedup", Title: "动画帧渲染去重",
@@ -137,9 +137,9 @@ func TestEvolveSessionThreeOutputs(t *testing.T) {
 		}, nil
 	}
 
-	s.evolveSession(newEvolverTestSession(6), "failed")
+	s.evolveSession(newEvolverTestSession(6), "success")
 
-	if got := profile.Current().Content; !strings.Contains(got, "偏好简洁输出") || !strings.Contains(got, "## 反馈记录") {
+	if got := profile.Current().Content; !strings.Contains(got, "以后所有输出都用中文") || !strings.Contains(got, "## 反馈记录") {
 		t.Fatalf("user prefs should land in archive section, got: %q", got)
 	}
 	if got := project.Current(context.Background()).Content; !strings.Contains(got, "渲染动画帧前先统一去白底") || !strings.Contains(got, "## 经验归档") {
@@ -148,8 +148,8 @@ func TestEvolveSessionThreeOutputs(t *testing.T) {
 	if len(sunkSkills) != 1 || sunkSkills[0].Name != "frame-render-dedup" {
 		t.Fatalf("skill sink should receive 1 skill, got %+v", sunkSkills)
 	}
-	if sunkOutcome != "failed" {
-		t.Fatalf("skill sink outcome = %q, want failed", sunkOutcome)
+	if sunkOutcome != "success" {
+		t.Fatalf("skill sink outcome = %q, want success", sunkOutcome)
 	}
 	for _, want := range []string{"user_pref", "project_lesson"} {
 		found := false

@@ -906,6 +906,27 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	//（防上下文膨胀/偏好泄露；项目偏好例外，见下）。
 	// 双路写入：remember_preference 工具（用户显式陈述，立即生效）+ 会话完成轻量模型提取。
 	// Merge 整理（2026-09-02 期 1）：提取增量经轻量模型去重/冲突归档进偏好/技术栈/沟通风格小节。
+	// 长期记忆生命周期（2026-10-24 撤回与污染修复）：items/events 权威在 PG，
+	// 注入只读 status=active 的有效视图，用户明确撤回在**当轮**生效。
+	// PG 不可用时退化为内存实现（撤回语义仍可验证，重启后从 Markdown 重新导入）。
+	var memoryLifecycle *agent.MemoryLifecycle
+	{
+		var repo store.MemoryRepo
+		if pgStore != nil && pgStore.DB() != nil {
+			if err := store.EnsureLongTermMemorySchema(ctx, pgStore.DB()); err != nil {
+				closeStores(pgStore, redisStore)
+				return nil, fmt.Errorf("ensure long-term memory schema: %w", err)
+			}
+			repo = store.NewLongTermMemoryStore(pgStore.DB())
+		} else {
+			repo = store.NewMemoryLongTermStore()
+		}
+		memoryLifecycle = agent.NewMemoryLifecycle(repo, cfg.Memory.RetractionMode)
+		if mm := newMemoryMatcher(modelFactory); mm != nil {
+			memoryLifecycle.SetMatcher(mm)
+		}
+		agentSvc.SetMemoryLifecycle(memoryLifecycle)
+	}
 	var profileStore *userprofile.Store
 	if paths.ProfilePath != "" {
 		profileStore = userprofile.NewStore(paths.ProfilePath)
@@ -922,13 +943,28 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		})
 		toolRegistry.SetUserProfileHook(func(ctx context.Context, text string) error {
 			// 记忆出处（2026-10-23）：附带来源会话短标签，便于回溯这条偏好的来龙去脉。
-			return profileStore.AppendWithSource("偏好", text, userprofile.SessionSource(tool.SessionIDFromContext(ctx)))
+			if err := profileStore.AppendWithSource("偏好", text, userprofile.SessionSource(tool.SessionIDFromContext(ctx))); err != nil {
+				return err
+			}
+			// 结构化条目（2026-10-24）：显式偏好同时写 items，才具备稳定 ID/可撤回/防复活。
+			// 激活前过防复活检查：命中已撤回的旧结论则落 candidate（不进入注入视图）。
+			if memoryLifecycle != nil {
+				writeExplicitMemoryItem(ctx, memoryLifecycle, store.MemoryScopeUser, "",
+					store.MemoryOriginExplicitTool, text)
+			}
+			return nil
 		})
 		// SessionEvolver（2026-09-02 设计 §6.1）：会话结束一次轻量模型调用产出三类沉淀。
 		// 未接线 ProfilePath 时不进化（画像是一切偏好的宿主）。
 		agentSvc.SetEvolver(func(ctx context.Context, in agent.EvolveInput) (*agent.EvolveOutput, error) {
 			return evolveSessionLLM(ctx, modelFactory, in)
 		})
+		// 长期记忆写入模式（2026-10-24 P0）：默认 shadow——候选只进 evolution_log，
+		// 不改 user_profile.md / 项目偏好 / 经验技能；确保“一次性任务指令不晋升长期记忆”。
+		agentSvc.SetMemoryWriteMode(cfg.Memory.WriteMode)
+		// 旧 Markdown 记忆 -> 结构化条目（幂等，仅作用域为空时导入一次）：
+		// 归档小节只导入为 tombstone、自动行标 legacy_import、人工行可 active。
+		importMemoryFromMarkdown(memoryLifecycle, paths.ProfilePath, store.MemoryScopeUser, "")
 		skillSink := newLearnedSkillSink(pgStore.LearnedSkills,
 			filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"), skillPool, cfg.Skills.MaxCount,
 			cfg.Skills.EvictColdDays, cfg.Skills.EvictIdleDays, cfg.Skills.EvictIdleMaxUse, modelFactory)
@@ -988,12 +1024,29 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		log.Printf("[bootstrap] load project preferences failed (non-fatal): %v", err)
 	} else {
 		agentSvc.SetProjectPreferencesStore(projectPrefsStore)
+		importMemoryFromMarkdown(memoryLifecycle, filepath.Join(workDir, ".bma", "project_preferences.md"),
+			store.MemoryScopeProject, workDir)
 		subAgentDispatcher.WithProjectPreferences(func(ctx context.Context) string {
+			// 2026-10-24：注入只读长期记忆有效视图（status=active，带紧凑 ID），
+			// 已被用户撤回/隔离的条目物理缺席；未装配生命周期时回落 Markdown（旧语义）。
+			if memoryLifecycle != nil && memoryLifecycle.Enabled() {
+				pk := store.NormalizeProjectKey(tool.WorkDirFromContext(ctx))
+				if block := memoryLifecycle.EffectiveBlock(ctx, "", pk, 2400); block != "" {
+					return block
+				}
+			}
 			// 注入侧剥归档小节（经验归档）：已废止经验只留磁盘审计，不污染子 Agent。
 			return userprofile.StripSection(projectPrefsStore.Current(ctx).Content, projectPrefsStore.ArchiveSection())
 		})
 		toolRegistry.SetProjectPreferenceHook(func(ctx context.Context, text string) error {
-			return projectPrefsStore.Append(ctx, "项目约定", text)
+			if err := projectPrefsStore.Append(ctx, "项目约定", text); err != nil {
+				return err
+			}
+			if memoryLifecycle != nil {
+				writeExplicitMemoryItem(ctx, memoryLifecycle, store.MemoryScopeProject,
+					store.NormalizeProjectKey(tool.WorkDirFromContext(ctx)), store.MemoryOriginHuman, text)
+			}
+			return nil
 		})
 	}
 	// 经验技能召回（设计 §6.5）：MetaAgent 新任务 goal 与子 Agent 派发 task 均做向量
@@ -1768,10 +1821,12 @@ func newEventSummarizer(f *model.ModelFactory) memory.EventSummarizer {
 
 // newHistorySummarizer 构造一个 memory.HistorySummarizer，供层级压缩（压缩金字塔）使用：
 // merge=false 把新滑出保留段的中段历史压成结构化压缩包；merge=true 把若干旧压缩包
-// 合并为一个更粗的包。压缩笔记三件套（TODO #21①，KC v0.23.0 同款直接抄终点）：
-// 【已定决策】【后续步骤】【可预见的障碍】；另保留【文件要点】节——
-// 压缩丢已读文件内容导致领域 Agent 失忆、反复重读同一文件（实测单领域 Agent 两小时
-// ReadFile 610 次 + SearchInFiles 351 次），读到的文件关键事实必须随压缩包存活。
+// 合并为一个更粗的包。摘要只保留执行状态（2026-10-24 P1，计划 §5.2）：
+// 【执行状态】【产物】【失败与未验证】【文件要点】——
+// 用户决策不再由摘要器生成（旧版【已定决策】节会从工具记录里反推出不存在的新目标），
+// 权威来源是 session_decisions 指令账本。
+// 【文件要点】节保留的原因：压缩丢已读文件内容导致领域 Agent 失忆、反复重读同一文件
+//（实测单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）。
 // 压缩前自盘提醒（TODO #21②，KC v0.41.0 同款）：提示先自盘状态再出包，摘要质量前置增益。
 // 看板/台账注入段在压缩视图之外常驻（wrapMetaMemory 尾部注入，压缩不触碰），
 // 随摘要天然保留（KC v0.41.0 同款语义，核实项）。
@@ -1780,26 +1835,41 @@ func newHistorySummarizer(f *model.ModelFactory) memory.HistorySummarizer {
 	if f == nil {
 		return nil
 	}
-	const threePiece = "四节结构：" +
-		"【已定决策】已拍板的结论与用户明确要求（含约束）；" +
-		"【后续步骤】未完成事项与已完成工作的关键文件路径；" +
-		"【可预见的障碍】已识别的坑/风险/依赖（如配置缺失、接口未定、待验证假设）；" +
-		"【文件要点】已读文件的关键事实：路径 + 行号区间 + 函数签名/常量值/结论（此节必须保留，防压缩后失忆重读）。"
 	return func(ctx context.Context, text string, merge bool) (string, error) {
-		// 压缩前自盘提醒：先盘状态再出包，防直接生成时丢三件套骨架。
-		preamble := "先自盘状态（已定决策/后续步骤/可预见的障碍），然后输出压缩包。"
-		var prompt string
-		if merge {
-			prompt = preamble + "以下是一个 Agent 会话的若干历史压缩包（按时间从旧到新）。把它们合并为一个结构化压缩包，" +
-				"500 字以内，保持" + threePiece +
-				"保留仍然有效的结论、文件路径与文件要点，" +
-				"丢弃已被推翻或完成清理的内容。直接输出压缩包，不要解释：\n" + text
-		} else {
-			prompt = preamble + "将以下 Agent 对话中段历史压成一个结构化压缩包，500 字以内，" + threePiece +
-				"直接输出压缩包，不要解释：\n" + text
-		}
-		return f.CallLightweightWithRetry(ctx, prompt)
+		return f.CallLightweightWithRetry(ctx, historySummarizerPrompt(text, merge))
 	}
+}
+
+// 压缩摘要四节结构（2026-10-24 P1，计划 §5.2）：
+// 摘要器**不再拥有决策权**——旧版本要求生成【已定决策】"已拍板的结论与用户明确要求"，
+// 模型于是从工具记录里反推出"用户要求压缩历史"这类从未存在的目标，写进摘要后每轮
+// 全文注入（§2.7 事故形态）。用户决策的唯一权威是 session_decisions（每轮固定注入、
+// 不参与压缩）；摘要只负责"执行状态"这类会自然过期的事实。
+const (
+	summaryStructure = "四节结构：" +
+		"【执行状态】已完成的动作、未完成事项、当前阻塞；" +
+		"【产物】产出文件路径与用途（有 task_id/hash 就一并保留）；" +
+		"【失败与未验证】真实报错原文、尚未证明的假设；" +
+		"【文件要点】已读文件的关键事实：路径 + 行号区间 + 函数签名/常量值/结论（此节必须保留，防压缩后失忆重读）。"
+	summaryRules = "纪律：只记录发生过的事实，不得发明用户目标/用户决策/验收口径" +
+		"（用户决策由服务端指令账本另行权威注入，此处写进去会被当成新指令）。"
+	summaryPreamble = "先自盘状态（已完成/未完成/阻塞），然后输出压缩包。"
+)
+
+// historySummarizerPrompt 构造压缩包生成提示词（单测可断言"不产生决策"的契约）。
+// merge=true 时额外携带当前否决轴：合并旧包不得复活已被用户否决的方案。
+func historySummarizerPrompt(text string, merge bool) string {
+	var prompt string
+	if merge {
+		prompt = summaryPreamble + "以下是一个 Agent 会话的若干历史压缩包（按时间从旧到新）。把它们合并为一个压缩包，" +
+			"500 字以内，保持" + summaryStructure + summaryRules +
+			"保留仍然有效的文件路径与文件要点；已在【已否决】里列出的方案不得写成现行有效结论；" +
+			"丢弃已完成的临时步骤。直接输出压缩包，不要解释：\n" + text
+	} else {
+		prompt = summaryPreamble + "将以下 Agent 对话中段历史压成一个压缩包，500 字以内，" + summaryStructure +
+			summaryRules + "直接输出压缩包，不要解释：\n" + text
+	}
+	return prompt
 }
 
 // registryStartupWarnings 检查注册表绑定引用的模型条目是否存在，

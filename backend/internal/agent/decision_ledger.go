@@ -50,7 +50,10 @@ func sessionDecisionCacheOf(session *reactInternalSession) *sessionDecisionCache
 const decisionCacheMax = 96
 
 // decisionBlockMaxRunes 注入块总长上限（长会话也不能把上下文挤爆）。
-const decisionBlockMaxRunes = 1400
+// 2026-10-24：1400 → 2200——多轴账本需要同时容纳「各轴现行决策 + 最新指令 + 审批门 +
+// 验收标准」，旧预算下这些必留段放不下，而旧实现是最后整体截尾，恰好砍掉最新指令。
+// 现在由 assembleLedger 按优先级装配：必留段先占，可选段放不下就整段跳过。
+const decisionBlockMaxRunes = 2200
 
 // decisionContentMaxRunes 单条账本内容上限。取值放宽到 4000：任务书全文要能进账本
 // （首条 user 消息被压缩掉时，账本是唯一还带路线原文的锚）；注入侧只渲染 routeHeadline
@@ -60,7 +63,7 @@ const decisionContentMaxRunes = 4000
 // routeDirectiveMarkers 路线级改向标记：命中即视为"用户在改方向"，会废止上一条路线。
 // 保守取值：只认明确的改向/选型语气，避免"渲染给我看"这类动作句误判成新路线。
 var routeDirectiveMarkers = []string{
-	"改用", "换成", "改成", "不要用", "别用", "不再用", "不用", "排除", "取消", "作废",
+	"改用", "换成", "改成", "不要用", "别用", "不再用", "不用", "不走", "排除", "取消", "作废",
 	"不是", "而是", "正确做法", "要到这种", "这种类型", "继续之前", "使用", "采用",
 	"要用", "必须用", "得用", "按这个做", "按这个来", "就用", "替换为", "替代",
 }
@@ -235,10 +238,19 @@ func (s *ReactService) SetDecisionStore(st *store.SessionDecisionStore) {
 
 // recordDecision 追加一条账本记录（best-effort：落库失败只告警，不影响主流程）。
 // 语义：
-//   - 路线级指令（isRouteDirective）→ 旧 active route 全部 superseded；
+//   - 路线级指令（isRouteDirective）→ **同轴**旧 active route superseded（2026-10-24 多轴账本）；
 //   - 用户否定（isNegativeFeedback）→ 写 rejection 并把 active route 标 rejected；
 //   - 内容里出现参考产物路径 → 额外写 reference（验收基准）。
 func (s *ReactService) recordDecision(ctx context.Context, session *reactInternalSession, kind, content, source string) {
+	s.recordDecisionAxis(ctx, session, kind, "", content, source)
+}
+
+// recordDecisionAxis 追加一条带决策轴的账本记录（2026-10-24 多轴账本）。
+//
+// axis 为空时按内容自动分类（classifyDecisionAxis）；显式传入用于审批门等无法从
+// 文本推断的场景（approval_anchor / approval_keyframe）。
+// 轴语义见 doc/计划_媒体动画与记忆质量修复.md §5.1：同轴互斥、跨轴同时有效。
+func (s *ReactService) recordDecisionAxis(ctx context.Context, session *reactInternalSession, kind, axis, content, source string) {
 	if session == nil {
 		return
 	}
@@ -250,17 +262,33 @@ func (s *ReactService) recordDecision(ctx context.Context, session *reactInterna
 	if kind == "" {
 		kind = store.DecisionKindDirective
 	}
-	if isNegativeFeedback(content) {
+	axis = strings.TrimSpace(axis)
+	if axis == "" {
+		axis = classifyDecisionAxis(content)
+	}
+	switch {
+	case isNegativeFeedback(content):
+		// 否决作用于"当前成果/做法"，不落具体轴——否则一句"这个动作不对"会误撤
+		// 视角、审批门、验收标准等其他维度的约束。
 		kind = store.DecisionKindRejection
-	} else if kind == store.DecisionKindDirective && isRouteDirective(content) {
+		axis = store.AxisGeneral
+	case kind == store.DecisionKindCriteria:
+		axis = store.AxisAcceptance
+	case kind == store.DecisionKindPlan || kind == store.DecisionKindReference:
+		axis = store.AxisGeneral
+	case (kind == store.DecisionKindDirective || kind == store.DecisionKindClarify) &&
+		isConstraintAxis(axis):
+		// 约束轴上的任何用户表述都算该轴的"现行选择"（不只是命中改向关键词的句子）：
+		// "动画用 16 帧图集""视角就按正面 45 度"同样要成为该轴的现行约束，
+		// 否则后一句"重新 AI 生图"就没东西可共存，多轴语义形同虚设。
 		kind = store.DecisionKindRoute
 	}
 
 	dc := sessionDecisionCacheOf(session)
 	dc.mu.Lock()
-	// 去重：最近 8 条里同 kind 同内容不重复写（重启/重跑/多入口重复调用）。
+	// 去重：最近 8 条里同 kind 同轴同内容不重复写（重启/重跑/多入口重复调用）。
 	for i := len(dc.items) - 1; i >= 0 && i >= len(dc.items)-8; i-- {
-		if dc.items[i].Kind == kind && dc.items[i].Content == content {
+		if dc.items[i].Kind == kind && dc.items[i].Axis == axis && dc.items[i].Content == content {
 			dc.mu.Unlock()
 			return
 		}
@@ -268,6 +296,7 @@ func (s *ReactService) recordDecision(ctx context.Context, session *reactInterna
 	d := store.SessionDecision{
 		SessionID: session.ID,
 		Kind:      kind,
+		Axis:      axis,
 		Content:   content,
 		Source:    source,
 		Status:    store.DecisionStatusActive,
@@ -279,7 +308,7 @@ func (s *ReactService) recordDecision(ctx context.Context, session *reactInterna
 		if id, err := s.decisionStore.Append(ictx, d); err == nil {
 			d.ID = id
 		} else {
-			log.Printf("[decision] append failed session=%s kind=%s err=%v", session.ID, kind, err)
+			log.Printf("[decision] append failed session=%s kind=%s axis=%s err=%v", session.ID, kind, axis, err)
 		}
 		cancel()
 	}
@@ -294,14 +323,15 @@ func (s *ReactService) recordDecision(ctx context.Context, session *reactInterna
 			if i == self {
 				continue
 			}
-			if dc.items[i].Kind == store.DecisionKindRoute &&
+			if dc.items[i].Kind == store.DecisionKindRoute && dc.items[i].Axis == axis &&
 				dc.items[i].Status == store.DecisionStatusActive {
 				dc.items[i].Status = store.DecisionStatusSuperseded
 			}
 		}
 		if s.decisionStore != nil {
 			ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-			_, _ = s.decisionStore.Supersede(ictx, session.ID, []string{store.DecisionKindRoute}, d.ID)
+			// 2026-10-24：只替换**同轴**的旧路线（SupersedeAxis），不再一刀切。
+			_, _ = s.decisionStore.SupersedeAxis(ictx, session.ID, axis, d.ID, []string{store.DecisionKindRoute})
 			cancel()
 		}
 	case store.DecisionKindRejection:
@@ -316,14 +346,36 @@ func (s *ReactService) recordDecision(ctx context.Context, session *reactInterna
 			_, _ = s.decisionStore.MarkRejected(ictx, session.ID, []string{store.DecisionKindRoute})
 			cancel()
 		}
+	case store.DecisionKindDirective:
+		// 审批门同轴只留最新一条（重新审批 / 撤回批准）：旧审批标 superseded，
+		// 不物理删，历史可查；否则同一轴会有两条 active 行、注入侧要猜以哪条为准。
+		if axis != store.AxisApprovalAnchor && axis != store.AxisApprovalKeyframe {
+			break
+		}
+		self := len(dc.items) - 1
+		for i := range dc.items {
+			if i == self {
+				continue
+			}
+			if dc.items[i].Kind == store.DecisionKindDirective && dc.items[i].Axis == axis &&
+				dc.items[i].Status == store.DecisionStatusActive {
+				dc.items[i].Status = store.DecisionStatusSuperseded
+			}
+		}
+		if s.decisionStore != nil {
+			ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			_, _ = s.decisionStore.SupersedeAxis(ictx, session.ID, axis, d.ID, []string{store.DecisionKindDirective})
+			cancel()
+		}
 	}
 	// 参考产物 → 验收基准（独立行，供 decisionBlock 单独置顶）。
 	if kind == store.DecisionKindDirective || kind == store.DecisionKindClarify ||
 		kind == store.DecisionKindRoute || kind == store.DecisionKindRejection {
-		for _, p := range extractReferencePaths(content) {
+		refs := extractReferencePaths(content)
+		for _, p := range refs {
 			ref := store.SessionDecision{
-				SessionID: session.ID, Kind: store.DecisionKindReference, Content: p,
-				Source: source, Status: store.DecisionStatusActive, CreatedAt: time.Now(),
+				SessionID: session.ID, Kind: store.DecisionKindReference, Axis: store.AxisGeneral,
+				Content: p, Source: source, Status: store.DecisionStatusActive, CreatedAt: time.Now(),
 			}
 			if s.decisionStore != nil {
 				ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
@@ -333,6 +385,11 @@ func (s *ReactService) recordDecision(ctx context.Context, session *reactInterna
 				cancel()
 			}
 			dc.items = append(dc.items, ref)
+		}
+		// 换参考资产才使旧审批门失效（规则 6）：改路线/换动画方式不得隐式清掉批准。
+		if kind == store.DecisionKindRoute && len(refs) > 0 &&
+			(axis == store.AxisIdentity || axis == store.AxisAssetSource) {
+			s.invalidateApprovalsLocked(ctx, session.ID, dc, refs)
 		}
 	}
 	if len(dc.items) > decisionCacheMax {
@@ -379,6 +436,13 @@ func (s *ReactService) hydrateDecisions(ctx context.Context, session *reactInter
 }
 
 // decisionBlock 渲染每轮注入的【用户指令账本】。空账本返回空串（零注入）。
+//
+// 2026-10-24 多轴版本（P1）：
+//   - 按决策轴渲染"现行决策"：同轴只留最新，跨轴同时有效（视角/审批门/验收标准
+//     不因"重新 AI 生图"之类指令被隐式清除）；
+//   - 预算裁剪确定性：必留段（规则/各轴/最新指令/审批门/验收标准）先装配，
+//     可选段（旧参考/已废止/最近指令）放不下就整段跳过——绝不最后整体尾巴一刀切
+//     （那会恰好砍掉最新指令，是 10-22 事故的成因之一）。
 func (s *ReactService) decisionBlock(session *reactInternalSession) string {
 	if session == nil {
 		return ""
@@ -390,24 +454,33 @@ func (s *ReactService) decisionBlock(session *reactInternalSession) string {
 	if len(decisions) == 0 {
 		return ""
 	}
-	var current *store.SessionDecision
 	var firstDirective *store.SessionDecision
-	var criteria *store.SessionDecision
-	var superseded, rejected []store.SessionDecision
-	var refs []store.SessionDecision
+	var criteria, latestRoute *store.SessionDecision
+	var superseded, rejected, refs []store.SessionDecision
+	// axisCurrent：轴 → 最新 active 路线行（同轴互斥后理论上唯一，兜底取最后一条）。
+	axisCurrent := map[string]*store.SessionDecision{}
+	axisOrder := make([]string, 0, 4)
 	for i := range decisions {
 		d := &decisions[i]
 		switch d.Kind {
 		case store.DecisionKindRoute:
 			switch d.Status {
 			case store.DecisionStatusActive:
-				current = d
+				latestRoute = d
+				if _, ok := axisCurrent[d.Axis]; !ok {
+					axisOrder = append(axisOrder, d.Axis)
+				}
+				axisCurrent[d.Axis] = d
 			case store.DecisionStatusSuperseded:
 				superseded = append(superseded, *d)
 			case store.DecisionStatusRejected:
 				rejected = append(rejected, *d)
 			}
 		case store.DecisionKindDirective:
+			// 审批门以普通指令行承载（content=approved/rejected ref=...）。
+			if d.Axis == store.AxisApprovalAnchor || d.Axis == store.AxisApprovalKeyframe {
+				continue
+			}
 			if firstDirective == nil {
 				firstDirective = d
 			}
@@ -419,56 +492,127 @@ func (s *ReactService) decisionBlock(session *reactInternalSession) string {
 			}
 		}
 	}
+
 	var b strings.Builder
 	b.WriteString("【用户指令账本】（服务端维护·不参与压缩·最高优先级）\n")
 	b.WriteString("规则：本块与任何压缩摘要/项目偏好/用户画像/项目经验冲突时，一律以本块为准。")
-	b.WriteString("若当前工作方向与本块【现行路线】不一致，必须停下来说明冲突并 ask_user 确认，禁止直接按旧方向继续。\n")
-	if current != nil {
-		b.WriteString("【现行路线】" + routeHeadline(current.Content, 420) + "\n")
+	b.WriteString("【现行决策】按轴独立：同一轴内以最新为准，不同轴同时有效；")
+	b.WriteString("除非用户明确撤销，不得自行清除某轴的约束（视角/审批门/验收标准）。")
+	b.WriteString("若当前工作方向与本块【现行路线】不一致，必须停下来说明冲突并 ask_user 确认。\n")
+	header := b.String()
+
+	var sections []ledgerSection
+	sections = append(sections, ledgerSection{required: true, text: header})
+
+	// 现行路线（最新 active route 的短摘录，兼容既有注入语义）。
+	var routeText string
+	if latestRoute != nil {
+		routeText = "【现行路线】" + routeHeadline(latestRoute.Content, 420) + "\n"
 		// 任务书全文由首条 user 消息承载；只在"这条路线就是任务书"或摘录确实短于原文时提示，
 		// 避免模型以为账本被截断而去文件系统/临时目录里找"完整账本"。
-		if current.Source == "goal" || utf8.RuneCountInString(current.Content) > 420 {
-			b.WriteString("（任务书全文见会话首条用户消息，始终有效；本行只摘录路线要点）\n")
+		if latestRoute.Source == "goal" || utf8.RuneCountInString(latestRoute.Content) > 420 {
+			routeText += "（任务书全文见会话首条用户消息，始终有效；本行只摘录路线要点）\n"
 		}
 	} else if firstDirective != nil {
-		b.WriteString("【最初目标·可能已被后续指令修订】" + routeHeadline(firstDirective.Content, 300) + "\n")
+		routeText = "【最初目标·可能已被后续指令修订】" + routeHeadline(firstDirective.Content, 300) + "\n"
 	}
-	// 验收标准锚（2026-10-23）：计划批准时提取，随后续压缩不丢失——"验收口径"本来就是
-	// 最容易被压缩摘要吞掉、又最不该丢的部分。
+	sections = append(sections, ledgerSection{text: routeText})
+
+	// 各轴现行约束（必留）。
+	if len(axisOrder) > 0 {
+		var ab strings.Builder
+		ab.WriteString("【现行决策·按轴】（同轴只留最新，跨轴同时有效）\n")
+		for _, axis := range axisOrder {
+			d := axisCurrent[axis]
+			if d == nil {
+				continue
+			}
+			label := axisLabel(axis)
+			if label == "" {
+				// 无轴路线（isRouteDirective 命中但内容不属任何约束轴，如"就要用这个"）：
+				// 退化为"其他约束"而不是空标签，避免输出 "- ：…"。
+				label = "其他约束"
+			}
+			ab.WriteString("- " + label + "：" + routeHeadline(d.Content, 120) + "\n")
+		}
+		sections = append(sections, ledgerSection{required: true, text: ab.String()})
+	}
+
+	// 审批门（必留）：只要有审批轴记录就必须出现——未批准不得进入下一阶段。
+	var gateText string
+	for _, d := range decisions {
+		if d.Kind != store.DecisionKindDirective ||
+			(d.Axis != store.AxisApprovalAnchor && d.Axis != store.AxisApprovalKeyframe) {
+			continue
+		}
+		if d.Status != store.DecisionStatusActive {
+			continue
+		}
+		label := axisLabel(d.Axis)
+		state := approvalStateOf(d.Content)
+		ref := approvalRef(d.Content)
+		line := "【审批门】" + label + " = " + state
+		if ref != "" {
+			line += "（参考：" + ref + "）"
+		}
+		if state != "approved" {
+			line += " —— 未批准禁止进入下一阶段（keyframe/inbetween/运动视频本地拒绝）"
+		}
+		gateText += line + "\n"
+	}
+	sections = append(sections, ledgerSection{required: true, text: gateText})
+
+	// 验收标准锚（必留）。
+	var criteriaText string
 	if criteria != nil {
-		b.WriteString("【验收标准·已批准计划】" + ledgerEllipsis(criteria.Content, 400) + "\n")
-		b.WriteString("（交付前逐条对照；缺项不得以文字说明代替）\n")
+		criteriaText = "【验收标准·已批准计划】" + ledgerEllipsis(criteria.Content, 400) + "\n" +
+			"（交付前逐条对照；缺项不得以文字说明代替）\n"
 	}
+	sections = append(sections, ledgerSection{required: true, text: criteriaText})
+
+	// 已否决（可选）。
+	var rejText string
 	for _, d := range rejected {
-		b.WriteString("【已否决·禁止继续】" + ledgerEllipsis(d.Content, 120) + "（" + d.CreatedAt.Format("01-02 15:04") + "）\n")
+		rejText += "【已否决·禁止继续】" + ledgerEllipsis(d.Content, 120) + "（" + d.CreatedAt.Format("01-02 15:04") + "）\n"
 	}
-	if len(rejected) > 0 {
-		b.WriteString("【行动要求】当前路线已被用户否决：停止在旧方案上继续修补；先向用户确认新方向，或严格按【验收基准】重做。\n")
+	if rejText != "" {
+		rejText += "【行动要求】当前路线已被用户否决：停止在旧方案上继续修补；先向用户确认新方向，或严格按【验收基准】重做。\n"
 	}
-	// 已废止路线保留最近 2 条（每条 100 runes）：让模型知道"这条路被用户改掉了"，
-	// 又不把整段旧指令灌回上下文（2026-10-22 用户反馈：已否决内容本身也是污染）。
+	sections = append(sections, ledgerSection{text: rejText})
+
+	// 已废止（可选）：最近 2 条，让模型知道"这条路被用户改掉了"。
 	if len(superseded) > 2 {
 		superseded = superseded[len(superseded)-2:]
 	}
+	var supText string
 	for _, d := range superseded {
-		b.WriteString("【已废止·禁止再采用】" + truncateRunes(d.Content, 100) + "（" + d.CreatedAt.Format("01-02 15:04") + "）\n")
+		tag := ""
+		if label := axisLabel(d.Axis); label != "" {
+			tag = "[" + label + "]"
+		}
+		supText += "【已废止·禁止再采用】" + tag + truncateRunes(d.Content, 100) + "（" + d.CreatedAt.Format("01-02 15:04") + "）\n"
 	}
+	sections = append(sections, ledgerSection{text: supText})
+
+	// 验收基准·参考产物（可选）。
+	var refText string
 	if len(refs) > 0 {
-		// 保留最近 3 条；每条整行输出（路径本身就是短串），不做"半句截断"。
 		if len(refs) > 3 {
 			refs = refs[len(refs)-3:]
 		}
-		b.WriteString("【验收基准·用户给的参考产物】\n")
+		refText = "【验收基准·用户给的参考产物】\n"
 		seen := map[string]bool{}
 		for _, r := range refs {
 			if seen[r.Content] {
 				continue
 			}
 			seen[r.Content] = true
-			b.WriteString("- " + ledgerEllipsis(r.Content, 200) + "\n")
+			refText += "- " + ledgerEllipsis(r.Content, 200) + "\n"
 		}
 	}
-	// 最近指令（旧→新）：三类都列，最后一条最新。跳过 reference（上面已单列）。
+	sections = append(sections, ledgerSection{text: refText})
+
+	// 最近用户指令（可选）：三类都列，最后一条最新。跳过 reference（上面已单列）。
 	type row struct {
 		ts   time.Time
 		tag  string
@@ -479,7 +623,13 @@ func (s *ReactService) decisionBlock(session *reactInternalSession) string {
 		var tag string
 		switch d.Kind {
 		case store.DecisionKindDirective:
+			if d.Axis == store.AxisApprovalAnchor || d.Axis == store.AxisApprovalKeyframe {
+				continue
+			}
 			tag = "指令"
+			if label := axisLabel(d.Axis); label != "" {
+				tag = label
+			}
 		case store.DecisionKindRoute:
 			tag = "路线"
 		case store.DecisionKindClarify:
@@ -509,14 +659,16 @@ func (s *ReactService) decisionBlock(session *reactInternalSession) string {
 	if len(rows) > 5 {
 		rows = rows[len(rows)-5:]
 	}
+	var recentText string
 	if len(rows) > 0 {
-		b.WriteString("【最近用户指令（旧→新，最后一条最新）】\n")
+		recentText = "【最近用户指令（旧→新，最后一条最新）】\n"
 		for _, r := range rows {
-			b.WriteString("- " + r.ts.Format("01-02 15:04") + " [" + r.tag + "] " + ledgerEllipsis(r.text, 120) + "\n")
+			recentText += "- " + r.ts.Format("01-02 15:04") + " [" + r.tag + "] " + ledgerEllipsis(r.text, 120) + "\n"
 		}
 	}
-	out := strings.TrimRight(b.String(), "\n")
-	return ledgerEllipsis(out, decisionBlockMaxRunes)
+	sections = append(sections, ledgerSection{text: recentText})
+
+	return assembleLedger(sections, decisionBlockMaxRunes)
 }
 
 // planConflictWarning 在计划审批卡生成前比对"计划路线 vs 现行路线"，命中互斥主题

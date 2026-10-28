@@ -9,6 +9,8 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev && npm cache clean --force
 COPY server.js ./
+# media-core.js：能力路由/产物清单/审批门的确定性策略层（2026-10-24）。
+COPY media-core.js ./
 
 # stdio MCP server：stdout 只承载 JSON-RPC 帧，日志一律 stderr。
 ENTRYPOINT ["node", "server.js"]

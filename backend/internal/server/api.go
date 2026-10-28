@@ -80,6 +80,9 @@ type APIHandler struct {
 	skillReforge func(ctx context.Context, name string) (string, error)
 	// memoryConsolidation 块记忆库整理器（2026-10-13）：手动触发一轮近重复合并/零访问归档，返回摘要。
 	memoryConsolidation func(ctx context.Context) (string, error)
+	// memoryLifecycle 长期记忆生命周期服务（2026-10-24 撤回与污染修复）：
+	// 条目列表/详情/事件时间线 + 撤回/隔离/恢复。未注入时端点 503。
+	memoryLifecycle *agent.MemoryLifecycle
 	// roleEvolution 角色自进化准则存储（窄接口，*store.RoleEvolutionStore 实现；未注入端点 503）。
 	roleEvolution roleEvolutionStoreOps
 	// roleRegistry 角色注册表（角色全集与显示名来源；未注入端点 503）。

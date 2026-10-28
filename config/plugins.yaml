@@ -182,6 +182,11 @@ plugins:
         OD_API_TOKEN: ${OD_API_TOKEN:}
         # 缺省产物（未传 save_as 的草稿）返回给 Agent 的宿主侧相对路径前缀（相对工作目录）。
         OD_OUTPUT_REL_PREFIX: .bma/od-artifacts
+        # 能力声明：仓库根 .env 的 IMAGE_CAPABILITIES / VIDEO_CAPABILITIES 经下面这组
+        # ${VAR:} 插值进桥容器环境（daemon 的 /api/media/config 会把未知字段丢弃，
+        # 所以能力不经 daemon 探测）。未声明=空 → 桥用保守默认集。
+        OD_IMAGE_CAPABILITIES: ${IMAGE_CAPABILITIES:}
+        OD_VIDEO_CAPABILITIES: ${VIDEO_CAPABILITIES:}
         # ---- 媒体模型/网关 = 单点配置（2026-10-14）----
         # 唯一手改点 = **仓库根 .env 媒体段**（IMAGE_PROVIDER / IMAGE_URL / IMAGE_MODEL /
         # IMAGE_KEY；VIDEO_PROVIDER / VIDEO_URL / VIDEO_MODEL / VIDEO_KEY），改完运行
@@ -192,6 +197,21 @@ plugins:
         # OD_VIDEO_PROVIDER / OD_*_VIDEO_MODEL 行即恢复"env 最优先"，但会重新引入第二
         # 配置源，仅排障用。桥内默认超时：图 600s / 视频 720s（< exec_timeout_sec 1200s）。
         # volcengine 视频模型的真实名须经 OD_MEDIA_MODEL_ALIASES（也在仓库根 .env）改写。
+        #
+        # ---- 2026-10-24 媒体质量修复（计划_媒体动画与记忆质量修复 P0/P1）----
+        # 工具面新增/变化：
+        #   od_image_generate：operation(t2i|subject_reference|image_edit|inpaint)、
+        #     input_fidelity / negative_prompt / seed（仅通道声明时允许）、stage(asset|anchor|
+        #     keyframe|inbetween)、扩展画幅 3:2 / 2:3。不支持的能力/参数**发上游前本地拒绝**。
+        #   od_video_generate：provider 默认 auto（删去不再推荐显式指定）；显式未配置 provider
+        #     本地拒绝 provider_not_configured。
+        #   od_media_approve（新）：锚点/关键姿态人审登记；未批准锚点时 keyframe/inbetween
+        #     与带首帧的视频被本地拒绝（gates.json 按产物内容 hash 记忆，换图即失效）。
+        # 产物对账：每个 task 落 <工作目录>/.bma/media/<task_id>/{request,result}.json；
+        # 已删除"取项目最新文件"兜底（缺文件名 → reconcile_required + task_id）。
+        # 能力声明：仓库根 .env 的 IMAGE_CAPABILITIES / VIDEO_CAPABILITIES（entrypoint 写入
+        # daemon provider 槽的 capabilities，桥一并探测）；未声明 = 保守默认集（不宣称
+        # image_edit/inpaint）。改动桥代码后须重建 bma/open-design-mcp:local 并换 keeper。
       roles: ["meta","domain","ui_assistant"]
       # 1200s：批量 20+ 张 × 单张最长 60s ÷ 桥内并发 3 ≈ 8min，见上方注释。
       exec_timeout_sec: 1200

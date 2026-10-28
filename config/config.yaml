@@ -25,6 +25,21 @@ http:
   auth_enabled: false                     # 是否启用 Token 鉴权（推荐生产环境开启）
   auth_token: ${BMA_API_TOKEN:""}        # API Token，建议通过环境变量注入
 
+# 长期记忆写入模式（2026-10-24 媒体/记忆质量修复 P0）
+# SessionEvolver 会话结束会产出「用户偏好 / 项目经验 / 经验技能」三类候选；离线审计实测
+# 一次性任务指令、试验参数、失败半成品被自动晋升成长期记忆并每轮回注，污染现行上下文。
+#   off     不跑进化，不写偏好/项目经验/经验技能；
+#   shadow  允许生成候选，只写 evolution_log（审计可查），不改 user_profile.md /
+#            project_preferences.md / skills_learned/ / learned_skills 表（第一版默认）；
+#   enforce 允许写入，且必须通过确定性准入门（长期意图/已验证/未否决/可复用）。
+memory:
+  write_mode: shadow
+  # 撤回模式（2026-10-24 长期记忆撤回与污染修复）：enforce=用户明确撤回/替换/隔离
+  # **当轮**执行（不等会话结束）。与 write_mode 解耦：shadow/off 只禁止新候选晋升，
+  # 不得停掉撤回——否则 shadow 防住了新污染，却让已被用户推翻的旧条目一直注入。
+  # 紧急回滚口：off（仅在撤回服务故障时临时使用）。
+  retraction_mode: enforce
+
 # Agent 运行时动态参数
 agent:
   # 测试助手交付验收开关（2026-09-12）为工作目录级配置，不在本文件：

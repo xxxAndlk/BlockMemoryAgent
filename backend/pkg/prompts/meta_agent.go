@@ -217,6 +217,13 @@ message_type=request) 问：「你本人慢还是你下拆的叶子慢？给出�
    spec 须钉死「锚点样图+参考图」路线：先出一张锚点样图落 assets/img/<系列>-anchor.png
    并看图确认（验收口径一并钉死），其余素材批量带 reference=锚点路径锁一致性、不逐张
    重绘；仅用户明确要求纯程序化或 ui_design 不可用才选纯 canvas 并写明理由；贴图路线
+   【媒体阶段纪律（2026-10-24）】美术任务 spec 里须钉死阶段与审批门：锚点**单张**
+   生成→ShowArtifact→ask_user 审批（问题以「【资产审批·anchor】」开头、detail 写
+   「产物：<路径>」）→od_media_approve 登记→才允许关键姿态（先 2～4 张）/中间帧/
+   运动视频；禁止把「整批 16 帧一次抽完」写进 spec。视频调用一律不带 provider
+   （auto），显式指定未配置 provider 只会被本地拒绝，不要据此判断模型强弱。
+   角色合同（参考图/配色/体型）在 spec 里冻结，子 Agent 不得改写；「只改某部位」
+   需求须在 spec 声明必须具备 image_edit/inpaint 能力，通道不支持就上报而不是硬凑。
    须声明资源加载层改动范围。
 - 同波多领域用 call_sub_agents 一次给齐（domain 名唯一，按职责细分命名防同名
    拒派）；call_sub_agent 只用于单个追加派发（返工/补缺）。多文件创建类任务必须

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"           // 用于包装和格式化错误信息
+	"log"           // 用于非法配置回落时的告警
 	"os"            // 用于读取配置文件与获取环境变量
 	"path/filepath" // 用于定位同目录下的拆分配置文件
 	"strings"       // 用于字符串切分、裁剪等处理
@@ -472,6 +473,18 @@ type MemoryConfig struct {
 	WriteBatchSize     int `yaml:"write_batch_size"`     // 单批写入的最大记忆条数
 	WriteFlushInterval int `yaml:"write_flush_interval"` // 定时刷新间隔（秒）
 	SnapshotInterval   int `yaml:"snapshot_interval"`    // 快照持久化间隔（秒）
+	// WriteMode 长期记忆（SessionEvolver 三类沉淀）写入模式（2026-10-24 媒体/记忆质量修复）：
+	//   off     不跑 SessionEvolver，不写偏好/项目经验/经验技能；
+	//   shadow  允许生成候选但只写 evolution_log，不改 user_profile.md /
+	//           project_preferences.md / skills_learned / learned_skills（第一版默认）；
+	//   enforce 允许写入，且必须过确定性准入门（不是仅靠 LLM 自评）。
+	// 空值按配置层默认 shadow 填充；非法值回落 shadow 并告警。
+	WriteMode string `yaml:"write_mode"`
+	// RetractionMode 用户撤回的执行模式（2026-10-24 长期记忆撤回与污染修复）：
+	//   enforce（默认）用户明确撤回/替换/隔离**当轮**执行，与 WriteMode 解耦——
+	//           write_mode=off/shadow 只禁止新候选进入现行记忆，不得停掉撤回；
+	//   off      紧急回滚口：不处理撤回（旧条目继续注入，仅用于撤回服务故障时）。
+	RetractionMode string `yaml:"retraction_mode"`
 }
 
 // Load 从指定路径读取 YAML 配置文件并构造 *Config。
@@ -766,6 +779,28 @@ func (c *Config) applyMemoryDefaults() {
 	}
 	if c.Memory.SnapshotInterval == 0 {
 		c.Memory.SnapshotInterval = 300
+	}
+	// 长期记忆写入模式（2026-10-24）：第一版默认 shadow（只出候选、不落现行记忆）。
+	// 非法值不启动失败——记忆写入策略回落到最保守的 shadow，避免手误把污染重新打开。
+	switch strings.ToLower(strings.TrimSpace(c.Memory.WriteMode)) {
+	case "off", "shadow", "enforce":
+		c.Memory.WriteMode = strings.ToLower(strings.TrimSpace(c.Memory.WriteMode))
+	case "":
+		c.Memory.WriteMode = "shadow"
+	default:
+		log.Printf("[config] memory.write_mode=%q 非法（可选 off|shadow|enforce），回落 shadow", c.Memory.WriteMode)
+		c.Memory.WriteMode = "shadow"
+	}
+	// 撤回模式（2026-10-24）：默认 enforce——撤回是用户明确指令，不能因为
+	// write_mode 关掉了自动沉淀就一并失效。
+	switch strings.ToLower(strings.TrimSpace(c.Memory.RetractionMode)) {
+	case "off", "enforce":
+		c.Memory.RetractionMode = strings.ToLower(strings.TrimSpace(c.Memory.RetractionMode))
+	case "":
+		c.Memory.RetractionMode = "enforce"
+	default:
+		log.Printf("[config] memory.retraction_mode=%q 非法（可选 off|enforce），回落 enforce", c.Memory.RetractionMode)
+		c.Memory.RetractionMode = "enforce"
 	}
 }
 

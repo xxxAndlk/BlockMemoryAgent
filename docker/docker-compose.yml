@@ -73,6 +73,31 @@ services:
       retries: 12
       start_period: 10s
 
+  # MiniMax 媒体适配桥（2026-10-23，docker/minimax-media）。
+  # 作用：把 MiniMax（含 M Plan 订阅 Key）的生图/生视频端点翻译成 open_design daemon
+  # 认识的两种协议——图像走 custom-image 的 OpenAI /images/generations，视频走 grok 线的
+  # /videos/generations + 轮询。daemon 与 ui_design 桥因此零改动，切换只在仓库根 .env
+  # 媒体段（见 .env「通道 D」）。
+  # 常驻但空闲：没有请求时零开销；未选通道时存在也无害。
+  # 容器间地址（写进 IMAGE_URL / VIDEO_URL）：http://minimax-media:8787/v1
+  # 宿主调试口：http://127.0.0.1:8787/health（不回显 key）。
+  minimax-media:
+    build: ./minimax-media
+    image: bma/minimax-media:local
+    container_name: bma-minimax-media
+    restart: unless-stopped
+    env_file:
+      - path: ../.env
+        required: false
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
 volumes:
   # 固定卷名（不带 compose 项目前缀）：兼容项目名定死为 bma 之前以默认
   # 项目名 docker 创建的存量卷（docker_postgres_data/docker_redis_data），

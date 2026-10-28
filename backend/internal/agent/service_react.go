@@ -117,6 +117,13 @@ type ReactService struct {
 	// decisionStore 会话决策账本存储（2026-10-22 上下文事故修复）：用户指令/路线/
 	// 参考基准/否决落 PG，每轮固定注入，不参与压缩。为 nil 时账本仅内存生效。
 	decisionStore *store.SessionDecisionStore
+	// memoryLifecycle 长期记忆生命周期（2026-10-24 撤回与污染修复）：
+	// 当轮撤回 + 有效视图注入 + 防复活。nil 时回落到 Markdown 画像/偏好注入（旧语义）。
+	memoryLifecycle *MemoryLifecycle
+	// memoryWriteMode 长期记忆写入模式（2026-10-24）：off|shadow|enforce，见
+	// memory_write_mode.go。空值按 enforce 解释（保持直接构造的老代码/单测语义），
+	// bootstrap 按 config.memory.write_mode 注入（线上默认 shadow）。
+	memoryWriteMode string
 	// sharedMemoryStore 可选的共享记忆 KV,用于话题切换时写入旧话题摘要。
 	// key 格式 `topic:{topicID}:summary`。为 nil 时跳过摘要写入(测试场景)。
 	// MetaAgent 在新话题召回该摘要依赖步骤 4 part C(MetaAgent 根 recall 注入,未做)。
@@ -364,6 +371,39 @@ func (s *ReactService) SetUserProfileStore(st *userprofile.Store) {
 	s.userProfile = st
 }
 
+// SetMemoryLifecycle 注入长期记忆生命周期服务（bootstrap 装配）。
+// 注入后：① 用户消息入口当轮处理撤回/替换/隔离；
+// ② MetaAgent 与子 Agent 注入改用有效视图（只读 active 条目，带紧凑 ID）；
+// ③ 显式偏好写入与进化激活前做防复活检查。nil 时退回 Markdown 注入（旧语义）。
+func (s *ReactService) SetMemoryLifecycle(lc *MemoryLifecycle) {
+	s.memoryLifecycle = lc
+}
+
+// MemoryLifecycle 返回已装配的生命周期服务（管理 API/测试用；可能为 nil）。
+func (s *ReactService) MemoryLifecycle() *MemoryLifecycle { return s.memoryLifecycle }
+
+// applyMemoryRetraction 在**真实用户消息**入口执行长期记忆撤回（2026-10-24）。
+// 只处理用户原话：Agent 文本、工具结果、压缩摘要没有撤回权。
+// best-effort：失败只告警（不得假报成功，交由 memory_reconcile_required 提示）。
+func (s *ReactService) applyMemoryRetraction(ctx context.Context, session *reactInternalSession, text, source string) MemoryReport {
+	if s.memoryLifecycle == nil || session == nil {
+		return MemoryReport{}
+	}
+	sc := MemoryScopeContext{
+		ProjectKey: session.currentWorkDir(),
+		SessionID:  session.ID,
+	}
+	report := s.memoryLifecycle.HandleUserMessage(ctx, sc, text, source)
+	if report.Handled || report.ReconcileRequired {
+		msg := report.String()
+		if msg == "" {
+			msg = "长期记忆撤回处理中"
+		}
+		s.store.addEvent(session, eventkind.System, "System", "【长期记忆】"+msg, "", "", "", "", "", true)
+	}
+	return report
+}
+
 // SetProfileExtractor 注入会话完成时的偏好提取回调（轻量模型扫对话）。
 // 传 nil 关闭自动提取（默认关闭）；显式写入（remember_preference / SaveProfile）不受影响。
 func (s *ReactService) SetProfileExtractor(fn func(ctx context.Context, text string) ([]string, error)) {
@@ -420,7 +460,17 @@ func (s *ReactService) SaveProjectPreferences(ctx context.Context, content strin
 	if s.projectPrefs == nil {
 		return fmt.Errorf("project preferences store not wired")
 	}
-	return s.projectPrefs.Save(ctx, content)
+	if err := s.projectPrefs.Save(ctx, content); err != nil {
+		return err
+	}
+	// 同 SaveProfile：项目偏好的人工编辑也走条目同步（新增/移除均留痕）。
+	if s.memoryLifecycle != nil && s.memoryLifecycle.Enabled() {
+		if _, _, err := s.memoryLifecycle.SyncHumanEdit(ctx, "",
+			store.MemoryScopeProject, tool.WorkDirFromContext(ctx), content); err != nil {
+			log.Printf("[memory-lifecycle] sync human project prefs edit failed (non-fatal): %v", err)
+		}
+	}
+	return nil
 }
 
 // SetPluginVisibility 注入插件工具角色可见性回调（设计文档 §4.3）。
@@ -581,7 +631,17 @@ func (s *ReactService) SaveProfile(ctx context.Context, content string) error {
 	if s.userProfile == nil {
 		return fmt.Errorf("user profile store not wired")
 	}
-	return s.userProfile.Save(content)
+	if err := s.userProfile.Save(content); err != nil {
+		return err
+	}
+	// 2026-10-24：人工编辑不得无声绕过长期记忆条目/事件——同步为显式修订：
+	// 新增行落 active（human），被删掉的行标 retracted（human_edit），全部留痕。
+	if s.memoryLifecycle != nil && s.memoryLifecycle.Enabled() {
+		if _, _, err := s.memoryLifecycle.SyncHumanEdit(ctx, "", store.MemoryScopeUser, "", content); err != nil {
+			log.Printf("[memory-lifecycle] sync human profile edit failed (non-fatal): %v", err)
+		}
+	}
+	return nil
 }
 
 // extractProfilePreferences 会话完成时扫对话提取偏好增量并 Merge 整理入画像
@@ -877,6 +937,24 @@ func (s *ReactService) SetPersonaInjector(p PersonaInjector) {
 // 用户画像仅注入 MetaAgent；项目偏好经 Dispatcher 前缀同步下发子 Agent（执行层工艺）。
 // workDir 为会话工作目录（S2）：项目偏好按会话目录解析，空串回落 store 构造目录。
 func (s *ReactService) metaPersona(workDir string) PersonaInjector {
+	// 2026-10-24：注入只读"有效视图"（items status=active，带紧凑 ID）——
+	// 已被用户撤回/隔离的条目物理缺席，而不是新旧两条一起注入让模型自己猜。
+	if s.memoryLifecycle != nil && s.memoryLifecycle.Enabled() {
+		lc := s.memoryLifecycle
+		owner := ""
+		pk := store.NormalizeProjectKey(workDir)
+		userBlock := func() string {
+			return lc.RenderScope(context.Background(), owner, "", store.MemoryScopeUser, 2600)
+		}
+		projBlock := func() string {
+			return lc.RenderScope(context.Background(), owner, pk, store.MemoryScopeProject, 2000)
+		}
+		return CombinePersonaInjectors(
+			s.persona,
+			NewSectionInjector("【用户画像·有效记忆】（仅当前有效的条目；[M-xxx] 是条目 ID，可直接说「撤回 M-xxx」）", userBlock, 2600),
+			NewSectionInjector("【项目偏好·有效记忆】（本项目约定与经验；与用户当前指示冲突时以最新指示为准）", projBlock, 2000),
+		)
+	}
 	var userCurrent func() string
 	if s.userProfile != nil {
 		store := s.userProfile
@@ -2208,7 +2286,7 @@ func (s *ReactService) SetSessionTrustMode(sessionID, mode string) error {
 	sess := s.store.sessions[sessionID]
 	s.store.mu.RUnlock()
 	if sess == nil {
-		return fmt.Errorf("session %s not found", sessionID)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
 	}
 	sess.setTrustMode(mode)
 	return nil
@@ -2245,7 +2323,7 @@ func (s *ReactService) SetSessionGear(sessionID, gear string) error {
 	sess := s.store.sessions[sessionID]
 	s.store.mu.RUnlock()
 	if sess == nil {
-		return fmt.Errorf("session %s not found", sessionID)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
 	}
 	// D-2 留痕（TODO #14 T7）：档位切换全量落事件（含方向与来源），会话事件流可追溯。
 	from := sess.currentGear()
@@ -2280,7 +2358,7 @@ func (s *ReactService) SetSessionThinking(sessionID, thinking string) error {
 	sess := s.store.sessions[sessionID]
 	s.store.mu.RUnlock()
 	if sess == nil {
-		return fmt.Errorf("session %s not found", sessionID)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
 	}
 	from := sess.currentThinking()
 	sess.setThinking(t)
@@ -2316,7 +2394,7 @@ func (s *ReactService) SetSessionModel(sessionID, modelID string) error {
 	sess := s.store.sessions[sessionID]
 	s.store.mu.RUnlock()
 	if sess == nil {
-		return fmt.Errorf("session %s not found", sessionID)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
 	}
 	from := sess.currentModel()
 	sess.setModel(m)
@@ -4240,6 +4318,9 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 模型仍能从账本看到"最初目标 + 当前路线 + 已废止路线"。
 	s.hydrateDecisions(runCtx, session)
 	s.recordDecision(runCtx, session, store.DecisionKindDirective, session.Goal, "goal")
+	// 长期记忆撤回（2026-10-24）：任务书同样是真实用户原文——"这个项目以后不要单图
+	// warp"这类纠正必须在首轮就落到长期记忆，否则后续每轮仍在注入旧经验。
+	s.applyMemoryRetraction(runCtx, session, session.Goal, "goal")
 	// 经验技能预筛（设计 §6.5）：goal 向量 top-3 命中只注一行提示，不注全文。
 	goal = s.injectSkillRecall(ctx, goal)
 
@@ -4370,6 +4451,9 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	s.hydrateDecisions(ctx, session)
 	if !wakeTurn {
 		s.recordDecision(ctx, session, store.DecisionKindDirective, input, "user_message")
+		// 长期记忆撤回（2026-10-24）：用户纠正的当轮就要生效，不能等会话结束的
+		// SessionEvolver——会话取消/进程退出时撤回会永远不发生。
+		s.applyMemoryRetraction(ctx, session, input, "user_message")
 	}
 
 	// 按档位解析本轮顶层角色（fast=doc_assistant / daily=domain / cluster=meta）；缺失则报错。
@@ -5317,6 +5401,7 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	// 下一轮压缩就消失。非运行会话也会入账，resumeSession 的重复写入由去重吸收。
 	s.hydrateDecisions(ctx, session)
 	s.recordDecision(ctx, session, store.DecisionKindDirective, content, "user_message")
+	s.applyMemoryRetraction(ctx, session, content, "user_message")
 
 	// 运行中的会话：把新指令**投进 MetaAgent 邮箱**，本轮内的下一个检查点即读到它
 	//（等子 Agent 时 waitForChildren 每周期 drain，立即生效；其他阶段主循环顶部 drain，
@@ -5662,6 +5747,11 @@ func (s *ReactService) answerClarify(ctx context.Context, sessionID, answer stri
 		// 用户裁决在任意压缩后仍然可见。
 		s.hydrateDecisions(ctx, session)
 		s.recordDecision(ctx, session, store.DecisionKindClarify, answer, "clarify_answer")
+		// 资产审批门（2026-10-24）：锚点/关键姿态的人工审批写入决策账本（axis=approval_*）。
+		// 换参考图（不同的 产物路径 入账）会 supersede 旧批准，旧批准不再生效。
+		if stage, ref, ok := parseAssetGateClarify(pc); ok {
+			s.RecordMediaGateApproval(ctx, session.ID, stage, clarifyAnswerApproved(pc, answer), ref)
+		}
 		// 计划确认答复：批准则把计划摘要入账（kind=plan），供后续回溯"用户批准过什么"。
 		if pc != nil && strings.Contains(pc.Question, "【计划确认】") && clarifyAnswerApproved(pc, answer) {
 			if summary := planSummaryFromClarify(pc); summary != "" {
@@ -5781,6 +5871,7 @@ func (s *ReactService) enqueue(ctx context.Context, sessionID, content string) e
 	// 决策账本：队列注入同样是用户指令，入账后才不会被下一轮压缩吞掉。
 	s.hydrateDecisions(ctx, session)
 	s.recordDecision(ctx, session, store.DecisionKindDirective, content, "enqueue")
+	s.applyMemoryRetraction(ctx, session, content, "enqueue")
 	// 运行中：投进 MetaAgent 邮箱即时生效（同 sendMessage）。此前该分支只发事件不投递，
 	// 内容根本没进对话历史/循环——"队列注入"名不副实（2026-09-12 实证）。
 	if wasRunning {

@@ -20,6 +20,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
+	"github.com/blockmemory/agent/backend/internal/store"
 	"github.com/blockmemory/agent/backend/internal/userprofile"
 	"github.com/blockmemory/agent/backend/pkg/enums"
 )
@@ -171,8 +172,14 @@ const evolveTimeout = 90 * time.Second
 // LLM 失败回退画像提取；Merge 失败直写归档小节（mergeIntoStore 内）。
 // 用户主动取消不进此入口（setSessionError 对 context canceled 跳过）。
 func (s *ReactService) evolveSession(session *reactInternalSession, outcome string) {
+	// 写入模式闸门（2026-10-24 P0）：off 完全不跑进化（连候选都不生成）。
+	if s.MemoryWriteMode() == MemoryWriteModeOff {
+		return
+	}
 	if s.evolver == nil {
-		s.extractProfilePreferences(session)
+		if memoryModeAllowsWrite(s.MemoryWriteMode()) {
+			s.extractProfilePreferences(session)
+		}
 		return
 	}
 	if len(session.Events) < minEvolveEvents {
@@ -196,10 +203,13 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 	out, err := s.evolver(ctx, in)
 	if err != nil || out == nil {
 		log.Printf("[evolver] evolve session failed, degrade to profile extraction: err=%v", err)
-		s.extractProfilePreferences(session)
+		if memoryModeAllowsWrite(s.MemoryWriteMode()) {
+			s.extractProfilePreferences(session)
+		}
 		return
 	}
 	agentName := "SessionEvolver"
+	var blockedUser, blockedProject []string
 	// 用户否决门（2026-10-22 上下文事故）：模型"自报完成"不等于用户验收。事故里
 	// 08:54 的会话完成把"按枢轴拆 7 个部件做骨骼拼接"写成项目经验，17:58 用户却说
 	// "你做的什么玩意"，这条错误经验此后每轮注入、持续污染。用户明确否定时：
@@ -210,6 +220,13 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 	rejected := append([]string(nil), out.Rejected...)
 	if rejectedFeedback {
 		rejected = append(rejected, extractRejections(in.UserMessages)...)
+	}
+	// shadow 模式（2026-10-24 P0 默认）：只把三类候选写 evolution_log 供审计/人工采纳，
+	// 不碰 user_profile.md / project_preferences.md / skills_learned / learned_skills。
+	// 否决归档（merge）同样属于现行记忆改写，shadow 下一并跳过。
+	if !memoryModeAllowsWrite(s.MemoryWriteMode()) {
+		s.logShadowCandidates(session.ID, outcome, out, rejected)
+		return
 	}
 	if rejectedFeedback && len(rejected) > 0 {
 		if s.userProfile != nil {
@@ -223,22 +240,36 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 		s.logEvolution(session.ID, "user_rejected", "用户画像/项目经验", strings.Join(rejected, "；"))
 		return
 	}
+	// ② 防复活（2026-10-24 长期记忆撤回与污染修复）：候选进入现行记忆前查 tombstone——
+	// 与已撤回/已替换内容同 hash 或同 key 语义高度近似 → 拦截（resurrection_suspect），
+	// 不写回现行区（否则用户撤回过的结论会被"换措辞"重新沉淀）。
+	if s.memoryLifecycle != nil && s.memoryLifecycle.Enabled() {
+		sc := MemoryScopeContext{ProjectKey: session.currentWorkDir(), SessionID: session.ID}
+		out.UserPrefs, blockedUser = s.memoryLifecycle.ScreenCandidates(ctx, sc,
+			store.MemoryScopeUser, cleanIncrements(out.UserPrefs), "")
+		out.ProjectLessons, blockedProject = s.memoryLifecycle.ScreenCandidates(ctx, sc,
+			store.MemoryScopeProject, cleanIncrements(out.ProjectLessons), "")
+		s.logBlockedCandidates(session.ID, blockedUser, blockedProject)
+	}
 	// ① 用户偏好增量：Merge 整理进画像 + evolution_log。
-	if prefs := cleanIncrements(out.UserPrefs); len(prefs) > 0 && s.userProfile != nil {
+	// enforce 准入门（2026-10-24）：全局画像只接受带明确长期意图的条目；一次性任务选择
+	//（"用 D 版""这次先不用视频"）留在会话决策账本，不跨会话复用。
+	if prefs := admitPreferences(cleanIncrements(out.UserPrefs)); len(prefs) > 0 && s.userProfile != nil {
 		s.mergeIntoStore(session.ID, agentName, s.userProfile, userProfileTargets, prefs, out.Rejected)
 		s.logEvolution(session.ID, "user_pref", "用户画像", strings.Join(prefs, "；"))
 	}
 	// ② 项目经验增量：Merge 整理进项目偏好 + evolution_log。
 	// S2：项目偏好按会话工作目录解析（session.currentWorkDir() 空串回落 store 构造目录）。
 	// ForContext 返回 nil（目录不可解析）时既未写入也不应记 project_lesson 审计流水。
-	if lessons := cleanIncrements(out.ProjectLessons); len(lessons) > 0 && s.projectPrefs != nil {
+	if lessons := admitProjectLessons(outcome, cleanIncrements(out.ProjectLessons)); len(lessons) > 0 && s.projectPrefs != nil {
 		if st := s.projectPrefs.ForContext(tool.WithWorkDir(ctx, session.currentWorkDir())); st != nil {
 			s.mergeIntoStore(session.ID, agentName, st, projectPrefsTargets, lessons, out.Rejected)
 			s.logEvolution(session.ID, "project_lesson", "项目经验", strings.Join(lessons, "；"))
 		}
 	}
 	// ③ 技能包：skillSink 落文件+PG+evolution_log（含校验/同名更新）。
-	if len(out.Skills) > 0 && s.skillSink != nil {
+	// enforce 下 mixed/failed 会话不沉淀技能（失败半成品技能会把错误工艺固化成模板）。
+	if len(out.Skills) > 0 && s.skillSink != nil && admitSkillOutcome(outcome) {
 		sinkCtx, sinkCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		if err := s.skillSink(sinkCtx, session.ID, out.Skills, outcome); err != nil {
 			log.Printf("[evolver] persist skills failed (non-fatal): err=%v", err)
@@ -287,6 +318,19 @@ func (s *ReactService) logEvolution(sessionID, kind, target, summary string) {
 	if err := s.evolutionLog(ctx, sessionID, kind, target, summary); err != nil {
 		log.Printf("[evolver] write evolution log failed (non-fatal): kind=%s err=%v", kind, err)
 	}
+}
+
+// logBlockedCandidates 记录被防复活闸门拦截的候选（resurrection_suspect 审计）。
+func (s *ReactService) logBlockedCandidates(sessionID string, blocked ...[]string) {
+	var all []string
+	for _, b := range blocked {
+		all = append(all, b...)
+	}
+	if len(all) == 0 {
+		return
+	}
+	s.logEvolution(sessionID, "resurrection_suspect", "长期记忆候选", strings.Join(all, "；"))
+	log.Printf("[evolver] %d candidate(s) blocked by tombstone (resurrection_suspect) session=%s", len(all), sessionID)
 }
 
 // eventsDigest 事件流摘要：最近事件拼接（Agent: 消息），整体截断。
