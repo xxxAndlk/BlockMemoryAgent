@@ -70,7 +70,7 @@ type ReActAgent struct {
 	// toolResultDigestRunes 收口后保留的头部摘录 rune 数；<=0 按默认 2000。
 	toolResultDigestRunes int
 	// staleToolEvictRounds 陈旧工具结果驱逐轮数（TODO 第9项③）：请求构建期把 N 轮前
-	//（按 assistant 轮序）的 ReadFile/SearchInFiles 结果替换为"已驱逐需重读"占位符，
+	// （按 assistant 轮序）的 ReadFile/SearchInFiles 结果替换为"已驱逐需重读"占位符，
 	// 只影响本次请求视图，canonical history 与持久化不动。<=0 关闭。
 	staleToolEvictRounds int
 	// agentsMDMaxRunes AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦，rune 计数）。
@@ -78,13 +78,13 @@ type ReActAgent struct {
 	// <=0 关闭注入。bootstrap 从 config agents_md_max_runes 注入。
 	agentsMDMaxRunes int
 	// parallelTools 轮内并行工具执行开关（TODO 第9项①）：同轮多个 tool_calls 并发派发
-	//（信号量限 toolParallelMax），结果按原序串行回填。零值=关闭（测试稳定），
+	// （信号量限 toolParallelMax），结果按原序串行回填。零值=关闭（测试稳定），
 	// 生产配置 tool_parallel_enabled: true 打开。
 	parallelTools bool
 	// toolParallelMax 并行工具并发上限；<=0 用默认 defaultToolParallelConcurrency。
 	toolParallelMax int
 	// pathMu/pathMutexes 轮内并行的同路径写互斥锁表：写类工具按目标路径分键
-	//（相对路径按 agent workDir 解析，worktree 副本天然不同键），同路径串行、
+	// （相对路径按 agent workDir 解析，worktree 副本天然不同键），同路径串行、
 	// 异路径并行。仅并行派发路径使用；串行路径零开销。
 	pathMu      sync.Mutex
 	pathMutexes map[string]*sync.Mutex
@@ -121,7 +121,7 @@ type ReActAgent struct {
 	// 正文获取经 load_skill 工具按需进行，整块内容不随提示词重复展开。
 	skillBlock string
 	// memoryIndex 记忆索引槽（TODO #20③+#22③）：会话启动注入的一行式沉淀索引
-	//（renderMemoryIndex 渲染，行数/runes 双配额），详情走向量召回。同 skillBlock
+	// （renderMemoryIndex 渲染，行数/runes 双配额），详情走向量召回。同 skillBlock
 	// 尾部注入位（前缀缓存安全）；空串=未接线/无沉淀。
 	memoryIndex string
 	// directiveBlock 用户指令账本 provider（WithDirectiveBlock 注入，2026-10-22）：
@@ -367,10 +367,8 @@ func (a *ReActAgent) WithMemoryIndex(block string) *ReActAgent {
 	return a
 }
 
-// WithDirectiveBlock 注入会话用户指令账本 provider（2026-10-22 上下文事故修复）。
-// 每轮构建请求时求值，作为 system 消息追加到消息尾部——既不被历史压缩吞掉，
-// 也不被 windowMessages 滑窗裁掉；账本内容只在用户发新指令时变化，前缀缓存影响可忽略。
-// 仅会话顶层 Agent 注入；子 Agent 不读用户账本（其任务由父 Agent 的任务书界定）。
+// WithDirectiveBlock 注入每轮求值的尾部上下文。顶层用于用户决策账本与长期记忆，
+// 子 Agent 用于项目有效记忆；不被历史压缩或窗口裁剪，也不冻结进 system prompt。
 func (a *ReActAgent) WithDirectiveBlock(f func() string) *ReActAgent {
 	a.directiveBlock = f
 	return a
@@ -993,7 +991,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 			if err != nil {
 				// 循环守卫命中（连读死循环/探索预算耗尽/连续失败）：终止循环并带原因返回，
 				// 不吞成普通工具结果继续烧轮次。子 Agent 经 runSubAgent 走 Failed 语义
-				//（失败打捞 + 父 mailbox 通知）；MetaAgent 直达时上层以错误结束会话。
+				// （失败打捞 + 父 mailbox 通知）；MetaAgent 直达时上层以错误结束会话。
 				if errors.Is(err, tool.ErrLoopExit) {
 					return ReactResult{History: history}, err
 				}
@@ -1219,7 +1217,7 @@ func (a *ReActAgent) condenseToolResult(ctx context.Context, toolName string, re
 
 // dumpToolOutputToDisk 把超限工具输出全文写入 <workDir>/.bma/tool_outputs/，返回绝对路径。
 // workDir 优先取 ctx 注入的会话目录，回退 agent 自身 workDir，再回退系统临时目录
-//（与 mailbox 收口 dumpReturnToDisk 同容错口径：.bma 是项目级目录，各回退目录下语义一致）。
+// （与 mailbox 收口 dumpReturnToDisk 同容错口径：.bma 是项目级目录，各回退目录下语义一致）。
 func dumpToolOutputToDisk(ctx context.Context, agentWorkDir, agentID, toolName, output string) (string, error) {
 	wd := tool.WorkDirFromContext(ctx)
 	if wd == "" {
@@ -1266,12 +1264,12 @@ var evictableToolNames = map[string]bool{
 }
 
 // evictPlaceholderMark 占位符指纹：已驱逐的消息本轮不再重写，保持占位文本跨轮稳定
-//（前缀缓存友好；重写只会把"原文 N runes"换成占位符自身长度，毫无收益）。
+// （前缀缓存友好；重写只会把"原文 N runes"换成占位符自身长度，毫无收益）。
 const evictPlaceholderMark = "[内容已驱逐]"
 
 // evictStaleToolResults 陈旧工具结果驱逐（TODO 第9项③）：对请求视图做变换，把超过
 // keepRounds 轮前的 ReadFile/SearchInFiles 结果替换为合法 ToolResultJSON 占位符
-//（"已驱逐需重读"，防止模型幻觉记得旧内容）。只影响本次请求：
+// （"已驱逐需重读"，防止模型幻觉记得旧内容）。只影响本次请求：
 // canonical history / 持久化 / 续跑数据无损；驱逐保留 tool 消息本体与 ToolCallID，
 // sanitizeToolPairing 配对校验不受影响；token 估算天然看到驱逐后的大小。
 //
@@ -1799,8 +1797,8 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 		firstChunk = true
 		idleMu.Unlock()
 		// 流式块即活动证据（kind=stream）：thinking 模型单次长生成可达 5-7 分钟
-		//（大段代码+深度推理），chunk 持续刷新 lastTS；即使在飞 LLM 豁免兜不住的场景
-		//（跨入下一轮工具前）也有真实步进证据（TODO 第10项②）。
+		// （大段代码+深度推理），chunk 持续刷新 lastTS；即使在飞 LLM 豁免兜不住的场景
+		// （跨入下一轮工具前）也有真实步进证据（TODO 第10项②）。
 		a.touchActivity("stream")
 		if resp == nil || resp.Message == nil {
 			continue
@@ -1814,7 +1812,7 @@ func (a *ReActAgent) generateStreaming(ctx context.Context, req *blades.ModelReq
 			continue
 		}
 		// OpenAI 系（deepseek/ark/glm 等 openai 兼容端点）用 "reasoning_content" 键
-		//（provider_openai_chat/responses 累积写入）。此前只认 "thinking"，该键从未被
+		// （provider_openai_chat/responses 累积写入）。此前只认 "thinking"，该键从未被
 		// 消费 → OpenAI 系模型既无实时思考也无 think 事件（2026-09-26 实证）。
 		// 不 continue：这类 provider 单帧可同时携带累积正文（下方按前缀去重吸收），
 		// 跳过会丢本帧文本增量（末帧丢失无法由后续帧补回）。
@@ -2137,7 +2135,7 @@ func (a *ReActAgent) buildSystemPrompt() string {
 // 包含 OS（含 Windows 主版本判断）、时区、工作目录——全部跨轮字节稳定
 // （TODO #40：动态时间已移出，见 buildTimeMessage；本函数输出可被 DeepSeek 前缀缓存命中）。
 // agentsMDMaxRunes > 0 时追加 workDir 根部 AGENTS.md/CLAUDE.md 的【项目自述】段
-//（TODO 第10项⑦冷启动注入；mtime 缓存命中时零读取，缺失零开销）。
+// （TODO 第10项⑦冷启动注入；mtime 缓存命中时零读取，缺失零开销）。
 // workDir 为空时回退到进程 cwd。
 func buildEnvBlock(workDir string, agentsMDMaxRunes int) string {
 	osName := runtime.GOOS

@@ -35,6 +35,8 @@ func (lc *MemoryLifecycle) ImportMarkdown(ctx context.Context, owner, scope, pro
 	if lc == nil || lc.repo == nil {
 		return 0, "lifecycle not wired"
 	}
+	lc.importMu.Lock()
+	defer lc.importMu.Unlock()
 	if scope != store.MemoryScopeUser && scope != store.MemoryScopeProject {
 		return 0, "invalid scope"
 	}
@@ -70,6 +72,7 @@ func (lc *MemoryLifecycle) ImportMarkdown(ctx context.Context, owner, scope, pro
 			origin = store.MemoryOriginLegacyImport
 		} else if p.auto {
 			origin = store.MemoryOriginLegacyImport
+			status = store.MemoryStatusQuarantined
 		}
 		if !p.archived && !p.auto {
 			// 人工维护的约定视为已验证（计划 §8.2 第 6 条）。
@@ -196,10 +199,8 @@ func derivedMemoryKey(key, content string) string {
 	return "lesson." + base + "." + short
 }
 
-// SyncHumanEdit 把人工全量编辑过的 Markdown 记忆同步进结构化条目（PUT /api/profile、
-// 项目偏好 PUT 的路径）：新增行落 active（origin=human）；原 active 条目在新内容里
-// 已不存在的标 retracted（reason=human_edit）。不物理删除，事件留痕。
-// 归档小节的行仍按 tombstone 处理（不激活）。
+// SyncHumanEdit 把人工全量编辑同步为该 scope 的权威快照。快照中删除的 active
+// 条目无论来源都撤回；旧自动行即使保留也只隔离，不被洗成人工已验证偏好。
 func (lc *MemoryLifecycle) SyncHumanEdit(ctx context.Context, owner, scope, projectKey, markdown string) (added, removed int, err error) {
 	if lc == nil || lc.repo == nil {
 		return 0, 0, nil
@@ -207,41 +208,50 @@ func (lc *MemoryLifecycle) SyncHumanEdit(ctx context.Context, owner, scope, proj
 	pk := ""
 	if scope == store.MemoryScopeProject {
 		pk = store.NormalizeProjectKey(projectKey)
+		if pk == "" {
+			return 0, 0, fmt.Errorf("project_key required for project scope")
+		}
 	}
 	parsed := parseMemoryMarkdown(markdown)
 	want := map[string]bool{}
 	for _, p := range parsed {
-		if p.archived {
-			continue
+		if !p.archived {
+			want[store.MemoryContentHash(p.content)] = true
 		}
-		want[store.MemoryContentHash(p.content)] = true
 	}
-	existing, lerr := lc.repo.ListItems(ctx, store.MemoryQuery{
+	existing, err := lc.repo.ListItems(ctx, store.MemoryQuery{
 		Owner: owner, Scope: scope, ProjectKey: pk, Statuses: []string{store.MemoryStatusActive},
 	})
-	if lerr != nil {
-		return 0, 0, lerr
+	if err != nil {
+		return 0, 0, err
 	}
 	sc := MemoryScopeContext{Owner: owner, ProjectKey: pk}
+	var firstErr error
 	for _, it := range existing {
-		// 只处理人工/显式来源的行：自动沉淀（evolver）由 evolver 自己的路径管理。
-		if it.Origin != store.MemoryOriginHuman && it.Origin != store.MemoryOriginExplicitTool {
-			continue
-		}
 		if want[it.ContentHash] {
+			if (it.Origin == store.MemoryOriginLegacyImport || it.Origin == store.MemoryOriginEvolver) &&
+				it.Verification == store.MemoryVerificationUnverified {
+				if terr := lc.transition(ctx, sc, it, store.MemoryStatusQuarantined, store.MemoryActorAdmin,
+					"人工快照保留旧自动行，但未经人工逐条确认，保持隔离", ""); terr != nil && firstErr == nil {
+					firstErr = terr
+				}
+			}
 			continue
 		}
 		if terr := lc.transition(ctx, sc, it, store.MemoryStatusRetracted, store.MemoryActorAdmin,
-			"人工编辑已移除该行（human_edit）", ""); terr == nil {
-			removed++
+			"人工编辑已移除该行（human_edit）", ""); terr != nil {
+			if firstErr == nil {
+				firstErr = terr
+			}
+			continue
 		}
+		removed++
 	}
 	for _, p := range parsed {
-		if p.archived || want["used:"+p.content] {
+		if p.archived {
 			continue
 		}
 		hash := store.MemoryContentHash(p.content)
-		// 已 active 的同内容行跳过（避免重复）。
 		dup := false
 		for _, it := range existing {
 			if it.ContentHash == hash && it.Status == store.MemoryStatusActive {
@@ -260,18 +270,26 @@ func (lc *MemoryLifecycle) SyncHumanEdit(ctx context.Context, owner, scope, proj
 				key = "lesson.general"
 			}
 		}
-		// active 唯一键：同 key 已被占用则派生。
-		list, _ := lc.repo.ListItems(ctx, store.MemoryQuery{
-			Owner: owner, Scope: scope, ProjectKey: pk,
-			Statuses: []string{store.MemoryStatusActive}, MemoryKeys: []string{key}, Limit: 1,
-		})
-		if len(list) > 0 {
-			key = derivedMemoryKey(key, p.content)
+		status := store.MemoryStatusActive
+		origin := store.MemoryOriginHuman
+		verification := store.MemoryVerificationVerified
+		if p.auto {
+			status = store.MemoryStatusQuarantined
+			origin = store.MemoryOriginLegacyImport
+			verification = store.MemoryVerificationUnverified
+		} else {
+			list, _ := lc.repo.ListItems(ctx, store.MemoryQuery{
+				Owner: owner, Scope: scope, ProjectKey: pk,
+				Statuses: []string{store.MemoryStatusActive}, MemoryKeys: []string{key}, Limit: 1,
+			})
+			if len(list) > 0 {
+				key = derivedMemoryKey(key, p.content)
+			}
 		}
 		created, blocked, reason := lc.insertChecked(ctx, store.MemoryItem{
 			Owner: owner, Scope: scope, ProjectKey: pk, MemoryKey: key,
-			Content: p.content, Status: store.MemoryStatusActive, Origin: store.MemoryOriginHuman,
-			Verification: store.MemoryVerificationVerified, ContentHash: hash,
+			Content: p.content, Status: status, Origin: origin,
+			Verification: verification, ContentHash: hash,
 		})
 		if blocked {
 			log.Printf("[memory-lifecycle] human edit line blocked by tombstone (kept candidate): %s", reason)
@@ -282,5 +300,5 @@ func (lc *MemoryLifecycle) SyncHumanEdit(ctx context.Context, owner, scope, proj
 		}
 	}
 	lc.bumpRevision()
-	return added, removed, nil
+	return added, removed, firstErr
 }

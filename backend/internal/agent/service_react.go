@@ -205,7 +205,7 @@ type ReactService struct {
 	skillRecall func(ctx context.Context, task string) []SkillRecallHint
 	// pluginVisibility 热插拔插件角色可见性回调（设计文档 §4.3）：
 	// fn(roleID, toolName) -> (owned, visible)；nil 时插件工具不额外过滤
-	//（白名单语义不变）。由 bootstrap 注入 plugins.Manager.ToolVisibility。
+	// （白名单语义不变）。由 bootstrap 注入 plugins.Manager.ToolVisibility。
 	pluginVisibility ToolVisibilityFunc
 	// topLevelTools 顶层必备插件工具提供者（bootstrap 注入 plugins.Manager.TopLevelTools）：
 	// 快速/日常档会话启动时把返回的工具名预挂到顶层 Agent scope（=sessionID），
@@ -213,7 +213,7 @@ type ReactService struct {
 	topLevelTools func() []string
 	// pluginToolsResolver 指定插件解析器（KIMI 式插件选择，bootstrap 注入 plugins.Manager
 	// 实现）：输入插件 ID 列表，返回有效插件（展示名+已注册工具名）与无效 ID
-	//（不存在/未启用/未运行）。nil 时指定插件功能不可用（Set 报错/Create 丢弃）。
+	// （不存在/未启用/未运行）。nil 时指定插件功能不可用（Set 报错/Create 丢弃）。
 	pluginToolsResolver func(ids []string) (valid []PinnedPluginInfo, invalid []string)
 	// activityPinger 等待用户答复期间的心跳保活回调（bootstrap 注入
 	// subagent.Dispatcher.PingActivity）：审批/提问阻塞时周期性刷新子 Agent 活动时间，
@@ -276,7 +276,7 @@ func (s *ReactService) SetAgentMsgCache(c *store.AgentMsgRedisStore) {
 // metaSkillBlock 渲染 MetaAgent 的技能目录块：静态技能（yaml/builtin/目录/插件包）
 // 全列，经验技能（learned）只列常用 top-N + 检索提示——自进化技能库随会话沉淀
 // 无限增长（每次会话最多 +2 且无淘汰），全量入提示会持续膨胀并干扰模型选择
-//（治理三件套：A 目录收敛 / B 写入门 / C 库存整理）。
+// （治理三件套：A 目录收敛 / B 写入门 / C 库存整理）。
 // skillPool 未注入或池为空时返回空串（零注入）。
 func (s *ReactService) metaSkillBlock() string {
 	if s.skillPool == nil {
@@ -467,7 +467,7 @@ func (s *ReactService) SaveProjectPreferences(ctx context.Context, content strin
 	if s.memoryLifecycle != nil && s.memoryLifecycle.Enabled() {
 		if _, _, err := s.memoryLifecycle.SyncHumanEdit(ctx, "",
 			store.MemoryScopeProject, tool.WorkDirFromContext(ctx), content); err != nil {
-			log.Printf("[memory-lifecycle] sync human project prefs edit failed (non-fatal): %v", err)
+			return fmt.Errorf("sync project preferences to long-term memory: %w", err)
 		}
 	}
 	return nil
@@ -638,7 +638,7 @@ func (s *ReactService) SaveProfile(ctx context.Context, content string) error {
 	// 新增行落 active（human），被删掉的行标 retracted（human_edit），全部留痕。
 	if s.memoryLifecycle != nil && s.memoryLifecycle.Enabled() {
 		if _, _, err := s.memoryLifecycle.SyncHumanEdit(ctx, "", store.MemoryScopeUser, "", content); err != nil {
-			log.Printf("[memory-lifecycle] sync human profile edit failed (non-fatal): %v", err)
+			return fmt.Errorf("sync user profile to long-term memory: %w", err)
 		}
 	}
 	return nil
@@ -937,23 +937,10 @@ func (s *ReactService) SetPersonaInjector(p PersonaInjector) {
 // 用户画像仅注入 MetaAgent；项目偏好经 Dispatcher 前缀同步下发子 Agent（执行层工艺）。
 // workDir 为会话工作目录（S2）：项目偏好按会话目录解析，空串回落 store 构造目录。
 func (s *ReactService) metaPersona(workDir string) PersonaInjector {
-	// 2026-10-24：注入只读"有效视图"（items status=active，带紧凑 ID）——
-	// 已被用户撤回/隔离的条目物理缺席，而不是新旧两条一起注入让模型自己猜。
+	// 生命周期启用时有效记忆改由 sessionDirectiveBlock 每轮尾部注入，
+	// 避免撤回被 sync.Once 冻结在 system prompt 中。
 	if s.memoryLifecycle != nil && s.memoryLifecycle.Enabled() {
-		lc := s.memoryLifecycle
-		owner := ""
-		pk := store.NormalizeProjectKey(workDir)
-		userBlock := func() string {
-			return lc.RenderScope(context.Background(), owner, "", store.MemoryScopeUser, 2600)
-		}
-		projBlock := func() string {
-			return lc.RenderScope(context.Background(), owner, pk, store.MemoryScopeProject, 2000)
-		}
-		return CombinePersonaInjectors(
-			s.persona,
-			NewSectionInjector("【用户画像·有效记忆】（仅当前有效的条目；[M-xxx] 是条目 ID，可直接说「撤回 M-xxx」）", userBlock, 2600),
-			NewSectionInjector("【项目偏好·有效记忆】（本项目约定与经验；与用户当前指示冲突时以最新指示为准）", projBlock, 2000),
-		)
+		return s.persona
 	}
 	var userCurrent func() string
 	if s.userProfile != nil {
@@ -981,6 +968,47 @@ func (s *ReactService) metaPersona(workDir string) PersonaInjector {
 		// 当前指示为准"——旧经验保留参考权重但不压过用户最新指示。
 		NewSectionInjector("【项目偏好】（约定与经验；与用户当前指示冲突时以最新指示为准）", projCurrent, 2000),
 	)
+}
+
+// longTermMemoryBlock 每次请求前读取有效记忆。旧自动内容只读 active 人工确认视图，
+// 项目文件只用于首次幂等导入，不再作为撤回后的回退数据源。
+func (s *ReactService) longTermMemoryBlock(workDir string) string {
+	lc := s.memoryLifecycle
+	if lc == nil || !lc.Enabled() {
+		return ""
+	}
+	if workDir == "" {
+		workDir = s.workDir()
+	}
+	pk := store.NormalizeProjectKey(workDir)
+	if s.projectPrefs != nil && pk != "" {
+		current := s.projectPrefs.Current(tool.WithWorkDir(context.Background(), workDir))
+		if _, reason := lc.ImportMarkdown(context.Background(), "", store.MemoryScopeProject, pk, current.Content); reason != "" && reason != "already imported" && reason != "no importable lines" {
+			log.Printf("[memory-lifecycle] import project preferences failed: %s", reason)
+		}
+	}
+	var blocks []string
+	if content := lc.RenderScope(context.Background(), "", "", store.MemoryScopeUser, 2600); content != "" {
+		blocks = append(blocks, "【用户画像·有效记忆】（仅当前有效条目；[M-xxx] 是条目 ID，可直接说「撤回 M-xxx」）\n"+content)
+	}
+	if content := lc.RenderScope(context.Background(), "", pk, store.MemoryScopeProject, 2000); content != "" {
+		blocks = append(blocks, "【项目偏好·有效记忆】（本项目约定与经验；与用户当前指示冲突时以最新指示为准）\n"+content)
+	}
+	return strings.Join(blocks, "\n\n")
+}
+
+// sessionDirectiveBlock 把实时决策账本与长期记忆放在同一尾部注入位。
+func (s *ReactService) sessionDirectiveBlock(session *reactInternalSession) string {
+	decision := strings.TrimSpace(s.decisionBlock(session))
+	memory := strings.TrimSpace(s.longTermMemoryBlock(session.currentWorkDir()))
+	switch {
+	case decision == "":
+		return memory
+	case memory == "":
+		return decision
+	default:
+		return decision + "\n\n" + memory
+	}
 }
 
 // 历史：metaPersonaLite（续轮仅 soul 的轻量注入器，TODO 第八项 P0-2 省 ~4K runes/呼）
@@ -1012,7 +1040,7 @@ type ReactRuntimeConfig struct {
 	// 从会话创建起超时未终止则级联取消全部节点 + 会话置 error；<=0 关闭（默认）。
 	SessionMaxWallClockMin int
 	// ToolResultDumpRunes 工具结果统一收口阈值（TODO 第9项②，rune）；<=0 关闭
-	//（未注入 ReactRuntimeConfig 的测试场景默认关闭；生产由 config applyDefaults 兜底 8000）。
+	// （未注入 ReactRuntimeConfig 的测试场景默认关闭；生产由 config applyDefaults 兜底 8000）。
 	ToolResultDumpRunes int
 	// ToolResultDigestRunes 收口后头部摘录 rune 数；<=0 按默认 2000。
 	ToolResultDigestRunes int
@@ -1021,7 +1049,7 @@ type ReactRuntimeConfig struct {
 	// AgentsMDMaxRunes AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦，rune）；<=0 关闭（生产默认 4000）。
 	AgentsMDMaxRunes int
 	// ToolParallelEnabled 轮内并行工具执行开关（TODO 第9项①）；nil=关闭
-	//（未注入 ReactRuntimeConfig 的测试场景零值稳定；生产 config 默认 true）。
+	// （未注入 ReactRuntimeConfig 的测试场景零值稳定；生产 config 默认 true）。
 	ToolParallelEnabled *bool
 	// ToolParallelMaxConcurrency 并行工具并发上限；<=0 按默认 4。
 	ToolParallelMaxConcurrency int
@@ -1207,8 +1235,8 @@ func (s *ReactService) ReportWidgetError(sessionID, widgetID, errText string) {
 // 用户交互（按钮点击/表单提交）经 postMessage {type:'action',...} 上报后落到这里。
 // 与 ReportWidgetError 同款通道：落一条 System 会话事件（"【部件操作】"，用户可见）；
 // 会话仍在运行时额外向 MetaAgent 邮箱注入，让 Agent 感知部件交互并可继续编排
-//（messenger 未接线的精简装配降级为只落 System 事件）。会话不在内存时静默跳过
-//（HTTP 侧表现为 204）。
+// （messenger 未接线的精简装配降级为只落 System 事件）。会话不在内存时静默跳过
+// （HTTP 侧表现为 204）。
 func (s *ReactService) ReportWidgetAction(sessionID, widgetID, action, payload string) {
 	sess := s.store.getSession(sessionID)
 	if sess == nil {
@@ -1416,7 +1444,7 @@ func (c ReactRuntimeConfig) LoopConfig() LoopConfig {
 	}
 	// 上下文收口三件套 + 项目自述注入（TODO 第9项②③④ + 第10项⑦）：
 	// 未注入（零值）保持关闭，测试场景零行为变化；生产由 bootstrap 注入 config 值
-	//（applyDefaults 兜底 8000/2000/20/4000）。负数（显式关闭）归一为 0。
+	// （applyDefaults 兜底 8000/2000/20/4000）。负数（显式关闭）归一为 0。
 	if c.ToolResultDumpRunes != 0 {
 		lc.ToolResultDumpRunes = max(c.ToolResultDumpRunes, 0)
 	}
@@ -2347,7 +2375,7 @@ func (s *ReactService) SessionGear(sessionID string) string {
 
 // SetSessionThinking 切换会话级思考强度（2026-09-16，HTTP 切换通道）：
 // atomic 即时生效——providerForRole 闭包每次 LLM 调用实时读取，下一次调用即用新档
-//（免重启）；只覆盖本会话顶层 Agent，在飞子 Agent 各按角色解析不受影响。
+// （免重启）；只覆盖本会话顶层 Agent，在飞子 Agent 各按角色解析不受影响。
 // 空串 = 跟随角色默认（清除会话覆盖）。非法值返回错误（HTTP 400）；会话不存在返回错误。
 func (s *ReactService) SetSessionThinking(sessionID, thinking string) error {
 	t := tool.NormalizeThinking(thinking)
@@ -2381,7 +2409,7 @@ func (s *ReactService) SessionThinking(sessionID string) string {
 
 // SetSessionModel 切换会话级模型覆盖（2026-10-19，HTTP 切换通道）：
 // atomic 即时生效——providerForRole 闭包每次 LLM 调用实时读取，下一次调用即用新模型
-//（免重启）；只覆盖本会话顶层 Agent，在飞子 Agent 各按角色解析不受影响。
+// （免重启）；只覆盖本会话顶层 Agent，在飞子 Agent 各按角色解析不受影响。
 // 空串 = 清除覆盖、恢复跟随全局角色绑定（合法）。modelID 非空时校验条目须存在于
 // models.json 注册表（HTTP 400）；会话不存在返回错误。切换经 meta_memory 随下一次
 // persistHistory 落库（与会话档位同口径），重启后恢复。
@@ -2425,7 +2453,7 @@ func sessionModelDisplayName(modelID string) string {
 
 // SetSessionPinnedPlugins 切换会话级指定插件（KIMI 式插件选择，HTTP 切换通道）：
 // 选中=优先（强制）使用——插件工具经 MountPreApprovedForScope 预挂进会话顶层 scope
-//（用户显式授权，与 plugins.yaml top_level 同为配置外的人工声明，绕过角色天花板）；
+// （用户显式授权，与 plugins.yaml top_level 同为配置外的人工声明，绕过角色天花板）；
 // 取消勾选的工具按 mounted 集前缀匹配卸载（插件中途停用也能卸）。空列表=清空（合法）。
 // 无效 ID（不存在/未启用/未运行）整体拒绝并列明（HTTP 400），不做半套切换；
 // 会话不存在返回错误。atomic 即时生效，下一轮起跑按新集合构建提示块。
@@ -2546,7 +2574,7 @@ func (s *ReactService) SessionPinnedSkills(sessionID string) []string {
 // applyPinnedPlugins 把会话指定插件的工具预挂到顶层 scope（KIMI 式插件选择）：
 // runSession 起跑调用——挂载集纯内存，重启恢复/每轮起跑都需重挂（幂等），
 // 与 mountTopLevelEssentials 同语义。未指定/resolver 未接线/插件已停用
-//（工具未注册被 MountPreApprovedForScope 静默跳过）时零行为变化。
+// （工具未注册被 MountPreApprovedForScope 静默跳过）时零行为变化。
 func (s *ReactService) applyPinnedPlugins(session *reactInternalSession) {
 	ids := session.currentPinnedPlugins()
 	if len(ids) == 0 || s.toolRegistry == nil {
@@ -2678,7 +2706,7 @@ func (s *ReactService) SetSessionWorkDir(ctx context.Context, sessionID, dir str
 		}
 	}
 	// 审计留痕：主对话流留一条系统事件，事后可回溯"这个会话何时换了目录"
-	//（产物路径变了却查不到原因是常见困惑）。
+	// （产物路径变了却查不到原因是常见困惑）。
 	note := "工作目录已改为 " + dir
 	if dir == "" {
 		note = "工作目录已重置为进程默认目录"
@@ -3132,7 +3160,7 @@ func (s *ReactService) EscalateGearHook() tool.EscalateGearHookFunc {
 // Kind=confirm 确认卡 + resolveApproval 裁决；区别是答复原文一并返回——freeze 允许用户
 // 直接回复手改的 YAML 草案（可编辑确认）。
 // 无人值守会话（DAG 定时派发）无人可答，且审批涉及费用与批量执行：统一按"未确认"返回
-//（不自动放行——非交互会话的 self-decision 不适用于花钱的批量动作），工具侧如实回告。
+// （不自动放行——非交互会话的 self-decision 不适用于花钱的批量动作），工具侧如实回告。
 func (s *ReactService) WorkflowConfirmHook() tool.WorkflowConfirmHookFunc {
 	return func(ctx context.Context, req tool.WorkflowConfirmRequest) (tool.WorkflowConfirmResult, error) {
 		sid := tool.SessionIDFromContext(ctx)
@@ -3261,7 +3289,7 @@ func gearEscalationSeed(gear, goal, progress string, req tool.EscalateGearReques
 // restartWithGearSeed 升档续跑：等旧 run 落定（Stop 软停后 runSession 的
 // Canceled 分支落 awaiting_clarify）再投递种子消息——sendMessage 对非 running 会话
 // 走 resumeSession 新 run，resumeSession 按档位选 meta 角色全装。旧 run 若 30s 未落定
-//（流式重试等）放弃并留痕，用户手动发消息仍可续跑（档位已切换，不会丢）。
+// （流式重试等）放弃并留痕，用户手动发消息仍可续跑（档位已切换，不会丢）。
 func (s *ReactService) restartWithGearSeed(sessionID, seed string) {
 	bg := context.Background()
 	deadline := time.Now().Add(30 * time.Second)
@@ -3403,7 +3431,7 @@ func (s *ReactService) AskUserBatchHook() tool.AskUserBatchHookFunc {
 		s.store.mu.Unlock()
 
 		// 事件流：detail 先于问题（kind=clarify_detail），逐题 question-only
-		//（与单题 AskUserHook 同形态；每题独立事件便于历史按问答对回看）。
+		// （与单题 AskUserHook 同形态；每题独立事件便于历史按问答对回看）。
 		if req.Detail != "" {
 			s.store.addEvent(sess, eventkind.Clarify, "System", req.Detail, eventkind.ClarifyDetail, "", "", "", "", true)
 		}
@@ -4072,7 +4100,7 @@ func (s *ReactService) providerForRole(roleID, sessionID string) func(context.Co
 			return nil, errors.New("model factory not available")
 		}
 		// 会话级思考强度实时读取（2026-09-16）：运行中切换，下一次 LLM 调用即生效
-		//（providerForRole 闭包每次调用重解析）；会话不存在（罕见竞态）按空串=跟随角色默认。
+		// （providerForRole 闭包每次调用重解析）；会话不存在（罕见竞态）按空串=跟随角色默认。
 		var thinking string
 		if sessionID != "" {
 			s.store.mu.RLock()
@@ -4168,7 +4196,7 @@ func (s *ReactService) roleSkillBlock(roleDef *types.RoleDefinition) string {
 func (s *ReactService) runSession(session *reactInternalSession) { // 获取会话上下文；若不存在则使用 Background。
 	ctx := sessionContext(session)
 	// 本次 run 的运行代际快照：Canceled 分支据此判「只停主 Agent」请求是否属于本 run
-	//（防止停止请求之后消息续跑重建 context 时，旧请求误停新 run）。
+	// （防止停止请求之后消息续跑重建 context 时，旧请求误停新 run）。
 	s.store.mu.RLock()
 	myRunSeq := session.runSeq
 	s.store.mu.RUnlock()
@@ -4273,7 +4301,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
 		WithMemoryIndex(s.memoryIndexBlock(session.Goal)).
-		WithDirectiveBlock(func() string { return s.decisionBlock(session) }).
+		WithDirectiveBlock(func() string { return s.sessionDirectiveBlock(session) }).
 		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
 		WithPersonaInjector(s.metaPersona(session.currentWorkDir())).
 		WithMessageLogger(s.msgLogger).
@@ -4395,7 +4423,7 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	s.store.mu.Unlock()
 
 	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
-	//（用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
+	// （用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
 	s.evolveSession(session, "success")
 
 	// 持久化历史与事件到 Postgres。
@@ -4519,7 +4547,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		WithWorkDir(wd).
 		WithSkillBlock(skillBlock).
 		WithMemoryIndex(s.memoryIndexBlock(session.Goal)).
-		WithDirectiveBlock(func() string { return s.decisionBlock(session) }).
+		WithDirectiveBlock(func() string { return s.sessionDirectiveBlock(session) }).
 		WithEvolutionBlock(s.evolutionBlockFor(gearRoleID)).
 		// 人设链与首轮一致（2026-10-13 修复）：续跑曾用 metaPersonaLite（仅 soul），
 		// 依据"画像/偏好已在前缀缓存的历史里"节省 ~4K runes——该前提不成立：系统
@@ -4631,7 +4659,7 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	s.store.mu.Unlock()
 
 	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
-	//（用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
+	// （用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
 	s.evolveSession(session, "success")
 
 	s.store.persistHistory(session)
@@ -4698,7 +4726,7 @@ func (s *ReactService) finalizeThinking(session *reactInternalSession, ev LiveEv
 // 顶层 Meta 的实例 ID 就是会话 ID（emitLive：AgentID 填实例 ID，MetaAgent=session ID；
 // 子 Agent 为 "session-1/code_assistant-5"）。该档顶层 Meta 的中间轮口播必须与
 // 用户流隔离——LiveEventLLMDelta 只进轮缓冲、LiveEventToolCall 边界丢弃
-//（2026-09-18 编排内心独白泄露进对话栏实证；初版误用 ev.Agent=="" 判定，实测顶层
+// （2026-09-18 编排内心独白泄露进对话栏实证；初版误用 ev.Agent=="" 判定，实测顶层
 // 事件带展示名 role.Name="MetaAgent"，条件永不命中）。
 func (s *ReactService) isClusterTopEvent(session *reactInternalSession, ev LiveEvent) bool {
 	return ev.AgentID == session.ID && session.currentGear() == tool.GearCluster
@@ -4806,16 +4834,16 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		s.finalizeThinking(session, ev)
 		if s.isClusterTopEvent(session, ev) {
 			// 集群档顶层 Meta 分流：子 Agent 在跑 → 正文只进轮缓冲不推 StreamingText
-			//（中间轮的编排口播绝对不能进用户流，2026-09-18 用户实证）；子 Agent 全部
+			// （中间轮的编排口播绝对不能进用户流，2026-09-18 用户实证）；子 Agent 全部
 			// 结束 → 顶层文本即终答/直接汇报，实时直推——终答生成期不再整段转圈
-			//（2026-09-20 用户实证）。ask_user 恢复路径会清 StreamingText，无残留问题。
+			// （2026-09-20 用户实证）。ask_user 恢复路径会清 StreamingText，无残留问题。
 			if s.hasActiveSubAgents(session.ID) {
 				session.pendingTopText = ev.Text
 			} else {
 				session.pendingTopText = ""
 				// 新正文直推覆盖 StreamingText = 上一段口播的同轮去重使命结束：复位去重键，
 				// 跨轮逐字重复的口播（轮询等待循环）下一轮才能再落 assistant_text
-				//（2026-10-12 用户实证：扫码等待循环第二轮起口播不落事件，前端闪没）。
+				// （2026-10-12 用户实证：扫码等待循环第二轮起口播不落事件，前端闪没）。
 				// 缓冲分支（子 Agent 在跑）刻意不复位：StreamingText 未被覆盖，
 				// ThinkDelta 的陈旧清理仍要靠 lastInterimText 命中。
 				session.lastInterimText = ""
@@ -4835,10 +4863,10 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 			break
 		}
 		// 新一轮思考开始 = 上一轮口播正文已在工具调用边界落 assistant_text 事件
-		//（persistInterimText）：清掉瞬时 StreamingText。否则它一直残留到下一个正文
+		// （persistInterimText）：清掉瞬时 StreamingText。否则它一直残留到下一个正文
 		// delta 才被覆盖——思考更新触发的 SSE live 帧把这份陈旧正文一并重推，前端
 		// 已在工具事件时清掉的 live 行被"复活"，与落盘正文同屏重复且定格不动
-		//（2026-10-01 用户实证：旧正文卡住）。只在与已落盘文本一致时清：
+		// （2026-10-01 用户实证：旧正文卡住）。只在与已落盘文本一致时清：
 		// ask_user/审批 hook 阻塞期间保留的提问正文不等于 lastInterimText，不受影响。
 		st := strings.TrimSpace(session.StreamingText)
 		if ev.Agent != "" {
@@ -4866,7 +4894,7 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 			// 那段正文只活在瞬时 StreamingText 里，下一个轮次的 delta 直接覆盖、前端 live 行也在
 			// 工具调用事件到达时清掉——用户看到的是"话刚出现就凭空消失"（2026-09-13 用户实证）。
 			// 集群档顶层无子 Agent 在跑时同此语义：顶层即执行者，口播照常落 assistant_text
-			//（2026-09-29 用户实证：集群档直干活全程零中间正文，只剩"正在生成中"）。
+			// （2026-09-29 用户实证：集群档直干活全程零中间正文，只剩"正在生成中"）。
 			if s.isClusterTopEvent(session, ev) {
 				session.pendingTopText = ""
 			}
@@ -5068,7 +5096,7 @@ func (s *ReactService) pauseSession(session *reactInternalSession, history []Rea
 	// 状态翻转与文本清零必须同窗原子——pauseSession 与 defer 的 finalizeSession 之间存在
 	// 落事件的窗口期，SSE tick 此时已能看到停放态但 StreamingText 尚未清，会把旧正文随
 	// live 帧重推，前端 live 行复活、再发送时上一轮回答像被新回合复述。ask_user 阻塞态
-	//（真澄清）不走 pauseSession，提问正文快照不受影响；finalizeSession 的清空保留作兜底。
+	// （真澄清）不走 pauseSession，提问正文快照不受影响；finalizeSession 的清空保留作兜底。
 	session.StreamingText = ""
 	session.ThinkingText = ""
 	s.store.mu.Unlock()
@@ -5199,7 +5227,7 @@ func restartSessionContext(session *reactInternalSession) {
 	session.stopCancel = stopCancel
 	session.runStartedAt = time.Now()
 	// 运行代际自增 + 清「只停主 Agent」请求：新 run 不受旧停止请求影响
-	//（停止请求只对发起时的那个 run 有效，见 metaStopSeq 字段注释）。
+	// （停止请求只对发起时的那个 run 有效，见 metaStopSeq 字段注释）。
 	session.runSeq++
 	session.metaStopSeq = 0
 }
@@ -5404,7 +5432,7 @@ func (s *ReactService) sendMessageFull(ctx context.Context, sessionID, content s
 	s.applyMemoryRetraction(ctx, session, content, "user_message")
 
 	// 运行中的会话：把新指令**投进 MetaAgent 邮箱**，本轮内的下一个检查点即读到它
-	//（等子 Agent 时 waitForChildren 每周期 drain，立即生效；其他阶段主循环顶部 drain，
+	// （等子 Agent 时 waitForChildren 每周期 drain，立即生效；其他阶段主循环顶部 drain，
 	// 下一步生效）。不投递的话这条消息只躺在 session.Messages 里，而运行中的循环从不读
 	// 该字段——用户看着"已发送"，Agent 毫无反应（2026-09-12 实证）。
 	if wasRunning {
@@ -5477,7 +5505,7 @@ func (s *ReactService) SetBlockMemoryDistiller(fn func(ctx context.Context, sess
 }
 
 // distillEventsSnapshot 对事件快照做摘要：与 evolver.go eventsDigest 同口径
-//（最近 30 条、单行 120 runes、整体 1500 runes），但接受快照切片而非活会话，
+// （最近 30 条、单行 120 runes、整体 1500 runes），但接受快照切片而非活会话，
 // 供 /提炼 异步 goroutine 在不持锁、不触活会话的前提下构造 EvolveInput。
 func distillEventsSnapshot(events []internalEvent) string {
 	const keep = 30
@@ -5845,7 +5873,7 @@ func (s *ReactService) enqueue(ctx context.Context, sessionID, content string) e
 	// askUser/approval 通道。Agent goroutine 仍存活且阻塞在 hook 上，若走下方
 	// "置 Running + resumeSession" 会双开 ReAct 循环、换绑 session.ctx（阻塞中 hook
 	// 持有的旧 ctx 取消句柄丢失，旧 goroutine 永久滞留）且本内容不进 Messages 彻底丢失
-	//（2026-09-08 web 端 ask_user 答复误入 enqueue 通道事故修复）。
+	// （2026-09-08 web 端 ask_user 答复误入 enqueue 通道事故修复）。
 	if session.askUser != nil || session.approval != nil {
 		s.store.mu.Unlock()
 		return s.answerClarify(ctx, sessionID, content, nil)

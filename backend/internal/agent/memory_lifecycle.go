@@ -36,6 +36,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/store"
 )
 
@@ -173,6 +174,7 @@ func (r MemoryReport) String() string {
 // 本地操作后递增 revision，使注入侧缓存失效。
 type MemoryLifecycle struct {
 	mu            sync.Mutex
+	importMu      sync.Mutex
 	repo          store.MemoryRepo
 	retractMode   string
 	matcher       MemoryMatcherFunc
@@ -355,15 +357,27 @@ func (lc *MemoryLifecycle) applyDeterministic(ctx context.Context, sc MemoryScop
 	// 3) 同 key 匹配（用户说"以后不要 X"这类，X 落在已登记的主题键上）。
 	keys := classifyMemoryKeys(text)
 	candidates := filterItemsByKeys(items, keys)
-	if len(candidates) == 0 {
-		// key 未命中 → 用相似度兜底（≥0.35 的唯一最高分）。
+	matchedKeys := len(candidates) > 0
+	if !matchedKeys {
 		candidates = items
 	}
 	ranked := rankItemsBySimilarity(candidates, text)
+	hasConfidentTarget := func() bool {
+		if len(ranked) == 0 {
+			return false
+		}
+		if matchedKeys && len(ranked) == 1 {
+			return true
+		}
+		if ranked[0].score < 0.45 {
+			return false
+		}
+		return len(ranked) == 1 || ranked[0].score >= ranked[1].score+0.15
+	}
 
 	switch intent.action {
 	case memoryActionRetract:
-		if len(ranked) == 1 || (len(ranked) > 1 && ranked[0].score >= 0.45 && ranked[0].score >= ranked[1].score+0.15) {
+		if hasConfidentTarget() {
 			item := ranked[0].item
 			if lc.transition(ctx, sc, item, store.MemoryStatusRetracted, store.MemoryActorUser, text, sourceMessage) == nil {
 				report.Handled = true
@@ -371,8 +385,8 @@ func (lc *MemoryLifecycle) applyDeterministic(ctx context.Context, sc MemoryScop
 			}
 			return report
 		}
-		if len(ranked) > 1 {
-			// B 档：确认要撤回，但无法确定是哪一条 → 全部先隔离（立即不注入），交给用户确认。
+		if matchedKeys && len(ranked) > 1 {
+			// 只隔离主题命中的相关候选；无 key 的模糊文本不得全量隔离。
 			var ids []string
 			for _, r := range ranked {
 				if lc.transition(ctx, sc, r.item, store.MemoryStatusQuarantined, store.MemoryActorSystem, "撤回目标不唯一，先隔离："+truncateMemoryText(text, 60), sourceMessage) == nil {
@@ -385,12 +399,18 @@ func (lc *MemoryLifecycle) applyDeterministic(ctx context.Context, sc MemoryScop
 			}
 			return report
 		}
-		report.ReconcileRequired = true
-		report.Lines = append(report.Lines, "未找到与本次撤回对应的长期记忆条目（可能已撤回，或只属于当前会话决策）")
-		return report
+		if len(ranked) == 0 {
+			report.ReconcileRequired = true
+			report.Lines = append(report.Lines, "未找到与本次撤回对应的长期记忆条目（可能已撤回，或只属于当前会话决策）")
+			return report
+		}
+		return MemoryReport{}
 
 	case memoryActionReplace:
-		// 同 key 全部 supersede + 新建 active（新表述）；无 key 时退回相似度最高者。
+		// 同 key 全部 supersede + 新建 active（新表述）；无 key 时要求高置信唯一目标。
+		if len(keys) == 0 && !hasConfidentTarget() {
+			return MemoryReport{}
+		}
 		targetKey := ""
 		if len(keys) > 0 {
 			targetKey = keys[0]
@@ -436,8 +456,11 @@ func (lc *MemoryLifecycle) applyDeterministic(ctx context.Context, sc MemoryScop
 
 // applySemantic 确定性路径失败时的可选语义匹配（模型只建议，Go 校验后执行）。
 func (lc *MemoryLifecycle) applySemantic(ctx context.Context, sc MemoryScopeContext, intent memoryIntent, items []store.MemoryItem, text, sourceMessage string) MemoryReport {
+	reconcile := MemoryReport{ReconcileRequired: true, Lines: []string{
+		"无法可靠定位本次撤回/替换目标；未修改其他长期记忆，请给出条目 ID 或更具体的原文",
+	}}
 	if lc.matcher == nil || len(items) == 0 {
-		return MemoryReport{}
+		return reconcile
 	}
 	cands := make([]MemoryCandidate, 0, len(items))
 	for _, it := range items {
@@ -450,7 +473,7 @@ func (lc *MemoryLifecycle) applySemantic(ctx context.Context, sc MemoryScopeCont
 	})
 	if err != nil || res == nil {
 		log.Printf("[memory-lifecycle] matcher failed/empty: %v", err)
-		return MemoryReport{}
+		return reconcile
 	}
 	var report MemoryReport
 	byID := map[string]store.MemoryItem{}
@@ -542,8 +565,17 @@ func (lc *MemoryLifecycle) rejectUnverifiedSessionItems(ctx context.Context, sc 
 }
 
 // RecordExplicitItem 把一条用户显式写入（remember_preference / 项目约定工具）落成条目。
-// status=active，但先过防复活检查：命中已撤回结论则落 candidate（不进入注入视图）。
 func (lc *MemoryLifecycle) RecordExplicitItem(ctx context.Context, sc MemoryScopeContext, scope, origin, content string) {
+	lc.recordItem(ctx, sc, scope, origin, store.MemoryVerificationVerified, content)
+}
+
+// RecordEvolvedItem 把通过 enforce 准入的自动候选写入同一结构化有效视图。
+func (lc *MemoryLifecycle) RecordEvolvedItem(ctx context.Context, sc MemoryScopeContext, scope, content string) {
+	lc.recordItem(ctx, sc, scope, store.MemoryOriginEvolver, store.MemoryVerificationUnverified, content)
+}
+
+// recordItem 幂等写入；无明确替换意图时不覆盖其他 active 条目，改用派生 key。
+func (lc *MemoryLifecycle) recordItem(ctx context.Context, sc MemoryScopeContext, scope, origin, verification, content string) {
 	if lc == nil || lc.repo == nil || strings.TrimSpace(content) == "" {
 		return
 	}
@@ -551,22 +583,41 @@ func (lc *MemoryLifecycle) RecordExplicitItem(ctx context.Context, sc MemoryScop
 	if scope != store.MemoryScopeProject {
 		scope = store.MemoryScopeUser
 	}
-	key := ""
+	pk := projectKeyFor(scope, sc)
+	content = strings.TrimSpace(content)
+	hash := store.MemoryContentHash(content)
+	existing, err := lc.repo.ListItems(ctx, store.MemoryQuery{
+		Owner: sc.Owner, Scope: scope, ProjectKey: pk, Statuses: []string{store.MemoryStatusActive},
+	})
+	if err != nil {
+		log.Printf("[memory-lifecycle] list active items before write failed: %v", err)
+		return
+	}
+	key := "lesson.general"
 	if keys := classifyMemoryKeys(content); len(keys) > 0 {
 		key = keys[0]
-	} else {
-		key = "lesson.general"
 	}
-	pk := projectKeyFor(scope, sc)
+	occupied := false
+	for _, item := range existing {
+		if item.ContentHash == hash {
+			return
+		}
+		if item.MemoryKey == key {
+			occupied = true
+		}
+	}
+	if occupied {
+		key = derivedMemoryKey(key, content)
+	}
 	item := store.MemoryItem{
 		Owner: sc.Owner, Scope: scope, ProjectKey: pk, MemoryKey: key,
-		Content: strings.TrimSpace(content), Status: store.MemoryStatusActive,
-		Origin: origin, Verification: store.MemoryVerificationVerified,
-		SourceSession: sc.SessionID, ContentHash: store.MemoryContentHash(content),
+		Content: content, Status: store.MemoryStatusActive,
+		Origin: origin, Verification: verification,
+		SourceSession: sc.SessionID, ContentHash: hash,
 	}
 	created, blocked, reason := lc.insertChecked(ctx, item)
 	if blocked {
-		log.Printf("[memory-lifecycle] explicit item blocked by tombstone (kept candidate): %s", reason)
+		log.Printf("[memory-lifecycle] item blocked by tombstone (kept candidate): %s", reason)
 		return
 	}
 	if created.ID != "" {
@@ -574,13 +625,8 @@ func (lc *MemoryLifecycle) RecordExplicitItem(ctx context.Context, sc MemoryScop
 	}
 }
 
-// transition 状态迁移 + 事件（同一逻辑事务：先状态后事件，失败只告警）。
+// transition 状态迁移与审计事件在同一事务提交。
 func (lc *MemoryLifecycle) transition(ctx context.Context, sc MemoryScopeContext, item store.MemoryItem, status, actor, reason, sourceMessage string) error {
-	updated, err := lc.repo.SetStatus(ctx, item.Owner, item.ID, status, item.Revision)
-	if err != nil {
-		log.Printf("[memory-lifecycle] set status %s → %s failed: %v", item.ID, status, err)
-		return err
-	}
 	eventType := store.MemoryEventQuarantined
 	switch status {
 	case store.MemoryStatusRetracted:
@@ -592,14 +638,50 @@ func (lc *MemoryLifecycle) transition(ctx context.Context, sc MemoryScopeContext
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"from": item.Status, "to": status, "memory_key": item.MemoryKey,
-		"scope": item.Scope, "project_key": item.ProjectKey, "revision": updated.Revision,
+		"scope": item.Scope, "project_key": item.ProjectKey, "revision": item.Revision + 1,
 	})
-	_ = lc.repo.AppendEvent(ctx, store.MemoryEvent{
+	_, err := lc.repo.TransitionStatus(ctx, item.Owner, item.ID, status, item.Revision, store.MemoryEvent{
 		Owner: item.Owner, MemoryID: item.ID, EventType: eventType, Actor: actor,
 		SourceSession: sc.SessionID, SourceMessage: sourceMessage,
 		Reason: truncateMemoryText(reason, 240), Payload: string(payload),
 	})
-	return nil
+	if err != nil {
+		log.Printf("[memory-lifecycle] status transition %s → %s failed: %v", item.ID, status, err)
+	}
+	return err
+}
+
+// QuarantineLegacyUnverified 隔离存量旧自动记忆。只改状态并保留审计，幂等且可逐条恢复。
+func (lc *MemoryLifecycle) QuarantineLegacyUnverified(ctx context.Context, owner string) (int, error) {
+	if lc == nil || lc.repo == nil || !lc.Enabled() {
+		return 0, nil
+	}
+	items, err := lc.repo.ListItems(ctx, store.MemoryQuery{
+		Owner: owner, Statuses: []string{store.MemoryStatusActive},
+	})
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	var firstErr error
+	for _, item := range items {
+		if item.Origin != store.MemoryOriginLegacyImport || item.Verification != store.MemoryVerificationUnverified {
+			continue
+		}
+		sc := MemoryScopeContext{Owner: item.Owner, ProjectKey: item.ProjectKey, SessionID: item.SourceSession}
+		if err := lc.transition(ctx, sc, item, store.MemoryStatusQuarantined, store.MemoryActorSystem,
+			"旧自动记忆未经人工确认，启动时隔离以防继续污染", item.SourceMessage); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		count++
+	}
+	if count > 0 {
+		lc.bumpRevision()
+	}
+	return count, firstErr
 }
 
 // insertChecked 插入条目并做防复活检查：命中 tombstone → 降级为 candidate（不注入）。
@@ -625,9 +707,13 @@ func (lc *MemoryLifecycle) insertChecked(ctx context.Context, item store.MemoryI
 		log.Printf("[memory-lifecycle] insert item failed: %v", err)
 		return store.MemoryItem{}, false, ""
 	}
+	actor := store.MemoryActorUser
+	if created.Origin == store.MemoryOriginEvolver || created.Origin == store.MemoryOriginLegacyImport {
+		actor = store.MemoryActorSystem
+	}
 	_ = lc.repo.AppendEvent(ctx, store.MemoryEvent{
 		Owner: created.Owner, MemoryID: created.ID, EventType: store.MemoryEventActivated,
-		Actor: store.MemoryActorUser, SourceSession: created.SourceSession, SourceMessage: created.SourceMessage,
+		Actor: actor, SourceSession: created.SourceSession, SourceMessage: created.SourceMessage,
 		Reason: "激活新条目（" + created.Origin + "）",
 	})
 	return created, false, ""
@@ -693,10 +779,17 @@ func (lc *MemoryLifecycle) ScreenCandidates(ctx context.Context, sc MemoryScopeC
 // ---------------------------------------------------------------- 有效视图
 
 // RenderScope 渲染指定作用域的有效视图（只读 active；带紧凑 ID 供用户点名撤回）。
-// projectKey 为空时只渲染全局条目。返回空串表示无内容（零注入）。
+// 项目查询必须提供非空 projectKey，避免空条件退化为跨项目读取。
 func (lc *MemoryLifecycle) RenderScope(ctx context.Context, owner, projectKey, scope string, maxRunes int) string {
 	if lc == nil || lc.repo == nil {
 		return ""
+	}
+	projectKey = store.NormalizeProjectKey(projectKey)
+	if scope == store.MemoryScopeProject && projectKey == "" {
+		return ""
+	}
+	if scope == store.MemoryScopeUser {
+		projectKey = ""
 	}
 	if maxRunes <= 0 {
 		maxRunes = 1800
@@ -724,11 +817,11 @@ func (lc *MemoryLifecycle) RenderScope(ctx context.Context, owner, projectKey, s
 }
 
 // EffectiveBlock 渲染合并后的有效视图（项目条目覆盖同 key 的全局条目）。
-// 用于需要一份统一记忆块的注入点（子 Agent 前缀）。
 func (lc *MemoryLifecycle) EffectiveBlock(ctx context.Context, owner, projectKey string, maxRunes int) string {
 	if lc == nil || lc.repo == nil {
 		return ""
 	}
+	projectKey = store.NormalizeProjectKey(projectKey)
 	if maxRunes <= 0 {
 		maxRunes = 2200
 	}
@@ -737,23 +830,27 @@ func (lc *MemoryLifecycle) EffectiveBlock(ctx context.Context, owner, projectKey
 		return hit
 	}
 	var all []store.MemoryItem
-	for _, scope := range []string{store.MemoryScopeProject, store.MemoryScopeUser} {
-		pk := ""
-		if scope == store.MemoryScopeProject {
-			pk = projectKey
-		}
+	if projectKey != "" {
 		items, err := lc.repo.ListItems(ctx, store.MemoryQuery{
-			Owner: owner, Scope: scope, ProjectKey: pk,
+			Owner: owner, Scope: store.MemoryScopeProject, ProjectKey: projectKey,
 			Statuses: []string{store.MemoryStatusActive},
 		})
 		if err != nil {
-			log.Printf("[memory-lifecycle] effective block %s failed: %v", scope, err)
+			log.Printf("[memory-lifecycle] effective project block failed: %v", err)
 			return ""
 		}
 		all = append(all, dedupeByMemoryKey(items)...)
 	}
-	// 项目条目优先（更具体），同 key 的项目条目把全局条目挤掉。
-	out := renderMemoryItems(all, "effective", maxRunes)
+	items, err := lc.repo.ListItems(ctx, store.MemoryQuery{
+		Owner: owner, Scope: store.MemoryScopeUser,
+		Statuses: []string{store.MemoryStatusActive},
+	})
+	if err != nil {
+		log.Printf("[memory-lifecycle] effective user block failed: %v", err)
+		return ""
+	}
+	all = append(all, items...)
+	out := renderMemoryItems(dedupeEffectiveMemoryItems(all), "effective", maxRunes)
 	lc.storeBlock(cacheKey, out)
 	return out
 }
@@ -782,7 +879,7 @@ func renderMemoryItems(items []store.MemoryItem, scopeLabel string, maxRunes int
 		return ""
 	}
 	sort.SliceStable(items, func(i, j int) bool {
-		// project 优先，其次 veirfied，再按更新时间新→旧。
+		// project 优先，其次 verified，再按更新时间新→旧。
 		if items[i].Scope != items[j].Scope {
 			return items[i].Scope == store.MemoryScopeProject
 		}
@@ -798,7 +895,11 @@ func renderMemoryItems(items []store.MemoryItem, scopeLabel string, maxRunes int
 		if it.Scope == store.MemoryScopeProject {
 			scopeTag = "project"
 		}
-		line := fmt.Sprintf("- [%s %s/%s] %s\n", it.ID, scopeTag, it.MemoryKey, truncateMemoryText(it.Content, 200))
+		content := truncateMemoryText(it.Content, 200)
+		if it.Origin == store.MemoryOriginLegacyImport || it.Origin == store.MemoryOriginEvolver {
+			content = tool.WrapUntrusted("long-term-memory:"+it.ID, content)
+		}
+		line := fmt.Sprintf("- [%s %s/%s] %s\n", it.ID, scopeTag, it.MemoryKey, content)
 		n := utf8.RuneCountInString(line)
 		if used+n > maxRunes {
 			continue // 超预算跳过该条（确定性：不最后整体截断，避免砍掉用户最新纠正）
@@ -814,7 +915,7 @@ func renderMemoryItems(items []store.MemoryItem, scopeLabel string, maxRunes int
 	return out
 }
 
-// dedupeByMemoryKey 同 key 保留最新一条（理论上 active 唯一，兜底防历史脏数据）。
+// dedupeByMemoryKey 同 scope 内同 key 保留最新一条（active 唯一索引的脏数据兜底）。
 func dedupeByMemoryKey(items []store.MemoryItem) []store.MemoryItem {
 	if len(items) <= 1 {
 		return items
@@ -835,6 +936,30 @@ func dedupeByMemoryKey(items []store.MemoryItem) []store.MemoryItem {
 	out := make([]store.MemoryItem, 0, len(order))
 	for _, k := range order {
 		out = append(out, best[k])
+	}
+	return out
+}
+
+// dedupeEffectiveMemoryItems 合并单一项目与全局视图：同 key 的项目条目优先，
+// 不受全局条目更新时间影响；同 scope 内才比较新旧。
+func dedupeEffectiveMemoryItems(items []store.MemoryItem) []store.MemoryItem {
+	best := map[string]store.MemoryItem{}
+	var order []string
+	for _, it := range items {
+		current, ok := best[it.MemoryKey]
+		if !ok {
+			best[it.MemoryKey] = it
+			order = append(order, it.MemoryKey)
+			continue
+		}
+		if (it.Scope == store.MemoryScopeProject && current.Scope != store.MemoryScopeProject) ||
+			(it.Scope == current.Scope && it.UpdatedAt.After(current.UpdatedAt)) {
+			best[it.MemoryKey] = it
+		}
+	}
+	out := make([]store.MemoryItem, 0, len(order))
+	for _, key := range order {
+		out = append(out, best[key])
 	}
 	return out
 }

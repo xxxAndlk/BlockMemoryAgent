@@ -41,6 +41,16 @@
       "description": "domain 主力（OD 网关）：多轮编码、测试与集成修复；输出上限 128K，性价比高"
     },
     {
+      "id": "API-deepseek-v4.1-flash",
+      "name": "API DeepSeek V4.1 Flash",
+      "provider": "openai-responses",
+      "model": "deepseek-flash",
+      "api_key": "${OPENAI_API_KEY_SIX}",
+      "base_url": "${OPENAI_BASE_URL_SIX}",
+      "max_output_tokens": 128000,
+      "description": "domain 主力：多轮编码、测试与集成修复；输出上限 128K，性价比高"
+    },
+    {
       "id": "ark-deepseek-v4-flash",
       "name": "ARK DeepSeek V4 Flash",
       "provider": "anthropic",
@@ -91,5 +101,16 @@
       "description": "UI 出图与前端档：长 HTML 输出，防截断；输出上限 32K，请求间隔 ≥5s，网关不稳定"
     }
   ],
-  "role_bindings": {}
+  "role_bindings": {
+    "domain": {
+      "model_id": "ark-glm-5.3-flash",
+      "thinking": "high",
+      "applied_at": "2026-10-24T09:40:07.8631888Z"
+    },
+    "meta": {
+      "model_id": "od-deepseek-v4.1-flash",
+      "thinking": "high",
+      "applied_at": "2026-10-23T09:26:47.6362117Z"
+    }
+  }
 }

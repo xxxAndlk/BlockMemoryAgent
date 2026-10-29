@@ -256,6 +256,11 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 	//（"用 D 版""这次先不用视频"）留在会话决策账本，不跨会话复用。
 	if prefs := admitPreferences(cleanIncrements(out.UserPrefs)); len(prefs) > 0 && s.userProfile != nil {
 		s.mergeIntoStore(session.ID, agentName, s.userProfile, userProfileTargets, prefs, out.Rejected)
+		if s.memoryLifecycle != nil && s.memoryLifecycle.Enabled() {
+			for _, pref := range prefs {
+				s.memoryLifecycle.RecordEvolvedItem(ctx, MemoryScopeContext{SessionID: session.ID}, store.MemoryScopeUser, pref)
+			}
+		}
 		s.logEvolution(session.ID, "user_pref", "用户画像", strings.Join(prefs, "；"))
 	}
 	// ② 项目经验增量：Merge 整理进项目偏好 + evolution_log。
@@ -264,6 +269,13 @@ func (s *ReactService) evolveSession(session *reactInternalSession, outcome stri
 	if lessons := admitProjectLessons(outcome, cleanIncrements(out.ProjectLessons)); len(lessons) > 0 && s.projectPrefs != nil {
 		if st := s.projectPrefs.ForContext(tool.WithWorkDir(ctx, session.currentWorkDir())); st != nil {
 			s.mergeIntoStore(session.ID, agentName, st, projectPrefsTargets, lessons, out.Rejected)
+			if s.memoryLifecycle != nil && s.memoryLifecycle.Enabled() {
+				for _, lesson := range lessons {
+					s.memoryLifecycle.RecordEvolvedItem(ctx, MemoryScopeContext{
+						ProjectKey: session.currentWorkDir(), SessionID: session.ID,
+					}, store.MemoryScopeProject, lesson)
+				}
+			}
 			s.logEvolution(session.ID, "project_lesson", "项目经验", strings.Join(lessons, "；"))
 		}
 	}

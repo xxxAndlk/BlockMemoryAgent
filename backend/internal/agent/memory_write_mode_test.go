@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/blockmemory/agent/backend/internal/store"
 	"github.com/blockmemory/agent/backend/internal/userprofile"
 )
 
@@ -168,5 +169,33 @@ func TestMemoryWriteModeNormalize(t *testing.T) {
 	s.SetMemoryWriteMode("ENFORCE")
 	if got := s.MemoryWriteMode(); got != MemoryWriteModeEnforce {
 		t.Fatalf("模式应大小写归一，got %q", got)
+	}
+}
+
+func TestMemoryEnforceWritesStructuredEffectiveView(t *testing.T) {
+	s, _, _, _, _ := memModeFixture(t, MemoryWriteModeEnforce, sampleEvolveOutput())
+	repo := store.NewMemoryLongTermStore()
+	lc := NewMemoryLifecycle(repo, RetractionModeEnforce)
+	s.SetMemoryLifecycle(lc)
+	sess := newEvolverTestSession(6)
+	sess.setWorkDir(`D:\proj\moying`)
+	s.evolveSession(sess, "success")
+
+	userBlock := lc.RenderScope(context.Background(), "", "", store.MemoryScopeUser, 2000)
+	if !strings.Contains(userBlock, "以后所有输出都用中文") {
+		t.Fatalf("准入的用户偏好应进入结构化有效视图:\n%s", userBlock)
+	}
+	projectBlock := lc.RenderScope(context.Background(), "", sess.currentWorkDir(), store.MemoryScopeProject, 2000)
+	if !strings.Contains(projectBlock, "统一去白底") {
+		t.Fatalf("准入的项目经验应进入结构化有效视图:\n%s", projectBlock)
+	}
+	items, _ := repo.ListItems(context.Background(), store.MemoryQuery{Statuses: []string{store.MemoryStatusActive}})
+	if len(items) != 2 {
+		t.Fatalf("只应激活两条准入记忆，got %+v", items)
+	}
+	for _, item := range items {
+		if item.Origin != store.MemoryOriginEvolver || item.SourceSession != sess.ID {
+			t.Fatalf("自动记忆来源/会话必须保留: %+v", item)
+		}
 	}
 }

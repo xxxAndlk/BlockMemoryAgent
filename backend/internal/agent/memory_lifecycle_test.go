@@ -423,11 +423,13 @@ func TestMemoryImportMarkdown(t *testing.T) {
 		t.Fatalf("应导入 4 条（1 人工 + 2 拆开的自动 + 1 归档），got %d reason=%s", n, reason)
 	}
 	items, _ := repo.ListItems(context.Background(), store.MemoryQuery{Owner: "", Scope: store.MemoryScopeUser})
-	var active, retracted, legacy int
+	var active, quarantined, retracted, legacy int
 	for _, it := range items {
 		switch it.Status {
 		case store.MemoryStatusActive:
 			active++
+		case store.MemoryStatusQuarantined:
+			quarantined++
 		case store.MemoryStatusRetracted:
 			retracted++
 		}
@@ -435,8 +437,8 @@ func TestMemoryImportMarkdown(t *testing.T) {
 			legacy++
 		}
 	}
-	if active != 3 || retracted != 1 {
-		t.Fatalf("active=%d retracted=%d，期望 3/1", active, retracted)
+	if active != 1 || quarantined != 2 || retracted != 1 {
+		t.Fatalf("active=%d quarantined=%d retracted=%d，期望 1/2/1", active, quarantined, retracted)
 	}
 	if legacy < 3 {
 		t.Fatalf("带时间戳/归档行应标记 legacy_import，got %d", legacy)
@@ -452,5 +454,108 @@ func TestMemoryImportMarkdown(t *testing.T) {
 	})
 	if !blocked {
 		t.Fatal("归档行应作为 tombstone 阻止同内容复活")
+	}
+}
+
+func TestEffectiveBlockProjectOverridesGlobalAndIsolatesProjects(t *testing.T) {
+	lc, repo, sc := newLifecycleFixture(t, RetractionModeEnforce)
+	addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, MemoryKey: "animation.method", Content: "全局方法"})
+	addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeProject, ProjectKey: sc.ProjectKey, MemoryKey: "animation.method", Content: "项目A方法"})
+	addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeProject, ProjectKey: "d:/proj/other", MemoryKey: "animation.method", Content: "项目B方法"})
+
+	block := lc.EffectiveBlock(context.Background(), "", sc.ProjectKey, 2000)
+	if !strings.Contains(block, "项目A方法") || strings.Contains(block, "全局方法") || strings.Contains(block, "项目B方法") {
+		t.Fatalf("项目应覆盖全局同 key 且不得串项目:\n%s", block)
+	}
+	if got := lc.RenderScope(context.Background(), "", "", store.MemoryScopeProject, 2000); got != "" {
+		t.Fatalf("空项目键不得返回项目记忆: %q", got)
+	}
+	onlyGlobal := lc.EffectiveBlock(context.Background(), "", "", 2000)
+	if strings.Contains(onlyGlobal, "项目A方法") || strings.Contains(onlyGlobal, "项目B方法") {
+		t.Fatalf("空项目键不得退化为全项目查询:\n%s", onlyGlobal)
+	}
+}
+
+func TestSyncHumanEditRetractsEveryOrigin(t *testing.T) {
+	lc, repo, _ := newLifecycleFixture(t, RetractionModeEnforce)
+	legacy := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, Origin: store.MemoryOriginLegacyImport, MemoryKey: "lesson.legacy", Content: "旧自动污染"})
+	evolved := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, Origin: store.MemoryOriginEvolver, MemoryKey: "lesson.evolved", Content: "旧进化污染"})
+
+	added, removed, err := lc.SyncHumanEdit(context.Background(), "", store.MemoryScopeUser, "", "# 用户画像\n\n## 偏好\n\n- 新人工偏好\n")
+	if err != nil || added != 1 || removed != 2 {
+		t.Fatalf("同步结果 added=%d removed=%d err=%v", added, removed, err)
+	}
+	for _, id := range []string{legacy.ID, evolved.ID} {
+		got, _ := repo.GetItem(context.Background(), "", id)
+		if got.Status != store.MemoryStatusRetracted {
+			t.Fatalf("%s 应随人工删除撤回，got %s", id, got.Status)
+		}
+	}
+	block := lc.RenderScope(context.Background(), "", "", store.MemoryScopeUser, 2000)
+	if strings.Contains(block, "污染") || !strings.Contains(block, "新人工偏好") {
+		t.Fatalf("有效视图不符合人工快照:\n%s", block)
+	}
+}
+
+func TestSyncHumanEditKeepsAutoLineQuarantined(t *testing.T) {
+	lc, repo, _ := newLifecycleFixture(t, RetractionModeEnforce)
+	item := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, Origin: store.MemoryOriginLegacyImport, Content: "旧自动经验"})
+	md := "# 用户画像\n\n## 偏好\n\n- 旧自动经验（2026-10-21 18:45）\n"
+	if _, _, err := lc.SyncHumanEdit(context.Background(), "", store.MemoryScopeUser, "", md); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := repo.GetItem(context.Background(), "", item.ID)
+	if got.Status != store.MemoryStatusQuarantined || got.Origin != store.MemoryOriginLegacyImport {
+		t.Fatalf("旧自动行不得洗成人工 active: %+v", got)
+	}
+}
+
+func TestQuarantineLegacyUnverified(t *testing.T) {
+	lc, repo, _ := newLifecycleFixture(t, RetractionModeEnforce)
+	legacy := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, Origin: store.MemoryOriginLegacyImport, MemoryKey: "lesson.legacy", Content: "旧自动"})
+	human := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, Origin: store.MemoryOriginHuman, Verification: store.MemoryVerificationVerified, MemoryKey: "lesson.human", Content: "人工偏好"})
+
+	n, err := lc.QuarantineLegacyUnverified(context.Background(), "")
+	if err != nil || n != 1 {
+		t.Fatalf("应隔离一条旧自动记忆 n=%d err=%v", n, err)
+	}
+	got, _ := repo.GetItem(context.Background(), "", legacy.ID)
+	if got.Status != store.MemoryStatusQuarantined {
+		t.Fatalf("旧自动记忆应隔离，got %s", got.Status)
+	}
+	kept, _ := repo.GetItem(context.Background(), "", human.ID)
+	if kept.Status != store.MemoryStatusActive {
+		t.Fatalf("人工偏好不得被隔离，got %s", kept.Status)
+	}
+	if again, err := lc.QuarantineLegacyUnverified(context.Background(), ""); err != nil || again != 0 {
+		t.Fatalf("重复清理应幂等 n=%d err=%v", again, err)
+	}
+}
+
+func TestRetractDoesNotTouchUnrelatedSingleItem(t *testing.T) {
+	lc, repo, sc := newLifecycleFixture(t, RetractionModeEnforce)
+	item := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, MemoryKey: "response.style", Content: "输出要简洁"})
+	report := lc.HandleUserMessage(context.Background(), sc, "以后不要用某个我从未登记的做法了", "msg-unrelated")
+	if report.Handled || !report.ReconcileRequired {
+		t.Fatalf("低置信目标不得误撤回，应对账: %+v", report)
+	}
+	got, _ := repo.GetItem(context.Background(), "", item.ID)
+	if got.Status != store.MemoryStatusActive {
+		t.Fatalf("唯一但无关的条目不得被撤回，got %s", got.Status)
+	}
+}
+
+func TestLongTermMemoryBlockRefreshesAfterRetract(t *testing.T) {
+	lc, repo, _ := newLifecycleFixture(t, RetractionModeEnforce)
+	item := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, MemoryKey: "response.style", Content: "旧偏好"})
+	svc := &ReactService{memoryLifecycle: lc}
+	if block := svc.longTermMemoryBlock("D:\\proj\\moying"); !strings.Contains(block, "旧偏好") {
+		t.Fatalf("有效偏好应进入尾部记忆块: %q", block)
+	}
+	if _, err := lc.RetractByID(context.Background(), "", item.ID, "测试撤回"); err != nil {
+		t.Fatal(err)
+	}
+	if block := svc.longTermMemoryBlock("D:\\proj\\moying"); strings.Contains(block, "旧偏好") {
+		t.Fatalf("撤回后下一次记忆块不得含旧偏好: %q", block)
 	}
 }

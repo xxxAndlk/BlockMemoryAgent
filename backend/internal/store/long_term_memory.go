@@ -136,6 +136,8 @@ type MemoryRepo interface {
 	ListItems(ctx context.Context, q MemoryQuery) ([]MemoryItem, error)
 	// SetStatus 状态迁移（带 revision 乐观锁），返回更新后的条目。
 	SetStatus(ctx context.Context, owner, id, status string, expectedRevision int64) (*MemoryItem, error)
+	// TransitionStatus 在同一事务中迁移状态并追加对应审计事件。
+	TransitionStatus(ctx context.Context, owner, id, status string, expectedRevision int64, ev MemoryEvent) (*MemoryItem, error)
 	SetVerification(ctx context.Context, owner, id, verification string, expectedRevision int64) (*MemoryItem, error)
 	AppendEvent(ctx context.Context, ev MemoryEvent) error
 	ListEvents(ctx context.Context, owner, memoryID string, limit int) ([]MemoryEvent, error)
@@ -322,6 +324,55 @@ WHERE owner=$1 AND id=$2 AND revision=$4`, owner, id, status, expectedRevision)
 		return nil, ErrMemoryRevisionConflict
 	}
 	return s.GetItem(ctx, owner, id)
+}
+
+// TransitionStatus 状态迁移与审计事件同事务提交，任一步失败都回滚。
+func (s *LongTermMemoryStore) TransitionStatus(ctx context.Context, owner, id, status string, expectedRevision int64, ev MemoryEvent) (*MemoryItem, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("long-term memory store not wired")
+	}
+	if !validMemoryStatus(status) {
+		return nil, fmt.Errorf("invalid memory status %q", status)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin memory status transition: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `
+UPDATE long_term_memory_items
+SET status=$3, revision=revision+1, updated_at=now()
+WHERE owner=$1 AND id=$2 AND revision=$4`, owner, id, status, expectedRevision)
+	if err != nil {
+		return nil, fmt.Errorf("set memory status %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrMemoryRevisionConflict
+	}
+	row := tx.QueryRowContext(ctx,
+		`SELECT `+memoryItemColumns+` FROM long_term_memory_items WHERE owner=$1 AND id=$2`, owner, id)
+	updated, err := scanMemoryItem(row)
+	if err != nil {
+		return nil, fmt.Errorf("read transitioned memory item %s: %w", id, err)
+	}
+	if ev.Payload == "" {
+		ev.Payload = "{}"
+	}
+	if ev.Actor == "" {
+		ev.Actor = MemoryActorSystem
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO long_term_memory_events
+  (owner, memory_id, event_type, actor, source_session, source_message, reason, payload)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		ev.Owner, nullIfEmpty(ev.MemoryID), ev.EventType, ev.Actor, ev.SourceSession,
+		ev.SourceMessage, ev.Reason, ev.Payload); err != nil {
+		return nil, fmt.Errorf("append memory transition event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit memory status transition: %w", err)
+	}
+	return &updated, nil
 }
 
 // SetVerification 验证状态迁移（与 status 正交：verified 不能覆盖 retracted）。
@@ -525,6 +576,37 @@ func (m *MemoryLongTermStore) SetStatus(_ context.Context, owner, id, status str
 	it.Revision++
 	it.UpdatedAt = time.Now()
 	m.items[id] = it
+	return &it, nil
+}
+
+// TransitionStatus 实现 MemoryRepo，状态与事件在同一临界区提交。
+func (m *MemoryLongTermStore) TransitionStatus(_ context.Context, owner, id, status string, expectedRevision int64, ev MemoryEvent) (*MemoryItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !validMemoryStatus(status) {
+		return nil, fmt.Errorf("invalid memory status %q", status)
+	}
+	it, ok := m.items[id]
+	if !ok || it.Owner != owner {
+		return nil, ErrMemoryItemNotFound
+	}
+	if expectedRevision > 0 && it.Revision != expectedRevision {
+		return nil, ErrMemoryRevisionConflict
+	}
+	it.Status = status
+	it.Revision++
+	it.UpdatedAt = time.Now()
+	m.items[id] = it
+	m.seq++
+	ev.ID = m.seq
+	ev.CreatedAt = time.Now()
+	if ev.Payload == "" {
+		ev.Payload = "{}"
+	}
+	if ev.Actor == "" {
+		ev.Actor = MemoryActorSystem
+	}
+	m.events = append(m.events, ev)
 	return &it, nil
 }
 

@@ -1092,6 +1092,12 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	}
 	log.Printf("[subagent] STALL KILL: sub=%s parent=%s threshold>%s evidence=[%s] - cancel+notify",
 		subAgentID, meta.parentID, threshold, evidence)
+	// 先落 Failed 再取消执行，避免快速 Canceled 分支抢先把节点置成 Cancelled。
+	if d.treeFn != nil && meta.sessionID != "" {
+		if t := d.treeFn(meta.sessionID); t != nil {
+			t.Finish(subAgentID, "心跳超时疑似卡死", errors.New("heartbeat timeout"))
+		}
+	}
 	// cancel 可能为 nil：热驻 domain 槽的 subMeta 在任务 ctx 创建前注册（idle_pool
 	// dispatchHotDomain），首任务换绑前/挂起等用户续跑期间被巡检命中时（2026-08-26
 	// 实证进程级 panic）不得空指针崩溃。nil 时跳过主动 cancel，仍走 doneOnce 兜底
@@ -1155,11 +1161,6 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 			s.mu.Lock()
 			s.childReported = true
 			s.mu.Unlock()
-		}
-	}
-	if d.treeFn != nil && meta.sessionID != "" {
-		if t := d.treeFn(meta.sessionID); t != nil {
-			t.Finish(subAgentID, "心跳超时疑似卡死", errors.New("heartbeat timeout"))
 		}
 	}
 	// 被杀节点不再续跑（热驻槽随后走 destroySlot），回收实例级模型覆盖。
@@ -4823,7 +4824,8 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
-		WithWorkDir(d.subAgentWorkDirFor(ctx))
+		WithWorkDir(d.subAgentWorkDirFor(ctx)).
+		WithDirectiveBlock(func() string { return d.projectPrefsPrefix(ctx) })
 	// 技能渐进披露第一层：【可用技能】元数据块注入系统提示（正文经 load_skill 按需取）。
 	// 持有集以 heldSkills 为权威（未登记回退角色固定集），skillPool nil 时零行为。
 	sub = sub.WithSkillBlock(d.skillBlockFor(subAgentID, &roleDef))
@@ -4899,11 +4901,7 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		prefixes = append(prefixes, sp)
 		injectRunes["shared_prefix"] = len([]rune(sp))
 	}
-	// 项目偏好（2026-09-02 设计 §5）：本项目约定与经验下发给全部子 Agent（执行层工艺）。
-	if pp := d.projectPrefsPrefix(ctx); pp != "" {
-		prefixes = append(prefixes, pp)
-		injectRunes["project_prefs"] = len([]rune(pp))
-	}
+	// 项目经验由 WithDirectiveBlock 每轮动态注入，不再冻结进任务前缀。
 	// 经验技能召回（2026-09-02 设计 §6.5）：task 向量预筛 top-3，只注一行提示不注全文。
 	if sr := d.skillRecallPrefix(ctx, origTask); sr != "" {
 		prefixes = append(prefixes, sr)
@@ -5462,7 +5460,8 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		WithMailbox(d.mailbox).
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor(roleDef.ID)).
-		WithWorkDir(d.subAgentWorkDirFor(ctx))
+		WithWorkDir(d.subAgentWorkDirFor(ctx)).
+		WithDirectiveBlock(func() string { return d.projectPrefsPrefix(ctx) })
 	// resume 重建的 Agent 恢复技能块：持有集从 heldSkills 取（一次性路径派发时已登记；
 	// 进程重启丢失则回退角色固定集）。
 	sub = sub.WithSkillBlock(d.skillBlockFor(pausedNodeID, roleDef))

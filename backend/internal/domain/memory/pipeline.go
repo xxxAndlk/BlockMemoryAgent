@@ -10,9 +10,10 @@ import (
 	"sync"     // sync 提供读写锁，保证并发安全
 	"time"     // time 用于为事件填充发生时间
 
-	"github.com/blockmemory/agent/backend/internal/agent" // agent 包提供 MemoryEvent、MemoryPipeline、ReactMessage 等类型
-	"github.com/blockmemory/agent/backend/pkg/textutil"   // 统一截断工具
-	"github.com/blockmemory/agent/backend/pkg/types"      // types 包提供 RoleDefinition 类型
+	"github.com/blockmemory/agent/backend/internal/agent"       // agent 包提供 MemoryEvent、MemoryPipeline、ReactMessage 等类型
+	"github.com/blockmemory/agent/backend/internal/domain/tool" // 外部内容统一不可信围栏
+	"github.com/blockmemory/agent/backend/pkg/textutil"         // 统一截断工具
+	"github.com/blockmemory/agent/backend/pkg/types"            // types 包提供 RoleDefinition 类型
 )
 
 // DefaultEventLimit 定义当 Assemble 未配置事件数量上限时，默认注入上下文的近期事件条数。
@@ -616,17 +617,30 @@ func formatEvent(ev agent.MemoryEvent) string {
 		// 回答类型：展示 agentID 与回答内容摘要
 		return fmt.Sprintf("[%s] answer: %s", ev.AgentID, truncate(ev.Content, 120))
 	case "tool_call":
-		// 工具调用类型：展示工具名、输入输出摘要，便于回溯调用链
-		return fmt.Sprintf("[%s] tool=%s input=%s output=%s", ev.AgentID, ev.ToolName, truncate(ev.Input, 80), truncate(ev.Output, 120))
+		payload := fmt.Sprintf("input=%s output=%s", truncate(ev.Input, 80), truncate(ev.Output, 120))
+		if isUserDirectiveEventTool(ev.ToolName) {
+			return fmt.Sprintf("[%s] tool=%s %s", ev.AgentID, ev.ToolName, payload)
+		}
+		return fmt.Sprintf("[%s] tool=%s %s", ev.AgentID, ev.ToolName, tool.WrapUntrusted("tool:"+ev.ToolName, payload))
 	case "call_sub_agent":
 		// 调用子智能体类型：展示目标角色与触发内容摘要
-		return fmt.Sprintf("[%s] called sub-agent %s (%s)", ev.AgentID, ev.Role, truncate(ev.Content, 120))
+		return fmt.Sprintf("[%s] called sub-agent %s (%s)", ev.AgentID, ev.Role, tool.WrapUntrusted("dispatch:"+ev.Role, truncate(ev.Content, 120)))
 	case "sub_agent_summary":
-		// 子智能体汇总类型：展示子智能体角色与返回摘要
-		return fmt.Sprintf("[%s] sub-agent %s summary: %s", ev.AgentID, ev.Role, truncate(ev.Content, 120))
+		// 子 Agent 转述可能包含被污染外部源，保留数据来源与不可信边界。
+		return fmt.Sprintf("[%s] sub-agent %s summary: %s", ev.AgentID, ev.Role, tool.WrapUntrusted("sub-agent:"+ev.Role, truncate(ev.Content, 120)))
 	default:
 		// 未知或自定义类型：展示类型名与内容摘要
 		return fmt.Sprintf("[%s] %s: %s", ev.AgentID, ev.Type, truncate(ev.Content, 120))
+	}
+}
+
+// isUserDirectiveEventTool 识别承载真实用户裁决的工具，避免把用户答复降成不可信数据。
+func isUserDirectiveEventTool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "ask_user", "askuser", "ask_user_batch", "review_plan":
+		return true
+	default:
+		return false
 	}
 }
 

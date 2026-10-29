@@ -435,7 +435,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		WithFileMapProvider(toolRegistry.FileMapText) // 任务级文件小地图：触碰文件符号轮廓尾部常驻注入，压缩压不掉
 
 	// mailbox 留痕（编排页 Agent 间交互留痕）：每封邮件收发双方各写一条 agent_events
-	//（type=mailbox），随会话删除一并清理；写失败仅记日志，不影响投递。
+	// （type=mailbox），随会话删除一并清理；写失败仅记日志，不影响投递。
 	sharedMailbox.WithTrace(func(msg *mailbox.Message) {
 		// 异步落库：钩子在 Send 的调用方 goroutine 上同步执行，而 Pipeline.Write 是同步
 		// PG INSERT（各自 5s 超时）——同步写会让每封邮件（notify/墙钟预警/用户直连注入）
@@ -457,7 +457,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			}
 		}
 		// 交给独立 goroutine：Send 的调用方立即返回，不被 PG 写阻塞
-		//（mailbox 侧已传值拷贝，msg 归本闭包独占，跨 goroutine 使用安全）。
+		// （mailbox 侧已传值拷贝，msg 归本闭包独占，跨 goroutine 使用安全）。
 		go func() {
 			writeRow(msg.To)
 			// user/dispatcher 是系统侧发送者（非 Agent），不作为发送方行落库。
@@ -519,7 +519,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		ToolParallelMaxConcurrency: cfg.Agent.ToolParallelMaxConcurrency,
 	}
 	// 工具图片长边降采样（TODO 第9项④）：agent 包级旋钮，全部工具图片唯一汇流点
-	//（toolRegistryAdapter.Dispatch）读取；<=0 关闭。进程生命周期内不变。
+	// （toolRegistryAdapter.Dispatch）读取；<=0 关闭。进程生命周期内不变。
 	agent.SetImageMaxEdge(cfg.Agent.ImageMaxEdge)
 	subAgentTimeout := time.Duration(cfg.Agent.SubAgentTimeoutMin) * time.Minute
 	if subAgentTimeout < 0 {
@@ -788,7 +788,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	agentSvc.SetDecisionLayer(decisionLayer)
 	// 派发依赖门/回写用 GetRestored（2026-09-29 终审修复）：重启后 meta 重放 write_plan 之前，
 	// 内存无看板时从持久层惰性恢复，依赖门不静默放行；上面 agentSvc.SetBoard 仍用 Get
-	//（wrapMetaMemory 每轮调用，恢复语义会对无看板会话每轮打一次 PG，不可接受）。
+	// （wrapMetaMemory 每轮调用，恢复语义会对无看板会话每轮打一次 PG，不可接受）。
 	subAgentDispatcher.WithBoard(rt.Boards.GetRestored, func(sid, goal string) *board.TaskBoard {
 		return rt.Boards.GetOrCreate(sid, goal)
 	})
@@ -843,7 +843,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		return b.String(), nil
 	})
 	// 角色自进化准则写入钩子（update_evolution_prompt 工具）：按角色 upsert 准则
-	//（全量替换语义），并把变更摘要追加进 evolution_log 审计流水（记忆中心时间线可见）。
+	// （全量替换语义），并把变更摘要追加进 evolution_log 审计流水（记忆中心时间线可见）。
 	toolRegistry.SetEvolutionPromptHook(func(ctx context.Context, roleID, content, sessionID string) error {
 		if roleEvolutionStore == nil {
 			return fmt.Errorf("演化准则存储未启用")
@@ -857,8 +857,8 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		return nil
 	})
 	// 块记忆检索钩子（search_block_memory 工具）：跨 session 语义召回全局块记忆沉淀
-	//（excludeSessionID 传空 = 不排除任何会话）。每条结果包 <untrusted_data> 围栏
-	//（防注入纪律，同 dispatcher renderRecalledMemory），内容截 600 runes，
+	// （excludeSessionID 传空 = 不排除任何会话）。每条结果包 <untrusted_data> 围栏
+	// （防注入纪律，同 dispatcher renderRecalledMemory），内容截 600 runes，
 	// 附来源会话与沉淀时间供溯源。
 	toolRegistry.SetBlockMemorySearchHook(func(ctx context.Context, query string) (string, error) {
 		if pgStore == nil || pgStore.Knowledge == nil {
@@ -903,7 +903,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	agentSvc.SetPersonaInjector(rt.Soul)
 	// 用户画像（TODO #28 第四层记忆）：单文件 user_profile.md，人可编辑 + 程序结构化追加。
 	// 注入仅 MetaAgent（metaPersona 组合人格+画像+项目偏好），子 Agent 不下发用户画像
-	//（防上下文膨胀/偏好泄露；项目偏好例外，见下）。
+	// （防上下文膨胀/偏好泄露；项目偏好例外，见下）。
 	// 双路写入：remember_preference 工具（用户显式陈述，立即生效）+ 会话完成轻量模型提取。
 	// Merge 整理（2026-09-02 期 1）：提取增量经轻量模型去重/冲突归档进偏好/技术栈/沟通风格小节。
 	// 长期记忆生命周期（2026-10-24 撤回与污染修复）：items/events 权威在 PG，
@@ -926,6 +926,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			memoryLifecycle.SetMatcher(mm)
 		}
 		agentSvc.SetMemoryLifecycle(memoryLifecycle)
+		if n, err := memoryLifecycle.QuarantineLegacyUnverified(ctx, ""); err != nil {
+			log.Printf("[bootstrap] quarantine legacy memory completed with errors: %v", err)
+		} else if n > 0 {
+			log.Printf("[bootstrap] quarantined %d unverified legacy memory item(s)", n)
+		}
 	}
 	var profileStore *userprofile.Store
 	if paths.ProfilePath != "" {
@@ -1027,15 +1032,17 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		importMemoryFromMarkdown(memoryLifecycle, filepath.Join(workDir, ".bma", "project_preferences.md"),
 			store.MemoryScopeProject, workDir)
 		subAgentDispatcher.WithProjectPreferences(func(ctx context.Context) string {
-			// 2026-10-24：注入只读长期记忆有效视图（status=active，带紧凑 ID），
-			// 已被用户撤回/隔离的条目物理缺席；未装配生命周期时回落 Markdown（旧语义）。
 			if memoryLifecycle != nil && memoryLifecycle.Enabled() {
 				pk := store.NormalizeProjectKey(tool.WorkDirFromContext(ctx))
-				if block := memoryLifecycle.EffectiveBlock(ctx, "", pk, 2400); block != "" {
-					return block
+				if pk != "" {
+					current := projectPrefsStore.Current(ctx)
+					if _, reason := memoryLifecycle.ImportMarkdown(ctx, "", store.MemoryScopeProject, pk, current.Content); reason != "" && reason != "already imported" && reason != "no importable lines" {
+						log.Printf("[memory-lifecycle] import subagent project preferences failed: %s", reason)
+					}
 				}
+				// 有效视图为空也必须返回空，禁止已撤回内容经 Markdown 回退复活。
+				return memoryLifecycle.EffectiveBlock(ctx, "", pk, 2400)
 			}
-			// 注入侧剥归档小节（经验归档）：已废止经验只留磁盘审计，不污染子 Agent。
 			return userprofile.StripSection(projectPrefsStore.Current(ctx).Content, projectPrefsStore.ArchiveSection())
 		})
 		toolRegistry.SetProjectPreferenceHook(func(ctx context.Context, text string) error {
@@ -1136,7 +1143,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 派发任务的机器权威状态（完成/失败+原因/进行中），完成项禁止重新派发查询，防旧需求返工。
 	agentSvc.SetTaskLedgerProvider(subAgentDispatcher.TaskLedgerBrief)
 	// 记忆索引槽（TODO #20③+#22③，memory_index.go）：会话启动注入一行式沉淀索引
-	//（行数/runes 双配额 + 超限重写指令），untrusted 围栏行结构性丢弃（信任分层）。
+	// （行数/runes 双配额 + 超限重写指令），untrusted 围栏行结构性丢弃（信任分层）。
 	agentSvc.SetMemoryIndexProvider(newMemoryIndexProvider(pgStore.Knowledge, cfg.Agent.MemoryIndexMaxLines, cfg.Agent.MemoryIndexMaxRunes))
 	// 角色自进化准则注入（role_evolution_prompts）：MetaAgent 系统提示与子 Agent 派发前缀
 	// 追加该角色积累的行为准则；同一闭包供 ReactService 与 Dispatcher 两侧消费。
@@ -1366,18 +1373,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		}
 		return info.Name, info.Enabled, true
 	})
-		toolRegistry.SetWidgetManager(widgetMgr, agentSvc.PushWidgetData)
-		// owner 归属（TODO #18-8 多租户预留）：widget_save 落盘 Manifest.owner。
-		// 运行态会话内存当前不维护 user_id（owner 列仅落在 events/messages 等持久层），
-		// 会话 owner 来源接线后在此替换；返回空串时 owner 字段留空（不阻断保存）。
-		toolRegistry.SetWidgetOwnerResolver(func(sessionID string) string {
-			return "" // TODO(#18-8): 会话 owner 来源接线后返回 s.Owner
-		})
-	// 连接器调度器（2026-10-17 Widget「连接器」）：api/mcp 连接器按 interval_sec 定时
-	// 执行，结果经 BroadcastWidgetData 广播到打开部件的会话（widget_data 瞬时通道，
-	// 与 POST /widgets/push 同款出口；push 语义不变，只是新调用方）。mcp 工具调用经
-	// toolRegistry.Dispatch（ctx 注入主工作目录，与工作流量产程序化调用同口径）。
-	// 生命周期跟 startDataMaintenance 同款装配：goroutine + ctx 取消，cleanup 里停。
+	toolRegistry.SetWidgetManager(widgetMgr, agentSvc.PushWidgetData)
+	// owner 归属（TODO #18-8 多租户预留）：widget_save 落盘 Manifest.owner。
+	// 运行态会话内存当前不维护 user_id（owner 列仅落在 events/messages 等持久层），
+	// 会话 owner 来源接线后在此替换；返回空串时 owner 字段留空（不阻断保存）。
+	toolRegistry.SetWidgetOwnerResolver(func(sessionID string) string {
+		return "" // TODO(#18-8): 会话 owner 来源接线后返回 s.Owner
+	})
+// 连接器调度器（2026-10-17 Widget「连接器」）：api/mcp 连接器按 interval_sec 定时
+// 执行，结果经 BroadcastWidgetData 广播到打开部件的会话（widget_data 瞬时通道，
+// 与 POST /widgets/push 同款出口；push 语义不变，只是新调用方）。mcp 工具调用经
+// toolRegistry.Dispatch（ctx 注入主工作目录，与工作流量产程序化调用同口径）。
+// 生命周期跟 startDataMaintenance 同款装配：goroutine + ctx 取消，cleanup 里停。
 	connectorSchedCtx, connectorSchedCancel := context.WithCancel(context.Background())
 	connectorSched := widgets.NewConnectorScheduler(widgetMgr, agentSvc.BroadcastWidgetData)
 	connectorSched.SetMCPToolCaller(connectorToolCaller{reg: toolRegistry, workDir: workDir})
@@ -1607,7 +1614,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 }
 
 // connectorToolCaller 把 toolRegistry.Dispatch 适配成 widgets.MCPToolCaller
-//（连接器 mcp 型的工具调用通道）：ctx 注入进程主工作目录（与程序化调用同口径），
+// （连接器 mcp 型的工具调用通道）：ctx 注入进程主工作目录（与程序化调用同口径），
 // 成功取 Result.Output，失败带 Error 明细（调度器记日志后跳过本次）。
 type connectorToolCaller struct {
 	reg     *tool.Registry
@@ -1826,7 +1833,7 @@ func newEventSummarizer(f *model.ModelFactory) memory.EventSummarizer {
 // 用户决策不再由摘要器生成（旧版【已定决策】节会从工具记录里反推出不存在的新目标），
 // 权威来源是 session_decisions 指令账本。
 // 【文件要点】节保留的原因：压缩丢已读文件内容导致领域 Agent 失忆、反复重读同一文件
-//（实测单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）。
+// （实测单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）。
 // 压缩前自盘提醒（TODO #21②，KC v0.41.0 同款）：提示先自盘状态再出包，摘要质量前置增益。
 // 看板/台账注入段在压缩视图之外常驻（wrapMetaMemory 尾部注入，压缩不触碰），
 // 随摘要天然保留（KC v0.41.0 同款语义，核实项）。
@@ -1975,7 +1982,7 @@ func sessionIDOfAgentID(agentID string) string {
 }
 
 // boardStoreAdapter 把 store.BoardStore（[]byte 出入参）适配为 board.Store
-//（Snapshot 出入参）——分层纪律：store 不 import board，JSON 编解码在此收口。
+// （Snapshot 出入参）——分层纪律：store 不 import board，JSON 编解码在此收口。
 type boardStoreAdapter struct {
 	st *store.BoardStore
 }

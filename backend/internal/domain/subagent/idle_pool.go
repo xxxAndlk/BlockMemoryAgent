@@ -1171,6 +1171,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 	if wd == "" {
 		wd = d.subAgentWorkDir()
 	}
+	memoryCtx := tool.WithWorkDir(tool.WithSessionID(context.Background(), s.sessionID), wd)
 	sub := agent.NewReActAgent(s.id, *roleDef, provider, agent.NewToolRegistryAdapterForRole(d.tools, s.id, d.effectiveToolAllowlist(s.id, roleDef), roleDef.ID, d.pluginVisibility)).
 		WithSubAgent().
 		WithProviderFunc(providerFn).
@@ -1178,6 +1179,7 @@ func (d *Dispatcher) buildDomainAgent(s *domainSlot) (*agent.ReActAgent, error) 
 		WithMemory(mem).
 		WithLoopConfig(d.loopConfigFor("domain")).
 		WithWorkDir(wd).
+		WithDirectiveBlock(func() string { return d.projectPrefsPrefix(memoryCtx) }).
 		WithSkillBlock(d.skillBlockFor(s.id, roleDef)).
 		WithPendingChildrenChecker(d).
 		WithSuspendGate(&slotSuspendGate{d: d, sid: s.sessionID})
