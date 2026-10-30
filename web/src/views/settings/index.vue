@@ -32,6 +32,7 @@ onMounted(async () => {
 // 能力名 → 展示名（其余原样直出）
 const capLabels: Record<string, string> = {
   llm: 'LLM 模型',
+  docker: 'Docker 容器',
   postgres: 'Postgres',
   redis: 'Redis',
   embed: '向量嵌入',

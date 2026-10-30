@@ -135,6 +135,8 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/plugins/:id/enable", apiHandler.EnablePluginHandler)   // 热启用
 	api.POST("/plugins/:id/disable", apiHandler.DisablePluginHandler) // 热停用
 	api.POST("/plugins/reload", apiHandler.ReloadPluginsHandler)      // 重读配置 + 重扫 plugins.d/
+	api.GET("/plugins/docker", apiHandler.DockerPluginsHandler)      // docker 依赖自检（镜像/容器状态）
+	api.POST("/plugins/cleanup", apiHandler.CleanupPluginsHandler)   // 清理 docker 残留（?all=true 含运行中 keeper）
 
 	// 界面部件（Widget）管理 API：目录包热载 + 卡片文件服务 + 瞬时数据推送 + 错误回报。
 	// 静态段 reload/push/report 与 :id 同层注册（与 plugins 段同款，gin 静态优先）。

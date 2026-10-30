@@ -7,6 +7,7 @@ package model
 import (
 	"context" // 上下文传递
 	"fmt"     // 错误格式化
+	"log"     // 启动期模型解析报告（LogStartupResolution）
 	"sort"    // 实例覆盖清单排序（展示稳定）
 	"strings" // 失败角色列表拼接
 	"sync"    // 读写锁，保护 models 缓存
@@ -118,8 +119,8 @@ type ModelFactory struct {
 	// agentOvMu / agentOverrides：实例级模型覆盖（key: agentID）。独立于角色缓存 models——
 	// role_bindings 变更 / invalidateChangedClients / checkRegistryReload 均不触碰覆盖
 	// （角色换绑定不影响已覆盖实例）；反向亦隔离（覆盖不改同角色其他实例）。
-	agentOvMu       sync.RWMutex
-	agentOverrides  map[string]agentOverride
+	agentOvMu      sync.RWMutex
+	agentOverrides map[string]agentOverride
 }
 
 // NewModelFactory 创建模型工厂。
@@ -768,6 +769,39 @@ func (f *ModelFactory) WarmUp(ctx context.Context) error {
 	}
 	// 全部预热成功
 	return nil
+}
+
+// LogStartupResolution 启动期打印每个可切换角色的生效模型（provider/model/思路档 +
+// 是否配了 API Key），**不发任何网络请求**。
+//
+// 背景（2026-10-28）：启动不再做 LLM 连通性硬校验（模型可在应用内随时切换，单个模型
+// 不可用不该阻断桌面服务起来）。为了让"哪个模型大概能用"在启动日志里仍可判断，这里
+// 只做纯内存解析 + Key 有无的静态报告；真正的可用性由运行期调用/模型页连通性探测暴露。
+func (f *ModelFactory) LogStartupResolution() {
+	roles := f.SwitchableRoles()
+	// 排序保证日志稳定（fixed_roles 顺序在 yaml 里可能被改动）。
+	sort.Strings(roles)
+	okCount := 0
+	for _, roleID := range roles {
+		cfg, err := f.resolveConfig(roleID)
+		if err != nil {
+			log.Printf("[bootstrap] [WARN] 模型解析失败 role=%s（可在模型页重新绑定后使用）: %v", roleID, err)
+			continue
+		}
+		if cfg.Provider == "" || cfg.Model == "" {
+			log.Printf("[bootstrap] [WARN] 模型未配置 role=%s（可在模型页选择模型）", roleID)
+			continue
+		}
+		keyState := "missing"
+		if cfg.APIKey != "" {
+			keyState = "set"
+			okCount++
+		}
+		log.Printf("[bootstrap] model role=%s provider=%s model=%s thinking=%s api_key=%s",
+			roleID, cfg.Provider, cfg.Model, cfg.Thinking, keyState)
+	}
+	log.Printf("[bootstrap] 模型启动校验已跳过（只做静态解析，不做连通性探测）；可直接使用/可切换的角色 %d/%d——不可用的模型请在应用内模型页切换",
+		okCount, len(roles))
 }
 
 // probePrompt 连通性探测用的最小化提示词（廉价，约 1 token）。

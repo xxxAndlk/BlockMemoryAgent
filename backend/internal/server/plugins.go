@@ -6,6 +6,8 @@ package server
 //   - POST /api/plugins/{id}/enable     — 热启用
 //   - POST /api/plugins/{id}/disable    — 热停用
 //   - POST /api/plugins/reload          — 重读 plugins.yaml + 重扫 plugins.d/
+//   - GET  /api/plugins/docker          — docker 依赖自检（镜像/容器状态，只读）
+//   - POST /api/plugins/cleanup         — 清理 docker 残留（?all=true 含运行中 keeper）
 //
 // 全部端点经 GinAuthMiddleware 保护（bootstrap/router.go 统一挂组中间件）。
 
@@ -97,4 +99,38 @@ func (h *APIHandler) ReloadPluginsHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(200, map[string]any{"status": "ok", "plugins": h.pluginMgr.List()})
+}
+
+// DockerPluginsHandler 处理 GET /api/plugins/docker — docker 依赖自检（只读）。
+// 启用插件的镜像就绪情况 + bma 项目容器状态 + 残留停止容器清单。
+func (h *APIHandler) DockerPluginsHandler(c *gin.Context) {
+	if h.pluginMgr == nil {
+		c.String(503, "plugin manager not initialized")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	c.JSON(200, h.pluginMgr.DockerReport(ctx))
+}
+
+// CleanupPluginsHandler 处理 POST /api/plugins/cleanup — 清理 docker 残留。
+//
+// 默认（?all 缺省）：只删已停止的 bma-plugin-* 容器 + 悬空镜像（2026-10-28：换工作
+// 目录/镜像重建/进程被强杀都会残留，启动时也会自动跑同一套）。
+// ?all=true：连运行中的 keeper 容器一起删——会掐断其他 BMA 实例（tui/server 多开）
+// 的在途 MCP 会话，下次调用自动重建，仅用于显式释放内存/换镜像。
+func (h *APIHandler) CleanupPluginsHandler(c *gin.Context) {
+	if h.pluginMgr == nil {
+		c.String(503, "plugin manager not initialized")
+		return
+	}
+	includeRunning := c.Query("all") == "true" || c.Query("all") == "1"
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
+	defer cancel()
+	res := h.pluginMgr.CleanupDocker(ctx, includeRunning)
+	c.JSON(200, map[string]any{
+		"status":  "ok",
+		"cleanup": res,
+		"docker":  h.pluginMgr.DockerReport(ctx),
+	})
 }

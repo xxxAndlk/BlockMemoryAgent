@@ -15,15 +15,15 @@ import (
 // 注：文本嵌入模型配置（EmbedConfig）已迁移到 roles.yaml，由 pkg/config 解析。
 // 由 Load 函数从 YAML 文件读取并填充后返回。
 type Config struct {
-	Postgres PostgresConfig `yaml:"postgres"` // PostgreSQL 关系型存储配置（私有记忆、快照、知识库 CRUD）
-	PgVector PgVectorConfig `yaml:"pgvector"` // pgvector 向量索引配置（语义检索）
-	Redis    RedisConfig    `yaml:"redis"`    // Redis 热缓存配置（workspace、快照、Stream）
-	HTTP     HTTPConfig     `yaml:"http"`     // HTTP 服务监听与超时配置
-	Memory   MemoryConfig   `yaml:"memory"`   // 记忆管线运行参数（批写/刷新/快照间隔）
-	Agent    AgentConfig    `yaml:"agent"`    // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
-	Logging  LoggingConfig  `yaml:"logging"`  // 日志文件输出（按天分割，按入口分文件）
-	Data     DataConfig     `yaml:"data"`     // 数据生命周期（陈旧知识归档/日志与工具输出保留期，TODO #18-2 T29）
-	Notify   NotifyConfig   `yaml:"notify"`   // 会话终态 Webhook 通知（TODO #18-5 T32）
+	Postgres    PostgresConfig    `yaml:"postgres"`     // PostgreSQL 关系型存储配置（私有记忆、快照、知识库 CRUD）
+	PgVector    PgVectorConfig    `yaml:"pgvector"`     // pgvector 向量索引配置（语义检索）
+	Redis       RedisConfig       `yaml:"redis"`        // Redis 热缓存配置（workspace、快照、Stream）
+	HTTP        HTTPConfig        `yaml:"http"`         // HTTP 服务监听与超时配置
+	Memory      MemoryConfig      `yaml:"memory"`       // 记忆管线运行参数（批写/刷新/快照间隔）
+	Agent       AgentConfig       `yaml:"agent"`        // Agent 运行时动态参数（上下文窗口/工具轮数/重试等）
+	Logging     LoggingConfig     `yaml:"logging"`      // 日志文件输出（按天分割，按入口分文件）
+	Data        DataConfig        `yaml:"data"`         // 数据生命周期（陈旧知识归档/日志与工具输出保留期，TODO #18-2 T29）
+	Notify      NotifyConfig      `yaml:"notify"`       // 会话终态 Webhook 通知（TODO #18-5 T32）
 	Skills      SkillsConfig      `yaml:"skills"`       // 经验技能库治理（上限/目录收敛/自动整理）
 	BlockMemory BlockMemoryConfig `yaml:"block_memory"` // 块记忆库治理（近重复合并/零访问归档，2026-10-13）
 	Decision    DecisionConfig    `yaml:"decision"`     // 决策层 provider（TODO #23）：默认 LLM 兜底，外部 HTTP 默认关
@@ -130,10 +130,10 @@ type LLMRuntimeConfig struct {
 	// 实际大小脱钩，致 Agent 每 10 步强制失忆、反复重读文件；压缩已改为仅由 token 阈值
 	// （ContextTokenBudget/TokenBudgetPerRole，默认 150K）驱动。保留解析不破坏旧配置加载，
 	// 不再驱动任何逻辑（同 TokenBudgetPerGoal 退役先例）。
-	SummarizeEvery              int `yaml:"summarize_every"`
-	SummarizeKeepRecent         int `yaml:"summarize_keep_recent"`           // 压缩时保留最近 K 条原始消息（默认 15；<=0 视为 15。2026-08-21 由 10 上调：场景装配 Agent 压缩后丢工具结果细节被迫重读文件，多留 5 条原始消息换少一轮重侦察）
-	SummarizeMaxBundles         int `yaml:"summarize_max_bundles"`           // 层级压缩包数量上限（默认 20）：每次压缩触发产生一个结构化压缩包，超限把最老的一半合并为 1 个更粗的包，循环往复保留远期上下文
-	SummarizeTimeoutSec         int `yaml:"summarize_timeout_sec"`           // 事件摘要轻量模型调用超时（秒，默认 120）。旧硬编码 5s 对思考型模型必然超时，摘要全挂降级 raw join，上下文全量回注致 token 预算提前耗尽（实证 verify 子 Agent 300K 预算 7 分钟烧穿）
+	SummarizeEvery      int `yaml:"summarize_every"`
+	SummarizeKeepRecent int `yaml:"summarize_keep_recent"` // 压缩时保留最近 K 条原始消息（默认 15；<=0 视为 15。2026-08-21 由 10 上调：场景装配 Agent 压缩后丢工具结果细节被迫重读文件，多留 5 条原始消息换少一轮重侦察）
+	SummarizeMaxBundles int `yaml:"summarize_max_bundles"` // 层级压缩包数量上限（默认 20）：每次压缩触发产生一个结构化压缩包，超限把最老的一半合并为 1 个更粗的包，循环往复保留远期上下文
+	SummarizeTimeoutSec int `yaml:"summarize_timeout_sec"` // 事件摘要轻量模型调用超时（秒，默认 120）。旧硬编码 5s 对思考型模型必然超时，摘要全挂降级 raw join，上下文全量回注致 token 预算提前耗尽（实证 verify 子 Agent 300K 预算 7 分钟烧穿）
 	// SalvageLLMTimeoutSec 失败打捞轻量调用超时（秒，默认 30；思考型模型场景建议 >=60）。
 	// 旧硬编码 5s 对思考型模型（glm/deepseek 推理系）来不及出首 token，打捞 facts=0 全降级（TODO #33）。
 	SalvageLLMTimeoutSec int `yaml:"salvage_llm_timeout_sec"`
@@ -205,7 +205,7 @@ type LLMRuntimeConfig struct {
 
 // SafetyConfig 工具沙箱与安全策略配置。
 type SafetyConfig struct {
-	ToolSandboxDisabled     bool     `yaml:"tool_sandbox_disabled"`      // true 时关闭写路径逃逸检测（保留命令黑名单）
+	ToolSandboxDisabled bool `yaml:"tool_sandbox_disabled"` // true 时关闭写路径逃逸检测（保留命令黑名单）
 	// ToolApprovalDisabled 全信任模式（默认 false）：true 时关闭全部破坏性操作审批，
 	// needsApproval 直接短路——WriteFile/EditFile 生产目录写入、RunCommand 危险命令
 	// 模式、插件 Destructive 工具（computer_use 全工具自标 destructive）一律不再推
@@ -213,7 +213,7 @@ type SafetyConfig struct {
 	// destructive，视频诊断会话 30+ 次【需确认】拦截 list/read/wait 等无害只读调用，
 	// 审批风暴吃掉整晚墙钟。仅关闭确认链，命令黑名单（hard block）与写路径沙箱不受影响；
 	// 信任模型等于把裁决权从"每次人工确认"移交给提示词纪律 + 沙箱，单人开发机可开。
-	ToolApprovalDisabled bool `yaml:"tool_approval_disabled"`
+	ToolApprovalDisabled    bool     `yaml:"tool_approval_disabled"`
 	ToolSandboxAllowedPaths []string `yaml:"tool_sandbox_allowed_paths"` // 允许读写的额外绝对路径白名单
 	ToolSandboxBlockedCmds  []string `yaml:"tool_sandbox_blocked_cmds"`  // 额外命令黑名单（追加到默认黑名单）
 	// RoleToolGateEnabled 角色工具白名单硬门（默认 false=关闭，现状行为）。
@@ -262,6 +262,11 @@ type FeatureTogglesConfig struct {
 	// 完成回传汇成一条【整合纪要】单条送达父邮箱（防 N 子完成 N 次打扰父）。
 	// 默认 true；显式 false 退回逐条回传（逃生舱）。
 	BatchDigestEnabled *bool `yaml:"batch_digest_enabled"`
+
+	// VerifyLLMOnStartup 启动期是否对每个模型角色发起一次最小化真实调用做连通性探测。
+	// 默认 false（2026-10-28 起）：模型是可替换运行时依赖，单个模型不可用不阻断启动，
+	// 用户可在应用内模型页随时切换到其他模型；开启时也只告警不阻断（排障用）。
+	VerifyLLMOnStartup bool `yaml:"verify_llm_on_startup"`
 
 	// DecisionShadowEnabled 决策层影子总开关（TODO #23，默认 true）：true=全部决策点
 	// 影子运行（只记录不生效）；false=仅 enforce 点运行（省轻量调用成本）。

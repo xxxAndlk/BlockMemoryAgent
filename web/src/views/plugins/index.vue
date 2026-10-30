@@ -1,11 +1,18 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
-import { listPlugins, enablePlugin, disablePlugin, reloadPlugins, type PluginInfo } from '@/api/plugins'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  listPlugins, enablePlugin, disablePlugin, reloadPlugins,
+  fetchDockerReport, cleanupDocker,
+  type PluginInfo, type DockerReport,
+} from '@/api/plugins'
 
 const plugins = ref<PluginInfo[]>([])
 const loading = ref(false)
 const mutating = ref<string | null>(null)
+// docker 依赖自检（镜像/容器状态）+ 清理状态（2026-10-28）。
+const docker = ref<DockerReport | null>(null)
+const cleaning = ref(false)
 
 // 工具折叠：每卡独立展开状态（默认收起，最多展示 TOOL_COLLAPSE_LIMIT 个 chip）。
 const TOOL_COLLAPSE_LIMIT = 12
@@ -91,7 +98,85 @@ function kindBadge(p: PluginInfo) {
   return hit || { label: p.kind, cls: 'kind-other' }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadDocker()
+})
+
+// loadDocker 拉取 docker 自检（只读）：docker 不可用/缺镜像/残留容器都只提示不阻塞。
+async function loadDocker() {
+  try {
+    docker.value = await fetchDockerReport()
+  } catch {
+    // 自检失败不影响插件页主功能（旧版后端/插件管理器未接线）。
+    docker.value = null
+  }
+}
+
+// 容器计数：keeper 每换一个工作目录就多一套，页面上直接可见"有没有攒着"。
+function dockerContainerCount(state?: string) {
+  const list = docker.value?.containers || []
+  return state ? list.filter(c => c.state === state).length : list.length
+}
+
+// dockerOk 与后端 DockerReport.Healthy 同口径：无 docker 依赖时 docker 缺失不算问题。
+const dockerOk = computed(() => {
+  const d = docker.value
+  if (!d) return true
+  if (!d.available) return !d.required
+  return !d.missing_images?.length && !d.stopped_containers?.length
+})
+
+// handleCleanup 清理 docker 残留：只删已停止的插件容器 + 悬空镜像（启动时也自动跑这套）。
+// 运行中的 keeper 不动（可能被其他 BMA 实例（tui/server 多开）使用）。
+async function handleCleanup() {
+  const stopped = docker.value?.stopped_containers?.length || 0
+  const running = dockerContainerCount('running')
+  try {
+    await ElMessageBox.confirm(
+      `将删除：已停止的 bma-plugin-* 容器（当前 ${stopped} 个）+ 悬空镜像。\n` +
+      `运行中的 ${running} 个容器会保留（可能被其他 BMA 实例使用）。`,
+      '清理 Docker 残留',
+      { confirmButtonText: '清理', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  await runCleanup(false)
+}
+
+// handleCleanupAll 连运行中的 keeper 一起删（释放内存；会掐断在途 MCP 会话，
+// 下一次调用自动重建容器）。仅用于换镜像/确实要释放资源时。
+async function handleCleanupAll() {
+  const running = dockerContainerCount('running')
+  try {
+    await ElMessageBox.confirm(
+      `将删除全部 bma-plugin-* 容器（含运行中 ${running} 个）与悬空镜像。\n` +
+      `运行中的会话会被掐断（下一次工具调用自动重建容器）。`,
+      '全部清理（含运行中）',
+      { confirmButtonText: '全部清理', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  await runCleanup(true)
+}
+
+async function runCleanup(all: boolean) {
+  cleaning.value = true
+  try {
+    const res = await cleanupDocker(all)
+    docker.value = res.docker
+    const removed = res.cleanup?.removed_containers?.length || 0
+    const pruned = res.cleanup?.pruned_images || 0
+    ElMessage.success(`清理完成：删除容器 ${removed} 个、悬空镜像 ${pruned} 个${res.cleanup?.reclaimed ? `（回收 ${res.cleanup.reclaimed}）` : ''}`)
+  } catch (e) {
+    ElMessage.error('清理失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    cleaning.value = false
+    loadDocker()
+  }
+}
 </script>
 
 <template>
@@ -101,9 +186,45 @@ onMounted(load)
         <h2 class="text-lg font-bold text-ink">插件管理</h2>
         <p class="text-xs text-ink-2 mt-1">热插拔 MCP / bundle 插件；启用/停用下一轮对话生效，无需重启服务。</p>
       </div>
-      <el-button plain class="!bg-transparent !border-line !text-ink" :loading="loading" @click="handleReload">
-        <el-icon class="mr-1"><Refresh /></el-icon> 重载配置
-      </el-button>
+      <div class="flex items-center gap-2 shrink-0">
+        <el-button plain class="!bg-transparent !border-line !text-ink" :loading="cleaning" @click="handleCleanup">
+          <el-icon class="mr-1"><Delete /></el-icon> 清理 Docker 残留
+        </el-button>
+        <el-button plain class="!bg-transparent !border-line !text-ink" :loading="loading" @click="handleReload">
+          <el-icon class="mr-1"><Refresh /></el-icon> 重载配置
+        </el-button>
+      </div>
+    </div>
+
+    <!-- docker 依赖自检条（2026-10-28）：插件容器按工作目录哈希命名，换目录会新增一套，
+         残留（已停止）与缺镜像在这里一眼可见，并提供一键清理。 -->
+    <div v-if="docker" class="mb-4 rounded border px-3 py-2 text-[11px] leading-5"
+         :class="dockerOk
+           ? 'border-line bg-card text-ink-2'
+           : 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'">
+      <template v-if="docker.available">
+        <span class="font-mono">Docker {{ docker.version }}</span>
+        <span class="mx-2 opacity-40">|</span>
+        <span>bma 容器 {{ dockerContainerCount() }} 个（运行 {{ dockerContainerCount('running') }}）</span>
+        <span v-if="docker.missing_images?.length" class="ml-2">
+          · 缺镜像：<span class="font-mono">{{ docker.missing_images.join('、') }}</span>
+          （执行 <span class="font-mono">bash docker/bma-plugin.sh build</span>）
+        </span>
+        <span v-if="docker.stopped_containers?.length" class="ml-2">
+          · 残留停止容器 {{ docker.stopped_containers.length }} 个：
+          <span class="font-mono">{{ docker.stopped_containers.slice(0, 3).join('、') }}<template v-if="docker.stopped_containers.length > 3"> …</template></span>
+        </span>
+        <button v-if="dockerContainerCount('running') > 0"
+                class="ml-2 underline underline-offset-2 hover:opacity-80"
+                @click="handleCleanupAll">
+          全部清理（含运行中）
+        </button>
+      </template>
+      <template v-else>
+        Docker 不可达（Docker Desktop 未启动？）：{{ docker.error }}
+        <template v-if="docker.required">；容器类插件（ui_design / ui_preview / computer_use）不可用，其余功能不受影响。</template>
+        <template v-else>；当前没有启用中的 docker 插件，不影响使用。</template>
+      </template>
     </div>
 
     <div class="grid gap-4 md:grid-cols-2 items-stretch">

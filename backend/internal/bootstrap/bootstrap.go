@@ -23,13 +23,13 @@ import (
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
-	"github.com/blockmemory/agent/backend/internal/flow"
-	"github.com/blockmemory/agent/backend/internal/goal"
 	"github.com/blockmemory/agent/backend/internal/domain/memory"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/subagent"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/embed"
+	"github.com/blockmemory/agent/backend/internal/flow"
+	"github.com/blockmemory/agent/backend/internal/goal"
 	"github.com/blockmemory/agent/backend/internal/logger"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 	"github.com/blockmemory/agent/backend/internal/model"
@@ -74,30 +74,30 @@ type ConfigPaths struct {
 // 在 ReAct 重构过程中，旧的 graph 相关字段已被移除；Runtime 字段保留，
 // 用于兼容 soul/skills/watchdog 等 API。
 type App struct {
-	Agent           agent.Agent            // ReAct Agent 服务，负责会话执行逻辑
-	Server          *server.SessionManager // HTTP 会话管理器，处理 /api/sessions/* 请求
-	DAGHandler      *server.DAGHandler     // DAG HTTP 处理器
-	WorkflowEngine  *workflow.Engine       // 工作流量产引擎（2026-10-16）
-	WorkflowHandler *server.WorkflowHandler // 工作流 HTTP 处理器（/api/workflow/*）
-	FlowEngine      *flow.Engine           // 可视化编排引擎（2026-10-18）
-	FlowHandler     *server.FlowHandler    // 可视化编排 HTTP 处理器（/api/flow/*）
-	GoalManager     *goal.Manager          // 指令模式管理器（goal 目标 / loop 循环，2026-10-18）
-	DirectiveHandler *server.DirectiveHandler // 指令模式 HTTP 处理器（/api/sessions/:id/directive）
-	Runtime         *runtime.Runtime       // 运行时聚合器（人格、skill、watchdog 等）
-	Postgres     *store.PostgresStore      // PostgreSQL 持久化存储
-	Redis        *store.RedisStore         // Redis 缓存/消息存储
-	ModelFactory *model.ModelFactory       // 模型工厂，管理各角色模型连接
-	Embedder     embed.Embedder            // 向量嵌入器，用于记忆检索
-	Config       *config.Config            // 应用运行时配置
-	RoleConfig   *pkgconfig.RoleConfigFile // 角色配置对象
-	DAGScheduler *dag.Scheduler            // DAG 调度器；DAG 关闭时为 nil
-	Logger       *logger.Logger            // 结构化会话日志器
-	Plugins      *plugins.Manager          // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
-	Widgets      *widgets.Manager          // 界面部件管理器（widgets/ 目录包，Widget 机制）
-	WorkDir      string                    // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
+	Agent            agent.Agent               // ReAct Agent 服务，负责会话执行逻辑
+	Server           *server.SessionManager    // HTTP 会话管理器，处理 /api/sessions/* 请求
+	DAGHandler       *server.DAGHandler        // DAG HTTP 处理器
+	WorkflowEngine   *workflow.Engine          // 工作流量产引擎（2026-10-16）
+	WorkflowHandler  *server.WorkflowHandler   // 工作流 HTTP 处理器（/api/workflow/*）
+	FlowEngine       *flow.Engine              // 可视化编排引擎（2026-10-18）
+	FlowHandler      *server.FlowHandler       // 可视化编排 HTTP 处理器（/api/flow/*）
+	GoalManager      *goal.Manager             // 指令模式管理器（goal 目标 / loop 循环，2026-10-18）
+	DirectiveHandler *server.DirectiveHandler  // 指令模式 HTTP 处理器（/api/sessions/:id/directive）
+	Runtime          *runtime.Runtime          // 运行时聚合器（人格、skill、watchdog 等）
+	Postgres         *store.PostgresStore      // PostgreSQL 持久化存储
+	Redis            *store.RedisStore         // Redis 缓存/消息存储
+	ModelFactory     *model.ModelFactory       // 模型工厂，管理各角色模型连接
+	Embedder         embed.Embedder            // 向量嵌入器，用于记忆检索
+	Config           *config.Config            // 应用运行时配置
+	RoleConfig       *pkgconfig.RoleConfigFile // 角色配置对象
+	DAGScheduler     *dag.Scheduler            // DAG 调度器；DAG 关闭时为 nil
+	Logger           *logger.Logger            // 结构化会话日志器
+	Plugins          *plugins.Manager          // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
+	Widgets          *widgets.Manager          // 界面部件管理器（widgets/ 目录包，Widget 机制）
+	WorkDir          string                    // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
 	// SkillsDir 经验技能目录（config/skills_learned/，与 evolver 落库同口径）：
 	// DELETE /api/skills/learned/:name 删文件前做目录内安全校验用。
-	SkillsDir    string
+	SkillsDir string
 
 	// SkillConsolidation 经验技能库整理（C 库存治理）：POST /api/skills/consolidate 手动触发，
 	// 忽略阈值直接整理；返回人类可读摘要。nil 时端点返回 503。
@@ -231,21 +231,31 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 同步注入存储层，让反序列化失败等错误日志以 [ERRO] 级别输出。
 	pgStore.SetLogger(sessionLogger)
 
-	// 第十步：创建模型工厂并预热、校验连通性。
+	// 第十步：创建模型工厂（启动期只做静态解析，不做连通性校验）。
+	//
+	// 2026-10-28 起启动不再校验模型连接：模型只是可替换的运行时依赖，单个模型
+	// 不可用不该阻断服务启动（应用内模型页可随时切换到其他模型）。启动期改成：
+	//   - 注册表损坏 / 预热失败 → 仅告警，继续启动（模型页可修复/重绑）；
+	//   - 静态打印每个角色的生效模型与 Key 有无（LogStartupResolution，零网络请求）；
+	//   - 连通性探测只在显式开 `agent.verify_llm_on_startup: true` 时可选出，且仍只告警。
+	// 容器/基础设施自检见第十六步半插件装配后的 docker 依赖自检。
 	modelFactory := model.NewModelFactory(roleCfg)
 	// 注入模型注册表（config/models.json，与 roles.yaml 同目录）：连接参数来源 +
 	// 角色绑定（上次运行期切换的持久化结果）+ mtime 热更新。
-	// 必须先于 WarmUp/VerifyConnectivity：启动预热与连通性探测针对绑定后的模型。
+	// 必须先于 WarmUp：启动预热针对绑定后的模型。
 	modelsJSONPath := filepath.Join(filepath.Dir(paths.RolePath), "models.json")
 	registry, err := pkgconfig.NewRegistryStore(modelsJSONPath)
 	if err != nil {
-		// 注册表损坏会令 model_ref 角色不可解析，属严格启动范畴：fail-fast。
-		closeStores(pgStore, redisStore)
-		return nil, fmt.Errorf("load models registry %s: %w", modelsJSONPath, err)
-	}
-	modelFactory.SetRegistry(registry)
-	for _, warn := range registryStartupWarnings(registry) {
-		log.Printf("[bootstrap] [WARN] 模型绑定跳过: %s", warn)
+		// 注册表损坏只影响 model_ref/绑定解析（回落 roles.yaml 内联配置），
+		// 不再是启动硬失败：用户可在模型页重建注册表后使用。
+		log.Printf("[bootstrap] [WARN] 模型注册表 %s 读取失败（启动继续，模型解析回落 roles.yaml 内联配置；请在模型页修复）: %v",
+			modelsJSONPath, err)
+		registry = nil
+	} else {
+		modelFactory.SetRegistry(registry)
+		for _, warn := range registryStartupWarnings(registry) {
+			log.Printf("[bootstrap] [WARN] 模型绑定跳过: %s", warn)
+		}
 	}
 	// 启动即打印轻量模型解析结果（来源 direct / fallback-domain / binding），排查配置加载漂移：
 	// 2026-08-10 事故 roles.yaml 配 deepseek-v4-flash 但运行时 provider=glm-5.2（domain 回退），
@@ -256,13 +266,21 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	} else {
 		log.Printf("[bootstrap] lightweight model resolution: source=%s model=%q provider=%q", lmSource, lmCfg.Model, lmCfg.Provider)
 	}
+	// WarmUp 只构造客户端（缓存/连接池），不做真实调用；失败仅告警（多为 model_ref/
+	// 配置问题），不阻断启动。
 	if err := modelFactory.WarmUp(ctx); err != nil {
-		closeStores(pgStore, redisStore)
-		return nil, fmt.Errorf("warmup models: %w", err)
+		log.Printf("[bootstrap] [WARN] 模型预热失败（启动继续，可在模型页切换/修复后使用）: %v", err)
 	}
-	if err := modelFactory.VerifyConnectivity(ctx); err != nil {
-		closeStores(pgStore, redisStore)
-		return nil, fmt.Errorf("verify LLM connectivity: %w", err)
+	modelFactory.LogStartupResolution()
+	// 可选连通性探测（默认关闭）：显式开启时也只告警不阻断——模型可随时切换。
+	if cfg.Agent.VerifyLLMOnStartup {
+		probeCtx, probeCancel := context.WithTimeout(ctx, 150*time.Second)
+		if err := modelFactory.VerifyConnectivity(probeCtx); err != nil {
+			log.Printf("[bootstrap] [WARN] LLM 连通性探测未通过（启动继续，可在模型页切换模型）: %v", err)
+		} else {
+			log.Printf("[bootstrap] LLM 连通性探测通过")
+		}
+		probeCancel()
 	}
 
 	// 第十一步：加载技能池 + 扫描主流 Agent 工具约定目录（技能渐进披露）。
@@ -1202,9 +1220,36 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			return mcpbridge.NewFromSettings(id, settings, deps)
 		}),
 	)
+	// Docker 残留回收（2026-10-28）：在 Load 之前同步跑——插件预热会并行创建 keeper，
+	// 先清掉上次遗留的已停止 bma-plugin-* 容器与悬空镜像，避免启动一次攒一堆。
+	// 运行中的 keeper（可能被另一个 BMA 实例（tui + server 多开）使用）不动。
+	// 失败/无 docker 均不阻断启动。
+	{
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		res := pluginManager.CleanupDocker(cleanCtx, false)
+		cleanCancel()
+		if len(res.RemovedContainers) > 0 || res.PrunedImages > 0 || len(res.Errors) > 0 {
+			log.Printf("[bootstrap] docker 残留清理: removed=%v pruned_images=%d reclaimed=%q errors=%v",
+				res.RemovedContainers, res.PrunedImages, res.Reclaimed, res.Errors)
+		}
+	}
 	if err := pluginManager.Load(ctx); err != nil {
 		log.Printf("[bootstrap] plugins load failed (non-fatal): %v", err)
 	}
+	// Docker 依赖自检（2026-10-28）：启动不再校验模型连通性，改为校验容器——
+	// docker 可用性 / 启用插件的镜像是否就绪 / bma 项目容器是否在跑，全部只告警不阻断
+	//（媒体插件不可用时其余功能照常）。异步等预热完成后再报，避免预热窗口误报。
+	go func() {
+		pluginManager.WaitWarmup()
+		checkCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		rep := pluginManager.DockerReport(checkCtx)
+		if !rep.Healthy() {
+			log.Printf("[bootstrap] [WARN] docker 依赖自检未全通过（启动继续，可在插件页重载/重建镜像）: %s", rep.Summary())
+			return
+		}
+		log.Printf("[bootstrap] docker 依赖自检通过: %s", rep.Summary())
+	}()
 
 	// 外部 Agent 注册表（CallExternalAgent 数据源）：external_agents.yaml 与 config.yaml
 	// 同目录；缺文件返回空配置（零行为变化），解析失败仅记日志不阻断启动（同 plugins 惯例）。
@@ -1380,11 +1425,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	toolRegistry.SetWidgetOwnerResolver(func(sessionID string) string {
 		return "" // TODO(#18-8): 会话 owner 来源接线后返回 s.Owner
 	})
-// 连接器调度器（2026-10-17 Widget「连接器」）：api/mcp 连接器按 interval_sec 定时
-// 执行，结果经 BroadcastWidgetData 广播到打开部件的会话（widget_data 瞬时通道，
-// 与 POST /widgets/push 同款出口；push 语义不变，只是新调用方）。mcp 工具调用经
-// toolRegistry.Dispatch（ctx 注入主工作目录，与工作流量产程序化调用同口径）。
-// 生命周期跟 startDataMaintenance 同款装配：goroutine + ctx 取消，cleanup 里停。
+	// 连接器调度器（2026-10-17 Widget「连接器」）：api/mcp 连接器按 interval_sec 定时
+	// 执行，结果经 BroadcastWidgetData 广播到打开部件的会话（widget_data 瞬时通道，
+	// 与 POST /widgets/push 同款出口；push 语义不变，只是新调用方）。mcp 工具调用经
+	// toolRegistry.Dispatch（ctx 注入主工作目录，与工作流量产程序化调用同口径）。
+	// 生命周期跟 startDataMaintenance 同款装配：goroutine + ctx 取消，cleanup 里停。
 	connectorSchedCtx, connectorSchedCancel := context.WithCancel(context.Background())
 	connectorSched := widgets.NewConnectorScheduler(widgetMgr, agentSvc.BroadcastWidgetData)
 	connectorSched.SetMCPToolCaller(connectorToolCaller{reg: toolRegistry, workDir: workDir})
@@ -1499,28 +1544,28 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 
 	// 第二十步：组装 App 实例。
 	app := &App{
-		Agent:           agentSvc,
-		Server:          sessionMgr,
-		DAGHandler:      dagHandler,
-		WorkflowEngine:  workflowEngine,
-		WorkflowHandler: workflowHandler,
-		FlowEngine:      flowEngine,
-		FlowHandler:     flowHandler,
-		GoalManager:     goalManager,
+		Agent:            agentSvc,
+		Server:           sessionMgr,
+		DAGHandler:       dagHandler,
+		WorkflowEngine:   workflowEngine,
+		WorkflowHandler:  workflowHandler,
+		FlowEngine:       flowEngine,
+		FlowHandler:      flowHandler,
+		GoalManager:      goalManager,
 		DirectiveHandler: directiveHandler,
-		Runtime:         rt,
-		Postgres:     pgStore,
-		Redis:        redisStore,
-		ModelFactory: modelFactory,
-		Embedder:     embedder,
-		Config:       cfg,
-		RoleConfig:   roleCfg,
-		DAGScheduler: dagScheduler,
-		Logger:       sessionLogger,
-		Plugins:      pluginManager,
-		Widgets:      widgetMgr,
-		WorkDir:      workDir,
-		SkillsDir:    filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"),
+		Runtime:          rt,
+		Postgres:         pgStore,
+		Redis:            redisStore,
+		ModelFactory:     modelFactory,
+		Embedder:         embedder,
+		Config:           cfg,
+		RoleConfig:       roleCfg,
+		DAGScheduler:     dagScheduler,
+		Logger:           sessionLogger,
+		Plugins:          pluginManager,
+		Widgets:          widgetMgr,
+		WorkDir:          workDir,
+		SkillsDir:        filepath.Join(filepath.Dir(paths.ConfigPath), "skills_learned"),
 
 		SkillConsolidation: func(ctx context.Context) (string, error) {
 			return skillCons.Run(ctx, true)
@@ -1566,7 +1611,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			_ = pluginManager.StopAll(stopCtx)
 			return nil
 		},
-		func() error { stopMaintenance(); return nil }, // 停数据维护定时器
+		func() error { stopMaintenance(); return nil },      // 停数据维护定时器
 		func() error { connectorSchedCancel(); return nil }, // 停连接器调度器（goroutine + ctx 取消）
 		func() error {
 			// 先停止 DAG 调度器，避免在数据库关闭后还在调度任务。

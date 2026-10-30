@@ -1,13 +1,14 @@
 package server
 
 // capabilities.go 装机能力自检（TODO #18-1 T28）：
-// GET /api/capabilities 逐项报告 LLM / Postgres / Redis / 嵌入 / 插件 / 工作目录六类
-// 能力的健康状态，每项 {name, ok, detail, missing, hint}——ok=false 时给可行动的
-// 中文修复提示（装机向导与 settings 能力面板的数据源）。
+// GET /api/capabilities 逐项报告 LLM / Docker / Postgres / Redis / 嵌入 / 插件 /
+// 工作目录七类能力的健康状态，每项 {name, ok, detail, missing, hint}——ok=false 时给
+// 可行动的中文修复提示（装机向导与 settings 能力面板的数据源）。
 //
 // 设计口径：
-//   - 全部廉价检查（ping / os.Stat / 配置读取），不真调 LLM API——生产启动是严格
-//     模式（bootstrap.Build 连通性校验失败即拒启），进程活着本身就证明 LLM 通。
+//   - 全部廉价检查（ping / os.Stat / 配置读取 / docker 只读查询），不真调 LLM API——
+//     2026-10-28 起启动不再做模型连通性校验（模型可在应用内切换，容器才是基础设施
+//     闸门），所以这里也不拿“进程活着”当作 LLM 通的证明。
 //   - 全字段 nil 安全：测试桩缺任一依赖时对应项降级为"未接线"，不 panic。
 
 import (
@@ -36,6 +37,7 @@ func (h *APIHandler) CapabilitiesHandler(c *gin.Context) {
 
 	items := []CapabilityItem{
 		h.capabilityLLM(),
+		h.capabilityDocker(ctx),
 		h.capabilityPostgres(ctx),
 		h.capabilityRedis(ctx),
 		h.capabilityEmbed(),
@@ -55,7 +57,8 @@ func (h *APIHandler) CapabilitiesHandler(c *gin.Context) {
 	c.JSON(200, gin.H{"items": items, "all_ok": allOK, "default_work_dir": h.defaultWorkDir})
 }
 
-// capabilityLLM 检查 LLM 配置可解析（生产严格启动已保证连通，这里只报当前生效模型）。
+// capabilityLLM 检查 LLM 配置可解析（2026-10-28 起启动不做连通性硬校验，这里只报当前
+// 生效模型；可用性请在模型页逐条探测或直接切到其他模型）。
 func (h *APIHandler) capabilityLLM() CapabilityItem {
 	if h.modelFactory == nil {
 		return CapabilityItem{Name: "llm", OK: false, Detail: "模型工厂未接线",
@@ -64,10 +67,38 @@ func (h *APIHandler) capabilityLLM() CapabilityItem {
 	st, err := h.modelFactory.CurrentModelInfo("meta")
 	if err != nil {
 		return CapabilityItem{Name: "llm", OK: false, Detail: err.Error(),
-			Hint: "检查 config/models.json 的 api_key/base_url 与 roles.yaml 模型绑定，改后重启生效"}
+			Hint: "检查 config/models.json 的 api_key/base_url 与 roles.yaml 模型绑定，改后无需重启（下一轮生效）或在模型页切换模型"}
 	}
+	// 启动不做连通性探测（模型可在应用内切换），“可用”仅指配置可解析。
 	return CapabilityItem{Name: "llm", OK: true,
-		Detail: fmt.Sprintf("%s/%s（启动连通性校验已通过）", st.Provider, st.Model)}
+		Detail: fmt.Sprintf("%s/%s（仅静态配置校验；启动不探测连通性，可在模型页切换）", st.Provider, st.Model)}
+}
+
+// capabilityDocker 容器依赖自检（2026-10-28 起取代启动期模型连通性校验作为基础设施
+// 闸门）：docker 可达性 + 启用中 docker 插件的镜像就绪 + bma 项目容器运行状态。
+// 只做只读检查（不拉镜像、不启容器）；未装 docker 的部署（全部插件走 http/stdio）
+// 不报错，仅作提示。
+func (h *APIHandler) capabilityDocker(ctx context.Context) CapabilityItem {
+	if h.pluginMgr == nil {
+		return CapabilityItem{Name: "docker", OK: true, Detail: "插件管理器未接线（无容器依赖）"}
+	}
+	rep := h.pluginMgr.DockerReport(ctx)
+	if !rep.Available {
+		// 无启用中的 docker 插件（纯 http/stdio 部署）：docker 缺失不算未就绪。
+		if !rep.Required {
+			return CapabilityItem{Name: "docker", OK: true, Detail: rep.Summary()}
+		}
+		return CapabilityItem{Name: "docker", OK: false, Detail: rep.Error,
+			Missing: []string{"docker"},
+			Hint:    "启动 Docker Desktop（或 docker 引擎）后到插件页重载；媒体/沙箱插件依赖容器，其余功能不受影响"}
+	}
+	detail := rep.Summary()
+	if !rep.Healthy() {
+		return CapabilityItem{Name: "docker", OK: false, Detail: detail,
+			Missing: append(append([]string{}, rep.MissingImages...), rep.StoppedContainers...),
+			Hint:    "缺镜像：bash docker/bma-plugin.sh build；残留容器：POST /api/plugins/cleanup（或 bash docker/bma-plugin.sh clean）"}
+	}
+	return CapabilityItem{Name: "docker", OK: true, Detail: detail}
 }
 
 // capabilityPostgres Postgres 探活（nil 存储=未配置，区分于连不上）。
@@ -121,8 +152,8 @@ func (h *APIHandler) capabilityEmbed() CapabilityItem {
 			Detail: fmt.Sprintf("provider=%s model=%s", emb.Provider, emb.Model)}
 	default:
 		return CapabilityItem{Name: "embed", OK: false,
-			Detail:  fmt.Sprintf("未知 provider=%s", emb.Provider),
-			Hint:    "provider 取值：pseudo | openai | local | onnx"}
+			Detail: fmt.Sprintf("未知 provider=%s", emb.Provider),
+			Hint:   "provider 取值：pseudo | openai | local | onnx"}
 	}
 }
 

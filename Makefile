@@ -1,4 +1,4 @@
-.PHONY: backend-test test-test test-compile web-build lint up down migrate run bma-plugin plugins-build dist help
+.PHONY: backend-test test-test test-compile web-build lint up down migrate run bma-plugin bma-plugin-clean plugins-build dist help
 
 ## Run all backend Go tests (unit + package tests).
 backend-test:
@@ -47,6 +47,10 @@ run: web-build
 bma-plugin:
 	bash docker/bma-plugin.sh
 
+## Clean docker leftovers: stopped bma-plugin-* containers + dangling images (same as backend startup reap).
+bma-plugin-clean:
+	bash docker/bma-plugin.sh clean
+
 ## Build plugin images: local MCP bridges (bma/*:local). open_design daemon 由 compose 统一管理（up 时自动构建）。
 plugins-build:
 	docker build -t bma/computer-use-mcp:local docker/computer-use
@@ -77,6 +81,7 @@ help:
 	@echo "  migrate       - apply SQL migrations (requires POSTGRES_DSN)"
 	@echo "  run           - build web UI and run backend server"
 	@echo "  bma-plugin    - one command: build all plugin MCP bridge images"
+	@echo "  bma-plugin-clean - clean leftover plugin containers + dangling images"
 	@echo "  plugins-build - build plugin MCP bridge images (computer_use / ui_design / ui_preview)"
 	@echo "  dist          - build dist/ install layout (bin/config/web/dist/plugins.d)"
 	@echo "  note: TUI 视频附件默认 native 直传（mp4/avi/mov ≤ native_max_mb 无需 ffmpeg）；webm/mkv/超限回落抽帧需宿主机 ffmpeg（winget install Gyan.FFmpeg），缺失时降级为仅元数据"

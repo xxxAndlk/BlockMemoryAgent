@@ -15,6 +15,9 @@
 #   docker/bma-plugin.sh           # = all（build + status）
 #   docker/bma-plugin.sh build     # 只构建/拉取镜像
 #   docker/bma-plugin.sh status    # 查看插件镜像与容器状态
+#   docker/bma-plugin.sh clean     # 清理 docker 残留（已停止的插件容器 + 悬空镜像）
+#                                  #   clean --all 连运行中的 keeper 也删（会掐断在途会话）
+#                                  #   clean --images 额外删已退役架构的旧镜像（firecrawl 自托管栈/上游 od）
 #   docker/bma-plugin.sh media     # 应用媒体生成单点配置（仓库根 .env 媒体段 →
 #                                  #   重建 open_design 容器重写 media-config.json + 换 ui_design keeper）
 set -euo pipefail
@@ -45,10 +48,78 @@ cmd_status() {
     | grep -E '^bma/' || echo "(无 bma/* 镜像，先执行 build)"
   echo
   echo "=== 后端拉起的插件容器（bma-plugin-<id>[-<目录哈希>]） ==="
-  docker ps --filter "name=bma-plugin-" --format '{{.Names}}  {{.Image}}  {{.Status}}'
+  docker ps -a --filter "name=bma-plugin-" --format '{{.Names}}  {{.Image}}  {{.Status}}'
   echo
   echo "=== compose 统一管理的长驻服务（open_design / minimax-media） ==="
   docker ps --filter "name=bma-open-design" --filter "name=bma-minimax-media" --format '{{.Names}}  {{.Image}}  {{.Status}}'
+  echo
+  echo "提示：已停止的插件容器 / 悬空镜像 / 已退役架构的旧镜像占空间，可执行 bash docker/bma-plugin.sh clean --images"
+}
+
+# cmd_clean 清理 docker 残留（2026-10-28）：
+#   插件 keeper 容器按 (插件, 工作目录哈希) 命名，换项目目录就新增一套，旧容器 stop/孤立后
+#   永久残留；镜像重建（同名 tag 重打）后旧镜像变悬空。后端启动时会自动做同一套清理，
+#   这里给手动入口（换镜像、磁盘告警、装机回收时用）。
+#   默认只删**已停止**的 bma-plugin-* 容器——运行中的可能正被另一个 BMA 实例（tui+server
+#   多开）使用；--all 才连运行中的一起删（会掐断在途 MCP 会话，下次调用自动重建）。
+#   --images 额外删已退役架构的旧镜像（本地 firecrawl 自托管栈、上游 od 基础镜像；
+#   docker rmi 不用 -f，被其他项目引用时自动拒绝，不会误删）。
+cmd_clean() {
+  local all="" with_images=""
+  for arg in "$@"; do
+    case "$arg" in
+      --all) all="--all" ;;
+      --images) with_images="1" ;;
+      *) echo "未知参数: $arg（可用: --all / --images）" >&2; exit 1 ;;
+    esac
+  done
+  echo "=== 清理 Docker 残留 ==="
+  local filter=(--filter "name=bma-plugin-" --filter "label=com.docker.compose.project=bma")
+  local ids
+  if [ "$all" = "--all" ]; then
+    ids=$(docker ps -aq "${filter[@]}")
+  else
+    ids=$(docker ps -aq "${filter[@]}" --filter status=exited --filter status=created --filter status=dead)
+  fi
+  if [ -n "$ids" ]; then
+    echo "--- docker rm -f（$(echo "$ids" | wc -l | tr -d ' ') 个）"
+    # shellcheck disable=SC2086
+    docker rm -f $ids
+  else
+    echo "(无需要删除的插件容器)"
+  fi
+  # 悬空镜像安全清理：containerd 镜像存储下 `docker image prune -f` 会把仍被容器
+  # 引用的 untagged 镜像一起删掉（2026-10-30 实测：运行中 keeper 的镜像被清成不存在的
+  # ID，容器变"幽灵"）。这里显式排除"任何容器（含已停止）引用的镜像 ID"。
+  echo "--- 清理悬空镜像（排除仍被容器引用的）"
+  local used short
+  used=$(docker ps -aq | xargs -r docker inspect -f '{{.Image}}' 2>/dev/null || true)
+  for id in $(docker images -q -f dangling=true); do
+    short="${id#sha256:}"
+    case "$used" in *"$short"*) continue ;; esac
+    docker rmi "$id" >/dev/null 2>&1 || true
+  done
+  if [ -n "$with_images" ]; then
+    # 已退役架构的镜像（不参与当前部署）：本地 firecrawl 自托管栈（2026-09 切官方云端后删除）、
+    # 上游 od 基础镜像（现用 docker/open-design-daemon 构建的 bma/open-design-daemon:local）。
+    local retired=(
+      "bma/firecrawl-mcp:local"
+      "ghcr.io/firecrawl/firecrawl:latest"
+      "ghcr.io/firecrawl/playwright-service:latest"
+      "ghcr.io/firecrawl/nuq-postgres:latest"
+      "ghcr.io/nexu-io/od:latest"
+    )
+    echo "--- 删除已退役镜像（被其他项目引用时 docker 会拒绝，不强制）"
+    for img in "${retired[@]}"; do
+      if docker image inspect "$img" >/dev/null 2>&1; then
+        docker rmi "$img" || echo "(跳过 $img：仍被引用或正在使用)"
+      fi
+    done
+  fi
+  echo "--- 清理后状态"
+  docker ps -a --filter "name=bma-plugin-" --format '{{.Names}}  {{.Image}}  {{.Status}}' \
+    || echo "(无插件容器)"
+  echo "BMA_CLEAN_DONE"
 }
 
 # cmd_media 媒体生成配置单点应用（2026-10-14）：唯一手改点 = 仓库根 .env 媒体段。
@@ -80,6 +151,7 @@ case "${1:-all}" in
   all)    cmd_build; echo; cmd_status; echo; echo "BMA_PLUGIN_DONE" ;;
   build)  cmd_build ;;
   status) cmd_status ;;
+  clean)  shift; cmd_clean "$@" ;;
   media)  cmd_media ;;
-  *) echo "用法: $0 [all|build|status|media]" >&2; exit 1 ;;
+  *) echo "用法: $0 [all|build|status|clean [--all] [--images]|media]" >&2; exit 1 ;;
 esac

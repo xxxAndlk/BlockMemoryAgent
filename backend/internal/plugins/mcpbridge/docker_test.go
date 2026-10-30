@@ -152,15 +152,29 @@ func TestDockerExecArgs(t *testing.T) {
 	}
 }
 
-func TestParseDockerInspectRunning(t *testing.T) {
-	if running, image := parseDockerInspectRunning("true img:tag\n"); !running || image != "img:tag" {
-		t.Fatalf("running 解析错误: %v %q", running, image)
+func TestParseDockerKeeperState(t *testing.T) {
+	st := parseDockerKeeperState("true sha256:abc123 img:tag\n")
+	if !st.Running || st.ImageID != "sha256:abc123" || st.Image != "img:tag" {
+		t.Fatalf("keeper 解析错误: %+v", st)
 	}
-	if running, _ := parseDockerInspectRunning("false img:tag"); running {
+	if st := parseDockerKeeperState("false sha256:abc123 img:tag"); st.Running {
 		t.Fatal("stopped 容器应解析为 false")
 	}
-	if running, image := parseDockerInspectRunning("garbage"); running || image != "" {
-		t.Fatalf("非法输出应返回 false/空: %v %q", running, image)
+	if st := parseDockerKeeperState("garbage"); st.Running || st.ImageID != "" || st.Image != "" {
+		t.Fatalf("非法输出应返回零值: %+v", st)
+	}
+	// 镜像被删的僵尸容器：ImageID 仍在，可用于和 tag 当前 ID 比对识别过期。
+	if st := parseDockerKeeperState("true sha256:deadbeef <none>:<none>"); st.ImageID != "sha256:deadbeef" {
+		t.Fatalf("僵尸容器 ImageID 应保留: %+v", st)
+	}
+}
+
+func TestShortImageID(t *testing.T) {
+	if got := shortImageID("sha256:c41f0c651958a4d11d94b11c75935c4e"); got != "c41f0c651958" {
+		t.Fatalf("shortImageID = %q", got)
+	}
+	if got := shortImageID("abc"); got != "abc" {
+		t.Fatalf("短 ID 不应被截断: %q", got)
 	}
 }
 

@@ -34,7 +34,7 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 - **会话持久化，默认全新启动**：会话历史（goal/summary/工具结果）、主对话完整消息历史（`agent_messages`）与事件流写入 PostgreSQL；每次启动默认是全新会话列表，`agent.restore_sessions: true` 时才恢复最近 50 个会话到内存（含完整对话历史，续跑不再失忆）
 - **LLM 调用全链路日志**：`sessionLogger` 把每次 LLM I/O 写 `session_logs` 表，`QueryKindLogs` 按会话回看完整调用链；`LiveEventTokenUsage` 实时推送 token 用量；DeepSeek V4 缓存模式与 `reasoning_content` 字段适配
 - **结构化日志**：所有 Agent 关键事件写 `session_logs` 表并按 session/agent/level 可查；各组件注入 `*logger.Logger`，错误类日志真实输出 `[ERRO]`；文件日志按天分割（`logs/backend/`、`logs/tui/`）
-- **严格启动**：config/roles/env/soul/skills 任一配置文件缺失，或 PG/Redis/LLM 后端不可达，启动即失败并明确报错
+- **严格启动（基础设施）+ 容器校验**：config/roles/env/soul/skills 任一配置文件缺失，或 PG/Redis 不可达，启动即失败并明确报错；**模型连接不再是启动闸门**——启动只在日志里打印每个角色的生效模型与 Key 有无（零网络请求），某个模型不可用在应用内模型页换一个即可；启动改为校验容器（docker 可达性 / 启用插件镜像 / bma 项目容器状态，`/api/capabilities` 的 `docker` 项）
 - **双入口 + 可观测**：HTTP Web UI（Vue 3 SPA）+ bubbletea TUI；SSE 实时推送事件；`/api/metrics` 输出 Prometheus 格式指标
 - **可选 DAG 调度**：`dag_enabled` 开启后按标准 5 段 cron（如 `0 9 * * *`）或简易间隔（`Ns/Nm/Nh`）定时触发任务流程，Web 端「定时任务」页可视化管理
 
@@ -91,7 +91,7 @@ cp .env.example .env
 2. **`config/models.json`（必填）**：模型连接参数清单（provider/model/api_key/base_url，`${VAR}` 从 `.env` 插值）。照模板加一条你自己的模型条目即可，`api_key`/`base_url` 引用 `.env` 变量，不要把密钥直接写进 json。
 3. **`config/roles.yaml`（必填）**：把 `meta_agent.model_config.model_ref`、`domain_agent.model_config.model_ref`、`lightweight_model.model_ref` 指向 models.json 里可用的条目 id。这三个角色是最小可跑集合；meta 建议非推理或低思考档模型（路由/汇总要快），domain 建议留思考档（编码执行要正确率），lightweight 选最便宜快的（做摘要/压缩）。
 
-其余配置文件（`config/config.yaml` / `skills.yaml` / `soul.md` / `user_profile.md`）保持仓库默认值即可，但**必须存在**——严格启动，任一缺失或 PG/Redis/LLM 不可达都会启动失败并报出具体原因。
+其余配置文件（`config/config.yaml` / `skills.yaml` / `soul.md` / `user_profile.md`）保持仓库默认值即可，但**必须存在**——严格启动，任一缺失或 PG/Redis 不可达都会启动失败并报出具体原因。**模型不参与启动校验**：`models.json` 里某个条目 key 过期/端点不可用不影响启动，服务起来后在模型页切换角色绑定即可（`agent.verify_llm_on_startup: false` 默认关闭探测，开启也只记告警）。
 
 ### 第 2 步：启动 PostgreSQL + Redis
 

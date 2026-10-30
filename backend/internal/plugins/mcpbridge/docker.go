@@ -165,27 +165,59 @@ func dockerExecArgs(container string, s Settings) []string {
 	return append(argv, s.Args...)
 }
 
-// dockerInspectRunning 查询容器运行状态与镜像；容器不存在/查询失败返回 (false, "")。
-func dockerInspectRunning(logger *slog.Logger, name string) (running bool, image string) {
+// dockerKeeperState keeper 容器现状（用于判断能否复用）。
+type dockerKeeperState struct {
+	Running bool
+	// ImageID 容器实际使用的镜像 ID（sha256:…）。镜像被删/重打 tag 后仍返回
+	// 容器创建时记录的 ID，据此可识别"引用已消失镜像"的僵尸 keeper。
+	ImageID string
+	// Image 创建容器时的镜像引用（tag 字符串，仅用于日志）。
+	Image string
+}
+
+// dockerInspectRunning 查询 keeper 容器运行状态与镜像；容器不存在/查询失败返回零值。
+func dockerInspectRunning(logger *slog.Logger, name string) dockerKeeperState {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f",
-		"{{.State.Running}} {{.Config.Image}}", name).Output()
+		"{{.State.Running}} {{.Image}} {{.Config.Image}}", name).Output()
 	if err != nil {
 		// 容器不存在是常态（首次启动），不算错误。
 		logger.Debug("docker inspect", "container", name, "err", err)
-		return false, ""
+		return dockerKeeperState{}
 	}
-	return parseDockerInspectRunning(string(out))
+	return parseDockerKeeperState(string(out))
 }
 
-// parseDockerInspectRunning 解析 `docker inspect -f '{{.State.Running}} {{.Config.Image}}'` 输出。
-func parseDockerInspectRunning(out string) (bool, string) {
+// parseDockerKeeperState 解析 `docker inspect -f '{{.State.Running}} {{.Image}} {{.Config.Image}}'` 输出。
+func parseDockerKeeperState(out string) dockerKeeperState {
 	fields := strings.Fields(strings.TrimSpace(out))
-	if len(fields) != 2 {
-		return false, ""
+	if len(fields) != 3 {
+		return dockerKeeperState{}
 	}
-	return fields[0] == "true", fields[1]
+	return dockerKeeperState{Running: fields[0] == "true", ImageID: fields[1], Image: fields[2]}
+}
+
+// dockerTagImageID 返回本地 tag 当前指向的镜像 ID（tag 不存在/查询失败返回空）。
+// keepers 复用判定必须比镜像 ID 而不是 tag 字符串：镜像重建后同名 tag 指向新镜像，
+// 只比字符串会让 keeper 永远跑旧代码（2026-10-30 实测两个 keeper 引用的镜像已被删）。
+func dockerTagImageID(ctx context.Context, image string) string {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "docker", "image", "inspect", "-f", "{{.Id}}", image).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// shortImageID 截短 sha256 便于日志阅读。
+func shortImageID(id string) string {
+	id = strings.TrimPrefix(id, "sha256:")
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // warnMountMismatch 复用共享容器时校验挂载源与预期工作目录一致性：不一致只告警
@@ -243,18 +275,24 @@ func normalizeMountPath(p string) string {
 }
 
 // ensureSharedContainer 确保共享容器在运行且镜像匹配。
-// 容器不在/已停止 → rm 残留后 `docker run -d` 重建；镜像不匹配（配置改了）→ 重建。
+// 容器不在/已停止 → rm 残留后 `docker run -d` 重建；镜像不匹配 → 重建，
+// 判定口径是**镜像 ID**：镜像重建（同名 tag 重打）后 keeper 引用的仍是旧 ID，
+// 只比 tag 字符串会一直复用旧容器（工具行为与配置都是旧的）。
+// 本地没有该 tag 的镜像时（未构建）保留既有 keeper：重建必然失败，让后续
+// docker exec 报错比直接拒绝更能说明问题；tag 恢复后下一次调用自动对齐。
 // 并发竞态：另一实例同时重建撞名失败时重新 inspect，running 且镜像一致即放行。
 // `docker run -d` 单独包 60s 超时：Docker Desktop 卡死时不无限挂起预热。
 func (b *Bridge) ensureSharedContainer(ctx context.Context, container, workDir string, volumes []string) error {
-	running, image := dockerInspectRunning(b.logger, container)
-	if running && image == b.settings.Image {
-		b.warnMountMismatch(container, workDir)
-		return nil
-	}
-	if running {
-		b.logger.Warn("共享容器镜像不匹配，重建", "plugin", b.id, "container", container,
-			"running_image", image, "want_image", b.settings.Image)
+	state := dockerInspectRunning(b.logger, container)
+	wantID := dockerTagImageID(ctx, b.settings.Image)
+	if state.Running {
+		if wantID == "" || state.ImageID == wantID {
+			b.warnMountMismatch(container, workDir)
+			return nil
+		}
+		b.logger.Warn("共享容器镜像已更新，重建 keeper", "plugin", b.id, "container", container,
+			"running_image_id", shortImageID(state.ImageID), "want_image_id", shortImageID(wantID),
+			"image", b.settings.Image)
 	}
 	removeDockerContainer(b.logger, container)
 	args := dockerRunArgsShared(b.id, container, b.settings, volumes)
@@ -262,7 +300,7 @@ func (b *Bridge) ensureSharedContainer(ctx context.Context, container, workDir s
 	out, err := exec.CommandContext(runCtx, "docker", args...).CombinedOutput()
 	cancel()
 	if err != nil {
-		if r, img := dockerInspectRunning(b.logger, container); r && img == b.settings.Image {
+		if st := dockerInspectRunning(b.logger, container); st.Running && (wantID == "" || st.ImageID == wantID) {
 			b.logger.Info("共享容器已被并发实例创建，复用", "plugin", b.id, "container", container)
 			return nil
 		}

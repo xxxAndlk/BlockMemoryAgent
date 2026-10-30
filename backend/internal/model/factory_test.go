@@ -13,7 +13,8 @@ import (
 )
 
 // TestVerifyConnectivityRequiresKey 验证 P0-1：无 API key 的角色全部视为未配置，
-// 严格启动要求返回聚合错误，不允许跳过或 Mock 启动。
+// 显式探测（agent.verify_llm_on_startup=true / 模型页探活）返回聚合错误、不允许跳过。
+// 注：2026-10-30 起该探测不再是启动闸门（bootstrap 仅在显式开启时调用且只记 WARN）。
 func TestVerifyConnectivityRequiresKey(t *testing.T) {
 	// 构造角色配置：三个角色均提供 provider 与 model，但无 APIKey
 	cfg := &config.RoleConfigFile{
@@ -29,7 +30,7 @@ func TestVerifyConnectivityRequiresKey(t *testing.T) {
 	}
 }
 
-// TestVerifyConnectivityFailsOnUnreachable 验证 P0-1：有 key 但后端不可达时返回聚合错误。
+// TestVerifyConnectivityFailsOnUnreachable 验证 P0-1：有 key 但后端不可达时返回聚合错误（探测语义，非启动拒启）。
 func TestVerifyConnectivityFailsOnUnreachable(t *testing.T) {
 	// 构造角色配置：MetaAgent 指向一个不可达的本地端口
 	cfg := &config.RoleConfigFile{
@@ -149,7 +150,7 @@ func TestRetryStreamGenerate_AccumulatesChunks(t *testing.T) {
 // flakyStreamWrapper 首次 NewStreaming/Generate 调用注入错误，之后委托内层客户端
 // （用于验证重试路径：首 attempt 失败 → 退避 → 第二次成功）。
 type flakyStreamWrapper struct {
-	inner    *fakeStreamingClient
+	inner      *fakeStreamingClient
 	failedOnce bool
 }
 
@@ -242,4 +243,18 @@ func TestDocAssistantRoleResolution(t *testing.T) {
 	if d.Model != "glm-5.2" {
 		t.Fatalf("domain should stay on its own model, got %q", d.Model)
 	}
+}
+
+// TestLogStartupResolutionNilRegistry 验证启动期静态解析报告在无注册表（models.json
+// 损坏/缺失时 bootstrap 会注入 nil）与缺 Key 的情况下不 panic、不发起网络调用。
+func TestLogStartupResolutionNilRegistry(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:        config.MetaAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "m"}},
+		DomainAgent:      config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "d", APIKey: "k"}},
+		FixedRoles:       []types.RoleDefinition{{ID: "coder", ModelConfig: types.AgentModelConfig{ModelRef: "missing-entry"}}},
+		LightweightModel: types.AgentModelConfig{},
+	}
+	f := NewModelFactory(cfg)
+	// 不调用 SetRegistry（registry=nil）：应逐角色打印 WARN/解析结果后正常返回。
+	f.LogStartupResolution()
 }

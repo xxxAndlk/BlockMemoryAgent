@@ -2,7 +2,8 @@ package server
 
 // capabilities_test.go 装机能力自检（TODO #18-1 T28）：
 // 零真实 PG/Redis/插件——nil 依赖全字段降级不 panic；带 workDir 的可写探针；
-// 插件聚合口径（停用不计入问题清单）经注入真实 plugins.Manager + 缺 env 清单验证。
+// 插件聚合口径（停用不计入问题清单）经注入真实 plugins.Manager + 缺 env 清单验证；
+// docker 项（2026-10-28 起取代模型连通性作为启动闸门）在插件管理器未接线时直通。
 
 import (
 	"encoding/json"
@@ -36,8 +37,8 @@ func getCapabilities(t *testing.T, h *APIHandler) []CapabilityItem {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v body %s", err, w.Body.String())
 	}
-	if len(resp.Items) != 6 {
-		t.Fatalf("期望 6 项自检，got %d: %+v", len(resp.Items), resp.Items)
+	if len(resp.Items) != 7 {
+		t.Fatalf("期望 7 项自检，got %d: %+v", len(resp.Items), resp.Items)
 	}
 	if resp.AllOK {
 		t.Fatalf("nil 依赖下 all_ok 不应为 true: %+v", resp.Items)
@@ -54,10 +55,10 @@ func capabilityOf(items []CapabilityItem, name string) CapabilityItem {
 	return CapabilityItem{Name: "missing:" + name}
 }
 
-// TestCapabilities_NilDepsDegrade 验证零注入依赖时六项自检全部降级返回、无 panic。
+// TestCapabilities_NilDepsDegrade 验证零注入依赖时七项自检全部降级返回、无 panic。
 func TestCapabilities_NilDepsDegrade(t *testing.T) {
 	items := getCapabilities(t, &APIHandler{})
-	for _, name := range []string{"llm", "postgres", "redis", "embed", "plugins", "workdir"} {
+	for _, name := range []string{"llm", "docker", "postgres", "redis", "embed", "plugins", "workdir"} {
 		if capabilityOf(items, name).Name != name {
 			t.Fatalf("缺 %s 项: %+v", name, items)
 		}
@@ -67,6 +68,10 @@ func TestCapabilities_NilDepsDegrade(t *testing.T) {
 	}
 	if it := capabilityOf(items, "llm"); it.OK {
 		t.Fatalf("nil 模型工厂应 ok=false: %+v", it)
+	}
+	// 插件管理器未接线 = 无容器依赖，docker 项按通过处理（不因未装 docker 报错）。
+	if it := capabilityOf(items, "docker"); !it.OK {
+		t.Fatalf("未接线插件管理器时 docker 项应直通: %+v", it)
 	}
 }
 

@@ -88,5 +88,5 @@ try {
     }
     if (-not $caps.all_ok) { Write-Warning "存在未就绪能力,按上方提示修复后重启服务即可(配置在 $target)" }
 } catch {
-    Write-Host "未检测到运行中的服务($base)。启动后访问 $base/api/capabilities 可核对六类能力(LLM/PG/Redis/嵌入/插件/工作目录)。"
+    Write-Host "未检测到运行中的服务($base)。启动后访问 $base/api/capabilities 可核对七类能力(Docker/LLM/PG/Redis/嵌入/插件/工作目录)。"
 }

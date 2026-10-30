@@ -14,7 +14,7 @@ Go module: `github.com/blockmemory/agent/backend` (source under `backend/`; root
 - **底账 append-only（TODO #20①）**：任何上下文剪枝（压缩/重派/rewind/复活类操作）只改视图或标记（`archived`），不物理删行；失败分支的完整轨迹永远 SQL 可查（`agent_messages`/`session_events`/`agent_events`，归档行 `WHERE archived=true` 查回）。唯一物理删除例外：用户显式删除会话的 7 表级联。**话题切换 wipe 必留摘要**——节点快照 + `topic:*:summary` KV 留痕后才可清树。写入侧纪律：`agent_messages` 尾差量追加（分叉时旧版移归档）、`session_events` 按 `(session_id,seq)` 幂等纯追加（seq 永不清零）。
 - **`GOTOOLCHAIN=local` required** on machines whose default Go is older. All `go test` / `go run` commands in this repo use this flag. Do not omit.
 - **Windows bash shell**: use Unix syntax (`/dev/null` not `NUL`, forward slashes in paths).
-- **Strict startup**: `bootstrap.Build` fails fast - missing config files, unreachable PostgreSQL/Redis, or failed LLM warmup/connectivity check all abort boot. No degraded no-DB/no-key mode for the server binary.
+- **Strict startup**（2026-10-28 调整）: `bootstrap.Build` 仍然 fail-fast —— 缺配置文件、PostgreSQL/Redis 连不上直接拒启（无 no-DB 降级模式）。**模型连接不再是启动闸门**：`WarmUp`/`VerifyConnectivity` 失败只告警（`agent.verify_llm_on_startup` 默认 false，即便开也只告警），启动期只做静态解析并打印每个角色生效模型 + Key 有无（`LogStartupResolution`）；单个模型不可用在应用内模型页切换即可。改为**校验容器**：docker 可达性 / 启用中 docker 插件的镜像是否就绪 / bma 项目容器运行状态（`plugins.Manager.DockerReport`，只读只告警），结果同时经 `GET /api/capabilities` 的 `docker` 项暴露。
 - **Flags for `main.go`**: `-config config/config.yaml -roles config/roles.yaml -env .env -soul config/soul.md -skills config/skills.yaml`.
 
 ## Commands
@@ -143,6 +143,10 @@ Codebase migrated from CloudWeGo Eino to go-kratos Blades (pre-v3 Eino docs no l
 ## Plugin System
 
 Hot-pluggable plugins (design: `doc/设计文档_插件范式.md`): plugins register into the shared `domain/tool.Registry`; ReAct reads `Schema()` fresh every iteration, so enable/disable takes effect next iteration. Plugin manager lives in `backend/internal/plugins/` (manager + `mcpbridge/` + `bundle/`).
+
+- **Docker 残留清理（2026-10-28，2026-10-30 补镜像 ID 口径）**：插件的共享 keeper 容器按 `(插件, 工作目录哈希)` 命名（`bma-plugin-<id>-<hash>`），换项目目录/工作目录就新增一套，旧容器 stop 或进程被强杀后永久残留；镜像同名 tag 重建后旧镜像变悬空。`plugins.Manager.CleanupDocker` 在**启动时（Load 之前）自动跑一遍**：删已停止的 `bma-plugin-*`（双过滤：名字前缀 + `com.docker.compose.project=bma` 标签）+ 挂载源已被删除的运行中 keeper（孤儿）+ **镜像已落后于配置 tag 的过期 keeper**（运行中、`docker inspect .Image` ≠ tag 当前 ID；只判定本进程配置里启用中的插件，另一实例不同 plugins.yaml 的不动）+ 安全清理悬空镜像。启动清理跑在 Load 之前，插件清单从磁盘 `plugins.yaml` 读取（`dockerPluginImages`），否则实例表为空判定不出过期容器。
+- **keeper 复用口径 = 镜像 ID**（2026-10-30）：`ensureSharedContainer` 不再比 tag 字符串，而是比 `docker inspect .Image` 与 `docker image inspect .Id`——镜像重建后同名 tag 指向新镜像，只比字符串会让 keeper 永远跑旧代码（实测两个 keeper 引用的镜像被删成不存在的 ID 仍在跑）。本地没有该 tag 时保留既有 keeper（重建必失败）。顺带：`docker image prune -f` 在 containerd 镜像存储下会删掉**仍被容器引用**的 untagged 镜像（本次事故就是这么来的），Go 侧与 `docker/bma-plugin.sh clean` 都已改为先取"全部容器（含已停止）引用的镜像 ID"再对悬空镜像求差集执行 `rmi`。
+- **docker 自检**：`GET /api/plugins/docker` 返回 `plugins.DockerReport`（docker 版本 / 启用插件镜像就绪 / bma 容器状态 / 缺失镜像 / 残留停止容器 / 过期 keeper），启动日志与 `/api/capabilities` 的 `docker` 项同源。
 
 - Config: `config/plugins.yaml` (alongside `config.yaml`); external plugin packages go in `config/plugins.d/`. Manage via API: `GET/POST /api/plugins[/{id}][/enable|/disable]`, `POST /api/plugins/reload`. All endpoints pass `AuthMiddleware`.
 - Initial plugins: `web_search` (mcp, http transport → firecrawl 官方云端 `https://mcp.firecrawl.dev/v2/mcp`，免 key 会话，enabled by default；2026-09-15 由本地自托管栈切云端——本地栈实测 search 返回空结果（CN 网络到搜索源不可达）且常驻 ~3.5GB 内存。免 key 仅暴露 search/scrape/parse 三工具；全工具与更高配额需 firecrawl.dev key 并改走备选 2（stdio `npx firecrawl-mcp`），见 `config/plugins.yaml` 注释；本地自托管栈文件（docker-compose.firecrawl.yml、`docker/firecrawl-mcp/`）已于 2026-10 删除） and `computer_use` (mcp, stdio `npx computer-use-mcp`, **disabled by default**; all tools marked `Destructive()` → approval guard chain). `computer` sandbox service (Xvfb + noVNC) available in `docker/docker-compose.yml` behind the `computer` profile.
