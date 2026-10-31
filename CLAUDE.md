@@ -21,6 +21,22 @@ Go module: `github.com/blockmemory/agent/backend` (source under `backend/`; root
 
 See `Makefile` (`make help` lists all targets). Key targets: `make run` (build web + run server), `make backend-test`, `make test-test`, `make lint`, `make up`/`down` (docker compose), `make migrate`. The Makefile recipes are Unix-shell (Git Bash) syntax — `make` is not installed on some Windows hosts; there run `.\dist.ps1` (= `make dist`) in PowerShell, then `.\install.ps1` to copy `dist/` into a chosen install dir and set user env `BMA_HOME`.
 
+## 桌面版打包与更新（2026-10-30）
+
+`bma-app.ps1`（仓库根，UTF-8 BOM）把仓库打成"版本化 + 可回滚"的桌面应用包，**只带程序与配置模板，绝不带仓库本地运行时数据**。
+
+- `.\bma-app.ps1 pack [-Version v] [-SkipWeb] [-Test] [-NoZip]` → `dist/app/bma-<版本>/`（bin / web\dist / config-templates / launcher / VERSION.json / MANIFEST.sha256）+ `dist/bma-app-<版本>.zip`；ldflags 注入 `internal/buildinfo`（Version/Commit/BuiltAt）。
+- **日常更新一条命令**：`.\bma-app.ps1 deploy -Target <安装目录> [-SkipWeb] [-Keep 3]` = pack + update，自动完成"构建 → 切版本 → 重启后端 → 校验 `build.version`（失败回滚）→ **重启原本开着的桌面外壳**（`-NoShell` 跳过）"。实测全流程约 28s（`-SkipWeb` 时）。
+- `install|update -Target <dir> [-From 包|zip] [-Keep 3] [-HttpAddr host:port] [-NoRestart] [-NoShortcut] [-NoShell] [-Json]`：布局 = `app\versions\<ver>\`（不可变，程序）+ `app\current.json`（版本指针，含 previous）+ 根目录用户数据 `config\ .env plugins.d\ workspace\ logs\`。配置**只补缺、不覆盖**；重启前先关掉该目录下已运行的 `BMA-Desktop.exe`，重启后核对 `/api/health` 的 `build.version`，失败自动回滚上一版；拒绝安装到含 `.git`/`go.work` 的源码目录。
+- `start|stop|restart|status|rollback [-Target <dir>] [-Json]`：`status -Json` 给外部调用方机器可读状态（installed/runtime/running/http/health/versions）。
+- **禁运清单**（打包硬剔除 + 拒绝安装侧污染）：`config/models.json`、`config/user_profile.md`、`config/skills_learned/`、`.env`、`workspace/`、`logs/`、`plugins.installed.yaml`；包内文本命中疑似真实 key 直接拒包。
+- 启动器 `tools/app/{launch.ps1,BMA.cmd,BMA.vbs}`：读指针 → 健康检查单实例 → 生成 `app\run.cmd`（设 BMA_HOME + 日志重定向）→ **ShellExecute 拉起**（不能用 `-NoNewWindow`：子进程会继承调用方 stdout 管道，`& powershell -File launch.ps1` 永不返回）→ 等健康 → 写 `app/runtime.json` → 开浏览器。
+- **桌面外壳 `BMA-Desktop.exe`**（`backend/cmd/desktop`，go-webview2 + 系统 WebView2 Runtime，CGO 关闭可编、`-H=windowsgui` 无控制台）：安装到安装目录根、快捷方式指向它。行为 = 读版本指针/端口 → 健康检查 → 必要时拉起后端 → **原生 WebView2 窗口**渲染 UI（不再落到浏览器）；WebView2 缺失才退回 Edge/Chrome 的 `--app` 无边框窗口。
+- **托盘与退出语义（`tray.go`，energye/systray 纯 Go + `RunWithExternalLoop`）**：点窗口 X = **隐藏到托盘**（子类化 WndProc 拦截 `WM_CLOSE`），后端继续跑；左键托盘=唤回窗口，右键菜单 `打开主窗口 / 在浏览器中打开 / 退出（停止后台）`；只有托盘「退出」才 `stopBackend`（Toolhelp32 按 **安装目录路径** 精确匹配 `bma-server.exe`，不误杀开发实例）并退出。单实例靠按安装目录命名的互斥体：再次双击快捷方式只会唤回已隐藏的窗口。新图标的 Windows 11 默认落在任务栏「^」溢出区，需用户拖出常驻。
+- 图标 `assets/icon.{ico,png}` 由 `tools/make-icon.ps1` 生成（深蓝圆角底 + 3×3 记忆方块 + 中心琥珀高亮；16~256 共 7 尺寸 PNG-in-ICO）；exe 资源经 `backend/cmd/desktop/rsrc.syso`（rsrc 生成，已 gitignore，pack 时按需重建）注入，窗口/任务栏/快捷方式图标取自 `app\icon.ico`。
+- 后端 `GET /api/health` 新增 `build`（version/commit/built_at/go）、`pid`、`uptime_sec`——更新脚本据此确认"跑的是不是新版本"（2026-10-30 事故：旧进程占端口、新进程 bind 失败退出，健康检查却仍 200）。
+- 全新装机需自行填 `.env` 凭据（模板占位符会被严格启动拒绝：Redis NOAUTH / embed 401）；`install` 只补缺失配置并自动生成 `BMA_API_TOKEN`（占位符 `change-me*` 视为未设）。
+
 ## Documentation Map
 
 - **`doc/技术逻辑/`** - **代码级权威实现说明**（16 章，按子系统还原；正文基于 2026-09-16 快照，**2026-10-19 ~ 10-23 的增量见 `00-总览与阅读指引.md` §0.8 索引**）。行号仅供定位，以函数名/符号名为准。

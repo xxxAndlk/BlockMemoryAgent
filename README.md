@@ -356,3 +356,7 @@ make help           # 显示所有目标
 ## License
 
 MIT
+
+# 更新命令
+cd D:\WebData\github\BlockMemoryAgent
+.\bma-app.ps1 deploy -Target D:\WebApp\BMA-Desktop -SkipWeb

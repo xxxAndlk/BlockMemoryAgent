@@ -138,6 +138,12 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.GET("/plugins/docker", apiHandler.DockerPluginsHandler)      // docker 依赖自检（镜像/容器状态）
 	api.POST("/plugins/cleanup", apiHandler.CleanupPluginsHandler)   // 清理 docker 残留（?all=true 含运行中 keeper）
 
+	// 外部 Agent 注册表（config/external_agents.yaml）：清单 + 热重载。
+	// 处理器与 SetExternalAgentProvider 早就接好，但路由此前漏注册——请求会落到 SPA
+	// 静态回退返回 index.html，前端报 "Unexpected token '<' ... is not valid JSON"。
+	api.GET("/external-agents", apiHandler.ListExternalAgentsHandler)        // 注册表清单（含 disabled，附安装状态）
+	api.POST("/external-agents/reload", apiHandler.ReloadExternalAgentsHandler) // 重读 yaml 并热更新工具定义
+
 	// 界面部件（Widget）管理 API：目录包热载 + 卡片文件服务 + 瞬时数据推送 + 错误回报。
 	// 静态段 reload/push/report 与 :id 同层注册（与 plugins 段同款，gin 静态优先）。
 	api.GET("/widgets", apiHandler.ListWidgetsHandler)                 // 部件列表

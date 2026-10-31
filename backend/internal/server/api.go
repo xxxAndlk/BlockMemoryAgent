@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin" // Gin Web 框架
 
 	"github.com/blockmemory/agent/backend/internal/agent"            // ModelManager（模型动态切换）
+	"github.com/blockmemory/agent/backend/internal/buildinfo"        // 构建标识（健康检查核对版本）
 	"github.com/blockmemory/agent/backend/internal/domain/role"      // Registry（角色注册表）
 	"github.com/blockmemory/agent/backend/internal/domain/tool"      // WithWorkDir(work_dir 注入)
 	"github.com/blockmemory/agent/backend/internal/model"            // ModelFactory
@@ -30,6 +31,9 @@ import (
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"      // RoleConfigFile
 	"github.com/blockmemory/agent/backend/pkg/types"                 // 共享类型
 )
+
+// processStartedAt 进程启动时间（/api/health 的 uptime_sec 用）。
+var processStartedAt = time.Now()
 
 // APIHandler TUI / Web API 处理器。
 // 职责：聚合 broadcaster / snapshotMgr / 各存储与配置，统一暴露 HTTP 接口给前端。
@@ -308,6 +312,11 @@ func (h *APIHandler) HealthHandler(c *gin.Context) {
 		"postgres": pgStatus,
 		"redis":    redisStatus,
 		"llm":      llmStatus,
+		// 构建标识与进程信息：打包/更新脚本据此确认"当前在跑的就是刚部署的版本"
+		//（2026-10-30 事故：旧进程占端口，新进程 bind 失败退出，健康检查仍 200）。
+		"build":      buildinfo.Info(),
+		"pid":        os.Getpid(),
+		"uptime_sec": int64(time.Since(processStartedAt).Seconds()),
 	})
 }
 

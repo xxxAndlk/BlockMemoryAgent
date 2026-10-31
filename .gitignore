@@ -38,3 +38,5 @@ go.work.sum
 /.claude
 /.tui-driver
 .tmpshots
+# 桌面外壳：图标资源由 tools/make-icon.ps1 + rsrc 生成（pack 时自动重建）
+backend/cmd/desktop/rsrc.syso
