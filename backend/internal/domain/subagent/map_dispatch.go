@@ -134,10 +134,10 @@ func (t *mapSubAgentsTool) InputSchema() *jsonschema.Schema {
 	return &jsonschema.Schema{
 		Type: "object",
 		Properties: map[string]*jsonschema.Schema{
-			"role_id":       {Type: "string", Description: "统一目标角色 id（如 scout）"},
-			"task_template": {Type: "string", Description: "任务模板，必须含 {{item}} 占位，逐项替换后派发"},
-			"items":         {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "字符串列表，每项替换进模板"},
-			"context":       {Type: "string", Description: "可选：每项任务前附加的共享上下文（结论/契约/路径前缀）"},
+			"role_id":        {Type: "string", Description: "统一目标角色 id（如 scout）"},
+			"task_template":  {Type: "string", Description: "任务模板，必须含 {{item}} 占位，逐项替换后派发"},
+			"items":          {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "字符串列表，每项替换进模板"},
+			"context":        {Type: "string", Description: "可选：每项任务前附加的共享上下文（结论/契约/路径前缀）"},
 			"wall_clock_min": {Type: "number", Description: "可选：单项墙钟预算（分钟），缺省由角色决定（scout=5）"},
 			"tools":          {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "可选：逐项透传的派发级工具授权清单（内置/插件工具名）"},
 			"tools_mode":     {Type: "string", Description: "可选：extend（默认，角色白名单∪授权）/ only（仅授权集，收窄场景）"},
@@ -192,7 +192,7 @@ func (t *mapSubAgentsTool) Execute(ctx context.Context, args map[string]any) *to
 		res.Category = tool.ResultCategoryValidationRejected
 		return res
 	}
-	if !d.registry.CanCall(roleIDFromAgentID(parentID), roleID) {
+	if !d.registry.CanCall(d.roleIDForAgent(parentID), roleID) {
 		res.Error = fmt.Sprintf("role %s cannot be called by %s", roleID, parentID)
 		res.Category = tool.ResultCategoryValidationRejected
 		return res

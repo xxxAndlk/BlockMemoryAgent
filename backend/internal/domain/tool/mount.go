@@ -126,6 +126,16 @@ func (r *Registry) isPreMounted(scope, name string) bool {
 	return r.mounted[scope][name] && r.preMounted[scope][name]
 }
 
+// IsPreMountedForScope 报告 name 是否为 scope 的配置预挂载工具（settings.top_level）。
+// 供 Dispatcher 判定父级当前有效工具面：顶层的联网搜索等预挂载工具无需角色
+// Manifest 可见性即视为父可用，可继续向子 Agent 授权。
+func (r *Registry) IsPreMountedForScope(scope, name string) bool {
+	if r == nil {
+		return false
+	}
+	return r.isPreMounted(scope, name)
+}
+
 // MountForScope 把插件工具挂载进 scope（agentID）的挂载集，校验权限天花板（TODO #52）：
 //   - 工具必须已注册（未注册 → 拒绝）；
 //   - 工具必须是插件工具（owned=true）——非插件工具由角色基础白名单管理，无需挂载；

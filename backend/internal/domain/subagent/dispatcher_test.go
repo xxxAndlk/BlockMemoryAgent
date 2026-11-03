@@ -543,7 +543,7 @@ func dispatchCodeAssistant(t *testing.T, toolsReg *tool.Registry) string {
 }
 
 // subAgentIDOf 从派发结果里取子 Agent ID。Output 形如 "<subID>"，软警告
-//（task 超长 / domain 非中文领域名）会以"。警告: …"追加、接管会以"（已接管…）"追加——
+// （task 超长 / domain 非中文领域名）会以"。警告: …"追加、接管会以"（已接管…）"追加——
 // 直接拿整个 Output 当 ID 用，会在警告一触发时静默失配（2026-09-12 实证：
 // 热驻复用守卫相关用例集体"timed out waiting for tree idle"）。
 func subAgentIDOf(res *tool.Result) string {
@@ -863,30 +863,62 @@ func TestSendMessageTool_MissingArgs(t *testing.T) {
 	}
 }
 
-// TestRegistry_CanCall_PeerPermissions 验证 roles.yaml 中 parents 白名单
-// 允许 code_assistant <-> test_assistant 平级互调，支撑验证闭环。
-func TestRegistry_CanCall_PeerPermissions(t *testing.T) {
+// TestRoleIDForAgent_TopLevelSessionRole A-01：顶层会话角色由会话实际档位解析，
+// 不再对所有无 '/' 的 ID 固定返回 meta；显式登记与子 Agent 句柄解析仍生效。
+func TestRoleIDForAgent_TopLevelSessionRole(t *testing.T) {
+	d := NewDispatcher(nil, nil, nil, nil, nil)
+	d.WithSessionRoleResolver(func(sessionID string) string {
+		if sessionID == "sess-daily" {
+			return "domain"
+		}
+		return ""
+	})
+
+	if got := d.roleIDForAgent("sess-daily"); got != "domain" {
+		t.Fatalf("daily 顶层应为 domain, got %q", got)
+	}
+	if got := d.roleIDForAgent("sess-unknown"); got != "meta" {
+		t.Fatalf("未解析顶层应回落 meta, got %q", got)
+	}
+	d.noteAgentRole("sess-daily/leaf-1", "code_assistant")
+	if got := d.roleIDForAgent("sess-daily/leaf-1"); got != "code_assistant" {
+		t.Fatalf("显式登记角色优先, got %q", got)
+	}
+	// 带连字符的动态角色 ID 按末个 '-' 之前的完整段解析。
+	if got := d.roleIDForAgent("sess-daily/doc-reviewer-7"); got != "doc-reviewer" {
+		t.Fatalf("连字符角色解析错误, got %q", got)
+	}
+}
+
+// TestRegistry_CanCall_TargetParents 验证 A-02 语义：Parents 描述目标角色的
+// 允许直接父角色集合，不再被解释成"叶子可调用的平级角色"。
+func TestRegistry_CanCall_TargetParents(t *testing.T) {
 	cfg := &config.RoleConfigFile{
 		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		FixedRoles: []types.RoleDefinition{
-			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"test_assistant"}},
-			{ID: "test_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"code_assistant"}},
+			{ID: "scout", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"meta", "domain"}},
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true},
+			{ID: "domain_only", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"domain"}},
 		},
 	}
 	reg := role.NewRegistry(cfg)
 
-	// code_assistant 可调用 test_assistant（平级验证闭环正向）。
-	if !reg.CanCall("code_assistant", "test_assistant") {
-		t.Fatal("code_assistant should be able to call test_assistant")
+	// 目标 Parents 含 meta 与 domain：两者均可调用。
+	if !reg.CanCall("meta", "scout") || !reg.CanCall("domain", "scout") {
+		t.Fatal("meta/domain should call role whose parents whitelist allows both")
 	}
-	// test_assistant 可调用 code_assistant（平级验证闭环反向：打回修正）。
-	if !reg.CanCall("test_assistant", "code_assistant") {
-		t.Fatal("test_assistant should be able to call code_assistant")
+	// 空 Parents：任意编排者可调用。
+	if !reg.CanCall("meta", "code_assistant") || !reg.CanCall("domain", "code_assistant") {
+		t.Fatal("orchestrators should call role with empty parents")
 	}
-	// 未在 parents 中的角色不可调用。
-	if reg.CanCall("code_assistant", "ui_assistant") {
-		t.Fatal("code_assistant should NOT be able to call ui_assistant (not in parents)")
+	// 目标 Parents 仅 domain：meta 被拒。
+	if reg.CanCall("meta", "domain_only") || !reg.CanCall("domain", "domain_only") {
+		t.Fatal("target parents whitelist must be enforced")
+	}
+	// 叶子不派发：父级声明不被反向解释。
+	if reg.CanCall("code_assistant", "scout") || reg.CanCall("scout", "code_assistant") {
+		t.Fatal("fixed leaf roles must not dispatch")
 	}
 }
 
@@ -956,8 +988,8 @@ func TestDispatcher_MaxTotalDispatches(t *testing.T) {
 		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		FixedRoles: []types.RoleDefinition{
-			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"test_assistant"}, SystemPrompt: "code"},
-			{ID: "test_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"code_assistant"}, SystemPrompt: "test"},
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+			{ID: "test_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "test"},
 		},
 	}
 	reg := role.NewRegistry(cfg)
@@ -1080,7 +1112,7 @@ func (m *testKVMemory) Keys(ctx context.Context) []string {
 
 // TestBuildSharedPrefix_Layer3StaleDetection 验证 Layer 3：MD frontmatter mtime 不匹配
 // （文件被改）时普通共享记忆槽不再丢弃，照常注入并前置【失效警告】行号漂移警告
-//（常量值/签名类结论仍可直接采信，防止"跳过注入"导致子 Agent 从零重读）。
+// （常量值/签名类结论仍可直接采信，防止"跳过注入"导致子 Agent 从零重读）。
 // 旧格式（纯字符串）直接用，向后兼容。
 func TestBuildSharedPrefix_Layer3StaleDetection(t *testing.T) {
 	// 准备临时文件并记录初始 mtime。
@@ -1516,7 +1548,7 @@ func waitMailboxDrain(t *testing.T, mb *mailbox.Mailbox, parent string) string {
 // 经自检辅助 LLM 判定通过（额外一次 provider 调用 = 自检调用），结果回传父邮箱。
 func TestDispatch_ModeReflection(t *testing.T) {
 	cfg := &config.RoleConfigFile{
-		MetaAgent: config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		FixedRoles: []types.RoleDefinition{
 			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
@@ -1553,7 +1585,7 @@ func TestDispatch_ModeReflection(t *testing.T) {
 // 逐步执行（2 步 + 汇总），计划落 board（TUI 可见），最终结果回传父邮箱。
 func TestDispatch_ModePlanExecute(t *testing.T) {
 	cfg := &config.RoleConfigFile{
-		MetaAgent: config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		FixedRoles: []types.RoleDefinition{
 			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
@@ -1602,7 +1634,7 @@ func TestDispatch_ModePlanExecute(t *testing.T) {
 // TestDispatch_ModeValidation 非法 mode 拒绝（单派与批量逐项）。
 func TestDispatch_ModeValidation(t *testing.T) {
 	cfg := &config.RoleConfigFile{
-		MetaAgent: config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
 		FixedRoles: []types.RoleDefinition{
 			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
@@ -1690,9 +1722,9 @@ func TestValidateDispatchArgs_TaskRuneLimitsOverride(t *testing.T) {
 // 3100 runes 派发成功且 Output 含压缩警告；4100 runes 校验拒绝（Category=validation_rejected）。
 func TestCallSubAgent_TaskSoftLandingSuccess(t *testing.T) {
 	cfg := &config.RoleConfigFile{
-		MetaAgent:    config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
-		DomainAgent:  config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
-		FixedRoles:   []types.RoleDefinition{{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"}},
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles:  []types.RoleDefinition{{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"}},
 	}
 	reg := role.NewRegistry(cfg)
 	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
@@ -1915,5 +1947,34 @@ func TestSendMessageTool_MislabeledInquiryHint(t *testing.T) {
 	})
 	if strings.Contains(res.Output, "重发") {
 		t.Fatalf("request must not be flagged: %s", res.Output)
+	}
+}
+
+// TestDispatch_TeamBudgetGate B-04：会话 token 预算达上限后拒绝新增派发。
+func TestDispatch_TeamBudgetGate(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent:   config.MetaAgentConfig{SystemPrompt: "meta", ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+		FixedRoles: []types.RoleDefinition{
+			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, SystemPrompt: "code"},
+		},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "ok"}}, toolsReg, mailbox.New(), agent.NopMemoryPipeline{})
+	d.RegisterCallTool(toolsReg)
+	d.WithTeamBudgetCheck(func(sessionID string) bool { return sessionID == "session-1" })
+
+	ctx := agent.WithAgentID(context.Background(), "session-1")
+	res, err := toolsReg.Dispatch(ctx, "call_sub_agent", map[string]any{
+		"role_id":     "code_assistant",
+		"task":        "job",
+		"verify_kind": "none",
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if res.Success || !strings.Contains(res.Error, "token 预算") {
+		t.Fatalf("budget exceeded should reject dispatch, got success=%v err=%q", res.Success, res.Error)
 	}
 }

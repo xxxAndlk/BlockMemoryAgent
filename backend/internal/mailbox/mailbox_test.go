@@ -197,3 +197,41 @@ func TestMailboxHooks(t *testing.T) {
 		t.Fatalf("同 ID Restore 应幂等去重，Drain 应空，got %d", n)
 	}
 }
+
+// TestMailboxIdempotencyKey B-06：同收件人同 IdempotencyKey 只入箱一次，
+// 重复 Send 返回首次消息 ID；不同 key 正常入箱；不带 key 不受影响。
+func TestMailboxIdempotencyKey(t *testing.T) {
+	mb := New()
+	first := &Message{From: "a", To: "b", Subject: "done", IdempotencyKey: "k1"}
+	id1, err := mb.Send(first)
+	if err != nil {
+		t.Fatalf("first send: %v", err)
+	}
+	dup := &Message{From: "a", To: "b", Subject: "done again", IdempotencyKey: "k1"}
+	id2, err := mb.Send(dup)
+	if err != nil {
+		t.Fatalf("duplicate send: %v", err)
+	}
+	if id2 != id1 {
+		t.Fatalf("duplicate send should return first id %q, got %q", id1, id2)
+	}
+	if got := len(mb.Peek("b")); got != 1 {
+		t.Fatalf("duplicate key must not enqueue twice, got %d messages", got)
+	}
+
+	other := &Message{From: "a", To: "b", Subject: "other", IdempotencyKey: "k2"}
+	if _, err := mb.Send(other); err != nil {
+		t.Fatalf("different key send: %v", err)
+	}
+	if got := len(mb.Peek("b")); got != 2 {
+		t.Fatalf("different key should enqueue, got %d messages", got)
+	}
+
+	// 不同收件人同 key 不串。
+	if _, err := mb.Send(&Message{From: "a", To: "c", Subject: "x", IdempotencyKey: "k1"}); err != nil {
+		t.Fatalf("other recipient send: %v", err)
+	}
+	if got := len(mb.Peek("c")); got != 1 {
+		t.Fatalf("same key for other recipient should enqueue, got %d", got)
+	}
+}

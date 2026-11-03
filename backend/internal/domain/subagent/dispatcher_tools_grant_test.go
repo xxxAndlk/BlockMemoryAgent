@@ -378,6 +378,85 @@ func TestMapSubAgents_ToolsGrantPassthrough(t *testing.T) {
 	}
 }
 
+// TestParentAssignableTools_EffectiveSurface A-03：父级可授上限 = 其当前有效工具面。
+// meta 自身白名单收窄后，未暴露的注册内置工具不得下放；未知角色无可授工具。
+func TestParentAssignableTools_EffectiveSurface(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		MetaAgent: config.MetaAgentConfig{
+			SystemPrompt: "meta",
+			ModelConfig:  types.AgentModelConfig{Provider: "mock"},
+			Tools:        []string{"ReadFile", "call_sub_agent"},
+		},
+		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "mock"}},
+	}
+	reg := role.NewRegistry(cfg)
+	toolsReg := tool.NewBuiltinRegistry(t.TempDir(), nil, nil)
+	d := NewDispatcher(reg, &mockModelFactory{provider: &mockProvider{text: "done"}}, toolsReg, mailbox.New(), agent.NopMemoryPipeline{})
+
+	assignable := d.parentAssignableTools("meta")
+	if !assignable["ReadFile"] || !assignable["call_sub_agent"] {
+		t.Fatalf("meta 自身白名单应可授: %v", assignable)
+	}
+	if assignable["WriteFile"] || assignable["RunCommand"] {
+		t.Fatalf("meta 未暴露的内置工具不得进入可授上限: %v", assignable)
+	}
+	child := &types.RoleDefinition{ID: "code_assistant"}
+	grants, rejected := d.resolveChildTools("meta", child, []string{"WriteFile", "RunCommand", "ReadFile"})
+	if len(grants) != 1 || grants[0] != "ReadFile" {
+		t.Fatalf("仅白名单内工具应授予: grants=%v", grants)
+	}
+	if joined := strings.Join(rejected, ";"); !strings.Contains(joined, "父 Agent 未持有") {
+		t.Fatalf("越界内置工具应附父未持有原因: %v", rejected)
+	}
+	// 身份未知：不把"角色不存在"解释为全量特权。
+	if got := d.parentAssignableTools("s1/ghost-1"); len(got) != 0 {
+		t.Fatalf("未知角色不应有任何可授工具: %v", got)
+	}
+	// A-01 + A-03：daily 顶层（会话 ID，实际角色 domain）与 cluster 子节点 domain
+	// 使用同一有效工具面——都不含 meta 专属的 create_role。
+	d.WithSessionRoleResolver(func(sessionID string) string {
+		if sessionID == "sess-daily" {
+			return "domain"
+		}
+		return ""
+	})
+	if d.parentAssignableTools("sess-daily")["create_role"] {
+		t.Fatal("daily 顶层 domain 不应获得 meta 专属工具的可授权")
+	}
+	if d.parentAssignableTools("s1/domain-1")["create_role"] {
+		t.Fatal("子节点 domain 不应获得 meta 专属工具的可授权")
+	}
+}
+
+// TestResolveChildTools_PluginParentAccess A-03：插件工具须父级当前可用
+// （父角色可见或父 scope 配置预挂载）+ 对子角色可见，二者缺一不可。
+func TestResolveChildTools_PluginParentAccess(t *testing.T) {
+	d, toolsReg, _ := newGrantTestEnv(t, &mockProvider{text: "done"})
+	toolsReg.Register(&hintPluginTool{name: "child_only_plugin"})
+	toolsReg.Register(&hintPluginTool{name: "premounted_plugin"})
+	d.WithPluginVisibility(func(roleID, name string) (owned, visible bool) {
+		switch name {
+		case "child_only_plugin", "premounted_plugin":
+			// 子角色可见、父角色（scout）不可见。
+			return true, roleID != "scout"
+		}
+		return hintCeiling(roleID, name)
+	})
+
+	child := &types.RoleDefinition{ID: "code_assistant"}
+	grants, rejected := d.resolveChildTools("s1/scout-1", child, []string{"child_only_plugin"})
+	if len(grants) != 0 || !strings.Contains(strings.Join(rejected, ";"), "父 Agent 未持有") {
+		t.Fatalf("父不可用的插件工具不得下放: grants=%v rejected=%v", grants, rejected)
+	}
+
+	// 配置预挂载视为父可用：即使父角色 Manifest 不可见也可继续授权。
+	toolsReg.MountPreApprovedForScope("s1/scout-2", "scout", []string{"premounted_plugin"})
+	grants, rejected = d.resolveChildTools("s1/scout-2", child, []string{"premounted_plugin"})
+	if !containsString(grants, "premounted_plugin") {
+		t.Fatalf("父 scope 预挂载的插件工具应可下放: grants=%v rejected=%v", grants, rejected)
+	}
+}
+
 // TestToolsGrant_ModeValidation 并发安全占位：heldToolGrant 读写经 sync.Map，
 // 本用例压一遍并发 Store/Load/Delete 防数据竞争（配合 -race）。
 func TestToolsGrant_ConcurrentAccess(t *testing.T) {

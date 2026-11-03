@@ -171,6 +171,15 @@ type Dispatcher struct {
 	// 刻意用普通 func 而非 agent 包类型（与 projectPrefs 同风格）；nil 时空串、守卫放行。
 	sessionGearFn func(sessionID string) string
 
+	// agentRoles 权威实例角色身份表（A-01）：agentID -> roleID。
+	// 子 Agent 在派发时登记精确角色；顶层会话角色由 sessionRoleFn 解析
+	//（fast=doc_assistant / daily=domain / cluster=meta）。权限、可授工具、
+	// 技能分配、可见性与心跳分类统一读它，不再从 agentID 形状推断。
+	agentRoles sync.Map
+	// sessionRoleFn 顶层会话角色只读回调：sessionID -> 实际运行角色 ID。
+	// bootstrap 接 agentSvc.TopLevelRoleID（按会话档位解析）；nil 时回落 meta。
+	sessionRoleFn func(sessionID string) string
+
 	// domainProfilesFn 领域档案快照回调（TODO #17 T24）：ctx -> 全部未归档领域档案。
 	// 派发侧做名字/别名/路径匹配；nil 时档案匹配整体关闭。
 	domainProfilesFn func(ctx context.Context) []*DomainProfile
@@ -247,6 +256,9 @@ type Dispatcher struct {
 	// planMaxRevisions 每 Agent 计划被驳回重提上限；<=0 表示不限制（循环直到批准，
 	// 默认）。>0 时达上限不放行，转 send_message(escalate) 升级仲裁（防无限循环）。
 	planMaxRevisions int
+	// planApprovalFailClosed 审批不可用/超时策略（B-02）：true=阻断执行；
+	// false=保留 fail-open（按计划继续）。bootstrap 按 plan_approval_policy 注入。
+	planApprovalFailClosed bool
 	// planState 计划确认会话级状态（等待者注册表 + 驳回计数），NewDispatcher 初始化。
 	planState *planConfirmState
 
@@ -260,6 +272,9 @@ type Dispatcher struct {
 	// maxTotalDispatches 全局派发总数上限：同一 session 内所有角色的派发合计超过该值时
 	// 拒绝进一步派发，防止编排失控。<=0 表示不限制。计数随用户新消息重置。
 	maxTotalDispatches int
+	// teamBudgetExceeded 会话累计 token 预算闸门（B-04）：nil=不限制；
+	// 返回 true 时拒绝新增派发。bootstrap 接 agentSvc.TeamBudgetExceeded。
+	teamBudgetExceeded func(sessionID string) bool
 
 	// aggByAgent 聚合模式登记（TODO 第七项⑤ map_sub_agents）：subAgentID → *mapAggEntry。
 	// 命中时 notify 不直发父邮箱，改记入聚合器；收口后删除登记。
@@ -1047,7 +1062,7 @@ func (d *Dispatcher) scanStuck() {
 	d.activity.Range(func(k, v any) bool {
 		e := v.(*activityEvidence)
 		threshold := d.heartbeatTimeout
-		if roleIDFromAgentID(k.(string)) == "domain" {
+		if d.roleIDForAgent(k.(string)) == "domain" {
 			threshold = domainThreshold
 		}
 		// 0. 并发池排队中：豁免（未开始执行，无"静默"可言）。
@@ -1085,9 +1100,9 @@ func (d *Dispatcher) killStuckSubAgent(subAgentID, evidence string) {
 	// 展示用真实阈值：domain 按 domainHeartbeatTimeout（默认 2× 叶子），
 	// 与 scanStuck 判定口径一致——旧文案恒用叶子阈值，domain 被杀时报"超过 5m0s"与实际不符。
 	threshold := d.heartbeatTimeout
-	if roleIDFromAgentID(subAgentID) == "domain" && d.domainHeartbeatTimeout > 0 {
+	if d.roleIDForAgent(subAgentID) == "domain" && d.domainHeartbeatTimeout > 0 {
 		threshold = d.domainHeartbeatTimeout
-	} else if roleIDFromAgentID(subAgentID) == "domain" {
+	} else if d.roleIDForAgent(subAgentID) == "domain" {
 		threshold = 2 * d.heartbeatTimeout
 	}
 	log.Printf("[subagent] STALL KILL: sub=%s parent=%s threshold>%s evidence=[%s] - cancel+notify",
@@ -1319,6 +1334,8 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 	}
 	parentID := node.ParentID
 	subAgentID := node.ID
+	// 恢复路径同样以节点角色为权威身份（A-01）。
+	d.noteAgentRole(subAgentID, node.Role)
 
 	subAgentCtx := tool.StopContextFrom(ctx)
 	if subAgentCtx == nil {
@@ -1397,6 +1414,7 @@ func (d *Dispatcher) ReviveWithMessage(ctx context.Context, node orchestrator.No
 		defer d.lastWrites.Delete(subAgentID)
 		defer d.heldSkills.Delete(subAgentID)
 		defer d.heldTools.Delete(subAgentID)
+		defer d.agentRoles.Delete(subAgentID)
 		// 复活按默认 ReAct 模式重跑（mode=react、verify_kind 留空走角色默认校验分层）——
 		// 原派发的 mode/responsibility 未随节点持久化，无法复原；职责边界由种子里的
 		// 原任务文本与领域标签承载，必要时模型可自行重新派发下游。
@@ -1479,20 +1497,20 @@ func NewDispatcher(
 ) *Dispatcher {
 	// 构造 Dispatcher 实例，将依赖注入到对应字段。
 	return &Dispatcher{
-		registry:          registry,
-		models:            models,
-		tools:             tools,
-		mailbox:           mailbox,
-		memory:            memory,
-		ledger:            newTaskLedger(),
-		timeout:           30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
-		salvageTimeout:    30 * time.Second, // 默认 30s，可用 WithSalvageTimeout 覆盖（TODO #33）
-		taskRuneSoftLimit: 3000,             // task 文本软上限（TODO #35），WithTaskRuneLimits 覆盖
-		taskRuneHardLimit: 4000,
-		softStops:         make(map[string]bool),
-		pauseRequests:     make(map[string]bool),
-		planState:         newPlanConfirmState(),
-		pendingReqs:       newPendingRequestRegistry(),
+		registry:           registry,
+		models:             models,
+		tools:              tools,
+		mailbox:            mailbox,
+		memory:             memory,
+		ledger:             newTaskLedger(),
+		timeout:            30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
+		salvageTimeout:     30 * time.Second, // 默认 30s，可用 WithSalvageTimeout 覆盖（TODO #33）
+		taskRuneSoftLimit:  3000,             // task 文本软上限（TODO #35），WithTaskRuneLimits 覆盖
+		taskRuneHardLimit:  4000,
+		softStops:          make(map[string]bool),
+		pauseRequests:      make(map[string]bool),
+		planState:          newPlanConfirmState(),
+		pendingReqs:        newPendingRequestRegistry(),
 		batchDigestEnabled: true, // call_sub_agents 波聚合默认开（config agent.batch_digest_enabled 可关）
 	}
 }
@@ -1607,6 +1625,40 @@ func (d *Dispatcher) sessionGearOf(sessionID string) string {
 	return d.sessionGearFn(sessionID)
 }
 
+// WithSessionRoleResolver 注入顶层会话角色只读回调（A-01）：
+// bootstrap 接 agentSvc.TopLevelRoleID（fast→doc_assistant / daily→domain /
+// cluster→meta）。nil 时顶层实例回退按句柄推断（历史兼容 = meta）。
+func (d *Dispatcher) WithSessionRoleResolver(fn func(sessionID string) string) *Dispatcher {
+	d.sessionRoleFn = fn
+	return d
+}
+
+// noteAgentRole 登记实例的权威角色身份；roleID 为空时跳过（不覆盖已有登记）。
+func (d *Dispatcher) noteAgentRole(agentID, roleID string) {
+	if agentID == "" || roleID == "" {
+		return
+	}
+	d.agentRoles.Store(agentID, roleID)
+}
+
+// roleIDForAgent 返回实例的权威角色 ID（A-01 单一真相源）：
+//  1. 派发/复活时登记的精确角色；
+//  2. 顶层实例（无 '/'）：会话当前实际运行角色（fast/daily/cluster）；
+//  3. 兜底：按句柄 `parent/role-n` 解析（旧树恢复的兼容迁移路径）。
+func (d *Dispatcher) roleIDForAgent(agentID string) string {
+	if v, ok := d.agentRoles.Load(agentID); ok {
+		if roleID, _ := v.(string); roleID != "" {
+			return roleID
+		}
+	}
+	if !strings.Contains(agentID, "/") && d.sessionRoleFn != nil {
+		if roleID := strings.TrimSpace(d.sessionRoleFn(agentID)); roleID != "" {
+			return roleID
+		}
+	}
+	return roleIDFromAgentID(agentID)
+}
+
 // SkillHint 经验技能召回提示（设计 §6.5：只注一行提示，不注全文）。
 type SkillHint struct {
 	Name  string
@@ -1708,7 +1760,7 @@ func (d *Dispatcher) assignableSkills(agentID string) map[string]string {
 	if d.skillPool == nil {
 		return out
 	}
-	if roleIDFromAgentID(agentID) == "meta" {
+	if d.roleIDForAgent(agentID) == "meta" {
 		for _, s := range d.skillPool.All() {
 			name := s.Name
 			if name == "" {
@@ -1767,7 +1819,7 @@ func (d *Dispatcher) resolveChildSkills(parentID string, roleDef *types.RoleDefi
 // heldToolGrant 是一次派发级工具授权（派发级工具授权二期）：父 Agent 派发时
 // 经 tools/tools_mode 参数授予子 Agent 的工具面覆盖。
 // mode=extend：子有效白名单 = 角色白名单 ∪ tools（默认）；mode=only：仅 tools
-//（只读侦察等收窄场景）。tools 已在派发时校验 ⊆ 父可分配集（插件工具另受
+// （只读侦察等收窄场景）。tools 已在派发时校验 ⊆ 父可分配集（插件工具另受
 // 子角色 Manifest.Roles 可见性天花板约束）。
 type heldToolGrant struct {
 	tools []string
@@ -1845,24 +1897,28 @@ func (d *Dispatcher) effectiveToolAllowlist(scope string, roleDef *types.RoleDef
 }
 
 // parentAssignableTools 返回父 Agent 可下放给子 Agent 的工具查找集（内置工具口径）：
-// meta 或未声明 tools 的角色（空表=全量暴露）= 全注册工具；其他父 = 其角色白名单 ∪
-// 其自身携带的派发级授权（extend/only 授权集都是父的当前有效工具面，可继续下放）。
-// 插件工具的可见性天花板由 resolveChildTools 另行判定（不经本集合）。
+// 授权上限 = 父级**当前有效工具面**（A-03）——角色白名单 ∪ 其自身携带的派发级授权；
+// 角色白名单为空（全量暴露语义）时才回退全注册工具；角色不存在时无可授工具
+// （最小权限：不再把"身份未知"解释为特权）。
+// 插件工具的可用性由 resolveChildTools 另行判定（父可用 + 子可见 + 已挂载）。
 func (d *Dispatcher) parentAssignableTools(parentID string) map[string]bool {
 	out := map[string]bool{}
-	if d.tools == nil {
+	if d.tools == nil || d.registry == nil {
 		return out
 	}
-	roleID := roleIDFromAgentID(parentID)
-	rd := d.registry.Get(roleID)
-	if roleID == "meta" || rd == nil || len(rd.Tools) == 0 {
+	rd := d.registry.Get(d.roleIDForAgent(parentID))
+	if rd == nil {
+		return out
+	}
+	if len(rd.Tools) > 0 {
+		for _, n := range rd.Tools {
+			out[n] = true
+		}
+	} else {
+		// 空白名单在 adapter 中表示"全量暴露"：该角色的当前工具面即全注册工具。
 		for _, n := range d.tools.ToolNames() {
 			out[n] = true
 		}
-		return out
-	}
-	for _, n := range rd.Tools {
-		out[n] = true
 	}
 	if grants, _, ok := d.HeldToolGrant(parentID); ok {
 		for _, n := range grants {
@@ -1872,14 +1928,16 @@ func (d *Dispatcher) parentAssignableTools(parentID string) map[string]bool {
 	return out
 }
 
-// resolveChildTools 解析子 Agent 的派发级工具授权（二期）：逐项校验 ⊆ 父可分配集；
-// 插件工具还须对子角色可见（Manifest.Roles 天花板不变——基础插件保留角色分配）。
+// resolveChildTools 解析子 Agent 的派发级工具授权（二期）：逐项校验 ⊆ 父可分配集。
+// 插件工具（A-03）须同时满足：父级当前可用（父角色可见或父 scope 配置预挂载）
+// + 对子角色可见（Manifest.Roles 天花板）+ 授权后挂载进子 scope。
 // 越界/未注册项忽略并收进 rejected，由派发结果回告父 Agent（同 tools_hint/skills 口径）。
 func (d *Dispatcher) resolveChildTools(parentID string, roleDef *types.RoleDefinition, tools []string) (grants []string, rejected []string) {
 	if len(tools) == 0 || d.tools == nil || roleDef == nil {
 		return nil, nil
 	}
 	assignable := d.parentAssignableTools(parentID)
+	parentRoleID := d.roleIDForAgent(parentID)
 	for _, name := range tools {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -1889,11 +1947,20 @@ func (d *Dispatcher) resolveChildTools(parentID string, roleDef *types.RoleDefin
 			rejected = append(rejected, name+"（工具未注册）")
 			continue
 		}
-		// 插件工具：天花板=对子角色可见（ToolVisibility）；可见即可授。
+		// 插件工具：父可用 → 子可见 → 授权（挂载在派发成功后执行）。
 		if d.pluginVisibility != nil {
 			if owned, visible := d.pluginVisibility(roleDef.ID, name); owned {
 				if !visible {
 					rejected = append(rejected, name+"（超出子角色插件可见性天花板）")
+					continue
+				}
+				parentVisible := false
+				if _, pv := d.pluginVisibility(parentRoleID, name); pv {
+					parentVisible = true
+				}
+				// 顶层必备插件工具有"配置预挂载"豁免：父 scope 已挂载即视为父可用。
+				if !parentVisible && !d.tools.IsPreMountedForScope(parentID, name) {
+					rejected = append(rejected, name+"（父 Agent 未持有该插件工具）")
 					continue
 				}
 				if !containsString(grants, name) {
@@ -2004,6 +2071,13 @@ func (d *Dispatcher) WithBlockMemorySearcher(s BlockMemorySearcher) *Dispatcher 
 // 超过 n 时拒绝。n<=0 表示不限制。计数在用户发送新消息时经 ResetDispatchCounts 重置。
 func (d *Dispatcher) WithMaxTotalDispatches(n int) *Dispatcher {
 	d.maxTotalDispatches = n
+	return d
+}
+
+// WithTeamBudgetCheck 注入会话累计 token 预算闸门（B-04）：返回 true 时拒绝新增派发。
+// bootstrap 接 agentSvc.TeamBudgetExceeded；nil 表示不限制。
+func (d *Dispatcher) WithTeamBudgetCheck(fn func(sessionID string) bool) *Dispatcher {
+	d.teamBudgetExceeded = fn
 	return d
 }
 
@@ -2198,9 +2272,9 @@ func (d *Dispatcher) wakeSuspendedParent(parentID, hint string) {
 }
 
 // sweepPendingRequests 扫超期未答的协作询问，给提问方的父 Agent 投 escalate 告警
-//（提问方等不到回复不该只能沉默）。父取不到（树未接线/节点无父）时回退发到会话
+// （提问方等不到回复不该只能沉默）。父取不到（树未接线/节点无父）时回退发到会话
 // 顶层（meta，agentID==sessionID）；提问方本身是顶层 meta 时无人可升
-//（to=="" 或 to==pr.From），跳过不升级。
+// （to=="" 或 to==pr.From），跳过不升级。
 func (d *Dispatcher) sweepPendingRequests() {
 	if d.pendingReqs == nil || d.mailbox == nil {
 		return
@@ -2411,6 +2485,24 @@ func (d *Dispatcher) WithPlanConfirmation(enabled bool, timeout time.Duration, m
 	return d
 }
 
+// WithPlanApprovalPolicy 设置审批不可用/超时的处置策略（B-02）：
+// failClosed=true 时超时、父不可达、ask_user 通道失败一律阻断执行（不产出）；
+// false 保留历史 fail-open 语义。bootstrap 按 cfg.Agent.PlanApprovalPolicy 注入。
+func (d *Dispatcher) WithPlanApprovalPolicy(failClosed bool) *Dispatcher {
+	d.planApprovalFailClosed = failClosed
+	return d
+}
+
+// planBlockedResult 构造 fail-closed 阻断结果：明确告知模型不得继续产出。
+func (d *Dispatcher) planBlockedResult(reason string) *tool.Result {
+	return &tool.Result{
+		Tool:     "submit_plan",
+		Category: tool.ResultCategoryValidationRejected,
+		Error: fmt.Sprintf("计划审批未完成（%s），已按 fail-closed 阻断执行。未经批准禁止产出/改动；"+
+			"请停止本任务，并在结论中说明计划未获批准及等待的审批方。", reason),
+	}
+}
+
 // RegisterPlanTools 将 submit_plan / review_plan 工具安装到传入的工具注册表中
 // （plan_confirm.go 计划确认机制）。角色可见性由 role.Registry 的 meta/domain
 // 内置工具白名单 + roles.yaml 覆盖控制。
@@ -2506,7 +2598,7 @@ func (t *sendMessageTool) Execute(ctx context.Context, args map[string]any) *too
 	// 返回 nil）。越界即拒（消息不进对方邮箱），错误文案给出发送方自己的允许范围。
 	if targets := d.visibleTargets(sessionIDFromAgentID(fromID), fromID); targets != nil && !targets[toID] {
 		scope := "你的上级 domain 与同 domain 同级叶子"
-		if roleIDFromAgentID(fromID) == "domain" {
+		if t.dispatcher.roleIDForAgent(fromID) == "domain" {
 			scope = "你的上级、同级 domain 与你的下级叶子"
 		}
 		return &tool.Result{
@@ -3035,7 +3127,7 @@ func hasHanRunes(s string) bool {
 // 工具名直写形态——误判代价是一次改派往返（父 Agent 收工具错误即重派），漏判代价
 // 是整波子 Agent 空转（实测 meta 给 scout 派"用 PowerShell Get-Content 读文件"，
 // 3 个 scout 全无 RunCommand，一波全灭浪费数分钟与数万 token）。角色工具面空表
-//（domain 等未声明 tools）= 全量暴露，天然通过。
+// （domain 等未声明 tools）= 全量暴露，天然通过。
 var taskToolDemandSignals = []struct {
 	tool string
 	re   *regexp.Regexp
@@ -3516,6 +3608,21 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		return "", &tool.Result{Error: "missing parent agent context"}
 	}
 
+	// 会话累计 token 预算闸门（B-04）：达上限拒绝新增派发，已有结果仍可收口。
+	// 复用派发同样受限（放在 reuse 分流之前）。
+	if d.teamBudgetExceeded != nil {
+		sid := tool.SessionIDFromContext(ctx)
+		if sid == "" {
+			sid = sessionIDFromAgentID(parentID)
+		}
+		if d.teamBudgetExceeded(sid) {
+			return "", &tool.Result{
+				Error:    "会话累计 token 预算（agent.team_token_budget）已用尽，禁止新增派发；请整合已有结果答复用户，或等待用户调整预算",
+				Category: tool.ResultCategoryValidationRejected,
+			}
+		}
+	}
+
 	// 热驻复用分流（reuse_agent_id 参数）：槽 idle 唤醒 + 注入新任务；busy 入队；
 	// 不存在报错提示新建。热驻未开启时报错（防误参数静默新建）。
 	if reuseAgentID != "" {
@@ -3585,7 +3692,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	}
 
 	// 校验调用权限：只有被允许的角色关系才能发起子 Agent 调用。
-	if !d.registry.CanCall(roleIDFromAgentID(parentID), roleID) {
+	if !d.registry.CanCall(d.roleIDForAgent(parentID), roleID) {
 		return "", &tool.Result{Error: fmt.Sprintf("role %s cannot be called by %s", roleID, parentID), Category: tool.ResultCategoryValidationRejected}
 	}
 
@@ -3657,6 +3764,8 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 
 	// 生成全局唯一的子 Agent ID，格式为 "父ID/角色ID-序号"。
 	subAgentID := fmt.Sprintf("%s/%s-%d", parentID, roleID, d.seq.Add(1))
+	// 权威身份登记（A-01）：权限、可授工具、技能与可见性读同一 roleID。
+	d.noteAgentRole(subAgentID, roleID)
 
 	// worktree 隔离派发（TODO 第9⑤）：trackChildStart 之前创建副本——失败按
 	// validation_rejected 拒绝，不泄漏父 pending 计数；成功后句柄登记进 d.worktrees，
@@ -3832,6 +3941,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		defer d.lastWrites.Delete(subAgentID)
 		defer d.heldSkills.Delete(subAgentID)
 		defer d.heldTools.Delete(subAgentID)
+		defer d.agentRoles.Delete(subAgentID)
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
 		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
@@ -4587,12 +4697,13 @@ func (d *Dispatcher) treeFinishStatus(ctx context.Context, subAgentID, summary s
 //     活跃叶子）；
 //   - 叶子：上级 domain（父 id）+ 同 domain 同级叶子（同父活跃兄弟）——不注祖父
 //     （meta）与他域节点，天然满足"只能知道同级叶子+上级 domain"。
+//
 // 块内 id 是 send_message 的寻址前提（2026-09-21 实证根因修复：此前系统提示词无任何
 // 运行时身份，问答面纪律因此零使用）。尾部注入 fork 尾部，公共前缀缓存复用不破。
 // 名册均为派发时点快照，运行中变化由 siblingUptakePipeline 每轮【拓扑名册更新】
 // 实时刷新（diff 无变化零注入）。
 func (d *Dispatcher) runtimeIdentityBlock(sid, parentID, selfID string) string {
-	roleID := roleIDFromAgentID(selfID)
+	roleID := d.roleIDForAgent(selfID)
 	var b strings.Builder
 	b.WriteString("【运行时身份】（send_message 的 to_agent_id 填下列实例 id）\n")
 	fmt.Fprintf(&b, "- 你的实例 id：%s\n", selfID)
@@ -4707,7 +4818,7 @@ func (d *Dispatcher) visibleTargets(sid, fromID string) map[string]bool {
 	for _, e := range d.rosterEntries(sid, parentID, fromID) {
 		out[e.id] = true
 	}
-	if roleIDFromAgentID(fromID) == "domain" {
+	if d.roleIDForAgent(fromID) == "domain" {
 		for _, e := range d.childEntries(sid, fromID) {
 			out[e.id] = true
 		}
@@ -5504,6 +5615,7 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	defer d.running.Delete(pausedNodeID)
 	defer d.heldSkills.Delete(pausedNodeID)
 	defer d.heldTools.Delete(pausedNodeID)
+	defer d.agentRoles.Delete(pausedNodeID)
 	defer baseCancel()
 	// 仅终结出口清邮箱回投死信（同 runSubAgentOnce 口径）：再触限重暂停的节点
 	// 还会被 resume，误清会回投"已终结"死信并销账 pending；会话级硬删除仍由
@@ -5880,14 +5992,18 @@ func formatSubAgentFailure(ctx context.Context, err error, result agent.ReactRes
 // TUI 可见、HTTP cancel 可取消、叶子心跳覆盖（与异步派发同语义）。
 // 权限校验与 ID 生成与 call_sub_agent 工具一致；失败时返回 partial 结果与 err。
 func (d *Dispatcher) ExecuteChild(ctx context.Context, parentID, roleID, task string) (string, error) {
+	if d.teamBudgetExceeded != nil && d.teamBudgetExceeded(sessionIDFromAgentID(parentID)) {
+		return "", fmt.Errorf("会话累计 token 预算（agent.team_token_budget）已用尽，禁止新增派发")
+	}
 	roleDef := d.registry.Get(roleID)
 	if roleDef == nil {
 		return "", fmt.Errorf("unknown role: %s", roleID)
 	}
-	if !d.registry.CanCall(roleIDFromAgentID(parentID), roleID) {
+	if !d.registry.CanCall(d.roleIDForAgent(parentID), roleID) {
 		return "", fmt.Errorf("role %s cannot be called by %s", roleID, parentID)
 	}
 	subAgentID := fmt.Sprintf("%s/%s-%d", parentID, roleID, d.seq.Add(1))
+	d.noteAgentRole(subAgentID, roleID)
 	d.trackChildStart(parentID)
 	defer d.trackChildDone(parentID)
 
@@ -6442,7 +6558,7 @@ func (d *Dispatcher) WithSharedMemory(r tool.SharedMemoryStore) *Dispatcher {
 //
 // 提取策略（2026-09-16 收紧）：factExtractor 已注入时只认 LLM 提取结果——
 // 提取成功但零事实（模型判定无可复用信息）**不沉淀**；提取失败也不回退原文
-//（原文多为本次状态快照，是存量噪声的主要来源），仅记日志。未注入提取器时
+// （原文多为本次状态快照，是存量噪声的主要来源），仅记日志。未注入提取器时
 // 才回退原始 result.Text 落库（测试/未接线场景的向后兼容）。
 func (d *Dispatcher) saveBlockMemory(ctx context.Context, subAgentID, roleID, parentID, taskDomain, goal, result, outcome string, filesModified []string, history []agent.ReactMessage) {
 	if d.saver == nil || !d.writeEnabled {
@@ -6889,6 +7005,11 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 		Subject:       "子 Agent 完成: " + subAgentID,
 		Body:          body,
 		FilesModified: filesModified,
+		// B-09：机器可消费结果信封随 Payload 持久化（Mailbox Payload 即 JSONB）。
+		Payload: map[string]any{"agent_result": d.buildAgentResult(parentID, subAgentID, summary, filesModified)},
+		// B-06 幂等键：同一实例同结果的重复终态通知只入箱一次（重试/崩溃重投
+		// 不得重复提醒父 Agent）。不同结果（复活返工）哈希不同，仍会送达。
+		IdempotencyKey: fmt.Sprintf("sub_agent_terminal:%s:%08x", subAgentID, fnvHash32(summary)),
 	}); err != nil {
 		log.Printf("[subagent] notify dead-letter: to=%s from=%s err=%v", parentID, subAgentID, err)
 	}
@@ -6972,12 +7093,13 @@ func (d *Dispatcher) TopologyBrief(agentID string) string {
 	return truncateRunes(sb.String(), 800)
 }
 
-// roleIDFromAgentID 从 Agent 句柄中还原出角色 ID。
+// roleIDFromAgentID 从 Agent 句柄中解析角色 ID（仅展示/兼容用途，非身份真相源）。
 // 子 Agent 的标识格式为 "parent/role-n"（见 Execute 中的 subAgentID 生成），
 // 还原规则：取最后一个 '/' 之后的末段，再去掉末尾最后一个 '-' 之后的序号。
 // 角色 ID 自身可能含连字符（如 code-assistant），因此必须用 LastIndex 定位
 // 序号分隔符，不能用第一个 '-' 截断，否则会把角色 ID 截短（code-assistant → code）。
-// 顶层 Agent 以会话 ID（session-N）命名，其角色恒为 MetaAgent，返回 "meta"。
+// 顶层 Agent 以会话 ID（session-N）命名：本函数对无 '/' 句柄固定返回 "meta"，
+// 这只是旧调用方的兜底——权限与调度必须走 d.roleIDForAgent（A-01 权威身份）。
 func roleIDFromAgentID(agentID string) string {
 	// 查找最后一个 '/'，若存在则取最后一段 "role-n"。
 	if idx := strings.LastIndex(agentID, "/"); idx >= 0 {
@@ -7002,4 +7124,3 @@ func sessionIDFromAgentID(agentID string) string {
 	}
 	return agentID
 }
-

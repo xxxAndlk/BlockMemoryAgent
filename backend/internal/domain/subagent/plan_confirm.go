@@ -13,7 +13,8 @@ package subagent
 //
 // 结论语义：approve → 按计划执行；reject → 返还 feedback，下级修订后重新提交，
 // 循环直到批准为止（未经批准禁止执行；plan_max_revisions>0 时达上限转升级仲裁仍不放行）；
-// 等待超时 / 上级不可达 → fail-open 按计划继续（与 ask_user 超时"自行决策"语义一致）。
+// 等待超时 / 上级不可达 → 按 plan_approval_policy 处理：默认 fail-open 继续，
+// fail-closed 阻断执行并回告未获批准（B-02）。
 
 import (
 	"context" // context 用于取消信号传递
@@ -23,7 +24,7 @@ import (
 	"sync"    // sync 保护 planWaits / revisions 计数
 	"time"    // time 用于等待超时与保活 tick
 
-	"github.com/blockmemory/agent/backend/internal/agent" // agent 包提供 AgentIDFromContext
+	"github.com/blockmemory/agent/backend/internal/agent"       // agent 包提供 AgentIDFromContext
 	"github.com/blockmemory/agent/backend/internal/domain/tool" // tool 包提供 Result 类型与校验拒绝类别
 	"github.com/blockmemory/agent/backend/internal/mailbox"     // mailbox 包用于下级向上级投递计划审批请求
 )
@@ -50,7 +51,7 @@ type planWaiter struct {
 // planConfirmState 是计划确认的会话级状态：等待者注册表 + 每 Agent 驳回计数。
 type planConfirmState struct {
 	mu        sync.Mutex
-	seq       uint64                // plan_id 递增序号
+	seq       uint64                 // plan_id 递增序号
 	waits     map[string]*planWaiter // planID -> 等待者
 	revisions map[string]int         // agentID -> 已被驳回次数
 }
@@ -136,7 +137,8 @@ func (t *submitPlanTool) Description() string {
 		"子 Agent 的计划呈给父 Agent 审批。批准后本调用才返回并放行执行，未经批准禁止动手；" +
 		"被驳回时返回上级修改意见，修订后重新提交，循环直到批准为止" +
 		"（配置了 plan_max_revisions 上限时，达上限转升级仲裁，仍不放行）。" +
-		"等待超时或上级不可达时按计划继续（fail-open）。"
+		"等待超时或上级不可达时按服务端 plan_approval_policy 处理：默认 fail-open 继续，" +
+		"fail-closed 则阻断执行并回告未获批准。"
 }
 
 // Execute 提交计划：解析层级路由（用户 / 父 Agent），阻塞等待结论。
@@ -184,14 +186,20 @@ func (d *Dispatcher) submitPlanToUser(ctx context.Context, planID, taskSummary, 
 		},
 	})
 	if err != nil || res == nil {
+		log.Printf("[plan] submit_plan ask_user dispatch failed: plan_id=%s err=%v fail_closed=%v", planID, err, d.planApprovalFailClosed)
+		if d.planApprovalFailClosed {
+			return d.planBlockedResult("ask_user 审批通道不可用")
+		}
 		// ask_user 未接线/派发失败：fail-open 与等待超时语义一致。
-		log.Printf("[plan] submit_plan ask_user dispatch failed: plan_id=%s err=%v", planID, err)
 		return &tool.Result{Tool: "submit_plan", Success: true,
 			Output: "计划确认通道不可用，按计划继续执行（fail-open）。"}
 	}
 	answer := strings.TrimSpace(res.Output)
-	// ask_user 超时文案"用户未答复，自行决策"→ 视为同意继续（fail-open）。
+	// ask_user 超时文案"用户未答复，自行决策"→ 按策略处理（默认视为继续）。
 	if strings.Contains(answer, "未答复") {
+		if d.planApprovalFailClosed {
+			return d.planBlockedResult("用户未在超时内答复计划")
+		}
 		return &tool.Result{Tool: "submit_plan", Success: true,
 			Output: "用户未及时答复计划（超时），按计划继续执行（fail-open）。"}
 	}
@@ -219,8 +227,11 @@ func (d *Dispatcher) submitPlanToParent(ctx context.Context, w *planWaiter, plan
 		Priority: 10, // 高优先级：审批请求排在普通结果摘要之前
 	})
 	if err != nil {
+		log.Printf("[plan] submit_plan mailbox send failed: plan_id=%s from=%s to=%s err=%v fail_closed=%v", planID, w.agentID, w.parentID, err, d.planApprovalFailClosed)
+		if d.planApprovalFailClosed {
+			return d.planBlockedResult(fmt.Sprintf("上级 %s 不可达", w.parentID))
+		}
 		// 上级已销毁（Purge）等不可达场景：fail-open，避免下级永久挂起。
-		log.Printf("[plan] submit_plan mailbox send failed: plan_id=%s from=%s to=%s err=%v", planID, w.agentID, w.parentID, err)
 		return &tool.Result{Tool: "submit_plan", Success: true,
 			Output: fmt.Sprintf("上级 %s 不可达（%v），按计划继续执行（fail-open）。", w.parentID, err)}
 	}
@@ -266,7 +277,10 @@ func (d *Dispatcher) submitPlanToParent(ctx context.Context, w *planWaiter, plan
 			// 保活：等待审批期间刷新活动时间并沿父链冒泡，防心跳巡检误判假死 kill。
 			d.PingActivity(w.agentID)
 		case <-timer.C:
-			log.Printf("[plan] submit_plan wait timeout: plan_id=%s from=%s to=%s timeout=%s", planID, w.agentID, w.parentID, timeout)
+			log.Printf("[plan] submit_plan wait timeout: plan_id=%s from=%s to=%s timeout=%s fail_closed=%v", planID, w.agentID, w.parentID, timeout, d.planApprovalFailClosed)
+			if d.planApprovalFailClosed {
+				return d.planBlockedResult("审批等待超时 " + timeout.String())
+			}
 			return &tool.Result{Tool: "submit_plan", Success: true,
 				Output: "审批等待超时（" + timeout.String() + "），按计划继续执行（fail-open）。"}
 		case <-ctx.Done():

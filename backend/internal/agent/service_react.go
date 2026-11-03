@@ -54,6 +54,12 @@ type ReactService struct {
 	memory       MemoryPipeline      // 记忆管道，负责会话记忆的写入与查询
 	runtimeCfg   ReactRuntimeConfig  // ReAct 主循环运行时参数（轮数/超时/重试/历史滑窗）
 
+	// teamTokenBudget 会话累计 token 预算（B-04/B-10）：0=关闭；超限后 Dispatcher
+	// 拒绝新增派发（已有结果仍可收口）。bootstrap 按 agent.team_token_budget 注入。
+	teamTokenBudget int64
+	// teamUsage 会话累计用量：sessionID -> *teamTokenUsage（LiveEventTokenUsage 累加）。
+	teamUsage sync.Map
+
 	// notifier 会话终态 Webhook 通知器（TODO #18-5 T32）：finalizeSession 收尾时
 	// best-effort 通知外部渠道。为 nil 时零开销跳过；bootstrap 按 config.notify 构造注入。
 	notifier *Notifier
@@ -2371,6 +2377,20 @@ func (s *ReactService) SessionGear(sessionID string) string {
 		return ""
 	}
 	return sess.currentGear()
+}
+
+// TopLevelRoleID 返回会话顶层 Agent 的实际角色 ID（A-01 权威身份）：
+// fast→doc_assistant / daily→domain / cluster→meta。会话未加载时返回空串，
+// 调用方（Dispatcher）回落句柄解析。权限与调度不得再假设顶层恒为 meta。
+func (s *ReactService) TopLevelRoleID(sessionID string) string {
+	s.store.mu.RLock()
+	sess := s.store.sessions[sessionID]
+	s.store.mu.RUnlock()
+	if sess == nil {
+		return ""
+	}
+	_, roleID := s.resolveGearMetaRole(sess)
+	return roleID
 }
 
 // SetSessionThinking 切换会话级思考强度（2026-09-16，HTTP 切换通道）：
@@ -4956,6 +4976,8 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		// 单次 LLM 调用 token 用量：记为 token_usage 调试事件，供前端实时累加展示。
 		// 消息格式 in=<n> out=<n> cache_hit=<n> cache_miss=<n> 与 textutil.ParseTokenUsage
 		// 兼容（前缀 in=/out= 不变），便于后端日志解析复用。
+		// B-04/B-10：同步累加会话级总用量（顶层 + 全部子 Agent），供预算闸门与团队指标。
+		s.recordSessionTokens(session.ID, int64(ev.InputTokens), int64(ev.OutputTokens))
 		msg := fmt.Sprintf("in=%d out=%d cache_hit=%d cache_miss=%d", ev.InputTokens, ev.OutputTokens, ev.CacheHitTokens, ev.CacheMissTokens)
 		s.store.addEventDebug(session, eventkind.Stats, ev.Agent, msg, eventkind.TokenUsage, "", "", "", "", true, "", int(ev.InputTokens), int(ev.OutputTokens), int(ev.CacheHitTokens), int(ev.CacheMissTokens), "")
 	}

@@ -90,6 +90,10 @@ type Message struct {
 	// 由 dispatcher.notify 从子 Agent result.History 扫 WriteFile 工具调用收集，
 	// 父 drainMailbox 时展示给父 LLM，使其知晓子改了哪些文件（非 KV 失效--Layer 2 已在写时 per-path 失效）。
 	FilesModified []string `json:"files_modified,omitempty"`
+	// IdempotencyKey 可选幂等键（B-06）：同一收件人下同 key 的重复 Send 只入箱一次，
+	// 用于崩溃重投/重试场景抑制重复通知。传输层仍是 at-least-once，业务副作用
+	// 仍需消费方自行幂等（有副作用的工具）。空值不参与去重。
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // ErrRecipientClosed 是投递给已销毁（Purge 过）收件人的死信错误。
@@ -110,6 +114,9 @@ type Mailbox struct {
 	inbox  map[string][]*Message // agentID -> messages
 	closed map[string]struct{}   // 已销毁收件人（Purge 过），Send 死信
 	seq    atomic.Int64          // 全局递增序号，用于生成消息 ID
+	// idem 幂等键去重表（B-06）：agentID -> idempotency_key -> 首次消息 ID。
+	// 进程内有效；重启后由 PG 未读恢复兜底（重复投递按业务幂等消化）。
+	idem map[string]map[string]string
 	// trace 可选的发送留痕回调（编排页 Agent 间交互留痕数据源）：Send 投递成功后持锁外调用；
 	// nil 时零行为。实现方必须 best-effort 非阻塞。
 	trace func(*Message)
@@ -135,6 +142,7 @@ func New() *Mailbox {
 	return &Mailbox{
 		inbox:  make(map[string][]*Message),
 		closed: make(map[string]struct{}),
+		idem:   make(map[string]map[string]string),
 	}
 }
 
@@ -215,6 +223,22 @@ func (m *Mailbox) Send(msg *Message) (string, error) {
 	if _, ok := m.closed[msg.To]; ok {
 		m.mu.Unlock()
 		return "", fmt.Errorf("%w: %s", ErrRecipientClosed, msg.To)
+	}
+	// 幂等去重（B-06）：同收件人同 key 只入箱一次，重复 Send 返回首次消息 ID。
+	if msg.IdempotencyKey != "" {
+		if m.idem == nil {
+			m.idem = make(map[string]map[string]string)
+		}
+		keys := m.idem[msg.To]
+		if keys == nil {
+			keys = make(map[string]string)
+			m.idem[msg.To] = keys
+		}
+		if existing, ok := keys[msg.IdempotencyKey]; ok {
+			m.mu.Unlock()
+			return existing, nil
+		}
+		keys[msg.IdempotencyKey] = id
 	}
 	m.inbox[msg.To] = append(m.inbox[msg.To], msg)
 	trace := m.trace
@@ -350,6 +374,7 @@ func (m *Mailbox) Purge(agentID string) []*Message {
 		}
 	}
 	delete(m.inbox, agentID)
+	delete(m.idem, agentID)
 	// 标记收件人已销毁：此后 Send 至该 ID 返回死信错误。
 	m.closed[agentID] = struct{}{}
 	if len(dropped) > 0 {
@@ -407,6 +432,19 @@ func (m *Mailbox) Restore(msg *Message) error {
 	}
 	if !dup {
 		m.inbox[msg.To] = append(m.inbox[msg.To], msg)
+		if msg.IdempotencyKey != "" {
+			if m.idem == nil {
+				m.idem = make(map[string]map[string]string)
+			}
+			keys := m.idem[msg.To]
+			if keys == nil {
+				keys = make(map[string]string)
+				m.idem[msg.To] = keys
+			}
+			if _, ok := keys[msg.IdempotencyKey]; !ok {
+				keys[msg.IdempotencyKey] = msg.ID
+			}
+		}
 	}
 	hook := m.restoreHook
 	m.mu.Unlock()

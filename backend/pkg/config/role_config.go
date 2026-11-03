@@ -201,40 +201,55 @@ func (c *RoleConfigFile) GetFixedRolesByType(roleType enums.RoleType) []types.Ro
 	return result
 }
 
-// CanCall 调用权限矩阵: 判断 caller 角色能否调用 callee 角色。
-//
-// 规则:
-//  1. caller 必须存在; 否则拒绝。
-//  2. caller 为 meta/domain 时，可调用任意 fixed/dynamic 类型助手。
-//  3. 否则检查 callee 是否在 caller.Parents 列表(显式声明的可被调用方)。
-//
-// 参数:
-//   - callerRoleDefID: 调用方角色定义 ID。
-//   - calleeRoleDefID: 被调用方角色定义 ID。
-//
-// 返回: true 允许调用; false 拒绝。
+// CanCall 调用权限矩阵: 判断 caller 角色能否调用 callee 角色（静态配置口径，
+// 与 internal/domain/role.Registry.CanCall 同语义，A-02 纠偏后）：
+//  1. 仅 meta/domain 编排者可派发；固定角色不派发；
+//  2. callee 必须 CanBeCalled=true；
+//  3. callee.Parents 是允许的直接父角色集合：非空时 caller 必须在其中，空=不限父级；
+//  4. Meta→Domain 允许；Meta→Meta、Domain→Domain、Domain→Meta 拒绝。
 func (c *RoleConfigFile) CanCall(callerRoleDefID, calleeRoleDefID string) bool {
-	// 取调用方角色定义，若不存在则无法授权，直接拒绝。
-	caller := c.GetFixedRole(callerRoleDefID)
-	if caller == nil {
-		// 调用方不存在，直接拒绝。
+	if c == nil {
 		return false
 	}
-	// 规则2: meta/domain 可调用任意 fixed/dynamic 助手。
-	if caller.Type == enums.RoleTypeMeta || caller.Type == enums.RoleTypeDomain {
-		// 查询被调用方角色定义。
-		callee := c.GetFixedRole(calleeRoleDefID)
-		// 被调用方存在且类型为固定或动态助手时允许调用。
-		if callee != nil && (callee.Type == enums.RoleTypeFixed || callee.Type == enums.RoleTypeDynamic) {
+	// 解析调用方类型：meta/domain 为合成角色，不在 FixedRoles 中。
+	var callerType enums.RoleType
+	switch callerRoleDefID {
+	case "meta":
+		callerType = enums.RoleTypeMeta
+	case "domain":
+		callerType = enums.RoleTypeDomain
+	default:
+		if caller := c.GetFixedRole(callerRoleDefID); caller != nil {
+			callerType = caller.Type
+		}
+	}
+	// 非编排者不承担派发职责。
+	if callerType != enums.RoleTypeMeta && callerType != enums.RoleTypeDomain {
+		return false
+	}
+	switch calleeRoleDefID {
+	case "domain":
+		// Meta→Domain 允许下级拆分；Domain→Domain 拒绝。
+		return callerType == enums.RoleTypeMeta
+	case "meta":
+		return false
+	}
+	// 目标必须是可被调用的固定/动态角色。
+	callee := c.GetFixedRole(calleeRoleDefID)
+	if callee == nil || !callee.CanBeCalled {
+		return false
+	}
+	if callee.Type != enums.RoleTypeFixed && callee.Type != enums.RoleTypeDynamic {
+		return false
+	}
+	// 目标声明的允许父级白名单：空 = 不限制编排者；非空 = 调用方必须在其中。
+	if len(callee.Parents) == 0 {
+		return true
+	}
+	for _, parent := range callee.Parents {
+		if parent == callerRoleDefID {
 			return true
 		}
 	}
-	// 规则3: 检查 Parents 显式声明，命中则允许调用。
-	for _, parent := range caller.Parents {
-		if parent == calleeRoleDefID {
-			return true
-		}
-	}
-	// 默认拒绝：未通过任何授权规则。
 	return false
 }

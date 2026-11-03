@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/blockmemory/agent/backend/internal/config"
 )
 
 // TestCheckExpectedMtime_MatchPasses 匹配放行：EditFile/WriteFile 传回当前 mtime 成功写入。
@@ -219,4 +221,48 @@ func readAll(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// TestSharedWritePathRequiresExpectedMtime B-05：命中 shared_write_paths 的既有文件
+// 写入必须携带 expected_mtime；带版本校验则放行。
+func TestSharedWritePathRequiresExpectedMtime(t *testing.T) {
+	dir := t.TempDir()
+	e := NewExecutor(dir)
+	e.SetAgentConfig(&config.AgentConfig{SafetyConfig: config.SafetyConfig{
+		SharedWritePaths: []string{"shared"},
+	}})
+	sharedDir := filepath.Join(dir, "shared")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sharedFile := filepath.Join(sharedDir, "a.js")
+	if err := os.WriteFile(sharedFile, []byte("v1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// WriteFile 无 expected_mtime：拒绝。
+	res := e.writeFile(context.Background(), map[string]any{"path": "shared/a.js", "content": "v2"})
+	if res.Success || !strings.Contains(res.Error, "共享写路径") {
+		t.Fatalf("shared path write without expected_mtime must be rejected, got success=%v err=%q", res.Success, res.Error)
+	}
+	// EditFile 无 expected_mtime：拒绝。
+	res = e.editFile(context.Background(), map[string]any{"path": "shared/a.js", "old_string": "v1", "new_string": "v2"})
+	if res.Success || !strings.Contains(res.Error, "共享写路径") {
+		t.Fatalf("shared path edit without expected_mtime must be rejected, got success=%v err=%q", res.Success, res.Error)
+	}
+	// 带当前 mtime：放行。
+	mt := mtimeOf(t, sharedFile).Format(time.RFC3339)
+	res = e.writeFile(context.Background(), map[string]any{"path": "shared/a.js", "content": "v3", "expected_mtime": mt})
+	if !res.Success {
+		t.Fatalf("shared path write with expected_mtime should pass: %v", res.Error)
+	}
+	// 非共享路径保持 advisory 现状。
+	plain := filepath.Join(dir, "plain.js")
+	if err := os.WriteFile(plain, []byte("p1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res = e.writeFile(context.Background(), map[string]any{"path": "plain.js", "content": "p2"})
+	if !res.Success {
+		t.Fatalf("non-shared path write should keep advisory behavior: %v", res.Error)
+	}
 }

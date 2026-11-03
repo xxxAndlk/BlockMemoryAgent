@@ -1,6 +1,8 @@
 # BlockMemoryAgent
 
-> 一个基于 **上下文外部化 + 记忆隔离** 的 Go 多 Agent 编排系统。核心执行架构：单一 ReAct 主循环 + `call_sub_agent` 异步子 Agent 分发，配事件流记忆、三层存储（PostgreSQL + Redis + pgvector）与 HTTP Web UI / bubbletea TUI 双入口。
+> 一个基于 **上下文外部化 + 记忆隔离** 的 Go 多 Agent 编排系统。核心执行架构：单一 ReAct 主循环 + `call_sub_agent` 异步子 Agent 分发，配事件流记忆、PostgreSQL／pgvector + Redis 存储，以及 HTTP Web UI、bubbletea TUI、Windows 桌面入口。
+>
+> **文档入口**：当前模块与实现全景见 [项目模块全景](doc/项目模块全景.md)，多 Agent 完整主链见 [21 多 Agent 设计详解](doc/技术逻辑/21-多Agent设计详解.md)，新旧资料边界见 [文档地图](doc/文档地图.md)。本文保留快速上手和演进背景；具体默认开关、端点与状态语义冲突时，以当前代码、配置和项目模块全景为准。
 
 ---
 
@@ -18,25 +20,24 @@ BlockMemoryAgent 的应对思路：不依赖 LLM 记住一切。子 Agent 各自
 
 ## 核心特性
 
-- **单一 ReAct 主循环**：MetaAgent 跑 LLM → 工具 → 结果循环（默认上限 50 轮），直到输出纯文本回答
-- **层级即调用栈**：`call_sub_agent(role_id, task)` 起 goroutine 跑子 Agent，子 Agent 完成后把摘要推 Mailbox，父 Agent 每轮 LLM 前 Drain 邮箱注入上下文——任意深度递归，无图状态机
-- **层级历史压缩**：token 阈值（默认 150K）或每 `summarize_every` 步触发，`memory.Pipeline` 把新滑出保留段的中段历史压成一个结构化压缩包（轻量模型，四节：决策/进展/待办/约束；失败降级截断），视图呈"系统前缀 + 用户目标 + N 个压缩包（从旧到新）+ 最近 K 条"；压缩包超 `summarize_max_bundles`（默认 20）时最老的一半合并为 1 个更粗的包，循环往复渐变式遗忘；压缩状态落 `agent_compress_states` 表、主对话全量历史落 `agent_messages` 表，重启后懒加载恢复不再失忆；assistant 入史副本截断超长工具入参（单值 2000 runes），滑动窗口/压缩下刀只避开孤立 tool 结果（不锚 user 边界），防 token 爆炸、单轮 input 爆预算与上下文塌缩
-- **权威 Agent 树**：`internal/domain/orchestrator/tree.go` 维护派发树快照，HTTP 暴露 `GET /api/sessions/{id}/tree` 读子 Agent 节点状态 + `POST /api/sessions/{id}/agents/{aid}/cancel` 取消子 Agent（补 ReAct 重构后丢失的 introspect/cancel 能力）；`call_sub_agent` 同父 Agent 下同领域重复派发查树快照自动去重；暂停态（paused_on_child/awaiting_clarify）会话可取消
-- **块记忆事实提取**：子 Agent 完成后调轻量模型提取 1-5 条关键事实，每条单独向量化落 KnowledgeRecord，替代原始 result.Text 整段落库；提取失败自动回退原始保存
-- **共享记忆**：`WriteSharedMemory` 工具让主 Agent 把关键上下文（文件路径/行号/函数签名/验收标准）写入 `sharedKV`，子 Agent 自动读取，避免重读全文件；`task` 入参 2000 runes 上限强制规格走共享记忆
-- **验证闭环编排器**：`verifyloop` 原生驱动"产出 -> 自测 -> 修正 -> 上级统一测试"状态机，`Verifier`/`Fixer`/`Reporter` 三接口解耦，`PlanConfirmVerifier` 支持"测试方向不明确 -> 列方案 -> 产出方确认 -> 符合才自测"前置
-- **角色工具白名单**：`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集；MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet` 防越位，DomainAgent 开放完整权限承担上下文采集 + 任务拆分 + 派发执行
-- **经验技能自进化与「技能携带工具」**：会话结束由 SessionEvolver 沉淀经验技能（写入前轻量模型评分门禁 <3 拒收、title+when_to_use 向量近重复 LLM-judge 合并、每日自动整理）；目录式落盘 `<name>/SKILL.md + scripts/`，会话中跑通的自写脚本可固化为技能配套工具（≤60 行 + 写入前冒烟执行），`load_skill` 注入「配套工具」段、沙箱放行执行
-- **工作区文件树与全屏预览（Kimi Work 形态）**：会话侧栏整棵工作区目录树（实时筛选/tab 多开/面包屑跳转/在线编辑 Ctrl+S 保存带 mtime 409 冲突与 .bak），消息流统一文件卡片 + 全局 FileViewer 全屏预览（图片画廊/PDF/视频 Range 流/Markdown/代码高亮/CSV/xlsx/ipynb），支持「在文件夹中显示」与本机编辑器扫码打开（VS Code/Cursor/记事本等）
-- **热插拔插件系统**（[设计文档](doc/设计文档_插件范式.md)）：MCP 外部插件（stdio 子进程 / streamable HTTP / docker 容器）、Claude/Codex 插件包（`.mcp.json` + `SKILL.md`）与 Docker 长驻服务统一挂进 `tool.Registry` 或生命周期管理，运行中 enable/disable 下一轮迭代即生效；初始插件：`web_search`（firecrawl 官方云端免 key 端点，默认开）、`computer_use`（Xvfb 虚拟桌面容器，默认关，全部工具接审批守卫链）、`open_design`（画图设计台，随 `docker/docker-compose.yml` 统一启停）；管理 API：`/api/plugins`（list/get/enable/disable/reload），配置 `config/plugins.yaml` + `config/plugins.d/`，部署见下文「插件（Docker 部署）」
-- **14 个内置工具**：文件/命令（ReadFile/WriteFile/ListDir/RunCommand/SearchInFiles）、HTTP（HTTPGet/HTTPPost）、Git（GitDiff/GitStatus/GitLog/GitBlame）、共享内存（WriteSharedMemory）、Agent 通信（call_sub_agent/send_message），统一经沙箱守卫
-- **两段事件流记忆**：`Write` 追加事件（tool_call / call_sub_agent / sub_agent_summary / answer）并落 `agent_events` 表，`Assemble` 在 LLM 调用前注入最近 N 条（超 8 条经轻量模型压成 ≤200 字摘要，失败降级 raw join）；重启后懒加载恢复；无 RAG 自动注入（块记忆经 `SearchBlockMemory` 工具按需调用）
-- **会话持久化，默认全新启动**：会话历史（goal/summary/工具结果）、主对话完整消息历史（`agent_messages`）与事件流写入 PostgreSQL；每次启动默认是全新会话列表，`agent.restore_sessions: true` 时才恢复最近 50 个会话到内存（含完整对话历史，续跑不再失忆）
-- **LLM 调用全链路日志**：`sessionLogger` 把每次 LLM I/O 写 `session_logs` 表，`QueryKindLogs` 按会话回看完整调用链；`LiveEventTokenUsage` 实时推送 token 用量；DeepSeek V4 缓存模式与 `reasoning_content` 字段适配
-- **结构化日志**：所有 Agent 关键事件写 `session_logs` 表并按 session/agent/level 可查；各组件注入 `*logger.Logger`，错误类日志真实输出 `[ERRO]`；文件日志按天分割（`logs/backend/`、`logs/tui/`）
-- **严格启动（基础设施）+ 容器校验**：config/roles/env/soul/skills 任一配置文件缺失，或 PG/Redis 不可达，启动即失败并明确报错；**模型连接不再是启动闸门**——启动只在日志里打印每个角色的生效模型与 Key 有无（零网络请求），某个模型不可用在应用内模型页换一个即可；启动改为校验容器（docker 可达性 / 启用插件镜像 / bma 项目容器状态，`/api/capabilities` 的 `docker` 项）
-- **双入口 + 可观测**：HTTP Web UI（Vue 3 SPA）+ bubbletea TUI；SSE 实时推送事件；`/api/metrics` 输出 Prometheus 格式指标
-- **可选 DAG 调度**：`dag_enabled` 开启后按标准 5 段 cron（如 `0 9 * * *`）或简易间隔（`Ns/Nm/Nh`）定时触发任务流程，Web 端「定时任务」页可视化管理
+- **单一 ReAct 主循环**：角色 Agent 执行 LLM → 工具 → 结果回填，直到纯文本回答、暂停或达到配置上限；`tool_call_max_rounds` 当前为 `-1`，不再默认限制 50 轮
+- **层级即调用栈**：`call_sub_agent(role_id, task)` 异步运行子 Agent，完成后经 Mailbox 回传父 Agent；支持递归派发、权威 Agent 树、取消、计划确认、验收、热驻复用与可选 worktree 隔离
+- **层级历史压缩**：由角色 token 阈值驱动，`summarize_every` 已退役；旧历史形成可合并的结构化压缩包，保留近期消息，压缩状态落 `agent_compress_states`，完整主对话落 `agent_messages`
+- **长期记忆与多轴决策**：`long_term_memory_items/events` 提供候选、激活、隔离、替换、撤回、恢复和审计；自动写入默认 `shadow`，明确撤回默认 `enforce`；`session_decisions` 按执行模式、素材、视角、审批、验收等轴保留用户指令
+- **共享记忆与规格**：`WriteSharedMemory`／Spec 在父子 Agent 间传递文件路径、契约与验收标准，派发参数有软／硬长度限制，当前配置以 `task_max_runes` 和 `task_max_runes_hard` 为准
+- **分层验收**：当前主链以叶子自检、领域验收、Meta 整品验收和 spec verify levels 为主；`verifyloop` 包保留验证闭环接口，不应写成默认启用所有任务的独立状态机
+- **角色工具白名单**：工具经 Registry、角色白名单、插件可见性、沙箱与审批守卫共同约束；当前 `role_tool_gate_enabled: true`
+- **经验技能治理**：SessionEvolver 可生成偏好、项目经验与技能候选，但实际写入受 `memory.write_mode` 控制；技能库具有选择、使用统计、整理与淘汰机制
+- **工作区文件树与全屏预览**：会话侧栏工作区目录树、在线编辑、消息文件卡片和全屏 FileViewer，支持图片、PDF、视频、Markdown、代码、CSV、xlsx、ipynb 等格式
+- **热插拔插件系统**（[设计文档](doc/设计文档_插件范式.md)）：MCP stdio／HTTP／Docker、目录式插件包与长驻服务统一接入工具或生命周期管理；管理 API 为 `/api/plugins`，配置为 `config/plugins.yaml` 与 `config/plugins.d/`
+- **可扩展工具系统**：不止早期的 14 个工具；当前覆盖文件、命令、HTTP、Git、共享记忆／Spec、提问、定时、外部 Agent、插件、Widget、Workflow、工具锻造等，实际集合由装配与角色权限决定
+- **三类后续编排**：Goal／Loop 负责会话续跑与提醒，Flow 执行 start／llm／tool／branch／approval／answer 节点图，Workflow 执行带人审和预算的“件 × 阶段”量产
+- **会话持久化与恢复**：会话、消息、事件、树、看板、决策和各类 run 按各自机制落库；当前 `agent.restore_sessions: true`，启动预热最近会话，其他数据按查询或懒加载恢复
+- **LLM 调用全链路日志**：`sessionLogger` 写 `session_logs`，`QueryKindLogs` 回看调用链，`LiveEventTokenUsage` 推送 token 用量
+- **结构化日志与可观测性**：会话日志、文件按日分割、SSE 实时事件与 `/api/metrics` Prometheus 指标
+- **基础设施严格启动，模型不阻断**：配置与 PG／Redis 等基础设施按启动校验处理；`agent.verify_llm_on_startup: false` 默认关闭，开启探测也只告警不阻断，模型可在应用内切换
+- **Web／TUI／桌面入口**：Vue 3 SPA、Bubble Tea TUI 与 Windows WebView2 桌面壳；桌面支持托盘后台、版本化更新、健康门禁与回滚
+- **DAG 定时调度**：`dag_enabled` 开启后支持标准 5 段 cron、简易间隔和依赖任务，Web 端 `/dag` 管理
 
 ---
 
@@ -99,7 +100,7 @@ cp .env.example .env
 make up        # 等价：docker compose -f docker/docker-compose.yml up -d
 ```
 
-起两个容器：`blockmemory-postgres`（:5432，含 pgvector）与 `blockmemory-redis`（:6380）。已有自备实例则跳过本步，改 `.env` 里的 DSN/地址指向它们。
+核心数据面是 PostgreSQL（:5432，含 pgvector）与 Redis（:6380）；当前 Compose 还包含 `open_design` 和 `minimax-media` 媒体服务。已有自备 PG／Redis 时可调整或跳过相应服务，并修改 `.env` 的 DSN／地址；媒体服务是否启用按实际需求与配置处理。
 
 ### 第 3 步：建表
 
@@ -164,7 +165,7 @@ install.ps1 幂等可重复跑（即升级流程）；服务已在跑时会自�
 - Redis 7+
 - 至少一个大模型 API Key（OpenAI 兼容 / Anthropic / 本地 Ollama）
 
-> 所有依赖必须可用：配置文件须存在，PostgreSQL、Redis、LLM 后端须可达。任一缺失或不可达，启动失败并明确报告。
+> 配置文件与 PostgreSQL、Redis 等启动必需基础设施必须可用。LLM 后端不是启动闸门：默认不做连通性探测，即使开启 `agent.verify_llm_on_startup` 也只告警、不阻断；运行对话前仍需为所用角色配置可用模型。
 
 ### 安装与配置
 
@@ -228,69 +229,74 @@ make up              # 起 PostgreSQL + Redis + open_design 设计台（compose 
 
 ```
 .
-├── backend/                    # Go 主模块 (github.com/blockmemory/agent/backend)
-│   ├── main.go                 # HTTP 入口（flag/日志/监听，装配委托 bootstrap.Build）
-│   ├── cmd/                    # tui / memory-console / skill-cleanup（存量技能一次性清洗）
+├── backend/                    # Go 主模块（50 个包完整索引见项目模块全景）
+│   ├── main.go                 # HTTP 入口，装配委托 bootstrap.Build
+│   ├── cmd/                    # desktop / tui / memory-console / skill-cleanup
 │   ├── internal/
-│   │   ├── agent/              # ReAct 主循环 + Agent facade + 会话生命周期
-│   │   ├── domain/             # tool（注册表+内置工具）/ role / memory（事件流）/ subagent / verifyloop / orchestrator
-│   │   ├── bootstrap/          # 统一依赖装配（生产/TUI/测试共用）+ fact_extractor（块记忆事实提取 LLM）
-│   │   ├── model/              # Blades 模型工厂 + LLM 追踪/超时
-│   │   ├── store/              # PostgreSQL（领域子存储）+ Redis
-│   │   ├── logger/ logging/    # 结构化日志 + 文件按天分割
-│   │   ├── runtime/            # 运行时聚合（board/mailbox/skill/soul/watchdog/cmdqueue）
-│   │   ├── dag/ cmdqueue/      # DAG 调度（cron/间隔定时）/ 用户指令队列
-│   │   ├── server/             # HTTP API + SSE + 会话管理
-│   │   ├── tui/ testserver/    # bubbletea TUI / 测试用薄封装（委托 bootstrap）
-│   │   └── config/ embed/ retriever/ plugins/ computeruse/ ...
-│   └── pkg/                    # types / enums / config / 工具包
-├── config/                     # config.yaml / roles.yaml / skills.yaml / soul.md
-├── migrations/                 # SQL schema (001-012)
-├── web/                        # Vue 3 + Vite SPA
-├── test/                       # 集成测试（独立模块）：api / coding / tui / fixtures
-├── doc/                        # 设计文档
-└── docker/docker-compose.yml   # PG + Redis 一键起
+│   │   ├── agent/              # ReAct、会话、长期记忆、决策、附件与上下文
+│   │   ├── domain/             # subagent / tool / memory / role / orchestrator / decision / verifyloop
+│   │   ├── workflow/           # 配方、名册、件 × 阶段量产与人审
+│   │   ├── flow/ goal/ dag/    # 节点流程 / 会话指令 / 定时与依赖调度
+│   │   ├── bootstrap/          # 生产、TUI、桌面后端与测试共用的统一装配
+│   │   ├── model/ store/       # 模型适配 / PostgreSQL、Redis 与 Schema
+│   │   ├── server/             # Gin HTTP API + SSE + 管理端点
+│   │   ├── tui/                # Bubble Tea TUI
+│   │   ├── widgets/            # 界面部件管理
+│   │   ├── plugins/            # 插件包、MCP 桥与生命周期
+│   │   └── ...                 # board / mailbox / project / skill / logger 等
+│   └── pkg/                    # types / enums / config / prompts / 工具包
+├── config/                     # config / roles / models / plugins / skills / soul 等
+├── migrations/                 # SQL schema（当前 001-019）
+├── web/                        # Vue 3 + TypeScript + Vite SPA（18 个子路由）
+├── test/                       # 独立集成测试模块
+├── doc/                        # 当前全景、文档地图、技术逻辑、历史设计与评测
+├── docker/                     # Compose、open_design、minimax-media 与插件镜像
+└── bma-app.ps1                 # Windows 打包、安装、更新、启停与回滚
 ```
 
 ---
 
 ## 核心模块
 
-### 1. ReAct 主循环（`internal/agent/react_agent.go`）
+### 1. ReAct 与会话（`internal/agent`）
 
-`ReActAgent.RunWithHistory()`：prepend system prompt → `model.Generate`（带工具 schema）→ 有 `ToolPart` 则经 `ToolRegistry.Dispatch` 执行并回灌结果 → 直到纯文本回答或达到上限（默认 50 轮）。每轮 LLM 前 Drain Mailbox，把子 Agent 摘要注入历史并写入记忆事件。 每 `summarize_every` 步（默认 5）`compressHistory` 压缩中段历史防 token 爆炸；assistant 消息入史时 `truncateToolCallInputsForHistory` 截断超长工具入参（单值 2000 runes，派发执行仍用原始入参），防 WriteFile 全文逐轮重发耗尽 token 预算；`windowMessages`/`compressHistory` 下刀只避开孤立 tool 结果、不锚 user 边界，防工作型历史上下文塌缩。`sessionLogger` 写 LLM I/O 到 `session_logs`，`QueryKindLogs` 按会话回看。
+`react_agent.go` 执行模型、工具与结果回填；`service_react.go`、`session_react.go` 管理会话创建、发送、控制和恢复。历史由角色 token 阈值、滑动窗口和结构化压缩共同治理，`summarize_every` 已退役。决策账本、项目上下文、画像、技能和 Mailbox 在各自约束下进入请求视图。当前轮数上限、预算与超时以 `config/config.yaml` 为准。
 
-### 2. 异步子 Agent 分发（`internal/domain/subagent/dispatcher.go`）
+### 2. 子 Agent 与权威树（`internal/domain/subagent`、`orchestrator`）
 
-`call_sub_agent` 工具起 goroutine 跑子 ReActAgent，立即返回 `sub_agent_id`；子 Agent 完成后摘要推 Mailbox。角色权限由 `roles.yaml` 的 `can_be_called` / `parents` 控制；`domain` 字段定制 DomainAgent 展示名；`task` 入参 2000 runes 上限强制规格走 `WriteSharedMemory`。`WithSharedMemory` 注入共享 KV 只读视图，`buildSharedPrefix` 自动读取主 Agent 写入的关键上下文并做 Layer 3 mtime 校验（文件改动后 KV 失效）。父会话终结保护：有未决子 Agent 时阻塞等待，防迟到 mailbox 消息丢失。`WithFactExtractor` 注入事实提取器，`saveBlockMemory` 先调轻量模型提取关键事实再落库；`WithTree` 注入权威 Agent 树，派发时 Register/SetCancel/Finish。派 domain 角色时 `findPendingDomainSibling` 查树快照去重（同父同 domain Running/Paused 即拒，不烧派发配额）；递归派发的子 Agent 注入 `WithPendingChildrenChecker`，终答前须等自己的子 Agent 回传。
+`dispatcher.go` 负责异步派发、权限与 Spec、并发、计划确认、验收、暂停恢复、热驻复用、失败处理和 worktree。子 Agent 结果经 Mailbox 回传；`orchestrator.Tree` 维护持久化层级元数据，HTTP 提供树查询和取消。共享 KV 传递上下文，旧块记忆自动写入当前默认停用。
 
-### 3. 权威 Agent 树（`internal/domain/orchestrator/tree.go`）
+### 3. 工具域（`internal/domain/tool`）
 
-ReAct 重构后子 Agent 由 Dispatcher 直接 goroutine 创建，不注册为 `AgentInstance`，原"层级即调用栈"丢失 introspect/cancel 能力。补 `Tree` struct 作元数据层：Dispatcher 派发前 `Register` 节点（ID/ParentID/Role/Domain/Task/Started/Status=Running）+ `SetCancel` 绑定 cancel func，完成时 `Finish` 写终态（Done/Failed/Cancelled + Summary/Err）。HTTP 暴露 `GET /api/sessions/{id}/tree` 返回快照，`POST /api/sessions/{id}/agents/{aid}/cancel` 调 cancel func 取消子 Agent。`context.CancelFunc` 幂等，与 goroutine `defer cancel()` 重复调用安全。树经 PG 持久化（`agent_tree_nodes` 表），`TreeFor` lazy init 时 `LoadNodes` 恢复节点元数据，TUI 面板直读 `Tree()` 快照（旧事件流派生 `deriveSubAgentNodes` 已删）。`call_sub_agent` 派 domain 角色时基于树快照做同领域重复派发去重（`findPendingDomainSibling`）。`verifyloop.ExecuteChild` 同步路径暂不入树（phase 2）。`agent.Agent` 接口扩展 `Tree`/`CancelAgent` 两方法。
+`Registry` 负责 Schema、Dispatch、角色可见性和授权；内置工具覆盖文件、命令、HTTP、Git、共享记忆、协作、定时、插件、外部 Agent、Widget 与 Workflow 等。`sandbox.go`、`guards.go`、`destructive.go` 提供路径边界、命令黑名单和破坏性操作控制。当前角色工具硬门开启，不能再按“14 个工具”理解系统。
 
-### 3. 工具域（`internal/domain/tool/`）
+### 4. 记忆与决策（`domain/memory`、`agent/memory_*`、`store`）
 
-`Registry.Schema()` 为每个工具生成 JSON schema，`Registry.Dispatch` 按名执行；`executor.go` + `sandbox.go` + `guards.go` 提供路径逃逸检测与命令黑名单。`NewToolRegistryAdapterWithFilter` 按角色限制可调工具集（MetaAgent 仅 `call_sub_agent` + `WriteSharedMemory` + `HTTPGet`，DomainAgent 开放完整权限）。`WriteSharedMemory` 工具写 `sharedKV`，仅 MetaAgent 白名单可用。`ReactService.SetModelProvider` 支持注入 mock provider 跑测试。
+事件流与 Pipeline 负责执行历史和压缩；共享 KV／Spec 服务会话内协作；`long_term_memory_items/events` 负责跨会话条目生命周期与审计，`session_decisions` 按多轴保留当前会话指令。长期记忆自动写入默认 `shadow`，撤回默认 `enforce`，详见 [17 长期记忆与决策轴](doc/技术逻辑/17-长期记忆与决策轴.md)。
 
-### 4. 记忆（`internal/domain/memory/`）
+### 5. Goal、Flow 与 Workflow
 
-两段事件流 + 层级压缩：`Write` 追加 `MemoryEvent`（同步落 `agent_events` 表），`Assemble` 注入最近 N 条（超阈值走轻量模型摘要）；历史压缩在 `Pipeline`/`pyramid.go`——每次触发把新滑出保留段的中段压成一个结构化压缩包，包数超 `summarize_max_bundles` 合并最老一半，状态落 `agent_compress_states` 表。生产装配用 `PostgresEventStore`（事件 + 压缩状态持久化），`InMemoryStore` 供测试；重启后两者均懒加载恢复。`InMemoryKV` 提供共享 KV 记忆（主 Agent 写、子 Agent 读）。`WithMaxEventsPerAgent` 防事件流无限增长。遗留 `internal/memory/write.go` 仅负责 Episode 持久化，不在 ReAct 热路径上。
+Goal／Loop 在会话完成后评估或排程续跑；Flow 串行执行六类节点并支持审批；Workflow 按配方对名册执行件间并发、件内阶段串行的量产，支持 attempt、人审、预算、冻结和反馈。三者不是同一状态机，详见 [18](doc/技术逻辑/18-Goal指令与Flow流程.md) 与 [19](doc/技术逻辑/19-工作流量产流水线.md)。
 
-### 5. 验证闭环编排器（`internal/domain/verifyloop/`，默认关闭）
+### 6. 模型与存储（`internal/model`、`internal/store`）
 
-原生状态机驱动"产出 -> 自测 -> 修正 -> 上级统一测试"，不依赖主 Agent 提示词。三接口解耦：`Verifier`（SelfTest/UnifiedTest 返回结构化 `Verdict`）+ `Fixer`（修正产出）+ `Reporter`（上报结果）。`PlanConfirmVerifier` 可选接口实现"测试方向不明确 -> 列方案 -> 产出方确认 -> 符合才自测"前置。`maxRounds` 防死循环。bootstrap 按 `verification_role_pairs` 注册 `OnSubAgentDone` 钩子，`assistant_self_test_enabled` / `domain_self_test_enabled` 控制开关。`ComputerUseVerifier`/`CLIVerifier`/`MCPVerifier` 留扩展口子。
+模型层基于 Blades，适配 OpenAI 兼容、Anthropic、Ollama 等 provider，处理角色绑定、超时、重试、思考和 token。存储层按领域拆分会话、消息、事件、树、决策、长期记忆、看板、Flow、Workflow 等子存储；PostgreSQL 是持久权威，Redis 承担热数据，pgvector 支持向量检索。
 
-### 5. 日志（`internal/logger/` + `internal/logging/`）
+### 7. 插件与扩展（`internal/plugins`、`mcpbridge`）
 
-zerolog 实现，console/json 两种格式；error 级别可附调用栈（`logging.stack_enabled`）。`BatchingLogStore` 批量写 `session_logs` 表。各组件通过 `SetLogger` 注入；`store` 包因循环导入约束使用窄接口 `store.Logger`。入口把标准库 `log` 输出兜底转发到统一格式。`sessionLogger` 把每次 LLM 调用 I/O 写 `session_logs`，`LiveEventTokenUsage` 实时推送 token 用量。
+支持 MCP stdio／HTTP／Docker、目录式插件包和长驻服务，统一接入工具注册表与生命周期。`computer_use` 当前为按需 Docker transport 插件；`open_design` 和 `minimax-media` 随 Compose 提供媒体相关服务。
 
-### 6. 运行时聚合（`internal/runtime/runtime.go`）
+### 8. 运行时与 DAG（`internal/runtime`、`board`、`mailbox`、`dag`）
 
-单一 `Runtime` 持有 Boards / Mailbox / Skills / Soul / Watchdog / CmdQueue。当前接线现状：**Mailbox 是活的**（子 Agent 摘要回灌主循环）；Board → TUI 面板与 board API；Skill 池 → `/api/skills` 查询（prompt 装配未接入 ReAct）；Soul → 加载并经 API 暴露（未注入 prompt）；Watchdog → 阈值经 Query API 暴露（未在主循环执行，历史压缩在 ReAct 层部分缓解）；CmdQueue → enqueue/interrupt 端点。见 `doc/TODO.md`。
+Runtime 聚合 Board、Mailbox、Skill、Soul 等组件。Board 当前通过 `session_boards` 保存整板 JSONB 快照，Mailbox 负责进程内异步回传。DAG 支持 cron、简易间隔与依赖调度；它和 Goal 提醒、Flow 运行、Workflow 量产分别使用自己的状态与入口。
 
-### 8. DAG 调度（`internal/dag/`）
+### 9. 日志与可观测性（`internal/logger`、`server`）
 
-`agent.dag_enabled` 默认开启。调度器轮询 `dag_jobs` 表，支持标准 5 段 cron（robfig/cron，`0 9 * * *` 表每天 9 点）与简易间隔（`Ns`/`Nm`/`Nh`），按 `depends_on` 依赖把 task 派发为新会话；tick 轮询 task 会话终态推进下游并回写运行态，全部终态后清理运行实例。HTTP 端点：`GET/POST /api/dag`、`GET/DELETE /api/dag/{id}`、`POST /api/dag/{id}/trigger`、`GET /api/dag/running`。Web 端「定时任务」页（`/dag`）可视化创建/触发/查看运行快照；MetaAgent 也可用内置 `schedule_task` 工具直接创建/更新单节点定时任务（「每天X点做Y」类需求的正典入口）。已知限制：无失败自动重试、无断点续跑（重启后重新整体触发）、保存 DAG 会重置触发计时基准。
+结构化日志、会话 LLM I/O、SSE 事件、token 指标、Prometheus 指标和健康／能力端点共同提供诊断面。桌面更新还读取 `/api/health` 的 build 版本，防止旧进程占端口造成假更新成功。
+
+### 10. Windows 桌面与发布（`cmd/desktop`、`bma-app.ps1`）
+
+桌面壳使用 WebView2，关窗默认隐藏托盘；发布脚本提供版本化安装、更新、启停和回滚，用户数据与不可变版本目录分离。详见 [20 桌面端与发布运维](doc/技术逻辑/20-桌面端与发布运维.md)。
 
 ---
 
@@ -305,23 +311,22 @@ zerolog 实现，console/json 两种格式；error 级别可附调用栈（`logg
 
 ## 技术栈
 
-- **语言**：Go 1.25（需 `GOTOOLCHAIN=local`）
-- **Agent leaf 框架**：go-kratos Blades v0.5.0（`ModelProvider` + 原生 function-calling）
-- **上层编排**：自研 ReAct 主循环 + `call_sub_agent` 异步分发（不依赖图状态机）
-- **模型适配**：`openai` / `anthropic` / `ollama` 三种 provider 原生协议，按角色配置
-- **存储**：PostgreSQL 14+ + pgvector（会话历史/事件/日志/知识库）+ Redis 7+（工作区/快照/Stream）
-- **Web**：Vue 3 + Vite + Tailwind + Element Plus
-- **TUI**：bubbletea + lipgloss
-- **HTTP**：标准库 `net/http`，默认 `:10010`
-- **配置**：YAML + `.env`（`${VAR:default}` 插值）
+- **语言与 Agent 框架**：Go 1.25，go-kratos/blades；自研 ReAct 与 `call_sub_agent` 异步编排
+- **模型适配**：OpenAI Chat／Responses、Anthropic、Ollama，按角色配置并支持会话级覆盖
+- **存储**：PostgreSQL 14+、pgvector、Redis 7+
+- **HTTP**：Gin，默认 `127.0.0.1:10010`，SSE 实时事件
+- **Web**：Vue 3、Vite、TypeScript、Tailwind、Element Plus
+- **终端与桌面**：Bubble Tea／Lipgloss；Windows WebView2 与托盘
+- **配置**：YAML、JSON、`.env` 环境变量插值
+- **部署**：Docker Compose、PowerShell 版本化安装／更新／回滚
 
 ---
 
-## 扩展方向
+## 扩展方向与历史
 
-近期开放项见 `doc/TODO.md`（记忆 hot/cold 2 阶段分层、话题隔离轻量版、动态角色注册中心、verifyloop 折叠进 ReAct、硬 Token 预算、`Soul.Inject` 死代码清理、记忆事件 Postgres 持久化、`设计文档_v3.md` 漂移清理）。远期"Agent 工作流平台"愿景（工作流编排 / 测试自动化 / 研究 / 团队协作）见 `doc/扩展设计_Agent工作流平台.md`。
+开放项以 [TODO](doc/TODO.md) 的当前有效条目为准，远期愿景见 [Agent 工作流平台扩展设计](doc/扩展设计_Agent工作流平台.md)。TODO 同时保留历史完成记录，不能仅凭“已完成”标题推断当前默认开关或主链行为。
 
-阶段 0-9 已完成 + 2026-07-30 两步：测试基线修复 -> 块记忆闭环 -> 协作验证闭环 -> verifyloop 原生编排器 -> 评估产出 -> KVMemory 共享记忆 -> assembly 任务拆解抽象（已删）-> ReAct 历史压缩 + LLM 调用日志 + 代理展示名 + 共享内存工具 + 角色工具白名单 + DeepSeek V4 适配 -> **投机性泛化清理**（assembly/computeruse/verifiers 占位/KV 三套抽象/强制门/死配置，~1400 行净减）-> **Agent 树显式化**（`orchestrator.Tree` + `/tree` + `/cancel` 端点）-> **块记忆事实提取**（`FactExtractor` 接口 + 轻量模型提取关键事实）。详见 `doc/TODO.md` "已完成"段。
+项目经历 ReAct 重构、子 Agent 生命周期、共享记忆、验证机制、插件、历史压缩、长期记忆治理、Goal／Flow／Workflow 和桌面发布等多轮迭代。逐次背景与当时验证见 [变更记录](doc/变更.md)，当前模块状态以 [项目模块全景](doc/项目模块全景.md) 为准。
 
 ---
 
@@ -345,11 +350,17 @@ make help           # 显示所有目标
 
 | 文档 | 内容 |
 |------|------|
-| `doc/项目说明.md` | **权威实现说明**：目录结构、核心架构、代码阅读顺序、关键设计决策 |
-| `doc/设计文档_v3.md` | 设计愿景稿（顶部有状态声明，与代码偏离处以项目说明.md 为准） |
-| `doc/扩展设计_Agent工作流平台.md` | 未来愿景：从编程助手扩展为 Agent 工作流平台 |
-| `doc/TODO.md` | 待完成 / 开放项清单 |
-| `CLAUDE.md` | Claude Code 协作指引 |
+| [项目模块全景](doc/项目模块全景.md) | **当前实现总入口**：50 个 Go 包、18 个 Web 路由、数据、配置、部署与测试地图 |
+| [文档地图](doc/文档地图.md) | 现行说明、历史快照、设计、计划、变更与评测的可信边界 |
+| [技术逻辑 00](doc/技术逻辑/00-总览与阅读指引.md) | 00–22 章阅读导航与代码入口 |
+| [17 长期记忆](doc/技术逻辑/17-长期记忆与决策轴.md) · [18 Goal／Flow](doc/技术逻辑/18-Goal指令与Flow流程.md) · [19 Workflow](doc/技术逻辑/19-工作流量产流水线.md) · [20 桌面发布](doc/技术逻辑/20-桌面端与发布运维.md) | 四篇当前实现专题 |
+| [21 多 Agent 设计详解](doc/技术逻辑/21-多Agent设计详解.md) | 当前多 Agent 主链：角色、ReAct、派发、权限、记忆、审批、验收与恢复 |
+| [22 AgentTeam 问题与修复清单](doc/技术逻辑/22-AgentTeam问题与修复清单.md) | 真实使用 P0（效率与上下文）、身份权限、安全可靠性、Team 能力缺口及分阶段修复路线 |
+| [项目说明](doc/项目说明.md) | 2026-09-08 历史实现快照，不再作为权威现状说明 |
+| [设计文档 v3](doc/设计文档_v3.md) | 设计愿景；与代码偏离处以当前实现为准 |
+| [Agent 工作流平台扩展设计](doc/扩展设计_Agent工作流平台.md) | 未来愿景与扩展方向 |
+| [TODO](doc/TODO.md) · [变更](doc/变更.md) | 开放项／历史完成记录 · 逐次变更与当时验证 |
+| [CLAUDE](CLAUDE.md) | Claude Code 协作指引 |
 
 ---
 

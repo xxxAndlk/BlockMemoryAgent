@@ -30,11 +30,11 @@ import (
 
 // delegation grant 参数（TODO #22④）。
 const (
-	expandGrantTokens   = 8000                 // 展开器 token 预算 cap（delegation grant）
-	expandMaxIter       = 6                    // 展开器最大 LLM 轮数（防探查失控）
-	expandTTL           = 3 * time.Minute      // 展开器 TTL：超时即截答返回已有部分
-	expandAnswerMaxRune = 2000                 // 答案硬顶 ~2K tok（CJK 1 tok ≈ 1 rune）
-	expandToolRuneCap   = 16000                // 单工具结果进展开器历史的截断
+	expandGrantTokens   = 8000                               // 展开器 token 预算 cap（delegation grant）
+	expandMaxIter       = 6                                  // 展开器最大 LLM 轮数（防探查失控）
+	expandTTL           = 3 * time.Minute                    // 展开器 TTL：超时即截答返回已有部分
+	expandAnswerMaxRune = 2000                               // 答案硬顶 ~2K tok（CJK 1 tok ≈ 1 rune）
+	expandToolRuneCap   = 16000                              // 单工具结果进展开器历史的截断
 	expandReadTools     = "ReadFile, SearchInFiles, ListDir" // 结构性禁递归的低层工具面
 )
 
@@ -139,7 +139,7 @@ func buildExpandTask(query, chain string) string {
 // runExpander 构造并驱动只读展开器子 Agent（一次性、不入树、不 notify）。
 // 工具面硬编码低层展开工具（结构性禁递归）；LoopConfig=delegation grant 预算。
 func (d *Dispatcher) runExpander(ctx context.Context, parentID, task string) (string, error) {
-	roleID := roleIDFromAgentID(parentID)
+	roleID := d.roleIDForAgent(parentID)
 	provider, err := d.providerForAgent(ctx, roleID, parentID)
 	if err != nil {
 		return "", fmt.Errorf("get model: %w", err)
@@ -148,10 +148,10 @@ func (d *Dispatcher) runExpander(ctx context.Context, parentID, task string) (st
 
 	// 展开器角色：合成定义（不入 role.Registry——不是编排角色，是工具内部探针）。
 	roleDef := types.RoleDefinition{
-		ID:      "expander",
-		Name:    "只读展开器",
-		Type:    enums.RoleTypeFixed,
-		Tools:   []string{"ReadFile", "SearchInFiles", "ListDir"},
+		ID:    "expander",
+		Name:  "只读展开器",
+		Type:  enums.RoleTypeFixed,
+		Tools: []string{"ReadFile", "SearchInFiles", "ListDir"},
 		SystemPrompt: "你是只读展开器：按任务给出的摘要链与查询，用 ReadFile/SearchInFiles/ListDir " +
 			"取回被压缩掉的细节原文。禁止写入、禁止派发。答案 ≤2000 字，给原文/摘录 + 出处。",
 	}

@@ -46,34 +46,50 @@ func TestRegistry_Get_MetaAndFixed(t *testing.T) {
 	}
 }
 
-// TestRegistry_CanCall 验证角色间的调用权限判断逻辑。
+// TestRegistry_CanCall 验证角色间的调用权限判断逻辑（A-02 语义：Parents 是
+// 目标角色的允许直接父角色集合，不是调用方的可调用清单）。
 func TestRegistry_CanCall(t *testing.T) {
-	// 构造测试配置：包含可调用角色、带父角色的可调用角色以及不可调用角色。
+	// 构造测试配置：code 不限父级、ui 仅允许 code_assistant 作父级（非编排者，永远不可达）、
+	// meta_only 仅允许 meta 作父级、private 不可被调用。
 	cfg := &config.RoleConfigFile{
 		FixedRoles: []types.RoleDefinition{
 			{ID: "code_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true},
 			{ID: "ui_assistant", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"code_assistant"}},
+			{ID: "meta_only", Type: enums.RoleTypeFixed, CanBeCalled: true, Parents: []string{"meta"}},
 			{ID: "private", Type: enums.RoleTypeFixed, CanBeCalled: false},
 		},
 	}
 	// 创建角色注册表。
 	r := NewRegistry(cfg)
 
-	// 校验 meta 可以调用声明为 callable 的固定角色 code_assistant。
+	// 空 Parents = 不限父级：meta/domain 均可调用。
 	if !r.CanCall("meta", "code_assistant") {
-		t.Error("meta should be able to call callable fixed role")
+		t.Error("meta should be able to call callable fixed role with empty parents")
 	}
-	// 校验 meta 不能调用未声明 callable 的固定角色 private。
+	if !r.CanCall("domain", "code_assistant") {
+		t.Error("domain should be able to call callable fixed role with empty parents")
+	}
+	// 目标 Parents 显式限制父级：只允许 meta 时 domain 被拒。
+	if !r.CanCall("meta", "meta_only") {
+		t.Error("meta should be able to call role whitelisted for meta")
+	}
+	if r.CanCall("domain", "meta_only") {
+		t.Error("domain should not call role whose parents whitelist excludes it")
+	}
+	// CanBeCalled=false 即使父级匹配也拒绝。
 	if r.CanCall("meta", "private") {
 		t.Error("meta should not be able to call non-callable fixed role")
 	}
-	// 校验 ui_assistant 通过 Parents 字段获得调用 code_assistant 的权限。
-	if !r.CanCall("ui_assistant", "code_assistant") {
-		t.Error("ui_assistant parent permission should allow calling code_assistant")
+	// 固定角色不承担派发职责，Parent 关系不被反向解释为调用许可。
+	if r.CanCall("ui_assistant", "code_assistant") {
+		t.Error("fixed role should not dispatch via its own parents list")
 	}
-	// 校验 code_assistant 没有反向调用 ui_assistant 的权限。
 	if r.CanCall("code_assistant", "ui_assistant") {
-		t.Error("code_assistant should not be able to call ui_assistant without parent")
+		t.Error("fixed role should not dispatch other roles")
+	}
+	// 平级/环禁令保持：Meta→Meta、Domain→Domain、Domain→Meta 拒绝。
+	if r.CanCall("meta", "meta") || r.CanCall("domain", "domain") || r.CanCall("domain", "meta") {
+		t.Error("orchestrator peer/cyclic calls must be rejected")
 	}
 }
 

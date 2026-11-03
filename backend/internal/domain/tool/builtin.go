@@ -350,6 +350,49 @@ func checkExpectedMtime(absPath, expected string) error {
 	return nil
 }
 
+// sharedWritePathMatched 报告 absPath 是否命中配置的共享写路径（B-05）：
+// 条目可为绝对/相对路径、目录前缀或 glob；相对路径按工作目录解析。
+func (e *Executor) sharedWritePathMatched(absPath string) bool {
+	if e == nil || e.agentCfg == nil || len(e.agentCfg.SharedWritePaths) == 0 {
+		return false
+	}
+	target := filepath.Clean(absPath)
+	for _, raw := range e.agentCfg.SharedWritePaths {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		p := entry
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(e.workDir, p)
+		}
+		p = filepath.Clean(p)
+		if strings.ContainsAny(p, "*?[") {
+			if ok, err := filepath.Match(p, target); err == nil && ok {
+				return true
+			}
+			continue
+		}
+		if target == p || strings.HasPrefix(target, strings.TrimSuffix(p, string(os.PathSeparator))+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// requireExpectedMtimeForShared B-05：共享写路径上的既有文件必须携带 expected_mtime，
+// 防止多 Agent/跨会话在未读到最新版本时静默覆盖。新建文件尚无版本可锁，放行。
+func (e *Executor) requireExpectedMtimeForShared(absPath, expected string) error {
+	if expected != "" || !e.sharedWritePathMatched(absPath) {
+		return nil
+	}
+	if _, err := os.Stat(absPath); err != nil {
+		return nil
+	}
+	return fmt.Errorf("路径 %q 声明为共享写路径（agent.shared_write_paths），写入必须携带 expected_mtime"+
+		"（ReadFile 分页头 mtime=... 原值）；已拒绝无版本校验的覆盖", absPath)
+}
+
 // parseFlexibleTime 解析模型可能传回的 mtime 字符串：RFC3339/Nano（ReadFile 分页头格式）、
 // Go time.String() 默认布局、无时区的日期时间（按本地时区解释）。全部失败 ok=false。
 func parseFlexibleTime(s string) (time.Time, bool) {
@@ -426,6 +469,10 @@ func (e *Executor) writeFile(ctx context.Context, args map[string]any) *Result {
 		}
 	}
 
+	// 共享写路径（B-05）：既有文件必须带 expected_mtime，缺省拒绝。
+	if err := e.requireExpectedMtimeForShared(absPath, expectedMtime); err != nil {
+		return &Result{Tool: "WriteFile", Path: absPath, Error: err.Error()}
+	}
 	// 乐观锁（TODO #16 T16）：expected_mtime 传入时写入前比对，拦截并发覆盖。
 	if err := checkExpectedMtime(absPath, expectedMtime); err != nil {
 		return &Result{Tool: "WriteFile", Path: absPath, Error: err.Error()}
@@ -792,6 +839,10 @@ func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
 		return &Result{Tool: "EditFile", Path: absPath, Error: err.Error()}
 	}
 
+	// 共享写路径（B-05）：EditFile 必然操作既有文件，缺 expected_mtime 直接拒绝。
+	if err := e.requireExpectedMtimeForShared(absPath, expectedMtime); err != nil {
+		return &Result{Tool: "EditFile", Path: absPath, Error: err.Error()}
+	}
 	// 乐观锁（TODO #16 T16）：expected_mtime 传入时写入前比对，拦截并发覆盖
 	//（old_string 基于过期内容时，空白宽容匹配还可能误换到别的区域）。
 	if err := checkExpectedMtime(absPath, expectedMtime); err != nil {

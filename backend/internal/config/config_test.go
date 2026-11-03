@@ -1,4 +1,5 @@
 package config
+
 import (
 	"os"
 	"path/filepath"
@@ -152,5 +153,44 @@ func TestMemoryWriteModeDefault(t *testing.T) {
 	}
 	if c, err := Load(p2); err != nil || c.Memory.WriteMode != "shadow" {
 		t.Fatalf("非法值应回落 shadow，got %q err=%v", c.Memory.WriteMode, err)
+	}
+}
+
+// TestSecurityProfileValidation B-01：默认 development；shared/production 拒绝
+// full-auto 与全局关闭审批，除非显式 allow_full_auto_in_shared。
+func TestSecurityProfileValidation(t *testing.T) {
+	c := &Config{}
+	if err := c.applyDefaults(); err != nil {
+		t.Fatalf("默认配置应可启动: %v", err)
+	}
+	if c.Agent.SecurityProfile != "development" {
+		t.Fatalf("默认 security_profile 应为 development，got %q", c.Agent.SecurityProfile)
+	}
+
+	c = &Config{}
+	c.Agent.SecurityProfile = "shared"
+	c.Agent.TrustMode = "full-auto"
+	if err := c.applyDefaults(); err == nil {
+		t.Fatal("shared + full-auto 应被拒绝")
+	}
+
+	c = &Config{}
+	c.Agent.SecurityProfile = "production"
+	c.Agent.ToolApprovalDisabled = true
+	if err := c.applyDefaults(); err == nil {
+		t.Fatal("production + tool_approval_disabled 应被拒绝")
+	}
+
+	c = &Config{}
+	c.Agent.SecurityProfile = "shared"
+	c.Agent.AllowFullAutoInShared = true
+	if err := c.applyDefaults(); err != nil {
+		t.Fatalf("显式风险确认后应放行: %v", err)
+	}
+
+	c = &Config{}
+	c.Agent.SecurityProfile = "bogus"
+	if err := c.applyDefaults(); err == nil {
+		t.Fatal("非法 security_profile 应被拒绝")
 	}
 }

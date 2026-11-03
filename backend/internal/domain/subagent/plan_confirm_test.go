@@ -403,3 +403,19 @@ func TestReviewPlanValidations(t *testing.T) {
 		t.Fatalf("expected non-parent rejection, got err=%v res=%+v", err, res)
 	}
 }
+
+// TestSubmitPlanTimeoutFailClosed B-02：fail-closed 策略下审批超时阻断执行，
+// 不再按计划继续（禁止未批准产出）。
+func TestSubmitPlanTimeoutFailClosed(t *testing.T) {
+	d, toolsReg, _ := newPlanConfirmEnv(t)
+	d.WithPlanConfirmation(true, 60*time.Millisecond, 3)
+	d.WithPlanApprovalPolicy(true)
+	ctx := agent.WithAgentID(context.Background(), "session-1/domain-11")
+	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
+	if err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+	if res.Success || !strings.Contains(res.Error, "fail-closed") || !strings.Contains(res.Error, "禁止产出") {
+		t.Fatalf("fail-closed timeout should block execution, got success=%v err=%q", res.Success, res.Error)
+	}
+}

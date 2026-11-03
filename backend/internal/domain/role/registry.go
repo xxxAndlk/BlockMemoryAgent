@@ -224,10 +224,10 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 				// 让用户自己开浏览器。补进 domain 清单，与 meta 侧对齐。
 				"ShowArtifact",
 				"WriteSharedMemory", "ReadSharedMemory", "WriteSpec", "WriteFile", "EditFile", "RestoreFile", "RunCommand",
-					// 外部 Agent 调用（2026-10 CallExternalAgent）：domain 可把超出内置工具
-					// 能力的任务派给本机外部 Agent CLI（external_agents.yaml 注册表，硬门同步）。
-					"CallExternalAgent",
-					"RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "search_knowledge",
+				// 外部 Agent 调用（2026-10 CallExternalAgent）：domain 可把超出内置工具
+				// 能力的任务派给本机外部 Agent CLI（external_agents.yaml 注册表，硬门同步）。
+				"CallExternalAgent",
+				"RefreshProjectDoc", "send_message", "cancel_agent", "ask_user", "search_knowledge",
 				// 叶子治理（2026-09-10）：domain 管理自己直派的叶子——暂停/换档/续跑，
 				// 与 meta 管理 domain 同构（授权 caller == node.ParentID）。
 				"pause_agent", "resume_agent", "set_agent_model", "list_models",
@@ -262,8 +262,16 @@ func (r *Registry) Get(roleID string) *types.RoleDefinition {
 }
 
 // CanCall 判断 callerRoleID 是否有权调用 calleeRoleID。
-// 元代理和领域代理可以调用任意声明为 callable 的固定角色或动态角色；
-// 固定角色只能调用其 parents 允许列表中显式列出的角色。
+//
+// 语义（A-02 纠偏）：Parents 是**目标角色的允许直接父角色集合**，不是调用方的
+// 可调用清单。rules：
+//  1. 仅编排者（meta/domain）承担派发职责；固定/动态叶子不派发（叶子若需再派发，
+//     应另设 allowed_callees，不复用 Parents 表达反向关系）；
+//  2. 目标必须 CanBeCalled=true；
+//  3. 目标的 Parents 非空时，调用方必须在其允许父级中；空集合 = 任何编排者可调用
+//     （配置规范：空表示不限制父级）；
+//  4. Meta→Domain 允许（下级拆分）；Meta→Meta、Domain→Domain、Domain→Meta 拒绝，
+//     保留 hub-and-spoke 拓扑与环禁令。
 func (r *Registry) CanCall(callerRoleID, calleeRoleID string) bool {
 	// 若 Registry 或配置未初始化，无法判断权限，默认拒绝调用。
 	if r == nil || r.cfg == nil {
@@ -278,33 +286,35 @@ func (r *Registry) CanCall(callerRoleID, calleeRoleID string) bool {
 		return false
 	}
 
-	// 元代理与领域代理属于编排者：它们可以把任务分发给固定角色或动态角色，
-	// 但前提是目标角色自身声明了可被调用（CanBeCalled 为 true）。
-	// 例外：MetaAgent（Type=Meta）允许调用 DomainAgent（Type=Domain），
-	// DomainAgent 是 MetaAgent 的下一级拆分者，非平级互调；DomainAgent 调用 DomainAgent
-	// 仍属平级互调，被下面的 RoleTypeDomain 分支拒绝，避免递归。
-	if caller.Type == enums.RoleTypeMeta || caller.Type == enums.RoleTypeDomain {
-		// DomainAgent 作为 MetaAgent 的下级拆分者，允许被 MetaAgent 调用。
-		if caller.Type == enums.RoleTypeMeta && callee.Type == enums.RoleTypeDomain {
-			return callee.CanBeCalled
-		}
-		// 目标必须是固定角色或动态角色，才允许被编排者调用。
-		if callee.Type == enums.RoleTypeFixed || callee.Type == enums.RoleTypeDynamic {
-			// 返回目标角色是否显式声明可调用。
-			return callee.CanBeCalled
-		}
-		// 编排者不能直接调用其他编排者角色（Meta->Meta、Domain->Domain、Domain->Meta），避免循环调用。
+	// 非编排者不承担派发职责。
+	if caller.Type != enums.RoleTypeMeta && caller.Type != enums.RoleTypeDomain {
 		return false
 	}
-
-	// 固定角色：必须遵守其 parents 字段中的显式允许列表。
-	for _, parent := range caller.Parents {
-		// 若 calleeRoleID 出现在 caller 的父角色列表中，则允许调用。
-		if parent == calleeRoleID {
+	// 目标必须显式声明可被调用。
+	if !callee.CanBeCalled {
+		return false
+	}
+	// 目标类型与层级规则：Meta 可调 Domain（下级拆分）；编排者可调 fixed/dynamic；
+	// 其他组合（含 Meta→Meta、Domain→Domain、Domain→Meta）一律拒绝。
+	switch callee.Type {
+	case enums.RoleTypeDomain:
+		if caller.Type != enums.RoleTypeMeta {
+			return false
+		}
+	case enums.RoleTypeFixed, enums.RoleTypeDynamic:
+		// 允许编排者调用。
+	default:
+		return false
+	}
+	// 目标声明的允许父级白名单：空 = 不限制编排者；非空 = 调用方必须在其中。
+	if len(callee.Parents) == 0 {
+		return true
+	}
+	for _, parent := range callee.Parents {
+		if parent == callerRoleID {
 			return true
 		}
 	}
-	// 未在允许列表中找到匹配项，拒绝调用。
 	return false
 }
 

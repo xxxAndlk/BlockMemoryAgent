@@ -205,7 +205,17 @@ type LLMRuntimeConfig struct {
 
 // SafetyConfig 工具沙箱与安全策略配置。
 type SafetyConfig struct {
-	ToolSandboxDisabled bool `yaml:"tool_sandbox_disabled"` // true 时关闭写路径逃逸检测（保留命令黑名单）
+	// SecurityProfile 部署信任档（B-01）：development|shared|production，默认 development。
+	// shared/production 下禁止 full-auto 信任模式与全局关闭审批（需显式
+	// allow_full_auto_in_shared 接受风险），否则启动期直接拒绝。
+	SecurityProfile string `yaml:"security_profile"`
+	// AllowFullAutoInShared 共享环境显式风险确认：true 才允许 shared/production
+	// 与 full-auto / tool_approval_disabled 组合（默认 false）。
+	AllowFullAutoInShared bool `yaml:"allow_full_auto_in_shared"`
+	// SharedWritePaths 共享写路径（B-05）：命中的文件写入必须携带 expected_mtime，
+	// 缺省直接拒绝，防多 Agent/跨会话静默覆盖。支持绝对/相对路径、目录前缀与 glob。
+	SharedWritePaths    []string `yaml:"shared_write_paths"`
+	ToolSandboxDisabled bool     `yaml:"tool_sandbox_disabled"` // true 时关闭写路径逃逸检测（保留命令黑名单）
 	// ToolApprovalDisabled 全信任模式（默认 false）：true 时关闭全部破坏性操作审批，
 	// needsApproval 直接短路——WriteFile/EditFile 生产目录写入、RunCommand 危险命令
 	// 模式、插件 Destructive 工具（computer_use 全工具自标 destructive）一律不再推
@@ -243,6 +253,9 @@ type FeatureTogglesConfig struct {
 	MemoryIndexMaxLines int `yaml:"memory_index_max_lines"`
 	// MemoryIndexMaxRunes 记忆索引槽 runes 配额（对标 CC 25KB）。<=0 按默认 25000。
 	MemoryIndexMaxRunes int `yaml:"memory_index_max_runes"`
+	// TeamTokenBudget 会话累计 token 预算（B-04/B-10）：顶层 + 全部子 Agent 的
+	// in+out 合计达到上限后，Dispatcher 拒绝新增派发（已有结果仍可收口）。0=关闭。
+	TeamTokenBudget int64 `yaml:"team_token_budget"`
 	// MaxTotalDispatches 单 session 内所有角色派发总数上限（合计），超过拒绝派发。
 	// 计数在用户发送新消息时重置。默认 30；<=0 时回退默认，负数表示不限制。
 	MaxTotalDispatches int `yaml:"max_total_dispatches"`
@@ -258,6 +271,10 @@ type FeatureTogglesConfig struct {
 	// PlanMaxRevisions 每 Agent 计划被驳回重提上限。默认 0=不限制（循环直到批准，
 	// 对齐"未经批准不执行"）；>0 时达上限不放行、转 send_message(escalate) 升级仲裁。
 	PlanMaxRevisions int `yaml:"plan_max_revisions"`
+	// PlanApprovalPolicy 计划审批不可用/超时的处置策略（B-02）：
+	//   - fail-open（默认，本机开发）：按计划继续；
+	//   - fail-closed（共享/高风险）：阻断执行并回告"未经批准禁止产出"。
+	PlanApprovalPolicy string `yaml:"plan_approval_policy"`
 	// BatchDigestEnabled call_sub_agents 波聚合整合纪要开关：domain 项 ≥2 的同波派发
 	// 完成回传汇成一条【整合纪要】单条送达父邮箱（防 N 子完成 N 次打扰父）。
 	// 默认 true；显式 false 退回逐条回传（逃生舱）。
@@ -815,7 +832,9 @@ func (c *Config) applyAgentDefaults() error {
 	// 因此配置侧无法把任一项显式设为 0；如需禁用某参数，请改用对应的
 	// 布尔开关（如 DAGEnabled）而非将其置 0。
 	c.applyLLMRuntimeDefaults()
-	c.applySafetyDefaults()
+	if err := c.applySafetyDefaults(); err != nil {
+		return err
+	}
 	c.applyFeatureTogglesDefaults()
 	c.applyAgentStandaloneDefaults()
 	return nil
@@ -899,8 +918,27 @@ func (c *Config) applyLLMRuntimeDefaults() {
 	}
 }
 
-func (c *Config) applySafetyDefaults() {
-	// SafetyConfig 当前所有字段（黑名单/白名单/开关）零值即表示关闭/空列表，无需默认值兜底。
+func (c *Config) applySafetyDefaults() error {
+	// B-01 安全 profile：默认 development（单机开发信任边界）。
+	switch strings.ToLower(strings.TrimSpace(c.Agent.SecurityProfile)) {
+	case "":
+		c.Agent.SecurityProfile = "development"
+	case "development", "shared", "production":
+		c.Agent.SecurityProfile = strings.ToLower(strings.TrimSpace(c.Agent.SecurityProfile))
+	default:
+		return fmt.Errorf("invalid agent.security_profile %q (want development|shared|production)", c.Agent.SecurityProfile)
+	}
+	if c.Agent.SecurityProfile != "development" && !c.Agent.AllowFullAutoInShared {
+		// TrustMode 空 = 默认 full-auto（见 applyAgentStandaloneDefaults）；因此在默认值
+		// 落地前也要拦截。
+		fullAuto := c.Agent.TrustMode == "" || c.Agent.TrustMode == "full-auto"
+		if fullAuto || c.Agent.ToolApprovalDisabled {
+			return fmt.Errorf("security_profile=%s 禁止 full-auto/关闭审批 (trust_mode=%q tool_approval_disabled=%v)；"+
+				"请改用 trust_mode=auto-edit|suggest 并开启审批，或显式 allow_full_auto_in_shared=true 接受风险",
+				c.Agent.SecurityProfile, c.Agent.TrustMode, c.Agent.ToolApprovalDisabled)
+		}
+	}
+	return nil
 }
 
 func (c *Config) applyFeatureTogglesDefaults() {
@@ -930,6 +968,16 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	}
 	if c.Agent.PlanConfirmTimeoutSec <= 0 {
 		c.Agent.PlanConfirmTimeoutSec = 600
+	}
+	// 计划审批失败策略（B-02）：默认 fail-open（本机开发），shared/production 可切 fail-closed。
+	switch strings.ToLower(strings.TrimSpace(c.Agent.PlanApprovalPolicy)) {
+	case "":
+		c.Agent.PlanApprovalPolicy = "fail-open"
+	case "fail-open", "fail-closed":
+		c.Agent.PlanApprovalPolicy = strings.ToLower(strings.TrimSpace(c.Agent.PlanApprovalPolicy))
+	default:
+		log.Printf("[config] illegal plan_approval_policy %q, fallback fail-open", c.Agent.PlanApprovalPolicy)
+		c.Agent.PlanApprovalPolicy = "fail-open"
 	}
 	// 波聚合整合纪要默认开启（集群档提速：N 子完成汇 1 条，省父 Agent N-1 轮空转）。
 	if c.Agent.BatchDigestEnabled == nil {

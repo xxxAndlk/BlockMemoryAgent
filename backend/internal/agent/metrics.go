@@ -22,6 +22,9 @@ type metricsCollector struct {
 	totalDur time.Duration
 	// maxDur 记录截至目前遇到的最大单次调用耗时。
 	maxDur time.Duration
+	// totalIn / totalOut 累计输入/输出 token（B-10 团队成本聚合基础）。
+	totalIn  int64
+	totalOut int64
 }
 
 // metricsSnapshot 是 metricsCollector 在某一时刻的只读快照，
@@ -35,6 +38,9 @@ type metricsSnapshot struct {
 	AvgDurationMs int
 	// MaxDurationMs 表示最大单次调用耗时，单位为毫秒。
 	MaxDurationMs int
+	// TotalInputTokens / TotalOutputTokens 为累计 token（B-10）。
+	TotalInputTokens  int64
+	TotalOutputTokens int64
 }
 
 // newMetricsCollector 创建并返回一个空的 metricsCollector 实例。
@@ -59,6 +65,13 @@ func (m *metricsCollector) record(agent, model string, in, out, latency int) {
 
 	// 总调用次数加一：无论成功还是超时，都算一次调用。
 	m.callCount++
+	// B-10：累计 token 用量（负值防御性归零）。
+	if in > 0 {
+		m.totalIn += int64(in)
+	}
+	if out > 0 {
+		m.totalOut += int64(out)
+	}
 	// 如果 latency 为负值，说明上游将该调用标记为超时，需要单独统计超时次数。
 	if latency < 0 {
 		m.timeoutCount++
@@ -96,9 +109,11 @@ func (m *metricsCollector) snapshot() metricsSnapshot {
 	// 将当前受锁保护的内部字段复制到返回值中，
 	// 调用方获得快照后无需再持有锁即可安全读取。
 	return metricsSnapshot{
-		CallCount:     m.callCount,
-		TimeoutCount:  m.timeoutCount,
-		AvgDurationMs: avg,
-		MaxDurationMs: int(m.maxDur.Milliseconds()),
+		CallCount:         m.callCount,
+		TimeoutCount:      m.timeoutCount,
+		AvgDurationMs:     avg,
+		MaxDurationMs:     int(m.maxDur.Milliseconds()),
+		TotalInputTokens:  m.totalIn,
+		TotalOutputTokens: m.totalOut,
 	}
 }

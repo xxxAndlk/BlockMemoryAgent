@@ -615,6 +615,7 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		time.Duration(cfg.Agent.PlanConfirmTimeoutSec)*time.Second,
 		cfg.Agent.PlanMaxRevisions,
 	)
+	subAgentDispatcher.WithPlanApprovalPolicy(cfg.Agent.PlanApprovalPolicy == "fail-closed")
 	// 波聚合整合纪要（集群档提速 C-3a）：call_sub_agents 同波 domain 项 ≥2 时，
 	// 完成回传汇成一条【整合纪要】单条送达父邮箱（轻量模型按领域归并，失败回退
 	// 逐领域拼接），省父 Agent "收到，继续等" 空转轮。config 默认 true，可显式关闭。
@@ -826,6 +827,14 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	if err := agentSvc.SetDefaultTrustMode(cfg.Agent.TrustMode); err != nil {
 		return nil, fmt.Errorf("invalid agent.trust_mode: %w", err)
 	}
+	// B-01 启动预检报告：明确打印实际生效的安全组合（shared/production 已由
+	// applySafetyDefaults 拒绝 full-auto；此处只报告，不重复裁决）。
+	log.Printf("[bootstrap] security profile=%s trust_mode=%s tool_approval_disabled=%v allow_full_auto_in_shared=%v",
+		cfg.Agent.SecurityProfile, cfg.Agent.TrustMode, cfg.Agent.ToolApprovalDisabled, cfg.Agent.AllowFullAutoInShared)
+	// 会话累计 token 预算（B-04/B-10）：ReactService 在 token_usage 事件累加，
+	// Dispatcher 派发前查闸；0=关闭。
+	agentSvc.SetTeamTokenBudget(cfg.Agent.TeamTokenBudget)
+	subAgentDispatcher.WithTeamBudgetCheck(agentSvc.TeamBudgetExceeded)
 	// 默认执行档位（TODO #14 三档全手动）：config agent.default_gear 注入（现为 daily），同上。
 	if err := agentSvc.SetDefaultGear(cfg.Agent.DefaultGear); err != nil {
 		return nil, fmt.Errorf("invalid agent.default_gear: %w", err)
@@ -1309,6 +1318,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	subAgentDispatcher.WithPluginVisibility(pluginManager.ToolVisibility)
 	// 会话档位只读回调（TODO #14 T22）：热驻槽 enterIdle 固化档位 + 隐式复用档位守卫。
 	subAgentDispatcher.WithSessionGearResolver(agentSvc.SessionGear)
+	// 顶层会话角色解析（A-01）：fast→doc_assistant / daily→domain / cluster→meta，
+	// 权限、可授工具与心跳分类不再把顶层一律当成 meta。
+	subAgentDispatcher.WithSessionRoleResolver(agentSvc.TopLevelRoleID)
 	// 领域注册表派发匹配（TODO #17 T24）：档案快照 + 记忆链两个只读回调，
 	// 派发侧按名字/别名/路径匹配命中后注入冷复活种子；store 与 dispatcher 解耦。
 	subAgentDispatcher.SetDomainProfileHook(func(ctx context.Context) []*subagent.DomainProfile {

@@ -79,12 +79,12 @@ func (t *listSkillsTool) Execute(ctx context.Context, args map[string]any) *tool
 	}
 	// meta 持全池（可派发任意技能）；其他 Agent 只列自己持有集。
 	var names []string
-	if roleIDFromAgentID(agentID) == "meta" {
+	if d.roleIDForAgent(agentID) == "meta" {
 		names = d.skillPool.Names()
 	} else if v, ok := d.heldSkills.Load(agentID); ok {
 		names = v.([]string)
 	} else {
-		if roleDef := d.registry.Get(roleIDFromAgentID(agentID)); roleDef != nil {
+		if roleDef := d.registry.Get(d.roleIDForAgent(agentID)); roleDef != nil {
 			names = fixedSkillNames(d.skillPool, roleDef)
 		}
 	}
@@ -174,13 +174,13 @@ func (t *loadSkillTool) Execute(ctx context.Context, args map[string]any) *tool.
 	// 越权取用校验：非 meta 只能加载自己持有的技能（meta 持全池）。
 	// 例外（2026-09-02 设计 §6.5）：learned 技能（自进化经验库）全局可加载——
 	// 派发前缀只注入一行提示，取全文必须走 load_skill，持有集不登记经验技能。
-	if roleIDFromAgentID(agentID) != "meta" && s.Source != "learned" {
+	if d.roleIDForAgent(agentID) != "meta" && s.Source != "learned" {
 		held := map[string]bool{}
 		if v, ok := d.heldSkills.Load(agentID); ok {
 			for _, n := range v.([]string) {
 				held[n] = true
 			}
-		} else if roleDef := d.registry.Get(roleIDFromAgentID(agentID)); roleDef != nil {
+		} else if roleDef := d.registry.Get(d.roleIDForAgent(agentID)); roleDef != nil {
 			for _, n := range fixedSkillNames(d.skillPool, roleDef) {
 				held[n] = true
 			}

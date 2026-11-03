@@ -61,9 +61,9 @@ type DomainHotConfig = domainHotConfig
 type domainOpKind int
 
 const (
-	opNewTask  domainOpKind = iota // 新任务（复用派发）
-	opResume                       // 挂起唤醒（"继续"或任意用户消息的 wake-all）
-	opDestroy                      // 销毁（TTL 到期/硬取消/话题切换/失败收口）
+	opNewTask domainOpKind = iota // 新任务（复用派发）
+	opResume                      // 挂起唤醒（"继续"或任意用户消息的 wake-all）
+	opDestroy                     // 销毁（TTL 到期/硬取消/话题切换/失败收口）
 )
 
 // domainOp 是发给 supervisor goroutine 的单条指令。
@@ -87,20 +87,20 @@ type queuedTask struct {
 type slotState int
 
 const (
-	slotRunning slotState = iota // 执行任务中（含挂起中 suspended=true 嵌套）
-	slotIdle                     // 任务完结，park 等复用或 TTL 到期
-	slotDestroyed                // 已销毁
+	slotRunning   slotState = iota // 执行任务中（含挂起中 suspended=true 嵌套）
+	slotIdle                       // 任务完结，park 等复用或 TTL 到期
+	slotDestroyed                  // 已销毁
 )
 
 // domainSlot 单个热驻 domain 的全部状态。
 // ops 是 supervisor goroutine 的唯一指令入口（缓冲 8）；其余可变字段由 mu 保护。
 type domainSlot struct {
-	mu             sync.Mutex
-	id             string
-	sessionID      string
+	mu        sync.Mutex
+	id        string
+	sessionID string
 	// workDir 会话级工作目录（S2）：槽创建时从派发 ctx 捕获，会话内固定；
 	// 每任务 ctx 经 tool.WithWorkDir 重注入，空=进程默认。
-	workDir        string
+	workDir string
 	// stopCtx 会话级中断传播基底（TODO 第10④）：任务 ctx 以它为 WithCancel 基底，
 	// 会话 Stop/cancel 即刻取消执行中任务；复用派发时随新 runCtx 刷新（restartSessionContext
 	// 会重建，旧值已取消不能沿用）。
@@ -119,12 +119,12 @@ type domainSlot struct {
 	// 首个唤醒序列（dispatchToIdleSlot/wakeIdleWithTask）惰性启动并清零。
 	dormant bool
 
-	wallRemain time.Duration       // 挂起时冻结的剩余墙钟
-	wallTimer  *time.Timer         // 墙钟 timer（到期 cancel 当前任务 ctx）
-	wallFired  bool                // 墙钟 timer 已到期（Canceled 分支区分墙钟取消与外部硬取消）
-	childReported bool             // 当前任务的父未决计数已递减（destroySlot 兜底防双递减）
-	cancelTask context.CancelFunc  // 当前任务 ctx cancel
-	taskCtx    context.Context     // 当前任务 ctx（挂起判定用）
+	wallRemain    time.Duration      // 挂起时冻结的剩余墙钟
+	wallTimer     *time.Timer        // 墙钟 timer（到期 cancel 当前任务 ctx）
+	wallFired     bool               // 墙钟 timer 已到期（Canceled 分支区分墙钟取消与外部硬取消）
+	childReported bool               // 当前任务的父未决计数已递减（destroySlot 兜底防双递减）
+	cancelTask    context.CancelFunc // 当前任务 ctx cancel
+	taskCtx       context.Context    // 当前任务 ctx（挂起判定用）
 	// cancelPending: 取消/暂停指令到达时任务 ctx 尚未绑定（派发 Register 与 runDomainTask
 	// 建 ctx 之间的窗口），任务入口见标记即刻收口（暂停→park / 硬取消→销毁）。
 	cancelPending bool
@@ -134,10 +134,10 @@ type domainSlot struct {
 	pendingTask      string
 	pendingWallClock time.Duration
 	pendingImages    []tool.ResultImage
-	ttlArmed   bool                // TTL 是否已武装（enterIdle 完成即武装）
-	ttlTimer   *time.Timer         // 加权倒计时（武装后非 nil）
-	ttlDeadline time.Time          // 武装时的到期时刻（IdleLeft 计算用）
-	idleSince  time.Time
+	ttlArmed         bool        // TTL 是否已武装（enterIdle 完成即武装）
+	ttlTimer         *time.Timer // 加权倒计时（武装后非 nil）
+	ttlDeadline      time.Time   // 武装时的到期时刻（IdleLeft 计算用）
+	idleSince        time.Time
 
 	// gear 进 Idle 时固化的会话档位（TODO #14 T22）：隐式复用解析按它裁决——
 	// 新派发会话档位与槽档位不符时不隐式接管（用户刚把会话切到快速档，不该吃
@@ -198,8 +198,8 @@ func (s *sessionSuspendState) resume() {
 // slotSuspendGate 实现 agent.SuspendGate：挂起检查 + Park 在会话 wake channel 上。
 // gate 只在会话挂起时阻塞；销毁/取消经任务 ctx 取消（Park 同时 select ctx.Done）。
 type slotSuspendGate struct {
-	d    *Dispatcher
-	sid  string
+	d   *Dispatcher
+	sid string
 }
 
 func (g *slotSuspendGate) Park(ctx context.Context) error {
@@ -497,11 +497,11 @@ func (d *Dispatcher) IdleRoster(sessionID string) []agent.IdleDomainInfo {
 			continue
 		}
 		info := agent.IdleDomainInfo{
-			AgentID:     s.id,
-			Domain:      s.domain,
-			ReuseCount:  s.reuseCount,
-			Busy:        s.state == slotRunning,
-			Resp:        truncateRunes(strings.TrimSpace(s.responsibility), 60),
+			AgentID:    s.id,
+			Domain:     s.domain,
+			ReuseCount: s.reuseCount,
+			Busy:       s.state == slotRunning,
+			Resp:       truncateRunes(strings.TrimSpace(s.responsibility), 60),
 		}
 		if files := d.recentWrittenFiles(s.id, idleRosterFileWindow); len(files) > 0 {
 			n := len(files)
@@ -713,6 +713,7 @@ func (d *Dispatcher) destroySlotGuarded(s *domainSlot, reason string, guard func
 	d.lastWrites.Delete(s.id)
 	d.heldSkills.Delete(s.id)
 	d.heldTools.Delete(s.id)
+	d.agentRoles.Delete(s.id)
 	if d.mailbox != nil {
 		d.purgeMailboxWithNotice(s.id, "热驻槽已销毁")
 	}
@@ -725,7 +726,7 @@ func (d *Dispatcher) destroySlotGuarded(s *domainSlot, reason string, guard func
 	// 之后——supervisor 消费销毁指令后退出，通道永不再被读取，任务静默丢失且父未决
 	// 计数挂账永不递减。此处逐项补偿递减并回告父 Agent。
 	drainedNewTasks := 0
-	drainLoop:
+drainLoop:
 	for {
 		select {
 		case op := <-s.ops:
@@ -1935,6 +1936,7 @@ func (d *Dispatcher) recoverSlotPanic(s *domainSlot) {
 	d.lastWrites.Delete(s.id)
 	d.heldSkills.Delete(s.id)
 	d.heldTools.Delete(s.id)
+	d.agentRoles.Delete(s.id)
 	if d.mailbox != nil {
 		d.purgeMailboxWithNotice(s.id, "异常终止")
 	}

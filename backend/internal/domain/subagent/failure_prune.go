@@ -213,6 +213,7 @@ func (d *Dispatcher) ReviveFork(ctx context.Context, node orchestrator.Node, use
 		defer d.lastWrites.Delete(newID)
 		defer d.heldSkills.Delete(newID)
 		defer d.heldTools.Delete(newID)
+		defer d.agentRoles.Delete(newID)
 		paused := false
 		runCtx, runCancel, release, gateErr := d.enterExecGate(baseCtx, ev, newID, effectiveTimeout)
 		if gateErr != nil {
