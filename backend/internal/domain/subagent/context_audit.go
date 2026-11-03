@@ -25,14 +25,20 @@ type contextAuditEntry struct {
 
 // contextAuditDetail 一次派发的上下文注入审计。
 type contextAuditDetail struct {
-	Version       string              `json:"version"`
-	AgentID       string              `json:"agent_id"`
-	ParentID      string              `json:"parent_id"`
-	RoleID        string              `json:"role_id"`
-	TaskRunes     int                 `json:"task_runes"`
-	Isolated      bool                `json:"isolated"`
-	TotalInjected int                 `json:"total_injected_runes"`
-	Entries       []contextAuditEntry `json:"entries"`
+	Version       string `json:"version"`
+	AgentID       string `json:"agent_id"`
+	ParentID      string `json:"parent_id"`
+	RoleID        string `json:"role_id"`
+	TaskRunes     int    `json:"task_runes"`
+	Isolated      bool   `json:"isolated"`
+	TotalInjected int    `json:"total_injected_runes"`
+	// ManifestVersion/Required/Optional 是任务上下文清单的版本化声明（B-08）：
+	// Required=目标/任务与共享规格，Optional=项目自述/技能召回/块记忆召回。
+	ManifestVersion string              `json:"manifest_version"`
+	Required        []string            `json:"required"`
+	Optional        []string            `json:"optional"`
+	Dropped         []string            `json:"dropped,omitempty"`
+	Entries         []contextAuditEntry `json:"entries"`
 }
 
 // emitContextAudit 构造并转发注入审计事件；liveFn 未接线时静默跳过。
@@ -50,12 +56,14 @@ func (d *Dispatcher) emitContextAudit(sessionID, subAgentID, parentID, roleID st
 		{"block_recall", "session"},
 	}
 	detail := contextAuditDetail{
-		Version:   contextAuditVersion,
-		AgentID:   subAgentID,
-		ParentID:  parentID,
-		RoleID:    roleID,
-		TaskRunes: taskRunes,
-		Isolated:  isolated,
+		Version:         contextAuditVersion,
+		AgentID:         subAgentID,
+		ParentID:        parentID,
+		RoleID:          roleID,
+		TaskRunes:       taskRunes,
+		Isolated:        isolated,
+		ManifestVersion: contextAuditVersion,
+		Required:        []string{"task"},
 	}
 	for _, item := range order {
 		chars := injectRunes[item.key]
@@ -66,8 +74,14 @@ func (d *Dispatcher) emitContextAudit(sessionID, subAgentID, parentID, roleID st
 		if isolated {
 			entry.State = "dropped"
 			entry.Reason = "spawn fork hard cap → isolated"
+			detail.Dropped = append(detail.Dropped, item.key)
 		} else {
 			detail.TotalInjected += chars
+			if item.key == "shared_prefix" {
+				detail.Required = append(detail.Required, item.key)
+			} else {
+				detail.Optional = append(detail.Optional, item.key)
+			}
 		}
 		detail.Entries = append(detail.Entries, entry)
 	}

@@ -219,6 +219,9 @@ const (
 	// LiveEventTokenUsage 是单次 LLM 调用 token 用量事件，
 	// InputTokens/OutputTokens 字段携带用量；provider 未返回用量时不发射。
 	LiveEventTokenUsage = "token_usage"
+	// LiveEventContextInjection 是子 Agent 上下文注入审计事件（U-02/B-08）：
+	// Detail 为 JSON（来源/作用域/字符数/状态/隔离原因），落 stats 调试事件。
+	LiveEventContextInjection = "context_injection"
 	// LiveEventPeerAsk 是收到其他 Agent 提问（mailbox MsgRequest/MsgEscalate）的事件：
 	// 与 sub_agent_done（完成回传）语义不同——这是一条"需要我回答"的询问，
 	// 会话层落 peer_ask 事件供用户看到跨 Agent 问答确实在用。

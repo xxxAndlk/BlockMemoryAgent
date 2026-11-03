@@ -1524,6 +1524,15 @@ func (st *reactSessionStore) restoreSessions(ctx context.Context, limit int) int
 	}
 	st.mu.Unlock()
 
+	// B-07 恢复矩阵报告：明确启动预热覆盖范围与状态分布。树/看板/邮箱按需恢复，
+	// 运行中会话由 restoredSessionStatus 标为 interrupted，不伪装成仍在运行。
+	statusCounts := make(map[string]int, len(built))
+	for _, sess := range built {
+		statusCounts[string(sess.Status)]++
+	}
+	log.Printf("[agent] restore matrix: restored=%d candidate=%d limit=%d statuses=%v (tree/board/mailbox=lazy, running→interrupted)",
+		restored, len(pending), limit, statusCounts)
+
 	// maxSeq 用于恢复后同步自增序号，避免新会话 ID 与历史 ID 冲突。
 	// 新格式 sessionID = "session-<bootEpoch>-<bootRand>-<seq>"，解析取最后段 seq；
 	// 旧格式 "session-N" 解析整段为 N。取两者最大值确保新 seq 更大。

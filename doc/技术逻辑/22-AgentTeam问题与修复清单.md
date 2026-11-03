@@ -4,7 +4,7 @@
 >
 > 阅读顺序：先看 [21 多 Agent 设计详解](21-多Agent设计详解.md) 了解现行为，再用本文确定改造顺序。本文是评审与修复清单，不代表其中任何修复已经实施。
 >
-> **修复状态（2026-11-03）**：U-01 的拆分提示冲突、A-01（权威 Agent 身份）、A-02（Parents 目标白名单语义）、A-03（工具授权取父级有效工具面）已落地。P1 批次另落地 B-01（安全 profile）、B-02（审批 fail-closed）、B-04（会话 token 预算）、B-05（共享写路径强制乐观锁）、B-06（Mailbox 幂等键）、B-09（AgentResult 信封）、B-10（token 用量指标）。详见 `doc/变更.md` 同日两条。其余：U-02 注入审计、B-03 分风险 DoD、B-07 恢复矩阵代码化、B-08 TaskContextManifest、C-01～C-06 Team 能力尚未实施。
+> **修复状态（2026-11-03）**：U-01 的拆分提示冲突、A-01（权威 Agent 身份）、A-02（Parents 目标白名单语义）、A-03（工具授权取父级有效工具面）已落地。P1 批次另落地 B-01（安全 profile）、B-02（审批 fail-closed）、B-04（会话 token 预算）、B-05（共享写路径强制乐观锁）、B-06（Mailbox 幂等键）、B-09（AgentResult 信封）、B-10（token 用量指标）。详见 `doc/变更.md` 同日两条。U-02/B-08 已落地注入审计（来源/作用域/字符数/隔离丢弃原因 + manifest_version/required/optional）。B-07 增加启动恢复矩阵报告。C-01/C-02/C-04 首版模块 `internal/team` 落地（版本化 Spec、YAML 校验、有界嵌套 ValidateNested、角色包 RoleSpec），仅契约与校验，未接 Dispatcher/HTTP。其余：U-02 冲突裁决/来源优先级/撤回、B-03 分风险 DoD、C-03 自动调度、C-05 组织学习闭环、C-06 自认领实验尚未实施。
 
 ## 1. 评估口径
 

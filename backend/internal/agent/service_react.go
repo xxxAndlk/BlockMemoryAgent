@@ -4972,6 +4972,12 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		if strings.TrimSpace(ev.Text) != "" {
 			s.store.addEventDetail(session, eventkind.Message, "Workflow", ev.Text, eventkind.WorkflowUnit, ev.Tool, "", "", "", true, ev.Detail)
 		}
+	case LiveEventContextInjection:
+		// U-02/B-08：子 Agent 上下文注入审计（来源/作用域/字符数/丢弃原因），
+		// 落 stats 调试事件（detail_json 可查），不进入对话正文。
+		if strings.TrimSpace(ev.Detail) != "" {
+			s.store.addEventDetail(session, eventkind.Stats, ev.Agent, "上下文注入审计", eventkind.ContextInjection, ev.AgentID, "", "", "", true, ev.Detail)
+		}
 	case LiveEventTokenUsage:
 		// 单次 LLM 调用 token 用量：记为 token_usage 调试事件，供前端实时累加展示。
 		// 消息格式 in=<n> out=<n> cache_hit=<n> cache_miss=<n> 与 textutil.ParseTokenUsage

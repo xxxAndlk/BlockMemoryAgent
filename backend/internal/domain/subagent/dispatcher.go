@@ -166,6 +166,13 @@ type Dispatcher struct {
 	// nil 或空串时零注入。
 	projectPrefs func(ctx context.Context) string
 
+	// contextManifestMode 上下文清单模式（U-02）：off|shadow|enforce。
+	// shadow（默认）只构建并审计、模型输入不变；enforce 在 required 丢失时拒派。
+	contextManifestMode string
+	// memoryItemsFn 长期记忆结构化条目提供器（U-02）：bootstrap 接
+	// MemoryLifecycle.EffectiveItems。nil 时 Manifest 无记忆来源。
+	memoryItemsFn func(ctx context.Context) []MemoryContextItem
+
 	// sessionGear 会话档位只读回调（TODO #14 T22）：sessionID -> 当前档位
 	//（auto/fast/cluster）。热驻槽 enterIdle 固化档位、隐式复用解析按它裁决。
 	// 刻意用普通 func 而非 agent 包类型（与 projectPrefs 同风格）；nil 时空串、守卫放行。
@@ -5065,6 +5072,8 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		log.Printf("[subagent] ctx_inject: sub=%s role=%s agents_md=%d shared_prefix=%d project_prefs=%d skill_recall=%d block_recall=%d task=%d runes",
 			subAgentID, roleDef.ID, injectRunes["agents_md"], injectRunes["shared_prefix"], injectRunes["project_prefs"], injectRunes["skill_recall"], injectRunes["block_recall"], len([]rune(origTask)))
 	}
+	// U-02/B-08 注入审计：来源/作用域/字符数/是否被 fork 硬顶丢弃，落 stats 事件可查。
+	d.emitContextAudit(sid, subAgentID, parentID, roleDef.ID, injectRunes, isolated, len([]rune(origTask)))
 
 	vk := resolveVerifyKind(verifyKind, roleDef.ID, mode)
 	// 验证证据格式模板（TODO #63）：L0 可执行校验角色在任务尾部注入证据格式要求，
@@ -6244,11 +6253,19 @@ func (d *Dispatcher) smokeTargetsFor(parentID, domain string, history []agent.Re
 //
 // 返回纯前缀（不含【当前任务】标记），供 runSubAgentOnce 统一拼装多段前缀避免嵌套。
 func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain string) string {
+	text, _ := d.buildSharedPrefixStructured(ctx, parentID, domain)
+	return text
+}
+
+// buildSharedPrefixStructured 与 buildSharedPrefix 同源：返回渲染文本 + 结构化来源（U-02）。
+// 两者共用同一批槽位读取，避免审计清单与模型实际输入各写一套。
+func (d *Dispatcher) buildSharedPrefixStructured(ctx context.Context, parentID, domain string) (string, []contextSource) {
 	if d.sharedMem == nil {
-		return ""
+		return "", nil
 	}
 	prefix := parentID + ":"
 	var specPart, sharedParts []string
+	var sources []contextSource
 	slotCount, totalLen := 0, 0
 	slotNames := []string{}
 	for _, k := range d.sharedMem.Keys(ctx) {
@@ -6287,6 +6304,11 @@ func (d *Dispatcher) buildSharedPrefix(ctx context.Context, parentID, domain str
 				continue
 			}
 			sharedParts = append(sharedParts, val)
+			sources = append(sources, contextSource{
+				Source: team.SourceSharedFact, SourceID: slotName,
+				SourceRevision: team.HashContextContent(val), ConflictKey: "shared:" + slotName,
+				Scope: team.ScopeSession, Trust: team.TrustUntrusted, Content: val,
+			})
 			continue
 		}
 		// Layer 3 stale 判定：mtime 不匹配或 registry 打过 invalidated_at 标记。
