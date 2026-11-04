@@ -470,10 +470,18 @@ CREATE TABLE IF NOT EXISTS long_term_memory_items (
     verification    VARCHAR(16) NOT NULL DEFAULT 'unverified',
     source_session  TEXT NOT NULL DEFAULT '',
     source_message  TEXT NOT NULL DEFAULT '',
+    role_id         TEXT NOT NULL DEFAULT '',
+    task_type       TEXT NOT NULL DEFAULT '',
+    source_result_id TEXT NOT NULL DEFAULT '',
+    source_verification_report_id TEXT NOT NULL DEFAULT '',
     revision        BIGINT NOT NULL DEFAULT 1,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE long_term_memory_items ADD COLUMN IF NOT EXISTS role_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE long_term_memory_items ADD COLUMN IF NOT EXISTS task_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE long_term_memory_items ADD COLUMN IF NOT EXISTS source_result_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE long_term_memory_items ADD COLUMN IF NOT EXISTS source_verification_report_id TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS long_term_memory_events (
     id              BIGSERIAL PRIMARY KEY,
     owner           VARCHAR(64) NOT NULL DEFAULT '',

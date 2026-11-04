@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -173,6 +174,10 @@ type ToolResult struct {
 	Images []tool.ResultImage `json:"-"`
 }
 
+// ErrRequiredContextInvalid 运行中 required 上下文失效（U-02）：撤回、被新版本覆盖
+// 或内容 hash 变化。上层应停止本 attempt 并交上级重规划，不得静默继续。
+var ErrRequiredContextInvalid = errors.New("required context invalid")
+
 // ReactResult 是 ReActAgent 一次运行结束时返回的结果。
 type ReactResult struct {
 	Text    string         `json:"text"`    // Text 是模型最终生成的文本答案
@@ -180,6 +185,11 @@ type ReactResult struct {
 	// LimitReached 为 true 表示达到最大轮数上限而暂停（非错误）：
 	// Text 为空，History 保留全部进度，上层应暂停会话并等待用户消息续跑。
 	LimitReached bool `json:"limit_reached,omitempty"`
+	// PauseCause 标记 LimitReached 的具体原因（B-11）：
+	//   context_threshold  上下文/token 窗口触限；
+	//   iteration_limit    单次 run 迭代轮数上限。
+	// 空值按 context_threshold 兼容旧行为；PausedOnChild 时无意义。
+	PauseCause string `json:"pause_cause,omitempty"`
 	// PausedOnChild 为 true 表示因有子 DomainAgent 触达 token 上限进入 Paused 而暂停。
 	// 与 LimitReached 互斥语义:LimitReached=自身到限,PausedOnChild=子到限。
 	// 上层据此将会话置 PausedOnChild 态,等用户"继续"恢复该 domain。
@@ -222,6 +232,9 @@ const (
 	// LiveEventContextInjection 是子 Agent 上下文注入审计事件（U-02/B-08）：
 	// Detail 为 JSON（来源/作用域/字符数/状态/隔离原因），落 stats 调试事件。
 	LiveEventContextInjection = "context_injection"
+	// LiveEventContinuation 是执行连续性审计事件（B-11）：Detail 为 JSON
+	//（action/cause/checkpoint_id/continuation_seq/剩余预算），不进入对话正文。
+	LiveEventContinuation = "continuation"
 	// LiveEventPeerAsk 是收到其他 Agent 提问（mailbox MsgRequest/MsgEscalate）的事件：
 	// 与 sub_agent_done（完成回传）语义不同——这是一条"需要我回答"的询问，
 	// 会话层落 peer_ask 事件供用户看到跨 Agent 问答确实在用。

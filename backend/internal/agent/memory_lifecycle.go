@@ -726,8 +726,19 @@ func (lc *MemoryLifecycle) insertChecked(ctx context.Context, item store.MemoryI
 //  2. 同 key + 语义近似（Jaccard ≥ 0.6）→ resurrection_suspect，拒绝激活；
 //  3. 归档不是权威：只看数据库。
 func (lc *MemoryLifecycle) CheckResurrection(ctx context.Context, item store.MemoryItem) (bool, string) {
-	if lc == nil || lc.repo == nil {
+	blocked, reason, err := lc.CheckResurrectionStrict(ctx, item)
+	if err != nil {
+		log.Printf("[memory-lifecycle] resurrection check failed (fail-open): %v", err)
 		return false, ""
+	}
+	return blocked, reason
+}
+
+// CheckResurrectionStrict 供自动晋升使用：仓储错误返回 error（fail-closed），
+// 调用方不得在无法证明未复活时激活候选。
+func (lc *MemoryLifecycle) CheckResurrectionStrict(ctx context.Context, item store.MemoryItem) (bool, string, error) {
+	if lc == nil || lc.repo == nil {
+		return false, "", fmt.Errorf("memory lifecycle not wired")
 	}
 	hash := item.ContentHash
 	if hash == "" {
@@ -738,20 +749,19 @@ func (lc *MemoryLifecycle) CheckResurrection(ctx context.Context, item store.Mem
 		Statuses: []string{store.MemoryStatusRetracted, store.MemoryStatusSuperseded, store.MemoryStatusQuarantined},
 	})
 	if err != nil {
-		log.Printf("[memory-lifecycle] resurrection check failed (fail-open): %v", err)
-		return false, ""
+		return false, "", fmt.Errorf("resurrection check: %w", err)
 	}
 	for _, it := range dead {
 		if it.ContentHash == hash {
-			return true, fmt.Sprintf("与已 %s 条目 %s 内容完全相同（换排版/标点不算新结论）", it.Status, it.ID)
+			return true, fmt.Sprintf("与已 %s 条目 %s 内容完全相同（换排版/标点不算新结论）", it.Status, it.ID), nil
 		}
 		if it.MemoryKey == item.MemoryKey {
 			if sim := store.MemoryTextSimilarity(it.Content, item.Content); sim >= 0.6 {
-				return true, fmt.Sprintf("与已 %s 条目 %s 语义高度近似（%.2f），疑似旧结论换措辞复活", it.Status, it.ID, sim)
+				return true, fmt.Sprintf("与已 %s 条目 %s 语义高度近似（%.2f），疑似旧结论换措辞复活", it.Status, it.ID, sim), nil
 			}
 		}
 	}
-	return false, ""
+	return false, "", nil
 }
 
 // ScreenCandidates 供 SessionEvolver 在 enforce 激活前批量过滤候选（防复活）。
@@ -853,6 +863,38 @@ func (lc *MemoryLifecycle) EffectiveBlock(ctx context.Context, owner, projectKey
 	out := renderMemoryItems(dedupeEffectiveMemoryItems(all), "effective", maxRunes)
 	lc.storeBlock(cacheKey, out)
 	return out
+}
+
+// EffectiveItems 返回合并后的有效条目（项目条目覆盖同 key 的全局条目）。
+// 供 U-02 TaskContextManifest 结构化登记：不渲染、不套展示预算，保持条目级
+// source_id/revision/verification 可追溯。项目键为空时不查项目作用域。
+func (lc *MemoryLifecycle) EffectiveItems(ctx context.Context, owner, projectKey string) []store.MemoryItem {
+	if lc == nil || lc.repo == nil {
+		return nil
+	}
+	projectKey = store.NormalizeProjectKey(projectKey)
+	var all []store.MemoryItem
+	if projectKey != "" {
+		items, err := lc.repo.ListItems(ctx, store.MemoryQuery{
+			Owner: owner, Scope: store.MemoryScopeProject, ProjectKey: projectKey,
+			Statuses: []string{store.MemoryStatusActive},
+		})
+		if err != nil {
+			log.Printf("[memory-lifecycle] effective items project failed: %v", err)
+			return nil
+		}
+		all = append(all, dedupeByMemoryKey(items)...)
+	}
+	items, err := lc.repo.ListItems(ctx, store.MemoryQuery{
+		Owner: owner, Scope: store.MemoryScopeUser,
+		Statuses: []string{store.MemoryStatusActive},
+	})
+	if err != nil {
+		log.Printf("[memory-lifecycle] effective items user failed: %v", err)
+		return nil
+	}
+	all = append(all, items...)
+	return dedupeEffectiveMemoryItems(all)
 }
 
 // cachedBlock 读取注入视图缓存（revision 变化或超过 3s 即失效）。

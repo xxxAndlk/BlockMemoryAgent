@@ -60,6 +60,16 @@ type ReactService struct {
 	// teamUsage 会话累计用量：sessionID -> *teamTokenUsage（LiveEventTokenUsage 累加）。
 	teamUsage sync.Map
 
+	// 执行连续性（B-11）：主 Agent 自身触限的系统续跑。
+	autoResumeMode               string
+	autoResumeMaxPerTask         int
+	autoResumeNoProgressLimit    int
+	autoResumeConsume            func(sessionID string) (int, bool)
+	autoResumeDeadline           func(sessionID string) time.Time
+	autoResumeSeed               func(sessionID string, deadline time.Time)
+	sessionContinuations         sync.Map // sessionID -> *sessionContinuationState
+	sessionContinuationBudgetCnt sync.Map // sessionID -> *sessionContinuationCounter
+
 	// notifier 会话终态 Webhook 通知器（TODO #18-5 T32）：finalizeSession 收尾时
 	// best-effort 通知外部渠道。为 nil 时零开销跳过；bootstrap 按 config.notify 构造注入。
 	notifier *Notifier
@@ -4222,6 +4232,10 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	s.store.mu.RUnlock()
 	// 会话结束后清理临时目录并淘汰已完成会话。
 	defer s.finalizeSession(session)
+	// B-11：用根任务原始开始时间 + 会话墙钟预算预置共享 deadline（不等待首次暂停）。
+	if s.autoResumeSeed != nil && s.runtimeCfg.SessionMaxWallClockMin > 0 {
+		s.autoResumeSeed(session.ID, session.StartedAt.Add(time.Duration(s.runtimeCfg.SessionMaxWallClockMin)*time.Minute))
+	}
 
 	// 记录会话启动事件。
 	s.store.addEvent(session, eventkind.System, "System", "会话启动", "", "", "", "", "", true)
@@ -4406,8 +4420,13 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 		return
 	}
 
-	// 达到轮数上限：不视为失败——暂停会话、保留全部进度，等待用户消息续跑。
+	// 达到轮数上限：不视为失败——暂停会话、保留全部进度。
+	// B-11：主 Agent 自身上下文/迭代触限先尝试系统自动续跑（不伪造用户消息到决策账本）；
+	// 子 Agent 触限仍走 PausedOnChild 人工恢复；不满足续跑条件时回落到旧暂停。
 	if result.LimitReached {
+		if !result.PausedOnChild && s.tryScheduleSessionAutoResume(session, result) {
+			return
+		}
 		kind := PauseIterationLimit
 		if result.PausedOnChild {
 			kind = PauseOnChild
@@ -4641,8 +4660,13 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		return
 	}
 
-	// 达到轮数上限：不视为失败——暂停会话、保留全部进度，等待用户消息续跑。
+	// 达到轮数上限：不视为失败——暂停会话、保留全部进度。
+	// B-11：主 Agent 自身上下文/迭代触限先尝试系统自动续跑（不伪造用户消息到决策账本）；
+	// 子 Agent 触限仍走 PausedOnChild 人工恢复；不满足续跑条件时回落到旧暂停。
 	if result.LimitReached {
+		if !result.PausedOnChild && s.tryScheduleSessionAutoResume(session, result) {
+			return
+		}
 		kind := PauseIterationLimit
 		if result.PausedOnChild {
 			kind = PauseOnChild
@@ -4709,6 +4733,9 @@ func (s *ReactService) finalizeSession(session *reactInternalSession) {
 	}
 	// 淘汰已完成的会话，避免内存无限增长。
 	s.store.evictCompletedSessions()
+	// B-11：旧 run 的流式状态、临时资源和会话淘汰全部处理完后，才允许系统续跑。
+	// 不在触限分支用固定睡眠猜旧 run 是否退出。
+	s.resumeScheduledSessionContinuation(session)
 }
 
 // finalizeThinking 把累积的思考过程（session.ThinkingText）落为会话 think 事件并清空。
@@ -4977,6 +5004,12 @@ func (s *ReactService) handleLiveEvent(session *reactInternalSession, ev LiveEve
 		// 落 stats 调试事件（detail_json 可查），不进入对话正文。
 		if strings.TrimSpace(ev.Detail) != "" {
 			s.store.addEventDetail(session, eventkind.Stats, ev.Agent, "上下文注入审计", eventkind.ContextInjection, ev.AgentID, "", "", "", true, ev.Detail)
+		}
+	case LiveEventContinuation:
+		// B-11：系统触限/自动续跑审计（checkpoint/scheduled/resumed/blocked），
+		// 落 stats 调试事件，不进入对话正文、不写用户决策账本。
+		if strings.TrimSpace(ev.Detail) != "" {
+			s.store.addEventDetail(session, eventkind.Stats, ev.Agent, "执行连续性", eventkind.Continuation, ev.AgentID, "", "", "", true, ev.Detail)
 		}
 	case LiveEventTokenUsage:
 		// 单次 LLM 调用 token 用量：记为 token_usage 调试事件，供前端实时累加展示。

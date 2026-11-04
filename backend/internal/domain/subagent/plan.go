@@ -16,7 +16,28 @@ import (
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
+	"github.com/blockmemory/agent/backend/internal/team"
 )
+
+// WithReadyTrigger 注入 C-03 就绪唤醒（bootstrap 接 ReadyScheduler.Reconcile）。
+// 事件只负责唤醒；调度器仍回数据库/计划查真相。
+func (d *Dispatcher) WithReadyTrigger(fn func(sessionID string)) *Dispatcher {
+	d.readyTrigger = fn
+	return d
+}
+
+// taskBindingCtxKey 精确任务绑定上下文键（C-03）：派发时显式携带，
+// 不靠全局 map 猜当前任务；旧调用无绑定值时保持 Domain 整组语义。
+type taskBindingCtxKey struct{}
+
+func withTaskBinding(ctx context.Context, b team.TaskBinding) context.Context {
+	return context.WithValue(ctx, taskBindingCtxKey{}, b)
+}
+
+func taskBindingFromContext(ctx context.Context) (team.TaskBinding, bool) {
+	b, ok := ctx.Value(taskBindingCtxKey{}).(team.TaskBinding)
+	return b, ok && b.IsBound()
+}
 
 // writePlanTool 实现 write_plan 工具：写入/覆盖会话级执行计划。
 type writePlanTool struct {
@@ -47,7 +68,7 @@ func (t *writePlanTool) Description() string {
 
 // writePlanInput 是 write_plan 工具的入参结构。
 type writePlanInput struct {
-	Goal  string        `json:"goal"`
+	Goal  string           `json:"goal"`
 	Tasks []board.PlanTask `json:"tasks"`
 }
 
@@ -86,7 +107,45 @@ func (t *writePlanTool) Execute(ctx context.Context, args map[string]any) *tool.
 				}
 			}
 		}
+		// C-03 自动调度扩展（可选）：role_id + task 才进入 ReadyScheduler。
+		pt.RoleID, _ = m["role_id"].(string)
+		pt.Task, _ = m["task"].(string)
+		pt.Responsibility, _ = m["responsibility"].(string)
+		pt.Mode, _ = m["mode"].(string)
+		pt.VerifyKind, _ = m["verify_kind"].(string)
+		pt.Risk, _ = m["risk"].(string)
+		pt.MaxAttempts = int(int64Arg(m, "max_attempts"))
+		pt.Integration = boolArg(m, "integration")
+		pt.ToolsHint = stringSliceArg(m, "tools_hint")
+		pt.SkillsHint = stringSliceArg(m, "skills_hint")
 		tasks = append(tasks, pt)
+	}
+
+	// C-03 唯一集成责任：最多一个 integration 任务，且必须依赖其余全部交付任务。
+	integrationCount := 0
+	var integrationTask *board.PlanTask
+	for i := range tasks {
+		if tasks[i].Integration {
+			integrationCount++
+			integrationTask = &tasks[i]
+		}
+	}
+	if integrationCount > 1 {
+		return &tool.Result{Tool: "write_plan", Error: "只允许一个 integration 任务（唯一集成责任）"}
+	}
+	if integrationTask != nil {
+		deps := map[string]bool{}
+		for _, d := range integrationTask.DependsOn {
+			deps[d] = true
+		}
+		for _, t := range tasks {
+			if t.ID == integrationTask.ID {
+				continue
+			}
+			if !deps[t.ID] {
+				return &tool.Result{Tool: "write_plan", Error: fmt.Sprintf("integration 任务 %q 必须依赖其余交付任务（缺 %q）", integrationTask.ID, t.ID)}
+			}
+		}
 	}
 
 	if d.boardFn == nil {
@@ -105,6 +164,9 @@ func (t *writePlanTool) Execute(ctx context.Context, args map[string]any) *tool.
 	}
 	if err := bd.SetPlan(goal, tasks); err != nil {
 		return &tool.Result{Tool: "write_plan", Error: fmt.Sprintf("计划校验失败: %v", err)}
+	}
+	if d.readyTrigger != nil {
+		go d.readyTrigger(sid)
 	}
 	var out strings.Builder
 	fmt.Fprintf(&out, "已写入计划 %d 个子任务：", len(tasks))
@@ -131,6 +193,29 @@ func (d *Dispatcher) checkDepGate(ctx context.Context, parentID, domain string) 
 	}
 	b := d.boardFn(sid)
 	if b == nil {
+		return ""
+	}
+	// C-03 精确绑定：只检查绑定任务的依赖，不按 Domain 整组阻塞。
+	if bnd, ok := taskBindingFromContext(ctx); ok {
+		if !b.DependsDone(bnd.TaskID) {
+			snap := b.Snapshot()
+			var pending []string
+			for _, t := range snap.Tasks {
+				if t.ID != bnd.TaskID {
+					continue
+				}
+				for _, dep := range t.DependsOn {
+					for _, dt := range snap.Tasks {
+						if dt.ID == dep && dt.Status != board.TaskDone {
+							pending = append(pending, fmt.Sprintf("%s(%s)", dep, dt.Title))
+						}
+					}
+				}
+				break
+			}
+			return fmt.Sprintf("依赖未满足：子任务 %s(%s) 依赖 %s 未完成，请等待其 [mailbox] 回传后再派发",
+				bnd.TaskID, tskTitle(snap, bnd.TaskID), strings.Join(pending, "、"))
+		}
 		return ""
 	}
 	taskIDs := b.FindAllByDomain(domain)
@@ -270,6 +355,14 @@ func (d *Dispatcher) boardUpdate(ctx context.Context, parentID, domain string, s
 	if b == nil {
 		return
 	}
+	if bnd, ok := taskBindingFromContext(ctx); ok {
+		// 精确回写：只操作绑定任务，attempt fence 拒绝旧 attempt 迟到结果。
+		if err := b.FinalizeBound(bnd.TaskID, bnd.AttemptID, status, summary); err != nil {
+			log.Printf("[subagent] board bound update rejected: task=%s attempt=%s err=%v", bnd.TaskID, bnd.AttemptID, err)
+		}
+		d.notifyDepWaiters(ctx, parentID)
+		return
+	}
 	for _, taskID := range b.FindAllByDomain(domain) {
 		switch status {
 		case board.TaskDone:
@@ -282,6 +375,9 @@ func (d *Dispatcher) boardUpdate(ctx context.Context, parentID, domain string, s
 	}
 	// 依赖门就绪通知：本领域任务终态落定后，查同父 waiter 是否有领域依赖已全就绪。
 	d.notifyDepWaiters(ctx, parentID)
+	if d.readyTrigger != nil && sid != "" {
+		go d.readyTrigger(sid)
+	}
 }
 
 // boardAssign 派发回写（TODO #22 Phase 1 补全）：子 Agent 起步即把匹配 domain 的
@@ -301,6 +397,12 @@ func (d *Dispatcher) boardAssign(ctx context.Context, parentID, domain, assignee
 	}
 	b := d.boardFn(sid)
 	if b == nil {
+		return
+	}
+	if bnd, ok := taskBindingFromContext(ctx); ok {
+		if err := b.AssignBound(bnd.TaskID, bnd.AttemptID, assignee); err != nil {
+			log.Printf("[subagent] board bound assign rejected: task=%s attempt=%s err=%v", bnd.TaskID, bnd.AttemptID, err)
+		}
 		return
 	}
 	doneSet := make(map[string]bool)

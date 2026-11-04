@@ -31,6 +31,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/mailbox"             // mailbox 包用于子 Agent 向父 Agent 发送完成通知
 	"github.com/blockmemory/agent/backend/internal/project"             // project 包提供 AGENTS.md/CLAUDE.md 项目自述读取（TODO 第10项⑦）
 	"github.com/blockmemory/agent/backend/internal/skill"               // skill 包提供技能池与元数据块渲染（技能分发）
+	"github.com/blockmemory/agent/backend/internal/team"                // team 包提供 TaskContextManifest 中立契约（U-02）
 	"github.com/blockmemory/agent/backend/internal/userprofile"         // 项目偏好注入视图（剥归档 + 按小节预算）
 	"github.com/blockmemory/agent/backend/pkg/enums"                    // enums 包提供 KnowledgeTypeBlockMemory 等枚举常量
 	"github.com/blockmemory/agent/backend/pkg/textutil"                 // textutil 提供截断展示名用工具
@@ -172,6 +173,34 @@ type Dispatcher struct {
 	// memoryItemsFn 长期记忆结构化条目提供器（U-02）：bootstrap 接
 	// MemoryLifecycle.EffectiveItems。nil 时 Manifest 无记忆来源。
 	memoryItemsFn func(ctx context.Context) []MemoryContextItem
+
+	// verifyReports 每次 attempt 的逐项机器验收报告（B-03）：agentID -> *VerificationReport。
+	// runSubAgentOnce 出口写入，notify 读取并随 AgentResult v2 持久化到 Mailbox Payload。
+	verifyReports sync.Map
+	// verificationPolicyMode 验收强制模式（B-03）：off|shadow|enforce。
+	// 仅 C-03 绑定任务（task_id）在 enforce 下阻断未通过报告的 done；legacy 不变。
+	verificationPolicyMode string
+
+	// 执行连续性（B-11）：系统触限检查点与自动续跑。
+	// 默认 shadow（NewDispatcher），bootstrap 按 agent.auto_resume_mode 覆盖。
+	autoResumeMode            string
+	autoResumeMaxPerTask      int
+	autoResumeNoProgressLimit int
+	continuationStates        sync.Map // agentID -> *continuationState
+	continuationBudgetCnt     sync.Map // sessionID -> *atomicCounter
+	continuationDeadlines     sync.Map // sessionID -> time.Time（原始总截止时间）
+	// autoDispatchRoles C-03 自动调度允许角色（固定叶角色）；空=nil 时默认集。
+	autoDispatchRoles map[string]bool
+	// readyTrigger C-03 就绪唤醒（bootstrap 接 ReadyScheduler.Reconcile）；
+	// 事件只唤醒，调度器仍回数据库/计划查真相。nil 时零行为。
+	readyTrigger func(sessionID string)
+	// claimFinish C-06 自认领终态回写（bootstrap 接 WorkerSupervisor.FinishClaim）。
+	claimFinish func(ctx context.Context, b team.ClaimBinding, status, summary, resultID string)
+	// attemptFinish C-03 attempt 终态回写（bootstrap 接 AttemptStore.MarkTerminal）。
+	attemptFinish func(ctx context.Context, attemptID, status, resultID, errText string)
+	// candidateSink C-05 团队经验候选出口（bootstrap 接 MemoryPromotionService）；
+	// 仅在带 task_id 绑定且 B-03 报告 passed 时触发，默认 shadow 不入现行记忆。
+	candidateSink func(ctx context.Context, c TeamCandidateInput)
 
 	// sessionGear 会话档位只读回调（TODO #14 T22）：sessionID -> 当前档位
 	//（auto/fast/cluster）。热驻槽 enterIdle 固化档位、隐式复用解析按它裁决。
@@ -1487,6 +1516,10 @@ func (d *Dispatcher) HasPausedChild(parentID string) bool {
 	}
 	for _, n := range t.Snapshot() {
 		if n.ParentID == parentID && n.Status == orchestrator.StatusPaused && n.Role == "domain" {
+			// B-11：已安排系统自动续跑的节点不算“需要人工处理”，父保持等待。
+			if d.continuationPending(n.ID) {
+				continue
+			}
 			return true
 		}
 	}
@@ -1504,21 +1537,24 @@ func NewDispatcher(
 ) *Dispatcher {
 	// 构造 Dispatcher 实例，将依赖注入到对应字段。
 	return &Dispatcher{
-		registry:           registry,
-		models:             models,
-		tools:              tools,
-		mailbox:            mailbox,
-		memory:             memory,
-		ledger:             newTaskLedger(),
-		timeout:            30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
-		salvageTimeout:     30 * time.Second, // 默认 30s，可用 WithSalvageTimeout 覆盖（TODO #33）
-		taskRuneSoftLimit:  3000,             // task 文本软上限（TODO #35），WithTaskRuneLimits 覆盖
-		taskRuneHardLimit:  4000,
-		softStops:          make(map[string]bool),
-		pauseRequests:      make(map[string]bool),
-		planState:          newPlanConfirmState(),
-		pendingReqs:        newPendingRequestRegistry(),
-		batchDigestEnabled: true, // call_sub_agents 波聚合默认开（config agent.batch_digest_enabled 可关）
+		registry:                  registry,
+		models:                    models,
+		tools:                     tools,
+		mailbox:                   mailbox,
+		memory:                    memory,
+		ledger:                    newTaskLedger(),
+		timeout:                   30 * time.Minute, // 默认 30 分钟，可用 WithTimeout 覆盖；<=0 表示不限制
+		salvageTimeout:            30 * time.Second, // 默认 30s，可用 WithSalvageTimeout 覆盖（TODO #33）
+		taskRuneSoftLimit:         3000,             // task 文本软上限（TODO #35），WithTaskRuneLimits 覆盖
+		taskRuneHardLimit:         4000,
+		softStops:                 make(map[string]bool),
+		pauseRequests:             make(map[string]bool),
+		planState:                 newPlanConfirmState(),
+		pendingReqs:               newPendingRequestRegistry(),
+		batchDigestEnabled:        true, // call_sub_agents 波聚合默认开（config agent.batch_digest_enabled 可关）
+		autoResumeMode:            AutoResumeShadow,
+		autoResumeMaxPerTask:      2,
+		autoResumeNoProgressLimit: 1,
 	}
 }
 
@@ -1688,10 +1724,20 @@ func (d *Dispatcher) WithSkillUseCounter(fn func(name string) error) *Dispatcher
 
 // skillRecallPrefix 渲染【相关经验】派发前缀段；无回调/无命中返回空串（零注入）。
 func (d *Dispatcher) skillRecallPrefix(ctx context.Context, task string) string {
+	return renderSkillRecallPrefix(d.skillRecallHints(ctx, task))
+}
+
+// skillRecallHints 返回任务相关经验技能提示（nil/空任务时 nil），
+// 供前缀渲染与 U-02 Manifest 来源登记共用同一批召回结果。
+func (d *Dispatcher) skillRecallHints(ctx context.Context, task string) []SkillHint {
 	if d.skillRecall == nil || strings.TrimSpace(task) == "" {
-		return ""
+		return nil
 	}
-	hints := d.skillRecall(ctx, task)
+	return d.skillRecall(ctx, task)
+}
+
+// renderSkillRecallPrefix 渲染【相关经验】段；空列表返回空串。
+func renderSkillRecallPrefix(hints []SkillHint) string {
 	if len(hints) == 0 {
 		return ""
 	}
@@ -3115,6 +3161,7 @@ func (t *callSubAgentTool) Description() string {
 		"tools=派发级工具授权清单（内置/插件工具名，越界项忽略回告）、tools_mode=extend(默认，角色白名单∪授权)/only(仅授权集)——授权纪律：按需授予最小可用集，only 仅用于只读侦察等收窄场景，与 tools_hint（插件预挂载）正交互不替代；" +
 		"reuse_agent_id=热驻复用（填【空闲领域Agent】的 agent_id，保留全部上下文，spec 照写、key 与领域名对齐）；" +
 		"takeover=异名续建时填旧 domain 名，看板未完成条目迁移留痕（同名续建自动覆盖无需填）；" +
+		"task_id/attempt_id/plan_version=精确绑定已批准计划的单个任务（看板只更新该任务，旧 attempt 迟到结果被拒绝；普通派发省略保持按领域整组语义）；" +
 		"worktree=true 隔离派发到 git worktree 副本（子 Agent 全部文件写入落在副本，主目录零写入；成功收尾产出全量 patch，用 merge_worktree review 看完整 diff 后 merge/reject——仅文件级独立且需并行的任务使用；与 reuse_agent_id 互斥，热驻 domain 不支持）。\n" +
 		"可调用的 role_id：" + strings.Join(entries, "；") + "。"
 }
@@ -3379,6 +3426,19 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 	// dispatcher 迁移其非 Done 看板条目（含 Failed）到本次 domain 并留痕。
 	takeover, _ := args["takeover"].(string)
 	takeover = strings.TrimSpace(takeover)
+	// C-03 精确任务绑定：显式 task_id 时只看板该任务、按 attempt 做迟到结果 fence；
+	// 省略保持 Domain 整组兼容语义（legacy_delegate）。
+	taskID, _ := args["task_id"].(string)
+	attemptID, _ := args["attempt_id"].(string)
+	var binding *team.TaskBinding
+	if strings.TrimSpace(taskID) != "" {
+		binding = &team.TaskBinding{
+			TaskID:      taskID,
+			AttemptID:   attemptID,
+			PlanVersion: int64Arg(args, "plan_version"),
+			AttemptNo:   int(int64Arg(args, "attempt_no")),
+		}
+	}
 	// worktree 可选（TODO 第9⑤/#10⑤）：git worktree 隔离派发——子 Agent 在主仓库
 	// 副本内工作，成功收尾产出全量 patch，meta 经 merge_worktree 合并门合入。
 	wantWorktree := boolArg(args, "worktree")
@@ -3434,7 +3494,7 @@ func (t *callSubAgentTool) Execute(ctx context.Context, args map[string]any) *to
 		return &tool.Result{Tool: "call_sub_agent", Error: "worktree 与 reuse_agent_id 互斥：复用槽沿主目录上下文续作，请二选一", Category: tool.ResultCategoryValidationRejected}
 	}
 
-	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, toolsGrant, toolsMode, wallClock, reuseAgentID, takeover, &dispatchOpts{worktree: wantWorktree})
+	subAgentID, errRes := d.dispatchOne(ctx, roleID, domain, task, responsibility, mode, verifyKind, toolsHint, skillsHint, toolsGrant, toolsMode, wallClock, reuseAgentID, takeover, &dispatchOpts{worktree: wantWorktree, binding: binding})
 	if errRes != nil {
 		errRes.Tool = "call_sub_agent"
 		return errRes
@@ -3564,6 +3624,42 @@ type dispatchOpts struct {
 	// worktree 为 true 时（TODO 第9⑤/#10⑤）：本项派发到 git worktree 副本，
 	// 成功收尾产出 patch，meta 经 merge_worktree 合并门合入主仓库。
 	worktree bool
+	// binding 精确任务绑定（C-03）：非 nil 时依赖门/看板 Assign/终态回写
+	// 只操作指定 task_id，并写入 attempt_id 做迟到结果 fence。
+	binding *team.TaskBinding
+}
+
+// int64Arg 读取数值参数（JSON 解码为 float64；兼容 int/int64），缺失/非法返回 0。
+func int64Arg(args map[string]any, key string) int64 {
+	switch v := args[key].(type) {
+	case float64:
+		return int64(v)
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	default:
+		return 0
+	}
+}
+
+// stringSliceArg 读取字符串数组参数（[]any/[]string），忽略空项。
+func stringSliceArg(args map[string]any, key string) []string {
+	var out []string
+	switch v := args[key].(type) {
+	case []any:
+		for _, it := range v {
+			if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, s)
+			}
+		}
+	case []string:
+		out = append(out, v...)
+	}
+	return out
 }
 
 // fnvHash32 计算字符串的 FNV-1a 32 位哈希（派发分条锁用，纯函数无状态）。
@@ -3575,17 +3671,18 @@ func fnvHash32(s string) uint32 {
 
 // ProgrammaticSpec 是程序化派发（DispatchProgrammatic）的入参。
 type ProgrammaticSpec struct {
-	RoleID         string        // 子 Agent 角色 ID
-	Domain         string        // 中文领域展示名（roleID=domain 时非空）
-	Task           string        // 自包含任务简报
-	Responsibility string        // 职责说明（可空）
-	Mode           string        // 执行模式（可空）
-	VerifyKind     string        // 完成校验类型（可空；无验收传 none）
-	ToolsHint      []string      // 下放工具提示（可空）
-	SkillsHint     []string      // 下放技能集（可空）
-	ToolsGrant     []string      // 授权插件工具（可空）
-	ToolsMode      string        // 工具模式（可空）
-	WallClock      time.Duration // 派发级墙钟（<=0 用全局默认）
+	RoleID         string            // 子 Agent 角色 ID
+	Domain         string            // 中文领域展示名（roleID=domain 时非空）
+	Task           string            // 自包含任务简报
+	Responsibility string            // 职责说明（可空）
+	Mode           string            // 执行模式（可空）
+	VerifyKind     string            // 完成校验类型（可空；无验收传 none）
+	ToolsHint      []string          // 下放工具提示（可空）
+	SkillsHint     []string          // 下放技能集（可空）
+	ToolsGrant     []string          // 授权插件工具（可空）
+	ToolsMode      string            // 工具模式（可空）
+	WallClock      time.Duration     // 派发级墙钟（<=0 用全局默认）
+	Binding        *team.TaskBinding // 精确任务绑定（C-03 自动调度用；可空）
 }
 
 // DispatchProgrammatic 是程序化派发通道的导出薄封装（工作流量产引擎升级例外用，2026-10-16）：
@@ -3600,8 +3697,9 @@ func (d *Dispatcher) DispatchProgrammatic(ctx context.Context, spec Programmatic
 	if strings.TrimSpace(spec.RoleID) == "" {
 		return "", &tool.Result{Error: "programmatic dispatch: role_id required"}
 	}
+	opt := &dispatchOpts{binding: spec.Binding}
 	return d.dispatchOne(ctx, spec.RoleID, spec.Domain, spec.Task, spec.Responsibility, spec.Mode, spec.VerifyKind,
-		spec.ToolsHint, spec.SkillsHint, spec.ToolsGrant, spec.ToolsMode, spec.WallClock, "", "")
+		spec.ToolsHint, spec.SkillsHint, spec.ToolsGrant, spec.ToolsMode, spec.WallClock, "", "", opt)
 }
 
 func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, responsibility, mode, verifyKind string, toolsHint, skillsHint, toolsGrant []string, toolsMode string, wallClock time.Duration, reuseAgentID, takeover string, opts ...*dispatchOpts) (string, *tool.Result) {
@@ -3613,6 +3711,34 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	parentID := agent.AgentIDFromContext(ctx)
 	if parentID == "" {
 		return "", &tool.Result{Error: "missing parent agent context"}
+	}
+
+	// C-03 精确任务绑定：显式校验并随 ctx 传给执行体；不建全局 map 猜当前任务。
+	var binding *team.TaskBinding
+	if opt != nil && opt.binding != nil {
+		b := *opt.binding
+		if b.SessionID == "" {
+			if sid := tool.SessionIDFromContext(ctx); sid != "" {
+				b.SessionID = sid
+			} else if i := strings.Index(parentID, "/"); i > 0 {
+				b.SessionID = parentID[:i]
+			}
+		}
+		if err := b.Normalize(); err != nil {
+			return "", &tool.Result{Error: err.Error(), Category: tool.ResultCategoryValidationRejected}
+		}
+		if b.PlanVersion > 0 && d.boardFn != nil {
+			if bd := d.boardFn(b.SessionID); bd != nil {
+				if cur := bd.Snapshot().PlanVersion; cur != b.PlanVersion {
+					return "", &tool.Result{
+						Error:    fmt.Sprintf("stale plan version: task %s bound to v%d, current v%d; re-plan or drop task_id", b.TaskID, b.PlanVersion, cur),
+						Category: tool.ResultCategoryValidationRejected,
+					}
+				}
+			}
+		}
+		binding = &b
+		ctx = withTaskBinding(ctx, b)
 	}
 
 	// 会话累计 token 预算闸门（B-04）：达上限拒绝新增派发，已有结果仍可收口。
@@ -3710,6 +3836,16 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	stripe := &d.dispatchStripes[fnvHash32(parentID)%uint32(len(d.dispatchStripes))]
 	stripe.Lock()
 	defer stripe.Unlock()
+
+	// B-11 同任务防重派：已有可恢复的 paused 实例时不得新建同任务实例。
+	// enforce 直接拒绝；shadow 只留审计，不改变旧派发行为。
+	if existing, ok := d.findResumableDuplicate(parentID, domain, binding); ok {
+		msg := fmt.Sprintf("已有可恢复的子 Agent %s（同一任务暂停待续跑），不得重派；请等待自动续跑或 cancel_agent 后显式重派", existing)
+		d.emitContinuation(tool.SessionIDFromContext(ctx), existing, "continuation_redispatch_rejected", team.ContinuationCheckpoint{AgentID: existing, ParentAgentID: parentID}, map[string]any{"reason": msg})
+		if d.autoResumeMode == AutoResumeEnforce {
+			return "", &tool.Result{Error: msg, Category: tool.ResultCategoryValidationRejected}
+		}
+	}
 
 	// 派发依赖门（TODO #22 Phase 1）：计划中该领域子任务的 depends_on 未全部完成时拒绝，
 	// 提示等谁（实证：MetaAgent 未等回传重复派发渲染引擎×3 互相覆盖——依赖门治本）。
@@ -3869,6 +4005,9 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		workDirForChild = wt.Path
 	}
 	subAgentCtx = tool.WithWorkDir(subAgentCtx, workDirForChild)
+	if binding != nil {
+		subAgentCtx = withTaskBinding(subAgentCtx, *binding)
+	}
 	// 本轮用户图片（Alt+V 粘贴）带外穿透：子 Agent ctx 由 Background 重建，
 	// 父 ctx 的 value 不会自动流入，须显式重注入--子 Agent 首条 user 消息挂图，
 	// 其自身工具调用链（含再派发叶子）递归携带。
@@ -3907,7 +4046,11 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 	}
 	// 计划状态回写（TODO #22 Phase 1 补全）：派发即把该领域的计划子任务置为 in_progress，
 	// 否则任务只有完成/失败才翻状态，TUI 执行计划面板全程 Waiting、进度 0%。
-	d.boardAssign(ctx, parentID, domain, subAgentID)
+	assignCtx := ctx
+	if binding != nil {
+		assignCtx = withTaskBinding(ctx, *binding)
+	}
+	d.boardAssign(assignCtx, parentID, domain, subAgentID)
 	// 看板接力认领（TODO #73）：takeover 声明接管旧 domain 时，迁移其非 Done 条目
 	// （含 Failed）到本 domain 并留痕——旧 FAILED 条目随本次派发/完成翻绿，
 	// 不再永久红误导 meta 与用户。
@@ -3935,6 +4078,14 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		d.aggByAgent.Store(subAgentID, &mapAggEntry{agg: opt.aggregate, idx: opt.aggIdx, item: opt.aggItem})
 	}
 	go func() {
+		// B-11：paused 时必须在旧 run 的全部清理 defer 之后才调度续跑
+		//（本 defer 注册最早 → 最后执行），避免旧协程删除新 run 的角色/活动状态。
+		paused := false
+		defer func() {
+			if paused {
+				d.scheduleContinuation(baseCtx, tool.SessionIDFromContext(ctx), subAgentID)
+			}
+		}()
 		defer baseCancel()
 		// P1-3 panic 兜底：recover 后按 kill 路径语义收尾（父计数递减 + 树 Failed +
 		// 回告父），防一处 SDK/工具 panic 崩掉整个后端带走全部在跑会话。
@@ -3952,7 +4103,6 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 		// paused=true 时(domain 触达 token 上限)不递减父未决计数:父 PendingChildren 保持 >0,
 		// 由 MetaAgent PausedChildChecker 检测后主动暂停会话,等用户"继续"恢复。
 		// doneOnce 保证与心跳巡检竞争时 trackChildDone 仅触发一次，防双递减。
-		paused := false
 		runCtx, runCancel, release, gateErr := d.enterExecGate(baseCtx, ev, subAgentID, effectiveTimeout)
 		if gateErr != nil {
 			// 排队期被取消：cancel_agent/巡检硬取消由取消方收口树态与父通知，
@@ -3966,6 +4116,9 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, roleID, domain, task, resp
 			defer runCancel()
 			defer release()
 			paused = d.runSubAgent(runCtx, parentID, subAgentID, *roleDef, task, domain, responsibility, mode, verifyKind, started)
+		}
+		if !paused {
+			d.clearContinuation(subAgentID)
 		}
 		// 聚合模式：notify 未触达（暂停/无邮箱等路径）时兜底收口本项，防聚合器永久悬挂。
 		// 正常完成路径 notify 已先消费登记，此处 Load 不到即 no-op。
@@ -4584,6 +4737,8 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
 		d.treeFinishStatus(ctx, subAgentID, partial, treeStatus, failText)
 		d.notifyTerminal(subAgentID, parentID, msg, files)
+		d.finishClaimNow(ctx, subAgentID, msg, err)
+		d.finishDispatchAttemptNow(ctx, subAgentID, msg, err)
 		return false
 	}
 
@@ -4591,6 +4746,21 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 	// meta 纸面交付对照+返工，见 roles.yaml 提示词），完成路径不再自动派验证 Agent--
 	// 整品验收 Agent 2026-08-24 切出默认流程：isVerificationTask +【集成验证任务模式】保留为口子。
 	// A/B 实证自动验证闭环是负资产（开 5/16 vs 关 16/16），机制移至扩展设计文档 §12 作后期扩展。
+	// B-03：绑定任务（C-03 task_id）在 enforce 下必须机器报告通过才可标 done。
+	// 报告必须先于门禁生成；否则首次正常完成会因 rep==nil 被旧逻辑放行。
+	d.ensureVerificationReport(ctx, parentID, domain, subAgentID, result)
+	if msg, blocked := d.enforceVerificationGate(ctx, subAgentID); blocked {
+		log.Printf("[subagent] VERIFY-GATE blocked: sub=%s role=%s: %s", subAgentID, roleDef.ID, msg)
+		d.boardUpdate(ctx, parentID, domain, board.TaskUnverified, msg)
+		d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
+		d.treeFinishStatus(ctx, subAgentID, msg, orchestrator.StatusUnverified, msg)
+		d.notifyTerminal(subAgentID, parentID, failureMarker(FailureKindVerifyMissing, false)+"\n"+msg, files)
+		d.finishClaimNow(ctx, subAgentID, msg, errVerifyMissing)
+		d.finishDispatchAttemptNow(ctx, subAgentID, msg, errVerifyMissing)
+		return false
+	}
+	// C-05：绑定任务且机器验收通过时提交团队经验候选（默认 shadow，不激活）。
+	d.emitTeamCandidate(ctx, subAgentID, roleDef.ID, domain, task, result, d.peekVerificationReport(subAgentID))
 	log.Printf("[subagent] DONE: sub=%s role=%s duration=%s result_len=%d", subAgentID, roleDef.ID, duration, len(result.Text))
 	d.boardUpdate(ctx, parentID, domain, board.TaskDone, result.Text)
 	d.saveTerminalHistory(ctx, subAgentID, tool.SessionIDFromContext(ctx), result.History)
@@ -4619,6 +4789,8 @@ func (d *Dispatcher) runSubAgent(ctx context.Context, parentID, subAgentID strin
 		summary += note
 	}
 	d.notifyTerminal(subAgentID, parentID, summary, files)
+	d.finishClaimNow(ctx, subAgentID, summary, nil)
+	d.finishDispatchAttemptNow(ctx, subAgentID, summary, nil)
 	return false
 }
 
@@ -4859,7 +5031,7 @@ func parentIDOfAgentID(agentID string) string {
 // 出口邮箱处置：仅终结出口（成功/失败/部分返回/硬取消）清空邮箱并回投死信；
 // 暂停出口（errPaused / 手动暂停 / 软停止 domain，见 pauseExit）保留邮箱待续跑 drain。
 // 命名返回 err 供收尾 defer 判定出口类别（前两返回值本函数不使用命名形参）。
-func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode, verifyKind string) (_ *agent.ReActAgent, _ agent.ReactResult, err error) {
+func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID string, roleDef types.RoleDefinition, task, domain, responsibility, mode, verifyKind string) (_ *agent.ReActAgent, result agent.ReactResult, err error) {
 	provider, err := d.providerForAgent(ctx, roleDef.ID, subAgentID)
 	if err != nil {
 		return nil, agent.ReactResult{}, fmt.Errorf("get model: %w", err)
@@ -5001,6 +5173,13 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 
 	// 保留原始任务文本，供块记忆沉淀时作为 goal 标签使用（避免混入召回前缀）。
 	origTask := task
+	// B-03：任何出口都生成逐项验收报告（成功/失败/未验证/暂停/部分返回），
+	// notify 读取后随 AgentResult v2 持久化；不改旧 board 状态与通知语义。
+	defer func() {
+		d.verifyReports.Store(subAgentID, d.verificationFor(ctx, parentID, domain, subAgentID, result, err))
+		d.finishClaimIfNeeded(ctx, subAgentID, result.Text, err)
+		d.finishDispatchAttemptIfNeeded(ctx, subAgentID, result.Text, err)
+	}()
 	// 捕获父 spec 结构化切片（æ ¡éªåå±/å¥çº¦）：派发时 spec 尚新鲜，完成后 Layer 2
 	// 失效删除 spec 就再也读不到——冒烟检查目标与契约检查依赖此刻的捕获。
 	d.recordParentSpec(ctx, parentID, domain)
@@ -5009,25 +5188,53 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	// TODO 第七项③：各路注入 runes 逐路记账（ctx_inject 日志），供注入收口定默认值。
 	var prefixes []string
 	injectRunes := map[string]int{}
+	// U-02：与渲染同源登记结构化来源（shadow 对拍；enforce 做 required 完整性检查）。
+	ctxSources := []contextSource{{
+		Source: team.SourceUserInstruction, SourceID: "task", Scope: team.ScopeTask,
+		Trust: team.TrustAuthoritative, ConflictKey: "task", Content: origTask, Required: true,
+	}}
 	// 项目自述（TODO 第10项⑦）：workDir 根部 AGENTS.md/CLAUDE.md。置于所有前缀首位——
 	// 它是会话内最稳的段（文件不变则逐字节一致），越靠前越利于跨派发前缀缓存复用。
 	if brief := d.projectBriefPrefix(ctx); brief != "" {
 		prefixes = append(prefixes, brief)
 		injectRunes["agents_md"] = len([]rune(brief))
+		ctxSources = append(ctxSources, contextSource{
+			Source: team.SourceAgentsMD, SourceID: "AGENTS.md/CLAUDE.md",
+			SourceRevision: team.HashContextContent(brief), ConflictKey: "project_convention",
+			Scope: team.ScopeProject, Trust: team.TrustAuthoritative, Content: brief, Required: true,
+		})
 	}
-	if sp := d.buildSharedPrefix(ctx, parentID, domain); sp != "" {
+	if sp, spSources := d.buildSharedPrefixStructured(ctx, parentID, domain); sp != "" {
 		prefixes = append(prefixes, sp)
 		injectRunes["shared_prefix"] = len([]rune(sp))
+		ctxSources = append(ctxSources, spSources...)
 	}
 	// 项目经验由 WithDirectiveBlock 每轮动态注入，不再冻结进任务前缀。
 	// 经验技能召回（2026-09-02 设计 §6.5）：task 向量预筛 top-3，只注一行提示不注全文。
-	if sr := d.skillRecallPrefix(ctx, origTask); sr != "" {
-		prefixes = append(prefixes, sr)
-		injectRunes["skill_recall"] = len([]rune(sr))
+	if hints := d.skillRecallHints(ctx, origTask); len(hints) > 0 {
+		if sr := renderSkillRecallPrefix(hints); sr != "" {
+			prefixes = append(prefixes, sr)
+			injectRunes["skill_recall"] = len([]rune(sr))
+			for _, h := range hints {
+				ctxSources = append(ctxSources, contextSource{
+					Source: team.SourceSkill, SourceID: h.Name,
+					SourceRevision: team.HashContextContent(h.Name + "|" + h.Title),
+					ConflictKey:    "skill:" + h.Name, Scope: team.ScopeRole,
+					Trust: team.TrustVerified, Content: h.Name + " —— " + h.Title,
+				})
+			}
+		}
 	}
 	if bm, recs := d.injectScopedRecall(ctx, parentID, domain, origTask, ""); bm != "" {
 		prefixes = append(prefixes, bm)
 		injectRunes["block_recall"] = len([]rune(bm))
+		for _, rec := range recs {
+			ctxSources = append(ctxSources, contextSource{
+				Source: team.SourceBlockRecall, SourceID: fmt.Sprintf("block:%d", rec.ID),
+				SourceRevision: team.HashContextContent(rec.Content), Scope: team.ScopeSession,
+				Trust: team.TrustUntrusted, Content: rec.Content,
+			})
+		}
 		log.Printf("[subagent] inject block-memory: sub=%s role=%s hits=%d task_len=%d",
 			subAgentID, roleDef.ID, len(recs), len(origTask))
 		for i, rec := range recs {
@@ -5045,6 +5252,9 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 			uptake.seedSeen(recs)
 		}
 	}
+	// 长期记忆有效视图（U-02）：与 WithDirectiveBlock 每轮注入同源的 active 条目快照，
+	// 结构化登记来源/版本/trust；不受渲染预算影响。
+	ctxSources = append(ctxSources, d.contextMemorySources(ctx)...)
 	// 领域标签前缀：与系统提示词职责槽互补（prompt 管长效，前缀管当下），
 	// 让子 Agent 每次读任务时都看到自己的领域归属。
 	if roleDef.ID == "domain" {
@@ -5072,9 +5282,6 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 		log.Printf("[subagent] ctx_inject: sub=%s role=%s agents_md=%d shared_prefix=%d project_prefs=%d skill_recall=%d block_recall=%d task=%d runes",
 			subAgentID, roleDef.ID, injectRunes["agents_md"], injectRunes["shared_prefix"], injectRunes["project_prefs"], injectRunes["skill_recall"], injectRunes["block_recall"], len([]rune(origTask)))
 	}
-	// U-02/B-08 注入审计：来源/作用域/字符数/是否被 fork 硬顶丢弃，落 stats 事件可查。
-	d.emitContextAudit(sid, subAgentID, parentID, roleDef.ID, injectRunes, isolated, len([]rune(origTask)))
-
 	vk := resolveVerifyKind(verifyKind, roleDef.ID, mode)
 	// 验证证据格式模板（TODO #63）：L0 可执行校验角色在任务尾部注入证据格式要求，
 	// 与识别器口径同源（verificationCommandPatterns）——从源头消灭"回传了验证输出
@@ -5082,7 +5289,27 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 	if vk == verifyKindExecutable {
 		task += "\n\n" + tool.VerificationEvidenceTemplate()
 	}
-	result, err := d.runEngine(ctx, sub, subAgentID, roleDef.ID, mode, vk, task)
+
+	// U-02：清单在最终输入组装完成后构建，审计与恢复共用同一份冻结来源。
+	// shadow 只对拍（模型输入不变）；enforce 在 required 超预算/未决/被 fork 丢弃时拒派。
+	var manifest *team.TaskContextManifest
+	if cmMode := d.contextManifestModeValue(); cmMode != ContextManifestOff {
+		var probs manifestProblems
+		manifest, probs = d.buildTaskContextManifest(sid, roleDef.ID, ctxSources, isolated)
+		if cmMode == ContextManifestEnforce {
+			if merr := verifyManifestEnforce(probs); merr != nil {
+				return nil, agent.ReactResult{}, merr
+			}
+		}
+	}
+	// U-02/B-08 注入审计：来源/作用域/字符数/是否被 fork 硬顶丢弃，落 stats 事件可查。
+	d.emitContextAudit(sid, subAgentID, parentID, roleDef.ID, injectRunes, isolated, len([]rune(origTask)), manifest, team.HashContextContent(task))
+	// U-02 enforce：运行中 required 内容 hash 变化即停止后续执行（撤回/新版覆盖）。
+	if manifest != nil && d.contextManifestModeValue() == ContextManifestEnforce {
+		sub = sub.WithContextGuard(d.contextGuardFor(ctx, parentID, domain, manifest))
+	}
+
+	result, err = d.runEngine(ctx, sub, subAgentID, roleDef.ID, mode, vk, task)
 	if err != nil {
 		return sub, result, fmt.Errorf("run: %w", err)
 	}
@@ -5129,15 +5356,42 @@ func (d *Dispatcher) runSubAgentOnce(ctx context.Context, parentID, subAgentID s
 					t.Pause(subAgentID, "token budget exhausted")
 				}
 			}
-			// P0-2b 唤醒挂起等子的父会话：Paused 子节点不会再有完成事件，父若正处于
-			// awaiting_child 将永久睡死（运行中的父由 PausedChildChecker 在终答轮检测，
-			// 不受影响）。唤醒后父续跑一轮即转 paused_on_child，等用户"继续"。
-			d.pokeParent(parentID)
-			d.wakeSuspendedParent(parentID, "【系统】子 Agent "+subAgentID+" 触达 token 上限已暂停，请检测并处置（可换模型续跑或 cancel 放弃）。")
+			// B-11：记录检查点，由 dispatch goroutine 在旧 run 退出后决定是否同 ID 自动续跑。
+			taskID, attemptID := "", ""
+			if bnd, ok := taskBindingFromContext(ctx); ok {
+				taskID, attemptID = bnd.TaskID, bnd.AttemptID
+			}
+			d.recordContinuationCheckpoint(ctx, subAgentID, parentID, sid, "domain", pauseCauseOf(result), result.History, taskID, attemptID)
+			// 仅非 enforce 模式保留旧唤醒：enforce 下父应保持等待，不转换为
+			// paused_on_child，也不机会重派（B-11 父子等待协议）。
+			if d.autoResumeMode != AutoResumeEnforce {
+				d.pokeParent(parentID)
+				d.wakeSuspendedParent(parentID, "【系统】子 Agent "+subAgentID+" 触达 token 上限已暂停，请检测并处置（可换模型续跑或 cancel 放弃）。")
+			}
 			log.Printf("[subagent] PAUSED: sub=%s role=domain (token budget, history persisted)", subAgentID)
 			return sub, result, errPaused
 		}
-		// 叶子助手触达 token 上限:不持久化,把部分产出塞 result.Text 返回给父 mailbox + 标 Done。
+		// B-11 enforce：叶子触限也走同 ID 检查点续跑，不把截断文本冒充完成。
+		if d.autoResumeMode == AutoResumeEnforce && d.msgStore != nil {
+			sid := tool.SessionIDFromContext(ctx)
+			if err := d.msgStore.SaveMessages(ctx, subAgentID, sid, result.History); err != nil {
+				log.Printf("[subagent] LEAF PAUSE save messages failed: sub=%s err=%v", subAgentID, err)
+			} else {
+				if d.treeFn != nil && sid != "" {
+					if t := d.treeFn(sid); t != nil {
+						t.Pause(subAgentID, "token budget exhausted (leaf)")
+					}
+				}
+				taskID, attemptID := "", ""
+				if bnd, ok := taskBindingFromContext(ctx); ok {
+					taskID, attemptID = bnd.TaskID, bnd.AttemptID
+				}
+				d.recordContinuationCheckpoint(ctx, subAgentID, parentID, sid, "leaf", pauseCauseOf(result), result.History, taskID, attemptID)
+				log.Printf("[subagent] LEAF PAUSED: sub=%s role=%s (checkpointed, awaiting auto-resume)", subAgentID, roleDef.ID)
+				return sub, result, errPaused
+			}
+		}
+		// 叶子助手触达 token 上限（shadow/off 或检查点保存失败）:部分产出回灌父 mailbox + 标 Done。
 		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 		result.Text = partial
 		d.saveBlockMemory(ctx, subAgentID, roleDef.ID, parentID, domain, origTask, partial, blockOutcomePartial, agent.FilesModifiedFromHistory(result.History), result.History)
@@ -5490,9 +5744,22 @@ func (d *Dispatcher) planProgress(ctx context.Context, subAgentID string) func(s
 // pausedNodeID 为 Paused 节点 ID；parentID 从节点 ParentID 取。
 // 前置缺失（sid/treeFn/msgStore 为空）或加载空时返回错误，调用方应回退 pauseSession 不跑（防丢上下文）。
 func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (agent.ReactResult, error) {
+	return d.resumePausedWithOptions(ctx, pausedNodeID, team.ResumeOptions{Origin: "user_resume"})
+}
+
+// resumePausedWithOptions 续跑入口（B-11）：系统自动续跑与用户恢复共用，
+// 区别只在预算口径、重暂停通知与后续调度。
+func (d *Dispatcher) resumePausedWithOptions(ctx context.Context, pausedNodeID string, opts team.ResumeOptions) (result agent.ReactResult, err error) {
 	sid := tool.SessionIDFromContext(ctx)
 	if sid == "" || d.treeFn == nil || d.msgStore == nil {
 		return agent.ReactResult{}, fmt.Errorf("resume prerequisites not met (sid/tree/msgStore)")
+	}
+	// B-11：用户已停止的会话不再被系统续跑；用户恢复后 ClearSoftStop 才放行。
+	if opts.SystemContinuation() && d.isSoftStop(sid) {
+		return agent.ReactResult{}, fmt.Errorf("session stopped by user; system continuation cancelled")
+	}
+	if opts.Binding != nil {
+		ctx = withTaskBinding(ctx, *opts.Binding)
 	}
 	t := d.treeFn(sid)
 	if t == nil {
@@ -5511,21 +5778,31 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		return agent.ReactResult{}, fmt.Errorf("paused node not found: %s", pausedNodeID)
 	}
 	parentID := pausedNode.ParentID
+	// B-11：系统续跑再触限且仍可继续时，等本函数全部清理 defer 结束后再调度下一轮。
+	autoRepause := false
+	defer func() {
+		if autoRepause {
+			d.scheduleContinuation(ctx, sid, pausedNodeID)
+		}
+	}()
 
 	// 续跑次数上限：续跑会重置 fresh budget，若不设上限，"触限-暂停-续跑"环路永不绑定
 	// （v10 实证：验收领域研磨 32 轮 30 分钟不收敛）。触顶后强制收口部分返回，
 	// 返回 (result, nil) 使上层 resumePausedDomain 走"完成"分支——MetaAgent drain mailbox
 	// 整合部分产出并决定返工，与叶子助手 errPartialReturn 同哲学。
-	maxRes := d.maxPausedResumes
-	if maxRes <= 0 {
-		maxRes = 1
+	// B-11 系统续跑由任务级预算（auto_resume_max_per_task）统一限制，不再重复计旧上限。
+	if !opts.SystemContinuation() {
+		maxRes := d.maxPausedResumes
+		if maxRes <= 0 {
+			maxRes = 1
+		}
+		resumeCntV, _ := d.pausedResumes.LoadOrStore(pausedNodeID, new(atomic.Int64))
+		resumeCnt := resumeCntV.(*atomic.Int64)
+		if resumeCnt.Load() >= int64(maxRes) {
+			return d.concludePaused(ctx, pausedNode, maxRes)
+		}
+		resumeCnt.Add(1)
 	}
-	resumeCntV, _ := d.pausedResumes.LoadOrStore(pausedNodeID, new(atomic.Int64))
-	resumeCnt := resumeCntV.(*atomic.Int64)
-	if resumeCnt.Load() >= int64(maxRes) {
-		return d.concludePaused(ctx, pausedNode, maxRes)
-	}
-	resumeCnt.Add(1)
 
 	msgs, err := d.msgStore.LoadMessages(ctx, pausedNodeID)
 	if err != nil {
@@ -5534,6 +5811,8 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	if len(msgs) == 0 {
 		return agent.ReactResult{}, fmt.Errorf("no persisted messages for %s", pausedNodeID)
 	}
+	// B-11：context_threshold 用有界 continuation view；完整 History 仍保留在存储中。
+	msgs = boundedResumeHistory(msgs, opts.Cause)
 
 	roleDef := d.registry.Get(pausedNode.Role)
 	if roleDef == nil {
@@ -5613,6 +5892,9 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 	// 每会话工作目录（S2）：subCtx 由基底重建，从入站 ctx（resumePausedDomain
 	// 已注入）显式重注入，保证 resume 的 domain Agent 工具执行落在会话工作目录。
 	subCtx = tool.WithWorkDir(subCtx, tool.WorkDirFromContext(ctx))
+	if opts.Binding != nil {
+		subCtx = withTaskBinding(subCtx, *opts.Binding)
+	}
 	baseCtx, baseCancel := context.WithCancel(subCtx)
 	t.Resume(pausedNodeID, baseCancel)
 	d.running.Store(pausedNodeID, sub)
@@ -5640,24 +5922,40 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 
 	// 并发池准入（P1）：resume 是完整任务执行，同样占名额；排队期 ctx 取消按
 	// 续跑失败收口（树 Failed + 通知父 + 计数递减），与下方 err 分支同构。
-	runCtx, runCancel, release, gateErr := d.enterExecGate(baseCtx, ev, pausedNodeID, d.timeout)
+	sliceTimeout := d.timeout
+	if opts.RemainingTimeout > 0 && (sliceTimeout <= 0 || opts.RemainingTimeout < sliceTimeout) {
+		sliceTimeout = opts.RemainingTimeout
+	}
+	runCtx, runCancel, release, gateErr := d.enterExecGate(baseCtx, ev, pausedNodeID, sliceTimeout)
 	if gateErr != nil {
+		msg := formatSubAgentFailure(subCtx, gateErr, agent.ReactResult{}, d.timeout, "")
+		d.refreshVerificationReport(subCtx, parentID, pausedNode.Domain, pausedNodeID, agent.ReactResult{}, gateErr)
+		boardSt, _ := failureStatusTri(failureKindOf(subCtx, gateErr))
+		d.boardUpdate(subCtx, parentID, pausedNode.Domain, boardSt, msg)
 		d.treeFinish(subCtx, pausedNodeID, "", gateErr)
-		d.notify(parentID, pausedNodeID, formatSubAgentFailure(subCtx, gateErr, agent.ReactResult{}, d.timeout, ""), nil)
+		d.notify(parentID, pausedNodeID, msg, nil)
 		d.trackChildDone(parentID)
+		d.finishClaimNow(subCtx, pausedNodeID, msg, gateErr)
+		d.finishDispatchAttemptNow(subCtx, pausedNodeID, msg, gateErr)
 		return agent.ReactResult{}, gateErr
 	}
 	defer runCancel()
 	defer release()
 
-	result, err := sub.RunWithHistory(runCtx, "继续", msgs)
+	result, err = sub.RunWithHistory(runCtx, "继续", msgs)
 	files := agent.FilesModifiedFromHistory(result.History)
 	if err != nil {
+		d.clearContinuation(pausedNodeID)
 		partial := truncateRunes(agent.LastAssistantText(result.History), 500)
 		log.Printf("[subagent] resume FAIL: sub=%s err=%v", pausedNodeID, err)
+		d.refreshVerificationReport(subCtx, parentID, pausedNode.Domain, pausedNodeID, result, err)
+		boardSt, _ := failureStatusTri(failureKindOf(subCtx, err))
+		d.boardUpdate(subCtx, parentID, pausedNode.Domain, boardSt, partial)
 		d.treeFinish(subCtx, pausedNodeID, partial, err)
 		d.notify(parentID, pausedNodeID, formatSubAgentFailure(subCtx, err, result, d.timeout, partial), files)
 		d.trackChildDone(parentID)
+		d.finishClaimNow(subCtx, pausedNodeID, partial, err)
+		d.finishDispatchAttemptNow(subCtx, pausedNodeID, partial, err)
 		return result, err
 	}
 	if result.LimitReached {
@@ -5666,18 +5964,52 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 		}
 		t.Pause(pausedNodeID, "token budget exhausted (resume)")
 		rePaused = true // 重暂停非终结：邮箱保留待续跑 drain，收尾 defer 不清
-		// 再触限：父必须知情（否则父等 resume 时该节点静默占着未决计数）。
-		d.notify(parentID, pausedNodeID, "子 Agent 再次触达 token 上限已重新暂停（上下文保留）；可稍后 resume_agent 继续，或 cancel_agent 放弃并按部分产出收口。", agent.FilesModifiedFromHistory(result.History))
-		log.Printf("[subagent] resume RE-PAUSED: sub=%s (token budget)", pausedNodeID)
+		ownerKind := "domain"
+		if pausedNode.Role != "domain" {
+			ownerKind = "leaf"
+		}
+		taskID, attemptID := "", ""
+		if opts.Binding != nil {
+			taskID, attemptID = opts.Binding.TaskID, opts.Binding.AttemptID
+		}
+		cp := d.recordContinuationCheckpoint(subCtx, pausedNodeID, parentID, sid, ownerKind, pauseCauseOf(result), result.History, taskID, attemptID)
+		d.emitContinuation(sid, pausedNodeID, "continuation_repaused", cp.cp, map[string]any{
+			"origin": opts.Origin, "continuation_seq": opts.ContinuationSeq,
+		})
+		if opts.SystemContinuation() {
+			// 系统续跑再触限：父不被打扰，由控制预算决定是否再续一轮。
+			autoRepause = true
+		} else {
+			// 用户恢复再触限：父必须知情（否则父等 resume 时该节点静默占着未决计数）。
+			d.notify(parentID, pausedNodeID, "子 Agent 再次触达 token 上限已重新暂停（上下文保留）；可稍后 resume_agent 继续，或 cancel_agent 放弃并按部分产出收口。", agent.FilesModifiedFromHistory(result.History))
+		}
+		log.Printf("[subagent] resume RE-PAUSED: sub=%s (token budget, origin=%s)", pausedNodeID, opts.Origin)
 		return result, nil
 	}
+	d.clearContinuation(pausedNodeID)
 
 	log.Printf("[subagent] resume DONE: sub=%s result_len=%d", pausedNodeID, len(result.Text))
+	// 正常完成与恢复完成必须走同一终态出口：验收 → 看板绑定回写 → attempt/claim 收口 → 通知。
+	// 同一 Agent ID 在暂停阶段已经生成过报告；这里必须按恢复后的最终 History 重建，不能复用旧裁决。
+	d.refreshVerificationReport(subCtx, parentID, pausedNode.Domain, pausedNodeID, result, nil)
+	if msg, blocked := d.enforceVerificationGate(subCtx, pausedNodeID); blocked {
+		d.boardUpdate(subCtx, parentID, pausedNode.Domain, board.TaskUnverified, msg)
+		d.saveTerminalHistory(subCtx, pausedNodeID, sid, result.History)
+		d.treeFinishStatus(subCtx, pausedNodeID, msg, orchestrator.StatusUnverified, msg)
+		d.notify(parentID, pausedNodeID, failureMarker(FailureKindVerifyMissing, false)+"\n"+msg, files)
+		d.trackChildDone(parentID)
+		d.finishClaimNow(subCtx, pausedNodeID, msg, errVerifyMissing)
+		d.finishDispatchAttemptNow(subCtx, pausedNodeID, msg, errVerifyMissing)
+		return result, nil
+	}
+	d.boardUpdate(subCtx, parentID, pausedNode.Domain, board.TaskDone, result.Text)
 	// 终态全量落 PG（编排页对话视图权威源）：与 pause/失败分支同口径。
 	d.saveTerminalHistory(subCtx, pausedNodeID, sid, result.History)
 	d.treeFinish(subCtx, pausedNodeID, result.Text, nil)
 	d.notify(parentID, pausedNodeID, result.Text, files)
 	d.trackChildDone(parentID)
+	d.finishClaimNow(subCtx, pausedNodeID, result.Text, nil)
+	d.finishDispatchAttemptNow(subCtx, pausedNodeID, result.Text, nil)
 	return result, nil
 }
 
@@ -5689,6 +6021,12 @@ func (d *Dispatcher) ResumePaused(ctx context.Context, pausedNodeID string) (age
 // 失败通知（否则父等不到回灌也收不到失败，永久挂账）；成功路径的完成/失败回传由
 // ResumePaused 内部负责（不重复通知）。
 func (d *Dispatcher) resumePausedNode(ctx context.Context, nodeID string) {
+	d.resumePausedNodeWithOptions(ctx, nodeID, team.ResumeOptions{Origin: "user_resume"})
+}
+
+// resumePausedNodeWithOptions 异步续跑入口（B-11 系统续跑复用）。
+// 前置/加载失败时：叶子节点按未验证收口释放父等待；domain 保持暂停并通知父。
+func (d *Dispatcher) resumePausedNodeWithOptions(ctx context.Context, nodeID string, opts team.ResumeOptions) {
 	sid := tool.SessionIDFromContext(ctx)
 	base := tool.StopContextFrom(ctx)
 	if base == nil {
@@ -5699,11 +6037,24 @@ func (d *Dispatcher) resumePausedNode(ctx context.Context, nodeID string) {
 		subCtx = tool.WithWorkDir(subCtx, wd)
 	}
 	go func() {
-		if _, err := d.ResumePaused(subCtx, nodeID); err != nil {
-			log.Printf("[subagent] resume failed: sub=%s err=%v", nodeID, err)
+		if _, err := d.resumePausedWithOptions(subCtx, nodeID, opts); err != nil {
+			log.Printf("[subagent] resume failed: sub=%s origin=%s err=%v", nodeID, opts.Origin, err)
 			if d.treeFn != nil {
 				if t := d.treeFn(sid); t != nil {
 					if n, ok := t.Get(nodeID); ok && n.Status == orchestrator.StatusPaused {
+						cp := team.ContinuationCheckpoint{
+							SessionID: sid, AgentID: nodeID, NodeID: nodeID, ParentAgentID: n.ParentID,
+							Cause: team.PauseUncertain, OwnerKind: ownerKindOf(n.Role),
+						}
+						if opts.Binding != nil {
+							cp.TaskID, cp.AttemptID = opts.Binding.TaskID, opts.Binding.AttemptID
+						}
+						d.emitContinuation(sid, nodeID, "continuation_blocked", cp, map[string]any{"reason": "resume_failed: " + err.Error()})
+						if opts.SystemContinuation() && n.Role != "domain" {
+							// 叶子系统续跑失败：按未验证交付收口，父不得永久等待。
+							d.blockLeafContinuationWithBinding(cp, opts.Binding)
+							return
+						}
 						d.notify(n.ParentID, nodeID,
 							failureMarker(FailureKindError, false)+"\n续跑失败: "+err.Error()+
 								"（该节点仍为暂停态：可重试 resume_agent，或 cancel_agent 放弃并按已有产出收口）", nil)
@@ -5712,6 +6063,13 @@ func (d *Dispatcher) resumePausedNode(ctx context.Context, nodeID string) {
 			}
 		}
 	}()
+}
+
+func ownerKindOf(role string) string {
+	if role == "domain" {
+		return "domain"
+	}
+	return "leaf"
 }
 
 // ResumePausedWithMessage 用户直连"停止后"的 Paused 子 Agent（编排页发送框，2026-10-16）：
@@ -5760,36 +6118,43 @@ func (d *Dispatcher) ResumePausedWithMessage(ctx context.Context, pausedNodeID, 
 	return nil
 }
 
-// concludePaused 在 Paused domain 触达续跑上限时强制收口：
-// 从 msgStore 加载已持久化历史提取部分产出（LastAssistantText 截 500 字），
-// tree.Finish 标 Done + notify 父 mailbox（文案明确标注"触限强制收口"）+ trackChildDone + 清邮箱。
-// 与 ResumePaused 的完成分支同构；返回 (result, nil) 让上层走"完成"路径恢复 MetaAgent。
+// concludePaused 在 Paused 节点触达续跑上限时按未验证交付强制收口：
+// 部分产出不能冒充 Done；绑定任务与 legacy 任务都经过报告、看板、树、通知和 attempt/claim 终态。
 func (d *Dispatcher) concludePaused(ctx context.Context, pausedNode orchestrator.Node, maxRes int) (agent.ReactResult, error) {
 	sid := tool.SessionIDFromContext(ctx)
 	pausedNodeID := pausedNode.ID
 	parentID := pausedNode.ParentID
-
-	var partial string
-	var files []string
-	if msgs, err := d.msgStore.LoadMessages(ctx, pausedNodeID); err == nil && len(msgs) > 0 {
-		partial = truncateRunes(agent.LastAssistantText(msgs), 500)
-		files = agent.FilesModifiedFromHistory(msgs)
-	}
-	note := fmt.Sprintf("子 Agent 已达续跑上限（%d 次）仍未收敛，已强制收口并部分返回；请据部分产出决定返工或接手", maxRes)
-	text := note + "。" + partialSuffix(partial)
-
-	subCtx := context.Background()
+	// WithoutCancel 保留 TaskBinding/WorkDir 等值，同时允许终态持久化在取消后完成。
+	subCtx := context.WithoutCancel(ctx)
 	if sid != "" {
 		subCtx = tool.WithSessionID(subCtx, sid)
 	}
-	d.treeFinish(subCtx, pausedNodeID, text, nil)
-	d.notify(parentID, pausedNodeID, text, files)
+
+	var msgs []agent.ReactMessage
+	var partial string
+	var files []string
+	if loaded, err := d.msgStore.LoadMessages(subCtx, pausedNodeID); err == nil && len(loaded) > 0 {
+		msgs = loaded
+		partial = truncateRunes(agent.LastAssistantText(msgs), 500)
+		files = agent.FilesModifiedFromHistory(msgs)
+	}
+	note := fmt.Sprintf("子 Agent 已达续跑上限（%d 次）仍未收敛，已按未验证交付强制收口；请据部分产出决定返工或接手", maxRes)
+	text := note + "。" + partialSuffix(partial)
+	result := agent.ReactResult{Text: text, History: msgs}
+
+	d.refreshVerificationReport(subCtx, parentID, pausedNode.Domain, pausedNodeID, result, errVerifyMissing)
+	d.boardUpdate(subCtx, parentID, pausedNode.Domain, board.TaskUnverified, text)
+	d.treeFinishStatus(subCtx, pausedNodeID, text, orchestrator.StatusUnverified, text)
+	d.notifyTerminal(pausedNodeID, parentID, text, files)
 	d.trackChildDone(parentID)
+	d.finishClaimNow(subCtx, pausedNodeID, text, errVerifyMissing)
+	d.finishDispatchAttemptNow(subCtx, pausedNodeID, text, errVerifyMissing)
+	d.clearContinuation(pausedNodeID)
 	if d.mailbox != nil {
 		d.purgeMailboxWithNotice(pausedNodeID, "已达续跑上限强制收口")
 	}
-	log.Printf("[subagent] CONCLUDED: sub=%s parent=%s (resume cap %d reached, partial len=%d)", pausedNodeID, parentID, maxRes, len(partial))
-	return agent.ReactResult{Text: text}, nil
+	log.Printf("[subagent] CONCLUDED-UNVERIFIED: sub=%s parent=%s (resume cap %d reached, partial len=%d)", pausedNodeID, parentID, maxRes, len(partial))
+	return result, nil
 }
 
 // FailureKind 是子 Agent 失败的结构化类型（TODO #23），随父 mailbox 失败消息的
@@ -5820,11 +6185,16 @@ const (
 	// FailureKindContractViolation 跨域契约违例：兄弟域全完成后的静态契约检查
 	// 发现违例条目。retryable=false，父 Agent 按文件归属打回责任域。
 	FailureKindContractViolation FailureKind = "contract_violation"
+	// FailureKindContextInvalid 运行中 required 上下文失效（U-02）：撤回/新版覆盖/hash 变化，
+	// 停止执行并交上级重规划；不是执行失败，看板标 blocked。
+	FailureKindContextInvalid FailureKind = "context_invalid"
 )
 
 // failureKindOf 从失败错误分类失败类型；未知错误归 error。
 func failureKindOf(ctx context.Context, err error) FailureKind {
 	switch {
+	case errors.Is(err, agent.ErrRequiredContextInvalid):
+		return FailureKindContextInvalid
 	case isLLMCallDeadline(ctx, err):
 		// LLM 调用内部超时（endpoint 假死/单次调用超时）≠ 子 Agent 墙钟超时：
 		// 归 error 让父 Agent 看到"模型层故障"而非"执行超时"。
@@ -5856,6 +6226,10 @@ func failureKindOf(ctx context.Context, err error) FailureKind {
 func failureStatusTri(kind FailureKind) (board.TaskStatus, orchestrator.Status) {
 	if kind == FailureKindUnverified || kind == FailureKindVerifyMissing {
 		return board.TaskUnverified, orchestrator.StatusUnverified
+	}
+	if kind == FailureKindContextInvalid {
+		// blocked 语义：等待上级重规划/人工修正，不当作执行失败自动重试。
+		return board.TaskBlocked, orchestrator.StatusUnverified
 	}
 	return board.TaskFailed, orchestrator.StatusFailed
 }
@@ -6326,13 +6700,19 @@ func (d *Dispatcher) buildSharedPrefixStructured(ctx context.Context, parentID, 
 			for fp := range fm.Files {
 				files = append(files, fp)
 			}
-			specPart = []string{renderSpecPrefix(specMirror{
+			specText := renderSpecPrefix(specMirror{
 				Goal:         fm.Goal,
 				Acceptance:   fm.Acceptance,
 				Constraints:  fm.Constraints,
 				Files:        files,
 				VerifyLevels: fm.VerifyLevels,
-			})}
+			})
+			specPart = []string{specText}
+			sources = append(sources, contextSource{
+				Source: team.SourceTaskSpec, SourceID: slotName,
+				SourceRevision: team.HashContextContent(val), ConflictKey: "task_spec",
+				Scope: team.ScopeTask, Trust: team.TrustAuthoritative, Content: specText, Required: true,
+			})
 			continue
 		}
 		// 普通共享记忆槽：stale 不再丢弃——照常注入 body 并前置行号漂移警告
@@ -6341,9 +6721,14 @@ func (d *Dispatcher) buildSharedPrefixStructured(ctx context.Context, parentID, 
 			body = sharedStaleWarning + body
 		}
 		sharedParts = append(sharedParts, body)
+		sources = append(sources, contextSource{
+			Source: team.SourceSharedFact, SourceID: slotName,
+			SourceRevision: team.HashContextContent(val), ConflictKey: "shared:" + slotName,
+			Scope: team.ScopeSession, Trust: team.TrustUntrusted, Content: body,
+		})
 	}
 	if len(specPart) == 0 && len(sharedParts) == 0 {
-		return ""
+		return "", nil
 	}
 	log.Printf("[subagent] inject shared-memory: parent=%s slots=%d total_len=%d slot_names=%v spec=%v shared=%d",
 		parentID, slotCount, totalLen, slotNames, len(specPart) > 0, len(sharedParts))
@@ -6358,7 +6743,13 @@ func (d *Dispatcher) buildSharedPrefixStructured(ctx context.Context, parentID, 
 	}
 	if len(sharedParts) > 0 && !hasFileTree {
 		log.Printf("[subagent] shared-memory missing file_tree: parent=%s - injecting exploration hint", parentID)
-		sharedParts = append(sharedParts, "【项目结构未知】共享记忆缺 file_tree slot。请用 ListDir 扫项目结构 + ReadFile 抽签名，WriteSharedMemory(key=\"file_tree\", files=[只读参照文件]) 写入紧凑树供后续兄弟 Agent 复用。")
+		hint := "【项目结构未知】共享记忆缺 file_tree slot。请用 ListDir 扫项目结构 + ReadFile 抽签名，WriteSharedMemory(key=\"file_tree\", files=[只读参照文件]) 写入紧凑树供后续兄弟 Agent 复用。"
+		sharedParts = append(sharedParts, hint)
+		sources = append(sources, contextSource{
+			Source: team.SourceSharedFact, SourceID: "file_tree_hint",
+			SourceRevision: team.HashContextContent(hint), ConflictKey: "shared:hint",
+			Scope: team.ScopeSession, Trust: team.TrustUntrusted, Content: hint,
+		})
 	}
 
 	var parts []string
@@ -6374,7 +6765,7 @@ func (d *Dispatcher) buildSharedPrefixStructured(ctx context.Context, parentID, 
 	}
 	// 尾部固定反重读纪律行：注入内容视为已验证，禁止为其区间再 ReadFile。
 	parts = append(parts, sharedPrefixDisciplineNote)
-	return strings.TrimRight(strings.Join(parts, "\n\n"), "\n")
+	return strings.TrimRight(strings.Join(parts, "\n\n"), "\n"), sources
 }
 
 // resolveSpecKeyCandidates 返回 spec 键三级回退候选序：domain 专属键 → 遗留单键
@@ -7027,8 +7418,9 @@ func (d *Dispatcher) notify(parentID, subAgentID, summary string, filesModified 
 		Subject:       "子 Agent 完成: " + subAgentID,
 		Body:          body,
 		FilesModified: filesModified,
-		// B-09：机器可消费结果信封随 Payload 持久化（Mailbox Payload 即 JSONB）。
-		Payload: map[string]any{"agent_result": d.buildAgentResult(parentID, subAgentID, summary, filesModified)},
+		// B-09/B-03：机器可消费结果信封随 Payload 持久化（Mailbox Payload 即 JSONB）；
+		// 同一终态的一次性验收报告随 v2 信封落库（取不到时保留 legacy 语义）。
+		Payload: map[string]any{"agent_result": d.buildAgentResultWithReport(parentID, subAgentID, summary, filesModified, d.takeVerificationReport(subAgentID))},
 		// B-06 幂等键：同一实例同结果的重复终态通知只入箱一次（重试/崩溃重投
 		// 不得重复提醒父 Agent）。不同结果（复活返工）哈希不同，仍会送达。
 		IdempotencyKey: fmt.Sprintf("sub_agent_terminal:%s:%08x", subAgentID, fnvHash32(summary)),

@@ -92,17 +92,7 @@ func scoreAcceptance(history []agent.ReactMessage, acceptance []string, rec *par
 			continue // 存量纯字符串 / 纸面标准：机器不核
 		}
 		sc.total++
-		var ok bool
-		switch evidence {
-		case "command":
-			ok = agent.HasExecutableVerification(history)
-		case "screenshot":
-			ok, _ = visualEvidenceCheck(history, rec.scenes)
-		case "probe":
-			ok = agent.HasRuntimeProbeEvidence(history)
-		case "file":
-			ok = len(agent.FilesModifiedFromHistory(history)) > 0
-		}
+		ok := acceptanceItemPass(history, evidence, rec)
 		if ok {
 			sc.passed++
 			continue
@@ -114,6 +104,28 @@ func scoreAcceptance(history []agent.ReactMessage, acceptance []string, rec *par
 		}
 	}
 	return sc
+}
+
+// acceptanceItemPass 单条验收的机器证据判定（计分与 VerificationReport 共用，
+// 防两套口径漂移）。manual/legacy 恒 false——不机器核，由人审。
+func acceptanceItemPass(history []agent.ReactMessage, evidence string, rec *parentSpecRecord) bool {
+	switch evidence {
+	case "command":
+		return agent.HasExecutableVerification(history)
+	case "screenshot":
+		scenes := []string(nil)
+		if rec != nil {
+			scenes = rec.scenes
+		}
+		ok, _ := visualEvidenceCheck(history, scenes)
+		return ok
+	case "probe":
+		return agent.HasRuntimeProbeEvidence(history)
+	case "file":
+		return len(agent.FilesModifiedFromHistory(history)) > 0
+	default:
+		return false
+	}
 }
 
 // renderAcceptanceScore 渲染计分报告（【机器校验】段，meta 只读不自算）。

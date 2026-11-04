@@ -194,3 +194,61 @@ func TestSecurityProfileValidation(t *testing.T) {
 		t.Fatal("非法 security_profile 应被拒绝")
 	}
 }
+
+// TestAutoResumeDefaults B-11：默认 enforce + 2 次/1 次无进展；非法值回落 enforce。
+func TestAutoResumeDefaults(t *testing.T) {
+	c := &Config{}
+	if err := c.applyDefaults(); err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+	if c.Agent.AutoResumeMode != "enforce" || c.Agent.AutoResumeMaxPerTask != 2 || c.Agent.AutoResumeNoProgressLimit != 1 {
+		t.Fatalf("auto resume defaults mismatch: %+v", c.Agent)
+	}
+	for _, mode := range []string{"off", "shadow"} {
+		c = &Config{}
+		c.Agent.AutoResumeMode = mode
+		if err := c.applyDefaults(); err != nil {
+			t.Fatalf("defaults(%s): %v", mode, err)
+		}
+		if c.Agent.AutoResumeMode != mode {
+			t.Fatalf("mode %q normalized to %q", mode, c.Agent.AutoResumeMode)
+		}
+	}
+	c = &Config{}
+	c.Agent.AutoResumeMode = "bogus"
+	_ = c.applyDefaults()
+	if c.Agent.AutoResumeMode != "enforce" {
+		t.Fatalf("illegal mode should fallback enforce, got %q", c.Agent.AutoResumeMode)
+	}
+}
+
+// TestContextManifestModeDefaults U-02：默认 shadow，非法值回落 shadow，enforce 显式保留。
+func TestContextManifestModeDefaults(t *testing.T) {
+	c := &Config{}
+	if err := c.applyDefaults(); err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+	if c.Agent.ContextManifestMode != "shadow" {
+		t.Fatalf("context_manifest_mode default = %q, want shadow", c.Agent.ContextManifestMode)
+	}
+	for _, tc := range []struct{ in, want string }{
+		{"off", "off"}, {"enforce", "enforce"}, {"ENFORCE", "enforce"},
+	} {
+		c = &Config{}
+		c.Agent.ContextManifestMode = tc.in
+		if err := c.applyDefaults(); err != nil {
+			t.Fatalf("defaults(%s): %v", tc.in, err)
+		}
+		if c.Agent.ContextManifestMode != tc.want {
+			t.Fatalf("mode %q normalized to %q, want %q", tc.in, c.Agent.ContextManifestMode, tc.want)
+		}
+	}
+	c = &Config{}
+	c.Agent.ContextManifestMode = "bogus"
+	if err := c.applyDefaults(); err != nil {
+		t.Fatalf("defaults(bogus): %v", err)
+	}
+	if c.Agent.ContextManifestMode != "shadow" {
+		t.Fatalf("illegal mode should fallback shadow, got %q", c.Agent.ContextManifestMode)
+	}
+}

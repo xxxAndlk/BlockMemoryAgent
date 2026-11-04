@@ -60,16 +60,28 @@ const (
 
 // SubTask 看板上的一个子任务。
 type SubTask struct {
-	ID        string     `json:"id"`                   // 子任务唯一 ID，格式 <topicID>_t<n>（write_plan 可显式指定）
-	Title     string     `json:"title"`                // 子任务标题（由 MetaAgent 推断）
-	Domain    string     `json:"domain,omitempty"`     // 所属领域（write_plan 指定，派发依赖门按它匹配）
-	Assignee  string     `json:"assignee,omitempty"`   // 责任 Agent 实例 ID（domainAgent / assistant）
-	Status    TaskStatus `json:"status"`               // 当前状态
-	Result    string     `json:"result,omitempty"`     // 完成结果或失败/阻塞原因
-	DependsOn []string   `json:"depends_on,omitempty"` // 依赖的其他子任务 ID 列表
-	Acceptance []string  `json:"acceptance,omitempty"` // 验收标准（write_plan 指定，展示用）
-	CreatedAt time.Time  `json:"created_at"`           // 创建时间
-	UpdatedAt time.Time  `json:"updated_at"`           // 最近变更时间
+	ID         string     `json:"id"`                   // 子任务唯一 ID，格式 <topicID>_t<n>（write_plan 可显式指定）
+	Title      string     `json:"title"`                // 子任务标题（由 MetaAgent 推断）
+	Domain     string     `json:"domain,omitempty"`     // 所属领域（write_plan 指定，派发依赖门按它匹配）
+	Assignee   string     `json:"assignee,omitempty"`   // 责任 Agent 实例 ID（domainAgent / assistant）
+	AttemptID  string     `json:"attempt_id,omitempty"` // 精确派发 attempt（C-03）；旧 attempt 迟到结果被 fence 拒绝
+	Status     TaskStatus `json:"status"`               // 当前状态
+	Result     string     `json:"result,omitempty"`     // 完成结果或失败/阻塞原因
+	DependsOn  []string   `json:"depends_on,omitempty"` // 依赖的其他子任务 ID 列表
+	Acceptance []string   `json:"acceptance,omitempty"` // 验收标准（write_plan 指定，展示用）
+	// C-03 自动调度扩展（可选；未填=仅人工/legacy 派发）。
+	RoleID         string    `json:"role_id,omitempty"`
+	Task           string    `json:"task,omitempty"`
+	Responsibility string    `json:"responsibility,omitempty"`
+	Mode           string    `json:"mode,omitempty"`
+	VerifyKind     string    `json:"verify_kind,omitempty"`
+	Risk           string    `json:"risk,omitempty"`
+	MaxAttempts    int       `json:"max_attempts,omitempty"`
+	Integration    bool      `json:"integration,omitempty"`
+	ToolsHint      []string  `json:"tools_hint,omitempty"`
+	SkillsHint     []string  `json:"skills_hint,omitempty"`
+	CreatedAt      time.Time `json:"created_at"` // 创建时间
+	UpdatedAt      time.Time `json:"updated_at"` // 最近变更时间
 }
 
 // PlanTask 是 write_plan 工具入参的子任务项（TODO #22）。
@@ -79,6 +91,17 @@ type PlanTask struct {
 	Domain     string   `json:"domain"`     // 领域（派发依赖门按 domain 匹配）
 	DependsOn  []string `json:"depends_on"` // 依赖的子任务 ID 列表
 	Acceptance []string `json:"acceptance"` // 验收标准
+	// C-03 自动调度扩展：填 role_id + task 才进入 ReadyScheduler（默认仍只通知）。
+	RoleID         string   `json:"role_id,omitempty"`
+	Task           string   `json:"task,omitempty"`
+	Responsibility string   `json:"responsibility,omitempty"`
+	Mode           string   `json:"mode,omitempty"`
+	VerifyKind     string   `json:"verify_kind,omitempty"`
+	Risk           string   `json:"risk,omitempty"`
+	MaxAttempts    int      `json:"max_attempts,omitempty"`
+	Integration    bool     `json:"integration,omitempty"`
+	ToolsHint      []string `json:"tools_hint,omitempty"`
+	SkillsHint     []string `json:"skills_hint,omitempty"`
 }
 
 // TaskBoard 任务看板：单个 topic 的全局状态容器。
@@ -90,15 +113,19 @@ type PlanTask struct {
 type TaskBoard struct {
 	mu sync.RWMutex // 读写锁：读多写少场景下允许并发 Snapshot
 
-	TopicID     string              // 话题 ID（=会话 ID）
-	Goal        string              // 全局目标
-	Status      BoardStatus         // NEW / IN_PROGRESS / DONE / FAILED
-	Constraints map[string]string   // 全局约束（如"兼容旧版 API"）
-	Tasks       map[string]*SubTask // 子任务表，按 ID 索引
-	Order       []string            // 子任务展示顺序（创建序）
-	UpdatedAt   time.Time           // 看板最近变更时间
-	seq         atomic.Int64        // 原子计数器，生成唯一任务序号
-	persistFn   func(Snapshot)      // 持久化回调（Manager.WithStore 接线时注入）；nil=纯内存
+	TopicID     string // 话题 ID（=会话 ID）
+	Goal        string // 全局目标
+	PlanVersion int64  // 已接受计划的单调版本（C-03：运行中版本不可原地改写）
+	// planApproved 人工批准门（C-03）：write_plan 只落计划，不自动批准；
+	// 只有显式 ApprovePlan 后 ReadyScheduler 才能自动派发。
+	planApproved bool
+	Status       BoardStatus         // NEW / IN_PROGRESS / DONE / FAILED
+	Constraints  map[string]string   // 全局约束（如"兼容旧版 API"）
+	Tasks        map[string]*SubTask // 子任务表，按 ID 索引
+	Order        []string            // 子任务展示顺序（创建序）
+	UpdatedAt    time.Time           // 看板最近变更时间
+	seq          atomic.Int64        // 原子计数器，生成唯一任务序号
+	persistFn    func(Snapshot)      // 持久化回调（Manager.WithStore 接线时注入）；nil=纯内存
 }
 
 // NewTaskBoard 新建空看板。
@@ -269,25 +296,51 @@ func (b *TaskBoard) SetPlan(goal string, tasks []PlanTask) error {
 		}
 	}
 
-	// 落盘：已存在保留，新增追加。
+	// 落盘：已存在保留状态，但标题/领域/依赖/验收按新版本完整更新（C-03 重规划语义）；
+	// 运行中状态与既有结果不因标题修改而改写。每次接受计划单调递增 PlanVersion。
+	b.PlanVersion++
+	// 新版本计划必须重新人工批准，不能沿用旧批准。
+	b.planApproved = false
 	now := time.Now()
 	for _, t := range tasks {
 		id := strings.TrimSpace(t.ID)
 		if existing, ok := b.Tasks[id]; ok {
+			existing.Title = t.Title
 			existing.Domain = t.Domain
+			existing.DependsOn = append([]string{}, t.DependsOn...)
 			existing.Acceptance = t.Acceptance
+			existing.RoleID = t.RoleID
+			existing.Task = t.Task
+			existing.Responsibility = t.Responsibility
+			existing.Mode = t.Mode
+			existing.VerifyKind = t.VerifyKind
+			existing.Risk = t.Risk
+			existing.MaxAttempts = t.MaxAttempts
+			existing.Integration = t.Integration
+			existing.ToolsHint = append([]string{}, t.ToolsHint...)
+			existing.SkillsHint = append([]string{}, t.SkillsHint...)
 			existing.UpdatedAt = now
 			continue
 		}
 		b.Tasks[id] = &SubTask{
-			ID:         id,
-			Title:      t.Title,
-			Domain:     t.Domain,
-			Status:     TaskPending,
-			DependsOn:  append([]string{}, t.DependsOn...),
-			Acceptance: append([]string{}, t.Acceptance...),
-			CreatedAt:  now,
-			UpdatedAt:  now,
+			ID:             id,
+			Title:          t.Title,
+			Domain:         t.Domain,
+			Status:         TaskPending,
+			DependsOn:      append([]string{}, t.DependsOn...),
+			Acceptance:     append([]string{}, t.Acceptance...),
+			RoleID:         t.RoleID,
+			Task:           t.Task,
+			Responsibility: t.Responsibility,
+			Mode:           t.Mode,
+			VerifyKind:     t.VerifyKind,
+			Risk:           t.Risk,
+			MaxAttempts:    t.MaxAttempts,
+			Integration:    t.Integration,
+			ToolsHint:      append([]string{}, t.ToolsHint...),
+			SkillsHint:     append([]string{}, t.SkillsHint...),
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}
 		b.Order = append(b.Order, id)
 	}
@@ -296,6 +349,27 @@ func (b *TaskBoard) SetPlan(goal string, tasks []PlanTask) error {
 	b.mu.Unlock()
 	b.persist()
 	return nil
+}
+
+// PlanApproved 报告当前计划版本是否已人工批准。
+func (b *TaskBoard) PlanApproved() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.planApproved
+}
+
+// ApprovePlan 人工批准当前计划版本；无任务时拒绝。
+func (b *TaskBoard) ApprovePlan() bool {
+	b.mu.Lock()
+	if len(b.Tasks) == 0 {
+		b.mu.Unlock()
+		return false
+	}
+	b.planApproved = true
+	b.UpdatedAt = time.Now()
+	b.mu.Unlock()
+	b.persist()
+	return true
 }
 
 // FindByDomain 返回指定 domain 的子任务 ID（首个匹配）；未匹配返回空串。
@@ -332,13 +406,13 @@ func (b *TaskBoard) FindAllByDomain(domain string) []string {
 
 // TakeoverFrom 看板接力认领（TODO #73）：把旧 domain 的非 Done 子任务迁移到新 domain
 // 名下并留痕"曾失败，由 <newDomain> 接力完成"。异名续建时旧 FAILED 条目不再永久红
-//（实证 2026-08-25：domain-2 FAILED 永久红，异名"续建"完成后仍红，meta 只能散文解释；
+// （实证 2026-08-25：domain-2 FAILED 永久红，异名"续建"完成后仍红，meta 只能散文解释；
 // boardAssign/boardUpdate 按 domain 精确匹配，异名接管不命中旧条目）。
 // 返回迁移条数；旧 domain 无非 Done 条目返回 0（幂等，同名续建天然覆盖）。
 //
 // 迁移语义：条目 Domain 改为新名、Title 追加留痕注记、状态翻回 pending
-//（boardAssign 随派发置 in_progress、完成时整组 MarkDone 翻绿）；Done 条目不迁移
-//（已完成的留原 domain 归档）。执行者标记清空（assignee 由新派发覆写）。
+// （boardAssign 随派发置 in_progress、完成时整组 MarkDone 翻绿）；Done 条目不迁移
+// （已完成的留原 domain 归档）。执行者标记清空（assignee 由新派发覆写）。
 //
 // 并发安全：内部持写锁。
 func (b *TaskBoard) TakeoverFrom(oldDomain, newDomain string) int {
@@ -417,6 +491,61 @@ func (b *TaskBoard) Assign(taskID, assignee string) error {
 	t.Status = TaskInProgress // 分配后自动进入进行中
 	t.UpdatedAt = time.Now()  // 刷新任务更新时间
 	b.UpdatedAt = t.UpdatedAt // 同步看板更新时间
+	b.mu.Unlock()
+	b.persist()
+	return nil
+}
+
+// AssignBound 精确绑定派发（C-03）：只操作指定 task_id，并写入 attempt_id。
+// 已 Done 任务不翻回；已有不同 attempt 时返回 stale 错误（旧 attempt 不得覆盖新 attempt）。
+func (b *TaskBoard) AssignBound(taskID, attemptID, assignee string) error {
+	b.mu.Lock()
+	t, ok := b.Tasks[taskID]
+	if !ok {
+		b.mu.Unlock()
+		return errors.New("task not found")
+	}
+	if t.Status == TaskDone {
+		b.mu.Unlock()
+		return nil
+	}
+	if attemptID != "" && t.AttemptID != "" && t.AttemptID != attemptID {
+		b.mu.Unlock()
+		return fmt.Errorf("stale attempt: task %s bound to %s, got %s", taskID, t.AttemptID, attemptID)
+	}
+	if attemptID != "" {
+		t.AttemptID = attemptID
+	}
+	t.Assignee = assignee
+	t.Status = TaskInProgress
+	t.UpdatedAt = time.Now()
+	b.UpdatedAt = t.UpdatedAt
+	b.mu.Unlock()
+	b.persist()
+	return nil
+}
+
+// FinalizeBound 精确终态回写（C-03）：attempt 不匹配的迟到结果被拒绝，
+// 不改变看板状态；返回错误供调用方留痕。
+func (b *TaskBoard) FinalizeBound(taskID, attemptID string, status TaskStatus, result string) error {
+	b.mu.Lock()
+	t, ok := b.Tasks[taskID]
+	if !ok {
+		b.mu.Unlock()
+		return errors.New("task not found")
+	}
+	if attemptID != "" && t.AttemptID != "" && t.AttemptID != attemptID {
+		b.mu.Unlock()
+		return fmt.Errorf("stale attempt: task %s bound to %s, got %s", taskID, t.AttemptID, attemptID)
+	}
+	if attemptID != "" && t.AttemptID == "" {
+		t.AttemptID = attemptID
+	}
+	t.Status = status
+	t.Result = result
+	t.UpdatedAt = time.Now()
+	b.UpdatedAt = t.UpdatedAt
+	b.recomputeStatusLocked()
 	b.mu.Unlock()
 	b.persist()
 	return nil
@@ -565,13 +694,15 @@ func (b *TaskBoard) recomputeStatusLocked() {
 // 注入时必须只用 Snapshot()，禁止把 *TaskBoard 直接序列化，
 // 防止外部代码绕过锁修改内部状态。
 type Snapshot struct {
-	TopicID     string            `json:"topic_id"`    // 话题 ID
-	Goal        string            `json:"goal"`        // 全局目标
-	Status      BoardStatus       `json:"status"`      // 看板状态
-	Constraints map[string]string `json:"constraints"` // 全局约束快照
-	Tasks       []SubTask         `json:"tasks"`       // 子任务列表（按创建序）
-	UpdatedAt   time.Time         `json:"updated_at"`  // 快照时间
-	Seq         int64             `json:"seq"`         // 自动编号计数器（AddSubTask 的 _t<n> 后缀水位）
+	TopicID      string            `json:"topic_id"`      // 话题 ID
+	Goal         string            `json:"goal"`          // 全局目标
+	PlanVersion  int64             `json:"plan_version"`  // 已接受计划版本（C-03）
+	PlanApproved bool              `json:"plan_approved"` // 当前版本是否已人工批准
+	Status       BoardStatus       `json:"status"`        // 看板状态
+	Constraints  map[string]string `json:"constraints"`   // 全局约束快照
+	Tasks        []SubTask         `json:"tasks"`         // 子任务列表（按创建序）
+	UpdatedAt    time.Time         `json:"updated_at"`    // 快照时间
+	Seq          int64             `json:"seq"`           // 自动编号计数器（AddSubTask 的 _t<n> 后缀水位）
 }
 
 // Snapshot 返回看板视图。
@@ -600,22 +731,26 @@ func (b *TaskBoard) Snapshot() Snapshot {
 		}
 	}
 	return Snapshot{
-		TopicID:     b.TopicID,
-		Goal:        b.Goal,
-		Status:      b.Status,
-		Constraints: cs,
-		Tasks:       tasks,
-		UpdatedAt:   b.UpdatedAt,
-		Seq:         b.seq.Load(),
+		TopicID:      b.TopicID,
+		Goal:         b.Goal,
+		PlanVersion:  b.PlanVersion,
+		PlanApproved: b.planApproved,
+		Status:       b.Status,
+		Constraints:  cs,
+		Tasks:        tasks,
+		UpdatedAt:    b.UpdatedAt,
+		Seq:          b.seq.Load(),
 	}
 }
 
 // BoardFromSnapshot 从持久化快照重建看板（2026-09-28 P1：重启后依赖门状态恢复）。
 // seq 取快照水位与任务 ID 后缀（_t<n>）解析的最大值，防自动编号冲突
-//（write_plan 自定义 ID 无 _t 后缀，解析失败跳过即可）。
+// （write_plan 自定义 ID 无 _t 后缀，解析失败跳过即可）。
 func BoardFromSnapshot(s Snapshot) *TaskBoard {
 	b := NewTaskBoard(s.TopicID, s.Goal)
 	b.Status = s.Status
+	b.PlanVersion = s.PlanVersion
+	b.planApproved = s.PlanApproved
 	for k, v := range s.Constraints {
 		b.Constraints[k] = v
 	}
@@ -745,6 +880,17 @@ func NewManager() *Manager {
 	return &Manager{boards: make(map[string]*TaskBoard)}
 }
 
+// Sessions 返回当前已加载看板的会话 ID 列表（C-03 ReadyScheduler 兜底扫描用）。
+func (m *Manager) Sessions() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]string, 0, len(m.boards))
+	for id := range m.boards {
+		out = append(out, id)
+	}
+	return out
+}
+
 // WithStore 注入持久化（bootstrap 接 store.BoardStore 适配器）。重复注入后者覆盖。
 func (m *Manager) WithStore(s Store) *Manager {
 	m.mu.Lock()
@@ -822,7 +968,7 @@ func (m *Manager) GetRestored(topicID string) *TaskBoard {
 }
 
 // GetOrCreate 取或新建看板；内存 miss 且接了 store 时先从持久层恢复
-//（重启后依赖门/任务状态随之找回），恢复失败/无记录才新建。
+// （重启后依赖门/任务状态随之找回），恢复失败/无记录才新建。
 //
 // 参数：
 //   - topicID：话题 ID。

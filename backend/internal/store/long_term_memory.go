@@ -49,6 +49,8 @@ const (
 	MemoryOriginExplicitTool = "explicit_tool"
 	MemoryOriginEvolver      = "evolver"
 	MemoryOriginLegacyImport = "legacy_import"
+	// MemoryOriginTeamEvolver 团队经验候选（C-05）：来自 B-03 done 结果与验收报告。
+	MemoryOriginTeamEvolver = "team_evolver"
 )
 
 // 记忆条目的验证状态。
@@ -80,21 +82,26 @@ const (
 
 // MemoryItem 一条长期记忆条目。
 type MemoryItem struct {
-	ID            string    `json:"id"`
-	Owner         string    `json:"owner"`
-	Scope         string    `json:"scope"`
-	ProjectKey    string    `json:"project_key"`
-	MemoryKey     string    `json:"memory_key"`
-	Content       string    `json:"content"`
-	ContentHash   string    `json:"content_hash"`
-	Status        string    `json:"status"`
-	Origin        string    `json:"origin"`
-	Verification  string    `json:"verification"`
-	SourceSession string    `json:"source_session"`
-	SourceMessage string    `json:"source_message"`
-	Revision      int64     `json:"revision"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID            string `json:"id"`
+	Owner         string `json:"owner"`
+	Scope         string `json:"scope"`
+	ProjectKey    string `json:"project_key"`
+	MemoryKey     string `json:"memory_key"`
+	Content       string `json:"content"`
+	ContentHash   string `json:"content_hash"`
+	Status        string `json:"status"`
+	Origin        string `json:"origin"`
+	Verification  string `json:"verification"`
+	SourceSession string `json:"source_session"`
+	SourceMessage string `json:"source_message"`
+	// C-05 组织学习证据字段（旧行允许空值）。
+	RoleID                     string    `json:"role_id,omitempty"`
+	TaskType                   string    `json:"task_type,omitempty"`
+	SourceResultID             string    `json:"source_result_id,omitempty"`
+	SourceVerificationReportID string    `json:"source_verification_report_id,omitempty"`
+	Revision                   int64     `json:"revision"`
+	CreatedAt                  time.Time `json:"created_at"`
+	UpdatedAt                  time.Time `json:"updated_at"`
 }
 
 // MemoryEvent 一条生命周期审计事件（只追加）。
@@ -145,6 +152,12 @@ type MemoryRepo interface {
 	EventCount(ctx context.Context, owner string) (int64, error)
 }
 
+// AtomicPromoter C-05 原子晋升（旧 active 同 key → superseded，候选 → active，同事务）。
+// 任一实现失败不得留下“两个 active”或“全部不可用”的中间状态。
+type AtomicPromoter interface {
+	PromoteItem(ctx context.Context, owner, id string, expectedRevision int64, actor, reason string) (*MemoryItem, error)
+}
+
 // NormalizeProjectKey 把工作目录规范化为项目键（跨平台一致、大小写不敏感）。
 // 记忆不因会话工作目录字符串差一个斜杠/大小写就串项目（计划 §7.3）。
 func NormalizeProjectKey(workdir string) string {
@@ -180,13 +193,15 @@ func NewLongTermMemoryStore(db *sql.DB) *LongTermMemoryStore {
 func (s *LongTermMemoryStore) DB() *sql.DB { return s.db }
 
 const memoryItemColumns = `id, owner, scope, project_key, memory_key, content, content_hash,
-status, origin, verification, source_session, source_message, revision, created_at, updated_at`
+status, origin, verification, source_session, source_message, role_id, task_type,
+source_result_id, source_verification_report_id, revision, created_at, updated_at`
 
 func scanMemoryItem(sc interface{ Scan(...any) error }) (MemoryItem, error) {
 	var it MemoryItem
 	err := sc.Scan(&it.ID, &it.Owner, &it.Scope, &it.ProjectKey, &it.MemoryKey, &it.Content,
 		&it.ContentHash, &it.Status, &it.Origin, &it.Verification, &it.SourceSession,
-		&it.SourceMessage, &it.Revision, &it.CreatedAt, &it.UpdatedAt)
+		&it.SourceMessage, &it.RoleID, &it.TaskType, &it.SourceResultID,
+		&it.SourceVerificationReportID, &it.Revision, &it.CreatedAt, &it.UpdatedAt)
 	return it, err
 }
 
@@ -224,10 +239,11 @@ func (s *LongTermMemoryStore) InsertItem(ctx context.Context, item MemoryItem) (
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO long_term_memory_items (`+memoryItemColumns+`)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
 		item.ID, item.Owner, item.Scope, item.ProjectKey, item.MemoryKey, item.Content,
 		item.ContentHash, item.Status, item.Origin, item.Verification, item.SourceSession,
-		item.SourceMessage, item.Revision, item.CreatedAt, item.UpdatedAt)
+		item.SourceMessage, item.RoleID, item.TaskType, item.SourceResultID,
+		item.SourceVerificationReportID, item.Revision, item.CreatedAt, item.UpdatedAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "idx_long_term_memory_active_key") ||
 			strings.Contains(err.Error(), "duplicate key") {
@@ -371,6 +387,70 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit memory status transition: %w", err)
+	}
+	return &updated, nil
+}
+
+// PromoteItem 实现 AtomicPromoter（PG 事务版）。
+func (s *LongTermMemoryStore) PromoteItem(ctx context.Context, owner, id string, expectedRevision int64, actor, reason string) (*MemoryItem, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("long-term memory store not wired")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin promote: %w", err)
+	}
+	defer tx.Rollback()
+	row := tx.QueryRowContext(ctx,
+		`SELECT `+memoryItemColumns+` FROM long_term_memory_items WHERE owner=$1 AND id=$2 FOR UPDATE`, owner, id)
+	it, err := scanMemoryItem(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrMemoryItemNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load candidate: %w", err)
+	}
+	if it.Status != MemoryStatusCandidate {
+		return nil, fmt.Errorf("promote: item %s status=%s (want candidate)", id, it.Status)
+	}
+	if expectedRevision > 0 && it.Revision != expectedRevision {
+		return nil, ErrMemoryRevisionConflict
+	}
+	// 同 key 现有 active → superseded（与候选激活同事务）。
+	if _, err := tx.ExecContext(ctx, `
+UPDATE long_term_memory_items
+SET status=$4, revision=revision+1, updated_at=now()
+WHERE owner=$1 AND scope=$2 AND project_key=$3 AND memory_key=$5
+  AND status='active' AND id<>$6`,
+		owner, it.Scope, it.ProjectKey, MemoryStatusSuperseded, it.MemoryKey, id); err != nil {
+		return nil, fmt.Errorf("supersede active memory: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+UPDATE long_term_memory_items
+SET status=$3, revision=revision+1, updated_at=now()
+WHERE owner=$1 AND id=$2 AND revision=$4`,
+		owner, id, MemoryStatusActive, it.Revision)
+	if err != nil {
+		return nil, fmt.Errorf("activate candidate: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrMemoryRevisionConflict
+	}
+	row = tx.QueryRowContext(ctx,
+		`SELECT `+memoryItemColumns+` FROM long_term_memory_items WHERE owner=$1 AND id=$2`, owner, id)
+	updated, err := scanMemoryItem(row)
+	if err != nil {
+		return nil, fmt.Errorf("read promoted item: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO long_term_memory_events
+  (owner, memory_id, event_type, actor, reason, payload)
+VALUES ($1,$2,$3,$4,$5,'{}'::jsonb)`,
+		owner, id, "promote", actor, reason); err != nil {
+		return nil, fmt.Errorf("append promote event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit promote: %w", err)
 	}
 	return &updated, nil
 }
@@ -607,6 +687,50 @@ func (m *MemoryLongTermStore) TransitionStatus(_ context.Context, owner, id, sta
 		ev.Actor = MemoryActorSystem
 	}
 	m.events = append(m.events, ev)
+	return &it, nil
+}
+
+// PromoteItem 实现 AtomicPromoter（内存版）。
+func (m *MemoryLongTermStore) PromoteItem(_ context.Context, owner, id string, expectedRevision int64, actor, reason string) (*MemoryItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	it, ok := m.items[id]
+	if !ok || it.Owner != owner {
+		return nil, ErrMemoryItemNotFound
+	}
+	if it.Status != MemoryStatusCandidate {
+		return nil, fmt.Errorf("promote: item %s status=%s (want candidate)", id, it.Status)
+	}
+	if expectedRevision > 0 && it.Revision != expectedRevision {
+		return nil, ErrMemoryRevisionConflict
+	}
+	now := time.Now()
+	// 同 key 现有 active → superseded（同事务语义：内存锁内一次性完成）。
+	for oid, other := range m.items {
+		if oid == id || other.Owner != it.Owner || other.Scope != it.Scope ||
+			other.ProjectKey != it.ProjectKey || other.MemoryKey != it.MemoryKey ||
+			other.Status != MemoryStatusActive {
+			continue
+		}
+		other.Status = MemoryStatusSuperseded
+		other.Revision++
+		other.UpdatedAt = now
+		m.items[oid] = other
+		m.seq++
+		m.events = append(m.events, MemoryEvent{
+			ID: m.seq, Owner: other.Owner, MemoryID: oid, EventType: "superseded",
+			Actor: actor, Reason: "promote " + id, Payload: "{}", CreatedAt: now,
+		})
+	}
+	it.Status = MemoryStatusActive
+	it.Revision++
+	it.UpdatedAt = now
+	m.items[id] = it
+	m.seq++
+	m.events = append(m.events, MemoryEvent{
+		ID: m.seq, Owner: it.Owner, MemoryID: id, EventType: "promote",
+		Actor: actor, Reason: reason, Payload: "{}", CreatedAt: now,
+	})
 	return &it, nil
 }
 

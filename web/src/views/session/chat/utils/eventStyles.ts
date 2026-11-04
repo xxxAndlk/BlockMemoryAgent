@@ -21,6 +21,7 @@ export function kindTagType(kind?: string, type?: string): TagType {
   if (k === 'assistant_text') return 'primary'
   if (k === 'workflow_unit') return 'primary'
   if (k === 'context_injection') return 'info'
+  if (k === 'continuation') return 'warning'
   return 'info'
 }
 
@@ -43,6 +44,7 @@ export function kindIcon(kind?: string, type?: string): string {
   if (k === 'assistant_text') return 'ChatDotRound'
   if (k === 'workflow_unit') return 'SetUp'
   if (k === 'context_injection') return 'Tickets'
+  if (k === 'continuation') return 'RefreshRight'
   return 'InfoFilled'
 }
 
@@ -83,6 +85,7 @@ export function kindLabel(kind?: string, type?: string): string {
     enqueue: '入队',
     workflow_unit: '工作流单元',
     context_injection: '上下文注入',
+    continuation: '执行连续性',
   }
   return map[k] || k
 }
@@ -115,6 +118,7 @@ const kindPhrases: Record<string, string> = {
   enqueue: '任务已排队',
   workflow_unit: '量产流水线推进单元',
   context_injection: '记录本次上下文注入来源',
+  continuation: '系统自动续跑/熔断记录',
 }
 
 /** kind/type 对应的用户可读状态短语；无映射时回落 kindLabel。 */

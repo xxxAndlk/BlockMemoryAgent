@@ -15,6 +15,7 @@ package subagent
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,10 @@ const (
 // contextManifestRequiredCapRunes required 段硬预算：与派发 fork 硬顶同口径，
 // 超限即视为“必须缩小任务或改用工件引用”，不做截断后继续。
 const contextManifestRequiredCapRunes = spawnForkHardCapRunes
+
+// contextManifestOptionalCapRunes optional 段软预算：超限按优先级保序裁剪并留裁决审计。
+// 首批取值与项目偏好+召回的量级对齐（远小于 required 硬顶）。
+const contextManifestOptionalCapRunes = 16000
 
 // MemoryContextItem 项目/用户有效长期记忆的结构化条目（bootstrap 注入）。
 type MemoryContextItem struct {
@@ -119,20 +124,14 @@ func (d *Dispatcher) buildTaskContextManifest(sessionID, roleID string, sources 
 		Constraints:   decisions,
 		FrozenAt:      time.Now(),
 	}
-	var requiredRunes, optionalRunes int
+	var requiredRunes int
 	for _, e := range entries {
-		if e.Source == team.SourceUserInstruction {
+		if e.Source == team.SourceUserInstruction || e.Required {
 			m.Required = append(m.Required, e)
 			requiredRunes += entryRuneCount(e)
 			continue
 		}
-		if e.Required {
-			m.Required = append(m.Required, e)
-			requiredRunes += entryRuneCount(e)
-		} else {
-			m.Optional = append(m.Optional, e)
-			optionalRunes += entryRuneCount(e)
-		}
+		m.Optional = append(m.Optional, e)
 	}
 	// 项目/owner/水位从结构化记忆来源推导（无记忆时为空，不影响其它来源）。
 	for _, s := range sources {
@@ -146,6 +145,8 @@ func (d *Dispatcher) buildTaskContextManifest(sessionID, roleID string, sources 
 			m.SpecVersion = s.SourceRevision
 		}
 	}
+	m.Optional, decisions = trimOptionalBudget(m.Optional, contextManifestOptionalCapRunes, decisions)
+	m.Constraints = decisions
 	if requiredRunes > contextManifestRequiredCapRunes {
 		probs.RequiredOverflow = true
 	}
@@ -157,10 +158,55 @@ func (d *Dispatcher) buildTaskContextManifest(sessionID, roleID string, sources 
 			probs.IsolatedRequired = true
 		}
 	}
-	_ = optionalRunes
 	m.ContentHash = m.ComputeContentHash()
 	m.ManifestID = team.NewManifestID(m.ContentHash, m.FrozenAt)
 	return m, probs
+}
+
+// trimOptionalBudget 按来源优先级保序裁剪 optional，超预算条目记 dropped_budget。
+// 保留顺序与原注入顺序一致；只决定“若 enforce 将注入哪些”，shadow 不改模型输入。
+func trimOptionalBudget(entries []team.ContextEntry, capRunes int, decisions []team.ConstraintDecision) ([]team.ContextEntry, []team.ConstraintDecision) {
+	if capRunes <= 0 || len(entries) == 0 {
+		return entries, decisions
+	}
+	order := make([]int, len(entries))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		ea, eb := entries[order[a]], entries[order[b]]
+		ra, rb := team.SourceRank(ea.Source), team.SourceRank(eb.Source)
+		if ra != rb {
+			return ra < rb
+		}
+		ta, tb := team.TrustRank(ea.Trust), team.TrustRank(eb.Trust)
+		if ta != tb {
+			return ta < tb
+		}
+		return ea.EntryID < eb.EntryID
+	})
+	keep := make(map[int]bool, len(entries))
+	used := 0
+	for _, i := range order {
+		n := entryRuneCount(entries[i])
+		if used+n > capRunes {
+			decisions = append(decisions, team.ConstraintDecision{
+				ConflictKey: entries[i].ConflictKey, Scope: entries[i].Scope,
+				LoserIDs: []string{entries[i].EntryID}, Action: team.DecisionDropped,
+				Reason: "optional context over budget",
+			})
+			continue
+		}
+		keep[i] = true
+		used += n
+	}
+	out := make([]team.ContextEntry, 0, len(keep))
+	for i, e := range entries {
+		if keep[i] {
+			out = append(out, e)
+		}
+	}
+	return out, decisions
 }
 
 func entryRuneCount(e team.ContextEntry) int {
@@ -201,16 +247,23 @@ func arbitrateContextSources(sources []contextSource, probs *manifestProblems) (
 		firstByHash := map[string]int{}
 		for _, i := range idxs {
 			h := team.HashContextContent(sources[i].Content)
-			if j, ok := firstByHash[h]; ok {
-				keep[i] = false
-				decisions = append(decisions, team.ConstraintDecision{
-					ConflictKey: conflictKey, Scope: scope,
-					WinnerID: entryIDFor(sources[j]), LoserIDs: []string{entryIDFor(sources[i])},
-					Action: team.DecisionDuplicate, Reason: "identical content hash",
-				})
+			j, ok := firstByHash[h]
+			if !ok {
+				firstByHash[h] = i
 				continue
 			}
-			firstByHash[h] = i
+			// 同内容去重保留更高优先级副本，避免“先到者”误伤权威来源。
+			winner, loser := j, i
+			if sourceOutranks(sources[i], sources[j]) {
+				winner, loser = i, j
+				firstByHash[h] = i
+			}
+			keep[loser] = false
+			decisions = append(decisions, team.ConstraintDecision{
+				ConflictKey: conflictKey, Scope: scope,
+				WinnerID: entryIDFor(sources[winner]), LoserIDs: []string{entryIDFor(sources[loser])},
+				Action: team.DecisionDuplicate, Reason: "identical content hash",
+			})
 		}
 		// 收集仍然存活的条目。
 		var live []int
@@ -342,6 +395,60 @@ func materializeEntry(s contextSource) team.ContextEntry {
 	return e
 }
 
+// contextGuardFor 构造运行中 required 完整性检查（U-02）：
+// 每轮比对 agents_md 与 task_spec 的当前内容 hash 是否与冻结 Manifest 一致。
+// 不一致说明来源被撤回/覆盖/改写，返回原因即停止本 run。
+func (d *Dispatcher) contextGuardFor(ctx context.Context, parentID, domain string, manifest *team.TaskContextManifest) func(context.Context) string {
+	if manifest == nil {
+		return nil
+	}
+	expectedAgents := ""
+	specs := map[string]string{} // source_id -> content hash
+	for _, e := range manifest.Required {
+		switch e.Source {
+		case team.SourceAgentsMD:
+			expectedAgents = e.ContentHash
+		case team.SourceTaskSpec:
+			specs[e.SourceID] = e.ContentHash
+		}
+	}
+	if expectedAgents == "" && len(specs) == 0 {
+		return nil
+	}
+	base := ctx
+	return func(callCtx context.Context) string {
+		_ = callCtx
+		if expectedAgents != "" {
+			cur := d.projectBriefPrefix(base)
+			if cur == "" {
+				return "项目自述（AGENTS.md/CLAUDE.md）已失效或被删除"
+			}
+			if team.HashContextContent(cur) != expectedAgents {
+				return "项目自述（AGENTS.md/CLAUDE.md）内容已变化，required 约束不再与冻结 Manifest 一致"
+			}
+		}
+		if len(specs) > 0 {
+			_, sources := d.buildSharedPrefixStructured(base, parentID, domain)
+			cur := map[string]string{}
+			for _, s := range sources {
+				if s.Source == team.SourceTaskSpec {
+					cur[s.SourceID] = team.HashContextContent(s.Content)
+				}
+			}
+			for id, want := range specs {
+				got, ok := cur[id]
+				if !ok {
+					return "任务规范 " + id + " 已在运行中失效或被移除"
+				}
+				if got != want {
+					return "任务规范 " + id + " 内容已变化（新版本或撤回），required 约束不再有效"
+				}
+			}
+		}
+		return ""
+	}
+}
+
 // contextMemorySources 把有效记忆条目转成可选来源。
 func (d *Dispatcher) contextMemorySources(ctx context.Context) []contextSource {
 	if d == nil || d.memoryItemsFn == nil {
@@ -352,19 +459,15 @@ func (d *Dispatcher) contextMemorySources(ctx context.Context) []contextSource {
 	for _, it := range items {
 		source := team.SourceProjectMemory
 		scope := team.ScopeProject
-		trust := team.TrustVerified
-		rank := team.SourceRank(team.SourceProjectMemory)
 		if it.Scope == "user" {
 			source = team.SourceUserMemory
 			scope = team.ScopeUser
-			trust = team.TrustVerified
-			rank = team.SourceRank(team.SourceUserMemory)
 		}
+		// 未验证（evolver/旧导入）与块召回同档：只能作数据，不能覆盖人工/已验证事实。
+		trust := team.TrustVerified
 		if strings.TrimSpace(it.Verification) != "verified" {
 			trust = team.TrustUntrusted
-			rank = team.SourceRank(team.SourceBlockRecall)
 		}
-		_ = rank
 		out = append(out, contextSource{
 			Source: source, SourceID: it.ID, SourceRevision: strconv.FormatInt(it.Revision, 10),
 			ConflictKey: "memory:" + it.MemoryKey, Scope: scope, Trust: trust,

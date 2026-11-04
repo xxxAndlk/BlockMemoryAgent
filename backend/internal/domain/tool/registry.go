@@ -17,7 +17,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/config"  // config 包提供 Agent 阈值配置
 	"github.com/blockmemory/agent/backend/internal/project" // project 包提供 DomainClassifier 接口
 	"github.com/go-kratos/blades/tools"                     // blades tools 包提供对外暴露的工具定义
-	"github.com/google/jsonschema-go/jsonschema"           // jsonschema 提供动态工具入参 schema 类型
+	"github.com/google/jsonschema-go/jsonschema"            // jsonschema 提供动态工具入参 schema 类型
 )
 
 // maxConsecutiveValidationRejections 定义单个工具连续校验拒绝的最大次数（TODO #32）。
@@ -195,13 +195,13 @@ func NewBuiltinRegistry(workDir string, cfg *config.AgentConfig, progress Progre
 		exec.SetAgentConfig(cfg)
 	}
 	// 初始化 Registry 结构体，各 map 也一并初始化。
-		r := &Registry{
-			exec:              exec,
-			progress:          progress,
-			failures:          newFailureCounter(),
-			tools:             make(map[string]Tool),
-			aliases:           make(map[string]string),
-			externalAgents:    newExternalAgentRegistry(),
+	r := &Registry{
+		exec:              exec,
+		progress:          progress,
+		failures:          newFailureCounter(),
+		tools:             make(map[string]Tool),
+		aliases:           make(map[string]string),
+		externalAgents:    newExternalAgentRegistry(),
 		lastReadKey:       make(map[string]string),
 		sameReadCount:     make(map[string]int),
 		longFileScopes:    make(map[string]bool),
@@ -289,14 +289,14 @@ func (r *Registry) registerDefaults() {
 	// ShowArtifact：把可视成果（图/视频/音频/HTML/界面部件）展示到对话栏（媒体卡片）。
 	// 与 ReadMedia 互补：ReadMedia 喂模型，ShowArtifact 给用户看。
 	r.Register(&showArtifactTool{exec: r.exec})
-		// widget_save / widget_list / widget_push_data / widget_delete / widget_restore：
-		// Agent 自写界面部件（widgets/ 目录包）；管理面与数据推送回调经 SetWidgetManager
-		// 注入，未接线时调用返回未接线错误。restore 不带 name 列回收站条目。
-		r.Register(&widgetSaveTool{})
-		r.Register(&widgetListTool{})
-		r.Register(&widgetPushDataTool{})
-		r.Register(&widgetDeleteTool{})
-		r.Register(&widgetRestoreTool{})
+	// widget_save / widget_list / widget_push_data / widget_delete / widget_restore：
+	// Agent 自写界面部件（widgets/ 目录包）；管理面与数据推送回调经 SetWidgetManager
+	// 注入，未接线时调用返回未接线错误。restore 不带 name 列回收站条目。
+	r.Register(&widgetSaveTool{})
+	r.Register(&widgetListTool{})
+	r.Register(&widgetPushDataTool{})
+	r.Register(&widgetDeleteTool{})
+	r.Register(&widgetRestoreTool{})
 	// tool_forge：锻造自定义工具（脚本落盘 .bma/forged/，注册为 forged__<name>，
 	// 仅锻造者 scope 可见）；簿记走 RegisterForged（forgeScopes）。
 	r.Register(&forgeTool{exec: r.exec, registry: r})
@@ -1438,7 +1438,17 @@ func (r *Registry) Schema() []tools.Tool {
 			desc = d.Description()
 		}
 		if t, err := tools.NewFunc("call_sub_agent", desc, func(ctx context.Context, in callSubAgentInput) (string, error) {
-			res, _ := r.Dispatch(ctx, "call_sub_agent", map[string]any{"role_id": in.RoleID, "task": in.Task, "domain": in.Domain, "responsibility": in.Responsibility, "mode": in.Mode, "verify_kind": in.VerifyKind, "skills": in.Skills})
+			args := map[string]any{"role_id": in.RoleID, "task": in.Task, "domain": in.Domain, "responsibility": in.Responsibility, "mode": in.Mode, "verify_kind": in.VerifyKind, "skills": in.Skills}
+			if in.TaskID != "" {
+				args["task_id"] = in.TaskID
+			}
+			if in.AttemptID != "" {
+				args["attempt_id"] = in.AttemptID
+			}
+			if in.PlanVersion > 0 {
+				args["plan_version"] = in.PlanVersion
+			}
+			res, _ := r.Dispatch(ctx, "call_sub_agent", args)
 			b, _ := marshalNoHTMLEscape(res)
 			return string(b), nil
 		}); err == nil {

@@ -34,7 +34,7 @@ type Config struct {
 
 // BlockMemoryConfig 块记忆库（global_knowledge type=block_memory）治理配置。
 // 背景：任务沉淀只增不并会稀释【沉淀索引】槽并让无关条目进入会话上下文
-//（2026-10-13 实证），对齐经验技能库的 C 库存整理范式做 LLM 自清理。
+// （2026-10-13 实证），对齐经验技能库的 C 库存整理范式做 LLM 自清理。
 type BlockMemoryConfig struct {
 	// ConsolidateThreshold 激活块记忆数达到该值后每日自动整理（合并/归档），
 	// 默认 200；负数=关闭自动（0 取默认；手动触发不受限）。
@@ -279,6 +279,44 @@ type FeatureTogglesConfig struct {
 	// 完成回传汇成一条【整合纪要】单条送达父邮箱（防 N 子完成 N 次打扰父）。
 	// 默认 true；显式 false 退回逐条回传（逃生舱）。
 	BatchDigestEnabled *bool `yaml:"batch_digest_enabled"`
+	// AutoResumeMode 执行连续性自动续跑模式（B-11）：
+	//   off      系统触限保持旧人工“继续”链路；
+	//   shadow   只记录“本会恢复/为何阻断”，不改变行为；
+	//   enforce  对 context_threshold/iteration_limit 同 Agent ID 自动续跑（默认）。
+	AutoResumeMode string `yaml:"auto_resume_mode"`
+	// AutoResumeMaxPerTask 同一会话任务跨 root/domain/leaf 的累计自动续跑次数，
+	// 默认 2；续跑共享计数，不得按节点重置。
+	AutoResumeMaxPerTask int `yaml:"auto_resume_max_per_task"`
+	// AutoResumeNoProgressLimit 续跑后零可验证进展的最大容忍轮次，默认 1。
+	AutoResumeNoProgressLimit int `yaml:"auto_resume_no_progress_limit"`
+	// ResumeInterrupted 进程重启后是否自动恢复 interrupted 检查点；默认 false（先对账）。
+	ResumeInterrupted bool `yaml:"resume_interrupted"`
+	// SelfClaimEnabled C-06 看板自认领总开关；默认 false（未立项能力，显式开启）。
+	SelfClaimEnabled bool `yaml:"self_claim_enabled"`
+	// SelfClaimRoles 自认领允许的固定叶角色。
+	SelfClaimRoles []string `yaml:"self_claim_roles"`
+	// SelfClaimLeaseSec 认领租约（秒，默认 120）；SelfClaimHeartbeatSec 心跳间隔（默认 30）。
+	SelfClaimLeaseSec       int `yaml:"self_claim_lease_sec"`
+	SelfClaimHeartbeatSec   int `yaml:"self_claim_heartbeat_sec"`
+	SelfClaimWorkersPerRole int `yaml:"self_claim_workers_per_role"`
+	// AutoDispatchEnabled C-03 依赖就绪自动调度总开关；默认 false。
+	AutoDispatchEnabled bool `yaml:"auto_dispatch_enabled"`
+	// AutoDispatchRescanSec 兜底扫描间隔（秒），默认 5；零 LLM 调用。
+	AutoDispatchRescanSec int `yaml:"auto_dispatch_rescan_sec"`
+	// AutoDispatchMaxAttempts 单任务自动派发尝试上限，默认 1（不做盲目重试）。
+	AutoDispatchMaxAttempts int `yaml:"auto_dispatch_max_attempts"`
+	// AutoDispatchFailurePolicy block_dependents（默认）|wait_human。
+	AutoDispatchFailurePolicy string `yaml:"auto_dispatch_failure_policy"`
+	// AutoDispatchRoles 允许自动派发的固定叶角色，默认 code_assistant/test_assistant/scout。
+	AutoDispatchRoles []string `yaml:"auto_dispatch_roles"`
+	// VerificationPolicyMode 验收强制模式（B-03）：off|shadow|enforce。
+	// 默认 shadow（只记录报告）；enforce 仅对 C-03 绑定任务（task_id）阻断未通过报告的 done。
+	VerificationPolicyMode string `yaml:"verification_policy_mode"`
+	// ContextManifestMode 上下文清单模式（U-02）：
+	//   off      不构建清单，只保留 v1 五路字符审计；
+	//   shadow   构建并审计 v2 清单，模型输入不变（默认，对拍期）；
+	//   enforce  required 超预算/未决/被 fork 丢弃时拒派。
+	ContextManifestMode string `yaml:"context_manifest_mode"`
 
 	// VerifyLLMOnStartup 启动期是否对每个模型角色发起一次最小化真实调用做连通性探测。
 	// 默认 false（2026-10-28 起）：模型是可替换运行时依赖，单个模型不可用不阻断启动，
@@ -502,6 +540,16 @@ type MemoryConfig struct {
 	//   enforce 允许写入，且必须过确定性准入门（不是仅靠 LLM 自评）。
 	// 空值按配置层默认 shadow 填充；非法值回落 shadow 并告警。
 	WriteMode string `yaml:"write_mode"`
+	// PromotionMode 团队经验候选晋升模式（C-05）：off|shadow|enforce，默认 shadow。
+	PromotionMode string `yaml:"promotion_mode"`
+	// AutoActivate 是否允许 actor=auto 自动晋升；默认 false（项目作用域人工晋升）。
+	AutoActivate bool `yaml:"auto_activate"`
+	// MinEvalTasks/MinEvalRepeats 同预算 shadow eval 的最低任务数与重复次数（默认 10/2）。
+	MinEvalTasks   int `yaml:"min_eval_tasks"`
+	MinEvalRepeats int `yaml:"min_eval_repeats"`
+	// EvalTasks 同预算评估任务集（真实轻量模型调用）；空=不接线 eval runner，
+	// 候选只能人工验证，不允许自动晋升。
+	EvalTasks []string `yaml:"eval_tasks"`
 	// RetractionMode 用户撤回的执行模式（2026-10-24 长期记忆撤回与污染修复）：
 	//   enforce（默认）用户明确撤回/替换/隔离**当轮**执行，与 WriteMode 解耦——
 	//           write_mode=off/shadow 只禁止新候选进入现行记忆，不得停掉撤回；
@@ -824,6 +872,22 @@ func (c *Config) applyMemoryDefaults() {
 		log.Printf("[config] memory.retraction_mode=%q 非法（可选 off|enforce），回落 enforce", c.Memory.RetractionMode)
 		c.Memory.RetractionMode = "enforce"
 	}
+	// 团队经验晋升（C-05）：默认 shadow（只记录候选/晋升意图，不激活）。
+	switch strings.ToLower(strings.TrimSpace(c.Memory.PromotionMode)) {
+	case "off", "shadow", "enforce":
+		c.Memory.PromotionMode = strings.ToLower(strings.TrimSpace(c.Memory.PromotionMode))
+	case "":
+		c.Memory.PromotionMode = "shadow"
+	default:
+		log.Printf("[config] memory.promotion_mode=%q 非法（可选 off|shadow|enforce），回落 shadow", c.Memory.PromotionMode)
+		c.Memory.PromotionMode = "shadow"
+	}
+	if c.Memory.MinEvalTasks <= 0 {
+		c.Memory.MinEvalTasks = 10
+	}
+	if c.Memory.MinEvalRepeats <= 0 {
+		c.Memory.MinEvalRepeats = 2
+	}
 }
 
 func (c *Config) applyAgentDefaults() error {
@@ -983,6 +1047,71 @@ func (c *Config) applyFeatureTogglesDefaults() {
 	if c.Agent.BatchDigestEnabled == nil {
 		t := true
 		c.Agent.BatchDigestEnabled = &t
+	}
+	// 自动续跑（B-11）：对明确的系统触限默认 enforce；升级/排障可切 shadow/off。
+	switch strings.ToLower(strings.TrimSpace(c.Agent.AutoResumeMode)) {
+	case "", "enforce":
+		c.Agent.AutoResumeMode = "enforce"
+	case "off", "shadow":
+		c.Agent.AutoResumeMode = strings.ToLower(strings.TrimSpace(c.Agent.AutoResumeMode))
+	default:
+		log.Printf("[config] illegal auto_resume_mode %q, fallback enforce", c.Agent.AutoResumeMode)
+		c.Agent.AutoResumeMode = "enforce"
+	}
+	if c.Agent.AutoResumeMaxPerTask <= 0 {
+		c.Agent.AutoResumeMaxPerTask = 2
+	}
+	if c.Agent.AutoResumeNoProgressLimit <= 0 {
+		c.Agent.AutoResumeNoProgressLimit = 1
+	}
+	// 自认领（C-06）：默认关闭；开启后才允许 self_claim 计划与 Worker 拉取。
+	if len(c.Agent.SelfClaimRoles) == 0 {
+		c.Agent.SelfClaimRoles = []string{"code_assistant", "test_assistant", "scout"}
+	}
+	if c.Agent.SelfClaimLeaseSec <= 0 {
+		c.Agent.SelfClaimLeaseSec = 120
+	}
+	if c.Agent.SelfClaimHeartbeatSec <= 0 {
+		c.Agent.SelfClaimHeartbeatSec = 30
+	}
+	if c.Agent.SelfClaimWorkersPerRole <= 0 {
+		c.Agent.SelfClaimWorkersPerRole = 1
+	}
+	// 自动调度（C-03）：默认关闭；开启后才消费显式 role_id+task 的计划任务。
+	if c.Agent.AutoDispatchRescanSec <= 0 {
+		c.Agent.AutoDispatchRescanSec = 5
+	}
+	if c.Agent.AutoDispatchMaxAttempts <= 0 {
+		c.Agent.AutoDispatchMaxAttempts = 1
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Agent.AutoDispatchFailurePolicy)) {
+	case "wait_human":
+		c.Agent.AutoDispatchFailurePolicy = "wait_human"
+	default:
+		c.Agent.AutoDispatchFailurePolicy = "block_dependents"
+	}
+	if len(c.Agent.AutoDispatchRoles) == 0 {
+		c.Agent.AutoDispatchRoles = []string{"code_assistant", "test_assistant", "scout"}
+	}
+	// 验收强制默认 shadow（B-03）：只记录报告；enforce 仅影响 C-03 绑定任务。
+	switch strings.ToLower(strings.TrimSpace(c.Agent.VerificationPolicyMode)) {
+	case "off", "shadow", "enforce":
+		c.Agent.VerificationPolicyMode = strings.ToLower(strings.TrimSpace(c.Agent.VerificationPolicyMode))
+	default:
+		if c.Agent.VerificationPolicyMode != "" {
+			log.Printf("[config] illegal verification_policy_mode %q, fallback shadow", c.Agent.VerificationPolicyMode)
+		}
+		c.Agent.VerificationPolicyMode = "shadow"
+	}
+	// 上下文清单默认 shadow（U-02）：先对拍审计，模型输入不变；enforce 需显式开启。
+	switch strings.ToLower(strings.TrimSpace(c.Agent.ContextManifestMode)) {
+	case "", "shadow":
+		c.Agent.ContextManifestMode = "shadow"
+	case "off", "enforce":
+		c.Agent.ContextManifestMode = strings.ToLower(strings.TrimSpace(c.Agent.ContextManifestMode))
+	default:
+		log.Printf("[config] illegal context_manifest_mode %q, fallback shadow", c.Agent.ContextManifestMode)
+		c.Agent.ContextManifestMode = "shadow"
 	}
 	// 决策层（TODO #23）：影子默认开（影子先行是本层立身原则）；超时默认 5s
 	// （provider 故障/超时 fail-open 回退现状行为，不阻塞链路）。
@@ -1207,7 +1336,7 @@ func resolveEnvWithDefault(s string) string {
 }
 
 // ResolveEnvWithDefault 将形如 ${VAR} 或 ${VAR:"default"} 的字符串解析为实际值
-//（resolveEnvWithDefault 的导出版，语义与 plugins.yaml 密钥纪律完全同款）。
+// （resolveEnvWithDefault 的导出版，语义与 plugins.yaml 密钥纪律完全同款）。
 // 供运行期按同款纪律做插值的包复用（如 widgets 连接器 api headers：清单落盘原文，
 // 执行请求时才展开密钥，密钥不进 widget.json）。
 func ResolveEnvWithDefault(s string) string { return resolveEnvWithDefault(s) }

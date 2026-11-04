@@ -184,6 +184,12 @@ type (
 		// 后并入子持有集，越界项忽略并随派发结果回告。子 Agent 系统提示注入其【可用技能】
 		// 元数据块，正文经 load_skill 按需获取。
 		Skills []string `json:"skills" description:"下放给子 Agent 的技能名列表（可选，来自你的【可用技能】块）：子 Agent 将获得对应技能的元数据与 load_skill 加载权限。省略=不下放技能（子 Agent 仍有其角色固定技能）。"`
+		// TaskID 精确绑定已批准计划的单个任务（C-03）：省略时保持按领域整组语义。
+		TaskID string `json:"task_id" description:"（可选）已批准计划中的任务 ID：填写后看板只分配/回写该任务，不按 domain 整组联动；旧 attempt 的迟到结果会被拒绝。普通 domain 派发省略。"`
+		// AttemptID 绑定 attempt（省略按 task_id 自动生成）。
+		AttemptID string `json:"attempt_id" description:"（可选）精确任务绑定的 attempt ID；省略时按 task_id 自动生成。仅在填了 task_id 时有效。"`
+		// PlanVersion 计划版本；与看板当前版本不一致时拒派。
+		PlanVersion int64 `json:"plan_version" description:"（可选）绑定计划版本；与看板当前版本不一致时拒派，防按旧计划执行。仅在填了 task_id 时有效。"`
 	}
 )
 
@@ -327,7 +333,7 @@ const expectedMtimeTolerance = 2 * time.Second
 
 // checkExpectedMtime 校验可选乐观锁参数 expected_mtime（TODO #16 T16 并发写护栏）。
 // 模型把 ReadFile 分页头里的 mtime=... 原样传回；写入前 stat 比对，不符拒收本次写入
-//（工具结果级错误，不中止 ReAct 循环），列出当前 mtime 引导重读。expected 为空时
+// （工具结果级错误，不中止 ReAct 循环），列出当前 mtime 引导重读。expected 为空时
 // 不校验（现状 advisory 行为不变）。要求校验但文件已不存在同样拒收（可能被并发删除）。
 func checkExpectedMtime(absPath, expected string) error {
 	if expected == "" {

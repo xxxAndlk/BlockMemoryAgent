@@ -41,6 +41,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/server"
 	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/internal/store"
+	"github.com/blockmemory/agent/backend/internal/team"
 	"github.com/blockmemory/agent/backend/internal/userprofile"
 	"github.com/blockmemory/agent/backend/internal/widgets"
 	"github.com/blockmemory/agent/backend/internal/workflow"
@@ -74,27 +75,33 @@ type ConfigPaths struct {
 // 在 ReAct 重构过程中，旧的 graph 相关字段已被移除；Runtime 字段保留，
 // 用于兼容 soul/skills/watchdog 等 API。
 type App struct {
-	Agent            agent.Agent               // ReAct Agent 服务，负责会话执行逻辑
-	Server           *server.SessionManager    // HTTP 会话管理器，处理 /api/sessions/* 请求
-	DAGHandler       *server.DAGHandler        // DAG HTTP 处理器
-	WorkflowEngine   *workflow.Engine          // 工作流量产引擎（2026-10-16）
-	WorkflowHandler  *server.WorkflowHandler   // 工作流 HTTP 处理器（/api/workflow/*）
-	FlowEngine       *flow.Engine              // 可视化编排引擎（2026-10-18）
-	FlowHandler      *server.FlowHandler       // 可视化编排 HTTP 处理器（/api/flow/*）
-	GoalManager      *goal.Manager             // 指令模式管理器（goal 目标 / loop 循环，2026-10-18）
-	DirectiveHandler *server.DirectiveHandler  // 指令模式 HTTP 处理器（/api/sessions/:id/directive）
-	Runtime          *runtime.Runtime          // 运行时聚合器（人格、skill、watchdog 等）
-	Postgres         *store.PostgresStore      // PostgreSQL 持久化存储
-	Redis            *store.RedisStore         // Redis 缓存/消息存储
-	ModelFactory     *model.ModelFactory       // 模型工厂，管理各角色模型连接
-	Embedder         embed.Embedder            // 向量嵌入器，用于记忆检索
-	Config           *config.Config            // 应用运行时配置
-	RoleConfig       *pkgconfig.RoleConfigFile // 角色配置对象
-	DAGScheduler     *dag.Scheduler            // DAG 调度器；DAG 关闭时为 nil
-	Logger           *logger.Logger            // 结构化会话日志器
-	Plugins          *plugins.Manager          // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
-	Widgets          *widgets.Manager          // 界面部件管理器（widgets/ 目录包，Widget 机制）
-	WorkDir          string                    // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
+	Agent               agent.Agent                   // ReAct Agent 服务，负责会话执行逻辑
+	Server              *server.SessionManager        // HTTP 会话管理器，处理 /api/sessions/* 请求
+	DAGHandler          *server.DAGHandler            // DAG HTTP 处理器
+	WorkflowEngine      *workflow.Engine              // 工作流量产引擎（2026-10-16）
+	WorkflowHandler     *server.WorkflowHandler       // 工作流 HTTP 处理器（/api/workflow/*）
+	FlowEngine          *flow.Engine                  // 可视化编排引擎（2026-10-18）
+	FlowHandler         *server.FlowHandler           // 可视化编排 HTTP 处理器（/api/flow/*）
+	GoalManager         *goal.Manager                 // 指令模式管理器（goal 目标 / loop 循环，2026-10-18）
+	DirectiveHandler    *server.DirectiveHandler      // 指令模式 HTTP 处理器（/api/sessions/:id/directive）
+	Runtime             *runtime.Runtime              // 运行时聚合器（人格、skill、watchdog 等）
+	Postgres            *store.PostgresStore          // PostgreSQL 持久化存储
+	Redis               *store.RedisStore             // Redis 缓存/消息存储
+	ModelFactory        *model.ModelFactory           // 模型工厂，管理各角色模型连接
+	Embedder            embed.Embedder                // 向量嵌入器，用于记忆检索
+	Config              *config.Config                // 应用运行时配置
+	RoleConfig          *pkgconfig.RoleConfigFile     // 角色配置对象
+	DAGScheduler        *dag.Scheduler                // DAG 调度器；DAG 关闭时为 nil
+	AutoDispatch        *team.ReadyScheduler          // C-03 依赖就绪自动调度；关闭时为 nil
+	AttemptStore        team.AttemptStore             // C-03 派发 attempt 存储（关闭时也为 nil）
+	SelfClaim           *team.ClaimService            // C-06 自认领服务（默认关闭）
+	SelfClaimStore      team.ClaimStore               // C-06 三表存储
+	SelfClaimSupervisor *team.WorkerSupervisor        // C-06 Worker 控制面
+	Promotion           *agent.MemoryPromotionService // C-05 团队经验候选/晋升（默认 shadow）
+	Logger              *logger.Logger                // 结构化会话日志器
+	Plugins             *plugins.Manager              // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
+	Widgets             *widgets.Manager              // 界面部件管理器（widgets/ 目录包，Widget 机制）
+	WorkDir             string                        // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
 	// SkillsDir 经验技能目录（config/skills_learned/，与 evolver 落库同口径）：
 	// DELETE /api/skills/learned/:name 删文件前做目录内安全校验用。
 	SkillsDir string
@@ -563,6 +570,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// AGENTS.md/CLAUDE.md 项目自述注入上限（TODO 第10项⑦）：派发前缀首位注入【项目自述】段；
 	// 缺失零开销，<=0 关闭。
 	subAgentDispatcher.WithAgentsMDMaxRunes(cfg.Agent.AgentsMDMaxRunes)
+	// 上下文清单模式（U-02）：默认 shadow 只审计；enforce 拒派 required 缺失。
+	subAgentDispatcher.WithContextManifestMode(cfg.Agent.ContextManifestMode)
+	// 执行连续性（B-11）：系统触限同 ID 自动续跑 + 任务级熔断。
+	subAgentDispatcher.WithAutoResume(cfg.Agent.AutoResumeMode, cfg.Agent.AutoResumeMaxPerTask, cfg.Agent.AutoResumeNoProgressLimit)
+	// 验收强制模式（B-03）：默认 shadow；enforce 只阻断 C-03 绑定任务。
+	subAgentDispatcher.WithVerificationPolicyMode(cfg.Agent.VerificationPolicyMode)
 	// worktree 隔离派发开关（TODO 第9项⑤/#10项⑤）：允许 call_sub_agent worktree=true
 	// 派发到 git worktree 副本（主目录零写入，patch 交付经 merge_worktree 合并门）。
 	if cfg.Agent.WorktreeEnabled != nil {
@@ -834,6 +847,11 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 会话累计 token 预算（B-04/B-10）：ReactService 在 token_usage 事件累加，
 	// Dispatcher 派发前查闸；0=关闭。
 	agentSvc.SetTeamTokenBudget(cfg.Agent.TeamTokenBudget)
+	// 主 Agent 执行连续性（B-11）：自身触限时系统自动续跑（子 Agent 由 Dispatcher 同配置驱动）。
+	agentSvc.SetAutoResume(cfg.Agent.AutoResumeMode, cfg.Agent.AutoResumeMaxPerTask, cfg.Agent.AutoResumeNoProgressLimit)
+	agentSvc.SetAutoResumeBudget(subAgentDispatcher.TryConsumeAutoResume)
+	agentSvc.SetAutoResumeDeadline(subAgentDispatcher.ContinuationDeadline)
+	agentSvc.SetAutoResumeSeedDeadline(subAgentDispatcher.SetContinuationDeadline)
 	subAgentDispatcher.WithTeamBudgetCheck(agentSvc.TeamBudgetExceeded)
 	// 默认执行档位（TODO #14 三档全手动）：config agent.default_gear 注入（现为 daily），同上。
 	if err := agentSvc.SetDefaultGear(cfg.Agent.DefaultGear); err != nil {
@@ -953,6 +971,24 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			memoryLifecycle.SetMatcher(mm)
 		}
 		agentSvc.SetMemoryLifecycle(memoryLifecycle)
+		// U-02：把有效长期记忆以结构化条目提供给 Dispatcher 构建 TaskContextManifest。
+		// 与 EffectiveBlock 同源（只读 active 视图），不再让审计层解析渲染后的 Markdown。
+		subAgentDispatcher.WithMemoryContextItems(func(ctx context.Context) []subagent.MemoryContextItem {
+			if memoryLifecycle == nil || !memoryLifecycle.Enabled() {
+				return nil
+			}
+			pk := store.NormalizeProjectKey(tool.WorkDirFromContext(ctx))
+			items := memoryLifecycle.EffectiveItems(ctx, "", pk)
+			out := make([]subagent.MemoryContextItem, 0, len(items))
+			for _, it := range items {
+				out = append(out, subagent.MemoryContextItem{
+					ID: it.ID, Owner: it.Owner, Scope: it.Scope, ProjectKey: it.ProjectKey,
+					MemoryKey: it.MemoryKey, Content: it.Content, ContentHash: it.ContentHash,
+					Origin: it.Origin, Verification: it.Verification, Revision: it.Revision,
+				})
+			}
+			return out
+		})
 		if n, err := memoryLifecycle.QuarantineLegacyUnverified(ctx, ""); err != nil {
 			log.Printf("[bootstrap] quarantine legacy memory completed with errors: %v", err)
 		} else if n > 0 {
@@ -1554,6 +1590,156 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 轻量模型整理；审计写 evolution_log（复用技能库的审计表写入器）。
 	memCons := newMemoryConsolidator(pgStore.Knowledge, pgStore.LearnedSkills, modelFactory, cfg.BlockMemory.ConsolidateThreshold)
 
+	// 第十九步附：C-03 依赖就绪自动调度（默认关闭）。
+	var autoDispatcher *team.ReadyScheduler
+	var autoDispatchCancel context.CancelFunc
+	var autoAttemptStore team.AttemptStore
+	if cfg.Agent.AutoDispatchEnabled {
+		// 方案硬要求：开启自动调度时 Manifest 与验收策略必须 enforce，否则 fail-fast。
+		if cfg.Agent.ContextManifestMode != "enforce" || cfg.Agent.VerificationPolicyMode != "enforce" {
+			connectorSchedCancel()
+			return nil, fmt.Errorf("auto_dispatch requires context_manifest_mode=enforce and verification_policy_mode=enforce (got %q/%q)",
+				cfg.Agent.ContextManifestMode, cfg.Agent.VerificationPolicyMode)
+		}
+		// 持久防重必须真库：建表失败直接拒启，不能退回内存假装持久。
+		if pgStore == nil || pgStore.DB() == nil {
+			connectorSchedCancel()
+			return nil, fmt.Errorf("auto_dispatch requires PostgreSQL for durable attempt fencing")
+		}
+		if err := store.EnsureDispatchAttemptsSchema(pgStore.DB()); err != nil {
+			connectorSchedCancel()
+			return nil, fmt.Errorf("auto dispatch schema: %w", err)
+		}
+		var attStore team.AttemptStore = store.NewPostgresAttemptStore(pgStore.DB())
+		autoAttemptStore = attStore
+		subAgentDispatcher.WithAutoDispatchRoles(cfg.Agent.AutoDispatchRoles)
+		subAgentDispatcher.WithAttemptFinisher(func(ctx context.Context, attemptID, status, resultID, errText string) {
+			if err := autoAttemptStore.MarkTerminal(ctx, attemptID, status, resultID, errText); err != nil {
+				log.Printf("[bootstrap] mark attempt terminal failed: %s err=%v", attemptID, err)
+			}
+		})
+		// B-11 跨进程：先把上次进程的 reserved/running 标 interrupted。
+		// 默认不自动重放；resume_interrupted=true 时由调度器建新 attempt_no。
+		if n, err := attStore.MarkInterrupted(context.Background()); err != nil {
+			log.Printf("[bootstrap] mark interrupted attempts failed (non-fatal): %v", err)
+		} else if n > 0 {
+			log.Printf("[bootstrap] marked %d dispatch attempt(s) interrupted (resume_interrupted=%v)", n, cfg.Agent.ResumeInterrupted)
+		}
+		autoDispatcher = team.NewReadyScheduler(rt.Boards.GetRestored, rt.Boards.Sessions, attStore, subAgentDispatcher, cfg.Agent.AutoDispatchRoles)
+		autoDispatcher.Rescan = time.Duration(cfg.Agent.AutoDispatchRescanSec) * time.Second
+		autoDispatcher.FailurePolicy = cfg.Agent.AutoDispatchFailurePolicy
+		autoDispatcher.ResumeInterrupted = cfg.Agent.ResumeInterrupted
+		autoDispatcher.MaxAttempts = cfg.Agent.AutoDispatchMaxAttempts
+		autoDispatcher.Context = func(sid string) context.Context {
+			c := tool.WithSessionID(agent.WithAgentID(context.Background(), sid), sid)
+			return tool.WithWorkDir(c, workDir)
+		}
+		subAgentDispatcher.WithReadyTrigger(func(sid string) {
+			if sid != "" {
+				_ = autoDispatcher.Reconcile(context.Background(), sid)
+			}
+		})
+		schedCtx, cancel := context.WithCancel(context.Background())
+		autoDispatchCancel = cancel
+		// 启动恢复：先对账恢复的看板，再开放定时扫描。
+		go func() {
+			for _, sid := range rt.Boards.Sessions() {
+				if err := autoDispatcher.Reconcile(schedCtx, sid); err != nil {
+					log.Printf("[bootstrap] startup reconcile %s failed: %v", sid, err)
+				}
+			}
+		}()
+		autoDispatcher.Start(schedCtx)
+		log.Printf("[bootstrap] auto dispatch enabled: roles=%v rescan=%ds max_attempts=%d", cfg.Agent.AutoDispatchRoles, cfg.Agent.AutoDispatchRescanSec, cfg.Agent.AutoDispatchMaxAttempts)
+	}
+
+	// 第十九步附一：C-06 自认领（默认关闭）。
+	var selfClaimSvc *team.ClaimService
+	var selfClaimStore team.ClaimStore
+	var selfClaimSup *team.WorkerSupervisor
+	var selfClaimCancel context.CancelFunc
+	if cfg.Agent.SelfClaimEnabled {
+		if pgStore != nil && pgStore.DB() != nil {
+			if err := store.EnsureTeamTaskSchema(context.Background(), pgStore.DB()); err != nil {
+				log.Printf("[bootstrap] self claim schema failed (fallback memory): %v", err)
+				selfClaimStore = team.NewMemoryClaimStore()
+			} else {
+				selfClaimStore = store.NewTeamTaskStore(pgStore.DB())
+			}
+		} else {
+			selfClaimStore = team.NewMemoryClaimStore()
+		}
+		allowed := map[string]bool{}
+		for _, r := range cfg.Agent.SelfClaimRoles {
+			allowed[strings.TrimSpace(r)] = true
+		}
+		selfClaimSvc = &team.ClaimService{Store: selfClaimStore, AllowedRoles: allowed}
+		subAgentDispatcher.WithAutoDispatchRoles(cfg.Agent.SelfClaimRoles)
+		supCtx, cancel := context.WithCancel(context.Background())
+		selfClaimCancel = cancel
+		selfClaimSup = team.NewWorkerSupervisor(selfClaimSvc, subAgentDispatcher,
+			func() []string {
+				sids, err := selfClaimStore.ListSessions(context.Background())
+				if err != nil {
+					log.Printf("[bootstrap] self claim list sessions: %v", err)
+					return nil
+				}
+				return sids
+			}, cfg.Agent.SelfClaimRoles)
+		selfClaimSup.WorkersPerRole = cfg.Agent.SelfClaimWorkersPerRole
+		selfClaimSup.Lease = time.Duration(cfg.Agent.SelfClaimLeaseSec) * time.Second
+		selfClaimSup.HeartbeatInterval = time.Duration(cfg.Agent.SelfClaimHeartbeatSec) * time.Second
+		selfClaimSup.Context = func(sid string) context.Context {
+			c := tool.WithSessionID(agent.WithAgentID(context.Background(), sid), sid)
+			return tool.WithWorkDir(c, workDir)
+		}
+		subAgentDispatcher.WithClaimFinisher(func(ctx context.Context, b team.ClaimBinding, status, summary, resultID string) {
+			selfClaimSup.FinishClaim(ctx, b, status, summary, resultID)
+		})
+		selfClaimSup.Start(supCtx)
+		log.Printf("[bootstrap] self claim enabled: roles=%v lease=%ds heartbeat=%ds workers/role=%d",
+			cfg.Agent.SelfClaimRoles, cfg.Agent.SelfClaimLeaseSec, cfg.Agent.SelfClaimHeartbeatSec, cfg.Agent.SelfClaimWorkersPerRole)
+	}
+
+	// 第十九步附二：C-05 团队经验晋升服务（默认 shadow，不自动激活）。
+	promotionSvc := agent.NewMemoryPromotionService(memoryLifecycle, agent.PromotionConfig{
+		Mode: cfg.Memory.PromotionMode, AutoActivate: cfg.Memory.AutoActivate,
+		MinEvalTasks: cfg.Memory.MinEvalTasks, MinEvalRepeats: cfg.Memory.MinEvalRepeats,
+	})
+	// C-05 同预算 eval：配置了评测任务才接线真实轻量模型 runner；未配置时禁止自动晋升。
+	if len(cfg.Memory.EvalTasks) > 0 && modelFactory != nil {
+		tasks := make([]agent.EvalTask, 0, len(cfg.Memory.EvalTasks))
+		for i, prompt := range cfg.Memory.EvalTasks {
+			if strings.TrimSpace(prompt) == "" {
+				continue
+			}
+			tasks = append(tasks, agent.EvalTask{ID: fmt.Sprintf("eval-%d", i+1), Prompt: prompt})
+		}
+		if len(tasks) > 0 {
+			promotionSvc.Evaluator = &agent.LLMCandidateEvaluator{
+				Tasks: tasks, Repeats: cfg.Memory.MinEvalRepeats, MinTasks: cfg.Memory.MinEvalTasks,
+				Call: func(ctx context.Context, prompt string) (string, error) {
+					return modelFactory.CallLightweightWithRetry(ctx, prompt)
+				},
+			}
+		}
+	}
+	// 绑定任务成功 + B-03 报告 passed → 团队经验候选（默认 shadow）。
+	subAgentDispatcher.WithTeamCandidateSink(func(ctx context.Context, c subagent.TeamCandidateInput) {
+		if cfg.Memory.PromotionMode == "off" {
+			return
+		}
+		if _, err := promotionSvc.SubmitTeamCandidate(ctx, agent.TeamCandidate{
+			ProjectKey: c.ProjectKey, RoleID: c.RoleID, TaskType: c.TaskType, Content: c.Content,
+			SourceSession: c.SourceSession, SourceTask: c.SourceTask, SourceAttempt: c.SourceAttempt,
+			SourceResultID: c.SourceResultID, SourceVerificationReportID: c.SourceVerificationReportID,
+			SpecVersion: c.SpecVersion, ContextManifestHash: c.ContextManifestHash,
+			SourceStatus: c.SourceStatus, VerificationStatus: c.VerificationStatus,
+		}); err != nil {
+			log.Printf("[bootstrap] team candidate submit skipped: %v", err)
+		}
+	})
+
 	// 第二十步：组装 App 实例。
 	app := &App{
 		Agent:            agentSvc,
@@ -1615,6 +1801,12 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			log.Printf("[memory-consolidate] daily run failed (non-fatal): %v", err)
 		}
 	})
+	app.AutoDispatch = autoDispatcher
+	app.AttemptStore = autoAttemptStore
+	app.SelfClaim = selfClaimSvc
+	app.SelfClaimStore = selfClaimStore
+	app.SelfClaimSupervisor = selfClaimSup
+	app.Promotion = promotionSvc
 	app.cleanup = []func() error{
 		func() error {
 			// 先停全部插件（MCP 子进程/HTTP 连接），再关 DAG 调度器。
@@ -1623,7 +1815,22 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 			_ = pluginManager.StopAll(stopCtx)
 			return nil
 		},
-		func() error { stopMaintenance(); return nil },      // 停数据维护定时器
+		func() error { stopMaintenance(); return nil }, // 停数据维护定时器
+		func() error {
+			if autoDispatchCancel != nil {
+				autoDispatchCancel()
+			}
+			return nil
+		}, // 停 C-03 自动调度（goroutine + ctx 取消）
+		func() error {
+			if selfClaimSup != nil {
+				selfClaimSup.Stop()
+			}
+			if selfClaimCancel != nil {
+				selfClaimCancel()
+			}
+			return nil
+		}, // 停 C-06 自认领 Worker
 		func() error { connectorSchedCancel(); return nil }, // 停连接器调度器（goroutine + ctx 取消）
 		func() error {
 			// 先停止 DAG 调度器，避免在数据库关闭后还在调度任务。

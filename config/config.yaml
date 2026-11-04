@@ -39,6 +39,16 @@ memory:
   # 不得停掉撤回——否则 shadow 防住了新污染，却让已被用户推翻的旧条目一直注入。
   # 紧急回滚口：off（仅在撤回服务故障时临时使用）。
   retraction_mode: enforce
+  # 团队经验候选晋升（C-05）：默认 shadow 只记录候选/晋升意图，不激活；enforce 才允许
+  # 项目作用域人工晋升。auto_activate=false 时拒绝 actor=auto 的自动晋升。
+  promotion_mode: shadow
+  auto_activate: false
+  min_eval_tasks: 10
+  min_eval_repeats: 2
+  # 同预算 baseline/treatment 真实模型评测任务（留空=不接线 eval runner，禁止自动晋升）。
+  # eval_tasks:
+  #   - "实现一个带缓存的 Fibonacci 函数并给出测试"
+  #   - "修复这段 Go 代码的并发竞态并说明原因"
 
 # Agent 运行时动态参数
 agent:
@@ -125,6 +135,26 @@ agent:
   plan_max_revisions: 0             # 每 Agent 计划被驳回重提上限：0=不限制，循环修订直到上级批准；>0 达上限不放行、转 escalate 升级仲裁（防失控兜底）
   # -- 波聚合整合纪要（集群档提速 C-3a，2026-09-17）--
   batch_digest_enabled: true        # call_sub_agents 同波 domain 项 ≥2 时完成回传汇成一条【整合纪要】单条送达父邮箱（轻量模型按领域归并，失败回退逐领域拼接），省父 Agent "收到，继续等" 空转轮；false=退回逐条回传
+  # -- 执行连续性 B-11：系统触限同 Agent ID 自动续跑（用户暂停/审批/硬预算不自动恢复）--
+  auto_resume_mode: enforce          # off|shadow|enforce：enforce=上下文/迭代触限同 ID 自动续跑；shadow=只记录本会怎么做
+  auto_resume_max_per_task: 2        # 同一会话任务跨 root/domain/leaf 的累计自动续跑次数（共享计数，不按节点重置）
+  auto_resume_no_progress_limit: 1   # 续跑后零可验证进展的容忍轮次，超过转人工
+  resume_interrupted: false          # 进程重启后是否自动恢复 interrupted 检查点；默认 false（先对账副作用）
+  verification_policy_mode: shadow   # off|shadow|enforce：enforce 仅对 C-03 task_id 绑定任务阻断未通过机器验收报告的 done
+  # -- C-03 依赖就绪自动调度（默认关闭；计划任务需显式 role_id+task 才进入调度）--
+  auto_dispatch_enabled: false       # 总开关；关闭时只保留通知式依赖门与人工派发
+  auto_dispatch_rescan_sec: 5        # 兜底扫描间隔（秒）；零 LLM 调用
+  auto_dispatch_max_attempts: 1      # 单任务自动派发尝试上限；默认不盲目重试
+  auto_dispatch_failure_policy: block_dependents  # block_dependents|wait_human
+  auto_dispatch_roles: [code_assistant, test_assistant, scout]  # 首批仅固定叶角色冷启动
+  # -- C-06 看板自认领（默认关闭；开启前先满足实验立项门槛）--
+  self_claim_enabled: false
+  self_claim_roles: [code_assistant, test_assistant, scout]
+  self_claim_lease_sec: 120
+  self_claim_heartbeat_sec: 30
+  self_claim_workers_per_role: 1
+  # -- 上下文清单 U-02：统一登记实际注入来源/版本/冲突裁决，shadow 只对拍不改模型输入 --
+  context_manifest_mode: shadow     # off|shadow|enforce：shadow 构建 v2 清单并审计；enforce 在 required 超预算/未决/被 fork 丢弃时拒派
   # -- 记忆索引槽（TODO #20③+#22③）：会话启动注入一行式沉淀索引（行数/runes 双配额，
   # 超限带重写指令不静默截断）；untrusted 围栏行结构性丢弃（信任分层+召回循环防护）。
   memory_index_max_lines: 200     # 行数配额（对标 CC MEMORY.md 200 行）；<=0 按默认 200

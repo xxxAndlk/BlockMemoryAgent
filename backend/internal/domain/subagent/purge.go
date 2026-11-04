@@ -26,6 +26,7 @@ func (d *Dispatcher) PurgeSession(sessionID string, nodeIDs []string) {
 	delete(d.softStops, sessionID)
 	d.softStopMu.Unlock()
 	d.sessionCounts.Delete(sessionID)
+	d.continuationBudgetCnt.Delete(sessionID)
 	if d.ledger != nil {
 		d.ledger.Purge(sessionID)
 	}
@@ -49,6 +50,7 @@ func (d *Dispatcher) PurgeSession(sessionID string, nodeIDs []string) {
 		d.heldTools.Delete(id)
 		d.agentRoles.Delete(id)
 		d.aggByAgent.Delete(id)
+		d.continuationStates.Delete(id)
 	}
 	// 3. 热驻槽销毁（内部完成池摘除/邮箱清理/树收尾/模型覆盖回收）。
 	if d.pool != nil {

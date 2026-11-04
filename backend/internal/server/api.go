@@ -27,6 +27,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/runtime"          // Runtime
 	"github.com/blockmemory/agent/backend/internal/server/eventkind" // 事件类型常量
 	"github.com/blockmemory/agent/backend/internal/store"            // Postgres / Redis
+	"github.com/blockmemory/agent/backend/internal/team"             // C-03 自动调度管理面
 	"github.com/blockmemory/agent/backend/internal/widgets"          // 界面部件管理器
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"      // RoleConfigFile
 	"github.com/blockmemory/agent/backend/pkg/types"                 // 共享类型
@@ -59,22 +60,22 @@ type APIHandler struct {
 	paused   map[string]bool // topic_id -> 是否暂停
 	pausedMu sync.RWMutex    // 保护 paused 的并发读写
 
-	rt            *runtime.Runtime          // 聚合运行时
-	sessionMgr    *SessionManager           // 会话管理器
-	pgStore       *store.PostgresStore      // Postgres 存储
-	redisStore    *store.RedisStore         // Redis 存储
-	roleCfg       *pkgconfig.RoleConfigFile // 角色配置
-	modelFactory  *model.ModelFactory       // 模型工厂
-	modelMgr      agent.ModelManager        // 模型动态切换能力（ReactService 实现）
-	statsService  *StatsService             // 会话统计聚合服务
-	pluginMgr     *plugins.Manager          // 插件管理器（热插拔插件管理 API）
-	widgetMgr     *widgets.Manager          // 界面部件管理器（widgets/ 目录包管理 API）
+	rt           *runtime.Runtime          // 聚合运行时
+	sessionMgr   *SessionManager           // 会话管理器
+	pgStore      *store.PostgresStore      // Postgres 存储
+	redisStore   *store.RedisStore         // Redis 存储
+	roleCfg      *pkgconfig.RoleConfigFile // 角色配置
+	modelFactory *model.ModelFactory       // 模型工厂
+	modelMgr     agent.ModelManager        // 模型动态切换能力（ReactService 实现）
+	statsService *StatsService             // 会话统计聚合服务
+	pluginMgr    *plugins.Manager          // 插件管理器（热插拔插件管理 API）
+	widgetMgr    *widgets.Manager          // 界面部件管理器（widgets/ 目录包管理 API）
 	// externalAgentList/Reload 外部 Agent 管理面闭包（bootstrap 注入）：清单读取与
 	// external_agents.yaml 重读热更新；未接线时端点 503。
 	externalAgentList   func() []tool.ExternalAgentDef
 	externalAgentReload func() ([]tool.ExternalAgentDef, error)
-	hookLimiter   *widgets.HookRateLimiter // webhook 回调限流器（单部件 60s/60 次滑窗；懒初始化）
-	learnedSkills *store.LearnedSkillStore  // 自进化技能库存储（2026-09-02 设计 §8）
+	hookLimiter         *widgets.HookRateLimiter // webhook 回调限流器（单部件 60s/60 次滑窗；懒初始化）
+	learnedSkills       *store.LearnedSkillStore // 自进化技能库存储（2026-09-02 设计 §8）
 	// learnedSkillsDir 经验技能目录（config/skills_learned/）：DELETE 端点删文件前
 	// 做"必须落在该目录内"的安全校验。空=不删文件（仅删 PG 行）。
 	learnedSkillsDir string
@@ -87,6 +88,15 @@ type APIHandler struct {
 	// memoryLifecycle 长期记忆生命周期服务（2026-10-24 撤回与污染修复）：
 	// 条目列表/详情/事件时间线 + 撤回/隔离/恢复。未注入时端点 503。
 	memoryLifecycle *agent.MemoryLifecycle
+	// memoryPromotion C-05 团队经验候选 verify/promote/rollback；未注入时端点 503。
+	memoryPromotion *agent.MemoryPromotionService
+	// teamAttempts/teamScheduler C-03 自动调度管理面；未启用时端点 503。
+	teamAttempts  team.AttemptStore
+	teamScheduler *team.ReadyScheduler
+	// selfClaim/selfClaimStore/selfClaimSup C-06 自认领（默认关闭）。
+	selfClaim      *team.ClaimService
+	selfClaimStore team.ClaimStore
+	selfClaimSup   *team.WorkerSupervisor
 	// roleEvolution 角色自进化准则存储（窄接口，*store.RoleEvolutionStore 实现；未注入端点 503）。
 	roleEvolution roleEvolutionStoreOps
 	// roleRegistry 角色注册表（角色全集与显示名来源；未注入端点 503）。

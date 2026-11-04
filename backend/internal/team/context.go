@@ -189,12 +189,12 @@ func (m *TaskContextManifest) ComputeContentHash() string {
 		return ""
 	}
 	payload := struct {
-		Version     string           `json:"version"`
-		RoleID      string           `json:"role_id"`
-		ProjectKey  string           `json:"project_key"`
-		Execution   string           `json:"execution_path"`
-		Required    []entryCanonical `json:"required"`
-		Optional    []entryCanonical `json:"optional"`
+		Version     string               `json:"version"`
+		RoleID      string               `json:"role_id"`
+		ProjectKey  string               `json:"project_key"`
+		Execution   string               `json:"execution_path"`
+		Required    []entryCanonical     `json:"required"`
+		Optional    []entryCanonical     `json:"optional"`
 		Constraints []ConstraintDecision `json:"constraints"`
 	}{
 		Version:     m.Version,

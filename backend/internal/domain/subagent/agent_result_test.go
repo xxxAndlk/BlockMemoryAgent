@@ -11,7 +11,7 @@ func TestBuildAgentResult(t *testing.T) {
 		wantStatus string
 		wantVerify string
 	}{
-		{"completed", "done: changed 2 files", "completed", "passed"},
+		{"completed", "done: changed 2 files", "completed", "unverified"},
 		{"failed", "[failure kind=timeout retryable=true] timed out", "failed", "unknown"},
 		{"unverified", "交付完成（未验证：缺 L0 证据）", "unverified", "unverified"},
 	}

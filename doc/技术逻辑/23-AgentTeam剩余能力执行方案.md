@@ -1,15 +1,26 @@
 # AgentTeam 剩余能力执行方案
 
 > 日期：2026-11-03  
-> 范围：U-02、B-03、C-03、C-05、C-06。  
+> 范围：**B-11（最高优先级）**、U-02、B-03、C-03、C-05、C-06。
 > 前置文档：`doc/技术逻辑/22-AgentTeam问题与修复清单.md`，尤其是第 11 节的主路线、11.5 节的 C-06 启动门槛和第 12 节的候选技术预案。  
 > 文档性质：**开发与验收方案，不是实施完成报告**。本文中的目标结构体、配置项、表名和新增文件均为待实施设计；只有“现状边界”描述的是本次已核对的代码。
+>
+> **实施状态（2026-11-03）**：
+> - **B-11（进程内 + 跨进程保守恢复）**：Domain/叶子/主 Agent 系统触限检查点与同 ID 自动续跑；主 Agent 复用 `wakeInput` 系统来源；任务级共享次数/无进展/墙钟/Team token 熔断；paused-pending 不触发父 `paused_on_child`；同任务防重派；`continuation_*` 审计。**复核修复**：二次触限复位 single-flight、保留 task/attempt 绑定、共享 root/子预算与原始 deadline、无进展按成功输出内容 hash、context_threshold 有界续跑视图、Domain 阻断通知父。跨进程：启动标 interrupted；默认不重放并显式 blocked，开启时建新 attempt_no。
+> - **U-02**：Manifest v2（shadow/enforce）、来源登记、确定性裁决、optional 裁剪、结构化记忆视图、v2 审计；**运行中 required 失效停止**：enforce 下每轮比对 AGENTS.md/任务规范内容 hash，变化即停止后续执行并交上级（`context_invalid` → board blocked）。恢复专用重检仍走新派发重建。
+> - **B-03**：逐项 VerificationReport、AgentResult v2、团队风险策略契约；`verification_policy_mode` 默认 shadow，enforce 仅阻断 C-03 绑定任务。**复核修复**：门禁前先生成报告；绑定任务缺报告直接阻断；报告携带 task/attempt/risk；无报告 AgentResult 默认 unverified；**恢复完成与首次完成共用同一验收/看板/attempt 终态出口**；自动任务验收清单通过 `TaskBinding.Acceptance` 作为权威输入。
+> - **C-03**：精确绑定 + attempt fence + PlanVersion；`team_dispatch_attempts`（仅 PG，建表失败拒启）、`ReadyScheduler`（默认关闭、5s 扫描、固定叶角色、block_dependents、max_attempts 接入）、`DispatchBoundTask`；**人工批准门**（`POST /api/team/approve`，未批准不执行）+ 事件触发/启动 reconcile；`GET /api/team/attempts`、`POST /api/team/reconcile`；**attempt 正常终态回写**（MarkTerminal，done/unverified/failed + result_id）；Web `/team` 页面（attempt 表 + 批准 + 手动调度）；write_plan 校验唯一 integration 且必须依赖其余交付任务。开启时 Manifest/验收必须 enforce，否则 fail-fast。
+> - **C-05**：团队候选/严格防复活/shadow 默认/verified 后项目人工晋升/同 key active 原子替换/撤回回滚/曝光事件与聚合 API；**真实同预算 eval**：配置 `memory.eval_tasks` 后接轻量模型 baseline/treatment + judge，报告落 events；未配置时禁止自动晋升。
+> - **C-06（用户批准，默认关闭）**：`PlanEnvelope/TaskContract/Claim/ClaimBinding`；内存与 PG 三表（team_tasks/team_task_attempts/team_task_events）事务 Claim/lease/fencing；`ClaimService`、`WorkerSupervisor`（无 LLM 轮询、按角色总运行并发限制）、`DispatchClaimed` 与 `FinishClaim` 终态回写；API `/api/team/self-claim/{plan,tasks,run}`。`agent.self_claim_enabled=false` 默认关闭。
+> - 实际改动与验证见 `doc/变更.md` 同日条目；文中其余目标章节仍为设计，不得当成已实现。
 
 ## 1. 执行结论
 
-五项工作不能并行各做各的，正确依赖关系是：
+**先修 B-11 执行连续性，再推进其余能力。** 自动续跑与同任务防重派是当前真实使用阻塞点；它可基于现有 `ResumePaused` 独立落地，不应等待 U-02 或 C-03 全部完成。其余五项不能并行各做各的，正确依赖关系是：
 
 ```text
+B-11 系统暂停自动续跑 + 同任务防重派（P0，独立先行）
+
 U-02 版本化、可裁剪、可撤回的上下文契约 ─┐
                                            ├─→ B-03 分风险机器验收 ─→ C-03 依赖就绪自动调度
 现有长期记忆生命周期 + 来源与证据引用 ────┘              │
@@ -20,16 +31,18 @@ U-02 版本化、可裁剪、可撤回的上下文契约 ─┐
 
 更精确地说：
 
-1. **U-02 先统一“实际给执行者看了什么”**，否则自动调度只会更快地传播旧约束、冲突经验和无关上下文。
-2. **B-03 再统一“什么状态允许完成”**，否则 C-03 会把 Agent 自述或任意一次成功命令当成依赖完成信号。
-3. **C-03 先修精确任务绑定，再做自动派发**。现有按 Domain 整组 `Assign/MarkDone` 的语义不能直接用于逐任务自动执行。
-4. **C-05 复用现有 `long_term_memory_items/events`、撤回和防复活机制**，只补团队候选的证据、作用域、评估、晋升和反馈，不新建第二套长期记忆。
-5. **C-06 仍不是默认开发项**。先交付实验决策包；门槛不满足就停止，不为了架构一致性建设队列、Worker 和额外表。
+1. **B-11 先保证系统触限后无需人工反复“继续”**，同一个 Agent／attempt 自动恢复，父 Agent 不因子 Agent 可恢复暂停而停住，同任务不能重派；同时必须有累计预算和无进展熔断。
+2. **U-02 再统一“实际给执行者看了什么”**，否则自动调度只会更快地传播旧约束、冲突经验和无关上下文。B11-2 只需检查 required 上下文有效性，不等待完整 U-02；U-02 落地后接入同一恢复重检入口。
+3. **B-03 再统一“什么状态允许完成”**，否则 C-03 会把 Agent 自述或任意一次成功命令当成依赖完成信号。B-11 先保证截断产出不能冒充完成，后续由 B-03 提供完整机器报告。
+4. **C-03 先修精确任务绑定，再做自动派发**。现有按 Domain 整组 `Assign/MarkDone` 的语义不能直接用于逐任务自动执行；B-11 的 legacy 防重键在 C-03 后升级为精确 task／attempt。
+5. **C-05 复用现有 `long_term_memory_items/events`、撤回和防复活机制**，只补团队候选的证据、作用域、评估、晋升和反馈，不新建第二套长期记忆。
+6. **C-06 仍不是默认开发项**。先交付实验决策包；门槛不满足就停止，不为了架构一致性建设队列、Worker 和额外表。
 
-### 1.1 五项工作的交付边界
+### 1.1 六项工作的交付边界
 
 | 编号 | 本次要交付的能力 | 明确不做 |
 |---|---|---|
+| B-11 | 暂停原因分类、同 Agent／attempt 自动续跑、父子等待、叶子检查点、防重派、任务级熔断与安全恢复 | 不伪造用户“继续”；不自动恢复用户暂停／审批／硬预算；不重置总预算；不让 LLM 决定续跑 |
 | U-02 | 冻结 Manifest、来源优先级、冲突裁决、撤回重检、关键约束保真、全入口审计 | 不用一个更大的 Prompt 代替结构化治理；不重新打开旧块记忆自动写入 |
 | B-03 | 风险档、DoD 策略、逐项 VerificationReport、AgentResult v2、旧 v1 兼容 | 不重写现有 runtime／visual／command 证据采集；不让 LLM 自评替代机器状态 |
 | C-03 | 精确 task 绑定、已批准计划的确定性 ReadyScheduler、持久 attempt 防重、恢复和取消 | 不做 Agent 自由认领；不做第二条权限旁路；不默认自动重放有副作用任务 |
@@ -99,6 +112,319 @@ result_id / verification_report_id
 5. 默认关闭或 shadow 的回滚方式；
 6. 实际执行过的命令、环境和结果，未执行项明确标注；
 7. 对 21／22／23 号文档的实施状态同步，不把目标设计写成已实现。
+
+---
+
+## 3A. B-11：执行连续性——系统暂停自动续跑与同任务防重派
+
+> 优先级：**P0，先于 U-02／B-03／C-03 实施**。
+> 针对的真实问题：子 Agent 触限暂停后，主 Agent 重新派一个实例；或者主 Agent 也停下来，必须有人反复输入“继续”。
+> 当前状态：**仅为待实施设计，尚未修改代码**。本节确认的是代码中存在的故障路径，没有在未读取问题会话原始日志的情况下断言某次事故的每一个暂停都属于同一原因。
+
+### 3A.1 已核对的故障链与可复用原语
+
+当前链路不是“没有恢复能力”，而是**已有恢复能力没有被系统自动、正确地驱动**：
+
+1. `backend/internal/domain/subagent/dispatcher.go` 的 Domain `LimitReached` 路径会保存 History、执行 `tree.Pause`，但不发子 Agent 终态通知、不递减父节点 pending，随后返回 `errPaused`。
+2. 父 Agent 在 `backend/internal/agent/react_agent.go` 发现 Paused 子 Domain 后，返回 `LimitReached + PausedOnChild`。
+3. 顶层在 `backend/internal/agent/service_react.go` 收到 `Limit Reached` 后统一 `pauseSession`，因此子 Agent 的可恢复暂停会扩大成整个主会话等人工。
+4. 叶子执行触限存在另一条路径：截取部分文本并返回 `errPartialReturn`。如果没有可恢复检查点，父 Agent 只能拿部分结果收口或重新派发，容易丢失原实例的进度。
+5. `ResumePaused` 已经能按**同一个 Agent ID**恢复 Domain 和固定叶角色，加载持久 History 后继续执行。这是必须复用的原语，不重写第二套恢复引擎。
+6. 现有恢复路径会再次使用 `d.timeout` 进入执行门；若直接自动循环调用，会把总墙钟也一次次重置。`maxPausedResumes<=0` 时默认 1 的现有限制也不足以表达整个任务的累计续跑预算。
+
+因此 B-11 需要修的是**暂停分类、触发者、父子等待状态、任务级预算和防重派**，而不是简单把人工“继续”按钮改成定时自动点击。
+
+### 3A.2 目标行为与不变约束
+
+目标行为：
+
+- 对可继续的系统触限，在检查点持久化且旧 run 退出后，由系统自动恢复**同一个 session／node／Agent ID／attempt**，不需要用户输入。
+- Domain 子 Agent 自动续跑期间，父 Agent 保持等待该子任务，不把整个主会话置为 `paused_on_child`，也不能趁机重派。
+- 叶子 token／上下文触限也保存 History 和部分工作检查点，走同一续跑控制；不得把截断文本冒充完成。
+- 主 Agent 自身遇到可恢复的上下文阈值或迭代上限，也按相同原则续跑，而不是整个会话停住。
+- 自动续跑有任务级次数、无进展、总墙钟和 Team token 熔断；不能把“少点一次继续”变成“无人值守地无限烧预算”。
+
+不变约束：
+
+- 用户显式停止／暂停、等待澄清、等待审批、权限拒绝和硬预算耗尽，绝不自动续跑。
+- 不伪造真实用户消息，不写用户决策账本、项目经验或用户画像。
+- 不重置派发计数、Team 累计预算、总重试上限或原始绝对截止时间。
+- 旧 run 未退出、检查点未完整落盘、副作用是否提交尚不确定时，不双开执行。
+- 只有真正需要人工的原因才进入现有人工暂停；普通任务仍按既定路线优先 `single_writer`，不因 B-11 扩大多 Agent 使用范围。
+
+### 3A.3 先区分暂停原因，禁止统一 LimitReached 后 pauseSession
+
+在中立 Team 契约中增加带原因的暂停信封；`subagent` 只依赖该中立契约，`agent` 中的控制器通过接口适配 Dispatcher，避免形成 `agent ↔ subagent` 循环依赖。
+
+```go
+// 目标契约，可放 backend/internal/team/continuation.go。
+type PauseCause string
+
+const (
+    PauseContextThreshold PauseCause = "context_threshold"
+    PauseIterationLimit   PauseCause = "iteration_limit"
+    PauseUser             PauseCause = "user_pause"
+    PauseApproval         PauseCause = "approval_required"
+    PauseClarification    PauseCause = "clarification_required"
+    PausePermission       PauseCause = "permission_denied"
+    PauseTeamBudget       PauseCause = "team_budget_exhausted"
+    PauseWallClock        PauseCause = "wall_clock_exhausted"
+    PauseContextInvalid   PauseCause = "required_context_invalid"
+    PauseVerification     PauseCause = "verification_failed"
+    PauseUncertain        PauseCause = "uncertain_side_effect"
+)
+
+type ContinuationCheckpoint struct {
+    SessionID       string
+    RunID           string
+    ParentAgentID   string
+    AgentID         string
+    NodeID          string
+    TaskID          string
+    AttemptID       string
+    BudgetScopeID   string // 根任务/Team Run 的预算作用域，所有派生节点继承
+    OwnerKind       string // root/domain/leaf
+    Cause           PauseCause
+    CheckpointID    string
+    HistoryRef      string
+    HistoryVersion  int64
+    ProgressDigest  string
+    OriginalDeadline time.Time
+    ContinuationSeq int
+    CreatedAt       time.Time
+}
+```
+
+`CheckpointID` 标识一次确定的暂停，`ContinuationSeq` 标识第几次续跑。调度幂等键使用 `agent_id + checkpoint_id + continuation_seq`，不能只用 session，否则同一会话不同子 Agent 会互相吞掉续跑。
+
+`BudgetScopeID` 从根任务／Team Run 创建并由全部派生节点继承，续跑和模型重规划都不得修改；legacy 路径可先用 `session_id + 根 Domain ID` 形成稳定作用域，C-03 后映射到精确根任务。这样 root、父 Domain 和叶子消耗的是同一套累计预算，而不是各自重新开始。
+
+| 暂停／中断原因 | 系统自动续跑 | 必要前置与处理 |
+|---|---:|---|
+| 上下文／token 窗口阈值 | 是 | History 与工作检查点完整；required 上下文仍有效；只重置上下文窗口，不重置任务总预算 |
+| 单次 run 迭代上限 | 是 | 当前工具调用已经安全收口；续跑的是同一 attempt，不是新建任务 |
+| 子 Domain／叶子发生上述系统触限 | 是 | 父保持 `awaiting_child/continuation_pending`，不得向上转换成整会话人工暂停 |
+| 用户显式暂停、停止、取消 | 否 | 只有用户之后明确恢复才可继续；取消旧定时器和唤醒 |
+| 等待用户澄清或审批 | 否 | 等待对应真实输入或审批事件，不用系统“继续”替代 |
+| 工具／权限拒绝 | 否 | 保留权限边界；按现有失败或人工流程处理 |
+| Team token 硬预算或原始总墙钟耗尽 | 否 | 明确 blocked；不得通过续跑获得新预算 |
+| required 上下文缺失、Spec／Manifest 失效 | 否 | 等 U-02 重检或人工修正；不能带着残缺约束继续 |
+| 重复验证失败 | 否 | 不无限续跑同一实例；由失败策略或人工决定新 attempt |
+| 进程重启后状态不确定、副作用可能已提交 | 否 | 标 `interrupted`，先对账；只有 3A.10 的安全条件满足才自动恢复 |
+
+瞬时网络错误仍走现有有限重试策略，不与“上下文／迭代窗口续跑”混为一谈，也不能借重试绕过上述预算。
+
+### 3A.4 ContinuationController：确定性控制，不让 LLM 决定要不要续跑
+
+建议新增 `backend/internal/agent/continuation.go`。控制器只消费结构化检查点和预算状态，不调用模型做续跑裁决。
+
+```go
+type ContinuationController interface {
+    OnCheckpoint(cp team.ContinuationCheckpoint) error
+    OnRunExited(agentID, runID, checkpointID string) error
+    CancelSession(sessionID, reason string) error
+}
+
+type PausedDomainResumer interface {
+    ResumePausedWithOptions(/* 现有 ResumePaused 参数 + ResumeOptions */) error
+}
+
+type ResumeOptions struct {
+    CheckpointID     string
+    Cause            team.PauseCause
+    RemainingTimeout time.Duration
+    ContinuationSeq  int
+    Origin           string // system_continuation/user_resume
+}
+```
+
+具体接口签名按现有类型收敛，但以下语义不可删除：
+
+1. `OnCheckpoint` 只登记候选；必须等旧 `RunID` 的 `OnRunExited` 后才允许恢复，防止旧协程和新协程同时写。
+2. 以 `agent_id + checkpoint_id` 做 single-flight；定时器、恢复扫描和用户操作同时到达时也只能有一个有效续跑。
+3. 续跑前再次检查 session 是否被取消、用户是否暂停、任务预算是否有剩余、检查点是否仍为最新。
+4. Domain／叶子通过现有 `ResumePaused` 的适配入口恢复；保留同 Agent ID、固定叶角色和持久 History，并新增 `ResumeOptions`，不再无条件获得一份完整 `d.timeout`。
+5. 主会话复用现有 `wakeInput` 的**系统唤醒通道语义**，事件携带 checkpoint／cause／origin；不得调用 `sendMessage("继续")`，也不得在用户历史中增加一条“继续”。现有恢复引擎内部的继续指令可以保留，但必须标为系统来源。
+6. 续跑完成后沿用原有终态通知路径；控制器不额外构造第二份完成通知。
+7. `context_threshold` 恢复不能只是原样重放全部 History 后重新给一份 token 上限，否则可能立即再次触限。必须验证实际模型输入已降到阈值内：完整 History 仍持久保留，模型侧使用有界的 continuation view，包含当前任务与最新用户约束、未决计划／工具状态、已验证进展与工件引用，以及必要的近期工作尾部。
+8. continuation view 不创建新 Agent／attempt，也不改写原始 History。B11-2 先用确定性检查点和已有压缩能力实现；任何必需约束无法放入窗口时禁止自动续跑。LLM 摘要只能作为非权威辅助，不能覆盖原始约束；U-02 落地后再由版本化 Manifest 证明保真。
+9. `iteration_limit` 只开启新的迭代切片，不无故压缩或重写历史；两种原因的恢复路径和审计必须可区分。
+
+建议将运行状态显式区分为：
+
+```text
+running
+  └─系统触限→ paused_system/checkpointed
+                  ├─不可自动续跑→ blocked/awaiting_human
+                  └─可自动续跑→ continuation_pending
+                                    └─旧 run 已退出→ resuming → running（同 Agent ID、同 attempt）
+
+任意状态 + 用户取消 → cancelled（清理待续跑事件，永不自动唤醒）
+```
+
+`paused_system` 是持久检查点状态，`continuation_pending` 是已安排系统恢复的状态；二者均不是任务完成，也不解锁下游。
+
+### 3A.5 Domain 子 Agent 续跑时，父 Agent 不再跟着停
+
+将现有错误传播改为显式的父子等待协议：
+
+1. 子 Domain 保存 History、`tree.Pause` 和检查点后，发出 `continuation_checkpointed`；仍不递减父 pending、不发送完成通知。
+2. 父 Agent 收到带检查点的暂停结果后记录 `awaiting_child + continuation_pending`，等待恢复或终态事件；不再仅因子 Domain 为 Paused 就返回顶层 `Limit Reached + PausedOnChild`。
+3. 等子 Domain 旧 run 退出，控制器调用同 ID 恢复。父 Agent 可以继续等待，不重新规划、不创建新子 Agent。
+4. 子 Domain 最终成功、明确失败或转人工时，只沿现有通知路径唤醒父 Agent 一次，pending 只递减一次。
+5. 若原因不可自动续跑，才向上传 `blocked/awaiting_human`；顶层仅在确实需要用户时 `pauseSession`，错误消息必须包含真实原因和已自动续跑次数。
+6. 如果父 Agent 在等待期间自身也触限，先为父保存独立检查点；父、子各自的 checkpoint 和预算分别标识，但都消耗同一个任务累计预算。恢复顺序不得造成父子双开或重复完成通知。
+
+这一改造直接删除“子 Agent 暂停 ⇒ 主 Agent 暂停 ⇒ 用户继续 ⇒ 主 Agent 再决定重派”的默认链路。
+
+### 3A.6 叶子触限不得直接部分假完成
+
+为叶子执行补齐与 Domain 等价的检查点边界：
+
+- 在达到 token／上下文阈值时，保留已持久 History、已成功的工具结果、文件 diff／工件引用和未完成的 DoD 项。
+- 返回带 `OwnerKind=leaf` 的可恢复检查点，不直接走 `errPartialReturn` 的完成收口。
+- 恢复时沿用同一叶子实例标识与角色，只补“从检查点继续并完成未决项”的系统指令，不重派另一个同角色 Agent。
+- 自动续跑预算耗尽后，可保留 `delivered-unverified` 或 `blocked`，但必须列明缺失证据和未决项；不能标 `done`，不能默认解锁依赖。
+- 只有用户明确选择“接受部分产出”时才按现有人工部分收口处理，并记录操作者与理由。
+
+在 B-03 尚未落地前，首版至少使用现有结果字段与明确未验证标记，不能等待 B-03 才修假完成。
+
+### 3A.7 主 Agent 自动续跑，但不制造用户输入
+
+主 Agent 的上下文阈值／单次 run 迭代上限也生成同构检查点：
+
+1. 当前工具副作用已经收口，保存主会话 History、待办状态与最新进度摘要。
+2. 顶层识别 `PauseContextThreshold／PauseIterationLimit`，先交给控制器，而不是立即 `pauseSession`。
+3. 旧 run 退出后，通过内部系统唤醒恢复原主 session；恢复入口与用户新消息入口分流。
+4. 恢复时不新增用户消息、不重新执行需求理解、不重新拆队、不重置已派发子任务；先读取现有运行状态和 pending 子任务。
+5. 达到续跑／无进展／预算熔断时才转人工，并输出可操作的阻塞原因，而不是只显示“已达上限，请继续”。
+
+### 3A.8 派发前的同任务防重派守卫
+
+自动恢复与防重派必须同时交付，否则仍可能出现“旧实例正在恢复，新实例又被派出”。
+
+在 Dispatcher 创建新 Agent／节点之前增加确定性守卫：
+
+- C-03 已有精确标识后，使用 `parent_agent_id + task_id + attempt_id` 查询执行句柄。
+- legacy 路径暂用 `parent_agent_id + Domain ID + canonical Spec hash`；Spec hash 至少覆盖角色和任务内容，避免不同角色被误并。
+- 若已有节点处于 `paused_system`、`continuation_pending`、`resuming`，或可安全恢复的 `interrupted`，返回已有句柄或 `ErrResumableTaskExists`；禁止创建新 Agent。
+- 已确认不可恢复的阻塞实例，只有显式执行 `abandon/supersede` 并留下审计后，才允许建立新 attempt；普通模型重规划不能隐式完成这一步。
+- 守卫与续跑 single-flight 共用同一权威状态，不能一个读内存、另一个读可能滞后的 UI 快照。
+- 防重派不依赖 Mailbox 幂等键；邮箱只能保证通知去重，不能保证执行唯一。
+
+### 3A.9 任务级熔断、预算与进展判定
+
+建议首版默认：
+
+```yaml
+auto_resume_max_per_task: 2
+auto_resume_no_progress_limit: 1
+```
+
+语义必须固定：
+
+1. `auto_resume_max_per_task=2` 是**同一任务跨 root／Domain／leaf 的累计系统自动续跑次数**，不是每个节点各两次，防止嵌套 Agent 乘法放大。
+2. 与现有 `maxPausedResumes` 统一为一套任务累计预算；迁移时保留一个权威计数，不得两套计数各自重置。配置兼容层可把旧配置映射到新预算，并在废弃期打印告警。
+3. 用户手动恢复也不能无声清零计数。确实需要追加预算时，由用户显式授权并审计追加的次数与原因。
+4. `auto_resume_no_progress_limit=1` 表示最多容忍一轮“续跑后零可验证进展”；下一次又需要续跑时停止自动恢复并转人工。
+5. 有效进展只认：成功工具结果及其新产物、新的文件 diff、新的测试／验收证据、子任务状态实际推进。重复 LLM 文本、重复计划、重复“我将继续”和仅 token 增长均不算进展。
+6. `ProgressDigest` 由上述确定性证据计算；相同输出的重复工具调用不能仅靠调用次数算进展。没有新证据时保持原 digest。
+7. 自动续跑使用 `min(原剩余墙钟, 当前配置允许的单次执行时间)`；原绝对截止时间不变。`d.timeout` 只能作为单次切片上限，不能作为新的总 Deadline。
+8. Team token、工具重试、节点数、深度和审批档继续累计；上下文窗口和单次 run 的迭代切片可以更新，但总任务成本不能重新计满。
+9. 每次续跑前后都检查预算；恢复过程中若达到硬上限，按真实原因收口，不再安排下一次。
+
+### 3A.10 重启恢复与副作用安全
+
+B11-3 再开启跨进程自动恢复，且与进程内续跑分开验收：
+
+- 启动扫描时发现可恢复检查点，先校验 `RunID／CheckpointID／HistoryVersion` 和当前 lease，旧进程仍活跃时不接管。
+- 已完成持久结果但通知未发：只补通知，不重新执行。
+- 已确认未开始任何有副作用工具、或所有副作用都有可核对幂等记录：可在开关允许时同 ID 自动恢复。
+- 工具调用已发出但提交状态未知：保持 `interrupted`，先对账；不得盲目重放文件写入、网络写入、部署或支付等操作。
+- 检查点损坏、History 缺失、required 上下文失效或恢复后状态矛盾：转人工并保留现场。
+- `resume_interrupted` 默认 false；进程重启不借 B-11 把所有历史 Paused 会话批量唤醒。
+
+### 3A.11 审计、指标与人工可见性
+
+新增事件：
+
+- `continuation_checkpointed`
+- `continuation_scheduled`
+- `continuation_resumed`
+- `continuation_repaused`
+- `continuation_blocked`
+- `continuation_redispatch_rejected`
+
+每条至少记录 `session_id／task_id／attempt_id／parent_agent_id／agent_id／node_id／run_id／checkpoint_id／cause／origin／continuation_seq／progress_digest／remaining_budget／remaining_deadline`。不记录完整敏感 History 正文。
+
+至少提供以下指标：
+
+- 自动续跑次数、成功率、平均新增墙钟与 token；
+- 因无进展、总次数、Team 预算、用户暂停而阻断的次数；
+- 防重派命中数、双重恢复拒绝数；
+- 人工“继续”次数、重派实例数；
+- 同任务从首次暂停到最终正确交付的总时长。
+
+UI／最终结果可简洁显示“系统已自动续跑 1／2 次”；转人工时明确说明原因。审计事件不是用户消息，不进入用户决策账本或长期记忆。
+
+### 3A.12 分批开发
+
+#### PR B11-1：暂停原因、检查点和 shadow 对拍
+
+改动：
+
+- 增加中立暂停原因与检查点契约，拆解 Domain、叶子、父 Agent 和顶层的统一 `Limit Reached` 传播。
+- 在现有 History／tree pause 路径补充检查点完整性与 `run_exited` 事件；尚未具备完整检查点的叶子不得开启自动恢复。
+- 实现只记录、不实际唤醒的 ContinuationController shadow；记录“本会自动恢复／会因何阻断”。
+- 对现有 `ResumePaused` 做适配层设计，保持人工恢复行为不变。
+- 增加预算、remaining deadline 和 progress digest 采集，验证同任务累计口径。
+- 同任务重派守卫先 shadow，记录会拒绝的新建实例，不改变 legacy 派发。
+
+验收：能够从事故审计区分哪一种触限、哪个实例、是否可恢复；shadow 不发送系统唤醒、不新增用户消息、不改变完成状态。
+
+#### PR B11-2：同 ID 自动续跑、父子等待与防重派 enforce
+
+改动：
+
+- 开启进程内 Domain／叶子／主 Agent 的同 ID 自动续跑；旧 run 退出后触发，带 cause／origin 的系统事件走内部入口。
+- Domain 续跑期间父保持 `awaiting_child/continuation_pending`；删除默认向上扩大成 `paused_on_child` 的路径。
+- 叶子触限先走检查点，不能将截断输出直接作为完成。
+- 同任务防重派 enforce，旧实例可恢复时拒绝新建。
+- 同 PR 必须交付累计次数、无进展、总墙钟和 Team token 熔断，不能先上无限自动循环再补限制。
+- 统一 `maxPausedResumes` 与新任务预算；用户停止／取消清理所有待续跑事件。
+- 增加 `off|shadow|enforce` 总开关和分原因灰度开关。B11-1 默认 shadow；B11-2 在回归矩阵通过后，对明确的系统触限默认 enforce，保留一键关闭自动行为的回滚能力。
+
+验收：典型“子 Agent 一次上下文触限”和“主 Agent 一次迭代上限”都无需用户输入，同实例完成；父不暂停、不重派，最终完成通知只有一次。
+
+#### PR B11-3：重启安全恢复与全链路故障注入
+
+改动：
+
+- 加入启动恢复扫描、lease／fencing、重复事件去重和检查点兼容性校验。
+- 对状态确定且无副作用风险的任务开放受控恢复；`resume_interrupted` 默认 false。
+- 故障注入覆盖保存检查点前后、旧 run 退出前后、恢复调用前后、完成通知前后崩溃。
+- 用真实暂停案例做端到端回归，统计人工继续数、重派数、总 token、墙钟与最终正确性；未达到熔断和防双开要求不得扩大灰度。
+
+### 3A.13 B-11 验收矩阵
+
+| 场景 | 必须得到的结果 |
+|---|---|
+| Domain 子 Agent 上下文触限一次 | 无用户消息，同 Agent ID／attempt 自动恢复；父保持等待，不新建 Agent |
+| 叶子 token 触限一次 | History 与工作检查点保留，同角色实例恢复；截断文本不标 done |
+| 主 Agent 单次迭代上限 | 原主 session 自动续跑，不新增“继续”用户消息，不重新拆队 |
+| 子 Agent 恢复后完成 | 父只被唤醒一次，pending 只减一次，Mailbox 只有一个逻辑完成结果 |
+| 暂停期间模型或用户再次要求派同一任务 | 返回已有句柄或 `ErrResumableTaskExists`，节点数不增加 |
+| 续跑后只重复文本、没有新证据 | 触发无进展熔断，明确转人工，不无限循环 |
+| 达到任务累计续跑上限 | 所有嵌套节点共享计数，不再自动恢复；不能靠新 Agent 重置 |
+| 原总 Deadline／Team token 耗尽 | 不自动续跑，状态与原因准确，无额外预算 |
+| 用户显式停止、暂停或取消 | 待续跑定时器和系统唤醒全部失效，绝不自动复活 |
+| 等待审批、澄清或权限处理 | 不自动续跑，不以系统指令冒充用户决定 |
+| 定时器、恢复扫描和人工恢复同时到达 | single-flight／fencing 只允许一个 run，旧 run 迟到事件不能覆盖新状态 |
+| 进程在不确定工具副作用后崩溃 | 标 interrupted 并等待对账，不自动重放 |
+| 状态确定的安全检查点重启恢复 | 开关开启时同 ID 恢复；否则清楚标可人工恢复，不批量唤醒旧会话 |
+| 普通小型耦合功能 | 仍走 single_writer；B-11 不引入额外拆分、讨论或组织学习开销 |
+
+B-11 的业务验收不是“日志里出现了 resumed”，而是：**同一场可恢复触限演练中，人工继续次数为 0、同任务重派实例数为 0、最终交付证据完整，同时熔断测试证明不会无限自动执行。**
 
 ---
 
@@ -800,17 +1126,20 @@ C-06 状态保持 **未立项、默认不建设**。22 号文档第 12 节已经
 
 | 顺序 | PR | 可独立验收的产物 | 解锁条件 |
 |---|---|---|---|
-| 1 | U02-1 | Manifest v2 shadow、全来源清单、冲突 fixtures | 无；直接开始 |
-| 2 | U02-2 | 冲突裁决、required 保真、撤回与恢复重检 | U02-1 对拍可信 |
-| 3 | B03-1／B03-2 | VerificationReport、AgentResult v2、显式终态 | 可与 U02-2 部分并行，接口先冻结 |
-| 4 | B03-3 | 风险 DoD enforce，新路径状态可信 | B03-1／2 全终态回归通过 |
-| 5 | C03-1 | 精确 task／attempt 绑定，无自动行为 | B03 状态语义可用 |
-| 6 | C03-2／3／4 | 持久防重、ReadyScheduler、恢复和集成 | U02 enforce＋B03 enforce 均可用 |
-| 7 | C05-1 | 团队经验候选，保持 shadow | U02 SourceID＋B03 Report 可用 |
-| 8 | C05-2／3 | eval、受控晋升、反馈和回滚 | C05-1 候选质量可审计 |
-| 9 | C-06 决策包 | go／stop 结论 | C-03 与 controlled_parallel 有同条件基线 |
+| 1 | B11-1 | 暂停原因、检查点、预算／进展审计、续跑与防重派 shadow | 无；最高优先级直接开始 |
+| 2 | B11-2 | 同 ID 自动续跑、父子等待、叶子检查点、防重派和熔断 enforce | B11-1 对拍可信，检查点完整性通过 |
+| 3 | B11-3 | 重启安全恢复、lease／fencing 和崩溃故障注入 | B11-2 进程内矩阵全通过 |
+| 4 | U02-1 | Manifest v2 shadow、全来源清单、冲突 fixtures | B-11 主链路不再依赖人工反复继续 |
+| 5 | U02-2 | 冲突裁决、required 保真、撤回与恢复重检 | U02-1 对拍可信 |
+| 6 | B03-1／B03-2 | VerificationReport、AgentResult v2、显式终态 | 可与 U02-2 部分并行，接口先冻结 |
+| 7 | B03-3 | 风险 DoD enforce，新路径状态可信 | B03-1／2 全终态回归通过 |
+| 8 | C03-1 | 精确 task／attempt 绑定，无自动行为 | B03 状态语义可用 |
+| 9 | C03-2／3／4 | 持久防重、ReadyScheduler、恢复和集成 | U02 enforce＋B03 enforce 均可用；复用 B-11 控制面 |
+| 10 | C05-1 | 团队经验候选，保持 shadow | U02 SourceID＋B03 Report 可用 |
+| 11 | C05-2／3 | eval、受控晋升、反馈和回滚 | C05-1 候选质量可审计 |
+| 12 | C-06 决策包 | go／stop 结论 | C-03 与 controlled_parallel 有同条件基线 |
 
-C-05 与 C-03 可以在 U-02＋B-03 后由不同开发者并行；C-06 不应抢占前两项的开发资源。
+B11-3 与 U02-1 可由不同开发者并行，但 B11-2 未通过前不要扩大其他自动执行能力。C-05 与 C-03 可以在 U-02＋B-03 后由不同开发者并行；C-06 不应抢占 B-11、U-02、B-03 的开发资源。
 
 ### 9.2 建议默认配置
 
@@ -818,8 +1147,13 @@ C-05 与 C-03 可以在 U-02＋B-03 后由不同开发者并行；C-06 不应抢
 
 ```yaml
 agent:
-  context_manifest_mode: shadow       # off|shadow|enforce
-  verification_policy_mode: shadow   # off|shadow|enforce
+  continuation_mode: enforce           # off|shadow|enforce；B11-1 先 shadow，B11-2 验收后对系统触限 enforce
+  auto_resume_max_per_task: 2          # root/domain/leaf 共享的任务累计次数
+  auto_resume_no_progress_limit: 1     # 容忍一轮零可验证进展，再次触限转人工
+  resume_interrupted: false            # 进程重启后默认不自动恢复不确定现场
+
+  context_manifest_mode: shadow        # off|shadow|enforce
+  verification_policy_mode: shadow    # off|shadow|enforce
   auto_dispatch_enabled: false
   auto_dispatch_rescan_sec: 5
   auto_dispatch_max_attempts: 1
@@ -836,27 +1170,30 @@ memory:
 
 启动校验：
 
+- continuation enforce 只对明确可恢复的系统原因生效；缺检查点、预算字段非法或旧 run 未退出时不得自动启动，转人工并报警。
+- `auto_resume_max_per_task` 必须复用同一任务累计计数，不能每个 Agent 各自计数；旧 `maxPausedResumes` 只能经兼容映射保留，不能形成第二套独立预算。
+- continuation shadow／off 不得伪造用户输入；用户显式暂停、取消、审批和硬预算在任何模式下均不自动恢复。
 - auto_dispatch 开启时，Manifest 和 verification policy 必须 enforce，否则 fail-fast，不静默降级。
 - auto_dispatch 允许角色、重试、集成责任和审批档不合法时拒绝启动新计划。
 - self-claim 不属于上述默认配置，只有 C-06 go 后才加入且默认 false。
-- 所有新开关关闭时，legacy delegate、通知式依赖门、长期记忆撤回行为保持不变。
+- 除 B-11 已明确验收的系统续跑外，其余新开关关闭时，legacy delegate、通知式依赖门、长期记忆撤回行为保持不变。
 
 ## 10. 全局测试与故障注入
 
 ### 10.1 测试层次
 
-1. **契约单测**：Manifest、冲突裁决、风险档、DoD、结果版本、计划 DAG、嵌套策略。
+1. **契约单测**：暂停原因、续跑预算与进展判定、Manifest、冲突裁决、风险档、DoD、结果版本、计划 DAG、嵌套策略。
 2. **存储集成**：真实 PostgreSQL 事务、唯一键、revision、fencing、晋升／回滚原子性、会话删除。
-3. **执行集成**：Dispatcher 权限与工具交集、精确 task 回写、取消、panic、timeout、partial、pause、恢复。
+3. **执行集成**：Dispatcher 权限与工具交集、精确 task 回写、取消、panic、timeout、partial、pause、同 ID 恢复、防重派和完成通知去重。
 4. **上下文矩阵**：跨项目、角色／任务隔离、untrusted 围栏、required 保真、撤回、压缩与恢复。
-5. **端到端**：依赖乱序、多依赖同时完成、独立分支、唯一集成、用户取消、缺证据阻断。
-6. **性能对照**：首次正确交付、端到端墙钟、等待／执行／验证／集成分项、token、返工和人工接管。
+5. **端到端**：主／子／叶子触限无需人工继续、无进展熔断、依赖乱序、多依赖同时完成、独立分支、唯一集成、用户取消、缺证据阻断。
+6. **性能对照**：首次正确交付、端到端墙钟、等待／执行／验证／集成分项、token、返工、人工继续次数和同任务重派实例数。
 
 建议在 `backend` 目录按改动范围执行：
 
 ```bash
 go test ./internal/team ./internal/domain/subagent ./internal/board ./internal/agent ./internal/store
-go test -race ./internal/team ./internal/domain/subagent ./internal/board
+go test -race ./internal/team ./internal/domain/subagent ./internal/board ./internal/agent
 go test ./...
 go build ./...
 ```
@@ -867,6 +1204,11 @@ go build ./...
 
 | 故障点 | 期望 |
 |---|---|
+| 子 Domain 系统触限、旧 run 尚未退出 | 只登记 continuation_pending，不双开；退出后才同 ID 恢复，父不进入人工暂停 |
+| 主 Agent／叶子系统触限 | 主 session 无伪造用户消息；叶子无部分假完成，均有累计预算与无进展熔断 |
+| 可恢复暂停期间再次派发同任务 | 防重派拒绝创建新 Agent，返回已有句柄或明确错误 |
+| 恢复后没有新工具结果、diff、测试或子任务进展 | 不更新 progress digest，达到阈值后转人工 |
+| 用户取消与待续跑事件并发 | cancel 获胜，旧事件因 fence 失效，不自动复活 |
 | Manifest 构建后、派发前撤回记忆 | 新输入不含旧条目；required 变化则重建／拒派 |
 | 运行中修改关键 Spec | 停止旧约束后续写入，生成明确失效事件，交上级处理 |
 | required 超预算／项目记忆服务故障 | required 不静默丢；optional 可按策略降级并留审计 |
@@ -882,6 +1224,10 @@ go build ./...
 
 ### 11.1 全部能力的完成定义
 
+- [ ] 可恢复系统触限不需要人工输入“继续”，主／子／叶子均按同 session／Agent ID／attempt 恢复，且不伪造用户消息。
+- [ ] Domain 自动续跑期间父不进入人工暂停；同任务重派实例数为 0，最终完成只唤醒父一次。
+- [ ] 累计续跑次数、无进展、Team token 和原总 Deadline 均会熔断；用户暂停／取消、审批、澄清和硬预算绝不自动恢复。
+- [ ] 叶子截断结果不冒充 done；重启后不确定副作用不自动重放。
 - [ ] 实际模型输入可由 Manifest 重放，required 保真，所有动态注入有来源、版本和裁决审计。
 - [ ] 撤回、冲突、跨项目、压缩恢复、暂停恢复和进程重启测试通过。
 - [ ] 新路径完成状态来自显式结果与逐项机器报告，不再从摘要猜测。
@@ -895,11 +1241,13 @@ go build ./...
 
 ### 11.2 明确禁止提前做
 
-1. 未修精确 TaskBinding，不启动自动调度。
-2. 未接 B-03，不以 Agent 文本完成状态自动解锁依赖。
-3. 未接 U-02，不把冻结 Manifest 只当审计字段而继续走隐式注入。
-4. 未证明命令／截图／探针与具体验收关联，不标逐项 passed。
-5. 不把 Mailbox 幂等键当成执行 exactly-once；不对状态不确定的有副作用任务自动重放。
-6. 不通过 C-03 偷渡 C-06 的自由认领、空转 Worker 和无集成者拓扑。
-7. 不打开旧块记忆自动写入，不让团队结果直接写用户画像或全局长期经验。
-8. 不为了“统一架构”一次性删除 legacy delegate；先 shadow、对照、灰度，再退役。
+1. 未完成检查点、旧 run 退出确认、累计预算和无进展熔断，不开启自动续跑 enforce。
+2. 不用 `sendMessage("继续")` 伪造用户恢复，不在旧实例可恢复时新建同任务 Agent，不通过续跑重置总墙钟或 Team 预算。
+3. 未修精确 TaskBinding，不启动自动调度。
+4. 未接 B-03，不以 Agent 文本完成状态自动解锁依赖。
+5. 未接 U-02，不把冻结 Manifest 只当审计字段而继续走隐式注入。
+6. 未证明命令／截图／探针与具体验收关联，不标逐项 passed。
+7. 不把 Mailbox 幂等键当成执行 exactly-once；不对状态不确定的有副作用任务自动重放。
+8. 不通过 C-03 偷渡 C-06 的自由认领、空转 Worker 和无集成者拓扑。
+9. 不打开旧块记忆自动写入，不让团队结果直接写用户画像或全局长期经验。
+10. 不为了“统一架构”一次性删除 legacy delegate；先 shadow、对照、灰度，再退役。

@@ -14,6 +14,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/mailbox"
+	"github.com/blockmemory/agent/backend/internal/team"
 )
 
 // newPlanTestEnv 构造带 board 接线的 Dispatcher（write_plan 工具注册）。
@@ -69,6 +70,62 @@ func TestWritePlanTool_RoundTrip(t *testing.T) {
 	if cycleRes.Success || !strings.Contains(cycleRes.Error, "环依赖") && !strings.Contains(cycleRes.Error, "cycle") {
 		t.Fatalf("cycle plan should be rejected, got: %+v", cycleRes)
 	}
+}
+
+// TestExactTaskBinding 精确绑定：依赖只查绑定任务；看板回写只动该任务且 fence 旧 attempt。
+func TestExactTaskBinding(t *testing.T) {
+	d, _, bm, toolsReg := newPlanTestEnv(t, &mockProvider{text: "done"})
+	_, err := toolsReg.Dispatch(dispatchCtx(), "write_plan", map[string]any{
+		"goal": "同域双任务",
+		"tasks": []any{
+			map[string]any{"id": "a", "title": "A", "domain": "同域"},
+			map[string]any{"id": "b", "title": "B", "domain": "同域", "depends_on": []any{"a"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("write_plan: %v", err)
+	}
+	b := bm.Get("s1")
+	if b == nil {
+		t.Fatal("board missing")
+	}
+	ctxB := withTaskBinding(dispatchCtx(), team.TaskBinding{TaskID: "b", AttemptID: "b-att-1"})
+	if gate := d.checkDepGate(ctxB, "s1", "同域"); gate == "" || !strings.Contains(gate, "a") {
+		t.Fatalf("bound task b must wait for a: %q", gate)
+	}
+	if err := b.AssignBound("a", "a-att-1", "s1/domain-1"); err != nil {
+		t.Fatalf("assign a: %v", err)
+	}
+	if err := b.FinalizeBound("a", "a-att-1", board.TaskDone, "ok"); err != nil {
+		t.Fatalf("finalize a: %v", err)
+	}
+	if gate := d.checkDepGate(ctxB, "s1", "同域"); gate != "" {
+		t.Fatalf("bound task b should be ready after a done: %q", gate)
+	}
+	// 绑定回写 b：只动 b，旧 attempt 拒绝。
+	if err := b.AssignBound("b", "b-att-1", "s1/domain-2"); err != nil {
+		t.Fatalf("assign b: %v", err)
+	}
+	d.boardUpdate(withTaskBinding(dispatchCtx(), team.TaskBinding{TaskID: "b", AttemptID: "b-att-2"}), "s1", "同域", board.TaskDone, "late")
+	if got := taskByID(b.Snapshot(), "b"); got.Status == board.TaskDone {
+		t.Fatalf("stale attempt must not finalize b: %+v", got)
+	}
+	d.boardUpdate(withTaskBinding(dispatchCtx(), team.TaskBinding{TaskID: "b", AttemptID: "b-att-1"}), "s1", "同域", board.TaskDone, "ok")
+	if got := taskByID(b.Snapshot(), "b"); got.Status != board.TaskDone {
+		t.Fatalf("bound finalize should mark b done: %+v", got)
+	}
+	if got := taskByID(b.Snapshot(), "a"); got.Status != board.TaskDone {
+		t.Fatalf("a must remain done: %+v", got)
+	}
+}
+
+func taskByID(snap board.Snapshot, id string) board.SubTask {
+	for _, t := range snap.Tasks {
+		if t.ID == id {
+			return t
+		}
+	}
+	return board.SubTask{}
 }
 
 // TestDispatchDepGate 依赖门：依赖未完成拒绝派发；完成后放行。

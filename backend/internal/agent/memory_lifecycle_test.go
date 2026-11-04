@@ -476,6 +476,37 @@ func TestEffectiveBlockProjectOverridesGlobalAndIsolatesProjects(t *testing.T) {
 	}
 }
 
+// TestEffectiveItemsExcludesRetractedAndIsolatesProjects U-02：Manifest 结构化条目
+// 只来自 active 有效视图，撤回条目物理缺席，空项目键不得跨项目读取。
+func TestEffectiveItemsExcludesRetractedAndIsolatesProjects(t *testing.T) {
+	lc, repo, sc := newLifecycleFixture(t, RetractionModeEnforce)
+	keep := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeProject, ProjectKey: sc.ProjectKey, MemoryKey: "build", Content: "项目A用 vite"})
+	gone := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeProject, ProjectKey: sc.ProjectKey, MemoryKey: "old", Content: "项目A旧结论"})
+	addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeProject, ProjectKey: "d:/proj/other", MemoryKey: "build", Content: "项目B用 webpack"})
+	addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, MemoryKey: "tone", Content: "全局偏好"})
+	if _, err := lc.RetractByID(context.Background(), "", gone.ID, "user rejected"); err != nil {
+		t.Fatalf("retract: %v", err)
+	}
+
+	items := lc.EffectiveItems(context.Background(), "", sc.ProjectKey)
+	seen := map[string]bool{}
+	for _, it := range items {
+		seen[it.ID] = true
+		if it.ID == gone.ID {
+			t.Fatal("撤回条目不得进入 Manifest 有效视图")
+		}
+		if strings.Contains(it.Content, "项目B") {
+			t.Fatal("跨项目条目不得进入当前项目视图")
+		}
+	}
+	if !seen[keep.ID] {
+		t.Fatalf("active 项目条目缺失: %+v", items)
+	}
+	if got := lc.EffectiveItems(context.Background(), "", ""); len(got) != 1 || got[0].MemoryKey != "tone" {
+		t.Fatalf("空项目键只应返回全局条目: %+v", got)
+	}
+}
+
 func TestSyncHumanEditRetractsEveryOrigin(t *testing.T) {
 	lc, repo, _ := newLifecycleFixture(t, RetractionModeEnforce)
 	legacy := addActive(t, repo, store.MemoryItem{Scope: store.MemoryScopeUser, Origin: store.MemoryOriginLegacyImport, MemoryKey: "lesson.legacy", Content: "旧自动污染"})

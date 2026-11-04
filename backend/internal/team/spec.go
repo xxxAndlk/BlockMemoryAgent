@@ -22,24 +22,26 @@ const (
 
 // Spec 是版本化团队定义。
 type Spec struct {
-	ID            string     `yaml:"id" json:"id"`
-	Version       string     `yaml:"version" json:"version"`
-	Roles         []RoleSpec `yaml:"roles" json:"roles"`
-	Policies      Policies   `yaml:"policies" json:"policies"`
-	DefaultBudget int64      `yaml:"default_budget" json:"default_budget"`
-	DoD           []string   `yaml:"dod" json:"dod"`
-	MemoryScopes  []string   `yaml:"memory_scopes" json:"memory_scopes"`
+	ID            string              `yaml:"id" json:"id"`
+	Version       string              `yaml:"version" json:"version"`
+	Roles         []RoleSpec          `yaml:"roles" json:"roles"`
+	Policies      Policies            `yaml:"policies" json:"policies"`
+	DefaultBudget int64               `yaml:"default_budget" json:"default_budget"`
+	DoD           []string            `yaml:"dod" json:"dod"`
+	MemoryScopes  []string            `yaml:"memory_scopes" json:"memory_scopes"`
+	Verification  *VerificationPolicy `yaml:"verification" json:"verification,omitempty"`
 }
 
 // RoleSpec 是团队内的角色包声明：角色本身仍由 role.Registry 定义，
 // 这里只声明本团队如何使用它（工具、可派发关系、验收与实例上限）。
 type RoleSpec struct {
-	ID           string   `yaml:"id" json:"id"`
-	RoleID       string   `yaml:"role_id" json:"role_id"`
-	Tools        []string `yaml:"tools" json:"tools"`
-	CanCall      []string `yaml:"can_call" json:"can_call"`
-	DoD          []string `yaml:"dod" json:"dod"`
-	MaxInstances int      `yaml:"max_instances" json:"max_instances"`
+	ID           string              `yaml:"id" json:"id"`
+	RoleID       string              `yaml:"role_id" json:"role_id"`
+	Tools        []string            `yaml:"tools" json:"tools"`
+	CanCall      []string            `yaml:"can_call" json:"can_call"`
+	DoD          []string            `yaml:"dod" json:"dod"`
+	MaxInstances int                 `yaml:"max_instances" json:"max_instances"`
+	Verification *VerificationPolicy `yaml:"verification" json:"verification,omitempty"` // 只允许收紧
 }
 
 // Policies 团队级策略。
@@ -113,6 +115,20 @@ func (s *Spec) Normalize() error {
 	default:
 		return fmt.Errorf("team spec %s: invalid approval %q", s.ID, s.Policies.Approval)
 	}
+	// 验证策略（B-03）：默认 R2；production 审批最低 R3，不允许因“任务小”降档。
+	if s.Verification == nil {
+		s.Verification = &VerificationPolicy{}
+	}
+	if err := normalizeVerificationPolicy(s.Verification); err != nil {
+		return fmt.Errorf("team spec %s: %w", s.ID, err)
+	}
+	if s.Policies.Approval == "production" && RiskRank(s.Verification.Risk) < 3 {
+		s.Verification.Risk = RiskR3
+		s.Verification.RequiredLevels = append([]string(nil), riskLevels[RiskR3]...)
+		if err := normalizeVerificationPolicy(s.Verification); err != nil {
+			return fmt.Errorf("team spec %s: %w", s.ID, err)
+		}
+	}
 
 	seen := make(map[string]bool, len(s.Roles))
 	for i := range s.Roles {
@@ -128,6 +144,11 @@ func (s *Spec) Normalize() error {
 		seen[r.ID] = true
 		if r.MaxInstances < 0 {
 			return fmt.Errorf("team spec %s: role %s max_instances must be >= 0", s.ID, r.ID)
+		}
+		if r.Verification != nil {
+			if err := normalizeVerificationPolicy(r.Verification); err != nil {
+				return fmt.Errorf("team spec %s: role %s: %w", s.ID, r.ID, err)
+			}
 		}
 	}
 	return nil
@@ -179,6 +200,23 @@ func ValidateNested(parent, child *Spec) error {
 		if len(p.Tools) > 0 && !subset(c.Tools, p.Tools) {
 			return fmt.Errorf("nested team %s: role %q tools exceed parent", child.ID, c.ID)
 		}
+		if err := stricterThan(effectiveVerification(parent, &p), effectiveVerification(child, &c)); err != nil {
+			return fmt.Errorf("nested team %s: role %q %w", child.ID, c.ID, err)
+		}
+	}
+	if err := stricterThan(parent.Verification, child.Verification); err != nil {
+		return fmt.Errorf("nested team %s: %w", child.ID, err)
+	}
+	return nil
+}
+
+// effectiveVerification 角色未覆盖时继承团队默认策略。
+func effectiveVerification(spec *Spec, role *RoleSpec) *VerificationPolicy {
+	if role != nil && role.Verification != nil {
+		return role.Verification
+	}
+	if spec != nil {
+		return spec.Verification
 	}
 	return nil
 }

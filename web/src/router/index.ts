@@ -107,6 +107,13 @@ const routes: Array<RouteRecordRaw> = [
         meta: { title: '工作流运行', icon: 'SetUp' }
       },
       {
+        // C-03 自动调度运行页：按会话查看 attempt 状态并手动触发 reconcile。
+        path: 'team',
+        name: 'TeamAutoDispatch',
+        component: () => import('@/views/team/index.vue'),
+        meta: { title: '自动调度', icon: 'Connection' }
+      },
+      {
         path: 'flow',
         name: 'Flow',
         component: () => import('@/views/flow/index.vue'),

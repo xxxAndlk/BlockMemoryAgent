@@ -4,7 +4,22 @@
 >
 > 阅读顺序：先看 [21 多 Agent 设计详解](21-多Agent设计详解.md) 了解现行为，再用本文确定改造顺序。本文是评审与修复清单，不代表其中任何修复已经实施。
 >
-> **修复状态（2026-11-03）**：U-01 的拆分提示冲突、A-01（权威 Agent 身份）、A-02（Parents 目标白名单语义）、A-03（工具授权取父级有效工具面）已落地。P1 批次另落地 B-01（安全 profile）、B-02（审批 fail-closed）、B-04（会话 token 预算）、B-05（共享写路径强制乐观锁）、B-06（Mailbox 幂等键）、B-09（AgentResult 信封）、B-10（token 用量指标）。详见 `doc/变更.md` 同日两条。U-02/B-08 已落地注入审计（来源/作用域/字符数/隔离丢弃原因 + manifest_version/required/optional）。B-07 增加启动恢复矩阵报告。C-01/C-02/C-04 首版模块 `internal/team` 落地（版本化 Spec、YAML 校验、有界嵌套 ValidateNested、角色包 RoleSpec），仅契约与校验，未接 Dispatcher/HTTP。其余：U-02 冲突裁决/来源优先级/撤回、B-03 分风险 DoD、C-03 自动调度、C-05 组织学习闭环、C-06 自认领实验尚未实施。
+> **修复状态（2026-11-03）**：U-01 的拆分提示冲突、A-01（权威 Agent 身份）、A-02（Parents 目标白名单语义）、A-03（工具授权取父级有效工具面）已落地。P1 批次另落地 B-01（安全 profile）、B-02（审批 fail-closed）、B-04（会话 token 预算）、B-05（共享写路径强制乐观锁）、B-06（Mailbox 幂等键）、B-09（AgentResult 信封）、B-10（token 用量指标）。详见 `doc/变更.md` 同日条目。
+>
+> **2026-11-03 第二批（按 23 号执行方案）**：
+> - **B-11 首版（进程内）**：Domain/叶子系统触限生成检查点并同 Agent ID 自动续跑（`agent.auto_resume_mode` 默认 enforce），父保持等待；任务级累计次数/无进展/原墙钟/Team token 熔断；可恢复实例存在时拒绝重派；`continuation_*` 审计事件。未完成：主 Agent 自身触限自动续跑、跨进程 interrupted 恢复。
+> - **U-02 首批（U02-1 + 部分 U02-2）**：`internal/team/context.go` 中立 `TaskContextManifest v2`；`context_manifest.go` 统一登记 agents_md/task_spec/shared_fact/skill/block_recall/project_memory/user_memory/task 来源，含 source_id/revision/hash/trust/scope；确定性冲突裁决（同 hash 去重保留高优先级、同 key 按来源 rank→trust→revision 择优、同 rank 未决、optional 超预算裁剪）；`agent.context_manifest_mode=off|shadow|enforce` 默认 shadow，enforce 在 required 超预算/未决/被 fork 丢弃时拒派；审计升级 v2（entry_id/conflict_key/source_id/source_revision/trust/content_hash/decision/artifact_ref + manifest_id/hash/actual_model_input_hash）；`MemoryLifecycle.EffectiveItems` 提供结构化 active 视图（撤回条目物理缺席）。运行中 required 失效停止、恢复/重放专用版本重检尚未实施。
+> - **B-03 首批（B03-1/B03-2 + 团队策略）**：`verification_report.go` 逐项 `VerificationReport`（command/screenshot/probe/file 证据引用与缺失原因，manual/legacy 不机器通过）；`AgentResult v2` 保留 v1 字段并携带报告、unresolved、failure_kind/retryable；`runSubAgentOnce` 全出口生成报告、notify 一次性消费；`team.Spec/RoleSpec` 增加 `VerificationPolicy`（R0-R3 默认层级、production 强制 R3、嵌套不可降档/取消人工签核）。运行时 `verification_policy_mode` enforce 与 board done 阻断尚未实施（当前报告为 shadow 记录）。
+> - **C-03 首批（C03-1）**：`team.TaskBinding` + `call_sub_agent(task_id/attempt_id/plan_version)` 精确绑定；依赖门只查绑定任务；`board.AssignBound/FinalizeBound` 按 attempt fence 旧结果；`TaskBoard.PlanVersion` 单调递增、重规划完整更新标题/依赖；无绑定仍走 Domain 整组兼容路径。ReadyScheduler、attempt Store、自动派发前预检（C03-2/3/4）尚未实施。
+> - **C-01/C-02/C-04**：`internal/team` 版本化 Spec/YAML 校验/嵌套有界校验 + `VerificationPolicy`，未接 HTTP 派发。
+> - **B-03 enforce**：`agent.verification_policy_mode=off|shadow|enforce` 默认 shadow；enforce 仅对 C-03 绑定任务阻断未通过报告的 done。
+> - **C-03 自动调度**：`team_dispatch_attempts`（内存/PG，唯一键）、`ReadyScheduler`（默认关闭、5s 扫描、固定叶角色、block_dependents）、`DispatchBoundTask` 受控入口；计划任务需显式 `role_id+task`。
+> - **C-05 组织学习**：团队经验候选（team_evolver）、严格防复活、shadow 默认、verified 后项目作用域人工晋升、同 key active 原子替换、撤回/隔离/回滚与 `verify/promote/rollback` API；真实同预算 eval runner（配置 `memory.eval_tasks` 后接轻量模型 baseline/treatment + judge）；曝光聚合 API。
+> - **B-11 跨进程**：启动把 reserved/running attempt 标 interrupted；`resume_interrupted=false` 默认不重放，开启时建新 attempt_no。
+> - **U-02 运行中失效**：enforce 下每轮比对 AGENTS.md/任务规范 hash，变化即停止并交上级（board blocked）。
+> - **C-03 编排与页面**：write_plan/终态事件唤醒、启动 reconcile、`/api/team/attempts`、`/api/team/reconcile`、Web `/team` 自动调度页、唯一 integration 校验。
+> - **C-06 自认领（用户批准，默认关闭）**：三表事务 Claim/lease/fencing、ClaimService、WorkerSupervisor、DispatchClaimed/FinishClaim、`/api/team/self-claim/*`；`agent.self_claim_enabled=false` 默认关闭。
+> - **仍未实施**：跨进程自动恢复默认仍关闭（需显式 `resume_interrupted=true` 且只建新 attempt）；C-06 未做真实对照实验与大规模灰度；U-02 恢复专用 required 重检仍依赖新派发重建。
 
 ## 1. 评估口径
 

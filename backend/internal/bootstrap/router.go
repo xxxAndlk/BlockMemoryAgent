@@ -58,11 +58,11 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.GET("/sessions/:id/export", apiHandler.SessionExportHandler)
 
 	// 注册全局/系统级端点。
-	api.GET("/metrics", apiHandler.MetricsHandler)           // 指标聚合（Prometheus 格式）
-	api.GET("/status", apiHandler.StatusHandler)             // 服务状态
-	api.GET("/metrics/timeline", apiHandler.TimelineHandler) // 指标时间线
-	api.GET("/activity", apiHandler.ActivityHandler)         // 活动日志
-	api.GET("/capabilities", apiHandler.CapabilitiesHandler) // 装机能力自检（TODO #18-1 T28，settings 能力面板数据源）
+	api.GET("/metrics", apiHandler.MetricsHandler)            // 指标聚合（Prometheus 格式）
+	api.GET("/status", apiHandler.StatusHandler)              // 服务状态
+	api.GET("/metrics/timeline", apiHandler.TimelineHandler)  // 指标时间线
+	api.GET("/activity", apiHandler.ActivityHandler)          // 活动日志
+	api.GET("/capabilities", apiHandler.CapabilitiesHandler)  // 装机能力自检（TODO #18-1 T28，settings 能力面板数据源）
 	api.GET("/export/memory", apiHandler.MemoryExportHandler) // 记忆库导出 zip（TODO #18-2 T29：知识/画像/技能包）
 
 	// DAG 相关端点：调度器未启用时各 handler 自行返回 503。
@@ -84,34 +84,44 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	}
 
 	// 其他业务端点。
-	api.POST("/snapshot", apiHandler.SnapshotHandler)                         // 快照管理
-	api.POST("/memory/search", apiHandler.MemorySearchHandler)                // 记忆检索
-	api.GET("/memory/levels", apiHandler.MemoryLevelsHandler)                 // 记忆层级
-	api.GET("/memory/eval", apiHandler.MemoryEvalHandler)                     // 记忆评估
-	api.GET("/skills", apiHandler.SkillsHandler)                              // Skill 列表
-	api.GET("/files", apiHandler.FilesHandler)                                // 文件列表
-	api.GET("/files/content", apiHandler.FileContentHandler)                  // 文件内容读取
-	api.PUT("/files/content", apiHandler.SaveFileContentHandler)              // 在线编辑保存（TODO #26 G，限会话工作区）
-	api.GET("/files/raw", apiHandler.FileRawHandler)                          // 文件原始字节（图片内联/下载，限工作区）
-	api.GET("/files/reveal", apiHandler.FileRevealHandler)                    // 在文件夹中显示（TODO #26 C，explorer/open -R/xdg-open，限工作区）
-	api.GET("/editors", apiHandler.EditorsHandler)                            // 已安装编辑器扫码（TODO #26 F，60s 缓存）
-	api.POST("/editors/open", apiHandler.EditorOpenHandler)                   // 编辑器/系统默认打开（限工作区/WriteFile 产物路径）
-	api.GET("/fs/browse", apiHandler.BrowseFSHandler)                         // 目录浏览（前端工作目录选择器）
-	api.GET("/fs/tree", apiHandler.FSTreeHandler)                             // 会话工作区目录树（TODO #26 E，depth/节点数双上限+黑名单）
-	api.POST("/fs/pick-dir", apiHandler.PickDirHandler)                       // 系统原生目录选择框（服务端主机）
-	api.GET("/profile", apiHandler.ProfileHandler)                            // 用户画像查看（TODO #28）
-	api.PUT("/profile", apiHandler.SaveProfileHandler)                        // 用户画像编辑
+	api.POST("/snapshot", apiHandler.SnapshotHandler)            // 快照管理
+	api.POST("/memory/search", apiHandler.MemorySearchHandler)   // 记忆检索
+	api.GET("/memory/levels", apiHandler.MemoryLevelsHandler)    // 记忆层级
+	api.GET("/memory/eval", apiHandler.MemoryEvalHandler)        // 记忆评估
+	api.GET("/skills", apiHandler.SkillsHandler)                 // Skill 列表
+	api.GET("/files", apiHandler.FilesHandler)                   // 文件列表
+	api.GET("/files/content", apiHandler.FileContentHandler)     // 文件内容读取
+	api.PUT("/files/content", apiHandler.SaveFileContentHandler) // 在线编辑保存（TODO #26 G，限会话工作区）
+	api.GET("/files/raw", apiHandler.FileRawHandler)             // 文件原始字节（图片内联/下载，限工作区）
+	api.GET("/files/reveal", apiHandler.FileRevealHandler)       // 在文件夹中显示（TODO #26 C，explorer/open -R/xdg-open，限工作区）
+	api.GET("/editors", apiHandler.EditorsHandler)               // 已安装编辑器扫码（TODO #26 F，60s 缓存）
+	api.POST("/editors/open", apiHandler.EditorOpenHandler)      // 编辑器/系统默认打开（限工作区/WriteFile 产物路径）
+	api.GET("/fs/browse", apiHandler.BrowseFSHandler)            // 目录浏览（前端工作目录选择器）
+	api.GET("/fs/tree", apiHandler.FSTreeHandler)                // 会话工作区目录树（TODO #26 E，depth/节点数双上限+黑名单）
+	api.POST("/fs/pick-dir", apiHandler.PickDirHandler)          // 系统原生目录选择框（服务端主机）
+	api.GET("/profile", apiHandler.ProfileHandler)               // 用户画像查看（TODO #28）
+	api.PUT("/profile", apiHandler.SaveProfileHandler)           // 用户画像编辑
 	// 长期记忆条目管理（2026-10-24 撤回与污染修复 §9.1）：只改状态、不物理删历史。
-	api.GET("/memory/items", apiHandler.ListMemoryItemsHandler)                                      // 有效/候选/隔离/替换/撤回条目
-	api.GET("/memory/items/:id", apiHandler.GetMemoryItemHandler)                                    // 单条详情
-	api.GET("/memory/items/:id/events", apiHandler.ListMemoryItemEventsHandler)                       // 事件时间线（只追加审计）
-	api.POST("/memory/items/:id/retract", apiHandler.RetractMemoryItemHandler)                        // 撤回
-	api.POST("/memory/items/:id/quarantine", apiHandler.QuarantineMemoryItemHandler)                  // 隔离（立即不注入）
-	api.POST("/memory/items/:id/restore", apiHandler.RestoreMemoryItemHandler)                        // 恢复（针对具体条目）
-	api.GET("/project/preferences", apiHandler.ProjectPreferencesHandler)     // 项目偏好查看（2026-09-02 设计 §5）
-	api.PUT("/project/preferences", apiHandler.SaveProjectPreferencesHandler) // 项目偏好编辑
-	api.GET("/project/tester-config", apiHandler.TesterConfigHandler)         // 测试助手验收开关查看（工作目录级）
-	api.PUT("/project/tester-config", apiHandler.SaveTesterConfigHandler)     // 测试助手验收开关编辑
+	api.GET("/memory/items", apiHandler.ListMemoryItemsHandler)                      // 有效/候选/隔离/替换/撤回条目
+	api.GET("/memory/items/:id", apiHandler.GetMemoryItemHandler)                    // 单条详情
+	api.GET("/memory/items/:id/events", apiHandler.ListMemoryItemEventsHandler)      // 事件时间线（只追加审计）
+	api.POST("/memory/items/:id/retract", apiHandler.RetractMemoryItemHandler)       // 撤回
+	api.POST("/memory/items/:id/quarantine", apiHandler.QuarantineMemoryItemHandler) // 隔离（立即不注入）
+	api.POST("/memory/items/:id/restore", apiHandler.RestoreMemoryItemHandler)       // 恢复（针对具体条目）
+	api.POST("/memory/items/:id/verify", apiHandler.VerifyMemoryCandidateHandler)    // C-05 候选验证（verified，不激活）
+	api.POST("/memory/items/:id/promote", apiHandler.PromoteMemoryCandidateHandler)  // C-05 受控晋升（enforce + 人工）
+	api.POST("/memory/items/:id/rollback", apiHandler.RollbackMemoryItemHandler)     // C-05 回滚（撤回问题版本+恢复历史版本）
+	api.GET("/memory/items/:id/exposure", apiHandler.ExposureMemoryItemHandler)      // C-05 曝光/结果反馈聚合
+	api.GET("/team/attempts", apiHandler.ListTeamAttemptsHandler)                    // C-03 自动派发 attempt 列表
+	api.POST("/team/reconcile", apiHandler.ReconcileTeamHandler)                     // C-03 手动触发确定性调度
+	api.POST("/team/approve", apiHandler.ApproveTeamPlanHandler)                     // C-03 人工批准当前计划版本
+	api.POST("/team/self-claim/plan", apiHandler.SelfClaimPlanHandler)               // C-06 冻结自认领计划
+	api.GET("/team/self-claim/tasks", apiHandler.SelfClaimTasksHandler)              // C-06 任务投影
+	api.POST("/team/self-claim/run", apiHandler.SelfClaimRunHandler)                 // C-06 手动触发认领扫描
+	api.GET("/project/preferences", apiHandler.ProjectPreferencesHandler)            // 项目偏好查看（2026-09-02 设计 §5）
+	api.PUT("/project/preferences", apiHandler.SaveProjectPreferencesHandler)        // 项目偏好编辑
+	api.GET("/project/tester-config", apiHandler.TesterConfigHandler)                // 测试助手验收开关查看（工作目录级）
+	api.PUT("/project/tester-config", apiHandler.SaveTesterConfigHandler)            // 测试助手验收开关编辑
 
 	// 自进化技能库 + 进化日志（2026-09-02 设计 §8）。
 	api.GET("/skills/learned", apiHandler.ListLearnedSkillsHandler)                  // 技能库列表（含禁用）
@@ -135,32 +145,32 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/plugins/:id/enable", apiHandler.EnablePluginHandler)   // 热启用
 	api.POST("/plugins/:id/disable", apiHandler.DisablePluginHandler) // 热停用
 	api.POST("/plugins/reload", apiHandler.ReloadPluginsHandler)      // 重读配置 + 重扫 plugins.d/
-	api.GET("/plugins/docker", apiHandler.DockerPluginsHandler)      // docker 依赖自检（镜像/容器状态）
-	api.POST("/plugins/cleanup", apiHandler.CleanupPluginsHandler)   // 清理 docker 残留（?all=true 含运行中 keeper）
+	api.GET("/plugins/docker", apiHandler.DockerPluginsHandler)       // docker 依赖自检（镜像/容器状态）
+	api.POST("/plugins/cleanup", apiHandler.CleanupPluginsHandler)    // 清理 docker 残留（?all=true 含运行中 keeper）
 
 	// 外部 Agent 注册表（config/external_agents.yaml）：清单 + 热重载。
 	// 处理器与 SetExternalAgentProvider 早就接好，但路由此前漏注册——请求会落到 SPA
 	// 静态回退返回 index.html，前端报 "Unexpected token '<' ... is not valid JSON"。
-	api.GET("/external-agents", apiHandler.ListExternalAgentsHandler)        // 注册表清单（含 disabled，附安装状态）
+	api.GET("/external-agents", apiHandler.ListExternalAgentsHandler)           // 注册表清单（含 disabled，附安装状态）
 	api.POST("/external-agents/reload", apiHandler.ReloadExternalAgentsHandler) // 重读 yaml 并热更新工具定义
 
 	// 界面部件（Widget）管理 API：目录包热载 + 卡片文件服务 + 瞬时数据推送 + 错误回报。
 	// 静态段 reload/push/report 与 :id 同层注册（与 plugins 段同款，gin 静态优先）。
-	api.GET("/widgets", apiHandler.ListWidgetsHandler)                 // 部件列表
-	api.GET("/widgets/:id", apiHandler.GetWidgetHandler)               // 部件详情（Info JSON；webhook 附顶层 hook_url）
-	api.POST("/widgets", apiHandler.CreateWidgetHandler)               // 新建部件（含连接器；webhook 响应带 token + hook_url）
-	api.PUT("/widgets/:id/connector", apiHandler.UpdateWidgetConnectorHandler) // 更新连接器段（可 regen_token 再生 token）
-	api.POST("/widgets/:id/poll", apiHandler.PollWidgetHandler)        // 连接器立即执行一次（api/mcp），同步返回结果
-	api.POST("/widgets/:id/enable", apiHandler.EnableWidgetHandler)    // 热启用
-	api.POST("/widgets/:id/disable", apiHandler.DisableWidgetHandler)  // 热停用
-	api.POST("/widgets/reload", apiHandler.ReloadWidgetsHandler)       // 重扫 widgets/ 目录
-	api.GET("/widgets/:id/files/*path", apiHandler.HandleWidgetFile)   // 部件文件服务（iframe 渲染源；拒发 widget.json 与隐藏文件）
-		api.POST("/widgets/push", apiHandler.PushWidgetHandler)            // 瞬时数据推送（bridge 等进程插件）
-		api.POST("/widgets/report", apiHandler.ReportWidgetHandler)        // 部件渲染错误回报
-		api.POST("/widgets/action", apiHandler.WidgetActionHandler)        // 部件上行操作（卡片内用户交互）
-		api.DELETE("/widgets/:id", apiHandler.DeleteWidgetHandler)         // 软删（目录移入回收站）
-		api.GET("/widgets/trash", apiHandler.ListWidgetTrashHandler)       // 回收站条目列表
-		api.POST("/widgets/trash/:name/restore", apiHandler.RestoreWidgetTrashHandler) // 恢复回收站条目
+	api.GET("/widgets", apiHandler.ListWidgetsHandler)                             // 部件列表
+	api.GET("/widgets/:id", apiHandler.GetWidgetHandler)                           // 部件详情（Info JSON；webhook 附顶层 hook_url）
+	api.POST("/widgets", apiHandler.CreateWidgetHandler)                           // 新建部件（含连接器；webhook 响应带 token + hook_url）
+	api.PUT("/widgets/:id/connector", apiHandler.UpdateWidgetConnectorHandler)     // 更新连接器段（可 regen_token 再生 token）
+	api.POST("/widgets/:id/poll", apiHandler.PollWidgetHandler)                    // 连接器立即执行一次（api/mcp），同步返回结果
+	api.POST("/widgets/:id/enable", apiHandler.EnableWidgetHandler)                // 热启用
+	api.POST("/widgets/:id/disable", apiHandler.DisableWidgetHandler)              // 热停用
+	api.POST("/widgets/reload", apiHandler.ReloadWidgetsHandler)                   // 重扫 widgets/ 目录
+	api.GET("/widgets/:id/files/*path", apiHandler.HandleWidgetFile)               // 部件文件服务（iframe 渲染源；拒发 widget.json 与隐藏文件）
+	api.POST("/widgets/push", apiHandler.PushWidgetHandler)                        // 瞬时数据推送（bridge 等进程插件）
+	api.POST("/widgets/report", apiHandler.ReportWidgetHandler)                    // 部件渲染错误回报
+	api.POST("/widgets/action", apiHandler.WidgetActionHandler)                    // 部件上行操作（卡片内用户交互）
+	api.DELETE("/widgets/:id", apiHandler.DeleteWidgetHandler)                     // 软删（目录移入回收站）
+	api.GET("/widgets/trash", apiHandler.ListWidgetTrashHandler)                   // 回收站条目列表
+	api.POST("/widgets/trash/:name/restore", apiHandler.RestoreWidgetTrashHandler) // 恢复回收站条目
 
 	// webhook 回调端点（2026-10-17 连接器）：注册在无鉴权组——外部系统凭
 	// 部件 id + token 直推（token 即凭据），单部件 60s/60 次限流在 handler 内。
@@ -190,8 +200,8 @@ func apiHandlerOf(app *App) *server.APIHandler {
 		h.SetModelManager(mgr) // 模型动态切换（ReactService 实现；测试桩缺该能力时跳过）
 	}
 	if app.Postgres != nil {
-		h.SetLearnedSkills(app.Postgres.LearnedSkills) // 自进化技能库存储
-		h.SetLearnedSkillsDir(app.SkillsDir)           // 技能目录：DELETE 删文件安全校验（与 evolver 落库同口径）
+		h.SetLearnedSkills(app.Postgres.LearnedSkills)          // 自进化技能库存储
+		h.SetLearnedSkillsDir(app.SkillsDir)                    // 技能目录：DELETE 删文件安全校验（与 evolver 落库同口径）
 		h.SetRoleEvolution(app.RoleEvolution, app.RoleRegistry) // 角色自进化准则存储（≤300字/角色，AI 自维护）
 	}
 	h.SetSkillConsolidation(app.SkillConsolidation)   // 技能库整理（C 库存治理，未装配时端点 503）
@@ -200,6 +210,9 @@ func apiHandlerOf(app *App) *server.APIHandler {
 	if lc, ok := app.Agent.(interface{ MemoryLifecycle() *agent.MemoryLifecycle }); ok {
 		h.SetMemoryLifecycle(lc.MemoryLifecycle()) // 长期记忆条目管理（未装配时端点 503）
 	}
+	h.SetMemoryPromotion(app.Promotion)                                        // C-05 团队经验候选 verify/promote/rollback（未装配时 503）
+	h.SetTeamDispatch(app.AttemptStore, app.AutoDispatch)                      // C-03 自动调度 attempts/reconcile（未启用时 503）
+	h.SetSelfClaim(app.SelfClaim, app.SelfClaimStore, app.SelfClaimSupervisor) // C-06 自认领（默认关闭）
 	h.SetExternalAgentProvider(app.ExternalAgentList, app.ExternalAgentReload) // 外部 Agent 管理面（未装配时端点 503）
 	return h
 }

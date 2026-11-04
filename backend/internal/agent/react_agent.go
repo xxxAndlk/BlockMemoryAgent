@@ -179,6 +179,9 @@ type ReActAgent struct {
 	// 主循环顶部与 waitForChildren 内调用 Park：会话挂起期间阻塞（goroutine 真挂起），
 	// 恢复返回 nil 继续。为 nil 时零变化（热驻关闭时不注入）。
 	suspendGate SuspendGate
+	// contextGuard 可选的 required 上下文有效性检查（U-02）：每轮 LLM 调用前执行，
+	// 返回非空原因即停止本 run（错误包裹 ErrRequiredContextInvalid）。nil 时零变化。
+	contextGuard func(ctx context.Context) string
 	// msgLogger 可选的消息热层记录器（编排页对话视图）：每条入史消息同步热写。
 	// nil 时零行为。
 	msgLogger MessageLogger
@@ -505,6 +508,13 @@ func (a *ReActAgent) WithStreamIdleTimeout(d time.Duration) *ReActAgent {
 // WithSuspendGate 注入会话级挂起检查点。主循环顶部与 waitForChildren 内调用
 // Park：挂起期间阻塞，恢复返回 nil 继续循环。传 nil 关闭（默认关闭，热驻模式
 // 下由 dispatcher 注入给 domain 与叶子 Agent）。
+// WithContextGuard 注入 required 上下文有效性检查（U-02）：每轮 LLM 调用前执行，
+// 返回非空原因即停止本 run（ErrRequiredContextInvalid）。nil 关闭（默认）。
+func (a *ReActAgent) WithContextGuard(fn func(ctx context.Context) string) *ReActAgent {
+	a.contextGuard = fn
+	return a
+}
+
 func (a *ReActAgent) WithSuspendGate(g SuspendGate) *ReActAgent {
 	a.suspendGate = g
 	return a
@@ -685,6 +695,13 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 				return ReactResult{History: history}, err
 			}
 		}
+		// U-02：required 上下文在运行中失效（撤回/被新版覆盖/内容 hash 变化）→
+		// 停止后续 LLM 与工具调用，交上级重规划；不带着残缺约束继续产出。
+		if a.contextGuard != nil {
+			if reason := a.contextGuard(ctx); reason != "" {
+				return ReactResult{History: history}, fmt.Errorf("%w: %s", ErrRequiredContextInvalid, reason)
+			}
+		}
 		// P0-2 steering（TODO #14 T8）：generate 前补一次 drainMailbox，压缩用户注入
 		// 消息的插入延迟上界——上一轮工具执行期间经邮箱注入的用户消息，不必等到本轮
 		// 无 tool_calls 分支才可见，本轮请求即可带上。此处 history 以 tool 结果
@@ -748,7 +765,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 		if a.tokenBudget > 0 && a.subAgent {
 			if est := EstimateMessagesTokens(messages); est >= a.tokenBudget {
 				log.Printf("[react] context budget exceeded: role=%s est_tokens=%d budget=%d", a.role.Name, est, a.tokenBudget)
-				return ReactResult{History: history, LimitReached: true}, nil
+				return ReactResult{History: history, LimitReached: true, PauseCause: "context_threshold"}, nil
 			}
 		}
 
@@ -1064,7 +1081,7 @@ func (a *ReActAgent) RunWithHistory(ctx context.Context, input string, history [
 	// 达到最大迭代次数上限（仅 maxIter>0 时可能触发）：
 	// 不视为错误——返回 LimitReached 标记与完整历史，
 	// 由上层将会话置为暂停并提示用户发送消息续跑，而不是判定任务失败。
-	return ReactResult{History: history, LimitReached: true}, nil
+	return ReactResult{History: history, LimitReached: true, PauseCause: "iteration_limit"}, nil
 }
 
 // 停滞守卫阈值：连续 N 轮"无产出"（无产出性工具调用 ∧ 无 mailbox 新消息 ∧ 无终答）逐级响应。
@@ -1371,7 +1388,7 @@ var writeLockedTools = map[string]bool{"WriteFile": true, "EditFile": true, "Res
 var dispatchSerializedTools = map[string]bool{
 	"call_sub_agent": true, "call_sub_agents": true, "map_sub_agents": true,
 	"merge_worktree": true,
-	"cancel_agent": true, "pause_agent": true, "resume_agent": true,
+	"cancel_agent":   true, "pause_agent": true, "resume_agent": true,
 }
 
 // dispatchToolSerialized 带互斥的工具派发：写类工具按目标路径加锁、编排类工具

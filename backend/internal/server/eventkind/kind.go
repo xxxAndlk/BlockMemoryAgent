@@ -37,4 +37,5 @@ const (
 	Milestone        = "milestone"          // 子 Agent 中途里程碑播报
 	WorkflowUnit     = "workflow_unit"      // 工作流量产单元状态迁移事件（2026-10-16）
 	ContextInjection = "context_injection"  // 子 Agent 上下文注入审计（2026-11-03 U-02/B-08）
+	Continuation     = "continuation"       // 执行连续性审计（2026-11-03 B-11）
 )

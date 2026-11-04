@@ -65,8 +65,8 @@ func interceptClose(hwnd unsafe.Pointer) {
 }
 
 // showMainWindow 从托盘唤回窗口（最小化则先还原）。
-func showMainWindow(hwnd unsafe.Pointer) {
-	if hwnd == nil {
+func showMainWindow(hwnd windows.Handle) {
+	if hwnd == 0 {
 		return
 	}
 	if iconic, _, _ := procIsIconic.Call(uintptr(hwnd)); iconic != 0 {
@@ -78,16 +78,16 @@ func showMainWindow(hwnd unsafe.Pointer) {
 }
 
 // findWindowByTitle 找已有实例的主窗口（隐藏状态下也能找到）。
-func findWindowByTitle(title string) unsafe.Pointer {
+func findWindowByTitle(title string) windows.Handle {
 	p, err := windows.UTF16PtrFromString(title)
 	if err != nil {
-		return nil
+		return 0
 	}
 	h, _, _ := procFindWindowW.Call(0, uintptr(unsafe.Pointer(p)))
 	if h == 0 {
-		return nil
+		return 0
 	}
-	return unsafe.Pointer(h)
+	return windows.Handle(h)
 }
 
 // acquireSingleInstance 按安装目录创建命名互斥体；返回 (句柄, 是否首个实例)。

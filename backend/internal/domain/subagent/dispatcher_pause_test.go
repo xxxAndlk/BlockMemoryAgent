@@ -169,7 +169,7 @@ func TestRunSubAgent_AssistantLimitReachedPartialReturn(t *testing.T) {
 
 // TestResumePaused_ConcludesAfterResumeCap 验证 Paused domain 的续跑次数上限（maxPausedResumes=1）：
 // 首次 ResumePaused 正常续跑（mock 仍触限 -> re-pause，父 pending 不减、notify 一条"重新暂停"）；
-// 第二次 ResumePaused 触顶 -> 强制收口：tree.Finish Done + 父 mailbox notify（含"续跑上限"）+ 父 pending 减。
+// 第二次 ResumePaused 触顶 -> 未验证强制收口：tree.Unverified + 父 mailbox notify + 父 pending 减。
 // 绑定点在续跑层：续跑重置 fresh budget，无上限则"触限-暂停-续跑"环路永不收敛（v10 实证研磨 30 分钟）。
 func TestResumePaused_ConcludesAfterResumeCap(t *testing.T) {
 	d, _, mb, msgStore, tr, toolsReg := newPauseTestEnv(t, &tokenUsageProvider{text: "domain work"})
@@ -220,9 +220,9 @@ func TestResumePaused_ConcludesAfterResumeCap(t *testing.T) {
 	if !strings.Contains(r2.Text, "续跑上限") {
 		t.Fatalf("conclude text should mention resume cap, got %q", r2.Text)
 	}
-	waitForCond(t, "node done after conclude", func() bool {
+	waitForCond(t, "node unverified after conclude", func() bool {
 		n, ok := tr.Get(subID)
-		return ok && n.Status == orchestrator.StatusDone
+		return ok && n.Status == orchestrator.StatusUnverified
 	})
 	if got := d.PendingChildren("s1"); got != 0 {
 		t.Fatalf("pending after conclude = %d, want 0", got)
@@ -320,4 +320,3 @@ func TestRunSubAgent_ManualPauseRoutesToPausedTree(t *testing.T) {
 		t.Errorf("manual pause should notify parent once with pause subject, got %+v", drains)
 	}
 }
-

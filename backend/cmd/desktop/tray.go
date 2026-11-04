@@ -5,17 +5,17 @@
 package main
 
 import (
+	"golang.org/x/sys/windows"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"unsafe"
 
 	"github.com/energye/systray"
 )
 
 // startTray 创建托盘图标（非阻塞：内部有独立消息泵线程）。
 // hwnd 用函数是为了拿"当前"窗口句柄（窗口可能被隐藏/重建）。
-func startTray(root, base string, hwnd func() unsafe.Pointer, onExit func()) {
+func startTray(root, base string, hwnd func() windows.Handle, onExit func()) {
 	start, _ := systray.RunWithExternalLoop(func() {
 		if ico, err := os.ReadFile(filepath.Join(root, "app", "icon.ico")); err == nil {
 			systray.SetIcon(ico)

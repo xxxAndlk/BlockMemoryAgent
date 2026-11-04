@@ -138,6 +138,8 @@ const menuGroups = [
       // 工作流量产（2026-10-16）：原底部 Beta 占位项转正进菜单；详情页 /workflow/runs/:id
       // 经 activePath 前缀匹配保持高亮。
       { path: '/workflow', title: '工作流编排', icon: 'SetUp' },
+      // C-03 自动调度运行页：查看计划任务 attempt 与手动触发 reconcile。
+      { path: '/team', title: '自动调度', icon: 'Connection' },
       // 流程编排（2026-10-18）：节点图工作流编辑器（.bma/flows/*.json）；编辑页 /flow/edit 经 activePath 前缀匹配保持高亮。
       { path: '/flow', title: '流程编排', icon: 'Operation' },
       { path: '/settings', title: '系统设置', icon: 'Setting' },

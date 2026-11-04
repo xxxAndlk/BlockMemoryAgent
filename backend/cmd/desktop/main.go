@@ -222,7 +222,7 @@ func openWindow(root, base string) {
 
 	// 关窗 = 隐藏到托盘（后端继续跑）；真正退出走托盘菜单，并停掉该安装目录的后端。
 	interceptClose(hwnd)
-	startTray(root, base, func() unsafe.Pointer { return hwnd }, func() {
+	startTray(root, base, func() windows.Handle { return windows.Handle(uintptr(hwnd)) }, func() {
 		stopBackend(root)
 		quitTray()
 		w.Terminate()

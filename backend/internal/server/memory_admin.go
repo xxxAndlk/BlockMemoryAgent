@@ -32,6 +32,102 @@ func (h *APIHandler) SetMemoryLifecycle(lc *agent.MemoryLifecycle) {
 	h.memoryLifecycle = lc
 }
 
+// SetMemoryPromotion 注入 C-05 团队经验晋升服务（未装配时 verify/promote 端点 503）。
+func (h *APIHandler) SetMemoryPromotion(p *agent.MemoryPromotionService) {
+	h.memoryPromotion = p
+}
+
+func (h *APIHandler) memoryPromotionReady(c *gin.Context) bool {
+	if h.memoryPromotion == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory promotion service not wired"})
+		return false
+	}
+	return true
+}
+
+// VerifyMemoryCandidateHandler POST /api/memory/items/:id/verify —
+// 把团队经验候选置 verified（仍不激活；晋升需 enforce + 人工）。
+func (h *APIHandler) VerifyMemoryCandidateHandler(c *gin.Context) {
+	if !h.memoryPromotionReady(c) {
+		return
+	}
+	var body struct {
+		Reason           string `json:"reason"`
+		ExpectedRevision int64  `json:"expected_revision"`
+		Actor            string `json:"actor"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	actor := strings.TrimSpace(body.Actor)
+	if actor == "" {
+		actor = store.MemoryActorAdmin
+	}
+	item, err := h.memoryPromotion.VerifyCandidate(c.Request.Context(), memoryOwner(c), c.Param("id"), body.ExpectedRevision, actor, body.Reason)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"item": item})
+}
+
+// PromoteMemoryCandidateHandler POST /api/memory/items/:id/promote —
+// 项目作用域人工晋升（promotion_mode=enforce，auto_activate=false 时拒绝 actor=auto）。
+func (h *APIHandler) PromoteMemoryCandidateHandler(c *gin.Context) {
+	if !h.memoryPromotionReady(c) {
+		return
+	}
+	var body struct {
+		Reason           string `json:"reason"`
+		ExpectedRevision int64  `json:"expected_revision"`
+		Actor            string `json:"actor"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	actor := strings.TrimSpace(body.Actor)
+	if actor == "" {
+		actor = store.MemoryActorAdmin
+	}
+	item, err := h.memoryPromotion.PromoteCandidate(c.Request.Context(), memoryOwner(c), c.Param("id"), body.ExpectedRevision, actor, body.Reason)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"item": item})
+}
+
+// ExposureMemoryItemHandler GET /api/memory/items/:id/exposure —
+// C-05 曝光/结果反馈聚合（只统计，不推断因果）。
+func (h *APIHandler) ExposureMemoryItemHandler(c *gin.Context) {
+	if !h.memoryPromotionReady(c) {
+		return
+	}
+	stats, err := h.memoryPromotion.ExposureStats(c.Request.Context(), memoryOwner(c), c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"memory_id": c.Param("id"), "outcomes": stats})
+}
+
+// RollbackMemoryItemHandler POST /api/memory/items/:id/rollback —
+// 撤回问题版本并恢复指定历史版本（显式人工操作，带 actor/reason 审计）。
+func (h *APIHandler) RollbackMemoryItemHandler(c *gin.Context) {
+	if !h.memoryPromotionReady(c) {
+		return
+	}
+	var body struct {
+		GoodID string `json:"good_id"`
+		Reason string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.GoodID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "good_id required"})
+		return
+	}
+	if err := h.memoryPromotion.Rollback(c.Request.Context(), memoryOwner(c), c.Param("id"), body.GoodID, body.Reason); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
 // memoryOwner 当前单租户 owner 为空串（多租户预留：后续从鉴权主体取）。
 func memoryOwner(c *gin.Context) string {
 	if v := strings.TrimSpace(c.Query("owner")); v != "" {
