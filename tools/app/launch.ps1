@@ -81,12 +81,46 @@ if (Test-PortOpen $base) {
     exit 1
 }
 
+# ---- 依赖自举（PostgreSQL / Redis）----
+# 后端是严格启动：PG/Redis 连不上直接退出（装配依赖失败即退出）。桌面版要做到
+# "双击即用"，起后端之前必须先把依赖拉起来。依赖实现只有一份（Go，桌面外壳），
+# 这里通过 --ensure-deps 复用；外壳不在时按旧路直接起后端（失败信息会提示依赖）。
+$depsExe = Join-Path $Root 'BMA-Desktop.exe'
+$depsOut = Join-Path $Root 'app\deps.json'
+if (Test-Path $depsExe) {
+    Write-Host '[launch] 自举依赖（PostgreSQL / Redis）...'
+    # 不用 Start-Process -Wait：它会等整棵进程树，而自举可能拉起 Docker Desktop
+    # 这类常驻 GUI 进程，会把这里永久堵死。改成只等本进程退出。
+    if (Test-Path $depsOut) { Remove-Item $depsOut -Force -ErrorAction SilentlyContinue }
+    $dp = Start-Process -FilePath $depsExe -ArgumentList @('--ensure-deps', '--deps-out', $depsOut) -WindowStyle Hidden -PassThru
+    $dp.WaitForExit()
+    # 以 deps.json 为准（自举进程无论成败都会写它），退出码只作辅助。
+    $depsOk = $false
+    $msg = '依赖自举失败（PostgreSQL / Redis 未就绪）'
+    $hint = ''
+    if (Test-Path $depsOut) {
+        try {
+            # 必须显式 -Encoding UTF8：Windows PowerShell 5.1 默认按 ANSI(GBK) 读文件，
+            # 会把报告里的中文读坏，JSON 直接解析失败（报"依赖未就绪"的假象）。
+            $dr = Get-Content $depsOut -Raw -Encoding UTF8 | ConvertFrom-Json
+            $depsOk = [bool]$dr.ok
+            if ($dr.error) { $msg = $dr.error }
+            if ($dr.hint) { $hint = $dr.hint }
+        } catch { }
+    }
+    if (-not $depsOk) {
+        if ($hint) { $msg = $msg + "`n`n建议：" + $hint }
+        Show-Failure $msg $null
+        exit 1
+    }
+}
+
 $curPath = Join-Path $Root 'app\current.json'
 if (-not (Test-Path $curPath)) {
     Show-Failure "缺少版本指针 $curPath（请先运行 bma-app.ps1 install -Target `"$Root`"）"
     exit 1
 }
-$cur = Get-Content $curPath -Raw | ConvertFrom-Json
+$cur = Get-Content $curPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $verDir = Join-Path $Root ('app\versions\' + $cur.version)
 $exe = Join-Path $verDir 'bin\bma-server.exe'
 if (-not (Test-Path $exe)) {
@@ -110,6 +144,9 @@ $webDist = Join-Path $verDir 'web\dist'
 $runLines = @(
     '@echo off',
     ('set "BMA_HOME=' + $Root + '"'),
+    # 插件配置里的路径占位符（整串形式）：随包 Node 与 ui_design 桥
+    ('set "BMA_NODE_EXE=' + (Join-Path $Root 'runtime\node\node.exe') + '"'),
+    ('set "BMA_MEDIA_BRIDGE=' + (Join-Path $Root 'runtime\media\open-design-mcp\server.js') + '"'),
     ('cd /d "' + $Root + '"'),
     ('"' + $exe + '" -web-dist "' + $webDist + '" 1>>"' + $outLog + '" 2>>"' + $errLog + '"')
 )
@@ -143,7 +180,14 @@ if ($health) { $serverPid = [int]$health.pid }
 if (-not $health) {
     $runtime = Join-Path $Root 'app\runtime.json'
     if (Test-Path $runtime) { Remove-Item $runtime -Force -ErrorAction SilentlyContinue }
-    Show-Failure "启动失败：$TimeoutSec 秒内 $base/api/health 未就绪（日志 $errLog）" $errLog
+    $why = "启动失败：$TimeoutSec 秒内 $base/api/health 未就绪（日志 $errLog）"
+    # 后端是严格启动：最常见原因是 PostgreSQL/Redis 没起（Docker 未运行）。
+    $compose = Join-Path $Root 'docker\docker-compose.yml'
+    if (Test-Path $compose) {
+        $why = $why + "`n`n若日志提示 PostgreSQL/Redis 连接失败，请先启动 Docker Desktop 并执行：" +
+            "`n  docker compose -f `"$compose`" up -d postgres redis"
+    }
+    Show-Failure $why $errLog
     exit 1
 }
 

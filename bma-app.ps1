@@ -10,6 +10,7 @@ BlockMemoryAgent 桌面版打包 / 安装 / 更新工具。
   app\current.json           版本指针（含 previous，用于回滚）
   app\runtime.json           运行态（pid/版本/端口，启动器写入）
   app\launch.ps1             启动器（随包更新）
+  docker\                    依赖编排（compose + 媒体构建上下文），程序载荷，随版本覆盖
   BMA.cmd / BMA.vbs          桌面入口（快捷方式指向 BMA.vbs）
   config\  .env  plugins.d\  workspace\  logs\    ← 用户数据：只补缺，永不覆盖
 
@@ -29,6 +30,7 @@ BlockMemoryAgent 桌面版打包 / 安装 / 更新工具。
   restart   先停后起
   status    打印当前版本 / 运行态 / 健康检查（-Json 输出机器可读）
   rollback  切回上一版本并重启
+  media     应用媒体生成配置（重建桥镜像 + open_design/minimax-media 容器，换 keeper）
 
 .EXAMPLE
   .\bma-app.ps1 pack
@@ -38,7 +40,7 @@ BlockMemoryAgent 桌面版打包 / 安装 / 更新工具。
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('pack', 'install', 'update', 'deploy', 'start', 'stop', 'restart', 'status', 'rollback')]
+    [ValidateSet('pack', 'install', 'update', 'deploy', 'start', 'stop', 'restart', 'status', 'rollback', 'media', 'migrate-data')]
     [string]$Command = 'status',
 
     # 安装目录（install/update/start/stop/restart/status/rollback）
@@ -47,14 +49,17 @@ param(
     # 包来源（install/update）：包目录或 zip；缺省取 dist\app 下最新版本
     [string]$From,
 
+    # migrate-data：源库 DSN（把该实例的数据搬进桌面版自带实例）
+    [string]$FromDsn,
+
     # 打包版本号（pack）：缺省 yyyyMMdd-HHmmss-<git短号>
     [string]$Version,
 
     # 保留的历史版本数（install/update）：默认 3（当前 + 上一版 + 1）
     [int]$Keep = 3,
 
-    # 健康检查超时（秒）
-    [int]$TimeoutSec = 180,
+    # 健康检查超时（秒）。首次装机可能要拉 pgvector/redis 镜像，故默认给到 10 分钟。
+    [int]$TimeoutSec = 600,
 
     # 首次安装时写入 .env 的 HTTP_ADDR（并行安装/换端口用，例如 127.0.0.1:10011）
     [string]$HttpAddr,
@@ -62,6 +67,7 @@ param(
     [switch]$SkipWeb,     # pack：跳过前端构建（复用 web\dist）
     [switch]$Test,        # pack：额外跑 go test ./...
     [switch]$NoZip,       # pack：不生成 zip
+    [switch]$NoRuntime,   # pack：不带自带运行时（PG/Redis），只出程序包
     [switch]$NoRestart,   # install/update：装完不重启
     [switch]$NoShortcut,  # install/update/deploy：不建快捷方式
     [switch]$NoShell,     # install/update/deploy：不重启桌面外壳（默认会重启并保留"托盘常驻"体验）
@@ -152,8 +158,214 @@ function Get-Health([string]$Root) {
 
 # ---------------- pack ----------------
 
+# ---------------- runtime（自带运行时载荷）----------------
+
+# 自带运行时：PostgreSQL 免安装版 + pgvector 扩展 + Redis for Windows。
+# 目标机器因此不需要装 Docker——商业桌面应用的常规做法（服务端二进制随包、app 当子进程跑）。
+#
+# 源文件放在 dist\runtime-cache\（不进 git）：
+#   pg16.zip            EDB PostgreSQL 16 免安装包
+#   pgvector-pg16.zip   pgvector 的 Windows 预编译扩展（社区包）
+#   redis-win.zip       Redis for Windows（5.0.14）
+# 首次需要时用 installer\fetch-runtime.ps1 下载；解压裁剪结果缓存在
+# dist\runtime-cache\prepared\，重复打包直接复用。
+
+function Get-RuntimeCache([string]$Repo) { return (Join-Path $Repo 'dist\runtime-cache') }
+
+function Test-RuntimeAvailable([string]$Repo) {
+    $cache = Get-RuntimeCache $Repo
+    return ((Test-Path (Join-Path $cache 'pg16.zip')) -and
+            (Test-Path (Join-Path $cache 'pgvector-pg16.zip')) -and
+            (Test-Path (Join-Path $cache 'redis-win.zip')))
+}
+
+# Build-RuntimePayload 解压裁剪出 runtime\ 载荷（prepared 缓存命中则直接复制）。
+function Build-RuntimePayload {
+    param([string]$Repo, [string]$OutDir)
+
+    $cache = Get-RuntimeCache $Repo
+    if (-not (Test-RuntimeAvailable $Repo)) { throw "缺少运行时源包（$cache 下需要 pg16.zip / pgvector-pg16.zip / redis-win.zip），先跑 installer\fetch-runtime.ps1" }
+    $prepared = Join-Path $cache 'prepared'
+    # 配方版本：载荷组成变了就重建（否则会复用旧缓存，缺新加的 node/媒体桥）。
+    $recipe = 'v4-node-media-minimax'
+    $recipeFile = Join-Path $prepared '.recipe'
+    $preparedOk = ((Test-Path (Join-Path $prepared 'postgres\share\extension\vector.control')) -and
+                   (Test-Path (Join-Path $prepared 'postgres\bin\postgres.exe')) -and
+                   (Test-Path (Join-Path $prepared 'redis\redis-server.exe')) -and
+                   (Test-Path (Join-Path $prepared 'node\node.exe')) -and
+                   (Test-Path (Join-Path $prepared 'media\open-design-mcp\server.js')) -and
+                   ((Test-Path $recipeFile) -and ((Get-Content $recipeFile -Raw).Trim() -eq $recipe)))
+    if ($preparedOk) {
+        Write-Log '[runtime] 复用已准备的运行时载荷'
+    } else {
+    if (Test-Path $prepared) { Remove-Item -Recurse -Force $prepared }
+    New-Item -ItemType Directory -Force -Path $prepared | Out-Null
+
+    Write-Log '[runtime] 解压 PostgreSQL ...'
+    $pgTmp = Join-Path $cache '_pg'
+    if (Test-Path $pgTmp) { Remove-Item -Recurse -Force $pgTmp }
+    Expand-Archive -Path (Join-Path $cache 'pg16.zip') -DestinationPath $pgTmp -Force
+    $pgRoot = Join-Path $pgTmp 'pgsql'
+    if (-not (Test-Path $pgRoot)) { $pgRoot = $pgTmp }
+    $pgOut = Join-Path $prepared 'postgres'
+    New-Item -ItemType Directory -Force -Path $pgOut | Out-Null
+    foreach ($d in @('bin', 'lib', 'share')) {
+        Copy-Item -Recurse -Force (Join-Path $pgRoot $d) (Join-Path $pgOut $d)
+    }
+    # 裁剪：头文件、文档、静态库、上位版本升级工具——都不影响运行，能省几百 MB。
+    foreach ($junk in @('include', 'doc')) {
+        $p = Join-Path $pgOut $junk
+        if (Test-Path $p) { Remove-Item -Recurse -Force $p }
+    }
+    Get-ChildItem -Path (Join-Path $pgOut 'lib') -Filter '*.a' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+    foreach ($junk in @('pg_upgrade.exe', 'pgbench.exe')) {
+        $p = Join-Path $pgOut ('bin\' + $junk)
+        if (Test-Path $p) { Remove-Item -Force $p }
+    }
+    Remove-Item -Recurse -Force $pgTmp -ErrorAction SilentlyContinue
+
+    Write-Log '[runtime] 安装 pgvector 扩展 ...'
+    $vecTmp = Join-Path $cache '_vec'
+    if (Test-Path $vecTmp) { Remove-Item -Recurse -Force $vecTmp }
+    Expand-Archive -Path (Join-Path $cache 'pgvector-pg16.zip') -DestinationPath $vecTmp -Force
+    # PostgreSQL 的约定：控制文件与 SQL 脚本在 share\extension\，动态库在 pkglibdir。
+    # EDB 的 Windows 免安装版把 pkglibdir 定在 lib\（不是 Linux 的 lib/postgresql）。
+    $extDir = Join-Path $pgOut 'share\extension'
+    $libDir = Join-Path $pgOut 'lib'
+    New-Item -ItemType Directory -Force -Path $extDir, $libDir | Out-Null
+    $vecShare = Join-Path $vecTmp 'share\extension'
+    if (Test-Path $vecShare) {
+        Get-ChildItem -Path $vecShare -File | ForEach-Object { Copy-Item -Force $_.FullName $extDir }
+    }
+    $vecLib = Join-Path $vecTmp 'lib'
+    if (Test-Path $vecLib) {
+        Get-ChildItem -Path $vecLib -File -Filter '*.dll' | ForEach-Object { Copy-Item -Force $_.FullName $libDir }
+    }
+    Remove-Item -Recurse -Force $vecTmp -ErrorAction SilentlyContinue
+    if (-not (Test-Path (Join-Path $extDir 'vector.control'))) {
+        throw 'pgvector 扩展安装失败：payload 里没有 vector.control'
+    }
+    if (-not (Test-Path (Join-Path $libDir 'vector.dll'))) {
+        throw 'pgvector 扩展安装失败：payload 里没有 vector.dll'
+    }
+
+    Write-Log '[runtime] 解压 Redis ...'
+    $redisTmp = Join-Path $cache '_redis'
+    if (Test-Path $redisTmp) { Remove-Item -Recurse -Force $redisTmp }
+    Expand-Archive -Path (Join-Path $cache 'redis-win.zip') -DestinationPath $redisTmp -Force
+    $redisOut = Join-Path $prepared 'redis'
+    New-Item -ItemType Directory -Force -Path $redisOut | Out-Null
+    foreach ($f in @('redis-server.exe', 'redis-cli.exe')) {
+        $src = Get-ChildItem -Path $redisTmp -Filter $f -Recurse -File | Select-Object -First 1
+        if ($src) { Copy-Item -Force $src.FullName $redisOut }
+    }
+    Remove-Item -Recurse -Force $redisTmp -ErrorAction SilentlyContinue
+    if (-not (Test-Path (Join-Path $redisOut 'redis-server.exe'))) { throw 'Redis 解压失败：缺 redis-server.exe' }
+
+    # Node：随包，用于以 stdio 方式跑 ui_design 桥（免 Docker 的媒体链路）
+    $nodeZip = Join-Path $cache 'node-win.zip'
+    if (Test-Path $nodeZip) {
+        Write-Log '[runtime] 解压 Node ...'
+        $nodeTmp = Join-Path $cache '_node'
+        if (Test-Path $nodeTmp) { Remove-Item -Recurse -Force $nodeTmp }
+        Expand-Archive -Path $nodeZip -DestinationPath $nodeTmp -Force
+        $nodeRoot = (Get-ChildItem $nodeTmp -Directory | Select-Object -First 1).FullName
+        $nodeOut = Join-Path $prepared 'node'
+        New-Item -ItemType Directory -Force -Path $nodeOut | Out-Null
+        Copy-Item -Force (Join-Path $nodeRoot 'node.exe') $nodeOut
+        Remove-Item -Recurse -Force $nodeTmp -ErrorAction SilentlyContinue
+        if (-not (Test-Path (Join-Path $nodeOut 'node.exe'))) { throw 'Node 解压失败：缺 node.exe' }
+    } else {
+        Write-Log '[runtime] warn: 未找到 node-win.zip（桌面版将没有免 Docker 的媒体链路）'
+    }
+
+    # ui_design 桥（stdio）：源码 + 依赖（npm install 一次，之后走缓存）
+    $bridgeSrc = Join-Path $Repo 'docker\open-design-mcp'
+    if (Test-Path (Join-Path $bridgeSrc 'server.js')) {
+        $mediaOut = Join-Path $prepared 'media\open-design-mcp'
+        New-Item -ItemType Directory -Force -Path $mediaOut | Out-Null
+        foreach ($f in @('server.js', 'media-core.js', 'package.json')) {
+            Copy-Item -Force (Join-Path $bridgeSrc $f) $mediaOut
+        }
+        if (-not (Test-Path (Join-Path $mediaOut 'node_modules'))) {
+            Write-Log '[runtime] 安装桥依赖（npm install，一次）...'
+            Push-Location $mediaOut
+            try { & npm install --omit=dev --no-audit --no-fund | Out-Null } finally { Pop-Location }
+        }
+    }
+
+    # MiniMax 适配桥（零依赖单文件 Node 服务）：桌面版没有 Docker 网络，
+    # .env 里指向容器服务名（minimax-media:8787）的通道靠这个本地进程顶替。
+    $mmSrc = Join-Path $Repo 'docker\minimax-media'
+    if (Test-Path (Join-Path $mmSrc 'server.js')) {
+        $mmOut = Join-Path $prepared 'media\minimax-media'
+        New-Item -ItemType Directory -Force -Path $mmOut | Out-Null
+        Copy-Item -Force (Join-Path $mmSrc 'server.js') $mmOut
+    }
+    }
+
+    # 铺到包目录（prepared 保留作缓存，下次打包直接复制）
+    if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+    Copy-Item -Recurse -Force (Join-Path $prepared '*') $OutDir
+    # 记下配方版本（下次打包据此判断缓存是否可用）
+    [System.IO.File]::WriteAllText((Join-Path $prepared '.recipe'), $recipe)
+
+    $size = [math]::Round(((Get-ChildItem -Recurse -File $OutDir | Measure-Object -Property Length -Sum).Sum / 1MB), 0)
+    Write-Log "[runtime] 载荷就绪：$OutDir（$size MB）"
+}
+
+# Convert-PluginsToNative 把包内 plugins.yaml 的 ui_design 插件改成 stdio 方式。
+#
+# 桌面版要免装 Docker：ui_design 桥（Node MCP server）改为随包 Node 直接起本地子进程，
+# 上游指向原生媒体服务（127.0.0.1:7456）。开发实例仍用仓库里的容器方案（不改仓库配置）。
+#
+# 只替换 ui_design 这一个插件块（按两空格缩进的同级键界定范围），其余配置原样保留。
+function Convert-PluginsToNative([string]$Path) {
+    if (-not (Test-Path $Path)) { return }
+    $lines = [System.Collections.ArrayList]@([System.IO.File]::ReadAllLines($Path))
+    $start = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^  ui_design:\s*$') { $start = $i; break }
+    }
+    if ($start -lt 0) {
+        Write-Log '[pack] warn: plugins.yaml 里没有 ui_design 块，跳过原生媒体改写'
+        return
+    }
+    $end = $lines.Count
+    for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^  [A-Za-z_][A-Za-z0-9_]*:\s*$') { $end = $i; break }
+    }
+    $block = [string[]]@(
+        '  ui_design:',
+        '    kind: mcp',
+        '    enabled: true',
+        '    settings:',
+        '      # 桌面版走 stdio：随包 Node 直接起桥进程，上游是原生媒体服务（免 Docker）。',
+        '      transport: stdio',
+        # 路径用正斜杠：YAML 双引号里反斜杠算转义符，会被判成未知转义字符。
+        '      command: ${BMA_NODE_EXE}',
+        '      args: ["${BMA_MEDIA_BRIDGE}"]',
+        '      shared: false',
+        '      env:',
+        '        OD_API_URL: http://127.0.0.1:7456',
+        '        OD_API_TOKEN: ${OD_API_TOKEN:}',
+        '        # 工作目录占位符由插件管理器展开（config 层刻意不解析它）。',
+        '        OD_WORKSPACE_DIR: ${WORKDIR}',
+        '        OD_OUTPUT_REL_PREFIX: .bma/od-artifacts',
+        '        OD_IMAGE_CAPABILITIES: ${IMAGE_CAPABILITIES:}',
+        '        OD_VIDEO_CAPABILITIES: ${VIDEO_CAPABILITIES:}',
+        '      roles: ["meta","domain","ui_assistant"]',
+        '      exec_timeout_sec: 1200'
+    )
+    $lines.RemoveRange($start, $end - $start)
+    $lines.InsertRange($start, $block)
+    [System.IO.File]::WriteAllLines($Path, $lines, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Log '[pack] plugins.yaml：ui_design 改为 stdio（随包 Node，免 Docker）'
+}
+
 function Invoke-Pack {
-    param([string]$Version, [switch]$SkipWeb, [switch]$Test, [switch]$NoZip)
+    param([string]$Version, [switch]$SkipWeb, [switch]$Test, [switch]$NoZip, [switch]$NoRuntime)
 
     $repo = $PSScriptRoot
     $commit = Get-GitCommit $repo
@@ -218,6 +430,9 @@ function Invoke-Pack {
         if ($LASTEXITCODE -ne 0) { throw 'go build bma-server 失败' }
         & go build -trimpath -ldflags $ldflags -o (Join-Path $stage 'bin\tui.exe') ./cmd/tui
         if ($LASTEXITCODE -ne 0) { throw 'go build tui 失败' }
+        # 原生媒体服务（免 Docker 的生图/生视频上游适配）
+        & go build -trimpath -ldflags $ldflags -o (Join-Path $stage 'bin\mediaservice.exe') ./cmd/mediaservice
+        if ($LASTEXITCODE -ne 0) { throw 'go build mediaservice 失败' }
 
         # 桌面外壳（WebView2 原生窗口，自带图标）：GUI 子系统，避免黑框控制台
         $env:CGO_ENABLED = '0'
@@ -232,6 +447,8 @@ function Invoke-Pack {
         else { Write-Log "[pack] warn: 缺少配置模板 config\$t" }
     }
     Copy-Item -Force (Join-Path $repo '.env.example') (Join-Path $stage 'config-templates\env.example')
+    # 桌面版的 ui_design 走 stdio（随包 Node + 原生媒体服务），免 Docker
+    Convert-PluginsToNative (Join-Path $stage 'config-templates\plugins.yaml')
 
     # 启动器 + 图标
     foreach ($l in @('launch.ps1', 'BMA.cmd', 'BMA.vbs')) {
@@ -239,10 +456,60 @@ function Invoke-Pack {
     }
     Copy-Item -Force $iconPath (Join-Path $stage 'launcher\icon.ico')
 
+    # 依赖编排 + 媒体栈构建上下文（桌面版自举 PostgreSQL/Redis 与媒体栈用）。
+    # 只取 compose 文件与 4 个构建上下文；bma-plugin.sh / media-smoke.mjs /
+    # docker-compose.test.yml / install_docker.sh 是 Linux/bash 专用，不进包。
+    $dockerSrc = Join-Path $repo 'docker'
+    $dockerDst = Join-Path $stage 'docker'
+    New-Item -ItemType Directory -Force -Path $dockerDst | Out-Null
+    $composeSrc = Join-Path $dockerSrc 'docker-compose.yml'
+    if (Test-Path $composeSrc) {
+        Copy-Item -Force $composeSrc $dockerDst
+    } else {
+        throw '缺少 docker\docker-compose.yml（桌面版依赖自举需要它）'
+    }
+    foreach ($ctx in @('open-design-daemon', 'minimax-media', 'open-design-mcp', 'ui-preview-mcp')) {
+        $ctxSrc = Join-Path $dockerSrc $ctx
+        if (Test-Path $ctxSrc) {
+            Copy-Item -Recurse -Force $ctxSrc (Join-Path $dockerDst $ctx)
+        } else {
+            Write-Log "[pack] warn: 缺少 docker\$ctx（媒体栈构建上下文）"
+        }
+    }
+
+    # 自带运行时（PostgreSQL+pgvector / Redis）：目标机器免装 Docker。
+    # 源包不在仓库里（dist\runtime-cache），缺省时跳过（开发机仍走 Docker 依赖）。
+    if (-not $NoRuntime) {
+        if (Test-RuntimeAvailable $repo) {
+            Write-Log '[pack] 准备自带运行时载荷 ...'
+            Build-RuntimePayload -Repo $repo -OutDir (Join-Path $stage 'runtime')
+        } else {
+            Write-Log '[pack] warn: 未找到运行时源包（dist\runtime-cache），本次不带自带运行时（先跑 installer\fetch-runtime.ps1）'
+        }
+    }
+
     # 禁运清单：仓库运行时数据与密钥，任何情况下都不许进包
     foreach ($f in @('models.json', 'user_profile.md', 'plugins.installed.yaml', 'skills_learned', '.env')) {
         $p = Join-Path $stage ('config-templates\' + $f)
         if (Test-Path $p) { Remove-Item -Recurse -Force $p; Write-Log "[pack] 已剔除禁运文件 $f" }
+    }
+
+    # 模型注册表模板：models.json 在禁运清单里（用户注册表可能含明文 Key），但新装
+    # 机器没有它就没有任何可用模型 —— 生成一份"只含 ${VAR} 引用"的模板随包走。
+    $modelsSrc = Join-Path $repo 'config\models.json'
+    if (Test-Path $modelsSrc) {
+        try {
+            $mj = Get-Content $modelsSrc -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($m in $mj.models) {
+                if ($m.api_key -and -not ($m.api_key -match '\$\{')) { $m.api_key = '${ANTHROPIC_API_KEY}' }
+                if ($m.base_url -and -not ($m.base_url -match '\$\{')) { $m.base_url = '${ANTHROPIC_BASE_URL}' }
+            }
+            $jsonText = $mj | ConvertTo-Json -Depth 8
+            [System.IO.File]::WriteAllText((Join-Path $stage 'config-templates\models.json'), $jsonText, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Log '[pack] 已生成模型注册表模板（去密钥，仅 ${VAR} 引用）'
+        } catch {
+            Write-Log '[pack] warn: 生成模型注册表模板失败（新装机器将没有可用模型）'
+        }
     }
 
     # 密钥扫描：模板里只允许 ${VAR} 插值，发现疑似真实 key 一律拒包
@@ -252,6 +519,37 @@ function Invoke-Pack {
     if ($hits.Count -gt 0) {
         throw ('包内发现疑似真实密钥，拒绝打包: ' + (($hits | ForEach-Object { $_.Path }) -join ', '))
     }
+
+    # 安装器暂存目录（Inno Setup 的源）：按"最终安装后的样子"铺好，
+    # 让安装脚本只做一次整目录拷贝即可。
+    $setupDir = Join-Path $repo ('dist\setup\' + $Version)
+    if (Test-Path $setupDir) { Remove-Item -Recurse -Force $setupDir }
+    $verDir = Join-Path $setupDir ('app\versions\' + $Version)
+    New-Item -ItemType Directory -Force -Path $verDir, (Join-Path $setupDir 'app') | Out-Null
+    Copy-Item -Recurse -Force (Join-Path $stage 'bin') (Join-Path $verDir 'bin')
+    Copy-Item -Recurse -Force (Join-Path $stage 'web') (Join-Path $verDir 'web')
+    Copy-Item -Recurse -Force (Join-Path $stage 'config-templates') (Join-Path $verDir 'config-templates')
+    Copy-Item -Force (Join-Path $stage 'launcher\launch.ps1') (Join-Path $setupDir 'app\launch.ps1')
+    Copy-Item -Force (Join-Path $stage 'launcher\icon.ico') (Join-Path $setupDir 'app\icon.ico')
+    Copy-Item -Force (Join-Path $stage 'bin\bma-desktop.exe') (Join-Path $setupDir 'BMA-Desktop.exe')
+    if (Test-Path (Join-Path $stage 'docker')) {
+        Copy-Item -Recurse -Force (Join-Path $stage 'docker') (Join-Path $setupDir 'docker')
+    }
+    if (Test-Path (Join-Path $stage 'runtime')) {
+        Copy-Item -Recurse -Force (Join-Path $stage 'runtime') (Join-Path $setupDir 'runtime')
+    }
+    # 用户数据种子：安装时"缺失才铺"（Inno Setup 的 onlyifdoesntexist），已存在绝不覆盖
+    Copy-Item -Recurse -Force (Join-Path $stage 'config-templates') (Join-Path $setupDir 'config-templates')
+    Copy-Item -Force (Join-Path $stage 'config-templates\env.example') (Join-Path $setupDir '.env.example')
+    # 版本指针（安装器不再改写它）
+    Write-JsonFile (Join-Path $setupDir 'app\current.json') ([ordered]@{
+            version      = $Version
+            previous     = ''
+            installed_at = (Get-Date).ToString('o')
+            commit       = $commit
+            package      = 'installer'
+        })
+    Write-Log "[pack] 安装器暂存: $setupDir"
 
     # 清单与版本元数据
     $files = @(Get-ChildItem $stage -Recurse -File | ForEach-Object {
@@ -483,11 +781,49 @@ function Invoke-Install {
         $stopped = Stop-BmaServer $Target
         if ($stopped.Count -gt 0) { Write-Log ('[install] 已停止运行中的实例: pid ' + ($stopped -join ', ')) }
 
+        # 换版本目录前先停掉该目录下的后台进程（自带 PG/Redis、媒体服务、媒体桥）：
+        # 它们的可执行文件正被占用，目录删不掉（Access denied）。
+        $stopExe = Join-Path $Target 'BMA-Desktop.exe'
+        if (Test-Path $stopExe) {
+            $sp = Start-Process -FilePath $stopExe -ArgumentList '--stop' -WindowStyle Hidden -PassThru
+            [void]$sp.WaitForExit(60000)
+        }
+
         # 1) 程序载荷 → 版本目录（不可变，重复安装同版本则整体替换该版本目录）
         $dst = Join-Path $Target ('app\versions\' + $ver)
         if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
         Copy-Item -Recurse -Force $pkg $dst
         Write-Log "[install] 版本目录: $dst"
+
+        # 1b) 依赖编排（程序载荷，随版本覆盖）：桌面版自举 PostgreSQL/Redis 与媒体栈要用
+        $dockerPkg = Join-Path $dst 'docker'
+        $dockerOut = Join-Path $Target 'docker'
+        if (Test-Path $dockerPkg) {
+            if (Test-Path $dockerOut) { Remove-Item -Recurse -Force $dockerOut }
+            New-Item -ItemType Directory -Force -Path $dockerOut | Out-Null
+            Copy-Item -Recurse -Force (Join-Path $dockerPkg '*') $dockerOut
+            Write-Log "[install] 依赖编排: $dockerOut"
+        }
+
+        # 1c) 自带运行时（PostgreSQL+pgvector / Redis / Node / 媒体桥）：铺到安装目录根部。
+        # 运行时体积大且与版本无关，只在"缺失或版本标记不同"时重铺（避免每次更新都拷 300MB，
+        # 但运行时内容变化时必须更新 —— 用 .version 标记比对）。
+        $rtPkg = Join-Path $dst 'runtime'
+        $rtOut = Join-Path $Target 'runtime'
+        if (Test-Path $rtPkg) {
+            $marker = Join-Path $rtOut '.version'
+            $installed = ''
+            if (Test-Path $marker) { $installed = (Get-Content $marker -Raw).Trim() }
+            if ($installed -ne $ver) {
+                Write-Log "[install] 铺设自带运行时（较慢，约 300MB）..."
+                if (Test-Path $rtOut) { Remove-Item -Recurse -Force $rtOut -ErrorAction SilentlyContinue }
+                Copy-Item -Recurse -Force $rtPkg $rtOut
+                [System.IO.File]::WriteAllText($marker, $ver)
+                Write-Log "[install] 自带运行时: $rtOut"
+            } else {
+                Write-Log "[install] 自带运行时已是当前版本，跳过"
+            }
+        }
 
         # 2) 用户数据：只补缺，绝不覆盖
         $seeded = @()
@@ -509,6 +845,39 @@ function Invoke-Install {
             }
         }
         $tokenGenerated = Ensure-ApiToken (Join-Path $Target '.env')
+
+        # plugins.yaml 是"程序侧模板 + 用户可改"的混合体：桌面版随包把 ui_design 改成
+        # stdio（免 Docker），所以升级时要能更新它——但**只在用户没改过时**更新。
+        # 判据：与上次随包的那份（config\plugins.yaml.packaged）逐字节一致。
+        $pkgPlugins = Join-Path (Join-Path $Target 'config') 'plugins.yaml'
+        $prevPlugins = Join-Path (Join-Path $Target 'config') 'plugins.yaml.packaged'
+        $tplPlugins = Join-Path $tplDir 'plugins.yaml'
+        if (Test-Path $tplPlugins) {
+            $update = $true
+            if (Test-Path $pkgPlugins) {
+                $ref = $prevPlugins
+                if (-not (Test-Path $ref)) {
+                    # 老安装没有"上次随包副本"：与仓库原版逐字节一致才算用户没改过
+                    $ref = Join-Path $PSScriptRoot 'config\plugins.yaml'
+                    if (-not (Test-Path $ref)) { $ref = $null }
+                }
+                if ($ref) {
+                    $same = [System.Linq.Enumerable]::SequenceEqual(
+                        [System.IO.File]::ReadAllBytes($pkgPlugins),
+                        [System.IO.File]::ReadAllBytes($ref))
+                    $update = $same
+                } else {
+                    $update = $false
+                }
+            }
+            if ($update) {
+                Copy-Item -Force $tplPlugins $pkgPlugins
+                Copy-Item -Force $tplPlugins $prevPlugins
+                Write-Log '[install] config\plugins.yaml 已随包更新（用户未修改过）'
+            } else {
+                Write-Log '[install] warn: config\plugins.yaml 已被修改，未随包更新（媒体插件可能仍是容器方式）'
+            }
+        }
 
         # 3) 启动器与入口（随包更新）：优先桌面外壳，脚本启动器作为兜底
         Copy-Item -Force (Join-Path $dst 'launcher\launch.ps1') (Join-Path $Target 'app\launch.ps1')
@@ -602,6 +971,83 @@ function Invoke-Deploy {
     return $res
 }
 
+# ---------------- migrate-data ----------------
+
+# Invoke-MigrateData 把某个 PostgreSQL 实例的数据搬进桌面版自带实例。
+#
+# 场景：桌面版切到"自带运行时"后是独立库（%LOCALAPPDATA%\BlockMemoryAgent\data\pg），
+# 开发实例那套（Docker PG）里的会话与记忆不会自动跟过来 —— 用本命令一次性搬过去。
+# 走 pg_dump/pg_restore（包内自带，版本与目标实例一致）。
+function Invoke-MigrateData {
+    param([string]$Target, [string]$FromDsn)
+
+    $Target = Resolve-Target $Target
+    $pgBin = Join-Path $Target 'runtime\postgres\bin'
+    if (-not (Test-Path (Join-Path $pgBin 'pg_dump.exe'))) {
+        throw "缺少 $pgBin\pg_dump.exe（安装包未带自带运行时）"
+    }
+    $envPath = Join-Path $Target '.env'
+    $toDsn = Get-EnvValue $envPath 'POSTGRES_DSN'
+    if ([string]::IsNullOrWhiteSpace($toDsn)) { throw "目标 .env 里没有 POSTGRES_DSN（先跑一次桌面版，让它初始化自带实例）" }
+    if ([string]::IsNullOrWhiteSpace($FromDsn)) { throw '必须给 -FromDsn（源库的完整 DSN，含口令）' }
+
+    $dump = Join-Path $env:TEMP ("bma_migrate_" + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.dump')
+    Write-Log "[migrate] 导出源库 → $dump"
+    $env:PGPASSWORD = ([Uri]$FromDsn).UserInfo.Split(':') | Select-Object -Last 1
+    & (Join-Path $pgBin 'pg_dump.exe') -h ([Uri]$FromDsn).Host -p ([Uri]$FromDsn).Port -U ([Uri]$FromDsn).UserInfo.Split(':')[0] -d ([Uri]$FromDsn).AbsolutePath.TrimStart('/') -Fc -f $dump
+    if ($LASTEXITCODE -ne 0) { throw 'pg_dump 失败' }
+
+    Write-Log '[migrate] 导入目标库（先清空同名表）...'
+    $to = [Uri]$toDsn
+    $env:PGPASSWORD = $to.UserInfo.Split(':') | Select-Object -Last 1
+    & (Join-Path $pgBin 'pg_restore.exe') -h $to.Host -p $to.Port -U $to.UserInfo.Split(':')[0] -d $to.AbsolutePath.TrimStart('/') --clean --if-exists --no-owner $dump
+    if ($LASTEXITCODE -ne 0) { throw 'pg_restore 失败（目标库非空时可能需要先停掉桌面版）' }
+    Remove-Item $dump -Force -ErrorAction SilentlyContinue
+    Write-Log '[migrate] 完成'
+    return [ordered]@{ ok = $true; command = 'migrate-data'; target = $Target; from = $FromDsn }
+}
+
+# ---------------- media ----------------
+
+# Invoke-Media 应用媒体生成配置（对齐 docker/bma-plugin.sh media，但作用于安装目录）。
+# 唯一手改点 = <安装目录>\.env 的媒体段（IMAGE_PROVIDER/IMAGE_URL/IMAGE_KEY 等）：
+#   daemon 侧 → 重建容器让 entrypoint 重写 media-config.json（env_file 仅创建时读取）；
+#   桥侧     → 重建镜像（server.js 改动才需要，层缓存幂等）+ 换 keeper（共享容器按镜像
+#               tag 复用，不换新会继续跑旧代码/旧 env）。
+function Invoke-Media {
+    param([string]$Target)
+
+    $Target = Resolve-Target $Target
+    $compose = Join-Path $Target 'docker\docker-compose.yml'
+    if (-not (Test-Path $compose)) { throw "缺少 $compose（安装包不完整，请重新运行 install）" }
+    $dockerCtx = Join-Path $Target 'docker'
+
+    $bridge = Join-Path $dockerCtx 'open-design-mcp'
+    if (Test-Path $bridge) {
+        Write-Log '[media] 构建 bma/open-design-mcp:local ...'
+        & docker build -t bma/open-design-mcp:local $bridge | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '构建 bma/open-design-mcp:local 失败' }
+    }
+
+    Write-Log '[media] 拉起 minimax-media 适配桥 ...'
+    & docker compose -f $compose up -d --build minimax-media
+    if ($LASTEXITCODE -ne 0) { throw '启动 minimax-media 失败' }
+
+    Write-Log '[media] 重建 open_design 容器（entrypoint 重写 media-config.json）...'
+    & docker compose -f $compose up -d --build --force-recreate open_design
+    if ($LASTEXITCODE -ne 0) { throw '重建 open_design 失败' }
+
+    # 换 ui_design keeper：共享容器按镜像 tag 复用，不换新会继续跑旧代码/旧 env。
+    $keepers = @(& docker ps -aq --filter name=bma-plugin-ui_design)
+    if ($keepers.Count -gt 0) {
+        & docker rm -f $keepers | Out-Null
+        Write-Log '[media] 已换 ui_design keeper'
+    }
+
+    Write-Log '[media] 完成'
+    return [ordered]@{ ok = $true; command = 'media'; target = $Target; compose = $compose }
+}
+
 # ---------------- start / stop / status / rollback ----------------
 
 function Resolve-Target([string]$Target) {
@@ -677,7 +1123,7 @@ function Invoke-Rollback {
 $result = $null
 try {
     switch ($Command) {
-        'pack' { $result = Invoke-Pack -Version $Version -SkipWeb:$SkipWeb -Test:$Test -NoZip:$NoZip }
+        'pack' { $result = Invoke-Pack -Version $Version -SkipWeb:$SkipWeb -Test:$Test -NoZip:$NoZip -NoRuntime:$NoRuntime }
         'install' { $result = Invoke-Install -Target $Target -From $From -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -NoRestart:$NoRestart -NoShortcut:$NoShortcut -NoShell:$NoShell }
         'update' { $result = Invoke-Install -Target $Target -From $From -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -NoRestart:$NoRestart -NoShortcut:$NoShortcut -NoShell:$NoShell }
         'deploy' { $result = Invoke-Deploy -Target $Target -Version $Version -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -SkipWeb:$SkipWeb -Test:$Test -NoShortcut:$NoShortcut -NoShell:$NoShell }
@@ -690,6 +1136,8 @@ try {
         }
         'status' { $result = Invoke-Status -Target $Target }
         'rollback' { $result = Invoke-Rollback -Target $Target -TimeoutSec $TimeoutSec }
+        'media' { $result = Invoke-Media -Target $Target }
+        'migrate-data' { $result = Invoke-MigrateData -Target $Target -FromDsn $FromDsn }
     }
 } catch {
     $message = $_.Exception.Message

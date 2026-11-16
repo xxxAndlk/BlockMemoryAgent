@@ -20,6 +20,7 @@ import (
 	"context" // context 用于取消信号传递
 	"fmt"     // fmt 用于格式化 plan_id 与结果文案
 	"log"     // log 用于记录审批不可达等可观测事件
+	"regexp"  // regexp 用于从计划文本粗估涉及文件数（轻任务免审批判定）
 	"strings" // strings 用于结论关键词判定与层级拆分
 	"sync"    // sync 保护 planWaits / revisions 计数
 	"time"    // time 用于等待超时与保活 tick
@@ -132,7 +133,11 @@ func (t *submitPlanTool) Aliases() []string { return []string{"plan_submit"} }
 
 // Description 返回 LLM 可见的工具描述。
 func (t *submitPlanTool) Description() string {
-	return "提交执行计划给上级确认（任何任务动手前必调，无大小豁免）：task_summary 为一行任务简介，" +
+	return "提交执行计划给上级/用户确认。**默认不调用**——简单任务、只读调研、小改动一律直接执行，" +
+		"把计划压进开工第一句说明即可。仅以下情况必须调用：≥3 文件或跨模块重构；新功能端到端" +
+		"（涉及接口/数据结构契约）；多领域协同或长链路生成（多帧动画/整批素材/多章节）；" +
+		"批量删除/覆盖既有产物/迁移/schema/部署/CI/认证授权等不可逆或高影响操作；" +
+		"需求含糊且选错路线要大范围返工。task_summary 为一行任务简介，" +
 		"plan 为计划详情（步骤、涉及文件、验收标准）。顶层 Agent 的计划呈给用户确认；" +
 		"子 Agent 的计划呈给父 Agent 审批。批准后本调用才返回并放行执行，未经批准禁止动手；" +
 		"被驳回时返回上级修改意见，修订后重新提交，循环直到批准为止" +
@@ -161,6 +166,14 @@ func (t *submitPlanTool) Execute(ctx context.Context, args map[string]any) *tool
 	if d == nil || !d.planConfirmEnabled || d.planState == nil {
 		return &tool.Result{Tool: "submit_plan", Success: true,
 			Output: "计划确认机制未启用（plan_confirmation_enabled=false），请直接按当前理解执行。"}
+	}
+	// 轻任务直通（2026-11-07）：提示词已要求默认不做计划，但模型仍可能反射式调用。
+	// 此处按确定性规则兜底——无高风险动作关键词且涉及文件 <3 的计划直接放行，
+	// 不再打扰用户/上级（实证：只读调研类任务弹审批纯耗 30-60s，零驳回）。
+	if planIsTrivial(taskSummary, plan) {
+		return &tool.Result{Tool: "submit_plan", Success: true,
+			Output: "【轻任务·免审批】本任务不含批量删除/覆盖/迁移/部署/大规模重构等高风险动作，" +
+				"计划确认机制已自动放行。直接按计划执行，开工第一句说明步骤即可。"}
 	}
 
 	planID, w := d.planState.register(agentID, parentAgentIDOf(agentID))
@@ -369,6 +382,35 @@ func parsePlanAnswer(answer string) (approved bool, feedback string) {
 	}
 	// 自由文本（既无明确批准也无明确驳回）：视为修改意见驳回。
 	return false, answer
+}
+
+// planHighRiskKeywords 命中即视为必须审批的高影响动作（任一出现即不放行）。
+// 与提示词【计划纪律】的②③④分级对齐；宁可多审一次，也不能让不可逆动作静默执行。
+var planHighRiskKeywords = []string{
+	"删除", "删掉", "清空", "覆盖", "重置", "回滚", "迁移", "schema", "部署", "上线",
+	"重构", "认证", "授权", "权限", "证书", "密钥", "批量", "全量", "整批",
+	"drop ", "delete", "rm -rf", "reset --hard", "force push", "truncate",
+}
+
+// planFileRefRe 粗匹配计划里出现的文件路径（带扩展名），用于估规模。
+// 只做量级判断，不做精确解析：误判偏严也无害（多审一次 vs 漏审）。
+var planFileRefRe = regexp.MustCompile(`[A-Za-z0-9_\-./\\]+\.(?:go|ts|tsx|vue|js|jsx|py|java|cs|cpp|c|h|rs|rb|php|sql|yaml|yml|json|md|html|css|sh|ps1)\b`)
+
+// planIsTrivial 判定一份计划是否属于"无需人工审批"的轻任务：
+// 无高风险关键词，且涉及文件（去重）少于 3 个。任务简介也纳入关键词扫描，
+// 防止计划正文写得含糊、风险点却写在简介里。
+func planIsTrivial(taskSummary, plan string) bool {
+	text := strings.ToLower(taskSummary + "\n" + plan)
+	for _, kw := range planHighRiskKeywords {
+		if strings.Contains(text, strings.ToLower(kw)) {
+			return false
+		}
+	}
+	files := make(map[string]struct{})
+	for _, m := range planFileRefRe.FindAllString(plan, -1) {
+		files[strings.ToLower(strings.ReplaceAll(m, "\\", "/"))] = struct{}{}
+	}
+	return len(files) < 3
 }
 
 // parentAgentIDOf 返回 agentID 的直接上级 ID：去掉最后一段 "/role-seq"。

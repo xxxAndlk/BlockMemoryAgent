@@ -29,6 +29,9 @@ func startTray(root, base string, hwnd func() windows.Handle, onExit func()) {
 		browserItem := systray.AddMenuItem("在浏览器中打开", "用默认浏览器打开 UI")
 		browserItem.Click(func() { _ = exec.Command("cmd", "/c", "start", "", base).Start() })
 
+		updateItem := systray.AddMenuItem("检查更新", "检查是否有新版本并安装")
+		updateItem.Click(func() { go runUpdateCheck(root, true) })
+
 		systray.AddSeparator()
 
 		quitItem := systray.AddMenuItem("退出（停止后台）", "停止后端服务并退出")

@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -65,6 +66,17 @@ func LoadModelsRegistry(path string) (*ModelsRegistryFile, error) {
 		e.APIKey = resolveEnv(e.APIKey)
 		e.BaseURL = resolveEnv(e.BaseURL)
 	}
+	// 单条不合法（典型：model 写成 ${某环境变量} 而该变量没配）**不废掉整份注册表**——
+	// 否则一个占位条目会让所有角色都"模型不在注册表中"。这里剔除坏条目并告警。
+	kept := f.Models[:0]
+	for _, e := range f.Models {
+		if e.ID == "" || e.Provider == "" || e.Model == "" || e.MaxOutputTokens < 0 {
+			log.Printf("[models_registry] 跳过不合法条目 %q（provider=%q model=%q）", e.ID, e.Provider, e.Model)
+			continue
+		}
+		kept = append(kept, e)
+	}
+	f.Models = kept
 	if err := f.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid models registry %s: %w", path, err)
 	}

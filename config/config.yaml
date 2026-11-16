@@ -130,7 +130,7 @@ agent:
   spec_enforcement_enabled: true     # call_sub_agent 前是否强制 WriteSpec
   max_total_dispatches: 30           # 单 session 派发总数上限
   # -- 计划确认（下级中大型任务先出计划给上级确认，批准后才执行；对照 Claude Code 差距分析 2026-08-29）--
-  plan_confirmation_enabled: true   # 开关：子 Agent 任何任务动手前 submit_plan 阻塞等上级确认（无大小豁免）；false=直通不阻塞
+  plan_confirmation_enabled: true   # 开关：仅大型/高风险任务（≥3文件/跨模块/不可逆操作等）submit_plan 阻塞等上级确认；轻任务由代码自动放行。false=全部直通
   plan_confirm_timeout_sec: 600     # 单次审批等待超时（秒）：超时 fail-open 按计划继续，防上级忙线时下级永久挂起
   plan_max_revisions: 0             # 每 Agent 计划被驳回重提上限：0=不限制，循环修订直到上级批准；>0 达上限不放行、转 escalate 升级仲裁（防失控兜底）
   # -- 波聚合整合纪要（集群档提速 C-3a，2026-09-17）--

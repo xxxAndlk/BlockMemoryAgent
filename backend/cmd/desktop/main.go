@@ -4,22 +4,27 @@
 //
 // 行为：
 //  1. 从安装目录读 app\current.json + .env 的 HTTP_ADDR；
-//  2. /api/health 通 → 直接开窗口；不通 → 按版本指针拉起该版本的 bma-server.exe
-//    （BMA_HOME=安装目录、隐藏控制台、stdout/stderr 落 logs\desktop_*.log）并等就绪；
+//  2. /api/health 通 → 直接开窗口；不通 → 自举依赖（PostgreSQL/Redis，见 deps.go）
+//    → 按版本指针拉起该版本的 bma-server.exe（隐藏控制台、stdout/stderr 落
+//    logs\desktop_*.log）→ 等就绪；
 //  3. 用 WebView2 开一个自带标题栏/任务栏图标的原生窗口指向 UI（**不再落到浏览器**）；
+//     依赖自举期间窗口显示启动进度页，就绪后切到 UI；失败显示带「重试」的错误页。
 //     WebView2 不可用时才退化为 Edge/Chrome 的 --app 模式。
 //
-// 关闭窗口只结束外壳进程，后端继续在后台运行（与"关掉窗口≠关掉服务"的桌面习惯一致）。
+// 关闭窗口只隐藏到托盘，后端继续在后台运行（与"关掉窗口≠关掉服务"的桌面习惯一致）。
 package main
 
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -49,10 +54,39 @@ var (
 )
 
 func main() {
+	ensureDepsOnly := flag.Bool("ensure-deps", false, "只做依赖自举后退出（供脚本启动器/安装流程复用）")
+	depsOut := flag.String("deps-out", "", "依赖自举结果 JSON 输出路径")
+	stopOnly := flag.Bool("stop", false, "只停掉本安装目录的后端与自带运行时后退出（安装器卸载前用）")
+	flag.Parse()
+
 	root, err := resolveRoot()
 	if err != nil {
 		showError(appTitle, err.Error())
 		return
+	}
+
+	// CLI 模式：停掉后台（卸载/换版本前调用）。必须在单实例互斥之前——否则已运行的
+	// 外壳会让本进程直接退出，后端与数据库就还活着（文件被占，目录删不掉）。
+	if *stopOnly {
+		stopBackend(root)
+		stopEmbeddedRuntime(root)
+		stopMediaService(root)
+		stopLocalMediaBridge(root)
+		return
+	}
+
+	// CLI 模式：只自举依赖、不开窗口。**必须在单实例互斥之前返回**——否则已运行
+	// 的外壳会让本进程直接退出，调用方会把"没干活"误判成"依赖已就绪"。
+	if *ensureDepsOnly {
+		rep, derr := ensureAllDeps(root, nil)
+		if werr := writeDepsReport(*depsOut, rep); werr != nil {
+			rep.OK = false
+			rep.Error = strings.TrimSpace(rep.Error + "；写结果文件失败：" + werr.Error())
+		}
+		if derr != nil || !rep.OK {
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 
 	// 单实例：已有外壳在跑（窗口可能已隐藏到托盘）→ 唤回它的窗口后退出。
@@ -61,23 +95,170 @@ func main() {
 		return
 	}
 	base := baseURL(root)
-	logPath := ""
+	runApp(root, base)
+}
 
-	if !healthy(base) {
-		if p, err := startServer(root); err != nil {
-			showError(appTitle, "启动后端失败："+err.Error())
-			return
-		} else {
-			logPath = p
+// runApp 建窗口并进入消息循环；依赖自举与后端拉起在后台完成，就绪后窗口切到 UI。
+//
+// 只有一个窗口：启动期间显示进度页，就绪后导航到 UI，失败显示带重试的错误页——
+// 避免"进度窗关了、主窗口又闪出来"的窗口抖动，也避免残留窗口挡着 UI。
+//
+// 注意：w.Run() 必须与建窗在**同一个 goroutine**——WebView2 控制器绑定创建它的
+// 线程，消息泵跑到别的线程上会让窗口永远白屏（内容不渲染）。
+func runApp(root, base string) {
+	// 锁定当前 goroutine 到当前 OS 线程：WebView2 控制器绑定创建它的线程，
+	// 消息泵必须跑在同一个线程上，否则窗口白屏（Go 的 goroutine 随时可能换线程）。
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	w := webview.NewWithOptions(webview.WebViewOptions{
+		DataPath: filepath.Join(root, "app", "webview2"),
+		WindowOptions: webview.WindowOptions{
+			Title:  appTitle,
+			Width:  1320,
+			Height: 880,
+			Center: true,
+		},
+	})
+	if w == nil {
+		// WebView2 不可用：退化为浏览器应用窗口；依赖与后端照旧自举。
+		go func() {
+			if err := bootstrap(root, base, nil); err != nil {
+				showError(appTitle, launchErrorText(err))
+			}
+		}()
+		openBrowserFallback(root, base)
+		return
+	}
+	defer w.Destroy()
+
+	hwnd := w.Window()
+	setWindowIcon(hwnd, filepath.Join(root, "app", "icon.ico"))
+
+	// 关窗 = 隐藏到托盘（后端继续跑）；真正退出走托盘菜单，并停掉该安装目录的后端
+	// 与自带运行时（PostgreSQL/Redis）。
+	interceptClose(hwnd)
+	startTray(root, base, func() windows.Handle { return windows.Handle(uintptr(hwnd)) }, func() {
+		stopBackend(root)
+		stopEmbeddedRuntime(root)
+		stopMediaService(root)
+		stopLocalMediaBridge(root)
+		quitTray()
+		w.Terminate()
+	})
+
+	// 启动页：先显示进度，避免开窗即空白（首次可能要拉镜像，耗时几分钟）。
+	w.SetHtml(startupHTML("正在准备启动 ..."))
+
+	// 错误页的「重试」按钮 → 重走一遍自举。
+	_ = w.Bind("bmaRetry", func() {
+		go func() {
+			if err := bootstrap(root, base, w); err != nil {
+				w.Dispatch(func() { w.SetHtml(errorHTML(launchErrorText(err))) })
+			}
+		}()
+	})
+
+	// 首启向导：缺凭据时先引导填写（写进 .env），再继续启动。
+	gate := newWizardGate()
+	_ = w.Bind("bmaSetupSubmit", func(modelKey, modelURL, embedURL, embedKey string) {
+		go func() {
+			if err := applySetup(root, modelKey, modelURL, embedURL, embedKey); err != nil {
+				st := checkSetup(root)
+				st.Err = "保存失败：" + err.Error()
+				w.Dispatch(func() { w.SetHtml(wizardHTML(st)) })
+				return
+			}
+			gate.open()
+		}()
+	})
+	_ = w.Bind("bmaSetupSkip", func() { gate.open() })
+
+	// 依赖自举与后端拉起放后台：主 goroutine 留给 WebView2 消息泵。
+	go func() {
+		if st := checkSetup(root); st.NeedModel || st.NeedEmbed {
+			w.Dispatch(func() { w.SetHtml(wizardHTML(st)) })
+			gate.wait()
 		}
-		if !waitHealthy(base, 90*time.Second) {
-			msg := fmt.Sprintf("后端在 90 秒内未就绪：%s\n\n日志：%s", base, logPath)
-			showErrorWindow(base, msg)
-			return
+		if err := bootstrap(root, base, w); err != nil {
+			w.Dispatch(func() { w.SetHtml(errorHTML(launchErrorText(err))) })
+		}
+	}()
+
+	w.Run()
+}
+
+// bootstrap 自举依赖 → 起后端 → 等就绪；就绪后把窗口切到 UI。
+//
+// w 为 nil 表示没有窗口（WebView2 缺失的浏览器兜底路径），此时只做后台动作。
+func bootstrap(root, base string, w webview.WebView) error {
+	if healthy(base) {
+		navigate(w, base)
+		go runMediaSetup(root, base)
+		return nil
+	}
+
+	setProgress(w, "检查依赖（PostgreSQL / Redis）...")
+	// 依赖自举：安装包带了自带运行时就用它（目标机免装 Docker），否则走 Docker 路径。
+	rep, err := ensureAllDeps(root, func(step string) { setProgress(w, step) })
+	if err != nil {
+		return &launchError{msg: rep.Error, hint: rep.Hint}
+	}
+
+	// 原生媒体服务（免 Docker 的生图/生视频）：失败只降级媒体能力，不阻断启动。
+	if err := ensureMediaService(root, func(step string) { setProgress(w, step) }); err != nil {
+		logMediaNotice(root, err)
+	}
+
+	setProgress(w, "启动后端 ...")
+	logPath, pid, err := startServer(root)
+	if err != nil {
+		return &launchError{
+			msg:  "启动后端失败：" + err.Error(),
+			hint: "日志目录：" + filepath.Join(root, "logs"),
 		}
 	}
 
-	openWindow(root, base)
+	setProgress(w, "等待后端就绪 ...")
+	if !waitHealthyWithProc(base, pid, 90*time.Second) {
+		return &launchError{
+			msg:    "后端在 90 秒内未就绪",
+			hint:   "日志：" + logPath,
+			detail: tailFile(logPath, 20),
+		}
+	}
+
+	navigate(w, base)
+	// 媒体栈体积大、构建慢，放后台；失败只落日志（插件降级语义）。
+	go runMediaSetup(root, base)
+	// 启动后顺手检查一次更新（没配 BMA_UPDATE_URL 就静默跳过）。
+	go runUpdateCheck(root, false)
+	return nil
+}
+
+// launchError 启动失败的结构化描述（原因 + 建议 + 日志片段）。
+type launchError struct {
+	msg    string
+	hint   string
+	detail string
+}
+
+func (e *launchError) Error() string { return e.msg }
+
+// launchErrorText 把错误渲染成错误页正文。
+func launchErrorText(err error) string {
+	var le *launchError
+	if ok := errors.As(err, &le); ok {
+		s := le.msg
+		if le.hint != "" {
+			s += "\n\n建议：" + le.hint
+		}
+		if le.detail != "" {
+			s += "\n\n日志片段：\n" + le.detail
+		}
+		return s
+	}
+	return err.Error()
 }
 
 // resolveRoot 推断安装目录：<root>\BMA-Desktop.exe 或 <root>\app\versions\<v>\bin\bma-desktop.exe。
@@ -147,89 +328,74 @@ func healthy(base string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-func waitHealthy(base string, timeout time.Duration) bool {
+// waitHealthyWithProc 等后端就绪；进程提前退出（严格启动 fail-fast）立即判失败，
+// 不再像旧版那样空等满 90 秒才报一句"未就绪"。
+func waitHealthyWithProc(base string, pid uint32, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if healthy(base) {
 			return true
+		}
+		if pid != 0 && !processAlive(pid) {
+			return false
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	return false
 }
 
-// startServer 按版本指针拉起后端，返回日志路径。
-func startServer(root string) (string, error) {
+// startServer 按版本指针拉起后端，返回日志路径与进程 pid。
+func startServer(root string) (string, uint32, error) {
 	raw, err := os.ReadFile(filepath.Join(root, "app", "current.json"))
 	if err != nil {
-		return "", fmt.Errorf("读取版本指针失败: %w", err)
+		return "", 0, fmt.Errorf("读取版本指针失败: %w", err)
 	}
 	var cur struct {
 		Version string `json:"version"`
 	}
 	if err := json.Unmarshal(raw, &cur); err != nil || cur.Version == "" {
-		return "", fmt.Errorf("版本指针损坏: %v", err)
+		return "", 0, fmt.Errorf("版本指针损坏: %v", err)
 	}
 	verDir := filepath.Join(root, "app", "versions", cur.Version)
 	exe := filepath.Join(verDir, "bin", "bma-server.exe")
 	if !fileExists(exe) {
-		return "", fmt.Errorf("版本 %s 缺少 bin\\bma-server.exe", cur.Version)
+		return "", 0, fmt.Errorf("版本 %s 缺少 bin\\bma-server.exe", cur.Version)
 	}
 	logDir := filepath.Join(root, "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	logPath := filepath.Join(logDir, "desktop_"+time.Now().Format("20060102_150405")+".log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	cmd := exec.Command(exe, "-web-dist", filepath.Join(verDir, "web", "dist"))
-	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "BMA_HOME="+root)
+	// 工作目录 = 安装目录下的 workspace：会话产物（媒体桥的 .bma\od-artifacts 等）
+	// 落在用户可见的工作目录，而不是程序目录。
+	workDir := filepath.Join(root, "workspace")
+	if !fileExists(workDir) {
+		workDir = root
+	}
+	cmd.Dir = workDir
+	cmd.Env = append(os.Environ(),
+		"BMA_HOME="+root,
+		// 插件配置里的路径占位符（整串形式，配置插值只认整串 ${VAR}）
+		"BMA_NODE_EXE="+filepath.Join(root, runtimeDirName, "node", "node.exe"),
+		"BMA_MEDIA_BRIDGE="+filepath.Join(root, runtimeDirName, "media", "open-design-mcp", "server.js"),
+	)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindowFlag}
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
-		return logPath, fmt.Errorf("启动 bma-server: %w", err)
+		return logPath, 0, fmt.Errorf("启动 bma-server: %w", err)
 	}
+	pid := uint32(cmd.Process.Pid)
 	// 不等待子进程；外壳进程退出后后端继续运行。
 	_ = cmd.Process.Release()
-	return logPath, nil
-}
-
-// openWindow 用 WebView2 打开原生窗口；失败时退化为浏览器的应用窗口模式。
-func openWindow(root, base string) {
-	w := webview.NewWithOptions(webview.WebViewOptions{
-		DataPath: filepath.Join(root, "app", "webview2"),
-		WindowOptions: webview.WindowOptions{
-			Title:  appTitle,
-			Width:  1320,
-			Height: 880,
-			Center: true,
-		},
-	})
-	if w == nil {
-		openBrowserFallback(root, base)
-		return
-	}
-	defer w.Destroy()
-
-	hwnd := w.Window()
-	setWindowIcon(hwnd, filepath.Join(root, "app", "icon.ico"))
-
-	// 关窗 = 隐藏到托盘（后端继续跑）；真正退出走托盘菜单，并停掉该安装目录的后端。
-	interceptClose(hwnd)
-	startTray(root, base, func() windows.Handle { return windows.Handle(uintptr(hwnd)) }, func() {
-		stopBackend(root)
-		quitTray()
-		w.Terminate()
-	})
-
-	w.Navigate(base)
-	w.Run()
+	return logPath, pid, nil
 }
 
 // setWindowIcon 给原生窗口设置大/小图标（任务栏 + 标题栏）。
@@ -273,23 +439,25 @@ func openBrowserFallback(root, base string) {
 	_ = exec.Command("cmd", "/c", "start", "", base).Start()
 }
 
-// showErrorWindow 用 WebView2 直接显示错误页（避免控制台窗口）。
-func showErrorWindow(base, message string) {
-	w := webview.New(false)
-	if w == nil {
-		showError(appTitle, message)
-		return
-	}
-	defer w.Destroy()
-	w.SetTitle(appTitle)
-	w.SetSize(760, 420, webview.HintNone)
-	html := "<html><head><meta charset=\"utf-8\"><style>" +
+// startupHTML 启动进度页。
+func startupHTML(step string) string {
+	return "<html><head><meta charset=\"utf-8\"><style>" +
 		"body{font-family:'Segoe UI',sans-serif;background:#0d1929;color:#e2e8f0;padding:32px;line-height:1.6}" +
 		"h1{font-size:18px;color:#5eead4;margin:0 0 12px}pre{white-space:pre-wrap;background:#122434;padding:16px;border-radius:10px;font-size:12px}" +
-		"a{color:#7dd3fc}</style></head><body><h1>BlockMemoryAgent 启动失败</h1><pre>" + htmlEscape(message) +
-		"</pre><p>目标：<a href=\"" + base + "\">" + base + "</a></p></body></html>"
-	w.SetHtml(html)
-	w.Run()
+		".spin{display:inline-block;width:14px;height:14px;border:2px solid #5eead4;border-top-color:transparent;border-radius:50%;" +
+		"animation:sp 1s linear infinite;vertical-align:-2px;margin-right:8px}@keyframes sp{to{transform:rotate(360deg)}}" +
+		"</style></head><body><h1>BlockMemoryAgent</h1><pre><span class=\"spin\"></span>" + htmlEscape(step) +
+		"</pre></body></html>"
+}
+
+// errorHTML 错误页：原因 + 建议 + 日志片段 + 重试按钮。
+func errorHTML(message string) string {
+	return "<html><head><meta charset=\"utf-8\"><style>" +
+		"body{font-family:'Segoe UI',sans-serif;background:#0d1929;color:#e2e8f0;padding:32px;line-height:1.6}" +
+		"h1{font-size:18px;color:#f87171;margin:0 0 12px}pre{white-space:pre-wrap;background:#122434;padding:16px;border-radius:10px;font-size:12px}" +
+		"button{margin-top:16px;padding:8px 18px;border:0;border-radius:8px;background:#5eead4;color:#0d1929;font-size:13px;cursor:pointer}" +
+		"</style></head><body><h1>BlockMemoryAgent 启动失败</h1><pre>" + htmlEscape(message) +
+		"</pre><button onclick=\"bmaRetry()\">重试启动</button></body></html>"
 }
 
 func htmlEscape(s string) string {
@@ -303,4 +471,14 @@ func showError(title, message string) {
 	caption, _ := windows.UTF16PtrFromString(title)
 	user32.NewProc("MessageBoxW").Call(0,
 		uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(caption)), 0x10)
+}
+
+// showConfirm 是/否消息框（返回用户是否点了「是」）。
+func showConfirm(title, message string) bool {
+	text, _ := windows.UTF16PtrFromString(message)
+	caption, _ := windows.UTF16PtrFromString(title)
+	// 0x04 = MB_YESNO, 0x30 = MB_ICONQUESTION
+	ret, _, _ := user32.NewProc("MessageBoxW").Call(0,
+		uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(caption)), 0x04|0x30)
+	return ret == 6 // IDYES
 }

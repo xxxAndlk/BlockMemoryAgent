@@ -15,6 +15,13 @@ import (
 	"github.com/blockmemory/agent/backend/internal/mailbox"
 )
 
+// 大型任务样例：含"重构"高风险关键词与 3 个文件路径，保证 planIsTrivial 判否，
+// 从而走真实审批链路（轻任务会被自动放行，测不到阻塞语义）。
+const (
+	testBigSummary = "重构订单模块结算链路"
+	testBigPlan    = "1. 迁移 schema\n2. 修改 a.go / b.go / c.go\n3. go test ./..."
+)
+
 // newPlanConfirmEnv 构造计划确认测试环境：复用 salvage 测试环境的 Dispatcher 接线，
 // 注册 submit_plan/review_plan 工具（开关由各用例自行 WithPlanConfirmation 注入）。
 func newPlanConfirmEnv(t *testing.T) (*Dispatcher, *tool.Registry, *mailbox.Mailbox) {
@@ -43,7 +50,7 @@ func extractPlanID(t *testing.T, body string) string {
 func TestSubmitPlanDisabled(t *testing.T) {
 	_, toolsReg, _ := newPlanConfirmEnv(t) // 未调 WithPlanConfirmation：默认关闭
 	ctx := agent.WithAgentID(context.Background(), "session-1/domain-2")
-	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
+	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": testBigSummary, "plan": testBigPlan})
 	if err != nil {
 		t.Fatalf("dispatch failed: %v", err)
 	}
@@ -65,7 +72,7 @@ func TestSubmitPlanToParentApproved(t *testing.T) {
 	done := make(chan submitOutcome, 1)
 	go func() {
 		ctx := agent.WithAgentID(context.Background(), "session-1/domain-2")
-		res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "改造游戏代码", "plan": "1. 读 config.js\n2. 改 game.js\n3. node --check"})
+		res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "重构游戏代码", "plan": "1. 读 config.js\n2. 改 game.js\n3. 改 main.js\n4. node --check"})
 		done <- submitOutcome{res.Output, err}
 	}()
 
@@ -87,7 +94,7 @@ func TestSubmitPlanToParentApproved(t *testing.T) {
 	if planID == "" {
 		t.Fatal("plan request not delivered to parent mailbox in time")
 	}
-	if !strings.Contains(body, "提交者: session-1/domain-2") || !strings.Contains(body, "任务简介: 改造游戏代码") {
+	if !strings.Contains(body, "提交者: session-1/domain-2") || !strings.Contains(body, "任务简介: 重构游戏代码") {
 		t.Fatalf("plan request body missing submitter/summary: %s", body)
 	}
 
@@ -121,7 +128,7 @@ func TestSubmitPlanRejectedLoopUntilApproved(t *testing.T) {
 
 	submit := func(out chan<- string) {
 		ctx := agent.WithAgentID(context.Background(), "session-1/domain-3")
-		res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
+		res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": testBigSummary, "plan": testBigPlan})
 		if err != nil {
 			// goroutine 内不可 FailNow（vet testinggoroutine）：报错后送空串，让主断言带出原因
 			t.Errorf("submit dispatch failed: %v", err)
@@ -199,7 +206,7 @@ func TestSubmitPlanRejectedCapEscalates(t *testing.T) {
 
 	submit := func(out chan<- string) {
 		ctx := agent.WithAgentID(context.Background(), "session-1/domain-3")
-		res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
+		res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": testBigSummary, "plan": testBigPlan})
 		if err != nil {
 			// goroutine 内不可 FailNow（vet testinggoroutine）：报错后送空串，让主断言带出原因
 			t.Errorf("submit dispatch failed: %v", err)
@@ -280,7 +287,7 @@ func TestSubmitPlanTimeoutFailOpen(t *testing.T) {
 	d, toolsReg, _ := newPlanConfirmEnv(t)
 	d.WithPlanConfirmation(true, 80*time.Millisecond, 3)
 	ctx := agent.WithAgentID(context.Background(), "session-1/domain-9")
-	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
+	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": testBigSummary, "plan": testBigPlan})
 	if err != nil {
 		t.Fatalf("dispatch failed: %v", err)
 	}
@@ -298,7 +305,7 @@ func TestSubmitPlanTopLevelUsesAskUser(t *testing.T) {
 		if !strings.Contains(question, "【计划确认】") || !strings.Contains(question, "任务简介") {
 			t.Errorf("unexpected ask_user question: %s", question)
 		}
-		if opts.Detail != "p" {
+		if opts.Detail != testBigPlan {
 			t.Errorf("plan 全文应经 detail 透传（落对话区）, got %q", opts.Detail)
 		}
 		if strings.Contains(question, "p\n") || strings.Contains(question, "【计划详情】") {
@@ -310,7 +317,7 @@ func TestSubmitPlanTopLevelUsesAskUser(t *testing.T) {
 		return "用户答复: 批准开工", nil
 	})
 	ctx := agent.WithAgentID(context.Background(), "session-1")
-	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "多领域改造", "plan": "p"})
+	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "多领域重构", "plan": testBigPlan})
 	if err != nil {
 		t.Fatalf("dispatch failed: %v", err)
 	}
@@ -322,7 +329,7 @@ func TestSubmitPlanTopLevelUsesAskUser(t *testing.T) {
 	toolsReg.SetAskUserHook(func(ctx context.Context, question string, opts tool.AskUserOptions) (string, error) {
 		return "用户答复: 形象必须统一，全部重画", nil
 	})
-	res, err = toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "多领域改造", "plan": "p"})
+	res, err = toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "多领域重构", "plan": testBigPlan})
 	if err != nil {
 		t.Fatalf("dispatch failed: %v", err)
 	}
@@ -345,7 +352,7 @@ func TestSubmitPlanWakesSuspendedParent(t *testing.T) {
 	})
 	go func() {
 		ctx := agent.WithAgentID(context.Background(), "session-1/domain-7")
-		_, _ = toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
+		_, _ = toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": testBigSummary, "plan": testBigPlan})
 	}()
 	select {
 	case c := <-wake:
@@ -380,7 +387,7 @@ func TestReviewPlanValidations(t *testing.T) {
 	// 驳回缺 feedback：先提交一份计划再审批。
 	go func() {
 		ctx := agent.WithAgentID(context.Background(), "session-1/domain-4")
-		_, _ = toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
+		_, _ = toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": testBigSummary, "plan": testBigPlan})
 	}()
 	var planID string
 	deadline := time.Now().Add(3 * time.Second)
@@ -404,6 +411,51 @@ func TestReviewPlanValidations(t *testing.T) {
 	}
 }
 
+// TestPlanIsTrivial 轻任务判定：只读调研/小改动免审批，高风险关键词或 ≥3 文件必须审批。
+func TestPlanIsTrivial(t *testing.T) {
+	cases := []struct {
+		name    string
+		summary string
+		plan    string
+		want    bool
+	}{
+		{"只读调研", "找一下各购物网站的销量对比并给出选品建议", "1. web_search 检索\n2. 汇总成表格", true},
+		{"单文件小改", "改一下首页标题", "1. 改 index.vue 的标题文案", true},
+		{"两个文件", "调整接口与调用方", "1. 改 api/handler.go\n2. 改 web/views/session.vue", true},
+		{"三个文件", "调整接口链路", "1. handler.go\n2. service.go\n3. client.ts", false},
+		{"重构关键词", "重构结算模块", "1. 拆函数", false},
+		{"批量删除", "清理旧产物", "1. 批量删除过期截图", false},
+		{"部署动作", "更新线上服务", "1. 重新部署", false},
+		{"摘要藏风险", "迁移数据库", "1. 备份后执行", false},
+	}
+	for _, c := range cases {
+		if got := planIsTrivial(c.summary, c.plan); got != c.want {
+			t.Errorf("%s: planIsTrivial=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestSubmitPlanTrivialAutoPass 轻任务即便被调用 submit_plan 也直接放行，
+// 不阻塞等待用户/上级（提示词默认不计划的确定性兜底）。
+func TestSubmitPlanTrivialAutoPass(t *testing.T) {
+	d, toolsReg, mb := newPlanConfirmEnv(t)
+	d.WithPlanConfirmation(true, 5*time.Second, 3)
+	ctx := agent.WithAgentID(context.Background(), "session-1/domain-8")
+	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{
+		"task_summary": "找一下各购物网站的销量对比",
+		"plan":         "1. 检索销量数据\n2. 汇总成对比表",
+	})
+	if err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+	if !res.Success || !strings.Contains(res.Output, "免审批") {
+		t.Fatalf("expected trivial auto-pass, got success=%v output=%s", res.Success, res.Output)
+	}
+	if got := mb.Peek("session-1"); len(got) != 0 {
+		t.Fatalf("trivial plan must not reach parent mailbox, got %d messages", len(got))
+	}
+}
+
 // TestSubmitPlanTimeoutFailClosed B-02：fail-closed 策略下审批超时阻断执行，
 // 不再按计划继续（禁止未批准产出）。
 func TestSubmitPlanTimeoutFailClosed(t *testing.T) {
@@ -411,7 +463,7 @@ func TestSubmitPlanTimeoutFailClosed(t *testing.T) {
 	d.WithPlanConfirmation(true, 60*time.Millisecond, 3)
 	d.WithPlanApprovalPolicy(true)
 	ctx := agent.WithAgentID(context.Background(), "session-1/domain-11")
-	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": "s", "plan": "p"})
+	res, err := toolsReg.Dispatch(ctx, "submit_plan", map[string]any{"task_summary": testBigSummary, "plan": testBigPlan})
 	if err != nil {
 		t.Fatalf("dispatch failed: %v", err)
 	}

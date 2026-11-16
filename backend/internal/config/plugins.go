@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -97,10 +98,21 @@ func unmarshalPlugins(raw map[string]any) (*PluginsConfig, error) {
 	return cfg, nil
 }
 
+// workDirPlaceholder 插件管理器的工作目录占位符。
+//
+// 与 internal/plugins.WorkDirPlaceholder 同值；这里刻意不 import 那个包（避免
+// config ← plugins 的依赖环）。
+const workDirPlaceholder = "${WORKDIR}"
+
 // resolveEnvInValue 递归替换 map/slice/string 中的 ${VAR} 与 ${VAR:"default"} 引用。
 func resolveEnvInValue(v any) any {
 	switch t := v.(type) {
 	case string:
+		// ${WORKDIR} 是插件管理器占位符（会话工作目录），不是环境变量 —— 必须原样保留：
+		// 否则会被解析成空串，stdio 传输的插件就不知道自己该在哪个目录读写产物。
+		if strings.Contains(t, workDirPlaceholder) {
+			return t
+		}
 		return resolveEnvWithDefault(t)
 	case map[string]any:
 		for k, val := range t {

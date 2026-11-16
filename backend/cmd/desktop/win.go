@@ -110,6 +110,64 @@ func acquireSingleInstance(root string) (windows.Handle, bool) {
 	return handle, true
 }
 
+// processAlive 报告进程是否仍在运行（后端严格启动失败会立刻退出，
+// 等待健康检查时用它及时判失败，而不是空等满超时）。
+func processAlive(pid uint32) bool {
+	if pid == 0 {
+		return false
+	}
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return true // 快照失败时保守当作"活着"，交给健康检查超时兜底
+	}
+	defer windows.CloseHandle(snap)
+
+	var pe windows.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	for err := windows.Process32First(snap, &pe); err == nil; err = windows.Process32Next(snap, &pe) {
+		if pe.ProcessID == pid {
+			return true
+		}
+	}
+	return false
+}
+
+// stopProcessByDir 终止可执行文件位于指定目录下的同名进程（按完整路径精确匹配，
+// 不误杀别的安装目录或系统里的同名程序）。用于收掉自带运行时里的 Redis。
+func stopProcessByDir(dir, exeName string) int {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return 0
+	}
+	defer windows.CloseHandle(snap)
+
+	dirLower := strings.ToLower(strings.TrimRight(dir, "\\")) + "\\"
+	killed := 0
+	var pe windows.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	for err := windows.Process32First(snap, &pe); err == nil; err = windows.Process32Next(snap, &pe) {
+		if !strings.EqualFold(syscall.UTF16ToString(pe.ExeFile[:]), exeName) {
+			continue
+		}
+		h, err := windows.OpenProcess(processQueryLimitedInformation|processTerminate, false, pe.ProcessID)
+		if err != nil {
+			continue
+		}
+		var buf [windows.MAX_PATH]uint16
+		size := uint32(len(buf))
+		if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err == nil {
+			path := strings.ToLower(syscall.UTF16ToString(buf[:size]))
+			if strings.HasPrefix(path, dirLower) {
+				if err := windows.TerminateProcess(h, 1); err == nil {
+					killed++
+				}
+			}
+		}
+		windows.CloseHandle(h)
+	}
+	return killed
+}
+
 // stopBackend 终止安装目录下的 bma-server.exe（不误杀其他安装/开发实例）。
 func stopBackend(root string) int {
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)

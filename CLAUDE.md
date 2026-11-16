@@ -21,21 +21,39 @@ Go module: `github.com/blockmemory/agent/backend` (source under `backend/`; root
 
 See `Makefile` (`make help` lists all targets). Key targets: `make run` (build web + run server), `make backend-test`, `make test-test`, `make lint`, `make up`/`down` (docker compose), `make migrate`. The Makefile recipes are Unix-shell (Git Bash) syntax — `make` is not installed on some Windows hosts; there run `.\dist.ps1` (= `make dist`) in PowerShell, then `.\install.ps1` to copy `dist/` into a chosen install dir and set user env `BMA_HOME`.
 
-## 桌面版打包与更新（2026-10-30）
+## 桌面版打包与更新（2026-10-30；2026-11-14 自带运行时 + 正式安装包）
+
+**商业桌面应用的常规形态**：安装包（Inno Setup，per-user）+ **自带运行时**（PostgreSQL+pgvector、Redis 随包，目标机免装 Docker）+ 版本化程序目录 + 用户数据在 `%LOCALAPPDATA%`。
+
+- `installer/fetch-runtime.ps1`：下载运行时源包到 `dist\runtime-cache\`（PG 16 免安装版 EDB zip / pgvector 0.8.7 Windows 预编译包 / Redis 5.0.14.1 for Windows / WebView2 引导程序）。源包**不进 git**。
+- `installer/build-installer.ps1`：编译安装包 → `dist\installer\BlockMemoryAgent-Setup-<版本>.exe`（约 78MB，LZMA2）。
+- `installer/blockmemoryagent.iss`：per-user 安装到 `%LOCALAPPDATA%\Programs\BlockMemoryAgent`；铺程序 + `runtime\` + `docker\`；`config\` 与 `.env` **仅在缺失时种子化**（升级绝不覆盖）；开始菜单/桌面快捷方式 + 卸载项；目标机缺 WebView2 时静默补装；卸载前调 `BMA-Desktop.exe --stop` 停后端与内置运行时（用户数据默认保留）。
+- **自带运行时管理**（`backend/cmd/desktop/runtime.go`）：外壳把包内 `runtime\postgres`（PG 16 + `share\extension\vector.control` + `lib\vector.dll`）与 `runtime\redis` 当**子进程**拉起（Postgres.app 式）——首次 `initdb` → 起 PG（pg_ctl）→ 建库 + `CREATE EXTENSION vector` → 起 Redis；数据目录 `%LOCALAPPDATA%\BlockMemoryAgent\data\{pg,redis}`；实例口令/端口记在 `%LOCALAPPDATA%\BlockMemoryAgent\instance.json`（**跟数据走**，换安装目录不换口令）；生效的 DSN/Redis 地址写回安装目录 `.env` 给后端连。端口默认 55432/56380（与开发实例的 5432/6380 隔离）。
+- **依赖自举优先级**：`ensureAllDeps` → 安装包带 `runtime\` 就用自带运行时（免 Docker），否则回退 Docker 路径（`deps.go`：拉起 Docker Desktop + compose up）。`.env` 里显式配了**远程** PG/Redis 时不接管。
+- `bma-app.ps1 migrate-data -Target <安装目录> -FromDsn <源库 DSN>`：把别处的数据（典型是开发实例的 Docker PG）搬进自带实例（pg_dump/pg_restore，包内自带）。
+- `bma-app.ps1 pack [-NoRuntime]`：`runtime\` 载荷自动进包（裁剪后 122MB：去掉 include/doc/静态库/pg_upgrade/pgbench）；`-NoRuntime` 出纯程序包（开发机快速迭代用）。
+- **首启向导**（`backend/cmd/desktop/wizard.go`）：`.env` 里模型 Key / 嵌入 Key 还是占位值时，窗口先弹引导页（模型 Key + 接口地址 + 嵌入地址/Key），填完写进 `.env` 再继续启动；可「稍后再说」（跳过 = 相关能力降级）。已配过的一律不弹窗。
+- **自动更新**（`backend/cmd/desktop/update.go`）：更新地址写在 `.env` 的 `BMA_UPDATE_URL`（指向一个 JSON：`version`/`url`/`sha256`/`notes`）。启动后后台检查一次 + 托盘「检查更新」；有新版则询问 → 下载 → 校验 sha256 → 静默运行安装包（安装器用 Restart Manager 关掉旧进程）→ 退出旧版。没配 `BMA_UPDATE_URL` 就不检查、不打扰。
+- **原生媒体栈（免 Docker 的生图/生视频）**：桌面版不带 daemon 容器，改用随包的 `mediaservice.exe`（`backend/cmd/mediaservice`，实现 ui_design 桥实际用到的 9 个 daemon 端点）+ 随包 Node 起桥（stdio 传输）+ 随包 MiniMax 适配桥（本地 Node 进程，顶替容器服务名 `minimax-media:8787`）。打包时 `plugins.yaml` 的 ui_design 段被改写成 stdio（`${BMA_NODE_EXE}` / `${BMA_MEDIA_BRIDGE}` 两个**整串**占位符，由外壳/启动器注入环境变量；配置插值只认整串 `${VAR}`，不能嵌在路径中间）。安装时 `config\plugins.yaml` **仅在用户没改过**（与随包副本逐字节一致）才随版本更新，改过就保留并告警。
+- **媒体能力边界**：原生媒体服务只做纯文本生成（t2i/t2v）与 OpenAI 兼容的参考图通道（`/images/generations` + `image` 字段 data URL）；本地编辑（crop/遮罩）、Gemini 生图、方舟视频等上游特有形状仍需容器 daemon（装 Docker 后 `bma-app.ps1 media` 可切回）。
+
+### 打包工具（bma-app.ps1）
 
 `bma-app.ps1`（仓库根，UTF-8 BOM）把仓库打成"版本化 + 可回滚"的桌面应用包，**只带程序与配置模板，绝不带仓库本地运行时数据**。
 
-- `.\bma-app.ps1 pack [-Version v] [-SkipWeb] [-Test] [-NoZip]` → `dist/app/bma-<版本>/`（bin / web\dist / config-templates / launcher / VERSION.json / MANIFEST.sha256）+ `dist/bma-app-<版本>.zip`；ldflags 注入 `internal/buildinfo`（Version/Commit/BuiltAt）。
+- `.\bma-app.ps1 pack [-Version v] [-SkipWeb] [-Test] [-NoZip]` → `dist/app/bma-<版本>/`（bin / web\dist / config-templates / launcher / **docker** / VERSION.json / MANIFEST.sha256）+ `dist/bma-app-<版本>.zip`；ldflags 注入 `internal/buildinfo`（Version/Commit/BuiltAt）。
 - **日常更新一条命令**：`.\bma-app.ps1 deploy -Target <安装目录> [-SkipWeb] [-Keep 3]` = pack + update，自动完成"构建 → 切版本 → 重启后端 → 校验 `build.version`（失败回滚）→ **重启原本开着的桌面外壳**（`-NoShell` 跳过）"。实测全流程约 28s（`-SkipWeb` 时）。
 - `install|update -Target <dir> [-From 包|zip] [-Keep 3] [-HttpAddr host:port] [-NoRestart] [-NoShortcut] [-NoShell] [-Json]`：布局 = `app\versions\<ver>\`（不可变，程序）+ `app\current.json`（版本指针，含 previous）+ 根目录用户数据 `config\ .env plugins.d\ workspace\ logs\`。配置**只补缺、不覆盖**；重启前先关掉该目录下已运行的 `BMA-Desktop.exe`，重启后核对 `/api/health` 的 `build.version`，失败自动回滚上一版；拒绝安装到含 `.git`/`go.work` 的源码目录。
 - `start|stop|restart|status|rollback [-Target <dir>] [-Json]`：`status -Json` 给外部调用方机器可读状态（installed/runtime/running/http/health/versions）。
+- `media -Target <dir>`：应用媒体生成配置（对齐 `docker/bma-plugin.sh media`）——重建 `bma/open-design-mcp:local` 镜像 → `compose up -d --build minimax-media` → 重建 `open_design` 容器（entrypoint 重写 `media-config.json`）→ 换 `ui_design` keeper。唯一手改点 = `<安装目录>\.env` 媒体段。
 - **禁运清单**（打包硬剔除 + 拒绝安装侧污染）：`config/models.json`、`config/user_profile.md`、`config/skills_learned/`、`.env`、`workspace/`、`logs/`、`plugins.installed.yaml`；包内文本命中疑似真实 key 直接拒包。
-- 启动器 `tools/app/{launch.ps1,BMA.cmd,BMA.vbs}`：读指针 → 健康检查单实例 → 生成 `app\run.cmd`（设 BMA_HOME + 日志重定向）→ **ShellExecute 拉起**（不能用 `-NoNewWindow`：子进程会继承调用方 stdout 管道，`& powershell -File launch.ps1` 永不返回）→ 等健康 → 写 `app/runtime.json` → 开浏览器。
+- 启动器 `tools/app/{launch.ps1,BMA.cmd,BMA.vbs}`：读指针 → 健康检查单实例 → **自举依赖（`BMA-Desktop.exe --ensure-deps`，见下）** → 生成 `app\run.cmd`（设 BMA_HOME + 日志重定向）→ **ShellExecute 拉起**（不能用 `-NoNewWindow`：子进程会继承调用方 stdout 管道，`& powershell -File launch.ps1` 永不返回）→ 等健康 → 写 `app/runtime.json` → 开浏览器。
 - **桌面外壳 `BMA-Desktop.exe`**（`backend/cmd/desktop`，go-webview2 + 系统 WebView2 Runtime，CGO 关闭可编、`-H=windowsgui` 无控制台）：安装到安装目录根、快捷方式指向它。行为 = 读版本指针/端口 → 健康检查 → 必要时拉起后端 → **原生 WebView2 窗口**渲染 UI（不再落到浏览器）；WebView2 缺失才退回 Edge/Chrome 的 `--app` 无边框窗口。
+- **依赖自举（2026-11-14，`backend/cmd/desktop/deps.go`）**：后端严格启动，PG/Redis 连不上直接退；所以外壳在起后端前负责把依赖拉起来——探测（真实驱动 ping，能区分「库没起」与「账号/库名不对」）→ 引擎不可用则拉起 Docker Desktop 并等就绪 → `compose up -d postgres redis` → 等就绪。包内自带 `docker/docker-compose.yml` 与 4 个媒体构建上下文（**与开发实例同项目同卷**：数据不丢、端口不冲突）。失败给可读原因+建议，错误页带「重试」按钮；后端早退立即判失败并显示日志尾（旧版闷等 90 秒）。媒体栈（open_design/minimax-media/插件镜像）**后台**准备，失败只落 `logs\media_setup_*.log`。`--ensure-deps [--deps-out f.json]` 为 CLI 模式，供 launch.ps1 与外部调用方复用（结果写 `app\deps.json`）。
 - **托盘与退出语义（`tray.go`，energye/systray 纯 Go + `RunWithExternalLoop`）**：点窗口 X = **隐藏到托盘**（子类化 WndProc 拦截 `WM_CLOSE`），后端继续跑；左键托盘=唤回窗口，右键菜单 `打开主窗口 / 在浏览器中打开 / 退出（停止后台）`；只有托盘「退出」才 `stopBackend`（Toolhelp32 按 **安装目录路径** 精确匹配 `bma-server.exe`，不误杀开发实例）并退出。单实例靠按安装目录命名的互斥体：再次双击快捷方式只会唤回已隐藏的窗口。新图标的 Windows 11 默认落在任务栏「^」溢出区，需用户拖出常驻。
 - 图标 `assets/icon.{ico,png}` 由 `tools/make-icon.ps1` 生成（深蓝圆角底 + 3×3 记忆方块 + 中心琥珀高亮；16~256 共 7 尺寸 PNG-in-ICO）；exe 资源经 `backend/cmd/desktop/rsrc.syso`（rsrc 生成，已 gitignore，pack 时按需重建）注入，窗口/任务栏/快捷方式图标取自 `app\icon.ico`。
 - 后端 `GET /api/health` 新增 `build`（version/commit/built_at/go）、`pid`、`uptime_sec`——更新脚本据此确认"跑的是不是新版本"（2026-10-30 事故：旧进程占端口、新进程 bind 失败退出，健康检查却仍 200）。
-- 全新装机需自行填 `.env` 凭据（模板占位符会被严格启动拒绝：Redis NOAUTH / embed 401）；`install` 只补缺失配置并自动生成 `BMA_API_TOKEN`（占位符 `change-me*` 视为未设）。
+- 全新装机需自行填 `.env` 凭据（模板占位符会被严格启动拒绝：embed 401）；`install` 只补缺失配置并自动生成 `BMA_API_TOKEN`（占位符 `change-me*` 视为未设）。**`REDIS_PASSWORD` 必须与 compose 的 `requirepass` 一致（`.env.example` 已是 `blockmemory_dev`）**——空口令会撞 NOAUTH。
 
 ## Documentation Map
 
@@ -118,6 +136,7 @@ Agent 产出的图/视频/音频/HTML 原型可直接在对话栏渲染（效果
 - **窗口锚**：`windowMessages` 除首条 user 外，还保留**首条 user 之后紧跟的连续 system**（压缩视图固定前缀 = 压缩摘要 + 热改动回灌）。
 - **计划冲突提示**：`planConflictWarning` 比对计划 vs 现行路线的主题组（骨架/图集/AI 视频）；`positiveTopicText` 先剔否定分句（排除/否决/早期/口头…）与弱否定片段（禁…）再按出现次数计权 —— 任务书里的"明确排除：骨架拼接"不得被当成路线命中。
 - **验收标准锚（2026-10-23）**：计划确认卡批准时 `planCriteriaFromClarify` 提取含"验收"的行（剥列表序号，≤600 runes）写 `DecisionKindCriteria`；`decisionBlock` 在【现行路线】后输出【验收标准·已批准计划】，与账本同权（不压缩、不裁剪）。
+- **计划确认降噪（2026-11-07）**：此前提示词写死"任何任务动手前必调，无大小豁免"，纯调研类轻任务也弹计划审批卡。现改为**默认不计划**：简单任务/只读调研/分析/单文件小改直接干，计划压进开工第一句；仅五类必交——≥3 文件或跨模块重构、新功能端到端定契约、多领域协同/长链路批量产出、批量删除/覆盖既有产物/迁移/schema/部署/CI/认证授权等不可逆高影响、需求含糊选错路线大范围返工。三处提示词同步（`pkg/prompts/domain_agent.go`【计划纪律】、`pkg/prompts/meta_agent.go`【计划确认纪律】、`domain/role/registry.go` 兜底 domain 提示词）与 `submit_plan` 工具描述。**代码兜底 `planIsTrivial`**（`domain/subagent/plan_confirm.go`）：计划文本无高风险关键词且文件引用去重 <3 → 直接返回「轻任务·免审批」放行，不发邮箱不阻塞（提示词是软约束，防模型反射式调用扰民）；判定偏严可接受，宁多审一次不可漏审不可逆动作。
 - **长期记忆条目化（2026-10-24，2026-10-28 污染闭环加固）**：`long_term_memory_items`（状态投影：candidate/active/quarantined/superseded/retracted，带 owner/scope/project_key/memory_key/content_hash/revision）+ `long_term_memory_events`（只追加审计）。生命周期启用时**唯一注入权威 = active 有效视图**，空视图也不得回退 Markdown；项目查询必须有非空规范化 project key，同 key 项目条目覆盖全局。`SyncHumanEdit` 对人工全量编辑的所有来源生效，删除即撤回；旧自动行只隔离不洗成 human。启动时 `QuarantineLegacyUnverified` 幂等隔离旧自动 active 条目（不物理删除）。有效记忆与决策账本经 `WithDirectiveBlock` 每轮尾部动态注入（普通/恢复/热驻子 Agent 同构），不再冻结 system prompt；`enforce` 经 `RecordEvolvedItem` 写同一视图，`shadow/off` 不变。状态与事件经 `TransitionStatus` 同事务提交。`memory.retraction_mode` 独立于 `write_mode`，真实用户消息当轮撤回；tombstone 防复活；低置信目标不得误撤回/全量隔离。管理接口 `GET/POST /api/memory/items[...]`（restore 只针对具体条目）。
 - **记忆出处（2026-10-23）**：自动行尾戳变 `（2026-10-22 23:42 · 会话#65）`（`AppendWithSource`/`MergePlan.Source`/`SessionSource`）。**不做注入侧自动矛盾打标**——原型在真实画像上误标率高（"优先使用MIT引擎" vs "优先使用现有素材"），已撤；矛盾治理仍靠"否决→归档"+时间戳。
 - **项目概览分层（2026-10-23）**：`.bma/PROJECT.md` 常驻只留领域/目录/前 8 文件/资产台账；逐文件行数与顶层符号在 `.bma/PROJECT_FILES.md` 按需 ReadFile（实测同项目 8902→6405 字符）。

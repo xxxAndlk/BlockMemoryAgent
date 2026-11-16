@@ -278,6 +278,15 @@ func (b *Bridge) Init(ctx context.Context, deps plugins.Deps) error {
 			b.perWorkDir = true
 		}
 	}
+	// env 里的 ${WORKDIR} 同样展开：stdio 传输没有容器卷，插件要知道自己该在哪个
+	// 目录读写（如 ui_design 桥的 OD_WORKSPACE_DIR —— 产物落盘路径由它决定）。
+	if len(b.settings.Env) > 0 {
+		env := make(map[string]string, len(b.settings.Env))
+		for k, v := range b.settings.Env {
+			env[k] = plugins.ExpandWorkDir(v, deps.WorkDir)
+		}
+		b.settings.Env = env
+	}
 	b.extraSessions = map[string]*bridgeSession{}
 	if b.settings.Shared && b.settings.Transport != "docker" {
 		return fmt.Errorf("mcp 插件 %q: shared 仅支持 docker transport（当前 %q）", b.id, b.settings.Transport)

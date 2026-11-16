@@ -29,6 +29,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const IMAGE = process.env.MEDIA_SMOKE_IMAGE || 'bma/open-design-mcp:local';
+// 本地模式：不走容器，直接用本机 Node 起桥（例：MEDIA_SMOKE_CMD="node docker/open-design-mcp/server.js"）。
+// 用于桌面版的「原生媒体栈」验收——目标机没 Docker 也能跑同一条链路。
+const LOCAL_CMD = (process.env.MEDIA_SMOKE_CMD || '').trim();
 const DAEMON_URL = process.env.OD_API_URL || 'http://host.docker.internal:7456';
 const OD_HOST_HEADER = process.env.OD_HOST_HEADER || 'localhost:7456';
 
@@ -53,7 +56,7 @@ const argOf = (name, def = '') => {
 
 // callBridge 起一个桥容器，走最小 JSON-RPC 握手后调用一个工具。
 // 超时即杀容器（避免冒烟把 CI 挂住）。
-function callBridge(toolName, args, { timeoutMs = 180000 } = {}) {
+function callBridge(toolName, callArgs, { timeoutMs = 180000 } = {}) {
   const workdir = smokeWorkdir;
   const env = {
     OD_API_URL: DAEMON_URL,
@@ -65,14 +68,23 @@ function callBridge(toolName, args, { timeoutMs = 180000 } = {}) {
     OD_IMAGE_CAPABILITIES: process.env.IMAGE_CAPABILITIES || '',
     OD_VIDEO_CAPABILITIES: process.env.VIDEO_CAPABILITIES || '',
   };
-  const dockerArgs = [
+  let cmd = 'docker';
+  let args = [
     'run', '-i', '--rm', '--add-host=host.docker.internal:host-gateway',
     '-v', `${workdir}:/workspace`,
     ...Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
     IMAGE,
   ];
+  let spawnOpts = { stdio: ['pipe', 'pipe', 'pipe'] };
+  if (LOCAL_CMD) {
+    // 本地起桥：工作目录是宿主路径（不是 /workspace），环境变量直接传给子进程
+    const parts = LOCAL_CMD.split(/\s+/);
+    cmd = parts[0];
+    args = parts.slice(1);
+    spawnOpts = { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...env, OD_WORKSPACE_DIR: workdir } };
+  }
   return new Promise((resolve) => {
-    const child = spawn('docker', dockerArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(cmd, args, spawnOpts);
     let buf = '';
     let stderr = '';
     let settled = false;
@@ -106,7 +118,7 @@ function callBridge(toolName, args, { timeoutMs = 180000 } = {}) {
       }
     });
     child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
-    child.on('error', (err) => finish({ ok: false, text: `docker 启动失败: ${err.message}`, stderr }));
+    child.on('error', (err) => finish({ ok: false, text: `${cmd} 启动失败: ${err.message}`, stderr }));
     // 握手：initialize → initialized → tools/call
     child.stdin.write(JSON.stringify({
       jsonrpc: '2.0', id: 1, method: 'initialize',
@@ -115,7 +127,7 @@ function callBridge(toolName, args, { timeoutMs = 180000 } = {}) {
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
     child.stdin.write(JSON.stringify({
       jsonrpc: '2.0', id: 2, method: 'tools/call',
-      params: { name: toolName, arguments: args },
+      params: { name: toolName, arguments: callArgs },
     }) + '\n');
   });
 }
