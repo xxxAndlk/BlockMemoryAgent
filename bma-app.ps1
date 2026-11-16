@@ -622,13 +622,18 @@ function Invoke-Pack {
     }
 
     # 自带运行时（PostgreSQL+pgvector / Redis）：目标机器免装 Docker。
-    # 源包不在仓库里（dist\runtime-cache），缺省时跳过（开发机仍走 Docker 依赖）。
+    # 源包不在仓库里（dist\runtime-cache），需先跑 installer\fetch-runtime.ps1 下载。
+    #
+    # 缺源包时**直接报错**（除非显式 -NoRuntime）：不带运行时的包装出来跑不起来
+    # （后端严格启动，连不上 PG/Redis 就退出）——早失败好过装完才发现。
     if (-not $NoRuntime) {
         if (Test-RuntimeAvailable $repo) {
             Write-Log '[pack] 准备自带运行时载荷 ...'
             Build-RuntimePayload -Repo $repo -OutDir (Join-Path $stage 'runtime')
         } else {
-            Write-Log '[pack] warn: 未找到运行时源包（dist\runtime-cache），本次不带自带运行时（先跑 installer\fetch-runtime.ps1）'
+            throw ("缺少运行时源包（" + (Get-RuntimeCache $repo) + " 下需要 pg16.zip / pgvector-pg16.zip / redis-win.zip）。" +
+                   "先跑： pwsh -File .\installer\fetch-runtime.ps1（下载 PG16 + pgvector + Redis + WebView2 引导程序）；" +
+                   "若确实只要纯程序包（开发机用），显式加 -NoRuntime。")
         }
     }
 
@@ -855,18 +860,37 @@ function Start-And-Wait {
     $lp = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden -PassThru
     $deadline = (Get-Date).AddSeconds($TimeoutSec + 15)
     $h = $null
+    $started = Get-Date
+    $lastTick = 0
     while ((Get-Date) -lt $deadline) {
         $h = Get-Health $Root
         if ($h -and $h.build -and $h.build.version -and ($h.build.version -eq $ExpectVersion)) {
             return $h
         }
         if ($lp.HasExited -and -not $h) { break }
+        # 等待期给进度（每 10 秒一行）：否则长时间无输出像是卡死。
+        $elapsed = [int]((Get-Date) - $started).TotalSeconds
+        if ($elapsed -ge ($lastTick + 10)) {
+            $lastTick = $elapsed
+            Write-Log ("[start] 等待后端就绪 ... {0}s（依赖自举 / 首次 initdb 可能耗时）" -f $elapsed)
+        }
         Start-Sleep -Milliseconds 500
     }
     if ($h -and $h.build -and $h.build.version) {
         Write-Log ("[start] 运行版本 " + $h.build.version + " ≠ 期望 " + $ExpectVersion + '（旧进程可能仍在跑）')
     } elseif ($lp.HasExited) {
         Write-Log ("[start] 启动器已退出（退出码 " + $lp.ExitCode + "），服务未就绪")
+        # 启动器把依赖自举的失败原因写在 app\deps.json —— 报出来，别只说一句"未就绪"。
+        $depsFile = Join-Path $Root 'app\deps.json'
+        if (Test-Path $depsFile) {
+            try {
+                $dr = Get-Content $depsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($dr.error) {
+                    Write-Log ('[start] 依赖自举失败原因：' + $dr.error)
+                    if ($dr.hint) { Write-Log ('[start] 建议：' + $dr.hint) }
+                }
+            } catch { }
+        }
     } else {
         Write-Log '[start] 启动器仍未返回，且服务未就绪'
     }
@@ -1029,37 +1053,36 @@ function Invoke-Install {
         }
         $tokenGenerated = Ensure-ApiToken (Join-Path $Target '.env')
 
-        # plugins.yaml 是"程序侧模板 + 用户可改"的混合体：桌面版随包把 ui_design 改成
-        # stdio（免 Docker），所以升级时要能更新它——但**只在用户没改过时**更新。
+        # plugins.yaml 是"程序侧模板 + 用户可改"的混合体：桌面版随包把容器类插件改成
+        # 本地 stdio，所以升级时要能更新它——但**只在用户没改过时**更新。
         # 判据：与上次随包的那份（config\plugins.yaml.packaged）逐字节一致。
+        # 没有参照副本时（首次安装）：与随包模板一致即视为"用户没改"（刚种子化的）。
         $pkgPlugins = Join-Path (Join-Path $Target 'config') 'plugins.yaml'
         $prevPlugins = Join-Path (Join-Path $Target 'config') 'plugins.yaml.packaged'
         $tplPlugins = Join-Path $tplDir 'plugins.yaml'
         if (Test-Path $tplPlugins) {
-            $update = $true
-            if (Test-Path $pkgPlugins) {
-                $ref = $prevPlugins
-                if (-not (Test-Path $ref)) {
-                    # 老安装没有"上次随包副本"：与仓库原版逐字节一致才算用户没改过
-                    $ref = Join-Path $PSScriptRoot 'config\plugins.yaml'
-                    if (-not (Test-Path $ref)) { $ref = $null }
-                }
+            $update = $false
+            if (-not (Test-Path $pkgPlugins)) {
+                $update = $true
+            } else {
+                $ref = $null
+                if (Test-Path $prevPlugins) { $ref = $prevPlugins }
+                elseif (Test-Path $tplPlugins) { $ref = $tplPlugins }
                 if ($ref) {
-                    $same = [System.Linq.Enumerable]::SequenceEqual(
+                    $update = [System.Linq.Enumerable]::SequenceEqual(
                         [System.IO.File]::ReadAllBytes($pkgPlugins),
                         [System.IO.File]::ReadAllBytes($ref))
-                    $update = $same
-                } else {
-                    $update = $false
                 }
             }
             if ($update) {
                 Copy-Item -Force $tplPlugins $pkgPlugins
-                Copy-Item -Force $tplPlugins $prevPlugins
                 Write-Log '[install] config\plugins.yaml 已随包更新（用户未修改过）'
             } else {
                 Write-Log '[install] warn: config\plugins.yaml 已被修改，未随包更新（媒体插件可能仍是容器方式）'
             }
+            # 参照副本始终刷新为随包版本（下次升级比对用）——不刷新的话，
+            # 首装之后 .packaged 一直缺失，此后每次升级都会误判"用户改过"。
+            Copy-Item -Force $tplPlugins $prevPlugins
         }
 
         # 3) 启动器与入口（随包更新）：优先桌面外壳，脚本启动器作为兜底
