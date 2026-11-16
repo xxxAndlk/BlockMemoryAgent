@@ -353,6 +353,8 @@ function Build-RuntimePayload {
         Copy-Item -Force (Join-Path $mmSrc 'server.js') $mmOut
     }
 
+    # 注意：运行时载荷这三处**必须用 npm**（不能用 pnpm）——pnpm 的 node_modules 是
+    # 符号链接指向全局 store，载荷要整个拷进安装包、到别的机器上用，链接会断。
     # ui_preview（Playwright MCP）：Agent 的"眼睛"（浏览器截图 / UI 回显）。
     # 容器版要 Docker；桌面版改为随包 Node 直接跑本地 Chromium —— 目标机免 Docker、
     # 免系统 Node。浏览器二进制也随包（PLAYWRIGHT_BROWSERS_PATH 指过去），离线可用。
@@ -422,6 +424,45 @@ function Build-RuntimePayload {
 
     $size = [math]::Round(((Get-ChildItem -Recurse -File $OutDir | Measure-Object -Property Length -Sum).Sum / 1MB), 0)
     Write-Log "[runtime] 载荷就绪：$OutDir（$size MB）"
+}
+
+# Get-PackageManager 探测本机的包管理器：优先 pnpm，没有退回 npm。
+#
+# 只用于**前端依赖**（web/ 的 node_modules 是本机开发用，不进包）。
+# 运行时载荷（runtime\media\*）必须用 npm —— pnpm 的 node_modules 是符号链接指向
+# 全局 store，拷进安装包到别的机器上链接就断了。
+function Get-PackageManager {
+    $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue
+    if ($pnpm) {
+        $ver = (& pnpm -v 2>$null | Select-Object -First 1)
+        return [ordered]@{ kind = 'pnpm'; cmd = $pnpm.Source; version = $ver }
+    }
+    $npm = Get-Command npm -ErrorAction SilentlyContinue
+    if ($npm) {
+        $ver = (& npm -v 2>$null | Select-Object -First 1)
+        return [ordered]@{ kind = 'npm'; cmd = $npm.Source; version = $ver }
+    }
+    return $null
+}
+
+# Install-FrontendDeps 装前端依赖：优先用本机已有的 pnpm，失败再退回 npm。
+#
+# pnpm 常见的坑：pnpm 10 对"未批准的构建脚本"（esbuild / @parcel/watcher 等）
+# 直接以 ERR_PNPM_IGNORED_BUILDS 退出 1 —— 装到一半的 node_modules 不能用，
+# 所以失败时**清掉重来**用 npm 装。
+function Install-FrontendDeps([string]$WebDir) {
+    $pm = Get-PackageManager
+    if (-not $pm) { throw '找不到 npm 或 pnpm（装 Node.js 18+ 并把 node 加进 PATH）' }
+    Write-Log ('[pack] 用 ' + $pm.kind + ' ' + $pm.version + ' 安装前端依赖（首次较慢）...')
+    if ($pm.kind -eq 'pnpm') {
+        & pnpm install
+        if ($LASTEXITCODE -eq 0) { return 'pnpm' }
+        Write-Log '[pack] warn: pnpm install 失败，清理 node_modules 后退回 npm ...'
+        Remove-Item (Join-Path $WebDir 'node_modules') -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    & npm install --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) { throw '前端依赖安装失败（npm install 也失败；检查网络/registry，或用 -SkipWeb 复用已有 web\dist）' }
+    return 'npm'
 }
 
 # Get-PayloadFingerprint 计算目录载荷指纹（相对路径 + 大小的 SHA256）。
@@ -564,11 +605,7 @@ function Invoke-Pack {
         Push-Location (Join-Path $repo 'web')
         try {
             if (-not (Test-Path 'node_modules')) {
-                $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
-                if (-not $npmCmd) { throw '找不到 npm（装 Node.js 18+ 并把 node 加进 PATH；或用 -SkipWeb 复用已有 web\dist）' }
-                Write-Log ('[pack] 安装前端依赖（首次较慢，用 ' + $npmCmd.Source + '）...')
-                & npm install --no-audit --no-fund
-                if ($LASTEXITCODE -ne 0) { throw 'npm install 失败（装不上前端依赖；检查网络/registry，或用 -SkipWeb 复用已有 web\dist）' }
+                Install-FrontendDeps -WebDir (Get-Location).Path | Out-Null
             }
             # 直接调**本地二进制**，不经过 npm run <script>：
             #   * 不依赖 package.json 里的脚本名（换机器/拉旧代码时脚本可能还没合进来）；
