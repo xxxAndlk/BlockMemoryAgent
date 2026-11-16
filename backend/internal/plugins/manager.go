@@ -15,6 +15,7 @@ import (
 	"sort"        // TopLevelTools 稳定排序
 	"strings"     // 错误文案拼接
 	"sync"        // 注册表锁
+	"time"        // 后台拉起 Docker 的等待窗口
 
 	"github.com/blockmemory/agent/backend/internal/config"  // 插件配置
 	"github.com/blockmemory/agent/backend/internal/domain/tool" // 工具挂载目标
@@ -389,6 +390,62 @@ func (m *Manager) enableDesiredAsync(desired map[string]config.PluginConfig) {
 		sort.Strings(ready)
 		sort.Strings(failed)
 		m.logger.Info("插件异步预热完成", "ready", ready, "failed", failed)
+		// 因 Docker 引擎缺失而失败的插件：后台拉起 Docker（最多 3 次尝试），
+		// 就绪后自动重新启用——用户不用手动干预，插件能力自己回来。
+		m.retryDockerPlugins(failed)
+	}()
+}
+
+// transportOf 取插件 settings 的 transport（与 mcpbridge.FromSettings 解析一致：
+// 缺省 stdio）。plugins 包不能 import mcpbridge（会成环），这里只读原始键。
+func transportOf(settings map[string]any) string {
+	if settings == nil {
+		return "stdio"
+	}
+	if t, ok := settings["transport"].(string); ok && t != "" {
+		return t
+	}
+	return "stdio"
+}
+
+// retryDockerPlugins 后台拉起 Docker 引擎并重新启用依赖它的插件。
+//
+// 为什么放后台：插件启用发生在启动预热里，预热完成前首个会话要等它才能预挂
+// 顶层工具——在这里同步等 Docker 启动会把整个应用起步拖慢（分钟级）。
+// 于是启用路径只做**快速探测**（缺引擎即降级），拉起交给本 goroutine。
+//
+// 用户也可以在插件页点「启动 Docker」（POST /api/plugins/docker/start），
+// 那条路径同步等待并立即重载插件。
+func (m *Manager) retryDockerPlugins(failed []string) {
+	dockerPlugins := make([]string, 0, len(failed))
+	for _, id := range failed {
+		inst := m.getInstance(id)
+		if inst == nil {
+			continue
+		}
+		if transportOf(inst.config.Settings) == "docker" {
+			dockerPlugins = append(dockerPlugins, id)
+		}
+	}
+	if len(dockerPlugins) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		m.logger.Info("Docker 引擎缺失，后台尝试拉起", "plugins", dockerPlugins)
+		if err := EnsureDockerEngine(ctx, DockerLaunchAttempts); err != nil {
+			m.logger.Warn("Docker 引擎仍不可用，相关插件保持降级（可在插件页手动重试）",
+				"plugins", dockerPlugins, "err", err)
+			return
+		}
+		for _, id := range dockerPlugins {
+			if err := m.Enable(ctx, id); err != nil {
+				m.logger.Warn("Docker 就绪后插件仍启用失败", "plugin", id, "err", err)
+				continue
+			}
+			m.logger.Info("Docker 就绪，插件已自动恢复", "plugin", id)
+		}
 	}()
 }
 

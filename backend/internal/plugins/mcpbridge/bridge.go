@@ -37,6 +37,13 @@ const defaultExecTimeout = 120 * time.Second
 // 不能用超时 ctx spawn（超时到期会杀掉会话进程）。
 const connectHandshakeTimeout = 120 * time.Second
 
+// maxDockerReconnectFailures docker 传输连续重连失败次数上限。
+//
+// 超过即停止重连：镜像缺失、容器起不来这类问题不会自己好，继续重试只是刷屏
+// （每 30 秒一条，实测刷了 26 分钟）。停止后插件停在 degraded，用户在插件页
+// 重新启用（或先修好镜像）即可。
+const maxDockerReconnectFailures = 5
+
 // Settings 是 plugins.yaml 中 mcp 插件 settings 段的解析结果。
 type Settings struct {
 	// Transport 传输方式：stdio（默认）| http | docker。
@@ -221,13 +228,18 @@ type Bridge struct {
 
 	// containerName 仅 shared docker 使用：默认会话（启动目录）的容器名。
 	containerName string
-	// workDir 仅 shared docker 使用：Init 时记录的启动目录（默认会话的工作目录）。
+	// workDir 默认会话的工作目录（Init 时记录的启动目录）。
 	workDir string
 	// volumesRaw ${WORKDIR} 占位符的原始卷模板：settings.Volumes 在 Init 时已按启动目录
 	// 展开，异目录会话要重新展开，故原样留一份。
 	volumesRaw []string
+	// argsRaw / envRaw：stdio 插件的原始 args/env 模板（带 ${WORKDIR}），
+	// 按会话目录起独立进程时重新展开。docker 传输的 args 是容器内参数，不用这份。
+	argsRaw []string
+	envRaw  map[string]string
 	// 按工作目录分容器（见 docker.go dockerSharedContainerName）：只在卷里带
 	// ${WORKDIR} 时启用——这类插件的 /workspace 必须指向会话自己的工作目录。
+	// stdio 插件带 ${WORKDIR} 时同样按目录起独立进程（截图/产物落各自会话目录）。
 	perWorkDir bool
 	// extraSessions 异目录会话缓存（key=归一化工作目录）：容器卷在创建时固定，
 	// 异目录会话必须用自己容器的 exec 会话，否则读到/写到别人的项目目录。
@@ -271,10 +283,20 @@ func (b *Bridge) Manifest() plugins.Manifest { return b.manifest }
 //（deps.WorkDir 即 bootstrap 的 os.Getwd()，挂载随启动目录解析，支持多目录多开）。
 func (b *Bridge) Init(ctx context.Context, deps plugins.Deps) error {
 	b.volumesRaw = append([]string(nil), b.settings.Volumes...)
-	for i, v := range b.settings.Volumes {
+	// 原始 args/env 模板（带 ${WORKDIR}）：按会话目录起独立进程时要重新展开，
+	// 必须**在展开前**留一份（展开后占位符已被替换掉）。
+	b.argsRaw = append([]string(nil), b.settings.Args...)
+	b.envRaw = nil
+	if len(b.settings.Env) > 0 {
+		b.envRaw = make(map[string]string, len(b.settings.Env))
+		for k, v := range b.settings.Env {
+			b.envRaw[k] = v
+		}
+	}
+	for i, v := range b.volumesRaw {
 		b.settings.Volumes[i] = plugins.ExpandWorkDir(v, deps.WorkDir)
 		// 卷里带占位符 = 该插件必须看到会话的工作目录 → 按目录分容器（见 docker.go）。
-		if strings.Contains(b.volumesRaw[i], plugins.WorkDirPlaceholder) {
+		if strings.Contains(v, plugins.WorkDirPlaceholder) {
 			b.perWorkDir = true
 		}
 	}
@@ -282,11 +304,27 @@ func (b *Bridge) Init(ctx context.Context, deps plugins.Deps) error {
 	// 目录读写（如 ui_design 桥的 OD_WORKSPACE_DIR —— 产物落盘路径由它决定）。
 	if len(b.settings.Env) > 0 {
 		env := make(map[string]string, len(b.settings.Env))
-		for k, v := range b.settings.Env {
+		for k, v := range b.envRaw {
 			env[k] = plugins.ExpandWorkDir(v, deps.WorkDir)
 		}
 		b.settings.Env = env
 	}
+	// args 里的 ${WORKDIR}：stdio 插件按会话目录起独立进程时要用（见 sessionFor）。
+	// docker 传输的 args 是**容器内**参数（Linux 路径），不能塞宿主路径——只对 stdio 判定。
+	if b.settings.Transport == "stdio" || b.settings.Transport == "" {
+		for _, a := range b.argsRaw {
+			if strings.Contains(a, plugins.WorkDirPlaceholder) {
+				b.perWorkDir = true
+			}
+		}
+		for _, v := range b.envRaw {
+			if strings.Contains(v, plugins.WorkDirPlaceholder) {
+				b.perWorkDir = true
+			}
+		}
+	}
+	// 默认会话的工作目录：stdio 插件按目录起进程时用它展开 ${WORKDIR}。
+	b.workDir = deps.WorkDir
 	b.extraSessions = map[string]*bridgeSession{}
 	if b.settings.Shared && b.settings.Transport != "docker" {
 		return fmt.Errorf("mcp 插件 %q: shared 仅支持 docker transport（当前 %q）", b.id, b.settings.Transport)
@@ -342,6 +380,17 @@ func (b *Bridge) Start(ctx context.Context) error {
 	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())
 	lifecycleCtx := b.stopCtx
 	b.mu.Unlock()
+
+	// docker 传输：引擎不可用时**快速失败**并给出可读原因。
+	// 这里不阻塞地拉起 Docker Desktop——插件启用发生在启动预热里，而预热完成前
+	// 首个会话要等它才能预挂顶层工具（阻塞在这里 = 整个应用起步变慢）。
+	// 拉起由插件管理器在后台做（plugins.EnsureDockerEngine，3 次尝试），引擎就绪后
+	// 自动重新启用；用户也可在插件页点「启动 Docker」。
+	if b.settings.Transport == "docker" {
+		if err := dockerEngineReady(ctx); err != nil {
+			return err
+		}
+	}
 
 	session, cmd, tools, err := b.connect(lifecycleCtx)
 	if err != nil {
@@ -414,9 +463,9 @@ func (b *Bridge) newTransport(ctx context.Context, container, workDir string, vo
 	case "docker":
 		return b.newDockerTransport(ctx, container, workDir, volumes)
 	default: // stdio
-		cmd := exec.CommandContext(ctx, b.settings.Command, b.settings.Args...)
+		cmd := exec.CommandContext(ctx, b.settings.Command, b.expandArgs(workDir)...)
 		cmd.Env = os.Environ()
-		for k, v := range b.settings.Env {
+		for k, v := range b.expandEnv(workDir) {
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}
 		stdin, err := cmd.StdinPipe()
@@ -455,6 +504,7 @@ func (b *Bridge) supervise(session *mcp.ClientSession) {
 
 	// 指数退避重连：1s → 2s → 4s … 上限 30s。
 	delay := time.Second
+	failures := 0
 	for {
 		select {
 		case <-b.stopCtx.Done():
@@ -464,7 +514,21 @@ func (b *Bridge) supervise(session *mcp.ClientSession) {
 		b.logger.Info("mcp 重连", "plugin", b.id, "attempt_delay", delay.String())
 		newSession, cmd, newTools, err := b.connect(b.stopCtx)
 		if err != nil {
+			failures++
 			b.logger.Warn("mcp 重连失败", "plugin", b.id, "err", err)
+			// 依赖不在了就别再重试：docker 引擎不可用（用户没装/没启动 Docker Desktop）
+			// 时每 30 秒重试一次只会刷屏并空耗 CPU——直接停下，等用户装好后
+			// 在插件页手动重新启用。
+			if b.settings.Transport == "docker" {
+				if probeErr := dockerEngineReady(b.stopCtx); probeErr != nil {
+					b.logger.Warn("mcp 停止重连（Docker 引擎不可用）", "plugin", b.id, "err", probeErr)
+					return
+				}
+				if failures >= maxDockerReconnectFailures {
+					b.logger.Warn("mcp 停止重连（连续失败次数达上限）", "plugin", b.id, "failures", failures)
+					return
+				}
+			}
 			delay *= 2
 			if delay > 30*time.Second {
 				delay = 30 * time.Second
@@ -530,8 +594,51 @@ type bridgeSession struct {
 	cmd     *exec.Cmd
 }
 
-// sessionFor 取本次调用应使用的会话：插件的卷绑定了 ${WORKDIR} 时，按调用 ctx 里的
-// 会话工作目录选容器——异目录用自己的容器（卷指向该目录），同目录/无卷走默认会话。
+// perWorkDirSession 判断该插件是否支持"按工作目录分会话"。
+//
+// docker：仅 shared 模式（keeper 容器按目录分，legacy 模式本来就是每次调用起容器）。
+// stdio：支持——每个目录起一个独立子进程，args/env 里的 ${WORKDIR} 按目录展开
+// （本地跑的 ui_preview 截图必须落进会话自己的工作目录，否则 Agent 在自己目录里
+// 找不到产物，历史上因此反复"排查同步"死循环）。
+func (b *Bridge) perWorkDirSession() bool {
+	switch b.settings.Transport {
+	case "docker":
+		return b.settings.Shared
+	case "stdio", "":
+		return true
+	default:
+		return false
+	}
+}
+
+// expandArgs 按 workDir 展开 stdio 插件的启动参数（argsRaw 保留 ${WORKDIR} 模板）。
+// 没有原始模板（docker 传输）时原样返回配置里的 args。
+func (b *Bridge) expandArgs(workDir string) []string {
+	if b.argsRaw == nil {
+		return b.settings.Args
+	}
+	out := make([]string, 0, len(b.argsRaw))
+	for _, a := range b.argsRaw {
+		out = append(out, plugins.ExpandWorkDir(a, workDir))
+	}
+	return out
+}
+
+// expandEnv 按 workDir 展开 stdio 插件的环境变量（envRaw 保留 ${WORKDIR} 模板）。
+func (b *Bridge) expandEnv(workDir string) map[string]string {
+	if b.envRaw == nil {
+		return b.settings.Env
+	}
+	out := make(map[string]string, len(b.envRaw))
+	for k, v := range b.envRaw {
+		out[k] = plugins.ExpandWorkDir(v, workDir)
+	}
+	return out
+}
+
+// sessionFor 取本次调用应使用的会话：插件绑定了 ${WORKDIR} 时，按调用 ctx 里的
+// 会话工作目录选会话——异目录用自己的容器（docker）或自己的进程（stdio），
+// 同目录/无绑定走默认会话。
 //
 // 建立失败退回默认会话（并记日志）：拿到错目录的产物，好过整个插件用不了。
 func (b *Bridge) sessionFor(ctx context.Context) *mcp.ClientSession {
@@ -540,7 +647,7 @@ func (b *Bridge) sessionFor(ctx context.Context) *mcp.ClientSession {
 	stopped := b.stopped
 	lifecycleCtx := b.stopCtx
 	b.mu.Unlock()
-	if def == nil || !b.perWorkDir || b.settings.Transport != "docker" || !b.settings.Shared {
+	if def == nil || !b.perWorkDir || !b.perWorkDirSession() {
 		return def
 	}
 	wd := tool.WorkDirFromContext(ctx)

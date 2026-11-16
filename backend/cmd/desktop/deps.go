@@ -327,11 +327,23 @@ func composeUp(composeFile string, timeout time.Duration, services ...string) (s
 // 纯 best-effort：媒体镜像体积大、构建慢（Playwright 镜像），放不进启动关键路径；
 // 失败只落日志 + 返回摘要，不阻断主流程（与插件系统的降级语义一致）。
 //
+// 自包含模式（安装包带自带运行时）**不碰 Docker**：桌面版的媒体能力由原生
+// mediaservice.exe + 随包 Node 桥承担（见 media.go），容器 daemon 反而会与它
+// 抢 7456 端口（实测 compose up 失败：ports are not available）。
+//
 // 返回值区分"无需变更"与"已更新"——后者才需要通知后端换 keeper（重载会掐断在途会话）。
 func ensureMedia(root string, out io.Writer) string {
+	if runtimeAvailable(root) {
+		return "自包含模式：媒体能力由原生媒体服务承担，跳过容器媒体栈"
+	}
 	composeFile := filepath.Join(root, "docker", composeFileName)
 	if !fileExists(composeFile) {
 		return "未安装媒体栈（缺少 docker\\" + composeFileName + "）"
+	}
+	// Docker 引擎不可达时不要试 compose（只会得到一堆 npipe 报错）：
+	// 引擎就绪性由插件系统负责（缺引擎的插件降级，用户可在插件页「启动 Docker」）。
+	if err := dockerEngineReady(10 * time.Second); err != nil {
+		return "Docker 引擎不可用，跳过容器媒体栈"
 	}
 
 	// 插件镜像缺失时构建（后台较慢：open-design-mcp 需 npm install，ui-preview 拉 Playwright 镜像）。

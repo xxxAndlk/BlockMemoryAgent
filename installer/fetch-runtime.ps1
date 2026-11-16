@@ -7,6 +7,10 @@
 这三个二进制不进 git（体积大、且是第三方再分发物），首次打包前拉一次到
 dist\runtime-cache\ 即可；bma-app.ps1 pack 会自动解压裁剪并打进包。
 
+注意：随包的 Node / Playwright(+Chromium headless shell) / computer-use-mcp 是
+npm 包，由 bma-app.ps1 pack 在构建期现装（缓存于 dist\runtime-cache\prepared\），
+不在本脚本的下载范围内。
+
 来源与许可：
   * PostgreSQL 16 免安装版 —— EnterpriseDB 官方 binaries zip（PostgreSQL License）
   * pgvector 0.8.7 —— 社区 Windows 预编译包（PostgreSQL License）

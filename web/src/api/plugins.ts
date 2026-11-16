@@ -71,3 +71,11 @@ export function fetchDockerReport(): Promise<DockerReport> {
 export function cleanupDocker(all = false): Promise<{ status: string; cleanup: DockerCleanupResult; docker: DockerReport }> {
   return fetchJson(`/plugins/cleanup${all ? '?all=true' : ''}`, { method: 'POST' })
 }
+
+/**
+ * 拉起 Docker 引擎（插件因引擎没开而降级后，用户手动重试）。
+ * 后端最多尝试 3 次拉起 Docker Desktop 并等引擎就绪；成功后自动重载插件。
+ */
+export function startDocker(): Promise<{ status: string; error?: string; docker: DockerReport; plugins?: PluginInfo[] }> {
+  return fetchJson('/plugins/docker/start', { method: 'POST' })
+}

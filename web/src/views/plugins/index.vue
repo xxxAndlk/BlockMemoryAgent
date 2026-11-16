@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listPlugins, enablePlugin, disablePlugin, reloadPlugins,
-  fetchDockerReport, cleanupDocker,
+  fetchDockerReport, cleanupDocker, startDocker,
   type PluginInfo, type DockerReport,
 } from '@/api/plugins'
 
@@ -13,6 +13,8 @@ const mutating = ref<string | null>(null)
 // docker 依赖自检（镜像/容器状态）+ 清理状态（2026-10-28）。
 const docker = ref<DockerReport | null>(null)
 const cleaning = ref(false)
+// startingDocker：正在拉起 Docker Desktop（引擎没开时用户手动重试）。
+const startingDocker = ref(false)
 
 // 工具折叠：每卡独立展开状态（默认收起，最多展示 TOOL_COLLAPSE_LIMIT 个 chip）。
 const TOOL_COLLAPSE_LIMIT = 12
@@ -177,6 +179,26 @@ async function runCleanup(all: boolean) {
     loadDocker()
   }
 }
+
+// handleStartDocker 拉起 Docker 引擎（引擎没开导致容器类插件降级时的重试入口）。
+// 后端最多尝试 3 次拉起 Docker Desktop 并等引擎就绪；成功后自动重载插件。
+async function handleStartDocker() {
+  startingDocker.value = true
+  try {
+    const res = await startDocker()
+    docker.value = res.docker
+    if (res.status === 'started') {
+      ElMessage.success('Docker 已就绪，容器类插件已重新加载')
+      await load()
+    } else {
+      ElMessage.warning('Docker 仍未就绪：' + (res.error || '未知原因'))
+    }
+  } catch (e) {
+    ElMessage.error('启动 Docker 失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    startingDocker.value = false
+  }
+}
 </script>
 
 <template>
@@ -224,6 +246,10 @@ async function runCleanup(all: boolean) {
         Docker 不可达（Docker Desktop 未启动？）：{{ docker.error }}
         <template v-if="docker.required">；容器类插件（ui_design / ui_preview / computer_use）不可用，其余功能不受影响。</template>
         <template v-else>；当前没有启用中的 docker 插件，不影响使用。</template>
+        <button class="ml-2 underline underline-offset-2 hover:opacity-80 disabled:opacity-50"
+                :disabled="startingDocker" @click="handleStartDocker">
+          {{ startingDocker ? '正在启动 Docker ...' : '启动 Docker' }}
+        </button>
       </template>
     </div>
 

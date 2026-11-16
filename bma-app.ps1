@@ -40,7 +40,7 @@ BlockMemoryAgent 桌面版打包 / 安装 / 更新工具。
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('pack', 'install', 'update', 'deploy', 'start', 'stop', 'restart', 'status', 'rollback', 'media', 'migrate-data')]
+    [ValidateSet('pack', 'install', 'update', 'deploy', 'start', 'stop', 'restart', 'status', 'rollback', 'media', 'migrate-data', 'publish')]
     [string]$Command = 'status',
 
     # 安装目录（install/update/start/stop/restart/status/rollback）
@@ -54,6 +54,12 @@ param(
 
     # 打包版本号（pack）：缺省 yyyyMMdd-HHmmss-<git短号>
     [string]$Version,
+
+    # publish：安装包的公开下载地址前缀（拼出 latest.json 里的 url）
+    [string]$BaseUrl,
+
+    # publish：更新说明（写进 latest.json，桌面端弹窗里显示）
+    [string]$Notes,
 
     # 保留的历史版本数（install/update）：默认 3（当前 + 上一版 + 1）
     [int]$Keep = 3,
@@ -76,6 +82,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+# 随包本地 MCP 桥的 npm 版本（钉版本：升级要同时改这里的版本号与运行时配方号）。
+$playwrightMcpVersion = '0.0.85'
+$computerUseMcpVersion = '7.8.0'
 
 $script:JsonOutput = [bool]$Json
 
@@ -187,13 +197,16 @@ function Build-RuntimePayload {
     if (-not (Test-RuntimeAvailable $Repo)) { throw "缺少运行时源包（$cache 下需要 pg16.zip / pgvector-pg16.zip / redis-win.zip），先跑 installer\fetch-runtime.ps1" }
     $prepared = Join-Path $cache 'prepared'
     # 配方版本：载荷组成变了就重建（否则会复用旧缓存，缺新加的 node/媒体桥）。
-    $recipe = 'v4-node-media-minimax'
+    $recipe = 'v6-node-media-playwright-cu-headless'
     $recipeFile = Join-Path $prepared '.recipe'
     $preparedOk = ((Test-Path (Join-Path $prepared 'postgres\share\extension\vector.control')) -and
                    (Test-Path (Join-Path $prepared 'postgres\bin\postgres.exe')) -and
                    (Test-Path (Join-Path $prepared 'redis\redis-server.exe')) -and
                    (Test-Path (Join-Path $prepared 'node\node.exe')) -and
                    (Test-Path (Join-Path $prepared 'media\open-design-mcp\server.js')) -and
+                   (Test-Path (Join-Path $prepared 'media\ui-preview-mcp\node_modules\@playwright\mcp\cli.js')) -and
+                   (Test-Path (Join-Path $prepared 'media\computer-use-mcp\node_modules\@zavora-ai\computer-use-mcp\dist\launch.js')) -and
+                   (Test-Path (Join-Path $prepared 'media\playwright-browsers')) -and
                    ((Test-Path $recipeFile) -and ((Get-Content $recipeFile -Raw).Trim() -eq $recipe)))
     if ($preparedOk) {
         Write-Log '[runtime] 复用已准备的运行时载荷'
@@ -302,6 +315,62 @@ function Build-RuntimePayload {
         New-Item -ItemType Directory -Force -Path $mmOut | Out-Null
         Copy-Item -Force (Join-Path $mmSrc 'server.js') $mmOut
     }
+
+    # ui_preview（Playwright MCP）：Agent 的"眼睛"（浏览器截图 / UI 回显）。
+    # 容器版要 Docker；桌面版改为随包 Node 直接跑本地 Chromium —— 目标机免 Docker、
+    # 免系统 Node。浏览器二进制也随包（PLAYWRIGHT_BROWSERS_PATH 指过去），离线可用。
+    $uiPrevOut = Join-Path $prepared 'media\ui-preview-mcp'
+    if (-not (Test-Path (Join-Path $uiPrevOut 'node_modules\@playwright\mcp\cli.js'))) {
+        Write-Log '[runtime] 安装 Playwright MCP ...'
+        New-Item -ItemType Directory -Force -Path $uiPrevOut | Out-Null
+        Write-JsonFile (Join-Path $uiPrevOut 'package.json') ([ordered]@{
+                name    = 'bma-ui-preview-mcp'
+                private = $true
+                version = '1.0.0'
+                dependencies = [ordered]@{ '@playwright/mcp' = $playwrightMcpVersion }
+            })
+        Push-Location $uiPrevOut
+        try {
+            & npm install --omit=dev --no-audit --no-fund | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'npm install @playwright/mcp 失败' }
+        } finally { Pop-Location }
+    }
+    $browsers = Join-Path $prepared 'media\playwright-browsers'
+    if (-not (Test-Path $browsers)) {
+        Write-Log '[runtime] 下载 Chromium headless shell（一次性，约 290MB，随包分发）...'
+        New-Item -ItemType Directory -Force -Path $browsers | Out-Null
+        $prevBrowsersPath = $env:PLAYWRIGHT_BROWSERS_PATH
+        $env:PLAYWRIGHT_BROWSERS_PATH = $browsers
+        Push-Location $uiPrevOut
+        try {
+            # 只装 headless shell：桌面版的 ui_preview 恒为 headless（配置固定 --headless），
+            # 完整 Chromium（451MB）用不上 —— 实测 headless shell 单独即可完成导航与截图。
+            & node (Join-Path $uiPrevOut 'node_modules\playwright\cli.js') install chromium-headless-shell
+            if ($LASTEXITCODE -ne 0) { throw 'playwright install chromium-headless-shell 失败' }
+        } finally {
+            Pop-Location
+            $env:PLAYWRIGHT_BROWSERS_PATH = $prevBrowsersPath
+        }
+    }
+
+    # host_computer_use（真机 GUI 直控）：原先走 npx（要系统 Node + npm 源），
+    # 桌面版改为随包 Node 跑本地安装好的包 —— 同样免系统 Node。
+    $cuOut = Join-Path $prepared 'media\computer-use-mcp'
+    if (-not (Test-Path (Join-Path $cuOut 'node_modules\@zavora-ai\computer-use-mcp\dist\launch.js'))) {
+        Write-Log '[runtime] 安装 computer-use-mcp ...'
+        New-Item -ItemType Directory -Force -Path $cuOut | Out-Null
+        Write-JsonFile (Join-Path $cuOut 'package.json') ([ordered]@{
+                name    = 'bma-computer-use-mcp'
+                private = $true
+                version = '1.0.0'
+                dependencies = [ordered]@{ '@zavora-ai/computer-use-mcp' = $computerUseMcpVersion }
+            })
+        Push-Location $cuOut
+        try {
+            & npm install --omit=dev --no-audit --no-fund | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'npm install @zavora-ai/computer-use-mcp 失败' }
+        } finally { Pop-Location }
+    }
     }
 
     # 铺到包目录（prepared 保留作缓存，下次打包直接复制）
@@ -310,40 +379,75 @@ function Build-RuntimePayload {
     Copy-Item -Recurse -Force (Join-Path $prepared '*') $OutDir
     # 记下配方版本（下次打包据此判断缓存是否可用）
     [System.IO.File]::WriteAllText((Join-Path $prepared '.recipe'), $recipe)
+    # 载荷指纹标记：更新时比对"运行时有没有变"，没变就不重铺 300MB+。
+    $fp = Get-PayloadFingerprint $OutDir
+    [System.IO.File]::WriteAllText((Join-Path $OutDir '.payload-id'), ($recipe + ':' + $fp))
 
     $size = [math]::Round(((Get-ChildItem -Recurse -File $OutDir | Measure-Object -Property Length -Sum).Sum / 1MB), 0)
     Write-Log "[runtime] 载荷就绪：$OutDir（$size MB）"
 }
 
-# Convert-PluginsToNative 把包内 plugins.yaml 的 ui_design 插件改成 stdio 方式。
+# Get-PayloadFingerprint 计算目录载荷指纹（相对路径 + 大小的 SHA256）。
 #
-# 桌面版要免装 Docker：ui_design 桥（Node MCP server）改为随包 Node 直接起本地子进程，
-# 上游指向原生媒体服务（127.0.0.1:7456）。开发实例仍用仓库里的容器方案（不改仓库配置）。
+# 用途：更新时判断"运行时载荷有没有变"——没变就不必重铺 300MB+（PostgreSQL/Redis/
+# Chromium/Node 全在里面）。指纹只覆盖"路径 + 大小"，不逐字节哈希 400MB（太慢）。
+function Get-PayloadFingerprint([string]$Dir) {
+    if (-not (Test-Path $Dir)) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    Get-ChildItem $Dir -Recurse -File | Sort-Object FullName | ForEach-Object {
+        $rel = $_.FullName.Substring($Dir.Length + 1).Replace('\', '/')
+        [void]$sb.Append($rel).Append('|').Append($_.Length).Append("`n")
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($sb.ToString())
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLower()
+    } finally { $sha.Dispose() }
+}
+
+# Set-PluginBlock 把 plugins.yaml 里某个插件块整体替换为给定内容。
 #
-# 只替换 ui_design 这一个插件块（按两空格缩进的同级键界定范围），其余配置原样保留。
-function Convert-PluginsToNative([string]$Path) {
-    if (-not (Test-Path $Path)) { return }
+# 插件条目都在 plugins: 下的两空格缩进层，块边界按"下一个同缩进的 key"界定。
+# 只替换指定块，其余配置原样保留（开发实例仍用仓库里的容器方案）。
+function Set-PluginBlock([string]$Path, [string]$PluginId, [string[]]$Block) {
+    if (-not (Test-Path $Path)) { return $false }
     $lines = [System.Collections.ArrayList]@([System.IO.File]::ReadAllLines($Path))
     $start = -1
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^  ui_design:\s*$') { $start = $i; break }
+        if ($lines[$i] -match ('^  ' + [regex]::Escape($PluginId) + ':\s*$')) { $start = $i; break }
     }
     if ($start -lt 0) {
-        Write-Log '[pack] warn: plugins.yaml 里没有 ui_design 块，跳过原生媒体改写'
-        return
+        Write-Log "[pack] warn: plugins.yaml 里没有 $PluginId 块，跳过改写"
+        return $false
     }
     $end = $lines.Count
     for ($i = $start + 1; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match '^  [A-Za-z_][A-Za-z0-9_]*:\s*$') { $end = $i; break }
     }
-    $block = [string[]]@(
+    $lines.RemoveRange($start, $end - $start)
+    $lines.InsertRange($start, $Block)
+    [System.IO.File]::WriteAllLines($Path, $lines, (New-Object System.Text.UTF8Encoding($false)))
+    return $true
+}
+
+# Convert-PluginsToNative 把包内 plugins.yaml 的三个"依赖外部运行时"的插件改成本地 stdio。
+#
+# 桌面版要免装 Docker、免装系统 Node：
+#   * ui_design  → 随包 Node 起 ui_design 桥，上游是原生媒体服务（127.0.0.1:7456）；
+#   * ui_preview → 随包 Node 起 Playwright MCP，Chromium 也在包内（离线可用）；
+#   * host_computer_use → 随包 Node 起本地 computer-use-mcp（原先走 npx，要系统 Node + npm 源）。
+# 开发实例仍用仓库里的容器方案（不改仓库配置）。
+function Convert-PluginsToNative([string]$Path) {
+    if (-not (Test-Path $Path)) { return }
+
+    # ui_design：生图/生视频桥（路径用正斜杠：YAML 双引号里反斜杠算转义符）。
+    $uiDesign = [string[]]@(
         '  ui_design:',
         '    kind: mcp',
         '    enabled: true',
         '    settings:',
         '      # 桌面版走 stdio：随包 Node 直接起桥进程，上游是原生媒体服务（免 Docker）。',
         '      transport: stdio',
-        # 路径用正斜杠：YAML 双引号里反斜杠算转义符，会被判成未知转义字符。
         '      command: ${BMA_NODE_EXE}',
         '      args: ["${BMA_MEDIA_BRIDGE}"]',
         '      shared: false',
@@ -358,10 +462,50 @@ function Convert-PluginsToNative([string]$Path) {
         '      roles: ["meta","domain","ui_assistant"]',
         '      exec_timeout_sec: 1200'
     )
-    $lines.RemoveRange($start, $end - $start)
-    $lines.InsertRange($start, $block)
-    [System.IO.File]::WriteAllLines($Path, $lines, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Log '[pack] plugins.yaml：ui_design 改为 stdio（随包 Node，免 Docker）'
+    if (Set-PluginBlock $Path 'ui_design' $uiDesign) {
+        Write-Log '[pack] plugins.yaml：ui_design 改为 stdio（随包 Node，免 Docker）'
+    }
+
+    # ui_preview：Playwright MCP 本地跑（Chromium 随包）。
+    # ${WORKDIR} 由插件管理器在每次会话建连时展开（截图落进会话自己的工作目录）。
+    $uiPreview = [string[]]@(
+        '  ui_preview:',
+        '    kind: mcp',
+        '    enabled: true',
+        '    settings:',
+        '      # 桌面版走 stdio：随包 Node 起 Playwright MCP，Chromium 也在安装包内（免 Docker、免系统 Node）。',
+        '      transport: stdio',
+        '      command: ${BMA_NODE_EXE}',
+        '      args: ["${BMA_UI_PREVIEW_MCP}", "--headless", "--output-dir", "${WORKDIR}/.bma/ui-artifacts", "--allow-unrestricted-file-access", "--image-responses", "allow"]',
+        '      env:',
+        '        # 浏览器二进制随包（离线可用）：Playwright 按此变量找浏览器。',
+        '        PLAYWRIGHT_BROWSERS_PATH: ${BMA_PLAYWRIGHT_BROWSERS}',
+        '      image_passthrough: true',
+        '      roles: ["meta","domain","ui_assistant"]',
+        '      exec_timeout_sec: 180'
+    )
+    if (Set-PluginBlock $Path 'ui_preview' $uiPreview) {
+        Write-Log '[pack] plugins.yaml：ui_preview 改为 stdio（随包 Playwright，免 Docker）'
+    }
+
+    # host_computer_use：真机 GUI 直控，改随包 Node 跑本地包（原先 npx：需系统 Node + npm 源）。
+    $hostCu = [string[]]@(
+        '  host_computer_use:',
+        '    kind: mcp',
+        '    enabled: true',
+        '    settings:',
+        '      # 桌面版走 stdio：随包 Node 跑已装好的包（免系统 Node / npm 源）。',
+        '      transport: stdio',
+        '      command: ${BMA_NODE_EXE}',
+        '      args: ["${BMA_COMPUTER_USE_MCP}"]',
+        '      destructive: true',
+        '      roles: ["meta", "test_assistant"]',
+        '      image_passthrough: true',
+        '      tool_description_suffix: "注意:本工具直接操作宿主机真实桌面(非沙箱):截图为真机屏幕,鼠标键盘事件作用于真机前台窗口。文件落盘仍用内置 WriteFile/EditFile(会话工作目录),不要用本工具的 filesystem 能力落盘任务产物。"'
+    )
+    if (Set-PluginBlock $Path 'host_computer_use' $hostCu) {
+        Write-Log '[pack] plugins.yaml：host_computer_use 改为 stdio（随包 Node，免系统 Node）'
+    }
 }
 
 function Invoke-Pack {
@@ -512,9 +656,15 @@ function Invoke-Pack {
         }
     }
 
-    # 密钥扫描：模板里只允许 ${VAR} 插值，发现疑似真实 key 一律拒包
+    # 密钥扫描：模板里只允许 ${VAR} 插值，发现疑似真实 key 一律拒包。
+    # 扫描面 = 我们自己的配置/脚本（config-templates、启动器等），跳过 runtime\
+    # （第三方二进制 + node_modules：Chromium 的 .pak 会随机命中正则，误报）。
     $hits = @(Get-ChildItem $stage -Recurse -File |
-        Where-Object { $_.Name -notlike '*example*' } |
+        Where-Object {
+            $_.FullName -notlike '*\runtime\*' -and
+            $_.Name -notlike '*example*' -and
+            $_.Extension -notin @('.pak', '.dll', '.exe', '.node', '.zip', '.7z', '.bin', '.dat')
+        } |
         Select-String -Pattern 'sk-[A-Za-z0-9]{16,}', 'api_key\s*:\s*["'']?[A-Za-z0-9_\-]{16,}' -List -ErrorAction SilentlyContinue)
     if ($hits.Count -gt 0) {
         throw ('包内发现疑似真实密钥，拒绝打包: ' + (($hits | ForEach-Object { $_.Path }) -join ', '))
@@ -549,6 +699,9 @@ function Invoke-Pack {
             commit       = $commit
             package      = 'installer'
         })
+    # 版本号纯文本：安装器的 [Code] 段用它写版本指针（Pascal 侧读文件，
+    # 避开预处理器常量在 [Code] 里的引号问题——/D 传的是裸值）。
+    [System.IO.File]::WriteAllText((Join-Path $setupDir 'app\version.txt'), $Version, (New-Object System.Text.UTF8Encoding($false)))
     Write-Log "[pack] 安装器暂存: $setupDir"
 
     # 清单与版本元数据
@@ -629,7 +782,34 @@ function Stop-DesktopShell([string]$Root) {
             }
         }
     } catch { }
+    # 等进程真正退出：exe 文件在进程结束前一直被锁着，
+    # 不等就会在覆盖 BMA-Desktop.exe 时撞 "being used by another process"。
+    if ($stopped.Count -gt 0) {
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline) {
+            $alive = @($stopped | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+            if ($alive.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 300
+        }
+    }
     return $stopped
+}
+
+# Copy-WithRetry 复制文件，撞文件占用时重试几次（安装/更新期间进程退出有延迟）。
+#
+# 注意：不要返回值——PowerShell 函数会把未捕获的输出混进调用方的输出流，
+# 污染 Invoke-Install 的返回值（会变成数组，调用方再赋值属性就报错）。
+function Copy-WithRetry([string]$Src, [string]$Dst, [int]$Attempts = 5) {
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            Copy-Item -Force $Src $Dst
+            return
+        } catch {
+            if ($i -ge $Attempts) { throw }
+            Write-Log ("[install] 文件被占用，等候重试（{0}/{1}）: {2}" -f $i, $Attempts, $Dst)
+            Start-Sleep -Seconds 2
+        }
+    }
 }
 
 function Stop-BmaServer([string]$Root) {
@@ -805,23 +985,26 @@ function Invoke-Install {
             Write-Log "[install] 依赖编排: $dockerOut"
         }
 
-        # 1c) 自带运行时（PostgreSQL+pgvector / Redis / Node / 媒体桥）：铺到安装目录根部。
-        # 运行时体积大且与版本无关，只在"缺失或版本标记不同"时重铺（避免每次更新都拷 300MB，
-        # 但运行时内容变化时必须更新 —— 用 .version 标记比对）。
+        # 1c) 自带运行时（PostgreSQL+pgvector / Redis / Node / 媒体桥 / Chromium）：铺到安装目录根部。
+        # 运行时体积大（300MB+）且**与程序版本无关**——只在"载荷指纹变化"时重铺。
+        # 判据 = .payload-id（配方号 + 载荷指纹）：程序升级但运行时没变 → 跳过重铺
+        # （此前按"程序版本"比对，每次更新都重拷 300MB，白白多花几十秒）。
         $rtPkg = Join-Path $dst 'runtime'
         $rtOut = Join-Path $Target 'runtime'
         if (Test-Path $rtPkg) {
-            $marker = Join-Path $rtOut '.version'
-            $installed = ''
-            if (Test-Path $marker) { $installed = (Get-Content $marker -Raw).Trim() }
-            if ($installed -ne $ver) {
+            $pkgMarker = Join-Path $rtPkg '.payload-id'
+            $pkgId = ''
+            if (Test-Path $pkgMarker) { $pkgId = (Get-Content $pkgMarker -Raw).Trim() }
+            $installedId = ''
+            $installedMarker = Join-Path $rtOut '.payload-id'
+            if (Test-Path $installedMarker) { $installedId = (Get-Content $installedMarker -Raw).Trim() }
+            if ($pkgId -and ($installedId -eq $pkgId)) {
+                Write-Log '[install] 自带运行时未变化（载荷指纹一致），跳过重铺'
+            } else {
                 Write-Log "[install] 铺设自带运行时（较慢，约 300MB）..."
                 if (Test-Path $rtOut) { Remove-Item -Recurse -Force $rtOut -ErrorAction SilentlyContinue }
                 Copy-Item -Recurse -Force $rtPkg $rtOut
-                [System.IO.File]::WriteAllText($marker, $ver)
                 Write-Log "[install] 自带运行时: $rtOut"
-            } else {
-                Write-Log "[install] 自带运行时已是当前版本，跳过"
             }
         }
 
@@ -880,14 +1063,14 @@ function Invoke-Install {
         }
 
         # 3) 启动器与入口（随包更新）：优先桌面外壳，脚本启动器作为兜底
-        Copy-Item -Force (Join-Path $dst 'launcher\launch.ps1') (Join-Path $Target 'app\launch.ps1')
+        Copy-WithRetry (Join-Path $dst 'launcher\launch.ps1') (Join-Path $Target 'app\launch.ps1')
         foreach ($l in @('BMA.cmd', 'BMA.vbs')) {
-            Copy-Item -Force (Join-Path $dst ('launcher\' + $l)) (Join-Path $Target $l)
+            Copy-WithRetry (Join-Path $dst ('launcher\' + $l)) (Join-Path $Target $l)
         }
         $desktopSrc = Join-Path $dst 'bin\bma-desktop.exe'
-        if (Test-Path $desktopSrc) { Copy-Item -Force $desktopSrc (Join-Path $Target 'BMA-Desktop.exe') }
+        if (Test-Path $desktopSrc) { Copy-WithRetry $desktopSrc (Join-Path $Target 'BMA-Desktop.exe') }
         $iconDst = Join-Path $Target 'app\icon.ico'
-        if (Test-Path (Join-Path $dst 'launcher\icon.ico')) { Copy-Item -Force (Join-Path $dst 'launcher\icon.ico') $iconDst }
+        if (Test-Path (Join-Path $dst 'launcher\icon.ico')) { Copy-WithRetry (Join-Path $dst 'launcher\icon.ico') $iconDst }
 
         # 4) 版本指针
         Write-JsonFile $curPath ([ordered]@{
@@ -1048,6 +1231,52 @@ function Invoke-Media {
     return [ordered]@{ ok = $true; command = 'media'; target = $Target; compose = $compose }
 }
 
+# ---------------- publish ----------------
+
+# Invoke-Publish 生成自动更新清单（latest.json）。
+#
+# 桌面外壳的自动更新读的就是这个 JSON（.env 的 BMA_UPDATE_URL 指过来）：
+#   { "version": "...", "url": "...", "sha256": "...", "notes": "..." }
+# 版本号用时间戳前缀（yyyyMMdd-HHmmss-<commit>），字符串比较即时间比较。
+#
+# 用法：
+#   pwsh -File .\bma-app.ps1 publish -BaseUrl https://example.com/bma
+#   → dist\installer\latest.json（连同安装包一起传到该地址即可）
+function Invoke-Publish {
+    param([string]$BaseUrl, [string]$Version, [string]$Notes)
+
+    $installerDir = Join-Path $PSScriptRoot 'dist\installer'
+    if (-not (Test-Path $installerDir)) { throw "缺少 $installerDir（先跑 pack + installer\build-installer.ps1）" }
+    $exe = $null
+    if ($Version) {
+        $exe = Join-Path $installerDir ('BlockMemoryAgent-Setup-' + $Version + '.exe')
+        if (-not (Test-Path $exe)) { throw "找不到安装包: $exe" }
+    } else {
+        $exe = (Get-ChildItem $installerDir -Filter 'BlockMemoryAgent-Setup-*.exe' |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+        if (-not $exe) { throw "找不到安装包（先跑 pack + installer\build-installer.ps1）" }
+    }
+    $file = Split-Path $exe -Leaf
+    $ver = $file -replace '^BlockMemoryAgent-Setup-', '' -replace '\.exe$', ''
+    $sha = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLower()
+    $url = ''
+    if ($BaseUrl) {
+        $url = $BaseUrl.TrimEnd('/') + '/' + $file
+    }
+    $manifest = [ordered]@{
+        version = $ver
+        url     = $url
+        sha256  = $sha
+        notes   = $Notes
+    }
+    $out = Join-Path $installerDir 'latest.json'
+    Write-JsonFile $out $manifest
+    Write-Log "[publish] $out"
+    if (-not $url) { Write-Log '[publish] warn: 未给 -BaseUrl，清单里的 url 为空（桌面端拿到会拒绝安装）' }
+    Write-Host ("更新清单: " + $out)
+    return [ordered]@{ ok = $true; command = 'publish'; version = $ver; url = $url; sha256 = $sha; manifest = $out }
+}
+
 # ---------------- start / stop / status / rollback ----------------
 
 function Resolve-Target([string]$Target) {
@@ -1138,6 +1367,7 @@ try {
         'rollback' { $result = Invoke-Rollback -Target $Target -TimeoutSec $TimeoutSec }
         'media' { $result = Invoke-Media -Target $Target }
         'migrate-data' { $result = Invoke-MigrateData -Target $Target -FromDsn $FromDsn }
+        'publish' { $result = Invoke-Publish -BaseUrl $BaseUrl -Version $Version -Notes $Notes }
     }
 } catch {
     $message = $_.Exception.Message
@@ -1156,7 +1386,12 @@ if ($script:JsonOutput) {
         'pack' { Write-Host ("打包完成: " + $result.package) }
         'status' {
             Write-Host ("安装目录: " + $result.target)
-            if ($result.installed) { Write-Host ("当前版本: " + $result.installed.version + "（commit " + $result.installed.commit + "，安装于 " + $result.installed.installed_at + "）") }
+            if ($result.installed) {
+                # installed_at 只有 bma-app.ps1 安装路径会写；Inno 安装器写的指针没有它。
+                $meta = "commit " + $result.installed.commit
+                if ($result.installed.installed_at) { $meta += "，安装于 " + $result.installed.installed_at }
+                Write-Host ("当前版本: " + $result.installed.version + "（" + $meta + "）")
+            }
             else { Write-Host '当前版本: 未安装' }
             Write-Host ("运行中: " + $result.running)
             if ($result.health) { Write-Host ("健康: " + $result.http + " build=" + $result.health.build.version + " pid=" + $result.health.pid) }

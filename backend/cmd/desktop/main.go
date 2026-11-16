@@ -381,9 +381,15 @@ func startServer(root string) (string, uint32, error) {
 	cmd.Dir = workDir
 	cmd.Env = append(os.Environ(),
 		"BMA_HOME="+root,
-		// 插件配置里的路径占位符（整串形式，配置插值只认整串 ${VAR}）
+		// 插件配置里的路径占位符（整串形式，配置插值只认整串 ${VAR}）：
+		// 随包 Node + 三个本地 MCP 桥（生图/视频、浏览器截图、真机 GUI 直控）——
+		// 全部走 stdio，目标机不需要 Docker、不需要系统 Node。
 		"BMA_NODE_EXE="+filepath.Join(root, runtimeDirName, "node", "node.exe"),
 		"BMA_MEDIA_BRIDGE="+filepath.Join(root, runtimeDirName, "media", "open-design-mcp", "server.js"),
+		"BMA_UI_PREVIEW_MCP="+filepath.Join(root, runtimeDirName, "media", "ui-preview-mcp", "node_modules", "@playwright", "mcp", "cli.js"),
+		"BMA_COMPUTER_USE_MCP="+filepath.Join(root, runtimeDirName, "media", "computer-use-mcp", "node_modules", "@zavora-ai", "computer-use-mcp", "dist", "launch.js"),
+		// Chromium 浏览器二进制随包（离线可用）：Playwright 按此环境变量找浏览器。
+		"BMA_PLAYWRIGHT_BROWSERS="+filepath.Join(root, runtimeDirName, "media", "playwright-browsers"),
 	)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

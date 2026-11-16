@@ -134,3 +134,43 @@ func (h *APIHandler) CleanupPluginsHandler(c *gin.Context) {
 		"docker":  h.pluginMgr.DockerReport(ctx),
 	})
 }
+
+// StartDockerHandler 处理 POST /api/plugins/docker/start — 拉起 Docker 引擎。
+//
+// 场景：docker transport 插件因引擎没开而降级（能力缺失）。用户在应用内点
+// 「启动 Docker」→ 这里尝试拉起 Docker Desktop（最多 3 次，每次等引擎就绪），
+// 成功后重载插件配置，让降级的 docker 插件自动恢复。
+//
+// 引擎本来就绪时是幂等的（直接返回就绪状态）。
+func (h *APIHandler) StartDockerHandler(c *gin.Context) {
+	if h.pluginMgr == nil {
+		c.String(503, "plugin manager not initialized")
+		return
+	}
+	// 3 次尝试 × 每次最多 90 秒等待 → 给足 5 分钟。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
+	defer cancel()
+	err := plugins.EnsureDockerEngine(ctx, plugins.DockerLaunchAttempts)
+	if err != nil {
+		c.JSON(200, map[string]any{
+			"status": "unavailable",
+			"error":  err.Error(),
+			"docker": h.pluginMgr.DockerReport(ctx),
+		})
+		return
+	}
+	// 引擎就绪：重载插件（降级的 docker 插件随之重新启用）。
+	if err := h.pluginMgr.Reload(ctx); err != nil {
+		c.JSON(200, map[string]any{
+			"status": "started",
+			"error":  "Docker 已就绪，但插件重载失败：" + err.Error(),
+			"docker": h.pluginMgr.DockerReport(ctx),
+		})
+		return
+	}
+	c.JSON(200, map[string]any{
+		"status":  "started",
+		"plugins": h.pluginMgr.List(),
+		"docker":  h.pluginMgr.DockerReport(ctx),
+	})
+}

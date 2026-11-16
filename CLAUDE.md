@@ -21,20 +21,27 @@ Go module: `github.com/blockmemory/agent/backend` (source under `backend/`; root
 
 See `Makefile` (`make help` lists all targets). Key targets: `make run` (build web + run server), `make backend-test`, `make test-test`, `make lint`, `make up`/`down` (docker compose), `make migrate`. The Makefile recipes are Unix-shell (Git Bash) syntax — `make` is not installed on some Windows hosts; there run `.\dist.ps1` (= `make dist`) in PowerShell, then `.\install.ps1` to copy `dist/` into a chosen install dir and set user env `BMA_HOME`.
 
-## 桌面版打包与更新（2026-10-30；2026-11-14 自带运行时 + 正式安装包）
+## 桌面版打包与更新（2026-10-30；2026-11-14 自带运行时 + 正式安装包；2026-11-16 完全自包含）
 
-**商业桌面应用的常规形态**：安装包（Inno Setup，per-user）+ **自带运行时**（PostgreSQL+pgvector、Redis 随包，目标机免装 Docker）+ 版本化程序目录 + 用户数据在 `%LOCALAPPDATA%`。
+**商业桌面应用的常规形态**：安装包（Inno Setup，per-user）+ **自带运行时**（目标机免装 Docker、免装 Node、免装任何外部依赖）+ 版本化程序目录 + 用户数据在 `%LOCALAPPDATA%`。
+
+**自包含边界（2026-11-16 定型）**：安装包内含 PostgreSQL+pgvector、Redis、Node、三个本地 MCP 桥（生图生视频 / Playwright+Chromium / 真机 GUI 直控），**镜像与容器不进包**（镜像 GB 级），原生产物能力（Gemini 生图、本地裁剪遮罩、方舟视频等上游特有形状）仍需装 Docker 后用 `bma-app.ps1 media` 切回。
 
 - `installer/fetch-runtime.ps1`：下载运行时源包到 `dist\runtime-cache\`（PG 16 免安装版 EDB zip / pgvector 0.8.7 Windows 预编译包 / Redis 5.0.14.1 for Windows / WebView2 引导程序）。源包**不进 git**。
-- `installer/build-installer.ps1`：编译安装包 → `dist\installer\BlockMemoryAgent-Setup-<版本>.exe`（约 78MB，LZMA2）。
-- `installer/blockmemoryagent.iss`：per-user 安装到 `%LOCALAPPDATA%\Programs\BlockMemoryAgent`；铺程序 + `runtime\` + `docker\`；`config\` 与 `.env` **仅在缺失时种子化**（升级绝不覆盖）；开始菜单/桌面快捷方式 + 卸载项；目标机缺 WebView2 时静默补装；卸载前调 `BMA-Desktop.exe --stop` 停后端与内置运行时（用户数据默认保留）。
+- `installer/build-installer.ps1`：编译安装包 → `dist\installer\BlockMemoryAgent-Setup-<版本>.exe`（含 Chromium 后约 200MB+，LZMA2）。
+- `installer/blockmemoryagent.iss`：per-user 安装到 `%LOCALAPPDATA%\Programs\BlockMemoryAgent`；铺程序 + `runtime\` + `docker\`；`config\` 与 `.env` **仅在缺失时种子化**（升级绝不覆盖）；开始菜单/桌面快捷方式 + 卸载项；目标机缺 WebView2 时静默补装；卸载前调 `BMA-Desktop.exe --stop` 停后端与内置运行时（用户数据默认保留）。**升级语义**：① 覆盖文件前先 `BMA-Desktop.exe --stop`（否则被占用的 exe 拷不进去）；② `runtime\` 按载荷指纹（`.payload-id`）判定，没变就跳过重铺 300MB；③ 版本指针保留 `previous`（可 `bma-app.ps1 rollback`）；④ 旧版本目录只留当前 + 上一版。
 - **自带运行时管理**（`backend/cmd/desktop/runtime.go`）：外壳把包内 `runtime\postgres`（PG 16 + `share\extension\vector.control` + `lib\vector.dll`）与 `runtime\redis` 当**子进程**拉起（Postgres.app 式）——首次 `initdb` → 起 PG（pg_ctl）→ 建库 + `CREATE EXTENSION vector` → 起 Redis；数据目录 `%LOCALAPPDATA%\BlockMemoryAgent\data\{pg,redis}`；实例口令/端口记在 `%LOCALAPPDATA%\BlockMemoryAgent\instance.json`（**跟数据走**，换安装目录不换口令）；生效的 DSN/Redis 地址写回安装目录 `.env` 给后端连。端口默认 55432/56380（与开发实例的 5432/6380 隔离）。
 - **依赖自举优先级**：`ensureAllDeps` → 安装包带 `runtime\` 就用自带运行时（免 Docker），否则回退 Docker 路径（`deps.go`：拉起 Docker Desktop + compose up）。`.env` 里显式配了**远程** PG/Redis 时不接管。
 - `bma-app.ps1 migrate-data -Target <安装目录> -FromDsn <源库 DSN>`：把别处的数据（典型是开发实例的 Docker PG）搬进自带实例（pg_dump/pg_restore，包内自带）。
-- `bma-app.ps1 pack [-NoRuntime]`：`runtime\` 载荷自动进包（裁剪后 122MB：去掉 include/doc/静态库/pg_upgrade/pgbench）；`-NoRuntime` 出纯程序包（开发机快速迭代用）。
+- `bma-app.ps1 pack [-NoRuntime]`：`runtime\` 载荷自动进包（裁剪后约 300MB：PG 裁掉 include/doc/静态库，加 Node + 媒体桥 + Playwright/Chromium）；`-NoRuntime` 出纯程序包（开发机快速迭代用）。载荷写 `.payload-id`（配方号 + 文件清单指纹）→ 更新时据此判定"运行时没变就不重铺"。
 - **首启向导**（`backend/cmd/desktop/wizard.go`）：`.env` 里模型 Key / 嵌入 Key 还是占位值时，窗口先弹引导页（模型 Key + 接口地址 + 嵌入地址/Key），填完写进 `.env` 再继续启动；可「稍后再说」（跳过 = 相关能力降级）。已配过的一律不弹窗。
-- **自动更新**（`backend/cmd/desktop/update.go`）：更新地址写在 `.env` 的 `BMA_UPDATE_URL`（指向一个 JSON：`version`/`url`/`sha256`/`notes`）。启动后后台检查一次 + 托盘「检查更新」；有新版则询问 → 下载 → 校验 sha256 → 静默运行安装包（安装器用 Restart Manager 关掉旧进程）→ 退出旧版。没配 `BMA_UPDATE_URL` 就不检查、不打扰。
-- **原生媒体栈（免 Docker 的生图/生视频）**：桌面版不带 daemon 容器，改用随包的 `mediaservice.exe`（`backend/cmd/mediaservice`，实现 ui_design 桥实际用到的 9 个 daemon 端点）+ 随包 Node 起桥（stdio 传输）+ 随包 MiniMax 适配桥（本地 Node 进程，顶替容器服务名 `minimax-media:8787`）。打包时 `plugins.yaml` 的 ui_design 段被改写成 stdio（`${BMA_NODE_EXE}` / `${BMA_MEDIA_BRIDGE}` 两个**整串**占位符，由外壳/启动器注入环境变量；配置插值只认整串 `${VAR}`，不能嵌在路径中间）。安装时 `config\plugins.yaml` **仅在用户没改过**（与随包副本逐字节一致）才随版本更新，改过就保留并告警。
+- **自动更新**（`backend/cmd/desktop/update.go`）：更新地址写在 `.env` 的 `BMA_UPDATE_URL`（指向一个 JSON：`version`/`url`/`sha256`/`notes`）。启动后后台检查一次 + 托盘「检查更新」；有新版则询问 → 下载 → 校验 sha256 → 静默运行安装包（安装器用 Restart Manager 关掉旧进程）→ 退出旧版。没配 `BMA_UPDATE_URL` 就不检查、不打扰。清单由 `bma-app.ps1 publish -BaseUrl <地址>` 生成（`dist\installer\latest.json`）。
+- **本地插件栈（免 Docker / 免系统 Node）**：桌面版把三个"依赖外部运行时"的插件改成本地 stdio——打包时 `plugins.yaml` 的对应段被改写（`${BMA_NODE_EXE}` / `${BMA_MEDIA_BRIDGE}` / `${BMA_UI_PREVIEW_MCP}` / `${BMA_COMPUTER_USE_MCP}` / `${BMA_PLAYWRIGHT_BROWSERS}` 五个**整串**占位符，由外壳注入环境变量；配置插值只认整串 `${VAR}`，不能嵌在路径中间）：
+  - `ui_design` → 随包 Node 起桥，上游是原生 `mediaservice.exe`（127.0.0.1:7456）；
+  - `ui_preview` → 随包 Node 起 `@playwright/mcp`，**Chromium 也在包内**（`PLAYWRIGHT_BROWSERS_PATH` 指过去，离线可用）；
+  - `host_computer_use` → 随包 Node 起 `@zavora-ai/computer-use-mcp`（原先走 `npx`，要系统 Node + npm 源）。
+  安装时 `config\plugins.yaml` **仅在用户没改过**（与随包副本逐字节一致）才随版本更新，改过就保留并告警。
+- **Docker 缺失时的降级纪律（2026-11-16）**：插件要 Docker 而引擎没起时，**启用路径最多尝试拉起 Docker Desktop 1 次（45 秒内）**，仍失败则该插件降级（能力缺失，不阻断启动）；断线后的重连循环探测到引擎不可用就**停止重连**（此前每 30 秒刷一条，实测刷了 26 分钟）。用户可在**插件页点「启动 Docker」**重新拉起（`POST /api/plugins/docker/start` → `plugins.EnsureDockerEngine(ctx, 3)`，3 次尝试 + 自动重载插件）。自包含模式（安装包带 runtime）下桌面外壳**完全不碰 Docker**（媒体走原生服务）。
 - **媒体能力边界**：原生媒体服务只做纯文本生成（t2i/t2v）与 OpenAI 兼容的参考图通道（`/images/generations` + `image` 字段 data URL）；本地编辑（crop/遮罩）、Gemini 生图、方舟视频等上游特有形状仍需容器 daemon（装 Docker 后 `bma-app.ps1 media` 可切回）。
 
 ### 打包工具（bma-app.ps1）
@@ -43,7 +50,8 @@ See `Makefile` (`make help` lists all targets). Key targets: `make run` (build w
 
 - `.\bma-app.ps1 pack [-Version v] [-SkipWeb] [-Test] [-NoZip]` → `dist/app/bma-<版本>/`（bin / web\dist / config-templates / launcher / **docker** / VERSION.json / MANIFEST.sha256）+ `dist/bma-app-<版本>.zip`；ldflags 注入 `internal/buildinfo`（Version/Commit/BuiltAt）。
 - **日常更新一条命令**：`.\bma-app.ps1 deploy -Target <安装目录> [-SkipWeb] [-Keep 3]` = pack + update，自动完成"构建 → 切版本 → 重启后端 → 校验 `build.version`（失败回滚）→ **重启原本开着的桌面外壳**（`-NoShell` 跳过）"。实测全流程约 28s（`-SkipWeb` 时）。
-- `install|update -Target <dir> [-From 包|zip] [-Keep 3] [-HttpAddr host:port] [-NoRestart] [-NoShortcut] [-NoShell] [-Json]`：布局 = `app\versions\<ver>\`（不可变，程序）+ `app\current.json`（版本指针，含 previous）+ 根目录用户数据 `config\ .env plugins.d\ workspace\ logs\`。配置**只补缺、不覆盖**；重启前先关掉该目录下已运行的 `BMA-Desktop.exe`，重启后核对 `/api/health` 的 `build.version`，失败自动回滚上一版；拒绝安装到含 `.git`/`go.work` 的源码目录。
+- `install|update -Target <dir> [-From 包|zip] [-Keep 3] [-HttpAddr host:port] [-NoRestart] [-NoShortcut] [-NoShell] [-Json]`：布局 = `app\versions\<ver>\`（不可变，程序）+ `app\current.json`（版本指针，含 previous）+ 根目录用户数据 `config\ .env plugins.d\ workspace\ logs\`。配置**只补缺、不覆盖**；**运行时按 `.payload-id` 指纹复用**（没变不重拷 300MB）；重启前先关掉该目录下已运行的 `BMA-Desktop.exe`，重启后核对 `/api/health` 的 `build.version`，失败自动回滚上一版；拒绝安装到含 `.git`/`go.work` 的源码目录。
+- `publish -BaseUrl <地址> [-Notes <说明>]`：生成自动更新清单 `dist\installer\latest.json`（version/url/sha256/notes）；把安装包与该 JSON 传到该地址，再在安装目录 `.env` 写 `BMA_UPDATE_URL=<地址>/latest.json` 即启用自动更新。
 - `start|stop|restart|status|rollback [-Target <dir>] [-Json]`：`status -Json` 给外部调用方机器可读状态（installed/runtime/running/http/health/versions）。
 - `media -Target <dir>`：应用媒体生成配置（对齐 `docker/bma-plugin.sh media`）——重建 `bma/open-design-mcp:local` 镜像 → `compose up -d --build minimax-media` → 重建 `open_design` 容器（entrypoint 重写 `media-config.json`）→ 换 `ui_design` keeper。唯一手改点 = `<安装目录>\.env` 媒体段。
 - **禁运清单**（打包硬剔除 + 拒绝安装侧污染）：`config/models.json`、`config/user_profile.md`、`config/skills_learned/`、`.env`、`workspace/`、`logs/`、`plugins.installed.yaml`；包内文本命中疑似真实 key 直接拒包。

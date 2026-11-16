@@ -146,6 +146,7 @@ func NewDefaultRouter(app *App) *gin.Engine {
 	api.POST("/plugins/:id/disable", apiHandler.DisablePluginHandler) // 热停用
 	api.POST("/plugins/reload", apiHandler.ReloadPluginsHandler)      // 重读配置 + 重扫 plugins.d/
 	api.GET("/plugins/docker", apiHandler.DockerPluginsHandler)       // docker 依赖自检（镜像/容器状态）
+	api.POST("/plugins/docker/start", apiHandler.StartDockerHandler)  // 拉起 Docker 引擎（插件降级后用户手动重试）
 	api.POST("/plugins/cleanup", apiHandler.CleanupPluginsHandler)    // 清理 docker 残留（?all=true 含运行中 keeper）
 
 	// 外部 Agent 注册表（config/external_agents.yaml）：清单 + 热重载。

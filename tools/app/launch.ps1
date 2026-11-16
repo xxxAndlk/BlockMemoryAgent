@@ -144,9 +144,14 @@ $webDist = Join-Path $verDir 'web\dist'
 $runLines = @(
     '@echo off',
     ('set "BMA_HOME=' + $Root + '"'),
-    # 插件配置里的路径占位符（整串形式）：随包 Node 与 ui_design 桥
+    # 插件配置里的路径占位符（整串形式）：随包 Node + 三个本地 MCP 桥
+    # （生图生视频 / Playwright 截图 / 真机 GUI 直控）。漏任何一个 → 插件命令变成
+    # `node ""`，node 会把 stdin 当 JS 源码解析 → 握手超时（2026-11-16 实测）。
     ('set "BMA_NODE_EXE=' + (Join-Path $Root 'runtime\node\node.exe') + '"'),
     ('set "BMA_MEDIA_BRIDGE=' + (Join-Path $Root 'runtime\media\open-design-mcp\server.js') + '"'),
+    ('set "BMA_UI_PREVIEW_MCP=' + (Join-Path $Root 'runtime\media\ui-preview-mcp\node_modules\@playwright\mcp\cli.js') + '"'),
+    ('set "BMA_COMPUTER_USE_MCP=' + (Join-Path $Root 'runtime\media\computer-use-mcp\node_modules\@zavora-ai\computer-use-mcp\dist\launch.js') + '"'),
+    ('set "BMA_PLAYWRIGHT_BROWSERS=' + (Join-Path $Root 'runtime\media\playwright-browsers') + '"'),
     ('cd /d "' + $Root + '"'),
     ('"' + $exe + '" -web-dist "' + $webDist + '" 1>>"' + $outLog + '" 2>>"' + $errLog + '"')
 )
