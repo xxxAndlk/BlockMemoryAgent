@@ -235,94 +235,108 @@ function Build-RuntimePayload {
     $cache = Get-RuntimeCache $Repo
     if (-not (Test-RuntimeAvailable $Repo)) { throw "缺少运行时源包（$cache 下需要 pg16.zip / pgvector-pg16.zip / redis-win.zip），先跑 installer\fetch-runtime.ps1" }
     $prepared = Join-Path $cache 'prepared'
-    # 配方版本：载荷组成变了就重建（否则会复用旧缓存，缺新加的 node/媒体桥）。
+    # 配方版本：载荷**组成**变了就重建（否则会复用旧缓存，缺新加的 node/媒体桥）。
     $recipe = 'v6-node-media-playwright-cu-headless'
     $recipeFile = Join-Path $prepared '.recipe'
-    $preparedOk = ((Test-Path (Join-Path $prepared 'postgres\share\extension\vector.control')) -and
-                   (Test-Path (Join-Path $prepared 'postgres\bin\postgres.exe')) -and
-                   (Test-Path (Join-Path $prepared 'redis\redis-server.exe')) -and
-                   (Test-Path (Join-Path $prepared 'node\node.exe')) -and
-                   (Test-Path (Join-Path $prepared 'media\open-design-mcp\server.js')) -and
-                   (Test-Path (Join-Path $prepared 'media\ui-preview-mcp\node_modules\@playwright\mcp\cli.js')) -and
-                   (Test-Path (Join-Path $prepared 'media\computer-use-mcp\node_modules\@zavora-ai\computer-use-mcp\dist\launch.js')) -and
-                   (Test-Path (Join-Path $prepared 'media\playwright-browsers')) -and
-                   ((Test-Path $recipeFile) -and ((Get-Content $recipeFile -Raw).Trim() -eq $recipe)))
-    if ($preparedOk) {
-        Write-Log '[runtime] 复用已准备的运行时载荷'
-    } else {
-    if (Test-Path $prepared) { Remove-Item -Recurse -Force $prepared }
+    $recipeMatch = ((Test-Path $recipeFile) -and ((Get-Content $recipeFile -Raw).Trim() -eq $recipe))
+    # 配方**明确**不匹配：组成可能整体不同，清空重建（全本地源包/缓存，代价可控）。
+    # 配方文件缺失（上次准备到一半就断了）：按“只补缺”处理，不白扔已下好的几百 MB。
+    if ((Test-Path $recipeFile) -and -not $recipeMatch) {
+        Write-Log ('[runtime] 载荷配方变了（' + ((Get-Content $recipeFile -Raw).Trim()) + ' → ' + $recipe + '），重建')
+        if (Test-Path $prepared) { Remove-Item -Recurse -Force $prepared }
+    }
     New-Item -ItemType Directory -Force -Path $prepared | Out-Null
 
-    Write-Log '[runtime] 解压 PostgreSQL ...'
-    $pgTmp = Join-Path $cache '_pg'
-    if (Test-Path $pgTmp) { Remove-Item -Recurse -Force $pgTmp }
-    Expand-Archive -Path (Join-Path $cache 'pg16.zip') -DestinationPath $pgTmp -Force
-    $pgRoot = Join-Path $pgTmp 'pgsql'
-    if (-not (Test-Path $pgRoot)) { $pgRoot = $pgTmp }
+    # **逐部件判定、只补缺不全铺**（2026-11-16 实战）。此前是"任一部件缺 → 删整个
+    # prepared 重做"，于是"只剩桥依赖没装好"也会把已下好的 290MB Chromium/PostgreSQL
+    # 全部重下——失败一次就要多等十几分钟。现在：配方一致时，哪个部件缺就只重建哪个，
+    # 已经完整的部件（PG/Redis/Node/浏览器）原样保留。
     $pgOut = Join-Path $prepared 'postgres'
-    New-Item -ItemType Directory -Force -Path $pgOut | Out-Null
-    foreach ($d in @('bin', 'lib', 'share')) {
-        Copy-Item -Recurse -Force (Join-Path $pgRoot $d) (Join-Path $pgOut $d)
-    }
-    # 裁剪：头文件、文档、静态库、上位版本升级工具——都不影响运行，能省几百 MB。
-    foreach ($junk in @('include', 'doc')) {
-        $p = Join-Path $pgOut $junk
-        if (Test-Path $p) { Remove-Item -Recurse -Force $p }
-    }
-    Get-ChildItem -Path (Join-Path $pgOut 'lib') -Filter '*.a' -File -ErrorAction SilentlyContinue | Remove-Item -Force
-    foreach ($junk in @('pg_upgrade.exe', 'pgbench.exe')) {
-        $p = Join-Path $pgOut ('bin\' + $junk)
-        if (Test-Path $p) { Remove-Item -Force $p }
-    }
-    Remove-Item -Recurse -Force $pgTmp -ErrorAction SilentlyContinue
+    $pgDone = ((Test-Path (Join-Path $pgOut 'bin\postgres.exe')) -and
+               (Test-Path (Join-Path $pgOut 'share\extension\vector.control')) -and
+               (Test-Path (Join-Path $pgOut 'lib\vector.dll')))
+    if ($pgDone) {
+        Write-Log '[runtime] 复用 PostgreSQL + pgvector'
+    } else {
+        # PG 与 pgvector 是一体的（扩展文件装进 PG 目录），缺任一就整体重解（本地 zip，很快）。
+        if (Test-Path $pgOut) { Remove-Item -Recurse -Force $pgOut }
 
-    Write-Log '[runtime] 安装 pgvector 扩展 ...'
-    $vecTmp = Join-Path $cache '_vec'
-    if (Test-Path $vecTmp) { Remove-Item -Recurse -Force $vecTmp }
-    Expand-Archive -Path (Join-Path $cache 'pgvector-pg16.zip') -DestinationPath $vecTmp -Force
-    # PostgreSQL 的约定：控制文件与 SQL 脚本在 share\extension\，动态库在 pkglibdir。
-    # EDB 的 Windows 免安装版把 pkglibdir 定在 lib\（不是 Linux 的 lib/postgresql）。
-    $extDir = Join-Path $pgOut 'share\extension'
-    $libDir = Join-Path $pgOut 'lib'
-    New-Item -ItemType Directory -Force -Path $extDir, $libDir | Out-Null
-    $vecShare = Join-Path $vecTmp 'share\extension'
-    if (Test-Path $vecShare) {
-        Get-ChildItem -Path $vecShare -File | ForEach-Object { Copy-Item -Force $_.FullName $extDir }
-    }
-    $vecLib = Join-Path $vecTmp 'lib'
-    if (Test-Path $vecLib) {
-        Get-ChildItem -Path $vecLib -File -Filter '*.dll' | ForEach-Object { Copy-Item -Force $_.FullName $libDir }
-    }
-    Remove-Item -Recurse -Force $vecTmp -ErrorAction SilentlyContinue
-    if (-not (Test-Path (Join-Path $extDir 'vector.control'))) {
-        throw 'pgvector 扩展安装失败：payload 里没有 vector.control'
-    }
-    if (-not (Test-Path (Join-Path $libDir 'vector.dll'))) {
-        throw 'pgvector 扩展安装失败：payload 里没有 vector.dll'
+        Write-Log '[runtime] 解压 PostgreSQL ...'
+        $pgTmp = Join-Path $cache '_pg'
+        if (Test-Path $pgTmp) { Remove-Item -Recurse -Force $pgTmp }
+        Expand-Archive -Path (Join-Path $cache 'pg16.zip') -DestinationPath $pgTmp -Force
+        $pgRoot = Join-Path $pgTmp 'pgsql'
+        if (-not (Test-Path $pgRoot)) { $pgRoot = $pgTmp }
+        New-Item -ItemType Directory -Force -Path $pgOut | Out-Null
+        foreach ($d in @('bin', 'lib', 'share')) {
+            Copy-Item -Recurse -Force (Join-Path $pgRoot $d) (Join-Path $pgOut $d)
+        }
+        # 裁剪：头文件、文档、静态库、上位版本升级工具——都不影响运行，能省几百 MB。
+        foreach ($junk in @('include', 'doc')) {
+            $p = Join-Path $pgOut $junk
+            if (Test-Path $p) { Remove-Item -Recurse -Force $p }
+        }
+        Get-ChildItem -Path (Join-Path $pgOut 'lib') -Filter '*.a' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+        foreach ($junk in @('pg_upgrade.exe', 'pgbench.exe')) {
+            $p = Join-Path $pgOut ('bin\' + $junk)
+            if (Test-Path $p) { Remove-Item -Force $p }
+        }
+        Remove-Item -Recurse -Force $pgTmp -ErrorAction SilentlyContinue
+
+        Write-Log '[runtime] 安装 pgvector 扩展 ...'
+        $vecTmp = Join-Path $cache '_vec'
+        if (Test-Path $vecTmp) { Remove-Item -Recurse -Force $vecTmp }
+        Expand-Archive -Path (Join-Path $cache 'pgvector-pg16.zip') -DestinationPath $vecTmp -Force
+        # PostgreSQL 的约定：控制文件与 SQL 脚本在 share\extension\，动态库在 pkglibdir。
+        # EDB 的 Windows 免安装版把 pkglibdir 定在 lib\（不是 Linux 的 lib/postgresql）。
+        $extDir = Join-Path $pgOut 'share\extension'
+        $libDir = Join-Path $pgOut 'lib'
+        New-Item -ItemType Directory -Force -Path $extDir, $libDir | Out-Null
+        $vecShare = Join-Path $vecTmp 'share\extension'
+        if (Test-Path $vecShare) {
+            Get-ChildItem -Path $vecShare -File | ForEach-Object { Copy-Item -Force $_.FullName $extDir }
+        }
+        $vecLib = Join-Path $vecTmp 'lib'
+        if (Test-Path $vecLib) {
+            Get-ChildItem -Path $vecLib -File -Filter '*.dll' | ForEach-Object { Copy-Item -Force $_.FullName $libDir }
+        }
+        Remove-Item -Recurse -Force $vecTmp -ErrorAction SilentlyContinue
+        if (-not (Test-Path (Join-Path $extDir 'vector.control'))) {
+            throw 'pgvector 扩展安装失败：payload 里没有 vector.control'
+        }
+        if (-not (Test-Path (Join-Path $libDir 'vector.dll'))) {
+            throw 'pgvector 扩展安装失败：payload 里没有 vector.dll'
+        }
     }
 
-    Write-Log '[runtime] 解压 Redis ...'
-    $redisTmp = Join-Path $cache '_redis'
-    if (Test-Path $redisTmp) { Remove-Item -Recurse -Force $redisTmp }
-    Expand-Archive -Path (Join-Path $cache 'redis-win.zip') -DestinationPath $redisTmp -Force
     $redisOut = Join-Path $prepared 'redis'
-    New-Item -ItemType Directory -Force -Path $redisOut | Out-Null
-    foreach ($f in @('redis-server.exe', 'redis-cli.exe')) {
-        $src = Get-ChildItem -Path $redisTmp -Filter $f -Recurse -File | Select-Object -First 1
-        if ($src) { Copy-Item -Force $src.FullName $redisOut }
+    if (Test-Path (Join-Path $redisOut 'redis-server.exe')) {
+        Write-Log '[runtime] 复用 Redis'
+    } else {
+        Write-Log '[runtime] 解压 Redis ...'
+        $redisTmp = Join-Path $cache '_redis'
+        if (Test-Path $redisTmp) { Remove-Item -Recurse -Force $redisTmp }
+        Expand-Archive -Path (Join-Path $cache 'redis-win.zip') -DestinationPath $redisTmp -Force
+        New-Item -ItemType Directory -Force -Path $redisOut | Out-Null
+        foreach ($f in @('redis-server.exe', 'redis-cli.exe')) {
+            $src = Get-ChildItem -Path $redisTmp -Filter $f -Recurse -File | Select-Object -First 1
+            if ($src) { Copy-Item -Force $src.FullName $redisOut }
+        }
+        Remove-Item -Recurse -Force $redisTmp -ErrorAction SilentlyContinue
+        if (-not (Test-Path (Join-Path $redisOut 'redis-server.exe'))) { throw 'Redis 解压失败：缺 redis-server.exe' }
     }
-    Remove-Item -Recurse -Force $redisTmp -ErrorAction SilentlyContinue
-    if (-not (Test-Path (Join-Path $redisOut 'redis-server.exe'))) { throw 'Redis 解压失败：缺 redis-server.exe' }
 
     # Node：随包，用于以 stdio 方式跑 ui_design 桥（免 Docker 的媒体链路）
+    $nodeOut = Join-Path $prepared 'node'
     $nodeZip = Join-Path $cache 'node-win.zip'
-    if (Test-Path $nodeZip) {
+    if (Test-Path (Join-Path $nodeOut 'node.exe')) {
+        Write-Log '[runtime] 复用 Node'
+    } elseif (Test-Path $nodeZip) {
         Write-Log '[runtime] 解压 Node ...'
         $nodeTmp = Join-Path $cache '_node'
         if (Test-Path $nodeTmp) { Remove-Item -Recurse -Force $nodeTmp }
         Expand-Archive -Path $nodeZip -DestinationPath $nodeTmp -Force
         $nodeRoot = (Get-ChildItem $nodeTmp -Directory | Select-Object -First 1).FullName
-        $nodeOut = Join-Path $prepared 'node'
         New-Item -ItemType Directory -Force -Path $nodeOut | Out-Null
         Copy-Item -Force (Join-Path $nodeRoot 'node.exe') $nodeOut
         Remove-Item -Recurse -Force $nodeTmp -ErrorAction SilentlyContinue
@@ -339,7 +353,8 @@ function Build-RuntimePayload {
         foreach ($f in @('server.js', 'media-core.js', 'package.json')) {
             Copy-Item -Force (Join-Path $bridgeSrc $f) $mediaOut
         }
-        if (-not (Test-Path (Join-Path $mediaOut 'node_modules'))) {
+        # 判定靠**入口依赖**而不是 server.js（见上方 preparedOk 注释）。
+        if (-not (Test-Path (Join-Path $mediaOut 'node_modules\@modelcontextprotocol\sdk'))) {
             Write-Log '[runtime] 安装桥依赖（npm install，一次）...'
             Invoke-NpmInstall -Dir $mediaOut -What 'ui_design 桥依赖' -Repo $Repo
         }
@@ -403,7 +418,6 @@ function Build-RuntimePayload {
             })
         Invoke-NpmInstall -Dir $cuOut -What '@zavora-ai/computer-use-mcp' -Repo $Repo
     }
-    }
 
     # 铺到包目录（prepared 保留作缓存，下次打包直接复制）
     if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
@@ -419,21 +433,70 @@ function Build-RuntimePayload {
     Write-Log "[runtime] 载荷就绪：$OutDir（$size MB）"
 }
 
+# Resolve-PkgExe 把包管理器名（npm / pnpm）解析成**可直接 & 调用**的 Application 路径。
+#
+# **为什么必须绕开 PowerShell 的名字解析**（2026-11-16 新机器事故根因）：
+# PS 在 PATH 里会优先选 `npm.ps1`（ExternalScript）而不是 `npm.cmd`，而 Node 22.18/22.20
+# 自带的 npm 10.9.3 的 npm.ps1 有参数切分 bug（npm/cli#8528，10.9.4 才修）：
+# 它用 `$NPM_NO_REDIRECTS_COMMAND.Substring($MyInvocation.InvocationName.Length)` 剥掉命令名，
+# 而脚本里写 `& npm install ...`（带调用运算符）时 InvocationName 只有 `&`（长度 1），
+# 于是参数变成 `pm install ...` → npm 报 `Unknown command: "pm"`。
+# 不带 `&` 的 `npm install` 恰好 InvocationName=`npm` 才正常——所以本仓库自带的
+# dist.ps1 一直能用，只有打包脚本里显式 `& npm` 的这几处会翻车。
+# 解法：一律调 `.cmd`/`.exe`（cmd shim 不经过 PS 的参数解析），不走 `.ps1`。
+function Resolve-PkgExe {
+    param([string]$Name)
+    foreach ($ext in @('.cmd', '.exe')) {
+        $hit = @(Get-Command ($Name + $ext) -CommandType Application -ErrorAction SilentlyContinue) |
+            Select-Object -First 1
+        if ($hit -and $hit.Source) { return $hit.Source }
+    }
+    return $null
+}
+
+# Get-NpmInvoker 返回 npm 调用器：exe + 前置参数（npm.cmd 优先，退化到 node + npm-cli.js）。
+function Get-NpmInvoker {
+    $exe = Resolve-PkgExe 'npm'
+    if ($exe) { return [ordered]@{ exe = $exe; prefix = @() } }
+    $node = Resolve-PkgExe 'node'
+    if ($node) {
+        $cli = Join-Path (Split-Path $node -Parent) 'node_modules\npm\bin\npm-cli.js'
+        if (Test-Path $cli) { return [ordered]@{ exe = $node; prefix = @($cli) } }
+    }
+    Write-Log '[pack] warn: 找不到 npm.cmd / npm-cli.js，将退回 PowerShell 名字解析（npm < 10.9.4 会报 Unknown command: "pm"）'
+    return [ordered]@{ exe = 'npm'; prefix = @() }
+}
+
+# Invoke-Npm 跑 npm（参数逐个透传，不经 Invoke-Expression），返回退出码。
+# -Log 给了就把全部输出（含 stderr）落盘，供失败时回显尾部；没给就直写控制台（**不进管道**，
+# 否则调用方的 `$code = Invoke-Npm ...` 会收成"输出行 + 退出码"的数组）。
+function Invoke-Npm {
+    param([string[]]$Arguments, [string]$Log)
+    $inv = Get-NpmInvoker
+    $all = @($inv.prefix) + @($Arguments)
+    if ($Log) { & $inv.exe @all *> $Log } else { & $inv.exe @all 2>&1 | ForEach-Object { Write-Host $_ } }
+    return $LASTEXITCODE
+}
+
+# Get-NpmVersion 取 npm 版本（诊断用；同样绕开 .ps1 shim）。
+function Get-NpmVersion {
+    $inv = Get-NpmInvoker
+    $all = @($inv.prefix) + @('-v')
+    try { return ((@(& $inv.exe @all 2>$null) | Select-Object -First 1) + '') } catch { return '' }
+}
+
 # Get-PackageManager 探测本机的包管理器：优先 pnpm，没有退回 npm。
 #
 # 只用于**前端依赖**（web/ 的 node_modules 是本机开发用，不进包）。
 # 运行时载荷（runtime\media\*）必须用 npm —— pnpm 的 node_modules 是符号链接指向
 # 全局 store，拷进安装包到别的机器上链接就断了。
 function Get-PackageManager {
-    $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue
-    if ($pnpm) {
-        $ver = (& pnpm -v 2>$null | Select-Object -First 1)
-        return [ordered]@{ kind = 'pnpm'; cmd = $pnpm.Source; version = $ver }
-    }
-    $npm = Get-Command npm -ErrorAction SilentlyContinue
-    if ($npm) {
-        $ver = (& npm -v 2>$null | Select-Object -First 1)
-        return [ordered]@{ kind = 'npm'; cmd = $npm.Source; version = $ver }
+    foreach ($name in @('pnpm', 'npm')) {
+        $exe = Resolve-PkgExe $name
+        if (-not $exe) { continue }
+        $ver = ''
+        try { $ver = ((@(& $exe -v 2>$null) | Select-Object -First 1) + '') } catch { $ver = '' }
+        return [ordered]@{ kind = $name; cmd = $exe; version = $ver }
     }
     return $null
 }
@@ -448,13 +511,15 @@ function Install-FrontendDeps([string]$WebDir) {
     if (-not $pm) { throw '找不到 npm 或 pnpm（装 Node.js 18+ 并把 node 加进 PATH）' }
     Write-Log ('[pack] 用 ' + $pm.kind + ' ' + $pm.version + ' 安装前端依赖（首次较慢）...')
     if ($pm.kind -eq 'pnpm') {
-        & pnpm install
+        & $pm.cmd install 2>&1 | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -eq 0) { return 'pnpm' }
         Write-Log '[pack] warn: pnpm install 失败，清理 node_modules 后退回 npm ...'
         Remove-Item (Join-Path $WebDir 'node_modules') -Recurse -Force -ErrorAction SilentlyContinue
     }
-    & npm install --no-audit --no-fund
-    if ($LASTEXITCODE -ne 0) { throw '前端依赖安装失败（npm install 也失败；检查网络/registry，或用 -SkipWeb 复用已有 web\dist）' }
+    $code = Invoke-Npm @('install', '--no-audit', '--no-fund')
+    if ($code -ne 0) {
+        throw ('前端依赖安装失败（npm ' + (Get-NpmVersion) + ' 也失败；检查网络/registry，或用 -SkipWeb 复用已有 web\dist）')
+    }
     return 'npm'
 }
 
@@ -477,14 +542,13 @@ function Invoke-NpmInstall {
     $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
     Push-Location $Dir
     try {
-        & npm install --omit=dev --no-audit --no-fund *> $log
-        $code = $LASTEXITCODE
+        $code = Invoke-Npm @('install', '--omit=dev', '--no-audit', '--no-fund') -Log $log
     } finally {
         Pop-Location
         $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = $skip
     }
     if ($code -ne 0) {
-        Write-Host ('--- npm install ' + $What + ' 失败（末尾 20 行）---')
+        Write-Host ('--- npm install ' + $What + ' 失败（npm ' + (Get-NpmVersion) + '，末尾 20 行）---')
         Get-Content $log -Tail 20 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
         Write-Host ('--- 完整输出见 ' + $log + ' ---')
         throw ('npm install ' + $What + ' 失败')
@@ -643,7 +707,7 @@ function Invoke-Pack {
                 throw ('找不到 ' + $viteExe + '（node_modules 不完整？先在 web 目录跑 npm install，或用 -SkipWeb 复用已有 web\dist）')
             }
             # 环境版本也打进日志：前端构建出问题时报错信息自解释。
-            Write-Log ('[pack] node ' + (& node -v 2>$null) + ' / npm ' + (& npm -v 2>$null))
+            Write-Log ('[pack] node ' + (& node -v 2>$null) + ' / npm ' + (Get-NpmVersion))
             # 类型检查单独跑：**不阻断打包**。类型问题该在开发期修，不是拦住出包的闸门
             # （新机器/新 Node 版本的类型差异不该让整个安装流程失败）。
             if (Test-Path $tscExe) {

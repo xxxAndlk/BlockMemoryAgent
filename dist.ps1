@@ -5,10 +5,24 @@ $repo = $PSScriptRoot
 
 # web 前端
 Push-Location "$repo\web"
+# 调 npm.cmd / node+npm-cli.js，**不走 npm.ps1**：npm < 10.9.4 的 npm.ps1 在 `& npm ...`
+# 形式下会把 `npm` 切错成 `pm`（npm/cli#8528），报 Unknown command: "pm"。
 # --no-audit --no-fund：跳过 registry.npmjs.org 的 audit/fund 网络请求——国内网络到该源
 # 时通时断，裸 install 会卡在重试上数分钟~十几分钟（install 本体其实 <1s~15s，2026-10-14 实测）。
-npm install --no-audit --no-fund; if ($LASTEXITCODE -ne 0) { throw "npm install 失败" }
-npm run build; if ($LASTEXITCODE -ne 0) { throw "npm run build 失败" }
+$npmCmd = @(Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue) | Select-Object -First 1
+if ($npmCmd) {
+    $npmExe = $npmCmd.Source
+    $npmPrefix = @()
+} else {
+    $nodeCmd = @(Get-Command node -CommandType Application -ErrorAction SilentlyContinue) | Select-Object -First 1
+    if (-not $nodeCmd) { throw "找不到 npm（装 Node.js 18+ 并把 node 加进 PATH）" }
+    $cli = Join-Path (Split-Path $nodeCmd.Source -Parent) 'node_modules\npm\bin\npm-cli.js'
+    if (-not (Test-Path $cli)) { throw "找不到 npm：既无 npm.cmd 也无 $cli" }
+    $npmExe = $nodeCmd.Source
+    $npmPrefix = @($cli)
+}
+& $npmExe @npmPrefix install --no-audit --no-fund; if ($LASTEXITCODE -ne 0) { throw "npm install 失败" }
+& $npmExe @npmPrefix run build; if ($LASTEXITCODE -ne 0) { throw "npm run build 失败" }
 Pop-Location
 
 # 后端二进制(GOTOOLCHAIN=local,见 CLAUDE.md 约定)
