@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 下载自带运行时源包（PostgreSQL 免安装版 + pgvector 扩展 + Redis for Windows）。
 

@@ -564,15 +564,32 @@ function Invoke-Pack {
         Push-Location (Join-Path $repo 'web')
         try {
             if (-not (Test-Path 'node_modules')) {
-                Write-Log '[pack] 安装前端依赖（首次较慢）...'
+                $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
+                if (-not $npmCmd) { throw '找不到 npm（装 Node.js 18+ 并把 node 加进 PATH；或用 -SkipWeb 复用已有 web\dist）' }
+                Write-Log ('[pack] 安装前端依赖（首次较慢，用 ' + $npmCmd.Source + '）...')
                 & npm install --no-audit --no-fund
                 if ($LASTEXITCODE -ne 0) { throw 'npm install 失败（装不上前端依赖；检查网络/registry，或用 -SkipWeb 复用已有 web\dist）' }
             }
+            # 直接调**本地二进制**，不经过 npm run <script>：
+            #   * 不依赖 package.json 里的脚本名（换机器/拉旧代码时脚本可能还没合进来）；
+            #   * 少一层 npm 参数转发，出错信息直指真正执行的命令。
+            $binDir = Join-Path (Get-Location).Path 'node_modules\.bin'
+            $tscExe = Join-Path $binDir 'vue-tsc.cmd'
+            $viteExe = Join-Path $binDir 'vite.cmd'
+            if (-not (Test-Path $viteExe)) {
+                throw ('找不到 ' + $viteExe + '（node_modules 不完整？先在 web 目录跑 npm install，或用 -SkipWeb 复用已有 web\dist）')
+            }
+            # 环境版本也打进日志：前端构建出问题时报错信息自解释。
+            Write-Log ('[pack] node ' + (& node -v 2>$null) + ' / npm ' + (& npm -v 2>$null))
             # 类型检查单独跑：**不阻断打包**。类型问题该在开发期修，不是拦住出包的闸门
             # （新机器/新 Node 版本的类型差异不该让整个安装流程失败）。
-            & npm run typecheck
-            if ($LASTEXITCODE -ne 0) {
-                Write-Log '[pack] warn: vue-tsc 类型检查未通过（不阻断打包）——请在开发环境用 npm run typecheck 修掉'
+            if (Test-Path $tscExe) {
+                & $tscExe -b
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Log '[pack] warn: vue-tsc 类型检查未通过（不阻断打包）——请在开发环境修掉'
+                }
+            } else {
+                Write-Log '[pack] warn: 找不到 vue-tsc，跳过类型检查'
             }
             # vite 构建：失败时把真实报错打回控制台（原来只有一句"npm run build 失败"，
             # 看不到原因）。输出同时落文件备查。
@@ -580,13 +597,16 @@ function Invoke-Pack {
             New-Item -ItemType Directory -Force -Path (Split-Path $webLog -Parent) | Out-Null
             # vite 构建吃内存，机器内存小时默认堆上限会 OOM——给足堆。
             $env:NODE_OPTIONS = '--max-old-space-size=4096'
-            & npm run build:only *> $webLog
+            Write-Log ('[pack] 执行: ' + $viteExe + ' build')
+            & $viteExe build *> $webLog
             $webExit = $LASTEXITCODE
             $env:NODE_OPTIONS = ''
             if ($webExit -ne 0) {
-                Write-Host '--- 前端构建输出（末尾 30 行）---'
+                Write-Host '--- 前端构建输出（开头 10 行 / 末尾 30 行）---'
+                Get-Content $webLog -TotalCount 10 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+                Write-Host '   ...'
                 Get-Content $webLog -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-                Write-Host '--- 完整输出见 ' + $webLog + ' ---'
+                Write-Host ('--- 完整输出见 ' + $webLog + ' ---')
                 throw '前端构建失败（vite build）'
             }
         } finally { Pop-Location }
