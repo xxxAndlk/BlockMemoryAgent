@@ -37,7 +37,10 @@ $items = @(
     # → 走 8 连接分块并行。
     @{ name = 'pg16.zip';          url = 'https://get.enterprisedb.com/postgresql/postgresql-16.4-1-windows-x64-binaries.zip'; big = $true },
     @{ name = 'pgvector-pg16.zip'; url = 'https://github.com/andreiramani/pgvector_pgsql_windows/releases/download/0.8.7/vector.v0.8.7-pg16.zip' },
-    @{ name = 'redis-win.zip';     url = 'https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Redis-x64-5.0.14.1.zip' }
+    @{ name = 'redis-win.zip';     url = 'https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Redis-x64-5.0.14.1.zip' },
+    # Node 运行时：桌面版的三个本地 MCP 桥（生图生视频 / Playwright 截图 / 真机 GUI 直控）
+    # 都靠它跑 —— 漏了这个源包，打出来的包装了也不能用（没有 Node）。
+    @{ name = 'node-win.zip';     url = 'https://nodejs.org/dist/v24.22.3/node-v24.22.3-win-x64.zip' }
 )
 
 # Resolve-Proxy 决定走不走代理：显式 -Proxy 优先，其次环境变量

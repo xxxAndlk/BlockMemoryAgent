@@ -223,7 +223,9 @@ function Test-RuntimeAvailable([string]$Repo) {
     $cache = Get-RuntimeCache $Repo
     return ((Test-Path (Join-Path $cache 'pg16.zip')) -and
             (Test-Path (Join-Path $cache 'pgvector-pg16.zip')) -and
-            (Test-Path (Join-Path $cache 'redis-win.zip')))
+            (Test-Path (Join-Path $cache 'redis-win.zip')) -and
+            # Node 也要：三个本地 MCP 桥全靠它跑，缺了等于装了个不能用的包。
+            (Test-Path (Join-Path $cache 'node-win.zip')))
 }
 
 # Build-RuntimePayload 解压裁剪出 runtime\ 载荷（prepared 缓存命中则直接复制）。
@@ -339,8 +341,7 @@ function Build-RuntimePayload {
         }
         if (-not (Test-Path (Join-Path $mediaOut 'node_modules'))) {
             Write-Log '[runtime] 安装桥依赖（npm install，一次）...'
-            Push-Location $mediaOut
-            try { & npm install --omit=dev --no-audit --no-fund | Out-Null } finally { Pop-Location }
+            Invoke-NpmInstall -Dir $mediaOut -What 'ui_design 桥依赖' -Repo $Repo
         }
     }
 
@@ -368,11 +369,7 @@ function Build-RuntimePayload {
                 version = '1.0.0'
                 dependencies = [ordered]@{ '@playwright/mcp' = $playwrightMcpVersion }
             })
-        Push-Location $uiPrevOut
-        try {
-            & npm install --omit=dev --no-audit --no-fund | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'npm install @playwright/mcp 失败' }
-        } finally { Pop-Location }
+        Invoke-NpmInstall -Dir $uiPrevOut -What '@playwright/mcp' -Repo $Repo
     }
     $browsers = Join-Path $prepared 'media\playwright-browsers'
     if (-not (Test-Path $browsers)) {
@@ -404,11 +401,7 @@ function Build-RuntimePayload {
                 version = '1.0.0'
                 dependencies = [ordered]@{ '@zavora-ai/computer-use-mcp' = $computerUseMcpVersion }
             })
-        Push-Location $cuOut
-        try {
-            & npm install --omit=dev --no-audit --no-fund | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'npm install @zavora-ai/computer-use-mcp 失败' }
-        } finally { Pop-Location }
+        Invoke-NpmInstall -Dir $cuOut -What '@zavora-ai/computer-use-mcp' -Repo $Repo
     }
     }
 
@@ -463,6 +456,39 @@ function Install-FrontendDeps([string]$WebDir) {
     & npm install --no-audit --no-fund
     if ($LASTEXITCODE -ne 0) { throw '前端依赖安装失败（npm install 也失败；检查网络/registry，或用 -SkipWeb 复用已有 web\dist）' }
     return 'npm'
+}
+
+# Invoke-NpmInstall 在载荷目录里装 npm 依赖（失败时报真实原因，不吞输出）。
+#
+# 两个要点：
+#  1. **PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1**：@playwright/mcp 与 computer-use-mcp 都
+#     依赖 `playwright` 包，它的 postinstall 会把**全部浏览器**（chromium + firefox +
+#     webkit + headless shell，约 500MB）下载到用户目录——我们只随包带一个 headless
+#     shell（见下），这些下载纯属浪费，慢到超时还会让 npm install 直接失败。
+#  2. 输出落盘再回显尾部：原来 `| Out-Null` 把报错吞了，只剩一句"npm install 失败"。
+function Invoke-NpmInstall {
+    param([string]$Dir, [string]$What, [string]$Repo)
+
+    $logDir = Join-Path $Repo 'dist'
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $log = Join-Path $logDir ('npm-install-' + ($What -replace '[^A-Za-z0-9_-]', '_') + '.log')
+
+    $skip = $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+    $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
+    Push-Location $Dir
+    try {
+        & npm install --omit=dev --no-audit --no-fund *> $log
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = $skip
+    }
+    if ($code -ne 0) {
+        Write-Host ('--- npm install ' + $What + ' 失败（末尾 20 行）---')
+        Get-Content $log -Tail 20 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+        Write-Host ('--- 完整输出见 ' + $log + ' ---')
+        throw ('npm install ' + $What + ' 失败')
+    }
 }
 
 # Get-PayloadFingerprint 计算目录载荷指纹（相对路径 + 大小的 SHA256）。
