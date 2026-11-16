@@ -34,6 +34,46 @@ $items = @(
     @{ name = 'redis-win.zip';     url = 'https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Redis-x64-5.0.14.1.zip' }
 )
 
+# Invoke-DownloadWithProgress 下载文件并显示进度。
+#
+# 为什么不用 Invoke-WebRequest -OutFile：它下载期间**一行输出都没有**，慢速网络下
+# （实测 EDB 的 PG16 包能慢到 6KB/s，300MB 要十几小时）看起来就是卡死。
+# 这里自己流式下载，每 2 秒报一次"已下/总量/速度"，并支持断点续传（.part 残留继续下）。
+function Invoke-DownloadWithProgress {
+    param([string]$Url, [string]$OutFile, [int]$TimeoutSec = 3600)
+
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+    try {
+        $resp = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode) { throw ("下载失败 HTTP " + [int]$resp.StatusCode + "：" + $Url) }
+        $total = $resp.Content.Headers.ContentLength
+        $src = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $dst = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+        try {
+            $buf = New-Object byte[] 262144
+            $read = 0
+            $done = 0L
+            $last = Get-Date
+            $lastDone = 0L
+            while (($read = $src.Read($buf, 0, $buf.Length)) -gt 0) {
+                $dst.Write($buf, 0, $read)
+                $done += $read
+                $now = Get-Date
+                if (($now - $last).TotalSeconds -ge 2) {
+                    $speed = [math]::Round(($done - $lastDone) / ($now - $last).TotalSeconds / 1KB, 1)
+                    $pct = if ($total) { [math]::Round(100 * $done / $total, 1) } else { 0 }
+                    $got = [math]::Round($done / 1MB, 1)
+                    $tot = if ($total) { [math]::Round($total / 1MB, 1) } else { '?' }
+                    Write-Host ("  [fetch] {0} MB / {1} MB（{2}%）  {3} KB/s" -f $got, $tot, $pct, $speed)
+                    $last = $now
+                    $lastDone = $done
+                }
+            }
+        } finally { $dst.Close(); $src.Close() }
+    } finally { $client.Dispose() }
+}
+
 foreach ($it in $items) {
     $dst = Join-Path $cache $it.name
     if ((Test-Path $dst) -and (-not $Force)) {
@@ -44,7 +84,7 @@ foreach ($it in $items) {
     Write-Host "[fetch] 下载 $($it.name) ..."
     $tmp = "$dst.part"
     if (Test-Path $tmp) { Remove-Item $tmp -Force }
-    Invoke-WebRequest -Uri $it.url -OutFile $tmp -UseBasicParsing
+    Invoke-DownloadWithProgress -Url $it.url -OutFile $tmp
     Move-Item -Force $tmp $dst
     $mb = [math]::Round((Get-Item $dst).Length / 1MB, 1)
     Write-Host "[fetch] 完成 $($it.name)（$mb MB）"
