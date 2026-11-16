@@ -1,46 +1,58 @@
 ﻿<#
 .SYNOPSIS
-BlockMemoryAgent 桌面版打包 / 安装 / 更新工具。
+BlockMemoryAgent 桌面版：**装 / 更新 / 回退** 一条脚本搞定。
 
 .DESCRIPTION
 把仓库打成"版本化 + 可回滚"的桌面应用包，并安装或更新到目标目录。
+
+日常只有三个动作（都在这一个脚本里）：
+  pwsh -File .\bma-app.ps1 install  -Target <安装目录>   # 装 / 更新（不带 -From 就地构建）
+  pwsh -File .\bma-app.ps1 rollback -Target <安装目录>   # 回退到上一版
+  pwsh -File .\bma-app.ps1 status   -Target <安装目录>   # 看版本 / 运行态 / 健康
+
+分发给别人装（产出自包含安装包，目标机零外部依赖）：
+  pwsh -File .\bma-app.ps1 dist                          # = 打包 + 编译 Inno 安装包
+  pwsh -File .\bma-app.ps1 publish -BaseUrl <地址>        # 自动更新清单（latest.json）
 
 安装目录布局（-Target，默认 %LOCALAPPDATA%\Programs\BlockMemoryAgent）：
   app\versions\<版本>\...    程序（bin + web\dist + 配置模板 + 启动器），不可变
   app\current.json           版本指针（含 previous，用于回滚）
   app\runtime.json           运行态（pid/版本/端口，启动器写入）
   app\launch.ps1             启动器（随包更新）
+  runtime\                   自带运行时（PG+pgvector / Redis / Node / 媒体桥 / Chromium）
   docker\                    依赖编排（compose + 媒体构建上下文），程序载荷，随版本覆盖
   BMA.cmd / BMA.vbs          桌面入口（快捷方式指向 BMA.vbs）
   config\  .env  plugins.d\  workspace\  logs\    ← 用户数据：只补缺，永不覆盖
 
 仓库 → 安装目录的数据隔离：
-  * 打包只取"程序 + 配置模板"，绝不包含 .env / config\models.json /
+  * 打包只取"程序 + 配置模板 + 自带运行时"，绝不包含 .env / config\models.json /
     config\user_profile.md / config\skills_learned / workspace / logs
     （这些是仓库本地的密钥与运行时状态）；
   * 安装/更新只对缺失的用户数据文件做种子拷贝，既有文件一律不动；
   * 拒绝安装到源码仓库目录（含 .git / go.work）。
 
 .PARAMETER Command
-  pack      构建并打包（默认输出 dist\app\bma-<版本>\ 与 dist\bma-app-<版本>.zip）
-  install   安装到目标目录（首次），等同 update
-  update    更新到目标目录（保留用户数据，健康门禁，失败自动回滚）
-  start     启动当前版本（经 app\launch.ps1）
-  stop      停止该安装目录下的后端进程
-  restart   先停后起
-  status    打印当前版本 / 运行态 / 健康检查（-Json 输出机器可读）
+  install   装 / 更新到目标目录（不给 -From 就地构建；给 -From 装现成的包/目录/安装包 exe）
+  update    install 的别名
+  deploy    install 的别名（旧名保留）
   rollback  切回上一版本并重启
+  status    打印当前版本 / 运行态 / 健康检查（-Json 输出机器可读）
+  dist      打包 + 编译 Inno 安装包（dist\installer\BlockMemoryAgent-Setup-<版本>.exe）
+  pack      只打包（不进安装包）
+  start / stop / restart   起停当前版本
   media     应用媒体生成配置（重建桥镜像 + open_design/minimax-media 容器，换 keeper）
+  migrate-data  把别处的数据搬进自带实例
+  publish   生成自动更新清单（latest.json）
 
 .EXAMPLE
-  .\bma-app.ps1 pack
-  .\bma-app.ps1 install -Target D:\WebApp\BMA-Desktop
-  .\bma-app.ps1 update -Target D:\WebApp\BMA-Desktop
-  .\bma-app.ps1 status -Target D:\WebApp\BMA-Desktop -Json
+  pwsh -File .\bma-app.ps1 install  -Target D:\WebApp\BMA-Install
+  pwsh -File .\bma-app.ps1 rollback -Target D:\WebApp\BMA-Install
+  pwsh -File .\bma-app.ps1 dist
+  pwsh -File .\bma-app.ps1 install -From .\dist\installer\BlockMemoryAgent-Setup-xxx.exe -Target D:\WebApp\BMA-Install
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('pack', 'install', 'update', 'deploy', 'start', 'stop', 'restart', 'status', 'rollback', 'media', 'migrate-data', 'publish')]
+    [ValidateSet('pack', 'install', 'update', 'deploy', 'dist', 'start', 'stop', 'restart', 'status', 'rollback', 'media', 'migrate-data', 'publish')]
     [string]$Command = 'status',
 
     # 安装目录（install/update/start/stop/restart/status/rollback）
@@ -74,6 +86,7 @@ param(
     [switch]$Test,        # pack：额外跑 go test ./...
     [switch]$NoZip,       # pack：不生成 zip
     [switch]$NoRuntime,   # pack：不带自带运行时（PG/Redis），只出程序包
+    [switch]$NoFetch,     # pack：不自动下载运行时源包（缺了就报错）
     [switch]$NoRestart,   # install/update：装完不重启
     [switch]$NoShortcut,  # install/update/deploy：不建快捷方式
     [switch]$NoShell,     # install/update/deploy：不重启桌面外壳（默认会重启并保留"托盘常驻"体验）
@@ -181,6 +194,27 @@ function Get-Health([string]$Root) {
 # dist\runtime-cache\prepared\，重复打包直接复用。
 
 function Get-RuntimeCache([string]$Repo) { return (Join-Path $Repo 'dist\runtime-cache') }
+
+# Ensure-RuntimeSources 确保运行时源包（PG16 / pgvector / Redis）已就位；缺则自动下载一次。
+#
+# 为什么自动下载：这些 zip 是第三方再分发物，不进 git，全新机器上必然没有。
+# 用户的目标是"一条命令装好"——缺了就补，而不是让人先去跑另一个脚本再回来。
+# 需要离线/离线包时用 -NoFetch 跳过（此时缺源包会明确报错）。
+function Ensure-RuntimeSources([string]$Repo, [switch]$NoFetch) {
+    if (Test-RuntimeAvailable $Repo) { return $true }
+    if ($NoFetch) { return $false }
+    $fetch = Join-Path $Repo 'installer\fetch-runtime.ps1'
+    if (-not (Test-Path $fetch)) { return $false }
+    Write-Log '[runtime] 缺少运行时源包，自动下载（一次性，约 300MB）...'
+    try {
+        & pwsh -NoProfile -ExecutionPolicy Bypass -File $fetch
+        if ($LASTEXITCODE -ne 0) { throw "fetch-runtime.ps1 退出码 $LASTEXITCODE" }
+    } catch {
+        Write-Log ('[runtime] warn: 自动下载失败：' + $_.Exception.Message)
+        return $false
+    }
+    return (Test-RuntimeAvailable $Repo)
+}
 
 function Test-RuntimeAvailable([string]$Repo) {
     $cache = Get-RuntimeCache $Repo
@@ -509,7 +543,7 @@ function Convert-PluginsToNative([string]$Path) {
 }
 
 function Invoke-Pack {
-    param([string]$Version, [switch]$SkipWeb, [switch]$Test, [switch]$NoZip, [switch]$NoRuntime)
+    param([string]$Version, [switch]$SkipWeb, [switch]$Test, [switch]$NoZip, [switch]$NoRuntime, [switch]$NoFetch)
 
     $repo = $PSScriptRoot
     $commit = Get-GitCommit $repo
@@ -627,14 +661,14 @@ function Invoke-Pack {
     # 缺源包时**直接报错**（除非显式 -NoRuntime）：不带运行时的包装出来跑不起来
     # （后端严格启动，连不上 PG/Redis 就退出）——早失败好过装完才发现。
     if (-not $NoRuntime) {
-        if (Test-RuntimeAvailable $repo) {
-            Write-Log '[pack] 准备自带运行时载荷 ...'
-            Build-RuntimePayload -Repo $repo -OutDir (Join-Path $stage 'runtime')
-        } else {
+        # 源包缺失时自动下载一次（全新机器的常规路径），失败再报错。
+        if (-not (Ensure-RuntimeSources -Repo $repo -NoFetch:$NoFetch)) {
             throw ("缺少运行时源包（" + (Get-RuntimeCache $repo) + " 下需要 pg16.zip / pgvector-pg16.zip / redis-win.zip）。" +
                    "先跑： pwsh -File .\installer\fetch-runtime.ps1（下载 PG16 + pgvector + Redis + WebView2 引导程序）；" +
                    "若确实只要纯程序包（开发机用），显式加 -NoRuntime。")
         }
+        Write-Log '[pack] 准备自带运行时载荷 ...'
+        Build-RuntimePayload -Repo $repo -OutDir (Join-Path $stage 'runtime')
     }
 
     # 禁运清单：仓库运行时数据与密钥，任何情况下都不许进包
@@ -1167,14 +1201,83 @@ function Invoke-Install {
 
 # deploy = pack + update：一条命令完成"构建 → 切版本 → 重启后端 → 重启桌面外壳"。
 function Invoke-Deploy {
-    param([string]$Target, [string]$Version, [int]$Keep, [int]$TimeoutSec, [string]$HttpAddr, [switch]$SkipWeb, [switch]$Test, [switch]$NoShortcut, [switch]$NoShell)
+    param([string]$Target, [string]$Version, [int]$Keep, [int]$TimeoutSec, [string]$HttpAddr, [switch]$SkipWeb, [switch]$Test, [switch]$NoShortcut, [switch]$NoShell, [switch]$NoRuntime, [switch]$NoFetch)
     Write-Log '[deploy] 1/2 打包 ...'
-    $packed = Invoke-Pack -Version $Version -SkipWeb:$SkipWeb -Test:$Test
+    $packed = Invoke-Pack -Version $Version -SkipWeb:$SkipWeb -Test:$Test -NoRuntime:$NoRuntime -NoFetch:$NoFetch
     Write-Log ('[deploy] 2/2 安装 ' + $packed.version + ' ...')
     $res = Invoke-Install -Target $Target -From $packed.package -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -NoShortcut:$NoShortcut -NoShell:$NoShell
     $res.command = 'deploy'
     $res.build = [ordered]@{ version = $packed.version; commit = $packed.commit; prompt_version = $packed.prompt_version }
     return $res
+}
+
+# Invoke-InstallOrBuild 统一的"装 / 更新"入口——用户只需要记住这一个动词：
+#   * 不给 -From：就地构建（pack）再装（= deploy）。全新机器与开发机日常更新都走这条；
+#     缺运行时源包时自动下载一次（Ensure-RuntimeSources）。
+#   * -From 目录/zip：装现成的包（dist\app\bma-<版本> 或 dist\bma-app-<版本>.zip）。
+#   * -From *.exe：跑现成的 Inno 安装包（静默），装完起服务并校验健康。
+function Invoke-InstallOrBuild {
+    param([string]$Target, [string]$From, [string]$Version, [int]$Keep, [int]$TimeoutSec, [string]$HttpAddr,
+        [switch]$SkipWeb, [switch]$Test, [switch]$NoRestart, [switch]$NoShortcut, [switch]$NoShell,
+        [switch]$NoRuntime, [switch]$NoFetch)
+
+    if ([string]::IsNullOrWhiteSpace($From)) {
+        return Invoke-Deploy -Target $Target -Version $Version -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr `
+            -SkipWeb:$SkipWeb -Test:$Test -NoShortcut:$NoShortcut -NoShell:$NoShell -NoRuntime:$NoRuntime -NoFetch:$NoFetch
+    }
+    if ($From.ToLower().EndsWith('.exe')) {
+        return Invoke-InstallFromSetup -SetupExe $From -Target $Target -TimeoutSec $TimeoutSec -NoRestart:$NoRestart -NoShortcut:$NoShortcut
+    }
+    $res = Invoke-Install -Target $Target -From $From -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr `
+        -NoRestart:$NoRestart -NoShortcut:$NoShortcut -NoShell:$NoShell
+    $res.command = 'install'
+    return $res
+}
+
+# Invoke-InstallFromSetup 跑现成的 Inno 安装包（-From *.exe）。
+#
+# 注意：/VERYSILENT 等开关必须原样传给安装器——在 Git Bash 里直接写会被 MSYS
+# 当成路径转换（变成 C:/Program Files/Git/VERYSILENT），安装器于是弹向导卡住。
+# 用 Start-Process 传参就没有这个问题。
+function Invoke-InstallFromSetup {
+    param([string]$SetupExe, [string]$Target, [int]$TimeoutSec, [switch]$NoRestart, [switch]$NoShortcut)
+
+    $exe = [System.IO.Path]::GetFullPath($SetupExe)
+    if (-not (Test-Path $exe)) { throw "找不到安装包：$exe" }
+    if ([string]::IsNullOrWhiteSpace($Target)) { $Target = Join-Path $env:LOCALAPPDATA 'Programs\BlockMemoryAgent' }
+    $Target = [System.IO.Path]::GetFullPath($Target)
+    Write-Log ("[install] 运行安装包 → " + $Target)
+    $args = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$Target")
+    $p = Start-Process -FilePath $exe -ArgumentList $args -PassThru -Wait
+    if ($p.ExitCode -ne 0) { throw ("安装包执行失败（退出码 " + $p.ExitCode + "）") }
+
+    $cur = Read-JsonFile (Join-Path $Target 'app\current.json')
+    $expect = ''
+    if ($cur) { $expect = $cur.version }
+    $health = $null
+    if (-not $NoRestart) {
+        # 静默安装不会自动启动应用（安装包的 [Run] 在静默模式下跳过）→ 这里起并校验。
+        $health = Start-And-Wait -Root $Target -TimeoutSec $TimeoutSec -ExpectVersion $expect
+        if (-not $health) { throw ("安装完成但后端未就绪（见 " + (Join-Path $Target 'logs') + "）") }
+    }
+    return [ordered]@{ ok = $true; command = 'install'; target = $Target; version = $expect; health = $health; setup = $exe }
+}
+
+# Invoke-Dist 打包 + 编译 Inno 安装包（一条命令产出可分发的自包含安装包）。
+function Invoke-Dist {
+    param([string]$Version, [switch]$SkipWeb, [switch]$Test, [switch]$NoRuntime, [switch]$NoFetch)
+
+    $packed = Invoke-Pack -Version $Version -SkipWeb:$SkipWeb -Test:$Test -NoRuntime:$NoRuntime -NoFetch:$NoFetch
+    $builder = Join-Path $PSScriptRoot 'installer\build-installer.ps1'
+    if (-not (Test-Path $builder)) { throw '缺少 installer\build-installer.ps1' }
+    Write-Log '[dist] 编译安装包（要几分钟，压缩 600MB 运行时）...'
+    & pwsh -NoProfile -ExecutionPolicy Bypass -File $builder -Version $packed.version
+    if ($LASTEXITCODE -ne 0) { throw ("安装包编译失败（退出码 " + $LASTEXITCODE + "）") }
+    $setup = Join-Path $PSScriptRoot ('dist\installer\BlockMemoryAgent-Setup-' + $packed.version + '.exe')
+    if (-not (Test-Path $setup)) { throw "未产出安装包：$setup" }
+    $mb = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+    Write-Host ("安装包: " + $setup + "（" + $mb + " MB）")
+    return [ordered]@{ ok = $true; command = 'dist'; version = $packed.version; setup = $setup; size_mb = $mb }
 }
 
 # ---------------- migrate-data ----------------
@@ -1354,10 +1457,17 @@ function Invoke-Rollback {
     $curPath = Join-Path $Target 'app\current.json'
     $cur = Read-JsonFile $curPath
     if (-not $cur) { throw "未安装（缺少 $curPath）" }
-    if ([string]::IsNullOrWhiteSpace($cur.previous)) { throw '没有可回滚的上一版本' }
+    if ([string]::IsNullOrWhiteSpace($cur.previous)) {
+        throw ('没有可回滚的上一版本（指针 app\current.json 的 previous 为空）。' +
+               '若是安装包装的，回退办法是：用旧版安装包覆盖安装 —— bma-app.ps1 install -From <旧 setup.exe> -Target ' + $Target)
+    }
     $prev = $cur.previous
-    if (-not (Test-Path (Join-Path $Target ('app\versions\' + $prev)))) { throw "上一版本 $prev 已不存在（可能已被清理）" }
+    if (-not (Test-Path (Join-Path $Target ('app\versions\' + $prev)))) {
+        throw ("上一版本 $prev 的程序目录已不存在（可能已被清理）——" +
+               "用旧版安装包覆盖安装即可回退： bma-app.ps1 install -From <旧 setup.exe> -Target " + $Target)
+    }
 
+    Stop-DesktopShell $Target | Out-Null
     Stop-BmaServer $Target | Out-Null
     Write-JsonFile $curPath ([ordered]@{
             version      = $prev
@@ -1366,7 +1476,8 @@ function Invoke-Rollback {
             package      = 'rollback'
         })
     $h = Start-And-Wait -Root $Target -TimeoutSec $TimeoutSec -ExpectVersion $prev
-    if (-not $h) { throw "回滚到 $prev 后健康检查失败" }
+    if (-not $h) { throw "回滚到 $prev 后健康检查失败（见 $Target\logs）" }
+    Write-Host ("已回退到: " + $prev)
     return [ordered]@{ ok = $true; command = 'rollback'; target = $Target; version = $prev; previous = $cur.version; health = $h }
 }
 
@@ -1375,10 +1486,11 @@ function Invoke-Rollback {
 $result = $null
 try {
     switch ($Command) {
-        'pack' { $result = Invoke-Pack -Version $Version -SkipWeb:$SkipWeb -Test:$Test -NoZip:$NoZip -NoRuntime:$NoRuntime }
-        'install' { $result = Invoke-Install -Target $Target -From $From -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -NoRestart:$NoRestart -NoShortcut:$NoShortcut -NoShell:$NoShell }
-        'update' { $result = Invoke-Install -Target $Target -From $From -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -NoRestart:$NoRestart -NoShortcut:$NoShortcut -NoShell:$NoShell }
-        'deploy' { $result = Invoke-Deploy -Target $Target -Version $Version -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -SkipWeb:$SkipWeb -Test:$Test -NoShortcut:$NoShortcut -NoShell:$NoShell }
+        'pack' { $result = Invoke-Pack -Version $Version -SkipWeb:$SkipWeb -Test:$Test -NoZip:$NoZip -NoRuntime:$NoRuntime -NoFetch:$NoFetch }
+        'install' { $result = Invoke-InstallOrBuild -Target $Target -From $From -Version $Version -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -SkipWeb:$SkipWeb -Test:$Test -NoRestart:$NoRestart -NoShortcut:$NoShortcut -NoShell:$NoShell -NoRuntime:$NoRuntime -NoFetch:$NoFetch }
+        'update' { $result = Invoke-InstallOrBuild -Target $Target -From $From -Version $Version -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -SkipWeb:$SkipWeb -Test:$Test -NoRestart:$NoRestart -NoShortcut:$NoShortcut -NoShell:$NoShell -NoRuntime:$NoRuntime -NoFetch:$NoFetch }
+        'deploy' { $result = Invoke-InstallOrBuild -Target $Target -From $From -Version $Version -Keep $Keep -TimeoutSec $TimeoutSec -HttpAddr $HttpAddr -SkipWeb:$SkipWeb -Test:$Test -NoRestart:$NoRestart -NoShortcut:$NoShortcut -NoShell:$NoShell -NoRuntime:$NoRuntime -NoFetch:$NoFetch }
+        'dist' { $result = Invoke-Dist -Version $Version -SkipWeb:$SkipWeb -Test:$Test -NoRuntime:$NoRuntime -NoFetch:$NoFetch }
         'start' { $result = Invoke-Start -Target $Target -TimeoutSec $TimeoutSec }
         'stop' { $result = Invoke-Stop -Target $Target }
         'restart' {

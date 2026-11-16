@@ -46,15 +46,24 @@ See `Makefile` (`make help` lists all targets). Key targets: `make run` (build w
 
 ### 打包工具（bma-app.ps1）
 
-`bma-app.ps1`（仓库根，UTF-8 BOM）把仓库打成"版本化 + 可回滚"的桌面应用包，**只带程序与配置模板，绝不带仓库本地运行时数据**。
+`bma-app.ps1`（仓库根，UTF-8 BOM）把仓库打成"版本化 + 可回滚"的桌面应用包，**只带程序、配置模板与自带运行时，绝不带仓库本地运行时数据**。
 
-- `.\bma-app.ps1 pack [-Version v] [-SkipWeb] [-Test] [-NoZip]` → `dist/app/bma-<版本>/`（bin / web\dist / config-templates / launcher / **docker** / VERSION.json / MANIFEST.sha256）+ `dist/bma-app-<版本>.zip`；ldflags 注入 `internal/buildinfo`（Version/Commit/BuiltAt）。
-- **日常更新一条命令**：`.\bma-app.ps1 deploy -Target <安装目录> [-SkipWeb] [-Keep 3]` = pack + update，自动完成"构建 → 切版本 → 重启后端 → 校验 `build.version`（失败回滚）→ **重启原本开着的桌面外壳**（`-NoShell` 跳过）"。实测全流程约 28s（`-SkipWeb` 时）。
-- `install|update -Target <dir> [-From 包|zip] [-Keep 3] [-HttpAddr host:port] [-NoRestart] [-NoShortcut] [-NoShell] [-Json]`：布局 = `app\versions\<ver>\`（不可变，程序）+ `app\current.json`（版本指针，含 previous）+ 根目录用户数据 `config\ .env plugins.d\ workspace\ logs\`。配置**只补缺、不覆盖**；**运行时按 `.payload-id` 指纹复用**（没变不重拷 300MB）；重启前先关掉该目录下已运行的 `BMA-Desktop.exe`，重启后核对 `/api/health` 的 `build.version`，失败自动回滚上一版；拒绝安装到含 `.git`/`go.work` 的源码目录。
-- `publish -BaseUrl <地址> [-Notes <说明>]`：生成自动更新清单 `dist\installer\latest.json`（version/url/sha256/notes）；把安装包与该 JSON 传到该地址，再在安装目录 `.env` 写 `BMA_UPDATE_URL=<地址>/latest.json` 即启用自动更新。
-- `start|stop|restart|status|rollback [-Target <dir>] [-Json]`：`status -Json` 给外部调用方机器可读状态（installed/runtime/running/http/health/versions）。
-- `media -Target <dir>`：应用媒体生成配置（对齐 `docker/bma-plugin.sh media`）——重建 `bma/open-design-mcp:local` 镜像 → `compose up -d --build minimax-media` → 重建 `open_design` 容器（entrypoint 重写 `media-config.json`）→ 换 `ui_design` keeper。唯一手改点 = `<安装目录>\.env` 媒体段。
+**日常只有三个动作（装 / 更新 / 回退都在这一个脚本里）**：
+
+- `.\bma-app.ps1 install -Target <安装目录> [-SkipWeb]` —— **装 / 更新一条命令**（不传 `-From` 就地构建再装）。自动完成"构建 → 切版本目录 → 铺运行时（按 `.payload-id` 指纹，没变不重拷 600MB）→ 只补缺用户数据 → 改版本指针 → 清旧版本 → 起后端 → 校验 `/api/health` 的 `build.version`（失败自动回滚上一版）→ 重启原本开着的桌面外壳（`-NoShell` 跳过）"。**新机器上首次跑会自动下载运行时源包**（PG16/pgvector/Redis，约 300MB，`-NoFetch` 可关）。
+- `.\bma-app.ps1 install -From <包>` —— 装现成的：目录 / zip / **Inno 安装包 exe**（exe 走静默 `/VERYSILENT /DIR=<目标>`，装完起服务并校验健康）。
+- `.\bma-app.ps1 rollback -Target <安装目录>` —— 回退到上一版（切版本指针 + 重启；指针的 previous 与新版本互换，可再前进）。
+- `.\bma-app.ps1 status -Target <安装目录> [-Json]` —— 版本 / 运行态 / 健康（`-Json` 给外部调用方机器可读）。
+
+**分发（给别人装）**：
+
+- `.\bma-app.ps1 dist [-SkipWeb]` —— 打包 + 编译 Inno 安装包 → `dist\installer\BlockMemoryAgent-Setup-<版本>.exe`（约 195MB，自包含）。目标机双击即装，零外部依赖。
+- `.\bma-app.ps1 publish -BaseUrl <地址> [-Notes <说明>]` —— 生成自动更新清单 `dist\installer\latest.json`（version/url/sha256/notes）；把安装包与该 JSON 传到该地址，再在安装目录 `.env` 写 `BMA_UPDATE_URL=<地址>/latest.json` 即启用自动更新。
+
+**进阶（少用）**：`pack`（只打包）、`start|stop|restart`、`media -Target <dir>`（切回容器媒体栈，需 Docker）、`migrate-data`（搬数据）。
+
 - **禁运清单**（打包硬剔除 + 拒绝安装侧污染）：`config/models.json`、`config/user_profile.md`、`config/skills_learned/`、`.env`、`workspace/`、`logs/`、`plugins.installed.yaml`；包内文本命中疑似真实 key 直接拒包。
+- **用户数据只补缺不覆盖**：`.env` / `config\*` / `workspace` / `logs` 在安装与升级中一律不动；唯一例外是 `config\plugins.yaml`——随包版本被改写过（容器→本地 stdio），"用户没改过"（与 `plugins.yaml.packaged` 逐字节一致）才随版本更新，改过就保留并告警。
 - 启动器 `tools/app/{launch.ps1,BMA.cmd,BMA.vbs}`：读指针 → 健康检查单实例 → **自举依赖（`BMA-Desktop.exe --ensure-deps`，见下）** → 生成 `app\run.cmd`（设 BMA_HOME + 日志重定向）→ **ShellExecute 拉起**（不能用 `-NoNewWindow`：子进程会继承调用方 stdout 管道，`& powershell -File launch.ps1` 永不返回）→ 等健康 → 写 `app/runtime.json` → 开浏览器。
 - **桌面外壳 `BMA-Desktop.exe`**（`backend/cmd/desktop`，go-webview2 + 系统 WebView2 Runtime，CGO 关闭可编、`-H=windowsgui` 无控制台）：安装到安装目录根、快捷方式指向它。行为 = 读版本指针/端口 → 健康检查 → 必要时拉起后端 → **原生 WebView2 窗口**渲染 UI（不再落到浏览器）；WebView2 缺失才退回 Edge/Chrome 的 `--app` 无边框窗口。
 - **依赖自举（2026-11-14，`backend/cmd/desktop/deps.go`）**：后端严格启动，PG/Redis 连不上直接退；所以外壳在起后端前负责把依赖拉起来——探测（真实驱动 ping，能区分「库没起」与「账号/库名不对」）→ 引擎不可用则拉起 Docker Desktop 并等就绪 → `compose up -d postgres redis` → 等就绪。包内自带 `docker/docker-compose.yml` 与 4 个媒体构建上下文（**与开发实例同项目同卷**：数据不丢、端口不冲突）。失败给可读原因+建议，错误页带「重试」按钮；后端早退立即判失败并显示日志尾（旧版闷等 90 秒）。媒体栈（open_design/minimax-media/插件镜像）**后台**准备，失败只落 `logs\media_setup_*.log`。`--ensure-deps [--deps-out f.json]` 为 CLI 模式，供 launch.ps1 与外部调用方复用（结果写 `app\deps.json`）。
