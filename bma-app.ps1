@@ -87,6 +87,9 @@ param(
     [switch]$NoZip,       # pack：不生成 zip
     [switch]$NoRuntime,   # pack：不带自带运行时（PG/Redis），只出程序包
     [switch]$NoFetch,     # pack：不自动下载运行时源包（缺了就报错）
+    # 代理（http://127.0.0.1:7890 这类 clash 端口）。设置后 npm / playwright / go /
+    # 运行时源包下载**全部**走它（子进程继承环境变量）。
+    [string]$Proxy,
     [switch]$NoRestart,   # install/update：装完不重启
     [switch]$NoShortcut,  # install/update/deploy：不建快捷方式
     [switch]$NoShell,     # install/update/deploy：不重启桌面外壳（默认会重启并保留"托盘常驻"体验）
@@ -1502,6 +1505,17 @@ function Invoke-Rollback {
 }
 
 # ---------------- dispatch ----------------
+
+# 代理：设进环境变量，子进程（npm / playwright / go / fetch-runtime）全部继承。
+# .NET 的 HttpClient 不认 HTTPS_PROXY（那是 curl/npm 的约定），fetch-runtime.ps1
+# 里显式把它转成 WebProxy——两处都要有才都能走代理。
+if (-not [string]::IsNullOrWhiteSpace($Proxy)) {
+    $env:HTTPS_PROXY = $Proxy
+    $env:HTTP_PROXY = $Proxy
+    $env:https_proxy = $Proxy
+    $env:http_proxy = $Proxy
+    Write-Log ('[proxy] 使用代理 ' + $Proxy + '（npm / playwright / go / 运行时源包下载都会走它）')
+}
 
 $result = $null
 try {
