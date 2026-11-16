@@ -37,6 +37,7 @@ BlockMemoryAgent 桌面版：**装 / 更新 / 回退** 一条脚本搞定。
   deploy    install 的别名（旧名保留）
   rollback  切回上一版本并重启
   status    打印当前版本 / 运行态 / 健康检查（-Json 输出机器可读）
+  shortcuts 重建桌面 + 开始菜单快捷方式（装完发现没图标，或快捷方式被误删时用）
   dist      打包 + 编译 Inno 安装包（dist\installer\BlockMemoryAgent-Setup-<版本>.exe）
   pack      只打包（不进安装包）
   start / stop / restart   起停当前版本
@@ -52,7 +53,7 @@ BlockMemoryAgent 桌面版：**装 / 更新 / 回退** 一条脚本搞定。
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('pack', 'install', 'update', 'deploy', 'dist', 'start', 'stop', 'restart', 'status', 'rollback', 'media', 'migrate-data', 'publish')]
+    [ValidateSet('pack', 'install', 'update', 'deploy', 'dist', 'start', 'stop', 'restart', 'status', 'rollback', 'media', 'migrate-data', 'publish', 'shortcuts')]
     [string]$Command = 'status',
 
     # 安装目录（install/update/start/stop/restart/status/rollback）
@@ -1119,6 +1120,76 @@ function Remove-OldVersions {
     return $removed
 }
 
+# Get-DesktopDirs 返回**候选**桌面目录（按可信度排序，去重、只留真实存在的）。
+#
+# 为什么不能只信 `[Environment]::GetFolderPath('Desktop')`（2026-11-16 实战：用户装了
+# 却"桌面没图标"）：那玩意返回的是当前**进程账号**的桌面。典型翻车场景：
+#   * 桌面被 OneDrive 接走 → 现桌面是 `%USERPROFILE%\OneDrive\Desktop`，而旧的
+#     `%USERPROFILE%\Desktop` 目录仍然存在（甚至就是 API 返回的那个）→ 快捷方式
+#     落进没人看的空壳目录；
+#   * 用管理员/服务账号跑安装，跟自己平时登录的账号不是同一个，或
+#     `$env:USERPROFILE` 与登录用户不一致。
+# 所以：注册表 `User Shell Folders` 的 Desktop 是第一权威（就是 explorer 实际用的），
+# 其次 .NET API，再次 USERPROFILE / OneDrive 探测，最后附上其它真实用户的桌面。
+function Get-DesktopDirs {
+    $cands = New-Object System.Collections.Generic.List[string]
+    $add = {
+        param($p)
+        if ([string]::IsNullOrWhiteSpace($p)) { return }
+        # 展开 REG_EXPAND_SZ 里可能残留的 %USERPROFILE%
+        try { $p = [Environment]::ExpandEnvironmentVariables($p) } catch { }
+        if (-not [System.IO.Path]::IsPathRooted($p)) { return }
+        if (-not (Test-Path -LiteralPath $p -PathType Container)) { return }
+        if (-not $cands.Contains($p)) { $cands.Add($p) }
+    }
+    foreach ($regKey in @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders',
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders')) {
+        try {
+            $v = (Get-ItemProperty -Path $regKey -Name 'Desktop' -ErrorAction Stop).Desktop
+            & $add $v
+        } catch { }
+    }
+    try { & $add ([Environment]::GetFolderPath('Desktop')) } catch { }
+    try { & $add ([Environment]::GetFolderPath('DesktopDirectory')) } catch { }
+    if ($env:USERPROFILE) { & $add (Join-Path $env:USERPROFILE 'Desktop') }
+    if ($env:OneDrive) { & $add (Join-Path $env:OneDrive 'Desktop') }
+    # 多账号机器：把其它真实用户的桌面也附上（装给谁就跑在谁桌面，宁可多建一个）。
+    $usersRoot = Split-Path $env:USERPROFILE -Parent
+    if ($usersRoot -and (Test-Path $usersRoot)) {
+        Get-ChildItem $usersRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notin @('Public', 'Default', 'Default User', 'All Users') } |
+            ForEach-Object {
+                & $add (Join-Path $_.FullName 'Desktop')
+                & $add (Join-Path $_.FullName 'OneDrive\Desktop')
+            }
+    }
+    return $cands
+}
+
+# Get-StartMenuDirs 返回开始菜单目录（始终有入口，不依赖桌面重定向是否猜对）。
+function Get-StartMenuDirs {
+    $cands = New-Object System.Collections.Generic.List[string]
+    $add = {
+        param($p)
+        if ([string]::IsNullOrWhiteSpace($p)) { return }
+        try { $p = [Environment]::ExpandEnvironmentVariables($p) } catch { }
+        if (-not [System.IO.Path]::IsPathRooted($p)) { return }
+        if (-not $cands.Contains($p)) { $cands.Add($p) }
+    }
+    try { & $add ([Environment]::GetFolderPath('Programs')) } catch { }
+    if ($env:APPDATA) { & $add (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs') }
+    if ($env:ProgramData) { & $add (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs') }
+    return $cands
+}
+
+# New-AppShortcuts 建桌面 + 开始菜单入口，并**校验落盘**后才报成功。
+#
+# 原来的坑：只往 `GetFolderPath('Desktop')` 写一个，写完不检查就打印"已创建快捷方式"，
+# 桌面被 OneDrive 重定向时用户根本看不到（Powershell 也不报错）。现改为：
+#   * 桌面 → 所有候选目录都建（顶级 "BlockMemoryAgent.lnk"）；
+#   * 开始菜单 → 建 "BlockMemoryAgent" 文件夹 + 卸载项，搜索/开始菜单里总能找到；
+#   * 每个 .lnk 落盘后 Test-Path 复核，日志里分开报"已建/失败"。
 function New-AppShortcuts {
     param([string]$Root, [string]$Version)
     # 优先指向桌面外壳（原生窗口 + 自带图标）；外壳缺失时退回 VBS 脚本启动器。
@@ -1127,27 +1198,75 @@ function New-AppShortcuts {
     $target = $null
     if (Test-Path $desktopExe) { $target = $desktopExe }
     elseif (Test-Path $vbs) { $target = $vbs }
-    if (-not $target) { return }
+    if (-not $target) {
+        Write-Log ("[install] warn: 找不到 BMA-Desktop.exe / BMA.vbs，跳过快捷方式（$Root）")
+        return
+    }
 
     $icon = Join-Path $Root 'app\icon.ico'
     if (-not (Test-Path $icon)) { $icon = Join-Path $Root ('app\versions\' + $Version + '\bin\bma-server.exe') }
+
+    $made = New-Object System.Collections.Generic.List[string]
+    $failed = New-Object System.Collections.Generic.List[string]
     try {
         $ws = New-Object -ComObject WScript.Shell
-        $targets = @($Root)
-        $desktop = [Environment]::GetFolderPath('Desktop')
-        if ($desktop) { $targets += $desktop }
-        foreach ($dir in $targets) {
-            $lnkPath = Join-Path $dir 'BlockMemoryAgent.lnk'
+        # 同一个 lnk 的公共属性抽出来，避免三处重复
+        $makeLnk = {
+            param($lnkPath)
             $lnk = $ws.CreateShortcut($lnkPath)
             $lnk.TargetPath = $target
             $lnk.WorkingDirectory = $Root
-            $lnk.IconLocation = ($icon + ',0')
+            if (Test-Path $icon) { $lnk.IconLocation = ($icon + ',0') }
             $lnk.Description = 'BlockMemoryAgent'
             $lnk.Save()
+            return (Test-Path -LiteralPath $lnkPath)
         }
-        Write-Log "[install] 已创建快捷方式（$($targets -join ', ')）→ $target"
+
+        # 1) 桌面：所有候选目录都放一份（多账号/OneDrive 重定向时总有一个是对的）
+        foreach ($dir in (Get-DesktopDirs)) {
+            $lnkPath = Join-Path $dir 'BlockMemoryAgent.lnk'
+            try {
+                if (& $makeLnk $lnkPath) { $made.Add($lnkPath) } else { $failed.Add($lnkPath) }
+            } catch { $failed.Add($lnkPath + ' (' + $_.Exception.Message + ')') }
+        }
+
+        # 2) 开始菜单：文件夹里放程序 + 卸载（开始菜单搜索/所有应用里必能找到）
+        foreach ($dir in (Get-StartMenuDirs)) {
+            $folder = Join-Path $dir 'BlockMemoryAgent'
+            try {
+                New-Item -ItemType Directory -Force -Path $folder | Out-Null
+                $lnkPath = Join-Path $folder 'BlockMemoryAgent.lnk'
+                if (& $makeLnk $lnkPath) { $made.Add($lnkPath) } else { $failed.Add($lnkPath) }
+                $uninst = Join-Path $Root 'unins000.exe'
+                if (Test-Path $uninst) {
+                    $ulnk = $ws.CreateShortcut((Join-Path $folder '卸载 BlockMemoryAgent.lnk'))
+                    $ulnk.TargetPath = $uninst
+                    $ulnk.WorkingDirectory = $Root
+                    $ulnk.Save()
+                }
+            } catch { $failed.Add($folder + ' (' + $_.Exception.Message + ')') }
+        }
+
+        # 3) 安装目录里也放一份（从安装目录找入口的老习惯）
+        $rootLnk = Join-Path $Root 'BlockMemoryAgent.lnk'
+        try {
+            if (& $makeLnk $rootLnk) { $made.Add($rootLnk) } else { $failed.Add($rootLnk) }
+        } catch { $failed.Add($rootLnk + ' (' + $_.Exception.Message + ')') }
     } catch {
         Write-Log ("[install] warn: 创建快捷方式失败: " + $_.Exception.Message)
+        return
+    }
+
+    if ($made.Count -gt 0) {
+        Write-Log ("[install] 已创建快捷方式（" + $made.Count + " 处）→ " + $target)
+        foreach ($p in $made) { Write-Log ('         · ' + $p) }
+    }
+    if ($failed.Count -gt 0) {
+        Write-Log "[install] warn: 以下快捷方式未能落盘（可手动右键 BMA-Desktop.exe → 发送到 → 桌面快捷方式）:"
+        foreach ($p in $failed) { Write-Log ('         × ' + $p) }
+    }
+    if ($made.Count -eq 0) {
+        Write-Log ("[install] warn: 没建成任何快捷方式；直接双击 " + $target + " 即可启动")
     }
 }
 
@@ -1336,14 +1455,32 @@ function Invoke-Install {
             $restarted = $true
         }
 
-        # 更新后把桌面外壳拉回来（原来是开着的才拉，保持"托盘常驻"体验）；-NoShell 可跳过
+        # 起桌面外壳。语义：**之前开着就拉回来**（保持"托盘常驻"，不要在更新时把它弄丢），
+        # 但“之前没开”时也要拉起一个——安装/更新的终点应该是一个能用的窗口加托盘，
+        # 而不是“后端在跑但用户面前什么都没有”（2026-11-16 用户实战：装完桌面没图标、
+        # 也没开窗口，以为装失败）。安装机是交互桌面（非无人值守）就直接拉起。
         $shellRestarted = $false
-        if ($restarted -and $hadShell -and (-not $NoShell)) {
+        if ($restarted -and (-not $NoShell)) {
             $desktopExe = Join-Path $Target 'BMA-Desktop.exe'
             if (Test-Path $desktopExe) {
-                Start-Process -FilePath $desktopExe -WorkingDirectory $Target
-                $shellRestarted = $true
-                Write-Log '[install] 桌面外壳已重启'
+                $skipShell = $false
+                # 无人值守/服务会话里起 GUI 会挂在一个看不见的会话里，且可能阻住安装旁
+                # 一直等 —— N/A 的空闲时长 / 无交互会话时只提示不拉起。
+                try {
+                    if ([Environment]::UserInteractive -eq $false) { $skipShell = $true }
+                    $sess = (Get-Process -Id $PID).SessionId
+                    if ($sess -eq 0) { $skipShell = $true }
+                } catch { }
+                if ($skipShell) {
+                    Write-Log ('[install] 当前是非交互会话，不自动开窗口；双击 ' + $desktopExe + '（或桌面快捷方式）即可启动')
+                } else {
+                    Start-Process -FilePath $desktopExe -WorkingDirectory $Target
+                    $shellRestarted = $true
+                    if ($hadShell) { Write-Log '[install] 桌面外壳已重启' }
+                    else { Write-Log '[install] 桌面外壳已启动（窗口 + 托盘图标）' }
+                }
+            } else {
+                Write-Log ('[install] warn: 缺少 ' + $desktopExe + '（桌面外壳未随包？）')
             }
         }
 
@@ -1651,6 +1788,20 @@ function Invoke-Rollback {
     return [ordered]@{ ok = $true; command = 'rollback'; target = $Target; version = $prev; previous = $cur.version; health = $h }
 }
 
+# New-Shortcuts 命令实现：给已装好的实例重建桌面/开始菜单入口。
+#
+# 存在的理由：快捷方式属"外部系统状态"（桌面重定向、权限、被误删），可能是装完才坏的，
+# 而为了补一个 .lnk 跑一遍完整 install（重新打包 + 重铺运行时）代价太大。
+function Invoke-Shortcuts {
+    param([string]$Target, [switch]$NoShortcut)
+    $Target = Resolve-Target $Target
+    $cur = Read-JsonFile (Join-Path $Target 'app\current.json')
+    if (-not $cur) { throw "未安装（缺少 $Target\app\current.json）" }
+    if ($NoShortcut) { throw '-NoShortcut 与 shortcuts 命令冲突' }
+    New-AppShortcuts -Root $Target -Version $cur.version
+    return [ordered]@{ ok = $true; command = 'shortcuts'; target = $Target; version = $cur.version }
+}
+
 # ---------------- dispatch ----------------
 
 # 代理：设进环境变量，子进程（npm / playwright / go / fetch-runtime）全部继承。
@@ -1684,6 +1835,7 @@ try {
         'media' { $result = Invoke-Media -Target $Target }
         'migrate-data' { $result = Invoke-MigrateData -Target $Target -FromDsn $FromDsn }
         'publish' { $result = Invoke-Publish -BaseUrl $BaseUrl -Version $Version -Notes $Notes }
+        'shortcuts' { $result = Invoke-Shortcuts -Target $Target -NoShortcut:$NoShortcut }
     }
 } catch {
     $message = $_.Exception.Message
