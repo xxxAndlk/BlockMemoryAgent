@@ -601,13 +601,16 @@ func (f *ModelFactory) GetLightweightModel(ctx context.Context) (LLMClient, erro
 // resolveConfig 根据角色ID解析生效模型配置（含注册表合并）。
 //
 // 连接参数（provider/model/api_key/base_url）合并序：
-//  1. role_bindings[roleID] 存在 → 取注册表 models[binding.model_id]
-//  2. 否则角色配置 model_ref 非空 → 取注册表 models[model_ref]
-//  3. 否则用角色配置内联连接字段（roles.yaml 直填，测试夹具场景）
+//  1. role_bindings[roleID] 存在且条目可解析 → 取注册表 models[binding.model_id]
+//  2. 否则角色配置 model_ref 非空且可解析 → 取注册表 models[model_ref]
+//  3. 否则角色自带内联连接字段（roles.yaml 直填，测试夹具场景）→ 直接用
+//  4. 否则注册表只有一条模型 → 自动选用（新装机手动加第一条模型即全局可用）
+//  5. 否则非 meta 角色 → 跟随 meta（连接参数跟 meta，行为参数仍取本角色）
+//  6. 都不可用 → error（提示去模型页新增模型/绑定角色）
 //
 // 行为参数：temperature/max_tokens 恒取角色配置；thinking = binding.thinking（非空）
 // > 角色 thinking。base 为 meta/domain/lightweight/dynamic/fixed/回退各分支的
-// 角色侧配置；连接字段缺失（model_ref 解析不到）返回 error。
+// 角色侧配置。
 //
 // 并发安全：registry 内部持锁；f.cfg 只读。
 func (f *ModelFactory) resolveConfig(roleDefID string) (types.AgentModelConfig, error) {
@@ -626,14 +629,56 @@ func (f *ModelFactory) resolveConfig(roleDefID string) (types.AgentModelConfig, 
 	}
 	// 2. 角色引用注册表条目（model_ref）
 	if base.ModelRef != "" {
-		entry, found := f.entryByID(base.ModelRef)
-		if !found {
-			return types.AgentModelConfig{}, fmt.Errorf("role %s 的 model_ref %q 不在模型注册表中", roleDefID, base.ModelRef)
+		if entry, found := f.entryByID(base.ModelRef); found {
+			return applyModelEntry(base, entry), nil
 		}
-		base = applyModelEntry(base, entry)
+		// 指向的条目不存在（典型：包内模板换了模型，roles.yaml 的 model_ref 没跟上）：
+		// 视为“未设置”继续走下面的自动选用/跟随 meta，而不是当场判死。
 	}
-	// 3. 内联连接字段已在 base 中，直接生效
-	return base, nil
+	// 3. 角色自带内联连接字段（roles.yaml 直填，测试夹具场景）：已设置就照用。
+	if base.Model != "" && base.Provider != "" {
+		return base, nil
+	}
+	// 4. 注册表只有一条模型时自动选用（2026-11-18）：新装机从空注册表手动加一条模型，
+	// 不必再去逐个角色绑定；meta 靠这条即可立刻可用。
+	if entry, ok := f.soleModelEntry(); ok {
+		return applyModelEntry(base, entry), nil
+	}
+	// 5. 其他角色未设置模型 → 跟随 meta（连接参数跟 meta，行为参数仍是本角色的）。
+	// 递归深度恒为 1：meta 分支不会再向下跟随（上面已挡）。
+	if roleDefID != "meta" {
+		if metaCfg, metaErr := f.resolveConfig("meta"); metaErr == nil {
+			base.Provider = metaCfg.Provider
+			base.Model = metaCfg.Model
+			base.APIKey = metaCfg.APIKey
+			base.BaseURL = metaCfg.BaseURL
+			if base.MaxTokens <= 0 {
+				base.MaxTokens = metaCfg.MaxTokens
+			}
+			return base, nil
+		}
+	}
+	// 6. 仍不可用：给出可操作错误（模型页新增模型即可）。
+	if base.ModelRef != "" {
+		return types.AgentModelConfig{}, fmt.Errorf("角色 %q 的 model_ref %q 不在模型注册表中（请在模型页新增该模型或给角色绑定模型）", roleDefID, base.ModelRef)
+	}
+	if base.Model != "" {
+		return types.AgentModelConfig{}, fmt.Errorf("角色 %q 的模型连接受参数不完整（model=%q provider=%q）", roleDefID, base.Model, base.Provider)
+	}
+	return types.AgentModelConfig{}, fmt.Errorf("角色 %q 未配置模型：模型注册表为空，请先在模型页新增一个模型", roleDefID)
+}
+
+// soleModelEntry 返回注册表里唯一一条模型（恰好 1 条时）；0 条或多条返回 false。
+// 语义：新装机手动加的第一条模型自动承担所有未显式绑定的角色（meta 优先）。
+func (f *ModelFactory) soleModelEntry() (types.ModelEntry, bool) {
+	if f.registry == nil {
+		return types.ModelEntry{}, false
+	}
+	models := f.registry.Models()
+	if len(models) != 1 {
+		return types.ModelEntry{}, false
+	}
+	return models[0], true
 }
 
 // resolveBaseConfig 解析角色侧基础配置（未合并注册表）：含 model_ref/内联连接字段 +
@@ -1108,6 +1153,7 @@ func (f *ModelFactory) SwitchableRoles() []string {
 // CurrentModelInfo 返回角色当前生效的模型状态（含绑定/model_ref 来源，不含 api_key）。
 // 供 StatusHandler 与模型目录展示；unknown roleID 按默认解析链返回（Bound=false）。
 func (f *ModelFactory) CurrentModelInfo(roleID string) (ModelStatus, error) {
+	f.checkRegistryReload()
 	_, bound := f.bindingFor(roleID)
 	cfg, err := f.resolveConfig(roleID)
 	if err != nil {
@@ -1196,7 +1242,40 @@ func (f *ModelFactory) AddModel(entry types.ModelEntry) error {
 	if entry.ID == "" {
 		entry.ID = f.generateModelID(entry.Model)
 	}
-	return f.registry.Add(entry)
+	if err := f.registry.Add(entry); err != nil {
+		return err
+	}
+	// 单模型即用（2026-11-18）：meta 尚未绑定且它的 model_ref 也解析不到时，把 meta
+	// 自动绑到刚新增的条目（其余角色按“未设置即跟随 meta”解析）。绑定落盘后即使以后
+	// 再加第二条模型，meta 也不会因为“唯一模型没了”而重新变成无模型可用。
+	if f.metaNeedsAutoBinding() {
+		if err := f.registry.SetBinding("meta", entry.ID, ""); err != nil {
+			return fmt.Errorf("自动绑定 meta 失败（模型已新增 %s）: %w", entry.ID, err)
+		}
+	}
+	f.invalidateChangedClients()
+	return nil
+}
+
+// metaNeedsAutoBinding 报告 meta 是否处于“没有模型可用”状态：无绑定、无内联连接、
+// 且 model_ref 解析不到（或未填）。用于新增模型后的自动绑定。
+func (f *ModelFactory) metaNeedsAutoBinding() bool {
+	if f.registry == nil {
+		return false
+	}
+	if _, ok := f.registry.Binding("meta"); ok {
+		return false
+	}
+	base := f.resolveBaseConfig("meta")
+	if base.Model != "" {
+		return false
+	}
+	if base.ModelRef != "" {
+		if _, ok := f.entryByID(base.ModelRef); ok {
+			return false
+		}
+	}
+	return true
 }
 
 // generateModelID 由 model 名生成条目 ID（小写、非法字符转 -），与注册表已有条目
@@ -1227,10 +1306,13 @@ func (f *ModelFactory) generateModelID(modelName string) string {
 }
 
 // RegistryModels 返回模型注册表清单副本（目录展示用）；registry 未启用返回 nil。
+// RegistryModels 返回模型注册表清单副本（目录展示用）；registry 未启用返回 nil。
+// 先做一次热更新检查：手改 models.json 后目录接口也要立即看到（否则页面停在旧清单）。
 func (f *ModelFactory) RegistryModels() []types.ModelEntry {
 	if f.registry == nil {
 		return nil
 	}
+	f.checkRegistryReload()
 	return f.registry.Models()
 }
 

@@ -334,12 +334,15 @@ func TestMaxOutputTokensResolution(t *testing.T) {
 	}
 }
 
-func TestModelRefMissingFailsStrict(t *testing.T) {
+// TestModelRefMissingFallsBackToMeta（2026-11-18 语义变更）：model_ref 指向的条目不在
+// 注册表时不再当场报死 —— 非 meta 角色改为跟随 meta（连接参数取 meta，行为参数取自己）。
+// 旧语义（strict 报错）会把“模板没跟上”变成全局不可用，新装机只能逐个角色重绑。
+func TestModelRefMissingFallsBackToMeta(t *testing.T) {
 	cfg := &config.RoleConfigFile{
 		MetaAgent:   config.MetaAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "meta-old", APIKey: "k-meta"}},
 		DomainAgent: config.DomainAgentConfig{ModelConfig: types.AgentModelConfig{Provider: "openai", Model: "domain-old", APIKey: "k-domain"}},
 		FixedRoles: []types.RoleDefinition{
-			{ID: "bad_ref", Name: "bad", ModelConfig: types.AgentModelConfig{ModelRef: "gone"}},
+			{ID: "bad_ref", Name: "bad", ModelConfig: types.AgentModelConfig{ModelRef: "gone", Temperature: 0.7, MaxTokens: 2048}},
 		},
 	}
 	f := NewModelFactory(cfg)
@@ -349,8 +352,38 @@ func TestModelRefMissingFailsStrict(t *testing.T) {
 		t.Fatalf("registry store: %v", err)
 	}
 	f.SetRegistry(store)
-	if _, err := f.GetModel(context.Background(), "bad_ref"); err == nil {
-		t.Fatal("model_ref 解析不到应报错（strict startup）")
+	cfgResolved, err := f.resolveConfig("bad_ref")
+	if err != nil {
+		t.Fatalf("model_ref 解析不到应跟随 meta: %v", err)
+	}
+	if cfgResolved.Model != "meta-old" || cfgResolved.APIKey != "k-meta" || cfgResolved.Provider != "openai" {
+		t.Fatalf("连接参数应取 meta: %+v", cfgResolved)
+	}
+	if cfgResolved.Temperature != 0.7 || cfgResolved.MaxTokens != 2048 {
+		t.Fatalf("行为参数应保留角色侧: %+v", cfgResolved)
+	}
+	st, err := f.CurrentModelInfo("bad_ref")
+	if err != nil || st.Model != "meta-old" {
+		t.Fatalf("CurrentModelInfo = %+v err=%v", st, err)
+	}
+}
+
+// TestUnresolvableWithoutAnyModelFails：meta 自己也没模型、注册表也空 → 仍然报错（
+// 不能把不可用静默成“可用但调用必败”）。
+func TestUnresolvableWithoutAnyModelFails(t *testing.T) {
+	cfg := &config.RoleConfigFile{
+		FixedRoles: []types.RoleDefinition{
+			{ID: "bad_ref", Name: "bad", ModelConfig: types.AgentModelConfig{ModelRef: "gone"}},
+		},
+	}
+	f := NewModelFactory(cfg)
+	store, err := config.NewRegistryStore(filepath.Join(t.TempDir(), "models.json"))
+	if err != nil {
+		t.Fatalf("registry store: %v", err)
+	}
+	f.SetRegistry(store)
+	if _, err := f.resolveConfig("bad_ref"); err == nil {
+		t.Fatal("无任何可用模型时应报错")
 	}
 	if _, err := f.CurrentModelInfo("bad_ref"); err == nil {
 		t.Fatal("CurrentModelInfo 同样应报错")

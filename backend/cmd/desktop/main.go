@@ -159,27 +159,13 @@ func runApp(root, base string) {
 		}()
 	})
 
-	// 首启向导：缺凭据时先引导填写（写进 .env），再继续启动。
-	gate := newWizardGate()
-	_ = w.Bind("bmaSetupSubmit", func(modelKey, modelURL, embedURL, embedKey string) {
-		go func() {
-			if err := applySetup(root, modelKey, modelURL, embedURL, embedKey); err != nil {
-				st := checkSetup(root)
-				st.Err = "保存失败：" + err.Error()
-				w.Dispatch(func() { w.SetHtml(wizardHTML(st)) })
-				return
-			}
-			gate.open()
-		}()
-	})
-	_ = w.Bind("bmaSetupSkip", func() { gate.open() })
+	// 首启向导已移除（2026-11-18）：启动不弹任何配置页，直接进 UI。模型由用户在
+	// 模型页手动新增（新装机器给的是一份空注册表模板，不再预填火山模型）。这里只补
+	// models.json（缺失或 0 字节时用包内模板铺一份），补不了也不阻断启动。
+	seedModelsTemplate(root)
 
 	// 依赖自举与后端拉起放后台：主 goroutine 留给 WebView2 消息泵。
 	go func() {
-		if st := checkSetup(root); st.NeedModel || st.NeedEmbed {
-			w.Dispatch(func() { w.SetHtml(wizardHTML(st)) })
-			gate.wait()
-		}
 		if err := bootstrap(root, base, w); err != nil {
 			w.Dispatch(func() { w.SetHtml(errorHTML(launchErrorText(err))) })
 		}

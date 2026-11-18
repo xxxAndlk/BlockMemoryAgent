@@ -253,16 +253,16 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	modelsJSONPath := filepath.Join(filepath.Dir(paths.RolePath), "models.json")
 	registry, err := pkgconfig.NewRegistryStore(modelsJSONPath)
 	if err != nil {
-		// 注册表损坏只影响 model_ref/绑定解析（回落 roles.yaml 内联配置），
-		// 不再是启动硬失败：用户可在模型页重建注册表后使用。
-		log.Printf("[bootstrap] [WARN] 模型注册表 %s 读取失败（启动继续，模型解析回落 roles.yaml 内联配置；请在模型页修复）: %v",
+		// 注册表损坏（JSON 写坏）不再让模型页失去写能力：改用空注册表继续运行，
+		// 用户新增/切换模型时 Save 会原子重建该文件（模型页即“修复入口”）。
+		// JSON 损坏的原文不丢：启动日志已打印具体 parse 错误，可在升级前手工备份。
+		log.Printf("[bootstrap] [WARN] 模型注册表 %s 读取失败（改用空注册表继续，模型页新增/切换会重写该文件）: %v",
 			modelsJSONPath, err)
-		registry = nil
-	} else {
-		modelFactory.SetRegistry(registry)
-		for _, warn := range registryStartupWarnings(registry) {
-			log.Printf("[bootstrap] [WARN] 模型绑定跳过: %s", warn)
-		}
+		registry = pkgconfig.NewEmptyRegistryStore(modelsJSONPath)
+	}
+	modelFactory.SetRegistry(registry)
+	for _, warn := range registryStartupWarnings(registry) {
+		log.Printf("[bootstrap] [WARN] 模型绑定跳过: %s", warn)
 	}
 	// 启动即打印轻量模型解析结果（来源 direct / fallback-domain / binding），排查配置加载漂移：
 	// 2026-08-10 事故 roles.yaml 配 deepseek-v4-flash 但运行时 provider=glm-5.2（domain 回退），

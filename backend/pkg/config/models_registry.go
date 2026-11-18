@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -55,6 +56,13 @@ func LoadModelsRegistry(path string) (*ModelsRegistryFile, error) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("read models registry %s: %w", path, err)
+	}
+	// 空文件（0 字节 / 只有空白）算"空注册表"，不算损坏：安装器/向导可能先落一个空占位
+	// 文件。此前这里 json.Unmarshal 直接报 "unexpected end of JSON input" → NewRegistryStore
+	// 失败 → bootstrap 拿不到注册表（registry=nil）→ 模型页新增模型恒报"模型注册表未启用"
+	//（2026-11-18 实测事故）。
+	if len(bytes.TrimSpace(data)) == 0 {
+		return &ModelsRegistryFile{}, nil
 	}
 	var f ModelsRegistryFile
 	if err := json.Unmarshal(data, &f); err != nil {
@@ -176,6 +184,15 @@ func NewRegistryStore(path string) (*RegistryStore, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// NewEmptyRegistryStore 构造一个空注册表（文件缺失/损坏时的兜底）：loaded=true、索引为空，
+// 后续 Add/Bind 经 Save 原子落盘重建文件。用途是"注册表坏了也不能失去写能力"——
+// 模型页可以新增模型把文件修回来（bootstrap 在读取失败时用它代替 nil）。
+func NewEmptyRegistryStore(path string) *RegistryStore {
+	s := &RegistryStore{path: path, loaded: true, file: &ModelsRegistryFile{}}
+	s.rebuildIndexLocked()
+	return s
 }
 
 // MaybeReload 检查文件 mtime/size，变化则重载并重建索引。

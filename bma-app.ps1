@@ -848,23 +848,12 @@ function Invoke-Pack {
         if (Test-Path $p) { Remove-Item -Recurse -Force $p; Write-Log "[pack] 已剔除禁运文件 $f" }
     }
 
-    # 模型注册表模板：models.json 在禁运清单里（用户注册表可能含明文 Key），但新装
-    # 机器没有它就没有任何可用模型 —— 生成一份"只含 ${VAR} 引用"的模板随包走。
-    $modelsSrc = Join-Path $repo 'config\models.json'
-    if (Test-Path $modelsSrc) {
-        try {
-            $mj = Get-Content $modelsSrc -Raw -Encoding UTF8 | ConvertFrom-Json
-            foreach ($m in $mj.models) {
-                if ($m.api_key -and -not ($m.api_key -match '\$\{')) { $m.api_key = '${ANTHROPIC_API_KEY}' }
-                if ($m.base_url -and -not ($m.base_url -match '\$\{')) { $m.base_url = '${ANTHROPIC_BASE_URL}' }
-            }
-            $jsonText = $mj | ConvertTo-Json -Depth 8
-            [System.IO.File]::WriteAllText((Join-Path $stage 'config-templates\models.json'), $jsonText, (New-Object System.Text.UTF8Encoding($false)))
-            Write-Log '[pack] 已生成模型注册表模板（去密钥，仅 ${VAR} 引用）'
-        } catch {
-            Write-Log '[pack] warn: 生成模型注册表模板失败（新装机器将没有可用模型）'
-        }
-    }
+    # 模型注册表模板（2026-11-18 改）：新装机一律给**空注册表** {"models": []}，
+    # 由用户在应用内模型页手动新增自己的模型；不再从仓库 models.json 复制“去密钥副本”
+    #（那会把开发机的火山/方舟模型清单默认铺给所有人，用户不想要这些模型）。
+    [System.IO.File]::WriteAllText((Join-Path $stage 'config-templates\models.json'),
+        "{`n  `"models`": []`n}`n", (New-Object System.Text.UTF8Encoding($false)))
+    Write-Log '[pack] 模型注册表模板：空清单（首次在模型页手动新增）'
 
     # 密钥扫描：模板里只允许 ${VAR} 插值，发现疑似真实 key 一律拒包。
     # 扫描面 = 我们自己的配置/脚本（config-templates、启动器等），跳过 runtime\
@@ -1139,7 +1128,13 @@ function Get-DesktopDirs {
         # 展开 REG_EXPAND_SZ 里可能残留的 %USERPROFILE%
         try { $p = [Environment]::ExpandEnvironmentVariables($p) } catch { }
         if (-not [System.IO.Path]::IsPathRooted($p)) { return }
-        if (-not (Test-Path -LiteralPath $p -PathType Container)) { return }
+        # 这里不能用 Test-Path：拒绝访问的目录（典型是别人的 C:\Users\X\Desktop）会让它写一条
+        # error record，而脚本全局 $ErrorActionPreference='Stop' 把它升级成终止错误 —— 2026-11-16
+        # 实证：C:\Users\WsiAccount\Desktop 权限拒绝直接中断整段快捷方式创建（连开始菜单都没建）。
+        # Directory.Exists 无权限只返回 False，不抛错，正是这里需要的语义。
+        $isDir = $false
+        try { $isDir = [System.IO.Directory]::Exists($p) } catch { $isDir = $false }
+        if (-not $isDir) { return }
         if (-not $cands.Contains($p)) { $cands.Add($p) }
     }
     foreach ($regKey in @(
@@ -1152,17 +1147,22 @@ function Get-DesktopDirs {
     }
     try { & $add ([Environment]::GetFolderPath('Desktop')) } catch { }
     try { & $add ([Environment]::GetFolderPath('DesktopDirectory')) } catch { }
-    if ($env:USERPROFILE) { & $add (Join-Path $env:USERPROFILE 'Desktop') }
-    if ($env:OneDrive) { & $add (Join-Path $env:OneDrive 'Desktop') }
+    if ($env:USERPROFILE) { try { & $add (Join-Path $env:USERPROFILE 'Desktop') } catch { } }
+    if ($env:OneDrive) { try { & $add (Join-Path $env:OneDrive 'Desktop') } catch { } }
     # 多账号机器：把其它真实用户的桌面也附上（装给谁就跑在谁桌面，宁可多建一个）。
+    # 整段再包一层 try/catch：探测别的用户目录本来就可能因权限失败，不该连累主候选。
     $usersRoot = Split-Path $env:USERPROFILE -Parent
-    if ($usersRoot -and (Test-Path $usersRoot)) {
-        Get-ChildItem $usersRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notin @('Public', 'Default', 'Default User', 'All Users') } |
-            ForEach-Object {
-                & $add (Join-Path $_.FullName 'Desktop')
-                & $add (Join-Path $_.FullName 'OneDrive\Desktop')
+    if ($usersRoot) {
+        try {
+            if ([System.IO.Directory]::Exists($usersRoot)) {
+                Get-ChildItem $usersRoot -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -notin @('Public', 'Default', 'Default User', 'All Users') } |
+                    ForEach-Object {
+                        try { & $add (Join-Path $_.FullName 'Desktop') } catch { }
+                        try { & $add (Join-Path $_.FullName 'OneDrive\Desktop') } catch { }
+                    }
             }
+        } catch { }
     }
     return $cands
 }
@@ -1178,8 +1178,15 @@ function Get-StartMenuDirs {
         if (-not $cands.Contains($p)) { $cands.Add($p) }
     }
     try { & $add ([Environment]::GetFolderPath('Programs')) } catch { }
-    if ($env:APPDATA) { & $add (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs') }
-    if ($env:ProgramData) { & $add (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs') }
+    if ($env:APPDATA) { try { & $add (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs') } catch { } }
+    # 全用户开始菜单只有管理员能写：非提权时**不加候选**，否则每次装都刷一条 × 权限噪音
+    # （per-user 安装靠自己的 Programs 目录就够，开始菜单搜索同样能找到）。
+    $isAdmin = $false
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $isAdmin = (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { }
+    if ($isAdmin -and $env:ProgramData) { try { & $add (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs') } catch { } }
     return $cands
 }
 
@@ -1208,6 +1215,13 @@ function New-AppShortcuts {
 
     $made = New-Object System.Collections.Generic.List[string]
     $failed = New-Object System.Collections.Generic.List[string]
+    # 目录探测放在外层 try 之前：它只是"猜桌面/开始菜单在哪"，猜不到或没权限不该连累
+    # 开始菜单与安装目录那两处入口（2026-11-16 实证：一个读不了的其它用户桌面把整段
+    # 捷径创建拖进 catch，结果一处都没建成）。
+    $desktopDirs = @()
+    $startMenuDirs = @()
+    try { $desktopDirs = @(Get-DesktopDirs) } catch { Write-Log ("[install] warn: 桌面目录探测失败（继续）: " + $_.Exception.Message) }
+    try { $startMenuDirs = @(Get-StartMenuDirs) } catch { Write-Log ("[install] warn: 开始菜单目录探测失败（继续）: " + $_.Exception.Message) }
     try {
         $ws = New-Object -ComObject WScript.Shell
         # 同一个 lnk 的公共属性抽出来，避免三处重复
@@ -1223,15 +1237,18 @@ function New-AppShortcuts {
         }
 
         # 1) 桌面：所有候选目录都放一份（多账号/OneDrive 重定向时总有一个是对的）
-        foreach ($dir in (Get-DesktopDirs)) {
-            $lnkPath = Join-Path $dir 'BlockMemoryAgent.lnk'
+        # 桌面上用短名 "BMA.lnk"："BlockMemoryAgent" 在桌面标签处会被截成 "BlockMe…"，
+        # 用户根本认不出是自己的应用（2026-11-17 实证：图标建好了，用户却说"还是没有"）。
+        # 开始菜单与安装目录仍保留全名（那里没有截断问题）。
+        foreach ($dir in $desktopDirs) {
+            $lnkPath = Join-Path $dir 'BMA.lnk'
             try {
                 if (& $makeLnk $lnkPath) { $made.Add($lnkPath) } else { $failed.Add($lnkPath) }
             } catch { $failed.Add($lnkPath + ' (' + $_.Exception.Message + ')') }
         }
 
         # 2) 开始菜单：文件夹里放程序 + 卸载（开始菜单搜索/所有应用里必能找到）
-        foreach ($dir in (Get-StartMenuDirs)) {
+        foreach ($dir in $startMenuDirs) {
             $folder = Join-Path $dir 'BlockMemoryAgent'
             try {
                 New-Item -ItemType Directory -Force -Path $folder | Out-Null
@@ -1362,7 +1379,13 @@ function Invoke-Install {
             foreach ($f in Get-ChildItem $tplDir -File) {
                 if ($f.Name -eq 'env.example') { continue }
                 $out = Join-Path (Join-Path $Target 'config') $f.Name
-                if (-not (Test-Path $out)) {
+                # 0 字节也算缺失：老安装出现过空 models.json 占位文件，空 JSON 会让注册表
+                # 加载失败（模型页新增模型报“模型注册表未启用”）。
+                $needSeed = -not (Test-Path -LiteralPath $out)
+                if (-not $needSeed) {
+                    try { $needSeed = ((Get-Item -LiteralPath $out).Length -eq 0) } catch { }
+                }
+                if ($needSeed) {
                     Copy-Item -Force $f.FullName $out
                     $seeded += ('config\' + $f.Name)
                 }
